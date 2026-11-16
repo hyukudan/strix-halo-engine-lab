@@ -59,3 +59,5 @@ run with `STRIX_SERVE_ROW_BUDGET=0`.
 
 With `STRIX_SERVE_RECEIPT=1` the log carries `serve lever name=row_budget ... active=1` and the per-cycle rows
 (see [cycle-receipt.md](cycle-receipt.md)).
+
+`scripts/bench/qwen/serve_cycles.py` turns a served log (`STRIX_MTP_BATCH_LOG=2`) and serve_bench results into a per-burst table: decode-window and wall tok/s, emissions per lane, cycle / draft / target ms, the host gap between cycles and each owner topology's measured target ms and emissions; `--pairs A,B` compares in-process A/B arms (ids per request, both rates).
