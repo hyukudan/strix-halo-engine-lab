@@ -45,7 +45,7 @@ def stream(base, prompt, max_tokens, timeout):
     rtx = (strix or {}).get('rtx', {})
     return dict(t_first=first, t_end=t1, ttft=(first - t0) if first else None, wall=t1 - t0,
                 tokens=(usage or {}).get('completion_tokens'), ids=rtx.get('ids'), error=error,
-                decode_tps=(strix or {}).get('decode_tokens_per_second'))
+                decode_tps=(strix or {}).get('decode_tokens_per_second'), tpc=rtx.get('tokens_per_cycle'), cf=rtx.get('copy_first_steps'))
 
 
 def barrier(n, fn):
@@ -126,7 +126,7 @@ def main():
                 ref.append(r['ids'])
                 ids_out.write(json.dumps(dict(pas=pas, cls=cls, c=1, i=i, ids=r['ids'])) + '\n')
                 say(f'{pas} {cls} C1 i={i} prompt={len(p)} tokens={r["tokens"]} decode_tps={r["decode_tps"]} '
-                    f'short={int((r["tokens"] or 0) < a.min_decode_tokens)} err={r["error"]}')
+                    f'short={int((r["tokens"] or 0) < a.min_decode_tokens)} tpc={r["tpc"]} cf={r["cf"]} err={r["error"]}')
             if pas == 'cold':
                 sets[cls + '_ref'] = ref
             for c in (4, 8):

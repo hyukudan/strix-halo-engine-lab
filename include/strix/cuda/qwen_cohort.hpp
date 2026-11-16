@@ -8,6 +8,7 @@
 #include "strix/env_flags.hpp"
 #include "strix/cuda/qwen_cohort_plan.hpp"
 #include "strix/cuda/qwen_prefill.hpp"
+#include "strix/mtp_context_draft.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -23,11 +24,46 @@ namespace qp = strix::cuda::qwen_prefill;
 
 // A decoding session: `pending` is the next input token (the last verified one), at position `position` (= the
 // session's length).
+// Context copy/n-gram drafter of one stream: the shared host drafter (strix/mtp_context_draft.hpp, the HIP engine's
+// --mtp-ngram-draft=ctx|copy). copy-first: a gated context span supplies the window's rows with no MTP predictor
+// forward (the commit writes the MTP teacher rows of every committed position from the target's hidden rows, so the
+// predictor cache is the same as after a drafted window); otherwise the span extends or replaces the confident MTP
+// prefix. Every row still passes the greedy verify: the committed tokens are the target's whatever the proposal.
+enum class ContextMode { off, ctx, copy };
+inline ContextMode context_mode_of(const char* v) {
+    const std::string s = v ? v : "";
+    if (s == "ctx") return ContextMode::ctx;
+    if (s == "copy" || s == "1" || s == "on") return ContextMode::copy;
+    return ContextMode::off;
+}
+inline const char* context_mode_name(ContextMode m) { return m == ContextMode::copy ? "copy" : m == ContextMode::ctx ? "ctx" : "off"; }
+// STRIX_QRTX_CONTEXT_DRAFT=off|ctx|copy (unset: the default below), one resolution for every entry point.
+inline ContextMode context_mode_default() {
+    static const ContextMode m = [] {
+        const char* v = strix::envcfg::text("STRIX_QRTX_CONTEXT_DRAFT");
+        return v ? context_mode_of(v) : ContextMode::off;
+    }();
+    return m;
+}
+struct ContextDraft {
+    strix::MtpContextDraft drafter;
+    double mtp_expected = -1.0;    // accepted drafts per MTP (not copy-first) step, EMA 0.75/0.25 (as the HIP runtime)
+    bool copy_first = false;       // this step's rows came from the context, no predictor forward
+    std::uint64_t copy_first_steps = 0, extended_steps = 0, context_rows = 0, context_accepted = 0;
+    static MtpContextDraftConfig config(ContextMode m) {
+        MtpContextDraftConfig c;
+        c.copy_edit = m == ContextMode::copy;
+        return c;
+    }
+    explicit ContextDraft(ContextMode m) : drafter(config(m)) {}
+};
+
 struct Stream {
     qp::SessionId session = 0;
     std::uint32_t pending = 0;
     std::uint64_t position = 0;
     std::uint32_t depth_max = 0;  // per-request draft cap (0: the step's depth)
+    ContextDraft* context = nullptr;  // borrowed; null = MTP drafts only
 };
 
 inline std::uint32_t window_rows_default() {
@@ -132,8 +168,22 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
         std::uint32_t depth = o.mtp ? draft_depth_cap(m, o.depth, o.policy, o.budget) : 0U;
         if (s.depth_max) depth = std::min(depth, s.depth_max);
         requests[i] = {s.session, s.pending, depth, o.min_p};
-        chains += depth > 0;
     }
+    // copy-first: a gated context span replaces this stream's MTP chain (no predictor forward)
+    std::vector<std::uint32_t> room(n, 0);
+    std::vector<std::vector<std::uint32_t>> copy(n);
+    for (std::uint32_t i = 0; i < n; ++i) {
+        room[i] = requests[i].depth;
+        auto* c = streams[i].context;
+        if (!c) continue;
+        c->copy_first = false;
+        if (room[i] == 0) continue;
+        std::vector<double> acceptance;
+        copy[i] = c->drafter.begin_copy_cycle(streams[i].pending, room[i], acceptance, o.min_p, c->mtp_expected);
+        if (copy[i].size() > room[i]) copy[i].resize(room[i]);
+        if (!copy[i].empty()) { c->copy_first = true; requests[i].depth = 0; }
+    }
+    for (std::uint32_t i = 0; i < n; ++i) chains += requests[i].depth > 0;
     // drafts: batched by step across sessions (<= 8 chains per call), or one chain per session
     std::vector<qp::Draft> drafts(n);
     if (batch && chains > 1) {
@@ -148,9 +198,33 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
     }
     for (std::uint32_t i = 0; i < n; ++i) {
         auto& s = streams[i];
-        const auto& d = drafts[i];
+        auto& d = drafts[i];
+        auto* c = s.context;
+        if (c && c->copy_first) {
+            d.tokens = copy[i];
+            ++c->copy_first_steps;
+            c->context_rows += copy[i].size();
+        } else if (c && room[i] > 0) {
+            // context rows after any confident MTP prefix (also none), or a longer span replacing it
+            std::size_t confident = 0;
+            double kept_expected = 0.0, run = 1.0;
+            while (confident < d.tokens.size() && confident < d.probability.size() && d.probability[confident] >= o.min_p) {
+                run *= d.probability[confident];
+                kept_expected += run;
+                ++confident;
+            }
+            std::vector<double> acceptance;
+            auto ext = c->drafter.begin_cycle(s.pending, d.tokens, confident, room[i], acceptance, o.min_p, kept_expected);
+            if (!ext.empty()) {
+                const std::size_t kept = std::min<std::size_t>(c->drafter.kept_drafts(), d.tokens.size());
+                d.tokens.resize(kept);
+                for (std::size_t r = 0; r < ext.size() && d.tokens.size() < room[i]; ++r) d.tokens.push_back(ext[r]);
+                ++c->extended_steps;
+                c->context_rows += d.tokens.size() - kept;
+            }
+        }
         rows[i].insert(rows[i].end(), d.tokens.begin(), d.tokens.end());
-        out[i].drafted = static_cast<std::uint32_t>(d.tokens.size());
+        out[i].drafted = c && c->copy_first ? 0U : static_cast<std::uint32_t>(d.tokens.size());
         const std::uint64_t room = o.max_positions > s.position ? o.max_positions - s.position : 0U;
         want[i] = static_cast<std::uint32_t>(std::min<std::uint64_t>(rows[i].size(), std::max<std::uint64_t>(room, 1U)));
     }
@@ -208,6 +282,15 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
             out[e.index].retried = true;
             (void)run_window({e}, false);
         }
+    }
+    // the context drafters learn from the verified tokens (accepted drafts + the target's next token)
+    for (std::uint32_t i = 0; i < n; ++i) {
+        auto* c = streams[i].context;
+        if (!c || out[i].failed || out[i].tokens.empty()) continue;
+        const std::size_t verified = out[i].rows > 0 ? out[i].rows - 1U : 0U, accepted = out[i].tokens.size() - 1U;
+        c->drafter.finish_cycle(out[i].tokens, verified, accepted);
+        if (c->copy_first) c->context_accepted += accepted;
+        else if (room[i] > 0) c->mtp_expected = c->mtp_expected < 0.0 ? static_cast<double>(accepted) : 0.75 * c->mtp_expected + 0.25 * static_cast<double>(accepted);
     }
     if (timing) {
         timing->draft_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();

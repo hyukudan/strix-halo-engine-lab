@@ -3,7 +3,7 @@
 # GPU samples every second (index, MiB, util, SM MHz) beside every arm. Ends with OUT/summary.txt.
 #   SERVE_EXE   server executable (strix-cuda-qwen-serve)
 #   SERVE_ARGS  model / tables / sidecar / port / slot flags (the deploy declaration's values)
-#   ARMS        "A|ENV=v ENV2=v ;; B|ENV=w"   (name|environment of the arm)
+#   ARMS        "A|ENV=v ENV2=v ;; B|ENV=w ## --profile fast"   (name|environment of the arm [## extra server flags of the arm])
 #   ORDER       arm names in run order, e.g. "A B A B A B"
 #   CLIENT      client command; the arm's output path is appended (e.g. "python qwen_serve_classes.py http://127.0.0.1:8095 ...")
 #   OUT         output directory;  GPU_INDEX (default 0): the nvidia-smi index the server is pinned to
@@ -12,18 +12,20 @@ set -u
 GPU_INDEX=${GPU_INDEX:-0}
 mkdir -p "$OUT"
 smi() { nvidia-smi --query-gpu=index,memory.used,utilization.gpu,clocks.sm --format=csv,noheader | tr '\n' ' '; }
-declare -A ENVS
+declare -A ENVS FLAGS
 IFS=';' read -ra LIST <<< "${ARMS//;;/;}"
 for spec in "${LIST[@]}"; do
   [ -n "${spec// /}" ] || continue
-  ENVS[$(echo "$spec" | cut -d'|' -f1 | tr -d ' ')]=$(echo "$spec" | cut -d'|' -f2)
+  n=$(echo "$spec" | cut -d'|' -f1 | tr -d ' '); rest=$(echo "$spec" | cut -d'|' -f2-)
+  ENVS[$n]=${rest%%##*}
+  FLAGS[$n]=""; [[ "$rest" == *"##"* ]] && FLAGS[$n]=${rest#*##}
 done
 echo "start $(date +%T) smi $(smi)" > "$OUT/summary.txt"
 k=0
 for name in $ORDER; do
   k=$((k + 1)); A="$OUT/$k-$name"; mkdir -p "$A"
   # shellcheck disable=SC2086
-  env CUDA_VISIBLE_DEVICES=$GPU_INDEX ${ENVS[$name]} "$SERVE_EXE" $SERVE_ARGS > "$A/serve.log" 2>&1 &
+  env CUDA_VISIBLE_DEVICES=$GPU_INDEX ${ENVS[$name]} "$SERVE_EXE" $SERVE_ARGS ${FLAGS[$name]} > "$A/serve.log" 2>&1 &
   SPID=$!
   ( while kill -0 $SPID 2>/dev/null; do echo "$(date +%T) $(smi)" >> "$A/smi.samples"; sleep 1; done ) & MPID=$!
   timeout "${LIMIT_S:-900}" $CLIENT "$A/bench.txt" > "$A/client.log" 2>&1; rc=$?
