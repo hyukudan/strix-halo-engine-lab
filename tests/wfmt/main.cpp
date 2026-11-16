@@ -21,8 +21,7 @@ bool wfmt_cpu_test();
 bool wfmt_intel_test();
 bool wfmt_cpu_capture(std::string_view);
 bool wfmt_intel_capture(std::string_view);
-int main(int argc, char** argv) {
-    try {
+int main(int argc, char** argv) try {
     if (argc == 3 && std::string_view(argv[1]) == "--wfmt-backend-capture")
         return wfmt_cpu_capture(argv[2]) && wfmt_intel_capture(argv[2]) ? 0 : 1;
     if (argc == 3 && std::string_view(argv[1]) == "--wfmt-reference-capture")
