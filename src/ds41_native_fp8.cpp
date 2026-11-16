@@ -165,7 +165,7 @@ SafetensorsCheckpoint::SafetensorsCheckpoint(const std::filesystem::path& dir, b
 
 void SafetensorsCheckpoint::load_header(const std::filesystem::path& file) {
     std::shared_ptr<const weight::Source> source;
-    auto status = weight::open_source(file.string(), source, std::filesystem::relative(file,dir_).generic_string());
+    auto status = weight::open_source(file.string(), source, std::filesystem::absolute(file).lexically_relative(std::filesystem::absolute(dir_)).generic_string());
     weight::TensorIndex index;
     if (status) status = weight::index_safetensors(source, index);
     if (!status) throw std::runtime_error("ds41 native fp8: " + status.detail);
