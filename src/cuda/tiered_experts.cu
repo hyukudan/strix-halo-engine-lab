@@ -1,5 +1,5 @@
-// Tiered expert residency, CUDA side. See include/strix/cuda_tiered_experts.hpp for the protocol.
-#include "strix/cuda_tiered_experts.hpp"
+// Tiered expert residency, CUDA side. See include/strix/cuda/tiered_experts.hpp for the protocol.
+#include "strix/cuda/tiered_experts.hpp"
 #include "strix/residency/expert_residency.hpp"
 
 #include <algorithm>

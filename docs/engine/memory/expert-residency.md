@@ -43,7 +43,7 @@ Per MoE layer of a step, on one stream (capturable in the step's CUDA graphs):
    into the card's per-(row, slot) buffer and ORs the CPU status; the unchanged merge and commit follow.
 
 Exactness: every (row, slot, output) value of the routed MoE depends only on that (row, slot) and the expert's
-bytes (`include/strix/cuda_qwen_moe.hpp`), the merge reads per-(row, slot) values in slot order and never the
+bytes (`include/strix/cuda/qwen_moe.hpp`), the merge reads per-(row, slot) values in slot order and never the
 expert ids, and the CPU executor implements the decode chains operation for operation (integer group dots, then
 only single-rounding FP32 multiplies/adds in the card's order, the gfx1151 expf twin, the same h quantizer):
 `src/cpu/core/routed_expert.hpp`. Tiered output is therefore bitwise the fully resident output; MTP verification
@@ -71,7 +71,7 @@ unchanged.
 ## Other families
 
 The planner and resolver are host-shared. DeepSeek V4.1 on CUDA already keeps a per-layer id -> slot table with
-LRU dynamic slots and remote homes (`include/strix/cuda_ds41_hot_residency.hpp`); its LRU refill is the binding
+LRU dynamic slots and remote homes (`include/strix/cuda/ds41_hot_residency.hpp`); its LRU refill is the binding
 target of this planner (follow-up in a DS41 window). The CPU executor does not bind DS41 (IQ2_XXS / Q2_K experts and
 the split combine of `include/strix/ds41_hot_placement.hpp`). GLM and MiniMax have no CUDA route (`src/cuda`).
 

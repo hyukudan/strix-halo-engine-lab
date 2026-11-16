@@ -16,6 +16,7 @@
 #include "strix/serve/deepseek_chat.hpp"
 #include "strix/serve/prefill_group.hpp"
 #include "strix/serve/session_api.hpp"
+#include "strix/serve/session_reservation.hpp"
 #include "strix/serve/session_runtime.hpp"
 #if __has_include("deepseek41/http_session_owner.hpp")
 #include "deepseek41/http_session_owner.hpp"
@@ -180,6 +181,7 @@ using strix::deepseek41::BatchRow;
 using strix::deepseek41::BatchSequence;
 namespace serve=strix::serve;
 using Clock=std::chrono::steady_clock;
+#include "reservation.inc"
 #include "args.inc"
 [[noreturn]] void poisoned(unsigned,const std::string& e){throw std::runtime_error(e);}
 #include "control.inc"

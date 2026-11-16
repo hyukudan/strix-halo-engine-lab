@@ -609,6 +609,20 @@ failure may prevent final report delivery; inspect retained evidence privately.
 the state handed to the pair, the pair alone, the CUDA device alone), cold and warm, in one detached run with a phase
 breakdown, GPU clocks per token and a host-node link probe (RTT and useful throughput both ways).
 
+### MiniMax pair: chunk-invariant MoE order
+
+`STRIX_MMX_PF_ORDER=invariant` binds the shared `moe_core::kGroupedSingleChainContract` (S = 1 for routed and shared
+gate/up/down, identity `mmx-pf-moe-s1-v1`); the default `adaptive` keeps today's rows-dependent split. Gates:
+`strix-chunk-order-contract-tests` (host order reference, chunks 256/1024/4096/whole and 1..17-row tails) and
+`strix-hip-mmx-moe-bench --test --tests test_prefill_chunk_invariance` (device bytes). One pair run (TTFT, state FNV,
+MemAvailable, kfd `evicted_ms`, busy/sclk) is `scripts/bench/chunkinv/pair_run.sh --bin RANK --model DIR --peer HOST
+--out DIR STRIX_MMX_PF_ORDER=... -- <rank args>`, run inside the caller's pair GPU turn.
+Each run creates a fresh `DIR/run.*` on both hosts and preserves existing contents; peer collisions fail.
+Relative inputs are resolved from each host's launch directory. Failed ranks, collection failures or missing
+TTFT/state/token records return nonzero. The device fixture covers device-planned final outputs only, not
+host-planner cross-chunk equality, intermediate buffers, every variant or complete model state. The dense
+contract helper has test consumers only; neither fixture qualifies production dense or whole-engine invariance.
+
 ### Prefill window-loop census from a kernel trace
 
 [`scripts/bench/prefill-trace/`](../scripts/bench/prefill-trace/README.md) reads a rocprofv3 kernel trace of a prefill

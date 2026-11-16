@@ -18,9 +18,9 @@
 #include <type_traits>
 #include <vector>
 
-#include "strix/cuda_qwen_moe.hpp"
-#include "strix/cuda_tiered_experts.hpp"
-#include "qwen_amd_math_tables.hpp"
+#include "strix/cuda/qwen_moe.hpp"
+#include "strix/cuda/tiered_experts.hpp"
+#include "strix/cuda/amd_math_tables.hpp"
 
 namespace mo = strix::cuda::qwen_moe;
 namespace am = strix::cuda::amdmath;

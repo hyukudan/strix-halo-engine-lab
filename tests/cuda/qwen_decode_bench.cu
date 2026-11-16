@@ -2,7 +2,7 @@
 //   qwen_decode_bench <tables dir> <rope table> <max positions> <tokens file> <prompt N> <generate G>
 // Prefills rows [0, N-1), then reports: serial greedy steps (T = 1), verify windows of T = 2..8 rows over the serial
 // tokens (ms per window), and MTP speculative decode (depth 7, min-p STRIX_QWEN_MIN_P or 0.7) when a sidecar is set.
-#include "strix/cuda_qwen_prefill.hpp"
+#include "strix/cuda/qwen_prefill.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/residency/residency_cli.hpp"
 

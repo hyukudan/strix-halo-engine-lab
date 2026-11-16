@@ -100,7 +100,21 @@ ninja -C build strix-hip-decode-token
 
 ## Command line
 
-Qwen accepts `--profile default|fast|quality` for CLI decode, `--http-serve`,
+TURBO (`--profile turbo`, opt-in by name, never a default) is shared by Qwen,
+DS41 pair, GLM pair and MiniMax pair ([turbo.hpp](../../include/strix/turbo.hpp)):
+versioned names `qwen-turbo-v1`, `ds41-turbo-v1`, `glm-turbo-v1`,
+`minimax-turbo-v1`; an empty turbo cell takes the lever's fast cell; every lever
+keeps its own on/off switch (CLI > environment > profile > builtin). The weight
+toggle `--turbo-weights native|onfly|converted` (`--turbo-weight-bits`,
+`--turbo-weights-pack`, or `STRIX_TURBO_WEIGHTS*`) is printed requested/effective
+with its reason, and a request the build cannot load refuses the run. TURBO
+states use their own cache namespace (`STRIX_TURBO_CACHE_NS`, exported by the
+profile) even with every lever off, and ranks must agree on it. MiniMax rank's
+per-phase timing session is now `--timing-profile NAME:PROMPT.u32:STEPS` (the
+old `--profile NAME:PROMPT.u32:STEPS` still works, with a notice). Quality bar:
+`tools/strix-gate/fast_logit_gate.py compare --mode turbo` (see its README).
+
+Qwen accepts `--profile default|fast|quality|turbo` for CLI decode, `--http-serve`,
 MTP and the MTP qualification runner. Omission means `default`: it exports no
 profile switches and preserves the existing exact bundle, output WMMA and
 automatic prefill pair, including their existing admission guards.
@@ -213,8 +227,16 @@ filtered per GSQ owner, so GSQ runs without the former requirement to disable th
 Long prompts run with the default command up to the model maximum of 262,144 tokens (prompt plus generation):
 the automatic context is clamped to that maximum, the admission estimate credits the PLE pages that reclaim will
 free, and the tile falls back from T16384 (when eligible) to T8192, T4096 and then T2048 before the route declines,
-reporting each failed tile and its reason. A prompt plus generation
-above the maximum is refused (`prompt-exceeds-model-context`); a tile that does not fit the memory budget reports
+reporting each failed tile and its reason. A prompt plus generation above the native 262,144 positions, or an
+explicit `--context` above it, is refused unless experimental YaRN is explicitly requested. The diagnostic
+recommends `--rope-yarn 2` up to 524,288 or `--rope-yarn 4` up to 1,048,576, together with an explicit
+`--context`; prompts above 524,288 ids need `--prompt-ids FILE`. These are supported extents, not qualified
+model-fidelity or complete-workload bands. HTTP uses the same opt-in rule and still refuses YaRN execution.
+Every request native RoPE admits keeps it. Automatically discovered MTP bundle runtime budgets grow to the
+predictor's need at the admitted context (2,304 bytes per position plus workspace). Explicit CLI or bundle
+budgets remain ceilings and refuse insufficient capacity on CLI and serving paths alike. Startup and
+`--print-effective-config` report requested/effective runtime bytes and their source on stderr. A
+two-node prefill pipelines the prompt down to a multiple of 16 rows; the last rows run after the hand-off. A tile that does not fit the memory budget reports
 `insufficient-memory`. Under the priced native pools, at 131,072 and 262,143 real-text
 tokens the default admits automatic T16384, and with `STRIX_QPF2K_T16K=0` it admits T8192
 as before, with no fallback.

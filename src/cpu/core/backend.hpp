@@ -16,6 +16,7 @@
 // Compile with contraction off.
 #include <cstddef>
 #include <cstdint>
+#include "strix/weight/host_q8.hpp"
 
 #include "ops/norm/norm.hpp"
 
@@ -40,8 +41,8 @@ struct Stream {
 };
 
 // ------------------------------------------------------------------------------ weight formats
-inline constexpr std::size_t q8_0_group = 32;
-inline constexpr std::size_t q8_0_block_bytes = 34;  // FP16 scale (little endian) + 32 x int8
+inline constexpr std::size_t q8_0_group = weight::Q8Storage::elements;
+inline constexpr std::size_t q8_0_block_bytes = weight::Q8Storage::bytes;  // FP16 scale (little endian) + 32 x int8
 inline constexpr std::size_t product_lanes = 32;
 float half_to_float(std::uint16_t bits) noexcept;
 
@@ -71,6 +72,8 @@ struct Kernels {
                         unsigned rows, const Stream& s) = nullptr;
 };
 const Kernels& reference_kernels() noexcept;
+// Explicit source registration; architecture scaffolds remain unavailable.
+const Kernels* registered_weight_kernels(Isa) noexcept;
 // Best table for the host: specialisations in priority order, gaps filled from the reference.
 // Returned by value: subsequent selections and selecting-thread exit cannot invalidate it.
 Kernels select(const Caps& c) noexcept;
