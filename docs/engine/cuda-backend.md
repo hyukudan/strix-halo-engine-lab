@@ -125,11 +125,15 @@ the CUDA single-slot loop and other engines do not bind it. Use this route for m
 applicability reporting and rejection of unsupported overrides remain pending.
 Default `STRIX_QRTX_COPY_WIDE=auto`: on only when a fully accepted wide window beats a fully accepted 8-row window
 under the measured window costs (`CopyWideModel`, qwen_cohort_plan.hpp). On sm_120 one session costs 9.65 ms at 1 row,
-+1.1 ms per row to 17.2 ms at 8, and a flat 62.5 ms at 9..16 rows (prefill-shaped families), so it stays off: forced
-on, edit C1 drops 29 % (3 in-process ABAB pairs, ids equal). This fixed sm_120 model needs manual recalibration
-after kernel changes and separate qualification on other devices; costs are not measured automatically.
-A calibrated wide cost under ~34 ms enables auto (`STRIX_QRTX_COPY_WIDE_MS` overrides the model;
-`STRIX_QRTX_COPY_WIDE=1` / `=0` force it).
++1.1 ms per row to 17.2 ms at 8. Windows of 9..16 rows used to run the tiled prefill forms (flat 62.5 ms; forced on,
+edit C1 -29 %). The backend's decode row cap (`strix/cuda/core/decode_rows.hpp`, `STRIX_CUDA_DECODE_ROWS_MAX`, default
+16, `=8` = old switch point) now runs them on the decode forms: dense projections and router logits as <= 8-row
+pieces, MoE row kernels (8-assignment chunks), QSA head kernels and the hc split forms at up to 16 rows, all with the
+tiled forms' per-row chains (bits unchanged: qwen_decode_e2e STRIX_QWEN_TMAX=16 T=2..16 + rollback bitwise). A
+16-row window costs 29.2 ms (27.6 at 9), so the auto rule (`copy_wide_measured`, by cap) turns wide copy on at 16
+rows: edit C1 420.1 vs 372.7 tok/s (+12.7 %, 3 in-process ABAB pairs, ids equal; json / prose flat).
+The cost table is a manual sm_120 calibration: recalibrate after kernel changes, qualify other devices separately
+(`STRIX_QRTX_COPY_WIDE_MS` overrides the model; `STRIX_QRTX_COPY_WIDE=1` / `=0` force it).
 
 Served decode by prompt class: `scripts/bench/cuda/qwen_serve_classes.py` (prose / edit / json, C1 / C4 / C8, cold and
 warm passes, ids of every request) with `scripts/bench/cuda/qwen_classes_prompts.json`, and strict ABAB server arms with
