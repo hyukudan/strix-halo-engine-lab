@@ -2131,8 +2131,22 @@ int main(int argc, char** argv) {
                 setenv("STRIX_MM_AB_WARM_O", name.substr(8).c_str(), 1);
                 name = "xbwarmo";
             }
+            // pfmsaflash=A,B: this run's arms (STRIX_MM_AB_FLASH_A / _B, several pairs in one process); unset again below
+            const bool fl_set = name.rfind("pfmsaflash=", 0) == 0;
+            if (fl_set) {
+                const std::string arms = name.substr(11);
+                const auto comma = arms.find(',');
+                if (comma == std::string::npos) throw std::invalid_argument("--ab pfmsaflash=A,B");
+                setenv("STRIX_MM_AB_FLASH_A", arms.substr(0, comma).c_str(), 1);
+                setenv("STRIX_MM_AB_FLASH_B", arms.substr(comma + 1).c_str(), 1);
+                name = "pfmsaflash";
+            }
             const std::uint64_t ah = ab_flag(eng, name, read_u32(ppath), std::stoi(b.substr(c + 1)),
                                              ref == g_session_tokens.end() ? nullptr : &ref->second);
+            if (fl_set) {
+                unsetenv("STRIX_MM_AB_FLASH_A");
+                unsetenv("STRIX_MM_AB_FLASH_B");
+            }
             if (wo_set) {
                 if (wo_env == nullptr) unsetenv("STRIX_MM_AB_WARM_O");
                 else setenv("STRIX_MM_AB_WARM_O", wo0.c_str(), 1);
