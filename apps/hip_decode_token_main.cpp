@@ -1189,6 +1189,7 @@ static strix::decode_cli::CacheFamilyIdentity resolved_cache_family(
     c.cohort=strix::decode_cli::MtpBatchRunner::prompt_window_cohort(); c.small=number("STRIX_BATCH_PROMPT_SMALL",0)!=0;
     c.windows=number("STRIX_PROMPT_WINDOW",1)!=0;
     c.nest_rows=number("STRIX_BATCH_NEST_ROWS",2048); c.short_rows=number("STRIX_BATCH_SHORT_FIRST_ROWS",2048);
+    if(options.batch_cache_solo && runner==strix::decode_cli::CacheRunner::batch_mtp) {c.groups=false;c.cohort=false;c.nest_rows=0;}
     c.lookahead=number("STRIX_BATCH_SERVICE_LOOKAHEAD",2); c.cancel=number("STRIX_BATCH_CANCEL_POINTS",1)!=0;
     c.interleave=number("STRIX_BATCH_INTERLEAVE",options.http_serve?1:0);
     const char* service=std::getenv("STRIX_BATCH_SERVICE_MS"); c.service_ms=service?std::max(0.0,std::atof(service)):250;
@@ -4142,18 +4143,20 @@ static int run_decode_entry(
                 throw std::logic_error("tiled MTP prompt lacks its tiled prefill owners");
             auto& tiled = parents->tiled;
             tiled.blocks = known_prefix_backend.get(); tiled.block_owner = known_prefix_owner;
-            for (std::size_t t = 0; t < known_tail_backends.size(); ++t)
-                tiled.tails.push_back({known_tail_backends[t].get(), known_tail_owners[t], options.known_prefix_tail_rows[t]});
+            for (std::size_t t = 0; t < known_tail_backends.size(); ++t) {
+                if (strix::decode_cli::known_prefix_tail_tiles_prompts(options, options.known_prefix_tail_rows[t], compiled_prefill.has_value())) {
+                    tiled.tails.push_back({known_tail_backends[t].get(), known_tail_owners[t], options.known_prefix_tail_rows[t]});
+                    strix::decode_cli::QwenPlanOwner owner;
+                    owner.execution=known_tail_plans[t]->prefill_execution_identity;
+                    owner.kernel=known_tail_plans[t]->prefill_kernel_plan_identity;
+                    tiled.numerical_plan.tails.push_back(owner);
+                }
+            }
             for (std::size_t w = 0; w < known_wide_owners.size(); ++w)
                 tiled.wide.push_back({nullptr, known_wide_owners[w], options.mtp.copy_wide_rows[w]});
             tiled.rows = options.known_prefix_prefill_rows;
             tiled.numerical_plan.block.execution=known_prefill_plan->prefill_execution_identity;
             tiled.numerical_plan.block.kernel=known_prefill_plan->prefill_kernel_plan_identity;
-            for(const auto& tail:known_tail_plans) {
-                strix::decode_cli::QwenPlanOwner owner;
-                owner.execution=tail->prefill_execution_identity;owner.kernel=tail->prefill_kernel_plan_identity;
-                tiled.numerical_plan.tails.push_back(owner);
-            }
             tiled.numerical_plan.decode_execution=compiled.execution_identity;
             tiled.numerical_plan.decode_kernel=compiled.kernel_plan_identity;
             tiled.numerical_plan.prefill_execution=compiled_prefill?compiled_prefill->execution_identity:compiled.execution_identity;
@@ -4315,6 +4318,7 @@ static int run_decode_entry(
             std::shared_ptr<strix::HipKnownPrefixWindow> block_owner;
             std::unique_ptr<strix::HipKnownPromptBackend> blocks;
             std::vector<std::shared_ptr<strix::HipKnownPrefixWindow>> tail_owners;
+            std::vector<std::shared_ptr<strix::HipKnownPrefixWindow>> wide_owners;  // split profile: decode-profile wide owners
             std::vector<std::unique_ptr<strix::HipKnownPromptBackend>> tails;
             std::unique_ptr<strix::decode_cli::HipPrefixStateCacheSession> cache;
             // Split prefill profile: the sibling prefill execution's view of this slot's serial scratch and
@@ -4407,6 +4411,13 @@ static int run_decode_entry(
                     known_tail_memories[t]->scratch, model.vocab_size, original_work_device));
                 hand_off(*stack.tails.back());
             }
+            // --mtp-copy-wide-rows under a split prefill profile: the slot's decode-profile wide owners (as the CLI's
+            // known_wide_owners; their scratch is shared like the tails': the server runs a wide cycle only while one
+            // request is active)
+            for (std::size_t w = 0; w < known_wide_plans.size() && w < known_wide_memories.size(); ++w)
+                stack.wide_owners.push_back(std::make_shared<strix::HipKnownPrefixWindow>(*known_wide_plans[w], compiled, model,
+                    catalog_config, stack.parents->resources, known_wide_memories[w]->scratch, known_wide_memories[w]->scope,
+                    std::static_pointer_cast<const void>(known_wide_memories[w]), workspace(known_wide_memories[w])));
             if (prefix_store)
                 stack.cache = std::make_unique<strix::decode_cli::HipPrefixStateCacheSession>(prefix_store, prefix_cache_identity,
                     prefix_cache_unit(options), prefix_cache_every, model, state_layout, stack.memory->state());
@@ -4416,16 +4427,20 @@ static int run_decode_entry(
             if(stack.cache) stack.cache->set_staging_cap(options.prefix_cache_staging_bytes);
             auto& tiled = stack.parents->tiled;
             tiled.blocks = stack.blocks.get(); tiled.block_owner = stack.block_owner;
-            for (std::size_t t = 0; t < stack.tails.size(); ++t)
-                tiled.tails.push_back({stack.tails[t].get(), stack.tail_owners[t], options.known_prefix_tail_rows[t]});
+            for (std::size_t t = 0; t < stack.tails.size(); ++t) {
+                if (strix::decode_cli::known_prefix_tail_tiles_prompts(options, options.known_prefix_tail_rows[t], compiled_prefill.has_value())) {
+                    tiled.tails.push_back({stack.tails[t].get(), stack.tail_owners[t], options.known_prefix_tail_rows[t]});
+                    strix::decode_cli::QwenPlanOwner owner;
+                    owner.execution=known_tail_plans[t]->prefill_execution_identity;
+                    owner.kernel=known_tail_plans[t]->prefill_kernel_plan_identity;
+                    tiled.numerical_plan.tails.push_back(owner);
+                }
+            }
+            for (std::size_t w = 0; w < stack.wide_owners.size(); ++w)
+                tiled.wide.push_back({nullptr, stack.wide_owners[w], options.mtp.copy_wide_rows[w]});
             tiled.rows = options.known_prefix_prefill_rows;
             tiled.numerical_plan.block.execution=known_prefill_plan->prefill_execution_identity;
             tiled.numerical_plan.block.kernel=known_prefill_plan->prefill_kernel_plan_identity;
-            for(const auto& tail:known_tail_plans) {
-                strix::decode_cli::QwenPlanOwner owner;
-                owner.execution=tail->prefill_execution_identity;owner.kernel=tail->prefill_kernel_plan_identity;
-                tiled.numerical_plan.tails.push_back(owner);
-            }
             tiled.numerical_plan.decode_execution=compiled.execution_identity;
             tiled.numerical_plan.decode_kernel=compiled.kernel_plan_identity;
             tiled.numerical_plan.prefill_execution=compiled_prefill?compiled_prefill->execution_identity:compiled.execution_identity;
@@ -4504,7 +4519,12 @@ static int run_decode_entry(
                 if (!observation.gtt_limit || !observation.gtt_used || *observation.gtt_used > *observation.gtt_limit) return {};
                 return *observation.gtt_limit - *observation.gtt_used;
             };
-            const auto serving = prompt_memory.serving(options);
+            auto serving = prompt_memory.serving(options);
+            // The bridge builds a wide workspace for every slot, including slot zero.
+            // The stack probe below does not build these; charge them as future slot commitments.
+            const auto wide_bytes = mtp_wide_copy_retained_bytes(model, state_layout, mtp_wide_copy_rows_effective(options));
+            serving.slot_host = add(serving.slot_host, wide_bytes);
+            serving.slot_device = add(serving.slot_device, wide_bytes);
             // Future commitments exclude the already resident primary stack and tiled arenas.
             auto slot_metadata = known_prefill_plan->host_metadata_payload_bytes;
             for (const auto& tail : known_tail_plans) slot_metadata = add(slot_metadata, tail->host_metadata_payload_bytes);
@@ -4610,10 +4630,13 @@ static int run_decode_entry(
                 ? capacity.slots : 0U;
             const bool pool_fallback = !single_route && !batch_slots &&
                 qsa_mtp_pool_single_fallback_pending(options, strix::qpf2k::has_gsq_gate(manifest));
-            options.http_batch = static_cast<std::uint32_t>(batch_slots);
+            resolve_batch_cache_scheduler(options, requested_environment, static_cast<std::uint32_t>(batch_slots));
             if (pool_fallback) {
                 // Batch sizing excluded the pool; the single runner keeps it only if its one slot still fits with it.
-                const auto single = resolve_http_bridge_capacity(retained, prompt_memory.serving(options),
+                auto single_serving = prompt_memory.serving(options);
+                single_serving.slot_host = add(single_serving.slot_host, wide_bytes);
+                single_serving.slot_device = add(single_serving.slot_device, wide_bytes);
+                const auto single = resolve_http_bridge_capacity(retained, single_serving,
                     fit_host, fit_device, headroom, headroom, 1U);
                 options.qsa_mtp_pool_fallback_unfit = !single.slots;
                 std::cerr << "qsa-mtp-pool single-fallback enabled=" << (single.slots ? 1 : 0) << " reserved_bytes="

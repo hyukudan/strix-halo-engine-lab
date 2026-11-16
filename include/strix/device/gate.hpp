@@ -124,4 +124,15 @@ struct CommandLine {
 };
 [[nodiscard]] CommandLine take_command_line(int& argc, char** argv);
 
+// True when the command line asks for help (`--help` or `-h`). A main that prints its usage and exits before its
+// gate call answers on a machine without a visible GPU (package smoke tests, containers). The gate itself never
+// skips the bind: a main that goes on past it would bind lazily later.
+[[nodiscard]] inline bool wants_help(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view a = argv[i];
+        if (a == "--help" || a == "-h") return true;
+    }
+    return false;
+}
+
 } // namespace strix::device
