@@ -24,6 +24,12 @@ def function(marker):
         end += 1
     return source[start:end]
 
+# PR720: exercise the actual allocation transaction with fault-injected HIP allocation.
+(out / "shared_dev.inc").write_text("template <typename T>\n" + function("struct Dev {") + ";\n")
+start = source.index("                        if (m.sh_gate.n <")
+end = source.index("                        for (std::uint32_t r = 0; r < no;", start)
+(out / "shared_alloc.inc").write_text(source[start:end])
+
 
 methods = function("bool flash_attn_at(") + "\n"
 if "void prepare_flash_mirrors()" in source:
@@ -58,7 +64,10 @@ assert end < source.index('hipEventRecord(m.chunk_ready, st)', end)
 source = read("src/core/f16_dense_q8a8.hpp")
 (out / "parts.inc").write_text(function("inline void enqueue_parts("))
 source = read("src/hip_ds41_layer.hip")
-(out / "dense.inc").write_text(function("static bool enqueue_fast_dense("))
+helper = function("static strix::core::f16_dense_tall::q8a8::View fast_dense_view(") if "::View fast_dense_view(" in source else ""
+(out / "dense.inc").write_text(helper + "\n" + function("static bool enqueue_fast_dense(") + "\n" +
+                              function("bool q8_0_a8_fast_core_supported(") + "\n" +
+                              function("bool enqueue_q8_0_a8_fast_core("))
 (out / "fast_dense_on.inc").write_text(function("static bool fast_dense_on()"))
 source = read("src/hip_ds41_prefill.hip")
 (out / "fast_moe.inc").write_text(function("bool fast_moe() {"))

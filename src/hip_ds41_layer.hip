@@ -3319,15 +3319,19 @@ static bool fast_dense_on() {
     // a running DevicePrefill's own precision first (strix/ds41_prefill_precision.hpp), else the override or env
     return effective_fast(&PrefillPrecision::fast_dense, fast_dense_mode, env);
 }
-static bool enqueue_fast_dense(const Q8A8DensePrefillView& v, void* stream) {
-    static const unsigned min_rows = fast_profile::dense_min_rows();
-    namespace q8a8 = strix::core::f16_dense_tall::q8a8;
-    q8a8::View f{};
+static strix::core::f16_dense_tall::q8a8::View fast_dense_view(const Q8A8DensePrefillView& v) {
+    strix::core::f16_dense_tall::q8a8::View f{};
     f.weight = v.weight, f.codes = v.codes, f.deltas = v.deltas, f.out = v.out;
     f.row_bytes = (v.row_width ? v.row_width : v.width) / 32U * 34U;
     f.k_bytes = v.k_offset / 32U * 34U;
     f.in = v.width, f.count = v.count, f.rows = v.rows, f.x_stride = v.x_stride, f.out_stride = v.out_stride;
     f.accumulate = v.accumulate ? 1U : 0U;
+    return f;
+}
+static bool enqueue_fast_dense(const Q8A8DensePrefillView& v, void* stream) {
+    static const unsigned min_rows = fast_profile::dense_min_rows();
+    namespace q8a8 = strix::core::f16_dense_tall::q8a8;
+    const auto f = fast_dense_view(v);
     if (v.rows < min_rows || !q8a8::supported(f)) return false;
     q8a8::enqueue_parts(f, v.k_parts, as_stream(stream));
     hip_check(hipGetLastError(), "Q8_0 x A8 FP16 dense launch");

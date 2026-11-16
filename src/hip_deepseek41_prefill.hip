@@ -672,6 +672,7 @@ struct DevicePrefill::Impl {
     Dev<std::int32_t> sh_sums;
     // FAST shared expert (ds41-shared-f16-v1): FP32 gate / up of one pass of at most kSharedFastRows rows (allocated on first use)
     Dev<float> sh_gate, sh_up;
+    const unsigned fast_shared_min_rows = ds41::fast_profile::dense_min_rows();
     // world 2: half sums of every row; TP attention: this rank's and the peer's wo_b K-half of a chunk
     Dev<float> half_own, half_other, y_own, y_other;
     // head (last row)
@@ -3284,7 +3285,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 // dense core into FP32, the exact epilogue swiglu_a8 (clamped SwiGLU + A8 of the activations, the CUDA FAST form),
                 // then down on the same core into this rank's shared rows. Below the FAST dense row floor, or for a view the
                 // core does not take, the exact expert kernels below (the whole expert in one form).
-                if (m.options.fast_shared && no >= ds41::fast_profile::dense_min_rows()) {
+                if (m.options.fast_shared && no >= m.fast_shared_min_rows) {
                     constexpr std::uint32_t kSharedFastRows = 2048U;
                     const std::uint32_t pass = std::min(no, kSharedFastRows);
                     const auto product = [&](const std::uint8_t* weight, std::uint32_t width, std::uint32_t count, const std::int8_t* codes,
@@ -3310,9 +3311,11 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     if (ds41::q8_0_a8_fast_core_supported(product(wg, H, I, xc, xd, out, pass)) &&
                         ds41::q8_0_a8_fast_core_supported(product(wu, H, I, xc, xd, out, pass)) &&
                         ds41::q8_0_a8_fast_core_supported(product(wd, I, H, m.sh_codes.p, m.sh_deltas.p, out, no))) {
-                        if (m.sh_gate.n < std::size_t{kSharedFastRows} * I) {
-                            m.sh_gate = Dev<float>(std::size_t{kSharedFastRows} * I);
-                            m.sh_up = Dev<float>(std::size_t{kSharedFastRows} * I);
+                        if (m.sh_gate.n < std::size_t{kSharedFastRows} * I || m.sh_up.n < std::size_t{kSharedFastRows} * I) {
+                            // Commit only after both allocations succeed, so a caught failure is retryable.
+                            Dev<float> gate(std::size_t{kSharedFastRows} * I), up(std::size_t{kSharedFastRows} * I);
+                            m.sh_gate = std::move(gate);
+                            m.sh_up = std::move(up);
                         }
                         for (std::uint32_t r = 0; r < no; r += kSharedFastRows) {
                             const std::uint32_t n = std::min(kSharedFastRows, no - r);
