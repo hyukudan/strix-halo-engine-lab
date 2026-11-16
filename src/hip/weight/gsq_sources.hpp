@@ -71,7 +71,7 @@ template<std::uint32_t T,class Arch>
 struct OperandSource<GsqTag<T>,F16TileTag,Arch,GsqF16Arithmetic> {
     static_assert(::strix::gsq_a8::iq_type(T)||T==::strix::gsq_a8::type_q2_0);
     using View=MatrixView;
-    template<unsigned TPC> using Block=gsq_detail::F16Block<T,TPC,Arch>;
+    template<unsigned TPC> using Block=gsq_detail::F16Block<T,TPC>;  // gfx1151 instructions (gsq_f16_codec.hpp)
     static constexpr unsigned group_k=32,alignment=4,shared_bytes=Block<1>::table_bytes;
     static constexpr bool has_input_transform=false,has_output_transform=false;
     static constexpr std::uint32_t wire_type=T;

@@ -1,8 +1,12 @@
 #pragma once
 #include "strix/gsq_a8_groups.hpp"
 #include "strix/hip_ggml_weight_formats.hpp"
+#include "arch/gfx1151_gsq.hpp"
 #include <hip/hip_fp16.h>
 namespace strix::weight::hip::gsq_detail {
+// The incumbent gfx1151 FP16 pair/mix instructions. Bound by one alias, not a template parameter: templating the
+// group structs on the instruction policy changed the scheduling of the IQ4_XS F16 prefill kernels.
+using Instructions=::strix::weight::hip::GsqGfx1151;
 namespace gsq_a8=::strix::gsq_a8;
 namespace hip_ggml=::strix::hip_ggml;
 // GSQ routed-expert weight decoders of the prefill kernels (hip_moe_gsq_f16_prefill.inc, hip_moe_gsq_wmma_prefill.inc).
@@ -25,7 +29,6 @@ __device__ __forceinline__ GsqQ20Raw gsq_q20_fetch(const unsigned char* row,unsi
     return {{v.x,v.y,v.z,v.w,last}};
 }
 // Low (lt) and high (ht) bytes of the block's four FP16 values round_f16(d * float(q - 1)), byte q = value q.
-template<class Instructions>
 __device__ __forceinline__ void gsq_q20_tables(unsigned d_bits,unsigned& lt,unsigned& ht) {
     const float d=__half2float(__ushort_as_half(static_cast<unsigned short>(d_bits)));
     const unsigned v01=Instructions::f16_pair(d*-1.0F,d*0.0F),v23=Instructions::f16_pair(d*1.0F,d*2.0F);
@@ -43,11 +46,11 @@ __device__ __forceinline__ void gsq_q20_word(unsigned w,unsigned lt,unsigned ht,
     out[4]=pair(p1,0x05010400U);out[5]=pair(q1,0x05010400U);out[6]=pair(p1,0x07030602U);out[7]=pair(q1,0x07030602U);
 }
 // FP16 weights of a thread's share of Q2_0 block `block`: 64/TPC halves from half 64/TPC*part, as 8/TPC uint4.
-template<unsigned TPC,class Instructions>
+template<unsigned TPC>
 __device__ __forceinline__ void gsq_q20_halves(const GsqQ20Raw& r,unsigned block,unsigned part,uint4 (&out)[8U/TPC]) {
     const unsigned odd=block&1U,select=odd?0x07060504U:0x05040302U;
     unsigned lt,ht;
-    gsq_q20_tables<Instructions>(odd?r.w[0]>>16U:r.w[0]&65535U,lt,ht);
+    gsq_q20_tables(odd?r.w[0]>>16U:r.w[0]&65535U,lt,ht);
     // Code dword k = bytes 4k..4k+3 of the codes: dwords k, k + 1 of the raw words (part 1 of two: k = 2, 3).
     unsigned w[4U/TPC+1U];
     if constexpr(TPC==1U){
@@ -89,13 +92,11 @@ __device__ __forceinline__ void gsq_ld_field(const unsigned char* p,unsigned byt
     for(unsigned k=0;k<N;++k)out[k]=4U*k<span?gsq_ld(p+4U*k):0U;
 }
 // FP16 pairs of four magnitudes (bytes of mags, each < 128) with their sign bits (bit j of signs = byte j negative).
-template<class Instructions>
 __device__ __forceinline__ uint2 gsq_signed_pairs(unsigned mags,unsigned signs,float a2) {
     const unsigned neg=((signs*0x00204081U)&0x01010101U)<<7U;
     return {Instructions::f16_mix_pair(a2,__builtin_amdgcn_perm(neg,mags,0x05010400U),-0.0F),Instructions::f16_mix_pair(a2,__builtin_amdgcn_perm(neg,mags,0x07030602U),-0.0F)};
 }
 // FP16 pairs of four IQ4 nibbles (bytes 0..15): kvalues_iq4nl = -127 -104 -83 -65 -49 -35 -22 -10 | 1 13 25 38 53 69 89 113.
-template<class Instructions>
 __device__ __forceinline__ uint2 gsq_iq4_pairs(unsigned nibbles,float a2) {
     const unsigned idx=nibbles&0x07070707U;
     const unsigned neg_mag=__builtin_amdgcn_perm(0x0A162331U,0x4153687FU,idx),pos_mag=__builtin_amdgcn_perm(0x71594535U,0x26190D01U,idx);
@@ -106,8 +107,8 @@ __device__ __forceinline__ uint2 gsq_iq4_pairs(unsigned nibbles,float a2) {
 __device__ __forceinline__ float gsq_half(unsigned bits){return __half2float(__ushort_as_half(static_cast<unsigned short>(bits)));}
 // One 32-weight group of a GSQ weight row as 4 uint4 of FP16 (K order). Policy per type: Raw (the loaded dwords),
 // fetch(row, group) (global loads only), convert(raw, group, tables, out); tables: LDS grid bytes and its loader.
-template<std::uint32_t T,class Instructions> struct F16Group;
-template<class Instructions> struct F16Group<gsq_a8::type_iq3_s,Instructions> {  // d, qs[64], qh[8], signs[32], scales[4]; 110 B per 256
+template<std::uint32_t T> struct F16Group;
+template<> struct F16Group<gsq_a8::type_iq3_s> {  // d, qs[64], qh[8], signs[32], scales[4]; 110 B per 256
     static constexpr unsigned table_bytes=512U*4U;
     struct Raw { unsigned d,qs[3],qh,sg[2],sc; };
     __device__ static void load_tables(unsigned* t,unsigned i,unsigned n){for(unsigned k=i;k<512U;k+=n)t[k]=hip_ggml::iq3s_grid[k];}
@@ -127,14 +128,14 @@ template<class Instructions> struct F16Group<gsq_a8::type_iq3_s,Instructions> { 
 #pragma unroll
         for(unsigned m=0;m<8U;++m) {
             const unsigned idx=(((m<4U?q0:q1)>>(8U*(m&3U)))&255U)|(((qh>>m)&1U)<<8U);
-            const uint2 p=gsq_signed_pairs<Instructions>(grid[idx],(signs>>(4U*m))&15U,a2);
+            const uint2 p=gsq_signed_pairs(grid[idx],(signs>>(4U*m))&15U,a2);
             pairs[2U*m]=p.x;pairs[2U*m+1U]=p.y;
         }
 #pragma unroll
         for(unsigned q=0;q<4U;++q)out[q]={pairs[4U*q],pairs[4U*q+1U],pairs[4U*q+2U],pairs[4U*q+3U]};
     }
 };
-template<class Instructions> struct F16Group<gsq_a8::type_iq3_xxs,Instructions> {  // d, qs[64] grid indices, 8 x u32 scale (4 bits) and 4 x 7-bit signs; 98 B
+template<> struct F16Group<gsq_a8::type_iq3_xxs> {  // d, qs[64] grid indices, 8 x u32 scale (4 bits) and 4 x 7-bit signs; 98 B
     static constexpr unsigned table_bytes=256U*4U;
     struct Raw { unsigned d,qs[3],aux[2]; };
     __device__ static void load_tables(unsigned* t,unsigned i,unsigned n){for(unsigned k=i;k<256U;k+=n)t[k]=hip_ggml::iq3xxs_grid[k];}
@@ -156,7 +157,7 @@ template<class Instructions> struct F16Group<gsq_a8::type_iq3_xxs,Instructions> 
 #pragma unroll
             for(unsigned h=0;h<2U;++h) {
                 const unsigned m=2U*l+h,idx=((m<4U?q0:q1)>>(8U*(m&3U)))&255U;
-                const uint2 p=gsq_signed_pairs<Instructions>(grid[idx],(sb>>(4U*h))&15U,a2);
+                const uint2 p=gsq_signed_pairs(grid[idx],(sb>>(4U*h))&15U,a2);
                 pairs[2U*m]=p.x;pairs[2U*m+1U]=p.y;
             }
         }
@@ -164,7 +165,7 @@ template<class Instructions> struct F16Group<gsq_a8::type_iq3_xxs,Instructions> 
         for(unsigned q=0;q<4U;++q)out[q]={pairs[4U*q],pairs[4U*q+1U],pairs[4U*q+2U],pairs[4U*q+3U]};
     }
 };
-template<class Instructions> struct F16Group<gsq_a8::type_iq2_s,Instructions> {  // d, qs[64] (32 grid low bytes + 32 sign bytes), qh[8], scales[8]; 82 B
+template<> struct F16Group<gsq_a8::type_iq2_s> {  // d, qs[64] (32 grid low bytes + 32 sign bytes), qh[8], scales[8]; 82 B
     static constexpr unsigned table_bytes=1024U*8U;
     struct Raw { unsigned d,qs[2],sg[2],qh,sc; };
     __device__ static void load_tables(unsigned* t,unsigned i,unsigned n) {
@@ -187,14 +188,14 @@ template<class Instructions> struct F16Group<gsq_a8::type_iq2_s,Instructions> { 
         for(unsigned l=0;l<4U;++l) {
             const unsigned idx=((q>>(8U*l))&255U)|(((qh>>(2U*l))&3U)<<8U),sb=(signs>>(8U*l))&255U;
             const float a2=l<2U?a0:a1;
-            const uint2 lo=gsq_signed_pairs<Instructions>(grid[2U*idx],sb&15U,a2),hi=gsq_signed_pairs<Instructions>(grid[2U*idx+1U],sb>>4U,a2);
+            const uint2 lo=gsq_signed_pairs(grid[2U*idx],sb&15U,a2),hi=gsq_signed_pairs(grid[2U*idx+1U],sb>>4U,a2);
             pairs[4U*l]=lo.x;pairs[4U*l+1U]=lo.y;pairs[4U*l+2U]=hi.x;pairs[4U*l+3U]=hi.y;
         }
 #pragma unroll
         for(unsigned k=0;k<4U;++k)out[k]={pairs[4U*k],pairs[4U*k+1U],pairs[4U*k+2U],pairs[4U*k+3U]};
     }
 };
-template<class Instructions> struct F16Group<gsq_a8::type_iq4_xs,Instructions> {  // d, scales_h (u16), scales_l[4], qs[128]; 136 B (dword-aligned)
+template<> struct F16Group<gsq_a8::type_iq4_xs> {  // d, scales_h (u16), scales_l[4], qs[128]; 136 B (dword-aligned)
     static constexpr unsigned table_bytes=0U;
     struct Raw { unsigned head,sl,qs[4]; };
     __device__ static void load_tables(unsigned*,unsigned,unsigned){}
@@ -210,13 +211,13 @@ template<class Instructions> struct F16Group<gsq_a8::type_iq4_xs,Instructions> {
         unsigned lo[8],hi[8];
 #pragma unroll
         for(unsigned k=0;k<4U;++k) {
-            const uint2 a=gsq_iq4_pairs<Instructions>(r.qs[k]&0x0f0f0f0fU,a2),b=gsq_iq4_pairs<Instructions>((r.qs[k]>>4U)&0x0f0f0f0fU,a2);
+            const uint2 a=gsq_iq4_pairs(r.qs[k]&0x0f0f0f0fU,a2),b=gsq_iq4_pairs((r.qs[k]>>4U)&0x0f0f0f0fU,a2);
             lo[2U*k]=a.x;lo[2U*k+1U]=a.y;hi[2U*k]=b.x;hi[2U*k+1U]=b.y;
         }
         out[0]={lo[0],lo[1],lo[2],lo[3]};out[1]={lo[4],lo[5],lo[6],lo[7]};out[2]={hi[0],hi[1],hi[2],hi[3]};out[3]={hi[4],hi[5],hi[6],hi[7]};
     }
 };
-template<class Instructions> struct F16Group<gsq_a8::type_iq4_nl,Instructions> {  // d, qs[16]; 18 B per 32 (the five dwords of gsq_q20_fetch)
+template<> struct F16Group<gsq_a8::type_iq4_nl> {  // d, qs[16]; 18 B per 32 (the five dwords of gsq_q20_fetch)
     static constexpr unsigned table_bytes=0U;
     using Raw=GsqQ20Raw;
     __device__ static void load_tables(unsigned*,unsigned,unsigned){}
@@ -228,7 +229,7 @@ template<class Instructions> struct F16Group<gsq_a8::type_iq4_nl,Instructions> {
 #pragma unroll
         for(unsigned k=0;k<4U;++k) {
             const unsigned w=__builtin_amdgcn_perm(r.w[k+1U],r.w[k],select);
-            const uint2 a=gsq_iq4_pairs<Instructions>(w&0x0f0f0f0fU,a2),b=gsq_iq4_pairs<Instructions>((w>>4U)&0x0f0f0f0fU,a2);
+            const uint2 a=gsq_iq4_pairs(w&0x0f0f0f0fU,a2),b=gsq_iq4_pairs((w>>4U)&0x0f0f0f0fU,a2);
             lo[2U*k]=a.x;lo[2U*k+1U]=a.y;hi[2U*k]=b.x;hi[2U*k+1U]=b.y;
         }
         out[0]={lo[0],lo[1],lo[2],lo[3]};out[1]={lo[4],lo[5],lo[6],lo[7]};out[2]={hi[0],hi[1],hi[2],hi[3]};out[3]={hi[4],hi[5],hi[6],hi[7]};
@@ -237,8 +238,8 @@ template<class Instructions> struct F16Group<gsq_a8::type_iq4_nl,Instructions> {
 
 // B operands of the FP16 kernels: thread part `part` of TPC fills 64/TPC halves of a K64 step of its weight row. Q2_0: one
 // block per step, the part's halves of it; the 32-weight group types: groups 2*step + part (TPC 2) or both (TPC 1).
-template<std::uint32_t W,unsigned TPC,class Instructions> struct F16Block {
-    using G=F16Group<W,Instructions>;
+template<std::uint32_t W,unsigned TPC> struct F16Block {
+    using G=F16Group<W>;
     static constexpr unsigned table_bytes=G::table_bytes;
     struct Raw { typename G::Raw g[2U/TPC]; };
     __device__ static void load_tables(unsigned* t,unsigned i,unsigned n){G::load_tables(t,i,n);}
@@ -257,12 +258,12 @@ template<std::uint32_t W,unsigned TPC,class Instructions> struct F16Block {
     }
     __device__ static uint4 raw4(const Raw& r){uint4 v{};__builtin_memcpy(&v,&r,sizeof(v)<sizeof(r)?sizeof(v):sizeof(r));return v;}
 };
-template<unsigned TPC,class Instructions> struct F16Block<gsq_a8::type_q2_0,TPC,Instructions> {
+template<unsigned TPC> struct F16Block<gsq_a8::type_q2_0,TPC> {
     static constexpr unsigned table_bytes=0U;
     using Raw=GsqQ20Raw;
     __device__ static void load_tables(unsigned*,unsigned,unsigned){}
     __device__ static void fetch(const unsigned char* row,unsigned step,unsigned,Raw& r){r=gsq_q20_fetch(row,step);}
-    __device__ static void convert(const Raw& r,unsigned step,unsigned part,const unsigned*,uint4 (&out)[8U/TPC]){gsq_q20_halves<TPC,Instructions>(r,step,part,out);}
+    __device__ static void convert(const Raw& r,unsigned step,unsigned part,const unsigned*,uint4 (&out)[8U/TPC]){gsq_q20_halves<TPC>(r,step,part,out);}
     __device__ static uint4 raw4(const Raw& r){return {r.w[0],r.w[1],r.w[2],r.w[3]};}
 };
 

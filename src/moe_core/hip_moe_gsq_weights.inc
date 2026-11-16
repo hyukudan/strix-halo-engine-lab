@@ -14,12 +14,9 @@
 namespace gsq_detail=::strix::weight::hip::gsq_detail;
 using gsq_detail::GsqQ20Raw;
 using gsq_detail::gsq_q20_fetch;
-template<unsigned TPC>
-__device__ __forceinline__ void gsq_q20_halves(const GsqQ20Raw& r,unsigned block,unsigned part,uint4 (&out)[8U/TPC]) {
-    gsq_detail::gsq_q20_halves<TPC,::strix::weight::hip::GsqGfx1151>(r,block,part,out);
-}
-template<std::uint32_t T> using GsqGroup=gsq_detail::F16Group<T,::strix::weight::hip::GsqGfx1151>;
-template<std::uint32_t W,unsigned TPC> using GsqB=gsq_detail::F16Block<W,TPC,::strix::weight::hip::GsqGfx1151>;
+using gsq_detail::gsq_q20_halves;
+template<std::uint32_t T> using GsqGroup=gsq_detail::F16Group<T>;
+template<std::uint32_t W,unsigned TPC> using GsqB=gsq_detail::F16Block<W,TPC>;
 // IQ decoder self-test (gsq_iq_decode_selftest): rows of `width` weights of type T (2560 for the 256-weight types, 640
 // for IQ4_NL), block b with random bytes and FP16 scale bits (b + seed) & 65535; every 32-weight group decoded through
 // GsqGroup<T> (LDS grids) against round_f16(hip_ggml::block_element<T>) (bitwise; a NaN reference requires a NaN).
