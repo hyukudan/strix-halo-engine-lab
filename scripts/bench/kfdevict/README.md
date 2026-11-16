@@ -14,3 +14,10 @@ unprivileged user can read.
 
 Reading: an eviction is harmless outside timed windows; inside them its restore time adds to the measurement. Trigger
 USERPTR / SVM with compaction or reclaim in the 2 s before it = page migration of host memory the GPU maps.
+
+| file | what it does | run |
+|---|---|---|
+| `upsum.py` | kfdevmon userptr allocations grouped by (size, first engine frame) with first/last time; `ALIVE_AT=s` lists the BOs alive at that moment (exposed to page migration during a window). Resolve frames with `addr2line -f -C -e BIN +OFF`. | `python3 upsum.py MONFILE` |
+| `postload.py` | Rank-0 userptr allocations made after the weight load ended (load time from `r0.log`): lazily loaded code objects and transient pins inside the timed prefills. | `python3 postload.py RUNDIR` |
+| `evprof.py` | Evictions per time bucket of an `evsample` log with MemAvailable / page cache and the reclaim, swap-out and compaction counters beside them (load-phase vs window, own vs foreign pressure). | `python3 evprof.py EVLOG [BUCKET_S]` |
+| `cached.py` | Page-cache resident bytes per file under the given directories (mincore, read-only, no root): whose files fill the cache before a load. | `python3 cached.py DIR...` |
