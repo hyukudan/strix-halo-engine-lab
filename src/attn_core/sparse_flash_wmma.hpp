@@ -62,7 +62,9 @@
 
 #include <hip/hip_runtime.h>
 
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -294,7 +296,11 @@ inline const char* flash_pf_reason(unsigned max_keys = ~0U) {
 }
 template <class P, unsigned T> inline void launch_flash_rows(const typename P::Args& a, unsigned grid, hipStream_t s, unsigned max_keys = ~0U) {
     constexpr unsigned threads = Geometry<P::kHeads, P::kDim, T>::kThreads;
-    if (flash_pf_enabled(max_keys)) flash_rows_kernel<P, T, true><<<grid, threads, 0, s>>>(a);
+    static std::atomic<int> shown{-1};  // print the decision (and its reason) whenever it changes
+    const bool pf = flash_pf_enabled(max_keys);
+    if (shown.exchange(pf ? 1 : 0, std::memory_order_relaxed) != (pf ? 1 : 0))
+        std::fprintf(stderr, "attn_core flash T %u: pipelined loads %s\n", T, flash_pf_reason(max_keys));
+    if (pf) flash_rows_kernel<P, T, true><<<grid, threads, 0, s>>>(a);
     else flash_rows_kernel<P, T, false><<<grid, threads, 0, s>>>(a);
 }
 
