@@ -52,7 +52,8 @@ void fixture(unsigned m,unsigned n,unsigned k) {
         "unqualified backend must reject native FP4");
 }
 }
-int main() try {
+namespace strix::weight::test {
+bool cuda_nvfp4_case() try {
     int current=-1;check(cudaGetDevice(&current));require(current==0,"native FP4 fixture requires device index zero");
     int major=0,minor=0;check(cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,0));
     check(cudaDeviceGetAttribute(&minor,cudaDevAttrComputeCapabilityMinor,0));
@@ -60,8 +61,12 @@ int main() try {
         source::Nvfp4Arguments args{};strix::weight::ExecutionContext context{};context.backend=strix::weight::Backend::cuda;
         require(source::enqueue_nvfp4(args,nullptr,0,context).code==strix::weight::Error::unavailable_isa,
             "non-SM120 launch must return unavailable_isa");
-        std::cerr<<"non-SM120 rejection PASS; positive SM120 qualification is mandatory separately\n";return 1;
+        std::cerr<<"non-SM120 rejection PASS; positive SM120 qualification is mandatory separately\n";return false;
     }
     fixture(1,7,64);fixture(3,65,128);fixture(9,33,64);fixture(65,65,128);
-    std::cout<<"native FP4 shared source: legacy_bitwise forwarding and FAST scalar tolerance PASS\n";return 0;
-}catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
+    std::cout<<"native FP4 shared source: legacy_bitwise forwarding and FAST scalar tolerance PASS\n";return true;
+}catch(const std::exception& error){std::cerr<<error.what()<<'\n';return false;}
+}
+#ifdef STRIX_WFMT_NVFP4_STANDALONE
+int main(){return strix::weight::test::cuda_nvfp4_case()?0:1;}
+#endif
