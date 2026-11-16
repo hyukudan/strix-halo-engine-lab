@@ -147,8 +147,8 @@ void run_case(const char* name, std::uint64_t last, unsigned rows, unsigned head
         flash_ms = timing([&] { g::enqueue_attention_flash_prefill(vf, nullptr); });
         const auto gf = dout.get();
         ef = compare(ref, gf);
-        std::printf("%-22s flash_ms=%.4f speedup=%.2f rel_l2=%.3g max_abs=%.3g nonfinite=%zu\n", name, flash_ms, flash_ms > 0.0F ? exact_ms / flash_ms : 0.0F,
-                    ef.rel_l2, ef.max_abs, ef.nonfinite);
+        std::printf("%-22s flash_ms=%.4f speedup=%.2f rel_l2=%.3g max_abs=%.3g nonfinite=%zu flash_bits=%016llx\n", name, flash_ms,
+                    flash_ms > 0.0F ? exact_ms / flash_ms : 0.0F, ef.rel_l2, ef.max_abs, ef.nonfinite, bits_hash(gf));
         // Declared limit of the BF16 operands (8 significant bits): the score error is about 2^-9 of the score's size, so
         // inputs with scores of hundreds (window scales above 134, |q| of 1e5) are reported, not bounded. The real
         // inputs are bounded by the FAST logit gate, not by this test.
