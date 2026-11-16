@@ -619,6 +619,50 @@ void test_apply() {
     }
 }
 
+// TURBO product profile: '--profile turbo' of rank and serve (exported as STRIX_MM_PRODUCT_PROFILE by print_or_apply)
+// resolves once; its cache identity is minimax-turbo-v1 even with every row off; the timing session moved to
+// --timing-profile with the old spelling kept; an unhonoured weight request is visible and refused.
+void test_turbo_product_profile() {
+    const EnvMap plain, turbo{{md::kProductProfileEnv, "turbo"}};
+    const auto pr = md::profile_resolution(lookup(turbo));
+    check(pr.is_turbo() && pr.versioned() == "minimax-turbo-v1", "turbo: versioned name");
+    check(md::prefill_identity(lookup(plain)).empty(), "turbo: default cache identity unchanged");
+    check(md::prefill_identity(lookup(turbo)).find("turbo=minimax-turbo-v1") != std::string::npos,
+          "turbo: cache identity carries the turbo namespace with every row off");
+    check(pr.fingerprint() != md::profile_resolution(lookup(plain)).fingerprint(), "turbo: ranks never agree with default");
+    const md::Cli rank = md::parse_cli("rank", {"/m", "0", "usb4gpu", "/o"}), serve = md::parse_cli("serve", {"/m"});
+    const auto rank_text = md::effective_config(rank, lookup(turbo)), serve_text = md::effective_config(serve, lookup(turbo));
+    const auto profile_lines = [](const std::string& text) {
+        std::string out;
+        std::size_t at = 0;
+        while ((at = text.find("profile.", at)) != std::string::npos) {
+            const auto end = text.find('\n', at);
+            out += text.substr(at, end - at) + "|";
+            at = end;
+        }
+        return out;
+    };
+    check(!profile_lines(rank_text).empty() && profile_lines(rank_text) == profile_lines(serve_text),
+          "turbo: rank and serve print the same profile resolution");
+    std::string timing;
+    std::vector<std::string> values{"turbo"};
+    auto next = [&]() { auto v = values.back(); values.pop_back(); return v; };
+    check(md::product_option("--profile", next, &timing) && timing.empty(), "turbo: --profile NAME is the product profile");
+    values = {"s:prompt.u32:8"};
+    check(md::product_option("--profile", next, &timing) && timing == "s:prompt.u32:8", "turbo: old timing spelling kept");
+    values = {"t:prompt.u32:4"};
+    timing.clear();
+    check(md::product_option("--timing-profile", next, &timing) && timing == "t:prompt.u32:4", "turbo: --timing-profile");
+    values = {"s:prompt.u32:8"};
+    bool refused = false;
+    try { (void)md::product_option("--profile", next, nullptr); } catch (const std::invalid_argument&) { refused = true; }
+    check(refused, "turbo: serve refuses a timing spec as a product profile");
+    const EnvMap onfly{{md::kProductProfileEnv, "turbo"}, {"STRIX_TURBO_WEIGHTS", "onfly"}};
+    const auto w = md::profile_resolution(lookup(onfly)).weights;
+    check(!w.honoured() && md::effective_config(serve, lookup(onfly)).find("profile.weights_reason=pending") != std::string::npos,
+          "turbo: unbuilt onfly is printed as pending, never run silently");
+}
+
 // FAST prefill profile (mm_profile_table.hpp): bundle expansion, explicit-OFF precedence, FAST_I4 exclusion, legacy
 // field omission with every row OFF, rank agreement.
 void test_fast_prefill_profile() {
@@ -883,6 +927,7 @@ int main(int argc, char** argv) {
         test_apply();
         test_entry_points_host_defaults();
         test_fast_prefill_profile();
+        test_turbo_product_profile();
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << "\n";
         return 1;

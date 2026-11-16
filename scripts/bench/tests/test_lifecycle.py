@@ -290,6 +290,30 @@ if '--out' in a:
         self.assertTrue((self.d / "out/pair/prose-0.json").is_file())
         self.assertEqual(load(self.d / "out/pair/prose-0")["client_rc"], 0)
 
+    def test_peer_inputs_fail_fast(self):
+        # The mock peer sees this rank's input root under a second root: an input present only on this rank must
+        # stop the run before launch and name the path; inputs present on both ranks pass.
+        local, peerfs = self.d / "in", self.d / "peerfs"
+        for p in (local / "a.u32", local / "b.u32", peerfs / "a.u32"):
+            write(p, "x")
+        lb = self.bash("cd %s && pwd" % shlex.quote(local.as_posix())).stdout.strip()
+        pb = self.bash("cd %s && pwd" % shlex.quote(peerfs.as_posix())).stdout.strip()
+        self.shim("ssh", 'bash -c "$(printf %%s "${@: -1}" | sed "s#%s#%s#g")"' % (lb, pb))
+
+        def check(*args):
+            return self.bash("source scripts/bench/common/runlib.sh && kit_peer_inputs %s && echo PASSED" %
+                             " ".join(shlex.quote(a) for a in args))
+        r = check("a=%s/a.u32" % lb, "d:%s/a.u32:128" % lb, "--batch", "/nonexistent/x.u32:64:8")
+        self.assertEqual(r.returncode, 0, r.stderr[-800:])
+        self.assertIn("PASSED", r.stdout)
+        self.assertIn("peer inputs ok (2 paths)", r.stderr)
+        r = check("a=%s/a.u32" % lb, "--batch", "%s/b.u32:64:8" % lb)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertNotIn("PASSED", r.stdout)
+        self.assertIn("missing inputs: ", r.stderr)
+        self.assertIn("/b.u32", r.stderr)
+        self.assertNotIn("/a.u32", r.stderr)
+
     def test_minimax_seal_both_slices_and_absolute_rule(self):
         # The host installs NumPy in the user site. Only this test shim relaxes -I;
         # production launchers still require dependencies in their isolated interpreter.

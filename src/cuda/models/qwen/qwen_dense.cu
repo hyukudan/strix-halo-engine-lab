@@ -955,7 +955,7 @@ template <Store S> cudaError_t launch_project(cudaStream_t stream, const KSite& 
             if (attr2 == cudaSuccess)
                 attr2 = cudaFuncSetAttribute(project_tile2_kernel<S, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, kT2Smem);
             // Diagnostic (microbench only, scheduling-only): shared-memory carveout hint in percent for the tiled kernels.
-            if (const char* cv = std::getenv("STRIX_QRTX_DENSE_CARVEOUT"); attr2 == cudaSuccess && cv && cv[0]) {
+            if (const char* cv = strix::envcfg::text("STRIX_QRTX_DENSE_CARVEOUT"); attr2 == cudaSuccess && cv && cv[0]) {
                 const int pct = std::atoi(cv);
                 attr2 = cudaFuncSetAttribute(project_tile2_kernel<S, 2>, cudaFuncAttributePreferredSharedMemoryCarveout, pct);
                 if (attr2 == cudaSuccess)
@@ -968,7 +968,7 @@ template <Store S> cudaError_t launch_project(cudaStream_t stream, const KSite& 
         bool a16 = (k.width / 32U) % 8U == 0U;   // aligned window: row_bytes % 16 == 0 and 16-aligned segments
         for (std::uint32_t m = 0; m < k.nseg; ++m) a16 = a16 && (reinterpret_cast<std::uintptr_t>(k.seg[m].w) & 15U) == 0U;
         if (a16 && dense_t2_remap_enabled() && dense_t2_a16_enabled()) {
-            static const int ns = [] { const char* e = std::getenv("STRIX_QRTX_DENSE_T2_NS"); return e && e[0] ? std::atoi(e) : 2; }();
+            static const int ns = [] { const char* e = strix::envcfg::text("STRIX_QRTX_DENSE_T2_NS"); return e && e[0] ? std::atoi(e) : 2; }();
             if (ns == 4) project_tile2_kernel<S, 2, 4><<<grid, kThreads, 4 * kT2Stage, stream>>>(k, rows, codes, deltas, pitch);
             else if (ns == 3) project_tile2_kernel<S, 2, 3><<<grid, kThreads, 3 * kT2Stage, stream>>>(k, rows, codes, deltas, pitch);
             else project_tile2_kernel<S, 2><<<grid, kThreads, kT2Smem, stream>>>(k, rows, codes, deltas, pitch);
