@@ -170,7 +170,7 @@ Index::Index(const std::string& dir) {
         if(!status)throw std::runtime_error("GLM index: "+status.detail);
         const auto file=static_cast<std::uint32_t>(files_.size());files_.push_back(path);
         for(const auto& raw:index.tensors) {
-            TensorInfo t;t.dtype=raw.wire_dtype;t.shape.assign(raw.shape.dims.begin(),raw.shape.dims.begin()+raw.shape.rank);
+            TensorInfo t;t.dtype=raw.wire_dtype;t.shape=raw.extents;
             t.file=file;t.offset=raw.payload.range.offset;t.bytes=raw.payload.range.bytes;
             if(!tensors_.emplace(raw.name,std::move(t)).second)throw std::runtime_error("duplicate tensor "+raw.name);
             common.tensors.push_back(raw);

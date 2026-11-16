@@ -1108,6 +1108,7 @@ __device__ __forceinline__ float gdn_rows_tree_add(float lower, float upper) {
 }
 // qkv, z (and Q8 beta/alpha) segments from BF16 rows to BF16-rounded FP32 workspaces.
 template <unsigned Rows> struct GdnInputRowsSite {
+    static constexpr unsigned turbo_group = strix::onfly_i4::gdn_in;  // TURBO+ onfly INT4 g64 decode (q8_rows/iu4)
     static constexpr bool dense_trellis_inputs = true;
     using Input = std::uint16_t;
     static constexpr unsigned rows = Rows;
@@ -1128,6 +1129,7 @@ template <unsigned Rows> struct GdnInputRowsSite {
     }
 };
 template <unsigned Rows> struct GdnOutputRowsSite {
+    static constexpr unsigned turbo_group = strix::onfly_i4::gdn_out;  // TURBO+ onfly INT4 g64 decode (q8_rows/iu4)
     using Input = float;
     static constexpr unsigned rows = Rows;
     static constexpr bool fused_fma = true;  // Site::fma compiles to v_fmac_f32 (wide VOPD rows)

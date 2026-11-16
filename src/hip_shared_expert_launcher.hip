@@ -1613,6 +1613,7 @@ __device__ __forceinline__ float shared_rows_coefficient(unsigned scale, std::in
 }
 // gate then up (two segments) into each row's contiguous FP32 workspace.
 template <unsigned Rows> struct SharedGateUpRowsSite {
+    static constexpr unsigned turbo_group = strix::onfly_i4::shared_expert;  // TURBO+ onfly INT4 g64 decode (q8_rows/iu4)
     using Input = std::uint16_t;
     static constexpr unsigned rows = Rows;
     static constexpr bool fused_fma = true;  // Site::fma compiles to v_fmac_f32 (wide VOPD rows)
@@ -1627,6 +1628,7 @@ template <unsigned Rows> struct SharedGateUpRowsSite {
     __device__ void store(std::uint32_t out, unsigned r, float value) const { output[r][out] = value; }
 };
 template <unsigned Rows> struct SharedDownRowsSite {
+    static constexpr unsigned turbo_group = strix::onfly_i4::shared_expert;  // TURBO+ onfly INT4 g64 decode (q8_rows/iu4)
     using Input = float;
     static constexpr unsigned rows = Rows;
 #if defined(STRIX_EXPERIMENTAL_MALL_SHARED_DOWN_NT)

@@ -6,6 +6,7 @@
 //       [--max-positions 32768] [--bind 127.0.0.1] [--port 8090] [--api-key-file F] [--model-id ID]
 //       [--mtp-depth 7] [--min-p 0.7] [--max-queue 64] [--http-slots 4] [--prefill-chunk 1024|auto] [--prefill-overlap-rows 1024]
 //       [--admit-grace-ms 2] [--cohort-depth fair|max] [--slot-margin-mib 2048] [--block-rows N]
+//       [--expert-residency auto|full|tiered] [--vram-budget-gib N] [--print-effective-config]
 //       [--prefix-cache on|off] [--prefix-cache-block 256] [--prefix-cache-stride 16384]
 //       [--prefix-cache-host-mb N] [--prefix-cache-vram-mb 0]
 // Context cap: --max-positions P is the largest session (KV/index/pooled + MTP cache, 31,616 B per position + 233 MB).
@@ -29,10 +30,12 @@
 // Token-block prefix checkpoints restore exact prompt state before the remaining prefill rows.
 #include "strix/device/cuda_enumerator.hpp"
 #include "cuda_qwen_prefix_cache.hpp"
+#include "strix/mtp_depth_host.hpp"
 #include "cuda_qwen_serve_policy.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/cuda/qwen_cohort.hpp"
 #include "strix/cuda/qwen_prefill.hpp"
+#include "strix/residency/residency_cli.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/engine.hpp"
@@ -86,6 +89,7 @@ struct Options {
     double prefill_auto_k = 1.0;                // auto: target chunk time = k decode steps
     std::string cohort_depth = "fair";
     std::uint32_t slot_margin_mib = 2048;       // free VRAM that must remain after a new slot's session
+    bool print_effective_config = false;        // resolve (GGUF header + live card/host numbers), print, exit: no model load
     cuda_qwen_serve::SessionPolicy session;     // per-request session capacity (one resolver for both serve paths)
 };
 
@@ -97,6 +101,7 @@ Options parse(int argc, char** argv) {
     o.engine.release_by_layer = false;
     if (const char* v = std::getenv("STRIX_QRTX_HTTP_SLOTS")) o.http_slots = static_cast<std::uint32_t>(std::stoul(v));
     if (const char* v = std::getenv("STRIX_QRTX_SLOT_MARGIN_MIB")) o.slot_margin_mib = static_cast<std::uint32_t>(std::stoul(v));
+    strix::residency::CliOptions residency_cli;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         const auto next = [&]() -> std::string {
@@ -153,6 +158,7 @@ Options parse(int argc, char** argv) {
         else if (a == "--prefill-overlap-rows") o.prefill_overlap_rows = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--admit-grace-ms") o.admit_grace_ms = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--cohort-depth") o.cohort_depth = next();
+        else if (strix::residency::consume_cli_arg(a, next, residency_cli)) {}  // --expert-residency, --vram-budget-gib, --print-effective-config
         else if (a == "--slot-margin-mib") o.slot_margin_mib = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--block-rows") {
             const auto r = static_cast<std::uint32_t>(std::stoul(next()));
@@ -163,6 +169,8 @@ Options parse(int argc, char** argv) {
     }
     if (o.engine.model_gguf.empty() || o.engine.tables_dir.empty() || o.engine.rope_table.empty())
         throw std::invalid_argument("--model, --tables and --rope-table are required");
+    o.engine.residency = strix::residency::finish_cli(residency_cli);  // flags win over STRIX_EXPERT_RESIDENCY / STRIX_VRAM_BUDGET_GIB
+    o.print_effective_config = residency_cli.print_effective_config;
     if (const char* v = std::getenv("STRIX_QRTX_COHORT"); v && v[0] == '0') o.http_slots = 1;
     if (o.http_slots == 0) throw std::invalid_argument("--http-slots must be >= 1");
     if (const char* v = strix::envcfg::text("STRIX_QRTX_SESSION_RESERVE")) o.session.per_request = std::string(v) != "max";
@@ -243,20 +251,48 @@ public:
         st.finish = "length";
         bool first = true;
         std::vector<std::uint32_t> emitted;
+        // Measured-cost depth controller (STRIX_MTP_CONTROLLER=depth, shared with the HIP engine): picks the draft depth
+        // and the verified rows per window; committed ids are unchanged (greedy verify, row-count invariant).
+        strix::MtpDepthHost dh(o_.mtp_depth, o_.min_p, mtp && strix::mtp_depth_controller_enabled());
         while (st.generated_tokens < job.max_tokens) {
             if (pos + 1 >= cap) { st.finish = "context"; break; }
+            const auto tw = Clock::now();
             std::vector<std::uint32_t> rows{pending};
+            std::vector<float> probs;
             if (mtp) {
-                const auto d = e_.draft(pending, depth, o_.min_p);
+                const std::uint32_t want = dh.on() ? dh.plan(depth) : depth;
+                const auto td = Clock::now();
+                const auto d = e_.draft(pending, want, dh.on() ? dh.min_p() : o_.min_p);
+                if (dh.on()) {
+                    dh.note_draft(want,
+                                  std::chrono::duration<double, std::milli>(Clock::now() - td).count());
+                    probs = d.probability;
+                    if (probs.size() > d.tokens.size()) probs.resize(d.tokens.size());
+                }
                 rows.insert(rows.end(), d.tokens.begin(), d.tokens.end());
                 st.proposed += d.tokens.size();
             }
             const auto room = static_cast<std::uint32_t>(std::min<std::uint64_t>(rows.size(), cap - pos));
             rows.resize(room);
+            bool selected = false;
+            if (dh.on()) {
+                probs.resize(std::min<std::size_t>(probs.size(), rows.size() - 1));
+                if (probs.size() + 1 == rows.size()) {
+                    const auto before = rows.size();
+                    rows.resize(dh.select(probs));
+                    st.proposed -= before - rows.size();
+                    selected = true;
+                }  // 1 = serial step
+            }
             const auto r = e_.verify(rows.data(), static_cast<std::uint32_t>(rows.size()), pos);
             std::uint32_t keep = 1;
             while (keep < rows.size() && rows[keep] == r.argmax[keep - 1]) ++keep;
             e_.commit(keep);
+            if (dh.on()) {
+                if (selected) dh.finish(static_cast<std::uint32_t>(rows.size()), keep - 1,
+                    std::chrono::duration<double, std::milli>(Clock::now() - tw).count());
+                else dh.skip();
+            }
             ++st.cycles;
             st.accepted += keep - 1;
             pos += keep;
@@ -303,6 +339,7 @@ class CohortServer {
 public:
     CohortServer(qp::Prefill& engine, const Options& o, serve::GenerationQueue& queue, px::Cache& cache) : e_(engine), o_(o), queue_(queue), cache_(cache) {
         mtp_ = !o_.engine.mtp_sidecar_gguf.empty() && o_.mtp_depth > 0;
+        dh_ = std::make_unique<strix::MtpDepthHost>(std::min<std::uint32_t>(o_.mtp_depth, qc::kWindowRows - 1U), o_.min_p, mtp_ && strix::mtp_depth_controller_enabled());
         if (o_.prefill_overlap) e_.enable_prefill_overlap(o_.prefill_overlap_rows);
         // slot 0 is the engine's session 0 (re-sized per request, never released); the others get theirs at admission
         for (std::uint32_t i = 0; i < o.http_slots; ++i) {
@@ -413,9 +450,17 @@ private:
         bool first = true;
     };
 
-    static std::pair<std::uint64_t, std::uint64_t> vram() {
+    // Free/total VRAM. Tiered residency: the engine was sized to a budget, so the server never fills the card beyond it:
+    // free = min(card free, budget - what this process holds (engine + extra sessions)), total = the budget.
+    std::pair<std::uint64_t, std::uint64_t> vram() const {
         std::size_t free = 0, total = 0;
         if (cudaMemGetInfo(&free, &total) != cudaSuccess) { (void)cudaGetLastError(); return {0, 0}; }
+        if (const std::uint64_t budget = e_.card_budget_bytes()) {
+            const unsigned live = live_slots();
+            const std::uint64_t used = e_.engine_device_bytes() + (live > 1U ? live - 1U : 0U) * e_.session_bytes();
+            free = std::min<std::uint64_t>(free, budget > used ? budget - used : 0U);
+            total = std::min<std::uint64_t>(total, budget);
+        }
         return {free, total};
     }
     unsigned live_slots() const {
@@ -676,7 +721,9 @@ private:
         qc::StepOptions opt;
         opt.mtp = mtp_;
         opt.depth = std::min<std::uint32_t>(o_.mtp_depth, qc::kWindowRows - 1U);
-        opt.min_p = o_.min_p;
+        opt.min_p = dh_->on() ? dh_->min_p() : o_.min_p;
+        const bool lone = dh_->on() && mtp_ && live.size() == 1 && !inflight_;
+        if (lone) opt.depth = dh_->plan(opt.depth);
         opt.policy = qc::depth_policy_of(o_.cohort_depth);
         opt.max_positions = o_.engine.max_positions;
         std::vector<qc::StreamStep> r;
@@ -701,6 +748,8 @@ private:
                 finish(s, step.error, "length");
                 continue;
             }
+            if (lone) dh_->finish_fixed(opt.depth, step.tokens.size() - 1, std::chrono::duration<double, std::milli>(Clock::now() - ts).count(),
+                                        step.drafted == opt.depth && step.rows == opt.depth + 1U);
             ++s.st.cycles;
             s.st.proposed += step.drafted;
             s.st.accepted += step.tokens.size() - 1;
@@ -762,6 +811,7 @@ private:
     px::Cache& cache_;
     std::vector<Slot> slots_;
     bool mtp_ = false;
+    std::unique_ptr<strix::MtpDepthHost> dh_;  // measured-cost lone-stream depth (STRIX_MTP_CONTROLLER=depth)
     std::uint32_t max_chunk_ = 1024, auto_rows_ = 256, first_rows_ = 0, fit_n_ = 0, inflight_steps_ = 0;
     Slot* inflight_ = nullptr;  // overlap: the slot whose chunk is on the prefill stream
     double step_ms_ = 0, fit_[5] = {0, 0, 0, 0, 0}, fit_a_ = 0, fit_b_ = 0;
@@ -785,9 +835,18 @@ int main(int argc, char** argv) {
     // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
     strix::device::bind_cuda_main(argc, argv);
     try {
-        const auto o = parse(argc, argv);
+        auto o = parse(argc, argv);
+        if (o.print_effective_config) {
+            // No model load: the residency decision from the GGUF headers and the live card/host numbers.
+            const auto plan = qp::plan_residency(o.engine);
+            std::cout << "{\"model\":\"" << o.engine.model_gguf << "\",\"max_positions_requested\":" << o.engine.max_positions
+                      << ",\"residency\":" << plan.json << "}" << std::endl;
+            return plan.decision.ok ? 0 : 3;
+        }
         std::cerr << "strix-cuda-qwen-serve: loading " << o.engine.model_gguf << std::endl;
+        if (!o.engine.mtp_sidecar_gguf.empty() && o.mtp_depth > 0) std::cerr << "strix-cuda-qwen-serve: " << strix::mtp_depth_state_line(o.min_p) << ", mtp_depth=" << o.mtp_depth << std::endl;
         qp::Prefill engine(o.engine);
+        o.engine.max_positions = engine.max_positions();  // resolved limit for admission, cache and capabilities
         std::cerr << "strix-cuda-qwen-serve: loaded " << engine.describe() << std::endl;
         const auto tokenizer = serve::BpeTokenizer::load_gguf(o.engine.model_gguf);
         serve::ApiConfig config;
@@ -807,7 +866,9 @@ int main(int argc, char** argv) {
         config.state_cache_stats = [&prefix_cache] { return prefix_cache.stats_json(); };
         // /api/status names the bound device (id, UUID, PCI, attach) next to the prefix cache counters.
         const std::string device_json = strix::device::receipt_json(strix::device::bind_cuda());
-        config.status_extra = [&prefix_cache, device_json](serve::Json& status) {
+        config.status_extra = [&prefix_cache, device_json, &engine](serve::Json& status) {
+            status.set("expert_residency", serve::parse_json(engine.residency_json()));
+            status.set("expert_residency_receipt", serve::parse_json(engine.residency_receipt_json()));
             status.set("prefix_cache", serve::parse_json(prefix_cache.stats_json()));
             status.set("device", serve::parse_json(device_json));
         };
