@@ -114,3 +114,8 @@ The optional session check records the preceding revision's known aliased-shard
 failure and requires the candidate to pass. Generated fixtures, binaries, logs,
 provenance and byte receipts stay outside Git. The aliased-shard loader keeps all
 asset-receipt path references while indexing each opened physical file once.
+
+Both source arguments must be clean checkout roots whose HEAD is the requested
+revision. The driver verifies both commits and tree IDs before configuring either
+build, rejecting tracked edits, untracked files and dirty submodules. Keep build
+and receipt directories outside the source checkouts (or ignored).

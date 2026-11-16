@@ -8,7 +8,7 @@ Status bind_gemma4(const TensorIndex& index,WeightMap& out) {
     {"q_proj",Role::attention_q},{"attn_q",Role::attention_q},{"k_proj",Role::attention_k},{"attn_k",Role::attention_k},
     {"v_proj",Role::attention_v},{"attn_v",Role::attention_v},{"o_proj",Role::attention_o},{"attn_output",Role::attention_o},
     {"down",Role::dense_down},{"gate",Role::dense_gate},{"up",Role::dense_up}};
-    const detail::FamilySchema schema{"gemma4",linear,plain,roles,false,false,false,true};
+    const detail::FamilySchema schema{"gemma4",linear,plain,roles,false,false,false,true,{},false,false,"model.language_model.","lm_head.weight"};
     return detail::bind_model(index,schema,out);
 }
 }

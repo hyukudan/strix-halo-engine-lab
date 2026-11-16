@@ -26,8 +26,52 @@ TensorIndex fixture(std::vector<Fixture> fields) {
     TensorIndex index;check(bool(index_safetensors(memory_source(bytes,"schema-fixture"),index)),"schema fixture parses");return index;
 }
 std::vector<Byte> text_bytes(std::string_view text){return {reinterpret_cast<const Byte*>(text.data()),reinterpret_cast<const Byte*>(text.data()+text.size())};}
+void rank_bounds() {
+    auto index=fixture({{"x.weight","F32",{1},floats(1)}});
+    TensorBinding binding{};binding.tensor=index.tensors[0].id;binding.role=Role::dense_up;
+    binding.logical_shape=index.tensors[0].shape;binding.expert_axis=UINT32_MAX;
+    binding.admitted_formats={{"plain.f32",1}};
+    WeightMap map;check(bool(admit(builtin_registry(),{&index,{&binding,1},{}},map)),"rank fixture admitted");
+    const auto original=describe_admission(map);
+    index.tensors[0].shape.rank=5;binding.logical_shape.rank=5;
+    auto status=admit(builtin_registry(),{&index,{&binding,1},{}},map);
+    check(status.code==Error::unsupported_shape && status.detail=="storage rank exceeds four","constructed storage rank rejected before strides");
+    check(describe_admission(map)==original,"over-rank admission leaves output intact");
+    index.tensors[0].shape.rank=1;
+    status=admit(builtin_registry(),{&index,{&binding,1},{}},map);
+    check(status.code==Error::unsupported_shape && status.detail=="binding rank exceeds four","logical rank rejected before normalization");
+    auto entry=map[0];entry.binding.logical_shape.rank=5;entry.weight.shape.rank=5;
+    status=validate_binding(builtin_registry(),entry);
+    check(status.code==Error::unsupported_shape && status.detail=="binding rank exceeds four","matching rank-five shapes rejected before comparison");
+    check(validate_map(builtin_registry(),{entry}).code==Error::unsupported_shape,"map rejects constructed ranks");
+    entry.binding.logical_shape.rank=1;
+    status=validate_binding(builtin_registry(),entry);
+    check(status.code==Error::unsupported_shape && status.detail=="weight rank exceeds four","weight rank checked before shape comparison");
+}
+void qwen_cuda_alpha_sources() {
+    // CUDA transcodes these GGUF projection inputs to F32 after shared admission.
+    for(const auto type:{1U,30U,8U}) {
+        const std::size_t elements=48*2560;
+        auto source=memory_source(std::vector<Byte>(type==8 ? elements/32*34 : elements*2));
+        TensorIndex index;index.container=Container::gguf;index.owner=source;
+        RawTensor raw{};raw.name="blk.0.ssm_alpha.weight";raw.wire_type=type;
+        raw.id=tensor_id(*source,raw.name);raw.shape={{{48,2560,0,0}},2};raw.payload={source,{0,source->size()}};
+        index.tensors.push_back(raw);WeightMap map;
+        check(bool(bind_qwen(index,map)),"CUDA alpha F16/BF16/Q8_0 source admitted");
+        check(map.size()==1 && map[0].binding.role==Role::dense_up,"alpha remains a projection");
+    }
+    for(const auto* name:{"blk.0.ssm_a","blk.0.ssm_d"}) {
+        WeightMap map;auto auxiliary=fixture({{name,"F32",{48},floats(48)}});
+        check(bool(bind_qwen(auxiliary,map)) && map.size()==1 && map[0].binding.role==Role::auxiliary,"standalone auxiliary keeps F32 role");
+        auxiliary=fixture({{name,"F16",{48},std::vector<Byte>(96)}});
+        check(!bind_qwen(auxiliary,map),"standalone auxiliary still refuses F16");
+    }
+    WeightMap map;auto bias=fixture({{"blk.0.ssm_dt.bias","F16",{48},std::vector<Byte>(96)}});
+    check(bool(bind_qwen(bias,map)) && map[0].binding.role==Role::bias,"dt bias is not standalone ssm_d");
+}
 }
 bool wfmt_admission_test() try {
+    rank_bounds();qwen_cuda_alpha_sources();
     check(wfmt_reference_admission_test(),"host reference admission negative coverage");
     std::array<Byte,128> bytes{};auto source=memory_source(bytes,"admission");TensorIndex index;index.container=Container::gguf;index.owner=source;
     RawTensor t{};t.id=tensor_id(*source,"x.weight");t.name="x.weight";t.wire_type=1;t.shape={{{2,32,0,0}},2};t.payload={source,{0,128}};index.tensors.push_back(t);
@@ -47,6 +91,10 @@ bool wfmt_admission_test() try {
     check(bool(bind_h3(index,family)),"H3 data schema");check(bool(bind_vision(index,family)),"vision data schema");
     index.tensors[0].wire_type=0;index.tensors[0].shape={{{2,16,0,0}},2};index.tensors[0].payload.range.bytes=128;check(bool(bind_gemma4(index,family)),"Gemma data schema");
     check(family[0].binding.admitted_categories==0,"legacy binder uses exact allowlist");
+    const auto gemma_text=fixture({{"model.language_model.layer.weight","F32",{1},floats(1)},
+        {"lm_head.weight","F32",{1},floats(1)},{"model.vision.layer.weight","F32",{1},floats(1)}});
+    WeightMap gemma_filtered;
+    check(bool(bind_gemma4(gemma_text,gemma_filtered)) && gemma_filtered.size()==2,"Gemma adapter selects text namespace and head only");
     WeightMap transformed;
     auto table=fixture({{"adaln_t_table","F32",{2,4},floats(8)}});check(bool(bind_h3(table,transformed)),"H3 existing F32 row lookup");
     check(transformed.size()==1 && transformed[0].binding.role==Role::lookup_row,"H3 row lookup role retained");

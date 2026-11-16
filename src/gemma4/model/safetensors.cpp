@@ -75,11 +75,12 @@ std::uint64_t integer(const serve::Json& value) {
 }
 SafeFile read_safetensors(const std::filesystem::path& path) {
     SafeFile out;
-    std::shared_ptr<const weight::Source> source;
-    auto status = weight::open_source(path.string(), source);
-    if (status) status = weight::index_safetensors(source, out.index);
-    if (!status) throw std::runtime_error(status.detail);
     out.storage = std::make_shared<MappedFile>(path);
+    const auto source = weight::view_source(
+        std::as_bytes(std::span(out.storage->data(), out.storage->size())), out.storage,
+        path.filename().generic_string());
+    auto status = weight::index_safetensors(source, out.index);
+    if (!status) throw std::runtime_error(status.detail);
     for (const auto& raw : out.index.tensors) {
         SafeTensor t; t.name = raw.name; t.dtype = raw.wire_dtype;
         t.shape.assign(raw.shape.dims.begin(), raw.shape.dims.begin() + raw.shape.rank);

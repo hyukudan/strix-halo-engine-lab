@@ -780,10 +780,11 @@
       "status": "migrated",
       "capture": "legacy-public-entrypoint",
       "operations": [
+        "as_bytes",
         "index_safetensors",
-        "open_source",
         "read_json",
-        "read_safetensors"
+        "read_safetensors",
+        "view_source"
       ]
     },
     {
