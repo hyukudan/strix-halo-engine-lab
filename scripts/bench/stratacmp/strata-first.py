@@ -124,8 +124,9 @@ def main():
                                 "position": position, "prompt_tokens": position+1,
                                 "label": ids[position+1], "request_sha256": hashlib.sha256(request.encode()).hexdigest(),
                                 "reply": line.strip()})
-            proc.stdin.write("QUIT\n"); proc.stdin.flush()
-            if proc.wait(timeout=10) != 0:
+            proc.stdin.write("QUIT\n"); proc.stdin.flush(); proc.stdin.close()
+            # A loaded engine releases its model and cache before exiting; 10 s was too short on a full pack.
+            if proc.wait(timeout=75) != 0:
                 raise RuntimeError("engine exit failure")
         finally:
             timer.cancel()
