@@ -261,6 +261,36 @@ int main() {
            row_receipt.find("pending-device-and-shape") != std::string::npos, "receipt reports automatic conditional plan");
     expect(decode_cli::effective_config_json(native).find("\"effective\":\"split\",\"enabled\":false,\"reason\":\"native-weights\"") !=
            std::string::npos, "receipt reports native row-decode disabled");
+    using Reduction = core::iu4_rows::RowReduction;
+    const auto canonical_cli = decode_cli::initialize_prefill_config({options_for({"--profile", "turbo", "--turbo-weights", "onfly"}),
+        {{"STRIX_IU4_ROW_REDUCTION", "canonical"}}});
+    const auto canonical_serve = decode_cli::initialize_prefill_config({options_for({"--profile", "turbo", "--turbo-weights", "onfly"}),
+        {{"STRIX_IU4_ROW_REDUCTION", "canonical"}}});
+    expect(canonical_cli.options.turbo.row_reduction.effective == Reduction::canonical &&
+           canonical_cli.options.turbo.row_reduction.effective == canonical_serve.options.turbo.row_reduction.effective &&
+           decode_cli::effective_prefill_argv(canonical_cli.options) == decode_cli::effective_prefill_argv(canonical_serve.options),
+           "CLI and server share the canonical reduction contract and cache identity");
+    expect(canonical_cli.options.turbo.identity().find("iu4-g64g96-gc32-v1") != std::string::npos &&
+           canonical_cli.options.turbo.identity() != onfly_i4::resolve({}, no_env, true).identity(),
+           "canonical reduction changes the numerical identity only when requested");
+    expect(cli.options.turbo.row_reduction.effective == Reduction::legacy &&
+           cli.options.turbo.identity() == std::string(onfly_i4::kIdentity) + "-g3-full", "legacy default identity preserved");
+    const auto canonical_native = decode_cli::initialize_prefill_config({options_for({}), {{"STRIX_IU4_ROW_REDUCTION", "canonical"}}});
+    expect(!canonical_native.options.turbo.row_reduction.active && canonical_native.options.turbo.identity().empty() &&
+           decode_cli::effective_prefill_argv(canonical_native.options) == decode_cli::effective_prefill_argv(native.options),
+           "canonical request cannot change native arithmetic or historical argv");
+    for (unsigned rows = 1U; rows <= 8U; ++rows) for (const unsigned groups : {64U, 96U}) {
+        const auto plan = core::iu4_rows::iu4_plan(rows, groups, Reduction::canonical);
+        expect(plan.S == 8U && plan.GC == 32U, "canonical reductions keep identical waves and K chunking at every row count");
+    }
+    expect(core::iu4_rows::iu4_plan(1U, 96U).GC == 96U && core::iu4_rows::iu4_plan(1U, 64U).GC == 64U &&
+           core::iu4_rows::iu4_plan(8U, 96U).GC == 32U, "legacy row-dependent plan preserved");
+    expect(decode_cli::effective_config_json(canonical_cli).find("\"contract\":\"iu4-g64g96-gc32-v1\",\"experimental\":true") !=
+           std::string::npos, "receipt names the experimental numerical contract");
+    bool invalid_reduction = false;
+    try { static_cast<void>(core::iu4_rows::parse_row_reduction("unknown")); }
+    catch (const std::invalid_argument&) { invalid_reduction = true; }
+    expect(invalid_reduction, "invalid reduction policy is refused");
 
     // Registry.
     int tensor = 0;

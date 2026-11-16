@@ -2356,7 +2356,12 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
         << ",\"reason\":\"" << o.turbo.row_decode.reason
         << "\",\"automatic_scope\":\"rows7-8-k6144-n2560\",\"device_requirement\":\"gfx1151-wave32\""
         << ",\"phase\":\"" << (o.turbo.row_decode.effective == core::iu4_rows::SingleDecodePolicy::automatic ?
-            "pending-device-and-shape" : "resolved") << "\"}}";
+            "pending-device-and-shape" : "resolved") << "\"}"
+        << ",\"row_reduction\":{\"requested\":\"" << core::iu4_rows::row_reduction_name(o.turbo.row_reduction.requested)
+        << "\",\"effective\":\"" << (o.turbo.row_reduction.active ? core::iu4_rows::row_reduction_name(o.turbo.row_reduction.effective) : "native")
+        << "\",\"contract\":\"" << (o.turbo.row_reduction.active ? core::iu4_rows::row_reduction_contract(o.turbo.row_reduction.effective) : "native")
+        << "\",\"experimental\":" << (o.turbo.row_reduction.effective == core::iu4_rows::RowReduction::canonical ? "true" : "false")
+        << ",\"scope\":\"IU4 G64/G96 reductions; native weights unchanged\"}}";
     out << ",\"hc_lowband_policy\":" << (config.environment.contains("STRIX_QPF2K_HC_LOWBAND") ?
         std::strtoul(config.environment.at("STRIX_QPF2K_HC_LOWBAND").c_str(), nullptr, 0) : 0U);
     out << ",\"hc_lowband_route\":\"exact-fp16-output-only\"";

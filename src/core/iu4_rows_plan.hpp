@@ -8,6 +8,27 @@
 namespace strix::core::iu4_rows {
 
 struct Iu4Plan { unsigned S, GC; };
+enum class RowReduction { legacy, canonical };
+inline RowReduction parse_row_reduction(std::string_view value) {
+    if (value.empty() || value == "legacy") return RowReduction::legacy;
+    if (value == "canonical") return RowReduction::canonical;
+    throw std::invalid_argument("STRIX_IU4_ROW_REDUCTION must be legacy or canonical");
+}
+constexpr std::string_view row_reduction_name(RowReduction policy) {
+    return policy == RowReduction::canonical ? "canonical" : "legacy";
+}
+constexpr std::string_view row_reduction_contract(RowReduction policy) {
+    return policy == RowReduction::canonical ? "iu4-g64g96-gc32-v1" : "iu4-row-buckets-v1";
+}
+struct RowReductionResolution {
+    RowReduction requested = RowReduction::legacy;
+    RowReduction effective = RowReduction::legacy;
+    bool active = false;
+};
+inline RowReductionResolution resolve_row_reduction(bool active, std::string_view value) {
+    const auto requested = parse_row_reduction(value);
+    return {requested, active ? requested : RowReduction::legacy, active};
+}
 constexpr bool supports_groups(unsigned groups) {
     return groups == 32U || groups == 40U || groups == 64U || groups == 96U;
 }
@@ -32,9 +53,10 @@ inline SingleDecodeResolution resolve_single_decode_policy(bool active, std::str
     return {requested, effective, !active ? "native-weights" : effective == SingleDecodePolicy::split ? "explicit-off" :
         effective == SingleDecodePolicy::force ? "diagnostic-force" : "measured-g96-r7-r8-n2560"};
 }
-constexpr Iu4Plan iu4_plan(unsigned rows, unsigned groups) {
+constexpr Iu4Plan iu4_plan(unsigned rows, unsigned groups, RowReduction reduction = RowReduction::legacy) {
     if (groups == 32U) return {4U, 32U};
     if (groups == 40U) return {4U, 40U};
+    if (reduction == RowReduction::canonical) return {8U, 32U};
     if (groups == 64U) return rows >= 6U ? Iu4Plan{8U, 32U} : Iu4Plan{8U, 64U};
     return rows >= 4U ? Iu4Plan{8U, 32U} : Iu4Plan{8U, 96U};
 }

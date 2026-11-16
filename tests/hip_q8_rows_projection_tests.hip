@@ -309,6 +309,8 @@ struct SingleDecodeSetting {
 void onfly_row_invariance(hipStream_t stream) {
     const SingleDecodeSetting requested_single;
     static_cast<void>(requested_single.policy());
+    const char* reduction_raw = envcfg::text("STRIX_IU4_ROW_REDUCTION");
+    const auto reduction = core::iu4_rows::resolve_row_reduction(true, reduction_raw ? reduction_raw : "").effective;
     unsigned observations = 0;
     struct Difference {
         std::uint32_t changed = 0, top_reference = 0, top_actual = 0;
@@ -386,6 +388,8 @@ void onfly_row_invariance(hipStream_t stream) {
                                       const std::vector<std::uint8_t>& actual, std::uint64_t launches) {
                     ++observations;
                     const auto d = compare(f, reference, actual);
+                    if (reduction == core::iu4_rows::RowReduction::canonical)
+                        require(reference == actual, "canonical IU4 reduction changed row-bucket output bytes");
                     std::cout << "onfly-row-invariance site=\"" << name(site) << "\" width=" << width
                         << " outputs=" << outputs << " mode=" << (mode == Mode::rows ? "exact" : "dense-a8")
                         << " profile=" << profile << " rows=" << rows << " reference_rows=1"
@@ -418,7 +422,8 @@ void onfly_row_invariance(hipStream_t stream) {
     }
     requested_single.restore();
     std::cout << "onfly-row-invariance-complete observations=" << observations
-        << " same_bucket_policies_bitwise=1 native_switch_bitwise=1\n";
+        << " same_bucket_policies_bitwise=1 native_switch_bitwise=1 canonical_reduction="
+        << (reduction == core::iu4_rows::RowReduction::canonical) << '\n';
 }
 
 // Diagnostic only: one load-time conversion per fixture; native and IU4 use the same production site.

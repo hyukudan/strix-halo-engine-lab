@@ -126,8 +126,11 @@ template <class Site> bool launch_iu4_rows(const Site& site, hipStream_t stream,
             w.base[m] = t->base;
             blocks += (n + 63U) / 64U;
         }
-        const auto run = [&]<unsigned G>() {
-            constexpr unsigned S = iu4_plan(Site::rows, G).S, GC = iu4_plan(Site::rows, G).GC;
+        const char* reduction_raw = strix::envcfg::text("STRIX_IU4_ROW_REDUCTION");
+        const auto reduction = core::iu4_rows::resolve_row_reduction(true, reduction_raw ? reduction_raw : "").effective;
+        const auto run = [&]<unsigned G, core::iu4_rows::RowReduction Reduction>() {
+            constexpr auto plan = iu4_plan(Site::rows, G, Reduction);
+            constexpr unsigned S = plan.S, GC = plan.GC;
             const auto go = [&](auto kernel, const std::int8_t* codes, const float* deltas) {
                 if (any_order && !slot)
                     hipExtLaunchKernelGGL(kernel, dim3(blocks), dim3(32U * S), 0, stream, nullptr, nullptr, hipExtAnyOrderLaunch, site, w,
@@ -154,11 +157,18 @@ template <class Site> bool launch_iu4_rows(const Site& site, hipStream_t stream,
                 }
             }
         };
+        const auto dispatch = [&]<unsigned G>() {
+            if constexpr (iu4_plan(Site::rows, G).GC != iu4_plan(Site::rows, G, core::iu4_rows::RowReduction::canonical).GC) {
+                if (reduction == core::iu4_rows::RowReduction::canonical)
+                    run.template operator()<G, core::iu4_rows::RowReduction::canonical>();
+                else run.template operator()<G, core::iu4_rows::RowReduction::legacy>();
+            } else run.template operator()<G, core::iu4_rows::RowReduction::legacy>();
+        };
         switch (width / 64U) {
-        case 32U: run.template operator()<32U>(); break;
-        case 40U: run.template operator()<40U>(); break;
-        case 64U: run.template operator()<64U>(); break;
-        case 96U: run.template operator()<96U>(); break;
+        case 32U: dispatch.template operator()<32U>(); break;
+        case 40U: dispatch.template operator()<40U>(); break;
+        case 64U: dispatch.template operator()<64U>(); break;
+        case 96U: dispatch.template operator()<96U>(); break;
         default: return false;
         }
         iu4_dispatches().fetch_add(1U, std::memory_order_relaxed);
