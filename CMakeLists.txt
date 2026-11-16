@@ -2437,6 +2437,8 @@ if(BUILD_TESTING)
         add_test(NAME strix-qwen-yarn-python-check
             COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tools/oracles/qwen_yarn_table_check.py
                 --emitter $<TARGET_FILE:strix-qwen-yarn-table-tests>)
+        add_test(NAME strix-qsa-score-split-loads-tests
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/qsa_score_split_loads_tests.py)
         add_test(NAME strix-session-gate-tests
             COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/session_gate_tests.py)
         add_test(NAME strix-ds41-pair-setup-tests
