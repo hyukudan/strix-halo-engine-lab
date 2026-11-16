@@ -6,7 +6,7 @@ The existing device-only and full MMRX handoff routes remain the defaults for th
 
 ## Build and host checks
 
-Build the CUDA producer with `src/minimax/rtxpf/cuda/build_prefill.bat` on its CUDA host, and the usual
+Build the CUDA producer with `src/cuda/models/minimax/build_prefill.bat` on its CUDA host, and the usual
 `strix-minimax-rank` HIP target on each pair node. The producer links `src/handoff.cpp` and `src/bp_codec.cpp`.
 Host-only tests need neither runtime nor model assets:
 

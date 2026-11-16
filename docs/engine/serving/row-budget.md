@@ -30,6 +30,13 @@ The budget plans cycles of up to `STRIX_SERVE_ROW_BUDGET_MAX_LANES` decoding req
 Above the bound every request gets the fixed table's two rows. The bound is measured: the budget is faster at
 two to six requests and slower at eight, where its deeper rows cost more than they yield.
 
+Above the bound the joint cycle can group requests by the row budget instead of a fixed count of eight:
+`STRIX_SERVE_JOINT_GROUP_LANES=9..16` lets one group (one logical target execution) take up to
+that many requests (16 = 32 rows, the widest shared step). The default stays 8 (9 to 16 requests run two forwards per
+cycle, 17 to 24 three): in the first served run a single group of nine requests stalled the server on the device after
+its first cycle, so the wider form is opt-in until that is found. `ab` alternates 8 and 16 by cycle (in-process A/B:
+the receipt's `forwards` field tells the arms apart). Scheduling only: the 9..32-row wide steps keep every row's arithmetic.
+
 ## Exactness
 
 Scheduling only. Every emitted token comes from the request's own target rows, so token ids equal those of a

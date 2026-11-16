@@ -62,6 +62,24 @@ int main() {
         require(strix::ds41::fast_profile::dense_min_rows_value(value.c_str()) == static_cast<unsigned>(-1),
                 "canonical unsigned export does not round trip");
         require(agrees(negative, resolve({{"STRIX_DS41_FAST_DENSE_MIN_ROWS", value}})), "unsigned normalization differs");
+        // ds41-engram-f16wmma-v1: explicit only (the bundle does not select it), exported, and a peer without it disagrees
+        const auto engram = resolve({{"STRIX_DS41_FAST_ENGRAM", "1"}});
+        require(!agrees(off, engram) && !agrees(engram, off), "asymmetric Engram peers admitted");
+        require(exported(engram, "STRIX_DS41_FAST_ENGRAM") == "1", "Engram lever not exported");
+        require(std::none_of(bundle.set_env.begin(), bundle.set_env.end(),
+                             [](const auto& kv) { return kv.first == "STRIX_DS41_FAST_ENGRAM" && kv.second == "1"; }),
+                "bundle selects the unqualified Engram lever");
+        require(exported(resolve({{"STRIX_DS41_FAST_ENGRAM", "1"}}, true), "STRIX_DS41_FAST_ENGRAM") == "1" &&
+                    exported(resolve({{"STRIX_DS41_FAST_ENGRAM", "yes"}}), "STRIX_DS41_FAST_ENGRAM") == "0",
+                "Engram lever not canonical (explicit value kept under --profile fast, anything but 1 is 0)");
+        require(agrees(off, resolve({{"STRIX_DS41_FAST_ENGRAM", "0"}})), "explicit Engram OFF changes the pair identity");
+        // ONE RESOLVER: the server and the prefill CLI resolve the same request to the same Engram value
+        for (const pd::App app : {pd::App::serve, pd::App::prefill}) {
+            const auto r = pd::resolve(app, {}, [](const char* key) -> const char* {
+                return std::string(key) == "STRIX_DS41_FAST_ENGRAM" ? "1" : std::string(key) == "STRIX_DS41_BASELINE" ? "1" : nullptr;
+            }, {}, {});
+            require(exported(r, "STRIX_DS41_FAST_ENGRAM") == "1", "serve / prefill CLI resolve a different Engram value");
+        }
         const auto report = pd::describe(pd::App::rank, bundle);
         require(report.find("STRIX_DS41_FAST_DENSE=1") != std::string::npos &&
                 report.find("STRIX_DS41_FAST_DENSE_MIN_ROWS=128") != std::string::npos, "effective report omits dense policy");

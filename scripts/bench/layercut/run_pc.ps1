@@ -12,7 +12,7 @@ param(
     [ValidateSet('relay','direct')][string]$Act = 'relay',
     [ValidateSet('identity','bp')][string]$Codec = 'identity',
     [string]$PairIdentity = 'default',
-    [string]$Binary = "$PSScriptRoot/../../../src/minimax/rtxpf/cuda/mm-rtx-prefill.exe",
+    [string]$Binary = "$PSScriptRoot/../../../src/cuda/models/minimax/mm-rtx-prefill.exe",
     [string]$OutputDir = 'layercut-out'
 )
 $ErrorActionPreference = 'Stop'
