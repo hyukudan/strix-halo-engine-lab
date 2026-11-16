@@ -206,6 +206,17 @@ std::uint32_t mtp_serve_joint_group_lanes(std::uint64_t cycle) noexcept {
         } catch(...) {return kMtpJointGroupLanesMax;}}();
     return lanes?lanes:(cycle&1U)?8U:kMtpJointGroupLanesMax;
 }
+const char* mtp_serve_row_measured_choice() noexcept {
+    static const char* choice=[]()->const char* {
+        const char* v=envcfg::text("STRIX_SERVE_ROW_MEASURED");
+        if(!v || !*v || std::string_view(v)=="auto") return "auto";
+        return std::string_view(v)=="0"?"0":"1";}();
+    return choice;
+}
+std::uint32_t mtp_serve_row_measured_lanes() noexcept {
+    const std::string_view c=mtp_serve_row_measured_choice();
+    return c=="auto"?kMtpRowMeasuredAutoLanes:c=="1"?0x1FEU:0U;
+}
 bool mtp_serve_row_budget_enabled() noexcept {
     static const bool on=envcfg::flag("STRIX_SERVE_ROW_BUDGET",true,EnvFlagMatch::exact);
     return on;
@@ -218,7 +229,8 @@ MtpBatchWindowController::Rule MtpBatchWindowController::parse_rule(std::string_
     if(text.find("cap4")!=std::string_view::npos) rule.cap=4;
     if(text.find("cap2")!=std::string_view::npos) rule.cap=2;
     if(text.find("budget")!=std::string_view::npos) rule.budget=true;
-    rule.measured=rule.budget && text.find("measured")!=std::string_view::npos;
+    if(rule.budget) rule.measured_lanes=text.find("measured")!=std::string_view::npos?0x1FEU:
+        text.find("budget-fit")!=std::string_view::npos?0U:mtp_serve_row_measured_lanes();
     return rule;
 }
 std::size_t MtpBatchWindowController::calibration_bin(double p) {
@@ -465,7 +477,11 @@ std::vector<std::uint32_t> MtpBatchWindowController::measured_rows(std::span<con
         if(found==costs_.end() || found->second.provisional()) continue;
         const double ms=found->second.value()+draft*static_cast<double>(a2+3U*a4+7U*a8);
         if(!(ms>0.0)) continue;
-        if(e/ms>best_rate) {best_rate=e/ms;best_e=e;best_ms=ms;chosen=s;}
+        // After drafting, the topology's tokens are scaled by what it delivered against the model (shrunk to 1 with
+        // eight tokens each way): a model that over-promises deep owners stops buying them on its word alone.
+        double yield=e;
+        if(!prior) if(const auto y=yields_.find({r2,a4,a8});y!=yields_.end()) yield*=(y->second[1]+8.0)/(y->second[0]+8.0);
+        if(yield/ms>best_rate) {best_rate=yield/ms;best_e=yield;best_ms=ms;chosen=s;}
     }
     if(chosen==S) return {};
     std::vector<std::uint32_t> out(n,2U);
@@ -525,6 +541,16 @@ void MtpBatchWindowController::observe(std::span<const Request> q,std::span<cons
     if(q.size()!=rows.size() || rows.size()!=accepted.size() || !(target_ms>0.0) || draft_ms<0.0)
         throw std::invalid_argument("joint MTP observation geometry or timing differs");
     costs_[batch_key(rows)].add(target_ms);
+    {
+        // Measured rule's yield calibration: the model's tokens for the executed rows (before this cycle updates the
+        // histories) against the tokens they delivered (accepted drafts inside the rows + the committed row).
+        auto& y=yields_[batch_key(rows)];
+        for(std::size_t k=0;k<q.size();++k) {
+            const auto r=std::max(rows[k],2U);
+            y[0]+=expected(q[k],r,false);
+            y[1]+=1.0+static_cast<double>(std::min(accepted[k],r-1U));
+        }
+    }
     if(steps && draft_ms>0.0) draft_.add(draft_ms/steps);
     for(std::size_t k=0;k<q.size();++k) {
         auto& h=history_.at(q[k].slot);

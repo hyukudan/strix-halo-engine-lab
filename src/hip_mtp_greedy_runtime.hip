@@ -1430,6 +1430,8 @@ std::vector<HipMtpServeLever> hip_mtp_serve_levers() {
         {"draft_batch","STRIX_MTP_DRAFT_BATCH",draft_batch_enabled(),draft_batch_enabled()?"1":"0"},
         {"joint_window","STRIX_MTP_BATCH_JOINT",joint || mtp_serve_row_budget_enabled(),joint || mtp_serve_row_budget_enabled()?"1":"0"},
         {"row_budget","STRIX_SERVE_ROW_BUDGET",mtp_serve_row_budget_enabled(),mtp_serve_row_budget_enabled()?"1":"0"},
+        {"row_measured","STRIX_SERVE_ROW_MEASURED",mtp_serve_row_budget_enabled() && mtp_serve_row_measured_lanes()!=0U,
+            std::string(mtp_serve_row_measured_choice())+" lanes=0x"+[]{char b[16];std::snprintf(b,sizeof b,"%x",mtp_serve_row_measured_lanes());return std::string(b);}()},
         {"row_budget_max_lanes","STRIX_SERVE_ROW_BUDGET_MAX_LANES",mtp_serve_row_budget_enabled(),std::to_string(mtp_serve_row_budget_max_lanes())},
         {"joint_group_lanes","STRIX_SERVE_JOINT_GROUP_LANES",mtp_serve_row_budget_enabled() && mtp_serve_joint_group_lanes(0)!=8U,
             mtp_serve_joint_group_lanes(0)==mtp_serve_joint_group_lanes(1)?std::to_string(mtp_serve_joint_group_lanes(0)):std::string("ab")},

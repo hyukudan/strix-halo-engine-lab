@@ -73,8 +73,14 @@ int main() {
         // budget-measured: synthetic topology costs (policy behaviour, not device measurements).
         using C=strix::MtpBatchWindowController;
         const auto rule=C::parse_rule("budget-measured");
-        expect(rule.budget && rule.measured,"measured policy is explicit");
-        expect(!C::parse_rule("budget").measured && !C::parse_rule("measured").measured,"measured needs the budget rule");
+        expect(rule.budget && rule.measured_lanes==0x1FEU,"measured policy is explicit");
+        expect(C::parse_rule("budget-fit").measured_lanes==0U && C::parse_rule("measured").measured_lanes==0U,
+            "budget-fit is the affine rule and measured needs the budget rule");
+        // One resolver: the serving default (no STRIX_MTP_JOINT_PLAN) is the plain budget rule with the auto lane table,
+        // the same value the CLI cohort path resolves.
+        expect(C::parse_rule("budget").measured_lanes==strix::mtp_serve_row_measured_lanes(),"plain budget takes the lane table");
+        if(!std::getenv("STRIX_SERVE_ROW_MEASURED") && !std::getenv("STRIX_MTP_JOINT_PLAN") && !std::getenv("STRIX_SERVE_ROW_BUDGET"))
+            expect(C::rule_from_env(false).measured_lanes==strix::kMtpRowMeasuredAutoLanes,"serve and CLI default = auto table");
         const std::array<float,7> p{1,1,1,1,1,1,1};
         std::vector<C::Request> q;
         for(std::uint32_t i=0;i<8U;++i) q.push_back({i,8U,p});
@@ -91,7 +97,7 @@ int main() {
         expect(expensive.choose(q,32)==r2,"a measured expensive R4 topology loses to R2");
         // A C8 table never prices a C4 topology: the same state under the budget rule plans the same.
         const std::span<const C::Request> four(q.data(),4);
-        C budget_copy=measured;budget_copy.set_rule(C::parse_rule("budget"));
+        C budget_copy=measured;budget_copy.set_rule(C::parse_rule("budget-fit"));
         expect(measured.choose(four,32)==budget_copy.choose(four,32),"an unmeasured lane count keeps the budget plan");
         for(auto& request:q) request.limit=2U;
         expect(measured.choose(q,32)==r2,"context limits bound the owners");
@@ -107,7 +113,7 @@ int main() {
             if(i==9) expect(rows==r4,"measured exploitation follows the probes");
         }
         expect(deep,"measured probes explore deeper owners at eight lanes");
-        C budget_only(8,C::parse_rule("budget"));
+        C budget_only(8,C::parse_rule("budget-fit"));
         for(int i=0;i<10;++i) expect(budget_only.plan(q,32)==r2,"the budget rule keeps C8 at two rows");
         measured.save_shared();
         const auto before=measured.choose(q,32);
