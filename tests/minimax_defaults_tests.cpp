@@ -114,7 +114,7 @@ const std::map<std::string, std::string> kFormer = {
     {"STRIX_MMX_MOE_DOWN_SPLIT", "0"},    {"STRIX_MM_ATTEND_DIET", "0"},
     {"STRIX_MM_ATTEND4_DECODE", "0"},      {"STRIX_MM_SELECT_ONCE", "0"},
     {"STRIX_MMX_PREFILL_GATHER_TOK", "0"}, {"STRIX_MM_PF_DENSE_QKV", "0"},
-    {"STRIX_MMX_PREFILL_TAIL_STREAM", "0"}, {"STRIX_MMX_PREFILL_PIPE_PAIR", "0"},
+    {"STRIX_MMX_PREFILL_TAIL_STREAM", "0"}, {"STRIX_MMX_PREFILL_PIPE_PAIR", "0"}, {"STRIX_MMX_PREFILL_PIPE_TAIL", "0"},
     {"STRIX_MM_PF_ROUTER_ROWS", "8"}, {"STRIX_MM_PF_MSA_SCRATCH_MB", "512"}, {"STRIX_MM_PF_DENSE_O", "0"},
     {"STRIX_MM_XB_WARM_O", "0"},           {"STRIX_MMX_MOE_TIGHT_GRID", "0"},
     {"STRIX_MMX_MOE_PIPE", "0"},
@@ -650,6 +650,12 @@ void test_fast_prefill_profile() {
         const EnvMap legacy_env{{"STRIX_MM_PF_MSA_FLASH", "1"}, {"STRIX_MM_PF_MSA_FLASH_LAYERS", "50-59"}};
         const auto legacy = md::prefill_policy(lookup(legacy_env));
         check(legacy.msa_flash == 1 && legacy.policies == "msa-flash-bf16-l50-59", "fast profile: the legacy opt-in still runs, named by its layers");
+        // A named layer set is reported by its policy id, whatever the mask syntax.
+        const EnvMap l30_env{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MM_PF_MSA_FLASH_LAYERS", "30-39,40-59"}};
+        const auto l30 = md::prefill_policy(lookup(l30_env));
+        check(l30.msa_flash == 1 && l30.msa_flash_layers == "30-59" && l30.policies == "msa-flash-bf16-l30-v1" &&
+                  md::prefill_identity(lookup(l30_env)) == "prefill_msa=msa-flash-bf16-l30-v1",
+              "fast profile: layers 30-59 = msa-flash-bf16-l30-v1");
     }
     {   // EXL3 base only: the bundle does not select it on FAST_I4; an explicit value still does.
         const EnvMap i4{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MMX_MODEL_FORMAT", "fast_i4"}};
@@ -707,6 +713,40 @@ void test_fast_prefill_profile() {
 
 }  // namespace
 
+// ONE RESOLVER: the same request through both entry points. Every host-path default is one row of one table; the
+// server may end with another value only where the row names the reason, and effective_config() prints both.
+void test_entry_points_host_defaults() {
+    const EnvMap none;
+    md::Cli rank, serve; rank.app = "rank"; serve.app = "serve";
+    const auto rank_lines = lines(md::effective_config(rank, lookup(none)));
+    const auto serve_lines = lines(md::effective_config(serve, lookup(none)));
+    check(!md::host_defaults().empty(), "host defaults table is not empty");
+    std::size_t differing = 0;
+    for (const md::HostDefault& row : md::host_defaults()) {
+        const char* a = md::host_default_value(row, "rank", lookup(none));
+        const char* b = md::host_default_value(row, "serve", lookup(none));
+        const std::string av = a ? a : "unset", bv = b ? b : "unset", key = std::string("host.") + row.name;
+        check(rank_lines.count(key + "=" + av) == 1, key + " printed by the CLI");
+        check(serve_lines.count(key + "=" + bv) == 1, key + " printed by the server");
+        if (av != bv) {
+            ++differing;
+            check(row.serving_reason != nullptr && std::string(row.serving_reason).size() > 20, key + " differs with a named reason");
+            check(serve_lines.count(key + ".serving_reason=" + row.serving_reason) == 1, key + " reason printed by the server");
+        } else {
+            check(row.serving_reason == nullptr, key + " equal on both entry points carries no reason");
+        }
+        // An explicit value wins on both entry points and removes the difference (and the reason line).
+        const EnvMap set = {{row.name, "7"}};
+        check(std::string(md::host_default_value(row, "rank", lookup(set))) == "7" &&
+              std::string(md::host_default_value(row, "serve", lookup(set))) == "7", key + " explicit value wins");
+        check(lines(md::effective_config(serve, lookup(set))).count(key + "=7") == 1, key + " explicit value printed");
+    }
+    check(differing == 3, "exactly the two transport timeouts and the prefill table ring differ between the entry points");
+    const EnvMap base = {{"STRIX_MM_BASELINE", "1"}};
+    for (const md::HostDefault& row : md::host_defaults())
+        if (row.optimization) check(md::host_default_value(row, "rank", lookup(base)) == nullptr, std::string(row.name) + " off under the baseline");
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: " << argv[0] << " minimax_production_receipt.txt\n";
@@ -726,6 +766,7 @@ int main(int argc, char** argv) {
         test_session_defaults();
         test_session_startup();
         test_apply();
+        test_entry_points_host_defaults();
         test_fast_prefill_profile();
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << "\n";

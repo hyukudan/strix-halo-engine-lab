@@ -79,6 +79,11 @@ public:
         std::span<const std::uint32_t> eos_tokens={},MtpSelectionTransaction* transaction=nullptr);
     [[nodiscard]] bool failed() const noexcept;
     [[nodiscard]] const HipMtpRuntime& native_runtime() const noexcept;
+    // STRIX_SERVE_CYCLE_PACK: the next finish_cycle leaves its reconciliation completion deferred; the cohort
+    // completes every member's owner with one packed fence right after its finish loop.
+    void defer_reconcile_for_cycle_pack(bool on) noexcept;
+    // A draft chain is open: draft_end() will finish it (and complete its predictor owner).
+    [[nodiscard]] bool draft_chain_open() const noexcept;
     // cycle() in two phases, for a caller that verifies the drafts of several sessions at once
     // (hip_mtp_greedy_cohort_cycle). begin_cycle_draft drafts for initial_target exactly as cycle
     // does (cost_model = false drafts up to the minimum probability only) and returns the draft

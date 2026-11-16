@@ -1,5 +1,8 @@
 #pragma once
 
+#include <memory>
+#include <exception>
+
 // deepseek41 prefill: the routed experts of T prompt rows at once, and the exact suffix replay plan.
 //
 // Routes. Every (row, k) assignment is one slot = row * top_k + k, as in the decode window. The
@@ -91,5 +94,57 @@ struct SuffixReplayPlan {
 // drafter seed over the per-layer windows, row by row. Returns an empty string when the plan
 // computes exactly the needed rows (nothing missing, nothing extra), else a description.
 [[nodiscard]] std::string verify_suffix_replay(const SuffixReplayGeometry& geometry, const SuffixReplayPlan& plan);
+
+struct PrefillMoeLayout {
+    std::uint64_t o_counts, o_begins, o_rows, o_slots, o_bexp, o_bbeg, o_bcnt, o_btot, o_order, o_low, o_sexp, o_sbeg, o_stot, o_codes, o_deltas, o_sums, o_raw, o_pcodes, o_pdeltas, bytes;
+};
+inline PrefillMoeLayout prefill_moe_layout(std::uint32_t chunk_rows, std::uint32_t top_k,
+    std::uint32_t owned, std::uint32_t hidden, std::uint32_t inter, std::uint32_t down_width) {
+    if (down_width == 0U) down_width = inter;
+    const std::uint64_t slots = static_cast<std::uint64_t>(chunk_rows) * top_k;
+    const std::uint64_t batches = prefill_max_batches(chunk_rows, top_k, owned, 8U);
+    // One allocation, 256-byte aligned parts.
+    std::uint64_t offset = 0;
+    const auto take = [&](std::uint64_t bytes) { const auto at = offset; offset += (bytes + 255U) / 256U * 256U; return at; };
+    const auto o_counts = take(owned * 4U), o_begins = take((owned + 1U) * 4U), o_rows = take(slots * 4U), o_slots = take(slots * 4U);
+    const auto o_bexp = take(batches * 4U), o_bbeg = take((batches + 1U) * 4U), o_bcnt = take(batches * 4U), o_btot = take(4U);
+    const auto o_order = take(slots * 4U), o_low = take(static_cast<std::uint64_t>(chunk_rows) * 4U);
+    const auto o_sexp = take(batches * 4U), o_sbeg = take((batches + 1U) * 4U), o_stot = take(4U);
+    const auto o_codes = take(slots * inter), o_deltas = take(slots * inter / 32U * 4U), o_sums = take(slots * inter / 32U * 4U);
+    const auto o_raw = take(slots * hidden * 4U);
+    const bool pad = down_width != inter;
+    const auto o_pcodes = pad ? take(slots * down_width) : 0U, o_pdeltas = pad ? take(slots * down_width / 32U * 4U) : 0U;
+    return {o_counts, o_begins, o_rows, o_slots, o_bexp, o_bbeg, o_bcnt, o_btot, o_order, o_low, o_sexp, o_sbeg, o_stot, o_codes, o_deltas, o_sums, o_raw, o_pcodes, o_pdeltas, offset};
+}
+
+// Budget is free memory while the old allocation remains live. Commit only after success.
+template<class Scratch, class Allocate>
+bool try_grow_moe_scratch(std::unique_ptr<Scratch>& current, std::uint64_t bytes,
+                          std::uint64_t free_bytes, Allocate allocate) {
+    if (bytes > free_bytes) return false;
+    try {
+        auto replacement = allocate();
+        current.swap(replacement);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+// Routed-MoE schedule of a row-split pair prefill. Bitwise: the MoE's rows are independent, so neither the window size
+// nor the joint / two-pass form changes a row's bits; only the number of expert reads and launches changes.
+// moe_window_rows: one MoE window per pass. The pass rows (the larger of a layer's peer and own rows, the same value on
+// both ranks) rounded up to whole `chunk` rows, at least `base` (the configured window) and at most max(cap, base).
+[[nodiscard]] std::uint32_t moe_window_rows(std::uint32_t base, std::uint32_t chunk, std::uint32_t pass_rows, std::uint32_t cap);
+// Explicit windows and scheduled slices bound automatic growth.
+inline std::uint32_t bounded_moe_window_rows(std::uint32_t base, std::uint32_t chunk,
+    std::uint32_t pass_rows, std::uint32_t cap, bool automatic, std::uint32_t task_cap) {
+    const auto rows = automatic ? moe_window_rows(base, chunk, pass_rows, cap) : base;
+    return task_cap != 0U && task_cap < rows ? task_cap : rows;
+}
+// moe_joint_layer: one expert pass over [peer rows; own rows] when the LAYER's rows (peer + own, the same on both ranks)
+// are at most max_rows (0: never). The two-pass form overlaps the peer rows' half sums with the own rows but reads every
+// expert twice; below max_rows the saved reads outweigh the exposed half-sum wire (rows x hidden x 4 B over the link).
+[[nodiscard]] bool moe_joint_layer(std::uint32_t peer_rows, std::uint32_t own_rows, std::uint32_t max_rows);
 
 } // namespace strix::ds41

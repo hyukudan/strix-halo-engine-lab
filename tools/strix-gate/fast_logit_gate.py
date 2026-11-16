@@ -16,7 +16,14 @@ Two subcommands (Python 3.9+, numpy):
            dumps, the selected ids that differ per layer and position. Exit 0 = gate passed, 1 = gate failed,
            2 = identity or input error (no verdict). The dNLL limit is absolute (--max-dnll) unless
            --dnll-rule floor is given: then it is mean + 2 sd (n - 1) of >= 3 --null-arm runs, allowed only for
-           the engine / profile pairs in DNLL_POLICY (DS41 FAST prefill); the absolute verdict stays a reference.
+           the engine / profile pairs in DNLL_POLICY; the absolute verdict stays a reference. DS41 FAST prefill:
+           dNLL only, layer-0 nulls. MiniMax FAST prefill: onset-matched nulls (one ulp at the candidate's first
+           FAST layer) and six checks (KL, top-1, capped dNLL, KL quantiles, sign test, copy rows), see MM_FLOOR.
+
+  witness  Launcher-side producer of the execution witness (schema strix-fast-execution/v1) that `seal
+           --execution-witness` binds and the floor rule requires. Reads the rank's engine log after the engine
+           exits: today the MiniMax adapter (route receipt -> engine, profile, numerical configuration, FAST layer
+           set; null-control log lines -> control), plus the binary, the model bundle and the completed dumps.
 
 Dump layout inside a run directory (PREFIX is the --prefix value, default "q"):
   PREFIX-<prompt>-tf-r<rank>.f32   [rows][width] little-endian FP32: the head logits of the last `rows` prompt
@@ -28,8 +35,10 @@ Dump layout inside a run directory (PREFIX is the --prefix value, default "q"):
 import argparse
 import hashlib
 import json
+import math
 import os
 import pathlib
+import re
 import sys
 import time
 
@@ -48,13 +57,52 @@ class GateError(Exception):
 # binary as the candidate; KL and top-1 limits are unchanged. Only the DeepSeek V4.1 FAST prefill profile may use "floor":
 # its layer-0 chaos floor (any one-ulp change at layer 0 re-routes MoE rows) already costs dNLL ~0.012 > 0.01. Adding an
 # entry here is a policy decision, not a tuning knob.
+# MiniMax FAST prefill ("floor" = MM_FLOOR below): one fp16-surviving ulp anywhere flips near-tie block selections and
+# top-4 expert routes, so a layer-0 null lands at KL ~0.5 / top-1 ~88 % / dNLL +-0.1, far above any FAST layer set that
+# starts later. Its nulls therefore start where the candidate starts (one ulp on the attention output of the candidate's
+# first FAST layer, the tensor MSA flash replaces), and KL, top-1 and dNLL must stay inside their spread, with the dNLL
+# limit capped, plus three checks that a wide floor cannot loosen: per-row KL quantiles, a sign test on the rows the
+# candidate changes, and the next-token misses on copy rows.
 DNLL_POLICY = {
     ("ds41", "fast-prefill"): ("abs", "floor"),
+    ("minimax", "fast-prefill"): ("abs", "floor"),
 }
 FLOOR_MIN_NULLS = 3
 FLOOR_SIGMAS = 2.0
 WITNESS_SCHEMA = "strix-fast-execution/v1"
 DS41_NULL_CONTROL = {"kind": "layer0-null", "layer": 0, "magnitude": 1, "unit": "ulp"}
+MM_NULL_KIND = "attn-ulp-null"  # MiniMax null control: {"kind", "layer", "magnitude": 1, "unit": "ulp", "seed"}
+MM_FLOOR = {
+    "policy": "minimax-onset-floor-v1.2",
+    "dnll_cap": 0.03,                   # the floor-relative dNLL limit never exceeds 3 x the absolute 0.01
+    "kl_quantiles": (0.5, 0.9, 0.99),   # per-row KL quantiles: max(mu + 2 sd of the nulls' same quantile, tolerance)
+    # v1.1: a quantile limit is never below these (nats). A one-ulp null's median row only carries rounding (KL ~1e-5,
+    # sd ~1e-6), so a purely relative q50 demands bitwise arithmetic; 1e-3 = 1/20 of the absolute mean bar 0.02 still
+    # catches a diffuse defect, and q90 / q99 are never held stricter than the absolute mean bar.
+    "kl_quantile_tol": {"q50": 1e-3, "q90": 0.02, "q99": 0.02},
+    # v1.2: q99 is reported, not required: the tail is chaos and one null site flips fewer near-ties than a FAST layer set
+    # (measured: the 40-59 control, absolute PASS, sits at q99 0.025-0.029 vs its single-site nulls 0.017-0.022).
+    "required_quantiles": ("q50", "q90"),
+    "sign_min_abs": 1e-3,               # rows with |dNLL| >= this (nats) enter the sign test
+    "sign_alpha": 0.01,                 # one-sided binomial P(X >= worse) vs p0 = max(0.5, pooled null worse share)
+    "copy_k": 8,                        # copy row: the last k prompt tokens occurred before, followed by the true token
+    "copy_slack_frac": 0.01,            # copy-row extra misses <= worst null + max(1, ceil(1 % of the copy rows))
+}
+
+
+def is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def check_fast_block(fast):
+    """A witnessed FAST layer set: {"policy": str, "msa_flash_mode": int, "layers": sorted unique non-negative ints}."""
+    if fast is None:
+        return
+    layers = fast.get("layers") if isinstance(fast, dict) else None
+    if (not isinstance(fast, dict) or not isinstance(fast.get("policy"), str) or not is_int(fast.get("msa_flash_mode"))
+            or not isinstance(layers, list) or not layers or not all(is_int(x) and x >= 0 for x in layers)
+            or layers != sorted(set(layers))):
+        raise GateError("execution witness: invalid FAST layer set")
 
 
 def execution_witness(doc):
@@ -74,10 +122,42 @@ def execution_witness(doc):
         raise GateError("execution witness: missing engine/profile")
     if "control" not in w or (w["control"] is not None and not isinstance(w["control"], dict)):
         raise GateError("execution witness: missing or invalid control identity")
+    check_fast_block(w.get("fast"))
+    cfg = w.get("config")
+    if cfg is not None and (not isinstance(cfg, dict) or sorted(cfg) != ["levers", "switches"] or not all(
+            isinstance(cfg[k], dict) and all(isinstance(a, str) and isinstance(b, str) for a, b in cfg[k].items())
+            for k in cfg)):
+        raise GateError("execution witness: invalid config (levers / switches maps of strings)")
     return w
 
 
+def config_difference(ref, cand):
+    """First difference outside the FAST allowlist. Receipts omit defaulted switches, so a missing entry cannot prove
+    equivalence to an explicit value: refuse one-sided entries too. None = the witnessed maps agree."""
+    lr, lc = ({k: v for k, v in c["levers"].items() if k not in MM_FAST_LEVERS} for c in (ref, cand))
+    if lr != lc:
+        return "lever " + next(k for k in sorted(set(lr) | set(lc)) if lr.get(k) != lc.get(k))
+    sr, sc = ref["switches"], cand["switches"]
+    for k in sorted((set(sr) | set(sc)) - MM_FAST_SWITCHES):
+        if sr.get(k) != sc.get(k):
+            return f"switch {k}={sr.get(k)!r} vs {sc.get(k)!r}"
+    return None
+
+
+def null_control_ok(engine, control, onset):
+    """DS41: exactly the layer-0 one-ulp control. MiniMax: the one-ulp attention-output control at the candidate's onset."""
+    if engine != "minimax":
+        # JSON comparison also refuses booleans in place of integer layer/magnitude.
+        return json.dumps(control, sort_keys=True) == json.dumps(DS41_NULL_CONTROL, sort_keys=True)
+    return (isinstance(control, dict) and sorted(control) == ["kind", "layer", "magnitude", "seed", "unit"]
+            and control["kind"] == MM_NULL_KIND and control["unit"] == "ulp" and is_int(control["magnitude"])
+            and control["magnitude"] == 1 and is_int(control["layer"]) and control["layer"] == onset
+            and is_int(control["seed"]) and control["seed"] >= 0)
+
+
 def check_floor_execution(ref, cand, nulls, engine, profile):
+    """Witness rules of the floor; returns the onset layer the nulls must start at (MiniMax) or None (DS41: layer 0)."""
+    onset = None
     for i, (mr, mc) in enumerate(zip(ref, cand)):
         wr, wc = execution_witness(mr), execution_witness(mc)
         if (wc["engine"], wc["profile"]) != (engine, profile) or wc["control"] is not None:
@@ -86,13 +166,31 @@ def check_floor_execution(ref, cand, nulls, engine, profile):
             raise GateError("floor reference must witness the exact baseline without a control")
         if wr["model_sha256"] != wc["model_sha256"]:
             raise GateError("floor reference/candidate model identity differs")
+        if engine == "minimax":
+            if wc.get("fast") is None or wr.get("fast") is not None:
+                raise GateError("minimax floor: the candidate must witness its FAST layer set and the reference none")
+            if wr.get("config") is None or wc.get("config") is None:
+                raise GateError("minimax floor: reference and candidate must witness their configuration (config)")
+            diff = config_difference(wr["config"], wc["config"])
+            if diff is not None:
+                raise GateError(f"minimax floor: the candidate differs from the reference beyond its FAST layer set ({diff})")
+            onset = wc["fast"]["layers"][0]
         for _, mn in nulls:
             wn = execution_witness(mn[i])
             if any(wn[k] != wr[k] for k in ("engine", "profile", "model_sha256", "numerical_config_sha256")):
                 raise GateError("null execution witness differs from the reference model/baseline numerical configuration")
-            # JSON comparison also refuses booleans in place of integer layer/magnitude.
-            if json.dumps(wn["control"], sort_keys=True) != json.dumps(DS41_NULL_CONTROL, sort_keys=True):
+            if wn.get("fast") is not None:
+                raise GateError("null execution witness carries a FAST layer set")
+            if not null_control_ok(engine, wn["control"], onset):
+                if engine == "minimax":
+                    raise GateError(f"null execution witness must attest the MiniMax one-ulp attention-output control at "
+                                    f"the candidate's first FAST layer {onset}")
                 raise GateError("null execution witness must attest the DS41 one-ulp layer-0 control")
+    if engine == "minimax":
+        seeds = [mn[0]["execution"]["control"]["seed"] for _, mn in nulls]
+        if len(set(seeds)) != len(seeds):
+            raise GateError(f"minimax floor: null seeds repeat ({seeds}); the spread needs independent controls")
+    return onset
 
 
 def allowed_dnll_rules(engine, profile):
@@ -112,7 +210,7 @@ def check_dnll_policy(rule, engine, profile, n_nulls):
         raise GateError(f"--dnll-rule {rule} is not allowed for engine {engine} profile {profile} (DNLL_POLICY grants it to: "
                         f"{granted}); use the absolute rule")
     if n_nulls < FLOOR_MIN_NULLS:
-        raise GateError(f"--dnll-rule floor needs at least {FLOOR_MIN_NULLS} --null-arm layer-0 null controls, got {n_nulls}")
+        raise GateError(f"--dnll-rule floor needs at least {FLOOR_MIN_NULLS} --null-arm null controls, got {n_nulls}")
 
 
 def floor_limit(null_dnll):
@@ -136,6 +234,103 @@ def dnll_verdict(dnll, rule, max_dnll, null_dnll=()):
         out["limit"] = max_dnll
     out["pass"] = bool(dnll <= out["limit"])
     return out
+
+
+def copy_rows(tokens, rows, k=MM_FLOOR["copy_k"]):
+    """Mask over the labelled rows (row i at prompt position total - rows + i predicts the next token; the last row has no
+    label): True where the last k prompt tokens occurred before and the most recent earlier occurrence was followed by the
+    true next token. Token-only, so the same rows for every arm; retrieving them is what attention does."""
+    t = np.asarray(tokens, dtype=np.int64)
+    total = len(t)
+    first = total - rows
+    mask = np.zeros(max(0, total - 1 - first), dtype=bool)
+    # Only scored history keys need tracking; a long prompt must not grow this map beyond the scored tail.
+    last = {t[p - k + 1:p + 1].tobytes(): None for p in range(max(k - 1, first), total - 1)}
+    for p in range(k - 1, total - 1):
+        key = t[p - k + 1:p + 1].tobytes()
+        if p >= first:
+            q = last.get(key)
+            mask[p - first] = q is not None and t[q + 1] == t[p + 1]
+        if key in last:
+            last[key] = p
+    return mask
+
+
+def binom_sf(w, n, p):
+    """P(X >= w) for X ~ Binomial(n, p), summed exactly in log space."""
+    if w <= 0:
+        return 1.0
+    if w > n or p <= 0.0:
+        return 0.0
+    if p >= 1.0:
+        return 1.0
+    lp, lq = math.log(p), math.log1p(-p)
+    terms = [math.lgamma(n + 1) - math.lgamma(j + 1) - math.lgamma(n - j + 1) + j * lp + (n - j) * lq for j in range(w, n + 1)]
+    m = max(terms)
+    return min(1.0, math.exp(m) * sum(math.exp(x - m) for x in terms))
+
+
+def arm_stats(results, copy_masks, policy=MM_FLOOR):
+    """Pooled statistics of one arm against the reference: KL / top-1 / dNLL, per-row KL quantiles, the rows it makes worse
+    or better on the true token, and next-token misses on copy rows (reference and arm)."""
+    kl = np.concatenate([r["kl"] for r in results])
+    d = np.concatenate([r["nll_cand"] - r["nll_ref"] for r in results])
+    hit_ref = np.concatenate([r["hit_ref"] for r in results])
+    hit = np.concatenate([r["hit_cand"] for r in results])
+    cm = np.concatenate(copy_masks)
+    if cm.size != d.size:
+        raise GateError("copy-row mask does not match the labelled rows")
+    eps = policy["sign_min_abs"]
+    return {"rows": int(kl.size), "kl": float(kl.mean()), "top1": float(np.concatenate([r["agree"] for r in results]).mean()),
+            "dnll": float(np.concatenate([r["nll_cand"] for r in results]).mean() - np.concatenate([r["nll_ref"] for r in results]).mean()),
+            "kl_q": {f"q{round(q * 100)}": float(np.quantile(kl, q)) for q in policy["kl_quantiles"]},
+            "worse": int((d >= eps).sum()), "better": int((d <= -eps).sum()), "copy_rows": int(cm.sum()),
+            "copy_miss_ref": int((cm & ~hit_ref).sum()), "copy_miss": int((cm & ~hit).sum()),
+            "copy_dnll": float(d[cm].mean()) if cm.any() else 0.0}
+
+
+def mean_sd(values):
+    v = np.asarray(values, dtype=np.float64)
+    if v.size < FLOOR_MIN_NULLS or not np.all(np.isfinite(v)):
+        raise GateError(f"floor rule needs at least {FLOOR_MIN_NULLS} finite null values, got {v.tolist()}")
+    return float(v.mean()), float(v.std(ddof=1))
+
+
+def minimax_floor_checks(c, nulls, policy=MM_FLOOR, max_kl=0.02, min_top1=0.93, max_dnll=0.01):
+    """The MiniMax floor checks of candidate stats `c` against the null stats; every check with required=True must pass.
+    The floor only relaxes: KL / top-1 / dNLL limits are the looser of the absolute bar and the null spread (mean +- 2 sd),
+    the dNLL limit capped at policy dnll_cap, so a tight or negative null floor never makes a bar stricter than absolute."""
+    checks, k = [], FLOOR_SIGMAS
+
+    def add(name, value, limit, ok, required=True, **extra):
+        checks.append({"name": name, "value": value, "limit": limit, "pass": bool(ok), "required": required, **extra})
+
+    m, s = mean_sd([n["kl"] for n in nulls])
+    limit = max(max_kl, m + k * s)
+    add("kl", c["kl"], limit, c["kl"] <= limit, mean=m, sd=s, floor=m + k * s, abs=max_kl)
+    m, s = mean_sd([n["top1"] for n in nulls])
+    limit = min(min_top1, m - k * s)
+    add("top1", c["top1"], limit, c["top1"] >= limit, mean=m, sd=s, floor=m - k * s, abs=min_top1)
+    m, s = mean_sd([n["dnll"] for n in nulls])
+    limit = min(max(max_dnll, m + k * s), policy["dnll_cap"])
+    add("dnll", c["dnll"], limit, c["dnll"] <= limit, mean=m, sd=s, floor=m + k * s, abs=max_dnll, cap=policy["dnll_cap"])
+    for q in c["kl_q"]:
+        m, s = mean_sd([n["kl_q"][q] for n in nulls])
+        tol = policy["kl_quantile_tol"].get(q, 0.0)
+        limit = max(m + k * s, tol)
+        add(f"kl_{q}", c["kl_q"][q], limit, c["kl_q"][q] <= limit, required=q in policy["required_quantiles"],
+            mean=m, sd=s, floor=m + k * s, tol=tol)
+    nw, nc = sum(n["worse"] for n in nulls), sum(n["worse"] + n["better"] for n in nulls)
+    p0 = max(0.5, nw / nc) if nc else 0.5
+    changed = c["worse"] + c["better"]
+    p = binom_sf(c["worse"], changed, p0)
+    add("sign", p, policy["sign_alpha"], p >= policy["sign_alpha"], worse=c["worse"], better=c["better"], p0=p0)
+    extra = c["copy_miss"] - c["copy_miss_ref"]
+    worst = max(0, max(n["copy_miss"] - n["copy_miss_ref"] for n in nulls))
+    slack = max(1, math.ceil(policy["copy_slack_frac"] * c["copy_rows"]))
+    add("copy", extra, worst + slack, extra <= worst + slack, rows=c["copy_rows"], miss_ref=c["copy_miss_ref"],
+        miss=c["copy_miss"], worst_null=worst, power=c["copy_rows"] > 0)
+    return checks
 
 
 def sha256_file(path):
@@ -192,6 +387,28 @@ def seal(a):
         raise GateError(f"seal: no binary {binary}")
     env = parse_pairs(a.env, "--env")
     attest = parse_pairs(a.attest, "--attest")
+    prompts = dump_entries(a, attest)
+    doc = {"schema": SCHEMA, "run_id": a.run_id, "arm": a.arm, "rank": a.rank, "prefix": a.prefix,
+           "binary": {"name": binary.name, "sha256": sha256_file(binary)}, "env": env, "attest": attest,
+           "sealed_unix": int(time.time()), "prompts": prompts}
+    if a.execution_witness:
+        try:
+            doc["execution"] = json.loads(pathlib.Path(a.execution_witness).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise GateError(f"cannot read execution witness: {e}") from e
+        execution_witness(doc)
+    tmp = manifest.with_suffix(".tmp")
+    tmp.write_text(json.dumps(doc, indent=1, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
+    os.replace(tmp, manifest)
+    print(f"sealed {manifest.name}: run {a.run_id} arm {a.arm} rank {a.rank} binary {doc['binary']['sha256'][:12]} "
+          f"prompts {' '.join(prompts)}")
+    return 0
+
+
+def dump_entries(a, attest):
+    """The sealed prompts map of one rank (seal and witness): every expected dump present, fresh, of the declared rows and
+    finite; per prompt the token count / sha256 and per dump its bytes / sha256 / width (selection: records / mode)."""
+    d = pathlib.Path(a.dir)
     prompts = {}
     for name, tok_path in parse_pairs(a.prompt, "--prompt").items():
         tok = pathlib.Path(tok_path)
@@ -228,20 +445,144 @@ def seal(a):
         prompts[name] = {"tokens": tok.stat().st_size // 4, "tokens_sha256": sha256_file(tok), "rows": a.rows, "files": files}
     if not prompts:
         raise GateError("seal: no --prompt")
-    doc = {"schema": SCHEMA, "run_id": a.run_id, "arm": a.arm, "rank": a.rank, "prefix": a.prefix,
-           "binary": {"name": binary.name, "sha256": sha256_file(binary)}, "env": env, "attest": attest,
-           "sealed_unix": int(time.time()), "prompts": prompts}
-    if a.execution_witness:
+    return prompts
+
+
+# ------------------------------------------------------------------------------------------------------- witness
+RECEIPT_PREFIX = "strix-route-receipt "
+# Switches that only name outputs or the control: excluded from the numerical configuration identity.
+MM_OUTPUT_SWITCHES = frozenset({"STRIX_MM_QUALITY_OUT", "STRIX_MM_QUALITY_ROWS", "STRIX_MM_QUALITY_SELECT", "STRIX_MM_STATE_FNV",
+                                "STRIX_MM_DIAG_ATTN_ULP"})
+# The FAST layer set's own lever and switches: ignored by config_difference (candidate == reference + this layer set).
+MM_FAST_SWITCHES = frozenset({"STRIX_MM_PF_MSA_FLASH", "STRIX_MM_PF_MSA_FLASH_LAYERS", "STRIX_MM_FAST_PREFILL"})
+MM_FAST_LEVERS = frozenset({"minimax.msa_flash"})
+MM_DIAG = re.compile(rb'DIAG attn ulp: layer (\d+) seed (\d+) rows (\d+) pos0 (\d+) values (\d+) prompt ("(?:[^"\\]|\\.)*")\s*')
+
+
+def canonical_sha(obj):
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def model_bundle_sha256(root):
+    """Identity of every model asset: sorted relative path, size and complete content digest (including tensor payloads)."""
+    root = pathlib.Path(root)
+    if not root.is_dir():
+        raise GateError(f"witness: no model directory {root}")
+    entries = []
+    for dirpath, dirs, files in os.walk(root):
+        dirs.sort()
+        for f in sorted(files):
+            p = pathlib.Path(dirpath) / f
+            if not p.is_file():
+                continue
+            size = p.stat().st_size
+            if f.endswith(".safetensors"):
+                with open(p, "rb") as fh:
+                    head = fh.read(8)
+                    n = int.from_bytes(head, "little") if len(head) == 8 else -1
+                    if n <= 0 or n > (256 << 20) or 8 + n > size:
+                        raise GateError(f"witness: {p} has no safetensors header")
+            entries.append([p.relative_to(root).as_posix(), size, "full", sha256_file(p)])
+    if not entries:
+        raise GateError(f"witness: empty model directory {root}")
+    return canonical_sha({"files": entries})
+
+
+def minimax_execution(log, rank, prompts):
+    """MiniMax adapter: engine / profile / configuration identities from the rank's process route receipt, the control
+    from the null-control log lines ("DIAG attn ulp: layer L seed S ..."; none = no control)."""
+    receipts = []
+    for line in log.decode("utf-8", "replace").splitlines():
+        if line.startswith(RECEIPT_PREFIX):
+            try:
+                doc = json.loads(line[len(RECEIPT_PREFIX):])
+            except ValueError as e:
+                raise GateError(f"witness: unreadable route receipt: {e}") from e
+            if isinstance(doc, dict) and doc.get("engine") == "minimax" and doc.get("rank") == rank and doc.get("scope") == "process":
+                receipts.append(doc)
+    if len(receipts) != 1:
+        raise GateError(f"witness: expected one minimax process route receipt of rank {rank}, found {len(receipts)}")
+    rc, levers = receipts[0], {}
+    for lv in rc.get("levers") or []:
+        name, eff = (lv.get("name"), lv.get("effective")) if isinstance(lv, dict) else (None, None)
+        if not isinstance(name, str) or not isinstance(eff, str) or name in levers:
+            raise GateError("witness: malformed or repeated lever in the route receipt")
+        levers[name] = eff
+    for need in ("minimax.msa_flash", "minimax.moe_prefill_format", "minimax.prefill_identity"):
+        if need not in levers:
+            raise GateError(f"witness: the route receipt lacks lever {need}")
+    switches = (rc.get("switches") or {}).get("set") if isinstance(rc.get("switches"), dict) else None
+    if not isinstance(switches, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in switches.items()):
+        raise GateError("witness: the route receipt lacks its switch set")
+    sw = {k: v for k, v in switches.items() if k not in MM_OUTPUT_SWITCHES}
+    m = re.fullmatch(r"([0-9]+)(?::layers=([01]+))?", levers["minimax.msa_flash"])
+    if not m or (m.group(1) != "0") != (m.group(2) is not None):
+        raise GateError(f"witness: unexpected minimax.msa_flash value {levers['minimax.msa_flash']!r}")
+    fast = None
+    if m.group(1) != "0":
+        layers = [i for i, ch in enumerate(m.group(2)) if ch == "1"]
+        if not layers:
+            raise GateError("witness: MSA flash selected on no layer")
+        fast = {"policy": "msa-flash", "msa_flash_mode": 10 + int(m.group(1)), "layers": layers}
+    plain = levers["minimax.moe_prefill_format"] == "exl3" and levers["minimax.prefill_identity"] == "default"
+    profile = ("fast-prefill" if fast else "exact") if plain else "other"
+    diag, covered = [], set()
+    for line in log.splitlines():
+        if not line.startswith(b"DIAG attn ulp:"):
+            continue
+        event = MM_DIAG.fullmatch(line)
+        if event is None:
+            raise GateError("witness: null-control event lacks a prompt identity or is malformed")
         try:
-            doc["execution"] = json.loads(pathlib.Path(a.execution_witness).read_text(encoding="utf-8"))
-        except (OSError, ValueError) as e:
-            raise GateError(f"cannot read execution witness: {e}") from e
-        execution_witness(doc)
-    tmp = manifest.with_suffix(".tmp")
-    tmp.write_text(json.dumps(doc, indent=1, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
-    os.replace(tmp, manifest)
-    print(f"sealed {manifest.name}: run {a.run_id} arm {a.arm} rank {a.rank} binary {doc['binary']['sha256'][:12]} "
-          f"prompts {' '.join(prompts)}")
+            prompt = json.loads(event[6])
+        except (ValueError, UnicodeError) as e:
+            raise GateError("witness: invalid null-control prompt identity") from e
+        layer, seed, rows, pos0, values = map(int, event.groups()[:5])
+        if prompt not in prompts:
+            raise GateError(f"witness: null-control event names unsealed prompt {prompt!r}")
+        if rows == 0 or values == 0 or pos0 + rows > prompts[prompt]["tokens"]:
+            raise GateError(f"witness: empty or out-of-range null-control event for {prompt!r}")
+        covered.add(prompt)
+        diag.append((layer, seed))
+    control = None
+    if diag:
+        layer_set, seed_set = {int(x[0]) for x in diag}, {int(x[1]) for x in diag}
+        if len(layer_set) != 1 or len(seed_set) != 1:
+            raise GateError(f"witness: the null control fired at layers {sorted(layer_set)} with seeds {sorted(seed_set)}")
+        if covered != set(prompts):
+            raise GateError(f"witness: null-control events missing for prompts {sorted(set(prompts) - covered)}")
+        control = {"kind": MM_NULL_KIND, "layer": layer_set.pop(), "magnitude": 1, "unit": "ulp", "seed": seed_set.pop()}
+    return {"engine": "minimax", "profile": profile, "fast": fast, "control": control,
+            "numerical_config_sha256": canonical_sha({"engine": "minimax", "levers": levers, "switches": sw}),
+            "config": {"levers": levers, "switches": sw}, "route_fingerprint": rc.get("fingerprint")}
+
+
+WITNESS_ADAPTERS = {"minimax": minimax_execution}
+
+
+def witness(a):
+    out = pathlib.Path(a.out)
+    if out.exists():
+        raise GateError(f"{out}: exists (witnesses are never rewritten)")
+    binary = pathlib.Path(a.binary)
+    if not binary.is_file():
+        raise GateError(f"witness: no binary {binary}")
+    try:
+        log = pathlib.Path(a.engine_log).read_bytes()
+    except OSError as e:
+        raise GateError(f"witness: cannot read the engine log: {e}") from e
+    prompts = dump_entries(a, parse_pairs(a.attest, "--attest"))
+    w = {"schema": WITNESS_SCHEMA, "run_id": a.run_id, "rank": a.rank, "binary_sha256": sha256_file(binary),
+         "model_sha256": model_bundle_sha256(a.model), "prompts": prompts,
+          **WITNESS_ADAPTERS[a.engine](log, a.rank, prompts)}
+    execution_witness({"execution": w, "run_id": a.run_id, "rank": a.rank, "binary": {"sha256": w["binary_sha256"]},
+                       "prompts": prompts})
+    tmp = out.with_suffix(".tmp")
+    tmp.write_text(json.dumps(w, indent=1, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
+    os.replace(tmp, out)
+    fast = w["fast"]
+    print(f"witness {out.name}: run {a.run_id} rank {a.rank} engine {w['engine']} profile {w['profile']} control {w['control']} "
+          f"fast {None if fast is None else (fast['msa_flash_mode'], fast['layers'][0], fast['layers'][-1], len(fast['layers']))}")
     return 0
 
 
@@ -267,8 +608,8 @@ def load_arm(d, ranks):
     if any("execution" in doc for doc in docs):
         witnesses = [execution_witness(doc) for doc in docs]
         for w in witnesses[1:]:
-            for key in ("engine", "profile", "model_sha256", "numerical_config_sha256", "control"):
-                if w[key] != witnesses[0][key]:
+            for key in ("engine", "profile", "model_sha256", "numerical_config_sha256", "control", "fast", "config"):
+                if w.get(key) != witnesses[0].get(key):
                     raise GateError(f"{d}: ranks disagree on execution {key}")
     return d, docs
 
@@ -306,7 +647,7 @@ def compare_logits(da, a, db, b, name, tokens, chunk=16):
     total = len(tokens)
     if rows > total:
         raise GateError(f"{name}: {rows} rows scored but the prompt has {total} tokens")
-    kl, agree, nla, nlb = np.empty(rows), np.empty(rows, bool), [], []
+    kl, agree, nla, nlb, hia, hib = np.empty(rows), np.empty(rows, bool), [], [], [], []
     identical = True
     for i in range(0, rows, chunk):
         za = np.concatenate([s[i:i + chunk] for s in sa], axis=1).astype(np.float64)
@@ -316,13 +657,17 @@ def compare_logits(da, a, db, b, name, tokens, chunk=16):
         identical = identical and bool((za == zb).all())
         la, lb = log_softmax(za), log_softmax(zb)
         kl[i:i + chunk] = (np.exp(la) * (la - lb)).sum(axis=1)
-        agree[i:i + chunk] = za.argmax(axis=1) == zb.argmax(axis=1)
+        ta, tb = za.argmax(axis=1), zb.argmax(axis=1)
+        agree[i:i + chunk] = ta == tb
         for j in range(za.shape[0]):
             pos = total - rows + i + j  # the row at prompt position pos predicts token pos + 1
             if pos + 1 < total:
                 nla.append(-la[j, tokens[pos + 1]])
                 nlb.append(-lb[j, tokens[pos + 1]])
-    return {"rows": rows, "kl": kl, "agree": agree, "nll_ref": np.array(nla), "nll_cand": np.array(nlb), "identical": identical}
+                hia.append(ta[j] == tokens[pos + 1])
+                hib.append(tb[j] == tokens[pos + 1])
+    return {"rows": rows, "kl": kl, "agree": agree, "nll_ref": np.array(nla), "nll_cand": np.array(nlb),
+            "hit_ref": np.array(hia, dtype=bool), "hit_cand": np.array(hib, dtype=bool), "identical": identical}
 
 
 def compare_selection(da, a, db, b, name):
@@ -391,8 +736,8 @@ def compare(a):
         if sorted(mn[0]["prompts"]) != names:
             raise GateError(f"{nd}: null arm prompt set differs from the reference / candidate")
         nulls.append((dn, mn))
-    if a.dnll_rule == "floor":
-        check_floor_execution(ma, mb, nulls, a.engine, a.profile)
+    onset = check_floor_execution(ma, mb, nulls, a.engine, a.profile) if a.dnll_rule == "floor" else None
+    mm_floor = a.dnll_rule == "floor" and a.engine == "minimax"
     report = {"ref": {k: ma[0][k] for k in ("run_id", "arm", "env", "attest")}, "cand": {k: mb[0][k] for k in ("run_id", "arm", "env", "attest")},
               "ref_binary": [m["binary"]["sha256"] for m in ma], "cand_binary": [m["binary"]["sha256"] for m in mb], "prompts": {}}
     if a.dnll_rule == "floor":
@@ -402,13 +747,18 @@ def compare(a):
     print(f"cand run {mb[0]['run_id']} arm {mb[0]['arm']} env {mb[0]['env']} binary {report['cand_binary'][0][:12]}")
     pooled = {"kl": [], "agree": [], "nll_ref": [], "nll_cand": []}
     identical, sel_slots, sel_slot_diff, sel_id_diff, sel_seen = True, 0, 0, 0, False
+    results, copy_masks, tok_of = [], [], {}
     for name in names:
         tok_sha = sha256_file(tokens[name])
         for m in ma + mb + [m for _, mn in nulls for m in mn]:
             if m["prompts"][name]["tokens_sha256"] != tok_sha:
                 raise GateError(f"{name}: a sealed run used a different token file than --tokens")
         tok = np.fromfile(tokens[name], "<u4").astype(np.int64)
+        if nulls:
+            tok_of[name] = tok
         r = compare_logits(da, ma, db, mb, name, tok)
+        results.append(r)
+        copy_masks.append(copy_rows(tok, r["rows"]))
         identical = identical and r["identical"]
         for k in pooled:
             pooled[k].append(r[k])
@@ -436,20 +786,21 @@ def compare(a):
     kl = float(np.concatenate(pooled["kl"]).mean())
     top1 = float(np.concatenate(pooled["agree"]).mean())
     dnll = float(np.concatenate(pooled["nll_cand"]).mean() - np.concatenate(pooled["nll_ref"]).mean())
-    null_rows = []
+    stats = arm_stats(results, copy_masks)
+    print(f"rows {stats['rows']}: KL q50 {stats['kl_q']['q50']:.2e} q90 {stats['kl_q']['q90']:.2e} "
+          f"q99 {stats['kl_q']['q99']:.2e}; true token worse {stats['worse']} better {stats['better']}; copy rows "
+          f"{stats['copy_rows']} misses ref {stats['copy_miss_ref']} cand {stats['copy_miss']} (copy dNLL {stats['copy_dnll']:+.5f})")
+    null_rows, null_stats = [], []
     for dn, mn in nulls:  # pooled exactly like the candidate: same reference, same prompts, same labels
-        acc = {"kl": [], "agree": [], "nll_ref": [], "nll_cand": []}
-        for name in names:
-            r = compare_logits(da, ma, dn, mn, name, np.fromfile(tokens[name], "<u4").astype(np.int64))
-            for k in acc:
-                acc[k].append(r[k])
-        nd_ = float(np.concatenate(acc["nll_cand"]).mean() - np.concatenate(acc["nll_ref"]).mean())
+        rs = [compare_logits(da, ma, dn, mn, name, tok_of[name]) for name in names]
+        st = arm_stats(rs, copy_masks)
+        null_stats.append(st)
         null_rows.append({"dir": str(dn), "run_id": mn[0]["run_id"], "arm": mn[0]["arm"], "env": mn[0]["env"],
-                          "execution": mn[0]["execution"],
-                          "rows": int(sum(len(k) for k in acc["kl"])), "kl": float(np.concatenate(acc["kl"]).mean()),
-                          "top1": float(np.concatenate(acc["agree"]).mean()), "dnll": nd_})
-        print(f"null {mn[0]['arm']} run {mn[0]['run_id']} env {mn[0]['env']}: KL {null_rows[-1]['kl']:.5f}, "
-              f"top-1 {null_rows[-1]['top1']:.4f}, dNLL {nd_:+.5f}")
+                          "execution": mn[0]["execution"], "rows": st["rows"], "kl": st["kl"], "top1": st["top1"],
+                          "dnll": st["dnll"], "stats": st})
+        print(f"null {mn[0]['arm']} run {mn[0]['run_id']} env {mn[0]['env']}: KL {st['kl']:.5f}, top-1 {st['top1']:.4f}, "
+              f"dNLL {st['dnll']:+.5f}; KL q50/q90/q99 {st['kl_q']['q50']:.2e}/{st['kl_q']['q90']:.2e}/{st['kl_q']['q99']:.2e}; "
+              f"worse {st['worse']} better {st['better']}; copy misses {st['copy_miss']} (ref {st['copy_miss_ref']})")
     dv = None
     if a.expect_identical:
         ok = identical and sel_slot_diff == 0
@@ -458,15 +809,34 @@ def compare(a):
         dv = dnll_verdict(dnll, a.dnll_rule, a.max_dnll, [x["dnll"] for x in null_rows])
         dv.update(engine=a.engine, profile=a.profile, nulls=null_rows)
         ok = kl <= a.max_kl and top1 >= a.min_top1 and dv["pass"]
-        if a.dnll_rule == "floor":
+        if mm_floor:
+            checks = minimax_floor_checks(stats, null_stats, max_kl=a.max_kl, min_top1=a.min_top1, max_dnll=a.max_dnll)
+            dnll_check = next(c for c in checks if c["name"] == "dnll")
+            dv.update(policy=MM_FLOOR["policy"], onset=onset, checks=checks, floor_limit=dv["limit"],
+                      limit=dnll_check["limit"], cap=MM_FLOOR["dnll_cap"], pass_dnll=dnll_check["pass"])
+            dv["pass"] = dnll_check["pass"]
+            ok = all(c["pass"] for c in checks if c["required"])
+            for c in checks:
+                extra = {k: v for k, v in c.items() if k not in ("name", "value", "limit", "pass", "required")}
+                print(f"check {c['name']}: {c['value']:.6g} vs limit {c['limit']:.6g} -> {'PASS' if c['pass'] else 'FAIL'}"
+                      f"{'' if c['required'] else ' (reported, not required)'} "
+                      f"{json.dumps(extra, sort_keys=True)}")
+            rule = (f"floor {a.engine}/{a.profile} {MM_FLOOR['policy']} onset layer {onset}, {dv['n_nulls']} nulls: all of "
+                    f"{', '.join(c['name'] for c in checks if c['required'])} (floor only relaxes the absolute bar)")
+        elif a.dnll_rule == "floor":
             rule = (f"KL <= {a.max_kl}, top-1 >= {a.min_top1}, dNLL <= {dv['limit']:+.5f} (floor {a.engine}/{a.profile}: "
                     f"{dv['n_nulls']} nulls mean {dv['mean']:+.5f} + {FLOOR_SIGMAS:g} sd {dv['sd']:.5f})")
         else:
             rule = f"KL <= {a.max_kl}, top-1 >= {a.min_top1}, dNLL <= {a.max_dnll}"
     report["pooled"] = {"rows": int(sum(len(k) for k in pooled["kl"])), "kl": kl, "top1": top1, "dnll": dnll, "identical": identical,
                         "selection": {"slots": sel_slots, "slot_diff": sel_slot_diff, "id_diff": sel_id_diff} if sel_seen else None,
-                        "rule": rule, "dnll_rule": dv, "pass": ok}
-    if dv is not None and a.dnll_rule == "floor":
+                        "rule": rule, "dnll_rule": dv, "stats": stats, "pass": ok}
+    if mm_floor:
+        absolute = kl <= a.max_kl and top1 >= a.min_top1 and dnll <= a.max_dnll
+        report["pooled"]["abs_pass"] = bool(absolute)
+        print(f"REFERENCE absolute KL <= {a.max_kl}, top-1 >= {a.min_top1}, dNLL <= {a.max_dnll}: "
+              f"{'PASS' if absolute else 'FAIL'} (not the verdict under the floor rule)")
+    elif dv is not None and a.dnll_rule == "floor":
         print(f"REFERENCE absolute dNLL <= {a.max_dnll}: {'PASS' if dv['abs_pass'] else 'FAIL'} (not the verdict under the floor rule)")
     sel = f"; selection {sel_slot_diff}/{sel_slots} slots differ, {sel_id_diff} ids" if sel_seen else ""
     print(f"POOLED rows {report['pooled']['rows']}: KL {kl:.5f}, top-1 {top1:.4f}, dNLL {dnll:+.5f}, logits identical {identical}{sel} "
@@ -493,6 +863,21 @@ def main(argv=None):
     s.add_argument("--execution-witness", metavar="JSON", help="launcher/engine execution evidence; required on every floor arm")
     s.add_argument("--select", action="store_true", help="selection dumps are required")
     s.add_argument("--not-before", type=float, help="unix time the run started: older dumps are stale")
+    w = sub.add_parser("witness")
+    w.add_argument("--dir", required=True)
+    w.add_argument("--rank", type=int, required=True)
+    w.add_argument("--run-id", required=True)
+    w.add_argument("--binary", required=True)
+    w.add_argument("--prefix", default="q")
+    w.add_argument("--rows", type=int, required=True)
+    w.add_argument("--prompt", action="append", metavar="NAME=TOKENS.u32")
+    w.add_argument("--attest", action="append", metavar="KEY=VALUE", help="sel_mode=N must equal the selection dump's mode")
+    w.add_argument("--select", action="store_true", help="selection dumps are required")
+    w.add_argument("--not-before", type=float, help="unix time the run started: older dumps are stale")
+    w.add_argument("--engine", required=True, choices=sorted(WITNESS_ADAPTERS))
+    w.add_argument("--engine-log", required=True, help="the rank's complete engine stdout + stderr")
+    w.add_argument("--model", required=True, help="model directory the rank loaded")
+    w.add_argument("--out", required=True, help="execution-r<rank>.json to write (then: seal --execution-witness)")
     c = sub.add_parser("compare")
     c.add_argument("ref")
     c.add_argument("cand")
@@ -503,18 +888,18 @@ def main(argv=None):
     c.add_argument("--max-dnll", type=float, default=0.01)
     c.add_argument("--dnll-rule", choices=("abs", "floor"), default="abs",
                    help="abs: dNLL <= --max-dnll (default, every engine); floor: dNLL <= mean + 2 sd of the --null-arm runs "
-                        "(only engine/profile pairs in DNLL_POLICY, today ds41/fast-prefill)")
+                        "(only engine/profile pairs in DNLL_POLICY: ds41/fast-prefill, minimax/fast-prefill)")
     c.add_argument("--null-arm", action="append", metavar="DIR",
-                   help="sealed layer-0 null-control run on the candidate's binary and prompts (repeat, >= 3 for floor)")
+                   help="sealed null-control run on the candidate's binary and prompts (DS41: layer 0; MiniMax: the candidate's first FAST layer; repeat, >= 3 for floor)")
     c.add_argument("--engine", help="engine of the candidate (floor rule policy check), e.g. ds41")
     c.add_argument("--profile", help="profile of the candidate (floor rule policy check), e.g. fast-prefill")
     c.add_argument("--expect-identical", action="store_true", help="repeat of one identity: any difference fails")
     c.add_argument("--json")
     a = ap.parse_args(argv)
     try:
-        if a.cmd == "seal" and a.rows <= 0:
-            raise GateError("seal: --rows must be positive")
-        return seal(a) if a.cmd == "seal" else compare(a)
+        if a.cmd in ("seal", "witness") and a.rows <= 0:
+            raise GateError(f"{a.cmd}: --rows must be positive")
+        return {"seal": seal, "witness": witness, "compare": compare}[a.cmd](a)
     except GateError as e:
         print(f"fast_logit_gate: {e}", file=sys.stderr)
         return 2
