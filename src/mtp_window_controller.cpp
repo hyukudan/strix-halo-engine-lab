@@ -199,10 +199,11 @@ std::uint32_t mtp_serve_joint_group_lanes(std::uint64_t cycle) noexcept {
         try {
             const char* raw=envcfg::text("STRIX_SERVE_JOINT_GROUP_LANES");
             if(raw && std::string_view(raw)=="ab") return 0U;
-            // Default 8 (one forward per eight requests): a 9-lane single group stalled the server on the
-            // device (cluster receipt 15-nov, cycle after the first 9-lane group), so 9..16 stays opt-in.
-            return envcfg::number<std::uint32_t>("STRIX_SERVE_JOINT_GROUP_LANES",8U,8U,kMtpJointGroupLanesMax);
-        } catch(...) {return 8U;}}();
+            // Default 16: above the lane bound one group (one weight read) takes up to 16 requests. Same token ids
+            // as 8 per request; 9 lanes 171.8 against 211.8 ms per cycle (joint16 receipt, 16-nov). The earlier
+            // 9-lane stall was the wide launchers' eight-session tables (kCohortWideMaxSessions). 8 = old form.
+            return envcfg::number<std::uint32_t>("STRIX_SERVE_JOINT_GROUP_LANES",kMtpJointGroupLanesMax,8U,kMtpJointGroupLanesMax);
+        } catch(...) {return kMtpJointGroupLanesMax;}}();
     return lanes?lanes:(cycle&1U)?8U:kMtpJointGroupLanesMax;
 }
 bool mtp_serve_row_budget_enabled() noexcept {
