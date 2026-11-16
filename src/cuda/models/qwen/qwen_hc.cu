@@ -59,6 +59,14 @@ bool hc_compact_norm_enabled() {
     static const bool on = strix::lever::select(hc_compact_norm_lever, {}).on;
     return on;
 }
+// STRIX_QRTX_HC_INJECT_VEC=0: the scalar inject kernel (one element per thread). Bitwise.
+inline constexpr strix::lever::Decl hc_inject_vec_lever{
+    .name = "qwen_hc_inject_vec", .env = "STRIX_QRTX_HC_INJECT_VEC", .exactness = strix::lever::Exactness::bitwise,
+    .default_on = true, .source = "scripts/bench/cuda/qwen_fast/ident.sh: exact and FAST logit dumps byte-identical on/off"};
+bool hc_inject_vec_enabled() {
+    static const bool on = strix::lever::select(hc_inject_vec_lever, {}).on;
+    return on;
+}
 
 __device__ __forceinline__ float bf16_to_float(std::uint16_t v) { return __uint_as_float(static_cast<std::uint32_t>(v) << 16U); }
 // HIP store_activation (hip_hyper_mix_launcher.hip:202-214, hip_runtime_launchers.hip:118-128): RNE, no NaN case.
@@ -929,6 +937,26 @@ __global__ void expand_kernel(const std::uint16_t* __restrict__ in, std::uint16_
     const std::size_t row = i / kWide, f = i % kHidden;
     out[i] = float_to_bf16(bf16_to_float(in[row * kHidden + f]));  // BF16 -> FP32 -> BF16: the identity
 }
+// Same per-element arithmetic as inject_kernel, 8 elements (16 B) per thread, row = blockIdx.y (lever qwen_hc_inject_vec,
+// bitwise: one fma + one BF16 rounding per element as before; 2560 % 8 == 0 so the 8 elements share one stream).
+__global__ __launch_bounds__(256) void inject_vec_kernel(const std::uint16_t* __restrict__ hyper, const std::uint16_t* __restrict__ hidden,
+    const float* __restrict__ weights, std::uint16_t* __restrict__ out) {
+    const std::size_t row = blockIdx.y;
+    const unsigned within = (blockIdx.x * 256U + threadIdx.x) * 8U, s = within / kHidden, f = within % kHidden;
+    if (within >= kWide) return;
+    const uint4 h = *reinterpret_cast<const uint4*>(hyper + row * kWide + within);
+    const uint4 v = *reinterpret_cast<const uint4*>(hidden + row * kHidden + f);
+    const float w = weights[row * kStreams + s];
+    const unsigned hw[4] = {h.x, h.y, h.z, h.w}, vw[4] = {v.x, v.y, v.z, v.w};
+    unsigned o[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const std::uint16_t lo = float_to_bf16(__fmaf_rn(bf16_to_float(static_cast<std::uint16_t>(vw[k])), w, bf16_to_float(static_cast<std::uint16_t>(hw[k]))));
+        const std::uint16_t hi = float_to_bf16(__fmaf_rn(bf16_to_float(static_cast<std::uint16_t>(vw[k] >> 16U)), w, bf16_to_float(static_cast<std::uint16_t>(hw[k] >> 16U))));
+        o[k] = static_cast<unsigned>(lo) | (static_cast<unsigned>(hi) << 16U);
+    }
+    *reinterpret_cast<uint4*>(out + row * kWide + within) = make_uint4(o[0], o[1], o[2], o[3]);
+}
 __global__ void inject_kernel(const std::uint16_t* __restrict__ hyper, const std::uint16_t* __restrict__ hidden,
     const float* __restrict__ weights, std::uint16_t* __restrict__ out, std::size_t total) {
     const std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -1407,7 +1435,12 @@ void inject(const std::uint16_t* hyper, const std::uint16_t* hidden, const float
     std::uint16_t* out, cudaStream_t stream) {
     const std::size_t total = std::size_t{rows} * kWide;
     if (!total) return;
-    inject_kernel<<<blocks_for(total, 256U), 256U, 0, stream>>>(hyper, hidden, injection, out, total);
+    const bool aligned = ((reinterpret_cast<std::uintptr_t>(hyper) | reinterpret_cast<std::uintptr_t>(hidden) |
+                           reinterpret_cast<std::uintptr_t>(out)) & 15U) == 0U;
+    if (aligned && rows <= 65535U && hc_inject_vec_enabled())
+        inject_vec_kernel<<<dim3((kWide / 8U + 255U) / 256U, rows), 256U, 0, stream>>>(hyper, hidden, injection, out);
+    else
+        inject_kernel<<<blocks_for(total, 256U), 256U, 0, stream>>>(hyper, hidden, injection, out, total);
     check(cudaGetLastError(), "inject launch");
 }
 void combine(const std::uint16_t* shared, const std::uint16_t* routed, std::uint32_t rows, std::uint16_t* out, cudaStream_t stream) {
