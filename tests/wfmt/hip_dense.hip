@@ -113,6 +113,39 @@ template<unsigned Form> __global__ void prepared_kernel(strix::core::f16_dense_t
     U4 data[8];c.stage(0,threadIdx.x%16U,0,data);
     for(unsigned i=0;i<8U;++i) reinterpret_cast<U4*>(out)[threadIdx.x*8U+i]=data[i];
 }
+struct StridedCols {
+    const _Float16* weight;float* out;unsigned in,count,stride;
+    __device__ strix::core::f16_dense_tall::ColumnTile tile(unsigned i) const {return {nullptr,out+16U*i,count,16U*i<count};}
+    __device__ void stage(unsigned tile,unsigned col,unsigned unit,strix::core::f16_dense_tall::U4* nb) const {
+        namespace d=strix::core::f16_dense_tall;
+        const auto* p=reinterpret_cast<const unsigned char*>(weight)+(static_cast<std::size_t>(2U*unit)*stride+tile*16U+col)*16U;
+#ifdef WFMT_HAS_NATIVE_SOURCES
+        ::strix::weight::hip::RawF16Source::strided_stage(p,stride*16U,nb);
+#else
+#pragma unroll
+        for(unsigned i=0;i<8U;++i) nb[i]=*(d::detail::GlobalU4*)(p+static_cast<std::size_t>(i)*stride*16U);
+#endif
+    }
+};
+__global__ void strided_raw_kernel(const float* x,unsigned k,unsigned rows,StridedCols cols) {
+    namespace d=strix::core::f16_dense_tall;
+    __shared__ d::Storage<1> lds;
+    d::core<1>(x,k,rows,cols,lds,d::q8a8::Store{cols.count,0U,0U});
+}
+void strided_raw_case() {
+    context("hip.raw-f16.strided-columns","hip-raw-f16-wmma@1",{7U,17U,128U},"plain.f16@1");
+    constexpr unsigned rows=7U,n=17U,padded=32U,k=128U;
+    std::vector<_Float16> w(padded*k),packed(padded*k);std::vector<float> x(rows*k);
+    for(unsigned o=0;o<padded;++o) for(unsigned j=0;j<k;++j) {
+        w[o*k+j]=static_cast<_Float16>(static_cast<float>(static_cast<int>((o*7U+j)%31U)-15)*0.03125F);
+        packed[(j/8U*padded+o)*8U+j%8U]=w[o*k+j];
+    }
+    for(unsigned i=0;i<x.size();++i) x[i]=static_cast<float>(static_cast<int>(i%15U)-7)*0.125F;
+    Buffer dw(w.size()*2U),dp(packed.size()*2U),dx(x.size()*4U),dy(rows*n*4U);dw.upload(w);dp.upload(packed);dx.upload(x);
+    hipLaunchKernelGGL(raw_kernel,dim3(1,2),dim3(256),0,0,dx.as<float>(),k,rows,RawCols{dw.as<_Float16>(),dy.as<float>(),k,n});check(hipGetLastError());const auto raw=dy.read<float>(rows*n);
+    hipLaunchKernelGGL(strided_raw_kernel,dim3(1,2),dim3(256),0,0,dx.as<float>(),k,rows,StridedCols{dp.as<_Float16>(),dy.as<float>(),k,n,padded});check(hipGetLastError());const auto strided=dy.read<float>(rows*n);
+    if(raw!=strided) throw std::runtime_error("strided raw F16 source layout differs");
+}
 std::vector<unsigned char> weights(unsigned k,unsigned n) {
     std::vector<unsigned char> w(n*(k/32U)*34U);
     for(unsigned b=0;b<n*(k/32U);++b) {
@@ -361,6 +394,7 @@ int main() try {
     if(!registered || registered->paired_k!=64U || registered->validate(view,shape)) throw std::runtime_error("HIP signed source admitted odd block pair");
     if(wh::find_source({"gguf.iq3_s",1},"f16-tile")) throw std::runtime_error("unregistered HIP source unexpectedly admitted");
 #endif
+    strided_raw_case();
     context("hip.q8-f16-operands","dense-q8a8-f16-v1@1",{16U,256U},"gguf.q8_0@1");
     Buffer op(4096U*3U*2U);hipLaunchKernelGGL(operands_kernel,dim3(16),dim3(256),0,0,op.as<std::uint16_t>());check(hipGetLastError());op.read<std::uint16_t>(4096U*3U);
     partial_case(false);partial_case(true);row_partials<1>();row_partials<32>();signed_partials<1>();signed_partials<16>();signed_partials<64>();f16_partials();
