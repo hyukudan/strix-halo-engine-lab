@@ -47,6 +47,7 @@ std::vector<int> parse_ids(const std::string& s) {
 int main(int argc, char** argv) try {
     using namespace strix::qwen35;
     std::string model, dump, ids_arg = "1";
+    unsigned wide = 0;
     unsigned gen = 16, rows = 1, maxpos = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -58,6 +59,7 @@ int main(int argc, char** argv) try {
         else if (a == "--prompt-ids") ids_arg = next();
         else if (a == "--gen") gen = unsigned(std::stoul(next()));
         else if (a == "--rows") rows = unsigned(std::stoul(next()));
+        else if (a == "--wide") wide = unsigned(std::stoul(next()));  // prompt windows of N rows, last-row logits only (N > 16 = FAST wide prefill)
         else if (a == "--dump-logits") dump = next();
         else if (a == "--max-pos") maxpos = unsigned(std::stoul(next()));
         else throw std::invalid_argument("unknown flag " + a);
@@ -70,6 +72,7 @@ int main(int argc, char** argv) try {
 
     HipEngineOptions opt;
     opt.max_positions = maxpos;
+    opt.prefill_rows = wide;
     const auto t_load0 = std::chrono::steady_clock::now();
     auto E = HipEngine::from_gguf(model, opt);
     const double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load0).count();
@@ -90,6 +93,21 @@ int main(int argc, char** argv) try {
     };
     const auto t_pf0 = std::chrono::steady_clock::now();
     unsigned last_n = 0;
+    if (wide) {
+        for (std::size_t at = 0; at < prompt.size();) {
+            const unsigned n = unsigned(std::min<std::size_t>(wide, prompt.size() - at));
+            std::vector<std::uint32_t> t(n);
+            for (unsigned i = 0; i < n; ++i) t[i] = std::uint32_t(prompt[at + i]);
+            const bool last = at + n == prompt.size();
+            const auto o = E->forward_commit(t.data(), n, last ? LogitRows::last : LogitRows::none);
+            if (last) {
+                E->read_top(o, 1, top);
+                if (!dump.empty()) { dumped.resize(V); E->read_logits(o, 1, dumped.data()); }
+            }
+            at += n;
+        }
+        last_n = 1;
+    } else
     for (std::size_t at = 0; at < prompt.size();) {
         last_n = unsigned(std::min<std::size_t>(rows, prompt.size() - at));
         forward(last_n, prompt.data() + at);

@@ -46,8 +46,8 @@ double quantile(std::vector<double> v, double p) {
 
 int main(int argc, char** argv) try {
     std::string model, ids_file, label = "run", sources = "copy";
-    std::uint32_t n_gen = 256, max_block = 16, max_pos = 0, pf_bench = 0, trace_n = 0;
-    bool check = true, cost_table = false, pf_sample = false, seed_costs = false;
+    std::uint32_t n_gen = 256, max_block = 16, max_pos = 0, pf_bench = 0, trace_n = 0, prefill_rows = 16;
+    bool check = true, cost_table = false, pf_sample = false, seed_costs = false, pf_twice = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -64,6 +64,8 @@ int main(int argc, char** argv) try {
         else if (a == "--cost-table") cost_table = true;
         else if (a == "--prefill-bench") pf_bench = std::uint32_t(std::stoul(next()));
         else if (a == "--pf-sample") pf_sample = true;
+        else if (a == "--pf-twice") pf_twice = true;  // two full prefills: cold first, warm last
+        else if (a == "--prefill-rows") prefill_rows = std::uint32_t(std::stoul(next()));  // >16 = FAST wide windows (dense-q8a8-f16-v1)
         else if (a == "--seed-costs") seed_costs = next() != "0";
         else if (a == "--trace") trace_n = std::uint32_t(std::stoul(next()));
         else if (a == "--label") label = next();
@@ -83,6 +85,7 @@ int main(int argc, char** argv) try {
     opt.max_positions = std::max<std::uint32_t>(max_pos, std::uint32_t(prompt.size()) + n_gen + 128U + (cost_table ? 512U : 0U));
     if (pf_bench) opt.max_positions = std::max(opt.max_positions, pf_bench + 64U);
     opt.quiet = true;
+    opt.prefill_rows = prefill_rows;
     auto E = q::HipEngine::from_gguf(model, opt);
     const auto vocab = E->config().vocab;
     std::printf("loaded: weights %.2f GB/pass, state %.0f MB/pass, max_positions %u\n", double(E->weight_bytes()) / 1e9,
@@ -90,8 +93,9 @@ int main(int argc, char** argv) try {
 
     auto prefill_ids = [&](const std::vector<std::uint32_t>& ids, std::uint32_t& anchor) {
         E->reset();
-        for (std::size_t p = 0; p < ids.size(); p += q::HipEngine::max_rows()) {
-            const auto rows = std::uint32_t(std::min<std::size_t>(q::HipEngine::max_rows(), ids.size() - p));
+        const std::size_t W = E->prefill_rows();
+        for (std::size_t p = 0; p < ids.size(); p += W) {
+            const auto rows = std::uint32_t(std::min<std::size_t>(W, ids.size() - p));
             const bool last = p + rows == ids.size();
             const auto o = E->forward_commit(ids.data() + p, rows, last ? q::LogitRows::last : q::LogitRows::none);
             if (last) E->read_top(o, 1, &anchor);
@@ -110,8 +114,17 @@ int main(int argc, char** argv) try {
     if (pf_bench) {
         std::vector<std::uint32_t> ids(pf_bench);
         for (std::uint32_t i = 0; i < pf_bench; ++i) ids[i] = std::uint32_t(mix(77 + i) % vocab);
-        const std::uint32_t R = q::HipEngine::max_rows();
-        if (!pf_sample) {
+        const std::uint32_t R = E->prefill_rows();
+        if (pf_twice) {
+            std::uint32_t anchor = 0;
+            for (int pass = 0; pass < 2; ++pass) {
+                const double t0 = now_ms();
+                prefill_ids(ids, anchor);
+                const double ms = now_ms() - t0;
+                std::printf("prefill[%s] %s: %u tokens in %.1f ms = %.1f tok/s (window %u, anchor %u)\n", label.c_str(), pass ? "WARM" : "COLD",
+                            pf_bench, ms, 1000.0 * pf_bench / ms, E->prefill_rows(), anchor);
+            }
+        } else if (!pf_sample) {
             std::uint32_t anchor = 0;
             std::vector<std::uint32_t> warm_ids(ids.begin(), ids.begin() + R);
             prefill_ids(warm_ids, anchor);

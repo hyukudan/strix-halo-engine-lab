@@ -20,6 +20,10 @@ namespace strix::qwen35 {
 struct HipEngineOptions {
     std::uint32_t max_positions = 4096;  // KV capacity per full-attention layer
     bool quiet = false;
+    // forward_commit window width. 16 = exact (the serial arithmetic). > 16 = FAST policy dense-q8a8-f16-v1 (shared
+    // core::f16_dense_tall::q8a8: A8 activations x Q8_0 weights, FP16 WMMA) for the dense projections of those wide windows;
+    // GDN and attention keep their exact kernels. Decode windows (forward_rows) stay <= 16 rows.
+    std::uint32_t prefill_rows = 16;
 };
 
 struct HipRowsOut {
@@ -37,6 +41,7 @@ public:
     [[nodiscard]] const Config& config() const;
     [[nodiscard]] std::uint32_t vocab() const;
     [[nodiscard]] static constexpr std::uint32_t max_rows() { return 16U; }
+    [[nodiscard]] std::uint32_t prefill_rows() const;  // widest forward_commit window (options)
     [[nodiscard]] std::uint32_t committed() const;
     [[nodiscard]] std::uint64_t weight_bytes() const;          // bytes read per pass (all weights but the embedding table)
     [[nodiscard]] std::uint64_t state_bytes_per_pass() const;  // GDN state read + write per pass

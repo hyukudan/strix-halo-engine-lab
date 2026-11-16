@@ -21,6 +21,7 @@
 #include "strix/hip_gdn_dims.hpp"
 #include "../../attn_core/dense_decode.hpp"
 #include "../../core/dense_linear.hpp"
+#include "../../core/f16_dense_q8a8.hpp"
 #include "../../ops/norm/norm_device.hpp"
 
 namespace strix::qwen35 {
@@ -203,10 +204,12 @@ struct Layer {
 
 dl::View view(const Tensor& t) { return {t.data, t.inputs, t.outputs, t.row_bytes}; }
 
+// Rows 9..16: four outputs per wave (store epilogue) so each activation read feeds 4 outputs (T=1 re-reads 64 B of
+// activations per weight and is L2-bound: 16 rows 827 ms, T=2 414, T=4 305-323); gate/up (two accumulator sets) keep T=2
+// (T=4 spills 176-252 B/lane scratch). Rows <= 8: two outputs per wave (unchanged).
 template <unsigned Rows, wd::Format F, dl::Epilogue E>
 void launch_dense(const Tensor& w, const Tensor& up, const float* x, float* out, hipStream_t s) {
-    constexpr unsigned T = Rows >= 16U ? 1U : 2U;  // T=2 at 16 rows spills (256 VGPR, 264-492 B scratch): one output per wave
-
+    constexpr unsigned T = Rows <= 8U ? 2U : (E == dl::Epilogue::silu_mul ? 2U : 4U);
     dl::kernel<Rows, T, F, E><<<(w.outputs + 4U * T - 1U) / (4U * T), 128, 0, s>>>(view(w), view(up), x, out);
 }
 // Rows are padded to the next of 1/2/4/8/16 over kMaxRows-sized scratch; every row is independent.
@@ -218,16 +221,77 @@ void dispatch_rows(unsigned rows, const Tensor& w, const Tensor& up, const float
     else if (rows <= 8U) launch_dense<8, F, E>(w, up, x, out, s);
     else launch_dense<16, F, E>(w, up, x, out, s);
 }
-void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s) {
+// ---- wide windows (rows > 16): FAST dense-q8a8-f16-v1 of the shared f16_dense_tall core --------------------------------
+// One engine per process binds these scratch buffers (set by Impl); rows beyond the exact 16-row sweep go through them.
+struct WideScratch { std::int8_t* codes = nullptr; float *deltas = nullptr, *g = nullptr, *u = nullptr; unsigned rows = 16U; } g_wide;
+
+// A8 of 32-value groups, one wave per group (as quantize_a8: amax / 127, rint, clamp +-127; delta 1 for zero or tiny groups).
+__global__ void a8_quant_kernel(const float* x, unsigned inputs, std::int8_t* codes, float* deltas) {
+    const unsigned lane = threadIdx.x % 32U, group = blockIdx.x * (blockDim.x / 32U) + threadIdx.x / 32U, groups = inputs / 32U;
+    if (group >= groups) return;
+    const std::size_t at = std::size_t(blockIdx.y) * inputs + std::size_t(group) * 32U + lane;
+    const float y = x[at];
+    float amax = fmaxf(0.0F, fabsf(y));
+    for (int d = 16; d; d >>= 1) amax = fmaxf(amax, __shfl_xor(amax, d, 32));
+    const bool tiny = amax > 0.0F && amax < 0x1p-119F;
+    const float dl = (amax == 0.0F || tiny) ? 1.0F : amax / 127.0F;
+    float q = tiny ? 0.0F : __builtin_rintf(y / dl);
+    q = fmaxf(-127.0F, fminf(127.0F, q));
+    codes[at] = static_cast<std::int8_t>(q);
+    if (lane == 0) deltas[std::size_t(blockIdx.y) * groups + group] = dl;
+}
+__global__ void silu_mul_kernel(const float* g, const float* u, float* out, std::size_t n) {
+    for (std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += std::size_t(gridDim.x) * blockDim.x)
+        out[i] = dl::silu(g[i]) * u[i];
+}
+bool wide_ok(const Tensor& t) { return g_wide.codes && t.fmt == 8U && t.inputs % 128U == 0U && t.outputs % 16U == 0U; }
+// out[r][o] for rows > 16 from already quantized activations (codes / deltas in g_wide).
+void wide_dense(const Tensor& w, float* out, unsigned rows, hipStream_t s) {
+    namespace q = core::f16_dense_tall::q8a8;
+    q::View v{};
+    v.weight = w.data; v.codes = g_wide.codes; v.deltas = g_wide.deltas; v.out = out;
+    v.row_bytes = std::uint32_t(w.row_bytes); v.k_bytes = 0U; v.in = w.inputs; v.count = w.outputs; v.rows = rows;
+    v.x_stride = w.inputs; v.out_stride = w.outputs; v.accumulate = 0U;
+    if (!q::supported(v)) throw std::runtime_error("q8a8 view not supported");
+    if (q::waves_for(rows, w.inputs) == 16U) q::launch_form<16>(v, q::form_for(), s);
+    else q::launch_form<8>(v, q::form_for(), s);
+}
+void wide_quant(const float* x, unsigned inputs, unsigned rows, hipStream_t s) {
+    a8_quant_kernel<<<dim3((inputs / 32U + 7U) / 8U, rows), 256, 0, s>>>(x, inputs, g_wide.codes, g_wide.deltas);
+}
+void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s);
+void linear16(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s) {
     if (w.fmt == 30U) dispatch_rows<wd::Format::bf16, dl::Epilogue::store>(rows, w, w, x, out, s);
     else if (w.fmt == 8U) dispatch_rows<wd::Format::q8_0, dl::Epilogue::store>(rows, w, w, x, out, s);
     else throw std::runtime_error("dense projection needs bf16 or q8_0 weights");
 }
-void glu(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned rows, hipStream_t s) {
+void glu16(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned rows, hipStream_t s) {
     if (g.fmt != u.fmt || g.outputs != u.outputs) throw std::runtime_error("gate/up mismatch");
     if (g.fmt == 30U) dispatch_rows<wd::Format::bf16, dl::Epilogue::silu_mul>(rows, g, u, x, out, s);
     else if (g.fmt == 8U) dispatch_rows<wd::Format::q8_0, dl::Epilogue::silu_mul>(rows, g, u, x, out, s);
     else throw std::runtime_error("gate/up need bf16 or q8_0");
+}
+void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s) {
+    if (rows <= 16U) return linear16(w, x, out, rows, s);
+    if (wide_ok(w)) {
+        wide_quant(x, w.inputs, rows, s);
+        wide_dense(w, out, rows, s);
+    } else {  // not a Q8_0 shape the WMMA core takes: exact 16-row sweeps
+        for (unsigned r = 0; r < rows; r += 16U)
+            linear16(w, x + std::size_t(r) * w.inputs, out + std::size_t(r) * w.outputs, std::min(16U, rows - r), s);
+    }
+}
+void glu(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned rows, hipStream_t s) {
+    if (rows <= 16U) return glu16(g, u, x, out, rows, s);
+    if (wide_ok(g) && wide_ok(u) && g.outputs == u.outputs) {
+        wide_quant(x, g.inputs, rows, s);
+        wide_dense(g, g_wide.g, rows, s);
+        wide_dense(u, g_wide.u, rows, s);
+        silu_mul_kernel<<<1024, 256, 0, s>>>(g_wide.g, g_wide.u, out, std::size_t(rows) * g.outputs);
+    } else {
+        for (unsigned r = 0; r < rows; r += 16U)
+            glu16(g, u, x + std::size_t(r) * g.inputs, out + std::size_t(r) * g.outputs, std::min(16U, rows - r), s);
+    }
 }
 void rmsnorm(const float* x, const Tensor& gain, unsigned n, float eps, float* y, unsigned rows, hipStream_t s) {
     ops::norm::rmsnorm_kernel<NormTraits, 256><<<rows, 256, 0, s>>>(x, reinterpret_cast<const float*>(gain.data), 0, n, eps, y);
@@ -346,11 +410,20 @@ struct HipEngine::Impl {
         if (!opt.quiet)
             std::printf("loaded %.2f GiB (layers %u, hidden %u, vocab %u, GDN layers %u)\n", double(loader.total()) / double(1ULL << 30),
                         cfg.layers, H, V, n_gdn);
-        auto fm = [&](float** p, std::size_t n) { alloc0(p, n * kMaxRows * 4U); };
+        const unsigned RS = std::max(kMaxRows, opt.prefill_rows);  // scratch rows (wide prefill windows)
+        auto fm = [&](float** p, std::size_t n) { alloc0(p, n * RS * 4U); };
         fm(&x, H); fm(&xn, H); fm(&qkv, GC); fm(&z, GV); fm(&beta, GH); fm(&gate, GH); fm(&core, GV); fm(&proj, H);
-        fm(&q_in, 2U * QW); fm(&kk, KW); fm(&vv, KW); fm(&qn, QW); fm(&ctx, QW); fm(&gu, I); fm(&logits, V);
+        fm(&q_in, 2U * QW); fm(&kk, KW); fm(&vv, KW); fm(&qn, QW); fm(&ctx, QW); fm(&gu, I); alloc0(&logits, std::size_t(V) * kMaxRows * 4U);
         fm(&core_r, GV);
-        alloc0(&d_ids, kMaxRows * 4U);
+        alloc0(&d_ids, RS * 4U);
+        if (RS > kMaxRows) {
+            std::size_t maxin = std::max<std::size_t>(H, I);
+            alloc0(&g_wide.codes, std::size_t(RS) * maxin);
+            alloc0(&g_wide.deltas, std::size_t(RS) * (maxin / 32U) * 4U);
+            alloc0(&g_wide.g, std::size_t(RS) * I * 4U);
+            alloc0(&g_wide.u, std::size_t(RS) * I * 4U);
+            g_wide.rows = RS;
+        }
         alloc0(&d_arg, kMaxRows * 4U);
     }
 
@@ -382,7 +455,9 @@ struct HipEngine::Impl {
     }
 
     HipRowsOut run(const std::uint32_t* tokens, unsigned n, LogitRows want, bool defer) {
-        if (n < 1U || n > kMaxRows) throw std::invalid_argument("rows must be 1..16");
+        if (n < 1U || n > (defer ? kMaxRows : std::max(kMaxRows, opt.prefill_rows)))
+            throw std::invalid_argument("rows must be 1..16 (decode windows) or 1..prefill_rows (forward_commit)");
+        if (n > kMaxRows && want == LogitRows::all) throw std::invalid_argument("wide windows return last-row or no logits");
         if (pending) { restore_and_replay(0U); pending = 0; }  // an uncommitted window is discarded
         if (committed + n > opt.max_positions) throw std::runtime_error("KV capacity exceeded (max_positions)");
         const unsigned pos = committed;
@@ -457,6 +532,7 @@ std::unique_ptr<HipEngine> HipEngine::from_gguf(const std::string& path, const H
 }
 const Config& HipEngine::config() const { return p_->cfg; }
 std::uint32_t HipEngine::vocab() const { return p_->V; }
+std::uint32_t HipEngine::prefill_rows() const { return std::max(kMaxRows, p_->opt.prefill_rows); }
 std::uint32_t HipEngine::committed() const { return p_->committed; }
 std::uint64_t HipEngine::weight_bytes() const { return p_->pass_weight_bytes; }
 std::uint64_t HipEngine::state_bytes_per_pass() const { return 2ULL * p_->sb * p_->n_gdn; }

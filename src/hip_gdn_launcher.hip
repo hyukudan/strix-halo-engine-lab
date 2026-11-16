@@ -1642,6 +1642,84 @@ void recurrent_step_kernel(
     }
 }
 
+// Rows of one window in one launch: the retained state tile stays in registers from row to row (the per-row kernel above
+// reads and writes it through memory every row). Row r runs exactly the operations of recurrent_step_kernel on the
+// qkv / beta / gate / core of row r (strides below), in the same order, so the bits equal `rows` separate launches;
+// the stored state of row r is the retained value the next row loads (a float round trip is exact).
+__global__ __launch_bounds__(kRecurrentThreads)
+void recurrent_rows_kernel(
+    const float* qkv, const float* beta, const float* gate, float* state, float* core,
+    std::uint32_t key_heads, std::uint32_t value_heads, std::uint32_t head_dim, std::uint32_t rows,
+    std::uint64_t qkv_stride, std::uint64_t core_stride) {
+    const auto tile_count = head_dim / kValueTile;
+    const auto value_head = static_cast<std::uint32_t>(blockIdx.x) / tile_count;
+    const auto tile = static_cast<std::uint32_t>(blockIdx.x) % tile_count;
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x);
+    if (value_head >= value_heads || lane >= head_dim) return;
+    const auto key_head = value_head % key_heads;
+    const auto value_base = tile * kValueTile;
+    const auto q_base = static_cast<std::uint64_t>(key_head) * head_dim;
+    const auto k_base = static_cast<std::uint64_t>(key_heads) * head_dim + q_base;
+    const auto v_base = static_cast<std::uint64_t>(key_heads) * head_dim * 2ULL + static_cast<std::uint64_t>(value_head) * head_dim;
+    __shared__ float reduction[kRecurrentThreads * kValueTile];
+    __shared__ float deltas[kValueTile];
+    float retained[kValueTile];
+#pragma unroll
+    for (std::uint32_t column = 0; column < kValueTile; ++column)
+        retained[column] = state[(static_cast<std::uint64_t>(value_head) * head_dim + lane) * head_dim + value_base + column];
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        const float* q = qkv + r * qkv_stride;
+        const float* b = beta + static_cast<std::uint64_t>(r) * value_heads;
+        const float* g = gate + static_cast<std::uint64_t>(r) * value_heads;
+        float* out = core + r * core_stride;
+        const float decay = expf(g[value_head]);
+#pragma unroll
+        for (std::uint32_t column = 0; column < kValueTile; ++column) {
+            retained[column] = retained[column] * decay;
+            reduction[static_cast<std::size_t>(lane) * kValueTile + column] = retained[column] * q[k_base + lane];
+        }
+        __syncthreads();
+        for (std::uint32_t stride = kRecurrentThreads / 2U; stride > 0; stride >>= 1U) {
+            if (lane < stride) {
+#pragma unroll
+                for (std::uint32_t column = 0; column < kValueTile; ++column)
+                    reduction[static_cast<std::size_t>(lane) * kValueTile + column] +=
+                        reduction[static_cast<std::size_t>(lane + stride) * kValueTile + column];
+            }
+            __syncthreads();
+        }
+        if (lane == 0) {
+#pragma unroll
+            for (std::uint32_t column = 0; column < kValueTile; ++column)
+                deltas[column] = (q[v_base + value_base + column] - reduction[column]) * b[value_head];
+        }
+        __syncthreads();
+#pragma unroll
+        for (std::uint32_t column = 0; column < kValueTile; ++column) {
+            retained[column] += q[k_base + lane] * deltas[column];
+            reduction[static_cast<std::size_t>(lane) * kValueTile + column] = retained[column] * q[q_base + lane];
+        }
+        __syncthreads();
+        for (std::uint32_t stride = kRecurrentThreads / 2U; stride > 0; stride >>= 1U) {
+            if (lane < stride) {
+#pragma unroll
+                for (std::uint32_t column = 0; column < kValueTile; ++column)
+                    reduction[static_cast<std::size_t>(lane) * kValueTile + column] +=
+                        reduction[static_cast<std::size_t>(lane + stride) * kValueTile + column];
+            }
+            __syncthreads();
+        }
+        if (lane == 0) {
+#pragma unroll
+            for (std::uint32_t column = 0; column < kValueTile; ++column)
+                out[static_cast<std::uint64_t>(value_head) * head_dim + value_base + column] = reduction[column];
+        }
+        __syncthreads();  // the next row rewrites reduction[] and deltas[]
+    }
+#pragma unroll
+    for (std::uint32_t column = 0; column < kValueTile; ++column)
+        state[(static_cast<std::uint64_t>(value_head) * head_dim + lane) * head_dim + value_base + column] = retained[column];
+}
 #ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
 template <unsigned Rows> struct GdnRecurrentWindowPointers {
     const float* qkv[Rows];
@@ -7922,13 +8000,12 @@ void hip_gdn_decode_step_dims(const HipGdnDimsStep& v, void* stream_ptr) {
         throw std::invalid_argument("hip_gdn_decode_step_dims: head_dim must be 128 and value_heads a multiple of key_heads");
     const auto kind = small_weight_kind(v.small_type);
     const unsigned channels = (2U * v.key_heads + v.value_heads) * d;
-    // Rows run one after the other (R1 per row): row r is bit-identical alone or in any window.
+    // Rows run one after the other (R1 per row): row r is bit-identical alone or in any window. The conv / transform / norm
+    // steps are per row (the conv history is sequential); the recurrence of all rows is ONE launch (state in registers).
     for (unsigned r = 0; r < v.rows; ++r) {
         float* qkv = v.qkv + std::size_t(r) * channels;
         float* beta = v.beta + std::size_t(r) * v.value_heads;
         float* gate = v.gate + std::size_t(r) * v.value_heads;
-        float* core = v.core + std::size_t(r) * v.value_heads * d;
-        const float* z = v.z + std::size_t(r) * v.value_heads * d;
         hipLaunchKernelGGL(conv_update_kernel, dim3((channels + kProjectionThreads - 1U) / kProjectionThreads),
             dim3(kProjectionThreads), 0, stream, qkv, v.conv_state, v.conv, kind, channels, v.kernel,
             static_cast<std::uint32_t*>(nullptr));
@@ -7936,8 +8013,13 @@ void hip_gdn_decode_step_dims(const HipGdnDimsStep& v, void* stream_ptr) {
             dim3(kProjectionThreads), 0, stream, beta, gate, v.dt, kind, v.a, kind, v.value_heads);
         hipLaunchKernelGGL(normalize_qk_kernel, dim3(v.key_heads * 2U), dim3(d), 0, stream,
             qkv, v.key_heads, d, v.qk_epsilon, static_cast<std::uint32_t*>(nullptr));
-        hipLaunchKernelGGL(recurrent_step_kernel, dim3(v.value_heads * (d / kValueTile)), dim3(d), 0, stream,
-            qkv, beta, gate, v.matrix, core, v.key_heads, v.value_heads, d, static_cast<std::uint32_t*>(nullptr));
+    }
+    hipLaunchKernelGGL(recurrent_rows_kernel, dim3(v.value_heads * (d / kValueTile)), dim3(d), 0, stream,
+        v.qkv, v.beta, v.gate, v.matrix, v.core, v.key_heads, v.value_heads, d, v.rows,
+        static_cast<std::uint64_t>(channels), static_cast<std::uint64_t>(v.value_heads) * d);
+    for (unsigned r = 0; r < v.rows; ++r) {
+        float* core = v.core + std::size_t(r) * v.value_heads * d;
+        const float* z = v.z + std::size_t(r) * v.value_heads * d;
         if (v.norm_kind == HipGdnGatedNorm::swish)
             hipLaunchKernelGGL(gated_rms_norm_swish_kernel, dim3(v.value_heads), dim3(d), 0, stream,
                 core, z, v.norm, kind, v.value_heads, d, v.rms_epsilon);
