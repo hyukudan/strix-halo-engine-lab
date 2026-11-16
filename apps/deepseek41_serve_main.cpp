@@ -124,6 +124,7 @@
 #include "strix/deepseek41_cache_lease.hpp"
 #include "strix/deepseek41_session_cache.hpp"
 #include "strix/serve/session_api.hpp"
+#include "strix/serve/session_reservation.hpp"
 #include "deepseek41/http_session_owner.hpp"
 #include "strix/deepseek41_describe.hpp"
 #include "strix/deploy/binding.hpp"
@@ -184,6 +185,11 @@
 #include <unistd.h>
 
 namespace {
+
+// --pool-positions: a request reserves prompt + max_tokens + 1 positions (the row its next step writes), capped at the
+// context; the shared per-request rule (strix/serve/session_reservation.hpp, same as the CUDA Qwen server) with no
+// granule (the pool hands out exact position ranges).
+strix::serve::ReservationRule pool_rule(std::uint64_t context) { return {context, 1U, 1U, 1U}; }
 
 using strix::deepseek41::BatchForward;
 using strix::deepseek41::BatchRow;
@@ -2857,7 +2863,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         const std::uint32_t slot = free_slots.back();
         std::uint32_t want = 0;
         if (a.pool != 0U) {
-            want = static_cast<std::uint32_t>(std::min<std::uint64_t>(a.context, std::uint64_t{st.position} + j.reserve_tokens + 1U));
+            want = static_cast<std::uint32_t>(strix::serve::reservation_positions(pool_rule(a.context), st.position, j.reserve_tokens));
             if (!pool_reserve(slot, want)) {
                 res.status = 503;
                 res.error = "the KV pool has no room for the state";
@@ -3771,7 +3777,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 }
                 if (free_slots.empty()) unpark_oldest();  // a parked state gives its slot to a request that needs one
                 if (a.pool != 0U) {  // room for the prompt and every token it may generate, or wait (FIFO)
-                    const auto want = static_cast<std::uint32_t>(std::min<std::uint64_t>(a.context, prompt.size() + std::uint64_t{request(*r).job.max_tokens} + 1U));
+                    const auto want = static_cast<std::uint32_t>(strix::serve::reservation_positions(pool_rule(a.context), prompt.size(), request(*r).job.max_tokens));
                     if (!pool_reserve(free_slots.back(), want)) {
                         if (want > a.pool) {  // never fits
                             serve::GenerationStats st;

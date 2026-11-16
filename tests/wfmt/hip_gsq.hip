@@ -268,7 +268,8 @@ void build_case(Case& c, const std::string& name) {
     c.dd = std::make_unique<Buffer>(T * c.dd_row); c.ds = std::make_unique<Buffer>(T * c.dd_row); c.raw = std::make_unique<Buffer>(T * c.raw_row);
     auto* base = c.table->as<unsigned>();
     c.dcsr = {base + c.csr.summary, base + c.csr.offsets, base + c.csr.touched, base + c.csr.rows, base + c.csr.slots, base + c.csr.experts, base + c.csr.begins};
-    for (unsigned r = 0; r < sp.T; ++r) {
+    // DeviceRows holds max_union_rows pointers per field: the window arm only runs T <= 32, prefill uses the strided rows.
+    for (unsigned r = 0; r < std::min(sp.T, kr::max_union_rows); ++r) {
         c.rows.codes[r] = c.codes->as<signed char>() + static_cast<std::size_t>(r) * sp.H;
         c.rows.deltas[r] = c.deltas->as<float>() + static_cast<std::size_t>(r) * groups_h;
         c.rows.sums[r] = c.sums->as<int>() + static_cast<std::size_t>(r) * groups_h;

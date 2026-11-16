@@ -99,7 +99,7 @@ struct StepTiming {
     std::uint32_t windows = 0, rows = 0;
 };
 
-// Every stream must have room for at least one row (position < max_positions) and its position must equal the
+// Every stream must have room for at least one row (position < min(max_positions, its session's capacity)) and its position must equal the
 // engine session's length. Streams are advanced in place. Failure isolation: when a window with several sessions comes
 // back with a failed entry (a routed-MoE failure word taints the whole window), every entry is undone (keep 0, exact) and
 // each session is re-run alone in its own window; only a session that also fails alone is marked failed. So a healthy
@@ -151,7 +151,8 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
         const auto& d = drafts[i];
         rows[i].insert(rows[i].end(), d.tokens.begin(), d.tokens.end());
         out[i].drafted = static_cast<std::uint32_t>(d.tokens.size());
-        const std::uint64_t room = o.max_positions > s.position ? o.max_positions - s.position : 0U;
+        const std::uint64_t cap = std::min<std::uint64_t>(o.max_positions, p.capacity(s.session));  // the session's reservation
+        const std::uint64_t room = cap > s.position ? cap - s.position : 0U;
         want[i] = static_cast<std::uint32_t>(std::min<std::uint64_t>(rows[i].size(), std::max<std::uint64_t>(room, 1U)));
     }
     const auto t1 = Clock::now();

@@ -1778,8 +1778,11 @@ static int run_decode_entry(
             rr::lever("qwen.prefill_tile", "auto", "fallback", rr::Reason::no_match, true, effective.tile_fallback);
     }
     // Export only after the resolved route has admitted the profile proposals.
-    strix::qwen::profile::withdraw_declined(options.product_profile);
-    strix::qwen::profile::apply(options.product_profile);
+    // --print-effective-config always prints and exits: it must not write the process environment.
+    if (!options.print_effective_config) {
+        strix::qwen::profile::withdraw_declined(options.product_profile);
+        strix::qwen::profile::apply(options.product_profile);
+    }
     for (const auto& notice : options.product_profile.notices()) std::cerr << notice << '\n';
 #if defined(STRIX_MTP_MODEL_QUALIFICATION_RUNNER)
     strix::tests::set_mtp_product_profile(options.product_profile);

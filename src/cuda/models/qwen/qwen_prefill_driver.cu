@@ -183,8 +183,10 @@ struct SessionState {
     std::uint32_t window_offset = 0;            // first row of this session in the cohort window
     std::uint64_t window_position = 0;
     std::vector<std::uint32_t> window_tokens;
-    std::vector<void*> allocations;
-    std::uint64_t bytes = 0;
+    std::vector<void*> allocations;      // fixed-size buffers (GDN/conv state, held row)
+    std::vector<void*> row_allocations;  // position buffers, sized to `capacity`
+    std::uint64_t capacity = 0;          // positions the row buffers hold (<= Config::max_positions; reserve_session)
+    std::uint64_t bytes = 0;             // device bytes of all of the above
 };
 
 struct StateCopyStream {
@@ -375,7 +377,11 @@ struct Prefill::Impl : BlockFields {
         if (it == sessions.end()) throw std::invalid_argument("unknown decode session " + std::to_string(id));
         return *it->second;
     }
-    SessionState& new_session();
+    SessionState& new_session(std::uint64_t positions);
+    void alloc_rows(SessionState& s, std::uint64_t positions);
+    void drop_session_graphs(SessionId id);
+    [[nodiscard]] std::uint64_t rows_bytes_at(std::uint64_t positions) const;
+    [[nodiscard]] std::uint64_t fixed_session_bytes() const;
     // ---- MTP draft chain (decode + sidecar)
     hc::HcPacked mtp_hc_attn{}, mtp_hc_ffn{}, mtp_hc_head{};
     float *mtp_attn_inject = nullptr, *mtp_ffn_inject = nullptr;   // F32 [4][10240] (sidecar Q8_0 widened)
@@ -800,11 +806,66 @@ void Prefill::Impl::allocate() {
     if (cfg.export_state) ck(cudaMallocHost(&host, host_bytes), "pinned export staging");  // device-only runs need none
 }
 
-// The per-session device state (same buffers and sizes the single-session engine allocated).
-SessionState& Prefill::Impl::new_session() {
+// Device bytes of a session's position buffers at `positions` (alloc_rows allocates exactly these): per QSA ordinal KV
+// P*1024 BF16, raw index P*128 BF16, pooled keys ceil(P/4)*128 F32; with MTP the same three over the predictor cache.
+std::uint64_t Prefill::Impl::rows_bytes_at(std::uint64_t P) const {
+    const std::uint64_t one = P * 1024 * 2 + P * 128 * 2 + (P + 3) / 4 * 128 * 4;
+    return 12U * one + (mtp ? one : 0U);
+}
+
+std::uint64_t Prefill::Impl::fixed_session_bytes() const {
+    std::uint64_t b = state_bytes(36) + 36ULL * gdn::kConvStateHalfs * 2 + 10240ULL * 9 * 2;
+    if (cfg.decode) b += state_bytes(36) + 36ULL * gdn::kConvStateHalfs * 2 + 10240ULL * 9 * 2;
+    if (mtp && cfg.decode) b += kWide * 2;
+    return b;
+}
+
+// The position buffers of one session at `positions` (every kernel indexes them by position only: the capacity is a
+// bound, never a stride). On failure the session keeps no row buffer.
+void Prefill::Impl::alloc_rows(SessionState& s, std::uint64_t P) {
+    if (P == 0 || P > cfg.max_positions) throw std::invalid_argument("session positions 1..max_positions");
+    std::uint64_t added = 0;
+    const auto alloc = [&](std::uint64_t bytes, const char* what) {
+        void* p = nullptr;
+        strix::cuda::require_vram(std::max<std::uint64_t>(bytes, 1), what);
+        ck(cudaMalloc(&p, std::max<std::uint64_t>(bytes, 1)), what);
+        s.row_allocations.push_back(p);
+        s.bytes += bytes;
+        added += bytes;
+        return p;
+    };
+    s.kv.clear();
+    s.raw_index.clear();
+    s.pooled.clear();
+    try {
+        for (std::uint32_t o = 0; o < 12; ++o) {
+            s.kv.push_back(static_cast<std::uint16_t*>(alloc(P * 1024 * 2, "kv")));
+            s.raw_index.push_back(static_cast<std::uint16_t*>(alloc(P * 128 * 2, "raw index")));
+            s.pooled.push_back(static_cast<float*>(alloc((P + 3) / 4 * 128 * 4, "pooled index keys")));
+        }
+        if (mtp) {
+            s.mtp_kv = static_cast<std::uint16_t*>(alloc(P * 1024 * 2, "mtp kv"));
+            s.mtp_pooled = static_cast<float*>(alloc((P + 3) / 4 * 128 * 4, "mtp pooled keys"));
+            s.mtp_index = static_cast<std::uint16_t*>(alloc(P * 128 * 2, "mtp index"));
+        }
+    } catch (...) {
+        for (void* p : s.row_allocations) cudaFree(p);
+        s.row_allocations.clear();
+        s.kv.clear();
+        s.raw_index.clear();
+        s.pooled.clear();
+        s.mtp_kv = s.mtp_index = nullptr;
+        s.mtp_pooled = nullptr;
+        s.bytes -= added;
+        throw;
+    }
+    s.capacity = P;
+}
+
+// The per-session device state (same buffers the single-session engine allocated; position buffers at `positions`).
+SessionState& Prefill::Impl::new_session(std::uint64_t P) {
     auto s = std::make_unique<SessionState>();
     s->id = next_session++;
-    const std::uint64_t P = cfg.max_positions;
     const auto alloc = [&](std::uint64_t bytes, const char* what) {
         void* p = nullptr;
         strix::cuda::require_vram(std::max<std::uint64_t>(bytes, 1), what);
@@ -814,11 +875,7 @@ SessionState& Prefill::Impl::new_session() {
         return p;
     };
     try {
-        for (std::uint32_t o = 0; o < 12; ++o) {
-            s->kv.push_back(static_cast<std::uint16_t*>(alloc(P * 1024 * 2, "kv")));
-            s->raw_index.push_back(static_cast<std::uint16_t*>(alloc(P * 128 * 2, "raw index")));
-            s->pooled.push_back(static_cast<float*>(alloc((P + 3) / 4 * 128 * 4, "pooled index keys")));
-        }
+        alloc_rows(*s, P);
         s->gdn_state = static_cast<float*>(alloc(state_bytes(36), "gdn state"));
         s->gdn_base = s->gdn_state;  // graph key parity: which of the two buffers is current
         s->gdn_conv = static_cast<std::uint16_t*>(alloc(36 * gdn::kConvStateHalfs * 2, "gdn conv"));
@@ -828,14 +885,10 @@ SessionState& Prefill::Impl::new_session() {
             s->conv_before = static_cast<std::uint16_t*>(alloc(36 * gdn::kConvStateHalfs * 2, "conv before"));
             s->ple_before = static_cast<std::uint16_t*>(alloc(10240 * 9 * 2, "ple conv before"));
         }
-        if (mtp) {
-            s->mtp_kv = static_cast<std::uint16_t*>(alloc(P * 1024 * 2, "mtp kv"));
-            s->mtp_pooled = static_cast<float*>(alloc((P + 3) / 4 * 128 * 4, "mtp pooled keys"));
-            s->mtp_index = static_cast<std::uint16_t*>(alloc(P * 128 * 2, "mtp index"));
-            if (cfg.decode) s->held = static_cast<std::uint16_t*>(alloc(kWide * 2, "held row"));
-        }
+        if (mtp && cfg.decode) s->held = static_cast<std::uint16_t*>(alloc(kWide * 2, "held row"));
     } catch (...) {
         for (void* p : s->allocations) cudaFree(p);
+        for (void* p : s->row_allocations) cudaFree(p);
         throw;
     }
     s->target_identity = qwen_route::identity(route_policy.enabled, route_policy.enabled).hash;
@@ -843,6 +896,19 @@ SessionState& Prefill::Impl::new_session() {
     auto& ref = *s;
     sessions.emplace(ref.id, std::move(s));
     return ref;
+}
+
+// Graphs and warm-up counts that captured this session's pointers (keys: session, layout pairs).
+void Prefill::Impl::drop_session_graphs(SessionId session) {
+    const auto uses = [&](const GraphKey& k) {
+        if (!k.empty() && k[0] >= kTableKey - 1U) return false;  // descriptor-table graphs bake no session pointer
+        for (std::size_t i = 0; i < k.size(); i += 2) if (k[i] == session) return true;
+        return false;
+    };
+    for (auto it = graphs.begin(); it != graphs.end();) {
+        if (uses(it->first)) { auto next = std::next(it); drop_graph(it); it = next; } else ++it;
+    }
+    for (auto it = warmed.begin(); it != warmed.end();) it = uses(it->first) ? warmed.erase(it) : std::next(it);
 }
 
 void Prefill::Impl::drop_graph(std::map<GraphKey, StepGraph>::iterator it) {
@@ -930,7 +996,7 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
     m.upload_mtp();
     m.allocate();
     m.upload_draft();
-    m.new_session();  // session 0: the single-session API
+    m.new_session(config.session_positions ? config.session_positions : config.max_positions);  // session 0: the single-session API
     {
         const char* v = std::getenv("STRIX_QRTX_GRAPHS");
         m.use_graphs = !(v && v[0] == '0');
@@ -1263,7 +1329,7 @@ Timing Prefill::run(SessionId session, const std::vector<std::uint32_t>& tokens,
     if (m.cohort_open) throw std::logic_error("run() with an open decode window");
     if (S.prefilling || m.pre_session) throw std::logic_error("run() while an overlapped prefill chunk is in flight");
     if (position > tokens.size() || position == 0) throw std::invalid_argument("prefill position out of range");
-    if (position > m.cfg.max_positions) throw std::invalid_argument("prompt longer than max_positions");
+    if (position > S.capacity) throw std::invalid_argument("prompt longer than the session's capacity");
     const auto plan = plan_blocks(position, m.cfg.block_schedule,
         options.tail_large.value_or(m.cfg.tail_large),
         options.final_block_rows.value_or(m.cfg.final_block_rows));
@@ -1692,7 +1758,7 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
         if (c.position != s.length)
             throw std::invalid_argument("verify(): position " + std::to_string(c.position) + " != session length " + std::to_string(s.length));
         if (c.rows == 0 || c.rows > kMaxStepRows) throw std::invalid_argument("step rows out of range");
-        if (c.position + c.rows > m.cfg.max_positions) throw std::invalid_argument("step beyond max_positions");
+        if (c.position + c.rows > s.capacity) throw std::invalid_argument("step beyond the session's capacity");
         if (!s.gdn_base || (s.gdn_state != s.gdn_base && s.gdn_other != s.gdn_base))
             throw std::logic_error("decode graphs: GDN buffer parity lost");
         members.push_back(&s);
@@ -1877,7 +1943,42 @@ SessionId Prefill::create_session() {
     auto& m = *impl_;
     qwen_route::require_composition(m.route_policy.enabled, qwen_route::Composition::cohort);
     if (!m.cfg.decode) throw std::logic_error("create_session() needs Config::decode");
-    return m.new_session().id;
+    return m.new_session(m.cfg.session_positions ? m.cfg.session_positions : m.cfg.max_positions).id;
+}
+
+SessionId Prefill::create_session(std::uint64_t positions) {
+    auto& m = *impl_;
+    qwen_route::require_composition(m.route_policy.enabled, qwen_route::Composition::cohort);
+    if (!m.cfg.decode) throw std::logic_error("create_session() needs Config::decode");
+    return m.new_session(positions).id;
+}
+
+// New position buffers of `positions` for an idle session (session 0 too); its state is discarded (length 0) and the
+// graphs that captured its old pointers are dropped. Fixed buffers (GDN/conv state) stay.
+void Prefill::reserve_session(SessionId session, std::uint64_t positions) {
+    auto& m = *impl_;
+    auto& s = m.session(session);
+    if (s.window_open || s.prefilling || m.cohort_open) throw std::logic_error("reserve_session() with an open window or a chunk in flight");
+    if (positions == 0 || positions > m.cfg.max_positions) throw std::invalid_argument("reserve_session(): positions 1..max_positions");
+    if (positions == s.capacity) { s.length = 0; return; }
+    ck(cudaStreamSynchronize(m.stream), "session resize");
+    m.drop_session_graphs(session);
+    for (void* p : s.row_allocations) cudaFree(p);
+    s.row_allocations.clear();
+    s.bytes -= m.rows_bytes_at(s.capacity);
+    s.capacity = 0;
+    s.length = 0;
+    std::fill(std::begin(s.pooled_valid), std::end(s.pooled_valid), 0U);
+    s.mtp_pooled_valid = 0;
+    m.alloc_rows(s, positions);  // throws with no row buffer left: the caller re-sizes again or destroys
+}
+
+std::uint64_t Prefill::capacity(SessionId session) const { return impl_->session(session).capacity; }
+
+std::uint64_t Prefill::session_bytes(SessionId session) const { return impl_->session(session).bytes; }
+
+std::uint64_t Prefill::session_bytes_at(std::uint64_t positions) const {
+    return impl_->fixed_session_bytes() + impl_->rows_bytes_at(positions);
 }
 
 void Prefill::destroy_session(SessionId session) {
@@ -1886,16 +1987,8 @@ void Prefill::destroy_session(SessionId session) {
     auto& s = m.session(session);
     if (s.window_open || s.prefilling) throw std::logic_error("destroy_session() with an open window or a chunk in flight");
     ck(cudaStreamSynchronize(m.stream), "session drop");
-    // graphs and warm-up counts that captured this session's pointers (keys: session, layout pairs)
-    const auto uses = [&](const Impl::GraphKey& k) {
-        if (!k.empty() && k[0] >= kTableKey - 1U) return false;  // descriptor-table graphs bake no session pointer
-        for (std::size_t i = 0; i < k.size(); i += 2) if (k[i] == session) return true;
-        return false;
-    };
-    for (auto it = m.graphs.begin(); it != m.graphs.end();) {
-        if (uses(it->first)) { auto next = std::next(it); m.drop_graph(it); it = next; } else ++it;
-    }
-    for (auto it = m.warmed.begin(); it != m.warmed.end();) it = uses(it->first) ? m.warmed.erase(it) : std::next(it);
+    m.drop_session_graphs(session);
+    for (void* p : s.row_allocations) cudaFree(p);
     for (void* p : s.allocations) cudaFree(p);
     m.sessions.erase(session);
 }
@@ -1967,7 +2060,7 @@ void Prefill::import_state(SessionId session, std::uint64_t length, const std::v
     auto& m = *impl_;
     auto& s = m.session(session);
     qwen_route::require_composition(m.route_policy.enabled, qwen_route::Composition::untagged_state_import);
-    if (!fixed || length == 0 || length >= m.cfg.max_positions) throw std::invalid_argument("prefix import length/fixed");
+    if (!fixed || length == 0 || length >= s.capacity) throw std::invalid_argument("prefix import length/fixed");
     std::uint64_t end = 0;
     for (const auto& seg : segments) {
         if (!seg.data || seg.first != end || seg.count == 0 || seg.count > length - end)
@@ -1993,7 +2086,7 @@ CanonicalState Prefill::capture_canonical(SessionId session) {
         throw std::invalid_argument(refusal);
     auto& s = m.session(session);
     if (m.mtp && !m.cfg.diagnostic_bf16_mtp) throw std::invalid_argument("canonical snapshot MTP-sidecar layout is unqualified");
-    if (!s.length || s.length >= m.cfg.max_positions) throw std::invalid_argument("canonical snapshot length");
+    if (!s.length || s.length >= s.capacity) throw std::invalid_argument("canonical snapshot length");
     CanonicalState out;
     out.target = numerical_identity().hash;
     out.engine_binding = m.snapshot_binding;
@@ -2040,7 +2133,7 @@ void Prefill::restore_canonical(const CanonicalState& state, SessionId session) 
         throw std::invalid_argument(refusal);
     auto& s = m.session(session);
     if (m.mtp && !m.cfg.diagnostic_bf16_mtp) throw std::invalid_argument("canonical snapshot MTP-sidecar layout is unqualified");
-    if (!state.length || state.length >= m.cfg.max_positions) throw std::invalid_argument("canonical snapshot length");
+    if (!state.length || state.length >= s.capacity) throw std::invalid_argument("canonical snapshot length");
     if (m.cfg.diagnostic_bf16_mtp) {
         const qwen_mtp_diagnostic::Binding expected{numerical_identity().hash,m.snapshot_binding,s.diagnostic_generation,m.cfg.max_positions,
             qwen_route::hash_part(qwen_route::hash_part(0xcbf29ce484222325ULL,m.cfg.mtp_sidecar_gguf),m.cfg.draft_vocab),1};
@@ -2054,7 +2147,7 @@ void Prefill::restore_canonical(const CanonicalState& state, SessionId session) 
     const auto canonical_width = m.cfg.diagnostic_bf16_mtp ? 12ULL * 2304 : row_bytes();
     qwen_route::validate_snapshot(state.target, numerical_identity().hash,
         state.engine_binding, m.snapshot_binding,
-        state.length, m.cfg.max_positions, state.rows.size(), canonical_width,
+        state.length, s.capacity, state.rows.size(), canonical_width,
         state.fixed.size(), fixed_bytes(), state.held.size(), s.held ? kWide * 2U : 0U);
     const auto stream = m.state_copy_stream(s);
     s.length = 0;
@@ -2178,7 +2271,7 @@ std::uint64_t Prefill::prefill_chunk(SessionId session, const std::vector<std::u
     if (m.window || m.table_mode || m.qsa_cut || m.after_layer) throw std::logic_error("prefill_chunk() inside a decode window or capture");
     if (m.cfg.export_state) throw std::logic_error("prefill_chunk() needs Config::export_state = false");
     if (position > tokens.size() || position == 0 || from >= position) throw std::invalid_argument("prefill chunk out of range");
-    if (position > m.cfg.max_positions) throw std::invalid_argument("prompt longer than max_positions");
+    if (position > S.capacity) throw std::invalid_argument("prompt longer than the session's capacity");
     if (from != 0 && from != S.length) throw std::invalid_argument("prefill chunk does not continue the session");
     const auto rows = m.prefill_enqueue(S, tokens, position, from, max_rows);
     ck(cudaStreamSynchronize(m.stream), "prefill chunk");
@@ -2252,7 +2345,7 @@ void Prefill::prefill_chunk_async(SessionId session, const std::vector<std::uint
     if (S.window_open || S.prefilling) throw std::logic_error("prefill_chunk_async() on a session in a window");
     if (m.cfg.export_state) throw std::logic_error("prefill_chunk() needs Config::export_state = false");
     if (position > tokens.size() || position == 0 || from >= position) throw std::invalid_argument("prefill chunk out of range");
-    if (position > m.cfg.max_positions) throw std::invalid_argument("prompt longer than max_positions");
+    if (position > S.capacity) throw std::invalid_argument("prompt longer than the session's capacity");
     if (from != 0 && from != S.length) throw std::invalid_argument("prefill chunk does not continue the session");
     // enqueue with the prefill set swapped in: every launch reads the prefill stream and buffers; nothing is shared with
     // the decode windows (the session is in no window until prefill_wait()).
@@ -2319,7 +2412,7 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
     if (S.length == 0) throw std::logic_error("draft() before run()");
     depth = std::min(depth, kMaxStepRows - 1U);
     // the window that verifies these drafts covers positions [length, length + depth]
-    const std::uint64_t room = m.cfg.max_positions > S.length ? m.cfg.max_positions - S.length - 1U : 0U;
+    const std::uint64_t room = S.capacity > S.length ? S.capacity - S.length - 1U : 0U;
     depth = static_cast<std::uint32_t>(std::min<std::uint64_t>(depth, room));
     Draft out;
     if (depth == 0) return out;
@@ -2427,7 +2520,7 @@ std::vector<Draft> Prefill::draft_cohort(const std::vector<DraftRequest>& reques
         if (!S.held) throw std::logic_error("draft() needs Config::decode and an MTP sidecar");
         if (S.prefilling) throw std::logic_error("draft() on a session with a prefill chunk in flight");
         if (S.length == 0) throw std::logic_error("draft() before run()");
-        const std::uint64_t room = m.cfg.max_positions > S.length ? m.cfg.max_positions - S.length - 1U : 0U;
+        const std::uint64_t room = S.capacity > S.length ? S.capacity - S.length - 1U : 0U;
         depth[i] = static_cast<std::uint32_t>(std::min<std::uint64_t>(std::min(requests[i].depth, kMaxStepRows - 1U), room));
         if (depth[i] > 0) order.push_back(i);
     }

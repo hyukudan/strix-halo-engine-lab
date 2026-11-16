@@ -30,12 +30,17 @@ The budget plans cycles of up to `STRIX_SERVE_ROW_BUDGET_MAX_LANES` decoding req
 Above the bound every request gets the fixed table's two rows. The bound is measured: the budget is faster at
 two to six requests and slower at eight, where its deeper rows cost more than they yield.
 
-Above the bound the joint cycle can group requests by the row budget instead of a fixed count of eight:
-`STRIX_SERVE_JOINT_GROUP_LANES=9..16` lets one group (one logical target execution) take up to
-that many requests (16 = 32 rows, the widest shared step). The default stays 8 (9 to 16 requests run two forwards per
-cycle, 17 to 24 three): in the first served run a single group of nine requests stalled the server on the device after
-its first cycle, so the wider form is opt-in until that is found. `ab` alternates 8 and 16 by cycle (in-process A/B:
-the receipt's `forwards` field tells the arms apart). Scheduling only: the 9..32-row wide steps keep every row's arithmetic.
+Above the bound the joint cycle groups requests by the row budget instead of a fixed count of eight: by default one
+group (one logical target execution, one weight read) takes up to 16 requests (32 rows, the widest shared step), so
+9 to 16 requests run one forward per cycle and 17 to 24 two. `STRIX_SERVE_JOINT_GROUP_LANES=8..16` sets the cap
+(8 = the old form, one forward per eight requests). Each wide cohort step spans up to `kCohortWideMaxSessions` (16)
+sessions; every wide launcher's session table holds that many (the GDN prepare/recurrence table holds eight, so it runs
+once per eight sessions, each block on its own session's state). An earlier nine-request stall was a launcher that
+accepted only eight sessions. Measured on one node, nine requests: 171.8 against 211.8 ms per cycle, the same token ids
+per request as the old form. `ab` alternates 8 and 16 by cycle (in-process A/B: the receipt's `forwards` field tells
+the arms apart). Scheduling only: the 9..32-row wide steps keep every row's arithmetic. Coverage: groups of 10 to 16
+live requests were not reached on the measured node (nine slots at 8K context); their token ids at 16 submitted
+requests match the old form, and the session split rests on the per-session state ownership above.
 
 ## Exactness
 
