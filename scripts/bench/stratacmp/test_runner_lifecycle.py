@@ -44,6 +44,8 @@ class RunnerLifecycle(unittest.TestCase):
                                 ("wait_ready", None), ("stop_owned", None)):
                 patches.enter_context(mock.patch.object(runner, name, return_value=value))
             patches.enter_context(mock.patch.object(runner, "Sampler", Sampler))
+            patches.enter_context(mock.patch.object(runner.subprocess, "run", return_value=types.SimpleNamespace(
+                stdout="NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 00000000:01:00.0, GPU-test\n")))
             patches.enter_context(mock.patch.object(runner.subprocess, "Popen", return_value=types.SimpleNamespace(pid=123)))
             patches.enter_context(mock.patch.object(runner.owner_api, "windows_job", return_value=None))
             patches.enter_context(mock.patch.object(runner, "client", side_effect=client))

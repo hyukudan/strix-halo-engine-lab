@@ -135,7 +135,15 @@ def run_one(config, arm, workload, pair, out, args):
             raise RuntimeError(f"resources not released before load: RAM {ram / 1024**3:.1f} GiB, GPU 0 {memory} MiB")
         time.sleep(2)
     out.mkdir(parents=True, exist_ok=False)
-    env = dict(os.environ, **arm.get("env", {}), CUDA_DEVICE_ORDER="PCI_BUS_ID", CUDA_VISIBLE_DEVICES="0")
+    identity = subprocess.run(["nvidia-smi", "-i", "0", "--query-gpu=name,pci.bus_id,uuid",
+                               "--format=csv,noheader"], check=True, capture_output=True, text=True)
+    device_name, device_bus, device_uuid = [part.strip() for part in identity.stdout.strip().split(",")]
+    if ("RTX PRO 6000" not in device_name or device_bus.lower().lstrip("0") != ":01:00.0"
+            or not device_uuid.startswith("GPU-")):
+        raise RuntimeError("physical index 0 is not the expected RTX PRO at 01:00.0; no model loaded")
+    env = dict(os.environ)
+    env.update(arm.get("env", {}))
+    env.update(CUDA_DEVICE_ORDER="PCI_BUS_ID", CUDA_VISIBLE_DEVICES=device_uuid)
     manifest = dict(arm=arm["name"], pair=pair, workload=workload, pack_identity=config["pack_identity"],
                     cmd=arm["cmd"], records=[], status="running")
     write(out / "run.json", manifest)
