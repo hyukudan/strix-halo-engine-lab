@@ -968,6 +968,25 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
         }
         std::printf("pfmsarework modes A=%u B=%u\n", rework_base, rework_mode);
     }
+    // pfmsaflash: arms STRIX_MM_AB_FLASH_A / _B = MODE[rROWS] (FAST flash mode 0..3 of the flash layers, row-group rows
+    // 0 auto / 4 / 8), default A = 1 (key split), B = 3 (row groups, auto rows); restored after the A/B.
+    struct FlashArm { unsigned mode, rows; };
+    const auto flash_arm = [](const char* name, const char* dflt) {
+        const char* e = std::getenv(name);
+        const std::string t = e != nullptr ? e : dflt;
+        FlashArm x{0U, 0U};
+        if (t.empty() || t[0] < '0' || t[0] > '3' || (t.size() != 1 && t != std::string(1, t[0]) + "r4" && t != std::string(1, t[0]) + "r8" &&
+                                                     t != std::string(1, t[0]) + "r0"))
+            throw std::invalid_argument(std::string(name) + " must be MODE[r0|r4|r8], MODE 0..3");
+        x.mode = static_cast<unsigned>(t[0] - '0');
+        x.rows = t.size() == 1 ? 0U : static_cast<unsigned>(t[2] - '0');
+        return x;
+    };
+    const FlashArm fa = flag == "pfmsaflash" ? flash_arm("STRIX_MM_AB_FLASH_A", "1") : FlashArm{0U, 0U};
+    const FlashArm fb = flag == "pfmsaflash" ? flash_arm("STRIX_MM_AB_FLASH_B", "3") : FlashArm{0U, 0U};
+    const unsigned flash0 = eng.prefill_msa_flash(), rg_rows0 = eng.prefill_rg_rows();
+    if (flag == "pfmsaflash") std::printf("pfmsaflash arms A=%u r%u B=%u r%u
+", fa.mode, fa.rows, fb.mode, fb.rows);
     const std::string pipe_on = std::getenv("STRIX_MM_AB_PIPE") != nullptr ? std::getenv("STRIX_MM_AB_PIPE") : "2";  // moepipe B form
     const char* pipe_env = std::getenv("STRIX_MMX_MOE_PIPE");  // restored after the A/B
     const std::string moe_pipe0 = pipe_env != nullptr ? pipe_env : "";
@@ -1032,7 +1051,11 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
         }
         else if (flag == "pfmsa") eng.set_prefill_msa_batch(on);
         else if (flag == "pfdensemlp") eng.set_prefill_dense_mlp(on);  // layers 0-2 dense MLP: strix_gemm (A) / v4 core (B)
-        else if (flag == "pfflashkeys") eng.set_prefill_flash_keys(on ? 2U : 0U);  // FAST flash: incumbent loads (A) / key halves (B)
+        else if (flag == "pfflashkeys") eng.set_prefill_flash_keys(on ? 2U : 0U);
+        else if (flag == "pfmsaflash") {
+            eng.set_prefill_msa_flash(on ? fb.mode : fa.mode);
+            eng.set_prefill_rg_rows(on ? fb.rows : fa.rows);
+        }  // FAST flash: incumbent loads (A) / key halves (B)
         else if (flag == "pfheadless") eng.set_prefill_headless(on);  // last layer of headless chunks: full (A) / cache-only (B)
         else if (flag == "pfattn4") eng.set_prefill_attend4(on);
         else if (flag == "pfidxconc") eng.set_prefill_index_concurrent(on ? idx_conc_b : 0);
@@ -1123,7 +1146,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     std::vector<double> ttft[2], step_ms[2];
     std::vector<std::uint32_t> first(6);
     std::vector<std::uint64_t> states, outs;  // per arm: K/V/IK state FNV, final-rows FNV (this rank only; never in the cross-rank hash)
-    const bool hash_state = ((flag == "pfattn4" || flag == "pfmsa" || flag == "pfheadless" || flag == "pfdensemlp" || flag == "pfflashkeys" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall")) || (state_fnv_on() && (flag == "pfx" || flag == "pfil" || flag == "pfxip" || std::getenv("STRIX_MM_AB_STATE") != nullptr));
+    const bool hash_state = ((flag == "pfattn4" || flag == "pfmsa" || flag == "pfheadless" || flag == "pfdensemlp" || flag == "pfflashkeys" || flag == "pfmsaflash" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall")) || (state_fnv_on() && (flag == "pfx" || flag == "pfil" || flag == "pfxip" || std::getenv("STRIX_MM_AB_STATE") != nullptr));
     // pfattn4 / pfmsa / pfmsarework / mtfit / core8 / pftab / pfgufuse / pfidx / pftxuc / pfrouter / pfidxconc / pfkvtile / pftiled: A B A B A B A (every B bracketed by two A prefills); the other prefill flags: A B A B A B
     const int prefills = flag == "attn" || flag == "linears" || flag == "xfer" || flag == "idxdec" || flag == "idxconc" || flag == "xbfold" || flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbpub" || flag == "xbwarm" || flag == "xbwarmo" || flag == "moegrid" || flag == "moepipe" || flag == "xbilp" || flag == "xbset" ? 1 : (flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall" || flag == "pfi4") ? 7 : 6;  // idxattn: both  // decode-only flags: one prefill, no TTFT cells
     first.resize(static_cast<std::size_t>(prefills));
@@ -1167,6 +1190,10 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
             for (double v : cell[b]) std::printf(" %.3f", v);
             std::printf("\n");
         }
+    }
+    if (flag == "pfmsaflash") {
+        eng.set_prefill_msa_flash(flash0);
+        eng.set_prefill_rg_rows(rg_rows0);
     }
     if (flag == "pfmsarework") {
         eng.set_prefill_msa_rework(rework0);

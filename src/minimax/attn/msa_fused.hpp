@@ -99,6 +99,9 @@ struct PrefillView {
     // FAST flash (msa_rework 11/12) load schedule, attn_core sparse_flash_keysplit Opt: 0 = incumbent (one key fragment
     // load per QK step), 1 = keys first (diagnostic), 2 = key halves (default, STRIX_MM_PF_FLASH_KEYS). Output bits identical in every mode.
     std::uint32_t flash_keys = 2;
+    // Row-group flash (msa_rework 13) rows per work-group, attn_core RowGroup<..., Rows>: 0 = auto (8 on dense windows,
+    // 4 on sparse rows, measured 16-11), 4 or 8 = both (STRIX_MM_PF_MSA_RG_ROWS). Output bits identical in every value.
+    std::uint32_t rg_rows = 0;
 };
 using PrefillStageMarker = void (*)(void* user, const char* category, bool before);
 void enqueue_prefill(const PrefillView& v, hipStream_t stream,

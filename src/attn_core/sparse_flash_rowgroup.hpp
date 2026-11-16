@@ -39,22 +39,25 @@
 
 namespace strix::attn_core::sparse {
 
-template <unsigned H, unsigned D, unsigned Segs> struct RowGroup {
+// Rows: query rows per work-group (one wave each); 4 or 8. Every wave runs its own row's tiles in ascending order with
+// the same expressions whatever Rows is, so the output bits do not depend on Rows (only the union and the schedule do).
+template <unsigned H, unsigned D, unsigned Segs, unsigned Rows = 4> struct RowGroup {
     static_assert(H == 16 && D == 128, "key-split fragment layouts");
-    static constexpr unsigned kRows = 4, kWaves = kRows, kThreads = 32 * kWaves, kT = 16, kKs = D / 16;
+    static_assert(Rows == 4 || Rows == 8, "waves 0-3 load the tiles");
+    static constexpr unsigned kRows = Rows, kWaves = kRows, kThreads = 32 * kWaves, kT = 16, kKs = D / 16;
     static constexpr unsigned kKPitch = 2 * D + 16;    // K row: 128 dims + 16-B pad (272 B: 8 lanes cover 32 banks)
     static constexpr unsigned kVPitch = 2 * kT + 16;   // V^T row: 16 keys + 16-B pad (key-split pitch)
     static constexpr unsigned kKBytes = kT * kKPitch, kVBytes = D * kVPitch, kStage = kKBytes + kVBytes;
     static constexpr unsigned kCand = kRows * Segs;
-    static constexpr unsigned kCv = 2 * kStage;                  // u64 candidate identity [kCand]
+    static constexpr unsigned kQBytes = kRows * H * D * 2;       // query staging (prologue only), aliases the stages
+    static constexpr unsigned kCv = kQBytes > 2 * kStage ? kQBytes : 2 * kStage;  // u64 candidate identity [kCand]
     static constexpr unsigned kKp = kCv + 8 * kCand;             // u64 union K segment base [kCand]
     static constexpr unsigned kVp = kKp + 8 * kCand;             // u64 union V segment base [kCand]
     static constexpr unsigned kNk = kVp + 8 * kCand;             // u16 visible keys [union][row], 0 = not selected
     static constexpr unsigned kDup = kNk + 2 * kRows * kCand;    // u32 duplicate flag [kCand]
     static constexpr unsigned kCnt = kDup + 4 * kCand;           // u32 union length
     static constexpr unsigned kBytes = kCnt + 16;
-    static_assert(kRows * H * D * 2 <= 2 * kStage, "query staging fits the tile stages");
-    static_assert(2 * kRows * kCand == 4 * kThreads, "one u32 of the visible-key table per thread");
+    static_assert(kRows * kCand % 2 == 0, "visible-key table cleared as u32");
     static_assert(Segs <= 32, "one candidate per lane");
 };
 
@@ -82,9 +85,9 @@ __device__ __forceinline__ tile::Frag p_frag(const std::uint16_t (&v)[8], unsign
 }
 }  // namespace rowgroup_detail
 
-template <class P, unsigned Opt = 0U>
-__global__ __launch_bounds__((RowGroup<P::kHeads, P::kDim, P::kMaxSegs>::kThreads)) void flash_rowgroup_kernel(typename P::Args a) {
-    using G = RowGroup<P::kHeads, P::kDim, P::kMaxSegs>;
+template <class P, unsigned Opt = 0U, unsigned Rows = 4U>
+__global__ __launch_bounds__((RowGroup<P::kHeads, P::kDim, P::kMaxSegs, Rows>::kThreads)) void flash_rowgroup_kernel(typename P::Args a) {
+    using G = RowGroup<P::kHeads, P::kDim, P::kMaxSegs, Rows>;
     using tile::Acc;
     using tile::Frag;
     using tile::U2;
@@ -106,7 +109,7 @@ __global__ __launch_bounds__((RowGroup<P::kHeads, P::kDim, P::kMaxSegs>::kThread
     const unsigned cnt = act ? P::segments(a, row) : 0U;
     if (cnt > S) __builtin_trap();
     // 1. candidates (lane c = segment c of the wave's row), queries staged per wave, visible-key table cleared
-    reinterpret_cast<unsigned*>(nkt)[tid] = 0U;
+    for (unsigned i = tid; i < G::kRows * G::kCand / 2U; i += G::kThreads) reinterpret_cast<unsigned*>(nkt)[i] = 0U;
     if (tid == 0) *cnt_u = 0U;
     std::uint64_t mine = ~0ULL;
     unsigned mine_nk = 0;
@@ -156,14 +159,18 @@ __global__ __launch_bounds__((RowGroup<P::kHeads, P::kDim, P::kMaxSegs>::kThread
     const unsigned nu = *cnt_u;
     if (nu == 0) return;  // no row with a visible key: outputs untouched
     const std::size_t ks = P::key_stride(a);
-    const bool vload = tid < 64U;
+    const bool vload = tid < 64U, kload = tid >= 64U && tid < 128U;  // waves 4+ (Rows 8) only compute
     const unsigned t2 = tid & 63U, kg = t2 & 3U, dg = t2 >> 2U;  // V: keys 4 kg .. + 3, dims 8 dg .. + 7
     const auto keys_max = [&](unsigned u) {
         const unsigned* p = reinterpret_cast<const unsigned*>(nkt + u * G::kRows);
-        const unsigned x0 = p[0], x1 = p[1];
-        const unsigned m0 = (x0 & 0xffffU) > (x0 >> 16U) ? x0 & 0xffffU : x0 >> 16U;
-        const unsigned m1 = (x1 & 0xffffU) > (x1 >> 16U) ? x1 & 0xffffU : x1 >> 16U;
-        return m0 > m1 ? m0 : m1;
+        unsigned m = 0;
+#pragma unroll
+        for (unsigned i = 0; i < G::kRows / 2U; ++i) {
+            const unsigned x = p[i], lo = x & 0xffffU, hi = x >> 16U;
+            m = lo > m ? lo : m;
+            m = hi > m ? hi : m;
+        }
+        return m;
     };
     U4 stg[4];
     const auto fetch = [&](unsigned u, unsigned k0, unsigned nm) {
@@ -176,7 +183,7 @@ __global__ __launch_bounds__((RowGroup<P::kHeads, P::kDim, P::kMaxSegs>::kThread
                 const U4 x = *reinterpret_cast<const U4*>(base + static_cast<std::size_t>(ok ? k : nm - 1U) * ks + 8U * dg);
                 stg[i] = ok ? x : U4{0U, 0U, 0U, 0U};
             }
-        } else {
+        } else if (kload) {
             const auto* base = reinterpret_cast<const std::uint16_t*>(kp[u]);
 #pragma unroll
             for (unsigned i = 0; i < 4; ++i) {
@@ -189,7 +196,7 @@ __global__ __launch_bounds__((RowGroup<P::kHeads, P::kDim, P::kMaxSegs>::kThread
         unsigned char* const buf = lds + stage * G::kStage;
         if (vload) {
             tile::store_vt4x8<G::kVPitch>(buf + G::kKBytes, stg, 8U * dg, kg);
-        } else {
+        } else if (kload) {
 #pragma unroll
             for (unsigned i = 0; i < 4; ++i)
                 *reinterpret_cast<U4*>(buf + ((t2 >> 4U) + 4U * i) * G::kKPitch + 16U * (t2 & 15U)) = stg[i];

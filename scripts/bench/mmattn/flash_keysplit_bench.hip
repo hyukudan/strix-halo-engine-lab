@@ -109,10 +109,10 @@ template <unsigned Opt, bool Split> void launch(const BenchPolicy::Args& a, unsi
     hipLaunchKernelGGL((ks::flash_rows_keysplit_kernel<BenchPolicy, Split, Opt>), dim3(wgs), dim3(ks::KeySplit<kH, kD>::kThreads), 0,
                        nullptr, a);
 }
-template <unsigned Opt> void launch_rowgroup(const BenchPolicy::Args& a, unsigned rows) {
+template <unsigned Opt, unsigned Rows = 4> void launch_rowgroup(const BenchPolicy::Args& a, unsigned rows) {
     namespace ks = strix::attn_core::sparse;
-    using G = ks::RowGroup<kH, kD, kTop>;
-    hipLaunchKernelGGL((ks::flash_rowgroup_kernel<BenchPolicy, Opt>), dim3((rows + G::kRows - 1) / G::kRows * kKvh), dim3(G::kThreads), 0,
+    using G = ks::RowGroup<kH, kD, kTop, Rows>;
+    hipLaunchKernelGGL((ks::flash_rowgroup_kernel<BenchPolicy, Opt, Rows>), dim3((rows + G::kRows - 1) / G::kRows * kKvh), dim3(G::kThreads), 0,
                        nullptr, a);
 }
 }  // namespace
@@ -202,6 +202,7 @@ int main(int argc, char** argv) {
             case 18: launch_rowgroup<1>(a, rows); break;
             case 20: launch_rowgroup<2>(a, rows); break;
             case 22: launch_rowgroup<3>(a, rows); break;
+            case 24: launch_rowgroup<1, 8>(a, rows); break;  // OPT 12: lazy rescale, 8 rows per work-group
             default: std::fprintf(stderr, "unknown OPT\n"); std::exit(1);
         }
     };

@@ -2365,12 +2365,20 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
             // FAST: one-term flash on the shared core's row-group form: 4 neighbouring rows of one KV group per block
             // share each K/V tile of their merged block lists (same selection and block lists as mode 11; one softmax
             // stream per row, so not mode 11's bytes).
+            // p.rg_rows: 4 or 8 rows per work-group (same bits); auto = 8 on dense windows (every row shares every
+            // tile: bench -7 %), 4 on sparse rows (union grows with the group: bench drift 2+ is +1..+3 % at 8).
             namespace ks = strix::attn_core::sparse;
-            using RG = ks::RowGroup<kGroup, kHeadDim, MsaFlashPolicy::kMaxSegs>;
             const unsigned rows = scheduled.rows - p.first_window * kMaxRows;
             const MsaFlashArgs args{scheduled, DENSE ? 1U : 0U};
-            hipLaunchKernelGGL((ks::flash_rowgroup_kernel<MsaFlashPolicy, ks::kRgLazyRescale>), dim3((rows + RG::kRows - 1) / RG::kRows * v.kv_heads),
-                               dim3(RG::kThreads), 0, stream, args);
+            const unsigned rg = p.rg_rows != 0U ? p.rg_rows : DENSE ? 8U : 4U;
+            const auto go = [&](auto rows_c) {
+                constexpr unsigned R = decltype(rows_c)::value;
+                using RG = ks::RowGroup<kGroup, kHeadDim, MsaFlashPolicy::kMaxSegs, R>;
+                hipLaunchKernelGGL((ks::flash_rowgroup_kernel<MsaFlashPolicy, ks::kRgLazyRescale, R>),
+                                   dim3((rows + RG::kRows - 1) / RG::kRows * v.kv_heads), dim3(RG::kThreads), 0, stream, args);
+            };
+            if (rg == 8U) go(std::integral_constant<unsigned, 8>{});
+            else go(std::integral_constant<unsigned, 4>{});
             hip_check(hipGetLastError(), "minimax prefill flash attend (row groups)");
             return;
         }
@@ -2757,7 +2765,7 @@ void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarke
         const unsigned nw = windows - first < batch_cap ? windows - first : batch_cap;
         const unsigned r0 = first * kMaxRows;
         PrefillView batch{prefill_offset(v, r0), p.rows - r0, p.pos0 + r0, p.scratch_windows, 0, p.index_tile, p.index_rows, p.msa_rework,
-                          p.flash_keys};
+                          p.flash_keys, p.rg_rows};
         if (batch.rows > nw * kMaxRows) batch.rows = nw * kMaxRows;
         const unsigned dense = route::dense_windows(batch.pos0, batch.rows, nw, kMaxRows, kTopK * kBlock);
         const unsigned sparse = nw - dense;

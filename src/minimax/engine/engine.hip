@@ -688,6 +688,7 @@ struct Engine::Impl {
     // STRIX_MM_PF_FLASH_KEYS (default 2 = key halves, schedule only, same bits): FAST flash key-fragment load schedule
     // (PrefillView::flash_keys; 0 = incumbent, 1 = keys first). Bench: scripts/bench/mmattn.
     unsigned pf_flash_keys = 2;
+    unsigned pf_rg_rows = 0;  // STRIX_MM_PF_MSA_RG_ROWS=0 (auto) | 4 | 8: row-group flash rows per work-group (same bits)
     // STRIX_MM_PF_DENSE_MLP (default ON, exact): the dense MLP of layers 0..kFirstMoe-1 (gate + up, then down) on the v4
     // prefill core for 4096-row pieces (dense_mlp), the q/k/v core contract (== strix_gemm bitwise); 0 keeps strix_gemm.
     bool pf_dense_mlp = true;
@@ -906,6 +907,12 @@ struct Engine::Impl {
             const std::string mode(value);
             if (mode != "0" && mode != "1" && mode != "2") throw std::invalid_argument("STRIX_MM_PF_FLASH_KEYS must be 0, 1 or 2");
             pf_flash_keys = static_cast<unsigned>(mode[0] - '0');
+        }
+        if (const char* value = std::getenv("STRIX_MM_PF_MSA_RG_ROWS")) {
+            const std::string mode(value);
+            if (mode != "0" && mode != "auto" && mode != "4" && mode != "8")
+                throw std::invalid_argument("STRIX_MM_PF_MSA_RG_ROWS must be auto, 0, 4 or 8");
+            pf_rg_rows = mode == "4" ? 4U : mode == "8" ? 8U : 0U;
         }
         pf_dense_mlp = env_flag("STRIX_MM_PF_DENSE_MLP", true);
         if (const char* value = std::getenv("STRIX_MM_PF_IDX_CONC")) {
@@ -2116,7 +2123,7 @@ struct Engine::Impl {
                         dv.idx_count = pf_cnt;
                         dv.partial = pf_partial;
                         dv.ticket = pf_ticket;
-                        const mfused::PrefillView pfv{dv, static_cast<std::uint32_t>(n), pos0, pf_msa_windows, 0, pf_idx_tile && n > 8, pf_idx_rows, n > 8 ? (pf_msa_flash != 0 && pf_msa_rework != 0 && pf_msa_flash_layers.test(L) ? 10U + pf_msa_flash : pf_msa_rework) : 0U, pf_flash_keys};
+                        const mfused::PrefillView pfv{dv, static_cast<std::uint32_t>(n), pos0, pf_msa_windows, 0, pf_idx_tile && n > 8, pf_idx_rows, n > 8 ? (pf_msa_flash != 0 && pf_msa_rework != 0 && pf_msa_flash_layers.test(L) ? 10U + pf_msa_flash : pf_msa_rework) : 0U, pf_flash_keys, pf_rg_rows};
                         if (cache_only) {
                             mfused::enqueue_prefill_cache_only(pfv, nullptr, tl ? PrefillTimeline::msa_mark : nullptr, tl);
                             did_cache_only = true;
@@ -3680,6 +3687,18 @@ void Engine::set_prefill_flash_keys(unsigned mode) {
     impl_->pf_flash_keys = mode;
 }
 unsigned Engine::prefill_flash_keys() const { return impl_->pf_flash_keys; }
+void Engine::set_prefill_rg_rows(unsigned rows) {
+    impl_->no_task("set_prefill_rg_rows");
+    if (rows != 0 && rows != 4 && rows != 8) throw std::invalid_argument("prefill row-group rows must be 0 (auto), 4 or 8");
+    impl_->pf_rg_rows = rows;
+}
+unsigned Engine::prefill_rg_rows() const { return impl_->pf_rg_rows; }
+void Engine::set_prefill_msa_flash(unsigned mode) {
+    impl_->no_task("set_prefill_msa_flash");
+    if (mode > 3) throw std::invalid_argument("prefill MSA flash must be 0..3");
+    impl_->pf_msa_flash = mode;
+}
+unsigned Engine::prefill_msa_flash() const { return impl_->pf_msa_flash; }
 void Engine::set_prefill_msa_rework(unsigned mode) {
     impl_->no_task("set_prefill_msa_rework");
     impl_->set_prefill_msa_rework(mode);
