@@ -679,7 +679,8 @@ private:
         extra += "]";
         if (s.ctx) extra += std::string(",\"context_draft\":\"") + qc::context_mode_name(context_mode_) + "\",\"copy_first_steps\":" +
             std::to_string(s.ctx->copy_first_steps) + ",\"context_extended_steps\":" + std::to_string(s.ctx->extended_steps) +
-            ",\"context_rows\":" + std::to_string(s.ctx->context_rows) + ",\"copy_first_accepted\":" + std::to_string(s.ctx->context_accepted);
+            ",\"context_rows\":" + std::to_string(s.ctx->context_rows) + ",\"copy_first_accepted\":" + std::to_string(s.ctx->context_accepted) +
+            ",\"context_host_us\":" + std::to_string(static_cast<long long>(s.ctx->host_us));
         extra += ",\"prefix_cached\":" + std::to_string(st.cached_tokens) + ",\"prefix_restore_ms\":" + std::to_string(s.prefix_restore_ms)
             + ",\"prefix_capture_ms\":" + std::to_string(s.prefix_capture_ms) + "}";
         st.engine_extra.emplace_back("rtx", extra);

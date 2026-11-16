@@ -29,14 +29,17 @@ namespace qp = strix::cuda::qwen_prefill;
 // forward (the commit writes the MTP teacher rows of every committed position from the target's hidden rows, so the
 // predictor cache is the same as after a drafted window); otherwise the span extends or replaces the confident MTP
 // prefix. Every row still passes the greedy verify: the committed tokens are the target's whatever the proposal.
-enum class ContextMode { off, ctx, copy };
+enum class ContextMode { off, ctx, copy, first };
 inline ContextMode context_mode_of(const char* v) {
     const std::string s = v ? v : "";
     if (s == "ctx") return ContextMode::ctx;
-    if (s == "copy" || s == "1" || s == "on") return ContextMode::copy;
+    if (s == "copy") return ContextMode::copy;
+    if (s == "first" || s == "1" || s == "on") return ContextMode::first;
     return ContextMode::off;
 }
-inline const char* context_mode_name(ContextMode m) { return m == ContextMode::copy ? "copy" : m == ContextMode::ctx ? "ctx" : "off"; }
+inline const char* context_mode_name(ContextMode m) {
+    return m == ContextMode::first ? "first" : m == ContextMode::copy ? "copy" : m == ContextMode::ctx ? "ctx" : "off";
+}
 // STRIX_QRTX_CONTEXT_DRAFT=off|ctx|copy (unset: the default below), one resolution for every entry point.
 inline ContextMode context_mode_default() {
     static const ContextMode m = [] {
@@ -49,13 +52,15 @@ struct ContextDraft {
     strix::MtpContextDraft drafter;
     double mtp_expected = -1.0;    // accepted drafts per MTP (not copy-first) step, EMA 0.75/0.25 (as the HIP runtime)
     bool copy_first = false;       // this step's rows came from the context, no predictor forward
+    bool deliver_extension = true;  // first: context rows only as copy-first windows; extensions are scored, never verified
     std::uint64_t copy_first_steps = 0, extended_steps = 0, context_rows = 0, context_accepted = 0;
+    double host_us = 0.0;           // host time in the drafter (proposals + learning)
     static MtpContextDraftConfig config(ContextMode m) {
         MtpContextDraftConfig c;
-        c.copy_edit = m == ContextMode::copy;
+        c.copy_edit = m == ContextMode::copy || m == ContextMode::first;
         return c;
     }
-    explicit ContextDraft(ContextMode m) : drafter(config(m)) {}
+    explicit ContextDraft(ContextMode m) : drafter(config(m)), deliver_extension(m != ContextMode::first) {}
 };
 
 struct Stream {
@@ -179,9 +184,11 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
         c->copy_first = false;
         if (room[i] == 0) continue;
         std::vector<double> acceptance;
+        const auto h0 = Clock::now();
         copy[i] = c->drafter.begin_copy_cycle(streams[i].pending, room[i], acceptance, o.min_p, c->mtp_expected);
         if (copy[i].size() > room[i]) copy[i].resize(room[i]);
         if (!copy[i].empty()) { c->copy_first = true; requests[i].depth = 0; }
+        c->host_us += std::chrono::duration<double, std::micro>(Clock::now() - h0).count();
     }
     for (std::uint32_t i = 0; i < n; ++i) chains += requests[i].depth > 0;
     // drafts: batched by step across sessions (<= 8 chains per call), or one chain per session
@@ -214,7 +221,10 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
                 ++confident;
             }
             std::vector<double> acceptance;
+            const auto h0 = Clock::now();
             auto ext = c->drafter.begin_cycle(s.pending, d.tokens, confident, room[i], acceptance, o.min_p, kept_expected);
+            if (!c->deliver_extension) { c->drafter.discard_selection(); ext.clear(); }  // learning only
+            c->host_us += std::chrono::duration<double, std::micro>(Clock::now() - h0).count();
             if (!ext.empty()) {
                 const std::size_t kept = std::min<std::size_t>(c->drafter.kept_drafts(), d.tokens.size());
                 d.tokens.resize(kept);
@@ -288,7 +298,9 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
         auto* c = streams[i].context;
         if (!c || out[i].failed || out[i].tokens.empty()) continue;
         const std::size_t verified = out[i].rows > 0 ? out[i].rows - 1U : 0U, accepted = out[i].tokens.size() - 1U;
+        const auto h0 = Clock::now();
         c->drafter.finish_cycle(out[i].tokens, verified, accepted);
+        c->host_us += std::chrono::duration<double, std::micro>(Clock::now() - h0).count();
         if (c->copy_first) c->context_accepted += accepted;
         else if (room[i] > 0) c->mtp_expected = c->mtp_expected < 0.0 ? static_cast<double>(accepted) : 0.75 * c->mtp_expected + 0.25 * static_cast<double>(accepted);
     }
