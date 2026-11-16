@@ -167,4 +167,15 @@ std::string verify_suffix_replay(const SuffixReplayGeometry& g, const SuffixRepl
     return problem;
 }
 
+std::uint32_t moe_window_rows(std::uint32_t base, std::uint32_t chunk, std::uint32_t pass_rows, std::uint32_t cap) {
+    if (base == 0U || chunk == 0U) throw std::invalid_argument("ds41 moe window: base and chunk rows must be positive");
+    const std::uint64_t whole = (std::uint64_t{pass_rows} + chunk - 1U) / chunk * chunk;
+    const std::uint64_t top = std::max<std::uint64_t>(cap / chunk * chunk, base);
+    return static_cast<std::uint32_t>(std::clamp<std::uint64_t>(whole, base, top));
+}
+
+bool moe_joint_layer(std::uint32_t peer_rows, std::uint32_t own_rows, std::uint32_t max_rows) {
+    return max_rows != 0U && std::uint64_t{peer_rows} + own_rows <= max_rows;
+}
+
 } // namespace strix::ds41

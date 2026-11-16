@@ -2022,7 +2022,10 @@ void enqueue_attention_flash_prefill(const AttentionView& v, hipStream_t stream)
     if (v.kv != nullptr || v.ring_out != nullptr) throw std::invalid_argument("ds41 flash attention: no window fold");
     if (v.ring16 == nullptr || (v.idx_count != nullptr && v.kv16 == nullptr)) throw std::invalid_argument("ds41 flash attention: key mirrors");
     using strix::attn_core::sparse::flash_rows_kernel;
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(flash_rows_kernel<FlashAttentionPolicy, 32U>), dim3(v.rows * (v.heads / 32U)), dim3(256), 0, stream, v);
+    if (v.q16 != nullptr)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(flash_rows_kernel<FlashAttentionQ16Policy, 32U>), dim3(v.rows * (v.heads / 32U)), dim3(256), 0, stream, v);
+    else
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(flash_rows_kernel<FlashAttentionPolicy, 32U>), dim3(v.rows * (v.heads / 32U)), dim3(256), 0, stream, v);
     hipLaunchKernelGGL(attention_flash_combine_kernel, dim3(v.heads, v.rows), dim3(32), 0, stream, v);
     hip_check(hipGetLastError(), "ds41 flash attention");
 }

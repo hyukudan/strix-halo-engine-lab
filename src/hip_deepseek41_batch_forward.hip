@@ -2,12 +2,15 @@
 #include "strix/file_snapshot.hpp"
 #include "strix/hip_check.hpp"
 #include "strix/deepseek41_batch_forward.hpp"
+#include "strix/hip_logprob_partials.hpp"
 
 #include "strix/deepseek41_attention_host.hpp"
 #include "strix/deepseek41_plan.hpp"
 #include "strix/dist/communicator.hpp"
 #include "hip_ds41_staged_ready.hpp"
 #include "xport/ds41_adapter.hpp"
+#include "hip_deepseek41_prefill_xport.hpp"
+#include "strix/ds41_decode_xport.hpp"
 #include "strix/ds41_engram.hpp"
 #include "strix/ds41_expert_tp.hpp"
 #include "strix/ds41_moe.hpp"
@@ -366,6 +369,7 @@ std::uint64_t workspace_bytes_for(const TargetModel& model, const BatchForwardOp
     n += W * H + 2U * W * H / 32U * 4U;                                                    // FFN input A8
     n += W * K * I + 2U * W * K * I / 32U * 4U + W * I + 2U * W * I / 32U * 4U;            // expert activations A8
     n += (W * partial_blocks + 5U * W) * sizeof(ds41::ArgmaxCandidate);                     // argmax
+    n += 2U * W * sizeof(LogprobPartial);                                                 // score_own, score_other (also when scoring is off)
     n += 2U * (W * H + W * H / 2U) * 4U;                                                   // half sums (+ split shared down rows)
     n += 2U * (W * I / 2U + W * I / 64U * 4U);                                             // split shared activation halves
     n += 6U * (W * K + 1U) * 4U + 2U * std::max<std::uint64_t>(options.layers, 1U) * 4U;                                                // built routes
@@ -598,6 +602,9 @@ struct BatchForward::Impl {
     Dev<std::int32_t> sums, act_sums, sh_act_sums;
     Dev<ds41::ArgmaxCandidate> partial, cand0, cand1, best, cand_own, cand_other;
     Pinned<ds41::ArgmaxCandidate> best_pinned;
+    // logprob scoring (BatchForward::set_score_slots): [slice 0 rows | slice 1 rows] partials
+    Dev<LogprobPartial> score_own, score_other;
+    Pinned<LogprobPartial> score_pinned;
     struct BuiltRoutes {
         Dev<std::uint32_t> experts, begins, rows, slots, order, low_counts, counts;
     } built;
@@ -650,6 +657,14 @@ struct BatchForward::Impl {
     std::uint32_t last_first_layer = 0;  // the last step's first layer (step_boundary: its cut; commit skips the layers before)
     std::vector<LastSegment> front_segments;  // the segments of the last step_front (its TAIL half may follow in this process)
     Dev<std::uint8_t> control;  // the serving control channel: [out][in], control_bytes each
+    // STRIX_DS41_DECODE_XPORT=channel (strix/ds41_decode_xport.hpp, agreed by both ranks at load): every exchange of a
+    // plain TP step runs on a Channel that leases the communicator's transport for the step (release_transport at the
+    // step start, drain at its end). The two never progress the transport together (as the prefill lease, prefill.hip).
+    bool decode_xport = false;
+    std::unique_ptr<prefill_xport::Exchange> decode_channel;  // created at the first channel step (transport released)
+    prefill_xport::Runtime decode_runtime;
+    std::unique_ptr<prefill_xport::Communicator> decode_wire;
+    std::uint64_t decode_xport_steps = 0, decode_xport_declined = 0;
 
     [[nodiscard]] bool distributed() const noexcept { return options.world == 2U; }
     [[nodiscard]] double comm_seconds() const { return distributed() ? options.communicator->stats().seconds : 0.0; }
@@ -1174,6 +1189,9 @@ BatchForward::BatchForward(const std::filesystem::path& gguf, const BatchForward
     m.cand_own = m.track<ds41::ArgmaxCandidate>(W);
     m.cand_other = m.track<ds41::ArgmaxCandidate>(W);
     m.best_pinned = Pinned<ds41::ArgmaxCandidate>(W);
+    m.score_own = m.track<LogprobPartial>(W);
+    m.score_other = m.track<LogprobPartial>(W);
+    m.score_pinned = Pinned<LogprobPartial>(std::size_t{2} * W);
     m.half_own = m.track<float>(W * H + W * H / 2U);
     m.half_other = m.track<float>(W * H + W * H / 2U);
     m.shx_own = m.track<std::uint8_t>(W * I / 2U + W * I / 64U * 4U);
@@ -1253,6 +1271,13 @@ BatchForward::BatchForward(const std::filesystem::path& gguf, const BatchForward
             requested && m.engram_async && m.engram_reader != nullptr,
             W * m.model.engram.rows_per_token() * 264U, m.half_other.bytes(),
             dist::Tag{static_cast<std::uint32_t>(dist::TagKind::control), 0x6567726dU, 0U});
+        const bool channel = ds41::decode_xport_choice(std::getenv(ds41::decode_xport_lever.env.data())).on;
+        m.decode_xport = options.communicator->agree_exchange(channel, 1U, 1U,
+            dist::Tag{static_cast<std::uint32_t>(dist::TagKind::control), 0x64787074U, 0U});
+        ds41::check_decode_xport_step(channel, m.decode_xport, options.slice_logits || options.gather_logits);
+        if (channel || m.decode_xport)
+            std::fprintf(stderr, "ds41 decode xport: requested=%s effective=%s\n", ds41::decode_xport_name(channel),
+                         ds41::decode_xport_name(m.decode_xport));
     }
     load_seconds_ = seconds_since(t_load);
 }
@@ -1269,6 +1294,8 @@ std::string BatchForward::overlay_description() const {
 
 BatchForward::~BatchForward() {
     if (impl_) {
+        impl_->decode_wire.reset();  // drains the channel and retires its consumers before the stream goes
+        impl_->decode_channel.reset();
         impl_->trellis_oa.reset();
         impl_->trellis.reset();
     }
@@ -1676,6 +1703,32 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
     const std::uint32_t H = c.hidden_size, hc = c.hc_mult, K = c.num_experts_per_tok, I = c.moe_intermediate_size;
     const std::uint32_t V = c.vocab_size, W = m.row_capacity;
     hipStream_t st = m.stream;
+    // STRIX_DS41_DECODE_XPORT=channel: the transport is leased to the Channel for this step (plain TP steps only: the
+    // pipeline FRONT / TAIL halves keep the communicator). Logit gathers use the same bounded Channel byte exchanges.
+    // A communicator still holding a
+    // staged view (none between steps today) declines the step, counted in decode_xport_declined.
+    bool channel_step = m.decode_xport && !tail && front_cut == 0U;
+    if (channel_step) {
+        try {
+            m.options.communicator->release_transport(st);
+        } catch (const std::logic_error&) {
+            channel_step = false;
+            ++m.decode_xport_declined;
+        }
+    }
+    ds41::check_decode_xport_step(m.decode_xport, channel_step, m.options.slice_logits || m.options.gather_logits);
+    if (channel_step && !m.decode_channel) {
+        prefill_xport::Exchange::Options opt;
+        opt.rank = m.options.rank;
+        opt.stream = st;
+        opt.capacity = std::size_t{1} << 20U;  // >= 16 rows x hidden x 4 and every Engram piece; larger messages are chunked
+        opt.depth = 4;                         // two layers of o_b + half-sum exchanges in flight
+        m.decode_channel = std::make_unique<prefill_xport::Exchange>(m.options.communicator->transport(), opt);
+        m.decode_wire = std::make_unique<prefill_xport::Communicator>(m.options.communicator, m.decode_channel.get(), m.decode_runtime);
+    }
+    prefill_xport::Communicator legacy_wire(m.options.communicator, nullptr, m.decode_runtime);
+    auto& wire = channel_step ? *m.decode_wire : legacy_wire;
+    if (channel_step) ++m.decode_xport_steps;
     const auto t_step = std::chrono::steady_clock::now();
     if (!m.trace && ds41::StepTrace::env_level() != 0) {
         m.trace = std::make_unique<ds41::StepTrace>(ds41::StepTrace::env_level(), m.options.rank);
@@ -1915,7 +1968,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
         dv.out = m.shared.p;
         ds41::enqueue_routes_product(down_fmt, dv, st);
     };
-    using BatchRawCommunicator = std::remove_reference_t<decltype(*m.options.communicator)>;
+    using BatchRawCommunicator = std::remove_reference_t<decltype(wire)>;
     using BatchRawExchange = xport::Ds41RawSlotsExchange<BatchRawCommunicator, hipStream_t, dist::Tag>;
     std::optional<BatchRawExchange> batch_shared_raw_exchange;
     const Step* deferred_shared = nullptr;
@@ -2147,11 +2200,11 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 const std::size_t at = li * R * cols * 264U, row_bytes_all = std::size_t{R} * cols * 264U;
                 const dist::Tag rows_tag{static_cast<std::uint32_t>(dist::TagKind::engram_rows), layer, 0U};
                 if (rows_from_lead) {
-                    m.options.communicator->exchange(st, m.half_other.p, m.erows.p + at, row_bytes_all, rows_tag);
+                    wire.exchange(st, m.half_other.p, m.erows.p + at, row_bytes_all, rows_tag);
                 } else {
                     engram_wait.at(li).get();
                     check(hipMemcpyAsync(m.erows.p + at, m.erows_pinned.p + at, row_bytes_all, hipMemcpyHostToDevice, st), "engram rows");
-                    if (engram_peer_rows) m.options.communicator->exchange(st, m.erows.p + at, m.half_other.p, row_bytes_all, rows_tag);
+                    if (engram_peer_rows) wire.exchange(st, m.erows.p + at, m.half_other.p, row_bytes_all, rows_tag);
                 }
                 stats_.engram_wait_seconds += seconds_since(t_rows);
             }
@@ -2178,7 +2231,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 // fit one view. Each chunk's product runs while the chunk before it is on the wire; no device copies or events.
                 // Same per-row products, plain copies: the same bits.
                 static const bool engram_views = strix::envcfg::flag("STRIX_DS41_ENGRAM_READY", true);
-                const std::uint32_t chunk = engram_views ? m.options.communicator->staged_ready_chunk_rows(R, std::size_t{half} * 4U) : 0U;
+                const std::uint32_t chunk = engram_views ? wire.staged_ready_chunk_rows(R, std::size_t{half} * 4U) : 0U;
                 bool exchanged = false;
                 if (chunk != 0U) {
                     const std::uint32_t other = (1U - m.options.rank) * half;
@@ -2194,7 +2247,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                     for (std::uint32_t r0 = 0, ci = 0; r0 < R; r0 += chunk, ++ci) {
                         const std::uint32_t rn = std::min(chunk, R - r0);
                         const std::size_t bytes = std::size_t{rn} * half * 4U;
-                        const auto stage = m.options.communicator->prepare_staged_ready(st, bytes);
+                        const auto stage = wire.prepare_staged_ready(st, bytes);
                         if (!stage.data) {  // retain the full-payload fallback even after a completed chunk
                             exchanged = false;
                             if (r0 + rn < R) product(r0 + rn, R - r0 - rn);
@@ -2202,7 +2255,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                         }
                         ready_detail::gather_publish(m.ekv.p + std::size_t{r0} * n, rn, n, half, v.first, stage, st);
                         xport::ds41_exchange_raw_slots_staged<true>(
-                            *m.options.communicator, st, stage.data, bytes,
+                            wire, st, stage.data, bytes,
                             dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), 0x10000U | static_cast<std::uint32_t>(layer), ci},
                             [&] {
                                 if (r0 + chunk < R) product(r0 + chunk, std::min(chunk, R - r0 - chunk));
@@ -2221,7 +2274,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 engram_pack<<<blocks, 256, 0, st>>>(m.ekv.p, m.ekv_tx.p, R, n, half, v.first);
                 check(hipGetLastError(), "engram_pack");
                 xport::ds41_exchange_raw_slots(
-                    *m.options.communicator, st, m.ekv_tx.p, m.ekv_rx.p, std::size_t{total} * 4U,
+                    wire, st, m.ekv_tx.p, m.ekv_rx.p, std::size_t{total} * 4U,
                     dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), 0x10000U | static_cast<std::uint32_t>(layer), 0U}, [] {});
                 engram_scatter<<<blocks, 256, 0, st>>>(m.ekv_rx.p, m.ekv.p, R, n, half, (1U - m.options.rank) * half);
                 check(hipGetLastError(), "engram_scatter");
@@ -2324,15 +2377,32 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                     break;
                 }
                 if (s.op == Op::o_b && !ta.o_b.empty()) {
+                    if (tp && wire.active() && std::size_t{R} * H * 4U <= wire.capacity()) {
+                        // STRIX_DS41_DECODE_XPORT=channel: one Channel kernel copies the half into the TX slot and publishes it;
+                        // the host goes on enqueuing (late mix, next layer) and the add waits for the RX flag on the GPU.
+                        // Same add (a + b, rank 0's half first) as the ready view below: same bits.
+                        const std::uint32_t n = R * H;
+                        ds41::enqueue_trellis_linear(*ta.o_b[0], m.o_low.p, m.half_own.p, R, o_half, H, false, st);
+                        wire.start_staged_copy(st, m.half_own.p, std::size_t{n} * 4U,
+                                               dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U});
+                        enqueue_late_mix();
+                        if (m.prefetch_bytes) prefetch_after(s);
+                        const auto* other = static_cast<const float*>(wire.finish_staged(st));
+                        add_halves<<<(n + 255U) / 256U, 256, 0, st>>>(m.options.rank == 0U ? m.half_own.p : other,
+                                                                        m.options.rank == 0U ? other : m.half_own.p, m.y.p, n);
+                        check(hipGetLastError(), "add_halves");
+                        wire.release_staged(st);
+                        break;
+                    }
                     if (tp && ready_detail::trellis_ob())
-                        if (const auto stage = m.options.communicator->prepare_staged_ready(st, std::size_t{R} * H * 4U); stage.data) {
+                        if (const auto stage = wire.prepare_staged_ready(st, std::size_t{R} * H * 4U); stage.data) {
                             // STRIX_DS41_TRELLIS_OB_READY (default, =0 off): the device half copied into the TX view by one kernel that publishes
                             // it, the add straight from the RX view (no SDMA copies or events); same products, same add
                             const std::uint32_t n = R * H;
                             ds41::enqueue_trellis_linear(*ta.o_b[0], m.o_low.p, m.half_own.p, R, o_half, H, false, st);
                             ready_detail::copy_publish(m.half_own.p, stage, n, st);
                             xport::ds41_exchange_raw_slots_staged<true>(
-                                *m.options.communicator, st, stage.data, std::size_t{R} * H * 4U,
+                                wire, st, stage.data, std::size_t{R} * H * 4U,
                                 dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U},
                                 [&] {
                                     enqueue_late_mix();
@@ -2351,7 +2421,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                         const auto tag = dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U};
                         ds41::enqueue_trellis_linear(*ta.o_b[0], m.o_low.p, m.half_own.p, R, o_half, H, false, st);
                         xport::ds41_exchange_raw_slots(
-                            *m.options.communicator, st, m.half_own.p, m.half_other.p, std::size_t{R} * H * 4U,
+                            wire, st, m.half_own.p, m.half_other.p, std::size_t{R} * H * 4U,
                             tag, [&] {
                                 enqueue_late_mix();
                                 prefetch_after(s);
@@ -2433,7 +2503,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                         product(0U);
                         for (std::uint32_t k = 0; k < ob_k; ++k) {
                             xport::ds41_exchange_raw_slots(
-                                *m.options.communicator, st, m.half_own.p + k * ob_chunk, m.half_other.p + k * ob_chunk, ob_chunk * 4U,
+                                wire, st, m.half_own.p + k * ob_chunk, m.half_other.p + k * ob_chunk, ob_chunk * 4U,
                                 dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U}, [&] {
                                     if (k == 0U) enqueue_late_mix();
                                 if (k == 0U && m.prefetch_bytes) prefetch_after(s);
@@ -2444,12 +2514,12 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                         add(ob_k - 1U);
                         break;
                     }
-                    if (const auto stage = m.options.communicator->prepare_staged_ready(st, std::size_t{R} * H * 4U); stage.data) {
+                    if (const auto stage = wire.prepare_staged_ready(st, std::size_t{R} * H * 4U); stage.data) {
                         auto* own = static_cast<float*>(stage.data);
                         v.out = own;
                         ready_detail::product(v, stage, st);
                         xport::ds41_exchange_raw_slots_staged<true>(
-                            *m.options.communicator, st, stage.data, std::size_t{R} * H * 4U,
+                            wire, st, stage.data, std::size_t{R} * H * 4U,
                             dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U},
                             [&] {
                                 enqueue_late_mix();
@@ -2463,11 +2533,11 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                             });
                         break;
                     }
-                    if (auto* staged = static_cast<float*>(m.options.communicator->send_staging(std::size_t{R} * H * 4U))) {
+                    if (auto* staged = static_cast<float*>(wire.send_staging(std::size_t{R} * H * 4U))) {
                         v.out = staged;
                         ds41::enqueue_q8_0_a8(v, st);
                         xport::ds41_exchange_raw_slots_staged<false>(
-                            *m.options.communicator, st, staged, std::size_t{R} * H * 4U,
+                            wire, st, staged, std::size_t{R} * H * 4U,
                             dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U},
                             [&] {
                                 enqueue_late_mix();
@@ -2485,14 +2555,14 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                     ds41::enqueue_q8_0_a8(v, st);
                     if (m.prefetch_bytes) {
                         xport::ds41_exchange_raw_slots(
-                            *m.options.communicator, st, m.half_own.p, m.half_other.p, std::size_t{R} * H * 4U,
+                            wire, st, m.half_own.p, m.half_other.p, std::size_t{R} * H * 4U,
                             dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U}, [&] {
                                 enqueue_late_mix();
                                 prefetch_after(s);
                             });
                     } else {
                         xport::ds41_exchange_raw_slots(
-                            *m.options.communicator, st, m.half_own.p, m.half_other.p, std::size_t{R} * H * 4U,
+                            wire, st, m.half_own.p, m.half_other.p, std::size_t{R} * H * 4U,
                             dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 0U}, [&] {
                                 enqueue_late_mix();
                             });
@@ -2859,7 +2929,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 gu.act_deltas = reinterpret_cast<float*>(m.shx_own.p + std::size_t{R} * hI);
                 gu.act_sums = m.sh_act_sums.p;
                 ds41::enqueue_gate_up(gu_fmt, gu, st);
-                batch_shared_raw_exchange.emplace(*m.options.communicator, st, m.shx_own.p, m.shx_other.p,
+                batch_shared_raw_exchange.emplace(wire, st, m.shx_own.p, m.shx_other.p,
                                                   std::size_t{R} * hI + std::size_t{R} * hI / 32U * 4U,
                                                   dist::Tag{static_cast<std::uint32_t>(dist::TagKind::raw_slots), layer, 1U});
                 break;
@@ -2953,7 +3023,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 v.half = m.expert_tp ? 0U : m.options.rank;  // expert TP: the fold of all the row's slots (low_counts = top_k)
                 v.out = m.half_own.p;
                 ds41::enqueue_half_sum(v, st);
-                xport::ds41_exchange_half_sum(*m.options.communicator, st, m.half_own.p, m.half_other.p,
+                xport::ds41_exchange_half_sum(wire, st, m.half_own.p, m.half_other.p,
                                               (std::size_t{R} * H + std::size_t{R} * hH) * 4U,
                                               dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, 0U}, [&] {
                                                   if (m.prefetch_bytes) prefetch_after(s);
@@ -2976,12 +3046,34 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 v.half = m.expert_tp ? 0U : m.options.rank;  // expert TP: the fold of all the row's slots (low_counts = top_k)
                 // STRIX_DS41_MOE_READY=1: the half sum straight into the coherent TX view, the combine straight from RX
                 // (lean releases, no copies or events); same sums, same order. Above the view limit: as below.
+                if (!m.shexp_tp && wire.active() && std::size_t{R} * H * 4U <= wire.capacity()) {
+                    // STRIX_DS41_DECODE_XPORT=channel: the half sum straight into the Channel TX slot (published after it),
+                    // the combine from the RX slot behind a GPU wait; no host wait. Same sums, same order ((s + low) + high).
+                    const std::size_t bytes = std::size_t{R} * H * 4U;
+                    auto* own = static_cast<float*>(wire.send_staging(bytes));
+                    v.out = own;
+                    ds41::enqueue_half_sum(v, st);
+                    xport::ds41_exchange_raw_slots_staged<false>(wire, st, own, bytes,
+                        dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, 0U}, [&] {
+                            if (deferred_shared) {
+                                enqueue_shared(*deferred_shared);
+                                deferred_shared = nullptr;
+                            } else if (m.prefetch_bytes) {
+                                prefetch_after(s);
+                            }
+                        }, [&](const void* peer_view) {
+                            const auto* peer = static_cast<const float*>(peer_view);
+                            ds41::enqueue_canonical_sum(m.shared.p, m.options.rank == 0U ? own : peer, m.options.rank == 0U ? peer : own,
+                                                        std::size_t{R} * H, m.y.p, st);
+                        });
+                    break;
+                }
                 if (!m.shexp_tp && ready_detail::moe())
-                    if (const auto stage = m.options.communicator->prepare_staged_ready(st, std::size_t{R} * H * 4U); stage.data) {
+                    if (const auto stage = wire.prepare_staged_ready(st, std::size_t{R} * H * 4U); stage.data) {
                         auto* own = static_cast<float*>(stage.data);
                         v.out = own;
                         ds41::enqueue_half_sum_ready(v, stage, st);
-                        xport::ds41_exchange_half_sum_ready(*m.options.communicator, st, own, std::size_t{R} * H * 4U,
+                        xport::ds41_exchange_half_sum_ready(wire, st, own, std::size_t{R} * H * 4U,
                             dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, 0U}, [&] {
                                 if (deferred_shared) {
                                     enqueue_shared(*deferred_shared);
@@ -3000,14 +3092,14 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 ds41::enqueue_half_sum(v, st);
                 if (m.shexp_tp) {  // shexp-tp: S_r + P_r travels, y = (S0 + P0) + (S1 + P1)
                     ds41::enqueue_add_inplace_f32(m.half_own.p, m.shared.p, std::size_t{R} * H, st);
-                    xport::ds41_exchange_half_sum(*m.options.communicator, st, m.half_own.p, m.half_other.p,
+                    xport::ds41_exchange_half_sum(wire, st, m.half_own.p, m.half_other.p,
                         std::size_t{R} * H * 4U, dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, 0U}, [] {});
                     const float* low = m.options.rank == 0U ? m.half_own.p : m.half_other.p;
                     const float* high = m.options.rank == 0U ? m.half_other.p : m.half_own.p;
                     ds41::enqueue_add_f32(low, high, std::size_t{R} * H, m.y.p, st);
                     break;
                 }
-                xport::ds41_exchange_half_sum(*m.options.communicator, st, m.half_own.p, m.half_other.p,
+                xport::ds41_exchange_half_sum(wire, st, m.half_own.p, m.half_other.p,
                     std::size_t{R} * H * 4U, dist::Tag{static_cast<std::uint32_t>(dist::TagKind::half_sum), layer, 0U}, [&] {
                         if (deferred_shared) {
                             enqueue_shared(*deferred_shared);
@@ -3088,7 +3180,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
             if (m.options.gather_logits) {  // gate runs: every row's slices exchanged so both ranks hold every logit
                 const auto other = ds41::vocab_slice(c.vocab_size, 2U, 1U - m.options.rank);
                 for (std::uint32_t r = 0; r < R; ++r)
-                    m.options.communicator->exchange(st, m.logits.p + std::size_t{r} * V + m.head_slice.first,
+                    wire.exchange(st, m.logits.p + std::size_t{r} * V + m.head_slice.first,
                                                      m.logits.p + std::size_t{r} * V + other.first, std::size_t{other.count} * 4U,
                                                      dist::Tag{static_cast<std::uint32_t>(dist::TagKind::control), r, 0U});
                 check(hipMemcpyAsync(m.logits_host.data(), m.logits.p, std::size_t{R} * V * 4U, hipMemcpyDeviceToHost, st), "logits");
@@ -3106,11 +3198,21 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 const auto& sl = m.head_slice;
                 const auto [lp, ls] = m.logits_rows(sl.first, V);
                 ds41::enqueue_argmax(lp, R, sl.count, static_cast<std::uint32_t>(ls), sl.first, m.partial.p, m.cand_own.p, st);
-                m.options.communicator->exchange(st, m.cand_own.p, m.cand_other.p, std::size_t{R} * sizeof(ds41::ArgmaxCandidate),
+                wire.exchange(st, m.cand_own.p, m.cand_other.p, std::size_t{R} * sizeof(ds41::ArgmaxCandidate),
                                                  dist::Tag{static_cast<std::uint32_t>(dist::TagKind::argmax), 0U, 0U});
                 const auto* first = m.options.rank == 0U ? m.cand_own.p : m.cand_other.p;
                 const auto* second = m.options.rank == 0U ? m.cand_other.p : m.cand_own.p;
                 ds41::enqueue_combine_argmax(first, second, R, m.best.p, st);
+                if (score_slots_ != 0U) {  // this rank's slice partials, swapped with the peer's in one exchange
+                    enqueue_hip_logprob_partials({lp, R, sl.count, static_cast<std::uint32_t>(ls), sl.first, kLogprobPartialTop, nullptr,
+                                                  m.score_own.p}, st);
+                    wire.exchange(st, m.score_own.p, m.score_other.p, std::size_t{R} * sizeof(LogprobPartial),
+                                  dist::Tag{static_cast<std::uint32_t>(dist::TagKind::argmax), 1U, 0U});
+                    const auto* s0 = m.options.rank == 0U ? m.score_own.p : m.score_other.p;
+                    const auto* s1 = m.options.rank == 0U ? m.score_other.p : m.score_own.p;
+                    check(hipMemcpyAsync(m.score_pinned.p, s0, std::size_t{R} * sizeof(LogprobPartial), hipMemcpyDeviceToHost, st), "scores");
+                    check(hipMemcpyAsync(m.score_pinned.p + R, s1, std::size_t{R} * sizeof(LogprobPartial), hipMemcpyDeviceToHost, st), "scores");
+                }
             } else {
                 const auto r0 = ds41::vocab_slice(c.vocab_size, 2U, 0U), r1 = ds41::vocab_slice(c.vocab_size, 2U, 1U);
                 const auto [l0, s0] = m.logits_rows(r0.first, V);
@@ -3118,6 +3220,14 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 ds41::enqueue_argmax(l0, R, r0.count, static_cast<std::uint32_t>(s0), r0.first, m.partial.p, m.cand0.p, st);
                 ds41::enqueue_argmax(l1, R, r1.count, static_cast<std::uint32_t>(s1), r1.first, m.partial.p, m.cand1.p, st);
                 ds41::enqueue_combine_argmax(m.cand0.p, m.cand1.p, R, m.best.p, st);
+                if (score_slots_ != 0U) {  // world 1: both slices here, the same two partials per row as a pair
+                    enqueue_hip_logprob_partials({l0, R, r0.count, static_cast<std::uint32_t>(s0), r0.first, kLogprobPartialTop, nullptr,
+                                                  m.score_own.p}, st);
+                    enqueue_hip_logprob_partials({l1, R, r1.count, static_cast<std::uint32_t>(s1), r1.first, kLogprobPartialTop, nullptr,
+                                                  m.score_other.p}, st);
+                    check(hipMemcpyAsync(m.score_pinned.p, m.score_own.p, std::size_t{R} * sizeof(LogprobPartial), hipMemcpyDeviceToHost, st), "scores");
+                    check(hipMemcpyAsync(m.score_pinned.p + R, m.score_other.p, std::size_t{R} * sizeof(LogprobPartial), hipMemcpyDeviceToHost, st), "scores");
+                }
             }
             check(hipMemcpyAsync(m.best_pinned.p, m.best.p, std::size_t{R} * sizeof(ds41::ArgmaxCandidate), hipMemcpyDeviceToHost, st), "tokens");
             break;
@@ -3206,10 +3316,37 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
     // the union counts of every layer in one download (they were one 8-byte copy command per layer)
     check(hipMemcpyAsync(m.counts_pinned.p, m.built.counts.p, std::size_t{8U} * m.options.layers, hipMemcpyDeviceToHost, st), "union counts");
     check(hipStreamSynchronize(st), "step");
+    if (channel_step) m.decode_wire->drain_and_account(
+        [&](std::uint64_t exchanges, std::uint64_t bytes, double producer_wait, double wire_seconds, double check_seconds) {
+            m.options.communicator->account_borrowed_transport(exchanges, bytes, producer_wait, wire_seconds, check_seconds);
+        });
+    // Engine and server read the same communicator totals. Channel progress
+    // time overlaps device execution and must not be added to step wall time.
+    if (m.options.slice_logits || m.options.gather_logits)
+        std::fprintf(stderr, "ds41 decode qualification: rank=%u route=%s channel_steps=%llu declined=%llu\n",
+                     m.options.rank, ds41::decode_xport_name(channel_step),
+                     static_cast<unsigned long long>(m.decode_xport_steps),
+                     static_cast<unsigned long long>(m.decode_xport_declined));
     tokens_.resize(R);
     for (std::uint32_t r = 0; r < R; ++r) {
         if (m.best_pinned.p[r].finite == 0U) throw std::runtime_error("deepseek41 batch forward: non-finite logits");
         tokens_[r] = m.best_pinned.p[r].index;
+    }
+    scored_.assign(score_slots_ != 0U ? R : 0U, 0U);
+    scores_.resize(scored_.size());
+    for (std::uint32_t r = 0; r < scored_.size(); ++r) {  // the scored slots' rows: FP64 merge of the two slices
+        if (rows[r].slot >= 64U || ((score_slots_ >> rows[r].slot) & 1U) == 0U) continue;
+        const LogprobPartial parts[2] = {m.score_pinned.p[r], m.score_pinned.p[R + r]};
+        auto& sc = scores_[r];
+        sc = combine_logprob_partials(parts, kLogprobPartialTop);
+        // the emitted token is the greedy one, i.e. the merged top 1 (value descending, lowest ID first): a difference
+        // is a scoring or a selection bug, never a token to emit
+        if (sc.top.empty() || sc.top.front().id != tokens_[r])
+            throw std::logic_error("deepseek41 batch forward: scored top differs from the greedy token");
+        sc.has_target = true;
+        sc.target_logprob = sc.top.front().logprob;
+        sc.target_rank = 1U;
+        scored_[r] = 1U;
     }
     m.last_segments.clear();
     for (const auto& g : segments) {

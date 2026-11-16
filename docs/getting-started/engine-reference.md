@@ -213,8 +213,16 @@ filtered per GSQ owner, so GSQ runs without the former requirement to disable th
 Long prompts run with the default command up to the model maximum of 262,144 tokens (prompt plus generation):
 the automatic context is clamped to that maximum, the admission estimate credits the PLE pages that reclaim will
 free, and the tile falls back from T16384 (when eligible) to T8192, T4096 and then T2048 before the route declines,
-reporting each failed tile and its reason. A prompt plus generation
-above the maximum is refused (`prompt-exceeds-model-context`); a tile that does not fit the memory budget reports
+reporting each failed tile and its reason. A prompt plus generation above the native 262,144 positions, or an
+explicit `--context` above it, is refused unless experimental YaRN is explicitly requested. The diagnostic
+recommends `--rope-yarn 2` up to 524,288 or `--rope-yarn 4` up to 1,048,576, together with an explicit
+`--context`; prompts above 524,288 ids need `--prompt-ids FILE`. These are supported extents, not qualified
+model-fidelity or complete-workload bands. HTTP uses the same opt-in rule and still refuses YaRN execution.
+Every request native RoPE admits keeps it. Automatically discovered MTP bundle runtime budgets grow to the
+predictor's need at the admitted context (2,304 bytes per position plus workspace). Explicit CLI or bundle
+budgets remain ceilings and refuse insufficient capacity on CLI and serving paths alike. Startup and
+`--print-effective-config` report requested/effective runtime bytes and their source on stderr. A
+two-node prefill pipelines the prompt down to a multiple of 16 rows; the last rows run after the hand-off. A tile that does not fit the memory budget reports
 `insufficient-memory`. Under the priced native pools, at 131,072 and 262,143 real-text
 tokens the default admits automatic T16384, and with `STRIX_QPF2K_T16K=0` it admits T8192
 as before, with no fallback.
@@ -266,6 +274,7 @@ deferred at startup, so MTP/HTTP serving, cohorts and other binaries keep their 
 | `STRIX_QPF2K_SCORE_ROWS=auto` | Stage-batch QSA scorer: 32 rows above 4096 blocks, 16 otherwise. | `STRIX_QPF2K_SCORE_ROWS=0` (16 rows) |
 | `STRIX_PREFILL_PLE_BATCH=1` | PLE 64-row groups; wide lane recipe, layout and scratch admission still apply. | `STRIX_PREFILL_PLE_BATCH=0` |
 | `STRIX_QPF2K_SHARED_PRE=1` | Shared-expert FP16 operand preimage; existing tiled down admission and fallback apply. | `STRIX_QPF2K_SHARED_PRE=0` |
+| `STRIX_QPF2K_GLU_PAIR=1` | With the preimage admitted, the paired gate\|up epilogue writes it directly (bitwise); `=2` uses form 0 for the paired kernel. | `STRIX_QPF2K_GLU_PAIR=0` (activation pre-kernel) |
 | `STRIX_QPF2K_MOE_MC=1` | Ordered MoE merge + BF16 commit (mode 1) behind the existing DA16/ROUTE=14 certificate. | `STRIX_QPF2K_MOE_MC=0` |
 | `STRIX_QPF2K_MOE_HDR=1` | Gate/up superblock header reuse within the DA16 tune 80/82 path. | `STRIX_QPF2K_MOE_HDR=0` |
 | `STRIX_QPF2K_MOE_XOR64=1` | MoE 64-assignment DA16 tune (automatic tune only) with XOR-permuted LDS rows (three CTAs per WGP) from 3,072 rows; 128-assignment batches (from 4,915 rows for 512 experts, top-10) are unchanged. | `STRIX_QPF2K_MOE_XOR64=0` |

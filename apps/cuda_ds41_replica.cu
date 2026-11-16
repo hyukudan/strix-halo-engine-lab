@@ -82,13 +82,13 @@
 #include "strix/env_flags.hpp"
 #include "strix/ds41_replica_census.hpp"
 #include "strix/model_content_hash.hpp"
-#include "strix/cuda_ds41_dspark.hpp"
-#include "strix/cuda_ds41_attention.hpp"
-#include "strix/cuda_ds41_core.hpp"
-#include "strix/cuda_ds41_hot_residency.hpp"
-#include "strix/cuda_ds41_prefill.hpp"
-#include "strix/cuda_ds41_router_v2.hpp"
-#include "strix/cuda_ds41_tier_site.hpp"
+#include "strix/cuda/ds41_dspark.hpp"
+#include "strix/cuda/ds41_attention.hpp"
+#include "strix/cuda/ds41_core.hpp"
+#include "strix/cuda/ds41_hot_residency.hpp"
+#include "strix/cuda/ds41_prefill.hpp"
+#include "strix/cuda/ds41_router_v2.hpp"
+#include "strix/cuda/ds41_tier_site.hpp"
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/deepseek41_model.hpp"
 #include "strix/ds41_dspark_driver.hpp"
@@ -103,7 +103,7 @@
 #include "cuda_ds41_session_draft.hpp"
 #include "cuda_ds41_replica_budget.hpp"
 
-#include "strix/cuda_ds41_moe_v2.hpp"
+#include "strix/cuda/ds41_moe_v2.hpp"
 
 #include <cuda_runtime.h>
 
@@ -354,15 +354,16 @@ static std::optional<strix::ds41::dspark::WindowController::Table> resolve_prior
 }
 
 int main(int argc, char** argv) {
-    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
-    // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
-    strix::device::bind_cuda_main(argc, argv);
-    // lazy module loading + a kernel spinning on a host flag can deadlock the first launch of another kernel
+    // lazy module loading + a kernel spinning on a host flag can deadlock the first launch of another kernel. The driver
+    // reads this once, when the CUDA runtime starts, so it is set before the start gate (which starts the runtime).
 #ifdef _WIN32
     _putenv_s("CUDA_MODULE_LOADING", "EAGER");
 #else
     setenv("CUDA_MODULE_LOADING", "EAGER", 1);
 #endif
+    // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
+    // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
+    strix::device::bind_cuda_main(argc, argv);
     if (argc < 2) usage("MODEL.gguf [options]");
     const std::string model = argv[1];
     std::string state_file, ref_file, routes, seqmod = "5:0", chats_arg, seqs_file, json_out, timeline_out, phases_arg = "exact0,pressure,exact8,chats8,chats0";

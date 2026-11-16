@@ -21,7 +21,7 @@ repeticiones e interruptores de apagado en [rendimiento](docs/performance.md) y 
 | Qwen3.8-Flash-Next | 2 nodos (prefill en pipeline, opcional) | - | 2,968 tok/s a 32K (exacto), 3,191 (`fast`, opcional; calificación de calidad en curso); por debajo de 28,672 filas de prompt el par lee el prompt en un nodo |
 | DeepSeek V4.1 Flash | par | 70.6 tok/s (DSpark, código) | 1,165 tok/s a 8K, 1,285 a 32K (exacto); 1,377 / 1,546 con el perfil FAST de prefill (opcional; [puerta de calidad relativa al suelo superada](docs/models/deepseek-v4.1/README.es.md#puerta-de-calidad-del-prefill-fast)) |
 | MiniMax M3.1 Flash | par | 23.10 tok/s (1K) | 669 tok/s a 8K, 529 a 32K (exacto) |
-| GLM-5.3 Flash | par | 44.5 tok/s (MTP, código) | 541 tok/s a 8K, 529 a 32K (exacto); 918 a 8K (`fast`, opcional; calificación de calidad en curso) |
+| GLM-5.3 Flash | par | 44.5 tok/s (MTP, código) | 664 tok/s a 8K (exacto, segundo prefill en caliente), 642 a 32K (exacto); `fast` (opcional; calificación de calidad en curso) a 8K: 957 en caliente, 918 en proceso nuevo |
 | Nemotron 3.5 Bolt E4B | 1 nodo | 91.9 tok/s (C1) | 2,780 tok/s a 8K, 2,336 a 32K (`fast`) |
 | Nemotron 3.5 Bolt E4B | 2 nodos (prefill en pipeline, opcional) | - | 4,804 tok/s a 8K, 3,965 a 32K (`fast`, mismos bytes que 1 nodo) |
 | MiniMax H3 | par | clip de 5 s 1344x768 con audio en 405.5 s | - |
@@ -132,6 +132,7 @@ imagen y `session_id`. Los demás modelos aún no admiten imágenes. Detalles: [
   por un intercambio de 20 KB ([par](docs/pair.es.md)).
 - Cada valor por defecto tiene una ganancia medida y un interruptor de apagado ([optimizaciones](docs/optimizations.md)).
 - Añadir un modelo: [docs/engine/adding-a-model.es.md](docs/engine/adding-a-model.es.md).
+- Mapa de los núcleos compartidos y qué modelo usa cada uno: [docs/engine/shared-cores.es.md](docs/engine/shared-cores.es.md).
 
 ## Documentación
 
@@ -142,7 +143,7 @@ imagen y `session_id`. Los demás modelos aún no admiten imágenes. Detalles: [
 | Par y servicio | [par](docs/pair.es.md) · [configuración del par](docs/pair-setup.es.md) · [servicio](docs/serving.es.md) · [GPU discreta](docs/discrete-gpu.es.md) |
 | Interruptores | [toggles](docs/toggles.es.md) · [optimizaciones](docs/optimizations.md) ([JSON](docs/optimizations.json)) |
 | Números | [rendimiento](docs/performance.md) · [ganancias medidas](docs/measured-gains.es.md) · [metodología](docs/methodology.es.md) |
-| Internos | [arquitectura](docs/architecture/README.md) · [registro de decisiones](docs/decisions/decision-register.md) · [estado de implementación](docs/reference/implementation-status.md) · [fuentes](docs/reference/sources-ledger.md) |
+| Internos | [arquitectura](docs/architecture/README.md) · [núcleos compartidos](docs/engine/shared-cores.es.md) · [registro de decisiones](docs/decisions/decision-register.md) · [estado de implementación](docs/reference/implementation-status.md) · [fuentes](docs/reference/sources-ledger.md) |
 | Índice | [índice completo de la documentación](docs/README.md) · [AGENTS.md](AGENTS.md) |
 
 <a id="related-repositories"></a>
