@@ -393,6 +393,7 @@ __global__ void __launch_bounds__(256, 1) big_kernel_f8(const BigArgs a) {
 // one block per row: scale = amax / 448, e4m3 bytes in the nvfp4_expand_e4m3 permutation (position 32t + 4j + 2p + e of a 128 block =
 // input 16j + 8p + 2t + e); rows >= `rows` (padding) are zero with scale 1. thread = 4 consecutive output bytes.
 __global__ void __launch_bounds__(256) quant_e4m3_kernel(const float* x, unsigned char* plane, float* rscale, std::uint32_t rows, std::uint32_t in) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     const std::uint32_t r = blockIdx.x;
     unsigned char* dst = plane + static_cast<std::size_t>(r) * in;
     const std::uint32_t nw = in >> 2;
@@ -422,17 +423,15 @@ __global__ void __launch_bounds__(256) quant_e4m3_kernel(const float* x, unsigne
         const float* src = xr + blk * 128 + 16 * j + 2 * t;
         const float2 lo = *reinterpret_cast<const float2*>(src), hi = *reinterpret_cast<const float2*>(src + 8);
         std::uint32_t w0, w1;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
-        // cvt.*.e4m3x2 needs sm_89+; FAST8 admission (dense_big.cu fast8 runtime check) never launches this here.
-        (void)lo; (void)hi; (void)inv;
-        w0 = w1 = 0u;
-        __trap();
-#else
         asm("{\n .reg .b16 h;\n cvt.rn.satfinite.e4m3x2.f32 h, %2, %1;\n cvt.u32.u16 %0, h;\n}" : "=r"(w0) : "f"(lo.x * inv), "f"(lo.y * inv));
         asm("{\n .reg .b16 h;\n cvt.rn.satfinite.e4m3x2.f32 h, %2, %1;\n cvt.u32.u16 %0, h;\n}" : "=r"(w1) : "f"(hi.x * inv), "f"(hi.y * inv));
-#endif
         reinterpret_cast<std::uint32_t*>(dst)[m] = (w0 & 0xFFFFu) | (w1 << 16);
     }
+#else
+    // E4M3 conversion requires sm_89+; host FAST8 admission rejects this image.
+    (void)x; (void)plane; (void)rscale; (void)rows; (void)in;
+    __trap();
+#endif
 }
 
 // ---------------------------------------------------------------------------------------------------- split / expand kernels
