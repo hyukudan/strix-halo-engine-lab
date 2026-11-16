@@ -44,7 +44,7 @@ case "$mode" in host) comps='core\|tools' ;; hip) comps='hip' ;; *) comps='cuda'
 mapfile -t targets < <(sed -n "s/^  \\($comps\\):\\(strix-[A-Za-z0-9_.-]*\\)\$/\\2/p" "$receipt")
 [ ${#targets[@]} -gt 0 ] || { echo "package.sh: no packaged executables in $receipt" >&2; exit 1; }
 cmake --build "$build" -j "$jobs" --target "${targets[@]}" >"$build/build.log" 2>&1 ||
-    { tail -n 20 "$build/build.log"; exit 1; }
+    { grep -m 12 -E "error:|FAILED:" "$build/build.log" | cut -c1-300; tail -n 5 "$build/build.log"; exit 1; }
 (cd "$build" && cpack >cpack.log 2>&1) || { tail -n 20 "$build/cpack.log"; exit 1; }
 echo "package.sh: $mode built ${#targets[@]} executables"
 ls -1 "$build"/strix-*.deb "$build"/strix-*.rpm "$build"/strix-*.tar.gz 2>/dev/null || true
