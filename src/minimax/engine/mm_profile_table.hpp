@@ -5,8 +5,8 @@
 // effective config and rank agreement read the same values. A row at its builtin value is left out of the profile
 // fingerprint (omit_builtin_fingerprint), so with every row OFF these rows add no fingerprint inputs.
 // Complete cache compatibility also depends on the executable and raw environment identity.
-// No row has a 'fast' column yet: MiniMax rank's --profile is the per-phase timing session, so the product profile is
-// selected by the FAST prefill bundle switch only.
+// FAST still uses its existing bundle switch. Product TURBO proposals stay pending until
+// the adapter admits and exports them through prefill_policy before engine construction.
 #include "strix/engine_profile.hpp"
 #include "strix/fast_profile.hpp"
 
@@ -55,12 +55,12 @@ static_assert(msa_flash_policy(kMsaFlashLayers) != nullptr &&
 inline constexpr std::array<strix::profile::Lever, 4> profile_table{{
     // Prefill only: MSA attention of windows > 8 rows; selection, block lists and K/V caches unchanged.
     {"msa_flash", "STRIX_MM_PF_MSA_FLASH", "", {"", "", "", "1"}, "0", strix::profile::Kind::bit_changing,
-     {true, false, true, false}, {true, true, true, true}, "", "0",
-     "msa-flash-bf16-l40-v1 (EXL3 gate PASS 8K KL 0.0012, 32K KL 0.0029); 2 = two-term operands; turbo = 1 (mode 11) on layers 0-59 ahead of qualification",
-     false, {false, false, false, true}, true},
+     {true, false, true, false}, {true, true, true, false}, "", "0",
+     "msa-flash-bf16-l40-v1 (EXL3 gate PASS 8K KL 0.0012, 32K KL 0.0029); 2 = two-term operands; pending turbo adapter admission/export for mode 1 on layers 0-59",
+     false, {}, true},
     {"msa_flash_layers", "STRIX_MM_PF_MSA_FLASH_LAYERS", "", {"", "", "", "0-59"}, kMsaFlashLayers, strix::profile::Kind::bit_changing,
-     {true, false, true, false}, {true, true, true, true}, "", "", "FAST MSA flash layer set (read only while msa_flash is on); turbo = 0-59, per-prompt qualification with the layer-range kit (scripts/bench/mmflash)",
-     false, {false, false, false, true}, true},
+     {true, false, true, false}, {true, true, true, false}, "", "", "FAST MSA flash layer set (read only while msa_flash is on); pending turbo adapter admission/export for 0-59, then per-prompt qualification with scripts/bench/mmflash",
+     false, {}, true},
     // PENDING turbo cells: the lever exists only on an open PR / has no per-layer selector yet (reason in `source`).
     {"moe_invariant", "STRIX_MM_MOE_INVARIANT", "", {"", "", "", "1"}, "0", strix::profile::Kind::bit_changing,
      {true, false, true, false}, {false, false, false, false}, "", "0",
