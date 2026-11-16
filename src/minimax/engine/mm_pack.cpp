@@ -11,6 +11,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 
 namespace strix::minimax::engine::detail {
 
@@ -44,6 +45,8 @@ PackReader::PackReader(std::string dir) : dir_(std::move(dir)) {
     const auto files = assets::pack_files(dir_, &snapshot_);
     const bool want_direct = std::getenv("STRIX_MM_LOAD_DIRECT") == nullptr || std::atoi(std::getenv("STRIX_MM_LOAD_DIRECT")) != 0;
     description::PackHeaders headers(description::check_enabled());
+    std::set<std::pair<std::uint64_t,std::uint64_t>> indexed_files;
+    weight::TensorIndex common; common.container = weight::Container::safetensors; common.schema = "safetensors@1";
     for (std::uint32_t f = 0; f < files.size(); ++f) {
         const std::string path = files[f].string();
         int fd = want_direct ? ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT) : -1;
@@ -61,6 +64,11 @@ PackReader::PackReader(std::string dir) : dir_(std::move(dir)) {
             ::close(hfd);
             throw std::runtime_error("invalid safetensors header length: " + path);
         }
+        // The asset receipt retains every spelling, but aliases of one opened
+        // physical shard contribute its tensor table exactly once.
+        if (!indexed_files.emplace(static_cast<std::uint64_t>(st.st_dev),static_cast<std::uint64_t>(st.st_ino)).second) {
+            ::close(hfd); continue;
+        }
         std::uint64_t hb = 0;
         pread_all(hfd, &hb, 8, 0, path);
         std::uint64_t payload_bytes = 0;
@@ -69,6 +77,12 @@ PackReader::PackReader(std::string dir) : dir_(std::move(dir)) {
         std::string head(hb, '\0');
         pread_all(hfd, head.data(), hb, 8, path);
         ::close(hfd);
+        std::shared_ptr<const weight::Source> owner;
+        auto status = weight::open_source(path, owner, std::filesystem::absolute(files[f]).lexically_relative(std::filesystem::absolute(dir_)).generic_string());
+        weight::TensorIndex shard;
+        if (status) status = weight::index_safetensors(owner, shard);
+        if (!status) throw std::runtime_error("MiniMax index: " + status.detail);
+        common.tensors.insert(common.tensors.end(), shard.tensors.begin(), shard.tensors.end());
         for (const auto& entry : headers.add(head, payload_bytes)) {
             TensorInfo t;
             t.dtype = entry.dtype;
@@ -80,6 +94,8 @@ PackReader::PackReader(std::string dir) : dir_(std::move(dir)) {
                 throw std::runtime_error("duplicate tensor across safetensors shards: " + entry.name);
         }
     }
+    auto admission = weight::bind_minimax(common, weights_);
+    if (!admission) throw std::runtime_error("MiniMax admission: " + admission.detail);
     for (std::size_t f = 0; f < fds_.size(); ++f)
         sources_.push_back(std::make_unique<strix::core::FileWeightSource>(fds_[f], direct_[f] != 0));
     void* p = nullptr;

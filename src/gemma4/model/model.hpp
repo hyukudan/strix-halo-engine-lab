@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/weight/admission.hpp"
 
 #include "gemma4/contracts/g4_types.hpp"
 #include "strix/serve/json.hpp"
@@ -33,6 +34,7 @@ struct SafeTensor {
 struct SafeFile {
     std::shared_ptr<MappedFile> storage;
     std::vector<SafeTensor> tensors;
+    weight::TensorIndex index;
 };
 [[nodiscard]] SafeFile read_safetensors(const std::filesystem::path& path);
 [[nodiscard]] ModelConfig parse_text_config(const std::filesystem::path& path);

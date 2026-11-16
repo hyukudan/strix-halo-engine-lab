@@ -7,6 +7,7 @@ namespace strix::weight::detail {
 inline constexpr std::uint64_t all_linear_roles = (1ull << (unsigned(Role::bias) + 1)) - 1;
 inline constexpr std::uint64_t auxiliary_roles = (1ull << unsigned(Role::norm)) | (1ull << unsigned(Role::bias)) | (1ull << unsigned(Role::auxiliary));
 Status validate(const WeightView&);
+Status validate_metadata(const WeightView&);
 Status decode(const WeightView&, const DecodeRequest&, DecodeBuffer&);
 Status group(const WeightView&, std::uint64_t, SignedGroup32&);
 Status unavailable(const WeightView&, const DecodeRequest&, DecodeBuffer&);

@@ -8,7 +8,7 @@ import platform
 import shlex
 import subprocess
 import sys
-from records import read_matrix, validate_inventory
+from records import read_matrix, validate_inventory, read_record
 
 
 def main():
@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--matrix", required=True, type=pathlib.Path)
     parser.add_argument("--out", required=True, type=pathlib.Path)
     parser.add_argument("--source", type=pathlib.Path)
+    parser.add_argument("--adapter", choices=("protocol", "reference", "native", "backend"), default="protocol")
     parser.add_argument("--compiler", required=True)
     parser.add_argument("--architecture", required=True)
     parser.add_argument("--flags", default="")
@@ -30,6 +31,7 @@ def main():
         parser.error("output already contains records; use a fresh capture directory")
     summary = {"schema": "wfmt.capture@2", "pass": False,
                "compiler": args.compiler, "architecture": args.architecture,
+               "adapter": args.adapter, "fixture_only": args.adapter == "protocol",
                "flags": args.flags, "device": args.device, "platform": platform.platform()}
     try:
         exe = args.exe.resolve(strict=True)
@@ -43,13 +45,22 @@ def main():
                 ["git", "-C", str(args.source), "rev-parse", "HEAD"], text=True).strip()
         extra = args.args[1:] if args.args[:1] == ["--"] else args.args
         summary["adapter_args"] = extra
-        command = shlex.split(args.runner) + [str(exe), "--wfmt-capture", str(args.out.resolve()),
-                   "--wfmt-matrix", str(matrix)] + extra
+        adapter_args = ["--wfmt-capture", str(args.out.resolve()), "--wfmt-matrix", str(matrix)]
+        if args.adapter == "reference":
+            adapter_args = ["--wfmt-reference-capture", str(args.out.resolve())]
+        elif args.adapter == "backend":
+            adapter_args = ["--wfmt-backend-capture", str(args.out.resolve())]
+        command = shlex.split(args.runner) + [str(exe)] + adapter_args + extra
         with (args.out / "capture.log").open("w") as log:
             result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
                                     timeout=args.timeout, check=False)
         if result.returncode:
             raise ValueError(f"capture adapter exit {result.returncode}")
+        if args.adapter != "protocol":
+            for record in args.out.rglob("*.wfmt"):
+                header, _ = read_record(record)
+                if header["case"] == "protocol-fixture":
+                    raise ValueError("protocol fixture cannot qualify a numerical capture")
         (args.out / "matrix.json").write_bytes(matrix_bytes)
         records = validate_inventory(args.out, contract)
         summary.update({"pass": True, "records": len(records), "record_sha256": records})

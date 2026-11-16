@@ -1,4 +1,5 @@
 #include "strix/serve/json.hpp"
+#include "strix/gguf_reader.hpp"
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
@@ -117,18 +118,19 @@ int wfmt_census_test() {
     }
     for (int i = 2; i <= 14; ++i) require(work.count("P" + std::string(i < 10 ? "0" : "") + std::to_string(i)), "missing migration");
     for (const auto& pr : assigned) require(work.count(pr), "binding lacks work item " + pr);
-    // Independently enumerate the actual reader switch, including parse-only and typed entries.
-    const auto reader = read(root / "src/gguf_reader.cpp");
-    const std::regex geometry(R"(case\s+(\d+):\s*return TensorTypeGeometry\{(\d+),\s*(\d+)\})");
+    // The reader now forwards the registry; enumerate its wire map independently
+    // and compare every live reader geometry with the frozen baseline census.
+    const auto registry = read(root / "src/weight/registry.cpp");
+    const std::regex geometry(R"(\{\s*(\d+),\{\"[^\"]+\",\d+\}\})");
     std::set<int> current, declared;
-    for (auto i = std::sregex_iterator(reader.begin(), reader.end(), geometry); i != std::sregex_iterator(); ++i)
+    for (auto i = std::sregex_iterator(registry.begin(), registry.end(), geometry); i != std::sregex_iterator(); ++i)
         current.insert(std::stoi((*i)[1].str()));
     for (const auto& format : field(manifest, "gguf").as_array()) {
         const int wire = int(field(format, "wire_id").as_int());
         require(declared.insert(wire).second, "duplicate wire ID");
-        const auto expected = "case " + std::to_string(wire) + ": return TensorTypeGeometry{" +
-            std::to_string(field(format, "block_elements").as_int()) + ", " + std::to_string(field(format, "block_bytes").as_int()) + "}";
-        require(reader.find(expected) != std::string::npos, "geometry drift for " + std::to_string(wire));
+        const auto live = strix::gguf::tensor_type_geometry(std::uint32_t(wire));
+        require(live && live->block_elements == std::uint64_t(field(format, "block_elements").as_int()) &&
+            live->block_bytes == std::uint64_t(field(format, "block_bytes").as_int()), "geometry drift for " + std::to_string(wire));
         const auto state = field(format, "execution").as_string();
         require(state == "legacy-oracle" || state == "parse-only" || state == "typed-only", "storage admission class");
         if (wire == 3 || wire == 9 || wire == 15 || wire == 17 || wire == 19 || wire == 29 || wire == 34 || wire == 35)
