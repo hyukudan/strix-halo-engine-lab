@@ -54,6 +54,8 @@ struct Config {
     // Explicit unqualified CUDA A8 route-storage candidate. Omitted: environment;
     // false: individual OFF. Baseline/defaults/exact masters always suppress it.
     std::optional<bool> moe_route_bf16;
+    // Frozen by the common resolver; direct API callers resolve once at construction.
+    std::optional<qwen_route::Policy> route_policy;
     // Explicit source diagnostic only: does not admit ordinary product MTP.
     bool diagnostic_bf16_mtp = false;
     // Prefill arithmetic forms of the FAST profile (CUDA numerical identities, include/strix/profiles/qwen_cuda.hpp).

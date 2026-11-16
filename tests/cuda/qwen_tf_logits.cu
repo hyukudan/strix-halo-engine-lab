@@ -82,6 +82,13 @@ int main(int argc, char** argv) try {
     std::printf("loading...\n");
     std::fflush(stdout);
     qp::Prefill engine(resolved.config);
+    // Written by the executing process, after construction, for the quality-gate seal.
+    {
+        std::ofstream config_file(fs::path(out_dir) / "effective-config.json");
+        config_file << qo::effective_config_json(resolved) << '\n';
+        config_file.close();
+        if (!config_file) throw std::runtime_error("cannot write effective configuration");
+    }
     std::printf("loaded %s\n", engine.describe().c_str());
     const qp::Sink drop = [](const qp::Piece&) {};
     for (std::size_t p = 0; p < prompts.size(); ++p) {

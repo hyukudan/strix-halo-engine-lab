@@ -14,6 +14,7 @@
 // run on the exact rows of the block.
 #include "strix/env_flags.hpp"
 #include "strix/cuda/qwen_prefill.hpp"
+#include "strix/cuda/qwen_options.hpp"
 #include "strix/device/cuda_enumerator.hpp"
 #include <cstdlib>
 #include "strix/moe_route_bf16.hpp"
@@ -838,7 +839,7 @@ SessionState& Prefill::Impl::new_session() {
         for (void* p : s->allocations) cudaFree(p);
         throw;
     }
-    s->target_identity = qwen_route::identity(route_policy.enabled, route_policy.enabled).hash;
+    s->target_identity = qwen_options::numerical_identity(cfg).hash;
     if (cfg.diagnostic_bf16_mtp) s->diagnostic_generation = qwen_route::new_engine_binding();
     auto& ref = *s;
     sessions.emplace(ref.id, std::move(s));
@@ -853,14 +854,13 @@ void Prefill::Impl::drop_graph(std::map<GraphKey, StepGraph>::iterator it) {
 
 Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
     auto& m = *impl_;
-    m.route_policy = qwen_route::environment(config.moe_route_bf16);
+    m.cfg = qwen_options::resolve_route(config);
+    m.route_policy = *m.cfg.route_policy; // frozen before device work; no second environment lookup
     m.state_type = recurrent_state_policy().type;
     // Typed prefill currently rounds at call boundaries. Reject before device or
     // cache setup until rounding is independent of scheduling and prefix history.
     require_f32_recurrent_state(m.state_type, "CUDA application (schedule-independent prefill and prefix reuse unqualified)");
     m.state_layer_floats = recurrent_state_bytes(gdn::kMatrixFloats, m.state_type) / sizeof(float);
-    m.cfg = config;
-    m.cfg.moe_route_bf16 = m.route_policy.enabled; // freeze before device work
     const auto* diagnostic_graphs = std::getenv("STRIX_QRTX_GRAPHS");
     qwen_mtp_diagnostic::admission(config.diagnostic_bf16_mtp, m.route_policy.enabled,
         config.decode, config.export_state, !config.mtp_sidecar_gguf.empty(),
@@ -976,7 +976,7 @@ std::string Prefill::describe() const {
 }
 
 qwen_route::Identity Prefill::numerical_identity() const {
-    return qwen_route::identity(impl_->route_policy.enabled, impl_->route_policy.enabled);
+    return qwen_options::numerical_identity(impl_->cfg);
 }
 qwen_route::Policy Prefill::route_storage_policy() const { return impl_->route_policy; }
 
@@ -984,7 +984,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
     NvtxScope nv;
     std::uint32_t rows = 0;  // all rows of the block
     for (std::uint32_t i = 0; i < count; ++i) {
-        if (seg[i].s->target_identity != qwen_route::identity(route_policy.enabled, route_policy.enabled).hash)
+        if (seg[i].s->target_identity != qwen_options::numerical_identity(cfg).hash)
             throw std::logic_error("Qwen session target identity mismatch");
         rows += seg[i].rows;
     }

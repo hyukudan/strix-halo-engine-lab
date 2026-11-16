@@ -357,7 +357,9 @@ int main(int argc, char** argv) {
     }
     // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
     // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
-    strix::device::bind_cuda_main(argc, argv);
+    strix::device::CommandLine device_cli;
+    try { device_cli = strix::device::take_command_line(argc, argv); }
+    catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 2; }
     qo::Request request;  // common engine + profile options (shared with serve and the gate tools)
     std::string bind = "127.0.0.1", port = "8096", api_key, handoff_key;
     qh::Options handoff;
@@ -402,6 +404,11 @@ int main(int argc, char** argv) {
     try { resolved = qo::resolve(request, qo::Entry::prefill_service, "Qwen3.8-Flash-Next-UD-Q4_K_XL-merged.gguf"); }
     catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
     if (request.print_effective_config) { std::printf("%s\n", qo::effective_config_json(resolved).c_str()); return 0; }
+    try {
+        strix::device::Request device_request;
+        device_request.select = device_cli.select;
+        strix::device::bind_cuda(std::move(device_request), device_cli.devices_path);
+    } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 2; }
     const qp::Config c = resolved.config;
     for (const auto& n : resolved.resolution.notices()) std::fprintf(stderr, "%s\n", n.c_str());
     std::fprintf(stderr, "arithmetic: %s\n", resolved.contract.c_str());

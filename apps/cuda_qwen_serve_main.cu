@@ -666,10 +666,13 @@ int main(int argc, char** argv) {
     }
     // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
     // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
-    strix::device::bind_cuda_main(argc, argv);
     try {
+        const auto device_cli = strix::device::take_command_line(argc, argv);
         const auto o = parse(argc, argv);
         if (!o.effective_config.empty()) { std::cout << o.effective_config << std::endl; return 0; }
+        strix::device::Request device_request;
+        device_request.select = device_cli.select;
+        strix::device::bind_cuda(std::move(device_request), device_cli.devices_path);
         std::cerr << "strix-cuda-qwen-serve: loading " << o.engine.model_gguf << std::endl;
         qp::Prefill engine(o.engine);
         std::cerr << "strix-cuda-qwen-serve: loaded " << engine.describe() << std::endl;
