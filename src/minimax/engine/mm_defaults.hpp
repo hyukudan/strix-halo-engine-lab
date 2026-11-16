@@ -65,9 +65,10 @@ struct PrefillPolicy {
 // Static execution guards, also used by the engine receipt after runtime control changes.
 const char* msa_flash_decline_reason(bool rework, bool fused, unsigned layers);
 PrefillPolicy prefill_policy(const Lookup& env);
-// Pair pipeline rule (include/strix/pair/regime.hpp) with the MiniMax TP2 costs: the TP2 slices are fixed at load
-// (engine.hip:89-91 kWorld/kQLocal/kKVLocal/kIdxLocal/kExpertLocal, :1120-1131 rank expert slices), and holding
-// the whole stage layers next to them needs +41.6 GB/node with ~31 GB free, so every length stays on TP2.
+// Reference estimate using the shared pair rule and 8K FAST costs, extrapolated to rows. Assumes +41.6 GB/node
+// for whole stage layers and 31 GB free; neither is a runtime measurement or pipeline qualification.
+// Execution stays TP2: slices are fixed at load (engine.hip:89-91,1120-1131), with no pipeline implementation.
+// The returned choice is diagnostic only and must never select the execution route.
 strix::pair::PipelineChoice pair_pipeline_choice(std::uint64_t rows);
 const profile::Engine& profile_engine();                 // tag "minimax-pair", table profile_table
 profile::Resolution profile_resolution(const Lookup& env);

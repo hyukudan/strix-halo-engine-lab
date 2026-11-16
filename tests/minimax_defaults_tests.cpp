@@ -163,24 +163,36 @@ void test_receipts(const char* path) {
     }
 }
 
-// Pair pipeline declaration (MMPIPE-PLAN PR-4): CLI rank and serve resolve the same row, TP2 with the layout reason.
+// Execution residency is independent of the hypothetical 8K FAST capacity/timing estimate.
 void test_pair_pipeline_declaration() {
-    const EnvMap none;
-    const std::string want = "prefill.pair_pipeline=off pair.pipeline mode=tensor chunk=";
+    const std::string actual = "prefill.pair_pipeline=off mode=tensor residency=tensor_split free_memory=pending "
+        "reason=layout: tensor-split weights; pipeline execution unimplemented";
+    const std::string reference = "prefill.pair_pipeline_reference=estimate profile=FAST rows=8192 "
+        "assumed_free_gb=31.0 assumed_extra_gb=41.6 pair.pipeline mode=tensor chunk=";
     const std::string reason = "reason=layout: src/minimax/engine/engine.hip:89-91,1120-1131 needs +41.6 GB/node, free 31.0 GB";
-    std::string rows[2];
     const char* apps[2] = {"rank", "serve"};
-    for (int i = 0; i < 2; ++i) {
-        const std::vector<std::string> args = i == 0 ? std::vector<std::string>{"model", "0", "tcp", "out"} : std::vector<std::string>{};
-        for (const auto& line : lines(md::effective_config(md::parse_cli(apps[i], args), lookup(none))))
-            if (line.rfind("prefill.pair_pipeline=", 0) == 0) rows[i] = line;
-        check(rows[i].rfind(want, 0) == 0 && rows[i].find(reason) != std::string::npos, std::string(apps[i]) + ": pair pipeline row " + rows[i]);
+    for (const char* fast : {"0", "1"}) {
+        const EnvMap env{{"STRIX_MM_FAST_PREFILL", fast}};
+        std::string estimates[2];
+        for (int i = 0; i < 2; ++i) {
+            const std::vector<std::string> args = i == 0 ? std::vector<std::string>{"model", "0", "tcp", "out"} : std::vector<std::string>{};
+            std::string row;
+            for (const auto& line : lines(md::effective_config(md::parse_cli(apps[i], args), lookup(env)))) {
+                if (line.rfind("prefill.pair_pipeline=", 0) == 0) row = line;
+                if (line.rfind("prefill.pair_pipeline_reference=", 0) == 0) estimates[i] = line;
+            }
+            check(row == actual, std::string(apps[i]) + ": execution stays tensor with memory pending, FAST=" + fast);
+            check(estimates[i].rfind(reference, 0) == 0 && estimates[i].find(reason) != std::string::npos,
+                std::string(apps[i]) + ": reference labels its profile, rows and assumed memory, FAST=" + fast);
+        }
+        check(estimates[0] == estimates[1], "rank and serve format the same reference estimate");
     }
-    check(rows[0] == rows[1], "CLI and serve resolve the same pair pipeline row");
     const auto at8k = md::pair_pipeline_choice(8192U);
     check(at8k.pipeline_ms > 9500.0 && at8k.pipeline_ms < 9700.0 && at8k.alt_ms > 9809.0 && at8k.alt_ms < 9811.0,
-        "MiniMax 8K best pipeline ~9.6 s vs TP2 9.81 s");
-    check(md::pair_pipeline_choice(32768U).mode == strix::pair::Mode::tensor, "32K stays TP2 (layout)");
+        "MiniMax 8K reference estimate: pipeline ~9.6 s vs TP2 9.81 s");
+    const auto at32k = md::pair_pipeline_choice(32768U);
+    check(at32k.mode == strix::pair::Mode::tensor && "reason=" + at32k.reason == reason,
+        "32K reference stays TP2 because the assumed layout does not fit");
 }
 
 void test_off_switches() {
