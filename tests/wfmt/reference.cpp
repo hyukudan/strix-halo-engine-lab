@@ -32,10 +32,10 @@ std::vector<Byte> source_bytes(const Slice& slice) {
 }
 WeightView fixture(const FormatDescriptor& format,std::uint32_t seed) {
  WeightView view{}; view.storage=format.id; view.parameters.bits=4; view.parameters.group_size=16;
- Geometry g{}; if(!format.geometry(view.parameters,g)) throw std::runtime_error("fixture geometry"); view.geometry=g;
- auto width=std::uint64_t(g.block_elements),rows=std::uint64_t(1);
  const auto name=format.id.name;
  if(name.starts_with("exl3.")) view.parameters.bits=seed==0?4:seed==1?5:seed==UINT32_MAX?8:6;
+ Geometry g{}; if(!format.geometry(view.parameters,g)) throw std::runtime_error("fixture geometry"); view.geometry=g;
+ auto width=std::uint64_t(g.block_elements),rows=std::uint64_t(1);
  if(name=="block.e4m3-e8m0.32x32") { width=32; rows=32; }
  if(name=="nvidia.nvfp4") width=64;
  if(name.starts_with("linear.")) { width=256; rows=2; view.parameters.transform="convrot256"; }
