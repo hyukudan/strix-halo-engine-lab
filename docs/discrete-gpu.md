@@ -150,6 +150,16 @@ The node side uses `--rtx-state-import` with `--http-serve` (without `--http-bat
 changes. Service build and protocol: [Qwen CUDA prefill service](engine/serving/qwen-cuda-prefill.md) and
 [RTX state import](rtx-state-import.md).
 
+Splitting one prompt by layers over the card and both nodes (card -> node A -> node B) is planned by the shared
+chain planner (`include/strix/pair/chain.hpp`); the route itself is not available yet. To see what a link would buy,
+run the host tool with your measured rates, e.g. `strix-qwen-chain-plan --rows 32768 --card-rate 4320
+--node-rate 1600 --link-mbps 118` (add `--costs <node layer costs json>` for measured per-layer node costs). On a
+1 Gbit/s link it keeps the whole prefill on the card; from 2.5 Gbit/s it predicts a three-way split.
+Reverse row state waits for each producing block and relay, with one coalesced message per block/hop.
+The host planner rejects simulations above 1,000,000 resource updates; search has a 20,000,000-unit
+budget counting enumeration and simulated resource updates, and refuses a partial winner on exhaustion.
+Uniform rates and scaled layer costs are prediction assumptions; these host results do not qualify a native route.
+
 ## Qwen3.8-Flash-Next, served from one RTX
 
 `strix-cuda-qwen-serve` serves the model from one RTX PRO 6000 without a node: OpenAI and Anthropic APIs, SSE,
@@ -165,15 +175,15 @@ follow-up agent turns restore their cached prefix and prefill only the new token
 Build, then the measured run (exactness and speed; an HTTP server for this route is not tested end to end yet):
 
 ```powershell
-pwsh src/glm/rtxpf/producer/build.ps1 -BuildDir BUILD_DIR -Fresh -Parallel 2 `
+pwsh src/cuda/models/glm/producer/build.ps1 -BuildDir BUILD_DIR -Fresh -Parallel 2 `
     -TierstreamSource TIERSTREAM_DIR [-CutlassDir CUTLASS_DIR]
-python -B src/glm/rtxpf/producer/decode_qualification_window.py --build BUILD_DIR `
+python -B src/cuda/models/glm/producer/decode_qualification_window.py --build BUILD_DIR `
     --model MODEL_DIR --prompt-dir PROMPT_DIR --unit-file OUT_DIR/glm-units.bin `
     --unit-manifest-sha256 MANIFEST_SHA256 --full-card --allow-gpu
 ```
 
 For a smaller card replace `--full-card` with `--vram-total-gib 24 --ram-total-gib 32` (or your own caps). The unit
-file, every option and the measured rows: [GLM RTX guide](../src/glm/rtxpf/README.md).
+file, every option and the measured rows: [GLM RTX guide](../src/cuda/models/glm/README.md).
 
 The GLM service (`glm_native_service`) also takes `--dgpu auto|<uuid>`: it checks through NVML, before any CUDA call,
 that the card is an `sm_120` RTX PRO (`auto` picks the eligible card with the most memory) and pins it; `--dgpu off` is

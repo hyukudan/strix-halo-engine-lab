@@ -18,7 +18,10 @@
 //   --tf ORACLE_DIR [--tf-write]                     full teacher-forced logits of ORACLE_DIR/rows.u32 (G4 form): fnv,
 //                                                     top-1 vs the real next token; --tf-write saves logits_pair.f32
 //   --session NAME:PROMPT.u32:STEPS                  prefill + STEPS greedy decode steps (repeatable)
-//   --profile NAME:PROMPT.u32:STEPS                  the same with synchronised per-phase times (slower)
+//   --timing-profile NAME:PROMPT.u32:STEPS           the same with synchronised per-phase times (slower); the old
+//                                                    spelling --profile NAME:PROMPT.u32:STEPS stays accepted (notice)
+//   --profile default|fast|quality|turbo             product profile (strix-minimax-serve takes the same switch)
+//   --turbo-weights native|onfly|converted           TURBO weight source (+ --turbo-weight-bits, --turbo-weights-pack)
 //   --batch PROMPT.u32:STEPS:N1,N2,...               batched decode (rows = prefixes of the prompt), checked vs alone
 //   --verify-trace NAME:PROMPT.u32:REPS:R1,R2,...    verify-shaped steps (one slot, R rows) timed by R (xfer on/off
 //                                                     ABA) + per-phase GPU trace and distinct routed experts per layer
@@ -1705,7 +1708,9 @@ int main(int argc, char** argv) {
             else if (a == "--offload") offloads.push_back(next());
             else if (a == "--offload-import") offload_imports.push_back(next());
             else if (a == "--offload-listen") offload_listens.push_back(next());
-            else if (a == "--profile") sessions.push_back("@" + next());  // a session with per-phase timing
+            else if (std::string timing; strix::minimax::defaults::product_option(a, next, &timing)) {
+                if (!timing.empty()) sessions.push_back("@" + timing);  // a session with per-phase timing
+            }
             else if (a == "--batch") batches.push_back(next());
             else if (a == "--verify-trace") vtraces.push_back(next());
             else if (a == "--ab") ab_runs.push_back(next());
@@ -1740,23 +1745,9 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(warm.hits));
             return 0;
         }
-        // The ranks load at different speeds (measurement: 44 s vs 166 s under page-cache pressure): the first collective after
-        // the load must not hit the dist layer's 120 s default. An explicit value wins.
-        (void)::setenv("STRIX_DIST_USB4_TIMEOUT_MS", "600000", 0);
-        (void)::setenv("STRIX_DIST_WAIT_TIMEOUT_MS", "600000", 0);
-        // DS production host-path settings (CRC on parallel workers, CRC overlap, 1 MiB host chunks): transport
-        // only, bits unchanged; measurement ABA x3 TTFT 1K -12.8 %, decode -1 %. An explicit value wins (=0 disables each).
-        (void)::setenv("STRIX_DIST_CRC_PARALLEL", "1", 0);
-        (void)::setenv("STRIX_DIST_HOST_CRC_OVERLAP", "1", 0);
-        (void)::setenv("STRIX_DIST_HOST_CHUNK_BYTES", "1048576", 0);
-        // deferred CRC ON by default (measurement: 7 processes inline/deferred alternated, 384-step 1K
-        // sessions, tokens identical, each deferred arm below its two inline neighbours by 0.04-0.12 ms/token).
-        // STRIX_MMX_CRC: 0 = off, 1 = inline, deferred = deferred check.
-        (void)::setenv("STRIX_MMX_CRC", "deferred", 0);
-        // Prefill MoE table ring ON in this app only (qualified here, single engine owner; serve keeps it off).
-        // Measurement: exact, 1K -0.5 %, 8K not slower. An explicit value or STRIX_MM_BASELINE=1 wins.
-        if (const char* base = std::getenv("STRIX_MM_BASELINE"); base == nullptr || std::string(base) != "1")
-            (void)::setenv("STRIX_MM_PF_TABLE_RING", "1", 0);
+        // Host-path defaults (transport timeouts, prefill table ring): the one table both entry points apply
+        // (mm_defaults host_defaults(); --print-effective-config prints the rows). An explicit value wins.
+        strix::minimax::defaults::apply_host_defaults("rank");
         const auto capabilities = strix::dist::parse_transport_capabilities(strix::xport::staging_env("STRIX_MM_USB4_CAPS"));
         if (capabilities && std::string(argv[3]).rfind("usb4", 0) != 0)
             throw std::invalid_argument("STRIX_MM_USB4_CAPS requires USB4 startup capability agreement");

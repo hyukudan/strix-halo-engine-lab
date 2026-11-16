@@ -1,4 +1,4 @@
-// Tests of src/cuda/qwen_dense.cu (dense A8 projections + shared expert) against the literal host reference
+// Tests of src/cuda/models/qwen/qwen_dense.cu (dense A8 projections + shared expert) against the literal host reference
 // tests/cuda/qwen_dense_ref.hpp, bit for bit.
 //   qwen_dense_tests                 host-only tests (no CUDA call)
 //   qwen_dense_tests --gpu           + CUDA vs host: synthetic edge cases, real Q8_0 weights, shared expert
@@ -20,8 +20,8 @@
 #include <thread>
 #include <vector>
 
-#include "strix/cuda_qwen_dense.hpp"
-#include "qwen_amd_math_tables.hpp"
+#include "strix/cuda/qwen_dense.hpp"
+#include "strix/cuda/amd_math_tables.hpp"
 #include "qwen_dense_ref.hpp"
 #include "qwen_fixture.hpp"
 #include "qwen_gguf_host.hpp"

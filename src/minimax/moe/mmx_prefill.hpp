@@ -94,6 +94,13 @@ inline constexpr unsigned kMaxDenseJobs = 4;
 struct PrefillDenseJob {
     Exl3 w{};
     float* out = nullptr;
+    // Optional query image (MSA FAST flash layers; output % 128 == 0, 128-column heads): instead of out, the BF16
+    // image of each head after msa::norm_rope_lane (norm weights image_w [128], RoPE row image_rope[row]) as the flash
+    // core's query_op reads it, and with image_lo its lo terms (mode 12). Same bits as the flash prologue on out.
+    std::uint16_t* image = nullptr;
+    std::uint16_t* image_lo = nullptr;
+    const float* image_w = nullptr;
+    const void* image_rope = nullptr;  // const msa::RopeRow* (strix/minimax_msa.hpp)
 };
 bool prefill_dense_supported(const Exl3& w);
 std::size_t prefill_dense_workspace_bytes(const PrefillDenseJob* jobs, unsigned count, unsigned rows);
@@ -178,6 +185,12 @@ void set_prefill_dense_band(int value);
 // v4 + mtfit tail classes beside the MT8 launch on a side stream: -1 = STRIX_MMX_PREFILL_TAIL_STREAM (default on),
 // 0 = off, 1 = on. cleanup_ releases the side stream and its events (Engine teardown).
 void set_prefill_tail_stream(int on);
+// MoE numeric order contract: -1 = STRIX_MMX_PF_ORDER (default adaptive), 0 = adaptive (S from the expert's rows in
+// the chunk, today's identity), 1 = invariant (gate/up/down S = 1: bits independent of chunking, identity
+// mmx-pf-moe-s1-v1). Host and device plans and the group-wide plan all follow it.
+// Test fixture only: one host thread, all device work synchronized before each
+// change, restore -1 before leaving the fixture. Never change a running engine.
+void set_prefill_moe_order(int invariant);
 void cleanup_prefill_tail_stream() noexcept;
 void set_prefill_core8(int value);  // -1 = environment, 0 = off (default), 1 = A LDS, 2 = shared B
 // Profiling only: `marker(label, stream, user)` after "start" and each launch ("gather", "gate_up[.mtN]", "finish",

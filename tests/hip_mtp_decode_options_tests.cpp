@@ -342,6 +342,38 @@ void campaign_defaults_contract(){
         "(--known-prefix-tail-rows including it, below --known-prefix-prefill-rows)","explicit tails must include the wide rows");
     auto with_tail=wide32;with_tail.insert(with_tail.end(),{"--known-prefix-tail-rows","128,32"});
     require(parse(with_tail).known_prefix_tail_rows==std::vector<std::uint32_t>{128U,32U},"explicit tails including 32 are kept");
+    // One resolver: the same request through the CLI route and the --http-batch route resolves the same wide setting
+    // (explained difference only: STRIX_MTP_SERVE_WIDE=0 forces the serve route off).
+    {
+        auto cli_args=both;for(auto& value:cli_args)if(value=="--mtp-ngram-draft=copy")value="--mtp-ngram-draft=wide";
+        const auto cli=parse(cli_args);
+        const auto cli_rows=mtp_wide_copy_rows_effective(cli);
+        require(cli_rows==std::vector<std::uint32_t>{32U,16U},"the CLI route resolves the listed wide sizes");
+        auto serve=cli;serve.http_serve=true;serve.http_batch_explicit=true;serve.http_batch_cap=4U;
+        serve.mtp.window_prefix=true;serve.mtp.draft_chain=true;serve.mtp.window_rows_set={2U,4U,8U};
+        resolve_http_route(serve);
+        require(serve.http_batch==4U && serve.http_slot_reason.find("copy-wide")==std::string::npos,
+            "--http-batch admits the wide copy route");
+        require(mtp_wide_copy_rows_effective(serve)==cli_rows,"the serve route resolves the CLI's wide sizes");
+        require(mtp_wide_copy_rows_effective(serve,false).empty() && mtp_wide_copy_rows_effective(cli,false)==cli_rows,
+            "only STRIX_MTP_SERVE_WIDE=0 differs, and only on the serve route");
+        // tail sizes added only for the wide cycle never tile prompts under a split prefill profile (prompt cut as without the flags)
+        require(!cli.known_prefix_wide_only_tail_rows.empty(),"wide-only tail exclusion is exercised");
+        for(const auto rows:cli.known_prefix_wide_only_tail_rows)
+            require(!known_prefix_tail_tiles_prompts(cli,rows,true) && known_prefix_tail_tiles_prompts(cli,rows,false),
+                "a wide-only tail size stays out of split-profile prompt tiling");
+        for(const auto rows:cli.known_prefix_tail_rows)
+            if(std::find(cli.known_prefix_wide_only_tail_rows.begin(),cli.known_prefix_wide_only_tail_rows.end(),rows)==
+               cli.known_prefix_wide_only_tail_rows.end())
+                require(known_prefix_tail_tiles_prompts(cli,rows,true),"a requested tail size still tiles prompts");
+        {   // the real command line: --http-serve --http-batch with the wide flags parses (tails resolved with the prefill)
+            auto line=cli_args;line.insert(line.end(),{"--mtp-target-window-rows-set","2,4,8","--http-serve","--http-batch","2"});
+            const auto served=parse(line);
+            require(served.http_batch==2U && mtp_wide_copy_rows_effective(served)==cli_rows,"--http-batch parses with the wide flags");
+        }
+        auto plain_serve=parse(wide);plain_serve.http_serve=true;
+        require(mtp_wide_copy_rows_effective(plain_serve).empty(),"without the flags the serve route stays off");
+    }
 }
 
 int main(){try{

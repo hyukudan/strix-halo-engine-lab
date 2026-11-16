@@ -564,6 +564,14 @@ void test_startup_agreement() {
         kda[1] |= rd::kPfKdaWmmaConfig;
         pair(kda, kda, rd::max_rows_auto(tf), rd::max_rows_auto(tf), false);
         pair(kda, fast, false, false, true);
+        auto mla = kda;  // the FAST MLA GEMMs (glm-pf-mla-wmma-v1, FAST default): a rank without them is refused
+        mla[1] |= rd::kPfMlaWmmaConfig;
+        pair(mla, mla, rd::max_rows_auto(tf), rd::max_rows_auto(tf), false);
+        pair(mla, kda, false, false, true);
+        auto idxproj = kda;  // the FAST indexer projections: one rank without them is refused
+        idxproj[1] |= rd::kPfIdxProjWmmaConfig;
+        pair(idxproj, idxproj, rd::max_rows_auto(tf), rd::max_rows_auto(tf), false);
+        pair(idxproj, kda, false, false, true);
     }
     // External Xfer, including fixed and baseline modes, never enters this host handshake.
     for (const auto& extra : {Args{}, Args{"--baseline"}, Args{"--max-rows", "8192"}}) {
@@ -591,13 +599,22 @@ void test_startup_agreement() {
     CHECK(exchanges == 0);
     CHECK(!rd::has_startup_handshake(2, "comm", false, false));
     CHECK(!rd::has_startup_handshake(2, "comm", true, true));
-    // --tf adds a config-only agreement on two comm ranks; other reference gates and xfer/world 1 stay exchange-free.
+    // --tf and --pf-ttft (both set reference_gate) add a config-only agreement on two comm ranks; other reference gates
+    // and xfer/world 1 stay exchange-free, and the rows stay on the fixed fallback (no startup handshake).
     CHECK(rd::has_config_agreement(2, "comm", false, true, true));
     CHECK(rd::has_config_agreement(2, "comm", true, true, true));
     CHECK(rd::has_config_agreement(2, "comm", true, false, false));
     CHECK(!rd::has_config_agreement(2, "comm", true, true, false));
     CHECK(!rd::has_config_agreement(2, "xfer", false, true, true));
     CHECK(!rd::has_config_agreement(1, "comm", false, true, true));
+    {
+        rd::Effective pf;
+        pf.max_rows = {"8192", "auto-8192"};
+        const bool comm = true, handshake = rd::has_startup_handshake(2, "comm", false, true);
+        CHECK(rd::has_config_agreement(2, "comm", false, true, true) && !handshake);
+        rd::fallback_without_handshake(pf, comm, handshake);
+        CHECK(pf.max_rows.value == "4096");
+    }
 }
 
 void test_no_handshake_fallback() {
