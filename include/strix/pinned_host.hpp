@@ -11,8 +11,11 @@
 // (fine-grained for hipHostMallocCoherent requests, coarse-grained otherwise). Same bytes, same addresses semantics
 // for the caller: bitwise output. Off: the exact hipHostMalloc / hipHostFree calls.
 //
-// Lever STRIX_HOST_ANON_PIN (bitwise; opt-in until its in-app A/B lands as default). Only allocations of at least
-// kMinBytes take the pinned path: small buffers are revalidated cheaply and keep hipHostMalloc.
+// Lever STRIX_HOST_ANON_PIN (bitwise). Default ON on integrated GPUs (unified memory: the measured regime; MiniMax pair
+// 8K cold prefill under a CPU memory job 15.80 -> 13.38 s, quiet neutral, same FNV), off on discrete GPUs (their host
+// BOs are TTM pages, not movable); STRIX_HOST_ANON_PIN=1/0 forces it. Only allocations of at least kMinBytes take the
+// pinned path: small buffers are revalidated cheaply and keep hipHostMalloc. If the mlock or the long-term pin is
+// refused (RLIMIT_MEMLOCK), the allocation falls back to the exact hipHostMalloc: an unpinned anon range buys nothing.
 #include "strix/lever.hpp"
 
 #include <hip/hip_runtime.h>
@@ -32,8 +35,8 @@
 namespace strix::host_pin {
 
 inline constexpr std::string_view kLeverName = "host.anon_pin";
-inline constexpr lever::Decl kLever{kLeverName, "STRIX_HOST_ANON_PIN", lever::Exactness::bitwise, false, {}, {},
-                                    "wave4/next1112/KFDEVICT-RESULT.md (micro A/B under memory pressure)"};
+inline constexpr lever::Decl kLever{kLeverName, "STRIX_HOST_ANON_PIN", lever::Exactness::bitwise, true, {}, {},
+                                    "wave4/next1112/KFDEVICT-RESULT.md (in-app pair A/B under memory pressure)"};
 inline constexpr std::size_t kMinBytes = std::size_t{2} << 20;
 
 struct Pinned { std::size_t bytes = 0; int ring = -1; bool locked = false; };
@@ -41,7 +44,13 @@ struct Registry { std::mutex m; std::map<void*, Pinned> live; std::size_t bytes 
 inline Registry& registry() { static Registry r; return r; }
 
 [[nodiscard]] inline bool enabled() {
-    static const bool on = lever::select(kLever, lever::Inputs{}).on;
+    static const bool on = [] {
+        const lever::Choice c = lever::select(kLever, lever::Inputs{});
+        if (c.origin == lever::Origin::explicit_switch || !c.on) return c.on;
+        int dev = 0, integrated = 0;  // builtin ON applies to unified memory only
+        return hipGetDevice(&dev) == hipSuccess &&
+               hipDeviceGetAttribute(&integrated, hipDeviceAttributeIntegrated, dev) == hipSuccess && integrated != 0;
+    }();
     return on;
 }
 
@@ -66,19 +75,24 @@ inline Registry& registry() { static Registry r; return r; }
     const std::size_t page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
     const std::size_t size = (bytes + page - 1) / page * page;
     void* p = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
-    if (p == MAP_FAILED) return hipErrorOutOfMemory;
+    if (p == MAP_FAILED) return hipHostMalloc(host, bytes, flags);
     (void)::madvise(p, size, MADV_DONTFORK);
     Pinned rec{size, -1, ::mlock(p, size) == 0};
-    rec.ring = long_term_pin(p, size);
+    rec.ring = rec.locked ? long_term_pin(p, size) : -1;
+    if (rec.ring < 0) {  // not pinned: the exact old path
+        ::munmap(p, size);
+        std::lock_guard<std::mutex> lock(registry().m);
+        ++registry().unpinned;
+        return hipHostMalloc(host, bytes, flags);
+    }
     const unsigned reg = hipHostRegisterMapped | ((flags & hipHostMallocCoherent) ? 0U : hipExtHostRegisterCoarseGrained);
     if (const hipError_t e = hipHostRegister(p, size, reg); e != hipSuccess) {
-        if (rec.ring >= 0) ::close(rec.ring);
+        ::close(rec.ring);
         ::munmap(p, size);
         return e;
     }
     auto& r = registry();
     std::lock_guard<std::mutex> lock(r.m);
-    if (rec.ring < 0 || !rec.locked) ++r.unpinned;
     r.bytes += size;
     r.live.emplace(p, rec);
     *host = p;

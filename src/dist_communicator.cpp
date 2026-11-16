@@ -1932,8 +1932,8 @@ Communicator::Communicator(Group group, std::unique_ptr<Transport> transport, st
             check(hipDeviceGetAttribute(&native_atomics, hipDeviceAttributeHostNativeAtomicSupported, device), "host atomics");
             if (!native_atomics) throw std::runtime_error("staged readiness requires native host atomics");
             const auto count = std::min(max_bytes_, staged_ready_bytes_) + sizeof(Trailer);
-            check(hipHostMalloc(reinterpret_cast<void**>(&staged_send_host_), count, hipHostMallocCoherent), "coherent staged send");
-            check(hipHostMalloc(reinterpret_cast<void**>(&staged_receive_host_), count, hipHostMallocCoherent), "coherent staged receive");
+            check(strix::host_pin::allocate(reinterpret_cast<void**>(&staged_send_host_), count, hipHostMallocCoherent), "coherent staged send");
+            check(strix::host_pin::allocate(reinterpret_cast<void**>(&staged_receive_host_), count, hipHostMallocCoherent), "coherent staged receive");
             check(hipHostMalloc(reinterpret_cast<void**>(&producer_flag_), sizeof(StagedReady), hipHostMallocCoherent), "producer readiness");
             check(hipHostMalloc(reinterpret_cast<void**>(&consumer_flag_), sizeof(StagedReady), hipHostMallocCoherent), "consumer readiness");
             new (producer_flag_) StagedReady{};
@@ -1954,8 +1954,8 @@ Communicator::Communicator(Group group, std::unique_ptr<Transport> transport, st
             if (staged_counters_) (void)hipFree(staged_counters_);
             if (consumer_flag_) (void)hipHostFree(consumer_flag_);
             if (producer_flag_) (void)hipHostFree(producer_flag_);
-            if (staged_receive_host_) (void)hipHostFree(staged_receive_host_);
-            if (staged_send_host_) (void)hipHostFree(staged_send_host_);
+            if (staged_receive_host_) (void)strix::host_pin::release(staged_receive_host_);
+            if (staged_send_host_) (void)strix::host_pin::release(staged_send_host_);
             (void)strix::host_pin::release(receive_host_);
             (void)strix::host_pin::release(send_host_);
             throw;
@@ -2233,8 +2233,8 @@ Communicator::~Communicator() {
     if (consumer_flag_) (void)hipHostFree(consumer_flag_);
     if (staged_counters_) (void)hipFree(staged_counters_);
     if (producer_flag_) (void)hipHostFree(producer_flag_);
-    if (staged_receive_host_) (void)hipHostFree(staged_receive_host_);
-    if (staged_send_host_) (void)hipHostFree(staged_send_host_);
+    if (staged_receive_host_) (void)strix::host_pin::release(staged_receive_host_);
+    if (staged_send_host_) (void)strix::host_pin::release(staged_send_host_);
     (void)strix::host_pin::release(send_host_);
     (void)strix::host_pin::release(receive_host_);
     if (pre_copy_) (void)hipEventDestroy(pre_copy_);
