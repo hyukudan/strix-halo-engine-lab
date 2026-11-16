@@ -1,4 +1,5 @@
 #include "../apps/qwen_prompt_organization.hpp"
+#include "strix/serve_cli_parity.hpp"
 #include "../apps/qwen_http_memory.hpp"
 #include "../apps/mtp_asset_verification.hpp"
 #include "../apps/qwen_cache_family_contract.hpp"
@@ -362,6 +363,47 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
     const auto resolve=[&](const RequestedOptions& r,const PrefillMemory& m) {
         return resolve_effective_config(r,model,{},manifest,validated_model_content_identity,{true,true,true},m);
     };
+    {
+        // Server / CLI parity (strix/serve_cli_parity.hpp): the same request words through the ONE resolver, once as the
+        // HTTP server (--http-serve --http-batch 2 and its prefix-cache block setting) and once as the CLI. Compare the
+        // environment and the route fields projected below, with the listed field/family allowances. This is not
+        // complete effective-configuration or numerical-identity parity.
+        namespace sp = strix::parity;
+        std::vector<std::string> cli_args;
+        for(std::size_t i=0;i<args.size();++i) {
+            if(args[i]=="--http-serve") continue;
+            if(args[i]=="--http-batch" || args[i]=="--prefix-cache-block-rows") { ++i; continue; }
+            cli_args.push_back(args[i]);
+        }
+        const auto view=[](const EffectiveConfig& c) {
+            sp::Config v;
+            for(const auto& [k,value] : c.environment) v["env:"+k]=value;
+            v["known_prefix_prefill_rows"]=std::to_string(c.options.known_prefix_prefill_rows);
+            v["mtp"]=c.options.mtp.enabled?"1":"0";
+            v["admitted"]=c.admitted?"1":"0";
+            v["tile_fallback"]=c.tile_fallback;
+            v["arithmetic_fallback"]=c.arithmetic_fallback;
+            return v;
+        };
+        const auto served=resolve(request,ample_memory());
+        const auto cli=resolve(RequestedOptions{parse(cli_args),request.environment},ample_memory());
+        static constexpr sp::Allowed allowed[]={
+            // The server has no prompt at startup, so resolve_serve_prefill (apps/qwen_effective_config.hpp) admits the
+            // known-prefix tiled prefill and its organisation for the serving context then; the CLI resolves the same
+            // route from the prompt it is given (same block plan and kernels at 8K: wave4 SRVPAR receipts). Named here so
+            // that serving-only values outside these fields/families fail.
+            {"known_prefix_prefill_rows","serving admits the tiled prefill at startup; the CLI from its prompt"},
+            {"env:STRIX_QPF2K_*","organisation of the tiled prefill admitted at serving startup"},
+            {"env:STRIX_QSA_*","organisation of the tiled prefill admitted at serving startup"},
+            {"env:STRIX_PREFILL_PIPE","organisation of the tiled prefill admitted at serving startup"},
+            {"env:STRIX_PREFILL_PLE_BATCH","organisation of the tiled prefill admitted at serving startup"},
+            {"env:STRIX_INTPREFILL_DENSE_ROWS","organisation of the tiled prefill admitted at serving startup"},
+            {"env:STRIX_DISPATCH_FUSE","serial-route dispatch fusion; the tiled serving route does not use it"},
+        };
+        const auto report=sp::compare(view(cli),view(served),allowed);
+        if(!report.ok()) std::cerr<<sp::text("qwen",report);
+        expect(report.ok(),"qwen: projected CLI/server route fields and environment match within the listed allowances");
+    }
     {
         // Native joining gate shape: pinned MTP server args (C24576, T8192 serving prefill),
         // explicit 4 GiB host budget, --http-batch 3 --prefix-batch-cert l0, gate env.

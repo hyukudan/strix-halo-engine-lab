@@ -205,6 +205,10 @@ int main() {
     options = {}; options.quality_head_rows = 2U;
     check(!DevicePrefill::group_options_supported(options), "multirow quality head declined");
     check(std::string(DevicePrefill::group_decline_reason(options)) == "diagnostic-output-not-segmented", "diagnostic decline names its cause");
+    // FAST Engram: one overflow flag per view, a group view spans members (PROVISIONAL decline until a per-row flag)
+    options = {}; options.fast_dense = true; options.fast_moe = true; options.fast_engram = true;
+    check(!DevicePrefill::group_options_supported(options), "FAST Engram group declined");
+    check(std::string(DevicePrefill::group_decline_reason(options)) == "engram-fast-flag-per-view", "FAST Engram decline names its cause");
     dense_plan_tests();
     qualification_tests();
 
