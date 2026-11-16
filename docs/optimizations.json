@@ -218,7 +218,7 @@
     "default": "CLI tool (not in the serving path)",
     "exact": "No engine effect; CPU-only full-file hashing and optional structural audits.",
     "gain": "No throughput claim",
-    "preconditions": "Explicit role closure and root-relative members; trusted published pins where available. Distill-g needs separate supply.",
+    "preconditions": "Explicit role closure and root-relative members; trusted published pins where available. Distill-g is fetched from its published repository.",
     "off_switch": "Omit the explicit CLI command; no startup work is installed.",
     "doc_anchor": "docs/operations/release-assets.md"
   },
@@ -707,6 +707,17 @@
     "preconditions": "Automatic decoder route (CLI), admitted tiled prefill; MTP/HTTP serving and cohorts keep it opt-in; not applied under GSQ.",
     "off_switch": "STRIX_QPF2K_SHARED_PRE=0",
     "doc_anchor": "docs/optimizations.md#qwen-shared-pre"
+  },
+  {
+    "engine": "qwen",
+    "name": "Paired GLU store for the shared-expert preimage",
+    "flag_or_env": "STRIX_QPF2K_GLU_PAIR",
+    "default": "1",
+    "exact": "Bitwise: the shared-pre fixture (32..8192 rows, nine gate/up payload kinds including non-finite values, two streams) gives equal FP16 preimage, gate, outputs and overflow count on every route, plus an RNE oracle; final logits are identical at 8K, 32K and 128K.",
+    "gain": "Shared-expert kernels per 8K request 146.6 -> 128.0 ms (-18.6 ms), at 32K -68 ms (traced, one node); request level within clock noise (-0.1 % at 8K, -0.5 % at 32K)",
+    "preconditions": "STRIX_QPF2K_SHARED_PRE admitted, tiled gate|up admitted for the same rows, features a multiple of 16.",
+    "off_switch": "STRIX_QPF2K_GLU_PAIR=0",
+    "doc_anchor": "docs/optimizations.md#qwen-glu-pair"
   },
   {
     "engine": "qwen",
@@ -1865,6 +1876,17 @@
   },
   {
     "engine": "minimax",
+    "name": "Prefill MoE tail rows on the pipelined kernel",
+    "flag_or_env": "STRIX_MMX_PREFILL_PIPE_TAIL",
+    "default": "1",
+    "exact": "Same items, operands, k order and split partials; the partial block (MT 1-7) runs item_pipe with a guarded store. Fixture 12,480 cells memcmp vs item_core_v3; pair logits and both-rank state digests identical at 8K and 32K.",
+    "gain": "PAIR TTFT, valid runs without kfd evictions in the window: 8K 12.68 -> 12.47 s, 32K 51.81 -> 50.91 s.",
+    "preconditions": "MT-fit row plans (the default); class MT8 partial stays on the old kernel.",
+    "off_switch": "STRIX_MMX_PREFILL_PIPE_TAIL=0",
+    "doc_anchor": "docs/optimizations.md#mm-pf-pipe-tail"
+  },
+  {
+    "engine": "minimax",
     "name": "Prefill MoE paired MT8 PIPE bands",
     "flag_or_env": "STRIX_MMX_PREFILL_PIPE_PAIR",
     "default": "auto",
@@ -2723,6 +2745,17 @@
   },
   {
     "engine": "glm",
+    "name": "FAST shared expert on 128-row slices",
+    "flag_or_env": "STRIX_GLM_PF_WMMA_SHARED128",
+    "default": "on wherever the FAST WMMA prefill runs with 128-row tiles",
+    "exact": "Bitwise to the glm-pf-wmma-x identity (64-row slices equal on every buffer in hip_glm_pf_wmma_tests arm 7; pair 8K logits of both ranks equal).",
+    "gain": "Pair FAST 8K warm 8.606 -> 8.571 s (-0.4 %, 2 ABAB pairs); whole MoE call at 2048 rows 26.73 -> 26.54 ms.",
+    "preconditions": "STRIX_GLM_PF_WMMA=1 and STRIX_GLM_PF_WMMA_ROWS=128 (default).",
+    "off_switch": "STRIX_GLM_PF_WMMA_SHARED128=0 (64-row shared slices, same bits)",
+    "doc_anchor": "docs/optimizations.md#glm-pf-wmma-shared128"
+  },
+  {
+    "engine": "glm",
     "name": "FAST KDA plain-weight projections on WMMA (glm-pf-kda-wmma-v1)",
     "flag_or_env": "STRIX_GLM_PF_KDA_WMMA",
     "default": "on in FAST prefill (STRIX_GLM_PF_WMMA=1); off in exact mode",
@@ -2742,6 +2775,17 @@
     "preconditions": "32 MLA heads per rank (TP2).",
     "off_switch": "STRIX_GLM_PF_ATTN_WMMA=0 (or exact mode)",
     "doc_anchor": "docs/optimizations.md#glm-pf-attn-wmma"
+  },
+  {
+    "engine": "glm",
+    "name": "FAST fused attention core reads q-tilde as a bf16 image",
+    "flag_or_env": "STRIX_GLM_PF_MLA_QT16",
+    "default": "on wherever the FAST fused MLA core runs with the v3 absorb GEMM",
+    "exact": "Bitwise to the glm-pf-attn-wmma identity: the absorb GEMM keeps its FP32 chains and stores tile::to_bf16 of each result, the operand bits the core made of FP32 q-tilde. hip_glm_prefill_tests (STRIX_GLM_PF_TEST_ONLY=mla): o-bar, MLA output and guards equal for T 32 and T 16 with finite and NaN/Inf latents; layer bench arm 23 == 21; pair 8K logits of both ranks equal in every A/B run.",
+    "gain": "Pair FAST 8K, warm: 8.617 -> 8.524 s median (-99 ms, 3 ABAB pairs: -196 / -50 / -99 ms), 951 -> 961 tok/s, GPU clocks per token 2894k -> 2845k; layer bench C 4096: absorb 9.52 -> 7.37 ms, fused core 27.74 -> 26.37 ms per launch.",
+    "preconditions": "STRIX_GLM_PF_WMMA=1 with the fused core (STRIX_GLM_PF_ATTN_WMMA not 0), 32 heads per rank, absorb GEMM v3 (the default); other GEMM versions keep FP32 q-tilde.",
+    "off_switch": "STRIX_GLM_PF_MLA_QT16=0 (FP32 q-tilde, same bits)",
+    "doc_anchor": "docs/optimizations.md#glm-pf-mla-qt16"
   },
   {
     "engine": "glm",
