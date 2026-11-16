@@ -26,7 +26,9 @@ struct Buffer {
         std::vector<T> v(n); check(hipMemcpy(v.data(),p,n*sizeof(T),hipMemcpyDeviceToHost)); return v;
     }
 };
-template<unsigned R> struct Site {
+__device__ float* partial_trace;
+__device__ unsigned* partial_count;
+template<unsigned R,bool Diagnostic=false> struct Site {
     using Input = float;
     static constexpr unsigned rows=R;
     static constexpr bool fused_fma=true;
@@ -39,7 +41,14 @@ template<unsigned R> struct Site {
         asm("v_fma_mix_f32 %0, %1, %2, neg(0) op_sel_hi:[1,0,0]" : "=v"(result) : "v"(scale), "v"(static_cast<float>(code)));
         return result;
     }
-    __device__ static void fma(float& acc,float c,float x) { acc=__builtin_fmaf(c,x,acc); }
+    __device__ static void fma(float& acc,float c,float x) {
+        acc=__builtin_fmaf(c,x,acc);
+        if constexpr(Diagnostic) {
+            const unsigned t=blockIdx.x*blockDim.x+threadIdx.x;
+            const unsigned i=partial_count[t]++;
+            if(i<256U) partial_trace[t*256U+i]=acc;
+        }
+    }
     __device__ static float add(float lower,float upper) {
         float result; asm("v_add_f32 %0, %1, %2" : "=v"(result) : "v"(lower), "v"(upper)); return result;
     }
@@ -67,6 +76,12 @@ __global__ void operands_kernel(std::uint16_t* out) {
     out[3U*i]=__builtin_bit_cast(std::uint16_t,a);
     out[3U*i+1U]=__builtin_bit_cast(std::uint16_t,pair[0]);
     out[3U*i+2U]=__builtin_bit_cast(std::uint16_t,pair[1]);
+}
+template<unsigned Form> __global__ void prepared_kernel(strix::core::f16_dense_tall::q8a8::View v,std::uint32_t* out) {
+    using namespace strix::core::f16_dense_tall;
+    q8a8::Cols<8U,Form> c{v};
+    U4 data[8];c.stage(0,threadIdx.x%16U,0,data);
+    for(unsigned i=0;i<8U;++i) reinterpret_cast<U4*>(out)[threadIdx.x*8U+i]=data[i];
 }
 std::vector<unsigned char> weights(unsigned k,unsigned n) {
     std::vector<unsigned char> w(n*(k/32U)*34U);
@@ -121,6 +136,27 @@ template<unsigned R> void rows_case(unsigned k,unsigned n) {
         }
     }
 }
+void partial_case(bool q6) {
+    using namespace strix::q8_rows;
+    auto w=weights(256U,1U);
+    if(q6) w.assign(208U,0);
+    std::vector<float> x(256U,0.125F);
+    Buffer dw(w.size()),dx(x.size()*4U),dy(4U),trace(256U*256U*4U),counts(256U*4U);
+    dw.upload(w);dx.upload(x);
+    auto* tp=trace.as<float>();auto* cp=counts.as<unsigned>();
+    check(hipMemcpyToSymbol(HIP_SYMBOL(partial_trace),&tp,sizeof(tp)));
+    check(hipMemcpyToSymbol(HIP_SYMBOL(partial_count),&cp,sizeof(cp)));
+    Site<1U,true> site{};site.input[0]=dx.p;site.segments=segments({{dw.p,1U}});site.width=256;site.outputs=1;site.output=dy.as<float>();
+    if(q6) hipLaunchKernelGGL((project_rows_kernel<Site<1U,true>,2U,false,true>),dim3(1),dim3(256),0,0,site);
+    else hipLaunchKernelGGL((project_rows_kernel<Site<1U,true>,2U,false,false>),dim3(1),dim3(256),0,0,site);
+    check(hipGetLastError());dy.read<float>(1);
+    auto values=trace.read<float>(256U*256U);
+    auto used=counts.read<unsigned>(256U);
+    for(unsigned count:used) if(count>256U) throw std::runtime_error("diagnostic partial capacity");
+#ifdef STRIX_WFMT_CAPTURE
+    strix::weight::capture::emit("partials",values.data(),values.size()*sizeof(float));
+#endif
+}
 void dense_case(unsigned k,unsigned n,unsigned rows) {
     namespace d=strix::core::f16_dense_tall;
     auto w=weights(k,n);std::vector<std::int8_t> a(rows*k);std::vector<float> scales(rows*k/32U,0.03125F),x(rows*k);
@@ -128,6 +164,15 @@ void dense_case(unsigned k,unsigned n,unsigned rows) {
     Buffer dw(w.size()),da(a.size()),ds(scales.size()*4U),dx(x.size()*4U),dy(rows*n*4U);
     dw.upload(w);da.upload(a);ds.upload(scales);dx.upload(x);
     d::q8a8::View v{dw.as<std::uint8_t>(),da.as<std::int8_t>(),ds.as<float>(),dy.as<float>(),k/32U*34U,0,k,n,rows,k,n,0,0};
+    if(rows==1U) {
+        Buffer prepared(16U*8U*16U);
+        hipLaunchKernelGGL((prepared_kernel<0U>),dim3(1),dim3(16),0,0,v,prepared.as<std::uint32_t>());check(hipGetLastError());const auto a0=prepared.read<std::uint32_t>(16U*8U*4U);
+        hipLaunchKernelGGL((prepared_kernel<1U>),dim3(1),dim3(16),0,0,v,prepared.as<std::uint32_t>());check(hipGetLastError());const auto a1=prepared.read<std::uint32_t>(16U*8U*4U);
+        if(a0!=a1) throw std::runtime_error("prepared scalar packed fragments differ");
+#ifdef STRIX_WFMT_CAPTURE
+        strix::weight::capture::emit("prepared",a0.data(),a0.size()*sizeof(std::uint32_t));
+#endif
+    }
     hipLaunchKernelGGL((d::q8a8::kernel<1U,8U,0U>),dim3((rows+127U)/128U,(n+15U)/16U),dim3(256),0,0,v);check(hipGetLastError());const auto scalar=dy.read<float>(rows*n);
     hipLaunchKernelGGL((d::q8a8::kernel<1U,8U,1U>),dim3((rows+127U)/128U,(n+15U)/16U),dim3(256),0,0,v);check(hipGetLastError());const auto packed=dy.read<float>(rows*n);
     if(scalar!=packed) throw std::runtime_error("scalar packed source differs");
@@ -143,6 +188,7 @@ void dense_case(unsigned k,unsigned n,unsigned rows) {
 }
 int main() try {
     Buffer op(4096U*3U*2U);hipLaunchKernelGGL(operands_kernel,dim3(16),dim3(256),0,0,op.as<std::uint16_t>());check(hipGetLastError());op.read<std::uint16_t>(4096U*3U);
+    partial_case(false);partial_case(true);
     for(unsigned n:{1U,17U,65U}) {rows_case<1>(256U,n);rows_case<2>(512U,n);rows_case<7>(256U,n);rows_case<8>(512U,n);rows_case<16>(256U,n);rows_case<32>(512U,n);rows_case<64>(256U,n);}
     for(unsigned rows:{1U,2U,7U,8U,9U,31U,32U,33U,63U,64U,65U,127U,128U,129U}) dense_case(128U,17U,rows);
     std::cout<<"HIP dense source migration: operands/raw/Q8 scalar-packed/Q6/direct/staged/stepped/wide/coef/lane PASS\n";return 0;
