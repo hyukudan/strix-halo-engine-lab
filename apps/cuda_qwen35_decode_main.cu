@@ -101,7 +101,7 @@ int main(int argc, char** argv) {
         bool graphs = true, multi = true, bwp = false, pdl = false, print_cfg = false;
         q::EngineOptions topt;  // TURBO levers (defaults = exact)
         std::string arith_name = "mma3";
-        std::string pf_arith;            // --prefill-arith exact|flash|fast|fast2: large-M prefill (absent: windows of --rows)
+        std::string pf_arith, pf_dump;            // --prefill-arith exact|flash|fast|fast2: large-M prefill (absent: windows of --rows)
         std::uint32_t pf_chunk = 2048, pf_repeat = 1, pf_slots = 2;
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
@@ -120,6 +120,7 @@ int main(int argc, char** argv) {
             else if (a == "--max-pos") max_pos = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--prefill-arith") pf_arith = next();
             else if (a == "--prefill-chunk") pf_chunk = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (a == "--prefill-dump") pf_dump = next();  // last-token logits of the LAST prefill (float32 [vocab])
             else if (a == "--prefill-slots") pf_slots = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--prefill-repeat") pf_repeat = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--layers") layers_override = static_cast<std::uint32_t>(std::stoul(next()));
@@ -176,11 +177,12 @@ int main(int argc, char** argv) {
         }
         q::EngineOptions opt = topt;
         if (!pf_arith.empty()) {
-            if (pf_arith == "exact") opt.prefill_arith = q::PrefillArith::exact;
+            if (pf_arith == "windows") opt.prefill_big = false;  // reference: prefill() runs forward_rows windows of 32 + commit
+            else if (pf_arith == "exact") opt.prefill_arith = q::PrefillArith::exact;
             else if (pf_arith == "flash") opt.prefill_arith = q::PrefillArith::flash;
             else if (pf_arith == "fast") opt.prefill_arith = q::PrefillArith::fast;
             else if (pf_arith == "fast2") opt.prefill_arith = q::PrefillArith::fast2;
-            else throw std::runtime_error("--prefill-arith expects exact|flash|fast|fast2");
+            else throw std::runtime_error("--prefill-arith expects windows|exact|flash|fast|fast2");
             opt.prefill_chunk = pf_chunk;
             opt.prefill_slots = pf_slots;
         }
@@ -228,6 +230,14 @@ int main(int argc, char** argv) {
                 E->sync();
                 const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                 E->read_top(o, 1, &next_tok);
+                if (!pf_dump.empty() && rep + 1 == pf_repeat) {
+                    std::vector<float> lg(cfg.vocab);
+                    E->read_logits(o, 0, lg.data());
+                    if (std::FILE* f = std::fopen(pf_dump.c_str(), "wb")) {
+                        std::fwrite(lg.data(), 4, lg.size(), f);
+                        std::fclose(f);
+                    }
+                }
                 std::fprintf(stderr, "prefill[%u/%u] %s %zu tokens in %.3f s = %.1f tok/s (%s) top1 %u\n", rep + 1, pf_repeat, pf_arith.c_str(),
                              prompt.size(), sec, static_cast<double>(prompt.size()) / sec, rep == 0 ? "FIRST/cold" : rep + 1 == pf_repeat ? "LAST/warm" : "mid", next_tok);
             }
