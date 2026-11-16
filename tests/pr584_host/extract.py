@@ -33,6 +33,13 @@ if "void prepare_flash_mirrors()" in source:
 run_from = function("PrefillResult DevicePrefill::run_from(")
 head = run_from[:run_from.index("const strix::session::EmbedSplice embeds")]
 assert "PrefillPrecisionScope" in head and "m.options.fast_dense, m.options.fast_moe" in head, "run_from must install its own precision first"
+# DAYAUDIT 5: export_state() after run_group (single sequence discarded: rows 0, last row "local") must refuse
+(out / "export_state.inc").write_text(function("AttentionState DevicePrefill::export_state() const"))
+exp_seq = function("static AttentionState export_sequence(")
+assert exp_seq.index("last_local_row && local_rows == 0U") < exp_seq.index("local_rows - 1U"), "export_sequence must guard local_rows - 1"
+grp_end = source[source.index("m.group_used = nseg;"):]
+assert grp_end.index("m.solo_discarded = true;") < grp_end.index("} else {"), "run_group marks the single sequence discarded"
+assert "m.solo_discarded = false;    // the single sequence is the imported one again" in function("void DevicePrefill::import_state("), "import restores it"
 (out / "setter.inc").write_text(
     function("void DevicePrefill::set_precision_for_new_sequence(bool") + "\n" +
     function("void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions&"))

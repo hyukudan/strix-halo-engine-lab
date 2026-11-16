@@ -592,6 +592,7 @@ struct DevicePrefill::Impl {
     };
     std::vector<SeqState> group;
     std::uint32_t group_used = 0;               // members of the last run_group (0: none)
+    bool solo_discarded = false;                // run_group dropped the single sequence: export_state() refuses until run / import
     const PrefillGroupPlan* grp = nullptr;      // set by run_group around its run_from
     std::vector<PrefillResult> group_results;   // filled by the head of a group pass
     // group scratch: the members' last rows (head), their logits blocks, argmax candidates, seed rows of every member
@@ -758,6 +759,7 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
     }
     options.fast_dense = options.fast_dense || ds41::fast_profile::dense_on();
     options.fast_moe = options.fast_moe || ds41::fast_profile::moe_on();
+    options.fast_engram = options.fast_engram || ds41::fast_profile::engram_on();
     // Per-shape selector of the FP16 backend: STRIX_DS41_PREFILL_FP16_PROJ (comma list of q_a, kv, q_b, o_a, o_b),
     // STRIX_DS41_PREFILL_FP16_MIN_ROWS (calls of at least that many rows), STRIX_DS41_PREFILL_APPROX_LAYERS=first-end,
     // STRIX_DS41_PREFILL_FP16_A8=1 (operands from the A8 codes)
@@ -1574,6 +1576,7 @@ void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions& p) {
     o.fast_attention_flash = p.fast_attention_flash;
     o.fast_moe = p.fast_moe;
     o.fast_dense = p.fast_dense;
+    o.fast_engram = p.fast_engram;
     // no process-wide switch: run_from installs these options as the precision of its own execution (another
     // DevicePrefill of the process keeps its own; strix/ds41_prefill_precision.hpp)
 }
@@ -2438,7 +2441,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 v.x_stride = v.width;
                 v.out_stride = v.count;
                 v.out = m.ekv.p;
-                ds41::enqueue_engram_f16_rows(v, st);
+                ds41::enqueue_engram_f16_rows(v, st, m.options.fast_engram);
                 ds41::enqueue_engram_inject(stream_now() + std::size_t{r0} * stream_row, m.ekv.p, m.devf(p + "engram_q_norm.weight"),
                                             m.devf(p + "engram_k_norm.weight"), n, H, 1e-20F, st,
                                             m.image_rows_set ? m.image_rows.p + r0 : nullptr);  // image rows: gate 0 (upstream)
@@ -3712,12 +3715,14 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         m.last_row_local = true;
         m.state_incomplete = false;
         m.seed_rows = 0;
+        m.solo_discarded = true;
     } else {
         m.rows_done = P0 + T;
         m.local_rows_done = Tn;
         m.last_row_local = last_local;
         m.state_incomplete = defer;
         m.group_used = 0;
+        m.solo_discarded = false;
     }
 #ifdef STRIX_DS41_PREFILL_FP16_LT
     if (m.fast_used) {
@@ -3824,6 +3829,7 @@ void DevicePrefill::import_state(const AttentionState& s) {
     m.cancel_broken = false;
     m.state_incomplete = false;  // a complete state replaces a deferred run's (only after the import succeeded)
     m.defer_next = 0;
+    m.solo_discarded = false;    // the single sequence is the imported one again
 }
 
 // The attention state of one sequence: `layers` its per-layer state, T its rows, local_rows the rows this rank computed of
@@ -3831,6 +3837,8 @@ void DevicePrefill::import_state(const AttentionState& s) {
 static AttentionState export_sequence(const DevicePrefill::Impl& m, const std::vector<DevicePrefill::Impl::LayerState>& layers, std::uint32_t T,
                                       std::uint32_t local_rows, bool last_local_row) {
     namespace attn = ds41::attn;
+    // the last row's index count is read at local_rows - 1: a rank holding the last row holds at least that row
+    if (last_local_row && local_rows == 0U) throw std::logic_error("deepseek41 prefill: export of a state without local rows");
     AttentionState s;
     s.position = T;
     s.layers.resize(m.options.layers);
@@ -3909,6 +3917,8 @@ static AttentionState export_sequence(const DevicePrefill::Impl& m, const std::v
 AttentionState DevicePrefill::export_state() const {
     const auto& m = *impl_;
     if (m.state_incomplete) throw std::logic_error("deepseek41 prefill: the last run deferred its decoder (its continuation completes the state)");
+    // after run_group the single sequence was discarded (rows 0): its members export by segment
+    if (m.solo_discarded) throw std::logic_error("deepseek41 prefill: the last pass was a group: export_state(segment)");
     return export_sequence(m, m.attn, m.rows_done, m.local_rows_done, m.last_row_local);
 }
 

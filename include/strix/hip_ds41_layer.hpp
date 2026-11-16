@@ -257,6 +257,10 @@ struct Q8A8DensePrefillView {
 // FAST lever ds41-dense-f16-v1 (STRIX_DS41_FAST_DENSE): 1 on, 0 off, -1 = the environment (default). Process-wide.
 // Callers must serialize changes against execution in every engine instance, not only the current prefill task.
 void set_fast_dense(int mode);
+// FAST lever ds41-engram-f16wmma-v1 (STRIX_DS41_FAST_ENGRAM): the Engram KV projection on the shared FP16 WMMA core.
+// 1 on, 0 off, -1 = the environment (default). Process-wide, serialized like set_fast_dense.
+// Only controls the two-argument dispatch; DevicePrefill passes its per-instance policy explicitly.
+void set_fast_engram(int mode);
 // Returns true when the outputs' A8 (a8_codes) was written.
 bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& view, void* stream);
 // F16 projection (weight [count rows of width]): out[r * out_stride + o] = f16_row_dot(row first + o, x_r),
@@ -278,6 +282,8 @@ void enqueue_f16_rows(const F16RowsView& view, void* stream);
 // gives NaN in both, possibly with another payload). Default on; STRIX_DS41_ENGRAM_F16_PF=0
 // (read on every call) restores enqueue_f16_rows, which also serves every other view.
 void enqueue_engram_f16_rows(const F16RowsView& view, void* stream);
+// Per-execution numerical policy, independent of set_fast_engram and its environment default.
+void enqueue_engram_f16_rows(const F16RowsView& view, void* stream, bool fast_engram);
 // Explicit entry for tests / microbench: rejects unsupported views, ignores the switch.
 [[nodiscard]] bool engram_f16_pf_supported(const F16RowsView& view) noexcept;
 // Default admission (enqueue_engram_f16_rows): supported and the 48-row padding at most 9/8 of the 64-row tile's.

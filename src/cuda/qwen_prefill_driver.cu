@@ -527,11 +527,14 @@ void Prefill::Impl::upload_model() {
     // HC: pack every mixer's down/up once; the raw Q8_0 copies are dropped.
     hc_attn.resize(kLayers);
     hc_ffn.resize(kLayers);
+    std::vector<std::string> packed_raw;
     auto pack = [&](const std::string& prefix) {
         void* base = dev_alloc<std::uint8_t>(hc::hc_packed_bytes(), "hc packed");
         hc_storage.push_back(base);
         const auto packed = hc::hc_packed_view(base);
         hc::hc_pack(w.get(prefix + "_down.weight"), w.get(prefix + "_up.weight"), packed, stream);
+        packed_raw.push_back(prefix + "_down.weight");
+        packed_raw.push_back(prefix + "_up.weight");
         return packed;
     };
     for (std::uint32_t l = 0; l < kLayers; ++l) {
@@ -539,6 +542,15 @@ void Prefill::Impl::upload_model() {
         hc_ffn[l] = pack("blk." + std::to_string(l) + ".hc_ffn");
     }
     if (cfg.decode) hc_out = pack("output_hc");
+    // Only the packed copies are read after this (every hc kernel takes HcPacked): free the raw Q8_0 mixes once the packs
+    // are done (~0.68 GB of VRAM, one more 32K serve session). weights_gb keeps reporting the uploaded bytes.
+    ck(cudaStreamSynchronize(stream), "hc pack");
+    for (const auto& name : packed_raw) {
+        const auto it = w.tensors.find(name);
+        if (it == w.tensors.end()) continue;
+        ck(cudaFree(it->second), "free raw hc mix");
+        w.tensors.erase(it);
+    }
     lw.resize(kLayers);
     for (std::uint32_t l = 0; l < kLayers; ++l) {
         const std::string blk = "blk." + std::to_string(l);

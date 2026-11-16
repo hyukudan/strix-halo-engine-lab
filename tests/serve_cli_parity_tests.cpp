@@ -4,6 +4,8 @@
 // difference that no longer exists. `--print` prints both resolved configurations side by side (the report tools use it).
 #include "strix/serve_cli_parity.hpp"
 
+#include <span>
+
 #include <cstring>
 #include <functional>
 #include <iostream>
@@ -20,6 +22,9 @@
 #endif
 #if defined(STRIX_PARITY_DS41)
 #include "strix/deepseek41_pair_defaults.hpp"
+#endif
+#if defined(STRIX_PARITY_GEMMA4)
+#include "gemma4/engine/runtime.hpp"
 #endif
 
 namespace {
@@ -80,12 +85,9 @@ void glm() {
     namespace rd = strix::glm::rank_defaults;
     const rd::EnvGet none = [](const char*) -> const char* { return nullptr; };
     const std::vector<std::string> request{"--world", "2"};
-    static constexpr sp::Allowed allowed[] = {
-        // OPEN (not yet removed): the CLI sizes the exchange with its startup admission (8192 rows when both ranks fit),
-        // the server starts from the 4096-row fallback. Named here so it cannot grow silently.
-        {"effective max-rows", "serve has no startup row admission: 4096-row exchange fallback (auto-4096-serve)"},
-        {"effective max-rows-admission", "the startup row admission line exists on the CLI only"},
-    };
+    // Nothing is allowed to differ: max-rows auto is admitted at load by the same function on both entry points
+    // (apps/glm_auto_rows.hpp), so the server resolves the CLI's 8192-row candidate and its admission line.
+    const std::span<const sp::Allowed> allowed{};
     // "value (source)": the gate compares the value; the source label names the entry point's path to it.
     const auto values = [](sp::Config c) {
         for (auto& [k, v] : c)
@@ -120,9 +122,18 @@ void minimax() {
     static constexpr sp::Allowed allowed[] = {
         {"app", "the entry point's own name"},
         {"session_reason", "text that quotes the app and transport names"},
-        // OPEN (not yet removed): the server defaults to the device exchange, the CLI negotiates it.
-        {"transport", "serve default usb4gpu (device exchange), rank default usb4-auto (negotiated)"},
+        // EXCEPTION for the user (not measured server vs CLI on the same transport): the server defaults to the device
+        // exchange, the CLI to the host exchange.
+        {"transport", "serve default usb4gpu (device exchange), rank default usb4-auto (host exchange)"},
         {"serve.*", "scheduler / speculation policy between concurrent requests; no CLI counterpart"},
+        // One host-path table (mm_defaults host_defaults()), two columns:
+        {"host.STRIX_DIST_USB4_TIMEOUT_MS", "transport only: a request fails within a minute when the peer is gone"},
+        {"host.STRIX_DIST_WAIT_TIMEOUT_MS", "transport only: a request fails within a minute when the peer is gone"},
+        {"host.STRIX_DIST_USB4_TIMEOUT_MS.serving_reason", "the reason line exists on the server only"},
+        {"host.STRIX_DIST_WAIT_TIMEOUT_MS.serving_reason", "the reason line exists on the server only"},
+        // EXCEPTION for the user: exact prefill MoE table ring (1K -0.5 %), qualified with one engine owner only.
+        {"host.STRIX_MM_PF_TABLE_RING", "not qualified with several sessions sharing the engine"},
+        {"host.STRIX_MM_PF_TABLE_RING.serving_reason", "the reason line exists on the server only"},
     };
     gate("minimax", cli, server, allowed);
     // FAST prefill profile rows (mm_profile_table.hpp): every row is printed by both entry points and resolves the
@@ -171,14 +182,57 @@ void ds41() {
         return c;
     };
     static constexpr sp::Allowed allowed[] = {
-        {"arg:--engram-direct", "the resolver adds the flag for the CLI; the server has it as its built-in default"},
-        {"arg:--tp-attention", "the resolver adds the flag for the CLI; the server has it as its built-in default"},
         {"arg:--peer-timeout", "serving waits for the peer rank; the CLI starts both ranks together"},
         {"arg:--slots", "request slots exist on the server only"},
         {"arg:--prefill-path", "the server prefills prompts on the device batch path; the CLI's prompt goes through its decode windows"},
         {"arg:--prefill-rows", "row budget of the server's device prefill path (auto)"},
     };
     gate("ds41", config(pd::App::rank), config(pd::App::serve), allowed);
+}
+#endif
+
+#if defined(STRIX_PARITY_GEMMA4)
+// Gemma: strix-gemma4-decode calls parse_options, strix-gemma4-serve calls prepare_serve = parse_options + the serve
+// additions (src/gemma4/engine/runtime.cpp). Same request words through both; every option and profile entry compared.
+void gemma() {
+    namespace e = strix::gemma4::engine;
+    const auto config = [](const e::Options& o) {
+        sp::Config c;
+        c["model"] = o.model.generic_string();
+        c["rope"] = o.rope.generic_string();
+        c["backend"] = o.backend;
+        c["threads"] = std::to_string(o.threads);
+        c["streams"] = std::to_string(o.streams);
+        c["request.max_tokens"] = std::to_string(o.request.max_tokens);
+        std::string stops;
+        for (const auto id : o.request.stop_ids) stops += std::to_string(id) + ",";
+        c["request.stop_ids"] = stops;
+        c["request.temperature"] = std::to_string(o.request.sampling.temperature);
+        c["request.top_p"] = std::to_string(o.request.sampling.top_p);
+        c["request.top_k"] = std::to_string(o.request.sampling.top_k);
+        c["request.seed"] = std::to_string(o.request.sampling.seed);
+        c["request.dflash"] = std::to_string(static_cast<int>(o.request.dflash));
+        c["request.draft_k"] = std::to_string(o.request.draft_k);
+        c["draft"] = o.draft.generic_string();
+        c["draft_mtp"] = o.draft_mtp.generic_string();
+        c["profile"] = std::to_string(static_cast<int>(o.profile.name));
+        c["profile.app"] = std::to_string(static_cast<unsigned>(o.profile.app));
+        for (const auto& entry : o.profile.entries)
+            if (entry.lever) c["profile." + std::string(entry.lever->name)] = entry.value;
+        return c;
+    };
+    std::vector<std::string> words{"x", "--model", "/m/model.gguf", "--rope-tables", "/m/rope"};
+    std::vector<char*> argv;
+    for (auto& w : words) argv.push_back(w.data());
+    const auto cli = config(e::parse_options(static_cast<int>(argv.size()), argv.data()));
+    const auto served = e::prepare_serve(static_cast<int>(argv.size()), argv.data());
+    check(!served.exit_code, "gemma: prepare_serve accepts the CLI's request words");
+    static constexpr sp::Allowed allowed[] = {
+        // EXCEPTION for the user: the server sizes session-fixed choices (the EXL3 core identity) for the requests that
+        // can decode together (STRIX_G4_SERVE_SLOTS, default 8); the CLI runs one stream unless --streams N.
+        {"streams", "the server decodes up to STRIX_G4_SERVE_SLOTS requests together"},
+    };
+    gate("gemma", cli, config(served.options), allowed);
 }
 #endif
 
@@ -206,7 +260,13 @@ int main(int argc, char** argv) {
 #else
         std::cout << "skipped: ds41 (resolver not linked)\n";
 #endif
-        std::cout << "skipped: qwen (separate strix-qwen-effective-config-tests), gemma (no configuration parity fixture)\n";
+#if defined(STRIX_PARITY_GEMMA4)
+        std::cout << "included: gemma\n";
+        gemma();
+#else
+        std::cout << "skipped: gemma (strix_gemma4_engine not built)\n";
+#endif
+        std::cout << "qwen: strix-qwen-effective-config-tests (serve / CLI parity case)\n";
     } catch (const std::exception& e) {
         std::cerr << "FAIL: exception: " << e.what() << "\n";
         return 1;
