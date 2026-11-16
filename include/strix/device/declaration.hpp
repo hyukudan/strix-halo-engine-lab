@@ -1,5 +1,7 @@
 #pragma once
 
+#include "strix/device/link_class.hpp"
+
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -17,6 +19,18 @@
 //   memory_bytes = 102641958912                  # optional, informational
 //   roles = ["replica", "prefill"]               # empty or absent = no work
 //   attach = { kind = "pcie", pcie_gen = 4, pcie_width = 16, h2d_gbytes_ps = 0.0 }
+//
+//   [devices.halo-a]                             # a GPU in another machine, reached over the network
+//   vendor = "amd"
+//   pci = "0000:c3:00.0"
+//   roles = ["prefill", "decode"]
+//   attach = { kind = "remote", link = "2.5gbe" }        # link class: the one line that sets the link model
+//   # attach = { kind = "remote", link = "2.5gbe", port = "nic0", gbps_measured = 2.31, rtt_us_measured = 180 }
+//
+//   [links.pair]                                 # a direct link between two declared devices (not via this host)
+//   between = ["halo-a", "halo-b"]
+//   class = "usb4"                               # same classes as attach.link; measured keys override the class
+//   gbps_measured = 36.8                         # optional; rtt_us_measured and port as in attach
 //
 //   [devices.spare]
 //   vendor = "nvidia"
@@ -63,8 +77,25 @@ struct Attach {
     std::uint32_t pcie_gen = 0;  // negotiated, not the capability
     std::uint32_t pcie_width = 0;
     double h2d_gbytes_ps = 0.0;  // 0 = not probed
-    double gbps_measured = 0.0;  // remote only; 0 = not probed
+    double gbps_measured = 0.0;  // remote only: useful payload Gbit/s; 0 = not probed
     std::uint64_t rtt_us_measured = 0;
+    // Link class (device/link_class.hpp: 1gbe, 2.5gbe, 5gbe, 10gbe, 25gbe, usb4, usb4-gen2, pcie3x4, pcie4x4, pcie4x16,
+    // pcie5x16, oculink4x4). Nominal rates only; a measured key above always wins. Empty = derive from kind/pcie keys.
+    std::string link;
+    // Shared resource name: links that name the same port share its bandwidth. Default: "attach-remote" for a remote
+    // device (every remote device of one machine shares its network port unless declared otherwise), else
+    // "attach-<device id>" (a PCIe slot is its own resource).
+    std::string port;
+};
+
+// A declared link between two devices that does not pass through this machine (for example the cable of a pair).
+struct Link {
+    std::string name;
+    std::string a, b; // device ids of this declaration
+    std::string link; // class, as Attach::link (required)
+    double gbps_measured = 0.0;
+    std::uint64_t rtt_us_measured = 0;
+    std::string port; // shared resource; default "link-<name>"
 };
 
 struct Descriptor {
@@ -103,6 +134,7 @@ struct Declaration {
     std::string machine;
     std::vector<Descriptor> devices;
     std::vector<Policy> policies;
+    std::vector<Link> links;
 };
 
 // Throws std::invalid_argument naming the offending key.

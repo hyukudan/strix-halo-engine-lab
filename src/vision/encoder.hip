@@ -1,4 +1,5 @@
 // HIP runner of the shared vision encoder, arithmetic identity "vision-f16-v1" (class FAST).
+// The device projector (default on) uses the separate identity returned by effective_arithmetic().
 //
 // Every linear (patch embedding over flattened patches, qkv, out, MLP, projector) is the shared dense FP16 tall GEMM
 // (core/f16_dense_tall.hpp): weights as FP16 panels with a power-of-two tensor scale (undone exactly in the FP32
@@ -18,6 +19,7 @@
 #include "../core/f16_dense_tall.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -395,19 +397,36 @@ Panel make_panel(const Tensor& w, const Tensor& bias) {
     p.n = static_cast<unsigned>(w.rows);
     p.inp = layout::round_up(p.in, layout::kGemmIn);
     p.n16 = layout::round_up(p.n, layout::kGemmOut);
-    std::vector<float> f(w.size());
+    // Per-row magnitude in parallel (max is exact, so the split cannot change it), then the scale.
+    std::vector<float> row_top(p.n, 0.0F);
+    std::atomic<bool> nonfinite{false};
+    layout::parallel_ranges(p.n, p.in, [&](std::size_t o0, std::size_t o1) {
+        for (std::size_t o = o0; o < o1; ++o) {
+            float t = 0.0F;
+            for (std::size_t c = 0; c < p.in; ++c) {
+                const float v = w.at(o * p.in + c);
+                if (!std::isfinite(v)) {
+                    nonfinite = true;
+                    return;
+                }
+                t = std::max(t, std::fabs(v));
+            }
+            row_top[o] = t;
+        }
+    });
+    if (nonfinite) throw std::invalid_argument("vision encoder: nonfinite weight");
     float top = 0.0F;
-    for (std::size_t i = 0; i < f.size(); ++i) {
-        f[i] = w.at(i);
-        if (!std::isfinite(f[i])) throw std::invalid_argument("vision encoder: nonfinite weight");
-        top = std::max(top, std::fabs(f[i]));
-    }
+    for (const float t : row_top) top = std::max(top, t);
     // Largest magnitude lands in [2^13, 2^14): far from the FP16 overflow, small entries far from the subnormals.
     const int k = top > 0.0F ? std::clamp(13 - std::ilogb(top), -60, 60) : 0;
     p.inv = std::ldexp(1.0F, -k);
+    // v * 2^k == ldexp(v, k) bit for bit: 2^k (|k| <= 60) is a normal float and both round the exact product once.
+    const float scale = std::ldexp(1.0F, k);
     std::vector<_Float16> h(std::size_t{p.n16} * p.inp, static_cast<_Float16>(0.0F));
-    for (std::size_t o = 0; o < p.n; ++o)
-        for (std::size_t c = 0; c < p.in; ++c) h[o * p.inp + c] = static_cast<_Float16>(std::ldexp(f[o * p.in + c], k));
+    layout::parallel_ranges(p.n, p.in, [&](std::size_t o0, std::size_t o1) {
+        for (std::size_t o = o0; o < o1; ++o)
+            for (std::size_t c = 0; c < p.in; ++c) h[o * p.inp + c] = static_cast<_Float16>(w.at(o * p.in + c) * scale);
+    });
     std::vector<float> b(p.n16, 0.0F);
     if (bias)
         for (std::size_t o = 0; o < p.n; ++o) b[o] = bias.at(o);
@@ -427,6 +446,68 @@ Dev make_vector(const Tensor& t, unsigned n) {  // FP32 [n], zeros when the tens
     return d;
 }
 
+// Page-locked host buffer: the source of one asynchronous upload per encode (grows only).
+struct Pinned {
+    void* p = nullptr;
+    std::size_t n = 0;
+    Pinned() = default;
+    Pinned(const Pinned&) = delete;
+    Pinned& operator=(const Pinned&) = delete;
+    ~Pinned() { reset(); }
+    void reset() {
+        if (p) (void)hipHostFree(p);
+        p = nullptr;
+        n = 0;
+    }
+    void grow(std::size_t bytes) {
+        if (bytes <= n) return;
+        reset();
+        ck(hipHostMalloc(&p, bytes, hipHostMallocDefault), "hipHostMalloc");
+        n = bytes;
+    }
+};
+// Device scratch that grows only: a call with a shape seen before allocates nothing.
+void grow(Dev& d, std::size_t bytes) {
+    if (bytes > d.n) {
+        d.reset();
+        d = Dev(layout::aligned(bytes));
+    }
+}
+
+// Projector steps on the device. x[t][inp] = unshuffled hidden rows (zeros past the grid edge and in the pads).
+__global__ __launch_bounds__(256) void unshuffle_kernel(const float* hid, unsigned pitch, float* x, unsigned inp, unsigned in,
+                                                        unsigned ratio, unsigned row_major, unsigned grid_h, unsigned grid_w,
+                                                        unsigned mw, std::size_t count) {
+    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * 256U + threadIdx.x;
+    if (i >= count) return;
+    const unsigned t = static_cast<unsigned>(i / inp), j = static_cast<unsigned>(i % inp);
+    float v = 0.0F;
+    if (j < in) {
+        const unsigned rr = ratio * ratio, c = j / rr, slot = j % rr;
+        const unsigned dy = row_major ? slot / ratio : slot % ratio, dx = row_major ? slot % ratio : slot / ratio;
+        const unsigned gy = (t / mw) * ratio + dy, gx = (t % mw) * ratio + dx;
+        if (gy < grid_h && gx < grid_w) v = hid[(static_cast<std::size_t>(gy) * grid_w + gx) * pitch + c];
+    }
+    x[i] = v;
+}
+// The host activate() formula (src/vision/projector.cpp) in FP64, same operation order; this file is built without
+// contraction, so no step is fused.
+__device__ float activate_f64(unsigned act, float v) {
+    const double x = static_cast<double>(v);
+    if (act == 0U) return static_cast<float>(0.5 * x * (1.0 + erf(x * 0.70710678118654752440)));
+    if (act == 1U) return static_cast<float>(0.5 * x * (1.0 + tanh(0.79788456080286535588 * (x + 0.044715 * x * x * x))));
+    return static_cast<float>(x / (1.0 + exp(-x)));
+}
+// x[r][xstride] = act(y[r][ystride] columns < n), zero pads.
+__global__ __launch_bounds__(256) void project_act_kernel(const float* y, unsigned ystride, float* x, unsigned xstride, unsigned n,
+                                                          unsigned act, std::size_t count) {
+    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * 256U + threadIdx.x;
+    if (i >= count) return;
+    const std::size_t r = i / xstride;
+    const unsigned c = static_cast<unsigned>(i % xstride);
+    x[i] = c < n ? activate_f64(act, y[r * ystride + c]) : 0.0F;
+}
+
 struct Block {
     Panel qkv, out, mlp1, mlp2;
     Dev n1w, n1b, n2w, n2b;
@@ -443,6 +524,30 @@ struct Encoder::Impl {
     std::vector<Block> blocks;
     Dev fnw, fnb, failure, ws;
     std::unordered_map<const void*, Panel> projector;
+    // Workspace zeroing: the pads are never written, so a buffer already cleared for the same geometry (rows + tile
+    // ends) still holds zero pads; any other geometry moves the sub-buffers and is cleared again.
+    bool ws_clear = false;
+    unsigned ws_rows = 0;
+    std::vector<unsigned> ws_tiles;
+    Pinned stage;                                  // inputs of one encode (patches, position addend, cos, sin)
+    Dev px, py, pact, py2, plo, pylo, phid;        // projector / linear() scratch, grow only
+    std::uint64_t epoch = 0;                       // encodes run; EncoderOutput::device_epoch of a resident result
+    const std::shared_ptr<const void> owner = std::make_shared<const char>(char{0});
+    const float* hid = nullptr;                    // resident hidden rows of encode `epoch` (null: none)
+    unsigned hid_pitch = 0;
+
+    const Panel& panel_for(const Tensor& w, const Tensor& bias) {
+        auto it = projector.find(w.data);
+        if (it == projector.end()) it = projector.emplace(w.data, make_panel(w, bias)).first;
+        const Panel& p = it->second;
+        if (p.in != w.cols || p.n != w.rows) throw std::invalid_argument("vision encoder: linear panel reuse with another shape");
+        return p;
+    }
+    void drop_workspace() {
+        ws.reset();
+        ws_clear = false;
+        hid = nullptr;
+    }
 
     // y[rows][p.n16] = raw sums of x[rows][p.inp] (scale and bias are the caller's epilogue). With `lo`/`ylo`
     // (split activations) the FP16 rounding residue of x goes through a second GEMM and is added.
@@ -594,8 +699,16 @@ void Encoder::unload() {
     im.blocks.clear();
     im.fnw.reset();
     im.fnb.reset();
-    im.ws.reset();
+    im.drop_workspace();
     im.projector.clear();
+    im.px.reset();
+    im.py.reset();
+    im.pact.reset();
+    im.py2.reset();
+    im.plo.reset();
+    im.pylo.reset();
+    im.phid.reset();
+    im.stage.reset();
 }
 
 bool Encoder::loaded() const { return impl_->loaded; }
@@ -605,8 +718,10 @@ std::size_t Encoder::device_bytes() const {
     std::size_t b = im.patch.bytes() + im.fnw.n + im.fnb.n + im.ws.n + im.failure.n;
     for (const auto& d : im.blocks) b += d.qkv.bytes() + d.out.bytes() + d.mlp1.bytes() + d.mlp2.bytes() + d.n1w.n + d.n1b.n + d.n2w.n + d.n2b.n;
     for (const auto& [key, p] : im.projector) b += p.bytes();
-    return b;
+    return b + im.px.n + im.py.n + im.pact.n + im.py2.n + im.plo.n + im.pylo.n + im.phid.n;
 }
+
+std::size_t Encoder::pinned_host_bytes() const { return impl_->stage.n; }
 
 EncoderOutput Encoder::encode(const PatchGrid& grid, const PositionInputs& pos) {
     EncodeStats stats;
@@ -614,6 +729,29 @@ EncoderOutput Encoder::encode(const PatchGrid& grid, const PositionInputs& pos) 
 }
 
 EncoderOutput Encoder::encode(const PatchGrid& grid, const PositionInputs& pos, EncodeStats& stats) {
+    return run(grid, pos, stats, false);
+}
+
+EncoderOutput Encoder::encode_for_projection(const PatchGrid& grid, const PositionInputs& pos) {
+    EncodeStats stats;
+    return run(grid, pos, stats, project_device());
+}
+
+void Encoder::reserve(unsigned rows, unsigned tiles) {
+    auto& im = *impl_;
+    const EncoderPlan pl = plan(im.cfg, rows, tiles, im.opt);
+    if (im.ws.n < pl.workspace_bytes()) {
+        im.drop_workspace();
+        im.ws = Dev(pl.workspace_bytes());
+    }
+}
+
+void Encoder::prepare_linear(const Tensor& w, const Tensor& bias) {
+    if (!w) throw std::invalid_argument("vision encoder: prepare_linear operand");
+    (void)impl_->panel_for(w, bias);
+}
+
+EncoderOutput Encoder::run(const PatchGrid& grid, const PositionInputs& pos, EncodeStats& stats, bool keep_hidden) {
     auto& im = *impl_;
     const auto& c = im.cfg;
     if (!im.loaded) throw std::logic_error("vision encoder: encode before load");
@@ -628,12 +766,20 @@ EncoderOutput Encoder::encode(const PatchGrid& grid, const PositionInputs& pos, 
     const auto g = layout::geometry(c, N, slots, im.opt);
     const std::size_t need = g.fixed() + g.mlp();
     if (im.ws.n < need) {
-        im.ws.reset();
+        im.drop_workspace();
         im.ws = Dev(need);
     }
+    im.hid = nullptr;  // this encode overwrites the workspace
+    ++im.epoch;
     const auto stream = im.stream;
-    // Zero workspace: the GEMM input pads (in % 128) and the padded head components are never written afterwards.
-    ck(hipMemsetAsync(im.ws.p, 0, need, stream), "workspace clear");
+    // Zero workspace: the GEMM input pads (in % 128) and the padded head components are never written afterwards, so
+    // a workspace cleared for this geometry before still has them zero; another geometry moves them.
+    if (!im.ws_clear || im.ws_rows != N || im.ws_tiles != grid.tile_end) {
+        ck(hipMemsetAsync(im.ws.p, 0, need, stream), "workspace clear");
+        im.ws_clear = true;
+        im.ws_rows = N;
+        im.ws_tiles = grid.tile_end;
+    }
     ck(hipMemsetAsync(im.failure.p, 0, 4U, stream), "failure clear");
     std::size_t used = 0;
     const auto take = [&](std::size_t bytes) {
@@ -664,26 +810,33 @@ EncoderOutput Encoder::encode(const PatchGrid& grid, const PositionInputs& pos, 
     float* const mylo = f32(g.mylo);
     if (used != need) throw std::logic_error("vision encoder: workspace layout");
 
-    // Host -> device inputs (synchronous copies: the host buffers die at the end of this scope).
+    // Host -> device inputs: the four input buffers lead the workspace, so they are staged in page-locked memory
+    // (zeros in the pads, as the clear leaves them) and go up in one asynchronous copy behind the clear. The staging
+    // buffer is free again when this encode returns (it ends with a stream synchronisation).
     {
-        ck(hipStreamSynchronize(stream), "workspace clear");
+        const std::size_t prefix = static_cast<std::size_t>(reinterpret_cast<unsigned char*>(x) - static_cast<unsigned char*>(im.ws.p));
+        im.stage.grow(prefix);
+        auto* const base = static_cast<unsigned char*>(im.stage.p);
+        std::memset(base, 0, prefix);
+        const auto at = [&](const float* dev) {
+            return reinterpret_cast<float*>(base + (reinterpret_cast<const unsigned char*>(dev) - static_cast<unsigned char*>(im.ws.p)));
+        };
         if (g.pp == g.p) {
-            ck(hipMemcpy(dpatch, grid.data.data(), grid.data.size() * 4U, hipMemcpyHostToDevice), "patch upload");
+            std::memcpy(at(dpatch), grid.data.data(), grid.data.size() * 4U);
         } else {
-            std::vector<float> padded(std::size_t{N} * g.pp, 0.0F);
-            for (unsigned r = 0; r < N; ++r) std::memcpy(&padded[std::size_t{r} * g.pp], &grid.data[std::size_t{r} * g.p], std::size_t{g.p} * 4U);
-            ck(hipMemcpy(dpatch, padded.data(), padded.size() * 4U, hipMemcpyHostToDevice), "patch upload");
+            float* const hp = at(dpatch);
+            for (unsigned r = 0; r < N; ++r) std::memcpy(&hp[std::size_t{r} * g.pp], &grid.data[std::size_t{r} * g.p], std::size_t{g.p} * 4U);
         }
-        if (!pos.addend.empty()) ck(hipMemcpy(dpos, pos.addend.data(), pos.addend.size() * 4U, hipMemcpyHostToDevice), "position upload");
+        if (!pos.addend.empty()) std::memcpy(at(dpos), pos.addend.data(), pos.addend.size() * 4U);
         if (g.rope) {
-            std::vector<float> cs(pos.angles.size()), sn(pos.angles.size());
-            for (std::size_t i = 0; i < cs.size(); ++i) {
+            float* const cs = at(dcos);
+            float* const sn = at(dsin);
+            for (std::size_t i = 0; i < pos.angles.size(); ++i) {
                 cs[i] = static_cast<float>(std::cos(static_cast<double>(pos.angles[i])));
                 sn[i] = static_cast<float>(std::sin(static_cast<double>(pos.angles[i])));
             }
-            ck(hipMemcpy(dcos, cs.data(), cs.size() * 4U, hipMemcpyHostToDevice), "rotary upload");
-            ck(hipMemcpy(dsin, sn.data(), sn.size() * 4U, hipMemcpyHostToDevice), "rotary upload");
         }
+        ck(hipMemcpyAsync(im.ws.p, base, prefix, hipMemcpyHostToDevice, stream), "input upload");
     }
 
     im.linear(im.patch, dpatch, N, o, x, g.wp, false, lo, ylo);
@@ -740,13 +893,16 @@ EncoderOutput Encoder::encode(const PatchGrid& grid, const PositionInputs& pos, 
             stats.layer_ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tl).count());
         }
     }
-    if (c.final_norm) {
-        im.norm(x, nrm, g.wp, N, im.fnw, im.fnb);
-        out.hidden = im.download(nrm, g.wp, N, g.w);
-    } else {
-        out.hidden = im.download(x, g.wp, N, g.w);
-    }
+    const float* const hidden = c.final_norm ? nrm : x;
+    if (c.final_norm) im.norm(x, nrm, g.wp, N, im.fnw, im.fnb);
+    if (!keep_hidden) out.hidden = im.download(hidden, g.wp, N, g.w);
     im.check_failure();
+    if (keep_hidden) {  // valid until the next encode, reserve() or unload()
+        im.hid = hidden;
+        im.hid_pitch = g.wp;
+        out.device_epoch = im.epoch;
+        out.device_owner = im.owner;
+    }
     stats.total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return out;
 }
@@ -754,25 +910,75 @@ EncoderOutput Encoder::encode(const PatchGrid& grid, const PositionInputs& pos, 
 void Encoder::linear(const Tensor& w, const Tensor& bias, const float* x, std::size_t rows, float* y) {
     auto& im = *impl_;
     if (!w || !x || !y || !rows || rows > 0x00FFFFFFU) throw std::invalid_argument("vision encoder: linear operands");
-    auto it = im.projector.find(w.data);
-    if (it == im.projector.end()) it = im.projector.emplace(w.data, make_panel(w, bias)).first;
-    const Panel& p = it->second;
-    if (p.in != w.cols || p.n != w.rows) throw std::invalid_argument("vision encoder: linear panel reuse with another shape");
+    const Panel& p = im.panel_for(w, bias);
     const unsigned nr = static_cast<unsigned>(rows);
     std::vector<float> padded(rows * p.inp, 0.0F);
     for (std::size_t r = 0; r < rows; ++r) std::memcpy(&padded[r * p.inp], x + r * p.in, std::size_t{p.in} * 4U);
-    Dev dx(padded.size() * 4U), dy(rows * p.n16 * 4U), lo, ylo;
+    grow(im.px, padded.size() * 4U);
+    grow(im.py, rows * p.n16 * 4U);
     if (im.opt.split_activations) {
-        lo = Dev(dx.n);
-        ylo = Dev(dy.n);
+        grow(im.plo, padded.size() * 4U);
+        grow(im.pylo, rows * p.n16 * 4U);
     }
     ck(hipMemsetAsync(im.failure.p, 0, 4U, im.stream), "failure clear");
-    ck(hipStreamSynchronize(im.stream), "linear");
-    ck(hipMemcpy(dx.p, padded.data(), dx.n, hipMemcpyHostToDevice), "linear upload");
-    im.linear(p, dx.as<const float>(), nr, dy.as<float>(), dy.as<float>(), p.n16, false, lo.as<float>(), ylo.as<float>());
-    const std::vector<float> got = im.download(dy.as<const float>(), p.n16, nr, p.n);
+    ck(hipMemcpyAsync(im.px.p, padded.data(), padded.size() * 4U, hipMemcpyHostToDevice, im.stream), "linear upload");
+    float* const lo = im.opt.split_activations ? im.plo.as<float>() : nullptr;
+    float* const ylo = im.opt.split_activations ? im.pylo.as<float>() : nullptr;
+    im.linear(p, im.px.as<const float>(), nr, im.py.as<float>(), im.py.as<float>(), p.n16, false, lo, ylo);
+    const std::vector<float> got = im.download(im.py.as<const float>(), p.n16, nr, p.n);  // synchronises before `padded` dies
     im.check_failure();
     std::memcpy(y, got.data(), got.size() * 4U);
+}
+
+void Encoder::merge_project(const EncoderOutput& hidden, unsigned grid_h, unsigned grid_w, const MergeProjector& m, float* rows) {
+    auto& im = *impl_;
+    const bool resident = hidden.device_epoch != 0;
+    if (resident && (!hidden.resident_for(im.owner, im.epoch) || !im.hid))
+        throw std::logic_error("vision encoder: the device hidden rows of this output were overwritten");
+    if (!project_device()) {  // host graph through linear(); encode_for_projection() downloaded the rows
+        DenseOps::merge_project(hidden, grid_h, grid_w, m, rows);
+        return;
+    }
+    const unsigned R = m.ratio, W = hidden.width;
+    const auto geometry = layout::projector_geometry(hidden, grid_h, grid_w, m, rows, resident);
+    const unsigned mw = geometry.mw, tokens = geometry.tokens;
+    if (tokens > 0x00FFFFFFU) throw std::invalid_argument("vision encoder: merge projector rows");
+    const Panel& p1 = im.panel_for(m.w1, m.b1);
+    const Panel& p2 = im.panel_for(m.w2, m.b2);
+    const auto stream = im.stream;
+    const float* src = im.hid;
+    unsigned pitch = im.hid_pitch;
+    if (!resident) {  // host rows (a caller of encode()): one upload
+        grow(im.phid, hidden.hidden.size() * 4U);
+        ck(hipMemcpyAsync(im.phid.p, hidden.hidden.data(), hidden.hidden.size() * 4U, hipMemcpyHostToDevice, stream), "hidden upload");
+        src = im.phid.as<const float>();
+        pitch = W;
+    }
+    const std::size_t x1 = std::size_t{tokens} * p1.inp, y1 = std::size_t{tokens} * p1.n16, x2 = std::size_t{tokens} * p2.inp,
+                      y2 = std::size_t{tokens} * p2.n16;
+    grow(im.px, x1 * 4U);
+    grow(im.py, y1 * 4U);
+    grow(im.pact, x2 * 4U);
+    grow(im.py2, y2 * 4U);
+    float* lo = nullptr;
+    float* ylo = nullptr;
+    if (im.opt.split_activations) {
+        grow(im.plo, std::max(x1, x2) * 4U);
+        grow(im.pylo, std::max(y1, y2) * 4U);
+        lo = im.plo.as<float>();
+        ylo = im.pylo.as<float>();
+    }
+    ck(hipMemsetAsync(im.failure.p, 0, 4U, stream), "failure clear");
+    hipLaunchKernelGGL(unshuffle_kernel, dim3(blocks_of(x1)), dim3(256), 0, stream, src, pitch, im.px.as<float>(), p1.inp, p1.in, R,
+                       m.row_major ? 1U : 0U, grid_h, grid_w, mw, x1);
+    im.linear(p1, im.px.as<const float>(), tokens, im.py.as<float>(), im.py.as<float>(), p1.n16, false, lo, ylo);
+    const unsigned act = m.act == Activation::gelu ? 0U : m.act == Activation::gelu_tanh ? 1U : 2U;
+    hipLaunchKernelGGL(project_act_kernel, dim3(blocks_of(x2)), dim3(256), 0, stream, im.py.as<const float>(), p1.n16, im.pact.as<float>(),
+                       p2.inp, p1.n, act, x2);
+    im.linear(p2, im.pact.as<const float>(), tokens, im.py2.as<float>(), im.py2.as<float>(), p2.n16, false, lo, ylo);
+    const std::vector<float> got = im.download(im.py2.as<const float>(), p2.n16, tokens, p2.n);  // the one synchronisation
+    im.check_failure();
+    std::memcpy(rows, got.data(), got.size() * 4U);
 }
 
 void splice_rows(float* dst, std::size_t dst_stride, const std::uint16_t* src, unsigned width, const std::uint32_t* dst_row,

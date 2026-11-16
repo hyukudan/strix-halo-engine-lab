@@ -2778,6 +2778,17 @@
   },
   {
     "engine": "glm",
+    "name": "FAST fused attention core reads q-tilde as a bf16 image",
+    "flag_or_env": "STRIX_GLM_PF_MLA_QT16",
+    "default": "on wherever the FAST fused MLA core runs with the v3 absorb GEMM",
+    "exact": "Bitwise to the glm-pf-attn-wmma identity: the absorb GEMM keeps its FP32 chains and stores tile::to_bf16 of each result, the operand bits the core made of FP32 q-tilde. hip_glm_prefill_tests (STRIX_GLM_PF_TEST_ONLY=mla): o-bar, MLA output and guards equal for T 32 and T 16 with finite and NaN/Inf latents; layer bench arm 23 == 21; pair 8K logits of both ranks equal in every A/B run.",
+    "gain": "Pair FAST 8K, warm: 8.617 -> 8.524 s median (-99 ms, 3 ABAB pairs: -196 / -50 / -99 ms), 951 -> 961 tok/s, GPU clocks per token 2894k -> 2845k; layer bench C 4096: absorb 9.52 -> 7.37 ms, fused core 27.74 -> 26.37 ms per launch.",
+    "preconditions": "STRIX_GLM_PF_WMMA=1 with the fused core (STRIX_GLM_PF_ATTN_WMMA not 0), 32 heads per rank, absorb GEMM v3 (the default); other GEMM versions keep FP32 q-tilde.",
+    "off_switch": "STRIX_GLM_PF_MLA_QT16=0 (FP32 q-tilde, same bits)",
+    "doc_anchor": "docs/optimizations.md#glm-pf-mla-qt16"
+  },
+  {
+    "engine": "glm",
     "name": "Server batched MTP verify",
     "flag_or_env": "STRIX_GLM_SERVE_G2",
     "default": "on (with MTP)",

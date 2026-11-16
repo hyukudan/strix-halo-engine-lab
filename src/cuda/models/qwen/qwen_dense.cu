@@ -378,6 +378,128 @@ template <Store S> cudaError_t launch_rows(cudaStream_t stream, const KSite& k, 
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// Decode projection, K-split form (rows <= 8; default, STRIX_QRTX_ROWS_KSPLIT=0 = project_rows_kernel). Same chain per
+// (row, output) as project_rows_kernel: acc = fma(dw * delta, float(dot_b), acc) over blocks b ascending, so the outputs
+// are bit-identical. Only the integer block dots (exact, order-free) are computed K-parallel: warp w owns blocks
+// 8w .. 8w + 7 (quad j = block 8w + j, lane q = codes 8q .. 8q + 7 as above) and keeps their activation codes in
+// registers, then walks the CTA's kKsOut outputs reading 272 contiguous weight bytes per output (the old mapping read 8
+// rows per warp instruction) and leaves the finished dots in shared memory. One thread per (output, row) then runs the
+// FP32 chain in block order. A CTA covers kKsOut outputs, so 2,560-output projections fill the card (320 CTAs, was 80)
+// and the activations are read once per CTA from L1 instead of being staged per 32 outputs.
+constexpr unsigned kKsOut = 8;
+bool rows_ksplit_enabled() {
+    static const bool on = strix::envcfg::flag("STRIX_QRTX_ROWS_KSPLIT", true);
+    return on;
+}
+template <Store S, unsigned R, unsigned RP>
+__global__ __launch_bounds__(1024) void project_rows_ks_kernel(KSite site, const std::int8_t* codes, const float* deltas,
+                                                              std::uint32_t pitch) {
+    extern __shared__ __align__(16) unsigned char smem[];
+    const std::uint32_t width = site.width, nblocks = width / 32U, row_bytes = nblocks * 34U;
+    auto* DOT = reinterpret_cast<int*>(smem);                                         // [nblocks][kKsOut][RP]
+    auto* DW = reinterpret_cast<float*>(smem + nblocks * kKsOut * RP * 4U);          // [nblocks][kKsOut]
+    auto* D = DW + nblocks * kKsOut;                                                  // [nblocks][RP]
+    for (std::uint32_t i = threadIdx.x; i < RP * nblocks; i += blockDim.x)
+        D[i] = i % RP < R ? deltas[static_cast<std::uint64_t>(i / RP) * pitch + i % RP] : 0.0F;
+    const unsigned lane = threadIdx.x & 31U, q = lane & 3U;
+    const std::uint32_t blk = (threadIdx.x >> 5U) * 8U + (lane >> 2U);
+    const bool active = blk < nblocks;
+    std::uint32_t a0[RP], a1[RP];
+#pragma unroll
+    for (unsigned r = 0; r < RP; ++r) {
+        const auto* a = reinterpret_cast<const std::uint32_t*>(codes + static_cast<std::uint64_t>(r) * width) + blk * 8U + 2U * q;
+        a0[r] = active && r < R ? a[0] : 0U;
+        a1[r] = active && r < R ? a[1] : 0U;
+    }
+    constexpr unsigned OWN = RP >= 4U ? RP / 4U : RP;
+    const unsigned first = RP >= 4U ? (q >> 1U) * (RP / 2U) + (q & 1U) * (RP / 4U) : 0U;
+    const std::uint32_t n0 = blockIdx.x * kKsOut;
+#pragma unroll 2
+    for (unsigned o = 0; o < kKsOut; ++o) {
+        const std::uint32_t n = n0 + o;
+        const bool valid = active && n < site.outputs;
+        const unsigned char* wrow = site.seg[0].w;
+        if (n < site.outputs) {
+            const KSeg& sg = site.seg[find_seg(site, n)];
+            wrow = sg.w + static_cast<std::uint64_t>(n - sg.begin) * row_bytes;
+        }
+        const auto* h = reinterpret_cast<const unsigned short*>(wrow + 34U * (active ? blk : 0U));
+        const float dw = __half2float(__ushort_as_half(valid ? h[0] : static_cast<unsigned short>(0)));
+        const unsigned short* c = h + 1U + 4U * q;
+        const std::uint32_t w0 = valid ? static_cast<std::uint32_t>(c[0]) | (static_cast<std::uint32_t>(c[1]) << 16U) : 0U;
+        const std::uint32_t w1 = valid ? static_cast<std::uint32_t>(c[2]) | (static_cast<std::uint32_t>(c[3]) << 16U) : 0U;
+        int dot[RP];
+#pragma unroll
+        for (unsigned r = 0; r < RP; ++r)
+            dot[r] = __dp4a(static_cast<int>(w1), static_cast<int>(a1[r]), __dp4a(static_cast<int>(w0), static_cast<int>(a0[r]), 0));
+        if constexpr (RP >= 4U) {
+            const bool hi2 = (q & 2U) != 0U, hi1 = (q & 1U) != 0U;
+#pragma unroll
+            for (unsigned i = 0; i < RP / 2U; ++i) {
+                const int keep = hi2 ? dot[i + RP / 2U] : dot[i], send = hi2 ? dot[i] : dot[i + RP / 2U];
+                dot[i] = keep + __shfl_xor_sync(0xffffffffU, send, 2);
+            }
+#pragma unroll
+            for (unsigned i = 0; i < RP / 4U; ++i) {
+                const int keep = hi1 ? dot[i + RP / 4U] : dot[i], send = hi1 ? dot[i] : dot[i + RP / 4U];
+                dot[i] = keep + __shfl_xor_sync(0xffffffffU, send, 1);
+            }
+        } else {
+#pragma unroll
+            for (unsigned r = 0; r < RP; ++r) {
+                dot[r] += __shfl_xor_sync(0xffffffffU, dot[r], 1);
+                dot[r] += __shfl_xor_sync(0xffffffffU, dot[r], 2);
+            }
+        }
+        if (active && (RP >= 4U || q == 0U)) {
+            int* out = DOT + (blk * kKsOut + o) * RP + first;
+#pragma unroll
+            for (unsigned i = 0; i < OWN; ++i) out[i] = dot[i];
+            if (q == 0U) DW[blk * kKsOut + o] = dw;
+        }
+    }
+    __syncthreads();
+    for (std::uint32_t t = threadIdx.x; t < kKsOut * R; t += blockDim.x) {
+        const std::uint32_t o = t / R, r = t % R, n = n0 + o;
+        if (n >= site.outputs) continue;
+        float acc = 0.0F;
+        for (std::uint32_t b = 0; b < nblocks; ++b) {
+            const float p = __fmul_rn(DW[b * kKsOut + o], D[b * RP + r]);                       // v_mul_f32 dw * delta
+            acc = __fmaf_rn(p, static_cast<float>(DOT[(b * kKsOut + o) * RP + r]), acc);        // v_fmac_f32
+        }
+        store_value<S>(site, r, n, acc);
+    }
+}
+
+template <Store S, unsigned R> cudaError_t launch_rows_ks_r(cudaStream_t stream, const KSite& k, const std::int8_t* codes,
+                                                           const float* deltas, std::uint32_t pitch) {
+    constexpr unsigned RP = R <= 1U ? 1U : R <= 2U ? 2U : R <= 4U ? 4U : 8U;
+    const std::uint32_t nb = k.width / 32U, smem = nb * (kKsOut * RP + kKsOut + RP) * 4U;
+    static std::once_flag once;
+    static cudaError_t attr = cudaSuccess;
+    std::call_once(once, [] {
+        attr = cudaFuncSetAttribute(project_rows_ks_kernel<S, R, RP>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    256 * (kKsOut * 8 + kKsOut + 8) * 4);
+    });
+    if (attr != cudaSuccess) return attr;
+    project_rows_ks_kernel<S, R, RP><<<(k.outputs + kKsOut - 1U) / kKsOut, 32U * ((nb + 7U) / 8U), smem, stream>>>(k, codes, deltas, pitch);
+    return cudaGetLastError();
+}
+template <Store S> cudaError_t launch_rows_ks(cudaStream_t stream, const KSite& k, std::uint32_t rows, const std::int8_t* codes,
+                                              const float* deltas, std::uint32_t pitch) {
+    switch (rows) {
+    case 1: return launch_rows_ks_r<S, 1>(stream, k, codes, deltas, pitch);
+    case 2: return launch_rows_ks_r<S, 2>(stream, k, codes, deltas, pitch);
+    case 3: return launch_rows_ks_r<S, 3>(stream, k, codes, deltas, pitch);
+    case 4: return launch_rows_ks_r<S, 4>(stream, k, codes, deltas, pitch);
+    case 5: return launch_rows_ks_r<S, 5>(stream, k, codes, deltas, pitch);
+    case 6: return launch_rows_ks_r<S, 6>(stream, k, codes, deltas, pitch);
+    case 7: return launch_rows_ks_r<S, 7>(stream, k, codes, deltas, pitch);
+    default: return launch_rows_ks_r<S, 8>(stream, k, codes, deltas, pitch);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // rows_shared_activation_scalar_kernel (src/hip_shared_expert_launcher.hip:535-562), 256 threads, blockIdx.y = row.
 __global__ __launch_bounds__(256) void shared_activation_kernel(float* workspace_base, std::uint64_t workspace_stride,
                                                                 const std::uint16_t* input_base, std::uint64_t input_stride,
@@ -409,7 +531,9 @@ __global__ __launch_bounds__(256) void shared_activation_kernel(float* workspace
 
 template <Store S> cudaError_t launch_project(cudaStream_t stream, const KSite& k, std::uint32_t rows, const std::int8_t* codes,
                                               const float* deltas, std::uint32_t pitch) {
-    if (rows <= 8U && k.width <= 6144U && decode_rows_enabled()) return launch_rows<S>(stream, k, rows, codes, deltas, pitch);
+    if (rows <= 8U && k.width <= 6144U && decode_rows_enabled())
+        return rows_ksplit_enabled() ? launch_rows_ks<S>(stream, k, rows, codes, deltas, pitch)
+                                     : launch_rows<S>(stream, k, rows, codes, deltas, pitch);
     static std::once_flag once;
     static cudaError_t attr = cudaSuccess;
     std::call_once(once, [] { attr = cudaFuncSetAttribute(project_kernel<S>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem); });
