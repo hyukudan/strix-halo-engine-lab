@@ -2788,6 +2788,28 @@
     "doc_anchor": "docs/optimizations.md#glm-pf-mla-qt16"
   },
   {
+    "engine": "deepseek41",
+    "name": "DS41 FAST flash reads q as a bf16 image after RoPE",
+    "flag_or_env": "STRIX_DS41_FAST_ATTN_Q16",
+    "default": "on in ds41-attn-bf16flash-v1 layers when q_b runs on dense-q8a8-f16-v1",
+    "exact": "Bitwise: the q_b epilogue applies the flash prologue's rope_pair and tile::to_bf16; fast-dense test 0 differing values, pair 11,594 logits fnv equal in 12 processes.",
+    "gain": "q_b 2048x1024x8192 1.505 -> 1.352 ms; pair 11,594 warm ABAB +15/+30/-29 ms (no wall gain beyond noise).",
+    "preconditions": "STRIX_DS41_FAST_ATTN=2 flash layers, q_b on the FAST dense core (rows >= STRIX_DS41_FAST_DENSE_MIN_ROWS); other q_b forms keep FP32 q.",
+    "off_switch": "STRIX_DS41_FAST_ATTN_Q16=0 (FP32 q, same bits)",
+    "doc_anchor": "docs/optimizations.md#ds41-pf-flash-q16"
+  },
+  {
+    "engine": "minimax",
+    "name": "MiniMax MSA FAST flash reads q as a bf16 image after norm + RoPE",
+    "flag_or_env": "STRIX_MM_PF_MSA_Q16",
+    "default": "on in MSA mode 11 / 12 layers when q comes from the v4 dense core",
+    "exact": "Bitwise: dense_finish_kernel runs the same msa::norm_rope_lane and pack2; test_prefill_dense image + lo equal at T 9..4096; pair 8K state fnv equal in 6 runs.",
+    "gain": "pair 8K warm ABAB -1.87/-1.10/-0.50 s (directional; larger than the byte saving explains, being traced).",
+    "preconditions": "STRIX_MM_PF_MSA_FLASH flash layers, n > 8, v4 dense qkv (n >= 1024); library-GEMM rows keep FP32 q.",
+    "off_switch": "STRIX_MM_PF_MSA_Q16=0 (FP32 q, same bits)",
+    "doc_anchor": "docs/optimizations.md#mm-pf-msa-q16"
+  },
+  {
     "engine": "glm",
     "name": "Server batched MTP verify",
     "flag_or_env": "STRIX_GLM_SERVE_G2",

@@ -78,7 +78,8 @@ void enqueue_index_proj_diag(const IndexProjView& v, int mode, hipStream_t strea
 // The events are the caller's and must not be re-recorded while a previous record of them may still be pending (the
 // installed HIP 10.1 runtime leaves that undefined): e.g. one pair per layer, reused only after the per-step sync
 // when the caller synchronizes once per step, or a pool reset after a full synchronization.
-void index_proj_fork(const IndexProjView& v, hipStream_t main, hipStream_t side, hipEvent_t forked);
+// fast_xt != nullptr: the side stream runs enqueue_index_proj_fast (FAST identity) with that x16 workspace.
+void index_proj_fork(const IndexProjView& v, hipStream_t main, hipStream_t side, hipEvent_t forked, _Float16* fast_xt = nullptr);
 void index_proj_join(hipStream_t main, hipStream_t side, hipEvent_t joined);
 
 }  // namespace strix::minimax::attn

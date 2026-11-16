@@ -11,6 +11,7 @@
 // explicit per-item value still wins in both modes. apply() exports each unset item's resolved value into the process
 // environment, so the readers in the engine, the exchange modules and the dist layer see exactly what
 // --print-effective-config prints.
+#include "strix/pair/regime.hpp"
 #include <cstdint>
 #include <cstddef>
 #include <functional>
@@ -59,17 +60,27 @@ struct PrefillPolicy {
     std::string msa_flash_layers;                  // layer set text the engine parses (builtin kMsaFlashLayers)
     std::string msa_flash_layers_requested;        // original layer syntax, for provenance only
     std::string msa_flash_asked;                   // "default", the explicit value, or "fast_prefill" (bundle)
+    bool idx_wmma = false;                         // index projections on the shared FP16 WMMA core (prefill rows > 8)
+    std::string idx_wmma_layers;                   // canonical ranges of its layer set (builtin kIdxWmmaLayers)
+    std::string idx_wmma_asked;                    // "default" or the explicit value
     std::string policies;                          // named FAST policies that run, '+'-joined; empty: none
     std::string note;                              // why a bundle member does not run; empty: none
 };
 // Static execution guards, also used by the engine receipt after runtime control changes.
 const char* msa_flash_decline_reason(bool rework, bool fused, unsigned layers);
 PrefillPolicy prefill_policy(const Lookup& env);
+// Reference estimate using the shared pair rule and 8K FAST costs, extrapolated to rows. Assumes +41.6 GB/node
+// for whole stage layers and 31 GB free; neither is a runtime measurement or pipeline qualification.
+// Execution stays TP2: slices are fixed at load (engine.hip:89-91,1120-1131), with no pipeline implementation.
+// The returned choice is diagnostic only and must never select the execution route.
+strix::pair::PipelineChoice pair_pipeline_choice(std::uint64_t rows);
 const profile::Engine& profile_engine();                 // tag "minimax-pair", table profile_table
 profile::Resolution profile_resolution(const Lookup& env);
 // Cache / receipt identity of the active prefill policies; empty with every governed row at its builtin and the EXL3
 // MoE format. This field's omission alone does not establish complete cache compatibility.
 std::string prefill_identity(const Lookup& env);
+// Policy id of the index projection member for a canonical layer set ("minimax-index-proj-wmma-v1-l40-59").
+std::string idx_wmma_policy(const std::string& layers);
 // Rank agreement of the profile rows (strix::profile::check_peer over the process environment): both ranks call it at
 // the same startup point with the control-channel byte exchange; a mismatch throws naming both fingerprints.
 void check_peer(const std::function<void(const void*, void*, std::size_t)>& exchange);

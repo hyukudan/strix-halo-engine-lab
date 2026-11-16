@@ -29,7 +29,9 @@
 //       __shfl_down tree adds (+146..).
 #include "../../weight/arch/sm120_sources.cuh"
 #include "strix/env_flags.hpp"
+#include "strix/lever.hpp"
 #include "strix/cuda/qwen_hc.hpp"
+#include "strix/cuda/amd_math.cuh"
 #include "../../core/mma_tile.cuh"
 
 #include <cuda_fp16.h>
@@ -47,6 +49,25 @@ namespace am = strix::cuda::amdmath;
 
 void check(cudaError_t e, const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string("qwen_hc ") + what + ": " + cudaGetErrorString(e));
+}
+
+// STRIX_QRTX_HC_COMPACT_NORM=0: the HC mix stores and re-reads the full FP32 normalized rows (40 KB per row). Bitwise
+// (exact and FAST tiled paths): the projection and output kernels rebuild each normalized value from the BF16 input and
+// the stored per-(row, stream) inverse with the norm kernel's own two roundings.
+inline constexpr strix::lever::Decl hc_compact_norm_lever{
+    .name = "qwen_hc_compact_norm", .env = "STRIX_QRTX_HC_COMPACT_NORM", .exactness = strix::lever::Exactness::bitwise,
+    .default_on = true, .source = "scripts/bench/cuda/qwen_fast/ident.sh: exact and FAST logit dumps byte-identical on/off"};
+bool hc_compact_norm_enabled() {
+    static const bool on = strix::lever::select(hc_compact_norm_lever, {}).on;
+    return on;
+}
+// STRIX_QRTX_HC_INJECT_VEC=0: the scalar inject kernel (one element per thread). Bitwise.
+inline constexpr strix::lever::Decl hc_inject_vec_lever{
+    .name = "qwen_hc_inject_vec", .env = "STRIX_QRTX_HC_INJECT_VEC", .exactness = strix::lever::Exactness::bitwise,
+    .default_on = true, .source = "scripts/bench/cuda/qwen_fast/ident.sh: exact and FAST logit dumps byte-identical on/off"};
+bool hc_inject_vec_enabled() {
+    static const bool on = strix::lever::select(hc_inject_vec_lever, {}).on;
+    return on;
 }
 
 __device__ __forceinline__ float bf16_to_float(std::uint16_t v) { return __uint_as_float(static_cast<std::uint32_t>(v) << 16U); }
@@ -100,6 +121,28 @@ __global__ void hc_pack_kernel(const unsigned char* __restrict__ down, const uns
 
 // ---------------------------------------------------------------------------------------------------------------------
 // [N] rows_prepare_hyper_norm_kernel (hip_hyper_mix_launcher.hip:1757-1776): one block per (row, stream), 256 threads.
+// Compact (lever qwen_hc_compact_norm, tiled paths): only the inverse is stored, at normalized[row][stream]
+// (the wide part of the row is otherwise unused); the consumers rebuild (x * inverse) * w from the BF16 input with the
+// same two roundings (norm_value), so every value they use is bit-identical while 40 KB per row are neither written
+// nor read twice.
+__device__ __forceinline__ float norm_value(std::uint16_t x, float inverse, float w) {
+    return __fmul_rn(__fmul_rn(bf16_to_float(x), inverse), w);
+}
+// Four normalized values of features col..col+3 (col % 4 == 0, inside one stream) of one row: the stored FP32 values,
+// or (Compact) the bit-identical rebuild from the BF16 input and the stored inverse.
+template <bool Compact>
+__device__ __forceinline__ float4 load_x4(const float* x_rows, const std::uint16_t* xin, const float* xnorm, std::size_t row, unsigned col) {
+    if constexpr (Compact) {
+        const uint2 v = *reinterpret_cast<const uint2*>(xin + row * kWide + col);
+        const float inv = x_rows[row * kNormalizedPitch + col / kHidden];
+        const float4 w = *reinterpret_cast<const float4*>(xnorm + col);
+        return make_float4(norm_value(static_cast<std::uint16_t>(v.x), inv, w.x), norm_value(static_cast<std::uint16_t>(v.x >> 16U), inv, w.y),
+                           norm_value(static_cast<std::uint16_t>(v.y), inv, w.z), norm_value(static_cast<std::uint16_t>(v.y >> 16U), inv, w.w));
+    } else {
+        return *reinterpret_cast<const float4*>(x_rows + row * kNormalizedPitch + col);
+    }
+}
+template <bool Compact = false>
 __global__ __launch_bounds__(256) void hc_norm_kernel(const std::uint16_t* __restrict__ input, const float* __restrict__ norm,
     float epsilon, float* __restrict__ normalized, am::Tables t) {
     const unsigned row = blockIdx.x, stream = blockIdx.y, lane = threadIdx.x;
@@ -126,7 +169,9 @@ __global__ __launch_bounds__(256) void hc_norm_kernel(const std::uint16_t* __res
 #pragma unroll
         for (unsigned stride = 8U; stride > 0U; stride >>= 1U) v = __fadd_rn(v, __shfl_down_sync(0xffffffffU, v, stride));
         if (lane == 0U) inverse = am::amd_rsqrtf(t, __fadd_rn(__fdiv_rn(v, static_cast<float>(kHidden)), epsilon));
+        if (Compact && lane == 0U) normalized[static_cast<std::size_t>(row) * kNormalizedPitch + stream] = inverse;
     }
+    if constexpr (Compact) return;
     __syncthreads();
     const float inv = inverse;
     const float* w = norm + stream * kHidden;
@@ -163,9 +208,11 @@ template <unsigned Level> __device__ __forceinline__ void fold_level(float (&acc
 }
 
 // x_rows and low_rows are the same workspace (normalized part read, low part written): no __restrict__ on them.
+template <bool Compact = false>
 __global__ __launch_bounds__(256, 1) void hc_projection_kernel(const float* x_rows, std::uint32_t rows,
     const std::int8_t* __restrict__ down_codes, const float* __restrict__ down_scales, const float* __restrict__ inject,
-    float* low_rows, float* __restrict__ injection, am::Tables t) {
+    float* low_rows, float* __restrict__ injection, am::Tables t, const std::uint16_t* __restrict__ xin = nullptr,
+    const float* __restrict__ xnorm = nullptr) {
     __shared__ float4 xs[2][kProjRows][32];
     const unsigned warp = threadIdx.x / 32U, lane = threadIdx.x % 32U, row0 = blockIdx.y * kProjRows;
     const bool is_inject = blockIdx.x >= kProjLowBlocks;
@@ -179,8 +226,7 @@ __global__ __launch_bounds__(256, 1) void hc_projection_kernel(const float* x_ro
             const unsigned e = threadIdx.x + 256U * m, r = e / 32U, k = e % 32U;
             float4 v = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
             if (row0 + r < rows)
-                v = *reinterpret_cast<const float4*>(x_rows + static_cast<std::size_t>(row0 + r) * kNormalizedPitch +
-                    (chunk / 5U) * 640U + (chunk % 5U) * 128U + k * 4U);
+                v = load_x4<Compact>(x_rows, xin, xnorm, row0 + r, (chunk / 5U) * 640U + (chunk % 5U) * 128U + k * 4U);
             xs[buffer][r][k] = v;
         }
     };
@@ -188,8 +234,8 @@ __global__ __launch_bounds__(256, 1) void hc_projection_kernel(const float* x_ro
 #pragma unroll
         for (unsigned m = 0; m < 2U; ++m) {
             const unsigned e = threadIdx.x + 256U * m, r = e / 32U, k = e % 32U;
-            next[m] = row0 + r < rows ? *reinterpret_cast<const float4*>(x_rows + static_cast<std::size_t>(row0 + r) *
-                kNormalizedPitch + (chunk / 5U) * 640U + (chunk % 5U) * 128U + k * 4U) : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+            next[m] = row0 + r < rows ? load_x4<Compact>(x_rows, xin, xnorm, row0 + r, (chunk / 5U) * 640U + (chunk % 5U) * 128U + k * 4U)
+                                      : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
         }
     };
 
@@ -292,10 +338,10 @@ __global__ __launch_bounds__(256, 1) void hc_projection_kernel(const float* x_ro
 // contracts `gate += low * c` to v_fmac_f32 and the mix to v_fma(.., 0)/v_fmac: the same DAG, so no change).
 constexpr unsigned kOutRows = 32U, kOutThreads = 128U;
 
-template <bool Fused>
+template <bool Fused, bool Compact = false>
 __global__ __launch_bounds__(128) void hc_output_kernel(const float* __restrict__ normalized, std::uint32_t rows,
     const std::uint32_t* __restrict__ up_codes, const float* __restrict__ up_scales, std::uint16_t* __restrict__ output,
-    float* __restrict__ gates, am::Tables t) {
+    float* __restrict__ gates, am::Tables t, const std::uint16_t* __restrict__ xin = nullptr, const float* __restrict__ xnorm = nullptr) {
     __shared__ __align__(16) float lows[kRank][kOutRows];
     const unsigned row0 = blockIdx.x * kOutRows, f = blockIdx.y * kOutThreads + threadIdx.x;
     for (unsigned idx = threadIdx.x; idx < kRank * kOutRows; idx += kOutThreads) {
@@ -360,7 +406,14 @@ __global__ __launch_bounds__(128) void hc_output_kernel(const float* __restrict_
         const float* n = normalized + static_cast<std::size_t>(row0 + r) * kNormalizedPitch + f;
         float mixed = 0.0F;
 #pragma unroll
-        for (unsigned s = 0; s < kStreams; ++s) mixed = __fmaf_rn(n[s * kHidden], amd_sigmoid(t, g[s][r]), mixed);
+        for (unsigned s = 0; s < kStreams; ++s) {
+            float nv;
+            if constexpr (Compact)   // bit-identical rebuild (norm_value); the inverse sits at normalized[row][s]
+                nv = norm_value(xin[static_cast<std::size_t>(row0 + r) * kWide + s * kHidden + f],
+                                normalized[static_cast<std::size_t>(row0 + r) * kNormalizedPitch + s], xnorm[s * kHidden + f]);
+            else nv = n[s * kHidden];
+            mixed = __fmaf_rn(nv, amd_sigmoid(t, g[s][r]), mixed);
+        }
         output[static_cast<std::size_t>(row0 + r) * kHidden + f] = float_to_bf16(__fmul_rn(mixed, 0.25F));
     }
 }
@@ -390,10 +443,11 @@ struct ProjCfg {
     static constexpr unsigned kSmem = 2U * kRowsCta * kMmaPitch * 2U + 2U * kOutCta * kMmaCodePitch + 2U * kOutCta * 8U;
 };
 
-template <unsigned MT, unsigned NW>
+template <unsigned MT, unsigned NW, bool Compact = false>
 __global__ __launch_bounds__(NW * 32U, 1) void hc_projection_mma_kernel(const float* x_rows, std::uint32_t rows,
     const std::int8_t* __restrict__ down_codes, const float* __restrict__ down_scales, const float* __restrict__ inject,
-    float* low_rows, float* __restrict__ injection, am::Tables t_) {
+    float* low_rows, float* __restrict__ injection, am::Tables t_, const std::uint16_t* __restrict__ xin,
+    const float* __restrict__ xnorm) {
     using Cfg = ProjCfg<MT, NW>;
     constexpr unsigned kT = Cfg::kThreads, kBM = Cfg::kRowsCta, kNR = Cfg::kOutCta;
     constexpr unsigned kXI = (kBM * 16U + kT - 1U) / kT, kSI = (kNR + kT - 1U) / kT, kIK = (MT + NW - 1U) / NW;
@@ -412,8 +466,9 @@ __global__ __launch_bounds__(NW * 32U, 1) void hc_projection_mma_kernel(const fl
         for (unsigned i = 0; i < kXI; ++i) {
             const unsigned e = tid + kT * i, r = e >> 4U, m4 = e & 15U;
             xr[i] = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
-            if (e < kBM * 16U && row0 + r < rows)
-                xr[i] = *reinterpret_cast<const float4*>(x_rows + static_cast<std::size_t>(row0 + r) * kNormalizedPitch + c * 64U + m4 * 4U);
+            if (e < kBM * 16U && row0 + r < rows) {
+                xr[i] = load_x4<Compact>(x_rows, xin, xnorm, row0 + r, c * 64U + m4 * 4U);   // 64-chunks stay in one stream
+            }
         }
 #pragma unroll
         for (unsigned i = 0; i < kSI; ++i) {
@@ -567,20 +622,25 @@ __global__ __launch_bounds__(NW * 32U, 1) void hc_projection_mma_kernel(const fl
     }
 }
 
-template <unsigned MT, unsigned NW>
-void launch_projection_mma(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream) {
+template <unsigned MT, unsigned NW, bool Compact>
+void launch_projection_mma_c(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream) {
     using Cfg = ProjCfg<MT, NW>;
     static const bool attr = [] {
-        check(cudaFuncSetAttribute(hc_projection_mma_kernel<MT, NW>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(Cfg::kSmem)),
-            "mma projection attr");
+        check(cudaFuncSetAttribute(hc_projection_mma_kernel<MT, NW, Compact>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(Cfg::kSmem)), "mma projection attr");
         return true;
     }();
     (void)attr;
-    hc_projection_mma_kernel<MT, NW><<<dim3((a.rows + Cfg::kRowsCta - 1U) / Cfg::kRowsCta, 8U / NW), Cfg::kThreads, Cfg::kSmem, stream>>>(
-        a.normalized, a.rows, a.packed.down_codes, a.packed.down_scales, a.inject, a.normalized, a.injection, tables);
+    hc_projection_mma_kernel<MT, NW, Compact><<<dim3((a.rows + Cfg::kRowsCta - 1U) / Cfg::kRowsCta, 8U / NW), Cfg::kThreads, Cfg::kSmem, stream>>>(
+        a.normalized, a.rows, a.packed.down_codes, a.packed.down_scales, a.inject, a.normalized, a.injection, tables, a.input, a.norm);
+}
+template <unsigned MT, unsigned NW>
+void launch_projection_mma(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream, bool compact) {
+    if (compact) launch_projection_mma_c<MT, NW, true>(a, tables, stream);
+    else launch_projection_mma_c<MT, NW, false>(a, tables, stream);
 }
 // Tile shape per row count: fill the 188 SMs (one wave, no tail) while keeping the weight re-reads (per row tile) low.
-void projection_mma(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream) {
+void projection_mma(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream, bool compact) {
     struct Opt { unsigned mt, nw; };
     static const Opt opts[] = {{4U, 8U}, {3U, 8U}, {2U, 8U}, {4U, 4U}, {2U, 4U}, {1U, 4U}};
     unsigned best = 0; double best_cost = 1e30;
@@ -594,12 +654,12 @@ void projection_mma(const HcMixArgs& a, const am::Tables& tables, cudaStream_t s
         if (cost < best_cost) { best_cost = cost; best = i; }
     }
     switch (best) {
-    case 0: launch_projection_mma<4U, 8U>(a, tables, stream); break;
-    case 1: launch_projection_mma<3U, 8U>(a, tables, stream); break;
-    case 2: launch_projection_mma<2U, 8U>(a, tables, stream); break;
-    case 3: launch_projection_mma<4U, 4U>(a, tables, stream); break;
-    case 4: launch_projection_mma<2U, 4U>(a, tables, stream); break;
-    default: launch_projection_mma<1U, 4U>(a, tables, stream); break;
+    case 0: launch_projection_mma<4U, 8U>(a, tables, stream, compact); break;
+    case 1: launch_projection_mma<3U, 8U>(a, tables, stream, compact); break;
+    case 2: launch_projection_mma<2U, 8U>(a, tables, stream, compact); break;
+    case 3: launch_projection_mma<4U, 4U>(a, tables, stream, compact); break;
+    case 4: launch_projection_mma<2U, 4U>(a, tables, stream, compact); break;
+    default: launch_projection_mma<1U, 4U>(a, tables, stream, compact); break;
     }
 }
 
@@ -608,9 +668,11 @@ void projection_mma(const HcMixArgs& a, const am::Tables& tables, cudaStream_t s
 constexpr unsigned kMmaOutPasses = 5U, kMmaOutPitch = kRank + cm::kPadHalves;
 constexpr unsigned kMmaOutSmem = kMmaOutRows * kMmaOutPitch * 2U;
 
+template <bool Compact = false>
 __global__ __launch_bounds__(128) void hc_output_mma_kernel(const float* __restrict__ normalized, std::uint32_t rows,
     const std::uint32_t* __restrict__ up_codes, const float* __restrict__ up_scales, std::uint16_t* __restrict__ output,
-    float* __restrict__ gates, am::Tables t_) {
+    float* __restrict__ gates, am::Tables t_,
+    const std::uint16_t* __restrict__ xin, const float* __restrict__ xnorm) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     __half* a_s = reinterpret_cast<__half*>(smem_raw);  // [64][328]
     const unsigned tid = threadIdx.x, warp = tid >> 5U, lane = tid & 31U, g = lane >> 2U, t = lane & 3U;
@@ -683,7 +745,15 @@ __global__ __launch_bounds__(128) void hc_output_mma_kernel(const float* __restr
                 float mixed0 = 0.0F, mixed1 = 0.0F;
 #pragma unroll
                 for (unsigned s = 0; s < kStreams; ++s) {
-                    const float2 n = *reinterpret_cast<const float2*>(normalized + static_cast<std::size_t>(row) * kNormalizedPitch + s * kHidden + f);
+                    float2 n;
+                    if constexpr (Compact) {   // bit-identical rebuild of the normalized pair (norm_value)
+                        const std::uint32_t xv = *reinterpret_cast<const std::uint32_t*>(xin + static_cast<std::size_t>(row) * kWide + s * kHidden + f);
+                        const float inv = normalized[static_cast<std::size_t>(row) * kNormalizedPitch + s];
+                        const float2 w = *reinterpret_cast<const float2*>(xnorm + s * kHidden + f);
+                        n = make_float2(norm_value(static_cast<std::uint16_t>(xv), inv, w.x), norm_value(static_cast<std::uint16_t>(xv >> 16U), inv, w.y));
+                    } else {
+                        n = *reinterpret_cast<const float2*>(normalized + static_cast<std::size_t>(row) * kNormalizedPitch + s * kHidden + f);
+                    }
                     mixed0 = __fmaf_rn(n.x, fast_sigmoid(acc[s][m][2U * h]), mixed0);
                     mixed1 = __fmaf_rn(n.y, fast_sigmoid(acc[s][m][2U * h + 1U]), mixed1);
                 }
@@ -868,6 +938,26 @@ __global__ void expand_kernel(const std::uint16_t* __restrict__ in, std::uint16_
     if (i >= total) return;
     const std::size_t row = i / kWide, f = i % kHidden;
     out[i] = float_to_bf16(bf16_to_float(in[row * kHidden + f]));  // BF16 -> FP32 -> BF16: the identity
+}
+// Same per-element arithmetic as inject_kernel, 8 elements (16 B) per thread, row = blockIdx.y (lever qwen_hc_inject_vec,
+// bitwise: one fma + one BF16 rounding per element as before; 2560 % 8 == 0 so the 8 elements share one stream).
+__global__ __launch_bounds__(256) void inject_vec_kernel(const std::uint16_t* __restrict__ hyper, const std::uint16_t* __restrict__ hidden,
+    const float* __restrict__ weights, std::uint16_t* __restrict__ out) {
+    const std::size_t row = blockIdx.y;
+    const unsigned within = (blockIdx.x * 256U + threadIdx.x) * 8U, s = within / kHidden, f = within % kHidden;
+    if (within >= kWide) return;
+    const uint4 h = *reinterpret_cast<const uint4*>(hyper + row * kWide + within);
+    const uint4 v = *reinterpret_cast<const uint4*>(hidden + row * kHidden + f);
+    const float w = weights[row * kStreams + s];
+    const unsigned hw[4] = {h.x, h.y, h.z, h.w}, vw[4] = {v.x, v.y, v.z, v.w};
+    unsigned o[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const std::uint16_t lo = float_to_bf16(__fmaf_rn(bf16_to_float(static_cast<std::uint16_t>(vw[k])), w, bf16_to_float(static_cast<std::uint16_t>(hw[k]))));
+        const std::uint16_t hi = float_to_bf16(__fmaf_rn(bf16_to_float(static_cast<std::uint16_t>(vw[k] >> 16U)), w, bf16_to_float(static_cast<std::uint16_t>(hw[k] >> 16U))));
+        o[k] = static_cast<unsigned>(lo) | (static_cast<unsigned>(hi) << 16U);
+    }
+    *reinterpret_cast<uint4*>(out + row * kWide + within) = make_uint4(o[0], o[1], o[2], o[3]);
 }
 __global__ void inject_kernel(const std::uint16_t* __restrict__ hyper, const std::uint16_t* __restrict__ hidden,
     const float* __restrict__ weights, std::uint16_t* __restrict__ out, std::size_t total) {
@@ -1276,36 +1366,48 @@ template <unsigned R> void route_rows_r(const std::uint16_t* hidden, const float
 void hc_mix(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream, unsigned stages) {
     if (!a.rows) return;
     if (a.rows > 65535U * kProjRows) throw std::invalid_argument("qwen_hc mix: too many rows");
-    if (stages & 1U) hc_norm_kernel<<<dim3(a.rows, kStreams), 256U, 0, stream>>>(a.input, a.norm, a.epsilon, a.normalized, tables);
+    const bool compact = hc_compact_workspace(a, stages, hc_compact_norm_enabled(), decode_rows_enabled());
+    if ((stages & 1U) && compact) hc_norm_kernel<true><<<dim3(a.rows, kStreams), 256U, 0, stream>>>(a.input, a.norm, a.epsilon, a.normalized, tables);
+    else if (stages & 1U) hc_norm_kernel<<<dim3(a.rows, kStreams), 256U, 0, stream>>>(a.input, a.norm, a.epsilon, a.normalized, tables);
     check(cudaGetLastError(), "norm launch");
     const unsigned out_blocks = kProjLowBlocks + (a.inject ? 1U : 0U);
     // Output blocks fastest (HIP default order): the 6 blocks of one row block run together and share its x rows in L2.
     if (a.mma) {  // FAST form: tensor-core projection + output (stages bit 1 / bit 2 as the exact path)
         static const bool attr = [] {
-            check(cudaFuncSetAttribute(hc_output_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kMmaOutSmem)), "mma attr");
+            check(cudaFuncSetAttribute(hc_output_mma_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kMmaOutSmem)), "mma attr");
+            check(cudaFuncSetAttribute(hc_output_mma_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kMmaOutSmem)), "mma attr");
             return true;
         }();
         (void)attr;
         const unsigned row_tiles = (a.rows + kMmaOutRows - 1U) / kMmaOutRows;
-        if (stages & 2U) projection_mma(a, tables, stream);
+        if (stages & 2U) projection_mma(a, tables, stream, compact);
         check(cudaGetLastError(), "mma projection launch");
-        if (stages & 4U) hc_output_mma_kernel<<<dim3(row_tiles, kHidden / (32U * kMmaOutPasses)), 128U, kMmaOutSmem, stream>>>(a.normalized,
-            a.rows, a.packed.up_codes, a.packed.up_scales, a.output, a.gates, tables);
+        const dim3 og(row_tiles, kHidden / (32U * kMmaOutPasses));
+        if ((stages & 4U) && compact) hc_output_mma_kernel<true><<<og, 128U, kMmaOutSmem, stream>>>(a.normalized,
+            a.rows, a.packed.up_codes, a.packed.up_scales, a.output, a.gates, tables, a.input, a.norm);
+        else if (stages & 4U) hc_output_mma_kernel<false><<<og, 128U, kMmaOutSmem, stream>>>(a.normalized,
+            a.rows, a.packed.up_codes, a.packed.up_scales, a.output, a.gates, tables, a.input, a.norm);
         check(cudaGetLastError(), "mma output launch");
         if ((stages & 8U) && a.gates)
             hc_mix_epilogue_kernel<true><<<blocks_for(std::size_t{a.rows} * kHidden, 256U), 256U, 0, stream>>>(a.normalized, a.gates, a.rows,
                 a.output, tables);
         return;
     }
-    if (a.rows <= 8U && stages == 15U && !a.gates && decode_rows_enabled()) {
+    if (!compact && a.rows <= 8U && stages == 15U && !a.gates && decode_rows_enabled()) {
         hc_mix_rows(a, tables, stream);
         return;
     }
-    if (stages & 2U) hc_projection_kernel<<<dim3(out_blocks, (a.rows + kProjRows - 1U) / kProjRows), 256U, 0, stream>>>(a.normalized, a.rows,
+    const dim3 proj_grid(out_blocks, (a.rows + kProjRows - 1U) / kProjRows);
+    if ((stages & 2U) && compact) hc_projection_kernel<true><<<proj_grid, 256U, 0, stream>>>(a.normalized, a.rows,
+        a.packed.down_codes, a.packed.down_scales, a.inject, a.normalized, a.injection, tables, a.input, a.norm);
+    else if (stages & 2U) hc_projection_kernel<<<proj_grid, 256U, 0, stream>>>(a.normalized, a.rows,
         a.packed.down_codes, a.packed.down_scales, a.inject, a.normalized, a.injection, tables);
     check(cudaGetLastError(), "projection launch");
     const dim3 out_grid((a.rows + kOutRows - 1U) / kOutRows, kHidden / kOutThreads);
-    if ((stages & 4U) && !a.gates)
+    if ((stages & 4U) && !a.gates && compact)
+        hc_output_kernel<true, true><<<out_grid, kOutThreads, 0, stream>>>(a.normalized, a.rows, a.packed.up_codes, a.packed.up_scales,
+            a.output, nullptr, tables, a.input, a.norm);
+    else if ((stages & 4U) && !a.gates)
         hc_output_kernel<true><<<out_grid, kOutThreads, 0, stream>>>(a.normalized, a.rows, a.packed.up_codes, a.packed.up_scales,
             a.output, nullptr, tables);
     if ((stages & 4U) && a.gates)
@@ -1332,7 +1434,12 @@ void inject(const std::uint16_t* hyper, const std::uint16_t* hidden, const float
     std::uint16_t* out, cudaStream_t stream) {
     const std::size_t total = std::size_t{rows} * kWide;
     if (!total) return;
-    inject_kernel<<<blocks_for(total, 256U), 256U, 0, stream>>>(hyper, hidden, injection, out, total);
+    const bool aligned = ((reinterpret_cast<std::uintptr_t>(hyper) | reinterpret_cast<std::uintptr_t>(hidden) |
+                           reinterpret_cast<std::uintptr_t>(out)) & 15U) == 0U;
+    if (aligned && rows <= 65535U && hc_inject_vec_enabled())
+        inject_vec_kernel<<<dim3((kWide / 8U + 255U) / 256U, rows), 256U, 0, stream>>>(hyper, hidden, injection, out);
+    else
+        inject_kernel<<<blocks_for(total, 256U), 256U, 0, stream>>>(hyper, hidden, injection, out, total);
     check(cudaGetLastError(), "inject launch");
 }
 void combine(const std::uint16_t* shared, const std::uint16_t* routed, std::uint32_t rows, std::uint16_t* out, cudaStream_t stream) {

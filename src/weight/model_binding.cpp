@@ -41,7 +41,7 @@ Status bind_model(const TensorIndex& index,const FamilySchema& schema,WeightMap&
     std::vector<TensorBinding> bindings;std::vector<Parameters> parameters;
     const bool nvfp4=index.container==Container::safetensors && index.schema=="strix.nvfp4.safetensors@1";
     for(const auto& raw:index.tensors) {
-        if(schema.text_only && index.container!=Container::gguf && !raw.name.starts_with("model.language_model.") && raw.name!="lm_head.weight")continue;
+        if(schema.text_only && index.container!=Container::gguf && !raw.name.starts_with(schema.text_prefix) && raw.name!=schema.text_head)continue;
         const bool trellis=raw.name.ends_with(".trellis");
         const bool standalone=std::any_of(schema.roles.begin(),schema.roles.end(),[&](const auto& p){return p.standalone && p.matches(raw.name);});
         const bool fp4_codes=nvfp4 && raw.name.ends_with(".codes");
