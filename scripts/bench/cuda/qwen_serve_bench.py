@@ -32,26 +32,48 @@ def stream(base, prompt, max_tokens, timeout):
     body = dict(prompt=prompt, max_tokens=max_tokens, temperature=0, stream=True, return_token_ids=True)
     req = urllib.request.Request(base + '/v1/completions', json.dumps(body).encode(), {'Content-Type': 'application/json'})
     t0 = time.perf_counter()
-    first, usage, strix, error = None, None, None, None
+    first, usage, strix, error = None, None, {}, None
+    done, finish = False, None
     with urllib.request.urlopen(req, timeout=timeout) as r:
         for line in r:
-            if not line.startswith(b'data:') or b'[DONE]' in line:
+            if not line.startswith(b'data:'):
                 continue
+            if line[5:].strip() == b'[DONE]':
+                done = True
+                break
             try:
                 obj = json.loads(line[5:])
             except ValueError:
+                error = error or 'invalid JSON in stream'
+                continue
+            if not isinstance(obj, dict):
+                error = error or 'invalid stream event'
                 continue
             usage = obj.get('usage') or usage
-            if obj.get('error'):
-                error = obj['error']
-            if isinstance(obj.get('strix'), dict) and 'rtx' in obj['strix']:
-                strix = obj['strix']
+            if 'error' in obj:
+                error = obj['error'] or 'stream error'
+            if isinstance(obj.get('strix'), dict):
+                strix.update(obj['strix'])
+            for choice in obj.get('choices') or []:
+                if choice.get('finish_reason') is not None:
+                    finish = choice['finish_reason']
             if first is None and any((c.get('text') or '') for c in obj.get('choices') or []):
                 first = time.perf_counter()
     t1 = time.perf_counter()
-    rtx = (strix or {}).get('rtx', {})
+    ids = strix.get('token_ids')
+    tokens = usage.get('completion_tokens') if isinstance(usage, dict) else None
+    if not done or finish not in ('stop', 'length'):
+        error = error or 'incomplete or unsuccessful stream'
+    if not isinstance(ids, list) or any(type(token) is not int for token in ids):
+        error = error or 'missing or invalid strix.token_ids'
+    if type(tokens) is not int or tokens < 0:
+        error = error or 'missing or invalid completion_tokens'
+        tokens = None
+    elif isinstance(ids, list) and len(ids) != tokens:
+        error = error or 'token ID count differs from completion_tokens'
+    rtx = strix.get('rtx', {})
     return dict(t0=t0, t_first=first, t_end=t1, ttft=(first - t0) if first else None, wall=t1 - t0,
-                tokens=(usage or {}).get('completion_tokens'), ids=rtx.get('ids'), error=error,
+                tokens=tokens, ids=ids, error=error,
                 live=rtx.get('live_slots'), cap=rtx.get('session_positions'),
                 prefill_ms=(strix or {}).get('prefill_ms'), decode_tps=(strix or {}).get('decode_tokens_per_second'))
 
@@ -86,6 +108,7 @@ def main():
     ap.add_argument('--max-tokens', type=int, default=128)
     ap.add_argument('--timeout', type=int, default=900)
     a = ap.parse_args()
+    failed = False
     ids = [int(x) for x in Path(a.prompt_ids).read_text().replace(',', ' ').split()]
     out = open(a.out, 'a', encoding='utf-8')
 
@@ -107,6 +130,7 @@ def main():
     for L in [int(x) for x in a.lens.split(',') if x]:
         for run in ('cold', 'warm'):
             r = stream(a.base, take(L), 16, a.timeout)
+            failed = failed or r['error'] is not None
             tps = round(L / (r['prefill_ms'] / 1e3)) if r['prefill_ms'] else None
             say(f'pf L={L} {run} ttft={r["ttft"] and round(r["ttft"], 3)} prefill_ms={r["prefill_ms"]} tok/s={tps} err={r["error"]}')
     arms = [int(x) for x in a.arms.split(',') if x]
@@ -116,13 +140,16 @@ def main():
     with open(a.out + '.ids', 'a', encoding='utf-8') as f:
         for i, p in enumerate(prompts):
             r = stream(a.base, p, a.max_tokens, a.timeout)
-            ref.append(r['ids'])
+            ref.append(r)
+            failed = failed or r['error'] is not None
             f.write(json.dumps(r['ids']) + '\n')
             say(f'C1 i={i} tokens={r["tokens"]} decode_tps={r["decode_tps"]} ttft={r["ttft"] and round(r["ttft"], 3)} cap={r["cap"]} err={r["error"]}')
     for c in arms:
         res, wall = barrier(c, lambda i: stream(a.base, prompts[i], a.max_tokens, a.timeout))
         toks = sum((r.get('tokens') or 0) for r in res)
-        same = sum(1 for i, r in enumerate(res) if ref[i] and r.get('ids') == ref[i])
+        same = sum(1 for i, r in enumerate(res)
+                   if ref[i]['error'] is None and r.get('error') is None and r.get('ids') == ref[i]['ids'])
+        failed = failed or same != c
         first_end = max(r.get('t_first') or 0 for r in res)
         last = max(r.get('t_end') or 0 for r in res)
         dec_agg = toks / (last - first_end) if last > first_end else None
@@ -130,8 +157,10 @@ def main():
         say(f'C{c} wall={round(wall, 2)} tokens={toks} agg_tps={round(toks / wall, 1)} '
             f'agg_decode_tps_after_last_first={dec_agg and round(dec_agg, 1)} ttft_max={round(max(r.get("ttft") or 0 for r in res), 3)} '
             f'live_sessions_max={live} same_as_C1={same}/{c} errs={[r.get("error") for r in res if r.get("error")]}')
-    say('done')
+    say('FAILED' if failed else 'done')
+    out.close()
+    return 1 if failed else 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

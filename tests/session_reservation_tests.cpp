@@ -1,5 +1,5 @@
-// Host tests: per-request session reservation (strix/serve/session_reservation.hpp) and the CUDA Qwen server's two
-// entry points resolving the same capacity for the same request (apps/cuda_qwen_serve_policy.hpp, ONE RESOLVER).
+// Host tests: shared per-request reservation and CUDA Qwen policy with simulated serialized/cohort slot views.
+// These test policy equivalence, not the production entry points' wiring to the policy.
 #include "../apps/cuda_qwen_serve_policy.hpp"
 
 #include <cstdio>
@@ -93,6 +93,30 @@ int main() {
         const auto w = plan_admission(all, 100, b, G, 0);
         CHECK(w.action == AdmitAction::wait && !w.why.empty());
     }
+    {   // A smaller pinned target can return bytes unavailable when growing the largest unpinned target.
+        std::vector<SlotSession> s{{false, true, true, 256, qwen_bytes(256)},
+                                  {false, true, false, 1280, qwen_bytes(1280)}};
+        const auto margin = 64 * M;  // Also keeps the both-sessions boundary positive with fixed session bytes.
+        const auto free_bytes = margin + qwen_bytes(8192) - qwen_bytes(1280) - 1;
+        const auto p = plan_admission(s, 8192, qwen_bytes, free_bytes, margin);
+        CHECK(p.action == AdmitAction::resize && p.slot == 0 && p.positions == 8192);
+        CHECK(p.release == std::vector<std::size_t>{1});
+        CHECK(p.bytes == qwen_bytes(8192));
+        // At the exact boundary, reclaiming both sessions fits; one byte below it must reject.
+        const auto boundary = margin + qwen_bytes(8192) - qwen_bytes(256) - qwen_bytes(1280);
+        CHECK(plan_admission(s, 8192, qwen_bytes, boundary, margin).action == AdmitAction::resize);
+        CHECK(plan_admission(s, 8192, qwen_bytes, boundary - 1, margin).action == AdmitAction::reject);
+        // A busy pinned session cannot be a fallback target or enter the release list.
+        s[0].busy = true;
+        const auto busy = plan_admission(s, 8192, qwen_bytes, free_bytes, margin);
+        CHECK(busy.action == AdmitAction::wait && busy.release.empty());
+        // Neither the pin nor the fallback may depend on slot index zero.
+        s[0].busy = false;
+        std::swap(s[0], s[1]);
+        const auto swapped = plan_admission(s, 8192, qwen_bytes, free_bytes, margin);
+        CHECK(swapped.action == AdmitAction::resize && swapped.slot == 1);
+        CHECK(swapped.release == std::vector<std::size_t>{0});
+    }
     {   // slot count follows memory: 6 GB free, 2 GB margin, 1K prompt + 128 tokens at 34,816 cap (CUDA Qwen numbers)
         cuda_qwen_serve::SessionPolicy pol{34816, cuda_qwen_serve::kDefaultGranule, true};
         std::vector<SlotSession> s(16);
@@ -112,7 +136,7 @@ int main() {
                     static_cast<unsigned long long>(1 + (6ULL * G - qwen_bytes(256) - 2048ULL * M) / qwen_bytes(34816)));
         CHECK(placed >= 14);
     }
-    // ---- ONE RESOLVER: serialized path == cohort admission, every request shape, both modes
+    // ---- Policy equivalence with simulated serialized/cohort views, every request shape, both modes
     for (const bool per_request : {true, false}) {
         const cuda_qwen_serve::SessionPolicy pol{34816, 256, per_request};
         for (const std::uint64_t n : {2ULL, 100ULL, 1024ULL, 8192ULL, 32768ULL, 34815ULL})

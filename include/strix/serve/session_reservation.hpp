@@ -82,7 +82,7 @@ inline const char* admit_action_name(AdmitAction a) {
 // after the allocation (e.g. the WDDM spill margin). Order of preference:
 //   1. an idle session that already holds it (the smallest such: large sessions stay for long requests);
 //   2. a new session in an empty slot (keeps the idle sessions), if free memory holds it;
-//   3. re-size an idle session that is too small (the largest: it returns the most bytes);
+//   3. re-size an idle session that is too small (largest first: it returns the most bytes);
 //   4. 2 or 3 after releasing idle unpinned sessions, largest first, only as many as needed;
 //   5. wait while something runs, else reject.
 inline AdmitPlan plan_admission(const std::vector<SlotSession>& slots, std::uint64_t need, const SessionBytes& bytes_at,
@@ -141,6 +141,13 @@ inline AdmitPlan plan_admission(const std::vector<SlotSession>& slots, std::uint
     if (empty != slots.size() && fits(free_bytes) && try_target(empty, AdmitAction::build, 0)) return p;  // nothing released
     if (grow != slots.size() && try_target(grow, AdmitAction::resize, slots[grow].bytes)) return p;
     if (empty != slots.size() && try_target(empty, AdmitAction::build, 0)) return p;
+    // A smaller pinned target can return bytes that the largest target cannot release.
+    // Retry each eligible target with its own release list before declaring the pool infeasible.
+    for (std::size_t i = 0; i < slots.size(); ++i) {
+        const auto& s = slots[i];
+        if (i != grow && !s.busy && s.built && s.positions < need &&
+            try_target(i, AdmitAction::resize, s.bytes)) return p;
+    }
     p.release.clear();
     p.action = any_busy ? AdmitAction::wait : AdmitAction::reject;
     p.why = "session of " + std::to_string(need) + " positions (" + mib(p.bytes) + " MiB) + headroom " + mib(headroom) +
