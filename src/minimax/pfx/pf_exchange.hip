@@ -2,6 +2,7 @@
 #include "pf_exchange.hpp"
 #include "minimax/xfer/minimax_xfer_device.hpp"
 #include "strix/env_flags.hpp"
+#include "strix/pinned_host.hpp"
 
 #include <immintrin.h>
 #include <pthread.h>
@@ -102,10 +103,10 @@ Exchanger::Exchanger(dist::Transport& borrowed, Options options)
         hip_check(hipExtMallocWithFlags(reinterpret_cast<void**>(&tx_dev_), total, hipDeviceMallocUncached), "uncached TX slots");
         tx_host_ = tx_dev_;
     } else {
-        hip_check(hipHostMalloc(reinterpret_cast<void**>(&tx_host_), total, flags), "TX slots");
+        hip_check(strix::host_pin::allocate(reinterpret_cast<void**>(&tx_host_), total, flags), "TX slots");
         hip_check(hipHostGetDevicePointer(reinterpret_cast<void**>(&tx_dev_), tx_host_, 0), "TX slots");
     }
-    hip_check(hipHostMalloc(reinterpret_cast<void**>(&rx_host_), total, flags), "RX slots");
+    hip_check(strix::host_pin::allocate(reinterpret_cast<void**>(&rx_host_), total, flags), "RX slots");
     hip_check(hipHostMalloc(reinterpret_cast<void**>(&flags_host_), 4096, flags), "flags");
     hip_check(hipHostGetDevicePointer(reinterpret_cast<void**>(&rx_dev_), rx_host_, 0), "RX slots");
     hip_check(hipHostGetDevicePointer(reinterpret_cast<void**>(&flags_dev_), flags_host_, 0), "flags");
@@ -146,9 +147,9 @@ Exchanger::~Exchanger() {
     }
     (void)hipFree(counter_dev_);
     (void)hipHostFree(flags_host_);
-    (void)hipHostFree(rx_host_);
+    (void)strix::host_pin::release(rx_host_);
     if (options_.tx_uncached) (void)hipFree(tx_dev_);
-    else (void)hipHostFree(tx_host_);
+    else (void)strix::host_pin::release(tx_host_);
 }
 
 std::byte* Exchanger::tx_slot(std::uint64_t sequence) const { return tx_host_ + ((sequence - 1) % options_.depth) * stride_; }
@@ -171,15 +172,15 @@ bool Exchanger::set_tx_uncached(bool on) {
         }
         host = dev;
     } else {
-        hip_check(hipHostMalloc(reinterpret_cast<void**>(&host), total, hipHostMallocMapped | hipHostMallocCoherent), "TX slots");
+        hip_check(strix::host_pin::allocate(reinterpret_cast<void**>(&host), total, hipHostMallocMapped | hipHostMallocCoherent), "TX slots");
         const hipError_t status = hipHostGetDevicePointer(reinterpret_cast<void**>(&dev), host, 0);
         if (status != hipSuccess) {
-            (void)hipHostFree(host);
+            (void)strix::host_pin::release(host);
             hip_check(status, "TX slots");
         }
     }
     if (options_.tx_uncached) (void)hipFree(tx_dev_);
-    else (void)hipHostFree(tx_host_);
+    else (void)strix::host_pin::release(tx_host_);
     tx_host_ = host;
     tx_dev_ = dev;
     options_.tx_uncached = on;

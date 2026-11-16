@@ -9,7 +9,7 @@
 // src/prompt_terminal_diagnostics.cpp; include/strix/session/checkpoint_io.hpp;
 // src/session/checkpoint_io.cpp. The recursive session scope detects the last
 // two additions; extending the audit's other exact scopes is separate work.
-{"CMakeLists.txt", 0xcdb54dea2bd062caULL},
+{"CMakeLists.txt", 0x5309f88c49c87c0dULL},
 {"apps/minimax_rank_main.cpp", 0x1ebd5ab6649fe50dULL},
 
 {"apps/minimax_serve_main.cpp", 0x901f15e2f283f377ULL},
@@ -51,7 +51,7 @@
 {"src/minimax/attn/index_proj.hpp", 0x2aac71c5947fec1fULL},
 {"src/minimax/attn/index_proj_tests.hip", 0x0f1909d729f105beULL},
 {"src/minimax/attn/msa_flash_policy.hpp", 0x6145468dde882efcULL},
-{"src/minimax/attn/msa_fused.hip", 0xc269612a4fc82653ULL},
+{"src/minimax/attn/msa_fused.hip", 0x93d5a54e9196955fULL},
 {"src/minimax/attn/msa_fused.hpp", 0xd1fa22ab20594e2dULL},
 {"src/minimax/attn/msa_fused_tests.hip", 0x638638dff9689cd0ULL},
 {"src/minimax/attn/msa_inblock_layout.hpp", 0x617784020ff4b04fULL},
@@ -103,7 +103,7 @@
 {"src/minimax/moe/mmx_trellis_device.hpp", 0x11cfbcfe7d145fe4ULL},
 {"src/minimax/pfx/pf_crc.cpp", 0xefbe65eb2a3ec54dULL},
 {"src/minimax/pfx/pf_crc.hpp", 0xa9ad32c18b11abe1ULL},
-{"src/minimax/pfx/pf_exchange.hip", 0xc26408d9edc8708fULL},
+{"src/minimax/pfx/pf_exchange.hip", 0x8e65ed281f165a4eULL},
 {"src/minimax/pfx/pf_exchange.hpp", 0x7dc8d4bed78e490bULL},
 {"src/minimax/pfx/pf_route.hpp", 0x878d7c6a37f4125fULL},
 {"src/minimax/pfx/pf_wire.hpp", 0xa9288211f52dfd9aULL},
@@ -230,3 +230,6 @@
 {"include/strix/session/cycle_pack.hpp", 0x2c4f745f250c4906ULL},
 {"include/strix/session/prefill_session.hpp", 0x223658661ba6ef38ULL},
 {"src/session/cycle_pack.hip", 0x3638b767c18f834cULL},
+{"include/strix/pinned_host.hpp", 0xba3ccbc4f64ff08aULL},
+{"include/strix/lever.hpp", 0xe020f2925ab29ca5ULL},
+{"src/dist_communicator.cpp", 0xdbae6ae630eb8a29ULL},

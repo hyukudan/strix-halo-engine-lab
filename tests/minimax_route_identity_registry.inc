@@ -158,3 +158,6 @@
 // src/core/moe_i4_chain.hpp launch_chain; src/minimax/moe/mmx_prefill_iu4.inc. The resolved STRIX_MOE_I4_CHAIN_GSAVE
 // boolean is read once per call and passed to the shared plan policy.
 {"prefill-i4-chain-plan", 'a', "requested IU4 plan+STRIX_MOE_I4_CHAIN_GSAVE+scratch admission; a scratch-form paired launch the device rejects (spill or residency) retries the register-save form on plan 1, then a second tile list for the down", "moe_i4_chain_host_tests.cpp plan policy (admission, insufficient and zero scratch); every admitted form computes the same integers; UNCOVERED native MiniMax fallback execution", ""},
+
+// include/strix/pinned_host.hpp; src/minimax/pfx/pf_exchange.hip; src/dist_communicator.cpp
+{"host-anon-pin", 'a', "STRIX_HOST_ANON_PIN=0/1; automatic integrated GPU only; cached at startup; >=2 MiB anonymous locked long-term-pinned mapped buffers, small/refused pin falls back to hipHostMalloc; matching release; no arithmetic change", "minimax_route_identity_tests.cpp host_pin_selector automatic/override/invalid source contracts; source audit edit/removal negatives; UNCOVERED native pair complete token/logit/state equality under pin success, refusal and OFF", ""},
