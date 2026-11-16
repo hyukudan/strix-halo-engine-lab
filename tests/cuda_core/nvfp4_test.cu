@@ -273,6 +273,8 @@ static void bench() {
             cudaGraphExec_t ge;
             cudaStream_t cs;
             CK(cudaStreamCreate(&cs));
+            run_s(0, cs);  // workspaces are per (device, stream): size this stream's one outside the capture
+            CK(cudaStreamSynchronize(cs));
             CK(cudaStreamBeginCapture(cs, cudaStreamCaptureModeGlobal));
             for (std::size_t i = 0; i < sets; ++i) run_s(i, cs);
             CK(cudaStreamEndCapture(cs, &gr));
@@ -287,6 +289,7 @@ static void bench() {
             CK(cudaEventElapsedTime(&ms, e0, e1));
             CK(cudaGraphExecDestroy(ge));
             CK(cudaGraphDestroy(gr));
+            cc::nvfp4_release_workspace(cs);
             CK(cudaStreamDestroy(cs));
             const double us = ms * 1e3 / (4.0 * sets);
             std::printf("  %7.1f %5.0f", us, per / (us * 1e-6) / 1e9);
