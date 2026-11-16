@@ -1231,7 +1231,7 @@ struct Engine::Impl {
         rr::lever("minimax.prefill_identity", fp32_prefill ? "fp32" : "default", fp32_prefill ? "fp32" : "default");
         {   // Linear K order of the prefill MoE + dense v4 linears (STRIX_MMX_PF_ORDER): a bit-changing contract, so the
             // gate witnesses it as a FAST layer set over every layer (onset 0).
-            const char* order = std::getenv("STRIX_MMX_PF_ORDER");
+            const char* order = strix::envcfg::text("STRIX_MMX_PF_ORDER");
             const bool inv = mmoe::prefill_order_invariant();
             rr::lever("minimax.linear_order", order != nullptr && *order != 0 ? order : "default",
                       inv ? "invariant:mmx-pf-linear-s1-v1" : "adaptive", inv ? rr::Reason::selected : rr::Reason::disabled);
