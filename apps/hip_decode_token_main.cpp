@@ -5829,7 +5829,8 @@ static int run_decode_entry(
             emulate_req.schedule_defer = false;  // a deferred block would complete across a stage switch
             emulate_req.ladder_tail_rows = options.known_prefix_ladder_tail_rows;
             strix::KnownPromptChunkCursor emulate_chunks(emulate_req, *known_prefix_backend, backend);
-            for (auto& tail : known_tail_backends) emulate_chunks.set_tail_backend(*tail);
+            for (auto& tail : known_tail_backends)  // only owners smaller than the emulated tile
+                if (tail->logical_rows() < emulate_req.logical_rows) emulate_chunks.set_tail_backend(*tail);
             const auto emulate_units = emulate_chunks.cold_plan().size();
             std::vector<strix::KnownPromptChunkStageView> emulate_views(emulate_stages, emulate_chunks.stage_view());
             std::vector<strix::qwen_pp::StageFrontier> emulate_frontiers(emulate_stages,
