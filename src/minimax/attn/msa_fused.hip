@@ -2369,7 +2369,7 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
             using RG = ks::RowGroup<kGroup, kHeadDim, MsaFlashPolicy::kMaxSegs>;
             const unsigned rows = scheduled.rows - p.first_window * kMaxRows;
             const MsaFlashArgs args{scheduled, DENSE ? 1U : 0U};
-            hipLaunchKernelGGL((ks::flash_rowgroup_kernel<MsaFlashPolicy>), dim3((rows + RG::kRows - 1) / RG::kRows * v.kv_heads),
+            hipLaunchKernelGGL((ks::flash_rowgroup_kernel<MsaFlashPolicy, ks::kRgLazyRescale>), dim3((rows + RG::kRows - 1) / RG::kRows * v.kv_heads),
                                dim3(RG::kThreads), 0, stream, args);
             hip_check(hipGetLastError(), "minimax prefill flash attend (row groups)");
             return;
