@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iterator>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -80,8 +81,7 @@ int main(int argc, char** argv) try {
         std::ifstream f(ids_arg.substr(1));
         if (!f) throw std::invalid_argument("cannot read " + ids_arg.substr(1));
         ids_arg.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
-        while (!ids_arg.empty() && (ids_arg.back() == '
-' || ids_arg.back() == '' || ids_arg.back() == ' ')) ids_arg.pop_back();
+        while (!ids_arg.empty() && std::isspace(static_cast<unsigned char>(ids_arg.back()))) ids_arg.pop_back();
     }
     const auto prompt = parse_ids(ids_arg);
     if (prompt.empty()) throw std::invalid_argument("empty prompt");
