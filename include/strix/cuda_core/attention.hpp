@@ -5,6 +5,7 @@
 #include <cstdint>
 
 #include "strix/cuda_core/types.hpp"
+#include "strix/cuda_core/attention_policy.hpp"  // FlashPipe, FlashTail
 
 namespace strix::cuda_core {
 
@@ -52,8 +53,6 @@ cudaError_t attention_decode(const AttentionDims& d, const float* q, const Group
 // T mod S tiles form a partial wave that bills a whole CTA time. split: those tiles run as jobs of w active warps (w = 1/2/4, the
 // smallest with (T mod S) * 8 / w <= S, or tail_warps if non-zero), so the partial wave spreads over the idle SMs. Every warp keeps its
 // 16 rows, its head and the tile count of its 128-row block, so each output row runs the same instructions on the same tiles.
-enum class FlashPipe : std::uint8_t { pad2 = 0, swz3 = 1 };
-enum class FlashTail : std::uint8_t { off = 0, split = 1 };
 cudaError_t attention_prefill_flash(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate, const GroupedView& gv,
                                     const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache, std::uint32_t pos0, std::uint32_t rows,
                                     float* out, cudaStream_t stream, FlashPipe pipe = FlashPipe::pad2, FlashTail tail = FlashTail::off,

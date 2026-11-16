@@ -17,7 +17,7 @@
 
 #include <cuda_runtime.h>
 
-#include "strix/cuda_core/attention.hpp"
+#include "strix/cuda_core/attention_policy.hpp"
 #include "strix/cuda_core/dense.hpp"
 #include "strix/qwen35/config.hpp"
 #include "strix/qwen35/engine_types.hpp"
