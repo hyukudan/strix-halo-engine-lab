@@ -55,6 +55,12 @@ struct Config {
     std::optional<bool> moe_route_bf16;
     // Explicit source diagnostic only: does not admit ordinary product MTP.
     bool diagnostic_bf16_mtp = false;
+    // TURBO onfly weights (--profile turbo --turbo-weights onfly, resolved by strix/cuda_qwen_turbo.hpp): convert the
+    // dense Q8_0 roles to NVFP4 once at load (onfly-nvfp4-rtn-g16, nvfp4-a8-v1) and read them in decode windows.
+    // false (default, exact, FAST): nothing converted, every route and byte unchanged.
+    bool turbo_onfly_nvfp4 = false;
+    // TURBO cache namespace (strix::profile::turbo::cache_namespace); empty outside turbo. Part of the prefix identity.
+    std::string turbo_namespace;
 };
 
 // Diagnostic snapshot, not the node wire or a portable session/cache format.

@@ -27,6 +27,7 @@
 #include "cuda_qwen_prefix_cache.hpp"
 #include "strix/cuda_qwen_cohort.hpp"
 #include "strix/cuda_qwen_prefill.hpp"
+#include "strix/cuda_qwen_turbo.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/engine.hpp"
@@ -66,6 +67,8 @@ void on_signal(int) { g_stop.store(true); }
 
 struct Options {
     qp::Config engine;
+    strix::cuda::qwen_turbo::Request turbo;                    // --profile / --turbo-weights* (same resolver as the CLI)
+    std::optional<strix::cuda::qwen_turbo::Resolved> resolved;
     px::Settings prefix;
     std::string bind = "127.0.0.1", api_key_file, model_id = "qwen3.8-flash-next";
     int port = 8090;
@@ -91,6 +94,7 @@ Options parse(int argc, char** argv) {
     if (const char* v = std::getenv("STRIX_QRTX_HTTP_SLOTS")) o.http_slots = static_cast<std::uint32_t>(std::stoul(v));
     if (const char* v = std::getenv("STRIX_QRTX_SLOT_MARGIN_MIB")) o.slot_margin_mib = static_cast<std::uint32_t>(std::stoul(v));
     for (int i = 1; i < argc; ++i) {
+        if (strix::cuda::qwen_turbo::take_option(argc, argv, i, o.turbo)) continue;
         const std::string a = argv[i];
         const auto next = [&]() -> std::string {
             if (i + 1 >= argc) throw std::invalid_argument(a + " needs a value");
@@ -148,6 +152,9 @@ Options parse(int argc, char** argv) {
         }
         else throw std::invalid_argument("unknown option " + a);
     }
+    o.resolved = strix::cuda::qwen_turbo::resolve(o.turbo);   // throws on an unloadable turbo weight request
+    strix::cuda::qwen_turbo::apply(*o.resolved, o.engine);
+    if (o.turbo.print_effective_config) return o;
     if (o.engine.model_gguf.empty() || o.engine.tables_dir.empty() || o.engine.rope_table.empty())
         throw std::invalid_argument("--model, --tables and --rope-table are required");
     if (const char* v = std::getenv("STRIX_QRTX_COHORT"); v && v[0] == '0') o.http_slots = 1;
@@ -673,6 +680,11 @@ int main(int argc, char** argv) {
     strix::device::bind_cuda_main(argc, argv);
     try {
         const auto o = parse(argc, argv);
+        if (o.turbo.print_effective_config) {
+            std::cout << o.resolved->effective_config();
+            return 0;
+        }
+        if (o.resolved->resolution.is_turbo()) std::cerr << o.resolved->effective_config();
         std::cerr << "strix-cuda-qwen-serve: loading " << o.engine.model_gguf << std::endl;
         qp::Prefill engine(o.engine);
         std::cerr << "strix-cuda-qwen-serve: loaded " << engine.describe() << std::endl;

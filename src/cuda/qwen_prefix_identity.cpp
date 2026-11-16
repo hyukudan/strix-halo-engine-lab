@@ -57,6 +57,8 @@ IdentityFields identity_fields(const qwen_prefill::Config& c, std::uint32_t bloc
         put("target.storage", std::string(id.storage));
         put("target.pair", std::to_string(id.hash));
     }
+    // TURBO states never alias exact / FAST ones; outside turbo no field (legacy identities byte-identical).
+    if (!c.turbo_namespace.empty()) put("turbo.namespace", c.turbo_namespace);
     model("model", c.model_gguf);
     model("mtp", c.mtp_sidecar_gguf);
     file("draft_vocab", c.draft_vocab);

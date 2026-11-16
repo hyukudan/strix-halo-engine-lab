@@ -12,7 +12,8 @@ endif()
 add_library(strix_qwen_cuda STATIC
     src/cuda/qwen_prefill_driver.cu src/cuda/qwen_hc.cu src/cuda/qwen_dense.cu
     src/cuda/qwen_gdn.cu src/cuda/qwen_qsa.cu src/cuda/qwen_moe.cu
-    src/cuda/qwen_plemtp.cu src/cuda/qwen_mtp_draft.cu src/cuda/qwen_transcode.cu src/cuda/qwen_amd_math_tables.cu src/gguf_reader.cpp)
+    src/cuda/qwen_plemtp.cu src/cuda/qwen_mtp_draft.cu src/cuda/qwen_transcode.cu src/cuda/qwen_amd_math_tables.cu src/gguf_reader.cpp
+    src/cuda/core/nvfp4_a8.cu src/cuda/core/nvfp4_a8_reference.cpp src/cuda/core/nvfp4_reference.cpp)
 target_include_directories(strix_qwen_cuda PUBLIC include src/cuda)
 # Every Qwen CUDA binary resolves its device through the start gate (strix-devices-v1) before its first allocation.
 include(${CMAKE_CURRENT_LIST_DIR}/StrixDevice.cmake)
@@ -40,6 +41,15 @@ add_test(NAME qwen_prefill_schedule COMMAND qwen_prefill_schedule_test)
 add_test(NAME qwen_handoff_codec COMMAND qwen_handoff_codec_test)
 add_executable(qwen_decode_e2e tests/cuda/qwen_decode_e2e.cu)
 target_link_libraries(qwen_decode_e2e PRIVATE strix_qwen_cuda strix_qwen_handoff)
+# TURBO onfly (qwen-turbo-v1): shared nvfp4-a8-v1 core vs its host oracles, the Qwen dense binding, and the one
+# resolver (serve == CLI).
+add_executable(nvfp4_a8_test tests/cuda/nvfp4_a8_test.cu)
+target_link_libraries(nvfp4_a8_test PRIVATE strix_qwen_cuda)
+target_compile_options(nvfp4_a8_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+add_test(NAME nvfp4_a8 COMMAND nvfp4_a8_test)
+add_executable(qwen_turbo_resolver_test tests/cuda/qwen_turbo_resolver_test.cu)
+target_link_libraries(qwen_turbo_resolver_test PRIVATE strix_qwen_cuda strix_qwen_prefix)
+add_test(NAME qwen_turbo_resolver COMMAND qwen_turbo_resolver_test)
 add_executable(qwen_decode_bench tests/cuda/qwen_decode_bench.cu)
 target_link_libraries(qwen_decode_bench PRIVATE strix_qwen_cuda)
 add_executable(strix-cuda-qwen-serve apps/cuda_qwen_serve_main.cu)
