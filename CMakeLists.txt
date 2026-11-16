@@ -5853,6 +5853,8 @@ if(BUILD_TESTING)
     if(Python3_Interpreter_FOUND)
         add_test(NAME strix-mmflash-ranges-tests
             COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mmflash_ranges.py)
+        add_test(NAME strix-rtx-gpu-guard-tests
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gpu_guard.py)
     endif()
 endif()
 
