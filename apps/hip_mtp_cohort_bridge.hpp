@@ -124,6 +124,7 @@ inline void run_mtp_cohort_bridge(const Options& options, const ModelContract& m
                 throw std::invalid_argument("MTP cohort window factory returned incompatible actual owner");
             assets->validate_assets_unchanged();
             std::vector<HipMtpReplayRow> replay_rows; replay_rows.reserve(golden.rows.size());
+            const q6p::iu4::SuspendScope exact_golden_scope;  // golden replay = exact arithmetic (onfly INT4 suspended)
             for (std::size_t i = 0; i < request.tokens.size(); ++i) {
                 auto current = l.target->execute_serial(session, r, *request.dispatcher, request.tokens[i]);
                 if (l.pending.valid()) replay_rows.push_back({l.pending, request.tokens[i]});

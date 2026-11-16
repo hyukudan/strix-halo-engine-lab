@@ -251,7 +251,8 @@ struct Effective {
 inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& facts = {}) {
     Effective e;
     e.baseline = baseline_requested(r, env);
-    if (r.product.profile || r.product.allow_pending) {
+    if (r.product.profile || r.product.allow_pending ||
+        strix::profile::turbo::has_weight_request(r.product.weights, env)) {
         auto inputs = r.product;
         inputs.env = env;
         e.product = strix::profile::resolve(product_profile_engine, inputs);
