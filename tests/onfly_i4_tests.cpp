@@ -138,7 +138,8 @@ int main() {
                     for (int j = 0; j < 64; ++j) {
                         const std::size_t k = g * 64U + static_cast<std::size_t>(j);
                         const std::size_t byte = ((k / 16U * (padded / 16U) + c / 16U) * 16U + c % 16U) * 8U + (k % 16U) / 2U;
-                        const double d = w[j] - s * core::iu4_unpack(cp.packed[byte], static_cast<int>(k & 1U));
+                        const double d = static_cast<double>(w[j]) -
+                                         static_cast<double>(s) * static_cast<double>(core::iu4_unpack(cp.packed[byte], static_cast<int>(k & 1U)));
                         e += d * d;
                     }
                     return e;
