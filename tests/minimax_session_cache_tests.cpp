@@ -843,8 +843,11 @@ int main() {
       }
       return Bytes(phase_bytes.begin(), phase_bytes.end());
     };
-    Cache writer(c.compat, 0, 1, 32ULL << 20, lock_dir, held_exchange, 8, 1400000);
-    Cache contender(c.compat, 0, 1, 32ULL << 20, lock_dir, self, 8, 1400000);
+    // This fixture publishes three generations of A while testing lock ownership.
+    // All retained generations remain charged; quota eviction is tested above.
+    const auto lock_budget = 3 * encode(sample()).size() + 4096;
+    Cache writer(c.compat, 0, 1, 32ULL << 20, lock_dir, held_exchange, 8, lock_budget);
+    Cache contender(c.compat, 0, 1, 32ULL << 20, lock_dir, self, 8, lock_budget);
     std::exception_ptr writer_error;
     std::thread writing([&] { try { writer.checkpoint(sample()); } catch (...) { writer_error = std::current_exception(); } });
     bool checkpoint_refused = false, delete_refused = false;
@@ -859,7 +862,7 @@ int main() {
     if (writer_error) std::rethrow_exception(writer_error);
     check(checkpoint_refused && delete_refused, "lock covers quota/publication/eviction/delete");
     contender.checkpoint(sample()); // replacement charges both generations at peak
-    check(contender.stats().disk_bytes <= 1400000, "replacement peak cap");
+    check(contender.stats().disk_bytes <= lock_budget, "replacement peak cap");
 #ifndef _WIN32
     // A separate process holds flock: library writers must honor the same lock.
     int ready[2], done_pipe[2];
