@@ -36,6 +36,8 @@
 #include "strix/hip_mtp_asset_loader.hpp"
 #include "strix/hip_launcher_catalog.hpp"
 #include "strix/hip_mtp_forward_replay.hpp"
+#include "strix/q6p_registry.hpp"
+#include <optional>
 #include "strix/mtp_forward_golden_file.hpp"
 #include "strix/hip_mtp_greedy_runtime.hpp"
 #include "strix/serve/cycle_receipt.hpp"
@@ -2528,6 +2530,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     if(!options.http_serve && options.cache_readiness_recheck) options.cache_readiness_recheck();
     assets->validate_assets_unchanged();
     std::vector<HipMtpReplayRow> replay_rows;replay_rows.reserve(golden.rows.size());
+    std::optional<q6p::iu4::SuspendScope> exact_golden_scope;exact_golden_scope.emplace();  // golden replay = exact arithmetic (onfly INT4 suspended)
     std::vector<std::uint32_t> generated;generated.reserve(static_cast<std::size_t>(options.generate_tokens));
     std::uint64_t cycles=0,proposed=0,accepted=0,target_rows=0,window_attempts=0,window_accepts=0,window_restores=0,r2_dispatches=0;
     std::array<std::uint64_t,9> chosen_rows{};
@@ -2621,6 +2624,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
         if(runtime->next_source_position()+1U!=session.next_position)
             throw std::logic_error("MTP replay did not prime the actual final prompt frontier");
         replay_rows.clear(); // release prompt snapshots before bounded cycles
+        exact_golden_scope.reset();
         if(options.rotary.mode()==RotaryMode::yarn) {
             // Qualification retains its receipts/pins; calibration values are no
             // longer read. Release their storage before prompt/chain owners grow.
