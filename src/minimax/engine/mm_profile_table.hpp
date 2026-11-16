@@ -21,7 +21,7 @@ namespace strix::minimax::defaults {
 //                  the bundle does not select it with STRIX_MMX_MODEL_FORMAT=fast_i4 (gate fails there, KL 0.079).
 // A set member variable wins over the bundle ("0" = off beats it). Changes logits.
 inline constexpr strix::fast_profile::Member kFastMembers[] = {
-    {"STRIX_MM_PF_MSA_FLASH", "1", "msa-flash-bf16-l40-v1", "1 2"},
+    {"STRIX_MM_PF_MSA_FLASH", "1", "msa-flash-bf16-l40-v1", "1 2 3"},
 };
 inline constexpr strix::fast_profile::Bundle kFastBundle{"STRIX_MM_FAST_PREFILL", "mm-fast-pf-v1", kFastMembers};
 inline constexpr const char* kMsaFlashLayers = "40-59";  // passes the FAST gate on EXL3 at 8K and 32K; 30-59 8K only
@@ -33,7 +33,9 @@ inline constexpr unsigned kMsaLayers = 60;
 //   l30-v1  8K PASS (KL 0.0076, top-1 98.2 %, dNLL -0.0096); 32K FAIL (b32k KL 0.042, dNLL +0.012; c32k dNLL +0.016):
 //           explicit STRIX_MM_PF_MSA_FLASH_LAYERS=30-59 only, for prompts of at most 8K tokens. The layer set is
 //           resolved once per process, so the bundle cannot switch it by prompt length.
-// Any other mask / the two-term mode is reported by its ranges.
+// Any other mask / the two-term mode is reported by its ranges. Mode 3 (explicit only, not gated yet) = one-term
+// operands on the shared core's row-group form (attn_core/sparse_flash_rowgroup.hpp: 4 neighbouring rows per
+// work-group share each K/V tile; one softmax stream per row): policy msa-flash-bf16-rg4-l<ranges>.
 struct MsaFlashPolicy {
     const char* layers;
     const char* policy;

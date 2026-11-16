@@ -69,4 +69,12 @@ struct MsaFlashPolicy {
         norm_rope_lane(q, x.q_w, *x.rope, lane);
     }
     static __device__ __forceinline__ float* out(const Args&, const Row& x) { return x.o; }
+    // Row-group form (attn_core/sparse_flash_rowgroup.hpp): row group = `rows` consecutive launch rows of one KV group.
+    // Every row has <= kTopK segments: sparse rows the selection, dense windows only rows before kTopK blocks.
+    static constexpr unsigned kMaxSegs = kTopK;
+    static __device__ __forceinline__ unsigned member(const Args& a, unsigned group, unsigned i, unsigned rows) {
+        const unsigned kvh = a.p.window.kv_heads, r = rows * (group / kvh) + i;
+        return r < a.p.rows - a.p.first_window * kMaxRows ? r * kvh + group % kvh : ~0U;
+    }
+    static __device__ __forceinline__ std::size_t key_stride(const Args& a) { return std::size_t{a.p.window.kv_heads} * kHeadDim; }
 };

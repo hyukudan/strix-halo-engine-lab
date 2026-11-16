@@ -5,12 +5,17 @@
 //
 // Build: amdclang++ -x hip --offload-arch=gfx1151 -O3 -std=c++20 -I<repo>/src -I<repo>/include flash_keysplit_bench.hip
 // Run:   flash_keysplit_bench POS0 ROWS R OPT [SPLIT]   -> one line: ms (median of 20), TFLOPS, output fnv64
-//        POS0 = position of the first row, ROWS = rows in the launch, OPT = core Opt bits (0 = incumbent schedule).
+//        POS0 = position of the first row, ROWS = rows in the launch, OPT = core Opt bits (0 = incumbent schedule);
+//        OPT 8 = row-group form (sparse_flash_rowgroup.hpp, 4 rows per work-group; SPLIT must be 0).
+//        [DRIFT]: if given (>= 0), each row's selection is its predecessor's with DRIFT of the 15 older blocks
+//        replaced (R ignored). OPT != 0 also prints max |out - out(OPT 0)| (same SPLIT) and max |out(OPT 0)|.
 #include "attn_core/sparse_flash_keysplit.hpp"
+#include "attn_core/sparse_flash_rowgroup.hpp"
 
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -78,6 +83,12 @@ struct BenchPolicy {
         q[3] = v.w;
     }
     static __device__ __forceinline__ float* out(const Args&, const Row& x) { return x.o; }
+    static constexpr unsigned kMaxSegs = kTop;
+    static __device__ __forceinline__ unsigned member(const Args& a, unsigned group, unsigned i, unsigned n) {
+        const unsigned r = n * (group / kKvh) + i;
+        return r < a.rows ? r * kKvh + group % kKvh : ~0U;
+    }
+    static __device__ __forceinline__ std::size_t key_stride(const Args&) { return std::size_t{kKvh} * kD; }
 };
 
 std::uint16_t bf16(float f) {
@@ -98,6 +109,12 @@ template <unsigned Opt, bool Split> void launch(const BenchPolicy::Args& a, unsi
     hipLaunchKernelGGL((ks::flash_rows_keysplit_kernel<BenchPolicy, Split, Opt>), dim3(wgs), dim3(ks::KeySplit<kH, kD>::kThreads), 0,
                        nullptr, a);
 }
+void launch_rowgroup(const BenchPolicy::Args& a, unsigned rows) {
+    namespace ks = strix::attn_core::sparse;
+    using G = ks::RowGroup<kH, kD, kTop>;
+    hipLaunchKernelGGL((ks::flash_rowgroup_kernel<BenchPolicy>), dim3((rows + G::kRows - 1) / G::kRows * kKvh), dim3(G::kThreads), 0,
+                       nullptr, a);
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -107,6 +124,7 @@ int main(int argc, char** argv) {
     }
     const unsigned pos0 = std::atoi(argv[1]), rows = std::atoi(argv[2]), reuse = std::max(1, std::atoi(argv[3]));
     const unsigned opt = std::atoi(argv[4]), split = argc > 5 ? std::atoi(argv[5]) : 0;
+    const int drift = argc > 6 ? std::atoi(argv[6]) : -1;
     const std::size_t npos = pos0 + rows;
     std::mt19937 rng(12345);
     std::uniform_real_distribution<float> u(-1.0F, 1.0F);
@@ -121,6 +139,31 @@ int main(int argc, char** argv) {
         const unsigned nb = (pos0 + r + 1 + kBlk - 1) / kBlk;
         keys += kKvh * std::uint64_t{nb <= kTop ? pos0 + r + 1 : (kTop - 1) * kBlk + (pos0 + r + 1 - (nb - 1) * kBlk)};
         if (nb <= kTop) continue;
+        if (drift >= 0) {
+            static std::vector<std::vector<std::uint32_t>> prev(kKvh);
+            static std::mt19937 dr(777U);
+            for (unsigned g = 0; g < kKvh; ++g) {
+                std::vector<std::uint32_t>& cur = prev[g];
+                const auto has = [&](std::uint32_t b) { return std::find(cur.begin(), cur.end(), b) != cur.end(); };
+                if (cur.empty()) {
+                    while (cur.size() < kTop - 1) {
+                        const std::uint32_t b = dr() % (nb - 1);
+                        if (!has(b)) cur.push_back(b);
+                    }
+                } else {
+                    for (int i = 0; i < drift; ++i) {
+                        std::uint32_t b = dr() % (nb - 1);
+                        while (has(b)) b = dr() % (nb - 1);
+                        cur[dr() % cur.size()] = b;
+                    }
+                }
+                std::sort(cur.begin(), cur.end());
+                std::uint32_t* d = &ids[(std::size_t{r} * kKvh + g) * kTop];
+                for (unsigned i = 0; i < kTop - 1; ++i) d[i] = cur[i];
+                d[kTop - 1] = nb - 1;
+            }
+            continue;
+        }
         for (unsigned g = 0; g < kKvh; ++g) {
             std::mt19937 sr(1000003U * (r / reuse) + 7U * g + 1U);
             std::vector<std::uint32_t> pool(nb - 1);
@@ -146,7 +189,7 @@ int main(int argc, char** argv) {
     check(hipMemcpy(dids, ids.data(), ids.size() * 4, hipMemcpyHostToDevice), "copy");
     const BenchPolicy::Args a{dk, dv, dq, dids, dout, rows, pos0};
     const unsigned wgs = rows * kKvh;
-    auto run = [&] {
+    const auto run_opt = [&](unsigned opt) {
         const unsigned key = opt * 2U + (split != 0 ? 1U : 0U);
         switch (key) {
             case 0: launch<0, false>(a, wgs); break;
@@ -155,9 +198,11 @@ int main(int argc, char** argv) {
             case 3: launch<1, true>(a, wgs); break;
             case 4: launch<2, false>(a, wgs); break;
             case 5: launch<2, true>(a, wgs); break;
+            case 16: launch_rowgroup(a, rows); break;
             default: std::fprintf(stderr, "unknown OPT\n"); std::exit(1);
         }
     };
+    const auto run = [&] { run_opt(opt); };
     for (int i = 0; i < 3; ++i) run();
     check(hipDeviceSynchronize(), "warmup");
     hipEvent_t e0, e1;
@@ -179,8 +224,19 @@ int main(int argc, char** argv) {
     std::uint64_t h = 1469598103934665603ULL;
     const auto* b = reinterpret_cast<const unsigned char*>(out.data());
     for (std::size_t i = 0; i < out.size() * 4; ++i) h = (h ^ b[i]) * 1099511628211ULL;
+    float diff = 0.0F, big = 0.0F;
+    if (opt != 0) {
+        check(hipMemset(dout, 0, out.size() * 4), "clear");
+        run_opt(0);
+        std::vector<float> ref(out.size());
+        check(hipMemcpy(ref.data(), dout, ref.size() * 4, hipMemcpyDeviceToHost), "copy back");
+        for (std::size_t i = 0; i < ref.size(); ++i) {
+            diff = std::max(diff, std::fabs(out[i] - ref[i]));
+            big = std::max(big, std::fabs(ref[i]));
+        }
+    }
     const double flop = double(keys) * kH * kD * 4.0 * (split != 0 ? 2.0 : 1.0);
-    std::printf("pos0 %u rows %u R %u opt %u split %u ms %.3f min %.3f TFLOPS %.2f fnv %016llx\n", pos0, rows, reuse, opt, split, ms[10],
-                ms[0], flop / (ms[10] * 1e-3) / 1e12, static_cast<unsigned long long>(h));
+    std::printf("pos0 %u rows %u R %u opt %u split %u ms %.3f min %.3f TFLOPS %.2f fnv %016llx drift %d maxdiff %.3g maxref %.3g\n", pos0, rows, reuse, opt, split, ms[10],
+                ms[0], flop / (ms[10] * 1e-3) / 1e12, static_cast<unsigned long long>(h), drift, diff, big);
     return 0;
 }

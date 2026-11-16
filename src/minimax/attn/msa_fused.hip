@@ -9,6 +9,7 @@
 #include "attn_core/index_score_band.hpp"
 #include "attn_core/index_score_wmma.hpp"
 #include "attn_core/sparse_flash_keysplit.hpp"
+#include "attn_core/sparse_flash_rowgroup.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -2360,6 +2361,19 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
         }
         const auto chunks = prefill_chunk_prefix(p.pos0 + scheduled.rows) -
                             prefill_chunk_prefix(p.pos0 + p.first_window * kMaxRows);
+        if (p.msa_rework == 13) {
+            // FAST: one-term flash on the shared core's row-group form: 4 neighbouring rows of one KV group per block
+            // share each K/V tile of their merged block lists (same selection and block lists as mode 11; one softmax
+            // stream per row, so not mode 11's bytes).
+            namespace ks = strix::attn_core::sparse;
+            using RG = ks::RowGroup<kGroup, kHeadDim, MsaFlashPolicy::kMaxSegs>;
+            const unsigned rows = scheduled.rows - p.first_window * kMaxRows;
+            const MsaFlashArgs args{scheduled, DENSE ? 1U : 0U};
+            hipLaunchKernelGGL((ks::flash_rowgroup_kernel<MsaFlashPolicy>), dim3((rows + RG::kRows - 1) / RG::kRows * v.kv_heads),
+                               dim3(RG::kThreads), 0, stream, args);
+            hip_check(hipGetLastError(), "minimax prefill flash attend (row groups)");
+            return;
+        }
         if (p.msa_rework == 11 || p.msa_rework == 12) {
             // FAST: BF16 WMMA key-split flash on the shared core, one block per (row, group); same grid and block
             // lists as mode 10. 11 = one-term operands, 12 = two-term (hi + lo) queries and probabilities. Not

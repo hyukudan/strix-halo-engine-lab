@@ -983,7 +983,8 @@ struct Engine::Impl {
         }
         if (pf_msa_flash != 0 && defaults::msa_flash_decline_reason(pf_msa_rework != 0, attn_prefill_fused,
                                                                   pf_msa_flash_layers.count()) == nullptr)
-            std::fprintf(stderr, "prefill identity mm-pf-msa-flash FAST (bf16 WMMA key-split MSA attend, %u-term operands, %u layers)\n", pf_msa_flash, pf_msa_flash_layers.count());
+            std::fprintf(stderr, "prefill identity mm-pf-msa-flash FAST (bf16 WMMA key-split MSA attend, %u-term operands%s, %u layers)\n",
+                         pf_msa_flash == 2 ? 2U : 1U, pf_msa_flash == 3 ? ", row groups of 4" : "", pf_msa_flash_layers.count());
         if (i4_shadow && !model_fast_i4)
             throw std::invalid_argument("STRIX_MMX_FAST_I4_SHADOW needs STRIX_MMX_MODEL_FORMAT=fast_i4");
         if (model_fast_i4) {

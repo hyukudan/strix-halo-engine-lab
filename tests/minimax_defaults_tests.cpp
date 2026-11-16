@@ -650,6 +650,9 @@ void test_fast_prefill_profile() {
         const EnvMap two_env{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MM_PF_MSA_FLASH", "2"}};
         const auto two = md::prefill_policy(lookup(two_env));
         check(two.msa_flash == 2 && two.msa_flash_asked == "2" && two.policies == "msa-flash-bf16-2term-l40-59", "fast profile: explicit 2 wins");
+        const EnvMap rg_env{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MM_PF_MSA_FLASH", "3"}};
+        const auto rg = md::prefill_policy(lookup(rg_env));
+        check(rg.msa_flash == 3 && rg.policies == "msa-flash-bf16-rg4-l40-59", "fast profile: explicit 3 = row-group form");
         const EnvMap legacy_env{{"STRIX_MM_PF_MSA_FLASH", "1"}, {"STRIX_MM_PF_MSA_FLASH_LAYERS", "50-59"}};
         const auto legacy = md::prefill_policy(lookup(legacy_env));
         check(legacy.msa_flash == 1 && legacy.policies == "msa-flash-bf16-l50-59", "fast profile: the legacy opt-in still runs, named by its layers");
