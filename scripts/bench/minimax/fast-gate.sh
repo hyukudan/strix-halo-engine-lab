@@ -5,6 +5,8 @@
 #   GPU (one arm per ticket):
 #     ticket.sh OUT minimax/fast-gate run --bin BIN --model MODEL_DIR --arm 'NAME|ARGS|ENV' --sessions a=A.u32,b=B.u32
 #         [--capacity 34816] [--rows 256]
+#     --rows 0 = timing route: same run without the quality dump env (no logit rows are captured inside the
+#     timed prefill); seal/compare need a run with rows > 0. Both ranks' inputs are checked before launch.
 #   CPU (after the tickets, no GPU):
 #     fast-gate.sh seal    --out OUT --arm NAME --bin BIN --model MODEL_DIR --sessions ...   (both ranks)
 #     fast-gate.sh compare --out OUT --ref NAME --cand NAME [--dnll-rule abs] [gate args...]
@@ -39,14 +41,20 @@ for s in "${SS[@]}"; do SA+=(--session "${s%%=*}:${s#*=}:1"); PR+=(--prompt "${s
 case $mode in
 run)
     [[ -x $bin && -e $model && ${#SS[@]} -gt 0 && -n $name ]] || kit_die 'run needs --bin, --model, --sessions and --arm'
+    [[ $rows =~ ^[0-9]+$ ]] || kit_die "--rows must be a count (0 = timing route without quality dumps)"
     kit_same_binary "$bin"
+    kit_peer_inputs "$model" "${SS[@]}" "${A[@]}"
     d=$out/$name
     [[ -e $d-r0 ]] && kit_die "run dir $d-r0 exists (never reused)"
-    q=(STRIX_SESSION_CACHE=0 STRIX_MM_STATE_FNV=1 STRIX_MM_QUALITY_ROWS=$rows STRIX_MM_QUALITY_SELECT=1)
     peer_out=${KIT_PEER_OUT:-$out}
-    p1=(env "${q[@]}" STRIX_MM_QUALITY_OUT="$peer_out/$name-r1/q" "${E[@]}" "$bin" "$model" 1 usb4-auto "$peer_out/$name-r1/w"
+    q=(STRIX_SESSION_CACHE=0 STRIX_MM_STATE_FNV=1) q1=() q0=()
+    if ((rows > 0)); then
+        q+=(STRIX_MM_QUALITY_ROWS=$rows STRIX_MM_QUALITY_SELECT=1)
+        q1=(STRIX_MM_QUALITY_OUT="$peer_out/$name-r1/q") q0=(STRIX_MM_QUALITY_OUT="$d-r0/q")
+    fi
+    p1=(env "${q[@]}" "${q1[@]}" "${E[@]}" "$bin" "$model" 1 usb4-auto "$peer_out/$name-r1/w"
         --slots 1 --capacity "$cap" --max-rows 4096 "${SA[@]}" "${A[@]}")
-    p0=(env "${q[@]}" STRIX_MM_QUALITY_OUT="$d-r0/q" "${E[@]}" "$bin" "$model" 0 usb4-auto "$d-r0/w"
+    p0=(env "${q[@]}" "${q0[@]}" "${E[@]}" "$bin" "$model" 0 usb4-auto "$d-r0/w"
         --slots 1 --capacity "$cap" --max-rows 4096 "${SA[@]}" "${A[@]}")
     export KIT_TAG=$name KIT_ARM=$name KIT_ROUND=0 KIT_TOKENS=0 KIT_EXPECTED=0
     export KIT_RECEIPT_ARGS='--need-prefill --family minimax --require ranks.AGREE'
