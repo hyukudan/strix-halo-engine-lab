@@ -1,5 +1,6 @@
 #include "strix/env_flags.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
+#include "core/ordered_reduce.hpp"
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_ggml_weight_formats.hpp"
 #include "strix/known_prefill_limits.hpp"
@@ -1151,19 +1152,15 @@ __global__ void ple_rows_gate_norm_kernel(
         key_square += k * k;
         query_square += q * q;
     }
-    key_reduce[lane] = key_square;
-    query_reduce[lane] = query_square;
-    __syncthreads();
-    for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
-        if (lane < stride) {
-            key_reduce[lane] += key_reduce[lane + stride];
-            query_reduce[lane] += query_reduce[lane + stride];
-        }
-        __syncthreads();
-    }
+    // Halving trees of key_reduce/query_reduce, levels 16..1 in wave 0 registers (core/ordered_reduce.hpp: same pairing
+    // and bits, 3 barriers per tree instead of 9). The barrier after each lane-0 block is the reuse barrier.
+    namespace tree = ::strix::core::ordered_reduce;
+    float* const square_reduce[2] = {key_reduce, query_reduce};
+    float squares[2] = {key_square, query_square};
+    tree::tree_to_lane0<kThreads, 2U>(square_reduce, squares, lane);
     if (lane == 0) {
-        inverse_key = rsqrtf(key_reduce[0] / static_cast<float>(hidden_size) + epsilon);
-        inverse_query = rsqrtf(query_reduce[0] / static_cast<float>(hidden_size) + epsilon);
+        inverse_key = rsqrtf(squares[0] / static_cast<float>(hidden_size) + epsilon);
+        inverse_query = rsqrtf(squares[1] / static_cast<float>(hidden_size) + epsilon);
     }
     __syncthreads();
 
@@ -1175,14 +1172,9 @@ __global__ void ple_rows_gate_norm_kernel(
             bf16_to_float(query[index]) * inverse_query * load_small(query_norm, query_norm_kind, index);
         dot += normalized_key * normalized_query;
     }
-    key_reduce[lane] = dot;
-    __syncthreads();
-    for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
-        if (lane < stride) key_reduce[lane] += key_reduce[lane + stride];
-        __syncthreads();
-    }
+    dot = tree::tree_to_lane0<kThreads>(key_reduce, dot, lane);
     if (lane == 0) {
-        const float score = key_reduce[0] / sqrtf(static_cast<float>(hidden_size));
+        const float score = dot / sqrtf(static_cast<float>(hidden_size));
         const float magnitude = sqrtf(fmaxf(fabsf(score), 1e-6F));
         const float signed_root = score > 0.0F ? magnitude : score < 0.0F ? -magnitude : 0.0F;
         gate = 1.0F / (1.0F + expf(-signed_root));
@@ -1196,13 +1188,8 @@ __global__ void ple_rows_gate_norm_kernel(
         const float gated = ple_rows_exact_mul(value[feature], g);
         square += gated * gated;
     }
-    key_reduce[lane] = square;
-    __syncthreads();
-    for (std::uint32_t stride = kThreads / 2U; stride > 0; stride >>= 1U) {
-        if (lane < stride) key_reduce[lane] += key_reduce[lane + stride];
-        __syncthreads();
-    }
-    if (lane == 0) inverse_rms = rsqrtf(key_reduce[0] / static_cast<float>(hidden_size) + epsilon);
+    square = tree::tree_to_lane0<kThreads>(key_reduce, square, lane);
+    if (lane == 0) inverse_rms = rsqrtf(square / static_cast<float>(hidden_size) + epsilon);
     __syncthreads();
     for (std::uint32_t feature = lane; feature < hidden_size; feature += kThreads) {
         const auto index = base + feature;

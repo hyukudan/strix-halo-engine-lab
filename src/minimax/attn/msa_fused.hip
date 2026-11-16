@@ -1331,6 +1331,11 @@ __device__ __forceinline__ void group_scores_h(const uint2* tile, unsigned grp, 
     }
 }
 
+// chunkinv-attn-state-v1 (src/core/chunk_contract.hpp): bound as is. Every MSA mode cuts a row's keys into absolute
+// 128-key blocks of its own position (block_count(pos + 1), idx_count per row), the partial combine runs in ascending
+// block order (prefill_combine_kernel), exact modes accumulate per row in scalar FMA, and the FAST key-split core
+// zeroes the V of keys past the visible count (attn_core/sparse_flash_keysplit.hpp), so no partition or WMMA K pair
+// depends on neighbouring queries or the call's rows. Index scores are per (row, key) with no key reduction.
 // Number of valid 128-key partials for positions [0, end).
 __host__ __device__ std::uint64_t prefill_chunk_prefix(std::uint64_t end) {
     const std::uint64_t limit = kTopK * kBlock;

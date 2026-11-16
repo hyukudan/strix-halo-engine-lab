@@ -9,12 +9,12 @@
 // src/prompt_terminal_diagnostics.cpp; include/strix/session/checkpoint_io.hpp;
 // src/session/checkpoint_io.cpp. The recursive session scope detects the last
 // two additions; extending the audit's other exact scopes is separate work.
-{"CMakeLists.txt", 0xf75bf891438b1ad8ULL},
+{"CMakeLists.txt", 0x29d36a06a0b54204ULL},
 {"apps/minimax_rank_main.cpp", 0xdafbd8266583dba0ULL},
 
 
 {"apps/minimax_serve_main.cpp", 0x901f15e2f283f377ULL},
-{"cmake/StrixSession.cmake", 0x542fe6fbe1e9d983ULL},
+{"cmake/StrixSession.cmake", 0x1fbbb6c55e80be02ULL},
 {"include/strix/bp_codec.hpp", 0x879520c3a673e0acULL},
 {"include/strix/hip_minimax_moe.hpp", 0xafeacaf792657053ULL},
 {"include/strix/hip_minimax_msa.hpp", 0x52145037fe615f8dULL},
@@ -52,7 +52,7 @@
 {"src/minimax/attn/index_proj.hpp", 0x2aac71c5947fec1fULL},
 {"src/minimax/attn/index_proj_tests.hip", 0x0f1909d729f105beULL},
 {"src/minimax/attn/msa_flash_policy.hpp", 0x6145468dde882efcULL},
-{"src/minimax/attn/msa_fused.hip", 0xc269612a4fc82653ULL},
+{"src/minimax/attn/msa_fused.hip", 0x93d5a54e9196955fULL},
 {"src/minimax/attn/msa_fused.hpp", 0xd1fa22ab20594e2dULL},
 {"src/minimax/attn/msa_fused_tests.hip", 0x638638dff9689cd0ULL},
 {"src/minimax/attn/msa_inblock_layout.hpp", 0x617784020ff4b04fULL},
@@ -106,7 +106,7 @@
 {"src/minimax/moe/mmx_trellis_device.hpp", 0x11cfbcfe7d145fe4ULL},
 {"src/minimax/pfx/pf_crc.cpp", 0xefbe65eb2a3ec54dULL},
 {"src/minimax/pfx/pf_crc.hpp", 0xa9ad32c18b11abe1ULL},
-{"src/minimax/pfx/pf_exchange.hip", 0xc26408d9edc8708fULL},
+{"src/minimax/pfx/pf_exchange.hip", 0x8e65ed281f165a4eULL},
 {"src/minimax/pfx/pf_exchange.hpp", 0x7dc8d4bed78e490bULL},
 {"src/minimax/pfx/pf_route.hpp", 0x878d7c6a37f4125fULL},
 {"src/minimax/pfx/pf_wire.hpp", 0xa9288211f52dfd9aULL},
@@ -168,7 +168,7 @@
 {"src/moe_core/decode_schedule.hpp", 0x11d945bbc7e75567ULL},
 {"src/moe_core/dense_a8_small.inc", 0x01133f92f0724019ULL},
 {"src/moe_core/dense_a8_small_layout.hpp", 0x61bf1cc95aac0b4aULL},
-{"src/moe_core/device_plan.hpp", 0x9564d02af0ff8c02ULL},
+{"src/moe_core/device_plan.hpp", 0xd11705be6d35d151ULL},
 {"src/moe_core/device_plan_index.hpp", 0x123ba19e0be85987ULL},
 {"src/moe_core/exl3_trellis.hpp", 0x5fc38e991faf2a23ULL},
 {"src/moe_core/grouped_core.hpp", 0x80e99be3df2f4e6dULL},
