@@ -47,6 +47,27 @@ template <bool kOut> void run(unsigned heads, unsigned C, std::mt19937& g, bool 
     M::gemm<kLora, kDim, kOut>(dx, dk, heads, C, dy, nullptr);
     ok(hipGetLastError(), "launch");
     ok(hipMemcpy(y.data(), dy, y.size() * 4, hipMemcpyDeviceToHost), "y d2h");
+    if constexpr (!kOut) {  // bf16 q-tilde image (fused core 22 / 23): bitwise tile::to_bf16 of the FP32 sums, guard kept
+        std::uint16_t* dz;
+        const std::size_t zn = yn + guard;
+        ok(hipMalloc(&dz, zn * 2), "z");
+        std::vector<std::uint16_t> z(zn, 0xA5A5U);
+        ok(hipMemcpy(dz, z.data(), zn * 2, hipMemcpyHostToDevice), "z h2d");
+        M::gemm<kLora, kDim, kOut>(dx, dk, heads, C, reinterpret_cast<float*>(dz), nullptr, true);
+        ok(hipGetLastError(), "image launch");
+        ok(hipMemcpy(z.data(), dz, zn * 2, hipMemcpyDeviceToHost), "z d2h");
+        ok(hipFree(dz), "z free");
+        std::size_t bad = 0;
+        for (std::size_t i = 0; i < yn; ++i) {
+            std::uint32_t u;
+            std::memcpy(&u, &y[i], 4);
+            const std::uint16_t ref = (u & 0x7FFFFFFFU) > 0x7F800000U ? static_cast<std::uint16_t>((u >> 16) | 0x40U)
+                                                                         : static_cast<std::uint16_t>((u + 0x7FFFU + ((u >> 16) & 1U)) >> 16);
+            bad += z[i] != ref;
+        }
+        for (std::size_t i = yn; i < zn; ++i) bad += z[i] != 0xA5A5U;
+        check(bad == 0, "absorb H" + std::to_string(heads) + " C" + std::to_string(C) + " bf16 image == to_bf16(FP32 sums), guard kept");
+    }
     // Sampled rows: the first, the last, fragment / CTA edges and a stride; every head, every output.
     std::vector<unsigned> rows{0, C - 1};
     for (unsigned r : {15U, 16U, 127U, 128U, 129U}) if (r < C) rows.push_back(r);

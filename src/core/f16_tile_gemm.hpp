@@ -22,9 +22,13 @@
 //           16 ds_store_b16 (a wave writes 64 contiguous bytes per store), so no transposed weight copy is kept.
 //   grid  : x = column tile (fastest), y = 128-row block, z = batch: the column CTAs of one row block run back to back
 //           and read their A tile from L2; a batch's weights (all its row blocks) stay L2-resident.
-// Store policy: where a finished sum goes (default RawStore: y[b][r][n] = sum, FP32).
+// Store policy: where a finished sum goes (default RawStore: y[b][r][n] = sum, FP32; Bf16Store: the bf16 image
+// attn_core tile::to_bf16(sum) (RNE, the operand bits a bf16 WMMA consumer makes of the FP32 sum) as u16 at the same
+// element strides, half the output bytes; the sums themselves are unchanged).
 //   put(b, r, n, v): row r < rows, column n, v = the chain's sum. One call per output.
 // Limits (callers check with fits()): K % 32 == 0, N % 128 == 0, rows >= 1, 16-byte aligned a / w / y row starts.
+#include "attn_core/wmma_types.hpp"
+
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
@@ -64,6 +68,14 @@ struct RawStore {
     std::size_t y_row, y_batch;
     __device__ __forceinline__ void put(unsigned b, unsigned r, unsigned n, float v) const {
         y[b * y_batch + r * y_row + n] = v;
+    }
+};
+
+struct Bf16Store {
+    std::uint16_t* y;
+    std::size_t y_row, y_batch;
+    __device__ __forceinline__ void put(unsigned b, unsigned r, unsigned n, float v) const {
+        y[b * y_batch + r * y_row + n] = strix::attn_core::tile::to_bf16(v);
     }
 };
 
@@ -182,8 +194,13 @@ inline dim3 grid(const Args& p) {
     return p.order == 1U ? dim3(p.N / kBN, p.batches, rb) : dim3(p.N / kBN, rb, p.batches);
 }
 
-template <Layout L> inline void gemm(const Args& p, hipStream_t s) {
-    gemm_kernel<L, RawStore><<<grid(p), kThreads, 0, s>>>(p, RawStore{p.y, p.y_row, p.y_batch});
+template <Layout L, class Store> inline void gemm(const Args& p, const Store& store, hipStream_t s) {
+    gemm_kernel<L, Store><<<grid(p), kThreads, 0, s>>>(p, store);
+}
+template <Layout L> inline void gemm(const Args& p, hipStream_t s) { gemm<L>(p, RawStore{p.y, p.y_row, p.y_batch}, s); }
+// Bf16Store into y's memory (the u16 image occupies its first half; same element strides).
+template <Layout L> inline void gemm_bf16(const Args& p, hipStream_t s) {
+    gemm<L>(p, Bf16Store{reinterpret_cast<std::uint16_t*>(p.y), p.y_row, p.y_batch}, s);
 }
 
 }  // namespace strix::core::f16_tile_gemm

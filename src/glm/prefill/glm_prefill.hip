@@ -3483,7 +3483,8 @@ void mla_mark(unsigned i, hipStream_t s) {
 void set_mla_profile(hipEvent_t* ev6) { g_mla_prof = ev6; }
 // FAST glm-pf-attn-wmma (default with STRIX_GLM_PF_WMMA=1, STRIX_GLM_PF_ATTN_WMMA=0 opts out; heads 32): the fused core
 // (20 = T 32, 21 = T 16; 22 / 23 = the same with the bf16 q-tilde image, same bits, STRIX_GLM_PF_MLA_QT16=0 opts out)
-// instead of the o-bar selector; absorb / out keep the exact GEMM selector (the image needs absorb v3, else 22/23 = 20/21).
+// instead of the o-bar selector; absorb / out keep the exact GEMM selector (the image needs absorb v3 or the FAST MLA
+// WMMA GEMM, which stores the same bf16 image of its own sums; else 22/23 = 20/21).
 static unsigned obar_env_version(unsigned heads) {
     static const bool fused = attn_wmma::enabled();
     static const unsigned keys = attn_wmma::block_keys();
@@ -3498,10 +3499,14 @@ bool mla_e_lane_major(unsigned heads) {
 
 // FAST glm-pf-mla-wmma-v1 (STRIX_GLM_PF_MLA_WMMA=1, opt-in): absorb (kOut = false) / out GEMM on the shared short-K FP16
 // WMMA tile GEMM (glm_pf_mla_wmma.hpp); false = not selected, the caller runs its exact GEMM version.
+bool mla_wmma_selected(const float* x, const std::uint16_t* kv_b, unsigned heads, unsigned C) {
+    return mla_wmma::enabled() && mla_wmma::fits<kKvLora, kMlaDim>(x, x, kv_b, heads, C);
+}
+// image (absorb only): y receives the bf16 q-tilde image the fused core 22 / 23 reads (same bits as its own conversion).
 template <bool kOut>
-bool mla_gemm_wmma(const float* x, const std::uint16_t* kv_b, unsigned heads, unsigned C, float* y, hipStream_t s) {
-    if (!mla_wmma::enabled() || !mla_wmma::fits<kKvLora, kMlaDim>(x, x, kv_b, heads, C)) return false;
-    mla_wmma::gemm<kKvLora, kMlaDim, kOut>(x, kv_b, heads, C, y, s);
+bool mla_gemm_wmma(const float* x, const std::uint16_t* kv_b, unsigned heads, unsigned C, float* y, hipStream_t s, bool image = false) {
+    if (!mla_wmma_selected(x, kv_b, heads, C)) return false;
+    mla_wmma::gemm<kKvLora, kMlaDim, kOut>(x, kv_b, heads, C, y, s, image);
     mla_wmma::calls.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -3514,10 +3519,10 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
     if (gemm_v != 1 && gemm_v != 2 && gemm_v != 3) throw std::runtime_error("glm pf mla_attention_rows_versions: unsupported gemm version");
     if (obar_v >= 20 && obar_v <= 23) {  // FAST fused core (T = 32 / 16, FP32 / bf16 q-tilde): absorb GEMM, flash core, out GEMM
         if (heads != 32) throw std::runtime_error("glm pf mla_attention_rows_versions: the fused attn-wmma core needs heads 32");
-        const bool q16 = obar_v >= 22 && gemm_v == 3;
+        const bool q16 = obar_v >= 22 && (gemm_v == 3 || mla_wmma_selected(q, kv_b, heads, C));
         const unsigned keys = obar_v % 2 == 1 ? 16U : 32U;
         mla_mark(0, s);
-        if (!q16 && mla_gemm_wmma<false>(q, kv_b, heads, C, qt, s)) {
+        if (mla_gemm_wmma<false>(q, kv_b, heads, C, qt, s, q16)) {
         } else if (q16) mla_gemm_rows_v3_kernel<false, true><<<g3_grid(kKvLora, C, heads, g3_heads_mid()), 256, 0, s>>>(q, kv_b, heads, C, qt, g3_heads_mid());
         else if (gemm_v == 3) mla_gemm_rows_v3_kernel<false><<<g3_grid(kKvLora, C, heads, g3_heads_mid()), 256, 0, s>>>(q, kv_b, heads, C, qt, g3_heads_mid());
         else if (gemm_v == 2) mla_gemm_rows_v2_kernel<false><<<dim3((C + kG2R - 1) / kG2R, kKvLora / kG2C, heads), 256, 0, s>>>(q, kv_b, heads, C, qt);
