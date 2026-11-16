@@ -73,6 +73,9 @@ static __device__ __forceinline__ void finish_block(const float* part, unsigned 
     strix::moe_core::hadamard128(v, lane);
 #pragma unroll
     for (int j = 0; j < 4; ++j) v[j] = v[j] * strix::moe_core::half_bits(svh[b * 128 + lane + 32U * static_cast<unsigned>(j)]);
+#if defined(STRIX_WFMT_CAPTURE) && STRIX_WFMT_CAPTURE
+    for (int j = 0; j < 4; ++j) strix::wfmt_trace::trellis_trace(strix::wfmt_trace::kTrellisFinish, v[j]);
+#endif
 }
 
     static __device__ __forceinline__ float router_accumulate(float w, float v, float acc) {

@@ -86,8 +86,13 @@ DEVICE_BRANCH = re.compile(
     r"^#if defined\(__HIP_DEVICE_COMPILE__\)\n(.*?)^#else\n.*?^#endif\n", re.MULTILINE | re.DOTALL)
 
 
+CAPTURE_HOOK = re.compile(
+    r"^#if defined\(STRIX_WFMT_CAPTURE\) && STRIX_WFMT_CAPTURE\n.*?^#endif\n", re.MULTILINE | re.DOTALL)
+
+
 def device_view(source):
-    """Device-compiled text of declarations that also carry a host emulation."""
+    """Device-compiled text of declarations that also carry a host emulation (test-only capture hooks are no production text)."""
+    source = CAPTURE_HOOK.sub("", source)
     source = DEVICE_BRANCH.sub(r"\1", source)
     return source.replace("__host__ __device__ __forceinline__", "__device__ __forceinline__")
 
