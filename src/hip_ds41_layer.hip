@@ -15,6 +15,7 @@
 #include "strix/hip_ds41_rn_wide.hpp"
 #include "strix/hip_ds41_f8_rows_fast.hpp"
 
+#include "strix/ds41_attention.hpp"  // q_b's RoPE image (enqueue_q_b_rope_image): RopeRow, rope_pair
 #include "strix/hip_ds41_formats.hpp"
 
 #include <hip/hip_fp16.h>
@@ -1495,8 +1496,11 @@ __global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8Dense
     if constexpr (Lean >= 1) asm volatile("" : "+v"(magic));
     // Lean >= 2: the activation codes as a buffer (raw, stride 0, offsets in bytes) and each row's byte offset
     const std::size_t abytes = static_cast<std::size_t>(v.rows) * v.x_stride;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wsign-conversion"  // num_records is int in some ROCm builtins, unsigned in others (clamped value)
     [[maybe_unused]] const __amdgpu_buffer_rsrc_t abuf = __builtin_amdgcn_make_buffer_rsrc(
-        const_cast<std::int8_t*>(v.codes), static_cast<short>(0), (abytes < 0x7fffffffU ? abytes : std::size_t{0x7fffffffU}), 0x31004000);
+        const_cast<std::int8_t*>(v.codes), static_cast<short>(0), static_cast<int>(abytes < 0x7fffffffU ? abytes : std::size_t{0x7fffffffU}), 0x31004000);
+#pragma clang diagnostic pop
     [[maybe_unused]] unsigned aoff[RT];
 #pragma unroll
     for (unsigned rt = 0; rt < RT; ++rt) {
@@ -1505,8 +1509,11 @@ __global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8Dense
     }
     // Lean >= 3: the weight tensor as a buffer and each output row's byte offset (K-offset included)
     const std::size_t wbytes = static_cast<std::size_t>(v.count) * row_bytes;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wsign-conversion"  // num_records is int in some ROCm builtins, unsigned in others (clamped value)
     [[maybe_unused]] const __amdgpu_buffer_rsrc_t wbuf = __builtin_amdgcn_make_buffer_rsrc(
-        const_cast<std::uint8_t*>(v.weight), static_cast<short>(0), (wbytes < 0x7fffffffU ? wbytes : std::size_t{0x7fffffffU}), 0x31004000);
+        const_cast<std::uint8_t*>(v.weight), static_cast<short>(0), static_cast<int>(wbytes < 0x7fffffffU ? wbytes : std::size_t{0x7fffffffU}), 0x31004000);
+#pragma clang diagnostic pop
     [[maybe_unused]] unsigned woff[OT];
 #pragma unroll
     for (unsigned t = 0; t < OT; ++t) {
@@ -3331,7 +3338,7 @@ static strix::core::f16_dense_tall::q8a8::View fast_dense_view(const Q8A8DensePr
 static bool enqueue_fast_dense(const Q8A8DensePrefillView& v, void* stream) {
     static const unsigned min_rows = fast_profile::dense_min_rows();
     namespace q8a8 = strix::core::f16_dense_tall::q8a8;
-    const auto f = fast_dense_view(v);
+    const q8a8::View f = fast_dense_view(v);
     if (v.rows < min_rows || !q8a8::supported(f)) return false;
     q8a8::enqueue_parts(f, v.k_parts, as_stream(stream));
     hip_check(hipGetLastError(), "Q8_0 x A8 FP16 dense launch");
@@ -3344,6 +3351,31 @@ bool enqueue_q8_0_a8_fast_core(const Q8A8DensePrefillView& v, void* stream) {
     if (!q8_0_a8_fast_core_supported(v)) return false;
     strix::core::f16_dense_tall::q8a8::enqueue_parts(fast_dense_view(v), 1U, as_stream(stream));
     hip_check(hipGetLastError(), "Q8_0 x A8 FP16 core launch (shared expert)");
+    return true;
+}
+
+// q_b's operand image for the flash core's query_op (hip_ds41_attention_flash.inl FlashAttentionQ16Policy): the pair
+// transform is the flash prologue's rope512 (rope_pair on pairs (d, d + 1), d = o % 512 >= 448, pair (d - 448) / 2,
+// the row's table), so image = to_bf16(rope(q)) with the bits query16 + frag_from_f32 produced from the FP32 q.
+struct QbRopeImage {
+    using Args = const attn::RopeRow*;
+    static constexpr strix::attn_core::tile::Operand kOp = strix::attn_core::tile::Operand::bf16;
+    static __device__ __forceinline__ void pair(const Args& rope, unsigned r, unsigned o, float& x0, float& x1) {
+        const unsigned d = o % attn::kHeadDim;
+        if (d < attn::kHeadDim - attn::kRopeDim) return;
+        const unsigned p = (d - (attn::kHeadDim - attn::kRopeDim)) / 2U;
+        attn::rope_pair(x0, x1, rope[r].c[p], rope[r].s[p], false);
+    }
+};
+bool enqueue_q_b_rope_image(const Q8A8DensePrefillView& v, std::uint16_t* image, const void* rope, void* stream) {
+    static const unsigned min_rows = fast_profile::dense_min_rows();
+    namespace q8a8 = strix::core::f16_dense_tall::q8a8;
+    const q8a8::View f = fast_dense_view(v);
+    if (!fast_dense_on() || rope == nullptr || v.k_parts != 1U || v.a8_codes != nullptr || v.rows < min_rows ||
+        v.count % attn::kHeadDim != 0U || !q8a8::supported_image(f, image))
+        return false;
+    q8a8::enqueue_image<QbRopeImage>(f, image, static_cast<const attn::RopeRow*>(rope), as_stream(stream));
+    hip_check(hipGetLastError(), "Q8_0 x A8 FP16 dense q image launch");
     return true;
 }
 

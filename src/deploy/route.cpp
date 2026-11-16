@@ -401,7 +401,8 @@ RoutePlan plan_route(const RouteRequest& request, const Inventory& inventory, co
     // Common closing: uncertainty, gate, notes.
     const auto finish = [&](RouteOption& o, const Protocol& p, std::string refusal, const std::string& notes) {
         o.gate = p.gate;
-        if (refusal.empty() && p.gate.empty()) refusal = "not qualified: protocol " + p.identity + " has no gate receipt";
+        if (refusal.empty() && (p.gate.empty() || p.gate == "pending"))
+            refusal = "not qualified: protocol " + p.identity + (p.gate.empty() ? " has no gate receipt" : " gate pending");
         o.selectable = refusal.empty() && o.predicted;
         o.reason = refusal.empty() ? notes : refusal + (notes.empty() ? "" : " (" + notes + ")");
         plan.options.push_back(std::move(o));

@@ -44,7 +44,7 @@ inline std::string without_prefix_reuse_policy(std::string text) {
 
 // Remove only additive reports; retain the frozen bytes of every incumbent field.
 inline std::string without_added_prefill_reports(std::string text) {
-    for (const char* key : {"prefill_identity", "prefill_identity_hash", "prefill_options_active",
+    for (const char* key : {"weight_plans", "prefill_identity", "prefill_identity_hash", "prefill_options_active",
             "compact_stage_images_requested", "hc_lowband_policy", "hc_lowband_route", "index_batch", "qwen_router_bf16",
             "early_setup", "eager_code_load", "hip_enable_deferred_loading", "t16k_policy", "profile", "prefill_moe_route_bf16",
             "prefill_storage_identity", "prefill_storage_identity_hash",

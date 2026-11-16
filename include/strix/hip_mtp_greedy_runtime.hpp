@@ -16,6 +16,7 @@ struct HipMtpGreedyCycleResult {
     std::vector<std::optional<ModelContentIdentity>> output_logits_digests; // emitted rows, diagnostic only
     std::uint32_t proposed_candidates=0,accepted_candidates=0;
     std::uint64_t consumed_target_rows=0;
+    std::uint64_t target_forwards=0; // own dispatches; shared cohort execution is counted separately
     bool eos=false,terminal_budget=false;
     HipMtpTargetHiddenTicket final_target;
     bool attempted_target_window=false,accepted_target_window=false,target_checkpoint_restored=false;
