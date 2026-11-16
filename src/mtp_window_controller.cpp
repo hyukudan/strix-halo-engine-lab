@@ -218,6 +218,7 @@ MtpBatchWindowController::Rule MtpBatchWindowController::parse_rule(std::string_
     if(text.find("cap4")!=std::string_view::npos) rule.cap=4;
     if(text.find("cap2")!=std::string_view::npos) rule.cap=2;
     if(text.find("budget")!=std::string_view::npos) rule.budget=true;
+    rule.measured=rule.budget && text.find("measured")!=std::string_view::npos;
     return rule;
 }
 std::size_t MtpBatchWindowController::calibration_bin(double p) {
@@ -340,6 +341,10 @@ std::vector<std::uint32_t> MtpBatchWindowController::budget_rows(std::span<const
         throw std::invalid_argument("joint MTP windows require 1..8 requests (16 above the lane bound) and two physical rows each");
     for(const auto& r:q) if(r.limit!=2U && r.limit!=4U && r.limit!=8U)
         throw std::invalid_argument("joint MTP window limit must be an admitted owner");
+    if(measured_plans(q.size())) {
+        auto measured=measured_rows(q,budget,prior,info);
+        if(!measured.empty()) return measured;
+    }
     // Regime selection: above the lane bound the measured cycle is faster with the fixed table's two rows per
     // request (the cost of a deeper row exceeds its yield there), so the budget plans only up to the bound.
     if(q.size()>mtp_serve_row_budget_max_lanes()) {
@@ -414,6 +419,64 @@ std::vector<std::uint32_t> MtpBatchWindowController::budget_rows(std::span<const
     if(info) *info=estimate(q,out,prior);
     return out;
 }
+std::vector<std::uint32_t> MtpBatchWindowController::measured_rows(std::span<const Request> q,std::uint32_t budget,bool prior,
+    PlanInfo* info) const {
+    // Exact maximum of expected tokens / (measured topology ms + predictor ms) over every owner assignment. A lane
+    // takes 0 (no draft, two physical rows), 2, 4 or 8 rows; the cycle cost depends only on the counts (#R4, #R8,
+    // drafting R2s), so a DP over lanes keeps each count triple's best tokens (9^3 states, ~23K steps at eight
+    // lanes, against 4^8 leaves for a plain enumeration) and the triples are then ranked by tokens per ms. Only a
+    // topology with >= 3 cycle samples prices: no slope is extrapolated across a dispatch or padding boundary.
+    const std::size_t n=q.size();
+    if(n==0U || n>8U) return {};
+    constexpr std::size_t D=9U,S=D*D*D;
+    constexpr std::uint32_t kRows[4]{0U,2U,4U,8U};
+    constexpr std::size_t kStep[4]{0U,1U,D*D,D}; // state index (a4*D+a8)*D+a2: what each choice adds
+    std::vector<double> best((n+1U)*S,-1.0);
+    std::vector<std::uint8_t> pick((n+1U)*S,0U);
+    best[0]=0.0;
+    for(std::size_t k=0;k<n;++k) {
+        double gain[4];
+        for(std::size_t c=0;c<4U;++c) {
+            const auto r=kRows[c];
+            const bool ok=(prior || r!=0U) && std::max(r,2U)<=q[k].limit && !(prior && r>rule_.cap);
+            gain[c]=ok?(r?expected(q[k],r,prior):1.0):-1.0;
+        }
+        for(std::size_t s=0;s<S;++s) {
+            const double v=best[k*S+s];
+            if(v<0.0) continue;
+            for(std::size_t c=0;c<4U;++c) {
+                if(gain[c]<0.0) continue;
+                const auto t=(k+1U)*S+s+kStep[c];
+                if(v+gain[c]>best[t]) {best[t]=v+gain[c];pick[t]=static_cast<std::uint8_t>(c);}
+            }
+        }
+    }
+    const double draft=prior?(draft_.samples()?draft_.value():1.2):0.0;
+    double best_rate=-1.0,best_e=0.0,best_ms=0.0;
+    std::size_t chosen=S;
+    for(std::size_t s=0;s<S;++s) {
+        const double e=best[n*S+s];
+        if(e<0.0) continue;
+        const std::uint32_t a4=static_cast<std::uint32_t>(s/(D*D)),a8=static_cast<std::uint32_t>((s/D)%D),a2=static_cast<std::uint32_t>(s%D);
+        const std::uint32_t r2=static_cast<std::uint32_t>(n)-a4-a8,used=2U*r2+4U*a4+8U*a8;
+        // Small primaries have exactly four or eight rows (see search).
+        if(used>budget || (used<9U && used!=4U && used!=8U)) continue;
+        const auto found=costs_.find({r2,a4,a8});
+        if(found==costs_.end() || found->second.provisional()) continue;
+        const double ms=found->second.value()+draft*static_cast<double>(a2+3U*a4+7U*a8);
+        if(!(ms>0.0)) continue;
+        if(e/ms>best_rate) {best_rate=e/ms;best_e=e;best_ms=ms;chosen=s;}
+    }
+    if(chosen==S) return {};
+    std::vector<std::uint32_t> out(n,2U);
+    for(std::size_t k=n,s=chosen;k>0U;--k) {
+        const auto c=pick[k*S+s];
+        out[k-1U]=kRows[c];
+        s-=kStep[c];
+    }
+    if(info) *info={best_e,best_ms,false};
+    return out;
+}
 MtpBatchWindowController::PlanInfo MtpBatchWindowController::estimate(std::span<const Request> q,
     std::span<const std::uint32_t> rows,bool prior) const {
     double e=0.0;std::uint32_t drafts=0;
@@ -424,7 +487,7 @@ std::vector<std::uint32_t> MtpBatchWindowController::plan(std::span<const Reques
     plan_members_=q.size();
     auto out=rule_.budget?budget_rows(q,budget,true,&last_):search(q,budget,true,&last_);
     probe_.clear();
-    if(rule_.budget && q.size()>mtp_serve_row_budget_max_lanes()) return out;
+    if(rule_.budget && q.size()>mtp_serve_row_budget_max_lanes() && !measured_plans(q.size())) return out;
     auto& plans=plans_.at(q.size());
     // Bounded exploration samples deeper windows even after a low-acceptance
     // region. It does not borrow another request's acceptance history.
@@ -432,7 +495,10 @@ std::vector<std::uint32_t> MtpBatchWindowController::plan(std::span<const Reques
         const auto depth=plans<=9U?(2U<<((plans-1U)%3U)):plans%96U<33U?8U:plans%96U<65U?4U:2U;
         std::uint32_t used=2U*static_cast<std::uint32_t>(q.size());
         std::fill(out.begin(),out.end(),2U);
-        for(std::size_t k=0;k<q.size();++k) {
+        for(std::size_t n=0;n<q.size();++n) {
+            // The measured rule rotates the first deep lane between probe rounds, so a mixed topology is not
+            // always the same lanes' (the budget fills lane 0 first, as before).
+            const auto k=measured_plans(q.size())?(n+(plans-1U)/3U)%q.size():n;
             auto r=std::min(depth,rule_.cap);while(r>q[k].limit || used+r-2U>budget) r/=2U;
             if(r>=2U) {out[k]=r;used+=r-2U;}
         }

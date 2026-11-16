@@ -69,6 +69,64 @@ double share(const Run& r,std::uint32_t rows) {
 } // namespace
 
 int main() {
+    {
+        // budget-measured: synthetic topology costs (policy behaviour, not device measurements).
+        using C=strix::MtpBatchWindowController;
+        const auto rule=C::parse_rule("budget-measured");
+        expect(rule.budget && rule.measured,"measured policy is explicit");
+        expect(!C::parse_rule("budget").measured && !C::parse_rule("measured").measured,"measured needs the budget rule");
+        const std::array<float,7> p{1,1,1,1,1,1,1};
+        std::vector<C::Request> q;
+        for(std::uint32_t i=0;i<8U;++i) q.push_back({i,8U,p});
+        const std::vector<std::uint32_t> r2(8,2U),r4(8,4U),a2(8,1U),a4(8,3U);
+        C measured(8,rule);
+        expect(measured.choose(q,32)==r2,"unmeasured C8 keeps the fixed two rows");
+        for(int i=0;i<3;++i) measured.observe(q,r2,a2,8.0,150.0,8U);
+        measured.observe(q,r4,a4,24.0,180.0,24U);
+        expect(measured.choose(q,32)==r2,"a provisional topology does not price");
+        for(int i=0;i<2;++i) measured.observe(q,r4,a4,24.0,180.0,24U);
+        expect(measured.choose(q,32)==r4,"measured C8 buys productive R4 owners");
+        C expensive(8,rule);
+        for(int i=0;i<3;++i) {expensive.observe(q,r2,a2,8.0,150.0,8U);expensive.observe(q,r4,a4,24.0,450.0,24U);}
+        expect(expensive.choose(q,32)==r2,"a measured expensive R4 topology loses to R2");
+        // A C8 table never prices a C4 topology: the same state under the budget rule plans the same.
+        const std::span<const C::Request> four(q.data(),4);
+        C budget_copy=measured;budget_copy.set_rule(C::parse_rule("budget"));
+        expect(measured.choose(four,32)==budget_copy.choose(four,32),"an unmeasured lane count keeps the budget plan");
+        for(auto& request:q) request.limit=2U;
+        expect(measured.choose(q,32)==r2,"context limits bound the owners");
+        for(auto& request:q) request.limit=8U;
+        expect(measured.choose(q,16)==r2,"the row budget bounds the owners");
+        // Bounded exploration through C8 (above the budget's lane bound), then the measured plan.
+        bool deep=false;
+        for(int i=0;i<10;++i) {
+            const auto rows=measured.plan(q,32);
+            std::uint32_t sum=0;
+            for(auto r:rows) {expect(r==0U || r==2U || r==4U || r==8U,"valid physical owner");sum+=r?r:2U;deep=deep || r>2U;}
+            expect(sum<=32U,"measured exploration stays in the row budget");
+            if(i==9) expect(rows==r4,"measured exploitation follows the probes");
+        }
+        expect(deep,"measured probes explore deeper owners at eight lanes");
+        C budget_only(8,C::parse_rule("budget"));
+        for(int i=0;i<10;++i) expect(budget_only.plan(q,32)==r2,"the budget rule keeps C8 at two rows");
+        measured.save_shared();
+        const auto before=measured.choose(q,32);
+        for(int i=0;i<8;++i) measured.observe(q,r4,a4,24.0,900.0,24U);
+        expect(measured.choose(q,32)==r2,"a slower measured topology is dropped");
+        expect(measured.restore_shared() && measured.choose(q,32)==before,"A/B restore restores topology costs");
+        // Per-lane placement: deep owners go to the lanes that accept.
+        const std::array<float,7> none{0,0,0,0,0,0,0};
+        std::vector<C::Request> mixed;
+        for(std::uint32_t i=0;i<8U;++i) mixed.push_back({i,8U,i<4U?std::span<const float>(p):std::span<const float>(none)});
+        C placed(8,rule);
+        const std::vector<std::uint32_t> half{4,4,4,4,2,2,2,2},zero(8,0U);
+        for(int i=0;i<3;++i) {
+            placed.observe(mixed,r2,zero,0.0,150.0,0U);placed.observe(mixed,half,zero,0.0,170.0,0U);
+            placed.observe(mixed,r4,zero,0.0,180.0,0U);
+        }
+        for(std::uint32_t i=0;i<8U;++i) placed.reset(i);
+        expect(placed.choose(mixed,32)==half,"measured plan places R4 on the accepting lanes");
+    }
     for (const std::size_t count : {0U, 1U, 2U, 6U, 7U, 8U, 9U, 16U, 19U, 24U}) {
         for (std::size_t round = 0; round < count + 2U; ++round) {
             std::vector<unsigned> seen(count, 0U);

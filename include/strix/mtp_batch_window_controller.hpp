@@ -19,8 +19,13 @@ namespace strix {
 // a cycle costs fixed + per-row + per-request milliseconds, so draft rows follow acceptance and shrink as the lanes
 // of a cycle grow. The serving default (STRIX_SERVE_ROW_BUDGET=0 turns it off); also the rule name "budget".
 // Scheduling only, as every other rule.
+// measured ("budget-measured"): through eight lanes, plan() and choose() price each owner topology (#R2,#R4,#R8)
+// by its own measured cycle ms (>= 3 samples) instead of the affine fit, and maximise expected tokens per ms
+// exactly over every owner assignment; above the lane bound the bounded probes run too, so 7-8 lanes can leave
+// the fixed two rows once a deeper topology is measured faster per token. No measured topology fits: the budget
+// rule's plan. Scheduling only.
 struct MtpBatchPlanRule {bool pooled=false; bool calibrated=false; std::uint32_t cap=8; std::size_t calibrated_min_members=0;
-    bool budget=false;};
+    bool budget=false; bool measured=false;};
 // The batched decode runs its joint cycle with the budget rule. On by default; STRIX_SERVE_ROW_BUDGET=0 (or the
 // baseline mode) restores the fixed rows-per-request table.
 [[nodiscard]] bool mtp_serve_row_budget_enabled() noexcept;
@@ -46,7 +51,7 @@ public:
     using Rule=MtpBatchPlanRule;
     // Unset: calibrated-c3, or production under baseline. Explicit rules win over that default.
     [[nodiscard]] static Rule rule_from_env(bool baseline=false);
-    // "calibrated-c3", "calibrated", "pooled", "cap4", "cap2", "budget"; production/0/unknown = production.
+    // "calibrated-c3", "calibrated", "pooled", "cap4", "cap2", "budget", "budget-measured"; production/0/unknown = production.
     [[nodiscard]] static Rule parse_rule(std::string_view text);
     // Measurement: the rule may change between admissions (in-process A/B); histories and costs are kept.
     void set_rule(Rule rule) noexcept {rule_=rule;}
@@ -106,5 +111,10 @@ private:
         PlanInfo* info=nullptr) const;
     [[nodiscard]] std::vector<std::uint32_t> budget_rows(std::span<const Request>,std::uint32_t,bool prior,
         PlanInfo* info=nullptr) const;
+    // The measured rule's plan, empty when no measured topology fits (the caller keeps the budget plan).
+    [[nodiscard]] std::vector<std::uint32_t> measured_rows(std::span<const Request>,std::uint32_t,bool prior,
+        PlanInfo* info=nullptr) const;
+    // The measured rule plans and probes up to eight lanes, above the budget's lane bound too.
+    [[nodiscard]] bool measured_plans(std::size_t lanes) const noexcept {return rule_.measured && lanes<=8U;}
 };
 } // namespace strix
