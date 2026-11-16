@@ -1,6 +1,19 @@
 include_guard(GLOBAL)
 get_filename_component(STRIX_WEIGHT_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 add_library(strix-weight STATIC
+    ${STRIX_WEIGHT_ROOT}/src/weight/source.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/admission.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/model_binding.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/readers/gguf.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/readers/safetensors.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/readers/pack.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/adapters/qwen.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/adapters/ds41.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/adapters/minimax.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/adapters/glm.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/adapters/gemma4.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/adapters/h3.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/adapters/vision.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/types.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/contracts.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/registry.cpp
@@ -35,3 +48,28 @@ if(MSVC)
 else()
     target_compile_options(strix-weight PRIVATE -ffp-contract=off)
 endif()
+
+# Legacy loader targets may be declared by vendor-only early-return branches or
+# nested family modules. Attach the shared implementation after all declarations.
+function(strix_weight_link_consumers directory)
+    get_property(targets DIRECTORY "${directory}" PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(target IN LISTS targets)
+        if(target STREQUAL "strix-weight")
+            continue()
+        endif()
+        get_target_property(sources ${target} SOURCES)
+        string(JOIN ";" source_list ${sources})
+        if(source_list MATCHES "(ds41_native_fp8|gguf_reader|qwen_model_description|ds41_prefill_driver|qwen_prefill_driver|glm_rank_plan|glm_model_description|mm_pack|src[/\\\\](gemma4|h3|vision)[/\\\\])" OR target MATCHES "^(strix[-_]h3|strix[-_]gemma4)")
+            get_target_property(kind ${target} TYPE)
+            if(NOT kind STREQUAL "INTERFACE_LIBRARY" AND NOT kind STREQUAL "UTILITY")
+                set_property(TARGET ${target} APPEND PROPERTY LINK_LIBRARIES strix-weight)
+                set_property(TARGET ${target} APPEND PROPERTY INTERFACE_LINK_LIBRARIES strix-weight)
+            endif()
+        endif()
+    endforeach()
+    get_property(children DIRECTORY "${directory}" PROPERTY SUBDIRECTORIES)
+    foreach(child IN LISTS children)
+        strix_weight_link_consumers("${child}")
+    endforeach()
+endfunction()
+cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}" CALL strix_weight_link_consumers "${CMAKE_SOURCE_DIR}")

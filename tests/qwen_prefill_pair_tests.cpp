@@ -333,16 +333,20 @@ void chunk_checks() {
     require(!valid_chunk(2048, 32776)); // eight-row terminal tail cannot execute
     require(!valid_chunk(2048, 0));
     costs.fixed_ms = 20;
-    require(legal_prefix(1193, 4096) == 1192);
+    // 16-row grain: an 8-row remainder (24 = 16 + 8) would leave serial rows inside the pipelined prefix.
+    require(legal_prefix(1193, 4096) == 1184);
     require(legal_prefix(32777, 4096) == 32768);
-    require(legal_prefix(32793, 4096) == 32792);
+    require(legal_prefix(32793, 4096) == 32784);
+    require(legal_prefix(262136, 4096) == 262128);
+    require(legal_prefix(262143, 4096) == 262128);
+    require(legal_prefix(253952, 4096) == 253952);
     require(choose_chunk(nullptr, 16384, 32769, nullptr, prediction).rows == 4096);
     require(choose_prompt_route(1193, 4096, nullptr, prediction).prefix == 0);
     require(choose_prompt_route(32771, 4096, nullptr, prediction).prefix == 32768);
     require(choose_prompt_route(24576, 4096, nullptr, prediction).prefix == 0);
     require(choose_prompt_route(28672, 4096, nullptr, prediction).prefix == 28672);
     require(choose_prompt_route(32777, 4096, nullptr, prediction).prefix == 32768);
-    require(choose_prompt_route(32793, 4096, nullptr, prediction).prefix == 32792);
+    require(choose_prompt_route(32793, 4096, nullptr, prediction).prefix == 32784);
     auto route_costs = costs;
     route_costs.fixed_ms = 0; route_costs.transfer_ms_per_row = 0;
     require(choose_prompt_route(131072, 4096, &route_costs, CutPrediction{24U, 0.3, 0.3}).prefix != 0);
