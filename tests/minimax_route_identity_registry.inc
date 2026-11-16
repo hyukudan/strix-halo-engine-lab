@@ -45,6 +45,8 @@
 {"prefill-router-tiled", 'a', "router lane chain (j = lane mod 32 ascending) + xor butterfly + ordered top-4 scan", "hip-minimax-moe-tests router_batch_tests: tiled 32 vs fused/4/8 bytes for every kind and tail; mm_defaults.cpp pf_router_rows (default 32 = tiled v2)", ""},
 // src/minimax/engine/engine.hip: dense_o (STRIX_MM_PF_DENSE_O) - o_proj through enqueue_prefill_dense on full pieces
 {"prefill-dense-o", 'a', "EXL3 matrix+library gemm_splits+per-row WMMA chain+ordered split finish", "hip-mmx-moe-bench test_prefill_dense o == strix_gemm bitwise (T 9..4096); 4096-row pieces only; mm_defaults.cpp pf_dense_o", ""},
+// src/minimax/engine/engine.hip: dense_mlp; mm_defaults.cpp: pf_dense_mlp; apps/minimax_rank_main.cpp: ab_flag
+{"prefill-dense-mlp", 'a', "STRIX_MM_PF_DENSE_MLP default ON, baseline/OFF=0; layers 0-2, 4096 rows, supported raw weights+workspace; fixed WMMA chain and ordered split finish", "hip_mmx_moe_bench.hip test_dense_mlp_chain bitwise intermediates/output; --ab pfdensemlp state/final rows plus every A=0/B>0 candidate-call coverage; minimax_ab_qualify_host rejects fallback/stale/contaminated/partial coverage; minimax_route_identity_tests.cpp default/baseline/override checks (host checks are not native qualification)", ""},
 // src/minimax/engine/engine.hip: MSA scratch cap (STRIX_MM_PF_MSA_SCRATCH_MB) - windows per batch only
 {"prefill-msa-scratch", 'a', "independent MSA windows; batch size only", "msa_fused_tests.hip every-batch bytes (scratch=1/125 and full); mm_defaults.cpp pf_msa_scratch_mb", ""},
 // src/minimax/attn/msa_fused.hip: enqueue_prefill_index (STRIX_IDX_WMMA, default exact), prefill_index_refine_kernel
@@ -107,6 +109,8 @@
 {"model-layout", 'b', "model tensor hashes+TP2 partition+rank order", "G3/G4 model gates; pack validation; F32 model fidelity remains draft pending all gates", ""},
 // src/minimax/moe/mmx_prefill.hip:476
 {"prefill-routed-split", 'c', "BLOCKED until matrix+arithmetic-version fixed S (no expert occupancy)", "UNCOVERED: known failed identity; existing core/mtfit receipts hold S fixed", "L3 routed gate/up WMMA k-tile24 reset vs continuation (rows1->9,S16->8)"},
+// src/minimax/moe/mmx_prefill.hip: prefill_moe_order (STRIX_MMX_PF_ORDER=invariant, opt-in; default adaptive)
+{"prefill-moe-order-invariant", 'b', "named identity mmx-pf-moe-s1-v1: routed+shared gate/up/down fixed S=1 (moe_core::kGroupedSingleChainContract), no expert occupancy", "chunk_order_contract_tests.cpp host order reference + chunk 256/1024/4096/whole and 1..17 tails; hip-mmx-moe-bench --test chunk-invariance device bytes; differs from adaptive for experts < 97 rows", ""},
 // src/minimax/moe/mmx_prefill.hip:477
 {"prefill-shared-split", 'c', "BLOCKED until shared matrix+arithmetic-version fixed S", "UNCOVERED: known failed max_rows identity", "L3 shared gate/up WMMA k-tile24 reset vs continuation (rows1->9,S16->8)"},
 // src/minimax/engine/engine.hip:227

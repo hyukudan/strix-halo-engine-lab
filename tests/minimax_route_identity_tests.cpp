@@ -315,7 +315,39 @@ void config_receipts() {
     const Lookup baseline_env = [](const char* key) -> const char* {
         return std::string_view(key) == kBaselineEnv ? "1" : nullptr;
     };
+    for (const char* asked : {static_cast<const char*>(nullptr), "", "adaptive", "invariant"}) {
+        const Lookup order_env = [asked](const char* key) -> const char* {
+            return std::string_view(key) == "STRIX_MMX_PF_ORDER" ? asked : nullptr;
+        };
+        const auto config = effective_config(Cli{}, order_env);
+        require(config.find(std::string("STRIX_MMX_PF_ORDER.requested=") +
+                            (asked ? asked : "default") + "\n") != std::string::npos,
+                "requested chunk order inspection");
+        const bool invariant = asked && std::string_view(asked) == "invariant";
+        require(config.find(std::string("STRIX_MMX_PF_ORDER.effective=") +
+                            (invariant ? "invariant" : "adaptive") + "\n") != std::string::npos,
+                "effective chunk order inspection");
+    }
     require(resolve(empty).size() == items().size(), "defaults registry");
+    const auto& dense_mlp = allow("prefill-dense-mlp");
+    require(dense_mlp.category == 'a' && std::string_view(dense_mlp.plan_key).size() != 0 &&
+            std::string_view(dense_mlp.gate).size() != 0, "missing dense MLP equivalence gate");
+    for (const bool baseline : {false, true}) {
+        for (const char* asked : {static_cast<const char*>(nullptr), "0", "1"}) {
+            const Lookup dense_env = [baseline, asked](const char* key) -> const char* {
+                if (std::string_view(key) == "STRIX_MM_PF_DENSE_MLP") return asked;
+                return baseline && std::string_view(key) == kBaselineEnv ? "1" : nullptr;
+            };
+            unsigned found = 0;
+            for (const auto& resolved : resolve(dense_env)) {
+                if (std::string_view(resolved.item->env) != "STRIX_MM_PF_DENSE_MLP") continue;
+                ++found;
+                require(resolved.value == (asked ? asked : baseline ? "0" : "1"),
+                        "dense MLP default/baseline/explicit override drift");
+            }
+            require(found == 1, "missing or duplicate dense MLP default");
+        }
+    }
     for (const auto& resolved : resolve(empty))
         if (std::string_view(resolved.item->env) == "STRIX_MM_PF_MSA_REWORK")
             require(resolved.value == "10", "in-block mode 10 is the default");
