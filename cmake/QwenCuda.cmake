@@ -13,8 +13,9 @@ include(${CMAKE_CURRENT_LIST_DIR}/StrixCudaBackend.cmake)
 add_library(strix_qwen_cuda STATIC
     src/cuda/models/qwen/qwen_prefill_driver.cu src/cuda/models/qwen/qwen_hc.cu src/cuda/models/qwen/qwen_dense.cu
     src/cuda/models/qwen/qwen_gdn.cu src/cuda/models/qwen/qwen_qsa.cu src/cuda/models/qwen/qwen_moe.cu
-    src/cuda/models/qwen/qwen_plemtp.cu src/cuda/models/qwen/qwen_mtp_draft.cu src/cuda/models/qwen/qwen_transcode.cu ${STRIX_CUDA_CORE_AMD_MATH_SOURCES} src/gguf_reader.cpp)
-target_include_directories(strix_qwen_cuda PUBLIC include src/cuda/models/qwen)
+    src/cuda/models/qwen/qwen_plemtp.cu src/cuda/models/qwen/qwen_mtp_draft.cu src/cuda/models/qwen/qwen_transcode.cu src/cuda/weight/registry.cu ${STRIX_CUDA_CORE_AMD_MATH_SOURCES} src/gguf_reader.cpp)
+target_include_directories(strix_qwen_cuda PUBLIC include src/cuda/models/qwen PRIVATE src)
+target_link_libraries(strix_qwen_cuda PUBLIC strix-weight)
 # Every Qwen CUDA binary resolves its device through the start gate (strix-devices-v1) before its first allocation.
 include(${CMAKE_CURRENT_LIST_DIR}/StrixDevice.cmake)
 target_link_libraries(strix_qwen_cuda PUBLIC strix_device strix_cuda_core)
@@ -143,4 +144,18 @@ if(STRIX_WFMT_CAPTURE)
     target_compile_definitions(strix_qwen_cuda PRIVATE STRIX_WFMT_CAPTURE=1)
     target_compile_definitions(qwen_dense_operator PRIVATE STRIX_WFMT_CAPTURE=1)
     target_compile_definitions(qwen_route_bf16_operator PRIVATE STRIX_WFMT_CAPTURE=1)
+endif()
+# The CUDA-only branch declares the tuned library before binding these tests.
+if(STRIX_WFMT_TESTS)
+    add_executable(strix-wfmt-cuda-tests tests/wfmt/cuda_main.cu tests/wfmt/cuda_dense.cu)
+    target_include_directories(strix-wfmt-cuda-tests PRIVATE src)
+    target_link_libraries(strix-wfmt-cuda-tests PRIVATE strix_qwen_cuda strix-weight strix_device)
+    target_compile_options(strix-wfmt-cuda-tests PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+    if(MSVC)
+        target_compile_options(strix-wfmt-cuda-tests PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+    endif()
+    add_test(NAME wfmt.cuda-dense COMMAND strix-wfmt-cuda-tests cuda-dense)
+    add_test(NAME wfmt.cuda-abi COMMAND strix-wfmt-cuda-tests cuda-abi)
+    set_tests_properties(wfmt.cuda-dense PROPERTIES TIMEOUT 110)
 endif()
