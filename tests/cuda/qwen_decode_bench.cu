@@ -50,7 +50,14 @@ int main(int argc, char** argv) {
     const qp::Sink drop = [](const qp::Piece&) {};
     std::vector<std::uint32_t> seq(prompt.begin(), prompt.begin() + static_cast<std::ptrdiff_t>(n));
     p.run(seq, n - 1, drop);
-    cudaProfilerStart();  // nsys --capture-range=cudaProfilerApi: decode only, not the upload
+    // STRIX_QWEN_PROFILE_T="8,16": the profiler range covers only those windows' loops (one range each; nsys
+    // --capture-range=cudaProfilerApi --capture-range-end=repeat); unset: everything after the upload
+    std::vector<std::uint32_t> prof_t;
+    if (const char* v = std::getenv("STRIX_QWEN_PROFILE_T")) {
+        std::stringstream ss(v);
+        for (std::string x; std::getline(ss, x, ',');) if (!x.empty()) prof_t.push_back(static_cast<std::uint32_t>(std::atoi(x.c_str())));
+    }
+    if (prof_t.empty()) cudaProfilerStart();  // nsys --capture-range=cudaProfilerApi: decode only, not the upload
     std::vector<double> ms;
     for (std::uint32_t i = 0; i < g; ++i) {
         const auto t0 = Clock::now();
@@ -67,11 +74,14 @@ int main(int argc, char** argv) {
         std::vector<std::uint32_t> pre(seq.begin(), seq.begin() + static_cast<std::ptrdiff_t>(n));
         p.run(pre, n - 1, drop);
         std::vector<double> w;
+        const bool prof = std::find(prof_t.begin(), prof_t.end(), t) != prof_t.end();
+        if (prof) { cudaDeviceSynchronize(); cudaProfilerStart(); }
         for (std::uint32_t i = 0; i + t <= g; i += t) {
             const auto t0 = Clock::now();
             p.step(&seq[n - 1 + i], t, n - 1 + i);
             w.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
         }
+        if (prof) { cudaDeviceSynchronize(); cudaProfilerStop(); }
         std::sort(w.begin(), w.end());
         std::printf("window T=%u: median %.2f ms\n", t, med(w));
     }
