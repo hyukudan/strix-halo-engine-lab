@@ -71,6 +71,16 @@ ARM uses compile-time features, and `sve_bits` is zero. Runtime and OS vector-st
 admission (including XCR0 and AMX permission) must be complete before registering
 instructions that require it. Both specialisation tables are currently empty.
 
+## CUDA NVFP4 dense operator
+
+The [shared NVFP4 core](../engine/kernels/cuda-nvfp4.md) provides a vendor-free
+operand/plan contract, scalar host oracle, explicit host/device activation
+quantizer, and SM120 native FP4 GEMM and small-row decode specialisation.
+Its FP32 MMA accumulation is a declared tolerance-qualified arithmetic identity;
+it does not register as an exact replacement for an existing dense identity.
+Caller-owned workspace and capability selection follow the memory/stream contract
+above. Model adapters and complete-workload qualification remain pending.
+
 ## CPU backend
 
 Tree: `src/cpu/core` (interface binding, scalar exact reference, capability detection and

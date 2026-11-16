@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+
 // Headless chunks of a chunked prefill (shared host policy, every engine).
 //
 // A chunked prefill runs a prompt as consecutive chunks, layer after layer. After the LAST layer only the last chunk's
@@ -23,7 +26,7 @@ struct Query {
     unsigned layers = 0;     // the model's layer count
     unsigned chunk = 0;      // chunk index in the prompt's unit
     unsigned chunks = 0;     // chunks in the unit
-    bool stack_end = false;  // this unit runs the stack to its last layer and its last chunk is the prompt's last chunk
+    bool stack_end = false;  // this unit reaches the model's last layer; it need not end the prompt
     bool observed = false;   // rows of non-last chunks are read after the layer (taps, digests, explicit row outputs)
 };
 
@@ -36,6 +39,21 @@ constexpr bool cache_only(const Query& q) noexcept {
 // chunk's rows, only on its position).
 constexpr unsigned headless_chunks(unsigned layer, unsigned layers, unsigned chunks, bool stack_end, bool observed) noexcept {
     return cache_only({layer, layers, 0, chunks, stack_end, observed}) ? chunks - 1 : 0;
+}
+
+// Qualification target for a complete grouped prefill: every unit keeps its last
+// chunk full, including a partial final unit. Independent of runtime admission so
+// disabled/unsupported routes cannot qualify merely by reporting zero work.
+constexpr std::size_t expected_chunks(std::size_t rows, std::size_t chunk_rows, std::size_t unit_chunks) noexcept {
+    if (rows == 0 || chunk_rows == 0 || unit_chunks < 2) return 0;
+    const auto chunks = rows / chunk_rows + (rows % chunk_rows != 0 ? 1U : 0U);
+    const auto units = chunks / unit_chunks + (chunks % unit_chunks != 0 ? 1U : 0U);
+    return chunks - units;
+}
+
+// A zero target is an inactive/unqualified experiment, even if hashes match.
+constexpr bool qualified_arm(bool enabled, std::uint64_t before, std::uint64_t after, std::size_t expected) noexcept {
+    return expected != 0 && after >= before && after - before == (enabled ? expected : 0);
 }
 
 }  // namespace strix::prefill_headless
