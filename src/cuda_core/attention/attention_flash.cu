@@ -304,6 +304,23 @@ FlashPlan flash_plan(std::uint32_t rows, std::uint32_t heads, std::uint32_t sms,
     return p;
 }
 
+cudaError_t attention_prefill_flash_grid(const AttentionDims& d, FlashPipe pipe, int device, FlashGrid* out) {
+    if (out == nullptr || d.heads == 0) return cudaErrorInvalidValue;
+    int sms = 0, per_sm = 0;
+    if (auto e = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device); e != cudaSuccess) return e;
+    cudaError_t e = cudaSuccess;
+    if (pipe == FlashPipe::swz3) {
+        e = cudaFuncSetAttribute(flash_kernel<SwzLayout>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<SwzLayout>());
+        if (e == cudaSuccess) e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, flash_kernel<SwzLayout>, 256, smem_bytes<SwzLayout>());
+    } else {
+        e = cudaFuncSetAttribute(flash_kernel<PadLayout>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<PadLayout>());
+        if (e == cudaSuccess) e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, flash_kernel<PadLayout>, 256, smem_bytes<PadLayout>());
+    }
+    if (e != cudaSuccess) return e;
+    *out = FlashGrid{static_cast<std::uint32_t>(QB), d.heads, static_cast<std::uint32_t>(sms), static_cast<std::uint32_t>(per_sm)};
+    return cudaSuccess;
+}
+
 cudaError_t iota_u32(std::uint32_t* p, std::uint32_t n, std::uint32_t base, std::uint32_t step, cudaStream_t stream) {
     iota_kernel<<<(n + 127) / 128, 128, 0, stream>>>(p, n, base, step);
     return cudaGetLastError();

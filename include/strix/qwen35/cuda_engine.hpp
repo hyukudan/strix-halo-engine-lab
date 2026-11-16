@@ -54,6 +54,10 @@ struct EngineOptions {
     // Large-M prefill (CudaEngine::prefill). Default exact = bitwise equal to the windowed path.
     PrefillArith prefill_arith = PrefillArith::exact;
     std::uint32_t prefill_chunk = 2048;  // rows per large-M chunk (multiple of 128, <= 8192); buffers are allocated on first use
+    // Wave-aligned steps (strix/wave_fit.hpp, scheduling only, bitwise): prompts of >= this many tokens step by the largest
+    // rows <= prefill_chunk whose flash grid fills whole waves (4096 -> 3968 on 188 SMs: flash +16 % at 128K, bench). 0 = off
+    // (opt-in until the 128K/256K wall ABAB; then the measured crossover becomes the default).
+    std::uint32_t prefill_wave_min_tokens = 0;
     std::uint32_t prefill_slots = 2;     // chunks in flight (1..2): 2 overlaps the sequential GDN kernel of one chunk with the GEMMs of the next
     // bounded submission (cuda_core/submit_window.hpp): the host queues at most this many chunks ahead of the GPU (waits on
     // chunk i - N before queuing chunk i). Scheduling only, bitwise. 0 = unbounded (whole prefill queued before one sync).
