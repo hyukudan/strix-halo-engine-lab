@@ -6,6 +6,7 @@
 #include <cmath>
 #include <bit>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -196,7 +197,9 @@ template<unsigned R> void rows_case(unsigned k,unsigned n) {
         constexpr unsigned waves=R/sub<8U?R/sub:8U;
         hipLaunchKernelGGL((project_wide_rows_coef_kernel<Site<R>,2U,sub,8U,false>),dim3(((n+1U)/2U)*(R/sub/waves)),dim3(32U*waves),0,0,s);const auto c=read();
         if(a!=c) throw std::runtime_error("coefficient source differs");
-        if constexpr(R%32U==0U) {
+        // Production admits the lane kernel only for width % 512 == 0 (an even chunk count; see
+        // lane_admits in src/hip_q8_rows_gemv.hpp); other widths are outside its contract.
+        if constexpr(R%32U==0U) if(k%512U==0U) {
             constexpr unsigned groups=(65U+63U)/64U;
             const unsigned g=(n+63U)/64U;
             Buffer codes(groups*16U*(k/256U)*1024U),scales(groups*(k/256U)*64U*16U),xs(R*k*4U);
@@ -205,7 +208,9 @@ template<unsigned R> void rows_case(unsigned k,unsigned n) {
             hipLaunchKernelGGL((lane_pack_rows_kernel<Site<R>>),dim3((R*k+255U)/256U),dim3(256),0,0,s,xs.as<float>());
             xs.read<float>(R*k);
             hipLaunchKernelGGL((project_wide_rows_lane_kernel<Site<R>,8U,8U,2U>),dim3(g*(R/32U)),dim3(256),0,0,s,codes.as<unsigned char>(),scales.as<std::uint16_t>(),xs.as<float>());const auto d=read();
-            if(a!=d) throw std::runtime_error("lane source differs");
+            if(a!=d) {unsigned diff=0;for(unsigned i=0;i<a.size();++i) diff+=a[i]!=d[i];
+                std::fprintf(stderr,"lane-vs-wide R=%u n=%u k=%u differ=%u/%zu\n",R,n,k,diff,a.size());
+                throw std::runtime_error("lane source differs");}
         }
     }
 }
@@ -407,7 +412,7 @@ int main() try {
     partial_case(false);partial_case(true);row_partials<1>();row_partials<32>();signed_partials<1>();signed_partials<16>();signed_partials<64>();f16_partials();
     signed_case<1>(256U,17U);signed_case<2>(256U,17U);signed_case<7>(256U,17U);signed_case<8>(256U,17U);
     signed_case<16>(256U,17U);signed_case<32>(256U,17U);signed_case<64>(256U,17U);signed_case<128>(256U,17U);
-    for(unsigned n:{1U,17U,65U}) {rows_case<1>(256U,n);rows_case<2>(512U,n);rows_case<7>(256U,n);rows_case<8>(512U,n);rows_case<16>(256U,n);rows_case<32>(512U,n);rows_case<64>(256U,n);}
+    for(unsigned n:{1U,17U,65U}) {rows_case<1>(256U,n);rows_case<2>(512U,n);rows_case<7>(256U,n);rows_case<8>(512U,n);rows_case<16>(256U,n);rows_case<32>(512U,n);rows_case<64>(256U,n);rows_case<64>(512U,n);}
     for(unsigned rows:{1U,2U,7U,8U,9U,31U,32U,33U,63U,64U,65U,127U,128U,129U}) dense_case(128U,17U,rows);
     std::cout<<"HIP dense source migration: operands/raw/Q8 scalar-packed/Q6/direct/staged/stepped/wide/coef/lane PASS\n";return 0;
 } catch(const std::exception& e) {std::cerr<<e.what()<<'\n';return 1;}
