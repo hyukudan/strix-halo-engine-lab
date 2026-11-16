@@ -7,6 +7,7 @@
 #include "minimax/engine/mm_profile_table.hpp"
 #include "minimax/engine/route_identity.hpp"
 #include "core/layer_set.hpp"
+#include "moe_core/grouped_policy.hpp"
 #include "minimax/serve/minimax_sched.hpp"
 #include "minimax/dspark/minimax_auto.hpp"
 #include "strix/session/speculation_default.hpp"
@@ -240,6 +241,21 @@ PrefillPolicy prefill_policy(const Lookup& env) {
     if (i4 && fp::switch_on(env(kFastBundle.env)) && !fp::set(raw))
         p.note = std::string(flash.policy) + " not selected by " + kFastBundle.env + " on STRIX_MMX_MODEL_FORMAT=fast_i4";
     return p;
+}
+
+strix::pair::PipelineChoice pair_pipeline_choice(std::uint64_t rows) {
+    // Hypothetical reference only: memory is assumed, not measured. This choice cannot enable execution.
+    // MMPIPE-PLAN section 1 (8K FAST stack): P(u) = 580 + 1.9946 u ms per chunk over both ranks (W 8.75 s at 4,096
+    // rows, 9.33 s at 2,048), FP32 seam 22 ms per 4,096 rows at 4.58 GB/s, TP2 resident 9,810 ms at 8K.
+    strix::pair::PipelineCost cost{580.0, 1.9946, 0.0, 0.0, 0.0, 0.0};
+    cost.hop_ms_per_row = 22.0 / 4096.0;
+    cost.tp_ms_per_row = 9810.0 / 8192.0;
+    static constexpr std::array<std::uint32_t, 4> chunks{1024U, 2048U, 4096U, 8192U};
+    static constexpr std::array<std::uint32_t, 6> virtual_stages{1U, 2U, 3U, 5U, 6U, 10U};
+    const strix::pair::LayoutDecl reference_layout{strix::pair::Residency::tensor_split, 31.0e9, 41.6e9,
+        "src/minimax/engine/engine.hip:89-91,1120-1131"};
+    return strix::pair::choose_pipeline(rows, cost, chunks, [](std::uint32_t) { return true; }, virtual_stages,
+        [](std::uint32_t v) { return 2U * v <= 60U; }, reference_layout);
 }
 
 const profile::Engine& profile_engine() {
@@ -502,6 +518,10 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
         const char* v = env(r);
         o << r << "=" << (v != nullptr ? v : "default") << "\n";
     }
+    const char* order_asked = env("STRIX_MMX_PF_ORDER");
+    const auto& order = strix::moe_core::resolve_grouped_order(order_asked);
+    o << "STRIX_MMX_PF_ORDER.requested=" << (order_asked ? order_asked : "default") << "\n"
+      << "STRIX_MMX_PF_ORDER.effective=" << (order.invariant() ? "invariant" : "adaptive") << "\n";
     o << "build.gu4_scalar=" << (STRIX_MM_GU4_SCALAR ? "on" : "off") << "\n";
     for (const Resolved& r : resolve(env)) o << r.item->env << "=" << r.value << "\n";
     {   // FAST prefill profile rows (default OFF): the same resolution the engine, the cache identity and the ranks use.
@@ -510,6 +530,7 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
         for (const auto& e : pr.entries) o << e.lever->env << "=" << e.value << "\n";
         const auto id = prefill_identity(env);
         const bool bundle_requested = strix::fast_profile::switch_on(env(kFastBundle.env));
+        const auto pipeline_reference = pair_pipeline_choice(8192U);
         o << "prefill.fast_profile=" << (bundle_requested && !pf.policies.empty() ? kFastBundle.profile : "off") << "\n"
           << "prefill.fast_profile_requested=" << (bundle_requested ? kFastBundle.profile : "off") << "\n"
           << "prefill.msa_flash_requested=" << pf.msa_flash_requested << "\n"
@@ -517,6 +538,10 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
           << "prefill.msa_flash_layers_requested=" << pf.msa_flash_layers_requested << "\n"
           << "prefill.fast_policies=" << (pf.policies.empty() ? "none" : pf.policies) << "\n"
           << "prefill.fast_note=" << (pf.note.empty() ? "none" : pf.note) << "\n"
+          << "prefill.pair_pipeline=off mode=tensor residency=tensor_split free_memory=pending "
+             "reason=layout: tensor-split weights; pipeline execution unimplemented\n"
+          << "prefill.pair_pipeline_reference=estimate profile=FAST rows=8192 assumed_free_gb=31.0 assumed_extra_gb=41.6 "
+          << strix::pair::effective_line(pipeline_reference) << "\n"
           << "prefill.identity=" << (id.empty() ? "default" : id) << "\n"
           << "profile_fingerprint=" << profile::hex_identity(pr.fingerprint()) << "\n";
     }

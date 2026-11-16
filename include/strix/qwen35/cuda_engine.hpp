@@ -91,6 +91,7 @@ struct SlotRows {
 
 class CudaEngine {
 public:
+    using LogitRows = qwen35::LogitRows;
     ~CudaEngine();
     CudaEngine(const CudaEngine&) = delete;
     CudaEngine& operator=(const CudaEngine&) = delete;

@@ -97,3 +97,10 @@ if(BUILD_TESTING)
         set_tests_properties(${t} PROPERTIES LABELS "gpu;cuda")
     endforeach()
 endif()
+
+# FAST8 needs a feature-specific image and must not select a generic SM120
+# image whose MMA helper traps. Other device generations are rejected at runtime.
+get_target_property(_cc_archs strix_cuda_core CUDA_ARCHITECTURES)
+if(_cc_archs MATCHES "(^|;)120a(-real)?(;|$)" AND NOT _cc_archs MATCHES "(^|;)120(-real|-virtual)?(;|$)")
+    target_compile_definitions(strix_cuda_core PRIVATE STRIX_CUDA_FAST8_SM120A=1)
+endif()

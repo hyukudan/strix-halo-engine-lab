@@ -656,6 +656,7 @@ struct CudaEngine::Impl {
         graphs.clear();
         ss.graphs.clear();
         if (s) cc::nvfp4_release_workspace(s);
+        pf.sl.clear();  // drain slot streams before freeing shared model/state buffers
         allocations.clear();
         W.owner.reset();
         if (s) (void)cudaStreamDestroy(s);
@@ -889,6 +890,20 @@ struct CudaEngine::Impl {
     struct Slot {
         cudaStream_t st = nullptr;
         cc::BigCtx* bc = nullptr;
+        std::vector<cc::UniqueHandle<void*, cudaFree>> allocations;
+        ~Slot() {
+            if (st) (void)cudaStreamSynchronize(st);
+            cc::dense_big_ctx_destroy(bc);
+            allocations.clear();
+            if (st) (void)cudaStreamDestroy(st);
+        }
+        template <class T> T* alloc(std::size_t n) {
+            cc::UniqueHandle<void*, cudaFree> owner;
+            CK(cudaMalloc(owner.put(), core::checked_product({n, sizeof(T)})));
+            T* p = static_cast<T*>(owner.get());
+            allocations.push_back(std::move(owner));
+            return p;
+        }
         float *x = nullptr, *xn = nullptr, *z = nullptr, *gout = nullptr, *raw = nullptr, *qkvc = nullptr, *ar = nullptr, *br = nullptr,
               *qg = nullptr, *q = nullptr, *k = nullptr, *v = nullptr, *ao = nullptr, *hid = nullptr, *scr = nullptr;
         std::uint32_t *ids = nullptr, *wpos = nullptr, *pos = nullptr, *cpar = nullptr;
@@ -900,44 +915,48 @@ struct CudaEngine::Impl {
     };
     struct Pf {
         std::uint32_t C = 0;
-        std::vector<Slot> sl;
+        std::vector<std::unique_ptr<Slot>> sl;
         int terms = 3;
     } pf;
 
-    [[nodiscard]] bool big_supported() const {
-        if (!opt.prefill_big || cc::dense_arith() == cc::DenseArith::fp32) return false;
-        if (opt.prefill_chunk == 0 || opt.prefill_chunk % 128 != 0 || opt.prefill_chunk > 8192) return false;
+    [[nodiscard]] const char* big_fallback() const {
+        if (!opt.prefill_big) return "disabled";
+        if (opt.dense_arithmetic == cc::DenseArith::fp32) return "fp32 policy";
+        if (opt.prefill_chunk == 0 || opt.prefill_chunk % 128 != 0 || opt.prefill_chunk > 8192) return "chunk shape";
         for (const LayerW& w : L) {
             const cc::DenseWeight all[] = {w.qkv, w.gate, w.beta, w.alpha, w.out, w.q, w.k, w.v, w.o, w.ffn_gate, w.ffn_up, w.ffn_down};
             for (const auto& d : all)
-                if (d.data != nullptr && !cc::dense_big_supported(d)) return false;
+                if (d.data != nullptr && !cc::dense_big_supported(d)) return "weight shape/format";
         }
-        return c.head_dim == 256 && gd.key_dim == 128 && gd.value_dim == 128;
+        return c.head_dim == 256 && gd.key_dim == 128 && gd.value_dim == 128 ? nullptr : "attention/GDN shape";
+    }
+    [[nodiscard]] bool big_supported() const {
+        return big_fallback() == nullptr;
     }
 
     void pf_make_slot(Slot& sl, std::uint32_t C) {
         const std::uint32_t H = c.hidden;
         CK(cudaStreamCreateWithFlags(&sl.st, cudaStreamNonBlocking));
         sl.bc = cc::dense_big_ctx_create();
-        sl.x = alloc<float>(static_cast<std::size_t>(C) * H);
-        sl.xn = alloc<float>(static_cast<std::size_t>(C) * H);
-        sl.z = alloc<float>(static_cast<std::size_t>(C) * gd.v_width());
-        sl.gout = alloc<float>(static_cast<std::size_t>(C) * gd.v_width());
-        sl.raw = alloc<float>(static_cast<std::size_t>(C) * gd.conv_channels());
-        sl.qkvc = alloc<float>(static_cast<std::size_t>(C) * gd.conv_channels());
-        sl.ar = alloc<float>(static_cast<std::size_t>(C) * gd.value_heads);
-        sl.br = alloc<float>(static_cast<std::size_t>(C) * gd.value_heads);
-        sl.qg = alloc<float>(static_cast<std::size_t>(C) * c.q_gate_width());
-        sl.q = alloc<float>(static_cast<std::size_t>(C) * c.heads * c.head_dim);
-        sl.k = alloc<float>(static_cast<std::size_t>(C) * c.kv_width());
-        sl.v = alloc<float>(static_cast<std::size_t>(C) * c.kv_width());
-        sl.ao = alloc<float>(static_cast<std::size_t>(C) * c.heads * c.head_dim);
-        sl.hid = alloc<float>(static_cast<std::size_t>(C) * c.intermediate);
-        sl.ids = alloc<std::uint32_t>(C);
-        sl.wpos = alloc<std::uint32_t>(C / 32 + 1);
-        sl.pos = alloc<std::uint32_t>(1);
-        sl.cpar = alloc<std::uint32_t>(1);
-        if (opt.prefill_arith == PrefillArith::exact) sl.scr = alloc<float>(cc::attention_scratch_floats(ad, RM));
+        sl.x = sl.alloc<float>(static_cast<std::size_t>(C) * H);
+        sl.xn = sl.alloc<float>(static_cast<std::size_t>(C) * H);
+        sl.z = sl.alloc<float>(static_cast<std::size_t>(C) * gd.v_width());
+        sl.gout = sl.alloc<float>(static_cast<std::size_t>(C) * gd.v_width());
+        sl.raw = sl.alloc<float>(static_cast<std::size_t>(C) * gd.conv_channels());
+        sl.qkvc = sl.alloc<float>(static_cast<std::size_t>(C) * gd.conv_channels());
+        sl.ar = sl.alloc<float>(static_cast<std::size_t>(C) * gd.value_heads);
+        sl.br = sl.alloc<float>(static_cast<std::size_t>(C) * gd.value_heads);
+        sl.qg = sl.alloc<float>(static_cast<std::size_t>(C) * c.q_gate_width());
+        sl.q = sl.alloc<float>(static_cast<std::size_t>(C) * c.heads * c.head_dim);
+        sl.k = sl.alloc<float>(static_cast<std::size_t>(C) * c.kv_width());
+        sl.v = sl.alloc<float>(static_cast<std::size_t>(C) * c.kv_width());
+        sl.ao = sl.alloc<float>(static_cast<std::size_t>(C) * c.heads * c.head_dim);
+        sl.hid = sl.alloc<float>(static_cast<std::size_t>(C) * c.intermediate);
+        sl.ids = sl.alloc<std::uint32_t>(C);
+        sl.wpos = sl.alloc<std::uint32_t>(C / 32 + 1);
+        sl.pos = sl.alloc<std::uint32_t>(1);
+        sl.cpar = sl.alloc<std::uint32_t>(1);
+        if (opt.prefill_arith == PrefillArith::exact) sl.scr = sl.alloc<float>(cc::attention_scratch_floats(ad, RM));
         CK(cc::dense_big_reserve(C, std::max(c.intermediate, H), static_cast<std::uint64_t>(c.intermediate) * H, 3, sl.bc));
     }
 
@@ -945,15 +964,16 @@ struct CudaEngine::Impl {
         if (pf.C != opt.prefill_chunk && !pf.sl.empty()) throw std::runtime_error("prefill: prefill_chunk cannot change after the first prefill");
         pf.C = opt.prefill_chunk;
         while (pf.sl.size() < nslots) {
-            pf.sl.emplace_back();
-            pf_make_slot(pf.sl.back(), pf.C);
+            auto slot = std::make_unique<Slot>();
+            pf_make_slot(*slot, pf.C);
+            pf.sl.push_back(std::move(slot));
         }
     }
 
     [[nodiscard]] int pf_terms() const {
         if (opt.prefill_arith == PrefillArith::fast || opt.prefill_arith == PrefillArith::fast8) return 1;
         if (opt.prefill_arith == PrefillArith::fast2) return 2;
-        const auto a = cc::dense_arith();
+        const auto a = opt.dense_arithmetic;
         return a == cc::DenseArith::mma3 ? 3 : a == cc::DenseArith::mma2 ? 2 : 1;
     }
 
@@ -1058,7 +1078,13 @@ struct CudaEngine::Impl {
 
     RowsOut prefill(const std::uint32_t* tokens, std::uint32_t n, LogitRows want) {
         if (n == 0) throw std::runtime_error("prefill: n must be >= 1");
-        if (committed + n > opt.max_positions) throw std::runtime_error("prefill: max_positions exceeded");
+        core::require_capacity(committed, n, opt.max_positions);
+        core::validate_token_ids(tokens, n, c.vocab);
+        if (opt.prefill_arith == PrefillArith::fast8 && !cc::dense_big_fast8_supported())
+            throw std::invalid_argument("prefill: FAST8 implementation unavailable for this build/device");
+        const char* fallback = big_fallback();
+        if (!opt.quiet) std::fprintf(stderr, "prefill route: %s; reason: %s; chunk: %u; requested slots: %u\n",
+                                    fallback ? "windows" : "large", fallback ? fallback : "admitted", opt.prefill_chunk, opt.prefill_slots);
         last_rows = 0;
         if (!big_supported()) {  // windows + commit
             RowsOut o;
@@ -1069,26 +1095,40 @@ struct CudaEngine::Impl {
             }
             return o;
         }
-        const std::uint32_t C = opt.prefill_chunk, nchunks = (n + C - 1) / C, H = c.hidden;
+        const std::uint32_t C = opt.prefill_chunk, nchunks = 1 + (n - 1) / C, H = c.hidden;
         pf_init(std::min<std::uint32_t>(std::max<std::uint32_t>(1, opt.prefill_slots), nchunks));
         pf.terms = pf_terms();
         const std::uint32_t nslots = static_cast<std::uint32_t>(pf.sl.size());
+        if (!opt.quiet) std::fprintf(stderr, "prefill effective slots: %u\n", std::min(nslots, nchunks));
         CK(cudaStreamSynchronize(s));
         std::uint32_t par0 = 0;
         CK(cudaMemcpy(&par0, d_parity, 4, cudaMemcpyDeviceToHost));
-        cudaEvent_t start = nullptr;
+        struct Events {
+            Pf& pf;
+            cudaStream_t stream;
+            cudaEvent_t start = nullptr;
+            std::vector<cudaEvent_t> ev;
+            ~Events() {
+                for (const auto& slot : pf.sl) (void)cudaStreamSynchronize(slot->st);
+                (void)cudaStreamSynchronize(stream);
+                for (auto e : ev) if (e) (void)cudaEventDestroy(e);
+                if (start) (void)cudaEventDestroy(start);
+            }
+        } events{pf, s, nullptr, {}};
+        auto& start = events.start;
+        auto& ev = events.ev;
         CK(cudaEventCreateWithFlags(&start, cudaEventDisableTiming));
         CK(cudaEventRecord(start, s));
-        std::vector<cudaEvent_t> ev(static_cast<std::size_t>(nchunks) * c.layers);
+        ev.resize(static_cast<std::size_t>(nchunks) * c.layers);
         for (auto& e : ev) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
         for (std::uint32_t ci = 0; ci < nchunks; ++ci) {
-            Slot& sl = pf.sl[ci % nslots];
+            Slot& sl = *pf.sl[ci % nslots];
             if (ci < nslots) CK(cudaStreamWaitEvent(sl.st, start, 0));
             const std::uint32_t p = ci * C, r = std::min<std::uint32_t>(C, n - p);
             pf_chunk(sl, tokens + p, r, committed + p, (par0 + ci) & 1u, ci ? &ev[static_cast<std::size_t>(ci - 1) * c.layers] : nullptr,
                      &ev[static_cast<std::size_t>(ci) * c.layers]);
         }
-        Slot& last = pf.sl[(nchunks - 1) % nslots];
+        Slot& last = *pf.sl[(nchunks - 1) % nslots];
         CK(cudaStreamWaitEvent(s, ev[static_cast<std::size_t>(nchunks) * c.layers - 1], 0));
         const std::uint32_t rl = n - (nchunks - 1) * C;
         // last token: final norm + lm_head on its row, exported through the decode buffers (row 0)
@@ -1096,14 +1136,12 @@ struct CudaEngine::Impl {
         const cc::GroupedView h1{1, 1, H, H, H};
         CK(cc::rmsnorm(x, h1, out_norm, xn, h1, c.rms_eps, s));
         if (want != LogitRows::none) {
-            CK(cc::dense_rows(head, xn, logits, 1, nullptr, s));
+            CK(cc::dense_rows(head, xn, logits, 1, nullptr, s, opt.dense_arithmetic));
             CK(cc::argmax_rows(logits, c.vocab, 1, d_top, d_argws, s));
         }
         const std::uint32_t par_end = (par0 + nchunks) & 1u;
         CK(cudaMemcpyAsync(d_parity, &par_end, 4, cudaMemcpyHostToDevice, s));
         CK(cudaStreamSynchronize(s));  // the staging copy above and the event pool are released after this point
-        for (auto e : ev) cudaEventDestroy(e);
-        cudaEventDestroy(start);
         committed += n;
         RowsOut o;
         o.logits = want == LogitRows::none ? nullptr : logits;
@@ -1157,6 +1195,7 @@ std::unique_ptr<CudaEngine> CudaEngine::from_gguf(const std::string& path, const
     std::unique_ptr<CudaEngine> e(new CudaEngine);
     auto& P = *e->p_;
     CK(cudaGetDevice(&P.device));
+    if (opt.prefill_slots < 1 || opt.prefill_slots > 2) throw std::invalid_argument("prefill_slots expects 1..2");
     P.opt = opt;
     P.graphs_on = opt.use_graphs;
     if (!opt.max_positions) throw std::invalid_argument("max_positions must be positive");
@@ -1301,6 +1340,7 @@ std::unique_ptr<CudaEngine> CudaEngine::synthetic(const Config& cfg, PackFormat 
     std::unique_ptr<CudaEngine> e(new CudaEngine);
     auto& P = *e->p_;
     CK(cudaGetDevice(&P.device));
+    if (opt.prefill_slots < 1 || opt.prefill_slots > 2) throw std::invalid_argument("prefill_slots expects 1..2");
     P.opt = opt;
     P.graphs_on = opt.use_graphs;
     P.c = cfg;
@@ -1355,6 +1395,8 @@ void print_effective_config(const EngineOptions& o, const char* arith, std::FILE
     std::fprintf(f, "  dense-arith: %s\n  turbo-weights: %s\n  turbo-bits: %u\n  turbo-lm-head: %s\n  turbo-multi-launch: %s (bitwise neutral)\n",
                  arith ? arith : "mma3", o.turbo_weights == TurboWeights::off ? "off (exact pack)" : o.turbo_weights == TurboWeights::native ? "native" : o.turbo_weights == TurboWeights::converted ? "converted (NVFP4 pack)" : "onfly",
                  o.turbo_bits, o.turbo_weights >= TurboWeights::onfly ? (o.turbo_lm_head ? "nvfp4" : "bf16") : "n/a", o.multi_gemv ? "on" : "off");
+    std::fprintf(f, "  prefill-arith: %s\n  prefill-big: %s\n  prefill-chunk: %u\n  prefill-slots: %u\n  prefill-admission: pending model/device; execution reports route/reason\n",
+                 prefill_arith_name(o.prefill_arith), o.prefill_big ? "on" : "off", o.prefill_chunk, o.prefill_slots);
     if (o.turbo_weights >= TurboWeights::onfly)
         std::fprintf(f, "  format: NVFP4 e2m1 + e4m3/16 + FP32 global; RTN; GEMV f16 mma, FP32 accumulate, activations RN f16, rows 1..32 bitwise row-invariant\n");
 }

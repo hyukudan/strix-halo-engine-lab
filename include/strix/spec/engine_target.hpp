@@ -7,7 +7,6 @@
 #include <span>
 #include <vector>
 
-#include "strix/qwen35/engine_types.hpp"
 #include "strix/spec/block_drafter.hpp"
 
 namespace strix::spec {
@@ -18,7 +17,7 @@ public:
     explicit EngineVerifyTarget(Engine& e) : e_(e) {}
     void verify(std::span<const std::uint32_t> tokens, std::vector<std::uint32_t>& greedy) override {
         const auto rows = static_cast<std::uint32_t>(tokens.size());
-        const auto out = e_.forward_rows(tokens.data(), rows, qwen35::LogitRows::all);
+        const auto out = e_.forward_rows(tokens.data(), rows, Engine::LogitRows::all);
         greedy.resize(rows);
         e_.read_top(out, rows, greedy.data());
     }
