@@ -161,6 +161,10 @@ class ToolTests(unittest.TestCase):
     def test_mandatory_inventory(self):
         for pr in run.COMMON:
             for backend in run.BACKENDS:
+                if pr in run.HIP_REQUIRED and backend != "hip":
+                    with self.assertRaisesRegex(ValueError, "requires the HIP backend"):
+                        run.required_tests(pr, backend)
+                    continue
                 required = run.required_tests(pr, backend)
                 self.assertEqual(run.validate_tests(junit(required), required), len(required))
                 for names in ([], sorted(required)[1:], list(required) + [sorted(required)[0]]):
@@ -169,6 +173,17 @@ class ToolTests(unittest.TestCase):
         self.assertIn("nvfp4_host", run.required_tests("P02", "nvfp4"))
         self.assertIn("strix-ds41-formats-tests", run.required_tests("P02", "cuda-ds41"))
         self.assertIn("strix-intel-dense-boundaries", run.required_tests("P05", "intel"))
+        self.assertEqual(run.required_tests("P06", "hip"), {
+            "wfmt.hip-dense", "strix-hip-dense-a8-wmma-tests", "strix-hip-gsq-dense-a8-tests",
+            "strix-hip-gsq-typed-sites-tests", "strix-hip-dense-f16-tiled-tests",
+            "strix-hip-ggml-weight-formats-tests"})
+        self.assertEqual(run.required_tests("P07", "hip"), {
+            "wfmt.hip-gsq", "strix-hip-moe-prefill-gsq-tests", "strix-hip-q20-a8-probe-tests",
+            "strix-hip-gsq-dense-a8-tests", "strix-hip-gsq-typed-sites-tests"})
+        self.assertEqual(run.required_tests("P08", "hip"), {
+            "wfmt.hip-trellis", "strix-trellis-codec-tests", "strix-hip-trellis-codec-tests",
+            "strix-ds41-trellis-identity-tests", "strix-glm-trellis-identity-tests",
+            "strix-moe-grouped-prefill-host-tests"})
         required = run.required_tests("P01", "host")
         for tag in ("skipped", "failure", "error"):
             root = junit(required)

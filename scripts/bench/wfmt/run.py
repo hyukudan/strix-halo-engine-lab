@@ -19,13 +19,28 @@ COMMON = {
     "P03": ("wfmt.readers", "wfmt.admission"),
     "P04": ("wfmt.resolve", "wfmt.cache", "wfmt.effective-config"),
     "P05": ("wfmt.cpu",),
+    "P06": ("wfmt.hip-dense",),
+    "P07": ("wfmt.hip-gsq",),
+    "P08": ("wfmt.hip-trellis",),
+}
+HIP_REQUIRED = {
+    "P06": tuple("strix-hip-" + part + "-tests" for part in
+                 ("dense-a8-wmma", "gsq-dense-a8", "gsq-typed-sites", "dense-f16-tiled", "ggml-weight-formats")),
+    "P07": tuple("strix-hip-" + part + "-tests" for part in
+                 ("moe-prefill-gsq", "q20-a8-probe", "gsq-dense-a8", "gsq-typed-sites")),
+    "P08": ("strix-trellis-codec-tests", "strix-hip-trellis-codec-tests",
+            "strix-ds41-trellis-identity-tests", "strix-glm-trellis-identity-tests",
+            "strix-moe-grouped-prefill-host-tests"),
 }
 
 
 def required_tests(pr, backend):
     if backend not in BACKENDS:
         raise ValueError("unknown backend")
+    if pr in HIP_REQUIRED and backend != "hip":
+        raise ValueError(pr + " requires the HIP backend")
     names = set(COMMON[pr])
+    names.update(HIP_REQUIRED.get(pr, ()))
     if pr == "P02" and backend in ("host", "hip", "cuda-ds41"):
         names.update("strix-ds41-" + part + "-tests" for part in ("formats", "native-fp8", "trellis-identity"))
     if pr == "P02" and backend in ("host", "nvfp4"):
