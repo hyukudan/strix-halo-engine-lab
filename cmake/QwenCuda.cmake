@@ -129,3 +129,17 @@ target_link_libraries(qwen_tf_logits PRIVATE strix_qwen_cuda strix_qwen_handoff)
 if(MSVC)
     target_compile_options(qwen_tf_logits PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
+
+# Synthetic operand/byte gates share the exact production library.
+option(STRIX_WFMT_CAPTURE "Enable test-only weight-format buffer capture" OFF)
+add_executable(qwen_dense_operator tests/cuda/qwen_dense_tests.cu)
+target_link_libraries(qwen_dense_operator PRIVATE strix_qwen_cuda)
+target_compile_options(qwen_dense_operator PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+if(MSVC)
+    target_compile_options(qwen_dense_operator PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
+if(STRIX_WFMT_CAPTURE)
+    target_compile_definitions(qwen_dense_operator PRIVATE STRIX_WFMT_CAPTURE=1)
+    target_compile_definitions(qwen_route_bf16_operator PRIVATE STRIX_WFMT_CAPTURE=1)
+endif()

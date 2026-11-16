@@ -27,6 +27,11 @@
 #include "qwen_dense_ref.hpp"
 #include "qwen_fixture.hpp"
 #include "qwen_gguf_host.hpp"
+#ifdef STRIX_WFMT_CAPTURE
+#include "../wfmt/cuda_capture.hpp"
+static std::string wfmt_capture_directory;
+static std::size_t wfmt_capture_index = 0;
+#endif
 
 namespace qd = strix::cuda::qwen_dense;
 namespace ref = strix::qwen_dense_ref;
@@ -273,6 +278,22 @@ static std::size_t run_projection(const Case& cs, const std::vector<std::vector<
     std::string first;
     for (std::uint32_t m = 0; m < nseg; ++m) {
         const auto got = outs[m]->down();
+#ifdef STRIX_WFMT_CAPTURE
+        if (!wfmt_capture_directory.empty()) {
+            // Observe the exact production buffers, not host recomputations.
+            const auto observed_codes = codes.down();
+            const auto observed_scales = deltas.down();
+            const std::uint64_t shape[]{rows, width, cs.outs[m], static_cast<std::uint64_t>(cs.store), m};
+            const std::string name = "cuda-dense-" + std::to_string(wfmt_capture_index++);
+            check(strix::weight::test::write_cuda_capture(wfmt_capture_directory, name,
+                "cuda-qwen-imma-four-chain@1", shape,
+                {{"source", std::as_bytes(std::span(weights[m]))},
+                 {"activation_codes", std::as_bytes(std::span(observed_codes))},
+                 {"activation_scales", std::as_bytes(std::span(observed_scales))},
+                 {"sidecars", std::as_bytes(std::span(gate))},
+                 {"output", std::as_bytes(std::span(got))}}), "write " + name);
+        }
+#endif
         const std::uint32_t N = cs.outs[m], ld = N + 4U;
         const std::uint32_t row_bytes = width / 32U * 34U;
         std::vector<std::uint8_t> expect_row_ok(check_rows.size(), 1);
@@ -597,6 +618,24 @@ static void replay_shared(const std::string& path, const strix::qwen_gguf::Model
 
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);  // a crash must not lose the log
+#ifdef STRIX_WFMT_CAPTURE
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::string_view(argv[i]) != "--wfmt-backend-capture") continue;
+        wfmt_capture_directory = argv[i + 1];
+        CK(cudaSetDevice(0));
+        // Boundary rows, output tails, even/odd Q8 group pairs and every store.
+        // Small synthetic tensors keep this a bounded pre-model GPU gate.
+        for (std::uint32_t store = 0; store < 4; ++store) {
+            const Case cs{"wfmt", static_cast<qd::Store>(store), qd::Input::bf16, 256U, {17U, 129U}};
+            std::vector<std::vector<std::uint8_t>> weights;
+            for (std::size_t m = 0; m < cs.outs.size(); ++m) weights.push_back(make_q8(cs.outs[m], cs.width, 90U + m));
+            for (std::uint32_t rows : {1U,2U,7U,8U,9U,31U,32U,33U,63U,64U,65U,127U,128U,129U})
+                run_projection(cs, weights, rows, rows + store * 101U, true, 129U);
+        }
+        std::printf("wfmt CUDA dense: %zu production records, %d failures\n", wfmt_capture_index, g_fail);
+        return g_fail ? 1 : 0;
+    }
+#endif
     bool gpu = false, do_bench = false;
     std::vector<std::array<std::uint32_t, 3>> shapes;
     std::string fixture;
@@ -681,3 +720,4 @@ int main(int argc, char** argv) {
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
+
