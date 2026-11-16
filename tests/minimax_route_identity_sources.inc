@@ -80,7 +80,7 @@
 {"src/minimax/engine/draft_lin.hpp", 0x05d11d75108270edULL},
 {"src/minimax/engine/engine.hip", 0x5f2d8ad1a2889440ULL},
 {"src/minimax/engine/mm_common.hpp", 0xa21d3da2534850d9ULL},
-{"src/minimax/engine/mm_defaults.cpp", 0x781fcffa2d6d9c8bULL},
+{"src/minimax/engine/mm_defaults.cpp", 0xc072ceb58400d279ULL},
 {"src/minimax/engine/mm_defaults.hpp", 0x8a121b0779ed96c7ULL},
 {"src/minimax/engine/mm_fast_i4.hpp", 0x873b1bb7b7177f59ULL},
 {"src/minimax/engine/mm_kernels.hpp", 0x434413100dddc9edULL},

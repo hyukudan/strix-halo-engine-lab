@@ -525,7 +525,8 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
         o << r << "=" << (v != nullptr ? v : "default") << "\n";
     }
     const char* order_asked = env("STRIX_MMX_PF_ORDER");
-    const auto& order = strix::moe_core::resolve_grouped_order(order_asked);
+    // requested = how the order was asked (unset = "default"); effective resolves the pf_order table item like apply().
+    const auto& order = strix::moe_core::resolve_grouped_order(linear_order(env).c_str());
     o << "STRIX_MMX_PF_ORDER.requested=" << (order_asked ? order_asked : "default") << "\n"
       << "STRIX_MMX_PF_ORDER.effective=" << (order.invariant() ? "invariant" : "adaptive") << "\n";
     o << "build.gu4_scalar=" << (STRIX_MM_GU4_SCALAR ? "on" : "off") << "\n";

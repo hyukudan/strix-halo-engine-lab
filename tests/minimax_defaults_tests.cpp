@@ -152,7 +152,10 @@ void test_receipts(const char* path) {
         const std::string got = md::effective_config(md::parse_cli(r.app, plain), lookup(none));
         auto numerical = [](const std::string& text) {
             std::istringstream input(text); std::string result, line;
-            while (std::getline(input,line)) if (!line.starts_with("session_")) result += line + "\n";
+            // The order's request line shows how it was asked (receipt: explicit; plain: "default"); the effective line
+            // and the item value are compared.
+            while (std::getline(input,line))
+                if (!line.starts_with("session_") && !line.starts_with("STRIX_MMX_PF_ORDER.requested=")) result += line + "\n";
             return result;
         };
         check(numerical(got) == numerical(want), r.app + ": host configuration == receipt\n--- receipt\n" + want + "--- host\n" + got);
@@ -182,9 +185,10 @@ void test_off_switches() {
             if (cli.app == "rank") {
                 std::size_t diff = 0;
                 for (const auto& l : off_lines) if (!l.starts_with("session_")) diff += on_lines.count(l) == 0 ? 1 : 0;
-                // The linear order also names its cache identity, so its off form changes the prefill.identity line too.
-                const std::size_t want = std::strcmp(it.env, "STRIX_MMX_PF_ORDER") == 0 ? 2 : 1;
-                check(diff == want, std::string(it.env) + " off changes one rank line (plus the identity line for the order)");
+                // The linear order also prints its request / effective inspection and names its cache identity, so its
+                // off form changes those three lines too.
+                const std::size_t want = std::strcmp(it.env, "STRIX_MMX_PF_ORDER") == 0 ? 4 : 1;
+                check(diff == want, std::string(it.env) + " off changes one rank line (plus inspection + identity for the order)");
             }
         }
     }
