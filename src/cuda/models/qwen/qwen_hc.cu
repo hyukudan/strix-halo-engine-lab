@@ -30,6 +30,7 @@
 #include "strix/env_flags.hpp"
 #include "strix/lever.hpp"
 #include "strix/cuda/qwen_hc.hpp"
+#include "strix/cuda/amd_math.cuh"
 #include "../../core/mma_tile.cuh"
 
 #include <cuda_fp16.h>
@@ -633,12 +634,12 @@ void launch_projection_mma_c(const HcMixArgs& a, const am::Tables& tables, cudaS
         a.normalized, a.rows, a.packed.down_codes, a.packed.down_scales, a.inject, a.normalized, a.injection, tables, a.input, a.norm);
 }
 template <unsigned MT, unsigned NW>
-void launch_projection_mma(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream) {
-    if (!a.gates && hc_compact_norm_enabled()) launch_projection_mma_c<MT, NW, true>(a, tables, stream);   // = hc_mix compact
+void launch_projection_mma(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream, bool compact) {
+    if (compact) launch_projection_mma_c<MT, NW, true>(a, tables, stream);
     else launch_projection_mma_c<MT, NW, false>(a, tables, stream);
 }
 // Tile shape per row count: fill the 188 SMs (one wave, no tail) while keeping the weight re-reads (per row tile) low.
-void projection_mma(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream) {
+void projection_mma(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream, bool compact) {
     struct Opt { unsigned mt, nw; };
     static const Opt opts[] = {{4U, 8U}, {3U, 8U}, {2U, 8U}, {4U, 4U}, {2U, 4U}, {1U, 4U}};
     unsigned best = 0; double best_cost = 1e30;
@@ -652,12 +653,12 @@ void projection_mma(const HcMixArgs& a, const am::Tables& tables, cudaStream_t s
         if (cost < best_cost) { best_cost = cost; best = i; }
     }
     switch (best) {
-    case 0: launch_projection_mma<4U, 8U>(a, tables, stream); break;
-    case 1: launch_projection_mma<3U, 8U>(a, tables, stream); break;
-    case 2: launch_projection_mma<2U, 8U>(a, tables, stream); break;
-    case 3: launch_projection_mma<4U, 4U>(a, tables, stream); break;
-    case 4: launch_projection_mma<2U, 4U>(a, tables, stream); break;
-    default: launch_projection_mma<1U, 4U>(a, tables, stream); break;
+    case 0: launch_projection_mma<4U, 8U>(a, tables, stream, compact); break;
+    case 1: launch_projection_mma<3U, 8U>(a, tables, stream, compact); break;
+    case 2: launch_projection_mma<2U, 8U>(a, tables, stream, compact); break;
+    case 3: launch_projection_mma<4U, 4U>(a, tables, stream, compact); break;
+    case 4: launch_projection_mma<2U, 4U>(a, tables, stream, compact); break;
+    default: launch_projection_mma<1U, 4U>(a, tables, stream, compact); break;
     }
 }
 
@@ -1364,10 +1365,7 @@ template <unsigned R> void route_rows_r(const std::uint16_t* hidden, const float
 void hc_mix(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream, unsigned stages) {
     if (!a.rows) return;
     if (a.rows > 65535U * kProjRows) throw std::invalid_argument("qwen_hc mix: too many rows");
-    // Compact normalized rows on the tiled paths with the fused output (the split epilogue and the decode-rows kernels
-    // read the full FP32 rows).
-    const bool compact = !a.gates && hc_compact_norm_enabled() &&
-        (a.mma || !(a.rows <= 8U && stages == 15U && decode_rows_enabled()));   // the decode-rows kernels read full rows
+    const bool compact = hc_compact_workspace(a, stages, hc_compact_norm_enabled(), decode_rows_enabled());
     if ((stages & 1U) && compact) hc_norm_kernel<true><<<dim3(a.rows, kStreams), 256U, 0, stream>>>(a.input, a.norm, a.epsilon, a.normalized, tables);
     else if (stages & 1U) hc_norm_kernel<<<dim3(a.rows, kStreams), 256U, 0, stream>>>(a.input, a.norm, a.epsilon, a.normalized, tables);
     check(cudaGetLastError(), "norm launch");
@@ -1381,7 +1379,7 @@ void hc_mix(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream, u
         }();
         (void)attr;
         const unsigned row_tiles = (a.rows + kMmaOutRows - 1U) / kMmaOutRows;
-        if (stages & 2U) projection_mma(a, tables, stream);
+        if (stages & 2U) projection_mma(a, tables, stream, compact);
         check(cudaGetLastError(), "mma projection launch");
         const dim3 og(row_tiles, kHidden / (32U * kMmaOutPasses));
         if ((stages & 4U) && compact) hc_output_mma_kernel<true><<<og, 128U, kMmaOutSmem, stream>>>(a.normalized,
@@ -1394,7 +1392,7 @@ void hc_mix(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream, u
                 a.output, tables);
         return;
     }
-    if (a.rows <= 8U && stages == 15U && !a.gates && decode_rows_enabled()) {
+    if (!compact && a.rows <= 8U && stages == 15U && !a.gates && decode_rows_enabled()) {
         hc_mix_rows(a, tables, stream);
         return;
     }
