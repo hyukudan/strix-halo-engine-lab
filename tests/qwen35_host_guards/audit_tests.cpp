@@ -73,6 +73,9 @@ void glu16(const Tensor& g, const Tensor&, const float* x, float* out, unsigned 
 }
 void wide_quant(const float*, unsigned, unsigned, hipStream_t, const WideScratch& w) { scratch_seen.push_back(w.codes); }
 void wide_dense(const Tensor&, float*, unsigned, hipStream_t, const WideScratch& w) { scratch_seen.push_back(w.codes); }
+// The IU4 wide windows take only type-200 weights; the audited tensors are bf16 / q8_0, as in the real predicate.
+bool wide_iu4_ok(const Tensor& t, const WideScratch& w, unsigned) { return w.codes && t.fmt == 200U; }
+void wide_iu4(const Tensor&, const float*, float*, unsigned, hipStream_t) { runtime_require(false); }
 void silu_mul_host(const float*, const float*, float*, std::size_t) {}
 #include "audit_hip.inc"
 #include "audit_cli.inc"
