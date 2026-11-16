@@ -3,6 +3,8 @@
 add_library(strix_backend_cpu STATIC
     src/cpu/core/reference.cpp
     src/cpu/core/select.cpp
+    src/cpu/core/routed_expert.cpp
+    src/cpu/arch/avx2/routed_expert_avx2.cpp
     src/cpu/arch/avx512/kernels.cpp
     src/cpu/arch/neon/kernels.cpp)
 target_include_directories(strix_backend_cpu PUBLIC src)
@@ -12,6 +14,15 @@ if(MSVC)
     target_compile_options(strix_backend_cpu PRIVATE /fp:precise)
 else()
     target_compile_options(strix_backend_cpu PRIVATE -ffp-contract=off)
+endif()
+# AVX2 row kernels of the host routed expert: only this TU is compiled for AVX2 (runtime-selected by caps().avx2); the
+# float chain uses separate mul/add/sub intrinsics, never FMA. AVX-VNNI is used when cpuid reports it.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|X86_64|x64")
+    if(MSVC)
+        set_source_files_properties(src/cpu/arch/avx2/routed_expert_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+    else()
+        set_source_files_properties(src/cpu/arch/avx2/routed_expert_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mf16c;-mavxvnni")
+    endif()
 endif()
 if(BUILD_TESTING)
     find_package(Threads REQUIRED)
@@ -24,4 +35,18 @@ if(BUILD_TESTING)
     endif()
     strix_target_warnings(strix-cpu-backend-host-tests)
     add_test(NAME strix-cpu-backend-host-tests COMMAND strix-cpu-backend-host-tests)
+
+    # Host routed expert executor: bitwise vs the scalar reference and the verbatim CUDA-test oracle.
+    # STRIX_EXP_TABLES=<dir> selects the real gfx1151 probe tables; otherwise synthetic tables are generated.
+    add_executable(strix-cpu-routed-expert-tests tests/cpu/routed_expert_host_tests.cpp)
+    target_link_libraries(strix-cpu-routed-expert-tests PRIVATE strix_backend_cpu Threads::Threads)
+    strix_target_warnings(strix-cpu-routed-expert-tests)
+    add_test(NAME strix-cpu-routed-expert-tests COMMAND strix-cpu-routed-expert-tests)
 endif()
+
+# Microbench of the executor (not a test): scripts/bench/residency/cpu_expert_bench.cpp
+add_executable(strix-cpu-expert-bench scripts/bench/residency/cpu_expert_bench.cpp)
+target_link_libraries(strix-cpu-expert-bench PRIVATE strix_backend_cpu)
+find_package(Threads REQUIRED)
+target_link_libraries(strix-cpu-expert-bench PRIVATE Threads::Threads)
+strix_target_warnings(strix-cpu-expert-bench)

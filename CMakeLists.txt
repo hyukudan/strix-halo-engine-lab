@@ -5712,6 +5712,15 @@ endfunction()
 cmake_language(DEFER CALL strix_link_host_cache_adopters)
 # Serving-spec fragments (cmake/servespec/*.cmake): shared serving sources and their host tests.
 include("${CMAKE_CURRENT_LIST_DIR}/cmake/servespec/hook.cmake")
+# Shared expert residency planner (host only, always built).
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/StrixResidency.cmake")
+if(BUILD_TESTING)
+    # serve == bench residency command line (strix/residency/residency_cli.hpp); host only
+    add_executable(strix-expert-residency-parity-tests tests/expert_residency_parity_tests.cpp)
+    target_link_libraries(strix-expert-residency-parity-tests PRIVATE strix_residency)
+    strix_target_warnings(strix-expert-residency-parity-tests)
+    add_test(NAME strix-expert-residency-parity-tests COMMAND strix-expert-residency-parity-tests)
+endif()
 # CPU backend (opt-in, docs/architecture/backends.md).
 if(STRIX_BACKEND_CPU)
     include("${CMAKE_CURRENT_LIST_DIR}/cmake/StrixBackendCpu.cmake")

@@ -6,6 +6,7 @@
 //       [--max-positions 32768] [--bind 127.0.0.1] [--port 8090] [--api-key-file F] [--model-id ID]
 //       [--mtp-depth 7] [--min-p 0.7] [--max-queue 64] [--http-slots 4] [--prefill-chunk 1024|auto] [--prefill-overlap-rows 1024]
 //       [--admit-grace-ms 2] [--cohort-depth fair|max] [--slot-margin-mib 2048] [--block-rows N]
+//       [--expert-residency auto|full|tiered] [--vram-budget-gib N] [--print-effective-config]
 //       [--prefix-cache on|off] [--prefix-cache-block 256] [--prefix-cache-stride 16384]
 //       [--prefix-cache-host-mb N] [--prefix-cache-vram-mb 0]
 // Context cap: --max-positions P sizes every session (KV/index/pooled + MTP cache, 31,616 B per position + 233 MB).
@@ -27,6 +28,7 @@
 #include "cuda_qwen_prefix_cache.hpp"
 #include "strix/cuda_qwen_cohort.hpp"
 #include "strix/cuda_qwen_prefill.hpp"
+#include "strix/residency/residency_cli.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/engine.hpp"
@@ -80,6 +82,7 @@ struct Options {
     double prefill_auto_k = 1.0;                // auto: target chunk time = k decode steps
     std::string cohort_depth = "fair";
     std::uint32_t slot_margin_mib = 2048;       // free VRAM that must remain after a new slot's session
+    bool print_effective_config = false;        // resolve (GGUF header + live card/host numbers), print, exit: no model load
 };
 
 Options parse(int argc, char** argv) {
@@ -90,6 +93,7 @@ Options parse(int argc, char** argv) {
     o.engine.release_by_layer = false;
     if (const char* v = std::getenv("STRIX_QRTX_HTTP_SLOTS")) o.http_slots = static_cast<std::uint32_t>(std::stoul(v));
     if (const char* v = std::getenv("STRIX_QRTX_SLOT_MARGIN_MIB")) o.slot_margin_mib = static_cast<std::uint32_t>(std::stoul(v));
+    strix::residency::CliOptions residency_cli;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         const auto next = [&]() -> std::string {
@@ -140,6 +144,7 @@ Options parse(int argc, char** argv) {
         else if (a == "--prefill-overlap-rows") o.prefill_overlap_rows = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--admit-grace-ms") o.admit_grace_ms = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--cohort-depth") o.cohort_depth = next();
+        else if (strix::residency::consume_cli_arg(a, next, residency_cli)) {}  // --expert-residency, --vram-budget-gib, --print-effective-config
         else if (a == "--slot-margin-mib") o.slot_margin_mib = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--block-rows") {
             const auto r = static_cast<std::uint32_t>(std::stoul(next()));
@@ -150,6 +155,8 @@ Options parse(int argc, char** argv) {
     }
     if (o.engine.model_gguf.empty() || o.engine.tables_dir.empty() || o.engine.rope_table.empty())
         throw std::invalid_argument("--model, --tables and --rope-table are required");
+    o.engine.residency = strix::residency::finish_cli(residency_cli);  // flags win over STRIX_EXPERT_RESIDENCY / STRIX_VRAM_BUDGET_GIB
+    o.print_effective_config = residency_cli.print_effective_config;
     if (const char* v = std::getenv("STRIX_QRTX_COHORT"); v && v[0] == '0') o.http_slots = 1;
     if (o.http_slots == 0) throw std::invalid_argument("--http-slots must be >= 1");
     if (const char* v = std::getenv("STRIX_QRTX_PREFILL_OVERLAP")) o.prefill_overlap = v[0] == '1';
@@ -373,9 +380,17 @@ private:
         bool first = true;
     };
 
-    static std::pair<std::uint64_t, std::uint64_t> vram() {
+    // Free/total VRAM. Tiered residency: the engine was sized to a budget, so the server never fills the card beyond it:
+    // free = min(card free, budget - what this process holds (engine + extra sessions)), total = the budget.
+    std::pair<std::uint64_t, std::uint64_t> vram() const {
         std::size_t free = 0, total = 0;
         if (cudaMemGetInfo(&free, &total) != cudaSuccess) { (void)cudaGetLastError(); return {0, 0}; }
+        if (const std::uint64_t budget = e_.card_budget_bytes()) {
+            const unsigned live = live_slots();
+            const std::uint64_t used = e_.engine_device_bytes() + (live > 1U ? live - 1U : 0U) * e_.session_bytes();
+            free = std::min<std::uint64_t>(free, budget > used ? budget - used : 0U);
+            total = std::min<std::uint64_t>(total, budget);
+        }
         return {free, total};
     }
     std::uint64_t slot_fit(std::uint64_t free) const {
@@ -662,6 +677,13 @@ int main(int argc, char** argv) {
     strix::device::bind_cuda_main(argc, argv);
     try {
         const auto o = parse(argc, argv);
+        if (o.print_effective_config) {
+            // No model load: the residency decision from the GGUF headers and the live card/host numbers.
+            const auto plan = qp::plan_residency(o.engine);
+            std::cout << "{\"model\":\"" << o.engine.model_gguf << "\",\"max_positions_requested\":" << o.engine.max_positions
+                      << ",\"residency\":" << plan.json << "}" << std::endl;
+            return plan.decision.ok ? 0 : 3;
+        }
         std::cerr << "strix-cuda-qwen-serve: loading " << o.engine.model_gguf << std::endl;
         qp::Prefill engine(o.engine);
         std::cerr << "strix-cuda-qwen-serve: loaded " << engine.describe() << std::endl;
@@ -683,7 +705,9 @@ int main(int argc, char** argv) {
         config.state_cache_stats = [&prefix_cache] { return prefix_cache.stats_json(); };
         // /api/status names the bound device (id, UUID, PCI, attach) next to the prefix cache counters.
         const std::string device_json = strix::device::receipt_json(strix::device::bind_cuda());
-        config.status_extra = [&prefix_cache, device_json](serve::Json& status) {
+        config.status_extra = [&prefix_cache, device_json, &engine](serve::Json& status) {
+            status.set("expert_residency", serve::parse_json(engine.residency_json()));
+            status.set("expert_residency_receipt", serve::parse_json(engine.residency_receipt_json()));
             status.set("prefix_cache", serve::parse_json(prefix_cache.stats_json()));
             status.set("device", serve::parse_json(device_json));
         };

@@ -26,6 +26,7 @@
 #include "strix/cuda_qwen_qsa.hpp"
 #include "strix/cuda_qwen_transcode.hpp"
 #include "strix/gguf_reader.hpp"
+#include "qwen_tier_adapter.hpp"
 #include "strix/cuda_vram_guard.hpp"
 
 #include "qwen_amd_math_tables.hpp"
@@ -333,6 +334,16 @@ struct Prefill::Impl : BlockFields {
     std::map<GraphKey, std::uint32_t> warmed;      // eager runs per key before capture (lazy attributes, once flags)
     std::function<void(std::uint32_t)> qsa_cut;    // capture: called at each QSA core instead of launching it
     bool use_graphs = true;
+    // Tiered expert residency (null = fully resident: today's route, nothing below is touched)
+    ResidencyPlan plan;
+    std::unique_ptr<QwenTier> tier;
+    std::uint32_t* tier_routes = nullptr;          // tiered: slot routes [cap][kTopK] the routed kernels read
+    std::uint64_t engine_bytes = 0;                // device bytes held once loaded (measured)
+    void tier_step_end();                          // between steps (stream synchronized): planner + expert moves
+    std::FILE* trace_file = nullptr;               // Config::expert_trace (diagnostic)
+    std::uint32_t* trace_host = nullptr;          // pinned [layer][rows][top_k]
+    std::uint32_t trace_cap = 0, trace_step = 0;
+    ~Impl() { if (trace_file) std::fclose(trace_file); if (trace_host) cudaFreeHost(trace_host); }
     std::size_t graph_cap = 512;                   // layouts up to 16 rows (C8 with 1-draft windows: 256)
     std::uint64_t graph_clock = 0, graph_captures = 0, graph_replays = 0, graph_evictions = 0, eager_windows = 0;
     void drop_graph(std::map<GraphKey, StepGraph>::iterator it);
@@ -471,6 +482,7 @@ void Prefill::Impl::upload_model() {
     for (auto t : pinfo.tensors) {
         if (t.name.rfind("per_layer_token_embd", 0) == 0) { ple_part = part; info.tensors.push_back(t); continue; }  // PLE (host)
         if (t.name == "output.weight" && !cfg.decode) { info.tensors.push_back(t); continue; }                  // head (node)
+        if (tier && t.name.find("_exps.") != std::string::npos) { info.tensors.push_back(t); continue; }        // tiered: host-mapped
         const Target target = transcode_target(t);
         if (target != Target::native && !transcode::supported(t.ggml_type))
             throw std::runtime_error("no decoder for " + t.name + " type " + std::to_string(t.ggml_type));
@@ -552,6 +564,7 @@ void Prefill::Impl::upload_model() {
         w.tensors.erase(it);
     }
     lw.resize(kLayers);
+    if (tier) tier->alloc_slots();
     for (std::uint32_t l = 0; l < kLayers; ++l) {
         const std::string blk = "blk." + std::to_string(l);
         for (std::uint32_t i = 0; i < kLayerTensors; ++i) {
@@ -561,6 +574,11 @@ void Prefill::Impl::upload_model() {
         for (const auto& t : info.tensors) {
             if (t.name == blk + ".ffn_gate_exps.weight") lw[l].gate_type = t.ggml_type;
             if (t.name == blk + ".ffn_down_exps.weight") lw[l].down_type = t.ggml_type;
+        }
+        if (tier) {  // the routed kernels read the slot buffers (slot S = the zero expert)
+            lw[l].p[k_ffn_gate_exps_weight] = const_cast<void*>(tier->slot_gate(l));
+            lw[l].p[k_ffn_up_exps_weight] = const_cast<void*>(tier->slot_up(l));
+            lw[l].p[k_ffn_down_exps_weight] = const_cast<void*>(tier->slot_down(l));
         }
         moe::Weights probe;
         probe.gate_type = lw[l].gate_type;
@@ -755,6 +773,7 @@ void Prefill::Impl::allocate() {
     gdn_stride = 10240 + 6144 + 48 + 48 + 6144;
     const auto rows = round_up(*std::max_element(cfg.block_schedule.begin(), cfg.block_schedule.end()), 16U);
     allocate_block(rows, std::min<std::uint32_t>(rows, 1024U), true);
+    if (tier) tier_routes = dev_zero<std::uint32_t>(std::uint64_t{cap} * kTopK, "tier slot routes");
     if (cfg.decode) {
         head_logits = dev_zero<float>(std::uint64_t{kMaxWindowRows} * hc::kVocab, "head logits");
         argmax_dev = dev_zero<std::uint32_t>(kMaxWindowRows, "argmax");
@@ -826,6 +845,76 @@ void Prefill::Impl::drop_graph(std::map<GraphKey, StepGraph>::iterator it) {
     ++graph_evictions;
 }
 
+// ---- residency: decided from the GGUF headers and the live card/host numbers, before any upload ----
+namespace {
+constexpr std::uint32_t kTierRows = 256;  // rows per block of the tiered route (the host exchange's capacity)
+std::uint64_t scratch_estimate(std::uint32_t block_rows) {
+    // ~0.44 MiB of per-row workspace (activations, GDN rows, MoE scratch, raw dots) + fixed pools (GDN, QSA workspace,
+    // head logits, context): measured against cudaMemGetInfo after the load (residency_json "engine_bytes").
+    return std::uint64_t{block_rows} * (448ULL << 10) + (1280ULL << 20);
+}
+}  // namespace
+
+ResidencyPlan plan_residency(const Config& config) {
+    ResidencyPlan r;
+    const auto& bound = strix::device::bind_cuda();
+    ck(cudaSetDevice(bound.visible.ordinal), "set device");
+    auto& m = r.model;
+    m.layers = kLayers;
+    m.experts = kExperts;
+    m.top_k = kTopK;
+    m.expert_bytes.assign(kLayers, 0);
+    for (const auto& part : model_parts(config.model_gguf)) {
+        for (const auto& t : gguf::read_file(part).tensors) {
+            if (t.name.rfind("per_layer_token_embd", 0) == 0) { m.host_tables += t.byte_size; continue; }
+            if (t.name == "output.weight" && !config.decode) continue;
+            if (t.name.find("_exps.") != std::string::npos) {
+                if (t.name.rfind("blk.", 0) == 0) {
+                    const auto layer = static_cast<std::uint32_t>(std::stoul(t.name.substr(4)));
+                    if (layer < kLayers) m.expert_bytes[layer] += t.byte_size / kExperts;
+                }
+                continue;
+            }
+            const Target target = transcode_target(t);
+            m.core += target == Target::native ? t.byte_size
+                    : target == Target::q8_0 ? transcode::q8_0_bytes(elements_of(t)) : elements_of(t) * 4U;
+        }
+    }
+    const bool mtp = !config.mtp_sidecar_gguf.empty();
+    if (mtp) {
+        for (const auto& t : gguf::read_file(config.mtp_sidecar_gguf).tensors) m.mtp_head += t.byte_size;
+        m.core += m.mtp_head;
+    }
+    std::size_t free_bytes = 0, total_bytes = 0;
+    ck(cudaMemGetInfo(&free_bytes, &total_bytes), "memory info");
+    r.card = {total_bytes, free_bytes};
+    r.host.available = host_available_bytes();
+    auto& s = r.session;
+    s.per_position = (12ULL + (mtp ? 1ULL : 0ULL)) * (2048 + 256);
+    s.fixed = 36ULL * gdn::kMatrixFloats * sizeof(float) + 36ULL * gdn::kConvStateHalfs * 2 + 10240ULL * 9 * 2 + 8;
+    s.margin = 512ULL << 20;
+    s.sessions = 1;
+    s.positions = config.max_positions;
+    const std::uint32_t full_rows = round_up(*std::max_element(config.block_schedule.begin(), config.block_schedule.end()), 16U);
+    s.scratch = scratch_estimate(full_rows);
+    r.block_rows = full_rows;
+    r.decision = strix::residency::resolve(config.residency, m, r.card, s, r.host);
+    if (r.decision.mode == strix::residency::Mode::tiered) {
+        // the tiered route runs blocks of the exchange's rows: its scratch is smaller, so the pool is re-sized with it
+        s.scratch = scratch_estimate(kTierRows);
+        r.block_rows = kTierRows;
+        auto forced = config.residency;
+        forced.mode = strix::residency::Mode::tiered;
+        r.decision = strix::residency::resolve(forced, m, r.card, s, r.host);
+    }
+    auto json = strix::residency::decision_json(r.decision);
+    if (!json.empty() && json.back() == '}') json.pop_back();
+    r.json = json + ",\"card_total_bytes\":" + std::to_string(total_bytes) + ",\"card_free_bytes\":" + std::to_string(free_bytes) +
+             ",\"model_core_bytes\":" + std::to_string(m.core) + ",\"host_available_bytes\":" + std::to_string(r.host.available) +
+             ",\"scratch_estimate_bytes\":" + std::to_string(s.scratch) + ",\"block_rows\":" + std::to_string(r.block_rows) + "}";
+    return r;
+}
+
 Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
     auto& m = *impl_;
     m.route_policy = qwen_route::environment(config.moe_route_bf16);
@@ -857,6 +946,28 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
                                      " (select a card with --device-id or STRIX_DEVICE)");
         ck(cudaSetDevice(bound.visible.ordinal), "set device");
     }
+    // Residency is decided before our first allocation. Fully resident (automatic when the model fits, or full): nothing
+    // below this block changes, no allocation, launch or sync is added. Tiered: the experts stay in the memory-mapped GGUF,
+    // the card keeps a slot pool of the hot ones, blocks are capped to the exchange's rows, the position limit may shrink.
+    m.plan = plan_residency(m.cfg);
+    if (!m.plan.decision.ok) throw std::runtime_error("expert residency: " + m.plan.decision.error);
+    if (m.plan.decision.mode == strix::residency::Mode::tiered) {
+        if (m.route_policy.enabled)
+            throw std::runtime_error("expert residency: tiered declines BF16 route storage (the host gather writes FP32 raw dots; "
+                                     "qwen_moe.cu merge_kernel<true> reads BF16): use --expert-residency full or unset STRIX_QWEN_MOE_ROUTE_BF16");
+        // slot ids are expert ids of the routed kernels (< 512): the zero slot is the last, so at most 511 experts per layer
+        m.plan.decision.slots_per_layer = std::min(m.plan.decision.slots_per_layer, kExperts - 1U);
+        m.cfg.block_schedule = {kTierRows};
+        m.cfg.final_block_rows = 0;
+        m.cfg.max_positions = m.plan.decision.positions;
+        QwenTier::Init in;
+        in.parts = model_parts(m.cfg.model_gguf);
+        in.tables_dir = m.cfg.tables_dir;
+        in.decision = m.plan.decision;
+        in.model = m.plan.model;
+        in.layout = {kHidden, 640U, kTopK, kExperts, kTierRows};
+        m.tier = std::make_unique<QwenTier>(std::move(in));
+    }
     // Priorities change only which ready blocks the GPU schedules first, never what a kernel computes: the engine and
     // side streams (decode windows) get the highest, the prefill-overlap stream the lowest (decode first).
     if (cudaDeviceGetStreamPriorityRange(&m.stream_priority_low, &m.stream_priority_high) != cudaSuccess) {
@@ -885,7 +996,7 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
     {
         std::FILE* f = std::fopen(config.rope_table.c_str(), "rb");
         if (!f) throw std::runtime_error("cannot open rope table " + config.rope_table);
-        std::vector<qsa::RopeTable> cs(static_cast<std::size_t>(config.max_positions) * qsa::kRotaryPairs);
+        std::vector<qsa::RopeTable> cs(static_cast<std::size_t>(m.cfg.max_positions) * qsa::kRotaryPairs);
         if (std::fread(cs.data(), sizeof(qsa::RopeTable), cs.size(), f) != cs.size())
             throw std::runtime_error("rope table shorter than max_positions");
         std::fclose(f);
@@ -910,11 +1021,22 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
         const char* ms = std::getenv("STRIX_QRTX_MULTISEG");
         m.multiseg = !(ms && ms[0] == '0');
     }
+    if (!m.cfg.expert_trace.empty()) {
+        m.trace_file = std::fopen(m.cfg.expert_trace.c_str(), "wb");
+        if (!m.trace_file) throw std::runtime_error("expert trace: cannot open " + m.cfg.expert_trace);
+        const std::uint32_t head[6] = {0x52545845U, 0x00003130U, kLayers, kExperts, kTopK, 0U};  // magic "EXTR01" + 2 zero bytes
+        std::fwrite(head, 4, 6, m.trace_file);
+        m.use_graphs = false;  // the per-layer copies below are eager-only
+    }
+    {
+        std::size_t free_now = 0, total_now = 0;
+        if (cudaMemGetInfo(&free_now, &total_now) == cudaSuccess && m.plan.card.free > free_now) m.engine_bytes = m.plan.card.free - free_now;
+    }
     char buf[384];
     std::snprintf(buf, sizeof(buf), "{\"weights_gb\":%.2f,\"upload_s\":%.1f,\"block_rows\":%u,\"max_positions\":%u,"
                   "\"transcoded_tensors\":%u,\"native_experts\":%s}",
                   static_cast<double>(m.w.bytes) / 1e9, std::chrono::duration<double>(Clock::now() - t0).count(), m.cap,
-                  config.max_positions, m.transcoded, m.native_experts ? "true" : "false");
+                  m.cfg.max_positions, m.transcoded, m.native_experts ? "true" : "false");
     m.describe = buf; // OFF receipt remains the original byte sequence.
     if (m.route_policy.enabled) {
         const auto id = numerical_identity();
@@ -939,6 +1061,16 @@ std::string Prefill::describe() const {
         ",\"sidecar_weight_bytes\":" + std::to_string(impl_->mw.bytes) + ",\"single_weight_owner\":true}";
 }
 
+void Prefill::Impl::tier_step_end() { tier->after_step(stream); }
+bool Prefill::tiered() const { return impl_->tier != nullptr; }
+std::string Prefill::residency_json() const { return impl_->plan.json; }
+std::string Prefill::residency_receipt_json() const {
+    if (!impl_->tier) return "{\"expert_residency\":\"full\"}";
+    return impl_->tier->receipt_json();
+}
+std::uint64_t Prefill::card_budget_bytes() const { return impl_->tier ? impl_->plan.decision.budget : 0ULL; }
+std::uint64_t Prefill::engine_device_bytes() const { return impl_->engine_bytes; }
+
 qwen_route::Identity Prefill::numerical_identity() const {
     return qwen_route::identity(impl_->route_policy.enabled, impl_->route_policy.enabled);
 }
@@ -951,6 +1083,12 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         if (seg[i].s->target_identity != qwen_route::identity(route_policy.enabled, route_policy.enabled).hash)
             throw std::logic_error("Qwen session target identity mismatch");
         rows += seg[i].rows;
+    }
+    if (trace_file && rows > trace_cap) {
+        ck(cudaStreamSynchronize(stream), "expert trace grow");
+        if (trace_host) ck(cudaFreeHost(trace_host), "expert trace free");
+        ck(cudaHostAlloc(&trace_host, std::uint64_t{rows} * kLayers * kTopK * 4, cudaHostAllocDefault), "expert trace alloc");
+        trace_cap = rows;
     }
     if (pad > rows) ck(cudaMemsetAsync(ids, 0, std::uint64_t{pad} * 4, stream), "ids clear");
     for (std::uint32_t i = 0; i < count; ++i)
@@ -1114,6 +1252,8 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         hc::route_logits(hidden, static_cast<const float*>(lw[l].p[k_ffn_gate_inp_weight]), pad, logits, stream);
         hc::route_select(logits, pad, kTopK, true, tables, routes, route_w, stream);
         nv.pop();
+        if (trace_file) ck(cudaMemcpyAsync(trace_host + std::uint64_t{l} * rows * kTopK, routes, std::uint64_t{rows} * kTopK * 4,
+                                           cudaMemcpyDeviceToHost, stream), "expert trace");
         dn::SharedExpert sw;
         sw.gate_q8 = lw[l].p[k_ffn_gate_shexp_weight];
         sw.up_q8 = lw[l].p[k_ffn_up_shexp_weight];
@@ -1156,7 +1296,18 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         ew.up = static_cast<const std::uint8_t*>(lw[l].p[k_ffn_up_exps_weight]);
         ew.down = static_cast<const std::uint8_t*>(lw[l].p[k_ffn_down_exps_weight]);
         nv.push("moe_routed");
-        moe::enqueue(mr, pad, kHidden, ew, tables, nullptr, stream);
+        if (!tier) {
+            moe::enqueue(mr, pad, kHidden, ew, tables, nullptr, stream);
+        } else {
+            // Tiered: the prologue reads the real ids; publish maps them to slots (misses -> the zero slot) and hands the
+            // misses to the host; the routed kernels run on the slot routes; gather brings the host raw dots back.
+            moe::enqueue_prologue(mr, pad, kHidden, stream);
+            tier->publish(l, rows, pad, routes, tier_routes, moe_codes, moe_deltas, moe_sums, stream);
+            mr.routes = {tier_routes, kTopK * 4};
+            moe::enqueue_routed(mr, pad, ew, tables, stream);
+            tier->wait_gather(rows, moe_raw, mr.rawdots.stride, moe_status, mr.status.stride, csr.summary, stream);
+            moe::enqueue_combine(mr, pad, nullptr, stream);
+        }
         nv.pop();
         if (window) {
             moe_sticky_kernel<<<1, 32, 0, stream>>>(csr.summary, moe_status, 4, pad, moe_sticky);
@@ -1172,6 +1323,19 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
     }
     final_wide = wide;
     ck(cudaGetLastError(), "block launches");
+    if (trace_file) {
+        ck(cudaStreamSynchronize(stream), "expert trace sync");
+        const std::uint32_t head[3] = {0U, trace_step++, rows};
+        std::fwrite(head, 4, 3, trace_file);
+        std::vector<std::uint16_t> ids(std::uint64_t{rows} * kLayers * kTopK);
+        for (std::uint32_t r = 0; r < rows; ++r)
+            for (std::uint32_t l = 0; l < kLayers; ++l)
+                for (std::uint32_t k = 0; k < kTopK; ++k)
+                    ids[(std::uint64_t{r} * kLayers + l) * kTopK + k] =
+                        static_cast<std::uint16_t>(trace_host[(std::uint64_t{l} * rows + r) * kTopK + k]);
+        std::fwrite(ids.data(), 2, ids.size(), trace_file);
+        std::fflush(trace_file);
+    }
 }
 
 void Prefill::Impl::qsa_core(std::uint32_t l, const Segment& seg) {
@@ -1446,6 +1610,7 @@ Timing Prefill::run(SessionId session, const std::vector<std::uint32_t>& tokens,
     };
     if (!m.cfg.export_state) {  // decode-only session: nothing leaves the device
         ck(cudaStreamSynchronize(m.stream), "prefill");
+        if (m.tier) m.tier_step_end();
         timing.rows = position;
         timing.total_s = std::chrono::duration<double>(Clock::now() - t0).count();
         S.length = position;
@@ -1464,6 +1629,7 @@ Timing Prefill::run(SessionId session, const std::vector<std::uint32_t>& tokens,
     timing.rows = position;
     S.length = position;
     timing.total_s = std::chrono::duration<double>(Clock::now() - t0).count();
+    if (m.tier) { ck(cudaStreamSynchronize(m.stream), "prefill"); m.tier_step_end(); }
     return timing;
 }
 
@@ -1790,6 +1956,7 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
             ck(cudaMemcpyAsync(logits.data(), m.head_logits, logits.size() * 4, cudaMemcpyDeviceToHost, m.stream), "logits d2h");
         }
         ck(cudaStreamSynchronize(m.stream), "step");
+        if (m.tier) m.tier_step_end();
     } catch (...) {
         m.window = false;
         m.qsa_cut = nullptr;
@@ -2139,6 +2306,7 @@ std::uint64_t Prefill::prefill_chunk(SessionId session, const std::vector<std::u
     if (from != 0 && from != S.length) throw std::invalid_argument("prefill chunk does not continue the session");
     const auto rows = m.prefill_enqueue(S, tokens, position, from, max_rows);
     ck(cudaStreamSynchronize(m.stream), "prefill chunk");
+    if (m.tier) m.tier_step_end();
     S.length = from + rows;
     return S.length;
 }
@@ -2162,6 +2330,7 @@ void Prefill::Impl::free_block(BlockFields& b) noexcept {
 void Prefill::enable_prefill_overlap(std::uint32_t max_rows) {
     auto& m = *impl_;
     qwen_route::require_composition(m.route_policy.enabled, qwen_route::Composition::overlap);
+    if (m.tier) throw std::logic_error("prefill overlap is not available with tiered expert residency (one host exchange serves one stream)");
     if (!m.cfg.decode || m.cfg.export_state) throw std::logic_error("prefill overlap needs a decode engine with export_state = false");
     if (m.cohort_open || m.window || m.table_mode || m.qsa_cut || m.after_layer)
         throw std::logic_error("enable_prefill_overlap() inside a decode window");

@@ -1074,12 +1074,10 @@ bool native_types(const Weights& w) {
     return !(a8_gate && a8_down);
 }
 
-void enqueue(const Rows& v, std::uint32_t rows, std::uint32_t clear_words, const Weights& w, const amdmath::Tables& tables,
-             std::uint32_t* record, cudaStream_t s) {
+void enqueue_routed(const Rows& v, std::uint32_t rows, const Weights& w, const amdmath::Tables& tables, cudaStream_t s) {
     validate_route_storage(v, rows);
     if (v.route_bf16 && native_types(w))
         qwen_route::require_composition(true, qwen_route::Composition::other_weight_pack);
-    enqueue_prologue(v, rows, clear_words, s);
     enqueue_csr(v, rows, s);
     if (native_types(w)) {
         if (!v.intermediates.base) throw std::invalid_argument("MoE native expert types need Rows::intermediates");
@@ -1090,14 +1088,24 @@ void enqueue(const Rows& v, std::uint32_t rows, std::uint32_t clear_words, const
         check(cudaGetLastError(), "MoE native gate/up");
         native_down_kernel<<<dim3(tiles, hidden / 32U), 1024, 0, s>>>(w.down, w.down_type, v);
         check(cudaGetLastError(), "MoE native down");
-        enqueue_merge(v, rows, s);
-        enqueue_commit(v, rows, record, s);
         return;
     }
     enqueue_project(v, rows, w, tables, s);
     enqueue_down(v, rows, w, s);
+}
+void enqueue_combine(const Rows& v, std::uint32_t rows, std::uint32_t* record, cudaStream_t s) {
     enqueue_merge(v, rows, s);
     enqueue_commit(v, rows, record, s);
+}
+
+void enqueue(const Rows& v, std::uint32_t rows, std::uint32_t clear_words, const Weights& w, const amdmath::Tables& tables,
+             std::uint32_t* record, cudaStream_t s) {
+    validate_route_storage(v, rows);
+    if (v.route_bf16 && native_types(w))
+        qwen_route::require_composition(true, qwen_route::Composition::other_weight_pack);
+    enqueue_prologue(v, rows, clear_words, s);
+    enqueue_routed(v, rows, w, tables, s);
+    enqueue_combine(v, rows, record, s);
 }
 
 }  // namespace strix::cuda::qwen_moe
