@@ -187,6 +187,22 @@ static void test_f8(std::uint32_t out, std::uint32_t in, std::uint32_t rows, std
     for (std::size_t i = 0; i < a.size(); ++i) { const double d = double(a[i]) - b[i]; num += d * d; den += double(a[i]) * a[i]; }
     const double rel = std::sqrt(num / std::max(den, 1e-30));
     std::printf("  f8 rel RMS vs f16 path: %.4f\n", rel);
+    {   // clustering: per-output and per-row relative RMS (uniform = precision, a few outliers = bug)
+        std::vector<double> cn(out, 0.0), cd(out, 0.0), rn(rows, 0.0), rd(rows, 0.0);
+        for (std::uint32_t r = 0; r < rows; ++r)
+            for (std::uint32_t o = 0; o < out; ++o) {
+                const double d = double(a[std::size_t(r) * out + o]) - b[std::size_t(r) * out + o], v = a[std::size_t(r) * out + o];
+                cn[o] += d * d; cd[o] += v * v; rn[r] += d * d; rd[r] += v * v;
+            }
+        auto stat = [](const std::vector<double>& n, const std::vector<double>& d, const char* what) {
+            std::vector<double> e(n.size());
+            for (std::size_t i = 0; i < n.size(); ++i) e[i] = std::sqrt(n[i] / std::max(d[i], 1e-30));
+            std::sort(e.begin(), e.end());
+            std::printf("  %s rel RMS: min %.4f p50 %.4f p99 %.4f max %.4f\n", what, e.front(), e[e.size() / 2], e[e.size() * 99 / 100], e.back());
+        };
+        stat(cn, cd, "per-output");
+        stat(rn, rd, "per-row");
+    }
     expect(a8.f8 && rel < 0.08, "nvfp4 f8 relative RMS < 0.08");
     CK(cudaFree(x)); CK(cudaFree(y0)); CK(cudaFree(y8)); CK(cudaFree(w.mem));
 }
