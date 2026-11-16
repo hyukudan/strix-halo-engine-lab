@@ -10,6 +10,11 @@
 
 void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
 using hipStream_t = void*;
+namespace strix::weight::hip {
+struct Q8F16Source {
+#include "weight_supported.inc"
+};
+}
 namespace strix::core::f16_dense_tall::q8a8 {
 struct View {
     const std::uint8_t* weight{};

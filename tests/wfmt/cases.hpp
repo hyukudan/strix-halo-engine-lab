@@ -26,6 +26,10 @@ inline bool compare_records(const Record& a, const Record& b) noexcept {
 }
 bool compare_case();
 bool capture_case(std::string_view output_directory);
+struct ByteSection { std::string_view name; std::span<const std::byte> bytes; };
+bool write_capture_sections(std::string_view directory,std::string_view name,std::string_view format,
+                            std::string_view arithmetic,std::span<const std::uint64_t> shape,
+                            std::span<const ByteSection> sections);
 bool write_capture_record(std::string_view directory, std::string_view name,
                           std::string_view format, std::span<const std::uint64_t> shape,
                           std::span<const std::byte> source, std::span<const std::byte> output,

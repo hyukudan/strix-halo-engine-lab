@@ -1,4 +1,4 @@
-// CUDA GDN recurrence with a 16-bit stored recurrent state (STRIX_RECURRENT_STATE=f16|bf16), src/cuda/qwen_gdn.cu.
+// CUDA GDN recurrence with a 16-bit stored recurrent state (STRIX_RECURRENT_STATE=f16|bf16), src/cuda/models/qwen/qwen_gdn.cu.
 //   qwen_gdn_state16_test [--tables DIR]
 // (a) device Codec<f16> / Codec<bf16> store, load and round_in_register against the host integer functions, bit for bit;
 // (b) f16 / bf16: 8 rows in ONE round-each-row launch == 8 single-row launches (core and state bits), == split(window) +
@@ -21,8 +21,8 @@
 #include <crtdbg.h>
 #endif
 
-#include "strix/cuda_qwen_gdn.hpp"
-#include "qwen_amd_math_tables.hpp"
+#include "strix/cuda/qwen_gdn.hpp"
+#include "strix/cuda/amd_math_tables.hpp"
 #include "../../src/attn_core/recurrent_state.hpp"
 
 namespace am = strix::cuda::amdmath;

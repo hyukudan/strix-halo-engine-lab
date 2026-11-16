@@ -84,6 +84,9 @@ void gdn_known_window_rows_launch(std::span<const ExecutionDispatchContext> rows
 // commit applies the pending rows and the caller then stores pending_rows = 0
 // before any serial GDN token. Every GDN layer of a round shares one control.
 inline constexpr std::uint32_t gdn_window_max_rows = 8;
+// Sessions of one GDN cohort call (kCohortWideMaxSessions). The fused part 2 table holds gdn_window_max_rows segments
+// (kernel argument budget), so a wider cohort launches it once per eight sessions; each block owns one session's state.
+inline constexpr std::uint32_t gdn_window_cohort_max_segments = 16;
 // Rows of one GDN cohort launch (the sessions of several 8-row chunks: 16 or 32).
 inline constexpr std::uint32_t gdn_window_cohort_max_rows = 32;
 struct GdnWindowControl { std::uint32_t pending_rows = 0, pending_slot = 0; };

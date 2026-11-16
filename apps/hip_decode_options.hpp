@@ -30,6 +30,7 @@
 #include <array>
 #include "strix/token_sampling.hpp"
 #include "strix/mtp_draft_profiles.hpp"
+#include "strix/onfly_i4.hpp"
 #include "qwen_mtp_bundle.hpp"
 #include "strix/session/speculation_default.hpp"
 #include "strix/mtp_depth_window_controller.hpp"
@@ -257,6 +258,9 @@ struct Options {
     bool early_setup = true;
     bool eager_code_load = true;
     bool qwen_router_bf16 = true;
+    // TURBO+ onfly INT4 weights: as typed (CLI) and as resolved by initialize_prefill_config (CLI + environment).
+    strix::onfly_i4::Request turbo_request;
+    strix::onfly_i4::Resolved turbo;
     bool baseline = false;
     std::string suppressed_yarn_request;
     bool print_effective_config = false;
@@ -1710,7 +1714,11 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
                 throw std::invalid_argument("MTP cohort request requires 3..4097 prompt tokens within the context and a pinned golden");
     }
 }
+inline void validate_onfly_i4_routes(const Options& o) {
+    onfly_i4::require_serial(o.turbo.active(), !o.mtp.cohort.empty() || (o.http_serve && o.http_batch));
+}
 inline void validate_resolved_mtp_cli(const Options& o) {
+    validate_onfly_i4_routes(o);
     validate_mtp_cli(o,true);
     if(o.mtp.enabled && o.mtp.window_rows && (!o.deferred_moe_status || !o.virtual_q8_gdn_input || !o.prefetch_q8_gdn_input ||
        !o.virtual_q8_gdn_output || !o.wave8_q8_gdn_input || !o.wave8_q8_gdn_output))
@@ -2114,6 +2122,23 @@ inline Options parse_options(
         // A supplied controller or organization owns its route, including values
         // equal to the incumbent defaults. Arithmetic alone can select a prompt pair.
         // The opt-in route-dot storage candidate is a product arithmetic switch.
+        // TURBO+ weight source (strix/onfly_i4.hpp): a weight-format switch, not a route-owning option.
+        {
+            using Req = strix::onfly_i4::Request;
+            bool turbo_flag = false;
+            for (const auto& [flag, field] : {std::pair<std::string_view, std::string Req::*>{"--turbo-onfly-groups", &Req::groups},
+                                              {"--turbo-onfly-scale-rule", &Req::scale_rule}}) {
+                if (argument != flag && !(argument.starts_with(flag) && argument.size() > flag.size() && argument[flag.size()] == '=')) continue;
+                const auto value = argument == flag ? (index + 1 < argc ? std::string_view(argv[++index]) : std::string_view{})
+                                                    : argument.substr(flag.size() + 1U);
+                if (value.empty() || value.starts_with("--")) throw std::invalid_argument(std::string(flag) + " requires a value");
+                if (!(options.turbo_request.*field).empty()) throw std::invalid_argument("duplicate " + std::string(flag));
+                options.turbo_request.*field = std::string(value);
+                turbo_flag = true;
+                break;
+            }
+            if (turbo_flag) continue;
+        }
         if (argument.starts_with("--") && argument != "--generate" && !argument.starts_with("--generate=") &&
             argument != "--context" && !argument.starts_with("--context=") && argument != "--unqualified-context" &&
             !argument.starts_with("--optimization-profile") && argument != "--prefill-moe-route-bf16" &&

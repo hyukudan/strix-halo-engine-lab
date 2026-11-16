@@ -10,7 +10,8 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${ROOT}/src/hip_deepseek41_prefill.hip"
     "${ROOT}/src/hip_ds41_layer.hip"
     "${ROOT}/src/hip_ds41_prefill.hip"
-    "${ROOT}/src/core/f16_dense_q8a8.hpp")
+    "${ROOT}/src/core/f16_dense_q8a8.hpp"
+    "${ROOT}/src/hip/weight/ggml_sources.hpp")
 execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract.py"
     "${ROOT}" "${CMAKE_CURRENT_BINARY_DIR}" COMMAND_ERROR_IS_FATAL ANY)
 function(host_target name)

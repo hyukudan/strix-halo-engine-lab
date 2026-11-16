@@ -340,6 +340,12 @@ bool prefill_o_b_one() {
 // bit 2 = after them): host synchronisation at the points --timing synchronises at. Bit 1 alone holds the whole gain: with
 // the main stream drained, the lanes' wait on chunk_ready is already satisfied when their window launches are queued.
 bool prefill_moe_pass_window() { return strix::envcfg::flag("STRIX_DS41_PREFILL_MOE_PASS_WINDOW", true, strix::EnvFlagMatch::exact); }
+// ds41-attn-bf16flash-v1 layers: q_b writes q's BF16 image after RoPE (query_op of the shared flash core; same bits,
+// half the q bytes). Default on (bitwise); STRIX_DS41_FAST_ATTN_Q16=0 keeps the FP32 q and the flash prologue.
+bool prefill_flash_q16() {
+    static const bool on = strix::envcfg::flag("STRIX_DS41_FAST_ATTN_Q16", true, strix::EnvFlagMatch::exact);
+    return on;
+}
 std::uint32_t prefill_moe_window_cap() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_PREFILL_MOE_WINDOW_CAP", 8192U, 1U, 65536U); }
 bool prefill_joint_layer() { return strix::envcfg::flag("STRIX_DS41_PREFILL_JOINT_LAYER", false, strix::EnvFlagMatch::exact); }
 std::uint32_t prefill_joint_layer_rows() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_PREFILL_JOINT_LAYER_ROWS", 1024U, 0U, 65536U); }
@@ -2660,8 +2666,11 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     attn::hip::enqueue_compress(v, st);
                     L.carry_cur = 1 - L.carry_cur;
                 };
-                // q = q_b(qr) of this rank's chunk at r0 (n rows) into m.q
+                // q = q_b(qr) of this rank's chunk at r0 (n rows) into m.q; q16_chunk: the last chunk's q is the BF16 image
+                const bool q16_layer = m.flash_attn_at(layer) && prefill_flash_q16();
+                bool q16_chunk = false;
                 const auto q_b_chunk = [&](std::uint32_t r0, std::uint32_t n) {
+                    q16_chunk = false;
                     const bool fp16_q_b = m.fp16_at(4U, layer, n);
                     if (fp16_q_b && m.options.fp16_fast) {
                         ds41::Q8A8DensePrefillView v;
@@ -2684,7 +2693,13 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         v.x_stride = QA;
                         v.out = m.q.p;
                         v.out_stride = QL;
-                        m.dense(v, m.qr.p + std::size_t{r0} * QA, st, fp16_q_b);
+                        // flash layers: q's BF16 image after RoPE into m.q's own memory (u16, QL per row; nothing else
+                        // reads m.q there), row i with the RoPE row of chunk row r0 + i (the attention's rope + w0)
+                        const attn::RopeRow* qrope = (r.rope == attn::RopeKind::window ? m.lrope_window.p : m.lrope_comp.p) + r0;
+                        if (!fp16_q_b && q16_layer && ds41::enqueue_q_b_rope_image(v, reinterpret_cast<std::uint16_t*>(m.q.p), qrope, st))
+                            q16_chunk = true;
+                        else
+                            m.dense(v, m.qr.p + std::size_t{r0} * QA, st, fp16_q_b);
                     } else {
                         ds41::Q8A8PrefillView v;
                         v.weight = q8_rows(m.dev(p + "attn_q_b.weight"), std::size_t{head0} * c.head_dim, QA);
@@ -2994,9 +3009,10 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                             if (heads % 32U != 0U) throw std::invalid_argument("ds41-attn-bf16flash-v1: requires a multiple of 32 heads");
                             v.ring16 = m.ring16.p;
                             v.kv16 = m.kv16.p;
+                            if (q16_chunk) v.q16 = reinterpret_cast<const std::uint16_t*>(m.q.p) + std::size_t{w0 - r0} * QL;
                             attn::hip::enqueue_attention_flash_prefill(v, ls);
                             if (!flash_reported) {
-                                std::fprintf(stderr, "deepseek41 prefill effective attention: ds41-attn-bf16flash-v1\n");
+                                std::fprintf(stderr, "deepseek41 prefill effective attention: ds41-attn-bf16flash-v1 q16=%d\n", q16_chunk ? 1 : 0);
                                 flash_reported = true;
                             }
                         } else if (m.fast_attn_at(layer)) attn::hip::enqueue_attention_f16wmma_prefill(v, ls);
