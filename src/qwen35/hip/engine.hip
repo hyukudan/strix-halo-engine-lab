@@ -22,6 +22,7 @@
 #include "../../attn_core/dense_decode.hpp"
 #include "../../core/dense_linear.hpp"
 #include "../../core/dense_linear_iu4.hpp"
+#include "../../core/f16_dense_iu4.hpp"
 #include "../../core/f16_dense_q8a8.hpp"
 #include "../../ops/norm/norm_device.hpp"
 
@@ -256,10 +257,28 @@ void glu16(const Tensor& g, const Tensor& u, const float* x, float* out, unsigne
         silu_mul_kernel<<<256, 256, 0, s>>>(iu4.g, iu4.u, out, std::size_t(rows) * g.outputs);
     } else throw std::runtime_error("gate/up need bf16, q8_0 or iu4");
 }
+// rows > 16 over IU4 weights: FAST dense-iu4a16-f16-v1 (f16_dense_iu4.hpp), the same opt-in as the Q8_0 wide windows
+// (prefill_rows > 16 allocates the wide scratch). The exact reference flag keeps the 16-row sweeps.
+core::f16_dense_tall::iu4a16::View wide_iu4_view(const Tensor& w, const float* x, float* out, unsigned rows) {
+    core::f16_dense_tall::iu4a16::View v{};
+    v.weight = static_cast<const std::uint8_t*>(w.data);
+    v.scale = reinterpret_cast<const std::uint16_t*>(v.weight + core::dense_iu4::packed_bytes(w.outputs, w.inputs));
+    v.x = x; v.out = out; v.in = w.inputs; v.n = w.outputs; v.count = w.outputs; v.rows = rows; v.out_stride = w.outputs;
+    return v;
+}
+bool wide_iu4_ok(const Tensor& t, const WideScratch& wide, unsigned rows) {
+    return wide.codes && t.fmt == kIu4Fmt && !core::dense_iu4::reference_flag() && t.inputs % 128U == 0U && t.outputs % 16U == 0U &&
+           std::uint64_t(rows) * t.inputs * 4U < (1ULL << 32U);
+}
+void wide_iu4(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s) {
+    core::f16_dense_tall::iu4a16::enqueue(wide_iu4_view(w, x, out, rows), s);
+}
 void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s, const WideScratch& wide, const Iu4Scratch& iu4) {
     if (rows > 16U && wide_ok(w, wide)) {
         wide_quant(x, w.inputs, rows, s, wide);
         wide_dense(w, out, rows, s, wide);
+    } else if (rows > 16U && wide_iu4_ok(w, wide, rows)) {
+        wide_iu4(w, x, out, rows, s);
     } else {  // not a Q8_0 shape the WMMA core takes: exact 16-row sweeps
         core::dense_row_sweeps(rows, [&](unsigned r, unsigned count) {
             linear16(w, x + std::size_t(r) * w.inputs, out + std::size_t(r) * w.outputs, count, s, iu4);
@@ -271,6 +290,10 @@ void glu(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned 
         wide_quant(x, g.inputs, rows, s, wide);
         wide_dense(g, wide.g, rows, s, wide);
         wide_dense(u, wide.u, rows, s, wide);
+        silu_mul_kernel<<<1024, 256, 0, s>>>(wide.g, wide.u, out, std::size_t(rows) * g.outputs);
+    } else if (rows > 16U && wide_iu4_ok(g, wide, rows) && wide_iu4_ok(u, wide, rows) && g.outputs == u.outputs) {
+        wide_iu4(g, x, wide.g, rows, s);
+        wide_iu4(u, x, wide.u, rows, s);
         silu_mul_kernel<<<1024, 256, 0, s>>>(wide.g, wide.u, out, std::size_t(rows) * g.outputs);
     } else {
         core::dense_row_sweeps(rows, [&](unsigned r, unsigned count) {
