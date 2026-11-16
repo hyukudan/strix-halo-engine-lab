@@ -73,6 +73,8 @@ bool wfmt_admission_test() try {
     check(bool(bind_minimax(trellis,transformed)),"MiniMax variable-bit transformed schema");
     check(transformed[0].weight.parameters.bits==3 && transformed[0].weight.parameters.transform=="hadamard128","trellis transform/bit identity");
     check(bool(bind_glm(trellis,transformed)),"GLM transformed schema");
+    trellis.tensors[0].wire_dtype="U16";check(!bind_glm(trellis,transformed),"GLM retains I16-only trellis graph admission");
+    check(bool(bind_minimax(trellis,transformed)),"MiniMax retains its existing U16 transport admission");trellis.tensors[0].wire_dtype="I16";
     trellis.tensors.pop_back();check(bool(bind_glm(trellis,transformed)),"legacy GLM fixed mul1 contract permits absent wire marker");
     check(!bind_ds41(trellis,transformed),"DS41 requires actual mul1 marker");
     trellis.tensors.pop_back();check(!bind_glm(trellis,transformed),"missing transform sidecar rejected");

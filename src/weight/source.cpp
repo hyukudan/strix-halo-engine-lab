@@ -15,6 +15,7 @@
 #include <io.h>
 #else
 #include <sys/stat.h>
+#include <fcntl.h>
 #endif
 namespace strix::weight {
 namespace {
@@ -50,6 +51,14 @@ public:
     }
     ~FileSource() override { std::fclose(file_); }
     std::uint64_t size() const noexcept override { return size_; }
+    void discard(ByteRange range) const noexcept override {
+#ifndef _WIN32
+        if(range.offset<=size_ && range.bytes<=size_-range.offset)
+            (void)posix_fadvise(fileno(file_),static_cast<off_t>(range.offset),static_cast<off_t>(range.bytes),POSIX_FADV_DONTNEED);
+#else
+        (void)range;
+#endif
+    }
     std::string shard_name() const override { return shard_; }
     Status read(ByteRange range,std::span<Byte> out) const override {
         if (range.offset>size_ || range.bytes>size_-range.offset || range.bytes!=out.size())
@@ -93,6 +102,7 @@ public:
     std::uint64_t size() const noexcept override{return source_->size();}
     Digest256 identity() const override{return source_->identity();}
     std::string shard_name() const override{return shard_;}
+    void discard(ByteRange range) const noexcept override{source_->discard(range);}
 };
 class MemorySource final : public Source {
     std::vector<Byte> data_; std::string shard_;

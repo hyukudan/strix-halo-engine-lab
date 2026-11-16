@@ -9,6 +9,8 @@ struct Source {
   virtual Digest256 identity() const = 0;
   // Stable shard namespace, independent of a tensor name. Not a content digest.
   virtual std::string shard_name() const { return {}; }
+  // Optional positioned-I/O cache hint; it never changes the stored bytes.
+  virtual void discard(ByteRange) const noexcept {}
 };
 Digest256 digest_bytes(std::span<const Byte>);
 Status open_source(const std::string&, std::shared_ptr<const Source>&, std::string shard = {});
