@@ -63,6 +63,8 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 namespace strix::attn_core::sparse {
 
@@ -267,14 +269,32 @@ __global__ __launch_bounds__((Geometry<P::kHeads, P::kDim, T>::kThreads)) void f
 }
 
 // Pipelined loads (Pf, bitwise: same operands, same order), shared by every engine that binds this core.
-// STRIX_ATTN_FLASH_PF=0 restores the single-stage loop; resolved once per in-process arm (env_arms).
-inline bool flash_pf_enabled() {
-    static strix::env_arms::Resolved<bool> on;
-    return on.get([] { return strix::envcfg::flag("STRIX_ATTN_FLASH_PF", true); });
+// Auto by the launch's longest key list (host bound, max_keys): Pf hides latency only when there are blocks to overlap,
+// and its extra VGPRs (gfx1151 VGPR Pf on / off: T 16 210 / 253, T 32 238 / 199) cost occupancy on short lists. Measured receipts
+// (fp32glm3r, ABAB, bitwise in every case): GLM T 16 lists <= 2,051 flash ~-19 %; DS41 T 32 lists 640 -4.3..-4.7 %,
+// 228 +3.3 %, <= 128 +12..15 % -> on from kPfMinKeys. STRIX_ATTN_FLASH_PF=1 / 0 forces it; resolved once per in-process
+// arm (env_arms).
+inline constexpr unsigned kPfMinKeys = 320;
+inline int flash_pf_mode() {  // -1 auto, 0 off, 1 on
+    static strix::env_arms::Resolved<int> mode;
+    return mode.get([] {
+        const char* p = std::getenv("STRIX_ATTN_FLASH_PF");
+        if (p == nullptr || *p == '\0' || std::strcmp(p, "auto") == 0) return -1;
+        return strix::envcfg::flag("STRIX_ATTN_FLASH_PF", true) ? 1 : 0;
+    });
 }
-template <class P, unsigned T> inline void launch_flash_rows(const typename P::Args& a, unsigned grid, hipStream_t s) {
+inline bool flash_pf_enabled(unsigned max_keys = ~0U) {
+    const int m = flash_pf_mode();
+    return m < 0 ? max_keys >= kPfMinKeys : m == 1;
+}
+inline const char* flash_pf_reason(unsigned max_keys = ~0U) {
+    const int m = flash_pf_mode();
+    if (m >= 0) return m == 1 ? "on (STRIX_ATTN_FLASH_PF=1)" : "off (STRIX_ATTN_FLASH_PF=0)";
+    return max_keys >= kPfMinKeys ? "on (auto: key lists >= 320)" : "off (auto: key lists < 320, nothing to overlap)";
+}
+template <class P, unsigned T> inline void launch_flash_rows(const typename P::Args& a, unsigned grid, hipStream_t s, unsigned max_keys = ~0U) {
     constexpr unsigned threads = Geometry<P::kHeads, P::kDim, T>::kThreads;
-    if (flash_pf_enabled()) flash_rows_kernel<P, T, true><<<grid, threads, 0, s>>>(a);
+    if (flash_pf_enabled(max_keys)) flash_rows_kernel<P, T, true><<<grid, threads, 0, s>>>(a);
     else flash_rows_kernel<P, T, false><<<grid, threads, 0, s>>>(a);
 }
 
