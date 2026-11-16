@@ -73,7 +73,7 @@ __global__ __launch_bounds__(kThreads) void logprob_partials_kernel(const float*
     fold_u[t] = bad;
     lane_v[t] = bv;
     lane_i[t] = bi;
-    if (t == 0U) n_cand = 0U;
+    if (t == 0U) { n_cand = 0U; tau_v = -infinity(); tau_i = 0xFFFFFFFFU; }
     __syncthreads();
     for (unsigned half = kThreads / 2U; half > 0U; half /= 2U) {
         if (t < half) { fold_f[t] = fmaxf(fold_f[t], fold_f[t + half]); fold_u[t] += fold_u[t + half]; }
