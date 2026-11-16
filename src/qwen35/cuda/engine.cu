@@ -1230,6 +1230,10 @@ std::unique_ptr<CudaEngine> CudaEngine::from_gguf(const std::string& path, const
         P.opt.turbo_lm_head = false;
         for (const auto& t : specs) if (t.name == "output.weight") P.opt.turbo_lm_head = t.fp4;  // identity follows the pack
     } else {
+        // A converted pack holds NVFP4 tile bytes: without --turbo-weights converted they would be laid out as exact weights.
+        for (const auto& t : specs)
+            if (t.type == static_cast<int>(gguf::kNvfp4TilePack) || t.name == kPackGscaleName)
+                throw std::invalid_argument("qwen35: " + path + " is a converted NVFP4 pack; load it with --turbo-weights converted");
         mark_fp4(opt, specs);
     }
     layout(P.W, specs, P.c.layers);
