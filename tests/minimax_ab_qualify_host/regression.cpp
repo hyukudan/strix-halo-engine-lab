@@ -1,10 +1,13 @@
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include "strix/prefill_headless.hpp"
 
 struct Engine {
     struct Impl { std::uint64_t pf_dense_mlp_calls = 0; } storage;
@@ -14,6 +17,9 @@ struct Engine {
     unsigned rank_ = 0;
     bool enabled = false;
     std::uint64_t prefill_dense_mlp_count() const;
+    // These dense-MLP scenarios never execute headless prefill.
+    std::uint64_t prefill_headless_chunks() const { return 0; }
+    std::size_t prefill_headless_expected(std::size_t) const { return 0; }
     unsigned rank() const { return rank_; }
     std::uint32_t prefill(int, const std::vector<std::uint32_t>&, int) {
         if (enabled != (next % 2 == 1)) throw std::runtime_error("wrong arm order");

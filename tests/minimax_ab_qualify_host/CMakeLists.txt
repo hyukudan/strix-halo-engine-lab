@@ -9,7 +9,7 @@ execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/ext
     "${STRIX_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}" COMMAND_ERROR_IS_FATAL ANY)
 add_executable(minimax-ab-qualify-host regression.cpp)
 target_compile_features(minimax-ab-qualify-host PRIVATE cxx_std_20)
-target_include_directories(minimax-ab-qualify-host PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_include_directories(minimax-ab-qualify-host PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" "${STRIX_ROOT}/include")
 if(MSVC)
     target_compile_options(minimax-ab-qualify-host PRIVATE /W4 /WX /permissive-)
 else()
