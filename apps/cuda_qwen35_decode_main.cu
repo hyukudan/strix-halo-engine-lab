@@ -226,8 +226,7 @@ int main(int argc, char** argv) {
                 E->sync();
                 const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                 E->read_top(o, 1, &next_tok);
-                std::fprintf(stderr, "prefill[%u/%u] %s %zu tokens in %.3f s = %.1f tok/s (%s) top1 %u
-", rep + 1, pf_repeat, pf_arith.c_str(),
+                std::fprintf(stderr, "prefill[%u/%u] %s %zu tokens in %.3f s = %.1f tok/s (%s) top1 %u\n", rep + 1, pf_repeat, pf_arith.c_str(),
                              prompt.size(), sec, static_cast<double>(prompt.size()) / sec, rep == 0 ? "FIRST/cold" : rep + 1 == pf_repeat ? "LAST/warm" : "mid", next_tok);
             }
         }
