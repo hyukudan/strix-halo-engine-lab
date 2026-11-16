@@ -135,6 +135,68 @@ int main() {
             run_serial(*E2, tok, s2);
             CHECK(same(ser.logits, s2.logits), "multi-launch off differs");
         }
+        // 4. multi-session slots: every row bitwise equal to the session run alone (legacy single-session serial decode as reference);
+        //    sessions at different lengths, 1-row lanes mixed with 3-row windows, auto-commit and partial accept, rotating order.
+        {
+            const auto& c = E->config();
+            const std::uint32_t NS = 4, N = 44;
+            E->configure_slots(NS);
+            std::vector<std::vector<std::uint32_t>> T(NS, std::vector<std::uint32_t>(N));
+            std::vector<Rec> ref(NS);
+            for (auto& v : T) for (auto& t : v) t = rng() % 2048;
+            for (std::uint32_t i = 0; i < NS; ++i) run_serial(*E, T[i], ref[i]);
+            const std::uint32_t pre[NS] = {0, 5, 13, 22};
+            for (std::uint32_t i = 0; i < NS; ++i) {
+                E->reset_slot(i);
+                for (std::uint32_t done = 0; done < pre[i];) {
+                    const std::uint32_t n = std::min<std::uint32_t>(7, pre[i] - done);
+                    const q::SlotRows g{i, n};
+                    E->forward_slots(&g, 1, &T[i][done], q::LogitRows::none);
+                    done += n;
+                }
+                CHECK(E->slot_committed(i) == pre[i], "slot prefill length");
+            }
+            std::vector<float> lg(c.vocab), hd(c.hidden);
+            bool all_same = true;
+            std::uint32_t rows_checked = 0;
+            for (std::uint32_t step = 0; step < 400; ++step) {
+                std::vector<q::SlotRows> g;
+                std::vector<std::uint32_t> tk;
+                const bool windowed = step % 3 == 0;
+                for (std::uint32_t k = 0; k < NS; ++k) {
+                    const std::uint32_t sl = (k + step) % NS;
+                    const std::uint32_t len = E->slot_committed(sl);
+                    if (len >= N) continue;
+                    if (step % 5 == 4 && k == 1) continue;  // a slot skipping steps
+                    const std::uint32_t r = windowed && sl % 2 == 1 ? std::min<std::uint32_t>(3, N - len) : 1;
+                    g.push_back({sl, r});
+                    for (std::uint32_t j = 0; j < r; ++j) tk.push_back(T[sl][len + j]);
+                }
+                if (g.empty()) continue;
+                const auto o = E->forward_slots(g.data(), static_cast<std::uint32_t>(g.size()), tk.data(), q::LogitRows::all, !windowed);
+                std::uint32_t row = 0;
+                std::vector<std::uint32_t> acc;
+                for (std::size_t gi = 0; gi < g.size(); ++gi) {
+                    const std::uint32_t len = E->slot_committed(g[gi].slot) - (windowed ? 0 : g[gi].rows);
+                    for (std::uint32_t j = 0; j < g[gi].rows; ++j, ++row) {
+                        E->read_logits(o, row, lg.data());
+                        E->read_hidden(o.hidden_post + static_cast<std::size_t>(row) * c.hidden, 1, hd.data());
+                        const std::size_t pos = len + j;
+                        all_same = all_same && std::memcmp(lg.data(), &ref[g[gi].slot].logits[pos * c.vocab], c.vocab * 4) == 0 &&
+                                   std::memcmp(hd.data(), &ref[g[gi].slot].hidden[pos * c.hidden], c.hidden * 4) == 0;
+                        ++rows_checked;
+                    }
+                    acc.push_back(g[gi].rows == 1 ? 1 : (step / 3) % (g[gi].rows + 1));
+                }
+                if (windowed) E->commit_slots(acc.data());
+            }
+            CHECK(all_same, "slot batch rows differ from the single-session reference");
+            CHECK(rows_checked > 120, "slot test rows checked (%u)", rows_checked);
+            for (std::uint32_t i = 0; i < NS; ++i) CHECK(E->slot_committed(i) == N, "slot %u reached its length", i);
+            // copy_slot: a copy continues bitwise like the original
+            E->copy_slot(3, 1);
+            CHECK(E->slot_committed(3) == N, "copy_slot length");
+        }
         // MTP: one call with rows == the same rows one at a time
         if (E->has_mtp()) {
             const auto& c = E->config();

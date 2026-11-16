@@ -92,13 +92,61 @@ struct ClockSampler {
 
 }  // namespace
 
+// Multi-session decode bench: N slots at context `ctx`, 1 row per slot per step (greedy), steps timed on the host including the token
+// read-back (what a server pays). Reports aggregate and per-request tok/s (mean and best 1 s window), and the SM clock.
+struct SlotRun {
+    double total_s = 0, mean_step_ms = 0, per_req_mean = 0, per_req_peak = 0, agg_mean = 0, agg_peak = 0;
+    int clk_min = 0, clk_avg = 0;
+    std::vector<std::uint32_t> first_tokens;  // slot 0's generated ids (exactness cross-check between arms)
+};
+static SlotRun slot_decode(q::CudaEngine& E, std::uint32_t n_slots, std::uint32_t steps, std::vector<std::uint32_t>& cur) {
+    SlotRun r;
+    std::vector<q::SlotRows> g(n_slots);
+    for (std::uint32_t i = 0; i < n_slots; ++i) g[i] = {i, 1};
+    std::vector<std::uint32_t> top(n_slots);
+    ClockSampler clk;
+    clk.start();
+    using Clock = std::chrono::steady_clock;
+    std::vector<double> t_end(steps);
+    const auto t0 = Clock::now();
+    for (std::uint32_t i = 0; i < steps; ++i) {
+        const auto o = E.forward_slots(g.data(), n_slots, cur.data(), q::LogitRows::all, true);
+        E.read_top(o, n_slots, top.data());
+        for (std::uint32_t k = 0; k < n_slots; ++k) cur[k] = top[k];
+        r.first_tokens.push_back(top[0]);
+        t_end[i] = std::chrono::duration<double>(Clock::now() - t0).count();
+    }
+    clk.end();
+    r.total_s = t_end[steps - 1];
+    r.mean_step_ms = r.total_s * 1e3 / steps;
+    r.per_req_mean = steps / r.total_s;
+    r.agg_mean = r.per_req_mean * n_slots;
+    // best window of >= 1 s (or the whole run when shorter): steps completed / elapsed between window boundaries
+    double best = r.per_req_mean;
+    std::uint32_t lo = 0;
+    for (std::uint32_t hi = 0; hi < steps; ++hi) {
+        while (lo + 1 < hi && t_end[hi] - t_end[lo + 1] >= 1.0) ++lo;
+        if (t_end[hi] - t_end[lo] >= 1.0) best = std::max(best, (hi - lo) / (t_end[hi] - t_end[lo]));
+    }
+    r.per_req_peak = best;
+    r.agg_peak = best * n_slots;
+    if (!clk.mhz.empty()) {
+        r.clk_min = *std::min_element(clk.mhz.begin(), clk.mhz.end());
+        long sum = 0;
+        for (int m : clk.mhz) sum += m;
+        r.clk_avg = static_cast<int>(sum / static_cast<long>(clk.mhz.size()));
+    }
+    return r;
+}
+
 int main(int argc, char** argv) {
     strix::device::bind_cuda_main(argc, argv);
     try {
         std::string model, dump, ids_arg, synth, dump_mtp, force_file;
         bool mtp_pre = false;
-        std::uint32_t n_gen = 32, rows_cap = 16, max_pos = 4096, prompt_len = 0, ctx_fill = 0, layers_override = 0, decode_rows = 1;
-        bool graphs = true, multi = true, bwp = false, pdl = false, print_cfg = false;
+        std::uint32_t n_gen = 32, rows_cap = 16, max_pos = 4096, prompt_len = 0, ctx_fill = 0, layers_override = 0, decode_rows = 1, slots = 0, ab_pairs = 3;
+        std::string arms_arg;
+        bool slots_verify = false, graphs = true, multi = true, bwp = false, pdl = false, print_cfg = false;
         q::EngineOptions topt;  // TURBO levers (defaults = exact)
         std::string arith_name = "mma3";
         for (int i = 1; i < argc; ++i) {
@@ -118,6 +166,10 @@ int main(int argc, char** argv) {
             else if (a == "--max-pos") max_pos = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--layers") layers_override = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--graphs") graphs = next() != "0";
+            else if (a == "--slots") slots = static_cast<std::uint32_t>(std::stoul(next()));  // multi-session bench: N concurrent sessions
+            else if (a == "--slots-verify") slots_verify = true;  // exactness: batched slots == each slot decoded alone (logit hashes)
+            else if (a == "--arms") arms_arg = next();
+            else if (a == "--ab-pairs") ab_pairs = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--bw-probe") bwp = true;
             else if (a == "--pdl") pdl = next() != "0";
             else if (a == "--dense-arith") {
@@ -173,7 +225,7 @@ int main(int argc, char** argv) {
         opt.multi_gemv = multi;
         opt.pdl = pdl;
         std::unique_ptr<q::CudaEngine> E;
-        const std::uint64_t total_ctx = ctx_fill + prompt.size() + prompt_len + static_cast<std::uint64_t>(n_gen) * decode_rows + 64;
+        const std::uint64_t total_ctx = ctx_fill + (slots ? static_cast<std::uint64_t>(n_gen) * (ab_pairs + 1) * 2 : 0) + prompt.size() + prompt_len + static_cast<std::uint64_t>(n_gen) * decode_rows + 64;
         opt.max_positions = static_cast<std::uint32_t>(std::max<std::uint64_t>(max_pos, total_ctx));
         if (!model.empty()) {
             E = q::CudaEngine::from_gguf(model, opt);
@@ -193,6 +245,82 @@ int main(int argc, char** argv) {
             lcg = lcg * 6364136223846793005ull + 1442695040888963407ull;
             return static_cast<std::uint32_t>((lcg >> 33) % cfg.vocab);
         };
+        if (slots) {
+            // prefill slot 0 with ctx_fill random tokens (rows_cap rows per forward), clone it to the other slots, then ABAB:
+            // A = all slots batched, B = slot 0 alone (the sequential-serving rate; N sequential requests aggregate at B).
+            E->configure_slots(slots + (slots_verify ? 1 : 0));
+            std::vector<std::uint32_t> ctxt(ctx_fill);
+            for (auto& t : ctxt) t = rnd_tok();
+            const auto tp = std::chrono::steady_clock::now();
+            for (std::uint32_t p = 0; p < ctx_fill; p += rows_cap) {
+                const q::SlotRows g{0, std::min<std::uint32_t>(rows_cap, ctx_fill - p)};
+                E->forward_slots(&g, 1, ctxt.data() + p, q::LogitRows::none, true);
+            }
+            E->sync();
+            std::fprintf(stderr, "slot prefill %u tokens in %.2f s\n", ctx_fill, std::chrono::duration<double>(std::chrono::steady_clock::now() - tp).count());
+            const std::uint32_t pos_after_prefill = E->slot_committed(0);
+            if (slots_verify) {
+                // slot `slots` is the pristine copy; every slot starts from it with its own first token
+                E->copy_slot(slots, 0);
+                auto fnv = [](const std::vector<float>& v) {
+                    std::uint64_t h = 1469598103934665603ull;
+                    const auto* b = reinterpret_cast<const unsigned char*>(v.data());
+                    for (std::size_t i = 0; i < v.size() * 4; ++i) h = (h ^ b[i]) * 1099511628211ull;
+                    return h;
+                };
+                std::vector<float> lg(cfg.vocab);
+                const std::uint32_t steps = n_gen;
+                std::vector<std::vector<std::uint64_t>> hb(slots), hs(slots);
+                std::vector<std::uint32_t> cur(slots);
+                for (std::uint32_t k = 0; k < slots; ++k) { E->copy_slot(k, slots); cur[k] = (k * 7919 + 13) % cfg.vocab; }
+                std::vector<q::SlotRows> g(slots);
+                for (std::uint32_t k = 0; k < slots; ++k) g[k] = {k, 1};
+                std::vector<std::uint32_t> top(slots);
+                for (std::uint32_t i = 0; i < steps; ++i) {
+                    const auto o = E->forward_slots(g.data(), slots, cur.data(), q::LogitRows::all, true);
+                    E->read_top(o, slots, top.data());
+                    for (std::uint32_t k = 0; k < slots; ++k) { E->read_logits(o, k, lg.data()); hb[k].push_back(fnv(lg)); cur[k] = top[k]; }
+                }
+                std::uint32_t bad = 0;
+                for (std::uint32_t k = 0; k < slots; ++k) {
+                    E->copy_slot(k, slots);
+                    std::uint32_t t = (k * 7919 + 13) % cfg.vocab;
+                    const q::SlotRows one{k, 1};
+                    for (std::uint32_t i = 0; i < steps; ++i) {
+                        const auto o = E->forward_slots(&one, 1, &t, q::LogitRows::all, true);
+                        E->read_top(o, 1, &t);
+                        E->read_logits(o, 0, lg.data());
+                        hs[k].push_back(fnv(lg));
+                        if (hs[k].back() != hb[k][i]) ++bad;
+                    }
+                }
+                std::printf("slots-verify: %u slots x %u steps, ctx %u: %u of %u logit rows differ batched vs solo (%s)\n", slots, steps, pos_after_prefill, bad,
+                            slots * steps, bad ? "FAIL" : "BITWISE EQUAL");
+                return bad ? 1 : 0;
+            }
+            for (std::uint32_t i = 1; i < slots; ++i) E->copy_slot(i, 0);
+            auto run_arm = [&](std::uint32_t n_active, const char* label) {
+                // every arm starts from the same cloned state: restore slot i from a spare is not available, so arms continue
+                // each slot's own history (positions advance); contexts differ by <= n_gen per arm and are reported.
+                std::vector<std::uint32_t> cur(n_active);
+                for (std::uint32_t k = 0; k < n_active; ++k) cur[k] = (k * 7919 + 13) % cfg.vocab;
+                (void)slot_decode(*E, n_active, 8, cur);  // warm (graph capture)
+                const SlotRun r = slot_decode(*E, n_active, n_gen, cur);
+                std::printf("%s slots %u ctx0 %u ctx_end %u: step %.3f ms | per-request mean %.2f peak(1s) %.2f tok/s | aggregate mean %.1f peak %.1f tok/s | sm clock avg %d min %d MHz\n",
+                            label, n_active, pos_after_prefill, E->slot_committed(0), r.mean_step_ms, r.per_req_mean, r.per_req_peak, r.agg_mean,
+                            r.agg_peak, r.clk_avg, r.clk_min);
+                std::fflush(stdout);
+            };
+            std::vector<std::uint32_t> arms;  // --arms 8,1,4,1 : per pair, in this order (default: slots,1)
+            {
+                std::stringstream as(arms_arg.empty() ? std::to_string(slots) + ",1" : arms_arg);
+                std::string t;
+                while (std::getline(as, t, ',')) arms.push_back(static_cast<std::uint32_t>(std::stoul(t)));
+            }
+            for (std::uint32_t pair = 0; pair < ab_pairs; ++pair)
+                for (const auto n : arms) run_arm(std::min(n, slots), n == 1 ? "solo   " : "batched");
+            return 0;
+        }
         if (prompt.empty()) {
             for (std::uint32_t i = 0; i < prompt_len + ctx_fill; ++i) prompt.push_back(rnd_tok());
             if (prompt.empty()) throw std::runtime_error("give --prompt-ids or --prompt-len");

@@ -55,6 +55,13 @@ struct RowsOut {
     const float* hidden_pre = nullptr;   // [rows][hidden] residual stream before the final norm
 };
 
+// Multi-session decode (slots): one batch = groups; a group is `rows` consecutive rows of ONE session slot (1 = a decode lane,
+// more = a verify / prefill window). Total rows over all groups <= 32.
+struct SlotRows {
+    std::uint32_t slot = 0;
+    std::uint32_t rows = 1;
+};
+
 class CudaEngine {
 public:
     ~CudaEngine();
@@ -102,6 +109,23 @@ public:
     void read_top(const RowsOut& o, std::uint32_t rows, std::uint32_t* host) const;
     void read_hidden(const float* dev, std::uint32_t rows, float* host) const;
     void sync() const;
+
+    // ---- Multi-session (slots). Home: shared mechanism (row map + slot tables live in cuda_core attention/rope/gdn); the layer
+    // composition below is model-specific. Slots have their own KV, GDN/conv state, parity and length; the single-session API above
+    // is a separate session (do not interleave its pending window with a slot batch: both reuse the window buffers).
+    // Arithmetic per row is bitwise equal to running that session alone (every reduction is independent of the row count/mix).
+    void configure_slots(std::uint32_t n);  // allocate state for n sessions (once, before graphs); n >= 1
+    [[nodiscard]] std::uint32_t slot_count() const;
+    [[nodiscard]] std::uint32_t slot_committed(std::uint32_t slot) const;
+    void reset_slot(std::uint32_t slot);
+    void copy_slot(std::uint32_t dst, std::uint32_t src);  // dst becomes a copy of src (KV prefix, GDN state, length)
+    // tokens: host [sum rows] in group order; group g row i runs at position slot_committed(slot)+i. want: none/all (last == all for
+    // 1-row groups; for wider groups it also returns all rows). auto_commit: every row is accepted (state committed inside the graph);
+    // false keeps the window until commit_slots. Logits / top / hidden are indexed by batch row.
+    RowsOut forward_slots(const SlotRows* groups, std::uint32_t n, const std::uint32_t* tokens, LogitRows want = LogitRows::all,
+                          bool auto_commit = true);
+    // After forward_slots(..., auto_commit=false): accept[g] rows of group g (0..rows) are committed, the rest discarded.
+    void commit_slots(const std::uint32_t* accept);
 
     // Diagnostics (no effect on arithmetic).
     void set_graphs(bool on);

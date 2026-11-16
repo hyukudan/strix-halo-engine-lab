@@ -11,13 +11,14 @@ constexpr std::uint32_t CH = kAttnChunk;  // 256 positions per chunk
 constexpr int D = 256;
 
 __global__ void kv_store_kernel(AttentionDims d, const float* k, const float* v, __nv_bfloat16* kc, __nv_bfloat16* vc,
-                                const std::uint32_t* pos0p) {
+                                const std::uint32_t* pos0p, RowMap rm) {
     pdl_trigger();
     pdl_wait();
-    const std::uint32_t pos0 = *pos0p;
     const std::uint32_t r = blockIdx.y, h = blockIdx.x;
+    const std::uint32_t pos = rm.pos ? rm.pos[r] : *pos0p + r;
+    const std::size_t so = rm.slot ? rm.slot[r] * rm.slot_stride : 0;
     const std::size_t src = (static_cast<std::size_t>(r) * d.kv_heads + h) * d.head_dim;
-    const std::size_t dst = (static_cast<std::size_t>(h) * d.max_positions + pos0 + r) * d.head_dim;
+    const std::size_t dst = so + (static_cast<std::size_t>(h) * d.max_positions + pos) * d.head_dim;
     for (std::uint32_t i = threadIdx.x; i < d.head_dim; i += blockDim.x) {
         kc[dst + i] = __float2bfloat16_rn(k[src + i]);
         vc[dst + i] = __float2bfloat16_rn(v[src + i]);
@@ -43,12 +44,13 @@ __host__ __device__ inline Scratch carve(float* base, const AttentionDims& d, st
 // Phase A: block (chunk, kv head, row); warp w handles positions base + w + 8 i for all G query heads of the group
 // (the K row is read once). dot: lane owns 8 consecutive dims (sequential), xor butterfly 16..1; score = fl(dot) * scale.
 __global__ void __launch_bounds__(256) attn_scores_kernel(AttentionDims d, const float* q, GroupedView qv, const __nv_bfloat16* kc,
-                                                          const std::uint32_t* pos0p, std::uint32_t rows, Scratch sc) {
+                                                          const std::uint32_t* pos0p, std::uint32_t rows, Scratch sc, RowMap rm) {
     pdl_trigger();
     pdl_wait();
     const std::uint32_t chunk = blockIdx.x, kvh = blockIdx.y, r = blockIdx.z;
-    const std::uint32_t len = *pos0p + r + 1, base = chunk * CH;
+    const std::uint32_t len = (rm.pos ? rm.pos[r] : *pos0p + r) + 1, base = chunk * CH;
     if (base >= len) return;
+    if (rm.slot) kc += rm.slot[r] * rm.slot_stride;
     const std::uint32_t G = d.heads / d.kv_heads, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     const std::uint32_t mc = attn_max_chunks(d);
     float qr[8][8];
@@ -96,12 +98,13 @@ __global__ void __launch_bounds__(256) attn_scores_kernel(AttentionDims d, const
 // e_p = expf(s_p - m) with the exact global max m; chunk denominator = block tree of the e (thread t holds position base + t);
 // chunk value partial = sum over the chunk positions ascending of e_p * v[p][t] (separate rounded mul, add).
 __global__ void __launch_bounds__(256) attn_values_kernel(AttentionDims d, const __nv_bfloat16* vc, const std::uint32_t* pos0p,
-                                                          std::uint32_t rows, Scratch sc) {
+                                                          std::uint32_t rows, Scratch sc, RowMap rm) {
     pdl_trigger();
     pdl_wait();
     const std::uint32_t chunk = blockIdx.x, kvh = blockIdx.y, r = blockIdx.z;
-    const std::uint32_t len = *pos0p + r + 1, base = chunk * CH;
+    const std::uint32_t len = (rm.pos ? rm.pos[r] : *pos0p + r) + 1, base = chunk * CH;
     if (base >= len) return;
+    if (rm.slot) vc += rm.slot[r] * rm.slot_stride;
     const std::uint32_t G = d.heads / d.kv_heads, t = threadIdx.x, lane = t & 31, w = t >> 5;
     const std::uint32_t mc = attn_max_chunks(d), nch = (len + CH - 1) / CH;
     __shared__ float mg[8];
@@ -145,11 +148,11 @@ __global__ void __launch_bounds__(256) attn_values_kernel(AttentionDims d, const
 // Phase D: block (head, row), thread = dim. out = (sum over chunks ascending of the partials) / (sum of chunk denominators
 // ascending), times sigmoid(gate).
 __global__ void __launch_bounds__(256) attn_combine_kernel(AttentionDims d, const float* gate, GroupedView gv, const std::uint32_t* pos0p,
-                                                           float* out, Scratch sc) {
+                                                           float* out, Scratch sc, RowMap rm) {
     pdl_trigger();
     pdl_wait();
     const std::uint32_t h = blockIdx.x, r = blockIdx.y, t = threadIdx.x;
-    const std::uint32_t len = *pos0p + r + 1, nch = (len + CH - 1) / CH, mc = attn_max_chunks(d);
+    const std::uint32_t len = (rm.pos ? rm.pos[r] : *pos0p + r) + 1, nch = (len + CH - 1) / CH, mc = attn_max_chunks(d);
     const std::size_t rh = static_cast<std::size_t>(r) * d.heads + h;
     float denom = 0.0f, acc = 0.0f;
     for (std::uint32_t c = 0; c < nch; ++c) {
@@ -164,24 +167,24 @@ __global__ void __launch_bounds__(256) attn_combine_kernel(AttentionDims d, cons
 }  // namespace
 
 cudaError_t kv_store(const AttentionDims& d, const float* k, const float* v, __nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
-                     const std::uint32_t* pos0, std::uint32_t rows, cudaStream_t stream) {
+                     const std::uint32_t* pos0, std::uint32_t rows, cudaStream_t stream, const RowMap& rm) {
     if (rows == 0) return cudaErrorInvalidValue;
-    return launch_pdl(kv_store_kernel, dim3(d.kv_heads, rows), dim3(256), stream, d, k, v, k_cache, v_cache, pos0);
+    return launch_pdl(kv_store_kernel, dim3(d.kv_heads, rows), dim3(256), stream, d, k, v, k_cache, v_cache, pos0, rm);
 }
 
 cudaError_t attention_decode(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate,
                              const GroupedView& gv, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
-                             const std::uint32_t* pos0, std::uint32_t rows, float* out, float* scratch, cudaStream_t stream) {
+                             const std::uint32_t* pos0, std::uint32_t rows, float* out, float* scratch, cudaStream_t stream, const RowMap& rm) {
     if (d.head_dim != 256 || rows == 0 || rows > kMaxRows || d.kv_heads == 0 || d.heads % d.kv_heads != 0 || d.heads / d.kv_heads > 8)
         return cudaErrorInvalidValue;
     const Scratch sc = carve(scratch, d, rows);
     const std::uint32_t mc = attn_max_chunks(d);
-    if (auto e = launch_pdl(attn_scores_kernel, dim3(mc, d.kv_heads, rows), dim3(256), stream, d, q, qv, k_cache, pos0, rows, sc);
+    if (auto e = launch_pdl(attn_scores_kernel, dim3(mc, d.kv_heads, rows), dim3(256), stream, d, q, qv, k_cache, pos0, rows, sc, rm);
         e != cudaSuccess)
         return e;
-    if (auto e = launch_pdl(attn_values_kernel, dim3(mc, d.kv_heads, rows), dim3(256), stream, d, v_cache, pos0, rows, sc); e != cudaSuccess)
+    if (auto e = launch_pdl(attn_values_kernel, dim3(mc, d.kv_heads, rows), dim3(256), stream, d, v_cache, pos0, rows, sc, rm); e != cudaSuccess)
         return e;
-    return launch_pdl(attn_combine_kernel, dim3(d.heads, rows), dim3(256), stream, d, gate, gv, pos0, out, sc);
+    return launch_pdl(attn_combine_kernel, dim3(d.heads, rows), dim3(256), stream, d, gate, gv, pos0, out, sc, rm);
 }
 
 }  // namespace strix::cuda_core

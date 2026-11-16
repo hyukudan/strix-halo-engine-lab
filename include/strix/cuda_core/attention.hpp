@@ -15,7 +15,7 @@ struct AttentionDims {
 // pos0 is a DEVICE scalar (graph capture: the step's start position changes without re-capture).
 // Stores rows k/v ([rows][kv_heads][head_dim] FP32, contiguous) at positions pos0 + r, rounding RNE to BF16.
 cudaError_t kv_store(const AttentionDims& d, const float* k, const float* v, __nv_bfloat16* k_cache,
-                     __nv_bfloat16* v_cache, const std::uint32_t* pos0_dev, std::uint32_t rows, cudaStream_t stream);
+                     __nv_bfloat16* v_cache, const std::uint32_t* pos0_dev, std::uint32_t rows, cudaStream_t stream, const RowMap& rm = {});
 
 constexpr std::uint32_t kAttnChunk = 256;  // positions per reduction chunk
 [[nodiscard]] __host__ __device__ inline std::uint32_t attn_max_chunks(const AttentionDims& d) { return (d.max_positions + kAttnChunk - 1) / kAttnChunk; }
@@ -36,6 +36,6 @@ inline std::size_t attention_scratch_floats(const AttentionDims& d, std::uint32_
 cudaError_t attention_decode(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate,
                              const GroupedView& gv, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
                              const std::uint32_t* pos0_dev, std::uint32_t rows, float* out /*[rows][heads][head_dim]*/,
-                             float* scratch, cudaStream_t stream);
+                             float* scratch, cudaStream_t stream, const RowMap& rm = {});
 
 }  // namespace strix::cuda_core

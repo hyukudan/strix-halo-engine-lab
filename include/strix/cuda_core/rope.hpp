@@ -26,6 +26,6 @@ inline void rope_table_host(std::uint32_t positions, std::uint32_t rotary_dim, d
 // In place on x (view rows x heads(groups) x head_dim(n)); row r uses position *pos0_dev + r (device scalar: graph-capturable).
 // out1 = x1*c - x2*s ; out2 = x2*c + x1*s  (each product rounded, then one add/sub).
 cudaError_t rope_apply(float* x, const GroupedView& view, std::uint32_t rotary_dim, const float* cos_table,
-                       const float* sin_table, const std::uint32_t* pos0_dev, cudaStream_t stream);
+                       const float* sin_table, const std::uint32_t* pos0_dev, cudaStream_t stream, const RowMap& rm = {});
 
 }  // namespace strix::cuda_core

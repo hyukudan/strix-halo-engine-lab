@@ -41,4 +41,13 @@ void set_programmatic_launch(bool on);
 
 constexpr std::uint32_t kMaxRows = 32;  // verify window
 
+// Per-row indirection for multi-session decode (null members = single-session behaviour). Device arrays [rows]:
+// pos[r] = absolute position of row r (null: *pos0_dev + r); slot[r] = cache slot of row r (null: slot 0); a cache
+// buffer holds [slot][...] blocks of slot_stride elements. Rows of one slot are consecutive and ascending in position.
+struct RowMap {
+    const std::uint32_t* pos = nullptr;
+    const std::uint32_t* slot = nullptr;
+    std::size_t slot_stride = 0;
+};
+
 }  // namespace strix::cuda_core

@@ -74,7 +74,7 @@ Config read_cfg(const gguf::FileInfo& f) {
 }
 
 // ---------------------------------------------------------------- tensors
-struct TensorSpec {
+struct PackTensorSpec {
     std::string name;
     int type = 0;  // ggml: 30 bf16, 8 q8_0, 0 f32
     std::uint64_t in = 0, out = 1, bytes = 0, file_off = 0;
@@ -86,14 +86,14 @@ struct TensorSpec {
 
 // Tensors that take the NVFP4 path: 2-D BF16 weights (every projection, the MTP eh_proj, optional lm_head), never the
 // embedding table (row gather) nor norms / conv / state tensors.
-bool fp4_eligible(const EngineOptions& o, const TensorSpec& t) {
+bool fp4_eligible(const EngineOptions& o, const PackTensorSpec& t) {
     if (o.turbo_weights != TurboWeights::onfly || t.type != 30 || t.out <= 1) return false;
     if (t.name == "token_embd.weight") return false;
     if (t.name == "output.weight" && !o.turbo_lm_head) return false;
     if (t.name.size() < 7 || t.name.compare(t.name.size() - 7, 7, ".weight") != 0) return false;
     return cc::nvfp4_shape_ok(static_cast<std::uint32_t>(t.out), static_cast<std::uint32_t>(t.in));
 }
-void mark_fp4(const EngineOptions& o, std::vector<TensorSpec>& v) {
+void mark_fp4(const EngineOptions& o, std::vector<PackTensorSpec>& v) {
     for (auto& t : v) {
         if (!fp4_eligible(o, t)) continue;
         t.fp4 = true;
@@ -158,7 +158,7 @@ std::uint64_t fnv(const std::string& s) {
 struct WeightStore {
     unsigned char* base = nullptr;
     std::uint64_t total = 0, trunk_bytes = 0;
-    std::map<std::string, TensorSpec> spec;
+    std::map<std::string, PackTensorSpec> spec;
     std::map<std::string, std::uint64_t> off;
     [[nodiscard]] bool has(const std::string& n) const { return off.count(n) != 0; }
     [[nodiscard]] const void* ptr(const std::string& n) const { return base + off.at(n); }
@@ -187,7 +187,7 @@ struct WeightStore {
     }
 };
 
-void layout(WeightStore& W, const std::vector<TensorSpec>& specs, std::uint32_t layers) {
+void layout(WeightStore& W, const std::vector<PackTensorSpec>& specs, std::uint32_t layers) {
     std::uint64_t total = 0;
     for (const auto& t : specs) {
         W.spec[t.name] = t;
@@ -200,8 +200,8 @@ void layout(WeightStore& W, const std::vector<TensorSpec>& specs, std::uint32_t 
     CK(cudaMalloc(reinterpret_cast<void**>(&W.base), total));
 }
 
-std::vector<TensorSpec> specs_from_gguf(const gguf::FileInfo& f, std::uint32_t layers, bool load_mtp) {
-    std::vector<TensorSpec> v;
+std::vector<PackTensorSpec> specs_from_gguf(const gguf::FileInfo& f, std::uint32_t layers, bool load_mtp) {
+    std::vector<PackTensorSpec> v;
     for (const auto& t : f.tensors) {
         const std::string pre = "blk." + std::to_string(layers) + ".";
         if (t.name.rfind(pre, 0) == 0 && !load_mtp) continue;
@@ -209,7 +209,7 @@ std::vector<TensorSpec> specs_from_gguf(const gguf::FileInfo& f, std::uint32_t l
             const std::uint32_t idx = static_cast<std::uint32_t>(std::stoul(t.name.substr(4)));
             if (idx > layers) continue;
         }
-        TensorSpec s;
+        PackTensorSpec s;
         s.name = t.name;
         s.type = static_cast<int>(t.ggml_type);
         s.in = t.dimensions.at(0);
@@ -222,11 +222,11 @@ std::vector<TensorSpec> specs_from_gguf(const gguf::FileInfo& f, std::uint32_t l
 }
 
 // Tensor list of the qwen35 contract (design section 2) plus the fill rule of each tensor.
-std::vector<std::pair<TensorSpec, FillSpec>> synth_specs(const Config& c, PackFormat pack, bool with_mtp) {
-    std::vector<std::pair<TensorSpec, FillSpec>> v;
+std::vector<std::pair<PackTensorSpec, FillSpec>> synth_specs(const Config& c, PackFormat pack, bool with_mtp) {
+    std::vector<std::pair<PackTensorSpec, FillSpec>> v;
     const int wt = pack == PackFormat::bf16 ? 30 : 8;
     auto W = [&](const std::string& n, std::uint64_t in, std::uint64_t out, float gain) {
-        TensorSpec s;
+        PackTensorSpec s;
         s.name = n;
         s.type = wt;
         s.in = in;
@@ -235,7 +235,7 @@ std::vector<std::pair<TensorSpec, FillSpec>> synth_specs(const Config& c, PackFo
         v.push_back({s, FillSpec{Fill::weight, 0.0f, gain * std::sqrt(3.0f / static_cast<float>(in))}});
     };
     auto F = [&](const std::string& n, std::uint64_t cnt, std::uint64_t cols, float base, float amp) {
-        TensorSpec s;
+        PackTensorSpec s;
         s.name = n;
         s.type = 0;
         s.in = cols;
@@ -311,6 +311,26 @@ __global__ void set_inputs_kernel(InputPack in, std::uint32_t* pos, std::uint32_
     if (threadIdx.x < cc::kMaxRows) ids[threadIdx.x] = in.ids[threadIdx.x];
 }
 __global__ void zero_u32_kernel(std::uint32_t* p) { *p = 0; }
+
+// Multi-session batch tables (one small by-value pack, scattered to device arrays by one kernel before the graph).
+struct SlotPack {
+    std::uint32_t ids[cc::kMaxRows], pos[cc::kMaxRows], slot[cc::kMaxRows];
+    std::uint32_t g_row0[cc::kMaxRows], g_rows[cc::kMaxRows], g_slot[cc::kMaxRows];
+};
+struct SlotDev {
+    std::uint32_t *ids, *pos, *slot, *g_row0, *g_rows, *g_slot;
+};
+__global__ void set_slot_inputs_kernel(SlotPack in, SlotDev d) {
+    const std::uint32_t i = threadIdx.x;
+    if (i < cc::kMaxRows) {
+        d.ids[i] = in.ids[i];
+        d.pos[i] = in.pos[i];
+        d.slot[i] = in.slot[i];
+        d.g_row0[i] = in.g_row0[i];
+        d.g_rows[i] = in.g_rows[i];
+        d.g_slot[i] = in.g_slot[i];
+    }
+}
 
 }  // namespace
 
@@ -506,6 +526,7 @@ struct CudaEngine::Impl {
         float *x, *xn;
         const std::uint32_t* pos;
         __nv_bfloat16 *kc, *vc;
+        cc::RowMap rm{};
     };
 
     // GEMVs that share x: one launch when format and in agree (bitwise equal either way), else separate launches.
@@ -531,10 +552,10 @@ struct CudaEngine::Impl {
         const cc::GroupedView kvv{rows, c.kv_heads, D, c.kv_heads * D, D};
         CK(cc::rmsnorm(qg, qsrc, w.qn, q, qdst, c.rms_eps, s));
         CK(cc::rmsnorm(k, kvv, w.kn, k, kvv, c.rms_eps, s));
-        CK(cc::rope_apply(q, qdst, c.rotary_dim, cos_t, sin_t, b.pos, s));
-        CK(cc::rope_apply(k, kvv, c.rotary_dim, cos_t, sin_t, b.pos, s));
-        CK(cc::kv_store(ad, k, v, b.kc, b.vc, b.pos, rows, s));
-        CK(cc::attention_decode(ad, q, qdst, qg + D, qsrc, b.kc, b.vc, b.pos, rows, ao, scratch, s));
+        CK(cc::rope_apply(q, qdst, c.rotary_dim, cos_t, sin_t, b.pos, s, b.rm));
+        CK(cc::rope_apply(k, kvv, c.rotary_dim, cos_t, sin_t, b.pos, s, b.rm));
+        CK(cc::kv_store(ad, k, v, b.kc, b.vc, b.pos, rows, s, b.rm));
+        CK(cc::attention_decode(ad, q, qdst, qg + D, qsrc, b.kc, b.vc, b.pos, rows, ao, scratch, s, b.rm));
         CK(cc::dense_rows(w.o, ao, b.x, rows, b.x, s));
     }
 
@@ -632,6 +653,233 @@ struct CudaEngine::Impl {
         last_rows = 0;
     }
 
+    // ================= multi-session (slots)
+    struct SlotState {
+        std::uint32_t n = 0;
+        std::vector<__nv_bfloat16*> kc, vc;  // per layer [slot][kvh][maxpos][D] (attention layers)
+        std::vector<float*> conv, delta;     // per layer [slot][C*3], [slot][2][side] (GDN layers)
+        std::uint32_t* parity = nullptr;     // [slot]
+        SlotDev dev{};
+        std::uint32_t *accept = nullptr;
+        std::vector<std::uint32_t> len;
+        std::vector<cc::GdnCommitLayer> cl;
+        std::unordered_map<std::uint32_t, Graph> graphs;
+        std::uint32_t last_groups = 0, last_rows = 0;
+        std::vector<SlotRows> last;
+        std::size_t kv_stride = 0, conv_stride = 0, delta_stride = 0;
+    } ss;
+
+    cc::GdnSlotTable slot_table() const {
+        cc::GdnSlotTable t;
+        t.row0 = ss.dev.g_row0;
+        t.nrows = ss.dev.g_rows;
+        t.state_slot = ss.dev.g_slot;
+        t.parity = ss.parity;
+        t.conv_stride = ss.conv_stride;
+        t.delta_stride = ss.delta_stride;
+        return t;
+    }
+
+    void configure_slots(std::uint32_t n) {
+        if (n == 0) throw std::runtime_error("configure_slots: n must be >= 1");
+        if (ss.n != 0) throw std::runtime_error("configure_slots: already configured");
+        ss.n = n;
+        ss.kv_stride = static_cast<std::size_t>(c.kv_heads) * opt.max_positions * c.head_dim;
+        ss.conv_stride = static_cast<std::size_t>(gd.conv_channels()) * 3;
+        ss.delta_stride = 2 * static_cast<std::size_t>(gd.value_heads) * gd.key_dim * gd.value_dim;
+        for (std::uint32_t l = 0; l < c.layers; ++l) {
+            if (L[l].attn) {
+                ss.kc.push_back(alloc<__nv_bfloat16>(ss.kv_stride * n, true));
+                ss.vc.push_back(alloc<__nv_bfloat16>(ss.kv_stride * n, true));
+                ss.conv.push_back(nullptr);
+                ss.delta.push_back(nullptr);
+            } else {
+                ss.kc.push_back(nullptr);
+                ss.vc.push_back(nullptr);
+                ss.conv.push_back(alloc<float>(ss.conv_stride * n, true));
+                ss.delta.push_back(alloc<float>(ss.delta_stride * n, true));
+            }
+        }
+        std::uint32_t gi = 0;
+        for (std::uint32_t l = 0; l < c.layers; ++l) {
+            if (L[l].attn) continue;
+            auto cl = commit_layers[gi++];
+            cl.state = {ss.conv[l], ss.delta[l]};
+            ss.cl.push_back(cl);
+        }
+        ss.parity = alloc<std::uint32_t>(n, true);
+        ss.accept = alloc<std::uint32_t>(RM, true);
+        ss.dev.ids = d_ids;
+        ss.dev.pos = alloc<std::uint32_t>(RM);
+        ss.dev.slot = alloc<std::uint32_t>(RM);
+        ss.dev.g_row0 = alloc<std::uint32_t>(RM, true);
+        ss.dev.g_rows = alloc<std::uint32_t>(RM, true);
+        ss.dev.g_slot = alloc<std::uint32_t>(RM, true);
+        ss.len.assign(n, 0);
+        CK(cudaDeviceSynchronize());
+    }
+
+    void check_slot(std::uint32_t slot) const {
+        if (slot >= ss.n) throw std::runtime_error("slot out of range (configure_slots first)");
+    }
+
+    void reset_slot(std::uint32_t slot) {
+        check_slot(slot);
+        for (std::uint32_t l = 0; l < c.layers; ++l) {
+            if (L[l].attn) continue;
+            CK(cudaMemsetAsync(ss.conv[l] + slot * ss.conv_stride, 0, ss.conv_stride * 4, s));
+            CK(cudaMemsetAsync(ss.delta[l] + slot * ss.delta_stride, 0, ss.delta_stride * 4, s));
+        }
+        CK(cudaMemsetAsync(ss.parity + slot, 0, 4, s));
+        CK(cudaStreamSynchronize(s));
+        ss.len[slot] = 0;
+    }
+
+    void copy_slot(std::uint32_t dst, std::uint32_t src) {
+        check_slot(dst);
+        check_slot(src);
+        if (dst == src) return;
+        const std::size_t pitch = static_cast<std::size_t>(opt.max_positions) * c.head_dim * sizeof(__nv_bfloat16);
+        const std::size_t width = static_cast<std::size_t>(ss.len[src]) * c.head_dim * sizeof(__nv_bfloat16);
+        for (std::uint32_t l = 0; l < c.layers; ++l) {
+            if (L[l].attn) {
+                if (width) {
+                    CK(cudaMemcpy2DAsync(ss.kc[l] + dst * ss.kv_stride, pitch, ss.kc[l] + src * ss.kv_stride, pitch, width, c.kv_heads,
+                                         cudaMemcpyDeviceToDevice, s));
+                    CK(cudaMemcpy2DAsync(ss.vc[l] + dst * ss.kv_stride, pitch, ss.vc[l] + src * ss.kv_stride, pitch, width, c.kv_heads,
+                                         cudaMemcpyDeviceToDevice, s));
+                }
+            } else {
+                CK(cudaMemcpyAsync(ss.conv[l] + dst * ss.conv_stride, ss.conv[l] + src * ss.conv_stride, ss.conv_stride * 4,
+                                   cudaMemcpyDeviceToDevice, s));
+                CK(cudaMemcpyAsync(ss.delta[l] + dst * ss.delta_stride, ss.delta[l] + src * ss.delta_stride, ss.delta_stride * 4,
+                                   cudaMemcpyDeviceToDevice, s));
+            }
+        }
+        CK(cudaMemcpyAsync(ss.parity + dst, ss.parity + src, 4, cudaMemcpyDeviceToDevice, s));
+        CK(cudaStreamSynchronize(s));
+        ss.len[dst] = ss.len[src];
+    }
+
+    void trunk_slots(std::uint32_t rows, std::uint32_t groups, LogitRows want, bool auto_commit) {
+        const std::uint32_t H = c.hidden;
+        const cc::GroupedView hv{rows, 1, H, H, H};
+        const cc::RowMap rm{ss.dev.pos, ss.dev.slot, ss.kv_stride};
+        const cc::GdnSlotTable tab = slot_table();
+        CK(cc::embedding_rows(embd, d_ids, x, rows, s));
+        std::uint32_t gi = 0;
+        for (std::uint32_t l = 0; l < c.layers; ++l) {
+            const LayerW& w = L[l];
+            CK(cc::rmsnorm(x, hv, w.attn_norm, xn, hv, c.rms_eps, s));
+            if (!w.attn) {
+                {
+                    const cc::DenseWeight ws[4] = {w.qkv, w.gate, w.beta, w.alpha};
+                    float* const ys[4] = {raw[l], z, br[l], ar[l]};
+                    multi(ws, ys, 4, xn, rows);
+                }
+                const auto& cl = ss.cl[gi++];
+                CK(cc::gdn_window_slots(gd, cl.layer, cl.state, cl.win, z, gout, groups, tab, c.rms_eps, s));
+                CK(cc::dense_rows(w.out, gout, x, rows, x, s));
+            } else {
+                attn_mixer(w, Bufs{x, xn, nullptr, ss.kc[l], ss.vc[l], rm}, rows);
+            }
+            mlp(w, Bufs{x, xn, nullptr, nullptr, nullptr}, rows);
+        }
+        CK(cc::rmsnorm(x, hv, out_norm, xn, hv, c.rms_eps, s));
+        if (want != LogitRows::none) {
+            CK(cc::dense_rows(head, xn, logits, rows, nullptr, s));
+            CK(cc::argmax_rows(logits, c.vocab, rows, d_top, d_argws, s));
+        }
+        if (auto_commit) CK(cc::gdn_commit_slots(gd, ss.cl.data(), static_cast<std::uint32_t>(ss.cl.size()), groups, tab, nullptr, false, s));
+    }
+
+    RowsOut forward_slots(const SlotRows* g, std::uint32_t n, const std::uint32_t* tokens, LogitRows want, bool auto_commit) {
+        if (ss.n == 0) throw std::runtime_error("forward_slots: configure_slots first");
+        if (n == 0 || n > RM) throw std::runtime_error("forward_slots: 1..32 groups");
+        SlotPack in{};
+        std::uint32_t rows = 0;
+        std::vector<bool> seen(ss.n, false);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            check_slot(g[i].slot);
+            if (g[i].rows == 0 || rows + g[i].rows > RM) throw std::runtime_error("forward_slots: rows must total 1..32");
+            if (seen[g[i].slot]) throw std::runtime_error("forward_slots: a slot may appear once per batch");
+            seen[g[i].slot] = true;
+            if (ss.len[g[i].slot] + g[i].rows > opt.max_positions) throw std::runtime_error("forward_slots: max_positions exceeded");
+            in.g_row0[i] = rows;
+            in.g_rows[i] = g[i].rows;
+            in.g_slot[i] = g[i].slot;
+            for (std::uint32_t r = 0; r < g[i].rows; ++r, ++rows) {
+                in.ids[rows] = tokens[rows];
+                in.pos[rows] = ss.len[g[i].slot] + r;
+                in.slot[rows] = g[i].slot;
+            }
+        }
+        set_slot_inputs_kernel<<<1, 32, 0, s>>>(in, ss.dev);
+        CK(cudaGetLastError());
+        const std::uint32_t key = rows | (n << 8) | (static_cast<std::uint32_t>(want) << 16) | (auto_commit ? 1u << 20 : 0u);
+        if (graphs_on) {
+            auto it = ss.graphs.find(key);
+            if (it == ss.graphs.end()) {
+                cudaGraph_t gr = nullptr;
+                CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+                try {
+                    trunk_slots(rows, n, want, auto_commit);
+                } catch (...) {
+                    cudaGraph_t dummy = nullptr;
+                    cudaStreamEndCapture(s, &dummy);
+                    if (dummy) cudaGraphDestroy(dummy);
+                    throw;
+                }
+                CK(cudaStreamEndCapture(s, &gr));
+                Graph ge;
+                CK(cudaGraphInstantiate(&ge.exec, gr, 0));
+                std::size_t nn = 0;
+                CK(cudaGraphGetNodes(gr, nullptr, &nn));
+                ge.nodes = nn;
+                CK(cudaGraphDestroy(gr));
+                it = ss.graphs.emplace(key, ge).first;
+            }
+            last_nodes = it->second.nodes;
+            CK(cudaGraphLaunch(it->second.exec, s));
+        } else {
+            trunk_slots(rows, n, want, auto_commit);
+            last_nodes = 0;
+        }
+        if (auto_commit) {
+            for (std::uint32_t i = 0; i < n; ++i) ss.len[g[i].slot] += g[i].rows;
+            ss.last_groups = 0;
+        } else {
+            ss.last.assign(g, g + n);
+            ss.last_groups = n;
+            ss.last_rows = rows;
+        }
+        RowsOut o;
+        o.logits = want == LogitRows::none ? nullptr : logits;
+        o.top = want == LogitRows::none ? nullptr : d_top;
+        o.hidden_post = xn;
+        o.hidden_pre = x;
+        return o;
+    }
+
+    void commit_slots(const std::uint32_t* accept) {
+        if (ss.last_groups == 0) throw std::runtime_error("commit_slots: no pending window");
+        bool partial = false;
+        std::uint32_t any = 0;
+        for (std::uint32_t i = 0; i < ss.last_groups; ++i) {
+            if (accept[i] > ss.last[i].rows) throw std::runtime_error("commit_slots: accept exceeds the window");
+            partial = partial || (accept[i] > 0 && accept[i] < ss.last[i].rows);
+            any += accept[i];
+        }
+        if (any) {
+            CK(cudaMemcpyAsync(ss.accept, accept, ss.last_groups * 4, cudaMemcpyHostToDevice, s));
+            CK(cc::gdn_commit_slots(gd, ss.cl.data(), static_cast<std::uint32_t>(ss.cl.size()), ss.last_groups, slot_table(), ss.accept,
+                                    partial, s));
+            CK(cudaStreamSynchronize(s));  // `accept` is pageable host memory
+        }
+        for (std::uint32_t i = 0; i < ss.last_groups; ++i) ss.len[ss.last[i].slot] += accept[i];
+        ss.last_groups = 0;
+    }
+
     CudaEngine::MtpOut mtp(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0, bool want_top) {
         if (!mtp_ok) throw std::runtime_error("mtp_forward: no MTP tensors loaded");
         if (rows == 0 || rows > RM || pos0 + rows > opt.max_positions) throw std::runtime_error("mtp_forward: bad rows/pos0");
@@ -724,7 +972,7 @@ std::unique_ptr<CudaEngine> CudaEngine::synthetic(const Config& cfg, PackFormat 
     const auto t0 = std::chrono::steady_clock::now();
     if (opt.turbo_weights == TurboWeights::onfly) pack = PackFormat::bf16;  // onfly source is BF16
     const auto sp = synth_specs(cfg, pack, opt.load_mtp);
-    std::vector<TensorSpec> specs;
+    std::vector<PackTensorSpec> specs;
     for (const auto& [t, f] : sp) specs.push_back(t);
     mark_fp4(opt, specs);
     layout(P.W, specs, cfg.layers);
@@ -818,6 +1066,18 @@ void CudaEngine::read_hidden(const float* dev, std::uint32_t rows, float* host) 
     CK(cudaMemcpyAsync(host, dev, static_cast<std::size_t>(rows) * p_->c.hidden * 4, cudaMemcpyDeviceToHost, p_->s));
     CK(cudaStreamSynchronize(p_->s));
 }
+void CudaEngine::configure_slots(std::uint32_t n) { p_->configure_slots(n); }
+std::uint32_t CudaEngine::slot_count() const { return p_->ss.n; }
+std::uint32_t CudaEngine::slot_committed(std::uint32_t slot) const {
+    p_->check_slot(slot);
+    return p_->ss.len[slot];
+}
+void CudaEngine::reset_slot(std::uint32_t slot) { p_->reset_slot(slot); }
+void CudaEngine::copy_slot(std::uint32_t dst, std::uint32_t src) { p_->copy_slot(dst, src); }
+RowsOut CudaEngine::forward_slots(const SlotRows* groups, std::uint32_t n, const std::uint32_t* tokens, LogitRows want, bool auto_commit) {
+    return p_->forward_slots(groups, n, tokens, want, auto_commit);
+}
+void CudaEngine::commit_slots(const std::uint32_t* accept) { p_->commit_slots(accept); }
 void CudaEngine::sync() const { CK(cudaStreamSynchronize(p_->s)); }
 void CudaEngine::set_graphs(bool on) { p_->graphs_on = on; }
 std::uint64_t CudaEngine::launches_last_forward() const { return p_->last_nodes; }
