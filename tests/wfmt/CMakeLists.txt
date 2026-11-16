@@ -35,7 +35,7 @@ target_include_directories(strix-wfmt-host-tests PRIVATE ${WFMT_ROOT}/src ${WFMT
 target_compile_definitions(strix-wfmt-host-tests PRIVATE STRIX_WFMT_SOURCE_DIR="${WFMT_ROOT}")
 if(MSVC)
     target_compile_options(strix-weight PRIVATE /fp:strict)
-    target_compile_options(strix-wfmt-host-tests PRIVATE /fp:strict)
+    target_compile_options(strix-wfmt-host-tests PRIVATE /fp:strict /D_CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(strix-weight PRIVATE -ffp-contract=off)
     target_compile_options(strix-wfmt-host-tests PRIVATE -ffp-contract=off)
