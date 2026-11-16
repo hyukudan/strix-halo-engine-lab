@@ -387,6 +387,18 @@ int main(int argc, char** argv) {
         else if (a == "--handoff-chunk-mib") handoff.chunk_bytes = static_cast<std::uint64_t>(std::max(1, std::atoi(next().c_str()))) << 20;
         else { std::fprintf(stderr, "unknown flag %s\n", a.c_str()); return 1; }
     }
+    qo::Resolved resolved;
+    try { resolved = qo::resolve(request, qo::Entry::prefill_service, "Qwen3.8-Flash-Next-UD-Q4_K_XL-merged.gguf"); }
+    catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
+    if (request.print_effective_config) { std::printf("%s\n", qo::effective_config_json(resolved).c_str()); return 0; }
+    try {
+        strix::device::Request device_request;
+        device_request.select = device_cli.select;
+        strix::device::bind_cuda(std::move(device_request), device_cli.devices_path);
+    } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 2; }
+    const qp::Config c = resolved.config;
+    for (const auto& n : resolved.resolution.notices()) std::fprintf(stderr, "%s\n", n.c_str());
+    std::fprintf(stderr, "arithmetic: %s\n", resolved.contract.c_str());
     try {
         // HTTP chunk POSTs: the connection count is not the shared-lib stream model (a POST waits for its reply), so it
         // keeps the family value unless given explicitly.
@@ -400,18 +412,12 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "%s\n", e.what());
         return 1;
     }
-    qo::Resolved resolved;
-    try { resolved = qo::resolve(request, qo::Entry::prefill_service, "Qwen3.8-Flash-Next-UD-Q4_K_XL-merged.gguf"); }
-    catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
-    if (request.print_effective_config) { std::printf("%s\n", qo::effective_config_json(resolved).c_str()); return 0; }
-    try {
-        strix::device::Request device_request;
-        device_request.select = device_cli.select;
-        strix::device::bind_cuda(std::move(device_request), device_cli.devices_path);
-    } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 2; }
-    const qp::Config c = resolved.config;
-    for (const auto& n : resolved.resolution.notices()) std::fprintf(stderr, "%s\n", n.c_str());
-    std::fprintf(stderr, "arithmetic: %s\n", resolved.contract.c_str());
+    if (c.tables_dir.empty() || c.rope_table.empty()) { std::fprintf(stderr, "--tables and --rope-table are required\n"); return 1; }
+    if (c.block_schedule.empty() ||
+        c.final_block_rows > *std::max_element(c.block_schedule.begin(), c.block_schedule.end())) {
+        std::fprintf(stderr, "invalid final block rows\n");
+        return 1;
+    }
     http::startup();
     // Bind before loading so a busy port fails fast.
     addrinfo hints{};
