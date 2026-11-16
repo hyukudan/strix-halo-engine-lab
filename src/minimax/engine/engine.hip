@@ -1244,8 +1244,8 @@ struct Engine::Impl {
                   flash ? rr::Reason::selected : rr::Reason::disabled);
         rr::lever("minimax.prefill_identity", fp32_prefill ? "fp32" : "default", fp32_prefill ? "fp32" : "default");
         {  // shared TP2 exchange format (one resolver: defaults::prefill_policy)
-            const char* xf = strix::envcfg::text(strix::xport::kExchangeFormatEnv);
-            rr::lever("minimax.tp2_exchange_fmt", xf != nullptr && *xf != 0 ? xf : "default", strix::xport::exchange_format_name(pf_fmt),
+            const char* xfmt = strix::envcfg::text(strix::xport::kExchangeFormatEnv);
+            rr::lever("minimax.tp2_exchange_fmt", xfmt != nullptr && *xfmt != 0 ? xfmt : "default", strix::xport::exchange_format_name(pf_fmt),
                       pf_fmt == strix::xport::ExchangeFormat::f16 ? rr::Reason::selected : rr::Reason::disabled);
         }
         rr::lever("minimax.moe_kernels", moe_opt ? "1" : "0", moe_opt ? "1" : "0");
@@ -1476,9 +1476,11 @@ struct Engine::Impl {
                     grp_remote.push_back(dalloc<float>(T * kHidden));
                 } else if (pf_fmt == strix::xport::ExchangeFormat::f16) {  // f16 exchange: each member's FP32 partial
                     grp_part.push_back(dalloc<float>(T * kHidden));
-                    pf_fmt_f16_ready = true;
                 }
             }
+            // f16 exchange on the module path: the communicator backend's member partials (allocated by default) or
+            // the ones above are the grouped producers' FP32 outputs; the module path never reads them otherwise.
+            pf_fmt_f16_ready = pf_fmt == strix::xport::ExchangeFormat::f16 && grp_part.size() + 1 >= pf_group;
         }
         for (auto& bank : pf_fences) {
             for (unsigned c = 0; c < pf_group; ++c) {
@@ -3698,7 +3700,7 @@ void Engine::set_prefill_headless(bool on) {
 bool Engine::prefill_headless() const { return impl_->pf_headless; }
 void Engine::set_prefill_exchange_f16(bool on) {
     impl_->no_task("set_prefill_exchange_f16");
-    if (on && !impl_->pf_fmt_f16_ready)
+    if (on && !impl_->pf_fmt_f16_ready && impl_->pf_fmt != strix::xport::ExchangeFormat::f16)
         throw std::invalid_argument("set_prefill_exchange_f16: start the process with STRIX_TP2_EXCHANGE_FMT=f16 (FAST)");
     impl_->pf_fmt = on ? strix::xport::ExchangeFormat::f16 : strix::xport::ExchangeFormat::f32;
 }
