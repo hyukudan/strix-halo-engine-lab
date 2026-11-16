@@ -89,6 +89,10 @@ struct HcSiteView {
     // expand_mixes[r].pre to collapse_out[r * hidden + i] (as the collapse a NormView with hc_stream reads), same bits;
     // tiles of at most 4 rows.
     float* collapse_out = nullptr;
+    // With collapse_out: 0 by STRIX_DS41_HC_COLLAPSE_ONCE (default on); 1 each copy's chunk read on its own (the
+    // previous form: every copy re-reads the hc residual copies and sub); 2 one read of the residual copies and sub
+    // expands every copy (hip_ds41_layer.hip site_fast_partial, same expressions and order, same bits).
+    std::uint32_t collapse_once = 0;
 };
 inline constexpr std::uint32_t hc_site_one_launch_rows = 4;  // previous kernel, measured: one launch wins at 1-4 rows, loses at 8
 inline constexpr std::uint32_t hc_site_fast_one_launch_rows = 8;  // fast kernel

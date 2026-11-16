@@ -627,7 +627,10 @@ __device__ __forceinline__ float site_stream_value(const float* __restrict__ sub
 // row g on wave g. Collapse (with Expand and Mix): the block takes the chunk at the same hidden offset in each of the
 // hc copies in turn (each chunk as above) and also stores the collapse of the expanded values with the expansion's
 // pre (as norm_input: from 0, ascending copies) to v.collapse_out.
-template <bool Expand, bool Mix, unsigned G, bool Collapse = false>
+// Once (with Collapse): one read of the hc residual copies and sub at the block's hidden offset expands every copy
+// (copy_value's expressions, ascending j, so the same bits) into its own LDS slice before the copies' dots; without
+// it each copy's chunk re-reads all the residual copies and sub (4x the loads, the previous form).
+template <bool Expand, bool Mix, unsigned G, bool Collapse = false, bool Once = false>
 __device__ __forceinline__ void site_fast_partial(const HcSiteView& v, const float* __restrict__ sub, const float* __restrict__ residual,
                                                   const HcMix* __restrict__ em, float* __restrict__ stream,
                                                   const std::uint16_t* __restrict__ fn, float* __restrict__ partial,
@@ -644,12 +647,43 @@ __device__ __forceinline__ void site_fast_partial(const HcSiteView& v, const flo
     for (unsigned g = 0; g < G; ++g)
 #pragma unroll
         for (unsigned u = 0; u < site_x_per_thread; ++u) y[g][u] = 0.0F;
-    for (unsigned q = 0; q < copies; ++q) {
-        if (q) __syncthreads();  // the previous copy's dots have read xs
-        const unsigned c = q * per_tile + b, c0 = c * chunk, kc = c0 / H, i0 = c0 % H;
-        float x[G][site_x_per_thread];
+    static_assert(!Once || Collapse, "one read of the copies only with the collapse");
+    if constexpr (Once) {  // xs[k * G + g]: copy k of tile row g at the hidden offset b * chunk
+        const unsigned i0 = b * chunk;
 #pragma unroll
         for (unsigned g = 0; g < G; ++g) {
+            const unsigned r = r0 + g < rows ? r0 + g : rows - 1U;
+            const float* res = residual + static_cast<std::size_t>(r) * n;
+            const HcMix& m = em[r];
+#pragma unroll
+            for (unsigned u = 0; u < site_x_per_thread; ++u) {  // past the chunk: a repeat of its last value, not stored
+                const unsigned e = threadIdx.x + u * site_threads, ec = e < chunk ? e : chunk - 1U;
+                float rv[hc_copies];
+#pragma unroll
+                for (unsigned j = 0; j < hc_copies; ++j) rv[j] = res[j * H + i0 + ec];
+                const float sv = sub[static_cast<std::size_t>(r) * H + i0 + ec];
+#pragma unroll
+                for (unsigned k = 0; k < hc_copies; ++k) {
+                    float s = 0.0F;  // copy_value
+#pragma unroll
+                    for (unsigned j = 0; j < hc_copies; ++j) s = s + m.comb[j * hc_copies + k] * rv[j];
+                    const float x = m.post[k] * sv + s;
+                    const float pre = m.pre[k];
+                    y[g][u] = y[g][u] + pre * x;
+                    xs[k * G + g][e] = x;
+                    if (r0 + g < rows && ((u + 1U) * site_threads <= chunk || e < chunk))
+                        stream[static_cast<std::size_t>(r0 + g) * n + k * H + i0 + e] = x;
+                }
+            }
+        }
+    }
+    for (unsigned q = 0; q < copies; ++q) {
+        if (!Once && q) __syncthreads();  // the previous copy's dots have read xs
+        const unsigned c = q * per_tile + b, c0 = c * chunk, kc = c0 / H, i0 = c0 % H;
+        float (*xq)[pad] = Once ? xs + q * G : xs;
+        float x[G][site_x_per_thread];
+#pragma unroll
+        for (unsigned g = 0; g < (Once ? 0U : G); ++g) {
             const unsigned r = r0 + g < rows ? r0 + g : rows - 1U;
             const float* srow = stream + static_cast<std::size_t>(r) * n + c0;
 #pragma unroll
@@ -672,7 +706,7 @@ __device__ __forceinline__ void site_fast_partial(const HcSiteView& v, const flo
                 for (unsigned k = 0; k < chunk_k; ++k) raw[j][k] = f[static_cast<std::size_t>(j) * n + k * wave];
         }
 #pragma unroll
-        for (unsigned g = 0; g < G; ++g) {
+        for (unsigned g = 0; g < (Once ? 0U : G); ++g) {
             float* srow = stream + static_cast<std::size_t>(r0 + g) * n + c0;
 #pragma unroll
             for (unsigned u = 0; u < site_x_per_thread; ++u) {  // xs is padded to whole passes: its stores need no branch
@@ -697,7 +731,7 @@ __device__ __forceinline__ void site_fast_partial(const HcSiteView& v, const flo
                 float sq = 0.0F;
 #pragma unroll
                 for (unsigned k = 0; k < chunk_k; ++k) {
-                    const float xv = xs[g][k * wave + l];
+                    const float xv = xq[g][k * wave + l];
                     if (w == g) sq = sq + xv * xv;
 #pragma unroll
                     for (unsigned j = 0; j < site_mixes; ++j) acc[j] = acc[j] + f[j][k] * xv;
@@ -821,12 +855,12 @@ __global__ __launch_bounds__(site_threads) void hc_site_fast_kernel(HcSiteView v
                                blockIdx.x - partial_blocks, norm_chunks, norm_part, lds, sq);
 }
 // Expansion + mixes + the collapse with the expansion's pre (HcSiteView::collapse_out): partial blocks only.
-template <unsigned G>
+template <unsigned G, bool Once = false>
 __global__ __launch_bounds__(site_threads) void hc_site_collapse_kernel(HcSiteView v, unsigned mix_chunks) {
-    __shared__ float lds[G * site_x_per_thread * site_threads];
+    __shared__ float lds[(Once ? hc_copies : 1U) * G * site_x_per_thread * site_threads];
     __shared__ unsigned last;
-    site_fast_partial<true, true, G, true>(v, v.sub, v.residual, v.expand_mixes, v.stream, v.fn, v.partial, v.counters, mix_chunks, lds,
-                                           last);
+    site_fast_partial<true, true, G, true, Once>(v, v.sub, v.residual, v.expand_mixes, v.stream, v.fn, v.partial, v.counters, mix_chunks,
+                                                 lds, last);
 }
 using SiteFastKernel = void (*)(HcSiteView, unsigned, unsigned, unsigned, unsigned);
 template <unsigned G> SiteFastKernel site_fast_kernel(bool expand, bool mix) {
@@ -2225,6 +2259,10 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
     // STRIX_DS41_HC_SITE_FAST=0: the previous site kernel (and its one-launch row limit); same bits either way.
     static const bool fast_env = strix::envcfg::flag("STRIX_DS41_HC_SITE_FAST", true);
     const bool fast = v.form == 2 || (v.form == 0 && fast_env);
+    // STRIX_DS41_HC_COLLAPSE_ONCE=0: the collapse site re-reads the residual copies and sub for every copy (the previous
+    // form); default on: one read expands every copy. Scheduling only, same bits (tests/hip_ds41_layer_bench.hip).
+    static const bool once_env = strix::envcfg::flag("STRIX_DS41_HC_COLLAPSE_ONCE", true);
+    const bool once = v.collapse_once == 2 || (v.collapse_once == 0 && once_env);
     const bool one = v.launches == 1 ||
                      (v.launches == 0 && v.rows <= (fast ? hc_site_fast_one_launch_rows : hc_site_one_launch_rows));
     if (!one) {
@@ -2258,7 +2296,9 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
         const unsigned tiles = (v.rows + g - 1U) / g;
         if (v.collapse_out) {  // one block per hidden chunk (every copy) and tile of at most 4 rows (8: ~100 VGPRs spilled)
             const unsigned gc = g < 4U ? g : 4U, ctiles = (v.rows + gc - 1U) / gc;
-            const auto kernel = gc == 1 ? hc_site_collapse_kernel<1> : gc == 2 ? hc_site_collapse_kernel<2> : hc_site_collapse_kernel<4>;
+            const auto kernel = once ? (gc == 1 ? hc_site_collapse_kernel<1, true> : gc == 2 ? hc_site_collapse_kernel<2, true>
+                                                                                           : hc_site_collapse_kernel<4, true>)
+                                     : (gc == 1 ? hc_site_collapse_kernel<1> : gc == 2 ? hc_site_collapse_kernel<2> : hc_site_collapse_kernel<4>);
             hipLaunchKernelGGL(kernel, dim3(mix_chunks / hc_copies * ctiles), dim3(site_threads), 0, as_stream(stream), v, mix_chunks);
             hip_check(hipGetLastError(), "hc site collapse launch");
             return;

@@ -335,8 +335,9 @@ void bench_hc_collapse(std::mt19937& rng, int iterations) {
     auto* counters = dev(std::vector<std::uint32_t>(hc_site_counter_count(R), 0U));
     auto* mixes = dev<HcMix>(R);
     auto* cout = dev<float>(std::size_t{R} * H);
-    auto view = [&](std::uint32_t tile) {
+    auto view = [&](std::uint32_t tile, std::uint32_t once) {
         HcSiteView v;
+        v.collapse_once = once;
         v.rows = R; v.hidden = H; v.sub = dsub; v.residual = dres; v.expand_mixes = dem; v.stream = st;
         v.fn = dfn; v.base = dbase; v.scale = dscale; v.iters = 20; v.mix_norm_eps = 1e-20F;
         v.mixes_out = mixes; v.partial = partial; v.counters = counters;
@@ -354,19 +355,20 @@ void bench_hc_collapse(std::mt19937& rng, int iterations) {
         add(st, std::size_t{R} * n * 4); add(mixes, R * sizeof(HcMix)); add(cout, std::size_t{R} * H * 4);
         return all;
     };
-    enqueue_hc_site(view(4), nullptr);
+    enqueue_hc_site(view(4, 1), nullptr);  // reference: the previous form, tile 4
     const auto ref = outputs();
     const double bytes = static_cast<double>(R) * (2.0 * n + 2.0 * H) * 4.0;
     for (int round = 0; round < 3; ++round) {
+        for (const std::uint32_t once : {1U, 2U})
         for (const std::uint32_t tile : {4U, 2U, 1U}) {
             check(hipMemset(st, 0, std::size_t{R} * n * 4), "clear");
             check(hipMemset(cout, 0, std::size_t{R} * H * 4), "clear");
             check(hipMemset(mixes, 0, R * sizeof(HcMix)), "clear");
-            enqueue_hc_site(view(tile), nullptr);
+            enqueue_hc_site(view(tile, once), nullptr);
             const bool exact = round > 0 || outputs() == ref;
-            const double ms = time_ms(iterations, [&](int) { enqueue_hc_site(view(tile), nullptr); });
-            std::printf("{\"kernel\":\"hc-collapse\",\"round\":%d,\"rows\":%u,\"tile\":%u,\"ms\":%.4f,\"gbps\":%.1f,\"exact\":%s}\n", round, R,
-                        tile, ms, bytes / ms * 1e-6, exact ? "true" : "false");
+            const double ms = time_ms(iterations, [&](int) { enqueue_hc_site(view(tile, once), nullptr); });
+            std::printf("{\"kernel\":\"hc-collapse\",\"round\":%d,\"rows\":%u,\"once\":%u,\"tile\":%u,\"ms\":%.4f,\"gbps\":%.1f,\"exact\":%s}\n",
+                        round, R, once == 2 ? 1U : 0U, tile, ms, bytes / ms * 1e-6, exact ? "true" : "false");
         }
         const double cms = time_ms(iterations, [&](int) {
             check(hipMemcpyAsync(st, dres, std::size_t{R} * n * 4, hipMemcpyDeviceToDevice, nullptr), "copy");
