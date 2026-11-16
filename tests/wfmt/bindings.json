@@ -780,11 +780,8 @@
       "status": "migrated",
       "capture": "legacy-public-entrypoint",
       "operations": [
-        "as_bytes",
-        "index_safetensors",
         "read_json",
-        "read_safetensors",
-        "view_source"
+        "read_safetensors"
       ]
     },
     {
@@ -4920,6 +4917,35 @@
         "dequantize_row",
         "gguf_type"
       ]
+    },
+    {
+      "id": "container:src/core/weight_archive.cpp",
+      "source": "src/core/weight_archive.cpp",
+      "backend": "host",
+      "formats": [
+        "all",
+        "recognised",
+        "storage"
+      ],
+      "arithmetic": "index/admission only",
+      "migration": "P03",
+      "owner": "shared-weight-layer-maintainer",
+      "status": "migrated",
+      "capture": "legacy-public-entrypoint",
+      "operations": [
+        "as_bytes",
+        "bytes",
+        "decode_row",
+        "dequantize_row",
+        "index_safetensors",
+        "load_gguf",
+        "load_safetensors",
+        "read",
+        "read_json",
+        "read_safetensors",
+        "row_bytes",
+        "view_source"
+      ]
     }
   ],
   "operation_scan_keywords": [
@@ -4979,6 +5005,7 @@
     "src/core/linear_plan.hpp",
     "src/core/trellis_codec.hpp",
     "src/core/trellis_format.hpp",
+    "src/core/weight_archive.cpp",
     "src/cpu/arch/avx512/kernels.cpp",
     "src/cpu/arch/neon/kernels.cpp",
     "src/cpu/core/backend.hpp",
