@@ -1220,14 +1220,13 @@ void layer_core_multi(const RowBuffers& b, const SegmentState* segs, std::uint32
 bool graph_shape(const std::uint32_t* seg_rows, std::uint32_t n, const Workspace& ws, MultiShape& shape) {
     if (n == 0 || n > kMaxSegments) return false;
     static const bool score_wave = strix::envcfg::flag("STRIX_QSA_SCORE_WAVE", false);
-    std::uint32_t rows = 0, max_rows = 0, min_rows = 0xffffffffU, pool = 0, waves = 0;
+    std::uint32_t rows = 0, max_rows = 0, min_rows = 0xffffffffU, waves = 0;
     const std::uint32_t chunks = (ws.max_blocks + 31U) / 32U;  // waves per row group at the workspace's last block
     for (std::uint32_t i = 0; i < n; ++i) {
         if (seg_rows[i] == 0) return false;
         rows += seg_rows[i];
         max_rows = std::max(max_rows, seg_rows[i]);
         min_rows = std::min(min_rows, seg_rows[i]);
-        pool += seg_rows[i] / kRatio + 1U;  // new complete blocks of a window that starts where the last one committed
         waves += (seg_rows[i] + kScoreRowsPerWave - 1U) / kScoreRowsPerWave * chunks;
     }
     const bool head_all = max_rows <= 8U && decode_rows_enabled(), rows_all = !decode_rows_enabled() || min_rows > 8U;
@@ -1239,7 +1238,8 @@ bool graph_shape(const std::uint32_t* seg_rows, std::uint32_t n, const Workspace
     }();
     shape.rows = rows;
     shape.head_all = head_all;
-    shape.pool_grid = pool;                                                   // grid-stride: a longer re-pool loops
+    // Replay may start with a cold pool, regardless of the window's row count. Empty CTAs exit in the existing kernel.
+    shape.pool_grid = 2U * sms;
     shape.score_grid = std::max(1U, std::min((waves + 7U) / 8U, 2U * sms));   // grid-stride beyond
     shape.slot_runs = (kMaxSelected + kRun - 1U) / kRun;                      // runs past a row's selected count return at once
     return true;
