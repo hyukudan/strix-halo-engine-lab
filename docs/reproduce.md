@@ -626,6 +626,23 @@ layer-0 nulls (`tools/strix-gate/README.md`, onset-matched floor). Gates:
 `strix-hip-mmx-moe-bench --test --tests test_prefill_chunk_invariance` (device bytes). One pair run (TTFT, state FNV,
 MemAvailable, kfd `evicted_ms`, busy/sclk) is `scripts/bench/chunkinv/pair_run.sh --bin RANK --model DIR --peer HOST
 --out DIR STRIX_MMX_PF_ORDER=... -- <rank args>`, run inside the caller's pair GPU turn.
+Each run creates a fresh `DIR/run.*` on both hosts and preserves existing contents; peer collisions fail.
+Relative inputs are resolved from each host's launch directory. Failed ranks, collection failures or missing
+TTFT/state/token records return nonzero. The device fixture covers device-planned final outputs only, not
+host-planner cross-chunk equality, intermediate buffers, every variant or complete model state. The dense
+contract is used by invariant prefill linears; the fixtures alone do not qualify whole-engine invariance.
+
+### Prefill window-loop census from a kernel trace
+
+[`scripts/bench/prefill-trace/`](../scripts/bench/prefill-trace/README.md) reads a rocprofv3 kernel trace of a prefill
+process and reports the per-window launch loop of one run: span, GPU idle inside it, time per kernel kind, launches
+per hardware queue, and the compute-unit time the flash kernel and the kernels that cannot share a CU with it leave free.
+
+### MiniMax MSA flash layer ranges (FAST gate)
+
+[`scripts/bench/mmflash/`](../scripts/bench/mmflash/README.md) qualifies a layer range for the FAST MSA flash attention
+(one-term or two-term operands) against the exact path in one detached pair run: onset-matched one-ulp nulls for the
+floor rule, optional multi-site / magnitude nulls as a diagnostic, cold and warm TTFT, evicted_ms and GPU clocks per token.
 
 ## Long-context retrieval and reasoning checks (Qwen)
 

@@ -41,6 +41,8 @@ unsigned gemm_splits(unsigned input, unsigned output, unsigned bits, unsigned ro
 }
 // MoE numeric order contract (STRIX_MMX_PF_ORDER): adaptive (default, today's identity: S from the expert's rows in the
 // chunk) or invariant (shared kGroupedSingleChainContract, S = 1 for gate, up and down: bits independent of chunking).
+// Test fixture only: change this between synchronized calls on one host thread;
+// never mutate it during engine execution or concurrent planning.
 namespace { int g_order_override = -1; }  // -1 = STRIX_MMX_PF_ORDER, 0 = adaptive, 1 = invariant
 void set_prefill_moe_order(int invariant) {
     if (invariant < -1 || invariant > 1) throw std::invalid_argument("set_prefill_moe_order: value must be -1, 0 or 1");
@@ -50,10 +52,7 @@ const ::strix::moe_core::GroupedSplitContract& prefill_moe_order() {
     if (g_order_override == 0) return ::strix::moe_core::kGroupedAdaptiveContract;
     if (g_order_override == 1) return ::strix::moe_core::kGroupedSingleChainContract;
     static const ::strix::moe_core::GroupedSplitContract c = [] {
-        const char* e = std::getenv("STRIX_MMX_PF_ORDER");
-        if (e == nullptr || !*e || std::string(e) == "adaptive") return ::strix::moe_core::kGroupedAdaptiveContract;
-        if (std::string(e) == "invariant") return ::strix::moe_core::kGroupedSingleChainContract;
-        throw std::invalid_argument("STRIX_MMX_PF_ORDER must be adaptive or invariant");
+        return ::strix::moe_core::resolve_grouped_order(strix::envcfg::text("STRIX_MMX_PF_ORDER"));
     }();
     return c;
 }

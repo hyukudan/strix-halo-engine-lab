@@ -183,6 +183,8 @@ void set_prefill_tail_stream(int on);
 // mmx-pf-moe-s1-v1). Host and device plans and the group-wide plan all follow it. The same switch binds the dense v4
 // linears (enqueue_prefill_dense) to core::fixed_linear_contract (S = kDenseFixedSplits); MoE + dense together are the
 // named identity mmx-pf-linear-s1-v1.
+// Test fixture only: one host thread, all device work synchronized before each
+// change, restore -1 before leaving the fixture. Never change a running engine.
 void set_prefill_moe_order(int invariant);
 bool prefill_order_invariant();
 inline constexpr int kDenseFixedSplits = 1;

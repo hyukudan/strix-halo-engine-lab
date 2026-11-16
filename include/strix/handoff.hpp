@@ -73,13 +73,23 @@ struct SenderOptions {
     Codec codec = Codec::bp_v1;   // falls back to identity when the receiver does not accept it
     unsigned streams = 1;          // TCP connections to the same endpoint (1..64); piece seq s goes on stream s % N
     unsigned encode_threads = 8;   // bp-v1 worker pool
-    std::size_t max_queued_wire_bytes = std::size_t{512} << 20;  // encoded-but-unsent bytes before encoding waits
+    // bp-v1: queued pieces encoded side by side on the pool (1 = one at a time), within the byte budget.
+    // The encoded frame bytes and submission order are unchanged.
+    unsigned encode_batch = 16;
+    // Reservations include encoding workspace and unsent buffers. One oversized piece may run alone for progress.
+    std::size_t max_queued_wire_bytes = std::size_t{512} << 20;
     std::size_t max_pending_plain_bytes = 0;  // submitted-but-unreleased caller bytes before submit() waits; 0 = no bound
     int socket_buffer = 32 << 20;
     std::chrono::seconds connect_timeout{900};  // the ranks may still be loading
     std::chrono::seconds reply_timeout{600};    // ACCEPT (a receiver may finish another session first) and REPLY
     std::chrono::seconds send_timeout{60};      // a send() that makes no progress this long fails the session
     bp_codec::EncodeOptions encode{};
+#ifdef STRIX_HANDOFF_TESTING
+    // Host regression hooks, absent from production builds. Called on the encoder thread.
+    std::function<void()> before_encode;
+    std::function<void(std::size_t, std::size_t)> observe_batch;  // pieces, total reserved bytes
+    std::function<void(std::uint32_t, std::span<const std::uint8_t>, std::span<const std::uint8_t>)> observe_frame;
+#endif
 };
 
 struct SenderStats {
