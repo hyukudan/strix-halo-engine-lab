@@ -1061,6 +1061,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             for(std::uint32_t r=1;r<rows;++r) inputs.push_back(candidates[std::min<std::size_t>(r-1U,candidates.size()-1U)]);
             auto& previous=i.window_base;previous=session;
             host_phase_mark("4 verify prologue");
+            ++out.target_forwards;
             auto native=owner->window->execute_mtp_captured(session,inputs,capture,{},active);
             host_phase_mark("7 window launch+wait");
             attempted_target=true;out.attempted_window=true;
@@ -1101,6 +1102,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             std::vector<std::uint32_t> inputs;inputs.reserve(rows);inputs.push_back(pending);
             inputs.insert(inputs.end(),candidates.begin(),candidates.begin()+static_cast<std::ptrdiff_t>(rows-1));
             if(i.bounded)i.checkpoint->capture_window(session);else i.checkpoint->capture(session);
+            ++out.target_forwards;
             auto native=owner->window->execute_mtp_captured(session,inputs,capture);
             // Successful return proves actual target consumption. Rejected
             // admission leaves the original ready session untouched; dispatch
@@ -1137,6 +1139,7 @@ HipMtpVerifiedTargetRows HipMtpWindowVerifier::verify(SerialSessionContext& sess
             if(transaction){transaction->discard();transaction->reset();}
         }
         for(std::size_t index=0;out.emitted_tokens.size()<budget && session.next_position<capacity;++index) {
+            ++out.target_forwards;
             auto ticket=i.target->execute_serial(session,i.resources,dispatcher,pending,
                 index<drafts.size()?&drafts[index]:nullptr,
                 transaction?HipMtpHostRowSelector{[&](auto row){
