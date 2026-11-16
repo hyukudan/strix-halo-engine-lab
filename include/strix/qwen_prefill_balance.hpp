@@ -315,7 +315,11 @@ inline PairRoute resolve_pair_route(std::uint64_t prompt, std::uint32_t legacy, 
         const bool fixed_rows = chunk_value != nullptr;
         const auto candidates = fixed_rows ? std::span<const std::uint32_t>(explicit_rows)
                                            : std::span<const std::uint32_t>(pipeline_chunk_candidates);
+        // Prefill-only runs the entire prompt (below), so its candidates must hold for the full prompt;
+        // trimming to a legal prefix is only sound when the suffix is handed off.
+        const bool full_prompt = execution == PairExecution::prefill_only;
         out.model = pair::choose_pipeline(prompt - prompt % 8U, pipeline_cost, candidates, [&](std::uint32_t rows) {
+            if (full_prompt) return rows <= legacy && rows < prompt && valid_chunk(rows, prompt);
             const auto prefix = legal_prefix(prompt, rows);
             return rows <= legacy && rows < prefix && valid_chunk(rows, prefix);
         });
