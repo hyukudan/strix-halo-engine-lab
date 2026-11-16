@@ -101,7 +101,7 @@
 {"src/minimax/engine/mm_fast_i4.hpp", 0x873b1bb7b7177f59ULL},
 {"src/minimax/engine/mm_kernels.hpp", 0x434413100dddc9edULL},
 {"src/minimax/engine/mm_pack.cpp", 0x114f206e768dad75ULL},
-{"src/minimax/engine/mm_profile_table.hpp", 0x477287c2804d8530ULL},
+{"src/minimax/engine/mm_profile_table.hpp", 0x0dc2bc88238339eeULL},
 {"src/minimax/engine/prefill_timeline.hpp", 0x2911755ae15611b9ULL},
 {"src/minimax/engine/route_identity.hpp", 0xc56451e8f0126ed6ULL},
 {"src/minimax/model_assets.cpp", 0x3f16a3d2496a5d24ULL},

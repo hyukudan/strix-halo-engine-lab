@@ -67,7 +67,7 @@ static_assert(msa_flash_policy(kMsaFlashLayers) != nullptr &&
               "the bundle member's policy id names the bundle's layer set");
 
 // Bundle selection is requested provenance; only effective members enter agreement.
-inline constexpr std::array<strix::profile::Lever, 6> profile_table{{
+inline constexpr std::array<strix::profile::Lever, 8> profile_table{{
     // Prefill only: MSA attention of windows > 8 rows; selection, block lists and K/V caches unchanged.
     {"msa_flash", "STRIX_MM_PF_MSA_FLASH", "", {"", "", "", "1"}, "0", strix::profile::Kind::bit_changing,
      {true, false, true, false}, {true, true, true, false}, "", "0",
