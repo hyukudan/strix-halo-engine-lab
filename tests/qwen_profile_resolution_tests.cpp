@@ -181,7 +181,7 @@ void config_matrix() {
         }
     }
     for (const auto& args : std::vector<std::vector<std::string>>{
-            {"--profile"},{"--profile","turbo"},{"--profile","fast","--profile=default"},
+            {"--profile"},{"--profile","turbbo"},{"--profile","fast","--profile=default"},
             {"--output-head-profile","fp16-output-head"}}) {
         auto argv=std::vector<std::string>{"decoder","model.gguf","1"}; argv.insert(argv.end(),args.begin(),args.end());
         try { (void)options(argv); check(false,"invalid CLI must refuse"); }

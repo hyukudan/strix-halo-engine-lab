@@ -182,7 +182,8 @@ const char* app_name(App app) {
 }
 
 const strix::profile::Engine& profile_engine() {
-    static const strix::profile::Engine engine{"deepseek41-pair", "STRIX_DS41_PROFILE_ALLOW_PENDING", profile_table, false};
+    static const strix::profile::Engine engine{"deepseek41-pair", "STRIX_DS41_PROFILE_ALLOW_PENDING", profile_table, false,
+                                              "ds41-turbo-v1"};
     return engine;
 }
 
