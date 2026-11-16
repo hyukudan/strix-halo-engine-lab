@@ -381,6 +381,7 @@ if(BUILD_TESTING)
     add_test(NAME strix-device-profile-host-tests COMMAND strix-device-profile-host-tests)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        add_subdirectory(tests/qwen_cuda_graph_host)
         add_test(NAME strix-hip-arch-caps-host-tests COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip_arch_caps_host_tests.py" --compiler "${CMAKE_CXX_COMPILER}")
     endif()
