@@ -124,6 +124,13 @@ class Requests(unittest.TestCase):
         self.assertAlmostEqual(first["tok_s"], 10.0)  # (11 - 1) / 1.0 s
         self.assertEqual(sb.request_metrics(self.EVENTS[2])["tokens"], 3)  # no usage: chunk count
         self.assertIsNone(sb.request_metrics(self.EVENTS[3])["tok_s"])  # one token has no rate
+        self.assertIsNone(sb.request_metrics(self.EVENTS[3])["peak_1s_tok_s"])  # spans < 1 s
+
+    def test_peak_1s(self):
+        # 10 chunks in the first 0.5 s, then 4 spread over 1.5 s; 28 tokens = 2 per chunk on average.
+        times = [0.05 * i for i in range(10)] + [0.9, 1.4, 1.9, 2.4]
+        self.assertAlmostEqual(sb.peak_1s(times, 28), 11 * 2.0)  # window [0, 1) holds 11 chunks
+        self.assertIsNone(sb.peak_1s([0.0, 0.5], 2))
 
     def test_burst_metrics(self):
         m = sb.burst_metrics(self.EVENTS)
