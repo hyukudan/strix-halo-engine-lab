@@ -733,10 +733,11 @@ __global__ __launch_bounds__(256) void mtp_cache_projection_kernel(const std::ui
 
 // 8a. norm_rope_body (hip_indexed_attention_launcher.hip:880-994) on K in place, grid (2 heads, rows) x 256.
 __global__ __launch_bounds__(256) void mtp_key_norm_rope_kernel(float* key, const float* k_norm, const float* cs,
-    std::uint64_t rope_positions, std::uint64_t position0, float eps, std::uint32_t* status, am::Tables tb) {
+    std::uint64_t rope_positions, std::uint64_t position0, const std::uint64_t* position_dev, float eps, std::uint32_t* status,
+    am::Tables tb) {
     __shared__ float source[kMtpHeadDim], reduction[kMtpHeadDim];
     const unsigned head = blockIdx.x, row = blockIdx.y, f = threadIdx.x;
-    const std::uint64_t position = position0 + row;
+    const std::uint64_t position = (position_dev ? *position_dev : position0) + row;
     float* values = key + static_cast<std::uint64_t>(row) * kMtpKvWidth + head * kMtpHeadDim;
     const float input = values[f];
     source[f] = input;
@@ -775,10 +776,10 @@ __global__ void mtp_cache_validate_kernel(const float* index_key, const float* k
     if (bad) { atomicMin(first_bad, row); if (status) atomicOr(status, 8U); }
 }
 __global__ void mtp_cache_store_kernel(const float* index_key, const float* key, const float* value, std::uint64_t position0,
-    const std::uint32_t* first_bad, std::uint16_t* kv, std::uint16_t* raw_index) {
+    const std::uint64_t* position_dev, const std::uint32_t* first_bad, std::uint16_t* kv, std::uint16_t* raw_index) {
     const std::uint32_t row = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= *first_bad || i >= kMtpKvWidth) return;
-    const std::uint64_t p = position0 + row;
+    const std::uint64_t p = (position_dev ? *position_dev : position0) + row;
     kv[p * kMtpKvWidth * 2U + i] = f2bf(key[static_cast<std::uint64_t>(row) * kMtpKvWidth + i]);
     kv[p * kMtpKvWidth * 2U + kMtpKvWidth + i] = f2bf(value[static_cast<std::uint64_t>(row) * kMtpKvWidth + i]);
     if (i < kMtpIndexDim) raw_index[p * kMtpIndexDim + i] = f2bf(index_key[static_cast<std::uint64_t>(row) * kMtpIndexDim + i]);
@@ -805,7 +806,7 @@ MtpWorkspaceViews mtp_workspace_views(void* workspace, std::uint32_t rows) {
 
 void launch_mtp_cache_rows(const MtpWeights& w, const MtpRounding& rd, const std::uint16_t* hidden,
     const std::uint32_t* next_tokens, std::uint32_t rows, std::uint64_t position0, std::uint16_t* kv, std::uint16_t* raw_index,
-    void* workspace, std::uint32_t* status, const amdmath::Tables& tables, cudaStream_t stream) {
+    void* workspace, std::uint32_t* status, const amdmath::Tables& tables, cudaStream_t stream, const std::uint64_t* position_dev) {
     if (!rows) return;
     const auto l = mtp_layout(rows);
     const auto v = mtp_workspace_views(workspace, rows);
@@ -824,9 +825,10 @@ void launch_mtp_cache_rows(const MtpWeights& w, const MtpRounding& rd, const std
     mtp_cache_projection_kernel<<<dim3(kMtpIndexDim + 2U * kMtpKvWidth, (rows + kLinRows - 1U) / kLinRows), 256, 0, stream>>>(
         v.hidden0, rows, w.index_k, static_cast<const std::uint8_t*>(w.k), static_cast<const std::uint8_t*>(w.v), v.index_key, v.key, v.value);
     mtp_key_norm_rope_kernel<<<dim3(kMtpKvHeads, rows), 256, 0, stream>>>(v.key, w.k_norm, w.rope_cs, w.rope_positions, position0,
-        rd.epsilon, status, tables);
+        position_dev, rd.epsilon, status, tables);
     mtp_cache_validate_kernel<<<rows, 256, 0, stream>>>(v.index_key, v.key, v.value, first_bad, status);
-    mtp_cache_store_kernel<<<dim3(kMtpKvWidth / 256U, rows), 256, 0, stream>>>(v.index_key, v.key, v.value, position0, first_bad, kv, raw_index);
+    mtp_cache_store_kernel<<<dim3(kMtpKvWidth / 256U, rows), 256, 0, stream>>>(v.index_key, v.key, v.value, position0, position_dev, first_bad, kv,
+        raw_index);
     check(cudaGetLastError(), "MTP cache rows launch");
 }
 

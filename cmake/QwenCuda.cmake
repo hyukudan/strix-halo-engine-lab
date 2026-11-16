@@ -13,8 +13,20 @@ include(${CMAKE_CURRENT_LIST_DIR}/StrixCudaBackend.cmake)
 add_library(strix_qwen_cuda STATIC
     src/cuda/models/qwen/qwen_prefill_driver.cu src/cuda/models/qwen/qwen_hc.cu src/cuda/models/qwen/qwen_dense.cu
     src/cuda/models/qwen/qwen_gdn.cu src/cuda/models/qwen/qwen_qsa.cu src/cuda/models/qwen/qwen_moe.cu
-    src/cuda/models/qwen/qwen_plemtp.cu src/cuda/models/qwen/qwen_mtp_draft.cu src/cuda/models/qwen/qwen_transcode.cu ${STRIX_CUDA_CORE_AMD_MATH_SOURCES} src/gguf_reader.cpp)
+    src/cuda/models/qwen/qwen_plemtp.cu src/cuda/models/qwen/qwen_mtp_draft.cu src/cuda/models/qwen/qwen_transcode.cu src/cuda/tiered_experts.cu
+    ${STRIX_CUDA_CORE_AMD_MATH_SOURCES} src/gguf_reader.cpp)
 target_include_directories(strix_qwen_cuda PUBLIC include src/cuda/models/qwen)
+# Tiered expert residency: the host planner/resolver and the CPU routed-expert executor (bitwise = the card's A8 chains).
+# Only the library targets are needed; the Qwen-only build has no strix_target_warnings, so a no-op stands in for it.
+if(NOT COMMAND strix_target_warnings)
+    function(strix_target_warnings target)
+    endfunction()
+endif()
+include(${CMAKE_CURRENT_LIST_DIR}/StrixResidency.cmake)
+if(NOT TARGET strix_backend_cpu)
+    include(${CMAKE_CURRENT_LIST_DIR}/StrixBackendCpu.cmake)
+endif()
+target_link_libraries(strix_qwen_cuda PUBLIC strix_residency strix_backend_cpu)
 # Every Qwen CUDA binary resolves its device through the start gate (strix-devices-v1) before its first allocation.
 include(${CMAKE_CURRENT_LIST_DIR}/StrixDevice.cmake)
 target_link_libraries(strix_qwen_cuda PUBLIC strix_device strix_cuda_core)
@@ -128,3 +140,17 @@ if(MSVC)
 endif()
 add_test(NAME qwen_gdn_state16 COMMAND qwen_gdn_state16_test)
 set_tests_properties(qwen_gdn_state16 PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=0")
+
+# GPU unit test of tiered expert residency: full route vs tiered route (CPU executor) on random weights, bitwise.
+add_executable(qwen_tiered_moe_tests tests/cuda/qwen_tiered_moe_tests.cu)
+target_link_libraries(qwen_tiered_moe_tests PRIVATE strix_qwen_cuda)
+target_compile_options(qwen_tiered_moe_tests PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+if(MSVC)
+    target_compile_options(qwen_tiered_moe_tests PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
+
+# serve == bench residency command line (host only, no CUDA)
+add_executable(strix-expert-residency-parity-tests tests/expert_residency_parity_tests.cpp)
+target_link_libraries(strix-expert-residency-parity-tests PRIVATE strix_residency)
+add_test(NAME strix-expert-residency-parity-tests COMMAND strix-expert-residency-parity-tests)

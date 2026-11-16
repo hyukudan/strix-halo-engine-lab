@@ -59,6 +59,10 @@
 #include "strix/hip_gsq_a8_groups.hpp"
 #include "moe_core/dense_a8_small_layout.hpp"
 #include "strix/known_window_cohort.hpp"
+#include "core/iu4_onfly.hpp"
+#include "core/iu4_plan.hpp"
+#include "core/w4a16.hpp"
+#include "strix/onfly_i4.hpp"
 
 namespace strix {
 // Launches that drop the AQL barrier bit for kernels proven independent of the one queued
@@ -1879,6 +1883,8 @@ template <class Site> void launch_dense_a8_gsq(const Site& site, const DenseA8Sl
 // projection reads) and one barrier-ordered projection launch (dot4 rows <= 8, WMMA
 // 16/32/64).
 #include "moe_core/dense_a8_small.inc"
+// (hip_q8_rows_iu4.hpp: its core includes are at the top of this file)
+#include "hip_q8_rows_iu4.hpp"
 
 template <class Site> void launch_dense_a8(const Site& site, hipStream_t stream, bool any_order) {
     static_assert(Site::rows <= 8U || (Site::rows % 16U == 0U && Site::rows <= kDenseA8WideRows));
@@ -1974,6 +1980,8 @@ template <class Site> void launch_dense_a8_quantized(const Site& site, const Den
     for (unsigned m = 0; m < site.segments.count; ++m)
         if (reinterpret_cast<std::uintptr_t>(site.segments.weights[m]) % 4U)
             throw std::invalid_argument("q8_rows: dense A8 requires dword-aligned Q8 weights");
+    if constexpr (Site::rows <= 8U && iu4_group_of<Site>() != 0U)
+        if (launch_iu4_rows(site, stream, false, &slot)) return;
     if (gsq_segments(site.segments)) {
         if constexpr (Site::rows <= 8U) { launch_dense_a8_gsq(site, slot, stream); return; }
         else throw std::invalid_argument("q8_rows: GSQ dense A8 supports 1..8 rows");
@@ -2139,6 +2147,8 @@ template <class Site> void launch(const Site& site, bool a8, hipStream_t stream,
         }
     }
 #endif
+    if constexpr (Site::rows <= 8U && iu4_group_of<Site>() != 0U)
+        if (launch_iu4_rows(site, stream, any_order, nullptr)) return;
     if (a8) { launch_dense_a8(site, stream, any_order); return; }
     const auto start = [&](auto kernel, unsigned blocks, unsigned threads, std::uint32_t bytes, const Site& args) {
         if (any_order)
