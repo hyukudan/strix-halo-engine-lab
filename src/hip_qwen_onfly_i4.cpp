@@ -8,6 +8,7 @@
 #include <hip/hip_runtime.h>
 
 #include <chrono>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 
@@ -17,6 +18,9 @@ using strix::hip_check;
 unsigned group_index(unsigned group) { return group == 1U ? 0U : group == 2U ? 1U : group == 4U ? 2U : 3U; }
 }  // namespace
 HipQwenOnflyI4::~HipQwenOnflyI4() {
+    if (!copies.empty())
+        std::fprintf(stderr, "turbo-weights onfly: INT4 kernel launches %llu, registry hits %llu\n",
+                     static_cast<unsigned long long>(q6p::iu4::launches.load()), static_cast<unsigned long long>(q6p::iu4::hits()));
     for (const auto& c : copies) {
         q6p::iu4::unregister_tensor(c.original, static_cast<const unsigned char*>(c.device));
         (void)hipFree(c.device);

@@ -128,6 +128,7 @@ template <class Site> bool launch_iu4_rows(const Site& site, hipStream_t stream,
         default: return false;
         }
         iu4_dispatches().fetch_add(1U, std::memory_order_relaxed);
+        q6p::iu4::launches.fetch_add(1U, std::memory_order_relaxed);
         return true;
     }
 }

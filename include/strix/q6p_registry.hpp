@@ -21,6 +21,7 @@
 // their Q8_0 weights up here and fall back to the Q8_0 kernel when the address is
 // not registered or STRIX_Q6P=0.
 
+#include <atomic>
 #include <cstdint>
 
 namespace strix::q6p {
@@ -77,6 +78,7 @@ std::uint64_t count() noexcept;
 std::uint64_t hits() noexcept;
 // The independent MTP golden replay validates the EXACT arithmetic: onfly INT4 dispatch is suspended on the calling thread
 // while it runs (the INT4 copies are lossy by design and are never compared with the exact golden).
+inline std::atomic<std::uint64_t> launches{0};  // INT4 kernel launches issued (printed at exit by the owner)
 inline thread_local int suspend_depth = 0;
 [[nodiscard]] inline bool suspended() noexcept { return suspend_depth != 0; }
 struct SuspendScope {
