@@ -151,6 +151,17 @@ int main() {
         for (auto& w : want) w = rng() % 10;
         check_invariants(want, budget);
     }
+    // wide copy window rule: measured sm_120 costs (wide 62.5 ms) -> off; a decode-shaped wide form (26 ms) -> on at 16
+    // rows, still off at 9 rows (9 / 26 < 8 / 17.35); <= 8 rows never
+    {
+        const qc::CopyWideModel measured{}, decode16{8.55, 1.1, 26.0};
+        if (qc::copy_wide_pays(16, measured) || qc::copy_wide_pays(8, decode16) || !qc::copy_wide_pays(16, decode16) ||
+            qc::copy_wide_pays(9, decode16)) {
+            std::printf("FAIL copy_wide_pays decision table
+");
+            ++failures;
+        }
+    }
     std::printf("%s (%d failures)\n", failures == 0 ? "COHORT PLAN PASS" : "COHORT PLAN FAIL", failures);
     return failures == 0 ? 0 : 1;
 }

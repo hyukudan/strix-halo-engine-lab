@@ -146,6 +146,30 @@ inline double copy_wide_accept_default() {
     }();
     return p;
 }
+// The wide copy window's decision (auto): it turns on only when a fully accepted wide window delivers more tokens per
+// ms than a fully accepted 8-row window (the narrow copy-first window it replaces), from the measured window costs of
+// one session. sm_120 RTX PRO 6000 (rtxmax5 t9, qwen_decode_bench): 9.65 ms at 1 row, +1.1 ms per row to 17.2 ms at 8
+// rows, 62.5 ms flat for 9..16 rows (prefill-shaped families) -> 16 / 62.5 = 0.26 vs 8 / 17.2 = 0.46 tokens/ms: off
+// (served edit C1 -29 %, 3 ABAB pairs). It turns on by itself once a 9..16-row decode-shaped form brings the wide cost
+// under ~34 ms (STRIX_QRTX_COPY_WIDE_MS). STRIX_QRTX_COPY_WIDE=1 forces it on, 0 off; the request field copy_rows
+// forces the rows of one request (measurement).
+inline const CopyWideModel& copy_wide_model() {
+    static const CopyWideModel m = [] {
+        CopyWideModel w;
+        if (const char* v = std::getenv("STRIX_QRTX_COPY_WIDE_MS"); v && v[0]) w.wide_ms = std::strtod(v, nullptr);
+        return w;
+    }();
+    return m;
+}
+// -1 auto (copy_wide_pays), 0 off, 1 on
+inline int copy_wide_switch() {
+    static const int v = [] {
+        const char* s = strix::envcfg::text("STRIX_QRTX_COPY_WIDE");
+        if (!s || !s[0] || std::string(s) == "auto") return -1;
+        return s[0] == '0' ? 0 : 1;
+    }();
+    return v;
+}
 inline bool wide_rule_default() {
     static const bool on = strix::envcfg::flag("STRIX_QRTX_WIDE_RULE", true);
     return on;
@@ -231,7 +255,10 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
         } else {
             bool wide = false;
             const std::uint32_t wide_rows = streams[i].copy_rows ? std::min(streams[i].copy_rows, kMaxWindowRows) : copy_rows;
-            if (n == 1 && wide_rows > kWindowRows && c->copy_edit) {
+            const int sw = copy_wide_switch();
+            const bool wide_on = streams[i].copy_rows ? streams[i].copy_rows > kWindowRows
+                : sw < 0 ? copy_wide_pays(wide_rows, copy_wide_model()) : sw == 1;
+            if (n == 1 && wide_on && wide_rows > kWindowRows && c->copy_edit) {
                 copy[i] = c->drafter.propose_wide(streams[i].pending, wide_rows - 1U, wide_accept);
                 wide = !copy[i].empty();
             }

@@ -722,8 +722,10 @@ int main(int argc, char** argv) {
         std::cerr << "strix-cuda-qwen-serve: loading " << o.engine.model_gguf << std::endl;
         if (!o.engine.mtp_sidecar_gguf.empty() && o.mtp_depth > 0) std::cerr << "strix-cuda-qwen-serve: " << strix::mtp_depth_state_line(o.min_p) << ", mtp_depth=" << o.mtp_depth
             << ", context_draft=" << qc::context_mode_name(qc::context_mode_default())
-            << ", copy_rows=" << qc::copy_rows_default() << " (lone-session wide copy windows; <= 8 off), copy_wide_accept="
-            << qc::copy_wide_accept_default()
+            << ", copy_rows=" << qc::copy_rows_default() << ", copy_wide=" << (qc::copy_wide_switch() < 0 ? "auto" : qc::copy_wide_switch() ? "on" : "off")
+            << " (effective " << ((qc::copy_wide_switch() < 0 ? qc::copy_wide_pays(qc::copy_rows_default(), qc::copy_wide_model()) : qc::copy_wide_switch() == 1) ? "on" : "off")
+            << ": wide " << qc::copy_wide_model().wide_ms << " ms vs 8-row " << qc::copy_wide_model().narrow_a_ms + 8 * qc::copy_wide_model().narrow_b_ms
+            << " ms), copy_wide_accept=" << qc::copy_wide_accept_default()
             << ", context_draft_effective=" << qc::context_mode_name(o.http_slots > 1 ? qc::context_mode_default() : qc::ContextMode::off)
             << ", context_draft_applicable=" << (o.http_slots > 1 ? "cohort" : "no (single-slot loop)") << std::endl;
         qp::Prefill engine(o.engine);

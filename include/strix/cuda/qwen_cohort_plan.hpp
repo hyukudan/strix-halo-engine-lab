@@ -121,4 +121,14 @@ inline std::uint32_t choose_budget(std::uint32_t sessions, std::uint32_t depth, 
     return wide > narrow * (1.0 + m.min_gain) ? budget : kWindowRows;
 }
 
+// Wide copy window costs of one session (decision rule in qwen_cohort.hpp, copy_wide_switch)
+struct CopyWideModel {
+    double narrow_a_ms = 8.55, narrow_b_ms = 1.1, wide_ms = 62.5;
+};
+inline bool copy_wide_pays(std::uint32_t rows, const CopyWideModel& m = {}) {
+    if (rows <= kWindowRows || !(m.wide_ms > 0.0)) return false;
+    const double narrow = static_cast<double>(kWindowRows) / (m.narrow_a_ms + m.narrow_b_ms * kWindowRows);
+    return static_cast<double>(rows) / m.wide_ms > narrow;
+}
+
 }  // namespace strix::cuda::qwen_cohort

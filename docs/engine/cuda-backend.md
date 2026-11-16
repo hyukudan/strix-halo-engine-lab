@@ -117,6 +117,11 @@ edit in the span, learned copy acceptance >= `STRIX_QRTX_COPY_WIDE_ACCEPT`) veri
 9..16-row window (the prefill-shaped families) and commits at the first rejected row (exact rollback). Each row's bits
 equal its serial step (`qwen_decode_e2e` with `STRIX_QWEN_TMAX=16`: windows of 2..16 rows and 16-row rollback). Stats:
 `copy_wide_steps`, `copy_wide_rows`, `copy_wide_accepted`.
+Default `STRIX_QRTX_COPY_WIDE=auto`: on only when a fully accepted wide window beats a fully accepted 8-row window
+under the measured window costs (`CopyWideModel`, qwen_cohort_plan.hpp). On sm_120 one session costs 9.65 ms at 1 row,
++1.1 ms per row to 17.2 ms at 8, and a flat 62.5 ms at 9..16 rows (prefill-shaped families), so it stays off: forced
+on, edit C1 drops 29 % (3 in-process ABAB pairs, ids equal). It turns on by itself when a decode-shaped 9..16-row form
+brings the wide cost under ~34 ms (`STRIX_QRTX_COPY_WIDE_MS` overrides the model; `=1` / `=0` force it).
 
 Served decode by prompt class: `scripts/bench/cuda/qwen_serve_classes.py` (prose / edit / json, C1 / C4 / C8, cold and
 warm passes, ids of every request) with `scripts/bench/cuda/qwen_classes_prompts.json`, and strict ABAB server arms with
