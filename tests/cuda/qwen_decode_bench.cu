@@ -31,7 +31,10 @@ static std::vector<std::uint32_t> tokens_of(const std::string& path) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 7) { std::fprintf(stderr, "usage: qwen_decode_bench tables rope max_positions tokens N G\n"); return 1; }
+    if (argc < 7) { std::fprintf(stderr, "usage: qwen_decode_bench tables rope max_positions tokens N G [--greedy-only]\n"); return 1; }
+    if (argc > 7 && (argc != 8 || std::string(argv[7]) != "--greedy-only")) {
+        std::fprintf(stderr, "unknown benchmark option\n"); return 1;
+    }
     qp::Config c;
     c.model_gguf = std::getenv("STRIX_QWEN_GGUF") ? std::getenv("STRIX_QWEN_GGUF") : "Qwen3.8-Flash-Next-UD-Q4_K_XL-merged.gguf";
     if (const char* s = std::getenv("STRIX_QWEN_MTP")) c.mtp_sidecar_gguf = s;
@@ -61,6 +64,11 @@ int main(int argc, char** argv) {
     const auto med = [](const std::vector<double>& v) { const std::size_t k = v.size(); return k % 2 ? v[k / 2] : 0.5 * (v[k / 2 - 1] + v[k / 2]); };
     std::sort(ms.begin(), ms.end());
     std::printf("serial T=1: median %.2f ms (%.1f tok/s), min %.2f\n", med(ms), 1000.0 / med(ms), ms[0]);
+    if (argc == 8) {
+        cudaProfilerStop();
+        std::printf("profile scope: greedy C1 only, %u emitted tokens\n", g);
+        return 0;
+    }
     for (std::uint32_t t = 2; t <= 8; ++t) {
         std::vector<std::uint32_t> pre(seq.begin(), seq.begin() + static_cast<std::ptrdiff_t>(n));
         p.run(pre, n - 1, drop);

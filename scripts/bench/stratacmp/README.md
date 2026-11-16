@@ -5,6 +5,8 @@ come from arguments. Keep one model family resident and use the device declarati
 Use `--plan` to list the fixed ABAB order, then `--run-index N` to execute one entry per reserved
 FIFO window into the same output directory. Config and prompt hashes must remain identical;
 the completion marker is written only after every plan entry has a complete receipt.
+For kernel attribution, `qwen_decode_bench ... N G --greedy-only` closes its CUDA profiler range after
+the serial C1 emissions, excluding upload, initial prefill and the later teacher-window sweeps.
 
 ## Teacher-forced quality
 
