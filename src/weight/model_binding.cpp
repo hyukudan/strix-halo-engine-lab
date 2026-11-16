@@ -39,11 +39,19 @@ Status channel_parameters(const TensorIndex& index,const RawTensor& raw,Paramete
 }
 Status bind_model(const TensorIndex& index,const FamilySchema& schema,WeightMap& out) {
     std::vector<TensorBinding> bindings;std::vector<Parameters> parameters;
+    const bool nvfp4=index.container==Container::safetensors && index.schema=="strix.nvfp4.safetensors@1";
     for(const auto& raw:index.tensors) {
         if(schema.text_only && index.container!=Container::gguf && !raw.name.starts_with("model.language_model.") && raw.name!="lm_head.weight")continue;
         const bool trellis=raw.name.ends_with(".trellis");
         const bool standalone=std::any_of(schema.roles.begin(),schema.roles.end(),[&](const auto& p){return p.standalone && raw.name.find(p.pattern)!=std::string::npos;});
-        const bool weight=raw.name.ends_with(".weight") || raw.name.ends_with("_weight") || standalone;
+        const bool fp4_codes=nvfp4 && raw.name.ends_with(".codes");
+        if(nvfp4 && (raw.name.ends_with(".block_scales") || raw.name.ends_with(".tensor_scale"))) {
+            const auto suffix=raw.name.ends_with(".block_scales")?13u:13u;
+            if(!named(index,raw.name.substr(0,raw.name.size()-suffix)+".codes"))
+                return {Error::malformed,"orphan canonical NVFP4 scale sidecar"};
+            continue;
+        }
+        const bool weight=raw.name.ends_with(".weight") || raw.name.ends_with("_weight") || standalone || fp4_codes;
         const bool bias=raw.name.ends_with(".bias");
         // Sidecars are attached by schema to their weight, not advertised as independent matrices.
         if(!weight && !trellis && !bias)continue;
@@ -52,7 +60,13 @@ Status bind_model(const TensorIndex& index,const FamilySchema& schema,WeightMap&
         const bool expert=raw.name.find("experts")!=std::string::npos || raw.name.find("_exps")!=std::string::npos;
         if(expert){if(raw.shape.rank>2)b.expert_axis=0;if(b.role==Role::dense_gate)b.role=Role::expert_gate;if(b.role==Role::dense_up)b.role=Role::expert_up;if(b.role==Role::dense_down)b.role=Role::expert_down;}
         Parameters p{};
-        if(trellis) {
+        if(fp4_codes) {
+            if(expert || b.role==Role::embedding || b.role==Role::lookup_row || b.role==Role::router ||
+               b.role==Role::norm || b.role==Role::bias || b.role==Role::auxiliary)
+                return {Error::unsupported_role,"native NVFP4 schema requires a dense matrix role"};
+            if(raw.shape.rank!=2 || raw.shape.dims[1]>UINT64_MAX/2)return {Error::unsupported_shape,"invalid NVFP4 matrix shape"};
+            b.logical_shape.dims[1]*=2;p.transform="strix.nvfp4.safetensors@1";
+        }else if(trellis) {
             if(raw.wire_dtype=="U16" && !schema.unsigned_trellis)return {Error::unknown_format,"legacy family graph requires signed I16 trellis transport"};
             if(!schema.transformed)return {Error::unknown_format,"family does not admit tile trellis transport"};
             if(raw.shape.rank!=3 || raw.shape.dims[0]>UINT64_MAX/16 || raw.shape.dims[1]>UINT64_MAX/16)return {Error::unsupported_shape,"invalid trellis tile shape"};

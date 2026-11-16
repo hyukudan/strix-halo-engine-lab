@@ -9,7 +9,9 @@ Status bind_qwen(const TensorIndex& index,WeightMap& out) {
     {"q_proj",Role::attention_q},{"attn_q",Role::attention_q},{"k_proj",Role::attention_k},{"attn_k",Role::attention_k},
     {"v_proj",Role::attention_v},{"attn_v",Role::attention_v},{"o_proj",Role::attention_o},{"attn_output",Role::attention_o},
     {"down",Role::dense_down},{"gate",Role::dense_gate},{"up",Role::dense_up}};
-    const detail::FamilySchema schema{"qwen",linear,plain,roles,false,false,false,false,auxiliary};
+    auto native_linear=std::vector<FormatId>(std::begin(linear),std::end(linear));
+    native_linear.push_back({"nvidia.nvfp4",1});
+    const detail::FamilySchema schema{"qwen",native_linear,plain,roles,false,false,false,false,auxiliary};
     return detail::bind_model(index,schema,out);
 }
 }
