@@ -4710,6 +4710,7 @@
         "base_kv_bytes_per_token",
         "block",
         "block_member",
+        "block_plan_canonical",
         "blocks",
         "build_model_tensor_index",
         "build_ple_hash_contract",
