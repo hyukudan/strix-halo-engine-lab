@@ -64,6 +64,13 @@ int main(int argc, char** argv) {
                         if (bad++ < 6) std::printf("DECODE DIFF %s row %llu group %u\n", t.name.c_str(), static_cast<unsigned long long>(r), g);
                     }
                 // Q8_0 transcode of the row vs the same rule on the host
+                strix::cuda::transcode::to_f32(d_raw, t.ggml_type, width, d_out, nullptr);
+                ck(cudaMemcpy(dev.data(), d_out, width * 4, cudaMemcpyDeviceToHost), "d2h production decode");
+                if (std::memcmp(host.data(), dev.data(), width * 4) != 0) {
+                    std::fprintf(stderr, "PRODUCTION DECODE DIFF %s row %llu host0 %.9g device0 %.9g\n", t.name.c_str(),
+                                 static_cast<unsigned long long>(r), static_cast<double>(host[0]), static_cast<double>(dev[0]));
+                    return 4;
+                }
                 ck(cudaMemset(d_q8, 0xA5, width / 32 * 34), "poison q8");  // an unwritten group cannot pass as zeros
                 strix::cuda::transcode::to_q8_0(d_raw, t.ggml_type, width, d_q8, nullptr);
                 ck(cudaDeviceSynchronize(), "q8 transcode");

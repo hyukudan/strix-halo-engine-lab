@@ -27,9 +27,10 @@ __global__ void to_q8_0_kernel(const std::uint8_t* src, std::uint32_t type, std:
     const float d = __fdiv_rn(amax, 127.0F);
     const float id = d != 0.0F ? __fdiv_rn(1.0F, d) : 0.0F;
     std::uint8_t* out = dst + g * 34U;
-    const unsigned short h = __half_as_ushort(__float2half_rn(d));
-    out[0] = static_cast<std::uint8_t>(h & 255U);
-    out[1] = static_cast<std::uint8_t>(h >> 8U);
+    // Store the raw half in one operation. Splitting __half_as_ushort into bytes
+    // can be lowered to a numeric half->u8 conversion, destroying the low byte.
+    // cudaMalloc is aligned and every Q8_0 group starts at an even 34-byte stride.
+    *reinterpret_cast<__half*>(out) = __float2half_rn(d);
     for (int j = 0; j < 32; ++j) out[2 + j] = static_cast<std::uint8_t>(static_cast<std::int8_t>(roundf(__fmul_rn(v[j], id))));
 }
 
