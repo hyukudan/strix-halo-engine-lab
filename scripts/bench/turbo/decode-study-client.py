@@ -22,7 +22,9 @@ def body(i):
 
 def one(i, res, t0):
     s = time.time()
-    req = urllib.request.Request(url, data=json.dumps(body(i)).encode(), headers={"Content-Type": "application/json"})
+    payload = body(i)
+    request_sha = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=600) as r:
             j = json.loads(r.read())
@@ -36,7 +38,7 @@ def one(i, res, t0):
               "queue_ms": st.get("queue_ms"), "prefill_ms": st.get("prefill_ms"), "decode_ms": st.get("decode_ms"),
               "dec_tps": st.get("decode_tokens_per_second"), "acc": st.get("mtp_accepted"), "prop": st.get("mtp_proposed"),
               "cycles": st.get("mtp_cycles"), "ids_sha": hashlib.sha256(json.dumps(ids).encode()).hexdigest()[:16],
-              "finish": j["choices"][0]["finish_reason"]}
+              "finish": j["choices"][0]["finish_reason"], "request_sha256": request_sha}
     if os.environ.get("TURBODEC_KEEP_TOKEN_IDS") == "1":
         res[i]["token_ids"] = ids
 

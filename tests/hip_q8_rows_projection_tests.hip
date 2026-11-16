@@ -286,6 +286,122 @@ float median_us(const Fixture& f, Mode mode, bool cold, const Buffer& flush, hip
     std::sort(samples.begin(), samples.end());
     return samples[samples.size() / 2U];
 }
+// Same weight/input pointers across row buckets: isolate regrouping of FP32
+// partial sums from quantization error or changes in activations.
+void onfly_row_invariance(hipStream_t stream) {
+    const bool requested_single = envcfg::flag("STRIX_IU4_R8_SINGLE_DECODE", false);
+    unsigned observations = 0;
+    struct Difference {
+        std::uint32_t changed = 0, top_reference = 0, top_actual = 0;
+        std::uint64_t max_ulp32 = 0;
+        float max_abs = 0;
+    };
+    const auto compare = [](const Fixture& f, const std::vector<std::uint8_t>& reference,
+                            const std::vector<std::uint8_t>& actual) {
+        Difference d;
+        const auto ordered = [](float x) {
+            const auto bits = std::bit_cast<std::uint32_t>(x);
+            return bits & 0x80000000U ? ~bits : bits ^ 0x80000000U;
+        };
+        for (std::uint32_t i = 0; i < f.outputs; ++i) {
+            const float a = f.value(reference, i), b = f.value(actual, i);
+            require(std::isfinite(a) && std::isfinite(b), "row-invariance finite fixture overflowed");
+            if (std::bit_cast<std::uint32_t>(a) != std::bit_cast<std::uint32_t>(b)) ++d.changed;
+            d.max_abs = std::max(d.max_abs, std::fabs(a - b));
+            const auto aa = ordered(a), bb = ordered(b);
+            d.max_ulp32 = std::max(d.max_ulp32, static_cast<std::uint64_t>(aa > bb ? aa - bb : bb - aa));
+            if (a > f.value(reference, d.top_reference)) d.top_reference = i;
+            if (b > f.value(actual, d.top_actual)) d.top_actual = i;
+        }
+        return d;
+    };
+    for (const auto site : sites) for (const unsigned width : {2048U, 2560U, 4096U, 6144U}) {
+        const auto outputs = model_shape(site).second;
+        Fixture f(site, 8U, width, outputs); f.prepare(0);
+        auto weight_seed = weights_bytes(width, outputs, 0U);
+        // Non-power-of-two scales and varied exponents expose rounding that an
+        // integer/power-of-two fixture can hide. These bytes never change with R.
+        for (std::size_t block = 0; block < weight_seed.size() / 34U; ++block) {
+            const auto scale = static_cast<std::uint16_t>(0x2001U + (block * 37U) % 0x17ffU);
+            weight_seed[block * 34U] = static_cast<std::uint8_t>(scale);
+            weight_seed[block * 34U + 1U] = static_cast<std::uint8_t>(scale >> 8U);
+        }
+        f.weights.upload(weight_seed);
+        auto input_seed = input_bytes(width, 0U, bf16_input(site), 0U);
+        for (std::uint32_t i = 0; i < width; ++i) {
+            const std::uint32_t hash = i * 2654435761U + 2246822519U;
+            const auto bits = (hash & 0x80000000U) | (0x3c000000U + (hash & 0x037fffffU));
+            if (bf16_input(site)) {
+                const auto h = bf16(std::bit_cast<float>(bits));
+                std::memcpy(input_seed.data() + 2U * i, &h, 2U);
+            } else std::memcpy(input_seed.data() + 4U * i, &bits, 4U);
+        }
+        f.input[0]->upload(input_seed);
+        require(f.weights.download() == weight_seed && f.input[0]->download() == input_seed,
+                "row-invariance source upload changed bytes");
+        Buffer packed(core::onfly::copy_bytes(outputs, width));
+        auto* base = reinterpret_cast<std::uint8_t*>(packed.address);
+        check(core::convert_q8_0_iu4(reinterpret_cast<const std::uint8_t*>(f.weights.address),
+            static_cast<int>(width), static_cast<int>(outputs), base,
+            reinterpret_cast<std::uint16_t*>(base + core::onfly::packed_bytes(core::onfly::padded_outputs(outputs), width)),
+            stream, core::iu4_scale_rule_fast_full), "row-invariance conversion");
+        check(hipStreamSynchronize(stream), "row-invariance conversion complete");
+        const auto* original = reinterpret_cast<const void*>(f.weights.address);
+        q6p::iu4::register_tensor(original, {base, outputs, width});
+        for (const auto mode : {Mode::rows, Mode::rows_a8}) {
+            std::vector<std::uint8_t> native_reference, halves_reference, single_reference;
+            for (const unsigned rows : {1U, 2U, 4U, 7U, 8U}) {
+                if (rows == 7U && site != Site::gdn_input && site != Site::gdn_output) continue;
+                f.rows = rows;
+                require(f.input[0]->download() == input_seed, "row-invariance input changed between buckets");
+                std::vector<std::uint8_t> native;
+                {
+                    const q6p::iu4::SuspendScope suspended;
+                    require(setenv("STRIX_IU4_R8_SINGLE_DECODE", "0", 1) == 0, "set native row control");
+                    native = f.run(mode, stream)[0];
+                    require(setenv("STRIX_IU4_R8_SINGLE_DECODE", "1", 1) == 0, "set native row candidate");
+                    require(f.run(mode, stream)[0] == native, "single-decode switch changed native output bits");
+                }
+                if (rows == 1U) native_reference = native;
+                const auto emit = [&](const char* profile, const std::vector<std::uint8_t>& reference,
+                                      const std::vector<std::uint8_t>& actual, std::uint64_t launches) {
+                    ++observations;
+                    const auto d = compare(f, reference, actual);
+                    std::cout << "onfly-row-invariance site=\"" << name(site) << "\" width=" << width
+                        << " outputs=" << outputs << " mode=" << (mode == Mode::rows ? "exact" : "dense-a8")
+                        << " profile=" << profile << " rows=" << rows << " reference_rows=1"
+                        << " bitwise=" << (reference == actual) << " changed=" << d.changed
+                        << " max_abs=" << d.max_abs << " max_ulp32=" << d.max_ulp32
+                        << " top1_agree=" << (d.top_reference == d.top_actual)
+                        << " top1_reference=" << d.top_reference << " top1_actual=" << d.top_actual
+                        << " iu4_launches=" << launches << " same_input_bytes=1 same_weight_image=1 native_switch_bitwise=1\n";
+                };
+                emit("native", native_reference, native, 0U);
+                require(setenv("STRIX_IU4_R8_SINGLE_DECODE", "0", 1) == 0, "set row-half policy");
+                auto before = q6p::iu4::launches.load();
+                const auto halves = f.run(mode, stream)[0];
+                const auto halves_launches = q6p::iu4::launches.load() - before;
+                require(halves_launches > 0U, "row-invariance arm silently bypassed IU4");
+                if (rows == 1U) halves_reference = halves;
+                emit("iu4-halves", halves_reference, halves, halves_launches);
+                require(setenv("STRIX_IU4_R8_SINGLE_DECODE", "1", 1) == 0, "set full-row policy");
+                before = q6p::iu4::launches.load();
+                const auto single = f.run(mode, stream)[0];
+                const auto single_launches = q6p::iu4::launches.load() - before;
+                require(single_launches > 0U, "single row-invariance arm silently bypassed IU4");
+                require(single == halves, "single-decode policy changed same-bucket bits");
+                if (rows == 1U) single_reference = single;
+                emit("iu4-single", single_reference, single, single_launches);
+            }
+        }
+        require(f.weights.download() == weight_seed, "row-invariance weights changed between buckets");
+        q6p::iu4::unregister_tensor(original, base);
+    }
+    require(setenv("STRIX_IU4_R8_SINGLE_DECODE", requested_single ? "1" : "0", 1) == 0, "restore requested row policy");
+    std::cout << "onfly-row-invariance-complete observations=" << observations
+        << " same_bucket_policies_bitwise=1 native_switch_bitwise=1\n";
+}
+
 // Diagnostic only: one load-time conversion per fixture; native and IU4 use the same production site.
 // Bandwidth is logical unique weight bytes / GPU event time, not measured DRAM traffic.
 // Compare both row-half policies bytewise before timing the requested policy.
@@ -295,6 +411,7 @@ void onfly_decode_bench(hipStream_t stream) {
     for (const auto site : sites) {
         const auto [width, outputs] = model_shape(site);
         for (const unsigned rows : {1U, 2U, 4U, 7U, 8U}) {
+            if (rows == 7U && site != Site::gdn_input && site != Site::gdn_output) continue;
             Fixture f(site, rows, width, outputs); f.prepare(0);
             const auto exact = f.run(Mode::rows, stream);
             const auto exact_a8 = f.run(Mode::rows_a8, stream);
@@ -425,6 +542,11 @@ void wide_bench(hipStream_t stream) {
 int main() try {
     hipStream_t stream = nullptr;
     check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create stream");
+    if (strix::envcfg::flag("STRIX_Q8_ROWS_ONFLY_ROW_INVARIANCE", false)) {
+        onfly_row_invariance(stream);
+        check(hipStreamDestroy(stream), "destroy stream");
+        return 0;
+    }
     if (strix::envcfg::flag("STRIX_Q8_ROWS_ONFLY_BENCH", false)) {
         onfly_decode_bench(stream);
         check(hipStreamDestroy(stream), "destroy stream");

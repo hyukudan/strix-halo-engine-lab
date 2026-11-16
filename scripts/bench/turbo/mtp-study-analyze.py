@@ -133,7 +133,8 @@ def compare_logits(left, right, left_run, right_run):
     for key in l.keys() & r.keys():
         x, req, lf = l[key]
         y, other, rf = r[key]
-        if req['prompt'] != other['prompt'] or req['lane'] != other['lane']:
+        if (req['prompt'] != other['prompt'] or req['lane'] != other['lane'] or
+                not req.get('request_sha256') or req['request_sha256'] != other.get('request_sha256')):
             raise ValueError('prompt identity mismatch')
         bitwise = int(x.tobytes() == y.tobytes())
         tx, ty = int(np.argmax(x)), int(np.argmax(y))
