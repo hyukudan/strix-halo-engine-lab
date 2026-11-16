@@ -16,6 +16,10 @@ def main() -> int:
     ref = np.fromfile(ref_path, dtype=np.float32).reshape(-1, vocab).astype(np.float64)
     tur = np.fromfile(tur_path, dtype=np.float32).reshape(-1, vocab).astype(np.float64)
     n = min(len(ref), len(tur))
+    # optional 4th arg: number of aligned rows (prompt + continuation while both runs fed the same tokens);
+    # rows after the two greedy sequences diverge compare different contexts and must not enter the gate.
+    if len(sys.argv) > 4:
+        n = min(n, int(sys.argv[4]))
     ref, tur = ref[:n], tur[:n]
 
     def logsm(x):
