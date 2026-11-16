@@ -11,7 +11,9 @@ Policies (all at the same resident byte budget):
   static_calib   frequency from the --calib traces only (what a shipped profile would give)
   lru            global LRU over (layer, expert), promote on every miss
   planner        decayed reuse score with hysteresis, promote only when the score margin pays the upload
-                 (the shared residency planner's rule; see docs/engine/memory/expert-residency.md)
+                 (an approximation, not the production planner)
+No production parity: global residency differs from uniform per-layer slots; decay, margin,
+upload-byte limits, seeds and victim protection differ. Curves are not implementation predictions.
 Reported: byte-weighted hit rate (bytes served from the card / active expert bytes), promoted bytes per step.
 
     python scripts/bench/residency/residency_sim.py --classes qwen-classes.json --trace a.extr [--calib b.extr]
@@ -147,7 +149,7 @@ LABELS = ["serial", "w2", "w3", "w4", "w5", "w6", "w7", "w8", "mtp"]
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="Approximate residency policies; curves do not predict the production planner.")
     ap.add_argument("--classes", required=True)
     ap.add_argument("--trace", required=True, action="append")
     ap.add_argument("--budgets-gib", default="2,4,6,8,12,16,24,32")
@@ -173,6 +175,7 @@ def main():
                     fr[(layer, e)] += 1
         return fr
     budgets = [float(b) for b in a.budgets_gib.split(",")]
+    print("APPROXIMATION: global slots, decay/margin, upload limits and seed/victim rules differ from production")
     print("experts/layer %d top_k %d; expert MB min %.3f max %.3f; budgets GiB %s" % (
         experts, top_k, min(ebytes) / 1e6, max(ebytes) / 1e6, a.budgets_gib))
     for want in a.segments.split(","):

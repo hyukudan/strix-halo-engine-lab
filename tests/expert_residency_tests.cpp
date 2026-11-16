@@ -101,8 +101,9 @@ void test_resolve() {
         REQUIRE(d.ok && d.mode == Mode::tiered);
         REQUIRE(d.positions_requested == 262144 && d.positions < 262144 && d.positions % 1024 == 0 && d.positions >= 1024);
         REQUIRE(has(d.reason, "positions reduced"));
-        // the next 1024 step up would not have left a non-negative pool
-        const std::uint64_t used = m.core + 2 * GiB + (24576ull * (d.positions + 1024) + (64ull << 20)) + per_layer_set;
+        REQUIRE(d.slots_per_layer >= 1);
+        // the next 1024 step up would not have left one resident slot per layer
+        const std::uint64_t used = m.core + 2 * GiB + (24576ull * (d.positions + 1024) + (64ull << 20)) + 2 * per_layer_set;
         REQUIRE(used > 8 * GiB);
     }
     {  // not even 1024 positions fit
@@ -167,6 +168,11 @@ void test_flags() {
 
     set_env("STRIX_EXPERT_RESIDENCY", "full");
     set_env("STRIX_VRAM_BUDGET_GIB", "12");
+    for (const char* mode : {"full", "tiered"}) {
+        set_env("STRIX_EXPERT_RESIDENCY", mode);
+        REQUIRE(with_environment(parse({"--expert-residency", "auto"})).mode == Mode::automatic);
+    }
+    set_env("STRIX_EXPERT_RESIDENCY", "full");
     Options e = with_environment({});
     REQUIRE(e.mode == Mode::full && e.vram_budget == 12 * GiB);
     Options f = with_environment(parse({"--expert-residency", "tiered", "--vram-budget-gib", "8"}));

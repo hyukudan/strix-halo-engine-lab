@@ -25,6 +25,19 @@
 
 namespace strix::cuda::tiered {
 
+// Scope a resolved cap around allocation entry points, independent of expert mode.
+// Nested scopes restore the caller's budget. Only setup/allocation paths query the card.
+class AllocationBudget {
+public:
+    AllocationBudget(std::uint64_t initial_free, std::uint64_t budget);
+    ~AllocationBudget();
+    AllocationBudget(const AllocationBudget&) = delete;
+    AllocationBudget& operator=(const AllocationBudget&) = delete;
+private:
+    std::uint64_t previous_free_, previous_budget_;
+};
+void require_budget(std::uint64_t bytes, const char* what);
+
 struct TierLayout {
     std::uint32_t hidden = 0, ffn = 0, top_k = 0, experts = 0, max_rows = 0;
 };

@@ -25,6 +25,7 @@ struct Options {
     // false (STRIX_TIER_HOST_CHECK=0): tiered starts even when the host cannot hold every non-resident expert;
     // cold experts then page from the model file (the reason says by how much). Budget emulation only.
     bool host_check = true;
+    bool mode_explicit = false;
 };
 
 // Consumes `--expert-residency auto|full|tiered` and `--vram-budget-gib N` (decimal ok, > 0). Returns true when
@@ -32,7 +33,7 @@ struct Options {
 // std::invalid_argument. Serve and CLI both call this, so they accept the same flags.
 bool parse_flag(std::string_view arg, const std::function<std::string()>& next, Options& out);
 // STRIX_EXPERT_RESIDENCY / STRIX_VRAM_BUDGET_GIB via envcfg; only fills what the flags left unset (flags win).
-// Callers: parse flags first, then call with_environment (it does not override a non-default value).
+// Callers: parse flags first, then call with_environment (explicit auto also wins over the environment).
 Options with_environment(Options in);
 
 struct ModelBytes {
@@ -48,7 +49,18 @@ struct CardBytes {
 struct SessionBytes {
     std::uint64_t per_position = 0, fixed = 0, scratch = 0, margin = 0;
     std::uint32_t sessions = 1, positions = 0;
+    std::uint64_t per_group = 0;
+    std::uint32_t group_size = 1;
+    std::function<std::uint64_t(std::uint32_t)> position_scratch;
 };
+// Shared checked storage contracts, also used by adapters before allocating or exposing tensors.
+std::uint64_t grouped_bytes(std::uint64_t positions, std::uint32_t group, std::uint64_t bytes);
+std::uint64_t session_bytes(const SessionBytes&, std::uint32_t positions);
+void validate_expert_tensor(const std::vector<std::uint64_t>& dimensions, std::uint64_t bytes,
+                            std::uint64_t input, std::uint64_t output, std::uint64_t experts,
+                            std::uint64_t block_elements, std::uint64_t block_bytes);
+bool allocation_fits(std::uint64_t budget, std::uint64_t initial_free, std::uint64_t free_now,
+                     std::uint64_t bytes);
 struct HostBytes {
     std::uint64_t available = 0;
 };

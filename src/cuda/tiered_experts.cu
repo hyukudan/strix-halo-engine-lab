@@ -1,5 +1,6 @@
 // Tiered expert residency, CUDA side. See include/strix/cuda_tiered_experts.hpp for the protocol.
 #include "strix/cuda_tiered_experts.hpp"
+#include "strix/residency/expert_residency.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -145,6 +146,26 @@ __global__ __launch_bounds__(256) void gather_kernel(TierDev d, float* rawdots, 
 
 }  // namespace
 
+namespace {
+thread_local std::uint64_t allocation_initial_free = 0, allocation_budget = 0;
+}
+AllocationBudget::AllocationBudget(std::uint64_t initial_free, std::uint64_t budget)
+    : previous_free_(allocation_initial_free), previous_budget_(allocation_budget) {
+    allocation_initial_free = initial_free;
+    allocation_budget = budget;
+}
+AllocationBudget::~AllocationBudget() {
+    allocation_initial_free = previous_free_;
+    allocation_budget = previous_budget_;
+}
+void require_budget(std::uint64_t bytes, const char* what) {
+    if (!allocation_budget) return;
+    std::size_t available = 0, total = 0;
+    ck(cudaMemGetInfo(&available, &total), "allocation memory info");
+    if (!residency::allocation_fits(allocation_budget, allocation_initial_free, available, bytes))
+        throw std::runtime_error(std::string("residency allocation exceeds VRAM budget: ") + what);
+}
+
 Exchange::Exchange(const TierLayout& layout) : layout_(layout) {
     if (layout.hidden % 128U || !layout.top_k || layout.top_k > 32U || !layout.max_rows || !layout.experts)
         throw std::invalid_argument("tiered exchange: bad layout");
@@ -157,35 +178,42 @@ Exchange::Exchange(const TierLayout& layout) : layout_(layout) {
     const auto o_status = place(rows * 4);
     const auto o_raw = place(rows * layout.top_k * layout.hidden * 4);
     host_bytes_ = at;
-    ck(cudaHostAlloc(reinterpret_cast<void**>(&host_base_), host_bytes_, cudaHostAllocMapped | cudaHostAllocPortable), "exchange alloc");
-    std::memset(host_base_, 0, host_bytes_);
-    std::uint8_t* dbase = nullptr;
-    ck(cudaHostGetDevicePointer(reinterpret_cast<void**>(&dbase), host_base_, 0), "exchange device pointer");
-    host_published_ = reinterpret_cast<std::uint64_t*>(host_base_ + o_pub);
-    host_done_ = reinterpret_cast<std::uint64_t*>(host_base_ + o_done);
-    host_header_ = reinterpret_cast<std::uint32_t*>(host_base_ + o_header);
-    host_miss_ = reinterpret_cast<Miss*>(host_base_ + o_miss);
-    host_codes_ = reinterpret_cast<std::int8_t*>(host_base_ + o_codes);
-    host_deltas_ = reinterpret_cast<float*>(host_base_ + o_deltas);
-    host_sums_ = reinterpret_cast<std::int32_t*>(host_base_ + o_sums);
-    host_status_ = reinterpret_cast<std::uint32_t*>(host_base_ + o_status);
-    host_rawdots_ = reinterpret_cast<float*>(host_base_ + o_raw);
-    ck(cudaMalloc(reinterpret_cast<void**>(&state_), sizeof(DevState)), "state alloc");
-    ck(cudaMemset(state_, 0, sizeof(DevState)), "state clear");
-    dev_.seq_published = reinterpret_cast<volatile std::uint64_t*>(dbase + o_pub);
-    dev_.seq_done = reinterpret_cast<volatile std::uint64_t*>(dbase + o_done);
-    dev_.header = reinterpret_cast<std::uint32_t*>(dbase + o_header);
-    dev_.miss = reinterpret_cast<Miss*>(dbase + o_miss);
-    dev_.codes = reinterpret_cast<std::int8_t*>(dbase + o_codes);
-    dev_.deltas = reinterpret_cast<float*>(dbase + o_deltas);
-    dev_.sums = reinterpret_cast<std::int32_t*>(dbase + o_sums);
-    dev_.status = reinterpret_cast<std::uint32_t*>(dbase + o_status);
-    dev_.rawdots = reinterpret_cast<float*>(dbase + o_raw);
-    dev_.state = state_;
-    dev_.hidden = layout.hidden;
-    dev_.top_k = layout.top_k;
-    dev_.experts = layout.experts;
-    dev_.max_rows = layout.max_rows;
+    try {
+        ck(cudaHostAlloc(reinterpret_cast<void**>(&host_base_), host_bytes_, cudaHostAllocMapped | cudaHostAllocPortable), "exchange alloc");
+        std::memset(host_base_, 0, host_bytes_);
+        std::uint8_t* dbase = nullptr;
+        ck(cudaHostGetDevicePointer(reinterpret_cast<void**>(&dbase), host_base_, 0), "exchange device pointer");
+        host_published_ = reinterpret_cast<std::uint64_t*>(host_base_ + o_pub);
+        host_done_ = reinterpret_cast<std::uint64_t*>(host_base_ + o_done);
+        host_header_ = reinterpret_cast<std::uint32_t*>(host_base_ + o_header);
+        host_miss_ = reinterpret_cast<Miss*>(host_base_ + o_miss);
+        host_codes_ = reinterpret_cast<std::int8_t*>(host_base_ + o_codes);
+        host_deltas_ = reinterpret_cast<float*>(host_base_ + o_deltas);
+        host_sums_ = reinterpret_cast<std::int32_t*>(host_base_ + o_sums);
+        host_status_ = reinterpret_cast<std::uint32_t*>(host_base_ + o_status);
+        host_rawdots_ = reinterpret_cast<float*>(host_base_ + o_raw);
+        require_budget(sizeof(DevState), "exchange state");
+        ck(cudaMalloc(reinterpret_cast<void**>(&state_), sizeof(DevState)), "state alloc");
+        ck(cudaMemset(state_, 0, sizeof(DevState)), "state clear");
+        dev_.seq_published = reinterpret_cast<volatile std::uint64_t*>(dbase + o_pub);
+        dev_.seq_done = reinterpret_cast<volatile std::uint64_t*>(dbase + o_done);
+        dev_.header = reinterpret_cast<std::uint32_t*>(dbase + o_header);
+        dev_.miss = reinterpret_cast<Miss*>(dbase + o_miss);
+        dev_.codes = reinterpret_cast<std::int8_t*>(dbase + o_codes);
+        dev_.deltas = reinterpret_cast<float*>(dbase + o_deltas);
+        dev_.sums = reinterpret_cast<std::int32_t*>(dbase + o_sums);
+        dev_.status = reinterpret_cast<std::uint32_t*>(dbase + o_status);
+        dev_.rawdots = reinterpret_cast<float*>(dbase + o_raw);
+        dev_.state = state_;
+        dev_.hidden = layout.hidden;
+        dev_.top_k = layout.top_k;
+        dev_.experts = layout.experts;
+        dev_.max_rows = layout.max_rows;
+    } catch (...) {
+        if (state_) cudaFree(state_);
+        if (host_base_) cudaFreeHost(host_base_);
+        throw;
+    }
 }
 
 Exchange::~Exchange() {

@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <numeric>
+#include <limits>
 #include <stdexcept>
 
 namespace strix::residency {
@@ -53,11 +54,44 @@ std::string num(double v) {
 }
 }  // namespace
 
+std::uint64_t grouped_bytes(std::uint64_t positions, std::uint32_t group, std::uint64_t bytes) {
+    if (!group) throw std::invalid_argument("residency: zero storage group");
+    const auto groups = positions / group + (positions % group != 0);
+    if (bytes && groups > std::numeric_limits<std::uint64_t>::max() / bytes)
+        throw std::overflow_error("residency: storage size overflow");
+    return groups * bytes;
+}
+
+std::uint64_t session_bytes(const SessionBytes& s, std::uint32_t positions) {
+    return grouped_bytes(positions, 1, s.per_position) + grouped_bytes(positions, s.group_size, s.per_group) + s.fixed;
+}
+
+void validate_expert_tensor(const std::vector<std::uint64_t>& dims, std::uint64_t bytes,
+                            std::uint64_t input, std::uint64_t output, std::uint64_t experts,
+                            std::uint64_t block_elements, std::uint64_t block_bytes) {
+    if (dims != std::vector<std::uint64_t>{input, output, experts} || !input || !output || !experts ||
+        !block_elements || !block_bytes || input % block_elements)
+        throw std::invalid_argument("residency: expert tensor shape or block geometry mismatch");
+    auto expected = input / block_elements;
+    for (const auto factor : {output, experts, block_bytes}) {
+        if (expected > std::numeric_limits<std::uint64_t>::max() / factor)
+            throw std::overflow_error("residency: expert tensor size overflow");
+        expected *= factor;
+    }
+    if (bytes != expected) throw std::invalid_argument("residency: expert tensor byte size mismatch");
+}
+
+bool allocation_fits(std::uint64_t budget, std::uint64_t initial_free, std::uint64_t free_now, std::uint64_t bytes) {
+    const auto used = initial_free > free_now ? initial_free - free_now : 0;
+    return bytes <= free_now && (!budget || (used <= budget && bytes <= budget - used));
+}
+
 bool parse_flag(std::string_view arg, const std::function<std::string()>& next, Options& out) {
     if (arg == "--expert-residency") {
         const std::string v = next();
         if (!parse_mode(v, out.mode))
             throw std::invalid_argument("--expert-residency: expected auto|full|tiered, got '" + v + "'");
+        out.mode_explicit = true;
         return true;
     }
     if (arg == "--vram-budget-gib") {
@@ -69,7 +103,7 @@ bool parse_flag(std::string_view arg, const std::function<std::string()>& next, 
 }
 
 Options with_environment(Options in) {
-    if (in.mode == Mode::automatic) {
+    if (!in.mode_explicit && in.mode == Mode::automatic) {
         if (const char* v = envcfg::text("STRIX_EXPERT_RESIDENCY"); v && *v) {
             if (!parse_mode(v, in.mode))
                 throw std::invalid_argument(std::string("STRIX_EXPERT_RESIDENCY: expected auto|full|tiered, got '") + v + "'");
@@ -98,10 +132,11 @@ Decision resolve(const Options& opt, const ModelBytes& m, const CardBytes& card,
     const std::uint64_t zero_all = std::accumulate(m.expert_bytes.begin(), m.expert_bytes.end(), std::uint64_t{0});
     const std::uint64_t experts_all = zero_all * m.experts;
     auto sessions = [&](std::uint32_t pos) {
-        return std::uint64_t{s.sessions} * (s.per_position * pos + s.fixed);
+        return std::uint64_t{s.sessions} * session_bytes(s, pos);
     };
     const std::uint64_t fixed_cost = m.core + s.scratch + s.margin;
-    const std::uint64_t need_full = fixed_cost + experts_all + sessions(s.positions);
+    const auto scratch = [&](std::uint32_t pos) { return s.position_scratch ? s.position_scratch(pos) : 0ULL; };
+    const std::uint64_t need_full = fixed_cost + scratch(s.positions) + experts_all + sessions(s.positions);
     d.session_total = sessions(s.positions);
 
     const bool fits = need_full <= d.budget;
@@ -130,8 +165,8 @@ Decision resolve(const Options& opt, const ModelBytes& m, const CardBytes& card,
     }
     bool found = false;
     for (std::uint32_t pos : tries) {
-        const std::uint64_t used = fixed_cost + zero_all + sessions(pos);
-        if (used <= d.budget) {
+        const std::uint64_t used = fixed_cost + scratch(pos) + zero_all + sessions(pos);
+        if (used <= d.budget && zero_all <= d.budget - used) {
             d.positions = pos;
             d.session_total = sessions(pos);
             d.expert_pool = d.budget - used;
@@ -141,10 +176,10 @@ Decision resolve(const Options& opt, const ModelBytes& m, const CardBytes& card,
     }
     if (!found) {
         const std::uint32_t pos = tries.back();
-        const std::uint64_t used = fixed_cost + zero_all + sessions(pos);
+        const std::uint64_t used = fixed_cost + scratch(pos) + 2 * zero_all + sessions(pos);
         d.positions = pos;
         d.session_total = sessions(pos);
-        d.error = "tiered does not fit: core+scratch+margin+zero experts+" + std::to_string(pos) + " positions need " +
+        d.error = "tiered does not fit: core+scratch+margin+zero and resident experts+" + std::to_string(pos) + " positions need " +
                   gib(used) + " GiB, budget " + gib(d.budget) + " GiB";
         d.reason = d.error;
         return d;

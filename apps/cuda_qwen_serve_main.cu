@@ -676,7 +676,7 @@ int main(int argc, char** argv) {
     // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
     strix::device::bind_cuda_main(argc, argv);
     try {
-        const auto o = parse(argc, argv);
+        auto o = parse(argc, argv);
         if (o.print_effective_config) {
             // No model load: the residency decision from the GGUF headers and the live card/host numbers.
             const auto plan = qp::plan_residency(o.engine);
@@ -686,6 +686,7 @@ int main(int argc, char** argv) {
         }
         std::cerr << "strix-cuda-qwen-serve: loading " << o.engine.model_gguf << std::endl;
         qp::Prefill engine(o.engine);
+        o.engine.max_positions = engine.max_positions();  // resolved limit for admission, cache and capabilities
         std::cerr << "strix-cuda-qwen-serve: loaded " << engine.describe() << std::endl;
         const auto tokenizer = serve::BpeTokenizer::load_gguf(o.engine.model_gguf);
         serve::ApiConfig config;

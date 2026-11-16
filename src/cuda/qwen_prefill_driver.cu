@@ -27,6 +27,7 @@
 #include "strix/cuda_qwen_transcode.hpp"
 #include "strix/gguf_reader.hpp"
 #include "qwen_tier_adapter.hpp"
+#include <filesystem>
 #include "strix/cuda_vram_guard.hpp"
 
 #include "qwen_amd_math_tables.hpp"
@@ -135,6 +136,7 @@ struct Weights {
 
 template <class T> T* dev_alloc(std::uint64_t count, const char* what) {
     void* p = nullptr;
+    tiered::require_budget(std::max<std::uint64_t>(count, 1) * sizeof(T), what);
     strix::cuda::require_vram(std::max<std::uint64_t>(count, 1) * sizeof(T), what);
     ck(cudaMalloc(&p, std::max<std::uint64_t>(count, 1) * sizeof(T)), what);
     return static_cast<T*>(p);
@@ -337,6 +339,7 @@ struct Prefill::Impl : BlockFields {
     // Tiered expert residency (null = fully resident: today's route, nothing below is touched)
     ResidencyPlan plan;
     std::unique_ptr<QwenTier> tier;
+    std::uint32_t tier_prefill_failure = 0;       // sticky until engine destruction
     std::uint32_t* tier_routes = nullptr;          // tiered: slot routes [cap][kTopK] the routed kernels read
     std::uint64_t engine_bytes = 0;                // device bytes held once loaded (measured)
     void tier_step_end(std::uint64_t filled);      // between steps (stream synchronized): planner + expert moves;
@@ -493,6 +496,7 @@ void Prefill::Impl::upload_model() {
             if (scratch_bytes < t.byte_size) {
                 ck(cudaStreamSynchronize(stream), "scratch reuse");
                 if (scratch) cudaFree(scratch);
+                tiered::require_budget(t.byte_size, "transcode scratch");
                 strix::cuda::require_vram(t.byte_size, "transcode scratch");
                 ck(cudaMalloc(&scratch, t.byte_size), "transcode scratch");
                 scratch_bytes = t.byte_size;
@@ -696,6 +700,7 @@ void Prefill::Impl::upload_draft() {
 // The BlockFields buffers for blocks of up to `rows` rows (the current BlockFields set). qsa_chunk: rows per QSA chunk
 // of the attention workspace (the same for every set, so the chunking never differs between sets).
 void Prefill::Impl::allocate_block(std::uint32_t rows, std::uint32_t qsa_chunk, bool engine_set) {
+    const tiered::AllocationBudget budget(plan.card.free, plan.decision.budget);
     cap = rows;
     const std::uint64_t R = cap;
     ids = dev_zero<std::uint32_t>(R, "ids");
@@ -710,6 +715,7 @@ void Prefill::Impl::allocate_block(std::uint32_t rows, std::uint32_t qsa_chunk, 
     codes = dev_zero<std::int8_t>(R * 6144, "a8 codes");
     deltas = dev_zero<float>(R * (6144 / 32), "a8 deltas");
     gdn_rows = dev_zero<float>(R * gdn_stride, "gdn rows");
+    tiered::require_budget(std::max(gdn::core_scratch_bytes(cap), gdn::multi_scratch_bytes()), "gdn scratch");
     strix::cuda::require_vram(std::max(gdn::core_scratch_bytes(cap), gdn::multi_scratch_bytes()), "gdn scratch");
     ck(cudaMalloc(&gdn_scratch, std::max(gdn::core_scratch_bytes(cap), gdn::multi_scratch_bytes())), "gdn scratch");
     q_gate = dev_zero<float>(R * qsa::kQGateWidth, "q gate");
@@ -718,6 +724,7 @@ void Prefill::Impl::allocate_block(std::uint32_t rows, std::uint32_t qsa_chunk, 
     index_q = dev_zero<float>(R * qsa::kIndexQWidth, "index q");
     index_k = dev_zero<float>(R * qsa::kIndexDim, "index k");
     attn_out = dev_zero<float>(R * qsa::kAttnWidth, "attention out");
+    tiered::require_budget(qsa::workspace_bytes(qsa_chunk, cfg.max_positions), "qsa workspace");
     qws = qsa::allocate_workspace(qsa_chunk, cfg.max_positions);
     logits = dev_zero<float>(R * kExperts, "router logits");
     routes = dev_zero<std::uint32_t>(R * kTopK, "routes");
@@ -761,6 +768,7 @@ void Prefill::Impl::allocate_block(std::uint32_t rows, std::uint32_t qsa_chunk, 
     ple_gates = dev_zero<float>(R * 4, "ple gates");
     ple_status = dev_zero<std::uint32_t>(1, "ple status");
     if (mtp) {
+        tiered::require_budget(pm::mtp_workspace_bytes(cap), "mtp workspace");
         strix::cuda::require_vram(pm::mtp_workspace_bytes(cap), "mtp workspace");
         ck(cudaMalloc(&mtp_ws, pm::mtp_workspace_bytes(cap)), "mtp workspace");
         mtp_next = dev_zero<std::uint32_t>(R, "mtp next");
@@ -797,11 +805,14 @@ void Prefill::Impl::allocate() {
 
 // The per-session device state (same buffers and sizes the single-session engine allocated).
 SessionState& Prefill::Impl::new_session() {
+    const tiered::AllocationBudget budget(plan.card.free, plan.decision.budget);
+    tiered::require_budget(residency::session_bytes(plan.session, cfg.max_positions), "session");
     auto s = std::make_unique<SessionState>();
     s->id = next_session++;
     const std::uint64_t P = cfg.max_positions;
     const auto alloc = [&](std::uint64_t bytes, const char* what) {
         void* p = nullptr;
+        tiered::require_budget(std::max<std::uint64_t>(bytes, 1), what);
         strix::cuda::require_vram(std::max<std::uint64_t>(bytes, 1), what);
         ck(cudaMalloc(&p, std::max<std::uint64_t>(bytes, 1)), what);
         s->allocations.push_back(p);
@@ -812,7 +823,7 @@ SessionState& Prefill::Impl::new_session() {
         for (std::uint32_t o = 0; o < 12; ++o) {
             s->kv.push_back(static_cast<std::uint16_t*>(alloc(P * 1024 * 2, "kv")));
             s->raw_index.push_back(static_cast<std::uint16_t*>(alloc(P * 128 * 2, "raw index")));
-            s->pooled.push_back(static_cast<float*>(alloc((P + 3) / 4 * 128 * 4, "pooled index keys")));
+            s->pooled.push_back(static_cast<float*>(alloc(residency::grouped_bytes(P, 4, 128 * 4), "pooled index keys")));
         }
         s->gdn_state = static_cast<float*>(alloc(36 * gdn::kMatrixFloats * 4, "gdn state"));
         s->gdn_base = s->gdn_state;  // graph key parity: which of the two buffers is current
@@ -825,7 +836,7 @@ SessionState& Prefill::Impl::new_session() {
         }
         if (mtp) {
             s->mtp_kv = static_cast<std::uint16_t*>(alloc(P * 1024 * 2, "mtp kv"));
-            s->mtp_pooled = static_cast<float*>(alloc((P + 3) / 4 * 128 * 4, "mtp pooled keys"));
+            s->mtp_pooled = static_cast<float*>(alloc(residency::grouped_bytes(P, 4, 128 * 4), "mtp pooled keys"));
             s->mtp_index = static_cast<std::uint16_t*>(alloc(P * 128 * 2, "mtp index"));
             if (cfg.decode) s->held = static_cast<std::uint16_t*>(alloc(kWide * 2, "held row"));
         }
@@ -865,6 +876,7 @@ ResidencyPlan plan_residency(const Config& config) {
     m.experts = kExperts;
     m.top_k = kTopK;
     m.expert_bytes.assign(kLayers, 0);
+    std::vector<unsigned> expert_kinds(kLayers, 0);
     for (const auto& part : model_parts(config.model_gguf)) {
         for (const auto& t : gguf::read_file(part).tensors) {
             if (t.name.rfind("per_layer_token_embd", 0) == 0) { m.host_tables += t.byte_size; continue; }
@@ -872,7 +884,16 @@ ResidencyPlan plan_residency(const Config& config) {
             if (t.name.find("_exps.") != std::string::npos) {
                 if (t.name.rfind("blk.", 0) == 0) {
                     const auto layer = static_cast<std::uint32_t>(std::stoul(t.name.substr(4)));
-                    if (layer < kLayers) m.expert_bytes[layer] += t.byte_size / kExperts;
+                    if (layer < kLayers) {
+                        const auto kind = t.name.find("ffn_gate_exps") != std::string::npos ? 0U
+                            : t.name.find("ffn_up_exps") != std::string::npos ? 1U
+                            : t.name.find("ffn_down_exps") != std::string::npos ? 2U : 3U;
+                        if (kind == 3U || (expert_kinds[layer] & (1U << kind)))
+                            throw std::invalid_argument("residency: unknown or duplicate expert tensor");
+                        validate_qwen_expert(t, kind, kHidden, 640U, kExperts);
+                        expert_kinds[layer] |= 1U << kind;
+                        m.expert_bytes[layer] += t.byte_size / kExperts;
+                    }
                 }
                 continue;
             }
@@ -881,6 +902,8 @@ ResidencyPlan plan_residency(const Config& config) {
                     : target == Target::q8_0 ? transcode::q8_0_bytes(elements_of(t)) : elements_of(t) * 4U;
         }
     }
+    if (std::any_of(expert_kinds.begin(), expert_kinds.end(), [](unsigned kinds) { return kinds != 7U; }))
+        throw std::invalid_argument("residency: missing expert tensor");
     const bool mtp = !config.mtp_sidecar_gguf.empty();
     if (mtp) {
         for (const auto& t : gguf::read_file(config.mtp_sidecar_gguf).tensors) m.mtp_head += t.byte_size;
@@ -892,17 +915,29 @@ ResidencyPlan plan_residency(const Config& config) {
     r.host.available = host_available_bytes();
     auto& s = r.session;
     s.per_position = (12ULL + (mtp ? 1ULL : 0ULL)) * (2048 + 256);
-    s.fixed = 36ULL * gdn::kMatrixFloats * sizeof(float) + 36ULL * gdn::kConvStateHalfs * 2 + 10240ULL * 9 * 2 + 8;
+    s.per_group = (12ULL + (mtp ? 1ULL : 0ULL)) * 128 * 4;
+    s.group_size = 4;
+    s.fixed = (config.decode ? 2ULL : 1ULL) *
+        (36ULL * gdn::kMatrixFloats * sizeof(float) + 36ULL * gdn::kConvStateHalfs * 2 + 10240ULL * 9 * 2);
+    if (mtp && config.decode) s.fixed += kWide * 2;
     s.margin = 512ULL << 20;
     s.sessions = 1;
     s.positions = config.max_positions;
     const std::uint32_t full_rows = round_up(*std::max_element(config.block_schedule.begin(), config.block_schedule.end()), 16U);
     s.scratch = scratch_estimate(full_rows);
     r.block_rows = full_rows;
+    s.position_scratch = [full_rows](std::uint32_t positions) {
+        return qsa::workspace_bytes(std::min(full_rows, 1024U), positions) +
+            std::uint64_t{positions} * qsa::kRotaryPairs * sizeof(qsa::RopeTable);
+    };
     r.decision = strix::residency::resolve(config.residency, m, r.card, s, r.host);
     if (r.decision.mode == strix::residency::Mode::tiered) {
         // the tiered route runs blocks of the exchange's rows: its scratch is smaller, so the pool is re-sized with it
         s.scratch = scratch_estimate(kTierRows);
+        s.position_scratch = [](std::uint32_t positions) {
+            return qsa::workspace_bytes(kTierRows, positions) +
+                std::uint64_t{positions} * qsa::kRotaryPairs * sizeof(qsa::RopeTable);
+        };
         r.block_rows = kTierRows;
         auto forced = config.residency;
         forced.mode = strix::residency::Mode::tiered;
@@ -912,7 +947,7 @@ ResidencyPlan plan_residency(const Config& config) {
     if (!json.empty() && json.back() == '}') json.pop_back();
     r.json = json + ",\"card_total_bytes\":" + std::to_string(total_bytes) + ",\"card_free_bytes\":" + std::to_string(free_bytes) +
              ",\"model_core_bytes\":" + std::to_string(m.core) + ",\"host_available_bytes\":" + std::to_string(r.host.available) +
-             ",\"scratch_estimate_bytes\":" + std::to_string(s.scratch) + ",\"block_rows\":" + std::to_string(r.block_rows) + "}";
+             ",\"scratch_estimate_bytes\":" + std::to_string(s.scratch + s.position_scratch(r.decision.positions)) + ",\"block_rows\":" + std::to_string(r.block_rows) + "}";
     return r;
 }
 
@@ -952,6 +987,7 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
     // the card keeps a slot pool of the hot ones, blocks are capped to the exchange's rows, the position limit may shrink.
     m.plan = plan_residency(m.cfg);
     if (!m.plan.decision.ok) throw std::runtime_error("expert residency: " + m.plan.decision.error);
+    const tiered::AllocationBudget budget(m.plan.card.free, m.plan.decision.budget);
     if (m.plan.decision.mode == strix::residency::Mode::tiered) {
         if (m.route_policy.enabled)
             throw std::runtime_error("expert residency: tiered declines BF16 route storage (the host gather writes FP32 raw dots; "
@@ -993,6 +1029,13 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
             ck(cudaEventCreateWithFlags(&m.side_join, cudaEventDisableTiming), "side event");
         }
     }
+    // The table loader uploads at most its six input files plus the small exp2 table.
+    // Reserve that upper bound before entering its internal allocator.
+    std::uint64_t table_bytes = 4096;
+    for (const char* name : {"hard_v_exp_f32.bin", "hard_v_rsq_f32.bin", "hard_v_rcp_f32.bin",
+                             "tbl_exp_pm.bin", "tbl_rsq_1_4.bin", "tbl_rcp_1_2.bin"})
+        table_bytes += std::max<std::uint64_t>(8, std::filesystem::file_size(config.tables_dir + "/" + name));
+    tiered::require_budget(table_bytes, "arithmetic tables");
     m.tables = am::load_tables(config.tables_dir);
     {
         std::FILE* f = std::fopen(config.rope_table.c_str(), "rb");
@@ -1069,7 +1112,7 @@ std::string Prefill::residency_receipt_json() const {
     if (!impl_->tier) return "{\"expert_residency\":\"full\"}";
     return impl_->tier->receipt_json();
 }
-std::uint64_t Prefill::card_budget_bytes() const { return impl_->tier ? impl_->plan.decision.budget : 0ULL; }
+std::uint64_t Prefill::card_budget_bytes() const { return impl_->cfg.residency.vram_budget || impl_->tier ? impl_->plan.decision.budget : 0ULL; }
 std::uint64_t Prefill::engine_device_bytes() const { return impl_->engine_bytes; }
 
 qwen_route::Identity Prefill::numerical_identity() const {
@@ -1078,6 +1121,10 @@ qwen_route::Identity Prefill::numerical_identity() const {
 qwen_route::Policy Prefill::route_storage_policy() const { return impl_->route_policy; }
 
 void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint32_t pad) {
+    if (tier_prefill_failure) {
+        for (std::uint32_t i = 0; i < count; ++i) poison(*seg[i].s);
+        throw std::runtime_error("prefill: tiered exchange is poisoned; recreate engine");
+    }
     NvtxScope nv;
     std::uint32_t rows = 0;  // all rows of the block
     for (std::uint32_t i = 0; i < count; ++i) {
@@ -1307,6 +1354,21 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
             mr.routes = {tier_routes, kTopK * 4};
             moe::enqueue_routed(mr, pad, ew, tables, stream);
             tier->wait_gather(rows, moe_raw, mr.rawdots.stride, moe_status, mr.status.stride, csr.summary, stream);
+            if (!window) {
+                // Read every layer before its summary is cleared by the next prologue. No failed
+                // prefill may publish state or reuse a possibly poisoned exchange.
+                std::uint32_t failure = 0;
+                try {
+                    ck(cudaMemcpyAsync(&failure, csr.summary, sizeof(failure), cudaMemcpyDeviceToHost, stream), "prefill MoE status");
+                    ck(cudaStreamSynchronize(stream), "prefill MoE status");
+                    tier_prefill_failure |= failure;
+                    if (tier_prefill_failure) throw std::runtime_error("prefill: tiered expert worker or watchdog failure");
+                } catch (...) {
+                    tier_prefill_failure |= 8U;
+                    for (std::uint32_t i = 0; i < count; ++i) poison(*seg[i].s);
+                    throw;
+                }
+            }
             moe::enqueue_combine(mr, pad, nullptr, stream);
         }
         nv.pop();
@@ -2316,7 +2378,7 @@ std::uint64_t Prefill::prefill_chunk(SessionId session, const std::vector<std::u
     if (from != 0 && from != S.length) throw std::invalid_argument("prefill chunk does not continue the session");
     const auto rows = m.prefill_enqueue(S, tokens, position, from, max_rows);
     ck(cudaStreamSynchronize(m.stream), "prefill chunk");
-    if (m.tier) m.tier_step_end(position);
+    if (m.tier) m.tier_step_end(from + rows);
     S.length = from + rows;
     return S.length;
 }

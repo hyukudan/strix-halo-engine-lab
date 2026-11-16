@@ -277,7 +277,7 @@ public:
     [[nodiscard]] bool tiered() const;
     [[nodiscard]] std::string residency_json() const;
     [[nodiscard]] std::string residency_receipt_json() const;
-    // Card budget the engine was sized for (tiered: the decision's budget; 0 = whole card, fully resident) and the
+    // Resolved card budget (tiered or an explicit cap, including full mode; 0 = full mode without an explicit cap) and the
     // device bytes it holds once loaded (measured): a server admits sessions against budget - engine bytes.
     [[nodiscard]] std::uint64_t card_budget_bytes() const;
     [[nodiscard]] std::uint64_t engine_device_bytes() const;

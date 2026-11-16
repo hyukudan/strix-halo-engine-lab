@@ -56,6 +56,12 @@ bool throws(const std::vector<std::string>& args) {
 int main() {
     set_env("STRIX_EXPERT_RESIDENCY", "");
     set_env("STRIX_VRAM_BUDGET_GIB", "");
+    for (const char* mode : {"full", "tiered"}) {
+        set_env("STRIX_EXPERT_RESIDENCY", mode);
+        REQUIRE(finish_cli(serve_loop({"--expert-residency", "auto"})).mode == Mode::automatic);
+        REQUIRE(finish_cli(bench_tail({"--expert-residency", "auto"})).mode == Mode::automatic);
+    }
+    set_env("STRIX_EXPERT_RESIDENCY", "");
     const std::vector<std::vector<std::string>> cases = {
         {}, {"--expert-residency", "full"}, {"--expert-residency", "tiered", "--vram-budget-gib", "12"},
         {"--vram-budget-gib", "7.5"}, {"--expert-residency", "auto", "--vram-budget-gib", "24"}, {"--print-effective-config"}};

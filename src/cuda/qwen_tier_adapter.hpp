@@ -24,6 +24,15 @@
 
 namespace strix::cuda::qwen_prefill {
 
+// Model-specific layout; checked byte arithmetic belongs to shared residency code.
+inline void validate_qwen_expert(const gguf::TensorInfo& t, std::uint32_t kind,
+                                 std::uint32_t hidden, std::uint32_t ffn, std::uint32_t experts) {
+    const auto geometry = gguf::tensor_type_geometry(t.ggml_type);
+    if (!geometry) throw std::invalid_argument("tiered residency: unsupported expert format");
+    residency::validate_expert_tensor(t.dimensions, t.byte_size, kind == 2U ? ffn : hidden,
+        kind == 2U ? hidden : ffn, experts, geometry->block_elements, geometry->block_bytes);
+}
+
 // Physical RAM the process could still use (Windows: available = free + standby cache; POSIX: _SC_AVPHYS_PAGES).
 inline std::uint64_t host_available_bytes() {
 #if defined(_WIN32)
@@ -63,6 +72,9 @@ public:
                     : t.name.find("ffn_up_exps") != std::string::npos ? 1U
                     : t.name.find("ffn_down_exps") != std::string::npos ? 2U : 3U;
                 if (kind == 3U) continue;
+                validate_qwen_expert(t, kind, L.hidden, L.ffn, L.experts);
+                if (stored_[std::size_t{layer} * 3U + kind].found)
+                    throw std::invalid_argument("tiered residency: duplicate expert tensor");
                 stored_[std::size_t{layer} * 3U + kind] = {p, t.absolute_offset, t.byte_size, t.ggml_type, true};
                 any = true;
             }
@@ -128,12 +140,14 @@ public:
             for (std::uint32_t k = 0; k < 3U; ++k) {
                 const std::uint64_t bytes = per_expert_[std::size_t{l} * 3U + k] * (std::uint64_t{slots()} + 1U);
                 std::uint8_t* p = nullptr;
+                tiered::require_budget(bytes, "expert slot");
                 ck(cudaMalloc(reinterpret_cast<void**>(&p), bytes), "slot buffer");
                 ck(cudaMemset(p, 0, bytes), "slot clear");
                 buffers_.push_back(p);
                 slot_[std::size_t{l} * 3U + k] = p;
                 resident += bytes;
             }
+        tiered::require_budget(std::uint64_t{n} * L.experts * 8U, "expert tables");
         ck(cudaMalloc(reinterpret_cast<void**>(&table_), std::uint64_t{n} * L.experts * 4U), "table");
         ck(cudaMemset(table_, 0xFF, std::uint64_t{n} * L.experts * 4U), "table clear");
         buffers_.push_back(table_);
