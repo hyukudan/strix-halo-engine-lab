@@ -95,7 +95,11 @@ void enqueue_project(const Rows&, std::uint32_t rows, const Weights&, const amdm
 void enqueue_down(const Rows&, std::uint32_t rows, const Weights&, cudaStream_t, bool moe_mma = false);
 void enqueue_merge(const Rows&, std::uint32_t rows, cudaStream_t);
 void enqueue_commit(const Rows&, std::uint32_t rows, std::uint32_t* record, cudaStream_t);
-// Returns whether candidate MMA arithmetic was dispatched (native experts fall back).
+// enqueue() = prologue + routed (csr, project, down; the native FAST branch included) + combine (merge, commit):
+// tiered residency (strix/cuda/tiered_experts.hpp) runs its publish/gather kernels between these parts.
+// enqueue_routed() and enqueue() return whether candidate MMA arithmetic was dispatched (native experts fall back).
+bool enqueue_routed(const Rows&, std::uint32_t rows, const Weights&, const amdmath::Tables&, cudaStream_t, bool moe_mma = false);
+void enqueue_combine(const Rows&, std::uint32_t rows, std::uint32_t* record, cudaStream_t);
 bool enqueue(const Rows&, std::uint32_t rows, std::uint32_t clear_words, const Weights&, const amdmath::Tables&,
              std::uint32_t* record, cudaStream_t, bool moe_mma = false);
 // True when the expert types are not the A8 profile's (gate Q4_K/Q5_K with down Q5_1/Q8_0): enqueue() then runs the native

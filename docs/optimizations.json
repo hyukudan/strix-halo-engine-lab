@@ -2767,6 +2767,28 @@
   },
   {
     "engine": "glm",
+    "name": "Exact MLA absorb / out GEMM heads-mid CTA order (glm-pf-mla-gemm-heads)",
+    "flag_or_env": "STRIX_GLM_PF_MLA_GEMM_HEADS",
+    "default": "on (exact and FAST routes)",
+    "exact": "bitwise (placement only; prefill tests STRIX_GLM_PF_TEST_ONLY=mla 48 checks, v3 == v1 explicit arms and v3 == v2)",
+    "gain": "layer bench C 4096 t0 4096 us/row exact arm: absorb 2.38 -> 1.16, out 2.16 -> 2.01; pair e2e exact 8K one pair warm 12.24 / 12.52 s, cold 12.99 / 12.73 s (off / on): inside noise, rebased ABAB pending",
+    "preconditions": "mla_gemm_rows_v3 (default GEMM version 3)",
+    "off_switch": "STRIX_GLM_PF_MLA_GEMM_HEADS=0",
+    "doc_anchor": "docs/optimizations.md#glm-pf-mla-gemm-heads"
+  },
+  {
+    "engine": "glm",
+    "name": "FAST MLA absorb / out GEMMs on the shared FP16 WMMA tile core (glm-pf-mla-wmma-v1)",
+    "flag_or_env": "STRIX_GLM_PF_MLA_WMMA, STRIX_GLM_PF_MLA_OB16",
+    "default": "on in FAST prefill (STRIX_GLM_PF_WMMA=1); off in exact mode",
+    "exact": "FAST identity (FP16-rounded activations, WMMA FP32 accumulation, one chain per output ascending in k); gate vs FAST without it KL 0.0053 / top-1 98.2 % / dNLL -0.0002, vs exact KL 0.0048 / 97.5 % / -0.0045 (1,536 rows prose / code / chat); the bf16 q-tilde image is bitwise to the operand conversion it replaces (the opt-in FP16 o-bar image is not bitwise at C 4096)",
+    "gain": "layer bench C 4096 us/row FAST arm absorb + o-bar + out 9.171 -> 7.938 (-5.0 ms per call, 22 calls per rank at 8K; o-bar image alone -2.6 ms per call over 4 ABAB pairs); pair FAST 8K (pre-#668 base, 3 strict ABAB pairs, against FAST without it) warm 8.504 -> 8.399 s (-1.2 %, 963 -> 975 tok/s), cold 9.847 -> 9.489 s (-3.6 %); rebased (with both images) ABAB pending",
+    "preconditions": "fused attn-wmma MLA core or the MLA DSA path, heads 32 / 64, rows >= 1; 16-byte aligned buffers",
+    "off_switch": "STRIX_GLM_PF_MLA_WMMA=0 (or exact mode); STRIX_GLM_PF_MLA_OB16 default off (opt-in =1 FP16 o-bar image: not bitwise at C 4096, no e2e gain)",
+    "doc_anchor": "docs/optimizations.md#glm-pf-mla-wmma"
+  },
+  {
+    "engine": "glm",
     "name": "FAST fused MLA/DSA attention core (glm-pf-attn-wmma)",
     "flag_or_env": "STRIX_GLM_PF_ATTN_WMMA",
     "default": "on in FAST prefill (STRIX_GLM_PF_WMMA=1); off in exact mode",

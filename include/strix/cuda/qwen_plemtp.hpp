@@ -128,7 +128,8 @@ struct MtpRounding {
 // bit 3 a non-finite or BF16-overflowing cache value (validate_mtp_cache_casts; the row is then not stored).
 void launch_mtp_cache_rows(const MtpWeights& w, const MtpRounding& rounding, const std::uint16_t* hidden,
     const std::uint32_t* next_tokens, std::uint32_t rows, std::uint64_t position0, std::uint16_t* kv, std::uint16_t* raw_index,
-    void* workspace, std::uint32_t* status, const amdmath::Tables& tables, cudaStream_t stream);
+    void* workspace, std::uint32_t* status, const amdmath::Tables& tables, cudaStream_t stream,
+    const std::uint64_t* position_dev = nullptr);  // non-null: position0 read from device memory (graph replays)
 
 // The fused Q4 projection alone (tests / timing): normalized [rows][12800] FP32 -> fused [rows][10240] BF16.
 void launch_mtp_fused_projection(const float* normalized, const void* eh_q4, std::uint32_t rows, std::uint16_t* fused,
