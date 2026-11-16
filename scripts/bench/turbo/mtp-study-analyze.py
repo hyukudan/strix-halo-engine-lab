@@ -34,7 +34,7 @@ def load_run(path):
         row = dict(re.findall(r'(\w+)=([^ ]+)', line))
         i, request = locate(int(row['ns']))
         if request is None:
-            continue
+            raise ValueError('unresolved verification timestamp attribution')
         row = {k: float(v) if k == 'p' else int(v) for k, v in row.items()}
         group = (i, row['ns'], row['at'])
         depth, prefix = prefixes.get(group, (1, True))
@@ -58,8 +58,8 @@ def load_run(path):
                      independently_expected_accept=expected,
                      eligible=row.get('eligible', 1), diagnostic=row.get('diagnostic', 0),
                      accounting_gap=(row['accepted'] - expected) if not row.get('diagnostic', 0) else 0)
-    for i, rows in comparisons.items():
-        if sum(row['accepted'] for row in rows) != requests[i]['acc']:
+    for i, request in enumerate(requests):
+        if sum(row['accepted'] for row in comparisons[i]) != request['acc']:
             raise ValueError('verification accepted rows disagree with HTTP accepted-token ledger')
     return requests, locate, comparisons, totals
 
@@ -127,7 +127,7 @@ def indexed_logits(path, run):
         # Only the base input is committed. Later physical rows consume drafts,
         # which may intentionally differ from the eventual completion ledger.
         history = tuple(ids[:input_index]) + tuple(inputs)
-        key = (i, position, row, window_hash, history)
+        key = (i, position, row, window_hash, history, rows)
         if key in out:
             raise ValueError('duplicate scoped logit row')
         out[key] = (values, request, fields)

@@ -186,7 +186,8 @@ inline Environment requested_prefill_environment(Get get) {
             "STRIX_QPF2K_HC_RECOMPUTE_NORM", "STRIX_INTPREFILL_MOE_TUNE", "STRIX_QPF2K_MOE", "STRIX_QPF2K_MOE_SMALL", "STRIX_QPF2K_QSA_BUDGET", "STRIX_QPF2K_MOE_DIRECT_B"})
         if (!(qpf2k::pre_injected_moe_marker && std::string_view(name) == "STRIX_QPF2K_MOE_DEFAULTED"))
             if (const char* value = get(name)) env.emplace(name, value);
-    for (const char* name : {"STRIX_TURBO_ONFLY_GROUPS", "STRIX_TURBO_ONFLY_SCALE"})
+    for (const char* name : {"STRIX_TURBO_ONFLY_GROUPS", "STRIX_TURBO_ONFLY_SCALE",
+            "STRIX_IU4_ROW_REDUCTION", "STRIX_IU4_R8_SINGLE_DECODE"})
         if (const char* value = get(name)) env.emplace(name, value);
     for (const char* name : {"STRIX_BITCALC_LOGITS_OUT", "STRIX_BITCALC_FORCE_TOKENS"})
         if (get(name)) env.emplace(name, "1");
@@ -198,7 +199,7 @@ inline Environment requested_prefill_environment(Get get) {
     return env;
 }
 inline Environment requested_prefill_environment() {
-    return requested_prefill_environment([](const char* name) { return std::getenv(name); });
+    return requested_prefill_environment([](const char* name) { return ::strix::envcfg::text(name); });
 }
 inline void apply_measured_prompt_organization(Options& o) {
     o.q51_slot_parallel_down = true;

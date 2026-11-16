@@ -30,6 +30,37 @@ def run(ids, request_sha='same'):
     return [request], lambda ns: (0, request), {0: []}, {}
 
 class ContextMatching(unittest.TestCase):
+    def test_window_size_is_part_of_strict_matching(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            left, right = Path(tmp) / 'r8.bin', Path(tmp) / 'r1.bin'
+            ids = list(range(5, 13))
+            write_dump(left, [(100, ids)])
+            write_dump(right, [(100, ids[:1])])
+            strict = study.compare_logits(left, right, run(ids), run(ids))
+            self.assertEqual(strict['matched_context_rows'], 0)
+            relaxed = study.compare_logits(left, right, run(ids), run(ids), context_only=True)
+            self.assertEqual(relaxed['matched_context_rows'], 1)
+
+    def test_missing_and_unattributed_verification_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            (path / 'clock-anchor.json').write_text(json.dumps(dict(epoch_ns=0, monotonic_ns=0)))
+            lane = dict(start=0, end=2, lane=0, acc=1)
+            (path / 'res.jsonl').write_text(json.dumps(dict(t0=0, lanes=[lane])) + '\n')
+            (path / 'srv.err').write_text('')
+            with self.assertRaisesRegex(ValueError, 'HTTP accepted-token ledger'):
+                study.load_run(path)
+            lane['acc'] = 0
+            (path / 'res.jsonl').write_text(json.dumps(dict(t0=0, lanes=[lane])) + '\n')
+            self.assertEqual(study.load_run(path)[2][0], [])
+            (path / 'srv.err').write_text('mtp-verify ns=3000000000\n')
+            with self.assertRaisesRegex(ValueError, 'unresolved verification'):
+                study.load_run(path)
+            (path / 'res.jsonl').write_text(json.dumps(dict(t0=0, lanes=[lane, lane])) + '\n')
+            (path / 'srv.err').write_text('mtp-verify ns=1000000000\n')
+            with self.assertRaisesRegex(ValueError, 'unresolved verification'):
+                study.load_run(path)
+
     def test_verification_prefix_and_http_ledger_are_independent(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)

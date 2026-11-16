@@ -126,8 +126,8 @@ template <class Site> bool launch_iu4_rows(const Site& site, hipStream_t stream,
             w.base[m] = t->base;
             blocks += (n + 63U) / 64U;
         }
-        const char* reduction_raw = strix::envcfg::text("STRIX_IU4_ROW_REDUCTION");
-        const auto reduction = core::iu4_rows::resolve_row_reduction(true, reduction_raw ? reduction_raw : "").effective;
+        const auto& execution = core::iu4_rows::execution_policy();
+        const auto reduction = execution.reduction;
         const auto run = [&]<unsigned G, core::iu4_rows::RowReduction Reduction>() {
             constexpr auto plan = iu4_plan(Site::rows, G, Reduction);
             constexpr unsigned S = plan.S, GC = plan.GC;
@@ -139,12 +139,12 @@ template <class Site> bool launch_iu4_rows(const Site& site, hipStream_t stream,
             };
             if constexpr (Site::rows * GC * 128U <= kIu4StageBytes) {  // staged FP16 rows must fit the LDS budget
                 if constexpr (Site::rows >= 7U) {
-                    const char* raw = strix::envcfg::text("STRIX_IU4_R8_SINGLE_DECODE");
-                    const auto policy = core::iu4_rows::resolve_single_decode_policy(true, raw ? raw : "").effective;
+                    const auto policy = execution.single_decode;
                     const unsigned outputs = site.segments.first[site.segments.count] - site.segments.first[0];
                     const bool device_qualified = policy == core::iu4_rows::SingleDecodePolicy::automatic &&
                         core::iu4_rows::measured_single_decode_admitted(Site::rows, G, outputs) && iu4_single_decode_device_qualified();
                     if (core::iu4_rows::single_decode_applies(Site::rows, G, policy, outputs, device_qualified)) {
+                        core::iu4_rows::single_decode_launches.fetch_add(1, std::memory_order_relaxed);
                         if (slot) go(project_rows_iu4_kernel<Site, S, G, GC, true, true>, slot->codes, slot->deltas);
                         else go(project_rows_iu4_kernel<Site, S, G, GC, false, true>, nullptr, nullptr);
                     } else {

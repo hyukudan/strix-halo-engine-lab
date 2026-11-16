@@ -12,9 +12,26 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <optional>
 
 using namespace strix;
 namespace {
+struct ScopedEnvironment {
+    const char* name;
+    std::optional<std::string> old;
+    ScopedEnvironment(const char* key, const char* value) : name(key) {
+        if (const char* previous = envcfg::text(name)) old = previous;
+        set(value);
+    }
+    void set(const char* value) const {
+#ifdef _WIN32
+        if (_putenv_s(name, value ? value : "") != 0) throw std::runtime_error("test environment update failed");
+#else
+        if ((value ? setenv(name, value, 1) : unsetenv(name)) != 0) throw std::runtime_error("test environment update failed");
+#endif
+    }
+    ~ScopedEnvironment() { set(old ? old->c_str() : nullptr); }
+};
 int failures = 0;
 void expect(bool ok, const char* message) {
     if (!ok) { ++failures; std::cerr << "FAIL: " << message << '\n'; }
@@ -262,6 +279,34 @@ int main() {
     expect(decode_cli::effective_config_json(native).find("\"effective\":\"split\",\"enabled\":false,\"reason\":\"native-weights\"") !=
            std::string::npos, "receipt reports native row-decode disabled");
     using Reduction = core::iu4_rows::RowReduction;
+    {
+        const ScopedEnvironment reduction_env("STRIX_IU4_ROW_REDUCTION", "canonical");
+        const ScopedEnvironment single_env("STRIX_IU4_R8_SINGLE_DECODE", "force");
+        for (const char* setting : {"0", "force"}) {
+            single_env.set(setting);
+            const auto captured = decode_cli::requested_prefill_environment();
+            const auto resolved = decode_cli::initialize_prefill_config({
+                options_for({"--profile", "turbo", "--turbo-weights", "onfly"}), captured});
+            const auto& turbo = resolved.options.turbo;
+            expect(turbo.row_reduction.effective == Reduction::canonical &&
+                   turbo.row_decode.effective == core::iu4_rows::parse_single_decode_policy(setting),
+                   "actual startup environment reaches the IU4 resolver");
+            expect(turbo.identity().find("iu4-g64g96-gc32-v1") != std::string::npos &&
+                   decode_cli::effective_prefill_argv(resolved.options) != decode_cli::effective_prefill_argv(cli.options),
+                   "captured canonical policy changes the cache identity");
+            core::iu4_rows::configure_execution_policy({turbo.row_decode.effective, turbo.row_reduction.effective});
+            single_env.set("auto");
+            envcfg::record("STRIX_IU4_R8_SINGLE_DECODE", "auto", "dispatch-must-not-register");
+            for (unsigned i = 0; i < 100U; ++i) {
+                const auto& execution = core::iu4_rows::execution_policy();
+                expect(execution.single_decode == turbo.row_decode.effective && execution.reduction == turbo.row_reduction.effective,
+                       "dispatch policy stays identical to resolved startup despite later environment changes");
+            }
+            for (const auto& entry : envcfg::registered())
+                if (entry.name == "STRIX_IU4_R8_SINGLE_DECODE")
+                    expect(entry.value == "dispatch-must-not-register", "dispatch reads do not rewrite the environment registry");
+        }
+    }
     const auto canonical_cli = decode_cli::initialize_prefill_config({options_for({"--profile", "turbo", "--turbo-weights", "onfly"}),
         {{"STRIX_IU4_ROW_REDUCTION", "canonical"}}});
     const auto canonical_serve = decode_cli::initialize_prefill_config({options_for({"--profile", "turbo", "--turbo-weights", "onfly"}),

@@ -1840,6 +1840,8 @@ static int run_decode_entry(
         }
     }
     strix::decode_cli::require_effective_prefill_execution(effective);
+    strix::core::iu4_rows::configure_execution_policy({effective.options.turbo.row_decode.effective,
+                                                     effective.options.turbo.row_reduction.effective});
     std::unique_ptr<strix::decode_cli::YarnMemoryWatchdog> yarn_watchdog;
     if (yarn) yarn_watchdog = std::make_unique<strix::decode_cli::YarnMemoryWatchdog>();
     strix::decode_cli::YarnMemoryWatchdogScope yarn_watchdog_scope(yarn_watchdog.get());

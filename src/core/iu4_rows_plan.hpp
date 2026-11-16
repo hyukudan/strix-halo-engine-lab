@@ -1,7 +1,10 @@
 #pragma once
 
 #include <stdexcept>
+#include <atomic>
+#include <cstdint>
 #include <string_view>
+#include "strix/env_flags.hpp"
 
 // Shared small-row IU4 staging plan. The automatic table is measured on gfx1151;
 // force measures every legal group for qualification.
@@ -52,6 +55,32 @@ inline SingleDecodeResolution resolve_single_decode_policy(bool active, std::str
     const auto effective = active ? requested : SingleDecodePolicy::split;
     return {requested, effective, !active ? "native-weights" : effective == SingleDecodePolicy::split ? "explicit-off" :
         effective == SingleDecodePolicy::force ? "diagnostic-force" : "measured-g96-r7-r8-n2560"};
+}
+
+struct ExecutionPolicy {
+    SingleDecodePolicy single_decode = SingleDecodePolicy::automatic;
+    RowReduction reduction = RowReduction::legacy;
+};
+inline std::atomic<std::uint64_t> single_decode_launches{0};
+namespace detail {
+inline ExecutionPolicy& execution_policy_storage(const ExecutionPolicy* resolved = nullptr) {
+    // Standalone callers resolve once; engines install their resolved startup
+    // policy before launching any workers. No environment bookkeeping at dispatch.
+    static ExecutionPolicy policy = [resolved] {
+        if (resolved) return *resolved;
+        const char* single = envcfg::text("STRIX_IU4_R8_SINGLE_DECODE");
+        const char* reduction = envcfg::text("STRIX_IU4_ROW_REDUCTION");
+        return ExecutionPolicy{parse_single_decode_policy(single ? single : ""),
+                               parse_row_reduction(reduction ? reduction : "")};
+    }();
+    return policy;
+}
+}  // namespace detail
+inline const ExecutionPolicy& execution_policy() { return detail::execution_policy_storage(); }
+// Startup only, before workers exist. Diagnostics may reinstall only between
+// synchronized runs. The plan is immutable for the lifetime of an execution.
+inline void configure_execution_policy(ExecutionPolicy policy) {
+    detail::execution_policy_storage(&policy) = policy;
 }
 constexpr Iu4Plan iu4_plan(unsigned rows, unsigned groups, RowReduction reduction = RowReduction::legacy) {
     if (groups == 32U) return {4U, 32U};

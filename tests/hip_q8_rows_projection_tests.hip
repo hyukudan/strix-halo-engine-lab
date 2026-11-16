@@ -288,19 +288,17 @@ float median_us(const Fixture& f, Mode mode, bool cold, const Buffer& flush, hip
     return samples[samples.size() / 2U];
 }
 struct SingleDecodeSetting {
-    bool present;
-    std::string value;
-    SingleDecodeSetting() {
-        const char* raw = envcfg::text("STRIX_IU4_R8_SINGLE_DECODE");
-        present = raw != nullptr;
-        value = raw ? raw : "";
-    }
+    core::iu4_rows::ExecutionPolicy value = core::iu4_rows::execution_policy();
     core::iu4_rows::SingleDecodePolicy policy() const {
-        return core::iu4_rows::parse_single_decode_policy(value);
+        return value.single_decode;
+    }
+    static void set(const char* single) {
+        auto next = core::iu4_rows::execution_policy();
+        next.single_decode = core::iu4_rows::parse_single_decode_policy(single);
+        core::iu4_rows::configure_execution_policy(next);
     }
     void restore() const {
-        const int rc = present ? setenv("STRIX_IU4_R8_SINGLE_DECODE", value.c_str(), 1) : unsetenv("STRIX_IU4_R8_SINGLE_DECODE");
-        require(rc == 0, "restore requested row policy");
+        core::iu4_rows::configure_execution_policy(value);
     }
 };
 
@@ -378,9 +376,9 @@ void onfly_row_invariance(hipStream_t stream) {
                 std::vector<std::uint8_t> native;
                 {
                     const q6p::iu4::SuspendScope suspended;
-                    require(setenv("STRIX_IU4_R8_SINGLE_DECODE", "0", 1) == 0, "set native row control");
+                    SingleDecodeSetting::set("0");
                     native = f.run(mode, stream)[0];
-                    require(setenv("STRIX_IU4_R8_SINGLE_DECODE", "force", 1) == 0, "set native row candidate");
+                    SingleDecodeSetting::set("force");
                     require(f.run(mode, stream)[0] == native, "single-decode switch changed native output bits");
                 }
                 if (rows == 1U) native_reference = native;
@@ -400,14 +398,14 @@ void onfly_row_invariance(hipStream_t stream) {
                         << " iu4_launches=" << launches << " same_input_bytes=1 same_weight_image=1 native_switch_bitwise=1\n";
                 };
                 emit("native", native_reference, native, 0U);
-                require(setenv("STRIX_IU4_R8_SINGLE_DECODE", "0", 1) == 0, "set row-half policy");
+                SingleDecodeSetting::set("0");
                 auto before = q6p::iu4::launches.load();
                 const auto halves = f.run(mode, stream)[0];
                 const auto halves_launches = q6p::iu4::launches.load() - before;
                 require(halves_launches > 0U, "row-invariance arm silently bypassed IU4");
                 if (rows == 1U) halves_reference = halves;
                 emit("iu4-halves", halves_reference, halves, halves_launches);
-                require(setenv("STRIX_IU4_R8_SINGLE_DECODE", "force", 1) == 0, "set full-row policy");
+                SingleDecodeSetting::set("force");
                 before = q6p::iu4::launches.load();
                 const auto single = f.run(mode, stream)[0];
                 const auto single_launches = q6p::iu4::launches.load() - before;
@@ -464,10 +462,15 @@ void onfly_decode_bench(hipStream_t stream) {
             }();
             if (rows >= 7U) {
                 for (const auto mode : {Mode::rows, Mode::rows_a8}) {
-                    require(setenv("STRIX_IU4_R8_SINGLE_DECODE", "0", 1) == 0, "set row-half control");
+                    SingleDecodeSetting::set("0");
+                    const auto single_before = core::iu4_rows::single_decode_launches.load();
                     const auto control = f.run(mode, stream);
-                    require(setenv("STRIX_IU4_R8_SINGLE_DECODE", "force", 1) == 0, "set single-decode candidate");
+                    require(core::iu4_rows::single_decode_launches.load() == single_before,
+                            "split control dispatched the single-decode specialization");
+                    SingleDecodeSetting::set("force");
                     require(f.run(mode, stream) == control, "single-decode R7/R8 changed output bits");
+                    require(core::iu4_rows::single_decode_launches.load() > single_before,
+                            "forced candidate did not dispatch the single-decode specialization");
                 }
                 requested_single.restore();
             }
