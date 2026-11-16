@@ -1,4 +1,5 @@
 #include "strix/env_flags.hpp"
+#include "strix/pinned_host.hpp"
 #include "strix/file_snapshot.hpp"
 #include "strix/hip_check.hpp"
 #include "strix/ds41_prefill_tuning.hpp"
@@ -759,6 +760,7 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
     }
     options.fast_dense = options.fast_dense || ds41::fast_profile::dense_on();
     options.fast_moe = options.fast_moe || ds41::fast_profile::moe_on();
+    options.fast_engram = options.fast_engram || ds41::fast_profile::engram_on();
     // Per-shape selector of the FP16 backend: STRIX_DS41_PREFILL_FP16_PROJ (comma list of q_a, kv, q_b, o_a, o_b),
     // STRIX_DS41_PREFILL_FP16_MIN_ROWS (calls of at least that many rows), STRIX_DS41_PREFILL_APPROX_LAYERS=first-end,
     // STRIX_DS41_PREFILL_FP16_A8=1 (operands from the A8 codes)
@@ -1229,7 +1231,7 @@ DevicePrefill::~DevicePrefill() {
     if (impl_->comm_stream != nullptr) (void)hipStreamDestroy(impl_->comm_stream);
     if (impl_->stream != nullptr) (void)hipStreamDestroy(impl_->stream);
     impl_->join_engram_ahead();
-    if (impl_->engram_pinned != nullptr) (void)hipHostFree(impl_->engram_pinned);
+    if (impl_->engram_pinned != nullptr) (void)strix::host_pin::release(impl_->engram_pinned);
 }
 
 std::uint64_t DevicePrefill::weight_bytes() const noexcept {
@@ -1575,6 +1577,7 @@ void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions& p) {
     o.fast_attention_flash = p.fast_attention_flash;
     o.fast_moe = p.fast_moe;
     o.fast_dense = p.fast_dense;
+    o.fast_engram = p.fast_engram;
     // no process-wide switch: run_from installs these options as the precision of its own execution (another
     // DevicePrefill of the process keeps its own; strix/ds41_prefill_precision.hpp)
 }
@@ -2157,10 +2160,10 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         const std::size_t bytes = requests.size() * 264U;
         if (m.overlap) {
             if (m.engram_pinned_bytes < bytes) {
-                if (m.engram_pinned != nullptr) check(hipHostFree(m.engram_pinned), "engram pinned");
+                if (m.engram_pinned != nullptr) check(strix::host_pin::release(m.engram_pinned), "engram pinned");
                 m.engram_pinned = nullptr;
                 m.engram_pinned_bytes = 0;
-                check(hipHostMalloc(reinterpret_cast<void**>(&m.engram_pinned), bytes, hipHostMallocDefault), "engram pinned");
+                check(strix::host_pin::allocate(reinterpret_cast<void**>(&m.engram_pinned), bytes, hipHostMallocDefault), "engram pinned");
                 m.engram_pinned_bytes = bytes;
             }
             engram_data = m.engram_pinned;
@@ -2439,7 +2442,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 v.x_stride = v.width;
                 v.out_stride = v.count;
                 v.out = m.ekv.p;
-                ds41::enqueue_engram_f16_rows(v, st);
+                ds41::enqueue_engram_f16_rows(v, st, m.options.fast_engram);
                 ds41::enqueue_engram_inject(stream_now() + std::size_t{r0} * stream_row, m.ekv.p, m.devf(p + "engram_q_norm.weight"),
                                             m.devf(p + "engram_k_norm.weight"), n, H, 1e-20F, st,
                                             m.image_rows_set ? m.image_rows.p + r0 : nullptr);  // image rows: gate 0 (upstream)

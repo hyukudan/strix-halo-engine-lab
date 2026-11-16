@@ -189,7 +189,7 @@ void dispatch_rows(unsigned rows, const Tensor& w, const Tensor& up, const float
 }
 // ---- wide windows (rows > 16): FAST dense-q8a8-f16-v1 of the shared f16_dense_tall core --------------------------------
 // One engine per process binds these scratch buffers (set by Impl); rows beyond the exact 16-row sweep go through them.
-struct WideScratch { std::int8_t* codes = nullptr; float *deltas = nullptr, *g = nullptr, *u = nullptr; unsigned rows = 16U; } g_wide;
+using WideScratch = core::DenseWideScratch;
 
 // A8 of 32-value groups, one wave per group (as quantize_a8: amax / 127, rint, clamp +-127; delta 1 for zero or tiny groups).
 __global__ void a8_quant_kernel(const float* x, unsigned inputs, std::int8_t* codes, float* deltas) {
@@ -210,79 +210,72 @@ __global__ void silu_mul_kernel(const float* g, const float* u, float* out, std:
     for (std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += std::size_t(gridDim.x) * blockDim.x)
         out[i] = dl::silu(g[i]) * u[i];
 }
-bool wide_ok(const Tensor& t) { return g_wide.codes && t.fmt == 8U && t.inputs % 128U == 0U && t.outputs % 16U == 0U; }
-// out[r][o] for rows > 16 from already quantized activations (codes / deltas in g_wide).
-void wide_dense(const Tensor& w, float* out, unsigned rows, hipStream_t s) {
+bool wide_ok(const Tensor& t, const WideScratch& wide) { return wide.codes && t.fmt == 8U && t.inputs % 128U == 0U && t.outputs % 16U == 0U; }
+// out[r][o] for rows > 16 from already quantized activations (codes / deltas in wide).
+void wide_dense(const Tensor& w, float* out, unsigned rows, hipStream_t s, const WideScratch& wide) {
     namespace q = core::f16_dense_tall::q8a8;
     q::View v{};
-    v.weight = w.data; v.codes = g_wide.codes; v.deltas = g_wide.deltas; v.out = out;
+    v.weight = w.data; v.codes = wide.codes; v.deltas = wide.deltas; v.out = out;
     v.row_bytes = std::uint32_t(w.row_bytes); v.k_bytes = 0U; v.in = w.inputs; v.count = w.outputs; v.rows = rows;
     v.x_stride = w.inputs; v.out_stride = w.outputs; v.accumulate = 0U;
     if (!q::supported(v)) throw std::runtime_error("q8a8 view not supported");
     if (q::waves_for(rows, w.inputs) == 16U) q::launch_form<16>(v, q::form_for(), s);
     else q::launch_form<8>(v, q::form_for(), s);
 }
-void wide_quant(const float* x, unsigned inputs, unsigned rows, hipStream_t s) {
-    a8_quant_kernel<<<dim3((inputs / 32U + 7U) / 8U, rows), 256, 0, s>>>(x, inputs, g_wide.codes, g_wide.deltas);
+void wide_quant(const float* x, unsigned inputs, unsigned rows, hipStream_t s, const WideScratch& wide) {
+    a8_quant_kernel<<<dim3((inputs / 32U + 7U) / 8U, rows), 256, 0, s>>>(x, inputs, wide.codes, wide.deltas);
 }
-void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s);
 // ---- IU4 g64 pack (ggml type 200): shared W4A16 core, third dense weight format -----------------------------------------
-// FP16 activation rows and F32 gate / up rows of the 16-row windows; allocated on first use (engine lifetime).
-struct Iu4Scratch { _Float16* xh = nullptr; float *g = nullptr, *u = nullptr; } g_iu4;
+// FP16 activation rows and F32 gate / up rows of the 16-row windows; non-owning view, the engine Impl owns the allocations.
+struct Iu4Scratch { _Float16* xh = nullptr; float *g = nullptr, *u = nullptr; };
 constexpr unsigned kIu4Fmt = gguf::type_strix_iu4_g64;
-void iu4_scratch() {
-    if (g_iu4.xh) return;
-    constexpr std::size_t n = std::size_t(16) * 17408U;
-    HK(hipMalloc(&g_iu4.xh, n * sizeof(_Float16)));
-    HK(hipMalloc(&g_iu4.g, n * sizeof(float)));
-    HK(hipMalloc(&g_iu4.u, n * sizeof(float)));
-}
-void linear16(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s) {
+void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s, const WideScratch& wide, const Iu4Scratch& iu4);
+void linear16(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s, const Iu4Scratch& iu4) {
     if (w.fmt == 30U) dispatch_rows<wd::Format::bf16, dl::Epilogue::store>(rows, w, w, x, out, s);
     else if (w.fmt == 8U) dispatch_rows<wd::Format::q8_0, dl::Epilogue::store>(rows, w, w, x, out, s);
     else if (w.fmt == kIu4Fmt) {
-        iu4_scratch();
+        if (!iu4.xh) throw std::runtime_error("iu4 scratch not allocated");
         if (core::dense_iu4::reference_flag()) return core::dense_iu4::reference(w.data, w.inputs, w.outputs, x, out, rows, s);
-        core::dense_iu4::linear(w.data, w.inputs, w.outputs, x, g_iu4.xh, out, rows, s);
+        core::dense_iu4::linear(w.data, w.inputs, w.outputs, x, iu4.xh, out, rows, s);
     } else throw std::runtime_error("dense projection needs bf16, q8_0 or iu4 weights");
 }
-void glu16(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned rows, hipStream_t s) {
+void glu16(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned rows, hipStream_t s, const Iu4Scratch& iu4) {
     if (g.fmt != u.fmt || g.outputs != u.outputs) throw std::runtime_error("gate/up mismatch");
     if (g.fmt == 30U) dispatch_rows<wd::Format::bf16, dl::Epilogue::silu_mul>(rows, g, u, x, out, s);
     else if (g.fmt == 8U) dispatch_rows<wd::Format::q8_0, dl::Epilogue::silu_mul>(rows, g, u, x, out, s);
     else if (g.fmt == kIu4Fmt) {  // two projections that share one FP16 conversion, then SiLU(gate) * up
-        iu4_scratch();
+        if (!iu4.xh) throw std::runtime_error("iu4 scratch not allocated");
         if (core::dense_iu4::reference_flag()) {
-            core::dense_iu4::reference(g.data, g.inputs, g.outputs, x, g_iu4.g, rows, s);
-            core::dense_iu4::reference(u.data, u.inputs, u.outputs, x, g_iu4.u, rows, s);
-            return silu_mul_kernel<<<256, 256, 0, s>>>(g_iu4.g, g_iu4.u, out, std::size_t(rows) * g.outputs);
+            core::dense_iu4::reference(g.data, g.inputs, g.outputs, x, iu4.g, rows, s);
+            core::dense_iu4::reference(u.data, u.inputs, u.outputs, x, iu4.u, rows, s);
+            return silu_mul_kernel<<<256, 256, 0, s>>>(iu4.g, iu4.u, out, std::size_t(rows) * g.outputs);
         }
-        core::dense_iu4::prepare(x, g_iu4.xh, g.inputs, rows, s);
-        core::dense_iu4::run(g.data, g.inputs, g.outputs, g_iu4.xh, g_iu4.g, rows, s);
-        core::dense_iu4::run(u.data, u.inputs, u.outputs, g_iu4.xh, g_iu4.u, rows, s);
-        silu_mul_kernel<<<256, 256, 0, s>>>(g_iu4.g, g_iu4.u, out, std::size_t(rows) * g.outputs);
+        core::dense_iu4::prepare(x, iu4.xh, g.inputs, rows, s);
+        core::dense_iu4::run(g.data, g.inputs, g.outputs, iu4.xh, iu4.g, rows, s);
+        core::dense_iu4::run(u.data, u.inputs, u.outputs, iu4.xh, iu4.u, rows, s);
+        silu_mul_kernel<<<256, 256, 0, s>>>(iu4.g, iu4.u, out, std::size_t(rows) * g.outputs);
     } else throw std::runtime_error("gate/up need bf16, q8_0 or iu4");
 }
-void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s) {
-    if (rows <= 16U) return linear16(w, x, out, rows, s);
-    if (wide_ok(w)) {
-        wide_quant(x, w.inputs, rows, s);
-        wide_dense(w, out, rows, s);
+void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s, const WideScratch& wide, const Iu4Scratch& iu4) {
+    if (rows > 16U && wide_ok(w, wide)) {
+        wide_quant(x, w.inputs, rows, s, wide);
+        wide_dense(w, out, rows, s, wide);
     } else {  // not a Q8_0 shape the WMMA core takes: exact 16-row sweeps
-        for (unsigned r = 0; r < rows; r += 16U)
-            linear16(w, x + std::size_t(r) * w.inputs, out + std::size_t(r) * w.outputs, std::min(16U, rows - r), s);
+        core::dense_row_sweeps(rows, [&](unsigned r, unsigned count) {
+            linear16(w, x + std::size_t(r) * w.inputs, out + std::size_t(r) * w.outputs, count, s, iu4);
+        });
     }
 }
-void glu(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned rows, hipStream_t s) {
-    if (rows <= 16U) return glu16(g, u, x, out, rows, s);
-    if (wide_ok(g) && wide_ok(u) && g.outputs == u.outputs) {
-        wide_quant(x, g.inputs, rows, s);
-        wide_dense(g, g_wide.g, rows, s);
-        wide_dense(u, g_wide.u, rows, s);
-        silu_mul_kernel<<<1024, 256, 0, s>>>(g_wide.g, g_wide.u, out, std::size_t(rows) * g.outputs);
+void glu(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned rows, hipStream_t s, const WideScratch& wide, const Iu4Scratch& iu4) {
+    if (rows > 16U && wide_ok(g, wide) && wide_ok(u, wide) && g.outputs == u.outputs) {
+        wide_quant(x, g.inputs, rows, s, wide);
+        wide_dense(g, wide.g, rows, s, wide);
+        wide_dense(u, wide.u, rows, s, wide);
+        silu_mul_kernel<<<1024, 256, 0, s>>>(wide.g, wide.u, out, std::size_t(rows) * g.outputs);
     } else {
-        for (unsigned r = 0; r < rows; r += 16U)
-            glu16(g, u, x + std::size_t(r) * g.inputs, out + std::size_t(r) * g.outputs, std::min(16U, rows - r), s);
+        core::dense_row_sweeps(rows, [&](unsigned r, unsigned count) {
+            glu16(g, u, x + std::size_t(r) * g.inputs, out + std::size_t(r) * g.outputs, count, s, iu4);
+        });
     }
 }
 void rmsnorm(const float* x, const Tensor& gain, unsigned n, float eps, float* y, unsigned rows, hipStream_t s) {
@@ -312,6 +305,8 @@ __global__ void concat2_kernel(const float* a, const float* b, float* out, unsig
 
 struct HipEngine::Impl {
     HipEngineOptions opt;
+    WideScratch wide;
+    Iu4Scratch iu4;  // IU4 dense weights: FP16 activations + F32 gate/up windows of kMaxRows rows
     Config cfg;
     hipStream_t stream = nullptr;
     unsigned H = 0, V = 0, D = 0, QW = 0, KW = 0, I = 0, GV = 0, GC = 0, GH = 0;
@@ -347,6 +342,7 @@ struct HipEngine::Impl {
     } mtp;
 
     ~Impl() {
+        if (stream) (void)hipStreamSynchronize(stream);
         auto fr = [](auto* p) { if (p) (void)hipFree(p); };
         auto fn = [&](Tensor& t) { fr(t.data); };
         fn(embd); fn(onorm); fn(head);
@@ -358,6 +354,8 @@ struct HipEngine::Impl {
                         qn, ctx, gu, logits}) fr(p);
         for (auto* p : {conv_all, bak_conv}) fr(p);
         fr(d_ids); fr(d_arg);
+        fr(wide.codes); fr(wide.deltas); fr(wide.g); fr(wide.u);
+        fr(iu4.xh); fr(iu4.g); fr(iu4.u);
         if (stream) (void)hipStreamDestroy(stream);
     }
 
@@ -437,11 +435,15 @@ struct HipEngine::Impl {
         alloc0(&d_ids, RS * 4U);
         if (RS > kMaxRows) {
             std::size_t maxin = std::max<std::size_t>(H, I);
-            alloc0(&g_wide.codes, std::size_t(RS) * maxin);
-            alloc0(&g_wide.deltas, std::size_t(RS) * (maxin / 32U) * 4U);
-            alloc0(&g_wide.g, std::size_t(RS) * I * 4U);
-            alloc0(&g_wide.u, std::size_t(RS) * I * 4U);
-            g_wide.rows = RS;
+            alloc0(&wide.codes, std::size_t(RS) * maxin);
+            alloc0(&wide.deltas, std::size_t(RS) * (maxin / 32U) * 4U);
+            alloc0(&wide.g, std::size_t(RS) * I * 4U);
+            alloc0(&wide.u, std::size_t(RS) * I * 4U);
+        }
+        {  // IU4 dense weights; sized for the widest dense input / gate-up output of a kMaxRows window (~3 MB)
+            alloc0(&iu4.xh, std::size_t(kMaxRows) * std::max<std::size_t>(H, I) * sizeof(_Float16));
+            alloc0(&iu4.g, std::size_t(kMaxRows) * I * 4U);
+            alloc0(&iu4.u, std::size_t(kMaxRows) * I * 4U);
         }
         alloc0(&d_arg, kMaxRows * 4U);
     }
@@ -492,10 +494,10 @@ struct HipEngine::Impl {
             auto& y = L[l];
             rmsnorm(x, y.attn_norm, H, cfg.rms_eps, xn, n, stream);
             if (gdn_index[l] != ~0U) {
-                linear(y.qkv, xn, qkv, n, stream);
-                linear(y.z, xn, z, n, stream);
-                linear(y.beta, xn, beta, n, stream);
-                linear(y.alpha, xn, gate, n, stream);
+                linear(y.qkv, xn, qkv, n, stream, wide, iu4);
+                linear(y.z, xn, z, n, stream, wide, iu4);
+                linear(y.beta, xn, beta, n, stream, wide, iu4);
+                linear(y.alpha, xn, gate, n, stream, wide, iu4);
                 if (defer) {
                     const std::size_t gi = gdn_index[l];
                     capture_raw_kernel<<<64, 256, 0, stream>>>(qkv, beta, gate, raw_qkv + gi * kMaxRows * GC, raw_beta + gi * kMaxRows * GH,
@@ -508,21 +510,21 @@ struct HipEngine::Impl {
                 g.kernel = cfg.gdn_conv_kernel; g.rows = n; g.qk_epsilon = 1e-6F; g.rms_epsilon = cfg.rms_eps;
                 g.norm_kind = HipGdnGatedNorm::swish;
                 hip_gdn_decode_step_dims(g, stream);
-                linear(y.out, core, proj, n, stream);
+                linear(y.out, core, proj, n, stream, wide, iu4);
             } else {
-                linear(y.q, xn, q_in, n, stream);
-                linear(y.k, xn, kk, n, stream);
-                linear(y.v, xn, vv, n, stream);
+                linear(y.q, xn, q_in, n, stream, wide, iu4);
+                linear(y.k, xn, kk, n, stream, wide, iu4);
+                linear(y.v, xn, vv, n, stream, wide, iu4);
                 attn_core::dense_decode::Params p{n, cfg.heads, cfg.kv_heads, 2U * D, cfg.rotary_dim, pos, cfg.rms_eps,
                                                   1.0F / std::sqrt(float(D)), cfg.rope_theta, true};
                 attn_core::dense_decode::launch<256>(p, q_in, kk, vv, reinterpret_cast<const float*>(y.qnorm.data),
                                                      reinterpret_cast<const float*>(y.knorm.data), qn, y.k_cache, y.v_cache, ctx, stream);
-                linear(y.o, ctx, proj, n, stream);
+                linear(y.o, ctx, proj, n, stream, wide, iu4);
             }
             add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H);
             rmsnorm(x, y.post_norm, H, cfg.rms_eps, xn, n, stream);
-            glu(y.gate, y.up, xn, gu, n, stream);
-            linear(y.down, gu, proj, n, stream);
+            glu(y.gate, y.up, xn, gu, n, stream, wide, iu4);
+            linear(y.down, gu, proj, n, stream, wide, iu4);
             add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H);
         }
         HipRowsOut out;
@@ -534,7 +536,7 @@ struct HipEngine::Impl {
         if (want != LogitRows::none) {
             const unsigned first = want == LogitRows::last ? n - 1U : 0U, m = want == LogitRows::last ? 1U : n;
             rmsnorm(x + std::size_t(first) * H, onorm, H, cfg.rms_eps, xn, m, stream);
-            linear(head, xn, logits, m, stream);
+            linear(head, xn, logits, m, stream, wide, iu4);
             argmax_kernel<<<m, 1024, 0, stream>>>(logits, V, d_arg);
             out.logits = logits;
             out.top = reinterpret_cast<const std::uint32_t*>(d_arg);
@@ -597,29 +599,29 @@ struct HipEngine::Impl {
         auto& y = mtp.blk;
         HK(hipMemcpyAsync(mtp.ids, next_tokens, n * 4U, hipMemcpyHostToDevice, stream));
         embed_kernel<<<n, 256, 0, stream>>>(embd.data, embd.fmt, embd.row_bytes, H, mtp.ids, mtp.tA);
-        rmsnorm(mtp.tA, mtp.enorm, H, cfg.rms_eps, mtp.mxn, n, stream);
-        rmsnorm(hidden_dev, mtp.hnorm, H, cfg.rms_eps, mtp.tB, n, stream);
+        rmsnorm(mtp.tA, mtp.enorm, H, cfg.rms_eps, mtp.mxn, n, stream, wide, iu4);
+        rmsnorm(hidden_dev, mtp.hnorm, H, cfg.rms_eps, mtp.tB, n, stream, wide, iu4);
         concat2_kernel<<<(n * H + 255U) / 256U, 256, 0, stream>>>(mtp.mxn, mtp.tB, mtp.cat, n, H);
-        linear(mtp.eh, mtp.cat, mtp.mx, n, stream);
+        linear(mtp.eh, mtp.cat, mtp.mx, n, stream, wide, iu4);
         const unsigned nb = (n * H + 255U) / 256U;
-        rmsnorm(mtp.mx, y.attn_norm, H, cfg.rms_eps, mtp.mxn, n, stream);
-        linear(y.q, mtp.mxn, q_in, n, stream);
-        linear(y.k, mtp.mxn, kk, n, stream);
-        linear(y.v, mtp.mxn, vv, n, stream);
+        rmsnorm(mtp.mx, y.attn_norm, H, cfg.rms_eps, mtp.mxn, n, stream, wide, iu4);
+        linear(y.q, mtp.mxn, q_in, n, stream, wide, iu4);
+        linear(y.k, mtp.mxn, kk, n, stream, wide, iu4);
+        linear(y.v, mtp.mxn, vv, n, stream, wide, iu4);
         attn_core::dense_decode::Params p{n, cfg.heads, cfg.kv_heads, 2U * D, cfg.rotary_dim, pos0, cfg.rms_eps,
                                           1.0F / std::sqrt(float(D)), cfg.rope_theta, true};
         attn_core::dense_decode::launch<256>(p, q_in, kk, vv, reinterpret_cast<const float*>(y.qnorm.data),
                                              reinterpret_cast<const float*>(y.knorm.data), qn, y.k_cache, y.v_cache, ctx, stream);
-        linear(y.o, ctx, proj, n, stream);
+        linear(y.o, ctx, proj, n, stream, wide, iu4);
         add_kernel<<<nb, 256, 0, stream>>>(mtp.mx, proj, n * H);
-        rmsnorm(mtp.mx, y.post_norm, H, cfg.rms_eps, mtp.mxn, n, stream);
-        glu(y.gate, y.up, mtp.mxn, gu, n, stream);
-        linear(y.down, gu, proj, n, stream);
+        rmsnorm(mtp.mx, y.post_norm, H, cfg.rms_eps, mtp.mxn, n, stream, wide, iu4);
+        glu(y.gate, y.up, mtp.mxn, gu, n, stream, wide, iu4);
+        linear(y.down, gu, proj, n, stream, wide, iu4);
         add_kernel<<<nb, 256, 0, stream>>>(mtp.mx, proj, n * H);
-        rmsnorm(mtp.mx, mtp.shnorm, H, cfg.rms_eps, mtp.mxn, n, stream);  // mx (pre-norm block output) stays intact for 'pre'
+        rmsnorm(mtp.mx, mtp.shnorm, H, cfg.rms_eps, mtp.mxn, n, stream, wide, iu4);  // mx (pre-norm block output) stays intact for 'pre'
         HipMtpOut o;
         if (want_top) {
-            linear(head, mtp.mxn, mtp.mlogits, n, stream);
+            linear(head, mtp.mxn, mtp.mlogits, n, stream, wide, iu4);
             argmax_kernel<<<n, 1024, 0, stream>>>(mtp.mlogits, V, mtp.top);
             o.logits = mtp.mlogits;
             o.top = reinterpret_cast<const std::uint32_t*>(mtp.top);

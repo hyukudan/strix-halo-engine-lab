@@ -47,6 +47,7 @@ class HipEngine {
 public:
     using Rows = HipRowsOut;   // shared MtpChain binding (strix/spec/mtp_chain.hpp)
     using MtpOut = HipMtpOut;
+    using LogitRows = qwen35::LogitRows;
     ~HipEngine();
     HipEngine(const HipEngine&) = delete;
     HipEngine& operator=(const HipEngine&) = delete;

@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "strix/qwen35/cuda_engine.hpp"
+#include "strix/cuda_core/dense_big.hpp"
 
 namespace q = strix::qwen35;
 static int g_fail = 0;
@@ -217,17 +218,24 @@ int main() {
         }
         // large-M prefill: exact policy == windowed serial decode (logits of the last prompt token and of 8 continuation tokens,
         // which exercises the committed KV / GDN delta / conv state); flash policy is gated (finite, close, same top-1 mostly).
-        for (int pol = 0; pol < 3; ++pol) {
+        for (int pol = 0; pol < 6; ++pol) {
             q::EngineOptions po = opt;
             po.multi_gemv = true;
-            po.prefill_chunk = 128;  // 160 prompt tokens = one full chunk + a 32-row tail chunk
-            po.prefill_arith = pol == 0 ? q::PrefillArith::exact : pol == 1 ? q::PrefillArith::flash : q::PrefillArith::fast8;
+            po.prefill_chunk = 128;  // three full chunks and an arbitrary three-row tail
+            po.prefill_arith = pol < 4 ? q::PrefillArith::exact : pol == 4 ? q::PrefillArith::flash : q::PrefillArith::fast8;
+            if (pol == 5 && !strix::cuda_core::dense_big_fast8_supported()) continue;
+            using Arithmetic = strix::cuda_core::DenseArith;
+            const Arithmetic policies[] = {Arithmetic::mma3, Arithmetic::mma2, Arithmetic::mma1, Arithmetic::fp32};
+            po.dense_arithmetic = pol < 4 ? policies[pol] : opt.dense_arithmetic;
+            const auto saved_default = strix::cuda_core::dense_arith();
+            strix::cuda_core::set_dense_arith(po.dense_arithmetic == Arithmetic::mma3 ? Arithmetic::fp32 : Arithmetic::mma3);
             q::Config pcfg = cfg;
             pcfg.gdn_value_heads = 16;  // beta/alpha out = 16: serves the large-M path (out % 16 == 0)
             auto P = q::CudaEngine::synthetic(pcfg, pack, po, 7);
-            CHECK(P->prefill_is_big(), "variant %d: large-M path enabled", var);
-            const std::size_t n = 160, extra = 8;
-            std::vector<std::uint32_t> t2(tok.begin(), tok.begin() + n);
+            CHECK(P->prefill_is_big() == (po.dense_arithmetic != Arithmetic::fp32), "variant %d: large-M admission follows engine arithmetic", var);
+            const std::size_t n = 387, extra = 8;
+            std::vector<std::uint32_t> t2(n);
+            for (auto& id : t2) id = rng() % 2048;
             for (std::size_t i = 0; i < extra; ++i) t2.push_back(rng() % 2048);
             auto Ref = q::CudaEngine::synthetic(pcfg, pack, po, 7);
             Rec sr;
@@ -245,7 +253,8 @@ int main() {
                 P->commit(1);
             }
             CHECK(P->committed() == n + extra, "committed length");
-            if (pol == 0) {
+            strix::cuda_core::set_dense_arith(saved_default);
+            if (pol < 4) {
                 CHECK(same(lp, lref), "variant %d: prefill(exact) last-token logits differ from serial", var);
                 CHECK(same(cont, cref), "variant %d: prefill(exact) continuation logits differ from serial", var);
             } else {
@@ -259,13 +268,13 @@ int main() {
                     ref = std::max(ref, static_cast<double>(std::fabs(cref[i])));
                 }
                 for (std::size_t i = 0; i < extra; ++i) top_ok += arg(cont, i * c2.vocab) == arg(cref, i * c2.vocab);
-                std::printf("  %s prefill vs serial: max|dlogit| %.4g (max|logit| %.4g), top-1 agree %zu/%zu\n", pol == 1 ? "flash" : "fast8", mx, ref, top_ok, extra);
+                std::printf("  %s prefill vs serial: max|dlogit| %.4g (max|logit| %.4g), top-1 agree %zu/%zu\n", pol == 4 ? "flash" : "fast8", mx, ref, top_ok, extra);
                 // fast8 = e4m3 x e4m3 on nvfp4 weights: ~3.2 % uniform relative RMS per GEMM (dense_big_test: per-row/per-output spread 2.5-4.2 %, i.e.
                 // precision, not a defect); on the flat tiny synthetic logits that reads as ~0.14 * max|logit|. The real gate is the
                 // KL / top-1 kit at 8K (P-RESULT). Here: finite, within 0.25 * max|logit|, and most top-1 agree.
-                const double tol = (pol == 2 && var >= 2) ? 0.25 : 0.1;
+                const double tol = (pol == 5 && var >= 2) ? 0.25 : 0.1;
                 CHECK(fin && mx < tol * ref + 1e-3, "variant %d: flash/fast8 prefill finite and close", var);
-                if (pol == 2 && var >= 2) CHECK(top_ok * 4 >= extra * 3 - 1, "variant %d: fast8 top-1 mostly agrees", var);
+                if (pol == 5 && var >= 2) CHECK(top_ok * 4 >= extra * 3 - 1, "variant %d: fast8 top-1 mostly agrees", var);
             }
         }
         // MTP: one call with rows == the same rows one at a time

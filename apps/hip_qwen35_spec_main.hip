@@ -343,9 +343,9 @@ int main(int argc, char** argv) try {
                 std::printf("prefill[%s] %s: %u tokens in %.1f ms = %.1f tok/s (window %u, anchor %u)\n", label.c_str(), pass ? "WARM" : "COLD",
                             pf_bench, ms, 1000.0 * pf_bench / ms, E->prefill_rows(), anchor);
             }
-        } else if (!pf_sample) {
+        } else if (!pf_sample || pf_bench < R) {
             std::uint32_t anchor = 0;
-            std::vector<std::uint32_t> warm_ids(ids.begin(), ids.begin() + R);
+            std::vector<std::uint32_t> warm_ids(ids.begin(), ids.begin() + std::min<std::size_t>(R, ids.size()));
             prefill_ids(warm_ids, anchor);
             const double t0 = now_ms();
             prefill_ids(ids, anchor);
@@ -355,7 +355,7 @@ int main(int argc, char** argv) try {
         } else {
             // Windows at positions spread over [0, N): window cost is linear in position (attention), so trapezoid over samples.
             std::uint32_t anchor = 0;
-            std::vector<std::uint32_t> warm_ids(ids.begin(), ids.begin() + R);
+            std::vector<std::uint32_t> warm_ids(ids.begin(), ids.begin() + std::min<std::size_t>(R, ids.size()));
             prefill_ids(warm_ids, anchor);
             const unsigned S = 9;
             std::vector<double> pos, cost;
@@ -483,6 +483,7 @@ int main(int argc, char** argv) try {
         spec.start(anchor);
         std::vector<double> tick_ms{0.0}, per_step;
         std::vector<std::uint32_t> cum{1};
+        std::uint64_t windows[17] = {};
         std::uint64_t by_source[3] = {0, 0, 0};
         const double t0 = now_ms();
         while (out.size() < n_run) {
@@ -496,12 +497,13 @@ int main(int argc, char** argv) try {
                 std::printf("T%zu src%u rows%u prop%u acc%u em%u ver%.2f dr%.2f\n", per_step.size(), unsigned(r.source), r.rows, r.proposed,
                             r.accepted, r.emitted, r.verify_ms, r.draft_ms);
             ++by_source[std::size_t(r.source)];
+            if (r.rows <= 16U) ++windows[r.rows];
             per_step.push_back(double(r.emitted));
             tick_ms.push_back(now_ms() - t0);
             cum.push_back(std::uint32_t(out.size()));
         }
         const double wall = now_ms() - t0;
-        std::size_t bad = 0;
+        std::size_t bad = (out.size() != n_run || (!ref.empty() && n_run == n_gen && ref.size() != n_gen)) ? 1U : 0U;
         for (std::size_t i = 0; i < out.size() && i < ref.size(); ++i)
             if (out[i] != ref[i]) { ++bad; if (bad == 1) std::fprintf(stderr, "MISMATCH at token %zu: spec %u serial %u\n", i, out[i], ref[i]); }
         double best = 0;
@@ -517,6 +519,9 @@ int main(int argc, char** argv) try {
                     label.c_str(), use_chain ? "" : "/copy-only", out.size(), per_step.size(), (unsigned long long)by_source[0], (unsigned long long)by_source[1],
                     (unsigned long long)by_source[2], mean_e, quantile(per_step, 0.5), quantile(per_step, 0.9),
                     1000.0 * double(out.size() - 1) / wall, wall / double(std::max<std::size_t>(per_step.size(), 1)), best, prompt.size(), prefill_ms);
+        for (unsigned r = 1; r <= 16U; ++r)
+            if (windows[r]) std::printf("verify-window %u: %llu calls
+", r, (unsigned long long)windows[r]);
         if (use_chain && chain_glue)
             std::printf("mtp[%s]: hidden %s chain_k %u, mtp_forward calls %llu rows %llu, draft() %llu calls %.1f ms total = %.2f ms/draft, %.2f ms/mtp_forward call; "
                         "chain-source passes %llu (%.1f %%), hybrid blocks %llu (ext proposed %llu accepted %llu)\n",

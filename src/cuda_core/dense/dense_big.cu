@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <map>
+#include <memory>
 #include <tuple>
 #include <vector>
 
@@ -18,8 +19,20 @@
 #include "../common.cuh"
 
 namespace strix::cuda_core {
+struct Table {
+    int* kbs = nullptr;
+    int* seg_end = nullptr;
+    std::uint32_t nseg = 0, nkb = 0;
+    ~Table() {
+        if (kbs) (void)cudaFree(kbs);
+        if (seg_end) (void)cudaFree(seg_end);
+    }
+};
 // Scratch of one stream context: activation planes, expanded weight, q8 scales (grow-only).
 struct BigCtx {
+    int device = -1;
+    std::map<std::tuple<int, std::uint32_t, std::uint32_t, std::uint32_t>, std::unique_ptr<Table>> tables;
+    ~BigCtx();
     void* planes[2] = {nullptr, nullptr};  // slot 0: bf16 planes, slot 1: f16 plane (both may be live for one x)
     std::uint64_t planes_bytes[2] = {0, 0};
     void* wexp = nullptr;
@@ -380,6 +393,7 @@ __global__ void __launch_bounds__(256, 1) big_kernel_f8(const BigArgs a) {
 // one block per row: scale = amax / 448, e4m3 bytes in the nvfp4_expand_e4m3 permutation (position 32t + 4j + 2p + e of a 128 block =
 // input 16j + 8p + 2t + e); rows >= `rows` (padding) are zero with scale 1. thread = 4 consecutive output bytes.
 __global__ void __launch_bounds__(256) quant_e4m3_kernel(const float* x, unsigned char* plane, float* rscale, std::uint32_t rows, std::uint32_t in) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     const std::uint32_t r = blockIdx.x;
     unsigned char* dst = plane + static_cast<std::size_t>(r) * in;
     const std::uint32_t nw = in >> 2;
@@ -413,6 +427,11 @@ __global__ void __launch_bounds__(256) quant_e4m3_kernel(const float* x, unsigne
         asm("{\n .reg .b16 h;\n cvt.rn.satfinite.e4m3x2.f32 h, %2, %1;\n cvt.u32.u16 %0, h;\n}" : "=r"(w1) : "f"(hi.x * inv), "f"(hi.y * inv));
         reinterpret_cast<std::uint32_t*>(dst)[m] = (w0 & 0xFFFFu) | (w1 << 16);
     }
+#else
+    // E4M3 conversion requires sm_89+; host FAST8 admission rejects this image.
+    (void)x; (void)plane; (void)rscale; (void)rows; (void)in;
+    __trap();
+#endif
 }
 
 // ---------------------------------------------------------------------------------------------------- split / expand kernels
@@ -490,21 +509,25 @@ __global__ void expand_q8_kernel(const unsigned char* w, std::size_t nblocks, st
 }
 
 // ---------------------------------------------------------------------------------------------------- host state
-struct Table {
-    int* kbs = nullptr;
-    int* seg_end = nullptr;
-    std::uint32_t nseg = 0, nkb = 0;
-};
-std::map<std::tuple<int, std::uint32_t, std::uint32_t, std::uint32_t>, Table>& tables() {
-    static std::map<std::tuple<int, std::uint32_t, std::uint32_t, std::uint32_t>, Table> t;
-    return t;
-}
 using Scratch = BigCtx;
 bool g_bkb2 = true;
 std::uint32_t g_group = 16;
 Scratch& scratch() {
-    static Scratch s;
-    return s;
+    // The implicit single-stream context is isolated by host thread and device.
+    thread_local std::map<int, std::unique_ptr<Scratch>> contexts;
+    int device = -1;
+    (void)cudaGetDevice(&device);
+    auto& ctx = contexts[device];
+    if (!ctx) ctx = std::make_unique<Scratch>();
+    return *ctx;
+}
+
+cudaError_t bind_device(BigCtx& ctx) {
+    int device = -1;
+    if (auto e = cudaGetDevice(&device); e != cudaSuccess) return e;
+    if (ctx.device != -1 && ctx.device != device) return cudaErrorInvalidValue;
+    ctx.device = device;
+    return cudaSuccess;
 }
 
 cudaError_t grow(void** p, std::uint64_t* have, std::uint64_t need) {
@@ -517,13 +540,13 @@ cudaError_t grow(void** p, std::uint64_t* have, std::uint64_t need) {
     return cudaSuccess;
 }
 
-const Table* get_table(Mode mode, std::uint32_t out, std::uint32_t in, int bkb) {
+const Table* get_table(BigCtx& ctx, Mode mode, std::uint32_t out, std::uint32_t in, int bkb) {
     const std::uint32_t nkb = in >> 5;
     std::uint32_t key2 = 0;
     if (mode == kSplit) key2 = nvfp4_split_k(out, in);
     const auto key = std::make_tuple(static_cast<int>(mode), in, mode == kSplit ? key2 : 0u, static_cast<std::uint32_t>(bkb));
-    auto it = tables().find(key);
-    if (it != tables().end()) return &it->second;
+    auto it = ctx.tables.find(key);
+    if (it != ctx.tables.end()) return it->second.get();
     std::vector<int> kbs, ends;
     if (mode == kSplit) {
         const std::uint32_t nch = in >> 7, ks = key2;
@@ -550,24 +573,21 @@ const Table* get_table(Mode mode, std::uint32_t out, std::uint32_t in, int bkb) 
         kbs = ub;
         ends = ue;
     }
-    Table t;
-    t.nkb = static_cast<std::uint32_t>(kbs.size());
-    t.nseg = static_cast<std::uint32_t>(ends.size());
-    if (cudaMalloc(reinterpret_cast<void**>(&t.kbs), kbs.size() * 4) != cudaSuccess) return nullptr;
-    if (cudaMalloc(reinterpret_cast<void**>(&t.seg_end), ends.size() * 4) != cudaSuccess) return nullptr;
-    cudaMemcpy(t.kbs, kbs.data(), kbs.size() * 4, cudaMemcpyHostToDevice);
-    cudaMemcpy(t.seg_end, ends.data(), ends.size() * 4, cudaMemcpyHostToDevice);
-    return &tables().emplace(key, t).first->second;
+    auto t = std::make_unique<Table>();
+    t->nkb = static_cast<std::uint32_t>(kbs.size());
+    t->nseg = static_cast<std::uint32_t>(ends.size());
+    if (cudaMalloc(reinterpret_cast<void**>(&t->kbs), kbs.size() * sizeof(int)) != cudaSuccess) return nullptr;
+    if (cudaMalloc(reinterpret_cast<void**>(&t->seg_end), ends.size() * sizeof(int)) != cudaSuccess) return nullptr;
+    if (cudaMemcpy(t->kbs, kbs.data(), kbs.size() * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return nullptr;
+    if (cudaMemcpy(t->seg_end, ends.data(), ends.size() * sizeof(int), cudaMemcpyHostToDevice) != cudaSuccess) return nullptr;
+    return ctx.tables.emplace(key, std::move(t)).first->second.get();
 }
 
 template <bool F16, int T, int NT, int MODE, int BKB>
 cudaError_t launch(const BigArgs& a, std::uint32_t out, std::uint32_t rows, cudaStream_t s) {
     using C = Cfg<T, NT, BKB>;
-    static bool attr = false;
-    if (!attr) {
-        if (auto e = cudaFuncSetAttribute(big_kernel<F16, T, NT, MODE, BKB>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM); e != cudaSuccess) return e;
-        attr = true;
-    }
+    // CUDA applies attributes to the current device; no process-global initialization flag.
+    if (auto e = cudaFuncSetAttribute(big_kernel<F16, T, NT, MODE, BKB>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM); e != cudaSuccess) return e;
     BigArgs b = a;
     b.tiles_x = (out + BM - 1) / BM;
     b.tiles_y = (rows + C::BN - 1) / C::BN;
@@ -579,11 +599,8 @@ cudaError_t launch(const BigArgs& a, std::uint32_t out, std::uint32_t rows, cuda
 template <int NT, int BKB, int STG>
 cudaError_t launch8(const BigArgs& a, std::uint32_t out, std::uint32_t rows, cudaStream_t s) {
     using C = Cfg8<NT, BKB, STG>;
-    static bool attr = false;
-    if (!attr) {
-        if (auto e = cudaFuncSetAttribute(big_kernel_f8<NT, BKB, STG>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM); e != cudaSuccess) return e;
-        attr = true;
-    }
+    // CUDA applies attributes to the current device; no process-global initialization flag.
+    if (auto e = cudaFuncSetAttribute(big_kernel_f8<NT, BKB, STG>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM); e != cudaSuccess) return e;
     BigArgs b = a;
     b.tiles_x = (out + BM - 1) / BM;
     b.tiles_y = (rows + C::BN - 1) / C::BN;
@@ -594,6 +611,17 @@ cudaError_t launch8(const BigArgs& a, std::uint32_t out, std::uint32_t rows, cud
 
 }  // namespace
 
+bool dense_big_fast8_supported() {
+#if defined(STRIX_CUDA_FAST8_SM120A)
+    int device = -1;
+    cudaDeviceProp prop{};
+    return cudaGetDevice(&device) == cudaSuccess && cudaGetDeviceProperties(&prop, device) == cudaSuccess &&
+           prop.major == 12 && prop.minor == 0;
+#else
+    return false;
+#endif
+}
+
 bool dense_big_supported(const DenseWeight& w) {
     if (w.out % 16 != 0 || w.data == nullptr) return false;
     if (w.format == WeightFormat::bf16 || w.format == WeightFormat::q8_0) return w.in % 32 == 0;
@@ -603,6 +631,7 @@ bool dense_big_supported(const DenseWeight& w) {
 
 cudaError_t dense_big_reserve(std::uint32_t max_rows, std::uint32_t max_in, std::uint64_t max_weight_elems, int max_terms, BigCtx* ctx) {
     Scratch& S = ctx ? *ctx : scratch();
+    if (auto e = bind_device(S); e != cudaSuccess) return e;
     const std::uint32_t rp = (max_rows + 127) / 128 * 128;
     if (auto e = grow(&S.planes[0], &S.planes_bytes[0], static_cast<std::uint64_t>(std::max(1, max_terms)) * rp * max_in * 2); e != cudaSuccess) return e;
     if (auto e = grow(&S.planes[1], &S.planes_bytes[1], static_cast<std::uint64_t>(rp) * max_in * 2); e != cudaSuccess) return e;
@@ -613,27 +642,36 @@ cudaError_t dense_big_reserve(std::uint32_t max_rows, std::uint32_t max_in, std:
 
 void dense_big_release(BigCtx* ctx) {
     Scratch& S = ctx ? *ctx : scratch();
+    int previous = -1;
+    (void)cudaGetDevice(&previous);
+    if (S.device != -1) (void)cudaSetDevice(S.device);
+    S.tables.clear();
     for (void* p : S.planes)
         if (p) cudaFree(p);
     if (S.wexp) cudaFree(S.wexp);
     if (S.scales) cudaFree(S.scales);
     if (S.rscale) cudaFree(S.rscale);
-    S = Scratch{};
+    S.planes[0] = S.planes[1] = S.wexp = nullptr;
+    S.scales = S.rscale = nullptr;
+    S.planes_bytes[0] = S.planes_bytes[1] = S.wexp_bytes = S.scales_bytes = S.rscale_bytes = 0;
+    if (previous != -1) (void)cudaSetDevice(previous);
 }
 std::uint64_t dense_big_reserved_bytes(const BigCtx* ctx) {
     const Scratch& S = ctx ? *ctx : scratch();
     return S.planes_bytes[0] + S.planes_bytes[1] + S.wexp_bytes + S.scales_bytes + S.rscale_bytes;
 }
+BigCtx::~BigCtx() { dense_big_release(this); }
 BigCtx* dense_big_ctx_create() { return new BigCtx(); }
 void dense_big_ctx_destroy(BigCtx* ctx) {
     if (!ctx) return;
-    dense_big_release(ctx);
     delete ctx;
 }
 
 cudaError_t dense_big_split(const float* x, std::uint32_t rows, std::uint32_t in, WeightFormat fmt, int terms, BigAct* out, cudaStream_t s, BigCtx* ctx, bool f8) {
+    if (f8 && !dense_big_fast8_supported()) return cudaErrorNotSupported;
     if (rows == 0 || in % 32 != 0 || terms < 1 || terms > 3) return cudaErrorInvalidValue;
     Scratch& S = ctx ? *ctx : scratch();
+    if (auto e = bind_device(S); e != cudaSuccess) return e;
     const std::uint32_t rp = (rows + 127) / 128 * 128;
     const bool f16 = fmt == WeightFormat::nvfp4;
     const int T = f16 ? 1 : terms;
@@ -667,9 +705,11 @@ cudaError_t dense_big_split(const float* x, std::uint32_t rows, std::uint32_t in
 }
 
 cudaError_t dense_big_gemm(const DenseWeight& w, const BigAct& a, float* y, const float* aux, BigEpi epi, cudaStream_t s, BigCtx* ctx) {
+    if (a.f8 && !dense_big_fast8_supported()) return cudaErrorNotSupported;
     if (!dense_big_supported(w) || a.in != w.in || a.f16 != (w.format == WeightFormat::nvfp4)) return cudaErrorInvalidValue;
     if (epi != BigEpi::none && aux == nullptr) return cudaErrorInvalidValue;
     Scratch& S = ctx ? *ctx : scratch();
+    if (auto e = bind_device(S); e != cudaSuccess) return e;
     BigArgs ba{};
     ba.P = static_cast<const std::uint16_t*>(a.planes);
     ba.y = y;
@@ -707,7 +747,7 @@ cudaError_t dense_big_gemm(const DenseWeight& w, const BigAct& a, float* y, cons
         ba.A = static_cast<const std::uint16_t*>(S.wexp);
     }
     const int bkb = (w.in % 128 == 0 && a.terms <= 2 && g_bkb2) ? 2 : 1;
-    const Table* tb = get_table(mode, w.out, w.in, bkb);
+    const Table* tb = get_table(S, mode, w.out, w.in, bkb);
     if (tb == nullptr) return cudaErrorMemoryAllocation;
     ba.kbs = tb->kbs;
     ba.seg_end = tb->seg_end;

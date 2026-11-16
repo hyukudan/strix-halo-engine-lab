@@ -216,16 +216,13 @@ int main(int argc, char** argv) {
             else if (a == "--mtp-hidden") mtp_pre = next() == "pre";
             else throw std::runtime_error("unknown argument " + a);
         }
-        if (print_cfg) {
-            topt.multi_gemv = multi;
-            q::print_effective_config(topt, arith_name.c_str(), stdout);
-            return 0;
-        }
+        if (pf_repeat == 0) throw std::invalid_argument("--prefill-repeat must be positive");
+        if (pf_slots < 1 || pf_slots > 2) throw std::invalid_argument("--prefill-slots expects 1..2");
         if (bwp) {
             std::printf("bw-probe: %.3f TB/s streaming read (4 GiB)\n", bw_probe_tbs());
             return 0;
         }
-        if ((model.empty() == synth.empty()) || rows_cap == 0 || rows_cap > 32 || decode_rows == 0 || decode_rows > 32)
+        if (!print_cfg && ((model.empty() == synth.empty()) || rows_cap == 0 || rows_cap > 32 || decode_rows == 0 || decode_rows > 32))
             throw std::runtime_error(
                 "usage: (--model F.gguf | --synthetic-full bf16|q8_0 [--layers N]) (--prompt-ids 1,2,3 | --prompt-len N) [--ctx-fill N] "
                 "[--dense-arith mma3|mma2|mma1|fp32] [--n-gen N] [--rows 1..32] [--decode-rows 1..32 (timing of an R-row window, committed fully)] [--max-pos N] "
@@ -245,8 +242,13 @@ int main(int argc, char** argv) {
             else if (pf_arith == "fast2") opt.prefill_arith = q::PrefillArith::fast2;
             else if (pf_arith == "fast8") opt.prefill_arith = q::PrefillArith::fast8;
             else throw std::runtime_error("--prefill-arith expects windows|exact|flash|fast|fast2|fast8");
-            opt.prefill_chunk = pf_chunk;
-            opt.prefill_slots = pf_slots;
+        }
+        opt.prefill_chunk = pf_chunk;
+        opt.prefill_slots = pf_slots;
+        if (print_cfg) {
+            opt.multi_gemv = multi;
+            q::print_effective_config(opt, arith_name.c_str(), stdout);
+            return 0;
         }
         opt.use_graphs = graphs;
         opt.multi_gemv = multi;
