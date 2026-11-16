@@ -361,6 +361,7 @@ void bench_hc_collapse(std::mt19937& rng, int iterations) {
     for (int round = 0; round < 3; ++round) {
         for (const std::uint32_t once : {1U, 2U})
         for (const std::uint32_t tile : {4U, 2U, 1U}) {
+            if (once == 2U && tile == 4U) continue;  // one read caps the tile at 2 rows
             check(hipMemset(st, 0, std::size_t{R} * n * 4), "clear");
             check(hipMemset(cout, 0, std::size_t{R} * H * 4), "clear");
             check(hipMemset(mixes, 0, R * sizeof(HcMix)), "clear");
