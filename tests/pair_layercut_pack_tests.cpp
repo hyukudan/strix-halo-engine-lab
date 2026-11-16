@@ -1,5 +1,5 @@
 // Host-only regression: a cut pack never opens files that contain only suffix layers.
-#include "minimax/rtxpf/cuda/mm_rtx_pack.hpp"
+#include "cuda/models/minimax/mm_rtx_pack.hpp"
 #include <filesystem>
 #include <fstream>
 #include <cstdio>
