@@ -4678,7 +4678,7 @@ out to the file, which the same prefill would read again. Decode keeps the open'
 - **Exactness evidence:** Prefill state, tokens and logits bitwise equal on and off; 16 TTFT repeats bitwise equal across four alternating loads.
 - **Off switch:** --prefill-clean-evict 0
 - **Measured gain:** Full card, `--ttft-only`, disk queue 1, four alternating fresh-process loads (on / off / off / on): TTFT 8K 14.9 → 12.7 s first request and 13.2 → 11.6 s second (off → on, −15 % / −12 %), 32K 43.7-43.8 s in every load (tie); per load the prefill read 3.5-4.0 GB from the unit file instead of 9.6 GB (−60 %) and the decode residency restore took 2.5-2.9 s instead of 4.1-4.6 s
-- **Implementation / evidence:** [GLM RTX guide](../src/glm/rtxpf/README.md), [cache hook](../src/glm/rtxpf/producer/expert_tier.hpp)
+- **Implementation / evidence:** [GLM RTX guide](../src/cuda/models/glm/README.md), [cache hook](../src/cuda/models/glm/producer/expert_tier.hpp)
 
 <a id="glm-rtx-disk-queue"></a>
 
@@ -4694,7 +4694,7 @@ Unit-file reads in flight in a three-tier open; `auto` picks 4 / 6 / 8 from the 
 - **Exactness evidence:** Same output bytes (tokens, logits, state) at any queue.
 - **Off switch:** `--tier-disk-queue 1`
 - **Measured gain:** Auto vs 1 at about 76 % file share (24 GiB VRAM + 32 GiB RAM) was never slower in the latest measured decode cell means: 1K cold / warm +42 / +35 %, 8K cold / warm +33 / +16 %. Earlier one-drive cells were +9..+42 % in seven of eight (remaining -3.4 % traced to drive read phases); two-drive stripes +26..+38 %. Single loads vary up to 2x, so the gain size is uncertain. At about 61 % (48 GiB + 32 GiB), one earlier night observed cold-1K decode -32 % against the queue-1 mean; warm 1K +3 %, cold 8K +7 %, warm 8K +1 %. A later set at the same budget reversed the cold-1K result: auto +8.4 % pooled, every auto arm faster. The 70 % cut remains a conservative empirical cutoff: 61 % stays at 1. Full card (about 1-4 % at tile 2048) tied in TTFT (8K +0.6..+2 %, 32K equal), so it stays at 1.
-- **Implementation / evidence:** [GLM RTX guide](../src/glm/rtxpf/README.md)
+- **Implementation / evidence:** [GLM RTX guide](../src/cuda/models/glm/README.md)
 
 <a id="glm-pf-seqpar"></a>
 

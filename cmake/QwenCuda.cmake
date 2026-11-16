@@ -9,14 +9,15 @@ if(MSVC)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/EHsc> $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
         $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>)
 endif()
+include(${CMAKE_CURRENT_LIST_DIR}/StrixCudaBackend.cmake)
 add_library(strix_qwen_cuda STATIC
-    src/cuda/qwen_prefill_driver.cu src/cuda/qwen_hc.cu src/cuda/qwen_dense.cu
-    src/cuda/qwen_gdn.cu src/cuda/qwen_qsa.cu src/cuda/qwen_moe.cu
-    src/cuda/qwen_plemtp.cu src/cuda/qwen_mtp_draft.cu src/cuda/qwen_transcode.cu src/cuda/qwen_amd_math_tables.cu src/gguf_reader.cpp)
-target_include_directories(strix_qwen_cuda PUBLIC include src/cuda)
+    src/cuda/models/qwen/qwen_prefill_driver.cu src/cuda/models/qwen/qwen_hc.cu src/cuda/models/qwen/qwen_dense.cu
+    src/cuda/models/qwen/qwen_gdn.cu src/cuda/models/qwen/qwen_qsa.cu src/cuda/models/qwen/qwen_moe.cu
+    src/cuda/models/qwen/qwen_plemtp.cu src/cuda/models/qwen/qwen_mtp_draft.cu src/cuda/models/qwen/qwen_transcode.cu ${STRIX_CUDA_CORE_AMD_MATH_SOURCES} src/gguf_reader.cpp)
+target_include_directories(strix_qwen_cuda PUBLIC include src/cuda/models/qwen)
 # Every Qwen CUDA binary resolves its device through the start gate (strix-devices-v1) before its first allocation.
 include(${CMAKE_CURRENT_LIST_DIR}/StrixDevice.cmake)
-target_link_libraries(strix_qwen_cuda PUBLIC strix_device)
+target_link_libraries(strix_qwen_cuda PUBLIC strix_device strix_cuda_core)
 target_compile_options(strix_qwen_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
 if(MSVC)
     target_compile_options(strix_qwen_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
@@ -64,7 +65,7 @@ target_link_libraries(qwen_qsa_multi_test PRIVATE strix_qwen_cuda)
 target_compile_options(qwen_qsa_multi_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
 
 # Prefix storage and compatibility planning are host-only; no CUDA initialization in their tests.
-add_library(strix_qwen_prefix STATIC src/prefix_state_cache.cpp src/cuda/qwen_prefix_identity.cpp)
+add_library(strix_qwen_prefix STATIC src/prefix_state_cache.cpp src/cuda/models/qwen/qwen_prefix_identity.cpp)
 target_include_directories(strix_qwen_prefix PUBLIC include)
 target_link_libraries(strix_qwen_prefix PUBLIC strix_qwen_handoff)
 target_link_libraries(strix-cuda-qwen-serve PRIVATE strix_qwen_prefix)

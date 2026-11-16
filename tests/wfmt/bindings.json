@@ -3761,8 +3761,8 @@
       ]
     },
     {
-      "id": "cuda-dense:include/strix/cuda_qwen_quant.cuh",
-      "source": "include/strix/cuda_qwen_quant.cuh",
+      "id": "cuda-dense:include/strix/cuda/qwen_quant.cuh",
+      "source": "include/strix/cuda/qwen_quant.cuh",
       "backend": "cuda",
       "formats": [
         "F32",
@@ -3795,8 +3795,8 @@
       ]
     },
     {
-      "id": "cuda-dense:src/cuda/qwen_prefill_driver.cu",
-      "source": "src/cuda/qwen_prefill_driver.cu",
+      "id": "cuda-dense:src/cuda/models/qwen/qwen_prefill_driver.cu",
+      "source": "src/cuda/models/qwen/qwen_prefill_driver.cu",
       "backend": "cuda",
       "formats": [
         "Q8_0",
@@ -3881,8 +3881,8 @@
       ]
     },
     {
-      "id": "cuda-dense:src/cuda/qwen_transcode.cu",
-      "source": "src/cuda/qwen_transcode.cu",
+      "id": "cuda-dense:src/cuda/models/qwen/qwen_transcode.cu",
+      "source": "src/cuda/models/qwen/qwen_transcode.cu",
       "backend": "cuda",
       "formats": [
         "Q8_0",
@@ -3904,8 +3904,8 @@
       ]
     },
     {
-      "id": "cuda-dense:src/cuda/qwen_dense.cu",
-      "source": "src/cuda/qwen_dense.cu",
+      "id": "cuda-dense:src/cuda/models/qwen/qwen_dense.cu",
+      "source": "src/cuda/models/qwen/qwen_dense.cu",
       "backend": "cuda",
       "formats": [
         "Q8_0",
@@ -3944,8 +3944,8 @@
       ]
     },
     {
-      "id": "cuda-dense:src/cuda/qwen_mtp_draft.cu",
-      "source": "src/cuda/qwen_mtp_draft.cu",
+      "id": "cuda-dense:src/cuda/models/qwen/qwen_mtp_draft.cu",
+      "source": "src/cuda/models/qwen/qwen_mtp_draft.cu",
       "backend": "cuda",
       "formats": [
         "Q8_0",
@@ -3971,8 +3971,8 @@
       ]
     },
     {
-      "id": "cuda-dense:src/cuda/qwen_plemtp.cu",
-      "source": "src/cuda/qwen_plemtp.cu",
+      "id": "cuda-dense:src/cuda/models/qwen/qwen_plemtp.cu",
+      "source": "src/cuda/models/qwen/qwen_plemtp.cu",
       "backend": "cuda",
       "formats": [
         "Q8_0",
@@ -4021,8 +4021,8 @@
       ]
     },
     {
-      "id": "cuda-dense:src/cuda/ds41_dense_fast.cu",
-      "source": "src/cuda/ds41_dense_fast.cu",
+      "id": "cuda-dense:src/cuda/models/ds41/ds41_dense_fast.cu",
+      "source": "src/cuda/models/ds41/ds41_dense_fast.cu",
       "backend": "cuda",
       "formats": [
         "Q8_0",
@@ -4063,8 +4063,8 @@
       ]
     },
     {
-      "id": "cuda-expert:src/cuda/qwen_moe.cu",
-      "source": "src/cuda/qwen_moe.cu",
+      "id": "cuda-expert:src/cuda/models/qwen/qwen_moe.cu",
+      "source": "src/cuda/models/qwen/qwen_moe.cu",
       "backend": "cuda",
       "formats": [
         "Q4_K",
@@ -4131,8 +4131,8 @@
       ]
     },
     {
-      "id": "cuda-ds41:src/cuda/ds41_moe.cu",
-      "source": "src/cuda/ds41_moe.cu",
+      "id": "cuda-ds41:src/cuda/models/ds41/ds41_moe.cu",
+      "source": "src/cuda/models/ds41/ds41_moe.cu",
       "backend": "cuda",
       "formats": [
         "IQ2_XXS",
@@ -4180,8 +4180,8 @@
       ]
     },
     {
-      "id": "cuda-ds41:src/cuda/ds41_prefill_kernels.cu",
-      "source": "src/cuda/ds41_prefill_kernels.cu",
+      "id": "cuda-ds41:src/cuda/models/ds41/ds41_prefill_kernels.cu",
+      "source": "src/cuda/models/ds41/ds41_prefill_kernels.cu",
       "backend": "cuda",
       "formats": [
         "IQ2_XXS",
@@ -4215,8 +4215,8 @@
       ]
     },
     {
-      "id": "cuda-ds41:src/cuda/ds41_core_layer.cu",
-      "source": "src/cuda/ds41_core_layer.cu",
+      "id": "cuda-ds41:src/cuda/models/ds41/ds41_core_layer.cu",
+      "source": "src/cuda/models/ds41/ds41_core_layer.cu",
       "backend": "cuda",
       "formats": [
         "IQ2_XXS",
@@ -4259,8 +4259,8 @@
       ]
     },
     {
-      "id": "cuda-ds41:src/cuda/ds41_prefill_driver.cu",
-      "source": "src/cuda/ds41_prefill_driver.cu",
+      "id": "cuda-ds41:src/cuda/models/ds41/ds41_prefill_driver.cu",
+      "source": "src/cuda/models/ds41/ds41_prefill_driver.cu",
       "backend": "cuda",
       "formats": [
         "IQ2_XXS",
@@ -4403,8 +4403,8 @@
       ]
     },
     {
-      "id": "cuda-ds41:src/cuda/trellis.cu",
-      "source": "src/cuda/trellis.cu",
+      "id": "cuda-ds41:src/cuda/core/trellis.cu",
+      "source": "src/cuda/core/trellis.cu",
       "backend": "cuda",
       "formats": [
         "IQ2_XXS",
@@ -4478,8 +4478,8 @@
       ]
     },
     {
-      "id": "cuda:src/cuda/ds41_hot_residency.cpp",
-      "source": "src/cuda/ds41_hot_residency.cpp",
+      "id": "cuda:src/cuda/models/ds41/ds41_hot_residency.cpp",
+      "source": "src/cuda/models/ds41/ds41_hot_residency.cpp",
       "backend": "cuda",
       "formats": [],
       "arithmetic": "DS41-residency",
@@ -5047,7 +5047,7 @@
     "apps/hip_decode_token_main.cpp",
     "apps/qwen_effective_config.hpp",
     "include/strix/cuda/core/nvfp4.hpp",
-    "include/strix/cuda_qwen_quant.cuh",
+    "include/strix/cuda/qwen_quant.cuh",
     "include/strix/deepseek41_device_forward.hpp",
     "include/strix/device_profile.hpp",
     "include/strix/ds41_dspark.hpp",
@@ -5072,19 +5072,19 @@
     "src/cuda/core/arch/sm120/nvfp4.cuh",
     "src/cuda/core/nvfp4.cu",
     "src/cuda/core/nvfp4_reference.cpp",
-    "src/cuda/ds41_core_layer.cu",
-    "src/cuda/ds41_dense_fast.cu",
-    "src/cuda/ds41_hot_residency.cpp",
-    "src/cuda/ds41_moe.cu",
-    "src/cuda/ds41_prefill_driver.cu",
-    "src/cuda/ds41_prefill_kernels.cu",
-    "src/cuda/qwen_dense.cu",
-    "src/cuda/qwen_moe.cu",
-    "src/cuda/qwen_mtp_draft.cu",
-    "src/cuda/qwen_plemtp.cu",
-    "src/cuda/qwen_prefill_driver.cu",
-    "src/cuda/qwen_transcode.cu",
-    "src/cuda/trellis.cu",
+    "src/cuda/models/ds41/ds41_core_layer.cu",
+    "src/cuda/models/ds41/ds41_dense_fast.cu",
+    "src/cuda/models/ds41/ds41_hot_residency.cpp",
+    "src/cuda/models/ds41/ds41_moe.cu",
+    "src/cuda/models/ds41/ds41_prefill_driver.cu",
+    "src/cuda/models/ds41/ds41_prefill_kernels.cu",
+    "src/cuda/models/qwen/qwen_dense.cu",
+    "src/cuda/models/qwen/qwen_moe.cu",
+    "src/cuda/models/qwen/qwen_mtp_draft.cu",
+    "src/cuda/models/qwen/qwen_plemtp.cu",
+    "src/cuda/models/qwen/qwen_prefill_driver.cu",
+    "src/cuda/models/qwen/qwen_transcode.cu",
+    "src/cuda/core/trellis.cu",
     "src/deepseek41_pair_defaults.cpp",
     "src/ds41_dense_adapter.hpp",
     "src/ds41_formats.cpp",
