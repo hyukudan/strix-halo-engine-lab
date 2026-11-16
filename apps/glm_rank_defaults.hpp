@@ -8,6 +8,7 @@
 // --baseline / STRIX_GLM_BASELINE=1 restores the old path of every item (except where noted) unless that item is set
 // explicitly; a default whose precondition fails falls back with one notice line (prefill auto at world 1, see the app).
 #pragma once
+#include <strix/weight/family.hpp>
 
 #include "glm_model_facts.hpp"
 #include "glm/engine/glm_kvshard_layout.hpp"
@@ -244,6 +245,7 @@ struct Effective {
     std::string prefill;  // resolved: gemv | ref | wmma
     std::string xch;
     std::map<std::string, Value> env;  // env name -> effective value
+    std::shared_ptr<const strix::weight::FamilyPlans> weight_plans{};
 };
 
 inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& facts = {}) {
@@ -400,7 +402,7 @@ inline void apply_env(const Effective& e, const std::function<void(const char*, 
 }
 
 inline std::string print(const Effective& e) {
-    std::string s;
+    std::string s = strix::weight::family_plan_notice(e.weight_plans);
     auto line = [&](const std::string& k, const Value& v) { s += "effective " + k + "=" + v.value + " (" + v.source + ")\n"; };
     s += std::string("effective baseline=") + (e.baseline ? "1" : "0") + "\n";
     line("identity", e.identity);

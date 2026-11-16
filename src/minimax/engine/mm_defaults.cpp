@@ -494,6 +494,7 @@ void apply_host_defaults(const std::string& app) {
 
 std::string effective_config(const Cli& cli, const Lookup& env) {
     std::ostringstream o;
+    o << strix::weight::family_plan_notice(cli.weight_plans);
     o << "app=" << cli.app << "\n"
       << "transport=" << cli.transport << "\n"
       << "slots=" << cli.slots << "\n"
