@@ -175,3 +175,7 @@ rule at v = 1; `choose_pipeline(..., virtual_stages, legal_v, LayoutDecl)` keeps
 resident route when the whole stage layers do not fit next to the decode layout, and otherwise pipelines only when
 it beats the alternative (tensor route or one node) by `min_gain` (3 %, run noise). `effective_line` prints
 `pair.pipeline mode=.. chunk=.. virtual=.. predicted_ms=.. alt_ms=.. reason=..`.
+`stage_map.hpp` holds the interleaved seam: `StageMap` (2v stages, stage s on rank s % 2, text `0,12,24,36,48`),
+`balance_map` (whole-layer cuts minimising the slowest stage) and `StagePipes` (one two-slot pipe per direction, each on
+its own ordered transport; execution order = groups of at most 4 chunks, depth-first inside a group, so both
+directions stay live with two slots). Wire v4 (`[43]` boundary, `[44]` map FNV) only when v > 1; v = 1 stays wire v3.
