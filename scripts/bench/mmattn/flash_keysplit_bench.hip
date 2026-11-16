@@ -6,7 +6,7 @@
 // Build: amdclang++ -x hip --offload-arch=gfx1151 -O3 -std=c++20 -I<repo>/src -I<repo>/include flash_keysplit_bench.hip
 // Run:   flash_keysplit_bench POS0 ROWS R OPT [SPLIT]   -> one line: ms (median of 20), TFLOPS, output fnv64
 //        POS0 = position of the first row, ROWS = rows in the launch, OPT = core Opt bits (0 = incumbent schedule);
-//        OPT 8 = row-group form (sparse_flash_rowgroup.hpp, 4 rows per work-group; SPLIT must be 0).
+//        OPT 8 + b = row-group form (sparse_flash_rowgroup.hpp, 4 rows per work-group, Opt bits b = 0..3; SPLIT 0).
 //        [DRIFT]: if given (>= 0), each row's selection is its predecessor's with DRIFT of the 15 older blocks
 //        replaced (R ignored). OPT != 0 also prints max |out - out(OPT 0)| (same SPLIT) and max |out(OPT 0)|.
 #include "attn_core/sparse_flash_keysplit.hpp"
@@ -109,10 +109,10 @@ template <unsigned Opt, bool Split> void launch(const BenchPolicy::Args& a, unsi
     hipLaunchKernelGGL((ks::flash_rows_keysplit_kernel<BenchPolicy, Split, Opt>), dim3(wgs), dim3(ks::KeySplit<kH, kD>::kThreads), 0,
                        nullptr, a);
 }
-void launch_rowgroup(const BenchPolicy::Args& a, unsigned rows) {
+template <unsigned Opt> void launch_rowgroup(const BenchPolicy::Args& a, unsigned rows) {
     namespace ks = strix::attn_core::sparse;
     using G = ks::RowGroup<kH, kD, kTop>;
-    hipLaunchKernelGGL((ks::flash_rowgroup_kernel<BenchPolicy>), dim3((rows + G::kRows - 1) / G::kRows * kKvh), dim3(G::kThreads), 0,
+    hipLaunchKernelGGL((ks::flash_rowgroup_kernel<BenchPolicy, Opt>), dim3((rows + G::kRows - 1) / G::kRows * kKvh), dim3(G::kThreads), 0,
                        nullptr, a);
 }
 }  // namespace
@@ -198,7 +198,10 @@ int main(int argc, char** argv) {
             case 3: launch<1, true>(a, wgs); break;
             case 4: launch<2, false>(a, wgs); break;
             case 5: launch<2, true>(a, wgs); break;
-            case 16: launch_rowgroup(a, rows); break;
+            case 16: launch_rowgroup<0>(a, rows); break;
+            case 18: launch_rowgroup<1>(a, rows); break;
+            case 20: launch_rowgroup<2>(a, rows); break;
+            case 22: launch_rowgroup<3>(a, rows); break;
             default: std::fprintf(stderr, "unknown OPT\n"); std::exit(1);
         }
     };

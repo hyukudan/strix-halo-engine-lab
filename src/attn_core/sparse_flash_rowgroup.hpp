@@ -58,6 +58,12 @@ template <unsigned H, unsigned D, unsigned Segs> struct RowGroup {
     static_assert(Segs <= 32, "one candidate per lane");
 };
 
+// Opt bits (schedule / exactness notes per bit):
+//   kRgLazyRescale  skip the accumulator rescale when no lane's alpha differs from 1 (exp2(0) = 1: same bits)
+//   kRgQkPair       QK in two accumulator chains (even / odd 16-dim steps) added once: half the dependent WMMA chain,
+//                   different score rounding (FAST: changes the bits of the default form)
+inline constexpr unsigned kRgLazyRescale = 1U, kRgQkPair = 2U;
+
 namespace rowgroup_detail {
 // P[head ln][16 keys] B fragment from the lane's 8 probabilities (key 2e + hf) and the other half's (key-split form).
 __device__ __forceinline__ tile::Frag p_frag(const std::uint16_t (&v)[8], unsigned hf) {
@@ -76,7 +82,7 @@ __device__ __forceinline__ tile::Frag p_frag(const std::uint16_t (&v)[8], unsign
 }
 }  // namespace rowgroup_detail
 
-template <class P>
+template <class P, unsigned Opt = 0U>
 __global__ __launch_bounds__((RowGroup<P::kHeads, P::kDim, P::kMaxSegs>::kThreads)) void flash_rowgroup_kernel(typename P::Args a) {
     using G = RowGroup<P::kHeads, P::kDim, P::kMaxSegs>;
     using tile::Acc;
@@ -211,18 +217,32 @@ __global__ __launch_bounds__((RowGroup<P::kHeads, P::kDim, P::kMaxSegs>::kThread
         if (act && k0 < own) {
             const unsigned char* const buf = lds + (t & 1U) * G::kStage;
             Acc s = tile::acc_zero();
+            if constexpr ((Opt & kRgQkPair) != 0U) {
+                Acc s1 = tile::acc_zero();
 #pragma unroll
-            for (unsigned x = 0; x < G::kKs; ++x) s = tile::mma<O>(tile::frag32(buf + ln * G::kKPitch + 32U * x), qf[x], s);
+                for (unsigned x = 0; x < G::kKs; x += 2U) {
+                    s = tile::mma<O>(tile::frag32(buf + ln * G::kKPitch + 32U * x), qf[x], s);
+                    s1 = tile::mma<O>(tile::frag32(buf + ln * G::kKPitch + 32U * (x + 1U)), qf[x + 1U], s1);
+                }
+#pragma unroll
+                for (unsigned e = 0; e < 8; ++e) s[e] += s1[e];
+            } else {
+#pragma unroll
+                for (unsigned x = 0; x < G::kKs; ++x) s = tile::mma<O>(tile::frag32(buf + ln * G::kKPitch + 32U * x), qf[x], s);
+            }
             float sv[8];
 #pragma unroll
             for (unsigned e = 0; e < 8; ++e) sv[e] = k0 + 2U * e + hf < own ? s[e] * P::kScaleLog2 : -__builtin_huge_valf();
             std::uint16_t pb[8];
             const float alpha = tile::online_step<O, 8, 2, tile::SumOf::rounded, 16>(sv, st, pb);
             const Frag pf = rowgroup_detail::p_frag(pb, hf);
+            const bool rescale = (Opt & kRgLazyRescale) == 0U || __builtin_amdgcn_ballot_w32(alpha != 1.0F) != 0U;
 #pragma unroll
             for (unsigned x = 0; x < G::kKs; ++x) {
+                if (rescale) {
 #pragma unroll
-                for (unsigned e = 0; e < 8; ++e) o[x][e] *= alpha;
+                    for (unsigned e = 0; e < 8; ++e) o[x][e] *= alpha;
+                }
                 o[x] = tile::mma<O>(tile::frag32(buf + G::kKBytes + (16U * x + ln) * G::kVPitch), pf, o[x]);
             }
         }
