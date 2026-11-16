@@ -159,6 +159,10 @@ int main() {
         EXPECT(!qc::copy_wide_pays(8, decode16));
         EXPECT(qc::copy_wide_pays(16, decode16));
         EXPECT(!qc::copy_wide_pays(9, decode16));
+        // the measured table by decode row cap (rtxmax5 t9 / rtxmax5r t11): cap 8 -> 62.5 off, cap 16 -> 29.2 on at 16 only
+        EXPECT(!qc::copy_wide_pays(16, qc::copy_wide_measured(8)));
+        EXPECT(qc::copy_wide_pays(16, qc::copy_wide_measured(16)));
+        EXPECT(!qc::copy_wide_pays(12, qc::copy_wide_measured(16)));
     }
     std::printf("%s (%d failures)\n", failures == 0 ? "COHORT PLAN PASS" : "COHORT PLAN FAIL", failures);
     return failures == 0 ? 0 : 1;

@@ -6,6 +6,7 @@
 #pragma once
 
 #include "strix/env_flags.hpp"
+#include "strix/cuda/core/decode_rows.hpp"
 #include "strix/cuda/qwen_cohort_plan.hpp"
 #include "strix/cuda/qwen_prefill.hpp"
 #include "strix/mtp_context_draft.hpp"
@@ -152,12 +153,14 @@ inline double copy_wide_accept_default() {
 // one session. sm_120 RTX PRO 6000 (qwen_decode_bench): 9.65 ms at 1 row, +1.1 ms per row to 17.2 ms at 8
 // rows, 62.5 ms flat for 9..16 rows (prefill-shaped families) -> 16 / 62.5 = 0.26 vs 8 / 17.2 = 0.46 tokens/ms: off
 // (served edit C1 -29 %, 3 ABAB pairs). Costs require manual recalibration after kernel changes; other devices need
-// separate qualification. A calibrated wide cost under ~34 ms enables auto (STRIX_QRTX_COPY_WIDE_MS).
+// separate qualification. A calibrated wide cost under ~34 ms enables auto (STRIX_QRTX_COPY_WIDE_MS). With the
+// backend's 9..16-row decode pieces (core::decode_rows_max() 16, the default) the calibrated sm_120 wide cost is 29.2 ms
+// (rtxmax5r t11) -> 16 / 29.2 = 0.55 tokens/ms: on at 16 rows (copy_wide_measured, by cap).
 // STRIX_QRTX_COPY_WIDE=1 forces it on, 0 off; the request field copy_rows
 // forces the rows of one request (measurement).
 inline const CopyWideModel& copy_wide_model() {
     static const CopyWideModel m = [] {
-        CopyWideModel w;
+        CopyWideModel w = copy_wide_measured(strix::cuda::core::decode_rows_max());
         w.wide_ms = strix::envcfg::number<double>("STRIX_QRTX_COPY_WIDE_MS", w.wide_ms, std::numeric_limits<double>::min());
         return w;
     }();

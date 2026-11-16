@@ -127,6 +127,15 @@ inline std::uint32_t choose_budget(std::uint32_t sessions, std::uint32_t depth, 
 struct CopyWideModel {
     double narrow_a_ms = 8.55, narrow_b_ms = 1.1, wide_ms = 62.5;
 };
+// Measured sm_120 decision table by the backend's decode row cap (strix/cuda/core/decode_rows.hpp), qwen_decode_bench on
+// the RTX PRO 6000: cap 8 -> 9..16 rows on the tiled prefill forms, 62.5 ms flat (rtxmax5 t9); cap 16 -> 8-row decode
+// pieces, 27.6 ms at 9 .. 29.2 ms at 16 (windows of 9..16 rows are padded to 16) (rtxmax5r t11). Served edit C1
+// copy_rows 16 vs 8: -29 % at cap 8, +12.7 % at cap 16 (3 ABAB pairs each, ids equal).
+inline CopyWideModel copy_wide_measured(unsigned decode_rows_cap) {
+    CopyWideModel m;
+    m.wide_ms = decode_rows_cap >= 16U ? 29.2 : 62.5;
+    return m;
+}
 inline bool copy_wide_pays(std::uint32_t rows, const CopyWideModel& m = {}) {
     if (rows <= kWindowRows || !(m.wide_ms > 0.0)) return false;
     const double narrow = static_cast<double>(kWindowRows) / (m.narrow_a_ms + m.narrow_b_ms * kWindowRows);
