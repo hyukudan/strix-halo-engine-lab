@@ -1,4 +1,5 @@
 #pragma once
+#include <strix/weight/family.hpp>
 
 #include <cstdint>
 #include <functional>
@@ -95,6 +96,7 @@ struct Resolved {
     // STRIX_DS41_DECODE_XPORT as BatchForward resolves it (strix/ds41_decode_xport.hpp): "communicator" / "channel",
     // then the origin ("default" / "explicit"). One rule for CLI, serve and engine; both ranks also agree at load.
     std::string decode_xport;
+    std::shared_ptr<const strix::weight::FamilyPlans> weight_plans{};
 };
 
 using Getenv = std::function<const char*(const char*)>;

@@ -627,6 +627,7 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
         if (cli.app == "serve" && row.serving_reason != nullptr && env(row.name) == nullptr)
             o << "host." << row.name << ".serving_reason=" << row.serving_reason << "\n";
     }
+    o << strix::weight::family_plan_notice(cli.weight_plans);
     return o.str();
 }
 

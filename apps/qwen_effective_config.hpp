@@ -1,4 +1,5 @@
 #pragma once
+#include <strix/weight/family.hpp>
 
 #include "strix/deploy/device.hpp"
 #include "strix/deploy/footprint.hpp"
@@ -128,6 +129,7 @@ struct EffectiveConfig {
     std::map<std::string, std::uint64_t> admission;
     QwenRouterBf16Reservation router_bf16_reservation;
     RotaryIdentity rotary_identity;
+    std::shared_ptr<const strix::weight::FamilyPlans> weight_plans{};
 };
 // Inspection knows resolved arithmetic, not an executed workload or its assets.
 // Native qualification callers may attach their actual compiled lineage.
@@ -2132,6 +2134,7 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
         out << "{\"rotary\":" << (config.rotary_identity.descriptor().mode() == RotaryMode::yarn ?
             config.rotary_identity.json() : o.rotary.json()) << ',';
     else out << "{\"rotary\":" << o.rotary.json() << ',';
+    out << "\"weight_plans\":" << serve::Json(strix::weight::family_plan_notice(config.weight_plans)).dump() << ',';
     out << "\"profile\":" << o.product_profile.json() << ',';
     if (!o.suppressed_yarn_request.empty())
         out << "\"suppressed_yarn_request\":\"" << yarn_json_error(o.suppressed_yarn_request) << "\",";

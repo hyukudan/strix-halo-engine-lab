@@ -14,6 +14,17 @@ add_library(strix-weight STATIC
     ${STRIX_WEIGHT_ROOT}/src/weight/adapters/gemma4.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/adapters/h3.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/adapters/vision.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/resolve.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/cache.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/image_identity.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/decision_table.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/runtime.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/family.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/levers.cpp
+    ${STRIX_WEIGHT_ROOT}/src/cpu/weight/runtime.cpp
+    ${STRIX_WEIGHT_ROOT}/src/hip/weight/runtime.cpp
+    ${STRIX_WEIGHT_ROOT}/src/cuda/weight/runtime.cpp
+    ${STRIX_WEIGHT_ROOT}/src/intel/weight/runtime.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/types.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/contracts.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/registry.cpp
@@ -73,3 +84,19 @@ function(strix_weight_link_consumers directory)
     endforeach()
 endfunction()
 cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}" CALL strix_weight_link_consumers "${CMAKE_SOURCE_DIR}")
+
+find_package(Threads REQUIRED)
+target_link_libraries(strix-weight PUBLIC Threads::Threads)
+
+option(STRIX_WFMT_NATIVE_HIP_RUNTIME "Compile native HIP image runtime callbacks" OFF)
+option(STRIX_WFMT_NATIVE_CUDA_RUNTIME "Compile native CUDA image runtime callbacks" OFF)
+if(STRIX_WFMT_NATIVE_HIP_RUNTIME)
+    find_package(hip CONFIG REQUIRED)
+    target_link_libraries(strix-weight PRIVATE hip::host)
+    target_compile_definitions(strix-weight PRIVATE STRIX_WFMT_HIP_RUNTIME=1)
+endif()
+if(STRIX_WFMT_NATIVE_CUDA_RUNTIME)
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(strix-weight PRIVATE CUDA::cudart)
+    target_compile_definitions(strix-weight PRIVATE STRIX_WFMT_CUDA_RUNTIME=1)
+endif()

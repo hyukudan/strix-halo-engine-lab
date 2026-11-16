@@ -1,4 +1,5 @@
 #pragma once
+#include <strix/weight/family.hpp>
 // MiniMax M3.1 defaults-on resolver (optimizations are ON by default in code and are
 // switched OFF, never the other way round). Host only, no HIP: the apps and the engine call apply() before they read
 // any switch, and the CPU tests diff the explicit host configuration against the measured production receipt,
@@ -112,6 +113,7 @@ struct Cli {
     std::uint32_t slots = 8;
     std::uint64_t capacity = 8256;
     std::uint32_t max_rows = 4096;
+    std::shared_ptr<const strix::weight::FamilyPlans> weight_plans{};
 };
 struct SessionConfig {
     bool enabled = true, disk = true;

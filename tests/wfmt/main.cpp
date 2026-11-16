@@ -13,6 +13,10 @@ bool wfmt_group_reads_test();
 bool wfmt_geometry_test();
 bool wfmt_iq3s_test();
 bool wfmt_reference_capture(std::string_view);
+bool wfmt_resolve_test();
+bool wfmt_cache_test();
+bool wfmt_effective_config_test();
+bool wfmt_runtime_test();
 int main(int argc, char** argv) try {
     if (argc == 3 && std::string_view(argv[1]) == "--wfmt-reference-capture")
         return wfmt_reference_capture(argv[2]) ? 0 : 1;
@@ -22,6 +26,11 @@ int main(int argc, char** argv) try {
     if (argc != 2) return 2;
     const std::string_view name(argv[1]);
     bool ok = false;
+    if (name == "resolve") ok = wfmt_resolve_test();
+    else if (name == "cache") ok = wfmt_cache_test();
+    else if (name == "effective-config") ok = wfmt_effective_config_test();
+    else if (name == "runtime") ok = wfmt_runtime_test();
+    else
     if (name == "contracts") ok = wfmt_contracts_test();
     else if (name == "census") ok = wfmt_census_test() == 0;
     else if (name == "readers") ok = wfmt_readers_test();
