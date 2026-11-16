@@ -17,6 +17,12 @@ target_include_directories(strix_qwen_cuda PUBLIC include src/cuda)
 # Every Qwen CUDA binary resolves its device through the start gate (strix-devices-v1) before its first allocation.
 include(${CMAKE_CURRENT_LIST_DIR}/StrixDevice.cmake)
 target_link_libraries(strix_qwen_cuda PUBLIC strix_device)
+
+add_executable(strix-cuda-qwen-logits apps/cuda_qwen_logits_main.cu)
+target_link_libraries(strix-cuda-qwen-logits PRIVATE strix_qwen_cuda)
+if(MSVC)
+    target_compile_options(strix-cuda-qwen-logits PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
 target_compile_options(strix_qwen_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
 if(MSVC)
     target_compile_options(strix_qwen_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
