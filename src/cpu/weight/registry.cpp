@@ -41,12 +41,15 @@ Status from_legacy(const ::strix::cpu::Q8a8View& view,std::span<const Byte> byte
  return q8_weight_from_legacy(bytes,std::move(owner),view.count,view.in,view.row_bytes,0,tensor,out);
 }
 ExecutionContext execution_context() {
- auto context=cpu_execution_context();
- auto callbacks=std::make_shared<RuntimeCallbacks>(*context.callbacks);
- callbacks->enqueue=[](const Plan& plan,const WeightView& weight,const KernelArguments& args,void* output,void*,std::size_t,ExecutionContext&) {
-  return dispatch(plan,weight,args,output);
- };
- context.callbacks=std::move(callbacks); return context;
+ static const auto callbacks=[] {
+  const auto base=cpu_execution_context();
+  auto result=std::make_shared<RuntimeCallbacks>(*base.callbacks);
+  result->enqueue=[](const Plan& plan,const WeightView& weight,const KernelArguments& args,void* output,void*,std::size_t,ExecutionContext&) {
+   return dispatch(plan,weight,args,output);
+  };
+  return result;
+ }();
+ return {Backend::cpu,nullptr,0,callbacks};
 }
 Status enqueue_dense(const WeightView& weight,const DenseArguments& args) {
  Plan plan{}; plan.selected=candidates()[0];
