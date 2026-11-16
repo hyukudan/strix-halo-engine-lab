@@ -1,3 +1,4 @@
+#include "strix/cohort_step_plan.hpp"
 #include "strix/hip_mtp_prime_rows.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
@@ -5052,7 +5053,7 @@ void hyper_mix_known_window_rows_launch(std::span<const ExecutionDispatchContext
 }
 void hyper_mix_known_window_cohort_launch(std::span<const std::span<const ExecutionDispatchContext>> segments,
     const HipHyperMixLauncherConfig& config) {
-    if(segments.size()<2U || segments.size()>8U || !config.splitk_projection || !config.lane_chain_output)
+    if(segments.size()<2U || segments.size()>kCohortWideMaxSessions || !config.splitk_projection || !config.lane_chain_output)
         throw std::invalid_argument("wide HC cohort requires split-K and lane-chain output");
     auto lead=prepare_hyper_rows(segments[0],config);
     HyperCohortRows rows{};

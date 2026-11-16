@@ -57,6 +57,10 @@ target_compile_options(qwen_quant_device_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>
 add_executable(qwen_cohort_plan_test tests/cuda/qwen_cohort_plan_test.cpp)
 target_include_directories(qwen_cohort_plan_test PRIVATE include)
 add_test(NAME qwen_cohort_plan COMMAND qwen_cohort_plan_test)
+# per-request session reservation + the serve's ONE RESOLVER check (host only)
+add_executable(qwen_session_reservation_test tests/session_reservation_tests.cpp)
+target_include_directories(qwen_session_reservation_test PRIVATE include)
+add_test(NAME qwen_session_reservation COMMAND qwen_session_reservation_test)
 add_executable(qwen_cohort_e2e tests/cuda/qwen_cohort_e2e.cu)
 target_link_libraries(qwen_cohort_e2e PRIVATE strix_qwen_cuda strix_qwen_handoff)
 # Multi-segment QSA core == per-segment layer_core on random data (device, no model): qwen_qsa_multi_test <tables dir>

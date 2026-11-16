@@ -24,15 +24,31 @@ using ::strix::profile::kind_name;
 using ::strix::profile::status_name;
 #include "strix/qwen_profile_table.hpp"
 inline std::span<const Lever> levers() { return table; }
-inline Name parse(std::string_view value) {
-    if (value == "default") return Name::standard;
-    if (value == "fast") return Name::fast;
-    if (value == "quality") return Name::quality;
-    throw std::invalid_argument("profile must be default, fast or quality");
-}
+inline Name parse(std::string_view value) { return ::strix::profile::parse(value); }  // default|fast|quality|turbo
+inline constexpr std::string_view kTurboVersion = "qwen-turbo-v1";
+// Weight sources this build loads under turbo (onfly / converted flip to runnable with their loaders).
+inline constexpr ::strix::profile::turbo::WeightCaps kWeightCaps{};
 struct Resolution {
     Name profile = Name::standard;
     std::vector<Entry> entries;
+    ::strix::profile::turbo::Weights weights{};  // weight toggle (native outside turbo)
+    bool is_turbo() const { return profile == Name::turbo; }
+    std::string versioned() const { return is_turbo() ? std::string(kTurboVersion) : std::string(name(profile)); }
+    // Effective lever values (not how they were set), as in the shared strix::profile::Resolution::fingerprint().
+    std::uint64_t fingerprint() const {
+        auto h = ::strix::host_fnv::field(::strix::host_fnv::offset64, versioned());
+        h = ::strix::host_fnv::field(h, qualification());
+        h = ::strix::host_fnv::field(h, weights.identity());
+        for (const auto& entry : entries) {
+            h = ::strix::host_fnv::field(h, entry.lever->name);
+            h = ::strix::host_fnv::field(h, entry.value);
+        }
+        return h;
+    }
+    // TURBO cache namespace: the profile, not only its switches, names the cache space (every lever off included).
+    std::string cache_namespace() const {
+        return is_turbo() ? ::strix::profile::turbo::cache_namespace(kTurboVersion, fingerprint(), weights.identity()) : std::string();
+    }
     const Entry* find(std::string_view key) const {
         for (const auto& entry : entries) if (entry.lever->name == key) return &entry;
         return nullptr;
@@ -52,6 +68,7 @@ struct Resolution {
     std::vector<std::string> notices() const {
         std::vector<std::string> out;
         if (profile == Name::quality) out.emplace_back("quality: no quality rows for this model, using default");
+        if (!weights.honoured()) out.push_back("profile turbo: " + weights.describe().substr(0, weights.describe().size() - 1U));
         for (const auto& entry : entries) if (entry.status == Status::provisional)
             out.push_back(std::string("profile ") + name(profile) + ": " + std::string(entry.lever->name) +
                 " is bit-changing; qualification in progress");
@@ -89,6 +106,16 @@ struct Resolution {
             if (entry.status == Status::unqualified) unqualified.push(serve::Json(std::string(lever.name)));
         }
         out.set("levers", std::move(rows));
+        if (is_turbo()) {
+            auto t = serve::Json::object();
+            t.set("version", serve::Json(std::string(kTurboVersion)));
+            t.set("weights_requested", serve::Json(weights.requested_text()));
+            t.set("weights", serve::Json(weights.identity()));
+            t.set("weights_origin", serve::Json(weights.origin));
+            t.set("weights_reason", serve::Json(weights.reason));
+            t.set("cache_namespace", serve::Json(cache_namespace()));
+            out.set("turbo", std::move(t));
+        }
         out.set("pending", std::move(pending));
         out.set("provisional", std::move(provisional));
         out.set("unqualified", std::move(unqualified));
@@ -101,6 +128,7 @@ struct Inputs {
     Pairs cli;
     Lookup env;
     bool allow_pending = false;
+    ::strix::profile::turbo::WeightsRequest weights{};  // --turbo-weights / --turbo-weight-bits / --turbo-weights-pack
 };
 using ::strix::profile::environment;
 // Export provenance survives a future re-exec. A changed inherited value
@@ -110,11 +138,13 @@ inline std::string marker(Name profile, Status status, std::string_view value) {
     return std::string(name(profile)) + ":" + status_name(status) + ":" + std::string(value);
 }
 inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<const Lever> rows = levers()) {
-    Resolution out{profile, {}};
+    Resolution out{profile, {}, {}};
     const char* allow = environment(inputs.env, "STRIX_QWEN_PROFILE_ALLOW_PENDING");
     const bool allow_pending = inputs.allow_pending || (allow && std::string_view(allow) == "1");
-    const auto column = static_cast<unsigned>(profile);
+    out.weights = ::strix::profile::turbo::resolve_weights(out.is_turbo(), inputs.weights,
+        [&inputs](const char* key) { return environment(inputs.env, key); }, kWeightCaps);
     for (const auto& lever : rows) {
+        const auto column = ::strix::profile::value_column(lever, profile);  // empty turbo cell: the fast cell
         const std::string* cli = nullptr;
         for (const auto& [key, value] : inputs.cli) if (key == lever.name) cli = &value;
         const char* env = lever.env.empty() ? nullptr : environment(inputs.env, std::string(lever.env));
@@ -127,10 +157,11 @@ inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<con
             inherited = owned && std::string_view(owned) == marker(profile, status, env) &&
                 (status != Status::pending);
         }
-        Entry entry{&lever, std::string(lever.builtin), Status::builtin, {}, false, {}};
+        Entry entry{&lever, std::string(lever.builtin), Status::builtin, {}, false, {}, std::string(wanted)};
         if (cli || (env && !inherited)) {
             entry.cli_override = cli != nullptr;
             entry.value = cli ? *cli : env;
+            entry.requested = entry.value;
             entry.status = cli ? Status::explicit_cli : Status::explicit_env;
             if ((!lever.off.empty() && entry.value == lever.off) || entry.value == "off") entry.status = Status::off;
             bool runnable = false;
@@ -179,9 +210,11 @@ inline void withdraw_declined(const Resolution& resolution, const Lookup& get = 
             throw std::runtime_error("cannot withdraw profile switch " + key);
     }
 }
-// Apply after route admission, before device switch readers. Emit notices
-// once at startup; if a re-exec is added, emit them in its final process image.
-inline void apply(const Resolution& resolution, const Export& put = export_environment) {
+// Pure proposal for a local map, including pending weights during inspection.
+inline void propose_exports(const Resolution& resolution, const Export& put) {
+    if (resolution.is_turbo() && !put(std::string(::strix::profile::turbo::kCacheNamespaceEnv).c_str(),
+                                      resolution.cache_namespace().c_str()))
+        throw std::runtime_error("cannot export " + std::string(::strix::profile::turbo::kCacheNamespaceEnv));
     for (const auto& entry : resolution.entries) {
         const auto& lever = *entry.lever;
         // Native CLI overrides already live in Options; exporting them would
@@ -192,6 +225,11 @@ inline void apply(const Resolution& resolution, const Export& put = export_envir
             !put(marker_key(lever).c_str(), marker(resolution.profile, entry.status, entry.value).c_str()))
             throw std::runtime_error("cannot export profile switch " + std::string(lever.env));
     }
+}
+// Admit execution after route resolution and before device switch readers.
+inline void apply(const Resolution& resolution, const Export& put = export_environment) {
+    resolution.weights.require_honoured();
+    propose_exports(resolution, put);
 }
 // Profile policy has no numerical identity bytes of its own. Only applied
 // arithmetic switches belong in session/prefix identities.
@@ -206,6 +244,15 @@ inline bool take_option(int argc, char** argv, int& i, std::optional<Name>& prof
     const auto equal = arg.find('=');
     const auto key = arg.substr(0, equal);
     if (arg == "--allow-pending") { inputs.allow_pending = true; return true; }
+    namespace tb = ::strix::profile::turbo;
+    if (key == tb::kWeightsOption || key == tb::kBitsOption || key == tb::kPackOption) {
+        const auto value = equal != std::string_view::npos ? arg.substr(equal + 1U) :
+            (i + 1 < argc ? std::string_view(argv[++i]) : std::string_view{});
+        if (value.empty() || value.starts_with("--")) throw std::invalid_argument(std::string(key) + " requires a value");
+        (key == tb::kWeightsOption ? inputs.weights.source : key == tb::kBitsOption ? inputs.weights.bits :
+            inputs.weights.pack) = std::string(value);
+        return true;
+    }
     const Lever* lever = nullptr;
     for (const auto& row : levers()) if (!row.native_option && key == row.option) lever = &row;
     if (key != "--profile" && !lever) return false;
