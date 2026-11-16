@@ -1484,7 +1484,7 @@ bool enqueue_routed(const Rows& v, std::uint32_t rows, const Weights& w, const a
     }
     enqueue_project(v, rows, w, tables, s, moe_mma);
     enqueue_down(v, rows, w, s, moe_mma);
-    // enqueue_project / enqueue_down_storage run the rows kernels for <= kRowsMax rows (decode kernels on): no MMA ran.
+    // enqueue_project / enqueue_down_storage run the rows kernels for at most kRowsMax rows with the decode kernels on: no MMA ran.
     return moe_mma && !(rows <= kRowsMax && decode_rows_enabled());
 }
 void enqueue_combine(const Rows& v, std::uint32_t rows, std::uint32_t* record, cudaStream_t s) {
