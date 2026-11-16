@@ -42,13 +42,13 @@ Status bind_model(const TensorIndex& index,const FamilySchema& schema,WeightMap&
     for(const auto& raw:index.tensors) {
         if(schema.text_only && index.container!=Container::gguf && !raw.name.starts_with("model.language_model.") && raw.name!="lm_head.weight")continue;
         const bool trellis=raw.name.ends_with(".trellis");
-        const bool standalone=std::any_of(schema.roles.begin(),schema.roles.end(),[&](const auto& p){return p.standalone && raw.name.find(p.pattern)!=std::string::npos;});
+        const bool standalone=std::any_of(schema.roles.begin(),schema.roles.end(),[&](const auto& p){return p.standalone && p.matches(raw.name);});
         const bool weight=raw.name.ends_with(".weight") || raw.name.ends_with("_weight") || standalone;
         const bool bias=raw.name.ends_with(".bias");
         // Sidecars are attached by schema to their weight, not advertised as independent matrices.
         if(!weight && !trellis && !bias)continue;
         TensorBinding b{};b.tensor=raw.id;b.logical_shape=raw.shape;b.expert_axis=UINT32_MAX;b.role=Role::dense_up;
-        for(const auto& pattern:schema.roles)if(raw.name.find(pattern.pattern)!=std::string::npos){b.role=pattern.role;break;}
+        for(const auto& pattern:schema.roles)if(pattern.matches(raw.name)){b.role=pattern.role;break;}
         const bool expert=raw.name.find("experts")!=std::string::npos || raw.name.find("_exps")!=std::string::npos;
         if(expert){if(raw.shape.rank>2)b.expert_axis=0;if(b.role==Role::dense_gate)b.role=Role::expert_gate;if(b.role==Role::dense_up)b.role=Role::expert_up;if(b.role==Role::dense_down)b.role=Role::expert_down;}
         Parameters p{};
