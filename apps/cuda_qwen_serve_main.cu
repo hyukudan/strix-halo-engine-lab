@@ -48,6 +48,7 @@
 #include <vector>
 
 #include "strix/preflight.hpp"
+#include "strix/qwen_weight_packs.hpp"
 
 // The node's preflight (src/preflight.cpp) is POSIX-only; it is reached only through ApiConfig::health_record, which this
 // server does not set.
@@ -80,6 +81,7 @@ struct Options {
     double prefill_auto_k = 1.0;                // auto: target chunk time = k decode steps
     std::string cohort_depth = "fair";
     std::uint32_t slot_margin_mib = 2048;       // free VRAM that must remain after a new slot's session
+    bool print_effective_config = false;        // print the resolved weight pack + server values as JSON, load nothing
 };
 
 Options parse(int argc, char** argv) {
@@ -113,7 +115,8 @@ Options parse(int argc, char** argv) {
             if (end != value.size() || count > UINT32_MAX) throw std::invalid_argument(a + " token count out of range");
             return static_cast<std::uint32_t>(count);
         };
-        if (a == "--prefix-cache") {
+        if (a == "--print-effective-config") o.print_effective_config = true;
+        else if (a == "--prefix-cache") {
             const auto value = next();
             if (value != "on" && value != "off") throw std::invalid_argument("--prefix-cache is on or off");
             o.prefix.enabled = value == "on";
@@ -662,6 +665,22 @@ int main(int argc, char** argv) {
     strix::device::bind_cuda_main(argc, argv);
     try {
         const auto o = parse(argc, argv);
+        if (o.print_effective_config) {  // the same admission the engine load runs (qwen_packs::admit_file)
+            const auto ad = strix::qwen_packs::admit_model(o.engine.model_gguf);
+            std::cout << "{\"model\":\"" << o.engine.model_gguf << "\",\"weight_pack\":";
+            if (ad.pack)
+                std::cout << "{\"id\":\"" << ad.pack->id << "\",\"arithmetic\":\"" << ad.pack->arithmetic
+                          << "\",\"route\":\"" << ad.pack->route << "\"";
+            else
+                std::cout << "{\"id\":null";
+            std::cout << ",\"fingerprint\":\"" << strix::qwen_packs::hex64(ad.fingerprint) << "\",\"tensors_by_type\":{";
+            const char* sep = "";
+            for (const auto& [type, n] : ad.tensors_by_type) { std::cout << sep << '"' << type << "\":" << n; sep = ","; }
+            std::cout << "},\"declined\":\"" << ad.reason << "\"},\"http_slots\":" << o.http_slots
+                      << ",\"max_positions\":" << o.engine.max_positions << ",\"prefix_cache\":"
+                      << (o.prefix.enabled ? "true" : "false") << "}\n";
+            return ad.pack ? 0 : 3;
+        }
         std::cerr << "strix-cuda-qwen-serve: loading " << o.engine.model_gguf << std::endl;
         qp::Prefill engine(o.engine);
         std::cerr << "strix-cuda-qwen-serve: loaded " << engine.describe() << std::endl;
