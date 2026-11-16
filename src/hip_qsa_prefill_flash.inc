@@ -334,7 +334,10 @@ __device__ __forceinline__ void select_row_body(float* const scores, std::uint32
     // the band remain approximate. Union-cap consumers request preserve_scores,
     // so selected values are restored exactly before they leave this selector.
     [[maybe_unused]] __shared__ SelectBandStorage<Band> band_storage;
-    if constexpr (Band) {
+    // Rows scored by the VALU kernel (no band query) take the incumbent path inside the band instantiation: one
+    // copy of the selector's LDS per kernel.
+    [[maybe_unused]] const bool band_on = Band && band.query != nullptr;
+    if constexpr (Band) if (band_on) {
         if (tid < 32U) {  // wave 0 cooperates (band_state is a wave function)
             const BandState s = band_state(band);
             if (tid == 0U) band_storage.state = s;
@@ -393,7 +396,7 @@ __device__ __forceinline__ void select_row_body(float* const scores, std::uint32
     std::uint32_t prefix = 0, mask = 0, need = block_topk;
     const bool enough = radix([&](std::uint32_t g) { return row_max[g]; }, groups, prefix, mask, need);
     float group_cut = -INFINITY;
-    if constexpr (Band) {
+    if constexpr (Band) if (band_on) {
         float m = INFINITY;
         if (enough) for (unsigned g = tid; g < groups; g += kSelectThreads)
             if (row_max[g] > -INFINITY && (select_key(row_max[g]) & mask) == prefix) m = fminf(m, row_max[g]);
@@ -406,7 +409,7 @@ __device__ __forceinline__ void select_row_body(float* const scores, std::uint32
     for (std::uint32_t base = 0; exact && base < groups; base += kSelectThreads) {
         const auto g = base + tid;
         const float m = g < groups ? row_max[g] : -INFINITY;
-        const bool keep = m > -INFINITY && (Band ? m >= group_cut : (select_key(m) & mask) >= prefix);
+        const bool keep = m > -INFINITY && (band_on ? m >= group_cut : (select_key(m) & mask) >= prefix);
         std::uint32_t tile = 0;
         const auto at = taken + select_scan(keep ? 1U : 0U, waves, tile) - (keep ? 1U : 0U);
         if (keep && at < kCandidates / kGroup) cand_group[at] = g;
@@ -418,7 +421,7 @@ __device__ __forceinline__ void select_row_body(float* const scores, std::uint32
         if (exact) { atomicAdd(&stats[kCandidateGroups], taken); atomicMax(&stats[kCandidateMax], taken); }
     }
     if (!exact) {
-        if constexpr (Band) {
+        if constexpr (Band) if (band_on) {
             // Fewer finite maxima need not mean fewer finite blocks. Restore all
             // scores before the incumbent fallback, including its zero padding.
             band_rescore_all(scores, complete, band, band_storage.state);
@@ -434,7 +437,7 @@ __device__ __forceinline__ void select_row_body(float* const scores, std::uint32
         cand[i] = block < complete ? scores[block] : -INFINITY;
     }
     __syncthreads();
-    if constexpr (Band) {
+    if constexpr (Band) if (band_on) {
         need = block_topk;
         radix([&](std::uint32_t i) { return cand[i]; }, n, prefix, mask, need);
         float t = INFINITY;
@@ -466,7 +469,7 @@ __device__ __forceinline__ void select_row_body(float* const scores, std::uint32
             const auto block = cand_group[i / kGroup] * kGroup + i % kGroup, slot = g + min(e, need);
             for (std::uint32_t offset = 0; offset < compress_ratio; ++offset)
                 selected[slot * compress_ratio + offset] = block * compress_ratio + offset;
-            if constexpr (Band) {
+            if constexpr (Band) if (band_on) {
                 if (preserve_scores) scores[block] = band_exact_score(band, band_storage.state, block);
             }
             if (!preserve_scores) scores[block] = -INFINITY;
@@ -505,9 +508,7 @@ __global__ __launch_bounds__(kSelectThreads) void select_band_batch_kernel(const
     std::uint32_t compress_ratio, std::uint32_t block_topk) {
     const SelectRow row = rows[blockIdx.x];
     const BandRow band = bands[blockIdx.x];
-    if (band.query)
-        select_row_body<false, true>(row.scores, row.selected, row.visible, row.maxima, compress_ratio, block_topk, nullptr, row.pad != 0U, band);
-    else select_row_body<false>(row.scores, row.selected, row.visible, row.maxima, compress_ratio, block_topk, nullptr, row.pad != 0U);
+    select_row_body<false, true>(row.scores, row.selected, row.visible, row.maxima, compress_ratio, block_topk, nullptr, row.pad != 0U, band);
 }
 // One serial decode row (STRIX_QSA_DECODE_SELECT): the 4-block group maxima of a finished score row, with score_kernel's
 // expression fmaxf(fmaxf(s0, s1), fmaxf(s2, s3)) and -inf past the row's blocks, then select_row_body over them.
