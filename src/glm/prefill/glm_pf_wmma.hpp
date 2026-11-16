@@ -36,9 +36,17 @@ inline std::atomic<std::uint64_t> calls{0};  // launches that ran on the WMMA co
 
 namespace strix::glm::pf::mla_wmma {
 // FAST identity glm-pf-mla-wmma-v1 (glm_pf_mla_wmma.hpp): the MLA absorb / out GEMMs on the shared short-K FP16 WMMA
-// tile GEMM (core/f16_tile_gemm.hpp). Opt-in until its FAST gate passes: STRIX_GLM_PF_MLA_WMMA=1 selects it, unset or 0
-// keeps the exact FP32 GEMM. Part of the TP2 startup agreement (rank_defaults::kPfMlaWmmaConfig).
-inline bool enabled() { return envcfg::flag("STRIX_GLM_PF_MLA_WMMA", false); }
+// tile GEMM (core/f16_tile_gemm.hpp). FAST gate PASS (vs FAST without it: KL 0.0053, top-1 98.2 %, dNLL -0.0002, 1,536
+// rows prose/code/chat): on by default when the FAST prefill route is selected (STRIX_GLM_PF_WMMA=1);
+// STRIX_GLM_PF_MLA_WMMA=0 opts out (exact FP32 GEMM), =1 forces it. The exact route (FAST not selected, switch unset)
+// never takes it. Part of the TP2 startup agreement (rank_defaults::kPfMlaWmmaConfig).
+inline bool enabled() {
+    const char* p = std::getenv("STRIX_GLM_PF_MLA_WMMA");
+    if (p == nullptr || *p == '\0') return wmma_x::enabled();
+    if (std::strcmp(p, "0") == 0) return false;
+    if (std::strcmp(p, "1") == 0) return true;
+    throw std::invalid_argument("STRIX_GLM_PF_MLA_WMMA must be 0 or 1");
+}
 // With it: the fused flash core stores o-bar as the FP16 image the out GEMM's staging would make (same bits, half the
 // o-bar bytes written and read). Default on; STRIX_GLM_PF_MLA_OB16=0 restores the FP32 o-bar.
 inline bool ob16() { return envcfg::flag("STRIX_GLM_PF_MLA_OB16", true); }
