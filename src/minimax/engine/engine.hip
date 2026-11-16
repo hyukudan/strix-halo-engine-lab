@@ -3655,6 +3655,7 @@ void Engine::set_prefill_dense_mlp(bool on) {
     impl_->pf_dense_mlp = on;
 }
 bool Engine::prefill_dense_mlp() const { return impl_->pf_dense_mlp; }
+std::uint64_t Engine::prefill_dense_mlp_count() const { return impl_->pf_dense_mlp_calls; }
 void Engine::set_prefill_msa_rework(unsigned mode) {
     impl_->no_task("set_prefill_msa_rework");
     impl_->set_prefill_msa_rework(mode);

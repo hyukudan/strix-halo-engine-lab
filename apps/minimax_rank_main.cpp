@@ -1125,11 +1125,14 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     // pfattn4 / pfmsa / pfmsarework / mtfit / core8 / pftab / pfgufuse / pfidx / pftxuc / pfrouter / pfidxconc / pfkvtile / pftiled: A B A B A B A (every B bracketed by two A prefills); the other prefill flags: A B A B A B
     const int prefills = flag == "attn" || flag == "linears" || flag == "xfer" || flag == "idxdec" || flag == "idxconc" || flag == "xbfold" || flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbpub" || flag == "xbwarm" || flag == "xbwarmo" || flag == "moegrid" || flag == "moepipe" || flag == "xbilp" || flag == "xbset" ? 1 : (flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall" || flag == "pfi4") ? 7 : 6;  // idxattn: both  // decode-only flags: one prefill, no TTFT cells
     first.resize(static_cast<std::size_t>(prefills));
+    std::vector<std::uint64_t> dense_mlp_calls;
     for (int r = 0; r < prefills; ++r) {
         set(r % 2 == 1);
+        const auto dense_before = eng.prefill_dense_mlp_count();
         const auto t0 = Clock::now();
         first[static_cast<std::size_t>(r)] = eng.prefill(0, prompt, 0);
         ttft[r % 2].push_back(secs(t0, Clock::now()));
+        dense_mlp_calls.push_back(eng.prefill_dense_mlp_count() - dense_before);
         if (hash_state) {
             states.push_back(eng.state_fnv(0, prompt.size()));
             outs.push_back(eng.prefill_out_fnv());
@@ -1267,6 +1270,17 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
         if (!same_state || !same_out) g_exact_fail = true;
     }
     if (!same_first) g_exact_fail = true;
+    if (flag == "pfdensemlp") {
+        bool covered = true;
+        std::printf("rank %u ab-%s: candidate calls per prefill (A B A B ...):", eng.rank(), flag.c_str());
+        for (std::size_t i = 0; i < dense_mlp_calls.size(); ++i) {
+            const auto calls = dense_mlp_calls[i];
+            std::printf(" %llu", static_cast<unsigned long long>(calls));
+            covered &= i % 2 == 0 ? calls == 0 : calls > 0;
+        }
+        std::printf(" -> %s\n", covered ? "COVERED (A=0, B>0)" : "UNQUALIFIED (requires A=0 and B>0 on every prefill; fallback equality only)");
+        if (!covered) g_exact_fail = true;
+    }
     std::printf("rank %u ab-%s: decode ms/token median per block (A=off, B=on):", eng.rank(), flag.c_str());
     for (int b = 0; b < blocks; ++b) {
         // drop the block's first 2 steps (arm switch)
