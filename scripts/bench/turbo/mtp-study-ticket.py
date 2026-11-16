@@ -18,7 +18,7 @@ plan = json.loads(a.plan.read_text())
 begin = time.monotonic()
 for arm in plan:
     left = a.budget - int(time.monotonic() - begin) - 5
-    if left < 25:
+    if left < arm.get("min_seconds", 35):
         raise SystemExit(f"insufficient startup budget before {arm['tag']}: {left}s")
     env = dict(os.environ, LEFT=str(left), SLOTS="2", MAXTOK=str(arm.get("tokens", 192)))
     env.update({str(k): str(v) for k, v in arm.get("adapter_env", {}).items()})
@@ -37,7 +37,10 @@ for arm in plan:
                     "STRIX_HTTP_SLOT_TIMING=1", *settings], env=env, check=True)
     result = root / "runs" / arm["tag"] / "res.jsonl"
     rows = [json.loads(x) for x in result.read_text().splitlines()]
-    if len(rows) != len(arm.get("requests", "C1,C1").split(",")) or any(
+    expected_requests = len(arm.get("requests", "C1,C1").split(","))
+    if len(rows) != expected_requests:
+        raise SystemExit(f"incomplete requests for {arm['tag']}: {len(rows)}/{expected_requests}")
+    if any(
         r["errors"] or not r["tokens"] or not all(l["cycle_accounting_valid"] for l in r["lanes"])
         for r in rows
     ):

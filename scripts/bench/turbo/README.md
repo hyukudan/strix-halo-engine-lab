@@ -6,7 +6,7 @@ The decode layout census reads only a GGUF header and reports eligible projectio
 python3 scripts/bench/turbo/decode-layout.py MODEL --verify-rows 8 --emitted-per-pass E
 ```
 
-Its byte bounds are logical weight visits, not a DRAM counter. The present launcher leaves K=640 shared-down copies unused; the census reports them separately. Embedding lookup, draft, KV, activation traffic, cache residency and repeated loads are excluded.
+Its byte bounds are logical weight visits, not a DRAM counter. K=640 shared-down projections use the native fallback, and the loader skips their unsupported INT4 copies; the census reports this historically unused allocation separately. Embedding lookup, draft, KV, activation traffic, cache residency and repeated loads are excluded.
 
 Use the census shapes for full-model traffic accounting. The projection fixture uses representative shapes; its QSA input has 13,952 outputs, while the measured pack has 13,312 (12,288 + 512 + 512). Its microsecond figures are not whole-model pass times.
 
@@ -16,11 +16,23 @@ For draft/verification diagnostics, `mtp-study-ticket.py PLAN.json` runs declare
 
 `STRIX_MTP_WEIGHT_LOG=1` prints actual draft source/transform groups and target verify/commit groups. `STRIX_MTP_VERIFY_LOG=1` records every evaluated proposal row, including rows after a rejected prefix; `reached`, `eligible`, `accepted`, and `greedy_accept` distinguish prefix acceptance from teacher-forced equality. Logs carry monotonic timestamps for request attribution. These diagnostics change no arithmetic when disabled.
 
-An arm with `logits: true` writes a full target-row dump using `STRIX_MTP_LOGITS_DUMP`. Enable `TURBODEC_KEEP_TOKEN_IDS=1` to retain the completion ledger. `mtp-study-analyze.py RUN_E RUN_T --logits E.logits T.logits --out result.json` computes per-depth acceptance, joint proposal/target agreement and KL only for identical committed and speculative token contexts. The dump's window-input hash alone does not establish a full-context match. Forced full-chain/one-commit diagnostics are excluded from ordinary accounting gaps and must never supply qualification timings.
+An arm with `logits: true` writes a full target-row dump using `STRIX_MTP_LOGITS_DUMP`. Enable `TURBODEC_KEEP_TOKEN_IDS=1` to retain the completion ledger. `mtp-study-analyze.py RUN_E RUN_T --logits E.logits T.logits --out result.json` computes per-depth acceptance, joint proposal/target agreement and KL only for identical committed and speculative token contexts. Serial prompt-tail dumps are excluded using the recorded prompt length. The dump's window-input hash alone does not establish a full-context match. `--context-only` permits different physical row shapes while still requiring the complete token history, and reports each matched shape pair. Forced full-chain/one-commit diagnostics are excluded from ordinary accounting gaps and must never supply qualification timings. `mtp-study-controller.py RUN... --out costs.json` reports observed warm cost and emissions by row bucket; differing contexts make these descriptive costs, not a causal fit.
 
 The shared IU4 R7/R8 candidate is controlled by `STRIX_IU4_R8_SINGLE_DECODE` (default `0`, old halves). `1` or `auto` admits staged single decode where the LDS allocation preserves the resident block count. `force` tests every legal R7/R8 group; it is a diagnostic setting used to measure the remaining crossover rather than assuming occupancy predicts performance. The projection fixture byte-compares every candidate group against both R4 halves before reporting timing. Inspect compiled scratch/spills, address-space lowering and LDS as well as elapsed time. Wider tensor conversion is a distinct, bit-changing quality decision; the census does not enable it.
 
 `STRIX_Q8_ROWS_ONFLY_ROW_INVARIANCE=1` runs a separate same-input/weight row-bucket fixture at K=2048/2560/4096/6144. `mtp-study-row-summary.py LOG --output JSON` requires all 624 observations and its completion marker. Projection-vector argmax is a diagnostic, not a token-level quality gate. `mtp-study-resources.py --binary BIN --output DIR` captures compiled HIP resources and a matched old/new R8 ISA pair. Protocol tests run with `python -m unittest discover -s scripts/bench/turbo -p test_mtp_study.py`.
+
+The shared row-decode resolver and runtime use the same `STRIX_IU4_R8_SINGLE_DECODE` parser:
+
+|Value|Effective row-decode policy|
+|---|---|
+|unset, `auto`, `1`|Automatic: single weight decode for gfx1151 wave32, 7/8 rows, K=6144 and N=2560; other shapes retain split decode.|
+|`0`, `off`|Split decode.|
+|`force`|Diagnostic single decode for every legal group count (32/40/64/96) at 7/8 rows.|
+
+Effective configuration prints `turbo_weights.row_decode` requested/effective/enabled/reason/scope/device_requirement fields. Inspection that has not selected a device and projection shape reports `pending-device-and-shape`; it does not claim that every projection uses single decode. Full-model before/after qualification remains separate from the projection fixture.
+
+`python3 scripts/bench/turbo/mtp-study-pairs.py OUTPUT_ROOT --before-binary BEFORE --after-binary AFTER --prefix mtp --pairs 3` pools the declared interleaved exact/before/after cold and warm receipts and checks before/after token IDs.
 
 The source-controlled ticket runner and HTTP client are documented in [the decode-study workflow](decode-study.md). A deployment supplies only its model-specific server command adapter and assets; binary, model and prompt paths are parameters. Use the same binary, model, MTP bundle, prompts, slot budget and explicit numerical options in both arms. Count emitted tokens, retain invalid startup attempts, record both first and last prefill, use strict alternating pairs, and include the GPU busy fraction in clocks per token. Pre-cache files consistently before bounded tickets when startup requires it.
 

@@ -1,5 +1,6 @@
 """Protocol tests: a shared window is insufficient without a shared committed prefix."""
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -29,6 +30,48 @@ def run(ids, request_sha='same'):
     return [request], lambda ns: (0, request), {0: []}, {}
 
 class ContextMatching(unittest.TestCase):
+    def test_verification_prefix_and_http_ledger_are_independent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            (path / 'clock-anchor.json').write_text(json.dumps(dict(epoch_ns=0, monotonic_ns=0)))
+            lane = dict(start=0, end=2, lane=0, acc=1)
+            (path / 'res.jsonl').write_text(json.dumps(dict(t0=0, lanes=[lane])) + '\n')
+            line = ('mtp-verify ns=1000000000 at=100 d=1 rows=2 active=2 budget=2 diagnostic=0 '
+                    'proposal=6 target=6 equal=1 eligible=1 reached=1 accepted=1 greedy_accept=1 eos=0 p=0.9\n')
+            (path / 'srv.err').write_text(line)
+            loaded = study.load_run(path)
+            self.assertEqual(loaded[3][(0, 'code', 1)]['independently_expected_accept'], 1)
+            (path / 'srv.err').write_text(line.replace('greedy_accept=1', 'greedy_accept=0'))
+            with self.assertRaisesRegex(ValueError, 'prefix reconstruction'):
+                study.load_run(path)
+            (path / 'srv.err').write_text(line)
+            lane['acc'] = 0
+            (path / 'res.jsonl').write_text(json.dumps(dict(t0=0, lanes=[lane])) + '\n')
+            with self.assertRaisesRegex(ValueError, 'HTTP accepted-token ledger'):
+                study.load_run(path)
+
+    def test_prompt_tail_does_not_rebase_completion_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'rows.bin'
+            write_dump(path, [(94, [42]), (99, [9]), (100, [5, 42]), (101, [8])])
+            indexed, counts = study.indexed_logits(path, run([5, 8]))
+            self.assertEqual(counts['prompt_rows'], 2)
+            self.assertEqual(counts['indexed'], 3)
+            self.assertEqual(counts['ledger_mismatch'], 0)
+            self.assertEqual(counts['missing_window_base'], 0)
+            self.assertEqual(len(indexed), 3)
+
+    def test_cross_row_matching_requires_complete_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            left, right = Path(tmp) / 'l.bin', Path(tmp) / 'r.bin'
+            write_dump(left, [(100, [5, 42])])
+            write_dump(right, [(100, [5]), (101, [42])])
+            matched = study.compare_logits(left, right, run([5, 42]), run([5, 42]), context_only=True)
+            self.assertEqual(matched['matched_context_rows'], 2)
+            self.assertTrue(any(r['left_row'] == 1 and r['right_row'] == 0 for r in matched['row_pairs']))
+            changed = study.compare_logits(left, right, run([5, 8]), run([5, 8]), context_only=True)
+            self.assertEqual(changed['matched_context_rows'], 1)
+
     def test_speculative_input_need_not_match_eventual_completion(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'rows.bin'
