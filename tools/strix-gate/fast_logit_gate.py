@@ -454,9 +454,19 @@ RECEIPT_PREFIX = "strix-route-receipt "
 MM_OUTPUT_SWITCHES = frozenset({"STRIX_MM_QUALITY_OUT", "STRIX_MM_QUALITY_ROWS", "STRIX_MM_QUALITY_SELECT", "STRIX_MM_STATE_FNV",
                                 "STRIX_MM_DIAG_ATTN_ULP"})
 # The FAST layer set's own lever and switches: ignored by config_difference (candidate == reference + this layer set).
-MM_FAST_SWITCHES = frozenset({"STRIX_MM_PF_MSA_FLASH", "STRIX_MM_PF_MSA_FLASH_LAYERS", "STRIX_MM_FAST_PREFILL"})
-MM_FAST_LEVERS = frozenset({"minimax.msa_flash"})
+# The index projection member (minimax-index-proj-wmma-v1) is part of the witnessed FAST layer set too.
+MM_FAST_SWITCHES = frozenset({"STRIX_MM_PF_MSA_FLASH", "STRIX_MM_PF_MSA_FLASH_LAYERS", "STRIX_MM_FAST_PREFILL",
+                              "STRIX_MM_PF_IDX_WMMA", "STRIX_MM_PF_IDX_WMMA_LAYERS"})
+MM_FAST_LEVERS = frozenset({"minimax.msa_flash", "minimax.index_proj_wmma"})
 MM_DIAG = re.compile(rb'DIAG attn ulp: layer (\d+) seed (\d+) rows (\d+) pos0 (\d+) values (\d+) prompt ("(?:[^"\\]|\\.)*")\s*')
+MM_INDEX_EXEC = re.compile(rb'minimax-index-proj-executed rank (\d+) tokens (\d+) token_fnv ([0-9a-f]{16}) layers ([01]{60})\s*')
+
+
+def token_fnv1a64(data):
+    value = 14695981039346656037
+    for byte in data:
+        value = ((value ^ byte) * 1099511628211) & ((1 << 64) - 1)
+    return f"{value:016x}"
 
 
 def canonical_sha(obj):
@@ -524,6 +534,31 @@ def minimax_execution(log, rank, prompts):
         if not layers:
             raise GateError("witness: MSA flash selected on no layer")
         fast = {"policy": "msa-flash", "msa_flash_mode": 10 + int(m.group(1)), "layers": layers}
+    # Index projections on WMMA (receipts before the lever existed: absent = off). The FAST layer set is the union,
+    # so the floor's onset is the first layer either member changes.
+    ip = re.fullmatch(r"(0|1:layers=([01]+))", levers.get("minimax.index_proj_wmma", "0"))
+    if not ip:
+        raise GateError(f"witness: unexpected minimax.index_proj_wmma value {levers['minimax.index_proj_wmma']!r}")
+    if ip.group(2) is not None:
+        idx_layers = [i for i, ch in enumerate(ip.group(2)) if ch == "1"]
+        if not idx_layers:
+            raise GateError("witness: index projection WMMA selected on no layer")
+        executed = set()
+        for line in log.splitlines():
+            if not line.startswith(b"minimax-index-proj-executed "):
+                continue
+            event = MM_INDEX_EXEC.fullmatch(line)
+            if event is None or int(event[1]) != rank or event[4].decode() != ip.group(2):
+                raise GateError("witness: malformed or inconsistent index WMMA execution evidence")
+            if int(event[2]) <= 8:
+                raise GateError("witness: index WMMA execution has too few rows")
+            executed.add((int(event[2]), event[3].decode()))
+        for name, prompt in prompts.items():
+            if (prompt["tokens"], prompt.get("tokens_fnv1a64")) not in executed:
+                raise GateError(f"witness: missing completed index WMMA execution for prompt {name!r}")
+        fast = ({"policy": "index-proj", "msa_flash_mode": 10, "layers": idx_layers} if fast is None else
+                {"policy": "msa-flash+index-proj", "msa_flash_mode": fast["msa_flash_mode"],
+                 "layers": sorted(set(fast["layers"]) | set(idx_layers))})
     plain = levers["minimax.moe_prefill_format"] == "exl3" and levers["minimax.prefill_identity"] == "default"
     profile = ("fast-prefill" if fast else "exact") if plain else "other"
     diag, covered = [], set()
@@ -572,9 +607,12 @@ def witness(a):
     except OSError as e:
         raise GateError(f"witness: cannot read the engine log: {e}") from e
     prompts = dump_entries(a, parse_pairs(a.attest, "--attest"))
+    # FNV binds the native completion record to input bytes; keep the sealed SHA-256 manifest contract unchanged.
+    execution_prompts = {name: {**prompts[name], "tokens_fnv1a64": token_fnv1a64(pathlib.Path(path).read_bytes())}
+                         for name, path in parse_pairs(a.prompt, "--prompt").items()}
     w = {"schema": WITNESS_SCHEMA, "run_id": a.run_id, "rank": a.rank, "binary_sha256": sha256_file(binary),
          "model_sha256": model_bundle_sha256(a.model), "prompts": prompts,
-          **WITNESS_ADAPTERS[a.engine](log, a.rank, prompts)}
+          **WITNESS_ADAPTERS[a.engine](log, a.rank, execution_prompts)}
     execution_witness({"execution": w, "run_id": a.run_id, "rank": a.rank, "binary": {"sha256": w["binary_sha256"]},
                        "prompts": prompts})
     tmp = out.with_suffix(".tmp")

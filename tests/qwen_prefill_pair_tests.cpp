@@ -57,6 +57,17 @@ void route_mode_checks() {
     const auto short_fixed = resolve_pair_route(6144, 8192, nullptr, nullptr, {}, false, true,
         PairExecution::prefill_only);
     require(short_fixed.route.prefix == 6144U && short_fixed.chunk.rows == 4096U && short_fixed.chunks == 2U);
+    // Prefill-only runs the whole prompt: a length-model chunk must leave a full-prompt tail the pipe accepts
+    // (10,248 tokens: 2,048 rows would leave an 8-row tail; 4,096 leaves 2,056).
+    const auto tail = resolve_pair_route(10248, 8192, nullptr, nullptr, {}, true, true,
+        PairExecution::prefill_only);
+    require(tail.route.prefix == 10248U && valid_chunk(tail.chunk.rows, 10248U));
+    for (std::uint64_t prompt = 8192U; prompt <= 40960U; prompt += 8U) {
+        const auto r = resolve_pair_route(prompt, 8192, nullptr, nullptr, {}, true, true,
+            PairExecution::prefill_only);
+        require(r.route.prefix == prompt);
+        if (std::string_view(r.chunk.reason) == "length-model") require(valid_chunk(r.chunk.rows, prompt));
+    }
 }
 
 struct ScopedPairEnv {
@@ -89,7 +100,7 @@ void policy_inspection_checks() {
         for (const char* tiles : {static_cast<const char*>(nullptr), "0"}) {
             ScopedPairEnv::set(chunk_env.name, chunk);
             ScopedPairEnv::set(tiles_env.name, tiles);
-            const auto policy = resolve_pair_policy(8192, PairExecution::handoff);
+            const auto policy = resolve_pair_policy(8192, PairExecution::handoff, false);
             const auto config = strix::serve::parse_json(inspect_pair_policy("{\"kept\":true}", policy));
             require(config.find("kept") && config.find("kept")->as_bool());
             const auto* pair = config.find("qwen_pair");
@@ -119,7 +130,7 @@ void policy_inspection_checks() {
         ScopedPairEnv::set(tiles_env.name, nullptr);
         ScopedPairEnv::set(name, "invalid");
         bool rejected = false;
-        try { (void)resolve_pair_policy(8192, PairExecution::prefill_only); }
+        try { (void)resolve_pair_policy(8192, PairExecution::prefill_only, false); }
         catch (const std::invalid_argument& error) { rejected = std::string_view(error.what()).find(name) != std::string_view::npos; }
         require(rejected);
     }
@@ -323,16 +334,20 @@ void chunk_checks() {
     require(!valid_chunk(2048, 32776)); // eight-row terminal tail cannot execute
     require(!valid_chunk(2048, 0));
     costs.fixed_ms = 20;
-    require(legal_prefix(1193, 4096) == 1192);
+    // 16-row grain: an 8-row remainder (24 = 16 + 8) would leave serial rows inside the pipelined prefix.
+    require(legal_prefix(1193, 4096) == 1184);
     require(legal_prefix(32777, 4096) == 32768);
-    require(legal_prefix(32793, 4096) == 32792);
+    require(legal_prefix(32793, 4096) == 32784);
+    require(legal_prefix(262136, 4096) == 262128);
+    require(legal_prefix(262143, 4096) == 262128);
+    require(legal_prefix(253952, 4096) == 253952);
     require(choose_chunk(nullptr, 16384, 32769, nullptr, prediction).rows == 4096);
     require(choose_prompt_route(1193, 4096, nullptr, prediction).prefix == 0);
     require(choose_prompt_route(32771, 4096, nullptr, prediction).prefix == 32768);
     require(choose_prompt_route(24576, 4096, nullptr, prediction).prefix == 0);
     require(choose_prompt_route(28672, 4096, nullptr, prediction).prefix == 28672);
     require(choose_prompt_route(32777, 4096, nullptr, prediction).prefix == 32768);
-    require(choose_prompt_route(32793, 4096, nullptr, prediction).prefix == 32792);
+    require(choose_prompt_route(32793, 4096, nullptr, prediction).prefix == 32784);
     auto route_costs = costs;
     route_costs.fixed_ms = 0; route_costs.transfer_ms_per_row = 0;
     require(choose_prompt_route(131072, 4096, &route_costs, CutPrediction{24U, 0.3, 0.3}).prefix != 0);
