@@ -21,6 +21,7 @@
 #include "strix/hip_gdn_dims.hpp"
 #include "../../attn_core/dense_decode.hpp"
 #include "../../core/dense_linear.hpp"
+#include "../../core/dense_linear_iu4.hpp"
 #include "../../core/f16_dense_q8a8.hpp"
 #include "../../ops/norm/norm_device.hpp"
 
@@ -105,7 +106,7 @@ __global__ void argmax_kernel(const float* logits, unsigned vocab, int* out) {
 
 struct Tensor {
     std::uint8_t* data = nullptr;
-    unsigned inputs = 0, outputs = 0, fmt = 0;  // fmt: ggml type 0 f32, 1 f16, 8 q8_0, 30 bf16
+    unsigned inputs = 0, outputs = 0, fmt = 0;  // fmt: ggml type 0 f32, 1 f16, 8 q8_0, 30 bf16, 200 IU4 g64 (shared pack)
     std::size_t bytes = 0, row_bytes = 0;
 };
 constexpr unsigned kMaxRows = HipEngine::max_rows();
@@ -225,16 +226,42 @@ void wide_quant(const float* x, unsigned inputs, unsigned rows, hipStream_t s) {
     a8_quant_kernel<<<dim3((inputs / 32U + 7U) / 8U, rows), 256, 0, s>>>(x, inputs, g_wide.codes, g_wide.deltas);
 }
 void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s);
+// ---- IU4 g64 pack (ggml type 200): shared W4A16 core, third dense weight format -----------------------------------------
+// FP16 activation rows and F32 gate / up rows of the 16-row windows; allocated on first use (engine lifetime).
+struct Iu4Scratch { _Float16* xh = nullptr; float *g = nullptr, *u = nullptr; } g_iu4;
+constexpr unsigned kIu4Fmt = gguf::type_strix_iu4_g64;
+void iu4_scratch() {
+    if (g_iu4.xh) return;
+    constexpr std::size_t n = std::size_t(16) * 17408U;
+    HK(hipMalloc(&g_iu4.xh, n * sizeof(_Float16)));
+    HK(hipMalloc(&g_iu4.g, n * sizeof(float)));
+    HK(hipMalloc(&g_iu4.u, n * sizeof(float)));
+}
 void linear16(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s) {
     if (w.fmt == 30U) dispatch_rows<wd::Format::bf16, dl::Epilogue::store>(rows, w, w, x, out, s);
     else if (w.fmt == 8U) dispatch_rows<wd::Format::q8_0, dl::Epilogue::store>(rows, w, w, x, out, s);
-    else throw std::runtime_error("dense projection needs bf16 or q8_0 weights");
+    else if (w.fmt == kIu4Fmt) {
+        iu4_scratch();
+        if (core::dense_iu4::reference_flag()) return core::dense_iu4::reference(w.data, w.inputs, w.outputs, x, out, rows, s);
+        core::dense_iu4::linear(w.data, w.inputs, w.outputs, x, g_iu4.xh, out, rows, s);
+    } else throw std::runtime_error("dense projection needs bf16, q8_0 or iu4 weights");
 }
 void glu16(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned rows, hipStream_t s) {
     if (g.fmt != u.fmt || g.outputs != u.outputs) throw std::runtime_error("gate/up mismatch");
     if (g.fmt == 30U) dispatch_rows<wd::Format::bf16, dl::Epilogue::silu_mul>(rows, g, u, x, out, s);
     else if (g.fmt == 8U) dispatch_rows<wd::Format::q8_0, dl::Epilogue::silu_mul>(rows, g, u, x, out, s);
-    else throw std::runtime_error("gate/up need bf16 or q8_0");
+    else if (g.fmt == kIu4Fmt) {  // two projections that share one FP16 conversion, then SiLU(gate) * up
+        iu4_scratch();
+        if (core::dense_iu4::reference_flag()) {
+            core::dense_iu4::reference(g.data, g.inputs, g.outputs, x, g_iu4.g, rows, s);
+            core::dense_iu4::reference(u.data, u.inputs, u.outputs, x, g_iu4.u, rows, s);
+            return silu_mul_kernel<<<256, 256, 0, s>>>(g_iu4.g, g_iu4.u, out, std::size_t(rows) * g.outputs);
+        }
+        core::dense_iu4::prepare(x, g_iu4.xh, g.inputs, rows, s);
+        core::dense_iu4::run(g.data, g.inputs, g.outputs, g_iu4.xh, g_iu4.g, rows, s);
+        core::dense_iu4::run(u.data, u.inputs, u.outputs, g_iu4.xh, g_iu4.u, rows, s);
+        silu_mul_kernel<<<256, 256, 0, s>>>(g_iu4.g, g_iu4.u, out, std::size_t(rows) * g.outputs);
+    } else throw std::runtime_error("gate/up need bf16, q8_0 or iu4");
 }
 void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s) {
     if (rows <= 16U) return linear16(w, x, out, rows, s);

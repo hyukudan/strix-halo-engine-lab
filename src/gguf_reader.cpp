@@ -454,6 +454,7 @@ std::optional<TensorTypeGeometry> tensor_type_geometry(
     case 35: return TensorTypeGeometry{256, 66};
     case 39: return TensorTypeGeometry{32, 17};
     case 42: return TensorTypeGeometry{64, 18};
+    case type_strix_iu4_g64: return TensorTypeGeometry{64, 34};
     default: return std::nullopt;
     }
 }
