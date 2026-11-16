@@ -4631,6 +4631,32 @@ main loop unchanged). The out GEMM still reads FP32 o-bar.
 - **Resources:** no spill; fused core 256 VGPR and absorb 128 VGPR as before; same scratch buffer (the image uses half of it).
 - **Implementation / evidence:** [hook](../src/attn_core/sparse_flash_wmma.hpp), [GLM absorb + policy](../src/glm/prefill/glm_prefill.hip), [test](../tests/hip_glm_prefill_tests.hip), [bench](../tests/hip_glm_pf_layer_bench.hip), [pair A/B kit](../scripts/bench/glm/prefill-pair.sh) (arms `--profile fast` with and without `STRIX_GLM_PF_MLA_QT16=0`)
 
+<a id="ds41-pf-flash-q16"></a>
+
+### DS41 FAST flash reads q as a bf16 image after RoPE
+
+**Engine:** `deepseek41` (shared cores `core::f16_dense_tall::q8a8` image store, `attn_core::sparse` query_op). **Control:** `STRIX_DS41_FAST_ATTN_Q16`. **Default:** on in ds41-attn-bf16flash-v1 layers when q_b runs on dense-q8a8-f16-v1.
+
+The q_b epilogue applies the flash prologue's own RoPE (`rope_pair`, dims 448..511) and rounding (`tile::to_bf16`) and stores the bf16 image in q's memory; the flash core loads it through `query_op` with no FP32 prologue. Other q_b forms keep FP32 q.
+
+- **Exactness evidence:** Bitwise. `strix-hip-ds41-fast-dense-tests` image vs prologue 0 differing values (10 shapes); pair 11,594 logits fnv equal in all 12 processes (both ranks, both arms).
+- **Off switch:** `STRIX_DS41_FAST_ATTN_Q16=0` (FP32 q, same bits)
+- **Measured gain:** q_b 2048 x 1024 x 8192: 1.505 -> 1.352 ms. Pair 11,594 warm, strict ABAB 3 pairs: d +15 / +30 / -29 ms (no wall gain beyond noise).
+- **Implementation / evidence:** [image store](../src/core/f16_dense_q8a8.hpp), [q_b](../src/hip_ds41_layer.hip), [policy](../src/hip_ds41_attention_flash.inl), [test](../tests/hip_ds41_fast_dense_tests.hip)
+
+<a id="mm-pf-msa-q16"></a>
+
+### MiniMax MSA FAST flash reads q as a bf16 image after norm + RoPE
+
+**Engine:** `minimax` (shared core `attn_core::sparse` key-split query_op / query_op_lo). **Control:** `STRIX_MM_PF_MSA_Q16`. **Default:** on in mode 11 / 12 layers when q comes from the v4 dense core (1024+ rows).
+
+The q finish (`dense_finish_kernel`) moves each head row to the prologue's lane layout, runs the same `msa::norm_rope_lane` (one definition, `msa_norm_rope.hpp`) and stores `pack2<bf16>` (mode 12 also the lo terms) in q's memory; the key-split core loads it through `query_op`. Rows below 1024 use the library GEMM (no epilogue) and keep FP32 q.
+
+- **Exactness evidence:** Bitwise. `strix-hip-mmx-moe-bench --tests test_prefill_dense`: q image and lo equal to the prologue at T 9..4096 and band 4; pair 8K state and final-rows fnv equal in all 6 runs.
+- **Off switch:** `STRIX_MM_PF_MSA_Q16=0` (FP32 q, same bits)
+- **Measured gain:** pair 8K warm, strict ABAB 3 pairs: d -1.87 / -1.10 / -0.50 s; larger than the byte saving explains (directional, being traced).
+- **Implementation / evidence:** [hook](../src/attn_core/sparse_flash_keysplit.hpp), [q finish](../src/minimax/moe/mmx_prefill.hip), [policy](../src/minimax/attn/msa_flash_policy.hpp), [test](../tests/hip_mmx_moe_bench.hip)
+
 <a id="mm-pf-msa-flash"></a>
 
 ### FAST key-split MSA attention core (mm-pf-msa-flash)
@@ -4727,7 +4753,7 @@ out to the file, which the same prefill would read again. Decode keeps the open'
 - **Exactness evidence:** Prefill state, tokens and logits bitwise equal on and off; 16 TTFT repeats bitwise equal across four alternating loads.
 - **Off switch:** --prefill-clean-evict 0
 - **Measured gain:** Full card, `--ttft-only`, disk queue 1, four alternating fresh-process loads (on / off / off / on): TTFT 8K 14.9 → 12.7 s first request and 13.2 → 11.6 s second (off → on, −15 % / −12 %), 32K 43.7-43.8 s in every load (tie); per load the prefill read 3.5-4.0 GB from the unit file instead of 9.6 GB (−60 %) and the decode residency restore took 2.5-2.9 s instead of 4.1-4.6 s
-- **Implementation / evidence:** [GLM RTX guide](../src/glm/rtxpf/README.md), [cache hook](../src/glm/rtxpf/producer/expert_tier.hpp)
+- **Implementation / evidence:** [GLM RTX guide](../src/cuda/models/glm/README.md), [cache hook](../src/cuda/models/glm/producer/expert_tier.hpp)
 
 <a id="glm-rtx-disk-queue"></a>
 
@@ -4743,7 +4769,7 @@ Unit-file reads in flight in a three-tier open; `auto` picks 4 / 6 / 8 from the 
 - **Exactness evidence:** Same output bytes (tokens, logits, state) at any queue.
 - **Off switch:** `--tier-disk-queue 1`
 - **Measured gain:** Auto vs 1 at about 76 % file share (24 GiB VRAM + 32 GiB RAM) was never slower in the latest measured decode cell means: 1K cold / warm +42 / +35 %, 8K cold / warm +33 / +16 %. Earlier one-drive cells were +9..+42 % in seven of eight (remaining -3.4 % traced to drive read phases); two-drive stripes +26..+38 %. Single loads vary up to 2x, so the gain size is uncertain. At about 61 % (48 GiB + 32 GiB), one earlier night observed cold-1K decode -32 % against the queue-1 mean; warm 1K +3 %, cold 8K +7 %, warm 8K +1 %. A later set at the same budget reversed the cold-1K result: auto +8.4 % pooled, every auto arm faster. The 70 % cut remains a conservative empirical cutoff: 61 % stays at 1. Full card (about 1-4 % at tile 2048) tied in TTFT (8K +0.6..+2 %, 32K equal), so it stays at 1.
-- **Implementation / evidence:** [GLM RTX guide](../src/glm/rtxpf/README.md)
+- **Implementation / evidence:** [GLM RTX guide](../src/cuda/models/glm/README.md)
 
 <a id="glm-pf-seqpar"></a>
 

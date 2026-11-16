@@ -391,6 +391,8 @@ def seal(a):
     doc = {"schema": SCHEMA, "run_id": a.run_id, "arm": a.arm, "rank": a.rank, "prefix": a.prefix,
            "binary": {"name": binary.name, "sha256": sha256_file(binary)}, "env": env, "attest": attest,
            "sealed_unix": int(time.time()), "prompts": prompts}
+    if a.model_sha:
+        doc["model_sha"] = a.model_sha
     if a.execution_witness:
         try:
             doc["execution"] = json.loads(pathlib.Path(a.execution_witness).read_text(encoding="utf-8"))
@@ -750,6 +752,8 @@ def compare_selection(da, a, db, b, name):
 
 
 def compare(a):
+    if a.mode == "turbo":
+        return compare_turbo(a)
     ranks = sorted(set(a.ranks))
     null_dirs = a.null_arm or []
     if a.expect_identical and (a.dnll_rule != "abs" or null_dirs):
@@ -883,6 +887,263 @@ def compare(a):
         pathlib.Path(a.json).write_text(json.dumps(report, indent=1, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
     return 0 if ok else 1
 
+TURBO_RECEIPT = "strix-turbo-receipt/v1"
+TASK_CATEGORIES = ("code", "math", "retrieval", "tools", "json", "prose")
+TASK_DROP_POINTS = {"code": 5.0, "math": 5.0, "retrieval": 2.0, "tools": 1.0}  # absolute drop vs E, proposed [I]
+PERF_KEYS = ("tok_s", "bytes_per_token", "ttft_ms", "p95_ms")
+Z95 = 1.959964
+Z95_ONE_SIDED = 1.644854
+
+
+def wilson(passed, total, z=Z95):
+    if total <= 0:
+        return [None, None]
+    p, z2 = passed / total, z * z
+    centre = (p + z2 / (2 * total)) / (1 + z2 / total)
+    half = z * math.sqrt(p * (1 - p) / total + z2 / (4 * total * total)) / (1 + z2 / total)
+    return [max(0.0, centre - half), min(1.0, centre + half)]
+
+
+def checked_model_sha(sha):
+    if not isinstance(sha, str) or len(sha) != 64 or any(c not in "0123456789abcdefABCDEF" for c in sha):
+        raise GateError("TURBO requires a nonempty SHA-256 model digest for every participating rank")
+    return sha.lower()
+
+
+def arm_sha(manifests):
+    """Require a consistent, known weights identity for every rank of a TURBO arm."""
+    shas = set()
+    for m in manifests:
+        declared = m.get("model_sha")
+        witnessed = (m.get("execution") or {}).get("model_sha256")
+        for sha in (declared, witnessed):
+            if sha is not None:
+                checked_model_sha(sha)
+        if declared is not None and witnessed is not None and declared.lower() != witnessed.lower():
+            raise GateError("declared model sha disagrees with execution witness model_sha256")
+        shas.add(checked_model_sha(declared or witnessed))
+    if len(shas) != 1:
+        raise GateError("ranks of one arm record different model shas")
+    return shas.pop()
+
+
+def check_pack_shas(sha_e, sha_t, sha_r, a):
+    sha_e, sha_t = checked_model_sha(sha_e), checked_model_sha(sha_t)
+    if a.reference_pack_arm:
+        sha_r = checked_model_sha(sha_r)
+    candidate_sha = checked_model_sha(a.candidate_sha) if a.candidate_sha is not None else None
+    reference_sha = checked_model_sha(a.reference_sha) if a.reference_sha is not None else None
+    if a.reference_sha and not a.reference_pack_arm:
+        raise GateError("--reference-sha without --reference-pack-arm")
+    if sha_t != sha_e and not a.candidate_sha:
+        raise GateError(f"candidate sha {sha_t} differs from the reference E sha {sha_e} and --candidate-sha does not declare it")
+    if candidate_sha and candidate_sha != sha_t:
+        raise GateError(f"--candidate-sha {a.candidate_sha} does not match the candidate seal {sha_t}")
+    if a.reference_pack_arm:
+        if sha_r != sha_e and not a.reference_sha:
+            raise GateError(f"reference pack sha {sha_r} differs from E sha {sha_e} and --reference-sha does not declare it")
+        if reference_sha and reference_sha != sha_r:
+            raise GateError(f"--reference-sha {a.reference_sha} does not match the reference pack seal {sha_r}")
+
+
+def paired_u95(x, y):
+    """One-sided upper 95 % bound of mean(x - y) over rows (rows are paired: same E, same tokens)."""
+    d = np.asarray(x, np.float64) - np.asarray(y, np.float64)
+    se = float(d.std(ddof=1) / math.sqrt(len(d))) if len(d) > 1 else 0.0
+    return float(d.mean()) + Z95_ONE_SIDED * se
+
+
+def mean_ci(v):
+    v = np.asarray(v, np.float64)
+    se = float(v.std(ddof=1) / math.sqrt(len(v))) if len(v) > 1 else 0.0
+    m = float(v.mean())
+    return {"mean": m, "ci95": [m - Z95 * se, m + Z95 * se]}
+
+
+def turbo_metrics(rs):
+    kl = np.concatenate([r["kl"] for r in rs])
+    dis = np.concatenate([(~r["agree"]).astype(np.float64) for r in rs])
+    dn = np.concatenate([r["nll_cand"] - r["nll_ref"] for r in rs])
+    return {"kl": kl, "disagree": dis, "dnll": dn}
+
+
+def load_task_results(path):
+    try:
+        doc = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+        tasks = doc["tasks"]
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise GateError(f"cannot read task results: {e}") from e
+    if not isinstance(tasks, list) or not tasks:
+        raise GateError("task results: empty tasks list")
+    for t in tasks:
+        if not isinstance(t, dict) or not t.get("name") or t.get("category") not in TASK_CATEGORIES:
+            raise GateError(f"task results: bad task entry {t!r} (name + category in {'|'.join(TASK_CATEGORIES)})")
+        for arm in ("E", "T", "R"):
+            c = t.get(arm)
+            if c is None and arm == "R":
+                continue
+            if not isinstance(c, dict) or not is_int(c.get("passed")) or not is_int(c.get("total")) \
+                    or c["total"] <= 0 or not 0 <= c["passed"] <= c["total"]:
+                raise GateError(f"task results: {t.get('name')}: invalid {arm} counts")
+    return tasks
+
+
+def task_summary(tasks):
+    """Per category and overall: passed/total/rate/Wilson 95 % interval per arm (None when a task lacks that arm)."""
+    out = {}
+    groups = {"overall": tasks}
+    for t in tasks:
+        groups.setdefault(t["category"], []).append(t)
+    for cat, ts in groups.items():
+        row = {}
+        for arm in ("E", "T", "R"):
+            if any(t.get(arm) is None for t in ts):
+                row[arm] = None
+                continue
+            p, n = sum(t[arm]["passed"] for t in ts), sum(t[arm]["total"] for t in ts)
+            row[arm] = {"passed": p, "total": n, "rate": p / n, "wilson95": wilson(p, n)}
+        out[cat] = row
+    return out
+
+
+def task_checks(summary, limits):
+    checks = []
+    for cat, row in summary.items():
+        if cat == "overall":
+            continue
+        e, t, r = row["E"], row["T"], row["R"]
+        drop_t = e["rate"] - t["rate"]
+        if r is not None:
+            drop_r = e["rate"] - r["rate"]
+            overlap = t["wilson95"][1] >= r["wilson95"][0] and r["wilson95"][1] >= t["wilson95"][0]
+            checks.append({"name": f"task:{cat}:vs-R", "value": drop_t, "limit": drop_r,
+                           "pass": drop_t <= drop_r or overlap, "overlap": overlap})
+        if cat in limits:
+            checks.append({"name": f"task:{cat}:drop-vs-E", "value": drop_t * 100, "limit": limits[cat],
+                           "pass": drop_t * 100 <= limits[cat] + 1e-9})
+        if cat == "json":
+            checks.append({"name": "task:json:100pct", "value": t["rate"], "limit": 1.0, "pass": t["passed"] == t["total"]})
+    return checks
+
+
+def compare_turbo(a):
+    ranks = sorted(set(a.ranks))
+    if a.expect_identical or a.dnll_rule != "abs":
+        raise GateError("--mode turbo has its own relative rule: drop --expect-identical / --dnll-rule")
+    de, me = load_arm(a.ref, ranks)
+    dt, mt = load_arm(a.cand, ranks)
+    dr, mr = load_arm(a.reference_pack_arm, ranks) if a.reference_pack_arm else (None, None)
+    sha_e, sha_t, sha_r = arm_sha(me), arm_sha(mt), (arm_sha(mr) if mr else None)
+    check_pack_shas(sha_e, sha_t, sha_r, a)
+    tokens = parse_pairs(a.tokens, "--tokens")
+    names = sorted(me[0]["prompts"])
+    seen = {me[0]["run_id"]}
+    others = [("candidate", mt)] + ([("reference pack", mr)] if mr else [])
+    nulls = []
+    for nd in a.null_arm or []:
+        dn, mn = load_arm(nd, ranks)
+        arm_sha(mn)  # Null controls also need known, consistent pack identities.
+        nulls.append((dn, mn))
+        others.append((f"null arm {nd}", mn))
+    for label, m in others:
+        if m[0]["run_id"] in seen:
+            raise GateError(f"{label}: run id {m[0]['run_id']} repeats another arm")
+        seen.add(m[0]["run_id"])
+    if any(sorted(m[0]["prompts"]) != names for _, m in others) or names != sorted(tokens):
+        raise GateError("arms and --tokens disagree on the prompt set")
+    toks = {}
+    for name in names:
+        tok_sha = sha256_file(tokens[name])
+        for m in me + [x for _, mm in others for x in mm]:
+            if m["prompts"][name]["tokens_sha256"] != tok_sha:
+                raise GateError(f"{name}: a sealed run used a different token file than --tokens")
+        toks[name] = np.fromfile(tokens[name], "<u4").astype(np.int64)
+
+    def measure(dx, mx):
+        return turbo_metrics([compare_logits(de, me, dx, mx, n, toks[n]) for n in names])
+
+    mtr = measure(dt, mt)
+    mrr = measure(dr, mr) if mr else None
+    abs_t = {"kl": float(mtr["kl"].mean()), "top1": 1 - float(mtr["disagree"].mean()), "dnll": float(mtr["dnll"].mean())}
+
+    def block(m):
+        return {"kl": mean_ci(m["kl"]), "top1": mean_ci(1 - m["disagree"]), "dnll": mean_ci(m["dnll"]), "rows": int(len(m["kl"]))}
+
+    metrics = {"T": block(mtr)}
+    checks = []
+    for flag, key, op in (("turbo_max_kl", "kl", "le"), ("turbo_min_top1", "top1", "ge"), ("turbo_max_dnll", "dnll", "le")):
+        lim = getattr(a, flag)
+        if lim is not None:
+            checks.append({"name": f"abs:{key}", "value": abs_t[key], "limit": lim,
+                           "pass": abs_t[key] <= lim if op == "le" else abs_t[key] >= lim})
+    if mr:
+        metrics["R"] = block(mrr)
+        for key, label in (("kl", "KL"), ("disagree", "disagreement"), ("dnll", "dNLL")):
+            u = paired_u95(mtr[key], mrr[key])
+            checks.append({"name": f"rel:{label}", "value": u, "limit": 0.0, "pass": u <= 0.0, "what": "U95(T - R) <= 0"})
+    controls = []
+    for dn, mn in nulls:
+        mm = measure(dn, mn)
+        controls.append({"dir": str(dn), "run_id": mn[0]["run_id"], "arm": mn[0]["arm"], "env": mn[0]["env"],
+                         "kl": float(mm["kl"].mean()), "top1": 1 - float(mm["disagree"].mean()), "dnll": float(mm["dnll"].mean())})
+    tasks = None
+    missing_r = mr is None
+    if a.task_results:
+        limits = dict(TASK_DROP_POINTS)
+        for item in a.task_drop_limit or []:
+            k, v = item.split("=", 1)
+            limits[k] = float(v)
+        tasks = task_summary(load_task_results(a.task_results))
+        missing_r = missing_r or tasks["overall"]["R"] is None
+        checks += task_checks(tasks, limits)
+    print(f"E run {me[0]['run_id']} sha {sha_e}; T run {mt[0]['run_id']} sha {sha_t}; "
+          f"R {'run ' + mr[0]['run_id'] + ' sha ' + str(sha_r) if mr else 'absent'}")
+    print(f"T vs E: KL {abs_t['kl']:.5f}, top-1 {abs_t['top1']:.4f}, dNLL {abs_t['dnll']:+.5f}")
+    if mr:
+        print(f"R vs E: KL {metrics['R']['kl']['mean']:.5f}, top-1 {metrics['R']['top1']['mean']:.4f}, "
+              f"dNLL {metrics['R']['dnll']['mean']:+.5f}")
+    for c in controls:
+        print(f"null {c['arm']} run {c['run_id']}: KL {c['kl']:.5f}, top-1 {c['top1']:.4f}, dNLL {c['dnll']:+.5f}")
+    for c in checks:
+        print(f"check {c['name']}: {c['value']:.6g} vs limit {c['limit']:.6g} -> {'PASS' if c['pass'] else 'FAIL'}")
+    failing = [c["name"] for c in checks if not c["pass"]]
+    verdict = "FAIL" if failing else ("NO-REFERENCE" if missing_r else "PASS")
+    print(f"TURBO verdict {verdict}" + (f": failing {', '.join(failing)}" if failing else ""))
+    if a.receipt:
+        write_turbo_receipt(a, verdict, failing, me, mt, mr, (sha_e, sha_t, sha_r), metrics, checks, controls, tasks)
+    return {"PASS": 0, "FAIL": 1, "NO-REFERENCE": 3}[verdict]
+
+
+def read_json_opt(path, what):
+    if not path:
+        return None
+    try:
+        return json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise GateError(f"cannot read {what}: {e}") from e
+
+
+def write_turbo_receipt(a, verdict, failing, me, mt, mr, shas, metrics, checks, controls, tasks):
+    perf_in = read_json_opt(a.perf, "--perf") or {}
+    perf = {k: perf_in.get(k) for k in PERF_KEYS}
+    perf["missing"] = [k for k in PERF_KEYS if perf_in.get(k) is None]
+    cfg = None
+    if a.effective_config:
+        try:
+            cfg = pathlib.Path(a.effective_config).read_text(encoding="utf-8").splitlines()
+        except OSError as e:
+            raise GateError(f"cannot read --effective-config: {e}") from e
+    witnesses = {n: [m["execution"] for m in ms] for n, ms in (("E", me), ("T", mt), ("R", mr or [])) if ms and "execution" in ms[0]}
+    doc = {"schema": TURBO_RECEIPT, "verdict": verdict, "failing": failing, "commit": a.commit,
+           "binary_sha256": {"E": me[0]["binary"]["sha256"], "T": mt[0]["binary"]["sha256"],
+                             "R": mr[0]["binary"]["sha256"] if mr else None},
+           "pack": {"calibration": a.calibration, "E_sha": shas[0], "T_sha": shas[1], "R_sha": shas[2]},
+           "run": {"E": me[0]["run_id"], "T": mt[0]["run_id"], "R": mr[0]["run_id"] if mr else None},
+           "hardware": read_json_opt(a.run_manifest, "--run-manifest"),
+           "routes": {"effective_config": cfg, "execution_witness": witnesses or None},
+           "metrics": metrics, "checks": checks, "tasks": tasks, "controls": controls, "performance": perf}
+    pathlib.Path(a.receipt).write_text(json.dumps(doc, indent=1, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
+
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -901,6 +1162,7 @@ def main(argv=None):
     s.add_argument("--execution-witness", metavar="JSON", help="launcher/engine execution evidence; required on every floor arm")
     s.add_argument("--select", action="store_true", help="selection dumps are required")
     s.add_argument("--not-before", type=float, help="unix time the run started: older dumps are stale")
+    s.add_argument("--model-sha", metavar="SHA", help="weights/pack sha recorded in the seal (checked by compare --mode turbo)")
     w = sub.add_parser("witness")
     w.add_argument("--dir", required=True)
     w.add_argument("--rank", type=int, required=True)
@@ -933,6 +1195,23 @@ def main(argv=None):
     c.add_argument("--profile", help="profile of the candidate (floor rule policy check), e.g. fast-prefill")
     c.add_argument("--expect-identical", action="store_true", help="repeat of one identity: any difference fails")
     c.add_argument("--json")
+    c.add_argument("--mode", choices=("fast", "turbo"), default="fast",
+                   help="fast (default): absolute bar; turbo: T's loss vs E must not exceed the reference pack R's")
+    c.add_argument("--reference-pack-arm", metavar="DIR", help="turbo: sealed arm of the reference pack R")
+    c.add_argument("--reference-sha", help="turbo: weights/pack sha of R (must equal R's seal --model-sha)")
+    c.add_argument("--candidate-sha", help="turbo: declared sha of T when its weights differ from E's (TURBO+)")
+    c.add_argument("--task-results", metavar="JSON", help="turbo: per-task pass counts of E, T and R")
+    c.add_argument("--task-drop-limit", action="append", metavar="CAT=POINTS",
+                   help="turbo: max absolute pass-rate drop of T vs E in points (default code=5 math=5 retrieval=2 tools=1)")
+    c.add_argument("--turbo-max-kl", type=float, help="turbo: optional absolute safety limit KL(E||T)")
+    c.add_argument("--turbo-min-top1", type=float, help="turbo: optional absolute safety limit top-1")
+    c.add_argument("--turbo-max-dnll", type=float, help="turbo: optional absolute safety limit dNLL")
+    c.add_argument("--receipt", metavar="OUT.json", help="turbo: write a strix-turbo-receipt/v1 receipt")
+    c.add_argument("--commit", help="turbo receipt: commit id")
+    c.add_argument("--calibration", help="turbo receipt: calibration id")
+    c.add_argument("--run-manifest", metavar="JSON", help="turbo receipt: hardware, gpu_clock_mhz, ... (free keys)")
+    c.add_argument("--effective-config", metavar="FILE", help="turbo receipt: the engine's --print-effective-config output")
+    c.add_argument("--perf", metavar="JSON", help="turbo receipt: tok_s, bytes_per_token, ttft_ms, p95_ms")
     a = ap.parse_args(argv)
     try:
         if a.cmd in ("seal", "witness") and a.rows <= 0:

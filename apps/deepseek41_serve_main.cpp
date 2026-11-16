@@ -1,4 +1,5 @@
 #include "strix/device/hip_gate.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/dist/open_transport.hpp"
 // strix-deepseek41-serve: DeepSeek V4.1 Flash served by a two-node engine group (EP experts, TP attention).
 // Rank 0 runs the OpenAI/Anthropic-compatible HTTP front end (strix_serve) and the continuous-batching scheduler; rank
@@ -123,6 +124,7 @@
 #include "strix/deepseek41_cache_lease.hpp"
 #include "strix/deepseek41_session_cache.hpp"
 #include "strix/serve/session_api.hpp"
+#include "strix/serve/session_reservation.hpp"
 #include "deepseek41/http_session_owner.hpp"
 #include "strix/deepseek41_describe.hpp"
 #include "strix/deploy/binding.hpp"
@@ -183,6 +185,11 @@
 #include <unistd.h>
 
 namespace {
+
+// --pool-positions: a request reserves prompt + max_tokens + 1 positions (the row its next step writes), capped at the
+// context; the shared per-request rule (strix/serve/session_reservation.hpp, same as the CUDA Qwen server) with no
+// granule (the pool hands out exact position ranges).
+strix::serve::ReservationRule pool_rule(std::uint64_t context) { return {context, 1U, 1U, 1U}; }
 
 using strix::deepseek41::BatchForward;
 using strix::deepseek41::BatchRow;
@@ -710,6 +717,14 @@ std::unique_ptr<VisionStack> make_vision_stack(const Args& a, const strix::deeps
     o.limits.max_pixels = limits.max_pixels;
     if (vis::resident_from_env()) {
         st->encoder->load(st->weights);
+        // Every first-use cost of the first image moves here: projector panels, the workspace of the largest admitted
+        // image, and (STRIX_VISION_WARMUP, default 1) one grey image through the whole encode path.
+        const bool warm_up = strix::envcfg::flag("STRIX_VISION_WARMUP", true);
+        const vis::PrepareReport r = vis::prepare_backend(*st->adapter, *st->encoder, st->weights, warm_up);
+        const std::string warm = warm_up ? std::to_string(r.warmup_rows) + " rows " + std::to_string(static_cast<long>(r.warmup_ms)) + " ms" : "off";
+        std::fprintf(stderr, "vision: resident tower + %zu projector panels, workspace for %u rows, %.1f MiB on the device, %.1f MiB pinned staging (%.0f ms); warm-up %s\n",
+                     r.linears, r.reserved_rows, static_cast<double>(st->encoder->device_bytes()) / 1048576.0,
+                     static_cast<double>(st->encoder->pinned_host_bytes()) / 1048576.0, r.prepare_ms, warm.c_str());
     } else {
         auto* const enc = st->encoder.get();
         const auto* const w = &st->weights;
@@ -2848,7 +2863,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
         const std::uint32_t slot = free_slots.back();
         std::uint32_t want = 0;
         if (a.pool != 0U) {
-            want = static_cast<std::uint32_t>(std::min<std::uint64_t>(a.context, std::uint64_t{st.position} + j.reserve_tokens + 1U));
+            want = static_cast<std::uint32_t>(strix::serve::reservation_positions(pool_rule(a.context), st.position, j.reserve_tokens));
             if (!pool_reserve(slot, want)) {
                 res.status = 503;
                 res.error = "the KV pool has no room for the state";
@@ -3762,7 +3777,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                 }
                 if (free_slots.empty()) unpark_oldest();  // a parked state gives its slot to a request that needs one
                 if (a.pool != 0U) {  // room for the prompt and every token it may generate, or wait (FIFO)
-                    const auto want = static_cast<std::uint32_t>(std::min<std::uint64_t>(a.context, prompt.size() + std::uint64_t{request(*r).job.max_tokens} + 1U));
+                    const auto want = static_cast<std::uint32_t>(strix::serve::reservation_positions(pool_rule(a.context), prompt.size(), request(*r).job.max_tokens));
                     if (!pool_reserve(free_slots.back(), want)) {
                         if (want > a.pool) {  // never fits
                             serve::GenerationStats st;

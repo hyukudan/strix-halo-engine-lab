@@ -2023,7 +2023,11 @@ void enqueue_attention_flash_prefill(const AttentionView& v, hipStream_t stream)
     if (v.ring16 == nullptr || (v.idx_count != nullptr && v.kv16 == nullptr)) throw std::invalid_argument("ds41 flash attention: key mirrors");
     // Pf auto bound: window + the selection capacity (window-only layers: <= kWindow keys, below the Pf crossover)
     const unsigned max_keys = kWindow + (v.idx_count != nullptr ? v.topk : 0U);
-    strix::attn_core::sparse::launch_flash_rows<FlashAttentionPolicy, 32U>(v, v.rows * (v.heads / 32U), stream, max_keys);  // 256 threads
+    using strix::attn_core::sparse::launch_flash_rows;
+    if (v.q16 != nullptr)
+        launch_flash_rows<FlashAttentionQ16Policy, 32U>(v, v.rows * (v.heads / 32U), stream, max_keys);
+    else
+        launch_flash_rows<FlashAttentionPolicy, 32U>(v, v.rows * (v.heads / 32U), stream, max_keys);
     hipLaunchKernelGGL(attention_flash_combine_kernel, dim3(v.heads, v.rows), dim3(32), 0, stream, v);
     hip_check(hipGetLastError(), "ds41 flash attention");
 }
