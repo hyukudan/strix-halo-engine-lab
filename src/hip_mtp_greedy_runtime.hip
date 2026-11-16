@@ -1217,7 +1217,9 @@ std::vector<HipMtpGreedyCycleResult> joint_cycle(std::span<const HipMtpGreedyCoh
         std::vector<std::uint32_t> accepted;
         std::uint32_t emitted=0;
         for(const auto& r:out) {accepted.push_back(r.accepted_candidates);emitted+=static_cast<std::uint32_t>(r.emitted_tokens.size());}
-        controller.observe(observed,rows,accepted,draft_ms,target_ms,draft_steps);
+        // The complete candidates (context rows included, marked by external_first) as choose() priced them: the yield
+        // calibration compares like with like; observe() updates predictor histories below external_first only.
+        controller.observe(requests,rows,accepted,draft_ms,target_ms,draft_steps);
         if(draft_batch_enabled() && draft_batch_ab()) draft_batch_ab_timing().add(members.size(),draft_ms,draft_ms+target_ms,emitted);
         // STRIX_MTP_BATCH_LOG=2 adds the plan's estimate (of the executed plan, probes included) and per member
         // slot:position:limit:remaining budget:planned rows/predictor steps launched/predictor drafts retained
@@ -1430,6 +1432,8 @@ std::vector<HipMtpServeLever> hip_mtp_serve_levers() {
         {"draft_batch","STRIX_MTP_DRAFT_BATCH",draft_batch_enabled(),draft_batch_enabled()?"1":"0"},
         {"joint_window","STRIX_MTP_BATCH_JOINT",joint || mtp_serve_row_budget_enabled(),joint || mtp_serve_row_budget_enabled()?"1":"0"},
         {"row_budget","STRIX_SERVE_ROW_BUDGET",mtp_serve_row_budget_enabled(),mtp_serve_row_budget_enabled()?"1":"0"},
+        {"row_measured","STRIX_SERVE_ROW_MEASURED",mtp_serve_row_budget_enabled() && mtp_serve_row_measured_lanes()!=0U,
+            std::string(mtp_serve_row_measured_choice())+" lanes=0x"+[]{char b[16];std::snprintf(b,sizeof b,"%x",mtp_serve_row_measured_lanes());return std::string(b);}()},
         {"row_budget_max_lanes","STRIX_SERVE_ROW_BUDGET_MAX_LANES",mtp_serve_row_budget_enabled(),std::to_string(mtp_serve_row_budget_max_lanes())},
         {"joint_group_lanes","STRIX_SERVE_JOINT_GROUP_LANES",mtp_serve_row_budget_enabled() && mtp_serve_joint_group_lanes(0)!=8U,
             mtp_serve_joint_group_lanes(0)==mtp_serve_joint_group_lanes(1)?std::to_string(mtp_serve_joint_group_lanes(0)):std::string("ab")},

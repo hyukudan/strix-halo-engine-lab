@@ -17,6 +17,9 @@
 //   --send IP0:PORT0,IP1:PORT1  timing mode, one prompt: every layer's state rows go to rank r's
 //                    strix-minimax-rank --offload-listen as soon as the layer is done (one sender thread per rank);
 //                    rank 0 returns the last row's token, which ends the TTFT clock
+//   --layer-cut K    prefix-resident block pipeline to --layercut-listen (one full prompt)
+//   --cut-block C --cut-act relay|direct --cut-pair-identity ID; --split/--cut share env resolution
+//   --print-effective-config   inspect split policy without CUDA work
 //   --codec bp       hand-off frames bp-v1 encoded (lossless; the ranks decode before importing)
 //   --replay-state DIR --send ...  no GPU: stream DIR/state-NAME-rank<r>.bin (a finished prefill) layer by layer to the
 //                    listeners, --repeat K times per prompt alternating identity / bp-v1 frames (ABA...): transport,
@@ -27,6 +30,7 @@
 #include "mm_rtx_weights.hpp"
 #include "minimax/rtxpf/fp32_identity.hpp"
 #include "strix/bp_codec.hpp"
+#include "strix/minimax_layercut.hpp"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -406,6 +410,8 @@ std::uint64_t hash_bytes(const std::vector<std::uint8_t>& b) {  // cache-file na
     return h;
 }
 
+#include "mm_rtx_layercut.inc"
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -416,6 +422,9 @@ int main(int argc, char** argv) {
         }
         const std::string model = argv[1], rope_path = argv[2], out_dir = argv[3];
         unsigned n_layers = kLayers, repeat = 1;
+        lc::Cli cut_cli;
+        bool print_effective = false;
+        std::string cut_pair_identity = "default";
         std::string send_to;
         bool codec_bp = false;
         int resident = -1, pinned_n = -1;
@@ -427,6 +436,17 @@ int main(int argc, char** argv) {
         std::vector<Prompt> prompts;
         for (int i = 4; i < argc; ++i) {
             const std::string a = argv[i];
+            auto cut_value = [&]() -> std::string {
+                if (i + 1 >= argc) throw std::invalid_argument("missing value for " + a);
+                return argv[++i];
+            };
+            if (a == "--layer-cut") { cut_cli.split = "layer-cut"; cut_cli.cut = cut_value(); continue; }
+            if (a == "--split") { cut_cli.split = cut_value(); continue; }
+            if (a == "--cut") { cut_cli.cut = cut_value(); continue; }
+            if (a == "--cut-block") { cut_cli.block = cut_value(); continue; }
+            if (a == "--cut-act") { cut_cli.act = cut_value(); continue; }
+            if (a == "--cut-pair-identity") { cut_pair_identity = cut_value(); continue; }
+            if (a == "--print-effective-config") { print_effective = true; continue; }
             if (a == "--layers") { n_layers = static_cast<unsigned>(std::stoul(argv[++i])); continue; }
             if (a == "--resident") { resident = std::stoi(argv[++i]); continue; }
             if (a == "--repeat") { repeat = static_cast<unsigned>(std::stoul(argv[++i])); continue; }
@@ -438,6 +458,24 @@ int main(int argc, char** argv) {
             const auto c = a.find(':');
             prompts.push_back({a.substr(0, c), read_u32(a.substr(c + 1))});
         }
+        lc::Inputs cut_input{mlc::chain_shape(), prompts.empty() ? 0 : prompts.front().tokens.size()};
+        cut_input.rtx_rows_s = strix::envcfg::number<double>("STRIX_SPLIT_RTX_ROWS_S", 0, 0);
+        cut_input.pair_rows_s = strix::envcfg::number<double>("STRIX_SPLIT_PAIR_ROWS_S", 0, 0);
+        cut_input.link_mbps = strix::envcfg::number<double>("STRIX_SPLIT_LINK_MBPS", 0, 0);
+        const auto cut_cfg = lc::resolve(cut_cli, cut_input);
+        if (print_effective || cut_cfg.split == lc::chain::Split::layer_cut) std::printf("%s", cut_cfg.lines.c_str());
+        if (print_effective) return 0;
+        if (cut_cfg.planned && cut_cfg.split == lc::chain::Split::device_only && cut_cfg.first != 0)
+            throw std::invalid_argument("--split auto chose pair device-only: run the prompt on the pair without the CUDA producer");
+        const bool layer_cut = cut_cfg.split == lc::chain::Split::layer_cut;
+        if (layer_cut) {
+            if (prompts.size() != 1 || prompts[0].tokens.empty() || send_to.empty() || !replay_dir.empty() || pinned_n >= 0)
+                throw std::invalid_argument("--layer-cut needs one prompt, --send and resident timing mode (no replay/pinned tier)");
+            if (resident >= 0 && resident != static_cast<int>(cut_cfg.cut)) throw std::invalid_argument("--resident must equal --cut");
+            resident = static_cast<int>(cut_cfg.cut); n_layers = cut_cfg.cut;
+        }
+        if (cut_cfg.split == lc::chain::Split::handoff && send_to.empty())
+            throw std::invalid_argument("--split handoff-full requires --send");
         if (!replay_dir.empty()) {  // transport replay, no GPU
             WSADATA wsa;
             if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) throw std::runtime_error("WSAStartup");
@@ -501,7 +539,7 @@ int main(int argc, char** argv) {
         if (!send_to.empty() && resident < 0) throw std::runtime_error("--send needs the timing mode (--resident N)");
         const auto t0 = Clock::now();
         g_ph.on = std::getenv("MM_RTX_PROFILE") != nullptr;
-        hx::Pack pack(model);
+        hx::Pack pack(model, layer_cut ? cut_cfg.cut : 0);
         std::vector<cu::RopeRow> rope;
         {
             std::size_t max_rows = 0;
@@ -566,7 +604,7 @@ int main(int argc, char** argv) {
             std::size_t slot_bytes = 0, stage_bytes = 0;
             const auto a = Clock::now();
             for (unsigned L = 0; L < n_layers; ++L) {
-                st.meta[L] = hx::build_layer(pack, L);
+                st.meta[L] = hx::build_layer(pack, L, layer_cut && L + 1 == cut_cfg.cut);
                 auto& bytes = st.meta[L].bytes;
                 st.size[L] = bytes.size();
                 if (st.tier[L] == 'd') {
@@ -630,6 +668,10 @@ int main(int argc, char** argv) {
             if (!send_to.empty() && WSAStartup(MAKEWORD(2, 2), &wsa) != 0) throw std::runtime_error("WSAStartup");
         }
 
+        if (layer_cut) {
+            run_layercut(cut_cfg, st, table, w_in0, rope_d, prompts[0].tokens, send_to, cut_pair_identity, repeat, codec_bp);
+            return 0;
+        }
         // groups: gate mode = all prompts batched in one pass; timing mode = one prompt at a time
         std::vector<std::vector<std::size_t>> groups;
         if (resident < 0) {

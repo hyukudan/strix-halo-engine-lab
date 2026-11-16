@@ -2504,6 +2504,8 @@ struct Engine::Impl {
         std::vector<std::uint32_t> toks;
         std::uint64_t pos0 = 0;
         std::size_t c0 = 0, c = 0, chunks = 0, m = 1, rows = 0;  // next chunk's first row / index; the open unit's members, rows
+        unsigned first_layer = 0;
+        Engine::CutFetch cut_fetch;
         unsigned layer = 0;                                      // next layer of the open chunk / group (0: not started)
         std::uint64_t output_fnv = 14695981039346656037ULL;
         strix::core::LayerSet idx_wmma_executed;  // successful submissions, published only after the completion fence
@@ -2552,6 +2554,22 @@ struct Engine::Impl {
         if (auto* t = child_bank ? child_timeline.get() : timeline.get()) t->begin();
     }
 
+    void prefill_begin_cut(std::uint32_t slot, std::span<const std::uint32_t> toks, std::uint64_t pos0,
+                           unsigned first_layer, Engine::CutFetch fetch) {
+        if (first_layer == 0 || first_layer >= kLayers || !fetch)
+            throw std::invalid_argument("prefill_begin_cut: first_layer / fetch");
+        prefill_begin(slot, toks, pos0);
+        task.first_layer = first_layer;
+        task.cut_fetch = std::move(fetch);
+    }
+    void fetch_cut(std::uint64_t row0, std::size_t rows) {
+        task.cut_fetch(row0, rows, h, nullptr);
+        // Exactly post_exchange's norm: 256 strided fmaf chains, tree 128..1, IEEE sqrt/div,
+        // (h*r)*(1+w). No residual addition: h already contains both producer partials.
+        hipLaunchKernelGGL(rmsnorm_gemma_kernel, dim3(static_cast<unsigned>(rows)), dim3(256), 0, nullptr,
+                           h, layers[task.first_layer - 1].w_next, hn, kHidden);
+    }
+
     // Runs at most `layers` more layers of the open prefill (a chunk's tap sink and the head run in the unit of its last
     // layer). Returns true with *next = the greedy token after the last row once the prefill is complete.
     bool prefill_resume(unsigned budget, std::uint32_t* next) {
@@ -2589,7 +2607,11 @@ struct Engine::Impl {
                     task.rows = route::unit_rows(task.m, opt.max_rows, toks.size() - task.c0);
                 }
                 if (left == 0) break;
-                const unsigned L0 = task.layer, L1 = route::layer_end(L0, left, kLayers);
+                if (task.layer == 0 && task.first_layer > 0 && fp32_prefill) {
+                    hip_ok(hipStreamSynchronize(nullptr), "cut FP32 job ring");
+                    f32_jobs_used = 0;
+                }
+                const unsigned L0 = task.layer == 0 ? task.first_layer : task.layer, L1 = route::layer_end(L0, left, kLayers);
                 left -= L1 - L0;
                 const std::size_t c0 = task.c0, rows = task.rows, m = task.m;
                 const bool last = c0 + rows == toks.size();
@@ -2614,7 +2636,8 @@ struct Engine::Impl {
                     ++calls;
                     task.c += m;
                 } else {
-                    if (L0 == 0) embed_rows(toks.data() + c0, rows);
+                    if (task.layer == 0 && task.first_layer > 0) fetch_cut(task.pos0 + c0, rows);
+                    else if (L0 == 0) embed_rows(toks.data() + c0, rows);
                     layers_range(rows, {}, task.slot, task.pos0 + c0, L0, L1);
                     if (L1 < kLayers) {
                         task.layer = L1;
@@ -2899,6 +2922,10 @@ struct Engine::Impl {
             return px::Exchanger::View{P[c], R[c]};
         };
         if (attn_prefill_fused) prefill_table(slot);
+        for (std::size_t c = 0; task.layer == 0 && task.first_layer > 0 && c < m; ++c) {
+            use(c);
+            fetch_cut(pos0 + c * opt.max_rows, N[c]);
+        }
         for (std::size_t c = 0; L0 == 0 && c < m; ++c) {
             use(c);
             embed_rows(toks.data() + c * opt.max_rows, N[c]);
@@ -3559,6 +3586,11 @@ bool Engine::prefill_active() const { return impl_->task.open; }
 void Engine::prefill_begin(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0) {
     impl_->no_task("prefill");
     impl_->prefill_begin(slot, tokens, pos0);
+}
+void Engine::prefill_begin_cut(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0,
+                               unsigned first_layer, CutFetch fetch) {
+    impl_->no_task("prefill_begin_cut");
+    impl_->prefill_begin_cut(slot, tokens, pos0, first_layer, std::move(fetch));
 }
 bool Engine::prefill_resume(unsigned layers, std::uint32_t* next) { return impl_->prefill_resume(layers, next); }
 void Engine::prefill_cancel() { impl_->prefill_cancel(); }
