@@ -790,6 +790,52 @@ static void report_err(const std::string& name, const Err& all, const Err* cls, 
     }
     report(name, all.rel() < tol && hi <= 3.0 * std::max(all.rel(), 1e-9), detail);
 }
+// Exercise the actual FAST output kernels with identical low-rank input, bypassing norm/projection.
+static void test_hc_mma_split(const am::Tables& t) {
+    constexpr unsigned rows = 65;  // Includes a partial output tile.
+    auto wu = synth_q8(W, RK, 2e-4F, 2e-3F);
+    const std::size_t stream_bytes = wu.size() / S;
+    for (unsigned s = 1; s < S; ++s)
+        std::copy_n(wu.data(), stream_bytes, wu.data() + s * stream_bytes);
+    Dev<std::uint8_t> down(synth_q8(RK, W, 2e-4F, 2e-3F)), up(wu);
+    Dev<std::uint8_t> packed(hc::hc_packed_bytes());
+    std::vector<float> n(static_cast<std::size_t>(rows) * P, 0.0F);
+    for (unsigned r = 0; r < rows; ++r) {
+        for (unsigned k = 0; k < RK; ++k)
+            n[static_cast<std::size_t>(r) * P + W + k] = r == 0 ? 0.0F : nrand(2.0F);
+        for (unsigned f = 0; f < H; ++f) {
+            // Row 0: zero gates make sigmoid exactly 1/2. Probe a BF16 tie and
+            // its adjacent FP32 values. Other rows cancel equal, nonzero gates.
+            const float midpoint = 1.00390625F;
+            const float boundary = f % 3U == 0 ? std::nextafter(midpoint, 0.0F) :
+                (f % 3U == 1 ? midpoint : std::nextafter(midpoint, 2.0F));
+            const std::size_t i = static_cast<std::size_t>(r) * P + f;
+            n[i] = r == 0 ? 0.0F : 4096.0F;
+            n[i + H] = 8.0F * boundary;
+            n[i + 2U * H] = -n[i];
+        }
+    }
+    Dev<float> normalized(n), gates(static_cast<std::size_t>(rows) * W);
+    Dev<std::uint16_t> output(static_cast<std::size_t>(rows) * H);
+    hc::HcMixArgs a;
+    a.rows = rows; a.mma = true; a.normalized = normalized.p; a.output = output.p;
+    a.packed = hc::hc_packed_view(packed.p);
+    hc::hc_pack(down.p, up.p, a.packed, nullptr);
+    hc::hc_mix(a, t, nullptr, 4U);
+    CK(cudaDeviceSynchronize());
+    const auto fused = output.get();
+    CK(cudaMemset(output.p, 0xff, output.n * sizeof(std::uint16_t)));
+    a.gates = gates.p;
+    hc::hc_mix(a, t, nullptr, 12U);
+    CK(cudaDeviceSynchronize());
+    same("hc FAST fused == split: finite cancellation and BF16 boundaries", fused, output.get(), false, H);
+    bool boundary_ok = true, finite = true;
+    for (unsigned f = 0; f < H; ++f)
+        boundary_ok = boundary_ok && fused[f] == (f % 3U == 2 ? 0x3f81U : 0x3f80U);
+    for (auto v : fused) finite = finite && (v & 0x7f80U) != 0x7f80U;
+    report("hc FAST split fixture covers BF16 tie and neighbors", boundary_ok);
+    report("hc FAST cancellation outputs remain finite", finite);
+}
 static void test_hc_mma(const am::Tables& t, const char* tag, float down_lo, float down_hi, bool with_inject, bool outliers) {
     HcWeights w;
     w.down = synth_q8(RK, W, down_lo, down_hi); w.up = synth_q8(W, RK, 2e-4F, 2e-3F);
@@ -878,6 +924,7 @@ int main(int argc, char** argv) {
         try {
             load_host_math(tables);
             am::Tables t = am::load_tables(tables);
+            test_hc_mma_split(t);
             test_hc_mma(t, "mild", 2e-4F, 2e-3F, true, false);
             test_hc_mma(t, "mild+outliers", 2e-4F, 2e-3F, true, true);
             test_hc_mma(t, "saturating", 2e-3F, 2e-2F, false, false);
