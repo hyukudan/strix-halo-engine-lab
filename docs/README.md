@@ -169,6 +169,7 @@ work as it stood on their date; documents marked **Superseded** name their repla
 - [Validation-only final generation state](operations/final-generation-state-validation.md): --validation-final-state: export final session state allocations after an eager generation for validation.
 - [UMA/GTT budget — working draft](operations/memory-budget.md): UMA/GTT working-draft budget for 128 GB: GTT sizing, host reserve, admission categories, admin UI.
 - [Selective model weight backing](operations/model-weight-residency.md): Opt-in selective model weight backing (--model-copy-tier) into owned HIP allocations.
+- [Tiered expert residency](engine/memory/expert-residency.md): CUDA cards smaller than the model (`--expert-residency auto|full|tiered`, `--vram-budget-gib`): hot experts on the card, misses computed exactly on the CPU; kits in `scripts/bench/residency/`.
 - [Persisted offline tuning preparation](operations/offline-tuning.md): --offline-tuning-cache: persisted versioned offline tuning records and their keys.
 - [Base runtime owner inventory](operations/runtime-owner-inventory.md): --execution-inventory: base runtime owner inventory of model views and allocator pools.
 - [Retained UMA owner inventory](operations/uma-owner-inventory.md): build_uma_owner_inventory: retained UMA allocation lease inventory and alias accounting.
