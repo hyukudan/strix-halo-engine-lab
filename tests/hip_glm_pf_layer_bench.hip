@@ -7,22 +7,25 @@
 // per-component minima are optimistic estimates, not an end-to-end layer time. A warm pass and the last timed pass are
 // compared on every branch output and state (determinism), all finite, no flag; the process exits nonzero otherwise.
 // usage: hip_glm_pf_layer_bench C T0_DSA [C T0_DSA ...]   e.g. 1024 0 2048 6144 2048 30720
+#include "attn_core/sparse_flash_wmma.hpp"
 #include "glm/kernels/glm_dsa.hpp"
 #include "glm/kernels/glm_tier_a.hpp"
 #include "glm/prefill/glm_pf_moe.hpp"
 #include "glm/prefill/glm_prefill.hpp"
 #include "strix_trellis.h"
+#include "strix/env_arms.hpp"
 
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <optional>
 #include <functional>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
