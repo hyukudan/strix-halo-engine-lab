@@ -12,6 +12,7 @@
 #pragma once
 #include "strix/weight/admission.hpp"
 
+#include "strix/residency/expert_residency.hpp"
 #include "strix/qwen_prefill_trace.hpp"
 #include "strix/qwen_prefill_schedule.hpp"
 #include "strix/cuda/qwen_route_bf16.hpp"
@@ -32,7 +33,10 @@ struct Config {
     std::string mtp_sidecar_gguf;      // MTP sidecar (distillG/D Q8_0); empty = no MTP rows (non-MTP node route)
     std::string tables_dir;            // gfx1151 math tables (amd_math_tables.hpp)
     std::string rope_table;            // cs[position][32] float2 from the node (rope_cs_262144.bin)
-    std::uint32_t max_positions = 32768;
+    std::uint32_t max_positions = 32768;   // context cap: the largest session; rope/QSA workspaces are sized to it
+    // Positions of session 0 and of create_session() without an argument (0: max_positions). A server sets it small
+    // and sizes each request's session with reserve_session() (strix/serve/session_reservation.hpp).
+    std::uint32_t session_positions = 0;
     std::vector<std::uint32_t> block_schedule{1024, 2048, 4096, 8192};  // rows per block; the last entry repeats
     bool tail_large = true;           // rotate final remainder to front; same count and capacity (--block-schedule default = off)
     std::uint32_t final_block_rows = 0; // optional tail reservation within loaded max block
@@ -49,6 +53,13 @@ struct Config {
     // Decode with a sidecar: the MTP draft head covers these token ids (little-endian uint32 file, e.g.
     // data/draft-vocab/core64k.bin); empty = the whole vocabulary. Drafts never change committed tokens.
     std::string draft_vocab;
+    // Diagnostic: append every block's router selections (all rows, all layers) to this EXTR01 file
+    // (scripts/bench/residency/residency_sim.py). Forces eager windows (no graphs); empty = off, no change.
+    std::string expert_trace;
+    // Expert residency (docs/engine/memory/expert-residency.md): automatic = fully resident when the model fits the card
+    // budget (today's route, nothing new happens), else tiered (hot experts on the card, the rest computed on the host,
+    // bitwise equal). The caller applies strix::residency::with_environment before constructing the engine.
+    strix::residency::Options residency;
     // false: run() keeps the state on the device only (no D2H staging, no pieces): a decode session that never hands off.
     bool export_state = true;
     // Explicit unqualified CUDA A8 route-storage candidate. Omitted: environment;
@@ -143,6 +154,19 @@ struct CohortRows {
     std::uint64_t position = 0;
 };
 
+// The residency decision of a configuration, resolved from the GGUF headers and the live card/host numbers without
+// loading the model (the same function the engine calls before its upload).
+struct ResidencyPlan {
+    strix::residency::ModelBytes model;
+    strix::residency::CardBytes card;
+    strix::residency::SessionBytes session;
+    strix::residency::HostBytes host;
+    strix::residency::Decision decision;
+    std::uint32_t block_rows = 0;     // rows per prefill block in the decided mode (tiered: the exchange's rows)
+    std::string json;                 // decision_json + the numbers it used
+};
+[[nodiscard]] ResidencyPlan plan_residency(const Config& config);
+
 class Prefill {
 public:
     explicit Prefill(const Config& config);
@@ -171,10 +195,18 @@ public:
     Draft draft(std::uint32_t pending, std::uint32_t depth, float min_probability);
 
     // ---- multi-session decode (Config::decode)
-    // A new session (fresh state, length 0): allocates ~P * 30 KB + 0.23 GB of device memory (P = max_positions).
+    // A new session (fresh state, length 0): allocates session_bytes_at(P) = ~P * 31.6 KB + 0.23 GB of device memory
+    // (P = Config::session_positions, else max_positions; or `positions`).
     SessionId create_session();
+    SessionId create_session(std::uint64_t positions);
     void destroy_session(SessionId session);        // not session 0; drops the graphs that captured it
-    [[nodiscard]] std::uint64_t session_bytes() const;  // device bytes of one session's state
+    // New position buffers of 1..max_positions for an idle session (session 0 too): its state is discarded (length 0)
+    // and the graphs that captured it are dropped. Every write past capacity() is refused (run, chunks, verify, drafts).
+    void reserve_session(SessionId session, std::uint64_t positions);
+    [[nodiscard]] std::uint64_t capacity(SessionId session) const;
+    [[nodiscard]] std::uint64_t session_bytes() const;  // device bytes of session 0's state
+    [[nodiscard]] std::uint64_t session_bytes(SessionId session) const;
+    [[nodiscard]] std::uint64_t session_bytes_at(std::uint64_t positions) const;  // exact bytes a session of P allocates
     [[nodiscard]] std::uint64_t length(SessionId session) const;
     // Component-major rows: 12 KV arrays (count * 1024 BF16 each), 12 raw-index arrays
     // (count * 128 BF16 each), then MTP KV and raw index when a sidecar is loaded.
@@ -255,6 +287,15 @@ public:
 
     // Diagnostics for the bitwise gates: the wide residual rows after layer 47 of the last run (BF16 [rows][10240]).
     [[nodiscard]] std::string describe() const;
+    // Residency: the decision JSON (mode, reason, pool, slots, positions) and, tiered only, the receipt JSON (hit rate,
+    // promotions, host time); the receipt of a fully resident engine is {"expert_residency":"full"}.
+    [[nodiscard]] bool tiered() const;
+    [[nodiscard]] std::string residency_json() const;
+    [[nodiscard]] std::string residency_receipt_json() const;
+    // Resolved card budget (tiered or an explicit cap, including full mode; 0 = full mode without an explicit cap) and the
+    // device bytes it holds once loaded (measured): a server admits sessions against budget - engine bytes.
+    [[nodiscard]] std::uint64_t card_budget_bytes() const;
+    [[nodiscard]] std::uint64_t engine_device_bytes() const;
     [[nodiscard]] qwen_route::Identity numerical_identity() const;
     [[nodiscard]] qwen_route::Policy route_storage_policy() const;
     // No window/chunk in flight. Armed MTP includes committed predictor pairs and

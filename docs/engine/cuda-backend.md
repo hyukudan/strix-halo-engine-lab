@@ -17,6 +17,13 @@ Entry points stay in `apps/cuda_*` and tests in `tests/cuda/`; the GLM producer 
 (`src/cuda/models/glm/producer`) and the MiniMax prefill its build scripts (`src/cuda/models/minimax/*.bat`).
 `src/glm/rtxpf/import` (the receiving side of the GLM state import) is host code and stays with GLM.
 
+Session memory is planned by the shared host policy `include/strix/serve/session_reservation.hpp`: each request
+reserves prompt + max_tokens + the engine's slack (rounded to a granule, capped at the context), and admission
+reuses, builds, re-sizes or releases sessions from the free memory. The CUDA Qwen server binds it through
+`apps/cuda_qwen_serve_policy.hpp` (`--session-reserve request|max`, `--session-granule N`). Its serve bench kit is
+`scripts/bench/cuda/qwen_serve_arms.sh` (strict arm order, one card) with `qwen_serve_bench.py` (cold and warm
+prefill, C1 references, concurrency arms with `same_as_C1`).
+
 ## Phase 1 (layout, bitwise)
 
 Files were moved, not rewritten. The SASS gate is `scripts/bench/cuda/sass_compare.py

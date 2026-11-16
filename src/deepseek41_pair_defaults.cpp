@@ -183,7 +183,8 @@ const char* app_name(App app) {
 }
 
 const strix::profile::Engine& profile_engine() {
-    static const strix::profile::Engine engine{"deepseek41-pair", "STRIX_DS41_PROFILE_ALLOW_PENDING", profile_table, false};
+    static const strix::profile::Engine engine{"deepseek41-pair", "STRIX_DS41_PROFILE_ALLOW_PENDING", profile_table, false,
+                                              "ds41-turbo-v1"};
     return engine;
 }
 
@@ -498,6 +499,7 @@ Effective::Effective(App app, int& argc, char**& argv, const Build& build) {
         return out;
     };
     auto r = resolve(app, in, [](const char* n) { return static_cast<const char*>(std::getenv(n)); }, probe, build);
+    if (!r.print_only && r.profile) r.profile->weights.require_honoured();
     for (const auto& [k, v] : r.set_env) {
 #ifdef _WIN32
         _putenv_s(k.c_str(), v.c_str());

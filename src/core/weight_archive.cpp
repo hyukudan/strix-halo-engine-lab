@@ -90,7 +90,7 @@ SafeFile read_safetensors(const std::filesystem::path& path) {
     if (!status) throw std::runtime_error(status.detail);
     for (const auto& raw : out.index.tensors) {
         SafeTensor t; t.name = raw.name; t.dtype = raw.wire_dtype;
-        t.shape.assign(raw.shape.dims.begin(), raw.shape.dims.begin() + raw.shape.rank);
+        t.shape = raw.extents;
         t.offset = raw.payload.range.offset; t.bytes = raw.payload.range.bytes;
         out.tensors.push_back(std::move(t));
     }

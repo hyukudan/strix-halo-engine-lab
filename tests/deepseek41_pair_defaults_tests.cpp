@@ -702,11 +702,31 @@ void test_decode_xport() {
 
 }  // namespace
 
+void test_pending_weights_inspection() {
+    for (const auto app : {pd::App::rank, pd::App::serve}) {
+        try {
+            const auto r = World{}.run(app, {MODEL, "--rank", "0", "--transport", "usb4auto", "--profile", "turbo",
+                                           "--turbo-weights", "onfly", "--print-effective-config"});
+            const auto text = pd::describe(app, r);
+            check(r.print_only && r.profile && !r.profile->weights.honoured(), "pending weights inspect without admission");
+            check(text.find("onfly") != std::string::npos && text.find("pending") != std::string::npos,
+                  "inspection displays requested weights and pending reason");
+            bool refused = false, exported = false;
+            try { strix::profile::apply(*r.profile, [&](const char*, const char*) { exported = true; return true; }); }
+            catch (const std::invalid_argument&) { refused = true; }
+            check(refused && !exported, "execution refuses pending weights before exporting");
+        } catch (const std::exception& e) {
+            check(false, std::string("pending weight inspection threw: ") + e.what());
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--print-effective-config") {
         pd::Effective effective(pd::App::serve, argc, argv, {});
         return 1;  // Inspection must exit successfully before returning here.
     }
+    test_pending_weights_inspection();
     test_decode_xport();
     test_equivalence();
     test_off_switches();

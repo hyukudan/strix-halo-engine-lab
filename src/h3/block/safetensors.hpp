@@ -85,7 +85,7 @@ public:
         for (const auto& raw : index.tensors) {
             StTensor t; t.name = checkpoint_name(raw.name, names); t.dtype_name = raw.wire_dtype;
             t.dtype = parse_st_dtype(t.dtype_name);
-            for (unsigned i = 0; i < raw.shape.rank; ++i) t.shape.push_back(static_cast<std::int64_t>(raw.shape.dims[i]));
+            for (auto dim : raw.extents) t.shape.push_back(static_cast<std::int64_t>(dim));
             t.begin = raw.payload.range.offset; t.end = t.begin + raw.payload.range.bytes;
             const auto canonical = t.name;
             if (!tensors_.emplace(canonical,std::move(t)).second)
