@@ -43,12 +43,21 @@ std::span<const SourceRegistration> sources() noexcept {
         {{"gguf.q8_0",1},"native-scalar","existing-row-site",32,2,0,0,false,false,Q8RowsSource::validate},
         {{"image.q6p32",1},"native-scalar","existing-row-site",32,2,0,0,false,false,Q6RowsSource::validate},
         {{"gguf.q8_0",1},"signed-a8","existing-block-chain",32,4,0,64,false,false,Q8SignedSource::validate},
-        {{"image.q6p32",1},"signed-a8","existing-block-chain",32,4,0,64,false,false,Q6SignedSource::validate}
+        {{"image.q6p32",1},"signed-a8","existing-block-chain",32,4,0,64,false,false,Q6SignedSource::validate},
+        {{"exl3.mul1.tiles16",1},"trellis-tile","trellis-mul1-legacy",16,4,0,0,true,true,validate_trellis_mul1},
+        {{"exl3.gemma.transport",1},"trellis-tile","g4-exl3-v1",16,2,0,0,true,true,validate_gemma_transport},
+        {{"exl3.gemma.transport",1},"trellis-tile","g4-exl3-v2",16,2,0,0,true,true,validate_gemma_transport},
+        {{"exl3.gemma.transport",1},"trellis-tile","g4-exl3-v3",16,2,0,0,true,true,validate_gemma_transport},
+        {{"exl3.gemma.transport",1},"trellis-tile","g4-exl3-wmma-pf-v1",16,2,0,0,true,true,validate_gemma_transport}
     };
     return table;
 }
 const SourceRegistration* find_source(FormatId storage,std::string_view protocol) noexcept {
     for(const auto& s:sources()) if(s.storage==storage && s.protocol==protocol) return &s;
+    return nullptr;
+}
+const SourceRegistration* find_source(FormatId storage,std::string_view protocol,std::string_view arithmetic) noexcept {
+    for(const auto& s:sources()) if(s.storage==storage && s.protocol==protocol && s.arithmetic==arithmetic) return &s;
     return nullptr;
 }
 }  // namespace strix::weight::hip

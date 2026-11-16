@@ -26,6 +26,7 @@ struct MoeTraits : MoePolicy {
     static constexpr unsigned kE = kMoeExperts, kTop = kMoeTop, kH = kMoeHidden, kI = kMoeInter;
     static constexpr unsigned kHB = kH / 128, kIB = kI / 128;
     template <int Bits> using WeightDecode = strix::moe_core::Exl3Trellis<Bits>;
+    template <int Bits> using WeightSource = strix::weight::hip::LegacyMul1Source<static_cast<unsigned>(Bits)>;
     template <int Bits> using Norm = typename WeightDecode<Bits>::Norm;
     template <typename T> using Glob = const __attribute__((address_space(1))) T*;
 // One grouped work item: one expert matrix over its group's rows.

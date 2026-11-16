@@ -9,6 +9,9 @@
 namespace strix::minimax::moe::opt {
 
 template <int Bits> using WeightDecode = strix::moe_core::Exl3Trellis<Bits>;
+// The registered operand source the decode policy is bound to (hip/weight/trellis_sources.hpp); same codec and input transform.
+template <int Bits> using WeightSource = strix::weight::hip::LegacyMul1Source<static_cast<unsigned>(Bits)>;
+static_assert(std::is_base_of_v<WeightSource<3>, WeightDecode<3>>);
 
 // Host dispatch selects a policy on the existing grouped PAIR/PIPE kernels.
 template <bool Packed> struct MinimaxPrefillTraits {

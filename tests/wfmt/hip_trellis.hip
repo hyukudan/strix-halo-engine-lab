@@ -16,6 +16,7 @@
 #endif
 #include "core/trellis_codec.hpp"
 #include "strix/env_flags.hpp"
+#include "hip/weight/registry.hpp"
 #if defined(STRIX_WFMT_GEMMA) && STRIX_WFMT_GEMMA
 #include "gemma4/exl3/device.hpp"
 #endif
@@ -658,9 +659,22 @@ void gemma_cases() {
             }
 }
 #endif
+
+// One registry row per EXL3 numeric version, found by its exact arithmetic; Gemma is never bound to the generic mul1 arithmetic.
+void registry_cases() {
+    namespace wh = strix::weight::hip;
+    expect(wh::find_source({"exl3.mul1.tiles16", 1}, "trellis-tile", "trellis-mul1-legacy") != nullptr, "mul1 source unregistered");
+    for (const auto name : {"g4-exl3-v1", "g4-exl3-v2", "g4-exl3-v3", "g4-exl3-wmma-pf-v1"}) {
+        const auto* r = wh::find_source({"exl3.gemma.transport", 1}, "trellis-tile", name);
+        expect(r && r->input_transform && r->output_transform && r->alignment == 2U, std::string("Gemma source unregistered ") + name);
+    }
+    expect(!wh::find_source({"exl3.gemma.transport", 1}, "trellis-tile", "trellis-mul1-legacy"), "Gemma bound to the generic mul1 arithmetic");
+    ++g_cases;
+}
 }  // namespace
 
 int main() try {
+    registry_cases();
     g_report = strix::envcfg::integer("STRIX_WFMT_TRELLIS_REPORT", 0) != 0;
     // STRIX_WFMT_TRELLIS_GEMMA_ONLY=1: only the Gemma cases (one process per STRIX_G4_EXL3_IDENTITY).
     if (strix::envcfg::integer("STRIX_WFMT_TRELLIS_GEMMA_ONLY", 0) == 0) {
