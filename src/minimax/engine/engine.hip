@@ -679,6 +679,9 @@ struct Engine::Impl {
     // flash core instead of the exact in-block kernel; selection, block lists and K/V caches unchanged. Governed rows of the
     // MiniMax FAST prefill profile (mm_profile_table.hpp; STRIX_MM_FAST_PREFILL=1 selects msa-flash-bf16-l40-v1).
     unsigned pf_msa_flash = 0;
+    // its layers: the q finish writes q's BF16 image after norm + RoPE for the flash core's query_op (bitwise, half
+    // the q bytes); default on, STRIX_MM_PF_MSA_Q16=0 keeps the FP32 q and the flash prologue
+    bool pf_msa_q16 = strix::envcfg::flag("STRIX_MM_PF_MSA_Q16", true, strix::EnvFlagMatch::exact);
     std::string pf_msa_flash_asked = "default";  // receipt: "default", the explicit value or "fast_prefill"
     strix::core::LayerSet pf_msa_flash_layers;  // STRIX_MM_PF_MSA_FLASH_LAYERS: layers that use it (unset: defaults::kMsaFlashLayers)
     // STRIX_MM_PF_IDX_WMMA=1 (minimax-index-proj-wmma-v1): prefill index projections (rows > 8) of the layers in
@@ -1991,6 +1994,7 @@ struct Engine::Impl {
             if (conc) strix::minimax::attn::index_proj_fork(ipv, nullptr, idx_side,
                 gemv ? idx_fork[L] : pf_idx_conc == 2 ? pf_idx_fork_device[ie] : pf_idx_fork[ie], idx_fast ? idx_xt : nullptr);
             if (tl && lin_opt) tl->mark("qkv-projections", true);
+            std::size_t q16_rows = 0;  // > 0: q holds the BF16 image (and lo) of these rows, not FP32 (dense q finish)
             if (f32) {
                 if (tl) tl->mark("q-projection", true);
                 f32_linear(y.rq, hn, kHidden, q, kQLocal, n);
@@ -2007,8 +2011,18 @@ struct Engine::Impl {
                 if (xb_prepped) mmoe::enqueue_linears_prepared(j, 3, static_cast<unsigned>(n), lin_ws, nullptr);  // STRIX_MM_XB_PREP
                 else mmoe::enqueue_linears(j, 3, static_cast<unsigned>(n), lin_ws, nullptr);
                 xb_prepped = false;
-            } else if (const mmoe::PrefillDenseJob qkv[3] = {{y.rq, q}, {y.rk, k}, {y.rv, v}}; dense_qkv(n, qkv)) {
+            } else if (mmoe::PrefillDenseJob qkv[3] = {{y.rq, q}, {y.rk, k}, {y.rv, v}}; dense_qkv(n, qkv)) {
                 // STRIX_MM_PF_DENSE_QKV: one v4-core call, one timeline interval (compare with q + k + v of the library).
+                // MSA FAST flash layers (the mode 11 / 12 branch of the attention below, same predicate): q's BF16 image
+                // in q's own memory (u16; mode 12's lo image in its second half), read through query_op
+                if (pf_msa_q16 && rows.empty() && attn_prefill_fused && n > 8 && pf_msa_flash != 0 && pf_msa_rework != 0 &&
+                    pf_msa_flash_layers.test(L)) {
+                    qkv[0].image = reinterpret_cast<std::uint16_t*>(q);
+                    qkv[0].image_lo = pf_msa_flash == 2 ? qkv[0].image + n * kQLocal : nullptr;
+                    qkv[0].image_w = y.norm[0];
+                    qkv[0].image_rope = d_rope + pos0;
+                    q16_rows = n;
+                }
                 if (tl) tl->mark("qkv-projections", true);
                 mmoe::enqueue_prefill_dense(qkv, 3, hn, static_cast<unsigned>(n), pf_ws, pf_ws_bytes, nullptr);
                 if (tl) tl->mark("qkv-projections", false);
@@ -2114,6 +2128,10 @@ struct Engine::Impl {
                         dv.idx = pf_idx;
                         dv.idx_count = pf_cnt;
                         dv.partial = pf_partial;
+                        if (q16_rows == n) {  // the dense q finish wrote the image (this r0 is 0: one call covers n rows)
+                            dv.q16 = reinterpret_cast<const std::uint16_t*>(q) + r0 * kQLocal;
+                            dv.q16_lo = pf_msa_flash == 2 ? reinterpret_cast<const std::uint16_t*>(q) + n * kQLocal + r0 * kQLocal : nullptr;
+                        }
                         dv.ticket = pf_ticket;
                         mfused::enqueue_prefill({dv, static_cast<std::uint32_t>(n), pos0, pf_msa_windows, 0, pf_idx_tile && n > 8, pf_idx_rows, n > 8 ? (pf_msa_flash != 0 && pf_msa_rework != 0 && pf_msa_flash_layers.test(L) ? 10U + pf_msa_flash : pf_msa_rework) : 0U}, nullptr, tl ? PrefillTimeline::msa_mark : nullptr, tl);
                         break;
