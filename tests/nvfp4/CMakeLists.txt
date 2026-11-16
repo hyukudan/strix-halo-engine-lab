@@ -36,3 +36,15 @@ if(STRIX_NVFP4_CUDA)
   add_test(NAME nvfp4_device COMMAND nvfp4_device)
   set_tests_properties(nvfp4_device PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=0" TIMEOUT 110)
 endif()
+
+if(STRIX_NVFP4_CUDA)
+  add_executable(nvfp4_a8_nonfinite_device a8_nonfinite.cpp
+    ${STRIX_ROOT}/src/cuda/core/nvfp4_a8.cu
+    ${STRIX_ROOT}/src/cuda/core/nvfp4_a8_reference.cpp)
+  target_link_libraries(nvfp4_a8_nonfinite_device PRIVATE strix_nvfp4_reference)
+  target_include_directories(nvfp4_a8_nonfinite_device PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_compile_definitions(nvfp4_a8_nonfinite_device PRIVATE STRIX_TEST_A8_CUDA=1)
+  set_target_properties(nvfp4_a8_nonfinite_device PROPERTIES CUDA_ARCHITECTURES 120a CUDA_STANDARD 17)
+  target_compile_options(nvfp4_a8_nonfinite_device PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+  add_test(NAME nvfp4_a8_nonfinite_device COMMAND nvfp4_a8_nonfinite_device)
+endif()

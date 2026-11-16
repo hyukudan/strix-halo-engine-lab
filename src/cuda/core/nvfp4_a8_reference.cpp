@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 #include "strix/cuda/core/nvfp4.hpp"
@@ -14,7 +15,7 @@ float half_to_float(std::uint16_t h) {
     const std::uint32_t sign = (h >> 15) & 1U, exp = (h >> 10) & 31U, man = h & 1023U;
     float v;
     if (exp == 0) v = std::ldexp(static_cast<float>(man), -24);
-    else if (exp == 31) v = man ? std::nanf("") : INFINITY;
+    else if (exp == 31) v = man ? std::numeric_limits<float>::quiet_NaN() : std::numeric_limits<float>::infinity();
     else v = std::ldexp(static_cast<float>(man | 1024U), static_cast<int>(exp) - 25);
     return sign ? -v : v;
 }
