@@ -6,7 +6,7 @@
 // Build: amdclang++ -x hip --offload-arch=gfx1151 -O3 -std=c++20 -I<repo>/src -I<repo>/include flash_keysplit_bench.hip
 // Run:   flash_keysplit_bench POS0 ROWS R OPT [SPLIT]   -> one line: ms (median of 20), TFLOPS, output fnv64
 //        POS0 = position of the first row, ROWS = rows in the launch, OPT = core Opt bits (0 = incumbent schedule);
-//        OPT 8 + b = row-group form (sparse_flash_rowgroup.hpp, 4 rows per work-group, Opt bits b = 0..3; SPLIT 0).
+//        OPT 8 + b = row-group form (sparse_flash_rowgroup.hpp, 4 rows per work-group, Opt bits b = 0..3, 5, 13; SPLIT 0).
 //        [DRIFT]: if given (>= 0), each row's selection is its predecessor's with DRIFT of the 15 older blocks
 //        replaced (R ignored). OPT != 0 also prints max |out - out(OPT 0)| (same SPLIT) and max |out(OPT 0)|.
 #include "attn_core/sparse_flash_keysplit.hpp"
@@ -202,6 +202,8 @@ int main(int argc, char** argv) {
             case 18: launch_rowgroup<1>(a, rows); break;
             case 20: launch_rowgroup<2>(a, rows); break;
             case 22: launch_rowgroup<3>(a, rows); break;
+            case 26: launch_rowgroup<5>(a, rows); break;
+            case 42: launch_rowgroup<13>(a, rows); break;
             default: std::fprintf(stderr, "unknown OPT\n"); std::exit(1);
         }
     };

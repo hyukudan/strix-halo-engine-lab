@@ -39,30 +39,37 @@
 
 namespace strix::attn_core::sparse {
 
-template <unsigned H, unsigned D, unsigned Segs> struct RowGroup {
+template <unsigned H, unsigned D, unsigned Segs, bool Two = false> struct RowGroup {
     static_assert(H == 16 && D == 128, "key-split fragment layouts");
     static constexpr unsigned kRows = 4, kWaves = kRows, kThreads = 32 * kWaves, kT = 16, kKs = D / 16;
     static constexpr unsigned kKPitch = 2 * D + 16;    // K row: 128 dims + 16-B pad (272 B: 8 lanes cover 32 banks)
     static constexpr unsigned kVPitch = 2 * kT + 16;   // V^T row: 16 keys + 16-B pad (key-split pitch)
     static constexpr unsigned kKBytes = kT * kKPitch, kVBytes = D * kVPitch, kStage = kKBytes + kVBytes;
     static constexpr unsigned kCand = kRows * Segs;
-    static constexpr unsigned kCv = 2 * kStage;                  // u64 candidate identity [kCand]
+    static constexpr unsigned kVtWave = D * kVPitch;             // two-phase: one wave's private V^T tile
+    static constexpr unsigned kArea = Two && kWaves * kVtWave > 2 * kStage ? kWaves * kVtWave : 2 * kStage;
+    static constexpr unsigned kCv = kArea;                       // u64 candidate identity [kCand]
     static constexpr unsigned kKp = kCv + 8 * kCand;             // u64 union K segment base [kCand]
     static constexpr unsigned kVp = kKp + 8 * kCand;             // u64 union V segment base [kCand]
     static constexpr unsigned kNk = kVp + 8 * kCand;             // u16 visible keys [union][row], 0 = not selected
     static constexpr unsigned kDup = kNk + 2 * kRows * kCand;    // u32 duplicate flag [kCand]
-    static constexpr unsigned kCnt = kDup + 4 * kCand;           // u32 union length
+    static constexpr unsigned kMc = kDup + 4 * kCand;            // u32 rows that selected union entry u
+    static constexpr unsigned kSidx = kMc + 4 * kCand;           // u32 shared-phase entries (ascending)
+    static constexpr unsigned kCnt = kSidx + 4 * kCand;          // u32 union length, shared-phase length
     static constexpr unsigned kBytes = kCnt + 16;
     static_assert(kRows * H * D * 2 <= 2 * kStage, "query staging fits the tile stages");
     static_assert(2 * kRows * kCand == 4 * kThreads, "one u32 of the visible-key table per thread");
-    static_assert(Segs <= 32, "one candidate per lane");
+    static_assert(Segs <= 32 && kCand <= 64, "one candidate per lane; two ballot passes cover the union");
 };
 
 // Opt bits (schedule / exactness notes per bit):
 //   kRgLazyRescale  skip the accumulator rescale when no lane's alpha differs from 1 (exp2(0) = 1: same bits)
 //   kRgQkPair       QK in two accumulator chains (even / odd 16-dim steps) added once: half the dependent WMMA chain,
 //                   different score rounding (FAST: changes the bits of the default form)
-inline constexpr unsigned kRgLazyRescale = 1U, kRgQkPair = 2U;
+//   kRgTwoPhase     only segments selected by >= 2 rows (kRgShare3: >= 3) run in the shared lockstep phase; each
+//                   row's other segments run afterwards in its own wave without barriers (keys straight from global,
+//                   values through a wave-private V^T tile). Same tiles per row, different order: FAST.
+inline constexpr unsigned kRgLazyRescale = 1U, kRgQkPair = 2U, kRgTwoPhase = 4U, kRgShare3 = 8U;
 
 namespace rowgroup_detail {
 // P[head ln][16 keys] B fragment from the lane's 8 probabilities (key 2e + hf) and the other half's (key-split form).
@@ -84,7 +91,8 @@ __device__ __forceinline__ tile::Frag p_frag(const std::uint16_t (&v)[8], unsign
 
 template <class P, unsigned Opt = 0U>
 __global__ __launch_bounds__((RowGroup<P::kHeads, P::kDim, P::kMaxSegs>::kThreads)) void flash_rowgroup_kernel(typename P::Args a) {
-    using G = RowGroup<P::kHeads, P::kDim, P::kMaxSegs>;
+    constexpr bool kTwo = (Opt & kRgTwoPhase) != 0U;
+    using G = RowGroup<P::kHeads, P::kDim, P::kMaxSegs, kTwo>;
     using tile::Acc;
     using tile::Frag;
     using tile::U2;
@@ -92,6 +100,7 @@ __global__ __launch_bounds__((RowGroup<P::kHeads, P::kDim, P::kMaxSegs>::kThread
     constexpr unsigned H = P::kHeads, D = P::kDim, T = G::kT, S = P::kMaxSegs;
     constexpr tile::Operand O = P::kOp;
     static_assert(P::kSegKeys % T == 0, "segments are whole tiles");
+    constexpr unsigned kShareMin = !kTwo ? 1U : (Opt & kRgShare3) != 0U ? 3U : 2U;
     __shared__ __attribute__((aligned(16))) unsigned char lds[G::kBytes];
     auto* const cv = reinterpret_cast<std::uint64_t*>(lds + G::kCv);
     auto* const kp = reinterpret_cast<std::uint64_t*>(lds + G::kKp);
@@ -155,103 +164,175 @@ __global__ __launch_bounds__((RowGroup<P::kHeads, P::kDim, P::kMaxSegs>::kThread
     __syncthreads();
     const unsigned nu = *cnt_u;
     if (nu == 0) return;  // no row with a visible key: outputs untouched
+    // 4. members per union entry; shared-phase list (entries selected by >= kShareMin rows, ascending)
+    auto* const mc = reinterpret_cast<unsigned*>(lds + G::kMc);
+    auto* const sidx = reinterpret_cast<unsigned*>(lds + G::kSidx);
+    if (w == 0) {
+        unsigned base = 0;
+#pragma unroll
+        for (unsigned pass = 0; pass < 2; ++pass) {
+            const unsigned u = lane + 32U * pass;
+            unsigned m = 0;
+            if (u < nu) {
+#pragma unroll
+                for (unsigned r = 0; r < G::kRows; ++r) m += nkt[u * G::kRows + r] != 0 ? 1U : 0U;
+            }
+            if (u < G::kCand) mc[u] = m;
+            const bool shared = m >= kShareMin;
+            const unsigned mask = __builtin_amdgcn_ballot_w32(shared);
+            if (shared) sidx[base + __builtin_popcount(mask & ((1U << lane) - 1U))] = u;
+            base += __builtin_popcount(mask);
+        }
+        if (lane == 0) cnt_u[1] = base;
+    }
+    __syncthreads();
+    const unsigned ns = cnt_u[1];
     const std::size_t ks = P::key_stride(a);
-    const bool vload = tid < 64U;
-    const unsigned t2 = tid & 63U, kg = t2 & 3U, dg = t2 >> 2U;  // V: keys 4 kg .. + 3, dims 8 dg .. + 7
-    const auto keys_max = [&](unsigned u) {
-        const unsigned* p = reinterpret_cast<const unsigned*>(nkt + u * G::kRows);
-        const unsigned x0 = p[0], x1 = p[1];
-        const unsigned m0 = (x0 & 0xffffU) > (x0 >> 16U) ? x0 & 0xffffU : x0 >> 16U;
-        const unsigned m1 = (x1 & 0xffffU) > (x1 >> 16U) ? x1 & 0xffffU : x1 >> 16U;
-        return m0 > m1 ? m0 : m1;
-    };
-    U4 stg[4];
-    const auto fetch = [&](unsigned u, unsigned k0, unsigned nm) {
-        if (vload) {
-            const auto* base = reinterpret_cast<const std::uint16_t*>(vp[u]);
-#pragma unroll
-            for (unsigned i = 0; i < 4; ++i) {
-                const unsigned k = k0 + 4U * kg + i;
-                const bool ok = k < nm;
-                const U4 x = *reinterpret_cast<const U4*>(base + static_cast<std::size_t>(ok ? k : nm - 1U) * ks + 8U * dg);
-                stg[i] = ok ? x : U4{0U, 0U, 0U, 0U};
-            }
-        } else {
-            const auto* base = reinterpret_cast<const std::uint16_t*>(kp[u]);
-#pragma unroll
-            for (unsigned i = 0; i < 4; ++i) {
-                const unsigned k = k0 + (t2 >> 4U) + 4U * i;
-                stg[i] = *reinterpret_cast<const U4*>(base + static_cast<std::size_t>(k < nm ? k : nm - 1U) * ks + 8U * (t2 & 15U));
-            }
-        }
-    };
-    const auto put = [&](unsigned stage) {
-        unsigned char* const buf = lds + stage * G::kStage;
-        if (vload) {
-            tile::store_vt4x8<G::kVPitch>(buf + G::kKBytes, stg, 8U * dg, kg);
-        } else {
-#pragma unroll
-            for (unsigned i = 0; i < 4; ++i)
-                *reinterpret_cast<U4*>(buf + ((t2 >> 4U) + 4U * i) * G::kKPitch + 16U * (t2 & 15U)) = stg[i];
-        }
-    };
     Acc o[G::kKs];
 #pragma unroll
     for (unsigned c = 0; c < G::kKs; ++c) o[c] = tile::acc_zero();
     tile::SoftmaxState st;
-    unsigned u = 0, k0 = 0, nm = keys_max(0);
-    fetch(u, k0, nm);
-    put(0);
-    __syncthreads();
-#pragma unroll 1
-    for (unsigned t = 0;; ++t) {
-        unsigned u1 = u, k1 = k0 + T, nm1 = nm;
-        if (k1 >= nm) {
-            u1 = u + 1U;
-            k1 = 0;
-            nm1 = u1 < nu ? keys_max(u1) : 0U;
+    // One 16-key tile of the wave's row: K fragments kfrag(x), V^T rows at vtb, keys k0 + j visible for k0 + j < own.
+    const auto math = [&](auto kfrag, const unsigned char* vtb, unsigned k0, unsigned own) {
+        Acc s = tile::acc_zero();
+        if constexpr ((Opt & kRgQkPair) != 0U) {
+            Acc s1 = tile::acc_zero();
+#pragma unroll
+            for (unsigned x = 0; x < G::kKs; x += 2U) {
+                s = tile::mma<O>(kfrag(x), qf[x], s);
+                s1 = tile::mma<O>(kfrag(x + 1U), qf[x + 1U], s1);
+            }
+#pragma unroll
+            for (unsigned e = 0; e < 8; ++e) s[e] += s1[e];
+        } else {
+#pragma unroll
+            for (unsigned x = 0; x < G::kKs; ++x) s = tile::mma<O>(kfrag(x), qf[x], s);
         }
-        const bool more = u1 < nu;
-        if (more) fetch(u1, k1, nm1);  // in flight during this tile's math
-        const unsigned own = nkt[u * G::kRows + w];
-        if (act && k0 < own) {
-            const unsigned char* const buf = lds + (t & 1U) * G::kStage;
-            Acc s = tile::acc_zero();
-            if constexpr ((Opt & kRgQkPair) != 0U) {
-                Acc s1 = tile::acc_zero();
+        float sv[8];
 #pragma unroll
-                for (unsigned x = 0; x < G::kKs; x += 2U) {
-                    s = tile::mma<O>(tile::frag32(buf + ln * G::kKPitch + 32U * x), qf[x], s);
-                    s1 = tile::mma<O>(tile::frag32(buf + ln * G::kKPitch + 32U * (x + 1U)), qf[x + 1U], s1);
+        for (unsigned e = 0; e < 8; ++e) sv[e] = k0 + 2U * e + hf < own ? s[e] * P::kScaleLog2 : -__builtin_huge_valf();
+        std::uint16_t pb[8];
+        const float alpha = tile::online_step<O, 8, 2, tile::SumOf::rounded, 16>(sv, st, pb);
+        const Frag pf = rowgroup_detail::p_frag(pb, hf);
+        const bool rescale = (Opt & kRgLazyRescale) == 0U || __builtin_amdgcn_ballot_w32(alpha != 1.0F) != 0U;
+#pragma unroll
+        for (unsigned x = 0; x < G::kKs; ++x) {
+            if (rescale) {
+#pragma unroll
+                for (unsigned e = 0; e < 8; ++e) o[x][e] *= alpha;
+            }
+            o[x] = tile::mma<O>(tile::frag32(vtb + (16U * x + ln) * G::kVPitch), pf, o[x]);
+        }
+    };
+    // 5. shared phase: each tile of the shared entries loaded once (waves 0-1 V, 2-3 K), one barrier per tile
+    if (ns != 0) {
+        const bool vload = tid < 64U;
+        const unsigned t2 = tid & 63U, kg = t2 & 3U, dg = t2 >> 2U;  // V: keys 4 kg .. + 3, dims 8 dg .. + 7
+        const auto keys_max = [&](unsigned u) {
+            const unsigned* p = reinterpret_cast<const unsigned*>(nkt + u * G::kRows);
+            const unsigned x0 = p[0], x1 = p[1];
+            const unsigned m0 = (x0 & 0xffffU) > (x0 >> 16U) ? x0 & 0xffffU : x0 >> 16U;
+            const unsigned m1 = (x1 & 0xffffU) > (x1 >> 16U) ? x1 & 0xffffU : x1 >> 16U;
+            return m0 > m1 ? m0 : m1;
+        };
+        U4 stg[4];
+        const auto fetch = [&](unsigned u, unsigned k0, unsigned nm) {
+            if (vload) {
+                const auto* base = reinterpret_cast<const std::uint16_t*>(vp[u]);
+#pragma unroll
+                for (unsigned i = 0; i < 4; ++i) {
+                    const unsigned k = k0 + 4U * kg + i;
+                    const bool ok = k < nm;
+                    const U4 x = *reinterpret_cast<const U4*>(base + static_cast<std::size_t>(ok ? k : nm - 1U) * ks + 8U * dg);
+                    stg[i] = ok ? x : U4{0U, 0U, 0U, 0U};
                 }
+            } else {
+                const auto* base = reinterpret_cast<const std::uint16_t*>(kp[u]);
 #pragma unroll
-                for (unsigned e = 0; e < 8; ++e) s[e] += s1[e];
+                for (unsigned i = 0; i < 4; ++i) {
+                    const unsigned k = k0 + (t2 >> 4U) + 4U * i;
+                    stg[i] = *reinterpret_cast<const U4*>(base + static_cast<std::size_t>(k < nm ? k : nm - 1U) * ks + 8U * (t2 & 15U));
+                }
+            }
+        };
+        const auto put = [&](unsigned stage) {
+            unsigned char* const buf = lds + stage * G::kStage;
+            if (vload) {
+                tile::store_vt4x8<G::kVPitch>(buf + G::kKBytes, stg, 8U * dg, kg);
             } else {
 #pragma unroll
-                for (unsigned x = 0; x < G::kKs; ++x) s = tile::mma<O>(tile::frag32(buf + ln * G::kKPitch + 32U * x), qf[x], s);
+                for (unsigned i = 0; i < 4; ++i)
+                    *reinterpret_cast<U4*>(buf + ((t2 >> 4U) + 4U * i) * G::kKPitch + 16U * (t2 & 15U)) = stg[i];
             }
-            float sv[8];
+        };
+        unsigned si = 0, u = sidx[0], k0 = 0, nm = keys_max(u);
+        fetch(u, k0, nm);
+        put(0);
+        __syncthreads();
+#pragma unroll 1
+        for (unsigned t = 0;; ++t) {
+            unsigned si1 = si, u1 = u, k1 = k0 + T, nm1 = nm;
+            if (k1 >= nm) {
+                si1 = si + 1U;
+                k1 = 0;
+                u1 = si1 < ns ? sidx[si1] : 0U;
+                nm1 = si1 < ns ? keys_max(u1) : 0U;
+            }
+            const bool more = si1 < ns;
+            if (more) fetch(u1, k1, nm1);  // in flight during this tile's math
+            const unsigned own = nkt[u * G::kRows + w];
+            if (act && k0 < own) {
+                const unsigned char* const buf = lds + (t & 1U) * G::kStage;
+                math([&](unsigned x) { return tile::frag32(buf + ln * G::kKPitch + 32U * x); }, buf + G::kKBytes, k0, own);
+            }
+            if (!more) break;
+            put((t + 1U) & 1U);
+            __syncthreads();
+            si = si1;
+            u = u1;
+            k0 = k1;
+            nm = nm1;
+        }
+    }
+    // 6. private phase: the wave's remaining segments, no barriers (the key-split form's per-wave tile loop)
+    if constexpr (kTwo) {
+        if (ns != 0) __syncthreads();  // the wave V^T tiles reuse the stage area
+        if (act) {
+            unsigned char* const vtw = lds + w * G::kVtWave;
+            const unsigned kg = lane & 3U, dg = lane >> 2U;  // gather: 4 keys x 8 dims, two passes
+#pragma unroll 1
+            for (unsigned u = 0; u < nu; ++u) {
+                const unsigned own = nkt[u * G::kRows + w];
+                if (own == 0 || mc[u] >= kShareMin) continue;  // wave-uniform
+                const auto* kb = reinterpret_cast<const std::uint16_t*>(kp[u]);
+                const auto* vb = reinterpret_cast<const std::uint16_t*>(vp[u]);
+#pragma unroll 1
+                for (unsigned k0 = 0; k0 < own; k0 += T) {
+                    const std::uint16_t* const kr = kb + static_cast<std::size_t>(k0 + ln < own ? k0 + ln : own - 1U) * ks;
+                    Frag kf[G::kKs];
 #pragma unroll
-            for (unsigned e = 0; e < 8; ++e) sv[e] = k0 + 2U * e + hf < own ? s[e] * P::kScaleLog2 : -__builtin_huge_valf();
-            std::uint16_t pb[8];
-            const float alpha = tile::online_step<O, 8, 2, tile::SumOf::rounded, 16>(sv, st, pb);
-            const Frag pf = rowgroup_detail::p_frag(pb, hf);
-            const bool rescale = (Opt & kRgLazyRescale) == 0U || __builtin_amdgcn_ballot_w32(alpha != 1.0F) != 0U;
+                    for (unsigned x = 0; x < G::kKs / 2U; ++x) kf[x] = tile::frag32(kr + 16U * x);
+                    U4 gv[2][4];
 #pragma unroll
-            for (unsigned x = 0; x < G::kKs; ++x) {
-                if (rescale) {
+                    for (unsigned i = 0; i < 4; ++i) {
+                        const unsigned k = k0 + 4U * kg + i;
+                        const bool ok = k < own;
+                        const std::uint16_t* const vr = vb + static_cast<std::size_t>(ok ? k : own - 1U) * ks;
 #pragma unroll
-                    for (unsigned e = 0; e < 8; ++e) o[x][e] *= alpha;
+                        for (unsigned p = 0; p < 2; ++p) {
+                            const U4 x = *reinterpret_cast<const U4*>(vr + 8U * (dg + 8U * p));
+                            gv[p][i] = ok ? x : U4{0U, 0U, 0U, 0U};
+                        }
+                    }
+#pragma unroll
+                    for (unsigned x = G::kKs / 2U; x < G::kKs; ++x) kf[x] = tile::frag32(kr + 16U * x);
+                    __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+                    for (unsigned p = 0; p < 2; ++p) tile::store_vt4x8<G::kVPitch>(vtw, gv[p], 8U * (dg + 8U * p), kg);
+                    math([&](unsigned x) { return kf[x]; }, vtw, k0, own);
                 }
-                o[x] = tile::mma<O>(tile::frag32(buf + G::kKBytes + (16U * x + ln) * G::kVPitch), pf, o[x]);
             }
         }
-        if (!more) break;
-        put((t + 1U) & 1U);
-        __syncthreads();
-        u = u1;
-        k0 = k1;
-        nm = nm1;
     }
     if (!act) return;
     // O^T[dim 16 x + 2 e + hf][head ln] / l -> FP32 [H][D] (a head without visible keys writes zeros, as the key-split form)
