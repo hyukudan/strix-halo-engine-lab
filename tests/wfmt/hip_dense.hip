@@ -13,6 +13,7 @@
 #include <string>
 #include <initializer_list>
 #include <vector>
+#include "byte_equal.hpp"
 #if __has_include("../../src/hip/weight/registry.hpp")
 #include "../../src/hip/weight/registry.hpp"
 #include "strix/weight/source.hpp"
@@ -24,6 +25,7 @@
 #endif
 
 namespace {
+using strix::weight::test::byte_equal;
 void check(hipError_t e) { if (e != hipSuccess) throw std::runtime_error(hipGetErrorString(e)); }
 void context(const std::string& name,const char* arithmetic,std::initializer_list<std::uint64_t> shape,const char* format) {
 #ifdef STRIX_WFMT_CAPTURE
@@ -145,7 +147,7 @@ void strided_raw_case() {
     Buffer dw(w.size()*2U),dp(packed.size()*2U),dx(x.size()*4U),dy(rows*n*4U);dw.upload(w);dp.upload(packed);dx.upload(x);
     hipLaunchKernelGGL(raw_kernel,dim3(1,2),dim3(256),0,0,dx.as<float>(),k,rows,RawCols{dw.as<_Float16>(),dy.as<float>(),k,n});check(hipGetLastError());const auto raw=dy.read<float>(rows*n);
     hipLaunchKernelGGL(strided_raw_kernel,dim3(1,2),dim3(256),0,0,dx.as<float>(),k,rows,StridedCols{dp.as<_Float16>(),dy.as<float>(),k,n,padded});check(hipGetLastError());const auto strided=dy.read<float>(rows*n);
-    if(raw!=strided) throw std::runtime_error("strided raw F16 source layout differs");
+    if(!byte_equal(raw,strided)) throw std::runtime_error("strided raw F16 source layout differs");
 }
 std::vector<unsigned char> weights(unsigned k,unsigned n) {
     std::vector<unsigned char> w(n*(k/32U)*34U);
@@ -180,9 +182,9 @@ template<unsigned R> void rows_case(unsigned k,unsigned n) {
     if constexpr(R<=8U) {
         hipLaunchKernelGGL((project_rows_kernel<Site<R>,2U,false,false>),dim3((n+15U)/16U),dim3(256),0,0,s);const auto a=read();
         hipLaunchKernelGGL((project_rows_kernel<Site<R>,2U,true,false>),dim3((n+15U)/16U),dim3(256),R*k*4U,0,s);const auto b=read();
-        if(a!=b) throw std::runtime_error("staged rows differ");
+        if(!byte_equal(a,b)) throw std::runtime_error("staged rows differ");
         hipLaunchKernelGGL((project_rows_stepped_kernel<Site<R>,2U,1U>),dim3((n+15U)/16U),dim3(256),2U*R*256U*4U,0,s);const auto c=read();
-        if(a!=c) throw std::runtime_error("stepped rows differ");
+        if(!byte_equal(a,c)) throw std::runtime_error("stepped rows differ");
         // Seeded planar low/high codes cover signs, extrema and per-group FP16 scales.
         context(name+".q6p32","hip-q8-rows-fma-mix-fixture@1",{R,n,k},"image.q6p32@1");
         auto q6=q6_weights(k,n);
@@ -193,10 +195,10 @@ template<unsigned R> void rows_case(unsigned k,unsigned n) {
         constexpr unsigned sub=4U;
         hipLaunchKernelGGL((project_wide_rows_kernel<Site<R>,2U,sub>),dim3(((n+15U)/16U)*(R/sub)),dim3(256),0,0,s);const auto a=read();
         hipLaunchKernelGGL((project_wide_rows_staged_kernel<Site<R>,2U,sub>),dim3(((n+15U)/16U)*(R/sub)),dim3(256),0,0,s);const auto b=read();
-        if(a!=b) throw std::runtime_error("wide staged differs");
+        if(!byte_equal(a,b)) throw std::runtime_error("wide staged differs");
         constexpr unsigned waves=R/sub<8U?R/sub:8U;
         hipLaunchKernelGGL((project_wide_rows_coef_kernel<Site<R>,2U,sub,8U,false>),dim3(((n+1U)/2U)*(R/sub/waves)),dim3(32U*waves),0,0,s);const auto c=read();
-        if(a!=c) throw std::runtime_error("coefficient source differs");
+        if(!byte_equal(a,c)) throw std::runtime_error("coefficient source differs");
         // Production admits the lane kernel only for width % 512 == 0 (an even chunk count; see
         // lane_admits in src/hip_q8_rows_gemv.hpp); other widths are outside its contract.
         if constexpr(R%32U==0U) if(k%512U==0U) {
@@ -208,7 +210,7 @@ template<unsigned R> void rows_case(unsigned k,unsigned n) {
             hipLaunchKernelGGL((lane_pack_rows_kernel<Site<R>>),dim3((R*k+255U)/256U),dim3(256),0,0,s,xs.as<float>());
             xs.read<float>(R*k);
             hipLaunchKernelGGL((project_wide_rows_lane_kernel<Site<R>,8U,8U,2U>),dim3(g*(R/32U)),dim3(256),0,0,s,codes.as<unsigned char>(),scales.as<std::uint16_t>(),xs.as<float>());const auto d=read();
-            if(a!=d) {unsigned diff=0;for(unsigned i=0;i<a.size();++i) diff+=a[i]!=d[i];
+            if(!byte_equal(a,d)) {unsigned diff=0;for(unsigned i=0;i<a.size();++i) diff+=std::bit_cast<std::uint32_t>(a[i])!=std::bit_cast<std::uint32_t>(d[i]);
                 std::fprintf(stderr,"lane-vs-wide R=%u n=%u k=%u differ=%u/%zu\n",R,n,k,diff,a.size());
                 throw std::runtime_error("lane source differs");}
         }
@@ -233,7 +235,7 @@ template<unsigned R> void signed_case(unsigned k,unsigned n) {
     if constexpr(R<=8U) {
         hipLaunchKernelGGL((project_rows_dense_a8_kernel<Site<R>,1U,false,false>),dim3((n+7U)/8U),dim3(256),0,0,site,codes.as<std::int8_t>(),deltas.as<float>());check(hipGetLastError());const auto direct=dy.read<float>(R*n);
         hipLaunchKernelGGL((project_rows_dense_a8_kernel<Site<R>,1U,true,false>),dim3((n+7U)/8U),dim3(256),dense_a8_stage_bytes<R>(k),0,site,codes.as<std::int8_t>(),deltas.as<float>());check(hipGetLastError());const auto staged=dy.read<float>(R*n);
-        if(direct!=staged) throw std::runtime_error("signed-A8 source staging differs");
+        if(!byte_equal(direct,staged)) throw std::runtime_error("signed-A8 source staging differs");
         context(name+".q6p32","hip-signed-a8-block-chain@1",{R,n,k},"image.q6p32@1");
         auto q6=q6_weights(k,n);
         Buffer dq(q6.size());dq.upload(q6);site.segments=segments({{dq.p,n}});
@@ -269,36 +271,42 @@ void partial_case(bool q6) {
 }
 template<unsigned R> void row_partials() {
     using namespace strix::q8_rows;
-    context("hip.rows.partial.r"+std::to_string(R),"hip-q8-rows-fma-mix-fixture@1",{R,1U,256U},"gguf.q8_0@1");
-    auto w=weights(256U,1U);std::vector<float> x(R*256U,0.125F);
+    constexpr unsigned k=512U,chunks=k/256U;
+    static_assert(k%512U==0U); // lane pipeline requires an even chunk count
+    context("hip.rows.partial.r"+std::to_string(R),"hip-q8-rows-fma-mix-fixture@1",{R,1U,k},"gguf.q8_0@1");
+    auto w=weights(k,1U);std::vector<float> x(R*k,0.125F);
     constexpr unsigned blocks=R>8U?R/4U:1U,threads=blocks*256U;
     Buffer dw(w.size()),dx(x.size()*4U),dy(R*4U),trace(threads*kPartialSlots*4U),counts(threads*4U);
     dw.upload(w);dx.upload(x);
     auto* tp=trace.as<float>();auto* cp=counts.as<unsigned>();
     check(hipMemcpyToSymbol(HIP_SYMBOL(partial_trace),&tp,sizeof(tp)));check(hipMemcpyToSymbol(HIP_SYMBOL(partial_count),&cp,sizeof(cp)));
-    Site<R,true> site{};site.segments=segments({{dw.p,1U}});site.width=256;site.outputs=1;site.output=dy.as<float>();
-    for(unsigned r=0;r<R;++r) site.input[r]=dx.as<float>()+r*256U;
+    Site<R,true> site{};site.segments=segments({{dw.p,1U}});site.width=k;site.outputs=1;site.output=dy.as<float>();
+    for(unsigned r=0;r<R;++r) site.input[r]=dx.as<float>()+r*k;
     const auto read=[&] {
-        check(hipGetLastError());dy.read<float>(R);auto values=trace.read<float>(threads*kPartialSlots);const auto used=counts.read<unsigned>(threads);
+        check(hipGetLastError());auto output=dy.read<float>(R);auto values=trace.read<float>(threads*kPartialSlots);const auto used=counts.read<unsigned>(threads);
         unsigned total=0;for(unsigned n:used) {if(n>kPartialSlots) throw std::runtime_error("row diagnostic partial capacity");total+=n;}
-        if(!total) throw std::runtime_error("missing row diagnostic partials");
 #ifdef STRIX_WFMT_CAPTURE
+        if(!total) throw std::runtime_error("missing row diagnostic partials");
         strix::weight::capture::emit("partials",values.data(),values.size()*sizeof(float));
+#else
+        (void)total;
 #endif
         check(hipMemset(trace.p,0,threads*kPartialSlots*4U));check(hipMemset(counts.p,0,threads*4U));
+        return output;
     };
     if constexpr(R<=8U) {
-        hipLaunchKernelGGL((project_rows_kernel<Site<R,true>,2U,true,false>),dim3(1),dim3(256),R*256U*4U,0,site);read();
+        hipLaunchKernelGGL((project_rows_kernel<Site<R,true>,2U,true,false>),dim3(1),dim3(256),R*k*4U,0,site);read();
         hipLaunchKernelGGL((project_rows_stepped_kernel<Site<R,true>,2U,1U>),dim3(1),dim3(256),2U*R*256U*4U,0,site);read();
     } else {
-        hipLaunchKernelGGL((project_wide_rows_kernel<Site<R,true>,2U,4U>),dim3(blocks),dim3(256),0,0,site);read();
+        hipLaunchKernelGGL((project_wide_rows_kernel<Site<R,true>,2U,4U>),dim3(blocks),dim3(256),0,0,site);const auto wide=read();
         hipLaunchKernelGGL((project_wide_rows_staged_kernel<Site<R,true>,2U,4U>),dim3(blocks),dim3(256),0,0,site);read();
         hipLaunchKernelGGL((project_wide_rows_coef_kernel<Site<R,true>,2U,4U,8U,false>),dim3(1),dim3(256),0,0,site);read();
-        Buffer codes(16U*1024U),scales(64U*16U),xs(R*256U*4U);
-        hipLaunchKernelGGL((lane_pack_weights_kernel<Site<R,true>>),dim3(4),dim3(256),0,0,site,codes.as<unsigned char>(),scales.as<std::uint16_t>(),1U);
-        codes.read<unsigned char>(16U*1024U);scales.read<std::uint16_t>(64U*8U);
-        hipLaunchKernelGGL((lane_pack_rows_kernel<Site<R,true>>),dim3(R),dim3(256),0,0,site,xs.as<float>());xs.read<float>(R*256U);
-        hipLaunchKernelGGL((project_wide_rows_lane_kernel<Site<R,true>,8U,8U,2U>),dim3(1),dim3(256),0,0,site,codes.as<unsigned char>(),scales.as<std::uint16_t>(),xs.as<float>());read();
+        Buffer codes(16U*chunks*1024U),scales(chunks*64U*16U),xs(R*k*4U);
+        hipLaunchKernelGGL((lane_pack_weights_kernel<Site<R,true>>),dim3(chunks*4U),dim3(256),0,0,site,codes.as<unsigned char>(),scales.as<std::uint16_t>(),1U);
+        codes.read<unsigned char>(16U*chunks*1024U);scales.read<std::uint16_t>(chunks*64U*8U);
+        hipLaunchKernelGGL((lane_pack_rows_kernel<Site<R,true>>),dim3(R*chunks),dim3(256),0,0,site,xs.as<float>());xs.read<float>(R*k);
+        hipLaunchKernelGGL((project_wide_rows_lane_kernel<Site<R,true>,8U,8U,2U>),dim3(1),dim3(256),0,0,site,codes.as<unsigned char>(),scales.as<std::uint16_t>(),xs.as<float>());const auto lane=read();
+        if(!byte_equal(wide,lane)) throw std::runtime_error("diagnostic lane source differs");
     }
 }
 template<unsigned R> void signed_partials() {
@@ -367,14 +375,14 @@ void dense_case(unsigned k,unsigned n,unsigned rows) {
         Buffer prepared(16U*8U*16U);
         hipLaunchKernelGGL((prepared_kernel<0U>),dim3(1),dim3(16),0,0,v,prepared.as<std::uint32_t>());check(hipGetLastError());const auto a0=prepared.read<std::uint32_t>(16U*8U*4U);
         hipLaunchKernelGGL((prepared_kernel<1U>),dim3(1),dim3(16),0,0,v,prepared.as<std::uint32_t>());check(hipGetLastError());const auto a1=prepared.read<std::uint32_t>(16U*8U*4U);
-        if(a0!=a1) throw std::runtime_error("prepared scalar packed fragments differ");
+        if(!byte_equal(a0,a1)) throw std::runtime_error("prepared scalar packed fragments differ");
 #ifdef STRIX_WFMT_CAPTURE
         strix::weight::capture::emit("prepared",a0.data(),a0.size()*sizeof(std::uint32_t));
 #endif
     }
     hipLaunchKernelGGL((d::q8a8::kernel<1U,8U,0U>),dim3((rows+127U)/128U,(n+15U)/16U),dim3(256),0,0,v);check(hipGetLastError());const auto scalar=dy.read<float>(rows*n);
     hipLaunchKernelGGL((d::q8a8::kernel<1U,8U,1U>),dim3((rows+127U)/128U,(n+15U)/16U),dim3(256),0,0,v);check(hipGetLastError());const auto packed=dy.read<float>(rows*n);
-    if(scalar!=packed) throw std::runtime_error("scalar packed source differs");
+    if(!byte_equal(scalar,packed)) throw std::runtime_error("scalar packed source differs");
     std::vector<_Float16> f16(((n+15U)/16U)*16U*k);
     for(unsigned o=0;o<((n+15U)/16U)*16U;++o) for(unsigned j=0;j<k;++j) {
         const unsigned ro=std::min(o,n-1U);std::uint16_t scale;std::memcpy(&scale,w.data()+(ro*k/32U+j/32U)*34U,2U);
@@ -383,7 +391,7 @@ void dense_case(unsigned k,unsigned n,unsigned rows) {
     context(name+".raw-f16","hip-raw-f16-wmma@1",{rows,n,k},"plain.f16@1");
     Buffer df(f16.size()*2U);df.upload(f16);
     hipLaunchKernelGGL(raw_kernel,dim3((rows+127U)/128U,(n+15U)/16U),dim3(256),0,0,dx.as<float>(),k,rows,RawCols{df.as<_Float16>(),dy.as<float>(),k,n});check(hipGetLastError());const auto raw=dy.read<float>(rows*n);
-    if(scalar!=raw) throw std::runtime_error("raw F16 source differs");
+    if(!byte_equal(scalar,raw)) throw std::runtime_error("raw F16 source differs");
 }
 }
 int main() try {

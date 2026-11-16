@@ -4,6 +4,12 @@ This shared kit preserves distinct storage, image and arithmetic identities. It
 does not select faster arithmetic or supply model assets. Build and receipt
 directories are caller inputs and must remain outside version control.
 
+HIP production kernels exercise the extracted storage helpers. `BoundCore`,
+generic `load_fragment` entry points and the source admission registry remain
+scaffolding covered by fixtures, not production launch policy. Existing row
+construction adapters remain in place; consolidating them and connecting the
+typed facade requires a separate migration and native qualification.
+
 Invoke `build.sh` through the deployment's CPU build lane, passing `--source`,
 `--build`, `--backend` and optionally `--toolchain` and repeatable `--target`.
 Backends are `host`, `hip`, `cuda-qwen`, `cuda-ds41`, `cpu`, `intel` and `nvfp4`.

@@ -2,6 +2,7 @@
 #include <hip/hip_runtime.h>
 #include <cstddef>
 #include <cstdint>
+#include "registry.hpp"
 namespace strix::weight { struct Status; struct WeightView; }
 namespace strix::weight::hip {
 struct Q8_0Tag {}; struct RawF16Tag {}; struct Q6P32Tag {};
@@ -12,9 +13,6 @@ struct MatrixView {
     const std::uint8_t* blocks;
     std::uint64_t row_stride_bytes, expert_stride_bytes;
     std::uint32_t k,n;
-};
-struct LaunchShape {
-    std::uint64_t m,n,k,row_stride_bytes,activation_stride,output_stride,k_offset_bytes;
 };
 Status validate_q8_rows(const WeightView&,const LaunchShape&);
 Status validate_q6_rows(const WeightView&,const LaunchShape&);

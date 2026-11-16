@@ -26,6 +26,13 @@ endif()
 include(${WFMT_ROOT}/cmake/StrixWeight.cmake)
 include(${WFMT_ROOT}/cmake/StrixBackendCpu.cmake)
 include(${WFMT_ROOT}/cmake/StrixIntel.cmake)
+add_executable(strix-wfmt-hip-admission-tests hip_admission.cpp ${WFMT_ROOT}/src/weight/types.cpp)
+target_include_directories(strix-wfmt-hip-admission-tests PRIVATE ${WFMT_ROOT}/include)
+target_compile_features(strix-wfmt-hip-admission-tests PRIVATE cxx_std_20)
+strix_target_warnings(strix-wfmt-hip-admission-tests)
+foreach(case addressing q6-span bytes)
+    add_test(NAME wfmt.hip-${case} COMMAND strix-wfmt-hip-admission-tests ${case})
+endforeach()
 add_executable(strix-wfmt-host-tests main.cpp contracts.cpp census.cpp compare.cpp
     reference.cpp geometry.cpp fixtures/iq3_s_cases.cpp
     resolve.cpp cache.cpp effective_config.cpp runtime.cpp readers.cpp admission.cpp reference_admission.cpp cpu.cpp intel.cpp

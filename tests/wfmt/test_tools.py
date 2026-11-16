@@ -7,6 +7,7 @@ import re
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -21,6 +22,7 @@ import isa
 import matrix_from_records
 import records
 import run
+import sync_source
 
 
 def invoke(module, args):
@@ -86,6 +88,119 @@ amdhsa.version: [1, 2]
 
 
 class ToolTests(unittest.TestCase):
+    def archive(self, entries):
+        path = self.path / "source.tar"
+        with tarfile.open(path, "w") as archive:
+            for name, data in entries.items():
+                member = tarfile.TarInfo(name)
+                member.mode = 0o644
+                if isinstance(data, tuple):
+                    member.type = tarfile.SYMTYPE
+                    member.linkname = data[0]
+                    archive.addfile(member)
+                else:
+                    member.size = len(data)
+                    archive.addfile(member, io.BytesIO(data))
+        return path
+
+    def sync(self, entries, revision="a" * 40):
+        invoke(sync_source, ["--archive", self.archive(entries), "--source", self.path / "source",
+                             "--revision", revision])
+
+    def test_sync_file_directory_transitions_and_mtimes(self):
+        self.sync({"keep": b"same", "p": b"file"})
+        root = self.path / "source"
+        stamp = (root / "keep").stat().st_mtime_ns
+        self.sync({"keep": b"same", "p/deep/x": b"child"})
+        self.assertEqual((root / "p/deep/x").read_bytes(), b"child")
+        self.sync({"keep": b"same", "p": b"replacement"}, "b" * 40)
+        self.assertEqual((root / "p").read_bytes(), b"replacement")
+        self.assertEqual((root / "keep").stat().st_mtime_ns, stamp)
+        self.assertEqual(json.loads((root / ".wfmt-source-inventory.json").read_text())["revision"], "b" * 40)
+
+    def test_sync_conflict_preflight_and_recovery(self):
+        self.sync({"a": b"old", "p/x": b"tracked"})
+        root = self.path / "source"
+        receipt = (root / ".wfmt-source-inventory.json").read_bytes()
+        (root / "p/untracked").write_bytes(b"local")
+        with self.assertRaises(ValueError):
+            self.sync({"a": b"new", "p": b"file"})
+        self.assertEqual((root / "a").read_bytes(), b"old")
+        self.assertEqual((root / "p/x").read_bytes(), b"tracked")
+        self.assertEqual((root / "p/untracked").read_bytes(), b"local")
+        self.assertEqual((root / ".wfmt-source-inventory.json").read_bytes(), receipt)
+        (root / "p/untracked").unlink()
+        (root / "p/empty-local").mkdir()
+        with self.assertRaises(ValueError):
+            self.sync({"a": b"new", "p": b"file"})
+        (root / "p/empty-local").rmdir()
+        self.sync({"a": b"new", "p": b"file"})
+        self.assertEqual((root / "p").read_bytes(), b"file")
+
+    def test_sync_untracked_ancestor_and_file_conflicts(self):
+        self.sync({"a": b"old"})
+        root = self.path / "source"
+        (root / "p").write_bytes(b"local")
+        for name in ("p/x", "p"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.sync({"a": b"new", name: b"tracked"})
+            self.assertEqual((root / "a").read_bytes(), b"old")
+            self.assertEqual((root / "p").read_bytes(), b"local")
+
+    def test_sync_retry_after_interrupted_kind_change(self):
+        root = self.path / "source"
+        original_write = Path.write_bytes
+        for before, after, failing in (({"p/x": b"old"}, {"p": b"new"}, "p"),
+                                        ({"p": b"old"}, {"p/x": b"new"}, "p/x")):
+            self.sync(before)
+            receipt = (root / ".wfmt-source-inventory.json").read_bytes()
+            def interrupt(path, data):
+                if path == root / failing:
+                    raise OSError("simulated interrupted extraction")
+                return original_write(path, data)
+            with mock.patch.object(Path, "write_bytes", interrupt), self.assertRaises(OSError):
+                self.sync(after)
+            self.assertEqual((root / ".wfmt-source-inventory.json").read_bytes(), receipt)
+            self.sync(after)
+            self.assertEqual((root / failing).read_bytes(), b"new")
+
+    def test_sync_preserves_untracked_descendants_of_obsolete_directory(self):
+        self.sync({"p/x": b"tracked"})
+        root = self.path / "source"
+        (root / "p/local").write_bytes(b"local")
+        self.sync({"new": b"tracked"})
+        self.assertFalse((root / "p/x").exists())
+        self.assertEqual((root / "p/local").read_bytes(), b"local")
+
+    def test_sync_symlink_transitions(self):
+        probe = self.path / "probe"
+        try:
+            probe.symlink_to("missing")
+        except OSError as error:
+            self.skipTest("host cannot create symlinks: " + str(error))
+        probe.unlink()
+        root = self.path / "source"
+        for first, second in (({"p": b"file"}, {"p": ("target",)}),
+                              ({"p": ("target",)}, {"p/x": b"child"}),
+                              ({"p/x": b"child"}, {"p": ("target",)}),
+                              ({"p": ("target",)}, {"p": b"file"})):
+            self.sync({"target": b"safe", **first})
+            self.sync({"target": b"safe", **second})
+            self.assertEqual((root / "target").read_bytes(), b"safe")
+            self.assertEqual((root / "p").is_symlink(), isinstance(second.get("p"), tuple))
+
+    def test_lane_diagnostic_host_contract(self):
+        # A source guard is possible on hosts without HIP; output equivalence
+        # still requires running wfmt.hip-dense on a native device.
+        source = (ROOT / "tests/wfmt/hip_dense.hip").read_text()
+        body = source.split("template<unsigned R> void row_partials()", 1)[1].split("template<unsigned R> void signed_partials()", 1)[0]
+        self.assertIn("constexpr unsigned k=512U,chunks=k/256U;", body)
+        self.assertIn("Buffer codes(16U*chunks*1024U),scales(chunks*64U*16U),xs(R*k*4U);", body)
+        self.assertIn("dim3(chunks*4U)", body)
+        self.assertIn("dim3(R*chunks)", body)
+        self.assertIn("if(!byte_equal(wide,lane))", body)
+        self.assertRegex(body, r'#ifdef STRIX_WFMT_CAPTURE\s+if\(!total\)')
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="wfmt-test-", dir=ROOT)
         self.addCleanup(self.tmp.cleanup)
