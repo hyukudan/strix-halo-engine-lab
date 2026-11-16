@@ -100,10 +100,17 @@ below min_p (the verify would discard its steps). Kept drafts and verified token
 histogram of kept drafts (shared chooser `include/strix/mtp_draft_split.hpp`, expected steps a + P(kept > a) (depth - a
 + 0.25)). `STRIX_QRTX_DRAFT_SPLIT=0` = one segment, `N` = fixed a. Measured (#680, 3 ABAB pairs): prose C1 +7.3 %, json
 +1.9 %, edit +-0.2 %, window 16.1 -> 14.5 ms at 1.86 tokens/window.
+Context drafter (`STRIX_QRTX_CONTEXT_DRAFT=off|ctx|copy`, printed in the server's start line): the shared host drafter
+`include/strix/mtp_context_draft.hpp` (the HIP engine's `--mtp-ngram-draft=ctx|copy`) bound into `qwen_cohort::step`.
+`copy`: a gated context span (long unanimous anchor, learned acceptance above the MTP cycle's) supplies the window's rows
+with no predictor forward; otherwise context rows extend or replace the confident MTP prefix. The commit writes the MTP
+teacher rows of every committed position, so skipping the predictor leaves its cache as after a drafted window; every
+row passes the greedy verify (ids unchanged). The server's `rtx` stats carry `copy_first_steps` and `context_rows`.
 
 Served decode by prompt class: `scripts/bench/cuda/qwen_serve_classes.py` (prose / edit / json, C1 / C4 / C8, cold and
 warm passes, ids of every request) with `scripts/bench/cuda/qwen_classes_prompts.json`, and strict ABAB server arms with
-`scripts/bench/cuda/qwen_serve_abab.sh` (server, model flags, arms and client are parameters; GPU clock samples per arm).
+`scripts/bench/cuda/qwen_serve_abab.sh` (server, model flags, arms and client are parameters; an arm's extra server flags
+follow `##`, e.g. `F|ENV=v ## --profile fast`; GPU clock samples per arm; bench lines carry `tpc=` tokens per cycle).
 Summarise arms with `scripts/bench/cuda/qwen_serve_summary.py OUT`: C1 means only over prompts run in both passes, C1
 requests shorter than 16 tokens (the model ends early: prose slice 0 stops after 1 token) are listed and skipped, cold and
 warm side by side per arm. Comparing a 2-prompt warm mean that contains a 1-token request with an 8-prompt cold mean is
