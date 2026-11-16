@@ -1,9 +1,10 @@
-// CUDA backend, architecture layer: what the current device can do, asked once per device ordinal. Kernels choose
+// CUDA backend, architecture layer: what the current device can do, cached per device ordinal. Kernels choose
 // an architecture path through these queries (capability), never by model. The specialisations themselves live in
 // src/cuda/arch/<sm> (see src/cuda/arch/sm120/README.md).
 #pragma once
 
 #include <cuda_runtime.h>
+#include <atomic>
 
 namespace strix::cuda::arch {
 
@@ -11,11 +12,17 @@ namespace strix::cuda::arch {
 // API call or an ordinal outside the cache answers false (fail closed: the caller keeps its portable path).
 template <int Major>
 inline bool current_device_at_least() {
-    static int cap[64] = {};  // 0 unknown, 1 yes, 2 no
+    static std::atomic<int> cap[64]{};  // 0 unknown, 1 yes, 2 no
     int dev = -1, major = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
-    if (cap[dev] == 0) cap[dev] = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess && major >= Major ? 1 : 2;
-    return cap[dev] == 1;
+    // Only the capability value is published, not other memory. Concurrent first
+    // queries may duplicate the API call; a failed query still returns false.
+    int value = cap[dev].load(std::memory_order_relaxed);
+    if (value == 0) {
+        value = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess && major >= Major ? 1 : 2;
+        cap[dev].store(value, std::memory_order_relaxed);
+    }
+    return value == 1;
 }
 
 // Programmatic dependent launch (cudaLaunchAttributeProgrammaticStreamSerialization): compute capability 9.0+.

@@ -117,7 +117,7 @@ int main() {
         const cuda_qwen_serve::SessionPolicy pol{34816, 256, per_request};
         for (const std::uint64_t n : {2ULL, 100ULL, 1024ULL, 8192ULL, 32768ULL, 34815ULL})
             for (const std::uint64_t t : {1ULL, 128ULL, 4096ULL, 65536ULL})
-                for (const std::uint64_t cap0 : {cuda_qwen_serve::initial_positions(pol), 34816ULL}) {
+                for (const std::uint64_t cap0 : {cuda_qwen_serve::initial_positions(pol), std::uint64_t{34816}}) {
                     const auto a = serialized(pol, n, t, cap0), c = cohort(pol, n, t, cap0);
                     if (a != c || a < std::min<std::uint64_t>(34816, n + t)) {
                         std::fprintf(stderr, "resolver mismatch n=%llu t=%llu cap0=%llu: serialized %llu cohort %llu\n",

@@ -26,10 +26,13 @@ prefill, C1 references, concurrency arms with `same_as_C1`).
 
 ## Phase 1 (layout, bitwise)
 
-Files were moved, not rewritten; the arithmetic of every kernel is unchanged (the SASS of every CUDA object of the
-DeepSeek, Qwen, GLM and MiniMax builds compares equal before and after, with `scripts/bench/cuda/sass_compare.py
---base <old build> --new <new build>`, the byte gate for every later extraction too). Identical helpers that
-several files carried are defined once:
+Files were moved, not rewritten. The SASS gate is `scripts/bench/cuda/sass_compare.py
+--base <old build> --new <new build>`. It compares architecture/function pairs, requires nonzero CUDA coverage,
+and rejects missing artifacts, disassembly failures and symbol collisions. Artifact moves require explicit
+relative-path `--rename OLD=NEW` entries; helper or anonymous-namespace symbol changes require exact
+`--symbol-rename OLD=NEW` entries, also applied to call targets. Earlier totals from the lossy symbol gate do
+not establish this gate; native builds must be checked again. Identical helpers that several files carried
+are defined once:
 
 | Helper | Was in | Now |
 |---|---|---|

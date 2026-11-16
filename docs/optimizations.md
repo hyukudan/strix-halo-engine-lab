@@ -1084,7 +1084,7 @@ Four exact changes to the one-row (plain, non-MTP) decode step, each with its ow
 
 ### Qwen R1 GDN preparation fusion / Fusión de preparación GDN R1
 
-**Control:** `STRIX_QWEN_DECODE_FUSE`. **Default:** OFF (opt-in with `STRIX_QWEN_DECODE_FUSE=1`; part of `STRIX_QWEN_ALLON`). **OFF:** unset it.
+**Control:** `STRIX_QWEN_DECODE_FUSE`. **Default:** ON (code default, same tokens; plain one-row decode 41.60 -> 41.37 ms per step, strict ABAB of 3 pairs). **OFF:** `STRIX_QWEN_DECODE_FUSE=0`.
 Restart after changing the switch. `--baseline`, `STRIX_BASELINE=1`, `STRIX_QPF2K_DEFAULTS=0`
 and GSQ owners disable it. `--print-effective-config` reports the resolved switch and suppression
 reason in `long_context_items`; the requested environment retains its provenance.
@@ -1130,7 +1130,7 @@ python3 tests/qwen_decode_fuse_gate.py --binary build/strix-hip-decode-token --m
   --prompt-1k prompts/1k.ids --prompt-32k prompts/32k.ids --output ../private-decode-fuse-gate
 ```
 
-**Español.** Desactivado por defecto (opción `STRIX_QWEN_DECODE_FUSE=1`, parte de `STRIX_QWEN_ALLON`); sin ella se mantiene la secuencia anterior tras
+**Español.** Activado por defecto (mismos tokens; `STRIX_QWEN_DECODE_FUSE=0` lo desactiva); sin ella se mantiene la secuencia anterior tras
 reiniciar. Baseline, `STRIX_QPF2K_DEFAULTS=0` y modelos GSQ también lo desactivan. La inspección
 informa del valor efectivo y del motivo de desactivación. En R1 de dimensión 128 se fusionan
 convolución, transformación beta/gate y normalización Q/K con los mismos cuerpos de dispositivo,
@@ -4561,6 +4561,26 @@ memory. The absorb and out GEMMs stay on the exact v3 kernels (an f16 WMMA versi
 - **Off switch:** STRIX_GLM_PF_ATTN_WMMA=0 (or exact mode)
 - **Measured gain:** Layer bench (C 2048 rows, gfx1151): scores+softmax+o-bar 17.3 -> 6.7 us/row at the 8K position, 22.9 -> 7.2 at 32K (2.6x / 3.2x); MLA total 21.3 -> 11.2 / 27.3 -> 11.4 us/row. Pair FAST, fresh process per arm: 8K prefill 10.600 -> 9.695 s (-0.905 s, -8.5 %, 2 ABAB pairs, with the removed WMMA GEMM); 32K 44.30 -> 40.26 s (-4.03 s, -9.1 %; one F / core / F set: 43.54, 40.26, 45.05 s). FAST_I4 not measured.
 - **Implementation / evidence:** [core](../src/attn_core/sparse_flash_wmma.hpp), [helpers](../src/attn_core/flash_tile.hpp), [GLM policy](../src/glm/prefill/glm_prefill.hip), [test](../tests/hip_attn_core_sparse_tests.hip), [bench](../tests/hip_glm_pf_layer_bench.hip)
+
+<a id="glm-pf-mla-qt16"></a>
+
+### FAST fused attention core reads q-tilde as a bf16 image
+
+**Engine:** `glm` (shared core `attn_core::sparse`). **Control:** `STRIX_GLM_PF_MLA_QT16`. **Default:** on wherever the FAST fused MLA core runs with the v3 absorb GEMM.
+
+The fused core rounded each FP32 q-tilde value to bf16 when it loaded its query fragments, so the absorb GEMM wrote
+4 bytes per value that the core read back only to round. The absorb GEMM now keeps its FP32 chains and stores the
+rounded value itself (`tile::to_bf16`, the core's own rounding), and the core loads those operand bits through the
+shared core's optional `query_op` policy hook with no conversion: half the q-tilde bytes written and read (268 MB per
+4096-row launch), and the core's query prologue loses its rounding code (2,722 -> 798 instructions in the kernel,
+main loop unchanged). The out GEMM still reads FP32 o-bar.
+
+- **Preconditions:** `STRIX_GLM_PF_WMMA=1` with the fused core, 32 heads per rank, absorb GEMM v3 (the default); other GEMM versions keep FP32 q-tilde.
+- **Exactness evidence:** Bitwise to the glm-pf-attn-wmma identity. `hip_glm_prefill_tests` (`STRIX_GLM_PF_TEST_ONLY=mla`): o-bar, MLA output and guard regions equal for T 32 and T 16, finite and NaN/Inf latents; layer bench arm 23 equals arm 21; pair 8K logits of both ranks equal in every A/B run.
+- **Off switch:** `STRIX_GLM_PF_MLA_QT16=0` (FP32 q-tilde, same bits)
+- **Measured gain:** Pair FAST 8K, warm (second prefill of the process): 8.617 -> 8.524 s median (-99 ms, three ABAB pairs -196 / -50 / -99 ms), 951 -> 961 tok/s, GPU clocks per token 2894k -> 2845k. Layer bench (C 4096, one node): absorb 9.52 -> 7.37 ms, fused core 27.74 -> 26.37 ms per launch. Cold first prefills follow the KFD eviction time of the run, not the switch.
+- **Resources:** no spill; fused core 256 VGPR and absorb 128 VGPR as before; same scratch buffer (the image uses half of it).
+- **Implementation / evidence:** [hook](../src/attn_core/sparse_flash_wmma.hpp), [GLM absorb + policy](../src/glm/prefill/glm_prefill.hip), [test](../tests/hip_glm_prefill_tests.hip), [bench](../tests/hip_glm_pf_layer_bench.hip), [pair A/B kit](../scripts/bench/glm/prefill-pair.sh) (arms `--profile fast` with and without `STRIX_GLM_PF_MLA_QT16=0`)
 
 <a id="mm-pf-msa-flash"></a>
 

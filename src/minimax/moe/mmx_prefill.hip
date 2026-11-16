@@ -14,6 +14,7 @@
 #include "core/wmma_tiled.hpp"  // shared tiled core: grouped IU4 kernel and convert_exl3_iu4 (strix_tiled_core)
 #endif
 #include "moe_core/device_plan.hpp"
+#include "moe_core/grouped_policy.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/route_receipt.hpp"
 
@@ -36,6 +37,23 @@ unsigned gemm_tile_rows(unsigned input, unsigned output, unsigned bits, unsigned
 }
 unsigned gemm_splits(unsigned input, unsigned output, unsigned bits, unsigned rows) {
     return route::gemm_splits(input, output, bits, rows);
+}
+// MoE numeric order contract (STRIX_MMX_PF_ORDER): adaptive (default, today's identity: S from the expert's rows in the
+// chunk) or invariant (shared kGroupedSingleChainContract, S = 1 for gate, up and down: bits independent of chunking).
+// Test fixture only: change this between synchronized calls on one host thread;
+// never mutate it during engine execution or concurrent planning.
+namespace { int g_order_override = -1; }  // -1 = STRIX_MMX_PF_ORDER, 0 = adaptive, 1 = invariant
+void set_prefill_moe_order(int invariant) {
+    if (invariant < -1 || invariant > 1) throw std::invalid_argument("set_prefill_moe_order: value must be -1, 0 or 1");
+    g_order_override = invariant;
+}
+const ::strix::moe_core::GroupedSplitContract& prefill_moe_order() {
+    if (g_order_override == 0) return ::strix::moe_core::kGroupedAdaptiveContract;
+    if (g_order_override == 1) return ::strix::moe_core::kGroupedSingleChainContract;
+    static const ::strix::moe_core::GroupedSplitContract c = [] {
+        return ::strix::moe_core::resolve_grouped_order(strix::envcfg::text("STRIX_MMX_PF_ORDER"));
+    }();
+    return c;
 }
 
 namespace {
@@ -532,9 +550,10 @@ Plan make_plan(const PrefillMoeView& v) {
         g.pair_begin = static_cast<unsigned>(p.pair_row.size());
         g.tbegin = p.tpairs;
         p.tpairs += (g.n + 15U) / 16U * 16U;
-        g.s_gu = gemm_splits(kHidden, kInter, w.gate.bits, g.n);
-        g.s_dn = gemm_splits(kInter, kHidden, w.down.bits, g.n);
-        if (gemm_splits(kHidden, kInter, w.up.bits, g.n) != g.s_gu || gemm_tile_rows(kHidden, kInter, w.gate.bits, g.n) != 16 ||
+        const auto& order = prefill_moe_order();
+        g.s_gu = order.gate.resolve(gemm_splits(kHidden, kInter, w.gate.bits, g.n));
+        g.s_dn = order.down.resolve(gemm_splits(kInter, kHidden, w.down.bits, g.n));
+        if (order.up.resolve(gemm_splits(kHidden, kInter, w.up.bits, g.n)) != g.s_gu || gemm_tile_rows(kHidden, kInter, w.gate.bits, g.n) != 16 ||
             gemm_tile_rows(kHidden, kInter, w.up.bits, g.n) != 16)
             throw std::invalid_argument("minimax prefill moe: gate/up policy differs between the two matrices");
         g.part_gu = p.part_floats;
@@ -1070,6 +1089,8 @@ struct DevOut {
     float* part;
     unsigned tpairs;
     bool i4=false;
+    // Bound split of the numeric order contract (0 = adaptive): gate/up and down, the same for every group.
+    unsigned bound_gu = 0, bound_dn = 0;
     unsigned grid[16];  // the launch grid of every (stage, class): a bound of its CTAs (class_grids)
     // Group-wide plan only: the chunks' router tables ([n][4] ids, then [n][4] weights, n = the chunk's rows) and the
     // per-chunk expert counts [segments][128] of seg_count_kernel.
@@ -1174,7 +1195,10 @@ template <unsigned C> struct DevPolicyT {
         route::MtFit fit{};
         if (mine) {
             w = x < kExperts ? p.out.experts[x % kReal] : p.out.shared;
-            if (C > 1 && x < kExperts) {
+            if (p.out.bound_gu != 0U) {  // invariant contract: S from the matrix only, never from rows
+                s_gu = n ? p.out.bound_gu : 0U;
+                s_dn = n ? p.out.bound_dn : 0U;
+            } else if (C > 1 && x < kExperts) {
                 s_gu = n ? kGwSplitGu[x / kReal] : 0U;
                 s_dn = n ? kGwSplitDn[x / kReal] : 0U;
             } else {
@@ -1617,6 +1641,8 @@ void enqueue_device_moe(const PrefillMoeDeviceView& v, void* workspace, std::siz
     a.out.at = reinterpret_cast<_Float16*>(ws + l.at);
     a.out.part = reinterpret_cast<float*>(ws + l.part);
     a.out.tpairs = l.tpairs;
+    a.out.bound_gu = prefill_moe_order().gate.splits;
+    a.out.bound_dn = prefill_moe_order().down.splits;
     const auto grids = class_grids(T);
     for (unsigned c = 0; c < 16; ++c) a.out.grid[c] = grids[c];
     mark("start", stream);
@@ -1678,6 +1704,8 @@ void enqueue_group_moe(const PrefillMoeGroupView& v, void* workspace, std::size_
     a.out.at = reinterpret_cast<_Float16*>(ws + l.at);
     a.out.part = reinterpret_cast<float*>(ws + l.part);
     a.out.tpairs = l.tpairs;
+    a.out.bound_gu = prefill_moe_order().gate.splits;
+    a.out.bound_dn = prefill_moe_order().down.splits;
     a.out.seg_count = reinterpret_cast<unsigned*>(ws + l.seg_count);
     a.out.seg_rows = v.seg_rows;
     a.out.segments = S;

@@ -6,6 +6,7 @@
 #include "strix/route_receipt.hpp"
 #include "strix/serve/json_constraint.hpp"
 #include "strix/serve/media.hpp"
+#include "strix/serve/ollama.hpp"
 #include "strix/serve/request_fields.hpp"
 #include "strix/serve/session_api.hpp"
 #include "strix/serve/token_memo.hpp"
@@ -223,6 +224,9 @@ bool valid_request_id(std::string_view id) {
 // The accepted X-Request-Id of the request this connection thread is handling (ApiService::handle sets and clears it;
 // the ring record of the request is written on the same thread).
 thread_local std::string current_request_id;
+// A per-request context bound below the served context (Ollama options.num_ctx), set for the duration of the
+// handler call on the request thread; 0 = the served context. It only tightens max_tokens / the prompt fit.
+thread_local std::uint64_t request_context_ceiling = 0;
 
 // "detail=1" among the &-separated items of a query string.
 bool detail_requested(std::string_view query, bool allow_true = false) {
@@ -450,6 +454,7 @@ struct ApiService::Impl {
     std::atomic<std::uint64_t> chat_sequence{0};
     Json capabilities_document;
     std::string capabilities_id;
+    std::int64_t started_unix = unix_now();  // the Ollama tags "modified_at" of the resident model
     // Media kinds with a loaded adapter (ApiConfig::vision). Empty: no code below touches a request.
     std::vector<ApiMediaKind> media_kinds;
     mutable std::mutex media_mutex; // one request encodes at a time; guards the epochs
@@ -897,15 +902,23 @@ struct ApiService::Impl {
         return s;
     }
     std::uint32_t max_tokens(const Json& body, std::size_t prompt) const {
+        const auto context = request_context_ceiling ? std::min(context_tokens, request_context_ceiling) : context_tokens;
+        if (request_context_ceiling && prompt >= context)
+            throw ApiError(400, "invalid_request_error", "prompt of " + std::to_string(prompt) + " tokens does not fit options.num_ctx of " +
+                std::to_string(context) + " tokens (no truncation)", "num_ctx");
         if (config.exact_max_tokens) {
+            const auto bound = [&](std::uint64_t count) {  // num_ctx bounds prompt + output; the served context only output
+                if (request_context_ceiling) count = std::min<std::uint64_t>(count, context - prompt);
+                return static_cast<std::uint32_t>(std::min(count, context ? std::min(context, std::uint64_t{UINT32_MAX}) : std::uint64_t{UINT32_MAX}));
+            };
             for (const char* key : {"max_completion_tokens", "max_tokens"}) {
                 if (const auto* value = body.find(key); value && !value->is_null()) {
                     const auto count = unsigned_integer(*value, key, UINT64_MAX);
                     if (!count) throw ApiError(400, "invalid_request_error", std::string(key)+" must be a positive integer", key);
-                    return static_cast<std::uint32_t>(std::min(count, context_tokens ? std::min(context_tokens, std::uint64_t{UINT32_MAX}) : std::uint64_t{UINT32_MAX}));
+                    return bound(count);
                 }
             }
-            return config.default_max_tokens;
+            return request_context_ceiling ? bound(config.default_max_tokens) : config.default_max_tokens;
         }
         double requested = config.default_max_tokens;
         for (const char* key : {"max_completion_tokens", "max_tokens"})
@@ -914,10 +927,11 @@ struct ApiService::Impl {
                 requested = v->as_double();
                 break;
             }
-        if (prompt >= context_tokens)
+        if (prompt >= context)
             throw ApiError(400, "invalid_request_error", "prompt of " + std::to_string(prompt) + " tokens does not fit the context of " +
-                std::to_string(context_tokens) + " tokens", "messages");
-        const auto room = static_cast<double>(context_tokens - prompt);
+                std::to_string(context) + " tokens", "messages");
+        const auto room = static_cast<double>(context - prompt);
+        if (request_context_ceiling) requested = std::min(requested, room);
         if (config.strict_context_limit && requested > room)
             throw ApiError(400, "invalid_request_error", "request exceeds context capacity", "max_tokens");
         return static_cast<std::uint32_t>(std::max(1.0, std::min(requested, room)));
@@ -927,6 +941,66 @@ struct ApiService::Impl {
         const auto bearer = request.header("authorization");
         if (bearer == "Bearer " + config.api_key || request.header("x-api-key") == config.api_key) return;
         throw ApiError(401, "authentication_error", "invalid or missing API key");
+    }
+
+    // ---- Ollama-compatible contract (src/serve/ollama.cpp translates; the OpenAI handlers below execute) ----
+    ollama::Served ollama_served() const {
+        ollama::Served s;
+        s.model_id = config.model_id;
+        s.context_tokens = context_tokens;
+        s.thinking = config.default_thinking;
+        for (const auto& entry : media_kinds) if (entry.kind == "image") s.images = true;
+        return s;
+    }
+    void ollama_api(const HttpRequest& request, HttpResponseWriter& response) {
+        const auto served = ollama_served();
+        const auto& path = request.path;
+        const auto document = [&](const Json& out) { response.send(200, "application/json", out.dump()); };
+        if (request.method == "GET" && path == "/api/version") { Json v = Json::object(); v.set("version", Json(config.ollama_api_version)); document(v); return; }
+        if (request.method == "GET" && path == "/api/tags") { document(ollama::tags(served, started_unix)); return; }
+        if (request.method == "GET" && path == "/api/ps") { document(ollama::ps(served)); return; }
+        if (path == "/api/embed" || path == "/api/embeddings")
+            throw ollama::RequestError(501, "embeddings_unsupported", "embeddings are not executed by this engine");
+        for (const char* managed : {"/api/pull", "/api/push", "/api/create", "/api/copy", "/api/delete", "/api/blobs"})
+            if (path == managed || path.starts_with(std::string(managed) + "/"))
+                throw ollama::RequestError(501, "management_unsupported", "model management (" + path + ") is not supported: this server serves one resident model");
+        const bool chat = path == "/api/chat", generate = path == "/api/generate", show = path == "/api/show";
+        if (!chat && !generate && !show) throw ollama::RequestError(404, "unknown_route", "unknown route " + request.method + " " + path);
+        if (request.method != "POST") throw ollama::RequestError(405, "method_not_allowed", path + " takes POST");
+        Json body;
+        try { body = parse_request_json(request.body); }
+        catch (const JsonError& e) { throw ollama::RequestError(400, "invalid_json", std::string("invalid JSON body: ") + e.what()); }
+        if (!body.is_object()) throw ollama::RequestError(400, "invalid_json", "the request body must be a JSON object");
+        if (show) { ollama::require_model(body, served, true); document(ollama::show(served)); return; }
+        const auto route = chat ? ollama::Route::chat : ollama::Route::generate;
+        auto translated = ollama::translate(route, body, served);
+        ollama::ResponseWriter writer(response, route, config.model_id, translated.no_effect);
+        if (translated.load_only) {  // the model is resident: a load probe runs nothing
+            Json done = Json::object();
+            done.set("model", Json(config.model_id)); done.set("created_at", Json(ollama::rfc3339_now()));
+            if (chat) { Json m = Json::object(); m.set("role", Json("assistant")); m.set("content", Json("")); done.set("message", std::move(m)); }
+            else done.set("response", Json(""));
+            done.set("done", Json(true)); done.set("done_reason", Json("load"));
+            if (!translated.stream) { document(done); return; }
+            if (response.begin_stream(200, "application/x-ndjson")) { response.write(done.dump() + "\n"); response.end_stream(); }
+            return;
+        }
+        if (!tokenizer) throw ApiError(503, "server_error", "tokenizer is unavailable");
+        // The OpenAI route the request runs as: family validators and records see that route.
+        HttpRequest as_openai;  // headers and peer only: the body is the translated Json below
+        as_openai.method = request.method; as_openai.version = request.version;
+        as_openai.headers = request.headers; as_openai.peer = request.peer;
+        as_openai.path = as_openai.target = translated.raw ? "/v1/completions" : "/v1/chat/completions";
+        if (config.validate_request) family_call([&] { config.validate_request(as_openai, translated.body); });
+        struct Ceiling {
+            explicit Ceiling(std::uint64_t n) : previous(request_context_ceiling) { request_context_ceiling = n; }
+            ~Ceiling() { request_context_ceiling = previous; }
+            std::uint64_t previous;
+            Ceiling(const Ceiling&) = delete;
+            Ceiling& operator=(const Ceiling&) = delete;
+        } const ceiling(translated.context_ceiling);
+        if (translated.raw) completions(as_openai, writer, translated.body);
+        else chat_completions(as_openai, writer, translated.body);
     }
 
     // ---- chat ----
@@ -2727,7 +2801,10 @@ void ApiService::handle(const HttpRequest& request, HttpResponseWriter& raw_resp
     if (!current_request_id.empty()) raw_response.add_response_header("X-Request-Id", current_request_id);
     ApiResponse response(raw_response, request_scope);
     const bool anthropic = request.path == "/v1/messages";
+    // Ollama-compatible routes (/api/* except the strix status document); their errors are {"error": message}
+    const bool ollama_route = impl.config.ollama_api && ollama::enabled_by_default() && request.path.starts_with("/api/") && request.path != "/api/status";
     const auto error_body = [&](const ApiError& e) {
+        if (ollama_route) return ollama::error_body(e.what());
         Json detail = Json::object();
         if (anthropic) {
             detail.set("type", Json(e.type())); detail.set("message", Json(std::string(e.what())));
@@ -2788,6 +2865,7 @@ void ApiService::handle(const HttpRequest& request, HttpResponseWriter& raw_resp
             return;
         }
         impl.authorize(request);
+        if (ollama_route) { impl.ollama_api(request, response); return; }
         if (handle_deployment_route(request, response, impl.queue, impl.config.deployment, impl.config.on_drain)) return;
         if (request.method == "GET" && request.path == "/v1/cache/stats" && impl.config.state_cache_stats) {
             response.send(200,"application/json",impl.config.state_cache_stats()); return;
@@ -2874,6 +2952,9 @@ void ApiService::handle(const HttpRequest& request, HttpResponseWriter& raw_resp
             response.send(200, "application/json", out.dump());
         } else throw ApiError(404, impl.config.timed_completion_envelope ? "server_error" : "not_found_error",
             std::string(impl.config.timed_completion_envelope ? "no route " : "unknown route ") + request.path);
+    } catch (const ollama::RequestError& e) {
+        if (e.status() >= 500 && e.status() != 501) impl.record(RecentRequest{"", request.path, "error", unix_now()});
+        response.send(e.status(), "application/json", ollama::error_body(e.what()));
     } catch (const SessionApiError& e) {
         response.send(e.status,"application/json",session_error(e.code,e.what()).dump());
     } catch (const ApiError& e) {

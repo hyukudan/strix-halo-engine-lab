@@ -178,6 +178,12 @@ void set_prefill_dense_band(int value);
 // v4 + mtfit tail classes beside the MT8 launch on a side stream: -1 = STRIX_MMX_PREFILL_TAIL_STREAM (default on),
 // 0 = off, 1 = on. cleanup_ releases the side stream and its events (Engine teardown).
 void set_prefill_tail_stream(int on);
+// MoE numeric order contract: -1 = STRIX_MMX_PF_ORDER (default adaptive), 0 = adaptive (S from the expert's rows in
+// the chunk, today's identity), 1 = invariant (gate/up/down S = 1: bits independent of chunking, identity
+// mmx-pf-moe-s1-v1). Host and device plans and the group-wide plan all follow it.
+// Test fixture only: one host thread, all device work synchronized before each
+// change, restore -1 before leaving the fixture. Never change a running engine.
+void set_prefill_moe_order(int invariant);
 void cleanup_prefill_tail_stream() noexcept;
 void set_prefill_core8(int value);  // -1 = environment, 0 = off (default), 1 = A LDS, 2 = shared B
 // Profiling only: `marker(label, stream, user)` after "start" and each launch ("gather", "gate_up[.mtN]", "finish",
