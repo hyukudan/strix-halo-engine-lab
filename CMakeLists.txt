@@ -14,6 +14,29 @@ if(NOT strix_multi_config AND "${CMAKE_BUILD_TYPE}" STREQUAL "")
 endif()
 
 project(strix_engine_lab VERSION 0.1.0 LANGUAGES CXX)
+if(MSVC)
+    # Portable C library calls (getenv, fopen) are used on purpose; unknown loop pragmas (unroll), padding
+    # from alignas and code after Linux-only stubs that throw on Windows (C4702) are expected. Without this,
+    # /WX turns them into C2220 errors in every MSVC target. Conversion, sign-compare and shadow checks
+    # (C4244 C4267 C4389 C4459) stay enforced by the -Wconversion -Wshadow -Werror GCC build; MSVC also
+    # reports them inside standard-library template instantiations, which GCC does not.
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/wd4068> $<$<COMPILE_LANGUAGE:CXX>:/wd4324>
+        $<$<COMPILE_LANGUAGE:CXX>:/wd4702> $<$<COMPILE_LANGUAGE:CXX>:/wd4244> $<$<COMPILE_LANGUAGE:CXX>:/wd4267>
+        $<$<COMPILE_LANGUAGE:CXX>:/wd4389> $<$<COMPILE_LANGUAGE:CXX>:/wd4459>)
+endif()
+
+# Isolated shared CUDA-core qualification, with no model/runtime dependency.
+option(STRIX_CUDA_NVFP4_ONLY "Build only shared NVFP4 host/native checks" OFF)
+if(STRIX_CUDA_NVFP4_ONLY)
+    enable_testing()
+    add_subdirectory(tests/nvfp4)
+    return()
+endif()
+
+# Install rules and CPack packages (docs/install.md). Deferred to the end of this file so every target exists,
+# also in the CUDA-only modes below that return() early.
+cmake_language(DEFER CALL include "${CMAKE_CURRENT_SOURCE_DIR}/packaging/StrixPackaging.cmake")
 
 option(STRIX_LEGACY_MAINS "Build legacy Gemma4 and MiniMax serve executables" ON)
 
@@ -557,6 +580,20 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-env-flags-tests)
     add_test(NAME strix-env-flags-tests COMMAND strix-env-flags-tests)
     set_tests_properties(strix-env-flags-tests PROPERTIES LABELS "cpu;env")
+    add_executable(strix-chunk-contract-tests tests/chunk_contract_tests.cpp)
+    target_include_directories(strix-chunk-contract-tests PRIVATE src)
+    target_compile_features(strix-chunk-contract-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-chunk-contract-tests)
+    add_test(NAME strix-chunk-contract-tests COMMAND strix-chunk-contract-tests)
+    set_tests_properties(strix-chunk-contract-tests PROPERTIES LABELS "cpu;chunkinv")
+    find_program(STRIX_CHUNKINV_BASH NAMES bash)
+    if(STRIX_CHUNKINV_BASH)
+        add_test(NAME strix-chunkinv-fixtures-tests COMMAND "${STRIX_CHUNKINV_BASH}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/chunkinv_fixtures_tests.sh"
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/bench/chunkinv/fixtures.sh"
+            "${CMAKE_CURRENT_BINARY_DIR}/chunkinv-fixtures-host")
+        set_tests_properties(strix-chunkinv-fixtures-tests PROPERTIES LABELS "cpu;chunkinv")
+    endif()
     add_executable(strix-engine-profile-common-tests tests/engine_profile_common_tests.cpp)
     target_include_directories(strix-engine-profile-common-tests PRIVATE include)
     target_compile_features(strix-engine-profile-common-tests PRIVATE cxx_std_20)
@@ -685,6 +722,14 @@ add_library(strix_model_description STATIC src/model_description.cpp)
 target_include_directories(strix_model_description PUBLIC include)
 target_compile_features(strix_model_description PUBLIC cxx_std_20)
 strix_target_warnings(strix_model_description)
+# Shared --serve-config TOML expander (every serve CLI binds it with its own option table); reads TOML with the
+# model-description reader above.
+add_library(strix_serve_config STATIC src/serve/serve_config.cpp)
+target_include_directories(strix_serve_config PUBLIC include)
+target_compile_features(strix_serve_config PUBLIC cxx_std_20)
+target_link_libraries(strix_serve_config PUBLIC strix_model_description)
+strix_target_warnings(strix_serve_config)
+target_link_libraries(strix_core PUBLIC strix_serve_config)
 
 # Deployment planning is host-only. Its TOML reader is the existing model reader.
 add_library(strix_deploy STATIC src/deploy/device.cpp src/deploy/spec.cpp src/deploy/plan.cpp src/deploy/link.cpp
@@ -793,6 +838,7 @@ add_library(strix_serve STATIC
     src/serve/http_server.cpp
     src/serve/engine.cpp
     src/serve/api.cpp
+    src/serve/ollama.cpp
     src/serve/deployment.cpp
     src/serve/request_fields.cpp
     src/serve/health.cpp
@@ -813,9 +859,7 @@ add_library(strix_glm_session_owner STATIC src/glm/serve/glm_session_owner.cpp)
 target_include_directories(strix_glm_session_owner PUBLIC src)
 target_link_libraries(strix_glm_session_owner PUBLIC strix_session_owner)
 strix_target_warnings(strix_glm_session_owner)
-add_executable(strix-skeleton-serve examples/skeleton_engine/main.cpp)
-target_link_libraries(strix-skeleton-serve PRIVATE strix_session_shell)
-strix_target_warnings(strix-skeleton-serve)
+# strix-skeleton-serve is defined with strix-serve in cmake/StrixSession.cmake (every build mode).
 if(BUILD_TESTING)
     add_executable(skeleton_engine_tests tests/skeleton_engine_tests.cpp)
     target_link_libraries(skeleton_engine_tests PRIVATE strix_session_shell)
@@ -912,6 +956,11 @@ if(BUILD_TESTING)
     target_compile_features(strix-batch-nested-recipe-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-batch-nested-recipe-tests)
     add_test(NAME strix-batch-nested-recipe-tests COMMAND strix-batch-nested-recipe-tests)
+    add_executable(strix-block-summary-state-tests tests/block_summary_state_tests.cpp)
+    target_include_directories(strix-block-summary-state-tests PRIVATE include)
+    target_compile_features(strix-block-summary-state-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-block-summary-state-tests)
+    add_test(NAME strix-block-summary-state-tests COMMAND strix-block-summary-state-tests)
     add_executable(strix-batch-service-handoff-tests tests/batch_service_handoff_tests.cpp)
     target_include_directories(strix-batch-service-handoff-tests PRIVATE include)
     target_link_libraries(strix-batch-service-handoff-tests PRIVATE Threads::Threads)
@@ -1170,6 +1219,17 @@ if(BUILD_TESTING)
     target_link_libraries(strix-bp-codec-tests PRIVATE strix_core strix_serve)
     strix_target_warnings(strix-bp-codec-tests)
     add_test(NAME strix-bp-codec-tests COMMAND strix-bp-codec-tests)
+    # shared state hand-off transport + its policy resolver (loopback TCP sessions, cost model, effective-config lines)
+    add_executable(strix-handoff-tests tests/handoff_tests.cpp src/handoff.cpp src/bp_codec.cpp)
+    target_compile_definitions(strix-handoff-tests PRIVATE STRIX_HANDOFF_TESTING=1)
+    target_include_directories(strix-handoff-tests PRIVATE include)
+    target_link_libraries(strix-handoff-tests PRIVATE Threads::Threads)
+    target_compile_features(strix-handoff-tests PRIVATE cxx_std_20)
+    if(WIN32)
+        target_link_libraries(strix-handoff-tests PRIVATE ws2_32)
+    endif()
+    strix_target_warnings(strix-handoff-tests)
+    add_test(NAME strix-handoff-tests COMMAND strix-handoff-tests)
 
     add_executable(strix-known-prompt-chunks-tests tests/known_prompt_chunks_tests.cpp)
     target_link_libraries(strix-known-prompt-chunks-tests PRIVATE strix_core)
@@ -1181,6 +1241,18 @@ if(BUILD_TESTING)
     foreach(schedule IN ITEMS 2 4 16 20)
         add_test(NAME strix-serial-prompt-plan-sched-${schedule} COMMAND strix-serial-prompt-plan-tests ${schedule})
     endforeach()
+    add_executable(strix-serve-config-tests tests/serve_config_tests.cpp)
+    target_link_libraries(strix-serve-config-tests PRIVATE strix_core)
+    strix_target_warnings(strix-serve-config-tests)
+    add_test(NAME strix-serve-config-tests COMMAND strix-serve-config-tests)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(strix-serve-config-race-tests tests/serve_config_race_tests.cpp)
+        target_link_libraries(strix-serve-config-race-tests PRIVATE strix_serve_config)
+        target_link_options(strix-serve-config-race-tests PRIVATE -Wl,--wrap=stat -Wl,--wrap=fstat)
+        strix_target_warnings(strix-serve-config-race-tests)
+        add_test(NAME strix-serve-config-race-tests COMMAND strix-serve-config-race-tests)
+        set_tests_properties(strix-serve-config-race-tests PROPERTIES TIMEOUT 10)
+    endif()
     add_executable(strix-http-slot-capacity-tests tests/http_slot_capacity_tests.cpp)
     target_link_libraries(strix-http-slot-capacity-tests PRIVATE strix_core)
     strix_target_warnings(strix-http-slot-capacity-tests)
@@ -4034,6 +4106,15 @@ if(WIN32)
     target_link_libraries(strix-ds41-state-send PRIVATE ws2_32)
 endif()
 strix_target_warnings(strix-ds41-state-send)
+# link utilisation of the shared hand-off transport (strix::handoff): piece size x streams x codec sweeps, CPU cost
+add_executable(strix-xfer-probe apps/xfer_probe_main.cpp src/handoff.cpp src/bp_codec.cpp)
+target_include_directories(strix-xfer-probe PRIVATE include)
+target_link_libraries(strix-xfer-probe PRIVATE Threads::Threads)
+target_compile_features(strix-xfer-probe PRIVATE cxx_std_20)
+if(WIN32)
+    target_link_libraries(strix-xfer-probe PRIVATE ws2_32)
+endif()
+strix_target_warnings(strix-xfer-probe)
 if(BUILD_TESTING)
     add_executable(strix-deepseek41-attention-state-tests tests/deepseek41_attention_state_tests.cpp)
     target_link_libraries(strix-deepseek41-attention-state-tests PRIVATE strix_ds41_runtime)
@@ -4099,6 +4180,7 @@ if(BUILD_TESTING)
     add_subdirectory(tests/ds41_prefix_checkpoint_io)
     add_subdirectory(tests/ds41_prefix_owner)
     add_subdirectory(tests/pr584_host)
+    add_subdirectory(tests/ds41_dense_forms_host)
     add_executable(strix-deepseek41-pair-defaults-tests tests/deepseek41_pair_defaults_tests.cpp)
     target_link_libraries(strix-deepseek41-pair-defaults-tests PRIVATE strix_ds41_runtime)
     strix_target_warnings(strix-deepseek41-pair-defaults-tests)
@@ -4410,9 +4492,11 @@ add_library(strix_ds41_pipeline_front STATIC src/ds41_pipeline_front.cpp)
 target_link_libraries(strix_ds41_pipeline_front PUBLIC strix_ds41_pipeline strix_ds41_runtime)
 strix_target_warnings(strix_ds41_pipeline_front)
 # a FRONT without layers: replays recorded STEP payloads to a TAIL (exactness and TAIL timing without a FRONT's compute)
-add_executable(strix-deepseek41-pipeline-replay apps/deepseek41_pipeline_replay_main.cpp)
-target_link_libraries(strix-deepseek41-pipeline-replay PRIVATE strix_ds41_pipeline)
-strix_target_warnings(strix-deepseek41-pipeline-replay)
+if(NOT WIN32)  # pipeline Connection/Listener implement POSIX sockets only
+    add_executable(strix-deepseek41-pipeline-replay apps/deepseek41_pipeline_replay_main.cpp)
+    target_link_libraries(strix-deepseek41-pipeline-replay PRIVATE strix_ds41_pipeline)
+    strix_target_warnings(strix-deepseek41-pipeline-replay)
+endif()
 if(BUILD_TESTING)
     if(NOT WIN32)  # pipeline Connection/Listener implement POSIX sockets only
         add_executable(strix-ds41-pipeline-wire-tests tests/ds41_pipeline_wire_tests.cpp)
@@ -4972,6 +5056,12 @@ if(STRIX_FAMILY_MINIMAX)
         target_compile_features(strix-minimax-auto-tests PRIVATE cxx_std_20)
         strix_target_warnings(strix-minimax-auto-tests)
         add_test(NAME strix-minimax-auto-tests COMMAND strix-minimax-auto-tests)
+        # Chunk-invariant order contract: host reference of the bound K chain across chunk sizes and tails.
+        add_executable(strix-chunk-order-contract-tests tests/chunk_order_contract_tests.cpp)
+        target_include_directories(strix-chunk-order-contract-tests PRIVATE src include)
+        target_compile_features(strix-chunk-order-contract-tests PRIVATE cxx_std_20)
+        strix_target_warnings(strix-chunk-order-contract-tests)
+        add_test(NAME strix-chunk-order-contract-tests COMMAND strix-chunk-order-contract-tests)
         # Pure host policy census; source receipts reject unaudited selectors.
         add_executable(strix-minimax-route-identity-tests tests/minimax_route_identity_tests.cpp)
         target_link_libraries(strix-minimax-route-identity-tests PRIVATE strix_minimax_defaults)

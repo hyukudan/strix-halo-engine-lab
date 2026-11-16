@@ -19,6 +19,7 @@ second node of a pair is the ssh alias in `KIT_PEER`.
 | `abab.py` | `order` prints the strict ABAB order; `summary OUT [--metric M]` gives per-arm medians, per-round deltas and identity checks. |
 | `serve-decode.sh` | Starts a server (and its rank 1 on the peer), waits until it is ready, runs `tools/serve_bench.py` per decode class, then stops it. `--client-cmd` runs any other client instead. |
 | `serve_receipts.py` | Turns served results into receipts (`agg_C<n>`, `e2e_C<n>`, `req_C<n>`, `ttft_C<n>`). |
+| `forwards_ab.py` | Steady decode cycles by (lanes, target forwards) from the cycle receipts: the in-process A/B of `STRIX_SERVE_JOINT_GROUP_LANES=ab`. |
 | `prompt_ids.py` | Prompt files for any length (`p<N>.ids`, `.csv` or `.u32`). Each one is the seed text tokenized once, repeated and truncated, with a sha256 per prompt. |
 
 Every run directory holds `cmd.txt`, `stdout`, `stdout.ts`, `stderr`, `stderr.ts` (the arrival time of every line), `samples.tsv`,
@@ -57,18 +58,26 @@ ticket):
 | `qwen/serve-decode` | Qwen served decode, classes prose / edit / json at 1, 4 and 8 chats; one arm per ticket. | `qwen/serve-decode --bin B --model Q.gguf --arm 'wide\|--mtp-ngram-draft=wide\|' --round 0` |
 | `ds41/prefill-pair` | DeepSeek V4.1 pair prefill, length × rows × arm, cold and warm in one process (`--ttft-timing --repeat 2`); the logits FNV of both ranks must agree. | `ds41/prefill-pair --bin strix-deepseek41-prefill --model M --ids DIR --sizes 8K,32K --arm 'exact\|\|'` |
 | `ds41/serve-decode` | DeepSeek V4.1 pair served decode, classes prose / edit / json at 1, 4 and 8 chats (server cycle receipts, end-to-end, TTFT). | `ds41/serve-decode --bin-dir DIR --model M --arm 'ctl\|\|' --round 0` (then `abab.py summary OUT --metric e2e_C8`) |
+| `ds41/dense-forms` | Shared dense policy `dense-q8a8-f16-v1` weight-decode forms (scalar FP32 / packed FP16) on the DS41 rank-0 chunk shapes: exhaustive stager decode gate, bit identity of every form, strict ABAB kernel times and the per-layer-chunk census. | `ds41/dense-forms --bin strix-hip-ds41-fast-dense-tests [--rows 1024,680]` |
 | `glm/prefill-pair` | GLM pair prefill, exact vs FAST, several prompts in one load (`--pf-ttft`), first prompt cold and last warm; rank agreement on logits and state FNV. | `glm/prefill-pair --bin strix-glm5-rank --model DIR --prompts p8192.u32,p8192.u32` |
 | `minimax/fast-gate` | MiniMax FAST quality gate using the admitted absolute dNLL rule: reference and candidate, both ranks, then `tools/strix-gate/fast_logit_gate.py` seal and compare (`--dnll-rule abs`). | GPU: `minimax/fast-gate run --bin strix-minimax-rank --model DIR --arm 'cand\|\|STRIX_X=1' --sessions s8k=p.u32`; CPU: `fast-gate.sh seal ...`, `fast-gate.sh compare --ref ref --cand cand --dnll-rule abs` |
+| unit: MiniMax index projection | Exact slab vs FAST `minimax-index-proj-wmma-v1` (direct, x16 tiles, diagnostics), strict ABAB 3 pairs at 1,024 / 2,048 / 4,096 / 8,192 rows, fixed first 12 (4,096/8,192 rows) or 30 (1,024/2,048 rows) of 60 weight sets; x16-only timings require complete byte equality with direct WMMA; historical x16-only figures are withdrawn pending recollection, cold first call, kfd `evicted_ms`. | `STRIX_MMATTN_BENCH=wmma STRIX_MMATTN_WMMA_SERIES=x16 index-proj-tests` (build line in `src/minimax/attn/index_proj_tests.hip`) |
 | `vision/battery` | Vision content battery: one greedy answer per synthetic image, graded from the pixels (`score.py`): colours present or absent, pattern, orientation, palette rule. | `vision/battery --bin-dir DIR --model M --vision V.gguf --images IMGDIR`, then `python3 scripts/bench/vision/score.py IMGDIR OUT/*/battery.json` |
 | `rtx/ds41-rtx-pair-batch` | DeepSeek V4.1 RTX + pair batched decode C2 / C4 / C8: RTX FRONT on `[0, cut)` with `strix-cuda-ds41-multi-front`, pair TAIL on `strix-deepseek41-batch --hetero-listen`, 2 groups in flight; `--mode both` checks every request against its pair-only run. | node ticket: `rtx/ds41-rtx-pair-batch tail --bin strix-deepseek41-batch --model M --prompts a.csv,...,h.csv --token-file TOK --n 2,4,8 --generate 48`; RTX host: `scripts/bench/rtx/ds41-rtx-pair-batch.sh front --bin strix-cuda-ds41-multi-front --model M --stage NODE:7841 --token-file TOK` |
 | `rtx/serve-route` | Served RTX routes (Qwen whole model on one RTX, or any OpenAI-compatible RTX server), decode classes at 1, 4 and 8 chats. | `scripts/bench/rtx/serve-route.sh --route qwen --bin strix-cuda-qwen-serve --model Q.gguf -- --tables T --rope-table R --mtp-sidecar S --draft-vocab V` |
 | `logprobs/partials` | Logprob partial kernels (HIP or CUDA): device partials against the FP64 reference and the host lane order, then the kernel cost per step at 1 / 8 / 32 / 128 rows of a 64,640-entry slice (the activated cost of scoring). | `bash scripts/bench/logprobs/partials.sh --bin strix-hip-logprob-partials-tests --rows "1 8 32 128"` |
+| `kfdevict` | KFD queue evictions without root: in-process probe of the process's own eviction events (trigger, restore) and userptr allocations, node sampler of `evicted_ms` against reclaim / compaction counters and GPU busy windows, a controlled memory-pressure generator, and a micro A/B of host-memory backings. | `scripts/bench/kfdevict/README.md` |
 
 The RTX DeepSeek prefill service (`strix-cuda-ds41-prefill-service`) is measured with
 `tools/ds41_prefill_service_client.py`. The routes themselves are described in [discrete-gpu.md](discrete-gpu.md).
 
 The decode-class prompts are in `scripts/bench/prompts/classes/`. Drafting acceptance differs by an order of
 magnitude between prose, a code edit and CSV-to-JSON, so served decode is always reported per class.
+
+TURBO quality bar: `tools/qualification/turbo_bar/` ([README](../tools/qualification/turbo_bar/README.md)) measures
+E (exact route) against R (a smaller pack of the same weights on the same kernels) and T (TURBO): KL, top-1 and
+dNLL on full logits, scored tasks, retrieval, paired 95 % intervals (INCONCLUSIVE when unresolved) and a
+speed/quality frontier. `rpack_kquant.py` produces R; `models.json` declares E/R/T per model.
 
 ## Checks
 
