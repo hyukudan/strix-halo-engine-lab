@@ -155,6 +155,17 @@ std::vector<unsigned char> weights(unsigned k,unsigned n) {
     }
     return w;
 }
+std::vector<unsigned char> q6_weights(unsigned k,unsigned n) {
+    std::vector<unsigned char> w(n*(k/32U)*26U,0);
+    constexpr std::uint16_t scales[8]={1U,0x3ffU,0x400U,0x2800U,0x3c00U,0xbc00U,0x8000U,0x3555U};
+    for(unsigned o=0;o<n;++o) for(unsigned chunk=0;chunk<k/256U;++chunk) {
+        const auto c=strix::q6p::chunk_offsets(k,chunk);auto* row=w.data()+o*(k/32U)*26U;
+        for(unsigned j=0;j<128U;++j) row[c.qs+j]=static_cast<unsigned char>(j*7U+o*17U+chunk*13U);
+        for(unsigned j=0;j<64U;++j) row[c.qh+j]=static_cast<unsigned char>((j*13U+o*23U+chunk*7U)^0xa5U);
+        for(unsigned b=0;b<8U;++b) {const auto h=scales[(o+chunk+b)%8U];std::memcpy(row+c.d+2U*b,&h,2U);}
+    }
+    return w;
+}
 template<unsigned R> void rows_case(unsigned k,unsigned n) {
     using namespace strix::q8_rows;
     const auto name="hip.rows.r"+std::to_string(R)+".k"+std::to_string(k)+".n"+std::to_string(n);
@@ -171,13 +182,9 @@ template<unsigned R> void rows_case(unsigned k,unsigned n) {
         if(a!=b) throw std::runtime_error("staged rows differ");
         hipLaunchKernelGGL((project_rows_stepped_kernel<Site<R>,2U,1U>),dim3((n+15U)/16U),dim3(256),2U*R*256U*4U,0,s);const auto c=read();
         if(a!=c) throw std::runtime_error("stepped rows differ");
-        // Q6P32 all-zero codes with nonzero FP16 scales exercises the exact planar addressing.
+        // Seeded planar low/high codes cover signs, extrema and per-group FP16 scales.
         context(name+".q6p32","hip-q8-rows-fma-mix-fixture@1",{R,n,k},"image.q6p32@1");
-        std::vector<unsigned char> q6(n*(k/32U)*26U,0);
-        for(unsigned o=0;o<n;++o) for(unsigned chunk=0;chunk<k/256U;++chunk) {
-            auto off=strix::q6p::chunk_offsets(k,chunk);
-            for(unsigned b0=0;b0<8U;++b0) {const std::uint16_t h=0x2800U;std::memcpy(q6.data()+o*(k/32U)*26U+off.d+2U*b0,&h,2);}
-        }
+        auto q6=q6_weights(k,n);
         Buffer dq(q6.size());dq.upload(q6);s.segments=segments({{dq.p,n}});
         hipLaunchKernelGGL((project_rows_kernel<Site<R>,2U,false,true>),dim3((n+15U)/16U),dim3(256),0,0,s);read();
         hipLaunchKernelGGL((project_rows_kernel<Site<R>,2U,true,true>),dim3((n+15U)/16U),dim3(256),R*k*4U,0,s);read();
@@ -223,7 +230,7 @@ template<unsigned R> void signed_case(unsigned k,unsigned n) {
         hipLaunchKernelGGL((project_rows_dense_a8_kernel<Site<R>,1U,true,false>),dim3((n+7U)/8U),dim3(256),dense_a8_stage_bytes<R>(k),0,site,codes.as<std::int8_t>(),deltas.as<float>());check(hipGetLastError());const auto staged=dy.read<float>(R*n);
         if(direct!=staged) throw std::runtime_error("signed-A8 source staging differs");
         context(name+".q6p32","hip-signed-a8-block-chain@1",{R,n,k},"image.q6p32@1");
-        std::vector<unsigned char> q6(n*(k/32U)*26U,0);
+        auto q6=q6_weights(k,n);
         Buffer dq(q6.size());dq.upload(q6);site.segments=segments({{dq.p,n}});
         hipLaunchKernelGGL((project_rows_dense_a8_kernel<Site<R>,1U,false,true>),dim3((n+7U)/8U),dim3(256),0,0,site,codes.as<std::int8_t>(),deltas.as<float>());check(hipGetLastError());dy.read<float>(R*n);
     } else {
@@ -237,7 +244,7 @@ void partial_case(bool q6) {
     using namespace strix::q8_rows;
     context(q6?"hip.rows.partial.q6p32":"hip.rows.partial.q8","hip-q8-rows-fma-mix-fixture@1",{1U,1U,256U},q6?"image.q6p32@1":"gguf.q8_0@1");
     auto w=weights(256U,1U);
-    if(q6) w.assign(208U,0);
+    if(q6) w=q6_weights(256U,1U);
     std::vector<float> x(256U,0.125F);
     Buffer dw(w.size()),dx(x.size()*4U),dy(4U),trace(256U*kPartialSlots*4U),counts(256U*4U);
     dw.upload(w);dx.upload(x);
@@ -313,7 +320,7 @@ template<unsigned R> void signed_partials() {
     if constexpr(R<=8U) {
         hipLaunchKernelGGL((project_rows_dense_a8_kernel<Site<R,true>,1U,false,false>),dim3(1),dim3(256),0,0,site,codes.as<std::int8_t>(),deltas.as<float>());read();
         hipLaunchKernelGGL((project_rows_dense_a8_kernel<Site<R,true>,1U,true,false>),dim3(1),dim3(256),dense_a8_stage_bytes<R>(256U),0,site,codes.as<std::int8_t>(),deltas.as<float>());read();
-        std::vector<unsigned char> q6(208U,0);Buffer dq(q6.size());dq.upload(q6);site.segments=segments({{dq.p,1U}});
+        auto q6=q6_weights(256U,1U);Buffer dq(q6.size());dq.upload(q6);site.segments=segments({{dq.p,1U}});
         hipLaunchKernelGGL((project_rows_dense_a8_kernel<Site<R,true>,1U,false,true>),dim3(1),dim3(256),0,0,site,codes.as<std::int8_t>(),deltas.as<float>());read();
     } else {
         hipLaunchKernelGGL((project_rows_dense_a8_wmma_kernel<Site<R,true>,1U,1U>),dim3(R/16U),dim3(128),0,0,site,codes.as<std::int8_t>(),deltas.as<float>());read();
