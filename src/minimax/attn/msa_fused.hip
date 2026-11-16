@@ -147,6 +147,8 @@ __device__ void prep_kv(const DecodeView& v) {
 // Preserve local row/block coordinates and operation order inside each window.
 __host__ __device__ DecodeView prefill_offset(DecodeView v, unsigned r0) {
     v.q += static_cast<std::size_t>(r0) * v.q_heads * kHeadDim;
+    if (v.q16) v.q16 += static_cast<std::size_t>(r0) * v.q_heads * kHeadDim;
+    if (v.q16_lo) v.q16_lo += static_cast<std::size_t>(r0) * v.q_heads * kHeadDim;
     v.k += static_cast<std::size_t>(r0) * v.kv_heads * kHeadDim;
     v.v += static_cast<std::size_t>(r0) * v.kv_heads * kHeadDim;
     v.iq += static_cast<std::size_t>(r0) * v.idx_heads * kIdxDim;

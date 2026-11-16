@@ -589,6 +589,15 @@ int main(int argc, char** argv) {
                 } else if (f == 2) {
                     const bool same = std::memcmp(ob_q32.data(), ob_f.data(), nob * 4) == 0 && std::memcmp(mo_q32.data(), mo_f.data(), nmo * 4) == 0;
                     std::printf("   MLA attn-wmma bf16 q-tilde image (23) vs FP32 q-tilde (21): o-bar + out bitwise %s\n", same ? "equal" : "DIFFER");
+                    if (!same) {
+                        const auto require_equal = [](const std::vector<float>& ref, const std::vector<float>& got, const char* tensor) {
+                            for (std::size_t i = 0; i < ref.size(); ++i)
+                                if (std::memcmp(&ref[i], &got[i], sizeof(float)) != 0)
+                                    die("MLA arm 23 vs 21: " + std::string(tensor) + " differs at index " + std::to_string(i));
+                        };
+                        require_equal(ob_q32, ob_f, "o-bar");
+                        require_equal(mo_q32, mo_f, "out");
+                    }
                 }
             }
         }
