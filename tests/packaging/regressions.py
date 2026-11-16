@@ -235,6 +235,34 @@ def test_6():
     assert bash(script, *command).returncode != 0, 'arbitrary nonempty error accepted'
     write(tool, '#!/usr/bin/env bash\necho "usage: strix-bitcalc-cmp FILE" >&2\nexit 2\n')
     ok(bash(script, *command))
+    for code in (1, 3, 64):
+        write(tool, f'#!/usr/bin/env bash\necho "usage: strix-bitcalc-cmp FILE" >&2\nexit {code}\n')
+        ok(bash(script, *command))
+    for message, code in (('usage: another-tool FILE', 1),
+                          ('failure\\nusage: strix-bitcalc-cmp FILE', 1),
+                          ('usage: strix-bitcalc-cmp FILE', 124),
+                          ('usage: strix-bitcalc-cmp FILE', 139),
+                          ('usage: strix-bitcalc-cmp FILE\\nImportError: broken', 1)):
+        write(tool, f'#!/usr/bin/env bash\nprintf "{message}\\n" >&2\nexit {code}\n')
+        assert bash(script, *command).returncode != 0, (message, code)
+    nohelp_manifest = write(manifest.with_name('without-help-tools.txt'),
+                            'strix-inspect-gguf\nstrix-model-describe\nstrix-model-manifest\n')
+    for name in nohelp_manifest.read_text().splitlines():
+        nohelp_tool = prefix / 'bin' / name
+        write(manifest, f'strix-bitcalc-cmp\n{name}\n')
+        write(tool, '#!/usr/bin/env bash\necho "usage: strix-bitcalc-cmp"\n')
+        for code in (1, 2):
+            write(nohelp_tool, f'#!/usr/bin/env bash\n[ "$#" -eq 0 ] || exit 99\necho "model required" >&2\nexit {code}\n')
+            nohelp_tool.chmod(0o755)
+            ok(bash(script, *command))
+        for message, code in (('', 1), ('model required', 0), ('failure', 3),
+                              ('failure', 124), ('failure', 139),
+                              ('error while loading shared libraries', 1)):
+            write(nohelp_tool, f'#!/usr/bin/env bash\nprintf "{message}" >&2\nexit {code}\n')
+            assert bash(script, *command).returncode != 0, (name, message, code)
+        nohelp_tool.unlink()
+    nohelp_manifest.unlink()
+    write(manifest, 'strix-bitcalc-cmp\n')
     tool.unlink()
     assert bash(script, *command).returncode != 0, 'missing expected executable accepted'
     manifest.unlink()

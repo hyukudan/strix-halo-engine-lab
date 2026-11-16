@@ -98,7 +98,9 @@ jobs:
             apt-get update >/dev/null
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake ninja-build hip-dev dpkg-dev rpm file git >/dev/null
             git config --global --add safe.directory /work
-            bash packaging/package.sh build/pkg-hip hip --hip-archs "$ARCHS" --rpath /opt/rocm/lib $TAG_FLAG
+            # Match ci.yml hip-offline-build: pinned ROCm/hip-dev, Release,
+            # testing configuration and the default warnings-as-errors policy.
+            bash packaging/package.sh build/pkg-hip hip --hip-archs "$ARCHS" --rpath /opt/rocm/lib $TAG_FLAG -- -DBUILD_TESTING=ON -DSTRIX_WARNINGS_AS_ERRORS=ON
             bash packaging/smoke.sh --check-packages build/pkg-hip
             for p in build/pkg-hip/strix-*.deb; do dpkg-deb -I "$p" | sed -n "1,25p"; dpkg-deb -c "$p"; done
             for p in build/pkg-hip/strix-*.rpm; do rpm -qip "$p" | head -12; rpm -qlp "$p"; done

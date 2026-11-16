@@ -67,13 +67,28 @@ for exe in "$bindir"/strix-*; do
         missing=$(ldd "$exe" 2>/dev/null | grep "not found" | head -3 | tr -s ' \t' ' ')
         if [ -n "$missing" ]; then fail "$name: missing libraries:$missing"; continue; fi
     fi
+    without_help=0
+    for manifest in "$datadir"/support/without-help-*.txt; do
+        [ -f "$manifest" ] || continue
+        if grep -Fxq "$name" "$manifest"; then without_help=1; break; fi
+    done
+    if [ "$without_help" -eq 1 ]; then
+        out=$(timeout 30 "$exe" 2>&1 </dev/null); rc=$?
+        if { [ "$rc" -eq 1 ] || [ "$rc" -eq 2 ]; } && [ -n "$out" ] &&
+           ! printf '%s' "$out" | grep -qiE 'error while loading shared libraries|symbol lookup error|Traceback|ImportError|ModuleNotFoundError'; then
+            nohelp=$((nohelp + 1)); pass "$name without --help (rc=$rc)"
+        else
+            fail "$name without arguments: rc=$rc: $(printf '%s' "$out" | head -2 | tr '\n' ' ' | cut -c1-160)"
+        fi
+        continue
+    fi
     out=$(timeout 30 "$exe" --help 2>&1 </dev/null); rc=$?
     if [ $rc -eq 124 ] || [ $rc -ge 128 ]; then
         fail "$name --help: rc=$rc (timeout or signal)"
     elif [ $rc -eq 0 ]; then
         pass "$name --help (rc=$rc)"
-    elif { [ $rc -eq 1 ] || [ $rc -eq 2 ]; } &&
-         printf '%s' "$out" | grep -qiE '^(error: )?usage: ' &&
+    elif { [ "${out%%$'\n'*}" = "usage: $name" ] ||
+           [[ "$out" == "usage: $name "* ]]; } &&
          ! printf '%s' "$out" | grep -qiE 'Traceback|ImportError|ModuleNotFoundError'; then
         pass "$name usage (rc=$rc)"
     elif printf '%s' "$out" | grep -qiE "error while loading shared libraries|symbol lookup error"; then
@@ -87,8 +102,6 @@ for exe in "$bindir"/strix-*; do
         parser_ok=0
         if [ $rc -eq 1 ]; then
             case "$name:$out" in
-                'strix-inspect-gguf:error: cannot open GGUF file'|\
-                'strix-model-manifest:error: cannot open GGUF file'|\
                 'strix-memory-plan:error: unknown argument: --help') parser_ok=1 ;;
             esac
             if [ "$name" = strix-deepseek41-expert-server ]; then
