@@ -21,7 +21,7 @@ void expect(const std::vector<std::uint64_t>& bytes, std::uint32_t slots, double
 }
 }  // namespace
 
-int main() {
+int main() try {
     check(parse_host_pin_order("layer") == HostPinOrder::layer);
     check(parse_host_pin_order("deadline") == HostPinOrder::deadline);
     check(std::string_view(host_pin_order_name(HostPinOrder::layer)) == "layer");
@@ -129,17 +129,65 @@ int main() {
         for (std::size_t l = 0; l < 20; ++l) streamed[l] = 3'690'000'000ULL;  // 73.8 GB streamed
         const double one_gib = double(1ULL << 30);
         const auto big = resolve_host_pin_order(HostPinOrder::automatic, streamed, 68.0, 57.9 * one_gib, 0, 2);   // F ~11.6 GB
-        check(big.order == HostPinOrder::interleave && big.host_gib == 64.0 && big.ring_mib == kInterleaveFileRingMib);
+        check(big.order == HostPinOrder::interleave && big.host_gib == 53.9 && big.ring_mib == kInterleaveFileRingMib);
         check(big.layer_file_bytes > 10e9);
         const auto small = resolve_host_pin_order(HostPinOrder::automatic, streamed, 68.0, 80.0 * one_gib, 0, 2);  // F = 73.8 - 73.0
         check(small.order == HostPinOrder::layer && small.host_gib == 68.0 && small.ring_mib == kLegacyFileRingMib);
         const auto unknown = resolve_host_pin_order(HostPinOrder::automatic, streamed, 56.0, -1.0, 0, 2);     // F = 73.8 - 60.1
-        check(unknown.order == HostPinOrder::interleave);
+        check(unknown.order == HostPinOrder::layer && unknown.host_gib == 0.0);
         const auto forced = resolve_host_pin_order(HostPinOrder::layer, streamed, 56.0, -1.0, 0, 2);
         check(forced.order == HostPinOrder::layer && forced.ring_mib == kLegacyFileRingMib && forced.layer_file_bytes < 0.0);
         const auto none = resolve_host_pin_order(HostPinOrder::automatic, streamed, 68.0, 1.0 * one_gib, 0, 0);
         check(none.order == HostPinOrder::layer);
         check(parse_host_pin_order("auto") == HostPinOrder::automatic);
     }
+    {
+        const double unit = double(1ULL << 30);
+        const std::vector<std::uint64_t> streamed(20, 4ULL << 30);
+        // Low physical OR commit headroom must decline growth, including zero room and the reserve floor.
+        for (const auto room : {0.0, 3.0 * unit, host_pin_headroom(64 * unit, 35 * unit, 32 * unit),
+                                host_pin_headroom(35 * unit, 64 * unit, 32 * unit)}) {
+            const auto pick = resolve_host_pin_order(HostPinOrder::automatic, streamed, 32.0, room, 0, 2);
+            check(pick.order == HostPinOrder::layer && pick.ring_mib == kLegacyFileRingMib);
+            check(pick.host_gib * unit + double(kLegacyFileRingMib << 20U) <= std::max(room, double(kLegacyFileRingMib << 20U)));
+        }
+        bool unresolved = false;
+        try { (void)ordered_host_layers(HostPinOrder::automatic, streamed, 2, 4 * unit, 0); }
+        catch (const std::invalid_argument&) { unresolved = true; }
+        check(unresolved);
+        const HostPinChoice requested{HostPinOrder::interleave, 28.0, 4096, 12e9, "test"};
+        // Inject a failure at each page of an optional ring; no partial pins survive the retry.
+        for (unsigned fail = 0; fail < 64; ++fail) {
+            unsigned held = 0, releases = 0;
+            const auto result = allocate_file_ring(requested, true, 8192,
+                [&] { return 40 * unit - double(held) * double((64ULL << 20) + 8192); },
+                [&](unsigned pages, bool optional) {
+                    if (!optional) check(held == 0 && pages == 4);
+                    for (unsigned i = 0; i < pages; ++i) {
+                        if (optional && i == fail) return false;
+                        ++held;
+                    }
+                    return true;
+                }, [&] { held = 0; ++releases; });
+            check(releases == 1 && held == 4 && result.ring_mib == 256);
+            check(result.order == HostPinOrder::layer && result.host_gib == 32.0);
+            const auto host = ordered_host_layers(result.order, streamed, 2, result.host_gib * unit, 0);
+            check(host[0] && host[7] && !host[8]);
+        }
+        // Headroom recheck includes page padding; legacy still fits, but optional growth must not be attempted.
+        const auto pressure = allocate_file_ring(requested, true, 8192, [&] { return 4 * unit; },
+            [&](unsigned pages, bool optional) { check(!optional && pages == 4); return true; }, [] {});
+        check(pressure.host_gib < 4.0 && pressure.ring_mib == 256);
+        bool explicit_failed = false;
+        try {
+            (void)allocate_file_ring(requested, false, 0, [] { return 0.0; },
+                [](unsigned pages, bool optional) { check(pages == 64 && !optional); return false; }, [] {});
+        } catch (const std::runtime_error&) { explicit_failed = true; }
+        check(explicit_failed);
+    }
     std::puts("host pin plan checks pass");
+    return 0;
+} catch (const std::exception& e) {
+    std::fprintf(stderr, "%s\n", e.what());
+    return 1;
 }

@@ -1361,7 +1361,6 @@ std::vector<ExpertTier> default_tiers(const CudaPrefillOptions& o, std::uint32_t
     std::vector<ExpertTier> t(n_layers, ExpertTier::file);
     const double gib = static_cast<double>(layer_bytes) / double(1ULL << 30);
     auto dev_left = static_cast<std::int64_t>(o.device_expert_gib / gib + 1e-9);
-    auto host_left = static_cast<std::int64_t>(o.host_expert_gib / gib + 1e-9);
     // device: the decoder layers first from the top (cone: few rows each, a streamed load would not hide), then the
     // encoder layers from the last one down (the first streamed layers are preloaded between runs)
     std::vector<std::uint32_t> order;
@@ -1373,21 +1372,17 @@ std::vector<ExpertTier> default_tiers(const CudaPrefillOptions& o, std::uint32_t
             --dev_left;
         }
     }
-    if (o.host_pin_order != HostPinOrder::layer) {
-        std::vector<std::uint64_t> bytes(n_layers, 0);
-        for (std::uint32_t l = o.first_layer; l < o.end_layer; ++l)
-            if (t[l] == ExpertTier::file) bytes[l] = layer_bytes;
-        const auto budget = o.host_expert_gib * double(1ULL << 30);
-        const auto host = ordered_host_layers(o.host_pin_order, bytes, o.slots, budget, double(o.file_ring_mib) * double(1ULL << 20));
-        for (std::uint32_t l = o.first_layer; l < o.end_layer; ++l)
-            if (host[l]) t[l] = ExpertTier::host;
-        return t;
-    }
+    std::vector<std::uint64_t> bytes(n_layers, 0);
     for (std::uint32_t l = o.first_layer; l < o.end_layer; ++l)
-        if (t[l] == ExpertTier::file && host_left > 0) {
-            t[l] = ExpertTier::host;
-            --host_left;
-        }
+        if (t[l] == ExpertTier::file) bytes[l] = layer_bytes;
+    // Preserve the legacy whole-layer budget's rounding tolerance.
+    const double budget = o.host_pin_order == HostPinOrder::layer
+        ? double(static_cast<std::int64_t>(o.host_expert_gib / gib + 1e-9)) * double(layer_bytes)
+        : o.host_expert_gib * double(1ULL << 30);
+    const auto host = ordered_host_layers(o.host_pin_order, bytes, o.slots, budget,
+        double(o.file_ring_mib) * double(1ULL << 20));
+    for (std::uint32_t l = o.first_layer; l < o.end_layer; ++l)
+        if (host[l]) t[l] = ExpertTier::host;
     return t;
 }
 
@@ -1706,7 +1701,7 @@ CudaPrefill::CudaPrefill(const std::filesystem::path& gguf, const CudaPrefillOpt
     const auto host_pin_fallback = [&](const char* reason) {  // automatic outside the measured streamer path: layer
         if (o.host_pin_order != HostPinOrder::automatic) return;
         o.host_pin_order = HostPinOrder::layer;
-        o.file_ring_mib = kLegacyFileRingMib;
+        o.file_ring_mib = resolve_file_ring(o.host_pin_order, o.host_expert_gib, o.file_ring_mib, o.slots).ring_mib;
         m.host_pin_reason = reason;
     };
     if (!use_streamer) {
@@ -1747,6 +1742,8 @@ CudaPrefill::CudaPrefill(const std::filesystem::path& gguf, const CudaPrefillOpt
         sp.timing = o.timing;
         if (!o.expert_residency) {
             // whole layers through the streamer: device = all resident, host / file = all streamed, identity order
+            host_pin_fallback("whole-layer streamer: layer (not measured)");
+            sp.staging_pages = std::max<std::uint32_t>(2U, o.file_ring_mib / 64U);
             m.tiers = o.tiers.empty() ? default_tiers(o, c.num_hidden_layers, layer_bytes) : o.tiers;
             require(m.tiers.size() >= o.end_layer, "tiers cover the layer range");
             for (std::uint32_t l = o.first_layer; l < o.end_layer; ++l) {
@@ -1792,7 +1789,8 @@ CudaPrefill::CudaPrefill(const std::filesystem::path& gguf, const CudaPrefillOpt
                 for (std::uint32_t l = o.first_layer; l < o.end_layer; ++l)
                     streamed[l] = static_cast<std::uint64_t>(s[l - o.first_layer]) * static_cast<std::uint64_t>(expert_bytes);
                 const auto room = ds41::host_memory_room();
-                const double pinnable = room.known ? std::max(0.0, double(room.free_physical) - o.host_commit_floor_gib * double(1ULL << 30)) : -1.0;
+                const double pinnable = room.known ? host_pin_headroom(double(room.free_physical), double(room.free_commit),
+                    o.host_commit_floor_gib * double(1ULL << 30)) : 0.0;
                 const auto pick = resolve_host_pin_order(o.host_pin_order, streamed, o.host_expert_gib, pinnable, o.file_ring_mib, sp.slots);
                 o.host_pin_order = pick.order;
                 o.host_expert_gib = pick.host_gib;
@@ -1841,15 +1839,22 @@ CudaPrefill::CudaPrefill(const std::filesystem::path& gguf, const CudaPrefillOpt
             for (std::uint32_t l = o.first_layer; l < o.end_layer; ++l)
                 m.tiers[l] = sp.resident[l] == E ? ExpertTier::device : sp.stream_tier[l];
         }
-        if (o.host_pin_order == HostPinOrder::automatic) {
-            host_pin_fallback("whole-layer streamer: layer (not measured)");
-            sp.staging_pages = std::max<std::uint32_t>(2U, o.file_ring_mib / 64U);
-        }
+        sp.automatic_ring_growth = options.file_ring_mib == 0 && o.file_ring_mib > kLegacyFileRingMib;
+        sp.fixed_stream_tiers = !o.expert_residency && !o.tiers.empty();
+        sp.host_pin_choice = {o.host_pin_order, o.host_expert_gib, o.file_ring_mib, m.host_pin_layer_file_bytes, "resolved ring"};
         m.resident_experts = sp.resident;
         m.streamer = std::make_unique<detail::ExpertStreamer>(*m.reader, std::move(sp));
+        const auto& effective = m.streamer->plan().host_pin_choice;
+        if (effective.ring_mib != o.file_ring_mib) {
+            o.host_pin_order = effective.order;
+            o.host_expert_gib = effective.host_gib;
+            o.file_ring_mib = effective.ring_mib;
+            m.host_pin_reason = effective.reason;
+            m.host_pin_layer_file_bytes = effective.layer_file_bytes;
+        }
         // host layers whose pinned buffer could not be allocated were demoted to the file tier by the streamer
         for (std::uint32_t l = o.first_layer; l < o.end_layer; ++l)
-            if (m.tiers[l] == ExpertTier::host && m.streamer->plan().stream_tier[l] == ExpertTier::file) m.tiers[l] = ExpertTier::file;
+            if (m.tiers[l] != ExpertTier::device) m.tiers[l] = m.streamer->plan().stream_tier[l];
     }
     m.run_tiers = m.tiers;
     STRIX_CUDA_CHECK(cudaStreamSynchronize(m.st));

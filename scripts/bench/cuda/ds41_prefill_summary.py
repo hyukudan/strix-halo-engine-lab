@@ -3,11 +3,14 @@
 identity (sha256 / logits fnv / next token over all reps), the --timing accounting when present, and the GPU SM clock
 (mean of busy samples, max) with GPU clocks per token = busy x clock x prefill / tokens.
 
-  python ds41_prefill_summary.py OUT_DIR
+  python ds41_prefill_summary.py OUT_DIR [--lengths 2048 8192 32768 --reps 3]
 """
+import argparse
 import collections
 import json
+import math
 import os
+import re
 import sys
 
 
@@ -49,14 +52,35 @@ def fmt_acct(a):
 
 
 def main():
-    out = sys.argv[1]
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('out')
+    ap.add_argument('--lengths', nargs='+', type=int, default=[2048, 8192, 32768])
+    ap.add_argument('--reps', type=int, default=3)
+    args = ap.parse_args()
+    out = args.out
+    if args.reps < 1 or any(n < 1 for n in args.lengths) or len(set(args.lengths)) != len(args.lengths):
+        raise ValueError('expected positive, distinct lengths and positive repetitions')
     reqs = [json.loads(x) for x in open(os.path.join(out, 'requests.jsonl'), encoding='utf-8') if x.strip()]
     by = collections.OrderedDict()
     for j in reqs:
-        by.setdefault(j.get('tokens', 0), []).append(j)
+        if type(j.get('tokens')) is not int or j['tokens'] not in args.lengths or j.get('http_status') != 200:
+            raise ValueError('unexpected token count or unsuccessful HTTP status')
+        for key, size in (('sha256', 64), ('logits_fnv', 16)):
+            if not isinstance(j.get(key), str) or not re.fullmatch(r'[0-9a-fA-F]{%d}' % size, j[key]):
+                raise ValueError(f'missing or invalid {key}')
+        if type(j.get('next_token')) is not int or j['next_token'] < 0:
+            raise ValueError('missing or invalid next_token')
+        for duration in (j['wall_s'], j['seconds']['prefill']):
+            if type(duration) not in (int, float) or not math.isfinite(duration) or duration <= 0:
+                raise ValueError('missing or invalid duration')
+        by.setdefault(j['tokens'], []).append(j)
+    if set(by) != set(args.lengths) or any(len(xs) != args.reps for xs in by.values()):
+        raise ValueError('missing or extra benchmark lengths/repetitions')
     smp, mk = samples(out), marks(out)
+    differs = False
     for n, xs in by.items():
         ids = {(x.get('sha256'), x.get('logits_fnv'), x.get('next_token')) for x in xs}
+        differs = differs or len(ids) != 1
         pf = [x.get('seconds', {}).get('prefill', 0.0) for x in xs]
         st = {x.get('http_status') for x in xs}
         sha = str(next(iter(ids))[0])[:16]
@@ -78,8 +102,12 @@ def main():
                 print(fmt_acct(x['accounting']))
     if smp:
         print(f"GPU{os.environ.get('GPU_INDEX', '')} peak MiB {max(s[1] for s in smp):.0f}, max SM MHz {max(s[3] for s in smp):.0f}")
-    return 0
+    return int(differs)
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        print(f'benchmark invalid: {exc}', file=sys.stderr)
+        sys.exit(1)

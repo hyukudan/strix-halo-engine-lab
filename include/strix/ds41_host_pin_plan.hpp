@@ -128,12 +128,23 @@ inline std::vector<std::uint8_t> interleave_host_layers(std::span<const std::uin
     return host;
 }
 
-// The host set of a non-layer order (bytes[l]: streamed bytes of layer l, 0 = resident; budget and ring in bytes).
+// The host set of a resolved order (bytes[l]: streamed bytes of layer l, 0 = resident; budget and ring in bytes).
 inline std::vector<std::uint8_t> ordered_host_layers(HostPinOrder order, std::span<const std::uint64_t> bytes, std::uint32_t slots,
                                                    double budget_bytes, double ring_bytes) {
+    if (order == HostPinOrder::automatic) throw std::invalid_argument("resolve automatic host order before placement");
+    if (order == HostPinOrder::layer) {
+        std::vector<std::uint8_t> host(bytes.size(), 0);
+        for (std::size_t l = 0; l < bytes.size(); ++l)
+            if (bytes[l] && budget_bytes >= static_cast<double>(bytes[l])) {
+                host[l] = 1;
+                budget_bytes -= static_cast<double>(bytes[l]);
+            }
+        return host;
+    }
     if (order == HostPinOrder::early) return early_host_layers(bytes, slots, budget_bytes);
     if (order == HostPinOrder::interleave) return interleave_host_layers(bytes, slots, budget_bytes, ring_bytes);
-    return deadline_host_layers(bytes, slots, budget_bytes);
+    if (order == HostPinOrder::deadline) return deadline_host_layers(bytes, slots, budget_bytes);
+    throw std::invalid_argument("unsupported host placement order");
 }
 
 // File-read ring of the streamed experts. ring_mib 0 = auto (the default): the interleave order takes a 4 GiB ring out
@@ -155,7 +166,7 @@ inline FileRing resolve_file_ring(HostPinOrder order, double host_gib, std::uint
 
 // AUTO WHERE IT WINS: the order the automatic default resolves to, decided once at load (the pinned set is fixed for
 // the process). Decision variable: the bytes the layer order would stream from the file, F = streamed - pinnable,
-// pinnable = min(budget, free physical RAM - commit floor) (free RAM unknown: the budget). Measured on one RTX PRO
+// pinnable = min(budget, min(free physical RAM, free commit) - floor); unknown room declines growth. Measured on one RTX PRO
 // (sm_120, PCIe 5 x16, NVMe ~6.6 GB/s), equal pinned RAM, ABAB, 3 reps, all outputs bit-identical:
 //   F  8.4 GB: interleave 2K warm -5 % / cold -10 %, 8K warm +3 % / cold +6 %, 32K -1 %   -> layer (8K loses)
 //   F 12.2 GB: 2K -16 %, 8K -15 %, 32K -1 %; F 19.9-23.7 GB: 2K -13..-15 %, 8K -5..-6 %  -> interleave
@@ -170,6 +181,30 @@ struct HostPinChoice {
     double layer_file_bytes;  // F (automatic only; -1 otherwise)
     const char* reason;
 };
+// Unknown telemetry cannot admit optional ring growth. Both resources retain the floor.
+inline double host_pin_headroom(double physical, double commit, double floor_bytes) {
+    return std::max(0.0, std::min(physical, commit) - floor_bytes);
+}
+
+// Allocate a ring transactionally: release partial optional growth before retrying legacy staging.
+// Callbacks keep device allocation out of the shared planner and permit host fault injection.
+template<class Room, class Allocate, class Release>
+HostPinChoice allocate_file_ring(HostPinChoice choice, bool automatic_growth, std::size_t page_padding,
+                                Room room, Allocate allocate, Release release) {
+    const auto pages = std::max(2U, choice.ring_mib / 64U);
+    const double page_bytes = double((64ULL << 20U) + page_padding);
+    if ((!automatic_growth || room() >= double(pages) * page_bytes) && allocate(pages, automatic_growth)) return choice;
+    release();
+    if (!automatic_growth) throw std::runtime_error("explicit file ring allocation failed");
+    const double restored = choice.host_gib + double(choice.ring_mib) / 1024.0;
+    choice.host_gib = std::min(restored, std::max(0.0, room() - 4.0 * page_bytes) / double(1ULL << 30));
+    choice.order = HostPinOrder::layer;
+    choice.ring_mib = kLegacyFileRingMib;
+    choice.reason = "automatic file ring declined: legacy staging and layer placement";
+    if (!allocate(4U, false)) throw std::runtime_error("legacy file ring allocation failed");
+    return choice;
+}
+
 inline HostPinChoice resolve_host_pin_order(HostPinOrder requested, std::span<const std::uint64_t> streamed_bytes, double host_gib,
                                             double pinnable_bytes, std::uint32_t ring_mib, std::uint32_t slots) {
     if (requested != HostPinOrder::automatic) {
@@ -178,16 +213,18 @@ inline HostPinChoice resolve_host_pin_order(HostPinOrder requested, std::span<co
     }
     double streamed = 0.0;
     for (const auto b : streamed_bytes) streamed += static_cast<double>(b);
-    double pinned = host_gib * double(1ULL << 30);
-    if (pinnable_bytes >= 0.0) pinned = std::min(pinned, pinnable_bytes);
+    const double available_gib = std::max(0.0, pinnable_bytes) / double(1ULL << 30);
+    host_gib = std::min(host_gib, available_gib);
+    const double pinned = host_gib * double(1ULL << 30);
     const double file = std::max(0.0, streamed - pinned);
     const bool on = slots > 0 && host_gib >= 2.0 * double(kInterleaveFileRingMib) / 1024.0 && file >= kInterleaveMinFileBytes;
     const auto order = on ? HostPinOrder::interleave : HostPinOrder::layer;
-    const auto ring = resolve_file_ring(order, host_gib, ring_mib, slots);
+    auto ring = resolve_file_ring(order, host_gib, ring_mib, slots);
+    ring.host_gib = std::min(ring.host_gib, std::max(0.0, available_gib - double(ring.ring_mib) / 1024.0));
     return {order, ring.host_gib, ring.ring_mib, file,
             on ? "layer-order file tier >= 10 GB: interleave (measured 12-24 GB: 2K -13..-16 %, 8K -5..-15 %)"
                : slots == 0 || host_gib < 2.0 * double(kInterleaveFileRingMib) / 1024.0
-                   ? "no streamed slots or host budget under 8 GiB: layer (not measured)"
+                    ? "no streamed slots or admitted host budget under 8 GiB: layer"
                    : "layer-order file tier < 10 GB: layer (measured 8.4 GB: interleave 8K +3 % warm, +6 % cold)"};
 }
 

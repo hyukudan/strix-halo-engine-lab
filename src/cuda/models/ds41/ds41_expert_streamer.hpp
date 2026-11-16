@@ -46,6 +46,9 @@ struct StreamerPlan {
     // pinned 64 MiB pages of the file-read ring (>= 2): how far disk reads may run ahead of the copy stream. 4 (256 MiB)
     // keeps file reads in step with the copies; a ring of a whole file-tier layer lets its read overlap earlier host copies
     std::uint32_t staging_pages = 4;
+    bool automatic_ring_growth = false;
+    bool fixed_stream_tiers = false;              // explicit whole-layer tiers retain their supplied placement
+    HostPinChoice host_pin_choice{HostPinOrder::layer, 0.0, kLegacyFileRingMib, -1.0, "legacy ring"};
     std::uint32_t host_alias = 0;                  // TIMING ONLY: host layers beyond this many reuse earlier copies
     std::uint32_t host_pin_attempts = 3;           // tries per host layer's pinned buffer (the OS may grow the pagefile)
     std::uint32_t host_pin_retry_ms = 1500;        // wait between tries; a layer that still fails streams from the file
