@@ -1,3 +1,4 @@
+#include "strix/env_arms.hpp"
 #include "strix/device/hip_gate.hpp"
 #include "strix/env_flags.hpp"
 #include "glm/prefill/glm_pf_aux.hpp"
@@ -149,6 +150,8 @@ int main(int argc, char** argv) {
         std::string transport_spec, g3_tokens, prompt, out_path, tf_tokens, state_out, state_in;
         std::string mtp_prefill = "ref", mtp_prefill_gate;
         std::string prefill_mode = "auto", pf_gate, pf_ttft, pf_ttft_mode = "gemv", pf_null_study, pf_nulls;
+        std::string pf_ttft_arms;  // strix::env_arms spec: in-process ABAB arms for --pf-ttft (bundle tickets)
+        int pf_ttft_reps = 1;
         bool reference_gate = false;
         bool pf_before_load = false, pf_swap_moe = false;
         std::uint64_t tf_stop = 0;
@@ -207,6 +210,8 @@ int main(int argc, char** argv) {
             else if (a == "--pf-swap-moe") pf_swap_moe = true;  // --pf-gate test (world 2): a fresh fast MoE seam set right before the gemv run  // test: --prefill path set before load() (installed at its end)
             else if (a == "--pf-gate") pf_gate = next();  // prompt file: ref vs gemv (bitwise) vs wmma (D10) prefill, one process
             else if (a == "--pf-ttft") pf_ttft = next();  // comma-separated prompt files: chunked prefill TTFT
+            else if (a == "--pf-ttft-arms") pf_ttft_arms = next();  // "B:-/C:K=V+K=V": per rep every arm runs every prompt, one load
+            else if (a == "--pf-ttft-reps") pf_ttft_reps = std::stoi(next());  // arm cycles (strict ABAB order), default 1
             else if (a == "--pf-ttft-mode") pf_ttft_mode = next();  // gemv (default, exact identity) | wmma | wmma,gemv (each prompt in both, one load)
             else if (a == "--pf-null-study") pf_null_study = next();  // prompt file: exact (gemv) vs wmma vs 1-ulp nulls
             else if (a == "--pf-null") pf_nulls = next();  // comma-separated LAYER:POS:ELEM 1-ulp residual flips (test hook)
@@ -1748,6 +1753,12 @@ int main(int argc, char** argv) {
                     const std::string mode = pf_ttft_mode.substr(mb, me - mb);
                     if (mode != "wmma" && mode != "gemv") throw std::invalid_argument("--pf-ttft-mode: wmma | gemv | wmma,gemv");
                     guarded_install(mode.c_str());
+                    const auto arms = strix::env_arms::parse(pf_ttft_arms.empty() ? std::string("-:-") : pf_ttft_arms);
+                    if (pf_ttft_reps < 1) throw std::invalid_argument("--pf-ttft-reps must be >= 1");
+                    for (int rep = 0; rep < pf_ttft_reps; ++rep)
+                    for (const auto& arm : arms.arms) {
+                    strix::env_arms::apply(arms, arm);
+                    const std::string tag = pf_ttft_arms.empty() ? mode : mode + "." + arm.label;
                     std::size_t a = 0;
                     while (a <= pf_ttft.size()) {
                         const std::size_t b = std::min(pf_ttft.find(',', a), pf_ttft.size());
@@ -1756,10 +1767,10 @@ int main(int argc, char** argv) {
                         // Snapshot after the TTFT timer stops. The ordinary timing route
                         // retains its old cost; qualification explicitly requests full anchors.
                         const char* anchor = std::getenv("STRIX_GLM_PF_TTFT_ANCHOR");
-                        const Run r = guarded_run(toks, anchor && *anchor, (mode + " ttft").c_str());
+                        const Run r = guarded_run(toks, anchor && *anchor, (tag + " ttft").c_str());
                         if (anchor && *anchor) {
                             const std::string prefix = std::string(anchor) + ".n" + std::to_string(toks.size()) +
-                                ".r" + std::to_string(opt.rank) + "." + mode;
+                                ".r" + std::to_string(opt.rank) + "." + tag;
                             auto save = [&](const char* suffix, const void* data, std::size_t bytes) {
                                 std::ofstream file(prefix + suffix, std::ios::binary);
                                 file.write(static_cast<const char*>(data), static_cast<std::streamsize>(bytes));
@@ -1770,9 +1781,11 @@ int main(int argc, char** argv) {
                             save(".state.u8", r.state.data(), r.state.size());
                             std::printf("rank %u pf anchor: %zu logits, %zu state bytes\n", opt.rank, r.logits.size(), r.state.size());
                         }
-                        digest((mode + "-ttft").c_str(), r, toks.size());
+                        digest((tag + "-ttft").c_str(), r, toks.size());
                         a = b + 1;
                     }
+                    }
+                    strix::env_arms::restore(arms);
                     mb = me + 1;
                 }
             }
