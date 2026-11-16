@@ -779,7 +779,7 @@ void test_fast_prefill_profile() {
         const auto pi = md::prefill_policy(lookup(idx));
         check(pi.idx_wmma && pi.idx_wmma_layers == "40-59" && pi.msa_flash == 1 &&
                   pi.policies == "msa-flash-bf16-l40-v1+minimax-index-proj-wmma-v1-l40-59" &&
-                  md::prefill_identity(lookup(idx)) == "prefill_msa=msa-flash-bf16-l40-v1;prefill_idxproj=minimax-index-proj-wmma-v1-l40-59",
+                  md::prefill_identity(lookup(idx)) == "prefill_msa=msa-flash-bf16-l40-v1;prefill_idxproj=minimax-index-proj-wmma-v1-l40-59;" + kOrderId,
               "fast idx: explicit member runs beside the bundle, own cache field");
         check(!md::prefill_policy(lookup(bundle)).idx_wmma, "fast idx: not a bundle member before its gate");
         for (const char* layout : {"tiled", "off"}) {
@@ -813,7 +813,7 @@ void test_fast_prefill_profile() {
         idx_other["STRIX_MM_PF_IDX_WMMA_LAYERS"] = "30-59";
         check(!agree(idx, idx_other), "fast idx: different layer sets rejected");
         const EnvMap idx_only{{"STRIX_MM_PF_IDX_WMMA", "1"}, {"STRIX_MM_PF_IDX_WMMA_LAYERS", "40-49,50-59"}};
-        check(md::prefill_identity(lookup(idx_only)) == "prefill_idxproj=minimax-index-proj-wmma-v1-l40-59",
+        check(md::prefill_identity(lookup(idx_only)) == "prefill_idxproj=minimax-index-proj-wmma-v1-l40-59;" + kOrderId,
               "fast idx: alone, only the idxproj field");
         EnvMap idx_none = idx;
         idx_none["STRIX_MM_PF_IDX_WMMA_LAYERS"] = "none";
