@@ -86,7 +86,12 @@ if(MSVC)
     target_compile_options(cuda_core_dense_big_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
 
+# Host-only: converted-pack GGUF writer round trip (no GPU).
+add_executable(gguf_pack_writer_test ${_cc_root}/tests/gguf_pack_writer_test.cpp ${_cc_root}/src/gguf_reader.cpp)
+target_include_directories(gguf_pack_writer_test PRIVATE ${_cc_root}/include)
+
 if(BUILD_TESTING)
+    add_test(NAME gguf_pack_writer_test COMMAND gguf_pack_writer_test)
     foreach(t cuda_core_test qwen35_cuda_engine_test cuda_core_nvfp4_test cuda_core_dense_big_test)
         add_test(NAME ${t} COMMAND ${t})
         set_tests_properties(${t} PROPERTIES LABELS "gpu;cuda")

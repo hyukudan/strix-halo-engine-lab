@@ -56,6 +56,10 @@ struct MetadataEntry {
     std::vector<double> floating_array;
 };
 
+// Strix NVFP4 tile pack (converted weights, see strix::cuda_core nvfp4): dimensions [in, out], data is out/16 x in/128 records of
+// 1152 bytes (the cuda_core tile layout). Not the upstream GGML NVFP4 layout; the id is outside the upstream range.
+inline constexpr std::uint32_t kNvfp4TilePack = 43;
+
 struct TensorTypeGeometry {
     std::uint64_t block_elements = 0;
     std::uint64_t block_bytes = 0;
@@ -79,6 +83,8 @@ struct FileInfo {
     std::uint64_t file_size = 0;
     std::uint64_t alignment = 32;
     std::uint64_t data_offset = 0;
+    std::uint64_t metadata_count = 0;  // number of key/value entries
+    std::uint64_t metadata_end = 0;    // file offset just after the last key/value entry (they start at byte 24)
     std::vector<MetadataEntry> metadata;
     std::vector<TensorInfo> tensors;
 

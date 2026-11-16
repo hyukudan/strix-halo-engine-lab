@@ -49,6 +49,8 @@ public:
             }
             info.metadata.push_back(std::move(entry));
         }
+        info.metadata_count = metadata_count;
+        info.metadata_end = position_;
         apply_alignment(info);
 
         info.tensors.reserve(to_size(tensor_count));
@@ -309,6 +311,7 @@ private:
     }
 
     static bool valid_ggml_type(std::uint32_t type) {
+        if (type == kNvfp4TilePack) return true;
         if (type == 42) {  // Q2_0: block 64, fp16 d + 2-bit codes (GSQ-RCO builds)
             return true;
         }
@@ -454,6 +457,7 @@ std::optional<TensorTypeGeometry> tensor_type_geometry(
     case 35: return TensorTypeGeometry{256, 66};
     case 39: return TensorTypeGeometry{32, 17};
     case 42: return TensorTypeGeometry{64, 18};
+    case kNvfp4TilePack: return TensorTypeGeometry{128, 72};  // 16 rows x 128 columns = one 1152-byte record
     default: return std::nullopt;
     }
 }
