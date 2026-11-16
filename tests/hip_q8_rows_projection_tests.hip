@@ -455,7 +455,13 @@ void onfly_decode_bench(hipStream_t stream) {
             }
             const SingleDecodeSetting requested_single;
             const auto single_decode = requested_single.policy();
-            const bool single_decode_device = q8_rows::iu4_single_decode_device_qualified();
+            const bool single_decode_device = [] {
+                int device = -1;
+                hipDeviceProp_t properties{};
+                if (hipGetDevice(&device) != hipSuccess || hipGetDeviceProperties(&properties, device) != hipSuccess) return false;
+                return core::iu4_rows::measured_single_decode_device(properties.gcnArchName,
+                                                                     static_cast<unsigned>(properties.warpSize));
+            }();
             if (rows >= 7U) {
                 for (const auto mode : {Mode::rows, Mode::rows_a8}) {
                     require(setenv("STRIX_IU4_R8_SINGLE_DECODE", "0", 1) == 0, "set row-half control");
