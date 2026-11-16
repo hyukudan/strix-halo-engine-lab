@@ -10,6 +10,9 @@
 #include "strix/hip_gdn_lm_wave8_diagnostic.hpp"
 #endif
 #include "strix/hip_gdn_launcher.hpp"
+// A wide cohort step hands GDN up to kCohortWideMaxSessions sessions: the host segment tables must hold them all.
+static_assert(strix::gdn_window_cohort_max_segments >= strix::kCohortWideMaxSessions,
+              "GDN cohort segment capacity below the shared wide cohort session cap");
 #include "strix/recurrent_state_policy.hpp"
 #include "attn_core/recurrent_state.hpp"
 #include "hip_gdn_identity.hpp"
@@ -6630,12 +6633,12 @@ template <class Body> void gdn_window_rows_dispatch(std::size_t rows, Body&& bod
     }
 }
 struct GdnCohortBinding {
-    std::array<GdnWindowBinding, gdn_window_max_rows> segments;
+    std::array<GdnWindowBinding, gdn_window_cohort_max_segments> segments;
     std::size_t count = 0;
 };
 GdnCohortBinding bind_gdn_window_cohort(std::span<const HipGdnWindowCohortSegment> segments) {
-    if (segments.empty() || segments.size() > gdn_window_max_rows)
-        throw std::invalid_argument("GDN cohort window requires 1..8 session segments");
+    if (segments.empty() || segments.size() > gdn_window_cohort_max_segments)
+        throw std::invalid_argument("GDN cohort window requires 1..16 session segments");
     GdnCohortBinding out;
     for (std::size_t s = 0; s < segments.size(); ++s) {
         const auto& segment = segments[s];
@@ -6682,7 +6685,14 @@ template <class Body> void gdn_cohort_rows_dispatch(std::size_t rows, Body&& bod
 // legacy 2/4/8 rows, or 1..8 through the separate ANYSEG entry points.
 static void enqueue_gdn_window_segments(std::span<const GdnWindowCohortSegment> segments, const HipGdnLauncherConfig& config,
     hipStream_t stream, bool anyseg = false) {
-    if (segments.size() > gdn_window_max_rows) throw std::invalid_argument("GDN cohort segments exceed eight sessions");
+    if (segments.size() > gdn_window_cohort_max_segments) throw std::invalid_argument("GDN cohort segments exceed sixteen sessions");
+    // The kernel table holds eight segments: more sessions run as consecutive launches of at most eight. Every block
+    // reads and writes only its own segment's state, so the split changes no value.
+    if (segments.size() > gdn_window_max_rows) {
+        enqueue_gdn_window_segments(segments.first(gdn_window_max_rows), config, stream, anyseg);
+        enqueue_gdn_window_segments(segments.subspan(gdn_window_max_rows), config, stream, anyseg);
+        return;
+    }
     const auto shape = gdn_window_shape(config.model);
     GdnSegments all{};
     for (std::size_t s = 0; s < segments.size(); ++s) {
@@ -6734,8 +6744,8 @@ void gdn_window_cohort_enqueue(std::span<const GdnWindowCohortSegment> segments,
 #if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
     HipDenseTrellisScope arithmetic(config.dense_trellis_projections);
 #endif
-    if (segments.empty() || segments.size() > gdn_window_max_rows)
-        throw std::invalid_argument("GDN cohort window requires 1..8 session segments");
+    if (segments.empty() || segments.size() > gdn_window_cohort_max_segments)
+        throw std::invalid_argument("GDN cohort window requires 1..16 session segments");
     std::array<GdnWindowRow, gdn_window_cohort_max_rows> rows{};
     std::size_t count = 0;
     const auto& a = segments[0].layer;
@@ -6820,7 +6830,7 @@ void gdn_window_cohort_rows_preflight(std::span<const HipGdnWindowCohortSegment>
 }
 void gdn_window_cohort_rows_launch(std::span<const HipGdnWindowCohortSegment> segments) {
     const auto bound = bind_gdn_window_cohort(segments);
-    std::array<GdnWindowCohortSegment, gdn_window_max_rows> layers{};
+    std::array<GdnWindowCohortSegment, gdn_window_cohort_max_segments> layers{};
     for (std::size_t s = 0; s < bound.count; ++s)
         layers[s] = {bound.segments[s].layer, {bound.segments[s].rows.data(), bound.segments[s].count}, segments[s].config->control};
     gdn_window_cohort_enqueue({layers.data(), bound.count}, segments[0].config->gdn, hip_execution_stream());
