@@ -82,6 +82,11 @@ struct DecodeView {
     // block [grid][4].
     std::uint64_t* phase = nullptr;
     std::uint64_t* phase_index = nullptr;
+    // Prefill FAST flash (modes 11 / 12) only, when non-null: the q projection finish's BF16 image of q after norm +
+    // RoPE (same layout as q; mmx_prefill.hip dense_finish_kernel) and, mode 12, its lo terms. The flash core reads
+    // them through query_op with the bits of its own prologue; q is then not written.
+    const std::uint16_t* q16 = nullptr;
+    const std::uint16_t* q16_lo = nullptr;
 };
 
 // Single sequence, consecutive positions. Scratch has scratch_windows independent 16-row regions.
