@@ -15,6 +15,7 @@
 namespace strix::core::w4a16 {
 
 using Half2 = _Float16 __attribute__((ext_vector_type(2)));
+using Float2 = float __attribute__((ext_vector_type(2)));
 using U4 = std::uint32_t __attribute__((ext_vector_type(4)));
 
 // Nibbles at bit s and 16 + s of w as FP16 pair (exact): ((n ^ 8) | 0x6400) = 1024 + n + 8 (two's complement n), - 1032.
@@ -44,10 +45,13 @@ __device__ __forceinline__ float dot8(std::uint32_t w, const Half2 (&p)[4], floa
 // ascending, acc from +0).
 // MaxG: compile-time bound of the groups in [k0, k1) (k0 / 4 even): the lane's two columns' FP16 scales of the whole
 // range are read once up front with 4-byte loads (groups are contiguous per column) instead of 2 scattered loads per group.
-template<int R, unsigned KPS, unsigned MaxG, class Emit>
+// StagedRows keeps only four rows' group-dot values live while reusing each
+// decoded weight stage for every row. Caller provides R*32 Float2 LDS elements
+// per wave; stores/reloads preserve the exact FP32 dot sequence.
+template<int R, unsigned KPS, unsigned MaxG, bool StagedRows = false, class Emit>
 __device__ __forceinline__ void wave_rows(const std::uint8_t* wq, const std::uint16_t* ws, unsigned N, unsigned K, unsigned k0,
                                           unsigned k1, unsigned col0, const _Float16* xs, unsigned xs_stride, unsigned lane,
-                                          unsigned nrows, Emit&& emit) {
+                                          unsigned nrows, Emit&& emit, Float2* staged_dot = nullptr) {
     static_assert(KPS % 4U == 0U && R >= 1, "split boundaries on K64 groups");
     const unsigned ntiles = N / 16U, groups = K / 64U, tile = col0 + (lane >> 3U), pair = lane & 7U;
     const unsigned n0 = tile * 16U + 2U * pair;
@@ -76,7 +80,8 @@ __device__ __forceinline__ void wave_rows(const std::uint8_t* wq, const std::uin
         const unsigned sh = 16U * (gi & 1U);
         const float s0 = static_cast<float>(__builtin_bit_cast(_Float16, static_cast<std::uint16_t>(sc[0][gi / 2U] >> sh)));
         const float s1 = static_cast<float>(__builtin_bit_cast(_Float16, static_cast<std::uint16_t>(sc[1][gi / 2U] >> sh)));
-        float dot[R][2] = {};
+        constexpr int Chunk = StagedRows ? 4 : R;
+        float dot[Chunk][2] = {};
 #pragma unroll
         for (unsigned t = 0; t < 4U; ++t) {
             const U4 wv = ring[t];
@@ -87,9 +92,18 @@ __device__ __forceinline__ void wave_rows(const std::uint8_t* wq, const std::uin
 #pragma unroll
                 for (unsigned j = 0; j < 4U; ++j) wn[q][j] = nibble_pair(wv[q], 4U * j);
 #pragma unroll
-            for (int r = 0; r < R; ++r) {
-                if (static_cast<unsigned>(r) >= nrows) break;
-                const auto* xr = x32 + (static_cast<std::size_t>(r) * xs_stride + (k + t - k0) * 16U) / 2U;
+            for (int h = 0; h < R; h += Chunk) {
+#pragma unroll
+            for (int r = 0; r < Chunk; ++r) {
+                const unsigned row = static_cast<unsigned>(h + r);
+                if (row >= nrows) break;
+                if constexpr (StagedRows) {
+                    if (t) {
+                        const Float2 previous = reinterpret_cast<volatile Float2*>(staged_dot)[row * 32U + lane];
+                        dot[r][0] = previous[0]; dot[r][1] = previous[1];
+                    } else dot[r][0] = dot[r][1] = 0.0F;
+                }
+                const auto* xr = x32 + (static_cast<std::size_t>(row) * xs_stride + (k + t - k0) * 16U) / 2U;
                 const std::uint32_t lo[4] = {xr[0], xr[1], xr[2], xr[3]}, hi[4] = {xr[4], xr[5], xr[6], xr[7]};
                 Half2 pl[4], ph[4];
                 pair_activations(lo, pl);
@@ -104,13 +118,29 @@ __device__ __forceinline__ void wave_rows(const std::uint8_t* wq, const std::uin
                     dot[r][0] = __builtin_amdgcn_fdot2(wn[1][j], ph[j], dot[r][0], false);
                     dot[r][1] = __builtin_amdgcn_fdot2(wn[3][j], ph[j], dot[r][1], false);
                 }
+                if constexpr (StagedRows) {
+                    if (t < 3U) reinterpret_cast<volatile Float2*>(staged_dot)[row * 32U + lane] = Float2{dot[r][0], dot[r][1]};
+                    else {
+                        acc[row][0] = __builtin_fmaf(s0, dot[r][0], acc[row][0]);
+                        acc[row][1] = __builtin_fmaf(s1, dot[r][1], acc[row][1]);
+                    }
+                }
+            }
+            if constexpr (StagedRows) {
+                // Bound live activation chunks in both compiler and machine
+                // scheduling; neither fence emits a device barrier or wait.
+                asm volatile("" ::: "memory");
+                __builtin_amdgcn_sched_barrier(0);
+            }
             }
         }
+        if constexpr (!StagedRows) {
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             if (static_cast<unsigned>(r) >= nrows) break;
             acc[r][0] = __builtin_fmaf(s0, dot[r][0], acc[r][0]);
             acc[r][1] = __builtin_fmaf(s1, dot[r][1], acc[r][1]);
+        }
         }
         if ((k + 4U - k0) % KPS == 0U) {
             const unsigned split = (k + 4U - k0) / KPS - 1U;
