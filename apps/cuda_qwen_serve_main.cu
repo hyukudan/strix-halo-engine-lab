@@ -560,9 +560,13 @@ private:
         if (job.on_progress) job.on_progress({serve::GenerationPhase::decode, s.n, 0, s.n});
         s.phase = Phase::decode;
         s.ctx.reset();
-        if (mtp_ && context_mode_ != qc::ContextMode::off) {
+        // request field "ngram_draft" (shared serve API): false = no context drafter for this request, true = the
+        // configured mode (first when the server's is off); unset = the server's mode
+        const qc::ContextMode mode = !job.ngram_draft ? context_mode_
+            : !*job.ngram_draft ? qc::ContextMode::off : context_mode_ != qc::ContextMode::off ? context_mode_ : qc::ContextMode::first;
+        if (mtp_ && mode != qc::ContextMode::off) {
             // the drafter's context is what the session holds; the pending (last prompt) token joins at the first step
-            s.ctx = std::make_unique<qc::ContextDraft>(context_mode_);
+            s.ctx = std::make_unique<qc::ContextDraft>(mode);
             s.ctx->drafter.reset(std::span<const std::uint32_t>(job.prompt.data(), s.n - 1));
         }
         s.stream = qc::Stream{s.session, job.prompt[s.n - 1], s.n - 1, job.draft_depth_max, s.ctx.get(), job.copy_rows};
@@ -680,7 +684,7 @@ private:
         std::string extra = head;
         for (std::size_t i = 0; i < s.emitted.size() && i < 4096; ++i) extra += (i ? "," : "") + std::to_string(s.emitted[i]);
         extra += "]";
-        if (s.ctx) extra += std::string(",\"context_draft\":\"") + qc::context_mode_name(context_mode_) + "\",\"copy_first_steps\":" +
+        if (s.ctx) extra += std::string(",\"context_draft\":\"") + qc::context_mode_name(s.ctx->mode) + "\",\"copy_first_steps\":" +
             std::to_string(s.ctx->copy_first_steps) + ",\"context_extended_steps\":" + std::to_string(s.ctx->extended_steps) +
             ",\"context_rows\":" + std::to_string(s.ctx->context_rows) + ",\"copy_first_accepted\":" + std::to_string(s.ctx->context_accepted) +
             ",\"context_host_us\":" + std::to_string(static_cast<long long>(s.ctx->host_us)) +

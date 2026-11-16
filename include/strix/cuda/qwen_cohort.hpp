@@ -66,7 +66,8 @@ struct ContextDraft {
         c.copy_edit = m == ContextMode::copy || m == ContextMode::first;
         return c;
     }
-    explicit ContextDraft(ContextMode m) : drafter(config(m)), deliver_extension(m != ContextMode::first), copy_edit(config(m).copy_edit) {}
+    ContextMode mode = ContextMode::off;
+    explicit ContextDraft(ContextMode m) : drafter(config(m)), deliver_extension(m != ContextMode::first), copy_edit(config(m).copy_edit), mode(m) {}
 };
 
 struct Stream {
