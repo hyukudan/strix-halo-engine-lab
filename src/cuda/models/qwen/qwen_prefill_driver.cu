@@ -780,9 +780,9 @@ void Prefill::Impl::allocate_fitted_block() {
             drop();
             return false;
         }
-        std::size_t free = 0, total = 0;
-        ck(cudaMemGetInfo(&free, &total), "block fit");
-        if (free >= reserve) return true;
+        std::size_t free_bytes = 0, total_bytes = 0;
+        ck(cudaMemGetInfo(&free_bytes, &total_bytes), "block fit");
+        if (free_bytes >= reserve) return true;
         drop();
         return false;
     });
