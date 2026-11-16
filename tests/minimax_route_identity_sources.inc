@@ -229,3 +229,4 @@
 {"include/strix/session/cycle_pack.hpp", 0x2c4f745f250c4906ULL},
 {"include/strix/session/prefill_session.hpp", 0x223658661ba6ef38ULL},
 {"src/session/cycle_pack.hip", 0x3638b767c18f834cULL},
+{"src/hip/weight/trellis_sources.hpp", 0x2733a04fd2761ebcULL},

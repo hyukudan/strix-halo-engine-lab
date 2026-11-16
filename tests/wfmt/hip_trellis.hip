@@ -17,6 +17,7 @@
 #include "core/trellis_codec.hpp"
 #include "strix/env_flags.hpp"
 #include "hip/weight/registry.hpp"
+#include "trellis_checks.hpp"
 #if defined(STRIX_WFMT_GEMMA) && STRIX_WFMT_GEMMA
 #include "gemma4/exl3/device.hpp"
 #endif
@@ -32,6 +33,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -65,6 +67,19 @@ template <class T> void emit_vec(const char* section, const std::vector<T>& v) {
 
 bool g_report = false;
 unsigned g_cases = 0, g_failures = 0;
+unsigned g_glm_checks = 0, g_gemma_cases = 0;
+strix::wfmt::TrellisCoverage g_coverage{
+#if defined(STRIX_WFMT_GLM) && STRIX_WFMT_GLM
+    true,
+#else
+    false,
+#endif
+#if defined(STRIX_WFMT_GEMMA) && STRIX_WFMT_GEMMA
+    true,
+#else
+    false,
+#endif
+    false, false};
 void expect(bool ok, const std::string& what) {
     if (ok) return;
     ++g_failures;
@@ -488,12 +503,17 @@ template <int Bits> void core_cases() {
                     std::vector<float> sums(static_cast<std::size_t>(total) * kN, 0.0F);
                     for (unsigned s = 0; s < splits; ++s)
                         for (std::size_t i = 0; i < sums.size(); ++i) sums[i] += packed[static_cast<std::size_t>(s) * total * kN + i];
-                    Buffer sb(sums.size() * 4U); sb.put(sums);
-                    launch(false, 0, "partials", [&] {
-                        finish_probe<1><<<grid, kThreads>>>(d.experts->template as<ExpertDev>(), d.sel->template as<std::uint32_t>(), sb.as<float>(), 1U, total, d.out->template as<float>());
-                    });
-                    const auto glm = d.out->template read<float>(static_cast<std::size_t>(total) * kN);
-                    expect(same(mm, glm), name + " MiniMax split finish vs GLM finish splits " + std::to_string(splits));
+#if defined(STRIX_WFMT_GLM) && STRIX_WFMT_GLM
+                    if (g_coverage.run_glm()) {
+                        Buffer sb(sums.size() * 4U); sb.put(sums);
+                        launch(false, 0, "partials", [&] {
+                            finish_probe<1><<<grid, kThreads>>>(d.experts->template as<ExpertDev>(), d.sel->template as<std::uint32_t>(), sb.as<float>(), 1U, total, d.out->template as<float>());
+                        });
+                        const auto glm = d.out->template read<float>(static_cast<std::size_t>(total) * kN);
+                        expect(same(mm, glm), name + " MiniMax split finish vs GLM finish splits " + std::to_string(splits));
+                        ++g_glm_checks;
+                    }
+#endif
                     std::vector<float> ref(mm.size());
                     for (unsigned r = 0; r < total; ++r)
                         for (unsigned b = 0; b < kN / 128U; ++b) {
@@ -518,7 +538,7 @@ template <int Bits> void core_cases() {
                                     ref_dot += w * a; mag += std::fabs(w * a);
                                 }
                                 const double got = sums[static_cast<std::size_t>(r) * kN + n];
-                                if (std::fabs(got - ref_dot) > 1e-3 * mag + 1e-30) { expect(false, name + " core vs coefficient oracle at " + std::to_string(r) + "," + std::to_string(n)); break; }
+                                if (!strix::wfmt::coefficient_matches(got, ref_dot, mag)) { expect(false, name + " core vs coefficient oracle at " + std::to_string(r) + "," + std::to_string(n)); break; }
                             }
                 }
             }
@@ -669,23 +689,40 @@ void registry_cases() {
         expect(r && r->input_transform && r->output_transform && r->alignment == 2U, std::string("Gemma source unregistered ") + name);
     }
     expect(!wh::find_source({"exl3.gemma.transport", 1}, "trellis-tile", "trellis-mul1-legacy"), "Gemma bound to the generic mul1 arithmetic");
+    expect(!wh::find_source({"exl3.gemma.transport", 1}, "trellis-tile"), "ambiguous Gemma lookup accepted");
     ++g_cases;
 }
 }  // namespace
 
-int main() try {
+int main(int argc, char** argv) try {
+    if (argc > 2 || (argc == 2 && std::string_view(argv[1]) != "--require-engines"))
+        throw std::runtime_error("usage: [--require-engines]");
+    g_coverage.require_engines = argc == 2;
+    g_coverage.gemma_only = strix::envcfg::integer("STRIX_WFMT_TRELLIS_GEMMA_ONLY", 0) != 0;
+    std::cout << "GLM finish: " << (g_coverage.glm_available ? "available" : "SKIP (not built)")
+              << "; Gemma incumbent: " << (g_coverage.gemma_available ? "available" : "SKIP (not built)") << '\n';
+    if (const char* error = g_coverage.error()) throw std::runtime_error(error);
+    if (g_coverage.gemma_only && g_coverage.glm_available) std::cout << "GLM finish: SKIP (Gemma-only requested)\n";
     registry_cases();
     g_report = strix::envcfg::integer("STRIX_WFMT_TRELLIS_REPORT", 0) != 0;
     // STRIX_WFMT_TRELLIS_GEMMA_ONLY=1: only the Gemma cases (one process per STRIX_G4_EXL3_IDENTITY).
-    if (strix::envcfg::integer("STRIX_WFMT_TRELLIS_GEMMA_ONLY", 0) == 0) {
+    if (!g_coverage.gemma_only) {
         input_cases<3>();
         input_cases<4>();
         core_cases<3>();
         core_cases<4>();
     }
 #if defined(STRIX_WFMT_GEMMA) && STRIX_WFMT_GEMMA
-    gemma_cases();
+    if (g_coverage.run_gemma()) {
+        const unsigned before = g_cases;
+        gemma_cases();
+        g_gemma_cases = g_cases - before;
+    }
 #endif
+    std::cout << "Engine execution counts: GLM finish " << g_glm_checks << ", Gemma incumbent " << g_gemma_cases << '\n';
+    std::cout << "Gemma transport-view source: SKIP (fixture exercises incumbent engine only)\n";
+    if (g_coverage.require_engines && (!g_glm_checks || !g_gemma_cases))
+        throw std::runtime_error("required engine checks did not execute");
     std::cout << "HIP EXL3/trellis: " << g_cases << " cases, " << g_failures << " mismatches\n";
     return g_failures ? 1 : 0;
 } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

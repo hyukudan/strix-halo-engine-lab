@@ -100,6 +100,11 @@ def device_view(source):
     return source.replace("__host__ __device__ __forceinline__", "__device__ __forceinline__")
 
 
+SOURCE_DEPENDENCIES = {
+    'materialize': ('__device__ __forceinline__ float materialize(', 'ef6358e037a04bbd077ed8e912dd5d9bb742bf8ae79249d2b6d5094352f7b720'),
+    'half_bits': ('__device__ __forceinline__ float half_bits(', '400a96d242e35c0e5c5ce571d9a3d961cfcc1b59e1ea3ed5164c16d5c9dc9b26')
+}
+
 def main():
     adapter = (ROOT / "src/glm/moe/glm_trellis_device.hpp").read_text()
     # The codec primitives (hash16 .. TileStates) live in the shared codec header; moe_core re-exports them.
@@ -115,6 +120,10 @@ def main():
     for name, (marker, expected) in DEPENDENCIES.items():
         actual = sha256(declaration(shared, marker).encode()).hexdigest()
         assert actual == expected, name + " codec dependency changed"
+    # The moved bodies call helpers in their new namespace, not the old forwarder helpers.
+    for name, (marker, expected) in SOURCE_DEPENDENCIES.items():
+        actual = sha256(declaration(sources, marker).encode()).hexdigest()
+        assert actual == expected, name + " moved transform dependency changed"
     # Permit only imports in the adapter (the split policy is the shared one too).
     remainder = re.sub(r"//[^\n]*", "", adapter)
     remainder = re.sub(r"^using strix::moe_core::\w+;$", "", remainder, flags=re.MULTILINE)

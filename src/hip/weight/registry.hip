@@ -77,8 +77,7 @@ std::span<const SourceRegistration> sources() noexcept {
 }
 #undef STRIX_GSQ_REGISTER
 const SourceRegistration* find_source(FormatId storage,std::string_view protocol) noexcept {
-    for(const auto& s:sources()) if(s.storage==storage && s.protocol==protocol) return &s;
-    return nullptr;
+    return find_unique_source(sources(),storage,protocol);
 }
 const SourceRegistration* find_source(FormatId storage,std::string_view protocol,std::string_view arithmetic) noexcept {
     for(const auto& s:sources()) if(s.storage==storage && s.protocol==protocol && s.arithmetic==arithmetic) return &s;

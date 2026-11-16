@@ -38,6 +38,13 @@ add_test(NAME wfmt.hip-gsq-plan COMMAND strix-wfmt-hip-gsq-plan-tests)
 foreach(case addressing q6-span bytes)
     add_test(NAME wfmt.hip-${case} COMMAND strix-wfmt-hip-admission-tests ${case})
 endforeach()
+add_executable(strix-wfmt-trellis-checks trellis_checks.cpp ${WFMT_ROOT}/src/weight/types.cpp)
+target_include_directories(strix-wfmt-trellis-checks PRIVATE ${WFMT_ROOT}/include)
+target_compile_features(strix-wfmt-trellis-checks PRIVATE cxx_std_20)
+strix_target_warnings(strix-wfmt-trellis-checks)
+foreach(case oracle coverage lookup)
+    add_test(NAME wfmt.trellis-${case} COMMAND strix-wfmt-trellis-checks ${case})
+endforeach()
 add_executable(strix-wfmt-host-tests main.cpp contracts.cpp census.cpp compare.cpp
     reference.cpp geometry.cpp fixtures/iq3_s_cases.cpp
     resolve.cpp cache.cpp effective_config.cpp runtime.cpp readers.cpp admission.cpp reference_admission.cpp cpu.cpp intel.cpp
@@ -169,4 +176,9 @@ if(STRIX_WFMT_BACKEND STREQUAL "hip")
         target_link_libraries(strix-wfmt-hip-trellis-tests PRIVATE strix-weight)
     endif()
     add_test(NAME wfmt.hip-trellis COMMAND strix-wfmt-hip-trellis-tests)
+    # Qualification must opt into this gate; optional developer builds report skips.
+    option(STRIX_WFMT_TRELLIS_REQUIRE_ENGINES "Require GLM and Gemma device coverage" OFF)
+    if(STRIX_WFMT_TRELLIS_REQUIRE_ENGINES)
+        add_test(NAME wfmt.hip-trellis-required-engines COMMAND strix-wfmt-hip-trellis-tests --require-engines)
+    endif()
 endif()

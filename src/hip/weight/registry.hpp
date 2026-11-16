@@ -38,8 +38,8 @@ inline Status validate_trellis_launch(const WeightView& w,const LaunchShape& s,b
         return {Error::unsupported_shape,"HIP trellis source bit width"};
     if(w.shape.rank!=2) return {Error::unsupported_shape,"HIP trellis source needs a rank-2 tensor"};
     const auto n=w.shape.dims[0],k=w.shape.dims[1];
-    if(!n||!k||n%16U||k%16U||n>UINT32_MAX||k>UINT32_MAX||(gemma&&(n%128U||k%128U)))
-        return {Error::unsupported_shape,"HIP trellis source needs complete 16x16 tiles"};
+    if(!n||!k||n%128U||k%128U||n>UINT32_MAX||k>UINT32_MAX)
+        return {Error::unsupported_shape,"HIP trellis source needs complete H128 transform blocks"};
     if(!s.m||s.m>UINT32_MAX||s.n!=n||s.k!=k||s.activation_stride<k||s.output_stride<n)
         return {Error::unsupported_shape,"HIP trellis launch must span the whole tensor"};
     if(s.row_stride_bytes||s.k_offset_bytes)
@@ -70,6 +70,16 @@ struct SourceRegistration {
     Status (*validate)(const WeightView&,const LaunchShape&);
 };
 std::span<const SourceRegistration> sources() noexcept;
+// An omitted arithmetic is safe only when the storage/protocol pair is unique.
+inline const SourceRegistration* find_unique_source(std::span<const SourceRegistration> rows,
+                                                   FormatId storage,std::string_view protocol) noexcept {
+    const SourceRegistration* match=nullptr;
+    for(const auto& s:rows) if(s.storage==storage && s.protocol==protocol) {
+        if(match) return nullptr;
+        match=&s;
+    }
+    return match;
+}
 // Admission scaffolding tested by fixtures; production launchers do not use this
 // table yet. Callers retain incumbent launch and numeric Site policy.
 const SourceRegistration* find_source(FormatId,std::string_view protocol) noexcept;

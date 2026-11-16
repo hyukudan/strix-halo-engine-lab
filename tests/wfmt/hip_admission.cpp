@@ -61,6 +61,15 @@ WeightView trellis_tensor(std::uint64_t n,std::uint64_t k,unsigned bits,bool gem
 // Heterogeneous experts: every resident expert is admitted against its own sidecars, the launch spans the whole ring, and a
 // nominal packed row (K * bits / 8, Gemma's LinearView::row_bytes) is never accepted as a stride.
 void trellis() {
+    // Exact payloads and sidecars, with matching launches: only H128 tails fail.
+    for(bool gemma:{false,true})
+        for(const std::uint64_t n:{16ULL,128ULL,256ULL,272ULL})
+            for(const std::uint64_t k:{16ULL,128ULL,256ULL,272ULL}) {
+                const auto w=trellis_tensor(n,k,gemma?4U:3U,gemma);
+                const LaunchShape shape{1,n,k,0,k,n,0};
+                expect(bool(validate_trellis_launch(w,shape,gemma))==(n%128U==0 && k%128U==0),
+                       "matching trellis shape must contain complete H128 blocks");
+            }
     LaunchShape s{129,256,256,0,256,256,0};
     for(const bool gemma:{false,true}) {
         auto w=trellis_tensor(256,256,4,gemma);
