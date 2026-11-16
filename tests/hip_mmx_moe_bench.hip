@@ -2471,13 +2471,20 @@ struct Bench {
     // Token-major v4 gather (STRIX_MMX_PREFILL_GATHER_TOK) == per-pair gather: raw tile-major xt / at (padded rows
     // included: both start from the 0xff-poisoned workspace), split partials and output bitwise, gufuse off and on.
     void test_prefill_gather() {
-        struct Restore { ~Restore() { opt::set_prefill_gather_tok(-1); } } restore;
+        struct Restore { ~Restore() { opt::set_prefill_gather_tok(-1); opt::set_prefill_gather_prefetch(-1); } } restore;
         auto run = [&](Prefill& q, const std::string& name) {
             for (int gufuse : {0, 1}) {
                 opt::set_prefill_gather_tok(0);
                 const PfDump off = run_dump(q, -1, true, 0, gufuse);
                 opt::set_prefill_gather_tok(1);
+                opt::set_prefill_gather_prefetch(0);
+                const PfDump serial = run_dump(q, -1, true, 0, gufuse);
+                opt::set_prefill_gather_prefetch(1);
                 const PfDump on = run_dump(q, -1, true, 0, gufuse);
+                opt::set_prefill_gather_prefetch(-1);
+                const bool pre = serial.part == on.part && serial.xt == on.xt && serial.at == on.at && same_bits(serial.out, on.out);
+                check(pre, "gather_tok " + name + " gufuse=" + std::to_string(gufuse) + " prefetch differs from the serial loop");
+                std::printf("gather_tok %s gufuse=%d: prefetch vs serial %s\n", name.c_str(), gufuse, pre ? "bitwise" : "DIFF");
                 const bool part = off.part == on.part, xt = off.xt == on.xt, at = off.at == on.at, out = same_bits(off.out, on.out);
                 const std::string cell = "gather_tok " + name + " gufuse=" + std::to_string(gufuse);
                 check(part && xt && at && out, cell + " differs (part " + std::to_string(part) + " xt " + std::to_string(xt) +
@@ -2506,6 +2513,15 @@ struct Bench {
             // Whole calls, A = per-pair gather, B = token-major gather (production v4 otherwise).
             aba(cell + " pair/tok", 0, [&](int) { opt::set_prefill_gather_tok(0); prefill_B(q); },
                 [&](int) { opt::set_prefill_gather_tok(1); prefill_B(q); });
+            // Token-major gather, A = serial per-pair loop, B = prefetched pairs (production default).
+            opt::set_prefill_gather_tok(1);
+            aba(cell + " serial/prefetch", 0, [&](int) { opt::set_prefill_gather_prefetch(0); prefill_B(q); },
+                [&](int) { opt::set_prefill_gather_prefetch(1); prefill_B(q); });
+            for (int pre : {0, 1, 0, 1, 0, 1}) {
+                opt::set_prefill_gather_prefetch(pre);
+                stage_split(q, cell + (pre ? " prefetch" : " serial"), 1);
+            }
+            opt::set_prefill_gather_prefetch(-1);
             o.iters = saved;
             for (int tok : {0, 1, 0, 1}) {
                 opt::set_prefill_gather_tok(tok);

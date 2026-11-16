@@ -34,6 +34,7 @@
 //   --xb-check PROMPT.u32:K:N[:v]                exchange boundary check: decode logits of the 4 (wait, inplace) configurations bitwise == 00 (N slots, or :v one N-row verify window)
 //                                                    (pfgufuse: single-split gate/up fusion off/on; 7 prefills with state and final-row hashes)
 //                                                    (pftails: MoE tail classes on the caller's stream vs beside MT8 on a side stream; 7 hashed prefills)
+//                                                    (pfgpre: token-major MoE gather serial vs prefetched pairs; 7 hashed prefills)
 //                                                    (pfpair: paired MT8 PIPE bands off vs auto (calls >= 2048 rows); 7 hashed prefills)
 //                                                    (pftab: pinned prefill MoE tables off/on; 7 prefills with state and final-row hashes)
 //                                                    (mtfit: v4 row tiles, off/on; 7 prefills with state and final-row hashes)
@@ -1190,6 +1191,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
         else if (flag == "pftab") eng.set_prefill_table_ring(on ? 1 : 0);
         else if (flag == "pfgufuse") eng.set_prefill_gufuse(on ? 1 : 0);
         else if (flag == "pftails") strix::minimax::moe::opt::set_prefill_tail_stream(on ? 1 : 0);
+        else if (flag == "pfgpre") strix::minimax::moe::opt::set_prefill_gather_prefetch(on ? 1 : 0);
         else if (flag == "pfpair") strix::minimax::moe::opt::set_prefill_pipe_pair(on ? 2 : 0);
         else if (flag == "pfil") eng.set_prefill_interleave(on);
         else if (flag == "pfxip") eng.set_prefill_inplace(on);
@@ -1258,9 +1260,9 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     std::vector<double> ttft[2], step_ms[2];
     std::vector<std::uint32_t> first(6);
     std::vector<std::uint64_t> states, outs;  // per arm: K/V/IK state FNV, final-rows FNV (this rank only; never in the cross-rank hash)
-    const bool hash_state = ((flag == "pfattn4" || flag == "pfmsa" || flag == "pfheadless" || flag == "x16fmt" || flag == "pfdensemlp" || flag == "pfflashkeys" || flag == "pfmsaflash" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall")) || (state_fnv_on() && (flag == "pfx" || flag == "pfil" || flag == "pfxip" || std::getenv("STRIX_MM_AB_STATE") != nullptr));
+    const bool hash_state = ((flag == "pfattn4" || flag == "pfmsa" || flag == "pfheadless" || flag == "x16fmt" || flag == "pfdensemlp" || flag == "pfflashkeys" || flag == "pfmsaflash" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfgpre" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall")) || (state_fnv_on() && (flag == "pfx" || flag == "pfil" || flag == "pfxip" || std::getenv("STRIX_MM_AB_STATE") != nullptr));
     // pfattn4 / pfmsa / pfmsarework / mtfit / core8 / pftab / pfgufuse / pfidx / pftxuc / pfrouter / pfidxconc / pfkvtile / pftiled: A B A B A B A (every B bracketed by two A prefills); the other prefill flags: A B A B A B
-    const int prefills = flag == "attn" || flag == "linears" || flag == "xfer" || flag == "idxdec" || flag == "idxconc" || flag == "xbfold" || flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbpub" || flag == "xbwarm" || flag == "xbwarmo" || flag == "moegrid" || flag == "moepipe" || flag == "xbilp" || flag == "xbset" ? 1 : (flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall" || flag == "pfi4") ? 7 : 6;  // idxattn: both  // decode-only flags: one prefill, no TTFT cells
+    const int prefills = flag == "attn" || flag == "linears" || flag == "xfer" || flag == "idxdec" || flag == "idxconc" || flag == "xbfold" || flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbpub" || flag == "xbwarm" || flag == "xbwarmo" || flag == "moegrid" || flag == "moepipe" || flag == "xbilp" || flag == "xbset" ? 1 : (flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfgpre" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall" || flag == "pfi4") ? 7 : 6;  // idxattn: both  // decode-only flags: one prefill, no TTFT cells
     first.resize(static_cast<std::size_t>(prefills));
     std::vector<std::uint64_t> dense_mlp_calls;
     for (int r = 0; r < prefills; ++r) {
@@ -1336,6 +1338,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     else if (flag == "pftab") eng.set_prefill_table_ring(-1);
     else if (flag == "pfgufuse") eng.set_prefill_gufuse(-1);
     else if (flag == "pftails") strix::minimax::moe::opt::set_prefill_tail_stream(-1);
+    else if (flag == "pfgpre") strix::minimax::moe::opt::set_prefill_gather_prefetch(-1);
     else if (flag == "pfpair") strix::minimax::moe::opt::set_prefill_pipe_pair(-1);
     else if (flag == "pfrouterrows") {
         eng.set_prefill_router_batch(rtr0);
