@@ -111,8 +111,17 @@ host RAM, LRU-evicted; row segments are shared between checkpoints of the same p
 `qwen_quant_device_test` (GGUF decoders against the host reference), and the `qwen_decode_bench` timing bench. Prefix cache: `qwen_prefix_cache_host_test` (planner, identity,
 store, slab pool, batched capture) and `qwen_prefix_cache_e2e`.
 
-Profiles: `--profile exact|default|fast|quality` and the lever options (`--hc-mma`, `--mtp-mma`, `--qsa-mma`,
-`--prefill-moe-route-bf16`; env `STRIX_QRTX_HC_MMA` / `_MTP_MMA` / `_QSA_MMA`) are parsed by one shared parser
+Profiles: `--profile exact|default|fast|quality` and the lever options (`--hc-mma`, `--mtp-mma`, `--qsa-mma`, `--moe-mma`,
+`--prefill-moe-route-bf16`; env `STRIX_QRTX_HC_MMA` / `_MTP_MMA` / `_QSA_MMA` / `_MOE_MMA`) are parsed by one shared parser
 (`include/strix/cuda/qwen_options.hpp`) and resolved by the shared Qwen profile resolver over the CUDA rows in
 `include/strix/profiles/qwen_cuda.hpp`; `--print-effective-config` prints the result, with the serve-only values named and
 explained. FAST quality gate kit: `scripts/bench/cuda/qwen_fast/README.md` (`qwen_tf_logits`, `gate.sh`); host test `qwen_cuda_profile_host_test`.
+
+FAST prefill forms (`--profile fast`, each with its own off switch; the exact path is byte-identical when a form is off):
+the HC projection/output and the MTP fused projection on FP16 tensor cores (quantised codes are exact in FP16, FP32
+accumulation, per-32-K-block FP32 scale), QSA attention scores/softmax/values on BF16 tensor cores (the KV cache is
+BF16), and the MoE prefill project/down GEMMs with one FMA scale chain per output on int8 tensor cores. Shared tile
+code: `src/cuda/core/mma_tile.cuh`, `src/cuda/core/attention_tile.cuh`, `src/cuda/core/imma_tile.cuh`. Gate receipt:
+`gate.sh` run `fast-20261116015045` (12 prompts at 2K/8K/32K, 128 teacher-forced rows each): pooled KL 0.0091,
+top-1 0.986, dNLL +0.0026. Exact lever: the dense projection runs `project_tile2_kernel` (same FP32 chain per output,
+bitwise) by default; `STRIX_QRTX_DENSE_TILE2=0` restores the first tiled kernel.
