@@ -33,6 +33,12 @@ done
 if [ -z "$tf" ] || [ -z "$out" ] || [ ${#prompts[@]} -eq 0 ]; then sed -n 2,10p "$0" >&2; exit 2; fi
 [ -x "$tf" ] || { echo "not executable: $tf" >&2; exit 2; }
 mkdir -p "$out"
+# Profile arms must not inherit numerical overrides or profile-export provenance.
+for key in STRIX_QRTX_HC_MMA STRIX_QRTX_MTP_MMA STRIX_QRTX_QSA_MMA STRIX_QRTX_MOE_MMA \
+           STRIX_QPF2K_MOE_ROUTE_BF16 STRIX_QPF2K_QSA_BUDGET STRIX_QPF2K_GDN_FP16_CHUNK \
+           STRIX_QWEN_PROFILE_ALLOW_PENDING ${!STRIX_QWEN_PROFILE_OWNED_@}; do
+    unset "$key"
+done
 stamp=$(date +%Y%m%d%H%M%S)
 seal_prompts=() cmp_tokens=()
 for p in "${prompts[@]}"; do seal_prompts+=(--prompt "$p"); cmp_tokens+=(--tokens "$p"); done
@@ -46,10 +52,36 @@ run_arm() {  # arm profile extra...
     $wrap "$tf" "${engine[@]}" --profile "$profile" "$@" --rows "$rows" --out "$dir" --prefix q > "$out/$arm.log" 2>&1 \
         || { tail -n 20 "$out/$arm.log" >&2; echo "arm $arm failed (see $out/$arm.log)" >&2; exit 2; }
     tail -n 12 "$out/$arm.log"
+    # This file comes from the executing process, not a separate inspection launch.
+    local effective
+    effective=$("$python_bin" - "$dir/effective-config.json" "$arm" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding='utf-8') as f:
+    c = json.load(f)
+forms = c['forms']
+names = ['hc_mma', 'mtp_mma', 'qsa_mma', 'moe_mma']
+if set(forms) != set(names + ['moe_route_bf16']) or any(type(v) is not bool for v in forms.values()):
+    raise SystemExit('invalid resolved forms')
+fast = any(forms.values())
+contract = 'qwen-cuda;prefill=exact'
+if fast:
+    contract = ('qwen-cuda;prefill=fast;forms=' + (','.join(n for n in names if forms[n]) or 'none')
+                + ';moe_route_bf16=' + str(int(forms['moe_route_bf16'])))
+ids = ['qwen-cuda-hc-f16mma-v1', 'qwen-cuda-mtp-f16mma-v1',
+       'qwen-cuda-qsa-f16mma-v1', 'qwen-cuda-moe-i8fma-v1']
+if (c['entry'] != 'serve' or c['arithmetic_contract'] != contract
+        or c['form_identities'] != ','.join(i for n, i in zip(names, ids) if forms[n])
+        or fast != (sys.argv[2] == 'fast')):
+    raise SystemExit('arm does not match resolved arithmetic contract')
+print(json.dumps(c, sort_keys=True, separators=(',', ':')))
+PY
+    ) || { echo "invalid effective configuration for $arm" >&2; exit 2; }
     "$python_bin" "$gate_py" seal --dir "$dir" --rank 0 --arm "$arm" --run-id "$arm-$stamp" --binary "$tf" --rows "$rows" \
-        --prefix q "${seal_prompts[@]}" --env "profile=$profile" --env "extra=$*"
+        --prefix q "${seal_prompts[@]}" --env "profile=$profile" --env "extra=$*" --env "effective_config=$effective"
 }
-run_arm exact exact
+# Last CLI values win, including over common arguments after --.
+run_arm exact exact --hc-mma off --mtp-mma off --qsa-mma off --moe-mma off \
+    --prefill-moe-route-bf16 off --qsa-budget off --gdn-fp16-chunk off --output-head-profile off
 # shellcheck disable=SC2086
 run_arm fast fast $fast_args
 echo "== compare exact (reference) vs fast"

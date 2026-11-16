@@ -9,10 +9,15 @@ Pieces
   the gated configuration is the one the server runs.
 - `gate.sh`: runs the exact and the fast arm, seals both with `tools/strix-gate/fast_logit_gate.py`, compares, prints the
   KL / top-1 / dNLL verdict (limits default to KL <= 0.02, top-1 >= 0.93, dNLL <= 0.01).
+  Inherited numerical overrides are cleared; the reference forces every form OFF. Each executing arm writes
+  `effective-config.json`; the gate validates its forms/contract and includes that JSON in the seal.
 - `prefill_abab.sh` + `prefill_client.py`: strict ABAB server prefill arms (fresh server per arm, cold and warm prefill
   per length, GPU clock / busy samples). Env: SERVE, MODEL, TABLES, ROPE, IDS, OUT, ARMS (`name|ENV=v|--flags ;; ...`),
   optional MTP, VOCAB, PORT, GPU_INDEX, LIMIT_S, CLIENT_ARGS, COMMON; summary in `$OUT/summary.txt`. Run it inside the GPU
   ownership wrapper of your lab.
+  The client owns and cleans up only its launched child; occupied ports and early child exits fail the arm.
+  Prefix caching is forced OFF and samples require a reported zero cached-token count. Supply at least
+  `runs * sum(lens)` input IDs: slices are disjoint, never truncated or wrapped (81,920 IDs for the defaults).
 - `mkprompt.py`: builds `NAME.u32` token files from .u32 files, id lists or text (text is tokenised with `strix-tokenize`,
   the server's tokenizer, against a GGUF; nothing is downloaded).
 
@@ -30,3 +35,6 @@ Use
 `--print-effective-config` prints the resolved profile (levers with status, forms, serve differences, arithmetic contract).
 Each prompt needs rows + 2 <= tokens <= `--max-positions` (default 32768). Dump layout: `q-NAME-tf-r0.f32` = [rows][vocab] FP32.
 Exit codes of gate.sh: 0 pass, 1 fail, 2 identity or input error.
+
+This target-logit gate does not qualify MTP draft/cache fidelity or speculative acceptance. MTP forms remain
+provisional until a separate draft/cache check and a complete speculative-workload gate pass on native hardware.

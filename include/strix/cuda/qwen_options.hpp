@@ -4,6 +4,7 @@
 // Config for its entry, and names every value that differs between entries (serve_differences) with its reason.
 #include "strix/cuda/qwen_prefill.hpp"
 #include "strix/profiles/qwen_cuda.hpp"
+#include "strix/env_flags.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -100,6 +101,16 @@ inline void apply(const cp::Choice& choice, qp::Config& config) {
     config.moe_route_bf16 = choice.moe_route_bf16;  // explicit: the resolver already read the environment
 }
 
+inline qp::Config resolve_route(qp::Config config, const pr::Lookup& lookup = {}) {
+    if (!config.route_policy) {
+        const auto get = [&](const char* key) { return lookup ? lookup(key) : ::strix::envcfg::text(key); };
+        config.route_policy = ::strix::cuda::qwen_route::resolve(config.moe_route_bf16, get("STRIX_QPF2K_MOE_ROUTE_BF16"),
+            get("STRIX_BASELINE"), get("STRIX_QPF2K_DEFAULTS"), get("STRIX_PREFILL_EXACT_FP16"));
+    }
+    config.moe_route_bf16 = config.route_policy->enabled;
+    return config;
+}
+
 inline Resolved resolve(const Request& r, Entry entry, std::string_view default_model = {}) {
     Resolved out;
     out.entry = entry;
@@ -108,6 +119,16 @@ inline Resolved resolve(const Request& r, Entry entry, std::string_view default_
     out.resolution = cp::resolve(r.profile.value_or(pr::Name::standard), r.inputs);
     out.choice = cp::choose(out.resolution);
     apply(out.choice, c);
+    c.route_policy.reset(); // a new request resolves its supplied environment once
+    c = resolve_route(std::move(c), r.inputs.env);
+    out.choice.moe_route_bf16 = c.route_policy->enabled;
+    if (c.route_policy->requested && !c.route_policy->enabled) {
+        for (auto& row : out.resolution.entries) if (row.lever->name == "moe_route_bf16") {
+            row.value = "0";
+            row.status = pr::Status::off;
+            row.reason = c.route_policy->reason;
+        }
+    }
     out.contract = cp::arithmetic_contract(out.choice);
     const auto name = [&](std::string n, std::string v, std::string why) { out.differences.push_back({std::move(n), std::move(v), std::move(why)}); };
     if (entry == Entry::serve) {
@@ -146,6 +167,11 @@ inline std::string effective_config_json(const Resolved& r) {
     forms.set("moe_mma", J(c.forms.moe_mma));
     forms.set("moe_route_bf16", J(c.moe_route_bf16.value_or(false)));
     out.set("forms", std::move(forms));
+    auto route = J::object();
+    route.set("requested", J(c.route_policy->requested));
+    route.set("effective", J(c.route_policy->enabled));
+    route.set("reason", J(std::string(c.route_policy->reason)));
+    out.set("route_storage", std::move(route));
     out.set("form_identities", J(cp::form_identities(r.choice)));
     out.set("resolution", ::strix::serve::parse_json(r.resolution.json()));
     auto notices = J::array();
@@ -183,6 +209,18 @@ inline constexpr std::uint64_t fnv64(std::string_view s) {
 }
 inline cp::Choice choice_of(const qp::Config& c) {
     return {c.moe_route_bf16.value_or(false), c.forms.hc_mma, c.forms.mtp_mma, c.forms.qsa_mma, c.forms.moe_mma};
+}
+// Preserve historical route-only bytes; every enabled prefill form changes the snapshot target.
+inline ::strix::cuda::qwen_route::Identity numerical_identity(const qp::Config& c) {
+    namespace route = ::strix::cuda::qwen_route;
+    const bool bf16 = c.moe_route_bf16.value_or(false);
+    auto id = route::identity(bf16, bf16);
+    const auto forms = cp::form_identities(choice_of(c));
+    if (!forms.empty()) {
+        id.prefill = "cuda-qwen-a8-prefill+forms-v1";
+        id.hash = route::hash_part(id.hash, forms);
+    }
+    return id;
 }
 // Hand-off producer id: the exact CUDA path keeps its historical id bytes; a FAST arithmetic folds its contract in, so an
 // exact-identity node refuses a FAST state (different producer id).

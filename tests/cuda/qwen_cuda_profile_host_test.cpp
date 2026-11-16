@@ -5,6 +5,7 @@
 #include "strix/cuda/qwen_prefix_identity.hpp"
 
 #include <cstdio>
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -264,6 +265,60 @@ void effective_config() {
     const auto cli = qo::effective_config_json(one({}, qo::Entry::cli));
     check(at(strix::serve::parse_json(cli), "serve_differences").as_array().empty(), "cli names no serve differences");
 }
+
+void route_governors() {
+    const auto off = one({}, qo::Entry::serve);
+    for (unsigned mask = 0; mask < 8; ++mask) {
+        const auto r = one({"--prefill-moe-route-bf16", "on"}, qo::Entry::cli,
+            {{"STRIX_BASELINE", (mask & 1U) ? "1" : "0"},
+             {"STRIX_QPF2K_DEFAULTS", (mask & 2U) ? "0" : "1"},
+             {"STRIX_PREFILL_EXACT_FP16", (mask & 4U) ? "1" : "0"}});
+        check(r.choice.moe_route_bf16 == (mask == 0), "all governor combinations");
+    }
+    for (const auto& [key, value, reason] : {
+        std::array<const char*, 3>{"STRIX_BASELINE", "1", "baseline"},
+        std::array<const char*, 3>{"STRIX_QPF2K_DEFAULTS", "0", "qpf2k-defaults-off"},
+        std::array<const char*, 3>{"STRIX_PREFILL_EXACT_FP16", "1", "exact-master"}}) {
+        for (const auto entry : {qo::Entry::serve, qo::Entry::prefill_service, qo::Entry::cli}) {
+            for (const bool cli : {false, true}) {
+                const Env env{{key, value}, {"STRIX_QPF2K_MOE_ROUTE_BF16", "1"}};
+                const auto r = one(cli ? Args{"--prefill-moe-route-bf16", "on"} : Args{}, entry, env);
+                check(r.config.route_policy->requested && !r.config.route_policy->enabled, "governor suppresses requested storage");
+                check(r.config.route_policy->reason == reason, "governor reason");
+                check(!r.choice.moe_route_bf16 && r.contract == off.contract, "effective contract is exact");
+                check(!cp::choose(r.resolution).moe_route_bf16, "lever resolution is effective");
+                check(qo::handoff_numerical_id("old", r.choice) == qo::handoff_numerical_id("old", off.choice), "exact handoff restored");
+                const auto frozen = qo::resolve_route(r.config, [](const char*) -> const char* {
+                    throw std::runtime_error("resolved engine must not re-read environment");
+                });
+                check(!frozen.moe_route_bf16.value(), "execution retains resolved OFF");
+                const auto json = strix::serve::parse_json(qo::effective_config_json(r));
+                const auto* policy = json.find("route_storage");
+                check(policy->find("requested")->as_bool() && !policy->find("effective")->as_bool(), "requested and effective reported separately");
+            }
+        }
+    }
+    const auto on = one({"--prefill-moe-route-bf16", "on"}, qo::Entry::cli);
+    const auto frozen = qo::resolve_route(on.config, [](const char*) { return "1"; });
+    check(frozen.moe_route_bf16.value(), "execution retains resolved ON despite changed process environment");
+    check(!one({"--prefill-moe-route-bf16", "off"}, qo::Entry::cli,
+               {{"STRIX_QPF2K_MOE_ROUTE_BF16", "1"}}).config.route_policy->requested, "CLI OFF wins");
+}
+
+void snapshot_forms() {
+    std::set<std::uint64_t> hashes;
+    for (unsigned mask = 0; mask < 32; ++mask) {
+        qp::Config c;
+        c.moe_route_bf16 = (mask & 16U) != 0;
+        c.forms = {(mask & 1U) != 0, (mask & 2U) != 0, (mask & 4U) != 0, (mask & 8U) != 0};
+        const auto id = qo::numerical_identity(c);
+        check(hashes.insert(id.hash).second, "every form set has a distinct snapshot identity");
+        if ((mask & 15U) == 0) {
+            const auto legacy = strix::cuda::qwen_route::identity(mask != 0, mask != 0);
+            check(id.hash == legacy.hash && id.prefill == legacy.prefill, "no forms preserves historical identity");
+        }
+    }
+}
 }  // namespace
 
 int main() {
@@ -273,6 +328,8 @@ int main() {
         common_options();
         identities();
         effective_config();
+        route_governors();
+        snapshot_forms();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "exception: %s\n", e.what());
         return 2;

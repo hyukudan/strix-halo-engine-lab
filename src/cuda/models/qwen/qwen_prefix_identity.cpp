@@ -1,4 +1,5 @@
 #include "strix/cuda/qwen_prefix_identity.hpp"
+#include "strix/cuda/qwen_options.hpp"
 #include "strix/cuda/qwen_cohort.hpp"
 #include "strix/cuda/qwen_prefix_plan.hpp"
 
@@ -50,7 +51,7 @@ IdentityFields identity_fields(const qwen_prefill::Config& c, std::uint32_t bloc
     put("layout", "qwen-rtx-prefix-v1");
     // Preserve every OFF key byte. Experimental identities have their own pair
     // even while candidate cache admission is refused.
-    if (qwen_route::environment(c.moe_route_bf16).enabled) {
+    if (qwen_options::resolve_route(c).route_policy->enabled) {
         const auto id = qwen_route::identity(true, true);
         put("target.prefill", std::string(id.prefill));
         put("target.decode", std::string(id.decode));
