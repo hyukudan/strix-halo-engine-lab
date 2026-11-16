@@ -31,6 +31,9 @@ bool wfmt_readers_test() try {
     WeightMap vision_owned;
     {
         auto vision_source=memory_source(gg);auto vision_stream=source_stream(vision_source);auto info=strix::gguf::read(*vision_stream,gg.size());
+        auto malformed=info;malformed.tensors[0].dimensions={1,1,1,2,32};TensorIndex impossible;
+        const auto rank_status=index_gguf(malformed,vision_source,impossible);check(!rank_status && rank_status.code==Error::unsupported_shape,"externally supplied GGUF rank is bounded before copying axes");
+        bool rank_refused=false;try{strix::vision::GgufWeights bad(malformed,gg);(void)bad.tensor("a.weight");}catch(const std::invalid_argument&){rank_refused=true;}check(rank_refused,"vision rejects over-rank external metadata before indexing fixed axes");
         strix::vision::GgufWeights legacy_vision(std::move(info),std::move(gg));const auto tensor=legacy_vision.tensor("a.weight");
         check(tensor.rows==2 && tensor.cols==32,"vision legacy shape unchanged");
         check(std::memcmp(tensor.data,legacy_vision.bytes().data()+payload,128)==0,"vision legacy operand bytes unchanged");

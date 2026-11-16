@@ -1566,6 +1566,7 @@ private:
             serve_lever_lines();
             static_cast<void>(hip_mtp_take_serve_draft_ms());
         }
+        const std::uint64_t windows_before = stats_.cohort.cohort_windows;
         const auto runtime_done = [&](std::span<const HipMtpGreedyCycleResult> results) {
             if (!receipt_on) return;
             const auto now = clock::now();
@@ -1583,8 +1584,27 @@ private:
                 useful += std::min(rows, 1U + r.proposed_candidates);
                 for (std::uint32_t d = 1; d <= r.proposed_candidates; ++d) receipt.add_draft_depth(d);
                 receipt.emitted += static_cast<std::uint32_t>(r.emitted_tokens.size());
+                // A lane that verified in a forward of its own, by reason (one decoding lane: single).
+                if (rows && !r.shared.verify_members) {
+                    using R = serve::CycleSoloReason;
+                    const auto why = results.size() == 1U ? R::single : [&] {
+                        switch (r.shared.verify_decline) {
+                        case MtpCohortVerifyDecline::no_rows: return R::no_rows;
+                        case MtpCohortVerifyDecline::wide: return R::wide;
+                        case MtpCohortVerifyDecline::padding: return R::padding;
+                        case MtpCohortVerifyDecline::no_owner: return R::no_owner;
+                        default: return R::alone;
+                        }
+                    }();
+                    ++receipt.solo[static_cast<std::size_t>(why)];
+                }
             }
             receipt.set_rows(physical, useful);
+            for (const auto& s : slots_) receipt.admitted += s->active ? 1U : 0U;
+            // Count shared execution once, plus every own window attempt and serial dispatch.
+            std::uint64_t forwards = stats_.cohort.cohort_windows - windows_before;
+            for (const auto& r : results) forwards += r.target_forwards;
+            receipt.forwards = static_cast<std::uint32_t>(std::min<std::uint64_t>(forwards, UINT32_MAX));
         };
         const auto receipt_done = [&] {
             if (!receipt_on) return;

@@ -9,6 +9,7 @@ struct FamilySchema {
     bool text_only;
     std::span<const FormatId> lookup;
     bool unsigned_trellis=false;
+    bool fixed_mul1=false;
 };
 Status bind_model(const TensorIndex&,const FamilySchema&,WeightMap&);
 }

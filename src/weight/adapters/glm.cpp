@@ -8,7 +8,7 @@ Status bind_glm(const TensorIndex& index,WeightMap& out) {
     {"q_proj",Role::attention_q},{"attn_q",Role::attention_q},{"k_proj",Role::attention_k},{"attn_k",Role::attention_k},
     {"v_proj",Role::attention_v},{"attn_v",Role::attention_v},{"o_proj",Role::attention_o},{"attn_output",Role::attention_o},
     {"down",Role::dense_down},{"gate",Role::dense_gate},{"up",Role::dense_up}};
-    const detail::FamilySchema schema{"glm",linear,plain,roles,true,false,false,false};
+    const detail::FamilySchema schema{"glm",linear,plain,roles,true,false,false,false,{},false,true};
     return detail::bind_model(index,schema,out);
 }
 }
