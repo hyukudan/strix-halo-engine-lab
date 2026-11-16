@@ -870,7 +870,7 @@ public:
         std::uint64_t vocabulary, std::uint64_t capacity, strix::SerialSessionContext& session,
         std::shared_ptr<const strix::HipSetupQuiescenceGuard> guard,
         std::span<const std::uint32_t> teacher_inputs = {}, std::string teacher_logits_path = {},
-        std::uint64_t effective_max_positions = 262144U)
+        std::uint64_t effective_max_positions = 262144U, std::span<const std::uint64_t> teacher_logits_rows = {})
         : target_(target), ids_(ids.begin(), ids.end()), teacher_inputs_(teacher_inputs.begin(), teacher_inputs.end()),
           vocabulary_(vocabulary), maximum_rows_(teacher_inputs.empty() ? capacity : teacher_inputs.size() - 1U),
           session_(session), guard_(std::move(guard)) {
@@ -883,7 +883,10 @@ public:
         rows_.reserve(static_cast<std::size_t>(maximum_rows_));
         if (!teacher_logits_path.empty()) {
             if (teacher_inputs_.empty()) throw std::invalid_argument("teacher logits file requires retained teacher inputs");
-            spool_ = std::make_unique<strix::TeacherLogitSpool>(teacher_logits_path,vocabulary_,teacher_inputs_);
+            spool_ = std::make_unique<strix::TeacherLogitSpool>(teacher_logits_path,vocabulary_,teacher_inputs_,
+                teacher_logits_rows);
+        } else if (!teacher_logits_rows.empty()) {
+            throw std::invalid_argument("teacher logits rows require a teacher logits file");
         }
     }
     std::vector<float> execute(std::uint32_t token, std::uint64_t position) override {
@@ -1422,7 +1425,7 @@ static int run_decode_entry(
     // Bind supplied numerical settings; operational paths, switches and budgets are excluded.
     const std::set<std::string_view> session_io_options{"--session-save", "--session-load", "--session-then-prompt", "--session-logits",
         "--session-cache", "--session-disk", "--session-disk-bytes", "--session-first-generate", "--session-capture-host-bytes", "--session-dir", "--session-ram-bytes", "--session-max-parked", "--http-port",
-        "--generate", "--tokens-file", "--record-raw", "--reference", "--teacher-logits-file",
+        "--generate", "--tokens-file", "--record-raw", "--reference", "--teacher-logits-file", "--teacher-logits-rows",
         "--prefix-cache-inflight", "--prefix-cache-disk", "--prefix-cache-durable", "--deploy", "--deploy-check"};
     // Not part of the window-cost table key: prompts, per-run outputs and HTTP front-end settings.
     const std::set<std::string_view> cost_table_skip{"--prompt-ids", "--seqs-file", "--json", "--qual-dump", "--session-dump",
@@ -5532,7 +5535,7 @@ static int run_decode_entry(
             requested_logprobs = std::make_unique<RequestedLogprobBackend>(backend, options.logprob_token_ids,
                 model.vocab_size, options.context_tokens, session, original_work_device,
                 options.teacher_forced_score ? std::span<const std::uint32_t>{options.tokens} : std::span<const std::uint32_t>{},
-                options.teacher_logits_path, model.effective_max_positions());
+                options.teacher_logits_path, model.effective_max_positions(), options.teacher_logits_rows);
         strix::SerialGreedyStepBackend* generation_backend = requested_logprobs
             ? static_cast<strix::SerialGreedyStepBackend*>(requested_logprobs.get())
             : static_cast<strix::SerialGreedyStepBackend*>(&backend);
@@ -6493,7 +6496,10 @@ static int run_decode_entry(
         if (requested_logprobs) {
             if (!options.teacher_logits_path.empty())
                 std::cout << "  \"teacher_logits_file\":\"" << strix::decode_receipt::escape_json_string(options.teacher_logits_path)
-                    << "\",\n  \"teacher_logits_scope\":\"complete-finite-full-vocabulary-F32-scored-N-minus-1-rows-with-teacher-IDs-and-completion-footer\",\n";
+                    << "\",\n  \"teacher_logits_scope\":\"" << (options.teacher_logits_rows.empty()
+                        ? "complete-finite-full-vocabulary-F32-scored-N-minus-1-rows-with-teacher-IDs-and-completion-footer"
+                        : "complete-finite-full-vocabulary-F32-selected-rows-of-N-minus-1-scored-with-teacher-IDs-and-completion-footer")
+                    << "\",\n  \"teacher_logits_rows\":" << options.teacher_logits_rows.size() << ",\n";
             const auto previous_precision = std::cout.precision(17);
             std::cout << "  \"requested_logprobs_scope\":\""
                       << (options.teacher_forced_score ? "teacher-forced-next-input-diagnostic-N-minus-1-rows-not-a-speed-run" :
