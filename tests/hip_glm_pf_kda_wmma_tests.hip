@@ -171,6 +171,9 @@ int main() {
         run_case(rng, 4096, {128, 128, 32}, 4096, true);
         run_case(rng, 128, {8192}, 4096, true);
         run_case(rng, 128, {4096}, 4096, true);
+        // Pair shapes (32 KDA heads per rank) at 8192 rows: regime of the in-app chunk when it is not split.
+        run_case(rng, 4096, {128, 128, 32}, 8192, true);
+        run_case(rng, 128, {4096}, 8192, true);
         for (void* p : allocs) (void)hipFree(p);
         std::printf("glm pf kda wmma: %u checks, %u failures\n", checks, failures);
         return failures ? 1 : 0;
