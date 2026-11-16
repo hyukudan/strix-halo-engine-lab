@@ -3333,6 +3333,15 @@ static bool enqueue_fast_dense(const Q8A8DensePrefillView& v, void* stream) {
     hip_check(hipGetLastError(), "Q8_0 x A8 FP16 dense launch");
     return true;
 }
+bool q8_0_a8_fast_core_supported(const Q8A8DensePrefillView& v) {
+    return v.k_parts == 1U && !v.accumulate && v.a8_codes == nullptr && strix::core::f16_dense_tall::q8a8::supported(fast_dense_view(v));
+}
+bool enqueue_q8_0_a8_fast_core(const Q8A8DensePrefillView& v, void* stream) {
+    if (!q8_0_a8_fast_core_supported(v)) return false;
+    strix::core::f16_dense_tall::q8a8::enqueue_parts(fast_dense_view(v), 1U, as_stream(stream));
+    hip_check(hipGetLastError(), "Q8_0 x A8 FP16 core launch (shared expert)");
+    return true;
+}
 
 bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) {
     require(v.weight && v.codes && v.deltas && v.out && v.count && v.rows && v.width && v.width % 32U == 0 && v.x_stride >= v.width &&

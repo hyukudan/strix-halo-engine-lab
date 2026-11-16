@@ -263,6 +263,12 @@ void set_fast_dense(int mode);
 void set_fast_engram(int mode);
 // Returns true when the outputs' A8 (a8_codes) was written.
 bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& view, void* stream);
+// FAST lever ds41-shared-f16-v1 (the prefill shared expert on the FAST dense core): one Q8_0 x A8 product on the shared
+// FP16 WMMA core of policy dense-q8a8-f16-v1, whatever the FAST dense switch (one K part, no accumulate, no A8 output).
+// enqueue returns false and enqueues nothing when the core does not take the view: check every product of the expert
+// with q8_0_a8_fast_core_supported first, so an expert is either wholly FAST or wholly exact.
+bool q8_0_a8_fast_core_supported(const Q8A8DensePrefillView& view);
+bool enqueue_q8_0_a8_fast_core(const Q8A8DensePrefillView& view, void* stream);
 // F16 projection (weight [count rows of width]): out[r * out_stride + o] = f16_row_dot(row first + o, x_r),
 // any number of rows (above 8 a tiled kernel with the same lane classes and butterfly, so the same bits).
 struct F16RowsView {

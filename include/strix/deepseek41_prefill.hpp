@@ -47,6 +47,11 @@ struct PrefillOptions {
     // projection on the shared FP16 WMMA core; views with an x that would overflow FP16 keep the exact kernel.
     // Resolved at construction (option OR environment), then passed per execution; the precision setter replaces it.
     bool fast_engram = false;
+    // FAST lever ds41-shared-f16-v1 (STRIX_DS41_FAST_SHARED=1, explicit, not in the FAST bundle until its gate receipt): the
+    // shared expert's gate, up and down on the FAST dense core (FP16 WMMA, dense-q8a8-f16-v1) with the exact epilogue
+    // (swiglu_a8) between them, as the CUDA backend's FAST shared expert; calls under STRIX_DS41_FAST_DENSE_MIN_ROWS rows and
+    // views the core does not take keep the exact expert kernels. Resolved like fast_engram.
+    bool fast_shared = false;
     // Diagnostics/selection for the non-exact paths (no effect while both switches above are off, except null_ulp_layer):
     // projection bits 1 q_a, 2 kv, 4 q_b, 8 o_a, 16 o_b; layers [approx_layer_first, approx_layer_end); FP16 only at
     // calls of at least fp16_min_rows rows; fp16_keep_a8: FP16 operands from the A8 codes (the exact path's activations)
@@ -368,7 +373,7 @@ public:
     [[nodiscard]] std::uint32_t route_class(std::uint32_t rows) const noexcept;
     [[nodiscard]] serve::PrefillGroupCapacity group_capacity() const noexcept;
     [[nodiscard]] static bool group_options_supported(const PrefillOptions& o) noexcept {
-        return !(o.fp16_dense || o.bf16_attention || o.fast_attention || o.fast_attention_flash || o.fast_dense || o.fast_moe || o.fast_engram || o.trace || o.stream_hashes ||
+        return !(o.fp16_dense || o.bf16_attention || o.fast_attention || o.fast_attention_flash || o.fast_dense || o.fast_moe || o.fast_engram || o.fast_shared || o.trace || o.stream_hashes ||
                  o.routing_loads || o.quality_head_rows > 1U || o.null_ulp_layer >= 0 || o.verify_embed_extras);
     }
     // Members / rows per member the group states hold (PrefillOptions::group_members / group_rows); 0 = no group pass.

@@ -537,6 +537,7 @@ PrefixNamespace prefix_namespace_from_env(bool expert_tp_decode) {
     if (strix::ds41::fast_profile::dense_on())
         t += "prefill_dense=q8a8-f16-v1;dense_min_rows=" + std::to_string(strix::ds41::fast_profile::dense_min_rows()) + ";";
     if (strix::ds41::fast_profile::engram_on()) t += "prefill_engram=f16wmma-v1;";
+    if (strix::ds41::fast_profile::shared_on()) t += "prefill_shared=q8a8-f16-v1;";
     // FAST MoE: every routed entry takes the relaxed kernels whatever the chunking and route selectors (window / sparse
     // paths are off under the lever), so its arithmetic is one identity
     if (strix::ds41::fast_profile::moe_on()) t += "prefill_moe=relaxed-v1;";
