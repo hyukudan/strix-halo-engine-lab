@@ -832,6 +832,7 @@ __global__ __launch_bounds__(128) void hc_output_rows_kernel(const float* __rest
 }
 
 // Split epilogue: the same stream mix per (row, feature) from the stored gates.
+template <bool Fast>
 __global__ __launch_bounds__(256) void hc_mix_epilogue_kernel(const float* __restrict__ normalized, const float* __restrict__ gates,
     std::uint32_t rows, std::uint16_t* __restrict__ output, am::Tables t) {
     const std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -841,7 +842,10 @@ __global__ __launch_bounds__(256) void hc_mix_epilogue_kernel(const float* __res
     const float* g = gates + row * kStreams * kHidden + f;
     float mixed = 0.0F;
 #pragma unroll
-    for (unsigned s = 0; s < kStreams; ++s) mixed = __fmaf_rn(n[s * kHidden], amd_sigmoid(t, g[s * kHidden]), mixed);
+    for (unsigned s = 0; s < kStreams; ++s) {
+        if constexpr (Fast) mixed = __fmaf_rn(n[s * kHidden], fast_sigmoid(g[s * kHidden]), mixed);
+        else mixed = __fmaf_rn(n[s * kHidden], amd_sigmoid(t, g[s * kHidden]), mixed);
+    }
     output[i] = float_to_bf16(__fmul_rn(mixed, 0.25F));
 }
 
@@ -1288,7 +1292,7 @@ void hc_mix(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream, u
             a.rows, a.packed.up_codes, a.packed.up_scales, a.output, a.gates, tables);
         check(cudaGetLastError(), "mma output launch");
         if ((stages & 8U) && a.gates)
-            hc_mix_epilogue_kernel<<<blocks_for(std::size_t{a.rows} * kHidden, 256U), 256U, 0, stream>>>(a.normalized, a.gates, a.rows,
+            hc_mix_epilogue_kernel<true><<<blocks_for(std::size_t{a.rows} * kHidden, 256U), 256U, 0, stream>>>(a.normalized, a.gates, a.rows,
                 a.output, tables);
         return;
     }
@@ -1307,7 +1311,7 @@ void hc_mix(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream, u
         hc_output_kernel<false><<<out_grid, kOutThreads, 0, stream>>>(a.normalized, a.rows, a.packed.up_codes, a.packed.up_scales,
             a.output, a.gates, tables);
     if ((stages & 8U) && a.gates)
-        hc_mix_epilogue_kernel<<<blocks_for(std::size_t{a.rows} * kHidden, 256U), 256U, 0, stream>>>(a.normalized, a.gates, a.rows,
+        hc_mix_epilogue_kernel<false><<<blocks_for(std::size_t{a.rows} * kHidden, 256U), 256U, 0, stream>>>(a.normalized, a.gates, a.rows,
             a.output, tables);
     check(cudaGetLastError(), "output launch");
 }
