@@ -432,6 +432,43 @@ class MiniMaxFloor(unittest.TestCase):
         self.assertEqual(wc["fast"], {"policy": "mmx-pf-linear-s1-v1", "msa_flash_mode": 0, "layers": list(range(60))})
         self.assertIsNone(g.config_difference(we["config"], wc["config"]))
 
+    def test_witness_index_proj_member(self):
+        """minimax.index_proj_wmma joins the FAST layer set (union); absent lever = off; its switches are FAST-only."""
+        def run(fast, idx, evidence=True, event_rank=0, event_tokens=16, event_layers=None, order=None):
+            doc = json.loads(self.receipt(0, fast, order=order)[len("strix-route-receipt "):])
+            if idx is not None:
+                doc["levers"].append({"name": "minimax.index_proj_wmma", "requested": "1", "effective": idx, "reason": "selected"})
+                doc["switches"]["set"]["STRIX_MM_PF_IDX_WMMA"] = "1"
+            log = "strix-route-receipt " + json.dumps(doc)
+            digest = g.token_fnv1a64(bytes(64))
+            if evidence and idx and idx.startswith("1:layers="):
+                log += (f"\nminimax-index-proj-executed rank {event_rank} tokens {event_tokens} token_fnv {digest} layers " +
+                        (event_layers if event_layers is not None else idx[len("1:layers="):]))
+            return g.minimax_execution(log.encode(), 0, {"p": {"tokens": 16, "tokens_fnv1a64": digest}})
+        on = "1:layers=" + "".join("1" if 40 <= L else "0" for L in range(60))
+        both = run((11, 40), on)
+        self.assertEqual(both["fast"], {"policy": "msa-flash+index-proj", "msa_flash_mode": 11, "layers": list(range(40, 60))})
+        self.assertEqual(both["profile"], "fast-prefill")
+        combined = run((11, 40), on, order="invariant:mmx-pf-linear-s1-v1")
+        self.assertEqual(combined["fast"], {"policy": "mmx-pf-linear-s1-v1+msa-flash+index-proj",
+                                            "msa_flash_mode": 11, "layers": list(range(60))})
+        self.assertEqual(combined["profile"], "fast-prefill")
+        self.assertIsNone(g.config_difference(run(None, None)["config"], combined["config"]))
+        with self.assertRaises(g.GateError):
+            run((11, 40), on, evidence=False, order="invariant:mmx-pf-linear-s1-v1")
+        alone = run(None, "1:layers=" + "".join("1" if 30 <= L else "0" for L in range(60)))
+        self.assertEqual(alone["fast"], {"policy": "index-proj", "msa_flash_mode": 10, "layers": list(range(30, 60))})
+        self.assertEqual(run((11, 40), "0")["fast"]["policy"], "msa-flash")
+        self.assertIsNone(run(None, None)["fast"])
+        for bad in ("1", "1:layers=" + "0" * 60, "2:layers=1"):
+            with self.assertRaises(g.GateError):
+                run(None, bad)
+        self.assertIsNone(g.config_difference(run((11, 40), None)["config"], both["config"]))
+        for kwargs in ({"evidence": False}, {"event_rank": 1}, {"event_tokens": 8}, {"event_tokens": 17},
+                       {"event_layers": "0" * 60}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(g.GateError):
+                run(None, on, **kwargs)
+
     def test_witness_producer(self):
         e, _ = self.mm_arm("e", self.ref)
         n, _ = self.mm_arm("n", self.noisy(0.1, 1), control=(30, 2))

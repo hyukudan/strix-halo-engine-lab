@@ -139,12 +139,12 @@ los límites de RAM libre, swap y GTT no cambian. Sin caché, el valor sigue sie
 
 ## Ejecución: una RTX PRO 6000
 
-Solo Windows, opcional (opt-in): compile con `pwsh src/glm/rtxpf/producer/build.ps1` contra una exportación del código
+Solo Windows, opcional (opt-in): compile con `pwsh src/cuda/models/glm/producer/build.ps1` contra una exportación del código
 de tierstream, genere una vez el archivo de unidades con `glm_unit_file.exe` y ejecute
 `decode_qualification_window.py --full-card --allow-gpu`. El propio servicio acepta también `--dgpu auto|<uuid>`
 para elegir la RTX PRO antes de iniciar CUDA (`off` se rechaza: no hay ruta en CPU). Todos los pasos, el commit fijado de tierstream y las
 opciones (`--profile`, `--print-effective-config`, `--vram-total-gib`) están en la
-[guía de GLM RTX](../../../src/glm/rtxpf/README.md).
+[guía de GLM RTX](../../../src/cuda/models/glm/README.md).
 
 <a id="how-fast"></a>
 
@@ -295,7 +295,7 @@ simultáneas por defecto con este presupuesto (auto, 76 % de los expertos en el 
 **0.77 / 0.75 tok/s** en caliente / en frío con 1K (media de dos cargas, bench de 24 tokens). Con el prefetch de archivo en dos etapas opcional
 (`--tier-landing-blocks 16`, tres unidades en franjas) el decode fue un 20-40 % más rápido que sin él en las mismas
 ventanas, con salida idéntica (las repeticiones variaron entre un 15 y un 55 %). Compilación, archivo de unidades y
-opciones: [guía de GLM RTX](../../../src/glm/rtxpf/README.md).
+opciones: [guía de GLM RTX](../../../src/cuda/models/glm/README.md).
 
 **Prefill en RTX hacia el par (FAST, desactivado por defecto).** `strix-glm5-serve --rtx-prefill HOST:PUERTO
 --import-listen IP:PUERTO --import-peer IP:PUERTO --import-key FICHERO --import-model-sha SHA` (`--import-listen` en cada
@@ -334,5 +334,5 @@ RTX para prompts largos. Con el productor arrancado con su caché (primera petic
 El registro de cambios de cada palanca de GLM activada por defecto, con su ganancia medida, su evidencia de exactitud y
 su interruptor de desactivación, está en [ganancias medidas](../../measured-gains.es.md); el catálogo completo es
 [docs/optimizations.md](../../optimizations.md#glm). Compilación, fichero de unidades y opciones de GLM RTX:
-[guía de GLM RTX](../../../src/glm/rtxpf/README.md); notas del prefill nativo en RTX:
+[guía de GLM RTX](../../../src/cuda/models/glm/README.md); notas del prefill nativo en RTX:
 [docs/models/glm/rtx-prefill-native.md](../glm/rtx-prefill-native.md).

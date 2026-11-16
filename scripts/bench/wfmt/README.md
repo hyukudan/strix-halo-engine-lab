@@ -20,9 +20,13 @@ production kernel. P01 changes no production operation; later migration PRs add
 test-only adapters before replacing numerical bodies.
 
 For actual adapters, run `capture.py --exe EXECUTABLE --matrix MATRIX --out DIR
---compiler VERSION --architecture ARCH --source SOURCE --flags FLAGS --device ID`.
-The executable receives `--wfmt-capture DIR --wfmt-matrix MATRIX`. It must emit
-nonempty `.wfmt` records matching the matrix or capture fails. Capture stores executable/matrix SHA256,
+--compiler VERSION --architecture ARCH --source SOURCE --flags FLAGS --device ID
+--adapter reference|native|backend`. Use `--source SOURCE --source-ref COMMIT` with an archived source tree; COMMIT must be a full 40- or 64-hex revision declared by the archive producer (this does not verify archive contents).
+Source commit and exact compiler flags are required. `--adapter protocol` is explicitly fixture-only.
+The reference adapter uses `--wfmt-reference-capture DIR`; backend fixtures use
+`--wfmt-backend-capture DIR`; native hooks use `--wfmt-capture DIR --wfmt-matrix MATRIX`.
+A protocol fixture is rejected for numerical adapters. Each adapter must emit
+nonempty `.wfmt` records matching the supplied matrix or capture fails. Capture stores executable/matrix SHA256,
 source commit, flags, compiler, architecture and device. Frozen binaries and all
 raw payloads stay outside Git. `--runner` is an optional shell-style argv prefix;
 it is parsed without invoking a shell. Devices and asset paths are supplied by
@@ -95,3 +99,27 @@ two prefills per process (first cold, last warm), ABAB at least three pairs,
 clocks, busy fraction, time, tokens and clocks/token alongside throughput. Such
 long cases must be partitioned into bounded tickets. Capture hooks are test-only;
 they copy existing buffers rather than recomputing arithmetic.
+
+The legacy wrapper gate injects one test-only adapter into both the preceding
+source revision and the candidate. It captures accepted dtype, shape, byte range
+and payload through the existing DS41, H3, Gemma, vision and (on POSIX) GLM and
+MiniMax APIs. The same record writer and synthetic fixtures run in both binaries;
+no old parser implementation is copied into the kit. Run inside the CPU build
+lane with both source refs and revisions supplied:
+
+```sh
+python3 scripts/bench/wfmt/legacy_compare.py --baseline-source "$OLD_SOURCE" \
+  --candidate-source "$NEW_SOURCE" --baseline-revision "$OLD_REF" \
+  --candidate-revision "$NEW_REF" --build-root "$BUILD_ROOT" \
+  --output "$RECEIPTS" --verify-session
+```
+
+The optional session check records the preceding revision's known aliased-shard
+failure and requires the candidate to pass. Generated fixtures, binaries, logs,
+provenance and byte receipts stay outside Git. The aliased-shard loader keeps all
+asset-receipt path references while indexing each opened physical file once.
+
+Both source arguments must be clean checkout roots whose HEAD is the requested
+revision. The driver verifies both commits and tree IDs before configuring either
+build, rejecting tracked edits, untracked files and dirty submodules. Keep build
+and receipt directories outside the source checkouts (or ignored).

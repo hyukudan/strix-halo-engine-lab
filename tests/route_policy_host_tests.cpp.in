@@ -66,6 +66,9 @@ struct MiniMaxPolicies {
     strix::core::LayerSet i4_exl3_layers = strix::core::parse_layer_set(fast_i4::kQualityExl3Layers, kFirstMoe, kLayers, "kept");
     strix::core::LayerSet i4_a8_layers = strix::core::parse_layer_set("!", kFirstMoe, kLayers, "a8");
     strix::core::LayerSet pf_msa_flash_layers = strix::core::parse_layer_set("50-61", 0, kLayers, "flash");
+    bool pf_idx_wmma = false;
+    std::string pf_idx_wmma_asked = "default";
+    strix::core::LayerSet pf_idx_wmma_layers = strix::core::parse_layer_set("40-59", 0, kLayers, "idx");
 @MINIMAX_LEVERS@
     std::uint64_t fingerprint() const { rr::reset(); route_levers(); return rr::fingerprint(); }
 };
@@ -131,6 +134,14 @@ void glm_equivalent() {
     const auto defaults = glm_fingerprint();
     env("STRIX_GLM_PF_KDA_WMMA", "1");
     rr::require_same_route(defaults, glm_fingerprint(1));
+    {  // FAST indexer projections: the value equal to the default resolves to the same route, the other one differs
+        constexpr bool with_fast = strix::glm::pf::idxproj_wmma::kWithFast;
+        env("STRIX_GLM_PF_IDXPROJ_WMMA", with_fast ? "1" : "0");
+        rr::require_same_route(defaults, glm_fingerprint(1));
+        env("STRIX_GLM_PF_IDXPROJ_WMMA", with_fast ? "0" : "1");
+        different(defaults, glm_fingerprint());
+        env("STRIX_GLM_PF_IDXPROJ_WMMA", nullptr);
+    }
     // FAST WMMA selected: the auto floor is 32 rows; the exact route's is 64 (glm_pf_dense_policy.hpp).
     env("STRIX_GLM_PF_EXACT_X_MIN_ROWS", "32");
     rr::require_same_route(defaults, glm_fingerprint(1));

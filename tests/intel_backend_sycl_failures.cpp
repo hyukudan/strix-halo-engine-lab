@@ -88,6 +88,7 @@ void open_failures() {
 }
 } // namespace
 
+void wfmt_intel_queue_test();
 int main(int argc, char** argv) {
 #ifdef _MSC_VER
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
@@ -99,6 +100,7 @@ int main(int argc, char** argv) {
         if (name == "async") async_failures();
         else if (name == "sync") sync_failures();
         else if (name == "open") open_failures();
+        else if (name == "queues") wfmt_intel_queue_test();
         else throw std::runtime_error("expected async, sync or open");
     } catch (const std::exception& e) {
         std::fprintf(stderr, "SYCL boundary host test: %s\n", e.what());
