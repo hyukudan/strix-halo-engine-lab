@@ -23,8 +23,27 @@
 // warp partials in ascending order (the split count depends only on (out, in), never on rows), then * gscale, then the
 // optional residual add: rows 1..32 are bitwise identical to rows 1. Activations must satisfy |x| < 65504.
 #include "strix/cuda_core/types.hpp"
+#include <vector>
 
 namespace strix::cuda_core {
+
+// One device/stream owner. Growth retains old addresses used by captured graphs.
+// Destroy only after stream completion and destruction of all referring graphs.
+class Nvfp4Workspace {
+    std::vector<UniqueHandle<void*, cudaFree>> allocations_;
+    std::size_t bytes_ = 0;
+public:
+    cudaError_t reserve(std::size_t bytes) {
+        if (bytes <= bytes_) return cudaSuccess;
+        UniqueHandle<void*, cudaFree> allocation;
+        const auto error = cudaMalloc(allocation.put(), bytes);
+        if (error != cudaSuccess) return error;
+        allocations_.push_back(std::move(allocation));
+        bytes_ = bytes;
+        return cudaSuccess;
+    }
+    float* data() const noexcept { return allocations_.empty() ? nullptr : static_cast<float*>(allocations_.back().get()); }
+};
 
 constexpr std::uint32_t kNvfp4MaxRows = 32;
 constexpr std::uint32_t kNvfp4RecordBytes = 1152;
@@ -54,10 +73,12 @@ struct Nvfp4Job {
     const float* residual;
 };
 cudaError_t nvfp4_dense_rows_multi(const Nvfp4Job* jobs, std::uint32_t n, const float* x, std::uint32_t rows, cudaStream_t stream);
-// y = silu(gate x) * (up x), same format/shape; same arithmetic and order as two nvfp4_dense_rows + epilogue.
+// y = silu(gate x) * (up x), same format/shape.
 cudaError_t nvfp4_gate_up_silu_rows(const DenseWeight& gate, const DenseWeight& up, const float* x, float* y,
                                     std::uint32_t rows, cudaStream_t stream);
-cudaError_t nvfp4_reserve_workspace(std::size_t bytes);
+cudaError_t nvfp4_reserve_workspace(std::size_t bytes, cudaStream_t stream = nullptr);
+// Current device; caller owns the stream and must destroy graphs and synchronize first.
+void nvfp4_release_workspace(cudaStream_t stream);
 // Tuning/test hook: target number of blocks used to pick the split-K factor (default 1000; 0 = default).
 void nvfp4_set_split_target(std::uint32_t warps);
 // Split-K factor used for (out, in) (diagnostics / tests).

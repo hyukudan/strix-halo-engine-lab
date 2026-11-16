@@ -4,7 +4,9 @@
 //   bf16  weight = float(bits << 16)                        (exact)
 //   q8_0  34-byte blocks {f16 d, int8 q[32]}; weight = d * float(q)   (one FP32 product, as the g4 chunk decoder)
 // Home: shared (core). Gemma4's gemma4/kernels/chunk.hpp WeightChunk<bf16|q8_0> (chunk.hpp:32,52) is the same
-// arithmetic and is a follow-up rebind (not touched here).
+// arithmetic. Required adoption: replace those two WeightChunk specializations with adapters
+// to Chunk below, then run Gemma4 BF16/Q8_0 projection byte gates before removing local decoders.
+// Rebinding a HIP kernel is outside this change's permitted scope.
 #include <cstddef>
 #include <cstdint>
 #include <hip/hip_runtime.h>

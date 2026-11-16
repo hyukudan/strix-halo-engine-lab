@@ -9,11 +9,14 @@ namespace strix::qwen35 {
 namespace {
 
 constexpr std::uint32_t kF32 = 0, kQ8_0 = 8, kBF16 = 30;
+}  // namespace
 
-Config validate(const gguf::FileInfo& info) {
+Config validate(const gguf::FileInfo& info, std::uint32_t max_positions) {
     const Config config = config_from_gguf(info);
+    if (max_positions) validate_backend(config, max_positions);
     std::unordered_map<std::string, const gguf::TensorInfo*> by_name;
-    for (const auto& t : info.tensors) by_name.emplace(t.name, &t);
+    for (const auto& t : info.tensors)
+        if (!by_name.emplace(t.name, &t).second) throw std::invalid_argument("qwen35: duplicate tensor: " + t.name);
     for (const auto& spec : expected_tensors(config)) {
         const auto it = by_name.find(spec.name);
         if (it == by_name.end()) throw std::invalid_argument("qwen35: required tensor missing: " + spec.name);
@@ -24,8 +27,6 @@ Config validate(const gguf::FileInfo& info) {
     }
     return config;
 }
-
-}  // namespace
 
 void register_family() {
     if (model_family_registered("qwen35")) return;

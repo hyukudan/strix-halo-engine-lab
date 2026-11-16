@@ -137,6 +137,25 @@ int main(int argc, char** argv) try {
     m.bad_type = true;
     expect(throws([&] { find_model_family("qwen35")->validate(parse(tiny_gguf(m))); }), "wrong tensor type rejected");
 
+    // Execution admission regressions (malformed files must fail before device work).
+    auto malformed = good;
+    for (auto& e : malformed.metadata)
+        if (e.key == "qwen35.ssm.time_step_rank") e.unsigned_value = 0;
+    expect(throws([&] { (void)qwen35::validate(malformed); }), "zero GDN rank rejected");
+    malformed = good;
+    for (auto& t : malformed.tensors)
+        if (t.name == "blk.0.attn_qkv.weight") ++t.dimensions[1];
+    expect(throws([&] { (void)qwen35::validate(malformed); }), "oversized qkv rejected");
+    malformed = good;
+    for (auto& t : malformed.tensors)
+        if (t.name == "token_embd.weight") t.dimensions[1] = 0x100000000ULL;
+    expect(throws([&] { (void)qwen35::validate(malformed); }), "vocabulary narrowing rejected");
+    expect(throws([&] { qwen35::validate_backend(c, 16); }), "unsupported backend dimensions rejected");
+    qwen35::Config native;
+    qwen35::validate_backend(native, 16);
+    native.heads = 0xFFFFFFFFU;
+    expect(throws([&] { qwen35::validate_backend(native, 16); }), "backend width overflow rejected");
+
     // Optional: files written by tools/qwen35/convert.py must be admitted by the same family.
     for (int i = 1; i < argc; ++i) {
         const auto admitted = admit_model_file(argv[i]);

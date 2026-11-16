@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <limits>
 #include <vector>
 
 #include "strix/cuda_core/attention.hpp"
@@ -12,6 +13,8 @@
 #include "strix/cuda_core/gdn.hpp"
 #include "strix/cuda_core/norms.hpp"
 #include "strix/cuda_core/rope.hpp"
+#include "strix/cuda_core/nvfp4.hpp"
+#include "../../src/cuda_core/common.cuh"
 
 namespace cc = strix::cuda_core;
 static int g_fail = 0;
@@ -29,6 +32,9 @@ static bool bits_equal(const std::vector<float>& a, const std::vector<float>& b)
     return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
 }
 static double maxrel(const std::vector<float>& a, const std::vector<double>& ref) {
+    if (a.size() != ref.size()) return std::numeric_limits<double>::infinity();
+    for (float v : a) if (!std::isfinite(v)) return std::numeric_limits<double>::infinity();
+    for (double v : ref) if (!std::isfinite(v)) return std::numeric_limits<double>::infinity();
     double worst = 0, scale = 1e-30;
     for (double r : ref) scale = std::max(scale, std::fabs(r));
     for (std::size_t i = 0; i < a.size(); ++i) worst = std::max(worst, std::fabs(a[i] - ref[i]) / scale);
@@ -293,9 +299,50 @@ int test_gdn() {
     return 0;
 }
 
+__global__ void nvfp4_test_epilogue(const float* gate, const float* up, float* y, std::uint32_t out) {
+    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < out) y[i] = __fmul_rn(cc::cc_silu(gate[i]), up[i]);
+}
+
+static int test_nvfp4_fused() {
+    constexpr std::uint32_t in = 256;
+    cc::nvfp4_set_split_target(0);
+    for (const std::uint32_t out : {248320u, 16u}) {
+        CHECK(cc::nvfp4_split_k(out, in) == (out == 248320u ? 1u : 2u), "NVFP4 split coverage out=%u", out);
+        // Exact packed weights: gate = 1, up = 2, all local scales = 1 (e4m3 0x38).
+        std::vector<unsigned char> gate(cc::nvfp4_bytes(out, in), 0x22), up(gate.size(), 0x44);
+        for (std::size_t base = 0; base < gate.size(); base += cc::kNvfp4RecordBytes)
+            for (std::size_t i = 1024; i < cc::kNvfp4RecordBytes; ++i) gate[base + i] = up[base + i] = 0x38;
+        auto* dg = dev(gate);
+        auto* du = dev(up);
+        std::vector<float> x(in, 0.0f);
+        // One split retains the small term after cancellation; two splits lose it.
+        x[0] = 32768.0f; x[128] = -32768.0f; x[144] = 1.0f / 1024.0f;
+        if (out == 16u) x[128] = -16384.0f;  // Nonzero split-K epilogue coverage.
+        auto* dx = dev(x);
+        auto* g = devz<float>(out);
+        auto* u = devz<float>(out);
+        auto* separate = devz<float>(out);
+        auto* fused = devz<float>(out);
+        const cc::DenseWeight gw{dg, cc::WeightFormat::nvfp4, out, in, 0.5f};
+        const cc::DenseWeight uw{du, cc::WeightFormat::nvfp4, out, in, 0.25f};
+        CK(cc::nvfp4_dense_rows(gw, dx, g, 1, nullptr, nullptr));
+        CK(cc::nvfp4_dense_rows(uw, dx, u, 1, nullptr, nullptr));
+        nvfp4_test_epilogue<<<(out + 255) / 256, 256>>>(g, u, separate, out);
+        CK(cudaGetLastError());
+        CK(cc::nvfp4_gate_up_silu_rows(gw, uw, dx, fused, 1, nullptr));
+        CK(cudaDeviceSynchronize());
+        CHECK(bits_equal(get(fused, out), get(separate, out)), "NVFP4 fused vs separate bits out=%u", out);
+        CK(cudaFree(dg)); CK(cudaFree(du)); CK(cudaFree(dx));
+        CK(cudaFree(g)); CK(cudaFree(u)); CK(cudaFree(separate)); CK(cudaFree(fused));
+    }
+    cc::nvfp4_release_workspace();
+    return 0;
+}
+
 int main() {
     if (cudaSetDevice(0) != cudaSuccess) return 2;
-    int rc = test_dense() | test_norms_rope() | test_attention() | test_gdn();
+    int rc = test_dense() | test_norms_rope() | test_attention() | test_gdn() | test_nvfp4_fused();
     // repeat determinism is covered by the identical-bits checks (each compares two separate launches)
     std::printf(g_fail || rc ? "cuda_core_test: FAILED (%d checks)\n" : "cuda_core_test: PASS\n", g_fail);
     return (g_fail || rc) ? 1 : 0;

@@ -50,6 +50,9 @@ struct Config {
 
 // Reads and validates the qwen35.* metadata; throws std::invalid_argument naming the first bad key.
 [[nodiscard]] Config config_from_gguf(const gguf::FileInfo& info);
+// Full family admission, used by every backend before any device allocation.
+[[nodiscard]] Config validate(const gguf::FileInfo& info, std::uint32_t max_positions = 0);
+void validate_backend(const Config& config, std::uint32_t max_positions);
 
 // One required tensor. dimensions are in GGUF (ggml) order: dimensions[0] is the fastest axis, i.e. the input
 // features of a matrix. Matrices are BF16 or Q8_0 (the packs); everything else (norms, conv, ssm vectors) is F32.

@@ -4,7 +4,7 @@
   ref_forward.py MODEL.gguf --ids 1,2,3 | --ids-file F  [--n 32] [--out DIR] [--mtp-hidden post|pre]
 Outputs DIR/ref.npz (logits [T,V] f32, greedy ids, decode_logits [N-1,V], mtp_logits [T+N-1,V],
 layer norms) and DIR/summary.txt. Reads bf16 and q8_0 packs. Semantics: design.md section 1.
-MTP: position i feeds emb(token i+1) and the trunk hidden at i (post final norm by default, vLLM convention;
+MTP: position i feeds emb(token i+1) and the trunk hidden at i (post final norm by default;
 --mtp-hidden pre uses the residual stream before output_norm); RoPE position i; own KV; predicts token i+2.
 Home: specific tool (model arithmetic).
 """

@@ -1,3 +1,4 @@
+#include "../src/core/dense_linear.hpp"
 // strix-cuda-qwen35-spec: exact block drafting (copy / native MTP chain / hybrid blocks, up to 32 verify rows) on the qwen35
 // CUDA engine. Verifies output == serial decode token for token, reports accepted tokens per step (mean/p50/p90), tok/s
 // average and best 1 s window, and the engine cost table verify_ms(R) / MTP ms / lm_head share.
@@ -51,8 +52,8 @@ std::vector<std::uint32_t> parse_ids(const std::string& text) {
     std::vector<std::uint32_t> v;
     std::string t;
     for (const char c : text + ",") {
-        if (c >= '0' && c <= '9') t += c;
-        else if (!t.empty()) { v.push_back(std::uint32_t(std::stoul(t))); t.clear(); }
+        if (c != ',' && c != ' ' && c != '\n' && c != '\r' && c != '\t') t += c;
+        else if (!t.empty()) { v.push_back(strix::core::parse_u32(t)); t.clear(); }
     }
     return v;
 }
@@ -81,22 +82,22 @@ int main(int argc, char** argv) {
             };
             if (a == "--model") model = next();
             else if (a == "--synthetic-full") synth = next();
-            else if (a == "--layers") layers_override = std::uint32_t(std::stoul(next()));
+            else if (a == "--layers") layers_override = strix::core::parse_u32(next());
             else if (a == "--prompt-ids") ids_arg = next();
             else if (a == "--prompt-file") ids_file = next();
-            else if (a == "--prompt-len") prompt_len = std::uint32_t(std::stoul(next()));
-            else if (a == "--n-gen") n_gen = std::uint32_t(std::stoul(next()));
+            else if (a == "--prompt-len") prompt_len = strix::core::parse_u32(next());
+            else if (a == "--n-gen") n_gen = strix::core::parse_u32(next());
             else if (a == "--sources") sources = next();
-            else if (a == "--max-block") max_block = std::uint32_t(std::stoul(next()));
-            else if (a == "--chain-k") chain_k = std::uint32_t(std::stoul(next()));
+            else if (a == "--max-block") max_block = strix::core::parse_u32(next());
+            else if (a == "--chain-k") chain_k = strix::core::parse_u32(next());
             else if (a == "--oracle") oracle = std::stod(next());
             else if (a == "--cost-table") cost_table = true;
-            else if (a == "--trace") trace_n = std::uint32_t(std::stoul(next()));
+            else if (a == "--trace") trace_n = strix::core::parse_u32(next());
             else if (a == "--check") check = next() != "0";
             else if (a == "--graphs") graphs = next() != "0";
             else if (a == "--seed-costs") seed_costs = next() != "0";
             else if (a == "--chain-hidden") chain_hidden = next();
-            else if (a == "--max-pos") max_pos = std::uint32_t(std::stoul(next()));
+            else if (a == "--max-pos") max_pos = strix::core::parse_u32(next());
             else if (a == "--label") label = next();
             else if (a == "--turbo-weights") {
                 const std::string v = next();

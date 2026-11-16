@@ -20,6 +20,7 @@
 #include "strix/cuda_core/dense_big.hpp"
 #include "strix/cuda_core/rope.hpp"
 #include "strix/gguf_reader.hpp"
+#include "../../core/dense_linear.hpp"
 
 namespace cc = strix::cuda_core;
 
@@ -36,44 +37,6 @@ namespace strix::qwen35 {
 namespace {
 
 // ---------------------------------------------------------------- config from GGUF (until config_from_gguf lands here)
-std::uint64_t meta_u(const gguf::FileInfo& f, const std::string& k) {
-    const auto* e = f.find_metadata(k);
-    if (!e) throw std::runtime_error("missing metadata " + k);
-    if (e->unsigned_value) return *e->unsigned_value;
-    if (e->signed_value) return static_cast<std::uint64_t>(*e->signed_value);
-    throw std::runtime_error("metadata not integer: " + k);
-}
-double meta_f(const gguf::FileInfo& f, const std::string& k) {
-    const auto* e = f.find_metadata(k);
-    if (!e || !e->floating_value) throw std::runtime_error("missing float metadata " + k);
-    return *e->floating_value;
-}
-Config read_cfg(const gguf::FileInfo& f) {
-    const auto* arch = f.find_metadata("general.architecture");
-    if (!arch || !arch->string_value || *arch->string_value != "qwen35") throw std::runtime_error("architecture is not qwen35");
-    Config c;
-    c.layers = static_cast<std::uint32_t>(meta_u(f, "qwen35.block_count"));
-    c.hidden = static_cast<std::uint32_t>(meta_u(f, "qwen35.embedding_length"));
-    c.intermediate = static_cast<std::uint32_t>(meta_u(f, "qwen35.feed_forward_length"));
-    c.heads = static_cast<std::uint32_t>(meta_u(f, "qwen35.attention.head_count"));
-    c.kv_heads = static_cast<std::uint32_t>(meta_u(f, "qwen35.attention.head_count_kv"));
-    c.head_dim = static_cast<std::uint32_t>(meta_u(f, "qwen35.attention.key_length"));
-    c.rms_eps = static_cast<float>(meta_f(f, "qwen35.attention.layer_norm_rms_epsilon"));
-    c.rope_theta = meta_f(f, "qwen35.rope.freq_base");
-    c.rotary_dim = static_cast<std::uint32_t>(meta_u(f, "qwen35.rope.dimension_count"));
-    c.gdn_conv_kernel = static_cast<std::uint32_t>(meta_u(f, "qwen35.ssm.conv_kernel"));
-    c.gdn_key_dim = static_cast<std::uint32_t>(meta_u(f, "qwen35.ssm.state_size"));
-    c.gdn_key_heads = static_cast<std::uint32_t>(meta_u(f, "qwen35.ssm.group_count"));
-    c.gdn_value_heads = static_cast<std::uint32_t>(meta_u(f, "qwen35.ssm.time_step_rank"));
-    c.gdn_value_dim = static_cast<std::uint32_t>(meta_u(f, "qwen35.ssm.inner_size")) / c.gdn_value_heads;
-    c.full_attention_interval = static_cast<std::uint32_t>(meta_u(f, "qwen35.full_attention_interval"));
-    c.mtp_layers = f.find_metadata("qwen35.nextn_predict_layers") ? static_cast<std::uint32_t>(meta_u(f, "qwen35.nextn_predict_layers")) : 0;
-    for (const auto& t : f.tensors)
-        if (t.name == "token_embd.weight") c.vocab = static_cast<std::uint32_t>(t.dimensions.at(1));
-    if (c.vocab == 0) throw std::runtime_error("token_embd.weight missing");
-    return c;
-}
-
 // ---------------------------------------------------------------- tensors
 struct PackTensorSpec {
     std::string name;
@@ -157,6 +120,7 @@ std::uint64_t fnv(const std::string& s) {
 }
 
 struct WeightStore {
+    cc::UniqueHandle<void*, cudaFree> owner;
     unsigned char* base = nullptr;
     std::uint64_t total = 0, trunk_bytes = 0;
     std::map<std::string, PackTensorSpec> spec;
@@ -193,12 +157,16 @@ void layout(WeightStore& W, const std::vector<PackTensorSpec>& specs, std::uint3
     for (const auto& t : specs) {
         W.spec[t.name] = t;
         W.off[t.name] = total;
-        total += (t.bytes + 255) & ~255ULL;
+        core::require_capacity(t.bytes, 255, std::numeric_limits<std::size_t>::max());
+        const auto padded = (t.bytes + 255) & ~255ULL;
+        core::require_capacity(total, padded, std::numeric_limits<std::size_t>::max());
+        total += padded;
         const bool mtp = t.name.rfind("blk." + std::to_string(layers) + ".", 0) == 0;
         if (t.name != "token_embd.weight" && !mtp) W.trunk_bytes += t.bytes;
     }
     W.total = total;
-    CK(cudaMalloc(reinterpret_cast<void**>(&W.base), total));
+    CK(cudaMalloc(W.owner.put(), total));
+    W.base = static_cast<unsigned char*>(W.owner.get());
 }
 
 std::vector<PackTensorSpec> specs_from_gguf(const gguf::FileInfo& f, std::uint32_t layers, bool load_mtp) {
@@ -349,6 +317,8 @@ struct CudaEngine::Impl {
     cc::DenseWeight m_eh;
 
     static constexpr std::uint32_t RM = cc::kMaxRows;
+    int device = 0;
+    std::vector<cc::UniqueHandle<void*, cudaFree>> allocations;
     cudaStream_t s = nullptr;
     cc::GdnDims gd;
     cc::AttentionDims ad;
@@ -369,7 +339,7 @@ struct CudaEngine::Impl {
     std::uint32_t committed = 0, last_rows = 0;
     bool graphs_on = true;
     struct Graph {
-        cudaGraphExec_t exec = nullptr;
+        cc::UniqueHandle<cudaGraphExec_t, cudaGraphExecDestroy> exec;
         std::uint64_t nodes = 0;
     };
     std::unordered_map<std::uint32_t, Graph> graphs;
@@ -377,9 +347,11 @@ struct CudaEngine::Impl {
 
     template <class T>
     T* alloc(std::size_t n, bool zero = false) {
-        T* p = nullptr;
-        CK(cudaMalloc(reinterpret_cast<void**>(&p), n * sizeof(T)));
-        if (zero) CK(cudaMemset(p, 0, n * sizeof(T)));
+        cc::UniqueHandle<void*, cudaFree> owner;
+        CK(cudaMalloc(owner.put(), core::checked_product({n, sizeof(T)})));
+        T* p = static_cast<T*>(owner.get());
+        allocations.push_back(std::move(owner));
+        if (zero) CK(cudaMemset(p, 0, core::checked_product({n, sizeof(T)})));
         return p;
     }
     [[nodiscard]] std::string nm(std::uint32_t l, const char* suffix) const { return "blk." + std::to_string(l) + "." + suffix; }
@@ -431,7 +403,7 @@ struct CudaEngine::Impl {
                 layer_sum += b;
                 need = std::max(need, b);
             }
-            if (layer_sum) CK(cc::nvfp4_reserve_workspace(std::min<std::size_t>(layer_sum, std::max<std::size_t>(need * 4, 64u << 20))));
+            if (layer_sum) CK(cc::nvfp4_reserve_workspace(std::min<std::size_t>(layer_sum, std::max<std::size_t>(need * 4, 64u << 20)), s));
         }
         for (std::uint32_t l = 0; l < c.layers; ++l) L.push_back(resolve(l, c.kind(l) == LayerKind::full_attention));
         head = W.has("output.weight") ? W.dense("output.weight") : W.dense("token_embd.weight");
@@ -535,9 +507,9 @@ struct CudaEngine::Impl {
         bool ok = true;
         for (int j = 1; j < n; ++j) ok = ok && ws[j].format == ws[0].format && ws[j].in == ws[0].in;
         if (ok && opt.multi_gemv) {
-            CK(cc::dense_rows_multi(ws, ys, n, xin, rows, nullptr, s));
+            CK(cc::dense_rows_multi(ws, ys, n, xin, rows, nullptr, s, opt.dense_arithmetic));
         } else {
-            for (int j = 0; j < n; ++j) CK(cc::dense_rows(ws[j], xin, ys[j], rows, nullptr, s));
+            for (int j = 0; j < n; ++j) CK(cc::dense_rows(ws[j], xin, ys[j], rows, nullptr, s, opt.dense_arithmetic));
         }
     }
 
@@ -557,14 +529,14 @@ struct CudaEngine::Impl {
         CK(cc::rope_apply(k, kvv, c.rotary_dim, cos_t, sin_t, b.pos, s, b.rm));
         CK(cc::kv_store(ad, k, v, b.kc, b.vc, b.pos, rows, s, b.rm));
         CK(cc::attention_decode(ad, q, qdst, qg + D, qsrc, b.kc, b.vc, b.pos, rows, ao, scratch, s, b.rm));
-        CK(cc::dense_rows(w.o, ao, b.x, rows, b.x, s));
+        CK(cc::dense_rows(w.o, ao, b.x, rows, b.x, s, opt.dense_arithmetic));
     }
 
     void mlp(const LayerW& w, const Bufs& b, std::uint32_t rows) {
         const cc::GroupedView hv{rows, 1, c.hidden, c.hidden, c.hidden};
         CK(cc::rmsnorm(b.x, hv, w.post_norm, b.xn, hv, c.rms_eps, s));
-        CK(cc::dense_gate_up_silu_rows(w.ffn_gate, w.ffn_up, b.xn, hid, rows, s));
-        CK(cc::dense_rows(w.ffn_down, hid, b.x, rows, b.x, s));
+        CK(cc::dense_gate_up_silu_rows(w.ffn_gate, w.ffn_up, b.xn, hid, rows, s, opt.dense_arithmetic));
+        CK(cc::dense_rows(w.ffn_down, hid, b.x, rows, b.x, s, opt.dense_arithmetic));
     }
 
     void trunk(std::uint32_t rows, LogitRows want) {
@@ -583,7 +555,7 @@ struct CudaEngine::Impl {
                 }
                 const auto& cl = commit_layers[gi++];
                 CK(cc::gdn_window(gd, cl.layer, cl.state, cl.win, z, gout, rows, c.rms_eps, d_parity, s));
-                CK(cc::dense_rows(w.out, gout, x, rows, x, s));
+                CK(cc::dense_rows(w.out, gout, x, rows, x, s, opt.dense_arithmetic));
             } else {
                 attn_mixer(w, Bufs{x, xn, d_pos, kc[l], vc[l]}, rows);
             }
@@ -591,17 +563,18 @@ struct CudaEngine::Impl {
         }
         CK(cc::rmsnorm(x, hv, out_norm, xn, hv, c.rms_eps, s));
         if (want == LogitRows::all) {
-            CK(cc::dense_rows(head, xn, logits, rows, nullptr, s));
+            CK(cc::dense_rows(head, xn, logits, rows, nullptr, s, opt.dense_arithmetic));
             CK(cc::argmax_rows(logits, c.vocab, rows, d_top, d_argws, s));
         } else if (want == LogitRows::last) {
-            CK(cc::dense_rows(head, xn + static_cast<std::size_t>(rows - 1) * H, logits, 1, nullptr, s));
+            CK(cc::dense_rows(head, xn + static_cast<std::size_t>(rows - 1) * H, logits, 1, nullptr, s, opt.dense_arithmetic));
             CK(cc::argmax_rows(logits, c.vocab, 1, d_top, d_argws, s));
         }
     }
 
     RowsOut forward(const std::uint32_t* tokens, std::uint32_t rows, LogitRows want) {
         if (rows == 0 || rows > RM) throw std::runtime_error("forward_rows: rows must be 1..32");
-        if (committed + rows > opt.max_positions) throw std::runtime_error("forward_rows: max_positions exceeded");
+        core::require_capacity(committed, rows, opt.max_positions);
+        core::validate_token_ids(tokens, rows, c.vocab);
         InputPack in{};
         in.pos0 = committed;
         for (std::uint32_t i = 0; i < rows; ++i) in.ids[i] = tokens[i];
@@ -611,7 +584,7 @@ struct CudaEngine::Impl {
         if (graphs_on) {
             auto it = graphs.find(key);
             if (it == graphs.end()) {
-                cudaGraph_t g = nullptr;
+                cc::UniqueHandle<cudaGraph_t, cudaGraphDestroy> g;
                 CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
                 try {
                     trunk(rows, want);
@@ -621,17 +594,17 @@ struct CudaEngine::Impl {
                     if (dummy) cudaGraphDestroy(dummy);
                     throw;
                 }
-                CK(cudaStreamEndCapture(s, &g));
+                CK(cudaStreamEndCapture(s, g.put()));
                 Graph gr;
-                CK(cudaGraphInstantiate(&gr.exec, g, 0));
+                CK(cudaGraphInstantiate(gr.exec.put(), g.get(), 0));
                 std::size_t n = 0;
-                CK(cudaGraphGetNodes(g, nullptr, &n));
+                CK(cudaGraphGetNodes(g.get(), nullptr, &n));
                 gr.nodes = n;
-                CK(cudaGraphDestroy(g));
-                it = graphs.emplace(key, gr).first;
+
+                it = graphs.emplace(key, std::move(gr)).first;
             }
             last_nodes = it->second.nodes;
-            CK(cudaGraphLaunch(it->second.exec, s));
+            CK(cudaGraphLaunch(it->second.exec.get(), s));
         } else {
             trunk(rows, want);
             last_nodes = 0;
@@ -670,6 +643,20 @@ struct CudaEngine::Impl {
         std::size_t kv_stride = 0, conv_stride = 0, delta_stride = 0;
     } ss;
 
+    ~Impl() {
+        int previous = device;
+        (void)cudaGetDevice(&previous);
+        (void)cudaSetDevice(device);
+        if (s) (void)cudaStreamSynchronize(s);
+        graphs.clear();
+        ss.graphs.clear();
+        if (s) cc::nvfp4_release_workspace(s);
+        allocations.clear();
+        W.owner.reset();
+        if (s) (void)cudaStreamDestroy(s);
+        (void)cudaSetDevice(previous);
+    }
+
     cc::GdnSlotTable slot_table() const {
         cc::GdnSlotTable t;
         t.row0 = ss.dev.g_row0;
@@ -684,21 +671,23 @@ struct CudaEngine::Impl {
     void configure_slots(std::uint32_t n) {
         if (n == 0) throw std::runtime_error("configure_slots: n must be >= 1");
         if (ss.n != 0) throw std::runtime_error("configure_slots: already configured");
+        const auto mark = allocations.size();
+        try {
         ss.n = n;
         ss.kv_stride = static_cast<std::size_t>(c.kv_heads) * opt.max_positions * c.head_dim;
         ss.conv_stride = static_cast<std::size_t>(gd.conv_channels()) * 3;
         ss.delta_stride = 2 * static_cast<std::size_t>(gd.value_heads) * gd.key_dim * gd.value_dim;
         for (std::uint32_t l = 0; l < c.layers; ++l) {
             if (L[l].attn) {
-                ss.kc.push_back(alloc<__nv_bfloat16>(ss.kv_stride * n, true));
-                ss.vc.push_back(alloc<__nv_bfloat16>(ss.kv_stride * n, true));
+                ss.kc.push_back(alloc<__nv_bfloat16>(core::checked_product({ss.kv_stride, n}), true));
+                ss.vc.push_back(alloc<__nv_bfloat16>(core::checked_product({ss.kv_stride, n}), true));
                 ss.conv.push_back(nullptr);
                 ss.delta.push_back(nullptr);
             } else {
                 ss.kc.push_back(nullptr);
                 ss.vc.push_back(nullptr);
-                ss.conv.push_back(alloc<float>(ss.conv_stride * n, true));
-                ss.delta.push_back(alloc<float>(ss.delta_stride * n, true));
+                ss.conv.push_back(alloc<float>(core::checked_product({ss.conv_stride, n}), true));
+                ss.delta.push_back(alloc<float>(core::checked_product({ss.delta_stride, n}), true));
             }
         }
         std::uint32_t gi = 0;
@@ -718,6 +707,12 @@ struct CudaEngine::Impl {
         ss.dev.g_slot = alloc<std::uint32_t>(RM, true);
         ss.len.assign(n, 0);
         CK(cudaDeviceSynchronize());
+        } catch (...) {
+            (void)cudaStreamSynchronize(s);
+            ss = SlotState{};
+            allocations.resize(mark);
+            throw;
+        }
     }
 
     void check_slot(std::uint32_t slot) const {
@@ -780,7 +775,7 @@ struct CudaEngine::Impl {
                 }
                 const auto& cl = ss.cl[gi++];
                 CK(cc::gdn_window_slots(gd, cl.layer, cl.state, cl.win, z, gout, groups, tab, c.rms_eps, s));
-                CK(cc::dense_rows(w.out, gout, x, rows, x, s));
+                CK(cc::dense_rows(w.out, gout, x, rows, x, s, opt.dense_arithmetic));
             } else {
                 attn_mixer(w, Bufs{x, xn, nullptr, ss.kc[l], ss.vc[l], rm}, rows);
             }
@@ -788,7 +783,7 @@ struct CudaEngine::Impl {
         }
         CK(cc::rmsnorm(x, hv, out_norm, xn, hv, c.rms_eps, s));
         if (want != LogitRows::none) {
-            CK(cc::dense_rows(head, xn, logits, rows, nullptr, s));
+            CK(cc::dense_rows(head, xn, logits, rows, nullptr, s, opt.dense_arithmetic));
             CK(cc::argmax_rows(logits, c.vocab, rows, d_top, d_argws, s));
         }
         if (auto_commit) CK(cc::gdn_commit_slots(gd, ss.cl.data(), static_cast<std::uint32_t>(ss.cl.size()), groups, tab, nullptr, false, s));
@@ -802,10 +797,11 @@ struct CudaEngine::Impl {
         std::vector<bool> seen(ss.n, false);
         for (std::uint32_t i = 0; i < n; ++i) {
             check_slot(g[i].slot);
-            if (g[i].rows == 0 || rows + g[i].rows > RM) throw std::runtime_error("forward_slots: rows must total 1..32");
+            if (g[i].rows == 0 || g[i].rows > RM - rows) throw std::runtime_error("forward_slots: rows must total 1..32");
             if (seen[g[i].slot]) throw std::runtime_error("forward_slots: a slot may appear once per batch");
             seen[g[i].slot] = true;
-            if (ss.len[g[i].slot] + g[i].rows > opt.max_positions) throw std::runtime_error("forward_slots: max_positions exceeded");
+            core::require_capacity(ss.len[g[i].slot], g[i].rows, opt.max_positions);
+            core::validate_token_ids(tokens ? tokens + rows : nullptr, g[i].rows, c.vocab);
             in.g_row0[i] = rows;
             in.g_rows[i] = g[i].rows;
             in.g_slot[i] = g[i].slot;
@@ -821,7 +817,7 @@ struct CudaEngine::Impl {
         if (graphs_on) {
             auto it = ss.graphs.find(key);
             if (it == ss.graphs.end()) {
-                cudaGraph_t gr = nullptr;
+                cc::UniqueHandle<cudaGraph_t, cudaGraphDestroy> gr;
                 CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
                 try {
                     trunk_slots(rows, n, want, auto_commit);
@@ -831,17 +827,17 @@ struct CudaEngine::Impl {
                     if (dummy) cudaGraphDestroy(dummy);
                     throw;
                 }
-                CK(cudaStreamEndCapture(s, &gr));
+                CK(cudaStreamEndCapture(s, gr.put()));
                 Graph ge;
-                CK(cudaGraphInstantiate(&ge.exec, gr, 0));
+                CK(cudaGraphInstantiate(ge.exec.put(), gr.get(), 0));
                 std::size_t nn = 0;
-                CK(cudaGraphGetNodes(gr, nullptr, &nn));
+                CK(cudaGraphGetNodes(gr.get(), nullptr, &nn));
                 ge.nodes = nn;
-                CK(cudaGraphDestroy(gr));
-                it = ss.graphs.emplace(key, ge).first;
+
+                it = ss.graphs.emplace(key, std::move(ge)).first;
             }
             last_nodes = it->second.nodes;
-            CK(cudaGraphLaunch(it->second.exec, s));
+            CK(cudaGraphLaunch(it->second.exec.get(), s));
         } else {
             trunk_slots(rows, n, want, auto_commit);
             last_nodes = 0;
@@ -1114,7 +1110,9 @@ struct CudaEngine::Impl {
 
     CudaEngine::MtpOut mtp(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0, bool want_top) {
         if (!mtp_ok) throw std::runtime_error("mtp_forward: no MTP tensors loaded");
-        if (rows == 0 || rows > RM || pos0 + rows > opt.max_positions) throw std::runtime_error("mtp_forward: bad rows/pos0");
+        if (rows == 0 || rows > RM) throw std::runtime_error("mtp_forward: bad rows/pos0");
+        core::require_capacity(pos0, rows, opt.max_positions);
+        core::validate_token_ids(next_tokens, rows, c.vocab);
         const std::uint32_t H = c.hidden;
         InputPack in{};
         in.pos0 = pos0;
@@ -1125,7 +1123,7 @@ struct CudaEngine::Impl {
         CK(cc::embedding_rows(embd, d_mids, mtmp, rows, s));
         CK(cc::rmsnorm(mtmp, src, m_enorm, mcat, dst, c.rms_eps, s));
         CK(cc::rmsnorm(hidden_dev, src, m_hnorm, mcat + H, dst, c.rms_eps, s));
-        CK(cc::dense_rows(m_eh, mcat, mx, rows, nullptr, s));
+        CK(cc::dense_rows(m_eh, mcat, mx, rows, nullptr, s, opt.dense_arithmetic));
         const cc::GroupedView hv{rows, 1, H, H, H};
         CK(cc::rmsnorm(mx, hv, M.attn_norm, mxn, hv, c.rms_eps, s));
         const Bufs b{mx, mxn, d_mpos, mkc, mvc};
@@ -1135,7 +1133,7 @@ struct CudaEngine::Impl {
         CK(cc::rmsnorm(mx, hv, m_shnorm, mxn, hv, c.rms_eps, s));
         CudaEngine::MtpOut o;
         if (want_top) {
-            CK(cc::dense_rows(head, mxn, mlogits, rows, nullptr, s));
+            CK(cc::dense_rows(head, mxn, mlogits, rows, nullptr, s, opt.dense_arithmetic));
             CK(cc::argmax_rows(mlogits, c.vocab, rows, d_mtop, d_argws, s));
             o.logits = mlogits;
             o.top = d_mtop;
@@ -1153,22 +1151,29 @@ CudaEngine::~CudaEngine() = default;
 std::unique_ptr<CudaEngine> CudaEngine::from_gguf(const std::string& path, const EngineOptions& opt) {
     std::unique_ptr<CudaEngine> e(new CudaEngine);
     auto& P = *e->p_;
+    CK(cudaGetDevice(&P.device));
     P.opt = opt;
+    P.graphs_on = opt.use_graphs;
+    if (!opt.max_positions) throw std::invalid_argument("max_positions must be positive");
     const auto info = gguf::read_file(path);
-    P.c = read_cfg(info);
+    P.c = validate(info, opt.max_positions);
+    validate_backend(P.c, opt.max_positions);
     const auto t0 = std::chrono::steady_clock::now();
     auto specs = specs_from_gguf(info, P.c.layers, opt.load_mtp);
     mark_fp4(opt, specs);
     layout(P.W, specs, P.c.layers);
     std::uint64_t tmp_bytes = 0;
     for (const auto& t : specs) if (t.fp4) tmp_bytes = std::max(tmp_bytes, t.src_bytes);
+    cc::UniqueHandle<void*, cudaFree> tmp_owner;
     unsigned char* tmp = nullptr;  // BF16 staging for the on-the-fly conversion (largest eligible tensor)
-    if (tmp_bytes) CK(cudaMalloc(reinterpret_cast<void**>(&tmp), tmp_bytes));
+    if (tmp_bytes) CK(cudaMalloc(tmp_owner.put(), tmp_bytes));
+    tmp = static_cast<unsigned char*>(tmp_owner.get());
     std::ifstream in(path, std::ios::binary);
     if (!in) throw std::runtime_error("cannot open " + path);
     constexpr std::size_t kChunk = 128u << 20;
-    unsigned char* pin = nullptr;
-    CK(cudaMallocHost(reinterpret_cast<void**>(&pin), kChunk));
+    cc::UniqueHandle<void*, cudaFreeHost> pin_owner;
+    CK(cudaMallocHost(pin_owner.put(), kChunk));
+    auto* pin = static_cast<unsigned char*>(pin_owner.get());
     for (auto& [name, t] : P.W.spec) {
         in.seekg(static_cast<std::streamoff>(t.file_off));
         std::uint64_t done = 0;
@@ -1187,8 +1192,8 @@ std::unique_ptr<CudaEngine> CudaEngine::from_gguf(const std::string& path, const
             CK(cudaDeviceSynchronize());
         }
     }
-    CK(cudaFreeHost(pin));
-    if (tmp) CK(cudaFree(tmp));
+    pin_owner.reset();
+    tmp_owner.reset();
     P.init();
     if (!opt.quiet)
         std::fprintf(stderr, "qwen35 engine: loaded %.2f GB in %.1f s, mtp %s\n", static_cast<double>(P.W.total) / 1e9,
@@ -1199,8 +1204,11 @@ std::unique_ptr<CudaEngine> CudaEngine::from_gguf(const std::string& path, const
 std::unique_ptr<CudaEngine> CudaEngine::synthetic(const Config& cfg, PackFormat pack, const EngineOptions& opt, std::uint64_t seed) {
     std::unique_ptr<CudaEngine> e(new CudaEngine);
     auto& P = *e->p_;
+    CK(cudaGetDevice(&P.device));
     P.opt = opt;
+    P.graphs_on = opt.use_graphs;
     P.c = cfg;
+    validate_backend(P.c, opt.max_positions);
     const auto t0 = std::chrono::steady_clock::now();
     if (opt.turbo_weights == TurboWeights::onfly) pack = PackFormat::bf16;  // onfly source is BF16
     const auto sp = synth_specs(cfg, pack, opt.load_mtp);
@@ -1210,8 +1218,10 @@ std::unique_ptr<CudaEngine> CudaEngine::synthetic(const Config& cfg, PackFormat 
     layout(P.W, specs, cfg.layers);
     std::uint64_t tmp_bytes = 0;
     for (const auto& t : specs) if (t.fp4) tmp_bytes = std::max(tmp_bytes, t.src_bytes);
+    cc::UniqueHandle<void*, cudaFree> tmp_owner;
     unsigned char* tmp = nullptr;
-    if (tmp_bytes) CK(cudaMalloc(reinterpret_cast<void**>(&tmp), tmp_bytes));
+    if (tmp_bytes) CK(cudaMalloc(tmp_owner.put(), tmp_bytes));
+    tmp = static_cast<unsigned char*>(tmp_owner.get());
     for (const auto& [t0_, f] : sp) {
         auto& t = P.W.spec[t0_.name];
         unsigned char* dst = t.fp4 ? tmp : P.W.base + P.W.off[t.name];
@@ -1232,7 +1242,7 @@ std::unique_ptr<CudaEngine> CudaEngine::synthetic(const Config& cfg, PackFormat 
         }
     }
     CK(cudaDeviceSynchronize());
-    if (tmp) CK(cudaFree(tmp));
+    tmp_owner.reset();
     P.init();
     if (!opt.quiet)
         std::fprintf(stderr, "qwen35 engine: synthetic %s %.2f GB generated in %.1f s, mtp %s\n", pack == PackFormat::bf16 ? "bf16" : "q8_0",
@@ -1241,21 +1251,10 @@ std::unique_ptr<CudaEngine> CudaEngine::synthetic(const Config& cfg, PackFormat 
     return e;
 }
 
-static std::string engine_identity_base(const EngineOptions& o, const char* arith);
-std::string engine_identity(const EngineOptions& o, const char* arith) {
-    std::string base = engine_identity_base(o, arith);
-    if (o.prefill_arith != PrefillArith::exact) base += std::string("-pf-") + prefill_arith_name(o.prefill_arith);
-    return base;
-}
-static std::string engine_identity_base(const EngineOptions& o, const char* arith) {
-    const std::string a = arith ? arith : "mma3";
-    if (o.turbo_weights == TurboWeights::off) return "qwen35-cuda-exact-" + a + "-v1";
-    if (o.turbo_weights == TurboWeights::native) return "qwen35-turbo-native-" + a + "-v1";
-    return std::string("qwen35-turbo-nvfp4-onfly-rtn16-v1") + (o.turbo_lm_head ? "" : "-lmhead-bf16");
-}
-
 void print_effective_config(const EngineOptions& o, const char* arith, std::FILE* f) {
-    const std::string id = engine_identity(o, arith);
+    static const char* names[] = {"fp32", "mma3", "mma2", "mma1"};
+    arith = names[static_cast<unsigned>(o.dense_arithmetic)];
+    const std::string id = engine_identity(o);
     std::fprintf(f, "effective-config:\n  identity: %s\n  prefix-cache-key: %s (never shared across identities)\n", id.c_str(), id.c_str());
     std::fprintf(f, "  dense-arith: %s\n  turbo-weights: %s\n  turbo-bits: %u\n  turbo-lm-head: %s\n  turbo-multi-launch: %s (bitwise neutral)\n",
                  arith ? arith : "mma3", o.turbo_weights == TurboWeights::off ? "off (exact pack)" : o.turbo_weights == TurboWeights::native ? "native" : "onfly",
@@ -1267,8 +1266,7 @@ void print_effective_config(const EngineOptions& o, const char* arith, std::FILE
 const Config& CudaEngine::config() const { return p_->c; }
 const EngineOptions& CudaEngine::options() const { return p_->opt; }
 std::string CudaEngine::identity() const {
-    static const char* names[] = {"fp32", "mma3", "mma2", "mma1"};
-    return engine_identity(p_->opt, names[static_cast<int>(cc::dense_arith())]);
+    return engine_identity(p_->opt);
 }
 std::uint32_t CudaEngine::nvfp4_tensors() const {
     std::uint32_t n = 0;

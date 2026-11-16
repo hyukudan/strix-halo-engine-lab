@@ -2,6 +2,8 @@
 
 #include <cmath>
 #include <stdexcept>
+#include <limits>
+#include "../core/dense_linear.hpp"
 
 namespace strix::qwen35 {
 namespace {
@@ -69,11 +71,39 @@ Config config_from_gguf(const gguf::FileInfo& info) {
     for (const auto& t : info.tensors) {
         if (t.name == "token_embd.weight") {
             if (t.dimensions.size() != 2 || t.dimensions[0] != c.hidden) bad("token_embd.weight", "shape must be [hidden, vocab]");
+            if (t.dimensions[1] == 0 || t.dimensions[1] > 0x7FFFFFFFULL)
+                bad("token_embd.weight", "vocabulary must fit a positive signed index");
             c.vocab = static_cast<std::uint32_t>(t.dimensions[1]);
+            for (const auto width : {2ULL * c.heads * c.head_dim, 1ULL * c.kv_heads * c.head_dim,
+                                    (2ULL * c.gdn_key_heads + c.gdn_value_heads) * c.gdn_key_dim})
+                if (width > std::numeric_limits<std::uint32_t>::max()) bad("dimensions", "width overflow");
             return c;
         }
     }
     bad("token_embd.weight", "missing");
+}
+
+void validate_backend(const Config& c, std::uint32_t max_positions) {
+    if (!c.layers || c.layers > 64 || !c.full_attention_interval || c.full_attention_interval > c.layers ||
+        !c.heads || !c.kv_heads || c.heads % c.kv_heads || c.heads / c.kv_heads > 8 ||
+        c.head_dim != 256 || c.gdn_key_dim != 128 || c.gdn_value_dim != 128 || c.gdn_conv_kernel != 4 ||
+        !c.gdn_key_heads || !c.gdn_value_heads || c.gdn_value_heads % c.gdn_key_heads ||
+        !c.hidden || c.hidden % 32 || !c.intermediate || c.intermediate % 32 || !c.vocab || c.vocab > 0x7FFFFFFFU ||
+        !c.rotary_dim || c.rotary_dim > c.head_dim || c.rotary_dim % 2 || !max_positions)
+        bad("backend", "unsupported dimensions or capacity");
+    // Launch row offsets and grids use 32-bit indices; allocation products use size_t.
+    for (const auto width : {2ULL * c.hidden, 1ULL * c.intermediate, 1ULL * c.vocab,
+                            2ULL * c.heads * c.head_dim, 1ULL * c.kv_heads * c.head_dim,
+                            (2ULL * c.gdn_key_heads + c.gdn_value_heads) * c.gdn_key_dim})
+        if (width > (std::numeric_limits<std::uint32_t>::max() - 255ULL) / 32)
+            bad("backend", "row width overflow");
+    (void)core::checked_product({c.kv_heads, max_positions, c.head_dim, 2});
+    (void)core::checked_product({c.gdn_value_heads, c.gdn_key_dim, c.gdn_value_dim, 2, 4});
+    for (const auto& spec : expected_tensors(c)) {
+        std::size_t elements = 1;
+        for (const auto d : spec.dimensions) elements = core::checked_product({elements, static_cast<std::size_t>(d)});
+        (void)core::checked_product({elements, 4});
+    }
 }
 
 std::vector<TensorSpec> expected_tensors(const Config& c) {

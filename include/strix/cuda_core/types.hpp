@@ -6,10 +6,31 @@
 // one point (cc_expf/cc_log1pf in src/cuda_core/common.cuh) so a HIP twin can adopt the same bits.
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 
 #include <cuda_runtime.h>
 
 namespace strix::cuda_core {
+
+// Move-only CUDA handle, also used for allocations during partial construction.
+template <class T, auto Release>
+class UniqueHandle {
+    T value_{};
+public:
+    UniqueHandle() = default;
+    explicit UniqueHandle(T value) noexcept : value_(value) {}
+    ~UniqueHandle() { reset(); }
+    UniqueHandle(const UniqueHandle&) = delete;
+    UniqueHandle& operator=(const UniqueHandle&) = delete;
+    UniqueHandle(UniqueHandle&& other) noexcept : value_(std::exchange(other.value_, T{})) {}
+    UniqueHandle& operator=(UniqueHandle&& other) noexcept {
+        if (this != &other) { reset(); value_ = std::exchange(other.value_, T{}); }
+        return *this;
+    }
+    void reset(T value = {}) noexcept { if (value_) (void)Release(value_); value_ = value; }
+    T get() const noexcept { return value_; }
+    T* put() noexcept { reset(); return &value_; }
+};
 
 enum class WeightFormat : std::uint8_t {
     bf16,  // 2 bytes per element, row-major [out][in]

@@ -19,22 +19,17 @@ DenseArith dense_arith();
 // The optional residual is added after the dot is complete, so y = residual + W x is bitwise (W x) then add. y may alias
 // residual. Requires in % 8 == 0 (bf16/f32) or in % 32 == 0 (q8_0).
 cudaError_t dense_rows(const DenseWeight& w, const float* x, float* y, std::uint32_t rows, const float* residual,
-                       cudaStream_t stream);
+                       cudaStream_t stream, DenseArith arithmetic = dense_arith());
 
-// Up to 4 weights with the same x, format and in served by ONE launch (ys[j] gets weights[j]'s output); bitwise equal to separate
+// Up to 4 weights with the same x, format and in grouped by arithmetic route (ys[j] gets weights[j]'s output); bitwise equal to separate
 // dense_rows calls (the per-output-row order does not depend on the launch composition). No residual.
 cudaError_t dense_rows_multi(const DenseWeight* ws, float* const* ys, int n, const float* x, std::uint32_t rows,
-                             const float* residual, cudaStream_t stream);
-
-// Up to 4 weights with the same x, format and in served by ONE launch (ys[j] receives output j); bitwise equal to separate
-// dense_rows calls (the per-output-row order does not depend on the launch composition). No residual.
-cudaError_t dense_rows_multi(const DenseWeight* ws, float* const* ys, int n, const float* x, std::uint32_t rows,
-                             const float* residual, cudaStream_t stream);
+                             const float* residual, cudaStream_t stream, DenseArith arithmetic = dense_arith());
 
 // y[r][o] = silu(gate_dot) * up_dot with silu(g) = g / (1 + expf(-g)); bitwise equal to two dense_rows calls followed by the
 // same epilogue. gate and up must share format/in/out.
 cudaError_t dense_gate_up_silu_rows(const DenseWeight& gate, const DenseWeight& up, const float* x, float* y,
-                                    std::uint32_t rows, cudaStream_t stream);
+                                    std::uint32_t rows, cudaStream_t stream, DenseArith arithmetic = dense_arith());
 
 // out[r][i] = dequant(row ids[r]) of a [vocab][in] table (embedding gather), FP32.
 cudaError_t embedding_rows(const DenseWeight& table, const std::uint32_t* ids, float* out, std::uint32_t rows,
