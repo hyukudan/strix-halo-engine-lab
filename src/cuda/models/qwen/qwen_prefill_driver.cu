@@ -1,3 +1,4 @@
+#include "strix/weight/admission.hpp"
 // CUDA Qwen prefill driver (see include/strix/cuda/qwen_prefill.hpp): model upload, per-block step loop in the HIP
 // step order, node state export. The arithmetic lives in the family libraries (qwen_hc, qwen_dense, qwen_gdn, qwen_qsa,
 // qwen_moe, qwen_ple, qwen_mtp), each bit-identical to its HIP kernels; this file only wires buffers and order.
@@ -42,6 +43,7 @@
 #include <exception>
 #include <functional>
 #include <map>
+#include "strix/recurrent_state_policy.hpp"
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -301,6 +303,16 @@ struct BlockFields {
 struct Prefill::Impl : BlockFields {
     Config cfg;
     qwen_route::Policy route_policy;
+    // Stored element of the GDN recurrent matrices (STRIX_RECURRENT_STATE, resolved once in the constructor). gdn_state /
+    // gdn_other keep their float* type but hold 2-byte elements for f16 / bf16: state_layer_floats = float-sized units of one
+    // layer's matrix (kMatrixFloats for f32, half of it for 16-bit; kMatrixFloats is even).
+    RecurrentStateType state_type = RecurrentStateType::f32;
+    std::uint64_t state_layer_floats = gdn::kMatrixFloats;
+    [[nodiscard]] std::uint64_t state_bytes(std::uint64_t layers) const {
+        return recurrent_state_bytes(layers * gdn::kMatrixFloats, state_type);
+    }
+    // per_row: decode / window / commit-replay launches narrow the state after every row; prefill narrows once at the store
+    [[nodiscard]] gdn::Tuning gdn_tuning(bool per_row) const { return gdn::Tuning{4, state_type, per_row}; }
     std::uint64_t snapshot_binding = qwen_route::new_engine_binding();
     cudaStream_t copy_stream = nullptr;                    // release_by_layer: per-layer D2H
     cudaStream_t side_stream = nullptr;                    // decode: the shared expert beside the routed MoE
@@ -309,6 +321,8 @@ struct Prefill::Impl : BlockFields {
     std::function<void(std::uint32_t)> after_layer;        // called (host) after layer l's launches of a block
     am::Tables tables{};
     qsa::RopeTable* rope = nullptr;
+    weight::WeightMap source_weights;
+    std::vector<weight::LegacyConversion> source_conversions;
     gguf::FileInfo info;                       // tensors of every part, with the types as stored on the device
     std::string ple_part;                      // the part holding per_layer_token_embd
     bool native_experts = false;               // some layer's experts need the native MoE path
@@ -472,12 +486,23 @@ void Prefill::Impl::upload_model() {
     std::uint64_t scratch_bytes = 0;
     for (const auto& part : model_parts(cfg.model_gguf)) {
     const auto pinfo = gguf::read_file(part);
+    std::shared_ptr<const weight::Source> owner;
+    auto admission = weight::open_source(part,owner);
+    weight::TensorIndex indexed;
+    if (admission) admission = weight::index_gguf(pinfo,owner,indexed);
+    weight::WeightMap admitted;
+    if (admission) admission = weight::bind_qwen(indexed,admitted);
+    if (!admission) throw std::runtime_error("Qwen weight admission: " + admission.detail);
+    source_weights.insert(source_weights.end(),admitted.begin(),admitted.end());
     std::FILE* f = std::fopen(part.c_str(), "rb");
     if (!f) throw std::runtime_error("cannot open " + part);
     for (auto t : pinfo.tensors) {
         if (t.name.rfind("per_layer_token_embd", 0) == 0) { ple_part = part; info.tensors.push_back(t); continue; }  // PLE (host)
         if (t.name == "output.weight" && !cfg.decode) { info.tensors.push_back(t); continue; }                  // head (node)
         const Target target = transcode_target(t);
+        if (target != Target::native) source_conversions.push_back({std::find_if(indexed.tensors.begin(),indexed.tensors.end(),[&](const auto& raw){return raw.name==t.name;})->id,
+            target == Target::q8_0 ? weight::FormatId{"gguf.q8_0",1} : weight::FormatId{"plain.f32",1},
+            target == Target::q8_0 ? "legacy.qwen.cuda.amax127-f16-roundf@1" : "legacy.qwen.cuda.decode-f32@1"});
         if (target != Target::native && !transcode::supported(t.ggml_type))
             throw std::runtime_error("no decoder for " + t.name + " type " + std::to_string(t.ggml_type));
         void* raw = nullptr;
@@ -776,7 +801,7 @@ void Prefill::Impl::allocate() {
     }
     // host staging: every row component's rows plus the fixed blob
     const std::uint64_t P = cfg.max_positions;
-    host_bytes = P * (12ULL * 2048 + 12ULL * 256 + 2048 + 256) + 36 * gdn::kMatrixFloats * 4 + 36 * gdn::kConvStateHalfs * 2 +
+    host_bytes = P * (12ULL * 2048 + 12ULL * 256 + 2048 + 256) + state_bytes(36) + 36 * gdn::kConvStateHalfs * 2 +
                  10240ULL * 9 * 2 + 16 + kWide * 2;
     if (cfg.export_state) ck(cudaMallocHost(&host, host_bytes), "pinned export staging");  // device-only runs need none
 }
@@ -789,8 +814,8 @@ std::uint64_t Prefill::Impl::rows_bytes_at(std::uint64_t P) const {
 }
 
 std::uint64_t Prefill::Impl::fixed_session_bytes() const {
-    std::uint64_t b = 36ULL * gdn::kMatrixFloats * 4 + 36ULL * gdn::kConvStateHalfs * 2 + 10240ULL * 9 * 2;
-    if (cfg.decode) b += 36ULL * gdn::kMatrixFloats * 4 + 36ULL * gdn::kConvStateHalfs * 2 + 10240ULL * 9 * 2;
+    std::uint64_t b = state_bytes(36) + 36ULL * gdn::kConvStateHalfs * 2 + 10240ULL * 9 * 2;
+    if (cfg.decode) b += state_bytes(36) + 36ULL * gdn::kConvStateHalfs * 2 + 10240ULL * 9 * 2;
     if (mtp && cfg.decode) b += kWide * 2;
     return b;
 }
@@ -851,12 +876,12 @@ SessionState& Prefill::Impl::new_session(std::uint64_t P) {
     };
     try {
         alloc_rows(*s, P);
-        s->gdn_state = static_cast<float*>(alloc(36 * gdn::kMatrixFloats * 4, "gdn state"));
+        s->gdn_state = static_cast<float*>(alloc(state_bytes(36), "gdn state"));
         s->gdn_base = s->gdn_state;  // graph key parity: which of the two buffers is current
         s->gdn_conv = static_cast<std::uint16_t*>(alloc(36 * gdn::kConvStateHalfs * 2, "gdn conv"));
         s->ple_conv = static_cast<std::uint16_t*>(alloc(10240 * 9 * 2, "ple conv"));
         if (cfg.decode) {
-            s->gdn_other = static_cast<float*>(alloc(36 * gdn::kMatrixFloats * 4, "gdn state window"));
+            s->gdn_other = static_cast<float*>(alloc(state_bytes(36), "gdn state window"));
             s->conv_before = static_cast<std::uint16_t*>(alloc(36 * gdn::kConvStateHalfs * 2, "conv before"));
             s->ple_before = static_cast<std::uint16_t*>(alloc(10240 * 9 * 2, "ple conv before"));
         }
@@ -895,6 +920,11 @@ void Prefill::Impl::drop_graph(std::map<GraphKey, StepGraph>::iterator it) {
 Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
     auto& m = *impl_;
     m.route_policy = qwen_route::environment(config.moe_route_bf16);
+    m.state_type = recurrent_state_policy().type;
+    // Typed prefill currently rounds at call boundaries. Reject before device or
+    // cache setup until rounding is independent of scheduling and prefix history.
+    require_f32_recurrent_state(m.state_type, "CUDA application (schedule-independent prefill and prefix reuse unqualified)");
+    m.state_layer_floats = recurrent_state_bytes(gdn::kMatrixFloats, m.state_type) / sizeof(float);
     m.cfg = config;
     m.cfg.moe_route_bf16 = m.route_policy.enabled; // freeze before device work
     const auto* diagnostic_graphs = std::getenv("STRIX_QRTX_GRAPHS");
@@ -982,6 +1012,10 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
                   static_cast<double>(m.w.bytes) / 1e9, std::chrono::duration<double>(Clock::now() - t0).count(), m.cap,
                   config.max_positions, m.transcoded, m.native_experts ? "true" : "false");
     m.describe = buf; // OFF receipt remains the original byte sequence.
+    if (m.state_type != RecurrentStateType::f32) {  // f32 keeps the original receipt bytes
+        m.describe.pop_back();
+        m.describe += std::string(",\"recurrent_state\":\"") + recurrent_state_type_name(m.state_type) + "\"}";
+    }
     if (m.route_policy.enabled) {
         const auto id = numerical_identity();
         char identity_hash[17];
@@ -997,6 +1031,8 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
 }
 
 Prefill::~Prefill() = default;
+const weight::WeightMap& Prefill::weight_map() const noexcept { return impl_->source_weights; }
+const std::vector<weight::LegacyConversion>& Prefill::weight_conversions() const noexcept { return impl_->source_conversions; }
 
 std::string Prefill::describe() const {
     if (!impl_->cfg.diagnostic_bf16_mtp) return impl_->describe;
@@ -1109,16 +1145,16 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
                     x.count = seg[i].rows;
                     if (table_mode) {
                         x.conv = gdn::DevRef<std::uint16_t>{nullptr, &seg_table[i].gdn_conv, std::uint64_t{o} * gdn::kConvStateHalfs};
-                        x.state_in = gdn::DevRef<float>{nullptr, &seg_table[i].gdn_state, std::uint64_t{o} * gdn::kMatrixFloats};
-                        x.state_out = gdn::DevRef<float>{nullptr, &seg_table[i].gdn_other, std::uint64_t{o} * gdn::kMatrixFloats};
+                        x.state_in = gdn::DevRef<float>{nullptr, &seg_table[i].gdn_state, std::uint64_t{o} * state_layer_floats};
+                        x.state_out = gdn::DevRef<float>{nullptr, &seg_table[i].gdn_other, std::uint64_t{o} * state_layer_floats};
                     } else {
                         x.conv = gdn::DevRef<std::uint16_t>{ss.gdn_conv + o * gdn::kConvStateHalfs};
-                        x.state_in = gdn::DevRef<float>{ss.gdn_state + o * gdn::kMatrixFloats};
-                        x.state_out = gdn::DevRef<float>{ss.gdn_other + o * gdn::kMatrixFloats};
+                        x.state_in = gdn::DevRef<float>{ss.gdn_state + o * state_layer_floats};
+                        x.state_out = gdn::DevRef<float>{ss.gdn_other + o * state_layer_floats};
                     }
                 }
                 gdn::launch_core_multi(hidden, kHidden, gr, sg, win_raw + std::uint64_t{o} * kMaxWindowRows * gdn::kConvWidth, gdn_scratch,
-                    gw, tables, stream);
+                    gw, tables, stream, gdn_tuning(true));
             } else
             for (std::uint32_t i = 0; i < count; ++i) {
                 const std::uint64_t off = seg[i].offset;
@@ -1128,16 +1164,19 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
                 if (window && table_mode)
                     gdn::launch_core_split_ref(hidden + off * kHidden, kHidden, grs, seg[i].rows,
                         gdn::DevRef<std::uint16_t>{nullptr, &seg_table[i].gdn_conv, std::uint64_t{o} * gdn::kConvStateHalfs},
-                        gdn::DevRef<float>{nullptr, &seg_table[i].gdn_state, std::uint64_t{o} * gdn::kMatrixFloats},
-                        gdn::DevRef<float>{nullptr, &seg_table[i].gdn_other, std::uint64_t{o} * gdn::kMatrixFloats},
-                        win_raw + (std::uint64_t{o} * kMaxWindowRows + off) * gdn::kConvWidth, gdn_scratch, gw, tables, stream);
+                        gdn::DevRef<float>{nullptr, &seg_table[i].gdn_state, std::uint64_t{o} * state_layer_floats},
+                        gdn::DevRef<float>{nullptr, &seg_table[i].gdn_other, std::uint64_t{o} * state_layer_floats},
+                        win_raw + (std::uint64_t{o} * kMaxWindowRows + off) * gdn::kConvWidth, gdn_scratch, gw, tables, stream,
+                        nullptr, gdn_tuning(true));
                 else if (window)
                     gdn::launch_core_split(hidden + off * kHidden, kHidden, grs, seg[i].rows, ss.gdn_conv + o * gdn::kConvStateHalfs,
-                        ss.gdn_state + o * gdn::kMatrixFloats, ss.gdn_other + o * gdn::kMatrixFloats,
-                        win_raw + (std::uint64_t{o} * kMaxWindowRows + off) * gdn::kConvWidth, gdn_scratch, gw, tables, stream);
+                        ss.gdn_state + o * state_layer_floats, ss.gdn_other + o * state_layer_floats,
+                        win_raw + (std::uint64_t{o} * kMaxWindowRows + off) * gdn::kConvWidth, gdn_scratch, gw, tables, stream,
+                        nullptr, gdn_tuning(true));
                 else
                     gdn::launch_core(hidden + off * kHidden, kHidden, grs, seg[i].rows, ss.gdn_conv + o * gdn::kConvStateHalfs,
-                                     ss.gdn_state + o * gdn::kMatrixFloats, gdn_scratch, gw, tables, stream);
+                                     ss.gdn_state + o * state_layer_floats, gdn_scratch, gw, tables, stream, nullptr,
+                                     gdn_tuning(false));
             }
             nv.pop();
             nv.push("dense_out");
@@ -1327,7 +1366,7 @@ Timing Prefill::run(SessionId session, const std::vector<std::uint32_t>& tokens,
         ck(cudaMemsetAsync(S.kv[o], 0, position * 2048, m.stream), "kv clear");
         ck(cudaMemsetAsync(S.raw_index[o], 0, position * 256, m.stream), "index clear");
     }
-    ck(cudaMemsetAsync(S.gdn_state, 0, 36 * gdn::kMatrixFloats * 4, m.stream), "gdn clear");
+    ck(cudaMemsetAsync(S.gdn_state, 0, m.state_bytes(36), m.stream), "gdn clear");
     for (auto& v : S.pooled_valid) v = 0;
     S.mtp_pooled_valid = 0;
     ck(cudaMemsetAsync(S.gdn_conv, 0, 36 * gdn::kConvStateHalfs * 2, m.stream), "conv clear");
@@ -1379,8 +1418,8 @@ Timing Prefill::run(SessionId session, const std::vector<std::uint32_t>& tokens,
                     copy("index.L" + layer, false, p0, rows, S.raw_index[o] + p0 * 128, std::uint64_t{rows} * 256);
                 } else if (last_block) {
                     const auto g = gdn_ordinal(l);
-                    const std::uint64_t mb = std::uint64_t{gdn::kMatrixFloats} * 4, cb = std::uint64_t{gdn::kConvStateHalfs} * 2;
-                    copy("recurrent_matrix", true, g * mb, 0, S.gdn_state + std::uint64_t{g} * gdn::kMatrixFloats, mb);
+                    const std::uint64_t mb = m.state_bytes(1), cb = std::uint64_t{gdn::kConvStateHalfs} * 2;
+                    copy("recurrent_matrix", true, g * mb, 0, S.gdn_state + std::uint64_t{g} * m.state_layer_floats, mb);
                     copy("gdn_convolution", true, g * cb, 0, S.gdn_conv + std::uint64_t{g} * gdn::kConvStateHalfs, cb);
                 }
                 if (l == 1 && last_block) copy("ple_convolution", true, 0, 0, S.ple_conv, 10240ULL * 9 * 2);
@@ -1518,7 +1557,7 @@ Timing Prefill::run(SessionId session, const std::vector<std::uint32_t>& tokens,
         return timing;
     }
     if (!m.cfg.release_by_layer) {  // else sent per layer with the last block (release_by_layer)
-        fixed("recurrent_matrix", S.gdn_state, 36 * gdn::kMatrixFloats * 4);
+        fixed("recurrent_matrix", S.gdn_state, m.state_bytes(36));
         fixed("gdn_convolution", S.gdn_conv, 36 * gdn::kConvStateHalfs * 2);
         fixed("ple_convolution", S.ple_conv, 10240 * 9 * 2);
     }
@@ -1555,8 +1594,8 @@ void Prefill::Impl::commit_one(SessionState& s, std::uint32_t keep) {
         for (std::uint32_t o = 0; o < 36; ++o) {
             float* base = win_rows + (std::uint64_t{o} * kMaxWindowRows + off) * gdn_stride;
             const gdn::Rows gr{base, base + 10240, base + 16384, base + 16432, base + 16480, gdn_stride};
-            gdn::launch_recurrence_split(gr, keep, s.gdn_state + o * gdn::kMatrixFloats, s.gdn_other + o * gdn::kMatrixFloats,
-                gdn_scratch, tables, stream);
+            gdn::launch_recurrence_split(gr, keep, s.gdn_state + o * state_layer_floats, s.gdn_other + o * state_layer_floats,
+                gdn_scratch, tables, stream, gdn_tuning(true));
             gdn::launch_conv_rollback(win_raw + (std::uint64_t{o} * kMaxWindowRows + off) * gdn::kConvWidth, keep,
                 s.conv_before + o * gdn::kConvStateHalfs, s.gdn_conv + o * gdn::kConvStateHalfs, stream);
         }
@@ -1961,7 +2000,7 @@ std::uint64_t Prefill::length(SessionId session) const { return impl_->session(s
 std::uint64_t Prefill::row_bytes() const { return (12ULL + (impl_->mtp ? 1ULL : 0ULL)) * (2048 + 256); }
 
 std::uint64_t Prefill::fixed_bytes() const {
-    return 36ULL * gdn::kMatrixFloats * sizeof(float) + 36ULL * gdn::kConvStateHalfs * 2 + 10240ULL * 9 * 2 + 8;
+    return impl_->state_bytes(36) + 36ULL * gdn::kConvStateHalfs * 2 + 10240ULL * 9 * 2 + 8;
 }
 
 void Prefill::Impl::copy_rows(SessionState& s, std::uint64_t first, std::uint64_t count, void* data, bool importing, bool target_only) {
@@ -1986,7 +2025,7 @@ void Prefill::Impl::copy_fixed(SessionState& s, void* data, bool importing) {
         cursor += bytes;
     };
     // Preserve the current-buffer parity: pointer graphs key it and table graphs read it at replay.
-    copy(s.gdn_state, 36ULL * gdn::kMatrixFloats * sizeof(float));
+    copy(s.gdn_state, state_bytes(36));
     copy(s.gdn_conv, 36ULL * gdn::kConvStateHalfs * 2);
     copy(s.ple_conv, 10240ULL * 9 * 2);
     copy(s.ngram, sizeof(s.ngram));
@@ -2043,6 +2082,8 @@ void Prefill::import_state(SessionId session, std::uint64_t length, const std::v
 
 CanonicalState Prefill::capture_canonical(SessionId session) {
     auto& m = *impl_;
+    if (const auto refusal = recurrent_state_route_refusal(m.state_type, false, "canonical snapshot (untagged f32 matrix)"); !refusal.empty())
+        throw std::invalid_argument(refusal);
     auto& s = m.session(session);
     if (m.mtp && !m.cfg.diagnostic_bf16_mtp) throw std::invalid_argument("canonical snapshot MTP-sidecar layout is unqualified");
     if (!s.length || s.length >= s.capacity) throw std::invalid_argument("canonical snapshot length");
@@ -2088,6 +2129,8 @@ CanonicalState Prefill::capture_canonical(SessionId session) {
 
 void Prefill::restore_canonical(const CanonicalState& state, SessionId session) {
     auto& m = *impl_;
+    if (const auto refusal = recurrent_state_route_refusal(m.state_type, false, "canonical snapshot (untagged f32 matrix)"); !refusal.empty())
+        throw std::invalid_argument(refusal);
     auto& s = m.session(session);
     if (m.mtp && !m.cfg.diagnostic_bf16_mtp) throw std::invalid_argument("canonical snapshot MTP-sidecar layout is unqualified");
     if (!state.length || state.length >= s.capacity) throw std::invalid_argument("canonical snapshot length");
@@ -2190,7 +2233,7 @@ std::uint32_t Prefill::Impl::prefill_enqueue(SessionState& S, const std::vector<
             ck(cudaMemsetAsync(S.kv[o], 0, position * 2048, stream), "kv clear");
             ck(cudaMemsetAsync(S.raw_index[o], 0, position * 256, stream), "index clear");
         }
-        ck(cudaMemsetAsync(S.gdn_state, 0, 36 * gdn::kMatrixFloats * 4, stream), "gdn clear");
+        ck(cudaMemsetAsync(S.gdn_state, 0, state_bytes(36), stream), "gdn clear");
         for (auto& v : S.pooled_valid) v = 0;
         S.mtp_pooled_valid = 0;
         ck(cudaMemsetAsync(S.gdn_conv, 0, 36 * gdn::kConvStateHalfs * 2, stream), "conv clear");

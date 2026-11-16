@@ -1,4 +1,5 @@
 #include "strix/env_flags.hpp"
+#include "strix/pinned_host.hpp"
 #include "strix/file_snapshot.hpp"
 #include "strix/hip_check.hpp"
 #include "strix/ds41_prefill_tuning.hpp"
@@ -1230,7 +1231,7 @@ DevicePrefill::~DevicePrefill() {
     if (impl_->comm_stream != nullptr) (void)hipStreamDestroy(impl_->comm_stream);
     if (impl_->stream != nullptr) (void)hipStreamDestroy(impl_->stream);
     impl_->join_engram_ahead();
-    if (impl_->engram_pinned != nullptr) (void)hipHostFree(impl_->engram_pinned);
+    if (impl_->engram_pinned != nullptr) (void)strix::host_pin::release(impl_->engram_pinned);
 }
 
 std::uint64_t DevicePrefill::weight_bytes() const noexcept {
@@ -2159,10 +2160,10 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         const std::size_t bytes = requests.size() * 264U;
         if (m.overlap) {
             if (m.engram_pinned_bytes < bytes) {
-                if (m.engram_pinned != nullptr) check(hipHostFree(m.engram_pinned), "engram pinned");
+                if (m.engram_pinned != nullptr) check(strix::host_pin::release(m.engram_pinned), "engram pinned");
                 m.engram_pinned = nullptr;
                 m.engram_pinned_bytes = 0;
-                check(hipHostMalloc(reinterpret_cast<void**>(&m.engram_pinned), bytes, hipHostMallocDefault), "engram pinned");
+                check(strix::host_pin::allocate(reinterpret_cast<void**>(&m.engram_pinned), bytes, hipHostMallocDefault), "engram pinned");
                 m.engram_pinned_bytes = bytes;
             }
             engram_data = m.engram_pinned;

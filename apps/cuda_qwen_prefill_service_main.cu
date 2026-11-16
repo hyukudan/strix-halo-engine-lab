@@ -340,6 +340,17 @@ void handle(Service& svc, http::Sock s, std::uint32_t max_positions, const std::
 }  // namespace
 
 int main(int argc, char** argv) {
+    // --help answers before any device or file is touched (post-install smoke: the binary and its DLLs load).
+    {
+        if (strix::device::wants_help(argc, argv)) {
+            std::printf("usage: strix-cuda-qwen-prefill-service --model FILE.gguf --tables DIR --rope-table FILE\n"
+                        "         [--mtp-sidecar FILE] [--max-positions N] [--bind ADDR] [--port N]\n"
+                        "         [--devices FILE | --device-id ID]\n"
+                        "Exact CUDA Qwen prefill for a node (state hand-off). Protocol and options:\n"
+                        "docs/engine/serving/qwen-cuda-prefill.md\n");
+            return 0;
+        }
+    }
     // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
     // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
     strix::device::bind_cuda_main(argc, argv);

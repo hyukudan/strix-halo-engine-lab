@@ -1,4 +1,5 @@
 #include "xport/transport_backend.hpp"
+#include "strix/pinned_host.hpp"
 // The GLM exchange module behind the engine's Exchange seam (see glm_xfer_exchange.hpp).
 #include "glm_xfer_exchange.hpp"
 #include "glm_post_exchange.hpp"
@@ -90,11 +91,11 @@ SeqparExchange::Side::Side(unsigned max_rows, unsigned compute_streams) : stream
         ok(hipEventCreateWithFlags(&column, hipEventDisableTiming), "seqpar column handoff");
         // The transport writes peer rows straight into this consumer buffer.
         // Ordinary hipMalloc storage is not assumed host-coherent or CPU writable.
-        ok(hipHostMalloc(reinterpret_cast<void**>(&normalized_host), GlmSchedule::row_bytes(max_rows),
+        ok(strix::host_pin::allocate(reinterpret_cast<void**>(&normalized_host), GlmSchedule::row_bytes(max_rows),
                          hipHostMallocMapped | hipHostMallocCoherent), "seqpar normalized buffer");
         ok(hipHostGetDevicePointer(reinterpret_cast<void**>(&normalized_dev), normalized_host, 0), "seqpar normalized alias");
     } catch (...) {
-        if (normalized_host) (void)hipHostFree(normalized_host);
+        if (normalized_host) (void)strix::host_pin::release(normalized_host);
         if (column) (void)hipEventDestroy(column);
         for (auto e : consumed) if (e) (void)hipEventDestroy(e);
         for (auto e : ready) if (e) (void)hipEventDestroy(e);
@@ -110,7 +111,7 @@ SeqparExchange::Side::~Side() {
     // normal execution joins and synchronizes the compute queues before exit.
     for (auto s : compute) if (s) (void)hipStreamSynchronize(s);
     if (stream) (void)hipStreamSynchronize(stream);
-    if (normalized_host) (void)hipHostFree(normalized_host);
+    if (normalized_host) (void)strix::host_pin::release(normalized_host);
     if (column) (void)hipEventDestroy(column);
     for (auto e : consumed) if (e) (void)hipEventDestroy(e);
     for (auto e : ready) if (e) (void)hipEventDestroy(e);
