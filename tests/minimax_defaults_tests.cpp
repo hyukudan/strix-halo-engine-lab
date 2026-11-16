@@ -1,4 +1,4 @@
-#ifdef _MSC_VER
+#if defined(_MSC_VER) && !defined(_CRT_SECURE_NO_WARNINGS)
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 // MiniMax M3.1 defaults-on resolver, CPU only: the host invocation matches the measured production
@@ -767,9 +767,18 @@ void test_fast_prefill_profile() {
         idx["STRIX_MM_PF_IDX_WMMA"] = "1";
         const auto pi = md::prefill_policy(lookup(idx));
         check(pi.idx_wmma && pi.idx_wmma_layers == "40-59" && pi.msa_flash == 1 &&
+                  pi.router_wmma && pi.router_wmma_layers == "40-59" &&
                   pi.policies == "msa-flash-bf16-l40-v1+minimax-index-proj-wmma-v1-l40-59" &&
-                  md::prefill_identity(lookup(idx)) == "prefill_msa=msa-flash-bf16-l40-v1;prefill_idxproj=minimax-index-proj-wmma-v1-l40-59",
+                  md::prefill_identity(lookup(idx)) == "prefill_msa=msa-flash-bf16-l40-v1;prefill_idxproj=minimax-index-proj-wmma-v1-l40-59;prefill_router=mm-pf-router-wmma-v1-l40-59",
               "fast idx: explicit member runs beside the bundle, own cache field");
+        auto idx_router_off = idx;
+        idx_router_off["STRIX_MM_PF_ROUTER_WMMA"] = "0";
+        const auto pi_router_off = md::prefill_policy(lookup(idx_router_off));
+        check(pi_router_off.idx_wmma && pi_router_off.idx_wmma_layers == "40-59" && pi_router_off.msa_flash == 1 &&
+                  !pi_router_off.router_wmma && pi_router_off.policies == pi.policies &&
+                  md::prefill_identity(lookup(idx_router_off)) == "prefill_msa=msa-flash-bf16-l40-v1;prefill_idxproj=minimax-index-proj-wmma-v1-l40-59" &&
+                  !agree(idx, idx_router_off) && !agree(idx_router_off, idx),
+              "fast idx: router OFF preserves index policy and separates rank identities");
         check(!md::prefill_policy(lookup(bundle)).idx_wmma, "fast idx: not a bundle member before its gate");
         for (const char* layout : {"tiled", "off"}) {
             auto declined = idx;

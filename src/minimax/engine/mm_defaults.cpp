@@ -1,4 +1,4 @@
-#ifdef _MSC_VER
+#if defined(_MSC_VER) && !defined(_CRT_SECURE_NO_WARNINGS)
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 // MiniMax M3.1 defaults-on resolver: the table of default-ON items, the baseline master switch and the canonical
