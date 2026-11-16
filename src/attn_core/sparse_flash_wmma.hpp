@@ -38,6 +38,11 @@
 // Optional (a policy without them compiles to the code above):
 //   static __device__ void query16(const Args&, unsigned row, unsigned head, unsigned chunk, float (&x)[16])
 //                                 replaces query(): dims 16 chunk .. + 15 of a head, computed by the policy (e.g. RoPE)
+//   static __device__ const std::uint16_t* query_op(const Args&, unsigned row)
+//                                 replaces query() and query16(): the row's queries already in the operand type, [H][D],
+//                                 16-B aligned, loaded as fragments with no conversion. Same bits as query() when the
+//                                 producer stored tile::to_operand<kOp>(x) of the FP32 values (GLM: the absorb GEMM
+//                                 epilogue); halves the query bytes written and read
 //   static __device__ void emit_state(const Args&, unsigned row, unsigned head, float m, float l)
 //   static __device__ void emit(const Args&, unsigned row, unsigned head, unsigned dim, float o)
 //                                 replace out(): the raw online state (m in log2 units of the scaled score, l, and
@@ -73,6 +78,8 @@ template <unsigned H, unsigned D, unsigned T> struct Geometry {
 template <class P>
 concept PolicyQuery16 = requires(const typename P::Args& a, float (&x)[16]) { P::query16(a, 0U, 0U, 0U, x); };
 template <class P>
+concept PolicyQueryOp = requires(const typename P::Args& a, const std::uint16_t*& p) { p = P::query_op(a, 0U); };
+template <class P>
 concept PolicyRawState = requires(const typename P::Args& a) { P::emit_state(a, 0U, 0U, 0.0F, 0.0F); P::emit(a, 0U, 0U, 0U, 0.0F); };
 
 template <class P, unsigned T>
@@ -99,7 +106,11 @@ __global__ __launch_bounds__((Geometry<P::kHeads, P::kDim, T>::kThreads)) void f
         }
     }
     Frag qf[G::kKs];
-    if constexpr (PolicyQuery16<P>) {
+    if constexpr (PolicyQueryOp<P>) {
+        const std::uint16_t* qr = P::query_op(a, r) + static_cast<std::size_t>(mt * 16U + ln) * D + qd * G::kQd;
+#pragma unroll
+        for (unsigned k = 0; k < G::kKs; ++k) qf[k] = tile::frag32(qr + 16U * k);
+    } else if constexpr (PolicyQuery16<P>) {
 #pragma unroll
         for (unsigned k = 0; k < G::kKs; ++k) {
             float x[16];
