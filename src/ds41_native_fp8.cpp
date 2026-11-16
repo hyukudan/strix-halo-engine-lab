@@ -172,7 +172,7 @@ void SafetensorsCheckpoint::load_header(const std::filesystem::path& file) {
     index_.container = index.container; index_.schema = index.schema;
     for (const auto& raw : index.tensors) {
         Tensor t; t.file = file; t.dtype = raw.wire_dtype;
-        t.shape.assign(raw.shape.dims.begin(), raw.shape.dims.begin() + raw.shape.rank);
+        t.shape = raw.extents;
         t.offset = raw.payload.range.offset; t.bytes = raw.payload.range.bytes; t.source = raw.payload;
         if (reject_duplicate_names_ && tensors_.contains(raw.name))
             throw std::runtime_error("session cache: duplicate tensor name '" + raw.name + "' across consumed shards");

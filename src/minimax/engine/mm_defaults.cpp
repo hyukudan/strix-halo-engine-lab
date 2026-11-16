@@ -291,7 +291,7 @@ strix::pair::PipelineChoice pair_pipeline_choice(std::uint64_t rows) {
 }
 
 const profile::Engine& profile_engine() {
-    static const profile::Engine engine{"minimax-pair", "", profile_table, false};
+    static const profile::Engine engine{"minimax-pair", "", profile_table, false, "minimax-turbo-v1"};
     return engine;
 }
 
@@ -312,7 +312,32 @@ profile::Resolution profile_resolution(const Lookup& env) {
             return p.idx_wmma ? p.idx_wmma_layers.c_str() : nullptr;
         return base(key);
     };
+    // Product profile: '--profile NAME' of rank and serve, exported by print_or_apply() (one value for both apps).
+    if (const char* name = env(kProductProfileEnv); name != nullptr && *name != 0) in.profile = profile::parse(name);
     return profile::resolve(profile_engine(), in);
+}
+
+bool product_option(const std::string& a, const std::function<std::string()>& next, std::string* timing) {
+    if (a == profile::turbo::kWeightsOption || a == profile::turbo::kBitsOption || a == profile::turbo::kPackOption) {
+        (void)next();  // exported by print_or_apply()
+        return true;
+    }
+    if (a == "--timing-profile") {
+        if (timing == nullptr) throw std::invalid_argument("--timing-profile is a strix-minimax-rank option");
+        *timing = next();
+        return true;
+    }
+    if (a != "--profile") return false;
+    const std::string value = next();
+    if (profile::is_name(value)) return true;  // the product profile, exported by print_or_apply()
+    // Explicit compatibility: the old timing spelling NAME:PROMPT.u32:STEPS keeps working on rank, with one notice.
+    if (timing == nullptr || value.find(':') == std::string::npos)
+        throw std::invalid_argument("--profile must be default, fast, quality or turbo (got '" + value +
+                                    "'); the per-phase timing session is --timing-profile NAME:PROMPT.u32:STEPS");
+    std::fprintf(stderr, "strix-minimax-rank: '--profile %s' is the old spelling of '--timing-profile %s'; "
+                         "--profile now names the product profile\n", value.c_str(), value.c_str());
+    *timing = value;
+    return true;
 }
 
 void check_peer(const profile::Resolution& mine, const std::function<void(const void*, void*, std::size_t)>& exchange) {
@@ -338,6 +363,9 @@ std::string prefill_identity(const Lookup& env) {
     std::string out = msa.empty() ? std::string() : "prefill_msa=" + msa;
     if (!idx.empty()) out += std::string(out.empty() ? "" : ";") + "prefill_idxproj=" + idx;
     if (fast_i4_format(env)) out += std::string(out.empty() ? "" : ";") + "moe_prefill_format=fast_i4";
+    // TURBO: versioned name + effective levers + weight identity, even with every lever off (empty outside turbo).
+    if (const auto pr = profile_resolution(env); pr.is_turbo())
+        out += std::string(out.empty() ? "" : ";") + pr.cache_namespace();
     return out;
 }
 
@@ -574,6 +602,16 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
         const auto pf = prefill_policy(env);
         const auto pr = profile_resolution(env);
         for (const auto& e : pr.entries) o << e.lever->env << "=" << e.value << "\n";
+        if (pr.profile != profile::Name::standard) {  // default prints nothing new (legacy text unchanged)
+            o << "profile.name=" << profile::name(pr.profile) << "\n" << "profile.version=" << pr.versioned() << "\n"
+              << "profile.qualification=" << pr.qualification() << "\n";
+            if (pr.is_turbo())
+                o << "profile.weights_requested=" << pr.weights.requested_text() << "\n"
+                  << "profile.weights=" << pr.weights.identity() << "\n"
+                  << "profile.weights_origin=" << pr.weights.origin << "\n"
+                  << "profile.weights_reason=" << (pr.weights.reason.empty() ? "-" : pr.weights.reason) << "\n"
+                  << "profile.cache_namespace=" << pr.cache_namespace() << "\n";
+        }
         const auto id = prefill_identity(env);
         const bool bundle_requested = strix::fast_profile::switch_on(env(kFastBundle.env));
         const auto pipeline_reference = pair_pipeline_choice(8192U);
@@ -641,6 +679,18 @@ bool print_or_apply(const std::string& app, int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--baseline") { (void)export_env(kBaselineEnv, "1", 1); (void)export_env("STRIX_SESSION_CACHE", "0", 1); }
+        // Product profile and TURBO weight toggle: the CLI value wins over an inherited variable (CLI > environment).
+        if (a == "--profile" && i + 1 < argc && profile::is_name(argv[i + 1])) {
+            (void)export_env(kProductProfileEnv, argv[++i], 1);
+            continue;
+        }
+        if (a == profile::turbo::kWeightsOption || a == profile::turbo::kBitsOption || a == profile::turbo::kPackOption) {
+            if (i + 1 >= argc) throw std::invalid_argument("missing value for " + a);
+            const auto key = a == profile::turbo::kWeightsOption ? profile::turbo::kWeightsEnv :
+                a == profile::turbo::kBitsOption ? profile::turbo::kBitsEnv : profile::turbo::kPackEnv;
+            (void)export_env(std::string(key).c_str(), argv[++i], 1);
+            continue;
+        }
         const std::pair<const char*, const char*> flags[] = {
             {"--session-host-budget", "STRIX_SESSION_RAM_BYTES"}, {"--session-cache-dir", "STRIX_SESSION_DIR"},
             {"--session-cache", "STRIX_SESSION_CACHE"}, {"--session-disk", "STRIX_SESSION_DISK"},
@@ -657,7 +707,10 @@ bool print_or_apply(const std::string& app, int argc, char** argv) {
     apply();
     (void)pf_async_min_rows(process_env("STRIX_MM_PF_ASYNC_MIN_ROWS"));
     (void)effective_config(parse_cli(app, args), process_env);
-    if (!print) return false;
+    if (!print) {  // a weight request this build cannot honour refuses the run (printed, not refused, above)
+        profile_resolution(process_env).weights.require_honoured();
+        return false;
+    }
     std::fputs(effective_config(parse_cli(app, args), process_env).c_str(), stdout);
     if (app == "serve") {
         const bool off = serve_policy(process_env).sched == serve::Sched::off;
