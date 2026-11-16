@@ -45,11 +45,13 @@ inline bool enabled() {
     static env_arms::Resolved<bool> value;  // once per process (or per in-process arm, env_arms.hpp)
     return value.get([] { return envcfg::flag("STRIX_GLM_PF_MLA_WMMA", wmma_x::enabled()); });
 }
-// With it: the fused flash core stores o-bar as the FP16 image the out GEMM's staging would make (same bits, half the
-// o-bar bytes written and read). Default on; STRIX_GLM_PF_MLA_OB16=0 restores the FP32 o-bar.
+// With it: the fused flash core stores o-bar as the FP16 image the out GEMM's staging would make (half the o-bar bytes
+// written and read). Default OFF (opt-in STRIX_GLM_PF_MLA_OB16=1): measured NOT bitwise at C 4096 (layer bench: 3 % of
+// the out elements differ, max |d| 4.6e-5, spread over every row; the C 129 unit test is equal) and no e2e gain (pair 8K
+// FAST C vs OB16=0 8.438 vs 8.438 s warm, fp32glm3r bundle1); its bits are not gated (OB16=0 = the gated 2124b550).
 inline bool ob16() {
     static env_arms::Resolved<bool> value;  // once per process (or per in-process arm, env_arms.hpp)
-    return value.get([] { return envcfg::flag("STRIX_GLM_PF_MLA_OB16", true); });
+    return value.get([] { return envcfg::flag("STRIX_GLM_PF_MLA_OB16", false); });
 }
 inline std::atomic<std::uint64_t> calls{0};  // launches that ran on the WMMA core (identity reporting)
 }  // namespace strix::glm::pf::mla_wmma
