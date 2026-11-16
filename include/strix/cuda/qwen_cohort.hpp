@@ -63,6 +63,9 @@ struct ContextDraft {
     std::uint64_t copy_first_steps = 0, extended_steps = 0, context_rows = 0, context_accepted = 0;
     std::uint64_t wide_steps = 0, wide_rows = 0, wide_accepted = 0;  // copy windows of 9..16 rows (subset of copy_first_steps)
     double host_us = 0.0;           // host time in the drafter (proposals + learning)
+    // live per-position draft acceptance of this session (both drafters): EMA (0.9) of accepted draft rows and of their
+    // trials (accepted + 1 when a verified draft was rejected); p = accept_s / accept_t. Feeds the marginal rule.
+    double accept_s = 0.0, accept_t = 0.0;
     static MtpContextDraftConfig config(ContextMode m) {
         MtpContextDraftConfig c;
         c.copy_edit = m == ContextMode::copy || m == ContextMode::first;
@@ -84,7 +87,9 @@ struct Stream {
 inline std::uint32_t window_rows_default() {
     static const std::uint32_t rows = [] {
         const char* v = std::getenv("STRIX_QRTX_WINDOW_ROWS");
-        const long n = v ? std::strtol(v, nullptr, 10) : static_cast<long>(kWindowRows);
+        // default: 16 with the backend's 9..16-row decode pieces (the marginal rule then widens only where it pays), else 8
+        const long def = strix::cuda::core::decode_rows_max() >= 16U ? static_cast<long>(kMaxWindowRows) : static_cast<long>(kWindowRows);
+        const long n = v ? std::strtol(v, nullptr, 10) : def;
         return static_cast<std::uint32_t>(std::clamp<long>(n, 1, static_cast<long>(kMaxWindowRows)));
     }();
     return rows;
@@ -115,7 +120,7 @@ struct StepOptions {
 // STRIX_QRTX_WIDE_GAIN (minimum gain); STRIX_QRTX_WIDE_RULE=0 takes the budget as given (the c10-c12 behaviour).
 inline const WideModel& wide_model() {
     static const WideModel m = [] {
-        WideModel w;
+        WideModel w = wide_measured(strix::cuda::core::decode_rows_max());
         const auto rd = [](const char* name, double& v) { if (const char* s = std::getenv(name); s && s[0]) v = std::strtod(s, nullptr); };
         rd("STRIX_QRTX_WIDE_MS", w.wide_ms);
         rd("STRIX_QRTX_WIDE_ACCEPT", w.accept);
@@ -184,6 +189,18 @@ inline bool draft_batch_default() {
     return on;
 }
 
+// Mean live per-position acceptance of the step's sessions (ContextDraft accept_s / accept_t); -1 when a session has no
+// context drafter or fewer than 4 trials of history, or when STRIX_QRTX_WIDE_ACCEPT fixes the model's value.
+template <class Streams> double live_accept(const Streams& streams) {
+    static const bool fixed = std::getenv("STRIX_QRTX_WIDE_ACCEPT") != nullptr;
+    if (fixed || streams.empty()) return -1.0;
+    double sum = 0.0;
+    for (const auto& st : streams) {
+        if (!st.context || st.context->accept_t < 4.0) return -1.0;
+        sum += st.context->accept_s / st.context->accept_t;
+    }
+    return sum / static_cast<double>(streams.size());
+}
 struct StreamStep {
     std::vector<std::uint32_t> tokens;   // the verified tokens of this step (argmax of the kept rows), >= 1
     std::vector<float> logits;           // [tokens][vocab] when StepOptions::want_logits
@@ -218,7 +235,11 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
     const auto n = static_cast<std::uint32_t>(streams.size());
     // above 8 rows only when the marginal rule says the wider windows pay (packing only: every session's tokens are
     // the same either way)
-    if (o.budget > kWindowRows && (o.wide_rule < 0 ? wide_rule_default() : o.wide_rule != 0)) o.budget = choose_budget(n, o.mtp ? o.depth : 0U, o.policy, o.budget, wide_model());
+    if (o.budget > kWindowRows && (o.wide_rule < 0 ? wide_rule_default() : o.wide_rule != 0)) {
+        WideModel m = wide_model();
+        if (const double p = live_accept(streams); p >= 0.0) m.accept = p;
+        o.budget = choose_budget(n, o.mtp ? o.depth : 0U, o.policy, o.budget, m);
+    }
     std::vector<StreamStep> out(n);
     std::vector<std::vector<std::uint32_t>> rows(n);
     std::vector<std::uint32_t> want(n);
@@ -401,6 +422,10 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
         const auto h0 = Clock::now();
         c->drafter.finish_cycle(out[i].tokens, verified, accepted);
         c->host_us += std::chrono::duration<double, std::micro>(Clock::now() - h0).count();
+        if (verified > 0) {
+            c->accept_s = 0.9 * c->accept_s + static_cast<double>(accepted);
+            c->accept_t = 0.9 * c->accept_t + static_cast<double>(accepted + (accepted < verified ? 1U : 0U));
+        }
         if (c->copy_first) {
             c->context_accepted += accepted;
             if (out[i].rows > kWindowRows) c->wide_accepted += accepted;
