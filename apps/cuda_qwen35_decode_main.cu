@@ -1,3 +1,4 @@
+#include "../src/core/dense_linear.hpp"
 // strix-cuda-qwen35-decode: qwen35 (bf16 / q8_0) on one CUDA device through strix::qwen35::CudaEngine. Exact greedy decode,
 // C1 timing, real GGUF or on-device synthetic full-size weights (--synthetic-full bf16|q8_0, no disk).
 // Home: specific (CLI of the qwen35 family); engine in src/qwen35/cuda, arithmetic in src/cuda_core.
@@ -74,11 +75,19 @@ struct ClockSampler {
     void start() {
         th = std::thread([this] {
             while (!stop.load()) {
+                #ifdef _WIN32
                 FILE* p = _popen("nvidia-smi --query-gpu=clocks.sm -i 0 --format=csv,noheader,nounits", "r");
+#else
+                FILE* p = popen("nvidia-smi --query-gpu=clocks.sm -i 0 --format=csv,noheader,nounits", "r");
+#endif
                 if (p) {
                     char b[64] = {};
                     if (std::fgets(b, sizeof b, p)) mhz.push_back(std::atoi(b));
+#ifdef _WIN32
                     _pclose(p);
+#else
+                    pclose(p);
+#endif
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
@@ -158,25 +167,25 @@ int main(int argc, char** argv) {
             if (a == "--model") model = next();
             else if (a == "--synthetic-full") synth = next();
             else if (a == "--prompt-ids") ids_arg = next();
-            else if (a == "--prompt-len") prompt_len = static_cast<std::uint32_t>(std::stoul(next()));
-            else if (a == "--ctx-fill") ctx_fill = static_cast<std::uint32_t>(std::stoul(next()));
-            else if (a == "--n-gen") n_gen = static_cast<std::uint32_t>(std::stoul(next()));
-            else if (a == "--rows") rows_cap = static_cast<std::uint32_t>(std::stoul(next()));
-            else if (a == "--decode-rows") decode_rows = static_cast<std::uint32_t>(std::stoul(next()));
-            else if (a == "--max-pos") max_pos = static_cast<std::uint32_t>(std::stoul(next()));
-            else if (a == "--layers") layers_override = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (a == "--prompt-len") prompt_len = strix::core::parse_u32(next());
+            else if (a == "--ctx-fill") ctx_fill = strix::core::parse_u32(next());
+            else if (a == "--n-gen") n_gen = strix::core::parse_u32(next());
+            else if (a == "--rows") rows_cap = strix::core::parse_u32(next());
+            else if (a == "--decode-rows") decode_rows = strix::core::parse_u32(next());
+            else if (a == "--max-pos") max_pos = strix::core::parse_u32(next());
+            else if (a == "--layers") layers_override = strix::core::parse_u32(next());
             else if (a == "--graphs") graphs = next() != "0";
-            else if (a == "--slots") slots = static_cast<std::uint32_t>(std::stoul(next()));  // multi-session bench: N concurrent sessions
+            else if (a == "--slots") slots = strix::core::parse_u32(next());  // multi-session bench: N concurrent sessions
             else if (a == "--slots-verify") slots_verify = true;  // exactness: batched slots == each slot decoded alone (logit hashes)
             else if (a == "--arms") arms_arg = next();
-            else if (a == "--ab-pairs") ab_pairs = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (a == "--ab-pairs") ab_pairs = strix::core::parse_u32(next());
             else if (a == "--bw-probe") bwp = true;
             else if (a == "--pdl") pdl = next() != "0";
             else if (a == "--dense-arith") {
                 const std::string v = next();
                 arith_name = v == "fp32" || v == "mma2" || v == "mma1" ? v : "mma3";
-                strix::cuda_core::set_dense_arith(v == "fp32" ? strix::cuda_core::DenseArith::fp32 : v == "mma2" ? strix::cuda_core::DenseArith::mma2
-                                                  : v == "mma1" ? strix::cuda_core::DenseArith::mma1 : strix::cuda_core::DenseArith::mma3);
+                topt.dense_arithmetic = v == "fp32" ? strix::cuda_core::DenseArith::fp32 : v == "mma2" ? strix::cuda_core::DenseArith::mma2
+                                                  : v == "mma1" ? strix::cuda_core::DenseArith::mma1 : strix::cuda_core::DenseArith::mma3;
             }
             else if (a == "--multi" || a == "--turbo-multi-launch") multi = next() != "0";
             else if (a == "--turbo-weights") {
@@ -187,7 +196,7 @@ int main(int argc, char** argv) {
                 else if (v == "converted") throw std::runtime_error("--turbo-weights converted: not implemented yet (native|onfly)");
                 else throw std::runtime_error("--turbo-weights expects native|onfly");
             } else if (a == "--turbo-bits") {
-                topt.turbo_bits = static_cast<std::uint32_t>(std::stoul(next()));
+                topt.turbo_bits = strix::core::parse_u32(next());
                 if (topt.turbo_bits != 4) throw std::runtime_error("--turbo-bits: only 4 is implemented");
             } else if (a == "--turbo-lm-head") {
                 const std::string v = next();
@@ -218,7 +227,7 @@ int main(int argc, char** argv) {
         if (!ids_arg.empty()) {
             std::stringstream ss(ids_arg);
             std::string t;
-            while (std::getline(ss, t, ',')) prompt.push_back(static_cast<std::uint32_t>(std::stoul(t)));
+            while (std::getline(ss, t, ',')) prompt.push_back(strix::core::parse_u32(t));
         }
         q::EngineOptions opt = topt;
         opt.use_graphs = graphs;
@@ -315,7 +324,7 @@ int main(int argc, char** argv) {
             {
                 std::stringstream as(arms_arg.empty() ? std::to_string(slots) + ",1" : arms_arg);
                 std::string t;
-                while (std::getline(as, t, ',')) arms.push_back(static_cast<std::uint32_t>(std::stoul(t)));
+                while (std::getline(as, t, ',')) arms.push_back(strix::core::parse_u32(t));
             }
             for (std::uint32_t pair = 0; pair < ab_pairs; ++pair)
                 for (const auto n : arms) run_arm(std::min(n, slots), n == 1 ? "solo   " : "batched");
@@ -382,7 +391,8 @@ int main(int argc, char** argv) {
             std::string all((std::istreambuf_iterator<char>(ff)), std::istreambuf_iterator<char>());
             std::stringstream fs(all);
             std::string t;
-            while (std::getline(fs, t, ',')) if (!t.empty()) forced.push_back(static_cast<std::uint32_t>(std::stoul(t)));
+            while (std::getline(fs, t, ',')) if (!t.empty()) forced.push_back(strix::core::parse_u32(t));
+            strix::core::validate_token_ids(forced.data(), forced.size(), E->config().vocab);
         }
         for (std::uint32_t i = 0; i < n_gen; ++i) {
             if (i < forced.size()) next_tok = forced[i];

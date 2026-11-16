@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <map>
+#include <memory>
+#include <mutex>
 
 #include "../common.cuh"
 
@@ -261,8 +264,9 @@ __global__ void fp4_reduce(const Jobs jobs, std::uint32_t rows) {
     J.y[idx] = v;
 }
 
-float* g_ws = nullptr;
-std::size_t g_ws_bytes = 0;
+using WorkspaceKey = std::pair<int, cudaStream_t>;
+std::mutex workspace_mutex;
+std::map<WorkspaceKey, std::unique_ptr<Nvfp4Workspace>> workspaces;
 
 template <int RB, int MT>
 cudaError_t launch_gemv(Jobs& jobs, const float* x, std::uint32_t in, std::uint32_t rows, cudaStream_t s) {
@@ -296,14 +300,16 @@ bool ok(const DenseWeight& w, std::uint32_t rows) {
            nvfp4_shape_ok(w.out, w.in);
 }
 
-cudaError_t ensure_ws(std::size_t bytes) {
-    if (bytes <= g_ws_bytes) return cudaSuccess;
-    if (g_ws) cudaFree(g_ws);
-    g_ws = nullptr;
-    g_ws_bytes = 0;
-    const cudaError_t e = cudaMalloc(reinterpret_cast<void**>(&g_ws), bytes);
-    if (e == cudaSuccess) g_ws_bytes = bytes;
-    return e;
+cudaError_t ensure_ws(std::size_t bytes, cudaStream_t stream, float** data = nullptr) {
+    int device = 0;
+    auto error = cudaGetDevice(&device);
+    if (error != cudaSuccess) return error;
+    std::lock_guard<std::mutex> lock(workspace_mutex);
+    auto& owner = workspaces[{device, stream}];
+    if (!owner) owner = std::make_unique<Nvfp4Workspace>();
+    error = owner->reserve(bytes);
+    if (error == cudaSuccess && data) *data = owner->data();
+    return error;
 }
 
 // ----------------------------------------------------------------------------------------------------- converter
@@ -423,7 +429,13 @@ cudaError_t nvfp4_quantize_f32(const float* src, std::uint32_t out, std::uint32_
     return quantize<false>(src, out, in, dst, gscale, s);
 }
 
-cudaError_t nvfp4_reserve_workspace(std::size_t bytes) { return ensure_ws(bytes); }
+cudaError_t nvfp4_reserve_workspace(std::size_t bytes, cudaStream_t stream) { return ensure_ws(bytes, stream); }
+void nvfp4_release_workspace(cudaStream_t stream) {
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) return;
+    std::lock_guard<std::mutex> lock(workspace_mutex);
+    workspaces.erase({device, stream});
+}
 
 namespace {
 // Shared by the single, fused and multi entry points: builds the job table (split-K partial buffers carved from the
@@ -436,14 +448,15 @@ cudaError_t run_jobs(Jobs& jobs, const float* x, std::uint32_t in, std::uint32_t
         if (J.w[1] != nullptr) J.ks = std::max<std::uint32_t>(J.ks, 2);
         if (J.ks > 1) need += static_cast<std::size_t>(J.w[1] ? 2 : 1) * J.ks * rows * J.out * 4;
     }
-    cudaError_t e = need ? ensure_ws(need) : cudaSuccess;
+    float* workspace = nullptr;
+    cudaError_t e = need ? ensure_ws(need, s, &workspace) : cudaSuccess;
     if (e != cudaSuccess) return e;
     std::size_t off = 0;
     for (int q = 0; q < jobs.n; ++q) {
         Job& J = jobs.j[q];
         J.part = nullptr;
         if (J.ks > 1) {
-            J.part = g_ws + off / 4;
+            J.part = workspace + off / 4;
             off += static_cast<std::size_t>(J.w[1] ? 2 : 1) * J.ks * rows * J.out * 4;
         }
     }

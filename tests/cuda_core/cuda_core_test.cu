@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <limits>
 #include <vector>
 
 #include "strix/cuda_core/attention.hpp"
@@ -29,6 +30,9 @@ static bool bits_equal(const std::vector<float>& a, const std::vector<float>& b)
     return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
 }
 static double maxrel(const std::vector<float>& a, const std::vector<double>& ref) {
+    if (a.size() != ref.size()) return std::numeric_limits<double>::infinity();
+    for (float v : a) if (!std::isfinite(v)) return std::numeric_limits<double>::infinity();
+    for (double v : ref) if (!std::isfinite(v)) return std::numeric_limits<double>::infinity();
     double worst = 0, scale = 1e-30;
     for (double r : ref) scale = std::max(scale, std::fabs(r));
     for (std::size_t i = 0; i < a.size(); ++i) worst = std::max(worst, std::fabs(a[i] - ref[i]) / scale);

@@ -344,13 +344,13 @@ void set_dense_arith(DenseArith a) { g_arith = a; }
 DenseArith dense_arith() { return g_arith; }
 
 cudaError_t dense_rows(const DenseWeight& w, const float* x, float* y, std::uint32_t rows, const float* residual,
-                       cudaStream_t stream) {
+                       cudaStream_t stream, DenseArith arithmetic) {
     if (w.format == WeightFormat::nvfp4) return nvfp4_dense_rows(w, x, y, rows, residual, stream);
-    return dense_rows_multi(&w, &y, 1, x, rows, residual, stream);
+    return dense_rows_multi(&w, &y, 1, x, rows, residual, stream, arithmetic);
 }
 
 cudaError_t dense_rows_multi(const DenseWeight* ws, float* const* ys, int n, const float* x, std::uint32_t rows,
-                             const float* residual, cudaStream_t stream) {
+                             const float* residual, cudaStream_t stream, DenseArith arithmetic) {
     if (n < 1 || n > kMaxMulti || (residual != nullptr && n != 1)) return cudaErrorInvalidValue;
     if (ws[0].format == WeightFormat::nvfp4) {  // W4A16 GEMV: one launch for jobs sharing x, bitwise equal to separate calls
         Nvfp4Job jobs[kMaxMulti];
@@ -372,18 +372,40 @@ cudaError_t dense_rows_multi(const DenseWeight* ws, float* const* ys, int n, con
         ma.row_end[j] = total;
     }
     for (int j = n; j < kMaxMulti; ++j) ma.row_end[j] = total;
-    if (g_arith != DenseArith::fp32) {
+    if (arithmetic != DenseArith::fp32) {
         MmaCall mc{};
         mc.n = n; mc.format = ws[0].format; mc.in = ws[0].in; mc.rows = rows; mc.x = x; mc.residual = residual;
-        mc.terms = g_arith == DenseArith::mma3 ? 3 : g_arith == DenseArith::mma2 ? 2 : 1;
+        mc.terms = arithmetic == DenseArith::mma3 ? 3 : arithmetic == DenseArith::mma2 ? 2 : 1;
         for (int j = 0; j < n; ++j) { mc.w[j] = ws[j].data; mc.y[j] = ys[j]; mc.out[j] = ws[j].out; }
         if (dense_mma_supported(mc)) return dense_mma_launch(mc, stream);
+        // A sibling's fallback must not change another matrix's arithmetic.
+        if (n > 1) {
+            DenseWeight grouped[2][kMaxMulti];
+            float* outputs[2][kMaxMulti];
+            int counts[2]{};
+            for (int j = 0; j < n; ++j) {
+                MmaCall one = mc;
+                one.n = 1; one.out[0] = ws[j].out;
+                const int route = dense_mma_supported(one) ? 1 : 0;
+                outputs[route][counts[route]] = ys[j];
+                grouped[route][counts[route]++] = ws[j];
+            }
+            if (counts[1]) {
+                for (int route = 0; route < 2; ++route) {
+                    if (!counts[route]) continue;
+                    const auto error = dense_rows_multi(grouped[route], outputs[route], counts[route], x, rows,
+                                                        nullptr, stream, arithmetic);
+                    if (error != cudaSuccess) return error;
+                }
+                return cudaSuccess;
+            }
+        }
     }
     return dispatch<false>(ma, ws[0], nullptr, x, residual, rows, stream);
 }
 
 cudaError_t dense_gate_up_silu_rows(const DenseWeight& gate, const DenseWeight& up, const float* x, float* y,
-                                    std::uint32_t rows, cudaStream_t stream) {
+                                    std::uint32_t rows, cudaStream_t stream, DenseArith arithmetic) {
     if (gate.format == WeightFormat::nvfp4) return nvfp4_gate_up_silu_rows(gate, up, x, y, rows, stream);
     if (!valid(gate, rows) || !valid(up, rows) || gate.format != up.format || gate.in != up.in || gate.out != up.out)
         return cudaErrorInvalidValue;
@@ -393,10 +415,10 @@ cudaError_t dense_gate_up_silu_rows(const DenseWeight& gate, const DenseWeight& 
     ma.y[0] = y;
     ma.out[0] = gate.out;
     for (int j = 0; j < kMaxMulti; ++j) ma.row_end[j] = gate.out;
-    if (g_arith != DenseArith::fp32) {
+    if (arithmetic != DenseArith::fp32) {
         MmaCall mc{};
         mc.n = 1; mc.format = gate.format; mc.in = gate.in; mc.rows = rows; mc.x = x; mc.w1 = up.data;
-        mc.terms = g_arith == DenseArith::mma3 ? 3 : g_arith == DenseArith::mma2 ? 2 : 1;
+        mc.terms = arithmetic == DenseArith::mma3 ? 3 : arithmetic == DenseArith::mma2 ? 2 : 1;
         mc.w[0] = gate.data; mc.y[0] = y; mc.out[0] = gate.out;
         if (dense_mma_supported(mc)) return dense_mma_launch(mc, stream);
     }

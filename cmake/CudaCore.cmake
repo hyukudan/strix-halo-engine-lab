@@ -40,7 +40,8 @@ endif()
 
 include(${CMAKE_CURRENT_LIST_DIR}/StrixDevice.cmake)
 # qwen35 CUDA engine (reusable library: forward_rows / commit / MTP) + the decode CLI.
-add_library(strix_qwen35_cuda STATIC ${_cc_root}/src/qwen35/cuda/engine.cu ${_cc_root}/src/gguf_reader.cpp)
+add_library(strix_qwen35_cuda STATIC ${_cc_root}/src/qwen35/cuda/engine.cu ${_cc_root}/src/gguf_reader.cpp
+    ${_cc_root}/src/qwen35/config.cpp ${_cc_root}/src/qwen35/family.cpp ${_cc_root}/src/model_family_registry.cpp)
 target_link_libraries(strix_qwen35_cuda PUBLIC strix_cuda_core)
 target_include_directories(strix_qwen35_cuda PUBLIC ${_cc_root}/include)
 target_compile_options(strix_qwen35_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
@@ -74,4 +75,11 @@ target_link_libraries(cuda_core_nvfp4_test PRIVATE strix_cuda_core)
 target_compile_options(cuda_core_nvfp4_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
 if(MSVC)
     target_compile_options(cuda_core_nvfp4_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
+
+if(BUILD_TESTING)
+    foreach(t cuda_core_test qwen35_cuda_engine_test cuda_core_nvfp4_test)
+        add_test(NAME ${t} COMMAND ${t})
+        set_tests_properties(${t} PROPERTIES LABELS "gpu;cuda")
+    endforeach()
 endif()

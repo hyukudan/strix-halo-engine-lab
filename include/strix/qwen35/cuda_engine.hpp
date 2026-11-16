@@ -17,7 +17,7 @@
 
 #include <cuda_runtime.h>
 
-#include "strix/cuda_core/types.hpp"
+#include "strix/cuda_core/dense.hpp"
 #include "strix/qwen35/config.hpp"
 
 namespace strix::qwen35 {
@@ -29,6 +29,7 @@ enum class LogitRows : std::uint8_t { none, last, all };
 enum class TurboWeights : std::uint8_t { off, native, onfly };
 
 struct EngineOptions {
+    cuda_core::DenseArith dense_arithmetic = cuda_core::dense_arith();
     std::uint32_t max_positions = 4096;  // KV capacity per attention layer (and for the MTP layer)
     bool use_graphs = true;              // CUDA graph per (rows, logits mode)
     bool multi_gemv = true;              // one launch for GEMVs sharing x (q|k|v, qkv|z|beta|alpha); bitwise equal either way
@@ -43,7 +44,13 @@ struct EngineOptions {
 };
 
 // Named identity of the arithmetic + weight source; also the prefix-cache key (caches never mix identities).
-[[nodiscard]] std::string engine_identity(const EngineOptions& o, const char* dense_arith = "mma3");
+[[nodiscard]] inline std::string engine_identity(const EngineOptions& o) {
+    static const char* names[] = {"fp32", "mma3", "mma2", "mma1"};
+    const std::string a = names[static_cast<unsigned>(o.dense_arithmetic)];
+    if (o.turbo_weights == TurboWeights::off) return "qwen35-cuda-exact-" + a + "-v1";
+    if (o.turbo_weights == TurboWeights::native) return "qwen35-turbo-native-" + a + "-v1";
+    return "qwen35-turbo-nvfp4-onfly-rtn16-v2-retained-" + a + (o.turbo_lm_head ? "" : "-lmhead-bf16");
+}
 // Effective-config text (identity, prefix-cache key, every lever).
 void print_effective_config(const EngineOptions& o, const char* dense_arith, std::FILE* f);
 

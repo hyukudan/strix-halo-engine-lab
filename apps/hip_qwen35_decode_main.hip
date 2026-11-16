@@ -159,42 +159,6 @@ private:
     std::size_t total_ = 0;
 };
 
-std::uint64_t meta_u(const gguf::FileInfo& i, const std::string& key) {
-    const auto* e = i.find_metadata(key);
-    if (!e) throw std::invalid_argument("missing metadata " + key);
-    if (e->unsigned_value) return *e->unsigned_value;
-    if (e->signed_value) return std::uint64_t(*e->signed_value);
-    throw std::invalid_argument("metadata not integer: " + key);
-}
-double meta_f(const gguf::FileInfo& i, const std::string& key, double fallback) {
-    const auto* e = i.find_metadata(key);
-    if (!e) return fallback;
-    if (e->floating_value) return *e->floating_value;
-    if (e->unsigned_value) return double(*e->unsigned_value);
-    return fallback;
-}
-// Swappable with qwen35::config_from_gguf (WP-A) once it lands: same Config, same declaration.
-qwen35::Config load_config(const gguf::FileInfo& i) {
-    qwen35::Config c;
-    const std::string p = "qwen35.";
-    c.layers = unsigned(meta_u(i, p + "block_count"));
-    c.hidden = unsigned(meta_u(i, p + "embedding_length"));
-    c.intermediate = unsigned(meta_u(i, p + "feed_forward_length"));
-    c.heads = unsigned(meta_u(i, p + "attention.head_count"));
-    c.kv_heads = unsigned(meta_u(i, p + "attention.head_count_kv"));
-    c.head_dim = unsigned(meta_u(i, p + "attention.key_length"));
-    c.rms_eps = float(meta_f(i, p + "attention.layer_norm_rms_epsilon", 1e-6));
-    c.rope_theta = meta_f(i, p + "rope.freq_base", 1e7);
-    c.rotary_dim = unsigned(meta_u(i, p + "rope.dimension_count"));
-    c.gdn_conv_kernel = unsigned(meta_u(i, p + "ssm.conv_kernel"));
-    c.gdn_key_dim = c.gdn_value_dim = unsigned(meta_u(i, p + "ssm.state_size"));
-    c.gdn_key_heads = unsigned(meta_u(i, p + "ssm.group_count"));
-    c.gdn_value_heads = unsigned(meta_u(i, p + "ssm.time_step_rank"));
-    c.full_attention_interval = unsigned(meta_u(i, p + "full_attention_interval"));
-    c.mtp_layers = unsigned(meta_u(i, p + "nextn_predict_layers"));
-    return c;
-}
-
 struct Layer {
     Tensor attn_norm, post_norm, gate, up, down;
     Tensor qkv, z, beta, alpha, conv, dt, a, snorm, out;  // gdn
@@ -258,7 +222,11 @@ std::vector<int> parse_ids(const std::string& s) {
     std::stringstream ss(s);
     std::string t;
     while (std::getline(ss, t, ','))
-        if (!t.empty()) r.push_back(std::stoi(t));
+        if (!t.empty()) {
+            const auto id = core::parse_u32(t);
+            if (id > 0x7FFFFFFFU) throw std::invalid_argument("token ID exceeds signed index range");
+            r.push_back(static_cast<int>(id));
+        }
     return r;
 }
 }  // namespace
@@ -274,20 +242,25 @@ int main(int argc, char** argv) try {
         };
         if (a == "--model") model = next();
         else if (a == "--prompt-ids") ids_arg = next();
-        else if (a == "--gen") gen = unsigned(std::stoul(next()));
-        else if (a == "--rows") rows = unsigned(std::stoul(next()));
+        else if (a == "--gen") gen = core::parse_u32(next());
+        else if (a == "--rows") rows = core::parse_u32(next());
         else if (a == "--dump-logits") dump = next();
-        else if (a == "--max-pos") maxpos = unsigned(std::stoul(next()));
+        else if (a == "--max-pos") maxpos = core::parse_u32(next());
         else throw std::invalid_argument("unknown flag " + a);
     }
     if (model.empty() || rows < 1U || rows > kMaxRows)
         throw std::invalid_argument("usage: --model GGUF [--prompt-ids 1,2,3] [--gen N] [--rows 1..16] [--dump-logits FILE] [--max-pos N]");
     const auto prompt = parse_ids(ids_arg);
     if (prompt.empty()) throw std::invalid_argument("empty prompt");
-    if (!maxpos) maxpos = unsigned(prompt.size()) + gen + 1U;
+    core::require_capacity(prompt.size(), gen, 0xFFFFFFFFULL);
+    const auto required = prompt.size() + gen;
+    if (!maxpos) maxpos = static_cast<unsigned>(required);
+    core::require_capacity(0, required, maxpos);
 
     Loader loader(model);
-    const auto cfg = load_config(loader.info());
+    const auto cfg = qwen35::validate(loader.info(), maxpos);
+    qwen35::validate_backend(cfg, maxpos);
+    core::validate_token_ids(prompt.data(), prompt.size(), cfg.vocab);
     const unsigned H = cfg.hidden;
     const unsigned V = unsigned(loader.find("token_embd")->dimensions.at(1));
     const unsigned D = cfg.head_dim, QW = cfg.heads * D, KW = cfg.kv_heads * D, I = cfg.intermediate;
@@ -362,6 +335,9 @@ int main(int argc, char** argv) try {
     std::vector<float> dumped;
     unsigned pos = 0;
     auto forward = [&](unsigned n, const int* ids) {
+        if (!n || n > kMaxRows) throw std::invalid_argument("forward rows outside 1..16");
+        core::require_capacity(pos, n, maxpos);
+        core::validate_token_ids(ids, n, cfg.vocab);
         HK(hipMemcpyAsync(d_ids, ids, n * 4U, hipMemcpyHostToDevice, stream));
         embed_kernel<<<n, 256, 0, stream>>>(embd.data, embd.fmt, embd.row_bytes, H, d_ids, x);
         const unsigned nb = (n * H + 255U) / 256U;

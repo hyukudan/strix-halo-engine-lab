@@ -3,6 +3,46 @@
 // BF16 / Q8_0 chunk decoders (weight_decode.hpp). out[r][o] = sum_k W[o][k] * x[r][k], rows 1..16.
 // Epilogue kinds: store, or SiLU(gate) * up over two matrices that share every activation read.
 // Home: shared (core): no model names; qwen35 binds it, Gemma4/Qwen4 can later.
+#include <charconv>
+#include <cstddef>
+#include <cstdint>
+#include <initializer_list>
+#include <limits>
+#include <stdexcept>
+#include <string_view>
+
+namespace strix::core {
+// Host admission for embedding/dense inputs, shared by backend adapters.
+inline std::uint32_t parse_u32(std::string_view text) {
+    std::uint32_t value = 0;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size())
+        throw std::invalid_argument("expected an unsigned 32-bit decimal integer");
+    return value;
+}
+inline std::size_t checked_product(std::initializer_list<std::size_t> factors) {
+    std::size_t result = 1;
+    for (auto n : factors) {
+        if (n && result > std::numeric_limits<std::size_t>::max() / n)
+            throw std::invalid_argument("allocation size overflow");
+        result *= n;
+    }
+    return result;
+}
+inline void require_capacity(std::size_t pos, std::size_t rows, std::size_t capacity) {
+    if (pos > capacity || rows > capacity - pos)
+        throw std::invalid_argument("max_positions exceeded");
+}
+template <class Token>
+void validate_token_ids(const Token* ids, std::size_t count, std::uint32_t vocab) {
+    if (count && !ids) throw std::invalid_argument("null token IDs");
+    for (std::size_t i = 0; i < count; ++i)
+        if (static_cast<std::uint64_t>(ids[i]) >= vocab)
+            throw std::invalid_argument("token ID outside vocabulary");
+}
+} // namespace strix::core
+
+#if defined(__HIPCC__)
 #include "gemv_rows.hpp"
 #include "weight_decode.hpp"
 
@@ -47,3 +87,4 @@ __global__ void __launch_bounds__(128) kernel(View w, View up, const float* x, f
 }
 
 } // namespace strix::core::dense_linear
+#endif

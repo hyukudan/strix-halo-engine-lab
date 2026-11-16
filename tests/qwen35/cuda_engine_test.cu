@@ -105,6 +105,10 @@ int main() {
             cfg.gdn_value_heads = 16;  // ssm beta/alpha out = 16: NVFP4-eligible, exercises the 4-job multi launch
         }
         auto E = q::CudaEngine::synthetic(cfg, pack, opt, 7);
+        const std::uint32_t invalid_id = cfg.vocab;
+        bool rejected = false;
+        try { (void)E->forward_rows(&invalid_id, 1); } catch (const std::invalid_argument&) { rejected = true; }
+        CHECK(rejected, "engine rejects token outside vocabulary");
         if (var >= 2) CHECK(E->nvfp4_tensors() > 40, "nvfp4 tensors converted");
         std::mt19937 rng(99);
         std::vector<std::uint32_t> tok(160);
@@ -121,19 +125,21 @@ int main() {
         run_chain(*E, tok, chg, rng, false);
         CHECK(same(ser.logits, chg.logits), "graph-off chain logits differ from serial");
         E->set_graphs(true);
-        if (var >= 2) {  // multi-launch lever off must be bitwise equal too (separate GEMV launches)
+        {  // Every pack, including mixed eligible/ineligible BF16 and Q8 projections.
             opt.multi_gemv = false;
+            opt.use_graphs = false;
+            std::size_t free_before = 0, total_memory = 0;
+            cudaMemGetInfo(&free_before, &total_memory);
             auto E2 = q::CudaEngine::synthetic(cfg, pack, opt, 7);
             Rec s2;
             run_serial(*E2, tok, s2);
             CHECK(same(ser.logits, s2.logits), "multi-launch off differs");
-        }
-        if (var >= 2) {  // multi-launch lever off must be bitwise equal too (separate GEMV launches)
-            opt.multi_gemv = false;
-            auto E2 = q::CudaEngine::synthetic(cfg, pack, opt, 7);
-            Rec s2;
-            run_serial(*E2, tok, s2);
-            CHECK(same(ser.logits, s2.logits), "multi-launch off differs");
+            CHECK(E2->launches_last_forward() == 0, "factory graphs-off option ignored");
+            E2->configure_slots(2);
+            E2.reset();
+            std::size_t free_after = 0;
+            cudaMemGetInfo(&free_after, &total_memory);
+            CHECK(free_after + (1U << 20) >= free_before, "engine resources leaked on destruction");
         }
         // 4. multi-session slots: every row bitwise equal to the session run alone (legacy single-session serial decode as reference);
         //    sessions at different lengths, 1-row lanes mixed with 3-row windows, auto-commit and partial accept, rotating order.
@@ -141,6 +147,10 @@ int main() {
             const auto& c = E->config();
             const std::uint32_t NS = 4, N = 44;
             E->configure_slots(NS);
+            const q::SlotRows invalid_group{0, 1};
+            rejected = false;
+            try { (void)E->forward_slots(&invalid_group, 1, &invalid_id); } catch (const std::invalid_argument&) { rejected = true; }
+            CHECK(rejected, "slot rejects token outside vocabulary");
             std::vector<std::vector<std::uint32_t>> T(NS, std::vector<std::uint32_t>(N));
             std::vector<Rec> ref(NS);
             for (auto& v : T) for (auto& t : v) t = rng() % 2048;
@@ -196,6 +206,13 @@ int main() {
             // copy_slot: a copy continues bitwise like the original
             E->copy_slot(3, 1);
             CHECK(E->slot_committed(3) == N, "copy_slot length");
+            const q::SlotRows continuation[] = {{1, 1}, {3, 1}};
+            const std::uint32_t next[] = {T[1][0], T[1][0]};
+            const auto continued = E->forward_slots(continuation, 2, next, q::LogitRows::all);
+            std::vector<float> original(c.vocab), copied(c.vocab);
+            E->read_logits(continued, 0, original.data());
+            E->read_logits(continued, 1, copied.data());
+            CHECK(same(original, copied), "copied slot continuation logits");
         }
         // MTP: one call with rows == the same rows one at a time
         if (E->has_mtp()) {
@@ -209,6 +226,9 @@ int main() {
             cudaMalloc(reinterpret_cast<void**>(&dh), hid.size() * 4);
             cudaMemcpy(dh, hid.data(), hid.size() * 4, cudaMemcpyHostToDevice);
             std::vector<std::uint32_t> nxt(t8.begin() + 1, t8.begin() + 9);
+            rejected = false;
+            try { (void)E->mtp_forward(&invalid_id, dh, 1, 0); } catch (const std::invalid_argument&) { rejected = true; }
+            CHECK(rejected, "MTP rejects token outside vocabulary");
             const auto m8 = E->mtp_forward(nxt.data(), dh, 8, 0);
             std::vector<float> l8(8 * c.vocab), l1(8 * c.vocab);
             for (int r = 0; r < 8; ++r) E->read_logits(q::RowsOut{m8.logits}, r, &l8[r * c.vocab]);
