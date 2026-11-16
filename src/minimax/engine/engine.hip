@@ -833,8 +833,9 @@ struct Engine::Impl {
         // slower (measurement inconclusive): linear v4. Wide expert kernels at N2-4 only (form 2) ON: measured processes
         // W0/W2 alternated with pinned cable weights, rows == alone, N2 -3.0..-3.5 %, N4 -4..-6 %, N1/N8 the same
         // kernels. An explicit value wins (STRIX_MMX_MOE_WIDE=0 = 4-column CTAs at every N).
-        (void)::setenv("STRIX_MMX_LINEAR_V", "4", 0);
-        (void)::setenv("STRIX_MMX_MOE_WIDE", "2", 0);
+        // Exported defaults are noted so later reads record them as default (receipt "set" = user values only).
+        for (const auto& [k, v] : {std::pair{"STRIX_MMX_LINEAR_V", "4"}, std::pair{"STRIX_MMX_MOE_WIDE", "2"}})
+            if (std::getenv(k) == nullptr && ::setenv(k, v, 0) == 0) strix::envcfg::note_default_export(k, v);
         if (opt.rank >= kWorld) throw std::invalid_argument("rank must be 0 or 1");
         if (opt.max_rows < kMaxStepRows) throw std::invalid_argument("max_rows < 8");
         moe::opt::set_prefill_mtfit(-1);

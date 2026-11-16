@@ -5,6 +5,7 @@
 // receipt (argv + env, tests/fixtures/minimax_production_receipt.txt), serve's routed default is checked separately, every off switch restores its item's former
 // value, STRIX_MM_BASELINE=1 restores all of them, and apply() exports what --print-effective-config prints.
 #include "minimax/engine/mm_defaults.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/dist/transport_spec.hpp"
 #include "strix/minimax/session_startup.hpp"
 
@@ -537,6 +538,15 @@ void test_apply() {
             check(md::from_defaults(it.env), std::string("from_defaults ") + it.env);
         }
     }
+    // Shared recorder: a read of an exported default records as default; a user value stays "set" (receipt switches).
+    for (const char* name : {"STRIX_MM_PF_MSA_REWORK", "STRIX_MM_XB_PUBLISH"}) {
+        (void)strix::envcfg::text(name);
+        bool found = false, set = false;
+        for (const auto& e : strix::envcfg::registered())
+            if (e.name == name) { found = true; set = e.set; }
+        const bool user = std::strcmp(name, "STRIX_MM_XB_PUBLISH") == 0;
+        check(found && set == user, std::string("envcfg records exported default as default, user value as set: ") + name);
+    }
     // Exercise the actual app entry with and without inspection, for both rank arguments.
     for (const char* name : {"STRIX_MM_SERVE_SCHED", "STRIX_MM_SERVE_SERVICE_MS", "STRIX_MM_SERVE_GAP_MS",
                              "STRIX_MM_SERVE_SHORT_FIRST", "STRIX_MM_SERVE_NEST", "STRIX_MM_SERVE_DSPARK", "STRIX_MM_SERVE_DSPARK_INFLIGHT"}) {
@@ -741,20 +751,8 @@ void test_fast_prefill_profile() {
             const auto base = lookup(idx);
             std::set<std::string> seen;
             (void)md::prefill_policy([&](const char* k) -> const char* { seen.insert(k); return base(k); });
-            const bool exported = md::from_defaults("STRIX_MM_PF_MSA_REWORK");
-            check(seen.count("STRIX_DIST_CRC_PARALLEL") == 0 && seen.count("STRIX_MM_PF_MSA_REWORK") == (exported ? 0U : 1U),
+            check(seen.count("STRIX_DIST_CRC_PARALLEL") == 0 && seen.count("STRIX_MM_PF_MSA_REWORK") == 1,
                   "fast receipt: the flash guard reads the rework item, not the whole defaults set");
-            // After apply() (test_apply ran first): the exported rework default is not read, so the receipt does not
-            // list it as user-set; the flash decision is unchanged.
-            check(exported, "fast receipt: test_apply exported the rework item");
-            std::set<std::string> seen_proc;
-            const auto pp = md::prefill_policy([&](const char* k) -> const char* {
-                seen_proc.insert(k);
-                const char* v = base(k);
-                return v != nullptr ? v : std::getenv(k);
-            });
-            check(seen_proc.count("STRIX_MM_PF_MSA_REWORK") == 0 && pp.msa_flash == md::prefill_policy(base).msa_flash,
-                  "fast receipt: an exported rework default is not recorded and keeps the flash decision");
         }
         // ONE RESOLVER: rank and serve resolve the same request to the same prefill lines.
         const auto prefill_lines = [](const std::string& cfg) {

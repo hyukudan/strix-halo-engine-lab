@@ -4,6 +4,7 @@
 // MiniMax M3.1 defaults-on resolver: the table of default-ON items, the baseline master switch and the canonical
 // effective configuration (see mm_defaults.hpp).
 #include "minimax/engine/mm_defaults.hpp"
+#include "strix/env_flags.hpp"
 #include "minimax/engine/mm_profile_table.hpp"
 #include "minimax/engine/route_identity.hpp"
 #include "core/layer_set.hpp"
@@ -228,11 +229,8 @@ PrefillPolicy prefill_policy(const Lookup& env) {
         // Only the rework item and the baseline switch decide it: forwarding every item through a recording lookup
         // (the engine passes envcfg::text) put the whole defaults set into the FAST arm's receipt, which the floor
         // gate then refused against an exact reference ("differs beyond its FAST layer set").
-        // A value apply() exported is the item's own default: resolving it unset gives the same mode without a read,
-        // so the FAST arm does not record the exported value as user-set (the exact reference never reads it here).
         const Lookup rework_env = [&](const char* k) -> const char* {
-            const bool own = std::strcmp(k, "STRIX_MM_PF_MSA_REWORK") == 0 || std::strcmp(k, kBaselineEnv) == 0;
-            return own && !from_defaults(k) ? env(k) : nullptr;
+            return std::strcmp(k, "STRIX_MM_PF_MSA_REWORK") == 0 || std::strcmp(k, kBaselineEnv) == 0 ? env(k) : nullptr;
         };
         for (const auto& r : resolve(rework_env))
             if (std::strcmp(r.item->env, "STRIX_MM_PF_MSA_REWORK") == 0) rework = r.value != "0";
@@ -341,7 +339,7 @@ void apply() {
     const Lookup env = process_env;
     for (const Resolved& r : resolve(env)) {
         if (r.source == Source::env) continue;
-        (void)export_env(r.item->env, r.value.c_str(), 0);
+        if (export_env(r.item->env, r.value.c_str(), 0) == 0) strix::envcfg::note_default_export(r.item->env, r.value.c_str());
         g_exported.insert(r.item->env);
     }
     if (baseline(env))
