@@ -158,7 +158,7 @@ int main(int argc, char** argv) {
         bool slots_verify = false, graphs = true, multi = true, bwp = false, pdl = false, print_cfg = false;
         q::EngineOptions topt;  // TURBO levers (defaults = exact)
         std::string arith_name = "mma3";
-        std::string flash_pipe, pf_attn8;
+        std::string flash_pipe, flash_tail, pf_attn8;
         std::string pf_arith, pf_dump;            // --prefill-arith exact|flash|fast|fast2: large-M prefill (absent: windows of --rows)
         std::uint32_t pf_chunk = 2048, pf_repeat = 1, pf_slots = 2;
         for (int i = 1; i < argc; ++i) {
@@ -178,6 +178,7 @@ int main(int argc, char** argv) {
             else if (a == "--max-pos") max_pos = strix::core::parse_u32(next());
             else if (a == "--prefill-arith") pf_arith = next();
             else if (a == "--flash-pipe") flash_pipe = next();         // pad2|swz3 (bitwise equal; scheduling only)
+            else if (a == "--flash-tail") flash_tail = next();         // split|off (bitwise equal; scheduling only; default split)
             else if (a == "--prefill-attn8") pf_attn8 = next();        // on|off: e4m3 flash attention (FAST, identity -a8)
             else if (a == "--prefill-chunk") pf_chunk = strix::core::parse_u32(next());
             else if (a == "--prefill-dump") pf_dump = next();  // last-token logits of the LAST prefill (float32 [vocab])
@@ -259,6 +260,9 @@ int main(int argc, char** argv) {
         if (flash_pipe == "swz3") opt.flash_pipe = strix::cuda_core::FlashPipe::swz3;
         else if (flash_pipe == "pad2") opt.flash_pipe = strix::cuda_core::FlashPipe::pad2;
         else if (!flash_pipe.empty()) throw std::runtime_error("--flash-pipe expects pad2|swz3");
+        if (flash_tail == "off") opt.flash_tail = strix::cuda_core::FlashTail::off;
+        else if (flash_tail == "split") opt.flash_tail = strix::cuda_core::FlashTail::split;
+        else if (!flash_tail.empty()) throw std::runtime_error("--flash-tail expects split|off");
         if (pf_attn8 == "on") opt.prefill_attn8 = true;
         else if (pf_attn8 == "off") opt.prefill_attn8 = false;
         else if (!pf_attn8.empty()) throw std::runtime_error("--prefill-attn8 expects on|off");

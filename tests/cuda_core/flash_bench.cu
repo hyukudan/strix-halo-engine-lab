@@ -60,7 +60,26 @@ std::vector<std::uint32_t> parse_list(const char* s) {
     }
     return v;
 }
-const char* pipe_name(cc::FlashPipe p) { return p == cc::FlashPipe::swz3 ? "swz3" : "pad2"; }
+// arm = pipe [t[w]]: "pad2", "swz3", "pad2t" (wave-tail split, auto warps), "pad2t1" / "t2" / "t4" (forced tail warps)
+struct Arm {
+    cc::FlashPipe pipe = cc::FlashPipe::pad2;
+    cc::FlashTail tail = cc::FlashTail::off;
+    std::uint32_t warps = 0;
+    char name[8] = "pad2";
+};
+Arm parse_arm(const char* p) {
+    Arm a;
+    a.pipe = std::strncmp(p, "swz3", 4) == 0 ? cc::FlashPipe::swz3 : cc::FlashPipe::pad2;
+    if (p[0] && p[1] && p[2] && p[3] && p[4] == 't') {
+        a.tail = cc::FlashTail::split;
+        if (p[5] >= '1' && p[5] <= '4') a.warps = static_cast<std::uint32_t>(p[5] - '0');
+    }
+    std::size_t n = 0;
+    while (p[n] && p[n] != ',' && n < 7) ++n;
+    std::memcpy(a.name, p, n);
+    a.name[n] = 0;
+    return a;
+}
 
 struct Case {
     std::uint32_t L, rows;
@@ -69,7 +88,7 @@ struct Case {
 // returns number of byte-mismatching floats vs the first pipe (summed over pipes)
 bool with_f8 = true, f8_bad = false;
 
-std::size_t run_case(const Case& c, std::uint32_t heads, std::uint32_t kvh, const std::vector<cc::FlashPipe>& pipes, int iters, bool timing) {
+std::size_t run_case(const Case& c, std::uint32_t heads, std::uint32_t kvh, const std::vector<Arm>& pipes, int iters, bool timing) {
     constexpr std::uint32_t D = 256;
     cc::AttentionDims d;
     d.heads = heads;
@@ -102,7 +121,7 @@ std::size_t run_case(const Case& c, std::uint32_t heads, std::uint32_t kvh, cons
     CK(cudaEventCreate(&e1));
     for (std::size_t pi = 0; pi < pipes.size(); ++pi) {
         CK(cudaMemset(out, 0xFF, q_n * 4));
-        CK(cc::attention_prefill_flash(d, q, qv, gate, qv, kc, vc, pos0, c.rows, out, nullptr, pipes[pi]));
+        CK(cc::attention_prefill_flash(d, q, qv, gate, qv, kc, vc, pos0, c.rows, out, nullptr, pipes[pi].pipe, pipes[pi].tail, pipes[pi].warps));
         CK(cudaDeviceSynchronize());
         CK(cudaMemcpy(pi == 0 ? ref.data() : cur.data(), out, q_n * 4, cudaMemcpyDeviceToHost));
         std::size_t bad = 0;
@@ -114,7 +133,8 @@ std::size_t run_case(const Case& c, std::uint32_t heads, std::uint32_t kvh, cons
             std::vector<float> ms(static_cast<std::size_t>(iters));
             for (int it = 0; it < iters; ++it) {
                 CK(cudaEventRecord(e0));
-                CK(cc::attention_prefill_flash(d, q, qv, gate, qv, kc, vc, pos0, c.rows, out, nullptr, pipes[pi]));
+                CK(cc::attention_prefill_flash(d, q, qv, gate, qv, kc, vc, pos0, c.rows, out, nullptr, pipes[pi].pipe, pipes[pi].tail,
+                                               pipes[pi].warps));
                 CK(cudaEventRecord(e1));
                 CK(cudaEventSynchronize(e1));
                 CK(cudaEventElapsedTime(&ms[static_cast<std::size_t>(it)], e0, e1));
@@ -124,7 +144,7 @@ std::size_t run_case(const Case& c, std::uint32_t heads, std::uint32_t kvh, cons
         }
         int clk = 0;
         cudaDeviceGetAttribute(&clk, cudaDevAttrClockRate, 0);
-        std::printf("L=%u rows=%u pos0=%u heads=%u/%u pipe=%s ms=%.3f TF/s=%.1f %s%zu\n", c.L, c.rows, pos0, heads, kvh, pipe_name(pipes[pi]),
+        std::printf("L=%u rows=%u pos0=%u heads=%u/%u pipe=%s ms=%.3f TF/s=%.1f %s%zu\n", c.L, c.rows, pos0, heads, kvh, pipes[pi].name,
                     ms_med, timing ? flop / (ms_med * 1e9) : 0.0, pi == 0 ? "ref " : "mismatch=", pi == 0 ? std::size_t{0} : bad);
         std::fflush(stdout);
     }
@@ -197,7 +217,8 @@ int main(int argc, char** argv) {
     std::uint32_t rows = 4096, heads = 24, kvh = 4;
     int iters = 3;
     bool check_only = false;
-    std::vector<cc::FlashPipe> pipes{cc::FlashPipe::pad2, cc::FlashPipe::swz3};
+    std::vector<Arm> pipes{parse_arm("pad2"), parse_arm("swz3"), parse_arm("pad2t"), parse_arm("pad2t1"), parse_arm("pad2t2"),
+                           parse_arm("pad2t4"), parse_arm("swz3t")};
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> const char* { return i + 1 < argc ? argv[++i] : ""; };
@@ -211,7 +232,7 @@ int main(int argc, char** argv) {
         else if (a == "--pipes") {
             pipes.clear();
             for (const char* p = next(); *p;) {
-                pipes.push_back(std::strncmp(p, "swz3", 4) == 0 ? cc::FlashPipe::swz3 : cc::FlashPipe::pad2);
+                pipes.push_back(parse_arm(p));
                 while (*p && *p != ',') ++p;
                 if (*p == ',') ++p;
             }

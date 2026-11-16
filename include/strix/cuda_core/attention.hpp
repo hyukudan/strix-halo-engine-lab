@@ -48,10 +48,21 @@ cudaError_t attention_decode(const AttentionDims& d, const float* q, const Group
 // FlashPipe = shared-memory pipeline of the K/V tiles only (scheduling): every pipe gives the SAME bits (same tiles, same order per row).
 //   pad2: padded rows, 2 stages, two barriers per tile (the original form, kept as the off switch);
 //   swz3: XOR-swizzled dense rows, 3 stages (prefetch distance 2), one barrier per tile.
+// FlashTail = wave-tail split (scheduling only, SAME bits): with T = ceil(rows/128) * heads CTAs on S SMs (1 CTA/SM), the last
+// T mod S tiles form a partial wave that bills a whole CTA time. split: those tiles run as jobs of w active warps (w = 1/2/4, the
+// smallest with (T mod S) * 8 / w <= S, or tail_warps if non-zero), so the partial wave spreads over the idle SMs. Every warp keeps its
+// 16 rows, its head and the tile count of its 128-row block, so each output row runs the same instructions on the same tiles.
 enum class FlashPipe : std::uint8_t { pad2 = 0, swz3 = 1 };
+enum class FlashTail : std::uint8_t { off = 0, split = 1 };
 cudaError_t attention_prefill_flash(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate, const GroupedView& gv,
                                     const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache, std::uint32_t pos0, std::uint32_t rows,
-                                    float* out, cudaStream_t stream, FlashPipe pipe = FlashPipe::pad2);
+                                    float* out, cudaStream_t stream, FlashPipe pipe = FlashPipe::pad2, FlashTail tail = FlashTail::off,
+                                    std::uint32_t tail_warps = 0);
+// Launch plan of attention_prefill_flash (host arithmetic; exposed for tests and the effective-config print).
+struct FlashPlan {
+    std::uint32_t tiles = 0, full = 0, tail_tiles = 0, tail_warps = 8, jobs = 0;
+};
+FlashPlan flash_plan(std::uint32_t rows, std::uint32_t heads, std::uint32_t sms, FlashTail tail, std::uint32_t tail_warps = 0);
 // FAST8 prefill attention (bit-changing; under the FAST8 prefill policy and its quality gate only). An e4m3 SHADOW of the BF16 KV cache
 // (the BF16 cache stays the source of truth for decode and for every other path): per kv head K8 [P8][head_dim] e4m3 + ks [P8] FP32
 // (k = K8 * ks, ks = amax / 448 per position), V8T [head_dim][P8] e4m3 transposed + vs [P8] (v = V8T * vs); P8 = max_positions rounded up

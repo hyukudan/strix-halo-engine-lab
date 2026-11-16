@@ -1034,7 +1034,7 @@ struct CudaEngine::Impl {
                 CK(cc::kv_shadow_e4m3(ad, kc[l], vc[l], pf.sh[l], from, pos0 + rows - from, sl.st));
                 CK(cc::attention_prefill_flash8(ad, sl.q, qdst, sl.qg + D, qsrc, pf.sh[l], pos0, rows, sl.ao, sl.st));
             } else {
-                CK(cc::attention_prefill_flash(ad, sl.q, qdst, sl.qg + D, qsrc, kc[l], vc[l], pos0, rows, sl.ao, sl.st, opt.flash_pipe));
+                CK(cc::attention_prefill_flash(ad, sl.q, qdst, sl.qg + D, qsrc, kc[l], vc[l], pos0, rows, sl.ao, sl.st, opt.flash_pipe, opt.flash_tail));
             }
         }
         pf_dirty(sl);
@@ -1293,6 +1293,8 @@ void print_effective_config(const EngineOptions& o, const char* arith, std::FILE
                  o.turbo_bits, o.turbo_weights == TurboWeights::onfly ? (o.turbo_lm_head ? "nvfp4" : "bf16") : "n/a", o.multi_gemv ? "on" : "off");
     if (o.turbo_weights == TurboWeights::onfly)
         std::fprintf(f, "  format: NVFP4 e2m1 + e4m3/16 + FP32 global; RTN; GEMV f16 mma, FP32 accumulate, activations RN f16, rows 1..32 bitwise row-invariant\n");
+    std::fprintf(f, "  prefill-flash-tail: %s (scheduling only, bitwise equal; split = partial last wave as fewer-warp jobs)\n",
+                 o.flash_tail == cuda_core::FlashTail::split ? "split" : "off");
     std::fprintf(f, "  prefill-flash-pipe: %s (scheduling only, bitwise equal across pipes)\n  prefill-attn8: %s\n",
                  o.flash_pipe == cuda_core::FlashPipe::swz3 ? "swz3" : "pad2",
                  o.prefill_arith == PrefillArith::exact ? "n/a (exact prefill keeps attention_decode)"

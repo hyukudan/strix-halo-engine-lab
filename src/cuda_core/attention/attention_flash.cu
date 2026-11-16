@@ -65,11 +65,21 @@ __device__ __forceinline__ void load_kv_tile(std::uint32_t smem_stage, const __n
 template <class LY>
 __global__ void __launch_bounds__(256, 1)
     flash_kernel(AttentionDims d, const float* q, GroupedView qv, const float* gate, GroupedView gv, const __nv_bfloat16* kc, const __nv_bfloat16* vc,
-                 std::uint32_t pos0, std::uint32_t rows, float* out) {
+                 std::uint32_t pos0, std::uint32_t rows, float* out, std::uint32_t nqb, std::uint32_t n_full, std::uint32_t tail_w) {
     extern __shared__ __align__(16) unsigned char smem[];
-    const std::uint32_t qb = gridDim.x - 1 - blockIdx.x;  // heavy (late) blocks first
-    const std::uint32_t head = blockIdx.y, G = d.heads / d.kv_heads, kvh = head / G;
+    // job -> tile (linear order = the former 2D grid: head-major, x fastest). Jobs below n_full are whole tiles (8 warps); the rest
+    // split the remaining tiles into 8 / tail_w jobs of tail_w active warps (inactive warps still copy K/V and meet every barrier).
+    std::uint32_t tile = blockIdx.x, wlo = 0, wn = 8;
+    if (blockIdx.x >= n_full) {
+        const std::uint32_t k = blockIdx.x - n_full, per = 8 / tail_w;
+        tile = n_full + k / per;
+        wlo = (k % per) * tail_w;
+        wn = tail_w;
+    }
+    const std::uint32_t qb = nqb - 1 - tile % nqb;  // heavy (late) blocks first
+    const std::uint32_t head = tile / nqb, G = d.heads / d.kv_heads, kvh = head / G;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, q4 = lane & 3;
+    const bool act = static_cast<std::uint32_t>(warp) - wlo < wn;  // warp-uniform
     const std::uint32_t row_base = qb * QB, wrow0 = row_base + warp * 16;
     const std::uint32_t nkeys = pos0 + min(rows, row_base + QB);  // keys any row of this block may see
     const std::uint32_t ntiles = (nkeys + KT - 1) / KT;
@@ -129,6 +139,10 @@ __global__ void __launch_bounds__(256, 1)
             asm volatile("cp.async.commit_group;");
         }
         stage_idx = stage_idx + 1 == static_cast<std::uint32_t>(LY::STAGES) ? 0 : stage_idx + 1;
+        if (!act) {  // copy/barrier participant only
+            if constexpr (LY::STAGES == 2) __syncthreads();
+            continue;
+        }
         const unsigned char* sK = smem + stage;
         const std::uint32_t sV = smem_base + stage;
         float s[4][4];
@@ -202,6 +216,7 @@ __global__ void __launch_bounds__(256, 1)
         }
         if constexpr (LY::STAGES == 2) __syncthreads();
     }
+    if (!act) return;  // no barrier below
     // finalize
     l0 += __shfl_xor_sync(0xffffffffu, l0, 1);
     l0 += __shfl_xor_sync(0xffffffffu, l0, 2);
@@ -235,10 +250,18 @@ __global__ void iota_kernel(std::uint32_t* p, std::uint32_t n, std::uint32_t bas
 
 cudaError_t attention_prefill_flash(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate, const GroupedView& gv,
                                     const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache, std::uint32_t pos0, std::uint32_t rows,
-                                    float* out, cudaStream_t stream, FlashPipe pipe) {
+                                    float* out, cudaStream_t stream, FlashPipe pipe, FlashTail tail, std::uint32_t tail_warps) {
     if (d.head_dim != D || rows == 0 || d.kv_heads == 0 || d.heads % d.kv_heads != 0 || d.heads / d.kv_heads > 8 || pos0 + rows > d.max_positions)
         return cudaErrorInvalidValue;
-    const dim3 grid((rows + QB - 1) / QB, d.heads);
+    static int sms = 0;
+    if (sms == 0 && tail != FlashTail::off) {
+        int dev = 0;
+        if (auto e = cudaGetDevice(&dev); e != cudaSuccess) return e;
+        if (auto e = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev); e != cudaSuccess) return e;
+    }
+    const FlashPlan pl = flash_plan(rows, d.heads, static_cast<std::uint32_t>(sms), tail, tail_warps);
+    const std::uint32_t nqb = (rows + QB - 1) / QB;
+    const dim3 grid(pl.jobs);
     if (pipe == FlashPipe::swz3) {
         static bool attr = false;
         if (!attr) {
@@ -247,7 +270,8 @@ cudaError_t attention_prefill_flash(const AttentionDims& d, const float* q, cons
                 return e;
             attr = true;
         }
-        flash_kernel<SwzLayout><<<grid, 256, smem_bytes<SwzLayout>(), stream>>>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out);
+        flash_kernel<SwzLayout><<<grid, 256, smem_bytes<SwzLayout>(), stream>>>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, nqb,
+                                                                                 pl.full, pl.tail_warps);
     } else {
         static bool attr = false;
         if (!attr) {
@@ -256,9 +280,35 @@ cudaError_t attention_prefill_flash(const AttentionDims& d, const float* q, cons
                 return e;
             attr = true;
         }
-        flash_kernel<PadLayout><<<grid, 256, smem_bytes<PadLayout>(), stream>>>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out);
+        flash_kernel<PadLayout><<<grid, 256, smem_bytes<PadLayout>(), stream>>>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, nqb,
+                                                                                 pl.full, pl.tail_warps);
     }
     return cudaGetLastError();
+}
+
+FlashPlan flash_plan(std::uint32_t rows, std::uint32_t heads, std::uint32_t sms, FlashTail tail, std::uint32_t tail_warps) {
+    FlashPlan p;
+    p.tiles = (rows + QB - 1) / QB * heads;
+    p.full = p.jobs = p.tiles;
+    if (tail == FlashTail::off || sms == 0 || p.tiles <= sms) return p;  // no partial wave behind a full one
+    const std::uint32_t r = p.tiles % sms;
+    if (r == 0) return p;
+    std::uint32_t w = 0;
+    if (tail_warps == 1 || tail_warps == 2 || tail_warps == 4) {
+        w = tail_warps;
+    } else {
+        for (std::uint32_t c : {1u, 2u, 4u})
+            if (r * (8 / c) <= sms) {
+                w = c;
+                break;
+            }
+    }
+    if (w == 0) return p;
+    p.full = p.tiles - r;
+    p.tail_tiles = r;
+    p.tail_warps = w;
+    p.jobs = p.full + r * (8 / w);
+    return p;
 }
 
 cudaError_t iota_u32(std::uint32_t* p, std::uint32_t n, std::uint32_t base, std::uint32_t step, cudaStream_t stream) {

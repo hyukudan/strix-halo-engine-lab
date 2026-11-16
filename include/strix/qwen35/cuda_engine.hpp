@@ -58,6 +58,8 @@ struct EngineOptions {
     // Long-context prefill attention (non-exact prefill policies only; the exact policy keeps attention_decode).
     // flash_pipe: shared-memory pipeline of the flash kernel (scheduling only, bitwise equal across pipes).
     cuda_core::FlashPipe flash_pipe = cuda_core::FlashPipe::pad2;
+    // flash_tail: wave-tail split of the flash grid (scheduling only, bitwise equal; measured +4.5 % flash at 4096-row chunks). off = old grid.
+    cuda_core::FlashTail flash_tail = cuda_core::FlashTail::split;
     // attn8: e4m3 flash attention over an e4m3 shadow of the KV cache (bit-changing, own identity suffix "-a8"; FAST gate required).
     bool prefill_attn8 = false;
 };
