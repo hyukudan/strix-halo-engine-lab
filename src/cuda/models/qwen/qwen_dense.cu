@@ -394,8 +394,15 @@ bool rows_ksplit_enabled() {
     static const bool on = strix::envcfg::flag("STRIX_QRTX_ROWS_KSPLIT", true);
     return on;
 }
+// 9..16-row windows: one k-split pass with 16 padded rows (default) or STRIX_QRTX_DENSE_ROWS16=0 = two <= 8-row pieces
+bool rows16_enabled() {
+    static const bool on = strix::envcfg::flag("STRIX_QRTX_DENSE_ROWS16", true);
+    return on;
+}
+// 9..16 rows (RP 16, one pass over the weights instead of two 8-row pieces): same (row, output) chains; the form runs
+// at most 768 threads (width <= 6144), so its bound is 768 and the 32 activation registers per thread do not spill.
 template <Store S, unsigned R, unsigned RP, unsigned KO>
-__global__ __launch_bounds__(1024) void project_rows_ks_kernel(KSite site, const std::int8_t* codes, const float* deltas,
+__global__ __launch_bounds__(RP > 8U ? 768 : 1024) void project_rows_ks_kernel(KSite site, const std::int8_t* codes, const float* deltas,
                                                               std::uint32_t pitch) {
     extern __shared__ __align__(16) unsigned char smem[];
     const std::uint32_t width = site.width, nblocks = width / 32U, row_bytes = nblocks * 34U;
@@ -476,13 +483,15 @@ __global__ __launch_bounds__(1024) void project_rows_ks_kernel(KSite site, const
 
 template <Store S, unsigned R, unsigned KO> cudaError_t launch_rows_ks_o(cudaStream_t stream, const KSite& k, const std::int8_t* codes,
                                                            const float* deltas, std::uint32_t pitch) {
-    constexpr unsigned RP = R <= 1U ? 1U : R <= 2U ? 2U : R <= 4U ? 4U : 8U;
+    constexpr unsigned RP = R <= 1U ? 1U : R <= 2U ? 2U : R <= 4U ? 4U : R <= 8U ? 8U : 16U;
     const std::uint32_t nb = k.width / 32U, smem = nb * (KO * RP + KO + RP) * 4U;
+    // 256 blocks = width 8192 bound of the <= 8-row forms; RP 16 forms take width <= 6144 (192 blocks)
+    constexpr unsigned kAttr = RP > 8U ? 192U * (KO * RP + KO + RP) * 4U : 256U * (8U * 8U + 8U + 8U) * 4U;
     static std::once_flag once;
     static cudaError_t attr = cudaSuccess;
     std::call_once(once, [] {
         attr = cudaFuncSetAttribute(project_rows_ks_kernel<S, R, RP, KO>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    256 * (8 * 8 + 8 + 8) * 4);
+                                    static_cast<int>(kAttr));
     });
     if (attr != cudaSuccess) return attr;
     project_rows_ks_kernel<S, R, RP, KO><<<(k.outputs + KO - 1U) / KO, 32U * ((nb + 7U) / 8U), smem, stream>>>(k, codes, deltas, pitch);
@@ -493,6 +502,10 @@ template <Store S, unsigned R> cudaError_t launch_rows_ks_r(cudaStream_t stream,
     static const int ko = [] { const char* e = strix::envcfg::text("STRIX_QRTX_KSO"); return e ? std::atoi(e) : 0; }();
     const std::uint32_t nb = k.width / 32U;
     const int pick = ko ? ko : (nb >= 128U ? 4 : 8);
+    if constexpr (R > 8U) {   // RP 16: KO 4 (192 blocks: 64.5 KB of shared memory), KO 2 on request
+        return pick == 2 ? launch_rows_ks_o<S, R, 2>(stream, k, codes, deltas, pitch)
+                         : launch_rows_ks_o<S, R, 4>(stream, k, codes, deltas, pitch);
+    }
     return pick == 4 ? launch_rows_ks_o<S, R, 4>(stream, k, codes, deltas, pitch)
          : pick == 2 ? launch_rows_ks_o<S, R, 2>(stream, k, codes, deltas, pitch)
                      : launch_rows_ks_o<S, R, 8>(stream, k, codes, deltas, pitch);
@@ -507,7 +520,15 @@ template <Store S> cudaError_t launch_rows_ks(cudaStream_t stream, const KSite& 
     case 5: return launch_rows_ks_r<S, 5>(stream, k, codes, deltas, pitch);
     case 6: return launch_rows_ks_r<S, 6>(stream, k, codes, deltas, pitch);
     case 7: return launch_rows_ks_r<S, 7>(stream, k, codes, deltas, pitch);
-    default: return launch_rows_ks_r<S, 8>(stream, k, codes, deltas, pitch);
+    case 8: return launch_rows_ks_r<S, 8>(stream, k, codes, deltas, pitch);
+    case 9: return launch_rows_ks_r<S, 9>(stream, k, codes, deltas, pitch);
+    case 10: return launch_rows_ks_r<S, 10>(stream, k, codes, deltas, pitch);
+    case 11: return launch_rows_ks_r<S, 11>(stream, k, codes, deltas, pitch);
+    case 12: return launch_rows_ks_r<S, 12>(stream, k, codes, deltas, pitch);
+    case 13: return launch_rows_ks_r<S, 13>(stream, k, codes, deltas, pitch);
+    case 14: return launch_rows_ks_r<S, 14>(stream, k, codes, deltas, pitch);
+    case 15: return launch_rows_ks_r<S, 15>(stream, k, codes, deltas, pitch);
+    default: return launch_rows_ks_r<S, 16>(stream, k, codes, deltas, pitch);
     }
 }
 
@@ -740,6 +761,9 @@ template <Store S> cudaError_t launch_project(cudaStream_t stream, const KSite& 
                                               const float* deltas, std::uint32_t pitch) {
     // 9..16 rows (core::decode_rows_max): <= 8-row decode pieces. A piece sees rows r0.. through offset codes / deltas /
     // outputs / gates; each (row, output) chain is row-local, so the bits are the tiled kernel's.
+    if (rows > core::kDecodePieceRows && rows <= core::decode_rows_max() && k.width <= 6144U && decode_rows_enabled() &&
+        rows_ksplit_enabled() && rows16_enabled())
+        return launch_rows_ks<S>(stream, k, rows, codes, deltas, pitch);   // one weight pass for 9..16 rows
     if (rows > core::kDecodePieceRows && rows <= core::decode_rows_max() && k.width <= 6144U && decode_rows_enabled()) {
         constexpr std::uint64_t elem = S == Store::f32 || S == Store::f32_round_bf16 ? 4U : 2U;
         for (std::uint32_t r0 = 0; r0 < rows; r0 += core::kDecodePieceRows) {
