@@ -103,6 +103,8 @@ def main():
     parser.add_argument("--protocol-fixtures-only", action="store_true",
                         help="compare protocol files without qualification or capture receipts")
     parser.add_argument("--runner", default="")
+    parser.add_argument("--partition-tests", action="store_true",
+                        help="run each mandatory test in its own bounded runner ticket")
     parser.add_argument("--output", required=True, type=pathlib.Path)
     parser.add_argument("--timeout", type=int, default=120)
     args = parser.parse_args()
@@ -115,16 +117,32 @@ def main():
     try:
         required = required_tests(args.pr, args.backend)
         summary["required_tests"] = sorted(required)
+        summary["partition_tests"] = args.partition_tests
+        if args.runner and not args.partition_tests:
+            raise ValueError("a queued runner requires --partition-tests for bounded tickets")
         junit.unlink(missing_ok=True)
-        command = shlex.split(args.runner) + ["ctest", "--test-dir", str(args.build.resolve()),
-            "-C", "Release", "--output-on-failure", "--no-tests=error", "--output-junit", str(junit),
-            "-R", "^(" + "|".join(re.escape(name) for name in sorted(required)) + ")$"]
-        with (args.output / "ctest.log").open("w") as log:
-            result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=args.timeout)
-        if result.returncode:
-            raise ValueError(f"mandatory CTest group failed: {result.returncode}")
-        root = ET.parse(junit).getroot()
+        partitions = [{name} for name in sorted(required)] if args.partition_tests else [required]
+        root = ET.Element("testsuite")
+        for index, partition in enumerate(partitions, 1):
+            stem = f"ctest-{index:03d}" if args.partition_tests else "ctest"
+            part_junit = args.output.resolve() / (stem + ".xml")
+            part_junit.unlink(missing_ok=True)
+            command = shlex.split(args.runner) + ["ctest", "--test-dir", str(args.build.resolve()),
+                "-C", "Release", "--output-on-failure", "--no-tests=error", "--timeout", str(args.timeout),
+                "--output-junit", str(part_junit),
+                "-R", "^(" + "|".join(re.escape(name) for name in sorted(partition)) + ")$"]
+            with (args.output / (stem + ".log")).open("w") as log:
+                # The runner owns the FIFO wait and the ticket's process budget.
+                # CTest bounds its one test inside the ticket, not while queued.
+                result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
+                                        timeout=None if args.runner else args.timeout)
+            if result.returncode:
+                raise ValueError(f"mandatory CTest partition {index} failed: {result.returncode}")
+            part_root = ET.parse(part_junit).getroot()
+            validate_tests(part_root, partition)
+            root.extend(part_root.iter("testcase"))
         count = validate_tests(root, required)
+        ET.ElementTree(root).write(junit, encoding="utf-8", xml_declaration=True)
         if not args.protocol_fixtures_only:
             validate_captures(args.baseline, args.candidate)
         command = [sys.executable, str(pathlib.Path(__file__).with_name("compare.py")),

@@ -217,6 +217,34 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(self.run_gate(old, new, ["wfmt.compare"])[0], 1)
         self.assertEqual(self.run_gate(old, new)[0], 0)
 
+    def test_partitioned_tickets_preserve_complete_inventory_and_queue_budget(self):
+        old, new = self.make_capture("old"), self.make_capture("new")
+        required = run.required_tests("P06", "hip")
+        out = self.path / "partitions"
+        launched = []
+        def command(argv, **kwargs):
+            if "ctest" in argv:
+                self.assertEqual(argv[:2], ["ticket", "--"])
+                self.assertIsNone(kwargs["timeout"])
+                self.assertEqual(argv[argv.index("--timeout") + 1], "120")
+                expression = argv[argv.index("-R") + 1]
+                selected = [name for name in required if expression == "^(" + re.escape(name) + ")$"]
+                self.assertEqual(len(selected), 1)
+                launched.extend(selected)
+                ET.ElementTree(junit(selected)).write(argv[argv.index("--output-junit") + 1])
+                return subprocess.CompletedProcess(argv, 0)
+            return subprocess.CompletedProcess(argv, invoke(compare, argv[2:]))
+        args = ["--build", self.path, "--baseline", old, "--candidate", new,
+                "--backend", "hip", "--pr", "P06", "--output", out,
+                "--runner", "ticket --", "--partition-tests"]
+        with mock.patch.object(run.subprocess, "run", side_effect=command):
+            self.assertEqual(invoke(run, args), 0)
+        self.assertEqual(set(launched), required)
+        self.assertEqual(len(launched), len(required))
+        self.assertEqual(run.validate_tests(ET.parse(out / "ctest.xml").getroot(), required), len(required))
+        # Queue-aware runners cannot silently fall back to an unbounded group.
+        self.assertEqual(invoke(run, args[:-1]), 1)
+
     def test_zero_payload_rejected(self):
         path = self.path / "empty.wfmt"
         metadata = {"case": "decode", "shape": [4], "arithmetic": "legacy@1"}
