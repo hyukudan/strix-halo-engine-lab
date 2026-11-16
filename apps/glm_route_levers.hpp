@@ -40,6 +40,8 @@ inline std::uint64_t record_route_levers(std::string_view entry, unsigned rank, 
     rr::lever("glm.identity", identity, identity);
     rr::lever("glm.pf_wmma", wmma, wmma_on ? "f16_wmma" : "exact", wmma_on ? rr::Reason::selected : rr::Reason::disabled);
     rr::lever("glm.pf_kda_wmma", kda, pf::kda_wmma::enabled() ? "1" : "0");
+    rr::lever("glm.pf_idxproj_wmma", asked("STRIX_GLM_PF_IDXPROJ_WMMA"), pf::idxproj_wmma::enabled() ? "1" : "0");
+    rr::lever("glm.pf_x16", asked("STRIX_GLM_PF_X16"), pf::kda_wmma::x16_enabled() ? "1" : "0", rr::Reason::selected, false);
     rr::lever("glm.pf_exact_x", x + ":min_rows=" + asked("STRIX_GLM_PF_EXACT_X_MIN_ROWS"), x_effective, rr::Reason::selected, true,
               "auto takes the X3 route (and the WMMA identity when on) only for calls of at least min_rows rows");
     rr::lever("glm.max_rows", std::to_string(max_rows), std::to_string(max_rows), rr::Reason::selected, false);

@@ -314,6 +314,19 @@ void config_receipts() {
     const Lookup baseline_env = [](const char* key) -> const char* {
         return std::string_view(key) == kBaselineEnv ? "1" : nullptr;
     };
+    for (const char* asked : {static_cast<const char*>(nullptr), "", "adaptive", "invariant"}) {
+        const Lookup order_env = [asked](const char* key) -> const char* {
+            return std::string_view(key) == "STRIX_MMX_PF_ORDER" ? asked : nullptr;
+        };
+        const auto config = effective_config(Cli{}, order_env);
+        require(config.find(std::string("STRIX_MMX_PF_ORDER.requested=") +
+                            (asked ? asked : "default") + "\n") != std::string::npos,
+                "requested chunk order inspection");
+        const bool invariant = asked && std::string_view(asked) == "invariant";
+        require(config.find(std::string("STRIX_MMX_PF_ORDER.effective=") +
+                            (invariant ? "invariant" : "adaptive") + "\n") != std::string::npos,
+                "effective chunk order inspection");
+    }
     require(resolve(empty).size() == items().size(), "defaults registry");
     for (const auto& resolved : resolve(empty))
         if (std::string_view(resolved.item->env) == "STRIX_MM_PF_MSA_REWORK")

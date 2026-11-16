@@ -2,6 +2,7 @@
 
 #include "qwen_http.hpp"
 #include "strix/model_content_hash.hpp"
+#include "strix/recurrent_state_policy.hpp"
 #include "strix/serve/json.hpp"
 
 #include <algorithm>
@@ -51,7 +52,9 @@ bool is_identity(const std::string& codec) { return codec.empty() || codec == "i
 }  // namespace
 
 std::uint32_t element_width(const std::string& component) {
-    if (component == "recurrent_matrix" || component == "ngram_history" || component == "position_history") return 4;
+    if (component == "recurrent_matrix")  // the stored element of the active recurrent-state contract
+        return static_cast<std::uint32_t>(recurrent_state_element_bytes(recurrent_state_policy().type));
+    if (component == "ngram_history" || component == "position_history") return 4;
     return 2;
 }
 
@@ -153,6 +156,8 @@ Sender::~Sender() {
 }
 
 const Layout& Sender::layout() {
+    // v1 echoes the consumer identity; it does not negotiate the producer codec.
+    require_f32_recurrent_state(recurrent_state_policy().type, "node handoff (no producer state contract)");
     if (impl_->have_layout) return impl_->layout;
     const auto t0 = Clock::now();
     auto [status, body] = impl_->client.get(impl_->base_path + "/layout", impl_->auth);
