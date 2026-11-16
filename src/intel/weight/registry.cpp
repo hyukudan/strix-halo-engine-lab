@@ -6,6 +6,8 @@ Status eligible(const WeightView& weight,const Workload& work,const Hardware& ha
  if(hardware.backend!=Backend::intel) return {Error::unsupported_backend,"Intel ascending F16 source requires Intel backend"};
  if(!work.m || work.m>UINT32_MAX || work.k%128 || work.experts>1 || work.active_experts>1)
   return {Error::unsupported_shape,"Intel Q8 F16 incumbent requires dense rows and K multiple of 128"};
+ if(hardware.arch!="host-reference" && !::strix::intel::sycl_built()) return {Error::unsupported_backend,
+  "Intel native source unavailable; dependency=SYCL backend build; fixture=Intel native operand qualification; removal=build and qualify the existing SYCL boundary"};
  return validate_q8_shape(weight,work.n,work.k);
 }
 Status launch_view(const Plan& plan,const WeightView& weight,const KernelArguments& envelope,void* output,

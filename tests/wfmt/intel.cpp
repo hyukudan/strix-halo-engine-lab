@@ -50,7 +50,7 @@ bool intel_case(std::string_view directory,std::uint32_t rows,std::uint32_t n,st
  if(enqueue(plan,weight,malformed,f.actual.data(),nullptr,0,context).code!=Error::malformed) return false;
  for(auto id:{FormatId{"gguf.iq3_s",1},FormatId{"exl3.mul1.tiles16",1},FormatId{"nvidia.nvfp4",1}}) {
   auto unsupported=weight; unsupported.storage=id;
-  Workload work{rows,n,k,1,1,{},1,false,false}; Hardware hardware{}; hardware.backend=Backend::intel;
+  Workload work{rows,n,k,1,1,{},1,false,false}; Hardware hardware{}; hardware.backend=Backend::intel; hardware.arch="host-reference";
   if(intel::candidates()[0].validate(unsupported,work,hardware).code!=Error::unsupported_arithmetic) return false;
  }
  return true;
