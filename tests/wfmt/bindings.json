@@ -780,8 +780,6 @@
       "status": "migrated",
       "capture": "legacy-public-entrypoint",
       "operations": [
-        "index_safetensors",
-        "open_source",
         "read_json",
         "read_safetensors"
       ]
@@ -1088,10 +1086,13 @@
         "host_defaults",
         "invalid_argument",
         "linears",
+        "note_default_export",
         "pf_async_min_rows",
+        "reference",
         "resolve",
         "resolve_default",
         "resolve_grouped_order",
+        "resolve_index_projection",
         "rows"
       ]
     },
@@ -1118,6 +1119,7 @@
         "invalid_argument",
         "resolve",
         "resolve_default",
+        "resolve_dspark_settings",
         "resolve_sessions"
       ]
     },
@@ -1186,8 +1188,11 @@
         "launch",
         "product",
         "reference_kernels",
+        "registered_weight_kernels",
         "scale"
-      ]
+      ],
+      "operand_source": "src/cpu/weight/source.hpp",
+      "source_registry": "src/cpu/weight/registry.cpp"
     },
     {
       "id": "cpu:src/cpu/core/reference.cpp",
@@ -1202,12 +1207,17 @@
       "status": "incumbent",
       "capture": "legacy-public-entrypoint",
       "operations": [
+        "block",
         "invalid_argument",
         "product",
         "ref_gemv_q8_0_a8",
         "ref_quantize_a8",
-        "reference_kernels"
-      ]
+        "reference_kernels",
+        "scale"
+      ],
+      "operand_source": "src/cpu/weight/source.hpp",
+      "source_registry": "src/cpu/weight/registry.cpp",
+      "kernel_address_migration": "bound: CPU raw Q8 source"
     },
     {
       "id": "cpu:src/cpu/core/select.cpp",
@@ -1223,8 +1233,11 @@
       "capture": "legacy-public-entrypoint",
       "operations": [
         "kernels",
-        "reference_kernels"
-      ]
+        "reference_kernels",
+        "registered_weight_kernels"
+      ],
+      "operand_source": "src/cpu/weight/source.hpp",
+      "source_registry": "src/cpu/weight/registry.cpp"
     },
     {
       "id": "cpu:src/cpu/arch/avx512/kernels.cpp",
@@ -1271,9 +1284,13 @@
       "status": "incumbent",
       "capture": "legacy-public-entrypoint",
       "operations": [
+        "row_bytes",
         "run_reference",
         "supported"
-      ]
+      ],
+      "operand_source": "src/intel/weight/source.hpp",
+      "source_registry": "src/intel/weight/registry.cpp",
+      "kernel_address_migration": "deferred: kernel-body edit outside current authorization"
     },
     {
       "id": "intel:src/intel/core/backend.cpp",
@@ -1290,8 +1307,11 @@
       "operations": [
         "enqueue_dense_q8a8",
         "load",
-        "supported"
-      ]
+        "validate_view"
+      ],
+      "operand_source": "src/intel/weight/source.hpp",
+      "source_registry": "src/intel/weight/registry.cpp",
+      "kernel_address_migration": "deferred: kernel-body edit outside current authorization"
     },
     {
       "id": "hip-dense:src/core/f16_dense_q8a8.hpp",
@@ -1311,17 +1331,22 @@
         "__launch_bounds__",
         "block",
         "blocks",
+        "columns",
         "enqueue",
+        "enqueue_image",
         "enqueue_parts",
         "ext_vector_type",
         "fragment",
         "hipLaunchKernelGGL",
         "kernel",
+        "kernel_image",
         "launch",
         "launch_form",
+        "launch_image",
         "rows",
         "stage",
         "supported",
+        "supported_image",
         "tile"
       ],
       "images": [
@@ -1343,17 +1368,23 @@
       "capture": "legacy-public-entrypoint",
       "operations": [
         "__builtin_amdgcn_readfirstlane",
+        "__launch_bounds__",
         "__syncthreads",
         "block",
+        "enqueue_x16_tiles",
         "ext_vector_type",
         "fragment",
+        "hipLaunchKernelGGL",
         "launch",
         "row_fragment",
+        "rows",
         "stage",
         "staged_fragment",
         "tile",
         "tiles",
-        "volatile"
+        "volatile",
+        "x16_bytes",
+        "x16_tiles_kernel"
       ],
       "images": [
         "Q6P32"
@@ -1551,6 +1582,7 @@
         "enqueue_q8_0_a8_ready",
         "enqueue_q8_0_a8_rn",
         "enqueue_q8_0_a8_rn_ready",
+        "enqueue_q_b_rope_image",
         "enqueue_quantize_a8",
         "enqueue_rms_norm",
         "enqueue_rope",
@@ -1635,6 +1667,7 @@
         "site_a8_group",
         "site_fast_kernel",
         "supported",
+        "supported_image",
         "swiglu_a8_kernel",
         "tile",
         "tiles",
@@ -1688,7 +1721,6 @@
         "__builtin_amdgcn_readfirstlane",
         "__launch_bounds__",
         "__syncthreads",
-        "bytes",
         "compute_stage",
         "default",
         "enqueue_index_proj",
@@ -1701,6 +1733,7 @@
         "enqueue_index_proj_wmma",
         "enqueue_index_proj_wmma_diag",
         "enqueue_index_proj_wmma_x16",
+        "enqueue_x16_tiles",
         "ext_vector_type",
         "fragment",
         "group",
@@ -1728,8 +1761,7 @@
         "split_default",
         "stage",
         "store_stage",
-        "tile",
-        "x16_tiles_kernel"
+        "tile"
       ],
       "images": [
         "Q6P32"
@@ -1750,11 +1782,15 @@
       "capture": "legacy-public-entrypoint",
       "operations": [
         "__launch_bounds__",
+        "columns",
         "dense_group",
         "dense_kernel",
+        "dense_x16_kernel",
+        "enqueue_x16_tiles",
         "kernels",
         "supported",
-        "tile"
+        "tile",
+        "x16_bytes"
       ],
       "images": [
         "Q6P32"
@@ -3435,6 +3471,9 @@
         "loaded",
         "norm_kernel",
         "pack_kernel",
+        "pinned_host_bytes",
+        "prepare_linear",
+        "project_act_kernel",
         "rows",
         "scale",
         "splice_kernel",
@@ -3443,8 +3482,10 @@
         "sum_kernel",
         "tile",
         "unload",
+        "unshuffle_kernel",
         "valid",
-        "validate"
+        "validate",
+        "workspace_bytes"
       ],
       "images": [
         "CB4",
@@ -3792,11 +3833,14 @@
         "q8_0_bytes",
         "quantize_project",
         "read_file",
+        "recurrent_state_bytes",
+        "recurrent_state_type_name",
         "resolve_route",
         "row_bytes",
         "rows",
         "run_block",
         "session_bytes",
+        "state_bytes",
         "supported",
         "tensor",
         "type",
@@ -3855,15 +3899,18 @@
         "blocks",
         "decode_rows_enabled",
         "dense_a8_quantize8",
+        "dense_t2_ring_stages",
         "dense_tile2_enabled",
         "kernel",
         "loader",
+        "project_tile4_kernel",
         "quantize",
         "quantize_kernel",
         "quantize_project",
         "rows_ksplit_enabled",
         "rows_shared_activation_scalar_kernel",
-        "shared_activation_kernel"
+        "shared_activation_kernel",
+        "tile2"
       ]
     },
     {
@@ -3881,11 +3928,13 @@
       "status": "incumbent",
       "capture": "legacy-public-entrypoint",
       "operations": [
+        "Tile4",
         "__launch_bounds__",
         "__syncthreads",
         "block_acc",
         "blocks",
         "decode_rows_enabled",
+        "dense_t2_ring_stages",
         "dense_tile2_enabled",
         "launch_bounds",
         "launch_project",
@@ -3900,11 +3949,14 @@
         "project_rows_kernel",
         "project_rows_ks_kernel",
         "project_tile2_kernel",
+        "project_tile4_kernel",
+        "reads",
         "rows",
         "rows_ksplit_enabled",
         "scale_bits",
         "segments_tile_aligned",
         "stage",
+        "stages",
         "tile2",
         "volatile"
       ]

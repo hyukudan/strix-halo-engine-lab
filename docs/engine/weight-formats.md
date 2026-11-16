@@ -88,3 +88,12 @@ records each public API's dtype, shape, offset, length, acceptance and raw bytes
 then uses the same versioned writer and byte comparator. The root host session
 fixture also covers aliases: asset identity retains all path references, while
 one opened physical shard contributes one tensor table.
+
+Migration remains partial: wrappers retain legacy execution representations, and
+MiniMax still parses shard headers for both its execution table and shared index.
+The legacy capture fixtures cover small plain tensors and selected refusal paths;
+they do not qualify conversion or transformed-pack compatibility, model fidelity,
+complete logits/state equality, or timing. The compatibility driver requires clean
+checkouts at the requested commits and records their verified commit/tree IDs
+before configuring either build. Source-derived logical shapes are not independent
+graph-shape validation.

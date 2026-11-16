@@ -269,7 +269,11 @@ rank's process route receipt (`strix-route-receipt {...}`): engine; profile `exa
 off, EXL3, default prefill identity), `fast-prefill` (MSA flash on, otherwise the same) or
 `other`; `fast` = MSA flash mode (10 + `STRIX_MM_PF_MSA_FLASH`: 11 one-term, 12 two-term) and
 layers; `numerical_config_sha256` over the effective levers and switch set without output-only
-switches, and `config` = those levers and switches (for the comparison above). The control
+switches, and `config` = those levers and switches (for the comparison above).
+The index-projection WMMA member additionally requires `minimax-index-proj-executed` records,
+emitted after the prefill completion fence: matching rank, executed layer mask and each sealed
+prompt's token count and little-endian token FNV-1a64. A selected startup lever alone is insufficient.
+The control
 comes only from the engine's own null-control lines in a lab diagnostic build:
 `DIAG attn ulp: layer L seed S rows N pos0 P values V prompt "NAME"`.
 The prompt name is a JSON string matching a sealed prompt. All events must use one layer and seed,
@@ -289,3 +293,11 @@ where the arms part. This is a cross-run comparison: after the first difference 
 different activations, so later differences include propagation, not only local rounding.
 
 `python -m unittest discover -s tools/strix-gate -p 'test_*.py'` covers it with synthetic dumps.
+
+## GLM scored prefill compare: `glm_score_nll.py`
+
+The GLM rank captures the last N prompt rows' logits with `STRIX_GLM_PF_SCORE_LAST=N` and
+`STRIX_GLM_PF_SCORE_OUT=DIR/NAME-tf` (one vocabulary slice per rank). `glm_score_nll.py --dir DIR --ref X1 --test I1
+--prompt P.u32 --vocab-size V [--rows 256] [--json OUT]` (V is the model's full vocabulary size) prints NLL ref/test, dNLL (offset-1 target = the scored rule), mean KL and
+top-1 agreement. The prompt must be the length being gated: a `.u32` file holds 4 bytes per token (a 32,768-byte file
+is an 8K prompt). Tests: `python -m unittest test_glm_score_nll` in this directory.

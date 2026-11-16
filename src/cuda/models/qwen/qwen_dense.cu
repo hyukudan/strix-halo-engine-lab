@@ -55,6 +55,27 @@ bool dense_t2_remap_enabled() {
     return on;
 }
 
+// STRIX_QRTX_DENSE_T2_A16=0: the remap loader (4-byte .ca copies) instead of the aligned-window loader (16-byte .cg
+// copies of the 80-byte aligned window that holds a stage's 68 raw bytes). Bitwise: the same raw bytes reach the reader,
+// which adds the window's word shift. Needs row_bytes % 16 == 0 and 16-aligned segments (launcher check).
+inline constexpr strix::lever::Decl dense_t2_a16_lever{
+    .name = "qwen_dense_t2_a16", .env = "STRIX_QRTX_DENSE_T2_A16", .exactness = strix::lever::Exactness::bitwise,
+    .default_on = false, .source = "qwen_dense_tests --bench-shape 16-11: equal hashes, 2-stage ring +13 % slower (L2 bytes, see RTXFAST6R)"};
+bool dense_t2_a16_enabled() {
+    static const bool on = strix::lever::select(dense_t2_a16_lever, {}).on;
+    return on;
+}
+
+// STRIX_QRTX_DENSE_T4=0: tile2 (2 K blocks per stage, 4-byte weight copies) instead of project_tile4_kernel (4 K blocks
+// per stage, 8-byte weight copies). Bitwise: same per-output chain, blocks ascending. Needs the remap lever on.
+inline constexpr strix::lever::Decl dense_t4_lever{
+    .name = "qwen_dense_t4", .env = "STRIX_QRTX_DENSE_T4", .exactness = strix::lever::Exactness::bitwise,
+    .default_on = false, .source = "tests/cuda/qwen_dense_tests.cu --bench-shape: equal output hashes, 5 site shapes"};
+bool dense_t4_enabled() {
+    static const bool on = strix::lever::select(dense_t4_lever, {}).on;
+    return on;
+}
+
 __device__ __forceinline__ std::uint32_t bf16_bits(float v) {
     const std::uint32_t b = __float_as_uint(v);
     return (b + 0x7fffU + ((b >> 16U) & 1U)) >> 16U;   // HIP float_to_bf16, no NaN special case
@@ -146,6 +167,18 @@ struct DenseNumeric {
         static_cast<std::uint16_t*>(sg.out)[at] = static_cast<std::uint16_t>(bf16_bits(gated));
     }
 }
+    static bool dense_t2_a16_enabled() { return ::strix::cuda::qwen_dense::dense_t2_a16_enabled(); }
+    static bool dense_t4_enabled() { return ::strix::cuda::qwen_dense::dense_t4_enabled(); }
+    // Diagnostics (microbench only, scheduling-only), as in #735's launcher: ring depth of the aligned-window
+    // tile2 (2 default, 3 or 4) and the shared-memory carveout hint in percent (< 0: none).
+    static int dense_t2_ring_stages() {
+        static const int ns = [] { const char* e = std::getenv("STRIX_QRTX_DENSE_T2_NS"); return e && e[0] ? std::atoi(e) : 2; }();
+        return ns;
+    }
+    static int dense_carveout_percent() {
+        const char* cv = std::getenv("STRIX_QRTX_DENSE_CARVEOUT");
+        return cv && cv[0] ? std::atoi(cv) : -1;
+    }
 };
 // ---------------------------------------------------------------------------------------------------------------------
 // rows_shared_activation_scalar_kernel (src/hip_shared_expert_launcher.hip:535-562), 256 threads, blockIdx.y = row.

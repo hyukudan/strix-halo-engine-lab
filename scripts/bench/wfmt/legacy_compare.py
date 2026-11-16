@@ -20,6 +20,27 @@ def logged(command, path, required=True):
     return code
 
 
+def verify_source(source, revision):
+    """Require a clean checkout of the requested commit, not a receipt label."""
+    def git(*args):
+        result = subprocess.run(["git", "-C", str(source), *args],
+                                capture_output=True, text=True, check=False)
+        if result.returncode:
+            raise ValueError("cannot verify source: " + result.stderr.strip())
+        return result.stdout.strip()
+
+    if pathlib.Path(git("rev-parse", "--show-toplevel")).resolve() != source.resolve():
+        raise ValueError("source must be a checkout root")
+    commit = git("rev-parse", "--verify", "--end-of-options", revision + "^{commit}")
+    if git("rev-parse", "HEAD") != commit:
+        raise ValueError("source HEAD does not match requested revision: " + revision)
+    # Also reject staged changes, untracked inputs and dirty submodules. Requiring
+    # the entire checkout clean avoids guessing the build's transitive inputs.
+    if git("status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"):
+        raise ValueError("source checkout has uncommitted changes")
+    return {"revision": revision, "commit": commit, "tree": git("rev-parse", commit + "^{tree}")}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline-source", type=pathlib.Path, required=True)
@@ -40,8 +61,12 @@ def main():
                "baseline_revision": args.baseline_revision, "candidate_revision": args.candidate_revision,
                "architecture": platform.machine(), "flags": "Release; strict reference FP", "sources": {}}
     try:
-        for mode, source, revision in (("baseline", args.baseline_source, args.baseline_revision),
-                                       ("candidate", args.candidate_source, args.candidate_revision)):
+        sources = (("baseline", args.baseline_source, args.baseline_revision),
+                   ("candidate", args.candidate_source, args.candidate_revision))
+        # Verify both trees before either configure can run.
+        for mode, source, revision in sources:
+            summary["sources"][mode] = verify_source(source, revision)
+        for mode, source, _ in sources:
             build = (args.baseline_build if mode == "baseline" else args.candidate_build) or args.build_root / mode
             logged(["cmake", "-S", str(source), "-B", str(build), "-DCMAKE_BUILD_TYPE=Release",
                     "-DBUILD_TESTING=ON", "-DSTRIX_ENABLE_HIP_RUNTIME=OFF", "-DSTRIX_FAMILY_MINIMAX=ON",
@@ -62,9 +87,9 @@ def main():
             compiler_version = re.search(r'set\(CMAKE_CXX_COMPILER_VERSION "([^"]+)"\)', compiler_info).group(1)
             flags = {line.split("=", 1)[0]: line.split("=", 1)[1] for line in cache.splitlines()
                      if line.startswith(("CMAKE_CXX_FLAGS:STRING=", "CMAKE_CXX_FLAGS_RELEASE:STRING="))}
-            summary["sources"][mode] = {"revision": revision, "compiler": compiler_line.split("=", 1)[1],
+            summary["sources"][mode].update({"compiler": compiler_line.split("=", 1)[1],
                                         "compiler_version": compiler_version, "flags": flags,
-                                        "binary_sha256": hashlib.sha256(executable.read_bytes()).hexdigest()}
+                                        "binary_sha256": hashlib.sha256(executable.read_bytes()).hexdigest()})
             logged([sys.executable, str(kit / "capture.py"), "--exe", str(executable), "--matrix", str(matrix),
                     "--out", str(args.output / mode), "--compiler", compiler_line.split("=", 1)[1],
                     "--architecture", platform.machine(), "--flags", "Release; strict reference FP"],
