@@ -15,7 +15,7 @@ static Status check(typename Api::Error error) { return error==Api::Success ? St
 static void collect() {
     std::lock_guard lock(retired_mutex);
     for (auto it=retired.begin(); it!=retired.end();) {
-        Api::SetDevice(static_cast<int>(it->device));
+        if (Api::SetDevice(static_cast<int>(it->device))!=Api::Success) { ++it; continue; }
         bool done=!it->failed;
         for (auto event:it->events) done=done && Api::EventQuery(static_cast<typename Api::Event>(event))==Api::Success;
         if (!done) { ++it; continue; }
@@ -40,7 +40,7 @@ static strix::weight::Status bind(void* stream, std::uint32_t device, ExecutionC
         if (bytes>SIZE_MAX) return {Error::memory_budget,"allocation size overflow"};
         return check(Api::Malloc(&data,static_cast<std::size_t>(bytes ? bytes : 1)));
     };
-    callbacks->free=[device](void* data) { Api::SetDevice(static_cast<int>(device)); Api::Free(data); };
+    callbacks->free=[device](void* data) { if (Api::SetDevice(static_cast<int>(device))==Api::Success) Api::Free(data); };
     callbacks->record_event=[device](ExecutionContext& c,void*& value) -> Status {
         auto s=check(Api::SetDevice(static_cast<int>(device))); if (!s) return s;
         typename Api::Event event{}; s=check(Api::EventCreateWithFlags(&event,Api::EventDisableTiming)); if (!s) return s;
@@ -51,8 +51,8 @@ static strix::weight::Status bind(void* stream, std::uint32_t device, ExecutionC
         auto s=check(Api::SetDevice(static_cast<int>(device))); if (!s) return s;
         return check(Api::StreamWaitEvent(static_cast<typename Api::Stream>(c.stream),static_cast<typename Api::Event>(event),0));
     };
-    callbacks->event_complete=[device](void* event) { Api::SetDevice(static_cast<int>(device)); return Api::EventQuery(static_cast<typename Api::Event>(event))==Api::Success; };
-    callbacks->destroy_event=[device](void* event) { Api::SetDevice(static_cast<int>(device)); Api::EventDestroy(static_cast<typename Api::Event>(event)); };
+    callbacks->event_complete=[device](void* event) { return Api::SetDevice(static_cast<int>(device))==Api::Success && Api::EventQuery(static_cast<typename Api::Event>(event))==Api::Success; };
+    callbacks->destroy_event=[device](void* event) { if (Api::SetDevice(static_cast<int>(device))==Api::Success) Api::EventDestroy(static_cast<typename Api::Event>(event)); };
     callbacks->convert=[device](const WeightView& w,const Plan& p,void* data,ExecutionContext&) -> Status {
         if (p.selected.strategy!=Strategy::native || p.selected.resources.image_bytes!=w.payload.range.bytes)
             return {Error::unsupported_arithmetic,"image conversion source not registered"};
@@ -67,8 +67,9 @@ static strix::weight::Status bind(void* stream, std::uint32_t device, ExecutionC
         return {Error::ok,{}};
     };
     callbacks->retire=[device](void* data,std::vector<void*> events,ExecutionContext c) {
-        Api::SetDevice(static_cast<int>(device)); typename Api::Event fence{};
-        bool failed=Api::EventCreateWithFlags(&fence,Api::EventDisableTiming)!=Api::Success;
+        typename Api::Event fence{};
+        bool failed=Api::SetDevice(static_cast<int>(device))!=Api::Success;
+        if (!failed) failed=Api::EventCreateWithFlags(&fence,Api::EventDisableTiming)!=Api::Success;
         if (!failed) {
             if (Api::EventRecord(fence,static_cast<typename Api::Stream>(c.stream))!=Api::Success) { Api::EventDestroy(fence); failed=true; }
             else events.push_back(fence);
