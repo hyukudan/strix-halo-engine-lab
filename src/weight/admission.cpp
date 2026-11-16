@@ -1,6 +1,9 @@
 #include "strix/weight/admission.hpp"
 #include "strix/weight/registry.hpp"
 #include "core/trellis_format.hpp"
+#include "strix/ggml_dequant.hpp"
+#include <cmath>
+#include <cstring>
 #include <algorithm>
 #include <limits>
 #include <set>
@@ -8,7 +11,7 @@
 namespace strix::weight {
 namespace {
 bool same_shape(const Shape& a,const Shape& b) {if(a.rank!=b.rank)return false;for(unsigned i=0;i<a.rank;++i)if(a.dims[i]!=b.dims[i])return false;return true;}
-Status check(const Registry& registry,const WeightMapEntry& e) {
+Status check(const Registry& registry,const WeightMapEntry& e,bool scan_values=true) {
     const auto& b=e.binding;const auto& w=e.weight;
     if(b.tensor!=w.tensor)return {Error::malformed,"binding tensor identity mismatch"};
     if(!same_shape(b.logical_shape,w.shape))return {Error::unsupported_shape,"binding logical shape mismatch"};
@@ -26,7 +29,8 @@ Status check(const Registry& registry,const WeightMapEntry& e) {
     if(!valid_slice(w.payload))return {Error::malformed,"weight payload outside source"};
     std::set<std::string> names;
     for(const auto& sidecar:w.sidecars)if(!valid_slice(sidecar.data) || !names.insert(sidecar.name).second)return {Error::malformed,"invalid or duplicate semantic sidecar"};
-    if(format->validate){auto status=format->validate(w);if(!status)return status;}
+    if(scan_values && format->validate){auto status=format->validate(w);if(!status)return status;}
+    else {auto status=validate_metadata(w);if(!status)return status;}
     return {Error::ok,{}};
 }
 const RawTensor* named(const TensorIndex& index,std::string_view name) {for(const auto& t:index.tensors)if(t.name==name)return &t;return nullptr;}
@@ -81,11 +85,27 @@ Status normalise(const Registry& registry,const TensorIndex& index,const RawTens
             w.storage={"linear.w4a8-grouped",1};w.parameters.scale_encoding=f32?"f32":"e4m3fn";
             auto status=attach(".weight_s_rel","group_scales",f32?Scalar::f32:Scalar::e4m3fn);if(!status)return status;
             status=attach(".weight_s_channel","channel_scales",Scalar::f32);if(!status)return status;
+            // This model schema requires strictly positive channel scales, as the legacy loader does.
+            std::array<Byte,4096> chunk{};
+            for(std::uint64_t at=0;at<channel->payload.range.bytes;) {
+                const auto bytes=std::size_t(std::min<std::uint64_t>(chunk.size(),channel->payload.range.bytes-at));
+                auto part=channel->payload;part.range.offset+=at;part.range.bytes=bytes;
+                status=read_slice(part,{chunk.data(),bytes});if(!status)return status;
+                for(std::size_t i=0;i<bytes;i+=4){float scale;std::memcpy(&scale,chunk.data()+i,4);if(!std::isfinite(scale) || scale<=0)return {Error::malformed,"packed channel scale must be finite positive"};}
+                at+=bytes;
+            }
             if(const auto* codebook=named(index,prefix+".weight_codebook")) {
                 Scalar scalar;
                 if(codebook->wire_dtype=="F32")scalar=Scalar::f32;else if(codebook->wire_dtype=="F16")scalar=Scalar::f16;else if(codebook->wire_dtype=="BF16")scalar=Scalar::bf16;else return {Error::malformed,"unsupported channel codebook dtype"};
                 if(codebook->shape.rank!=1 || codebook->shape.dims[0]!=16)return {Error::malformed,"channel codebook requires sixteen entries"};
-                w.sidecars.push_back({"codebook",scalar,codebook->shape,codebook->payload});
+                if(scalar==Scalar::f32)w.sidecars.push_back({"codebook",scalar,codebook->shape,codebook->payload});
+                else {
+                    std::vector<Byte> stored(std::size_t(codebook->payload.range.bytes));auto status=read_slice(codebook->payload,stored);if(!status)return status;
+                    std::array<float,16> values{};ggml_dequant::dequantize_row(scalar==Scalar::f16?1U:30U,stored,values);
+                    const auto bytes=std::as_bytes(std::span<const float>(values));auto owner=memory_source(bytes,"canonical-channel-codebook");
+                    w.sidecars.push_back({"codebook",Scalar::f32,codebook->shape,{owner,{0,bytes.size()}}});
+                    w.sidecars.push_back({"source_codebook",scalar,codebook->shape,codebook->payload});
+                }
             }
         }
     }else if(!params.transform.empty())return {Error::unknown_format,"unsupported semantic transform "+params.transform};
@@ -97,15 +117,33 @@ Status normalise(const Registry& registry,const TensorIndex& index,const RawTens
     out=std::move(w);return {Error::ok,{}};
 }
 }
-Status validate_map(const Registry& registry,const WeightMap& map) {
+Status namespace_index(TensorIndex& index,std::string shard) {
+    if(!index.owner)return {Error::stale_source,"cannot namespace index without source owner"};
+    auto owner=namespace_source(index.owner,std::move(shard));
+    for(auto& t:index.tensors){t.payload.source=owner;t.id=tensor_id(*owner,t.name,index.header_identity);}
+    for(auto& blob:index.metadata_blobs)blob.data.source=owner;
+    index.owner=std::move(owner);return {Error::ok,{}};
+}
+
+Status validate_binding(const Registry& registry,const WeightMapEntry& entry) try {return check(registry,entry,false);}
+catch(const std::bad_alloc&){return {Error::memory_budget,"binding allocation failed"};}
+catch(const std::exception& e){return {Error::malformed,e.what()};}
+
+Status validate_map(const Registry& registry,const WeightMap& map) try {
     std::set<TensorId> seen;
     for(const auto& e:map){if(!seen.insert(e.binding.tensor).second)return {Error::malformed,"duplicate tensor identity in map"};auto status=check(registry,e);if(!status)return status;}
     return {Error::ok,{}};
 }
-Status admit(const Registry& registry,const AdmissionRequest& request,WeightMap& out) {
+catch(const std::bad_alloc&){return {Error::memory_budget,"admission allocation failed"};}
+catch(const std::exception& e){return {Error::malformed,e.what()};}
+Status admit(const Registry& registry,const AdmissionRequest& request,WeightMap& out) try {
     if(!request.index)return {Error::malformed,"admission index absent"};
     if(!request.tensor_parameters.empty() && request.tensor_parameters.size()!=request.bindings.size())return {Error::malformed,"parameter/binding count mismatch"};
-    std::set<TensorId> indexed;for(const auto& raw:request.index->tensors)if(!indexed.insert(raw.id).second)return {Error::malformed,"duplicate tensor identity in source index"};
+    std::set<TensorId> indexed;std::set<std::string> names;
+    for(const auto& raw:request.index->tensors) {
+        if(!indexed.insert(raw.id).second)return {Error::malformed,"duplicate tensor identity in source index"};
+        if(!names.insert(raw.name).second)return {Error::malformed,"duplicate tensor name across source shards"};
+    }
     WeightMap map;map.reserve(request.bindings.size());
     for(std::size_t i=0;i<request.bindings.size();++i){const auto& b=request.bindings[i];const RawTensor* raw=nullptr;for(const auto& t:request.index->tensors)if(t.id==b.tensor){raw=&t;break;}if(!raw)return {Error::malformed,"binding refers to absent tensor"};
         WeightView view;auto status=normalise(registry,*request.index,*raw,b,request.tensor_parameters.empty()?Parameters{}:request.tensor_parameters[i],view);if(!status)return status;
@@ -113,5 +151,7 @@ Status admit(const Registry& registry,const AdmissionRequest& request,WeightMap&
     }
     auto status=validate_map(registry,map);if(status)out=std::move(map);return status;
 }
+catch(const std::bad_alloc&){return {Error::memory_budget,"admission allocation failed"};}
+catch(const std::exception& e){return {Error::malformed,e.what()};}
 std::string describe_admission(const WeightMap& map) {std::ostringstream out;for(const auto& e:map)out<<e.binding.tensor<<' '<<unsigned(e.binding.role)<<' '<<serialize_id(e.weight.storage)<<' '<<e.weight.payload.range.offset<<'+'<<e.weight.payload.range.bytes<<'\n';return out.str();}
 }

@@ -483,7 +483,7 @@ void Prefill::Impl::upload_model() {
         if (t.name.rfind("per_layer_token_embd", 0) == 0) { ple_part = part; info.tensors.push_back(t); continue; }  // PLE (host)
         if (t.name == "output.weight" && !cfg.decode) { info.tensors.push_back(t); continue; }                  // head (node)
         const Target target = transcode_target(t);
-        if (target != Target::native) source_conversions.push_back({weight::tensor_id(*owner,t.name),
+        if (target != Target::native) source_conversions.push_back({std::find_if(indexed.tensors.begin(),indexed.tensors.end(),[&](const auto& raw){return raw.name==t.name;})->id,
             target == Target::q8_0 ? weight::FormatId{"gguf.q8_0",1} : weight::FormatId{"plain.f32",1},
             target == Target::q8_0 ? "legacy.qwen.cuda.amax127-f16-roundf@1" : "legacy.qwen.cuda.decode-f32@1"});
         if (target != Target::native && !transcode::supported(t.ggml_type))

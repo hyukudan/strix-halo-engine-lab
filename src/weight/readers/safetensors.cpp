@@ -23,12 +23,13 @@ Status index_safetensors(std::shared_ptr<const Source> source,TensorIndex& out) 
         std::string text(std::size_t(n),'\0');status=source->read({8,n},{reinterpret_cast<Byte*>(text.data()),text.size()});if(!status)return status;
         const auto root=serve::parse_json_unique(text);const auto base=8+n;
         TensorIndex result;result.container=Container::safetensors;result.schema="safetensors@1";result.owner=source;
+        result.header_identity=digest_bytes({reinterpret_cast<const Byte*>(text.data()),text.size()});
         const std::map<std::string,std::uint64_t> widths={{"BF16",2},{"F16",2},{"F32",4},{"F64",8},{"I8",1},{"U8",1},{"BOOL",1},{"I16",2},{"U16",2},{"I32",4},{"U32",4},{"I64",8},{"U64",8},{"F8_E4M3",1},{"F8_E4M3FN",1},{"F8_E5M2",1},{"F8_E8M0",1}};
         std::vector<std::pair<std::uint64_t,std::uint64_t>> spans;
         for(const auto& [name,d]:root.as_object()) {
             if(name=="__metadata__") {for(const auto& [key,value]:d.as_object())result.metadata.emplace_back(key,value.as_string());continue;}
             if(d.as_object().size()!=3)return {Error::malformed,"unsupported safetensors fields/strides"};
-            RawTensor t;t.name=name;t.id=tensor_id(*source,name);t.wire_dtype=require(d,"dtype").as_string();
+            RawTensor t;t.name=name;t.id=tensor_id(*source,name,result.header_identity);t.wire_dtype=require(d,"dtype").as_string();
             auto width=widths.find(t.wire_dtype);if(width==widths.end())return {Error::unknown_format,"unrecognised safetensors dtype "+t.wire_dtype};
             const auto& shape=require(d,"shape").as_array();if(shape.size()>4)return {Error::unsupported_shape,"safetensors rank exceeds WeightView rank"};
             t.shape.rank=std::uint8_t(shape.size());std::uint64_t count=1;

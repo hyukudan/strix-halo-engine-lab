@@ -42,8 +42,9 @@ are introduced in their assigned migration steps.
 
 P03 introduces owning positioned sources and a common GGUF/safetensors index.
 File sources retain their read handle, check size/change snapshots, and compute a
-full SHA-256 content identity lazily. A tensor ID includes its shard namespace
-and name. Slices keep sources alive after an index or loader is destroyed.
+full SHA-256 content identity lazily. A tensor ID includes its pack-relative shard namespace, bounded header digest
+and name. Identical node copies retain the same ID; same-basename shards in
+different pack subdirectories remain distinct. Slices keep sources alive after an index or loader is destroyed.
 
 Admission validates exact format allowlists, role masks, logical shapes, expert
 axes, payload bounds and semantic sidecars before publishing a map. GGUF native
@@ -61,3 +62,10 @@ loaded tensors, so their actual weight loaders perform admission. GLM's legacy
 fixed mul1 codebook is explicit even when its old container omits a marker.
 The reader tests verify source lifetime, content identities, mutation rejection,
 mixed GGUF formats and the existing DS41 positioned-read byte contract.
+
+`validate_binding` reuses the same allowlist/shape/schema policy without reading
+numerical payloads. Admission still performs the bounded value checks once;
+subsequent resolver calls do not re-scan weights. The counting-source fixture
+checks this distinction and a malformed FP8-code fixture verifies that full
+admission keeps its value gate. A Linux host fixture also instantiates GLM's
+production index and compares its legacy byte ranges with the shared map.

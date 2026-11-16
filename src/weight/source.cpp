@@ -36,17 +36,17 @@ class FileSource final : public Source {
         return {{{std::uint64_t(st.st_size),std::uint64_t(st.st_mtim.tv_sec),std::uint64_t(st.st_mtim.tv_nsec),std::uint64_t(st.st_ctim.tv_sec),std::uint64_t(st.st_ctim.tv_nsec),std::uint64_t(st.st_ino)}}};
 #endif
     }
-    mutable std::mutex mutex_; mutable std::optional<Digest256> digest_;
+    mutable std::mutex mutex_; mutable std::optional<Digest256> digest_; mutable std::once_flag digest_once_;
 public:
-    explicit FileSource(const std::string& path) : file_(std::fopen(path.c_str(),"rb")), size_(0),
-        shard_(std::filesystem::absolute(path).lexically_normal().generic_string()) {
+    explicit FileSource(const std::string& path,std::string shard) : file_(std::fopen(path.c_str(),"rb")), size_(0),
+        shard_(shard.empty()?std::filesystem::path(path).filename().generic_string():std::move(shard)) {
         if (!file_) throw std::runtime_error("cannot open source");
-        std::error_code ec; size_=std::filesystem::file_size(path,ec);
-        if (ec) { std::fclose(file_); throw std::runtime_error("cannot size source"); }
+        try {
+            snapshot_=snapshot();size_=snapshot_.words[0];
 #ifndef _WIN32
-        LoaderCapture::record(path,fileno(file_));
+            LoaderCapture::record(path,fileno(file_));
 #endif
-        snapshot_=snapshot();
+        }catch(...){std::fclose(file_);throw; }
     }
     ~FileSource() override { std::fclose(file_); }
     std::uint64_t size() const noexcept override { return size_; }
@@ -71,26 +71,37 @@ public:
         return {Error::ok,{}};
     }
     Digest256 identity() const override {
-        // Read through the retained handle; identity is lazy so header indexing never scans a model payload.
-        { std::lock_guard lock(mutex_); if(!(snapshot()==snapshot_))throw std::runtime_error("source changed after indexing");if (digest_) return *digest_; }
-        h3::te::Sha256 hash; std::array<Byte,65536> bytes;
-        for (std::uint64_t at=0;at<size_;) {
-            const auto n=std::size_t(std::min<std::uint64_t>(bytes.size(),size_-at));
-            auto status=read({at,n},{bytes.data(),n});
-            if (!status) throw std::runtime_error(status.detail);
-            hash.update(bytes.data(),n); at+=n;
-        }
-        auto result=Digest256{hash.finish()};
-        std::lock_guard lock(mutex_); digest_=result; return result;
+        {std::lock_guard lock(mutex_);if(!(snapshot()==snapshot_))throw std::runtime_error("source changed after indexing");}
+        std::call_once(digest_once_,[&] {
+            h3::te::Sha256 hash;std::array<Byte,65536> bytes;
+            for(std::uint64_t at=0;at<size_;) {
+                const auto n=std::size_t(std::min<std::uint64_t>(bytes.size(),size_-at));
+                auto status=read({at,n},{bytes.data(),n});if(!status)throw std::runtime_error(status.detail);
+                hash.update(bytes.data(),n);at+=n;
+            }
+            const auto result=Digest256{hash.finish()};
+            std::lock_guard lock(mutex_);if(!(snapshot()==snapshot_))throw std::runtime_error("source changed during digest");digest_=result;
+        });
+        std::lock_guard lock(mutex_);if(!(snapshot()==snapshot_))throw std::runtime_error("source changed after digest");return *digest_;
     }
+};
+class NamespaceSource final:public Source {
+    std::shared_ptr<const Source> source_;std::string shard_;
+public:
+    NamespaceSource(std::shared_ptr<const Source> source,std::string shard):source_(std::move(source)),shard_(std::move(shard)){}
+    Status read(ByteRange range,std::span<Byte> out) const override{return source_->read(range,out);}
+    std::uint64_t size() const noexcept override{return source_->size();}
+    Digest256 identity() const override{return source_->identity();}
+    std::string shard_name() const override{return shard_;}
 };
 class MemorySource final : public Source {
     std::vector<Byte> data_; std::string shard_;
+    mutable std::once_flag identity_once_;mutable Digest256 identity_{};
 public:
     MemorySource(std::span<const Byte> bytes,std::string shard):data_(bytes.begin(),bytes.end()),shard_(std::move(shard)){}
     std::uint64_t size() const noexcept override {return data_.size();}
     std::string shard_name() const override {return shard_;}
-    Digest256 identity() const override {return digest(data_);}
+    Digest256 identity() const override {std::call_once(identity_once_,[&]{identity_=digest(data_);});return identity_;}
     Status read(ByteRange r,std::span<Byte> out) const override {
         if(r.offset>data_.size() || r.bytes>data_.size()-r.offset || r.bytes!=out.size())
             return {Error::malformed,"source read outside bounds"};
@@ -140,20 +151,32 @@ public: explicit SourceStream(std::shared_ptr<const Source> source):std::istream
 };
 }
 Digest256 digest_bytes(std::span<const Byte> bytes) {return digest(bytes);}
-Status open_source(const std::string& path,std::shared_ptr<const Source>& out) {
-    try {auto source=std::make_shared<FileSource>(path);out=std::move(source);return {Error::ok,{}};}
+Status open_source(const std::string& path,std::shared_ptr<const Source>& out,std::string shard) {
+    try {auto source=std::make_shared<FileSource>(path,std::move(shard));out=std::move(source);return {Error::ok,{}};}
     catch(const std::exception& e){return {Error::malformed,e.what()};}
 }
 std::shared_ptr<const Source> memory_source(std::span<const Byte> bytes,std::string shard) {return std::make_shared<MemorySource>(bytes,std::move(shard));}
 std::shared_ptr<const Source> view_source(std::span<const Byte> bytes,std::shared_ptr<const void> owner,std::string shard){return std::make_shared<ViewSource>(bytes,std::move(owner),std::move(shard));}
 std::unique_ptr<std::istream> source_stream(std::shared_ptr<const Source> source) {return std::make_unique<SourceStream>(std::move(source));}
-TensorId tensor_id(const Source& source,std::string_view name) {
+TensorId tensor_id(const Source& source,std::string_view name,const Digest256& header) {
     h3::te::Sha256 hash;const auto shard=source.shard_name();
     if(shard.empty()){auto d=source.identity();hash.update(d.bytes.data(),d.bytes.size());}
     else hash.update(shard.data(),shard.size());
-    const char separator=0;hash.update(&separator,1);hash.update(name.data(),name.size());
+    const char separator=0;hash.update(&separator,1);hash.update(header.bytes.data(),header.bytes.size());hash.update(name.data(),name.size());
     const auto d=hash.finish();TensorId id=0;for(unsigned i=0;i<8;++i)id|=std::uint64_t(d[i])<<(8*i);return id;
 }
+std::shared_ptr<const Source> namespace_source(std::shared_ptr<const Source> source,std::string shard){return std::make_shared<NamespaceSource>(std::move(source),std::move(shard));}
+Status digest_slice(const Slice& slice,Digest256& out) {
+    if(!slice.source || slice.range.offset>slice.source->size() || slice.range.bytes>slice.source->size()-slice.range.offset)return {Error::malformed,"digest slice outside source"};
+    h3::te::Sha256 hash;std::array<Byte,65536> bytes;
+    for(std::uint64_t at=0;at<slice.range.bytes;) {
+        const auto n=std::size_t(std::min<std::uint64_t>(bytes.size(),slice.range.bytes-at));
+        auto status=slice.source->read({slice.range.offset+at,n},{bytes.data(),n});if(!status)return status;
+        hash.update(bytes.data(),n);at+=n;
+    }
+    out={hash.finish()};return {Error::ok,{}};
+}
+
 Status read_slice(const Slice& slice,std::span<Byte> out) {
     if(!slice.source)return {Error::stale_source,"missing source ownership"};
     return slice.source->read(slice.range,out);

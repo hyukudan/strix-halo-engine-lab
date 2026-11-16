@@ -6,8 +6,9 @@ namespace strix::weight {
 Status index_gguf(const gguf::FileInfo& parsed,std::shared_ptr<const Source> source,TensorIndex& out) {
     if(!source || source->size()!=parsed.file_size)return {Error::malformed,"GGUF source extent differs from parsed header"};
         TensorIndex result;result.container=Container::gguf;result.schema="gguf@3";result.owner=source;
+        auto status=digest_slice({source,{0,parsed.data_offset}},result.header_identity);if(!status)return status;
         for(const auto& t:parsed.tensors) {
-            RawTensor raw;raw.id=tensor_id(*source,t.name);raw.name=t.name;raw.wire_type=t.ggml_type;
+            RawTensor raw;raw.id=tensor_id(*source,t.name,result.header_identity);raw.name=t.name;raw.wire_type=t.ggml_type;
             raw.shape.rank=std::uint8_t(t.dimensions.size());
             // The public shape is row-major logical [N,K]; GGUF stores contiguous K first.
             std::reverse_copy(t.dimensions.begin(),t.dimensions.end(),raw.shape.dims.begin());

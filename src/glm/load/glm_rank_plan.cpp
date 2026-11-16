@@ -164,7 +164,7 @@ Index::Index(const std::string& dir) {
     for (const std::string& n : names) {
         const std::string path = dir + "/" + n;
         std::shared_ptr<const weight::Source> source;
-        auto status=weight::open_source(path,source);
+        auto status=weight::open_source(path,source,n);
         weight::TensorIndex index;
         if(status)status=weight::index_safetensors(source,index);
         if(!status)throw std::runtime_error("GLM index: "+status.detail);

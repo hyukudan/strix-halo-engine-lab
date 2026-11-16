@@ -71,7 +71,7 @@ PackReader::PackReader(std::string dir) : dir_(std::move(dir)) {
         pread_all(hfd, head.data(), hb, 8, path);
         ::close(hfd);
         std::shared_ptr<const weight::Source> owner;
-        auto status = weight::open_source(path, owner);
+        auto status = weight::open_source(path, owner, std::filesystem::relative(files[f],dir_).generic_string());
         weight::TensorIndex shard;
         if (status) status = weight::index_safetensors(owner, shard);
         if (!status) throw std::runtime_error("MiniMax index: " + status.detail);

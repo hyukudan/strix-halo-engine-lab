@@ -1,10 +1,31 @@
 #include "strix/weight/admission.hpp"
 #include "strix/weight/registry.hpp"
+#include "strix/serve/json.hpp"
+#include "strix/ds41_native_fp8.hpp"
 #include <array>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 using namespace strix::weight;
-namespace {void check(bool ok,const char* s){if(!ok)throw std::runtime_error(s);}}
+namespace {
+void check(bool ok,const char* s){if(!ok)throw std::runtime_error(s);}
+struct CountingSource final:Source {
+    std::shared_ptr<const Source> inner;mutable std::size_t bytes_read=0;
+    explicit CountingSource(std::shared_ptr<const Source> source):inner(std::move(source)){}
+    Status read(ByteRange range,std::span<Byte> out) const override {bytes_read+=out.size();return inner->read(range,out);}
+    std::uint64_t size() const noexcept override{return inner->size();}
+    Digest256 identity() const override{return inner->identity();}
+};
+struct Fixture {std::string name,dtype;std::vector<std::uint64_t> shape;std::vector<Byte> bytes;};
+std::vector<Byte> floats(std::size_t n){std::vector<Byte> out(n*4);float one=1;for(std::size_t i=0;i<n;++i)std::memcpy(out.data()+i*4,&one,4);return out;}
+TensorIndex fixture(std::vector<Fixture> fields) {
+    using strix::serve::Json;auto header=Json::object();std::uint64_t offset=0;
+    for(const auto& f:fields){auto entry=Json::object();entry.set("dtype",f.dtype);auto shape=Json::array();for(auto n:f.shape)shape.as_array().push_back(Json(n));entry.set("shape",shape);auto offsets=Json::array();offsets.as_array().push_back(Json(offset));offset+=f.bytes.size();offsets.as_array().push_back(Json(offset));entry.set("data_offsets",offsets);header.set(f.name,entry);}
+    const auto text=header.dump();std::vector<Byte> bytes;for(unsigned i=0;i<8;++i)bytes.push_back(Byte((text.size()>>(i*8))&255));for(char c:text)bytes.push_back(Byte(c));for(const auto& f:fields)bytes.insert(bytes.end(),f.bytes.begin(),f.bytes.end());
+    TensorIndex index;check(bool(index_safetensors(memory_source(bytes,"schema-fixture"),index)),"schema fixture parses");return index;
+}
+std::vector<Byte> bytes(std::string_view text){return {reinterpret_cast<const Byte*>(text.data()),reinterpret_cast<const Byte*>(text.data()+text.size())};}
+}
 bool wfmt_admission_test() try {
     std::array<Byte,128> bytes{};auto source=memory_source(bytes,"admission");TensorIndex index;index.container=Container::gguf;index.owner=source;
     RawTensor t{};t.id=tensor_id(*source,"x.weight");t.name="x.weight";t.wire_type=1;t.shape={{{2,32,0,0}},2};t.payload={source,{0,128}};index.tensors.push_back(t);
@@ -15,6 +36,7 @@ bool wfmt_admission_test() try {
     binding.admitted_formats={{"plain.f16",1}};binding.logical_shape.dims[0]=3;check(!admit(builtin_registry(),{&index,{&binding,1},{}},map),"shape mismatch rejected");binding.logical_shape=t.shape;
     binding.expert_axis=2;check(!admit(builtin_registry(),{&index,{&binding,1},{}},map),"expert axis rejected");binding.expert_axis=UINT32_MAX;
     index.tensors.push_back(t);check(!admit(builtin_registry(),{&index,{&binding,1},{}},map),"duplicate shard/tensor rejected");index.tensors.pop_back();
+    auto shard_duplicate=t;shard_duplicate.id+=1;index.tensors.push_back(shard_duplicate);check(!admit(builtin_registry(),{&index,{&binding,1},{}},map),"duplicate names across distinct source shards rejected");index.tensors.pop_back();
     // Reader-recognised Q4_1 is not silently executable.
     index.tensors[0].wire_type=3;index.tensors[0].payload.range.bytes=40;binding.admitted_formats={{"gguf.q4_1",1}};
     auto rejected=admit(builtin_registry(),{&index,{&binding,1},{}},map);check(!rejected && rejected.code==Error::unsupported_arithmetic,"parse-only never executable");
@@ -23,6 +45,42 @@ bool wfmt_admission_test() try {
     check(bool(bind_h3(index,family)),"H3 data schema");check(bool(bind_vision(index,family)),"vision data schema");
     index.tensors[0].wire_type=0;index.tensors[0].shape={{{2,16,0,0}},2};index.tensors[0].payload.range.bytes=128;check(bool(bind_gemma4(index,family)),"Gemma data schema");
     check(family[0].binding.admitted_categories==0,"legacy binder uses exact allowlist");
+    WeightMap transformed;
+    auto table=fixture({{"adaln_t_table","F32",{2,4},floats(8)}});check(bool(bind_h3(table,transformed)),"H3 existing F32 row lookup");
+    check(transformed.size()==1 && transformed[0].binding.role==Role::lookup_row,"H3 row lookup role retained");
+    const auto config=bytes(R"({"format":"int8_tensorwise","convrot":true,"convrot_groupsize":256})");
+    auto channel=fixture({{"layer.weight","I8",{1,256},std::vector<Byte>(256)},
+        {"layer.weight_scale","F32",{1,1},floats(1)},
+        {"layer.comfy_quant","U8",{config.size()},config}});
+    check(bool(bind_h3(channel,transformed)),"H3 authoritative int8 schema");
+    check(transformed.size()==1 && transformed[0].weight.storage==Id{"linear.i8-channel-convrot256",1} && transformed[0].weight.parameters.transform=="convrot256","H3 semantic identity");
+    auto counted=std::make_shared<CountingSource>(transformed[0].weight.payload.source);
+    transformed[0].weight.payload.source=counted;for(auto& side:transformed[0].weight.sidecars)side.data.source=counted;
+    check(bool(validate_binding(builtin_registry(),transformed[0])) && counted->bytes_read==0,"resolver metadata check performs no numerical source reads");
+    check(bool(validate_map(builtin_registry(),transformed)) && counted->bytes_read>0,"one-time admission still checks scale values");
+    const auto packed_config=bytes(R"({"format":"asym_w4a8_int8","group_size":16})");
+    auto packed=fixture({{"layer.weight","I8",{1,128},std::vector<Byte>(128)},
+        {"layer.weight_s_rel","F32",{1,16},floats(16)}, {"layer.weight_s_channel","F32",{1},floats(1)},
+        {"layer.weight_codebook","BF16",{16},std::vector<Byte>(32)},
+        {"layer.comfy_quant","U8",{packed_config.size()},packed_config}});
+    check(bool(bind_h3(packed,transformed)),"H3 packed schema and canonical codebook conversion");
+    bool original_codebook=false;for(const auto& side:transformed[0].weight.sidecars)original_codebook|=side.name=="source_codebook";
+    check(original_codebook,"original codebook provenance retained");
+    const std::vector<Byte> marker={Byte{0x2d},Byte{0xd1},Byte{0xdc},Byte{0x83}};
+    auto trellis=fixture({{"layer.up.trellis","I16",{8,8,48},std::vector<Byte>(6144)},
+        {"layer.up.suh","F16",{128},std::vector<Byte>(256)}, {"layer.up.svh","F16",{128},std::vector<Byte>(256)},
+        {"layer.up.mul1","I32",{1},marker}});
+    check(bool(bind_minimax(trellis,transformed)),"MiniMax variable-bit transformed schema");
+    check(transformed[0].weight.parameters.bits==3 && transformed[0].weight.parameters.transform=="hadamard128","trellis transform/bit identity");
+    check(bool(bind_glm(trellis,transformed)),"GLM transformed schema");
+    trellis.tensors.pop_back();check(bool(bind_glm(trellis,transformed)),"legacy GLM fixed mul1 contract permits absent wire marker");
+    check(!bind_ds41(trellis,transformed),"DS41 requires actual mul1 marker");
+    trellis.tensors.pop_back();check(!bind_glm(trellis,transformed),"missing transform sidecar rejected");
+    auto nan_codes=std::vector<Byte>(1024);nan_codes[0]=Byte{127};
+    auto malformed_fp8=fixture({{"layer.weight","F8_E4M3",{32,32},nan_codes},
+        {"layer.scale","F8_E8M0",{1,1},{Byte(strix::ds41::fp8_min_exponent)}}});
+    auto bad_fp8=bind_ds41(malformed_fp8,transformed);
+    check(!bad_fp8 && bad_fp8.code==Error::malformed,"full admission rejects malformed primary FP8 codes");
     // Ownership remains attached to maps after both index and caller source disappear.
     index={};source.reset();std::array<Byte,128> observed{};check(bool(read_slice(family[0].weight.payload,observed)),"admitted map retains source");
     return true;

@@ -25,12 +25,15 @@ bool wfmt_readers_test() try {
     auto retained=index.tensors[1].payload;index={};source.reset();std::array<Byte,68> bytes{};check(bool(read_slice(retained,bytes)),"source survives index destruction");
     check(std::equal(bytes.begin(),bytes.end(),gg.begin()+payload+128),"GGUF payload unchanged");
     auto wire=safe(R"({"a.weight":{"dtype":"BF16","shape":[2,2],"data_offsets":[0,8]},"aux":{"dtype":"I64","shape":[1],"data_offsets":[8,16]}})",16);
-    TensorIndex st;check(bool(index_safetensors(memory_source(wire,"a"),st)),"safetensors typed index");check(st.tensors.size()==2 && st.tensors[1].wire_dtype=="I64","typed dtype preserved");
-    auto same=memory_source(wire,"b");TensorIndex other;check(bool(index_safetensors(same,other)),"other shard");check(st.tensors[0].id!=other.tensors[0].id,"stable ID includes shard identity");
+    TensorIndex st;check(bool(index_safetensors(memory_source(wire,"sub-a/model.safetensors"),st)),"safetensors typed index");check(st.tensors.size()==2 && st.tensors[1].wire_dtype=="I64","typed dtype preserved");
+    auto same=memory_source(wire,"sub-b/model.safetensors");TensorIndex other;check(bool(index_safetensors(same,other)),"other shard");check(st.tensors[0].id!=other.tensors[0].id,"same-basename relative shard paths remain distinct");
+    TensorIndex copied;check(bool(index_safetensors(memory_source(wire,"sub-a/model.safetensors"),copied)),"copied source index");
+    check(copied.tensors[0].id==st.tensors[0].id,"deployment copies preserve stable tensor identity");
     auto bad=wire;bad.pop_back();TensorIndex untouched;untouched.schema="unchanged";check(!index_safetensors(memory_source(bad),untouched),"truncation rejected");check(untouched.schema=="unchanged","failure does not publish partial index");
     check(!index_safetensors(memory_source(safe(R"({"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"a":{"dtype":"F32","shape":[1],"data_offsets":[4,8]}})",8)),other),"duplicate name rejected");
     check(!index_safetensors(memory_source(safe(R"({"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"b":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}})",4)),other),"overlap rejected");
     check(!index_safetensors(memory_source(safe(R"({"a":{"dtype":"F32","shape":[9223372036854775807,4],"data_offsets":[0,4]}})",4)),other),"shape overflow rejected");
+    check(!index_safetensors(memory_source(safe(R"({"a":{"dtype":"F32","shape":[1],"data_offsets":[4,8]}})",8)),other),"unclaimed hole rejected");
     check(!index_pack(memory_source(wire),other),"unverified pack schema rejected");
     auto packed=safe(R"({"__metadata__":{"strix.weight.schema":"exl3.mul1.tiles16@1"},"x":{"dtype":"I16","shape":[1],"data_offsets":[0,2]}})",2);
     check(bool(index_pack(memory_source(packed),other)) && other.container==Container::pack,"declared pack indexed without advertising compute");

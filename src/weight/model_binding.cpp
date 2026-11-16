@@ -42,7 +42,8 @@ Status bind_model(const TensorIndex& index,const FamilySchema& schema,WeightMap&
     for(const auto& raw:index.tensors) {
         if(schema.text_only && index.container!=Container::gguf && !raw.name.starts_with("model.language_model.") && raw.name!="lm_head.weight")continue;
         const bool trellis=raw.name.ends_with(".trellis");
-        const bool weight=raw.name.ends_with(".weight") || raw.name.ends_with("_weight");
+        const bool standalone=std::any_of(schema.roles.begin(),schema.roles.end(),[&](const auto& p){return p.standalone && raw.name.find(p.pattern)!=std::string::npos;});
+        const bool weight=raw.name.ends_with(".weight") || raw.name.ends_with("_weight") || standalone;
         const bool bias=raw.name.ends_with(".bias");
         // Sidecars are attached by schema to their weight, not advertised as independent matrices.
         if(!weight && !trellis && !bias)continue;
@@ -59,7 +60,8 @@ Status bind_model(const TensorIndex& index,const FamilySchema& schema,WeightMap&
             b.expert_axis=UINT32_MAX;
         }else if(schema.native_fp8 && raw.wire_dtype=="F8_E4M3")p.transform="block.e4m3-e8m0.32x32@1";
         else if(schema.channel_quant && raw.wire_dtype=="I8") {auto status=channel_parameters(index,raw,p,b.logical_shape);if(!status)return status;}
-        const auto admitted=b.role==Role::norm || b.role==Role::bias?schema.plain:schema.linear;
+        const auto admitted=(b.role==Role::lookup_row || b.role==Role::auxiliary) && !schema.lookup.empty()?schema.lookup:
+            b.role==Role::norm || b.role==Role::bias?schema.plain:schema.linear;
         b.admitted_formats.assign(admitted.begin(),admitted.end());b.admitted_categories=0;
         bindings.push_back(std::move(b));parameters.push_back(std::move(p));
     }
