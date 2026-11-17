@@ -226,6 +226,11 @@ public:
     [[nodiscard]] bool prefill_msa_batch() const;
     void set_prefill_headless(bool on);  // STRIX_MM_PF_HEADLESS, default on: last layer cache-only for headless chunks (exact)
     [[nodiscard]] bool prefill_headless() const;
+    // STRIX_TP2_EXCHANGE_FMT (explicit FAST policy, resolved at construction): f16 = binary16 prefill exchange partials. At runtime
+    // (--ab x16fmt) only between f32 and a format resolved at load: set_prefill_exchange_f16(true) throws unless the
+    // process resolved f16 (its device partials and FAST policy exist). Both ranks must make the same calls.
+    void set_prefill_exchange_f16(bool on);
+    [[nodiscard]] bool prefill_exchange_f16() const;
     void set_prefill_dense_mlp(bool on);  // STRIX_MM_PF_DENSE_MLP, default on: layers 0..2 dense MLP on the v4 core (== strix_gemm bits)
     void set_prefill_flash_keys(unsigned mode);  // STRIX_MM_PF_FLASH_KEYS, default 2 (key halves): FAST flash key-load schedule (same bits)
     unsigned prefill_flash_keys() const;

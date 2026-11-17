@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 #include "strix/engine_profile.hpp"
+#include "xport/exchange_format.hpp"
 
 namespace strix::minimax::defaults {
 
@@ -67,6 +68,10 @@ struct PrefillPolicy {
     std::string router_wmma_layers;                // its layer set (builtin kRouterWmmaLayers), canonical ranges
     std::string policies;                          // named FAST policies that run, '+'-joined; empty: none
     std::string note;                              // why a bundle member does not run; empty: none
+    // STRIX_TP2_EXCHANGE_FMT (shared trait, xport/exchange_format.hpp): an explicit f16 = named FAST policy
+    // tp2-xchg-f16-v0 (throws under STRIX_MM_BASELINE=1); default f32 in every profile (the FAST bundle does not select it).
+    strix::xport::ExchangeFormat exchange_fmt = strix::xport::ExchangeFormat::f32;
+    std::string exchange_fmt_reason;
 };
 // Static execution guards, also used by the engine receipt after runtime control changes.
 const char* msa_flash_decline_reason(bool rework, bool fused, unsigned layers);

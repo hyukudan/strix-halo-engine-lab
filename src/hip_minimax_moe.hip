@@ -2,6 +2,7 @@
 #include "strix/hip_minimax_moe.hpp"
 #include "moe_core/route.hpp"
 #include "minimax/moe/mmx_trellis_device.hpp"  // dev::transform_block (STRIX_MM_XB_PREP)
+#include "xport/exchange_format_hip.hpp"   // STRIX_TP2_EXCHANGE_FMT=f16 partials
 #include "core/f16_dense_tall.hpp"             // FAST router product (enqueue_router_wmma)
 
 #include <cstdint>
@@ -39,8 +40,11 @@ struct StridedRoutePolicy {
 
 // Sum: exchange row fold (xport/row_fold.hpp). part0 is the folded slot = rank 0's partial + rank 1's partial, already
 // added by the exchange progress thread with the same binary32 addition; part1 is null. x = h + folded: same bits.
-template <unsigned Ilp, bool Sum = false>
+// Half (STRIX_TP2_EXCHANGE_FMT=f16, prefill): part0 / part1 hold binary16 rows (xport/exchange_format.hpp), widened
+// exactly to binary32 at the load; the sum, the norm and the routes are the FP32 expressions of the plain form.
+template <unsigned Ilp, bool Sum = false, bool Half = false>
 __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchangeView v) {
+    static_assert(!(Sum && Half), "the row fold is FP32 only");
     __shared__ __attribute__((aligned(16))) float hs[kHidden];  // 16-byte aligned: mode 2 stages float4 rows here
     __shared__ __attribute__((aligned(16))) float ys[kHidden];
     __shared__ float part[kNormThreads];
@@ -65,8 +69,10 @@ __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchang
         __syncthreads();
     }
     float* h = v.h + static_cast<std::size_t>(r) * kHidden;
-    const float* p0 = v.part0 + static_cast<std::size_t>(r) * kHidden;
-    const float* p1 = Sum ? nullptr : v.part1 + static_cast<std::size_t>(r) * kHidden;
+    const float* p0 = Half ? nullptr : v.part0 + static_cast<std::size_t>(r) * kHidden;
+    const float* p1 = Sum || Half ? nullptr : v.part1 + static_cast<std::size_t>(r) * kHidden;
+    [[maybe_unused]] const _Float16* q0 = Half ? reinterpret_cast<const _Float16*>(v.part0) + static_cast<std::size_t>(r) * kHidden : nullptr;
+    [[maybe_unused]] const _Float16* q1 = Half ? reinterpret_cast<const _Float16*>(v.part1) + static_cast<std::size_t>(r) * kHidden : nullptr;
     float acc = 0.0F;
     if constexpr (Ilp == 2) {  // STRIX_MM_XB_POSTILP mode 2: the partials (GPU-uncached exchange slots) staged into LDS
         // with coalesced 16-byte loads (4x fewer uncached requests), then the plain chain reads them from LDS: same
@@ -74,7 +80,16 @@ __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchang
         // reduction barriers; each hs[j] is read and then written by the same thread.
         const auto* p0v = reinterpret_cast<const float4*>(p0);
         const auto* p1v = reinterpret_cast<const float4*>(p1);
-        for (unsigned k = t; k < kHidden / 4U; k += kNormThreads) {
+        if constexpr (Half) {  // 16-byte loads of 8 halves, widened into the same LDS rows
+            const auto* h0v = reinterpret_cast<const uint4*>(q0);
+            const auto* h1v = reinterpret_cast<const uint4*>(q1);
+            for (unsigned k = t; k < kHidden / 8U; k += kNormThreads) {
+                const uint4 x0 = h0v[k], x1 = h1v[k];
+                strix::xport::hip::widen_f16x8(x0, hs + 8U * k);
+                strix::xport::hip::widen_f16x8(x1, ys + 8U * k);
+            }
+        }
+        for (unsigned k = t; !Half && k < kHidden / 4U; k += kNormThreads) {
             if constexpr (Sum) {
                 reinterpret_cast<float4*>(hs)[k] = p0v[k];
             } else {
@@ -100,8 +115,8 @@ __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchang
         for (unsigned q = 0; q < kPer; ++q) {
             const unsigned j = t + q * kNormThreads;
             a[q] = h[j];
-            b[q] = p0[j];
-            c[q] = Sum ? 0.0F : p1[j];
+            b[q] = Half ? static_cast<float>(q0[j]) : p0[j];
+            c[q] = Sum ? 0.0F : Half ? static_cast<float>(q1[j]) : p1[j];
         }
 #pragma unroll
         for (unsigned q = 0; q < kPer; ++q) {
@@ -113,7 +128,8 @@ __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchang
         }
     } else {
         for (unsigned j = t; j < kHidden; j += kNormThreads) {
-            const float x = Sum ? h[j] + p0[j] : h[j] + (p0[j] + p1[j]);
+            const float a0 = Half ? static_cast<float>(q0[j]) : p0[j];
+            const float x = Sum ? h[j] + a0 : h[j] + (a0 + (Half ? static_cast<float>(q1[j]) : p1[j]));
             h[j] = x;
             hs[j] = x;
             acc = __builtin_fmaf(x, x, acc);
@@ -371,7 +387,12 @@ void enqueue_post_exchange(const PostExchangeView& v, hipStream_t stream) {
     }
     if (v.ilp == 2 && ((reinterpret_cast<std::uintptr_t>(v.part0) | reinterpret_cast<std::uintptr_t>(v.part1)) & 15U) != 0)
         throw std::invalid_argument("minimax post-exchange: ilp mode 2 needs 16-byte aligned partials");
-    if (v.part1 == nullptr) {  // folded exchange: part0 is the pair sum
+    if (v.half_parts) {  // STRIX_TP2_EXCHANGE_FMT=f16: binary16 partials (two slots, never folded)
+        if (v.part0 == nullptr || v.part1 == nullptr) throw std::invalid_argument("minimax post-exchange: f16 partials need both slots");
+        if (v.ilp == 2) hipLaunchKernelGGL((post_exchange_kernel<2, false, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+        else if (v.ilp == 1) hipLaunchKernelGGL((post_exchange_kernel<1, false, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+        else hipLaunchKernelGGL((post_exchange_kernel<0, false, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+    } else if (v.part1 == nullptr) {  // folded exchange: part0 is the pair sum
         if (v.ilp == 2) hipLaunchKernelGGL((post_exchange_kernel<2, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
         else if (v.ilp == 1) hipLaunchKernelGGL((post_exchange_kernel<1, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
         else hipLaunchKernelGGL((post_exchange_kernel<0, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);

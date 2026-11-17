@@ -281,6 +281,14 @@ PrefillPolicy prefill_policy(const Lookup& env) {
         p.note += std::string(p.note.empty() ? "" : "; ") +
                   (!packed ? "index WMMA requires STRIX_MM_INDEX_PROJ=attn" : "index WMMA requires the default prefill identity");
     }
+    // Shared TP2 exchange format: an explicit f16 is its own named FAST policy (tp2-xchg-f16-v0), like an explicit
+    // FAST member; the exact baseline (STRIX_MM_BASELINE=1) refuses it (fail closed) and no profile selects it.
+    const auto xf = strix::xport::resolve_exchange_format(env(strix::xport::kExchangeFormatEnv), !baseline(env),
+                                                          "tp2-xchg-f16-v0, not under STRIX_MM_BASELINE=1");
+    p.exchange_fmt = xf.format;
+    p.exchange_fmt_reason = xf.reason;
+    if (xf.format == strix::xport::ExchangeFormat::f16)
+        p.policies += std::string(p.policies.empty() ? "" : "+") + "tp2-xchg-f16-v0";
     if (p.idx_wmma) p.policies += (p.policies.empty() ? "" : "+") + idx_wmma_policy(p.idx_wmma_layers);
     // FAST router product (bundle member or its own switch): the layers it runs on; layers without a router (dense)
     // are ignored. Admitted like the flash member (EXL3 MoE base only); an explicit value wins.
@@ -389,12 +397,15 @@ std::string prefill_identity(const Lookup& env) {
     for (std::size_t a = 0; a < p.policies.size();) {
         const std::size_t b = std::min(p.policies.find('+', a), p.policies.size());
         const std::string one = p.policies.substr(a, b - a);
+        if (one == "tp2-xchg-f16-v0") { a = b + 1; continue; }
         std::string& dst = one.rfind(kIdxWmmaPolicy, 0) == 0 ? idx : msa;
         dst += (dst.empty() ? "" : "+") + one;
         a = b + 1;
     }
     std::string out = msa.empty() ? std::string() : "prefill_msa=" + msa;
     if (!idx.empty()) out += std::string(out.empty() ? "" : ";") + "prefill_idxproj=" + idx;
+    if (p.exchange_fmt != strix::xport::ExchangeFormat::f32)
+        out += std::string(out.empty() ? "" : ";") + "tp2_exchange_fmt=" + strix::xport::exchange_format_name(p.exchange_fmt);
     if (p.router_wmma) out += std::string(out.empty() ? "" : ";") + "prefill_router=mm-pf-router-wmma-v1-l" + p.router_wmma_layers;
     if (fast_i4_format(env)) out += std::string(out.empty() ? "" : ";") + "moe_prefill_format=fast_i4";
     // Chunk-invariant linear order (MoE gate/up/down + dense q/k/v/o, fixed S = 1): different bits from the adaptive
@@ -670,6 +681,7 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
           << "prefill.idx_wmma_layers=" << (pf.idx_wmma ? pf.idx_wmma_layers : std::string("none")) << "\n"
           << "prefill.fast_policies=" << (pf.policies.empty() ? "none" : pf.policies) << "\n"
           << "prefill.fast_note=" << (pf.note.empty() ? "none" : pf.note) << "\n"
+          << "prefill.tp2_exchange_fmt=" << strix::xport::exchange_format_name(pf.exchange_fmt) << " (" << pf.exchange_fmt_reason << ")\n"
           << "prefill.pair_pipeline=off mode=tensor residency=tensor_split free_memory=pending "
              "reason=layout: tensor-split weights; pipeline execution unimplemented\n"
           << "prefill.pair_pipeline_reference=estimate profile=FAST rows=8192 assumed_free_gb=31.0 assumed_extra_gb=41.6 "

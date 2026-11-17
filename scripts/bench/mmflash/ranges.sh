@@ -5,6 +5,8 @@
 #   n<L>s<seed>       one-ulp null on the attention output of layer L (the gate's onset control; diagnostic hook binary)
 #   f<A>-<B>m<11|12>  candidate: MSA flash on layers A..B, mode 11 = STRIX_MM_PF_MSA_FLASH=1 (one-term), 12 = 2 (two-term)
 #   d<A>-<B>s<seed>g<mag>  diagnostic multi-site null: +-mag ulps on every layer A..B (absolute comparison only, never a floor)
+#   h<arm>            the e / f arm plus the binary16 TP2 exchange (STRIX_TP2_EXCHANGE_FMT=f16, FAST onset layer 0): floor
+#                     rule against the n0s* nulls, e.g. he (exchange only) or hf0-59m11 (MSA flash 0-59 + exchange)
 # Every arm is one pair ticket ($MMF_TURN LABEL CMD...), two lanes. Candidates get the floor rule (onset nulls n<A>s*,
 # --dnll-rule floor --engine minimax --profile fast-prefill, needs the MiniMax onset rule in the gate tool) and the
 # absolute comparison; summary.py writes the table. Environment: as seal.sh, plus MMF_TURN, MMF_SESSIONS (default
@@ -43,6 +45,7 @@ env_of() {
     n*) local x=${1#n}; echo "STRIX_MM_PF_MSA_FLASH=0 STRIX_MM_DIAG_ATTN_ULP=${x%%s*}:${x##*s}";;
     f*) local ix=${index_ranges[$1]}
         echo "STRIX_MM_PF_MSA_FLASH=${flash_modes[$1]} STRIX_MM_PF_MSA_FLASH_LAYERS=${flash_ranges[$1]}${ix:+ STRIX_MM_PF_IDX_WMMA=1 STRIX_MM_PF_IDX_WMMA_LAYERS=$ix}";;
+    h*) local b; b=$(env_of "${1#h}") || return 1; echo "$b STRIX_TP2_EXCHANGE_FMT=f16";;
     d*) local x=${1#d} r s g; r=${x%%s*}; s=${x#*s}; g=${s##*g}; s=${s%%g*}; echo "STRIX_MM_PF_MSA_FLASH=0 STRIX_MM_DIAG_ATTN_ULP=$r:$s:$g";;
     *) return 1;;
   esac
@@ -50,12 +53,14 @@ env_of() {
 [[ $REF =~ ^[A-Za-z0-9._-]+$ ]] && [ "$REF" != . ] && [ "$REF" != .. ] || exit 64
 declare -A seen=()
 for a in "$@"; do
-  [[ $a =~ ^(e[A-Za-z0-9._-]+|n[0-9]+s[0-9]+|f[0-9]+-[0-9]+m(11|12)(i[0-9]+-[0-9]+)?|d[0-9]+-[0-9]+s[0-9]+g[0-9]+)$ ]] || exit 64
+  [[ $a =~ ^(h?e[A-Za-z0-9._-]*|n[0-9]+s[0-9]+|h?f[0-9]+-[0-9]+m(11|12)(i[0-9]+-[0-9]+)?|d[0-9]+-[0-9]+s[0-9]+g[0-9]+)$ ]] || exit 64
   [ -z "${seen[$a]:-}" ] || exit 64
   seen[$a]=1
-  case $a in f*) parse_candidate "$a" || exit 64;; esac
-  case $a in f*|d*) printf '%s\t%s\tabsolute\n' "$a-abs" "$a" >> "$K/cmp/expected.tsv";; esac
-  case $a in f*) printf '%s\t%s\tfloor\n' "$a" "$a" >> "$K/cmp/expected.tsv";; esac
+  case $a in f*) parse_candidate "$a" || exit 64;;
+    hf*) parse_candidate "${a#h}" || exit 64; onsets[$a]=0;;
+    he*) onsets[$a]=0;; esac
+  case $a in f*|d*|h*) printf '%s\t%s\tabsolute\n' "$a-abs" "$a" >> "$K/cmp/expected.tsv";; esac
+  case $a in f*|h*) printf '%s\t%s\tfloor\n' "$a" "$a" >> "$K/cmp/expected.tsv";; esac
 done
 read -r -a TURN <<< "$MMF_TURN"
 arm() {
@@ -87,10 +92,10 @@ compare() {
   echo "$?" > "$K/cmp/$name.rc"
 }
 for a in "$@"; do
-  case $a in f*|d*) ;; *) continue;; esac
+  case $a in f*|d*|h*) ;; *) continue;; esac
   ok "$a" || { say "  $a: not sealed"; continue; }
   compare "$a-abs" "$MMF_RUN/$REF" "$MMF_RUN/$a" --ranks 0 1 "${T[@]}"
-  [ "${a#f}" = "$a" ] && continue
+  [ "${a#f}" = "$a" ] && [ "${a#h}" = "$a" ] && continue
   nl=(); missing_null=0
   while IFS= read -r n; do
     nl+=(--null-arm "$MMF_RUN/$n"); ok "$n" || missing_null=1
