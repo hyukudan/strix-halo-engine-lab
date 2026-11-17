@@ -187,10 +187,16 @@ void set_prefill_dense_band(int value);
 void set_prefill_tail_stream(int on);
 // MoE numeric order contract: -1 = STRIX_MMX_PF_ORDER (default adaptive), 0 = adaptive (S from the expert's rows in
 // the chunk, today's identity), 1 = invariant (gate/up/down S = 1: bits independent of chunking, identity
-// mmx-pf-moe-s1-v1). Host and device plans and the group-wide plan all follow it.
+// mmx-pf-moe-s1-v1). Host and device plans and the group-wide plan all follow it. The same switch binds the dense v4
+// linears (enqueue_prefill_dense) to core::fixed_linear_contract (S = kDenseFixedSplits); MoE + dense together are the
+// named identity mmx-pf-linear-s1-v1.
 // Test fixture only: one host thread, all device work synchronized before each
 // change, restore -1 before leaving the fixture. Never change a running engine.
 void set_prefill_moe_order(int invariant);
+bool prefill_order_invariant();
+inline constexpr int kDenseFixedSplits = 1;
+// Split of one dense v4 job: the fixed contract under the invariant order, else gemm_splits (the library's).
+unsigned prefill_dense_splits(unsigned input, unsigned output, unsigned bits, unsigned rows);
 void cleanup_prefill_tail_stream() noexcept;
 void set_prefill_core8(int value);  // -1 = environment, 0 = off (default), 1 = A LDS, 2 = shared B
 // Profiling only: `marker(label, stream, user)` after "start" and each launch ("gather", "gate_up[.mtN]", "finish",

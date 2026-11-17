@@ -1,5 +1,6 @@
 #include "strix/ds41_fast_profile.hpp"
 #include "strix/ds41_prefill_precision.hpp"
+#include "strix/lever_cache.hpp"
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -44,6 +45,7 @@ struct Q8A8DensePrefillView {
     float* out{};
     unsigned row_width{}, width{}, k_offset{}, k_parts{}, count{}, rows{}, x_stride{}, out_stride{};
     bool accumulate{};
+    bool exact{};
     std::int8_t* a8_codes{};
     float* a8_deltas{};
     std::int32_t* a8_sums{};
@@ -98,6 +100,7 @@ void grouped_test(std::string_view test) {
         require(test == "controls", "unknown grouped test");
         fast_dense_mode = 0; reject(v);
         fast_dense_mode = 1;
+        v.exact = true; reject(v); v.exact = false;
         { const PrefillPrecisionScope exact(PrefillPrecision{false, false}); reject(v); }
         v.rows = 127; reject(v); v.rows = 1024;
         fast_dense_mode = 0;

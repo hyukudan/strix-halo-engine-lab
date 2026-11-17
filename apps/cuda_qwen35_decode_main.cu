@@ -151,7 +151,7 @@ static SlotRun slot_decode(q::CudaEngine& E, std::uint32_t n_slots, std::uint32_
 int main(int argc, char** argv) {
     strix::device::bind_cuda_main(argc, argv);
     try {
-        std::string model, dump, ids_arg, synth, dump_mtp, force_file;
+        std::string model, dump, ids_arg, synth, dump_mtp, force_file, save_pack;
         bool mtp_pre = false;
         std::uint32_t n_gen = 32, rows_cap = 16, max_pos = 4096, prompt_len = 0, ctx_fill = 0, layers_override = 0, decode_rows = 1, slots = 0, ab_pairs = 3;
         std::string arms_arg;
@@ -203,8 +203,8 @@ int main(int argc, char** argv) {
                 if (v == "native") topt.turbo_weights = q::TurboWeights::native;
                 else if (v == "onfly") topt.turbo_weights = q::TurboWeights::onfly;
                 else if (v == "off") topt.turbo_weights = q::TurboWeights::off;
-                else if (v == "converted") throw std::runtime_error("--turbo-weights converted: not implemented yet (native|onfly)");
-                else throw std::runtime_error("--turbo-weights expects native|onfly");
+                else if (v == "converted") topt.turbo_weights = q::TurboWeights::converted;  // --model is a pack from --turbo-save-pack
+                else throw std::runtime_error("--turbo-weights expects off|native|onfly|converted");
             } else if (a == "--turbo-bits") {
                 topt.turbo_bits = strix::core::parse_u32(next());
                 if (topt.turbo_bits != 4) throw std::runtime_error("--turbo-bits: only 4 is implemented");
@@ -212,7 +212,8 @@ int main(int argc, char** argv) {
                 const std::string v = next();
                 if (v != "nvfp4" && v != "bf16") throw std::runtime_error("--turbo-lm-head expects nvfp4|bf16");
                 topt.turbo_lm_head = v == "nvfp4";
-            } else if (a == "--print-effective-config") print_cfg = true;
+            } else if (a == "--turbo-save-pack") save_pack = next();  // write the onfly NVFP4 weights of --model (BF16 gguf) as a converted pack, then exit
+            else if (a == "--print-effective-config") print_cfg = true;
             else if (a == "--dump-logits") dump = next();
             else if (a == "--force-gen-file") force_file = next();  // teacher forcing: decode feeds these tokens (comma list), not its own argmax
             else if (a == "--dump-mtp") dump_mtp = next();
@@ -221,6 +222,14 @@ int main(int argc, char** argv) {
         }
         if (pf_repeat == 0) throw std::invalid_argument("--prefill-repeat must be positive");
         if (pf_slots < 1 || pf_slots > 2) throw std::invalid_argument("--prefill-slots expects 1..2");
+        if (!save_pack.empty()) {
+            if (model.empty()) throw std::runtime_error("--turbo-save-pack needs --model <bf16.gguf>");
+            const auto t0 = std::chrono::steady_clock::now();
+            const std::uint64_t n = q::save_converted_pack(model, save_pack, topt);
+            std::printf("pack: %s %llu bytes in %.1f s\n", save_pack.c_str(), static_cast<unsigned long long>(n),
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            return 0;
+        }
         if (bwp) {
             std::printf("bw-probe: %.3f TB/s streaming read (4 GiB)\n", bw_probe_tbs());
             return 0;

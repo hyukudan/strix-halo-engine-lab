@@ -241,6 +241,9 @@ struct Q8A8DensePrefillView {
     std::uint32_t out_stride = 0;
     std::uint32_t row_width = 0, k_offset = 0;  // K-split parts, as Q8A8View
     bool accumulate = false;
+    // keep the exact kernels (no FAST dense form ds41-dense-f16-v1): a policy pins the call's form (in the padding
+    // after accumulate: the view's size and offsets, and so every kernel's arguments, are unchanged)
+    bool exact = false;
     std::uint32_t tall = 0;  // tall form RT * 10 + OT, 1 auto (the same bits); 0: STRIX_DS41_DENSE_TALL (default off)
     // Optional A8 of the outputs (enqueue_quantize_a8's bits; accumulate off, count a multiple of 32): codes at
     // r * a8_stride + o, deltas / sums at r * a8_stride / 32 + o / 32. Written by the tall forms whose blocks own whole

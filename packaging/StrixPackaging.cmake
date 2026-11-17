@@ -132,7 +132,7 @@ if(WIN32)
         set(_strix_health false)
     else()
         set(_strix_server "strix-cuda-qwen-serve")
-        set(_strix_inspect "")
+        set(_strix_inspect "--print-effective-config")
         set(_strix_health true)
     endif()
     file(WRITE "${_strix_pkg_out}/server.json"

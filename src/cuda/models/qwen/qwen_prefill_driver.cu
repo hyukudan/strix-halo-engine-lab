@@ -14,6 +14,7 @@
 // run on the exact rows of the block.
 #include "strix/env_flags.hpp"
 #include "strix/cuda/qwen_prefill.hpp"
+#include "strix/cuda/qwen_options.hpp"
 #include "strix/device/cuda_enumerator.hpp"
 #include <cstdlib>
 #include "strix/moe_route_bf16.hpp"
@@ -21,12 +22,14 @@
 #include "strix/cuda/qwen_dense.hpp"
 #include "strix/cuda/qwen_gdn.hpp"
 #include "strix/cuda/qwen_hc.hpp"
+#include "strix/cuda/amd_math.cuh"
 #include "strix/cuda/qwen_moe.hpp"
 #include "strix/cuda/qwen_mtp_draft.hpp"
 #include "strix/cuda/qwen_plemtp.hpp"
 #include "strix/cuda/qwen_qsa.hpp"
 #include "strix/mtp_draft_split.hpp"
 #include "strix/cuda/qwen_transcode.hpp"
+#include "strix/cuda/core/nvfp4_a8_cuda.hpp"
 #include "strix/gguf_reader.hpp"
 #include "qwen_tier_adapter.hpp"
 #include <filesystem>
@@ -72,7 +75,8 @@ void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
 }
 
-constexpr std::uint32_t kMaxStepRows = 8;    // rows of one session in a window (1 + up to 7 drafts); sessions per window
+constexpr std::uint32_t kMaxStepRows = 8;    // draft chain rows (1 + up to 7 drafts); sessions per window. A session's
+                                             // window rows go up to kMaxWindowRows (copy windows of 9..16 rows)
 constexpr std::uint32_t kMaxWindowRows = 16; // rows of a whole cohort window (9..16: the row-independent families run on the
                                              // exact prefill-shaped kernels over 16 padded rows, as a prefill block)
 constexpr std::uint32_t kLayers = 48, kHidden = 2560, kWide = 10240, kTopK = 10, kExperts = 512;
@@ -341,6 +345,8 @@ struct Prefill::Impl : BlockFields {
     // ---- decode window (rollback of a partial accept); the window scratch below holds the rows of every session of the
     // open cohort window (session i at its window_offset) until commit_cohort.
     bool window = false;                       // run_block in window mode (GDN rows kept per layer, split state)
+    Config::Forms executed_forms;
+    bool executed_moe_route_bf16 = false;
     bool cohort_open = false;
     std::vector<SessionState*> cohort;         // the sessions of the open window, in cohort order
     float* win_rows = nullptr;                 // [36][8][gdn_stride]
@@ -481,6 +487,12 @@ struct Prefill::Impl : BlockFields {
     std::uint64_t host_bytes = 0;
 
     std::string describe;
+    // TURBO onfly (Config::turbo_onfly_nvfp4): NVFP4 images of the dense Q8_0 roles, registered with qwen_dense.
+    // Process lifetime, like the uploaded model weights.
+    std::uint32_t onfly_tensors = 0;
+    std::uint64_t onfly_source_bytes = 0, onfly_image_bytes = 0;
+    double onfly_seconds = 0;
+    void convert_onfly();
     std::uint32_t transcoded = 0;              // tensors transcoded at load
     StateCopyStream state_copy;
     cudaStream_t state_copy_stream(SessionState& s) {
@@ -649,6 +661,53 @@ void Prefill::Impl::upload_model() {
         native_experts = native_experts || moe::native_types(probe);
     }
     ck(cudaStreamSynchronize(stream), "hc pack");
+    if (cfg.turbo_onfly_nvfp4) convert_onfly();
+}
+
+// TURBO onfly (qwen-turbo-v1, onfly-nvfp4-rtn-g16): the Qwen adapter's declaration of which tensors convert. Dense Q8_0
+// projections of the target only: GDN in (qkv, z) / out, QSA q/k/v/o, shared expert gate/up/down. Routed experts
+// (Q4_K: 4.5 -> 4.5 bpw, nothing to save; Q5_1 down: +20 GB beside the source), the LM head, the hyper-connection mixes,
+// the router and the MTP draft head keep their pack form. The Q8_0 source stays: prefill blocks (>= 16 rows) and the
+// draft read it; decode windows read the image (qwen_dense OnflyScope in run_block).
+void Prefill::Impl::convert_onfly() {
+    namespace a8 = strix::cuda::core::nvfp4_a8;
+    constexpr LayerTensor kRoles[] = {k_attn_qkv_weight, k_attn_gate_weight, k_ssm_out_weight, k_attn_q_weight,
+                                      k_attn_k_weight, k_attn_v_weight, k_attn_output_weight, k_ffn_gate_shexp_weight,
+                                      k_ffn_up_shexp_weight, k_ffn_down_shexp_weight};
+    constexpr std::uint32_t kQ8_0 = 8;
+    const auto t0 = Clock::now();
+    float* scratch = dev_alloc<float>(1, "turbo onfly scratch");
+    for (std::uint32_t l = 0; l < kLayers; ++l) {
+        const std::string blk = "blk." + std::to_string(l);
+        for (const LayerTensor role : kRoles) {
+            void* q8 = lw[l].p[role];
+            if (!q8) continue;   // GDN-only / QSA-only roles
+            const std::string name = blk + kLayerTensorSuffix[role];
+            const gguf::TensorInfo* t = nullptr;
+            for (const auto& x : info.tensors) if (x.name == name) { t = &x; break; }
+            if (!t || t->ggml_type != kQ8_0 || t->dimensions.size() != 2) continue;  // stays in its pack form
+            const auto k = static_cast<std::uint32_t>(t->dimensions[0]), n = static_cast<std::uint32_t>(t->dimensions[1]);
+            if (k % 64U != 0U) continue;
+            a8::Image image;
+            image.codes = dev_alloc<std::uint8_t>(std::uint64_t{n} * (k / 2U), "turbo onfly codes");
+            image.scales = dev_alloc<std::uint8_t>(std::uint64_t{n} * (k / 16U), "turbo onfly scales");
+            ck(a8::convert_q8_0(q8, n, k, image, scratch, stream), "turbo onfly convert");
+            dn::OnflyImage reg;
+            reg.codes = image.codes;
+            reg.scales = image.scales;
+            reg.tensor_scale = image.tensor_scale;
+            reg.outputs = n;
+            reg.width = k;
+            dn::onfly_register(q8, reg);
+            ++onfly_tensors;
+            onfly_source_bytes += t->byte_size;
+            onfly_image_bytes += a8::image_bytes(n, k);
+        }
+    }
+    ck(cudaStreamSynchronize(stream), "turbo onfly");
+    ck(cudaFree(scratch), "turbo onfly scratch");
+    onfly_seconds = std::chrono::duration<double>(Clock::now() - t0).count();
+    if (onfly_tensors == 0) throw std::runtime_error("--turbo-weights onfly: no Q8_0 dense tensor to convert in this pack");
 }
 
 void Prefill::Impl::upload_ple() {
@@ -753,8 +812,8 @@ void Prefill::Impl::upload_draft() {
     bd_logits = dev_alloc<float>(std::uint64_t{kMaxStepRows} * ids.size(), "batched draft logits");
     bd_token = dev_alloc<std::uint32_t>(kMaxStepRows, "batched draft tokens");
     bd_sel = dev_alloc<std::uint32_t>(2ULL * kMaxStepRows * kMaxStepRows, "batched draft selections");
-    teacher_hidden = dev_alloc<std::uint16_t>((kMaxStepRows + 1) * kWide, "teacher hidden");
-    teacher_next = dev_alloc<std::uint32_t>(kMaxStepRows + 1, "teacher next");
+    teacher_hidden = dev_alloc<std::uint16_t>((kMaxWindowRows + 1) * kWide, "teacher hidden");
+    teacher_next = dev_alloc<std::uint32_t>(kMaxWindowRows + 1, "teacher next");
     ck(cudaStreamSynchronize(stream), "draft upload");
 }
 
@@ -958,7 +1017,7 @@ SessionState& Prefill::Impl::new_session(std::uint64_t P) {
         for (void* p : s->row_allocations) cudaFree(p);
         throw;
     }
-    s->target_identity = qwen_route::identity(route_policy.enabled, route_policy.enabled).hash;
+    s->target_identity = qwen_options::numerical_identity(cfg).hash;
     if (cfg.diagnostic_bf16_mtp) s->diagnostic_generation = qwen_route::new_engine_binding();
     auto& ref = *s;
     sessions.emplace(ref.id, std::move(s));
@@ -1080,14 +1139,13 @@ ResidencyPlan plan_residency(const Config& config) {
 
 Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
     auto& m = *impl_;
-    m.route_policy = qwen_route::environment(config.moe_route_bf16);
+    m.cfg = qwen_options::resolve_route(config);
+    m.route_policy = *m.cfg.route_policy; // frozen before device work; no second environment lookup
     m.state_type = recurrent_state_policy().type;
     // Typed prefill currently rounds at call boundaries. Reject before device or
     // cache setup until rounding is independent of scheduling and prefix history.
     require_f32_recurrent_state(m.state_type, "CUDA application (schedule-independent prefill and prefix reuse unqualified)");
     m.state_layer_floats = recurrent_state_bytes(gdn::kMatrixFloats, m.state_type) / sizeof(float);
-    m.cfg = config;
-    m.cfg.moe_route_bf16 = m.route_policy.enabled; // freeze before device work
     const auto* diagnostic_graphs = std::getenv("STRIX_QRTX_GRAPHS");
     qwen_mtp_diagnostic::admission(config.diagnostic_bf16_mtp, m.route_policy.enabled,
         config.decode, config.export_state, !config.mtp_sidecar_gguf.empty(),
@@ -1232,6 +1290,14 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
             ",\"rawdot_row_bytes\":" + std::to_string(qwen_route::row_bytes(true)) +
             ",\"rawdot_capacity_bytes\":" + std::to_string(qwen_route::layout(m.cap, true).bytes) + "}";
     }
+    if (config.turbo_onfly_nvfp4) {  // OFF: the original bytes above
+        m.describe.pop_back();
+        m.describe += ",\"turbo_weights\":\"onfly-nvfp4-rtn-g16\",\"turbo_arithmetic\":\"" +
+            std::string(strix::cuda::core::nvfp4_a8::kArithmeticId) + "\",\"turbo_tensors\":" +
+            std::to_string(m.onfly_tensors) + ",\"turbo_source_bytes\":" + std::to_string(m.onfly_source_bytes) +
+            ",\"turbo_image_bytes\":" + std::to_string(m.onfly_image_bytes) + ",\"turbo_convert_s\":" +
+            std::to_string(m.onfly_seconds) + "}";
+    }
 }
 
 Prefill::~Prefill() = default;
@@ -1256,7 +1322,7 @@ std::uint64_t Prefill::card_budget_bytes() const { return impl_->cfg.residency.v
 std::uint64_t Prefill::engine_device_bytes() const { return impl_->engine_bytes; }
 
 qwen_route::Identity Prefill::numerical_identity() const {
-    return qwen_route::identity(impl_->route_policy.enabled, impl_->route_policy.enabled);
+    return qwen_options::numerical_identity(impl_->cfg);
 }
 qwen_route::Policy Prefill::route_storage_policy() const { return impl_->route_policy; }
 
@@ -1266,9 +1332,12 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         throw std::runtime_error("prefill: tiered exchange is poisoned; recreate engine");
     }
     NvtxScope nv;
+    // TURBO onfly: decode windows (every row count, so a session's bits never depend on its cohort) read the NVFP4
+    // images; prefill blocks keep Q8_0. No registration (exact / FAST): no route changes.
+    const dn::OnflyScope onfly(window && cfg.turbo_onfly_nvfp4);
     std::uint32_t rows = 0;  // all rows of the block
     for (std::uint32_t i = 0; i < count; ++i) {
-        if (seg[i].s->target_identity != qwen_route::identity(route_policy.enabled, route_policy.enabled).hash)
+        if (seg[i].s->target_identity != qwen_options::numerical_identity(cfg).hash)
             throw std::logic_error("Qwen session target identity mismatch");
         rows += seg[i].rows;
     }
@@ -1297,7 +1366,10 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         a.normalized = normalized;
         a.injection = injection;
         a.output = hidden;
+        a.mma = cfg.forms.hc_mma && !window;  // FAST form on run()'s prefill blocks only; verify/step windows stay exact
+        a.workspace_layout = hc::HcWorkspaceLayout::automatic;
         hc::hc_mix(a, tables, stream);
+        executed_forms.hc_mma |= a.mma;
     };
     const auto inject = [&](const std::uint16_t* value) {
         hc::inject(wide, value, injection, pad, wide_next, stream);
@@ -1489,14 +1561,14 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         ew.down = static_cast<const std::uint8_t*>(lw[l].p[k_ffn_down_exps_weight]);
         nv.push("moe_routed");
         if (!tier) {
-            moe::enqueue(mr, pad, kHidden, ew, tables, nullptr, stream);
+            moe::enqueue(mr, pad, kHidden, ew, tables, nullptr, stream, cfg.forms.moe_mma && !window);
         } else {
             // Tiered: the prologue reads the real ids; publish maps them to slots (misses -> the zero slot) and hands the
             // misses to the host; the routed kernels run on the slot routes; gather brings the host raw dots back.
             moe::enqueue_prologue(mr, pad, kHidden, stream);
             tier->publish(l, rows, pad, routes, tier_routes, moe_codes, moe_deltas, moe_sums, stream);
             mr.routes = {tier_routes, kTopK * 4};
-            moe::enqueue_routed(mr, pad, ew, tables, stream);
+            moe::enqueue_routed(mr, pad, ew, tables, stream, cfg.forms.moe_mma && !window);
             tier->wait_gather(rows, moe_raw, mr.rawdots.stride, moe_status, mr.status.stride, csr.summary, stream);
             if (!window) {
                 // Read every layer before its summary is cleared by the next prologue. No failed
@@ -1515,6 +1587,8 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
             }
             moe::enqueue_combine(mr, pad, nullptr, stream);
         }
+        executed_forms.moe_mma |= cfg.forms.moe_mma && !window;
+        executed_moe_route_bf16 |= mr.route_bf16;
         nv.pop();
         if (window) {
             moe_sticky_kernel<<<1, 32, 0, stream>>>(csr.summary, moe_status, 4, pad, moe_sticky);
@@ -1553,7 +1627,8 @@ void Prefill::Impl::qsa_core(std::uint32_t l, const Segment& seg) {
     const auto o = qsa_ordinal(l);
     SessionState& ss = *seg.s;
     const qsa::LayerState st{ss.kv[o], ss.raw_index[o], ss.pooled[o], &ss.pooled_valid[o]};
-    qsa::layer_core(rb, seg.rows, seg.p0, qw, st, rope, tables, qws, stream);
+    qsa::layer_core(rb, seg.rows, seg.p0, qw, st, rope, tables, qws, stream, cfg.forms.qsa_mma && !window);
+    executed_forms.qsa_mma |= cfg.forms.qsa_mma && !window && seg.rows != 0;
 }
 
 void Prefill::Impl::qsa_layer(std::uint32_t l, const Segment* seg, std::uint32_t count) {
@@ -1644,6 +1719,8 @@ Timing Prefill::run(SessionId session, const std::vector<std::uint32_t>& tokens,
     };
     const auto t0 = Clock::now();
     Timing timing;
+    m.executed_forms = {};
+    m.executed_moe_route_bf16 = false;
     // fresh state
     for (std::uint32_t o = 0; o < 12; ++o) {
         ck(cudaMemsetAsync(S.kv[o], 0, position * 2048, m.stream), "kv clear");
@@ -1784,8 +1861,9 @@ Timing Prefill::run(SessionId session, const std::vector<std::uint32_t>& tokens,
                 ck(cudaMemcpyAsync(m.mtp_next, m.next_host.data(), std::uint64_t{n} * 4, cudaMemcpyHostToDevice, m.stream), "mtp next");
                 const auto mwts = m.mtp_weights();
                 mark_stream(m.stream, "mtp_compute_start", k, {}, p0, n, 0);
-                pm::launch_mtp_cache_rows(mwts, pm::MtpRounding{}, m.tap, m.mtp_next, n, p0, S.mtp_kv, S.mtp_index, m.mtp_ws,
+                pm::launch_mtp_cache_rows(mwts, pm::MtpRounding{.mma = m.cfg.forms.mtp_mma}, m.tap, m.mtp_next, n, p0, S.mtp_kv, S.mtp_index, m.mtp_ws,
                                           m.mtp_status, m.tables, m.stream);
+                m.executed_forms.mtp_mma |= m.cfg.forms.mtp_mma;
                 mark_stream(m.stream, "mtp_compute_end", k, {}, p0, n, 0);
                 if (m.cfg.export_state) {
                 const auto kb = std::uint64_t{n} * 2048, ib = std::uint64_t{n} * 256;
@@ -1810,6 +1888,8 @@ Timing Prefill::run(SessionId session, const std::vector<std::uint32_t>& tokens,
         }
         mark_stream(m.stream, "block_end", k, {}, p0, rows, 0);
         ck(cudaStreamSynchronize(m.stream), "block");
+        timing.executed_forms = m.executed_forms;
+        timing.executed_moe_route_bf16 = m.executed_moe_route_bf16;
         const double bs = std::chrono::duration<double>(Clock::now() - tb).count();
         timing.block_s.push_back(bs);
         if (k == 0) timing.first_block_s = bs;
@@ -1897,8 +1977,11 @@ void Prefill::Impl::commit_one(SessionState& s, std::uint32_t keep) {
         if (keep > 1)
             ck(cudaMemcpyAsync(teacher_hidden + kWide, tap + off * kWide, (keep - 1) * wb, cudaMemcpyDeviceToDevice, stream), "teacher taps");
         ck(cudaMemcpyAsync(teacher_next, s.window_tokens.data(), std::uint64_t{keep} * 4, cudaMemcpyHostToDevice, stream), "teacher next");
-        pm::launch_mtp_cache_rows(mtp_weights(), pm::MtpRounding{}, teacher_hidden, teacher_next, keep, s.window_position - 1,
-            s.mtp_kv, s.mtp_index, mtp_ws, mtp_status, tables, stream);
+        // in pieces of <= 8 rows: the decode-shaped cache-row kernels (rows <= 8) at every keep, so a 9..16-row copy
+        // window writes the same MTP cache bits as two narrow windows (the rows are independent: one position each)
+        for (std::uint32_t r0 = 0; r0 < keep; r0 += 8U)
+            pm::launch_mtp_cache_rows(mtp_weights(), pm::MtpRounding{}, teacher_hidden + std::uint64_t{r0} * kWide, teacher_next + r0,
+                std::min(8U, keep - r0), s.window_position - 1 + r0, s.mtp_kv, s.mtp_index, mtp_ws, mtp_status, tables, stream);
         s.mtp_pooled_valid = std::min<std::uint32_t>(s.mtp_pooled_valid, static_cast<std::uint32_t>((s.window_position - 1) / 4));
         ck(cudaMemcpyAsync(s.held, tap + (off + keep - 1) * kWide, wb, cudaMemcpyDeviceToDevice, stream), "held");
     }
@@ -2000,6 +2083,7 @@ void Prefill::Impl::step_tail(std::uint32_t rows) {
     a.normalized = normalized;
     a.injection = injection;
     a.output = hidden;
+    a.workspace_layout = hc::HcWorkspaceLayout::automatic;
     hc::hc_mix(a, tables, stream);
     const void* head = w.get("output.weight");
     static const bool head1 = strix::envcfg::flag("STRIX_QRTX_HEAD1", false);
@@ -2050,7 +2134,7 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
         if (s.length == 0) throw std::logic_error("verify(): session " + std::to_string(s.id) + " has no prefilled state");
         if (c.position != s.length)
             throw std::invalid_argument("verify(): position " + std::to_string(c.position) + " != session length " + std::to_string(s.length));
-        if (c.rows == 0 || c.rows > kMaxStepRows) throw std::invalid_argument("step rows out of range");
+        if (c.rows == 0 || c.rows > kMaxWindowRows) throw std::invalid_argument("step rows out of range");
         if (c.position + c.rows > s.capacity) throw std::invalid_argument("step beyond the session's capacity");
         if (!s.gdn_base || (s.gdn_state != s.gdn_base && s.gdn_other != s.gdn_base))
             throw std::logic_error("decode graphs: GDN buffer parity lost");
@@ -2567,7 +2651,7 @@ std::uint32_t Prefill::Impl::prefill_enqueue(SessionState& S, const std::vector<
             const auto cnt = static_cast<std::uint32_t>(last - p0);
             for (std::uint32_t r = 0; r < cnt; ++r) next_pinned[r] = tokens[p0 + r + 1];
             ck(cudaMemcpyAsync(mtp_next, next_pinned, std::uint64_t{cnt} * 4, cudaMemcpyHostToDevice, stream), "mtp next");
-            pm::launch_mtp_cache_rows(mtp_weights(), pm::MtpRounding{}, tap, mtp_next, cnt, p0, S.mtp_kv, S.mtp_index, mtp_ws,
+            pm::launch_mtp_cache_rows(mtp_weights(), pm::MtpRounding{.mma = cfg.forms.mtp_mma}, tap, mtp_next, cnt, p0, S.mtp_kv, S.mtp_index, mtp_ws,
                                       mtp_status, tables, stream);
         }
     }
@@ -2744,6 +2828,7 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
         hc::HcMixArgs a;
         a.input = in; a.norm = norm; a.inject = inject; a.packed = packed; a.rows = 1;
         a.normalized = m.normalized; a.injection = m.injection; a.output = m.hidden;
+        a.workspace_layout = hc::HcWorkspaceLayout::automatic;
         hc::hc_mix(a, m.tables, m.stream);
     };
     // The whole chain as one graph replay: the same launches with the QSA cores on device maps and the cache positions read
@@ -2948,6 +3033,7 @@ std::vector<Draft> Prefill::draft_cohort(const std::vector<DraftRequest>& reques
         hc::HcMixArgs a;
         a.input = in; a.norm = norm; a.inject = inject; a.packed = packed; a.rows = rows;
         a.normalized = m.normalized; a.injection = m.injection; a.output = m.hidden;
+        a.workspace_layout = hc::HcWorkspaceLayout::automatic;
         hc::hc_mix(a, m.tables, m.stream);
     };
     const qsa::LayerWeights lw{static_cast<const std::uint16_t*>(mw("indexer.q_proj.weight")),

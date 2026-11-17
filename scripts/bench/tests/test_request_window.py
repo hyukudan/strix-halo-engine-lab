@@ -161,5 +161,37 @@ class RequestWindow(unittest.TestCase):
         self.assertFalse(rec["valid"])
 
 
+class PairVerdict(unittest.TestCase):
+    """The pair arm verdict line comes after the fold: a clean rank 0 with an evicting peer is INVALID."""
+
+    def fold(self, r0, r1):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            paths = []
+            for i, rec in enumerate((r0, r1)):
+                paths.append(os.path.join(d, "r%d.json" % i))
+                if rec is not None:
+                    with open(paths[-1], "w") as stream:
+                        json.dump(rec, stream)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = receipt.main(["pair"] + paths)
+            return rc, out.getvalue().strip()
+
+    def test_peer_eviction_invalidates_the_arm_line(self):
+        r0 = dict(tag="s128K-pair-exact-0", valid=True, invalid_reasons=[])
+        r1 = dict(tag="s128K-pair-exact-0-r1", valid=False, invalid_reasons=["kfd evicted_ms +1435 in the timed window"])
+        rc, line = self.fold(r0, r1)
+        self.assertTrue(rc)
+        self.assertEqual(line, "== s128K-pair-exact-0 PAIR INVALID[r0: - | r1: kfd evicted_ms +1435 in the timed window]")
+
+    def test_both_clean_is_valid_and_missing_peer_is_not(self):
+        ok = dict(tag="s32K-pair-fast-0", valid=True, invalid_reasons=[])
+        self.assertEqual(self.fold(ok, dict(ok, tag="s32K-pair-fast-0-r1")), (False, "== s32K-pair-fast-0 PAIR VALID"))
+        rc, line = self.fold(dict(ok), None)
+        self.assertTrue(rc)
+        self.assertTrue(line.startswith("== s32K-pair-fast-0 PAIR INVALID["), line)
+
+
 if __name__ == "__main__":
     unittest.main()

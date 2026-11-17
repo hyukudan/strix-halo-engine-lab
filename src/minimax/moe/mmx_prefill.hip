@@ -17,6 +17,7 @@
 #endif
 #include "moe_core/device_plan.hpp"
 #include "moe_core/grouped_policy.hpp"
+#include "core/linear_plan.hpp"  // fixed_linear_contract: rows-free dense K chain (invariant order)
 #include "strix/env_flags.hpp"
 #include "strix/route_receipt.hpp"
 
@@ -40,10 +41,12 @@ unsigned gemm_tile_rows(unsigned input, unsigned output, unsigned bits, unsigned
 unsigned gemm_splits(unsigned input, unsigned output, unsigned bits, unsigned rows) {
     return route::gemm_splits(input, output, bits, rows);
 }
-// MoE numeric order contract (STRIX_MMX_PF_ORDER): adaptive (default, today's identity: S from the expert's rows in the
-// chunk) or invariant (shared kGroupedSingleChainContract, S = 1 for gate, up and down: bits independent of chunking).
-// Test fixture only: change this between synchronized calls on one host thread;
-// never mutate it during engine execution or concurrent planning.
+// MoE numeric order contract (STRIX_MMX_PF_ORDER): invariant (default via the pf_order table item; shared
+// kGroupedSingleChainContract, S = 1 for gate, up and down: bits independent of chunking) or adaptive (off switch and
+// baseline; former identity: S from the expert's rows in the chunk).
+// The override is for test fixtures and for the engine's one load-time decline of a defaulted invariant order
+// (require_invariant_dense, on the loading thread before any execution or planning). Change it only between
+// synchronized calls on one host thread; never mutate it during engine execution or concurrent planning.
 namespace { int g_order_override = -1; }  // -1 = STRIX_MMX_PF_ORDER, 0 = adaptive, 1 = invariant
 void set_prefill_moe_order(int invariant) {
     if (invariant < -1 || invariant > 1) throw std::invalid_argument("set_prefill_moe_order: value must be -1, 0 or 1");
@@ -56,6 +59,15 @@ const ::strix::moe_core::GroupedSplitContract& prefill_moe_order() {
         return ::strix::moe_core::resolve_grouped_order(strix::envcfg::text("STRIX_MMX_PF_ORDER"));
     }();
     return c;
+}
+bool prefill_order_invariant() { return prefill_moe_order().invariant(); }
+// Dense v4 split: invariant binds the shared rows-free contract (one ascending K16 chain per output, S = 1 for every
+// MiniMax q/k/v/o matrix: the split the adaptive policy already picks for >= 1024-row pieces); adaptive keeps the
+// library's rows-dependent split (== strix_gemm bitwise).
+unsigned prefill_dense_splits(unsigned input, unsigned output, unsigned bits, unsigned rows) {
+    if (prefill_order_invariant())
+        return static_cast<unsigned>(::strix::core::fixed_linear_contract(static_cast<int>(input), kDenseFixedSplits).splits);
+    return gemm_splits(input, output, bits, rows);
 }
 
 namespace {
@@ -2104,7 +2116,7 @@ DensePlan make_dense_plan(const PrefillDenseJob* jobs, unsigned count, unsigned 
             w.svh == nullptr || jobs[m].out == nullptr)
             throw std::invalid_argument("minimax prefill dense: jobs need one input width and outputs % 128 == 0");
         if (!dense_bits_supported(w.bits)) throw std::invalid_argument("minimax prefill dense: unsupported bit width");
-        p.splits[m] = gemm_splits(w.input, w.output, w.bits, rows);
+        p.splits[m] = prefill_dense_splits(w.input, w.output, w.bits, rows);
         p.off_xt[m] = off;
         off += align256(std::size_t{p.tpad} * p.k * 2);
         p.off_part[m] = off;

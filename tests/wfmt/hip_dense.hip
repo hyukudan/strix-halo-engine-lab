@@ -405,7 +405,7 @@ int main() try {
     if(!strix::weight::format_geometry(view.storage,view.parameters,view.geometry)) throw std::runtime_error("Q8 source geometry");
     wh::LaunchShape shape{1U,17U,128U,136U,128U,17U,0U};
     const auto* registered=wh::find_source(view.storage,"f16-tile");
-    if(wh::sources().size()!=18U || !registered || !registered->validate(view,shape)) throw std::runtime_error("HIP source registration validation");
+    if(wh::sources().size()!=23U || !registered || !registered->validate(view,shape)) throw std::runtime_error("HIP source registration validation");
     shape.activation_stride=127U;
     if(registered->validate(view,shape)) throw std::runtime_error("HIP source admitted invalid activation stride");
     shape.activation_stride=128U;shape.k=64U;

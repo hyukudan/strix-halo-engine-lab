@@ -2,6 +2,7 @@
 #include "strix/hip_minimax_moe.hpp"
 #include "moe_core/route.hpp"
 #include "minimax/moe/mmx_trellis_device.hpp"  // dev::transform_block (STRIX_MM_XB_PREP)
+#include "core/f16_dense_tall.hpp"             // FAST router product (enqueue_router_wmma)
 
 #include <cstdint>
 #include <initializer_list>
@@ -296,6 +297,65 @@ __global__ __launch_bounds__(256) void router_select_kernel(std::uint32_t rows, 
     strix::moe_core::route_topk(StridedRoutePolicy<RowScores>{sc, ch, r, ids, weights});
 }
 
+// FAST router product (enqueue_router_wmma) on the shared dense FP16 WMMA core: the sum of (row, expert) goes through
+// the sigmoid and bias of router_tiled_kernel into the same scores scratch. The launch's y is the scratch itself, so the
+// expert of a column tile is its y offset.
+namespace tall = strix::core::f16_dense_tall;
+struct RouterScoreStore {
+    float* scores;
+    const float* bias;
+    unsigned rows;
+    struct Tile {
+        float* s;
+        float* c;
+        float b;
+    };
+    __device__ __forceinline__ Tile open(unsigned, const tall::ColumnTile& ct, unsigned c) const {
+        const unsigned e = static_cast<unsigned>(ct.y - scores) + c;
+        return {scores + static_cast<std::size_t>(e) * rows, scores + (static_cast<std::size_t>(kExperts) + e) * rows, bias[e]};
+    }
+    __device__ __forceinline__ void put(const Tile& t, unsigned r, float v) const {
+        const float sv = 1.0F / (1.0F + msa::exp_f(-v));
+        t.s[r] = sv;
+        t.c[r] = sv + t.b;
+    }
+    __device__ __forceinline__ void close() const {}
+    template <class F> __device__ __forceinline__ void run(F&& f) { f(*this); }
+};
+
+// Rows flagged by the guarded product (non-finite sum: FP16 overflow of y or of a weight) get the exact scores of
+// router_tiled_kernel: per (row, expert) lane L runs a = fmaf(y[j], w[e][j], a) over j = L, L + 32, ... from 0.0F, the
+// same xor butterfly, sigmoid and bias; FP32 weights.
+constexpr unsigned kRouterFallbackSpan = 1024;
+__global__ __launch_bounds__(kNormThreads) void router_exact_rows_kernel(std::uint32_t rows, const float* y, const float* router_w,
+                                                                         const float* bias, float* scores, std::uint32_t* flags) {
+    __shared__ unsigned list[kNormThreads];
+    __shared__ unsigned count;
+    __shared__ float ys[kHidden];
+    tall::exact_rows(flags, rows, kRouterFallbackSpan, list, &count, [&](unsigned r) __attribute__((always_inline)) {
+        for (unsigned j = threadIdx.x; j < kHidden; j += kNormThreads) ys[j] = y[static_cast<std::size_t>(r) * kHidden + j];
+        __syncthreads();
+        const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x >> 5U;
+        for (unsigned e = wave; e < kExperts; e += kWaves) {
+            const float* w = router_w + static_cast<std::size_t>(e) * kHidden;
+            float a = 0.0F;
+#pragma unroll 8  // the weight loads issue ahead; the chain order is unchanged
+            for (unsigned j = lane; j < kHidden; j += kRouterLanes) a = __builtin_fmaf(ys[j], w[j], a);
+            for (unsigned d = 16; d >= 1; d >>= 1U) a = a + __shfl_xor(a, static_cast<int>(d), 32);
+            if (lane == 0) {
+                const float sv = 1.0F / (1.0F + msa::exp_f(-a));
+                scores[static_cast<std::size_t>(e) * rows + r] = sv;
+                scores[(static_cast<std::size_t>(kExperts) + e) * rows + r] = sv + bias[e];
+            }
+        }
+    });
+}
+
+__global__ __launch_bounds__(256) void router_f16_kernel(const float* w, _Float16* out, unsigned n) {
+    const unsigned i = blockIdx.x * 256U + threadIdx.x;
+    if (i < n) out[i] = static_cast<_Float16>(w[i]);
+}
+
 }  // namespace
 
 void enqueue_post_exchange(const PostExchangeView& v, hipStream_t stream) {
@@ -345,6 +405,42 @@ void enqueue_router_tiled(std::uint32_t rows, const float* y, const float* route
     hipLaunchKernelGGL(router_select_kernel, dim3((rows + 255) / 256), dim3(256), 0, stream, rows, scratch, ids, weights);
     const hipError_t e = hipGetLastError();
     if (e != hipSuccess) throw std::runtime_error(std::string("minimax router tiled: ") + hipGetErrorString(e));
+}
+
+void convert_router_f16(const float* router_w, std::uint16_t* w16, hipStream_t stream) {
+    constexpr unsigned n = kExperts * kHidden;
+    hipLaunchKernelGGL(router_f16_kernel, dim3((n + 255U) / 256U), dim3(256), 0, stream, router_w, reinterpret_cast<_Float16*>(w16), n);
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) throw std::runtime_error(std::string("minimax router f16: ") + hipGetErrorString(e));
+}
+
+// MiniMax router: 8 column tiles of 6,144-long chains; the product is bound by the reads of y (25 KB per row). Automatic
+// form by piece rows (u2 unit receipts, gfx1151): up to 1,536 rows y stays in the 32 MB MALL and narrow4 (two 4-tile
+// column blocks sharing each y row) wins (1024: 0.183 vs wide16 0.415 ms); above it wide16 reads y once
+// (2048: 0.858 vs narrow4 1.101; 4096: 1.274 vs 1.710 ms). STRIX_F16_MATRIX_FORM overrides.
+constexpr unsigned kRouterWideRows = 1536;
+static tall::MatrixForm router_form(unsigned form, unsigned rows) {
+    if (form <= 2U) return static_cast<tall::MatrixForm>(form);
+    return tall::matrix_form(rows <= kRouterWideRows ? tall::MatrixForm::narrow4 : tall::MatrixForm::wide16);
+}
+const char* router_wmma_form() {
+    const tall::MatrixForm a = router_form(~0U, 0), b = router_form(~0U, ~0U);
+    return a == b ? tall::matrix_form_name(a) : "auto (narrow4 <= 1536 rows < wide16)";
+}
+
+void enqueue_router_wmma(std::uint32_t rows, const float* y, const float* router_w, const std::uint16_t* w16, const float* bias,
+                         std::uint32_t* ids, float* weights, float* scratch, std::uint32_t* flags, hipStream_t stream, unsigned form) {
+    static_assert(kHidden % 128U == 0 && kExperts % 16U == 0);
+    if (rows == 0) return;
+    if (scratch == nullptr || flags == nullptr || w16 == nullptr) throw std::invalid_argument("minimax router wmma: scratch, flags and f16 weights are required");
+    if (std::uint64_t{rows} * kHidden * 4U >= (std::uint64_t{1} << 32U)) throw std::invalid_argument("minimax router wmma: too many rows");
+    const tall::Guarded<RouterScoreStore> store{{scratch, bias, rows}, flags};
+    tall::launch_matrix(router_form(form, rows), y, rows, reinterpret_cast<const _Float16*>(w16), kHidden, kExperts, scratch, rows, store, stream);
+    hipLaunchKernelGGL(router_exact_rows_kernel, dim3((rows + kRouterFallbackSpan - 1U) / kRouterFallbackSpan), dim3(kNormThreads), 0, stream,
+                       rows, y, router_w, bias, scratch, flags);
+    hipLaunchKernelGGL(router_select_kernel, dim3((rows + 255) / 256), dim3(256), 0, stream, rows, scratch, ids, weights);
+    const hipError_t e = hipGetLastError();
+    if (e != hipSuccess) throw std::runtime_error(std::string("minimax router wmma: ") + hipGetErrorString(e));
 }
 
 }  // namespace strix::minimax::moe::hip
