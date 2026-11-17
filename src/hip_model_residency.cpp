@@ -715,25 +715,47 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
                 reserve(
                     ranges.size());
 
-            for (const auto range :
-                 ranges) {
-                const auto bytes =
-                    range.end -
-                    range.begin;
-                const auto host =
-                    mapped.base_address() +
-                    static_cast<
-                        std::uintptr_t>(
-                            range.begin);
-
+            const auto host_of = [&](const HostRange& range) {
+                return mapped.base_address() + static_cast<std::uintptr_t>(range.begin);
+            };
+            // Every piece is locked before the first is registered (registered_backing_lifetime.hpp ORDER): a lock
+            // splits the VMA at the piece boundary, which must not happen next to a registered piece.
+            acquire_locked_backings(ranges, [&](const HostRange& range) {
+#if defined(__linux__) && defined(MLOCK_ONFAULT)
+                // With vm.compact_unevictable_allowed=0 compaction does not migrate locked pages either.
+                if (!lock.enabled) return false;
+                const auto bytes = range.end - range.begin;
+                if (mlock2(reinterpret_cast<const void*>(host_of(range)), static_cast<std::size_t>(bytes), MLOCK_ONFAULT) == 0)
+                    return true;
+                const int lock_errno = errno;
+                lock.failed(std::string("model residency: requested registered-page lock failed; refusing unlocked userptr backing: ") + std::strerror(lock_errno), [&] {
+                    std::fprintf(stderr, "model residency: mlock of %llu registered bytes failed (%s); continuing unlocked\n",
+                        static_cast<unsigned long long>(bytes), std::strerror(lock_errno));
+                });
+                return false;
+#else
+                (void)range;
+                return false;
+#endif
+            }, [&](const HostRange& range) {
+#if defined(__linux__) && defined(MLOCK_ONFAULT)
+                (void)munlock(reinterpret_cast<const void*>(host_of(range)), static_cast<std::size_t>(range.end - range.begin));
+#else
+                (void)range;
+#endif
+            }, [&](const HostRange& range, bool locked, const auto& handed) {
+                const auto bytes = range.end - range.begin;
+                const auto host = host_of(range);
                 startup::Phase registration_marker("registration_chunk", range.begin);
                 acquire_registered_backing([&] {
                     check_hip(selective_enabled ? selective_register(reinterpret_cast<void*>(host), static_cast<std::size_t>(bytes)) :
                         hipHostRegister(reinterpret_cast<void*>(host), static_cast<std::size_t>(bytes), model_register_flags()),
                         "hipHostRegister(model range)");
                 }, [&] {
-                    // Track before querying the alias so failure retains the backing.
-                    result.registered_ranges_.push_back(RegisteredRange{host,0,bytes});
+                    // Track before querying the alias so failure retains the backing (and its lock).
+                    result.registered_ranges_.push_back(RegisteredRange{host,0,bytes,locked});
+                    if (locked) result.registered_locked_bytes_ = checked_add(result.registered_locked_bytes_, bytes);
+                    handed();
                 }, [&] {
                     void* device = nullptr;
                     check_hip(selective_enabled ? selective_alias(&device, reinterpret_cast<void*>(host)) :
@@ -741,26 +763,8 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
                         "hipHostGetDevicePointer(model range)");
                     result.registered_ranges_.back().device_base = reinterpret_cast<std::uintptr_t>(device);
                 });
-                result.registered_bytes_ =
-                    checked_add(
-                        result.registered_bytes_,
-                        bytes);
-#if defined(__linux__) && defined(MLOCK_ONFAULT)
-                // With vm.compact_unevictable_allowed=0 compaction does not migrate locked pages either.
-                if (lock.enabled) {
-                    if (mlock2(reinterpret_cast<const void*>(host), static_cast<std::size_t>(bytes), MLOCK_ONFAULT) == 0) {
-                        result.registered_ranges_.back().locked = true;
-                        result.registered_locked_bytes_ = checked_add(result.registered_locked_bytes_, bytes);
-                    } else {
-                        const int lock_errno = errno;
-                        lock.failed(std::string("model residency: requested registered-page lock failed; refusing unlocked userptr backing: ") + std::strerror(lock_errno), [&] {
-                            std::fprintf(stderr, "model residency: mlock of %llu registered bytes failed (%s); continuing unlocked\n",
-                                static_cast<unsigned long long>(bytes), std::strerror(lock_errno));
-                        });
-                    }
-                }
-#endif
-            }
+                result.registered_bytes_ = checked_add(result.registered_bytes_, bytes);
+            });
 
             for (std::size_t index = 0;
                  index <
