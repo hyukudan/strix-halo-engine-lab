@@ -58,6 +58,9 @@ run)
         --slots 1 --capacity "$cap" --max-rows 4096 "${SA[@]}" "${A[@]}")
     export KIT_TAG=$name KIT_ARM=$name KIT_ROUND=0 KIT_TOKENS=0 KIT_EXPECTED=0
     export KIT_RECEIPT_ARGS='--need-prefill --family minimax --require ranks.AGREE'
+    # Rank 1 prints its first "rank 1" line only after its transport to rank 0 is up, and rank 0 starts only after
+    # this wait, so the generic 120 s default only idles the ticket. A short head start for rank 1 is enough.
+    export KIT_PEER_WAIT=${KIT_PEER_WAIT:-3}
     printf '%s\n' "${E[@]}" >"$out/$name.env"
     kit_pair_arm "$d" "$(($(kit_left) - 3))" 'rank 1|what\(\)' p1 p0 ;;
 seal)
