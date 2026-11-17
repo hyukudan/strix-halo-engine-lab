@@ -104,6 +104,8 @@ constexpr Item kItems[] = {
     {"pf_msa_batch", "STRIX_MM_PF_MSA_BATCH", "1", "0", "Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 %"},
     {"pf_dense_mlp", "STRIX_MM_PF_DENSE_MLP", "1", "0",
      "Prefill: exact (== strix_gemm bitwise, the pf_dense_qkv contract); dense MLP of layers 0-2 on the v4 core for 4096-row pieces"},
+    {"pf_flash_keys", "STRIX_MM_PF_FLASH_KEYS", "2", "0",
+     "Prefill: schedule only, same bits (FAST flash output fnv identical); key fragments in two halves around the value loads (attn_core kKsKeysHalves)"},
     {"pf_headless", "STRIX_MM_PF_HEADLESS", "1", "0",
      "Prefill: exact (state + final rows fnv identical); last layer cache-only for every chunk but the last (strix/prefill_headless.hpp)"},
     {"pf_attend4", "STRIX_MM_PF_ATTEND4", "1", "0", "Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 %"},

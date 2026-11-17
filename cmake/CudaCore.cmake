@@ -32,6 +32,7 @@ add_library(strix_cuda_core STATIC
     ${_cc_root}/src/cuda_core/norms/rope.cu
     ${_cc_root}/src/cuda_core/attention/attention.cu
     ${_cc_root}/src/cuda_core/attention/attention_flash.cu
+    ${_cc_root}/src/cuda_core/attention/attention_flash8.cu
     ${_cc_root}/src/cuda_core/gdn/gdn.cu)
 target_include_directories(strix_cuda_core PUBLIC ${_cc_root}/include)
 # Identity: no FMA contraction, IEEE division and sqrt, no flush-to-zero (as the existing Qwen CUDA build).
@@ -79,6 +80,12 @@ if(MSVC)
     target_compile_options(cuda_core_nvfp4_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
 
+# Long-context prefill attention bench + pipe identity check (scripts: --check-only is the ctest form).
+add_executable(cuda_core_flash_bench ${_cc_root}/tests/cuda_core/flash_bench.cu)
+target_link_libraries(cuda_core_flash_bench PRIVATE strix_cuda_core)
+if(MSVC)
+    target_compile_options(cuda_core_flash_bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
 add_executable(cuda_core_dense_big_test ${_cc_root}/tests/cuda_core/dense_big_test.cu)
 target_link_libraries(cuda_core_dense_big_test PRIVATE strix_cuda_core)
 target_compile_options(cuda_core_dense_big_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
@@ -96,6 +103,8 @@ if(BUILD_TESTING)
         add_test(NAME ${t} COMMAND ${t})
         set_tests_properties(${t} PROPERTIES LABELS "gpu;cuda")
     endforeach()
+    add_test(NAME cuda_core_flash_bench COMMAND cuda_core_flash_bench --check-only)  # flash pipes bitwise identical, flash8 finite
+    set_tests_properties(cuda_core_flash_bench PROPERTIES LABELS "gpu;cuda")
 endif()
 
 # FAST8 needs a feature-specific image and must not select a generic SM120

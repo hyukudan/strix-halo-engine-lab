@@ -17,6 +17,7 @@
 
 #include <cuda_runtime.h>
 
+#include "strix/cuda_core/attention_policy.hpp"
 #include "strix/cuda_core/dense.hpp"
 #include "strix/qwen35/config.hpp"
 #include "strix/qwen35/engine_types.hpp"
@@ -59,6 +60,13 @@ struct EngineOptions {
     std::uint32_t prefill_inflight = 3;
     std::uint32_t prefill_ramp = 0;      // > 0: first chunks grow ramp, 2*ramp, ... (< prefill_chunk) from idle; 0 = off
     bool prefill_big = true;             // false: prefill() runs forward_rows windows of 32 + commit (reference / fallback)
+    // Long-context prefill attention (non-exact prefill policies only; the exact policy keeps attention_decode).
+    // flash_pipe: shared-memory pipeline of the flash kernel (scheduling only, bitwise equal across pipes).
+    cuda_core::FlashPipe flash_pipe = cuda_core::FlashPipe::pad2;
+    // flash_tail: wave-tail split of the flash grid (scheduling only, bitwise equal; measured +4.5 % flash at 4096-row chunks). off = old grid.
+    cuda_core::FlashTail flash_tail = cuda_core::FlashTail::split;
+    // attn8: e4m3 flash attention over an e4m3 shadow of the KV cache (bit-changing, own identity suffix "-a8"; FAST gate required).
+    bool prefill_attn8 = false;
 };
 
 // Named identity of the arithmetic + weight source; also the prefix-cache key (caches never mix identities).
@@ -67,7 +75,9 @@ struct EngineOptions {
     static const char* pf_names[] = {"exact", "flash", "fast", "fast2", "fast8"};
     const std::string a = names[static_cast<unsigned>(o.dense_arithmetic)];
     // a non-exact prefill policy is a different arithmetic identity (prefix caches never mix them)
-    const std::string pf = o.prefill_arith == PrefillArith::exact ? "" : std::string("-pf-") + pf_names[static_cast<unsigned>(o.prefill_arith)];
+    const std::string pf = o.prefill_arith == PrefillArith::exact
+        ? ""
+        : std::string("-pf-") + pf_names[static_cast<unsigned>(o.prefill_arith)] + (o.prefill_attn8 ? "-a8" : "");
     if (o.turbo_weights == TurboWeights::off) return "qwen35-cuda-exact-" + a + "-v1" + pf;
     if (o.turbo_weights == TurboWeights::native) return "qwen35-turbo-native-" + a + "-v1" + pf;
     // converted packs hold the onfly bytes: same arithmetic identity as onfly (prefix caches may be shared)
