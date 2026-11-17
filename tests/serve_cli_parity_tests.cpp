@@ -94,15 +94,18 @@ void glm() {
             if (const auto at = v.rfind(" ("); at != std::string::npos && !v.empty() && v.back() == ')') v.erase(at);
         return c;
     };
+    for (const char* profile : {"default", "fast", "quality"})
     for (const bool complete : {false, true}) for (const bool opt_out : {false, true}) {
+        auto profile_request = request;
+        profile_request.insert(profile_request.end(), {"--profile", profile});
         rd::ModelFacts facts;
         facts.mtp_present = facts.mtp_complete = complete;
         facts.reason = complete ? "complete" : "missing mtp.safetensors";
-        auto cli_args = request;
+        auto cli_args = profile_request;
         cli_args.insert(cli_args.end(), {"--decode", "64"});
         if (opt_out) cli_args.push_back("--no-mtp");
         const auto cli = rd::resolve(rd::scan(cli_args), none, facts);
-        const auto server = rd::resolve_serve(request, !opt_out, none, facts);
+        const auto server = rd::resolve_serve(profile_request, !opt_out, none, facts);
         const std::string expected = complete && !opt_out ? "1" : "0";
         check(cli.mtp_spec.value == expected && server.mtp_spec.value == expected &&
               cli.mtp.value == expected && server.mtp.value == expected && server.prefill == "gemv",
@@ -170,15 +173,20 @@ void ds41() {
     probe.file = [&](const std::string& f) { return files.count(f) != 0; };
     probe.dir = [&](const std::string& d) { return dirs.count(d) != 0; };
     probe.list = [](const std::string&) { return std::vector<std::string>{}; };
-    const auto config = [&](pd::App app) {
-        const auto r = pd::resolve(app, {model, "--rank", "0", "--transport", "usb4auto"},
+    const auto config = [&](pd::App app, const char* profile) {
+        const auto r = pd::resolve(app, {model, "--rank", "0", "--transport", "usb4auto", "--profile", profile},
                                    [](const char*) -> const char* { return nullptr; }, probe, pd::Build{true});
         auto c = sp::from_args(std::span<const std::string>(r.args).subspan(1));
         for (const auto& [k, v] : r.set_env) c["env:" + k] = v;
         for (const auto& k : r.unset_env) c["env:" + k] = "<unset>";
         c["session.enabled"] = r.session.enabled ? "1" : "0";
         c["session.disk"] = r.session.disk ? "1" : "0";
-        if (r.profile) c["profile"] = std::string(strix::profile::name(r.profile->profile));
+        if (r.profile) {
+            c["profile"] = std::string(strix::profile::name(r.profile->profile));
+            c["profile.fingerprint"] = strix::profile::hex_identity(r.profile->fingerprint());
+            for (const auto& entry : r.profile->entries)
+                if (entry.lever) c["profile." + std::string(entry.lever->name)] = entry.value;
+        }
         return c;
     };
     static constexpr sp::Allowed allowed[] = {
@@ -187,7 +195,8 @@ void ds41() {
         {"arg:--prefill-path", "the server prefills prompts on the device batch path; the CLI's prompt goes through its decode windows"},
         {"arg:--prefill-rows", "row budget of the server's device prefill path (auto)"},
     };
-    gate("ds41", config(pd::App::rank), config(pd::App::serve), allowed);
+    for (const char* profile : {"default", "fast", "quality"})
+        gate(std::string("ds41+") + profile, config(pd::App::rank, profile), config(pd::App::serve, profile), allowed);
 }
 #endif
 
@@ -243,7 +252,7 @@ int main(int argc, char** argv) {
     try {
         helper_tests();
 #if defined(STRIX_PARITY_GLM)
-        std::cout << "included: glm (complete/missing MTP assets, default/opt-out)\n";
+        std::cout << "included: glm (default/fast/quality; complete/missing MTP assets, default/opt-out)\n";
         glm();
 #else
         std::cout << "skipped: glm (resolver not linked)\n";
