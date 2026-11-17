@@ -93,11 +93,23 @@ if(MSVC)
     target_compile_options(cuda_core_dense_big_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
 
+# Host-only: converted-pack GGUF writer round trip (no GPU).
+add_executable(gguf_pack_writer_test ${_cc_root}/tests/gguf_pack_writer_test.cpp ${_cc_root}/src/gguf_reader.cpp)
+target_include_directories(gguf_pack_writer_test PRIVATE ${_cc_root}/include)
+
 if(BUILD_TESTING)
+    add_test(NAME gguf_pack_writer_test COMMAND gguf_pack_writer_test)
     foreach(t cuda_core_test qwen35_cuda_engine_test cuda_core_nvfp4_test cuda_core_dense_big_test)
         add_test(NAME ${t} COMMAND ${t})
         set_tests_properties(${t} PROPERTIES LABELS "gpu;cuda")
     endforeach()
     add_test(NAME cuda_core_flash_bench COMMAND cuda_core_flash_bench --check-only)  # flash pipes bitwise identical, flash8 finite
     set_tests_properties(cuda_core_flash_bench PROPERTIES LABELS "gpu;cuda")
+endif()
+
+# FAST8 needs a feature-specific image and must not select a generic SM120
+# image whose MMA helper traps. Other device generations are rejected at runtime.
+get_target_property(_cc_archs strix_cuda_core CUDA_ARCHITECTURES)
+if(_cc_archs MATCHES "(^|;)120a(-real)?(;|$)" AND NOT _cc_archs MATCHES "(^|;)120(-real|-virtual)?(;|$)")
+    target_compile_definitions(strix_cuda_core PRIVATE STRIX_CUDA_FAST8_SM120A=1)
 endif()

@@ -564,6 +564,27 @@ void test_startup_agreement() {
         kda[1] |= rd::kPfKdaWmmaConfig;
         pair(kda, kda, rd::max_rows_auto(tf), rd::max_rows_auto(tf), false);
         pair(kda, fast, false, false, true);
+        auto mla = kda;  // the FAST MLA GEMMs (glm-pf-mla-wmma-v1, FAST default): a rank without them is refused
+        mla[1] |= rd::kPfMlaWmmaConfig;
+        pair(mla, mla, rd::max_rows_auto(tf), rd::max_rows_auto(tf), false);
+        pair(mla, kda, false, false, true);
+        auto idxproj = kda;  // the FAST indexer projections: one rank without them is refused
+        idxproj[1] |= rd::kPfIdxProjWmmaConfig;
+        pair(idxproj, idxproj, rd::max_rows_auto(tf), rd::max_rows_auto(tf), false);
+        pair(idxproj, kda, false, false, true);
+        auto router = kda;  // the FAST router product (opt-in): one rank with it and one without is refused
+        router[1] |= rd::kPfRouterWmmaConfig;
+        pair(router, router, rd::max_rows_auto(tf), rd::max_rows_auto(tf), false);
+        pair(router, kda, false, false, true);
+        CHECK(rd::kPfIdxProjWmmaConfig == (1U << 18));
+        CHECK(rd::kPfRouterWmmaConfig == (1U << 20));
+        auto both = idxproj;
+        both[1] |= rd::kPfRouterWmmaConfig;
+        pair(both, both, rd::max_rows_auto(tf), rd::max_rows_auto(tf), false);
+        pair(both, idxproj, false, false, true);
+        pair(both, router, false, false, true);
+        CHECK((rd::kPfRouterWmmaConfig & (rd::kPfIdxProjWmmaConfig | rd::kPfKdaWmmaConfig | rd::kPfAttnWmmaConfig | rd::kPfWmmaConfig | rd::kFastI4Config |
+                                          rd::kAutoRowsConfig | (3U << rd::kIdxWmmaShift))) == 0);
     }
     // External Xfer, including fixed and baseline modes, never enters this host handshake.
     for (const auto& extra : {Args{}, Args{"--baseline"}, Args{"--max-rows", "8192"}}) {

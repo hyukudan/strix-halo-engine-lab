@@ -124,10 +124,19 @@ struct AttentionView {
     // STRIX_DS41_ATTN_LIVE_CHUNKS: the caller's upper bound on any row's visible keys (window + selected), or 0 (unknown):
     // the grid and the heads-per-wave choice then count only the chunks it can hold. A row above it traps.
     std::uint32_t max_visible = 0;
+    // FAST policy ds41-decoder-replay-bounded-v1 only: the absolute position of the layer's first window key (its kv_begin);
+    // a row at pos reads the window keys max(key_floor, pos - 127) .. pos (ring slots by the real pos). 0 = every window key
+    // from position 0 (today). Non-zero binds the floored instantiations (flash, f16wmma, exact lean-3; a compile-time
+    // policy); the BF16 prefill form refuses it. In the padding after max_visible: the view's size and offsets are main's,
+    // so the incumbent kernels' machine code is unchanged.
+    std::uint32_t key_floor = 0;
     // FAST lever ds41-attn-bf16flash-v1 only: BF16 mirrors of the ring (capacity x 512) and of kv_cache (entry x 512),
     // written by enqueue_attention_flash_mirror
     const std::uint16_t* ring16 = nullptr;
     const std::uint16_t* kv16 = nullptr;
+    // and, when non-null, the BF16 image of q after RoPE (R x heads x 512, from the q_b epilogue,
+    // enqueue_q_b_rope_image): the flash core reads it through query_op instead of q (same bits)
+    const std::uint16_t* q16 = nullptr;
 };
 inline constexpr unsigned kAttnGroupCount = 8;   // at most 8 head groups per row (8 heads per block)
 // variant 0: STRIX_DS41_BF16_ATTN_VARIANT (default 1, the first kernel); 2: QK split over the waves, 16-byte key stores

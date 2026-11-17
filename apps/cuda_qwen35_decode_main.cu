@@ -151,16 +151,17 @@ static SlotRun slot_decode(q::CudaEngine& E, std::uint32_t n_slots, std::uint32_
 int main(int argc, char** argv) {
     strix::device::bind_cuda_main(argc, argv);
     try {
-        std::string model, dump, ids_arg, synth, dump_mtp, force_file;
+        std::string model, dump, ids_arg, synth, dump_mtp, force_file, save_pack;
         bool mtp_pre = false;
         std::uint32_t n_gen = 32, rows_cap = 16, max_pos = 4096, prompt_len = 0, ctx_fill = 0, layers_override = 0, decode_rows = 1, slots = 0, ab_pairs = 3;
         std::string arms_arg;
         bool slots_verify = false, graphs = true, multi = true, bwp = false, pdl = false, print_cfg = false;
         q::EngineOptions topt;  // TURBO levers (defaults = exact)
         std::string arith_name = "mma3";
-        std::string flash_pipe, pf_attn8, dump_cont;
+        std::string flash_pipe, flash_tail, pf_attn8, dump_cont;
         std::string pf_arith, pf_dump;            // --prefill-arith exact|flash|fast|fast2: large-M prefill (absent: windows of --rows)
         std::uint32_t pf_chunk = 2048, pf_repeat = 1, pf_slots = 2, pf_wave_min = 0;
+        std::uint32_t pf_inflight = q::EngineOptions{}.prefill_inflight, pf_ramp = 0;  // bounded submission / ramp
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
             auto next = [&]() -> std::string {
@@ -178,11 +179,14 @@ int main(int argc, char** argv) {
             else if (a == "--max-pos") max_pos = strix::core::parse_u32(next());
             else if (a == "--prefill-arith") pf_arith = next();
             else if (a == "--flash-pipe") flash_pipe = next();         // pad2|swz3 (bitwise equal; scheduling only)
+            else if (a == "--flash-tail") flash_tail = next();         // split|off (bitwise equal; scheduling only; default off, opt-in)
             else if (a == "--prefill-attn8") pf_attn8 = next();        // on|off: e4m3 flash attention (FAST, identity -a8)
             else if (a == "--prefill-chunk") pf_chunk = strix::core::parse_u32(next());
             else if (a == "--prefill-wave-min") pf_wave_min = strix::core::parse_u32(next());  // 0 = off; wave-aligned steps
             else if (a == "--prefill-dump") pf_dump = next();  // last-token logits of the LAST prefill (float32 [vocab])
             else if (a == "--prefill-slots") pf_slots = strix::core::parse_u32(next());
+            else if (a == "--prefill-inflight") pf_inflight = strix::core::parse_u32(next());  // chunks queued ahead of the GPU, 0 = unbounded
+            else if (a == "--prefill-ramp") pf_ramp = strix::core::parse_u32(next());          // first chunk rows, doubling; 0 = off
             else if (a == "--prefill-repeat") pf_repeat = strix::core::parse_u32(next());
             else if (a == "--layers") layers_override = strix::core::parse_u32(next());
             else if (a == "--graphs") graphs = next() != "0";
@@ -204,8 +208,8 @@ int main(int argc, char** argv) {
                 if (v == "native") topt.turbo_weights = q::TurboWeights::native;
                 else if (v == "onfly") topt.turbo_weights = q::TurboWeights::onfly;
                 else if (v == "off") topt.turbo_weights = q::TurboWeights::off;
-                else if (v == "converted") throw std::runtime_error("--turbo-weights converted: not implemented yet (native|onfly)");
-                else throw std::runtime_error("--turbo-weights expects native|onfly");
+                else if (v == "converted") topt.turbo_weights = q::TurboWeights::converted;  // --model is a pack from --turbo-save-pack
+                else throw std::runtime_error("--turbo-weights expects off|native|onfly|converted");
             } else if (a == "--turbo-bits") {
                 topt.turbo_bits = strix::core::parse_u32(next());
                 if (topt.turbo_bits != 4) throw std::runtime_error("--turbo-bits: only 4 is implemented");
@@ -213,7 +217,8 @@ int main(int argc, char** argv) {
                 const std::string v = next();
                 if (v != "nvfp4" && v != "bf16") throw std::runtime_error("--turbo-lm-head expects nvfp4|bf16");
                 topt.turbo_lm_head = v == "nvfp4";
-            } else if (a == "--print-effective-config") print_cfg = true;
+            } else if (a == "--turbo-save-pack") save_pack = next();  // write the onfly NVFP4 weights of --model (BF16 gguf) as a converted pack, then exit
+            else if (a == "--print-effective-config") print_cfg = true;
             else if (a == "--dump-logits") dump = next();
             else if (a == "--dump-cont") dump_cont = next();  // with --prefill-arith: big prefill, then dump only its last row + decode rows
             else if (a == "--force-gen-file") force_file = next();  // teacher forcing: decode feeds these tokens (comma list), not its own argmax
@@ -221,16 +226,21 @@ int main(int argc, char** argv) {
             else if (a == "--mtp-hidden") mtp_pre = next() == "pre";
             else throw std::runtime_error("unknown argument " + a);
         }
-        if (print_cfg) {
-            topt.multi_gemv = multi;
-            q::print_effective_config(topt, arith_name.c_str(), stdout);
+        if (pf_repeat == 0) throw std::invalid_argument("--prefill-repeat must be positive");
+        if (pf_slots < 1 || pf_slots > 2) throw std::invalid_argument("--prefill-slots expects 1..2");
+        if (!save_pack.empty()) {
+            if (model.empty()) throw std::runtime_error("--turbo-save-pack needs --model <bf16.gguf>");
+            const auto t0 = std::chrono::steady_clock::now();
+            const std::uint64_t n = q::save_converted_pack(model, save_pack, topt);
+            std::printf("pack: %s %llu bytes in %.1f s\n", save_pack.c_str(), static_cast<unsigned long long>(n),
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
             return 0;
         }
         if (bwp) {
             std::printf("bw-probe: %.3f TB/s streaming read (4 GiB)\n", bw_probe_tbs());
             return 0;
         }
-        if ((model.empty() == synth.empty()) || rows_cap == 0 || rows_cap > 32 || decode_rows == 0 || decode_rows > 32)
+        if (!print_cfg && ((model.empty() == synth.empty()) || rows_cap == 0 || rows_cap > 32 || decode_rows == 0 || decode_rows > 32))
             throw std::runtime_error(
                 "usage: (--model F.gguf | --synthetic-full bf16|q8_0 [--layers N]) (--prompt-ids 1,2,3 | --prompt-len N) [--ctx-fill N] "
                 "[--dense-arith mma3|mma2|mma1|fp32] [--n-gen N] [--rows 1..32] [--decode-rows 1..32 (timing of an R-row window, committed fully)] [--max-pos N] "
@@ -255,13 +265,23 @@ int main(int argc, char** argv) {
             else if (pf_arith == "fast2") opt.prefill_arith = q::PrefillArith::fast2;
             else if (pf_arith == "fast8") opt.prefill_arith = q::PrefillArith::fast8;
             else throw std::runtime_error("--prefill-arith expects windows|exact|flash|fast|fast2|fast8");
-            opt.prefill_chunk = pf_chunk;
-            opt.prefill_wave_min_tokens = pf_wave_min;
-            opt.prefill_slots = pf_slots;
+        }
+        opt.prefill_chunk = pf_chunk;
+        opt.prefill_wave_min_tokens = pf_wave_min;
+        opt.prefill_slots = pf_slots;
+        opt.prefill_inflight = pf_inflight;
+        opt.prefill_ramp = pf_ramp;
+        if (print_cfg) {
+            opt.multi_gemv = multi;
+            q::print_effective_config(opt, arith_name.c_str(), stdout);
+            return 0;
         }
         if (flash_pipe == "swz3") opt.flash_pipe = strix::cuda_core::FlashPipe::swz3;
         else if (flash_pipe == "pad2") opt.flash_pipe = strix::cuda_core::FlashPipe::pad2;
         else if (!flash_pipe.empty()) throw std::runtime_error("--flash-pipe expects pad2|swz3");
+        if (flash_tail == "off") opt.flash_tail = strix::cuda_core::FlashTail::off;
+        else if (flash_tail == "split") opt.flash_tail = strix::cuda_core::FlashTail::split;
+        else if (!flash_tail.empty()) throw std::runtime_error("--flash-tail expects split|off");
         if (pf_attn8 == "on") opt.prefill_attn8 = true;
         else if (pf_attn8 == "off") opt.prefill_attn8 = false;
         else if (!pf_attn8.empty()) throw std::runtime_error("--prefill-attn8 expects on|off");

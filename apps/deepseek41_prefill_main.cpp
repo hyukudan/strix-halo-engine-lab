@@ -9,6 +9,7 @@
 #include "strix/dist/communicator.hpp"
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/ds41_expert_tp.hpp"
+#include "deepseek41_prefill_resident.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -20,6 +21,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <span>
 #include <limits>
 #include <map>
 #include <sstream>
@@ -35,7 +37,7 @@
 //   strix-deepseek41-prefill MODEL.gguf --prompt FILE (comma-separated ids) [--rows N] [--layers L]
 //       [--world 1 | --rank R --transport usb4-auto | usb4-gpu | tcp-listen:PORT | tcp-connect:HOST:PORT | emulate]
 //       [--chunk C] [--window W] [--lanes N] [--moe-chunk R] [--no-tp] [--row-split | --no-row-split] [--stream-experts] [--timing] [--reference] [--repeat K] [--connect-timeout S] [--no-cone] [--warmup N] [--split-min-rows N] [--joint-max-rows N] [--state-timing] [--loads] [--loads-out CSV] [--stream-hashes-out FILE] [--draft-rows N --seed-out PREFIX]
-//       [--ttft-timing [--ttft-warmup R] [--ttft-decode G]]
+//       [--ttft-timing [--ttft-warmup R] [--ttft-decode G | --plan FILE --plan-out DIR [--plan-budget S]]]
 //       [--task-levels whole,layer,phase,finest [--task-rows N,...] [--task-units K | --task-budget MS] [--task-moe-chunk R] [--task-table]
 //        [--interleave G [--bg-rows N]] [--mem-guard-gib G]]
 // --embed-identity A:B (world 1): the identity gate of provided embedding rows, see embed_identity_gate.
@@ -50,7 +52,9 @@
 // of its steps after every step() of each task: its tokens must equal the alone run's. Prints the unit table (device ms
 // per unit, by kind and by layer) and the step() wall times.
 // --ttft-timing: one "ttft" line per stage from the process start to the first token (exec to main, prompt read, transport,
-// communicator, weights, barrier, each run's wall time on the host); --ttft-warmup R: one run of the prompt's first R rows
+// communicator, weights, barrier, each run's wall time on the host); --plan FILE: instead of the --repeat runs, the resident
+// runner's plan (arms = environment sets, ABAB, repeats, warm-ups; apps/deepseek41_prefill_resident.hpp) on the one load,
+// receipts and summary.json into --plan-out (same path on both ranks); --ttft-warmup R: one run of the prompt's first R rows
 // before the measured runs (the first run of a process pays one-time costs); --ttft-decode G: after the runs, the state
 // goes to a decode forward (export, prefill freed, decode weights, import) and G greedy steps from the prefill's next
 // token are timed one by one (the first step pays the decode forward's one-time costs).
@@ -76,6 +80,8 @@ struct Args {
                   split_min_rows = strix::deepseek41::PrefillOptions{}.split_min_rows,
                   joint_max_rows = strix::deepseek41::PrefillOptions{}.joint_max_rows;
     unsigned connect_timeout = 60;
+    std::string plan_path, plan_out;  // --plan FILE --plan-out DIR: the resident runner on the --ttft-timing load
+    double plan_budget = 0.0;         // --plan-budget S: stop before a slot that would end past S seconds (0: none)
     bool embed_identity = false;  // --embed-identity A:B
     std::uint32_t embed_a = 0, embed_b = 0;
     bool select_ab = false;  // --select-ab: run k with the exact dense selector off (k even) / on (k odd), one load
@@ -144,18 +150,7 @@ std::uint64_t fnv(const std::vector<float>& v) {
 }
 
 std::vector<std::uint32_t> read_prompt(const std::string& path, std::uint32_t rows) {
-    std::ifstream in(path);
-    if (!in) throw std::invalid_argument("cannot read " + path);
-    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    std::vector<std::uint32_t> ids;
-    std::stringstream ss(text);
-    for (std::string t; std::getline(ss, t, ',');)
-        if (!t.empty()) ids.push_back(static_cast<std::uint32_t>(std::stoul(t)));
-    if (rows != 0U) {
-        if (rows > ids.size()) throw std::invalid_argument("prompt shorter than --rows");
-        ids.resize(rows);
-    }
-    return ids;
+    return strix::deepseek41::resident::read_csv_prompt(path, rows);
 }
 
 // DAYAUDIT 7: one repetition's digests (logits, per-layer stream hashes when collected, next token)
@@ -318,6 +313,33 @@ strix::deepseek41::PrefillResult ttft_runs(const Args& a, strix::deepseek41::Dev
     write_receipts(a, pre, r, rank);
     check_repeats(repeats, comm == nullptr ? "prefill" : "rank " + std::to_string(rank));
     return r;
+}
+
+// --plan: the --ttft-timing warm-up, then the resident runner's plan on this load (instead of the --repeat runs).
+strix::deepseek41::PrefillResult plan_runs(const Args& a, strix::deepseek41::DevicePrefill& pre, const std::vector<std::uint32_t>& prompt,
+                                           strix::dist::Communicator* comm, std::uint32_t rank, bool print) {
+    if (a.ttft_warmup != 0U) {
+        if (comm != nullptr) barrier(*comm, 900U);
+        (void)pre.run(std::span<const std::uint32_t>(prompt).first(std::min<std::size_t>(a.ttft_warmup, prompt.size())));
+        ttft_clock.line("warm-up run");
+    }
+    strix::deepseek41::resident::Wiring w;
+    w.rank = rank;
+    w.world = comm != nullptr ? 2U : 1U;
+    w.prompt_max = a.rows;
+    w.capacity = prompt.size() + 1U;  // the prompt rows and the one next token (plan "steps":1)
+    w.print = print;
+    if (comm != nullptr) {
+        std::uint32_t round = 0;
+        w.exchange = [comm, round](const void* out, void* in, std::size_t n) mutable {
+            comm->exchange_host(std::span<const std::byte>(static_cast<const std::byte*>(out), n), std::span<std::byte>(static_cast<std::byte*>(in), n),
+                                strix::dist::Tag{static_cast<std::uint32_t>(strix::dist::TagKind::control), 0x52455321U, round++});
+        };
+        w.barrier = [comm](std::uint32_t r) { barrier(*comm, 1000U + (r % 1000000U)); };
+    }
+    (void)strix::deepseek41::resident::run_plan_file(pre, w, a.plan_path, a.plan_out, a.plan_budget);
+    ttft_clock.line("resident plan");
+    return {};
 }
 
 // --ttft-decode: the prefill's state into a decode forward (the prefill already freed), then G greedy steps, each timed.
@@ -763,6 +785,10 @@ int run_world1(const Args& a, const std::vector<std::uint32_t>& prompt) {
             ttft_clock.line("prefill weights load");
             std::printf("world 1: layers [0, %u), device weights %.2f GiB loaded in %.1f s\n", a.layers,
                         static_cast<double>(pre.weight_bytes()) / 1073741824.0, pre.load_seconds());
+            if (!a.plan_path.empty()) {
+                (void)plan_runs(a, pre, prompt, nullptr, 0U, true);
+                return 0;
+            }
             next = ttft_runs(a, pre, prompt, nullptr, true, a.loads_out).next_token;
             if (a.ttft_decode == 0U) return 0;
             state = pre.export_state();
@@ -860,6 +886,10 @@ void run_rank(const Args& a, const std::vector<std::uint32_t>& prompt, std::uint
                 std::printf("rank %u of 2 (%s): layers [0, %u), device weights %.2f GiB loaded in %.1f s\n", rank, comm.transport_name().c_str(),
                             a.layers, static_cast<double>(pre.weight_bytes()) / 1073741824.0, pre.load_seconds());
             if (const auto ov = pre.overlay_description(); print && !ov.empty()) std::printf("weights overlay: %s\n", ov.c_str());
+            if (!a.plan_path.empty()) {
+                (void)plan_runs(a, pre, prompt, &comm, rank, print);
+                return;
+            }
             r = ttft_runs(a, pre, prompt, &comm, print, rank == 0U ? a.loads_out : std::string{});
             if (a.ttft_decode != 0U) {
                 st = pre.export_state();
@@ -1082,6 +1112,9 @@ int main(int argc, char** argv) try {
         else if (s == "--task-table") a.task_table = true;
         else if (s == "--interleave") a.interleave = static_cast<std::uint32_t>(std::stoul(next()));
         else if (s == "--bg-rows") a.bg_rows = static_cast<std::uint32_t>(std::stoul(next()));
+        else if (s == "--plan") a.plan_path = next();
+        else if (s == "--plan-out") a.plan_out = next();
+        else if (s == "--plan-budget") a.plan_budget = std::stod(next());
         else if (s == "--ttft-warmup") a.ttft_warmup = static_cast<std::uint32_t>(std::stoul(next()));
         else if (s == "--ttft-decode") a.ttft_decode = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a.model.empty()) a.model = s;
@@ -1097,6 +1130,8 @@ int main(int argc, char** argv) try {
     const auto prompt = read_prompt(a.prompt_path, a.rows);
     ttft_clock.line("prompt read");
     if ((a.ttft_warmup != 0U || a.ttft_decode != 0U) && !a.ttft) throw std::invalid_argument("--ttft-warmup and --ttft-decode need --ttft-timing");
+    if (!a.plan_path.empty() && (!a.ttft || a.ttft_decode != 0U || a.plan_out.empty() || a.transport == "emulate"))
+        throw std::invalid_argument("--plan needs --ttft-timing and --plan-out, without --ttft-decode or the emulate transport");
     if (a.world == 1U) return run_world1(a, prompt);
     if (a.transport == "emulate") {  // both ranks in this process; rank 0 prints; --reference compares with world 1
         auto [t0, t1] = strix::dist::memory_pair();

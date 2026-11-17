@@ -16,7 +16,9 @@
 namespace strix::cuda_core {
 
 // Scratch (planes, expanded weights) of one stream context. nullptr in every call = the module default context (single stream).
-// Concurrent streams need one context each.
+// Concurrent streams need one context each; a context binds to its first device.
+// The implicit context is isolated by host thread/device. Drain its stream before release.
+[[nodiscard]] bool dense_big_fast8_supported();
 struct BigCtx;
 [[nodiscard]] BigCtx* dense_big_ctx_create();
 void dense_big_ctx_destroy(BigCtx* ctx);
