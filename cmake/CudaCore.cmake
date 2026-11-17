@@ -16,7 +16,8 @@ if(MSVC)
 endif()
 get_filename_component(_cc_root "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 # NVFP4 (TURBO weights) needs sm_120a PTX (cvt.e2m1x2): own object library, built for 120a only.
-add_library(strix_cuda_core_fp4 OBJECT ${_cc_root}/src/cuda_core/dense/nvfp4.cu)
+add_library(strix_cuda_core_fp4 OBJECT ${_cc_root}/src/cuda_core/dense/nvfp4.cu
+    ${_cc_root}/src/cuda/core/nvfp4_tile.cu)  # FAST4 W4A4 tile GEMM (shared CUDA core, sm_120 block-scaled e2m1)
 set_target_properties(strix_cuda_core_fp4 PROPERTIES CUDA_ARCHITECTURES "120a-real")
 target_include_directories(strix_cuda_core_fp4 PUBLIC ${_cc_root}/include)
 target_compile_options(strix_cuda_core_fp4 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
@@ -33,7 +34,8 @@ add_library(strix_cuda_core STATIC
     ${_cc_root}/src/cuda_core/attention/attention.cu
     ${_cc_root}/src/cuda_core/attention/attention_flash.cu
     ${_cc_root}/src/cuda_core/attention/attention_flash8.cu
-    ${_cc_root}/src/cuda_core/gdn/gdn.cu)
+    ${_cc_root}/src/cuda_core/gdn/gdn.cu
+    ${_cc_root}/src/cuda_core/gdn/gdn_chunk.cu)  # FAST chunked GDN prefill (gdn-chunk16-f32-v1)
 target_include_directories(strix_cuda_core PUBLIC ${_cc_root}/include)
 # Identity: no FMA contraction, IEEE division and sqrt, no flush-to-zero (as the existing Qwen CUDA build).
 target_compile_options(strix_cuda_core PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
