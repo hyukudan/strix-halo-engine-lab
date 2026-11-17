@@ -74,6 +74,10 @@ def stream(base, prompt, max_tokens, timeout):
     rtx = strix.get('rtx', {})
     return dict(t0=t0, t_first=first, t_end=t1, ttft=(first - t0) if first else None, wall=t1 - t0,
                 tokens=tokens, ids=ids, error=error,
+                done=done, finish_reason=finish, max_tokens=max_tokens,
+                observed_ids_count=len(ids) if isinstance(ids, list) else None,
+                metadata_provenance=dict(done='SSE [DONE] sentinel', finish_reason='SSE choices.finish_reason',
+                                         max_tokens='request.max_tokens', observed_ids_count='len(strix.token_ids)'),
                 live=rtx.get('live_slots'), cap=rtx.get('session_positions'),
                 prefill_ms=(strix or {}).get('prefill_ms'), decode_tps=(strix or {}).get('decode_tokens_per_second'))
 
