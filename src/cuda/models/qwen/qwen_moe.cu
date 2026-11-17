@@ -499,11 +499,11 @@ bool enqueue_routed(const Rows& v, std::uint32_t rows, const Weights& w, const a
         const unsigned tiles = csr_sizes(rows).max_tiles;
         // The storage type binds the compile-time typed decoder (bitwise the runtime-type values; see with_native_source).
         weight::with_native_source<OperandArch>(w.gate_type, [&]<class Source>() {
-            native_project_kernel<Source,MoeBinding><<<dim3(tiles, ffn / 32U), 1024, 0, s>>>(w.gate, w.up, w.gate_type, v);
+            native_project_kernel<Source,MoeBinding><<<dim3(tiles, ffn / kNativeProjectOutputs), kNativeThreads, 0, s>>>(w.gate, w.up, w.gate_type, v);
         });
         check(cudaGetLastError(), "MoE native gate/up");
         weight::with_native_source<OperandArch>(w.down_type, [&]<class Source>() {
-            native_down_kernel<Source,MoeBinding><<<dim3(tiles, hidden / 32U), 1024, 0, s>>>(w.down, w.down_type, v);
+            native_down_kernel<Source,MoeBinding><<<dim3(tiles, hidden / kNativeDownOutputs), kNativeThreads, 0, s>>>(w.down, w.down_type, v);
         });
         check(cudaGetLastError(), "MoE native down");
         return false;   // native experts: candidate MMA arithmetic did not run

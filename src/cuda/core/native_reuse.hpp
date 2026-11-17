@@ -76,6 +76,55 @@ STRIX_NATIVE_REUSE_HD float butterfly_root(const float (&v)[32]) {
     return a[0];
 }
 
+// Tree order: the lane-0 butterfly root is the balanced binary tree whose bottom level pairs lane positions l and l ^ 16,
+// the next l ^ 8, ... and the top l ^ 1, each pair with the lower position first. Visiting the positions in 5-bit
+// bit-reversed order m -> tree_position(m) = 0, 16, 8, 24, 4, ... and merging every completed pair of equal-level partials
+// (older first) reproduces exactly those additions with at most five live partials (TreeCounter). So one thread can own a
+// whole (assignment, output) item over the full K range, K staged one lane position at a time, with no shuffles.
+STRIX_NATIVE_REUSE_HD constexpr unsigned tree_position(unsigned m) {
+    return ((m & 1U) << 4) | ((m & 2U) << 2) | (m & 4U) | ((m & 8U) >> 2) | ((m & 16U) >> 4);
+}
+// Groups of lane position l, applied in ascending order g = l + 32 t (0: the lane's value is the literal +0).
+STRIX_NATIVE_REUSE_HD constexpr unsigned position_groups(LaneSeed seed, unsigned l, unsigned groups) {
+    return l >= groups ? 0U : (seed == LaneSeed::direct ? 1U : (groups - l + 31U) / 32U);
+}
+// The data stage after stage (m, t) of the tree-ordered K schedule (one 32-value group per stage, every group once):
+// returns false after the last; otherwise sets next_m / next_group.
+STRIX_NATIVE_REUSE_HD bool next_stage(LaneSeed seed, unsigned groups, unsigned m, unsigned t, unsigned& next_m, unsigned& next_group) {
+    const unsigned l = tree_position(m);
+    if (t + 1U < position_groups(seed, l, groups)) { next_m = m; next_group = l + 32U * (t + 1U); return true; }
+    for (unsigned n = m + 1U; n < 32U; ++n)
+        if (position_groups(seed, tree_position(n), groups) != 0U) { next_m = n; next_group = tree_position(n); return true; }
+    return false;
+}
+// Binary counter over N items: push(m, v) with m = 0..31 in order; after push(31, v), v holds the root of every item,
+// bitwise butterfly_root of the 32 lane values (host test). Levels 0..2 change every 1, 2, 4 pushes and use constant slot
+// indices (registers in a kernel); levels 3 and 4 are touched only at m = 7, 15, 23, 31, so a kernel instantiates Deep =
+// volatile float to keep them in thread-local memory (24 accesses per item set) instead of the register budget. The branches
+// depend only on m (warp-uniform).
+template <unsigned N, class Deep = float> struct TreeCounter {
+    float s[3][N];
+    Deep d[2][N];
+    STRIX_NATIVE_REUSE_HD static void fold(const float (&older)[N], float (&v)[N]) {
+        for (unsigned i = 0; i < N; ++i) v[i] = add_rn(older[i], v[i]);
+    }
+    STRIX_NATIVE_REUSE_HD static void keep(float (&slot)[N], const float (&v)[N]) {
+        for (unsigned i = 0; i < N; ++i) slot[i] = v[i];
+    }
+    STRIX_NATIVE_REUSE_HD void push(unsigned m, float (&v)[N]) {
+        if (!(m & 1U)) { keep(s[0], v); return; }
+        fold(s[0], v);
+        if (!(m & 2U)) { keep(s[1], v); return; }
+        fold(s[1], v);
+        if (!(m & 4U)) { keep(s[2], v); return; }
+        fold(s[2], v);
+        if (!(m & 8U)) { for (unsigned i = 0; i < N; ++i) d[0][i] = v[i]; return; }
+        for (unsigned i = 0; i < N; ++i) v[i] = add_rn(float(d[0][i]), v[i]);
+        if (!(m & 16U)) { for (unsigned i = 0; i < N; ++i) d[1][i] = v[i]; return; }
+        for (unsigned i = 0; i < N; ++i) v[i] = add_rn(float(d[1][i]), v[i]);
+    }
+};
+
 // Register transpose-fold of N items per lane (N a power of two). Level k (distance 16 >> k) halves the live items while
 // N >> k >= 2: a lane keeps the half selected by its lane bit and adds its partner's value of the same items (own value
 // first, as the butterfly). Once one item is live the remaining levels are plain butterfly levels. After five levels

@@ -245,6 +245,103 @@ static void test_seed() {
     check(bits(d) == 0x80000000U && bits(z) == 0U, "seeds differ only for a -0 leaf", 0, 0);
 }
 
+// Tree order (native_reuse tree_position / TreeCounter): the binary counter over the bit-reversed lane positions is the
+// lane-0 butterfly root bit for bit, also for signed zeros, infinities and NaN (register slots and Deep = volatile float).
+template <class Deep> static void test_tree_order(std::mt19937& rng, u32 trials) {
+    for (u32 trial = 0; trial < trials; ++trial) {
+        float v[32][4];
+        for (auto& lane : v) for (auto& x : lane) x = (trial & 1U) ? special(rng) : std::ldexp(float(int(rng() % 2001U) - 1000), int(rng() % 40U) - 20);
+        nr::TreeCounter<4, Deep> tree;
+        float leaf[4] = {};
+        for (u32 m = 0; m < 32U; ++m) {
+            for (u32 i = 0; i < 4U; ++i) leaf[i] = v[nr::tree_position(m)][i];
+            tree.push(m, leaf);
+        }
+        for (u32 i = 0; i < 4U; ++i) {
+            float column[32];
+            for (u32 l = 0; l < 32U; ++l) column[l] = v[l][i];
+            check(same(nr::butterfly_root(column), leaf[i]), "tree order", trial, i);
+        }
+    }
+    bool perm[32] = {};
+    for (u32 m = 0; m < 32U; ++m) perm[nr::tree_position(m)] = true;
+    check(std::all_of(perm, perm + 32, [](bool b) { return b; }), "tree_position is a permutation", 0, 0);
+}
+
+// Host replica of the per-tile kernels of src/cuda/core/moe_a8.cuh (native_project_kernel / native_down_kernel): the same
+// lane map (rows wr * 8 + rl + 4 i, outputs per output warp), the stage schedule walked with next_stage exactly as the
+// kernel's double buffer does, the leaf rule of each route and TreeCounter<4, volatile float>. Every (row, output) of the
+// tile must be written exactly once and equal the butterfly route (lane_value + butterfly_root) bit for bit.
+static void test_tile_mapping(nr::LaneSeed seed, u32 t, u32 count, bool specials, std::mt19937& rng) {
+    const bool project = seed == nr::LaneSeed::zero_seeded;
+    const u32 width = project ? 2560U : 640U, groups = width / 32U, outputs = project ? 32U : 64U;
+    const u32 mats = project ? 2U : 1U;
+    const auto wbytes = random_rows(t, outputs * mats, width, rng);
+    const auto rb = std::size_t(width) / qt::geometry(t).block_elements * qt::geometry(t).block_bytes;
+    std::vector<float> dec(std::size_t(outputs) * mats * width), x(std::size_t(count) * width);
+    for (u32 r = 0; r < outputs * mats; ++r)
+        for (u32 g = 0; g < groups; ++g) qt::decode_row_group(t, wbytes.data() + r * rb, g, &dec[std::size_t(r) * width + 32U * g]);
+    for (u32 a = 0; a < count; ++a)
+        for (u32 f = 0; f < width; ++f) {
+            float val = std::ldexp(float(int(rng() % 4001U) - 2000), int(rng() % 16U) - 12);
+            if (project) { u32 b; std::memcpy(&b, &val, 4); b &= 0xFFFF0000U; std::memcpy(&val, &b, 4); }  // BF16 values
+            if (specials && a == count - 1U && f % 97U == 0U) val = special(rng);  // signed zeros / inf / NaN on the last row
+            x[std::size_t(a) * width + f] = val;
+        }
+    auto wrow = [&](u32 mat, u32 o) { return &dec[(std::size_t(mat) * outputs + o) * width]; };
+    auto reference = [&](u32 a, u32 mat, u32 o) {
+        float v[32];
+        for (u32 l = 0; l < 32U; ++l)
+            v[l] = nr::lane_value(seed, l, groups, [&](u32 g) {
+                return nr::group_chain(wrow(mat, o) + 32U * g, [&](u32 j) { return x[std::size_t(a) * width + 32U * g + j]; });
+            });
+        return nr::butterfly_root(v);
+    };
+    std::vector<u32> written(std::size_t(count) * outputs * mats, 0U);
+    for (u32 warp = 0; warp < 32U; ++warp)
+        for (u32 lane = 0; lane < 32U; ++lane) {
+            const u32 r0 = (warp & 7U) * 8U + (lane & 3U);
+            if ((warp & 7U) * 8U >= count) continue;  // inactive warp: never stores
+            u32 rows[2] = {r0, r0 + 4U}, item_o[4], item_m[4], item_r[4];
+            for (u32 i = 0; i < 2U; ++i)
+                for (u32 k = 0; k < 2U; ++k) {
+                    const u32 it = 2U * i + k;
+                    item_r[it] = rows[i];
+                    item_o[it] = project ? (warp >> 3) * 8U + (lane >> 2) : (warp >> 3) * 16U + (lane >> 2) + 8U * k;
+                    item_m[it] = project ? k : 0U;
+                }
+            nr::TreeCounter<4, volatile float> tree;
+            float leaf[4];
+            u32 sm = 0, sg = 0, stages = 0;  // the stage the double buffer holds (stage 0 = group 0)
+            bool more = true;
+            for (u32 m = 0; m < 32U; ++m) {
+                const u32 l = nr::tree_position(m), nt = nr::position_groups(seed, l, groups);
+                for (float& f : leaf) f = 0.0F;
+                for (u32 tt = 0; tt < nt; ++tt) {
+                    check(more && sm == m && sg == l + 32U * tt, "stage schedule", t, m);
+                    for (u32 it = 0; it < 4U; ++it) {
+                        const u32 a = std::min(item_r[it], count - 1U);  // rows >= count compute on any data, never stored
+                        const float* w = wrow(item_m[it], item_o[it]) + 32U * sg;
+                        float acc = 0.0F;
+                        for (u32 j = 0; j < 32U; ++j) acc = nr::fma_rn(w[j], x[std::size_t(a) * width + 32U * sg + j], acc);
+                        leaf[it] = project ? nr::add_rn(leaf[it], acc) : acc;
+                    }
+                    more = nr::next_stage(seed, groups, m, tt, sm, sg);
+                    ++stages;
+                }
+                tree.push(m, leaf);
+            }
+            check(!more && stages == groups, "every group staged once", t, stages);
+            for (u32 it = 0; it < 4U; ++it) {
+                if (item_r[it] >= count) continue;
+                const std::size_t idx = (std::size_t(item_r[it]) * outputs + item_o[it]) * mats + item_m[it];
+                ++written[idx];
+                check(same(reference(item_r[it], item_m[it], item_o[it]), leaf[it]), project ? "project tile map" : "down tile map", t, u32(idx));
+            }
+        }
+    check(std::all_of(written.begin(), written.end(), [](u32 n) { return n == 1U; }), "tile map writes every item once", t, count);
+}
+
 static void print_budgets() {
     // Candidate decoded-tile mappings (planning numbers; sm_120 limits 99 KiB shared per block, 64 regs at 1024 threads).
     struct Row { const char* name; nr::TileBudget b; unsigned threads; };
@@ -271,6 +368,15 @@ int main() {
     test_seed();
     for (u32 t : {qt::t_iq4_nl, qt::t_q2_0}) test_down(t, rng);  // down types of the native packs (ffn 640)
     for (u32 t : {qt::t_iq3_xxs, qt::t_iq3_s, qt::t_iq2_s, qt::t_iq4_xs, qt::t_q2_0}) test_project(t, rng);
+    test_tree_order<float>(rng, 512); test_tree_order<volatile float>(rng, 512);
+    // Fixture shapes of the tile kernels: T = 1 and 9 (old capture records), a full tile, a tile whose last 8-row warp is
+    // partial (37), the single-row second tile of T = 65, and signed-zero / non-finite inputs.
+    for (u32 count : {1U, 9U, 37U, 64U}) {
+        for (u32 t : {qt::t_iq4_nl, qt::t_q2_0}) test_tile_mapping(nr::LaneSeed::direct, t, count, count == 37U, rng);
+        for (u32 t : {qt::t_iq3_xxs, qt::t_iq3_s, qt::t_iq2_s, qt::t_iq4_xs}) test_tile_mapping(nr::LaneSeed::zero_seeded, t, count, count == 37U, rng);
+    }
+    test_tile_mapping(nr::LaneSeed::direct, qt::t_iq4_nl, 1U, true, rng);
+    test_tile_mapping(nr::LaneSeed::zero_seeded, qt::t_iq3_s, 1U, true, rng);
     print_budgets();
     std::printf("native_reuse host test: %s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;
