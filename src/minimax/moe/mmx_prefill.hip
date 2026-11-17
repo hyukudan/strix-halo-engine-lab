@@ -570,11 +570,18 @@ __global__ __launch_bounds__(128) __attribute__((flatten)) void dense_pipe_fused
         }
         __syncthreads();
         for (unsigned r = wave; r < 16U; r += 4U) {
-            const unsigned row = first + 16U * static_cast<unsigned>(s) + r;
-            if (MT != 8 && row >= a.rows) break;  // wave-uniform: the rows above are padding (r ascends)
-            float v[4];
-            finish_block(drain, 1, 16, r, 128, 0, svh, lane, v);
-            dense_store_block(a, m, row, bx, lane, v);
+            if constexpr (MT == 8) {
+                // Keep the incumbent full-tile evaluation order: do not extend row's live range across finish_block.
+                float v[4];
+                finish_block(drain, 1, 16, r, 128, 0, svh, lane, v);
+                dense_store_block(a, m, first + 16U * static_cast<unsigned>(s) + r, bx, lane, v);
+            } else {
+                const unsigned row = first + 16U * static_cast<unsigned>(s) + r;
+                if (row >= a.rows) break;  // wave-uniform: padded rows (r ascends)
+                float v[4];
+                finish_block(drain, 1, 16, r, 128, 0, svh, lane, v);
+                dense_store_block(a, m, row, bx, lane, v);
+            }
         }
         __syncthreads();  // all rows read before the next slice overwrites LDS
     }
