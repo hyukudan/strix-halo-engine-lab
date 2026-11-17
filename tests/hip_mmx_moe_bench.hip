@@ -2712,12 +2712,12 @@ struct Bench {
         run_dense_v4({down}, v4Out[0], got, T, ws, bytes, 0);
         hip_ok(hipDeviceSynchronize(), "dense MLP sync");
         const auto actA = d2h(libOut[0], hidden), actB = d2h(v4Out[0], hidden);
-        const auto outA = d2h(ref, output), outB = d2h(got[0], output);
+        const auto mlpA = d2h(ref, output), mlpB = d2h(got[0], output);
         const auto finite = [](const std::vector<float>& x) {
             return std::all_of(x.begin(), x.end(), [](float v) { return std::isfinite(v); });
         };
-        const bool same = finite(actA) && finite(actB) && finite(outA) && finite(outB) &&
-                          same_bits(actA, actB) && same_bits(outA, outB);
+        const bool same = finite(actA) && finite(actB) && finite(mlpA) && finite(mlpB) &&
+                          same_bits(actA, actB) && same_bits(mlpA, mlpB);
         check(same, "dense_v4 composed SwiGLU/down differs or contains poison");
         std::printf("dense_v4 chain rank %u bits %u/%u/%u T%u: %s\n", o.rank, gu[0]->copies[0].dev.bits,
                     gu[1]->copies[0].dev.bits, down->copies[0].dev.bits, T, same ? "bitwise" : "DIFF");
