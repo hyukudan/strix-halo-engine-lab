@@ -941,7 +941,14 @@ struct FlashKeysAB {
             eng = nullptr;
         }
     }
-    ~FlashKeysAB() { restore(); }
+    // Unwinding restore never throws (a throw here would terminate and hide the original error); restore() still throws.
+    ~FlashKeysAB() {
+        try {
+            restore();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "--ab pfflashkeys: restoring the flash key schedule failed: %s\n", e.what());
+        }
+    }
     void begin() { if (eng != nullptr) before = eng->prefill_flash_launches(); }
     void finish(int arm, std::uint64_t state, std::uint64_t out) const {
         if (eng == nullptr) return;
