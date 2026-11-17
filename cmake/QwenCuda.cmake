@@ -16,7 +16,8 @@ add_library(strix_qwen_cuda STATIC
     src/cuda/models/qwen/qwen_plemtp.cu src/cuda/models/qwen/qwen_mtp_draft.cu src/cuda/models/qwen/qwen_transcode.cu src/cuda/tiered_experts.cu
     ${STRIX_CUDA_CORE_AMD_MATH_SOURCES} src/gguf_reader.cpp
     src/cuda/core/nvfp4_a8.cu src/cuda/core/nvfp4_a8_reference.cpp src/cuda/core/nvfp4_reference.cpp)
-target_include_directories(strix_qwen_cuda PUBLIC include src/cuda/models/qwen)
+# Public headers reach shared src/ headers (strix/onfly_i4.hpp -> core/iu4_rows_plan.hpp), as strix_core exports.
+target_include_directories(strix_qwen_cuda PUBLIC include src src/cuda/models/qwen)
 # Tiered expert residency: the host planner/resolver and the CPU routed-expert executor (bitwise = the card's A8 chains).
 # Only the library targets are needed; the Qwen-only build has no strix_target_warnings, so a no-op stands in for it.
 if(NOT COMMAND strix_target_warnings)
@@ -135,7 +136,7 @@ target_compile_options(qwen_qsa_mma_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fm
 
 # Prefix storage and compatibility planning are host-only; no CUDA initialization in their tests.
 add_library(strix_qwen_prefix STATIC src/prefix_state_cache.cpp src/cuda/models/qwen/qwen_prefix_identity.cpp)
-target_include_directories(strix_qwen_prefix PUBLIC include)
+target_include_directories(strix_qwen_prefix PUBLIC include src)
 target_link_libraries(strix_qwen_prefix PUBLIC strix_qwen_handoff)
 target_link_libraries(strix-cuda-qwen-serve PRIVATE strix_qwen_prefix)
 add_executable(qwen_prefix_cache_host_test tests/cuda/qwen_prefix_cache_host_test.cpp)
