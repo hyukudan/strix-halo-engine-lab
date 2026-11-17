@@ -274,9 +274,9 @@ template<unsigned T> void launch_gsq_down(const Rows& v,unsigned rows,const Weig
 }
 void validate_expert_arithmetic(const Weights& w,bool moe_mma) {
     if(w.arithmetic==ExpertArithmetic::incumbent) return;
-    if(w.arithmetic!=ExpertArithmetic::gsq_a8_dot4 || !gsq_types(w))
-        throw std::invalid_argument("gsq-iq3s-a8-dot4-cuda-v1: unsupported expert storage");
-    if(moe_mma) throw std::invalid_argument("gsq-iq3s-a8-dot4-cuda-v1: single-chain moe_mma composition unqualified");
+    const std::string name(::strix::qwen_packs::expert_arithmetic_name(w.arithmetic));
+    if(!gsq_types(w)) throw std::invalid_argument(name+": unsupported expert storage");
+    if(moe_mma) throw std::invalid_argument(name+": single-chain moe_mma composition unqualified");
 }
 // Generic expert kernels live once in the backend core.
 // merge / commit (hip_moe_experts_launcher.hip:2660-2708).
@@ -485,6 +485,30 @@ bool native_types(const Weights& w) {
     return !(a8_gate && a8_down);
 }
 
+// gsq-iq-bf16mma-cuda-v1 (FAST, explicit selection only): the GSQ storage type binds the tensor-core kernels at compile
+// time. Same CSR tiles, input rows, intermediates and rawdots as the native route; merge / commit are unchanged.
+template <unsigned G> void launch_mma_project(const Rows& v, const Weights& w, unsigned tiles, cudaStream_t s) {
+    native_mma_project_kernel<G, MoeBinding><<<dim3(tiles, ffn / kMmaProjectOutputs), kMmaThreads, 0, s>>>(w.gate, w.up, v);
+}
+template <unsigned D> void launch_mma_down(const Rows& v, const Weights& w, unsigned tiles, cudaStream_t s) {
+    native_mma_down_kernel<D, MoeBinding><<<dim3(tiles, hidden / kMmaDownOutputs), kMmaThreads, 0, s>>>(w.down, v);
+}
+void enqueue_mma_experts(const Rows& v, const Weights& w, unsigned tiles, cudaStream_t s) {
+    switch (w.gate_type) {
+    case 18: launch_mma_project<18>(v, w, tiles, s); break;
+    case 21: launch_mma_project<21>(v, w, tiles, s); break;
+    case 22: launch_mma_project<22>(v, w, tiles, s); break;
+    case 23: launch_mma_project<23>(v, w, tiles, s); break;
+    case 42: launch_mma_project<42>(v, w, tiles, s); break;
+    default: throw std::invalid_argument("gsq-iq-bf16mma-cuda-v1: gate storage");
+    }
+    check(cudaGetLastError(), "MoE tensor-core gate/up");
+    if (w.down_type == 20) launch_mma_down<20>(v, w, tiles, s);
+    else if (w.down_type == 42) launch_mma_down<42>(v, w, tiles, s);
+    else throw std::invalid_argument("gsq-iq-bf16mma-cuda-v1: down storage");
+    check(cudaGetLastError(), "MoE tensor-core down");
+}
+
 bool enqueue_routed(const Rows& v, std::uint32_t rows, const Weights& w, const amdmath::Tables& tables, cudaStream_t s,
                     bool moe_mma) {
     validate_expert_arithmetic(w,moe_mma);
@@ -497,13 +521,17 @@ bool enqueue_routed(const Rows& v, std::uint32_t rows, const Weights& w, const a
         if (quant::geometry(w.gate_type).block_elements == 0 || quant::geometry(w.down_type).block_elements == 0)
             throw std::invalid_argument("MoE expert type without a decoder");
         const unsigned tiles = csr_sizes(rows).max_tiles;
+        if (w.arithmetic == ExpertArithmetic::gsq_bf16_mma) {
+            enqueue_mma_experts(v, w, tiles, s);
+            return false;   // tensor-core GSQ experts: the moe_mma candidate form did not run
+        }
         // The storage type binds the compile-time typed decoder (bitwise the runtime-type values; see with_native_source).
         weight::with_native_source<OperandArch>(w.gate_type, [&]<class Source>() {
-            native_project_kernel<Source,MoeBinding><<<dim3(tiles, ffn / 32U), 1024, 0, s>>>(w.gate, w.up, w.gate_type, v);
+            native_project_kernel<Source,MoeBinding><<<dim3(tiles, ffn / kNativeProjectOutputs), kNativeThreads, 0, s>>>(w.gate, w.up, w.gate_type, v);
         });
         check(cudaGetLastError(), "MoE native gate/up");
         weight::with_native_source<OperandArch>(w.down_type, [&]<class Source>() {
-            native_down_kernel<Source,MoeBinding><<<dim3(tiles, hidden / 32U), 1024, 0, s>>>(w.down, w.down_type, v);
+            native_down_kernel<Source,MoeBinding><<<dim3(tiles, hidden / kNativeDownOutputs), kNativeThreads, 0, s>>>(w.down, w.down_type, v);
         });
         check(cudaGetLastError(), "MoE native down");
         return false;   // native experts: candidate MMA arithmetic did not run

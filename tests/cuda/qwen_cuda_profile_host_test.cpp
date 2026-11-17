@@ -502,6 +502,17 @@ int main() {
         check(qo::handoff_numerical_id_config("old",native.config)==qo::handoff_numerical_id("old",qo::choice_of(native.config)),"incumbent handoff bytes preserved");
         check(refuses({"--expert-arithmetic","unknown"}),"unknown expert arithmetic rejected");
         check(refuses({"--expert-arithmetic","gsq-iq3s-a8-dot4-cuda-v1","--moe-mma","on"}),"GSQ single-chain composition rejects explicitly");
+        {
+            const Args mma={"--expert-arithmetic","gsq-iq-bf16mma-cuda-v1"};
+            same_request("explicit GSQ BF16 MMA arithmetic",mma);
+            const auto bf=one(mma,qo::Entry::cli);
+            check(bf.config.expert_arithmetic==strix::qwen_packs::ExpertArithmetic::gsq_bf16_mma,"explicit BF16 MMA parsed");
+            check(bf.contract.find("gsq-iq-bf16mma-cuda-v1")!=std::string::npos,"BF16 MMA contract named");
+            check(qo::numerical_identity(bf.config).hash!=qo::numerical_identity(gsq.config).hash &&
+                  qo::numerical_identity(bf.config).hash!=qo::numerical_identity(native.config).hash,"BF16 MMA has its own numerical identity");
+            check(qo::handoff_numerical_id_config("old",bf.config)!=qo::handoff_numerical_id_config("old",gsq.config),"BF16 MMA handoff differs from A8");
+            check(refuses({"--expert-arithmetic","gsq-iq-bf16mma-cuda-v1","--moe-mma","on"}),"BF16 MMA single-chain composition rejects explicitly");
+        }
         profiles();
         overrides();
         common_options();
