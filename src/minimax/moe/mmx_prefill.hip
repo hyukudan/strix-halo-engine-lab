@@ -435,6 +435,7 @@ struct DenseArgs {
     const msa::RopeRow* image_rope[kMaxDenseJobs];
     unsigned n[kMaxDenseJobs], splits[kMaxDenseJobs];
     unsigned count, rows, k;
+    unsigned finish_row0;  // dense_finish_kernel's first row (rows below it were finished by dense_pipe_fused_kernel)
 };
 
 __global__ __launch_bounds__(256) void dense_transform_kernel(const float* x, DenseArgs a) {
@@ -462,18 +463,10 @@ __global__ __launch_bounds__(256) void dense_transform_kernel(const float* x, De
     }
 }
 
-__global__ __launch_bounds__(256) void dense_finish_kernel(DenseArgs a) {
-    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
-    unsigned q = blockIdx.x * 8U + wave, m = 0;
-    for (; m < a.count; ++m) {  // job m owns rows * n / 128 consecutive waves
-        const unsigned w = a.rows * (a.n[m] / 128U);
-        if (q < w) break;
-        q -= w;
-    }
-    if (m == a.count) return;
-    const unsigned nb = a.n[m] / 128U, row = q / nb, b = q % nb;
-    float v[4];
-    finish_block(a.part[m], a.splits[m], a.rows, row, a.n[m], b, a.svh[m], lane, v);
+// The stores of one finished 128-column block b of row `row` of job m (v: finish_block's lane + 32 j layout), shared by
+// dense_finish_kernel and the dense_pipe_fused_kernel epilogue.
+__device__ __forceinline__ void dense_store_block(const DenseArgs& a, unsigned m, unsigned row, unsigned b, unsigned lane,
+                                                  float (&v)[4]) {
     if (a.image[m] != nullptr) {  // wave-uniform: block b = one 128-dim head of the row
         // the flash prologue's layout (msa_norm_rope.hpp): lane l takes dims 4l..4l+3; dim d is on lane d & 31, slot
         // d >> 5 = l >> 3 (moves only, no arithmetic)
@@ -500,6 +493,74 @@ __global__ __launch_bounds__(256) void dense_finish_kernel(DenseArgs a) {
 #pragma unroll
     for (int j = 0; j < 4; ++j)
         a.out[m][static_cast<std::size_t>(row) * a.n[m] + b * 128U + lane + 32U * static_cast<unsigned>(j)] = v[j];
+}
+
+__global__ __launch_bounds__(256) void dense_finish_kernel(DenseArgs a) {
+    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
+    unsigned q = blockIdx.x * 8U + wave, m = 0;
+    for (; m < a.count; ++m) {  // job m owns (rows - finish_row0) * n / 128 consecutive waves
+        const unsigned w = (a.rows - a.finish_row0) * (a.n[m] / 128U);
+        if (q < w) break;
+        q -= w;
+    }
+    if (m == a.count) return;
+    const unsigned nb = a.n[m] / 128U, row = a.finish_row0 + q / nb, b = q % nb;
+    float v[4];
+    finish_block(a.part[m], a.splits[m], a.rows, row, a.n[m], b, a.svh[m], lane, v);
+    dense_store_block(a, m, row, b, lane, v);
+}
+
+// The dense MT8 class (full 128-row tiles, K split 1) with the output transform as the PIPE epilogue: the CTA's
+// 128 x 128 accumulator tile is one 128-column block bx of 128 rows, so each sixteen-row slice goes through LDS to
+// finish_block (+0.0F + the one partial, H128, svh: the same expressions on the same values as dense_finish_kernel)
+// and dense_store_block. No FP32 partials for these rows; dense_finish_kernel takes the rows from finish_row0.
+template <bool Simplify, bool Packed>
+__global__ __launch_bounds__(128) __attribute__((flatten)) void dense_pipe_fused_kernel(const pfk::Item* items, unsigned count,
+                                                                                         DenseArgs a) {
+    __shared__ float drain[16 * 128];  // 8 KiB, reused for every sixteen-row slice
+    unsigned lo = 0, hi = count;
+    while (hi - lo > 1) {
+        const unsigned mid = (lo + hi) / 2;
+        if (items[mid].cta_begin <= blockIdx.x) lo = mid;
+        else hi = mid;
+    }
+    const pfk::Item it = items[lo];
+    const unsigned local = blockIdx.x - it.cta_begin;
+    const unsigned bx = local % it.gx, by = local / it.gx;  // K split 1: gx * gy CTAs per item
+    unsigned m = 0;
+    while (m + 1U < a.count && a.part[m] != it.part) ++m;  // the item's job (its partial slot names it)
+    pfk::Accum<8> acc;  // one drain below for every bit width
+    auto keep = [&acc](const pfk::Item&, unsigned, const auto& acc0, const auto& acc1, unsigned, unsigned, int) {
+#pragma unroll
+        for (int s = 0; s < 8; ++s) acc.acc0[s] = acc0[s], acc.acc1[s] = acc1[s];
+    };
+    switch (it.bits) {
+        case 3: pfk::pipe_run<3, Simplify, Packed>(it, bx, by, keep); break;
+        case 4: pfk::pipe_run<4, Simplify, Packed>(it, bx, by, keep); break;
+        case 5: pfk::pipe_run<5, Simplify, Packed>(it, bx, by, keep); break;
+        case 6: pfk::pipe_run<6, Simplify, Packed>(it, bx, by, keep); break;
+        default: pfk::pipe_run<8, Simplify, Packed>(it, bx, by, keep); break;
+    }
+    const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x >> 5U;
+    const unsigned col = wave * 32U + (lane & 15U);
+    const unsigned first = it.row0 + by * 128U;
+    const std::uint16_t* const svh = a.svh[m] + bx * 128U;
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const unsigned r = 2U * static_cast<unsigned>(j) + (lane >> 4U);
+            drain[r * 128U + col] = acc.acc0[s][j];
+            drain[r * 128U + col + 16U] = acc.acc1[s][j];
+        }
+        __syncthreads();
+        for (unsigned r = wave; r < 16U; r += 4U) {
+            float v[4];
+            finish_block(drain, 1, 16, r, 128, 0, svh, lane, v);
+            dense_store_block(a, m, first + 16U * static_cast<unsigned>(s) + r, bx, lane, v);
+        }
+        __syncthreads();  // all rows read before the next slice overwrites LDS
+    }
 }
 
 void launched(const char* what) {
@@ -2204,9 +2265,18 @@ void enqueue_prefill_dense(const PrefillDenseJob* jobs, unsigned count, const fl
         throw std::invalid_argument("minimax prefill dense: null input or workspace too small");
     auto* ws = static_cast<unsigned char*>(workspace);
     constexpr unsigned kBandClass = 8;  // tall bands (STRIX_MMX_PREFILL_DENSE_BAND), beside the eight row-tile classes
+    constexpr unsigned kFusedClass = 9;  // the full 128-row tiles on dense_pipe_fused_kernel
     const unsigned band = prefill_dense_band();
-    std::vector<pfk::Item> lists[kBandClass + 1];
-    unsigned ctas[kBandClass + 1] = {};
+    const auto fit = route::mtfit(rows);  // the production v4 + mtfit item shapes
+    // The output transform runs as the PIPE epilogue of the full tiles when the MT8 class would run
+    // grouped_pipe_kernel<8, 4> (PIPE, no tall bands, no N16; launch_class's pair is false here) and every job has
+    // K split 1 (the invariant contract's S, and adaptive's at >= 1024 rows): one partial per output, so finish_block's
+    // order is the same in both kernels. Otherwise (and for the remainder rows) the partials and dense_finish_kernel.
+    g_pipe_n16_pair = false;
+    bool fuse = prefill_pipe() != 0 && band == 0 && !prefill_pipe_n16() && fit.main != 0;
+    for (unsigned m = 0; m < count; ++m) fuse = fuse && p.splits[m] == 1;
+    std::vector<pfk::Item> lists[kFusedClass + 1];
+    unsigned ctas[kFusedClass + 1] = {};
     for (unsigned m = 0; m < count; ++m) {
         const Exl3& w = jobs[m].w;
         pfk::Item it{};
@@ -2226,20 +2296,19 @@ void enqueue_prefill_dense(const PrefillDenseJob* jobs, unsigned count, const fl
             ctas[c] += it.gx * gy * it.splits;
             lists[c].push_back(it);
         };
-        const auto fit = route::mtfit(rows);  // the production v4 + mtfit item shapes
         const unsigned banded = band != 0 ? fit.main / band * band : 0U;  // 128-row tiles in full bands
         if (banded != 0) {
             it.gx = w.output / 32;
             emit(kBandClass, 0, banded / band);
             it.gx = w.output / 128;
         }
-        if (fit.main != banded) emit(7, banded * 128, fit.main - banded);
+        if (fit.main != banded) emit(fuse ? kFusedClass : 7U, banded * 128, fit.main - banded);
         if (fit.remainder != 0) emit(fit.tail_class, fit.main * 128, 1);
     }
     std::lock_guard<std::mutex> staging(g_dense_mutex);
     DenseSlot& slot = next_dense_slot();
-    unsigned at[kBandClass + 1] = {}, used = 0;
-    for (unsigned c = 0; c <= kBandClass; ++c) {
+    unsigned at[kFusedClass + 1] = {}, used = 0;
+    for (unsigned c = 0; c <= kFusedClass; ++c) {
         at[c] = used;
         for (const pfk::Item& it : lists[c]) slot.host[used++] = it;
     }
@@ -2251,6 +2320,7 @@ void enqueue_prefill_dense(const PrefillDenseJob* jobs, unsigned count, const fl
     a.count = count;
     a.rows = rows;
     a.k = p.k;
+    a.finish_row0 = fuse ? fit.main * 128U : 0U;
     unsigned waves = 0;
     for (unsigned m = 0; m < count; ++m) {
         a.suh[m] = jobs[m].w.suh;
@@ -2262,7 +2332,7 @@ void enqueue_prefill_dense(const PrefillDenseJob* jobs, unsigned count, const fl
         a.image_rope[m] = static_cast<const msa::RopeRow*>(jobs[m].image_rope);
         a.n[m] = jobs[m].w.output;
         a.splits[m] = p.splits[m];
-        waves += rows * (jobs[m].w.output / 128);
+        waves += (rows - a.finish_row0) * (jobs[m].w.output / 128);
     }
     hipLaunchKernelGGL(dense_transform_kernel, dim3((rows * (p.k / 128) + 7) / 8), dim3(256), 0, stream, x, a);
     launched("dense transform");
@@ -2271,11 +2341,23 @@ void enqueue_prefill_dense(const PrefillDenseJob* jobs, unsigned count, const fl
         if (band == 8) launch_band_class<8>(items_d + at[kBandClass], n, ctas[kBandClass], stream);
         else launch_band_class<4>(items_d + at[kBandClass], n, ctas[kBandClass], stream);
     }
+    if (!lists[kFusedClass].empty()) {  // launch_class's MT8 PIPE kernel choice (pair false, no tail items)
+        const auto n = static_cast<unsigned>(lists[kFusedClass].size());
+        const pfk::Item* const fused = items_d + at[kFusedClass];
+        if (prefill_pipe() == 2)
+            hipLaunchKernelGGL((dense_pipe_fused_kernel<true, false>), dim3(ctas[kFusedClass]), dim3(128), 0, stream, fused, n, a);
+        else if (prefill_p1_packed())
+            hipLaunchKernelGGL((dense_pipe_fused_kernel<false, true>), dim3(ctas[kFusedClass]), dim3(128), 0, stream, fused, n, a);
+        else
+            hipLaunchKernelGGL((dense_pipe_fused_kernel<false, false>), dim3(ctas[kFusedClass]), dim3(128), 0, stream, fused, n, a);
+    }
     for (unsigned c = 0; c < 8; ++c)
         if (!lists[c].empty()) launch_class(items_d + at[c], static_cast<unsigned>(lists[c].size()), ctas[c], c, stream);
     launched("dense v4");
-    hipLaunchKernelGGL(dense_finish_kernel, dim3((waves + 7) / 8), dim3(256), 0, stream, a);
-    launched("dense finish");
+    if (waves != 0) {
+        hipLaunchKernelGGL(dense_finish_kernel, dim3((waves + 7) / 8), dim3(256), 0, stream, a);
+        launched("dense finish");
+    }
 }
 
 void cleanup_prefill_dense() noexcept {

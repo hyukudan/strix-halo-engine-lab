@@ -402,8 +402,12 @@ static __device__ __forceinline__ Half16 pipe_load_a(const unsigned char* base, 
 // accumulators (half the live registers), each lane decodes 8 states (lanes 16-31: k 8..15, window 2 Bits later, as
 // item_pipe_pair) and permlanex16 joins the halves; A is loaded per tile (twice the A loads per output). Same 128 columns
 // per CTA, same fragments, K-ascending chain per output from +0, split ranges and partial stores: same bits.
-template <int Bits, int MT, int G, bool FullRows = true, bool Simplify = false, int Tiles = 2>
-static __device__ void item_pipe(const Item& it, unsigned bx, unsigned by, unsigned bz) {
+// item_pipe_run: the PIPE loop of CTA (bx, by, bz), then epi(it, bz, acc0, acc1, first_row, col0, lane) in place of a store,
+// so an adapter epilogue can finish whole 128-column blocks (item_pipe passes the partial store). Tiles 2, wave w,
+// lane l: acc0[m][j] is row first_row + 16 m + 2 j + (l >> 4) at column col0 = bx 128 + 32 w + (l & 15); acc1 is
+// col0 + 16.
+template <int Bits, int MT, int G, bool Simplify, int Tiles, class Epi>
+static __device__ void item_pipe_run(const Item& it, unsigned bx, unsigned by, unsigned bz, Epi epi) {
     static_assert(MT >= 1 && MT <= 8 && G == (MT < 4 ? MT : 4));
     static_assert(Tiles == 1 || Tiles == 2);
     constexpr int G1 = MT - G;  // bank 1 tiles
@@ -526,17 +530,32 @@ static __device__ void item_pipe(const Item& it, unsigned bx, unsigned by, unsig
         }
     }
     const unsigned col0 = static_cast<unsigned>((Tiles == 2 ? 2 * tile_pair : my_tile) * 16 + c);
+    epi(it, bz, acc0, acc1, first_row, col0, lane);
+}
+
+// item_pipe's epilogue: the FP32 partial store of split bz (stateless, so item_pipe keeps its former arguments).
+template <int MT, bool FullRows, int Tiles>
+struct PipePartialStore {
+    __device__ __forceinline__ void operator()(const Item& it, unsigned bz, const Float8 (&acc0)[MT],
+                                               const Float8 (&acc1)[Tiles == 2 ? MT : 1], unsigned first_row,
+                                               unsigned col0, int lane) const {
 #pragma unroll
-    for (int m = 0; m < MT; ++m) {
+        for (int m = 0; m < MT; ++m) {
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const unsigned row = first_row + static_cast<unsigned>(16 * m + 2 * j + (lane >> 4));
-            if (!FullRows && row >= it.rows) continue;
-            auto* dst = it.part + (static_cast<std::size_t>(bz) * it.rows + row) * it.output;
-            dst[col0] = acc0[m][j];
-            if constexpr (Tiles == 2) dst[col0 + 16U] = acc1[m][j];
+            for (int j = 0; j < 8; ++j) {
+                const unsigned row = first_row + static_cast<unsigned>(16 * m + 2 * j + (lane >> 4));
+                if (!FullRows && row >= it.rows) continue;
+                auto* dst = it.part + (static_cast<std::size_t>(bz) * it.rows + row) * it.output;
+                dst[col0] = acc0[m][j];
+                if constexpr (Tiles == 2) dst[col0 + 16U] = acc1[m][j];
+            }
         }
     }
+};
+
+template <int Bits, int MT, int G, bool FullRows = true, bool Simplify = false, int Tiles = 2>
+static __device__ __forceinline__ void item_pipe(const Item& it, unsigned bx, unsigned by, unsigned bz) {
+    item_pipe_run<Bits, MT, G, Simplify, Tiles>(it, bx, by, bz, PipePartialStore<MT, FullRows, Tiles>{});
 }
 
 // Tiles 1 runs on 256 threads: the scalar fallback (4 waves, no barrier) runs on threads 0..127, the rest return.

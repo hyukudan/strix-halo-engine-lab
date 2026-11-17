@@ -72,6 +72,12 @@ __device__ __forceinline__ void pipe_or_tail(const Item& it, unsigned bx, unsign
     return PipeCore<Packed, Tail>::template pipe_or_tail<Bits, MT, G, Simplify, Tiles>(it, bx, by, bz);
 }
 
+// grouped_pipe_kernel<8, 4>'s loop on one full 128-row tile, K split 1, with the caller's epilogue for the accumulators.
+template <int Bits, bool Simplify, bool Packed, class Epi>
+__device__ __forceinline__ void pipe_run(const Item& it, unsigned bx, unsigned by, Epi epi) {
+    PipeCore<Packed>::template item_pipe_run<Bits, 8, 4, Simplify, 2>(it, bx, by, 0, epi);
+}
+
 // Tail class MT (1..7) on the pipelined loop (STRIX_MMX_PREFILL_PIPE_TAIL); same partials as item_core_v3.
 template <int Bits, int MT, bool Simplify, bool Packed>
 __device__ __forceinline__ void pipe_tail(const Item& it, unsigned bx, unsigned by, unsigned bz) {
