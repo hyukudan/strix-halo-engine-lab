@@ -194,11 +194,11 @@ void profiles() {
           "fast: the bundle's two forms on, mtp_mma / moe_mma off");
     check(fast.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::gsq_bf16_mma && fast.config.defer_prompt_mtp,
           "fast: bf16mma experts and deferred prompt MTP");
-    check(fast.contract == "qwen-cuda;prefill=fast;forms=hc_mma,qsa_mma;moe_route_bf16=0+gsq-iq-bf16mma-cuda-v1", "fast contract: " + fast.contract);
+    check(fast.contract == "qwen-cuda;prefill=fast;forms=hc_mma,qsa_mma;moe_route_bf16=0;ids=qwen-cuda-hc-f16mma-v1,qwen-cuda-qsa-bf16mma-v2+gsq-iq-bf16mma-cuda-v1", "fast contract: " + fast.contract);
     for (const char* f : {"hc_mma", "qsa_mma", "expert_fast"}) check(status(fast, f) == "provisional", std::string("fast: ") + f + " provisional");
     check(status(fast, "mtp_defer_prompt") == "profile", "fast: exact deferral applied by the profile (qualified exact row): " + status(fast, "mtp_defer_prompt"));
     for (const char* f : {"mtp_mma", "moe_mma", "expert_turbo"}) check(status(fast, f) == "absent", std::string("fast: ") + f + " not selected");
-    check(cp::form_identities(fast.choice) == "qwen-cuda-hc-f16mma-v1,qwen-cuda-qsa-f16mma-v2", "fast identities: " + cp::form_identities(fast.choice));
+    check(cp::form_identities(fast.choice) == "qwen-cuda-hc-f16mma-v1,qwen-cuda-qsa-bf16mma-v2", "fast identities: " + cp::form_identities(fast.choice));
     fast_bundle();
     for (const char* f : {"moe_route_bf16", "qsa_budget", "gdn_fp16_chunk", "output_head"})
         check(status(fast, f) == "pending", std::string("fast: ") + f + " pending (listed, not used)");
@@ -216,19 +216,19 @@ void overrides() {
     auto r = one({"--profile", "fast", "--hc-mma", "off"}, qo::Entry::cli);
     check(!r.config.forms.hc_mma && !r.config.forms.mtp_mma && r.config.forms.qsa_mma && !r.config.forms.moe_mma, "--hc-mma off wins over the profile");
     check(status(r, "hc_mma") == "off", "hc_mma status off");
-    check(r.contract == "qwen-cuda;prefill=fast;forms=qsa_mma;moe_route_bf16=0+gsq-iq-bf16mma-cuda-v1", r.contract);
+    check(r.contract == "qwen-cuda;prefill=fast;forms=qsa_mma;moe_route_bf16=0;ids=qwen-cuda-qsa-bf16mma-v2+gsq-iq-bf16mma-cuda-v1", r.contract);
     // moe_mma: option and env of the table row, CLI beats env, off wins over the fast profile.
     same_request("fast-moe-off", {"--profile", "fast", "--moe-mma", "off"});
     r = one({"--profile", "fast", "--moe-mma", "off"}, qo::Entry::cli);
     check(!r.config.forms.moe_mma && r.config.forms.hc_mma && status(r, "moe_mma") == "off", "--moe-mma off wins over the profile");
-    check(r.contract == "qwen-cuda;prefill=fast;forms=hc_mma,qsa_mma;moe_route_bf16=0+gsq-iq-bf16mma-cuda-v1", r.contract);
+    check(r.contract == "qwen-cuda;prefill=fast;forms=hc_mma,qsa_mma;moe_route_bf16=0;ids=qwen-cuda-hc-f16mma-v1,qwen-cuda-qsa-bf16mma-v2+gsq-iq-bf16mma-cuda-v1", r.contract);
     Env moe_env{{"STRIX_QRTX_MOE_MMA", "0"}};
     same_request("fast-env-moe-off", {"--profile", "fast"}, moe_env);
     r = one({"--profile", "fast"}, qo::Entry::serve, moe_env);
     check(!r.config.forms.moe_mma && status(r, "moe_mma") == "off", "STRIX_QRTX_MOE_MMA=0 reaches only through the lookup");
     moe_env = {{"STRIX_QRTX_MOE_MMA", "1"}};
     r = one({}, qo::Entry::prefill_service, moe_env);
-    check(r.config.forms.moe_mma && !r.config.forms.hc_mma && status(r, "moe_mma") == "explicit-env" && r.contract == "qwen-cuda;prefill=fast;forms=moe_mma;moe_route_bf16=0",
+    check(r.config.forms.moe_mma && !r.config.forms.hc_mma && status(r, "moe_mma") == "explicit-env" && r.contract == "qwen-cuda;prefill=fast;forms=moe_mma;moe_route_bf16=0;ids=qwen-cuda-moe-i8fma-v1",
           "env turns the MoE form on in the default profile: " + r.contract);
     r = one({"--moe-mma", "off"}, qo::Entry::cli, moe_env);
     check(!r.config.forms.moe_mma, "CLI beats env (moe_mma)");
@@ -240,7 +240,7 @@ void overrides() {
     check(!r.config.forms.qsa_mma && status(r, "qsa_mma") == "off", "STRIX_QRTX_QSA_MMA=0 reaches only through the lookup");
     env = {{"STRIX_QRTX_MTP_MMA", "1"}};
     r = one({}, qo::Entry::prefill_service, env);
-    check(r.config.forms.mtp_mma && status(r, "mtp_mma") == "explicit-env" && r.contract == "qwen-cuda;prefill=fast;forms=mtp_mma;moe_route_bf16=0",
+    check(r.config.forms.mtp_mma && status(r, "mtp_mma") == "explicit-env" && r.contract == "qwen-cuda;prefill=fast;forms=mtp_mma;moe_route_bf16=0;ids=qwen-cuda-mtp-f16mma-v1",
           "env turns one form on in the default profile: " + r.contract);
     r = one({"--mtp-mma", "off"}, qo::Entry::cli, env);
     check(!r.config.forms.mtp_mma, "CLI beats env");
@@ -330,7 +330,7 @@ void identities() {
     std::uint64_t legacy = 14695981039346656037ULL;
     for (const char ch : std::string(base)) { legacy ^= static_cast<unsigned char>(ch); legacy *= 1099511628211ULL; }
     check(qo::handoff_numerical_id(base, {}) == legacy, "exact hand-off id keeps its historical value");
-    check(cp::form_identities({false, true, true, true}) == "qwen-cuda-hc-f16mma-v1,qwen-cuda-mtp-f16mma-v1,qwen-cuda-qsa-f16mma-v2", "form identities");
+    check(cp::form_identities({false, true, true, true}) == "qwen-cuda-hc-f16mma-v1,qwen-cuda-mtp-f16mma-v1,qwen-cuda-qsa-bf16mma-v2", "form identities");
     // Prefix-cache identity: forms enter only when on.
     const auto dir = fs::temp_directory_path() / "strix_qwen_cuda_profile_host_test";
     fs::create_directories(dir / "tables");
@@ -356,7 +356,7 @@ void identities() {
     fs::remove_all(dir);
     // Receipt.
     const auto receipt = cp::receipt({false, true, false, true}).json();
-    check(receipt.find("qwen-cuda;prefill=fast;forms=hc_mma,qsa_mma;moe_route_bf16=0") != std::string::npos, "receipt carries the contract: " + receipt);
+    check(receipt.find("qwen-cuda;prefill=fast;forms=hc_mma,qsa_mma;moe_route_bf16=0;ids=qwen-cuda-hc-f16mma-v1,qwen-cuda-qsa-bf16mma-v2") != std::string::npos, "receipt carries the contract: " + receipt);
 }
 
 void effective_config() {

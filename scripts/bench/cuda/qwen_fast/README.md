@@ -46,3 +46,13 @@ Exit codes of gate.sh: 0 pass, 1 fail, 2 identity or input error.
 
 This target-logit gate does not qualify MTP draft/cache fidelity or speculative acceptance. MTP forms remain
 provisional until a separate draft/cache check and a complete speculative-workload gate pass on native hardware.
+
+FAST bundle `qwen-cuda-fast-bundle-v1` (`--profile fast`: FAST experts `gsq-iq-bf16mma-cuda-v1`, `hc_mma`, `qsa_mma`
+`qwen-cuda-qsa-bf16mma-v2`, prompt MTP rows deferred) is opt-in and provisional (`kFastBundleQualified = false`).
+- Not bit-identical to the exact profile in decode: the FAST experts also run in the decode step and MTP verify windows,
+  so they change the logits of generated tokens. `hc_mma` and `qsa_mma` run on prefill blocks only; they reach decode
+  through the prompt's K/V and recurrent state.
+- Gate coverage so far: 2K and 8K prose (pooled and per member), 32K pooled (one 32K prompt is below the per-prompt
+  top-1 bound), and short code / structured prompts (pooled and per prompt). Long code and other languages are not gated.
+- The arithmetic contract of a FAST run with forms carries the forms' versioned identities (`;ids=...`).
+- `hc_mma` is refused at load, with a reason, for a model whose HC norm / inject weights break its FP16 range bound.

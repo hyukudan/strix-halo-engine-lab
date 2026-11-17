@@ -58,7 +58,7 @@ inline constexpr Lever table[] = {
     {.name = "qsa_mma", .env = "STRIX_QRTX_QSA_MMA", .option = "--qsa-mma",
      .value = {"", "1", ""}, .builtin = "0",
      .kind = Kind::bit_changing, .ready = {true, false, true}, .runnable = {false, true, false},
-     .target = "qwen-cuda-qsa-f16mma-v2", .off = "0",
+     .target = "qwen-cuda-qsa-bf16mma-v2", .off = "0",
      .source = "QSA prefill attention on the shared row-group core (core/attention_rowgroup.cuh: union of 4 rows' keys, BF16 "
                "tensor cores, FP32 accumulation); union byte-equal in its fixture; logit gate pending; changes logits",
      .provisional = {false, true, false}},
@@ -110,7 +110,7 @@ inline constexpr std::string_view kFastBundleMembers[] = {"expert_fast", "qsa_mm
 
 inline constexpr std::string_view kHcIdentity = "qwen-cuda-hc-f16mma-v1";
 inline constexpr std::string_view kMtpIdentity = "qwen-cuda-mtp-f16mma-v1";
-inline constexpr std::string_view kQsaIdentity = "qwen-cuda-qsa-f16mma-v2";
+inline constexpr std::string_view kQsaIdentity = "qwen-cuda-qsa-bf16mma-v2";
 inline constexpr std::string_view kMoeIdentity = "qwen-cuda-moe-i8fma-v1";
 
 // The runnable levers a resolution selects. Pending, off and builtin-off rows select nothing.
@@ -178,14 +178,7 @@ inline std::string forms_list(const Choice& c) {
         if (on) out += (out.empty() ? "" : ",") + std::string(name);
     return out;
 }
-// The CUDA arithmetic of the prefill, as a stable string (receipt, hand-off producer id, prefix identity).
-inline std::string arithmetic_contract(const Choice& c) {
-    if (!c.fast()) return "qwen-cuda;prefill=exact";
-    const auto forms = forms_list(c);
-    return "qwen-cuda;prefill=fast;forms=" + (forms.empty() ? std::string("none") : forms) +
-        ";moe_route_bf16=" + (c.moe_route_bf16 ? "1" : "0");
-}
-// Identities of the selected forms, e.g. "qwen-cuda-hc-f16mma-v1,qwen-cuda-qsa-f16mma-v2".
+// Identities of the selected forms, e.g. "qwen-cuda-hc-f16mma-v1,qwen-cuda-qsa-bf16mma-v2".
 inline std::string form_identities(const Choice& c) {
     std::string out;
     const auto add = [&](bool on, std::string_view id) { if (on) out += (out.empty() ? "" : ",") + std::string(id); };
@@ -193,6 +186,17 @@ inline std::string form_identities(const Choice& c) {
     add(c.mtp_mma, kMtpIdentity);
     add(c.qsa_mma, kQsaIdentity);
     add(c.moe_mma, kMoeIdentity);
+    return out;
+}
+// The CUDA arithmetic of the prefill, as a stable string (receipt, hand-off producer id, prefix identity). A FAST run with
+// forms carries the forms' versioned identities (";ids=..."), so two versions of one form never share a contract; the
+// exact contract keeps its bytes.
+inline std::string arithmetic_contract(const Choice& c) {
+    if (!c.fast()) return "qwen-cuda;prefill=exact";
+    const auto forms = forms_list(c);
+    std::string out = "qwen-cuda;prefill=fast;forms=" + (forms.empty() ? std::string("none") : forms) +
+        ";moe_route_bf16=" + (c.moe_route_bf16 ? "1" : "0");
+    if (!forms.empty()) out += ";ids=" + form_identities(c);
     return out;
 }
 inline ::strix::profile::ExecutionReceipt receipt(const Choice& c, std::string_view prefill_lineage = {}) {

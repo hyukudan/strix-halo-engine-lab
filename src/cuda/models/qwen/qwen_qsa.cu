@@ -1101,7 +1101,7 @@ bool fused_enabled() {
 }
 
 // ------------------------------------------------------------------------------------------------------------------
-// FAST form (Config::forms.qsa_mma, identity qwen-cuda-qsa-f16mma-v2): the whole attention of a prefill row (scores +
+// FAST form (Config::forms.qsa_mma, identity qwen-cuda-qsa-bf16mma-v2): the whole attention of a prefill row (scores +
 // softmax + weighted values + gate) on BF16 tensor cores through the shared row-group core (core/attention_rowgroup.cuh).
 // Four neighbouring rows walk the union of their selections (selected[] is ascending: blocks, then the tail, see
 // select_kernel_body), so each K/V row is gathered from L2 once per 4 rows instead of once per row; one warp per row with
