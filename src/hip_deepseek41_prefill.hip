@@ -3365,16 +3365,18 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             // (attn: the ffn site; ffn: layer + 1's attention unless an Engram inject or the ULP diagnostic comes between)
             const auto* nx = &s + 1;
             const bool attn = s.site == "attn";
-            // ffn: the MoE step's canonical sum read in place (its three terms over these rows), else y
-            const bool sum_in = !attn && pending_sum.layer == s.layer && pending_sum.o0 == o0 && pending_sum.rows == no;
-            if (!sum_in) settle_sum(true);
-            const float* sub = sum_in ? pending_sum.shared : m.y.p + std::size_t{o0} * H;
-            const float* sub_low = sum_in ? pending_sum.low : nullptr;
-            const float* sub_high = sum_in ? pending_sum.high : nullptr;
             const bool next_mix = hc_fuse && no > 0U && nx != m.plan.steps.data() + m.plan.steps.size() && nx->op == Op::hc_mix &&
                                   nx->site == (attn ? "ffn" : "attn") && nx->layer == s.layer + (attn ? 0 : 1) &&
                                   (attn || (layer + 1U < m.options.layers && lrows[layer + 1U].o0 == o0 &&
                                             m.options.null_ulp_layer != static_cast<int>(layer)));
+            // ffn: the MoE step's canonical sum read in place (its three terms over these rows) by the collapse site or the
+            // expansion alone (enqueue_hc_site takes the terms only there), else y stored
+            const bool sum_in = !attn && pending_sum.layer == s.layer && pending_sum.o0 == o0 && pending_sum.rows == no &&
+                                (!next_mix || (hc_collapse && lrows[layer + 1U].x0 == o0));
+            if (!sum_in) settle_sum(true);
+            const float* sub = sum_in ? pending_sum.shared : m.y.p + std::size_t{o0} * H;
+            const float* sub_low = sum_in ? pending_sum.low : nullptr;
+            const float* sub_high = sum_in ? pending_sum.high : nullptr;
             if (next_mix) {
                 // as enqueue_hc_expand + enqueue_hc_mixes (the next hc_mix is skipped)
                 ds41::HcSiteView v;

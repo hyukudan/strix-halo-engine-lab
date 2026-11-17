@@ -82,7 +82,11 @@ struct HcSub {
     }
     __device__ __forceinline__ explicit operator bool() const { return p != nullptr; }
 };
+// Only the collapse site and the separate expansion take the terms (enqueue_hc_site routes them there): the other site
+// kernels see constant null terms, so the branch folds away and their code stays the stored-sub form (a runtime branch
+// there raised hc_site_fast_kernel to 175 VGPRs).
 __host__ __device__ inline HcSub hc_sub(const HcSiteView& v) { return HcSub{v.sub, v.sub_low, v.sub_high}; }
+__host__ __device__ inline HcSub hc_sub_stored(const HcSiteView& v) { return HcSub{v.sub, nullptr, nullptr}; }
 
 // Copy k of element i of row r after the expansion of the previous sublayer (as hc_expand):
 // post[k] * sub[i] + sum_j comb[j][k] * residual[j][i], the sum from 0 in ascending j.
@@ -487,7 +491,7 @@ __device__ __forceinline__ void site_body(const HcSiteView& v, HcSub sub, const 
 }
 __global__ __launch_bounds__(32 * site_waves) void hc_site_kernel(HcSiteView v, unsigned mix_chunks, unsigned partial_blocks,
                                                                   unsigned norm_chunks) {
-    site_body(v, hc_sub(v), v.residual, v.expand_mixes, v.stream, v.fn, v.partial, v.counters, v.collapse_mixes, v.out, v.codes, v.deltas,
+    site_body(v, hc_sub_stored(v), v.residual, v.expand_mixes, v.stream, v.fn, v.partial, v.counters, v.collapse_mixes, v.out, v.codes, v.deltas,
               v.sums, mix_chunks, partial_blocks, norm_chunks);
 }
 
@@ -865,10 +869,10 @@ __global__ __launch_bounds__(site_threads) void hc_site_fast_kernel(HcSiteView v
     __shared__ float sq[32];
     __shared__ unsigned last;
     if (blockIdx.x < partial_blocks)
-        site_fast_partial<Expand, Mix, G>(v, hc_sub(v), v.residual, v.expand_mixes, v.stream, v.fn, v.partial, v.counters, mix_chunks, lds,
+        site_fast_partial<Expand, Mix, G>(v, hc_sub_stored(v), v.residual, v.expand_mixes, v.stream, v.fn, v.partial, v.counters, mix_chunks, lds,
                                           last);
     else
-        site_fast_norm<Expand>(v, hc_sub(v), v.residual, v.expand_mixes, v.stream, v.collapse_mixes, v.out, v.codes, v.deltas, v.sums,
+        site_fast_norm<Expand>(v, hc_sub_stored(v), v.residual, v.expand_mixes, v.stream, v.collapse_mixes, v.out, v.codes, v.deltas, v.sums,
                                blockIdx.x - partial_blocks, norm_chunks, norm_part, lds, sq);
 }
 // Expansion + mixes + the collapse with the expansion's pre (HcSiteView::collapse_out): partial blocks only.
@@ -2303,6 +2307,7 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
     const bool once = collapse_route.once;
     const bool one = v.launches == 1 ||
                      (v.launches == 0 && v.rows <= (fast ? hc_site_fast_one_launch_rows : hc_site_one_launch_rows));
+    require(!v.sub_low || v.collapse_out || !one, "hc site: the canonical-sum terms need the collapse site or the separate expansion");
     if (!one) {
         if (v.sub) enqueue_hc_expand(v.sub, v.residual, v.expand_mixes, v.rows, H, v.stream, stream, v.sub_low, v.sub_high);
         if (v.fn) {
