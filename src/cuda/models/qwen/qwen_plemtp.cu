@@ -3,6 +3,7 @@
 // __fdiv_rn/__fsqrt_rn) with the operand order of the gfx1151 ISA (disassembly of hip_ple_launcher);
 // rsqrtf/expf are the gfx1151 emulations of amd_math.cuh.
 #include "strix/cuda/qwen_plemtp.hpp"
+#include "../../core/mma_tile.cuh"
 #include "strix/env_flags.hpp"
 
 #include <cuda_fp16.h>
@@ -591,6 +592,41 @@ __global__ __launch_bounds__(256) void mtp_fused_projection_kernel(const float* 
     }
 }
 
+// 3b. FAST form (Config::forms.mtp_mma): the same projection on FP16 tensor cores (core/mma_tile.cuh), FP32 accumulation,
+// per-32-K Q4 scale epilogue. Streams: s = 0 is the embedding half (x[0:2560] against weight blocks 0..79), s = 1..4 the four
+// HC streams (x[2560 s : +2560] against weight blocks 80..159, the same weights). CTA 128 rows x 128 outputs; the embedding
+// accumulator stays in registers while the four HC streams run, the epilogue is the exact kernel's rounding chain.
+using MtpTile = strix::cuda::core::mma::Tile<8>;
+__global__ __launch_bounds__(256) void mtp_fused_projection_mma_kernel(const float* normalized, const std::uint8_t* eh_q4,
+    std::uint32_t rows, std::uint16_t* fused, MtpRounding rd) {
+    __shared__ MtpTile::Smem sm;
+    const unsigned n0 = blockIdx.x * 128U, m0 = blockIdx.y * 128U;
+    constexpr std::uint64_t ld = kHidden + kExpanded;
+    float emb[2][8][4], acc[2][8][4];
+    MtpTile::run(emb, sm, normalized, ld, m0, rows, eh_q4, kMtpEhRowQ4, n0, kHidden / 32);
+    for (unsigned s = 0; s < kHc; ++s) {
+        MtpTile::run(acc, sm, normalized + kHidden * (s + 1U), ld, m0, rows, eh_q4 + (kHidden / 32U) * 18U, kMtpEhRowQ4, n0, kHidden / 32);
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi)
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const unsigned r = m0 + MtpTile::row(mi, 2 * h);
+                    if (r >= rows) continue;
+                    unsigned packed = 0;
+#pragma unroll
+                    for (int c = 0; c < 2; ++c) {
+                        const float e = emb[mi][j][2 * h + c], a = acc[mi][j][2 * h + c];
+                        const float pe = rd.projection_bf16 ? bf16f(f2bf_quiet(e)) : e;
+                        const float pa = rd.projection_bf16 ? bf16f(f2bf_quiet(a)) : a;
+                        packed |= static_cast<unsigned>(f2bf_quiet(__fadd_rn(pe, pa))) << (16 * c);
+                    }
+                    *reinterpret_cast<unsigned*>(fused + static_cast<std::uint64_t>(r) * kExpanded + s * kHidden + n0 + MtpTile::col(j, 0)) = packed;
+                }
+    }
+}
+
 // 4. prepare_hyper_norm_kernel<bf16> (hip_hyper_mix_launcher.hip:662-688), grid (4 streams, rows).
 __global__ __launch_bounds__(256) void mtp_hyper_norm_kernel(const std::uint16_t* fused, const float* norm, float eps,
     float* out, am::Tables t) {
@@ -1030,6 +1066,18 @@ MtpWorkspaceViews mtp_workspace_views(void* workspace, std::uint32_t rows) {
         reinterpret_cast<float*>(b + l.value)};
 }
 
+void launch_mtp_fused_projection(const float* normalized, const void* eh_q4, std::uint32_t rows, std::uint16_t* fused,
+    const MtpRounding& rd, cudaStream_t stream) {
+    if (!rows) return;
+    if (rd.mma)
+        mtp_fused_projection_mma_kernel<<<dim3(kHidden / 128U, (rows + 127U) / 128U), 256, 0, stream>>>(normalized,
+            static_cast<const std::uint8_t*>(eh_q4), rows, fused, rd);
+    else
+        mtp_fused_projection_kernel<<<dim3(kHidden / 8U, (rows + kFuseRows - 1U) / kFuseRows), 256, 0, stream>>>(normalized,
+            static_cast<const std::uint8_t*>(eh_q4), rows, fused, rd);
+    check(cudaGetLastError(), "MTP fused projection launch");
+}
+
 void launch_mtp_cache_rows(const MtpWeights& w, const MtpRounding& rd, const std::uint16_t* hidden,
     const std::uint32_t* next_tokens, std::uint32_t rows, std::uint64_t position0, std::uint16_t* kv, std::uint16_t* raw_index,
     void* workspace, std::uint32_t* status, const amdmath::Tables& tables, cudaStream_t stream, const std::uint64_t* position_dev) {
@@ -1046,7 +1094,9 @@ void launch_mtp_cache_rows(const MtpWeights& w, const MtpRounding& rd, const std
     const bool v2_up = v2 && (reinterpret_cast<std::uintptr_t>(w.hc_up) & 15U) == 0U;
     if (v2) mtp_input_norms_v2_kernel<<<dim3(2, rows), 256, 0, stream>>>(v.embedding, hidden, w.enorm, w.hnorm, v.normalized, rd);
     else mtp_input_norms_kernel<<<dim3(2, rows), 256, 0, stream>>>(v.embedding, hidden, w.enorm, w.hnorm, v.normalized, rd);
-    if (v2 && rows == 1U) mtp_fused_projection_v2_kernel<1><<<dim3(kHidden / 8U, 1), 256, 0, stream>>>(v.normalized,
+    // FAST MTP rounding (rd.mma): the tensor-core projection at every row count, as before the decode-step forms.
+    if (rd.mma) launch_mtp_fused_projection(v.normalized, w.eh_q4, rows, v.fused, rd, stream);
+    else if (v2 && rows == 1U) mtp_fused_projection_v2_kernel<1><<<dim3(kHidden / 8U, 1), 256, 0, stream>>>(v.normalized,
         static_cast<const std::uint8_t*>(w.eh_q4), rows, v.fused, rd);
     else if (v2) mtp_fused_projection_v2_kernel<4><<<dim3(kHidden / 8U, (rows + 3U) / 4U), 256, 0, stream>>>(v.normalized,
         static_cast<const std::uint8_t*>(w.eh_q4), rows, v.fused, rd);

@@ -154,7 +154,8 @@ def checks(source, parent):
     check("candidate_receipt_only_when_enabled",
           "if (m.route_policy.enabled) {\n        const auto id = numerical_identity();" in driver)
     check("policy_frozen_before_device",
-          driver.index("m.cfg.moe_route_bf16 = m.route_policy.enabled") < driver.index('ck(cudaSetDevice'))
+          driver.index("m.cfg = qwen_options::resolve_route(config);")
+          < driver.index("m.route_policy = *m.cfg.route_policy;") < driver.index('strix::device::bind_cuda()'))
     check("all_target_calls_bind_storage",
           "mr.route_bf16 = route_policy.enabled;" in driver and
           "mr.rawdots = {moe_raw, qwen_route::row_bytes(route_policy.enabled)};" in driver)
