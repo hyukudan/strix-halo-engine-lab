@@ -747,12 +747,15 @@ private:
     // (non-MTP) decode only (MTP verify windows / the C1 decoder can leave the engine ahead of the emitted tokens and
     // hold deferred KDA rows), a normal finish, and pos == prompt + emitted - 1. A refused store is counted, never
     // an error; the existing prompt-end entry stays.
+    // An imported slot is refused too: its prompt rows carry the optional FAST import identity, while every entry
+    // here is keyed by the native prefix identity and is restored by native-route requests (an import-eligible
+    // request never looks up). Like the prompt-end store, which the import path never reaches.
     void store_reply(std::uint32_t slot, const char* why) {
         const Active& a = *active_[slot];
         const std::string w = why;
         if (w != "stop" && w != "length") return;  // cancelled / context / failed: not a committed reply
         const auto& prompt = request(a).prompt;
-        const bool exact = !a.mtp_ok && a.generated >= 2 && a.emitted.size() == a.generated &&
+        const bool exact = !a.mtp_ok && a.imported == 0 && a.generated >= 2 && a.emitted.size() == a.generated &&
                            a.pos == prompt.size() + a.emitted.size() - 1 && a.pos < cfg_.capacity;
         if (!exact) {
             if (a.generated >= 2) { std::lock_guard<std::mutex> l(m_); ++stats_.prefix_reply_skipped; }

@@ -984,6 +984,13 @@ int main(int argc, char** argv) {
                                        nullptr, 1, false, false, 0, true);
         CHECK(imported.lead_error.empty() && imported.follow_error.empty() && imported.driver_error.empty());
         CHECK(imported.stats.imports > 0 && imported.stats.prefix_hits == 0 && imported.stats.prefix_stores == 0);
+        // Nor may the opt-in reply-end store keep an imported slot under the native identity: a later native-route
+        // request (import_route false, e.g. while another import is in flight) would restore FAST import rows.
+        const auto reply = run_pair(2, 4, true, 16, 0, hello_for(4, 4096, 2), false, 7, 0, 0, false, false,
+                                    nullptr, 1, false, false, 0, true, false, 1ULL << 20, true);
+        CHECK(reply.lead_error.empty() && reply.follow_error.empty() && reply.driver_error.empty());
+        CHECK(reply.stats.imports > 0 && reply.stats.prefix_hits == 0 && reply.stats.prefix_stores == 0 &&
+              reply.stats.prefix_stores_reply == 0 && reply.stats.prefix_reply_skipped > 0);
     }
     // Missing peer key and a local restore exception must be observed on BOTH ranks before suffix collectives.
     for (const bool missing : {false, true}) {
