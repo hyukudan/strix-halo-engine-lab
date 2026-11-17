@@ -5,6 +5,7 @@
 #include "strix/hip_gdn_decode_fuse.hpp"
 #include "strix/hip_gdn_dims.hpp"
 #include "strix/gdn_recurrent_layout_diagnostic.hpp"
+#include "strix/gdn_recurrent_lds_index.hpp"
 #include "strix/hip_ggml_weight_formats.hpp"
 #ifdef STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC
 #include "strix/hip_gdn_lm_wave8_diagnostic.hpp"
@@ -1693,6 +1694,9 @@ void recurrent_step_kernel(
 // reads and writes it through memory every row). Row r runs exactly the operations of recurrent_step_kernel on the
 // qkv / beta / gate / core of row r (strides below), in the same order, so the bits equal `rows` separate launches;
 // the stored state of row r is the retained value the next row loads (a float round trip is exact).
+// The reduction buffer's physical index is the form F (gdn_recurrent_lds_index.hpp): column_major (default) is
+// conflict-free; lane_major is the original placement (STRIX_GDN_ROWS_LDS_LANE_MAJOR=1). Same elements, pairs, order.
+template <gdn_recurrent_lds::Form F>
 __global__ __launch_bounds__(kRecurrentThreads)
 void recurrent_rows_kernel(
     const float* qkv, const float* beta, const float* gate, float* state, float* core,
@@ -1708,7 +1712,7 @@ void recurrent_rows_kernel(
     const auto q_base = static_cast<std::uint64_t>(key_head) * head_dim;
     const auto k_base = static_cast<std::uint64_t>(key_heads) * head_dim + q_base;
     const auto v_base = static_cast<std::uint64_t>(key_heads) * head_dim * 2ULL + static_cast<std::uint64_t>(value_head) * head_dim;
-    __shared__ float reduction[kRecurrentThreads * kValueTile];
+    __shared__ float reduction[gdn_recurrent_lds::extent(F)];
     __shared__ float deltas[kValueTile];
     float retained[kValueTile];
 #pragma unroll
@@ -1723,43 +1727,43 @@ void recurrent_rows_kernel(
 #pragma unroll
         for (std::uint32_t column = 0; column < kValueTile; ++column) {
             retained[column] = retained[column] * decay;
-            reduction[static_cast<std::size_t>(lane) * kValueTile + column] = retained[column] * q[k_base + lane];
+            reduction[gdn_recurrent_lds::index(F, lane, column)] = retained[column] * q[k_base + lane];
         }
         __syncthreads();
         for (std::uint32_t stride = kRecurrentThreads / 2U; stride > 0; stride >>= 1U) {
             if (lane < stride) {
 #pragma unroll
                 for (std::uint32_t column = 0; column < kValueTile; ++column)
-                    reduction[static_cast<std::size_t>(lane) * kValueTile + column] +=
-                        reduction[static_cast<std::size_t>(lane + stride) * kValueTile + column];
+                    reduction[gdn_recurrent_lds::index(F, lane, column)] +=
+                        reduction[gdn_recurrent_lds::index(F, lane + stride, column)];
             }
             __syncthreads();
         }
         if (lane == 0) {
 #pragma unroll
             for (std::uint32_t column = 0; column < kValueTile; ++column)
-                deltas[column] = (q[v_base + value_base + column] - reduction[column]) * b[value_head];
+                deltas[column] = (q[v_base + value_base + column] - reduction[gdn_recurrent_lds::index(F, 0U, column)]) * b[value_head];
         }
         __syncthreads();
 #pragma unroll
         for (std::uint32_t column = 0; column < kValueTile; ++column) {
             retained[column] += q[k_base + lane] * deltas[column];
-            reduction[static_cast<std::size_t>(lane) * kValueTile + column] = retained[column] * q[q_base + lane];
+            reduction[gdn_recurrent_lds::index(F, lane, column)] = retained[column] * q[q_base + lane];
         }
         __syncthreads();
         for (std::uint32_t stride = kRecurrentThreads / 2U; stride > 0; stride >>= 1U) {
             if (lane < stride) {
 #pragma unroll
                 for (std::uint32_t column = 0; column < kValueTile; ++column)
-                    reduction[static_cast<std::size_t>(lane) * kValueTile + column] +=
-                        reduction[static_cast<std::size_t>(lane + stride) * kValueTile + column];
+                    reduction[gdn_recurrent_lds::index(F, lane, column)] +=
+                        reduction[gdn_recurrent_lds::index(F, lane + stride, column)];
             }
             __syncthreads();
         }
         if (lane == 0) {
 #pragma unroll
             for (std::uint32_t column = 0; column < kValueTile; ++column)
-                out[static_cast<std::uint64_t>(value_head) * head_dim + value_base + column] = reduction[column];
+                out[static_cast<std::uint64_t>(value_head) * head_dim + value_base + column] = reduction[gdn_recurrent_lds::index(F, 0U, column)];
         }
         __syncthreads();  // the next row rewrites reduction[] and deltas[]
     }
@@ -1859,14 +1863,14 @@ void recurrent_retained_window_kernel(GdnRecurrentWindowPointers<Rows> rows, flo
 // Only physical LDS addresses differ from the incumbent recurrence. Logical
 // columns, arithmetic expressions, barriers and separate delta lifetime remain.
 // These same instantiations serve explicit eager choices and diagnostic probes.
-template <gdn_recurrent_layout_diagnostic::Layout Layout>
+template <gdn_recurrent_layout_diagnostic::Layout L>
 __device__ __forceinline__ constexpr std::size_t recurrent_layout_index(
     std::uint32_t lane, std::uint32_t column) {
-    if constexpr (Layout == gdn_recurrent_layout_diagnostic::Layout::transposed)
-        return static_cast<std::size_t>(column) * kRecurrentThreads + lane;
-    else
-        return static_cast<std::size_t>(lane) *
-            (Layout == gdn_recurrent_layout_diagnostic::Layout::stride33 ? 33U : kValueTile) + column;
+    using gdn_recurrent_layout_diagnostic::Layout;
+    return gdn_recurrent_lds::index(L == Layout::transposed ? gdn_recurrent_lds::Form::column_major
+                                        : L == Layout::stride33 ? gdn_recurrent_lds::Form::lane_major_pad
+                                                                : gdn_recurrent_lds::Form::lane_major,
+        lane, column);
 }
 
 template <gdn_recurrent_layout_diagnostic::Layout Layout>
@@ -8147,6 +8151,11 @@ __global__ void normalize_qk_rows_kernel(float* qkv, std::uint32_t key_heads, st
     normalize_qk_body(qkv + static_cast<std::uint64_t>(blockIdx.y) * channels, key_heads, head_dim, epsilon,
                       static_cast<std::uint32_t*>(nullptr), blockIdx.x, scratch);
 }
+// Off switch of the conflict-free recurrence LDS form (bits are the same either way; for A/B timing and rollback).
+static bool gdn_rows_lds_lane_major() {
+    static const bool on = strix::envcfg::flag("STRIX_GDN_ROWS_LDS_LANE_MAJOR", false);
+    return on;
+}
 static bool gdn_dims_row_launch() {
     static const bool on = strix::envcfg::flag("STRIX_GDN_DIMS_ROW_LAUNCH", false);
     return on;
@@ -8182,7 +8191,9 @@ void hip_gdn_decode_step_dims(const HipGdnDimsStep& v, void* stream_ptr) {
         hipLaunchKernelGGL(normalize_qk_kernel, dim3(v.key_heads * 2U), dim3(d), 0, stream,
             qkv, v.key_heads, d, v.qk_epsilon, static_cast<std::uint32_t*>(nullptr));
     }
-    hipLaunchKernelGGL(recurrent_rows_kernel, dim3(v.value_heads * (d / kValueTile)), dim3(d), 0, stream,
+    const auto rows_kernel = gdn_rows_lds_lane_major() ? recurrent_rows_kernel<gdn_recurrent_lds::Form::lane_major>
+                                                       : recurrent_rows_kernel<gdn_recurrent_lds::Form::column_major>;
+    hipLaunchKernelGGL(rows_kernel, dim3(v.value_heads * (d / kValueTile)), dim3(d), 0, stream,
         v.qkv, v.beta, v.gate, v.matrix, v.core, v.key_heads, v.value_heads, d, v.rows,
         static_cast<std::uint64_t>(channels), static_cast<std::uint64_t>(v.value_heads) * d);
     if (window && v.norm_kind == HipGdnGatedNorm::swish)
