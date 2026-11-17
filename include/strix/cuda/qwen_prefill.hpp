@@ -172,7 +172,7 @@ struct GraphCounters {
 // Read once when the engine is built: an A/B needs two processes.
 inline constexpr ::strix::lever::Decl moe_real_rows_lever{
     .name = "qwen_cuda_moe_real_rows", .env = "STRIX_QRTX_MOE_REAL_ROWS", .exactness = ::strix::lever::Exactness::bitwise,
-    .default_on = false, .source = "wave4/next1112/RTXCORE3-RESULT.md: native window gate PASS; timing T8/9/12/16 pending"};
+    .default_on = false, .source = "native window and rollback bitwise gate qualified; production default awaits whole-workload qualification"};
 
 // Routed-MoE rows of a decode window: requested (Config::moe_real_rows) -> effective for this engine, with the reason.
 // One rule for the engine and the host tests. Organizational only: each row's routed chain does not depend on the other
