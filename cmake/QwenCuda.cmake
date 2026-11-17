@@ -58,8 +58,11 @@ add_test(NAME qwen_prefill_schedule COMMAND qwen_prefill_schedule_test)
 add_test(NAME qwen_handoff_codec COMMAND qwen_handoff_codec_test)
 add_executable(qwen_decode_e2e tests/cuda/qwen_decode_e2e.cu)
 target_link_libraries(qwen_decode_e2e PRIVATE strix_qwen_cuda strix_qwen_handoff)
-# Dense IMMA site tests and --bench-shape microbench (production qwen_dense.cu from strix_qwen_cuda; GPU index 0 only).
-add_executable(qwen_dense_tests tests/cuda/qwen_dense_tests.cu)
+# Dense IMMA site tests, --bench-shape / --bench-rows microbenches (GPU index 0 only). An instrumented copy of the
+# production qwen_dense.cu (dispatch counter) is compiled in with the library's options; the archive's dense object is not linked.
+add_executable(qwen_dense_tests tests/cuda/qwen_dense_tests.cu src/cuda/models/qwen/qwen_dense.cu)
+target_compile_definitions(qwen_dense_tests PRIVATE STRIX_QWEN_DENSE_TEST_DISPATCH)
+target_compile_options(qwen_dense_tests PRIVATE $<TARGET_PROPERTY:strix_qwen_cuda,COMPILE_OPTIONS>)
 target_link_libraries(qwen_dense_tests PRIVATE strix_qwen_cuda)
 add_test(NAME qwen_dense_host COMMAND qwen_dense_tests)
 add_executable(qwen_hc_workspace_host_test tests/cuda/qwen_hc_workspace_host_test.cpp)
@@ -71,12 +74,19 @@ if(Python3_Interpreter_FOUND AND STRIX_IDENT_BASH)
     add_test(NAME qwen_ident_host COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda/qwen_ident_host_test.py)
 endif()
 target_include_directories(qwen_dense_tests PRIVATE tests/cuda)
-target_compile_options(qwen_dense_tests PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+set_source_files_properties(tests/cuda/qwen_dense_tests.cu PROPERTIES COMPILE_OPTIONS "--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false")
 if(MSVC)
     target_compile_options(qwen_dense_tests PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
 add_executable(qwen_decode_bench tests/cuda/qwen_decode_bench.cu)
 target_link_libraries(qwen_decode_bench PRIVATE strix_qwen_cuda)
+foreach(arm IN ITEMS 0 1)
+    add_test(NAME qwen_dense_rows16_${arm} COMMAND ${CMAKE_COMMAND} -E env
+        STRIX_QRTX_DENSE_ROWS16=${arm} STRIX_CUDA_DECODE_ROWS_MAX=16 STRIX_QRTX_DECODE_KERNELS=1
+        STRIX_QRTX_ROWS_KSPLIT=1 STRIX_QRTX_ROWS_CP=0 STRIX_QRTX_KSO=4
+        $<TARGET_FILE:qwen_dense_tests> --rows16 ${arm})
+    set_tests_properties(qwen_dense_rows16_${arm} PROPERTIES LABELS gpu RUN_SERIAL TRUE)
+endforeach()
 add_executable(strix-cuda-qwen-serve apps/cuda_qwen_serve_main.cu)
 # Shared MTP window controllers (also linked by the HIP engine): measured-cost depth/rows policy and its host adapter.
 add_library(strix_mtp_depth STATIC src/mtp_window_controller.cpp src/mtp_depth_window_controller.cpp src/serve/row_budget.cpp

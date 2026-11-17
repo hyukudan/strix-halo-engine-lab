@@ -32,6 +32,10 @@
 #include <mutex>
 
 namespace strix::cuda::qwen_dense {
+#ifdef STRIX_QWEN_DENSE_TEST_DISPATCH
+// Defined by the test executable; absent from production builds.
+void test_dispatch(std::uint32_t rows, bool one_pass);
+#endif
 namespace {
 
 // STRIX_QRTX_DECODE_KERNELS=0: keep the tiled kernels at rows <= 8 too (reference seam for the decode-shaped ones).
@@ -149,6 +153,11 @@ using core::dense_a8::partial_capture_config;
 #endif
 bool rows_ksplit_enabled() {
     static const bool on = strix::envcfg::flag("STRIX_QRTX_ROWS_KSPLIT", true);
+    return on;
+}
+// 9..16-row windows: one k-split pass with 16 padded rows (default) or STRIX_QRTX_DENSE_ROWS16=0 = two <= 8-row pieces
+bool rows16_enabled() {
+    static const bool on = strix::envcfg::flag("STRIX_QRTX_DENSE_ROWS16", true);
     return on;
 }
 // Decode rows (rows <= 8) policy of main's streamed form (#680, rtxmax2 receipts; kernels in core/imma_dense.cuh
@@ -291,7 +300,23 @@ cudaError_t project_observed(cudaStream_t stream, const Site& site, std::uint32_
     };
     // 9..16 rows (core::decode_rows_max): <= 8-row decode pieces. A piece sees rows r0.. through offset codes / deltas /
     // outputs / gates; each (row, output) chain is row-local, so the bits are the tiled kernel's.
+    if (rows > core::kDecodePieceRows && rows <= core::decode_rows_max() && k.width <= 6144U && decode_rows_enabled() &&
+        rows_ksplit_enabled() && rows16_enabled()) {
+#ifdef STRIX_QWEN_DENSE_TEST_DISPATCH
+        test_dispatch(rows, true);
+#endif
+        switch (site.store) {   // one weight pass for 9..16 rows
+        case Store::f32: return core::dense_a8::launch_rows_ks<Store::f32, weight::Q8ImmaSource, DenseNumeric, Capture>(stream, k, rows, codes, deltas, pitch);
+        case Store::f32_round_bf16: return core::dense_a8::launch_rows_ks<Store::f32_round_bf16, weight::Q8ImmaSource, DenseNumeric, Capture>(stream, k, rows, codes, deltas, pitch);
+        case Store::bf16: return core::dense_a8::launch_rows_ks<Store::bf16, weight::Q8ImmaSource, DenseNumeric, Capture>(stream, k, rows, codes, deltas, pitch);
+        case Store::bf16_gated: return core::dense_a8::launch_rows_ks<Store::bf16_gated, weight::Q8ImmaSource, DenseNumeric, Capture>(stream, k, rows, codes, deltas, pitch);
+        }
+        return cudaErrorInvalidValue;
+    }
     if (rows > core::kDecodePieceRows && rows <= core::decode_rows_max() && k.width <= 6144U && decode_rows_enabled()) {
+#ifdef STRIX_QWEN_DENSE_TEST_DISPATCH
+        test_dispatch(rows, false);
+#endif
         const std::uint64_t elem = site.store == Store::f32 || site.store == Store::f32_round_bf16 ? 4U : 2U;
         for (std::uint32_t r0 = 0; r0 < rows; r0 += core::kDecodePieceRows) {
             KSite piece = k;

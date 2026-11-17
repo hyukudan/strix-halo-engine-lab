@@ -82,15 +82,18 @@ struct Stream {
     std::uint32_t depth_max = 0;  // per-request draft cap (0: the step's depth)
     ContextDraft* context = nullptr;  // borrowed; null = MTP drafts only
     std::uint32_t copy_rows = 0;      // per-request wide copy window rows (0: the step's; request field "copy_rows")
+    std::uint32_t window_rows = 0;    // per-request window budget (0: the step's; request field "window_rows"; the
+                                      // step takes the widest one of its streams, packing only)
 };
 
 inline std::uint32_t window_rows_default() {
     static const std::uint32_t rows = [] {
         const char* v = std::getenv("STRIX_QRTX_WINDOW_ROWS");
-        // default 8. STRIX_QRTX_WINDOW_ROWS=16 (with the backend's 9..16-row decode pieces) lets the marginal rule widen on
-        // the live acceptance; not default yet: process-level C4/C8 arms were noisier than the effect
-        // (edit C1, budget-independent, moved 10 %), an in-process per-request budget A/B is the pending receipt
-        const long n = v ? std::strtol(v, nullptr, 10) : static_cast<long>(kWindowRows);
+        // default 16 with the backend's 9..16-row decode forms (core::decode_rows_max() 16), else 8: above 8 rows the
+        // marginal rule (wide_measured) widens on the live acceptance; STRIX_QRTX_WINDOW_ROWS=8 keeps 8-row windows
+        // (request field "window_rows" per request)
+        const long def = strix::cuda::core::decode_rows_max() >= 16U ? 16L : static_cast<long>(kWindowRows);
+        const long n = v ? std::strtol(v, nullptr, 10) : def;
         return static_cast<std::uint32_t>(std::clamp<long>(n, 1, static_cast<long>(kMaxWindowRows)));
     }();
     return rows;
@@ -231,6 +234,11 @@ struct StepTiming {
 inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams, const StepOptions& opt, StepTiming* timing = nullptr) {
     using Clock = std::chrono::steady_clock;
     StepOptions o = opt;
+    {
+        std::uint32_t req = 0;
+        for (const auto& s : streams) req = std::max(req, s.window_rows);
+        if (req) o.budget = req;
+    }
     o.budget = std::clamp<std::uint32_t>(o.budget, 1U, kMaxWindowRows);
     if (o.max_positions == 0) o.max_positions = p.max_positions();
     const auto n = static_cast<std::uint32_t>(streams.size());
