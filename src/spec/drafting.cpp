@@ -278,6 +278,18 @@ Decision Arbiter::decide(const StepInput& input) {
         pick = current;
     if (pick == std::size_t(Source::model) && passes_ < model_barred_until_) pick = 0;
     Decision d = best[pick].d;
+    // Frontier probe: the winning per-depth drafter offers one depth more than its evidence covers, at a bounded rate
+    // (ArbiterConfig::frontier_every); otherwise a first-row miss on the first probe pins it at k = 1 (see the config).
+    if (d.source == Source::model && !black_box && config_.frontier_every > 0 && d.k < model_n &&
+        passes_ >= last_frontier_ + config_.frontier_every) {
+        const auto& next = model_[depth_class(d.k + 1)];
+        const auto k = d.k + 1;
+        const auto rows = physical(k + 1);
+        if (next.a + next.b < config_.frontier_evidence && rows != 0 && rows <= input.max_rows) {
+            d = Decision{Source::model, k, rows, rows > k + 1, expected(Source::model, 0, k), verify_ms(rows, ctx) + draft_ms(k), true};
+            last_frontier_ = passes_;
+        }
+    }
     // Exploration of the learned drafter at its deepest legal k: first measurements, then re-probes.
     const bool explore = model_passes_ < config_.min_model_passes || passes_ >= last_model_ + config_.probe_every;
     if (model_n > 0 && d.source != Source::model && explore && black_box) {

@@ -1,0 +1,10 @@
+{
+ "class": "thinking",
+ "thinking": true,
+ "messages": [
+  {
+   "role": "user",
+   "content": "A warehouse has three conveyor belts. Belt A moves 120 boxes per hour, belt B moves 30 % fewer boxes than A, and belt C moves as many as A and B together minus 50. If all three run for 7.5 hours with one 40-minute stop on belt B, how many boxes are moved? Explain your reasoning."
+  }
+ ]
+}

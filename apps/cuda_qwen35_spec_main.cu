@@ -71,7 +71,11 @@ int main(int argc, char** argv) {
         std::string model, synth, ids_arg, ids_file, sources = "copy,chain,hybrid", chain_hidden = "post", label = "run";
         std::uint32_t n_gen = 256, prompt_len = 64, layers_override = 0, max_pos = 0, max_block = 32, chain_k = 7;
         double oracle = -1.0;
-        std::uint32_t trace_n = 0;
+        std::uint32_t trace_n = 0, pairs = 1;
+        std::string ids_out;
+        // Arbiter frontier probe per spec run (ArbiterConfig::frontier_every; 0 = the previous form). --arms 0,8 runs both
+        // in one process, interleaved --pairs times (A B A B ...), on the same loaded engine.
+        std::vector<std::uint32_t> arms{sp::ArbiterConfig{}.frontier_every};
         bool cost_table = false, check = true, graphs = true, seed_costs = true, turbo_lm_head = true;
         q::TurboWeights turbo = q::TurboWeights::off;
         for (int i = 1; i < argc; ++i) {
@@ -99,6 +103,10 @@ int main(int argc, char** argv) {
             else if (a == "--chain-hidden") chain_hidden = next();
             else if (a == "--max-pos") max_pos = strix::core::parse_u32(next());
             else if (a == "--label") label = next();
+            else if (a == "--frontier") arms = {strix::core::parse_u32(next())};
+            else if (a == "--arms") { arms = parse_ids(next()); if (arms.empty()) throw std::runtime_error("--arms needs values"); }
+            else if (a == "--pairs") { pairs = strix::core::parse_u32(next()); if (pairs == 0) throw std::runtime_error("--pairs >= 1"); }
+            else if (a == "--ids-out") ids_out = next();
             else if (a == "--turbo-weights") {
                 const std::string v = next();
                 if (v != "off" && v != "native" && v != "onfly" && v != "converted") throw std::runtime_error("--turbo-weights expects off|native|onfly|converted");
@@ -117,20 +125,32 @@ int main(int argc, char** argv) {
         }
         if (model.empty() == synth.empty())
             throw std::runtime_error("usage: (--model F.gguf | --synthetic-full bf16|q8_0 [--layers N]) [--prompt-ids a,b | --prompt-file F | --prompt-len N] "
-                                     "[--n-gen N] [--sources copy,chain,hybrid|none] [--oracle ACC] [--cost-table] [--check 0|1] [--max-block 1..32]");
-        std::vector<std::uint32_t> prompt;
-        if (!ids_arg.empty()) prompt = parse_ids(ids_arg);
+                                     "[--n-gen N] [--sources copy,chain,hybrid|none] [--oracle ACC] [--cost-table] [--check 0|1] [--max-block 1..32] "
+                                     "[--frontier N | --arms N,M --pairs P] [--ids-out DIR]  (--prompt-file accepts F1,F2,...: one engine load)");
+        // (label, ids) per prompt; --prompt-file takes a comma list (label = file stem), each prompt runs serial + spec arms.
+        std::vector<std::pair<std::string, std::vector<std::uint32_t>>> prompts;
+        if (!ids_arg.empty()) prompts.emplace_back(label, parse_ids(ids_arg));
         if (!ids_file.empty()) {
-            std::ifstream f(ids_file);
-            std::stringstream ss;
-            ss << f.rdbuf();
-            prompt = parse_ids(ss.str());
+            std::stringstream list(ids_file);
+            for (std::string file; std::getline(list, file, ',');) {
+                if (file.empty()) continue;
+                std::ifstream f(file);
+                if (!f) throw std::runtime_error("cannot open prompt file " + file);
+                std::stringstream ss;
+                ss << f.rdbuf();
+                auto stem = file.substr(file.find_last_of("/\\") + 1);
+                stem = stem.substr(0, stem.find('.'));
+                prompts.emplace_back(ids_file.find(',') == std::string::npos && label != "run" ? label : stem, parse_ids(ss.str()));
+            }
         }
+        std::size_t longest = 0;
+        for (const auto& p : prompts) longest = std::max(longest, p.second.size());
+        std::vector<std::uint32_t> prompt = prompts.empty() ? std::vector<std::uint32_t>{} : prompts.front().second;
         q::EngineOptions opt;
         opt.use_graphs = graphs;
         opt.turbo_weights = turbo;
         opt.turbo_lm_head = turbo_lm_head;
-        opt.max_positions = std::max<std::uint32_t>(max_pos, std::uint32_t(std::max<std::size_t>(prompt.size(), prompt_len) + n_gen + 128 +
+        opt.max_positions = std::max<std::uint32_t>(max_pos, std::uint32_t(std::max<std::size_t>(longest, prompt_len) + n_gen + 128 +
                                                                           (cost_table ? 4096 : 0)));
         std::unique_ptr<q::CudaEngine> E;
         if (!model.empty()) E = q::CudaEngine::from_gguf(model, opt);
@@ -144,6 +164,7 @@ int main(int argc, char** argv) {
         if (prompt.empty()) {
             std::uint64_t s = 99;
             for (std::uint32_t i = 0; i < prompt_len; ++i) prompt.push_back(std::uint32_t(mix(s + i) % cfg.vocab));
+            prompts.assign(1, {label, prompt});
         }
         q::SpecEngine S(*E, chain_hidden == "pre");
         const auto hid = cfg.hidden;
@@ -222,116 +243,152 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        // ---- serial reference (greedy)
-        std::uint32_t anchor = 0;
-        std::vector<std::uint32_t> ref;
-        double serial_ms = 0;
-        if (check || oracle >= 0.0) {
-            prefill(anchor);
-            warm();
-            ref.push_back(anchor);
-            std::uint32_t cur = anchor;
-            const double t0 = now_ms();
-            while (ref.size() < n_gen) {
-                const auto o = E->forward_rows(&cur, 1, q::LogitRows::last);
-                E->commit(1);
-                E->read_top(o, 1, &cur);
-                ref.push_back(cur);
-            }
-            serial_ms = now_ms() - t0;
-            std::printf("serial: %u tokens in %.1f ms = %.2f tok/s (%.3f ms/token)\n", n_gen, serial_ms, 1000.0 * (n_gen - 1) / serial_ms,
-                        serial_ms / (n_gen - 1));
-        }
-
-        // ---- speculative run
-        prefill(anchor);
-        warm();
-        sp::BlockConfig bc;
-        bc.max_block = max_block;
-        bc.chain_max_k = chain_k;
-        bc.copy = sources.find("copy") != std::string::npos;
-        bc.chain = sources.find("chain") != std::string::npos;
-        bc.hybrid = sources.find("hybrid") != std::string::npos;
-        sp::ChainDrafter* mtp_chain = S.has_chain() ? &S.make_chain() : nullptr;
-        OracleChain oracle_chain(ref, oracle);
-        sp::ChainDrafter* chain = nullptr;
-        if (oracle >= 0.0) chain = &oracle_chain;
-        else chain = mtp_chain;
-        if (sources == "none") { bc.copy = bc.chain = bc.hybrid = false; }
-        sp::BlockDrafter drafter(bc, chain);
-        if (seed_costs) {  // engine's measured verify wall per window shape (commit full), 3 reps each
-            std::vector<std::uint32_t> t(32, anchor);
-            for (const std::uint32_t r : {1U, 2U, 4U, 8U, 16U, 32U}) {
-                double sum = 0;
-                for (int rep = 0; rep < 3; ++rep) {
-                    const double t0 = now_ms();
-                    E->forward_rows(t.data(), r, q::LogitRows::all);
-                    E->commit(0);
-                    E->sync();
-                    sum += now_ms() - t0;
+        const auto write_ids = [&](const std::string& name, const std::vector<std::uint32_t>& ids) {
+            std::ofstream f(ids_out + "/" + name);
+            for (std::size_t i = 0; i < ids.size(); ++i) f << (i ? "," : "") << ids[i];
+            if (!f) throw std::runtime_error("cannot write " + ids_out + "/" + name);
+        };
+        std::size_t bad_total = 0;
+        for (const auto& [prompt_label, prompt_ids] : prompts) {
+            prompt = prompt_ids;
+            label = prompt_label;
+            std::printf("prompt[%s]: %zu tokens, n-gen %u\n", label.c_str(), prompt.size(), n_gen);
+            // ---- serial reference (greedy)
+            std::uint32_t anchor = 0;
+            std::vector<std::uint32_t> ref;
+            double serial_ms = 0;
+            if (check || oracle >= 0.0) {
+                prefill(anchor);
+                warm();
+                ref.push_back(anchor);
+                std::uint32_t cur = anchor;
+                const double t0 = now_ms();
+                while (ref.size() < n_gen) {
+                    const auto o = E->forward_rows(&cur, 1, q::LogitRows::last);
+                    E->commit(1);
+                    E->read_top(o, 1, &cur);
+                    ref.push_back(cur);
                 }
-                drafter.seed_verify_ms(r, sum / 3);
+                serial_ms = now_ms() - t0;
+                std::printf("serial[%s]: %u tokens in %.1f ms = %.2f tok/s (%.3f ms/token)\n", label.c_str(), n_gen, serial_ms, 1000.0 * (n_gen - 1) / serial_ms,
+                            serial_ms / (n_gen - 1));
             }
-        }
-        drafter.commit(prompt);
-        std::vector<std::uint32_t> out{anchor};
-        drafter.commit(std::span<const std::uint32_t>(out.data(), 1));
-        sp::BlockSpeculator spec(drafter, S);
-        spec.start(anchor);
-        std::vector<double> tick_ms{0.0};  // wall at each step end (relative), tokens cumulative in cum
-        std::vector<std::uint32_t> cum{1};
-        std::vector<double> per_step;      // emitted per step
-        std::uint64_t by_source[3] = {0, 0, 0};
-        const double t0 = now_ms();
-        while (out.size() < n_gen) {
-            sp::StepParams p;
-            p.remaining = n_gen - std::uint32_t(out.size());
-            p.max_rows = 32;
-            p.context = E->committed();
-            const auto r = spec.step(out, p);
-            if (r.emitted == 0) break;
-            if (per_step.size() < trace_n) {
-                const auto& A = drafter.arbiter().last_arms();
-                const auto& Sc = drafter.arbiter().last_arm_scores();
-                std::printf("T%zu src%u rows%u prop%u acc%u em%u ver%.2f dr%.2f | ser %.4f cpy k%u e%.2f ms%.2f %.4f | mdl k%u e%.2f ms%.2f %.4f probe%d | cc1 %.2f cc2 %.2f\n",
-                            per_step.size(), unsigned(r.source), r.rows, r.proposed, r.accepted, r.emitted, r.verify_ms, r.draft_ms,
-                            Sc[0], A[1].k, A[1].expected_tokens, A[1].expected_ms, Sc[1], A[2].k, A[2].expected_tokens, A[2].expected_ms,
-                            Sc[2], int(A[2].probe), drafter.chain_cost_ms(1), drafter.chain_cost_ms(2));
-            }
-            ++by_source[std::size_t(r.source)];
-            per_step.push_back(double(r.emitted));
-            tick_ms.push_back(now_ms() - t0);
-            cum.push_back(std::uint32_t(out.size()));
-        }
-        const double wall = now_ms() - t0;
-        std::size_t bad = 0;
-        if (!ref.empty())
-            for (std::size_t i = 0; i < out.size() && i < ref.size(); ++i)
-                if (out[i] != ref[i]) { ++bad; if (bad == 1) std::fprintf(stderr, "MISMATCH at token %zu: spec %u serial %u\n", i, out[i], ref[i]); }
-        // best 1 s window over step ends
-        double best = 0;
-        for (std::size_t i = 0; i < tick_ms.size(); ++i) {
-            std::size_t j = i;
-            while (j + 1 < tick_ms.size() && tick_ms[j] - tick_ms[i] < 1000.0) ++j;
-            const double dt = tick_ms[j] - tick_ms[i];
-            if (dt >= 900.0) best = std::max(best, 1000.0 * double(cum[j] - cum[i]) / dt);
-        }
-        const double mean_e = per_step.empty() ? 0.0 : double(out.size() - 1) / double(per_step.size());
-        const auto& st = drafter.stats();
-        std::printf("spec[%s]: %zu tokens, %zu steps (serial %llu copy %llu chain %llu), E mean %.2f p50 %.0f p90 %.0f, avg %.2f tok/s (%.3f ms/step), "
-                    "best-1s %.2f tok/s, hybrid blocks %llu (ext %llu/%llu), mtp calls %llu rows %llu\n",
-                    label.c_str(), out.size(), per_step.size(), (unsigned long long)by_source[0], (unsigned long long)by_source[1],
-                    (unsigned long long)by_source[2], mean_e, quantile(per_step, 0.5), quantile(per_step, 0.9),
-                    1000.0 * double(out.size() - 1) / wall, wall / double(std::max<std::size_t>(per_step.size(), 1)), best,
-                    (unsigned long long)drafter.hybrid_blocks, (unsigned long long)drafter.hybrid_ext_accepted,
-                    (unsigned long long)drafter.hybrid_ext_proposed, (unsigned long long)S.chain_calls(), (unsigned long long)S.chain_rows());
-        std::printf("stats %s\n", st.json().c_str());
-        if (!ref.empty()) {
-            std::printf("EXACT: %s (%zu tokens compared, %zu mismatches)%s\n", bad == 0 ? "PASS" : "FAIL", std::min(out.size(), ref.size()), bad,
-                        serial_ms > 0 ? "" : "");
-            if (serial_ms > 0) std::printf("speedup vs serial: %.2fx\n", serial_ms / double(n_gen - 1) / (wall / double(out.size() - 1)));
-        }
-        return bad == 0 ? 0 : 2;
+
+            if (!ids_out.empty() && !ref.empty()) write_ids(label + ".serial.ids", ref);
+            for (std::uint32_t pair = 0; pair < pairs; ++pair)
+            for (const std::uint32_t frontier : arms) {
+                const std::string tag = arms.size() > 1 || pairs > 1 ? label + "/f" + std::to_string(frontier) + "/p" + std::to_string(pair) : label;
+                // ---- speculative run
+                prefill(anchor);
+                warm();
+                sp::BlockConfig bc;
+                bc.arbiter.frontier_every = frontier;
+                bc.max_block = max_block;
+                bc.chain_max_k = chain_k;
+                bc.copy = sources.find("copy") != std::string::npos;
+                bc.chain = sources.find("chain") != std::string::npos;
+                bc.hybrid = sources.find("hybrid") != std::string::npos;
+                sp::ChainDrafter* mtp_chain = S.has_chain() ? &S.make_chain() : nullptr;
+                OracleChain oracle_chain(ref, oracle);
+                sp::ChainDrafter* chain = nullptr;
+                if (oracle >= 0.0) chain = &oracle_chain;
+                else chain = mtp_chain;
+                if (sources == "none") { bc.copy = bc.chain = bc.hybrid = false; }
+                sp::BlockDrafter drafter(bc, chain);
+                if (seed_costs) {  // engine's measured verify wall per window shape (commit full), 3 reps each
+                    std::vector<std::uint32_t> t(32, anchor);
+                    for (const std::uint32_t r : {1U, 2U, 4U, 8U, 16U, 32U}) {
+                        double sum = 0;
+                        for (int rep = 0; rep < 3; ++rep) {
+                            const double t0 = now_ms();
+                            E->forward_rows(t.data(), r, q::LogitRows::all);
+                            E->commit(0);
+                            E->sync();
+                            sum += now_ms() - t0;
+                        }
+                        drafter.seed_verify_ms(r, sum / 3);
+                    }
+                }
+                drafter.commit(prompt);
+                std::vector<std::uint32_t> out{anchor};
+                drafter.commit(std::span<const std::uint32_t>(out.data(), 1));
+                sp::BlockSpeculator spec(drafter, S);
+                spec.start(anchor);
+                std::vector<double> tick_ms{0.0};  // wall at each step end (relative), tokens cumulative in cum
+                std::vector<std::uint32_t> cum{1};
+                std::vector<double> per_step;      // emitted per step
+                std::uint64_t by_source[3] = {0, 0, 0};
+                // Per step: verify_ms = verify + commit wall, draft_ms = chain wall (StepRecord); host = step wall - both (decide,
+                // lookup, bookkeeping, launch gaps between them). Model passes by drafted depth k.
+                double sum_verify = 0, sum_draft = 0;
+                std::vector<std::uint64_t> k_hist(33, 0);
+                const auto calls0 = S.chain_calls(), rows0 = S.chain_rows();
+                const double t0 = now_ms();
+                while (out.size() < n_gen) {
+                    sp::StepParams p;
+                    p.remaining = n_gen - std::uint32_t(out.size());
+                    p.max_rows = 32;
+                    p.context = E->committed();
+                    const auto r = spec.step(out, p);
+                    if (r.emitted == 0) break;
+                    if (per_step.size() < trace_n) {
+                        const auto& A = drafter.arbiter().last_arms();
+                        const auto& Sc = drafter.arbiter().last_arm_scores();
+                        std::printf("T%zu src%u rows%u prop%u acc%u em%u ver%.2f dr%.2f | ser %.4f cpy k%u e%.2f ms%.2f %.4f | mdl k%u e%.2f ms%.2f %.4f probe%d | cc1 %.2f cc2 %.2f\n",
+                                    per_step.size(), unsigned(r.source), r.rows, r.proposed, r.accepted, r.emitted, r.verify_ms, r.draft_ms,
+                                    Sc[0], A[1].k, A[1].expected_tokens, A[1].expected_ms, Sc[1], A[2].k, A[2].expected_tokens, A[2].expected_ms,
+                                    Sc[2], int(A[2].probe), drafter.chain_cost_ms(1), drafter.chain_cost_ms(2));
+                    }
+                    ++by_source[std::size_t(r.source)];
+                    sum_verify += r.verify_ms;
+                    sum_draft += r.draft_ms;
+                    if (r.source == sp::Source::model) ++k_hist[std::min<std::uint32_t>(r.proposed, 32)];
+                    per_step.push_back(double(r.emitted));
+                    tick_ms.push_back(now_ms() - t0);
+                    cum.push_back(std::uint32_t(out.size()));
+                }
+                const double wall = now_ms() - t0;
+                std::size_t bad = 0;
+                if (!ref.empty())
+                    for (std::size_t i = 0; i < out.size() && i < ref.size(); ++i)
+                        if (out[i] != ref[i]) { ++bad; if (bad == 1) std::fprintf(stderr, "MISMATCH at token %zu: spec %u serial %u\n", i, out[i], ref[i]); }
+                if (!ref.empty() && out.size() != ref.size()) ++bad;  // a short run is not a pass
+                // best 1 s window over step ends
+                double best = 0;
+                for (std::size_t i = 0; i < tick_ms.size(); ++i) {
+                    std::size_t j = i;
+                    while (j + 1 < tick_ms.size() && tick_ms[j] - tick_ms[i] < 1000.0) ++j;
+                    const double dt = tick_ms[j] - tick_ms[i];
+                    if (dt >= 900.0) best = std::max(best, 1000.0 * double(cum[j] - cum[i]) / dt);
+                }
+                const double mean_e = per_step.empty() ? 0.0 : double(out.size() - 1) / double(per_step.size());
+                const auto& st = drafter.stats();
+                std::printf("spec[%s]: %zu tokens, %zu steps (serial %llu copy %llu chain %llu), E mean %.2f p50 %.0f p90 %.0f, avg %.2f tok/s (%.3f ms/step), "
+                            "best-1s %.2f tok/s, hybrid blocks %llu (ext %llu/%llu), mtp calls %llu rows %llu\n",
+                            tag.c_str(), out.size(), per_step.size(), (unsigned long long)by_source[0], (unsigned long long)by_source[1],
+                            (unsigned long long)by_source[2], mean_e, quantile(per_step, 0.5), quantile(per_step, 0.9),
+                            1000.0 * double(out.size() - 1) / wall, wall / double(std::max<std::size_t>(per_step.size(), 1)), best,
+                            (unsigned long long)drafter.hybrid_blocks, (unsigned long long)drafter.hybrid_ext_accepted,
+                            (unsigned long long)drafter.hybrid_ext_proposed, (unsigned long long)(S.chain_calls() - calls0),
+                            (unsigned long long)(S.chain_rows() - rows0));
+                const double steps_n = double(std::max<std::size_t>(per_step.size(), 1));
+                std::string hist;
+                for (std::size_t k = 1; k < k_hist.size(); ++k)
+                    if (k_hist[k]) hist += " " + std::to_string(k) + ":" + std::to_string(k_hist[k]);
+                std::printf("step[%s]: frontier %u, per step verify %.3f ms, draft %.3f ms, host %.3f ms; model k histogram%s\n", tag.c_str(),
+                            frontier, sum_verify / steps_n, sum_draft / steps_n, (wall - sum_verify - sum_draft) / steps_n,
+                            hist.empty() ? " none" : hist.c_str());
+                std::printf("stats %s\n", st.json().c_str());
+                if (!ids_out.empty()) write_ids(tag.substr(0, tag.find('/')) + ".spec-f" + std::to_string(frontier) + "-p" + std::to_string(pair) + ".ids", out);
+                if (!ref.empty()) {
+                    std::printf("EXACT[%s]: %s (%zu tokens compared, %zu mismatches)\n", tag.c_str(), bad == 0 ? "PASS" : "FAIL",
+                                std::min(out.size(), ref.size()), bad);
+                    if (serial_ms > 0) std::printf("speedup vs serial: %.2fx\n", serial_ms / double(n_gen - 1) / (wall / double(out.size() - 1)));
+                }
+                bad_total += bad;
+            }  // arms x pairs
+        }  // prompts
+        return bad_total == 0 ? 0 : 2;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strix-cuda-qwen35-spec: %s\n", e.what());
         return 1;

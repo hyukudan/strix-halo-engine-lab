@@ -85,6 +85,13 @@ struct ArbiterConfig {
     double min_lookup_evidence = 4.0;   // observations a lookup bucket needs before lookup may run (fresh buckets:
                                         // depth 1; resumed copy buckets: one hazard per emitted position)
     std::uint32_t min_model_passes = 3; // the learned drafter runs this often before it is compared
+    // Frontier probe (per-depth learned drafter only): expected() credits nothing to a depth no proposal has reached, and a
+    // drafter that wins at k only learns depths <= k + 1 of what it offers, so after a first-row miss on the first probe it
+    // stayed at k = 1 for good (measured: 290 of 291 MTP passes at depth 1, E 1.76, where depth 2 was worth ~0.5 token).
+    // While the model arm wins at k and depth k + 1 has decayed evidence below frontier_evidence, it offers k + 1 once every
+    // frontier_every passes. 0 = off (the previous form). Drafts never change emitted tokens; this only prices depth.
+    std::uint32_t frontier_every = 8;
+    double frontier_evidence = 0.5;
     double cost_weight_cap = 8.0;       // verify-cost EWMA: a new wall weighs >= 1/(cap+1)
     double cost_aging = 0.995;          // per pass, every window's weight decays (stale windows re-learn fast)
     double lookup_overhead_ms = 0.0;    // extra cost of a lookup pass (the proposal itself is computed every step: sunk)
@@ -164,7 +171,7 @@ private:
     std::vector<Pending> pending_;  // unresolved lookup proposals, oldest first (at most max_proposal)
     std::array<Costs, context_bins> cost_{};
     Source last_ = Source::serial;
-    std::uint64_t passes_ = 0, last_model_ = 0, model_passes_ = 0, model_barred_until_ = 0;
+    std::uint64_t passes_ = 0, last_model_ = 0, model_passes_ = 0, model_barred_until_ = 0, last_frontier_ = 0;
     std::uint32_t model_misses_ = 0, lookup_misses_ = 0;
     bool last_black_box_ = false;  // the last model decision used the drafter's measured rate (no retreat for it)
     bool lookup_barred_ = false;

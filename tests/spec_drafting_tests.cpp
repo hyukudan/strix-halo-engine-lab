@@ -326,6 +326,81 @@ void ds_arbiter_tests() {
     const auto r16 = ds_copy_run(16, 6, 15);
     SP_CHECK(r16.last_k == 15 && r16.last_expected >= 15.0, "16-row copy window predicts %.2f tokens (k %u)", r16.last_expected, r16.last_k);
 }
+
+// Frontier probe (ArbiterConfig::frontier_every). Replays the measured prose shape of the CUDA dense 27B MTP chain
+// (q27 D2 receipts: verify ~13.2 ms + ~0.25 ms/row, 0.85 ms per chain step, conditional acceptance 0.759 at depth 1,
+// 0.667 at depth 2, then 0.6) with the first probe missing at row 1, as in the receipt that stayed at k = 1 for 290 passes.
+struct FrontierRun { std::uint32_t max_k_after_first = 0; double tokens = 0, ms = 0; std::uint64_t probes = 0, model = 0, k1 = 0; };
+
+FrontierRun frontier_run(std::uint32_t frontier_every, std::uint64_t seed) {
+    sp::ArbiterConfig config;
+    config.windows.clear();
+    for (std::uint32_t w = 1; w <= 32; ++w) config.windows.push_back(w);
+    config.frontier_every = frontier_every;
+    sp::Arbiter a(config);
+    const auto verify = [](std::uint32_t rows) { return 13.2 + 0.25 * double(rows - 1); };
+    for (const std::uint32_t r : {1U, 2U, 4U, 8U, 16U, 32U}) a.seed_cost(r, verify(r));
+    std::vector<double> draft;
+    for (std::uint32_t k = 1; k <= 7; ++k) draft.push_back(0.85 * double(k));
+    const double rate[8] = {0.759, 0.667, 0.6, 0.55, 0.5, 0.5, 0.5, 0.5};
+    Rng rng{seed};
+    FrontierRun run;
+    std::vector<std::uint32_t> emitted;
+    for (int pass = 0; pass < 600; ++pass) {
+        sp::StepInput in;
+        in.model_max_k = 7;
+        in.model_draft_ms = draft;
+        const auto d = a.decide(in);
+        SP_CHECK(d.rows >= d.k + 1 && d.k <= 7, "illegal decision rows %u k %u", d.rows, d.k);
+        std::uint32_t acc = 0;
+        if (d.source == sp::Source::model) {
+            if (pass > 0)  // pass 0: the first probe misses at row 1 (the receipt's start)
+                while (acc < d.k && double(rng.next(1000)) / 1000.0 < rate[acc]) ++acc;
+            if (pass > 0) {
+                run.max_k_after_first = std::max(run.max_k_after_first, d.k);
+                ++run.model;
+                run.k1 += d.k == 1;
+            }
+            run.probes += d.probe;
+        }
+        const double ms = verify(d.rows) + (d.source == sp::Source::model ? draft[d.k - 1] : 0.0);
+        emitted.assign(acc + 1, 1U);
+        a.observe({d.source, 0, d.k, acc, d.rows, verify(d.rows), d.source == sp::Source::model ? draft[d.k - 1] : 0.0}, emitted);
+        run.tokens += double(acc + 1);
+        run.ms += ms;
+    }
+    return run;
+}
+
+void frontier_tests() {
+    for (const std::uint64_t seed : {1ULL, 7ULL, 42ULL}) {
+        const auto old_form = frontier_run(0, seed);
+        const auto fixed = frontier_run(sp::ArbiterConfig{}.frontier_every, seed);
+        // The previous form stays at k = 1 (the receipt; only a rare retreat + deep re-probe can free it); the frontier
+        // probe learns deeper depths and leaves k = 1.
+        SP_CHECK(double(old_form.k1) >= 0.8 * double(old_form.model), "old form: k = 1 on %llu of %llu model passes",
+                 static_cast<unsigned long long>(old_form.k1), static_cast<unsigned long long>(old_form.model));
+        SP_CHECK(fixed.max_k_after_first >= 2 && double(fixed.k1) < 0.5 * double(fixed.model), "frontier: max k %u, k = 1 on %llu of %llu",
+                 fixed.max_k_after_first, static_cast<unsigned long long>(fixed.k1), static_cast<unsigned long long>(fixed.model));
+        const double old_rate = old_form.tokens / old_form.ms, new_rate = fixed.tokens / fixed.ms;
+        std::printf("frontier seed %llu: off %.2f tok/step %.1f tok/s | on %.2f tok/step %.1f tok/s (max k %u, probes %llu)\n",
+                    static_cast<unsigned long long>(seed), old_form.tokens / 600.0, 1000.0 * old_rate, fixed.tokens / 600.0,
+                    1000.0 * new_rate, fixed.max_k_after_first, static_cast<unsigned long long>(fixed.probes));
+        SP_CHECK(new_rate > 1.10 * old_rate, "frontier gain %.3f below +10 %%", new_rate / old_rate);
+    }
+    // Black-box drafters (model_pass_ms) are priced on their measured rate: no frontier probe changes their k.
+    sp::ArbiterConfig config;
+    sp::Arbiter a(config);
+    for (int pass = 0; pass < 64; ++pass) {
+        sp::StepInput in;
+        in.model_max_k = 7;
+        in.model_pass_tokens = 3.0;
+        in.model_pass_ms = 20.0;
+        const auto d = a.decide(in);
+        SP_CHECK(d.source != sp::Source::model || d.k == 7, "black-box k %u", d.k);
+        a.observe({d.source, 0, d.k, 1, d.rows, 20.0, 0.0}, std::vector<std::uint32_t>(2, 1U));
+    }
+}
 } // namespace
 
 int main() {
@@ -333,6 +408,7 @@ int main() {
     copy_tests();
     arbiter_tests();
     ds_arbiter_tests();
+    frontier_tests();
     std::printf("PASS strix-spec-drafting-tests\n");
     return 0;
 }

@@ -103,9 +103,11 @@ struct Run {
 
 // legal_rows / capacity: the caller binds StepParams::max_rows = min(backend rows, context room), as the engine apps do.
 Run run(const World& w, std::uint32_t n_tokens, double accuracy, bool copy, bool chain, bool hybrid, bool seed_costs,
-        std::uint32_t legal_rows = 32, std::uint32_t capacity = ~0U) {
+        std::uint32_t legal_rows = 32, std::uint32_t capacity = ~0U,
+        std::uint32_t frontier_every = sp::ArbiterConfig{}.frontier_every) {
     sp::BlockConfig cfg;
     cfg.copy = copy; cfg.chain = chain; cfg.hybrid = hybrid;
+    cfg.arbiter.frontier_every = frontier_every;
     cfg.clock_ms = [] { return g_clock; };
     FakeChain fc(w, accuracy);
     sp::BlockDrafter drafter(cfg, chain || hybrid ? &fc : nullptr);
@@ -230,6 +232,20 @@ int main() {
         g_clock = 0.0;
         const auto r = run(w, n, 0.66, true, true, true, true);
         BD_CHECK(double(r.serial_steps) < 0.15 * double(r.steps), "66 %% chain: %llu of %llu passes serial", (unsigned long long)r.serial_steps, (unsigned long long)r.steps);
+    }
+    {  // frontier probe on/off (ArbiterConfig::frontier_every): emitted ids equal the serial truth in both forms, every
+       // prefix commit stays legal; the probe changes only how deep the chain drafts (verify cost and clock, never tokens)
+        const auto w = make_world("prose", 700, n, 11);
+        for (const std::uint32_t every : {0U, 8U, 1U}) {
+            g_clock = 0.0;
+            g_chain_step = 0.65;  // CUDA dense ratio: 0.85 ms chain step per ~13.2 ms verify, on this 10 ms fake
+            const auto r = run(w, n, 0.76, false, true, false, true, 32, ~0U, every);
+            g_chain_step = 1.5;
+            BD_CHECK(r.out.size() == n, "frontier %u: %zu tokens", every, r.out.size());
+            for (std::uint32_t i = 0; i < n; ++i)
+                BD_CHECK(r.out[i] == w.response[i], "frontier %u: token %u differs from serial", every, i);
+            std::printf("frontier %u: %llu steps for %u tokens, %.1f virtual ms\n", every, (unsigned long long)r.steps, n, g_clock);
+        }
     }
     std::printf("block drafter tests ok: %d cases, copy blocks %llu, chain blocks %llu, hybrid blocks %llu; edit %.2f vs serial %.2f ms/token\n",
                 cases, (unsigned long long)copies, (unsigned long long)chains, (unsigned long long)hybrids, tok_ms_all_loop, tok_ms_serial);

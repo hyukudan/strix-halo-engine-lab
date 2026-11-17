@@ -1,0 +1,10 @@
+{
+ "class": "prose",
+ "thinking": false,
+ "messages": [
+  {
+   "role": "user",
+   "content": "Write a long short story in English about a lighthouse keeper on a remote northern island who finds a sealed letter washed ashore after a winter storm. Describe the island, the weather, the keeper's daily routine and memories, and how the letter changes his life. Write at least 900 words."
+  }
+ ]
+}
