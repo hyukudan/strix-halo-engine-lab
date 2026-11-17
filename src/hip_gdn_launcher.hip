@@ -6,6 +6,7 @@
 #include "strix/hip_gdn_dims.hpp"
 #include "strix/gdn_recurrent_layout_diagnostic.hpp"
 #include "strix/gdn_recurrent_lds_index.hpp"
+#include "strix/gdn_recurrence_rows.hpp"
 #include "strix/hip_ggml_weight_formats.hpp"
 #ifdef STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC
 #include "strix/hip_gdn_lm_wave8_diagnostic.hpp"
@@ -5887,12 +5888,15 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
     }
     // qpf2k recurrence: QColsG lanes per column group, QColsC columns per group, QColsW waves per block (4 lanes x 32
     // keys, 2 columns per lane, 4 waves = 64 columns per block, 96 blocks; SGPR decay/beta).
-    constexpr unsigned QColsG = 4U, QColsC = 2U, QColsW = 4U, QColsChunk = 8U, QColsOpt = 2U;
+    using QColsDefault = qpf2k_gdn::ColsDefault;
+    constexpr unsigned QColsG = QColsDefault::G, QColsC = QColsDefault::C, QColsW = QColsDefault::W, QColsChunk = QColsDefault::Chunk,
+                       QColsOpt = QColsDefault::Opt;
     using QCols = qpf2k_gdn::ColsShape<QColsG, QColsC, QColsW>;
     if ((qpf2k & 1U) && count % QColsChunk == 0U) {
         const auto cols = [&]<GdnRecurrentStorage S>() {
             hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_qpf2k_cols_kernel<S, QColsG, QColsC, QColsW, QColsChunk, QColsOpt>),
-                dim3(first.value_heads * (128U / QCols::columns)), dim3(QColsW * 32U), 0, stream, strided, count, matrix, first.key_heads,
+                dim3(first.value_heads * (128U / QCols::columns)), dim3(QColsW * 32U), 0, stream,
+                gdn_recurrence::uniform(strided.qkv, strided.beta, strided.gate, strided.core, strided.stride), count, matrix, first.key_heads,
                 static_cast<const unsigned*>(nullptr));   // Nan 3 (pinned): the flag is not read
         };
         if (config.recurrent_storage == GdnRecurrentStorage::value_key) cols.template operator()<GdnRecurrentStorage::value_key>();
@@ -8156,6 +8160,11 @@ static bool gdn_rows_lds_lane_major() {
     static const bool on = strix::envcfg::flag("STRIX_GDN_ROWS_LDS_LANE_MAJOR", false);
     return on;
 }
+// Off switch of the shared chunked recurrence core in the window path (bits are the same either way: A/B timing, rollback).
+static bool gdn_dims_cols() {
+    static const bool on = strix::envcfg::flag("STRIX_GDN_DIMS_COLS", true);
+    return on;
+}
 static bool gdn_dims_row_launch() {
     static const bool on = strix::envcfg::flag("STRIX_GDN_DIMS_ROW_LAUNCH", false);
     return on;
@@ -8193,9 +8202,22 @@ void hip_gdn_decode_step_dims(const HipGdnDimsStep& v, void* stream_ptr) {
     }
     const auto rows_kernel = gdn_rows_lds_lane_major() ? recurrent_rows_kernel<gdn_recurrent_lds::Form::lane_major>
                                                        : recurrent_rows_kernel<gdn_recurrent_lds::Form::column_major>;
-    hipLaunchKernelGGL(rows_kernel, dim3(v.value_heads * (d / kValueTile)), dim3(d), 0, stream,
-        v.qkv, v.beta, v.gate, v.matrix, v.core, v.key_heads, v.value_heads, d, v.rows,
-        static_cast<std::uint64_t>(channels), static_cast<std::uint64_t>(v.value_heads) * d);
+    // The shared chunked core (qpf2k_gdn::gdn_qpf2k_cols_kernel: no barrier inside a row, in-lane + DPP tree; 0.79 us per
+    // row-layer on the 48 x 128 x 128 shape vs ~8.7 us for rows_kernel) runs the first multiple of its chunk; rows_kernel
+    // continues from the state it stored. Same operations, operand pairs and order as rows_kernel: the same bits
+    // (include/strix/gdn_recurrence_rows.hpp). STRIX_GDN_DIMS_COLS=0: rows_kernel for every row.
+    using QCols = qpf2k_gdn::ColsDefault;
+    const auto part = gdn_recurrence::split(window && gdn_dims_cols() ? v.rows : 0U, QCols::Chunk);
+    const gdn_recurrence::Rows all{v.qkv, v.beta, v.gate, v.core, channels, v.value_heads, static_cast<std::uint64_t>(v.value_heads) * d};
+    if (part.bulk)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_qpf2k_cols_kernel<GdnRecurrentStorage::key_value, QCols::G, QCols::C, QCols::W,
+                               QCols::Chunk, QCols::Opt>),
+            dim3(v.value_heads * (d / qpf2k_gdn::ColsShape<QCols::G, QCols::C, QCols::W>::columns)), dim3(QCols::W * 32U), 0, stream,
+            all, part.bulk, v.matrix, v.key_heads, static_cast<const unsigned*>(nullptr));   // Nan 3 (pinned): the flag is not read
+    if (const auto tail = gdn_recurrence::advance(all, part.bulk); part.bulk < v.rows)
+        hipLaunchKernelGGL(rows_kernel, dim3(v.value_heads * (d / kValueTile)), dim3(d), 0, stream,
+            tail.qkv, tail.beta, tail.gate, v.matrix, tail.core, v.key_heads, v.value_heads, d, v.rows - part.bulk,
+            static_cast<std::uint64_t>(channels), static_cast<std::uint64_t>(v.value_heads) * d);
     if (window && v.norm_kind == HipGdnGatedNorm::swish)
         hipLaunchKernelGGL(gated_rms_norm_swish_kernel, dim3(v.value_heads, v.rows), dim3(d), 0, stream,
             v.core, v.z, v.norm, kind, v.value_heads, d, v.rms_epsilon);
