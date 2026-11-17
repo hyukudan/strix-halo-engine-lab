@@ -170,6 +170,20 @@ void weights_toggle() {
     }), "pending weights remain inspectable as a pure export proposal");
     require(throws([&] { p::apply(pending, [](const char*, const char*) { return true; }); }),
             "apply refuses an unhonoured weight request");
+    namespace pq = strix::qwen::profile;
+    // Element axis: the CUDA caps name the NVFP4 image; the INT4 identities above stay byte-identical.
+    w = t::resolve_weights(true, {std::string("onfly"), {}, {}}, env0, pq::kCudaWeightCaps);
+    require(w.honoured() && w.identity() == "onfly-nvfp4-rtn-g16", "CUDA onfly identity names the nvfp element");
+    w = t::resolve_weights(true, {std::string("onfly"), std::string("3"), {}}, env0, pq::kCudaWeightCaps);
+    require(!w.honoured() && w.reason.find("incompatible: 3-bit") != std::string::npos, "CUDA onfly is 4-bit only");
+    w = t::resolve_weights(true, {std::string("converted"), {}, std::string("/packs/x")}, env0, pq::kCudaWeightCaps);
+    require(!w.honoured() && w.reason.find("owner") != std::string::npos, "CUDA converted stays pending (owner's OK)");
+    pq::Inputs cuda_inputs;
+    cuda_inputs.weights.source = "onfly";
+    cuda_inputs.caps = &pq::kCudaWeightCaps;
+    const auto cuda = pq::resolve(pq::Name::turbo, cuda_inputs, {});
+    require(cuda.weights.identity() == "onfly-nvfp4-rtn-g16" && cuda.cache_namespace() != onfly.cache_namespace(),
+            "nvfp4 and int4 images never share a cache namespace");
 }
 
 void cache_keys() {

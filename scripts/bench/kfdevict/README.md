@@ -14,3 +14,20 @@ unprivileged user can read.
 
 Reading: an eviction is harmless outside timed windows; inside them its restore time adds to the measurement. Trigger
 USERPTR / SVM with compaction or reclaim in the 2 s before it = page migration of host memory the GPU maps.
+
+| file | what it does | run |
+|---|---|---|
+| `upsum.py` | kfdevmon userptr allocations grouped by (size, first engine frame) with first/last time; `ALIVE_AT=s` lists the BOs alive at that moment (exposed to page migration during a window). Resolve frames with `addr2line -f -C -e BIN +OFF`. | `python3 upsum.py MONFILE` |
+| `postload.py` | Rank-0 userptr allocations at/after an explicit load-end marker; without it the boundary is unknown. This does not identify timed prefill windows. | `python3 postload.py RUNDIR` |
+| `evprof.py` | Evictions per bucket, MemAvailable / page cache at the first EV, and per-column maxima of overlapping two-second pressure observations. These are not counter totals. | `python3 evprof.py EVLOG [BUCKET_S]` |
+| `cached.py` | Page-cache resident bytes per file under the given directories (mincore, read-only, no root): whose files fill the cache before a load. | `python3 cached.py DIR...` |
+
+`postload.py` accepts `RUNDIR/load-end.boottime`: a single timestamp in seconds captured with
+`clock_gettime(CLOCK_BOOTTIME)` at rank 0's load completion, on the same host/boot as its `mon.*` log.
+The current engine does not emit this marker; an instrumented collector must record it at that boundary.
+Do not substitute log-receipt time, load duration, or first-allocation time. Use a directory containing only
+that rank's monitor log. Offsets in the output are relative to the marker, with no grace period.
+
+The legacy sampler repeats rolling vmstat deltas across EV records and PIDs. Its totals cannot be recovered
+by summing or deduplicating those observations. Counter totals require a separate timestamped cumulative
+vmstat stream sampled once per interval independently of EVs; this report does not claim such totals.

@@ -2351,7 +2351,7 @@ __global__ void gated_rms_norm_swish_kernel(
     const auto head = static_cast<std::uint32_t>(blockIdx.x);
     if (head >= heads || threadIdx.x >= head_dim) return;
     __shared__ float scratch[kRecurrentThreads];
-    const auto index = static_cast<std::uint64_t>(head) * head_dim + threadIdx.x;
+    const auto index = (static_cast<std::uint64_t>(blockIdx.y) * heads + head) * head_dim + threadIdx.x;  // grid.y = window row
     const float value = core[index];
     scratch[threadIdx.x] = value * value;
     __syncthreads();
@@ -8124,6 +8124,34 @@ void hip_gdn_decode_fuse_fixture(const HipGdnDecodeFuseFixture& v, bool fuse,
     check_hip(hipGetLastError(), "HIP GDN decode fusion fixture launch");
 }
 
+// Window forms of the per-row R1 helpers (the same bodies, the same per-row operation order: bitwise the per-row
+// launches). conv: one thread per channel walks the rows in order (its conv history is that channel's own state);
+// transform / normalize: grid.y = row. STRIX_GDN_DIMS_ROW_LAUNCH=1 keeps the old per-row launches.
+__global__ void conv_update_rows_kernel(float* qkv, std::uint16_t* conv_state, const void* conv_weights, SmallWeightKind kind,
+                                        std::uint32_t channels, std::uint32_t kernel_size, std::uint32_t rows) {
+    const auto channel = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (channel >= channels) return;
+    for (std::uint32_t r = 0; r < rows; ++r)
+        conv_update_body(qkv + static_cast<std::uint64_t>(r) * channels, conv_state, conv_weights, kind, kernel_size, channel);
+}
+__global__ void transform_beta_gate_rows_kernel(float* beta, float* gate, const void* dt, SmallWeightKind dt_kind, const void* a,
+                                                SmallWeightKind a_kind, std::uint32_t heads) {
+    const auto head = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (head >= heads) return;
+    const auto off = static_cast<std::uint64_t>(blockIdx.y) * heads;
+    transform_beta_gate_body(beta + off, gate + off, dt, dt_kind, a, a_kind, head);
+}
+__global__ void normalize_qk_rows_kernel(float* qkv, std::uint32_t key_heads, std::uint32_t head_dim, float epsilon,
+                                         std::uint64_t channels) {
+    __shared__ float scratch[kRecurrentThreads];
+    normalize_qk_body(qkv + static_cast<std::uint64_t>(blockIdx.y) * channels, key_heads, head_dim, epsilon,
+                      static_cast<std::uint32_t*>(nullptr), blockIdx.x, scratch);
+}
+static bool gdn_dims_row_launch() {
+    static const bool on = strix::envcfg::flag("STRIX_GDN_DIMS_ROW_LAUNCH", false);
+    return on;
+}
+
 void hip_gdn_decode_step_dims(const HipGdnDimsStep& v, void* stream_ptr) {
     const auto stream = static_cast<hipStream_t>(stream_ptr);
     constexpr unsigned d = kRecurrentThreads;
@@ -8133,7 +8161,16 @@ void hip_gdn_decode_step_dims(const HipGdnDimsStep& v, void* stream_ptr) {
     const unsigned channels = (2U * v.key_heads + v.value_heads) * d;
     // Rows run one after the other (R1 per row): row r is bit-identical alone or in any window. The conv / transform / norm
     // steps are per row (the conv history is sequential); the recurrence of all rows is ONE launch (state in registers).
-    for (unsigned r = 0; r < v.rows; ++r) {
+    const bool window = v.rows > 1U && !gdn_dims_row_launch();
+    if (window) {
+        hipLaunchKernelGGL(conv_update_rows_kernel, dim3((channels + kProjectionThreads - 1U) / kProjectionThreads),
+            dim3(kProjectionThreads), 0, stream, v.qkv, v.conv_state, v.conv, kind, channels, v.kernel, v.rows);
+        hipLaunchKernelGGL(transform_beta_gate_rows_kernel, dim3((v.value_heads + kProjectionThreads - 1U) / kProjectionThreads, v.rows),
+            dim3(kProjectionThreads), 0, stream, v.beta, v.gate, v.dt, kind, v.a, kind, v.value_heads);
+        hipLaunchKernelGGL(normalize_qk_rows_kernel, dim3(v.key_heads * 2U, v.rows), dim3(d), 0, stream,
+            v.qkv, v.key_heads, d, v.qk_epsilon, static_cast<std::uint64_t>(channels));
+    }
+    for (unsigned r = 0; !window && r < v.rows; ++r) {
         float* qkv = v.qkv + std::size_t(r) * channels;
         float* beta = v.beta + std::size_t(r) * v.value_heads;
         float* gate = v.gate + std::size_t(r) * v.value_heads;
@@ -8148,7 +8185,10 @@ void hip_gdn_decode_step_dims(const HipGdnDimsStep& v, void* stream_ptr) {
     hipLaunchKernelGGL(recurrent_rows_kernel, dim3(v.value_heads * (d / kValueTile)), dim3(d), 0, stream,
         v.qkv, v.beta, v.gate, v.matrix, v.core, v.key_heads, v.value_heads, d, v.rows,
         static_cast<std::uint64_t>(channels), static_cast<std::uint64_t>(v.value_heads) * d);
-    for (unsigned r = 0; r < v.rows; ++r) {
+    if (window && v.norm_kind == HipGdnGatedNorm::swish)
+        hipLaunchKernelGGL(gated_rms_norm_swish_kernel, dim3(v.value_heads, v.rows), dim3(d), 0, stream,
+            v.core, v.z, v.norm, kind, v.value_heads, d, v.rms_epsilon);
+    for (unsigned r = 0; !(window && v.norm_kind == HipGdnGatedNorm::swish) && r < v.rows; ++r) {
         float* core = v.core + std::size_t(r) * v.value_heads * d;
         const float* z = v.z + std::size_t(r) * v.value_heads * d;
         if (v.norm_kind == HipGdnGatedNorm::swish)

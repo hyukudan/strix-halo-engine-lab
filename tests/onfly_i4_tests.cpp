@@ -2,6 +2,7 @@
 // (CLI and server resolve one request through one function), cache identity and the q6p::iu4 registry.
 #include "../apps/qwen_effective_config.hpp"
 #include "core/iu4_onfly.hpp"
+#include "strix/qwen_onfly_i4.hpp"
 #include "strix/q6p_registry.hpp"
 
 #include <cmath>
@@ -12,9 +13,26 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <optional>
 
 using namespace strix;
 namespace {
+struct ScopedEnvironment {
+    const char* name;
+    std::optional<std::string> old;
+    ScopedEnvironment(const char* key, const char* value) : name(key) {
+        if (const char* previous = envcfg::text(name)) old = previous;
+        set(value);
+    }
+    void set(const char* value) const {
+#ifdef _WIN32
+        if (_putenv_s(name, value ? value : "") != 0) throw std::runtime_error("test environment update failed");
+#else
+        if ((value ? setenv(name, value, 1) : unsetenv(name)) != 0) throw std::runtime_error("test environment update failed");
+#endif
+    }
+    ~ScopedEnvironment() { set(old ? old->c_str() : nullptr); }
+};
 int failures = 0;
 void expect(bool ok, const char* message) {
     if (!ok) { ++failures; std::cerr << "FAIL: " << message << '\n'; }
@@ -174,6 +192,45 @@ int main() {
            onfly_i4::classify("blk.3.attn_output.weight") == onfly_i4::qsa_io && onfly_i4::classify("blk.3.ffn_down_shexp.weight") == onfly_i4::shared_expert &&
            onfly_i4::classify("blk.3.ffn_gate_inp.weight") == 0U && onfly_i4::classify("token_embd.weight") == 0U, "tensor groups");
 
+    // The loader and admission reserve the same consumed images. A mixed-layer
+    // manifest catches unused copies being counted even when every shape is a
+    // valid Q8 matrix: shared-down K640 has no small-row IU4 consumer.
+    ModelManifest copy_manifest;
+    const auto add_projection = [&](const std::string& name, std::uint64_t k, std::uint64_t n) {
+        ManifestTensor t;
+        t.name = name; t.dimensions = {k, n}; t.ggml_type = 8U;
+        t.byte_size = n * (k / 32U) * 34U;
+        copy_manifest.tensors.push_back(t);
+    };
+    for (unsigned layer = 0; layer < 48U; ++layer) {
+        const auto prefix = "blk." + std::to_string(layer) + ".";
+        if (layer < 36U) {
+            add_projection(prefix + "attn_qkv.weight", 2560U, 10240U);
+            add_projection(prefix + "attn_gate.weight", 2560U, 6144U);
+            add_projection(prefix + "ssm_out.weight", 6144U, 2560U);
+        } else {
+            add_projection(prefix + "attn_q.weight", 2560U, 12288U);
+            add_projection(prefix + "attn_k.weight", 2560U, 512U);
+            add_projection(prefix + "attn_v.weight", 2560U, 512U);
+            add_projection(prefix + "attn_output.weight", 6144U, 2560U);
+        }
+        add_projection(prefix + "ffn_gate_shexp.weight", 2560U, 640U);
+        add_projection(prefix + "ffn_up_shexp.weight", 2560U, 640U);
+        add_projection(prefix + "ffn_down_shexp.weight", 640U, 2560U);
+    }
+    const auto all_copies = onfly_i4::resolve({}, no_env, true);
+    std::size_t copied_tensors = 0;
+    std::uint64_t loader_copy_bytes = 0;
+    for (const auto& t : copy_manifest.tensors) if (qwen_onfly_i4_candidate(t, all_copies)) {
+        ++copied_tensors;
+        loader_copy_bytes += core::onfly::copy_bytes(t.dimensions[1], t.dimensions[0]);
+    }
+    expect(copy_manifest.tensors.size() == 300U && copied_tensors == 252U, "only consumed projection tensors get copies");
+    expect(loader_copy_bytes == 1504051200ULL && qwen_onfly_i4_reservation(copy_manifest, all_copies) == loader_copy_bytes,
+           "reservation matches loader-selected images without unused shared-down copies");
+    expect(qwen_onfly_i4_reservation(copy_manifest, onfly_i4::resolve({}, no_env, false)) == 0U,
+           "native reserves no INT4 images");
+
     // One resolver for the CLI and the server: the same request through Options + environment (what both build) agrees,
     // the identity enters the cache argv, native keeps the historical argv.
     const auto options_for = [](std::vector<std::string> extra) {
@@ -192,6 +249,96 @@ int main() {
     expect(decode_cli::effective_prefill_argv(cli.options) == decode_cli::effective_prefill_argv(serve.options), "CLI and server give the same cache argv");
     expect(decode_cli::effective_prefill_argv(cli.options) != decode_cli::effective_prefill_argv(native.options), "onfly never shares a cache key with native");
     expect(!native.options.turbo.active(), "native default");
+    const auto& cli_rows = cli.options.turbo.row_decode;
+    const auto& serve_rows = serve.options.turbo.row_decode;
+    using RowsPolicy = core::iu4_rows::SingleDecodePolicy;
+    expect(cli_rows.requested == serve_rows.requested && cli_rows.effective == serve_rows.effective &&
+           cli_rows.reason == serve_rows.reason && cli_rows.effective == RowsPolicy::automatic,
+           "CLI and server use one automatic row-decode resolver");
+    expect(native.options.turbo.row_decode.effective == RowsPolicy::split &&
+           native.options.turbo.row_decode.reason == "native-weights", "native row-decode disabled");
+    const auto split_rows = decode_cli::initialize_prefill_config({options_for({"--profile", "turbo", "--turbo-weights", "onfly"}),
+        {{"STRIX_IU4_R8_SINGLE_DECODE", "0"}}});
+    expect(split_rows.options.turbo.row_decode.effective == RowsPolicy::split &&
+           split_rows.options.turbo.row_decode.reason == "explicit-off", "row-decode off switch resolved");
+    const auto force_rows = core::iu4_rows::resolve_single_decode_policy(true, "force");
+    expect(force_rows.effective == RowsPolicy::force && force_rows.reason == "diagnostic-force", "row-decode diagnostic force");
+    expect(core::iu4_rows::measured_single_decode_device("gfx1151:xnack-", 32) &&
+           !core::iu4_rows::measured_single_decode_device("gfx1150", 32) &&
+           !core::iu4_rows::measured_single_decode_device("gfx1151", 64), "only measured device qualifies automatically");
+    for (const unsigned rows : {7U, 8U}) {
+        expect(core::iu4_rows::single_decode_applies(rows, 96U, cli_rows.effective, 2560U, true),
+               "measured G96 output shape selected");
+        expect(!core::iu4_rows::single_decode_applies(rows, 96U, cli_rows.effective, 2560U, false) &&
+               !core::iu4_rows::single_decode_applies(rows, 96U, cli_rows.effective, 4096U, true) &&
+               !core::iu4_rows::single_decode_applies(rows, 40U, cli_rows.effective, 2560U, true),
+               "unqualified device, shape and losing regime keep split rows");
+    }
+    expect(core::iu4_rows::single_decode_applies(8U, 40U, force_rows.effective, 10240U, false),
+           "diagnostic force remains available for losing and unqualified regimes");
+    const auto row_receipt = decode_cli::effective_config_json(cli);
+    expect(row_receipt.find("\"row_decode\":{\"requested\":\"auto\",\"effective\":\"auto\",\"enabled\":true") != std::string::npos &&
+           row_receipt.find("pending-device-and-shape") != std::string::npos, "receipt reports automatic conditional plan");
+    expect(decode_cli::effective_config_json(native).find("\"effective\":\"split\",\"enabled\":false,\"reason\":\"native-weights\"") !=
+           std::string::npos, "receipt reports native row-decode disabled");
+    using Reduction = core::iu4_rows::RowReduction;
+    {
+        const ScopedEnvironment reduction_env("STRIX_IU4_ROW_REDUCTION", "canonical");
+        const ScopedEnvironment single_env("STRIX_IU4_R8_SINGLE_DECODE", "force");
+        for (const char* setting : {"0", "force"}) {
+            single_env.set(setting);
+            const auto captured = decode_cli::requested_prefill_environment();
+            const auto resolved = decode_cli::initialize_prefill_config({
+                options_for({"--profile", "turbo", "--turbo-weights", "onfly"}), captured});
+            const auto& turbo = resolved.options.turbo;
+            expect(turbo.row_reduction.effective == Reduction::canonical &&
+                   turbo.row_decode.effective == core::iu4_rows::parse_single_decode_policy(setting),
+                   "actual startup environment reaches the IU4 resolver");
+            expect(turbo.identity().find("iu4-g64g96-gc32-v1") != std::string::npos &&
+                   decode_cli::effective_prefill_argv(resolved.options) != decode_cli::effective_prefill_argv(cli.options),
+                   "captured canonical policy changes the cache identity");
+            core::iu4_rows::configure_execution_policy({turbo.row_decode.effective, turbo.row_reduction.effective});
+            single_env.set("auto");
+            envcfg::record("STRIX_IU4_R8_SINGLE_DECODE", "auto", "dispatch-must-not-register");
+            for (unsigned i = 0; i < 100U; ++i) {
+                const auto& execution = core::iu4_rows::execution_policy();
+                expect(execution.single_decode == turbo.row_decode.effective && execution.reduction == turbo.row_reduction.effective,
+                       "dispatch policy stays identical to resolved startup despite later environment changes");
+            }
+            for (const auto& entry : envcfg::registered())
+                if (entry.name == "STRIX_IU4_R8_SINGLE_DECODE")
+                    expect(entry.value == "dispatch-must-not-register", "dispatch reads do not rewrite the environment registry");
+        }
+    }
+    const auto canonical_cli = decode_cli::initialize_prefill_config({options_for({"--profile", "turbo", "--turbo-weights", "onfly"}),
+        {{"STRIX_IU4_ROW_REDUCTION", "canonical"}}});
+    const auto canonical_serve = decode_cli::initialize_prefill_config({options_for({"--profile", "turbo", "--turbo-weights", "onfly"}),
+        {{"STRIX_IU4_ROW_REDUCTION", "canonical"}}});
+    expect(canonical_cli.options.turbo.row_reduction.effective == Reduction::canonical &&
+           canonical_cli.options.turbo.row_reduction.effective == canonical_serve.options.turbo.row_reduction.effective &&
+           decode_cli::effective_prefill_argv(canonical_cli.options) == decode_cli::effective_prefill_argv(canonical_serve.options),
+           "CLI and server share the canonical reduction contract and cache identity");
+    expect(canonical_cli.options.turbo.identity().find("iu4-g64g96-gc32-v1") != std::string::npos &&
+           canonical_cli.options.turbo.identity() != onfly_i4::resolve({}, no_env, true).identity(),
+           "canonical reduction changes the numerical identity only when requested");
+    expect(cli.options.turbo.row_reduction.effective == Reduction::legacy &&
+           cli.options.turbo.identity() == std::string(onfly_i4::kIdentity) + "-g3-full", "legacy default identity preserved");
+    const auto canonical_native = decode_cli::initialize_prefill_config({options_for({}), {{"STRIX_IU4_ROW_REDUCTION", "canonical"}}});
+    expect(!canonical_native.options.turbo.row_reduction.active && canonical_native.options.turbo.identity().empty() &&
+           decode_cli::effective_prefill_argv(canonical_native.options) == decode_cli::effective_prefill_argv(native.options),
+           "canonical request cannot change native arithmetic or historical argv");
+    for (unsigned rows = 1U; rows <= 8U; ++rows) for (const unsigned groups : {64U, 96U}) {
+        const auto plan = core::iu4_rows::iu4_plan(rows, groups, Reduction::canonical);
+        expect(plan.S == 8U && plan.GC == 32U, "canonical reductions keep identical waves and K chunking at every row count");
+    }
+    expect(core::iu4_rows::iu4_plan(1U, 96U).GC == 96U && core::iu4_rows::iu4_plan(1U, 64U).GC == 64U &&
+           core::iu4_rows::iu4_plan(8U, 96U).GC == 32U, "legacy row-dependent plan preserved");
+    expect(decode_cli::effective_config_json(canonical_cli).find("\"contract\":\"iu4-g64g96-gc32-v1\",\"quality_gate_pending\":true") !=
+           std::string::npos, "receipt names the pending-gate numerical contract");
+    bool invalid_reduction = false;
+    try { static_cast<void>(core::iu4_rows::parse_row_reduction("unknown")); }
+    catch (const std::invalid_argument&) { invalid_reduction = true; }
+    expect(invalid_reduction, "invalid reduction policy is refused");
 
     // Registry.
     int tensor = 0;

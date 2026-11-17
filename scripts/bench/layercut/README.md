@@ -57,7 +57,13 @@ prefill policies append `;` and the existing prefill policy identity. Copy that 
 The shared resolver is `include/strix/pair/layercut.hpp`: CLI overrides environment, then defaults.
 `--split` / `STRIX_SPLIT`: `device-only` (default), `handoff-full`, `layer-cut`, `auto`.
 `--cut` / `STRIX_SPLIT_CUT`: 1..59 or `auto`; `--cut-block` / `STRIX_SPLIT_BLOCK`: positive multiple of 16,
-or `auto` (default 2048); `--cut-act` / `STRIX_SPLIT_ACT`: `relay` (default) or `direct`.
+or `auto` (default 2048); `--cut-act` / `STRIX_SPLIT_ACT`: `link` (default), `relay` or `direct`.
+`link` sends the same producer bytes as `relay`, but rank 0's rows reach rank 1 over the pair's own link inside the
+engine (one control exchange per prefill chunk, at the same schedule point on both ranks); no relay ports.
+`--cut-xport` / `STRIX_SPLIT_XPORT`: `act-first` (default; contract v2) or `fifo` (v1, the previous order, off switch).
+`--cut-kv-frag` / `STRIX_SPLIT_KV_FRAG`: KV rows per piece under act-first (multiple of 16, default 1024).
+The rank follows the contract version in the producer's HELLO. Bench only: the producer's `--abab-xport` alternates
+fifo / act-first per `--repeat` run (the resolved one first) for a strict in-process ABAB.
 The rank route requires `--layercut-listen NAME:PROMPT.u32:BASE_PORT:STEPS:COUNT` and a cut policy on both ranks.
 Relay adds rank 0 `--cut-relay HOST:PORT` and rank 1 `--cut-relay-listen PORT`.
 `--print-effective-config` prints the resolved `split KEY VALUE (cli|env|default|planner)` lines without device work.
@@ -81,8 +87,19 @@ Hello.meta is little endian: u32 version=1, cut, block, hidden; u64 rows, token 
 u32 identity byte length; identity bytes (no NUL). Version, cut, block, hidden, rows, token digest and identity must match.
 The fixed identity is `mm-layercut-v1 rtx=cuda-fp32id L[0,K) pair=IDENTITY L[K,60)`.
 
-For each block, ACT (`0x4C434101`, index=block ordinal, row0, real rows) precedes KV for layers 0..K-1
-(`0x4C434B02`, index=layer). ACT is FP32 residual **h**, `[rows][6144]`, 24,576 bytes/row, never normalized hn.
+Contract v1 (fifo): for each block, ACT (`0x4C434101`, index=block ordinal, row0, real rows) precedes KV for layers
+0..K-1 (`0x4C434B02`, index=layer). Contract v2 (act-first, Meta.version 2): ACT blocks keep block order on their own
+cursor; KV of each layer arrives as contiguous row fragments (row0 = that layer's next row) in any interleaving with
+ACT and other layers; gaps, duplicates and incomplete coverage at END are rejected. The producer keeps [0,K) KV
+resident on the GPU, sends ACT as urgent pieces over both producer links (`strix::handoff::Lanes`: KV is handed to a
+Sender only while no ACT of any destination is unreleased) and exports KV fragments into a bounded pinned pool, so
+the GPU never waits for KV. bp-v1 (`--codec bp`), if on, applies to KV only; ACT is always sent uncoded.
+Per-rank KV pinned storage is `max(8, floor(32 MiB / fragment_bytes)) * fragment_bytes`, where
+`fragment_bytes = min(cut-kv-frag, cut-block) * 1280`. The 32 MiB value is a sizing target, not a cap:
+block=fragment=8192 uses 80 MiB per rank, in addition to the two ACT slots and other staging allocations.
+Timeline lines: `layercut-tl pc` (per block: ring wait, GPU+D2H, ACT queued, ACT/KV released per rank) and
+`layercut-xport pc` on the producer; `layercut-tl rR` (ACT stored, relayed, last KV stored, fetch start and wait),
+`layercut-rank` and `layercut-act` (XXH64 of the staged ACT, exactness witness) on each rank. ACT is FP32 residual **h**, `[rows][6144]`, 24,576 bytes/row, never normalized hn.
 Relay ACT goes only to rank 0 with `handoff::kRelay`; rank 0 submits it to rank 1 before publishing local rows.
 Rank 1's producer session then carries KV only; its separate relay session carries ACT only with the same metadata/session ID.
 Direct ACT goes to both ranks with flags=0. KV is rank-local BF16 K, V, IK in component-major planes

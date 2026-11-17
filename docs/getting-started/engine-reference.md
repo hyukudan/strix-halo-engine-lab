@@ -114,6 +114,17 @@ per-phase timing session is now `--timing-profile NAME:PROMPT.u32:STEPS` (the
 old `--profile NAME:PROMPT.u32:STEPS` still works, with a notice). Quality bar:
 `tools/strix-gate/fast_logit_gate.py compare --mode turbo` (see its README).
 
+Qwen on CUDA (sm_120, `strix-cuda-qwen-serve` and the other entries through the shared option resolver
+[cuda/qwen_options.hpp](../../include/strix/cuda/qwen_options.hpp), which binds
+[cuda/qwen_turbo.hpp](../../include/strix/cuda/qwen_turbo.hpp); no lever rows under turbo): `--profile turbo
+--turbo-weights onfly` converts the dense Q8_0 projections (GDN in/out, QSA q/k/v/o,
+shared expert) once at load to NVFP4 (identity `onfly-nvfp4-rtn-g16`, about +1.6 GB
+beside the pack) and decode windows read them through the shared
+[nvfp4-a8-v1](../../include/strix/cuda/core/nvfp4_a8.hpp) GEMV with the same A8
+activations as the exact route; prefill blocks, routed experts, the LM head and the
+MTP draft keep the pack. `--print-effective-config` adds a `turbo_weights` object (onfly, namespace, decode
+arithmetic) beside the resolution's weights; 3-bit or `converted` requests refuse the start.
+
 Qwen accepts `--profile default|fast|quality|turbo` for CLI decode, `--http-serve`,
 MTP and the MTP qualification runner. Omission means `default`: it exports no
 profile switches and preserves the existing exact bundle, output WMMA and

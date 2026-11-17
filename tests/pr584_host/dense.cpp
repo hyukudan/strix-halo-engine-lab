@@ -1,4 +1,5 @@
 #include "strix/ds41_fast_profile.hpp"
+#include "strix/lever_cache.hpp"
 #include <array>
 #include <cmath>
 #include <cstdint>
