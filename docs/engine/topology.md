@@ -88,3 +88,20 @@ each one reads the topology; today's two-node result is the invariant of every s
 
 Tests: `tests/device_topology_tests.cpp` (1, 2 equal, 2 unequal, 3 and 4 nodes, invalid files, legacy shape,
 identity, discovery, the link-graph bridge), target `strix-device-topology-tests`.
+
+## Bound today
+
+- Device gate: every HIP binary's `bind_hip_main` takes `--topology FILE` / `--node ID` and prints `topology:` beside
+  `device:` when a file is declared (or a legacy `--rank R` is on the command line). A declared file that cannot place
+  this process stops the start with the reason.
+- Pair routes (Qwen, Gemma 4; `include/strix/pair/link_flags.hpp`): with a file, the rank, the peer host and the
+  transport that the flags leave open come from it (Ethernet classes -> `tcp`, `usb4` classes -> the family default,
+  PCIe/OCuLink refused); explicit `--rank/--peer/--transport` still win. The pair route has two ranks: a file with
+  another node count is refused with the reason. Without a file the legacy flags behave exactly as before.
+- Qwen `--print-effective-config` carries the `"topology"` member when the process resolved one.
+- One link-rate source: `link_class.hpp` is the only class table (`interconnects()` is a view of it). Decisions tuned
+  on a protocol-level rate keep it as a named calibration row there (relay host path 4,400 MB/s; layer-cut handoff
+  118 / 290 / 1,180 / 4,600 MB/s; host egress 125 MB/s). Rule: declared measurement > calibration of the class > class
+  nominal. No file, or the lab's two-node `usb4` file without a measurement, gives exactly the former numbers.
+
+Tests: `tests/device_topology_bindings_tests.cpp`, target `strix-device-topology-bindings-tests`.

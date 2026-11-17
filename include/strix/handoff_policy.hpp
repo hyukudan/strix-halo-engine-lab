@@ -22,6 +22,7 @@
 //   STRIX_HANDOFF_ENCODE_BATCH    1..256 | auto   (bp-v1 pieces encoded side by side; 1 = one at a time)
 #include "strix/env_flags.hpp"
 #include "strix/handoff.hpp"
+#include "strix/device/link_class.hpp"
 
 #include <algorithm>
 #include <array>
@@ -52,7 +53,8 @@ inline constexpr std::array<LinkClass, 6> link_classes{{
     {"1gbe", 117.7, 12e-6, 118.0, "measured 2026-11-15 PC->node: 118.0 MB/s one stream at 16 MiB pieces, +11.5 us per piece"},
     {"2.5gbe", 294.2, 12e-6, 7000.0, "nominal 2500 Mb/s x 0.941; per-piece cost as 1gbe; per-stream cap = loopback"},
     {"10gbe", 1176.8, 12e-6, 7000.0, "nominal 10 Gb/s x 0.941; per-piece cost as 1gbe; per-stream cap = loopback"},
-    {"usb4", 4400.0, 60e-6, 4400.0, "measured 2026-10-31 host path >= 16 MB (relay, not TCP)"},
+    {"usb4", ::strix::device::link_rate_mbytes_ps(::strix::device::LinkUse::relay_host_path, "usb4"), 60e-6,
+     ::strix::device::link_rate_mbytes_ps(::strix::device::LinkUse::relay_host_path, "usb4"), "measured 2026-10-31 host path >= 16 MB (relay, not TCP)"},
     {"oculink", 6500.0, 12e-6, 7000.0, "nominal PCIe 4.0 x4 DMA; per-stream cap = loopback"},
     {"loopback", 19000.0, 12e-6, 7000.0, "measured 2026-11-15 node loopback: 7.0 GB/s one stream at 16 MiB, 18.9 GB/s 8 streams"},
 }};

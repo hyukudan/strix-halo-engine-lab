@@ -83,3 +83,21 @@ La topología no contiene conocimiento de modelos ni decide la colocación. El p
 
 Pruebas: `tests/device_topology_tests.cpp` (1, 2 iguales, 2 distintos, 3 y 4 nodos, ficheros inválidos, forma
 antigua, identidad, descubrimiento, puente al grafo de enlaces), objetivo `strix-device-topology-tests`.
+
+## Enlazado hoy
+
+- Puerta de dispositivo: `bind_hip_main` de cada binario HIP toma `--topology FICHERO` / `--node ID` e imprime
+  `topology:` junto a `device:` cuando hay fichero (o un `--rank R` antiguo en la línea de órdenes). Un fichero que no
+  puede situar este proceso detiene el arranque con el motivo.
+- Rutas de pareja (Qwen, Gemma 4; `include/strix/pair/link_flags.hpp`): con fichero, el rango, el host del par y el
+  transporte que las opciones dejan abiertos salen de él (clases Ethernet -> `tcp`, clases `usb4` -> el valor de la
+  familia, PCIe/OCuLink rechazadas); `--rank/--peer/--transport` explícitos siguen mandando. La ruta de pareja tiene
+  dos rangos: otro número de nodos se rechaza con el motivo. Sin fichero las opciones antiguas se comportan igual.
+- `--print-effective-config` de Qwen lleva el miembro `"topology"` cuando el proceso resolvió una.
+- Una sola fuente de velocidad de enlace: `link_class.hpp` es la única tabla de clases (`interconnects()` es una vista).
+  Las decisiones calibradas con una velocidad de protocolo la conservan como fila de calibración con nombre (relevo
+  por el host 4.400 MB/s; traspaso por corte de capas 118 / 290 / 1.180 / 4.600 MB/s; salida del host 125 MB/s).
+  Regla: medida declarada > calibración de la clase > nominal de la clase. Sin fichero, o con el fichero de dos nodos
+  `usb4` del laboratorio sin medida, salen exactamente los números anteriores.
+
+Pruebas: `tests/device_topology_bindings_tests.cpp`, objetivo `strix-device-topology-bindings-tests`.

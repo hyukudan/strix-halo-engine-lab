@@ -16,6 +16,7 @@ add_library(strix_device STATIC
     ${CMAKE_CURRENT_LIST_DIR}/../src/device/profiles.cpp
     ${CMAKE_CURRENT_LIST_DIR}/../src/device/budget.cpp
     ${CMAKE_CURRENT_LIST_DIR}/../src/device/topology.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/../src/device/process_topology.cpp
     ${CMAKE_CURRENT_LIST_DIR}/../src/deploy/memory_plan.cpp)
 target_link_libraries(strix_device PUBLIC strix_model_description)
 target_compile_features(strix_device PUBLIC cxx_std_20)
@@ -55,6 +56,14 @@ if(BUILD_TESTING)
         strix_target_warnings(strix-device-topology-tests)
     endif()
     add_test(NAME strix-device-topology-tests COMMAND strix-device-topology-tests)
+    # Topology bindings: pair flag strip vs declaration, gate `topology:` line / effective-config field, one link-rate
+    # source (link_class.hpp calibration rows reproduce every former constant).
+    add_executable(strix-device-topology-bindings-tests ${CMAKE_CURRENT_LIST_DIR}/../tests/device_topology_bindings_tests.cpp)
+    target_link_libraries(strix-device-topology-bindings-tests PRIVATE strix_device)
+    if(COMMAND strix_target_warnings)
+        strix_target_warnings(strix-device-topology-bindings-tests)
+    endif()
+    add_test(NAME strix-device-topology-bindings-tests COMMAND strix-device-topology-bindings-tests)
 endif()
 # The catalogue and the memory plan without a GPU (docs/devices.md).
 if(NOT TARGET strix-device-plan)

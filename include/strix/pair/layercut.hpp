@@ -3,6 +3,7 @@
 #include "strix/env_flags.hpp"
 #include "strix/pair/chain.hpp"
 #include "strix/handoff.hpp"
+#include "strix/device/link_class.hpp"
 #include <algorithm>
 #include <charconv>
 #include <limits>
@@ -12,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <thread>
 
@@ -137,12 +139,13 @@ inline std::uint32_t route_identity_grain(const Cli& cli, std::string_view pair_
     const std::string_view split = value && *value ? value : "device-only";
     return split == "layer-cut" || split == "auto" ? identity_grain(pair_identity) : 0;
 }
+// MB/s of a link class from the one link table: the layer-cut calibration rows keep 118 / 290 / 1180 / 4600 for
+// 1gbe / 2.5gbe / 10gbe / usb4; any other declared class (25gbe, 100gbe, pcie..., oculink4x4) reads its nominal rate.
 inline double link_class(std::string_view s) {
-    if (s == "1gbe") return 118;
-    if (s == "2.5gbe") return 290;
-    if (s == "10gbe") return 1180;
-    if (s == "usb4") return 4600;
-    throw std::invalid_argument("STRIX_HANDOFF_LINK: expected 1gbe|2.5gbe|10gbe|usb4");
+    if (const double mbps = ::strix::device::link_rate_mbytes_ps(::strix::device::LinkUse::layer_cut_handoff, s); mbps > 0) return mbps;
+    std::string known;
+    for (const auto& c : ::strix::device::link_classes) known += (known.empty() ? "" : "|") + std::string(c.name);
+    throw std::invalid_argument("STRIX_HANDOFF_LINK: expected " + known);
 }
 inline Resolved resolve(const Cli& cli, const Inputs& input, Lookup env = [](const char* k) { return envcfg::text(k); }) {
     struct Value { std::string text, origin; };
