@@ -35,6 +35,7 @@ if [ -z "$tf" ] || [ -z "$out" ] || [ ${#prompts[@]} -eq 0 ]; then sed -n 2,10p 
 mkdir -p "$out"
 # Profile arms must not inherit numerical overrides or profile-export provenance.
 for key in STRIX_QRTX_HC_MMA STRIX_QRTX_MTP_MMA STRIX_QRTX_QSA_MMA STRIX_QRTX_MOE_MMA \
+           STRIX_QRTX_EXPERT_FAST STRIX_QRTX_EXPERT_TURBO STRIX_QRTX_MTP_DEFER_PROMPT STRIX_QRTX_QSA_FUSED \
            STRIX_QPF2K_MOE_ROUTE_BF16 STRIX_QPF2K_QSA_BUDGET STRIX_QPF2K_GDN_FP16_CHUNK \
            STRIX_QWEN_PROFILE_ALLOW_PENDING ${!STRIX_QWEN_PROFILE_OWNED_@}; do
     unset "$key"
@@ -62,17 +63,22 @@ forms = c['forms']
 names = ['hc_mma', 'mtp_mma', 'qsa_mma', 'moe_mma']
 if set(forms) != set(names + ['moe_route_bf16']) or any(type(v) is not bool for v in forms.values()):
     raise SystemExit('invalid resolved forms')
-fast = any(forms.values())
+expert = c['expert_arithmetic']  # 'incumbent' or the expert contract (e.g. the FAST bundle's gsq-iq-bf16mma-cuda-v1)
 contract = 'qwen-cuda;prefill=exact'
-if fast:
+if any(forms.values()):
     contract = ('qwen-cuda;prefill=fast;forms=' + (','.join(n for n in names if forms[n]) or 'none')
                 + ';moe_route_bf16=' + str(int(forms['moe_route_bf16'])))
+if expert != 'incumbent':
+    contract += '+' + expert
+fast = contract != 'qwen-cuda;prefill=exact'
 ids = ['qwen-cuda-hc-f16mma-v1', 'qwen-cuda-mtp-f16mma-v1',
-       'qwen-cuda-qsa-f16mma-v1', 'qwen-cuda-moe-i8fma-v1']
+       'qwen-cuda-qsa-f16mma-v2', 'qwen-cuda-moe-i8fma-v1']
 if (c['entry'] != 'serve' or c['arithmetic_contract'] != contract
         or c['form_identities'] != ','.join(i for n, i in zip(names, ids) if forms[n])
         or fast != (sys.argv[2] == 'fast')):
     raise SystemExit('arm does not match resolved arithmetic contract')
+bundle = c.get('fast_bundle', {}).get('id', 'none')  # the FAST bundle id when this arm's values are the bundle
+sys.stderr.write(f"arm {sys.argv[2]}: contract {contract} | fast_bundle {bundle}\n")
 executions = c.get('executions')
 if not isinstance(executions, list) or not executions:
     raise SystemExit('missing completed execution receipts')
@@ -84,7 +90,7 @@ for execution in executions:
             or any(active[n] and not forms[n] for n in forms)
             or any(active[n] != forms[n] for n in targets)):
         raise SystemExit('invalid executed forms')
-    if any(active[n] for n in targets) != (sys.argv[2] == 'fast'):
+    if (any(active[n] for n in targets) or expert != 'incumbent') != (sys.argv[2] == 'fast'):
         raise SystemExit('arm has no executed target-changing form (MTP-only is not a target-logit gate)')
 print(json.dumps(c, sort_keys=True, separators=(',', ':')))
 PY
@@ -93,7 +99,7 @@ PY
         --prefix q "${seal_prompts[@]}" --env "profile=$profile" --env "extra=$*" --env "effective_config=$effective"
 }
 # Last CLI values win, including over common arguments after --.
-run_arm exact exact --hc-mma off --mtp-mma off --qsa-mma off --moe-mma off \
+run_arm exact exact --hc-mma off --mtp-mma off --qsa-mma off --moe-mma off --expert-fast off --expert-turbo off \
     --prefill-moe-route-bf16 off --qsa-budget off --gdn-fp16-chunk off --output-head-profile off
 # shellcheck disable=SC2086
 run_arm fast fast $fast_args
