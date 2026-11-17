@@ -450,6 +450,7 @@ void refreshed_selector_proofs() {
         const std::string source((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
         require(source.find(row.required) != std::string::npos, std::string("selector wiring drift: ") + row.id);
     }
+}
 // Host policy/source contract only: allocation and device equality need native gates.
 void host_pin_selector() {
     const auto& entry = allow("host-anon-pin");
