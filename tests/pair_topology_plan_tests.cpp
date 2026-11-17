@@ -113,7 +113,7 @@ inline Wire pair_wire(unsigned rank, const strix::deploy::DeviceFacts& local) {
 void balance_two_rank_identity() {
     std::mt19937 rng(1234U);
     for (int trial = 0; trial < 4000; ++trial) {
-        const std::uint32_t L = 2U + rng() % 47U;
+        const auto L = static_cast<std::uint32_t>(2U + rng() % 47U);
         std::vector<double> layers(L), front(L);
         const bool integer = trial % 3 == 0;   // integer costs: many exact ties
         for (std::uint32_t l = 0; l < L; ++l) {
@@ -165,7 +165,7 @@ void balance_n_ranks() {
     std::mt19937 rng(77U);
     for (std::uint32_t n = 1; n <= 4; ++n) {
         for (int trial = 0; trial < 60; ++trial) {
-            const std::uint32_t L = n + 1U + rng() % 14U;
+            const auto L = static_cast<std::uint32_t>(n + 1U + rng() % 14U);
             std::vector<std::vector<double>> costs(n, std::vector<double>(L));
             for (std::uint32_t l = 0; l < L; ++l) {
                 const double base = 1.0 + double(rng() % 50);
