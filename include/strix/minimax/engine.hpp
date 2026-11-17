@@ -92,8 +92,11 @@ public:
     void prefill_begin(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0);
     using CutFetch = std::function<void(std::uint64_t row0, std::size_t rows, float* h_device_dst, hipStream_t)>;
     // Fetches residual h at the cut. Caller retains fetched host rows until the stream has consumed them.
+    // link_relay: only rank 0 calls `fetch`; its rows reach rank 1 over the pair link in one control exchange per
+    // chunk, enqueued at the same point of the schedule on both ranks (before the chunk's first layer, so it is ordered
+    // with the layer collectives on the same stream). Bytes are those rank 0 fetched: no arithmetic change.
     void prefill_begin_cut(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0,
-                           unsigned first_layer, CutFetch fetch);
+                           unsigned first_layer, CutFetch fetch, bool link_relay = false);
     bool prefill_resume(unsigned layers, std::uint32_t* next);
     void prefill_cancel();
     using PfTaskId = std::uint64_t;
