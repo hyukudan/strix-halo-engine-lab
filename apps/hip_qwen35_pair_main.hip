@@ -346,6 +346,19 @@ int main(int argc, char** argv) try {
                     double(prompt.size()) * 1000.0 / wall, st.wait_ms, st.seal_ms, mhz);
     }
     if (place.head() && !a.dump.empty()) { dumped.resize(E->vocab()); E->read_logits(o, 1, dumped.data()); }
+    {   // Link counter for the decode receipt: round trips of one decode message (header + one row) down and a token back.
+        std::vector<std::byte> big(32U + row_bytes), small(32U);
+        std::vector<double> rtt;
+        for (int i = 0; i < 21; ++i) {
+            if (down) { const auto t = Clock::now(); down->send(big); down->receive(small); if (i) rtt.push_back(ms_since(t)); }
+            if (up) { up->receive(big); up->send(small); }
+        }
+        if (!rtt.empty()) {
+            std::sort(rtt.begin(), rtt.end());
+            std::printf("link ping stage %u->%u: %zu B down + 32 B back, median %.3f ms min %.3f ms max %.3f ms (%zu round trips)\n",
+                        place.stage, place.stage + 1U, big.size(), rtt[rtt.size() / 2U], rtt.front(), rtt.back(), rtt.size());
+        }
+    }
     // Layer-owned decode: one hidden row per cut per token, the token relayed back.
     std::vector<float> row(row_bytes / 4U);
     layers::DecodeOps d;
