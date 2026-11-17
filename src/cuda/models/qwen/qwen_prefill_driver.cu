@@ -22,6 +22,7 @@
 #include "strix/cuda/qwen_dense.hpp"
 #include "strix/cuda/qwen_gdn.hpp"
 #include "strix/cuda/qwen_hc.hpp"
+#include "strix/cuda/qwen_hc_fp16_range.hpp"
 #include "strix/cuda/amd_math.cuh"
 #include "strix/cuda/qwen_moe.hpp"
 #include "strix/cuda/qwen_mtp_defer.hpp"
@@ -692,6 +693,21 @@ void Prefill::Impl::upload_model() {
         probe.gate_type = lw[l].gate_type;
         probe.down_type = lw[l].down_type;
         native_experts = native_experts || moe::native_types(probe);
+    }
+    if (cfg.forms.hc_mma) {  // FAST hc_mma: its FP16 range argument is checked on this model's weights (qwen_hc_fp16_range.hpp)
+        namespace hr = strix::cuda::qwen_hc::fp16_range;
+        hr::Scan scan;
+        std::vector<float> host(4U * kWide);
+        for (std::uint32_t l = 0; l < kLayers; ++l)
+            for (const auto& [norm, inject] : {std::pair{k_hc_attn_norm, k_hc_attn_inject}, std::pair{k_hc_ffn_norm, k_hc_ffn_inject}}) {
+                if (!lw[l].p[norm] || !lw[l].p[inject]) throw std::runtime_error("hc_mma admission: HC norm/inject missing in layer " + std::to_string(l));
+                ck(cudaMemcpy(host.data(), lw[l].p[norm], kWide * sizeof(float), cudaMemcpyDeviceToHost), "hc_mma admission norm");
+                hr::scan_norm(scan, host.data(), kWide);
+                ck(cudaMemcpy(host.data(), lw[l].p[inject], 4U * kWide * sizeof(float), cudaMemcpyDeviceToHost), "hc_mma admission inject");
+                hr::scan_inject(scan, host.data(), 4U * kWide);
+            }
+        if (const auto why = hr::refusal(scan); !why.empty())
+            throw std::runtime_error("hc_mma (qwen-cuda-hc-f16mma-v1) refused for this model: " + why);
     }
     if(cfg.expert_arithmetic!=qwen_packs::ExpertArithmetic::incumbent && route_policy.enabled)
         qwen_route::require_composition(true,qwen_route::Composition::other_weight_pack);

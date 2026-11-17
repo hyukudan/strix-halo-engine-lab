@@ -268,6 +268,10 @@ set_tests_properties(qwen_gdn_state16 PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVIC
 add_executable(qwen_cuda_profile_host_test tests/cuda/qwen_cuda_profile_host_test.cpp)
 target_link_libraries(qwen_cuda_profile_host_test PRIVATE strix_qwen_prefix)
 add_test(NAME qwen_cuda_profile_host COMMAND qwen_cuda_profile_host_test)
+# FAST hc_mma model admission: the FP16 range bound on HC norm / inject weights (host-only).
+add_executable(qwen_hc_fp16_range_host_test tests/cuda/qwen_hc_fp16_range_host_test.cpp)
+target_include_directories(qwen_hc_fp16_range_host_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME qwen_hc_fp16_range_host COMMAND qwen_hc_fp16_range_host_test)
 # Gate kit: teacher-forced logit dump (layout of tools/strix-gate/fast_logit_gate.py); see scripts/bench/cuda/qwen_fast/README.md.
 add_executable(qwen_tf_logits tests/cuda/qwen_tf_logits.cu)
 target_link_libraries(qwen_tf_logits PRIVATE strix_qwen_cuda strix_qwen_handoff)
