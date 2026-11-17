@@ -14,6 +14,7 @@
 // run on the exact rows of the block.
 #include "strix/env_flags.hpp"
 #include "strix/cuda/qwen_prefill.hpp"
+#include "strix/cuda/qwen_options.hpp"
 #include "strix/device/cuda_enumerator.hpp"
 #include <cstdlib>
 #include "strix/moe_route_bf16.hpp"
@@ -21,6 +22,7 @@
 #include "strix/cuda/qwen_dense.hpp"
 #include "strix/cuda/qwen_gdn.hpp"
 #include "strix/cuda/qwen_hc.hpp"
+#include "strix/cuda/amd_math.cuh"
 #include "strix/cuda/qwen_moe.hpp"
 #include "strix/cuda/qwen_mtp_draft.hpp"
 #include "strix/cuda/qwen_plemtp.hpp"
@@ -341,6 +343,8 @@ struct Prefill::Impl : BlockFields {
     // ---- decode window (rollback of a partial accept); the window scratch below holds the rows of every session of the
     // open cohort window (session i at its window_offset) until commit_cohort.
     bool window = false;                       // run_block in window mode (GDN rows kept per layer, split state)
+    Config::Forms executed_forms;
+    bool executed_moe_route_bf16 = false;
     bool cohort_open = false;
     std::vector<SessionState*> cohort;         // the sessions of the open window, in cohort order
     float* win_rows = nullptr;                 // [36][8][gdn_stride]
@@ -958,7 +962,7 @@ SessionState& Prefill::Impl::new_session(std::uint64_t P) {
         for (void* p : s->row_allocations) cudaFree(p);
         throw;
     }
-    s->target_identity = qwen_route::identity(route_policy.enabled, route_policy.enabled).hash;
+    s->target_identity = qwen_options::numerical_identity(cfg).hash;
     if (cfg.diagnostic_bf16_mtp) s->diagnostic_generation = qwen_route::new_engine_binding();
     auto& ref = *s;
     sessions.emplace(ref.id, std::move(s));
@@ -1080,14 +1084,13 @@ ResidencyPlan plan_residency(const Config& config) {
 
 Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
     auto& m = *impl_;
-    m.route_policy = qwen_route::environment(config.moe_route_bf16);
+    m.cfg = qwen_options::resolve_route(config);
+    m.route_policy = *m.cfg.route_policy; // frozen before device work; no second environment lookup
     m.state_type = recurrent_state_policy().type;
     // Typed prefill currently rounds at call boundaries. Reject before device or
     // cache setup until rounding is independent of scheduling and prefix history.
     require_f32_recurrent_state(m.state_type, "CUDA application (schedule-independent prefill and prefix reuse unqualified)");
     m.state_layer_floats = recurrent_state_bytes(gdn::kMatrixFloats, m.state_type) / sizeof(float);
-    m.cfg = config;
-    m.cfg.moe_route_bf16 = m.route_policy.enabled; // freeze before device work
     const auto* diagnostic_graphs = std::getenv("STRIX_QRTX_GRAPHS");
     qwen_mtp_diagnostic::admission(config.diagnostic_bf16_mtp, m.route_policy.enabled,
         config.decode, config.export_state, !config.mtp_sidecar_gguf.empty(),
@@ -1256,7 +1259,7 @@ std::uint64_t Prefill::card_budget_bytes() const { return impl_->cfg.residency.v
 std::uint64_t Prefill::engine_device_bytes() const { return impl_->engine_bytes; }
 
 qwen_route::Identity Prefill::numerical_identity() const {
-    return qwen_route::identity(impl_->route_policy.enabled, impl_->route_policy.enabled);
+    return qwen_options::numerical_identity(impl_->cfg);
 }
 qwen_route::Policy Prefill::route_storage_policy() const { return impl_->route_policy; }
 
@@ -1268,7 +1271,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
     NvtxScope nv;
     std::uint32_t rows = 0;  // all rows of the block
     for (std::uint32_t i = 0; i < count; ++i) {
-        if (seg[i].s->target_identity != qwen_route::identity(route_policy.enabled, route_policy.enabled).hash)
+        if (seg[i].s->target_identity != qwen_options::numerical_identity(cfg).hash)
             throw std::logic_error("Qwen session target identity mismatch");
         rows += seg[i].rows;
     }
@@ -1297,7 +1300,10 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         a.normalized = normalized;
         a.injection = injection;
         a.output = hidden;
+        a.mma = cfg.forms.hc_mma && !window;  // FAST form on run()'s prefill blocks only; verify/step windows stay exact
+        a.workspace_layout = hc::HcWorkspaceLayout::automatic;
         hc::hc_mix(a, tables, stream);
+        executed_forms.hc_mma |= a.mma;
     };
     const auto inject = [&](const std::uint16_t* value) {
         hc::inject(wide, value, injection, pad, wide_next, stream);
@@ -1489,14 +1495,14 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         ew.down = static_cast<const std::uint8_t*>(lw[l].p[k_ffn_down_exps_weight]);
         nv.push("moe_routed");
         if (!tier) {
-            moe::enqueue(mr, pad, kHidden, ew, tables, nullptr, stream);
+            moe::enqueue(mr, pad, kHidden, ew, tables, nullptr, stream, cfg.forms.moe_mma && !window);
         } else {
             // Tiered: the prologue reads the real ids; publish maps them to slots (misses -> the zero slot) and hands the
             // misses to the host; the routed kernels run on the slot routes; gather brings the host raw dots back.
             moe::enqueue_prologue(mr, pad, kHidden, stream);
             tier->publish(l, rows, pad, routes, tier_routes, moe_codes, moe_deltas, moe_sums, stream);
             mr.routes = {tier_routes, kTopK * 4};
-            moe::enqueue_routed(mr, pad, ew, tables, stream);
+            moe::enqueue_routed(mr, pad, ew, tables, stream, cfg.forms.moe_mma && !window);
             tier->wait_gather(rows, moe_raw, mr.rawdots.stride, moe_status, mr.status.stride, csr.summary, stream);
             if (!window) {
                 // Read every layer before its summary is cleared by the next prologue. No failed
@@ -1515,6 +1521,8 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
             }
             moe::enqueue_combine(mr, pad, nullptr, stream);
         }
+        executed_forms.moe_mma |= cfg.forms.moe_mma && !window;
+        executed_moe_route_bf16 |= mr.route_bf16;
         nv.pop();
         if (window) {
             moe_sticky_kernel<<<1, 32, 0, stream>>>(csr.summary, moe_status, 4, pad, moe_sticky);
@@ -1553,7 +1561,8 @@ void Prefill::Impl::qsa_core(std::uint32_t l, const Segment& seg) {
     const auto o = qsa_ordinal(l);
     SessionState& ss = *seg.s;
     const qsa::LayerState st{ss.kv[o], ss.raw_index[o], ss.pooled[o], &ss.pooled_valid[o]};
-    qsa::layer_core(rb, seg.rows, seg.p0, qw, st, rope, tables, qws, stream);
+    qsa::layer_core(rb, seg.rows, seg.p0, qw, st, rope, tables, qws, stream, cfg.forms.qsa_mma && !window);
+    executed_forms.qsa_mma |= cfg.forms.qsa_mma && !window && seg.rows != 0;
 }
 
 void Prefill::Impl::qsa_layer(std::uint32_t l, const Segment* seg, std::uint32_t count) {
@@ -1644,6 +1653,8 @@ Timing Prefill::run(SessionId session, const std::vector<std::uint32_t>& tokens,
     };
     const auto t0 = Clock::now();
     Timing timing;
+    m.executed_forms = {};
+    m.executed_moe_route_bf16 = false;
     // fresh state
     for (std::uint32_t o = 0; o < 12; ++o) {
         ck(cudaMemsetAsync(S.kv[o], 0, position * 2048, m.stream), "kv clear");
@@ -1784,8 +1795,9 @@ Timing Prefill::run(SessionId session, const std::vector<std::uint32_t>& tokens,
                 ck(cudaMemcpyAsync(m.mtp_next, m.next_host.data(), std::uint64_t{n} * 4, cudaMemcpyHostToDevice, m.stream), "mtp next");
                 const auto mwts = m.mtp_weights();
                 mark_stream(m.stream, "mtp_compute_start", k, {}, p0, n, 0);
-                pm::launch_mtp_cache_rows(mwts, pm::MtpRounding{}, m.tap, m.mtp_next, n, p0, S.mtp_kv, S.mtp_index, m.mtp_ws,
+                pm::launch_mtp_cache_rows(mwts, pm::MtpRounding{.mma = m.cfg.forms.mtp_mma}, m.tap, m.mtp_next, n, p0, S.mtp_kv, S.mtp_index, m.mtp_ws,
                                           m.mtp_status, m.tables, m.stream);
+                m.executed_forms.mtp_mma |= m.cfg.forms.mtp_mma;
                 mark_stream(m.stream, "mtp_compute_end", k, {}, p0, n, 0);
                 if (m.cfg.export_state) {
                 const auto kb = std::uint64_t{n} * 2048, ib = std::uint64_t{n} * 256;
@@ -1810,6 +1822,8 @@ Timing Prefill::run(SessionId session, const std::vector<std::uint32_t>& tokens,
         }
         mark_stream(m.stream, "block_end", k, {}, p0, rows, 0);
         ck(cudaStreamSynchronize(m.stream), "block");
+        timing.executed_forms = m.executed_forms;
+        timing.executed_moe_route_bf16 = m.executed_moe_route_bf16;
         const double bs = std::chrono::duration<double>(Clock::now() - tb).count();
         timing.block_s.push_back(bs);
         if (k == 0) timing.first_block_s = bs;
@@ -2000,6 +2014,7 @@ void Prefill::Impl::step_tail(std::uint32_t rows) {
     a.normalized = normalized;
     a.injection = injection;
     a.output = hidden;
+    a.workspace_layout = hc::HcWorkspaceLayout::automatic;
     hc::hc_mix(a, tables, stream);
     const void* head = w.get("output.weight");
     static const bool head1 = strix::envcfg::flag("STRIX_QRTX_HEAD1", false);
@@ -2567,7 +2582,7 @@ std::uint32_t Prefill::Impl::prefill_enqueue(SessionState& S, const std::vector<
             const auto cnt = static_cast<std::uint32_t>(last - p0);
             for (std::uint32_t r = 0; r < cnt; ++r) next_pinned[r] = tokens[p0 + r + 1];
             ck(cudaMemcpyAsync(mtp_next, next_pinned, std::uint64_t{cnt} * 4, cudaMemcpyHostToDevice, stream), "mtp next");
-            pm::launch_mtp_cache_rows(mtp_weights(), pm::MtpRounding{}, tap, mtp_next, cnt, p0, S.mtp_kv, S.mtp_index, mtp_ws,
+            pm::launch_mtp_cache_rows(mtp_weights(), pm::MtpRounding{.mma = cfg.forms.mtp_mma}, tap, mtp_next, cnt, p0, S.mtp_kv, S.mtp_index, mtp_ws,
                                       mtp_status, tables, stream);
         }
     }
@@ -2744,6 +2759,7 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
         hc::HcMixArgs a;
         a.input = in; a.norm = norm; a.inject = inject; a.packed = packed; a.rows = 1;
         a.normalized = m.normalized; a.injection = m.injection; a.output = m.hidden;
+        a.workspace_layout = hc::HcWorkspaceLayout::automatic;
         hc::hc_mix(a, m.tables, m.stream);
     };
     // The whole chain as one graph replay: the same launches with the QSA cores on device maps and the cache positions read
@@ -2948,6 +2964,7 @@ std::vector<Draft> Prefill::draft_cohort(const std::vector<DraftRequest>& reques
         hc::HcMixArgs a;
         a.input = in; a.norm = norm; a.inject = inject; a.packed = packed; a.rows = rows;
         a.normalized = m.normalized; a.injection = m.injection; a.output = m.hidden;
+        a.workspace_layout = hc::HcWorkspaceLayout::automatic;
         hc::hc_mix(a, m.tables, m.stream);
     };
     const qsa::LayerWeights lw{static_cast<const std::uint16_t*>(mw("indexer.q_proj.weight")),

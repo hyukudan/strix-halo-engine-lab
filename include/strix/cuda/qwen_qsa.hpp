@@ -104,7 +104,12 @@ void select_rows(float* block_scores, std::uint32_t max_blocks, std::uint32_t ro
 // attention_score_rows_group256_kernel<64,12,16> + attention_softmax_rows_kernel<64> +
 // attention_output_rows_group_prefetch_kernel<64,12>. scores: [rows][24][2051] workspace.
 void attention(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
-    const std::uint16_t* kv, float* scores, float* attention_output, const amdmath::Tables& tables, cudaStream_t stream);
+    const std::uint16_t* kv, float* scores, float* attention_output, const amdmath::Tables& tables, cudaStream_t stream,
+    bool mma = false);
+// FAST form (Config::forms.qsa_mma): scores + softmax + values + gate in one flash kernel on BF16 tensor cores, FP32 accumulation.
+// Same selected[] / kv / q_gate inputs; no scores workspace. Numerically close to attention(), not bit-identical.
+void attention_mma(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
+    const std::uint16_t* kv, float* attention_output, cudaStream_t stream);
 
 // The three kernels of attention() separately (same arguments).
 void attention_scores(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
@@ -168,6 +173,7 @@ void prepare_replay(const SegmentState* segments, std::uint32_t count, const Wor
 // indexer projection, 3 norms, store, pool (blocks needed by the last row), then per chunk of workspace.chunk_rows rows:
 // block scores, selection, attention. Positions < first_position must already be in `state`.
 void layer_core(const RowBuffers& rows_buf, std::uint32_t rows, std::uint64_t first_position, const LayerWeights& w,
-    const LayerState& state, const RopeTable* cs, const amdmath::Tables& tables, Workspace& ws, cudaStream_t stream);
+    const LayerState& state, const RopeTable* cs, const amdmath::Tables& tables, Workspace& ws, cudaStream_t stream,
+    bool mma_attention = false);
 
 }  // namespace strix::cuda::qwen_qsa
