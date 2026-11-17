@@ -936,10 +936,11 @@ int main(int argc, char** argv) {
         config.state_cache_stats = [&prefix_cache] { return prefix_cache.stats_json(); };
         // /api/status names the bound device (id, UUID, PCI, attach) next to the prefix cache counters.
         const std::string device_json = strix::device::receipt_json(strix::device::bind_cuda());
-        config.status_extra = [&prefix_cache, device_json, &engine](serve::Json& status) {
+        config.status_extra = [&prefix_cache, device_json, &engine, &o](serve::Json& status) {
             status.set("expert_residency", serve::parse_json(engine.residency_json()));
             status.set("expert_residency_receipt", serve::parse_json(engine.residency_receipt_json()));
             status.set("moe_window_rows_receipt", serve::parse_json(engine.moe_rows_receipt_json()));
+            status.set("expert_dispatch", qo::expert_dispatch_json(o.engine, engine.weight_pack_id(), engine.native_experts(), engine.moe_rows()));
             status.set("prefix_cache", serve::parse_json(prefix_cache.stats_json()));
             status.set("device", serve::parse_json(device_json));
         };

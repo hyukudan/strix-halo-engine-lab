@@ -468,6 +468,24 @@ int main() {
             const auto s=one(a,qo::Entry::prefill_service);
             check(qo::config_arithmetic_contract(s.config)==s.contract,"service /health contract = effective config contract: "+s.contract);
         }
+        {   // loaded-dispatch receipt: the class the kernels run, not the declared form; declared contract bytes kept
+            namespace qpk=strix::qwen_packs;
+            const auto mma=one({"--moe-mma","on"},qo::Entry::cli);
+            const auto real=strix::cuda::qwen_prefill::moe_rows_policy(true,false);
+            check(qo::expert_dispatch_class(qpk::ExpertArithmetic::incumbent,true,true)=="cuda-native-iq-fp32@1","native experts ignore moe_mma");
+            check(qo::expert_dispatch_class(qpk::ExpertArithmetic::incumbent,false,true)=="cuda-native-iq-fp32@1","native experts without moe_mma");
+            check(qo::expert_dispatch_class(qpk::ExpertArithmetic::incumbent,true,false)=="cuda-moe-mma@1","A8 + moe_mma");
+            check(qo::expert_dispatch_class(qpk::ExpertArithmetic::incumbent,false,false)=="cuda-four-chain-imma@1","A8 exact");
+            check(qo::expert_dispatch_class(qpk::ExpertArithmetic::gsq_a8_dot4,false,false)==qpk::gsq_a8_contract,"GSQ A8 contract");
+            const auto nat=qo::expert_dispatch_json(mma.config,"gsq-pack",true,real).dump();
+            check(nat.find("\"arithmetic\":\"cuda-native-iq-fp32@1\"")!=std::string::npos,"loaded native receipt names the native class: "+nat);
+            check(nat.find("\"declared_expert_arithmetic\":\"incumbent\"")!=std::string::npos,"declared arithmetic kept: "+nat);
+            check(nat.find("\"weight_pack\":\"gsq-pack\"")!=std::string::npos && nat.find("\"native_experts\":true")!=std::string::npos
+                  && nat.find("\"moe_window_rows_effective\":true")!=std::string::npos,"loaded source facts: "+nat);
+            check(nat.find("\"declared_contract\":\""+mma.contract+"\"")!=std::string::npos,"declared contract = effective config contract: "+nat);
+            const auto g=qo::expert_dispatch_json(gsq.config,"gsq-pack",false,real).dump();
+            check(g.find("\"arithmetic\":\"gsq-iq3s-a8-dot4-cuda-v1\"")!=std::string::npos,"GSQ A8 receipt: "+g);
+        }
         check(qo::numerical_identity(gsq.config).hash!=qo::numerical_identity(native.config).hash,"GSQ snapshots have independent numerical identity");
         check(qo::handoff_numerical_id_config("old",gsq.config)!=qo::handoff_numerical_id_config("old",native.config),"GSQ handoffs cannot masquerade as native");
         check(qo::handoff_numerical_id_config("old",native.config)==qo::handoff_numerical_id("old",qo::choice_of(native.config)),"incumbent handoff bytes preserved");

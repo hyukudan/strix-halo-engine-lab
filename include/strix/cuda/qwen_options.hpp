@@ -317,6 +317,36 @@ inline cp::Choice choice_of(const qp::Config& c) {
 inline std::string config_arithmetic_contract(const qp::Config& c) {
     return with_expert_arithmetic(cp::arithmetic_contract(choice_of(c)), c.expert_arithmetic);
 }
+// Routed-expert arithmetic class the loaded engine dispatches (qwen_moe enqueue_routed): native IQ FP32 SIMT kernels
+// whenever a layer's expert types are native (qwen_moe::native_types, independent of --moe-mma), else the GSQ A8 dot4
+// contract, else the A8 form. Names are the wfmt capture classes (tests/cuda/qwen_moe_wfmt_capture.inc).
+inline std::string_view expert_dispatch_class(qwen_packs::ExpertArithmetic expert, bool moe_mma, bool native_experts) {
+    if (native_experts) return "cuda-native-iq-fp32@1";
+    if (expert == qwen_packs::ExpertArithmetic::gsq_a8_dot4) return qwen_packs::gsq_a8_contract;
+    return moe_mma ? "cuda-moe-mma@1" : "cuda-four-chain-imma@1";
+}
+// Status receipt from loaded facts (Prefill::weight_pack_id / native_experts / moe_rows). Reporting only: the
+// declared contract, numerical identity and hand-off ids keep their bytes.
+inline ::strix::serve::Json expert_dispatch_json(const qp::Config& c, std::string_view weight_pack, bool native_experts,
+                                                 const qp::MoeRowsPolicy& rows) {
+    using J = ::strix::serve::Json;
+    auto out = J::object();
+    out.set("engine", J(std::string("cuda-qwen-moe")));
+    out.set("arithmetic", J(std::string(expert_dispatch_class(c.expert_arithmetic, c.forms.moe_mma, native_experts))));
+    out.set("declared_expert_arithmetic", J(std::string(qwen_packs::expert_arithmetic_name(c.expert_arithmetic))));
+    out.set("declared_contract", J(config_arithmetic_contract(c)));
+    auto source = J::object();
+    source.set("weight_pack", J(std::string(weight_pack)));
+    source.set("native_experts", J(native_experts));
+    source.set("moe_window_rows_effective", J(rows.effective));
+    out.set("source", std::move(source));
+    out.set("reason", J(std::string(native_experts
+        ? "loaded expert types have no A8 route: native IQ FP32 kernels (the moe_mma form does not apply to experts)"
+        : c.expert_arithmetic == qwen_packs::ExpertArithmetic::gsq_a8_dot4
+            ? "loaded GSQ expert types under the explicit GSQ A8 dot4 contract"
+            : "loaded A8 expert types: the declared moe_mma form selects the expert arithmetic")));
+    return out;
+}
 // Preserve historical route-only bytes; every enabled prefill form changes the snapshot target.
 inline ::strix::cuda::qwen_route::Identity numerical_identity(const qp::Config& c) {
     namespace route = ::strix::cuda::qwen_route;
