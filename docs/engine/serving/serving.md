@@ -201,6 +201,19 @@ win, including with that environment switch set. `--baseline` / `STRIX_BASELINE=
 the automatic T and the 1024-row checkpoint default. Inspect `--print-effective-config` for T,
 `serve_automatic_prefill` and `prefix_cache_block_rows`.
 
+An explicit tiled server owner keeps the uniform row layout: every one of its T rows holds its own
+logits and QSA block scores. The bounded QSA score ring and the terminal logits stripe belong to
+the single-request command (`compact_prompt_memory`) and are not command-line options. The server's
+workspace is therefore T times the per-row arena, independent of the context: on Qwen3.8 Flash
+the CPU plan test measures 998,400 bytes per row, i.e. 8,178,892,800 bytes at T = 8192 and
+1,022,361,600 bytes at T = 1024, so `--known-prefix-workspace-budget-bytes 4294967296` refuses
+T8192 and `8589934592` admits it. A refusal prints T, the bytes needed and per row, the budget,
+the layout and the largest row buffers. Prefer the automatic owner: omit the tiled flags and
+budgets, keep only the MTP calibration, golden, sidecar, pins and window budgets, and read the
+`Qwen serve-prefill:` line printed at load for the reason whenever it declines. Low-level
+organization flags are not needed for that route; with them the server keeps their organization
+instead of the single-request decode profile.
+
 GPU service, nesting and slots gates reported EXACT against sequential explicit T2048: complete
 IDs and committed target state matched; service/nesting also checked prompt state, and slots
 covered 1/2/4/8 clients. Every default startup selected automatic T8192. These gates do not
