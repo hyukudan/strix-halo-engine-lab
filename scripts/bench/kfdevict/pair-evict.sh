@@ -3,8 +3,8 @@
 # reports the KFD queue evictions per prefill window and the page-compaction work of both nodes during the ticket.
 #
 #   <queue>/gpu-turn-pair.sh LABEL <repo>/scripts/bench/kfdevict/pair-evict.sh OUT BIN MODEL_DIR base '' a=A.u32
-#   <queue>/gpu-turn-pair.sh LABEL <repo>/scripts/bench/kfdevict/pair-evict.sh OUT BIN MODEL_DIR pages \
-#       'STRIX_HOST_DRIVER_PAGES=1' a=A.u32,b=B.u32,c=C.u32
+#   <queue>/gpu-turn-pair.sh LABEL <repo>/scripts/bench/kfdevict/pair-evict.sh OUT BIN MODEL_DIR off \
+#       'STRIX_HOST_DRIVER_PAGES=0' a=A.u32,b=B.u32,c=C.u32
 #
 # ENV: space-separated NAME=VALUE given to both ranks ('' = none). SESSIONS: name=ids.u32[,...], run in order in one
 # process (first = cold, right after load; a 3-session arm reaches ~35 s after load). KIT_PEER as for every pair kit.
@@ -22,6 +22,8 @@ here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 out=$1 bin=$2 model=$3 arm=$4 envs=$5 sessions=$6
 [[ -n ${KIT_PEER:-} ]] || { echo 'pair-evict: KIT_PEER is not set (ssh alias of the second node)' >&2; exit 64; }
 peer_out=${KIT_PEER_OUT:-$out}
+# Rank 1 prints its ready line only once rank 0 exists: do not spend the ticket waiting for it (the kit's own knob).
+export KIT_PEER_WAIT=${KIT_PEER_WAIT:-8}
 peer() { ssh -o BatchMode=yes -o ServerAliveInterval=15 "$KIT_PEER" "$@"; }
 keys='compact_stall compact_fail compact_success compact_daemon_wake compact_daemon_migrate_scanned compact_migrate_scanned compact_isolated pgmigrate_success pgmigrate_fail'
 vm() { awk -v keys="$keys" 'BEGIN { n = split(keys, k, " "); for (i = 1; i <= n; i++) want[k[i]] = 1 } ($1 in want) { print $1, $2 }' /proc/vmstat; }

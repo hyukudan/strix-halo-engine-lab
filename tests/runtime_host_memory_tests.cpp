@@ -35,12 +35,23 @@ struct Env {
         if (put_ok) values[name] = value;
         return put_ok;
     }
-    bool apply() {
+    unsigned apply(bool default_applies = false) {
         return dev::apply_runtime_host_driver_pages([&](const char* name) { return get(name); },
-                                                    [&](const char* name, const char* value) { return put(name, value); });
+                                                    [&](const char* name, const char* value) { return put(name, value); },
+                                                    default_applies);
     }
     bool driver_pages() const { return dev::runtime_host_memory_is_driver_pages(get(dev::kRuntimePagedMemory)); }
+    // every value of the set is present with the policy's value
+    bool whole_set() const {
+        for (const auto& item : dev::kRuntimeImmovableHostMemory)
+            if (get(item.name) == nullptr || std::string_view(get(item.name)) != item.value) return false;
+        return true;
+    }
+    std::string receipt(bool default_applies, int restart_error = 0) const {
+        return dev::runtime_host_memory_receipt([&](const char* name) { return get(name); }, restart_error, default_applies);
+    }
 };
+constexpr unsigned kAll = (1U << dev::kRuntimeImmovableHostMemory.size()) - 1U;
 
 static_assert(!dev::runtime_host_memory_is_driver_pages(nullptr));
 static_assert(!dev::runtime_host_memory_is_driver_pages(""));
@@ -50,31 +61,47 @@ static_assert(!dev::runtime_host_memory_is_driver_pages("00"));
 static_assert(!dev::runtime_host_memory_is_driver_pages(" 0"));
 static_assert(dev::host_io_route(true) == dev::HostIoRoute::own_pages);
 static_assert(dev::host_io_route(false) == dev::HostIoRoute::shared_allocator);
-static_assert(!dev::kHostDriverPages.default_on, "opt-in until the pair receipt exists");
+static_assert(dev::kHostDriverPages.default_on, "default on where the default applies (pair receipt: no eviction in any window)");
 static_assert(dev::kHostDriverPages.exactness == strix::lever::Exactness::bitwise);
+static_assert(std::string_view(dev::kRuntimeImmovableHostMemory[0].name) == dev::kRuntimePagedMemory,
+              "the first value of the set is the mode switch the engine routes direct I/O by");
 
 void environment_step() {
     {
-        Env env;  // nothing set: the runtime default stays, nothing is written
-        require(!env.apply() && env.puts == 0 && !env.driver_pages(), "default must not touch the runtime mode");
+        Env env;  // nothing set, a device the default does not apply to: the runtime default stays, nothing is written
+        require(env.apply(false) == 0 && env.puts == 0 && !env.driver_pages(), "no default where it does not apply");
     }
     {
-        Env env;
+        Env env;  // nothing set, device memory is host memory: the whole set, once
+        require(env.apply(true) == kAll && env.puts == 4 && env.driver_pages() && env.whole_set(), "default inserts the whole set");
+        require(env.apply(true) == 0 && env.puts == 4, "the restarted image finds the values and does not insert again");
+    }
+    {
+        Env env;  // the switch decides on any device
         env.values["STRIX_HOST_DRIVER_PAGES"] = "1";
-        require(env.apply() && env.puts == 1 && env.driver_pages(), "lever on inserts the runtime value");
-        require(!env.apply() && env.puts == 1, "the restarted image finds the value and does not insert again");
+        require(env.apply(false) == kAll && env.puts == 4 && env.whole_set(), "lever on inserts the whole set");
+        require(env.apply(false) == 0 && env.puts == 4, "the restarted image finds the values and does not insert again");
     }
     for (const char* explicit_value : {"1", "", "0"}) {
-        Env env;
-        env.values["STRIX_HOST_DRIVER_PAGES"] = "1";
-        env.values[dev::kRuntimePagedMemory] = explicit_value;
-        require(!env.apply() && env.puts == 0, "an explicit runtime value always wins");
-        require(env.driver_pages() == (std::string_view(explicit_value) == "0"), "mode follows the explicit value");
+        for (const bool default_applies : {false, true}) {
+            Env env;
+            env.values["STRIX_HOST_DRIVER_PAGES"] = "1";
+            env.values[dev::kRuntimePagedMemory] = explicit_value;
+            require(env.apply(default_applies) == 0 && env.puts == 0, "an explicit runtime mode always wins: nothing is inserted");
+            require(env.driver_pages() == (std::string_view(explicit_value) == "0"), "mode follows the explicit value");
+        }
     }
     {
+        Env env;  // a supplied secondary value is kept, the rest of the set is inserted
+        env.values[dev::kRuntimeSharedVirtualMemory] = "1";
+        const unsigned inserted = env.apply(true);
+        require(inserted == (kAll & ~2U) && env.puts == 3 && env.driver_pages(), "absent values only");
+        require(std::string_view(env.get(dev::kRuntimeSharedVirtualMemory)) == "1" && !env.whole_set(), "the supplied value stays");
+    }
+    for (const bool default_applies : {false, true}) {
         Env env;
         env.values["STRIX_HOST_DRIVER_PAGES"] = "0";
-        require(!env.apply() && env.puts == 0, "lever off");
+        require(env.apply(default_applies) == 0 && env.puts == 0, "off switch");
     }
     {
         Env env;
@@ -95,37 +122,91 @@ void environment_step() {
 
 void restart_step() {
     int restarts = 0, erased = 0;
-    const auto erase_ok = [&](const char* name) { erased += std::string_view(name) == dev::kRuntimePagedMemory; return true; };
-    require(dev::finish_runtime_host_driver_pages(false, erase_ok, [&] { ++restarts; return 0; }) == 0 && restarts == 0 && erased == 0,
+    const auto erase_ok = [&](const char*) { ++erased; return true; };
+    require(dev::finish_runtime_host_driver_pages(0U, erase_ok, [&] { ++restarts; return 0; }) == 0 && restarts == 0 && erased == 0,
             "nothing inserted: no restart, nothing erased");
-    // exec returned: the already-initialised runtime did not read the value, so the engine must not route for it
+    // exec returned: the already-initialised runtime did not read the values, so the engine must not route for them
     Env env;
-    env.values["STRIX_HOST_DRIVER_PAGES"] = "1";
-    require(env.apply() && env.driver_pages(), "inserted");
+    env.values[dev::kRuntimeSharedVirtualMemory] = "1";  // supplied by the operator: not ours to erase
+    const unsigned inserted = env.apply(true);
+    require(inserted == (kAll & ~2U) && env.driver_pages(), "inserted");
     const int error = dev::finish_runtime_host_driver_pages(
-        true, [&](const char* name) { ++erased; return env.values.erase(name) == 1; }, [&] { ++restarts; return EACCES; });
-    require(error == EACCES && restarts == 1 && erased == 1, "failed restart reports the exec error and rolls back");
+        inserted, [&](const char* name) { ++erased; return env.values.erase(name) == 1; }, [&] { ++restarts; return EACCES; });
+    require(error == EACCES && restarts == 1 && erased == 3, "failed restart reports the exec error and rolls back what it inserted");
     require(!env.driver_pages() && dev::host_io_route(env.driver_pages()) == dev::HostIoRoute::shared_allocator,
             "after rollback the engine routes for the runtime default");
+    require(env.values.size() == 1 && std::string_view(env.get(dev::kRuntimeSharedVirtualMemory)) == "1",
+            "rollback leaves exactly the operator's value");
     require(dev::runtime_host_memory_restart_error() == EACCES, "restart error kept for the receipt");
     bool failed = false;
     try {
-        (void)dev::finish_runtime_host_driver_pages(true, [](const char*) { return false; }, [] { return EACCES; });
+        (void)dev::finish_runtime_host_driver_pages(1U, [](const char*) { return false; }, [] { return EACCES; });
     } catch (const std::runtime_error&) { failed = true; }
     require(failed, "a rollback that cannot be done is an error");
 }
 
 void receipt_lines() {
-    require(dev::runtime_host_memory_receipt(nullptr, nullptr, 0).empty(), "default mode prints nothing");
-    require(dev::runtime_host_memory_receipt("1", "1", 0).empty(), "explicit user pages prints nothing");
-    require(dev::runtime_host_memory_receipt("0", "1", 0) ==
-                "runtime host memory: driver pages (STRIX_HOST_DRIVER_PAGES=1), direct-I/O staging on engine pages",
-            "lever receipt");
-    require(dev::runtime_host_memory_receipt("0", nullptr, 0) ==
-                "runtime host memory: driver pages (HSA_USERPTR_FOR_PAGED_MEM=0), direct-I/O staging on engine pages",
-            "explicit runtime value receipt");
-    require(dev::runtime_host_memory_receipt(nullptr, "1", EACCES).starts_with("runtime host memory: user pages (restart failed: "),
-            "restart failure receipt");
+    const std::string tail = ", direct-I/O staging on engine pages; queue context on driver pages; pageable copies staged";
+    {
+        Env env;
+        require(env.receipt(false).empty() && env.receipt(true).empty(), "runtime defaults, nothing asked: no line");
+        env.values["STRIX_HOST_DRIVER_PAGES"] = "0";
+        require(env.receipt(false).empty(), "off switch where the default does not apply: no line");
+        require(env.receipt(true) == "runtime host memory: user pages (STRIX_HOST_DRIVER_PAGES=0)", "off switch receipt");
+    }
+    {
+        Env env;
+        require(env.apply(true) == kAll, "default");
+        require(env.receipt(true) == "runtime host memory: driver pages (default: device memory is host memory)" + tail, "default receipt");
+    }
+    {
+        Env env;
+        env.values["STRIX_HOST_DRIVER_PAGES"] = "1";
+        require(env.apply(false) == kAll, "lever");
+        require(env.receipt(false) == "runtime host memory: driver pages (STRIX_HOST_DRIVER_PAGES=1)" + tail, "lever receipt");
+    }
+    {
+        Env env;  // the operator's own mode: the line says what is and is not covered
+        env.values[dev::kRuntimePagedMemory] = "0";
+        require(env.receipt(true) == "runtime host memory: driver pages (HSA_USERPTR_FOR_PAGED_MEM=0), direct-I/O staging on engine pages; "
+                                     "queue context on movable pages; pageable copies registered in place",
+                "explicit runtime value receipt");
+        env.values[dev::kRuntimePagedMemory] = "1";
+        env.values["STRIX_HOST_DRIVER_PAGES"] = "1";
+        require(env.receipt(true).empty(), "explicit user pages prints nothing");
+    }
+    {
+        Env env;
+        env.values["STRIX_HOST_DRIVER_PAGES"] = "1";
+        require(env.receipt(true, EACCES).starts_with("runtime host memory: user pages (restart failed: "), "restart failure receipt");
+    }
+}
+
+// The device class the default applies to, from the driver's topology text (no runtime, no device).
+void topology_probe() {
+    using M = dev::KfdNodeMemory;
+    require(dev::kfd_node_memory("cpu_cores_count 16\nsimd_count 0\nlocal_mem_size 0\n") == M::not_a_gpu, "CPU node");
+    require(dev::kfd_node_memory("simd_count 80\nmem_banks_count 1\nlocal_mem_size 0\nfw_version 34\n") == M::host_shared, "host-shared GPU");
+    require(dev::kfd_node_memory("simd_count 384\nlocal_mem_size 25753026560\n") == M::dedicated, "GPU with its own memory");
+    require(dev::kfd_node_memory("simd_count 80\n") == M::dedicated, "a GPU that does not say is not claimed");
+    require(dev::kfd_node_memory("max_simd_count 80\nlocal_mem_size 0\n") == M::not_a_gpu, "key must start the line");
+    require(dev::kfd_node_memory("simd_count 80\nlocal_mem_size 0x0\n") == M::dedicated, "unparsed value is not claimed");
+    require(dev::kfd_node_memory("") == M::not_a_gpu, "empty text");
+
+    const std::filesystem::path root = std::filesystem::temp_directory_path() / "strix-runtime-host-memory-tests";
+    std::filesystem::remove_all(root);
+    const auto node = [&](const char* name, const char* text) {
+        std::filesystem::create_directories(root / name);
+        std::ofstream(root / name / "properties", std::ios::binary) << text;
+    };
+    require(!dev::kfd_gpus_share_host_memory(root / "missing"), "no topology: the default does not apply");
+    node("0", "cpu_cores_count 16\nsimd_count 0\nlocal_mem_size 0\n");
+    require(!dev::kfd_gpus_share_host_memory(root), "no GPU: the default does not apply");
+    node("1", "simd_count 80\nlocal_mem_size 0\n");
+    require(dev::kfd_gpus_share_host_memory(root), "one host-shared GPU");
+    node("2", "simd_count 384\nlocal_mem_size 25753026560\n");
+    require(!dev::kfd_gpus_share_host_memory(root), "a GPU with its own memory beside it: not claimed");
+    std::filesystem::remove_all(root);
 }
 
 std::string read(const std::filesystem::path& path) {
@@ -164,6 +245,14 @@ void direct_io_sources(const std::filesystem::path& root) {
     require(gate.find("apply_runtime_host_driver_pages(") < gate.find("eager_code_load_or_restart(argv, code_load);") &&
                 gate.find("eager_code_load_or_restart(argv, code_load);") < gate.find("finish_runtime_host_driver_pages("),
             "the runtime value must be inserted before the eager-code restart and settled after it");
+    // One resolver for every entry point (command line and serving alike): the default is decided in the start gate
+    // only, from the topology probe and the code-load policy, and the effective mode is recorded there.
+    require(gate.find("const bool host_pages_default = code_load == CodeLoad::shared && kfd_gpus_share_host_memory();") != std::string::npos,
+            "the default must come from the topology probe and the shared code-load policy");
+    require(gate.find("strix::envcfg::record(\"STRIX_HOST_DRIVER_PAGES\"") != std::string::npos, "effective mode must be recorded");
+    for (const char* file : {"include/strix/pinned_host.hpp", "src/core/hip_weight_uploader.hpp", "apps/minimax_rank_main.cpp"})
+        require(read(root / file).find("apply_runtime_host_driver_pages(") == std::string::npos,
+                std::string("a second resolver of the runtime host memory mode: ") + file);
 }
 
 }  // namespace
@@ -173,6 +262,7 @@ int main() {
         environment_step();
         restart_step();
         receipt_lines();
+        topology_probe();
         direct_io_sources(std::filesystem::path(STRIX_RUNTIME_HOST_MEMORY_SOURCE_DIR));
     } catch (const std::exception& e) {
         std::fprintf(stderr, "runtime host memory tests: FAILED: %s\n", e.what());
