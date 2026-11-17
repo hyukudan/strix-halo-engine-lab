@@ -161,18 +161,41 @@ generation setting, CUDA sm_120 and a 534 W configured GPU cap gave:
 These are window timings, not whole-model generation throughput or a claim about
 all request mixes. Tiered execution and numerical quality qualification are unchanged.
 
-### Native expert shared-memory layout
+### Shared native expert pipeline
 
 The shared native expert kernels use padded group storage and vector loads to
-avoid bank conflicts, retaining their arithmetic order. The 60-case capture is
-byte-identical; all 20 native cases also retain stable capture digests across
-four timing runs. No extra numerical route or control is introduced.
+avoid bank conflicts. A compile-time decoder binding removes the per-group
+runtime type switch, and each down-projection weight group is decoded once per
+expert tile rather than once per eight-row chunk. Per-assignment arithmetic and
+reduction order remain unchanged. There is no new numerical route or control.
 
-A matched served C1 prefill pair on an RTX PRO 6000 at a configured 534 W used
-the same GSQ IQ3_S model files, exact prefill, 8,076 actual prompt tokens,
-prefix caching off and one emitted token. Warm prefill rose from 407.9 to
-925.6 tokens/s (19.800 to 8.725 seconds), a 2.27× improvement in this cell.
-The first requests measured 406.4 and 1,019.9 tokens/s. This is one process per
-arm and two request-order observations, not an all-workload speed claim.
-The timing client saved output counts rather than token IDs; bitwise evidence
-comes from the separate native capture tests, not this full-model timing pair.
+On an RTX PRO 6000 at a configured 534 W, the same GSQ IQ3_S model files, exact
+prefill, 8,076 actual prompt tokens, prefix caching off and one emitted token gave:
+
+| Pipeline | First request (tokens/s) | Second request (tokens/s) |
+|---|---:|---:|
+| Initial native pipeline | 406.4 | 407.9 |
+| Conflict-free group storage | 1,019.9 | 925.6 |
+| Typed decoder and down-group reuse | 1,665.9 | 1,717.3 |
+
+The final second-request time is 4.703 seconds versus the initial 19.800 seconds,
+a 4.21× improvement in this served cell. Each version used one fresh process and
+two fixed request-order observations; these are not all-workload figures. The
+timing client saved output counts rather than token IDs. Bitwise evidence comes
+from the separate native captures, not this full-model timing series.
+
+The group-layout change retains the full 60-case capture. The typed decoder
+retains all 20 changed native records plus two T=51 cases covering multiple
+chunks, a tail and runtime-source fallback. Each comparison covers complete
+record bytes; unchanged MMA controls are reused.
+
+| Adapter | Binding of this shared correction |
+|---|---|
+| CUDA Qwen MoE | Binds the shared NativeScalar/CudaNativeFp32 expert source and CSR/rawdot kernels. |
+| CUDA DeepSeek | Uses IQ2_XXS-to-A8/Q2_K expert arithmetic with different scale and clamp contracts; this FP32 body cannot be bound unchanged. |
+| CUDA GLM and MiniMax | Use trellis projections and transform geometry rather than GGML native group decoding. |
+| Dense CUDA Qwen | Uses the shared dense BF16/Q8/NVFP4 core, with no routed-expert CSR/rawdot body. |
+| HIP-only adapters | Have no CUDA native-expert binding; CUDA intrinsics and types are not transplanted into HIP. |
+
+The implementation lives in `src/cuda/core/moe_a8.cuh` and
+`src/cuda/weight/gsq_sources.cuh`; the Qwen adapter only selects the shared source.
