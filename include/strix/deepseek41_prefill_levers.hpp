@@ -125,6 +125,7 @@ inline constexpr PrefillLever kPrefillLevers[] = {
     {"STRIX_DS41_FAST_ATTN", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
     {"STRIX_DS41_FAST_ATTN_Q16", PrefillLeverClass::reload},  // static once per process (hip_deepseek41_prefill.hip)
     {"STRIX_DS41_FAST_DENSE", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
+    {"STRIX_DS41_FAST_DENSE_BATCH", PrefillLeverClass::cached},  // scheduling only (batched o_a groups), same bits
     {"STRIX_DS41_FAST_DENSE_MIN_ROWS", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
     {"STRIX_DS41_FAST_ENGRAM", PrefillLeverClass::reload},  // startup pair resolver exports the Engram policy
     {"STRIX_DS41_FAST_I4", PrefillLeverClass::runtime},
