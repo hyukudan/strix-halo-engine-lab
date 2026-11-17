@@ -10,7 +10,8 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${ROOT}/src/hip_deepseek41_prefill.hip"
     "${ROOT}/src/hip_ds41_layer.hip"
     "${ROOT}/src/hip_ds41_prefill.hip"
-    "${ROOT}/src/core/f16_dense_q8a8.hpp")
+    "${ROOT}/src/core/f16_dense_q8a8.hpp"
+    "${ROOT}/src/hip/weight/ggml_sources.hpp")
 execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract.py"
     "${ROOT}" "${CMAKE_CURRENT_BINARY_DIR}" COMMAND_ERROR_IS_FATAL ANY)
 function(host_target name)
@@ -46,6 +47,9 @@ host_target(pr584-profile profile.cpp "${ROOT}/src/deepseek41_pair_defaults.cpp"
 add_test(NAME pr584-profile-agreement COMMAND pr584-profile)
 host_target(pr584-dense dense.cpp)
 add_test(NAME pr584-dense-parts COMMAND pr584-dense)
+foreach(case zero-parts k-offset overflow invalid controls batch-off)
+    add_test(NAME pr724-dense-groups-${case} COMMAND pr584-dense ${case})
+endforeach()
 host_target(pr584-precision-owner precision_owner.cpp)
 add_test(NAME dayaudit2-precision-per-execution COMMAND pr584-precision-owner)
 host_target(pr623-group ../prefill_group_regression_tests.cpp)

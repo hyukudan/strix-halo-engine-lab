@@ -697,8 +697,12 @@ struct Engine::Impl {
     // STRIX_MM_PF_HEADLESS (default ON, exact): the last layer of a headless chunk runs cache-only (strix/prefill_headless.hpp):
     // q/k/v + index projections and the cache prep unchanged, no attention / o_proj / exchanges / FFN for that chunk.
     bool pf_headless = true;
+    // STRIX_MM_PF_DENSE_MLP (default ON, exact): the dense MLP of layers 0..kFirstMoe-1 (gate + up, then down) on the v4
+    // prefill core for 4096-row pieces (dense_mlp), the q/k/v core contract (== strix_gemm bitwise); 0 keeps strix_gemm.
+    bool pf_dense_mlp = true;
     bool pf_headless_logged = false;
     std::uint64_t pf_headless_chunks = 0;  // chunks that ran their last layer cache-only
+    std::uint64_t pf_dense_mlp_calls = 0;  // dense MLP pieces that ran on the v4 core
     bool pf_msa_batch = true;  // STRIX_MM_PF_MSA_BATCH (default ON, exact measurement): independent scratch per prefill window
     unsigned pf_msa_windows = 0;
     float *pf_scores = nullptr, *pf_partial = nullptr;
@@ -914,6 +918,7 @@ struct Engine::Impl {
         pf_attend4 = env_flag("STRIX_MM_PF_ATTEND4", true);
         pf_msa_batch = env_flag("STRIX_MM_PF_MSA_BATCH", true);
         pf_headless = env_flag("STRIX_MM_PF_HEADLESS", true);
+        pf_dense_mlp = env_flag("STRIX_MM_PF_DENSE_MLP", true);
         if (const char* value = std::getenv("STRIX_MM_PF_IDX_CONC")) {
             const std::string mode(value);
             if (mode != "0" && mode != "1" && mode != "2")
@@ -2069,6 +2074,15 @@ struct Engine::Impl {
         return dense_admit(n, job, pf_dense_o && n == kDenseORows);
     }
 
+    // Prefill dense MLP (layers 0..kFirstMoe-1) on the v4 core: gate + up in one call, down in another, the dense_qkv
+    // contract (== strix_gemm bitwise). Only 4096-row pieces (the size measured; others keep strix_gemm).
+    bool dense_mlp(std::size_t n, const mmoe::PrefillDenseJob* jobs, unsigned count) const {
+        if (!pf_dense_mlp || n != kDenseORows || pf_ws == nullptr) return false;
+        for (unsigned i = 0; i < count; ++i)  // raw weights loaded, same input width, implemented bit width
+            if (jobs[i].w.trellis == nullptr || jobs[i].w.input != jobs[0].w.input || !mmoe::prefill_dense_supported(jobs[i].w)) return false;
+        return mmoe::prefill_dense_workspace_bytes(jobs, count, static_cast<unsigned>(n)) <= pf_ws_bytes;
+    }
+
     // Layer L up to the attention partial: q/k/v + index projections, MSA, o_proj -> out (n rows; h / hn: the rows').
     // cache_only (headless chunk, prefill_group): returns true when the batched prefill stage ran its cache prep only
     // (no attention output, no o_proj: `out` is not written); any other route runs the full stage and returns false.
@@ -2416,6 +2430,13 @@ struct Engine::Impl {
                     } else {
                         mmoe::enqueue_linears(&dn, 1, static_cast<unsigned>(n), lin_ws, nullptr);
                     }
+                } else if (const mmoe::PrefillDenseJob gu[2] = {{y.rdense.gate, big1}, {y.rdense.up, big2}},
+                           dn[1] = {{y.rdense.down, out}};
+                           !gemv && dense_mlp(n, gu, 2) && dense_mlp(n, dn, 1)) {  // STRIX_MM_PF_DENSE_MLP
+                    mmoe::enqueue_prefill_dense(gu, 2, hn, static_cast<unsigned>(n), pf_ws, pf_ws_bytes, nullptr);
+                    hipLaunchKernelGGL(swiglu_kernel, dim3(grid(n * kDenseLocal)), dim3(256), 0, nullptr, big1, big2, big1, n * kDenseLocal);
+                    mmoe::enqueue_prefill_dense(dn, 1, big1, static_cast<unsigned>(n), pf_ws, pf_ws_bytes, nullptr);
+                    ++pf_dense_mlp_calls;
                 } else {
                     run_mlp(y.dense, hn, n, kDenseLocal, out);
                 }
@@ -3835,6 +3856,12 @@ void Engine::set_prefill_headless(bool on) {
     impl_->pf_headless = on;
 }
 bool Engine::prefill_headless() const { return impl_->pf_headless; }
+void Engine::set_prefill_dense_mlp(bool on) {
+    impl_->no_task("set_prefill_dense_mlp");
+    impl_->pf_dense_mlp = on;
+}
+bool Engine::prefill_dense_mlp() const { return impl_->pf_dense_mlp; }
+std::uint64_t Engine::prefill_dense_mlp_count() const { return impl_->pf_dense_mlp_calls; }
 std::uint64_t Engine::prefill_headless_chunks() const { return impl_->pf_headless_chunks; }
 std::size_t Engine::prefill_headless_expected(std::size_t rows) const {
     return strix::prefill_headless::expected_chunks(rows, impl_->opt.max_rows, impl_->pf_group);

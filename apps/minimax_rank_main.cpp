@@ -26,7 +26,7 @@
 //   --batch PROMPT.u32:STEPS:N1,N2,...               batched decode (rows = prefixes of the prompt), checked vs alone
 //   --verify-trace NAME:PROMPT.u32:REPS:R1,R2,...    verify-shaped steps (one slot, R rows) timed by R (xfer on/off
 //                                                     ABA) + per-phase GPU trace and distinct routed experts per layer
-//   --ab FLAG:PROMPT.u32:BLOCK                       ABA x3 of a runtime flag (staging | shared | attn | linears | xfer | attnpf | index | idxdec | idxattn | idxconc | xbwait | xbinplace | xbboth | xbprep | xbfold | xbpub | xbwarm | xbwarmo | moegrid | moepipe | xbilp | xbset | pfx | pfil | pfxip | pfattn4 | pfmsa | pfheadless | pfmsarework | mtfit | core8 | pfpipe | pfpair | pftails | pftab | pfgufuse | pfrouter | pfrouterrows | core8v2 | pfidxconc | pfkvtile | pftiled | pfidx | pftxuc | pfall | pfi4): TTFT and decode blocks
+//   --ab FLAG:PROMPT.u32:BLOCK                       ABA x3 of a runtime flag (staging | shared | attn | linears | xfer | attnpf | index | idxdec | idxattn | idxconc | xbwait | xbinplace | xbboth | xbprep | xbfold | xbpub | xbwarm | xbwarmo | moegrid | moepipe | xbilp | xbset | pfx | pfil | pfxip | pfattn4 | pfmsa | pfheadless | pfdensemlp | pfmsarework | mtfit | core8 | pfpipe | pfpair | pftails | pftab | pfgufuse | pfrouter | pfrouterrows | core8v2 | pfidxconc | pfkvtile | pftiled | pfidx | pftxuc | pfall | pfi4): TTFT and decode blocks
 //                                                    (pfidxconc: 0 vs STRIX_MM_AB_IDXCONC=1|2, default 2; 7 hashed prefills)
 //                                                    (pfkvtile: off vs STRIX_MM_AB_KVTILE=auto|<index>, default auto; 7 hashed prefills)
 //                                                    (pftxuc: PFX copy-to-host-coherent vs producer-to-uncached TX; 7 hashed prefills)
@@ -1085,6 +1085,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
             eng.set_prefill_tx_uncached(on);
         }
         else if (flag == "pfmsa") eng.set_prefill_msa_batch(on);
+        else if (flag == "pfdensemlp") eng.set_prefill_dense_mlp(on);  // layers 0-2 dense MLP: strix_gemm (A) / v4 core (B)
         else if (flag == "pfheadless") eng.set_prefill_headless(on);  // last layer of headless chunks: full (A) / cache-only (B)
         else if (flag == "pfattn4") eng.set_prefill_attend4(on);
         else if (flag == "pfidxconc") eng.set_prefill_index_concurrent(on ? idx_conc_b : 0);
@@ -1152,6 +1153,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
                          : flag == "pftxuc" ? eng.prefill_tx_uncached()
                          : flag == "pfmsa" ? eng.prefill_msa_batch()
                          : flag == "pfheadless" ? eng.prefill_headless()
+                         : flag == "pfdensemlp" ? eng.prefill_dense_mlp()
                          : flag == "pfattn4" ? eng.prefill_attend4()
                          : flag == "pfidxconc" ? eng.prefill_index_concurrent() != 0
                          : flag == "pfrouter" ? eng.prefill_router_batch()
@@ -1173,16 +1175,19 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     std::vector<double> ttft[2], step_ms[2];
     std::vector<std::uint32_t> first(6);
     std::vector<std::uint64_t> states, outs;  // per arm: K/V/IK state FNV, final-rows FNV (this rank only; never in the cross-rank hash)
-    const bool hash_state = ((flag == "pfattn4" || flag == "pfmsa" || flag == "pfheadless" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall")) || (state_fnv_on() && (flag == "pfx" || flag == "pfil" || flag == "pfxip" || std::getenv("STRIX_MM_AB_STATE") != nullptr));
+    const bool hash_state = ((flag == "pfattn4" || flag == "pfmsa" || flag == "pfheadless" || flag == "pfdensemlp" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall")) || (state_fnv_on() && (flag == "pfx" || flag == "pfil" || flag == "pfxip" || std::getenv("STRIX_MM_AB_STATE") != nullptr));
     // pfattn4 / pfmsa / pfmsarework / mtfit / core8 / pftab / pfgufuse / pfidx / pftxuc / pfrouter / pfidxconc / pfkvtile / pftiled: A B A B A B A (every B bracketed by two A prefills); the other prefill flags: A B A B A B
     const int prefills = flag == "attn" || flag == "linears" || flag == "xfer" || flag == "idxdec" || flag == "idxconc" || flag == "xbfold" || flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbpub" || flag == "xbwarm" || flag == "xbwarmo" || flag == "moegrid" || flag == "moepipe" || flag == "xbilp" || flag == "xbset" ? 1 : (flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall" || flag == "pfi4") ? 7 : 6;  // idxattn: both  // decode-only flags: one prefill, no TTFT cells
     first.resize(static_cast<std::size_t>(prefills));
+    std::vector<std::uint64_t> dense_mlp_calls;
     for (int r = 0; r < prefills; ++r) {
         set(r % 2 == 1);
+        const auto dense_before = eng.prefill_dense_mlp_count();
         const auto headless_before = eng.prefill_headless_chunks();
         const auto t0 = Clock::now();
         first[static_cast<std::size_t>(r)] = eng.prefill(0, prompt, 0);
         ttft[r % 2].push_back(secs(t0, Clock::now()));
+        dense_mlp_calls.push_back(eng.prefill_dense_mlp_count() - dense_before);
         if (flag == "pfheadless") {
             const auto headless_after = eng.prefill_headless_chunks();
             const auto expected = eng.prefill_headless_expected(prompt.size());
@@ -1268,6 +1273,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     else if (flag == "pfidxconc") eng.set_prefill_index_concurrent(idx_conc0);
     else if (flag == "pftiled") strix_trellis_lab_set_wmma_tiled(-1);
     else if (flag == "pfheadless") eng.set_prefill_headless(start_arm);
+    else if (flag == "pfdensemlp") eng.set_prefill_dense_mlp(start_arm);
     else if (flag == "pfi4") strix::minimax::moe::opt::set_prefill_iu4(-1);
     else if (flag == "pfall") {
         eng.set_prefill_msa_batch(msa0);
@@ -1329,6 +1335,17 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
         if (!same_state || !same_out) g_exact_fail = true;
     }
     if (!same_first) g_exact_fail = true;
+    if (flag == "pfdensemlp") {
+        bool covered = true;
+        std::printf("rank %u ab-%s: candidate calls per prefill (A B A B ...):", eng.rank(), flag.c_str());
+        for (std::size_t i = 0; i < dense_mlp_calls.size(); ++i) {
+            const auto calls = dense_mlp_calls[i];
+            std::printf(" %llu", static_cast<unsigned long long>(calls));
+            covered &= i % 2 == 0 ? calls == 0 : calls > 0;
+        }
+        std::printf(" -> %s\n", covered ? "COVERED (A=0, B>0)" : "UNQUALIFIED (requires A=0 and B>0 on every prefill; fallback equality only)");
+        if (!covered) g_exact_fail = true;
+    }
     std::printf("rank %u ab-%s: decode ms/token median per block (A=off, B=on):", eng.rank(), flag.c_str());
     for (int b = 0; b < blocks; ++b) {
         // drop the block's first 2 steps (arm switch)

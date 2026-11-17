@@ -18,7 +18,8 @@ def copy_scope(dest):
     shutil.copy2(root / "include/strix/serve/session_runtime.hpp", dest / "include/strix/serve/session_runtime.hpp")
     for rel in ("src/hip/weight/trellis_sources.hpp", "CMakeLists.txt", "cmake/StrixSession.cmake", "src/serve/engine.cpp",
                 "src/serve/session_runtime.cpp", "include/strix/serve/engine.hpp",
-                "include/strix/prefill_headless.hpp"):
+                "include/strix/prefill_headless.hpp", "include/strix/pinned_host.hpp",
+                "include/strix/lever.hpp", "src/dist_communicator.cpp"):
         target = dest / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(root / rel, target)
@@ -110,3 +111,15 @@ with tempfile.TemporaryDirectory(prefix="queue-owner-", dir=scratch) as temp:
     assert result.returncode != 0 and "src/serve/engine.cpp" in result.stdout, result.stdout
 
 print("PASS receipted Git snapshot and source audit negatives; current source gate retains seven unresolved rows")
+
+for relative in ("include/strix/pinned_host.hpp", "include/strix/lever.hpp", "src/dist_communicator.cpp"):
+    with tempfile.TemporaryDirectory(prefix="host-pin-", dir=scratch) as temp:
+        tree = pathlib.Path(temp) / "tree"
+        copy_scope(tree)
+        owner = tree / relative
+        owner.write_bytes(owner.read_bytes() + b"\n// selector drift\n")
+        edited = audit(tree)
+        assert edited.returncode != 0 and relative in edited.stdout, edited.stdout
+        owner.unlink()
+        removed = audit(tree)
+        assert removed.returncode != 0 and relative in removed.stdout, removed.stdout

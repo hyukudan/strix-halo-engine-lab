@@ -223,6 +223,9 @@ public:
     [[nodiscard]] bool prefill_msa_batch() const;
     void set_prefill_headless(bool on);  // STRIX_MM_PF_HEADLESS, default on: last layer cache-only for headless chunks (exact)
     [[nodiscard]] bool prefill_headless() const;
+    void set_prefill_dense_mlp(bool on);  // STRIX_MM_PF_DENSE_MLP, default on: layers 0..2 dense MLP on the v4 core (== strix_gemm bits)
+    [[nodiscard]] bool prefill_dense_mlp() const;
+    [[nodiscard]] std::uint64_t prefill_dense_mlp_count() const;  // submitted dense MLP pieces; read between tasks
     [[nodiscard]] std::uint64_t prefill_headless_chunks() const;  // cumulative successful cache-only chunks on this rank
     [[nodiscard]] std::size_t prefill_headless_expected(std::size_t rows) const;  // qualification target, independent of admission
     void set_prefill_msa_rework(unsigned mode);  // STRIX_MM_PF_MSA_REWORK=0..10; prefill only, default 10
