@@ -923,7 +923,7 @@ struct Engine::Impl {
         pf_attend4 = env_flag("STRIX_MM_PF_ATTEND4", true);
         pf_msa_batch = env_flag("STRIX_MM_PF_MSA_BATCH", true);
         pf_headless = env_flag("STRIX_MM_PF_HEADLESS", true);
-        if (const char* value = std::getenv("STRIX_MM_PF_FLASH_KEYS")) {
+        if (const char* value = strix::envcfg::text("STRIX_MM_PF_FLASH_KEYS")) {
             const std::string mode(value);
             if (mode != "0" && mode != "1" && mode != "2") throw std::invalid_argument("STRIX_MM_PF_FLASH_KEYS must be 0, 1 or 2");
             pf_flash_keys = static_cast<unsigned>(mode[0] - '0');
