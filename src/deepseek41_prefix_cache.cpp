@@ -1,5 +1,6 @@
 #include "strix/ds41_fast_profile.hpp"
 #include "strix/deepseek41_prefix_cache.hpp"
+#include "strix/turbo.hpp"
 
 #include "strix/ds41_attention.hpp"
 #include "strix/env_flags.hpp"
@@ -561,7 +562,14 @@ PrefixNamespace prefix_namespace_from_env(bool expert_tp_decode) {
                               "STRIX_DS41_PREFILL_FP16_WSPLIT"})
             t += std::string(k + 11) + "=" + env_or(k) + ";";
 
+    // FAST policy ds41-decoder-replay-bounded-v1: a bounded run's decoder state is not the full prefill's
+    if (const auto replay = env_or("STRIX_DS41_DECODER_REPLAY"); !replay.empty() && replay != "0")
+        t += "prefill_decoder=replay-bounded-v1:rows=" + replay + ";";
     t += std::string("decode=") + (expert_tp_decode ? "ds41-expert-tp2-i1152-v1" : "ep") + ";";
+    // TURBO (--profile turbo): versioned name + effective levers + weight identity, exported by the shared profile
+    // resolver (strix/turbo.hpp); absent outside turbo, so every legacy namespace keeps its text and tag.
+    if (const auto turbo = strix::profile::turbo::exported_namespace(); !turbo.empty())
+        t += turbo + ";";
     const auto* b = reinterpret_cast<const std::byte*>(t.data());
     PrefixNamespace ns;
     ns.text = t;

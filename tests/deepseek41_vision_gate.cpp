@@ -3,6 +3,11 @@
 //
 //   strix-deepseek41-vision-gate --model FILE.gguf --ref DIR [--backend host|hip] [--only a,b]
 //                                [--host-max-patches N] [--split | --no-split] [--unpinned] [--diagnose a,b]
+//                                [--dump DIR] [--rounding none|linear|attention|both]
+//
+// --dump writes this backend's rows (BF16 values as FP32) and tower output beside the reference names, so two
+// backends can be compared row by row; references, aliases and existing dumps cannot be overwritten.
+// --rounding (host only, diagnostic) studies FP16 operand sensitivity (ReferenceRounding), not bitwise device equality.
 //
 // Per case of DIR/cases.txt:
 //   preprocess  PNG -> adapter.patches() against the reference patches (max |diff| <= 1e-6, which implies equal
@@ -12,10 +17,12 @@
 // Thresholds: host FP32 backend cosine >= 0.99999 (graph); device backend mean >= 0.9995, min >= 0.998, relative
 // L2 <= 2 % (arithmetic class FAST). The device backend also prints the per-layer time receipt.
 #include "../src/deepseek41/vision_adapter.hpp"
+#include "vision_gate_dump.hpp"
 
 #include "strix/deepseek41_model.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/vision/compare.hpp"
+#include "strix/vision/embed_cache.hpp"
 #include "strix/vision/encoder.hpp"
 #include "strix/vision/gguf_weights.hpp"
 #include "strix/vision/image.hpp"
@@ -201,9 +208,41 @@ int diagnose(const std::string& names, const std::filesystem::path& dir, const d
 }
 #endif
 
+// --bench FILE.png: the serve path of one image without a cache (decode + patches, then encode_cached: positions,
+// encode, project), reps times on the loaded backend. --prepare: prepare_backend first (projector panels, workspace;
+// --warm adds the grey warm-up image), as the server does at start. Rep 1 carries what is still first-use.
+int bench(const std::string& png_path, unsigned reps, int prepare, ds::VisionAdapter& adapter, const vision::EncoderWeights& weights,
+          vision::EncoderBackend& backend) {
+    const std::vector<std::uint8_t> png = read_raw<std::uint8_t>(png_path);
+    if (prepare >= 0) {
+        const auto t0 = Clock::now();
+        const vision::PrepareReport r = vision::prepare_backend(adapter, backend, weights, prepare > 0);
+        std::printf("bench prepare %.2f ms (linears %zu, reserved rows %u, prepare %.2f ms, warm-up rows %u %.2f ms)\n", ms_since(t0),
+                    r.linears, r.reserved_rows, r.prepare_ms, r.warmup_rows, r.warmup_ms);
+    }
+    std::uint64_t first_fnv = 0;
+    for (unsigned rep = 0; rep < reps; ++rep) {
+        auto t0 = Clock::now();
+        const vision::Image image = vision::decode(png);
+        const vision::PatchGrid g = adapter.patches(image);
+        const double pre_ms = ms_since(t0);
+        t0 = Clock::now();
+        const auto enc = vision::encode_cached(adapter, backend, weights, nullptr, vision::Digest{}, g);
+        const double enc_ms = ms_since(t0);
+        std::uint64_t h = 1469598103934665603ULL;
+        for (const auto v : enc.rows->bf16) h = (h ^ v) * 1099511628211ULL;
+        if (rep == 0) first_fnv = h;
+        std::printf("bench rep %u: patches %u grid %ux%u rows %u | preprocess %.2f ms encode_cached %.2f ms | rows fnv %016llx %s\n",
+                    rep + 1U, g.rows, g.grid_h, g.grid_w, enc.rows->rows, pre_ms, enc_ms, static_cast<unsigned long long>(h),
+                    h == first_fnv ? "same" : "DIFFERS");
+    }
+    return 0;
+}
+
 int run(int argc, char** argv) {
-    std::string model, ref, backend_name = "host", only, diagnose_names;
-    unsigned host_max_patches = 200;
+    std::string model, ref, backend_name = "host", only, diagnose_names, bench_png, dump_dir, rounding = "none";
+    unsigned host_max_patches = 200, bench_reps = 3;
+    int bench_prepare = -1;  // -1 none, 0 prepare_backend, 1 prepare_backend + warm-up
     bool split = false, no_split = false, unpinned = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -220,9 +259,16 @@ int run(int argc, char** argv) {
         else if (a == "--no-split") no_split = true;
         else if (a == "--unpinned") unpinned = true;
         else if (a == "--diagnose") diagnose_names = next();
+        else if (a == "--bench") bench_png = next();
+        else if (a == "--reps") bench_reps = static_cast<unsigned>(std::stoul(next()));
+        else if (a == "--prepare") bench_prepare = 0;
+        else if (a == "--warm") bench_prepare = 1;
+        else if (a == "--dump") dump_dir = next();
+        else if (a == "--rounding") rounding = next();
         else throw std::invalid_argument("unknown option " + a);
     }
-    if (model.empty() || ref.empty()) throw std::invalid_argument("usage: --model FILE.gguf --ref DIR [--backend host|hip]");
+    if (model.empty() || (ref.empty() && bench_png.empty()))
+        throw std::invalid_argument("usage: --model FILE.gguf (--ref DIR | --bench FILE.png [--reps N]) [--backend host|hip]");
     const bool device = backend_name == "hip";
     if (!device && backend_name != "host") throw std::invalid_argument("--backend host|hip");
 
@@ -269,6 +315,9 @@ int run(int argc, char** argv) {
         t0 = Clock::now();
         enc->load(weights);
         std::printf("device load %.0f ms, %.1f MiB\n", ms_since(t0), static_cast<double>(enc->device_bytes()) / 1048576.0);
+        const vision::EncoderLoadStats& ls = enc->load_stats();
+        std::printf("load receipt: scan %.0f | host alloc %.0f | convert %.0f | device alloc %.0f | upload %.0f | vectors %.0f | total %.0f ms\n",
+                    ls.scan_ms, ls.host_alloc_ms, ls.convert_ms, ls.device_alloc_ms, ls.upload_ms, ls.vectors_ms, ls.total_ms);
         gpu = enc.get();
         backend = std::move(enc);
     }
@@ -277,15 +326,27 @@ int run(int argc, char** argv) {
     (void)no_split;
     if (device) throw std::runtime_error("this build has no device backend");
 #endif
-    if (!backend) backend = std::make_unique<vision::ReferenceEncoder>(cfg, weights);
+    // --rounding (host backend, diagnostic): the device's FP16 operand roundings placed one site at a time.
+    vision::ReferenceRounding model_rounding;
+    model_rounding.linear_inputs_f16 = rounding == "linear" || rounding == "both";
+    model_rounding.attention_f16 = rounding == "attention" || rounding == "both";
+    if (rounding != "none" && !model_rounding.any()) throw std::invalid_argument("--rounding none|linear|attention|both");
+    if (device && model_rounding.any()) throw std::invalid_argument("--rounding models the device on the host backend");
+    if (model_rounding.any()) std::printf("rounding model %s (diagnostic, not a gate result)\n", rounding.c_str());
+    if (!backend) backend = std::make_unique<vision::ReferenceEncoder>(cfg, weights, model_rounding);
     std::printf("backend %s\n", backend->arithmetic());
+    if (!bench_png.empty()) return bench(bench_png, bench_reps, bench_prepare, adapter, weights, *backend);
 
     const double cos_mean_gate = device ? 0.9995 : 0.99999, cos_min_gate = device ? 0.998 : 0.99999;
     const double rel_gate = device ? 0.02 : 0.01;
     bool ok = true;
     unsigned ran = 0;
     const std::filesystem::path dir(ref);
-    for (const Case& c : read_cases(dir)) {
+    const auto cases = read_cases(dir);
+    if (!dump_dir.empty())
+        for (const Case& c : cases)
+            if (listed(only, c.name)) vision_gate::check_dump_paths(dir, dump_dir, c.name);
+    for (const Case& c : cases) {
         if (!listed(only, c.name)) continue;
         const std::vector<float> ref_patches = read_raw<float>(dir / (c.name + ".patches.f32"));
         const unsigned patches = c.grid_h * c.grid_w;
@@ -362,6 +423,13 @@ int run(int argc, char** argv) {
                 }
             }
             m = compare(got.data(), want.data(), rows.width, image_rows);
+            if (!dump_dir.empty()) {  // this backend's rows and tower output, same layout as the reference dumps
+                const auto write = [&](const std::string& file, const std::vector<float>& v) {
+                    vision_gate::write_dump(std::filesystem::path(dump_dir) / (c.name + file), v);
+                };
+                write(".rows.f32", got);
+                write(".hidden.f32", hidden_copy);
+            }
             const std::filesystem::path hidden_path = dir / (c.name + ".hidden.f32");
             if (std::filesystem::exists(hidden_path)) {
                 const std::vector<float> want_hidden = read_raw<float>(hidden_path);

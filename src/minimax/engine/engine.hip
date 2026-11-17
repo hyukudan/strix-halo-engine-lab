@@ -1,6 +1,7 @@
 #include "minimax/engine/route_identity.hpp"
 #include "core/layer_set.hpp"
 #include "core/i4_shadow.hpp"
+#include "core/f16_dense_tall.hpp"
 #include "core/hip_range_weight_loader.hpp"
 #include "minimax/engine/mm_fast_i4.hpp"
 // MiniMax M3.1 Flash engine, TP2 (see include/strix/minimax/engine.hpp and qualification notes).
@@ -536,6 +537,7 @@ struct Layer {
     _Float16 *wiq16b = nullptr, *wik16b = nullptr;
     _Float16* wip = nullptr;  // packed index projection (pack_index_proj layout); only the selected layouts are resident
     float *wiq = nullptr, *wik = nullptr, *norm[4] = {}, *w_post = nullptr, *w_next = nullptr, *wr = nullptr, *wb = nullptr;
+    core::f16_dense_tall::DeviceStorage<std::uint16_t> wr16;  // FAST router weights, owned even during constructor unwinding
     bool moe = false;
     Mlp dense, shared;
     std::vector<Mlp> experts;
@@ -679,8 +681,18 @@ struct Engine::Impl {
     // flash core instead of the exact in-block kernel; selection, block lists and K/V caches unchanged. Governed rows of the
     // MiniMax FAST prefill profile (mm_profile_table.hpp; STRIX_MM_FAST_PREFILL=1 selects msa-flash-bf16-l40-v1).
     unsigned pf_msa_flash = 0;
+    // its layers: the q finish writes q's BF16 image after norm + RoPE for the flash core's query_op (bitwise, half
+    // the q bytes); default on, STRIX_MM_PF_MSA_Q16=0 keeps the FP32 q and the flash prologue
+    bool pf_msa_q16 = strix::envcfg::flag("STRIX_MM_PF_MSA_Q16", true, strix::EnvFlagMatch::exact);
     std::string pf_msa_flash_asked = "default";  // receipt: "default", the explicit value or "fast_prefill"
     strix::core::LayerSet pf_msa_flash_layers;  // STRIX_MM_PF_MSA_FLASH_LAYERS: layers that use it (unset: defaults::kMsaFlashLayers)
+    // STRIX_MM_PF_IDX_WMMA=1 (minimax-index-proj-wmma-v1): prefill index projections (rows > 8) of the layers in
+    // pf_idx_wmma_layers on the shared FP16 WMMA core; pf_idx_xt = its x16 tiles (max_rows x 6144 FP16).
+    bool pf_idx_wmma = false;
+    std::string pf_idx_wmma_asked = "default";
+    strix::core::LayerSet pf_idx_wmma_layers;
+    _Float16* pf_idx_xt = nullptr;
+    std::size_t pf_idx_xt_rows = 0;
     bool pf_msa_batch = true;  // STRIX_MM_PF_MSA_BATCH (default ON, exact measurement): independent scratch per prefill window
     unsigned pf_msa_windows = 0;
     float *pf_scores = nullptr, *pf_partial = nullptr;
@@ -708,6 +720,12 @@ struct Engine::Impl {
     bool pf_router_batch = true;               // STRIX_MM_PF_ROUTER_BATCH: prefill only, default ON (prefill measurement exact); =0 off
     unsigned pf_router_rows = 32;               // STRIX_MM_PF_ROUTER_ROWS: 32 (default: tiled scores, weights read once per 16 rows), 4 or 8; same bits
     float* router_scratch = nullptr;           // tiled router scores [2][128][rows] (STRIX_MM_PF_ROUTER_ROWS=32)
+    // STRIX_MM_PF_ROUTER_WMMA=1 (FAST mm-pf-router-wmma-v1, opt-in; defaults::prefill_policy): the tiled router's product
+    // on the shared FP16 WMMA core for the layers of STRIX_MM_PF_ROUTER_WMMA_LAYERS (default 40-59), same scores scratch
+    // and selection; router_flags = its overflow guard (T rows, zero).
+    bool pf_router_wmma = false;
+    strix::core::LayerSet pf_router_wmma_layers;
+    core::f16_dense_tall::DeviceStorage<std::uint32_t> router_flags;
     bool pf_tx_uncached = false;              // STRIX_MM_PF_TX_UNCACHED: prefill producers write uncached TX
     bool pf_inplace = false;                   // STRIX_MM_PFX_INPLACE: o_proj / FFN outputs written straight into the TX slot
     bool pf_async_start = true, pf_late_src_fence = true;
@@ -832,8 +850,9 @@ struct Engine::Impl {
         // slower (measurement inconclusive): linear v4. Wide expert kernels at N2-4 only (form 2) ON: measured processes
         // W0/W2 alternated with pinned cable weights, rows == alone, N2 -3.0..-3.5 %, N4 -4..-6 %, N1/N8 the same
         // kernels. An explicit value wins (STRIX_MMX_MOE_WIDE=0 = 4-column CTAs at every N).
-        (void)::setenv("STRIX_MMX_LINEAR_V", "4", 0);
-        (void)::setenv("STRIX_MMX_MOE_WIDE", "2", 0);
+        // Exported defaults are noted so later reads record them as default (receipt "set" = user values only).
+        for (const auto& [sw, dv] : {std::pair{"STRIX_MMX_LINEAR_V", "4"}, std::pair{"STRIX_MMX_MOE_WIDE", "2"}})
+            if (std::getenv(sw) == nullptr && ::setenv(sw, dv, 0) == 0) strix::envcfg::note_default_export(sw, dv);
         if (opt.rank >= kWorld) throw std::invalid_argument("rank must be 0 or 1");
         if (opt.max_rows < kMaxStepRows) throw std::invalid_argument("max_rows < 8");
         moe::opt::set_prefill_mtfit(-1);
@@ -850,7 +869,7 @@ struct Engine::Impl {
         shared_first = env_flag("STRIX_MM_SHARED_FIRST", false);
         const char* at = std::getenv("STRIX_MM_ATTN");
         attn_fused = at == nullptr || std::string(at) != "off";  // ON by default (measurement: bitwise, ABA x3 never slower); =off
-        const auto index_policy = route::resolve_index_projection(std::getenv("STRIX_MM_INDEX_PROJ"),
+        const auto index_policy = route::resolve_index_projection(strix::envcfg::text("STRIX_MM_INDEX_PROJ"),
                                                                  env_flag("STRIX_MM_INDEX_DECODE", true));
         index_attn = index_policy.attn;
         index_tiled = index_policy.tiled;
@@ -965,11 +984,17 @@ struct Engine::Impl {
             pf_msa_flash = policy.msa_flash_requested;
             pf_msa_flash_asked = policy.msa_flash_asked;
             pf_msa_flash_layers = strix::core::parse_layer_set(policy.msa_flash_layers.c_str(), 0, kLayers, "STRIX_MM_PF_MSA_FLASH_LAYERS");
+            pf_idx_wmma = policy.idx_wmma;
+            pf_idx_wmma_asked = policy.idx_wmma_asked;
+            pf_idx_wmma_layers = strix::core::parse_layer_set(policy.idx_wmma_layers.c_str(), 0, kLayers, "STRIX_MM_PF_IDX_WMMA_LAYERS");
             if (!policy.note.empty()) std::fprintf(stderr, "minimax fast prefill: %s\n", policy.note.c_str());
         }
         if (pf_msa_flash != 0 && defaults::msa_flash_decline_reason(pf_msa_rework != 0, attn_prefill_fused,
                                                                   pf_msa_flash_layers.count()) == nullptr)
             std::fprintf(stderr, "prefill identity mm-pf-msa-flash FAST (bf16 WMMA key-split MSA attend, %u-term operands, %u layers)\n", pf_msa_flash, pf_msa_flash_layers.count());
+        if (pf_idx_wmma)
+            std::fprintf(stderr, "prefill identity %s FAST (index projections on the shared FP16 WMMA core, %u layers)\n",
+                         defaults::idx_wmma_policy(defaults::prefill_policy(strix::envcfg::text).idx_wmma_layers).c_str(), pf_idx_wmma_layers.count());
         if (i4_shadow && !model_fast_i4)
             throw std::invalid_argument("STRIX_MMX_FAST_I4_SHADOW needs STRIX_MMX_MODEL_FORMAT=fast_i4");
         if (model_fast_i4) {
@@ -1051,6 +1076,15 @@ struct Engine::Impl {
             lib.upload_raw(kP + "embed_tokens.weight", embed);
         }
         layers.resize(kLayers);
+        {   // FAST router product (opt-in): the one resolver's switch and layer set; its layers get FP16 weights below
+            const auto rp = defaults::prefill_policy(strix::envcfg::text);
+            pf_router_wmma = rp.router_wmma;
+            if (pf_router_wmma) {
+                pf_router_wmma_layers = strix::core::parse_layer_set(rp.router_wmma_layers.c_str(), 0, kLayers, "STRIX_MM_PF_ROUTER_WMMA_LAYERS");
+                std::fprintf(stderr, "prefill identity mm-pf-router-wmma-v1 FAST (router product on the FP16 WMMA core, form %s, layers %s)\n",
+                             moe::hip::router_wmma_form(), rp.router_wmma_layers.c_str());
+            }
+        }
         for (unsigned L = 0; L < kLayers; ++L) {
             Layer& y = layers[L];
             const std::string lp = kP + "layers." + std::to_string(L) + ".", a = lp + "self_attn.", b = lp + "block_sparse_moe.";
@@ -1115,6 +1149,11 @@ struct Engine::Impl {
             } else {
                 y.wr = dupload(pack.floats(b + "gate.weight"));
                 y.wb = dupload(pack.floats(b + "e_score_correction_bias"));
+                if (pf_router_wmma && pf_router_wmma_layers.test(L)) {  // converted once; the FP32 copy stays (fallback)
+                    y.wr16.reset(dalloc<std::uint16_t>(std::size_t{kExperts} * kHidden));
+                    moe::hip::convert_router_f16(y.wr, y.wr16.get(), nullptr);
+                    hip_ok(hipStreamSynchronize(nullptr), "router f16");
+                }
                 if (moe_opt) {
                     auto raw = [&](const std::string& pre, const char* const* nm) {
                         return mmoe::ExpertSlices{lib.raw_out(pre + nm[0], rank * kExpertLocal, kExpertLocal),
@@ -1145,6 +1184,7 @@ struct Engine::Impl {
         hip_ok(hipDeviceSynchronize(), "load head");
         lib.release_staging();
         alloc();
+        require_invariant_dense();  // reject an unexecutable identity before receipts or inference
         if (model_fast_i4) setup_fast_i4();
         route_levers();  // shared route receipt: requested vs effective, part of the rank fingerprint
         LoadReport r;
@@ -1227,7 +1267,19 @@ struct Engine::Impl {
         rr::lever("minimax.msa_flash", pf_msa_flash_asked,
                   std::to_string(flash) + (flash ? ":layers=" + mask(pf_msa_flash_layers, 0) : ""),
                   flash ? rr::Reason::selected : rr::Reason::disabled);
+        const bool index_wmma = pf_idx_wmma && !fp32_prefill &&
+            route::index_projection_route({index_attn, index_tiled, index_decode}, 9) == route::IndexLayout::packed;
+        rr::lever("minimax.index_proj_wmma", pf_idx_wmma_asked,
+                  index_wmma ? "1:layers=" + mask(pf_idx_wmma_layers, 0) : std::string("0"),
+                  index_wmma ? rr::Reason::selected : rr::Reason::disabled);
         rr::lever("minimax.prefill_identity", fp32_prefill ? "fp32" : "default", fp32_prefill ? "fp32" : "default");
+        {   // Linear K order of the prefill MoE + dense v4 linears (STRIX_MMX_PF_ORDER): a bit-changing contract, so the
+            // gate witnesses it as a FAST layer set over every layer (onset 0).
+            const char* order = strix::envcfg::text("STRIX_MMX_PF_ORDER");
+            const bool inv = mmoe::prefill_order_invariant();
+            rr::lever("minimax.linear_order", order != nullptr && *order != 0 ? order : "default",
+                      inv ? "invariant:mmx-pf-linear-s1-v1" : "adaptive", inv ? rr::Reason::selected : rr::Reason::disabled);
+        }
         rr::lever("minimax.moe_kernels", moe_opt ? "1" : "0", moe_opt ? "1" : "0");
     }
     // Timing collection is nonblocking. At prompt completion the existing prefill fence makes
@@ -1406,6 +1458,10 @@ struct Engine::Impl {
                 i4_shadow_sums = dalloc<float>(4);
             }
         }
+        if (pf_idx_wmma) {  // x16 tiles of the FAST index projections: one chunk (max_rows rows) at a time
+            pf_idx_xt_rows = opt.max_rows;
+            pf_idx_xt = dalloc<_Float16>(pf_idx_xt_rows * kHidden);
+        }
         hip_ok(hipEventCreateWithFlags(&routes_ready, hipEventDisableTiming), "route event");
         if (fp32_prefill) {  // FP32 identity workspaces: expert pairs (T x 4 rows) at the widest site
             const std::size_t pairs = T * kTopE;
@@ -1430,6 +1486,10 @@ struct Engine::Impl {
         ids_d = route_d;
         wts4_d = reinterpret_cast<float*>(route_d + T * kTopE);
         router_scratch = dalloc<float>(moe::hip::router_tiled_scratch_floats(static_cast<std::uint32_t>(T)));  // any router form can be selected later
+        if (pf_router_wmma) {
+            router_flags.reset(dalloc<std::uint32_t>(T));
+            hip_ok(hipMemset(router_flags.get(), 0, T * sizeof(std::uint32_t)), "router flags");
+        }
         part = dalloc<float>(T * kHidden);
         remote = dalloc<float>(T * kHidden);
         if (pf != nullptr && pf->options().depth < pf_group) {
@@ -1649,6 +1709,13 @@ struct Engine::Impl {
         ++xb_warm_o_count;
     }
 
+    // The FP16 router weights of the layer whose FP32 router weights are `w` (nullptr: not a FAST router layer).
+    const std::uint16_t* router_f16(const float* w) const {
+        if (!pf_router_wmma || w == nullptr) return nullptr;
+        for (const Layer& y : layers)
+            if (y.wr == w) return y.wr16.get();
+        return nullptr;
+    }
     // Every post-exchange launch of the engine (STRIX_MM_XB_POSTILP selects the loads-first form, same bits).
     void enqueue_post(moe::hip::PostExchangeView view, hipStream_t stream) {
         view.ilp = xb_postilp ? xb_postilp_mode : 0U;
@@ -1657,8 +1724,13 @@ struct Engine::Impl {
             const float* router_w = view.router_w;
             view.router_w = nullptr;
             moe::hip::enqueue_post_exchange(view, stream);
+            const std::uint16_t* w16 = router_f16(router_w);
             // Tiled scores only on the measured piece sizes (1024..4096 rows); other piece sizes keep the 8-row form.
-            if (pf_router_rows == 32 && router_scratch != nullptr && view.rows >= 1024 && view.rows <= 4096)
+            if (w16 != nullptr && router_scratch != nullptr && router_flags != nullptr) {  // FAST mm-pf-router-wmma-v1 layer
+                moe::hip::enqueue_router_wmma(view.rows, view.y, router_w, w16, view.bias, view.ids, view.weights, router_scratch,
+                                              router_flags.get(), stream);
+                strix::route::launched(strix::route::Product::router, strix::route::Family::f16_wmma, view.rows);
+            } else if (pf_router_rows == 32 && router_scratch != nullptr && view.rows >= 1024 && view.rows <= 4096)
                 moe::hip::enqueue_router_tiled(view.rows, view.y, router_w, view.bias, view.ids, view.weights, router_scratch, stream);
             else
                 moe::hip::enqueue_router_batch(view.rows, view.y, router_w, view.bias, view.ids, view.weights, pf_router_rows == 4 ? 4U : 8U, stream);
@@ -1929,20 +2001,65 @@ struct Engine::Impl {
     // Prefill q/k/v on the v4 core: measured faster than three strix_gemm calls from 1024 rows (bench pfdv4 q+k+v
     // T1024 0.78, T4096 0.70; o alone is slower at 1024 rows and stays on the library).
     static constexpr std::size_t kDenseQkvMinRows = 1024;
-    bool dense_qkv(std::size_t n, const mmoe::PrefillDenseJob (&jobs)[3]) const {
-        if (!pf_dense_qkv || n < kDenseQkvMinRows || pf_ws == nullptr) return false;
-        for (const auto& j : jobs)  // raw weights loaded, same input width, implemented bit width; else the library
+    // Invariant order (STRIX_MMX_PF_ORDER=invariant, identity mmx-pf-linear-s1-v1): strix_gemm's split follows the rows
+    // (route::gemm_splits; <= 8 rows a GEMV chain), so a call whose library split differs from the fixed contract runs on
+    // the v4 core with S = kDenseFixedSplits. Where they agree (> 8 rows, S = 1) both give the same bits
+    // (test_prefill_dense: v4 == strix_gemm bitwise at equal S) and the measured route choice stays.
+    template <class W> static bool lib_off_contract(std::size_t n, const W& w) {
+        return n <= 8 || route::gemm_splits(w.input, w.output, w.bits, static_cast<unsigned>(n)) !=
+                             static_cast<unsigned>(mmoe::kDenseFixedSplits);
+    }
+    template <std::size_t N> static bool dense_forced(std::size_t n, const mmoe::PrefillDenseJob (&jobs)[N]) {
+        if (!mmoe::prefill_order_invariant()) return false;
+        for (const auto& j : jobs)
+            if (lib_off_contract(n, j.w)) return true;
+        return false;
+    }
+    template <std::size_t N> bool dense_available(std::size_t n, const mmoe::PrefillDenseJob (&jobs)[N]) const {
+        if (pf_ws == nullptr) return false;
+        for (const auto& j : jobs)  // raw weights loaded, same input width, implemented bit width
             if (j.w.trellis == nullptr || j.w.input != jobs[0].w.input || !mmoe::prefill_dense_supported(j.w)) return false;
-        return mmoe::prefill_dense_workspace_bytes(jobs, 3, static_cast<unsigned>(n)) <= pf_ws_bytes;
+        return mmoe::prefill_dense_workspace_bytes(jobs, static_cast<unsigned>(N), static_cast<unsigned>(n)) <= pf_ws_bytes;
+    }
+    // Invariant prefill must cover every layer and every tail, even when the preferred dense routes are OFF.
+    // With fixed S=1, workspace size is monotone in rows, so max_rows bounds every admitted chunk.
+    // A table default (pf_order) that cannot hold declines to adaptive with a printed reason, before receipts; an
+    // explicit STRIX_MMX_PF_ORDER=invariant keeps the hard error. Both ranks load the same config and weights, so the
+    // decision is the same on each rank (and the route receipt fingerprint checks it).
+    void require_invariant_dense() const {
+        if (!mmoe::prefill_order_invariant()) return;
+        const char* unmet = nullptr;
+        if (!linears_loaded || !moe_opt) unmet = "STRIX_MMX_PF_ORDER=invariant requires STRIX_MM_LINEARS!=off and STRIX_MM_MOE!=off";
+        for (const auto& y : layers) {
+            if (unmet != nullptr) break;
+            const mmoe::PrefillDenseJob qkv[3] = {{y.rq, q}, {y.rk, k}, {y.rv, v}};
+            const mmoe::PrefillDenseJob o1[1] = {{y.ro, part}};
+            if (!dense_available(opt.max_rows, qkv) || !dense_available(opt.max_rows, o1))
+                unmet = "STRIX_MMX_PF_ORDER=invariant requires supported resident q/k/v/o weights and sufficient prefill workspace";
+        }
+        if (unmet == nullptr) return;
+        if (!defaults::from_defaults("STRIX_MMX_PF_ORDER")) throw std::invalid_argument(unmet);
+        defaults::decline_default("STRIX_MMX_PF_ORDER", "adaptive", unmet);
+        mmoe::set_prefill_moe_order(0);
+    }
+    template <std::size_t N> bool dense_admit(std::size_t n, const mmoe::PrefillDenseJob (&jobs)[N], bool preferred) const {
+        if (gemv) return false;  // decode and verification retain their existing GEMV arithmetic
+        const bool forced = dense_forced(n, jobs);
+        if (!forced && !preferred) return false;
+        const bool available = dense_available(n, jobs);
+        if (forced && !available)
+            throw std::runtime_error("STRIX_MMX_PF_ORDER=invariant dense route unavailable; refusing adaptive fallback");
+        return available;
+    }
+    bool dense_qkv(std::size_t n, const mmoe::PrefillDenseJob (&jobs)[3]) const {
+        return dense_admit(n, jobs, pf_dense_qkv && n >= kDenseQkvMinRows);
     }
 
     // Prefill o_proj on the v4 core only for exactly 4096-row pieces (bench pfdv4 o: 0.96 at 4096 rows, 1.10 at 1024 rows;
     // larger --max-rows pieces are not qualified).
     static constexpr std::size_t kDenseORows = 4096;
     bool dense_o(std::size_t n, const mmoe::PrefillDenseJob (&job)[1]) const {
-        return pf_dense_o && n == kDenseORows && pf_ws != nullptr && job[0].w.trellis != nullptr &&
-               mmoe::prefill_dense_supported(job[0].w) &&
-               mmoe::prefill_dense_workspace_bytes(job, 1, static_cast<unsigned>(n)) <= pf_ws_bytes;
+        return dense_admit(n, job, pf_dense_o && n == kDenseORows);
     }
 
     // Layer L up to the attention partial: q/k/v + index projections, MSA, o_proj -> out (n rows; h / hn: the rows').
@@ -1957,11 +2074,18 @@ struct Engine::Impl {
             const bool conc = index_route == route::IndexLayout::packed && (gemv ? index_conc && !f32 : pf_idx_conc != 0);
             const strix::minimax::attn::IndexProjView ipv{hn, y.wip, iq, ik, static_cast<std::uint32_t>(n)};
             const std::size_t ie = pf_idx_member * kLayers + L;
+            // FAST index projections (STRIX_MM_PF_IDX_WMMA): prefill rows > 8 of the selected layers, exact prefill base.
+            const bool idx_fast = pf_idx_wmma && !gemv && !f32 && n > 8 && index_route == route::IndexLayout::packed &&
+                                  pf_idx_wmma_layers.test(L);
+            // x16 workspace for chunks up to max_rows; a longer call takes the direct WMMA form (same bits).
+            _Float16* const idx_xt = idx_fast && n <= pf_idx_xt_rows ? pf_idx_xt : nullptr;
             // hn belongs to this chunk; q/k/v only read it. Join below precedes
             // prep (the first iq/ik reader), every hn write and the next chunk.
+            if (conc && idx_fast && idx_xt == nullptr) throw std::logic_error("minimax index proj: FAST side-stream call beyond max_rows");
             if (conc) strix::minimax::attn::index_proj_fork(ipv, nullptr, idx_side,
-                gemv ? idx_fork[L] : pf_idx_conc == 2 ? pf_idx_fork_device[ie] : pf_idx_fork[ie]);
+                gemv ? idx_fork[L] : pf_idx_conc == 2 ? pf_idx_fork_device[ie] : pf_idx_fork[ie], idx_fast ? idx_xt : nullptr);
             if (tl && lin_opt) tl->mark("qkv-projections", true);
+            std::size_t q16_rows = 0;  // > 0: q holds the BF16 image (and lo) of these rows, not FP32 (dense q finish)
             if (f32) {
                 if (tl) tl->mark("q-projection", true);
                 f32_linear(y.rq, hn, kHidden, q, kQLocal, n);
@@ -1978,8 +2102,18 @@ struct Engine::Impl {
                 if (xb_prepped) mmoe::enqueue_linears_prepared(j, 3, static_cast<unsigned>(n), lin_ws, nullptr);  // STRIX_MM_XB_PREP
                 else mmoe::enqueue_linears(j, 3, static_cast<unsigned>(n), lin_ws, nullptr);
                 xb_prepped = false;
-            } else if (const mmoe::PrefillDenseJob qkv[3] = {{y.rq, q}, {y.rk, k}, {y.rv, v}}; dense_qkv(n, qkv)) {
+            } else if (mmoe::PrefillDenseJob qkv[3] = {{y.rq, q}, {y.rk, k}, {y.rv, v}}; dense_qkv(n, qkv)) {
                 // STRIX_MM_PF_DENSE_QKV: one v4-core call, one timeline interval (compare with q + k + v of the library).
+                // MSA FAST flash layers (the mode 11 / 12 branch of the attention below, same predicate): q's BF16 image
+                // in q's own memory (u16; mode 12's lo image in its second half), read through query_op
+                if (pf_msa_q16 && rows.empty() && attn_prefill_fused && n > 8 && pf_msa_flash != 0 && pf_msa_rework != 0 &&
+                    pf_msa_flash_layers.test(L)) {
+                    qkv[0].image = reinterpret_cast<std::uint16_t*>(q);
+                    qkv[0].image_lo = pf_msa_flash == 2 ? qkv[0].image + n * kQLocal : nullptr;
+                    qkv[0].image_w = y.norm[0];
+                    qkv[0].image_rope = d_rope + pos0;
+                    q16_rows = n;
+                }
                 if (tl) tl->mark("qkv-projections", true);
                 mmoe::enqueue_prefill_dense(qkv, 3, hn, static_cast<unsigned>(n), pf_ws, pf_ws_bytes, nullptr);
                 if (tl) tl->mark("qkv-projections", false);
@@ -2016,6 +2150,9 @@ struct Engine::Impl {
             if (conc) {
                 strix::minimax::attn::index_proj_join(nullptr, idx_side,
                     gemv ? idx_join[L] : pf_idx_conc == 2 ? pf_idx_join_device[ie] : pf_idx_join[ie]);
+            } else if (idx_fast) {  // FAST minimax-index-proj-wmma-v1 (x16 tiles from kFastTilesRows rows; forms same bits)
+                if (idx_xt != nullptr) strix::minimax::attn::enqueue_index_proj_fast(ipv, idx_xt, nullptr);
+                else strix::minimax::attn::enqueue_index_proj_wmma(ipv, nullptr);
             } else if (index_route == route::IndexLayout::packed) {  // decode register ring / prefill tiles, same bits
                 strix::minimax::attn::enqueue_index_proj(ipv, nullptr);
             } else if (index_route == route::IndexLayout::fp16_block) {
@@ -2033,6 +2170,7 @@ struct Engine::Impl {
                 hipLaunchKernelGGL(dense_t_kernel, dim3(static_cast<unsigned>(n), kIdxLocal / 128), dim3(128), 0, nullptr, hn, y.wiq, iq, kHidden, kIdxLocal);
                 hipLaunchKernelGGL(dense_t_kernel, dim3(static_cast<unsigned>(n), 1), dim3(128), 0, nullptr, hn, y.wik, ik, kHidden, 128U);
             }
+            if (idx_fast && task.open) task.idx_wmma_executed.set(L);
             if (tl) tl->mark(conc ? "index-join" : "index-projection", false);
             lap(prof.attn_proj);
             tmark(tmark_at(L, 0));
@@ -2081,6 +2219,10 @@ struct Engine::Impl {
                         dv.idx = pf_idx;
                         dv.idx_count = pf_cnt;
                         dv.partial = pf_partial;
+                        if (q16_rows == n) {  // the dense q finish wrote the image (this r0 is 0: one call covers n rows)
+                            dv.q16 = reinterpret_cast<const std::uint16_t*>(q) + r0 * kQLocal;
+                            dv.q16_lo = pf_msa_flash == 2 ? reinterpret_cast<const std::uint16_t*>(q) + n * kQLocal + r0 * kQLocal : nullptr;
+                        }
                         dv.ticket = pf_ticket;
                         mfused::enqueue_prefill({dv, static_cast<std::uint32_t>(n), pos0, pf_msa_windows, 0, pf_idx_tile && n > 8, pf_idx_rows, n > 8 ? (pf_msa_flash != 0 && pf_msa_rework != 0 && pf_msa_flash_layers.test(L) ? 10U + pf_msa_flash : pf_msa_rework) : 0U}, nullptr, tl ? PrefillTimeline::msa_mark : nullptr, tl);
                         break;
@@ -2453,8 +2595,12 @@ struct Engine::Impl {
         std::vector<std::uint32_t> toks;
         std::uint64_t pos0 = 0;
         std::size_t c0 = 0, c = 0, chunks = 0, m = 1, rows = 0;  // next chunk's first row / index; the open unit's members, rows
-        unsigned layer = 0;                                      // next layer of the open chunk / group (0: not started)
+        unsigned first_layer = 0;
+        Engine::CutFetch cut_fetch;
+        bool cut_link = false;                                   // rank 0's fetched rows go to rank 1 over the pair link
+        unsigned layer = 0;                                     // next layer of the open chunk / group (0: not started)
         std::uint64_t output_fnv = 14695981039346656037ULL;
+        strix::core::LayerSet idx_wmma_executed;  // successful submissions, published only after the completion fence
         Engine::PfTaskId id = 0, parent = 0;
         std::uint64_t generation = 0;
         std::unique_ptr<strix::core::i4_shadow::Accumulator<kLayers>> shadow;
@@ -2500,6 +2646,32 @@ struct Engine::Impl {
         if (auto* t = child_bank ? child_timeline.get() : timeline.get()) t->begin();
     }
 
+    void prefill_begin_cut(std::uint32_t slot, std::span<const std::uint32_t> toks, std::uint64_t pos0,
+                           unsigned first_layer, Engine::CutFetch fetch, bool link_relay) {
+        if (first_layer == 0 || first_layer >= kLayers || !fetch)
+            throw std::invalid_argument("prefill_begin_cut: first_layer / fetch");
+        prefill_begin(slot, toks, pos0);
+        task.first_layer = first_layer;
+        task.cut_fetch = std::move(fetch);
+        task.cut_link = link_relay;
+    }
+    void fetch_cut(std::uint64_t row0, std::size_t rows) {
+        if (!task.cut_link || opt.rank == 0) task.cut_fetch(row0, rows, h, nullptr);
+        if (task.cut_link) {
+            // Rank 0's rows to rank 1 on the null stream, after rank 0's H2D and before the norm below; the reverse
+            // direction of the symmetric exchange carries hn, which that norm rewrites on both ranks.
+            dist::Tag tag;
+            tag.kind = static_cast<std::uint32_t>(dist::TagKind::control);
+            tag.request = controls++;
+            comm.exchange(nullptr, opt.rank == 0 ? static_cast<const void*>(h) : static_cast<const void*>(hn),
+                          opt.rank == 0 ? static_cast<void*>(hn) : static_cast<void*>(h), rows * kHidden * sizeof(float), tag);
+        }
+        // Exactly post_exchange's norm: 256 strided fmaf chains, tree 128..1, IEEE sqrt/div,
+        // (h*r)*(1+w). No residual addition: h already contains both producer partials.
+        hipLaunchKernelGGL(rmsnorm_gemma_kernel, dim3(static_cast<unsigned>(rows)), dim3(256), 0, nullptr,
+                           h, layers[task.first_layer - 1].w_next, hn, kHidden);
+    }
+
     // Runs at most `layers` more layers of the open prefill (a chunk's tap sink and the head run in the unit of its last
     // layer). Returns true with *next = the greedy token after the last row once the prefill is complete.
     bool prefill_resume(unsigned budget, std::uint32_t* next) {
@@ -2537,7 +2709,11 @@ struct Engine::Impl {
                     task.rows = route::unit_rows(task.m, opt.max_rows, toks.size() - task.c0);
                 }
                 if (left == 0) break;
-                const unsigned L0 = task.layer, L1 = route::layer_end(L0, left, kLayers);
+                if (task.layer == 0 && task.first_layer > 0 && fp32_prefill) {
+                    hip_ok(hipStreamSynchronize(nullptr), "cut FP32 job ring");
+                    f32_jobs_used = 0;
+                }
+                const unsigned L0 = task.layer == 0 ? task.first_layer : task.layer, L1 = route::layer_end(L0, left, kLayers);
                 left -= L1 - L0;
                 const std::size_t c0 = task.c0, rows = task.rows, m = task.m;
                 const bool last = c0 + rows == toks.size();
@@ -2562,7 +2738,8 @@ struct Engine::Impl {
                     ++calls;
                     task.c += m;
                 } else {
-                    if (L0 == 0) embed_rows(toks.data() + c0, rows);
+                    if (task.layer == 0 && task.first_layer > 0) fetch_cut(task.pos0 + c0, rows);
+                    else if (L0 == 0) embed_rows(toks.data() + c0, rows);
                     layers_range(rows, {}, task.slot, task.pos0 + c0, L0, L1);
                     if (L1 < kLayers) {
                         task.layer = L1;
@@ -2585,6 +2762,16 @@ struct Engine::Impl {
                 if (pf_active) pf->drain();
                 pf_active = false;
                 hip_ok(hipDeviceSynchronize(), "prefill");
+                if (task.idx_wmma_executed.count() != 0) {
+                    std::uint64_t token_fnv = 14695981039346656037ULL;
+                    for (const auto token : task.toks)
+                        for (unsigned byte = 0; byte < 4; ++byte)
+                            token_fnv = (token_fnv ^ ((token >> (8U * byte)) & 255U)) * 1099511628211ULL;
+                    std::string executed;
+                    for (unsigned l = 0; l < kLayers; ++l) executed += task.idx_wmma_executed.test(l) ? '1' : '0';
+                    std::fprintf(stderr, "minimax-index-proj-executed rank %u tokens %zu token_fnv %016llx layers %s\n",
+                                 opt.rank, task.toks.size(), static_cast<unsigned long long>(token_fnv), executed.c_str());
+                }
                 if (model_fast_i4) jit_collect(true);
                 mmoe::prefill_moe_device_check();  // invalid routes met by a device-planned MoE call (failed exchange)
                 if (task.shadow) task.shadow->print("mm", opt.rank);
@@ -2837,6 +3024,10 @@ struct Engine::Impl {
             return px::Exchanger::View{P[c], R[c]};
         };
         if (attn_prefill_fused) prefill_table(slot);
+        for (std::size_t c = 0; task.layer == 0 && task.first_layer > 0 && c < m; ++c) {
+            use(c);
+            fetch_cut(pos0 + c * opt.max_rows, N[c]);
+        }
         for (std::size_t c = 0; L0 == 0 && c < m; ++c) {
             use(c);
             embed_rows(toks.data() + c * opt.max_rows, N[c]);
@@ -3497,6 +3688,11 @@ bool Engine::prefill_active() const { return impl_->task.open; }
 void Engine::prefill_begin(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0) {
     impl_->no_task("prefill");
     impl_->prefill_begin(slot, tokens, pos0);
+}
+void Engine::prefill_begin_cut(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0,
+                               unsigned first_layer, CutFetch fetch, bool link_relay) {
+    impl_->no_task("prefill_begin_cut");
+    impl_->prefill_begin_cut(slot, tokens, pos0, first_layer, std::move(fetch), link_relay);
 }
 bool Engine::prefill_resume(unsigned layers, std::uint32_t* next) { return impl_->prefill_resume(layers, next); }
 void Engine::prefill_cancel() { impl_->prefill_cancel(); }

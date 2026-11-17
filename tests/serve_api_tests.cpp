@@ -1457,6 +1457,13 @@ int main() try {
     std::thread http_thread([&] { server.serve(); });
     std::thread engine_thread([&] { queue.run(engine); });
     const std::string auth = "Authorization: Bearer secret\r\n";
+    for (const char* value : {"1.5", "1e100", "1e999", "-1", "17", "true", "\"8\""}) {
+        const auto reply = http(port, "POST", "/v1/completions",
+            std::string("{\"model\":\"test-model\",\"prompt\":\"hello\",\"max_tokens\":1,\"window_rows\":") + value + "}", auth);
+        const auto error = parse_json(reply.body);
+        check(reply.status == 400 && at(at(error, "error"), "type").as_string() == "invalid_request_error" &&
+              at(at(error, "error"), "param").as_string() == "window_rows", "invalid window_rows is a client error");
+    }
     const auto first_choice = [](const Json& j) -> const Json& { return at(j, "choices").as_array().at(0); };
     for (const bool server_default : {false, true}) {
         const auto headers = auth + std::string("X-Test-Config: thinking-") + (server_default ? "on" : "off") + "\r\n";
@@ -1518,6 +1525,11 @@ int main() try {
         double sum = 0; for (std::size_t i = 0; i < tokenizer->vocab_size(); ++i) sum += std::exp((i == 'a' || i == 'b' ? 2.0 : i == 'c' ? -1.0 : -100.0) - 2);
         check(at(scores.as_array()[0], "logprob").as_double() == -std::log(sum), "wire logprob exactly equals reference");
         check(at(at(result, "strix"), "scoring").find("basis")->as_string() == "target-row-log-softmax", "score basis receipt");
+        check(at(at(result, "strix"), "scoring").find("values")->as_string() == "raw", "score values receipt: raw target row");
+        check(at(at(at(result, "strix"), "scoring"), "execution").as_string() == constrained_config.scoring_execution,
+              "score receipt execution matches configured route");
+        check(at(at(at(result, "strix"), "scoring"), "precision").as_string() == constrained_config.scoring_precision,
+              "score receipt precision matches configured route");
         for(const auto* marker:{"ROUTE_MTP","ROUTE_OFF"}) {
             auto routed=base;routed.set("messages",parse_json(std::string("[{\"role\":\"user\",\"content\":\"")+marker+"\"}]"));
             const auto wire=parse_json(call("/v1/chat/completions",routed,false).body);
@@ -1550,6 +1562,15 @@ int main() try {
             if (at(e,"type").as_string() == "response.output_text.delta") for (const auto& score : at(e,"logprobs").as_array()) response_stream.push(score);
         check(response_stream.dump() == scores.dump(), "Responses delta scores match nonstream");
         for (const auto n : {-1,21}) { auto b = parse_json(base.dump()); b.set("top_logprobs",Json(n)); check(call("/v1/chat/completions",b,false).status == 400,"top logprobs bounds"); }
+        {  // prompt-token scores: no engine executes them; the field is refused explicitly on every route, never ignored
+            auto b = parse_json(base.dump()); b.set("prompt_logprobs", Json(1));
+            const auto refused = call("/v1/chat/completions", b, false);
+            check(refused.status == 400 && refused.body.find("prompt_logprobs") != std::string::npos, "prompt_logprobs refused explicitly (chat)");
+            auto legacy = parse_json(R"({"prompt":"Hi","max_tokens":2,"prompt_logprobs":0})");
+            check(call("/v1/completions", legacy, false).status == 400, "prompt_logprobs refused explicitly (completions)");
+            auto neutral = parse_json(base.dump()); neutral.set("prompt_logprobs", Json());
+            check(call("/v1/chat/completions", neutral, false).status == 200, "prompt_logprobs null is neutral");
+        }
         for (const auto n : {-1,6}) { auto b = parse_json(completion.dump()); b.set("logprobs",Json(n)); check(call("/v1/completions",b,false).status == 400,"completion logprobs bounds"); }
         for (const auto* field : {"presence_penalty","frequency_penalty","repetition_penalty"}) {
             for (const auto value : {-3.0, 11.0}) { auto b = parse_json(base.dump()); b.set(field,Json(value)); check(call("/v1/chat/completions",b,false).status == 400,"transform bounds"); }
