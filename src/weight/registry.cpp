@@ -14,7 +14,7 @@ constexpr Wire wires[] = {
  {22,{"gguf.iq2_s",1}}, {23,{"gguf.iq4_xs",1}}, {24,{"typed.i8",1}}, {25,{"typed.i16",1}},
  {26,{"typed.i32",1}}, {27,{"typed.i64",1}}, {28,{"typed.f64",1}}, {29,{"gguf.iq1_m",1}},
  {30,{"plain.bf16",1}}, {34,{"gguf.tq1_0",1}}, {35,{"gguf.tq2_0",1}}, {39,{"gguf.mxfp4",1}},
- {42,{"gguf.q2_0.strix",1}}, {200,{"gguf.iu4_g64.strix",1}}
+ {42,{"gguf.q2_0.strix",1}}, {43,{"gguf.nvfp4_tile.strix",1}}, {200,{"gguf.iu4_g64.strix",1}}
 };
 }
 FormatId gguf_format(std::uint32_t type) noexcept {

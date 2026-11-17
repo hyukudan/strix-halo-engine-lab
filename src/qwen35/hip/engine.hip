@@ -17,11 +17,14 @@
 #include <string>
 #include <vector>
 
+#include "strix/env_flags.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/hip_gdn_dims.hpp"
 #include "../../attn_core/dense_decode.hpp"
+#include "../../attn_core/dense_decode_flash.hpp"
 #include "../../core/dense_linear.hpp"
 #include "../../core/dense_linear_iu4.hpp"
+#include "../../core/f16_dense_iu4.hpp"
 #include "../../core/f16_dense_q8a8.hpp"
 #include "../../ops/norm/norm_device.hpp"
 
@@ -166,6 +169,7 @@ struct Layer {
     float* gdn_state = nullptr;
     std::uint16_t* conv_state = nullptr;
     std::uint16_t *k_cache = nullptr, *v_cache = nullptr;
+    std::uint16_t* v_t = nullptr;  // V^T copy for the wide-window flash attention (prefill_rows > 16 only)
 };
 
 dl::View view(const Tensor& t) { return {t.data, t.inputs, t.outputs, t.row_bytes}; }
@@ -256,10 +260,28 @@ void glu16(const Tensor& g, const Tensor& u, const float* x, float* out, unsigne
         silu_mul_kernel<<<256, 256, 0, s>>>(iu4.g, iu4.u, out, std::size_t(rows) * g.outputs);
     } else throw std::runtime_error("gate/up need bf16, q8_0 or iu4");
 }
+// rows > 16 over IU4 weights: FAST dense-iu4a16-f16-v1 (f16_dense_iu4.hpp), the same opt-in as the Q8_0 wide windows
+// (prefill_rows > 16 allocates the wide scratch). The exact reference flag keeps the 16-row sweeps.
+core::f16_dense_tall::iu4a16::View wide_iu4_view(const Tensor& w, const float* x, float* out, unsigned rows) {
+    core::f16_dense_tall::iu4a16::View v{};
+    v.weight = static_cast<const std::uint8_t*>(w.data);
+    v.scale = reinterpret_cast<const std::uint16_t*>(v.weight + core::dense_iu4::packed_bytes(w.outputs, w.inputs));
+    v.x = x; v.out = out; v.in = w.inputs; v.n = w.outputs; v.count = w.outputs; v.rows = rows; v.out_stride = w.outputs;
+    return v;
+}
+bool wide_iu4_ok(const Tensor& t, const WideScratch& wide, unsigned rows) {
+    return wide.codes && t.fmt == kIu4Fmt && !core::dense_iu4::reference_flag() && t.inputs % 128U == 0U && t.outputs % 16U == 0U &&
+           std::uint64_t(rows) * t.inputs * 4U < (1ULL << 32U);
+}
+void wide_iu4(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s) {
+    core::f16_dense_tall::iu4a16::enqueue(wide_iu4_view(w, x, out, rows), s);
+}
 void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s, const WideScratch& wide, const Iu4Scratch& iu4) {
     if (rows > 16U && wide_ok(w, wide)) {
         wide_quant(x, w.inputs, rows, s, wide);
         wide_dense(w, out, rows, s, wide);
+    } else if (rows > 16U && wide_iu4_ok(w, wide, rows)) {
+        wide_iu4(w, x, out, rows, s);
     } else {  // not a Q8_0 shape the WMMA core takes: exact 16-row sweeps
         core::dense_row_sweeps(rows, [&](unsigned r, unsigned count) {
             linear16(w, x + std::size_t(r) * w.inputs, out + std::size_t(r) * w.outputs, count, s, iu4);
@@ -271,6 +293,10 @@ void glu(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned 
         wide_quant(x, g.inputs, rows, s, wide);
         wide_dense(g, wide.g, rows, s, wide);
         wide_dense(u, wide.u, rows, s, wide);
+        silu_mul_kernel<<<1024, 256, 0, s>>>(wide.g, wide.u, out, std::size_t(rows) * g.outputs);
+    } else if (rows > 16U && wide_iu4_ok(g, wide, rows) && wide_iu4_ok(u, wide, rows) && g.outputs == u.outputs) {
+        wide_iu4(g, x, wide.g, rows, s);
+        wide_iu4(u, x, wide.u, rows, s);
         silu_mul_kernel<<<1024, 256, 0, s>>>(wide.g, wide.u, out, std::size_t(rows) * g.outputs);
     } else {
         core::dense_row_sweeps(rows, [&](unsigned r, unsigned count) {
@@ -323,6 +349,16 @@ struct HipEngine::Impl {
           *q_in = nullptr, *kk = nullptr, *vv = nullptr, *qn = nullptr, *ctx = nullptr, *gu = nullptr, *logits = nullptr;
     int *d_ids = nullptr, *d_arg = nullptr;
     unsigned committed = 0, pending = 0;
+    // Wide-window attention (rows > 16, FAST): shared flash over the BF16 cache (attn_core/dense_decode_flash.hpp).
+    // vt_valid = positions whose V^T copy matches the cache (any other cache write lowers it).
+    unsigned vt_valid = 0, vt_stride = 0;
+    float* fws = nullptr;
+    std::size_t fws_floats = 0;
+    unsigned* ffail = nullptr;
+    bool wide_flash(unsigned n) const {
+        static const bool off = strix::envcfg::choice("STRIX_Q35_WIDE_ATTN", {"flash", "decode"}, 0) == 1;
+        return n > kMaxRows && vt_stride && !off;
+    }
 
     // MTP layer (load_mtp): own tensors, own bf16 KV (max_positions), own scratch; the trunk's embedding / lm_head are shared.
     struct MtpData {
@@ -349,7 +385,8 @@ struct HipEngine::Impl {
         for (auto& y : L)
             for (Tensor* t : {&y.attn_norm, &y.post_norm, &y.gate, &y.up, &y.down, &y.qkv, &y.z, &y.beta, &y.alpha, &y.conv, &y.dt,
                               &y.a, &y.snorm, &y.out, &y.q, &y.k, &y.v, &y.o, &y.qnorm, &y.knorm}) fn(*t);
-        for (auto& y : L) { fr(y.k_cache); fr(y.v_cache); }
+        for (auto& y : L) { fr(y.k_cache); fr(y.v_cache); fr(y.v_t); }
+        fr(fws); fr(ffail);
         for (auto* p : {gdn_all, bak_state, raw_qkv, raw_beta, raw_gate, core_r, x, xn, qkv, z, beta, gate, core, proj, q_in, kk, vv,
                         qn, ctx, gu, logits}) fr(p);
         for (auto* p : {conv_all, bak_conv}) fr(p);
@@ -439,6 +476,15 @@ struct HipEngine::Impl {
             alloc0(&wide.deltas, std::size_t(RS) * (maxin / 32U) * 4U);
             alloc0(&wide.g, std::size_t(RS) * I * 4U);
             alloc0(&wide.u, std::size_t(RS) * I * 4U);
+            // flash attention of the wide windows: geometry the shared adapter is instantiated for (Dim 256, GQA group 6)
+            if (D == 256U && cfg.heads == 6U * cfg.kv_heads) {
+                vt_stride = (opt.max_positions + 15U) / 16U * 16U;
+                for (unsigned l = 0; l < cfg.layers; ++l)
+                    if (gdn_index[l] == ~0U) alloc0(&L[l].v_t, std::size_t(KW) * vt_stride * 2U);
+                fws_floats = attn_core::dense::workspace_floats(RS, cfg.heads, D, 4U);
+                alloc0(&fws, fws_floats * 4U);
+                alloc0(&ffail, 4U);
+            }
         }
         {  // IU4 dense weights; sized for the widest dense input / gate-up output of a kMaxRows window (~3 MB)
             alloc0(&iu4.xh, std::size_t(kMaxRows) * std::max<std::size_t>(H, I) * sizeof(_Float16));
@@ -490,6 +536,9 @@ struct HipEngine::Impl {
         HK(hipMemcpyAsync(d_ids, tokens, n * 4U, hipMemcpyHostToDevice, stream));
         embed_kernel<<<n, 256, 0, stream>>>(embd.data, embd.fmt, embd.row_bytes, H, d_ids, x);
         const unsigned nb = (n * H + 255U) / 256U;
+        const bool flash = wide_flash(n);
+        const unsigned vt_from = std::min(vt_valid, pos);
+        vt_valid = flash ? pos + n : vt_from;
         for (unsigned l = 0; l < cfg.layers; ++l) {
             auto& y = L[l];
             rmsnorm(x, y.attn_norm, H, cfg.rms_eps, xn, n, stream);
@@ -517,8 +566,13 @@ struct HipEngine::Impl {
                 linear(y.v, xn, vv, n, stream, wide, iu4);
                 attn_core::dense_decode::Params p{n, cfg.heads, cfg.kv_heads, 2U * D, cfg.rotary_dim, pos, cfg.rms_eps,
                                                   1.0F / std::sqrt(float(D)), cfg.rope_theta, true};
-                attn_core::dense_decode::launch<256>(p, q_in, kk, vv, reinterpret_cast<const float*>(y.qnorm.data),
-                                                     reinterpret_cast<const float*>(y.knorm.data), qn, y.k_cache, y.v_cache, ctx, stream);
+                if (flash)
+                    attn_core::dense_decode_flash::launch<256, 6>(p, q_in, kk, vv, reinterpret_cast<const float*>(y.qnorm.data),
+                                                                  reinterpret_cast<const float*>(y.knorm.data), qn, y.k_cache, y.v_cache,
+                                                                  y.v_t, vt_stride, vt_from, ffail, fws, fws_floats, ctx, stream);
+                else
+                    attn_core::dense_decode::launch<256>(p, q_in, kk, vv, reinterpret_cast<const float*>(y.qnorm.data),
+                                                         reinterpret_cast<const float*>(y.knorm.data), qn, y.k_cache, y.v_cache, ctx, stream);
                 linear(y.o, ctx, proj, n, stream, wide, iu4);
             }
             add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H);

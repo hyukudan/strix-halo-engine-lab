@@ -1379,7 +1379,20 @@ __device__ __forceinline__ unsigned visible_keys(const AttentionView& v, unsigne
     nw = p + 1U < kWindow ? static_cast<unsigned>(p + 1U) : kWindow;
     return nw + (v.idx_count != nullptr ? v.idx_count[r] : 0U);
 }
-template <unsigned kAttnHpw, bool Swizzle, bool Half = false, bool Fold = false, unsigned Lean = 0>
+// policy ds41-decoder-replay-bounded-v1 (separate instantiations; visible_keys above stays main's text so the incumbent
+// kernels compile as before): the window keys start at the layer's key_floor (<= pos), so a row reads
+// min(pos + 1 - key_floor, kWindow) window keys; the ring slots keep the real positions.
+__device__ __forceinline__ unsigned visible_keys_floor(const AttentionView& v, unsigned r, unsigned& nw) {
+    const std::uint64_t p = v.pos[r], span = p + 1U - v.key_floor;
+    nw = span < kWindow ? static_cast<unsigned>(span) : kWindow;
+    return nw + (v.idx_count != nullptr ? v.idx_count[r] : 0U);
+}
+template <bool Floor>
+__device__ __forceinline__ unsigned visible_keys_at(const AttentionView& v, unsigned r, unsigned& nw) {
+    if constexpr (Floor) return visible_keys_floor(v, r, nw);
+    else return visible_keys(v, r, nw);
+}
+template <unsigned kAttnHpw, bool Swizzle, bool Half = false, bool Fold = false, unsigned Lean = 0, bool Floor = false>
 __device__ __forceinline__ void attention_chunk_body(const AttentionView& v, const uint3 bid) {
     DS41_TIMED(5U);
     __shared__ float4 ks[kTile][kHeadDim / 4];   // the f32 tile, or (STRIX_DS41_ATTN_TILE_F16) the f16 tile in its first half
@@ -1389,7 +1402,7 @@ __device__ __forceinline__ void attention_chunk_body(const AttentionView& v, con
     const unsigned c = bid.x, r = bid.z, tid = threadIdx.x, lane = tid & 31U;
     const unsigned hb = (bid.y * (kAttnThreads / 32U) + (tid >> 5U)) * kAttnHpw;
     unsigned nw;
-    const unsigned n = visible_keys(v, r, nw), chunks = (n + kChunk - 1) / kChunk;
+    const unsigned n = visible_keys_at<Floor>(v, r, nw), chunks = (n + kChunk - 1) / kChunk;
     if (v.max_visible != 0U && n > v.max_visible) __builtin_trap();   // the grid covers max_visible keys only
     if (c >= chunks) return;
     const unsigned j0 = c * kChunk, end = n - j0 < kChunk ? n : j0 + kChunk;
@@ -1500,10 +1513,11 @@ __device__ __forceinline__ void attention_chunk_body(const AttentionView& v, con
     if (tid == 0U) *ticket = 0U;
     DS41_MARK(11U);
 }
+template <bool Floor = false>
 __device__ __forceinline__ void attention_combine_body(const AttentionView& v, const uint3 bid) {
     DS41_TIMED(6U);
     unsigned nw;
-    const unsigned n = visible_keys(v, bid.y, nw);
+    const unsigned n = visible_keys_at<Floor>(v, bid.y, nw);
     attention_combine_head(v, bid.y, bid.x, threadIdx.x, (n + kChunk - 1) / kChunk);
 }
 
@@ -1767,6 +1781,12 @@ __global__ __launch_bounds__(32) void attention_combine_seg_kernel(SegmentLaunch
     const uint3 b = segment_block(s, k);
     attention_combine_body(s.v[k], b);
 }
+// policy ds41-decoder-replay-bounded-v1: the exact form with the window key floor, as separate kernels (no window fold;
+// the incumbent kernels above keep their instantiations)
+template <unsigned kAttnHpw, bool Swizzle, bool Half, unsigned Lean, bool Cap = false>
+__global__ __launch_bounds__(kAttnThreads) __attribute__((amdgpu_waves_per_eu(Cap ? 6 : 1)))
+void attention_chunk_floor_kernel(AttentionView v) { attention_chunk_body<kAttnHpw, Swizzle, Half, false, Lean, true>(v, own_block()); }
+__global__ __launch_bounds__(32) void attention_combine_floor_kernel(AttentionView v) { attention_combine_body<true>(v, own_block()); }
 
 // Host side: segments of one kind, each with its own grid, flushed as launches of at most kMaxSegments.
 template <class View>
@@ -1978,10 +1998,23 @@ static void launch_attention(const AttentionView& v, hipStream_t stream) {
     if (v.tickets == nullptr) hipLaunchKernelGGL(attention_combine_kernel, dim3(v.heads, v.rows), dim3(32), 0, stream, v);
     hip_check(hipGetLastError(), "ds41 attention");
 }
+template <bool Swizzle, bool Half>
+static void launch_attention_floor(const AttentionView& v, hipStream_t stream) {  // launch_attention's grid and forms, Lean 3
+    const unsigned hpw = attention_hpw(v);
+    const dim3 grid(attention_chunks(v), v.heads / (kAttnMinBlockHeads * hpw), v.rows);
+    if (hpw == 4U && attention_wave_cap(v))
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_floor_kernel<4, Swizzle, false, 3, true>), grid, dim3(kAttnThreads), 0, stream, v);
+    else if (hpw == 4U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_floor_kernel<4, Swizzle, false, 3>), grid, dim3(kAttnThreads), 0, stream, v);
+    else if (hpw == 2U) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_floor_kernel<2, Swizzle, Half, 3>), grid, dim3(kAttnThreads), 0, stream, v);
+    else hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_chunk_floor_kernel<1, Swizzle, Half, 3>), grid, dim3(kAttnThreads), 0, stream, v);
+    if (v.tickets == nullptr) hipLaunchKernelGGL(attention_combine_floor_kernel, dim3(v.heads, v.rows), dim3(32), 0, stream, v);
+    hip_check(hipGetLastError(), "ds41 attention (key floor)");
+}
 void enqueue_attention_bf16_prefill(const AttentionView& v, hipStream_t stream, int variant) {
     static strix::lever_cache<int> env_variant{[] { const char* e = std::getenv("STRIX_DS41_BF16_ATTN_VARIANT"); return e && e[0] == '2' ? 2 : 1; }};
     if (variant == 0) variant = env_variant.get();
     (void)attention_hpw(v); // retain the incumbent view validation
+    if (v.key_floor != 0U) throw std::invalid_argument("ds41 BF16 prefill attention: no window key floor form");
     if(v.heads%16U)throw std::invalid_argument("BF16 prefill requires a multiple of 16 heads");
     if (variant == 2) hipLaunchKernelGGL(attention_bf16_chunk2, dim3(kMaxChunks,v.heads/16,v.rows),dim3(256),0,stream,v);
     else hipLaunchKernelGGL(attention_bf16_chunk, dim3(kMaxChunks,v.heads/16,v.rows),dim3(256),0,stream,v);
@@ -2000,6 +2033,8 @@ void set_fast_attn_tuning(unsigned chunks_per_block, unsigned ablate, unsigned h
 template <unsigned Cpb, unsigned H>
 static void launch_f16wmma(const AttentionView& v, hipStream_t stream) {
     const dim3 grid((attention_chunks(v) + Cpb - 1U) / Cpb, v.heads / H, v.rows);
+    // policy ds41-decoder-replay-bounded-v1 never binds this form (256 VGPR with spills): flash or exact only
+    if (v.key_floor != 0U) throw std::invalid_argument("ds41 f16wmma prefill attention: no window key floor form");
     hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_f16wmma_kernel<Cpb, H>), grid, dim3(256), 0, stream, v);
     if (v.tickets == nullptr) hipLaunchKernelGGL(HIP_KERNEL_NAME(attention_f16wmma_combine_kernel<Cpb>), dim3(v.heads, v.rows), dim3(32), 0, stream, v);
 }
@@ -2023,10 +2058,15 @@ void enqueue_attention_flash_prefill(const AttentionView& v, hipStream_t stream)
     if (v.heads % 32U != 0U) throw std::invalid_argument("ds41 flash attention: heads must be a multiple of 32");
     if (v.kv != nullptr || v.ring_out != nullptr) throw std::invalid_argument("ds41 flash attention: no window fold");
     if (v.ring16 == nullptr || (v.idx_count != nullptr && v.kv16 == nullptr)) throw std::invalid_argument("ds41 flash attention: key mirrors");
-    // Pf auto bound: window + the selection capacity (window-only layers: <= kWindow keys, below the Pf crossover)
+    // Pf auto bound: window + the selection capacity (window-only layers: <= kWindow keys, below the Pf crossover);
+    // a floored list (policy ds41-decoder-replay-bounded-v1) is never longer
     const unsigned max_keys = kWindow + (v.idx_count != nullptr ? v.topk : 0U);
     using strix::attn_core::sparse::launch_flash_rows;
-    if (v.q16 != nullptr)
+    if (v.key_floor != 0U && v.q16 != nullptr)  // bounded replay + q16 query image
+        launch_flash_rows<FlashAttentionFloorQ16Policy, 32U>(v, v.rows * (v.heads / 32U), stream, max_keys);
+    else if (v.key_floor != 0U)  // policy ds41-decoder-replay-bounded-v1: the floored instantiation
+        launch_flash_rows<FlashAttentionFloorPolicy, 32U>(v, v.rows * (v.heads / 32U), stream, max_keys);
+    else if (v.q16 != nullptr)
         launch_flash_rows<FlashAttentionQ16Policy, 32U>(v, v.rows * (v.heads / 32U), stream, max_keys);
     else
         launch_flash_rows<FlashAttentionPolicy, 32U>(v, v.rows * (v.heads / 32U), stream, max_keys);
@@ -2054,6 +2094,13 @@ void enqueue_attention(const AttentionView& v, hipStream_t stream) {
     check_fold(v);
     const bool fold = v.kv != nullptr;
     const int lean = attention_lean();
+    if (v.key_floor != 0U) {  // policy ds41-decoder-replay-bounded-v1: the floored exact form (no fold, lean 3)
+        if (fold || lean != 3) throw std::invalid_argument("ds41 attention: the window key floor needs the unfolded lean-3 form");
+        const bool f16 = attention_tile_f16();
+        if (attention_lds_swizzle()) f16 ? launch_attention_floor<true, true>(v, stream) : launch_attention_floor<true, false>(v, stream);
+        else f16 ? launch_attention_floor<false, true>(v, stream) : launch_attention_floor<false, false>(v, stream);
+        return;
+    }
     if (lean == 3) enqueue_attention_form<3>(v, fold, stream);
     else lean == 2 ? enqueue_attention_form<2>(v, fold, stream) : lean == 1 ? enqueue_attention_form<1>(v, fold, stream) : enqueue_attention_form<0>(v, fold, stream);
 }

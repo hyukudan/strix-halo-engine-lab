@@ -23,7 +23,8 @@ Config validate(const gguf::FileInfo& info, std::uint32_t max_positions) {
         if (it == by_name.end()) throw std::invalid_argument("qwen35: required tensor missing: " + spec.name);
         const auto& t = *it->second;
         if (t.dimensions != spec.dimensions) throw std::invalid_argument("qwen35: unexpected shape for " + spec.name);
-        const bool type_ok = spec.matrix ? (t.ggml_type == kBF16 || t.ggml_type == kQ8_0 || t.ggml_type == gguf::type_strix_iu4_g64) : t.ggml_type == kF32;
+        const bool type_ok = spec.matrix ? (t.ggml_type == kBF16 || t.ggml_type == kQ8_0 || t.ggml_type == gguf::kNvfp4TilePack ||
+                                       t.ggml_type == gguf::type_strix_iu4_g64) : t.ggml_type == kF32;
         if (!type_ok) throw std::invalid_argument("qwen35: unexpected tensor type " + std::to_string(t.ggml_type) + " for " + spec.name);
     }
     return config;

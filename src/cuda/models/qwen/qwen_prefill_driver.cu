@@ -29,6 +29,7 @@
 #include "strix/cuda/qwen_qsa.hpp"
 #include "strix/mtp_draft_split.hpp"
 #include "strix/cuda/qwen_transcode.hpp"
+#include "strix/cuda/core/nvfp4_a8_cuda.hpp"
 #include "strix/gguf_reader.hpp"
 #include "qwen_tier_adapter.hpp"
 #include <filesystem>
@@ -486,6 +487,12 @@ struct Prefill::Impl : BlockFields {
     std::uint64_t host_bytes = 0;
 
     std::string describe;
+    // TURBO onfly (Config::turbo_onfly_nvfp4): NVFP4 images of the dense Q8_0 roles, registered with qwen_dense.
+    // Process lifetime, like the uploaded model weights.
+    std::uint32_t onfly_tensors = 0;
+    std::uint64_t onfly_source_bytes = 0, onfly_image_bytes = 0;
+    double onfly_seconds = 0;
+    void convert_onfly();
     std::uint32_t transcoded = 0;              // tensors transcoded at load
     StateCopyStream state_copy;
     cudaStream_t state_copy_stream(SessionState& s) {
@@ -654,6 +661,53 @@ void Prefill::Impl::upload_model() {
         native_experts = native_experts || moe::native_types(probe);
     }
     ck(cudaStreamSynchronize(stream), "hc pack");
+    if (cfg.turbo_onfly_nvfp4) convert_onfly();
+}
+
+// TURBO onfly (qwen-turbo-v1, onfly-nvfp4-rtn-g16): the Qwen adapter's declaration of which tensors convert. Dense Q8_0
+// projections of the target only: GDN in (qkv, z) / out, QSA q/k/v/o, shared expert gate/up/down. Routed experts
+// (Q4_K: 4.5 -> 4.5 bpw, nothing to save; Q5_1 down: +20 GB beside the source), the LM head, the hyper-connection mixes,
+// the router and the MTP draft head keep their pack form. The Q8_0 source stays: prefill blocks (>= 16 rows) and the
+// draft read it; decode windows read the image (qwen_dense OnflyScope in run_block).
+void Prefill::Impl::convert_onfly() {
+    namespace a8 = strix::cuda::core::nvfp4_a8;
+    constexpr LayerTensor kRoles[] = {k_attn_qkv_weight, k_attn_gate_weight, k_ssm_out_weight, k_attn_q_weight,
+                                      k_attn_k_weight, k_attn_v_weight, k_attn_output_weight, k_ffn_gate_shexp_weight,
+                                      k_ffn_up_shexp_weight, k_ffn_down_shexp_weight};
+    constexpr std::uint32_t kQ8_0 = 8;
+    const auto t0 = Clock::now();
+    float* scratch = dev_alloc<float>(1, "turbo onfly scratch");
+    for (std::uint32_t l = 0; l < kLayers; ++l) {
+        const std::string blk = "blk." + std::to_string(l);
+        for (const LayerTensor role : kRoles) {
+            void* q8 = lw[l].p[role];
+            if (!q8) continue;   // GDN-only / QSA-only roles
+            const std::string name = blk + kLayerTensorSuffix[role];
+            const gguf::TensorInfo* t = nullptr;
+            for (const auto& x : info.tensors) if (x.name == name) { t = &x; break; }
+            if (!t || t->ggml_type != kQ8_0 || t->dimensions.size() != 2) continue;  // stays in its pack form
+            const auto k = static_cast<std::uint32_t>(t->dimensions[0]), n = static_cast<std::uint32_t>(t->dimensions[1]);
+            if (k % 64U != 0U) continue;
+            a8::Image image;
+            image.codes = dev_alloc<std::uint8_t>(std::uint64_t{n} * (k / 2U), "turbo onfly codes");
+            image.scales = dev_alloc<std::uint8_t>(std::uint64_t{n} * (k / 16U), "turbo onfly scales");
+            ck(a8::convert_q8_0(q8, n, k, image, scratch, stream), "turbo onfly convert");
+            dn::OnflyImage reg;
+            reg.codes = image.codes;
+            reg.scales = image.scales;
+            reg.tensor_scale = image.tensor_scale;
+            reg.outputs = n;
+            reg.width = k;
+            dn::onfly_register(q8, reg);
+            ++onfly_tensors;
+            onfly_source_bytes += t->byte_size;
+            onfly_image_bytes += a8::image_bytes(n, k);
+        }
+    }
+    ck(cudaStreamSynchronize(stream), "turbo onfly");
+    ck(cudaFree(scratch), "turbo onfly scratch");
+    onfly_seconds = std::chrono::duration<double>(Clock::now() - t0).count();
+    if (onfly_tensors == 0) throw std::runtime_error("--turbo-weights onfly: no Q8_0 dense tensor to convert in this pack");
 }
 
 void Prefill::Impl::upload_ple() {
@@ -1236,6 +1290,14 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
             ",\"rawdot_row_bytes\":" + std::to_string(qwen_route::row_bytes(true)) +
             ",\"rawdot_capacity_bytes\":" + std::to_string(qwen_route::layout(m.cap, true).bytes) + "}";
     }
+    if (config.turbo_onfly_nvfp4) {  // OFF: the original bytes above
+        m.describe.pop_back();
+        m.describe += ",\"turbo_weights\":\"onfly-nvfp4-rtn-g16\",\"turbo_arithmetic\":\"" +
+            std::string(strix::cuda::core::nvfp4_a8::kArithmeticId) + "\",\"turbo_tensors\":" +
+            std::to_string(m.onfly_tensors) + ",\"turbo_source_bytes\":" + std::to_string(m.onfly_source_bytes) +
+            ",\"turbo_image_bytes\":" + std::to_string(m.onfly_image_bytes) + ",\"turbo_convert_s\":" +
+            std::to_string(m.onfly_seconds) + "}";
+    }
 }
 
 Prefill::~Prefill() = default;
@@ -1270,6 +1332,9 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         throw std::runtime_error("prefill: tiered exchange is poisoned; recreate engine");
     }
     NvtxScope nv;
+    // TURBO onfly: decode windows (every row count, so a session's bits never depend on its cohort) read the NVFP4
+    // images; prefill blocks keep Q8_0. No registration (exact / FAST): no route changes.
+    const dn::OnflyScope onfly(window && cfg.turbo_onfly_nvfp4);
     std::uint32_t rows = 0;  // all rows of the block
     for (std::uint32_t i = 0; i < count; ++i) {
         if (seg[i].s->target_identity != qwen_options::numerical_identity(cfg).hash)

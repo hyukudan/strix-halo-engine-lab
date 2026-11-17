@@ -142,14 +142,16 @@ int main() {
         edge.wide_ms = 55.0;
         EXPECT(qc::choose_budget(8, 7, qc::DepthPolicy::fair, 16, edge) == 8);
     }
-    // cap-16 cohort table (wide_measured) with the live acceptance: high-acceptance classes widen at C4 / C8 (edit p ~0.95,
-    // json p ~0.87 at C8), low acceptance (prose p ~0.5) and json at C4 stay at 8
+    // cap-16 cohort table (wide_measured, 50 ms) with the live acceptance: high-acceptance classes widen at C4 / C8 (edit
+    // p ~0.95, json p ~0.87), low acceptance (prose p ~0.5) stays at 8; the 0.65 prior (no live p) widens at C8 only
     {
         auto at = [](double p) { qc::WideModel m = qc::wide_measured(16); m.accept = p; return m; };
         EXPECT(qc::choose_budget(8, 7, qc::DepthPolicy::fair, 16, at(0.95)) == 16);
         EXPECT(qc::choose_budget(4, 7, qc::DepthPolicy::fair, 16, at(0.95)) == 16);
         EXPECT(qc::choose_budget(8, 7, qc::DepthPolicy::fair, 16, at(0.87)) == 16);
-        EXPECT(qc::choose_budget(4, 7, qc::DepthPolicy::fair, 16, at(0.87)) == 8);
+        EXPECT(qc::choose_budget(4, 7, qc::DepthPolicy::fair, 16, at(0.87)) == 16);
+        EXPECT(qc::choose_budget(8, 7, qc::DepthPolicy::fair, 16, at(0.65)) == 16);
+        EXPECT(qc::choose_budget(4, 7, qc::DepthPolicy::fair, 16, at(0.65)) == 8);
         EXPECT(qc::choose_budget(8, 7, qc::DepthPolicy::fair, 16, at(0.5)) == 8);
         EXPECT(qc::choose_budget(4, 7, qc::DepthPolicy::fair, 16, at(0.5)) == 8);
         EXPECT(qc::choose_budget(1, 7, qc::DepthPolicy::fair, 16, at(0.95)) == 8);  // one session: copy windows decide

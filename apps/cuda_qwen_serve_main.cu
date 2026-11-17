@@ -692,7 +692,7 @@ private:
             s.ctx = std::make_unique<qc::ContextDraft>(mode);
             s.ctx->drafter.reset(std::span<const std::uint32_t>(job.prompt.data(), s.n - 1));
         }
-        s.stream = qc::Stream{s.session, job.prompt[s.n - 1], s.n - 1, job.draft_depth_max, s.ctx.get(), job.copy_rows};
+        s.stream = qc::Stream{s.session, job.prompt[s.n - 1], s.n - 1, job.draft_depth_max, s.ctx.get(), job.copy_rows, job.window_rows};
         s.st.finish = "length";
         if (job.max_tokens == 0) finish(s, {}, "length");
     }

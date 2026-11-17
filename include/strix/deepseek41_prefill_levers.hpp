@@ -79,6 +79,7 @@ inline constexpr PrefillLever kPrefillLevers[] = {
     {"STRIX_DS41_COMPRESS_RING", PrefillLeverClass::reload},
     {"STRIX_DS41_COPY_ROWS", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
     {"STRIX_DS41_DECODER_REPLAY", PrefillLeverClass::reload},  // pair profile table row (bounded decoder replay policy)
+    {"STRIX_DS41_DECODER_REPLAY_ORACLE", PrefillLeverClass::reload},  // measurement-only exact cone rows of the replay
     {"STRIX_DS41_DECODE_PREFETCH", PrefillLeverClass::reload},
     {"STRIX_DS41_DECODE_XPORT", PrefillLeverClass::reload},  // startup resolver applies this policy before resident arms
     {"STRIX_DS41_DEFER_DECODER", PrefillLeverClass::cached},

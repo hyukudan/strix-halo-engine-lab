@@ -1,3 +1,4 @@
+#include <cassert>
 #include "strix/env_flags.hpp"
 #include "strix/pinned_host.hpp"
 #include "strix/file_snapshot.hpp"
@@ -351,6 +352,12 @@ bool prefill_flash_q16() {
 std::uint32_t prefill_moe_window_cap() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_PREFILL_MOE_WINDOW_CAP", 8192U, 1U, 65536U); }
 bool prefill_joint_layer() { return strix::envcfg::flag("STRIX_DS41_PREFILL_JOINT_LAYER", false, strix::EnvFlagMatch::exact); }
 std::uint32_t prefill_joint_layer_rows() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_PREFILL_JOINT_LAYER_ROWS", 1024U, 0U, 65536U); }
+// FAST policy ds41-decoder-replay-bounded-v1 (STRIX_DS41_DECODER_REPLAY = R rows, a multiple of 128; 0/unset off; set by the
+// governed profile table): every decoder layer runs only its last R rows, window keys floored at the cut
+// (ds41::plan_bounded_replay). STRIX_DS41_DECODER_REPLAY_ORACLE=1 (measurement only): the exact cone's rows with the same
+// key floors, whose last-row logits and state must equal the bounded run's bit for bit (fixture b).
+std::uint32_t prefill_decoder_replay_rows() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_DECODER_REPLAY", 0U, 0U, 65536U); }
+bool prefill_decoder_replay_oracle() { return strix::envcfg::flag("STRIX_DS41_DECODER_REPLAY_ORACLE", false, strix::EnvFlagMatch::exact); }
 unsigned prefill_window_drain() { return strix::envcfg::number<unsigned>("STRIX_DS41_PREFILL_WINDOW_DRAIN", 1U, 0U, 3U); }
 bool prefill_o_low_a8_fused() {
     const char* v = std::getenv("STRIX_DS41_PREFILL_O_LOW_A8_FUSED");
@@ -460,16 +467,22 @@ struct DevicePrefill::Impl {
     ds41::DenseFp16Cache dense_fp16;
 #endif
     // projection bit (PrefillOptions::fp16_projections) of a layer's call of `rows` rows on the FP16 backend
+    // policy ds41-decoder-replay-bounded-v1 pins the decoder layers (>= this) to the exact dense form, so a projection's
+    // form never depends on the bound's row count: bounded run == full run with the window keys floored, bit for bit
+    // (the FP16 form picks its form and hipBLASLt solution by rows). ~0: no pin (every other run).
+    std::uint32_t exact_dense_from = 0xFFFFFFFFU;
+    bool dense_exact = false;  // the op being enqueued is in a pinned layer (dense(): no FAST dense form)
     bool fp16_at(std::uint32_t bit, std::uint32_t layer, std::uint32_t rows) const {
         // FP16 output form: calls under 128 rows stay exact (hipBLASLt loses there: 64 x 8192 x 5120 0.46-0.51 vs 0.40 ms)
         return options.fp16_dense && (options.fp16_projections & bit) != 0U && layer >= options.approx_layer_first &&
-               layer < options.approx_layer_end && rows >= std::max(options.fp16_min_rows, options.fp16_fast ? 128U : 0U);
+               layer < options.approx_layer_end && layer < exact_dense_from &&
+               rows >= std::max(options.fp16_min_rows, options.fp16_fast ? 128U : 0U);
     }
     // FP16 output form: the norms' FP16 activations (x for q_a / kv, qr for q_b), sized as x / qr on first use
     Dev<std::uint16_t> x16, qr16;
     bool fast_at(std::uint32_t bits, std::uint32_t layer) const {
         return options.fp16_dense && options.fp16_fast && (options.fp16_projections & bits) != 0U && layer >= options.approx_layer_first &&
-               layer < options.approx_layer_end;
+               layer < options.approx_layer_end && layer < exact_dense_from;
     }
     bool fast_used = false;
     void fast(const ds41::Q8A8DensePrefillView* views, unsigned count, std::uint32_t rows, const std::uint16_t* a16, std::uint32_t a16_stride,
@@ -498,9 +511,10 @@ struct DevicePrefill::Impl {
 #else
             throw std::runtime_error("FP16 dense prefill requires STRIX_DS41_PREFILL_FP16_LT");
 #endif
-        } else if (dense_select && v.tall == 0U) {
+        } else if ((dense_select && v.tall == 0U) || dense_exact) {
             auto w = v;
-            w.tall = 1U;  // auto
+            if (dense_select && w.tall == 0U) w.tall = 1U;  // auto
+            w.exact = w.exact || dense_exact;
             return ds41::enqueue_q8_0_a8_dense_prefill(w,st);
         }
         return ds41::enqueue_q8_0_a8_dense_prefill(v,st);
@@ -1390,6 +1404,7 @@ std::uint64_t DevicePrefill::owned_weight_bytes(const std::filesystem::path& ggu
     return need;
 }
 std::string DevicePrefill::overlay_description() const { return impl_->overlay ? impl_->overlay->describe() : std::string{}; }
+std::filesystem::path DevicePrefill::overlay_path() const { return impl_->overlay ? impl_->overlay->path() : std::filesystem::path{}; }
 
 namespace {
 
@@ -1668,6 +1683,11 @@ void DevicePrefill::set_precision_for_new_sequence(bool dense,bool attention) {
     impl_->options.fp16_dense=dense;impl_->options.bf16_attention=attention;impl_->broken=true;
 }
 
+void DevicePrefill::set_cone(bool on) {
+    if (impl_->task) throw std::logic_error("cannot change the cone during a prefill task");
+    impl_->options.cone = on;
+}
+
 void DevicePrefill::apply_levers() {
     if (impl_->task) throw std::logic_error("cannot apply levers during a prefill task");
     auto& m = *impl_;
@@ -1710,6 +1730,8 @@ void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions& p) {
     o.fast_attention_flash = p.fast_attention_flash;
     o.fast_moe = p.fast_moe;
     o.fast_dense = p.fast_dense;
+    o.decoder_replay_rows = p.decoder_replay_rows;
+    o.decoder_replay_override = p.decoder_replay_override;
     o.fast_engram = p.fast_engram;
     // no process-wide switch: run_from installs these options as the precision of its own execution (another
     // DevicePrefill of the process keeps its own; strix/ds41_prefill_precision.hpp)
@@ -1828,6 +1850,13 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     // own cone, as this code plans it (rounded down to W, with the draft rows), starts at least one attention window
     // after the continuation's first row in every decoder layer, so it reads no decoder ring entry of this run.
     const std::uint32_t first_decoder = ds41::SuffixReplayGeometry{}.first_decoder;
+    // the bounded decoder replay's bound (0 off) and oracle form, agreed by both ranks with the deferral below
+    // (PrefillOptions::decoder_replay_rows, else the environment). A run from position 0 only: a later run (extend)
+    // continues from the bounded state with the exact plan.
+    const std::uint32_t bounded = P0 != 0U ? 0U : (m.options.decoder_replay_override || m.options.decoder_replay_rows != 0U) ? m.options.decoder_replay_rows : prefill_decoder_replay_rows();
+    const bool bounded_oracle = bounded != 0U && prefill_decoder_replay_oracle();
+    result.decoder_replay_rows = bounded;
+    result.decoder_replay_oracle = bounded_oracle;
     bool defer = false;
     {
         const std::uint32_t next_rows = std::exchange(m.defer_next, 0U);
@@ -1842,30 +1871,66 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             for (const auto& pl : ds41::plan_suffix_replay(g, 0U, next_rows).layers)
                 if (pl.layer >= first_decoder && pl.out_begin / W * W < attn::kWindow) defer = false;
         }
-        if (grp == nullptr && m.distributed() && m.options.cone && m.options.layers == c.num_hidden_layers) {  // both ranks: the same decision
-            const std::array<std::uint32_t, 2> mine{defer ? 1U : 0U, defer ? next_rows : 0U};
-            std::array<std::uint32_t, 2> other{};
+        if (grp == nullptr && m.distributed() && (m.options.cone || bounded != 0U) && m.options.layers == c.num_hidden_layers) {  // both ranks: the same decision
+            const std::array<std::uint32_t, 3> mine{defer ? 1U : 0U, defer ? next_rows : 0U, bounded | (bounded_oracle ? 0x80000000U : 0U)};
+            std::array<std::uint32_t, 3> other{};
             m.options.communicator->exchange_host(std::as_bytes(std::span(mine)), std::as_writable_bytes(std::span(other)),
                                                   dist::Tag{static_cast<std::uint32_t>(dist::TagKind::control), 0x64656631U, P0});
             if (other != mine)
-                throw std::runtime_error("deepseek41 prefill: the ranks disagree on the decoder deferral of the run at " + std::to_string(P0));
+                throw std::runtime_error("deepseek41 prefill: the ranks disagree on the decoder deferral or the bounded decoder replay of the run at " + std::to_string(P0));
         }
     }
+    // bounded decoder replay (FAST policy ds41-decoder-replay-bounded-v1): v1 is a fresh prompt's whole cone only
+    if (bounded != 0U) {
+        if (m.options.draft_rows > bounded)
+            throw std::invalid_argument("ds41-decoder-replay-bounded-v1: draft_rows = " + std::to_string(m.options.draft_rows) +
+                                        " exceeds R = " + std::to_string(bounded));
+        if (ds41::bounded_replay_floor_unit % W != 0U)
+            throw std::invalid_argument("ds41-decoder-replay-bounded-v1: window_rows = " + std::to_string(W) +
+                                        " must divide the fixed floor unit = " + std::to_string(ds41::bounded_replay_floor_unit));
+        if (bounded % attn::kWindow != 0U || bounded % W != 0U)
+            throw std::invalid_argument("ds41-decoder-replay-bounded-v1: the bound must be a multiple of 128 and of window_rows");
+        if (bounded < ds41::bounded_replay_min_rows)
+            throw std::invalid_argument("ds41-decoder-replay-bounded-v1: bounds below " + std::to_string(ds41::bounded_replay_min_rows) +
+                                        " rows fail the DS41 FAST quality gate (R = 128: dNLL +0.01406 > +0.00991)");
+        // its plan replaces the cone (also without options.cone: the quality runner's all-rows form, whose head rows lie
+        // inside the bound)
+        if (m.options.layers != c.num_hidden_layers || !m.snap_points.empty() || defer || m.state_incomplete || grp != nullptr ||
+            (!m.options.cone && m.options.quality_head_rows > bounded))
+            throw std::invalid_argument("ds41-decoder-replay-bounded-v1 (v1): a fresh prompt's whole-model run only (no cached prefix, "
+                                        "no in-run snapshot points, no decoder deferral, no group pass, head rows inside the bound)");
+        // floored window keys only on the flash and exact attention forms: never the f16wmma (spilling) or BF16 forms
+        for (std::uint32_t layer = first_decoder; layer < m.options.layers; ++layer)
+            if (m.bf16_at(layer) || (m.fast_attn_at(layer) && !m.flash_attn_at(layer)))
+                throw std::invalid_argument("ds41-decoder-replay-bounded-v1: decoder layer " + std::to_string(layer) +
+                                            " would take the f16wmma or BF16 attention form (only flash or exact take a key floor)");
+    }
+    m.exact_dense_from = bounded != 0U ? first_decoder : 0xFFFFFFFFU;  // both modes (bounded and oracle): one dense form
     result.decoder_deferred = defer;
     if (defer) result.next_token = 0xFFFFFFFFU;
-    struct Rows { std::uint32_t x0 = 0, k0 = 0, o0 = 0; };
+    struct Rows { std::uint32_t x0 = 0, k0 = 0, o0 = 0, kf = 0; };  // kf: the window key floor (0 none)
     std::vector<Rows> rows(m.options.layers);
-    if (m.options.cone && m.options.layers == c.num_hidden_layers && grp == nullptr) {  // a group pass: every row in every layer (exact)
+    if ((m.options.cone || bounded != 0U) && m.options.layers == c.num_hidden_layers && grp == nullptr) {  // a group pass: every row in every layer (exact)
         ds41::SuffixReplayGeometry g;
         g.layers = c.num_hidden_layers;
         g.draft_rows = m.options.draft_rows;
-        const auto plan = ds41::plan_suffix_replay(g, 0U, T);
+        const auto plan = bounded != 0U && !bounded_oracle ? ds41::plan_bounded_replay(g, 0U, T, bounded) : ds41::plan_suffix_replay(g, 0U, T);
         const auto down = [&](std::uint64_t v) { return static_cast<std::uint32_t>(v / W * W); };
+        // ds41-decoder-replay-bounded-v1: fixed 256-row floor, independent of scheduling window_rows.
+        static_assert(ds41::bounded_replay_floor_unit == attn::kMaxCallRows);
+        const auto key_cut = bounded != 0U ? static_cast<std::uint32_t>(ds41::bounded_replay_key_floor(T, bounded)) : 0U;
         for (const auto& pl : plan.layers) {
             if (pl.layer >= m.options.layers) continue;
             auto& r = rows[pl.layer];
             r.o0 = down(pl.out_begin);
             r.k0 = down(pl.kv_begin);
+            if (bounded != 0U && pl.layer >= first_decoder) {
+                r.kf = key_cut;
+                r.o0 = std::max(r.o0, key_cut);
+                r.k0 = std::max(r.k0, key_cut);
+                // Clamping also protects Release and the oracle: no query below the key floor.
+                assert(r.o0 >= r.kf && r.k0 >= r.kf);
+            }
             r.x0 = m.roles[pl.layer].owns_kv ? 0U : r.k0;
         }
         // in-run snapshot points: also the cone of the state at p (one contiguous suffix per layer: the union)
@@ -2526,6 +2591,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     };
     for (const auto& s : m.plan.steps) {
         const auto layer = static_cast<std::uint32_t>(std::max(s.layer, 0));
+        m.dense_exact = s.layer >= 0 && layer >= m.exact_dense_from;
         if (defer && (s.layer < 0 ? s.op == Op::head || s.op == Op::argmax : layer >= first_decoder)) {
             // deferred decoder: only a compressed-KV source's attention input and its compressor run (no head)
             const bool source = s.layer >= 0 && m.roles[layer].owns_kv;
@@ -3148,6 +3214,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         }
                         v.partial = ln.attn_partial.p;
                         v.tickets = ln.attn_tickets.p;
+                        v.key_floor = R0.kf != 0U ? static_cast<std::uint32_t>(P0 + R0.kf) : 0U;  // bounded decoder replay: no window key below the cut
                         v.o = m.o.p + std::size_t{w0 - r0} * QL;
                         if (o_a8_fused) {
                             v.codes = m.ocodes.p + std::size_t{w0 - r0} * QL;
@@ -3739,7 +3806,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 }
                 break;
             }
-            if(m.options.quality_head_rows>1) {
+            if(m.options.quality_head_rows>1 && !m.options.cone) {
                 unsigned nr=std::min(m.options.quality_head_rows,Tn),first=Tn-nr;
                 ds41::enqueue_hc_collapse(stream_now()+std::size_t(first)*stream_row,m.identity_pre?nullptr:m.mix_ffn.p+first,nr,H,m.quality_h.p,st);
                 ds41::enqueue_rms_norm(m.quality_h.p,m.devf("output_norm.weight"),nr,H,H,1e-20F,m.quality_h.p,st);

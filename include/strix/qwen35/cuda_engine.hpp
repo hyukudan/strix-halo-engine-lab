@@ -25,8 +25,9 @@ namespace strix::qwen35 {
 
 enum class PackFormat : std::uint8_t { bf16, q8_0 };
 // TURBO weight source (owner requirement): off = exact pack as is; native = TURBO policy without weight change;
-// onfly = BF16 2-D weights rounded at load to NVFP4 (RTN per 16, kept only in VRAM). `converted` is not implemented yet.
-enum class TurboWeights : std::uint8_t { off, native, onfly };
+// onfly = BF16 2-D weights rounded at load to NVFP4 (RTN per 16, kept only in VRAM). converted = the same NVFP4 bytes read from a pack written by save_converted_pack (no BF16 source,
+// no conversion; the pack decides which tensors are NVFP4, e.g. lm_head).
+enum class TurboWeights : std::uint8_t { off, native, onfly, converted };
 // Prefill arithmetic policy for CudaEngine::prefill (the large-M path). exact: dense on the large-M tensor-core GEMM with the decode
 // reduction order + decode attention in 32-row windows + sequential GDN: bitwise equal to forward_rows windows + commit.
 // flash: exact dense, causal flash attention (bf16 P, online softmax; FAST attention, differs from decode attention).
@@ -69,8 +70,11 @@ struct EngineOptions {
     const std::string pf = o.prefill_arith == PrefillArith::exact ? "" : std::string("-pf-") + pf_names[static_cast<unsigned>(o.prefill_arith)];
     if (o.turbo_weights == TurboWeights::off) return "qwen35-cuda-exact-" + a + "-v1" + pf;
     if (o.turbo_weights == TurboWeights::native) return "qwen35-turbo-native-" + a + "-v1" + pf;
+    // converted packs hold the onfly bytes: same arithmetic identity as onfly (prefix caches may be shared)
     return "qwen35-turbo-nvfp4-onfly-rtn16-v2-retained-" + a + (o.turbo_lm_head ? "" : "-lmhead-bf16") + pf;
 }
+// Writes the onfly NVFP4 weights of the BF16 gguf `src` as a converted pack at `out` (use with TurboWeights::converted). Returns bytes.
+std::uint64_t save_converted_pack(const std::string& src, const std::string& out, const EngineOptions& opt);
 // Effective-config text (identity, prefix-cache key, every lever).
 void print_effective_config(const EngineOptions& o, const char* dense_arith, std::FILE* f);
 
