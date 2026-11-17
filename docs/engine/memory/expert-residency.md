@@ -118,3 +118,5 @@ Next levers (predicted, not yet measured): promotions asynchronous on a copy str
 ring, with the planner margin priced in measured ms per byte (24 GiB warm plain 23 -> ~28 tok/s, 12 GiB at least
 the 8 GiB figure); MTP at 12 / 10 GiB with a smaller pool (expected ~40 tok/s warm from the 16 GiB ratio); a
 persistent spinning CPU pool during steps (per-layer fixed cost).
+
+The device profile caps total card usage, so physical bytes already in use are subtracted before sizing this engine. An explicit residency budget limits the engine allowance further.
