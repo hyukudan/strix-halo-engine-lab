@@ -562,6 +562,44 @@ static void test_mma_tile(u32 tg, u32 td, u32 count, std::mt19937& rng) {
     for (std::size_t i = 0; i < sd.size(); ++i) check(sd[i] == 1, "mma down staging", count, u32(i));
 }
 
+// Tile-major raster of the FAST kernels (native_mma::tile_major) on their launch grids (tiles, ffn / 64) and
+// (tiles, hidden / 128): every (tile, slice) is owned by exactly one block, the slices of a tile are consecutive in dispatch
+// order, the blocks past tile_count are exactly (tiles - tile_count) x slices, and each tile still writes every output of
+// both kernels once (project_output / down_output unchanged).
+static void test_mma_raster() {
+    constexpr u32 ffn = 640U, hidden = 2560U;
+    for (u32 slices : {ffn / nm::kProjectOutputs, hidden / nm::kDownOutputs}) {
+        const bool project = slices == ffn / nm::kProjectOutputs;
+        for (u32 tiles : {1U, 2U, 9U, 65U, 1262U, 1775U}) {
+            std::vector<u8> seen(std::size_t(tiles) * slices, 0);
+            const u32 tile_count = tiles > 2U ? tiles - 2U : tiles;
+            u32 exited = 0, prev_tile = 0;
+            for (u32 by = 0; by < slices; ++by)
+                for (u32 bx = 0; bx < tiles; ++bx) {
+                    const nm::TileSlice ts = nm::tile_major(bx, by, tiles, slices);
+                    const u32 l = bx + tiles * by;
+                    check(ts.tile < tiles && ts.slice < slices, "mma raster range", tiles, l);
+                    if (ts.tile < tiles && ts.slice < slices) ++seen[std::size_t(ts.tile) * slices + ts.slice];
+                    check(ts.slice == l % slices && (l == 0U || ts.tile == prev_tile + (ts.slice == 0U ? 1U : 0U)),
+                          "mma raster tile-major order", tiles, l);
+                    prev_tile = ts.tile;
+                    exited += ts.tile >= tile_count ? 1U : 0U;
+                }
+            for (std::size_t i = 0; i < seen.size(); ++i) check(seen[i] == 1, "mma raster bijection", tiles, u32(i));
+            check(exited == (tiles - tile_count) * slices, "mma raster early exit", tiles, exited);
+            std::vector<u8> out(project ? ffn : hidden, 0);
+            for (u32 s = 0; s < slices; ++s)
+                for (u32 w = 0; w < nm::kThreads / 32U; ++w)
+                    for (u32 n = 0; n < (project ? 1U : 2U); ++n)
+                        for (u32 c = 0; c < 8U; ++c) {
+                            const u32 o = project ? nm::project_output(s, w, c) : nm::down_output(s, w, n, c);
+                            if (o < out.size()) ++out[o];
+                        }
+            for (std::size_t i = 0; i < out.size(); ++i) check(out[i] == 1, "mma raster output cover", slices, u32(i));
+        }
+    }
+}
+
 int main() {
     std::mt19937 rng(20261117U);
     test_codes(rng);
@@ -582,6 +620,7 @@ int main() {
     test_micro_tile_banks<2>(); test_micro_tile_banks<4>();
     test_mma_geometry(rng);
     test_mma_conversions(rng);
+    test_mma_raster();
     for (u32 count : {1U, 9U, 37U, 64U}) {
         u32 n = 0;
         for (u32 tg : {qt::t_iq3_xxs, qt::t_iq3_s, qt::t_iq2_s, qt::t_iq4_xs, qt::t_q2_0})

@@ -106,19 +106,19 @@ QQ_HD std::uint32_t u32(const std::uint8_t* p) {
     return static_cast<std::uint32_t>(p[0]) | (static_cast<std::uint32_t>(p[1]) << 8) | (static_cast<std::uint32_t>(p[2]) << 16) |
            (static_cast<std::uint32_t>(p[3]) << 24);
 }
-// Exact FP16 -> FP32 (normals, subnormals, inf/NaN), the GGML_FP16_TO_FP32 value.
+// Exact FP16 -> FP32 (normals, subnormals, inf/NaN), the GGML_FP16_TO_FP32 value, with the oracle's quieted NaN payload.
+// Branch-free (selects only), so a decoder that calls it stays one basic block and its loads can be scheduled together:
+// exponents 1..30 rebias by an integer add; zero and subnormals are man x 2^-24, exact in FP32 (man < 2^10 converts
+// exactly and the power-of-two scaling lands in the FP32 normal range, so FTZ never applies); exp 31 builds inf or the
+// quieted NaN. Bit-identical to the former branching form for all 65,536 inputs (tests/cuda/gsq_decode_host_test.cpp).
 QQ_HD float fp16(std::uint16_t h) {
-    const std::uint32_t sign = static_cast<std::uint32_t>(h & 0x8000U) << 16U;
-    std::uint32_t exp = (h >> 10U) & 0x1fU, man = h & 0x3ffU, bits;
-    if (exp == 0U) {
-        if (man == 0U) bits = sign;
-        else {  // subnormal: normalize
-            exp = 127U - 15U + 1U;
-            while ((man & 0x400U) == 0U) { man <<= 1U; --exp; }
-            bits = sign | (exp << 23U) | ((man & 0x3ffU) << 13U);
-        }
-    } else if (exp == 31U) bits = sign | 0x7f800000U | (man << 13U) | (man ? 0x00400000U : 0U);  // NaN quieted, as the oracle
-    else bits = sign | ((exp + 112U) << 23U) | (man << 13U);
+    const std::uint32_t sign = static_cast<std::uint32_t>(h & 0x8000U) << 16U, mag = h & 0x7fffU, man = h & 0x3ffU;
+    const float tiny = static_cast<float>(static_cast<int>(mag)) * 5.9604644775390625e-8F;  // x 2^-24, used for mag < 0x400
+    std::uint32_t tiny_bits;
+    std::memcpy(&tiny_bits, &tiny, 4);
+    const std::uint32_t special = 0x7f800000U | (man << 13U) | (man != 0U ? 0x00400000U : 0U);
+    const std::uint32_t normal = (mag << 13U) + (112U << 23U);
+    const std::uint32_t bits = sign | (mag < 0x400U ? tiny_bits : (mag >= 0x7c00U ? special : normal));
     float f;
     std::memcpy(&f, &bits, 4);
     return f;
