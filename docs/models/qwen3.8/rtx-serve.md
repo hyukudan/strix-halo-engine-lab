@@ -147,7 +147,9 @@ new engine/process. The numerical identity and real-row arithmetic are unchanged
 
 Qualification includes bitwise native verification and partial-accept rollback for
 T=2–16, plus poisoned-padding operator checks. Paired old/new and reversed-order
-native window measurements on the qualified full-resident profile gave:
+native window measurements (two observations per arm from opposite orders) on a
+full-resident Qwen MoE Q4_K_XL profile, 1,024 prompt tokens, 144-token benchmark
+generation setting, CUDA sm_120 and a 534 W configured GPU cap gave:
 
 | Window rows | Padded median (ms) | Real-row median (ms) |
 |---|---:|---:|

@@ -420,9 +420,9 @@ void moe_window_rows() {
         check(d.config.moe_real_rows && d.moe_real_rows_origin == "default", "default: real rows, origin default");
         check(y.config.moe_real_rows && y.moe_real_rows_origin == "explicit", "STRIX_QRTX_MOE_REAL_ROWS=1 requests real rows");
         check(!n.config.moe_real_rows && n.moe_real_rows_origin == "explicit", "STRIX_QRTX_MOE_REAL_ROWS=0 is explicit off");
-        check(qo::numerical_identity(y.config).hash == qo::numerical_identity(d.config).hash &&
-                  qo::handoff_numerical_id_config("x", y.config) == qo::handoff_numerical_id_config("x", d.config) &&
-                  y.contract == d.contract,
+        check(qo::numerical_identity(y.config).hash == qo::numerical_identity(n.config).hash &&
+                  qo::handoff_numerical_id_config("x", y.config) == qo::handoff_numerical_id_config("x", n.config) &&
+                  y.contract == n.contract,
               "real rows: same numerical identity, hand-off id and arithmetic contract");
         const auto row_of = [](const qo::Resolved& r) {
             const auto json = strix::serve::parse_json(qo::effective_config_json(r));
