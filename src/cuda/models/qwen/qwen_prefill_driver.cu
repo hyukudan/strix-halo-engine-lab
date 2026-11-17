@@ -221,12 +221,6 @@ bool nvtx_on() {
     return on;
 }
 
-// STRIX_QRTX_MOE_PAD_ROWS=1: decode windows of 9..15 rows also route the padding rows of their 16-row block through the
-// routed experts (the old form). Default: the routed MoE of a window runs on its real rows only (run_block).
-bool moe_pad_rows() {
-    static const bool on = strix::envcfg::flag("STRIX_QRTX_MOE_PAD_ROWS", false);
-    return on;
-}
 inline void nvtx_push(const char* name) { if (nvtx_on()) nvtxRangePushA(name); }
 inline void nvtx_pop() { if (nvtx_on()) nvtxRangePop(); }
 // Ranges of one run_block: whatever is still open when it unwinds (an exception mid-enqueue) is popped.
@@ -374,6 +368,8 @@ struct Prefill::Impl : BlockFields {
     ~Impl() { if (trace_file) std::fclose(trace_file); if (trace_host) cudaFreeHost(trace_host); }
     std::size_t graph_cap = 512;                   // layouts up to 16 rows (C8 with 1-draft windows: 256)
     std::uint64_t graph_clock = 0, graph_captures = 0, graph_replays = 0, graph_evictions = 0, eager_windows = 0;
+    // Routed-MoE window rows receipt (moe_rows_policy): 9..15-row windows counted at verify_cohort.
+    std::uint64_t moe_real_row_windows = 0, moe_padding_rows_skipped = 0, moe_padded_windows = 0;
     void drop_graph(std::map<GraphKey, StepGraph>::iterator it);
     std::uint32_t* ids_pinned = nullptr;           // [8] window tokens (graph memcpy source)
     std::uint32_t* argmax_pinned = nullptr;        // [8]
@@ -1391,6 +1387,14 @@ std::string Prefill::residency_receipt_json() const {
     if (!impl_->tier) return "{\"expert_residency\":\"full\"}";
     return impl_->tier->receipt_json();
 }
+std::string Prefill::moe_rows_receipt_json() const {
+    const auto& m = *impl_;
+    const auto p = moe_rows_policy(m.cfg.moe_real_rows, m.tier != nullptr);
+    const auto b = [](bool v) { return v ? std::string("true") : std::string("false"); };
+    return "{\"requested\":" + b(p.requested) + ",\"effective\":" + b(p.effective) + ",\"reason\":\"" + p.reason +
+           "\",\"real_row_windows\":" + std::to_string(m.moe_real_row_windows) + ",\"padding_rows_skipped\":" +
+           std::to_string(m.moe_padding_rows_skipped) + ",\"padded_windows\":" + std::to_string(m.moe_padded_windows) + "}";
+}
 std::uint64_t Prefill::card_budget_bytes() const {
     // a cap the plan used (flag, environment or device profile) or the tiered route: the engine was sized to it
     return impl_->plan.decision.cap_source != "card" || impl_->tier ? impl_->plan.decision.budget : 0ULL;
@@ -1430,7 +1434,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
     // failure word. Each row's routed chain does not depend on the other rows (windows are batch-invariant; 1..8-row
     // windows already route exactly their rows), so the real rows' bits are unchanged. Prefill blocks and the tiered
     // path keep `pad`.
-    const std::uint32_t moe_rows = window && !tier && !moe_pad_rows() ? rows : pad;
+    const std::uint32_t moe_rows = moe_block_rows(moe_rows_policy(cfg.moe_real_rows, tier != nullptr), window, rows, pad);
     for (std::uint32_t i = 0; i < count; ++i)
         ck(cudaMemcpyAsync(ids + seg[i].offset, seg[i].tokens, std::uint64_t{seg[i].rows} * 4, cudaMemcpyHostToDevice, stream), "ids");
     nv.push("embed");
@@ -2232,6 +2236,14 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
     // and never read back)
     const std::uint32_t pad = total <= 8U ? total : 16U;
     if (pad > m.cap) throw std::invalid_argument("step rows out of range");
+    if (total < pad) {  // receipt: what run_block's routed MoE does with this window's padding rows
+        if (moe_rows_policy(m.cfg.moe_real_rows, m.tier != nullptr).effective) {
+            ++m.moe_real_row_windows;
+            m.moe_padding_rows_skipped += pad - total;
+        } else {
+            ++m.moe_padded_windows;
+        }
+    }
     // The pinned window inputs (ids_pinned, ple_ids_host, seg_table_pinned) are rewritten below and read by the copies of
     // this window only when it executes: every earlier window synchronized the decode stream before returning, so no
     // reader is in flight. Enforced here (one query), so a later change that returns before the sync fails loudly

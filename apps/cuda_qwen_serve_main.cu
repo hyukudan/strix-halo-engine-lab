@@ -939,6 +939,7 @@ int main(int argc, char** argv) {
         config.status_extra = [&prefix_cache, device_json, &engine](serve::Json& status) {
             status.set("expert_residency", serve::parse_json(engine.residency_json()));
             status.set("expert_residency_receipt", serve::parse_json(engine.residency_receipt_json()));
+            status.set("moe_window_rows_receipt", serve::parse_json(engine.moe_rows_receipt_json()));
             status.set("prefix_cache", serve::parse_json(prefix_cache.stats_json()));
             status.set("device", serve::parse_json(device_json));
         };

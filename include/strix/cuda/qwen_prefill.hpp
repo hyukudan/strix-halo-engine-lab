@@ -18,6 +18,7 @@
 #include "strix/cuda/qwen_route_bf16.hpp"
 #include "strix/cuda/qwen_mtp_diagnostic.hpp"
 #include "strix/qwen_weight_packs.hpp"
+#include "strix/lever.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -47,6 +48,11 @@ struct Config {
     // maximum before the decode buffers and refuse when anything later does not fit (the pre-fit behaviour).
     bool block_fit = false;
     std::uint32_t block_fit_reserve_mib = 512;
+    // Routed-MoE rows of a 9..15-row decode window (lever qwen_cuda_moe_real_rows, resolved by qwen_options): true = route
+    // and run the routed experts on the window's real rows only; false = the padded 16-row block (the old form). Read once
+    // when the engine is built (a change needs a new engine / process). Prefill blocks and tiered engines keep the padded
+    // rows either way (moe_rows_policy below); the engine reports what it applied in moe_rows_receipt_json().
+    bool moe_real_rows = false;
     int device = 0;
     bool ple_host_pinned = true;       // per_layer_token_embd (28.8 GB) in pinned host memory, gathered on the host
     // Release per layer: every block's KV/index rows of layer l, and in the last block each GDN layer's recurrent/conv
@@ -156,6 +162,35 @@ struct GraphCounters {
     std::size_t cached = 0, cap = 0;
     std::uint64_t captures = 0, replays = 0, evictions = 0, eager_windows = 0;
 };
+
+// Routed-MoE rows of a 9..15-row decode window (moe_rows_policy below). ON: the window routes and runs the routed experts on
+// its real rows instead of the padded 16-row block, so the padding rows (token 0 over stale core rows, never read back) no
+// longer stream their experts' bytes nor raise the window-wide CSR failure word. Organizational: real-row bits unchanged
+// (native window gate T=2..16 + partial-accept rollback, bit-identical), so no new numerical identity. Every entry
+// (CLI = serve); only decode windows change; prefill blocks and tiered engines keep the padded rows. OFF by default until
+// the whole-workload timing receipt qualifies it; then default ON with STRIX_QRTX_MOE_REAL_ROWS=0 as the off switch.
+// Read once when the engine is built: an A/B needs two processes.
+inline constexpr ::strix::lever::Decl moe_real_rows_lever{
+    .name = "qwen_cuda_moe_real_rows", .env = "STRIX_QRTX_MOE_REAL_ROWS", .exactness = ::strix::lever::Exactness::bitwise,
+    .default_on = false, .source = "wave4/next1112/RTXCORE3-RESULT.md: native window gate PASS; timing T8/9/12/16 pending"};
+
+// Routed-MoE rows of a decode window: requested (Config::moe_real_rows) -> effective for this engine, with the reason.
+// One rule for the engine and the host tests. Organizational only: each row's routed chain does not depend on the other
+// rows, so real-row bits and the numerical identity are unchanged; only the expert bytes streamed for padding rows change.
+struct MoeRowsPolicy {
+    bool requested = false;
+    bool effective = false;
+    const char* reason = "";
+};
+[[nodiscard]] inline MoeRowsPolicy moe_rows_policy(bool requested, bool tiered) {
+    if (!requested) return {false, false, "padded: 9..15-row windows route all 16 block rows (default until qualified)"};
+    if (tiered) return {true, false, "padded: tiered expert residency keeps the 16-row block (slot publish/gather unchanged)"};
+    return {true, true, "real rows: 9..15-row windows route their real rows; prefill blocks stay padded"};
+}
+// Rows that reach route_logits/route_select, the routed experts and the sticky status scan of one run_block.
+[[nodiscard]] inline std::uint32_t moe_block_rows(const MoeRowsPolicy& p, bool window, std::uint32_t rows, std::uint32_t pad) {
+    return window && p.effective ? rows : pad;
+}
 
 // Multi-session decode. A session is the per-request state: QSA KV / raw index / pooled keys per layer, the GDN recurrent
 // double buffer and conv histories, PLE conv + n-gram word, the MTP predictor cache and held row, the length and the
@@ -320,6 +355,9 @@ public:
     [[nodiscard]] bool tiered() const;
     [[nodiscard]] std::string residency_json() const;
     [[nodiscard]] std::string residency_receipt_json() const;
+    // Routed-MoE window rows: {"requested","effective","reason","real_row_windows","padding_rows_skipped",
+    // "padded_windows"} - windows counted at verify_cohort (eager and graph replays alike), 9..15-row windows only.
+    [[nodiscard]] std::string moe_rows_receipt_json() const;
     // Resolved card budget (tiered or an explicit cap, including full mode; 0 = full mode without an explicit cap) and the
     // device bytes it holds once loaded (measured): a server admits sessions against budget - engine bytes.
     [[nodiscard]] std::uint64_t card_budget_bytes() const;

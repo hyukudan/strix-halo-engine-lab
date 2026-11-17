@@ -63,6 +63,7 @@ struct Resolved {
     cp::Choice choice;
     std::string contract;                  // arithmetic_contract
     std::vector<Difference> differences;   // named entry-role differences, each with its reason
+    std::string moe_real_rows_origin = "default";  // lever origin of config.moe_real_rows (default | explicit)
 };
 
 inline std::uint64_t number(std::string_view option, const std::string& text, std::uint64_t max = UINT32_MAX) {
@@ -204,6 +205,13 @@ inline Resolved resolve(const Request& r, Entry entry, std::string_view default_
         const char* raw = r.inputs.env ? r.inputs.env(key.c_str()) : ::strix::envcfg::text(key.c_str());
         c.block_fit = !r.blocks_typed && ::strix::lever::select(block_fit_lever, {}, raw).on;
     }
+    {  // every entry: CLI = serve
+        const std::string key(qp::moe_real_rows_lever.env);
+        const char* raw = r.inputs.env ? r.inputs.env(key.c_str()) : ::strix::envcfg::text(key.c_str());
+        const auto pick = ::strix::lever::select(qp::moe_real_rows_lever, {}, raw);
+        c.moe_real_rows = pick.on;
+        out.moe_real_rows_origin = ::strix::lever::origin_name(pick.origin);
+    }
     if (entry != Entry::serve && c.model_gguf.empty() && !default_model.empty()) {
         c.model_gguf = std::string(default_model);
         name("model_gguf", c.model_gguf, "prefill service default file name when --model is absent");
@@ -258,6 +266,18 @@ inline std::string effective_config_json(const Resolved& r) {
     engine.set("tail_large", J(c.tail_large));
     engine.set("final_block_rows", J(static_cast<std::uint64_t>(c.final_block_rows)));
     engine.set("block_fit", J(c.block_fit));
+    {  // requested here; the loaded engine's moe_rows receipt adds the tiered fallback (still padded) and window counts
+        const auto p = qp::moe_rows_policy(c.moe_real_rows, false);
+        auto rows = J::object();
+        rows.set("lever", J(std::string(qp::moe_real_rows_lever.name)));
+        rows.set("requested", J(p.requested));
+        rows.set("source", J(r.moe_real_rows_origin));
+        rows.set("qualified_default", J(qp::moe_real_rows_lever.default_on));
+        rows.set("reason", J(std::string(p.reason)));
+        rows.set("tiered", J(std::string(qp::moe_rows_policy(c.moe_real_rows, true).reason)));
+        rows.set("restart", J(std::string("read once at engine build; A/B needs separate processes")));
+        engine.set("moe_window_rows", std::move(rows));
+    }
     auto blocks = J::array();
     for (const auto b : c.block_schedule) blocks.push(J(static_cast<std::uint64_t>(b)));
     engine.set("block_schedule", std::move(blocks));
