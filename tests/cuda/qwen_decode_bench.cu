@@ -1,8 +1,9 @@
 // Decode timing of the CUDA Qwen engine (one model load; no logits leave the device).
 //   qwen_decode_bench <tables dir> <rope table> <max positions> <tokens file> <prompt N> <generate G>
-// Prefills rows [0, N-1), then reports: serial greedy steps (T = 1), verify windows of T = 2..8 rows over the serial
+// Prefills rows [0, N-1), then reports: serial greedy steps (T = 1), verify windows of T = 2..STRIX_QWEN_TMAX (default 8, up to 16) rows over the serial
 // tokens (ms per window), and MTP speculative decode (depth 7, min-p STRIX_QWEN_MIN_P or 0.7) when a sidecar is set.
 #include "strix/cuda/qwen_prefill.hpp"
+#include "qwen_decode_test_plan.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/residency/residency_cli.hpp"
 
@@ -72,11 +73,21 @@ static int bench_main(int argc, char** argv) {
     std::printf("loaded %s\n", p.describe().c_str());
     std::printf("residency %s\n", p.residency_json().c_str());
     const qp::Sink drop = [](const qp::Piece&) {};
-    cudaProfilerStart();  // nsys --capture-range=cudaProfilerApi: decode only, not the upload
+    // STRIX_QWEN_PROFILE_T="8,16": the profiler range covers only those windows' loops (one range each; nsys
+    // --capture-range=cudaProfilerApi --capture-range-end=repeat); unset: everything after the upload
+    std::vector<std::uint32_t> prof_t;
+    if (const char* v = std::getenv("STRIX_QWEN_PROFILE_T")) {
+        std::stringstream ss(v);
+        for (std::string x; std::getline(ss, x, ',');) if (!x.empty()) prof_t.push_back(static_cast<std::uint32_t>(std::atoi(x.c_str())));
+    }
+    if (prof_t.empty()) cudaProfilerStart();  // nsys --capture-range=cudaProfilerApi: decode only, not the upload
+    const auto tmax = strix::cuda::decode_test::max_width();
     for (const auto& file : files) {
     const auto prompt = tokens_of(file);
     const std::uint64_t n = n_arg == 0 ? prompt.size() : n_arg;
-    if (n < 2 || n > prompt.size() || g < 8) { std::fprintf(stderr, "bad N/G\n"); return 1; }
+    if (n < 2 || n > prompt.size() || !strix::cuda::decode_test::benchmark_rows_sufficient(g, tmax)) {
+        std::fprintf(stderr, "bad N/G: require valid N and G >= TMAX (%u)\n", tmax); return 1;
+    }
     std::printf("prompt %s n=%llu g=%u\n", file.c_str(), static_cast<unsigned long long>(n), g);
     std::vector<std::uint32_t> seq(prompt.begin(), prompt.begin() + static_cast<std::ptrdiff_t>(n));
     p.run(seq, n - 1, drop);
@@ -95,15 +106,19 @@ static int bench_main(int argc, char** argv) {
     }
     std::sort(ms.begin(), ms.end());
     std::printf("serial T=1: median %.2f ms (%.1f tok/s), min %.2f\n", med(ms), 1000.0 / med(ms), ms[0]);
-    for (std::uint32_t t = 2; t <= 8; ++t) {
+    // STRIX_QWEN_TMAX (default 8, up to 16): the widest window; 9..16 = one session's copy window (prefill-shaped families)
+    for (std::uint32_t t = 2; t <= tmax; ++t) {
         std::vector<std::uint32_t> pre(seq.begin(), seq.begin() + static_cast<std::ptrdiff_t>(n));
         p.run(pre, n - 1, drop);
         std::vector<double> w;
+        const bool prof = std::find(prof_t.begin(), prof_t.end(), t) != prof_t.end();
+        if (prof) { cudaDeviceSynchronize(); cudaProfilerStart(); }
         for (std::uint32_t i = 0; i + t <= g; i += t) {
             const auto t0 = Clock::now();
             p.step(&seq[n - 1 + i], t, n - 1 + i);
             w.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
         }
+        if (prof) { cudaDeviceSynchronize(); cudaProfilerStop(); }
         std::sort(w.begin(), w.end());
         std::printf("window T=%u: median %.2f ms\n", t, med(w));
     }

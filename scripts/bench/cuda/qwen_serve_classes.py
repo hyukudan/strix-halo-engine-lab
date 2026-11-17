@@ -23,8 +23,12 @@ from urllib.parse import urlsplit
 from pathlib import Path
 
 
+EXTRA = {}  # --extra-json: request fields merged into every body (measurement switches, e.g. {"copy_rows": 8})
+
+
 def stream(base, prompt, max_tokens, timeout):
     body = dict(prompt=prompt, max_tokens=max_tokens, temperature=0, stream=True, return_token_ids=True)
+    body.update(EXTRA)
     req = urllib.request.Request(base + '/v1/completions', json.dumps(body).encode(), {'Content-Type': 'application/json'})
     t0 = time.perf_counter()
     first, usage, strix, error = None, None, None, None
@@ -54,7 +58,7 @@ def stream(base, prompt, max_tokens, timeout):
                 tokens=(usage or {}).get('completion_tokens'), ids=rtx.get('ids'), error=error, done=done,
                 decode_tps=(strix or {}).get('decode_tokens_per_second'), tpc=rtx.get('tokens_per_cycle'), cf=rtx.get('copy_first_steps'),
                 cx=rtx.get('context_extended_steps'), cr=rtx.get('context_rows'), hu=rtx.get('context_host_us'),
-                rps=rtx.get('rows_per_step'))
+                rps=rtx.get('rows_per_step'), cw=rtx.get('copy_wide_steps'))
 
 
 def response_error(result, max_tokens, reference=None):
@@ -138,12 +142,16 @@ def main():
     ap.add_argument('--health-s', type=int, default=600)
     ap.add_argument('--warm-c1', type=int, default=8, help='C1 prompts repeated in the warm pass (same prompts as cold)')
     ap.add_argument('--min-decode-tokens', type=int, default=16, help='C1 requests with fewer tokens are flagged short=1')
+    ap.add_argument('--conc', default='4,8', help='concurrent levels after C1 (comma list; empty = C1 only)')
+    ap.add_argument('--extra-json', default='', help='JSON object merged into every request body (per-request switches)')
     a = ap.parse_args()
     if a.probe_endpoint:
         print(probe_endpoint(a.base))
         return
     if not all((a.out, a.prompts, a.tokenizer, a.prose_ids)) or a.max_tokens <= 0:
         ap.error('out, --prompts, --tokenizer, --prose-ids and positive --max-tokens are required')
+    if a.extra_json:
+        EXTRA.update(json.loads(a.extra_json))
     from tokenizers import Tokenizer  # local tokenizer.json, no download
     tok = Tokenizer.from_file(a.tokenizer)
     kit = json.loads(Path(a.prompts).read_text(encoding='utf-8'))
@@ -185,10 +193,10 @@ def main():
                 ref.append(r['ids'])
                 ids_out.write(json.dumps(dict(pas=pas, cls=cls, c=1, i=i, ids=r['ids'])) + '\n')
                 say(f'{pas} {cls} C1 i={i} prompt={len(p)} tokens={r["tokens"]} decode_tps={r["decode_tps"]} '
-                    f'short={int((r["tokens"] or 0) < a.min_decode_tokens)} tpc={r["tpc"]} cf={r["cf"]} cx={r["cx"]} cr={r["cr"]} hu={r["hu"]} rps={r["rps"]} err={r["error"]}')
+                    f'short={int((r["tokens"] or 0) < a.min_decode_tokens)} tpc={r["tpc"]} cf={r["cf"]} cx={r["cx"]} cr={r["cr"]} hu={r["hu"]} rps={r["rps"]} cw={r.get("cw")} err={r["error"]}')
             if pas == 'cold':
                 sets[cls + '_ref'] = ref
-            for c in (4, 8):
+            for c in [int(x) for x in a.conc.split(',') if x.strip()]:
                 res, wall = barrier(c, lambda i: stream(a.base, P[i], a.max_tokens, 900))
                 toks = sum((r.get('tokens') or 0) for r in res)
                 same = sum(check(r, sets[cls + '_ref'][i]) for i, r in enumerate(res))

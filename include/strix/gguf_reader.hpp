@@ -56,6 +56,11 @@ struct MetadataEntry {
     std::vector<double> floating_array;
 };
 
+// Private (non-ggml) tensor type: shared IU4 g64 dense projection, N outputs x K inputs (core/iu4.hpp): tiles
+// [K/16][N/16][column within tile][K within tile / 2] signed nibbles, then FP16 scales [N][K/64]. Geometry per row of K:
+// K/64 blocks of 64 elements, 34 bytes (32 nibble bytes + 2 scale bytes), N % 64 == 0.
+inline constexpr std::uint32_t type_strix_iu4_g64 = 200;
+
 struct TensorTypeGeometry {
     std::uint64_t block_elements = 0;
     std::uint64_t block_bytes = 0;
