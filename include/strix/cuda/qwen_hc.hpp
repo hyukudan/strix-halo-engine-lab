@@ -60,7 +60,12 @@ struct HcMixArgs {
     bool mma = false;                      // FAST form (Config::forms.hc_mma): projection + output on FP16 tensor cores, FP32 acc
                                            // (prefill-sized windows only; false = the exact kernels)
     HcWorkspaceLayout workspace_layout = HcWorkspaceLayout::full;
+    int output_batched = -1;               // exact fused output epilogue: -1 = lever qwen_hc_output_batched_sigmoid (default on),
+                                           // 0 = per-element sigmoids, 1 = batched table gathers (same bits; test/timing seam)
 };
+// Epilogue form of the exact fused output kernel (hc_output_kernel<true, *, Batched>): the explicit per-call choice wins over
+// the lever. Both forms give the same bits (amd_expf_batch = amd_expf per element); only the gather schedule differs.
+inline bool hc_output_batched(const HcMixArgs& a, bool lever_on) { return a.output_batched < 0 ? lever_on : a.output_batched != 0; }
 // One host admission decision, shared by all producers and consumers (including MMA).
 // rows_cap: the largest row count hc_mix runs on its rows forms (core::decode_rows_max() with the rows split on, else 8). Those
 // forms need the full layout, so an exact automatic call at or below it is never compact (compact sent 9..16-row windows to the
