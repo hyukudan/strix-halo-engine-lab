@@ -218,11 +218,29 @@ execution or a deliberately rewritten manifest. CLI engine/profile labels are
 checked against the sealed witness. This change defines the consumer contract;
 it does not add a native witness producer. Runs without producer evidence cannot
 use the floor rule; do not create evidence by relabelling existing runs.
+
+Producer: `strix-deepseek41-prefill-quality MODEL manifest.tsv OUT RANK BUDGET GATE_DIR` (gate mode). Per prompt
+of n tokens each arm prefills P = (n - 64) / 128 * 128 rows from position 0 with the arm's policy (the
+exact suffix replay, or `fast3b<R>`'s bounded decoder replay), then teacher-forces the 64 rows [P, P + 64)
+from that state. Rank 0 writes 65 rows per prompt (the prefill's last row, then the 64) as
+`GATE_DIR/<arm>/q-<prompt>-tf-r0.f32`, the prompt's first P + 64 tokens as `GATE_DIR/tok/<prompt>.u32` and
+`GATE_DIR/<arm>/execution-r0.json` from the executed configuration (profile `exact` for `exact` and the
+`n_l0_s<seed>` layer-0 nulls, `fast-prefill` for `fast3` / `fast3b<R>`). When the prompts run in several
+processes (one per GPU ticket), `merge_parts.py RUNDIR RUN ARM...` joins the per-process witnesses of an arm
+(refusing any disagreement on binary, model, numerical configuration, profile or control, a prompt in two
+parts, or a dump that no longer matches its entry) into one with `run_id` `RUN-ARM`; then `seal --rows 65
+--execution-witness` and `compare --ranks 0`.
 Mean plus two sample standard deviations from three controls is an empirical
 policy threshold, not a confidence bound or model-fidelity result. Synthetic
 host tests establish validation and arithmetic only; compiler, native execution,
 model fidelity and complete-workload qualification remain separate gates.
 
+DS41 gate arms explicitly disable inherited decoder replay unless their label sets a bound.
+Witnesses record the resolved replay mode and hash the actual target and effective overlay
+contents; both ranks must agree on that content. The producer uses `row_split=false` and
+128-aligned prefill boundaries. Its evidence does not qualify row-split serving or arbitrary
+tails. Whole-run replay rejects snapshots, group passes and decoder deferral; serving needs
+an explicit admission contract for scheduler/cache operations before qualification.
 ### Onset-matched floor (MiniMax FAST prefill)
 
 ```sh
@@ -248,8 +266,11 @@ prompts and reference) the candidate must pass all of (`MM_FLOOR` in the script)
 
 The absolute KL / top-1 / dNLL verdict is printed and stored (`pooled.abs_pass`) as a reference.
 The candidate must differ from the reference only in its FAST layer set: every receipt lever other
-than `minimax.msa_flash` must be equal, and so must every recorded switch outside the explicit
-FAST allowlist (`STRIX_MM_PF_MSA_FLASH`, `STRIX_MM_PF_MSA_FLASH_LAYERS`, `STRIX_MM_FAST_PREFILL`).
+than `minimax.msa_flash` / `minimax.linear_order` must be equal, and so must every recorded switch outside
+the explicit FAST allowlist (`STRIX_MM_PF_MSA_FLASH`, `STRIX_MM_PF_MSA_FLASH_LAYERS`, `STRIX_MM_FAST_PREFILL`,
+`STRIX_MMX_PF_ORDER`). The chunk-invariant linear order (`minimax.linear_order` =
+`invariant:mmx-pf-linear-s1-v1`) changes MoE / dense rounding in every layer, so its FAST layer set is all 60 layers:
+onset 0, layer-0 one-ulp nulls, and an exact reference that differs only by `STRIX_MMX_PF_ORDER`.
 Receipts omit defaulted switches and cannot distinguish them from unconsulted switches; a
 one-sided entry outside that allowlist is therefore refused, even if it explicitly selects a default.
 Mean + 2 sd of three controls is a policy threshold, not a bound: a candidate drawn exactly like
@@ -293,6 +314,39 @@ where the arms part. This is a cross-run comparison: after the first difference 
 different activations, so later differences include propagation, not only local rounding.
 
 `python -m unittest discover -s tools/strix-gate -p 'test_*.py'` covers it with synthetic dumps.
+
+### TURBO relative bar: `compare --mode turbo`
+
+`--mode fast` (default) is the absolute FAST bar above, unchanged. `--mode turbo` judges T (the candidate) against a
+reference pack R measured on the same E (the exact arm): `compare E T --mode turbo --reference-pack-arm R_DIR ...`.
+Per row, U95(KL_T-KL_R), U95(disagreement_T-disagreement_R) and U95(dNLL_T-dNLL_R) must each be <= 0 (one-sided 95 %,
+paired rows). Optional absolute safety limits: `--turbo-max-kl`, `--turbo-min-top1`, `--turbo-max-dnll`. `--null-arm`
+controls are measured against E and reported (not a verdict input).
+
+The normal-approximation intervals treat sampled rows (and paired T-minus-R differences) as independent
+observations with finite variance and enough samples for the approximation. Tokens within a prompt may be
+correlated, making these intervals overconfident; they do not establish prompt-level uncertainty or model
+qualification. Such claims require independently sampled prompts and prompt-level resampling or another
+validated treatment of clustering. Task Wilson intervals likewise assume independent Bernoulli trials.
+
+Pack identity: `seal --model-sha SHA` records the weights/pack sha (else the execution witness `model_sha256` is used).
+E and T must share it unless `--candidate-sha` declares T's; R may differ from E only with `--reference-sha` equal to R's
+sealed value. Every participating rank, including null controls, needs a valid SHA-256 digest. A declared digest
+must agree with an available execution witness. Missing, invalid, undeclared or mismatching identities are errors (exit 2).
+
+`--task-results JSON`: `{"tasks":[{"name":"t1","category":"code|math|retrieval|tools|json|prose","E":{"passed":8,"total":10},"T":{...},"R":{...}}]}`.
+Per category and overall the receipt carries passed/total/rate and a Wilson 95 % interval per arm. Checks per category:
+T's drop vs E must not exceed R's drop unless the T and R Wilson intervals overlap; absolute drop of T vs E <= 5 points
+code/math, 2 retrieval, 1 tools (override `--task-drop-limit CAT=POINTS`); json must pass 100 % for T.
+
+Verdicts and exit codes: PASS 0, FAIL 1 (every failing check is named), error 2, NO-REFERENCE 3 (no `--reference-pack-arm`
+or a task without `R`; never PASS, but a failing check still reports FAIL).
+
+`--receipt OUT.json` writes `strix-turbo-receipt/v1`: `verdict`, `failing`, `commit` (`--commit`), `binary_sha256` {E,T,R},
+`pack` {calibration (`--calibration`), E_sha, T_sha, R_sha}, `run`, `hardware` (`--run-manifest JSON`, free keys such as
+hardware, gpu_clock_mhz), `routes` {effective_config: lines of `--effective-config FILE`, execution_witness from the seals},
+`metrics` (mean + 95 % interval for T and R), `checks`, `tasks`, `controls`, `performance` (`--perf JSON`: tok_s,
+bytes_per_token, ttft_ms, p95_ms; absent keys are null and listed in `missing`).
 
 ## GLM scored prefill compare: `glm_score_nll.py`
 

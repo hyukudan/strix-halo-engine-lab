@@ -30,6 +30,7 @@
 #include <array>
 #include "strix/token_sampling.hpp"
 #include "strix/mtp_draft_profiles.hpp"
+#include "strix/onfly_i4.hpp"
 #include "qwen_mtp_bundle.hpp"
 #include "strix/session/speculation_default.hpp"
 #include "strix/mtp_depth_window_controller.hpp"
@@ -42,6 +43,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <locale>
 #include <optional>
 #include <set>
 #include <string>
@@ -257,6 +259,9 @@ struct Options {
     bool early_setup = true;
     bool eager_code_load = true;
     bool qwen_router_bf16 = true;
+    // TURBO+ onfly INT4 weights: as typed (CLI) and as resolved by initialize_prefill_config (CLI + environment).
+    strix::onfly_i4::Request turbo_request;
+    strix::onfly_i4::Resolved turbo;
     bool baseline = false;
     std::string suppressed_yarn_request;
     bool print_effective_config = false;
@@ -1710,7 +1715,11 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
                 throw std::invalid_argument("MTP cohort request requires 3..4097 prompt tokens within the context and a pinned golden");
     }
 }
+inline void validate_onfly_i4_routes(const Options& o) {
+    onfly_i4::require_serial(o.turbo.active(), !o.mtp.cohort.empty() || (o.http_serve && o.http_batch));
+}
 inline void validate_resolved_mtp_cli(const Options& o) {
+    validate_onfly_i4_routes(o);
     validate_mtp_cli(o,true);
     if(o.mtp.enabled && o.mtp.window_rows && (!o.deferred_moe_status || !o.virtual_q8_gdn_input || !o.prefetch_q8_gdn_input ||
        !o.virtual_q8_gdn_output || !o.wave8_q8_gdn_input || !o.wave8_q8_gdn_output))
@@ -1867,6 +1876,31 @@ inline void apply_prefix_cache_environment(Options& o, Lookup lookup) {
         o.prefix_cache_then_prompts.clear();
         o.prefix_cache_source = "off"; o.prefix_cache_reason = "disabled";
     }
+}
+
+inline std::vector<std::uint64_t> read_teacher_logits_rows(std::istream& input) {
+    std::vector<std::uint64_t> rows;
+    while (input >> std::ws && input.peek() != std::char_traits<char>::eof()) {
+        if (rows.size() == 65536U)
+            throw std::invalid_argument("teacher logits rows file must list 1..65536 positions");
+        // C++20 array extraction reads at most 20 characters plus the terminator.
+        // Reject a longer word before consuming or allocating its remaining bytes.
+        char word[21]{};
+        input >> word;
+        const auto next = input.peek();
+        if (next != std::char_traits<char>::eof() && !std::isspace(static_cast<char>(next), input.getloc()))
+            throw std::invalid_argument("teacher logits rows must be ascending decimal positions");
+        const std::string_view token(word);
+        std::uint64_t row = 0;
+        const auto parsed = std::from_chars(token.data(), token.data() + token.size(), row);
+        if (parsed.ec != std::errc{} || parsed.ptr != token.data() + token.size() ||
+            (!rows.empty() && row <= rows.back()))
+            throw std::invalid_argument("teacher logits rows must be ascending decimal positions");
+        rows.push_back(row);
+    }
+    if (input.bad()) throw std::invalid_argument("cannot read teacher logits rows file");
+    if (rows.empty()) throw std::invalid_argument("teacher logits rows file must list 1..65536 positions");
+    return rows;
 }
 
 // The serve options a --serve-config file may set for this CLI (src/serve/serve_config.cpp expands them in front of
@@ -2114,6 +2148,23 @@ inline Options parse_options(
         // A supplied controller or organization owns its route, including values
         // equal to the incumbent defaults. Arithmetic alone can select a prompt pair.
         // The opt-in route-dot storage candidate is a product arithmetic switch.
+        // TURBO+ weight source (strix/onfly_i4.hpp): a weight-format switch, not a route-owning option.
+        {
+            using Req = strix::onfly_i4::Request;
+            bool turbo_flag = false;
+            for (const auto& [flag, field] : {std::pair<std::string_view, std::string Req::*>{"--turbo-onfly-groups", &Req::groups},
+                                              {"--turbo-onfly-scale-rule", &Req::scale_rule}}) {
+                if (argument != flag && !(argument.starts_with(flag) && argument.size() > flag.size() && argument[flag.size()] == '=')) continue;
+                const auto value = argument == flag ? (index + 1 < argc ? std::string_view(argv[++index]) : std::string_view{})
+                                                    : argument.substr(flag.size() + 1U);
+                if (value.empty() || value.starts_with("--")) throw std::invalid_argument(std::string(flag) + " requires a value");
+                if (!(options.turbo_request.*field).empty()) throw std::invalid_argument("duplicate " + std::string(flag));
+                options.turbo_request.*field = std::string(value);
+                turbo_flag = true;
+                break;
+            }
+            if (turbo_flag) continue;
+        }
         if (argument.starts_with("--") && argument != "--generate" && !argument.starts_with("--generate=") &&
             argument != "--context" && !argument.starts_with("--context=") && argument != "--unqualified-context" &&
             !argument.starts_with("--optimization-profile") && argument != "--prefill-moe-route-bf16" &&
@@ -2199,17 +2250,7 @@ inline Options parse_options(
                 throw std::invalid_argument("teacher logits rows requires a nonempty path");
             std::ifstream rows_file{std::string(value)};
             if (!rows_file) throw std::invalid_argument("cannot read teacher logits rows file");
-            std::string word;
-            while (rows_file >> word) {
-                std::uint64_t row = 0;
-                const auto parsed = std::from_chars(word.data(), word.data() + word.size(), row);
-                if (parsed.ec != std::errc{} || parsed.ptr != word.data() + word.size() ||
-                    (!options.teacher_logits_rows.empty() && row <= options.teacher_logits_rows.back()))
-                    throw std::invalid_argument("teacher logits rows must be ascending decimal positions");
-                options.teacher_logits_rows.push_back(row);
-            }
-            if (options.teacher_logits_rows.empty() || options.teacher_logits_rows.size() > 65536U)
-                throw std::invalid_argument("teacher logits rows file must list 1..65536 positions");
+            options.teacher_logits_rows = read_teacher_logits_rows(rows_file);
             options.teacher_logits_rows_supplied = true;
             continue;
         }

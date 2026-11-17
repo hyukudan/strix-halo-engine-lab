@@ -21,7 +21,7 @@ def check(source, case):
                 "r.run_tokens.commit(run_window, r.seq.slot, r.seq.generated, r.published, job.max_tokens, job.stop_tokens)")
         require(region("const auto batch_step =", "if (++prof.steps"), "emitted += run_commit(*r)")
     elif case == "restored":
-        direct = region("if (const auto m = parked.empty() ? -1", "if (sched.mode ==")
+        direct = region("if (const auto m = parked.empty() || image ? -1", "if (sched.mode ==")
         require(direct, "run_window.request(now)")
         require(direct, "run_window.restored(now, run_commit(*running.back()))")
         if direct.index("run_window.request(now)") > direct.index("run_window.restored(now"):

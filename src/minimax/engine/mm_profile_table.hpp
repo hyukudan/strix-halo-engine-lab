@@ -5,8 +5,8 @@
 // effective config and rank agreement read the same values. A row at its builtin value is left out of the profile
 // fingerprint (omit_builtin_fingerprint), so with every row OFF these rows add no fingerprint inputs.
 // Complete cache compatibility also depends on the executable and raw environment identity.
-// No row has a 'fast' column yet: MiniMax rank's --profile is the per-phase timing session, so the product profile is
-// selected by the FAST prefill bundle switch only.
+// FAST still uses its existing bundle switch. Product TURBO proposals stay pending until
+// the adapter admits and exports them through prefill_policy before engine construction.
 #include "strix/engine_profile.hpp"
 #include "strix/fast_profile.hpp"
 
@@ -15,16 +15,24 @@
 
 namespace strix::minimax::defaults {
 
-// STRIX_MM_FAST_PREFILL=1 (default off) = profile mm-fast-pf-v1:
+// STRIX_MM_FAST_PREFILL=1 (default off) = profile mm-fast-pf-v2:
 //   MSA attention  STRIX_MM_PF_MSA_FLASH=1  msa-flash-bf16-l40-v1 (one-term BF16 operands on the shared key-split
 //                  WMMA flash core, layers STRIX_MM_PF_MSA_FLASH_LAYERS = 40-59), on the exact EXL3 MoE base only:
 //                  the bundle does not select it with STRIX_MMX_MODEL_FORMAT=fast_i4 (gate fails there, KL 0.079).
+//   MoE router     STRIX_MM_PF_ROUTER_WMMA=1  mm-pf-router-wmma-v1 (router product of the MoE layers in
+//                  STRIX_MM_PF_ROUTER_WMMA_LAYERS = 40-59 on the shared FP16 WMMA core; sigmoid, bias, selection
+//                  unchanged), same EXL3-only admission. v2 = v1 + this member (gate 8K + 32K, pfe2o).
 // A set member variable wins over the bundle ("0" = off beats it). Changes logits.
 inline constexpr strix::fast_profile::Member kFastMembers[] = {
     {"STRIX_MM_PF_MSA_FLASH", "1", "msa-flash-bf16-l40-v1", "1 2"},
+    {"STRIX_MM_PF_ROUTER_WMMA", "1", "mm-pf-router-wmma-v1"},
 };
-inline constexpr strix::fast_profile::Bundle kFastBundle{"STRIX_MM_FAST_PREFILL", "mm-fast-pf-v1", kFastMembers};
+inline constexpr strix::fast_profile::Bundle kFastBundle{"STRIX_MM_FAST_PREFILL", "mm-fast-pf-v2", kFastMembers};
 inline constexpr const char* kMsaFlashLayers = "40-59";  // passes the FAST gate on EXL3 at 8K and 32K; 30-59 8K only
+// FAST mm-pf-router-wmma-v1 (STRIX_MM_PF_ROUTER_WMMA=1, or the bundle mm-fast-pf-v2; "0" opts out): the prefill
+// router product of the MoE layers in STRIX_MM_PF_ROUTER_WMMA_LAYERS on the shared FP16 WMMA core. The default set is
+// the flash set: a change in a shallower layer alters every later selection (the onset rule of the MSA gate).
+inline constexpr const char* kRouterWmmaLayers = "40-59";
 inline constexpr unsigned kMsaLayers = 60;
 // Index projections (index q of the rank's heads + the shared index key, attn/index_proj.hpp) on the shared dense
 // FP16 WMMA core (core/f16_dense_tall.hpp; x16 tile form from kX16Rows rows) instead of the exact slab chains:
@@ -59,18 +67,33 @@ static_assert(msa_flash_policy(kMsaFlashLayers) != nullptr &&
               "the bundle member's policy id names the bundle's layer set");
 
 // Bundle selection is requested provenance; only effective members enter agreement.
-inline constexpr std::array<strix::profile::Lever, 4> profile_table{{
+inline constexpr std::array<strix::profile::Lever, 8> profile_table{{
     // Prefill only: MSA attention of windows > 8 rows; selection, block lists and K/V caches unchanged.
-    {"msa_flash", "STRIX_MM_PF_MSA_FLASH", "", {"", "", ""}, "0", strix::profile::Kind::bit_changing,
-     {true, false, true}, {true, true, true}, "", "0",
-     "msa-flash-bf16-l40-v1 (EXL3 gate PASS 8K KL 0.0012, 32K KL 0.0029); 2 = two-term operands", false, {}, true},
-    {"msa_flash_layers", "STRIX_MM_PF_MSA_FLASH_LAYERS", "", {"", "", ""}, kMsaFlashLayers, strix::profile::Kind::bit_changing,
-     {true, false, true}, {true, true, true}, "", "", "FAST MSA flash layer set (read only while msa_flash is on)", false, {}, true},
+    {"msa_flash", "STRIX_MM_PF_MSA_FLASH", "", {"", "", "", "1"}, "0", strix::profile::Kind::bit_changing,
+     {true, false, true, false}, {true, true, true, false}, "", "0",
+     "msa-flash-bf16-l40-v1 (EXL3 gate PASS 8K KL 0.0012, 32K KL 0.0029); 2 = two-term operands; pending turbo adapter admission/export for mode 1 on layers 0-59",
+     false, {}, true},
+    {"msa_flash_layers", "STRIX_MM_PF_MSA_FLASH_LAYERS", "", {"", "", "", "0-59"}, kMsaFlashLayers, strix::profile::Kind::bit_changing,
+     {true, false, true, false}, {true, true, true, false}, "", "", "FAST MSA flash layer set (read only while msa_flash is on); pending turbo adapter admission/export for 0-59, then per-prompt qualification with scripts/bench/mmflash",
+     false, {}, true},
+    // PENDING turbo cells: the lever exists only on an open PR / has no per-layer selector yet (reason in `source`).
+    {"moe_invariant", "STRIX_MM_MOE_INVARIANT", "", {"", "", "", "1"}, "0", strix::profile::Kind::bit_changing,
+     {true, false, true, false}, {false, false, false, false}, "", "0",
+     "pending: rows-free MoE order (open PR #662, chunkinv/linear-contract); cell flips with that merge", false, {}, true},
+    {"iu4_layers", "STRIX_MM_IU4_LAYERS", "", {"", "", "", ""}, "", strix::profile::Kind::bit_changing,
+     {true, false, true, false}, {false, false, false, false}, "", "",
+     "pending: transient IU4 per layer (fast_i4 is all-or-nothing today and fails the gate, KL 0.079); no per-layer selector yet; "
+     "never imposed where it slows", false, {}, true},
     // Prefill only: index projections of rows > 8 on the shared FP16 WMMA core; K/V caches and MSA attention unchanged.
-    {"idx_wmma", "STRIX_MM_PF_IDX_WMMA", "", {"", "", ""}, "0", strix::profile::Kind::bit_changing,
-     {true, false, true}, {true, true, true}, "", "0", "minimax-index-proj-wmma-v1 (opt-in; FAST gate e3wire)", false, {}, true},
-    {"idx_wmma_layers", "STRIX_MM_PF_IDX_WMMA_LAYERS", "", {"", "", ""}, kIdxWmmaLayers, strix::profile::Kind::bit_changing,
-     {true, false, true}, {true, true, true}, "", "", "FAST index projection layer set (read only while idx_wmma is on)", false, {}, true},
+    {"idx_wmma", "STRIX_MM_PF_IDX_WMMA", "", {"", "", "", ""}, "0", strix::profile::Kind::bit_changing,
+     {true, false, true, false}, {true, true, true, false}, "", "0", "minimax-index-proj-wmma-v1 (opt-in; FAST gate e3wire)", false, {}, true},
+    {"idx_wmma_layers", "STRIX_MM_PF_IDX_WMMA_LAYERS", "", {"", "", "", ""}, kIdxWmmaLayers, strix::profile::Kind::bit_changing,
+     {true, false, true, false}, {true, true, true, false}, "", "", "FAST index projection layer set (read only while idx_wmma is on)", false, {}, true},
+    // Prefill only: router product of the listed MoE layers on the FP16 WMMA core; sigmoid, bias and selection unchanged.
+    {"router_wmma", "STRIX_MM_PF_ROUTER_WMMA", "", {"", "", "", ""}, "0", strix::profile::Kind::bit_changing,
+     {true, false, true, false}, {true, true, true, false}, "", "0", "mm-pf-router-wmma-v1 (FAST bundle mm-fast-pf-v2; gate 8K KL 0.0020, 32K pfe2o)", false, {}, true},
+    {"router_wmma_layers", "STRIX_MM_PF_ROUTER_WMMA_LAYERS", "", {"", "", "", ""}, kRouterWmmaLayers, strix::profile::Kind::bit_changing,
+     {true, false, true, false}, {true, true, true, false}, "", "", "FAST router layer set (read only while router_wmma is on)", false, {}, true},
 }};
 
 }  // namespace strix::minimax::defaults

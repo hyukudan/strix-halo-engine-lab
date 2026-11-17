@@ -1,4 +1,4 @@
-#ifdef _MSC_VER
+#if defined(_MSC_VER) && !defined(_CRT_SECURE_NO_WARNINGS)
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 // MiniMax M3.1 defaults-on resolver: the table of default-ON items, the baseline master switch and the canonical
@@ -135,6 +135,10 @@ constexpr Item kItems[] = {
      "Grouped all-member >=2048-row gate (configurable); TP2 4096+3844 IDs identical, -2.3/-2.5 % with late fence; full state/workload qualification pending"},
     {"pf_late_src_fence", "STRIX_MM_PF_LATE_SRC_FENCE", "1", "0",
      "Admitted grouped async source lifetime; TP2 IDs identical, combined -2.3/-2.5 %; full state/workload qualification pending"},
+    {"pf_order", "STRIX_MMX_PF_ORDER", "invariant", "adaptive",
+     "Chunk-invariant linear order mmx-pf-linear-s1-v1 (bits independent of chunking; cache identity prefill_order=): gate32 6 x 32K "
+     "units vs 3 L0 nulls each, pooled dNLL -0.053 CI95 [-0.148,+0.041] inside null spread, task 40/42 == 40/42; "
+     "a defaulted value falls back to adaptive when the invariant route is unmet"},
     // transport (host path, bits unchanged)
     {"dist_crc_parallel", "STRIX_DIST_CRC_PARALLEL", "1", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
     {"dist_host_crc_overlap", "STRIX_DIST_HOST_CRC_OVERLAP", "1", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
@@ -270,6 +274,17 @@ PrefillPolicy prefill_policy(const Lookup& env) {
                   (!packed ? "index WMMA requires STRIX_MM_INDEX_PROJ=attn" : "index WMMA requires the default prefill identity");
     }
     if (p.idx_wmma) p.policies += (p.policies.empty() ? "" : "+") + idx_wmma_policy(p.idx_wmma_layers);
+    // FAST router product (bundle member or its own switch): the layers it runs on; layers without a router (dense)
+    // are ignored. Admitted like the flash member (EXL3 MoE base only); an explicit value wins.
+    const char* router = env("STRIX_MM_PF_ROUTER_WMMA");
+    if (fp::set(router) && std::strcmp(router, "0") != 0 && std::strcmp(router, "1") != 0)
+        throw std::invalid_argument("STRIX_MM_PF_ROUTER_WMMA must be 0 or 1");
+    const auto rit = p.canonical.find("STRIX_MM_PF_ROUTER_WMMA");
+    const char* rlayers = env("STRIX_MM_PF_ROUTER_WMMA_LAYERS");
+    const auto rmask = strix::core::parse_layer_set(fp::set(rlayers) ? rlayers : kRouterWmmaLayers, 0, kMsaLayers,
+                                                    "STRIX_MM_PF_ROUTER_WMMA_LAYERS");
+    p.router_wmma_layers = fp::layer_ranges(kMsaLayers, [&](unsigned l) { return rmask.test(l); });
+    p.router_wmma = rit != p.canonical.end() && rit->second == "1" && rmask.count() != 0;
     return p;
 }
 
@@ -291,7 +306,7 @@ strix::pair::PipelineChoice pair_pipeline_choice(std::uint64_t rows) {
 }
 
 const profile::Engine& profile_engine() {
-    static const profile::Engine engine{"minimax-pair", "", profile_table, false};
+    static const profile::Engine engine{"minimax-pair", "", profile_table, false, "minimax-turbo-v1"};
     return engine;
 }
 
@@ -310,9 +325,37 @@ profile::Resolution profile_resolution(const Lookup& env) {
             return !p.idx_wmma && p.idx_wmma_asked == "default" ? nullptr : p.idx_wmma ? "1" : "0";
         if (std::strcmp(key, "STRIX_MM_PF_IDX_WMMA_LAYERS") == 0)
             return p.idx_wmma ? p.idx_wmma_layers.c_str() : nullptr;
+        // The same for the FAST router product: unset or 0 is the builtin, its layer set counts only while it runs.
+        if (std::strcmp(key, "STRIX_MM_PF_ROUTER_WMMA") == 0) return p.router_wmma ? "1" : nullptr;
+        if (std::strcmp(key, "STRIX_MM_PF_ROUTER_WMMA_LAYERS") == 0) return p.router_wmma ? p.router_wmma_layers.c_str() : nullptr;
         return base(key);
     };
+    // Product profile: '--profile NAME' of rank and serve, exported by print_or_apply() (one value for both apps).
+    if (const char* name = env(kProductProfileEnv); name != nullptr && *name != 0) in.profile = profile::parse(name);
     return profile::resolve(profile_engine(), in);
+}
+
+bool product_option(const std::string& a, const std::function<std::string()>& next, std::string* timing) {
+    if (a == profile::turbo::kWeightsOption || a == profile::turbo::kBitsOption || a == profile::turbo::kPackOption) {
+        (void)next();  // exported by print_or_apply()
+        return true;
+    }
+    if (a == "--timing-profile") {
+        if (timing == nullptr) throw std::invalid_argument("--timing-profile is a strix-minimax-rank option");
+        *timing = next();
+        return true;
+    }
+    if (a != "--profile") return false;
+    const std::string value = next();
+    if (profile::is_name(value)) return true;  // the product profile, exported by print_or_apply()
+    // Explicit compatibility: the old timing spelling NAME:PROMPT.u32:STEPS keeps working on rank, with one notice.
+    if (timing == nullptr || value.find(':') == std::string::npos)
+        throw std::invalid_argument("--profile must be default, fast, quality or turbo (got '" + value +
+                                    "'); the per-phase timing session is --timing-profile NAME:PROMPT.u32:STEPS");
+    std::fprintf(stderr, "strix-minimax-rank: '--profile %s' is the old spelling of '--timing-profile %s'; "
+                         "--profile now names the product profile\n", value.c_str(), value.c_str());
+    *timing = value;
+    return true;
 }
 
 void check_peer(const profile::Resolution& mine, const std::function<void(const void*, void*, std::size_t)>& exchange) {
@@ -322,6 +365,13 @@ void check_peer(const profile::Resolution& mine, const std::function<void(const 
 }
 void check_peer(const std::function<void(const void*, void*, std::size_t)>& exchange) {
     check_peer(profile_resolution(process_env), exchange);
+}
+
+std::string linear_order(const Lookup& env) {
+    for (const auto& r : resolve(env))  // a table default counts exactly like an explicit value
+        if (std::strcmp(r.item->env, "STRIX_MMX_PF_ORDER") == 0) return r.value;
+    const char* v = env("STRIX_MMX_PF_ORDER");
+    return v != nullptr && *v != '\0' ? std::string(v) : std::string("adaptive");
 }
 
 std::string prefill_identity(const Lookup& env) {
@@ -337,7 +387,14 @@ std::string prefill_identity(const Lookup& env) {
     }
     std::string out = msa.empty() ? std::string() : "prefill_msa=" + msa;
     if (!idx.empty()) out += std::string(out.empty() ? "" : ";") + "prefill_idxproj=" + idx;
+    if (p.router_wmma) out += std::string(out.empty() ? "" : ";") + "prefill_router=mm-pf-router-wmma-v1-l" + p.router_wmma_layers;
     if (fast_i4_format(env)) out += std::string(out.empty() ? "" : ";") + "moe_prefill_format=fast_i4";
+    // Chunk-invariant linear order (MoE gate/up/down + dense q/k/v/o, fixed S = 1): different bits from the adaptive
+    // order, so a parked state written under one never restores into the other.
+    if (linear_order(env) == "invariant") out += std::string(out.empty() ? "" : ";") + "prefill_order=mmx-pf-linear-s1-v1";
+    // TURBO: versioned name + effective levers + weight identity, even with every lever off (empty outside turbo).
+    if (const auto pr = profile_resolution(env); pr.is_turbo())
+        out += std::string(out.empty() ? "" : ";") + pr.cache_namespace();
     return out;
 }
 
@@ -375,6 +432,13 @@ void apply() {
 bool from_defaults(const char* env) {
     std::lock_guard<std::mutex> g(g_mutex);
     return g_exported.count(env) != 0;
+}
+
+void decline_default(const char* env, const char* value, const std::string& reason) {
+    std::lock_guard<std::mutex> g(g_mutex);
+    if (g_exported.count(env) == 0) throw std::logic_error(std::string("decline_default: ") + env + " was not exported by the defaults");
+    (void)export_env(env, value, 1);
+    std::printf("minimax defaults: %s default declined -> %s (%s)\n", env, value, reason.c_str());
 }
 
 Cli parse_cli(const std::string& app, const std::vector<std::string>& args) {
@@ -565,7 +629,8 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
         o << r << "=" << (v != nullptr ? v : "default") << "\n";
     }
     const char* order_asked = env("STRIX_MMX_PF_ORDER");
-    const auto& order = strix::moe_core::resolve_grouped_order(order_asked);
+    // requested = how the order was asked (unset = "default"); effective resolves the pf_order table item like apply().
+    const auto& order = strix::moe_core::resolve_grouped_order(linear_order(env).c_str());
     o << "STRIX_MMX_PF_ORDER.requested=" << (order_asked ? order_asked : "default") << "\n"
       << "STRIX_MMX_PF_ORDER.effective=" << (order.invariant() ? "invariant" : "adaptive") << "\n";
     o << "build.gu4_scalar=" << (STRIX_MM_GU4_SCALAR ? "on" : "off") << "\n";
@@ -574,10 +639,20 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
         const auto pf = prefill_policy(env);
         const auto pr = profile_resolution(env);
         for (const auto& e : pr.entries) o << e.lever->env << "=" << e.value << "\n";
+        if (pr.profile != profile::Name::standard) {  // default prints nothing new (legacy text unchanged)
+            o << "profile.name=" << profile::name(pr.profile) << "\n" << "profile.version=" << pr.versioned() << "\n"
+              << "profile.qualification=" << pr.qualification() << "\n";
+            if (pr.is_turbo())
+                o << "profile.weights_requested=" << pr.weights.requested_text() << "\n"
+                  << "profile.weights=" << pr.weights.identity() << "\n"
+                  << "profile.weights_origin=" << pr.weights.origin << "\n"
+                  << "profile.weights_reason=" << (pr.weights.reason.empty() ? "-" : pr.weights.reason) << "\n"
+                  << "profile.cache_namespace=" << pr.cache_namespace() << "\n";
+        }
         const auto id = prefill_identity(env);
         const bool bundle_requested = strix::fast_profile::switch_on(env(kFastBundle.env));
         const auto pipeline_reference = pair_pipeline_choice(8192U);
-        o << "prefill.fast_profile=" << (bundle_requested && pf.msa_flash != 0 ? kFastBundle.profile : "off") << "\n"
+        o << "prefill.fast_profile=" << (bundle_requested && (pf.msa_flash != 0 || pf.router_wmma) ? kFastBundle.profile : "off") << "\n"
           << "prefill.fast_profile_requested=" << (bundle_requested ? kFastBundle.profile : "off") << "\n"
           << "prefill.msa_flash_requested=" << pf.msa_flash_requested << "\n"
           << "prefill.msa_flash_source=" << pf.msa_flash_asked << "\n"
@@ -641,6 +716,18 @@ bool print_or_apply(const std::string& app, int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--baseline") { (void)export_env(kBaselineEnv, "1", 1); (void)export_env("STRIX_SESSION_CACHE", "0", 1); }
+        // Product profile and TURBO weight toggle: the CLI value wins over an inherited variable (CLI > environment).
+        if (a == "--profile" && i + 1 < argc && profile::is_name(argv[i + 1])) {
+            (void)export_env(kProductProfileEnv, argv[++i], 1);
+            continue;
+        }
+        if (a == profile::turbo::kWeightsOption || a == profile::turbo::kBitsOption || a == profile::turbo::kPackOption) {
+            if (i + 1 >= argc) throw std::invalid_argument("missing value for " + a);
+            const auto key = a == profile::turbo::kWeightsOption ? profile::turbo::kWeightsEnv :
+                a == profile::turbo::kBitsOption ? profile::turbo::kBitsEnv : profile::turbo::kPackEnv;
+            (void)export_env(std::string(key).c_str(), argv[++i], 1);
+            continue;
+        }
         const std::pair<const char*, const char*> flags[] = {
             {"--session-host-budget", "STRIX_SESSION_RAM_BYTES"}, {"--session-cache-dir", "STRIX_SESSION_DIR"},
             {"--session-cache", "STRIX_SESSION_CACHE"}, {"--session-disk", "STRIX_SESSION_DISK"},
@@ -657,7 +744,10 @@ bool print_or_apply(const std::string& app, int argc, char** argv) {
     apply();
     (void)pf_async_min_rows(process_env("STRIX_MM_PF_ASYNC_MIN_ROWS"));
     (void)effective_config(parse_cli(app, args), process_env);
-    if (!print) return false;
+    if (!print) {  // a weight request this build cannot honour refuses the run (printed, not refused, above)
+        profile_resolution(process_env).weights.require_honoured();
+        return false;
+    }
     std::fputs(effective_config(parse_cli(app, args), process_env).c_str(), stdout);
     if (app == "serve") {
         const bool off = serve_policy(process_env).sched == serve::Sched::off;

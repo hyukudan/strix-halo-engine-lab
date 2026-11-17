@@ -35,6 +35,7 @@ int main(int argc, char** argv) try {
     set_env("STRIX_BASELINE", baseline && !cli ? "1" : nullptr);
     set_env("STRIX_QWEN_PAIR_CHUNK_POLICY", nullptr);
     set_env("STRIX_QWEN_PAIR_SINGLE_TILES", nullptr);
+    set_env("STRIX_QWEN_PAIR_HALF_CUT", nullptr);
     set_env("STRIX_QWEN_PF_PIPE_CHUNK", nullptr);
     std::vector<std::string> args{"decoder", "model.gguf", "--no-mtp",
         "--known-prefix-window", "--known-prefix-full-rows", "--known-prefix-prefill-rows", "8192",
@@ -55,6 +56,7 @@ int main(int argc, char** argv) try {
         require(route.route.prefix == (baseline && execution == PairExecution::handoff ? 0U : 8192U) &&
             route.tile_rows == (baseline ? 4096U : 2048U), "baseline restores historical route and tile size");
         require(policy.chunk_policy.on == !baseline && policy.single_tiles.on == !baseline, "automatic choices obey baseline");
+        require(policy.half_cut.on == !baseline, "half cut: auto on at 8K, off under baseline");
         const auto config = strix::serve::parse_json(inspect_pair_policy("{}", policy));
         const auto* control = config.find("qwen_pair")->find("STRIX_QWEN_PAIR_CHUNK_POLICY");
         require(control->find("requested")->as_string() == "auto" && control->find("effective")->as_bool() == !baseline,
