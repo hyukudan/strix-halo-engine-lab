@@ -27,6 +27,7 @@
 //   [L] prefetch8_wave_q8_lm_head_kernel<u16,8> (hip_lm_head_launcher.s:180867): coefficient = v_fma_mix_f32 scale,
 //       code, -0 (exact product, +103..+123), leaf chain CONTRACTED v_fmac_f32 partial, coef, x (+114..+129),
 //       __shfl_down tree adds (+146..).
+#include "../../weight/arch/sm120_sources.cuh"
 #include "strix/env_flags.hpp"
 #include "strix/lever.hpp"
 #include "strix/cuda/core/decode_rows.hpp"
@@ -81,7 +82,7 @@ __device__ __forceinline__ std::uint16_t float_to_bf16(float v) {
     const std::uint32_t b = __float_as_uint(v);
     return static_cast<std::uint16_t>((b + 0x7fffU + ((b >> 16U) & 1U)) >> 16U);
 }
-__device__ __forceinline__ float half_bits_to_float(std::uint16_t h) { return __half2float(__ushort_as_half(h)); }
+__device__ __forceinline__ float half_bits_to_float(std::uint16_t h) { return weight::Q8Block::scale_bits(h); }
 // sigmoid(x) = 1.0F / (1.0F + expf(-x)) (hip_hyper_mix_launcher.hip:399-404; ISA [P], [O]).
 __device__ __forceinline__ float amd_sigmoid(const am::Tables& t, float x) {
     return __fdiv_rn(1.0F, __fadd_rn(1.0F, am::amd_expf(t, -x)));
@@ -931,7 +932,7 @@ __global__ void embedding_kernel(const unsigned char* __restrict__ table, const 
         const unsigned char* block = table + (token * (kHidden / 32U) + f / 32U) * 34U;
         const float scale = half_bits_to_float(static_cast<std::uint16_t>(block[0] | (block[1] << 8U)));
         out[static_cast<std::size_t>(row) * kHidden + f] =
-            float_to_bf16(__fmul_rn(scale, static_cast<float>(static_cast<signed char>(block[2 + f % 32U]))));
+            float_to_bf16(__fmul_rn(scale, static_cast<float>(weight::Q8Block::code(block, f % 32U))));
     }
 }
 __global__ void expand_kernel(const std::uint16_t* __restrict__ in, std::uint16_t* __restrict__ out, std::size_t total) {

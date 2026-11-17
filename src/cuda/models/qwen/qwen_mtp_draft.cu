@@ -1,4 +1,5 @@
 // RTX MTP draft kernels (see include/strix/cuda/qwen_mtp_draft.hpp). Free arithmetic: drafts never reach output.
+#include "../../weight/arch/sm120_sources.cuh"
 #include "strix/cuda/qwen_mtp_draft.hpp"
 #include "strix/env_flags.hpp"
 
@@ -23,14 +24,14 @@ __device__ __forceinline__ std::uint16_t f2bf(float f) {  // RNE
     return static_cast<std::uint16_t>((u + 0x7fffU + ((u >> 16) & 1U)) >> 16);
 }
 __device__ __forceinline__ float scale_of(const unsigned char* block) {
-    return __half2float(__ushort_as_half(*reinterpret_cast<const unsigned short*>(block)));
+    return weight::Q8Block::scale(block);
 }
 
 __global__ void q8_to_f32_kernel(const unsigned char* q8, std::uint64_t elements, float* out) {
     const std::uint64_t i = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= elements) return;
     const unsigned char* b = q8 + i / 32U * kBlock;
-    out[i] = scale_of(b) * static_cast<float>(static_cast<signed char>(b[2U + i % 32U]));
+    out[i] = scale_of(b) * static_cast<float>(weight::Q8Block::code(b, i % 32U));
 }
 
 __global__ void gather_kernel(const unsigned char* src, std::uint64_t row_bytes, const std::uint32_t* ids, unsigned char* dst) {
@@ -47,7 +48,7 @@ __device__ __forceinline__ float dot_q8(const unsigned char* row, const float* x
         const unsigned char* blk = row + b * kBlock;
         float s = 0.0F;
 #pragma unroll
-        for (unsigned j = 0; j < 32U; ++j) s += x[b * 32U + j] * static_cast<float>(static_cast<signed char>(blk[2U + j]));
+        for (unsigned j = 0; j < 32U; ++j) s += x[b * 32U + j] * static_cast<float>(weight::Q8Block::code(blk, j));
         acc += scale_of(blk) * s;
     }
 #pragma unroll

@@ -77,6 +77,21 @@ bool wfmt_admission_test() try {
     RawTensor t{};t.id=tensor_id(*source,"x.weight");t.name="x.weight";t.wire_type=1;t.shape={{{2,32,0,0}},2};t.payload={source,{0,128}};index.tensors.push_back(t);
     TensorBinding binding{};binding.tensor=t.id;binding.role=Role::dense_up;binding.logical_shape=t.shape;binding.expert_axis=UINT32_MAX;binding.admitted_formats={{"plain.f16",1}};
     WeightMap map;check(bool(admit(builtin_registry(),{&index,{&binding,1},{}},map)),"explicit plain admission");check(map.size()==1 && map[0].weight.storage==Id{"plain.f16",1},"source storage retained");
+    // Reject ranks before comparing dimensions or constructing scalar strides.
+    for (const std::uint8_t rank : {std::uint8_t{5}, std::uint8_t{255}}) {
+        auto invalid=map[0]; invalid.binding.logical_shape.rank=rank;
+        auto status=validate_binding(builtin_registry(),invalid);
+        check(status.code==Error::unsupported_shape && status.detail.find("rank exceeds four")!=std::string::npos,"binding rank rejected before comparison");
+        invalid.weight.shape.rank=rank;
+        check(validate_binding(builtin_registry(),invalid).code==Error::unsupported_shape,"equal oversized ranks rejected");
+        invalid.binding.logical_shape.rank=t.shape.rank;
+        check(validate_binding(builtin_registry(),invalid).code==Error::unsupported_shape,"weight rank rejected");
+        index.tensors[0].shape.rank=rank; binding.logical_shape.rank=rank;
+        check(admit(builtin_registry(),{&index,{&binding,1},{}},map).code==Error::unsupported_shape,"plain raw rank rejected before strides");
+        index.tensors[0].wire_type=UINT32_MAX;
+        check(admit(builtin_registry(),{&index,{&binding,1},{}},map).code==Error::unsupported_shape,"raw rank rejected before format normalization");
+        index.tensors[0]=t; binding.logical_shape=t.shape;
+    }
     const auto original=describe_admission(map);binding.admitted_formats={{"plain.f32",1}};check(!admit(builtin_registry(),{&index,{&binding,1},{}},map),"format allowlist enforced");check(describe_admission(map)==original,"failed admission atomic");
     binding.admitted_formats.clear();binding.admitted_categories=1;check(bool(admit(builtin_registry(),{&index,{&binding,1},{}},map)),"explicit plain category opt-in");binding.admitted_categories=0;
     binding.admitted_formats={{"plain.f16",1}};binding.logical_shape.dims[0]=3;check(!admit(builtin_registry(),{&index,{&binding,1},{}},map),"shape mismatch rejected");binding.logical_shape=t.shape;

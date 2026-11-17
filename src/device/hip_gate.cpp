@@ -53,6 +53,7 @@ void bind_hip_main(int& argc, char** argv, std::FILE* receipt, CodeLoad code_loa
         const auto cli = take_command_line(argc, argv);
         Request request;
         request.select = cli.select;
+        request.profile = cli.profile;
         (void)bind_hip(std::move(request), cli.devices_path, receipt);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "%s\n", e.what());

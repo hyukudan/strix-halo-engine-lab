@@ -5,6 +5,7 @@
 #include "../../core/attention_tile.cuh"
 #include "strix/env_flags.hpp"
 #include "strix/cuda/core/decode_rows.hpp"
+#include "strix/lever.hpp"
 #include "strix/cuda/qwen_qsa.hpp"
 #include "strix/cuda/vram_guard.hpp"
 
@@ -316,6 +317,110 @@ __global__ __launch_bounds__(256) void block_score_kernel(const float* __restric
     float* __restrict__ block_scores, std::uint32_t max_blocks) {
     block_score_body(index_query, rows, first_position, pooled_keys, scored_blocks, block_scores, max_blocks,
         blockIdx.x * 8U + threadIdx.x / 32U);
+}
+
+// block_score_tree_kernel: the SAME score bits as block_score_body without its 13 shuffles per (row, block). One thread
+// owns (row, head) and keeps q[128] in registers; the CTA (64 rows x 4 heads) streams 32-block key tiles through shared
+// memory (broadcast reads). Per (row, block, head) the thread forms v[L] = (q[L]k[L] + q[L+64]k[L+64]) + (q[L+32]k[L+32] +
+// q[L+96]k[L+96]) for L = 0..31 (lane L's `partial` above) and adds them in scatter's pairing tree (L + L^16, then ^8, ^4,
+// ^2, ^1; IEEE addition is commutative, so only the pairing matters). Heads combine in order 0 + relu(h0) + .. + relu(h3)
+// through 4 shuffles inside the row's lane quad, then / sqrtf(128). Scores are staged per tile and written row-coalesced
+// with the incumbent's write condition (row < rows, block < complete(row) when complete > 512).
+// STRIX_QRTX_QSA_SCORE_TREE=0: the warp-shuffle block_score_kernel (off switch). Bitwise: same products, tree and head order.
+inline constexpr strix::lever::Decl score_tree_lever{
+    .name = "qwen_qsa_score_tree", .env = "STRIX_QRTX_QSA_SCORE_TREE", .exactness = strix::lever::Exactness::bitwise,
+    .default_on = true, .source = "tests/cuda/qwen_qsa_tests.cu: byte equality vs block_score_kernel"};
+bool score_tree_enabled() {
+    static const bool on = strix::lever::select(score_tree_lever, {}).on;
+    return on;
+}
+// The tree body reads the query rows and pooled keys as float4; the shuffle scorer reads floats. A base pointer that is
+// not 16-B aligned gets the shuffle scorer (same bits) instead of a misaligned vector load.
+bool tree_aligned(const void* p) { return (reinterpret_cast<std::uintptr_t>(p) & 15U) == 0U; }
+constexpr unsigned kTreeRows = 64, kTreeTile = 32, kTreeSeg = 256;
+static_assert(kIndexHeads == 4U && kIndexDim == 128U, "block_score_tree_kernel maps 4 heads x 128 features");
+__device__ __forceinline__ void block_score_tree_body(const float* __restrict__ index_query, std::uint32_t rows,
+    std::uint64_t first_position, const float* __restrict__ pooled_keys, std::uint32_t scored_blocks,
+    float* __restrict__ block_scores, std::uint32_t max_blocks, std::uint32_t tile_x, std::uint32_t tile_y) {
+    __shared__ __align__(16) float sk[kTreeTile * kIndexDim];
+    __shared__ float ss[kTreeRows][kTreeTile + 1U];
+    const unsigned tid = threadIdx.x, lane = tid & 31U, rr = tid / 4U, h = tid & 3U;
+    const std::uint32_t r0 = tile_x * kTreeRows, r = r0 + rr;
+    if (r0 >= rows) return;  // uniform per CTA (multi-segment grids are sized by the largest segment)
+    const std::uint32_t s0 = tile_y * kTreeSeg, s1 = min(scored_blocks, s0 + kTreeSeg);
+    const std::uint32_t last_row = min(rows, r0 + kTreeRows) - 1U;  // complete() is nondecreasing in the row
+    const auto limit_of = [&](std::uint32_t row) -> std::uint32_t {
+        const auto complete = static_cast<std::uint32_t>((first_position + row + 1U) / kRatio);
+        return complete > kTopK ? complete : 0U;
+    };
+    if (s0 >= s1 || s0 >= limit_of(last_row)) return;  // uniform per CTA, before any barrier
+    float q[kIndexDim];
+#pragma unroll
+    for (unsigned d = 0; d < kIndexDim; d += 4U) {
+        float4 v = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+        if (r < rows) v = *reinterpret_cast<const float4*>(index_query + static_cast<std::uint64_t>(r) * kIndexQWidth + h * kIndexDim + d);
+        q[d] = v.x; q[d + 1U] = v.y; q[d + 2U] = v.z; q[d + 3U] = v.w;
+    }
+    const float scale = __fsqrt_rn(static_cast<float>(kIndexDim));
+    for (std::uint32_t b0 = s0; b0 < s1; b0 += kTreeTile) {
+        const unsigned nb = min(kTreeTile, s1 - b0);
+        __syncthreads();  // previous tile's sk / ss fully consumed
+        for (unsigned e = tid; e < kTreeTile * kIndexDim / 4U; e += 256U) {
+            const unsigned blk = e / (kIndexDim / 4U);
+            float4 v = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+            if (blk < nb) v = reinterpret_cast<const float4*>(pooled_keys + static_cast<std::uint64_t>(b0) * kIndexDim)[e];
+            reinterpret_cast<float4*>(sk)[e] = v;
+        }
+        __syncthreads();
+        for (unsigned i = 0; i < nb; ++i) {
+            const float* k = sk + i * kIndexDim;
+            float a[16];
+#pragma unroll
+            for (unsigned g = 0; g < 4U; ++g) {
+                float v[8];  // v[0..3] = lanes 4g..4g+3, v[4..7] = lanes 4g+16..4g+19
+#pragma unroll
+                for (unsigned half = 0; half < 2U; ++half) {
+                    const unsigned L = 4U * g + 16U * half;
+                    const float4 k0 = *reinterpret_cast<const float4*>(k + L), k1 = *reinterpret_cast<const float4*>(k + L + 32U);
+                    const float4 k2 = *reinterpret_cast<const float4*>(k + L + 64U), k3 = *reinterpret_cast<const float4*>(k + L + 96U);
+                    const float kk0[4] = {k0.x, k0.y, k0.z, k0.w}, kk1[4] = {k1.x, k1.y, k1.z, k1.w};
+                    const float kk2[4] = {k2.x, k2.y, k2.z, k2.w}, kk3[4] = {k3.x, k3.y, k3.z, k3.w};
+#pragma unroll
+                    for (unsigned c = 0; c < 4U; ++c) {
+                        const float p0 = __fmul_rn(q[L + c], kk0[c]), p1 = __fmul_rn(q[L + c + 32U], kk1[c]);
+                        const float p2 = __fmul_rn(q[L + c + 64U], kk2[c]), p3 = __fmul_rn(q[L + c + 96U], kk3[c]);
+                        v[4U * half + c] = __fadd_rn(__fadd_rn(p0, p2), __fadd_rn(p1, p3));
+                    }
+                }
+#pragma unroll
+                for (unsigned c = 0; c < 4U; ++c) a[4U * g + c] = __fadd_rn(v[c], v[4U + c]);  // L + (L ^ 16)
+            }
+#pragma unroll
+            for (unsigned l = 0; l < 8U; ++l) a[l] = __fadd_rn(a[l], a[l + 8U]);  // ^8
+#pragma unroll
+            for (unsigned l = 0; l < 4U; ++l) a[l] = __fadd_rn(a[l], a[l + 4U]);  // ^4
+#pragma unroll
+            for (unsigned l = 0; l < 2U; ++l) a[l] = __fadd_rn(a[l], a[l + 2U]);  // ^2
+            const float head_sum = __fadd_rn(a[0], a[1]);                         // ^1
+            float total = 0.0F;
+#pragma unroll
+            for (unsigned hh = 0; hh < kIndexHeads; ++hh)
+                total = __fadd_rn(total, fmaxf(__shfl_sync(kFull, head_sum, static_cast<int>((lane & ~3U) | hh)), 0.0F));
+            if (h == 0U) ss[rr][i] = __fdiv_rn(total, scale);
+        }
+        __syncthreads();
+        for (unsigned e = tid; e < kTreeRows * kTreeTile; e += 256U) {
+            const unsigned row_in = e / kTreeTile, i = e % kTreeTile;
+            const std::uint32_t row = r0 + row_in;
+            if (row < rows && i < nb && b0 + i < limit_of(row))
+                block_scores[static_cast<std::uint64_t>(row) * max_blocks + b0 + i] = ss[row_in][i];
+        }
+    }
+}
+__global__ __launch_bounds__(256, 1) void block_score_tree_kernel(const float* __restrict__ index_query, std::uint32_t rows,
+    std::uint64_t first_position, const float* __restrict__ pooled_keys, std::uint32_t scored_blocks,
+    float* __restrict__ block_scores, std::uint32_t max_blocks) {
+    block_score_tree_body(index_query, rows, first_position, pooled_keys, scored_blocks, block_scores, max_blocks, blockIdx.x, blockIdx.y);
 }
 
 // ------------------------------------------------------------------------------------------------------------------
@@ -1001,6 +1106,17 @@ __global__ __launch_bounds__(256) void block_score_multi_kernel(const float* __r
             wave - map.score_begin[seg]);
     }
 }
+// Multi-segment tree scores: blockIdx.z = segment; the grid covers the largest segment and the body exits for tiles past a
+// segment's rows / scored blocks, so every segment gets exactly block_scores()'s entries and bits.
+template <class MapArg>
+__global__ __launch_bounds__(256, 1) void block_score_tree_multi_kernel(const float* __restrict__ index_query, MapArg mapa,
+    float* __restrict__ block_scores, std::uint32_t max_blocks) {
+    const SegmentMap& map = map_of(mapa);
+    const unsigned seg = blockIdx.z;
+    const auto row = map.first_row[seg];
+    block_score_tree_body(index_query + static_cast<std::uint64_t>(row) * kIndexQWidth, map.first_row[seg + 1U] - row, map.position[seg],
+        map.pooled[seg], map.scored[seg], block_scores + static_cast<std::uint64_t>(row) * max_blocks, max_blocks, blockIdx.x, blockIdx.y);
+}
 template <class MapArg>
 __global__ __launch_bounds__(kSelectThreads) void select_multi_kernel(float* __restrict__ all_scores, std::uint32_t max_blocks,
     MapArg mapa, std::uint32_t* __restrict__ all_selected) {
@@ -1108,9 +1224,21 @@ void block_pool(const std::uint16_t* raw_index, std::uint32_t first_block, std::
 
 void block_scores(const float* index_query, std::uint32_t rows, std::uint64_t first_position, const float* pooled_keys,
     float* scores, std::uint32_t max_blocks, cudaStream_t stream) {
+    block_scores_form(score_tree_enabled() ? ScoreForm::tree : ScoreForm::shuffle, index_query, rows, first_position, pooled_keys,
+        scores, max_blocks, stream);
+}
+
+void block_scores_form(ScoreForm form, const float* index_query, std::uint32_t rows, std::uint64_t first_position,
+    const float* pooled_keys, float* scores, std::uint32_t max_blocks, cudaStream_t stream) {
     if (!rows) return;
     const auto scored = static_cast<std::uint32_t>((first_position + rows) / kRatio);  // complete blocks of the last row
     if (scored <= kTopK) return;
+    if (form == ScoreForm::tree && tree_aligned(index_query) && tree_aligned(pooled_keys)) {
+        const dim3 grid((rows + kTreeRows - 1U) / kTreeRows, (scored + kTreeSeg - 1U) / kTreeSeg);
+        block_score_tree_kernel<<<grid, 256, 0, stream>>>(index_query, rows, first_position, pooled_keys, scored, scores, max_blocks);
+        check(cudaGetLastError(), "block score tree launch");
+        return;
+    }
     const auto waves = static_cast<std::uint64_t>((rows + kScoreRowsPerWave - 1U) / kScoreRowsPerWave) * ((scored + 31U) / 32U);
     block_score_kernel<<<static_cast<std::uint32_t>((waves + 7U) / 8U), 256, 0, stream>>>(index_query, rows, first_position,
         pooled_keys, scored, scores, max_blocks);
@@ -1241,7 +1369,7 @@ bool prepare_multi(const SegmentState* segs, std::uint32_t n, const Workspace& w
     const bool head_all = max_rows <= core::decode_rows_max() && decode_rows_enabled(), rows_all = !decode_rows_enabled() || min_rows > core::decode_rows_max();
     if (rows > ws.chunk_rows || score_wave || !(head_all || rows_all)) return false;  // outside the multi-launch shapes
     // pooled keys per session (host-side valid counts, as layer_core), block-score waves, attention slots
-    std::uint32_t pool = 0, waves = 0, slots = 0;
+    std::uint32_t pool = 0, waves = 0, slots = 0, tree_x = 0, tree_y = 0;
     for (std::uint32_t i = 0; i < n; ++i) {
         const auto& g = segs[i];
         const auto last_complete = static_cast<std::uint32_t>((g.first_position + g.rows) / kRatio);
@@ -1260,7 +1388,11 @@ bool prepare_multi(const SegmentState* segs, std::uint32_t n, const Workspace& w
         map.score_begin[i] = waves;
         const auto scored = last_complete;  // (first_position + rows) / kRatio: complete blocks of the segment's last row
         map.scored[i] = scored;
-        if (scored > kTopK) waves += static_cast<std::uint32_t>((g.rows + kScoreRowsPerWave - 1U) / kScoreRowsPerWave * ((scored + 31U) / 32U));
+        if (scored > kTopK) {
+            waves += static_cast<std::uint32_t>((g.rows + kScoreRowsPerWave - 1U) / kScoreRowsPerWave * ((scored + 31U) / 32U));
+            tree_x = std::max(tree_x, (g.rows + kTreeRows - 1U) / kTreeRows);
+            tree_y = std::max(tree_y, (scored + kTreeSeg - 1U) / kTreeSeg);
+        }
         for (std::uint64_t p = g.first_position; p < g.first_position + g.rows && slots < kMaxSelected; ++p) slots = std::max(slots, selected_count(p));
     }
     map.pool_begin[n] = pool;
@@ -1269,6 +1401,8 @@ bool prepare_multi(const SegmentState* segs, std::uint32_t n, const Workspace& w
     shape.head_all = head_all;
     shape.pool_grid = pool;
     shape.score_grid = (waves + 7U) / 8U;
+    shape.tree_grid = dim3(tree_x, tree_y, n);
+    for (std::uint32_t i = 0; i < n; ++i) shape.tree_aligned = shape.tree_aligned && tree_aligned(map.pooled[i]);
     shape.slot_runs = (slots + kRun - 1U) / kRun;
     return true;
 }
@@ -1292,7 +1426,10 @@ void launch_multi(const RowBuffers& b, MapArg map, const MultiShape& shape, cons
         block_pool_multi_kernel<<<shape.pool_grid, kIndexDim, 0, stream>>>(map, w.index_k_norm, cs, tables);
         check(cudaGetLastError(), "block pool multi launch");
     }
-    if (shape.score_grid) {
+    if (shape.score_grid && score_tree_enabled() && shape.tree_aligned && tree_aligned(b.index_query)) {
+        block_score_tree_multi_kernel<<<shape.tree_grid, 256, 0, stream>>>(b.index_query, map, ws.block_scores, ws.max_blocks);
+        check(cudaGetLastError(), "block score tree multi launch");
+    } else if (shape.score_grid) {
         block_score_multi_kernel<<<shape.score_grid, 256, 0, stream>>>(b.index_query, map, ws.block_scores, ws.max_blocks);
         check(cudaGetLastError(), "block score multi launch");
     }
@@ -1359,6 +1496,7 @@ bool graph_shape(const std::uint32_t* seg_rows, std::uint32_t n, const Workspace
     // Replay may start with a cold pool, regardless of the window's row count. Empty CTAs exit in the existing kernel.
     shape.pool_grid = 2U * sms;
     shape.score_grid = std::max(1U, std::min((waves + 7U) / 8U, 2U * sms));   // grid-stride beyond
+    shape.tree_grid = dim3((max_rows + kTreeRows - 1U) / kTreeRows, (ws.max_blocks + kTreeSeg - 1U) / kTreeSeg, n);
     shape.slot_runs = (kMaxSelected + kRun - 1U) / kRun;                      // runs past a row's selected count return at once
     return true;
 }
@@ -1373,6 +1511,9 @@ void prepare_replay(const SegmentState* segs, std::uint32_t n, const Workspace& 
     std::uint32_t valid_after[kMaxSegments] = {};
     if (!prepare_multi(segs, n, ws, map, shape, valid_after))
         throw std::logic_error("qwen_qsa prepare_replay: window outside the captured multi-launch shape");
+    // a captured graph keeps the scorer chosen at capture: refuse pooled keys the captured tree scorer cannot read
+    if (score_tree_enabled() && !shape.tree_aligned)
+        throw std::logic_error("qwen_qsa prepare_replay: pooled keys not 16-B aligned for the captured tree scorer");
     for (std::uint32_t i = 0; i < n; ++i)
         if (segs[i].state.pooled) *segs[i].state.pooled_valid = valid_after[i];
 }

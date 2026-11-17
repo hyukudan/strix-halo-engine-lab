@@ -66,6 +66,7 @@ constexpr ScopeRule scope_rules[] = {
     {"include/strix", "bp_codec.", false, "header of bp_codec.cpp"},
 };
 constexpr const char* exact_scope_files[] = {
+    "include/strix/prefill_headless.hpp",
     // The MoE input transforms and their local helpers moved out of moe_core.
     "src/hip/weight/trellis_sources.hpp",
     "cmake/StrixSession.cmake", "include/strix/serve/engine.hpp",
