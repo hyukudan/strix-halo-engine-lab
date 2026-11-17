@@ -55,7 +55,7 @@ __device__ __forceinline__ void mma_scale_acc(float (&acc)[4], const float (&p)[
     for (unsigned i = 0; i < 4U; ++i) acc[i] = __fmaf_rn(p[i], scale[i & 1U], acc[i]);
 }
 
-// grid (tiles, ffn / 64), 256 threads. Writes h = native_activation(gate, up) into intermediates[row][slot * 2 * ffn + o]
+// grid (tiles, ffn / 64), tile-major raster (native_mma::tile_major), 256 threads. Writes h = native_activation(gate, up) into intermediates[row][slot * 2 * ffn + o]
 // with the exact route's layout and fail-closed flags. Gate and up of one output are in the same lane (same C element).
 template <unsigned T, class Binding>
 __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_project_kernel(const std::uint8_t* gate, const std::uint8_t* up,
@@ -67,13 +67,14 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_project_kernel(cons
     static_assert(hidden % kMmaProjectK == 0U && hidden % Decode::be == 0U && ffn % kMmaProjectOutputs == 0U,
                   "tensor-core project covers whole stages, storage blocks and output blocks");
     const auto& csr = v.csr;
-    if (csr.summary[0] || blockIdx.x >= *csr.tile_count) return;
-    const unsigned tile_begin = csr.tile_begins[blockIdx.x], count = csr.tile_begins[blockIdx.x + 1U] - tile_begin;
-    const unsigned expert = csr.tile_experts[blockIdx.x];
+    const native_mma::TileSlice ts = native_mma::tile_major(blockIdx.x, blockIdx.y, gridDim.x, ffn / kMmaProjectOutputs);
+    if (csr.summary[0] || ts.tile >= *csr.tile_count) return;
+    const unsigned tile_begin = csr.tile_begins[ts.tile], count = csr.tile_begins[ts.tile + 1U] - tile_begin;
+    const unsigned expert = csr.tile_experts[ts.tile];
     __shared__ alignas(16) std::uint16_t X[2][kNativeTileRows][kMmaProjectPitch];
     __shared__ unsigned row_of[kNativeTileRows], slot_of[kNativeTileRows];
     const unsigned t = threadIdx.x, lane = t & 31U, warp = t >> 5, g = lane >> 2, q = lane & 3U;
-    const unsigned out_base = native_mma::project_output(blockIdx.y, warp, 0U);
+    const unsigned out_base = native_mma::project_output(ts.slice, warp, 0U);
     if (t < kNativeTileRows) {
         const unsigned a = t < count ? t : 0U;
         row_of[t] = csr.rows[tile_begin + a]; slot_of[t] = csr.slots[tile_begin + a];
@@ -148,7 +149,7 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_project_kernel(cons
         }
 }
 
-// grid (tiles, hidden / 128), 256 threads. Reads h from intermediates[row][slot * 2 * ffn + k] and writes FP32
+// grid (tiles, hidden / 128), tile-major raster (native_mma::tile_major), 256 threads. Reads h from intermediates[row][slot * 2 * ffn + k] and writes FP32
 // rawdots[row][slot * hidden + o] (the exact route's storage; merge / commit unchanged). h enters as hi + lo BF16
 // (native_mma::split); both MMAs of a half share the code fragment.
 template <unsigned T, class Binding>
@@ -161,14 +162,15 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_down_kernel(const s
     static_assert(ffn % kMmaDownK == 0U && ffn % Decode::be == 0U && hidden % kMmaDownOutputs == 0U,
                   "tensor-core down covers whole stages, storage blocks and output blocks");
     const auto& csr = v.csr;
-    if (csr.summary[0] || blockIdx.x >= *csr.tile_count) return;
-    const unsigned tile_begin = csr.tile_begins[blockIdx.x], count = csr.tile_begins[blockIdx.x + 1U] - tile_begin;
-    const unsigned expert = csr.tile_experts[blockIdx.x];
+    const native_mma::TileSlice ts = native_mma::tile_major(blockIdx.x, blockIdx.y, gridDim.x, hidden / kMmaDownOutputs);
+    if (csr.summary[0] || ts.tile >= *csr.tile_count) return;
+    const unsigned tile_begin = csr.tile_begins[ts.tile], count = csr.tile_begins[ts.tile + 1U] - tile_begin;
+    const unsigned expert = csr.tile_experts[ts.tile];
     __shared__ alignas(16) std::uint16_t Xh[2][kNativeTileRows][kMmaDownPitch];
     __shared__ alignas(16) std::uint16_t Xl[2][kNativeTileRows][kMmaDownPitch];
     __shared__ unsigned row_of[kNativeTileRows], slot_of[kNativeTileRows];
     const unsigned t = threadIdx.x, lane = t & 31U, warp = t >> 5, g = lane >> 2, q = lane & 3U;
-    const unsigned out_base = native_mma::down_output(blockIdx.y, warp, 0U, 0U);
+    const unsigned out_base = native_mma::down_output(ts.slice, warp, 0U, 0U);
     if (t < kNativeTileRows) {
         const unsigned a = t < count ? t : 0U;
         row_of[t] = csr.rows[tile_begin + a]; slot_of[t] = csr.slots[tile_begin + a];
