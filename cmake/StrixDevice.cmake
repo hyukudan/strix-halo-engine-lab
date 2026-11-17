@@ -12,7 +12,10 @@ endif()
 add_library(strix_device STATIC
     ${CMAKE_CURRENT_LIST_DIR}/../src/device/declaration.cpp
     ${CMAKE_CURRENT_LIST_DIR}/../src/device/gate.cpp
-    ${CMAKE_CURRENT_LIST_DIR}/../src/device/nvidia_smi.cpp)
+    ${CMAKE_CURRENT_LIST_DIR}/../src/device/nvidia_smi.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/../src/device/profiles.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/../src/device/budget.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/../src/deploy/memory_plan.cpp)
 target_link_libraries(strix_device PUBLIC strix_model_description)
 target_compile_features(strix_device PUBLIC cxx_std_20)
 if(MSVC)
@@ -28,6 +31,31 @@ if(BUILD_TESTING)
         strix_target_warnings(strix-device-gate-tests)
     endif()
     add_test(NAME strix-device-gate-tests COMMAND strix-device-gate-tests)
+    # Device catalogue, declared budgets and the shared memory plan (strix/device/profiles.hpp, budget.hpp,
+    # strix/deploy/memory_plan.hpp); also checks data/devices/profiles.toml against the table.
+    add_executable(strix-device-profiles-tests ${CMAKE_CURRENT_LIST_DIR}/../tests/device_profiles_tests.cpp
+        ${CMAKE_CURRENT_LIST_DIR}/../src/deploy/device.cpp)
+    target_link_libraries(strix-device-profiles-tests PRIVATE strix_device)
+    if(MSVC)
+        target_compile_definitions(strix-device-profiles-tests PRIVATE _CRT_SECURE_NO_WARNINGS)
+    endif()
+    target_compile_definitions(strix-device-profiles-tests PRIVATE
+        STRIX_SOURCE_ROOT="${CMAKE_CURRENT_LIST_DIR}/..")
+    if(COMMAND strix_target_warnings)
+        strix_target_warnings(strix-device-profiles-tests)
+    endif()
+    add_test(NAME strix-device-profiles-tests COMMAND strix-device-profiles-tests)
+endif()
+# The catalogue and the memory plan without a GPU (docs/devices.md).
+if(NOT TARGET strix-device-plan)
+    add_executable(strix-device-plan ${CMAKE_CURRENT_LIST_DIR}/../apps/device_plan_main.cpp)
+    target_link_libraries(strix-device-plan PRIVATE strix_device)
+    if(MSVC)
+        target_compile_definitions(strix-device-plan PRIVATE _CRT_SECURE_NO_WARNINGS)
+    endif()
+    if(COMMAND strix_target_warnings)
+        strix_target_warnings(strix-device-plan)
+    endif()
 endif()
 
 # HIP side of the gate. Defined at the end of the configuration, when the HIP toolkit has been located; without the HIP

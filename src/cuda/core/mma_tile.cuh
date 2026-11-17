@@ -22,6 +22,7 @@
 #include <cstdint>
 
 #include "ptx.cuh"
+#include "../weight/arch/sm120_sources.cuh"
 
 namespace strix::cuda::core::mma {
 
@@ -52,9 +53,7 @@ __device__ __forceinline__ unsigned u4_pair_to_half2(unsigned w, unsigned shift)
 }
 // Same, for u already shifted so the two nibbles sit at bits 0 and 8 (Q4_0 byte pairs: low / high halves of the block).
 __device__ __forceinline__ unsigned u4_bytes_to_half2(unsigned u) {
-    const unsigned v = 0x64006400U | (u & 15U) | (((u >> 8U) & 15U) << 16U);
-    const __half2 r = __hsub2(*reinterpret_cast<const __half2*>(&v), __half2half2(__ushort_as_half(0x6408)));
-    return *reinterpret_cast<const unsigned*>(&r);
+    return ::strix::cuda::weight::Q40F16Source::unpack_pair(u);
 }
 
 // Per-32-K-block FP32 scale epilogue: acc += scale * (block partial) for one c fragment (s0 / s1: scales of columns 2t, 2t+1).
@@ -102,26 +101,7 @@ __device__ __forceinline__ void warp_gemm_k32(float (&acc)[MT][4], const unsigne
 // Weight-format trait of the smem tile: Q4_0-style blocks, 18 B (2-byte aligned): fp16 d, 16 bytes; byte j low nibble = element j,
 // high nibble = element j + 16. Regs = one block as 9 u16 (loaded for all threads, two threads per output row); store() turns the
 // nibbles into exact f16 codes (code = nibble - 8) of elements kh * 16 .. +15 and the scale into FP32 (kh == 0 only).
-struct Q40Blocks {
-    static constexpr unsigned kBlockBytes = 18;
-    struct Regs { unsigned short w[9]; };
-    __device__ static __forceinline__ void load(Regs& r, const std::uint8_t* blk) {
-#pragma unroll
-        for (int i = 0; i < 9; ++i) r.w[i] = *reinterpret_cast<const unsigned short*>(blk + 2 * i);
-    }
-    // dw: smem row of the output at element kh * 16 (>= 16 B aligned); scale_dst: FP32 scale slot of the output.
-    __device__ static __forceinline__ void store(const Regs& r, __half* dw_half, float* scale_dst, unsigned kh) {
-        uint4 pv[2];
-        unsigned* ww = reinterpret_cast<unsigned*>(pv);
-        const unsigned sh = kh * 4U;
-#pragma unroll
-        for (int i = 0; i < 8; ++i) ww[i] = u4_bytes_to_half2(static_cast<unsigned>(r.w[1 + i]) >> sh);
-        uint4* dw = reinterpret_cast<uint4*>(dw_half);
-        dw[0] = pv[0];
-        dw[1] = pv[1];
-        if (!kh) *scale_dst = __half2float(__ushort_as_half(r.w[0]));
-    }
-};
+using Q40Blocks = ::strix::cuda::weight::Q40TileSource;
 
 // CTA tile: BM = 128 rows x BN = 16 * NT8 outputs per CTA of 256 threads (8 warps: 4 along M x 2 along N, warp tile 32 x 8 * NT8).
 template <int NT8, class WeightFmt = Q40Blocks>

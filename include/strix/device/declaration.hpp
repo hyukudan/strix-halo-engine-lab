@@ -19,6 +19,13 @@
 //   memory_bytes = 102641958912                  # optional, informational
 //   roles = ["replica", "prefill"]               # empty or absent = no work
 //   attach = { kind = "pcie", pcie_gen = 4, pcie_width = 16, h2d_gbytes_ps = 0.0 }
+//   profile = "rtx-5090-32"                      # optional known model (profiles.hpp): every route sizes itself to it
+//   memory_gib = 30                              # optional device budget (over the profile's memory)
+//
+//   [devices.pair]                               # a planned shape: no identity, planners only
+//   profile = "rtx-5090-32"
+//   count = 2
+//   interconnect = "pcie5x16"
 //
 //   [devices.halo-a]                             # a GPU in another machine, reached over the network
 //   vendor = "amd"
@@ -56,6 +63,7 @@
 //   [devices.host]
 //   kind = "cpu"                                 # no identity; at most one cpu unit
 //   cores = "2-15"                               # cores the host lane may pin
+//   memory_gib = 64                              # optional host RAM budget for the routes on this machine
 //   roles = ["host", "aux"]                      # host: tokenizer, image, sampling, exchange fold, background work
 //   byte_cap_gbytes_ps = 10.0                    # background memory traffic ceiling while any decode is active
 //
@@ -111,6 +119,18 @@ struct Descriptor {
     std::vector<std::string> roles;
     bool excluded = false;
     std::string reason;
+    // Known device model (strix/device/profiles.hpp) and the entry's overrides of it. budget_bytes is `memory_gib`:
+    // on a GPU the device budget every route sizes itself to (over the profile's memory), on the cpu unit the host
+    // RAM budget. 0 = not declared.
+    std::string profile;
+    std::uint64_t budget_bytes = 0;
+    double bandwidth_gbytes_ps = 0.0; // overrides the profile's memory bandwidth; 0 = the profile's
+    std::uint32_t units = 0;          // overrides the profile's SM / CU count; 0 = the profile's
+    // Cluster shape: `count` identical devices joined by `interconnect` (a class in profiles.hpp). An entry with
+    // count > 1, or a profile without an identity, is planned: the planners size it, the gate never binds it.
+    std::uint32_t count = 1;
+    std::string interconnect;
+    bool planned = false;
     // kind = cpu only.
     std::string cores_text;           // as declared ("2-15", "0,4-7"); empty = not declared
     std::vector<std::uint32_t> cores; // sorted, unique

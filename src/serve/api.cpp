@@ -1490,6 +1490,7 @@ struct ApiService::Impl {
     std::shared_ptr<GenerationTicket> submit(std::vector<std::uint32_t> prompt, std::uint32_t max_tokens, const SamplingParameters& sampling,
         const Json& body, std::uint32_t stable_prefix = 0, std::shared_ptr<const ConstraintSpec> spec = {}, std::shared_ptr<GenerationContext> context = {}) {
         (void)bool_or(body, "return_token_ids", false); // reject malformed presentation before admission
+        const bool trace_emissions = bool_or(body, "return_token_emissions", false);
         if (api_request_scope) {
             auto& scope = *api_request_scope;
             scope.observation.request_id = current_request_id;
@@ -1504,6 +1505,7 @@ struct ApiService::Impl {
             }
         }
         GenerationJob job;
+        job.trace_emissions = trace_emissions;
         job.family_context = std::move(context);
         job.constraint = std::move(spec);
         if (const auto* policy = body.find("state_cache")) {
@@ -1655,6 +1657,19 @@ struct ApiService::Impl {
     Json engine_json(const Outcome& o, const std::string& note, const Json& body) const { return with_media(engine_json_text(o, note, body)); }
     Json engine_json_text(const Outcome& o, const std::string& note, const Json& body) const {
         Json e = Json::object();
+        if (o.stats.emission_trace) {
+            Json trace = Json::object(), events = Json::array();
+            trace.set("clock", Json("steady_ns"));
+            trace.set("includes_stop_tokens", Json(true));
+            for (const auto& event : o.stats.token_emissions) {
+                Json pair = Json::array();
+                pair.push(Json(event.steady_ns));
+                pair.push(Json(event.count));
+                events.push(std::move(pair));
+            }
+            trace.set("events", std::move(events));
+            e.set("token_emissions", std::move(trace));
+        }
         if (bool_or(body, "return_token_ids", false)) {
             Json ids = Json::array();
             for (const auto id : o.token_ids) ids.push(Json(static_cast<std::int64_t>(id)));

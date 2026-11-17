@@ -343,8 +343,8 @@ void units() {
                       "\"byte_cap_gbytes_ps\":10}") != std::string::npos &&
                 json.find("\"corun_qualification\":\"E1-test\"}]}") != std::string::npos,
             "units in the receipt");
-    rejects([&] { (void)resolve(&all, {igpu}, Request{Vendor::amd, "npu", -1, {}}); }, "npu unit, not a GPU", "selecting the npu as the GPU");
-    rejects([&] { (void)resolve(&all, {igpu}, Request{Vendor::amd, "host", -1, {}}); }, "cpu unit, not a GPU", "selecting the cpu as the GPU");
+    rejects([&] { (void)resolve(&all, {igpu}, Request{Vendor::amd, "npu", -1, {}, {}}); }, "npu unit, not a GPU", "selecting the npu as the GPU");
+    rejects([&] { (void)resolve(&all, {igpu}, Request{Vendor::amd, "host", -1, {}, {}}); }, "cpu unit, not a GPU", "selecting the cpu as the GPU");
 
     // An NPU without its qualification parses, is listed, and is refused the role.
     const auto unqualified = parse_declaration(gpu + npu + "driver = \"amdxdna\"\n");
