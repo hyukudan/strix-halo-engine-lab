@@ -1911,6 +1911,11 @@ int main(int argc, char** argv) {
             catch (const std::invalid_argument& e) { std::fprintf(stderr, "%s\n", e.what()); return 2; }
             return 0;  // no allocation or device work
         }
+        if (mode == "kda") {  // KDA prefill vs decode only, every scan version (bounded single-ticket gate)
+            test_kda(argv[1], g);
+            std::printf("checks: %d failures: %d\n", checks, failures);
+            return failures ? 1 : 0;
+        }
         if (mode == "hcexpand" || mode == "hcexpandbench") {
             test_hc_expand_cta(g, false);
             if (failures == 0 && want_timing && mode == "hcexpandbench") test_hc_expand_cta(g, true);
