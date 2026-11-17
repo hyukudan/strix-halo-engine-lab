@@ -5,6 +5,8 @@
 #include "strix/decode_numerical_profile.hpp"
 #include "core/layer_set.hpp"
 #include "minimax/engine/mm_fast_i4.hpp"
+#include "minimax/engine/route_identity.hpp"
+#include "moe_core/grouped_policy.hpp"
 #include "glm/prefill/glm_pf_exact.hpp"
 #include "glm/prefill/glm_pf_dense_policy.hpp"
 #include "glm/prefill/glm_pf_wmma.hpp"
@@ -53,8 +55,14 @@ void dispatch_receipt(unsigned rows, unsigned input = 128) {
 }
 namespace mmoe {
 int g_iu4_override = -1;
+int g_order_override = -1;
+@MINIMAX_ORDER@
 @IU4_RESOLVER@
 }
+namespace defaults {
+@MINIMAX_FLASH_DECLINE@
+}
+namespace route = strix::minimax::route;
 namespace fast_i4 = strix::minimax::engine::fast_i4;
 struct MiniMaxPolicies {
     static constexpr unsigned kFirstMoe = 3, kLayers = 62;
@@ -66,6 +74,8 @@ struct MiniMaxPolicies {
     strix::core::LayerSet i4_exl3_layers = strix::core::parse_layer_set(fast_i4::kQualityExl3Layers, kFirstMoe, kLayers, "kept");
     strix::core::LayerSet i4_a8_layers = strix::core::parse_layer_set("!", kFirstMoe, kLayers, "a8");
     strix::core::LayerSet pf_msa_flash_layers = strix::core::parse_layer_set("50-61", 0, kLayers, "flash");
+    bool attn_prefill_fused = true, index_attn = true, index_tiled = true, index_decode = true;
+    std::string pf_msa_flash_asked = "default";
     bool pf_idx_wmma = false;
     std::string pf_idx_wmma_asked = "default";
     strix::core::LayerSet pf_idx_wmma_layers = strix::core::parse_layer_set("40-59", 0, kLayers, "idx");
@@ -102,7 +112,10 @@ void minimax() {
     const auto on = p.fingerprint();
     env("STRIX_MMX_PF_IU4", "0");
     different(on, p.fingerprint());
-    require(rr::levers().front().effective == "exl3", "disabled IU4 must report exact format");
+    bool exact_format = false;
+    for (const auto& lever : rr::levers())
+        if (lever.name == "minimax.moe_prefill_format") exact_format = lever.effective == "exl3";
+    require(exact_format, "disabled IU4 must report exact format");
     env("STRIX_MMX_PF_IU4", "1");
     rr::require_same_route(on, p.fingerprint());
     mmoe::g_iu4_override = 0;
@@ -113,8 +126,24 @@ void minimax() {
     const auto a8 = p.fingerprint();
     p.i4_a8_layers = strix::core::parse_layer_set("!3-38", 3, 62, "a8");
     rr::require_same_route(a8, p.fingerprint());
+    // These dependencies are extracted or included from the real host policies.
+    // Check them so fixture stand-ins cannot silently mask a changed receipt.
+    mmoe::set_prefill_moe_order(1);
+    different(a8, p.fingerprint());
+    mmoe::set_prefill_moe_order(0);
+    rr::require_same_route(a8, p.fingerprint());
+    p.pf_idx_wmma = true;
+    const auto index_on = p.fingerprint();
+    different(a8, index_on);
+    p.index_attn = p.index_tiled = false;
+    rr::require_same_route(a8, p.fingerprint());
+    p.index_attn = p.index_tiled = true;
+    p.pf_idx_wmma = false;
     p.pf_msa_flash = 1;
     const auto flash1 = p.fingerprint();
+    p.attn_prefill_fused = false;
+    rr::require_same_route(a8, p.fingerprint());
+    p.attn_prefill_fused = true;
     different(a8, flash1);
     p.pf_msa_flash = 2;
     different(flash1, p.fingerprint());
