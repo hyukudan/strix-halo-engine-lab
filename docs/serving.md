@@ -49,9 +49,27 @@ call; `strix-serve-cli-parity-tests` (host, no GPU) resolves the same plain requ
 difference that is not listed in `tests/serve_cli_parity_tests.cpp` with the reason serving requires it, and on any
 listed difference that no longer exists. `strix-serve-cli-parity-tests --print` prints both resolved configurations
 side by side. Its ordinary output lists included and skipped families; GLM covers complete/missing MTP assets
-and explicit opt-out. The Qwen pair of entry points is covered separately by `strix-qwen-effective-config-tests`.
-Gemma configuration parity is not yet covered by this gate; its benchmark request contract is tested by
-`gemma4-session-shared-api` using the same request fixture as the Python tool.
+and explicit opt-out. Gemma compares `parse_options` (CLI) with `prepare_serve` (server). The Qwen pair of entry
+points is covered by `strix-qwen-serve-prefill-admission-tests` (the same words with and without `--http-serve`
+through `resolve_effective_config`, comparing selected route fields and environment values with field/family
+allowances; this does not establish complete configuration or numerical-identity parity).
+Gemma's benchmark request contract is tested by `gemma4-session-shared-api`
+using the same request fixture as the Python tool.
+
+Removed differences: GLM's automatic max-rows (the server now runs the CLI's load-time admission,
+`apps/glm_auto_rows.hpp`, and resolves the 8192-row candidate when both ranks admit it; the 4096-row
+`auto-4096-serve` fallback is gone); DeepSeek V4.1's `--tp-attention` / `--engram-direct` (the resolver emits them for
+the server too); MiniMax's two host setenv lists (one table, `host.NAME=` lines in `--print-effective-config`).
+Differences kept and named for a decision: MiniMax transport (server device exchange, CLI host exchange) and its
+prefill MoE table ring (CLI only: qualified with one engine owner); Gemma's stream count (server
+`STRIX_G4_SERVE_SLOTS`, CLI 1); Qwen's tiled prefill admitted at serving startup (the CLI resolves it from its
+prompt). Scheduling between concurrent requests (slots, per-step prefill limits, peer timeouts) has no CLI
+counterpart.
+
+GLM uses the shared prefill load callbacks for candidate admission and installation, including the first-forward
+reserve and the engine's two-rank install votes/retries. The synthetic host gate in `tests/pr593_host` checks agreed
+rows and installed layouts under reduced and asymmetric memory, including 4096-row fallback. These host checks
+do not qualify serving row sizes for native token/logit/state equality; that requires the engine's native gates.
 
 To measure the result, run the server and the CLI on the same build and prompt and report the ratio (exit 1 below
 `--min-ratio`, default 0.99, when complete token sequences differ, or when any measured run lacks evidence).

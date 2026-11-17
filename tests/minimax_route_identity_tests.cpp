@@ -51,6 +51,7 @@ struct ScopeRule { const char* dir; const char* prefix; bool recursive; const ch
 constexpr ScopeRule scope_rules[] = {
     {"src/minimax", "", true, "strix_minimax_{engine,assets,defaults,session,serve,pfx,dspark,moe_opt_hip,model_description}"},
     {"src/moe_core", "", true, "shared MoE device core included by the MiniMax engine kernels"},
+    {"src/cuda/models/minimax", "", true, "MiniMax RTX prefill (CUDA backend, was src/minimax/rtxpf/cuda)"},
     {"src/dspark_common", "", true, "drafter kernels included by strix_minimax_dspark"},
     {"src/xport", "", true, "strix_xport INTERFACE linked by strix_minimax_engine (xfer)"},
     {"include/strix/minimax", "", true, "public headers of the strix_minimax_* libraries"},
@@ -66,6 +67,10 @@ constexpr ScopeRule scope_rules[] = {
     {"include/strix", "bp_codec.", false, "header of bp_codec.cpp"},
 };
 constexpr const char* exact_scope_files[] = {
+    "include/strix/prefill_headless.hpp",
+    "include/strix/pinned_host.hpp", "include/strix/lever.hpp", "src/dist_communicator.cpp",
+    // The MoE input transforms and their local helpers moved out of moe_core.
+    "src/hip/weight/trellis_sources.hpp",
     "cmake/StrixSession.cmake", "include/strix/serve/engine.hpp",
     "src/serve/engine.cpp", "src/serve/session_runtime.cpp"};
 void source_coverage(const fs::path& source_root = fs::path(STRIX_ROUTE_SOURCE_DIR)) {
@@ -315,7 +320,40 @@ void config_receipts() {
     const Lookup baseline_env = [](const char* key) -> const char* {
         return std::string_view(key) == kBaselineEnv ? "1" : nullptr;
     };
+    for (const char* asked : {static_cast<const char*>(nullptr), "", "adaptive", "invariant"}) {
+        const Lookup order_env = [asked](const char* key) -> const char* {
+            return std::string_view(key) == "STRIX_MMX_PF_ORDER" ? asked : nullptr;
+        };
+        const auto config = effective_config(Cli{}, order_env);
+        require(config.find(std::string("STRIX_MMX_PF_ORDER.requested=") +
+                            (asked ? asked : "default") + "\n") != std::string::npos,
+                "requested chunk order inspection");
+        // Unset resolves the pf_order table default (invariant); an empty value is explicit and stays adaptive.
+        const bool invariant = !asked || std::string_view(asked) == "invariant";
+        require(config.find(std::string("STRIX_MMX_PF_ORDER.effective=") +
+                            (invariant ? "invariant" : "adaptive") + "\n") != std::string::npos,
+                "effective chunk order inspection");
+    }
     require(resolve(empty).size() == items().size(), "defaults registry");
+    const auto& dense_mlp = allow("prefill-dense-mlp");
+    require(dense_mlp.category == 'a' && std::string_view(dense_mlp.plan_key).size() != 0 &&
+            std::string_view(dense_mlp.gate).size() != 0, "missing dense MLP equivalence gate");
+    for (const bool baseline : {false, true}) {
+        for (const char* asked : {static_cast<const char*>(nullptr), "0", "1"}) {
+            const Lookup dense_env = [baseline, asked](const char* key) -> const char* {
+                if (std::string_view(key) == "STRIX_MM_PF_DENSE_MLP") return asked;
+                return baseline && std::string_view(key) == kBaselineEnv ? "1" : nullptr;
+            };
+            unsigned found = 0;
+            for (const auto& resolved : resolve(dense_env)) {
+                if (std::string_view(resolved.item->env) != "STRIX_MM_PF_DENSE_MLP") continue;
+                ++found;
+                require(resolved.value == (asked ? asked : baseline ? "0" : "1"),
+                        "dense MLP default/baseline/explicit override drift");
+            }
+            require(found == 1, "missing or duplicate dense MLP default");
+        }
+    }
     for (const auto& resolved : resolve(empty))
         if (std::string_view(resolved.item->env) == "STRIX_MM_PF_MSA_REWORK")
             require(resolved.value == "10", "in-block mode 10 is the default");
@@ -412,6 +450,34 @@ void refreshed_selector_proofs() {
         const std::string source((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
         require(source.find(row.required) != std::string::npos, std::string("selector wiring drift: ") + row.id);
     }
+// Host policy/source contract only: allocation and device equality need native gates.
+void host_pin_selector() {
+    const auto& entry = allow("host-anon-pin");
+    require(entry.category == 'a' && std::string_view(entry.gate).find("UNCOVERED") != std::string_view::npos,
+            "host pin must retain its pending native gate");
+    std::ifstream input(fs::path(STRIX_ROUTE_SOURCE_DIR) / "include/strix/pinned_host.hpp", std::ios::binary);
+    require(input.good(), "cannot inspect host pin selector");
+    const std::string source((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    for (const auto* contract : {
+             "\"STRIX_HOST_ANON_PIN\", lever::Exactness::bitwise, true, {}, {}",
+             "static const bool on", "lever::select(kLever, lever::Inputs{})",
+             "c.origin == lever::Origin::explicit_switch || !c.on",
+             "hipDeviceAttributeIntegrated", "integrated != 0",
+             "std::size_t{2} << 20", "!enabled() || bytes < kMinBytes",
+             "if (p == MAP_FAILED) return hipHostMalloc(host, bytes, flags)",
+             "rec.locked ? long_term_pin(p, size) : -1", "if (rec.ring < 0)",
+             "if (it == r.live.end()) return hipHostFree(host)"})
+        require(source.find(contract) != std::string::npos, std::string("host pin contract changed: ") + contract);
+    std::ifstream lever_input(fs::path(STRIX_ROUTE_SOURCE_DIR) / "include/strix/lever.hpp", std::ios::binary);
+    require(lever_input.good(), "cannot inspect host pin switch parser");
+    const std::string lever_source((std::istreambuf_iterator<char>(lever_input)), std::istreambuf_iterator<char>());
+    for (const auto* contract : {
+             "value == nullptr || *value == '\\0'", "return automatic(row, in, gate_open)",
+             "if (text == \"0\") return {false, Origin::explicit_switch}",
+             "if (text == \"1\") return {true, Origin::explicit_switch}",
+             "throw std::invalid_argument(std::string(row.env)"})
+        require(lever_source.find(contract) != std::string::npos,
+                std::string("host pin switch parser contract changed: ") + contract);
 }
 void selector_boundary_proofs() {
     using namespace strix::minimax::defaults;
@@ -452,6 +518,7 @@ int main(int argc, char** argv) {
         if (argc >= 2) source_coverage(argc == 3 ? fs::path(argv[2]) : fs::path(STRIX_ROUTE_SOURCE_DIR));
         selector_boundary_proofs();
         refreshed_selector_proofs();
+        host_pin_selector();
         std::set<std::string_view> ids;
         std::array<unsigned, 3> counts{};
         bool open_gate = false;
