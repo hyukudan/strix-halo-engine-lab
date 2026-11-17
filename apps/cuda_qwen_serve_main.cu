@@ -29,6 +29,7 @@
 // --http-slots 1 or STRIX_QRTX_COHORT=0: the old serialized path (one request at a time, generate() to completion).
 // Token-block prefix checkpoints restore exact prompt state before the remaining prefill rows.
 #include "strix/device/cuda_enumerator.hpp"
+#include "strix/deploy/memory_plan.hpp"
 #include "cuda_qwen_prefix_cache.hpp"
 #include "strix/mtp_depth_host.hpp"
 #include "cuda_qwen_serve_policy.hpp"
@@ -48,6 +49,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -72,6 +74,16 @@ namespace serve = strix::serve;
 using Clock = std::chrono::steady_clock;
 
 namespace {
+
+// The bound device's memory budget (strix/device/budget.hpp: --device-profile NAME or the entry's profile /
+// memory_gib; 0 = no cap). Free memory is what the budget leaves after everything already on the card, so a smaller
+// profile sees the slot count and the refusals a card of that size would.
+std::uint64_t g_budget_bytes = 0;
+std::pair<std::uint64_t, std::uint64_t> budget_view(std::uint64_t free, std::uint64_t total) {
+    if (!g_budget_bytes || g_budget_bytes >= total) return {free, total};
+    const std::uint64_t used = total - free;
+    return {used < g_budget_bytes ? g_budget_bytes - used : 0, g_budget_bytes};
+}
 
 std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop.store(true); }
@@ -466,7 +478,8 @@ private:
             free = std::min<std::uint64_t>(free, budget > used ? budget - used : 0U);
             total = std::min<std::uint64_t>(total, budget);
         }
-        return {free, total};
+        // and the bound device profile (strix/device/budget.hpp): the smaller of the two caps
+        return budget_view(free, total);
     }
     unsigned live_slots() const {
         unsigned n = 0;
@@ -864,7 +877,13 @@ int main(int argc, char** argv) {
         auto o = parse(argc, argv);
         strix::device::Request device_request;
         device_request.select = device_cli.select;
-        strix::device::bind_cuda(std::move(device_request), device_cli.devices_path);
+        const auto& bound = strix::device::bind_cuda(std::move(device_request), device_cli.devices_path);
+        // ONE budget resolver (strix/device/budget.hpp), as every route: the bound profile caps the admission view
+        // (budget_view). This route has a host / file expert tier, so the residency plan, not a weights-only
+        // check, decides whether the model fits.
+        const auto budget = strix::device::route_budget(bound, {});
+        g_budget_bytes = budget.device_bytes;
+        if (budget.device_capped()) std::cerr << "strix-cuda-qwen-serve: memory budget " << budget.json() << std::endl;
         if (o.print_effective_config) {
             // No model load: the residency decision from the GGUF headers and the live card/host numbers.
             const auto plan = qp::plan_residency(o.engine);
@@ -884,6 +903,26 @@ int main(int argc, char** argv) {
         qp::Prefill engine(o.engine);
         o.engine.max_positions = engine.max_positions();  // resolved limit for admission, cache and capabilities
         std::cerr << "strix-cuda-qwen-serve: loaded " << engine.describe() << std::endl;
+        if (budget.device_capped()) {
+            // Measured after the load: what is on the card + one session + margin must fit the budget (the shared plan).
+            std::size_t free = 0, total = 0;
+            if (cudaMemGetInfo(&free, &total) != cudaSuccess) throw std::runtime_error("cudaMemGetInfo failed");
+            strix::deploy::RouteNeeds needs;
+            needs.route = "qwen-serve";
+            needs.session_fixed = engine.session_bytes();
+            // weights + context, as measured (session 0 is already allocated and is counted as a slot below)
+            needs.weights_resident = total - free > needs.session_fixed ? total - free - needs.session_fixed : 0;
+            needs.slots = o.http_slots;
+            needs.margin_bytes = std::uint64_t{o.slot_margin_mib} << 20U;
+            auto view = budget;
+            view.physical_device_bytes = total;
+            const auto plan = strix::deploy::plan_memory(view, needs);
+            std::cerr << "strix-cuda-qwen-serve: memory plan " << plan.json() << std::endl;
+            if (plan.refused) {
+                std::cerr << "strix-cuda-qwen-serve: refusing to start: " << plan.refusal << std::endl;
+                return 2;
+            }
+        }
         const auto tokenizer = serve::BpeTokenizer::load_gguf(o.engine.model_gguf);
         serve::ApiConfig config;
         config.model_id = o.model_id;
