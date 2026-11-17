@@ -57,25 +57,43 @@ template <unsigned Waves> struct Cols {
     }
     // 64 weights of the stager's column = four 8-byte rows of four K16 tiles (one K64 scale group); columns past count
     // read the last one (never stored). unit % 4 == 0 (the core stages four k units at a time from 0).
-    __device__ __forceinline__ void stage(unsigned tile, unsigned col, unsigned unit, U4* nb) const {
+    // Split for the core's schedule (f16_dense_tall.hpp ColsStageSplit): stage_load issues the loads, stage_decode does
+    // the arithmetic; stage() is their composition (same bits wherever the decode runs).
+    struct Raw {
+        std::uint32_t w[8];
+        std::uint32_t s;
+    };
+    __device__ __forceinline__ Raw stage_load(unsigned tile, unsigned col, unsigned unit) const {
         const unsigned o0 = 16U * (v.tile0 + tile) + col, o = o0 < v.count ? o0 : v.count - 1U;
         const std::size_t col_bytes = (std::size_t(o / 16U) * 16U + o % 16U) * 8U, kt_bytes = std::size_t(v.n) * 8U;
-        std::uint32_t w[8];
+        Raw r;
 #pragma unroll
         for (unsigned j = 0; j < 4U; ++j) {
             const auto t = *(detail::GlobalU2*)(v.weight + std::size_t(unit + j) * kt_bytes + col_bytes);
-            w[2U * j] = t[0], w[2U * j + 1U] = t[1];
+            r.w[2U * j] = t[0], r.w[2U * j + 1U] = t[1];
         }
-        const std::uint32_t s = v.scale[std::size_t(o) * (v.in / 64U) + unit / 4U];
-        const detail::Half2 scale2 = __builtin_bit_cast(detail::Half2, s | (s << 16U));
+        r.s = v.scale[std::size_t(o) * (v.in / 64U) + unit / 4U];
+        return r;
+    }
+    __device__ __forceinline__ void stage_decode(const Raw& raw, U4* nb) const {
+        // The empty asm keeps every decode instruction here (measured: the compiler otherwise hoists the XOR and the
+        // scale pack next to the loads, and the stager waits for DRAM before the stage's WMMAs).
+        Raw r = raw;
+#pragma unroll
+        for (unsigned q = 0; q < 8U; ++q) asm volatile("" : "+v"(r.w[q]));
+        asm volatile("" : "+v"(r.s));
+        const detail::Half2 scale2 = __builtin_bit_cast(detail::Half2, r.s | (r.s << 16U));
 #pragma unroll
         for (unsigned q = 0; q < 8U; ++q) {  // nb[q] = k 8q .. 8q + 7 of the group = word q (8 nibbles)
-            const std::uint32_t b = w[q] ^ 0x88888888U;
+            const std::uint32_t b = r.w[q] ^ 0x88888888U;
             U4 h;
 #pragma unroll
             for (unsigned p = 0; p < 4U; ++p) h[p] = detail::w16_pair(b, p, scale2);
             nb[q] = h;
         }
+    }
+    __device__ __forceinline__ void stage(unsigned tile, unsigned col, unsigned unit, U4* nb) const {
+        stage_decode(stage_load(tile, col, unit), nb);
     }
 };
 

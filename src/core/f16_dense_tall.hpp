@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <memory>
 #include <type_traits>
+#include <utility>
 
 namespace strix::core::f16_dense_tall {
 // Optional ownership for matrix weights / row flags. Constructor unwinding must
@@ -73,16 +74,45 @@ template <class T> __device__ __forceinline__ T* uniform(T* p) {  // wave-unifor
     const auto lo = uni(static_cast<std::uint32_t>(v)), hi = uni(static_cast<std::uint32_t>(v >> 32U));
     return reinterpret_cast<T*>((static_cast<std::uintptr_t>(hi) << 32U) | lo);
 }
-__device__ __forceinline__ Half16 row_fragment(const unsigned char* x, std::uint32_t offset) {
-    asm("" : "+v"(offset));
+// The lane's 16 FP32 x values of one A fragment (loads only) and their FP16 form (the core's RNE cast). Split so the
+// core can issue the loads one k unit ahead and convert after the WMMAs in between.
+struct RowRaw {
     Float4 f[4];
+};
+__device__ __forceinline__ RowRaw row_raw(const unsigned char* x, std::uint32_t offset) {
+    asm("" : "+v"(offset));
+    RowRaw r;
 #pragma unroll
-    for (unsigned i = 0; i < 4U; ++i) f[i] = *(GlobalF4*)(x + offset + 16U * i);
+    for (unsigned i = 0; i < 4U; ++i) r.f[i] = *(GlobalF4*)(x + offset + 16U * i);
+    return r;
+}
+__device__ __forceinline__ Half16 row_half(const RowRaw& r) {
     Half16 h;
 #pragma unroll
-    for (unsigned i = 0; i < 16U; ++i) h[i] = static_cast<_Float16>(f[i / 4U][i % 4U]);
+    for (unsigned i = 0; i < 16U; ++i) h[i] = static_cast<_Float16>(r.f[i / 4U][i % 4U]);
     return h;
 }
+__device__ __forceinline__ Half16 row_fragment(const unsigned char* x, std::uint32_t offset) { return row_half(row_raw(x, offset)); }
+// Scheduling fence: no instruction moves across it (no code is emitted). The core uses it to keep loads ahead of the
+// WMMAs that hide their latency; it changes no operand and no order of arithmetic.
+__device__ __forceinline__ void sched_fence() { __builtin_amdgcn_sched_barrier(0); }
+// B-fragment ring of the core (ahead + 1 slots): slot t % (ahead + 1) must hold fragment t when WMMA t reads it, and
+// no later load may overwrite it before. Replays the core's load/read order (compile-time check per width).
+constexpr bool b_ring_ok(unsigned tc, unsigned ahead) {
+    int slot[17] = {};
+    for (unsigned i = 0; i <= ahead && i < 17U; ++i) slot[i] = -1;
+    for (unsigned t = 0; t < ahead; ++t) slot[t % (ahead + 1U)] = static_cast<int>(t);
+    for (unsigned t = 0; t < tc; ++t) {
+        if (t + ahead < tc) {
+            const unsigned w = (t + ahead) % (ahead + 1U);
+            if (slot[w] >= static_cast<int>(t)) return false;  // would overwrite a fragment not yet read (or this one)
+            slot[w] = static_cast<int>(t + ahead);
+        }
+        if (slot[t % (ahead + 1U)] != static_cast<int>(t)) return false;
+    }
+    return true;
+}
+static_assert(b_ring_ok(1, 1) && b_ring_ok(2, 2) && b_ring_ok(4, 2) && b_ring_ok(16, 2) && b_ring_ok(16, 3));
 __device__ __forceinline__ Half16 staged_fragment(const std::uint32_t* p) {
     struct { U4 l, h; } v{*reinterpret_cast<const U4*>(p), *reinterpret_cast<const U4*>(p + 4)};
     return __builtin_bit_cast(Half16, v);
@@ -102,6 +132,12 @@ __device__ __forceinline__ Half16 staged_fragment(const std::uint32_t* p) {
 //     (measured on the MiniMax index projection, 6 column blocks, 4096 rows: x re-streamed per block at rows-fast).
 template <class C> concept ColsStage = requires(const C& c, U4* nb) { c.stage(0U, 0U, 0U, nb); };
 template <class C> concept ColsFragment = requires(const C& c) { { c.fragment(0U, 0U) } -> std::same_as<Half16>; };
+//   stage_load(tile, col, unit) -> raw, stage_decode(raw, nb) (optional, both or neither): stage() split in its
+//     global loads and its arithmetic. The core issues the loads after the stage's second barrier and decodes after
+//     the stage's WMMAs, so the load latency hides behind them (stage() must equal stage_decode(stage_load())).
+template <class C> concept ColsStageSplit = requires(const C& c, U4* nb) { c.stage_decode(c.stage_load(0U, 0U, 0U), nb); };
+template <class C> struct StageRaw { using type = int; };
+template <ColsStageSplit C> struct StageRaw<C> { using type = decltype(std::declval<const C&>().stage_load(0U, 0U, 0U)); };
 template <class C> inline constexpr unsigned kCtaWaves = 8U;
 template <class C> requires requires { C::kWaves; } inline constexpr unsigned kCtaWaves<C> = C::kWaves;
 template <class C> inline constexpr bool kColumnFast = false;
@@ -166,9 +202,16 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
     const auto* xb = reinterpret_cast<const unsigned char*>(detail::uniform(x));
     // Rows past nr read row 0 (their sums are never stored).
     const std::uint32_t xr = row0 + c < nr ? row0 + c : 0U, xo = xr * in * 4U;
-    const auto frag = [&](unsigned unit) __attribute__((always_inline)) {
+    // A fragment in two steps: frag_load issues the loads (the policy's fragment, or the 16 FP32 x values), frag_half
+    // gives the WMMA operand (identity, or the core's RNE cast). The loads of unit u + 1 are issued before the WMMAs of
+    // unit u and converted after them.
+    const auto frag_load = [&](unsigned unit) __attribute__((always_inline)) {
         if constexpr (ColsFragment<Cols>) return cols.fragment(xr, unit);
-        else return detail::row_fragment(xb, xo + unit * 64U);
+        else return detail::row_raw(xb, xo + unit * 64U);
+    };
+    const auto frag_half = [](const auto& raw) __attribute__((always_inline)) {
+        if constexpr (ColsFragment<Cols>) return raw;
+        else return detail::row_half(raw);
     };
     // Stager role: thread tid owns column tid of the CTA's column block.
     const bool stager = tid < 16U * TC;
@@ -187,32 +230,57 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
     // A wave with no live row keeps its staging and barrier duties and skips its row loads and WMMAs.
     const bool idle = detail::uni(skip_dead_waves && row0 >= nr ? 1U : 0U) != 0U;
     Float8 acc[TC] = {};
-    Half16 an = frag(0U);
-    if (stager) fetch(0U);
+    auto ar = frag_load(0U);
+    if (stager) {
+        if constexpr (ColsStageSplit<Cols>) cols.stage_decode(cols.stage_load(stile, tid & 15U, 0U), nb);
+        else fetch(0U);
+    }
+    // Schedule (no operand or order of arithmetic changes; measured, wave4 hip_dense2): every load is issued ahead of
+    // the WMMAs that hide its latency and waited for after them. The fences keep the compiler from sinking the waits
+    // back next to the loads (it did: each B fragment, each A fragment and the stagers' weights were waited for
+    // immediately, 52 % of the wave time in waits). B fragments run two WMMAs ahead.
+    constexpr unsigned kAhead = TC < 2U ? TC : 2U;
     for (unsigned base = 0; base < units; base += 8U) {
 #pragma unroll
         for (unsigned s = 0; s < 2U; ++s) {
             const unsigned u0 = base + 4U * s;
+            const bool more = s == 0U || u0 + 4U < units;
             __syncthreads();  // every wave finished reading the previous stage
             if (stager) {
 #pragma unroll
                 for (unsigned i = 0; i < 8U; ++i) *reinterpret_cast<U4*>(&lds.w[tid][4U * i]) = nb[i];
             }
             __syncthreads();
-            if (stager && (s == 0U || u0 + 4U < units)) fetch(u0 + 4U);
+            [[maybe_unused]] typename StageRaw<Cols>::type sraw{};
+            if (stager && more) {
+                if constexpr (ColsStageSplit<Cols>) sraw = cols.stage_load(stile, tid & 15U, u0 + 4U);
+                else fetch(u0 + 4U);
+            }
             asm volatile("" ::: "memory");  // the requests stay ahead of this stage's WMMAs
-            if (idle) continue;
+            detail::sched_fence();
+            if (!idle) {
 #pragma unroll
-            for (unsigned kk = 0; kk < 4U; ++kk) {
-                const Half16 a = an;
-                if (kk + 1U < 4U || s == 0U || u0 + 4U < units) an = frag(u0 + kk + 1U);
+                for (unsigned kk = 0; kk < 4U; ++kk) {
+                    const Half16 a = frag_half(ar);
+                    if (kk + 1U < 4U || more) ar = frag_load(u0 + kk + 1U);
+                    detail::sched_fence();
+                    Half16 b[kAhead + 1U];
 #pragma unroll
-                for (unsigned t = 0; t < TC; ++t) {
-                    acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, detail::staged_fragment(&lds.w[16U * t + c][kk * 8U]), acc[t]);
+                    for (unsigned t = 0; t < kAhead; ++t) b[t] = detail::staged_fragment(&lds.w[16U * t + c][kk * 8U]);
+                    detail::sched_fence();
+#pragma unroll
+                    for (unsigned t = 0; t < TC; ++t) {
+                        if (t + kAhead < TC) b[(t + kAhead) % (kAhead + 1U)] = detail::staged_fragment(&lds.w[16U * (t + kAhead) + c][kk * 8U]);
+                        acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b[t % (kAhead + 1U)], acc[t]);
 #if defined(STRIX_WFMT_CAPTURE) && STRIX_WFMT_CAPTURE
-                    if constexpr (requires { cols.capture_partial(acc[t]); }) cols.capture_partial(acc[t]);
+                        if constexpr (requires { cols.capture_partial(acc[t]); }) cols.capture_partial(acc[t]);
 #endif
+                        detail::sched_fence();
+                    }
                 }
+            }
+            if constexpr (ColsStageSplit<Cols>) {
+                if (stager && more) cols.stage_decode(sraw, nb);
             }
         }
     }
