@@ -32,6 +32,7 @@
 #include "strix/lever.hpp"
 #include "strix/cuda/core/decode_rows.hpp"
 #include "strix/cuda/qwen_hc.hpp"
+#include "strix/cuda/qwen_hc_exact_shape.hpp"
 #include "strix/cuda/amd_math.cuh"
 #include "../../core/mma_tile.cuh"
 
@@ -61,6 +62,15 @@ inline constexpr strix::lever::Decl hc_compact_norm_lever{
     .default_on = true, .source = "scripts/bench/cuda/qwen_fast/ident.sh: exact and FAST logit dumps byte-identical on/off"};
 bool hc_compact_norm_enabled() {
     static const bool on = strix::lever::select(hc_compact_norm_lever, {}).on;
+    return on;
+}
+// STRIX_QRTX_HC_EXACT_FULL=0: exact automatic calls above the rows-form cap use the compact layout again (the admission before
+// this lever). Bitwise: layout only (hc_compact_workspace in qwen_hc.hpp).
+inline constexpr strix::lever::Decl hc_exact_full_lever{
+    .name = "qwen_hc_exact_full_workspace", .env = "STRIX_QRTX_HC_EXACT_FULL", .exactness = strix::lever::Exactness::bitwise,
+    .default_on = true, .source = "wave4 rtx_integ t1b hc fixture, sm_120 8076 rows: full mix 4.045 ms vs compact 4.227, hashes equal"};
+bool hc_exact_full_enabled() {
+    static const bool on = strix::lever::select(hc_exact_full_lever, {}).on;
     return on;
 }
 // STRIX_QRTX_HC_INJECT_VEC=0: the scalar inject kernel (one element per thread). Bitwise.
@@ -194,8 +204,11 @@ __global__ __launch_bounds__(256) void hc_norm_kernel(const std::uint16_t* __res
 // (16 rows x 8 outputs) per lane. The butterfly is a transpose-reduce: at each level a lane keeps the half of its
 // items selected by its lane bit and receives its partner's value of the same items, so after 5 levels lane L holds
 // 4 finished (row, output) pairs: row q = 8 b4 + 4 b3 + 2 b2 + b1, outputs 4 b0 + i (b = bits of L).
-constexpr unsigned kProjRows = 16U, kProjOutputs = 8U, kProjWarps = 8U, kProjItems = kProjRows * kProjOutputs;
-constexpr unsigned kProjLowBlocks = kRank / (kProjWarps * kProjOutputs);  // 5
+namespace hcs = exact_shape;
+constexpr unsigned kProjRows = hcs::kProjRows, kProjOutputs = hcs::kProjOutputs, kProjWarps = hcs::kProjWarps, kProjItems = hcs::kProjItems;
+constexpr unsigned kProjLowBlocks = hcs::kProjLowBlocks;  // 5
+constexpr unsigned kProjInjRows = hcs::kProjInjRows, kProjInjItems = hcs::kProjInjItems;  // 2 rows x 4 outputs per warp
+static_assert(hcs::kStreams == kStreams && hcs::kHidden == kHidden && hcs::kWide == kWide && hcs::kRank == kRank, "shape header");
 
 // One butterfly level at distance 16 >> Level: items [0, half) keep the lane's half and add the partner's same items.
 template <unsigned Level> __device__ __forceinline__ void fold_level(float (&acc)[kProjItems], unsigned lane) {
@@ -217,9 +230,11 @@ __global__ __launch_bounds__(256, 1) void hc_projection_kernel(const float* x_ro
     const float* __restrict__ xnorm = nullptr) {
     __shared__ float4 xs[2][kProjRows][32];
     const unsigned warp = threadIdx.x / 32U, lane = threadIdx.x % 32U, row0 = blockIdx.y * kProjRows;
+    // Injection block: every warp works, warp w owns rows 2w, 2w + 1 of the block x the 4 injection outputs (8 chains per lane);
+    // the same leaves, the same xor tree and the same tile sum as one warp running all 16 rows with 4 zero outputs did.
     const bool is_inject = blockIdx.x >= kProjLowBlocks;
     const unsigned first = is_inject ? 0U : (blockIdx.x * kProjWarps + warp) * kProjOutputs;
-    const unsigned total_outputs = is_inject ? (warp == 0U ? kStreams : 0U) : kRank;
+    const unsigned total_outputs = is_inject ? kStreams : kRank;
     const bool active = first < total_outputs;
 
     const auto stage = [&](unsigned chunk, unsigned buffer) {
@@ -241,11 +256,13 @@ __global__ __launch_bounds__(256, 1) void hc_projection_kernel(const float* x_ro
         }
     };
 
-    float acc[kProjItems], total[4];
+    float acc[kProjItems], total[4], inj_total[kProjInjItems];
 #pragma unroll
     for (unsigned i = 0; i < kProjItems; ++i) acc[i] = 0.0F;
 #pragma unroll
     for (unsigned i = 0; i < 4U; ++i) total[i] = 0.0F;
+#pragma unroll
+    for (unsigned i = 0; i < kProjInjItems; ++i) inj_total[i] = 0.0F;
     // Weights of the next chunk are loaded one chunk ahead (as HIP's load_weights, :2975): raw[] holds, for the Q8
     // blocks, the 8 code words then the 8 scales (bits); for the injection block, the 4 x 4 FP32 weights.
     std::uint32_t raw[16];
@@ -286,6 +303,29 @@ __global__ __launch_bounds__(256, 1) void hc_projection_kernel(const float* x_ro
                         __fmul_rn(__uint_as_float(raw[8U + p]), static_cast<float>(static_cast<signed char>((raw[p] >> (8U * j)) & 255U)));
             if (chunk + 1U < 80U) load_raw(chunk + 1U);
             const float4 (*x)[32] = xs[chunk & 1U];
+            if (is_inject) {
+#pragma unroll
+                for (unsigned rr = 0; rr < kProjInjRows; ++rr) {
+                    const float4 v = x[kProjInjRows * warp + rr][lane];
+                    const float in[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+                    for (unsigned j = 0; j < 4U; ++j)
+#pragma unroll
+                        for (unsigned p = 0; p < kStreams; ++p)
+                            acc[rr * kStreams + p] = __fmaf_rn(in[j], c[p][j], acc[rr * kStreams + p]);
+                }
+                if (chunk % 5U == 4U) {
+                    // Tile fold: xor butterfly, distances 16, 8, 4, 2, 1 -- per item the same pairs as the transpose-reduce form.
+#pragma unroll
+                    for (unsigned i = 0; i < kProjInjItems; ++i) {
+                        float v = acc[i];
+#pragma unroll
+                        for (unsigned d = 16U; d > 0U; d >>= 1U) v = __fadd_rn(v, __shfl_xor_sync(0xffffffffU, v, d));
+                        inj_total[i] = __fadd_rn(inj_total[i], v);
+                        acc[i] = 0.0F;
+                    }
+                }
+            } else {
 #pragma unroll
             for (unsigned r = 0; r < kProjRows; ++r) {
                 const float4 v = x[r][lane];
@@ -304,6 +344,7 @@ __global__ __launch_bounds__(256, 1) void hc_projection_kernel(const float* x_ro
 #pragma unroll
                 for (unsigned i = 0; i < kProjItems; ++i) acc[i] = 0.0F;
             }
+            }
         }
         if (chunk + 1U < 80U) {  // buffer (chunk + 1) & 1 was last read in chunk - 1, before the barrier below
 #pragma unroll
@@ -315,6 +356,16 @@ __global__ __launch_bounds__(256, 1) void hc_projection_kernel(const float* x_ro
         __syncthreads();
     }
     if (!active) return;
+    if (is_inject) {  // lane i < 8 finishes item i = (row 2w + i / 4, output i % 4); every lane holds all 8 folded totals
+        float v = inj_total[0];
+#pragma unroll
+        for (unsigned i = 1; i < kProjInjItems; ++i) v = lane == i ? inj_total[i] : v;
+        const unsigned row = row0 + kProjInjRows * warp + lane / kStreams;
+        if (lane >= kProjInjItems || row >= rows) return;
+        const float sig = amd_sigmoid(t, __fdiv_rn(v, static_cast<float>(kStreams)));
+        injection[static_cast<std::size_t>(row) * kStreams + lane % kStreams] = __fadd_rn(sig, sig);
+        return;
+    }
     const unsigned b = lane;
     const unsigned r = 8U * ((b >> 4U) & 1U) + 4U * ((b >> 3U) & 1U) + 2U * ((b >> 2U) & 1U) + ((b >> 1U) & 1U);
     const unsigned out_base = first + 4U * (b & 1U);
@@ -338,17 +389,31 @@ __global__ __launch_bounds__(256, 1) void hc_projection_kernel(const float* x_ro
 // are the same FP32 lows, so this kernel has no 8192-row pitch limit: above 8192 rows HIP switches to
 // wide_lane_chain_hyper_output_kernel<u16,32> (:3075-3180), whose ISA (hip_hyper_mix_launcher.s:355815) also
 // contracts `gate += low * c` to v_fmac_f32 and the mix to v_fma(.., 0)/v_fmac: the same DAG, so no change).
-constexpr unsigned kOutRows = 32U, kOutThreads = 128U;
+constexpr unsigned kOutRows = hcs::kOutRows, kOutThreads = hcs::kOutThreads;
+// Staging pitch 36 (16-B aligned float4 reads, 4-way staging writes) and the rolled fused epilogue (halves of 16 rows in thread-private
+// float4 slots of the idle lows buffer, 2 rows per iteration, one copy of the sigmoid code instead of 128 inline copies = 1.24 MB of
+// SASS that every CTA re-fetched): see include/strix/cuda/qwen_hc_exact_shape.hpp. Layout and loop shape only: same values.
+constexpr unsigned kOutLowPitch = hcs::kOutLowPitch, kOutHalfRows = hcs::kOutHalfRows, kOutMixRows = hcs::kOutMixRows;
 
 template <bool Fused, bool Compact = false>
 __global__ __launch_bounds__(128) void hc_output_kernel(const float* __restrict__ normalized, std::uint32_t rows,
     const std::uint32_t* __restrict__ up_codes, const float* __restrict__ up_scales, std::uint16_t* __restrict__ output,
     float* __restrict__ gates, am::Tables t, const std::uint16_t* __restrict__ xin = nullptr, const float* __restrict__ xnorm = nullptr) {
-    __shared__ __align__(16) float lows[kRank][kOutRows];
+    __shared__ __align__(16) float lows[kRank][kOutLowPitch];
     const unsigned row0 = blockIdx.x * kOutRows, f = blockIdx.y * kOutThreads + threadIdx.x;
-    for (unsigned idx = threadIdx.x; idx < kRank * kOutRows; idx += kOutThreads) {
-        const unsigned r = idx / kRank, k = idx % kRank;
-        lows[k][r] = row0 + r < rows ? normalized[static_cast<std::size_t>(row0 + r) * kNormalizedPitch + kWide + k] : 0.0F;
+    {   // all staging loads in flight before the first store (the chains are not live yet, so the 80 registers are free)
+        constexpr unsigned kPer = hcs::kOutStagePerThread;  // 80
+        float staged[kPer];
+#pragma unroll
+        for (unsigned i = 0; i < kPer; ++i) {
+            const unsigned idx = threadIdx.x + kOutThreads * i, r = idx / kRank, k = idx % kRank;
+            staged[i] = row0 + r < rows ? normalized[static_cast<std::size_t>(row0 + r) * kNormalizedPitch + kWide + k] : 0.0F;
+        }
+#pragma unroll
+        for (unsigned i = 0; i < kPer; ++i) {
+            const unsigned idx = threadIdx.x + kOutThreads * i;
+            lows[idx % kRank][idx / kRank] = staged[i];
+        }
     }
     __syncthreads();
     float g[kStreams][kOutRows];
@@ -402,21 +467,49 @@ __global__ __launch_bounds__(128) void hc_output_kernel(const float* __restrict_
         }
         return;
     }
+    // Per (row, f): mixed = fma(n3, sig3, fma(n2, sig2, fma(n1, sig1, fma(n0, sig0, 0)))), bf16(mixed * 0.25) -- unchanged; only the
+    // place where g waits (thread-private shared slots) and the loop shape (rolled, kOutMixRows rows per iteration) differ.
+    __syncthreads();  // every warp has finished reading lows; from here each thread touches only its own slots
+    float4* slots = reinterpret_cast<float4*>(&lows[0][0]);
+    float wn[kStreams];
+    if constexpr (Compact) {
 #pragma unroll
-    for (unsigned r = 0; r < kOutRows; ++r) {
-        if (row0 + r >= rows) break;
-        const float* n = normalized + static_cast<std::size_t>(row0 + r) * kNormalizedPitch + f;
-        float mixed = 0.0F;
+        for (unsigned s = 0; s < kStreams; ++s) wn[s] = xnorm[s * kHidden + f];
+    }
+#pragma unroll 1
+    for (unsigned h = 0; h < 2U; ++h) {
+        if (row0 + kOutHalfRows * h >= rows) break;
 #pragma unroll
-        for (unsigned s = 0; s < kStreams; ++s) {
-            float nv;
-            if constexpr (Compact)   // bit-identical rebuild (norm_value); the inverse sits at normalized[row][s]
-                nv = norm_value(xin[static_cast<std::size_t>(row0 + r) * kWide + s * kHidden + f],
-                                normalized[static_cast<std::size_t>(row0 + r) * kNormalizedPitch + s], xnorm[s * kHidden + f]);
-            else nv = n[s * kHidden];
-            mixed = __fmaf_rn(nv, amd_sigmoid(t, g[s][r]), mixed);
+        for (unsigned r = 0; r < kOutHalfRows; ++r)
+            slots[r * kOutThreads + threadIdx.x] = h == 0U ? make_float4(g[0][r], g[1][r], g[2][r], g[3][r])
+                : make_float4(g[0][kOutHalfRows + r], g[1][kOutHalfRows + r], g[2][kOutHalfRows + r], g[3][kOutHalfRows + r]);
+#pragma unroll 1
+        for (unsigned r0 = 0; r0 < kOutHalfRows; r0 += kOutMixRows) {
+            float n[kOutMixRows][kStreams], sig[kOutMixRows][kStreams];
+#pragma unroll
+            for (unsigned i = 0; i < kOutMixRows; ++i) {
+                const unsigned row = row0 + kOutHalfRows * h + r0 + i;
+                const float4 gv = slots[(r0 + i) * kOutThreads + threadIdx.x];
+                const float gs[kStreams] = {gv.x, gv.y, gv.z, gv.w};
+#pragma unroll
+                for (unsigned s = 0; s < kStreams; ++s) {
+                    sig[i][s] = amd_sigmoid(t, gs[s]);
+                    if (row >= rows) n[i][s] = 0.0F;
+                    else if constexpr (Compact)   // bit-identical rebuild (norm_value); the inverse sits at normalized[row][s]
+                        n[i][s] = norm_value(xin[static_cast<std::size_t>(row) * kWide + s * kHidden + f],
+                                             normalized[static_cast<std::size_t>(row) * kNormalizedPitch + s], wn[s]);
+                    else n[i][s] = normalized[static_cast<std::size_t>(row) * kNormalizedPitch + s * kHidden + f];
+                }
+            }
+#pragma unroll
+            for (unsigned i = 0; i < kOutMixRows; ++i) {
+                const unsigned row = row0 + kOutHalfRows * h + r0 + i;
+                float mixed = 0.0F;
+#pragma unroll
+                for (unsigned s = 0; s < kStreams; ++s) mixed = __fmaf_rn(n[i][s], sig[i][s], mixed);
+                if (row < rows) output[static_cast<std::size_t>(row) * kHidden + f] = float_to_bf16(__fmul_rn(mixed, 0.25F));
+            }
         }
-        output[static_cast<std::size_t>(row0 + r) * kHidden + f] = float_to_bf16(__fmul_rn(mixed, 0.25F));
     }
 }
 
@@ -1595,7 +1688,10 @@ template <unsigned R> void route_rows_r(const std::uint16_t* hidden, const float
 void hc_mix(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream, unsigned stages) {
     if (!a.rows) return;
     if (a.rows > 65535U * kProjRows) throw std::invalid_argument("qwen_hc mix: too many rows");
-    const bool compact = hc_compact_workspace(a, stages, hc_compact_norm_enabled(), decode_rows_enabled());
+    // rows_cap = the rows_form bound below: an exact automatic call that the rows forms can take is never made compact.
+    const unsigned rows_cap = hc_rows_split_enabled() ? core::decode_rows_max() : 8U;
+    const bool compact = hc_compact_workspace(a, stages, hc_compact_norm_enabled(), decode_rows_enabled(), rows_cap,
+        hc_exact_full_enabled());
     if ((stages & 1U) && compact) hc_norm_kernel<true><<<dim3(a.rows, kStreams), 256U, 0, stream>>>(a.input, a.norm, a.epsilon, a.normalized, tables);
     else if (stages & 1U) hc_norm_kernel<<<dim3(a.rows, kStreams), 256U, 0, stream>>>(a.input, a.norm, a.epsilon, a.normalized, tables);
     check(cudaGetLastError(), "norm launch");

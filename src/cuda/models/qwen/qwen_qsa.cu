@@ -3,6 +3,7 @@
 // the gfx1151 disassembly of hip_indexed_attention_launcher (S: line numbers).
 // Every FP operation is an explicit IEEE intrinsic (__fadd_rn, __fmul_rn, __fmaf_rn, __fdiv_rn) in the HIP order.
 #include "../../core/attention_tile.cuh"
+#include "qsa_fused_order.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/cuda/core/decode_rows.hpp"
 #include "strix/lever.hpp"
@@ -616,6 +617,30 @@ template <unsigned P, unsigned Step = 1U> __device__ __forceinline__ void scatte
         scatter16<P, Step + 1U>(v, lane);
     }
 }
+// One slot of the half-warp form, shared by score_half and the fused kernel: the 6 heads' products and the 256-feature
+// tree (strides 128..16 in-lane, 8..1 by scatter16). Every lane of the warp must call it (shuffles). Lane l returns the
+// sum of head score6_head(l) of its half-warp's slot (meaningful on even l).
+__device__ __forceinline__ float score6_slot(const float (&qv)[kHalfHeads][16], const float (&kf)[16], unsigned lane) {
+    float partial[8];
+#pragma unroll
+    for (unsigned h = 0; h < 8U; ++h) {
+        if (h >= kHalfHeads) { partial[h] = 0.0F; continue; }
+        float p[16];
+#pragma unroll
+        for (unsigned j = 0; j < 16U; ++j) p[j] = __fmul_rn(qv[h][j], kf[j]);
+#pragma unroll
+        for (unsigned j = 0; j < 8U; ++j) p[j] = __fadd_rn(p[j], p[j + 8U]);
+#pragma unroll
+        for (unsigned j = 0; j < 4U; ++j) p[j] = __fadd_rn(p[j], p[j + 4U]);
+        p[0] = __fadd_rn(p[0], p[2]); p[1] = __fadd_rn(p[1], p[3]);
+        partial[h] = __fadd_rn(p[0], p[1]);
+    }
+    scatter16<8>(partial, lane);
+    return partial[0];
+}
+__device__ __forceinline__ unsigned score6_head(unsigned l) {
+    return ((l & 8U) ? 4U : 0U) + ((l & 4U) ? 2U : 0U) + ((l & 2U) ? 1U : 0U);
+}
 __device__ __forceinline__ void attention_score_half_kernel_body(const float* __restrict__ q_gate, std::uint64_t first_position,
     const std::uint32_t* __restrict__ all_selected, const std::uint16_t* __restrict__ kv, float* __restrict__ all_scores) {
     const unsigned lane = threadIdx.x & 31U, warp = threadIdx.x >> 5U, l = lane & 15U, half = lane >> 4U;
@@ -654,25 +679,11 @@ __device__ __forceinline__ void attention_score_half_kernel_body(const float* __
 #pragma unroll
         for (unsigned j = 0; j < 16U; ++j) kf[j] = bf16f(raw[j]);
         if (i + 1U < kRun / 4U) load(i + 1U);
-        float partial[8];
-#pragma unroll
-        for (unsigned h = 0; h < 8U; ++h) {
-            if (h >= kHalfHeads) { partial[h] = 0.0F; continue; }
-            float p[16];
-#pragma unroll
-            for (unsigned j = 0; j < 16U; ++j) p[j] = __fmul_rn(qv[h][j], kf[j]);
-#pragma unroll
-            for (unsigned j = 0; j < 8U; ++j) p[j] = __fadd_rn(p[j], p[j + 8U]);
-#pragma unroll
-            for (unsigned j = 0; j < 4U; ++j) p[j] = __fadd_rn(p[j], p[j + 4U]);
-            p[0] = __fadd_rn(p[0], p[2]); p[1] = __fadd_rn(p[1], p[3]);
-            partial[h] = __fadd_rn(p[0], p[1]);
-        }
-        scatter16<8>(partial, lane);
-        const unsigned h = ((l & 8U) ? 4U : 0U) + ((l & 4U) ? 2U : 0U) + ((l & 2U) ? 1U : 0U);
+        const float partial = score6_slot(qv, kf, lane);
+        const unsigned h = score6_head(l);
         const auto slot = slot_of(i);
         if (h < kHalfHeads && (l & 1U) == 0U && slot < count)
-            scores[static_cast<std::uint64_t>(head0 + h) * kMaxSelected + slot] = __fdiv_rn(partial[0], scale);
+            scores[static_cast<std::uint64_t>(head0 + h) * kMaxSelected + slot] = __fdiv_rn(partial, scale);
     }
 }
 __global__ __launch_bounds__(128) void attention_score_half_kernel(const float* __restrict__ q_gate, std::uint64_t first_position,
@@ -727,6 +738,12 @@ __global__ __launch_bounds__(256) void softmax_kernel(float* __restrict__ all_sc
 // CUDA: block per (row, KV head), 128 threads x 2 features x 12 heads (24 chains per thread); the weights of a chunk of
 // slots are staged in shared memory as [slot][12] (3 x 16-byte broadcast loads per slot), tokens too.
 constexpr unsigned kOutThreads = 128, kOutChunk = 256;
+// The gated output value of one (head, feature) from its finished chain `sum` and the gate input g (shared epilogue).
+__device__ __forceinline__ float qsa_gated(float sum, float g, const am::Tables& tables) {
+    const float attn = round_bf16(sum);
+    const float gate = round_bf16(__fdiv_rn(1.0F, __fadd_rn(1.0F, am::amd_expf(tables, -g))));
+    return round_bf16(__fmul_rn(attn, gate));
+}
 __device__ __forceinline__ void attention_output_kernel_body(const float* __restrict__ q_gate,
     std::uint64_t first_position, const std::uint32_t* __restrict__ all_selected, const std::uint16_t* __restrict__ kv,
     const float* __restrict__ all_scores, float* __restrict__ output, am::Tables tables) {
@@ -785,10 +802,8 @@ __device__ __forceinline__ void attention_output_kernel_body(const float* __rest
 #pragma unroll
         for (unsigned e = 0; e < 2U; ++e) {
             const auto f = 2U * t + e;
-            const float attn = round_bf16(e ? s1[h] : s0[h]);
             const float g = qg[static_cast<std::uint64_t>(head) * kHeadDim * 2ULL + kHeadDim + f];
-            const float gate = round_bf16(__fdiv_rn(1.0F, __fadd_rn(1.0F, am::amd_expf(tables, -g))));
-            out[static_cast<std::uint64_t>(head) * kHeadDim + f] = round_bf16(__fmul_rn(attn, gate));
+            out[static_cast<std::uint64_t>(head) * kHeadDim + f] = qsa_gated(e ? s1[h] : s0[h], g, tables);
         }
     }
 }
@@ -942,6 +957,146 @@ bool head_pipe_enabled() {
 }
 bool idx_wide_enabled() {
     static const bool on = strix::envcfg::flag("STRIX_QRTX_QSA_IDX", true);
+    return on;
+}
+// ------------------------------------------------------------------------------------------------------------------
+// Exact fused form (STRIX_QRTX_QSA_FUSED): score_half + softmax + output of one (KV head, row) in one block, with the same
+// bits. The scores of a (row, KV head) are count x 12 FP32 <= 98,448 B and stay in dynamic shared memory ([slot][12]), so
+// the three-launch form's [rows][24][2051] round trip through DRAM (a 1,024-row chunk is 201 MB > L2) and its q reload
+// per 32-slot run disappear. 12 warps:
+//  1. scores: warp w = (6-head half w & 1, slot pair w >> 1); half-warp slot = 12 i + 2 (w >> 1) + half; q stays in
+//     registers for the whole row; per slot the arithmetic is score6_slot (shared with score_half), then / sqrt(256);
+//  2. softmax: warp w owns head w: max by fmaxf (order-free); e = amd_expf(s - max) in place; the denominator in the
+//     reference lane order (qsa_fused_order.hpp); weight = round_bf16(__fdiv_rn(e, den)) in place;
+//  3. output: thread = (4-head group t / 128, features 2 (t % 128), +1): chains fmaf(w, v, s) over slots ascending from 0
+//     (each (head, feature) chain equals attention_output_kernel's), V rows from a two-buffer register prefetch of 8
+//     slots, then the shared gate epilogue.
+constexpr unsigned kFusedWarps = 12, kFusedThreads = kFusedWarps * 32U, kFusedGroup = 4, kFusedStep = kFusedWarps, kFusedVB = 8;
+static_assert(kG == kFusedWarps && kG == 2U * kHalfHeads, "fused softmax: warp w owns head w of the KV head");
+static_assert(kFusedThreads == (kG / kFusedGroup) * (kHeadDim / 2U), "fused output: one (4-head group, feature pair) per thread");
+constexpr std::size_t fused_smem_bytes(std::uint32_t slots) { return std::size_t{slots} * kG * sizeof(float); }
+static_assert(fused_smem_bytes(kMaxSelected) <= 99U * 1024U, "qsa fused: one (row, KV head) of scores in shared memory");
+__device__ __forceinline__ void attention_fused_body(const float* __restrict__ q_gate, std::uint64_t first_position,
+    const std::uint32_t* __restrict__ all_selected, const std::uint16_t* __restrict__ kv, float* __restrict__ output,
+    const am::Tables& tables) {
+    extern __shared__ __align__(16) float sc[];   // [slot][12]: score, then e, then weight
+    const unsigned lane = threadIdx.x & 31U, warp = threadIdx.x >> 5U;
+    const auto kvh = blockIdx.x, r = blockIdx.y;
+    const auto count = selected_count(first_position + r);
+    const std::uint32_t* selected = all_selected + static_cast<std::uint64_t>(r) * kMaxSelected;
+    const float* qg = q_gate + static_cast<std::uint64_t>(r) * kQGateWidth;
+    {   // 1. scores
+        const unsigned l = lane & 15U, half = lane >> 4U, hh = warp & 1U, sp = warp >> 1U;
+        const auto head0 = kvh * kG + hh * kHalfHeads;
+        float qv[kHalfHeads][16];
+#pragma unroll
+        for (unsigned h = 0; h < kHalfHeads; ++h) {
+            const float* qp = qg + static_cast<std::uint64_t>(head0 + h) * kHeadDim * 2ULL + l;
+#pragma unroll
+            for (unsigned j = 0; j < 16U; ++j) qv[h][j] = qp[16U * j];
+        }
+        const float scale = __fsqrt_rn(static_cast<float>(kHeadDim));
+        const std::uint16_t* kbase = kv + static_cast<std::uint64_t>(kvh) * kHeadDim + l;
+        const auto slot_of = [&](unsigned i) { return kFusedStep * i + 2U * sp + half; };
+        std::uint16_t raw[16];
+        const auto load = [&](unsigned i) {
+            const auto slot = slot_of(i);
+            const auto token = slot < count ? selected[slot] : 0U;
+            const auto* row = kbase + static_cast<std::uint64_t>(token) * (kKvWidth * 2ULL);
+#pragma unroll
+            for (unsigned j = 0; j < 16U; ++j) raw[j] = row[16U * j];
+        };
+        const unsigned iters = (count + kFusedStep - 1U) / kFusedStep;   // block-uniform: every lane runs the shuffles
+        load(0U);
+#pragma unroll 1
+        for (unsigned i = 0; i < iters; ++i) {
+            float kf[16];
+#pragma unroll
+            for (unsigned j = 0; j < 16U; ++j) kf[j] = bf16f(raw[j]);
+            if (i + 1U < iters) load(i + 1U);
+            const float partial = score6_slot(qv, kf, lane);
+            const unsigned h = score6_head(l);
+            const auto slot = slot_of(i);
+            if (h < kHalfHeads && (l & 1U) == 0U && slot < count) sc[slot * kG + hh * kHalfHeads + h] = __fdiv_rn(partial, scale);
+        }
+    }
+    __syncthreads();
+    {   // 2. softmax of head `warp`
+        float* const col = sc + warp;
+        float maximum = (-kInf);
+        for (unsigned i = lane; i < count; i += 32U) maximum = fmaxf(maximum, col[i * kG]);
+#pragma unroll
+        for (unsigned d = 16U; d > 0U; d >>= 1U) maximum = fmaxf(maximum, __shfl_xor_sync(kFull, maximum, static_cast<int>(d)));
+        const auto add = [](float a, float b) { return __fadd_rn(a, b); };
+        const auto exp_store = [&](unsigned i) {
+            const float e = am::amd_expf(tables, __fsub_rn(col[i * kG], maximum));
+            col[i * kG] = e;
+            return e;
+        };
+        float den = fused_order::lane_partial(lane, count, add, exp_store);
+#pragma unroll
+        for (unsigned d = 16U; d > 0U; d >>= 1U) den = __fadd_rn(den, __shfl_down_sync(kFull, den, d));
+        den = __shfl_sync(kFull, den, 0);
+        __syncwarp();
+        for (unsigned i = lane; i < count; i += 32U) col[i * kG] = round_bf16(__fdiv_rn(col[i * kG], den));
+    }
+    __syncthreads();
+    {   // 3. weighted values + gate
+        const unsigned g = threadIdx.x >> 7U, tau = threadIdx.x & 127U, hq = g * kFusedGroup;
+        const std::uint16_t* vbase = kv + kKvWidth + kvh * kHeadDim + 2U * tau;
+        float s0[kFusedGroup], s1[kFusedGroup];
+#pragma unroll
+        for (unsigned h = 0; h < kFusedGroup; ++h) { s0[h] = 0.0F; s1[h] = 0.0F; }
+        const auto vrow = [&](unsigned slot) {
+            return *reinterpret_cast<const std::uint32_t*>(vbase + static_cast<std::uint64_t>(selected[slot]) * (kKvWidth * 2ULL));
+        };
+        const auto step = [&](std::uint32_t raw, unsigned slot) {
+            const float v0 = __uint_as_float(raw << 16U), v1 = __uint_as_float(raw & 0xffff0000U);
+            const float4 w = *reinterpret_cast<const float4*>(sc + slot * kG + hq);
+            const float wv[kFusedGroup] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+            for (unsigned h = 0; h < kFusedGroup; ++h) { s0[h] = __fmaf_rn(wv[h], v0, s0[h]); s1[h] = __fmaf_rn(wv[h], v1, s1[h]); }
+        };
+        const auto fill = [&](std::uint32_t (&buf)[kFusedVB], unsigned i0) {
+#pragma unroll
+            for (unsigned b = 0; b < kFusedVB; ++b) buf[b] = vrow(i0 + b);
+        };
+        const auto drain = [&](const std::uint32_t (&buf)[kFusedVB], unsigned i0) {
+#pragma unroll
+            for (unsigned b = 0; b < kFusedVB; ++b) step(buf[b], i0 + b);
+        };
+        const unsigned full = count / kFusedVB * kFusedVB;
+        std::uint32_t ra[kFusedVB], rb[kFusedVB];
+        if (full) fill(ra, 0U);
+#pragma unroll 1
+        for (unsigned i0 = 0; i0 < full; i0 += 2U * kFusedVB) {   // slots ascending: ra = [i0, i0+8), rb = [i0+8, i0+16)
+            if (i0 + kFusedVB < full) fill(rb, i0 + kFusedVB);
+            drain(ra, i0);
+            if (i0 + kFusedVB >= full) break;
+            if (i0 + 2U * kFusedVB < full) fill(ra, i0 + 2U * kFusedVB);
+            drain(rb, i0 + kFusedVB);
+        }
+        for (unsigned i = full; i < count; ++i) step(vrow(i), i);
+        float* out = output + static_cast<std::uint64_t>(r) * kAttnWidth;
+#pragma unroll
+        for (unsigned h = 0; h < kFusedGroup; ++h) {
+            const auto head = kvh * kG + hq + h;
+#pragma unroll
+            for (unsigned e = 0; e < 2U; ++e) {
+                const auto f = 2U * tau + e;
+                const float gin = qg[static_cast<std::uint64_t>(head) * kHeadDim * 2ULL + kHeadDim + f];
+                out[static_cast<std::uint64_t>(head) * kHeadDim + f] = qsa_gated(e ? s1[h] : s0[h], gin, tables);
+            }
+        }
+    }
+}
+__global__ __launch_bounds__(kFusedThreads, 1) void attention_fused_kernel(const float* __restrict__ q_gate,
+    std::uint64_t first_position, const std::uint32_t* __restrict__ all_selected, const std::uint16_t* __restrict__ kv,
+    float* __restrict__ output, am::Tables tables) {
+    attention_fused_body(q_gate, first_position, all_selected, kv, output, tables);
+}
+bool fused_enabled() {
+    static const bool on = strix::envcfg::flag("STRIX_QRTX_QSA_FUSED", false);
     return on;
 }
 
@@ -1156,6 +1311,13 @@ __global__ __launch_bounds__(kOutThreads) void attention_output_head_multi_pipe_
     const unsigned seg = seg_of(map, blockIdx.y);
     attention_output_head_pipe_body(q_gate, base_position(map, seg), all_selected, map.kv[seg], all_scores, output, tables);
 }
+template <class MapArg>
+__global__ __launch_bounds__(kFusedThreads, 1) void attention_fused_multi_kernel(const float* __restrict__ q_gate, MapArg mapa,
+    const std::uint32_t* __restrict__ all_selected, float* __restrict__ output, am::Tables tables) {
+    const SegmentMap& map = map_of(mapa);
+    const unsigned seg = seg_of(map, blockIdx.y);
+    attention_fused_body(q_gate, base_position(map, seg), all_selected, map.kv[seg], output, tables);
+}
 
 }  // namespace
 
@@ -1245,6 +1407,13 @@ void block_scores_form(ScoreForm form, const float* index_query, std::uint32_t r
     check(cudaGetLastError(), "block score launch");
 }
 
+// The largest selected count of rows [first_position, first_position + rows) (kMaxSelected at most).
+static std::uint32_t max_selected_count(std::uint64_t first_position, std::uint32_t rows) {
+    std::uint32_t slots = 0;
+    for (std::uint64_t p = first_position; p < first_position + rows && slots < kMaxSelected; ++p) slots = std::max(slots, selected_count(p));
+    return slots;
+}
+
 void select_rows(float* scores, std::uint32_t max_blocks, std::uint32_t rows, std::uint64_t first_position,
     std::uint32_t* selected, cudaStream_t stream) {
     if (!rows) return;
@@ -1255,8 +1424,7 @@ void select_rows(float* scores, std::uint32_t max_blocks, std::uint32_t rows, st
 void attention_scores(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
     const std::uint16_t* kv, float* scores, cudaStream_t stream) {
     if (!rows) return;
-    std::uint32_t slots = 0;
-    for (std::uint64_t p = first_position; p < first_position + rows && slots < kMaxSelected; ++p) slots = std::max(slots, selected_count(p));
+    const auto slots = max_selected_count(first_position, rows);
     static const bool wave = strix::envcfg::flag("STRIX_QSA_SCORE_WAVE", false);
     if (wave) {
         const auto waves = static_cast<std::uint64_t>(rows) * (kHeads / kG) * ((slots + kSlots - 1U) / kSlots);
@@ -1290,9 +1458,32 @@ void attention_values(const float* q_gate, std::uint32_t rows, std::uint64_t fir
 void attention(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
     const std::uint16_t* kv, float* scores, float* attention_output, const amdmath::Tables& tables, cudaStream_t stream, bool mma) {
     if (mma) { attention_mma(q_gate, rows, first_position, selected, kv, attention_output, stream); return; }
+    // the decode shape keeps the per-head output kernels (attention_values); the fused form serves the prefill shape
+    if (fused_enabled() && !(rows <= core::decode_rows_max() && decode_rows_enabled())) {
+        attention_fused(q_gate, rows, first_position, selected, kv, attention_output, tables, stream);
+        return;
+    }
     attention_scores(q_gate, rows, first_position, selected, kv, scores, stream);
     attention_softmax(rows, first_position, scores, tables, stream);
     attention_values(q_gate, rows, first_position, selected, kv, scores, attention_output, tables, stream);
+}
+namespace {
+void fused_smem_attr() {
+    static const bool attr = [] {
+        check(cudaFuncSetAttribute(attention_fused_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(fused_smem_bytes(kMaxSelected))), "fused smem attr");
+        return true;
+    }();
+    (void)attr;
+}
+}  // namespace
+void attention_fused(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
+    const std::uint16_t* kv, float* attention_output, const amdmath::Tables& tables, cudaStream_t stream) {
+    if (!rows) return;
+    fused_smem_attr();
+    attention_fused_kernel<<<dim3(kKvHeads, rows), kFusedThreads, fused_smem_bytes(max_selected_count(first_position, rows)), stream>>>(
+        q_gate, first_position, selected, kv, attention_output, tables);
+    check(cudaGetLastError(), "fused attention launch");
 }
 void attention_mma(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
     const std::uint16_t* kv, float* attention_output, cudaStream_t stream) {
@@ -1435,6 +1626,14 @@ void launch_multi(const RowBuffers& b, MapArg map, const MultiShape& shape, cons
     }
     select_multi_kernel<<<rows, kSelectThreads, 0, stream>>>(ws.block_scores, ws.max_blocks, map, ws.selected);
     check(cudaGetLastError(), "select multi launch");
+    if (!shape.head_all && fused_enabled()) {   // a prefill-shaped segment: the exact fused form (same bits as below)
+        fused_smem_attr();
+        const auto slots = std::min<std::uint32_t>(shape.slot_runs * kRun, kMaxSelected);
+        attention_fused_multi_kernel<<<dim3(kKvHeads, rows), kFusedThreads, fused_smem_bytes(slots), stream>>>(b.q_gate, map,
+            ws.selected, b.attention_output, tables);
+        check(cudaGetLastError(), "fused attention multi launch");
+        return;
+    }
     attention_score_half_multi_kernel<<<dim3(shape.slot_runs, kKvHeads, rows), 128, 0, stream>>>(b.q_gate, map, ws.selected, ws.scores);
     check(cudaGetLastError(), "score multi launch");
     softmax_multi_kernel<<<dim3(kHeads, rows), 256, 0, stream>>>(ws.scores, map, tables);

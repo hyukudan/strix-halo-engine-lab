@@ -42,6 +42,38 @@ class StreamTests(unittest.TestCase):
         self.assertEqual(result['ids'], ids)
         self.assertEqual(result['tokens'], len(ids))
 
+    def test_stream_exports_finish_and_request_metadata(self):
+        for finish in ('stop', 'length'):
+            with self.subTest(finish=finish):
+                data = completion([7, 8], finish=finish)
+                with mock.patch.object(BENCH.urllib.request, 'urlopen', return_value=io.BytesIO(data)) as opened:
+                    result = BENCH.stream('http://unused', [1, 2], 128, 1)
+                self.assertTrue(result['done'])
+                self.assertEqual(result['finish_reason'], finish)
+                self.assertEqual(result['max_tokens'], 128)
+                self.assertEqual(result['observed_ids_count'], 2)
+                self.assertEqual(result['metadata_provenance']['finish_reason'], 'SSE choices.finish_reason')
+                self.assertEqual(json.loads(opened.call_args.args[0].data),
+                                 dict(prompt=[1, 2], max_tokens=128, temperature=0, stream=True, return_token_ids=True))
+
+    def test_textless_short_stop_keeps_unknown_first_text_time(self):
+        data = event({'usage': {'completion_tokens': 1}, 'strix': {'token_ids': [248046]},
+                      'choices': [{'text': '', 'finish_reason': 'stop'}]}) + b'data: [DONE]\n\n'
+        with mock.patch.object(BENCH.urllib.request, 'urlopen', return_value=io.BytesIO(data)):
+            result = BENCH.stream('http://unused', [1], 128, 1)
+        self.assertIsNone(result['error'])
+        self.assertIsNone(result['ttft'])
+        self.assertIsNone(result['t_first'])
+        self.assertEqual(result['finish_reason'], 'stop')  # recorded stop is not inferred EOS
+        self.assertEqual(result['observed_ids_count'], 1)
+
+    def test_incomplete_stream_exports_observed_missing_metadata(self):
+        result = self.read(completion([7, 8], finish=None, done=False, full_ids=False))
+        self.assertFalse(result['done'])
+        self.assertIsNone(result['finish_reason'])
+        self.assertIsNone(result['observed_ids_count'])
+        self.assertTrue(result['error'])
+
     def test_shared_ids_without_rtx_metadata(self):
         self.assertEqual(self.read(completion([7, 8], rtx=False))['ids'], [7, 8])
 

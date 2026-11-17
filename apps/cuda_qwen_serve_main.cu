@@ -5,7 +5,7 @@
 //   strix-cuda-qwen-serve --model M.gguf --tables DIR --rope-table rope_cs.bin [--mtp-sidecar S.gguf --draft-vocab V.bin]
 //       [--max-positions 32768] [--bind 127.0.0.1] [--port 8090] [--api-key-file F] [--model-id ID]
 //       [--mtp-depth 7] [--min-p 0.7] [--max-queue 64] [--http-slots 4] [--prefill-chunk 1024|auto] [--prefill-overlap-rows 1024]
-//       [--admit-grace-ms 2] [--cohort-depth fair|max] [--slot-margin-mib 2048] [--block-rows N]
+//       [--admit-grace-ms 2] [--cohort-depth fair|max] [--slot-margin-mib 2048] [--block-rows N] [--mtp-defer-prompt on|off]
 //       [--expert-residency auto|full|tiered] [--vram-budget-gib N] [--print-effective-config]
 //       [--prefix-cache on|off] [--prefix-cache-block 256] [--prefix-cache-stride 16384]
 //       [--prefix-cache-host-mb N] [--prefix-cache-vram-mb 0]
@@ -50,6 +50,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <future>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -272,7 +273,10 @@ public:
             const auto tw = Clock::now();
             std::vector<std::uint32_t> rows{pending};
             std::vector<float> probs;
-            if (mtp) {
+            // Config::defer_prompt_mtp: the prompt's MTP rows are not computed yet; they only feed drafts, so this step
+            // verifies the pending token alone and enqueues them after the verify
+            const bool defer_step = mtp && e_.mtp_deferred(0);
+            if (mtp && !defer_step) {
                 const std::uint32_t want = dh.on() ? dh.plan(depth) : depth;
                 const auto td = Clock::now();
                 const auto d = e_.draft(pending, want, dh.on() ? dh.min_p() : o_.min_p);
@@ -288,7 +292,7 @@ public:
             const auto room = static_cast<std::uint32_t>(std::min<std::uint64_t>(rows.size(), cap - pos));
             rows.resize(room);
             bool selected = false;
-            if (dh.on()) {
+            if (dh.on() && !defer_step) {
                 probs.resize(std::min<std::size_t>(probs.size(), rows.size() - 1));
                 if (probs.size() + 1 == rows.size()) {
                     const auto before = rows.size();
@@ -301,6 +305,7 @@ public:
             std::uint32_t keep = 1;
             while (keep < rows.size() && rows[keep] == r.argmax[keep - 1]) ++keep;
             e_.commit(keep);
+            if (defer_step) e_.mtp_settle(0);  // no host wait; the next draft reads them in stream order
             if (dh.on()) {
                 if (selected) dh.finish(static_cast<std::uint32_t>(rows.size()), keep - 1,
                     std::chrono::duration<double, std::milli>(Clock::now() - tw).count());
@@ -453,6 +458,9 @@ private:
         double prefix_restore_ms = 0, prefix_capture_ms = 0;
         qc::Stream stream;
         std::unique_ptr<qc::ContextDraft> ctx;  // context copy/n-gram drafter of this request (STRIX_QRTX_CONTEXT_DRAFT)
+        // the drafter over the prompt, built on a worker while the prompt prefills (14-22 ms of host work at 8K that
+        // otherwise sits between the prefill and the first token); taken when the slot starts decoding
+        std::future<std::unique_ptr<qc::ContextDraft>> ctx_build;
         serve::GenerationStats st;
         Clock::time_point t0, t_decode;
         double prefill_gpu_ms = 0;   // overlapped chunks: GPU time on the prefill stream (events)
@@ -583,8 +591,10 @@ private:
                 auto taken = queue_.take(!busy);  // block only when nothing runs
                 if (!taken && woke && o_.admit_grace_ms > 0) {
                     // requests that arrive together (a client burst) join the same first step instead of waiting behind
-                    // the first one's whole-prompt prefill
-                    std::this_thread::sleep_for(std::chrono::milliseconds(o_.admit_grace_ms));
+                    // the first one's whole-prompt prefill. A deadline, not sleep_for: with the default Windows timer a
+                    // 2 ms sleep lasts a whole tick (~15.6 ms), all of it inside the first request's TTFT.
+                    const auto until = Clock::now() + std::chrono::milliseconds(o_.admit_grace_ms);
+                    while (Clock::now() < until) std::this_thread::yield();
                     woke = false;
                     taken = queue_.take(false);
                 }
@@ -628,6 +638,19 @@ private:
             queue_.finish(*s.job, s.st, error);
             s.job.reset();
             return;
+        }
+        // request field "ngram_draft" (shared serve API): false = no context drafter for this request, true = the
+        // configured mode (first when the server's is off); unset = the server's mode
+        const qc::ContextMode mode = !job.ngram_draft ? context_mode_
+            : !*job.ngram_draft ? qc::ContextMode::off : context_mode_ != qc::ContextMode::off ? context_mode_ : qc::ContextMode::first;
+        if (mtp_ && mode != qc::ContextMode::off) {
+            // the drafter's context is what the session holds; the pending (last prompt) token joins at the first step
+            s.ctx_build = std::async(std::launch::async,
+                [mode, prompt = std::vector<std::uint32_t>(job.prompt.begin(), job.prompt.begin() + static_cast<std::ptrdiff_t>(s.n - 1))] {
+                    auto c = std::make_unique<qc::ContextDraft>(mode);
+                    c->drafter.reset(std::span<const std::uint32_t>(prompt.data(), prompt.size()));
+                    return c;
+                });
         }
         s.prefilled = cache_.restore(e_, s.session, job.prompt, s.prefix_restore_ms);
         s.st.cached_tokens = s.prefilled;
@@ -696,16 +719,7 @@ private:
         s.st.prefill_ms = std::chrono::duration<double, std::milli>(s.t_decode - s.t0).count();
         if (job.on_progress) job.on_progress({serve::GenerationPhase::decode, s.n, 0, s.n});
         s.phase = Phase::decode;
-        s.ctx.reset();
-        // request field "ngram_draft" (shared serve API): false = no context drafter for this request, true = the
-        // configured mode (first when the server's is off); unset = the server's mode
-        const qc::ContextMode mode = !job.ngram_draft ? context_mode_
-            : !*job.ngram_draft ? qc::ContextMode::off : context_mode_ != qc::ContextMode::off ? context_mode_ : qc::ContextMode::first;
-        if (mtp_ && mode != qc::ContextMode::off) {
-            // the drafter's context is what the session holds; the pending (last prompt) token joins at the first step
-            s.ctx = std::make_unique<qc::ContextDraft>(mode);
-            s.ctx->drafter.reset(std::span<const std::uint32_t>(job.prompt.data(), s.n - 1));
-        }
+        s.ctx = s.ctx_build.valid() ? s.ctx_build.get() : nullptr;  // built in start() (same mode, same prompt)
         s.stream = qc::Stream{s.session, job.prompt[s.n - 1], s.n - 1, job.draft_depth_max, s.ctx.get(), job.copy_rows, job.window_rows};
         s.st.finish = "length";
         if (job.max_tokens == 0) finish(s, {}, "length");
@@ -936,9 +950,11 @@ int main(int argc, char** argv) {
         config.state_cache_stats = [&prefix_cache] { return prefix_cache.stats_json(); };
         // /api/status names the bound device (id, UUID, PCI, attach) next to the prefix cache counters.
         const std::string device_json = strix::device::receipt_json(strix::device::bind_cuda());
-        config.status_extra = [&prefix_cache, device_json, &engine](serve::Json& status) {
+        config.status_extra = [&prefix_cache, device_json, &engine, &o](serve::Json& status) {
             status.set("expert_residency", serve::parse_json(engine.residency_json()));
             status.set("expert_residency_receipt", serve::parse_json(engine.residency_receipt_json()));
+            status.set("moe_window_rows_receipt", serve::parse_json(engine.moe_rows_receipt_json()));
+            status.set("expert_dispatch", qo::expert_dispatch_json(o.engine, engine.weight_pack_id(), engine.native_experts(), engine.moe_rows()));
             status.set("prefix_cache", serve::parse_json(prefix_cache.stats_json()));
             status.set("device", serve::parse_json(device_json));
         };

@@ -15,7 +15,8 @@ namespace pr = ::strix::qwen::profile;
 using pr::Lever;
 using pr::Kind;
 
-// Columns: default, fast, quality. A form is provisional in fast until its gate receipt flips `ready`.
+// Columns: default, fast, quality, turbo. A form is provisional in fast until its gate receipt flips `ready`. An empty turbo
+// cell is the fast cell (engine_profile.hpp value_column): TURBO runs every FAST form plus the TURBO-only rows below.
 inline constexpr Lever table[] = {
     // Pending in fast: the engine refuses this storage with the MTP sidecar, graphs, cohorts, node hand-off and the prefix
     // cache (qwen_route::require_composition), i.e. in every shipped CUDA composition. Runnable only by an explicit
@@ -57,12 +58,23 @@ inline constexpr Lever table[] = {
      .target = "qwen-cuda-qsa-f16mma-v1", .off = "0",
      .source = "QSA prefill attention on FP16 tensor cores, FP32 accumulation; qualification in progress; changes logits",
      .provisional = {false, true, false}},
+    // turbo cell "0" (builtin): TURBO experts are the integer expert_turbo row; the single-chain moe_mma form refuses a
+    // non-incumbent expert arithmetic (qwen_options.hpp resolve), and `--moe-mma on` stays available explicitly.
     {.name = "moe_mma", .env = "STRIX_QRTX_MOE_MMA", .option = "--moe-mma",
-     .value = {"", "1", ""}, .builtin = "0",
-     .kind = Kind::bit_changing, .ready = {true, false, true}, .runnable = {false, true, false},
+     .value = {"", "1", "", "0"}, .builtin = "0",
+     .kind = Kind::bit_changing, .ready = {true, false, true, true}, .runnable = {false, true, false, true},
      .target = "qwen-cuda-moe-i8fma-v1", .off = "0",
      .source = "routed-MoE prefill gate/up and down on int8 tensor cores with one FP32 FMA chain per output; qualification in progress; changes logits",
      .provisional = {false, true, false}},
+    // TURBO only: routed GSQ experts on int8 tensor cores (gsq-iq-i8mma-turbo-cuda-v1, src/cuda/core/turbo_i8.hpp), selected
+    // ahead of qualification by `--profile turbo` (provisional). GSQ expert storage only: another pack refuses the start
+    // at admission; `--expert-turbo off` (or STRIX_QRTX_EXPERT_TURBO=0) keeps the pack's own experts under TURBO.
+    {.name = "expert_turbo", .env = "STRIX_QRTX_EXPERT_TURBO", .option = "--expert-turbo",
+     .value = {"", "", "", "1"}, .builtin = "0",
+     .kind = Kind::bit_changing, .ready = {true, true, true, false}, .runnable = {false, false, false, true},
+     .target = "gsq-iq-i8mma-turbo-cuda-v1", .off = "0",
+     .source = "routed GSQ experts: A8 int8 activations x integer codes on int8 IMMA, one FP32 FMA per group; TURBO bar pending; changes logits",
+     .provisional = {false, false, false, true}},
 };
 inline std::span<const Lever> levers() { return table; }
 
@@ -74,6 +86,7 @@ inline constexpr std::string_view kMoeIdentity = "qwen-cuda-moe-i8fma-v1";
 // The runnable levers a resolution selects. Pending, off and builtin-off rows select nothing.
 struct Choice {
     bool moe_route_bf16 = false, hc_mma = false, mtp_mma = false, qsa_mma = false, moe_mma = false;
+    bool expert_turbo = false;  // maps to Config::expert_arithmetic (its identity is the arithmetic name, not a form)
     bool fast() const { return moe_route_bf16 || hc_mma || mtp_mma || qsa_mma || moe_mma; }
     bool operator==(const Choice&) const = default;
 };
@@ -96,6 +109,7 @@ inline Choice choose(const pr::Resolution& r) {
     c.mtp_mma = lever_on(r, "mtp_mma");
     c.qsa_mma = lever_on(r, "qsa_mma");
     c.moe_mma = lever_on(r, "moe_mma");
+    c.expert_turbo = lever_on(r, "expert_turbo");
     return c;
 }
 inline std::string forms_list(const Choice& c) {
