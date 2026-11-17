@@ -220,6 +220,13 @@ bool nvtx_on() {
     static const bool on = strix::envcfg::flag("STRIX_QRTX_NVTX", false);
     return on;
 }
+
+// STRIX_QRTX_MOE_PAD_ROWS=1: decode windows of 9..15 rows also route the padding rows of their 16-row block through the
+// routed experts (the old form). Default: the routed MoE of a window runs on its real rows only (run_block).
+bool moe_pad_rows() {
+    static const bool on = strix::envcfg::flag("STRIX_QRTX_MOE_PAD_ROWS", false);
+    return on;
+}
 inline void nvtx_push(const char* name) { if (nvtx_on()) nvtxRangePushA(name); }
 inline void nvtx_pop() { if (nvtx_on()) nvtxRangePop(); }
 // Ranges of one run_block: whatever is still open when it unwinds (an exception mid-enqueue) is popped.
@@ -1417,6 +1424,13 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         trace_cap = rows;
     }
     if (pad > rows) ck(cudaMemsetAsync(ids, 0, std::uint64_t{pad} * 4, stream), "ids clear");
+    // Routed rows of a decode window: its real rows. The padding rows of a 9..15-row window (token 0 over stale
+    // attention-core rows, never read back) would otherwise route top-k on row-varying garbage and stream those experts'
+    // bytes (a 9-row window then pays about the 16-row MoE), and a non-finite padding row would set the window-wide CSR
+    // failure word. Each row's routed chain does not depend on the other rows (windows are batch-invariant; 1..8-row
+    // windows already route exactly their rows), so the real rows' bits are unchanged. Prefill blocks and the tiered
+    // path keep `pad`.
+    const std::uint32_t moe_rows = window && !tier && !moe_pad_rows() ? rows : pad;
     for (std::uint32_t i = 0; i < count; ++i)
         ck(cudaMemcpyAsync(ids + seg[i].offset, seg[i].tokens, std::uint64_t{seg[i].rows} * 4, cudaMemcpyHostToDevice, stream), "ids");
     nv.push("embed");
@@ -1582,8 +1596,8 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         mix(lw[l].p[k_hc_ffn_norm], lw[l].p[k_hc_ffn_inject], hc_ffn[l]);
         nv.pop();
         nv.push("moe_route");
-        hc::route_logits(hidden, static_cast<const float*>(lw[l].p[k_ffn_gate_inp_weight]), pad, logits, stream);
-        hc::route_select(logits, pad, kTopK, true, tables, routes, route_w, stream);
+        hc::route_logits(hidden, static_cast<const float*>(lw[l].p[k_ffn_gate_inp_weight]), moe_rows, logits, stream);
+        hc::route_select(logits, moe_rows, kTopK, true, tables, routes, route_w, stream);
         nv.pop();
         if (trace_file) ck(cudaMemcpyAsync(trace_host + std::uint64_t{l} * rows * kTopK, routes, std::uint64_t{rows} * kTopK * 4,
                                            cudaMemcpyDeviceToHost, stream), "expert trace");
@@ -1632,7 +1646,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         nv.push("moe_routed");
         if (!tier) {
             // FAST form: prefill blocks only; the receipt records what was dispatched (native experts fall back).
-            executed_forms.moe_mma |= moe::enqueue(mr, pad, kHidden, ew, tables, nullptr, stream, cfg.forms.moe_mma && !window);
+            executed_forms.moe_mma |= moe::enqueue(mr, moe_rows, kHidden, ew, tables, nullptr, stream, cfg.forms.moe_mma && !window);
         } else {
             // Tiered: the prologue reads the real ids; publish maps them to slots (misses -> the zero slot) and hands the
             // misses to the host; the routed kernels run on the slot routes; gather brings the host raw dots back.
@@ -1661,7 +1675,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         executed_moe_route_bf16 |= mr.route_bf16;
         nv.pop();
         if (window) {
-            moe_sticky_kernel<<<1, 32, 0, stream>>>(csr.summary, moe_status, 4, pad, moe_sticky);
+            moe_sticky_kernel<<<1, 32, 0, stream>>>(csr.summary, moe_status, 4, moe_rows, moe_sticky);
             ck(cudaGetLastError(), "moe sticky");
         }
         if (side) ck(cudaStreamWaitEvent(stream, side_join, 0), "side join wait");
