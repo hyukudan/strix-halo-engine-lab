@@ -858,6 +858,8 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
     }
     m.requested = requested;
     m.resolve_levers(options, requested);  // the per-object switches (shared with apply_levers)
+    m.moe_window_auto = options.moe_chunk_rows == 0U;
+    if (m.moe_window_auto) options.moe_chunk_rows = 4096U;
     m.options = options;
     if (options.world != 1U && options.world != 2U) throw std::invalid_argument("deepseek41 prefill: world must be 1 or 2");
     if (options.world == 2U && (options.communicator == nullptr || options.rank > 1U))
