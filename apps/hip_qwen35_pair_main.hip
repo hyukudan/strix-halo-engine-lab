@@ -143,6 +143,11 @@ int self_cut(const Args& a, const std::vector<std::uint32_t>& prompt) {
                 static_cast<unsigned long long>(fnv_bytes(ref.logits.data(), ref.logits.size() * 4U)));
     for (auto t : ref.ids) std::printf(" %u", t);
     std::printf("\n");
+    if (!a.dump.empty()) {   // the one-node reference of the multi-node identity check (same layout as the decode app's dump)
+        std::ofstream f(a.dump, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(ref.logits.data()), std::streamsize(ref.logits.size() * 4U));
+        std::printf("dumped %zu positions x %u to %s\n", ref.logits.size() / E->vocab(), E->vocab(), a.dump.c_str());
+    }
     int bad = 0;
     for (const auto k : parse_list(a.self_cut)) {
         if (k == 0U || k >= L) throw std::invalid_argument("--self-cut K must be 1..layers-1");
