@@ -27,7 +27,9 @@ CutArguments rank_args(std::vector<std::string> flags) {
     values.insert(values.end(), flags.begin(), flags.end());
     std::vector<char*> argv;
     for (auto& value : values) argv.push_back(value.data());
-    return cut_arguments(static_cast<int>(argv.size()), argv.data());
+    int argc = static_cast<int>(argv.size());
+    argv.push_back(nullptr);
+    return cut_arguments(argc, argv.data());
 }
 int main(int argc, char** argv) try {
     for (const char* key : {"STRIX_SPLIT", "STRIX_SPLIT_CUT", "STRIX_SPLIT_BLOCK", "STRIX_SPLIT_ACT",

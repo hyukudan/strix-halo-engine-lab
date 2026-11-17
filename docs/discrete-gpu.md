@@ -175,15 +175,15 @@ follow-up agent turns restore their cached prefix and prefill only the new token
 Build, then the measured run (exactness and speed; an HTTP server for this route is not tested end to end yet):
 
 ```powershell
-pwsh src/glm/rtxpf/producer/build.ps1 -BuildDir BUILD_DIR -Fresh -Parallel 2 `
+pwsh src/cuda/models/glm/producer/build.ps1 -BuildDir BUILD_DIR -Fresh -Parallel 2 `
     -TierstreamSource TIERSTREAM_DIR [-CutlassDir CUTLASS_DIR]
-python -B src/glm/rtxpf/producer/decode_qualification_window.py --build BUILD_DIR `
+python -B src/cuda/models/glm/producer/decode_qualification_window.py --build BUILD_DIR `
     --model MODEL_DIR --prompt-dir PROMPT_DIR --unit-file OUT_DIR/glm-units.bin `
     --unit-manifest-sha256 MANIFEST_SHA256 --full-card --allow-gpu
 ```
 
 For a smaller card replace `--full-card` with `--vram-total-gib 24 --ram-total-gib 32` (or your own caps). The unit
-file, every option and the measured rows: [GLM RTX guide](../src/glm/rtxpf/README.md).
+file, every option and the measured rows: [GLM RTX guide](../src/cuda/models/glm/README.md).
 
 The GLM service (`glm_native_service`) also takes `--dgpu auto|<uuid>`: it checks through NVML, before any CUDA call,
 that the card is an `sm_120` RTX PRO (`auto` picks the eligible card with the most memory) and pins it; `--dgpu off` is
@@ -208,10 +208,10 @@ described in [Declare the GPU to use](#declare-the-gpu-to-use).
 
 MiniMax M3.1 has an experimental block pipeline: CUDA computes layers `[0,K)` and the HIP TP2 pair computes
 `[K,60)`, including the first token's head on the last prompt row. Select it explicitly with
-`mm-rtx-prefill MODEL_DIR ROPE.bin OUTPUT_DIR cut:PROMPT.u32 --layer-cut K --cut-block 2048 --send NODE0_IP:PORT0,NODE1_IP:PORT1 --repeat 2`.
+`mm-rtx-prefill MODEL_DIR ROPE.bin OUTPUT_DIR cut:PROMPT.u32 --layer-cut K --cut-block 4096 --send NODE0_IP:PORT0,NODE1_IP:PORT1 --repeat 2`.
 The existing routes keep their defaults; layer-cut's compiler, native execution, fidelity and full-workload gates are pending.
 
-Both ranks use `--layercut-listen NAME:PROMPT.u32:BASE_PORT:STEPS:COUNT --cut K --cut-block 2048`.
+Both ranks use `--layercut-listen NAME:PROMPT.u32:BASE_PORT:STEPS:COUNT --cut K --cut-block 4096` (a multiple of the pair identity's chunk rows, 4096 by default).
 `--cut-act relay` (default) adds rank 0 `--cut-relay HOST:PORT` and rank 1 `--cut-relay-listen PORT`;
 `--cut-act direct` sends activations to both ranks. Rank r's producer listener uses BASE_PORT+r.
 Shared controls are `--split` / `STRIX_SPLIT` (default `device-only`), `--cut` / `STRIX_SPLIT_CUT`,

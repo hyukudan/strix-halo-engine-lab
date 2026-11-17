@@ -15,6 +15,7 @@
 #include "strix/hip_ds41_rn_wide.hpp"
 #include "strix/hip_ds41_f8_rows_fast.hpp"
 
+#include "strix/ds41_attention.hpp"  // q_b's RoPE image (enqueue_q_b_rope_image): RopeRow, rope_pair
 #include "strix/hip_ds41_formats.hpp"
 
 #include <hip/hip_fp16.h>
@@ -32,6 +33,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include "strix/lever_cache.hpp"
 
 // Pointers that never alias are declared __restrict__ (kernel parameters, or the parameters of the
 // force-inlined bodies of the view kernels, since restrict on struct members is not used by the
@@ -1495,8 +1498,11 @@ __global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8Dense
     if constexpr (Lean >= 1) asm volatile("" : "+v"(magic));
     // Lean >= 2: the activation codes as a buffer (raw, stride 0, offsets in bytes) and each row's byte offset
     const std::size_t abytes = static_cast<std::size_t>(v.rows) * v.x_stride;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wsign-conversion"  // num_records is int in some ROCm builtins, unsigned in others (clamped value)
     [[maybe_unused]] const __amdgpu_buffer_rsrc_t abuf = __builtin_amdgcn_make_buffer_rsrc(
-        const_cast<std::int8_t*>(v.codes), static_cast<short>(0), (abytes < 0x7fffffffU ? abytes : std::size_t{0x7fffffffU}), 0x31004000);
+        const_cast<std::int8_t*>(v.codes), static_cast<short>(0), static_cast<int>(abytes < 0x7fffffffU ? abytes : std::size_t{0x7fffffffU}), 0x31004000);
+#pragma clang diagnostic pop
     [[maybe_unused]] unsigned aoff[RT];
 #pragma unroll
     for (unsigned rt = 0; rt < RT; ++rt) {
@@ -1505,8 +1511,11 @@ __global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8Dense
     }
     // Lean >= 3: the weight tensor as a buffer and each output row's byte offset (K-offset included)
     const std::size_t wbytes = static_cast<std::size_t>(v.count) * row_bytes;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wsign-conversion"  // num_records is int in some ROCm builtins, unsigned in others (clamped value)
     [[maybe_unused]] const __amdgpu_buffer_rsrc_t wbuf = __builtin_amdgcn_make_buffer_rsrc(
-        const_cast<std::uint8_t*>(v.weight), static_cast<short>(0), (wbytes < 0x7fffffffU ? wbytes : std::size_t{0x7fffffffU}), 0x31004000);
+        const_cast<std::uint8_t*>(v.weight), static_cast<short>(0), static_cast<int>(wbytes < 0x7fffffffU ? wbytes : std::size_t{0x7fffffffU}), 0x31004000);
+#pragma clang diagnostic pop
     [[maybe_unused]] unsigned woff[OT];
 #pragma unroll
     for (unsigned t = 0; t < OT; ++t) {
@@ -2222,8 +2231,8 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
                                      !overlap(v.sub, stream_bytes / hc_copies, v.collapse_out, stream_bytes / hc_copies))),
             "hc site view");
     // STRIX_DS41_HC_SITE_FAST=0: the previous site kernel (and its one-launch row limit); same bits either way.
-    static const bool fast_env = strix::envcfg::flag("STRIX_DS41_HC_SITE_FAST", true);
-    const bool fast = v.form == 2 || (v.form == 0 && fast_env);
+    static strix::lever_cache<bool> fast_env{[] { return strix::envcfg::flag("STRIX_DS41_HC_SITE_FAST", true); }};
+    const bool fast = v.form == 2 || (v.form == 0 && fast_env.get());
     const bool one = v.launches == 1 ||
                      (v.launches == 0 && v.rows <= (fast ? hc_site_fast_one_launch_rows : hc_site_one_launch_rows));
     if (!one) {
@@ -2357,8 +2366,8 @@ void enqueue_fp8_a8(const Q8A8View& view, hipStream_t q) {
     }
     // Outputs per wave (1, 2 or 4; same bits): STRIX_DS41_FP8_W, default 1 at 1-2 rows (one contiguous row stream per
     // wave) and 2 from 3 rows (each row's unpacked A8 codes serve two outputs). 5-8 rows take at most 2 (4 spills).
-    static const unsigned env_w = [] { const char* e = std::getenv("STRIX_DS41_FP8_W"); return e && (e[0] == '1' || e[0] == '2' || e[0] == '4') ? unsigned(e[0] - '0') : 0U; }();
-    const unsigned set = fp8_outputs_per_wave ? fp8_outputs_per_wave : env_w;
+    static strix::lever_cache<unsigned> env_w{[] { const char* e = std::getenv("STRIX_DS41_FP8_W"); return e && (e[0] == '1' || e[0] == '2' || e[0] == '4') ? unsigned(e[0] - '0') : 0U; }};
+    const unsigned set = fp8_outputs_per_wave ? fp8_outputs_per_wave : env_w.get();
     const unsigned want = set ? set : view.rows <= 2 ? 1U : 2U;
     const bool w4 = want >= 4U && view.per_group % 4U == 0, w2 = want >= 2U && view.per_group % 2U == 0;
     if (view.rows == 1) { if (w4) launch_fp8_a8<1, 4>(view, q); else if (w2) launch_fp8_a8<1, 2>(view, q); else launch_fp8_a8<1, 1>(view, q); }
@@ -2445,7 +2454,8 @@ void enqueue_q8_0_a8(const Q8A8View& v, void* stream) {
     // W outputs per wave share every activation load; W must divide the group size.
     // Packed rows (CB4/U5/U6) at 1-2 rows: STRIX_DS41_PACKED_W=1|2|4 caps the outputs per wave (same bits,
     // W-independent). Default 1: P10 turn A, R1 greedy 46.85 -> 43.85 ms/token against 4.
-    static const unsigned packed_w = [] { const char* e = std::getenv("STRIX_DS41_PACKED_W"); return e && (e[0] == '2' || e[0] == '4') ? unsigned(e[0] - '0') : 1U; }();
+    static strix::lever_cache<unsigned> packed_w_cache{[] { const char* e = std::getenv("STRIX_DS41_PACKED_W"); return e && (e[0] == '2' || e[0] == '4') ? unsigned(e[0] - '0') : 1U; }};
+    const unsigned packed_w = packed_w_cache.get();
     const bool cap = view.packed != 0U && v.rows <= 2;
     const bool w4 = view.per_group % 4U == 0 && !(cap && packed_w < 4U), w2 = view.per_group % 2U == 0 && !(cap && packed_w < 2U);
     // The output A8 in the product kernel when one block owns whole groups: 1-2 rows at 4 outputs per wave (32 per
@@ -2482,10 +2492,11 @@ void launch_q8_ready(const Q8A8View& v, dist::ProducerStage stage, hipStream_t q
 }
 template <unsigned P>
 void launch_q8_ready_rows(const Q8A8View& v, dist::ProducerStage stage, hipStream_t q) {
-    static const unsigned packed_w = [] {
+    static strix::lever_cache<unsigned> packed_w_cache{[] {
         const char* e = std::getenv("STRIX_DS41_PACKED_W");
         return e && (e[0] == '2' || e[0] == '4') ? unsigned(e[0] - '0') : 1U;
-    }();
+    }};
+    const unsigned packed_w = packed_w_cache.get();
     const bool cap = P != 0U && v.rows <= 2;
     const bool w4 = v.per_group % 4U == 0 && !(cap && packed_w < 4U);
     const bool w2 = v.per_group % 2U == 0 && !(cap && packed_w < 2U);
@@ -2544,7 +2555,8 @@ void enqueue_q8_0_a8_pair(const Q8A8View& a, const Q8A8View& b, void* stream) {
         enqueue_q8_0_a8(b, stream);
         return;
     }
-    static const unsigned packed_w = [] { const char* e = std::getenv("STRIX_DS41_PACKED_W"); return e && (e[0] == '1' || e[0] == '2') ? unsigned(e[0] - '0') : 4U; }();
+    static strix::lever_cache<unsigned> packed_w_cache{[] { const char* e = std::getenv("STRIX_DS41_PACKED_W"); return e && (e[0] == '1' || e[0] == '2') ? unsigned(e[0] - '0') : 4U; }};
+    const unsigned packed_w = packed_w_cache.get();
     const bool cap = x.packed != 0U && x.rows <= 2;
     const bool w4 = x.per_group % 4U == 0 && y.per_group % 4U == 0 && !(cap && packed_w < 4U);
     const bool w2 = x.per_group % 2U == 0 && y.per_group % 2U == 0 && !(cap && packed_w < 2U);
@@ -2570,8 +2582,8 @@ void enqueue_f16_rows(const F16RowsView& v, void* stream) {
     }
     if (v.rows <= max_rows) {  // decode rows: lanes kernel, else the wide or the plain site kernel (same bits)
         // Same bits, 16-byte loads (hip_ds41_f16_rows.hip); STRIX_DS41_F16_LANES=0 keeps this kernel.
-        static const bool lanes = strix::envcfg::flag("STRIX_DS41_F16_LANES", true);
-        if (lanes && f16_rows_lanes_supported(v)) { enqueue_f16_rows_lanes(v, stream); return; }
+        static strix::lever_cache<bool> lanes_cache{[] { return strix::envcfg::flag("STRIX_DS41_F16_LANES", true); }};
+        if (lanes_cache.get() && f16_rows_lanes_supported(v)) { enqueue_f16_rows_lanes(v, stream); return; }
         // DSpark's wide-load kernel (same bits; superseded by the lanes kernel) when the lanes are switched off
         if (f16_rows_wide_enabled && v.width % f16_chunk == 0U && v.x_stride % 4U == 0U) {  // same bits, more bandwidth
             if (v.count >= 2048U)
@@ -2748,18 +2760,100 @@ bool engram_f16_pf_admitted(const F16RowsView& v) noexcept {
     return engram_f16_pf_supported(v) && (v.rows + 47U) / 48U * 48U * 8U <= (v.rows + 63U) / 64U * 64U * 9U;
 }
 
-void enqueue_engram_f16_rows(const F16RowsView& v, void* stream) {
+// FAST lever ds41-engram-f16wmma-v1 (STRIX_DS41_FAST_ENGRAM=1 or set_fast_engram(1 / 0; -1 = the environment); default
+// off): the Engram KV projection on the shared dense FP16 WMMA core (core/f16_dense_tall.hpp, 128-row CTAs x 256
+// columns) instead of the exact FP32 FMA chains of f16_tiled_pf (measured 4.2 TFLOPS: 77 ms per 1,024 rows).
+// Contract (the shared core's): x is rounded to FP16 (RNE); BF16 values of 2^-17 <= |x| < 2^16 convert exactly, smaller
+// ones lose low bits in FP16's subnormal range (absolute error <= 2^-25); the products are then exact in FP32 and the
+// sums run in WMMA order (one chain per row tile and column tile, 16-wide k units ascending). A scan flags |x| >= 65520 (FP16 RNE overflow),
+// Inf and NaN (FP16 would overflow); then the WMMA launch exits and the exact separate kernel runs instead (the lever-off
+// bits), without a host sync. Shapes the exact tile path does not admit keep the exact path.
+int fast_engram_mode = -1;
+void set_fast_engram(int mode) { fast_engram_mode = mode; }
+static bool fast_engram_on() {
+    static const bool env = fast_profile::engram_on();
+    return fast_engram_mode >= 0 ? fast_engram_mode != 0 : env;
+}
+namespace {
+// Sets *flag when any x of the view would overflow FP16 under RNE: |x| >= 65520 (FP32 bits 0x477FF000), Inf and NaN.
+__global__ __launch_bounds__(256) void engram_x_f16_scan(F16RowsView v, unsigned* flag) {
+    const std::size_t per_row = v.width / 4U, total = per_row * v.rows;
+    bool out = false;
+    for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * 256U + threadIdx.x; i < total; i += static_cast<std::size_t>(gridDim.x) * 256U) {
+        const std::size_t row = i / per_row, c = i - row * per_row;
+        const uint4 e = *reinterpret_cast<const uint4*>(v.x + row * v.x_stride + c * 4U);
+        const unsigned words[4] = {e.x, e.y, e.z, e.w};
+#pragma unroll
+        for (unsigned k = 0; k < 4; ++k) {
+            const unsigned m = words[k] & 0x7FFFFFFFU;
+            out = out || m >= 0x477FF000U;  // 65520: FP16 RNE overflows from here (Inf and NaN included)
+        }
+    }
+    if (out) atomicOr(flag, 1U);
+}
+struct EngramWmmaArgs {
+    const float* x;
+    const _Float16* w;  // [n][in] row-major
+    float* y;           // [rows][stride]
+    unsigned in, rows, n, stride, skip_idle;
+    const unsigned* flag;
+};
+struct EngramWmmaCols {
+    const EngramWmmaArgs& a;
+    __device__ __forceinline__ strix::core::f16_dense_tall::ColumnTile tile(unsigned t) const {
+        if (t < a.n / 16U) return {a.w + static_cast<std::size_t>(t) * 16U * a.in, a.y + t * 16U, a.stride, true};
+        return {a.w, a.y, a.stride, false};
+    }
+};
+__global__ __launch_bounds__(256) void engram_wmma_kernel(EngramWmmaArgs a) {
+    if (*a.flag != 0U) return;  // an x outside the exact FP16 set: the exact kernel below runs this view
+    __shared__ strix::core::f16_dense_tall::Storage<16> lds;
+    strix::core::f16_dense_tall::core<16>(a.x, a.in, a.rows, EngramWmmaCols{a}, lds, strix::core::f16_dense_tall::RawStore{},
+                                          a.skip_idle != 0U);
+}
+}  // namespace
+
+bool engram_f16_wmma_supported(const F16RowsView& v) noexcept {
+    return engram_f16_pf_admitted(v) && v.x_stride == v.width && v.width % 128U == 0U && v.count % 256U == 0U;
+}
+
+static bool enqueue_engram_f16_wmma(const F16RowsView& v, void* stream) {
+    // The device flag is per stream (not capturable, not shareable across the per-thread default stream's threads).
+    if (as_stream(stream) == hipStreamPerThread) return false;
+    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+    hip_check(hipStreamIsCapturing(as_stream(stream), &capture), "Engram WMMA capture status");
+    if (capture != hipStreamCaptureStatusNone) return false;
+    EngramWideFlag& w = engram_wide_flag(stream);
+    const std::lock_guard<std::mutex> submit(w.submit);
+    hip_check(hipMemsetAsync(w.p, 0, sizeof(unsigned), as_stream(stream)), "Engram FP16 scan reset");
+    hipLaunchKernelGGL(engram_x_f16_scan, dim3(256), dim3(256), 0, as_stream(stream), v, w.p);
+    const EngramWmmaArgs a{v.x, reinterpret_cast<const _Float16*>(v.weight), v.out, v.width, v.rows, v.count, v.out_stride,
+                           strix::core::f16_dense_tall::tail_policy() ? 1U : 0U, w.p};
+    hipLaunchKernelGGL(engram_wmma_kernel, dim3((v.rows + 127U) / 128U, v.count / 256U), dim3(256), 0, as_stream(stream), a);
+    const unsigned row_tiles = (v.rows + 47U) / 48U, output_tiles = (v.count + 63U) / 64U;
+    hipLaunchKernelGGL((f16_tiled_pf_kernel<48, 64, 8, 6, false>), dim3(row_tiles * output_tiles), dim3(48U / 6U * (64U / 16U) * 32U),
+                       0, as_stream(stream), v, row_tiles, output_tiles, static_cast<const unsigned*>(w.p));
+    hip_check(hipGetLastError(), "Engram FP16 WMMA launch");
+    return true;
+}
+
+void enqueue_engram_f16_rows(const F16RowsView& v, void* stream, bool fast_engram) {
     // Read on every call (in-process A/B); =0 restores enqueue_f16_rows with all its controls.
     const char* e = std::getenv("STRIX_DS41_ENGRAM_F16_PF");
+    if (fast_engram && !(e && e[0] == '0') && engram_f16_wmma_supported(v) && enqueue_engram_f16_wmma(v, stream)) return;
     if (!(e && e[0] == '0') && engram_f16_pf_admitted(v)) enqueue_engram_f16_pf(v, stream);
     else enqueue_f16_rows(v, stream);
 }
 
+void enqueue_engram_f16_rows(const F16RowsView& v, void* stream) {
+    enqueue_engram_f16_rows(v, stream, fast_engram_on());
+}
+
 void enqueue_f16_rows_pair(const F16RowsView& a, const F16RowsView& b, void* stream) {
     // STRIX_DS41_F16_PAIR (on by default since P16, =0 off): one launch when both views take the lanes kernels (hip_ds41_f16_rows.hip)
-    static const bool pair = strix::envcfg::flag("STRIX_DS41_F16_PAIR", true);
-    static const bool lanes = strix::envcfg::flag("STRIX_DS41_F16_LANES", true);
-    if (pair && lanes && a.rows <= max_rows && f16_rows_pair_supported(a, b)) {
+    static strix::lever_cache<bool> pair_cache{[] { return strix::envcfg::flag("STRIX_DS41_F16_PAIR", true); }};
+    static strix::lever_cache<bool> lanes_cache{[] { return strix::envcfg::flag("STRIX_DS41_F16_LANES", true); }};
+    if (pair_cache.get() && lanes_cache.get() && a.rows <= max_rows && f16_rows_pair_supported(a, b)) {
         enqueue_f16_rows_lanes_pair(a, b, stream);
         return;
     }
@@ -2829,9 +2923,12 @@ void enqueue_q8_0_a8_prefill(const Q8A8PrefillView& v, void* stream) {
 // STRIX_DS41_PF_CORE=1 (opt-in, see hip_ds41_prefill.hpp): the dense Q8_0 x A8 prefill on the shared tiled core. The
 // same forms (tall selector, two-part fusion, fused A8) as policy values; the same bits as the kernels below.
 static bool enqueue_q8_0_a8_dense_prefill_core(const Q8A8DensePrefillView& v, void* stream) {
-    static const bool tall_rotate = strix::envcfg::flag("STRIX_DS41_DENSE_TALL_ROTATE", false);
-    static const bool dense_stats = strix::envcfg::flag("STRIX_DS41_DENSE_STATS", false);
-    static const bool staged = strix::envcfg::flag("STRIX_DS41_DENSE_FORM", true);
+    static strix::lever_cache<bool> tall_rotate_cache{[] { return strix::envcfg::flag("STRIX_DS41_DENSE_TALL_ROTATE", false); }};
+    static strix::lever_cache<bool> dense_stats_cache{[] { return strix::envcfg::flag("STRIX_DS41_DENSE_STATS", false); }};
+    static strix::lever_cache<bool> staged_cache{[] { return strix::envcfg::flag("STRIX_DS41_DENSE_FORM", true); }};
+    const bool tall_rotate = tall_rotate_cache.get();
+    const bool dense_stats = dense_stats_cache.get();
+    const bool staged = staged_cache.get();
     const bool lean_ok = std::uint64_t(v.rows) * v.x_stride < 0x7fffffffULL &&
         std::uint64_t(v.count) * ((v.row_width ? v.row_width : v.width) / 32U * 34U) < 0x7fffffffULL;
     if (v.k_parts == 2U) {
@@ -2851,10 +2948,11 @@ static bool enqueue_q8_0_a8_dense_prefill_core(const Q8A8DensePrefillView& v, vo
         enqueue_q8_0_a8_dense_prefill_core(part, stream);
         return false;
     }
-    static const unsigned tall_env = [] {
+    static strix::lever_cache<unsigned> tall_env_cache{[] {
         const char* e = std::getenv("STRIX_DS41_DENSE_TALL");
         return e && std::strcmp(e, "auto") == 0 ? 1U : e ? unsigned(std::strtoul(e, nullptr, 10)) : 0U;
-    }();
+    }};
+    const unsigned tall_env = tall_env_cache.get();
     unsigned tall = v.tall ? v.tall : tall_env;
     if (tall == 1U) {
         tall = strix::core::integer_dense_form(v.rows, v.width, v.count, v.row_width, lean_ok);
@@ -2865,10 +2963,11 @@ static bool enqueue_q8_0_a8_dense_prefill_core(const Q8A8DensePrefillView& v, vo
         }
     }
     // STRIX_DS41_DENSE_STATS=1 (diagnostics): calls and rows per (form, width, count, row_width), printed at exit
-    static const bool stats = [] {
+    static strix::lever_cache<bool> stats_cache{[] {
         const char* e = std::getenv("STRIX_DS41_DENSE_STATS");
         return e != nullptr && e[0] == '1';
-    }();
+    }};
+    const bool stats = stats_cache.get();
     if (stats) {
         struct Count { unsigned long long calls = 0, rows = 0; };
         static std::mutex lock;
@@ -3233,22 +3332,53 @@ __global__ __launch_bounds__(32 * post_waves) void q8_0_a8_post_kernel(Q8A8Dense
 int fast_dense_mode = -1;
 void set_fast_dense(int mode) { fast_dense_mode = mode; }
 static bool fast_dense_on() {
-    static const bool env = fast_profile::dense_on();  // the lever or STRIX_DS41_FAST_PREFILL
+    static strix::lever_cache<bool> env{[] { return fast_profile::dense_on(); }};  // the lever or STRIX_DS41_FAST_PREFILL
     // a running DevicePrefill's own precision first (strix/ds41_prefill_precision.hpp), else the override or env
-    return effective_fast(&PrefillPrecision::fast_dense, fast_dense_mode, env);
+    return effective_fast(&PrefillPrecision::fast_dense, fast_dense_mode, env.get());
 }
-static bool enqueue_fast_dense(const Q8A8DensePrefillView& v, void* stream) {
-    static const unsigned min_rows = fast_profile::dense_min_rows();
-    namespace q8a8 = strix::core::f16_dense_tall::q8a8;
-    q8a8::View f{};
+static strix::core::f16_dense_tall::q8a8::View fast_dense_view(const Q8A8DensePrefillView& v) {
+    strix::core::f16_dense_tall::q8a8::View f{};
     f.weight = v.weight, f.codes = v.codes, f.deltas = v.deltas, f.out = v.out;
     f.row_bytes = (v.row_width ? v.row_width : v.width) / 32U * 34U;
     f.k_bytes = v.k_offset / 32U * 34U;
     f.in = v.width, f.count = v.count, f.rows = v.rows, f.x_stride = v.x_stride, f.out_stride = v.out_stride;
     f.accumulate = v.accumulate ? 1U : 0U;
+    return f;
+}
+static bool enqueue_fast_dense(const Q8A8DensePrefillView& v, void* stream) {
+    static strix::lever_cache<unsigned> min_rows_cache{[] { return fast_profile::dense_min_rows(); }};
+    const unsigned min_rows = min_rows_cache.get();
+    namespace q8a8 = strix::core::f16_dense_tall::q8a8;
+    const q8a8::View f = fast_dense_view(v);
     if (v.rows < min_rows || !q8a8::supported(f)) return false;
     q8a8::enqueue_parts(f, v.k_parts, as_stream(stream));
     hip_check(hipGetLastError(), "Q8_0 x A8 FP16 dense launch");
+    return true;
+}
+
+// q_b's operand image for the flash core's query_op (hip_ds41_attention_flash.inl FlashAttentionQ16Policy): the pair
+// transform is the flash prologue's rope512 (rope_pair on pairs (d, d + 1), d = o % 512 >= 448, pair (d - 448) / 2,
+// the row's table), so image = to_bf16(rope(q)) with the bits query16 + frag_from_f32 produced from the FP32 q.
+struct QbRopeImage {
+    using Args = const attn::RopeRow*;
+    static constexpr strix::attn_core::tile::Operand kOp = strix::attn_core::tile::Operand::bf16;
+    static __device__ __forceinline__ void pair(const Args& rope, unsigned r, unsigned o, float& x0, float& x1) {
+        const unsigned d = o % attn::kHeadDim;
+        if (d < attn::kHeadDim - attn::kRopeDim) return;
+        const unsigned p = (d - (attn::kHeadDim - attn::kRopeDim)) / 2U;
+        attn::rope_pair(x0, x1, rope[r].c[p], rope[r].s[p], false);
+    }
+};
+bool enqueue_q_b_rope_image(const Q8A8DensePrefillView& v, std::uint16_t* image, const void* rope, void* stream) {
+    static strix::lever_cache<unsigned> min_rows_cache{[] { return fast_profile::dense_min_rows(); }};
+    const unsigned min_rows = min_rows_cache.get();
+    namespace q8a8 = strix::core::f16_dense_tall::q8a8;
+    const q8a8::View f = fast_dense_view(v);
+    if (!fast_dense_on() || rope == nullptr || v.k_parts != 1U || v.a8_codes != nullptr || v.rows < min_rows ||
+        v.count % attn::kHeadDim != 0U || !q8a8::supported_image(f, image))
+        return false;
+    q8a8::enqueue_image<QbRopeImage>(f, image, static_cast<const attn::RopeRow*>(rope), as_stream(stream));
+    hip_check(hipGetLastError(), "Q8_0 x A8 FP16 dense q image launch");
     return true;
 }
 
@@ -3262,7 +3392,7 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
                                      std::uint64_t{v.k_offset} + 2ULL * v.width <= v.row_width &&
                                      std::uint64_t{v.x_stride} >= 2ULL * v.width)),
             "Q8_0 x A8 dense prefill view");
-    if (fast_dense_on() && enqueue_fast_dense(v, stream)) return false;
+    if (!v.exact && fast_dense_on() && enqueue_fast_dense(v, stream)) return false;
     if (pf_core_dense()) return enqueue_q8_0_a8_dense_prefill_core(v, stream);
     if (v.k_parts == 2U) {
         // one launch for both parts in form 822 from 896 rows (gfx1151 bench: -2 % at 896, -5..-7 % at 1024 rows; fewer rows
@@ -3293,15 +3423,17 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
     }
     unsigned outputs = 32U;
     const dim3 grid((v.rows + 15U) / 16U, (v.count + outputs - 1U) / outputs);
-    static const bool staged = strix::envcfg::flag("STRIX_DS41_DENSE_FORM", true);
+    static strix::lever_cache<bool> staged_cache{[] { return strix::envcfg::flag("STRIX_DS41_DENSE_FORM", true); }};
+    const bool staged = staged_cache.get();
     // STRIX_DS41_DENSE_TALL=22 / 41 / 14 / 21 / 12: RT OT of the tall form for every call (staged only); auto: by shape,
     // from the gfx1151 smoke (prefill measurements): >= 3072 rows, or 2048 rows and >= 1024 outputs: 1 x 4 (q_a / kv);
     // >= 256 rows with >= 4096 outputs and width >= 4096: 1 x 2 (wo_b halves); else the wide form. Every form: the same bits.
-    static const unsigned tall_env = [] {
+    static strix::lever_cache<unsigned> tall_env_cache{[] {
         const char* e = std::getenv("STRIX_DS41_DENSE_TALL");
         if (e != nullptr && std::string(e) == "auto") return 1U;
         return e ? static_cast<unsigned>(std::strtoul(e, nullptr, 10)) : 0U;
-    }();
+    }};
+    const unsigned tall_env = tall_env_cache.get();
     unsigned tall = v.tall ? v.tall : tall_env;
     if (tall == 1U) {
         // auto, by the production attention sites (site benchmark, gfx1151, every form bitwise): from 256 rows the Lean 4
@@ -3320,10 +3452,11 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
         }
         // STRIX_DS41_DENSE_TALL_ROTATE=1 (exactness gates only): every call takes the next of 814 / 914 / 822 in turn,
         // whatever its shape, so one --reference run covers the three selector forms on every site
-        static const bool rotate = [] {
+        static strix::lever_cache<bool> rotate_cache{[] {
             const char* e = std::getenv("STRIX_DS41_DENSE_TALL_ROTATE");
             return e != nullptr && e[0] == '1';
-        }();
+        }};
+        const bool rotate = rotate_cache.get();
         static std::atomic<unsigned> turn{0U};
         if (rotate) pick = std::array<unsigned, 3>{814U, 914U, 822U}[turn.fetch_add(1U, std::memory_order_relaxed) % 3U];
         if (pick != 0U && !lean_ok) pick = pick == 914U ? 114U : pick == 822U ? 22U : 14U;
@@ -3333,10 +3466,11 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
                                                                           : 0U;
     }
     // STRIX_DS41_DENSE_STATS=1 (diagnostics): calls and rows per (form, width, count, row_width), printed at exit
-    static const bool stats = [] {
+    static strix::lever_cache<bool> stats_cache{[] {
         const char* e = std::getenv("STRIX_DS41_DENSE_STATS");
         return e != nullptr && e[0] == '1';
-    }();
+    }};
+    const bool stats = stats_cache.get();
     if (stats) {
         struct Count { unsigned long long calls = 0, rows = 0; };
         static std::mutex lock;

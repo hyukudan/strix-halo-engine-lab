@@ -4102,6 +4102,7 @@ __device__ __forceinline__ float qsa_rows_coefficient(unsigned scale, std::int8_
 }
 // index_q, index_k, q, k, v (five segments) from BF16 rows to BF16-rounded FP32.
 template <unsigned Rows> struct QsaInputRowsSite {
+    static constexpr unsigned turbo_group = strix::onfly_i4::qsa_io;  // TURBO+ onfly INT4 g64 decode (q8_rows/iu4)
     static constexpr bool dense_trellis_inputs = true;
     using Input = std::uint16_t;
     static constexpr unsigned rows = Rows;
@@ -4121,6 +4122,7 @@ template <unsigned Rows> struct QsaInputRowsSite {
     }
 };
 template <unsigned Rows, class InputType = float> struct QsaOutputRowsSite {
+    static constexpr unsigned turbo_group = strix::onfly_i4::qsa_io;  // TURBO+ onfly INT4 g64 decode (q8_rows/iu4)
     using Input = InputType;
     static constexpr unsigned rows = Rows;
     static constexpr bool fused_fma = true;  // Site::fma compiles to v_fmac_f32 (wide VOPD rows)
@@ -6762,15 +6764,21 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                         qpf2k_maxima_row_stride = maxima_stride;
                         return;
                     }
-                    const auto launch = [&]<unsigned RowsPerCta>() {
+                    const auto launch_split = [&]<unsigned RowsPerCta, bool S>() {
                         if (pool->packed)
-                            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, RowsPerCta, W, false, false, true, 1U, false, true>),
+                            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, RowsPerCta, W, false, false, true, 1U, false, true, S>),
                                 dim3((tiles + W - 1U) / W, Rows / RowsPerCta), dim3(W * 32U), 0, stream, scores, static_cast<const void*>(pool->packed),
                                 scored_blocks, a.index_dim, maxima, maxima_stride, static_cast<const uint2*>(qpf2k_key_ranges(pool->capacity)));
                         else
-                            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, RowsPerCta, W>), dim3((tiles + W - 1U) / W, Rows / RowsPerCta),
+                            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, RowsPerCta, W, false, false, true, 1U, false, false, S>),
+                                dim3((tiles + W - 1U) / W, Rows / RowsPerCta),
                                 dim3(W * 32U), 0, stream, scores, static_cast<const float*>(pool->keys), scored_blocks, a.index_dim, maxima, maxima_stride,
                                 static_cast<const uint2*>(qpf2k_key_ranges(pool->capacity)));
+                    };
+                    // STRIX_QSA_SCORE_SPLIT_LOADS (qsa_flash::score_split_loads): same bits, no query-SGPR spills.
+                    const auto launch = [&]<unsigned RowsPerCta>() {
+                        if (qsa_flash::score_split_loads()) launch_split.template operator()<RowsPerCta, true>();
+                        else launch_split.template operator()<RowsPerCta, false>();
                     };
                     // 64-row groups use the stage batch's rows-per-CTA policy (qsa_flash::score_rows): this path scores every group above
                     // 65536 blocks, where the stage batch declines. Same bits for every RowsPerCta (tests/qsa_score_rows.hip).

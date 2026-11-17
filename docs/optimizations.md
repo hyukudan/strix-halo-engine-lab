@@ -4504,6 +4504,55 @@ stay on the exact kernels: they select experts and tokens, where a flip is not a
 - **Measured:** Pair FAST prefill 8K 9.25 -> 9.05 s (-2.1 %, 2 ABAB pairs: 9.258 / 9.245 vs 9.034 / 9.073); 32K 37.74 -> 37.13 s (-1.6 %; off 37.705 / 37.771, on 36.990 / 37.280 / 37.105; one run of each arm at 41-43 s discarded as a disturbed run); kernels at 4096 rows: f_a + g_a + b 3.06 -> 1.71 ms, f_b / g_b (8192 outputs) 4.06 -> 2.03 ms.
 - **Off switch:** `STRIX_GLM_PF_KDA_WMMA=0` (or exact mode). `=1` forces it; both ranks of a pair must resolve the same value (checked by the startup agreement).
 
+<a id="glm-pf-mla-gemm-heads"></a>
+
+### Exact MLA absorb / out GEMM: heads-mid CTA order (glm-pf-mla-gemm-heads)
+
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_MLA_GEMM_HEADS`. **Default:** on (exact and FAST routes; same bits).
+
+The per-head MLA GEMMs of a prefill chunk (absorb: q_nope x W_UK -> 512-wide latent query; out: o-bar x W_UV)
+read and write `[C][heads][K]` buffers, so the rows of one head sit 32 / 64 KiB apart. With the previous grid
+(column tile, row tile, head) every resident CTA worked on the same head: all requests hit the same 1 KiB slice of
+each row and camped on a few memory channels. `mla_gemm_rows_v3_kernel` now runs (column tile, head, row tile): the
+heads of a row tile are in flight together and the requests spread over the whole row. Placement only: every output
+keeps its FP32 chain. Microbenchmark on the same layout (WMMA tile core, C 4096 x 32 heads): rows-then-head 6.8 /
+6.4 ms, heads-mid 3.4 / 4.5 ms, head-major strides (no camping) 2.2 / 3.0 ms (absorb / out); head groups of 4, 8
+and 16 equal the plain heads-mid order, so weight re-reads are not the limit.
+
+- **Exactness:** bitwise (prefill tests `STRIX_GLM_PF_TEST_ONLY=mla`: 46 checks, v3 == v1 explicit arms and v3 == v2).
+- **Measured:** layer bench C 4096, t0 4096 (us/row, exact / FAST arm): absorb 2.38 / 2.21 -> 1.16 / 1.20, out 2.16 / 2.40 -> 2.01 / 2.03.
+- **Off switch:** `STRIX_GLM_PF_MLA_GEMM_HEADS=0` restores the rows-then-head order.
+
+<a id="glm-pf-mla-wmma"></a>
+
+### FAST MLA absorb / out GEMMs on the short-K WMMA tile core (glm-pf-mla-wmma-v1)
+
+**Engine:** `glm` + shared cores (`src/core/f16_tile_gemm.hpp`, `src/attn_core/sparse_flash_wmma.hpp` `out_op`). **Control:** `STRIX_GLM_PF_MLA_WMMA`, `STRIX_GLM_PF_MLA_OB16`. **Default:** on with the FAST route (`STRIX_GLM_PF_WMMA=1`); never on the exact route.
+
+The two MLA GEMMs run on a shared FP16 WMMA tile GEMM for short-K strided row batches (GLM adapter
+`src/glm/prefill/glm_pf_mla_wmma.hpp`): CTA 128 x 128, 8 waves as 4 x 2 (wave tile 32 x 64, 8 accumulators), K step
+32 through one 20 KB LDS stage with next-stage register prefetch (2 CTAs per CU), A converted FP32 -> FP16 (RNE) at
+staging, W_UV read as stored (`[n][k]`) and W_UK (`[k][n]`) transposed in LDS (no weight copy), fragments kept as 8
+dwords so gfx11 true16 codegen does not re-pack them (that re-pack cost 192 VALU per 16 WMMAs). Heads-mid order as
+above. The dense FP16 core (`f16_dense_tall`) was measured slower on these shapes (K 256 / 512: A straight from
+global with one-unit lookahead, 36.9 KB LDS = 1 CTA per CU). Softmax, scores and o-bar arithmetic are unchanged.
+The absorb writes the bf16 q-tilde image the fused flash core reads (core `Bf16Store`, same bits as #668's v3 image),
+and the flash core stores o-bar as the FP16 image the out GEMM would stage (`out_op` hook, core FP16-A input): the
+same operand bits from half the bytes on both sides.
+
+- **Exactness:** FAST identity (FP16-rounded activations, FP32 accumulation, one WMMA chain per output ascending in
+  k). FAST gate PASS vs FAST without it (prose / code / chat, 1,536 rows): KL 0.0053, top-1 98.2 %, dNLL -0.0002; vs
+  exact: KL 0.0048, top-1 97.5 %, dNLL -0.0045 (FAST without it: 0.0052 / 97.2 % / -0.0043). Both images are
+  bitwise (tests: image == to_bf16(sums), FP16-A == FP32-A; layer bench 23 == 21). Kernel gate: contract in double rel-L2 8.0e-7 (K 256) / 1.6e-6 (K 512), drift vs FP32 inputs 2.1e-4 (56 checks).
+- **Measured:** layer bench C 4096 us/row, FAST arm with the q-tilde image (absorb / o-bar / out): 0.876 / 6.436 /
+  1.859 -> 0.617 / 6.362 / 0.959 (-5.0 ms per call, 22 calls per rank at 8K); o-bar image alone -0.69 ms per call.
+  - **Pair (8K FAST, 3 strict ABAB pairs, before the two images):** warm 8.504 -> 8.399 s (963 -> 975 tok/s), cold
+  9.847 -> 9.489 s, against FAST without it. Rebased ABAB with both images: pending. Component image checks and layer timings do not qualify
+    the complete current-head workload or establish its performance/fidelity gates.
+- **Off switch:** `STRIX_GLM_PF_MLA_WMMA=0` (exact FP32 GEMMs inside FAST), `STRIX_GLM_PF_MLA_OB16` default off (opt-in `=1`: FP16 o-bar image, not bitwise at C 4096, no e2e gain); both
+  ranks of a pair must resolve the same value (startup agreement bit). Restart after changing these controls or
+  `STRIX_GLM_PF_MLA_GEMM_HEADS`; values are cached after application defaults, shared by receipts and dispatch.
+
 <a id="f16-dense-epilogue-tail"></a>
 
 ### Dense FP16 core: store policy, sized remainder launch, idle-wave skip (f16-dense-epilogue-tail)
@@ -4561,6 +4610,52 @@ memory. The absorb and out GEMMs stay on the exact v3 kernels (an f16 WMMA versi
 - **Off switch:** STRIX_GLM_PF_ATTN_WMMA=0 (or exact mode)
 - **Measured gain:** Layer bench (C 2048 rows, gfx1151): scores+softmax+o-bar 17.3 -> 6.7 us/row at the 8K position, 22.9 -> 7.2 at 32K (2.6x / 3.2x); MLA total 21.3 -> 11.2 / 27.3 -> 11.4 us/row. Pair FAST, fresh process per arm: 8K prefill 10.600 -> 9.695 s (-0.905 s, -8.5 %, 2 ABAB pairs, with the removed WMMA GEMM); 32K 44.30 -> 40.26 s (-4.03 s, -9.1 %; one F / core / F set: 43.54, 40.26, 45.05 s). FAST_I4 not measured.
 - **Implementation / evidence:** [core](../src/attn_core/sparse_flash_wmma.hpp), [helpers](../src/attn_core/flash_tile.hpp), [GLM policy](../src/glm/prefill/glm_prefill.hip), [test](../tests/hip_attn_core_sparse_tests.hip), [bench](../tests/hip_glm_pf_layer_bench.hip)
+
+<a id="glm-pf-mla-qt16"></a>
+
+### FAST fused attention core reads q-tilde as a bf16 image
+
+**Engine:** `glm` (shared core `attn_core::sparse`). **Control:** `STRIX_GLM_PF_MLA_QT16`. **Default:** on wherever the FAST fused MLA core runs with the v3 absorb GEMM.
+
+The fused core rounded each FP32 q-tilde value to bf16 when it loaded its query fragments, so the absorb GEMM wrote
+4 bytes per value that the core read back only to round. The absorb GEMM now keeps its FP32 chains and stores the
+rounded value itself (`tile::to_bf16`, the core's own rounding), and the core loads those operand bits through the
+shared core's optional `query_op` policy hook with no conversion: half the q-tilde bytes written and read (268 MB per
+4096-row launch), and the core's query prologue loses its rounding code (2,722 -> 798 instructions in the kernel,
+main loop unchanged). The out GEMM still reads FP32 o-bar.
+
+- **Preconditions:** `STRIX_GLM_PF_WMMA=1` with the fused core, 32 heads per rank, absorb GEMM v3 (the default); other GEMM versions keep FP32 q-tilde.
+- **Exactness evidence:** Bitwise to the glm-pf-attn-wmma identity. `hip_glm_prefill_tests` (`STRIX_GLM_PF_TEST_ONLY=mla`): o-bar, MLA output and guard regions equal for T 32 and T 16, finite and NaN/Inf latents; layer bench arm 23 equals arm 21; pair 8K logits of both ranks equal in every A/B run.
+- **Off switch:** `STRIX_GLM_PF_MLA_QT16=0` (FP32 q-tilde, same bits)
+- **Measured gain:** Pair FAST 8K, warm (second prefill of the process): 8.617 -> 8.524 s median (-99 ms, three ABAB pairs -196 / -50 / -99 ms), 951 -> 961 tok/s, GPU clocks per token 2894k -> 2845k. Layer bench (C 4096, one node): absorb 9.52 -> 7.37 ms, fused core 27.74 -> 26.37 ms per launch. Cold first prefills follow the KFD eviction time of the run, not the switch.
+- **Resources:** no spill; fused core 256 VGPR and absorb 128 VGPR as before; same scratch buffer (the image uses half of it).
+- **Implementation / evidence:** [hook](../src/attn_core/sparse_flash_wmma.hpp), [GLM absorb + policy](../src/glm/prefill/glm_prefill.hip), [test](../tests/hip_glm_prefill_tests.hip), [bench](../tests/hip_glm_pf_layer_bench.hip), [pair A/B kit](../scripts/bench/glm/prefill-pair.sh) (arms `--profile fast` with and without `STRIX_GLM_PF_MLA_QT16=0`)
+
+<a id="ds41-pf-flash-q16"></a>
+
+### DS41 FAST flash reads q as a bf16 image after RoPE
+
+**Engine:** `deepseek41` (shared cores `core::f16_dense_tall::q8a8` image store, `attn_core::sparse` query_op). **Control:** `STRIX_DS41_FAST_ATTN_Q16`. **Default:** on in ds41-attn-bf16flash-v1 layers when q_b runs on dense-q8a8-f16-v1.
+
+The q_b epilogue applies the flash prologue's own RoPE (`rope_pair`, dims 448..511) and rounding (`tile::to_bf16`) and stores the bf16 image in q's memory; the flash core loads it through `query_op` with no FP32 prologue. Other q_b forms keep FP32 q.
+
+- **Exactness evidence:** Bitwise. `strix-hip-ds41-fast-dense-tests` image vs prologue 0 differing values (10 shapes); pair 11,594 logits fnv equal in all 12 processes (both ranks, both arms).
+- **Off switch:** `STRIX_DS41_FAST_ATTN_Q16=0` (FP32 q, same bits)
+- **Measured gain:** q_b 2048 x 1024 x 8192: 1.505 -> 1.352 ms. Pair 11,594 warm, strict ABAB 3 pairs: d +15 / +30 / -29 ms (no wall gain beyond noise).
+- **Implementation / evidence:** [image store](../src/core/f16_dense_q8a8.hpp), [q_b](../src/hip_ds41_layer.hip), [policy](../src/hip_ds41_attention_flash.inl), [test](../tests/hip_ds41_fast_dense_tests.hip)
+
+<a id="mm-pf-msa-q16"></a>
+
+### MiniMax MSA FAST flash reads q as a bf16 image after norm + RoPE
+
+**Engine:** `minimax` (shared core `attn_core::sparse` key-split query_op / query_op_lo). **Control:** `STRIX_MM_PF_MSA_Q16`. **Default:** on in mode 11 / 12 layers when q comes from the v4 dense core (1024+ rows).
+
+The q finish (`dense_finish_kernel`) moves each head row to the prologue's lane layout, runs the same `msa::norm_rope_lane` (one definition, `msa_norm_rope.hpp`) and stores `pack2<bf16>` (mode 12 also the lo terms) in q's memory; the key-split core loads it through `query_op`. Rows below 1024 use the library GEMM (no epilogue) and keep FP32 q.
+
+- **Exactness evidence:** Bitwise. `strix-hip-mmx-moe-bench --tests test_prefill_dense`: q image and lo equal to the prologue at T 9..4096 and band 4; pair 8K state and final-rows fnv equal in all 6 runs.
+- **Off switch:** `STRIX_MM_PF_MSA_Q16=0` (FP32 q, same bits)
+- **Measured gain:** pair 8K warm, strict ABAB 3 pairs: d -1.87 / -1.10 / -0.50 s; larger than the byte saving explains (directional, being traced).
+- **Implementation / evidence:** [hook](../src/attn_core/sparse_flash_keysplit.hpp), [q finish](../src/minimax/moe/mmx_prefill.hip), [policy](../src/minimax/attn/msa_flash_policy.hpp), [test](../tests/hip_mmx_moe_bench.hip)
 
 <a id="mm-pf-msa-flash"></a>
 
@@ -4658,7 +4753,7 @@ out to the file, which the same prefill would read again. Decode keeps the open'
 - **Exactness evidence:** Prefill state, tokens and logits bitwise equal on and off; 16 TTFT repeats bitwise equal across four alternating loads.
 - **Off switch:** --prefill-clean-evict 0
 - **Measured gain:** Full card, `--ttft-only`, disk queue 1, four alternating fresh-process loads (on / off / off / on): TTFT 8K 14.9 → 12.7 s first request and 13.2 → 11.6 s second (off → on, −15 % / −12 %), 32K 43.7-43.8 s in every load (tie); per load the prefill read 3.5-4.0 GB from the unit file instead of 9.6 GB (−60 %) and the decode residency restore took 2.5-2.9 s instead of 4.1-4.6 s
-- **Implementation / evidence:** [GLM RTX guide](../src/glm/rtxpf/README.md), [cache hook](../src/glm/rtxpf/producer/expert_tier.hpp)
+- **Implementation / evidence:** [GLM RTX guide](../src/cuda/models/glm/README.md), [cache hook](../src/cuda/models/glm/producer/expert_tier.hpp)
 
 <a id="glm-rtx-disk-queue"></a>
 
@@ -4674,7 +4769,7 @@ Unit-file reads in flight in a three-tier open; `auto` picks 4 / 6 / 8 from the 
 - **Exactness evidence:** Same output bytes (tokens, logits, state) at any queue.
 - **Off switch:** `--tier-disk-queue 1`
 - **Measured gain:** Auto vs 1 at about 76 % file share (24 GiB VRAM + 32 GiB RAM) was never slower in the latest measured decode cell means: 1K cold / warm +42 / +35 %, 8K cold / warm +33 / +16 %. Earlier one-drive cells were +9..+42 % in seven of eight (remaining -3.4 % traced to drive read phases); two-drive stripes +26..+38 %. Single loads vary up to 2x, so the gain size is uncertain. At about 61 % (48 GiB + 32 GiB), one earlier night observed cold-1K decode -32 % against the queue-1 mean; warm 1K +3 %, cold 8K +7 %, warm 8K +1 %. A later set at the same budget reversed the cold-1K result: auto +8.4 % pooled, every auto arm faster. The 70 % cut remains a conservative empirical cutoff: 61 % stays at 1. Full card (about 1-4 % at tile 2048) tied in TTFT (8K +0.6..+2 %, 32K equal), so it stays at 1.
-- **Implementation / evidence:** [GLM RTX guide](../src/glm/rtxpf/README.md)
+- **Implementation / evidence:** [GLM RTX guide](../src/cuda/models/glm/README.md)
 
 <a id="glm-pf-seqpar"></a>
 
@@ -5173,3 +5268,12 @@ a route a lever does not admit. TILE64 (instead of the tier split), tier mode 2 
 fork, the union cap and the build-time DPP reductions replace or depend on other choices and are separate arms.
 `--print-effective-config` ends the prefill block with an `allon` object (mode, one entry per lever with its resolved value
 and class). Test plan and lever census: [all-on guide](models/qwen3.8/allon.md).
+
+### DeepSeek V4.1 group prefill under the FAST profile
+
+**Engine:** `deepseek`. **Control:** `STRIX_SERVE_PREFILL_GROUP=auto|0`. **Default:** auto, also under `STRIX_DS41_FAST_PREFILL=1` and each single FAST lever (`strix::ds41::kGroupFastQualified`; `false` restores "FAST groups only with an explicit auto", reason `pending-group-fast-identity`).
+
+Several short waiting prompts run as one device prefill pass under the FAST levers. Each member keeps its solo arithmetic: a shared route plan (`include/strix/prefill_dense_plan.hpp`, `include/strix/ds41_dense_plan.hpp`) gives every projection site's route (batch / exact dense / FAST dense) and K split from the member's own rows, split and cone; members group only with equal plans, and the pass pins the exact dense kernels where the members' route is exact (the FAST dense 128-row threshold never sees the summed rows). Flash attention runs on per-member BF16 mirrors. Still solo: the FP16 hipBLASLt backend (`fp16-solver-geometry-unpinned`) and diagnostic outputs (`diagnostic-output-not-segmented`).
+- **Off switch:** `STRIX_SERVE_PREFILL_GROUP=0`
+- **Exactness evidence:** pair runs, same eight prompts solo (one at a time) and grouped in one server: every member's logits and exported-state hashes equal its solo run on both ranks, under exact (solo hashes equal to the previous main), the FAST profile, FAST_DENSE, FAST_MOE, FAST_ATTN=2, and the FAST profile with `STRIX_DS41_FAST_DENSE_MIN_ROWS=64` (groups of 125 rows across the threshold).
+- **Measured gain:** FAST profile, eight requests x 256 tokens: whole run 99.9 -> 102.7 tok/s (+2.8 %), admission 1,428 -> 865 ms; four requests about +1 % (noisy).
