@@ -34,6 +34,7 @@
 #include "qwen_tier_adapter.hpp"
 #include <filesystem>
 #include "strix/cuda/vram_guard.hpp"
+#include "strix/qwen_weight_packs.hpp"
 
 #include "strix/cuda/amd_math_tables.hpp"
 
@@ -87,18 +88,7 @@ constexpr std::uint32_t qsa_ordinal(std::uint32_t layer) { return layer / 4U; }
 std::uint32_t round_up(std::uint32_t v, std::uint32_t m) { return (v + m - 1U) / m * m; }
 
 // The parts of a split GGUF ("...-00001-of-00002.gguf"): every part in order; otherwise the file itself.
-std::vector<std::string> model_parts(const std::string& path) {
-    const auto at = path.rfind("-00001-of-");
-    if (at == std::string::npos || path.size() < at + 20) return {path};
-    const auto total = static_cast<unsigned>(std::stoul(path.substr(at + 10, 5)));
-    std::vector<std::string> parts;
-    for (unsigned i = 1; i <= total; ++i) {
-        char index[8];
-        std::snprintf(index, sizeof(index), "%05u", i);
-        parts.push_back(path.substr(0, at + 1) + index + path.substr(at + 6));
-    }
-    return parts;
-}
+std::vector<std::string> model_parts(const std::string& path) { return weight_pack::gguf_parts(path); }
 bool ends_with(const std::string& s, const char* tail) {
     const std::size_t n = std::strlen(tail);
     return s.size() >= n && s.compare(s.size() - n, n, tail) == 0;
@@ -335,6 +325,7 @@ struct Prefill::Impl : BlockFields {
     gguf::FileInfo info;                       // tensors of every part, with the types as stored on the device
     std::string ple_part;                      // the part holding per_layer_token_embd
     bool native_experts = false;               // some layer's experts need the native MoE path
+    weight_pack::Admission admission;          // the declared weight pack the file is (strix/qwen_weight_packs.hpp)
     Weights w;
     std::vector<hc::HcPacked> hc_attn, hc_ffn;  // per layer
     struct LayerPtrs { void* p[kLayerTensors]{}; std::uint32_t gate_type = 0, down_type = 0; };
@@ -526,6 +517,9 @@ struct Prefill::Impl : BlockFields {
 };
 
 void Prefill::Impl::upload_model() {
+    // Retain admission of the original merged headers. `info` below describes device storage after transcode.
+    admission = qwen_packs::admit_model(cfg.model_gguf);
+    if (!admission.pack) throw std::runtime_error("Qwen weight pack not admitted: " + admission.reason);
     constexpr std::uint64_t kChunk = std::uint64_t{256} << 20;
     std::uint8_t* staging[2] = {nullptr, nullptr};
     ck(cudaMallocHost(&staging[0], kChunk), "pinned staging");
@@ -660,6 +654,9 @@ void Prefill::Impl::upload_model() {
         probe.down_type = lw[l].down_type;
         native_experts = native_experts || moe::native_types(probe);
     }
+    // Validate the route against source admission. FAST dense transcodes may still have A8 experts.
+    if (admission.pack->arithmetic == "exact" && native_experts)
+        throw std::logic_error(std::string("Qwen weight pack ") + std::string(admission.pack->id) + " disagrees with the expert route");
     ck(cudaStreamSynchronize(stream), "hc pack");
     if (cfg.turbo_onfly_nvfp4) convert_onfly();
 }
@@ -1268,11 +1265,15 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
         std::size_t free_now = 0, total_now = 0;
         if (cudaMemGetInfo(&free_now, &total_now) == cudaSuccess && m.plan.card.free > free_now) m.engine_bytes = m.plan.card.free - free_now;
     }
-    char buf[384];
+    char buf[512];
     std::snprintf(buf, sizeof(buf), "{\"weights_gb\":%.2f,\"upload_s\":%.1f,\"block_rows\":%u,\"max_positions\":%u,"
-                  "\"transcoded_tensors\":%u,\"native_experts\":%s}",
+                  "\"transcoded_tensors\":%u,\"native_experts\":%s,\"weight_pack\":\"%.*s\",\"pack_arithmetic\":\"%.*s\","
+                  "\"pack_fingerprint\":\"%s\"}",
                   static_cast<double>(m.w.bytes) / 1e9, std::chrono::duration<double>(Clock::now() - t0).count(), m.cap,
-                  m.cfg.max_positions, m.transcoded, m.native_experts ? "true" : "false");
+                  m.cfg.max_positions, m.transcoded, m.native_experts ? "true" : "false",
+                  static_cast<int>(m.admission.pack->id.size()), m.admission.pack->id.data(),
+                  static_cast<int>(m.admission.pack->arithmetic.size()), m.admission.pack->arithmetic.data(),
+                  qwen_packs::hex64(m.admission.fingerprint).c_str());
     m.describe = buf; // OFF receipt remains the original byte sequence.
     if (m.state_type != RecurrentStateType::f32) {  // f32 keeps the original receipt bytes
         m.describe.pop_back();
@@ -1561,14 +1562,15 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         ew.down = static_cast<const std::uint8_t*>(lw[l].p[k_ffn_down_exps_weight]);
         nv.push("moe_routed");
         if (!tier) {
-            moe::enqueue(mr, pad, kHidden, ew, tables, nullptr, stream, cfg.forms.moe_mma && !window);
+            // FAST form: prefill blocks only; the receipt records what was dispatched (native experts fall back).
+            executed_forms.moe_mma |= moe::enqueue(mr, pad, kHidden, ew, tables, nullptr, stream, cfg.forms.moe_mma && !window);
         } else {
             // Tiered: the prologue reads the real ids; publish maps them to slots (misses -> the zero slot) and hands the
             // misses to the host; the routed kernels run on the slot routes; gather brings the host raw dots back.
             moe::enqueue_prologue(mr, pad, kHidden, stream);
             tier->publish(l, rows, pad, routes, tier_routes, moe_codes, moe_deltas, moe_sums, stream);
             mr.routes = {tier_routes, kTopK * 4};
-            moe::enqueue_routed(mr, pad, ew, tables, stream, cfg.forms.moe_mma && !window);
+            executed_forms.moe_mma |= moe::enqueue_routed(mr, pad, ew, tables, stream, cfg.forms.moe_mma && !window);
             tier->wait_gather(rows, moe_raw, mr.rawdots.stride, moe_status, mr.status.stride, csr.summary, stream);
             if (!window) {
                 // Read every layer before its summary is cleared by the next prologue. No failed
@@ -1587,7 +1589,6 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
             }
             moe::enqueue_combine(mr, pad, nullptr, stream);
         }
-        executed_forms.moe_mma |= cfg.forms.moe_mma && !window;
         executed_moe_route_bf16 |= mr.route_bf16;
         nv.pop();
         if (window) {

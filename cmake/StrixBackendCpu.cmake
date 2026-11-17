@@ -55,7 +55,7 @@ if(BUILD_TESTING)
 endif()
 
 # Microbench of the executor (not a test): scripts/bench/residency/cpu_expert_bench.cpp
-add_executable(strix-cpu-expert-bench scripts/bench/residency/cpu_expert_bench.cpp)
+add_executable(strix-cpu-expert-bench ${_strix_cpu_root}/scripts/bench/residency/cpu_expert_bench.cpp)
 target_link_libraries(strix-cpu-expert-bench PRIVATE strix_backend_cpu)
 find_package(Threads REQUIRED)
 target_link_libraries(strix-cpu-expert-bench PRIVATE Threads::Threads)

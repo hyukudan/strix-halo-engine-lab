@@ -28,6 +28,11 @@
 #include "qwen_dense_ref.hpp"
 #include "qwen_fixture.hpp"
 #include "qwen_gguf_host.hpp"
+#ifdef STRIX_WFMT_CAPTURE
+#include "../wfmt/cuda_capture.hpp"
+static std::string wfmt_capture_directory;
+static std::size_t wfmt_capture_index = 0;
+#endif
 
 namespace qd = strix::cuda::qwen_dense;
 namespace ref = strix::qwen_dense_ref;
@@ -269,6 +274,21 @@ static std::size_t run_projection(const Case& cs, const std::vector<std::vector<
         CK(qd::quantize_project(nullptr, site, rows, cs.input, in.p, width, codes.p, deltas.p, pitch));
         CK(cudaDeviceSynchronize());
     }
+#ifdef STRIX_WFMT_CAPTURE
+    std::vector<float> observed_partials;
+    std::uint32_t captured_outputs = 0;
+    if (!wfmt_capture_directory.empty()) {
+        std::vector<std::vector<std::uint8_t>> production;
+        for (const auto& out : outs) production.push_back(out->down());
+        for (const auto n : cs.outs) captured_outputs += n;
+        Dev<float> partials(static_cast<std::size_t>(width / 32U) * rows * captured_outputs);
+        CK(qd::capture_project_partials(nullptr, site, rows, codes.p, deltas.p, pitch, partials.p));
+        CK(cudaDeviceSynchronize());
+        observed_partials = partials.down();
+        for (std::size_t m = 0; m < outs.size(); ++m)
+            check(production[m] == outs[m]->down(), "diagnostic matches production output");
+    }
+#endif
     // host reference on the checked rows
     std::vector<std::int8_t> hc(static_cast<std::size_t>(rows) * width);
     std::vector<float> hd(static_cast<std::size_t>(width / 32U) * pitch);
@@ -285,6 +305,29 @@ static std::size_t run_projection(const Case& cs, const std::vector<std::vector<
     std::string first;
     for (std::uint32_t m = 0; m < nseg; ++m) {
         const auto got = outs[m]->down();
+#ifdef STRIX_WFMT_CAPTURE
+        if (!wfmt_capture_directory.empty()) {
+            // Observe the exact production buffers, not host recomputations.
+            const auto observed_codes = codes.down();
+            const auto observed_scales = deltas.down();
+            std::uint32_t begin = 0;
+            for (std::uint32_t j = 0; j < m; ++j) begin += cs.outs[j];
+            std::vector<float> segment_partials;
+            for (std::size_t line = 0; line < static_cast<std::size_t>(width / 32U) * rows; ++line)
+                segment_partials.insert(segment_partials.end(), observed_partials.data() + line * captured_outputs + begin,
+                                         observed_partials.data() + line * captured_outputs + begin + cs.outs[m]);
+            const std::uint64_t shape[]{rows, width, cs.outs[m], static_cast<std::uint64_t>(cs.store), m};
+            const std::string name = "cuda-dense-" + std::to_string(wfmt_capture_index++);
+            check(strix::weight::test::write_cuda_capture(wfmt_capture_directory, name,
+                "cuda-qwen-imma-four-chain@1", shape,
+                {{"source", std::as_bytes(std::span(weights[m]))},
+                 {"activation_codes", std::as_bytes(std::span(observed_codes))},
+                 {"activation_scales", std::as_bytes(std::span(observed_scales))},
+                 {"sidecars", std::as_bytes(std::span(gate))},
+                 {"partials", std::as_bytes(std::span(segment_partials))},
+                 {"output", std::as_bytes(std::span(got))}}), "write " + name);
+        }
+#endif
         const std::uint32_t N = cs.outs[m], ld = N + 4U;
         const std::uint32_t row_bytes = width / 32U * 34U;
         std::vector<std::uint8_t> expect_row_ok(check_rows.size(), 1);
@@ -657,7 +700,33 @@ static void replay_shared(const std::string& path, const strix::qwen_gguf::Model
 }
 
 int main(int argc, char** argv) {
-    std::setvbuf(stdout, nullptr, _IONBF, 0);   // a crash keeps the lines printed so far
+    std::setvbuf(stdout, nullptr, _IONBF, 0);  // a crash must not lose the log
+#ifdef STRIX_WFMT_CAPTURE
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::string_view(argv[i]) != "--wfmt-backend-capture") continue;
+        wfmt_capture_directory = argv[i + 1];
+        CK(cudaSetDevice(0));
+        // Boundary rows, output tails, even/odd Q8 group pairs and every store.
+        // Small synthetic tensors keep this a bounded pre-model GPU gate.
+        for (std::uint32_t store = 0; store < 4; ++store) {
+            const Case cs{"wfmt", static_cast<qd::Store>(store), qd::Input::bf16, 256U, {17U, 129U}};
+            std::vector<std::vector<std::uint8_t>> weights;
+            for (std::size_t m = 0; m < cs.outs.size(); ++m) weights.push_back(make_q8(cs.outs[m], cs.width, 90U + m));
+            for (std::uint32_t rows : {1U,2U,7U,8U,9U,31U,32U,33U,63U,64U,65U,127U,128U,129U})
+                run_projection(cs, weights, rows, rows + store * 101U, true, 129U);
+        }
+        // A single segment starts at a tile boundary and exercises tile2;
+        // the preceding split segments exercise the raw136 fallback.
+        for (std::uint32_t store = 0; store < 4; ++store) {
+            const Case cs{"wfmt-tile2", static_cast<qd::Store>(store), qd::Input::bf16, 256U, {129U}};
+            const std::vector<std::vector<std::uint8_t>> weights{make_q8(129U, 256U, 92U)};
+            for (std::uint32_t rows : {1U,2U,7U,8U,9U,31U,32U,33U,63U,64U,65U,127U,128U,129U})
+                run_projection(cs, weights, rows, rows + store * 101U, true, 129U);
+        }
+        std::printf("wfmt CUDA dense: %zu production records, %d failures\n", wfmt_capture_index, g_fail);
+        return g_fail ? 1 : 0;
+    }
+#endif
     bool gpu = false, do_bench = false, do_bench_rows = false;
     std::vector<std::array<std::uint32_t, 3>> shapes;
     std::string fixture;
@@ -755,3 +824,4 @@ int main(int argc, char** argv) {
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }
+

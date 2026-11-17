@@ -510,6 +510,35 @@ void test_queue_wait_work_until() {
     }
 }
 
+void test_ticket_emissions() {
+    for (const bool trace : {false, true}) {
+        GenerationQueue queue;
+        GenerationJob job;
+        job.prompt = {1U};
+        job.trace_emissions = trace;
+        const auto ticket = queue.submit(std::move(job));
+        const std::vector<std::uint32_t> first{2U, 3U}, last{4U};
+        ticket->publish(first);
+        ticket->publish({});
+        ticket->publish(last);
+        GenerationStats stats;
+        stats.generated_tokens = 3;
+        ticket->finish(std::move(stats));
+        const auto result = ticket->stats();
+        check(result.emission_trace == trace, "publication trace is request opt-in");
+        check(result.token_emissions.size() == (trace ? 2U : 0U), "trace counts committed nonempty groups only");
+        if (trace) {
+            check(result.token_emissions[0].count == 2U && result.token_emissions[1].count == 1U &&
+                  result.token_emissions[1].steady_ns >= result.token_emissions[0].steady_ns,
+                  "trace preserves group counts and monotonic publication times");
+        }
+        bool done = false;
+        check(ticket->wait(std::chrono::milliseconds(0), done) == std::vector<std::uint32_t>({2U, 3U, 4U}) && done,
+              "trace does not change ticket output or completion");
+        queue.shutdown();
+    }
+}
+
 // GenerationTicket::wake ends one wait() without tokens (set before the wait counts, so no lost wakeup), and a
 // cancelled ticket waited with wake_on_cancel=false blocks until the finish instead of returning at once.
 void test_ticket_wake() {
@@ -1342,6 +1371,7 @@ int main() try {
     test_batched_queue();
     test_queue_wait_work_until();
     test_ticket_wake();
+    test_ticket_emissions();
     test_queue_caller_orders();
     test_queue_cancel_replenishment();
     const auto tokenizer = tiny_tokenizer();
@@ -1509,6 +1539,28 @@ int main() try {
     };
 
     try {
+    {
+        const auto plain = http(port, "POST", "/v1/chat/completions",
+            R"({"messages":[{"role":"user","content":"Hi"}],"max_tokens":3})", auth);
+        check(plain.status == 200 && !at(parse_json(plain.body), "strix").find("token_emissions"),
+              "publication trace absent by default");
+        const auto traced = http(port, "POST", "/v1/chat/completions",
+            R"({"messages":[{"role":"user","content":"Hi"}],"max_tokens":3,"return_token_emissions":true})", auth);
+        const auto result = parse_json(traced.body);
+        const auto& trace = at(at(result, "strix"), "token_emissions");
+        std::int64_t previous = 0, count = 0;
+        for (const auto& event : at(trace, "events").as_array()) {
+            check(event.as_array()[0].as_int() >= previous, "wire emission times monotonic");
+            previous = event.as_array()[0].as_int();
+            count += event.as_array()[1].as_int();
+        }
+        check(traced.status == 200 && at(trace, "clock").as_string() == "steady_ns" &&
+              at(trace, "includes_stop_tokens").as_bool() && count == at(at(result, "usage"), "completion_tokens").as_int(),
+              "wire publication counts match final usage without logprobs");
+        const auto invalid = http(port, "POST", "/v1/chat/completions",
+            R"({"messages":[{"role":"user","content":"Hi"}],"return_token_emissions":1})", auth);
+        check(invalid.status == 400, "malformed trace request refused before admission");
+    }
     {
         const auto mode = auth + "X-Test-Config: constraints\r\n";
         const auto call = [&](const std::string& path, Json body, bool stream) {

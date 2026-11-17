@@ -119,7 +119,8 @@ const std::map<std::string, std::string> kFormer = {
     {"STRIX_MMX_PREFILL_TAIL_STREAM", "0"}, {"STRIX_MMX_PREFILL_PIPE_PAIR", "0"}, {"STRIX_MMX_PREFILL_PIPE_TAIL", "0"},
     {"STRIX_MM_PF_ROUTER_ROWS", "8"}, {"STRIX_MM_PF_MSA_SCRATCH_MB", "512"}, {"STRIX_MM_PF_DENSE_O", "0"},
     {"STRIX_MM_XB_WARM_O", "0"},           {"STRIX_MMX_MOE_TIGHT_GRID", "0"},
-    {"STRIX_MMX_MOE_PIPE", "0"},           {"STRIX_MMX_PF_ORDER", "adaptive"},
+    {"STRIX_MMX_MOE_PIPE", "0"},
+    {"STRIX_MM_PF_HEADLESS", "0"},          {"STRIX_MMX_PF_ORDER", "adaptive"},
 };
 // Cache identity field of the default chunk-invariant linear order (table item pf_order).
 const std::string kOrderId = "prefill_order=mmx-pf-linear-s1-v1";
