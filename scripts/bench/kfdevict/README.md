@@ -31,3 +31,13 @@ that rank's monitor log. Offsets in the output are relative to the marker, with 
 The legacy sampler repeats rolling vmstat deltas across EV records and PIDs. Its totals cannot be recovered
 by summing or deduplicating those observations. Counter totals require a separate timestamped cumulative
 vmstat stream sampled once per interval independently of EVs; this report does not claim such totals.
+
+## Pair ticket: evictions per prefill window
+
+| file | what it does | run |
+|---|---|---|
+| `pair-evict.sh` | One MiniMax pair ticket (one arm): the `minimax/fast-gate` timing route plus `OUT/evict.txt` with the evicted milliseconds of each rank before the first prefill, inside each prefill window and after the last, the compaction / migration counter deltas of both nodes over the ticket, and for rank 0 the runtime host-memory receipt with its count of shared anonymous host maps. | `pair-evict.sh OUT BIN MODEL_DIR ARM 'ENV' name=ids.u32[,...]` (inside a pair GPU turn, `KIT_PEER` set) |
+
+Use it with one session (the request right after load) and with three (reaches about 35 s after load, where the
+deferred compaction pass lands). `STRIX_HOST_DRIVER_PAGES=1` in `ENV` puts the runtime's own host memory on driver
+pages (`include/strix/device/runtime_host_memory.hpp`): compaction counters still move, the `ev` lines should not.

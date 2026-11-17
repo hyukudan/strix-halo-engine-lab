@@ -37,7 +37,8 @@ public:
         void* p = nullptr;
         // Shared host allocator (STRIX_HOST_ANON_PIN): staging pages out of compaction / reclaim while the load's
         // device allocations drive both (rank load under a full page cache: hundreds of queue evictions).
-        ok(strix::host_pin::allocate(&p, static_cast<std::size_t>(bytes), hipHostMallocDefault), "pinned staging");
+        // allocate_io: staging is the target of the load's O_DIRECT reads, at every size class.
+        ok(strix::host_pin::allocate_io(&p, static_cast<std::size_t>(bytes), hipHostMallocDefault), "pinned staging");
         std::lock_guard<std::mutex> lock(m_);
         pinned_ += bytes;
         peak_pinned_ = std::max(peak_pinned_, pinned_);

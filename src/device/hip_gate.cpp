@@ -1,10 +1,13 @@
 #include "strix/device/hip_gate.hpp"
 
 #include "strix/device/hip_enumerator.hpp"
+#include "strix/device/runtime_host_memory.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/power/sampler.hpp"
 #include "strix/route_receipt.hpp"
 
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <mutex>
 #include <optional>
@@ -47,8 +50,29 @@ const Bound& bind_hip(Request request, const std::string& devices_path, std::FIL
 }
 
 void bind_hip_main(int& argc, char** argv, std::FILE* receipt, CodeLoad code_load) {
+    // Runtime host memory mode first (runtime_host_memory.hpp): the eager-code restart then carries both values in one
+    // exec. Still here afterwards with a value this image inserted: restart for it, or roll it back.
+    bool host_pages_inserted = false;
+    try {
+        host_pages_inserted = apply_runtime_host_driver_pages(
+            [](const char* name) { return strix::envcfg::text(name); },
+            [](const char* name, const char* value) { return ::setenv(name, value, 0) == 0; });
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "%s\n", e.what());
+        std::fflush(stderr);
+        std::exit(2);
+    }
     eager_code_load_or_restart(argv, code_load);  // before anything touches the device: the restart repeats the process
+    if (const int error = finish_runtime_host_driver_pages(host_pages_inserted,
+            [](const char* name) { return ::unsetenv(name) == 0; }, [&] { return restart_own_image(argv); }))
+        std::fprintf(stderr, "runtime host memory: restart failed (%s); continuing with user pages\n", std::strerror(error));
     if (receipt && code_load == CodeLoad::shared) std::fprintf(receipt, "%s\n", code_load_receipt(code_load).c_str());
+    if (receipt) {
+        const std::string line = runtime_host_memory_receipt(strix::envcfg::text(kRuntimePagedMemory),
+                                                             strix::envcfg::text("STRIX_HOST_DRIVER_PAGES"),
+                                                             runtime_host_memory_restart_error());
+        if (!line.empty()) std::fprintf(receipt, "%s\n", line.c_str());
+    }
     try {
         const auto cli = take_command_line(argc, argv);
         Request request;
