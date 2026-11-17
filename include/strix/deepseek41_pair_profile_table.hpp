@@ -12,7 +12,7 @@
 // (docs/optimizations.json). No quality pack: 'quality' runs default with one notice.
 namespace strix::deepseek41::pair_defaults {
 
-inline constexpr std::array<strix::profile::Lever, 8> profile_table{{
+inline constexpr std::array<strix::profile::Lever, 9> profile_table{{
     // Prefill only (device prefill of the serve and the prefill app). FP32 softmax statistics.
     {"attention_f16wmma", "STRIX_DS41_FAST_ATTN", "", {"", "1", "", "2"}, "0", strix::profile::Kind::bit_changing,
      {true, false, true, false}, {true, true, true, true}, "ds41-attn-f16wmma-v1", "0",
