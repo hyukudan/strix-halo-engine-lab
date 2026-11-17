@@ -286,7 +286,9 @@ EncoderPlan plan(const EncoderConfig& c, unsigned rows, unsigned tiles, const En
 }
 
 unsigned attention_terms_from_env() {
-    static const unsigned terms = envcfg::number<unsigned>("STRIX_VISION_ATTN_TERMS", 2U, 1U, 2U);
+    // Default 1: the main rows. Two terms change the tower bits and the served answer of one fixture, cost +14 % per
+    // encode, and the device gate re-check still fails on preprocessing; 2 stays opt-in until that gate passes.
+    static const unsigned terms = envcfg::number<unsigned>("STRIX_VISION_ATTN_TERMS", 1U, 1U, 2U);
     return terms;
 }
 

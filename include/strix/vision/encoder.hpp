@@ -212,8 +212,8 @@ void splice_rows_host(float* dst, std::size_t dst_stride, const ProjectedRows& s
 
 // ---- HIP runner ------------------------------------------------------------------------------------------------
 
-// FP16 terms of the tower attention operands Q, K, V, P: 2 = hi + lo (default: precise, 3x the attention WMMA),
-// 1 = one term (faster, lower precision: the "vision-f16-v1" rows). STRIX_VISION_ATTN_TERMS=1|2, strict; the one
+// FP16 terms of the tower attention operands Q, K, V, P: 1 = one term (default: the "vision-f16-v1" rows, faster),
+// 2 = hi + lo (opt-in: closer to FP32, 3x the attention WMMA, other bits). STRIX_VISION_ATTN_TERMS=1|2, strict; the one
 // resolver of the default (every EncoderOptions starts from it: server, CLI, gate, memory plan).
 unsigned attention_terms_from_env();
 struct EncoderOptions {
@@ -252,8 +252,8 @@ struct EncoderLoadStats {
 // Defined in the HIP library only (src/vision/encoder.hip).
 class Encoder final : public EncoderBackend {
 public:
-    static constexpr const char* kArithmetic = "vision-f16-v1";            // one-term attention (attention_terms 1)
-    static constexpr const char* kArithmeticAttn2 = "vision-f16-attn2-v1";  // two-term attention (the default)
+    static constexpr const char* kArithmetic = "vision-f16-v1";            // one-term attention (attention_terms 1, the default)
+    static constexpr const char* kArithmeticAttn2 = "vision-f16-attn2-v1";  // two-term attention (opt-in)
     explicit Encoder(EncoderConfig, EncoderOptions = {});
     ~Encoder() override;
     Encoder(const Encoder&) = delete;

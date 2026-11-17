@@ -130,7 +130,7 @@ cosine at least 0.99999 per row; device backend mean cosine at least 0.9995, min
 | Preprocessing against Pillow, 6 images | patch tensor bit-equal |
 | Host FP32 tower + adapter against the numpy implementation | cosine 1.000000, relative L2 0.00000 (rows differ only by their BF16 storage) |
 | Device arithmetic `vision-f16-v1`, 7 images | single FP16 operands: 4 pass, 3 fail the row minimum; split activations: 1 of the 5 run fails it |
-| Device arithmetic `vision-f16-attn2-v1` (default: split activations + two-term attention), 7 images | **pass**: row minimum at least 0.999800, mean at least 0.999997, relative L2 at most 0.2 % |
+| Device arithmetic `vision-f16-attn2-v1` (opt-in: split activations + two-term attention), 7 images | **pass**: row minimum at least 0.999800, mean at least 0.999997, relative L2 at most 0.2 % |
 | Reference processor (checkpoint code), 6 images | patch tensor bit-equal (maximum difference 0), same grids, including grids with partial cells |
 | Reference model in FP32, 7 images, same patches | tower and rows cosine 1.000000, row minimum at least 0.999994, relative L2 at most 0.0002; special rows bit-equal |
 | Reference processor + model in FP32 against `preprocess` + `encode`, 6 images | rows cosine 1.000000, row minimum at least 0.999999, relative L2 at most 0.0001 |
@@ -160,7 +160,7 @@ the single FP16 rounding of the attention operands. A host model of the device r
 of the gate tool, FP16 terms per operand Q, K, V, P) attributes it: rounding Q alone gives 0.9893, K alone 0.99999,
 V alone 0.99996, P alone 0.999998. The rounding of the outlier's query, amplified by the softmax, carries the error.
 
-The tower attention therefore carries Q, K, V and P as two FP16 terms by default (hi + lo, lo = the FP16 rounding of
+With `STRIX_VISION_ATTN_TERMS=2` the tower attention carries Q, K, V and P as two FP16 terms (hi + lo, lo = the FP16 rounding of
 the remainder; the shared mechanism `tile::to_operand2` that the key-split sparse core already uses). Every product
 runs as hi.hi + hi.lo + lo.hi, at three times the attention WMMA. The gain is conditioned on format and range, not a
 fixed figure: per FP16 operand the error goes from max(2^-11 |x|, 2^-25) to max(2^-22 |x|, 2^-25), so per product
@@ -173,8 +173,8 @@ threshold.
 
 | Switch | Value | Rows | Cost on the minimum image (1,550 patches, steady) |
 |---|---|---|---|
-| `STRIX_VISION_ATTN_TERMS` unset or `2` (default) | two-term attention, arithmetic `vision-f16-attn2-v1` | gate passes | attention core 23 -> 48 ms; encode about 207 -> 236 ms |
-| `STRIX_VISION_ATTN_TERMS=1` | one-term attention, arithmetic `vision-f16-v1`: faster, lower precision | byte-equal to the previous rows | as before |
+| `STRIX_VISION_ATTN_TERMS=2` (opt-in) | two-term attention, arithmetic `vision-f16-attn2-v1` | encoder gate passes; the preprocessing re-check fails, so not the default yet | attention core 23 -> 48 ms; encode about 207 -> 236 ms |
+| `STRIX_VISION_ATTN_TERMS` unset or `1` (default) | one-term attention, arithmetic `vision-f16-v1`: faster, lower precision | byte-equal to the previous rows | as before |
 
 The value is resolved once (`vision::attention_terms_from_env`) and is the default of every `EncoderOptions`, so the
 server, the command-line tools and the memory plan see the same value; any other value is rejected. The two-term

@@ -454,7 +454,7 @@ void test_plan() {
     split.split_activations = true;
     CHECK(plan(c, 1521, 1, split).workspace_bytes() > small.workspace_bytes());
     CHECK(plan(c, 1521, 4).fixed_bytes >= small.fixed_bytes);
-    {  // two-term attention (the default) holds the lo terms of K and V^T: 2 x slots x heads x dp x 2 B more
+    {  // two-term attention (opt-in) holds the lo terms of K and V^T: 2 x slots x heads x dp x 2 B more
         EncoderOptions one, two;
         one.attention_terms = 1U;
         two.attention_terms = 2U;
@@ -596,8 +596,8 @@ void test_two_term_model() {
 
 // The device-rounding models of the attention operands: one FP16 term carries a relative operand error up to 2^-11,
 // hi + lo up to max(2^-22 |x|, 2^-25) (two_term_model.hpp); on a tower whose scores are large (ill-conditioned
-// softmax), the two-term form tracks FP32 far closer than the one-term form (the device's default vs its faster
-// switch), both in the operand model (attn_*) and in the model of the core's real products and order (attn_order).
+// softmax), the two-term form tracks FP32 far closer than the one-term form (the device's opt-in vs its faster
+// default), both in the operand model (attn_*) and in the model of the core's real products and order (attn_order).
 void test_attention_terms() {
     for (const float x : {1.0F, 0.1F, -3.14159F, 1e-3F, 6.1e-5F, 1234.567F, 0.33333334F}) {
         CHECK(round_f16_terms(x, 0U) == x);
