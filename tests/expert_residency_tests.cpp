@@ -135,6 +135,38 @@ void test_resolve() {
         REQUIRE(has(j, std::to_string(d.slots_per_layer).c_str()));
         REQUIRE(j.front() == '{' && j.back() == '}');
     }
+    {  // device profile cap (route_budget) is a residency input: same plan as the equal explicit budget, smaller cap wins
+        const CardBytes card{96 * GiB, 96 * GiB};
+        auto with = [&](std::uint64_t budget, std::uint64_t cap, Mode mode = Mode::automatic) {
+            Options o;
+            o.mode = mode;
+            o.vram_budget = budget;
+            o.device_cap = cap;
+            return resolve(o, m, card, sessions(), big_host());
+        };
+        auto same_plan = [](const Decision& a, const Decision& b) {
+            return a.ok == b.ok && a.mode == b.mode && a.budget == b.budget && a.expert_pool == b.expert_pool &&
+                   a.slots_per_layer == b.slots_per_layer && a.positions == b.positions && a.cap == b.cap;
+        };
+        const Decision none = with(0, 0), flag12 = with(12 * GiB, 0), prof12 = with(0, 12 * GiB);
+        REQUIRE(none.cap == card.total && none.cap_source == "card" && none.mode == Mode::full);
+        REQUIRE(flag12.cap_source == "residency" && prof12.cap_source == "device_profile");
+        REQUIRE(same_plan(flag12, prof12) && prof12.mode == Mode::tiered && prof12.budget == 12 * GiB);
+        const Decision tighter = with(8 * GiB, 12 * GiB), looser = with(24 * GiB, 12 * GiB), tie = with(12 * GiB, 12 * GiB);
+        REQUIRE(tighter.cap_source == "residency" && same_plan(tighter, with(8 * GiB, 0)));
+        REQUIRE(looser.cap_source == "device_profile" && same_plan(looser, prof12));
+        REQUIRE(tie.cap_source == "residency" && same_plan(tie, prof12));
+        // the forced tiered re-resolve of a route sees the same cap as its automatic decision
+        REQUIRE(with(0, 12 * GiB, Mode::tiered).budget == prof12.budget);
+        // the live free bytes still bound the budget below the cap; the cap is reported as applied
+        Options o;
+        o.device_cap = 12 * GiB;
+        const Decision busy = resolve(o, m, {96 * GiB, 10 * GiB}, sessions(), big_host());
+        REQUIRE(busy.budget == 10 * GiB && busy.cap == 12 * GiB && busy.cap_source == "device_profile");
+        const std::string j = decision_json(prof12);
+        REQUIRE(has(j, "\"vram_cap_source\":\"device_profile\"") && has(j, ("\"vram_cap_bytes\":" + std::to_string(12 * GiB)).c_str()));
+        REQUIRE(has(decision_json(none), "\"vram_cap_source\":\"card\""));
+    }
 }
 
 Options parse(std::vector<std::string> args) {

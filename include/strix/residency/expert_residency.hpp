@@ -22,6 +22,9 @@ enum class Mode { automatic, full, tiered };
 struct Options {
     Mode mode = Mode::automatic;
     std::uint64_t vram_budget = 0;  // bytes; 0 = whole card
+    // bytes; the bound device profile's cap (strix::device::MemoryBudget::device_bytes), 0 = none. Set by the route
+    // from the start gate, never by a flag: the plan then honours the same cap as the server's admission view.
+    std::uint64_t device_cap = 0;
     // false (STRIX_TIER_HOST_CHECK=0): tiered starts even when the host cannot hold every non-resident expert;
     // cold experts then page from the model file (the reason says by how much). Budget emulation only.
     bool host_check = true;
@@ -74,7 +77,18 @@ struct Decision {
     std::uint32_t slots_per_layer = 0;  // uniform, excludes the zero slot
     std::uint32_t positions = 0;
     std::uint32_t positions_requested = 0;
+    // budget = min(card free, cap); cap_source: card | residency (--vram-budget-gib / STRIX_VRAM_BUDGET_GIB) | device_profile
+    std::uint64_t cap = 0;
+    std::string cap_source = "card";
 };
+
+// The cap the budget plans for, before the live free bytes: the smaller of the explicit residency budget and the
+// device profile's cap (an explicit budget wins a tie), else the card total. `source` names which one applied.
+struct BudgetCap {
+    std::uint64_t bytes = 0;
+    std::string source = "card";
+};
+BudgetCap budget_cap(const Options&, std::uint64_t card_total);
 
 Decision resolve(const Options&, const ModelBytes&, const CardBytes&, const SessionBytes&, const HostBytes&);
 // {"expert_residency":...,"reason":...,"vram_budget_bytes":...,"expert_pool_bytes":...,"slots_per_layer":...,

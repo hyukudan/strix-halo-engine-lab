@@ -12,11 +12,12 @@ Bound today: Qwen3.8-Flash-Next on the CUDA route (`strix-cuda-qwen-serve`, `qwe
 | Flag / environment | Values | Meaning |
 |---|---|---|
 | `--expert-residency` / `STRIX_EXPERT_RESIDENCY` | `auto` (default), `full`, `tiered` | `auto` = `full` when everything fits the budget, `tiered` otherwise |
-| `--vram-budget-gib` / `STRIX_VRAM_BUDGET_GIB` | number, e.g. `8` or `7.5` | card bytes the engine may use (default: the whole card); emulates a smaller card on a bigger one |
+| `--vram-budget-gib` / `STRIX_VRAM_BUDGET_GIB` | number, e.g. `8` or `7.5` | card bytes the engine may use (default: the bound device profile's memory budget when one is declared, else the whole card; when both are set the smaller wins); emulates a smaller card on a bigger one |
 | `STRIX_TIER_CPU_THREADS` | integer | CPU expert threads (default min(16, hardware threads)) |
 
 `strix-cuda-qwen-serve --print-effective-config` resolves without loading the model and prints the choice and its
-reason (`expert_residency`, `reason`, `vram_budget_bytes`, `expert_pool_bytes`, `slots_per_layer`, `positions`,
+reason (`expert_residency`, `reason`, `vram_budget_bytes`, `vram_cap_bytes`, `vram_cap_source` = `card` | `residency` |
+`device_profile`, `expert_pool_bytes`, `slots_per_layer`, `positions`,
 `host_expert_bytes`). The same parser and resolver run inside `qwen_decode_bench`
 (`include/strix/residency/residency_cli.hpp`, `include/strix/residency/expert_residency.hpp`); a host test
 (`tests/expert_residency_parity_tests.cpp`) checks that both entry points resolve the same request identically.
