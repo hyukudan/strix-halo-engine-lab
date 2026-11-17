@@ -21,6 +21,7 @@
 #include <cstdint>
 
 #include "strix/cuda/amd_math.cuh"
+#include "strix/qwen_weight_packs.hpp"
 
 namespace strix::cuda::qwen_moe {
 
@@ -73,12 +74,15 @@ struct Rows {
     std::uint64_t rawdot_capacity = 0;
 };
 
+// Explicit FAST contract; defaults preserve the historical source/arithmetic.
+using ExpertArithmetic=::strix::qwen_packs::ExpertArithmetic;
 struct Weights {
     std::uint32_t gate_type = type_q4_k;       // 12 or 13 (gate and up share it)
     const std::uint8_t* gate = nullptr;        // [experts][ffn][hidden/256 blocks]
     const std::uint8_t* up = nullptr;
     std::uint32_t down_type = type_q5_1;       // 7 or 8
     const std::uint8_t* down = nullptr;        // [experts][hidden][ffn/32 blocks]
+    ExpertArithmetic arithmetic=ExpertArithmetic::incumbent;
 };
 
 // The single steps (tests) and the whole routed MoE of one layer. Any rows >= 1 is accepted (the HIP entry requires
@@ -101,5 +105,6 @@ bool enqueue(const Rows&, std::uint32_t rows, std::uint32_t clear_words, const W
 // True when the expert types are not the A8 profile's (gate Q4_K/Q5_K with down Q5_1/Q8_0): enqueue() then runs the native
 // FAST path (any cuda_qwen_quant.cuh type; needs Rows::intermediates for the FP32 h values).
 [[nodiscard]] bool native_types(const Weights&);
+[[nodiscard]] bool gsq_types(const Weights&);
 
 }  // namespace strix::cuda::qwen_moe

@@ -3278,9 +3278,16 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                                 m.dense(d,m.o.p+g*v.width,st,true);
                             }
                         } else if (m.dense_o_a && (grp != nullptr ? grp_dense(layer, ds41::kDenseOa) : n >= m.dense_min_rows)) {
-                            // one dense call per o-group (the same group products as the grouped batch kernel)
-                            o_low_quantized = o_low_a8;
-                            for (unsigned g = 0; g < groups; ++g) {
+                            // one dense call per o-group (the same group products as the grouped batch kernel); under the
+                            // FAST dense form all groups in one batched launch of the shared core (same bits, no A8 out)
+                            ds41::Q8A8DensePrefillView all;
+                            all.exact = pin_exact(layer, ds41::kDenseOa);
+                            all.weight = v.weight, all.width = v.width, all.count = c.o_lora_rank, all.rows = n, all.x_stride = QL;
+                            all.codes = m.ocodes.p, all.deltas = m.odeltas.p, all.out = m.o_low.p, all.out_stride = OLL;
+                            const bool batched = ds41::enqueue_q8_0_a8_fast_dense_groups(
+                                all, groups, std::size_t{c.o_lora_rank} * (v.width / 32U) * 34U, st);
+                            o_low_quantized = o_low_a8 && !batched;
+                            for (unsigned g = 0; !batched && g < groups; ++g) {
                                 ds41::Q8A8DensePrefillView d;
                                 d.weight = q8_rows(v.weight, std::size_t{g} * c.o_lora_rank, v.width);
                                 d.width = v.width;

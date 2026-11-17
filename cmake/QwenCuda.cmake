@@ -165,12 +165,16 @@ target_include_directories(qwen_route_bf16_operator PRIVATE tests/cuda)
 target_link_libraries(qwen_route_bf16_operator PRIVATE strix_qwen_cuda)
 target_compile_options(qwen_route_bf16_operator PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+add_executable(qwen_gsq_source_test tests/cuda/qwen_gsq_source_test.cu)
+target_link_libraries(qwen_gsq_source_test PRIVATE strix_qwen_cuda)
+target_compile_options(qwen_gsq_source_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
 add_executable(qwen_route_bf16_e2e tests/cuda/qwen_route_bf16_e2e.cu)
 target_link_libraries(qwen_route_bf16_e2e PRIVATE strix_qwen_cuda)
 target_compile_options(qwen_route_bf16_e2e PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
 if(MSVC)
-    foreach(target qwen_route_bf16_operator qwen_route_bf16_e2e)
+    foreach(target qwen_route_bf16_operator qwen_route_bf16_e2e qwen_gsq_source_test)
         target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
     endforeach()
 else()

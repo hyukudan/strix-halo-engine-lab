@@ -180,7 +180,8 @@ Options parse(int argc, char** argv) {
     if (request.print_effective_config) {
         auto config = serve::parse_json(qo::effective_config_json(resolved));
         if (!o.engine.model_gguf.empty()) {
-            const auto admission = strix::qwen_packs::admit_model(o.engine.model_gguf);
+            const auto admission = strix::qwen_packs::admit_model(o.engine.model_gguf,
+                strix::qwen_packs::expert_arithmetic_name(o.engine.expert_arithmetic));
             config.set("weight_pack", strix::weight_pack::to_json(admission));
         }
         o.effective_config = config.dump();

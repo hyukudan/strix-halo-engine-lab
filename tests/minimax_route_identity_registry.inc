@@ -45,6 +45,8 @@
 {"prefill-router-tiled", 'a', "router lane chain (j = lane mod 32 ascending) + xor butterfly + ordered top-4 scan", "hip-minimax-moe-tests router_batch_tests: tiled 32 vs fused/4/8 bytes for every kind and tail; mm_defaults.cpp pf_router_rows (default 32 = tiled v2)", ""},
 // src/minimax/engine/engine.hip: dense_o (STRIX_MM_PF_DENSE_O) - o_proj through enqueue_prefill_dense on full pieces
 {"prefill-dense-o", 'a', "EXL3 matrix+library gemm_splits+per-row WMMA chain+ordered split finish", "hip-mmx-moe-bench test_prefill_dense o == strix_gemm bitwise (T 9..4096); 4096-row pieces only; mm_defaults.cpp pf_dense_o", ""},
+// src/minimax/engine/engine.hip: dense_mlp; mm_defaults.cpp: pf_dense_mlp; apps/minimax_rank_main.cpp: ab_flag
+{"prefill-dense-mlp", 'a', "STRIX_MM_PF_DENSE_MLP default ON, baseline/OFF=0; layers 0-2, 4096 rows, supported raw weights+workspace; fixed WMMA chain and ordered split finish", "hip_mmx_moe_bench.hip test_dense_mlp_chain bitwise intermediates/output; --ab pfdensemlp state/final rows plus every A=0/B>0 candidate-call coverage; minimax_ab_qualify_host rejects fallback/stale/contaminated/partial coverage; minimax_route_identity_tests.cpp default/baseline/override checks (host checks are not native qualification)", ""},
 // src/minimax/engine/engine.hip: MSA scratch cap (STRIX_MM_PF_MSA_SCRATCH_MB) - windows per batch only
 {"prefill-msa-scratch", 'a', "independent MSA windows; batch size only", "msa_fused_tests.hip every-batch bytes (scratch=1/125 and full); mm_defaults.cpp pf_msa_scratch_mb", ""},
 // src/minimax/attn/msa_fused.hip: enqueue_prefill_index (STRIX_IDX_WMMA, default exact), prefill_index_refine_kernel
@@ -158,3 +160,6 @@
 // src/core/moe_i4_chain.hpp launch_chain; src/minimax/moe/mmx_prefill_iu4.inc. The resolved STRIX_MOE_I4_CHAIN_GSAVE
 // boolean is read once per call and passed to the shared plan policy.
 {"prefill-i4-chain-plan", 'a', "requested IU4 plan+STRIX_MOE_I4_CHAIN_GSAVE+scratch admission; a scratch-form paired launch the device rejects (spill or residency) retries the register-save form on plan 1, then a second tile list for the down", "moe_i4_chain_host_tests.cpp plan policy (admission, insufficient and zero scratch); every admitted form computes the same integers; UNCOVERED native MiniMax fallback execution", ""},
+
+// include/strix/pinned_host.hpp; src/minimax/pfx/pf_exchange.hip; src/dist_communicator.cpp
+{"host-anon-pin", 'a', "STRIX_HOST_ANON_PIN=0/1; automatic integrated GPU only; cached at startup; >=2 MiB anonymous locked long-term-pinned mapped buffers, small/refused pin falls back to hipHostMalloc; matching release; no arithmetic change", "minimax_route_identity_tests.cpp host_pin_selector automatic/override/invalid source contracts; source audit edit/removal negatives; UNCOVERED native pair complete token/logit/state equality under pin success, refusal and OFF", ""},
