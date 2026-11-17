@@ -1,6 +1,7 @@
 #pragma once
 
-// Eager GPU code-object loading, ONE home for every HIP binary (host only, no HIP headers).
+// Eager GPU code-object loading, ONE home for every HIP and CUDA binary (host only, no HIP / CUDA
+// headers; the CUDA policy is apply_eager_cuda_module_loading below).
 //
 // With the HIP default (deferred loading) a code object is loaded at the first launch of one of its kernels. On a
 // unified-memory APU that load allocates the code segment as a KFD userptr BO on host pages (seen with the kfdevict
@@ -43,6 +44,31 @@ inline bool apply_eager_code_loading(bool enabled, Get get, Put put) {
     if (!put("HIP_ENABLE_DEFERRED_LOADING", "0"))
         throw std::runtime_error("cannot configure HIP eager code loading");
     return true;
+}
+
+// CUDA side of the same policy. The CUDA driver reads CUDA_MODULE_LOADING once, when the runtime starts (cuInit), not
+// during static initialisation, so the CUDA start gate (cuda_enumerator.hpp bind_cuda) sets it before its first CUDA
+// call and no restart is needed. With the driver default (lazy, CUDA 12.2+) a module is loaded at the first launch of
+// one of its kernels, i.e. inside the first request: the cold 8,076-token Qwen prefill on the RTX PRO spent 168 ms in
+// four such loads (22-86 ms each) with the GPU idle. Eager loading moves them to process start; kernel arithmetic does
+// not change (bitwise). STRIX_EAGER_CODE_LOAD=0 declines; an explicitly supplied CUDA_MODULE_LOADING always wins.
+// Returns true when it set CUDA_MODULE_LOADING=EAGER.
+template<class Get, class Put>
+inline bool apply_eager_cuda_module_loading(Get get, Put put) {
+    const char* policy = get("STRIX_EAGER_CODE_LOAD");
+    if ((policy && policy[0] == '0') || get("CUDA_MODULE_LOADING")) return false;
+    if (!put("CUDA_MODULE_LOADING", "EAGER"))
+        throw std::runtime_error("cannot configure CUDA eager module loading");
+    return true;
+}
+
+// Receipt line of a CUDA binary's code loading: "code load: ..." (set_by_gate = apply_eager_cuda_module_loading's result).
+template<class Get>
+inline std::string cuda_code_load_receipt(Get get, bool set_by_gate) {
+    if (set_by_gate) return "code load: eager (CUDA_MODULE_LOADING=EAGER, start gate)";
+    if (const char* mode = get("CUDA_MODULE_LOADING")) return std::string("code load: CUDA_MODULE_LOADING=") + mode + " (environment)";
+    const char* policy = get("STRIX_EAGER_CODE_LOAD");
+    return policy && policy[0] == '0' ? "code load: lazy (STRIX_EAGER_CODE_LOAD=0)" : "code load: lazy (driver default)";
 }
 
 // The restart must repeat the process's own arguments: a runner that wraps an engine entry forwards a reduced argv,
