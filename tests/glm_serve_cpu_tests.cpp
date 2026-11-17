@@ -1339,7 +1339,8 @@ int main(int argc, char** argv) {
             auto blk = gs::encode(old_peer);
             const std::uint32_t v5 = 5;
             std::memcpy(blk.data() + offsetof(gs::Control, version), &v5, sizeof v5);
-            CHECK(throws_with([&] { (void)gs::decode(blk); }, "protocol version 5 from the peer, expected 8"));
+            CHECK(throws_with([&] { (void)gs::decode(blk); },
+                              "protocol version 5 from the peer, expected " + std::to_string(gs::kControlVersion)));
             CHECK(gs::decode(gs::encode(old_peer)).version == gs::kControlVersion);
             std::printf("v5-layout peer block: refused at the version check\n");
         }
