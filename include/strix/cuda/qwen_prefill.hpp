@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string_view>
 #include <optional>
 #include <string>
 #include <vector>
@@ -368,6 +369,11 @@ public:
     // Routed-MoE window rows: {"requested","effective","reason","real_row_windows","padding_rows_skipped",
     // "padded_windows"} - windows counted at verify_cohort (eager and graph replays alike), 9..15-row windows only.
     [[nodiscard]] std::string moe_rows_receipt_json() const;
+    // What the cohort's window cost model keys on (qwen_cohort_plan.hpp WideProfile): the routed-MoE window rows applied,
+    // the declared weight pack id and whether some layer's routed experts run the native MoE path.
+    [[nodiscard]] MoeRowsPolicy moe_rows() const;
+    [[nodiscard]] std::string_view weight_pack_id() const;
+    [[nodiscard]] bool native_experts() const;
     // Resolved card budget (tiered or an explicit cap, including full mode; 0 = full mode without an explicit cap) and the
     // device bytes it holds once loaded (measured): a server admits sessions against budget - engine bytes.
     [[nodiscard]] std::uint64_t card_budget_bytes() const;

@@ -1416,6 +1416,9 @@ std::string Prefill::residency_receipt_json() const {
     if (!impl_->tier) return "{\"expert_residency\":\"full\"}";
     return impl_->tier->receipt_json();
 }
+MoeRowsPolicy Prefill::moe_rows() const { return moe_rows_policy(impl_->cfg.moe_real_rows, impl_->tier != nullptr); }
+std::string_view Prefill::weight_pack_id() const { return impl_->admission.pack->id; }
+bool Prefill::native_experts() const { return impl_->native_experts; }
 std::string Prefill::moe_rows_receipt_json() const {
     const auto& m = *impl_;
     const auto p = moe_rows_policy(m.cfg.moe_real_rows, m.tier != nullptr);
