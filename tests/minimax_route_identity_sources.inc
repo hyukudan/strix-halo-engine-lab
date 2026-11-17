@@ -9,7 +9,7 @@
 // src/prompt_terminal_diagnostics.cpp; include/strix/session/checkpoint_io.hpp;
 // src/session/checkpoint_io.cpp. The recursive session scope detects the last
 // two additions; extending the audit's other exact scopes is separate work.
-{"CMakeLists.txt", 0x5fc1ec09f74b80dfULL},
+{"CMakeLists.txt", 0xc58bbad8dcfecdbdULL},
 {"apps/minimax_layercut.inc", 0x92d2fe37dc07e424ULL},
 {"apps/minimax_rank_main.cpp", 0x21ea381c8185ba08ULL},
 {"apps/minimax_serve_main.cpp", 0x901f15e2f283f377ULL},
@@ -30,7 +30,7 @@
 {"include/strix/minimax_msa.hpp", 0xa0a6110622dc918bULL},
 {"include/strix/pinned_host.hpp", 0xba3ccbc4f64ff08aULL},
 {"include/strix/prefill_headless.hpp", 0xf242052dcb4a1b87ULL},
-{"include/strix/serve/engine.hpp", 0xc7f79066a864c703ULL},
+{"include/strix/serve/engine.hpp", 0x397933dad5e2bf26ULL},
 {"include/strix/serve/session_runtime.hpp", 0xc2ab1eaeb7bfd9f2ULL},
 {"include/strix/session/backend.hpp", 0xcb84ff80943799d5ULL},
 {"include/strix/session/backend_cpu.hpp", 0xd51c05740b5ae454ULL},
@@ -200,7 +200,7 @@
 {"src/moe_core/qwen_k_weight_decode.inc", 0xb3796f17d32c5ef1ULL},
 {"src/moe_core/route.hpp", 0x3acb79710ef6b1a8ULL},
 {"src/moe_core/route_prune.hpp", 0xc984e04250ded524ULL},
-{"src/serve/engine.cpp", 0x9e161aad98be7b85ULL},
+{"src/serve/engine.cpp", 0xcb3cb4d65ed99916ULL},
 {"src/serve/session_runtime.cpp", 0xbbe4127996483de1ULL},
 {"src/session/backend_cpu.cpp", 0x50c31392820e2f65ULL},
 {"src/session/backend_hip.cpp", 0xa6e4474212a9da70ULL},
