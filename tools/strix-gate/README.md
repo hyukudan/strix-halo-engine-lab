@@ -170,8 +170,9 @@ Refused with exit 2 (no verdict): fewer than three nulls, a null whose binary di
 candidate's, whose prompts or token files differ, or whose run id repeats the reference, the
 candidate or another null; `--null-arm` without `--dnll-rule floor`; floor with
 `--expect-identical`; and any `--engine` / `--profile` pair that `DNLL_POLICY` in the script does not
-grant the floor rule. Today the table holds one entry, `ds41` / `fast-prefill`; every other engine and
-profile keeps the absolute dNLL <= 0.01 (the default, unchanged). Widening the table is a policy
+grant the floor rule. Today the table holds two entries, `ds41` / `fast-prefill` and `minimax` /
+`fast-prefill` (next section); every other engine and profile keeps the absolute dNLL <= 0.01 (the
+default, unchanged). Widening the table is a policy
 decision. Under the floor rule the report prints and records (`pooled.dnll_rule` in `--json`) the
 rule, engine, profile, each null (run id, arm, env, rows, KL, top-1, dNLL), mean, sd, the limit and
 the absolute 0.01 verdict as a reference column; with the default rule `pooled.dnll_rule` records
@@ -222,6 +223,69 @@ policy threshold, not a confidence bound or model-fidelity result. Synthetic
 host tests establish validation and arithmetic only; compiler, native execution,
 model fidelity and complete-workload qualification remain separate gates.
 
+### Onset-matched floor (MiniMax FAST prefill)
+
+```sh
+python tools/strix-gate/fast_logit_gate.py compare EXACT CAND --ranks 0 1 --tokens ... \
+    --dnll-rule floor --engine minimax --profile fast-prefill --null-arm N1 --null-arm N2 --null-arm N3
+```
+
+On MiniMax one fp16-surviving ulp anywhere flips near-tie block selections (top-16) and expert
+routes (top-4 of 128), so a layer-0 null already lands at KL ~0.5, top-1 ~88 % and a dNLL that
+swings by +-0.1 between seeds: a floor built on it would pass anything. The rule therefore matches
+the null to the candidate: each null is a one-ulp change of the attention output (the tensor MSA
+flash replaces) at the candidate's FIRST FAST layer, and the gate checks the null's control layer
+against the candidate's witnessed layer set. With >= 3 such nulls (distinct seeds, same binary,
+prompts and reference) the candidate must pass all of (`MM_FLOOR` in the script):
+
+| check | rule |
+|---|---|
+| `kl`, `top1` | pooled KL <= max(0.02, mean + 2 sd of the nulls); top-1 >= min(0.93, mean - 2 sd): the floor only relaxes the absolute bar |
+| `dnll` | pooled dNLL <= min(max(0.01, mean + 2 sd), 0.03): never tighter than the absolute 0.01, never looser than 3 x 0.01 |
+| `kl_q50`, `kl_q90` | each per-row KL quantile <= max(mean + 2 sd of the nulls' same quantile, tolerance 1e-3 / 0.02): a diffuse shift cannot hide under heavy null tails, and a one-ulp null's median row (rounding only, KL ~1e-5) does not demand bitwise arithmetic; `kl_q99` is reported only (the tail is chaos, and one null site flips fewer near-ties than a FAST layer set) |
+| `sign` | rows with abs(dNLL) >= 1e-3: one-sided binomial P(X >= worse) >= 0.01 against p0 = max(0.5, pooled null worse share); more chaos adds rows, not slack |
+| `copy` | copy rows (the last 8 prompt tokens occurred earlier and were followed by the true token; token-only, the same rows for every arm): next-token misses beyond the reference's <= worst null + max(1, ceil(1 %)) |
+
+The absolute KL / top-1 / dNLL verdict is printed and stored (`pooled.abs_pass`) as a reference.
+The candidate must differ from the reference only in its FAST layer set: every receipt lever other
+than `minimax.msa_flash` must be equal, and so must every recorded switch outside the explicit
+FAST allowlist (`STRIX_MM_PF_MSA_FLASH`, `STRIX_MM_PF_MSA_FLASH_LAYERS`, `STRIX_MM_FAST_PREFILL`).
+Receipts omit defaulted switches and cannot distinguish them from unconsulted switches; a
+one-sided entry outside that allowlist is therefore refused, even if it explicitly selects a default.
+Mean + 2 sd of three controls is a policy threshold, not a bound: a candidate drawn exactly like
+the nulls fails one such check about 11 % of the time (t with 2 degrees of freedom).
+
+### Witness producer: `witness`
+
+```sh
+python3 fast_logit_gate.py witness --dir RUN --rank R --run-id ID --binary BIN --rows 256 --select \
+    --attest sel_mode=4 --prompt NAME=TOKENS.u32 --engine minimax --engine-log RUN/rR.log --model MODEL_DIR \
+    --out RUN/execution-rR.json
+python3 fast_logit_gate.py seal ... --execution-witness RUN/execution-rR.json
+```
+
+Run by the launcher on the rank's node after the engine exits. The MiniMax adapter reads the
+rank's process route receipt (`strix-route-receipt {...}`): engine; profile `exact` (MSA flash
+off, EXL3, default prefill identity), `fast-prefill` (MSA flash on, otherwise the same) or
+`other`; `fast` = MSA flash mode (10 + `STRIX_MM_PF_MSA_FLASH`: 11 one-term, 12 two-term) and
+layers; `numerical_config_sha256` over the effective levers and switch set without output-only
+switches, and `config` = those levers and switches (for the comparison above).
+The index-projection WMMA member additionally requires `minimax-index-proj-executed` records,
+emitted after the prefill completion fence: matching rank, executed layer mask and each sealed
+prompt's token count and little-endian token FNV-1a64. A selected startup lever alone is insufficient.
+The control
+comes only from the engine's own null-control lines in a lab diagnostic build:
+`DIAG attn ulp: layer L seed S rows N pos0 P values V prompt "NAME"`.
+The prompt name is a JSON string matching a sealed prompt. All events must use one layer and seed,
+have positive row/value counts and a row span inside that prompt; every sealed prompt must have
+an event. Unlabelled, malformed and incomplete control logs are refused. The lab emitter must
+supply these prompt identities; this gate does not add native diagnostic instrumentation.
+`model_sha256` binds every file's relative path, size and full-content SHA-256, including all tensor
+payloads and large-file middles. Producing a witness reads the complete model bundle; keep assets
+immutable from execution through witness generation. Regenerate older header/sample-based witnesses.
+The prompts map is the one `seal` computes. Same trust boundary as above: launcher statements,
+not proofs of which assets, binary or log belong to a completed run.
+
 When both arms carry selection dumps (`PREFIX-<prompt>-sel-r<rank>.u32`; MiniMax writes them
 with `STRIX_MM_QUALITY_SELECT=1` next to `STRIX_MM_QUALITY_OUT`), `compare` also reports, per
 layer, the (row, head) slots whose selected block set differs and the first layer and position
@@ -229,3 +293,44 @@ where the arms part. This is a cross-run comparison: after the first difference 
 different activations, so later differences include propagation, not only local rounding.
 
 `python -m unittest discover -s tools/strix-gate -p 'test_*.py'` covers it with synthetic dumps.
+
+### TURBO relative bar: `compare --mode turbo`
+
+`--mode fast` (default) is the absolute FAST bar above, unchanged. `--mode turbo` judges T (the candidate) against a
+reference pack R measured on the same E (the exact arm): `compare E T --mode turbo --reference-pack-arm R_DIR ...`.
+Per row, U95(KL_T-KL_R), U95(disagreement_T-disagreement_R) and U95(dNLL_T-dNLL_R) must each be <= 0 (one-sided 95 %,
+paired rows). Optional absolute safety limits: `--turbo-max-kl`, `--turbo-min-top1`, `--turbo-max-dnll`. `--null-arm`
+controls are measured against E and reported (not a verdict input).
+
+The normal-approximation intervals treat sampled rows (and paired T-minus-R differences) as independent
+observations with finite variance and enough samples for the approximation. Tokens within a prompt may be
+correlated, making these intervals overconfident; they do not establish prompt-level uncertainty or model
+qualification. Such claims require independently sampled prompts and prompt-level resampling or another
+validated treatment of clustering. Task Wilson intervals likewise assume independent Bernoulli trials.
+
+Pack identity: `seal --model-sha SHA` records the weights/pack sha (else the execution witness `model_sha256` is used).
+E and T must share it unless `--candidate-sha` declares T's; R may differ from E only with `--reference-sha` equal to R's
+sealed value. Every participating rank, including null controls, needs a valid SHA-256 digest. A declared digest
+must agree with an available execution witness. Missing, invalid, undeclared or mismatching identities are errors (exit 2).
+
+`--task-results JSON`: `{"tasks":[{"name":"t1","category":"code|math|retrieval|tools|json|prose","E":{"passed":8,"total":10},"T":{...},"R":{...}}]}`.
+Per category and overall the receipt carries passed/total/rate and a Wilson 95 % interval per arm. Checks per category:
+T's drop vs E must not exceed R's drop unless the T and R Wilson intervals overlap; absolute drop of T vs E <= 5 points
+code/math, 2 retrieval, 1 tools (override `--task-drop-limit CAT=POINTS`); json must pass 100 % for T.
+
+Verdicts and exit codes: PASS 0, FAIL 1 (every failing check is named), error 2, NO-REFERENCE 3 (no `--reference-pack-arm`
+or a task without `R`; never PASS, but a failing check still reports FAIL).
+
+`--receipt OUT.json` writes `strix-turbo-receipt/v1`: `verdict`, `failing`, `commit` (`--commit`), `binary_sha256` {E,T,R},
+`pack` {calibration (`--calibration`), E_sha, T_sha, R_sha}, `run`, `hardware` (`--run-manifest JSON`, free keys such as
+hardware, gpu_clock_mhz), `routes` {effective_config: lines of `--effective-config FILE`, execution_witness from the seals},
+`metrics` (mean + 95 % interval for T and R), `checks`, `tasks`, `controls`, `performance` (`--perf JSON`: tok_s,
+bytes_per_token, ttft_ms, p95_ms; absent keys are null and listed in `missing`).
+
+## GLM scored prefill compare: `glm_score_nll.py`
+
+The GLM rank captures the last N prompt rows' logits with `STRIX_GLM_PF_SCORE_LAST=N` and
+`STRIX_GLM_PF_SCORE_OUT=DIR/NAME-tf` (one vocabulary slice per rank). `glm_score_nll.py --dir DIR --ref X1 --test I1
+--prompt P.u32 --vocab-size V [--rows 256] [--json OUT]` (V is the model's full vocabulary size) prints NLL ref/test, dNLL (offset-1 target = the scored rule), mean KL and
+top-1 agreement. The prompt must be the length being gated: a `.u32` file holds 4 bytes per token (a 32,768-byte file
+is an 8K prompt). Tests: `python -m unittest test_glm_score_nll` in this directory.

@@ -5,6 +5,7 @@
 #include "strix/cuda/qwen_prefill.hpp"
 #include "strix/profiles/qwen_cuda.hpp"
 #include "strix/env_flags.hpp"
+#include "strix/lever.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -31,7 +32,17 @@ struct Request {
     pr::Inputs inputs;                     // lever options (cli) and the environment lookup (empty: process env)
     bool print_effective_config = false;   // --print-effective-config
     std::optional<bool> release_by_layer;  // typed explicitly
+    bool blocks_typed = false;             // --blocks / --block-rows typed: the schedule is the caller's
 };
+
+// Flat prefill blocks: an untyped schedule becomes one entry, the largest block of the configured schedule (same
+// allocation: every workspace is sized from that maximum). Scheduling only: every schedule produces bit-identical
+// state. Each block pays the routed-MoE expert weights and the per-kernel launch/skeleton costs once whatever its
+// rows, so fewer, larger blocks are less work per token. ON where measured: the serve entry (state stays on the
+// device). The hand-off entries keep the ramp, whose small first block releases state early; unmeasured there.
+inline constexpr ::strix::lever::Decl flat_blocks_lever{
+    .name = "qwen_cuda_flat_blocks", .env = "STRIX_QRTX_FLAT_BLOCKS", .exactness = ::strix::lever::Exactness::bitwise,
+    .default_on = true, .source = "docs/engine/serving/qwen-cuda-prefill.md: flat-block receipt (strict ABAB, bit-equal logit dumps)"};
 
 struct Difference {
     std::string name, value, reason;
@@ -78,6 +89,7 @@ inline bool take(int argc, char** argv, int& i, Request& r) {
         const auto n = number(a, v, qp::kMaxBlockRows);
         c.final_block_rows = static_cast<std::uint32_t>(n);
     } else if (a == "--blocks") {
+        r.blocks_typed = true;
         c.block_schedule.clear();
         const auto v = next();
         for (std::size_t at = 0; at < v.size();) {
@@ -88,6 +100,7 @@ inline bool take(int argc, char** argv, int& i, Request& r) {
     } else if (a == "--block-rows") {
         const auto rows = static_cast<std::uint32_t>(number(a, next()));
         if (rows < 1024 || rows % 16) throw std::invalid_argument("--block-rows must be a multiple of 16 and >= 1024");
+        r.blocks_typed = true;
         c.block_schedule = {rows};
     } else if (a == "--release-by-layer") r.release_by_layer = true;
     else if (a == "--no-release-by-layer") r.release_by_layer = false;
@@ -140,6 +153,19 @@ inline Resolved resolve(const Request& r, Entry entry, std::string_view default_
         name("decode", "1", "serve runs decode/verify steps (LM head + final mix uploaded, step() enabled)");
         name("export_state", "0", "a decode session never hands its state off; no D2H staging");
         name("release_by_layer", "0", "nothing is exported, so there are no pieces to release per layer");
+        if (!r.blocks_typed && !c.block_schedule.empty()) {
+            const std::string key(flat_blocks_lever.env);
+            const char* raw = r.inputs.env ? r.inputs.env(key.c_str()) : ::strix::envcfg::text(key.c_str());
+            if (::strix::lever::select(flat_blocks_lever, {}, raw).on) {
+                const auto cap = *std::max_element(c.block_schedule.begin(), c.block_schedule.end());
+                if (c.block_schedule != std::vector<std::uint32_t>{cap}) {
+                    c.block_schedule = {cap};
+                    name("block_schedule", std::to_string(cap),
+                         "flat blocks (qwen_cuda_flat_blocks, bitwise): no hand-off needs an early small block, and each block "
+                         "re-reads the expert weights once; off: STRIX_QRTX_FLAT_BLOCKS=0 or a typed --blocks");
+                }
+            }
+        }
     } else if (r.release_by_layer) c.release_by_layer = *r.release_by_layer;
     if (entry != Entry::serve && c.model_gguf.empty() && !default_model.empty()) {
         c.model_gguf = std::string(default_model);
@@ -153,6 +179,17 @@ inline Resolved resolve(const Request& r, Entry entry, std::string_view default_
     return out;
 }
 
+inline ::strix::serve::Json forms_json(const qwen_prefill::Config::Forms& f, bool moe_route_bf16) {
+    using J = ::strix::serve::Json;
+    auto forms = J::object();
+    forms.set("hc_mma", J(f.hc_mma));
+    forms.set("mtp_mma", J(f.mtp_mma));
+    forms.set("qsa_mma", J(f.qsa_mma));
+    forms.set("moe_mma", J(f.moe_mma));
+    forms.set("moe_route_bf16", J(moe_route_bf16));
+    return forms;
+}
+
 inline std::string effective_config_json(const Resolved& r) {
     using J = ::strix::serve::Json;
     const auto& c = r.config;
@@ -160,13 +197,7 @@ inline std::string effective_config_json(const Resolved& r) {
     out.set("entry", J(entry_name(r.entry)));
     out.set("profile", J(pr::name(r.resolution.profile)));
     out.set("arithmetic_contract", J(r.contract));
-    auto forms = J::object();
-    forms.set("hc_mma", J(c.forms.hc_mma));
-    forms.set("mtp_mma", J(c.forms.mtp_mma));
-    forms.set("qsa_mma", J(c.forms.qsa_mma));
-    forms.set("moe_mma", J(c.forms.moe_mma));
-    forms.set("moe_route_bf16", J(c.moe_route_bf16.value_or(false)));
-    out.set("forms", std::move(forms));
+    out.set("forms", forms_json(c.forms, c.moe_route_bf16.value_or(false)));
     auto route = J::object();
     route.set("requested", J(c.route_policy->requested));
     route.set("effective", J(c.route_policy->enabled));

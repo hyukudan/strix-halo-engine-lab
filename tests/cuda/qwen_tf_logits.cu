@@ -8,7 +8,7 @@
 // [0, N - R), then step() windows of <= 8 rows over tokens [N - R, N) teacher-forced (each window is committed), and
 //   DIR/PREFIX-NAME-tf-r0.f32 = [R][vocab] little-endian FP32, row j = logits after consuming token N - R + j.
 // --runs 2 repeats prefill + windows in one process: the first run is cold (module load, allocation), the second warm;
-// the prefill ms of every run is printed and the dumps of the runs are compared bit for bit.
+// the prefill ms of every run is printed and the dumps must match bit for bit or the arm fails.
 #include "strix/cuda/qwen_options.hpp"
 #include "strix/cuda/qwen_prefill.hpp"
 
@@ -82,13 +82,9 @@ int main(int argc, char** argv) try {
     std::printf("loading...\n");
     std::fflush(stdout);
     qp::Prefill engine(resolved.config);
-    // Written by the executing process, after construction, for the quality-gate seal.
-    {
-        std::ofstream config_file(fs::path(out_dir) / "effective-config.json");
-        config_file << qo::effective_config_json(resolved) << '\n';
-        config_file.close();
-        if (!config_file) throw std::runtime_error("cannot write effective configuration");
-    }
+    // A receipt is published only after every prompt and repetition succeeds.
+    using J = strix::serve::Json;
+    auto executions = J::array();
     std::printf("loaded %s\n", engine.describe().c_str());
     const qp::Sink drop = [](const qp::Piece&) {};
     for (std::size_t p = 0; p < prompts.size(); ++p) {
@@ -113,8 +109,24 @@ int main(int argc, char** argv) try {
                         run == 0 ? "cold" : "warm", ms(t0, t1), timing.total_s * 1e3, static_cast<unsigned long long>(timing.rows), rows, ms(t1, t2));
             std::fflush(stdout);
             if (run == 0) first = std::move(dump);
-            else std::printf("%s run %u dump %s run 0\n", name.c_str(), run,
-                             dump.size() == first.size() && !std::memcmp(dump.data(), first.data(), dump.size() * sizeof(float)) ? "identical to" : "DIFFERS from");
+            else {
+                const auto common = std::min(first.size(), dump.size());
+                if (dump.size() != first.size() ||
+                    (common != 0 && std::memcmp(first.data(), dump.data(), common * sizeof(float)))) {
+                    std::size_t at = 0;
+                    while (at < common && !std::memcmp(&first[at], &dump[at], sizeof(float))) ++at;
+                    throw std::runtime_error(name + " run " + std::to_string(run) +
+                        " differs from run 0 at element " + std::to_string(at) +
+                        " (sizes " + std::to_string(first.size()) + ", " + std::to_string(dump.size()) + ")");
+                }
+                std::printf("%s run %u dump identical to run 0\n", name.c_str(), run);
+            }
+            auto execution = J::object();
+            execution.set("prompt", J(name));
+            execution.set("run", J(static_cast<std::uint64_t>(run)));
+            execution.set("rows", J(timing.rows));
+            execution.set("forms", qo::forms_json(timing.executed_forms, timing.executed_moe_route_bf16));
+            executions.push(std::move(execution));
         }
         const auto path = (fs::path(out_dir) / (prefix + "-" + name + "-tf-r0.f32")).string();
         std::ofstream f(path, std::ios::binary | std::ios::trunc);
@@ -122,6 +134,12 @@ int main(int argc, char** argv) try {
         if (!f) throw std::runtime_error("cannot write " + path);
         std::printf("%s: wrote %s (%u rows x %zu)\n", name.c_str(), path.c_str(), rows, first.size() / rows);
     }
+    auto receipt = strix::serve::parse_json(qo::effective_config_json(resolved));
+    receipt.set("executions", std::move(executions));
+    std::ofstream config_file(fs::path(out_dir) / "effective-config.json");
+    config_file << receipt.dump() << '\n';
+    config_file.close();
+    if (!config_file) throw std::runtime_error("cannot write effective configuration");
     return 0;
 } catch (const std::exception& e) {
     std::fprintf(stderr, "qwen_tf_logits: %s\n", e.what());

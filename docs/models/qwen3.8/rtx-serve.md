@@ -44,7 +44,7 @@ cmake --build build-rtx --target strix-cuda-qwen-serve
 | `--max-queue N` | 64 | Requests waiting for a slot; beyond it the server answers busy. |
 | `--prefill-chunk N\|auto` | 1024 | Prefill rows of a new request per chunk, run between the decode steps of the other sessions. `auto` fits the chunk to the decode step time. |
 | `--cohort-depth fair\|max` | `fair` | How MTP depth is shared when several sessions decode in one step. |
-| `--block-rows N` | 1024 | Prefill block rows (multiple of 16, at least 1024). |
+| `--block-rows N` | flat 8192 | Prefill block rows (multiple of 16, at least 1024). Untyped: one repeating block of 8192 rows (lever `qwen_cuda_flat_blocks`, bitwise; `STRIX_QRTX_FLAT_BLOCKS=0` or `--blocks 1024,2048,4096,8192` restores the ramp). See [prefill scheduling](../../engine/serving/qwen-cuda-prefill.md#flat-blocks-on-the-serve-entry). |
 
 Every response carries the `strix.rtx` receipt: emitted ids, prefill and decode timings and slot occupancy.
 
@@ -124,4 +124,10 @@ BF16), and the MoE prefill project/down GEMMs with one FMA scale chain per outpu
 code: `src/cuda/core/mma_tile.cuh`, `src/cuda/core/attention_tile.cuh`, `src/cuda/core/imma_tile.cuh`. Gate receipt:
 `gate.sh` run `fast-20261116015045` (12 prompts at 2K/8K/32K, 128 teacher-forced rows each): pooled KL 0.0091,
 top-1 0.986, dNLL +0.0026. Exact lever: the dense projection runs `project_tile2_kernel` (same FP32 chain per output,
-bitwise) by default; `STRIX_QRTX_DENSE_TILE2=0` restores the first tiled kernel.
+bitwise) by default; `STRIX_QRTX_DENSE_TILE2=0` restores the first tiled kernel. Its weight loader is the remapped one
+(`qwen_dense_t2_remap`, bitwise, default on: 16 lanes per weight row, stage-invariant addresses, one CTA per SM without
+the 128-register cap; `STRIX_QRTX_DENSE_T2_REMAP=0` restores the first loader). Site microbench
+(`qwen_dense_tests --bench-shape M,K,N`, 8192 rows, 2.6 GHz, equal output hashes): 2560 x 16384 3.148 -> 2.267 ms,
+2560 x 13312 2.570 -> 1.837, 6144 x 2560 1.227 -> 0.838, 2560 x 1280 0.282 -> 0.207, 640 x 2560 0.162 -> 0.131 ms
+(218 -> 303 TOPS on the largest site). Without any load the same kernel runs 1.529 ms and without the FP32 chain
+3.040 ms: the stage is bound by the weight loader, not by the chain.

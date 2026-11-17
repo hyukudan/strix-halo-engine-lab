@@ -1,9 +1,11 @@
 #include "strix/env_flags.hpp"
+#include "strix/pinned_host.hpp"
 #include "strix/file_snapshot.hpp"
 #include "strix/hip_check.hpp"
 #include "strix/ds41_prefill_tuning.hpp"
 #include "strix/hip_ds41_dense_fp16.hpp"
 #include "strix/deepseek41_prefill.hpp"
+#include "strix/ds41_prefill_precision.hpp"
 
 #include "strix/deepseek41_attention_host.hpp"
 #include "strix/deepseek41_plan.hpp"
@@ -338,6 +340,12 @@ bool prefill_o_b_one() {
 // bit 2 = after them): host synchronisation at the points --timing synchronises at. Bit 1 alone holds the whole gain: with
 // the main stream drained, the lanes' wait on chunk_ready is already satisfied when their window launches are queued.
 bool prefill_moe_pass_window() { return strix::envcfg::flag("STRIX_DS41_PREFILL_MOE_PASS_WINDOW", true, strix::EnvFlagMatch::exact); }
+// ds41-attn-bf16flash-v1 layers: q_b writes q's BF16 image after RoPE (query_op of the shared flash core; same bits,
+// half the q bytes). Default on (bitwise); STRIX_DS41_FAST_ATTN_Q16=0 keeps the FP32 q and the flash prologue.
+bool prefill_flash_q16() {
+    static const bool on = strix::envcfg::flag("STRIX_DS41_FAST_ATTN_Q16", true, strix::EnvFlagMatch::exact);
+    return on;
+}
 std::uint32_t prefill_moe_window_cap() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_PREFILL_MOE_WINDOW_CAP", 8192U, 1U, 65536U); }
 bool prefill_joint_layer() { return strix::envcfg::flag("STRIX_DS41_PREFILL_JOINT_LAYER", false, strix::EnvFlagMatch::exact); }
 std::uint32_t prefill_joint_layer_rows() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_PREFILL_JOINT_LAYER_ROWS", 1024U, 0U, 65536U); }
@@ -591,6 +599,7 @@ struct DevicePrefill::Impl {
     };
     std::vector<SeqState> group;
     std::uint32_t group_used = 0;               // members of the last run_group (0: none)
+    bool solo_discarded = false;                // run_group dropped the single sequence: export_state() refuses until run / import
     const PrefillGroupPlan* grp = nullptr;      // set by run_group around its run_from
     std::vector<PrefillResult> group_results;   // filled by the head of a group pass
     // group scratch: the members' last rows (head), their logits blocks, argmax candidates, seed rows of every member
@@ -757,6 +766,7 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
     }
     options.fast_dense = options.fast_dense || ds41::fast_profile::dense_on();
     options.fast_moe = options.fast_moe || ds41::fast_profile::moe_on();
+    options.fast_engram = options.fast_engram || ds41::fast_profile::engram_on();
     // Per-shape selector of the FP16 backend: STRIX_DS41_PREFILL_FP16_PROJ (comma list of q_a, kv, q_b, o_a, o_b),
     // STRIX_DS41_PREFILL_FP16_MIN_ROWS (calls of at least that many rows), STRIX_DS41_PREFILL_APPROX_LAYERS=first-end,
     // STRIX_DS41_PREFILL_FP16_A8=1 (operands from the A8 codes)
@@ -1227,7 +1237,7 @@ DevicePrefill::~DevicePrefill() {
     if (impl_->comm_stream != nullptr) (void)hipStreamDestroy(impl_->comm_stream);
     if (impl_->stream != nullptr) (void)hipStreamDestroy(impl_->stream);
     impl_->join_engram_ahead();
-    if (impl_->engram_pinned != nullptr) (void)hipHostFree(impl_->engram_pinned);
+    if (impl_->engram_pinned != nullptr) (void)strix::host_pin::release(impl_->engram_pinned);
 }
 
 std::uint64_t DevicePrefill::weight_bytes() const noexcept {
@@ -1573,8 +1583,9 @@ void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions& p) {
     o.fast_attention_flash = p.fast_attention_flash;
     o.fast_moe = p.fast_moe;
     o.fast_dense = p.fast_dense;
-    ds41::set_fast_dense(p.fast_dense ? 1 : 0);
-    ds41::set_fast_moe(p.fast_moe ? 1 : 0);   // process-wide switch of the batch MoE dispatch (one sequence at a time here)
+    o.fast_engram = p.fast_engram;
+    // no process-wide switch: run_from installs these options as the precision of its own execution (another
+    // DevicePrefill of the process keeps its own; strix/ds41_prefill_precision.hpp)
 }
 
 PrefillResult DevicePrefill::run(std::span<const std::uint32_t> tokens) {
@@ -1594,6 +1605,8 @@ std::uint32_t DevicePrefill::positions() const noexcept { return impl_->rows_don
 
 PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std::uint32_t start) {
     auto& m = *impl_;
+    // this object's FAST dense / MoE precision for every dispatch of the run (thread of the run: caller or task worker)
+    const ds41::PrefillPrecisionScope precision_scope(ds41::PrefillPrecision{m.options.fast_dense, m.options.fast_moe});
     // provided embedding rows of this run (none: text, nothing below changes)
     const strix::session::EmbedSplice embeds = std::exchange(m.embed_run, {});
     const ds41::RnWideOff own_kernels;  // the prefill keeps its own Q8_0 x A8 kernels (P12: the multi-row form is -1 %)
@@ -2153,10 +2166,10 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         const std::size_t bytes = requests.size() * 264U;
         if (m.overlap) {
             if (m.engram_pinned_bytes < bytes) {
-                if (m.engram_pinned != nullptr) check(hipHostFree(m.engram_pinned), "engram pinned");
+                if (m.engram_pinned != nullptr) check(strix::host_pin::release(m.engram_pinned), "engram pinned");
                 m.engram_pinned = nullptr;
                 m.engram_pinned_bytes = 0;
-                check(hipHostMalloc(reinterpret_cast<void**>(&m.engram_pinned), bytes, hipHostMallocDefault), "engram pinned");
+                check(strix::host_pin::allocate(reinterpret_cast<void**>(&m.engram_pinned), bytes, hipHostMallocDefault), "engram pinned");
                 m.engram_pinned_bytes = bytes;
             }
             engram_data = m.engram_pinned;
@@ -2435,7 +2448,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 v.x_stride = v.width;
                 v.out_stride = v.count;
                 v.out = m.ekv.p;
-                ds41::enqueue_engram_f16_rows(v, st);
+                ds41::enqueue_engram_f16_rows(v, st, m.options.fast_engram);
                 ds41::enqueue_engram_inject(stream_now() + std::size_t{r0} * stream_row, m.ekv.p, m.devf(p + "engram_q_norm.weight"),
                                             m.devf(p + "engram_k_norm.weight"), n, H, 1e-20F, st,
                                             m.image_rows_set ? m.image_rows.p + r0 : nullptr);  // image rows: gate 0 (upstream)
@@ -2653,8 +2666,11 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     attn::hip::enqueue_compress(v, st);
                     L.carry_cur = 1 - L.carry_cur;
                 };
-                // q = q_b(qr) of this rank's chunk at r0 (n rows) into m.q
+                // q = q_b(qr) of this rank's chunk at r0 (n rows) into m.q; q16_chunk: the last chunk's q is the BF16 image
+                const bool q16_layer = m.flash_attn_at(layer) && prefill_flash_q16();
+                bool q16_chunk = false;
                 const auto q_b_chunk = [&](std::uint32_t r0, std::uint32_t n) {
+                    q16_chunk = false;
                     const bool fp16_q_b = m.fp16_at(4U, layer, n);
                     if (fp16_q_b && m.options.fp16_fast) {
                         ds41::Q8A8DensePrefillView v;
@@ -2677,7 +2693,13 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         v.x_stride = QA;
                         v.out = m.q.p;
                         v.out_stride = QL;
-                        m.dense(v, m.qr.p + std::size_t{r0} * QA, st, fp16_q_b);
+                        // flash layers: q's BF16 image after RoPE into m.q's own memory (u16, QL per row; nothing else
+                        // reads m.q there), row i with the RoPE row of chunk row r0 + i (the attention's rope + w0)
+                        const attn::RopeRow* qrope = (r.rope == attn::RopeKind::window ? m.lrope_window.p : m.lrope_comp.p) + r0;
+                        if (!fp16_q_b && q16_layer && ds41::enqueue_q_b_rope_image(v, reinterpret_cast<std::uint16_t*>(m.q.p), qrope, st))
+                            q16_chunk = true;
+                        else
+                            m.dense(v, m.qr.p + std::size_t{r0} * QA, st, fp16_q_b);
                     } else {
                         ds41::Q8A8PrefillView v;
                         v.weight = q8_rows(m.dev(p + "attn_q_b.weight"), std::size_t{head0} * c.head_dim, QA);
@@ -2987,9 +3009,10 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                             if (heads % 32U != 0U) throw std::invalid_argument("ds41-attn-bf16flash-v1: requires a multiple of 32 heads");
                             v.ring16 = m.ring16.p;
                             v.kv16 = m.kv16.p;
+                            if (q16_chunk) v.q16 = reinterpret_cast<const std::uint16_t*>(m.q.p) + std::size_t{w0 - r0} * QL;
                             attn::hip::enqueue_attention_flash_prefill(v, ls);
                             if (!flash_reported) {
-                                std::fprintf(stderr, "deepseek41 prefill effective attention: ds41-attn-bf16flash-v1\n");
+                                std::fprintf(stderr, "deepseek41 prefill effective attention: ds41-attn-bf16flash-v1 q16=%d\n", q16_chunk ? 1 : 0);
                                 flash_reported = true;
                             }
                         } else if (m.fast_attn_at(layer)) attn::hip::enqueue_attention_f16wmma_prefill(v, ls);
@@ -3709,12 +3732,14 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
         m.last_row_local = true;
         m.state_incomplete = false;
         m.seed_rows = 0;
+        m.solo_discarded = true;
     } else {
         m.rows_done = P0 + T;
         m.local_rows_done = Tn;
         m.last_row_local = last_local;
         m.state_incomplete = defer;
         m.group_used = 0;
+        m.solo_discarded = false;
     }
 #ifdef STRIX_DS41_PREFILL_FP16_LT
     if (m.fast_used) {
@@ -3821,6 +3846,7 @@ void DevicePrefill::import_state(const AttentionState& s) {
     m.cancel_broken = false;
     m.state_incomplete = false;  // a complete state replaces a deferred run's (only after the import succeeded)
     m.defer_next = 0;
+    m.solo_discarded = false;    // the single sequence is the imported one again
 }
 
 // The attention state of one sequence: `layers` its per-layer state, T its rows, local_rows the rows this rank computed of
@@ -3828,6 +3854,8 @@ void DevicePrefill::import_state(const AttentionState& s) {
 static AttentionState export_sequence(const DevicePrefill::Impl& m, const std::vector<DevicePrefill::Impl::LayerState>& layers, std::uint32_t T,
                                       std::uint32_t local_rows, bool last_local_row) {
     namespace attn = ds41::attn;
+    // the last row's index count is read at local_rows - 1: a rank holding the last row holds at least that row
+    if (last_local_row && local_rows == 0U) throw std::logic_error("deepseek41 prefill: export of a state without local rows");
     AttentionState s;
     s.position = T;
     s.layers.resize(m.options.layers);
@@ -3906,6 +3934,8 @@ static AttentionState export_sequence(const DevicePrefill::Impl& m, const std::v
 AttentionState DevicePrefill::export_state() const {
     const auto& m = *impl_;
     if (m.state_incomplete) throw std::logic_error("deepseek41 prefill: the last run deferred its decoder (its continuation completes the state)");
+    // after run_group the single sequence was discarded (rows 0): its members export by segment
+    if (m.solo_discarded) throw std::logic_error("deepseek41 prefill: the last pass was a group: export_state(segment)");
     return export_sequence(m, m.attn, m.rows_done, m.local_rows_done, m.last_row_local);
 }
 

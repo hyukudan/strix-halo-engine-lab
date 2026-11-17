@@ -150,6 +150,16 @@ The node side uses `--rtx-state-import` with `--http-serve` (without `--http-bat
 changes. Service build and protocol: [Qwen CUDA prefill service](engine/serving/qwen-cuda-prefill.md) and
 [RTX state import](rtx-state-import.md).
 
+Splitting one prompt by layers over the card and both nodes (card -> node A -> node B) is planned by the shared
+chain planner (`include/strix/pair/chain.hpp`); the route itself is not available yet. To see what a link would buy,
+run the host tool with your measured rates, e.g. `strix-qwen-chain-plan --rows 32768 --card-rate 4320
+--node-rate 1600 --link-mbps 118` (add `--costs <node layer costs json>` for measured per-layer node costs). On a
+1 Gbit/s link it keeps the whole prefill on the card; from 2.5 Gbit/s it predicts a three-way split.
+Reverse row state waits for each producing block and relay, with one coalesced message per block/hop.
+The host planner rejects simulations above 1,000,000 resource updates; search has a 20,000,000-unit
+budget counting enumeration and simulated resource updates, and refuses a partial winner on exhaustion.
+Uniform rates and scaled layer costs are prediction assumptions; these host results do not qualify a native route.
+
 ## Qwen3.8-Flash-Next, served from one RTX
 
 `strix-cuda-qwen-serve` serves the model from one RTX PRO 6000 without a node: OpenAI and Anthropic APIs, SSE,
@@ -192,3 +202,25 @@ described in [Declare the GPU to use](#declare-the-gpu-to-use).
   jobs) lower every number; the measurements above were taken with the card otherwise idle.
 - **To stay on the Strix Halo defaults,** simply do not build or start these routes. Each route also has its own off
   switches in its guide.
+
+
+## Layer-cut runtime (MiniMax)
+
+MiniMax M3.1 has an experimental block pipeline: CUDA computes layers `[0,K)` and the HIP TP2 pair computes
+`[K,60)`, including the first token's head on the last prompt row. Select it explicitly with
+`mm-rtx-prefill MODEL_DIR ROPE.bin OUTPUT_DIR cut:PROMPT.u32 --layer-cut K --cut-block 2048 --send NODE0_IP:PORT0,NODE1_IP:PORT1 --repeat 2`.
+The existing routes keep their defaults; layer-cut's compiler, native execution, fidelity and full-workload gates are pending.
+
+Both ranks use `--layercut-listen NAME:PROMPT.u32:BASE_PORT:STEPS:COUNT --cut K --cut-block 2048`.
+`--cut-act relay` (default) adds rank 0 `--cut-relay HOST:PORT` and rank 1 `--cut-relay-listen PORT`;
+`--cut-act direct` sends activations to both ranks. Rank r's producer listener uses BASE_PORT+r.
+Shared controls are `--split` / `STRIX_SPLIT` (default `device-only`), `--cut` / `STRIX_SPLIT_CUT`,
+`--cut-block` / `STRIX_SPLIT_BLOCK` and `--cut-act` / `STRIX_SPLIT_ACT`; inspection uses `--print-effective-config`.
+
+The `minimax-m3.1/layercut-v1` handoff contract sends each block's FP32 residual h (24,576 bytes/row), followed by
+rank-local K/V/IK pieces for the prefix layers (1,280 bytes/row/layer/rank). Hello metadata binds cut, block, prompt
+length, token digest and identity. Both endpoints print
+`identity mm-layercut-v1 rtx=cuda-fp32id L[0,K) pair=IDENTITY L[K,60)`;
+`--cut-pair-identity` on CUDA must match the pair profile. `--codec bp` retains lossless bp-v1.
+See the [checked-in kit](../scripts/bench/layercut/README.md) for launch scripts, exact metadata layout,
+planning inputs, staging bounds, timing limitations and the pending qualification procedure.

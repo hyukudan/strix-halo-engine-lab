@@ -17,6 +17,13 @@ Entry points stay in `apps/cuda_*` and tests in `tests/cuda/`; the GLM producer 
 (`src/cuda/models/glm/producer`) and the MiniMax prefill its build scripts (`src/cuda/models/minimax/*.bat`).
 `src/glm/rtxpf/import` (the receiving side of the GLM state import) is host code and stays with GLM.
 
+Session memory is planned by the shared host policy `include/strix/serve/session_reservation.hpp`: each request
+reserves prompt + max_tokens + the engine's slack (rounded to a granule, capped at the context), and admission
+reuses, builds, re-sizes or releases sessions from the free memory. The CUDA Qwen server binds it through
+`apps/cuda_qwen_serve_policy.hpp` (`--session-reserve request|max`, `--session-granule N`). Its serve bench kit is
+`scripts/bench/cuda/qwen_serve_arms.sh` (strict arm order, one card) with `qwen_serve_bench.py` (cold and warm
+prefill, C1 references, concurrency arms with `same_as_C1`).
+
 ## Phase 1 (layout, bitwise)
 
 Files were moved, not rewritten. The SASS gate is `scripts/bench/cuda/sass_compare.py
@@ -56,8 +63,15 @@ capture and replay). Numerical identity is part of the plan (FMA or not, FTZ, di
 type, top-k ties, split-K, rounding): a core selects only between variants of the same identity, by capability and
 shape. Order:
 
-1. **Dense IMMA tile** (`core/dense/`, mirrors `src/core/linear_plan.hpp`, `tiled_core.hpp`, `integer_plan.hpp`):
-   `ds41_core_mma.cu` (tiled Q8_0 x A8) first; the DeepSeek and Qwen CMake lists then name the core library.
+1. **Dense IMMA tile (extracted; native qualification pending)** (`core/dense/q8_a8_imma.cu`): tiled Q8_0 x A8 kernels, repack and tuning dispatch
+   share `include/strix/cuda/core/{types,plan,dense}.hpp`; old DeepSeek signatures remain field-by-field adapters.
+   `include/strix/device/runtime.hpp` provides a capability-query binding, but the execution path does not consume it;
+   plan SM fields are metadata checks, not device admission. Workspace and stream stay caller-owned.
+   This intermediate extraction still uses model helpers, a fixed HC epilogue and process-global tuning.
+   Shared helpers, an explicit epilogue policy and immutable owner-level tuning remain follow-up work before concurrent multi-engine use.
+   The extraction gate compares every built CUDA object's and executable's SASS against the base build, moved
+   symbols declared one by one with `--symbol-rename OLD=NEW` (an undeclared namespace move is a difference);
+   this is an instruction-preserving move, with no new numerical or workload qualification claim.
 2. **Common numerics and norms** (`core/norms/`): `ds41_cuda_common.{cuh,cu}` (device, workspace, stream, event
    helpers become `core/runtime` pieces), `ds41_core_norm.cu`, Qwen `hc` with the AMD-identical math
    (`include/strix/cuda/amd_math.cuh` is already in core), MiniMax Gemma norms; one interface, separate arithmetic
@@ -86,3 +100,39 @@ shape. Order:
 
 The first Blackwell-only code (`arch/sm120/`, e.g. block-scaled FP4 for routed experts) enters as a policy of the
 grouped MoE core of step 4, selected through `arch/capability.hpp`.
+
+## Decode graphs: QSA inside the step graph, draft chain as one replay (Qwen, bitwise)
+
+The 12 QSA attention cores of a decode window used to run as eager launches between 13 graph segments, because their
+grids and arguments depend on the positions and the host pooled-key counts. `qwen_qsa::prepare_multi` now builds the
+window's `SegmentMap` on the host (validation, pooled ranges, score waves), and `layer_core_device` launches the same
+multi-segment kernels reading that map from device memory with a geometry fixed per segment-rows layout (pool and score
+kernels walk their blocks and waves grid-stride; score runs past a row's selected count return at once). A window is one
+captured graph; each replay first copies the 12 maps from pinned memory. The MTP draft chain of one session is captured
+the same way (positions and the pending token from pinned memory, maps 12..18). Kernel bodies and their operation order
+are unchanged, so the logits are bit-identical. Switches: `STRIX_QRTX_QSA_GRAPH=0` (cut graphs, eager cores) and
+`STRIX_QRTX_DRAFT_GRAPH=0` (eager draft chain), both default on.
+The C1 draft chain runs as two graph segments [0, a) and [a, depth): the second only when no draft of the first fell
+below min_p (the verify would discard its steps). Kept drafts and verified tokens are unchanged; `a` comes from a
+histogram of kept drafts (shared chooser `include/strix/mtp_draft_split.hpp`, expected steps a + P(kept > a) (depth - a
++ 0.25)). `STRIX_QRTX_DRAFT_SPLIT=0` = one segment, `N` = fixed a. Measured (#680, 3 ABAB pairs): prose C1 +7.3 %, json
++1.9 %, edit +-0.2 %, window 16.1 -> 14.5 ms at 1.86 tokens/window.
+Context drafter (`STRIX_QRTX_CONTEXT_DRAFT=first|off|ctx|copy`, default `first`, printed in the server's start line): the shared host drafter
+`include/strix/mtp_context_draft.hpp` (the HIP engine's `--mtp-ngram-draft=ctx|copy`) bound into `qwen_cohort::step`.
+`copy`: a gated context span (long unanimous anchor, learned acceptance above the MTP cycle's) supplies the window's rows
+with no predictor forward; otherwise context rows extend or replace the confident MTP prefix. The commit writes the MTP
+teacher rows of every committed position, so skipping the predictor leaves its cache as after a drafted window; every
+row passes the greedy verify (ids unchanged). `first` (default) uses only the copy-first windows; extension proposals
+are scored for learning but never verified, because a rejected extension row costs ~1.2 ms of routed-expert bytes.
+Measured (3 ABAB pairs, ids equal): edit C1 +13.6 %, C4 +3.5 %, C8 +2.1 %, json +-0.3 %, prose -0.5..-2.8 % (drafter
+host time ~50 us per stream per cycle on requests that never copy). The server's `rtx` stats carry `copy_first_steps`,
+`context_rows` and `context_host_us`.
+
+Served decode by prompt class: `scripts/bench/cuda/qwen_serve_classes.py` (prose / edit / json, C1 / C4 / C8, cold and
+warm passes, ids of every request) with `scripts/bench/cuda/qwen_classes_prompts.json`, and strict ABAB server arms with
+`scripts/bench/cuda/qwen_serve_abab.sh` (server, model flags, arms and client are parameters; an arm's extra server flags
+follow `##`, e.g. `F|ENV=v ## --profile fast`; GPU clock samples per arm; bench lines carry `tpc=` tokens per cycle).
+Summarise arms with `scripts/bench/cuda/qwen_serve_summary.py OUT`: C1 means only over prompts run in both passes, C1
+requests shorter than 16 tokens (the model ends early: prose slice 0 stops after 1 token) are listed and skipped, cold and
+warm side by side per arm. Comparing a 2-prompt warm mean that contains a 1-token request with an 8-prompt cold mean is
+what made warm look slower than cold in #680.

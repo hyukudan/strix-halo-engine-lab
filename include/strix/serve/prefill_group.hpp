@@ -2,6 +2,7 @@
 
 #include "strix/serve/short_first.hpp"
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -34,7 +35,11 @@ struct GroupCandidate {
     std::uint32_t rows = 0;          // prompt rows this prefill runs
     std::uint64_t arrival_seq = 0;   // admission order; candidates are passed oldest first
     std::uint32_t route_class = 0;   // engine route class for this prompt alone (R1)
+    // provided embedding rows (an image prompt): a group pass carries only token ids today (no per-member embedding
+    // frame nor resolution), so such a prompt runs alone and ends the company (kGroupImageDecline)
+    bool image_rows = false;
 };
+inline constexpr const char* kGroupImageDecline = "image rows not supported in groups";
 
 struct PrefillGroupCost {
     double a_ms = 0.0;   // fixed ms of one pass
@@ -135,7 +140,7 @@ struct PrefillGroupPolicy {
             throw std::invalid_argument("plan_prefill_group: candidates must be oldest first");
     const GroupCandidate& first = candidates.front();
     ids.push_back(first.id);
-    if (!policy.groups() || first.rows == 0U || first.rows >= policy.short_rows ||
+    if (!policy.groups() || first.image_rows || first.rows == 0U || first.rows >= policy.short_rows ||
         !capacity.accepts(first.route_class) || first.rows > capacity.member_rows) return ids;
     std::uint64_t rows = first.rows;
     std::uint64_t windows = capacity.window_count(first.rows);
@@ -143,7 +148,7 @@ struct PrefillGroupPolicy {
     for (std::size_t i = 1; i < candidates.size(); ++i) {
         const GroupCandidate& c = candidates[i];
         if (ids.size() >= std::min<std::uint64_t>(policy.max_members, capacity.members)) break;
-        if (c.rows == 0U || c.rows >= policy.short_rows || c.rows > capacity.member_rows) break;
+        if (c.image_rows || c.rows == 0U || c.rows >= policy.short_rows || c.rows > capacity.member_rows) break;
         if (c.route_class != first.route_class) break;
         const std::uint64_t next = rows + c.rows;
         if (next > std::min<std::uint64_t>(policy.max_rows, capacity.rows)) break;
@@ -158,6 +163,45 @@ struct PrefillGroupPolicy {
         ids.push_back(c.id);
     }
     return ids;
+}
+
+// The pair's common group limits. Each rank resolves its own policy (environment) and capacity (its device prefill's
+// storage and options); the leader sends whole groups that the follower must hold. Both ranks exchange
+// prefill_group_words() once after building their prefill, and the leader plans with agree_prefill_group(): the
+// minimum of both (scheduling only: a smaller group never changes a member's bits), off when either is off.
+inline constexpr std::size_t kPrefillGroupWords = 12;
+[[nodiscard]] inline std::array<std::uint64_t, kPrefillGroupWords> prefill_group_words(const PrefillGroupPolicy& p,
+                                                                                     const PrefillGroupCapacity& c) noexcept {
+    return {p.mode == PrefillGroupPolicy::Mode::automatic ? 1U : 0U, p.max_members, p.max_rows, p.short_rows,
+            c.members, c.rows, c.member_rows, c.windows, c.local_rows, c.window_rows, c.split_class_mask,
+            c.rejected_class_mask};
+}
+struct PrefillGroupAgreement {
+    PrefillGroupPolicy policy;
+    PrefillGroupCapacity capacity;
+};
+[[nodiscard]] inline PrefillGroupAgreement agree_prefill_group(const PrefillGroupPolicy& p, const PrefillGroupCapacity& c,
+                                                               const std::array<std::uint64_t, kPrefillGroupWords>& peer) noexcept {
+    const auto u32 = [](std::uint64_t v) { return static_cast<std::uint32_t>(std::min<std::uint64_t>(v, std::numeric_limits<std::uint32_t>::max())); };
+    PrefillGroupAgreement r{p, c};
+    if (peer[0] == 0U) r.policy.mode = PrefillGroupPolicy::Mode::off;
+    r.policy.max_members = std::min(p.max_members, u32(peer[1]));
+    r.policy.max_rows = std::min(p.max_rows, u32(peer[2]));
+    r.policy.short_rows = std::min(p.short_rows, u32(peer[3]));
+    auto& k = r.capacity;
+    k.members = std::min(c.members, peer[4]);
+    k.rows = std::min(c.rows, peer[5]);
+    k.member_rows = std::min(c.member_rows, peer[6]);
+    k.windows = std::min(c.windows, peer[7]);
+    k.local_rows = std::min(c.local_rows, peer[8]);
+    k.split_class_mask = c.split_class_mask & u32(peer[10]);    // split only where both split: a larger local count
+    k.rejected_class_mask = c.rejected_class_mask | u32(peer[11]);
+    if (peer[9] != c.window_rows) k.members = 0U, k.reason = "window-rows-differ-between-ranks";
+    else if (c.members >= 2U && peer[4] < 2U) k.reason = "peer-capacity";
+    else if (k.members < c.members || k.rows < c.rows || k.member_rows < c.member_rows || k.windows < c.windows ||
+             k.local_rows < c.local_rows || k.rejected_class_mask != c.rejected_class_mask ||
+             k.split_class_mask != c.split_class_mask) k.reason = "pair-minimum";
+    return r;
 }
 
 // ids are indices in the original arrival-ordered waiting queue. The selector

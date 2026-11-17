@@ -138,8 +138,10 @@ void timing(std::uint32_t rows, std::uint64_t first, const am::Tables& tables) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: qwen_qsa_mma_test <tables dir> [nofail]\n"); return 1; }
-    const bool nofail = argc > 2;
+    if (argc < 2 || argc > 3 || (argc == 3 && std::strcmp(argv[2], "nofail") != 0)) {
+        std::fprintf(stderr, "usage: qwen_qsa_mma_test <tables dir> [nofail]\n"); return 1;
+    }
+    const bool nofail = argc == 3;
     const auto tables = am::load_tables(argv[1]);
     for (const std::uint64_t first : {0ULL, 9000ULL})
         for (const std::uint32_t rows : {1U, 15U, 16U, 17U, 1000U, 4096U}) compare(rows, first, 2.0F, tables, nofail);
@@ -147,6 +149,10 @@ int main(int argc, char** argv) {
     compare(17, 2040, 2.0F, tables, nofail);     // crosses the 512-block boundary (count 2048 -> selection starts)
     timing(8192, 0, tables);
     timing(8192, 32768, tables);
+    if (nofail) {
+        std::printf("DIAGNOSTIC ONLY: numerical checks not enforced; no qualification verdict\n");
+        return 0;
+    }
     std::printf(failures ? "FAIL (%d)\n" : "PASS\n", failures);
     return failures ? 1 : 0;
 }

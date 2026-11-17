@@ -89,7 +89,11 @@ void same_request(const std::string& label, const Args& a, const Env& env = {}) 
     }
     for (const auto& name : diff(serve.config, cli.config))
         check(named.count(name) == 1, label + ": unexplained serve/cli difference in " + name);
-    check(named == std::set<std::string>({"decode", "export_state", "release_by_layer"}), label + ": serve differences are the three named levers");
+    check(named == std::set<std::string>({"decode", "export_state", "release_by_layer", "block_schedule"}),
+          label + ": serve differences are the three role levers and the flat block schedule");
+    check(serve.config.block_schedule == std::vector<std::uint32_t>({8192}) &&
+          cli.config.block_schedule == std::vector<std::uint32_t>({1024, 2048, 4096, 8192}) && cli.config.block_schedule == service.config.block_schedule,
+          label + ": serve runs flat blocks of the schedule maximum, the hand-off entries keep the ramp");
     check(cli.differences.empty() && service.differences.empty(), label + ": cli/service name no differences when --model is given");
     check(serve.config.decode && !serve.config.export_state && !serve.config.release_by_layer, label + ": serve role values");
     check(!cli.config.decode && cli.config.export_state && cli.config.release_by_layer, label + ": cli keeps the Config defaults");
@@ -187,6 +191,28 @@ void overrides() {
     check(!r.config.release_by_layer, "service takes --no-release-by-layer");
 }
 
+// Flat blocks: a bitwise scheduling lever of the serve entry; a typed schedule or the switch keeps the caller's blocks.
+void flat_blocks() {
+    const std::vector<std::uint32_t> ramp{1024, 2048, 4096, 8192};
+    const Env off{{"STRIX_QRTX_FLAT_BLOCKS", "0"}}, on{{"STRIX_QRTX_FLAT_BLOCKS", "1"}}, bad{{"STRIX_QRTX_FLAT_BLOCKS", "yes"}};
+    auto r = one({}, qo::Entry::serve, off);
+    check(r.config.block_schedule == ramp && r.differences.size() == 3, "flat blocks off by its switch: ramp, no named schedule difference");
+    r = one({}, qo::Entry::serve, on);
+    check(r.config.block_schedule == std::vector<std::uint32_t>({8192}), "flat blocks on by its switch");
+    check(one({"--profile", "fast"}, qo::Entry::serve).config.block_schedule == one({}, qo::Entry::serve).config.block_schedule,
+          "the schedule does not depend on the profile");
+    r = one({"--blocks", "1024,2048,4096,8192"}, qo::Entry::serve);
+    check(r.config.block_schedule == ramp && r.differences.size() == 3, "a typed --blocks is the caller's schedule");
+    r = one({"--block-rows", "4096"}, qo::Entry::serve);
+    check(r.config.block_schedule == std::vector<std::uint32_t>({4096}) && r.differences.size() == 3, "a typed --block-rows is kept");
+    check(one({}, qo::Entry::cli, on).config.block_schedule == ramp && one({}, qo::Entry::prefill_service, on).config.block_schedule == ramp,
+          "the hand-off entries keep the ramp");
+    check(refuses({}, bad, qo::Entry::serve), "STRIX_QRTX_FLAT_BLOCKS accepts 0 or 1 only");
+    bool listed = false;
+    for (const auto& d : one({}, qo::Entry::serve).differences) listed = listed || (d.name == "block_schedule" && d.value == "8192" && !d.reason.empty());
+    check(listed, "the flat schedule is named with its value and reason in the effective config");
+}
+
 void common_options() {
     const Args a{"--model", "m", "--mtp-sidecar", "s", "--draft-vocab", "d", "--tables", "t", "--rope-table", "r", "--max-positions", "4096",
                  "--blocks", "1024,2048", "--block-schedule", "default", "--final-block-rows", "64"};
@@ -260,7 +286,7 @@ void effective_config() {
     check(at(j, "entry").as_string() == "serve" && at(j, "profile").as_string() == "fast", "effective config: entry/profile");
     check(at(j, "arithmetic_contract").as_string() == serve.contract, "effective config: contract");
     check(at(at(j, "forms"), "hc_mma").as_bool() && !at(at(j, "forms"), "moe_route_bf16").as_bool(), "effective config: forms");
-    check(at(j, "serve_differences").as_array().size() == 3, "effective config names the three serve differences");
+    check(at(j, "serve_differences").as_array().size() == 4, "effective config names the three role differences and the flat block schedule");
     check(text.find("\"reason\"") != std::string::npos && text.find("pending") != std::string::npos, "effective config carries reasons and pending rows");
     const auto cli = qo::effective_config_json(one({}, qo::Entry::cli));
     check(at(strix::serve::parse_json(cli), "serve_differences").as_array().empty(), "cli names no serve differences");
@@ -326,6 +352,7 @@ int main() {
         profiles();
         overrides();
         common_options();
+        flat_blocks();
         identities();
         effective_config();
         route_governors();
