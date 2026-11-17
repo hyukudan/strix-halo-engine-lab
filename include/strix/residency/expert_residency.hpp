@@ -90,6 +90,10 @@ struct BudgetCap {
 };
 BudgetCap budget_cap(const Options&, const CardBytes&);
 
+// Apply a total-device cap to physical live memory before narrowing to this engine's remaining allowance.
+CardBytes live_budget_view(const CardBytes& physical, std::uint64_t device_cap,
+                           std::uint64_t engine_allowance = 0, std::uint64_t engine_used = 0);
+
 Decision resolve(const Options&, const ModelBytes&, const CardBytes&, const SessionBytes&, const HostBytes&);
 // {"expert_residency":...,"reason":...,"vram_budget_bytes":...,"expert_pool_bytes":...,"slots_per_layer":...,
 //  "positions":...,"positions_requested":...,"host_expert_bytes":...} for --print-effective-config.

@@ -175,6 +175,13 @@ void test_resolve() {
         REQUIRE(resolve(o, m, occupied, sessions(), big_host()).budget == 24 * GiB);
         o.vram_budget = 0;
         REQUIRE(resolve(o, m, occupied, sessions(), big_host()).budget == 80 * GiB);
+        // External allocations may grow after startup: intersect the live total-card headroom first.
+        const auto live = live_budget_view({96 * GiB, 56 * GiB}, 48 * GiB, 32 * GiB, 20 * GiB);
+        REQUIRE(live.free == 8 * GiB && live.total == 32 * GiB);
+        REQUIRE(live_budget_view({96 * GiB, 64 * GiB}, 48 * GiB, 32 * GiB, 20 * GiB).free == 12 * GiB);
+        REQUIRE(live_budget_view({96 * GiB, 40 * GiB}, 48 * GiB, 32 * GiB, 20 * GiB).free == 0);
+        REQUIRE(live_budget_view({96 * GiB, 56 * GiB}, 0, 32 * GiB, 20 * GiB).free == 12 * GiB);
+        REQUIRE(live_budget_view({96 * GiB, 56 * GiB}, 48 * GiB).free == 8 * GiB);
         const std::string j = decision_json(prof12);
         REQUIRE(has(j, "\"vram_cap_source\":\"device_profile\"") && has(j, ("\"vram_cap_bytes\":" + std::to_string(12 * GiB)).c_str()));
         REQUIRE(has(decision_json(none), "\"vram_cap_source\":\"card\""));

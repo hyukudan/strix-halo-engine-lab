@@ -134,6 +134,22 @@ BudgetCap budget_cap(const Options& opt, const CardBytes& card) {
     return c;
 }
 
+CardBytes live_budget_view(const CardBytes& physical, std::uint64_t device_cap,
+                           std::uint64_t engine_allowance, std::uint64_t engine_used) {
+    CardBytes view = physical;
+    if (device_cap && device_cap < physical.total) {
+        const auto used = physical.total > physical.free ? physical.total - physical.free : 0;
+        view.free = used < device_cap ? device_cap - used : 0;
+        view.total = device_cap;
+    }
+    if (engine_allowance) {
+        const auto remaining = engine_allowance > engine_used ? engine_allowance - engine_used : 0;
+        view.free = std::min(view.free, remaining);
+        view.total = std::min(view.total, engine_allowance);
+    }
+    return view;
+}
+
 Decision resolve(const Options& opt, const ModelBytes& m, const CardBytes& card, const SessionBytes& s,
                  const HostBytes& host) {
     Decision d;
