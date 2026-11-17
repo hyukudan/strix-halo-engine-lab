@@ -7,7 +7,7 @@
 //
 //   strix-cuda-qwen-serve --model M.gguf --tables DIR --rope-table rope_cs.bin [--mtp-sidecar S.gguf --draft-vocab V.bin]
 //       [--max-positions 32768] [--bind 127.0.0.1] [--port 8090] [--api-key-file F] [--model-id ID]
-//       [--mtp-depth 7] [--min-p 0.7] [--max-queue 64] [--http-slots 4] [--prefill-chunk 1024|auto] [--prefill-overlap-rows 1024]
+//       [--mtp-depth 7] [--min-p P (default 0.7, in [0,1])] [--max-queue 64] [--http-slots 4] [--prefill-chunk 1024|auto] [--prefill-overlap-rows 1024]
 //       [--admit-grace-ms 2] [--cohort-depth fair|max] [--slot-margin-mib 2048] [--block-rows N] [--mtp-defer-prompt on|off]
 //       [--expert-residency auto|full|tiered] [--vram-budget-gib N] [--print-effective-config]
 //       [--prefix-cache on|off] [--prefix-cache-block 256] [--prefix-cache-stride 16384] [--prefix-cache-root on|off]
@@ -35,6 +35,7 @@
 #include "strix/deploy/memory_plan.hpp"
 #include "cuda_qwen_prefix_cache.hpp"
 #include "strix/mtp_depth_host.hpp"
+#include "strix/mtp_draft_profiles.hpp"
 #include "cuda_qwen_serve_policy.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/cuda/qwen_cohort.hpp"
@@ -95,7 +96,9 @@ struct Options {
     std::string bind = "127.0.0.1", api_key_file, model_id = "qwen3.8-flash-next";
     int port = 8090;
     std::uint32_t mtp_depth = 7, max_queue = 64;
-    float min_p = 0.7F;
+    float min_p = 0.7F;                         // resolved draft min-p (strix/mtp_draft_profiles.hpp, CUDA)
+    std::optional<float> min_p_explicit;        // --min-p: always wins (0 is a real value)
+    std::string_view min_p_source;              // explicit | unprofiled
     std::uint32_t http_slots = 16, admit_grace_ms = 2;
     std::uint32_t prefill_chunk = 1024;         // rows per prefill chunk while others decode; 0 = auto (fitted, see chunk_done)
     std::uint32_t prefill_overlap_rows = 1024;  // largest chunk on the prefill stream (overlap); its scratch is sized to it
@@ -159,7 +162,13 @@ Options parse(int argc, char** argv) {
         else if (a == "--api-key-file") o.api_key_file = next();
         else if (a == "--model-id") o.model_id = next();
         else if (a == "--mtp-depth") o.mtp_depth = static_cast<std::uint32_t>(std::stoul(next()));
-        else if (a == "--min-p") o.min_p = std::stof(next());
+        else if (a == "--min-p") {
+            const auto value = next();
+            std::size_t end = 0;
+            const float v = std::stof(value, &end);
+            if (end != value.size()) throw std::invalid_argument("--min-p needs a number");
+            o.min_p_explicit = v;
+        }
         else if (a == "--max-queue") o.max_queue = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--session-granule") o.session.granule = std::stoull(next());
         else if (a == "--session-reserve") {
@@ -175,6 +184,13 @@ Options parse(int argc, char** argv) {
         else if (strix::residency::consume_cli_arg(a, next, residency_cli)) {}  // --expert-residency, --vram-budget-gib, --print-effective-config
         else if (a == "--slot-margin-mib") o.slot_margin_mib = static_cast<std::uint32_t>(std::stoul(next()));
         else throw std::invalid_argument("unknown option " + a);
+    }
+    {
+        // No CUDA draft identity is resolved from the loaded sidecar yet, so the draft is unprofiled here (every CUDA
+        // column is the legacy 0.7 until an RTX receipt qualifies another value keyed on the sidecar SHA-256).
+        const auto r = strix::resolve_mtp_draft_min_probability(o.min_p_explicit, nullptr, strix::MtpDraftBackend::cuda);
+        o.min_p = r.value;
+        o.min_p_source = r.source;
     }
     const auto resolved = qo::resolve(request, qo::Entry::serve);
     o.engine = resolved.config;
@@ -910,6 +926,7 @@ int main(int argc, char** argv) {
         }
         std::cerr << "strix-cuda-qwen-serve: loading " << o.engine.model_gguf << std::endl;
         if (!o.engine.mtp_sidecar_gguf.empty() && o.mtp_depth > 0) std::cerr << "strix-cuda-qwen-serve: " << strix::mtp_depth_state_line(o.min_p) << ", mtp_depth=" << o.mtp_depth
+            << ", min_p_source=" << o.min_p_source
             << ", context_draft=" << qc::context_mode_name(qc::context_mode_default())
             << ", copy_rows=" << qc::copy_rows_default() << ", copy_wide=" << (qc::copy_wide_switch() < 0 ? "auto" : qc::copy_wide_switch() ? "on" : "off")
             << " (effective " << ((qc::copy_wide_switch() < 0 ? qc::copy_wide_pays(qc::copy_rows_default(), qc::copy_wide_model()) : qc::copy_wide_switch() == 1) ? "on" : "off")

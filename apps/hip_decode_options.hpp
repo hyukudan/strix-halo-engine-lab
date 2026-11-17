@@ -211,7 +211,7 @@ inline float mtp_draft_min_probability(const MtpCliOptions& m) {
     if(m.spec_min_p>=0.0) return static_cast<float>(m.spec_min_p);
     if(m.window_rows_set.empty()) return 0.0F;
     const auto* profile=find_mtp_draft_profile_by_sha256(m.sidecar_sha256);
-    return mtp_depth_domain_min_probability(profile?profile->min_probability:0.5F);
+    return mtp_depth_domain_min_probability(mtp_draft_backend_min_probability(profile,MtpDraftBackend::hip));
 }
 // The n-gram extension runs: explicitly required, or by default (auto) where it is admissible:
 // greedy, one request, the draft chain with prefix windows, a generation route. The bridge also leaves

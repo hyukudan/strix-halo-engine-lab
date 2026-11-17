@@ -33,6 +33,23 @@ void depth_policy_options_contract(){
     bool rejected=false;try{(void)mtp_draft_min_probability(options);}catch(const std::invalid_argument&){rejected=true;}
     require(rejected,"unqualified sampled depth policy is rejected");
 }
+void draft_profile_min_p_contract(){
+    // The HIP caller resolves through the shared per-backend table: values unchanged (0.85 base, 0.7 distilled,
+    // 0.5 unprofiled), an explicit value (0 included) wins, no window set = single window (0).
+    using namespace strix::decode_cli;
+    Env mode("STRIX_MTP_CONTROLLER",nullptr),domain("STRIX_MTP_DOMAIN",nullptr);
+    MtpCliOptions options;options.window_rows_set={2,4,8};
+    options.sidecar_sha256=std::string(strix::find_mtp_draft_profile("base")->sidecar_sha256);
+    require(mtp_draft_min_probability(options)==.85F,"HIP base draft keeps 0.85");
+    options.sidecar_sha256=std::string(strix::find_mtp_draft_profile("distill-g")->sidecar_sha256);
+    require(mtp_draft_min_probability(options)==.7F,"HIP distilled draft keeps 0.7");
+    options.sidecar_sha256=std::string(64,'0');
+    require(mtp_draft_min_probability(options)==.5F,"HIP unprofiled draft keeps 0.5");
+    options.spec_min_p=0.0;
+    require(mtp_draft_min_probability(options)==0.0F,"explicit 0 min-p wins over the profile");
+    options.spec_min_p=-1.0;options.window_rows_set.clear();
+    require(mtp_draft_min_probability(options)==0.0F,"single target window does not stop early");
+}
 strix::decode_cli::Options parse(std::vector<std::string> args){
     std::vector<char*> argv;for(auto& value:args)argv.push_back(value.data());
     return strix::decode_cli::parse_options(static_cast<int>(argv.size()),argv.data());
@@ -742,5 +759,6 @@ int main(){try{
     }
     expert_copy_cli_contract();
     depth_policy_options_contract();
+    draft_profile_min_p_contract();
     return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
