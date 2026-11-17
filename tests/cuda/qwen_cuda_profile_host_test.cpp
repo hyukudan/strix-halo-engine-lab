@@ -463,6 +463,40 @@ int main() {
         check(gsq.config.expert_arithmetic==strix::qwen_packs::ExpertArithmetic::gsq_a8_dot4,"explicit GSQ parsed once");
         check(gsq.contract.find("gsq-iq3s-a8-dot4-cuda-v1")!=std::string::npos,"GSQ contract named");
         check(qo::effective_config_json(gsq).find("gsq-iq3s-a8-dot4-cuda-v1")!=std::string::npos,"GSQ effective config names arithmetic");
+        for(const auto* r:{&native,&gsq}) check(qo::config_arithmetic_contract(r->config)==r->contract,"service /health contract = effective config contract: "+r->contract);
+        for(const auto& a:{Args{"--profile","fast"},Args{"--profile","turbo","--turbo-weights","onfly"}}) {
+            const auto s=one(a,qo::Entry::prefill_service);
+            check(qo::config_arithmetic_contract(s.config)==s.contract,"service /health contract = effective config contract: "+s.contract);
+        }
+        {   // loaded-dispatch receipt: load-time presence/possible classes + declared form, never an exclusive executed class
+            namespace qpk=strix::qwen_packs;
+            using V=std::vector<std::string_view>;
+            const auto mma=one({"--moe-mma","on"},qo::Entry::cli);
+            const auto real=strix::cuda::qwen_prefill::moe_rows_policy(true,false);
+            // requested MMA is not an execution fact: decode windows (moe_mma && !window) and the decode-row fallback keep four-chain possible
+            check(qo::expert_possible_classes(qpk::ExpertArithmetic::incumbent,true,false)==V{"cuda-moe-mma@1","cuda-four-chain-imma@1"},"A8 + requested moe_mma keeps decode fallback class");
+            check(qo::expert_possible_classes(qpk::ExpertArithmetic::incumbent,false,false)==V{"cuda-four-chain-imma@1"},"A8 exact: one class");
+            // native_experts = ANY native layer: native present, A8 layers not excluded (mixed or unknown)
+            check(qo::expert_possible_classes(qpk::ExpertArithmetic::incumbent,true,true)==V{"cuda-native-iq-fp32@1","cuda-moe-mma@1","cuda-four-chain-imma@1"},"native presence + mixed A8 with moe_mma");
+            check(qo::expert_possible_classes(qpk::ExpertArithmetic::incumbent,false,true)==V{"cuda-native-iq-fp32@1","cuda-four-chain-imma@1"},"native presence + mixed A8");
+            check(qo::expert_possible_classes(qpk::ExpertArithmetic::gsq_a8_dot4,false,false)==V{qpk::gsq_a8_contract},"GSQ A8 contract, no native layer");
+            check(qo::expert_possible_classes(qpk::ExpertArithmetic::gsq_a8_dot4,false,true)==V{"cuda-native-iq-fp32@1",qpk::gsq_a8_contract},"GSQ A8 + native presence");
+            const auto nat=qo::expert_dispatch_json(mma.config,"gsq-pack",true,real).dump();
+            check(nat.find("\"arithmetic\"")==std::string::npos && nat.find("\"executed_class\":\"not-observed\"")!=std::string::npos
+                  && nat.find("\"scope\":\"loaded-presence\"")!=std::string::npos,"no exclusive actual class claimed: "+nat);
+            check(nat.find("\"possible_classes\":[\"cuda-native-iq-fp32@1\",\"cuda-moe-mma@1\",\"cuda-four-chain-imma@1\"]")!=std::string::npos
+                  && nat.find("\"native_class\":\"present\"")!=std::string::npos && nat.find("\"layer_mix\":\"unknown\"")!=std::string::npos,"native presence, mixed/unknown scope: "+nat);
+            check(nat.find("\"declared_expert_arithmetic\":\"incumbent\"")!=std::string::npos && nat.find("\"declared_moe_mma\":true")!=std::string::npos,"declared form kept separate: "+nat);
+            check(nat.find("\"weight_pack\":\"gsq-pack\"")!=std::string::npos && nat.find("\"native_experts\":true")!=std::string::npos
+                  && nat.find("\"moe_window_rows_effective\":true")!=std::string::npos,"loaded source facts: "+nat);
+            check(nat.find("\"declared_contract\":\""+mma.contract+"\"")!=std::string::npos,"declared contract = effective config contract: "+nat);
+            const auto a8=qo::expert_dispatch_json(mma.config,"a8-pack",false,real).dump();
+            check(a8.find("\"possible_classes\":[\"cuda-moe-mma@1\",\"cuda-four-chain-imma@1\"]")!=std::string::npos
+                  && a8.find("\"native_class\":\"absent\"")!=std::string::npos && a8.find("\"layer_mix\":\"a8-route-only\"")!=std::string::npos
+                  && a8.find("decode-row fallback")!=std::string::npos,"requested MMA with decode fallback: "+a8);
+            const auto g=qo::expert_dispatch_json(gsq.config,"gsq-pack",false,real).dump();
+            check(g.find("\"possible_classes\":[\"gsq-iq3s-a8-dot4-cuda-v1\"]")!=std::string::npos,"GSQ A8 receipt: "+g);
+        }
         check(qo::numerical_identity(gsq.config).hash!=qo::numerical_identity(native.config).hash,"GSQ snapshots have independent numerical identity");
         check(qo::handoff_numerical_id_config("old",gsq.config)!=qo::handoff_numerical_id_config("old",native.config),"GSQ handoffs cannot masquerade as native");
         check(qo::handoff_numerical_id_config("old",native.config)==qo::handoff_numerical_id("old",qo::choice_of(native.config)),"incumbent handoff bytes preserved");
