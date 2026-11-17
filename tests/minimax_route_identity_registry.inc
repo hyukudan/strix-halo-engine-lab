@@ -83,7 +83,7 @@
 {"rtx-tile", 'a', "F32 identity version+matrix+input order", "fp32_identity_device.inc f32_core_body; hip-mm-fp32id-tests; mm_fp32_identity_tests.cu", ""},
 // src/minimax/rtxpf/fp32_identity.hpp: resolve_core_version; cuda/fp32_identity.cu
 {"rtx-core", 'a', "FP32 identity+matrix+input order; v3/v3.1 decode", "mm_fp32_identity_tests.cu default/env/explicit and all 65536 mul1 states vs host; full-model gate at 1K/8K code prompts, both ranks", ""},
-// src/minimax/rtxpf/cuda/mm_rtx_prefill_main.cu:635
+// src/cuda/models/minimax/mm_rtx_prefill_main.cu:635
 {"io-cache", 'a', "model tensor content+dtype+rank slices", "weight loader sizes/format validation; actual dependency notices preserved", ""},
 // src/minimax/dspark/hip_minimax_dspark.hip:755
 {"draft-native-linears", 'a', "drafter model dtype+matrix+reduction contract", "hip_minimax_dspark_tests.hip linears/attention bitwise gates; mm_defaults.cpp draft linears contract", ""},
@@ -107,6 +107,8 @@
 {"model-layout", 'b', "model tensor hashes+TP2 partition+rank order", "G3/G4 model gates; pack validation; F32 model fidelity remains draft pending all gates", ""},
 // src/minimax/moe/mmx_prefill.hip:476
 {"prefill-routed-split", 'c', "BLOCKED until matrix+arithmetic-version fixed S (no expert occupancy)", "UNCOVERED: known failed identity; existing core/mtfit receipts hold S fixed", "L3 routed gate/up WMMA k-tile24 reset vs continuation (rows1->9,S16->8)"},
+// src/minimax/moe/mmx_prefill.hip: prefill_moe_order (STRIX_MMX_PF_ORDER: invariant is the pf_order table default; adaptive = off switch / baseline; a defaulted invariant whose route is unmet declines to adaptive at startup with a printed reason, an explicit one is rejected)
+{"prefill-moe-order-invariant", 'b', "named identity mmx-pf-linear-s1-v1 (MoE part mmx-pf-moe-s1-v1): routed+shared gate/up/down fixed S=1 (moe_core::kGroupedSingleChainContract), no expert occupancy; prefill-only dense q/k/v/o core::fixed_linear_contract S=1 (v4 core wherever strix_gemm's split differs); startup requires resident supported weights and workspace, mandatory routes reject fallback; cache field prefill_order", "chunk_order_contract_tests.cpp host order reference + chunk 256/1024/4096/whole and 1..17 tails; pr665_host engine startup/resource/decode/route regressions; hip-mmx-moe-bench --test chunk-invariance device bytes; differs from adaptive for experts < 97 rows", ""},
 // src/minimax/moe/mmx_prefill.hip:477
 {"prefill-shared-split", 'c', "BLOCKED until shared matrix+arithmetic-version fixed S", "UNCOVERED: known failed max_rows identity", "L3 shared gate/up WMMA k-tile24 reset vs continuation (rows1->9,S16->8)"},
 // src/minimax/engine/engine.hip:227
@@ -119,7 +121,7 @@
 {"draft-append", 'c', "BLOCKED until draft append absolute-position plan fixed or pin vector per row", "UNCOVERED append32 vs8 intermediate/cache byte identity", "draft append FC GEMM32 vs GEMV8, then K/V projected context (first library core op opaque)"},
 // src/minimax/moe/mmx_prefill.hip:881
 {"diagnostic-cores", 'c', "BLOCKED in production; diagnostic-only plan", "UNCOVERED for production by design; expected-wrong-output timing APIs", "first skipped A/weight load or attention compute in diagnostic producer"},
-// src/minimax/rtxpf/cuda/mm_rtx_kernels.cu:601
+// src/cuda/models/minimax/mm_rtx_kernels.cu:601
 {"rtx-attention", 'c', "BLOCKED handoff until MSA cache/output bytes match exact producer plan", "UNCOVERED full native/CUDA MSA model fidelity for all positions/cuts", "RTX MSA index score or attention QK/PV legacy vs shared (first op needs CUDA byte gate)"},
 // src/minimax/engine/engine.hip: park_task / resume_parked; src/minimax/serve/minimax_lead.hpp: nested_candidate
 {"prefill-nest", 'a', "model+profile+original ordered chunk/group rows+positions+slot generation; sequential bank ownership", "GPU covered on both ranks, check-only resume-check: 512-token child in 7-layer units with 4608-token parent parked at layers 7/31 beside a decoder, 10/10 IDENTICAL; whole 511-token child with parent parked at layer 17, 6/6 IDENTICAL; complete 128-token continuations, all prompt outputs, committed state, first/continuation logits, frozen groups and standalone B1/mixed decode; HTTP token IDs identical policy ON/OFF; timing evidence in serving documentation", ""},

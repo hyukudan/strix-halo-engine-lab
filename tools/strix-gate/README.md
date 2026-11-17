@@ -248,8 +248,11 @@ prompts and reference) the candidate must pass all of (`MM_FLOOR` in the script)
 
 The absolute KL / top-1 / dNLL verdict is printed and stored (`pooled.abs_pass`) as a reference.
 The candidate must differ from the reference only in its FAST layer set: every receipt lever other
-than `minimax.msa_flash` must be equal, and so must every recorded switch outside the explicit
-FAST allowlist (`STRIX_MM_PF_MSA_FLASH`, `STRIX_MM_PF_MSA_FLASH_LAYERS`, `STRIX_MM_FAST_PREFILL`).
+than `minimax.msa_flash` / `minimax.linear_order` must be equal, and so must every recorded switch outside
+the explicit FAST allowlist (`STRIX_MM_PF_MSA_FLASH`, `STRIX_MM_PF_MSA_FLASH_LAYERS`, `STRIX_MM_FAST_PREFILL`,
+`STRIX_MMX_PF_ORDER`). The chunk-invariant linear order (`minimax.linear_order` =
+`invariant:mmx-pf-linear-s1-v1`) changes MoE / dense rounding in every layer, so its FAST layer set is all 60 layers:
+onset 0, layer-0 one-ulp nulls, and an exact reference that differs only by `STRIX_MMX_PF_ORDER`.
 Receipts omit defaulted switches and cannot distinguish them from unconsulted switches; a
 one-sided entry outside that allowlist is therefore refused, even if it explicitly selects a default.
 Mean + 2 sd of three controls is a policy threshold, not a bound: a candidate drawn exactly like
@@ -269,7 +272,11 @@ rank's process route receipt (`strix-route-receipt {...}`): engine; profile `exa
 off, EXL3, default prefill identity), `fast-prefill` (MSA flash on, otherwise the same) or
 `other`; `fast` = MSA flash mode (10 + `STRIX_MM_PF_MSA_FLASH`: 11 one-term, 12 two-term) and
 layers; `numerical_config_sha256` over the effective levers and switch set without output-only
-switches, and `config` = those levers and switches (for the comparison above). The control
+switches, and `config` = those levers and switches (for the comparison above).
+The index-projection WMMA member additionally requires `minimax-index-proj-executed` records,
+emitted after the prefill completion fence: matching rank, executed layer mask and each sealed
+prompt's token count and little-endian token FNV-1a64. A selected startup lever alone is insufficient.
+The control
 comes only from the engine's own null-control lines in a lab diagnostic build:
 `DIAG attn ulp: layer L seed S rows N pos0 P values V prompt "NAME"`.
 The prompt name is a JSON string matching a sealed prompt. All events must use one layer and seed,
@@ -289,3 +296,44 @@ where the arms part. This is a cross-run comparison: after the first difference 
 different activations, so later differences include propagation, not only local rounding.
 
 `python -m unittest discover -s tools/strix-gate -p 'test_*.py'` covers it with synthetic dumps.
+
+### TURBO relative bar: `compare --mode turbo`
+
+`--mode fast` (default) is the absolute FAST bar above, unchanged. `--mode turbo` judges T (the candidate) against a
+reference pack R measured on the same E (the exact arm): `compare E T --mode turbo --reference-pack-arm R_DIR ...`.
+Per row, U95(KL_T-KL_R), U95(disagreement_T-disagreement_R) and U95(dNLL_T-dNLL_R) must each be <= 0 (one-sided 95 %,
+paired rows). Optional absolute safety limits: `--turbo-max-kl`, `--turbo-min-top1`, `--turbo-max-dnll`. `--null-arm`
+controls are measured against E and reported (not a verdict input).
+
+The normal-approximation intervals treat sampled rows (and paired T-minus-R differences) as independent
+observations with finite variance and enough samples for the approximation. Tokens within a prompt may be
+correlated, making these intervals overconfident; they do not establish prompt-level uncertainty or model
+qualification. Such claims require independently sampled prompts and prompt-level resampling or another
+validated treatment of clustering. Task Wilson intervals likewise assume independent Bernoulli trials.
+
+Pack identity: `seal --model-sha SHA` records the weights/pack sha (else the execution witness `model_sha256` is used).
+E and T must share it unless `--candidate-sha` declares T's; R may differ from E only with `--reference-sha` equal to R's
+sealed value. Every participating rank, including null controls, needs a valid SHA-256 digest. A declared digest
+must agree with an available execution witness. Missing, invalid, undeclared or mismatching identities are errors (exit 2).
+
+`--task-results JSON`: `{"tasks":[{"name":"t1","category":"code|math|retrieval|tools|json|prose","E":{"passed":8,"total":10},"T":{...},"R":{...}}]}`.
+Per category and overall the receipt carries passed/total/rate and a Wilson 95 % interval per arm. Checks per category:
+T's drop vs E must not exceed R's drop unless the T and R Wilson intervals overlap; absolute drop of T vs E <= 5 points
+code/math, 2 retrieval, 1 tools (override `--task-drop-limit CAT=POINTS`); json must pass 100 % for T.
+
+Verdicts and exit codes: PASS 0, FAIL 1 (every failing check is named), error 2, NO-REFERENCE 3 (no `--reference-pack-arm`
+or a task without `R`; never PASS, but a failing check still reports FAIL).
+
+`--receipt OUT.json` writes `strix-turbo-receipt/v1`: `verdict`, `failing`, `commit` (`--commit`), `binary_sha256` {E,T,R},
+`pack` {calibration (`--calibration`), E_sha, T_sha, R_sha}, `run`, `hardware` (`--run-manifest JSON`, free keys such as
+hardware, gpu_clock_mhz), `routes` {effective_config: lines of `--effective-config FILE`, execution_witness from the seals},
+`metrics` (mean + 95 % interval for T and R), `checks`, `tasks`, `controls`, `performance` (`--perf JSON`: tok_s,
+bytes_per_token, ttft_ms, p95_ms; absent keys are null and listed in `missing`).
+
+## GLM scored prefill compare: `glm_score_nll.py`
+
+The GLM rank captures the last N prompt rows' logits with `STRIX_GLM_PF_SCORE_LAST=N` and
+`STRIX_GLM_PF_SCORE_OUT=DIR/NAME-tf` (one vocabulary slice per rank). `glm_score_nll.py --dir DIR --ref X1 --test I1
+--prompt P.u32 --vocab-size V [--rows 256] [--json OUT]` (V is the model's full vocabulary size) prints NLL ref/test, dNLL (offset-1 target = the scored rule), mean KL and
+top-1 agreement. The prompt must be the length being gated: a `.u32` file holds 4 bytes per token (a 32,768-byte file
+is an 8K prompt). Tests: `python -m unittest test_glm_score_nll` in this directory.

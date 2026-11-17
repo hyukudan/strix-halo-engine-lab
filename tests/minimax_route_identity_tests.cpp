@@ -50,6 +50,7 @@ struct ScopeRule { const char* dir; const char* prefix; bool recursive; const ch
 constexpr ScopeRule scope_rules[] = {
     {"src/minimax", "", true, "strix_minimax_{engine,assets,defaults,session,serve,pfx,dspark,moe_opt_hip,model_description}"},
     {"src/moe_core", "", true, "shared MoE device core included by the MiniMax engine kernels"},
+    {"src/cuda/models/minimax", "", true, "MiniMax RTX prefill (CUDA backend, was src/minimax/rtxpf/cuda)"},
     {"src/dspark_common", "", true, "drafter kernels included by strix_minimax_dspark"},
     {"src/xport", "", true, "strix_xport INTERFACE linked by strix_minimax_engine (xfer)"},
     {"include/strix/minimax", "", true, "public headers of the strix_minimax_* libraries"},
@@ -314,6 +315,20 @@ void config_receipts() {
     const Lookup baseline_env = [](const char* key) -> const char* {
         return std::string_view(key) == kBaselineEnv ? "1" : nullptr;
     };
+    for (const char* asked : {static_cast<const char*>(nullptr), "", "adaptive", "invariant"}) {
+        const Lookup order_env = [asked](const char* key) -> const char* {
+            return std::string_view(key) == "STRIX_MMX_PF_ORDER" ? asked : nullptr;
+        };
+        const auto config = effective_config(Cli{}, order_env);
+        require(config.find(std::string("STRIX_MMX_PF_ORDER.requested=") +
+                            (asked ? asked : "default") + "\n") != std::string::npos,
+                "requested chunk order inspection");
+        // Unset resolves the pf_order table default (invariant); an empty value is explicit and stays adaptive.
+        const bool invariant = !asked || std::string_view(asked) == "invariant";
+        require(config.find(std::string("STRIX_MMX_PF_ORDER.effective=") +
+                            (invariant ? "invariant" : "adaptive") + "\n") != std::string::npos,
+                "effective chunk order inspection");
+    }
     require(resolve(empty).size() == items().size(), "defaults registry");
     for (const auto& resolved : resolve(empty))
         if (std::string_view(resolved.item->env) == "STRIX_MM_PF_MSA_REWORK")

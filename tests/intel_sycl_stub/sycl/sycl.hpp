@@ -10,6 +10,9 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#include <deque>
+#include <memory>
+#include <cstring>
 
 namespace sycl {
 struct exception : std::runtime_error { exception() : std::runtime_error("injected SYCL failure") {} };
@@ -21,6 +24,22 @@ inline bool async_wait = false, async_destroy = false, null_alloc = false;
 inline int live = 0, delivered = 0, missing_handler = 0, info_calls = 0;
 inline char storage = 0;
 inline void fail(Fault at) { if (fault == at) throw exception{}; }
+// Optional deferred execution for ordering/retirement tests; fault tests stay inert.
+struct Work {
+    std::deque<std::function<void()>> pending;
+    std::size_t submitted=0,completed=0;
+};
+inline bool execute=false;
+inline std::vector<std::shared_ptr<Work>> queues;
+inline void submit(const std::shared_ptr<Work>& work,std::function<void()> action) {
+    work->pending.push_back(std::move(action)); ++work->submitted;
+}
+inline void drain(const std::shared_ptr<Work>& work,std::size_t until) {
+    while(work->completed<until) {
+        auto action=std::move(work->pending.front()); work->pending.pop_front();
+        action(); ++work->completed;
+    }
+}
 }
 namespace info {
 enum class device_type { gpu };
@@ -56,6 +75,7 @@ template<int N> struct id {
     std::size_t operator[](std::size_t) const { return 0; }
 };
 class queue {
+    std::shared_ptr<test::Work> work_=std::make_shared<test::Work>();
     std::function<void(exception_list)> handler_;
     void deliver() {
         ++test::delivered;
@@ -63,9 +83,9 @@ class queue {
         handler_({std::make_exception_ptr(exception{})});
     }
 public:
-    queue(const device&, property::queue::in_order) { test::fail(test::Fault::construct); ++test::live; }
+    queue(const device&, property::queue::in_order) { test::fail(test::Fault::construct); ++test::live; test::queues.push_back(work_); }
     template<class H> queue(const device&, H handler, property::queue::in_order)
-        : handler_(std::move(handler)) { test::fail(test::Fault::construct); ++test::live; }
+        : handler_(std::move(handler)) { test::fail(test::Fault::construct); ++test::live; test::queues.push_back(work_); }
     ~queue() noexcept {
         if (test::async_destroy) {
             try { deliver(); } catch (...) { /* recorded by delivered; test checks handler presence */ }
@@ -74,10 +94,17 @@ public:
     }
     void wait_and_throw() {
         test::fail(test::Fault::wait);
+        if(test::execute) test::drain(work_,work_->submitted);
         if (test::async_wait) { test::async_wait = false; deliver(); }
     }
-    void memcpy(void*, const void*, std::size_t) { test::fail(test::Fault::copy); }
-    template<class F> void parallel_for(range<2>, F) { test::fail(test::Fault::submit); }
+    void memcpy(void* dst, const void* src, std::size_t bytes) {
+        test::fail(test::Fault::copy);
+        if(test::execute) test::submit(work_,[=] { std::memcpy(dst,src,bytes); });
+    }
+    template<class F> void parallel_for(range<2>, F action) {
+        test::fail(test::Fault::submit);
+        if(test::execute) test::submit(work_,[=] { action(id<2>{}); });
+    }
 };
 inline void* allocation(test::Fault kind) {
     test::fail(kind);
