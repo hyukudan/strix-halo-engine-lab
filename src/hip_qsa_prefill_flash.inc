@@ -44,6 +44,13 @@ inline unsigned score_rows(std::uint32_t max_blocks) {
     if (mode != kScoreRowsAuto) return mode;
     return qsa_auto_score_rows(max_blocks, qpf2k::long_context_item_enabled("STRIX_QSA_SCORE_ROWS64"));
 }
+// STRIX_QSA_SCORE_SPLIT_LOADS (default on; 0 = the previous merged-load form): score_kernel's SplitLoads (see
+// head_dot). The requested value is startup-cached; shared baseline/master/model
+// suppression is applied after the cache, as for the other exact organization items.
+inline bool score_split_loads() {
+    static const bool on = strix::envcfg::flag("STRIX_QSA_SCORE_SPLIT_LOADS", true);
+    return on && !qpf2k::long_context_item_suppression("STRIX_QSA_SCORE_SPLIT_LOADS");
+}
 constexpr unsigned kGroup = 4U; // blocks per selection group (score_kernel maxima, select_kernel)
 typedef __attribute__((address_space(4))) const float* uniform_ptr;
 
@@ -123,12 +130,26 @@ __device__ __forceinline__ void leaf_pair_group(Q q, const float (&k)[kDim], uns
     for (unsigned i = 0; i < 8U; ++i) a[at + i] = x[i] + leaf<Fused, Q>(q, k, l0 + 16U + i);
     if constexpr (Fence) __builtin_amdgcn_sched_barrier(0);
 }
-template <bool Fused, class Q, bool Fence = true>
+// SplitLoads: an opaque copy of the wave-uniform query pointer before the second leaf group and before every head,
+// so the scalar-load combiner cannot merge the 8-float query loads of neighbouring groups / heads into 16-float
+// loads (s_load_b512). Merged, the fused form keeps all 128 query values of a head live (more than the SGPR file:
+// spills to VGPR lanes, ~64 v_writelane/v_readlane per row and block tile on gfx1151). Only the SGPR allocation and
+// the load widths change; every product, sum and their order are the same, so the bits are the same.
+template <class Q> __device__ __forceinline__ Q opaque_uniform(Q q) {
+    if constexpr (std::is_same_v<Q, uniform_ptr>) {
+        unsigned zero; // an SGPR zero the compiler cannot see through: the next loads are not provably adjacent
+        asm volatile("s_mov_b32 %0, 0" : "=s"(zero));
+        return q + zero;
+    } else {
+        return q;
+    }
+}
+template <bool Fused, class Q, bool Fence = true, bool SplitLoads = false>
 __device__ __forceinline__ float head_dot(Q q, const float (&k)[kDim]) {
 #pragma clang fp contract(off)
     float a[16];
     leaf_pair_group<Fused, Q, Fence>(q, k, 0U, a, 0U);
-    leaf_pair_group<Fused, Q, Fence>(q, k, 8U, a, 8U);
+    leaf_pair_group<Fused, Q, Fence>(SplitLoads ? opaque_uniform(q) : q, k, 8U, a, 8U);
 #pragma unroll
     for (unsigned l = 0; l < 8U; ++l) a[l] = a[l] + a[l + 8U];
 #pragma unroll
@@ -136,12 +157,13 @@ __device__ __forceinline__ float head_dot(Q q, const float (&k)[kDim]) {
     a[0] = a[0] + a[2]; a[1] = a[1] + a[3];
     return a[0] + a[1];
 }
-template <bool Fused, class Q, bool Fence = true>
+template <bool Fused, class Q, bool Fence = true, bool SplitLoads = false>
 __device__ __forceinline__ float block_score(Q q, const float (&k)[kDim], std::uint32_t head_dim) {
 #pragma clang fp contract(off)
     float total = 0.0F;
 #pragma unroll
-    for (unsigned h = 0; h < kHeads; ++h) total += fmaxf(head_dot<Fused, Q, Fence>(q + h * kDim, k), 0.0F);
+    for (unsigned h = 0; h < kHeads; ++h)
+        total += fmaxf(head_dot<Fused, Q, Fence, SplitLoads>(SplitLoads ? opaque_uniform(q + h * kDim) : q + h * kDim, k), 0.0F);
     return total / sqrtf(static_cast<float>(head_dim));
 }
 
@@ -167,7 +189,7 @@ template <unsigned Rows> struct ScoreGroup {
 // Packed: pooled_keys holds the pool's packed BF16 copy (u16 per feature, block_pool_kernel's packed_keys); each key is
 // widened back to the identical float, so every product, tree and guard is unchanged and the key reads halve.
 template <unsigned Rows, unsigned RowsPerCta, unsigned W, bool Stats = false, bool QueryLds = false, bool Fence = true, unsigned RowUnroll = 1U, bool Batch = false,
-    bool Packed = false>
+    bool Packed = false, bool SplitLoads = false>
 __global__ __launch_bounds__(W * 32U) void score_kernel(QsaRowsScoreViews<Rows> single, const void* pooled_keys,
     std::uint32_t scored_blocks, std::uint32_t head_dim, float* maxima, std::uint32_t maxima_stride, const uint2* key_ranges,
     std::uint32_t* stats = nullptr, const ScoreGroup<Rows>* groups = nullptr) {
@@ -247,7 +269,7 @@ __global__ __launch_bounds__(W * 32U) void score_kernel(QsaRowsScoreViews<Rows> 
             score = fused ? block_score<true, const float*, Fence>(q, k, head_dim) : block_score<false, const float*, Fence>(q, k, head_dim);
         } else {
             const auto q = reinterpret_cast<uniform_ptr>(reinterpret_cast<std::uintptr_t>(views.index_query[r]));
-            score = fused ? block_score<true>(q, k, head_dim) : block_score<false>(q, k, head_dim);
+            score = fused ? block_score<true, uniform_ptr, true, SplitLoads>(q, k, head_dim) : block_score<false>(q, k, head_dim);
         }
         if (b < blocks) views.block_scores[r][b] = score;
         if (maxima) {

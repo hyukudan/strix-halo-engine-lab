@@ -135,6 +135,10 @@ constexpr Item kItems[] = {
      "Grouped all-member >=2048-row gate (configurable); TP2 4096+3844 IDs identical, -2.3/-2.5 % with late fence; full state/workload qualification pending"},
     {"pf_late_src_fence", "STRIX_MM_PF_LATE_SRC_FENCE", "1", "0",
      "Admitted grouped async source lifetime; TP2 IDs identical, combined -2.3/-2.5 %; full state/workload qualification pending"},
+    {"pf_order", "STRIX_MMX_PF_ORDER", "invariant", "adaptive",
+     "Chunk-invariant linear order mmx-pf-linear-s1-v1 (bits independent of chunking; cache identity prefill_order=): gate32 6 x 32K "
+     "units vs 3 L0 nulls each, pooled dNLL -0.053 CI95 [-0.148,+0.041] inside null spread, task 40/42 == 40/42; "
+     "a defaulted value falls back to adaptive when the invariant route is unmet"},
     // transport (host path, bits unchanged)
     {"dist_crc_parallel", "STRIX_DIST_CRC_PARALLEL", "1", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
     {"dist_host_crc_overlap", "STRIX_DIST_HOST_CRC_OVERLAP", "1", "0", "Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged"},
@@ -349,6 +353,13 @@ void check_peer(const std::function<void(const void*, void*, std::size_t)>& exch
     check_peer(profile_resolution(process_env), exchange);
 }
 
+std::string linear_order(const Lookup& env) {
+    for (const auto& r : resolve(env))  // a table default counts exactly like an explicit value
+        if (std::strcmp(r.item->env, "STRIX_MMX_PF_ORDER") == 0) return r.value;
+    const char* v = env("STRIX_MMX_PF_ORDER");
+    return v != nullptr && *v != '\0' ? std::string(v) : std::string("adaptive");
+}
+
 std::string prefill_identity(const Lookup& env) {
     const auto p = prefill_policy(env);
     // MSA attention policies under prefill_msa (unchanged form), the index projection member under prefill_idxproj.
@@ -363,6 +374,9 @@ std::string prefill_identity(const Lookup& env) {
     std::string out = msa.empty() ? std::string() : "prefill_msa=" + msa;
     if (!idx.empty()) out += std::string(out.empty() ? "" : ";") + "prefill_idxproj=" + idx;
     if (fast_i4_format(env)) out += std::string(out.empty() ? "" : ";") + "moe_prefill_format=fast_i4";
+    // Chunk-invariant linear order (MoE gate/up/down + dense q/k/v/o, fixed S = 1): different bits from the adaptive
+    // order, so a parked state written under one never restores into the other.
+    if (linear_order(env) == "invariant") out += std::string(out.empty() ? "" : ";") + "prefill_order=mmx-pf-linear-s1-v1";
     // TURBO: versioned name + effective levers + weight identity, even with every lever off (empty outside turbo).
     if (const auto pr = profile_resolution(env); pr.is_turbo())
         out += std::string(out.empty() ? "" : ";") + pr.cache_namespace();
@@ -403,6 +417,13 @@ void apply() {
 bool from_defaults(const char* env) {
     std::lock_guard<std::mutex> g(g_mutex);
     return g_exported.count(env) != 0;
+}
+
+void decline_default(const char* env, const char* value, const std::string& reason) {
+    std::lock_guard<std::mutex> g(g_mutex);
+    if (g_exported.count(env) == 0) throw std::logic_error(std::string("decline_default: ") + env + " was not exported by the defaults");
+    (void)export_env(env, value, 1);
+    std::printf("minimax defaults: %s default declined -> %s (%s)\n", env, value, reason.c_str());
 }
 
 Cli parse_cli(const std::string& app, const std::vector<std::string>& args) {
@@ -593,7 +614,8 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
         o << r << "=" << (v != nullptr ? v : "default") << "\n";
     }
     const char* order_asked = env("STRIX_MMX_PF_ORDER");
-    const auto& order = strix::moe_core::resolve_grouped_order(order_asked);
+    // requested = how the order was asked (unset = "default"); effective resolves the pf_order table item like apply().
+    const auto& order = strix::moe_core::resolve_grouped_order(linear_order(env).c_str());
     o << "STRIX_MMX_PF_ORDER.requested=" << (order_asked ? order_asked : "default") << "\n"
       << "STRIX_MMX_PF_ORDER.effective=" << (order.invariant() ? "invariant" : "adaptive") << "\n";
     o << "build.gu4_scalar=" << (STRIX_MM_GU4_SCALAR ? "on" : "off") << "\n";

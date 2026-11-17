@@ -36,3 +36,17 @@ and MiniMax window loops pass their own kernel names. `--cus` and `--cu-lds` com
 these defaults do not detect the traced family or device. Set the overrides explicitly for
 other families/devices. Empty or malformed traces, invalid run indices and invalid capacity/edge
 arguments produce CLI errors. No host names or paths: the trace path is the only input.
+
+## kind_excess.py: long-context excess per phase and kernel kind
+
+`python3 kind_excess.py SHORT_kernel_trace.csv LONG_kernel_trace.csv [--mult 4] [--top 12] [--phase NAME=REGEX ...]`
+
+Both traces must contain kernel rows with `Kernel_Name`, `Start_Timestamp` and
+`End_Timestamp` headers, nonempty normalized names and integer timestamps satisfying
+`0 <= start <= end`. Invalid input fails with a file/line diagnostic before any
+comparison is printed. Aggregation and phase regexes use full normalized names;
+only display labels are shortened, and colliding labels are shown in full.
+compares two single-prefill traces whose prompts differ by `--mult` in length (e.g. 32K and 128K) and prints, per
+phase and per kernel kind, the time in each and `LONG - mult x SHORT`: the work that grows faster than the prompt
+(attention, indexer scoring and selection). Default phases are the Qwen prefill kernels; pass `--phase` for other
+families. CPU only; the trace paths are the only inputs.

@@ -88,6 +88,8 @@ bool product_option(const std::string& a, const std::function<std::string()>& ne
 // Cache / receipt identity of the active prefill policies; empty with every governed row at its builtin and the EXL3
 // MoE format. This field's omission alone does not establish complete cache compatibility.
 std::string prefill_identity(const Lookup& env);
+// Effective STRIX_MMX_PF_ORDER (table default or explicit): "adaptive" or "invariant" (identity mmx-pf-linear-s1-v1).
+std::string linear_order(const Lookup& env);
 // Policy id of the index projection member for a canonical layer set ("minimax-index-proj-wmma-v1-l40-59").
 std::string idx_wmma_policy(const std::string& layers);
 // Rank agreement of the profile rows (strix::profile::check_peer over the process environment): both ranks call it at
@@ -107,6 +109,9 @@ void apply();
 // True when apply() exported `env` (the user did not set it): a default that cannot hold falls back with a notice
 // instead of failing.
 bool from_defaults(const char* env);
+// A defaulted item that cannot hold on this load: re-export `value` (normally the item's off form) so receipts and
+// cache identities name what runs, and print the reason. Throws if `env` was not exported by apply().
+void decline_default(const char* env, const char* value, const std::string& reason);
 
 // The USB4 transport names in session routes, whichever accepted spelling was requested
 // (strix::dist::negotiated_transport(requested, direct_live, kRouteHost, kRouteGpu)).
