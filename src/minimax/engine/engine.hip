@@ -928,7 +928,7 @@ struct Engine::Impl {
             if (mode != "0" && mode != "1" && mode != "2") throw std::invalid_argument("STRIX_MM_PF_FLASH_KEYS must be 0, 1 or 2");
             pf_flash_keys = static_cast<unsigned>(mode[0] - '0');
         }
-        if (const char* value = std::getenv("STRIX_MM_PF_MSA_RG_ROWS")) {
+        if (const char* value = strix::envcfg::text("STRIX_MM_PF_MSA_RG_ROWS")) {
             const std::string mode(value);
             if (mode != "0" && mode != "auto" && mode != "4" && mode != "8")
                 throw std::invalid_argument("STRIX_MM_PF_MSA_RG_ROWS must be auto, 0, 4 or 8");
