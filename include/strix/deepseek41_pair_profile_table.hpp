@@ -38,7 +38,7 @@ inline constexpr std::array<strix::profile::Lever, 7> profile_table{{
     // ds41-replay-r128) stays pending: v1 refuses bounds below 256.
     {"decoder_replay", "STRIX_DS41_DECODER_REPLAY", "", {"", "", "", "128"}, "0", strix::profile::Kind::bit_changing,
      {true, false, true, false}, {true, true, true, false}, "", "0",
-     "explicit FAST policy ds41-decoder-replay-bounded-v1; gate-qualified from R = 256 (smaller bounds refused); turbo R=128 (ds41-replay-r128) pending", false, {}, true},
+     "explicit FAST policy ds41-decoder-replay-bounded-v1, R >= 256 (smaller bounds refused); not qualified on its key floor round_down(T - R, 256) (the R = 256 gate ran on the floor T - R), so no profile sets it; turbo R=128 (ds41-replay-r128) pending", false, {}, true},
     // Prefill only: the Engram KV projection on the shared FP16 WMMA core (ds41-engram-f16wmma-v1); views whose x would overflow FP16
     // keep the exact kernel. Explicit only (not a FAST bundle member) until its qualification receipt.
     {"engram_f16wmma", "STRIX_DS41_FAST_ENGRAM", "", {"", "", "", ""}, "0", strix::profile::Kind::bit_changing,
