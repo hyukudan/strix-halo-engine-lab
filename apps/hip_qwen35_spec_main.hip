@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "strix/qwen35/hip_engine.hpp"
+#include "strix/qwen35/hip_spec_defaults.hpp"
 #include "strix/spec/block_drafter.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/spec/engine_target.hpp"
@@ -28,12 +29,7 @@
 
 namespace sp = strix::spec;
 namespace q = strix::qwen35;
-struct HipChainDev {
-    static float* alloc(q::HipEngine& e, std::size_t n) { return e.alloc_f32(n); }
-    static void release(q::HipEngine& e, float* p) { e.free_f32(p); }
-    static void copy(q::HipEngine& e, float* d, const float* s, std::size_t n) { e.copy_f32_async(d, s, n); }
-};
-using HipMtpChain = sp::MtpChain<q::HipEngine, HipChainDev>;
+using HipMtpChain = q::HipMtpChain;  // shared glue + resolver: strix/qwen35/hip_spec_defaults.hpp
 using Clock = std::chrono::steady_clock;
 
 namespace {
@@ -244,7 +240,7 @@ int run_mtp_ref(q::HipEngine& E, const std::string& model, const std::string& mt
 int main(int argc, char** argv) try {
     std::string model, ids_file, label = "run", sources, mtp_file, chain_hidden = "post", dump_ref, dump_out;
     std::uint32_t n_gen = 256, max_block = 16, max_pos = 0, pf_bench = 0, trace_n = 0, prefill_rows = 16, chain_k = 7, ref_n = 0;
-    bool check = true, cost_table = false, pf_sample = false, seed_costs = false, pf_twice = false, mtp_ref = false;
+    bool check = true, cost_table = false, pf_sample = false, seed_costs = false, pf_twice = false, mtp_ref = false, draft_rows_on = true;
     std::uint32_t copy_arm = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -267,7 +263,8 @@ int main(int argc, char** argv) try {
         else if (a == "--seed-costs") seed_costs = next() != "0";
         else if (a == "--trace") trace_n = strix::core::parse_u32(next());
         else if (a == "--label") label = next();
-        else if (a == "--mtp") mtp_file = next();                  // side GGUF with blk.<layers>.* (MTP head)
+        else if (a == "--mtp") mtp_file = next();                  // auto (default) | off | side GGUF with blk.<layers>.* (MTP head)
+        else if (a == "--draft-rows") draft_rows_on = next() != "off";  // on (default) | off: draft-only subset head
         else if (a == "--chain-hidden") chain_hidden = next();      // post | pre (hidden fed to the MTP layer)
         else if (a == "--chain-k") chain_k = strix::core::parse_u32(next());
         else if (a == "--copy-arm") copy_arm = strix::core::parse_u32(next());  // also run the copy-only baseline for N tokens
@@ -277,6 +274,9 @@ int main(int argc, char** argv) try {
         else if (a == "--dump-out") dump_out = next();              // speculative emitted ids -> file
         else throw std::invalid_argument("unknown argument " + a);
     }
+    const auto plan = q::resolve_hip_dense_spec(model, mtp_file.empty() ? std::string("auto") : mtp_file, draft_rows_on);  // ONE resolver
+    mtp_file = plan.mtp_source;
+    std::printf("spec plan: mtp %s %s, draft rows %s\n", plan.mtp_reason.c_str(), mtp_file.c_str(), plan.draft_rows ? "subset" : "full");
     if (sources.empty()) sources = mtp_file.empty() ? "copy" : "copy,chain,hybrid";
     if (chain_hidden != "post" && chain_hidden != "pre") throw std::invalid_argument("--chain-hidden post|pre");
     if (model.empty() || (ids_file.empty() && !cost_table && !pf_bench))
@@ -299,6 +299,7 @@ int main(int argc, char** argv) try {
     if (!mtp_file.empty()) E->load_mtp(mtp_file);
     const auto vocab = E->config().vocab;
     std::unique_ptr<HipMtpChain> chain_glue;
+    std::unique_ptr<sp::DraftRows> drows;
     if (E->has_mtp()) chain_glue = std::make_unique<HipMtpChain>(*E, chain_hidden == "pre", q::HipEngine::mtp_max_rows());
     std::printf("loaded: weights %.2f GB/pass, state %.0f MB/pass, max_positions %u\n", double(E->weight_bytes()) / 1e9,
                 double(E->state_bytes_per_pass()) / 1e6, opt.max_positions);
@@ -477,6 +478,13 @@ int main(int argc, char** argv) try {
         drafter.commit(prompt);
         out.assign(1, anchor);
         drafter.commit(std::span<const std::uint32_t>(out.data(), 1));
+        const bool drows_on = use_chain && chain_glue && plan.draft_rows;
+        if (drows_on) {
+            if (!drows) drows = std::make_unique<sp::DraftRows>(q::hip_dense_draft_rows_config(vocab));
+            drows->begin(prompt);
+            drows->admit(std::span<const std::uint32_t>(out.data(), 1));
+        }
+        E->set_draft_rows(drows_on ? drows.get() : nullptr);
         sp::EngineVerifyTarget<q::HipEngine> target(*E);
         if (use_chain && chain_glue) target.set_observer([&](const q::HipRowsOut& o, std::uint32_t rows) { chain_glue->observe_verify(o, rows); });
         sp::BlockSpeculator spec(drafter, target);
@@ -501,8 +509,11 @@ int main(int argc, char** argv) try {
             per_step.push_back(double(r.emitted));
             tick_ms.push_back(now_ms() - t0);
             cum.push_back(std::uint32_t(out.size()));
+            if (drows_on) drows->admit(std::span<const std::uint32_t>(out.data() + out.size() - r.emitted, r.emitted));
         }
         const double wall = now_ms() - t0;
+        E->set_draft_rows(nullptr);
+        if (drows_on) std::printf("draft rows: %s\n", drows->describe().c_str());
         std::size_t bad = (out.size() != n_run || (!ref.empty() && n_run == n_gen && ref.size() != n_gen)) ? 1U : 0U;
         for (std::size_t i = 0; i < out.size() && i < ref.size(); ++i)
             if (out[i] != ref[i]) { ++bad; if (bad == 1) std::fprintf(stderr, "MISMATCH at token %zu: spec %u serial %u\n", i, out[i], ref[i]); }

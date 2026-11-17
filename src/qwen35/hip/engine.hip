@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -19,6 +20,8 @@
 
 #include "strix/env_flags.hpp"
 #include "strix/gguf_reader.hpp"
+#include "strix/qwen35/iu4_draft_head.hpp"
+#include "strix/spec/draft_rows.hpp"
 #include "strix/hip_gdn_dims.hpp"
 #include "../../attn_core/dense_decode.hpp"
 #include "../../attn_core/dense_decode_flash.hpp"
@@ -105,6 +108,33 @@ __global__ void argmax_kernel(const float* logits, unsigned vocab, int* out) {
         __syncthreads();
     }
     if (threadIdx.x == 0) out[blockIdx.x] = bi[0];
+}
+// Draft-only subset head: argmax over the first `count` compact rows (row stride `stride`, same first-max rule as
+// argmax_kernel), then compact row -> token id through the slot table (slot -> source group of `group` ids).
+__global__ void draft_argmax_map_kernel(const float* logits, unsigned count, unsigned stride, const std::uint32_t* map,
+                                        unsigned group, int* out) {
+    __shared__ float bv[1024];
+    __shared__ int bi[1024];
+    const float* row = logits + std::size_t(blockIdx.x) * stride;
+    float best = -INFINITY;
+    int bidx = 0x7fffffff;
+    for (unsigned i = threadIdx.x; i < count; i += 1024U)
+        if (row[i] > best) { best = row[i]; bidx = int(i); }
+    bv[threadIdx.x] = best;
+    bi[threadIdx.x] = bidx;
+    __syncthreads();
+    for (unsigned s = 512U; s > 0U; s >>= 1U) {
+        if (threadIdx.x < s) {
+            const float v = bv[threadIdx.x + s];
+            const int i = bi[threadIdx.x + s];
+            if (v > bv[threadIdx.x] || (v == bv[threadIdx.x] && i < bi[threadIdx.x])) { bv[threadIdx.x] = v; bi[threadIdx.x] = i; }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const unsigned r = unsigned(bi[0]);
+        out[blockIdx.x] = r < count ? int(map[r / group] * group + r % group) : bi[0];  // no finite row: as argmax_kernel
+    }
 }
 
 struct Tensor {
@@ -376,6 +406,13 @@ struct HipEngine::Impl {
             fr(ids); fr(top);
         }
     } mtp;
+    // Draft-only subset head (set_draft_rows): compact IU4 columns of `head` (dcols columns, tile stride dcols / 16) and the
+    // slot -> source group table. Grow-only buffers.
+    strix::spec::DraftRows* drows = nullptr;
+    std::uint8_t* dhead = nullptr;
+    std::uint32_t* d_dmap = nullptr;
+    std::size_t dhead_cap = 0;
+    std::uint32_t dmap_cap = 0, dcols = 0;
 
     ~Impl() {
         if (stream) (void)hipStreamSynchronize(stream);
@@ -391,6 +428,7 @@ struct HipEngine::Impl {
                         qn, ctx, gu, logits}) fr(p);
         for (auto* p : {conv_all, bak_conv}) fr(p);
         fr(d_ids); fr(d_arg);
+        fr(dhead); fr(d_dmap);
         fr(wide.codes); fr(wide.deltas); fr(wide.g); fr(wide.u);
         fr(iu4.xh); fr(iu4.g); fr(iu4.u);
         if (stream) (void)hipStreamDestroy(stream);
@@ -601,6 +639,45 @@ struct HipEngine::Impl {
         return out;
     }
 
+    void set_draft_rows(strix::spec::DraftRows* r) {
+        if (r) {
+            if (!mtp.ok) throw std::runtime_error("set_draft_rows: no MTP tensors loaded");
+            if (head.fmt != kIu4Fmt || r->group() != kIu4DraftGroup || head.outputs != V || r->vocab() != V || r->rows() == 0)
+                throw std::runtime_error("set_draft_rows: needs an IU4 lm_head and 16-row groups over the model vocabulary");
+            if (r->capacity() > dmap_cap) {  // grow-only slot table
+                if (d_dmap) { HK(hipStreamSynchronize(stream)); HK(hipFree(d_dmap)); d_dmap = nullptr; }
+                alloc0(&d_dmap, std::size_t(r->capacity()) * 4U);
+                dmap_cap = r->capacity();
+            }
+            if (r != drows) dcols = 0;  // another subset (or none) owned the compact head: lay it out again
+        }
+        drows = r;
+    }
+    // Gathers the subset's new slots (stream order). A subset that outgrows the compact layout gets a new column count and
+    // every slot is gathered again (iu4_draft_head.hpp).
+    void draft_rows_sync() {
+        const auto& g = drows->groups();
+        const std::uint32_t slots = drows->slots();
+        std::uint32_t from = drows->materialised();
+        if (dcols == 0 || std::size_t(slots) * kIu4DraftGroup > dcols) {
+            dcols = iu4_draft_columns(drows->rows(), head.outputs);
+            const std::size_t bytes = iu4_head_bytes(dcols, head.inputs);
+            if (bytes > dhead_cap) {
+                if (dhead) { HK(hipStreamSynchronize(stream)); HK(hipFree(dhead)); dhead = nullptr; }
+                alloc0(&dhead, bytes);
+                dhead_cap = bytes;
+            }
+            from = 0;
+        }
+        if (from < slots) {
+            for (const Iu4Copy& c : iu4_group_gather(head.inputs, head.outputs, dcols, g, from, slots))
+                HK(hipMemcpy2DAsync(dhead + c.dst, c.height > 1U ? c.dpitch : c.width, head.data + c.src, c.height > 1U ? c.spitch : c.width,
+                                    c.width, c.height, hipMemcpyDeviceToDevice, stream));
+            HK(hipMemcpyAsync(d_dmap + from, g.data() + from, std::size_t(slots - from) * 4U, hipMemcpyHostToDevice, stream));
+        }
+        drows->mark_materialised();
+    }
+
     void load_mtp(const std::string& path) {
         if (mtp.ok) throw std::logic_error("load_mtp: already loaded");
         Loader loader(path);
@@ -674,7 +751,17 @@ struct HipEngine::Impl {
         add_kernel<<<nb, 256, 0, stream>>>(mtp.mx, proj, n * H);
         rmsnorm(mtp.mx, mtp.shnorm, H, cfg.rms_eps, mtp.mxn, n, stream);  // mx (pre-norm block output) stays intact for 'pre'
         HipMtpOut o;
-        if (want_top) {
+        if (want_top && drows) {  // draft-only subset head: the same IU4 bytes per column, compact out, ids mapped on the device
+            draft_rows_sync();
+            Tensor w = head;
+            w.data = dhead;
+            w.outputs = dcols;
+            w.bytes = iu4_head_bytes(dcols, head.inputs);
+            linear(w, mtp.mxn, mtp.mlogits, n, stream, wide, iu4);
+            draft_argmax_map_kernel<<<n, 1024, 0, stream>>>(mtp.mlogits, drows->rows(), dcols, d_dmap, kIu4DraftGroup, mtp.top);
+            o.logits = mtp.mlogits;
+            o.top = reinterpret_cast<const std::uint32_t*>(mtp.top);
+        } else if (want_top) {
             linear(head, mtp.mxn, mtp.mlogits, n, stream, wide, iu4);
             argmax_kernel<<<n, 1024, 0, stream>>>(mtp.mlogits, V, mtp.top);
             o.logits = mtp.mlogits;
@@ -732,6 +819,18 @@ void HipEngine::sync() const { HK(hipStreamSynchronize(p_->stream)); }
 
 void HipEngine::load_mtp(const std::string& path) { p_->load_mtp(path); }
 bool HipEngine::has_mtp() const { return p_->mtp.ok; }
+void HipEngine::set_draft_rows(strix::spec::DraftRows* rows) { p_->set_draft_rows(rows); }
+bool HipEngine::has_mtp_layer(const std::string& path) {
+    const auto info = gguf::read_file(path);
+    std::uint64_t layers = 0;
+    for (const auto& t : info.tensors)
+        if (t.name.rfind("blk.", 0) == 0) layers = std::max<std::uint64_t>(layers, std::strtoull(t.name.c_str() + 4, nullptr, 10) + 1U);
+    if (layers == 0) return false;
+    const std::string eh = "blk." + std::to_string(layers - 1U) + ".nextn.eh_proj.weight";
+    for (const auto& t : info.tensors)
+        if (t.name == eh) return true;
+    return false;
+}
 HipMtpOut HipEngine::mtp_forward(const std::uint32_t* t, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0, bool want_top) {
     return p_->mtp_run(t, hidden_dev, rows, pos0, want_top);
 }
