@@ -771,6 +771,9 @@ struct DevicePrefill::Impl {
     Dev<std::int8_t> sh_codes;
     Dev<float> sh_deltas;
     Dev<std::int32_t> sh_sums;
+    // FAST shared expert (ds41-shared-f16-v1): FP32 gate / up of one pass of at most kSharedFastRows rows (allocated on first use)
+    Dev<float> sh_gate, sh_up;
+    const unsigned fast_shared_min_rows = ds41::fast_profile::dense_min_rows();
     // world 2: half sums of every row; TP attention: this rank's and the peer's wo_b K-half of a chunk
     Dev<float> half_own, half_other, y_own, y_other;
     // head (last row)
@@ -828,6 +831,8 @@ struct DevicePrefill::Impl {
         opts.fast_dense = req.fast_dense || ds41::fast_profile::dense_on();
         opts.fast_moe = req.fast_moe || ds41::fast_profile::moe_on();
         opts.fast_engram = req.fast_engram || ds41::fast_profile::engram_on();
+        static strix::lever_cache<bool> shared_on{[] { return ds41::fast_profile::shared_on(); }};
+        opts.fast_shared = req.fast_shared || shared_on.get();
         // Per-shape selector of the FP16 backend: STRIX_DS41_PREFILL_FP16_PROJ (comma list of q_a, kv, q_b, o_a, o_b),
         // STRIX_DS41_PREFILL_FP16_MIN_ROWS (calls of at least that many rows), STRIX_DS41_PREFILL_APPROX_LAYERS=first-end,
         // STRIX_DS41_PREFILL_FP16_A8=1 (operands from the A8 codes)
@@ -1733,6 +1738,7 @@ void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions& p) {
     o.decoder_replay_rows = p.decoder_replay_rows;
     o.decoder_replay_override = p.decoder_replay_override;
     o.fast_engram = p.fast_engram;
+    o.fast_shared = p.fast_shared;
     // no process-wide switch: run_from installs these options as the precision of its own execution (another
     // DevicePrefill of the process keeps its own; strix/ds41_prefill_precision.hpp)
     impl_->rebuild_dense_classes();             // the FAST dense routes of this owner changed
@@ -3520,6 +3526,56 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             if (no == 0U) break;
             sync_time(moe_s, [&] {
                 const auto gate_row = row_bytes(ds41::WeightFormat::q8_0, H), down_row = row_bytes(ds41::WeightFormat::q8_0, I);
+                // FAST lever ds41-shared-f16-v1 (PrefillOptions::fast_shared): gate and up as two Q8_0 x A8 products on the FAST
+                // dense core into FP32, the exact epilogue swiglu_a8 (clamped SwiGLU + A8 of the activations, the CUDA FAST form),
+                // then down on the same core into this rank's shared rows. Below the FAST dense row floor, or for a view the
+                // core does not take, the exact expert kernels below (the whole expert in one form).
+                if (m.options.fast_shared && no >= m.fast_shared_min_rows) {
+                    constexpr std::uint32_t kSharedFastRows = 2048U;
+                    const std::uint32_t pass = std::min(no, kSharedFastRows);
+                    const auto product = [&](const std::uint8_t* weight, std::uint32_t width, std::uint32_t count, const std::int8_t* codes,
+                                             const float* deltas, float* out, std::uint32_t rows) {
+                        ds41::Q8A8DensePrefillView v;
+                        v.weight = weight;
+                        v.width = width;
+                        v.count = count;
+                        v.codes = codes;
+                        v.deltas = deltas;
+                        v.rows = rows;
+                        v.x_stride = width;
+                        v.out = out;
+                        v.out_stride = count;
+                        return v;
+                    };
+                    const auto* wg = static_cast<const std::uint8_t*>(m.dev(s.weights[0]));
+                    const auto* wu = static_cast<const std::uint8_t*>(m.dev(s.weights[1]));
+                    const auto* wd = static_cast<const std::uint8_t*>(m.dev(s.weights[2]));
+                    const std::int8_t* xc = m.xcodes.p + std::size_t{o0} * H;
+                    const float* xd = m.xdeltas.p + std::size_t{o0} * H / 32U;
+                    float* out = m.shared.p + std::size_t{o0} * H;
+                    if (ds41::q8_0_a8_fast_core_supported(product(wg, H, I, xc, xd, out, pass)) &&
+                        ds41::q8_0_a8_fast_core_supported(product(wu, H, I, xc, xd, out, pass)) &&
+                        ds41::q8_0_a8_fast_core_supported(product(wd, I, H, m.sh_codes.p, m.sh_deltas.p, out, no))) {
+                        if (m.sh_gate.n < std::size_t{kSharedFastRows} * I || m.sh_up.n < std::size_t{kSharedFastRows} * I) {
+                            // Commit only after both allocations succeed, so a caught failure is retryable.
+                            Dev<float> gate(std::size_t{kSharedFastRows} * I), up(std::size_t{kSharedFastRows} * I);
+                            m.sh_gate = std::move(gate);
+                            m.sh_up = std::move(up);
+                        }
+                        for (std::uint32_t r = 0; r < no; r += kSharedFastRows) {
+                            const std::uint32_t n = std::min(kSharedFastRows, no - r);
+                            const std::int8_t* c0 = xc + std::size_t{r} * H;
+                            const float* d0 = xd + std::size_t{r} * H / 32U;
+                            (void)ds41::enqueue_q8_0_a8_fast_core(product(wg, H, I, c0, d0, m.sh_gate.p, n), st);
+                            (void)ds41::enqueue_q8_0_a8_fast_core(product(wu, H, I, c0, d0, m.sh_up.p, n), st);
+                            ds41::enqueue_swiglu_a8(m.sh_gate.p, m.sh_up.p, n, I, static_cast<float>(c.swiglu_limit),
+                                                    m.sh_codes.p + std::size_t{r} * I, m.sh_deltas.p + std::size_t{r} * I / 32U,
+                                                    m.sh_sums.p + std::size_t{r} * I / 32U, st);
+                        }
+                        (void)ds41::enqueue_q8_0_a8_fast_core(product(wd, I, H, m.sh_codes.p, m.sh_deltas.p, out, no), st);
+                        return;
+                    }
+                }
                 const auto& routes = site_routes(no, 1U);
                 ds41::PrefillGateUpView gu;
                 gu.gate = m.dev(s.weights[0]);

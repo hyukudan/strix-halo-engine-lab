@@ -2,10 +2,13 @@
 // invariants), default positions, the device plan, the embed cache and the row splice. No GPU, no checkpoint.
 #include "strix/vision/embed_cache.hpp"
 
+#include "../src/attn_core/two_term_model.hpp"
 #include "../src/vision/encoder_layout.hpp"
 #include "vision_encoder_toy.hpp"
 
 #include <algorithm>
+#include <bit>
+#include <cfenv>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -451,6 +454,13 @@ void test_plan() {
     split.split_activations = true;
     CHECK(plan(c, 1521, 1, split).workspace_bytes() > small.workspace_bytes());
     CHECK(plan(c, 1521, 4).fixed_bytes >= small.fixed_bytes);
+    {  // two-term attention (opt-in) holds the lo terms of K and V^T: 2 x slots x heads x dp x 2 B more
+        EncoderOptions one, two;
+        one.attention_terms = 1U;
+        two.attention_terms = 2U;
+        const std::size_t kv = strix::vision::layout::aligned(std::size_t{3072} * 16U * 64U * 2U);  // plan's slot bound: (2 x 1521 + 15 + 15) & ~15
+        CHECK(plan(c, 1521, 1, two).fixed_bytes == plan(c, 1521, 1, one).fixed_bytes + 2U * kv);
+    }
     CHECK(throws([&] { (void)plan(c, 0, 1); }));
     c.width = 1152;  // head dim 72 runs padded to 80
     c.mlp_width = 4304;
@@ -470,6 +480,159 @@ void test_plan() {
     odd.width = 576;  // 8 x 72: heads * 80 == round_up(576, 128), still compacted
     odd.heads = 8;
     CHECK(geometry(odd, 16, 32, {}).compact);
+}
+
+// The shared two-term model (src/attn_core/two_term_model.hpp): its RNE agrees with the reference's own FP16
+// rounding; split errors and product errors stay inside the format- and range-conditioned bounds (f16 and bf16,
+// normal remainders, subnormal remainders, subnormal values, near overflow); below 2^-14 two terms gain nothing.
+void test_two_term_large_head() {
+    namespace tm = strix::attn_core::model;
+    constexpr unsigned dp = 1026U;
+    const std::vector<tm::Terms> q(dp, {0.0F, 0.0F});
+    for (const auto f : {tm::Format::f16, tm::Format::bf16}) {
+        for (unsigned terms : {1U, 2U}) {
+            std::vector<tm::Terms> v(dp);
+            std::vector<float> want(dp);
+            for (unsigned d = 0; d < dp; ++d) {
+                v[d] = tm::split(static_cast<float>(d % 8U + 1U) + 0x1p-12F, f, terms);
+                want[d] = v[d].hi + v[d].lo;
+            }
+            for (unsigned nk : {1U, 17U}) {
+                std::vector<float> out(dp + 2U, -123.0F);
+                tm::dense_row(q.data(), nk, [&](unsigned) { return q.data(); },
+                              [&](unsigned) { return v.data(); }, dp, 1.0F, terms, f, out.data() + 1U);
+                CHECK(std::equal(want.begin(), want.end(), out.begin() + 1));
+                CHECK(out.front() == -123.0F && out.back() == -123.0F);
+            }
+        }
+    }
+}
+
+void test_f16_rounding_modes() {
+    namespace tm = strix::attn_core::model;
+    struct RestoreRounding {
+        int mode = std::fegetround();
+        ~RestoreRounding() { (void)std::fesetround(mode); }
+    } restore;
+    CHECK(restore.mode != -1);
+    const float inf = std::numeric_limits<float>::infinity();
+    const float nan = std::bit_cast<float>(std::uint32_t{0x7FC12345U});
+    const struct { float input, expected; } cases[] = {
+        {0.0F, 0.0F}, {0x1p-149F, 0.0F}, {0x1p-25F, 0.0F},
+        {0x1.8p-24F, 0x1p-23F}, {0x1p-24F, 0x1p-24F},
+        {0x1.ffcp-15F, 0x1p-14F}, {0x1p-14F, 0x1p-14F},
+        {0x1.002p0F, 1.0F}, {0x1.003p0F, 0x1.004p0F},
+        {0x1.006p0F, 0x1.008p0F}, {65519.0F, 65504.0F},
+        {65520.0F, inf}, {inf, inf}, {nan, nan}
+    };
+    for (int mode : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+        CHECK(std::fesetround(mode) == 0);
+        for (const auto& c : cases) {
+            for (bool negative : {false, true}) {
+                const std::uint32_t sign = negative ? 0x80000000U : 0U;
+                const float x = std::bit_cast<float>(std::bit_cast<std::uint32_t>(c.input) | sign);
+                const auto expected = std::bit_cast<std::uint32_t>(c.expected) | sign;
+                CHECK(std::bit_cast<std::uint32_t>(tm::round_operand(x, tm::Format::f16)) == expected);
+                CHECK(std::bit_cast<std::uint32_t>(round_to_f16(x)) == expected);
+            }
+        }
+        const float x = 0x1.003p0F;
+        const tm::Terms q{0.0F, 0.0F};
+        for (unsigned terms : {1U, 2U}) {
+            const auto v = tm::split(x, tm::Format::f16, terms);
+            CHECK(v.hi == 0x1.004p0F);
+            CHECK(v.lo == (terms == 1U ? 0.0F : -0x1p-12F));
+            CHECK(std::fabs(double(x) - v.hi - v.lo) <= tm::operand_bound(x, tm::Format::f16, terms));
+            float out = -123.0F;
+            tm::dense_row(&q, 1U, [&](unsigned) { return &q; }, [&](unsigned) { return &v; },
+                          1U, 1.0F, terms, tm::Format::f16, &out);
+            CHECK(out == (terms == 1U ? 0x1.004p0F : x));
+        }
+        CHECK(std::fegetround() == mode);
+    }
+}
+
+void test_two_term_model() {
+    namespace tm = strix::attn_core::model;
+    std::uint64_t s = 0x9E3779B97F4A7C15ULL;
+    const auto next = [&s] {
+        s ^= s << 13U;
+        s ^= s >> 7U;
+        s ^= s << 17U;
+        return s;
+    };
+    std::vector<float> xs = {0.0F, 1.0F, -1.0F, 0.1F, 1e-3F, 6.1e-5F, 0x1p-14F, 0x1.8p-15F, 3e-8F, 65504.0F, 65519.0F, 0.33333334F};
+    for (int i = 0; i < 4000; ++i) {  // log-uniform magnitudes 2^-30 .. 2^15, both signs
+        const double e = static_cast<double>(next() % 45000U) / 1000.0 - 30.0;
+        const double m = 1.0 + static_cast<double>(next() % 1000000U) / 1e6;
+        xs.push_back(static_cast<float>((next() & 1U ? -m : m) * std::exp2(e)));
+    }
+    unsigned gain_lost = 0;
+    for (const float x : xs) {
+        CHECK(tm::round_operand(x, tm::Format::f16) == round_to_f16(x));
+        CHECK(round_f16_terms(x, 2U) == tm::split(x, tm::Format::f16, 2U).hi + tm::split(x, tm::Format::f16, 2U).lo);
+        for (const tm::Format f : {tm::Format::f16, tm::Format::bf16}) {
+            for (unsigned terms = 1; terms <= 2U; ++terms) {
+                const tm::Terms t = tm::split(x, f, terms);
+                const double err = std::fabs(static_cast<double>(x) - t.hi - t.lo);
+                CHECK(err <= tm::operand_bound(x, f, terms));
+                const float y = xs[next() % xs.size()];
+                const tm::Terms u = tm::split(y, f, terms);
+                if (std::isfinite(t.hi) && std::isfinite(u.hi))
+                    CHECK(std::fabs(static_cast<double>(x) * y - tm::device_product(t, u)) <= tm::product_bound(x, y, f, terms));
+            }
+        }
+        if (std::fabs(x) < 0x1p-14F) {  // hi subnormal: lo is 0, two terms are one term
+            CHECK(tm::split(x, tm::Format::f16, 2U).lo == 0.0F);
+            ++gain_lost;
+        }
+    }
+    CHECK(gain_lost > 100U);
+    CHECK(std::isinf(tm::split(65520.0F, tm::Format::f16, 2U).hi) && std::isinf(tm::operand_bound(65520.0, tm::Format::f16, 2U)));
+    // The relative two-term figure depends on the format: f16 3 u^2 ~ 2^-20.4, bf16 3 u^2 ~ 2^-14.4 per product.
+    CHECK(tm::product_bound(1.0, 1.0, tm::Format::f16, 2U) < 0x1p-20 && tm::product_bound(1.0, 1.0, tm::Format::bf16, 2U) > 0x1p-15);
+    CHECK(tm::dot_roundings(64U, 1U) == 3U && tm::dot_roundings(64U, 2U) == 7U && tm::dot_roundings(80U, 2U) == 10U);
+}
+
+// The device-rounding models of the attention operands: one FP16 term carries a relative operand error up to 2^-11,
+// hi + lo up to max(2^-22 |x|, 2^-25) (two_term_model.hpp); on a tower whose scores are large (ill-conditioned
+// softmax), the two-term form tracks FP32 far closer than the one-term form (the device's opt-in vs its faster
+// default), both in the operand model (attn_*) and in the model of the core's real products and order (attn_order).
+void test_attention_terms() {
+    for (const float x : {1.0F, 0.1F, -3.14159F, 1e-3F, 6.1e-5F, 1234.567F, 0.33333334F}) {
+        CHECK(round_f16_terms(x, 0U) == x);
+        CHECK(round_f16_terms(x, 1U) == round_to_f16(x));
+        CHECK(std::fabs(round_to_f16(x) - x) <= std::fabs(x) * 0x1p-11F);
+        CHECK(std::fabs(round_f16_terms(x, 2U) - x) <= std::max(std::fabs(x) * 0x1p-22F, 0x1p-25F));
+    }
+    EncoderConfig c = base_config();
+    c.layers = 1;
+    Tower t = make_tower(c, 31);
+    for (std::size_t i = 0; i < 2U * c.width * c.width; ++i) mut(t.w.blocks[0].qkv_w)[i] *= 6.0F;  // sharp softmax
+    const PatchGrid g = make_grid(c, 4, 4, 32, 1);
+    const PositionInputs p = default_positions(c, t.w, g);
+    const EncoderOutput exact = reference_encode(c, t.w, g, p);
+    ReferenceRounding one, two, qk;
+    one.attention(1U);
+    two.attention(2U);
+    qk.attn_q = qk.attn_k = 1U;  // one term on QK only
+    const auto rel = [&](const ReferenceRounding& m) {
+        const EncoderOutput o = reference_encode(c, t.w, g, p, m);
+        double num = 0.0, den = 0.0;
+        for (std::size_t i = 0; i < o.hidden.size(); ++i) {
+            num += (static_cast<double>(o.hidden[i]) - exact.hidden[i]) * (static_cast<double>(o.hidden[i]) - exact.hidden[i]);
+            den += static_cast<double>(exact.hidden[i]) * exact.hidden[i];
+        }
+        return std::sqrt(num / den);
+    };
+    ReferenceRounding order1, order2;
+    order1.attention_order(1U);
+    order2.attention_order(2U);
+    const double e1 = rel(one), e2 = rel(two), eqk = rel(qk), o1 = rel(order1), o2 = rel(order2);
+    std::printf("attention terms model: relL2 one %.3g two %.3g qk-only %.3g | order model one %.3g two %.3g\n", e1, e2, eqk, o1, o2);
+    CHECK(e1 > 0.0 && eqk > 0.0 && e2 < e1 / 64.0);
+    CHECK(o1 > e1 / 4.0 && o1 < e1 * 4.0 && o2 > 0.0 && o2 < o1 / 64.0);
+    CHECK(ReferenceEncoder(c, t.w, two).arithmetic() == std::string("vision-ref-f32-rounded"));
 }
 
 ProjectedRows rows_of(unsigned rows, unsigned width, std::uint16_t fill) {
@@ -766,7 +929,8 @@ int main(int argc, char** argv) {
         if (argc == 3 && std::strcmp(argv[1], "--project-device") == 0) {
             const bool device = std::strcmp(argv[2], "on") == 0;
             CHECK(Encoder::project_device() == device);
-            CHECK(std::strcmp(Encoder::effective_arithmetic(), device ? "vision-f16-v1-project-device-f64-v1" : "vision-f16-v1") == 0);
+            CHECK(std::strcmp(Encoder::effective_arithmetic(1U), device ? "vision-f16-v1-project-device-f64-v1" : "vision-f16-v1") == 0);
+            CHECK(std::strcmp(Encoder::effective_arithmetic(2U), device ? "vision-f16-attn2-v1-project-device-f64-v1" : "vision-f16-attn2-v1") == 0);
             return failures ? 1 : 0;
         }
         test_bf16();
@@ -779,6 +943,10 @@ int main(int argc, char** argv) {
         test_tiles();
         test_taps_and_types();
         test_plan();
+        test_two_term_model();
+        test_two_term_large_head();
+        test_f16_rounding_modes();
+        test_attention_terms();
         test_cache();
         test_encode_cached();
         test_merge_project();

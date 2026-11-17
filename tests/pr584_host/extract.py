@@ -24,6 +24,12 @@ def function(marker):
         end += 1
     return source[start:end]
 
+# PR720: exercise the actual allocation transaction with fault-injected HIP allocation.
+(out / "shared_dev.inc").write_text("template <typename T>\n" + function("struct Dev {") + ";\n")
+start = source.index("                        if (m.sh_gate.n <")
+end = source.index("                        for (std::uint32_t r = 0; r < no;", start)
+(out / "shared_alloc.inc").write_text(source[start:end])
+
 
 methods = function("bool flash_attn_at(") + "\n"
 if "std::uint32_t min_ratio() const" in source:
@@ -73,8 +79,10 @@ source = read("src/core/f16_dense_q8a8.hpp")
 (out / "dense_supported.inc").write_text(function("inline bool supported("))
 source = read("src/hip_ds41_layer.hip")
 (out / "dense_dispatch.inc").write_text(re.search(r"if \(!v.exact && fast_dense_on\(\) && enqueue_fast_dense\(v, stream\)\) return false;", source)[0])
-(out / "dense.inc").write_text(function("static strix::core::f16_dense_tall::q8a8::View fast_dense_view(")
-                                 + "\n" + function("static bool enqueue_fast_dense("))
+helper = function("static strix::core::f16_dense_tall::q8a8::View fast_dense_view(")
+(out / "dense.inc").write_text(helper + "\n" + function("static bool enqueue_fast_dense(") + "\n" +
+                              function("bool q8_0_a8_fast_core_supported(") + "\n" +
+                              function("bool enqueue_q8_0_a8_fast_core("))
 (out / "dense_validation.inc").write_text(function("static bool valid_q8_0_a8_dense_prefill_view("))
 (out / "dense_groups.inc").write_text(function("bool enqueue_q8_0_a8_fast_dense_groups("))
 (out / "fast_dense_on.inc").write_text(function("static bool fast_dense_on()"))

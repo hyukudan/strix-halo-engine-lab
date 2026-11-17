@@ -44,6 +44,11 @@ Status index_safetensors(std::shared_ptr<const Source> source,TensorIndex& out) 
         std::sort(spans.begin(),spans.end());std::uint64_t end=0;
         for(auto [first,last]:spans){if(first!=end)return {Error::malformed,"safetensors overlap or unclaimed hole"};end=last;}
         if(end!=source->size()-base)return {Error::malformed,"unclaimed safetensors payload"};
+        // Only an explicit versioned marker gives U8 codes/scales FP4 semantics.
+        for(const auto& [key,value]:result.metadata)if(key=="strix.weight_schema") {
+            if(value!="strix.nvfp4.safetensors@1")return {Error::unknown_format,"unsupported strix weight schema"};
+            result.schema=value;
+        }
         out=std::move(result);return {Error::ok,{}};
     }catch(const std::exception& e){return {Error::malformed,e.what()};}
 }

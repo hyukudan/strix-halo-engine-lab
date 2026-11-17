@@ -59,10 +59,28 @@ w::Status launch_transcode(const w::Plan& plan, const w::WeightView& view, const
     else transcode::to_q8_0(a.source,type,a.elements,output,stream);
     return device_status(cudaPeekAtLastError());
 }
+w::Status launch_nvfp4(const w::Plan& plan,const w::WeightView& view,const w::KernelArguments& record,
+    void* output,void* workspace,std::size_t bytes,w::ExecutionContext& context) {
+    if(plan.selected.storage!=w::FormatId{"nvidia.nvfp4",1} ||
+       plan.selected.arithmetic!=w::ArithmeticId{"nvfp4-mma-f32-v1",1} ||
+       plan.selected.strategy!=w::Strategy::native || plan.selected.image!=native_nvfp4_image ||
+       plan.selected.exactness!=w::Exactness::fast)
+        return {w::Error::unsupported_arithmetic,"native FP4 requires explicit native MMA FAST contract/image"};
+    const auto& a=*static_cast<const Nvfp4Arguments*>(record.data);
+    if(a.view.output!=output || view.shape.rank!=2 || a.view.n!=view.shape.dims[0] ||
+       a.view.k!=view.shape.dims[1] || a.plan.workspace_bytes!=plan.workspace_bytes)
+        return {w::Error::unsupported_shape,"native FP4 typed source/output/workspace differs from plan"};
+    LaunchShape shape{};shape.m=a.view.m;shape.n=a.view.n;shape.k=a.view.k;
+    auto status=NativeNvfp4Source::validate(view,shape);if(!status)return status;
+    // a.view.b is made from the admitted weight's UploadedSlices; its image
+    // lease and the activation/output buffers outlive stream completion.
+    return enqueue_nvfp4(a,workspace,bytes,context);
+}
 constexpr std::array registrations{
     Registration{dense_project_schema,1,sizeof(DenseProjectArguments),alignof(DenseProjectArguments),dense},
     Registration{transcode_q8_schema,1,sizeof(TranscodeArguments),alignof(TranscodeArguments),launch_transcode},
     Registration{transcode_f32_schema,1,sizeof(TranscodeArguments),alignof(TranscodeArguments),launch_transcode},
+    Registration{nvfp4_schema,1,sizeof(Nvfp4Arguments),alignof(Nvfp4Arguments),launch_nvfp4},
 };
 }
 std::span<const Registration> source_registry() noexcept { return registrations; }

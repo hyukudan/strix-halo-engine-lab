@@ -17,6 +17,11 @@ namespace strix::deepseek41::quality {
 // hash of the seed instead of the last-bit flip, so seeds sample the noise floor).
 // Prefix eng_ (any arm, e.g. eng_fast3, eng_exact; labels are [a-z0-9_]): adds the FAST lever ds41-engram-f16wmma-v1 (Engram projection on WMMA).
 inline PrefillOptions arm_precision(const std::string& label) {
+    if (label.rfind("sh_", 0) == 0 && label.size() > 3) {  // + ds41-shared-f16-v1 (shared expert on the FAST dense core)
+        PrefillOptions e = arm_precision(label.substr(3));
+        e.fast_shared = true;
+        return e;
+    }
     if (label.rfind("eng_", 0) == 0 && label.size() > 4) {
         PrefillOptions e = arm_precision(label.substr(4));
         e.fast_engram = true;

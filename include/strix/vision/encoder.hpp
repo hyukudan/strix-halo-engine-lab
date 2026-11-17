@@ -4,7 +4,7 @@
 //
 // Two backends run the same graph from the same EncoderWeights:
 //   ReferenceEncoder  host FP32, slow, the fixture oracle (src/vision/reference.cpp);
-//   Encoder           HIP, arithmetic identity "vision-f16-v1" (src/vision/encoder.hip): weights -> FP16 panels with a
+//   Encoder           HIP, arithmetic identity "vision-f16-attn2-v1" / "vision-f16-v1" (src/vision/encoder.hip): weights -> FP16 panels with a
 //                     power-of-two tensor scale, FP16 operands, FP32 accumulation and residual, FP32
 //                     norm/activation/softmax; optional hi+lo split activations. Class FAST, judged on its gates.
 // A family supplies an adapter (adapter.hpp): tensor names, resize rule, patch order, projector and span layout.
@@ -166,14 +166,30 @@ public:
 
 // Diagnostic rounding model of a device arithmetic inside the host reference (default: none = the FP32 oracle,
 // bit for bit). It places the FP16 operand roundings of vision-f16-v1 one site at a time to study sensitivity.
-// Accumulation and transcendental evaluation remain FP64: this is not a bitwise device oracle or proof of a defect.
+// Accumulation and transcendental evaluation remain FP64 (attn_order: FP32 chains in the core's order, still with
+// std::exp2): this is not a bitwise device oracle or proof of a defect.
 // Never an adapter arithmetic; the shared rounded identity is diagnostic only, not a cache/qualification identity.
 struct ReferenceRounding {
     bool linear_inputs_f16 = false;  // every linear input rounded to FP16 (the single-operand device policy)
-    bool attention_f16 = false;      // Q/K/V and probabilities at each 16-key online maximum rounded to FP16
-    bool any() const { return linear_inputs_f16 || attention_f16; }
+    // The flash core's operands Q, K, V and the probabilities P (rounded at each 16-key online maximum), as FP16 terms per operand: 0 = FP32 (no rounding),
+    // 1 = one FP16 term (the one-term attention), 2 = hi + lo (the two-term attention: lo = FP16 of the remainder).
+    // This operand model rounds the operands only: it keeps lo x lo (the device drops it) and multiplies and sums in
+    // FP64 (error bounds by format and range: src/attn_core/two_term_model.hpp).
+    unsigned char attn_q = 0, attn_k = 0, attn_v = 0, attn_p = 0;
+    // attn_order: the dense core's real products and order instead (attn_core::model::dense_row: hi.hi + hi.lo +
+    // lo.hi, FP32 chains in the core's step order, online exp2 softmax per 16-key tile), attn_q terms on all four
+    // operands; keys in tile order (the device's cyclic slots and split-K merges are not modelled).
+    bool attn_order = false;
+    void attention(unsigned terms) { attn_q = attn_k = attn_v = attn_p = static_cast<unsigned char>(terms); }
+    void attention_order(unsigned terms) {
+        attention(terms);
+        attn_order = true;
+    }
+    bool any_attention() const { return attn_q || attn_k || attn_v || attn_p; }
+    bool any() const { return linear_inputs_f16 || any_attention(); }
 };
 float round_to_f16(float);  // nearest-even FP16 value as a float (subnormals kept, overflow -> infinity)
+float round_f16_terms(float, unsigned terms);  // 0: the value; 1: round_to_f16; 2: hi + round_to_f16(value - hi)
 
 class ReferenceEncoder final : public EncoderBackend {
 public:
@@ -196,8 +212,13 @@ void splice_rows_host(float* dst, std::size_t dst_stride, const ProjectedRows& s
 
 // ---- HIP runner ------------------------------------------------------------------------------------------------
 
+// FP16 terms of the tower attention operands Q, K, V, P: 1 = one term (default: the "vision-f16-v1" rows, faster),
+// 2 = hi + lo (opt-in: closer to FP32, 3x the attention WMMA, other bits). STRIX_VISION_ATTN_TERMS=1|2, strict; the one
+// resolver of the default (every EncoderOptions starts from it: server, CLI, gate, memory plan).
+unsigned attention_terms_from_env();
 struct EncoderOptions {
     bool split_activations = false;                   // hi + lo FP16 operands for every linear input (two GEMMs)
+    unsigned attention_terms = attention_terms_from_env();  // 2 = hi + lo attention operands, 1 = one term
     std::size_t mlp_workspace_bytes = 160U << 20U;    // cap of the chunked MLP buffers (2304 rows split, 4352 single)
     void* stream = nullptr;                           // hipStream_t; null = default stream
 };
@@ -231,7 +252,8 @@ struct EncoderLoadStats {
 // Defined in the HIP library only (src/vision/encoder.hip).
 class Encoder final : public EncoderBackend {
 public:
-    static constexpr const char* kArithmetic = "vision-f16-v1";
+    static constexpr const char* kArithmetic = "vision-f16-v1";            // one-term attention (attention_terms 1, the default)
+    static constexpr const char* kArithmeticAttn2 = "vision-f16-attn2-v1";  // two-term attention (opt-in)
     explicit Encoder(EncoderConfig, EncoderOptions = {});
     ~Encoder() override;
     Encoder(const Encoder&) = delete;
@@ -243,7 +265,8 @@ public:
     std::size_t device_bytes() const;  // panels + workspace + projector scratch currently held
     std::size_t pinned_host_bytes() const;  // retained input staging, separate from device_bytes()
     static bool project_device();  // governed, process-cached, default on (STRIX_VISION_PROJECT_DEVICE=0 = host graph); also available in host-only builds
-    static const char* effective_arithmetic();
+    // Identity of the tower attention terms (1 or 2) and the projector placement; also available in host-only builds.
+    static const char* effective_arithmetic(unsigned attention_terms = attention_terms_from_env());
     const EncoderLoadStats& load_stats() const;
 
     EncoderOutput encode(const PatchGrid&, const PositionInputs&) override;
@@ -260,7 +283,7 @@ public:
     // Device chain: unshuffle kernel, linear1, activation kernel (FP64, the host formula), linear2, one download.
     // STRIX_VISION_PROJECT_DEVICE=0: the host graph of DenseOps (A/B and bitwise check).
     void merge_project(const EncoderOutput& hidden, unsigned grid_h, unsigned grid_w, const MergeProjector&, float* rows) override;
-    const char* arithmetic() const override { return effective_arithmetic(); }
+    const char* arithmetic() const override;  // effective_arithmetic(EncoderOptions::attention_terms)
 
 private:
     struct Impl;

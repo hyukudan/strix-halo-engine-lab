@@ -3420,6 +3420,15 @@ bool enqueue_q8_0_a8_fast_dense_groups(const Q8A8DensePrefillView& v, unsigned g
         return false;
     return enqueue_fast_dense(v, stream, groups, weight_group_bytes);
 }
+bool q8_0_a8_fast_core_supported(const Q8A8DensePrefillView& v) {
+    return v.k_parts == 1U && !v.accumulate && v.a8_codes == nullptr && strix::core::f16_dense_tall::q8a8::supported(fast_dense_view(v));
+}
+bool enqueue_q8_0_a8_fast_core(const Q8A8DensePrefillView& v, void* stream) {
+    if (!q8_0_a8_fast_core_supported(v)) return false;
+    strix::core::f16_dense_tall::q8a8::enqueue_parts(fast_dense_view(v), 1U, as_stream(stream));
+    hip_check(hipGetLastError(), "Q8_0 x A8 FP16 core launch (shared expert)");
+    return true;
+}
 
 // q_b's operand image for the flash core's query_op (hip_ds41_attention_flash.inl FlashAttentionQ16Policy): the pair
 // transform is the flash prologue's rope512 (rope_pair on pairs (d, d + 1), d = o % 512 >= 448, pair (d - 448) / 2,

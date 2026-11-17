@@ -48,6 +48,11 @@ struct PrefillOptions {
     // projection on the shared FP16 WMMA core; views with an x that would overflow FP16 keep the exact kernel.
     // Resolved at construction (option OR environment), then passed per execution; the precision setter replaces it.
     bool fast_engram = false;
+    // FAST lever ds41-shared-f16-v1 (STRIX_DS41_FAST_SHARED=1, explicit, not in the FAST bundle until its gate receipt): the
+    // shared expert's gate, up and down on the FAST dense core (FP16 WMMA, dense-q8a8-f16-v1) with the exact epilogue
+    // (swiglu_a8) between them, as the CUDA backend's FAST shared expert; calls under STRIX_DS41_FAST_DENSE_MIN_ROWS rows and
+    // views the core does not take keep the exact expert kernels. Resolved like fast_engram.
+    bool fast_shared = false;
     // Diagnostics/selection for the non-exact paths (no effect while both switches above are off, except null_ulp_layer):
     // projection bits 1 q_a, 2 kv, 4 q_b, 8 o_a, 16 o_b; layers [approx_layer_first, approx_layer_end); FP16 only at
     // calls of at least fp16_min_rows rows; fp16_keep_a8: FP16 operands from the A8 codes (the exact path's activations)
@@ -397,6 +402,7 @@ public:
     //   fp16-solver-geometry-unpinned   the hipBLASLt FP16 backend picks its solver by the call's shape
     //   diagnostic-output-not-segmented trace / stream hashes / routing loads / quality head rows / null ULP / embed extras
     //                                   report one sequence's run
+    //   shared-fast-group-unqualified FAST shared expert retains its solo-only admission
     //   engram-fast-flag-per-view       FAST Engram (ds41-engram-f16wmma-v1) takes its exact fallback for a whole view when
     //                                   any x of the view would overflow FP16 (one flag per view: engram_x_f16_scan,
     //                                   src/hip_ds41_layer.hip enqueue_engram_f16_wmma); a group view spans members, so one
@@ -406,6 +412,7 @@ public:
         if (o.fp16_dense) return "fp16-solver-geometry-unpinned";
         if (o.trace || o.stream_hashes || o.routing_loads || o.quality_head_rows > 1U || o.null_ulp_layer >= 0 || o.verify_embed_extras)
             return "diagnostic-output-not-segmented";
+        if (o.fast_shared) return "shared-fast-group-unqualified";
         if (o.fast_engram) return "engram-fast-flag-per-view";
         return nullptr;
     }

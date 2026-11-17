@@ -290,6 +290,12 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& view, void* strea
 // the FAST dense form does not take the call or STRIX_DS41_FAST_DENSE_BATCH=0: the caller then makes the per-group calls.
 // Invalid dense views, including k_parts != 1, are declined before enqueueing. The outputs' A8 (a8_codes) is never written here.
 bool enqueue_q8_0_a8_fast_dense_groups(const Q8A8DensePrefillView& view, unsigned groups, std::size_t weight_group_bytes, void* stream);
+// FAST lever ds41-shared-f16-v1 (the prefill shared expert on the FAST dense core): one Q8_0 x A8 product on the shared
+// FP16 WMMA core of policy dense-q8a8-f16-v1, whatever the FAST dense switch (one K part, no accumulate, no A8 output).
+// enqueue returns false and enqueues nothing when the core does not take the view: check every product of the expert
+// with q8_0_a8_fast_core_supported first, so an expert is either wholly FAST or wholly exact.
+bool q8_0_a8_fast_core_supported(const Q8A8DensePrefillView& view);
+bool enqueue_q8_0_a8_fast_core(const Q8A8DensePrefillView& view, void* stream);
 // FAST flash layers (ds41-attn-bf16flash-v1), q_b only: when the FAST dense form takes `view` (the same rule as above),
 // writes the BF16 image of q after RoPE (rope[r] for output row r; view.out_stride elements per row) into `image`
 // instead of view.out and returns true; the flash core reads it through query_op with the bits of the FP32 path.

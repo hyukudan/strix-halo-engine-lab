@@ -80,6 +80,21 @@ int main() {
             }, {}, {});
             require(exported(r, "STRIX_DS41_FAST_ENGRAM") == "1", "serve / prefill CLI resolve a different Engram value");
         }
+        // ds41-shared-f16-v1: explicit only, exported, canonical, a peer without it disagrees; ONE RESOLVER across serve / CLI
+        const auto shared = resolve({{"STRIX_DS41_FAST_SHARED", "1"}});
+        require(!agrees(off, shared) && !agrees(shared, off), "asymmetric shared-expert peers admitted");
+        require(exported(shared, "STRIX_DS41_FAST_SHARED") == "1", "shared-expert lever not exported");
+        require(std::none_of(bundle.set_env.begin(), bundle.set_env.end(),
+                             [](const auto& kv) { return kv.first == "STRIX_DS41_FAST_SHARED" && kv.second == "1"; }),
+                "bundle selects the unqualified shared-expert lever");
+        require(exported(resolve({{"STRIX_DS41_FAST_SHARED", "yes"}}), "STRIX_DS41_FAST_SHARED") == "0", "shared-expert lever not canonical");
+        require(agrees(off, resolve({{"STRIX_DS41_FAST_SHARED", "0"}})), "explicit shared-expert OFF changes the pair identity");
+        for (const pd::App app : {pd::App::serve, pd::App::prefill}) {
+            const auto r = pd::resolve(app, {}, [](const char* key) -> const char* {
+                return std::string(key) == "STRIX_DS41_FAST_SHARED" ? "1" : std::string(key) == "STRIX_DS41_BASELINE" ? "1" : nullptr;
+            }, {}, {});
+            require(exported(r, "STRIX_DS41_FAST_SHARED") == "1", "serve / prefill CLI resolve a different shared-expert value");
+        }
         const auto report = pd::describe(pd::App::rank, bundle);
         require(report.find("STRIX_DS41_FAST_DENSE=1") != std::string::npos &&
                 report.find("STRIX_DS41_FAST_DENSE_MIN_ROWS=128") != std::string::npos, "effective report omits dense policy");

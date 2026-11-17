@@ -90,15 +90,17 @@ EncoderConfig tower(unsigned width, unsigned heads, unsigned mlp, EncoderConfig:
     return c;
 }
 
-bool run(const Case& k, std::uint64_t seed) {
+bool run(const Case& k, std::uint64_t seed, unsigned attention_terms) {
     Tower t = make_tower(k.cfg, seed, 48);
     const PatchGrid g = make_grid(k.cfg, k.gh, k.gw, seed + 1U, k.tiles);
     const PositionInputs p = default_positions(k.cfg, t.w, g);
     const EncoderOutput want = reference_encode(k.cfg, t.w, g, p);
     EncoderOptions opt;
     opt.split_activations = k.split;
+    opt.attention_terms = attention_terms;
     opt.mlp_workspace_bytes = std::size_t{1} << 20U;  // several MLP chunks
     Encoder enc(k.cfg, opt);
+    std::printf("attention terms %u backend %s\n", attention_terms, enc.arithmetic());
     enc.load(t.w);
     EncodeStats stats;
     stats.per_layer = true;
@@ -276,6 +278,7 @@ int main(int argc, char** argv) {
     deep.cfg.deepstack_taps = {0, 2};
     deep.cfg.final_norm = true;
     cases.push_back(deep);
+    cases.push_back({"d72-tiled-tail", deep.cfg, 3, 5, 3, false});
     cases.push_back({"d80-ln-gelu-learned", tower(160, 2, 640, C::Norm::layernorm, C::Mlp::gelu, C::Pos::learned_interp, 14), 9, 7, 1, false});
     cases.push_back({"d64-split", tower(128, 2, 352, C::Norm::rmsnorm, C::Mlp::swiglu, C::Pos::rope2d, 14), 13, 13, 1, true});
     Case clamp{"d64-swiglu-limit-adj", tower(256, 4, 512, C::Norm::rmsnorm, C::Mlp::swiglu, C::Pos::rope2d, 14), 20, 17, 1, false};
@@ -298,7 +301,10 @@ int main(int argc, char** argv) {
             dense_fixture::require(static_cast<bool>(reference), "cannot open OFF reference");
         }
         std::uint64_t seed = 101;
-        for (const auto& k : cases) ok = run(k, seed += 7U) && ok;
+        for (const auto& k : cases) {
+            seed += 7U;
+            for (const unsigned terms : {1U, 2U}) ok = run(k, seed, terms) && ok;
+        }
         if (with_bench || save_bench) bench(with_bench ? &reference : nullptr, save_bench ? &save : nullptr);
         if (with_bench) dense_fixture::finish_reference(reference);
         if (save_bench) {

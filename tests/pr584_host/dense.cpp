@@ -150,6 +150,21 @@ int main(int argc, char** argv) {
         require(enqueue_fast_dense(v, nullptr) && out == 1.0F, "unfused arithmetic differs");
         q::calls.clear(); v.width = 64; v.k_parts = 2;
         require(!enqueue_fast_dense(v, nullptr) && q::calls.empty(), "unsupported part partially launched");
+        v.width = 128; v.k_parts = 1; v.accumulate = false; v.rows = 1;
+        require(q8_0_a8_fast_core_supported(v), "shared core must admit short tails");
+        require(enqueue_q8_0_a8_fast_core(v, nullptr) && q::calls.size() == 1, "shared core wrapper did not launch");
+        const auto shared = q::calls.front();
+        require(shared.weight == v.weight && shared.codes == v.codes && shared.deltas == v.deltas && shared.out == v.out &&
+                shared.row_bytes == 544 && shared.k_bytes == 272 && shared.in == 128 && shared.rows == 1 &&
+                shared.count == v.count && shared.x_stride == v.x_stride && shared.out_stride == v.out_stride &&
+                shared.accumulate == 0, "shared view conversion lost fields");
+        q::calls.clear();
+        v.k_parts = 2;
+        require(!enqueue_q8_0_a8_fast_core(v, nullptr), "shared core admitted split parts");
+        v.k_parts = 1; v.accumulate = true;
+        require(!enqueue_q8_0_a8_fast_core(v, nullptr), "shared core admitted accumulation");
+        v.accumulate = false; v.a8_codes = codes.data();
+        require(!enqueue_q8_0_a8_fast_core(v, nullptr) && q::calls.empty(), "shared core admitted A8 output");
         return 0;
     } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
 }

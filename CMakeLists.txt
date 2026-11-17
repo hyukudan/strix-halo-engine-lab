@@ -1268,6 +1268,12 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-prefix-queue-protection-tests)
     add_test(NAME strix-prefix-queue-protection-tests COMMAND strix-prefix-queue-protection-tests)
     set_tests_properties(strix-prefix-queue-protection-tests PROPERTIES LABELS "cpu" TIMEOUT 120)
+    # Server start: phase line and overlapped start work (strix/serve/startup_phases.hpp).
+    add_executable(strix-serve-startup-phases-tests tests/serve_startup_phases_tests.cpp)
+    target_link_libraries(strix-serve-startup-phases-tests PRIVATE strix_core Threads::Threads)
+    strix_target_warnings(strix-serve-startup-phases-tests)
+    add_test(NAME strix-serve-startup-phases-tests COMMAND strix-serve-startup-phases-tests)
+    set_tests_properties(strix-serve-startup-phases-tests PROPERTIES LABELS "cpu" TIMEOUT 120)
     add_test(NAME strix-prefill-option-cache-write COMMAND strix-prefix-state-cache-tests
         --write-option-checkpoint "${CMAKE_CURRENT_BINARY_DIR}/prefill-option-cache")
     add_test(NAME strix-prefill-option-cache-read COMMAND strix-prefix-state-cache-tests
