@@ -69,9 +69,24 @@ constexpr unsigned chunk_k = chunk / 32; // values per lane in a chunk
 constexpr unsigned hc_tile = 8;          // rows per mix-partial block
 constexpr unsigned mix_waves = hc_mix_count + 1;
 
+// The sublayer input an expansion reads: p[i], or, with the rank partials (HcSiteView::sub_low / sub_high), the canonical
+// rank sum (p[i] + low[i]) + high[i] read in place: the expression and order of canonical_sum_kernel, FP32 adds only (no
+// product, so contraction cannot differ), the same value the materialised sum stored. low and high are both set or both null.
+struct HcSub {
+    const float* __restrict__ p;
+    const float* __restrict__ low;
+    const float* __restrict__ high;
+    __device__ __forceinline__ float operator[](std::size_t i) const {
+        const float s = p[i];
+        return low ? (s + low[i]) + high[i] : s;
+    }
+    __device__ __forceinline__ explicit operator bool() const { return p != nullptr; }
+};
+__host__ __device__ inline HcSub hc_sub(const HcSiteView& v) { return HcSub{v.sub, v.sub_low, v.sub_high}; }
+
 // Copy k of element i of row r after the expansion of the previous sublayer (as hc_expand):
 // post[k] * sub[i] + sum_j comb[j][k] * residual[j][i], the sum from 0 in ascending j.
-__device__ __forceinline__ float copy_value(const float* __restrict__ sub, const float* __restrict__ residual,
+__device__ __forceinline__ float copy_value(HcSub sub, const float* __restrict__ residual,
                                             const HcMix* __restrict__ em, unsigned r, unsigned k, unsigned i, unsigned hidden) {
     const float* res = residual + static_cast<std::size_t>(r) * hc_copies * hidden;
     const HcMix& m = em[r];
@@ -81,7 +96,7 @@ __device__ __forceinline__ float copy_value(const float* __restrict__ sub, const
     return m.post[k] * sub[static_cast<std::size_t>(r) * hidden + i] + s;
 }
 // All copies of element i of row r: expanded (sub not null) or read from the stored stream.
-__device__ __forceinline__ void site_copies(const float* __restrict__ sub, const float* __restrict__ residual,
+__device__ __forceinline__ void site_copies(HcSub sub, const float* __restrict__ residual,
                                             const HcMix* __restrict__ em, const float* __restrict__ stream, unsigned r, unsigned i,
                                             unsigned hidden, float* e) {
     const std::size_t row = static_cast<std::size_t>(r) * hc_copies * hidden;
@@ -204,7 +219,7 @@ __global__ __launch_bounds__(256) void hc_collapse_kernel(const float* __restric
     out[index] = y;
 }
 
-__global__ __launch_bounds__(256) void hc_expand_kernel(const float* __restrict__ sub, const float* __restrict__ residual,
+__global__ __launch_bounds__(256) void hc_expand_kernel(HcSub sub, const float* __restrict__ residual,
                                                         const HcMix* __restrict__ mixes, unsigned hidden, unsigned long long total,
                                                         float* __restrict__ out) {
     const auto index = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -371,7 +386,7 @@ __global__ __launch_bounds__(1024) void norm_split_kernel(NormView v) {
 constexpr unsigned site_waves = 8, site_mixes = hc_mix_count / site_waves, site_unroll = 10;
 static_assert(site_waves * site_mixes == hc_mix_count, "three mixes per wave");
 
-__device__ __forceinline__ void site_partial_row(const float* __restrict__ sub, const float* __restrict__ residual,
+__device__ __forceinline__ void site_partial_row(HcSub sub, const float* __restrict__ residual,
                                                  const HcMix* __restrict__ em, float* __restrict__ stream,
                                                  const std::uint16_t* __restrict__ fn, float* __restrict__ partial, unsigned hidden,
                                                  unsigned chunks, unsigned c, unsigned r) {
@@ -406,7 +421,7 @@ __device__ __forceinline__ void site_partial_row(const float* __restrict__ sub, 
     }
 }
 
-__device__ __forceinline__ void site_body(const HcSiteView& v, const float* __restrict__ sub, const float* __restrict__ residual,
+__device__ __forceinline__ void site_body(const HcSiteView& v, HcSub sub, const float* __restrict__ residual,
                                           const HcMix* __restrict__ em, float* __restrict__ stream, const std::uint16_t* __restrict__ fn,
                                           float* __restrict__ partial, std::uint32_t* __restrict__ counters,
                                           const HcMix* __restrict__ cm, float* __restrict__ out, std::int8_t* __restrict__ codes,
@@ -472,7 +487,7 @@ __device__ __forceinline__ void site_body(const HcSiteView& v, const float* __re
 }
 __global__ __launch_bounds__(32 * site_waves) void hc_site_kernel(HcSiteView v, unsigned mix_chunks, unsigned partial_blocks,
                                                                   unsigned norm_chunks) {
-    site_body(v, v.sub, v.residual, v.expand_mixes, v.stream, v.fn, v.partial, v.counters, v.collapse_mixes, v.out, v.codes, v.deltas,
+    site_body(v, hc_sub(v), v.residual, v.expand_mixes, v.stream, v.fn, v.partial, v.counters, v.collapse_mixes, v.out, v.codes, v.deltas,
               v.sums, mix_chunks, partial_blocks, norm_chunks);
 }
 
@@ -615,7 +630,7 @@ __device__ __forceinline__ void mix_final_fast_wave(const float* __restrict__ pa
 
 // Value e (< chunk) of the stream chunk at c0 of row r: expanded (as copy_value) or read from the stored stream.
 template <bool Expand>
-__device__ __forceinline__ float site_stream_value(const float* __restrict__ sub, const float* __restrict__ residual,
+__device__ __forceinline__ float site_stream_value(HcSub sub, const float* __restrict__ residual,
                                                    const HcMix* __restrict__ em, const float* __restrict__ srow, unsigned r,
                                                    unsigned kc, unsigned i, unsigned hidden, unsigned e) {
     if constexpr (Expand) return copy_value(sub, residual, em, r, kc, i, hidden);
@@ -633,7 +648,7 @@ __device__ __forceinline__ float site_stream_value(const float* __restrict__ sub
 // (copy_value's expressions, ascending j, so the same bits) into its own LDS slice before the copies' dots; without
 // it each copy's chunk re-reads all the residual copies and sub (4x the loads, the previous form).
 template <bool Expand, bool Mix, unsigned G, bool Collapse = false, bool Once = false>
-__device__ __forceinline__ void site_fast_partial(const HcSiteView& v, const float* __restrict__ sub, const float* __restrict__ residual,
+__device__ __forceinline__ void site_fast_partial(const HcSiteView& v, HcSub sub, const float* __restrict__ residual,
                                                   const HcMix* __restrict__ em, float* __restrict__ stream,
                                                   const std::uint16_t* __restrict__ fn, float* __restrict__ partial,
                                                   std::uint32_t* __restrict__ counters, unsigned mix_chunks, float* lds,
@@ -782,7 +797,7 @@ __device__ __forceinline__ void site_fast_partial(const HcSiteView& v, const flo
 // groups over the 8 waves.
 constexpr unsigned site_norm_part_max = 8, site_norm_groups_max = site_norm_part_max * chunk_k / site_waves;
 template <bool Expand>
-__device__ __forceinline__ void site_fast_norm(const HcSiteView& v, const float* __restrict__ sub, const float* __restrict__ residual,
+__device__ __forceinline__ void site_fast_norm(const HcSiteView& v, HcSub sub, const float* __restrict__ residual,
                                                const HcMix* __restrict__ em, const float* __restrict__ stream,
                                                const HcMix* __restrict__ cm, float* __restrict__ out, std::int8_t* __restrict__ codes,
                                                float* __restrict__ deltas, std::int32_t* __restrict__ sums_out, unsigned b,
@@ -850,10 +865,10 @@ __global__ __launch_bounds__(site_threads) void hc_site_fast_kernel(HcSiteView v
     __shared__ float sq[32];
     __shared__ unsigned last;
     if (blockIdx.x < partial_blocks)
-        site_fast_partial<Expand, Mix, G>(v, v.sub, v.residual, v.expand_mixes, v.stream, v.fn, v.partial, v.counters, mix_chunks, lds,
+        site_fast_partial<Expand, Mix, G>(v, hc_sub(v), v.residual, v.expand_mixes, v.stream, v.fn, v.partial, v.counters, mix_chunks, lds,
                                           last);
     else
-        site_fast_norm<Expand>(v, v.sub, v.residual, v.expand_mixes, v.stream, v.collapse_mixes, v.out, v.codes, v.deltas, v.sums,
+        site_fast_norm<Expand>(v, hc_sub(v), v.residual, v.expand_mixes, v.stream, v.collapse_mixes, v.out, v.codes, v.deltas, v.sums,
                                blockIdx.x - partial_blocks, norm_chunks, norm_part, lds, sq);
 }
 // Expansion + mixes + the collapse with the expansion's pre (HcSiteView::collapse_out): partial blocks only.
@@ -861,7 +876,7 @@ template <unsigned G, bool Once = false>
 __global__ __launch_bounds__(site_threads) void hc_site_collapse_kernel(HcSiteView v, unsigned mix_chunks) {
     __shared__ float lds[(Once ? hc_copies : 1U) * G * site_x_per_thread * site_threads];
     __shared__ unsigned last;
-    site_fast_partial<true, true, G, true, Once>(v, v.sub, v.residual, v.expand_mixes, v.stream, v.fn, v.partial, v.counters, mix_chunks,
+    site_fast_partial<true, true, G, true, Once>(v, hc_sub(v), v.residual, v.expand_mixes, v.stream, v.fn, v.partial, v.counters, mix_chunks,
                                                  lds, last);
 }
 using SiteFastKernel = void (*)(HcSiteView, unsigned, unsigned, unsigned, unsigned);
@@ -2236,13 +2251,21 @@ void enqueue_hc_collapse(const float* hc_stream, const HcMix* mixes, std::uint32
     hip_check(hipGetLastError(), "hc collapse launch");
 }
 
+// The canonical-sum terms of a sub (HcSub): both or neither, only with sub, none of the three inside [out, out + out_bytes).
+static bool sub_terms_clear(const float* sub, const float* low, const float* high, std::size_t sub_bytes, const void* out,
+                            std::size_t out_bytes) {
+    return (low == nullptr) == (high == nullptr) && (!low || sub) && !overlap(out, out_bytes, sub, sub_bytes) &&
+           !overlap(out, out_bytes, low, sub_bytes) && !overlap(out, out_bytes, high, sub_bytes);
+}
+
 void enqueue_hc_expand(const float* sub, const float* residual, const HcMix* mixes, std::uint32_t rows, std::uint32_t hidden,
-                       float* out, void* stream) {
+                       float* out, void* stream, const float* sub_low, const float* sub_high) {
     const std::size_t n = std::size_t{rows} * hc_copies * hidden * 4;
-    require(!overlap(out, n, residual, n) && !overlap(out, n, sub, n / hc_copies), "hc expand output must not alias its inputs");
+    require(!overlap(out, n, residual, n) && sub && sub_terms_clear(sub, sub_low, sub_high, n / hc_copies, out, n),
+            "hc expand output must not alias its inputs");
     const auto total = static_cast<unsigned long long>(rows) * hc_copies * hidden;
-    hipLaunchKernelGGL(hc_expand_kernel, dim3(blocks_for(total, 256)), dim3(256), 0, as_stream(stream), sub, residual, mixes,
-                       hidden, total, out);
+    hipLaunchKernelGGL(hc_expand_kernel, dim3(blocks_for(total, 256)), dim3(256), 0, as_stream(stream), HcSub{sub, sub_low, sub_high},
+                       residual, mixes, hidden, total, out);
     hip_check(hipGetLastError(), "hc expand launch");
 }
 
@@ -2254,7 +2277,10 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
     require(v.rows && H && H % chunk == 0 && v.stream && norm_chunks <= 32U && (v.fn || v.norm_weight || v.sub) &&
                 (v.tile == 0 || v.tile == 1 || v.tile == 2 || v.tile == 4 || v.tile == 8) && v.norm_part <= site_norm_part_max &&
                 (!v.sub || (v.residual && v.expand_mixes && !overlap(v.stream, stream_bytes, v.residual, stream_bytes) &&
-                            !overlap(v.stream, stream_bytes, v.sub, stream_bytes / hc_copies))) &&
+                            sub_terms_clear(v.sub, v.sub_low, v.sub_high, stream_bytes / hc_copies, v.stream, stream_bytes) &&
+                            sub_terms_clear(v.sub, v.sub_low, v.sub_high, stream_bytes / hc_copies, v.collapse_out,
+                                            stream_bytes / hc_copies))) &&
+                (v.sub || (!v.sub_low && !v.sub_high)) &&
                 (!v.fn || (v.base && v.scale && v.mixes_out && v.partial && v.counters && v.iters >= 1 &&
                            v.mixes_out != v.expand_mixes && v.mixes_out != v.collapse_mixes)) &&
                 (!v.norm_weight || ((v.out || v.codes) && (!v.out || v.out_stride >= H) &&
@@ -2278,7 +2304,7 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
     const bool one = v.launches == 1 ||
                      (v.launches == 0 && v.rows <= (fast ? hc_site_fast_one_launch_rows : hc_site_one_launch_rows));
     if (!one) {
-        if (v.sub) enqueue_hc_expand(v.sub, v.residual, v.expand_mixes, v.rows, H, v.stream, stream);
+        if (v.sub) enqueue_hc_expand(v.sub, v.residual, v.expand_mixes, v.rows, H, v.stream, stream, v.sub_low, v.sub_high);
         if (v.fn) {
             HcMixView m;
             m.stream = v.stream; m.fn = v.fn; m.base = v.base; m.scale = v.scale; m.rows = v.rows; m.hidden = H; m.iters = v.iters;
@@ -3650,6 +3676,8 @@ LaunchAccess launch_access(const HcSiteView& v) {
     const std::uint64_t H = v.hidden, n = H * hc_copies, R = v.rows;
     const std::uint64_t partial = hc_mix_partial_floats(v.rows, v.hidden) * 4, counters = hc_site_counter_count(v.rows) * 4;
     a.read(v.sub, R * H * 4);
+    a.read(v.sub_low, R * H * 4);
+    a.read(v.sub_high, R * H * 4);
     a.read(v.residual, R * n * 4);
     a.read(v.expand_mixes, R * sizeof(HcMix));
     a.read(v.stream, R * n * 4);
@@ -3732,10 +3760,12 @@ LaunchAccess launch_access(const F16RowsView& v) {
 }
 
 LaunchAccess launch_access_expand(const float* sub, const float* residual, const HcMix* mixes, std::uint32_t rows, std::uint32_t hidden,
-                                  const float* out) {
+                                  const float* out, const float* sub_low, const float* sub_high) {
     LaunchAccess a;
     const std::uint64_t n = std::uint64_t{hidden} * hc_copies;
     a.read(sub, std::uint64_t{rows} * hidden * 4);
+    a.read(sub_low, std::uint64_t{rows} * hidden * 4);
+    a.read(sub_high, std::uint64_t{rows} * hidden * 4);
     a.read(residual, rows * n * 4);
     a.read(mixes, std::uint64_t{rows} * sizeof(HcMix));
     a.write(out, rows * n * 4);

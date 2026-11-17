@@ -39,8 +39,9 @@ void enqueue_hc_mixes(const HcMixView& view, void* stream);
 void enqueue_hc_collapse(const float* hc_stream, const HcMix* mixes, std::uint32_t rows, std::uint32_t hidden, float* out,
                          void* stream);
 // out[r][k][i] = post[k] * sub[r][i] + sum_j comb[j][k] * residual[r][j][i] (out may not alias residual).
+// sub_low and sub_high (both or neither): sub[r][i] is (sub + sub_low) + sub_high, as HcSiteView::sub_low.
 void enqueue_hc_expand(const float* sub, const float* residual, const HcMix* mixes, std::uint32_t rows, std::uint32_t hidden,
-                       float* out, void* stream);
+                       float* out, void* stream, const float* sub_low = nullptr, const float* sub_high = nullptr);
 
 // One launch per hyper-connection site boundary (the decode chain between two sublayers), bitwise the
 // composition of the separate calls:
@@ -57,6 +58,10 @@ void enqueue_hc_expand(const float* sub, const float* residual, const HcMix* mix
 struct HcSiteView {
     std::uint32_t rows = 0, hidden = 0;
     const float* sub = nullptr;
+    // Not null (both, with sub): the sublayer input is the canonical rank sum (sub[i] + sub_low[i]) + sub_high[i], the
+    // expression and order of enqueue_canonical_sum, read where sub is read (no materialised sum); same bits. Row stride hidden.
+    const float* sub_low = nullptr;
+    const float* sub_high = nullptr;
     const float* residual = nullptr;
     const HcMix* expand_mixes = nullptr;
     float* stream = nullptr;
@@ -379,7 +384,8 @@ private:
 [[nodiscard]] LaunchAccess launch_access(const Q8A8View& view);
 [[nodiscard]] LaunchAccess launch_access(const F16RowsView& view);
 [[nodiscard]] LaunchAccess launch_access_expand(const float* sub, const float* residual, const HcMix* mixes, std::uint32_t rows,
-                                                std::uint32_t hidden, const float* out);
+                                                std::uint32_t hidden, const float* out, const float* sub_low = nullptr,
+                                                const float* sub_high = nullptr);
 [[nodiscard]] LaunchAccess launch_access_engram_inject(const float* hc_stream, const float* kv, const float* q_norm,
                                                        const float* k_norm, std::uint32_t rows, std::uint32_t hidden);
 [[nodiscard]] LaunchAccess launch_access_argmax(const float* logits, std::uint32_t rows, std::uint32_t count, std::uint32_t stride,

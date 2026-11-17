@@ -60,6 +60,13 @@ struct Device {
     }
 };
 
+// The stored canonical rank sum (hip_ds41_formats.hip canonical_sum_kernel's expression): the reference the in-place
+// terms (HcSiteView::sub_low / sub_high) must reproduce bit for bit.
+__global__ void stored_sum_kernel(const float* shared, const float* low, const float* high, std::size_t count, float* out) {
+    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * 256U + threadIdx.x;
+    if (i < count) out[i] = (shared[i] + low[i]) + high[i];
+}
+
 template <class T>
 bool same_bits(const std::vector<T>& a, const std::vector<T>& b) {
     return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0;
@@ -367,11 +374,23 @@ void synthetic(std::mt19937& rng) {
         Device<float> dres(res), dsb(sb), partial(hc_mix_partial_floats(sr, hidden)), st(std::size_t{sr} * n), x(std::size_t{sr} * hidden),
             sref(std::size_t{sr} * n), xref(std::size_t{sr} * hidden);
         Device<HcMix> dem(em), mixes(sr);
+        // sub as the MoE canonical rank sum: dsb = (sh + lo) + hi stored (STRIX_DS41_PREFILL_HC_FUSE=0), the terms read in place
+        // otherwise; specials in every term
+        auto lo = random_vector(rng, sb.size(), 1.0F), hi = random_vector(rng, sb.size(), 1.0F);
+        for (std::size_t i = 5; i < lo.size(); i += 1009) lo[i] = specials[(i / 1009) % 7];
+        for (std::size_t i = 7; i < hi.size(); i += 1013) hi[i] = specials[(i / 1013) % 7];
+        Device<float> dsh(sb), dlo(lo), dhi(hi), sterm(std::size_t{sr} * n), xterm(std::size_t{sr} * hidden);
+        stored_sum_kernel<<<static_cast<unsigned>((sb.size() + 255U) / 256U), 256>>>(dsh.p, dlo.p, dhi.p, sb.size(), dsb.p);
+        check(hipGetLastError(), "stored sum launch");
         // the separate kernels (STRIX_DS41_PREFILL_HC_FUSE=0): expansion, mixes, collapse
         enqueue_hc_expand(dsb.p, dres.p, dem.p, sr, hidden, sref.p, nullptr);
         enqueue_hc_collapse(sref.p, dem.p, sr, hidden, xref.p, nullptr);
         const auto stream_ref = sref.down(), x_ref = xref.down();
         const auto mix_ref = dev_mixes(sref, sr, hidden, dfn, dbase, dscale, 1e-6F, 1e-20F);
+        // the expansion alone (the last layer's ffn hc_post) with the terms in place
+        sterm.up(std::vector<float>(std::size_t{sr} * n, -1.0F));
+        enqueue_hc_expand(dsh.p, dres.p, dem.p, sr, hidden, sterm.p, nullptr, dlo.p, dhi.p);
+        expect(same_bits(sterm.down(), stream_ref), "hc expand with the canonical sum in place bitwise, rows=" + std::to_string(sr));
         Device<std::uint32_t> counters(std::vector<std::uint32_t>(hc_site_counter_count(sr), 0U));
         // Requested tiles 4/8 both clamp to 2 for one-read; these also cover dispatch clamping.
         for (int pass = 0; pass < 16; ++pass) {  // passes 0-7 one read of the copies, 8-15 the per-copy reads
@@ -398,6 +417,20 @@ void synthetic(std::mt19937& rng) {
                            (route.once ? "one-read" : "per-copy") + " requested tile " + std::to_string(v.tile) +
                            " effective tile " + std::to_string(route.tile) + " pass " +
                            std::to_string(pass));
+            // the same site reading the canonical sum's terms in place: the stored-sum results bit for bit
+            sterm.up(std::vector<float>(std::size_t{sr} * n, -1.0F));
+            xterm.up(std::vector<float>(std::size_t{sr} * hidden, -1.0F));
+            HcSiteView t = v;
+            t.sub = dsh.p; t.sub_low = dlo.p; t.sub_high = dhi.p; t.stream = sterm.p; t.collapse_out = xterm.p;
+            enqueue_hc_site(t, nullptr);
+            const auto taccess = launch_access(t);
+            bool terms = false;
+            for (std::uint32_t i = 0; i < taccess.count; ++i)
+                terms = terms || taccess.ranges[i].pointer == static_cast<const void*>(t.sub_high);
+            expect(terms, "site launch access covers the canonical sum terms");
+            expect(same_bits(sterm.down(), stream_ref) && same_mix(mixes.down(), mix_ref) && same_bits(xterm.down(), x_ref) &&
+                       counters.down() == std::vector<std::uint32_t>(hc_site_counter_count(sr), 0U),
+                   "site launch with the canonical sum in place bitwise, rows=" + std::to_string(sr) + " pass " + std::to_string(pass));
         }
     }
     {
