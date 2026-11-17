@@ -47,6 +47,7 @@ static int bench_main(int argc, char** argv) {
     }
     if (prefill_only && greedy_only) { std::fprintf(stderr, "--prefill-only and --greedy-only are exclusive\n"); return 1; }
     qp::Config c;
+    c.moe_real_rows = strix::lever::select(qp::moe_real_rows_lever, {}).on;  // STRIX_QRTX_MOE_REAL_ROWS (process arms)
     c.model_gguf = std::getenv("STRIX_QWEN_GGUF") ? std::getenv("STRIX_QWEN_GGUF") : "Qwen3.8-Flash-Next-UD-Q4_K_XL-merged.gguf";
     if (const char* s = std::getenv("STRIX_QWEN_MTP")) c.mtp_sidecar_gguf = s;
     if (const char* v = std::getenv("STRIX_QWEN_DRAFT_VOCAB")) c.draft_vocab = v;
@@ -173,6 +174,7 @@ static int bench_main(int argc, char** argv) {
                     produced / sec, static_cast<double>(produced) / windows, draft_ms / windows, verify_ms / windows);
     }
     std::printf("receipt %s\n", p.residency_receipt_json().c_str());  // tiered: hit rate, promotions, host time; full: nothing new
+    std::printf("moe_rows %s\n", p.moe_rows_receipt_json().c_str());
     }
     cudaProfilerStop();
     return 0;

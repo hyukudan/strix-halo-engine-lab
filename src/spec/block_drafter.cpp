@@ -17,7 +17,7 @@ BlockDrafter::BlockDrafter(BlockConfig config, ChainDrafter* chain)
     if (config_.max_block < 1 || config_.max_block > config_.arbiter.windows.back())
         throw std::invalid_argument("block drafter: max_block must be within the arbiter windows");
     if (config_.chain_max_k < 1 || config_.chain_max_k > ext_.size())
-        throw std::invalid_argument("block drafter: chain_max_k in 1..8");
+        throw std::invalid_argument("block drafter: chain_max_k in 1..16");
     if (!config_.clock_ms) config_.clock_ms = [] {
         using clock = std::chrono::steady_clock;
         return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();

@@ -353,4 +353,37 @@ struct OperandSource<RuntimeGgmlTag,NativeScalarTag,Arch,CudaNativeFp32> {
     }
 };
 
+// The same source with the storage type fixed at compile time. decode_row_group(Type, ...) is one case of the
+// runtime switch above (same expressions, same flags), so the 32 values are bitwise the runtime-type values. The
+// switch, the geometry lookup and the runtime-divisor group split fold away, and the decoded group no longer has to
+// be merged from every case through a stack array (the runtime form keeps it in local memory: STL per case, LDL
+// per use). The runtime `type` argument is kept for interface parity; the dispatcher binds it equal to Type.
+template<std::uint32_t Type> struct TypedGgmlTag {};
+template<std::uint32_t Type,class Arch>
+struct OperandSource<TypedGgmlTag<Type>,NativeScalarTag,Arch,CudaNativeFp32> {
+    static constexpr std::uint32_t storage_type=Type;
+    __host__ __device__ static std::uint64_t row_bytes(unsigned,unsigned width) {
+        const auto geometry=quant::geometry(Type);
+        return std::uint64_t(width)/geometry.block_elements*geometry.block_bytes;
+    }
+    __device__ static void decode(unsigned,const std::uint8_t* row,unsigned group,float* out) {
+        quant::decode_row_group(Type,row,group,out);
+    }
+};
+
+// Calls f.template operator()<Source>() with the typed source for the storage types the native expert route meets
+// in the shipped packs (GSQ-RCO gate/up IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS, down IQ4_NL / Q2_0) and with the
+// runtime-type source for every other decodable type. Values are identical either way; only the decode code differs.
+template<class Arch,class F> void with_native_source(std::uint32_t type,F&& f) {
+    switch(type) {
+    case quant::t_iq3_xxs: f.template operator()<OperandSource<TypedGgmlTag<quant::t_iq3_xxs>,NativeScalarTag,Arch,CudaNativeFp32>>(); return;
+    case quant::t_iq4_nl:  f.template operator()<OperandSource<TypedGgmlTag<quant::t_iq4_nl>,NativeScalarTag,Arch,CudaNativeFp32>>(); return;
+    case quant::t_iq3_s:   f.template operator()<OperandSource<TypedGgmlTag<quant::t_iq3_s>,NativeScalarTag,Arch,CudaNativeFp32>>(); return;
+    case quant::t_iq2_s:   f.template operator()<OperandSource<TypedGgmlTag<quant::t_iq2_s>,NativeScalarTag,Arch,CudaNativeFp32>>(); return;
+    case quant::t_iq4_xs:  f.template operator()<OperandSource<TypedGgmlTag<quant::t_iq4_xs>,NativeScalarTag,Arch,CudaNativeFp32>>(); return;
+    case quant::t_q2_0:    f.template operator()<OperandSource<TypedGgmlTag<quant::t_q2_0>,NativeScalarTag,Arch,CudaNativeFp32>>(); return;
+    default:               f.template operator()<OperandSource<RuntimeGgmlTag,NativeScalarTag,Arch,CudaNativeFp32>>(); return;
+    }
+}
+
 } // namespace strix::cuda::weight

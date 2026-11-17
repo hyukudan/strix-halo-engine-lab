@@ -115,6 +115,11 @@ void attention(const float* q_gate, std::uint32_t rows, std::uint64_t first_posi
 // Same selected[] / kv / q_gate inputs; no scores workspace. Numerically close to attention(), not bit-identical.
 void attention_mma(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
     const std::uint16_t* kv, float* attention_output, cudaStream_t stream);
+// Exact fused form: scores + softmax + values + gate of one (KV head, row) in one block, bit-identical to attention()'s
+// three kernels. No scores workspace. attention() and layer_core_multi take it for prefill-shaped rows when
+// STRIX_QRTX_QSA_FUSED=1.
+void attention_fused(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
+    const std::uint16_t* kv, float* attention_output, const amdmath::Tables& tables, cudaStream_t stream);
 
 // The three kernels of attention() separately (same arguments).
 void attention_scores(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,

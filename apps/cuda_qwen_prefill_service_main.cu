@@ -132,7 +132,8 @@ public:
         j.set("model", Json("qwen3.8-flash-next"));
         j.set("max_positions", Json(static_cast<std::uint64_t>(max_positions_)));
         j.set("served", Json(served_));
-        j.set("arithmetic_contract", Json(qo::cp::arithmetic_contract(qo::choice_of(config_))));
+        j.set("arithmetic_contract", Json(qo::config_arithmetic_contract(config_)));
+        j.set("expert_dispatch", qo::expert_dispatch_json(config_, p_.weight_pack_id(), p_.native_experts(), p_.moe_rows()));
         j.set("block_schedule", Json(config_.tail_large ? "tail-large" : "default"));
         j.set("final_block_rows", Json(static_cast<std::uint64_t>(config_.final_block_rows)));
         j.set("block_capacity", Json(static_cast<std::uint64_t>(*std::max_element(config_.block_schedule.begin(), config_.block_schedule.end()))));

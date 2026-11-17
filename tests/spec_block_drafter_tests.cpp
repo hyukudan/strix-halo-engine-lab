@@ -3,6 +3,7 @@
 // target's committed length equals prompt + emitted - 1 (the anchor is never committed). Costs are a virtual clock.
 #include "strix/spec/block_drafter.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -51,10 +52,13 @@ struct FakeTarget final : sp::VerifyTarget {
     std::vector<std::uint32_t> last;
     std::uint32_t max_rows_seen = 0;
     std::uint64_t verifies = 0;
+    // Backend contract: legal rows per verify (CUDA dense 32 / HIP MoE 16) and KV capacity in positions (prompt included).
+    std::uint32_t legal_rows = 32, capacity = ~0U;
     explicit FakeTarget(const World& world) : w(world) {}
     // row i sits at stream position prompt + committed_rows + i; its logits predict response[committed_rows + i]
     void verify(std::span<const std::uint32_t> tokens, std::vector<std::uint32_t>& greedy) override {
-        BD_CHECK(tokens.size() >= 1 && tokens.size() <= 32, "verify rows %zu", tokens.size());
+        BD_CHECK(tokens.size() >= 1 && tokens.size() <= legal_rows, "verify rows %zu > legal %u", tokens.size(), legal_rows);
+        BD_CHECK(w.prompt.size() + committed_rows + tokens.size() <= capacity, "verify rows %zu past capacity %u", tokens.size(), capacity);
         max_rows_seen = std::max<std::uint32_t>(max_rows_seen, std::uint32_t(tokens.size()));
         ++verifies;
         greedy.clear();
@@ -97,15 +101,21 @@ struct Run {
     std::uint32_t max_rows = 0;
 };
 
-Run run(const World& w, std::uint32_t n_tokens, double accuracy, bool copy, bool chain, bool hybrid, bool seed_costs) {
+// legal_rows / capacity: the caller binds StepParams::max_rows = min(backend rows, context room), as the engine apps do.
+Run run(const World& w, std::uint32_t n_tokens, double accuracy, bool copy, bool chain, bool hybrid, bool seed_costs,
+        std::uint32_t legal_rows = 32, std::uint32_t capacity = ~0U,
+        std::uint32_t frontier_every = sp::ArbiterConfig{}.frontier_every) {
     sp::BlockConfig cfg;
     cfg.copy = copy; cfg.chain = chain; cfg.hybrid = hybrid;
+    cfg.arbiter.frontier_every = frontier_every;
     cfg.clock_ms = [] { return g_clock; };
     FakeChain fc(w, accuracy);
     sp::BlockDrafter drafter(cfg, chain || hybrid ? &fc : nullptr);
     if (seed_costs)
         for (const std::uint32_t r : {1U, 2U, 4U, 8U, 16U, 32U}) drafter.seed_verify_ms(r, 10.0 + 0.15 * double(r));
     FakeTarget target(w);
+    target.legal_rows = legal_rows;
+    target.capacity = capacity;
     // prefill: the first token (greedy after the prompt) is the anchor; the stream = prompt + anchor
     drafter.commit(w.prompt);
     Run r;
@@ -119,8 +129,15 @@ Run run(const World& w, std::uint32_t n_tokens, double accuracy, bool copy, bool
         sp::StepParams p;
         p.remaining = n_tokens - std::uint32_t(r.out.size());
         p.context = w.prompt.size() + r.out.size();
+        const std::uint64_t used = w.prompt.size() + target.committed_rows;
+        p.max_rows = std::uint32_t(std::min<std::uint64_t>(legal_rows, capacity > used ? capacity - used : 0));
         const auto before = r.out.size();
+        const auto verifies = target.verifies;
         const auto rec = spec.step(r.out, p);
+        if (p.max_rows == 0) {  // no context room: nothing is verified or committed, the caller stops
+            BD_CHECK(rec.emitted == 0 && target.verifies == verifies && r.out.size() == before, "step past the context room");
+            break;
+        }
         BD_CHECK(rec.emitted >= 1 && rec.emitted <= p.remaining, "emitted %u remaining %u", rec.emitted, p.remaining);
         BD_CHECK(r.out.size() == before + rec.emitted, "out size");
         ++r.steps;
@@ -177,6 +194,26 @@ int main() {
         }
         g_chain_step = 1.5;
     }
+    {  // backend legal rows below max_block (HIP MoE windows: 16 rows, --max-block 32) and a context room that runs out:
+       // every verify stays legal (FakeTarget checks), partial accepts commit a prefix, output stays serial-exact
+        g_chain_step = 0.02;  // cheap chain: hybrid extensions are offered and must respect the 16-row cap
+        for (const std::string cls : {"edit", "loop", "prose"}) {
+            const auto w = make_world(cls, 40, n, 911);
+            for (int mode = 1; mode < 5; ++mode) {
+                const bool copy = mode == 1 || mode >= 3, chain = mode == 2 || mode >= 3, hybrid = mode == 4;
+                g_clock = 0.0;
+                const auto r16 = run(w, n, 0.9, copy, chain, hybrid, true, 16U);
+                BD_CHECK(r16.out.size() == n && r16.max_rows <= 16, "%s mode %d: 16-row backend rows %u", cls.c_str(), mode, r16.max_rows);
+                for (std::uint32_t i = 0; i < n; ++i) BD_CHECK(r16.out[i] == w.response[i], "16-row %s mode %d: token %u differs", cls.c_str(), mode, i);
+                const std::uint32_t room = 301;  // positions after the prompt: the run stops at 301 emitted (anchor not committed)
+                g_clock = 0.0;
+                const auto rc = run(w, n, 0.9, copy, chain, hybrid, true, 16U, std::uint32_t(w.prompt.size()) + room - 1U);
+                BD_CHECK(rc.out.size() == room, "%s mode %d: context room run emitted %zu, want %u", cls.c_str(), mode, rc.out.size(), room);
+                for (std::uint32_t i = 0; i < room; ++i) BD_CHECK(rc.out[i] == w.response[i], "room %s mode %d: token %u differs", cls.c_str(), mode, i);
+            }
+        }
+        g_chain_step = 1.5;
+    }
     BD_CHECK(copies > 100 && chains > 100, "sources never used: copy %llu chain %llu", (unsigned long long)copies, (unsigned long long)chains);
     BD_CHECK(hybrids > 0, "hybrid never chosen");
     // The mixed drafter must pay on structure (>= 3x fewer ms per token than serial on the edit class)...
@@ -195,6 +232,20 @@ int main() {
         g_clock = 0.0;
         const auto r = run(w, n, 0.66, true, true, true, true);
         BD_CHECK(double(r.serial_steps) < 0.15 * double(r.steps), "66 %% chain: %llu of %llu passes serial", (unsigned long long)r.serial_steps, (unsigned long long)r.steps);
+    }
+    {  // frontier probe on/off (ArbiterConfig::frontier_every): emitted ids equal the serial truth in both forms, every
+       // prefix commit stays legal; the probe changes only how deep the chain drafts (verify cost and clock, never tokens)
+        const auto w = make_world("prose", 700, n, 11);
+        for (const std::uint32_t every : {0U, 8U, 1U}) {
+            g_clock = 0.0;
+            g_chain_step = 0.65;  // CUDA dense ratio: 0.85 ms chain step per ~13.2 ms verify, on this 10 ms fake
+            const auto r = run(w, n, 0.76, false, true, false, true, 32, ~0U, every);
+            g_chain_step = 1.5;
+            BD_CHECK(r.out.size() == n, "frontier %u: %zu tokens", every, r.out.size());
+            for (std::uint32_t i = 0; i < n; ++i)
+                BD_CHECK(r.out[i] == w.response[i], "frontier %u: token %u differs from serial", every, i);
+            std::printf("frontier %u: %llu steps for %u tokens, %.1f virtual ms\n", every, (unsigned long long)r.steps, n, g_clock);
+        }
     }
     std::printf("block drafter tests ok: %d cases, copy blocks %llu, chain blocks %llu, hybrid blocks %llu; edit %.2f vs serial %.2f ms/token\n",
                 cases, (unsigned long long)copies, (unsigned long long)chains, (unsigned long long)hybrids, tok_ms_all_loop, tok_ms_serial);
