@@ -117,13 +117,49 @@ Options with_environment(Options in) {
     return in;
 }
 
+BudgetCap budget_cap(const Options& opt, const CardBytes& card) {
+    BudgetCap c;
+    c.bytes = opt.vram_budget ? opt.vram_budget : card.total;
+    c.available = std::min(card.free, c.bytes);
+    if (opt.vram_budget) c.source = "residency";
+    if (opt.device_cap) {
+        const auto used = card.total > card.free ? card.total - card.free : 0;
+        const auto available = opt.device_cap > used ? opt.device_cap - used : 0;
+        if (available < c.available || (!opt.vram_budget && available == c.available)) {
+            c.bytes = opt.device_cap;
+            c.available = std::min(card.free, available);
+            c.source = "device_profile";
+        }
+    }
+    return c;
+}
+
+CardBytes live_budget_view(const CardBytes& physical, std::uint64_t device_cap,
+                           std::uint64_t engine_allowance, std::uint64_t engine_used) {
+    CardBytes view = physical;
+    if (device_cap && device_cap < physical.total) {
+        const auto used = physical.total > physical.free ? physical.total - physical.free : 0;
+        view.free = used < device_cap ? device_cap - used : 0;
+        view.total = device_cap;
+    }
+    if (engine_allowance) {
+        const auto remaining = engine_allowance > engine_used ? engine_allowance - engine_used : 0;
+        view.free = std::min(view.free, remaining);
+        view.total = std::min(view.total, engine_allowance);
+    }
+    return view;
+}
+
 Decision resolve(const Options& opt, const ModelBytes& m, const CardBytes& card, const SessionBytes& s,
                  const HostBytes& host) {
     Decision d;
     d.positions_requested = s.positions;
     d.positions = s.positions;
-    const std::uint64_t cap = opt.vram_budget ? opt.vram_budget : card.total;
-    d.budget = std::min(card.free, cap);
+    const BudgetCap applied = budget_cap(opt, card);
+    const std::uint64_t cap = applied.bytes;
+    d.cap = cap;
+    d.cap_source = applied.source;
+    d.budget = applied.available;
     if (m.expert_bytes.size() != m.layers || m.layers == 0 || m.experts == 0) {
         d.error = "residency: model bytes inconsistent (expert_bytes size != layers, or empty)";
         d.reason = d.error;
@@ -212,6 +248,8 @@ std::string decision_json(const Decision& d) {
     o += json_str(mode_name(d.mode));
     o += ",\"reason\":" + json_str(d.reason);
     o += ",\"vram_budget_bytes\":" + std::to_string(d.budget);
+    o += ",\"vram_cap_bytes\":" + std::to_string(d.cap);
+    o += ",\"vram_cap_source\":" + json_str(d.cap_source);
     o += ",\"expert_pool_bytes\":" + std::to_string(d.expert_pool);
     o += ",\"slots_per_layer\":" + std::to_string(d.slots_per_layer);
     o += ",\"positions\":" + std::to_string(d.positions);

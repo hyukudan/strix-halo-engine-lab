@@ -259,6 +259,30 @@ int test_gdn() {
     run(6, o6, s6); run(1, o1, s1); run(3, o3, s3);
     CHECK(bits_equal(o6, o1) && bits_equal(s6, s1), "gdn rows=6 vs rows=1 not bitwise");
     CHECK(bits_equal(o6, o3) && bits_equal(s6, s3), "gdn rows=6 vs rows=3 not bitwise");
+    {  // prefill entry (one call over all rows, delta lands on the shadow side, then flip): bitwise the window path
+        std::vector<float> two(2 * s0.size(), 0.0f);
+        std::copy(s0.begin(), s0.end(), two.begin());
+        auto *draw = dev(qkv), *dqc = devz<float>(R * C), *dout = devz<float>(R * hv * 128), *dst = dev(two), *dcs = dev(cs0);
+        auto* dpar = devz<std::uint32_t>(1);
+        cc::GdnWindow w{draw, dqc, dar, dbr};
+        CK(cc::gdn_prefill_layer(d, L, {dcs, dst}, w, dz, dout, R, 1e-6f, dpar, nullptr));
+        CK(cc::gdn_prefill_flip(dpar, nullptr));
+        std::uint32_t par = 0;
+        CK(cudaMemcpy(&par, dpar, 4, cudaMemcpyDeviceToHost));
+        const auto po = get(dout, R * hv * 128);
+        const auto all = get(dst, two.size());
+        const std::vector<float> ps(all.begin() + par * s0.size(), all.begin() + (par + 1) * s0.size());
+        cudaFree(draw); cudaFree(dqc); cudaFree(dout); cudaFree(dst); cudaFree(dcs); cudaFree(dpar);
+        CHECK(bits_equal(po, o6) && bits_equal(ps, s6), "gdn prefill entry vs windows not bitwise");
+    }
+    {  // build-to-build identity: compare this line between two binaries (same fixture seed) for schedule-only kernel changes
+        auto fnv = [](const std::vector<float>& v) {
+            std::uint64_t h = 1469598103934665603ull;
+            for (float f : v) { std::uint32_t u; std::memcpy(&u, &f, 4); for (int i = 0; i < 4; ++i) { h ^= (u >> (8 * i)) & 0xffu; h *= 1099511628211ull; } }
+            return static_cast<unsigned long long>(h);
+        };
+        std::printf("gdn digest out %016llx state %016llx\n", fnv(o6), fnv(s6));
+    }
     // float64 reference
     std::vector<double> cs(cs0.begin(), cs0.end()), S(s0.begin(), s0.end()), ref(R * hv * 128);
     auto silu = [](double v) { return v / (1.0 + std::exp(-v)); };

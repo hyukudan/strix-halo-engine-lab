@@ -68,6 +68,41 @@ int main() {
         require(!r.ran && r.populated == 0, "zero request is a no-op");
         require(strix::core::describe(r).find("skipped") != std::string::npos, "describe names the skip");
     }
+#if defined(__linux__)
+    // A worker can die before reporting while its sibling holds memory. The
+    // sibling must close done before waiting, allowing EOF and release/reap.
+    for (const int failed_worker : {-1, 0, 1, 2}) {
+        int done[2], hold[2];
+        require(::pipe(done) == 0 && ::pipe(hold) == 0, "failure fixture pipes");
+        pid_t kids[2];
+        ::alarm(5);  // bound a regression to the original parent/child deadlock
+        for (int i = 0; i < 2; ++i) {
+            kids[i] = ::fork();
+            if (kids[i] == 0) {
+                (void)::close(done[0]);
+                (void)::close(hold[1]);
+                if (i == failed_worker) ::_exit(1);
+                strix::core::free_prepare_detail::report_and_hold(done[1], hold[0], failed_worker == 2 && i == 0 ? 0 : 1);
+                ::_exit(0);
+            }
+            require(kids[i] > 0, "failure fixture fork");
+        }
+        (void)::close(done[1]);
+        (void)::close(hold[0]);
+        const bool complete = strix::core::free_prepare_detail::collect_reports(done[0], 2);
+        require(complete == (failed_worker == -1), "missing worker report fails closed");
+        (void)::close(hold[1]);
+        (void)::close(done[0]);
+        for (const pid_t kid : kids) {
+            if (kid <= 0) continue;
+            int status = 0;
+            pid_t reaped;
+            do { reaped = ::waitpid(kid, &status, 0); } while (reaped < 0 && errno == EINTR);
+            require(reaped == kid && WIFEXITED(status), "all fixture workers reaped");
+        }
+        ::alarm(0);
+    }
+#endif
     if (failures != 0) { std::cerr << failures << " failure(s)\n"; return 1; }
     std::cout << "host_free_memory: all cases pass\n";
     return 0;

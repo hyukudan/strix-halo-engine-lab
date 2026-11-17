@@ -10,6 +10,7 @@
 #include "attn_core/index_score_band.hpp"
 #include "attn_core/index_score_wmma.hpp"
 #include "attn_core/sparse_flash_keysplit.hpp"
+#include "attn_core/sparse_flash_rowgroup.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -2329,7 +2330,8 @@ std::size_t prefill_window_bytes(std::uint32_t max_blocks) {
 }
 
 namespace {
-template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned windows, hipStream_t stream) {
+template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned windows, hipStream_t stream,
+                                              std::array<std::uint64_t, 7>* flash_launches) {
     if (windows == 0) return;
     const DecodeView& v = p.window;
     if (p.msa_rework != 0) {
@@ -2343,6 +2345,30 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
         }
         const auto chunks = prefill_chunk_prefix(p.pos0 + scheduled.rows) -
                             prefill_chunk_prefix(p.pos0 + p.first_window * kMaxRows);
+        if (p.msa_rework == 13) {
+            if (v.q16 != nullptr)
+                throw std::logic_error("minimax prefill row groups read FP32 q; the q image must not be written for mode 3");
+            // FAST: one-term flash on the shared core's row-group form: 4 neighbouring rows of one KV group per block
+            // share each K/V tile of their merged block lists (same selection and block lists as mode 11; one softmax
+            // stream per row, so not mode 11's bytes).
+            // p.rg_rows: 4 or 8 rows per work-group (same bits); auto = 8 on dense windows (every row shares every
+            // tile: bench -7 %), 4 on sparse rows (union grows with the group: bench drift 2+ is +1..+3 % at 8).
+            namespace ks = strix::attn_core::sparse;
+            const unsigned rows = scheduled.rows - p.first_window * kMaxRows;
+            const MsaFlashArgs args{scheduled, DENSE ? 1U : 0U};
+            const unsigned rg = p.rg_rows != 0U ? p.rg_rows : DENSE ? 8U : 4U;
+            const auto go = [&](auto rows_c) {
+                constexpr unsigned R = decltype(rows_c)::value;
+                using RG = ks::RowGroup<kGroup, kHeadDim, MsaFlashPolicy::kMaxSegs, R>;
+                hipLaunchKernelGGL((ks::flash_rowgroup_kernel<MsaFlashPolicy, ks::kRgLazyRescale, R>),
+                                   dim3((rows + RG::kRows - 1) / RG::kRows * v.kv_heads), dim3(RG::kThreads), 0, stream, args);
+            };
+            if (rg == 8U) go(std::integral_constant<unsigned, 8>{});
+            else go(std::integral_constant<unsigned, 4>{});
+            hip_check(hipGetLastError(), "minimax prefill flash attend (row groups)");
+            if (flash_launches != nullptr) ++(*flash_launches)[rg == 8U ? 6U : 5U];
+            return;
+        }
         if (p.msa_rework == 11 || p.msa_rework == 12) {
             // FAST: BF16 WMMA key-split flash on the shared core, one block per (row, group); same grid and block
             // lists as mode 10. 11 = one-term operands, 12 = two-term (hi + lo) queries and probabilities. Not
@@ -2352,11 +2378,26 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
             const MsaFlashArgs args{scheduled, DENSE ? 1U : 0U};
             // the q projection finish's image when it wrote one (query_op; same bits), else the FP32 q
             const bool q16 = v.q16 != nullptr && (p.msa_rework != 12 || v.q16_lo != nullptr);
-            if (p.msa_rework == 12 && q16) hipLaunchKernelGGL((ks::flash_rows_keysplit_kernel<MsaFlashQ16Policy, true>), grid, block, 0, stream, args);
-            else if (p.msa_rework == 12) hipLaunchKernelGGL((ks::flash_rows_keysplit_kernel<MsaFlashPolicy, true>), grid, block, 0, stream, args);
-            else if (q16) hipLaunchKernelGGL((ks::flash_rows_keysplit_kernel<MsaFlashQ16Policy, false>), grid, block, 0, stream, args);
-            else hipLaunchKernelGGL((ks::flash_rows_keysplit_kernel<MsaFlashPolicy, false>), grid, block, 0, stream, args);
+            // p.flash_keys: load schedule of the core (same bits): 0 incumbent, 1 keys first, 2 key halves.
+            const auto go = [&](auto split, auto opt) {
+                if (q16) {
+                hipLaunchKernelGGL((ks::flash_rows_keysplit_kernel<MsaFlashQ16Policy, decltype(split)::value, decltype(opt)::value>), grid,
+                                   block, 0, stream, args);
+                } else {
+                hipLaunchKernelGGL((ks::flash_rows_keysplit_kernel<MsaFlashPolicy, decltype(split)::value, decltype(opt)::value>), grid,
+                                   block, 0, stream, args);
+                }
+            };
+            using U0 = std::integral_constant<unsigned, 0U>;
+            using U1 = std::integral_constant<unsigned, ks::kKsKeysFirst>;
+            using U2 = std::integral_constant<unsigned, ks::kKsKeysHalves>;
+            const bool two = p.msa_rework == 12;
+            if (p.flash_keys == 1U) two ? go(std::true_type{}, U1{}) : go(std::false_type{}, U1{});
+            else if (p.flash_keys == 2U) two ? go(std::true_type{}, U2{}) : go(std::false_type{}, U2{});
+            else two ? go(std::true_type{}, U0{}) : go(std::false_type{}, U0{});
             hip_check(hipGetLastError(), "minimax prefill flash attend");
+            if (flash_launches != nullptr) ++(*flash_launches)[p.flash_keys <= 2U ? p.flash_keys : 0U];
+            if (flash_launches != nullptr) ++(*flash_launches)[p.msa_rework == 11 ? 3U : 4U];
             return;
         }
         if (p.msa_rework == 10) {
@@ -2734,7 +2775,7 @@ namespace {
 // The batched prefill view contract (shared by the full stage and the cache-only stage).
 void check_prefill_view(const PrefillView& p) {
     const DecodeView& v = p.window;
-    if (p.msa_rework > 12 || (p.index_rows != 16 && p.index_rows != 32 && p.index_rows != 64) ||
+    if (p.msa_rework > 13 || (p.index_rows != 16 && p.index_rows != 32 && p.index_rows != 64) ||
         p.rows == 0 || p.scratch_windows == 0 || p.first_window != 0 || v.seqs != 1 ||
         v.q_heads != 32 || v.kv_heads != 2 || v.idx_heads != 2 || v.shard_count != 1 || v.shard_rank != 0 ||
         v.max_blocks == 0 || v.max_blocks > kMaxBlocks || (attend_version(v) != 3 && attend_version(v) != 4) ||
@@ -2764,7 +2805,8 @@ void enqueue_prefill_cache_only(const PrefillView& p, hipStream_t stream, Prefil
     launch_prefill_prep(p, stream, marker, user);
 }
 
-void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarker marker, void* user) {
+void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarker marker, void* user,
+                     std::array<std::uint64_t, 7>* flash_launches) {
     check_prefill_view(p);
     const DecodeView& v = p.window;
     launch_prefill_prep(p, stream, marker, user);
@@ -2773,7 +2815,8 @@ void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarke
     for (unsigned first = 0; first < windows;) {
         const unsigned nw = windows - first < batch_cap ? windows - first : batch_cap;
         const unsigned r0 = first * kMaxRows;
-        PrefillView batch{prefill_offset(v, r0), p.rows - r0, p.pos0 + r0, p.scratch_windows, 0, p.index_tile, p.index_rows, p.msa_rework};
+        PrefillView batch{prefill_offset(v, r0), p.rows - r0, p.pos0 + r0, p.scratch_windows, 0, p.index_tile, p.index_rows, p.msa_rework,
+                          p.flash_keys, p.rg_rows};
         if (batch.rows > nw * kMaxRows) batch.rows = nw * kMaxRows;
         const unsigned dense = route::dense_windows(batch.pos0, batch.rows, nw, kMaxRows, kTopK * kBlock);
         const unsigned sparse = nw - dense;
@@ -2783,13 +2826,13 @@ void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarke
             enqueue_prefill_index(batch, stream);
             if (marker != nullptr) marker(user, "index-scoring", false);
             if (marker != nullptr) marker(user, "attend", true);
-            launch_prefill_attend<false>(batch, sparse, stream);
+            launch_prefill_attend<false>(batch, sparse, stream, flash_launches);
             if (marker != nullptr) marker(user, "attend", false);
             if (g_select_dump != nullptr) dump_prefill_select(batch, stream);
         }
         batch.first_window = 0;
         if (dense != 0 && marker != nullptr) marker(user, "attend", true);
-        launch_prefill_attend<true>(batch, dense, stream);
+        launch_prefill_attend<true>(batch, dense, stream, flash_launches);
         if (dense != 0 && marker != nullptr) marker(user, "attend", false);
         first += nw;
     }

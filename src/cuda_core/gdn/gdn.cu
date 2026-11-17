@@ -168,6 +168,10 @@ __device__ __forceinline__ void delta_body(const DeltaArgs& a, const GdnDims& d,
             kv = __fadd_rn(kv, __fmul_rn(S[k], ks[k]));
         }
         const float dl = __fmul_rn(__fsub_rn(vcol, kv), beta);
+        // Register budget: S[] already holds 128 registers. Without this fence the compiler keeps the 128 ks[] values loaded by the
+        // kv loop live into the update loop (256 values > 255 registers) and spills inside this serial per-row loop. The fence makes
+        // the update loop re-read ks[] from shared memory (same values, no store in between): loads only, arithmetic order unchanged.
+        asm volatile("" ::: "memory");
         float acc = 0.0f;
         if constexpr (OUT) {
 #pragma unroll

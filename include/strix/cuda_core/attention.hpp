@@ -62,6 +62,12 @@ struct FlashPlan {
     std::uint32_t tiles = 0, full = 0, tail_tiles = 0, tail_warps = 8, jobs = 0;
 };
 FlashPlan flash_plan(std::uint32_t rows, std::uint32_t heads, std::uint32_t sms, FlashTail tail, std::uint32_t tail_warps = 0);
+// Launch geometry of attention_prefill_flash for the wave planner (strix/wave_fit.hpp): q rows per CTA, CTAs per q-row tile
+// (one per q head), SMs, resident CTAs per SM from the occupancy of the real kernel. Keep it in step with the kernel.
+struct FlashGrid {
+    std::uint32_t tile_rows = 0, ctas_per_tile = 0, sms = 0, ctas_per_sm = 0;
+};
+cudaError_t attention_prefill_flash_grid(const AttentionDims& d, FlashPipe pipe, int device, FlashGrid* out);
 // FAST8 prefill attention (bit-changing; under the FAST8 prefill policy and its quality gate only). An e4m3 SHADOW of the BF16 KV cache
 // (the BF16 cache stays the source of truth for decode and for every other path): per kv head K8 [P8][head_dim] e4m3 + ks [P8] FP32
 // (k = K8 * ks, ks = amax / 448 per position), V8T [head_dim][P8] e4m3 transposed + vs [P8] (v = V8T * vs); P8 = max_positions rounded up

@@ -79,11 +79,7 @@ namespace {
 // memory_gib; 0 = no cap). Free memory is what the budget leaves after everything already on the card, so a smaller
 // profile sees the slot count and the refusals a card of that size would.
 std::uint64_t g_budget_bytes = 0;
-std::pair<std::uint64_t, std::uint64_t> budget_view(std::uint64_t free, std::uint64_t total) {
-    if (!g_budget_bytes || g_budget_bytes >= total) return {free, total};
-    const std::uint64_t used = total - free;
-    return {used < g_budget_bytes ? g_budget_bytes - used : 0, g_budget_bytes};
-}
+
 
 std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop.store(true); }
@@ -473,14 +469,10 @@ private:
     std::pair<std::uint64_t, std::uint64_t> vram() const {
         std::size_t free = 0, total = 0;
         if (cudaMemGetInfo(&free, &total) != cudaSuccess) { (void)cudaGetLastError(); return {0, 0}; }
-        if (const std::uint64_t budget = e_.card_budget_bytes()) {
-            const unsigned live = live_slots();
-            const std::uint64_t used = e_.engine_device_bytes() + (live > 1U ? live - 1U : 0U) * e_.session_bytes();
-            free = std::min<std::uint64_t>(free, budget > used ? budget - used : 0U);
-            total = std::min<std::uint64_t>(total, budget);
-        }
-        // and the bound device profile (strix/device/budget.hpp): the smaller of the two caps
-        return budget_view(free, total);
+        const unsigned live = live_slots();
+        const std::uint64_t used = e_.engine_device_bytes() + (live > 1U ? live - 1U : 0U) * e_.session_bytes();
+        const auto view = strix::residency::live_budget_view({total, free}, g_budget_bytes, e_.card_budget_bytes(), used);
+        return {view.free, view.total};
     }
     unsigned live_slots() const {
         unsigned n = 0;
@@ -880,8 +872,10 @@ int main(int argc, char** argv) {
         device_request.select = device_cli.select;
         const auto& bound = strix::device::bind_cuda(std::move(device_request), device_cli.devices_path);
         // ONE budget resolver (strix/device/budget.hpp), as every route: the bound profile caps the admission view
-        // (budget_view). This route has a host / file expert tier, so the residency plan, not a weights-only
-        // check, decides whether the model fits.
+        // (budget_view) and, through qp::plan_residency (the same route_budget), the residency plan, so the engine,
+        // --print-effective-config (vram_cap_bytes / vram_cap_source) and admission plan to one cap; a tighter
+        // --vram-budget-gib still wins. This route has a host / file expert tier, so the residency plan, not a
+        // weights-only check, decides whether the model fits.
         const auto budget = strix::device::route_budget(bound, {});
         g_budget_bytes = budget.device_bytes;
         if (budget.device_capped()) std::cerr << "strix-cuda-qwen-serve: memory budget " << budget.json() << std::endl;

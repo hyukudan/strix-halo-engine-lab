@@ -27,6 +27,7 @@
 #include "prefill_timeline.hpp"
 #include "minimax/xfer/minimax_xfer.hpp"
 #include "minimax/pfx/pf_exchange.hpp"
+#include "xport/exchange_format.hpp"
 #include "minimax/pfx/pf_route.hpp"
 #include "minimax/moe/mmx_moe.hpp"
 #include "minimax/moe/mmx_prefill.hpp"
@@ -708,6 +709,11 @@ struct Engine::Impl {
     // STRIX_MM_PF_HEADLESS (default ON, exact): the last layer of a headless chunk runs cache-only (strix/prefill_headless.hpp):
     // q/k/v + index projections and the cache prep unchanged, no attention / o_proj / exchanges / FFN for that chunk.
     bool pf_headless = true;
+    // STRIX_MM_PF_FLASH_KEYS (default 2 = key halves, schedule only, same bits): FAST flash key-fragment load schedule
+    // (PrefillView::flash_keys; 0 = incumbent, 1 = keys first). Bench: scripts/bench/mmattn.
+    unsigned pf_flash_keys = 2;
+    unsigned pf_rg_rows = 0;  // STRIX_MM_PF_MSA_RG_ROWS=0 (auto) | 4 | 8: row-group flash rows per work-group (same bits)
+    std::array<std::uint64_t, 7> pf_flash_launches{};
     // STRIX_MM_PF_DENSE_MLP (default ON, exact): the dense MLP of layers 0..kFirstMoe-1 (gate + up, then down) on the v4
     // prefill core for 4096-row pieces (dense_mlp), the q/k/v core contract (== strix_gemm bitwise); 0 keeps strix_gemm.
     bool pf_dense_mlp = true;
@@ -749,6 +755,14 @@ struct Engine::Impl {
     core::f16_dense_tall::DeviceStorage<std::uint32_t> router_flags;
     bool pf_tx_uncached = false;              // STRIX_MM_PF_TX_UNCACHED: prefill producers write uncached TX
     bool pf_inplace = false;                   // STRIX_MM_PFX_INPLACE: o_proj / FFN outputs written straight into the TX slot
+    // STRIX_TP2_EXCHANGE_FMT (shared trait xport/exchange_format.hpp, one resolver mm_defaults prefill_policy): f16 =
+    // FAST only. The producers then write FP32 into device buffers (part / grp_part), the module's pack kernel rounds
+    // them to binary16 into the TX slot, and post_exchange widens both ranks' halves (same bits on both ranks).
+    strix::xport::ExchangeFormat pf_fmt = strix::xport::ExchangeFormat::f32;
+    bool pf_fmt_f16_ready = false;   // resolved f16 at load: the per-member device partials exist (--ab x16fmt needs it)
+    std::uint64_t pf_f16_overflow0 = 0;  // module overflow count at the prefill start
+    strix::minimax::pfx::Stats pf_stats0{};  // module counters at the prefill start (exchange receipt)
+    bool pf_half() const { return pf_active && pf_fmt == strix::xport::ExchangeFormat::f16; }
     bool pf_async_start = true, pf_late_src_fence = true;
     std::size_t pf_async_min_rows = 2048;
     // Persistent per-member/per-activation-bank fences. Children currently fit
@@ -930,6 +944,17 @@ struct Engine::Impl {
         pf_attend4 = env_flag("STRIX_MM_PF_ATTEND4", true);
         pf_msa_batch = env_flag("STRIX_MM_PF_MSA_BATCH", true);
         pf_headless = env_flag("STRIX_MM_PF_HEADLESS", true);
+        if (const char* value = strix::envcfg::text("STRIX_MM_PF_FLASH_KEYS")) {
+            const std::string mode(value);
+            if (mode != "0" && mode != "1" && mode != "2") throw std::invalid_argument("STRIX_MM_PF_FLASH_KEYS must be 0, 1 or 2");
+            pf_flash_keys = static_cast<unsigned>(mode[0] - '0');
+        }
+        if (const char* value = strix::envcfg::text("STRIX_MM_PF_MSA_RG_ROWS")) {
+            const std::string mode(value);
+            if (mode != "0" && mode != "auto" && mode != "4" && mode != "8")
+                throw std::invalid_argument("STRIX_MM_PF_MSA_RG_ROWS must be auto, 0, 4 or 8");
+            pf_rg_rows = mode == "4" ? 4U : mode == "8" ? 8U : 0U;
+        }
         pf_dense_mlp = env_flag("STRIX_MM_PF_DENSE_MLP", true);
         if (const char* value = std::getenv("STRIX_MM_PF_IDX_CONC")) {
             const std::string mode(value);
@@ -1012,10 +1037,15 @@ struct Engine::Impl {
             pf_idx_wmma_asked = policy.idx_wmma_asked;
             pf_idx_wmma_layers = strix::core::parse_layer_set(policy.idx_wmma_layers.c_str(), 0, kLayers, "STRIX_MM_PF_IDX_WMMA_LAYERS");
             if (!policy.note.empty()) std::fprintf(stderr, "minimax fast prefill: %s\n", policy.note.c_str());
+            pf_fmt = policy.exchange_fmt;
+            if (pf_fmt != strix::xport::ExchangeFormat::f32)
+                std::fprintf(stderr, "prefill identity tp2-xchg-%s FAST (TP2 prefill exchange partials in binary16: %s)\n",
+                             strix::xport::exchange_format_name(pf_fmt), policy.exchange_fmt_reason.c_str());
         }
         if (pf_msa_flash != 0 && defaults::msa_flash_decline_reason(pf_msa_rework != 0, attn_prefill_fused,
                                                                   pf_msa_flash_layers.count()) == nullptr)
-            std::fprintf(stderr, "prefill identity mm-pf-msa-flash FAST (bf16 WMMA key-split MSA attend, %u-term operands, %u layers)\n", pf_msa_flash, pf_msa_flash_layers.count());
+            std::fprintf(stderr, "prefill identity mm-pf-msa-flash FAST (bf16 WMMA key-split MSA attend, %u-term operands%s, %u layers)\n",
+                         pf_msa_flash == 2 ? 2U : 1U, pf_msa_flash == 3 ? ", row groups of 4" : "", pf_msa_flash_layers.count());
         if (pf_idx_wmma)
             std::fprintf(stderr, "prefill identity %s FAST (index projections on the shared FP16 WMMA core, %u layers)\n",
                          defaults::idx_wmma_policy(defaults::prefill_policy(strix::envcfg::text).idx_wmma_layers).c_str(), pf_idx_wmma_layers.count());
@@ -1297,6 +1327,11 @@ struct Engine::Impl {
                   index_wmma ? "1:layers=" + mask(pf_idx_wmma_layers, 0) : std::string("0"),
                   index_wmma ? rr::Reason::selected : rr::Reason::disabled);
         rr::lever("minimax.prefill_identity", fp32_prefill ? "fp32" : "default", fp32_prefill ? "fp32" : "default");
+        {  // shared TP2 exchange format (one resolver: defaults::prefill_policy)
+            const char* xfmt = strix::envcfg::text(strix::xport::kExchangeFormatEnv);
+            rr::lever("minimax.tp2_exchange_fmt", xfmt != nullptr && *xfmt != 0 ? xfmt : "default", strix::xport::exchange_format_name(pf_fmt),
+                      pf_fmt == strix::xport::ExchangeFormat::f16 ? rr::Reason::selected : rr::Reason::disabled);
+        }
         {   // Linear K order of the prefill MoE + dense v4 linears (STRIX_MMX_PF_ORDER): a bit-changing contract, so the
             // gate witnesses it as a FAST layer set over every layer (onset 0).
             const char* order = strix::envcfg::text("STRIX_MMX_PF_ORDER");
@@ -1538,8 +1573,13 @@ struct Engine::Impl {
                 if (pf_comm_interleave) {
                     grp_part.push_back(dalloc<float>(T * kHidden));
                     grp_remote.push_back(dalloc<float>(T * kHidden));
+                } else if (pf_fmt == strix::xport::ExchangeFormat::f16) {  // f16 exchange: each member's FP32 partial
+                    grp_part.push_back(dalloc<float>(T * kHidden));
                 }
             }
+            // f16 exchange on the module path: the communicator backend's member partials (allocated by default) or
+            // the ones above are the grouped producers' FP32 outputs; the module path never reads them otherwise.
+            pf_fmt_f16_ready = pf_fmt == strix::xport::ExchangeFormat::f16 && grp_part.size() + 1 >= pf_group;
         }
         for (auto& bank : pf_fences) {
             for (unsigned c = 0; c < pf_group; ++c) {
@@ -1652,6 +1692,7 @@ struct Engine::Impl {
     // (STRIX_MM_STAGING=fused, host-path routes only: no device-to-host copy; the post-exchange kernel then reads the
     // peer's partial in the pinned receive buffer), else the device buffer `part`.
     float* send_buffer(std::size_t n) {
+        if (pf_half()) return part;  // f16 exchange: the pack kernel reads the FP32 partial from device memory
         if (pf_active && (pf_inplace || (pf_tx_uncached && n > kMaxStepRows))) return static_cast<float*>(pf->tx());  // direct prefill TX
         if (xb_inplace_now()) {  // STRIX_MM_XB_INPLACE: the decode producer writes the module's next TX slot
             xb_tx = static_cast<float*>(xf->tx());
@@ -1779,21 +1820,25 @@ struct Engine::Impl {
         const auto* local = static_cast<const float*>(x.local);
         const auto* peer = static_cast<const float*>(x.peer);
         wts4_d = reinterpret_cast<float*>(route_d + n * kTopE);
-        enqueue_post({static_cast<std::uint32_t>(n), h, opt.rank == 0 ? local : peer, opt.rank == 0 ? peer : local,
-                                         norm_w, hn, router_w, bias, ids_d, wts4_d}, nullptr);
+        moe::hip::PostExchangeView pv{static_cast<std::uint32_t>(n), h, opt.rank == 0 ? local : peer, opt.rank == 0 ? peer : local,
+                                      norm_w, hn, router_w, bias, ids_d, wts4_d};
+        pv.half_parts = pf_half();
+        enqueue_post(pv, nullptr);
         if (pf_active) pf->retire();  // the only consumer of both slots is enqueued
     }
 
     void exchange_post(std::size_t n, std::uint32_t layer, std::uint32_t which, const float* local, const float* norm_w,
                        const float* router_w, const float* bias) {
         mark();
-        const std::size_t bytes = strix::minimax::pfx::PrefillTraits::payload_bytes(n, kHidden);
+        const std::size_t bytes = pf_half() ? strix::xport::exchange_payload_bytes(pf_fmt, n, kHidden)
+                                            : strix::minimax::pfx::PrefillTraits::payload_bytes(n, kHidden);
         if (pf_active) {  // prefill module: the copy kernel (or a publish kernel after an in-place producer), then the RX wait
             // STRIX_MM_PF_TIMELINE: the send span (copy / publish), then the post span; the stream gap before the post
             // span is this message's exposed exchange wait (producer done -> RX flag), reported per message.
             if (tl) tl->mark("exchange-send", true);
             strix::minimax::pfx::Route<strix::minimax::pfx::Exchanger, strix::minimax::pfx::Tag> pf_route(*pf);
-            const auto pf_post_ticket = pf_route.post(local, bytes, {which + 1, layer, calls});
+            const auto pf_post_ticket = pf_half() ? pf_route.post_pack_f16(local, n * kHidden, {which + 1, layer, calls})
+                                                  : pf_route.post(local, bytes, {which + 1, layer, calls});
             if (tl) tl->mark("exchange-send", false);
             const auto x = pf_route.wait(pf_post_ticket);
             lap(prof.exchange);
@@ -2160,8 +2205,9 @@ struct Engine::Impl {
             } else if (mmoe::PrefillDenseJob qkv[3] = {{y.rq, q}, {y.rk, k}, {y.rv, v}}; dense_qkv(n, qkv)) {
                 // STRIX_MM_PF_DENSE_QKV: one v4-core call, one timeline interval (compare with q + k + v of the library).
                 // MSA FAST flash layers (the mode 11 / 12 branch of the attention below, same predicate): q's BF16 image
-                // in q's own memory (u16; mode 12's lo image in its second half), read through query_op
-                if (pf_msa_q16 && rows.empty() && attn_prefill_fused && n > 8 && pf_msa_flash != 0 && pf_msa_rework != 0 &&
+                // in q's own memory (u16; mode 12's lo image in its second half), read through query_op.
+                // Mode 3's row-group core reads FP32 q (no query_op), so no image is written for it.
+                if (pf_msa_q16 && rows.empty() && attn_prefill_fused && n > 8 && (pf_msa_flash == 1 || pf_msa_flash == 2) && pf_msa_rework != 0 &&
                     pf_msa_flash_layers.test(L)) {
                     qkv[0].image = reinterpret_cast<std::uint16_t*>(q);
                     qkv[0].image_lo = pf_msa_flash == 2 ? qkv[0].image + n * kQLocal : nullptr;
@@ -2279,12 +2325,12 @@ struct Engine::Impl {
                             dv.q16_lo = pf_msa_flash == 2 ? reinterpret_cast<const std::uint16_t*>(q) + n * kQLocal + r0 * kQLocal : nullptr;
                         }
                         dv.ticket = pf_ticket;
-                        const mfused::PrefillView pfv{dv, static_cast<std::uint32_t>(n), pos0, pf_msa_windows, 0, pf_idx_tile && n > 8, pf_idx_rows, n > 8 ? (pf_msa_flash != 0 && pf_msa_rework != 0 && pf_msa_flash_layers.test(L) ? 10U + pf_msa_flash : pf_msa_rework) : 0U};
+                        const mfused::PrefillView pfv{dv, static_cast<std::uint32_t>(n), pos0, pf_msa_windows, 0, pf_idx_tile && n > 8, pf_idx_rows, n > 8 ? (pf_msa_flash != 0 && pf_msa_rework != 0 && pf_msa_flash_layers.test(L) ? 10U + pf_msa_flash : pf_msa_rework) : 0U, pf_flash_keys, pf_rg_rows};
                         if (cache_only) {
                             mfused::enqueue_prefill_cache_only(pfv, nullptr, tl ? PrefillTimeline::msa_mark : nullptr, tl);
                             did_cache_only = true;
                         } else {
-                            mfused::enqueue_prefill(pfv, nullptr, tl ? PrefillTimeline::msa_mark : nullptr, tl);
+                            mfused::enqueue_prefill(pfv, nullptr, tl ? PrefillTimeline::msa_mark : nullptr, tl, &pf_flash_launches);
                         }
                         break;
                     }
@@ -2729,6 +2775,10 @@ struct Engine::Impl {
         task.m = task.grouped ? std::min<std::size_t>(unit_width(), task.chunks) : 1;  // the first unit (as prefill_resume sets it)
         task.rows = route::unit_rows(task.m, opt.max_rows, toks.size());
         task.open = true;
+        if (pf != nullptr) {  // TP2 exchange receipt (STRIX_TP2_EXCHANGE_FMT): this prefill's module messages
+            pf_stats0 = pf->stats();
+            pf_f16_overflow0 = pf->f16_overflows();
+        }
         if (auto* t = child_bank ? child_timeline.get() : timeline.get()) t->begin();
     }
 
@@ -2846,7 +2896,19 @@ struct Engine::Impl {
             }
             if (task.c0 == toks.size()) {
                 if (pf_active) pf->drain();
+                const bool half = pf_half();
                 pf_active = false;
+                if (pf != nullptr) {
+                    const auto st = pf->stats();
+                    if (st.exchanges > pf_stats0.exchanges)
+                        strix::xport::print_exchange_receipt(opt.rank, half ? pf_fmt : strix::xport::ExchangeFormat::f32,
+                                                             st.exchanges - pf_stats0.exchanges, st.bytes - pf_stats0.bytes,
+                                                             st.wire - pf_stats0.wire);
+                    // Fail closed: a finite FP32 partial that rounded to an infinity poisons both ranks' residual.
+                    if (const auto ov = pf->f16_overflows() - pf_f16_overflow0; ov != 0)
+                        throw std::runtime_error("STRIX_TP2_EXCHANGE_FMT=f16: " + std::to_string(ov) +
+                                                 " pack threads saw a partial beyond the binary16 range (use f32)");
+                }
                 hip_ok(hipDeviceSynchronize(), "prefill");
                 if (task.idx_wmma_executed.count() != 0) {
                     std::uint64_t token_fnv = 14695981039346656037ULL;
@@ -3067,13 +3129,15 @@ struct Engine::Impl {
             else if (via_comm) fences.destination_untracked[c] = true;
         };
         // All compute and shared scratch remain on main. Only copies overlap.
-        const auto out_of = [&](std::size_t c) { wait_source(c); return !via_comm && (pf_inplace || (pf_tx_uncached && N[c] > kMaxStepRows)) ? static_cast<float*>(pf->tx()) : P[c]; };
+        const bool half = pf_half();  // f16 exchange: producers write FP32 device partials, send() packs them
+        const auto out_of = [&](std::size_t c) { wait_source(c); return !via_comm && !half && (pf_inplace || (pf_tx_uncached && N[c] > kMaxStepRows)) ? static_cast<float*>(pf->tx()) : P[c]; };
         const auto send = [&](std::size_t c, std::uint32_t which, unsigned L, const float* produced) {
             const std::size_t bytes = N[c] * kHidden * sizeof(float);
             if (!via_comm) {
                 if (tl) tl->mark("exchange-send", true);
                 const auto ht = tl ? tl->host_begin("send") : 0;
-                if (produced == pf->tx()) pf->send(bytes, px::Tag{which + 1, L, calls + c});
+                if (half) pf->send_pack_f16(produced, N[c] * kHidden, px::Tag{which + 1, L, calls + c});
+                else if (produced == pf->tx()) pf->send(bytes, px::Tag{which + 1, L, calls + c});
                 else pf->send_copy(produced, bytes, px::Tag{which + 1, L, calls + c});
                 if (tl) tl->host_end(ht, false);
                 if (tl) tl->mark("exchange-send", false);
@@ -3179,7 +3243,7 @@ struct Engine::Impl {
                 bool grouped = span >= 2;
                 for (std::size_t c = c0; grouped && c < c0 + span; ++c)
                     grouped = N[c] >= mmoe::prefill_moe_group_min_rows() && (c + 1 == c0 + span || N[c] == opt.max_rows) &&
-                              (via_comm || pf_inplace || (pf_tx_uncached && N[c] > kMaxStepRows));
+                              (via_comm || (half ? pf_fmt_f16_ready : pf_inplace || (pf_tx_uncached && N[c] > kMaxStepRows)));
                 if (!grouped) {
                     for (std::size_t c = c0; c < c0 + span; ++c) {
                         post_router(c);
@@ -3204,7 +3268,9 @@ struct Engine::Impl {
                 }
                 for (std::size_t sm = 0; sm < span; ++sm) {
                     wait_source(c0 + sm);
-                    O[sm] = via_comm ? P[c0 + sm] : static_cast<float*>(pf->tx(static_cast<unsigned>(sm)));
+                    O[sm] = via_comm ? P[c0 + sm]
+                          : half ? (sm == 0 ? part : grp_part[sm - 1])  // f16: each member's FP32 device partial, packed at send
+                                 : static_cast<float*>(pf->tx(static_cast<unsigned>(sm)));
                     gv.out[sm] = O[sm];
                 }
                 use(c0);
@@ -3905,11 +3971,41 @@ void Engine::set_prefill_headless(bool on) {
     impl_->pf_headless = on;
 }
 bool Engine::prefill_headless() const { return impl_->pf_headless; }
+void Engine::set_prefill_exchange_f16(bool on) {
+    impl_->no_task("set_prefill_exchange_f16");
+    if (on && !impl_->pf_fmt_f16_ready && impl_->pf_fmt != strix::xport::ExchangeFormat::f16)
+        throw std::invalid_argument("set_prefill_exchange_f16: start the process with STRIX_TP2_EXCHANGE_FMT=f16 (FAST)");
+    impl_->pf_fmt = on ? strix::xport::ExchangeFormat::f16 : strix::xport::ExchangeFormat::f32;
+}
+bool Engine::prefill_exchange_f16() const { return impl_->pf_fmt == strix::xport::ExchangeFormat::f16; }
 void Engine::set_prefill_dense_mlp(bool on) {
     impl_->no_task("set_prefill_dense_mlp");
     impl_->pf_dense_mlp = on;
 }
 bool Engine::prefill_dense_mlp() const { return impl_->pf_dense_mlp; }
+void Engine::set_prefill_flash_keys(unsigned mode) {
+    impl_->no_task("set_prefill_flash_keys");
+    if (mode > 2) throw std::invalid_argument("prefill flash keys must be 0, 1 or 2");
+    impl_->pf_flash_keys = mode;
+}
+unsigned Engine::prefill_flash_keys() const { return impl_->pf_flash_keys; }
+void Engine::set_prefill_rg_rows(unsigned rows) {
+    impl_->no_task("set_prefill_rg_rows");
+    if (rows != 0 && rows != 4 && rows != 8) throw std::invalid_argument("prefill row-group rows must be 0 (auto), 4 or 8");
+    impl_->pf_rg_rows = rows;
+}
+unsigned Engine::prefill_rg_rows() const { return impl_->pf_rg_rows; }
+void Engine::set_prefill_msa_flash(unsigned mode) {
+    impl_->no_task("set_prefill_msa_flash");
+    if (mode > 3) throw std::invalid_argument("prefill MSA flash must be 0..3");
+    impl_->pf_msa_flash = mode;
+}
+unsigned Engine::prefill_msa_flash() const { return impl_->pf_msa_flash; }
+unsigned Engine::prefill_flash_mode() const {
+    return defaults::msa_flash_decline_reason(impl_->pf_msa_rework != 0, impl_->attn_prefill_fused,
+                                             impl_->pf_msa_flash_layers.count()) == nullptr ? impl_->pf_msa_flash : 0U;
+}
+std::array<std::uint64_t, 7> Engine::prefill_flash_launches() const { return impl_->pf_flash_launches; }
 std::uint64_t Engine::prefill_dense_mlp_count() const { return impl_->pf_dense_mlp_calls; }
 std::uint64_t Engine::prefill_headless_chunks() const { return impl_->pf_headless_chunks; }
 std::size_t Engine::prefill_headless_expected(std::size_t rows) const {

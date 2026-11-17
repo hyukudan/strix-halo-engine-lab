@@ -189,7 +189,8 @@ struct ResidencyPlan {
     strix::residency::SessionBytes session;
     strix::residency::HostBytes host;
     strix::residency::Decision decision;
-    std::uint32_t block_rows = 0;     // rows per prefill block in the decided mode (tiered: the exchange's rows)
+    strix::residency::Options options; // what the decision used: config.residency + the bound device profile's cap
+    std::uint32_t block_rows = 0;    // rows per prefill block in the decided mode (tiered: the exchange's rows)
     std::string json;                 // decision_json + the numbers it used
 };
 [[nodiscard]] ResidencyPlan plan_residency(const Config& config);

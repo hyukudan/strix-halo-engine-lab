@@ -50,6 +50,11 @@ bool run(const std::string& scenario, unsigned rank) {
     std::vector<double> ttft[2];
     const auto set = [&](bool on) { eng.enabled = on; };
     bool g_exact_fail = false;
+    // These scenarios never select --ab pfflashkeys, so production's FlashKeysAB is inactive (no-op).
+    struct {
+        void begin() {}
+        void finish(int, std::uint64_t, std::uint64_t) const {}
+    } flash_keys;
 #include "prefill.inc"
 #include "receipt.inc"
     if (eng.next != 6 || states.size() != 6 || outs.size() != 6 || first.size() != 6)

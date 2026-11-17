@@ -977,8 +977,65 @@ std::map<std::string, std::vector<std::uint32_t>> g_session_tokens;
 // weak, so binaries linked against a library without it still link (`--ab pftiled` then refuses).
 extern "C" void strix_trellis_lab_set_wmma_tiled(int on) __attribute__((weak));
 
+// A/B evidence is local to this engine and each completed prefill, never inferred from equal hashes.
+struct FlashKeysAB {
+    mm::Engine* eng;
+    unsigned saved;
+    bool msa_flash;
+    std::array<std::uint64_t, 7> before{};
+    FlashKeysAB(mm::Engine& engine, bool active, bool flash)
+        : eng(active || flash ? &engine : nullptr), saved(engine.prefill_flash_keys()), msa_flash(flash) {
+        if (active && eng->prefill_flash_mode() == 0)
+            throw std::invalid_argument("--ab pfflashkeys: NOT EXERCISED (flash admission disabled)");
+    }
+    void restore() {
+        if (eng != nullptr) {
+            eng->set_prefill_flash_keys(saved);
+            eng = nullptr;
+        }
+    }
+    // Unwinding restore never throws (a throw here would terminate and hide the original error); restore() still throws.
+    ~FlashKeysAB() {
+        try {
+            restore();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "--ab pfflashkeys: restoring the flash key schedule failed: %s\n", e.what());
+        }
+    }
+    void begin() { if (eng != nullptr) before = eng->prefill_flash_launches(); }
+    void finish(int arm, std::uint64_t state, std::uint64_t out) const {
+        if (eng == nullptr) return;
+        auto counts = eng->prefill_flash_launches();
+        for (std::size_t i = 0; i < counts.size(); ++i) counts[i] -= before[i];
+        if (msa_flash) {
+            const unsigned mode = eng->prefill_msa_flash(), rows = eng->prefill_rg_rows();
+            const auto launches = mode == 1 ? counts[3] : mode == 2 ? counts[4] : mode == 3 ?
+                                  (rows == 4 ? counts[5] : rows == 8 ? counts[6] : counts[5] + counts[6]) : 0;
+            const bool exercised = mode == 0 || launches != 0;
+            std::printf("rank %u ab-pfmsaflash: arm %c mode=%u rows=%u launches=%llu row-groups[4,8]=%llu,%llu %s\n",
+                        eng->rank(), arm % 2 == 1 ? 'B' : 'A', mode, rows,
+                        static_cast<unsigned long long>(launches), static_cast<unsigned long long>(counts[5]),
+                        static_cast<unsigned long long>(counts[6]), mode == 0 ? "OFF" : exercised ? "EXERCISED" : "NOT EXERCISED");
+            if (!exercised) g_exact_fail = true;
+            return;
+        }
+        const unsigned expected = arm % 2 == 0 ? 0U : 2U;
+        const unsigned schedule = eng->prefill_flash_keys();
+        const unsigned mode = eng->prefill_flash_mode();
+        const bool exercised = mode != 0 && schedule == expected && counts[expected] != 0 &&
+                               counts[1] == 0 && counts[2U - expected] == 0;
+        std::printf("rank %u ab-pfflashkeys: arm %d schedule=%u flash=%u launches[0,1,2]=%llu,%llu,%llu "
+                    "state=%016llx final-rows=%016llx %s\n", eng->rank(), arm, schedule, mode,
+                    static_cast<unsigned long long>(counts[0]), static_cast<unsigned long long>(counts[1]),
+                    static_cast<unsigned long long>(counts[2]), static_cast<unsigned long long>(state),
+                    static_cast<unsigned long long>(out), exercised ? "EXERCISED" : "NOT EXERCISED");
+        if (!exercised) g_exact_fail = true;
+    }
+};
+
 std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vector<std::uint32_t>& prompt, int block,
                       const std::vector<std::uint32_t>* reference) {
+    FlashKeysAB flash_keys(eng, flag == "pfflashkeys", flag == "pfmsaflash");
     const int pipe0 = strix::minimax::moe::opt::prefill_pipe_override();
     struct RestorePipe {
         bool active;
@@ -1023,6 +1080,24 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
         }
         std::printf("pfmsarework modes A=%u B=%u\n", rework_base, rework_mode);
     }
+    // pfmsaflash: arms STRIX_MM_AB_FLASH_A / _B = MODE[rROWS] (FAST flash mode 0..3 of the flash layers, row-group rows
+    // 0 auto / 4 / 8), default A = 1 (key split), B = 3 (row groups, auto rows); restored after the A/B.
+    struct FlashArm { unsigned mode, rows; };
+    const auto flash_arm = [](const char* name, const char* dflt) {
+        const char* e = std::getenv(name);
+        const std::string t = e != nullptr ? e : dflt;
+        FlashArm x{0U, 0U};
+        if (t.empty() || t[0] < '0' || t[0] > '3' || (t.size() != 1 && t != std::string(1, t[0]) + "r4" && t != std::string(1, t[0]) + "r8" &&
+                                                     t != std::string(1, t[0]) + "r0"))
+            throw std::invalid_argument(std::string(name) + " must be MODE[r0|r4|r8], MODE 0..3");
+        x.mode = static_cast<unsigned>(t[0] - '0');
+        x.rows = t.size() == 1 ? 0U : static_cast<unsigned>(t[2] - '0');
+        return x;
+    };
+    const FlashArm fa = flag == "pfmsaflash" ? flash_arm("STRIX_MM_AB_FLASH_A", "1") : FlashArm{0U, 0U};
+    const FlashArm fb = flag == "pfmsaflash" ? flash_arm("STRIX_MM_AB_FLASH_B", "3") : FlashArm{0U, 0U};
+    const unsigned flash0 = eng.prefill_msa_flash(), rg_rows0 = eng.prefill_rg_rows();
+    if (flag == "pfmsaflash") std::printf("pfmsaflash arms A=%u r%u B=%u r%u\n", fa.mode, fa.rows, fb.mode, fb.rows);
     const std::string pipe_on = std::getenv("STRIX_MM_AB_PIPE") != nullptr ? std::getenv("STRIX_MM_AB_PIPE") : "2";  // moepipe B form
     const char* pipe_env = std::getenv("STRIX_MMX_MOE_PIPE");  // restored after the A/B
     const std::string moe_pipe0 = pipe_env != nullptr ? pipe_env : "";
@@ -1087,6 +1162,12 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
         }
         else if (flag == "pfmsa") eng.set_prefill_msa_batch(on);
         else if (flag == "pfdensemlp") eng.set_prefill_dense_mlp(on);  // layers 0-2 dense MLP: strix_gemm (A) / v4 core (B)
+        else if (flag == "x16fmt") eng.set_prefill_exchange_f16(on);  // TP2 prefill exchange: FP32 (A) / binary16 (B), FAST
+        else if (flag == "pfflashkeys") eng.set_prefill_flash_keys(on ? 2U : 0U);
+        else if (flag == "pfmsaflash") {
+            eng.set_prefill_msa_flash(on ? fb.mode : fa.mode);
+            eng.set_prefill_rg_rows(on ? fb.rows : fa.rows);
+        }  // FAST flash: incumbent loads (A) / key halves (B)
         else if (flag == "pfheadless") eng.set_prefill_headless(on);  // last layer of headless chunks: full (A) / cache-only (B)
         else if (flag == "pfattn4") eng.set_prefill_attend4(on);
         else if (flag == "pfidxconc") eng.set_prefill_index_concurrent(on ? idx_conc_b : 0);
@@ -1153,6 +1234,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
                          : flag == "pfidx" ? eng.prefill_index_tile()
                          : flag == "pftxuc" ? eng.prefill_tx_uncached()
                          : flag == "pfmsa" ? eng.prefill_msa_batch()
+                         : flag == "x16fmt" ? eng.prefill_exchange_f16()
                          : flag == "pfheadless" ? eng.prefill_headless()
                          : flag == "pfdensemlp" ? eng.prefill_dense_mlp()
                          : flag == "pfattn4" ? eng.prefill_attend4()
@@ -1176,13 +1258,14 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     std::vector<double> ttft[2], step_ms[2];
     std::vector<std::uint32_t> first(6);
     std::vector<std::uint64_t> states, outs;  // per arm: K/V/IK state FNV, final-rows FNV (this rank only; never in the cross-rank hash)
-    const bool hash_state = ((flag == "pfattn4" || flag == "pfmsa" || flag == "pfheadless" || flag == "pfdensemlp" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall")) || (state_fnv_on() && (flag == "pfx" || flag == "pfil" || flag == "pfxip" || std::getenv("STRIX_MM_AB_STATE") != nullptr));
+    const bool hash_state = ((flag == "pfattn4" || flag == "pfmsa" || flag == "pfheadless" || flag == "x16fmt" || flag == "pfdensemlp" || flag == "pfflashkeys" || flag == "pfmsaflash" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall")) || (state_fnv_on() && (flag == "pfx" || flag == "pfil" || flag == "pfxip" || std::getenv("STRIX_MM_AB_STATE") != nullptr));
     // pfattn4 / pfmsa / pfmsarework / mtfit / core8 / pftab / pfgufuse / pfidx / pftxuc / pfrouter / pfidxconc / pfkvtile / pftiled: A B A B A B A (every B bracketed by two A prefills); the other prefill flags: A B A B A B
     const int prefills = flag == "attn" || flag == "linears" || flag == "xfer" || flag == "idxdec" || flag == "idxconc" || flag == "xbfold" || flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbpub" || flag == "xbwarm" || flag == "xbwarmo" || flag == "moegrid" || flag == "moepipe" || flag == "xbilp" || flag == "xbset" ? 1 : (flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall" || flag == "pfi4") ? 7 : 6;  // idxattn: both  // decode-only flags: one prefill, no TTFT cells
     first.resize(static_cast<std::size_t>(prefills));
     std::vector<std::uint64_t> dense_mlp_calls;
     for (int r = 0; r < prefills; ++r) {
         set(r % 2 == 1);
+        flash_keys.begin();
         const auto dense_before = eng.prefill_dense_mlp_count();
         const auto headless_before = eng.prefill_headless_chunks();
         const auto t0 = Clock::now();
@@ -1202,6 +1285,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
         if (hash_state) {
             states.push_back(eng.state_fnv(0, prompt.size()));
             outs.push_back(eng.prefill_out_fnv());
+            flash_keys.finish(r, states.back(), outs.back());
         }
     }
     // xb flags: A B A B A B A (every B bracketed), and matched replay: every block re-decodes the SAME positions with
@@ -1235,7 +1319,11 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
             std::printf("\n");
         }
     }
-    if (flag == "pfmsarework") {
+    if (flag == "pfmsaflash") {
+        eng.set_prefill_msa_flash(flash0);
+        eng.set_prefill_rg_rows(rg_rows0);
+    }
+    else if (flag == "pfmsarework") {
         eng.set_prefill_msa_rework(rework0);
         eng.set_prefill_msa_batch(msa0);
         eng.set_fused_prefill_attention(fused_prefill0);
@@ -1275,6 +1363,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     else if (flag == "pftiled") strix_trellis_lab_set_wmma_tiled(-1);
     else if (flag == "pfheadless") eng.set_prefill_headless(start_arm);
     else if (flag == "pfdensemlp") eng.set_prefill_dense_mlp(start_arm);
+    else if (flag == "pfflashkeys") flash_keys.restore();
     else if (flag == "pfi4") strix::minimax::moe::opt::set_prefill_iu4(-1);
     else if (flag == "pfall") {
         eng.set_prefill_msa_batch(msa0);
@@ -2287,8 +2376,22 @@ int main(int argc, char** argv) {
                 setenv("STRIX_MM_AB_WARM_O", name.substr(8).c_str(), 1);
                 name = "xbwarmo";
             }
+            // pfmsaflash=A,B: this run's arms (STRIX_MM_AB_FLASH_A / _B, several pairs in one process); unset again below
+            const bool fl_set = name.rfind("pfmsaflash=", 0) == 0;
+            if (fl_set) {
+                const std::string arms = name.substr(11);
+                const auto comma = arms.find(',');
+                if (comma == std::string::npos) throw std::invalid_argument("--ab pfmsaflash=A,B");
+                setenv("STRIX_MM_AB_FLASH_A", arms.substr(0, comma).c_str(), 1);
+                setenv("STRIX_MM_AB_FLASH_B", arms.substr(comma + 1).c_str(), 1);
+                name = "pfmsaflash";
+            }
             const std::uint64_t ah = ab_flag(eng, name, read_u32(ppath), std::stoi(b.substr(c + 1)),
                                              ref == g_session_tokens.end() ? nullptr : &ref->second);
+            if (fl_set) {
+                unsetenv("STRIX_MM_AB_FLASH_A");
+                unsetenv("STRIX_MM_AB_FLASH_B");
+            }
             if (wo_set) {
                 if (wo_env == nullptr) unsetenv("STRIX_MM_AB_WARM_O");
                 else setenv("STRIX_MM_AB_WARM_O", wo0.c_str(), 1);

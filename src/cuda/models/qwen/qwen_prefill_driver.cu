@@ -1109,6 +1109,10 @@ std::uint64_t scratch_estimate(std::uint32_t block_rows) {
 ResidencyPlan plan_residency(const Config& config) {
     ResidencyPlan r;
     const auto& bound = strix::device::bind_cuda();
+    // ONE budget resolver: the bound device profile's cap (strix/device/budget.hpp, the same route_budget the server's
+    // admission view uses) is an input of the residency plan; an explicit tighter --vram-budget-gib still wins.
+    r.options = config.residency;
+    r.options.device_cap = strix::device::route_budget(bound, {}).device_bytes;
     ck(cudaSetDevice(bound.visible.ordinal), "set device");
     auto& m = r.model;
     m.layers = kLayers;
@@ -1169,7 +1173,7 @@ ResidencyPlan plan_residency(const Config& config) {
         return qsa::workspace_bytes(std::min(full_rows, 1024U), positions) +
             std::uint64_t{positions} * qsa::kRotaryPairs * sizeof(qsa::RopeTable);
     };
-    r.decision = strix::residency::resolve(config.residency, m, r.card, s, r.host);
+    r.decision = strix::residency::resolve(r.options, m, r.card, s, r.host);
     if (r.decision.mode == strix::residency::Mode::tiered) {
         // the tiered route runs blocks of the exchange's rows: its scratch is smaller, so the pool is re-sized with it
         s.scratch = scratch_estimate(kTierRows);
@@ -1178,7 +1182,7 @@ ResidencyPlan plan_residency(const Config& config) {
                 std::uint64_t{positions} * qsa::kRotaryPairs * sizeof(qsa::RopeTable);
         };
         r.block_rows = kTierRows;
-        auto forced = config.residency;
+        auto forced = r.options;
         forced.mode = strix::residency::Mode::tiered;
         r.decision = strix::residency::resolve(forced, m, r.card, s, r.host);
     }
@@ -1380,7 +1384,10 @@ std::string Prefill::residency_receipt_json() const {
     if (!impl_->tier) return "{\"expert_residency\":\"full\"}";
     return impl_->tier->receipt_json();
 }
-std::uint64_t Prefill::card_budget_bytes() const { return impl_->cfg.residency.vram_budget || impl_->tier ? impl_->plan.decision.budget : 0ULL; }
+std::uint64_t Prefill::card_budget_bytes() const {
+    // a cap the plan used (flag, environment or device profile) or the tiered route: the engine was sized to it
+    return impl_->plan.decision.cap_source != "card" || impl_->tier ? impl_->plan.decision.budget : 0ULL;
+}
 std::uint64_t Prefill::engine_device_bytes() const { return impl_->engine_bytes; }
 
 qwen_route::Identity Prefill::numerical_identity() const {

@@ -122,6 +122,7 @@ const std::map<std::string, std::string> kFormer = {
     {"STRIX_MMX_MOE_PIPE", "0"},
     {"STRIX_MM_PF_HEADLESS", "0"},
     {"STRIX_MM_PF_DENSE_MLP", "0"},         {"STRIX_MMX_PF_ORDER", "adaptive"},
+    {"STRIX_MM_PF_FLASH_KEYS", "0"},         {"STRIX_MM_PF_MSA_RG_ROWS", "4"},
 };
 // Cache identity field of the default chunk-invariant linear order (table item pf_order).
 const std::string kOrderId = "prefill_order=mmx-pf-linear-s1-v1";
@@ -797,6 +798,9 @@ void test_fast_prefill_profile() {
         const EnvMap two_env{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MM_PF_MSA_FLASH", "2"}};
         const auto two = md::prefill_policy(lookup(two_env));
         check(two.msa_flash == 2 && two.msa_flash_asked == "2" && two.policies == "msa-flash-bf16-2term-l40-59", "fast profile: explicit 2 wins");
+        const EnvMap rg_env{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MM_PF_MSA_FLASH", "3"}};
+        const auto rg = md::prefill_policy(lookup(rg_env));
+        check(rg.msa_flash == 3 && rg.policies == "msa-flash-bf16-rg4-l40-59", "fast profile: explicit 3 = row-group form");
         const EnvMap legacy_env{{"STRIX_MM_PF_MSA_FLASH", "1"}, {"STRIX_MM_PF_MSA_FLASH_LAYERS", "50-59"}};
         const auto legacy = md::prefill_policy(lookup(legacy_env));
         check(legacy.msa_flash == 1 && legacy.policies == "msa-flash-bf16-l50-59", "fast profile: the legacy opt-in still runs, named by its layers");
@@ -819,7 +823,7 @@ void test_fast_prefill_profile() {
     }
     {
         bool threw = false;
-        const EnvMap bad_mode{{"STRIX_MM_PF_MSA_FLASH", "3"}}, bad_layers{{"STRIX_MM_PF_MSA_FLASH_LAYERS", "70"}};
+        const EnvMap bad_mode{{"STRIX_MM_PF_MSA_FLASH", "4"}}, bad_layers{{"STRIX_MM_PF_MSA_FLASH_LAYERS", "70"}};
         try { (void)md::prefill_policy(lookup(bad_mode)); } catch (const std::invalid_argument&) { threw = true; }
         check(threw, "fast profile: invalid flash mode rejected");
         threw = false;
@@ -1030,6 +1034,37 @@ void test_entry_points_host_defaults() {
         if (row.optimization) check(md::host_default_value(row, "rank", lookup(base)) == nullptr, std::string(row.name) + " off under the baseline");
 }
 
+// Shared TP2 exchange format (xport/exchange_format.hpp) through the one MiniMax resolver: default f32 everywhere with
+// the legacy identity and fingerprint; an explicit f16 is the named FAST policy tp2-xchg-f16-v0 (identity field,
+// fingerprint input, effective-config line); the exact baseline refuses it; bf16 / junk are refused.
+void test_tp2_exchange_format() {
+    const auto fp = [](const EnvMap& m) { return md::profile_resolution(lookup(m)).fingerprint(); };
+    const EnvMap off;
+    const auto p0 = md::prefill_policy(lookup(off));
+    check(p0.exchange_fmt == strix::xport::ExchangeFormat::f32 && p0.policies.empty(), "tp2 exchange: default f32, no policy");
+    const EnvMap f32{{"STRIX_TP2_EXCHANGE_FMT", "f32"}};
+    check(md::prefill_identity(lookup(f32)) == kOrderId && fp(f32) == fp(off), "tp2 exchange: explicit f32 keeps the legacy identity");
+    const EnvMap f16{{"STRIX_TP2_EXCHANGE_FMT", "f16"}};
+    const auto p = md::prefill_policy(lookup(f16));
+    check(p.exchange_fmt == strix::xport::ExchangeFormat::f16 && p.policies == "tp2-xchg-f16-v0" && p.msa_flash == 0,
+          "tp2 exchange: explicit f16 = named FAST policy");
+    check(md::prefill_identity(lookup(f16)) == "tp2_exchange_fmt=f16;" + kOrderId, "tp2 exchange: f16 enters the cache identity");
+    check(fp(f16) != fp(off), "tp2 exchange: f16 enters the rank-agreement fingerprint");
+    const EnvMap stack{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_TP2_EXCHANGE_FMT", "f16"}};
+    const auto ps = md::prefill_policy(lookup(stack));
+    check(ps.policies == "msa-flash-bf16-l40-v1+tp2-xchg-f16-v0", "tp2 exchange: joins the bundle's policy list: " + ps.policies);
+    check(md::prefill_identity(lookup(stack)) == "prefill_msa=msa-flash-bf16-l40-v1;tp2_exchange_fmt=f16;prefill_router=mm-pf-router-wmma-v1-l40-59;" + kOrderId,
+          "tp2 exchange: bundle identity keeps its MSA field: " + md::prefill_identity(lookup(stack)));
+    for (const auto& bad : {EnvMap{{"STRIX_TP2_EXCHANGE_FMT", "f16"}, {"STRIX_MM_BASELINE", "1"}},
+                            EnvMap{{"STRIX_TP2_EXCHANGE_FMT", "bf16"}}, EnvMap{{"STRIX_TP2_EXCHANGE_FMT", "F16"}}}) {
+        bool threw = false;
+        try { (void)md::prefill_policy(lookup(bad)); } catch (const std::invalid_argument&) { threw = true; }
+        check(threw, "tp2 exchange: refused (baseline f16 / unknown format)");
+    }
+    check(md::effective_config(md::Cli{}, lookup(f16)).find("prefill.tp2_exchange_fmt=f16 (explicit f16 under tp2-xchg-f16-v0") != std::string::npos,
+          "tp2 exchange: effective-config line");
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: " << argv[0] << " minimax_production_receipt.txt\n";
@@ -1053,6 +1088,7 @@ int main(int argc, char** argv) {
         test_entry_points_host_defaults();
         test_split_frame();
         test_fast_prefill_profile();
+        test_tp2_exchange_format();
         test_router_wmma();
         test_turbo_product_profile();
     } catch (const std::exception& e) {

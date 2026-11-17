@@ -101,7 +101,7 @@ void families() {
 
     const p::Engine mm{"minimax-pair", "", strix::minimax::defaults::profile_table, false, "minimax-turbo-v1"};
     generic(mm, p::Name::turbo, none, r);
-    require(strix::minimax::defaults::profile_table.size() == 8, "minimax retains its base FAST prefill index and router rows");
+    require(strix::minimax::defaults::profile_table.size() == 9, "minimax retains six base rows, the FAST router rows and explicit-only TP2 exchange row");
     for (const char* lever : {"idx_wmma", "idx_wmma_layers", "router_wmma", "router_wmma_layers"}) {
         const auto* e = find(r, lever);
         require(e != nullptr && e->status == p::Status::builtin && e->value == e->lever->builtin &&

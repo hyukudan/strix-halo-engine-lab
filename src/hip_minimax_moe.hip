@@ -1,5 +1,6 @@
 // minimax-m3 fused post-exchange kernel (declared order: strix/minimax_moe.hpp).
 #include "strix/hip_minimax_moe.hpp"
+#include "xport/exchange_format_hip.hpp"
 #include "moe_core/route.hpp"
 #include "minimax/moe/mmx_trellis_device.hpp"  // dev::transform_block (STRIX_MM_XB_PREP)
 #include "core/f16_dense_tall.hpp"             // FAST router product (enqueue_router_wmma)
@@ -50,8 +51,9 @@ struct SplitRow {
 __device__ __forceinline__ SplitRow split_row(const float* base, unsigned r, unsigned rows, unsigned head) {
     return SplitRow{base, std::size_t{r} * head, std::size_t{rows} * head + std::size_t{r} * (kHidden - head) - head, head};
 }
-template <unsigned Ilp, bool Sum = false, bool Split = false>
+template <unsigned Ilp, bool Sum = false, bool Split = false, bool Half = false>
 __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchangeView v) {
+    static_assert(!(Half && (Sum || Split)), "binary16 partials cannot be folded or split");
     __shared__ __attribute__((aligned(16))) float hs[kHidden];  // 16-byte aligned: mode 2 stages float4 rows here
     __shared__ __attribute__((aligned(16))) float ys[kHidden];
     __shared__ float part[kNormThreads];
@@ -76,13 +78,15 @@ __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchang
         __syncthreads();
     }
     float* h = v.h + static_cast<std::size_t>(r) * kHidden;
-    const float* p0 = v.part0 + static_cast<std::size_t>(r) * kHidden;
-    const float* p1 = Sum ? nullptr : v.part1 + static_cast<std::size_t>(r) * kHidden;
+    const float* p0 = Half ? nullptr : v.part0 + static_cast<std::size_t>(r) * kHidden;
+    const float* p1 = Sum || Half ? nullptr : v.part1 + static_cast<std::size_t>(r) * kHidden;
     [[maybe_unused]] SplitRow s0{}, s1{};
     if constexpr (Split) {
         s0 = split_row(v.part0, r, v.rows, v.split_head);
         if constexpr (!Sum) s1 = split_row(v.part1, r, v.rows, v.split_head);
     }
+    [[maybe_unused]] const _Float16* q0 = Half ? reinterpret_cast<const _Float16*>(v.part0) + static_cast<std::size_t>(r) * kHidden : nullptr;
+    [[maybe_unused]] const _Float16* q1 = Half ? reinterpret_cast<const _Float16*>(v.part1) + static_cast<std::size_t>(r) * kHidden : nullptr;
     float acc = 0.0F;
     if constexpr (Ilp == 2) {  // STRIX_MM_XB_POSTILP mode 2: the partials (GPU-uncached exchange slots) staged into LDS
         // with coalesced 16-byte loads (4x fewer uncached requests), then the plain chain reads them from LDS: same
@@ -90,7 +94,16 @@ __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchang
         // reduction barriers; each hs[j] is read and then written by the same thread.
         const auto* p0v = reinterpret_cast<const float4*>(p0);
         const auto* p1v = reinterpret_cast<const float4*>(p1);
-        for (unsigned k = t; k < kHidden / 4U; k += kNormThreads) {
+        if constexpr (Half) {
+            const auto* h0v = reinterpret_cast<const uint4*>(q0);
+            const auto* h1v = reinterpret_cast<const uint4*>(q1);
+            for (unsigned k = t; k < kHidden / 8U; k += kNormThreads) {
+                const uint4 x0 = h0v[k], x1 = h1v[k];
+                strix::xport::hip::widen_f16x8(x0, hs + 8U * k);
+                strix::xport::hip::widen_f16x8(x1, ys + 8U * k);
+            }
+        }
+        for (unsigned k = t; !Half && k < kHidden / 4U; k += kNormThreads) {
             if constexpr (Split) {  // a float4 never straddles the head boundary (head % 4 == 0)
                 const float4 x0 = *reinterpret_cast<const float4*>(s0.at(4U * k));
                 if constexpr (Sum) {
@@ -129,8 +142,8 @@ __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchang
                 b[q] = *s0.at(j);
                 c[q] = Sum ? 0.0F : *s1.at(j);
             } else {
-                b[q] = p0[j];
-                c[q] = Sum ? 0.0F : p1[j];
+                b[q] = Half ? static_cast<float>(q0[j]) : p0[j];
+                c[q] = Sum ? 0.0F : Half ? static_cast<float>(q1[j]) : p1[j];
             }
         }
 #pragma unroll
@@ -145,7 +158,10 @@ __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchang
         for (unsigned j = t; j < kHidden; j += kNormThreads) {
             float x;
             if constexpr (Split) x = Sum ? h[j] + *s0.at(j) : h[j] + (*s0.at(j) + *s1.at(j));
-            else x = Sum ? h[j] + p0[j] : h[j] + (p0[j] + p1[j]);
+            else {
+                const float a0 = Half ? static_cast<float>(q0[j]) : p0[j];
+                x = Sum ? h[j] + a0 : h[j] + (a0 + (Half ? static_cast<float>(q1[j]) : p1[j]));
+            }
             h[j] = x;
             hs[j] = x;
             acc = __builtin_fmaf(x, x, acc);
@@ -403,7 +419,13 @@ void enqueue_post_exchange(const PostExchangeView& v, hipStream_t stream) {
     }
     if (v.ilp == 2 && ((reinterpret_cast<std::uintptr_t>(v.part0) | reinterpret_cast<std::uintptr_t>(v.part1)) & 15U) != 0)
         throw std::invalid_argument("minimax post-exchange: ilp mode 2 needs 16-byte aligned partials");
-    if (v.split_head != 0) {  // split-producer chunk frame (opt-in): the same kernels with chunk-major partial addressing
+    if (v.half_parts && v.split_head != 0) throw std::invalid_argument("minimax post-exchange: f16 partials cannot use split frames");
+    if (v.half_parts) {
+        if (v.part0 == nullptr || v.part1 == nullptr) throw std::invalid_argument("minimax post-exchange: f16 partials need both slots");
+        if (v.ilp == 2) hipLaunchKernelGGL((post_exchange_kernel<2, false, false, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+        else if (v.ilp == 1) hipLaunchKernelGGL((post_exchange_kernel<1, false, false, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+        else hipLaunchKernelGGL((post_exchange_kernel<0, false, false, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+    } else if (v.split_head != 0) {  // split-producer chunk frame (opt-in): the same kernels with chunk-major partial addressing
         if (v.split_head % 4U != 0 || v.split_head >= kHidden) throw std::invalid_argument("minimax post-exchange: bad split head");
         if (v.part1 == nullptr) {
             if (v.ilp == 2) hipLaunchKernelGGL((post_exchange_kernel<2, true, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);

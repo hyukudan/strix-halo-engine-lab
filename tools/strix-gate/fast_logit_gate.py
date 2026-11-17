@@ -460,8 +460,8 @@ MM_OUTPUT_SWITCHES = frozenset({"STRIX_MM_QUALITY_OUT", "STRIX_MM_QUALITY_ROWS",
                                 "STRIX_MM_DIAG_ATTN_ULP"})
 # The FAST layer set's own lever and switches: ignored by config_difference (candidate == reference + this layer set).
 MM_FAST_SWITCHES = frozenset({"STRIX_MM_PF_MSA_FLASH", "STRIX_MM_PF_MSA_FLASH_LAYERS", "STRIX_MM_FAST_PREFILL",
-                              "STRIX_MMX_PF_ORDER", "STRIX_MM_PF_IDX_WMMA", "STRIX_MM_PF_IDX_WMMA_LAYERS"})
-MM_FAST_LEVERS = frozenset({"minimax.msa_flash", "minimax.linear_order", "minimax.index_proj_wmma"})
+                              "STRIX_MMX_PF_ORDER", "STRIX_MM_PF_IDX_WMMA", "STRIX_MM_PF_IDX_WMMA_LAYERS", "STRIX_TP2_EXCHANGE_FMT"})
+MM_FAST_LEVERS = frozenset({"minimax.msa_flash", "minimax.linear_order", "minimax.index_proj_wmma", "minimax.tp2_exchange_fmt"})
 # The chunk-invariant linear order (minimax.linear_order invariant:<identity>) changes MoE/dense rounding in every layer:
 # its FAST layer set is all MM_LAYERS layers (onset 0, so its nulls are layer-0 one-ulp controls).
 MM_LAYERS = 60
@@ -573,6 +573,13 @@ def minimax_execution(log, rank, prompts):
             raise GateError(f"witness: unexpected minimax.linear_order value {order!r}")
         fast = {"policy": mo.group(1) + ("+" + fast["policy"] if fast else ""),
                 "msa_flash_mode": fast["msa_flash_mode"] if fast else 0, "layers": list(range(MM_LAYERS))}
+    xchg = levers.get("minimax.tp2_exchange_fmt", "f32")
+    if xchg not in ("f32", "f16"):
+        raise GateError(f"witness: unexpected minimax.tp2_exchange_fmt value {xchg!r}")
+    if xchg == "f16":  # every layer's two exchanges round the partials: the FAST onset is layer 0
+        fast = fast or {"policy": "", "msa_flash_mode": 10, "layers": []}
+        fast["policy"] = (fast["policy"] + "+" if fast["policy"] else "") + "tp2-xchg-f16"
+        fast["layers"] = sorted(set(fast["layers"]) | set(range(MM_LAYERS)))
     plain = levers["minimax.moe_prefill_format"] == "exl3" and levers["minimax.prefill_identity"] == "default"
     profile = ("fast-prefill" if fast else "exact") if plain else "other"
     diag, covered = [], set()
