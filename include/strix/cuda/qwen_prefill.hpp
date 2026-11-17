@@ -264,7 +264,8 @@ public:
     // excluded; decode windows of the other sessions may keep running), else finalized as prefill_wait().
     std::optional<PrefillChunk> prefill_poll();
     [[nodiscard]] bool prefill_pending() const;
-    // Cohort verify window: the sessions' rows concatenated session-major (total 1..8 rows, distinct sessions). The
+    // Cohort verify window: the sessions' rows concatenated session-major (total 1..16 rows, <= 8 distinct sessions;
+    // windows of 9..16 rows, also one session's copy window, run the row-independent families prefill-shaped). The
     // row-independent families (dense A8, HC, router, shared expert, routed MoE, LM head, argmax) run once over all rows;
     // GDN cores, QSA attention, PLE tails and conv histories run per session on its own state and positions. Every row's
     // bits equal the same session's verify() alone. Results are per cohort entry. commit_cohort(keep[i]) (1 <= keep[i] <=

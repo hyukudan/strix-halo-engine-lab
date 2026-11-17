@@ -3524,17 +3524,16 @@ static void mla_flash_rows(const DsaSlot& sl, const std::uint32_t* tokens, const
     namespace M = strix::attn_core::sparse;
     topk_overlap_diag(tokens, n, C, s);
     const GlmMlaFlashPolicy::Args a{sl.latent, tokens, n, qt, ob};
-    constexpr unsigned T16 = M::Geometry<32, kKvLora, 16>::kThreads, T32 = M::Geometry<32, kKvLora, 32>::kThreads;
     using O16 = GlmMlaFlashOb16<GlmMlaFlashPolicy>;
     using QO16 = GlmMlaFlashOb16<GlmMlaFlashQ16Policy>;
-    if (ob16 && q16 && keys == 16) M::flash_rows_kernel<QO16, 16><<<C, T16, 0, s>>>(a);
-    else if (ob16 && q16) M::flash_rows_kernel<QO16, 32><<<C, T32, 0, s>>>(a);
-    else if (ob16 && keys == 16) M::flash_rows_kernel<O16, 16><<<C, T16, 0, s>>>(a);
-    else if (ob16) M::flash_rows_kernel<O16, 32><<<C, T32, 0, s>>>(a);
-    else if (q16 && keys == 16) M::flash_rows_kernel<GlmMlaFlashQ16Policy, 16><<<C, T16, 0, s>>>(a);
-    else if (q16) M::flash_rows_kernel<GlmMlaFlashQ16Policy, 32><<<C, T32, 0, s>>>(a);
-    else if (keys == 16) M::flash_rows_kernel<GlmMlaFlashPolicy, 16><<<C, T16, 0, s>>>(a);
-    else M::flash_rows_kernel<GlmMlaFlashPolicy, 32><<<C, T32, 0, s>>>(a);
+    if (ob16 && q16 && keys == 16) M::launch_flash_rows<QO16, 16>(a, C, s);
+    else if (ob16 && q16) M::launch_flash_rows<QO16, 32>(a, C, s);
+    else if (ob16 && keys == 16) M::launch_flash_rows<O16, 16>(a, C, s);
+    else if (ob16) M::launch_flash_rows<O16, 32>(a, C, s);
+    else if (q16 && keys == 16) M::launch_flash_rows<GlmMlaFlashQ16Policy, 16>(a, C, s);
+    else if (q16) M::launch_flash_rows<GlmMlaFlashQ16Policy, 32>(a, C, s);
+    else if (keys == 16) M::launch_flash_rows<GlmMlaFlashPolicy, 16>(a, C, s);
+    else M::launch_flash_rows<GlmMlaFlashPolicy, 32>(a, C, s);
     ok(hipGetLastError(), "glm pf mla flash (attn-wmma)");
     attn_wmma::calls.fetch_add(1, std::memory_order_relaxed);
 }

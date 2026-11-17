@@ -6,14 +6,17 @@
 #pragma once
 
 #include "strix/env_flags.hpp"
+#include "strix/cuda/core/decode_rows.hpp"
 #include "strix/cuda/qwen_cohort_plan.hpp"
 #include "strix/cuda/qwen_prefill.hpp"
 #include "strix/mtp_context_draft.hpp"
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -56,14 +59,20 @@ struct ContextDraft {
     double mtp_expected = -1.0;    // accepted drafts per MTP (not copy-first) step, EMA 0.75/0.25 (as the HIP runtime)
     bool copy_first = false;       // this step's rows came from the context, no predictor forward
     bool deliver_extension = true;  // first: context rows only as copy-first windows; extensions are scored, never verified
+    bool copy_edit = false;         // copy / first: long-anchor spans (copy-first, wide copy windows)
     std::uint64_t copy_first_steps = 0, extended_steps = 0, context_rows = 0, context_accepted = 0;
+    std::uint64_t wide_steps = 0, wide_rows = 0, wide_accepted = 0;  // copy windows of 9..16 rows (subset of copy_first_steps)
     double host_us = 0.0;           // host time in the drafter (proposals + learning)
+    // live per-position draft acceptance of this session (both drafters): EMA (0.9) of accepted draft rows and of their
+    // trials (accepted + 1 when a verified draft was rejected); p = accept_s / accept_t. Feeds the marginal rule.
+    double accept_s = 0.0, accept_t = 0.0;
     static MtpContextDraftConfig config(ContextMode m) {
         MtpContextDraftConfig c;
         c.copy_edit = m == ContextMode::copy || m == ContextMode::first;
         return c;
     }
-    explicit ContextDraft(ContextMode m) : drafter(config(m)), deliver_extension(m != ContextMode::first) {}
+    ContextMode mode = ContextMode::off;
+    explicit ContextDraft(ContextMode m) : drafter(config(m)), deliver_extension(m != ContextMode::first), copy_edit(config(m).copy_edit), mode(m) {}
 };
 
 struct Stream {
@@ -72,11 +81,15 @@ struct Stream {
     std::uint64_t position = 0;
     std::uint32_t depth_max = 0;  // per-request draft cap (0: the step's depth)
     ContextDraft* context = nullptr;  // borrowed; null = MTP drafts only
+    std::uint32_t copy_rows = 0;      // per-request wide copy window rows (0: the step's; request field "copy_rows")
 };
 
 inline std::uint32_t window_rows_default() {
     static const std::uint32_t rows = [] {
         const char* v = std::getenv("STRIX_QRTX_WINDOW_ROWS");
+        // default 8. STRIX_QRTX_WINDOW_ROWS=16 (with the backend's 9..16-row decode pieces) lets the marginal rule widen on
+        // the live acceptance; not default yet: process-level C4/C8 arms were noisier than the effect
+        // (edit C1, budget-independent, moved 10 %), an in-process per-request budget A/B is the pending receipt
         const long n = v ? std::strtol(v, nullptr, 10) : static_cast<long>(kWindowRows);
         return static_cast<std::uint32_t>(std::clamp<long>(n, 1, static_cast<long>(kMaxWindowRows)));
     }();
@@ -98,13 +111,17 @@ struct StepOptions {
     int draft_batch = -1;
     // budget above 8: -1 = the marginal rule unless STRIX_QRTX_WIDE_RULE=0; 0 = the budget as given (gates); 1 = the rule
     int wide_rule = -1;
+    // wide copy windows of a lone session: rows (0 = copy_rows_default(); <= 8 = off), minimum learned copy acceptance
+    // (< 0 = copy_wide_accept_default())
+    std::uint32_t copy_rows = 0;
+    double copy_wide_accept = -1.0;
 };
 // The marginal rule's model (cuda_qwen_cohort_plan.hpp, choose_budget): STRIX_QRTX_WIDE_MS (cost of a 9..16-row window),
 // STRIX_QRTX_WIDE_ACCEPT (acceptance per draft position), STRIX_QRTX_WIDE_A_MS / _B_MS (<= 8-row cost a + b * rows),
 // STRIX_QRTX_WIDE_GAIN (minimum gain); STRIX_QRTX_WIDE_RULE=0 takes the budget as given (the c10-c12 behaviour).
 inline const WideModel& wide_model() {
     static const WideModel m = [] {
-        WideModel w;
+        WideModel w = wide_measured(strix::cuda::core::decode_rows_max());
         const auto rd = [](const char* name, double& v) { if (const char* s = std::getenv(name); s && s[0]) v = std::strtod(s, nullptr); };
         rd("STRIX_QRTX_WIDE_MS", w.wide_ms);
         rd("STRIX_QRTX_WIDE_ACCEPT", w.accept);
@@ -115,6 +132,55 @@ inline const WideModel& wide_model() {
     }();
     return m;
 }
+// Wide copy windows: a session alone in its step whose context holds a long unanimous anchor (the shared drafter's
+// propose_wide: suffix >= copy_anchor, every earlier occurrence continuing alike, no known edit inside, learned copy
+// acceptance cells >= copy_wide_accept) verifies copy_rows - 1 context rows in ONE window of copy_rows (9..16) rows on
+// the prefill-shaped families, and commits at the first rejected row (the engine's exact rollback). Wide serial
+// equality gate: qwen_decode_e2e STRIX_QWEN_TMAX=16 (G >= 137) plus MTP cache validation. Otherwise the
+// narrow copy-first / MTP window as before. STRIX_QRTX_COPY_ROWS (<= 8 = off), STRIX_QRTX_COPY_WIDE_ACCEPT.
+inline std::uint32_t copy_rows_default() {
+    static const std::uint32_t rows = [] {
+        const char* v = strix::envcfg::text("STRIX_QRTX_COPY_ROWS");
+        const long n = v ? std::strtol(v, nullptr, 10) : 16L;
+        return static_cast<std::uint32_t>(std::clamp<long>(n, 1, static_cast<long>(kMaxWindowRows)));
+    }();
+    return rows;
+}
+inline double copy_wide_accept_default() {
+    static const double p = [] {
+        const char* v = strix::envcfg::text("STRIX_QRTX_COPY_WIDE_ACCEPT");
+        const double x = v ? std::strtod(v, nullptr) : 0.9;
+        return std::isfinite(x) ? std::clamp(x, 0.0, 1.0) : 0.9;
+    }();
+    return p;
+}
+// The wide copy window's decision (auto): it turns on only when a fully accepted wide window delivers more tokens per
+// ms than a fully accepted 8-row window (the narrow copy-first window it replaces), from the measured window costs of
+// one session. sm_120 RTX PRO 6000 (qwen_decode_bench): 9.65 ms at 1 row, +1.1 ms per row to 17.2 ms at 8
+// rows, 62.5 ms flat for 9..16 rows (prefill-shaped families) -> 16 / 62.5 = 0.26 vs 8 / 17.2 = 0.46 tokens/ms: off
+// (served edit C1 -29 %, 3 ABAB pairs). Costs require manual recalibration after kernel changes; other devices need
+// separate qualification. A calibrated wide cost under ~34 ms enables auto (STRIX_QRTX_COPY_WIDE_MS). With the
+// backend's 9..16-row decode pieces (core::decode_rows_max() 16, the default) the calibrated sm_120 wide cost is 29.2 ms
+// -> 16 / 29.2 = 0.55 tokens/ms: on at 16 rows (copy_wide_measured, by cap).
+// STRIX_QRTX_COPY_WIDE=1 forces it on, 0 off; the request field copy_rows
+// forces the rows of one request (measurement).
+inline const CopyWideModel& copy_wide_model() {
+    static const CopyWideModel m = [] {
+        CopyWideModel w = copy_wide_measured(strix::cuda::core::decode_rows_max());
+        w.wide_ms = strix::envcfg::number<double>("STRIX_QRTX_COPY_WIDE_MS", w.wide_ms, std::numeric_limits<double>::min());
+        return w;
+    }();
+    return m;
+}
+// -1 auto (copy_wide_pays), 0 off, 1 on
+inline int copy_wide_switch() {
+    static const int v = [] {
+        const char* s = strix::envcfg::text("STRIX_QRTX_COPY_WIDE");
+        if (!s || !s[0] || std::string(s) == "auto") return -1;
+        return s[0] == '0' ? 0 : 1;
+    }();
+    return v;
+}
 inline bool wide_rule_default() {
     static const bool on = strix::envcfg::flag("STRIX_QRTX_WIDE_RULE", true);
     return on;
@@ -124,6 +190,18 @@ inline bool draft_batch_default() {
     return on;
 }
 
+// Mean live per-position acceptance of the step's sessions (ContextDraft accept_s / accept_t); -1 when a session has no
+// context drafter or fewer than 4 trials of history, or when STRIX_QRTX_WIDE_ACCEPT fixes the model's value.
+template <class Streams> double live_accept(const Streams& streams) {
+    static const bool fixed = strix::envcfg::text("STRIX_QRTX_WIDE_ACCEPT") != nullptr;
+    if (fixed || streams.empty()) return -1.0;
+    double sum = 0.0;
+    for (const auto& st : streams) {
+        if (!st.context || st.context->accept_t < 4.0) return -1.0;
+        sum += st.context->accept_s / st.context->accept_t;
+    }
+    return sum / static_cast<double>(streams.size());
+}
 struct StreamStep {
     std::vector<std::uint32_t> tokens;   // the verified tokens of this step (argmax of the kept rows), >= 1
     std::vector<float> logits;           // [tokens][vocab] when StepOptions::want_logits
@@ -158,7 +236,11 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
     const auto n = static_cast<std::uint32_t>(streams.size());
     // above 8 rows only when the marginal rule says the wider windows pay (packing only: every session's tokens are
     // the same either way)
-    if (o.budget > kWindowRows && (o.wide_rule < 0 ? wide_rule_default() : o.wide_rule != 0)) o.budget = choose_budget(n, o.mtp ? o.depth : 0U, o.policy, o.budget, wide_model());
+    if (o.budget > kWindowRows && (o.wide_rule < 0 ? wide_rule_default() : o.wide_rule != 0)) {
+        WideModel m = wide_model();
+        if (const double p = live_accept(streams); p >= 0.0) m.accept = p;
+        o.budget = choose_budget(n, o.mtp ? o.depth : 0U, o.policy, o.budget, m);
+    }
     std::vector<StreamStep> out(n);
     std::vector<std::vector<std::uint32_t>> rows(n);
     std::vector<std::uint32_t> want(n);
@@ -183,6 +265,9 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
     // copy-first: a gated context span replaces this stream's MTP chain (no predictor forward)
     std::vector<std::uint32_t> room(n, 0);
     std::vector<std::vector<std::uint32_t>> copy(n);
+    const std::uint32_t copy_rows = std::min(o.copy_rows ? o.copy_rows : copy_rows_default(), kMaxWindowRows);
+    const double wide_accept = o.copy_wide_accept < 0.0 ? copy_wide_accept_default() : std::min(o.copy_wide_accept, 1.0);
+    std::uint32_t pack_budget = o.budget;  // a wide copy window widens the (single) window of this step
     for (std::uint32_t i = 0; i < n; ++i) {
         room[i] = requests[i].depth;
         auto* c = streams[i].context;
@@ -195,9 +280,22 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
             // The shared zero-room cycle initializes history without building proposals.
             (void)c->drafter.begin_cycle(streams[i].pending, {}, 0, 0, acceptance, o.min_p);
         } else {
-            copy[i] = c->drafter.begin_copy_cycle(streams[i].pending, room[i], acceptance, o.min_p, c->mtp_expected);
+            bool wide = false;
+            const std::uint32_t wide_rows = streams[i].copy_rows ? std::min(streams[i].copy_rows, kMaxWindowRows) : copy_rows;
+            const int sw = copy_wide_switch();
+            const bool wide_on = streams[i].copy_rows ? streams[i].copy_rows > kWindowRows
+                : sw < 0 ? copy_wide_pays(wide_rows, copy_wide_model()) : sw == 1;
+            if (n == 1 && wide_on && wide_rows > kWindowRows && c->copy_edit) {
+                copy[i] = c->drafter.propose_wide(streams[i].pending, wide_rows - 1U, wide_accept);
+                wide = !copy[i].empty();
+            }
+            if (wide) {
+                pack_budget = std::max<std::uint32_t>(pack_budget, static_cast<std::uint32_t>(copy[i].size()) + 1U);
+            } else {
+                copy[i] = c->drafter.begin_copy_cycle(streams[i].pending, room[i], acceptance, o.min_p, c->mtp_expected);
+                if (copy[i].size() > room[i]) copy[i].resize(room[i]);
+            }
         }
-        if (copy[i].size() > room[i]) copy[i].resize(room[i]);
         if (!copy[i].empty()) { c->copy_first = true; requests[i].depth = 0; }
         c->host_us += std::chrono::duration<double, std::micro>(Clock::now() - h0).count();
     }
@@ -265,6 +363,13 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
         ++windows_run;
         rows_run += total;
         const auto r = p.verify_cohort(cohort, o.want_logits);
+        for (const auto& e : entries) {
+            auto* c = streams[e.index].context;
+            if (c && c->copy_first && e.rows > kWindowRows) {
+                ++c->wide_steps;
+                c->wide_rows += e.rows - 1U;
+            }
+        }
         bool all_ok = true;
         for (const auto& x : r) all_ok = all_ok && x.ok;
         if (!all_ok) {
@@ -303,7 +408,7 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
         }
         return true;
     };
-    for (const auto& w : pack(want, o.budget)) {
+    for (const auto& w : pack(want, pack_budget)) {
         if (run_window(w.entries, w.entries.size() > 1)) continue;
         if (w.entries.size() == 1) continue;  // already marked failed
         for (const auto& e : w.entries) {     // isolation: each session alone
@@ -319,7 +424,14 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
         const auto h0 = Clock::now();
         c->drafter.finish_cycle(out[i].tokens, verified, accepted);
         c->host_us += std::chrono::duration<double, std::micro>(Clock::now() - h0).count();
-        if (c->copy_first) c->context_accepted += accepted;
+        if (verified > 0) {
+            c->accept_s = 0.9 * c->accept_s + static_cast<double>(accepted);
+            c->accept_t = 0.9 * c->accept_t + static_cast<double>(accepted + (accepted < verified ? 1U : 0U));
+        }
+        if (c->copy_first) {
+            c->context_accepted += accepted;
+            if (out[i].rows > kWindowRows) c->wide_accepted += accepted;
+        }
         else if (room[i] > 0) c->mtp_expected = c->mtp_expected < 0.0 ? static_cast<double>(out[i].mtp_accepted) : 0.75 * c->mtp_expected + 0.25 * static_cast<double>(out[i].mtp_accepted);
     }
     if (timing) {

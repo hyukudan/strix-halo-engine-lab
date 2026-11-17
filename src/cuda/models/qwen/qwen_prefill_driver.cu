@@ -74,7 +74,8 @@ void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
 }
 
-constexpr std::uint32_t kMaxStepRows = 8;    // rows of one session in a window (1 + up to 7 drafts); sessions per window
+constexpr std::uint32_t kMaxStepRows = 8;    // draft chain rows (1 + up to 7 drafts); sessions per window. A session's
+                                             // window rows go up to kMaxWindowRows (copy windows of 9..16 rows)
 constexpr std::uint32_t kMaxWindowRows = 16; // rows of a whole cohort window (9..16: the row-independent families run on the
                                              // exact prefill-shaped kernels over 16 padded rows, as a prefill block)
 constexpr std::uint32_t kLayers = 48, kHidden = 2560, kWide = 10240, kTopK = 10, kExperts = 512;
@@ -757,8 +758,8 @@ void Prefill::Impl::upload_draft() {
     bd_logits = dev_alloc<float>(std::uint64_t{kMaxStepRows} * ids.size(), "batched draft logits");
     bd_token = dev_alloc<std::uint32_t>(kMaxStepRows, "batched draft tokens");
     bd_sel = dev_alloc<std::uint32_t>(2ULL * kMaxStepRows * kMaxStepRows, "batched draft selections");
-    teacher_hidden = dev_alloc<std::uint16_t>((kMaxStepRows + 1) * kWide, "teacher hidden");
-    teacher_next = dev_alloc<std::uint32_t>(kMaxStepRows + 1, "teacher next");
+    teacher_hidden = dev_alloc<std::uint16_t>((kMaxWindowRows + 1) * kWide, "teacher hidden");
+    teacher_next = dev_alloc<std::uint32_t>(kMaxWindowRows + 1, "teacher next");
     ck(cudaStreamSynchronize(stream), "draft upload");
 }
 
@@ -1911,8 +1912,11 @@ void Prefill::Impl::commit_one(SessionState& s, std::uint32_t keep) {
         if (keep > 1)
             ck(cudaMemcpyAsync(teacher_hidden + kWide, tap + off * kWide, (keep - 1) * wb, cudaMemcpyDeviceToDevice, stream), "teacher taps");
         ck(cudaMemcpyAsync(teacher_next, s.window_tokens.data(), std::uint64_t{keep} * 4, cudaMemcpyHostToDevice, stream), "teacher next");
-        pm::launch_mtp_cache_rows(mtp_weights(), pm::MtpRounding{}, teacher_hidden, teacher_next, keep, s.window_position - 1,
-            s.mtp_kv, s.mtp_index, mtp_ws, mtp_status, tables, stream);
+        // in pieces of <= 8 rows: the decode-shaped cache-row kernels (rows <= 8) at every keep, so a 9..16-row copy
+        // window writes the same MTP cache bits as two narrow windows (the rows are independent: one position each)
+        for (std::uint32_t r0 = 0; r0 < keep; r0 += 8U)
+            pm::launch_mtp_cache_rows(mtp_weights(), pm::MtpRounding{}, teacher_hidden + std::uint64_t{r0} * kWide, teacher_next + r0,
+                std::min(8U, keep - r0), s.window_position - 1 + r0, s.mtp_kv, s.mtp_index, mtp_ws, mtp_status, tables, stream);
         s.mtp_pooled_valid = std::min<std::uint32_t>(s.mtp_pooled_valid, static_cast<std::uint32_t>((s.window_position - 1) / 4));
         ck(cudaMemcpyAsync(s.held, tap + (off + keep - 1) * kWide, wb, cudaMemcpyDeviceToDevice, stream), "held");
     }
@@ -2065,7 +2069,7 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
         if (s.length == 0) throw std::logic_error("verify(): session " + std::to_string(s.id) + " has no prefilled state");
         if (c.position != s.length)
             throw std::invalid_argument("verify(): position " + std::to_string(c.position) + " != session length " + std::to_string(s.length));
-        if (c.rows == 0 || c.rows > kMaxStepRows) throw std::invalid_argument("step rows out of range");
+        if (c.rows == 0 || c.rows > kMaxWindowRows) throw std::invalid_argument("step rows out of range");
         if (c.position + c.rows > s.capacity) throw std::invalid_argument("step beyond the session's capacity");
         if (!s.gdn_base || (s.gdn_state != s.gdn_base && s.gdn_other != s.gdn_base))
             throw std::logic_error("decode graphs: GDN buffer parity lost");
