@@ -696,7 +696,7 @@ struct Engine::Impl {
     unsigned pf_msa_flash = 0;
     // its layers: the q finish writes q's BF16 image after norm + RoPE for the flash core's query_op (bitwise, half
     // the q bytes); default on, STRIX_MM_PF_MSA_Q16=0 keeps the FP32 q and the flash prologue
-    bool pf_msa_q16 = strix::envcfg::flag("STRIX_MM_PF_MSA_Q16", true, strix::EnvFlagMatch::exact);
+    bool pf_msa_q16 = true;  // read after defaults::apply(), including baseline and explicit overrides
     std::string pf_msa_flash_asked = "default";  // receipt: "default", the explicit value or "fast_prefill"
     strix::core::LayerSet pf_msa_flash_layers;  // STRIX_MM_PF_MSA_FLASH_LAYERS: layers that use it (unset: defaults::kMsaFlashLayers)
     // STRIX_MM_PF_IDX_WMMA=1 (minimax-index-proj-wmma-v1): prefill index projections (rows > 8) of the layers in
@@ -881,6 +881,7 @@ struct Engine::Impl {
         // Defaults-on resolver first (mm_defaults.hpp): every default-ON item's value (or its off value under
         // STRIX_MM_BASELINE=1) is in the environment before any switch below is read. The apps call it at start-up.
         defaults::apply();
+        pf_msa_q16 = strix::envcfg::flag("STRIX_MM_PF_MSA_Q16", true, strix::EnvFlagMatch::exact);
         // Per-site linear schedule (v8/v9/v10) stays OFF until an engine-level ABA shows it never
         // slower (measurement inconclusive): linear v4. Wide expert kernels at N2-4 only (form 2) ON: measured processes
         // W0/W2 alternated with pinned cable weights, rows == alone, N2 -3.0..-3.5 %, N4 -4..-6 %, N1/N8 the same
