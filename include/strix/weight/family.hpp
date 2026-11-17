@@ -13,6 +13,8 @@ struct FamilyPlanInputs {
     Exactness permission = Exactness::legacy_bitwise;
     bool allow_fast = false;
     const char* measured_decisions_override = nullptr;
+    // Verified identity of the current executable; zero keeps incumbent-only planning.
+    Digest256 build_identity{};
 };
 struct FamilyPlans {
     WeightMap weights;

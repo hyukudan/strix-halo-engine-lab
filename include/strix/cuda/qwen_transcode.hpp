@@ -11,7 +11,8 @@ namespace strix::cuda::transcode {
 
 [[nodiscard]] bool supported(std::uint32_t ggml_type);
 [[nodiscard]] std::uint64_t q8_0_bytes(std::uint64_t elements);
-// src/dst device pointers; elements a multiple of 32 (rows are whole blocks, so the tensor is a flat run of groups).
+// src/dst device pointers; Q8_0 dst is two-byte aligned (as are cudaMalloc allocations).
+// elements is a multiple of 32 (rows are whole blocks, so the tensor is a flat run of groups).
 void to_q8_0(const void* src, std::uint32_t ggml_type, std::uint64_t elements, void* dst, cudaStream_t stream);
 void to_f32(const void* src, std::uint32_t ggml_type, std::uint64_t elements, float* dst, cudaStream_t stream);
 
