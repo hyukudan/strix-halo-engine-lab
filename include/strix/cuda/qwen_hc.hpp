@@ -62,7 +62,14 @@ struct HcMixArgs {
     HcWorkspaceLayout workspace_layout = HcWorkspaceLayout::full;
 };
 // One host admission decision, shared by all producers and consumers (including MMA).
-inline bool hc_compact_workspace(const HcMixArgs& a, unsigned stages, bool enabled, bool decode_rows) {
+// rows_cap: the largest row count hc_mix runs on its rows forms (core::decode_rows_max() with the rows split on, else 8). Those
+// forms need the full layout, so an exact automatic call at or below it is never compact (compact sent 9..16-row windows to the
+// tiled prefill kernels: 6 + 20 CTAs on the whole GPU). exact_full (lever qwen_hc_exact_full_workspace): exact automatic calls keep
+// the full layout; the compact rebuild adds ALU work to latency-bound kernels (sm_120 fixture, 8076 rows: mix 4.045 ms full vs
+// 4.227 compact per site, same output / injection / low hashes). The FAST (mma) forms keep the compact admission.
+// Defaults (8, false) are the admission before these two rules.
+inline bool hc_compact_workspace(const HcMixArgs& a, unsigned stages, bool enabled, bool decode_rows, unsigned rows_cap = 8U,
+                                 bool exact_full = false) {
     if (a.workspace_layout == HcWorkspaceLayout::full) return false;
     const bool eligible = !a.gates && a.input && a.norm &&
         (reinterpret_cast<std::uintptr_t>(a.input) & 7U) == 0U &&
@@ -72,7 +79,10 @@ inline bool hc_compact_workspace(const HcMixArgs& a, unsigned stages, bool enabl
         return true;  // explicit staged format, independent of automatic policy
     }
     if (stages != 15U) throw std::invalid_argument("qwen_hc automatic workspace requires all stages");
-    return enabled && eligible && (a.mma || a.rows > 8U || !decode_rows);
+    if (!enabled || !eligible) return false;
+    if (a.mma) return true;
+    if (exact_full) return false;
+    return a.rows > rows_cap || !decode_rows;
 }
 // rows_prepare_hyper_norm + wide2_splitk_hyper_projection<8,Vopd> + wide2_hyper_output<u16,32,RowsFirst> (3 launches).
 // stages (test/timing seam): bit 0 norm, bit 1 projection, bit 2 output (gates), bit 3 split epilogue alone.

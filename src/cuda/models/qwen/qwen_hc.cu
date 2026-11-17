@@ -64,6 +64,15 @@ bool hc_compact_norm_enabled() {
     static const bool on = strix::lever::select(hc_compact_norm_lever, {}).on;
     return on;
 }
+// STRIX_QRTX_HC_EXACT_FULL=0: exact automatic calls above the rows-form cap use the compact layout again (the admission before
+// this lever). Bitwise: layout only (hc_compact_workspace in qwen_hc.hpp).
+inline constexpr strix::lever::Decl hc_exact_full_lever{
+    .name = "qwen_hc_exact_full_workspace", .env = "STRIX_QRTX_HC_EXACT_FULL", .exactness = strix::lever::Exactness::bitwise,
+    .default_on = true, .source = "wave4 rtx_integ t1b hc fixture, sm_120 8076 rows: full mix 4.045 ms vs compact 4.227, hashes equal"};
+bool hc_exact_full_enabled() {
+    static const bool on = strix::lever::select(hc_exact_full_lever, {}).on;
+    return on;
+}
 // STRIX_QRTX_HC_INJECT_VEC=0: the scalar inject kernel (one element per thread). Bitwise.
 inline constexpr strix::lever::Decl hc_inject_vec_lever{
     .name = "qwen_hc_inject_vec", .env = "STRIX_QRTX_HC_INJECT_VEC", .exactness = strix::lever::Exactness::bitwise,
@@ -1679,7 +1688,10 @@ template <unsigned R> void route_rows_r(const std::uint16_t* hidden, const float
 void hc_mix(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream, unsigned stages) {
     if (!a.rows) return;
     if (a.rows > 65535U * kProjRows) throw std::invalid_argument("qwen_hc mix: too many rows");
-    const bool compact = hc_compact_workspace(a, stages, hc_compact_norm_enabled(), decode_rows_enabled());
+    // rows_cap = the rows_form bound below: an exact automatic call that the rows forms can take is never made compact.
+    const unsigned rows_cap = hc_rows_split_enabled() ? core::decode_rows_max() : 8U;
+    const bool compact = hc_compact_workspace(a, stages, hc_compact_norm_enabled(), decode_rows_enabled(), rows_cap,
+        hc_exact_full_enabled());
     if ((stages & 1U) && compact) hc_norm_kernel<true><<<dim3(a.rows, kStreams), 256U, 0, stream>>>(a.input, a.norm, a.epsilon, a.normalized, tables);
     else if (stages & 1U) hc_norm_kernel<<<dim3(a.rows, kStreams), 256U, 0, stream>>>(a.input, a.norm, a.epsilon, a.normalized, tables);
     check(cudaGetLastError(), "norm launch");
