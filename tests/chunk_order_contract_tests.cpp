@@ -124,6 +124,27 @@ void chunk_invariance() {
                 "1..17-row call changed bits");
     }
 }
+// Dense q/k/v/o (per rank: 6144 -> 4096 / 256 / 256, 4096 -> 6144): the fixed contract takes no rows; the adaptive
+// library split (route::gemm_splits) moves with the rows of a chunk (control). The engine keeps strix_gemm only where
+// its split equals the fixed one (> 8 rows, S = 1), so the effective K chain is the same for every row count.
+void dense_contract() {
+    struct M { unsigned in, out; };
+    const M mats[] = {{kHidden, 4096}, {kHidden, 256}, {4096, kHidden}};
+    const unsigned rows[] = {1, 8, 9, 16, 17, 48, 49, 96, 97, 255, 256, 257, 1024, 4095, 4096, 4097, 8192};
+    bool adaptive_moves = false;
+    for (const M& m : mats)
+        for (unsigned bits : {3U, 4U, 5U, 6U}) {
+            const auto fixed = strix::core::fixed_linear_contract(static_cast<int>(m.in), 1);
+            require(fixed.splits == 1 && fixed.k16 == static_cast<int>(m.in / 16), "dense fixed contract shape");
+            const unsigned whole = route::gemm_splits(m.in, m.out, bits, 4096);
+            for (unsigned r : rows) {
+                const unsigned lib = route::gemm_splits(m.in, m.out, bits, r);
+                adaptive_moves |= lib != whole;
+                // Actual engine admission/fallback is exercised by tests/minimax_route_host, not inferred from S here.
+            }
+        }
+    require(adaptive_moves, "negative control: adaptive dense split should depend on the rows of a chunk");
+}
 } // namespace
 
 int main() {
@@ -138,6 +159,7 @@ int main() {
         require(invalid, "invalid mode must be rejected");
         contract_shape();
         chunk_invariance();
+        dense_contract();
         std::cout << "chunk order contract: PASS\n";
         return 0;
     } catch (const std::exception& e) {

@@ -2755,6 +2755,103 @@ struct Bench {
             }
         }
     }
+    // Dense v4 chunk invariance (STRIX_MMX_PF_ORDER=invariant binds core::fixed_linear_contract): every group's output over
+    // T rows computed whole == computed in segments of 256 / 1024 / 4096 rows, 4096 + 1..17 tails and 1..17-row calls,
+    // bitwise; the adaptive control (gemm_splits by rows) must differ in some chunking. Where the library's split equals the fixed
+    // one (> 8 rows, S = 1) the invariant v4 output also equals strix_gemm (the engine keeps the library there).
+    void run_dense_segments(const std::vector<DenseSite*>& g, const float* in, const std::vector<float*>& outs, unsigned T,
+                            unsigned seg, void* ws) {
+        for (unsigned r0 = 0; r0 < T; r0 += seg) {
+            const unsigned n = std::min(seg, T - r0);
+            std::vector<opt::PrefillDenseJob> jobs;
+            for (std::size_t i = 0; i < g.size(); ++i)
+                jobs.push_back({g[i]->copies[0].dev, outs[i] + std::size_t{r0} * g[i]->output});
+            const std::size_t bytes = dense_v4_bytes(g, n);
+            opt::enqueue_prefill_dense(jobs.data(), static_cast<unsigned>(jobs.size()), in + std::size_t{r0} * g[0]->input, n,
+                                       ws, bytes, nullptr);
+        }
+        hip_ok(hipDeviceSynchronize(), "dense segments");
+    }
+    void test_prefill_dense_chunk_invariance() {
+        struct Restore { ~Restore() { opt::set_prefill_moe_order(-1); } } restore;
+        struct Case { unsigned T; std::vector<unsigned> segs; };
+        std::vector<Case> cases = {{8192, {256, 1024, 4096}}};
+        for (unsigned t = 1; t <= 17; ++t) cases.push_back({4096 + t, {4096}});
+        for (unsigned t = 1; t <= 17; ++t) cases.push_back({t, {1}});
+        for (const auto& g : dense_v4_groups()) {
+            const unsigned K = g[0]->input;
+            std::size_t ws_bytes = 0;
+            for (int order : {0, 1}) {
+                opt::set_prefill_moe_order(order);
+                ws_bytes = std::max(ws_bytes, dense_v4_bytes(g, 8192));
+                for (unsigned n : {256U, 1024U, 4096U}) ws_bytes = std::max(ws_bytes, dense_v4_bytes(g, n));
+            }
+            void* ws = nullptr;
+            hip_ok(hipMalloc(&ws, ws_bytes), "dense ws");
+            unsigned pass = 0, cells = 0, lib_same = 0, lib_cells = 0, control_cases = 0;
+            for (const Case& k : cases) {
+                std::vector<float> hin(std::size_t{k.T} * K);
+                std::normal_distribution<float> nd(0.0F, 1.0F);
+                for (auto& x : hin) x = nd(rng);
+                float* in = dupload(hin);
+                std::vector<float*> whole, part;
+                for (auto* ds : g) {
+                    whole.push_back(dalloc<float>(std::size_t{k.T} * ds->output));
+                    part.push_back(dalloc<float>(std::size_t{k.T} * ds->output));
+                }
+                bool control_differs = false;
+                for (int order : {1, 0}) {
+                    opt::set_prefill_moe_order(order);
+                    for (std::size_t i = 0; i < g.size(); ++i) hip_ok(hipMemset(whole[i], 0xff, std::size_t{k.T} * g[i]->output * 4), "poison");
+                    run_dense_segments(g, in, whole, k.T, k.T, ws);
+                    for (unsigned seg : k.segs) {
+                        for (std::size_t i = 0; i < g.size(); ++i) hip_ok(hipMemset(part[i], 0xff, std::size_t{k.T} * g[i]->output * 4), "poison");
+                        run_dense_segments(g, in, part, k.T, seg, ws);
+                        bool same = true;
+                        std::size_t at = 0;
+                        for (std::size_t i = 0; i < g.size() && same; ++i)
+                            same = same_bits(d2h(whole[i], std::size_t{k.T} * g[i]->output), d2h(part[i], std::size_t{k.T} * g[i]->output), &at);
+                        if (order == 1) {
+                            check(same, "dense chunk invariance " + group_name(g) + " T=" + std::to_string(k.T) + " seg=" +
+                                            std::to_string(seg) + " differs at " + std::to_string(at));
+                            pass += same ? 1U : 0U;
+                            ++cells;
+                        } else {
+                            control_differs |= !same;
+                        }
+                    }
+                    if (order == 1 && (k.T == 8192 || k.T == 4097 || k.T == 9 || k.T == 17)) {
+                        // Library cross-check where the engine keeps strix_gemm under the invariant order.
+                        bool off = false;
+                        for (auto* ds : g) off |= k.T <= 8 || opt::gemm_splits(ds->input, ds->output, ds->copies[0].dev.bits, k.T) != 1U;
+                        if (!off) {
+                            ++lib_cells;
+                            bool same = true;
+                            for (std::size_t i = 0; i < g.size(); ++i) {
+                                hip_ok(hipMemset(part[i], 0xff, std::size_t{k.T} * g[i]->output * 4), "poison");
+                                lib.gemm_wmma(g[i]->copies[0].lib, g[i]->input, g[i]->output, in, part[i], k.T);
+                            }
+                            hip_ok(hipDeviceSynchronize(), "lib sync");
+                            for (std::size_t i = 0; i < g.size(); ++i)
+                                same = same && same_bits(d2h(whole[i], std::size_t{k.T} * g[i]->output), d2h(part[i], std::size_t{k.T} * g[i]->output));
+                            check(same, "invariant v4 != strix_gemm where the library split is 1: " + group_name(g) + " T=" + std::to_string(k.T));
+                            lib_same += same ? 1U : 0U;
+                        }
+                    }
+                }
+                if (control_differs) ++control_cases;
+                hip_ok(hipFree(in), "free");
+                for (auto* x : whole) hip_ok(hipFree(x), "free");
+                for (auto* x : part) hip_ok(hipFree(x), "free");
+            }
+            // Adaptive control: some chunking must differ (q / o: only the short calls, where the library split is > 1).
+            check(control_cases > 0, "dense negative control: adaptive split should change bits in some chunking " + group_name(g));
+            std::printf("dense chunk invariance %s invariant: %u/%u bitwise; library == invariant v4 %u/%u; adaptive control "
+                        "differs in %u/%zu cases\n", group_name(g).c_str(), pass, cells, lib_same, lib_cells, control_cases, cases.size());
+            std::fflush(stdout);
+            hip_ok(hipFree(ws), "free");
+        }
+    }
     void bench_prefill_dense() {
         struct RestoreBand { ~RestoreBand() { opt::set_prefill_dense_band(-1); } } restore_band;
         for (unsigned T : {1024U, 4096U}) {
@@ -3515,6 +3612,7 @@ int main(int argc, char** argv) {
             if (!o.no_moe) test_section("test_prefill_table_ring", [&] { b.test_prefill_table_ring(); });
             if (!o.no_moe) test_section("test_prefill_gather", [&] { b.test_prefill_gather(); });
             test_section("test_prefill_dense", [&] { b.test_prefill_dense(); });
+            test_section("test_prefill_dense_chunk_invariance", [&] { b.test_prefill_dense_chunk_invariance(); });
             if (g_fail == 0) std::printf("TESTS PASS\n");
             else std::printf("TESTS FAIL (%d failures)\n", g_fail);
             std::fflush(stdout);

@@ -3,6 +3,7 @@
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/session/embed_splice.hpp"
 #include "strix/serve/prefill_group.hpp"
+#include "strix/prefill_dense_plan.hpp"
 
 #include <cstdint>
 #include <cstring>
@@ -365,12 +366,36 @@ public:
     // The route class a fresh sequence of `rows` rows takes ALONE: every row-count threshold of the run that can change
     // the bits (kernel / split / joint selection) evaluated on these rows. Prompts group only within one class (serve::
     // plan_prefill_group, R1), and run_group forces that class instead of re-selecting it from the summed rows.
+    // Bits 0-1: row split / joint MoE; bits 8 and up: the member's dense route class (the interned arithmetic signature of
+    // its route plan, dense_plan(rows); 0..255 for 1..group_rows rows, kSoloRouteClass when it cannot be represented).
     [[nodiscard]] std::uint32_t route_class(std::uint32_t rows) const noexcept;
+    static constexpr std::uint32_t kSoloRouteClass = 0x80000000U;  // a class no other prompt shares (stays solo)
+    // The dense route of every projection site (both ranks, every layer) of a fresh solo run of `rows` rows: the shared
+    // descriptor of the group pass and the bounded decoder replay (strix/ds41_dense_plan.hpp).
+    // Throws std::invalid_argument when rows exceeds a nonzero chunk_rows; multi-chunk runs are not represented.
+    [[nodiscard]] prefill_plan::DensePlan dense_plan(std::uint32_t rows) const;
     [[nodiscard]] serve::PrefillGroupCapacity group_capacity() const noexcept;
-    [[nodiscard]] static bool group_options_supported(const PrefillOptions& o) noexcept {
-        return !(o.fp16_dense || o.bf16_attention || o.fast_attention || o.fast_attention_flash || o.fast_dense || o.fast_moe || o.fast_engram || o.trace || o.stream_hashes ||
-                 o.routing_loads || o.quality_head_rows > 1U || o.null_ulp_layer >= 0 || o.verify_embed_extras);
+    // Why options keep every prompt solo (nullptr: a group pass is supported). The FAST levers group (GRPFAST): flash
+    // attention runs on per-member BF16 mirrors, FAST dense keeps each member's solo route per site (the route plan,
+    // strix/ds41_dense_plan.hpp: a call's bits depend on its route and K split, never on its rows), the relaxed MoE's
+    // products are per row (grouping changes which rows share an expert's weights, not a row's sum); BF16 / f16wmma
+    // attention run per window on the member's own view. Still solo (limits of this implementation, not of the math):
+    //   fp16-solver-geometry-unpinned   the hipBLASLt FP16 backend picks its solver by the call's shape
+    //   diagnostic-output-not-segmented trace / stream hashes / routing loads / quality head rows / null ULP / embed extras
+    //                                   report one sequence's run
+    //   engram-fast-flag-per-view       FAST Engram (ds41-engram-f16wmma-v1) takes its exact fallback for a whole view when
+    //                                   any x of the view would overflow FP16 (one flag per view: engram_x_f16_scan,
+    //                                   src/hip_ds41_layer.hip enqueue_engram_f16_wmma); a group view spans members, so one
+    //                                   member's rows would change another's bits. PROVISIONAL (owner dspf2k): lifted by a
+    //                                   per-row flag + the fixture "group member i == solo run i under FAST Engram".
+    [[nodiscard]] static const char* group_decline_reason(const PrefillOptions& o) noexcept {
+        if (o.fp16_dense) return "fp16-solver-geometry-unpinned";
+        if (o.trace || o.stream_hashes || o.routing_loads || o.quality_head_rows > 1U || o.null_ulp_layer >= 0 || o.verify_embed_extras)
+            return "diagnostic-output-not-segmented";
+        if (o.fast_engram) return "engram-fast-flag-per-view";
+        return nullptr;
     }
+    [[nodiscard]] static bool group_options_supported(const PrefillOptions& o) noexcept { return group_decline_reason(o) == nullptr; }
     // Members / rows per member the group states hold (PrefillOptions::group_members / group_rows); 0 = no group pass.
     [[nodiscard]] std::uint32_t group_members() const noexcept;
     [[nodiscard]] std::uint32_t group_rows() const noexcept;
