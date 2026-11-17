@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -102,6 +103,31 @@ inline std::string describe(const FreePrepReport& r) {
     return b;
 }
 
+#if defined(__linux__)
+namespace free_prepare_detail {
+// Close the reporting end before holding memory: a dead sibling must produce EOF
+// once all surviving workers have reported, rather than leaving the parent blocked.
+inline void report_and_hold(int done, int hold, char result) {
+    ssize_t n;
+    do { n = ::write(done, &result, 1); } while (n < 0 && errno == EINTR);
+    (void)::close(done);
+    do { n = ::read(hold, &result, 1); } while (n < 0 && errno == EINTR);
+}
+
+inline bool collect_reports(int done, std::size_t workers) {
+    bool success = true;
+    for (std::size_t i = 0; i < workers; ++i) {
+        char result = 0;
+        ssize_t n;
+        do { n = ::read(done, &result, 1); } while (n < 0 && errno == EINTR);
+        if (n != 1) return false;
+        if (result != 1) success = false;
+    }
+    return success;
+}
+}  // namespace free_prepare_detail
+#endif
+
 // Runs the plan. Call it once, before the first device allocation of a load, from the loading thread.
 // Opt-in: STRIX_HOST_FREE_PREPARE=1 (the pass costs about 1 s per 5 GiB of page cache it has to take back, so it pays
 // for a cold timed run, not for a server start); STRIX_HOST_FREE_PREPARE_THREADS sets the populate workers (default 16).
@@ -141,23 +167,21 @@ inline FreePrepReport prepare_free_memory(std::uint64_t need_bytes) {
                     for (std::uint64_t o = 0; o < per; o += 4096) static_cast<volatile unsigned char*>(p)[o] = 1;
             }
             char c = p != MAP_FAILED ? 1 : 0;
-            (void)!::write(done[1], &c, 1);
-            (void)!::read(hold[0], &c, 1);  // returns when the parent closes its end: every worker releases together
+            free_prepare_detail::report_and_hold(done[1], hold[0], c);
             ::_exit(0);
         }
         kids.push_back(pid);
     }
     (void)::close(done[1]);
     (void)::close(hold[0]);
-    std::uint64_t populated = 0;
-    for (std::size_t i = 0; i < kids.size(); ++i) {
-        char c = 0;
-        if (::read(done[0], &c, 1) != 1) break;  // a worker died (out of memory): stop waiting, release the rest
-        if (c == 1) populated += per;
-    }
+    const bool complete = free_prepare_detail::collect_reports(done[0], kids.size());
+    const std::uint64_t populated = complete && kids.size() == workers ? per * kids.size() : 0;
     (void)::close(hold[1]);
     (void)::close(done[0]);
-    for (const pid_t pid : kids) { int st = 0; (void)::waitpid(pid, &st, 0); }
+    for (const pid_t pid : kids) {
+        int st = 0;
+        while (::waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    }
     r.ran = populated != 0;
     if (!r.ran) r.reason = "populate workers failed";
     r.populated = populated;
