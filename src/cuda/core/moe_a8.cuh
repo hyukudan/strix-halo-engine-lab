@@ -815,12 +815,6 @@ __global__ __launch_bounds__(256) void down_rows_kernel(const std::uint8_t* weig
 // decoded per 32-value group with the shared decoders (bitwise the host reference values), FP32 dots, SwiGLU with expf. A warp owns
 // one output; each lane decodes its groups once per chunk of up to 8 assignments and applies them to every assignment.
 constexpr unsigned kNativeChunk = 8U;
-// Shared-memory pitch of one 32-value group of an assignment row (elements). Lane l reads group l (+32k), so with a
-// dense pitch of 32 every lane starts on the same bank (BF16: 16 words -> 16-way conflict per scalar LDS.U16; FP32:
-// 32 words -> all lanes on banks 0..3 per LDS.128). Pitch 36 gives BF16 18 words per group (uint2 reads: lanes 0..15
-// of a half-warp cover the 32 banks once) and FP32 36 words (LDS.128: lanes 0..7 of a quarter-warp cover them once).
-// Layout only: every lane still applies the same values in the same FMA order.
-constexpr unsigned kNativeGroupPitch = 36U;
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
     for (unsigned d = 16U; d; d >>= 1U) v += __shfl_xor_sync(0xffffffffU, v, d);
@@ -837,8 +831,7 @@ __global__ __launch_bounds__(1024) void native_project_kernel(const std::uint8_t
     if (csr.summary[0] || blockIdx.x >= *csr.tile_count) return;
     const unsigned tile_begin = csr.tile_begins[blockIdx.x], total = csr.tile_begins[blockIdx.x + 1U] - tile_begin;
     const unsigned expert = csr.tile_experts[blockIdx.x];
-    static_assert(hidden % 32U == 0U, "native project groups are 32 values");
-    __shared__ alignas(16) std::uint16_t X[kNativeChunk][hidden / 32U][kNativeGroupPitch];  // BF16 input rows, padded groups
+    __shared__ std::uint16_t X[kNativeChunk][hidden];  // BF16 input rows
     __shared__ unsigned row_of[kNativeChunk], slot_of[kNativeChunk];
     const unsigned t = threadIdx.x, lane = t & 31U, warp = t >> 5, o = blockIdx.y * 32U + warp;
     const std::uint64_t row_bytes = Source::row_bytes(type,hidden);
@@ -854,7 +847,7 @@ __global__ __launch_bounds__(1024) void native_project_kernel(const std::uint8_t
         __syncthreads();
         for (unsigned i = t; i < count * hidden; i += 1024U) {
             const unsigned a = i / hidden, f = i % hidden;
-            X[a][f / 32U][f % 32U] = at(v.input, row_of[a])[f];
+            X[a][f] = at(v.input, row_of[a])[f];
         }
         __syncthreads();
         float g[kNativeChunk], u[kNativeChunk];
@@ -868,17 +861,10 @@ __global__ __launch_bounds__(1024) void native_project_kernel(const std::uint8_t
 #pragma unroll
                 for (unsigned a = 0; a < kNativeChunk; ++a) {
                     if (a >= count) break;
-                    // Two BF16 values per word, element 2w in the low half (little endian): same values, same j order.
-                    const uint2* x = reinterpret_cast<const uint2*>(&X[a][grp][0]);
+                    const std::uint16_t* x = &X[a][32U * grp];
                     float sacc = 0.0F;
 #pragma unroll
-                    for (unsigned q = 0; q < 8U; ++q) {
-                        const uint2 p = x[q];
-                        sacc = __fmaf_rn(wv[4U * q + 0U], __uint_as_float(p.x << 16U), sacc);
-                        sacc = __fmaf_rn(wv[4U * q + 1U], __uint_as_float(p.x & 0xFFFF0000U), sacc);
-                        sacc = __fmaf_rn(wv[4U * q + 2U], __uint_as_float(p.y << 16U), sacc);
-                        sacc = __fmaf_rn(wv[4U * q + 3U], __uint_as_float(p.y & 0xFFFF0000U), sacc);
-                    }
+                    for (unsigned j = 0; j < 32U; ++j) sacc = __fmaf_rn(wv[j], __uint_as_float(static_cast<unsigned>(x[j]) << 16U), sacc);
                     if (m) u[a] += sacc; else g[a] += sacc;
                 }
             }
@@ -905,8 +891,7 @@ __global__ __launch_bounds__(1024) void native_down_kernel(const std::uint8_t* d
     if (csr.summary[0] || blockIdx.x >= *csr.tile_count) return;
     const unsigned tile_begin = csr.tile_begins[blockIdx.x], total = csr.tile_begins[blockIdx.x + 1U] - tile_begin;
     const unsigned expert = csr.tile_experts[blockIdx.x];
-    static_assert(ffn % 32U == 0U, "native down groups are 32 values");
-    __shared__ alignas(16) float H[kNativeChunk][ffn / 32U][kNativeGroupPitch];  // padded groups, see kNativeGroupPitch
+    __shared__ float H[kNativeChunk][ffn];
     __shared__ unsigned row_of[kNativeChunk], slot_of[kNativeChunk];
     const unsigned t = threadIdx.x, lane = t & 31U, warp = t >> 5, o = blockIdx.y * 32U + warp;
     const std::uint64_t row_bytes = Source::row_bytes(type,ffn);
@@ -921,7 +906,7 @@ __global__ __launch_bounds__(1024) void native_down_kernel(const std::uint8_t* d
         __syncthreads();
         for (unsigned i = t; i < count * ffn; i += 1024U) {
             const unsigned a = i / ffn, f = i % ffn;
-            H[a][f / 32U][f % 32U] = at(v.intermediates, row_of[a])[slot_of[a] * 2U * ffn + f];
+            H[a][f] = at(v.intermediates, row_of[a])[slot_of[a] * 2U * ffn + f];
         }
         __syncthreads();
         float acc[kNativeChunk];
@@ -935,7 +920,7 @@ __global__ __launch_bounds__(1024) void native_down_kernel(const std::uint8_t* d
                 if (a >= count) break;
                 float sacc = 0.0F;
 #pragma unroll
-                for (unsigned j = 0; j < 32U; ++j) sacc = __fmaf_rn(wv[j], H[a][lane][j], sacc);
+                for (unsigned j = 0; j < 32U; ++j) sacc = __fmaf_rn(wv[j], H[a][32U * lane + j], sacc);
                 acc[a] = sacc;
             }
         }
