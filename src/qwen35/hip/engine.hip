@@ -349,6 +349,8 @@ struct HipEngine::Impl {
           *q_in = nullptr, *kk = nullptr, *vv = nullptr, *qn = nullptr, *ctx = nullptr, *gu = nullptr, *logits = nullptr;
     int *d_ids = nullptr, *d_arg = nullptr;
     unsigned committed = 0, pending = 0;
+    unsigned own_begin = 0, own_end = 0;  // owned layer range (HipEngineOptions::layer_begin / layer_end)
+    unsigned win_vt_from = 0;             // vt_from of the current window (set by its first range)
     // Wide-window attention (rows > 16, FAST): shared flash over the BF16 cache (attn_core/dense_decode_flash.hpp).
     // vt_valid = positions whose V^T copy matches the cache (any other cache write lowers it).
     unsigned vt_valid = 0, vt_stride = 0;
@@ -410,8 +412,12 @@ struct HipEngine::Impl {
         D = cfg.head_dim; QW = cfg.heads * D; KW = cfg.kv_heads * D; I = cfg.intermediate;
         GV = cfg.gdn_v_width(); GC = cfg.gdn_conv_channels(); GH = cfg.gdn_value_heads;
         if (D != 256U) throw std::runtime_error("only head_dim 256 is instantiated");
+        own_begin = opt.layer_begin;
+        own_end = opt.layer_end ? opt.layer_end : cfg.layers;
+        if (own_begin >= own_end || own_end > cfg.layers) throw std::invalid_argument("owned layer range must be 0 <= begin < end <= layers");
         HK(hipStreamCreate(&stream));
-        embd = loader.load("token_embd"); onorm = loader.load("output_norm"); head = loader.load("output");
+        if (own_begin == 0U) embd = loader.load("token_embd");
+        if (own_end == cfg.layers) { onorm = loader.load("output_norm"); head = loader.load("output"); }
         L.assign(cfg.layers, Layer{});
         gdn_index.assign(cfg.layers, ~0U);
         for (unsigned l = 0; l < cfg.layers; ++l)
@@ -428,6 +434,7 @@ struct HipEngine::Impl {
         for (unsigned l = 0; l < cfg.layers; ++l) {
             const std::string b = "blk." + std::to_string(l) + ".";
             auto& y = L[l];
+            if (l < own_begin || l >= own_end) continue;  // another rank's layer: no weights, KV or state used here
             y.attn_norm = loader.load(b + "attn_norm");
             y.post_norm = loader.load(b + "post_attention_norm");
             y.gate = loader.load(b + "ffn_gate");
@@ -479,7 +486,7 @@ struct HipEngine::Impl {
             // flash attention of the wide windows: geometry the shared adapter is instantiated for (Dim 256, GQA group 6)
             if (D == 256U && cfg.heads == 6U * cfg.kv_heads) {
                 vt_stride = (opt.max_positions + 15U) / 16U * 16U;
-                for (unsigned l = 0; l < cfg.layers; ++l)
+                for (unsigned l = own_begin; l < own_end; ++l)
                     if (gdn_index[l] == ~0U) alloc0(&L[l].v_t, std::size_t(KW) * vt_stride * 2U);
                 fws_floats = attn_core::dense::workspace_floats(RS, cfg.heads, D, 4U);
                 alloc0(&fws, fws_floats * 4U);
@@ -522,24 +529,40 @@ struct HipEngine::Impl {
     }
 
     HipRowsOut run(const std::uint32_t* tokens, unsigned n, LogitRows want, bool defer) {
+        return run_range(0U, cfg.layers, tokens, n, want, defer);
+    }
+
+    // Layers [first, last) of one window (run == run_range(0, layers)). first > 0: the input rows are already in x
+    // (import_hidden / a stream-ordered copy). Head only at the last layer; the window commits when `last` is the owned end.
+    HipRowsOut run_range(unsigned first, unsigned last, const std::uint32_t* tokens, unsigned n, LogitRows want, bool defer) {
+        if (first >= last || first < own_begin || last > own_end)
+            throw std::invalid_argument("layer range must be non-empty and inside the owned range");
+        if (defer && (own_begin != 0U || own_end != cfg.layers || first != 0U || last != cfg.layers))
+            throw std::invalid_argument("deferred windows (forward_rows / commit) need the whole model on this rank");
+        if (want != LogitRows::none && last != cfg.layers) throw std::invalid_argument("logits need the range to end at the last layer");
         if (n < 1U || n > (defer ? kMaxRows : std::max(kMaxRows, opt.prefill_rows)))
             throw std::invalid_argument("rows must be 1..16 (decode windows) or 1..prefill_rows (forward_commit)");
         if (n > kMaxRows && want == LogitRows::all) throw std::invalid_argument("wide windows return last-row or no logits");
         if (pending) { restore_and_replay(0U); pending = 0; }  // an uncommitted window is discarded
         core::require_capacity(committed, n, opt.max_positions);
-        core::validate_token_ids(tokens, n, cfg.vocab);
+        if (first == 0U) core::validate_token_ids(tokens, n, cfg.vocab);
         const unsigned pos = committed;
         if (defer) {
             HK(hipMemcpyAsync(bak_state, gdn_all, sb * n_gdn, hipMemcpyDeviceToDevice, stream));
             HK(hipMemcpyAsync(bak_conv, conv_all, cb * n_gdn, hipMemcpyDeviceToDevice, stream));
         }
-        HK(hipMemcpyAsync(d_ids, tokens, n * 4U, hipMemcpyHostToDevice, stream));
-        embed_kernel<<<n, 256, 0, stream>>>(embd.data, embd.fmt, embd.row_bytes, H, d_ids, x);
+        if (first == 0U) {
+            HK(hipMemcpyAsync(d_ids, tokens, n * 4U, hipMemcpyHostToDevice, stream));
+            embed_kernel<<<n, 256, 0, stream>>>(embd.data, embd.fmt, embd.row_bytes, H, d_ids, x);
+        }
         const unsigned nb = (n * H + 255U) / 256U;
         const bool flash = wide_flash(n);
-        const unsigned vt_from = std::min(vt_valid, pos);
-        vt_valid = flash ? pos + n : vt_from;
-        for (unsigned l = 0; l < cfg.layers; ++l) {
+        if (first == own_begin) {  // once per window: a later range of the same window (one-process cut) reuses it
+            win_vt_from = std::min(vt_valid, pos);
+            vt_valid = flash ? pos + n : win_vt_from;
+        }
+        const unsigned vt_from = win_vt_from;
+        for (unsigned l = first; l < last; ++l) {
             auto& y = L[l];
             rmsnorm(x, y.attn_norm, H, cfg.rms_eps, xn, n, stream);
             if (gdn_index[l] != ~0U) {
@@ -582,7 +605,7 @@ struct HipEngine::Impl {
             add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H);
         }
         HipRowsOut out;
-        if (mtp.ok) {  // trunk hidden of every row for the MTP chain (same final norm as the logits path)
+        if (mtp.ok && last == cfg.layers) {  // trunk hidden of every row for the MTP chain (same final norm as the logits path)
             rmsnorm(x, onorm, H, cfg.rms_eps, mtp.hpost, n, stream);
             out.hidden_post = mtp.hpost;
             out.hidden_pre = x;
@@ -597,12 +620,13 @@ struct HipEngine::Impl {
         }
         HK(hipGetLastError());
         if (defer) pending = n;
-        else committed += n;
+        else if (last == own_end) committed += n;
         return out;
     }
 
     void load_mtp(const std::string& path) {
         if (mtp.ok) throw std::logic_error("load_mtp: already loaded");
+        if (own_begin != 0U || own_end != cfg.layers) throw std::logic_error("load_mtp: needs the whole model on this rank");
         Loader loader(path);
         const std::string b = "blk." + std::to_string(cfg.layers) + ".";
         auto& y = mtp.blk;
@@ -706,6 +730,23 @@ std::uint32_t HipEngine::kv_bytes_per_position() const { return std::uint32_t(p_
 void HipEngine::reset() { p_->reset_state(); }
 HipRowsOut HipEngine::forward_rows(const std::uint32_t* t, std::uint32_t rows, LogitRows want) { return p_->run(t, rows, want, true); }
 HipRowsOut HipEngine::forward_commit(const std::uint32_t* t, std::uint32_t rows, LogitRows want) { return p_->run(t, rows, want, false); }
+HipRowsOut HipEngine::forward_range(std::uint32_t first, std::uint32_t last, const std::uint32_t* t, std::uint32_t rows, LogitRows want) {
+    return p_->run_range(first, last, t, rows, want, false);
+}
+std::uint32_t HipEngine::layer_begin() const { return p_->own_begin; }
+std::uint32_t HipEngine::layer_end() const { return p_->own_end; }
+float* HipEngine::hidden_rows() const { return p_->x; }
+std::size_t HipEngine::hidden_row_bytes() const { return std::size_t(p_->H) * sizeof(float); }
+void HipEngine::export_hidden(float* host, std::uint32_t rows) const {
+    if (rows < 1U || rows > prefill_rows()) throw std::invalid_argument("export_hidden: rows outside the window");
+    HK(hipMemcpyAsync(host, p_->x, std::size_t(rows) * hidden_row_bytes(), hipMemcpyDeviceToHost, p_->stream));
+    HK(hipStreamSynchronize(p_->stream));
+}
+void HipEngine::import_hidden(const float* host, std::uint32_t rows) const {
+    if (rows < 1U || rows > prefill_rows()) throw std::invalid_argument("import_hidden: rows outside the window");
+    HK(hipMemcpyAsync(p_->x, host, std::size_t(rows) * hidden_row_bytes(), hipMemcpyHostToDevice, p_->stream));
+}
+void* HipEngine::stream_handle() const { return static_cast<void*>(p_->stream); }
 
 void HipEngine::commit(std::uint32_t k) {
     auto& p = *p_;
