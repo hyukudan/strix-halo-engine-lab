@@ -284,9 +284,12 @@ Build, unit file and options: [GLM RTX guide](../../../src/cuda/models/glm/READM
 layer only) lets the RTX producer prefill long prompts and hand each rank its state. Both ranks stage the hand-off,
 vote on it (the authenticated binding, then both restored) before the last prompt token runs, and any failure before
 that vote falls back to the pair's own prefill on both ranks; a failure inside the last-token collectives stops the
-server (fatal). `--import-dsa-once` (with the producer's `dsa_once`) sends the DSA state to rank 0 only and relays it
-to rank 1 over the pair link (8K: 480 -> 316 MB on the producer link, tokens equal to the version 1 hand-off). `--import-index-tail`
-(every rank, with the producer's `index_tail`; wire version 3, or 4 with `--import-dsa-once`) sends the DSA index key and
+server (fatal). DSA once (hand-off version 2, the default on a pair with `--import-listen`; `--no-import-dsa-once` or
+`STRIX_HANDOFF_SHARED_ONCE=0` restores version 1) sends the DSA state to rank 0 only and relays it to rank 1 over the
+pair link, hash checked (8K: 480 -> 316 MB on the producer link, 4.05 -> 2.67 s at 1 GbE; 32K: 1,461 -> 807 MB,
+12.38 -> 6.90 s; rank 1's merged payload is byte-identical to its version 1 payload, tokens equal). See
+[hand-off owners](../../pair.md#prompt-state-hand-off-one-copy-per-owner). `--import-index-tail`
+(every rank, with the producer's `index_tail`; wire version 3, or 4 with DSA once) sends the DSA index key and
 gate of the open pool block only (`P % 4` rows): the closed blocks travel as their pooled FP32 rows, which is all the
 decode, prefill and MTP kernels read (`include/strix/block_summary_state.hpp`). 32K: 806.92 -> 605.62 MB for both ranks
 with DSA once; 128K: -805.28 MB. Opt-in; `tests/hip_glm_dsa_tests.hip` checks the continuation bitwise with the omitted

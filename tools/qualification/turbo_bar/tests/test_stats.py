@@ -43,6 +43,36 @@ class StatsTests(unittest.TestCase):
         r = stats.paired_binary(a, b, B=200)
         self.assertEqual((r["a_only"], r["b_only"], r["both"], r["neither"]), (5, 5, 20, 0))
 
+    def test_binary_zero_discordance(self):
+        for outcomes in ([1] * 128, [0] * 128, [0, 1] * 64):
+            r = stats.paired_binary(outcomes, outcomes, limit=0.01)
+            self.assertEqual(r["verdict"], "INCONCLUSIVE")
+            self.assertGreater(r["hi"], 0.02)
+            self.assertLess(r["lo"], -0.02)
+        self.assertEqual(stats.paired_binary([1] * 1024, [1] * 1024, limit=0.01)["verdict"], "PASS")
+
+    def test_binary_bounds_and_direction(self):
+        r = stats.paired_binary([1] * 128, [0] * 128, limit=0.01)
+        self.assertEqual(r["verdict"], "FAIL")
+        reverse = stats.paired_binary([0] * 128, [1] * 128, limit=0.01)
+        self.assertEqual(reverse["verdict"], "PASS")
+        self.assertAlmostEqual(r["hi"], -reverse["lo"])
+        self.assertAlmostEqual(r["lo"], -reverse["hi"])
+        with self.assertRaises(ValueError):
+            stats.paired_binary([1, 0, 0.5], [1, 1, 1])
+
+    def test_binary_ceiling_false_pass_probability(self):
+        # Exact enumeration under a 2% loss: the chance of falsely establishing
+        # the 1% margin must not exceed the declared 5% error budget.
+        import math
+        n, p = 128, 0.02
+        false_pass = 0.0
+        for failures in range(n + 1):
+            result = stats.paired_binary([1] * n, [0] * failures + [1] * (n - failures), limit=0.01)
+            if result["verdict"] == "PASS":
+                false_pass += math.comb(n, failures) * p ** failures * (1 - p) ** (n - failures)
+        self.assertLessEqual(false_pass, 0.05)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4,6 +4,7 @@
 #include "../src/core/chunk_contract.hpp"
 #include "qwen_pair_transport.hpp"
 #include "strix/qwen_prefill_pair.hpp"
+#include "strix/qwen_prefill_stages.hpp"
 #include "strix/qwen_prefill_handoff.hpp"
 #include "strix/qwen_prefill_pipe_dump.hpp"
 #include "strix/qwen_prefill_balance.hpp"
@@ -33,6 +34,7 @@
 #include "strix/hip_q6p_pack.hpp"
 #include "strix/hip_qwen_router_bf16.hpp"
 #include "strix/hip_qwen_onfly_i4.hpp"
+#include <map>
 #include "strix/qwen_router_bf16.hpp"
 #include "strix/hip_dense_trellis_pack.hpp"
 #include "strix/q6p_registry.hpp"
@@ -1209,7 +1211,8 @@ static int run_decode_entry(
     // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
     // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
     // GPU of a node keeps working (declared=implicit). A retry re-enters here with the flags already removed.
-    strix::device::bind_hip_main(argc, argv);
+    // Eager code loading is resolved below by this engine's own policy (--no-eager-code-load, baseline, defaults off).
+    strix::device::bind_hip_main(argc, argv, stderr, strix::device::CodeLoad::engine);
     // Host wait policy of this engine (shared home: strix/device/hip_gate.hpp; STRIX_HOST_WAIT overrides): blocking.
     // The runtime's own schedule busy-waits (one host core at 100 % for the whole prefill) for no measured speed.
     try {
@@ -1403,21 +1406,9 @@ static int run_decode_entry(
     // Inspection predicts this policy without changing the process environment.
     // A value set here is already too late for this image, so restart it once with the value in its
     // environment; the restarted image finds the value set and continues without restarting again.
-    if (!options.print_effective_config && !options.print_cache_family &&
-        strix::decode_cli::apply_eager_code_loading(options.eager_code_load && !options.baseline &&
-            !(std::getenv("STRIX_QPF2K_DEFAULTS") && std::getenv("STRIX_QPF2K_DEFAULTS")[0] == '0'),
-            [](const char* name) { return std::getenv(name); },
-            [](const char* name, const char* value) { return ::setenv(name, value, 0) == 0; })) {
-        std::fflush(nullptr);
-        std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
-        const auto original = strix::decode_cli::split_process_arguments(
-            std::string((std::istreambuf_iterator<char>(cmdline)), std::istreambuf_iterator<char>()));
-        std::vector<char*> restart;
-        for (const auto& argument : original) restart.push_back(const_cast<char*>(argument.c_str()));
-        restart.push_back(nullptr);
-        ::execv("/proc/self/exe", original.empty() ? argv : restart.data());
-        std::fprintf(stderr, "eager code loading: restart failed (%s); continuing with deferred loading\n",
-            std::strerror(errno));
+    if (!options.print_effective_config && !options.print_cache_family) {
+        strix::device::restart_with_eager_code_loading(options.eager_code_load && !options.baseline &&
+            strix::envcfg::flag("STRIX_QPF2K_DEFAULTS", true, strix::EnvFlagMatch::first_character), argv);
     }
     if (allon_active)
         std::fprintf(stderr, "qwen allon long-prompt gate: rows=%zu, off: %s\n",
@@ -1862,6 +1853,8 @@ static int run_decode_entry(
         }
     }
     strix::decode_cli::require_effective_prefill_execution(effective);
+    strix::core::iu4_rows::configure_execution_policy({effective.options.turbo.row_decode.effective,
+                                                     effective.options.turbo.row_reduction.effective});
     std::unique_ptr<strix::decode_cli::YarnMemoryWatchdog> yarn_watchdog;
     if (yarn) yarn_watchdog = std::make_unique<strix::decode_cli::YarnMemoryWatchdog>();
     strix::decode_cli::YarnMemoryWatchdogScope yarn_watchdog_scope(yarn_watchdog.get());
@@ -2717,6 +2710,37 @@ static int run_decode_entry(
                   << onfly_i4_owner->source_bytes << " Q8_0 bytes -> " << onfly_i4_owner->copy_bytes << " INT4 bytes in "
                   << onfly_i4_owner->convert_seconds << " s (" << strix::onfly_i4::groups_text(options.turbo.groups) << ")\n";
     }
+    if (strix::envcfg::flag("STRIX_MTP_WEIGHT_LOG", false)) {
+        // The family adapter supplies tensor names; registry ownership and the
+        // shared projection's admitted K groups determine the effective form.
+        std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> groups;
+        for (std::size_t index = 0; index < manifest.tensors.size(); ++index) {
+            const auto& tensor = manifest.tensors[index];
+            const auto* runtime = strix::find_runtime_tensor_binding(model_residency.binding(), static_cast<std::uint32_t>(index));
+            if (!runtime || !runtime->address) continue;
+            std::string name = tensor.name;
+            if (name.starts_with("blk.")) {
+                const auto end = name.find('.', 4U);
+                if (end != std::string::npos) name.erase(0U, end + 1U);
+            }
+            const auto* address = reinterpret_cast<const void*>(runtime->address);
+            std::string form = "native";
+            if (const auto* packed = strix::q6p::find(address))
+                form = packed->kind == strix::q6p::Kind::bf16 ? "bf16-copy" : "q6p32-copy";
+            const bool copy = std::any_of(onfly_i4_owner->copies.begin(), onfly_i4_owner->copies.end(),
+                [&](const auto& c) { return c.original == address; });
+            if (copy && tensor.dimensions.size() == 2U) {
+                const auto g = tensor.dimensions[0] / 64U;
+                form = g == 32U || g == 40U || g == 64U || g == 96U ? options.turbo.identity() : "native-unused-i4-copy";
+            }
+            const std::string key = name + " ggml=" + std::to_string(tensor.ggml_type) + " effective=" + form;
+            auto& total = groups[key]; ++total.first; total.second += tensor.byte_size;
+        }
+        for (const auto& [group, total] : groups)
+            std::cerr << "mtp-weight path=verify_and_commit source_sha256=" << admitted_content << " group=" << group
+                      << " tensors=" << total.first << " source_bytes=" << total.second
+                      << " scope=decode-r1-r8 commit=reuse-verified-state wide_iu4=off\n";
+    }
     optimization_profile_receipt += "  \"qwen_router_bf16_enabled\":" + std::string(options.qwen_router_bf16 ? "true" : "false") + ",\n" +
         "  \"qwen_router_bf16_bytes\":" + std::to_string(router_bf16_owner->bytes) + ",\n" +
         "  \"qwen_router_bf16_tensors\":" + std::to_string(router_bf16_owner->copies.size()) + ",\n" +
@@ -3504,6 +3528,10 @@ static int run_decode_entry(
     strix::qwen_pp::PromptRoute pair_prompt_route;
     const char* pair_cut_env = std::getenv("STRIX_QWEN_PF_PIPE_CUT");
     const char* pair_cost_env = std::getenv("STRIX_QWEN_PF_PIPE_COSTS");
+    // PR-3 stage emulation: the pair chunk (STRIX_QWEN_PF_PIPE_CHUNK) is the tile, as the pair route sets it.
+    if (!strix::qwen_pp::pipe_enabled() && strix::envcfg::text("STRIX_QWEN_PF_STAGE_EMULATE") && options.known_prefix_prefill_rows)
+        if (const char* emulate_chunk = std::getenv("STRIX_QWEN_PF_PIPE_CHUNK"); emulate_chunk && *emulate_chunk)
+            options.known_prefix_prefill_rows = static_cast<std::uint32_t>(std::strtoul(emulate_chunk, nullptr, 10));
     if (strix::qwen_pp::pipe_enabled()) {
         strix::qwen_pp::LegalCuts pair_legal{};
         for (std::uint32_t pair_layer = 1; pair_layer < 48U; ++pair_layer) {
@@ -3524,7 +3552,8 @@ static int run_decode_entry(
                 strix::qwen_pp::parse_stage_cut(pair_cut_env, pair_legal, pair_legal_half)) :
                 strix::qwen_pp::choose_cut(pair_costs, pair_legal, pair_legal_half);
         } else {
-            const auto pair_cut = strix::qwen_pp::parse_stage_cut(pair_cut_env, pair_legal, pair_legal_half);
+            const auto pair_cut = strix::qwen_pp::resolve_stage_cut(pair_cut_env, pair_legal, pair_legal_half,
+                pair_policy->half_cut.on);
             pair_prediction.cut = pair_cut.layer;
             pair_prediction.half = pair_cut.half;
         }
@@ -5852,6 +5881,94 @@ static int run_decode_entry(
                     " bytes=" + std::to_string(bytes) + " fnv1a64=" + std::to_string(hash) + metadata + "\n");
             }
         };
+        // PR-3 identity gate (MMPIPE-PLAN, option C): STRIX_QWEN_PF_STAGE_EMULATE=v runs the interleaved (stage, chunk)
+        // order of 2v stages (v per rank) on ONE node: one cursor and one session, a frontier per stage swapped in
+        // around each step, the step's layer range in qwen_pp::pipe_step, seams kept per (chunk, boundary). v = 0 runs
+        // the same step loop without a split. Prints logits SHA-256, a state digest and the folded lineage.
+        if (const char* emulate_text = strix::envcfg::text("STRIX_QWEN_PF_STAGE_EMULATE");
+            emulate_text && *emulate_text && !strix::qwen_pp::pipe_enabled()) {
+            const auto emulate_v = static_cast<std::uint32_t>(std::strtoul(emulate_text, nullptr, 10));
+            if (!known_prefill_plan || !known_prefix_owner || model.hidden_layers != 48 || options.tokens.empty())
+                throw std::invalid_argument("stage emulation requires the 48-layer tiled model and a prompt");
+            strix::pair::StageMap emulate_map;
+            if (const char* map_text = strix::envcfg::text("STRIX_PAIR_STAGE_MAP"); map_text && *map_text && emulate_v)
+                emulate_map = strix::pair::StageMap::parse(map_text, 48U);
+            else if (emulate_v) emulate_map = strix::qwen_pp::even_map(emulate_v, 48U);
+            else emulate_map.cuts = {strix::pair::StageCut(0U), strix::pair::StageCut(48U)};
+            const auto emulate_stages = emulate_map.stages();
+            strix::KnownPromptChunkRequest emulate_req;
+            emulate_req.prompt_tokens = options.tokens;
+            emulate_req.start_position = session.next_position;
+            emulate_req.vocab_size = request.vocab_size; emulate_req.context_capacity = request.context_capacity;
+            emulate_req.max_new_tokens = 0U; emulate_req.eos_token_id = request.eos_token_id;
+            emulate_req.logical_rows = options.known_prefix_prefill_rows ? options.known_prefix_prefill_rows : options.known_prefix_rows;
+            emulate_req.tiled_prefill = true;
+            emulate_req.output_policy = options.known_prefix_output_policy;
+            emulate_req.all_row_heads = false;
+            emulate_req.schedule_extensions = true;
+            emulate_req.schedule_defer = false;  // a deferred block would complete across a stage switch
+            emulate_req.ladder_tail_rows = options.known_prefix_ladder_tail_rows;
+            strix::KnownPromptChunkCursor emulate_chunks(emulate_req, *known_prefix_backend, backend);
+            for (auto& tail : known_tail_backends)  // only owners smaller than the emulated tile
+                if (tail->logical_rows() < emulate_req.logical_rows) emulate_chunks.set_tail_backend(*tail);
+            const auto emulate_units = emulate_chunks.cold_plan().size();
+            strix::qwen_pp::require_stage_seams(emulate_stages,
+                strix::known_prompt_pipeline_plan(emulate_chunks.cold_plan()).serial_rows);
+            std::vector<strix::KnownPromptChunkStageView> emulate_views(emulate_stages, emulate_chunks.stage_view());
+            std::vector<strix::qwen_pp::StageFrontier> emulate_frontiers(emulate_stages,
+                strix::qwen_pp::StageFrontier{session.next_position, session.committed_tokens, session.arithmetic_lineage});
+            struct StepReset {
+                ~StepReset() { strix::qwen_pp::pipe_step = {}; }
+            } emulate_step_reset;
+            const auto emulate_swap = [&](std::uint32_t stage) {
+                emulate_chunks.swap_stage(emulate_views[stage]);
+                auto& front = emulate_frontiers[stage];
+                std::swap(session.next_position, front.next_position);
+                std::swap(session.committed_tokens, front.committed_tokens);
+                std::swap(session.arithmetic_lineage, front.lineage);
+            };
+            const auto emulate_start = std::chrono::steady_clock::now();
+            for (const auto& step : strix::qwen_pp::local_order(emulate_stages, emulate_units)) {
+                emulate_swap(step.stage);
+                strix::qwen_pp::pipe_step = {true, step.stage, emulate_stages, step.chunk, emulate_stages == 1U ?
+                    strix::qwen_pp::LayerRange{0U, 48U, false} : strix::qwen_pp::stage_range(emulate_map, step.stage)};
+                const bool ran = emulate_chunks.advance();
+                strix::qwen_pp::pipe_step = {};
+                emulate_swap(step.stage);
+                if (!ran) throw std::runtime_error("stage emulation: cursor ended before its planned units");
+            }
+            const auto emulate_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - emulate_start).count();
+            // The last stage holds the terminal logits; the session frontier is the last stage's, its lineage the fold.
+            emulate_chunks.swap_stage(emulate_views.back());
+            session.next_position = emulate_frontiers.back().next_position;
+            session.committed_tokens = emulate_frontiers.back().committed_tokens;
+            session.arithmetic_lineage = strix::qwen_pp::fold_stage_lineages(emulate_frontiers);
+            const auto emulate_frontier = emulate_chunks.frontier();
+            if (!emulate_frontier.valid || emulate_frontier.logits.size() != model.vocab_size)
+                throw std::runtime_error("stage emulation: no terminal logits");
+            check_hip(hipDeviceSynchronize(), "stage emulation state digest fence");
+            std::uint64_t emulate_state = 14695981039346656037ULL, emulate_state_bytes = 0;
+            std::vector<std::uint64_t> emulate_staging(strix::qwen_pp::seam_piece_bytes / sizeof(std::uint64_t));
+            for (const auto& view : pair_state_views(0U, 48U))
+                for (std::uint64_t offset = 0; offset < view.second.bytes;) {
+                    const auto size = static_cast<std::size_t>(std::min<std::uint64_t>(
+                        emulate_staging.size() * sizeof(std::uint64_t), view.second.bytes - offset));
+                    std::fill(emulate_staging.begin(), emulate_staging.end(), 0ULL);
+                    check_hip(hipMemcpy(emulate_staging.data(), reinterpret_cast<const void*>(view.second.address + offset),
+                        size, hipMemcpyDeviceToHost), "stage emulation state digest D2H");
+                    for (std::size_t word = 0; word < (size + 7U) / 8U; ++word)
+                        emulate_state = (emulate_state ^ emulate_staging[word]) * 1099511628211ULL;
+                    offset += size; emulate_state_bytes += size;
+                }
+            std::cout << "{\"stage_emulation\":" << emulate_v << ",\"map\":\"" << emulate_map.text() << "\",\"units\":" << emulate_units
+                << ",\"position\":" << session.next_position << ",\"lineage_history\":" << session.arithmetic_lineage.history_identity
+                << ",\"lineage_intervals\":" << session.arithmetic_lineage.intervals.size()
+                << ",\"lineage_tainted\":" << (session.arithmetic_lineage.tainted ? "true" : "false")
+                << ",\"state_fnv64w\":" << emulate_state << ",\"state_bytes\":" << emulate_state_bytes
+                << ",\"logits_sha256\":\"" << strix::model_content_identity_hex(strix::sha256_bytes(
+                    std::as_bytes(std::span<const float>(emulate_frontier.logits)))) << "\",\"wall_ms\":" << emulate_ms << "}\n";
+            return 0;
+        }
         if (strix::qwen_pp::pipe_enabled() && (!strix::qwen_pp::decode_enabled() || pair_prompt_route.prefix)) {
             const auto pair_prompt_size = strix::qwen_pp::decode_enabled() ? pair_prompt_route.prefix : options.tokens.size();
             if (!known_prefill_plan || !known_prefix_owner || model.hidden_layers != 48 || options.tokens.empty() ||
@@ -5870,7 +5987,8 @@ static int run_decode_entry(
 #endif
                 throw std::runtime_error("pair prefill layer range update failed");
             std::fprintf(stderr, "qwen-pair rank=%u cut=%s cut-source=%s cost-bucket=%llu predicted-A-ms=%.3f predicted-B-ms=%.3f prediction=%s\n",
-                pair_rank, pair_cut_text.c_str(), pair_cut_env ? "explicit" : (pair_cost_env ? "cost-model" : "measured-default"),
+                pair_rank, pair_cut_text.c_str(), pair_cut_env ? "explicit" : (pair_cost_env ? "cost-model" :
+                    (pair_policy && pair_policy->half_cut.on ? "measured-default-half" : "measured-default")),
                 static_cast<unsigned long long>(pair_bucket), pair_prediction.a * static_cast<double>(options.tokens.size()),
                 pair_prediction.b * static_cast<double>(options.tokens.size()), pair_cost_env ? "compute-only" : "unavailable");
             // Deployment may already have exchanged measured facts and plan IDs on its own link.

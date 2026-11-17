@@ -94,6 +94,19 @@ def pair_receipts(paths, expected=0):
     return reasons
 
 
+def pair_verdict_line(paths):
+    """One line for the folded pair arm: VALID only if every rank is; each rank's own reasons named."""
+    recs = [json.loads(read_text(p) or "{}") for p in paths]
+    tag = recs[0].get("tag") or "missing-rank"
+    if all(r.get("valid") for r in recs):
+        return "== %s PAIR VALID" % tag
+    own = []
+    for i, r in enumerate(recs):
+        why = [x for x in r.get("invalid_reasons", ["missing receipt"]) if x != "pair rank invalid or missing receipt"]
+        own.append("r%d: %s" % (i, "; ".join(why) or "-"))
+    return "== %s PAIR INVALID[%s]" % (tag, " | ".join(own))
+
+
 def read_text(path):
     try:
         with open(path, encoding="utf-8", errors="replace") as stream:
@@ -216,8 +229,12 @@ def integrate(rows, t0, t1):
 
 
 def cmd_meta(args):
+    # The gate reports the effective device after environment/CLI selection and discovery.
+    # Keep its complete evidence (including declaration source); absence means unknown.
+    logs = read_text(os.path.join(args.dir, "stderr")) + "\n" + read_text(os.path.join(args.dir, "stdout"))
+    bindings = list(dict.fromkeys(line for line in logs.splitlines() if line.startswith("device: id=")))
     meta = dict(rc=args.rc, wall_ms=args.wall_ms, mem=args.mem.strip(), host=args.host_tag, bin_sha=args.bin_sha,
-                intentional_shutdown=args.intentional_shutdown)
+                intentional_shutdown=args.intentional_shutdown, device_bindings=bindings)
     with open(os.path.join(args.dir, "meta.json"), "w") as stream:
         json.dump(meta, stream)
 
@@ -291,6 +308,7 @@ def cmd_summarize(args):
     rec = dict(
         tag=args.tag, arm=args.arm or args.tag, round=args.round, host=meta.get("host"), bin_sha=meta.get("bin_sha"),
         rc=meta.get("rc"), wall_ms=meta.get("wall_ms"), mem_start=meta.get("mem"),
+        device_bindings=meta.get("device_bindings", []),
         workload=args.workload, prefills=len(pf), prefill_ms_cold=cold, prefill_ms_warm=warm, tokens=tokens,
         prefill_tokens=counts, rank_evidence=[{k: v[k] for k in ("key", "tokens", "logits", "state") if k in v} for v in fr],
         tok_s_cold=(cold_tokens / (cold / 1e3) if cold_tokens and cold else 0.0),
@@ -413,7 +431,10 @@ def main(argv=None):
     s.add_argument("--strict-klog", action="store_true", help="kernel-log events invalidate instead of warning")
     args = p.parse_args(argv)
     if args.cmd == "pair":
-        return bool(pair_receipts(args.paths, args.expected))
+        reasons = pair_receipts(args.paths, args.expected)
+        # The per-rank '== tag VALID' lines are printed before this fold; this line is the pair arm's verdict.
+        print(pair_verdict_line(args.paths))
+        return bool(reasons)
     {"meta": cmd_meta, "summarize": cmd_summarize}[args.cmd](args)
 
 

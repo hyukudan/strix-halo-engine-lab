@@ -13,7 +13,7 @@ class RecurrentStateBoundaries(unittest.TestCase):
     def test_cuda_application_rejects_before_device_or_cache_setup(self):
         source = (ROOT / "src/cuda/models/qwen/qwen_prefill_driver.cu").read_text()
         start = source.index("Prefill::Prefill(const Config& config)")
-        startup = source[start:source.index("m.cfg = config;", start)]
+        startup = source[start:source.index("m.state_layer_floats = recurrent_state_bytes(", start)]
         self.assertIn("require_f32_recurrent_state(m.state_type,", startup)
         self.assertIn("schedule-independent prefill and prefix reuse unqualified", startup)
 

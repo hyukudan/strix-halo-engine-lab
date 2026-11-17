@@ -826,6 +826,17 @@ struct HipKnownPrefixWindow::Impl {
     bool pp_seam_valid = false;
     std::optional<std::uint32_t> pp_seam_layer;
     bool pp_seam_half = false;
+    // PR-3 one-node stage emulation (pipe_step active, no pair pipe): seams of the interleaved order kept by
+    // (chunk, boundary) until their consumer step, with the folded markers the pair header would carry.
+    struct PpLocalSeam {
+        std::vector<std::byte> bytes;
+        std::vector<std::uint32_t> tokens;
+        std::uint64_t position = 0;
+        std::optional<std::uint32_t> layer;
+        bool half = false;
+        std::vector<std::size_t> folded;
+    };
+    std::map<std::pair<std::uint64_t, std::uint32_t>, PpLocalSeam> pp_local_seams;
     void pp_seam(bool save, std::uint32_t seam_rows,
         const std::function<ExecutionDispatchContext(std::uint32_t)>& hc_context,
         const std::function<ExecutionDispatchContext(std::uint32_t)>& inject_context,
@@ -881,6 +892,20 @@ struct HipKnownPrefixWindow::Impl {
                 pp_seam_half = seam_half;
                 pp_seam_tokens.assign(seam_tokens.begin(), seam_tokens.end());
             }
+        }
+        const bool pp_local = !pair_frame && qwen_pp::pipe_step.active;
+        if (pp_local && !save) {
+            const auto found = qwen_pp::pipe_step.stage == 0U ? pp_local_seams.end() :
+                pp_local_seams.find({qwen_pp::pipe_step.chunk, qwen_pp::pipe_step.stage - 1U});
+            if (found == pp_local_seams.end()) throw std::logic_error("stage emulation: no saved seam for this (stage, chunk) step");
+            pp_seam_bytes = std::move(found->second.bytes);
+            pp_seam_tokens = std::move(found->second.tokens);
+            pp_seam_position = found->second.position;
+            pp_seam_layer = found->second.layer;
+            pp_seam_half = found->second.half;
+            prefill_folded = std::move(found->second.folded);
+            pp_seam_valid = true;
+            pp_local_seams.erase(found);
         }
         if (save) {
             pp_seam_valid = false;
@@ -983,6 +1008,13 @@ struct HipKnownPrefixWindow::Impl {
             if (save) pair_context.pipe->release(pair_context.sequence);
         }
         pp_seam_valid = save;
+        if (pp_local && save) {
+            hip_check(hipDeviceSynchronize(), "stage emulation seam save fence");
+            pp_local_seams[{qwen_pp::pipe_step.chunk, qwen_pp::pipe_step.stage}] =
+                PpLocalSeam{std::move(pp_seam_bytes), pp_seam_tokens, pp_seam_position, pp_seam_layer, pp_seam_half, prefill_folded};
+            pp_seam_bytes.clear();
+            pp_seam_valid = false;
+        }
         std::fprintf(stderr, "qwen-split seam=%s rows=%u bytes-per-row=25616 position=%llu\n",
             save ? "save" : "load", seam_rows, static_cast<unsigned long long>(seam_position));
     }
@@ -2555,7 +2587,7 @@ struct HipKnownPrefixWindow::Impl {
             hooks.static_preflight_memo=&static_preflight_memo;
             hooks.skip_head=skip_head;
             hooks.partial_rows=partial;
-            const auto pp_native_range = qwen_pp::parse_range(qwen_pf_layer_range_text(),
+            const auto pp_native_range = qwen_pp::step_or_process_range(qwen_pf_layer_range_text(),
                 static_cast<std::uint32_t>(model.hidden_layers));
             if (!pp_native_range.enabled || pp_native_range.begin == 0) {
                 prefill_folded.clear();

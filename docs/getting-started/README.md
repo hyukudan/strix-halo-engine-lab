@@ -69,6 +69,14 @@ DeepSeek production trellis API/library settings and the complete per-engine bui
 [Build each engine](../reproduce.md#build-each-engine). Configure and build both ranks identically.
 MiniMax and GLM family targets require these build options even though their execution defaults are fast.
 
+The HIP device gate isolates the SDK's empty GCC-host `__noinline__` macro before
+including further standard-library headers. This avoids a collision with the
+`[[__gnu__::__noinline__]]` attribute used by libstdc++ 16 through `<chrono>` and
+`<format>`; no ROCm header edits or warning suppression are needed. With HIP and
+`BUILD_TESTING=ON`, build `strix-hip-host-header-tests` and run
+`ctest --test-dir build -R '^strix-hip-host-header-tests$' --output-on-failure` for
+the host-only regression (no GPU or model required).
+
 The CUDA parts for the RTX PRO build separately with `-DSTRIX_ENABLE_CUDA_DS41=ON`. `ctest --test-dir build` runs
 the host and device tests (many device tests need the GPU and the model files). All CMake options are listed in
 [docs/getting-started/engine-reference.md](engine-reference.md#build-options).
