@@ -177,6 +177,7 @@
 {"src/moe_core/device_plan.hpp", 0xd11705be6d35d151ULL},
 {"src/moe_core/device_plan_index.hpp", 0x123ba19e0be85987ULL},
 {"src/moe_core/exl3_trellis.hpp", 0x609c2bb7f95699c4ULL},
+{"src/moe_core/grouped_a8_f16.hpp", 0x72c1010a123fb6fcULL},
 {"src/moe_core/grouped_core.hpp", 0xb3b2397545ca754bULL},
 {"src/moe_core/grouped_f16.hpp", 0xd4c01c860bfe9c98ULL},
 {"src/moe_core/grouped_integer_decode.hpp", 0xe4193b966715f39cULL},
