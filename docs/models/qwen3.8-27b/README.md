@@ -42,7 +42,10 @@ Real pack (2026-11-16): CUDA exact q8_0 vs ref_forward f64 on a 15-token chat pr
 Measurement kits (`scripts/bench/qwen35/`, parametrised; hosts/paths are arguments):
 `run_classes.sh BIN GGUF OUT [N]` exact drafting per prompt class (code/json/prose, EXACT gate inside);
 `rows_table.sh BIN "MODEL_ARGS" "ROWS"` verify-window ms per rows; `nsys_step.sh NSYS BIN OUT "ARGS"` per-kernel step table;
-`turbo_quality.py REF.bin TURBO.bin VOCAB [ALIGNED_ROWS]` TURBO gate (KL, top-1, error clustering).
+`turbo_quality.py REF.bin TURBO.bin VOCAB [ALIGNED_ROWS]` TURBO gate (KL, top-1, error clustering);
+`dense_pair.sh selfcut|identity|timing --bin DIR --model GGUF --ids FILE --out DIR [--ref DIR]` layer split over ranks
+(`strix-hip-qwen35-pair`): one-process cut test, two-rank identity against the one-node reference, two-rank timing
+(second rank on `KIT_PEER`).
 
 ## Sizes (parameters: trunk 24.35 B + head 1.27 B; vision skipped)
 BF16 pack ~51.2 GB per decode pass; Q8_0 pack ~27.2 GB (34/32 bytes per weight). GDN state 151 MB, KV 64 KiB/position (bf16).
