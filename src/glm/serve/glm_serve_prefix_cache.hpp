@@ -67,7 +67,7 @@ inline std::uint64_t prefix_snapshot_bound(std::uint64_t p) {
 class PrefixCache {
 public:
     using Kind = strix::serve::KeepKind;
-    // What a store prepares: key ids (the prompt, plus the MTP pending token), the rows the snapshot restores, bytes.
+    // What a store prepares: key ids (exactly the rows the snapshot restores, MTP or not), the frontier, bytes.
     struct Entry {
         std::uint64_t id = 0, identity = 0, frontier = 0;
         bool mtp = false;

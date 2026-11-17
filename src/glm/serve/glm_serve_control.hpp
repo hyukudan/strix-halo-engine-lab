@@ -26,7 +26,7 @@
 namespace strix::glm::serve {
 
 inline constexpr std::uint32_t kControlMagic = 0x434D4C47U;  // "GLMC" (little-endian bytes)
-inline constexpr std::uint32_t kControlVersion = 8;  // v8: prefill units (kPrefillUnits, budget = layer units); v7 paired prefix snapshots
+inline constexpr std::uint32_t kControlVersion = 9;  // v9: MTP prompt-end key = the prompt (plen == ppos); v8: prefill units (kPrefillUnits, budget = layer units); v7 paired prefix snapshots
 inline constexpr std::uint32_t kPrefillMtp = 1U;   // prefill pflags: exact chunked MTP bootstrap (prefill_mtp)
 inline constexpr std::uint32_t kPrefillLast = 2U;  // prefill pflags: the prompt's last chunk (MTP: its seed is kept)
 // prefill pflags (with kPrefillMtp): a prefill_mtp session of layer units; `budget` = units to run (0: cancel it).
@@ -395,8 +395,7 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
             cache->commit(c.prefix_ok != 0);
             return out;
         case Cmd::prefix_prepare: {
-            if (!cache || c.pslot >= slots || c.ppos == 0 || c.ppos >= capacity || c.prefix_id == 0 ||
-                c.plen != c.ppos + ((c.pflags & kPrefillMtp) ? 1U : 0U))
+            if (!cache || c.pslot >= slots || c.ppos == 0 || c.ppos >= capacity || c.prefix_id == 0 || c.plen != c.ppos)
                 throw ProtocolError("prefix cache: invalid snapshot");
             ch.tokens(prompt, c.plen, sender);
             bool ok = false;
