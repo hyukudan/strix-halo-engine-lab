@@ -1,3 +1,4 @@
+#include <cassert>
 #include "strix/env_flags.hpp"
 #include "strix/pinned_host.hpp"
 #include "strix/file_snapshot.hpp"
@@ -32,6 +33,7 @@
 #include "strix/hip_ds41_rn_table.hpp"
 
 #include <hip/hip_runtime.h>
+#include "strix/lever_cache.hpp"
 
 #include <algorithm>
 #include <array>
@@ -350,6 +352,12 @@ bool prefill_flash_q16() {
 std::uint32_t prefill_moe_window_cap() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_PREFILL_MOE_WINDOW_CAP", 8192U, 1U, 65536U); }
 bool prefill_joint_layer() { return strix::envcfg::flag("STRIX_DS41_PREFILL_JOINT_LAYER", false, strix::EnvFlagMatch::exact); }
 std::uint32_t prefill_joint_layer_rows() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_PREFILL_JOINT_LAYER_ROWS", 1024U, 0U, 65536U); }
+// FAST policy ds41-decoder-replay-bounded-v1 (STRIX_DS41_DECODER_REPLAY = R rows, a multiple of 128; 0/unset off; set by the
+// governed profile table): every decoder layer runs only its last R rows, window keys floored at the cut
+// (ds41::plan_bounded_replay). STRIX_DS41_DECODER_REPLAY_ORACLE=1 (measurement only): the exact cone's rows with the same
+// key floors, whose last-row logits and state must equal the bounded run's bit for bit (fixture b).
+std::uint32_t prefill_decoder_replay_rows() { return strix::envcfg::number<std::uint32_t>("STRIX_DS41_DECODER_REPLAY", 0U, 0U, 65536U); }
+bool prefill_decoder_replay_oracle() { return strix::envcfg::flag("STRIX_DS41_DECODER_REPLAY_ORACLE", false, strix::EnvFlagMatch::exact); }
 unsigned prefill_window_drain() { return strix::envcfg::number<unsigned>("STRIX_DS41_PREFILL_WINDOW_DRAIN", 1U, 0U, 3U); }
 bool prefill_o_low_a8_fused() {
     const char* v = std::getenv("STRIX_DS41_PREFILL_O_LOW_A8_FUSED");
@@ -371,7 +379,7 @@ bool prefill_hc_collapse() {
 }
 // STRIX_DS41_PREFILL_FINAL_KV=all (default since P17.5: 8K prefill +1.8 %, bitwise) | none | <comma-separated layers>
 bool prefill_final_kv(std::uint32_t layer) {
-    static const std::vector<bool> on = [] {
+    static strix::lever_cache<std::vector<bool>> on_cache{[] {
         std::vector<bool> r(1024, false);
         const char* v = std::getenv("STRIX_DS41_PREFILL_FINAL_KV");
         if (!v || !*v) return std::vector<bool>(1024, true);
@@ -388,7 +396,8 @@ bool prefill_final_kv(std::uint32_t layer) {
             i = j + 1U;
         }
         return r;
-    }();
+    }};
+    const std::vector<bool> on = on_cache.get();
     return layer < on.size() && on[layer];
 }
 
@@ -441,6 +450,8 @@ struct DevicePrefill::Impl {
     // this rank's rows), so the wait no longer leaves the GPU idle. Same kernel, same inputs: bitwise identical. Only
     // when the next unit boundary does not park (m.q is shared). Default on; STRIX_DS41_PREFILL_EARLY_QB=0: after.
     bool early_q_b = true;
+    bool staged_gather_allowed = true;  // not STRIX_DS41_PREFILL_STAGED_GATHER=0 (staged_gather also needs staged_half)
+    PrefillOptions requested;           // the options the object was constructed with: the base apply_levers resolves from
     Dev<std::uint32_t> pack_send, pack_recv;
     // sites run on the dense WMMA kernel instead of the batch kernel (STRIX_DS41_PREFILL_DENSE_SITES, comma list of
     // q_a, kv, q_b, o_a; default q_a,kv, faster on the dense kernel at 512 and 2048 rows; "none" = all on the batch
@@ -456,16 +467,22 @@ struct DevicePrefill::Impl {
     ds41::DenseFp16Cache dense_fp16;
 #endif
     // projection bit (PrefillOptions::fp16_projections) of a layer's call of `rows` rows on the FP16 backend
+    // policy ds41-decoder-replay-bounded-v1 pins the decoder layers (>= this) to the exact dense form, so a projection's
+    // form never depends on the bound's row count: bounded run == full run with the window keys floored, bit for bit
+    // (the FP16 form picks its form and hipBLASLt solution by rows). ~0: no pin (every other run).
+    std::uint32_t exact_dense_from = 0xFFFFFFFFU;
+    bool dense_exact = false;  // the op being enqueued is in a pinned layer (dense(): no FAST dense form)
     bool fp16_at(std::uint32_t bit, std::uint32_t layer, std::uint32_t rows) const {
         // FP16 output form: calls under 128 rows stay exact (hipBLASLt loses there: 64 x 8192 x 5120 0.46-0.51 vs 0.40 ms)
         return options.fp16_dense && (options.fp16_projections & bit) != 0U && layer >= options.approx_layer_first &&
-               layer < options.approx_layer_end && rows >= std::max(options.fp16_min_rows, options.fp16_fast ? 128U : 0U);
+               layer < options.approx_layer_end && layer < exact_dense_from &&
+               rows >= std::max(options.fp16_min_rows, options.fp16_fast ? 128U : 0U);
     }
     // FP16 output form: the norms' FP16 activations (x for q_a / kv, qr for q_b), sized as x / qr on first use
     Dev<std::uint16_t> x16, qr16;
     bool fast_at(std::uint32_t bits, std::uint32_t layer) const {
         return options.fp16_dense && options.fp16_fast && (options.fp16_projections & bits) != 0U && layer >= options.approx_layer_first &&
-               layer < options.approx_layer_end;
+               layer < options.approx_layer_end && layer < exact_dense_from;
     }
     bool fast_used = false;
     void fast(const ds41::Q8A8DensePrefillView* views, unsigned count, std::uint32_t rows, const std::uint16_t* a16, std::uint32_t a16_stride,
@@ -494,9 +511,10 @@ struct DevicePrefill::Impl {
 #else
             throw std::runtime_error("FP16 dense prefill requires STRIX_DS41_PREFILL_FP16_LT");
 #endif
-        } else if (dense_select && v.tall == 0U) {
+        } else if ((dense_select && v.tall == 0U) || dense_exact) {
             auto w = v;
-            w.tall = 1U;  // auto
+            if (dense_select && w.tall == 0U) w.tall = 1U;  // auto
+            w.exact = w.exact || dense_exact;
             return ds41::enqueue_q8_0_a8_dense_prefill(w,st);
         }
         return ds41::enqueue_q8_0_a8_dense_prefill(v,st);
@@ -786,6 +804,100 @@ struct DevicePrefill::Impl {
         if (hipStreamSynchronize(s) != hipSuccess) throw std::runtime_error("deepseek41 prefill: rope tables");
         pos_base = base;
     }
+    // The per-object switches that change no allocation and no weight layout, resolved from the CURRENT environment and the
+    // requested options: the constructor and DevicePrefill::apply_levers both call this (one resolver, one set of defaults).
+    // Not here (they size buffers or select what is loaded; reload): EXPERT_TP, WINDOW, SLABS, OVERLAY, STAGED_HALF, MEM_GUARD.
+    void resolve_levers(PrefillOptions& opts, const PrefillOptions& req) {
+        opts.fp16_dense = req.fp16_dense;
+        opts.bf16_attention = req.bf16_attention;
+        opts.fast_attention = req.fast_attention;
+        opts.fast_attention_flash = req.fast_attention_flash;
+        opts.fp16_projections = req.fp16_projections;
+        opts.fp16_min_rows = req.fp16_min_rows;
+        opts.approx_layer_first = req.approx_layer_first;
+        opts.approx_layer_end = req.approx_layer_end;
+        opts.fp16_keep_a8 = req.fp16_keep_a8;
+        opts.fp16_fast = req.fp16_fast;
+        opts.fp16_wsplit = req.fp16_wsplit;
+        if(const char* e=std::getenv("STRIX_DS41_PREFILL_FP16_DENSE");e && std::string(e)=="1")opts.fp16_dense=true;
+        if(const char* e=std::getenv("STRIX_DS41_PREFILL_BF16_ATTN");e && std::string(e)=="1")opts.bf16_attention=true;
+        if (const char* e = ds41::fast_profile::attention(); ds41::fast_profile::attention_on()) {  // the lever or STRIX_DS41_FAST_PREFILL
+            opts.fast_attention = true;
+            if (e[0] == '2') opts.fast_attention_flash = true;  // ds41-attn-bf16flash-v1
+        }
+        opts.fast_dense = req.fast_dense || ds41::fast_profile::dense_on();
+        opts.fast_moe = req.fast_moe || ds41::fast_profile::moe_on();
+        opts.fast_engram = req.fast_engram || ds41::fast_profile::engram_on();
+        // Per-shape selector of the FP16 backend: STRIX_DS41_PREFILL_FP16_PROJ (comma list of q_a, kv, q_b, o_a, o_b),
+        // STRIX_DS41_PREFILL_FP16_MIN_ROWS (calls of at least that many rows), STRIX_DS41_PREFILL_APPROX_LAYERS=first-end,
+        // STRIX_DS41_PREFILL_FP16_A8=1 (operands from the A8 codes)
+        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_PROJ"); e != nullptr && *e != 0) {
+            std::uint32_t mask = 0;
+            std::stringstream ss(e);
+            for (std::string t; std::getline(ss, t, ',');) {
+                if (t == "q_a") mask |= 1U;
+                else if (t == "kv") mask |= 2U;
+                else if (t == "q_b") mask |= 4U;
+                else if (t == "o_a") mask |= 8U;
+                else if (t == "o_b") mask |= 16U;
+                else throw std::invalid_argument("STRIX_DS41_PREFILL_FP16_PROJ: " + t);
+            }
+            opts.fp16_projections = mask;
+        }
+        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_MIN_ROWS"); e != nullptr && *e != 0)
+            opts.fp16_min_rows = static_cast<std::uint32_t>(std::strtoul(e, nullptr, 10));
+        if (const char* e = std::getenv("STRIX_DS41_PREFILL_APPROX_LAYERS"); e != nullptr && *e != 0) {
+            char* end = nullptr;
+            opts.approx_layer_first = static_cast<std::uint32_t>(std::strtoul(e, &end, 10));
+            if (end == nullptr || *end != '-') throw std::invalid_argument("STRIX_DS41_PREFILL_APPROX_LAYERS: first-end");
+            opts.approx_layer_end = static_cast<std::uint32_t>(std::strtoul(end + 1, nullptr, 10));
+        }
+        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_A8"); e != nullptr && std::string(e) == "1") opts.fp16_keep_a8 = true;
+        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_FAST"); e != nullptr && std::string(e) == "1") opts.fp16_fast = true;
+        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_WSPLIT"); e != nullptr && std::string(e) == "1") opts.fp16_wsplit = true;
+        const char* v = std::getenv("STRIX_DS41_PREFILL_MOE_PERSIST");
+        moe_persist = !(v != nullptr && v[0] == '0');
+        v = std::getenv("STRIX_DS41_PREFILL_ASYNC_GATHER");
+        async_gather = !(v != nullptr && v[0] == '0');
+        v = std::getenv("STRIX_DS41_PREFILL_PACK");
+        pack = !(v != nullptr && v[0] == '0');
+        v = std::getenv("STRIX_DS41_PREFILL_JOINT");
+        moe_joint = v != nullptr && v[0] == '1';
+        v = std::getenv("STRIX_DS41_PREFILL_OVERLAP");
+        overlap = !(v != nullptr && v[0] == '0');
+        split_min_rows = req.split_min_rows;
+        if (v = std::getenv("STRIX_DS41_PREFILL_SPLIT_MIN_ROWS"); v != nullptr && *v != 0)
+            split_min_rows = static_cast<std::uint32_t>(std::strtoul(v, nullptr, 10));
+        joint_max_rows = req.joint_max_rows;
+        if (v = std::getenv("STRIX_DS41_PREFILL_JOINT_MAX_ROWS"); v != nullptr && *v != 0)
+            joint_max_rows = static_cast<std::uint32_t>(std::strtoul(v, nullptr, 10));
+        dense_q_a = true, dense_kv = true, dense_q_b = false, dense_o_a = false;  // the member defaults
+        dense_min_rows = 256;
+        if (v = std::getenv("STRIX_DS41_PREFILL_DENSE_SITES"); v != nullptr) {
+            const std::string list = std::string(",") + v + ",";
+            dense_q_a = list.find(",q_a,") != std::string::npos;
+            dense_kv = list.find(",kv,") != std::string::npos;
+            dense_q_b = list.find(",q_b,") != std::string::npos;
+            dense_o_a = list.find(",o_a,") != std::string::npos;
+        }
+        if (v = std::getenv("STRIX_DS41_PREFILL_DENSE_MIN_ROWS"); v != nullptr && *v != 0) dense_min_rows = static_cast<std::uint32_t>(std::stoul(v));
+        env_dense_q_b = dense_q_b;
+        env_dense_o_a = dense_o_a;
+        // the exact dense selector is the default (bitwise EQUAL, 2K -5.5 % / 8K -5.1 % TTFT);
+        // STRIX_DS41_DENSE_SELECT=0 = the loaded configuration above (STRIX_DS41_DENSE_TALL / PREFILL_DENSE_SITES)
+        dense_select = false;
+        if (v = std::getenv("STRIX_DS41_DENSE_SELECT"); !(v != nullptr && v[0] == '0' && v[1] == 0)) {
+            dense_select = true;
+            dense_q_b = true;
+            dense_o_a = true;
+        }
+        // row_split exchanges only: STAGED_GATHER (also needs staged_half, which the constructor decides) and EARLY_QB
+        v = std::getenv("STRIX_DS41_PREFILL_STAGED_GATHER");
+        staged_gather_allowed = !(v != nullptr && v[0] == '0');
+        staged_gather = staged_half && staged_gather_allowed;
+        v = std::getenv("STRIX_DS41_PREFILL_EARLY_QB");
+        early_q_b = !(opts.row_split && v != nullptr && v[0] == '0');
+    }
     // The same tables for rows at arbitrary positions (a group pass: every member's rows from position 0); the next
     // single-sequence run uploads its own again (pos_base invalid)
     void upload_row_positions(const std::vector<std::uint64_t>& positions, hipStream_t s) {
@@ -835,42 +947,8 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
         options.window_rows = ds41::prefill_tuning::attention_rows(rows, options.chunk_rows, ds41::attn::kHeads,
                                                                  options.max_positions, options.attention_lanes);
     }
-    if(const char* e=std::getenv("STRIX_DS41_PREFILL_FP16_DENSE");e && std::string(e)=="1")options.fp16_dense=true;
-    if(const char* e=std::getenv("STRIX_DS41_PREFILL_BF16_ATTN");e && std::string(e)=="1")options.bf16_attention=true;
-    if (const char* e = ds41::fast_profile::attention(); ds41::fast_profile::attention_on()) {  // the lever or STRIX_DS41_FAST_PREFILL
-        options.fast_attention = true;
-        if (e[0] == '2') options.fast_attention_flash = true;  // ds41-attn-bf16flash-v1
-    }
-    options.fast_dense = options.fast_dense || ds41::fast_profile::dense_on();
-    options.fast_moe = options.fast_moe || ds41::fast_profile::moe_on();
-    options.fast_engram = options.fast_engram || ds41::fast_profile::engram_on();
-    // Per-shape selector of the FP16 backend: STRIX_DS41_PREFILL_FP16_PROJ (comma list of q_a, kv, q_b, o_a, o_b),
-    // STRIX_DS41_PREFILL_FP16_MIN_ROWS (calls of at least that many rows), STRIX_DS41_PREFILL_APPROX_LAYERS=first-end,
-    // STRIX_DS41_PREFILL_FP16_A8=1 (operands from the A8 codes)
-    if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_PROJ"); e != nullptr && *e != 0) {
-        std::uint32_t mask = 0;
-        std::stringstream ss(e);
-        for (std::string t; std::getline(ss, t, ',');) {
-            if (t == "q_a") mask |= 1U;
-            else if (t == "kv") mask |= 2U;
-            else if (t == "q_b") mask |= 4U;
-            else if (t == "o_a") mask |= 8U;
-            else if (t == "o_b") mask |= 16U;
-            else throw std::invalid_argument("STRIX_DS41_PREFILL_FP16_PROJ: " + t);
-        }
-        options.fp16_projections = mask;
-    }
-    if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_MIN_ROWS"); e != nullptr && *e != 0)
-        options.fp16_min_rows = static_cast<std::uint32_t>(std::strtoul(e, nullptr, 10));
-    if (const char* e = std::getenv("STRIX_DS41_PREFILL_APPROX_LAYERS"); e != nullptr && *e != 0) {
-        char* end = nullptr;
-        options.approx_layer_first = static_cast<std::uint32_t>(std::strtoul(e, &end, 10));
-        if (end == nullptr || *end != '-') throw std::invalid_argument("STRIX_DS41_PREFILL_APPROX_LAYERS: first-end");
-        options.approx_layer_end = static_cast<std::uint32_t>(std::strtoul(end + 1, nullptr, 10));
-    }
-    if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_A8"); e != nullptr && std::string(e) == "1") options.fp16_keep_a8 = true;
-    if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_FAST"); e != nullptr && std::string(e) == "1") options.fp16_fast = true;
-    if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_WSPLIT"); e != nullptr && std::string(e) == "1") options.fp16_wsplit = true;
+    m.requested = requested;
+    m.resolve_levers(options, requested);  // the per-object switches (shared with apply_levers)
     m.moe_window_auto = options.moe_chunk_rows == 0U;
     if (m.moe_window_auto) options.moe_chunk_rows = 4096U;
     m.options = options;
@@ -883,34 +961,6 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
     if (options.attention_lanes == 0U || options.attention_lanes > 16U) throw std::invalid_argument("deepseek41 prefill: attention_lanes 1..16");
     if (options.moe_chunk_rows == 0U || options.moe_chunk_rows % options.chunk_rows != 0U)
         throw std::invalid_argument("deepseek41 prefill: moe_chunk_rows a multiple of chunk_rows");
-    if (const char* v = std::getenv("STRIX_DS41_PREFILL_MOE_PERSIST"); v != nullptr && v[0] == '0') m.moe_persist = false;
-    if (const char* v = std::getenv("STRIX_DS41_PREFILL_ASYNC_GATHER"); v != nullptr && v[0] == '0') m.async_gather = false;
-    if (const char* v = std::getenv("STRIX_DS41_PREFILL_PACK"); v != nullptr && v[0] == '0') m.pack = false;
-    if (const char* v = std::getenv("STRIX_DS41_PREFILL_JOINT"); v != nullptr && v[0] == '1') m.moe_joint = true;
-    if (const char* v = std::getenv("STRIX_DS41_PREFILL_OVERLAP"); v != nullptr && v[0] == '0') m.overlap = false;
-    m.split_min_rows = options.split_min_rows;
-    if (const char* v = std::getenv("STRIX_DS41_PREFILL_SPLIT_MIN_ROWS"); v != nullptr && *v != 0)
-        m.split_min_rows = static_cast<std::uint32_t>(std::strtoul(v, nullptr, 10));
-    m.joint_max_rows = options.joint_max_rows;
-    if (const char* v = std::getenv("STRIX_DS41_PREFILL_JOINT_MAX_ROWS"); v != nullptr && *v != 0)
-        m.joint_max_rows = static_cast<std::uint32_t>(std::strtoul(v, nullptr, 10));
-    if (const char* v = std::getenv("STRIX_DS41_PREFILL_DENSE_SITES"); v != nullptr) {
-        const std::string list = std::string(",") + v + ",";
-        m.dense_q_a = list.find(",q_a,") != std::string::npos;
-        m.dense_kv = list.find(",kv,") != std::string::npos;
-        m.dense_q_b = list.find(",q_b,") != std::string::npos;
-        m.dense_o_a = list.find(",o_a,") != std::string::npos;
-    }
-    if (const char* v = std::getenv("STRIX_DS41_PREFILL_DENSE_MIN_ROWS"); v != nullptr && *v != 0) m.dense_min_rows = static_cast<std::uint32_t>(std::stoul(v));
-    m.env_dense_q_b = m.dense_q_b;
-    m.env_dense_o_a = m.dense_o_a;
-    // the exact dense selector is the default (bitwise EQUAL, 2K -5.5 % / 8K -5.1 % TTFT);
-    // STRIX_DS41_DENSE_SELECT=0 = the loaded configuration above (STRIX_DS41_DENSE_TALL / PREFILL_DENSE_SITES)
-    if (const char* v = std::getenv("STRIX_DS41_DENSE_SELECT"); !(v != nullptr && v[0] == '0' && v[1] == 0)) {
-        m.dense_select = true;
-        m.dense_q_b = true;
-        m.dense_o_a = true;
-    }
     m.model = validate_target(read_file(gguf));
     m.plan = build_decode_plan(m.model, 0, options.layers);
     m.file = std::make_unique<Mapped>(gguf);
@@ -1181,9 +1231,7 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
                 m.staged_half = comm->send_staging(bytes) != nullptr;
                 if (!m.staged_half && bytes > before) comm->resize_bytes(before, false);
             }
-            m.staged_gather = m.staged_half;
-            if (const char* v = std::getenv("STRIX_DS41_PREFILL_STAGED_GATHER"); v != nullptr && v[0] == '0') m.staged_gather = false;
-            if (const char* v = std::getenv("STRIX_DS41_PREFILL_EARLY_QB"); v != nullptr && v[0] == '0') m.early_q_b = false;
+            m.staged_gather = m.staged_half && m.staged_gather_allowed;  // (STAGED_GATHER, EARLY_QB: Impl::resolve_levers)
         }
         m.half_own = Dev<float>(half_rows * H);
         m.half_other = Dev<float>(half_rows * H);
@@ -1356,6 +1404,7 @@ std::uint64_t DevicePrefill::owned_weight_bytes(const std::filesystem::path& ggu
     return need;
 }
 std::string DevicePrefill::overlay_description() const { return impl_->overlay ? impl_->overlay->describe() : std::string{}; }
+std::filesystem::path DevicePrefill::overlay_path() const { return impl_->overlay ? impl_->overlay->path() : std::filesystem::path{}; }
 
 namespace {
 
@@ -1634,6 +1683,24 @@ void DevicePrefill::set_precision_for_new_sequence(bool dense,bool attention) {
     impl_->options.fp16_dense=dense;impl_->options.bf16_attention=attention;impl_->broken=true;
 }
 
+void DevicePrefill::set_cone(bool on) {
+    if (impl_->task) throw std::logic_error("cannot change the cone during a prefill task");
+    impl_->options.cone = on;
+}
+
+void DevicePrefill::apply_levers() {
+    if (impl_->task) throw std::logic_error("cannot apply levers during a prefill task");
+    auto& m = *impl_;
+    PrefillOptions o = m.options;
+    m.resolve_levers(o, m.requested);
+#ifndef STRIX_DS41_PREFILL_FP16_LT
+    if (o.fp16_dense) throw std::invalid_argument("FP16 prefill backend not built");
+#endif
+    if (o.fast_attention && o.fast_attention_flash) m.prepare_flash_mirrors();
+    m.options = o;
+    m.broken = true;  // like set_precision_for_new_sequence: the next run() starts a new sequence
+}
+
 void DevicePrefill::set_dense_select(bool on) {
     if (impl_->task) throw std::logic_error("cannot change the dense selector during a prefill task");
     auto& m = *impl_;
@@ -1663,6 +1730,8 @@ void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions& p) {
     o.fast_attention_flash = p.fast_attention_flash;
     o.fast_moe = p.fast_moe;
     o.fast_dense = p.fast_dense;
+    o.decoder_replay_rows = p.decoder_replay_rows;
+    o.decoder_replay_override = p.decoder_replay_override;
     o.fast_engram = p.fast_engram;
     // no process-wide switch: run_from installs these options as the precision of its own execution (another
     // DevicePrefill of the process keeps its own; strix/ds41_prefill_precision.hpp)
@@ -1781,10 +1850,18 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     // own cone, as this code plans it (rounded down to W, with the draft rows), starts at least one attention window
     // after the continuation's first row in every decoder layer, so it reads no decoder ring entry of this run.
     const std::uint32_t first_decoder = ds41::SuffixReplayGeometry{}.first_decoder;
+    // the bounded decoder replay's bound (0 off) and oracle form, agreed by both ranks with the deferral below
+    // (PrefillOptions::decoder_replay_rows, else the environment). A run from position 0 only: a later run (extend)
+    // continues from the bounded state with the exact plan.
+    const std::uint32_t bounded = P0 != 0U ? 0U : (m.options.decoder_replay_override || m.options.decoder_replay_rows != 0U) ? m.options.decoder_replay_rows : prefill_decoder_replay_rows();
+    const bool bounded_oracle = bounded != 0U && prefill_decoder_replay_oracle();
+    result.decoder_replay_rows = bounded;
+    result.decoder_replay_oracle = bounded_oracle;
     bool defer = false;
     {
         const std::uint32_t next_rows = std::exchange(m.defer_next, 0U);
-        static const bool defer_on = [] { const char* v = std::getenv("STRIX_DS41_DEFER_DECODER"); return !(v && std::strcmp(v, "0") == 0); }();
+        static strix::lever_cache<bool> defer_on_cache{[] { const char* v = std::getenv("STRIX_DS41_DEFER_DECODER"); return !(v && std::strcmp(v, "0") == 0); }};
+        const bool defer_on = defer_on_cache.get();
         if (next_rows != 0U && defer_on && m.options.cone && m.options.layers == c.num_hidden_layers && m.options.layers > first_decoder &&
             m.snap_points.empty() && (P0 + T) % W == 0U && grp == nullptr) {
             ds41::SuffixReplayGeometry g;
@@ -1794,30 +1871,66 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             for (const auto& pl : ds41::plan_suffix_replay(g, 0U, next_rows).layers)
                 if (pl.layer >= first_decoder && pl.out_begin / W * W < attn::kWindow) defer = false;
         }
-        if (grp == nullptr && m.distributed() && m.options.cone && m.options.layers == c.num_hidden_layers) {  // both ranks: the same decision
-            const std::array<std::uint32_t, 2> mine{defer ? 1U : 0U, defer ? next_rows : 0U};
-            std::array<std::uint32_t, 2> other{};
+        if (grp == nullptr && m.distributed() && (m.options.cone || bounded != 0U) && m.options.layers == c.num_hidden_layers) {  // both ranks: the same decision
+            const std::array<std::uint32_t, 3> mine{defer ? 1U : 0U, defer ? next_rows : 0U, bounded | (bounded_oracle ? 0x80000000U : 0U)};
+            std::array<std::uint32_t, 3> other{};
             m.options.communicator->exchange_host(std::as_bytes(std::span(mine)), std::as_writable_bytes(std::span(other)),
                                                   dist::Tag{static_cast<std::uint32_t>(dist::TagKind::control), 0x64656631U, P0});
             if (other != mine)
-                throw std::runtime_error("deepseek41 prefill: the ranks disagree on the decoder deferral of the run at " + std::to_string(P0));
+                throw std::runtime_error("deepseek41 prefill: the ranks disagree on the decoder deferral or the bounded decoder replay of the run at " + std::to_string(P0));
         }
     }
+    // bounded decoder replay (FAST policy ds41-decoder-replay-bounded-v1): v1 is a fresh prompt's whole cone only
+    if (bounded != 0U) {
+        if (m.options.draft_rows > bounded)
+            throw std::invalid_argument("ds41-decoder-replay-bounded-v1: draft_rows = " + std::to_string(m.options.draft_rows) +
+                                        " exceeds R = " + std::to_string(bounded));
+        if (ds41::bounded_replay_floor_unit % W != 0U)
+            throw std::invalid_argument("ds41-decoder-replay-bounded-v1: window_rows = " + std::to_string(W) +
+                                        " must divide the fixed floor unit = " + std::to_string(ds41::bounded_replay_floor_unit));
+        if (bounded % attn::kWindow != 0U || bounded % W != 0U)
+            throw std::invalid_argument("ds41-decoder-replay-bounded-v1: the bound must be a multiple of 128 and of window_rows");
+        if (bounded < ds41::bounded_replay_min_rows)
+            throw std::invalid_argument("ds41-decoder-replay-bounded-v1: bounds below " + std::to_string(ds41::bounded_replay_min_rows) +
+                                        " rows fail the DS41 FAST quality gate (R = 128: dNLL +0.01406 > +0.00991)");
+        // its plan replaces the cone (also without options.cone: the quality runner's all-rows form, whose head rows lie
+        // inside the bound)
+        if (m.options.layers != c.num_hidden_layers || !m.snap_points.empty() || defer || m.state_incomplete || grp != nullptr ||
+            (!m.options.cone && m.options.quality_head_rows > bounded))
+            throw std::invalid_argument("ds41-decoder-replay-bounded-v1 (v1): a fresh prompt's whole-model run only (no cached prefix, "
+                                        "no in-run snapshot points, no decoder deferral, no group pass, head rows inside the bound)");
+        // floored window keys only on the flash and exact attention forms: never the f16wmma (spilling) or BF16 forms
+        for (std::uint32_t layer = first_decoder; layer < m.options.layers; ++layer)
+            if (m.bf16_at(layer) || (m.fast_attn_at(layer) && !m.flash_attn_at(layer)))
+                throw std::invalid_argument("ds41-decoder-replay-bounded-v1: decoder layer " + std::to_string(layer) +
+                                            " would take the f16wmma or BF16 attention form (only flash or exact take a key floor)");
+    }
+    m.exact_dense_from = bounded != 0U ? first_decoder : 0xFFFFFFFFU;  // both modes (bounded and oracle): one dense form
     result.decoder_deferred = defer;
     if (defer) result.next_token = 0xFFFFFFFFU;
-    struct Rows { std::uint32_t x0 = 0, k0 = 0, o0 = 0; };
+    struct Rows { std::uint32_t x0 = 0, k0 = 0, o0 = 0, kf = 0; };  // kf: the window key floor (0 none)
     std::vector<Rows> rows(m.options.layers);
-    if (m.options.cone && m.options.layers == c.num_hidden_layers && grp == nullptr) {  // a group pass: every row in every layer (exact)
+    if ((m.options.cone || bounded != 0U) && m.options.layers == c.num_hidden_layers && grp == nullptr) {  // a group pass: every row in every layer (exact)
         ds41::SuffixReplayGeometry g;
         g.layers = c.num_hidden_layers;
         g.draft_rows = m.options.draft_rows;
-        const auto plan = ds41::plan_suffix_replay(g, 0U, T);
+        const auto plan = bounded != 0U && !bounded_oracle ? ds41::plan_bounded_replay(g, 0U, T, bounded) : ds41::plan_suffix_replay(g, 0U, T);
         const auto down = [&](std::uint64_t v) { return static_cast<std::uint32_t>(v / W * W); };
+        // ds41-decoder-replay-bounded-v1: fixed 256-row floor, independent of scheduling window_rows.
+        static_assert(ds41::bounded_replay_floor_unit == attn::kMaxCallRows);
+        const auto key_cut = bounded != 0U ? static_cast<std::uint32_t>(ds41::bounded_replay_key_floor(T, bounded)) : 0U;
         for (const auto& pl : plan.layers) {
             if (pl.layer >= m.options.layers) continue;
             auto& r = rows[pl.layer];
             r.o0 = down(pl.out_begin);
             r.k0 = down(pl.kv_begin);
+            if (bounded != 0U && pl.layer >= first_decoder) {
+                r.kf = key_cut;
+                r.o0 = std::max(r.o0, key_cut);
+                r.k0 = std::max(r.k0, key_cut);
+                // Clamping also protects Release and the oracle: no query below the key floor.
+                assert(r.o0 >= r.kf && r.k0 >= r.kf);
+            }
             r.x0 = m.roles[pl.layer].owns_kv ? 0U : r.k0;
         }
         // in-run snapshot points: also the cone of the state at p (one contiguous suffix per layer: the union)
@@ -2231,9 +2344,10 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     for (std::uint32_t k = 0; k < engram_cols; ++k)
                         m.engram_ahead_requests.push_back({li, nids[std::size_t{t} * per_token + li * engram_cols + k]});
         }
-        static const bool ahead_log = strix::envcfg::flag("STRIX_DS41_ENGRAM_LOOKAHEAD_LOG", false);
+        static strix::lever_cache<bool> ahead_log_cache{[] { return strix::envcfg::flag("STRIX_DS41_ENGRAM_LOOKAHEAD_LOG", false); }};
+        const bool ahead_log = ahead_log_cache.get();
         const auto own_stats = ahead_log ? m.engram_reader->stats() : ds41::EngramReaderStats{};
-        const auto start_ahead = [&m, P0, T, own_stats] {  // after this run's own read (the reader serves one caller at a time)
+        const auto start_ahead = [&m, P0, T, own_stats, ahead_log] {  // after this run's own read (the reader serves one caller at a time)
             if (ahead_log) {
                 const auto s = m.engram_reader->stats();
                 std::fprintf(stderr, "engram lookahead: run at %u, %u rows: own read %llu requests, %llu cache hits, %llu misses, %.3f s busy; next run %zu requests\n",
@@ -2244,7 +2358,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             }
             if (m.engram_ahead_requests.empty()) return;
             try {  // no thread: the next run reads its rows itself
-                m.engram_ahead = std::thread([&m] {
+                m.engram_ahead = std::thread([&m, ahead_log] {
                     const auto t0 = std::chrono::steady_clock::now();
                     try {
                         m.engram_ahead_out.resize(m.engram_ahead_requests.size() * 264U);
@@ -2275,7 +2389,8 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 // the same shared read-ahead loop to independently ready layers.
                 const std::size_t layer_requests = std::size_t{Tn} * engram_cols;
                 std::vector<std::size_t> offsets{0};
-                static const bool piece_read = strix::envcfg::flag("STRIX_DS41_ENGRAM_PIECE_READ", true, strix::EnvFlagMatch::exact);
+                static strix::lever_cache<bool> piece_read_cache{[] { return strix::envcfg::flag("STRIX_DS41_ENGRAM_PIECE_READ", true, strix::EnvFlagMatch::exact); }};
+                const bool piece_read = piece_read_cache.get();
                 if (engram_split_read && !engram_layer_blocks && Tn > 0U && piece_read) {
                     engram_piece_rows = m.task != nullptr && m.task->opt.engram_rows != 0U ? std::min(m.task->opt.engram_rows, C) : C;
                     engram_piece_blocks = (Tn + engram_piece_rows - 1U) / engram_piece_rows;
@@ -2476,6 +2591,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     };
     for (const auto& s : m.plan.steps) {
         const auto layer = static_cast<std::uint32_t>(std::max(s.layer, 0));
+        m.dense_exact = s.layer >= 0 && layer >= m.exact_dense_from;
         if (defer && (s.layer < 0 ? s.op == Op::head || s.op == Op::argmax : layer >= first_decoder)) {
             // deferred decoder: only a compressed-KV source's attention input and its compressor run (no head)
             const bool source = s.layer >= 0 && m.roles[layer].owns_kv;
@@ -3098,6 +3214,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         }
                         v.partial = ln.attn_partial.p;
                         v.tickets = ln.attn_tickets.p;
+                        v.key_floor = R0.kf != 0U ? static_cast<std::uint32_t>(P0 + R0.kf) : 0U;  // bounded decoder replay: no window key below the cut
                         v.o = m.o.p + std::size_t{w0 - r0} * QL;
                         if (o_a8_fused) {
                             v.codes = m.ocodes.p + std::size_t{w0 - r0} * QL;
@@ -3689,7 +3806,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 }
                 break;
             }
-            if(m.options.quality_head_rows>1) {
+            if(m.options.quality_head_rows>1 && !m.options.cone) {
                 unsigned nr=std::min(m.options.quality_head_rows,Tn),first=Tn-nr;
                 ds41::enqueue_hc_collapse(stream_now()+std::size_t(first)*stream_row,m.identity_pre?nullptr:m.mix_ffn.p+first,nr,H,m.quality_h.p,st);
                 ds41::enqueue_rms_norm(m.quality_h.p,m.devf("output_norm.weight"),nr,H,H,1e-20F,m.quality_h.p,st);
@@ -4229,7 +4346,8 @@ std::vector<PrefillResult> DevicePrefill::run_group(std::span<const PrefillSegme
 }
 
 void DevicePrefill::set_engram_lookahead(std::span<const std::uint32_t> next) {
-    static const bool on = [] { const char* v = std::getenv("STRIX_DS41_ENGRAM_LOOKAHEAD"); return !(v && std::strcmp(v, "0") == 0); }();
+    static strix::lever_cache<bool> on_cache{[] { const char* v = std::getenv("STRIX_DS41_ENGRAM_LOOKAHEAD"); return !(v && std::strcmp(v, "0") == 0); }};
+    const bool on = on_cache.get();
     impl_->engram_next.assign(next.begin(), next.end());
     if (!on) impl_->engram_next.clear();
 }

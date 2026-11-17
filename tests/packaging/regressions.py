@@ -272,6 +272,8 @@ def test_6():
 def test_7():
     package = tmp / 'package'
     write(package / 'bin/strix-cuda-ds41-replica.exe', 'not executed')
+    manifest = package / 'share/strix/support/executables-cuda.txt'
+    write(manifest, 'strix-cuda-ds41-replica.exe\n')
     path = write(package / 'smoke.ps1', source('packaging/windows/smoke.ps1'))
     metadata()
     log = tmp / 'processes.txt'
@@ -297,11 +299,94 @@ return $p
     (package / 'bin/strix-cuda-ds41-replica.exe').unlink()
     missing = ps(mocks + f'& {ps_quote(path)} -Prefix {ps_quote(package)} -EffectiveConfigArgs fixture\n')
     assert missing.returncode != 0, 'explicit inspection without a server skipped'
-    # Qwen HTTP is supported, but explicit inspection must fail, not invent an option.
+    # Qwen inspection must reach the executable with its supported CLI option.
     metadata(ds=False)
     write(package / 'bin/strix-cuda-qwen-serve.exe', 'not executed')
-    unsupported = ps(mocks + f'& {ps_quote(path)} -Prefix {ps_quote(package)} -EffectiveConfigArgs fixture\n')
-    assert unsupported.returncode != 0, 'unsupported Qwen inspection accepted'
+    write(manifest, 'strix-cuda-qwen-serve.exe\n')
+    inspected = ps(mocks + f'& {ps_quote(path)} -Prefix {ps_quote(package)} -EffectiveConfigArgs fixture\n')
+    ok(inspected)
+    assert 'strix-cuda-qwen-serve.exe fixture --print-effective-config' in log.read_text(encoding='utf-8-sig')
+
+
+def test_9():
+    package, prefix, config = tmp / 'package', tmp / 'installed', tmp / 'config'
+    installer = write(package / 'install.ps1', source('packaging/windows/install.ps1'))
+    for name in ('a', 'b'):
+        write(package / f'bin/strix-{name}.exe', f'payload {name}')
+    for name in ('serve.toml', 'serve.args', 'devices.example.toml'):
+        write(package / 'etc/strix' / name, 'configuration fixture')
+    command = f'& {ps_quote(installer)} -Prefix {ps_quote(prefix)} -ConfigDir {ps_quote(config)}\n'
+    copy_failure = '''$script:copies = 0
+function Copy-Item {
+param($LiteralPath, $Path, $Destination, [switch]$Force)
+$script:copies++
+if ($script:copies -eq 2) { throw 'injected second-copy failure' }
+if ($LiteralPath) { Microsoft.PowerShell.Management\\Copy-Item -LiteralPath $LiteralPath -Destination $Destination -Force:$Force }
+else { Microsoft.PowerShell.Management\\Copy-Item -Path $Path -Destination $Destination -Force:$Force }
+}
+'''
+    failed = ps(copy_failure + command)
+    assert failed.returncode != 0 and 'injected second-copy failure' in failed.stdout
+    assert not list((prefix / 'bin').glob('*.exe')), 'failed copy left unowned payload'
+    ok(ps(command))
+    manifest = prefix / 'install-manifest.json'
+    old_manifest = manifest.read_bytes()
+    old_payload = {p.name: p.read_bytes() for p in (prefix / 'bin').glob('*.exe')}
+    write(package / 'bin/strix-a.exe', 'upgraded a')
+    assert ps(copy_failure + command).returncode != 0
+    assert manifest.read_bytes() == old_manifest, 'failed upgrade changed ownership'
+    assert {p.name: p.read_bytes() for p in (prefix / 'bin').glob('*.exe')} == old_payload
+    # Failure while preparing the new manifest must restore the whole old payload.
+    manifest_failure = '''function Set-Content {
+param($LiteralPath, $Path, $Value, [Parameter(ValueFromPipeline=$true)]$InputObject)
+process {
+if ($LiteralPath -like '*manifest.json') { throw 'injected manifest failure' }
+Microsoft.PowerShell.Management\\Set-Content -Path $Path -Value $Value
+}
+}
+'''
+    failed = ps(manifest_failure + command)
+    assert failed.returncode != 0 and 'injected manifest failure' in failed.stdout
+    assert manifest.read_bytes() == old_manifest
+    assert {p.name: p.read_bytes() for p in (prefix / 'bin').glob('*.exe')} == old_payload
+    ok(ps(command))
+    # OS integration fails after commit; a normal reinstall must still succeed.
+    failed = ps("function New-ScheduledTaskAction { throw 'injected task failure' }\n" + command.rstrip() + ' -RegisterTask\n')
+    assert failed.returncode != 0 and 'injected task failure' in failed.stdout
+    ok(ps(command))
+    invalid_config = write(tmp / 'config-file', 'existing file')
+    fresh = tmp / 'fresh'
+    failed = ps(f'& {ps_quote(installer)} -Prefix {ps_quote(fresh)} -ConfigDir {ps_quote(invalid_config)}\n')
+    assert failed.returncode != 0
+    assert not fresh.exists(), 'invalid ConfigDir mutated the prefix'
+
+
+def test_10():
+    package = tmp / 'package'
+    script = write(package / 'smoke.ps1', source('packaging/windows/smoke.ps1'))
+    manifest = write(package / 'share/strix/support/executables-cuda.txt', 'strix-a.exe\nstrix-b.exe\n')
+    a = write(package / 'bin/strix-a.exe', 'never executed')
+    b = write(package / 'bin/strix-b.exe', 'never executed')
+    mocks = '''function Start-Process {
+param($FilePath, $ArgumentList, $RedirectStandardOutput, $RedirectStandardError,
+      [switch]$NoNewWindow, [switch]$PassThru)
+Set-Content -LiteralPath $RedirectStandardOutput -Value 'usage: fixture'
+Set-Content -LiteralPath $RedirectStandardError -Value ''
+$p = [pscustomobject]@{ ExitCode = 0 }
+$p | Add-Member ScriptMethod WaitForExit { param($ms) return $true }
+return $p
+}
+'''
+    command = mocks + f'& {ps_quote(script)} -Prefix {ps_quote(package)}\n'
+    ok(ps(command))
+    b.unlink()
+    assert ps(command).returncode != 0, 'missing one expected executable accepted'
+    a.unlink()
+    assert ps(command).returncode != 0, 'missing all expected executables accepted'
+    write(manifest, '')
+    assert ps(command).returncode != 0, 'empty expected-executable manifest accepted'
+    manifest.unlink()
+    assert ps(command).returncode != 0, 'missing expected-executable manifest accepted'
 
 
 def test_8():

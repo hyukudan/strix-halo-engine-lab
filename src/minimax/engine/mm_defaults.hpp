@@ -63,6 +63,8 @@ struct PrefillPolicy {
     bool idx_wmma = false;                         // index projections on the shared FP16 WMMA core (prefill rows > 8)
     std::string idx_wmma_layers;                   // canonical ranges of its layer set (builtin kIdxWmmaLayers)
     std::string idx_wmma_asked;                    // "default" or the explicit value
+    bool router_wmma = false;                      // STRIX_MM_PF_ROUTER_WMMA=1: FAST router product (mm-pf-router-wmma-v1)
+    std::string router_wmma_layers;                // its layer set (builtin kRouterWmmaLayers), canonical ranges
     std::string policies;                          // named FAST policies that run, '+'-joined; empty: none
     std::string note;                              // why a bundle member does not run; empty: none
 };

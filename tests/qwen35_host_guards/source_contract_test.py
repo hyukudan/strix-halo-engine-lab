@@ -13,7 +13,7 @@ for member in ("codes", "deltas", "g", "u"):
     assert f"fr(wide.{member})" in destructor
 for line in impl.splitlines():
     if "linear(" in line or "glu(" in line:
-        assert line.rstrip().endswith(", stream, wide);")
+        assert line.rstrip().endswith(", stream, wide, iu4);")  # every dense call carries both engine-owned scratches
 
 cuda = (root / "src/qwen35/cuda/engine.cu").read_text()
 assert cuda.index("pf.sl.clear();") < cuda.index("allocations.clear();")

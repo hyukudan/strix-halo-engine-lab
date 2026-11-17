@@ -1,6 +1,8 @@
 // Resident Windows PRO worker. Build never launches this executable.
 #include "sender.hpp"
 #include "runtime.hpp"
+#include "strix/device/budget.hpp"
+#include "strix/device/profiles.hpp"
 #include "verified_io.hpp"
 #include "policy.hpp"
 #include "dgpu.hpp"
@@ -208,12 +210,14 @@ int main(int argc,char** argv){p::install_crash_report();try{
     std::string dgpu_value;bool dgpu_given=false; // --dgpu auto|off|<uuid> (dgpu.hpp): the card, set before any CUDA call
     std::string command_file,command_out; // --decode-commands from a file (e.g. under a profiler that keeps stdin), results also to a file
     std::string cache,model,manifest_hash,key_file,export_dir,prompt_file,identity="glm-pf-rtx-native-v1",bind="127.0.0.1";unsigned port=8097,capacity=8192,tile=0,host_floor_gib=8,max_device_layers=43,max_pinned_layers=43;bool require_file_tier=false,allow=false,graphs=true,self_check=false,legacy_index=false,serial_stage=false,enable_generate=false,decode_commands=false,decode_profile=false;std::vector<std::string> check_prompts;unsigned decode_tokens=0;p::DecodeOptions dopts;bool plan_budget=false,print_effective=false,check_commands=false;double device_total_gib=-1,device_free_gib=-1;
+    std::string device_profile; // --device-profile NAME (strix/device/profiles.hpp)
     for(int i=1;i<argc;++i){std::string a=argv[i];if(a=="--require-file-tier")require_file_tier=true;else if(a=="--legacy-fp32-index")legacy_index=true;else if(a=="--serial-stage")serial_stage=true;else if(a=="--self-check-schedule")self_check=true;else if(a=="--allow-gpu")allow=true;else if(a=="--no-graphs")graphs=false;else if(a=="--enable-generate")enable_generate=true;else if(a=="--decode-commands")decode_commands=true;else if(a=="--reference-compare")dopts.reference_compare=true;else if(a=="--plan-budget")plan_budget=true;else if(a=="--allow-pending"){}else if(a=="--print-effective-config")print_effective=true;else if(a=="--check-decode-commands")check_commands=true;else if(a=="--decode-profile")decode_profile=true;else {w::require(i+1<argc,"missing option argument");std::string value=argv[++i];if(a=="--profile"){}else if(a=="--dgpu"){dgpu_value=value;dgpu_given=true;}else if(a=="--cache")cache=value;else if(a=="--model")model=value;else if(a=="--cache-manifest-sha256")manifest_hash=value;else if(a=="--key-file")key_file=value;else if(a=="--export-state")export_dir=value;else if(a=="--prompt"){prompt_file=value;check_prompts.push_back(value);}else if(a=="--identity")identity=value;else if(a=="--decode"){auto n=std::stoul(value);w::require(n>=1&&n<=131072,"decode token count");decode_tokens=unsigned(n);}else if(a=="--expert-tier")dopts.expert_tier=value;else if(a=="--unit-file")dopts.unit_file=value;else if(a=="--vram-total-gib")dopts.vram_total_gib=std::stod(value);else if(a=="--ram-total-gib")dopts.ram_total_gib=std::stod(value);else if(a=="--device-total-gib")device_total_gib=std::stod(value);else if(a=="--device-free-gib")device_free_gib=std::stod(value);else if(a=="--tier-vram-gib")dopts.tier_vram_gib=std::stod(value);else if(a=="--tier-ram-gib")dopts.tier_ram_gib=std::stod(value);
         else if(a=="--tier-spare-slots"){dopts.tier_spare_slots=unsigned(std::stoul(value));dopts.tier_spare_permille=0;}else if(a=="--tier-spare-percent"){const double v=std::stod(value);if(!(v>=0&&v<=50))throw std::runtime_error("--tier-spare-percent must be in [0, 50]");dopts.tier_spare_permille=unsigned(v*10+0.5);}else if(a=="--expert-residency")dopts.expert_residency=value;else if(a=="--expert-routes")dopts.expert_routes=value;else if(a=="--routes-out")dopts.routes_out=value;else if(a=="--routes-prefill"){w::require(value=="0"||value=="1","--routes-prefill 0|1");dopts.routes_prefill=value=="1";}
         else if(a=="--tier-policy"){w::require(value=="lru"||value=="scored"||value=="auto","--tier-policy must be lru, scored or auto");dopts.tier_policy=value;}else if(a=="--tier-predict"){w::require(value=="0"||value=="1","--tier-predict 0|1");dopts.tier_predict=value=="1";}
         else if(a=="--skip-empty-expert-groups"){w::require(value=="0"||value=="1","--skip-empty-expert-groups 0|1");dopts.skip_empty_expert_groups=value=="1";}
         else if(a=="--persistent-dense-fp16"){w::require(value=="0"||value=="1","--persistent-dense-fp16 0|1");dopts.persistent_dense_fp16=value=="1";}
         else if(a=="--dsa-short-skip")p::set_dsa_short_skip_value(dopts,value);
+        else if(a=="--device-profile")device_profile=value;
         else if(a=="--decode-row-kernels")p::set_row_kernels_value(dopts,value);
         else if(a=="--command-file")command_file=value;else if(a=="--command-out")command_out=value;
         else if(a=="--mtp-self-spec"){w::require(value=="0"||value=="1"||value=="always","--mtp-self-spec 0|1|always");dopts.mtp_spec=value!="0";dopts.spec_always=value=="always";}
@@ -240,6 +244,18 @@ int main(int argc,char** argv){p::install_crash_report();try{
     // run: its builtin form runs and it is listed (receipt + one stderr line). --print-effective-config prints the
     // resolution (the first receipt event's "profile" object) and exits here, before any model read or CUDA call.
     namespace rp=strix::glm::rtxpf::profile;
+    // ONE budget resolver (strix/device/budget.hpp), as every route: --vram-total-gib / --ram-total-gib > the known
+    // device model given by --device-profile NAME (docs/devices.md) > no cap (today's path).
+    if(!device_profile.empty()){
+        strix::device::Descriptor d;d.id="glm-producer";d.profile=device_profile;
+        if(!strix::device::find_profile(device_profile))throw std::invalid_argument("--device-profile: unknown profile "+device_profile+"; known: "+strix::device::profile_names());
+        strix::device::BudgetOverrides given;
+        if(dopts.vram_total_gib>=0)given.vram_total_gib=dopts.vram_total_gib;
+        if(dopts.ram_total_gib>=0)given.ram_total_gib=dopts.ram_total_gib;
+        const auto budget=strix::device::resolve_budget(d,nullptr,0,given);
+        dopts.vram_total_gib=budget.device_gib();dopts.ram_total_gib=budget.host_gib();
+        std::fprintf(stderr,"glm-producer: memory budget %s\n",budget.json().c_str());
+    }
     rp::Inputs profile_inputs;for(int i=1;i<argc;++i)profile_inputs.args.emplace_back(argv[i]);
     const auto prof=rp::resolve(rp::App::decode_service,profile_inputs);
     auto use=[&](const char* lever)->const rp::Entry*{auto* e=prof.find(lever);return e&&(e->status==rp::Status::profile||e->status==rp::Status::unqualified)?e:nullptr;};

@@ -47,6 +47,7 @@
 // C1 MTP: with one request in flight (none waiting) it decodes through the engine's exact single-slot self-speculation
 // (verify / commit / adaptive K, the CLI --decode route); rank 1 replays mtp_enter / mtp_run / mtp_leave. Any second
 // request ends the decoder at a cycle boundary (deferred rows flushed) and batched plain steps follow.
+#include "strix/pair/state_decls.hpp"
 #include "strix/device/hip_gate.hpp"
 #include "glm_rank_defaults.hpp"
 #include "glm_auto_rows.hpp"
@@ -862,6 +863,7 @@ int main(int argc, char** argv) {
         bool import_gate_on = false;          // --import-gate given (an empty list is a gate that FAILs, not serving)
         unsigned import_gate_tokens = 64;
         bool import_dsa_once = false;         // every rank: hand-off v2, rank 0 relays the DSA components to rank 1
+        int import_dsa_once_cli = -1;         // --import-dsa-once 1 / --no-import-dsa-once 0; resolved below
         bool import_index_tail = false;       // every rank: hand-off v3/v4, DSA index key/gate as the open pool block only
         std::vector<std::string> rank_args;  // the options the rank defaults depend on (rd::scan)
         for (int i = 2; i < argc; ++i) {
@@ -936,7 +938,8 @@ int main(int argc, char** argv) {
                 import_gate_on = true;
             }
             else if (a == "--import-gate-tokens") import_gate_tokens = static_cast<unsigned>(std::stoul(next()));
-            else if (a == "--import-dsa-once") import_dsa_once = true;
+            else if (a == "--import-dsa-once") import_dsa_once_cli = 1;
+            else if (a == "--no-import-dsa-once") import_dsa_once_cli = 0;
             else if (a == "--import-index-tail") import_index_tail = true;
             else if (strix::session::speculation_opt_out_argument(a)) serve_mtp = false;
             else throw std::invalid_argument("unknown option " + a);
@@ -953,6 +956,16 @@ int main(int argc, char** argv) {
         if (opt.capacity == 0 || opt.capacity % 4 != 0) throw std::invalid_argument("--capacity must be a positive multiple of 4");
         if (opt.world != 1 && opt.world != 2) throw std::invalid_argument("--world 1|2");
         if (opt.rank >= opt.world) throw std::invalid_argument("--rank must be < --world");
+        {
+            // One resolver for the hand-off owners (strix/pair/state_owners.hpp, GLM declaration in state_decls.hpp): the
+            // flag, then STRIX_HANDOFF_SHARED_ONCE, then the family default (DSA once, v2: the same bytes, relayed). The
+            // automatic default applies where v2 runs (import receiver on, a pair); an explicit request elsewhere refuses below.
+            namespace ps = strix::pair::state;
+            const ps::Resolved owners = ps::resolve(ps::decl::glm, import_dsa_once_cli, -1);
+            import_dsa_once = import_dsa_once_cli == 1 || (owners.shared_once && import_dsa_once_cli != 0 && !import_listen.empty() && opt.world == 2);
+            if (owners.prefix_first && !import_listen.empty())
+                std::printf("serve import: STRIX_HANDOFF_PREFIX_FIRST is not bound on the GLM import route yet (imports skip the prefix cache)\n");
+        }
         if (import_gate_on && import_gate.find_first_not_of(',') == std::string::npos)
             return import_gate_empty(import_gate);  // --import-gate "" or ",": an explicit empty suite FAILs before loading
         if (import_gate_on && (opt.rank != 0 || rtx_prefill.empty()))  // before the follower dispatch: rank 1 must not exit 0

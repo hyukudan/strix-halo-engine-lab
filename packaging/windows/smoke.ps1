@@ -7,7 +7,7 @@ Every bin\strix-*.exe must load (no missing DLL) and answer --help. strix-skelet
 answer GET /health = 200 without weights. With -ServeArgs (a real model), the default server is started with
 those arguments and /health must answer 200 within -HealthSeconds. With -EffectiveConfigArgs the server's
 inspection option must exit 0. Unsupported explicitly requested checks fail. DeepSeek uses a spool service,
-not HTTP, and supports --print-config; Qwen supports HTTP but no configuration inspection option.
+not HTTP, and supports --print-config; Qwen supports HTTP and --print-effective-config.
 
 .EXAMPLE
 powershell -ExecutionPolicy Bypass -File smoke.ps1
@@ -46,7 +46,17 @@ function Test-Health([int]$port) {
 
 $bin = Join-Path $Prefix 'bin'
 if (-not (Test-Path $bin)) { Write-Host "FAIL no bin directory at $bin"; exit 1 }
-foreach ($exe in Get-ChildItem -Path $bin -Filter 'strix-*.exe') {
+$expectedPath = Join-Path $Prefix 'share\strix\support\executables-cuda.txt'
+if (-not (Test-Path -LiteralPath $expectedPath -PathType Leaf)) {
+    Write-Host 'FAIL missing expected-executable manifest'; exit 1
+}
+$expected = @(Get-Content -LiteralPath $expectedPath | Where-Object { $_.Trim() } | Select-Object -Unique)
+$checked = 0
+foreach ($name in $expected) {
+    if ($name -notmatch '^strix-[A-Za-z0-9_-]+\.exe$') { Fail "invalid expected executable: $name"; continue }
+    $exe = Get-Item -LiteralPath (Join-Path $bin $name) -ErrorAction SilentlyContinue
+    if (-not $exe -or $exe.PSIsContainer) { Fail "missing expected executable: $name"; continue }
+    $checked++
     $r = Invoke-Bounded $exe.FullName @('--help') 30
     if ($r.Code -eq -1073741515) { Fail "$($exe.Name): a required DLL is missing (0xC0000135)" }
     elseif ($r.Code -eq 'timeout') { Fail "$($exe.Name) --help: timeout" }
@@ -59,6 +69,7 @@ foreach ($exe in Get-ChildItem -Path $bin -Filter 'strix-*.exe') {
         Pass "$($exe.Name) loads (no --help: $($r.Text.Trim().Split([char]10)[0]))"
     }
 }
+if ($checked -eq 0) { Fail 'no expected executables checked' }
 
 $skel = Join-Path $bin 'strix-skeleton-serve.exe'
 $reg = Join-Path $Prefix 'share\strix\examples\skeleton_engine'

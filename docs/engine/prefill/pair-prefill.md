@@ -110,7 +110,15 @@ feed-forward hyperconnection mix instead of the attention mix, and the sequence 
 layer N stays with stage A in the handoff. Logits and the tokens generated after the handoff
 are bitwise equal to the whole-layer cuts. Measured at 32K: 22.5: 11.82/11.85 s, 23:
 11.61-11.69 s, 23.5: 11.84 s, 22: 12.08 s, so the default stays 23; the half step is for
-prompts and models whose layer costs put the balance point inside a layer. A costs file
+prompts and models whose layer costs put the balance point inside a layer. Since the length
+chunk policy and the faster QSA kernels the half cut 23.5 wins below 64K and loses at 128K
+(stage B holds 7 of the 12 QSA layers; the attention block it hands over, ~0.3 s at 32K and
+~1.65 s at 128K, is smaller than the stage gap below 64K and larger at 128K), so without an
+explicit cut or a costs file `qwen.pair_half_cut` (`STRIX_QWEN_PAIR_HALF_CUT`, auto: on below
+65,537 context tokens; `0` keeps 23, `1` forces 23.5) picks it per prompt (`cut-source=
+measured-default-half`). Measured exact / FAST ms, 23 vs 23.5: 8K 3,320 / 3,051 vs 3,285 / 3,003;
+32K 11,176 / 10,111 vs 11,105 / 10,023; 64K 21,604 / 19,634 vs 21,512 / 19,369; 128K 42,489 /
+38,123 vs 42,714 / 38,404; logits identical. A costs file
 (`STRIX_QWEN_PF_PIPE_COSTS`) may add an `attention` object next to `layers` (per-layer cost
 of the attention sub-block, same units); only then does the cost model also offer half-layer
 cuts. The cut type and the half-layer balance are shared code (`strix/pair/pipe.hpp`,

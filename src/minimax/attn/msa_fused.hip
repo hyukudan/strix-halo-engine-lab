@@ -2730,7 +2730,9 @@ void set_select_dump(const char* path) {
     if (g_select_dump == nullptr) throw std::runtime_error(std::string("minimax select dump: cannot write ") + path);
 }
 
-void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarker marker, void* user) {
+namespace {
+// The batched prefill view contract (shared by the full stage and the cache-only stage).
+void check_prefill_view(const PrefillView& p) {
     const DecodeView& v = p.window;
     if (p.msa_rework > 12 || (p.index_rows != 16 && p.index_rows != 32 && p.index_rows != 64) ||
         p.rows == 0 || p.scratch_windows == 0 || p.first_window != 0 || v.seqs != 1 ||
@@ -2747,11 +2749,25 @@ void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarke
         v.scores == nullptr || v.idx == nullptr || v.idx_count == nullptr || v.partial == nullptr ||
         v.ticket == nullptr || v.o == nullptr)
         throw std::invalid_argument("minimax batched prefill: bad view");
-    const unsigned prep_grid = index_grid_cap();
+}
+// K / V / index-key cache rows of the chunk (norm, RoPE, pack): the only persistent state the stage writes.
+void launch_prefill_prep(const PrefillView& p, hipStream_t stream, PrefillStageMarker marker, void* user) {
     if (marker != nullptr) marker(user, "msa-prep", true);
-    hipLaunchKernelGGL(prefill_prep_kernel, dim3(prep_grid), dim3(kIdxThreads), 0, stream, p);
+    hipLaunchKernelGGL(prefill_prep_kernel, dim3(index_grid_cap()), dim3(kIdxThreads), 0, stream, p);
     hip_check(hipGetLastError(), "minimax batched prefill prep");
     if (marker != nullptr) marker(user, "msa-prep", false);
+}
+}  // namespace
+
+void enqueue_prefill_cache_only(const PrefillView& p, hipStream_t stream, PrefillStageMarker marker, void* user) {
+    check_prefill_view(p);
+    launch_prefill_prep(p, stream, marker, user);
+}
+
+void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarker marker, void* user) {
+    check_prefill_view(p);
+    const DecodeView& v = p.window;
+    launch_prefill_prep(p, stream, marker, user);
     const unsigned windows = (p.rows - 1) / kMaxRows + 1;
     const unsigned batch_cap = p.scratch_windows < 65535U ? p.scratch_windows : 65535U;
     for (unsigned first = 0; first < windows;) {
