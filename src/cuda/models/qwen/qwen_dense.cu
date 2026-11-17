@@ -25,7 +25,9 @@
 
 #include <cuda_fp16.h>
 
+#include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 
 namespace strix::cuda::qwen_dense {
@@ -148,10 +150,43 @@ bool rows_ksplit_enabled() {
     static const bool on = strix::envcfg::flag("STRIX_QRTX_ROWS_KSPLIT", true);
     return on;
 }
+// Decode rows (rows <= 8) policy of main's streamed form (#680, rtxmax2 receipts; kernels in core/imma_dense.cuh
+// project_rows_cp_kernel / project_rows_ks_kernel<KO>). Selection (qwen_rows_glue_exact_test --time on the RTX PRO 6000,
+// us/call old ks -> cp): small sites win (shared gate/up 2.7 MB 5.65 -> 3.76 at 1 row, shared down 1.4 MB 3.60 -> 2.98),
+// large sites lose (gdn in 44 MB 36.1 -> 43.6 at 8 rows, gdn out 16.7 MB 15.2 -> 20.2 at 1 row) except K = 6144 at 8 rows
+// (24.3 -> 22.5). STRIX_QRTX_ROWS_CP: unset/"auto" = by site (weight bytes <= STRIX_QRTX_ROWS_CP_MB, default 4, or
+// K >= 6144 at 8 rows), 1 = every fitting site, 0 = never (old K-split kernel everywhere). Bits are identical in every mode.
+int rows_cp_mode() {
+    static const int mode = [] {
+        const char* e = strix::envcfg::text("STRIX_QRTX_ROWS_CP");
+        if (e == nullptr || *e == 0 || std::strcmp(e, "auto") == 0) return 2;
+        return std::atoi(e) != 0 ? 1 : 0;
+    }();
+    return mode;
+}
+bool rows_cp_enabled() { return rows_cp_mode() != 0; }
+bool rows_cp_wanted(const KSite& k, unsigned rows) {
+    const int mode = rows_cp_mode();
+    if (mode != 2) return mode == 1;
+    static const double limit = [] {
+        const char* e = strix::envcfg::text("STRIX_QRTX_ROWS_CP_MB");
+        return (e != nullptr && *e != 0 ? std::atof(e) : 4.0) * 1048576.0;
+    }();
+    const double bytes = static_cast<double>(k.outputs) * (k.width / 32U) * 34.0;
+    return bytes <= limit || (rows >= 8U && k.width >= 6144U);
+}
+// K-split outputs per CTA (#680): STRIX_QRTX_KSO = 2 / 4 / 8, unset = 4 at >= 128 blocks per row, else 8.
+int rows_ks_out(std::uint32_t nblocks) {
+    static const int ko = [] { const char* e = strix::envcfg::text("STRIX_QRTX_KSO"); return e ? std::atoi(e) : 0; }();
+    return ko ? ko : (nblocks >= 128U ? 4 : 8);
+}
 struct DenseNumeric {
     using Site = KSite;
     static bool decode_rows_enabled() { return ::strix::cuda::qwen_dense::decode_rows_enabled(); }
     static bool rows_ksplit_enabled() { return ::strix::cuda::qwen_dense::rows_ksplit_enabled(); }
+    static bool rows_cp_enabled() { return ::strix::cuda::qwen_dense::rows_cp_enabled(); }
+    static bool rows_cp_wanted(const KSite& k, unsigned rows) { return ::strix::cuda::qwen_dense::rows_cp_wanted(k, rows); }
+    static int rows_ks_out(std::uint32_t nblocks) { return ::strix::cuda::qwen_dense::rows_ks_out(nblocks); }
     static bool dense_tile2_enabled() { return ::strix::cuda::qwen_dense::dense_tile2_enabled(); }
     static bool dense_t2_remap_enabled() { return ::strix::cuda::qwen_dense::dense_t2_remap_enabled(); }
     template <Store S>

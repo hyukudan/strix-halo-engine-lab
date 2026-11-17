@@ -3,6 +3,8 @@
 // src/cuda/arch/<sm> (see src/cuda/arch/sm120/README.md).
 #pragma once
 
+#include "strix/device/runtime.hpp"
+
 #include <cuda_runtime.h>
 #include <atomic>
 
@@ -29,5 +31,19 @@ inline bool current_device_at_least() {
 inline bool has_pdl() { return current_device_at_least<9>(); }
 // Thread block clusters (cudaLaunchAttributeClusterDimension): compute capability 9.0+.
 inline bool has_clusters() { return current_device_at_least<9>(); }
+
+// Query the bound ordinal without changing the current device; errors fail closed.
+inline ::strix::device::Capabilities capabilities(int ordinal) noexcept {
+    ::strix::device::Capabilities result;
+    if (cudaDeviceGetAttribute(&result.major, cudaDevAttrComputeCapabilityMajor, ordinal) != cudaSuccess ||
+        cudaDeviceGetAttribute(&result.minor, cudaDevAttrComputeCapabilityMinor, ordinal) != cudaSuccess) return {};
+    result.pdl = result.major >= 9;
+    result.clusters = result.major >= 9;
+    return result;
+}
+
+inline ::strix::device::Runtime runtime(const ::strix::device::Descriptor& descriptor, int ordinal) noexcept {
+    return {descriptor, ordinal, capabilities};
+}
 
 }  // namespace strix::cuda::arch

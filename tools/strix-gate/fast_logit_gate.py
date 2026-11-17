@@ -328,8 +328,11 @@ def minimax_floor_checks(c, nulls, policy=MM_FLOOR, max_kl=0.02, min_top1=0.93, 
     extra = c["copy_miss"] - c["copy_miss_ref"]
     worst = max(0, max(n["copy_miss"] - n["copy_miss_ref"] for n in nulls))
     slack = max(1, math.ceil(policy["copy_slack_frac"] * c["copy_rows"]))
-    add("copy", extra, worst + slack, extra <= worst + slack, rows=c["copy_rows"], miss_ref=c["copy_miss_ref"],
-        miss=c["copy_miss"], worst_null=worst, power=c["copy_rows"] > 0)
+    # Nonempty coverage is necessary; it does not establish a statistically powered sample size.
+    observed = c["copy_rows"] > 0
+    add("copy", extra, worst + slack, observed and extra <= worst + slack, rows=c["copy_rows"], miss_ref=c["copy_miss_ref"],
+        miss=c["copy_miss"], worst_null=worst, power=observed,
+        reason="observed copy rows" if observed else "insufficient copy evidence")
     return checks
 
 
@@ -456,10 +459,12 @@ RECEIPT_PREFIX = "strix-route-receipt "
 MM_OUTPUT_SWITCHES = frozenset({"STRIX_MM_QUALITY_OUT", "STRIX_MM_QUALITY_ROWS", "STRIX_MM_QUALITY_SELECT", "STRIX_MM_STATE_FNV",
                                 "STRIX_MM_DIAG_ATTN_ULP"})
 # The FAST layer set's own lever and switches: ignored by config_difference (candidate == reference + this layer set).
-# The index projection member (minimax-index-proj-wmma-v1) is part of the witnessed FAST layer set too.
 MM_FAST_SWITCHES = frozenset({"STRIX_MM_PF_MSA_FLASH", "STRIX_MM_PF_MSA_FLASH_LAYERS", "STRIX_MM_FAST_PREFILL",
-                              "STRIX_MM_PF_IDX_WMMA", "STRIX_MM_PF_IDX_WMMA_LAYERS"})
-MM_FAST_LEVERS = frozenset({"minimax.msa_flash", "minimax.index_proj_wmma"})
+                              "STRIX_MMX_PF_ORDER", "STRIX_MM_PF_IDX_WMMA", "STRIX_MM_PF_IDX_WMMA_LAYERS"})
+MM_FAST_LEVERS = frozenset({"minimax.msa_flash", "minimax.linear_order", "minimax.index_proj_wmma"})
+# The chunk-invariant linear order (minimax.linear_order invariant:<identity>) changes MoE/dense rounding in every layer:
+# its FAST layer set is all MM_LAYERS layers (onset 0, so its nulls are layer-0 one-ulp controls).
+MM_LAYERS = 60
 MM_DIAG = re.compile(rb'DIAG attn ulp: layer (\d+) seed (\d+) rows (\d+) pos0 (\d+) values (\d+) prompt ("(?:[^"\\]|\\.)*")\s*')
 MM_INDEX_EXEC = re.compile(rb'minimax-index-proj-executed rank (\d+) tokens (\d+) token_fnv ([0-9a-f]{16}) layers ([01]{60})\s*')
 
@@ -561,6 +566,13 @@ def minimax_execution(log, rank, prompts):
         fast = ({"policy": "index-proj", "msa_flash_mode": 10, "layers": idx_layers} if fast is None else
                 {"policy": "msa-flash+index-proj", "msa_flash_mode": fast["msa_flash_mode"],
                  "layers": sorted(set(fast["layers"]) | set(idx_layers))})
+    order = levers.get("minimax.linear_order", "adaptive")
+    if order != "adaptive":
+        mo = re.fullmatch(r"invariant:([a-z0-9.-]+)", order)
+        if not mo:
+            raise GateError(f"witness: unexpected minimax.linear_order value {order!r}")
+        fast = {"policy": mo.group(1) + ("+" + fast["policy"] if fast else ""),
+                "msa_flash_mode": fast["msa_flash_mode"] if fast else 0, "layers": list(range(MM_LAYERS))}
     plain = levers["minimax.moe_prefill_format"] == "exl3" and levers["minimax.prefill_identity"] == "default"
     profile = ("fast-prefill" if fast else "exact") if plain else "other"
     diag, covered = [], set()
