@@ -18,6 +18,11 @@
 #include "strix/cuda_core/dense.hpp"
 #include "strix/qwen35/cuda_engine.hpp"
 #include "strix/qwen35/cuda_spec.hpp"
+#include "strix/spec/draft_rows.hpp"
+
+#include <memory>
+#include <span>
+#include <thread>
 
 namespace q = strix::qwen35;
 namespace sp = strix::spec;
@@ -63,6 +68,27 @@ double quantile(std::vector<double> v, double p) {
     std::sort(v.begin(), v.end());
     return v[std::min<std::size_t>(v.size() - 1, std::size_t(p * double(v.size())))];
 }
+// One spec arm: controller form, draft head, chain cap (see --arms).
+struct ArmSpec { std::string tag; std::uint32_t frontier = 8; bool continuation = true; double loss = 0.05; bool subset = false; std::uint32_t cap = 7; };
+ArmSpec parse_arm(const std::string& name, std::uint32_t chain_k) {
+    ArmSpec a;
+    a.cap = chain_k;
+    if (!name.empty() && name.find_first_not_of("0123456789") == std::string::npos) {  // the cc_decode form (receipts cd1-cd5)
+        a.frontier = strix::core::parse_u32(name);
+        a.continuation = false;
+        a.loss = 1.0;
+        a.tag = "f" + name;
+        return a;
+    }
+    std::string base = name;
+    if (base.size() > 2 && base.compare(base.size() - 2, 2, "15") == 0) { a.cap = 15; base.resize(base.size() - 2); }
+    if (base == "sub") a.subset = true;
+    else if (base != "new") throw std::runtime_error("--arms: N, new, sub, new15 or sub15 (got " + name + ")");
+    a.frontier = sp::ArbiterConfig{}.frontier_every;
+    a.loss = sp::ArbiterConfig{}.frontier_loss;
+    a.tag = name;
+    return a;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -73,9 +99,16 @@ int main(int argc, char** argv) {
         double oracle = -1.0;
         std::uint32_t trace_n = 0, pairs = 1;
         std::string ids_out;
-        // Arbiter frontier probe per spec run (ArbiterConfig::frontier_every; 0 = the previous form). --arms 0,8 runs both
-        // in one process, interleaved --pairs times (A B A B ...), on the same loaded engine.
-        std::vector<std::uint32_t> arms{sp::ArbiterConfig{}.frontier_every};
+        // Controller / draft-head arms per spec run, interleaved --pairs times (A B A B ...) on the same loaded engine:
+        //   N (number) = the cc_decode form: frontier probe every N passes (0 = before it), flat prior, unpriced probe, full head;
+        //   new = the ArbiterConfig defaults (continuation prior, probe charged its cost), full head;
+        //   sub = new + the draft-only subset head (--draft-core groups of 16 ids + --draft-pack files chosen by the prompt +
+        //   prompt / emitted ids); a "15" suffix (new15, sub15) = chain cap 15. Drafts never change emitted tokens.
+        std::vector<std::string> arms{"new"};
+        std::uint32_t draft_core = sp::DraftRowsConfig{}.core_groups, draft_fallback = sp::DraftRowsConfig{}.fallback_groups;
+        std::string draft_pack;
+        std::unique_ptr<sp::DraftRows> draft_rows;
+        std::uint32_t idle_ms = 0;  // host sleep (GPU idle) before every spec run: thermal gaps inside one ticket
         bool cost_table = false, check = true, graphs = true, seed_costs = true, turbo_lm_head = true;
         q::TurboWeights turbo = q::TurboWeights::off;
         for (int i = 1; i < argc; ++i) {
@@ -103,8 +136,22 @@ int main(int argc, char** argv) {
             else if (a == "--chain-hidden") chain_hidden = next();
             else if (a == "--max-pos") max_pos = strix::core::parse_u32(next());
             else if (a == "--label") label = next();
-            else if (a == "--frontier") arms = {strix::core::parse_u32(next())};
-            else if (a == "--arms") { arms = parse_ids(next()); if (arms.empty()) throw std::runtime_error("--arms needs values"); }
+            else if (a == "--frontier") arms = {std::to_string(strix::core::parse_u32(next()))};
+            else if (a == "--arms") {
+                arms.clear();
+                const std::string v = next();
+                for (std::size_t b = 0, e = 0; b <= v.size(); b = e + 1) {
+                    e = v.find(',', b);
+                    if (e == std::string::npos) e = v.size();
+                    if (e > b) arms.push_back(v.substr(b, e - b));
+                }
+                if (arms.empty()) throw std::runtime_error("--arms needs values");
+                for (const auto& n : arms) (void)parse_arm(n, chain_k);
+            }
+            else if (a == "--draft-core") draft_core = strix::core::parse_u32(next());
+            else if (a == "--draft-fallback") draft_fallback = strix::core::parse_u32(next());
+            else if (a == "--draft-pack") draft_pack = next();
+            else if (a == "--idle-ms") idle_ms = strix::core::parse_u32(next());
             else if (a == "--pairs") { pairs = strix::core::parse_u32(next()); if (pairs == 0) throw std::runtime_error("--pairs >= 1"); }
             else if (a == "--ids-out") ids_out = next();
             else if (a == "--turbo-weights") {
@@ -126,7 +173,7 @@ int main(int argc, char** argv) {
         if (model.empty() == synth.empty())
             throw std::runtime_error("usage: (--model F.gguf | --synthetic-full bf16|q8_0 [--layers N]) [--prompt-ids a,b | --prompt-file F | --prompt-len N] "
                                      "[--n-gen N] [--sources copy,chain,hybrid|none] [--oracle ACC] [--cost-table] [--check 0|1] [--max-block 1..32] "
-                                     "[--frontier N | --arms N,M --pairs P] [--ids-out DIR]  (--prompt-file accepts F1,F2,...: one engine load)");
+                                     "[--frontier N | --arms 0,8,new,sub,new15,sub15 --pairs P] [--draft-core G] [--draft-fallback G] [--draft-pack F1,F2] [--idle-ms MS] [--ids-out DIR]  (--prompt-file accepts F1,F2,...: one engine load)");
         // (label, ids) per prompt; --prompt-file takes a comma list (label = file stem), each prompt runs serial + spec arms.
         std::vector<std::pair<std::string, std::vector<std::uint32_t>>> prompts;
         if (!ids_arg.empty()) prompts.emplace_back(label, parse_ids(ids_arg));
@@ -276,15 +323,19 @@ int main(int argc, char** argv) {
 
             if (!ids_out.empty() && !ref.empty()) write_ids(label + ".serial.ids", ref);
             for (std::uint32_t pair = 0; pair < pairs; ++pair)
-            for (const std::uint32_t frontier : arms) {
-                const std::string tag = arms.size() > 1 || pairs > 1 ? label + "/f" + std::to_string(frontier) + "/p" + std::to_string(pair) : label;
+            for (const auto& arm_name : arms) {
+                const ArmSpec arm = parse_arm(arm_name, chain_k);
+                const std::string tag = arms.size() > 1 || pairs > 1 ? label + "/" + arm.tag + "/p" + std::to_string(pair) : label;
                 // ---- speculative run
+                if (idle_ms) std::this_thread::sleep_for(std::chrono::milliseconds(idle_ms));
                 prefill(anchor);
                 warm();
                 sp::BlockConfig bc;
-                bc.arbiter.frontier_every = frontier;
+                bc.arbiter.frontier_every = arm.frontier;
+                bc.arbiter.model_continuation = arm.continuation;
+                bc.arbiter.frontier_loss = arm.loss;
                 bc.max_block = max_block;
-                bc.chain_max_k = chain_k;
+                bc.chain_max_k = arm.cap;
                 bc.copy = sources.find("copy") != std::string::npos;
                 bc.chain = sources.find("chain") != std::string::npos;
                 bc.hybrid = sources.find("hybrid") != std::string::npos;
@@ -312,6 +363,24 @@ int main(int argc, char** argv) {
                 drafter.commit(prompt);
                 std::vector<std::uint32_t> out{anchor};
                 drafter.commit(std::span<const std::uint32_t>(out.data(), 1));
+                if (arm.subset && !draft_rows) {
+                    sp::DraftRowsConfig dc;
+                    dc.vocab = E->config().vocab;
+                    dc.group = 16;  // one NVFP4 tile of the head
+                    dc.core_groups = draft_core;
+                    dc.fallback_groups = draft_fallback;
+                    for (std::size_t b = 0, e = 0; b < draft_pack.size(); b = e + 1) {
+                        e = draft_pack.find(',', b);
+                        if (e == std::string::npos) e = draft_pack.size();
+                        if (e > b) dc.packs.push_back(sp::DraftRows::read_ids(draft_pack.substr(b, e - b), dc.vocab));
+                    }
+                    draft_rows = std::make_unique<sp::DraftRows>(std::move(dc));
+                }
+                if (arm.subset) {
+                    draft_rows->begin(prompt);
+                    draft_rows->admit(std::span<const std::uint32_t>(out.data(), 1));
+                }
+                E->set_draft_rows(arm.subset ? draft_rows.get() : nullptr);
                 sp::BlockSpeculator spec(drafter, S);
                 spec.start(anchor);
                 std::vector<double> tick_ms{0.0};  // wall at each step end (relative), tokens cumulative in cum
@@ -331,6 +400,7 @@ int main(int argc, char** argv) {
                     p.context = E->committed();
                     const auto r = spec.step(out, p);
                     if (r.emitted == 0) break;
+                    if (arm.subset) draft_rows->admit(std::span<const std::uint32_t>(out.data() + out.size() - r.emitted, r.emitted));
                     if (per_step.size() < trace_n) {
                         const auto& A = drafter.arbiter().last_arms();
                         const auto& Sc = drafter.arbiter().last_arm_scores();
@@ -375,11 +445,13 @@ int main(int argc, char** argv) {
                 std::string hist;
                 for (std::size_t k = 1; k < k_hist.size(); ++k)
                     if (k_hist[k]) hist += " " + std::to_string(k) + ":" + std::to_string(k_hist[k]);
-                std::printf("step[%s]: frontier %u, per step verify %.3f ms, draft %.3f ms, host %.3f ms; model k histogram%s\n", tag.c_str(),
-                            frontier, sum_verify / steps_n, sum_draft / steps_n, (wall - sum_verify - sum_draft) / steps_n,
+                std::printf("step[%s]: arm %s, per step verify %.3f ms, draft %.3f ms, host %.3f ms; model k histogram%s\n", tag.c_str(),
+                            arm.tag.c_str(), sum_verify / steps_n, sum_draft / steps_n, (wall - sum_verify - sum_draft) / steps_n,
                             hist.empty() ? " none" : hist.c_str());
                 std::printf("stats %s\n", st.json().c_str());
-                if (!ids_out.empty()) write_ids(tag.substr(0, tag.find('/')) + ".spec-f" + std::to_string(frontier) + "-p" + std::to_string(pair) + ".ids", out);
+                if (arm.subset) std::printf("draft[%s]: %s\n", tag.c_str(), draft_rows->describe().c_str());
+                E->set_draft_rows(nullptr);
+                if (!ids_out.empty()) write_ids(tag.substr(0, tag.find('/')) + ".spec-" + arm.tag + "-p" + std::to_string(pair) + ".ids", out);
                 if (!ref.empty()) {
                     std::printf("EXACT[%s]: %s (%zu tokens compared, %zu mismatches)\n", tag.c_str(), bad == 0 ? "PASS" : "FAIL",
                                 std::min(out.size(), ref.size()), bad);

@@ -116,8 +116,9 @@ Arbiter::Arbiter(ArbiterConfig config) : config_(std::move(config)) {
         std::adjacent_find(w.begin(), w.end()) != w.end() || w.back() > max_proposal + 1)
         throw std::invalid_argument("arbiter windows must be ascending, unique, start at 1 and be <= 65 rows");
     if (!(config_.switch_in >= 1.0) || !(config_.half_life_tokens > 0.0) || !(config_.cost_weight_cap >= 1.0) ||
-        !(config_.cost_aging > 0.0 && config_.cost_aging <= 1.0))
-        throw std::invalid_argument("arbiter: switch_in >= 1, half_life_tokens > 0, cost_weight_cap >= 1, aging in (0, 1]");
+        !(config_.cost_aging > 0.0 && config_.cost_aging <= 1.0) || !(config_.frontier_loss >= 0.0))
+        throw std::invalid_argument("arbiter: switch_in >= 1, half_life_tokens > 0, cost_weight_cap >= 1, aging in (0, 1], "
+                                    "frontier_loss >= 0");
     for (auto& c : cost_) { c.ms.assign(w.back() + 1, 0.0); c.weight.assign(w.back() + 1, 0.0); c.seed.assign(w.back() + 1, 0.0); }
 }
 
@@ -195,14 +196,21 @@ double Arbiter::expected(Source source, std::uint32_t bucket, std::uint32_t k) c
     const auto& table = source == Source::lookup ? lookup_[std::min(bucket, lookup_buckets - 1)] : model_;
     const auto& prior = source == Source::lookup ? config_.lookup_prior : config_.model_prior;
     const double z = source == Source::lookup ? config_.lookup_sd : config_.model_sd;
-    double e = 1.0, alive = 1.0, bound = 1.0;
+    // Continuation (ArbiterConfig::model_continuation): the prior mean of S_j follows the shallower bounds geometrically.
+    const bool continuation = source == Source::model && config_.model_continuation;
+    const double w = prior[0] + prior[1];
+    double e = 1.0, alive = 1.0, bound = 1.0, before = 1.0;  // bound = B_{j-1}, before = B_{j-2}
     for (std::uint32_t j = 1; j <= k; ++j) {
         const auto& beta = table[source == Source::lookup ? lookup_class(bucket, j) : depth_class(j)];
         const double n = beta.a + beta.b;
-        if (!(n > 0.0)) break;
-        alive *= beta.a / n;
-        const double q = (alive * n + prior[0]) / (n + prior[0] + prior[1]);
-        bound = std::min(bound, std::max(0.0, q - z * std::sqrt(q * (1.0 - q) / (n + prior[0] + prior[1] + 1.0))));
+        if (!(n > 0.0) && !continuation) break;
+        // Prior mass m_j * w; the flat form keeps prior[0] itself (bit-identical to the previous expression).
+        const bool flat = !continuation || j == 1;
+        const double m = flat ? prior[0] / w : before > 0.0 ? bound * bound / before : 0.0;
+        alive = n > 0.0 ? alive * beta.a / n : m;  // no evidence at depth j: the continuation stands in for S_j
+        const double q = std::min(1.0, (alive * n + (flat ? prior[0] : m * w)) / (n + w));
+        before = bound;
+        bound = std::min(bound, std::max(0.0, q - z * std::sqrt(q * (1.0 - q) / (n + w + 1.0))));
         e += bound;
     }
     return e;
@@ -286,8 +294,12 @@ Decision Arbiter::decide(const StepInput& input) {
         const auto k = d.k + 1;
         const auto rows = physical(k + 1);
         if (next.a + next.b < config_.frontier_evidence && rows != 0 && rows <= input.max_rows) {
-            d = Decision{Source::model, k, rows, rows > k + 1, expected(Source::model, 0, k), verify_ms(rows, ctx) + draft_ms(k), true};
-            last_frontier_ = passes_;
+            // Charged: the probe runs only while its own priced score stays within frontier_loss of the pick.
+            const double tokens = expected(Source::model, 0, k), ms = verify_ms(rows, ctx) + draft_ms(k);
+            if (tokens / std::max(ms, 1e-9) >= best[pick].score * (1.0 - config_.frontier_loss)) {
+                d = Decision{Source::model, k, rows, rows > k + 1, tokens, ms, true};
+                last_frontier_ = passes_;
+            }
         }
     }
     // Exploration of the learned drafter at its deepest legal k: first measurements, then re-probes.

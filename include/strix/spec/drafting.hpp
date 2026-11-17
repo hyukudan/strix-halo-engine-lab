@@ -92,6 +92,15 @@ struct ArbiterConfig {
     // frontier_every passes. 0 = off (the previous form). Drafts never change emitted tokens; this only prices depth.
     std::uint32_t frontier_every = 8;
     double frontier_evidence = 0.5;
+    // The probe is charged its cost: it fires only when its priced score (expected tokens / (verify + draft ms)) is within
+    // frontier_loss of the pick, so it can cost at most frontier_loss / frontier_every of the throughput per pass.
+    double frontier_loss = 0.05;
+    // Per-depth learned drafter: the cumulative survival S_j is shrunk toward the geometric continuation of the shallower
+    // depths (m_j = B_{j-1}^2 / B_{j-2}, m_1 = the prior mean) instead of the flat prior mean, and a depth without evidence is
+    // priced at m_j. The flat mean (false, the previous form) pulls deep, little-evidenced S_j up toward 0.5: measured on the
+    // CUDA dense 27B Japanese prose, S_4 0.048 was priced 0.12 and the arm ran k = 4-5 instead of the k = 3 optimum (-3.8 %).
+    // Lookup sources keep the flat prior (their depth is bounded by the proposal). Only k changes; tokens never do.
+    bool model_continuation = true;
     double cost_weight_cap = 8.0;       // verify-cost EWMA: a new wall weighs >= 1/(cap+1)
     double cost_aging = 0.995;          // per pass, every window's weight decays (stale windows re-learn fast)
     double lookup_overhead_ms = 0.0;    // extra cost of a lookup pass (the proposal itself is computed every step: sunk)
