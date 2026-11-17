@@ -255,7 +255,7 @@ void identities() {
     std::uint64_t legacy = 14695981039346656037ULL;
     for (const char ch : std::string(base)) { legacy ^= static_cast<unsigned char>(ch); legacy *= 1099511628211ULL; }
     check(qo::handoff_numerical_id(base, {}) == legacy, "exact hand-off id keeps its historical value");
-    check(cp::form_identities({false, true, true, true}) == "qwen-cuda-hc-f16mma-v1,qwen-cuda-mtp-f16mma-v1,qwen-cuda-qsa-f16mma-v1", "form identities");
+    check(cp::form_identities({false, true, true, true}) == "qwen-cuda-hc-f16mma-v1,qwen-cuda-mtp-f16mma-v1,qwen-cuda-qsa-f16mma-v2", "form identities");
     // Prefix-cache identity: forms enter only when on.
     const auto dir = fs::temp_directory_path() / "strix_qwen_cuda_profile_host_test";
     fs::create_directories(dir / "tables");
