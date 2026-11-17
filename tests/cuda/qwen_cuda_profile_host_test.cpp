@@ -71,6 +71,7 @@ std::set<std::string> diff(const qp::Config& a, const qp::Config& b) {
     ne("decode", a.decode != b.decode);
     ne("draft_vocab", a.draft_vocab != b.draft_vocab);
     ne("export_state", a.export_state != b.export_state);
+    ne("defer_prompt_mtp", a.defer_prompt_mtp != b.defer_prompt_mtp);
     ne("moe_route_bf16", a.moe_route_bf16 != b.moe_route_bf16);
     ne("diagnostic_bf16_mtp", a.diagnostic_bf16_mtp != b.diagnostic_bf16_mtp);
     ne("forms.hc_mma", a.forms.hc_mma != b.forms.hc_mma);

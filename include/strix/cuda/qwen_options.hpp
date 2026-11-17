@@ -105,6 +105,10 @@ inline bool take(int argc, char** argv, int& i, Request& r) {
         const auto v = next();
         const auto n = number(a, v, qp::kMaxBlockRows);
         c.final_block_rows = static_cast<std::uint32_t>(n);
+    } else if (a == "--mtp-defer-prompt") {  // Config::defer_prompt_mtp: the first token before the prompt's MTP rows
+        const auto v = next();
+        if (v != "on" && v != "off") throw std::invalid_argument("--mtp-defer-prompt is on or off");
+        c.defer_prompt_mtp = v == "on";
     } else if (a == "--blocks") {
         r.blocks_typed = true;
         c.block_schedule.clear();
@@ -273,6 +277,7 @@ inline std::string effective_config_json(const Resolved& r) {
     engine.set("max_positions", J(static_cast<std::uint64_t>(c.max_positions)));
     engine.set("tail_large", J(c.tail_large));
     engine.set("final_block_rows", J(static_cast<std::uint64_t>(c.final_block_rows)));
+    engine.set("defer_prompt_mtp", J(c.defer_prompt_mtp));
     engine.set("block_fit", J(c.block_fit));
     {  // requested here; the loaded engine's moe_rows receipt adds the tiered fallback (still padded) and window counts
         const auto p = qp::moe_rows_policy(c.moe_real_rows, false);
