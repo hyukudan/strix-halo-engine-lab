@@ -2,12 +2,12 @@
 # Shared CUDA GDN register-fit A/B: ONE bounded workload, to be run by the PRO operator INSIDE the shared guard (scripts/bench/rtx/gpu_guard.py, <=210 seconds for this complete workload).
 # Fail-closed: any rc != 0, missing digest/prefill line/logits dump, or any logits sha != first arm stops before the next arm.
 #   gdn-register-fit.sh BASE_BIN_DIR CANDIDATE_BIN_DIR OUTPUT_DIR        (8K only; Qwen3.8-27B synthetic FAST8 prefill, same arm shape as the RTXLONG3 8K rung arm B)
-set -u
+set -uo pipefail
 BASE_DIR=$1; NEW_DIR=$2; OUT=$3; LEN=8192
 : "${STRIX_DEVICES:?Pass the device declaration through STRIX_DEVICES}"
 bin_dir() { if [[ $1 == base ]]; then printf '%s' "$BASE_DIR"; else printf '%s' "$NEW_DIR"; fi; }
 S=$OUT/summary.txt; mkdir -p "$OUT"
-echo "gq start $(date +%T) len $LEN base $(sha256sum $BASE_DIR/strix-cuda-qwen35-decode.exe | cut -c1-16) new $(sha256sum $NEW_DIR/strix-cuda-qwen35-decode.exe | cut -c1-16)" > "$S"
+echo "gq start $(date +%T) len $LEN base $(sha256sum "$BASE_DIR/strix-cuda-qwen35-decode.exe" | cut -c1-16) new $(sha256sum "$NEW_DIR/strix-cuda-qwen35-decode.exe" | cut -c1-16)" > "$S"
 # 1) kernel fixture: both builds pass, and the window-path digest is identical build-to-build
 for v in base new; do
   "$(bin_dir "$v")/cuda_core_test.exe" > "$OUT/test-$v.log" 2>&1; rc=$?
