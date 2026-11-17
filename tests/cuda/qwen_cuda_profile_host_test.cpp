@@ -353,30 +353,49 @@ void snapshot_forms() {
 }
 }  // namespace
 
-// TURBO (qwen-turbo-v1) through the one resolver: serve == CLI == strix/cuda/qwen_turbo.hpp, weight toggle only (the
-// exact CUDA prefill forms), lever options refused, and no turbo field outside turbo.
+// TURBO (qwen-turbo-v1) through the one resolver: serve == CLI == strix/cuda/qwen_turbo.hpp for the weight toggle, the
+// CUDA table read through its turbo cells (FAST forms + the TURBO-only integer expert row), lever options honoured, and
+// no turbo field outside turbo.
 void turbo_binding() {
     const Env none;
     const auto request = parse(with_paths({"--profile", "turbo", "--turbo-weights", "onfly", "--blocks", "1024,2048"}), none);
     const auto serve = qo::resolve(request, qo::Entry::serve), cli = qo::resolve(request, qo::Entry::cli);
-    const auto direct = strix::cuda::qwen_turbo::resolve({request.profile, request.inputs, false});
+    const auto direct = strix::cuda::qwen_turbo::resolve({request.profile, request.inputs, false}, strix::qwen::cuda_profile::levers());
     const auto plain = one({}, qo::Entry::serve);
     check(serve.resolution.is_turbo() && serve.config.turbo_onfly_nvfp4 && cli.config.turbo_onfly_nvfp4 && direct.onfly_nvfp4,
           "turbo: onfly effective in both entries");
     check(!serve.config.turbo_namespace.empty() && serve.config.turbo_namespace == cli.config.turbo_namespace &&
               serve.config.turbo_namespace == direct.cache_namespace, "turbo: namespace of the qwen_turbo resolver");
-    check(!serve.choice.fast() && !cli.choice.fast() && serve.contract == plain.contract, "turbo: exact CUDA prefill forms");
+    check(serve.choice == cli.choice && serve.choice.hc_mma && serve.choice.mtp_mma && serve.choice.qsa_mma &&
+              !serve.choice.moe_mma && serve.choice.expert_turbo && serve.contract != plain.contract,
+          "turbo: FAST forms inherited, moe_mma off, integer experts on");
+    check(serve.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::gsq_i8_turbo &&
+              cli.config.expert_arithmetic == serve.config.expert_arithmetic &&
+              serve.contract.find("gsq-iq-i8mma-turbo-cuda-v1") != std::string::npos,
+          "turbo: TURBO expert arithmetic in both entries");
+    check(qo::numerical_identity(serve.config).hash != qo::numerical_identity(plain.config).hash, "turbo: own numerical identity");
     check(diff(serve.config, cli.config) == std::set<std::string>({"decode", "export_state", "release_by_layer"}),
           "turbo: same values in both entries");
     check(!plain.config.turbo_onfly_nvfp4 && plain.config.turbo_namespace.empty() &&
               qo::effective_config_json(plain).find("turbo_weights") == std::string::npos &&
               qo::effective_config_json(serve).find("\"turbo_weights\"") != std::string::npos,
           "turbo: effective config field only under turbo");
+    const auto off = qo::resolve(parse(with_paths({"--profile", "turbo", "--expert-turbo", "off"}), none), qo::Entry::serve);
+    check(off.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::incumbent && !off.choice.expert_turbo &&
+              off.choice.hc_mma, "turbo: --expert-turbo off keeps the pack's experts, other rows stay");
+    const auto bf = qo::resolve(parse(with_paths({"--profile", "turbo", "--expert-arithmetic", "gsq-iq-bf16mma-cuda-v1"}), none),
+                                qo::Entry::serve);
+    check(bf.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::gsq_bf16_mma,
+          "turbo: an explicit expert arithmetic wins over the row");
+    const auto fast = qo::resolve(parse(with_paths({"--profile", "fast"}), none), qo::Entry::serve);
+    check(fast.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::incumbent && !fast.choice.expert_turbo &&
+              plain.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::incumbent,
+          "turbo row selects nothing outside turbo");
     bool threw = false;
     try {
         (void)qo::resolve(parse(with_paths({"--profile", "turbo", "--prefill-moe-route-bf16", "1"}), none), qo::Entry::serve);
     } catch (const std::invalid_argument&) { threw = true; }
-    check(threw, "turbo: CUDA lever option refused");
+    check(threw, "turbo: RouteBF16 with the TURBO expert arithmetic refused");
 }
 
 // Block fit: shared rows_fit planner (fake allocator) and the resolver binding (every entry, typed schedule strict).
@@ -513,6 +532,17 @@ int main() {
                   qo::numerical_identity(bf.config).hash!=qo::numerical_identity(native.config).hash,"BF16 MMA has its own numerical identity");
             check(qo::handoff_numerical_id_config("old",bf.config)!=qo::handoff_numerical_id_config("old",gsq.config),"BF16 MMA handoff differs from A8");
             check(refuses({"--expert-arithmetic","gsq-iq-bf16mma-cuda-v1","--moe-mma","on"}),"BF16 MMA single-chain composition rejects explicitly");
+            const Args ti={"--expert-arithmetic","gsq-iq-i8mma-turbo-cuda-v1"};
+            same_request("explicit GSQ TURBO int8 arithmetic",ti);
+            const auto tu=one(ti,qo::Entry::cli);
+            check(tu.config.expert_arithmetic==strix::qwen_packs::ExpertArithmetic::gsq_i8_turbo,"explicit TURBO int8 parsed");
+            check(tu.contract.find("gsq-iq-i8mma-turbo-cuda-v1")!=std::string::npos,"TURBO int8 contract named");
+            check(qo::numerical_identity(tu.config).hash!=qo::numerical_identity(gsq.config).hash &&
+                  qo::numerical_identity(tu.config).hash!=qo::numerical_identity(bf.config).hash &&
+                  qo::numerical_identity(tu.config).hash!=qo::numerical_identity(native.config).hash,"TURBO int8 has its own numerical identity");
+            check(qo::handoff_numerical_id_config("old",tu.config)!=qo::handoff_numerical_id_config("old",gsq.config) &&
+                  qo::handoff_numerical_id_config("old",tu.config)!=qo::handoff_numerical_id_config("old",bf.config),"TURBO int8 handoff differs");
+            check(refuses({"--expert-arithmetic","gsq-iq-i8mma-turbo-cuda-v1","--moe-mma","on"}),"TURBO int8 single-chain composition rejects explicitly");
         }
         profiles();
         overrides();

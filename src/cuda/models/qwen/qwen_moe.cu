@@ -24,6 +24,7 @@
 //   d*sc*r rounded once (same for zero signs, infinities and NaN). Every other operation is HIP's, in HIP's order.
 #include "strix/env_flags.hpp"
 #include "../../core/moe_a8.cuh"
+#include "../../core/moe_turbo_i8.cuh"
 #include "strix/cuda/core/decode_rows.hpp"
 #include "strix/cuda/qwen_moe.hpp"
 #include "strix/cuda/qwen_quant.cuh"
@@ -509,6 +510,36 @@ void enqueue_mma_experts(const Rows& v, const Weights& w, unsigned tiles, cudaSt
     check(cudaGetLastError(), "MoE tensor-core down");
 }
 
+// gsq-iq-i8mma-turbo-cuda-v1 (TURBO, profile row expert_turbo or explicit selection): int8 IMMA over the shared A8 input
+// codes (prologue) and the A8 down codes (project_activation_tile, run by the TURBO project kernel). Same CSR tiles;
+// rawdots in the native layout, merge / commit unchanged.
+template <unsigned G> void launch_turbo_project(const Rows& v, const Weights& w, const amdmath::Tables& tables, unsigned tiles,
+                                                cudaStream_t s) {
+    core::moe_turbo::turbo_project_kernel<G, MoeBinding>
+        <<<dim3(tiles, ffn / core::moe_turbo::kTurboProjectOutputs), core::moe_turbo::kTurboThreads, 0, s>>>(w.gate, w.up, v, tables);
+}
+template <unsigned D> void launch_turbo_down(const Rows& v, const Weights& w, unsigned tiles, cudaStream_t s) {
+    core::moe_turbo::turbo_down_kernel<D, MoeBinding>
+        <<<dim3(tiles, hidden / core::moe_turbo::kTurboDownOutputs), core::moe_turbo::kTurboThreads, 0, s>>>(w.down, v);
+}
+void enqueue_turbo_experts(const Rows& v, const Weights& w, const amdmath::Tables& tables, unsigned tiles, cudaStream_t s) {
+    if (!v.codes.base || !v.deltas.base || !v.down_codes.base || !v.down_deltas.base)
+        throw std::invalid_argument("gsq-iq-i8mma-turbo-cuda-v1 needs the A8 input and down code buffers");
+    switch (w.gate_type) {
+    case 18: launch_turbo_project<18>(v, w, tables, tiles, s); break;
+    case 21: launch_turbo_project<21>(v, w, tables, tiles, s); break;
+    case 22: launch_turbo_project<22>(v, w, tables, tiles, s); break;
+    case 23: launch_turbo_project<23>(v, w, tables, tiles, s); break;
+    case 42: launch_turbo_project<42>(v, w, tables, tiles, s); break;
+    default: throw std::invalid_argument("gsq-iq-i8mma-turbo-cuda-v1: gate storage");
+    }
+    check(cudaGetLastError(), "MoE TURBO int8 gate/up");
+    if (w.down_type == 20) launch_turbo_down<20>(v, w, tiles, s);
+    else if (w.down_type == 42) launch_turbo_down<42>(v, w, tiles, s);
+    else throw std::invalid_argument("gsq-iq-i8mma-turbo-cuda-v1: down storage");
+    check(cudaGetLastError(), "MoE TURBO int8 down");
+}
+
 bool enqueue_routed(const Rows& v, std::uint32_t rows, const Weights& w, const amdmath::Tables& tables, cudaStream_t s,
                     bool moe_mma) {
     validate_expert_arithmetic(w,moe_mma);
@@ -524,6 +555,10 @@ bool enqueue_routed(const Rows& v, std::uint32_t rows, const Weights& w, const a
         if (w.arithmetic == ExpertArithmetic::gsq_bf16_mma) {
             enqueue_mma_experts(v, w, tiles, s);
             return false;   // tensor-core GSQ experts: the moe_mma candidate form did not run
+        }
+        if (w.arithmetic == ExpertArithmetic::gsq_i8_turbo) {
+            enqueue_turbo_experts(v, w, tables, tiles, s);
+            return false;   // TURBO integer GSQ experts: the moe_mma candidate form did not run
         }
         // The storage type binds the compile-time typed decoder (bitwise the runtime-type values; see with_native_source).
         weight::with_native_source<OperandArch>(w.gate_type, [&]<class Source>() {
