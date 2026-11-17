@@ -140,6 +140,13 @@ inline qp::Config resolve_route(qp::Config config, const pr::Lookup& lookup = {}
     return config;
 }
 
+// The reported arithmetic contract: the form/route contract plus the expert arithmetic when it is not the incumbent.
+// One home for every receipt of a resolved config (effective config, service /health), so they cannot disagree.
+inline std::string with_expert_arithmetic(std::string contract, qwen_packs::ExpertArithmetic expert) {
+    if (expert == qwen_packs::ExpertArithmetic::gsq_a8_dot4) contract += "+" + std::string(qwen_packs::gsq_a8_contract);
+    return contract;
+}
+
 inline Resolved resolve(const Request& r, Entry entry, std::string_view default_model = {}) {
     Resolved out;
     out.entry = entry;
@@ -170,12 +177,11 @@ inline Resolved resolve(const Request& r, Entry entry, std::string_view default_
             row.reason = c.route_policy->reason;
         }
     }
-    out.contract = cp::arithmetic_contract(out.choice);
     if(c.expert_arithmetic==qwen_packs::ExpertArithmetic::gsq_a8_dot4) {
         if(c.forms.moe_mma) throw std::invalid_argument("GSQ A8: single-chain moe_mma composition unqualified; use --moe-mma off");
         if(c.route_policy->enabled) throw std::invalid_argument("GSQ A8: native IQ RouteBF16 composition unqualified");
-        out.contract+="+"+std::string(qwen_packs::gsq_a8_contract);
     }
+    out.contract = with_expert_arithmetic(cp::arithmetic_contract(out.choice), c.expert_arithmetic);
     const auto name = [&](std::string n, std::string v, std::string why) { out.differences.push_back({std::move(n), std::move(v), std::move(why)}); };
     if (entry == Entry::serve) {
         if (r.release_by_layer.value_or(false))
@@ -306,6 +312,10 @@ inline constexpr std::uint64_t fnv64(std::string_view s) {
 }
 inline cp::Choice choice_of(const qp::Config& c) {
     return {c.moe_route_bf16.value_or(false), c.forms.hc_mma, c.forms.mtp_mma, c.forms.qsa_mma, c.forms.moe_mma};
+}
+// Resolved::contract recomputed from a resolved Config (a running service holds only the Config).
+inline std::string config_arithmetic_contract(const qp::Config& c) {
+    return with_expert_arithmetic(cp::arithmetic_contract(choice_of(c)), c.expert_arithmetic);
 }
 // Preserve historical route-only bytes; every enabled prefill form changes the snapshot target.
 inline ::strix::cuda::qwen_route::Identity numerical_identity(const qp::Config& c) {

@@ -463,6 +463,11 @@ int main() {
         check(gsq.config.expert_arithmetic==strix::qwen_packs::ExpertArithmetic::gsq_a8_dot4,"explicit GSQ parsed once");
         check(gsq.contract.find("gsq-iq3s-a8-dot4-cuda-v1")!=std::string::npos,"GSQ contract named");
         check(qo::effective_config_json(gsq).find("gsq-iq3s-a8-dot4-cuda-v1")!=std::string::npos,"GSQ effective config names arithmetic");
+        for(const auto* r:{&native,&gsq}) check(qo::config_arithmetic_contract(r->config)==r->contract,"service /health contract = effective config contract: "+r->contract);
+        for(const auto& a:{Args{"--profile","fast"},Args{"--profile","turbo","--turbo-weights","onfly"}}) {
+            const auto s=one(a,qo::Entry::prefill_service);
+            check(qo::config_arithmetic_contract(s.config)==s.contract,"service /health contract = effective config contract: "+s.contract);
+        }
         check(qo::numerical_identity(gsq.config).hash!=qo::numerical_identity(native.config).hash,"GSQ snapshots have independent numerical identity");
         check(qo::handoff_numerical_id_config("old",gsq.config)!=qo::handoff_numerical_id_config("old",native.config),"GSQ handoffs cannot masquerade as native");
         check(qo::handoff_numerical_id_config("old",native.config)==qo::handoff_numerical_id("old",qo::choice_of(native.config)),"incumbent handoff bytes preserved");
