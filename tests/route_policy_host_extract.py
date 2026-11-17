@@ -49,7 +49,9 @@ def generate(source, output):
     qwen = read("apps/hip_decode_token_main.cpp")
     qwen_start = qwen.rfind("    {", 0, qwen.index("// Shared route receipt: the prefill route"))
     options = read("apps/hip_decode_options.hpp")
+    serve = read("apps/glm_serve_main.cpp")
     pieces = {
+        "GLM_INTERLEAVE": block(serve, serve.index("strix::serve::PrefillInterleave serve_prefill_interleave(")),
         "GLM_SELECTORS": selectors,
         "GLM_TILE_ROWS": tile_rows,
         "GLM_BENCH_SETUP": bench_setup,

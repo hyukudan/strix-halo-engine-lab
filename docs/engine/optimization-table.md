@@ -15,6 +15,9 @@ environment variable, the shipped value, the value that restores the previous pa
 | deepseek41-pair | attn_tile_f16 | `STRIX_DS41_ATTN_TILE_F16` |  | 0 |  |
 | deepseek41-pair | serve_warm | `STRIX_DS41_SERVE_WARM` |  | 0 |  |
 | deepseek41-pair | dspark_calib | `STRIX_DS41_DSPARK_CALIB` |  | 0 |  |
+| deepseek41-pair | window_drain | `STRIX_DS41_PREFILL_WINDOW_DRAIN` |  | 0 |  |
+| deepseek41-pair | moe_pass_window | `STRIX_DS41_PREFILL_MOE_PASS_WINDOW` |  | 0 |  |
+| deepseek41-pair | decode_xport | `STRIX_DS41_DECODE_XPORT` |  | 0 |  |
 | glm-pair | hp-crc-parallel | `STRIX_DIST_CRC_PARALLEL` | 1 | 0 | Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16 |
 | glm-pair | hp-crc-overlap | `STRIX_DIST_HOST_CRC_OVERLAP` | 1 | 0 | Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16 |
 | glm-pair | hp-chunk-bytes | `STRIX_DIST_HOST_CHUNK_BYTES` | 1048576 | 0 | Measurement: hp host path, exact TTFT 1K -8.5 %, 8K -3.1 %, logits fnv matches reference 16/16 |
@@ -88,6 +91,8 @@ environment variable, the shipped value, the value that restores the previous pa
 | minimax-pair | markov_cand_h | `STRIX_MM_MARKOV_H` | 8192 | 2048 | Markov measurement: \|H\| 8192 (offline approx1-K3: C4096/H8192 0 acceptance changes on 1857 anchors) |
 | minimax-pair | markov_topc_v2 | `STRIX_MM_MARKOV_TOPC` | v2 | v1 | Markov measurement: top-C v2 = v1 canonical set / scores / picks (payload gates v1/v2 vs CPU) |
 | minimax-pair | pf_msa_batch | `STRIX_MM_PF_MSA_BATCH` | 1 | 0 | Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 % |
+| minimax-pair | pf_dense_mlp | `STRIX_MM_PF_DENSE_MLP` | 1 | 0 | Prefill: exact (== strix_gemm bitwise, the pf_dense_qkv contract); dense MLP of layers 0-2 on the v4 core for 4096-row pieces |
+| minimax-pair | pf_headless | `STRIX_MM_PF_HEADLESS` | 1 | 0 | Prefill: exact (state + final rows fnv identical); last layer cache-only for every chunk but the last (strix/prefill_headless.hpp) |
 | minimax-pair | pf_attend4 | `STRIX_MM_PF_ATTEND4` | 1 | 0 | Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 % |
 | minimax-pair | pf_router_batch | `STRIX_MM_PF_ROUTER_BATCH` | 1 | 0 | Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 % |
 | minimax-pair | pf_mtfit | `STRIX_MMX_PREFILL_MTFIT` | 1 | 0 | Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 % |
@@ -97,6 +102,7 @@ environment variable, the shipped value, the value that restores the previous pa
 | minimax-pair | pf_moe_pipe | `STRIX_MMX_PREFILL_PIPE` | 1 | 0 | Prefill measurement: exact, 8K B/A 0.973 / 0.935 / 0.924 |
 | minimax-pair | pf_moe_pipe_pair | `STRIX_MMX_PREFILL_PIPE_PAIR` | auto | 0 | Prefill MoE measurement: exact (partials/xt/at/output bitwise), paired MT8 bands for calls >= 2048 rows: MoE call -0.6..-1.0 % 2048 / -0.9..-1.5 % 4096 rows, 1024 mixed |
 | minimax-pair | pf_moe_tail_stream | `STRIX_MMX_PREFILL_TAIL_STREAM` | 1 | 0 | Prefill MoE measurement: exact (partials/xt/at/output bitwise), tail classes beside MT8: MoE call -1.9 to -3.0 % real routes |
+| minimax-pair | pf_moe_pipe_tail | `STRIX_MMX_PREFILL_PIPE_TAIL` | 1 | 0 | Prefill MoE measurement: bitwise (pipe-tail fixture 12,480 cells, logits and state fnv of both ranks identical), tail rows (MT 1..7) on the pipelined kernel: PAIR TTFT 8K 12.68 -> 12.47 s, 32K 51.81 -> 50.91 s |
 | minimax-pair | pf_gather_tok | `STRIX_MMX_PREFILL_GATHER_TOK` | 1 | 0 | Prefill MoE measurement: exact (tiled xt/at, partials, output bitwise), gather 6.35 -> 4.14 ms per 4096-row call |
 | minimax-pair | pf_router_rows | `STRIX_MM_PF_ROUTER_ROWS` | 32 | 8 | Prefill router measurement: exact (routes/weights bitwise vs fused and 4/8-row forms), post+router 4096 rows 5.40 -> 4.82 ms; TTFT 1K -0.9 %, 8K -0.8 % |
 | minimax-pair | pf_msa_scratch_mb | `STRIX_MM_PF_MSA_SCRATCH_MB` | 1152 | 512 | Prefill attention: exact (independent windows), one MSA batch per 4096-row piece instead of three; kept at 512 below 4 GiB headroom |
@@ -106,6 +112,7 @@ environment variable, the shipped value, the value that restores the previous pa
 | minimax-pair | pf_tx_uncached | `STRIX_MM_PF_TX_UNCACHED` | 1 | 0 | Prefill exchange measurement: exact, exchange-send 0.23 -> 0.002 s GPU, ~1.3 % (prefill module route) |
 | minimax-pair | pf_async_start | `STRIX_MM_PF_ASYNC_START` | 1 | 0 | Grouped all-member >=2048-row gate (configurable); TP2 4096+3844 IDs identical, -2.3/-2.5 % with late fence; full state/workload qualification pending |
 | minimax-pair | pf_late_src_fence | `STRIX_MM_PF_LATE_SRC_FENCE` | 1 | 0 | Admitted grouped async source lifetime; TP2 IDs identical, combined -2.3/-2.5 %; full state/workload qualification pending |
+| minimax-pair | pf_order | `STRIX_MMX_PF_ORDER` | invariant | adaptive | Chunk-invariant linear order mmx-pf-linear-s1-v1 (bits independent of chunking; cache identity prefill_order=): gate32 6 x 32K units vs 3 L0 nulls each, pooled dNLL -0.053 CI95 [-0.148,+0.041] inside null spread, task 40/42 == 40/42; a defaulted value falls back to adaptive when the invariant route is unmet |
 | minimax-pair | dist_crc_parallel | `STRIX_DIST_CRC_PARALLEL` | 1 | 0 | Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged |
 | minimax-pair | dist_host_crc_overlap | `STRIX_DIST_HOST_CRC_OVERLAP` | 1 | 0 | Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged |
 | minimax-pair | dist_host_chunk | `STRIX_DIST_HOST_CHUNK_BYTES` | 1048576 | 0 | Host transport measurement: ABA x3 TTFT 1K -12.8 %, decode -1 %, bits unchanged |

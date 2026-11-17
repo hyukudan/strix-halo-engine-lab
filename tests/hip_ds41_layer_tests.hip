@@ -373,11 +373,13 @@ void synthetic(std::mt19937& rng) {
         const auto stream_ref = sref.down(), x_ref = xref.down();
         const auto mix_ref = dev_mixes(sref, sr, hidden, dfn, dbase, dscale, 1e-6F, 1e-20F);
         Device<std::uint32_t> counters(std::vector<std::uint32_t>(hc_site_counter_count(sr), 0U));
-        for (int pass = 0; pass < 8; ++pass) {
+        // Requested tiles 4/8 both clamp to 2 for one-read; these also cover dispatch clamping.
+        for (int pass = 0; pass < 16; ++pass) {  // passes 0-7 one read of the copies, 8-15 the per-copy reads
             st.up(std::vector<float>(std::size_t{sr} * n, -1.0F));
             x.up(std::vector<float>(std::size_t{sr} * hidden, -1.0F));
             HcSiteView v;
             v.rows = sr; v.hidden = hidden; v.stream = st.p; v.launches = 1; v.form = 2;
+            v.collapse_once = pass < 8 ? 2U : 1U;
             static constexpr std::uint32_t tiles[] = {1, 2, 4, 8};
             v.tile = tiles[pass % 4];
             v.sub = dsb.p; v.residual = dres.p; v.expand_mixes = dem.p;
@@ -391,7 +393,10 @@ void synthetic(std::mt19937& rng) {
             expect(covered, "site launch access covers collapse_out");
             const bool ok = same_bits(st.down(), stream_ref) && same_mix(mixes.down(), mix_ref) && same_bits(x.down(), x_ref) &&
                             counters.down() == std::vector<std::uint32_t>(hc_site_counter_count(sr), 0U);
-            expect(ok, "site launch with collapse bitwise, rows=" + std::to_string(sr) + " tile " + std::to_string(v.tile) + " pass " +
+            const auto route = hc_collapse_route(v, true);  // explicit forms ignore the environment
+            expect(ok, "site launch with collapse bitwise, rows=" + std::to_string(sr) + " path " +
+                           (route.once ? "one-read" : "per-copy") + " requested tile " + std::to_string(v.tile) +
+                           " effective tile " + std::to_string(route.tile) + " pass " +
                            std::to_string(pass));
         }
     }
@@ -933,6 +938,23 @@ void synthetic(std::mt19937& rng) {
     Device<float> dkv(kv), dqn(qn), dkn(kn), dst(s);
     enqueue_engram_inject(dst.p, dkv.p, dqn.p, dkn.p, rows, hidden, 1e-20F, nullptr);
     expect(same_bits(dst.down(), hs), "Engram injection (chunked) bitwise");
+    {
+        // image rows (every third row flagged): gate 0 there, the other rows as without flags
+        std::vector<std::uint8_t> off(rows, 0);
+        for (std::uint32_t r = 1; r < rows; r += 3) off[r] = 1;
+        auto hi = s;
+        for (std::uint32_t r = 0; r < rows; ++r)
+            engram_inject(std::span<float>(hi.data() + r * n, n), std::span<const float>(kv.data() + std::size_t{r} * hidden * 5, hidden * 5), qn, kn,
+                          1e-20F, off[r] != 0);
+        Device<std::uint8_t> doff(off);
+        Device<float> dimg(s);
+        enqueue_engram_inject(dimg.p, dkv.p, dqn.p, dkn.p, rows, hidden, 1e-20F, nullptr, doff.p);
+        const auto got = dimg.down();
+        bool untouched = true;
+        for (std::uint32_t r = 1; r < rows; r += 3)
+            untouched = untouched && std::equal(got.begin() + r * n, got.begin() + (r + 1) * n, s.begin() + r * n);
+        expect(same_bits(got, hi) && untouched, "Engram injection gate-off rows bitwise (image rows untouched)");
+    }
     std::cout << "synthetic layer-site kernels checked\n";
 }
 
