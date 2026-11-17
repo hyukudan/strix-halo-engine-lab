@@ -175,15 +175,15 @@ follow-up agent turns restore their cached prefix and prefill only the new token
 Build, then the measured run (exactness and speed; an HTTP server for this route is not tested end to end yet):
 
 ```powershell
-pwsh src/glm/rtxpf/producer/build.ps1 -BuildDir BUILD_DIR -Fresh -Parallel 2 `
+pwsh src/cuda/models/glm/producer/build.ps1 -BuildDir BUILD_DIR -Fresh -Parallel 2 `
     -TierstreamSource TIERSTREAM_DIR [-CutlassDir CUTLASS_DIR]
-python -B src/glm/rtxpf/producer/decode_qualification_window.py --build BUILD_DIR `
+python -B src/cuda/models/glm/producer/decode_qualification_window.py --build BUILD_DIR `
     --model MODEL_DIR --prompt-dir PROMPT_DIR --unit-file OUT_DIR/glm-units.bin `
     --unit-manifest-sha256 MANIFEST_SHA256 --full-card --allow-gpu
 ```
 
 For a smaller card replace `--full-card` with `--vram-total-gib 24 --ram-total-gib 32` (or your own caps). The unit
-file, every option and the measured rows: [GLM RTX guide](../src/glm/rtxpf/README.md).
+file, every option and the measured rows: [GLM RTX guide](../src/cuda/models/glm/README.md).
 
 The GLM service (`glm_native_service`) also takes `--dgpu auto|<uuid>`: it checks through NVML, before any CUDA call,
 that the card is an `sm_120` RTX PRO (`auto` picks the eligible card with the most memory) and pins it; `--dgpu off` is
@@ -202,3 +202,25 @@ described in [Declare the GPU to use](#declare-the-gpu-to-use).
   jobs) lower every number; the measurements above were taken with the card otherwise idle.
 - **To stay on the Strix Halo defaults,** simply do not build or start these routes. Each route also has its own off
   switches in its guide.
+
+
+## Layer-cut runtime (MiniMax)
+
+MiniMax M3.1 has an experimental block pipeline: CUDA computes layers `[0,K)` and the HIP TP2 pair computes
+`[K,60)`, including the first token's head on the last prompt row. Select it explicitly with
+`mm-rtx-prefill MODEL_DIR ROPE.bin OUTPUT_DIR cut:PROMPT.u32 --layer-cut K --cut-block 2048 --send NODE0_IP:PORT0,NODE1_IP:PORT1 --repeat 2`.
+The existing routes keep their defaults; layer-cut's compiler, native execution, fidelity and full-workload gates are pending.
+
+Both ranks use `--layercut-listen NAME:PROMPT.u32:BASE_PORT:STEPS:COUNT --cut K --cut-block 2048`.
+`--cut-act relay` (default) adds rank 0 `--cut-relay HOST:PORT` and rank 1 `--cut-relay-listen PORT`;
+`--cut-act direct` sends activations to both ranks. Rank r's producer listener uses BASE_PORT+r.
+Shared controls are `--split` / `STRIX_SPLIT` (default `device-only`), `--cut` / `STRIX_SPLIT_CUT`,
+`--cut-block` / `STRIX_SPLIT_BLOCK` and `--cut-act` / `STRIX_SPLIT_ACT`; inspection uses `--print-effective-config`.
+
+The `minimax-m3.1/layercut-v1` handoff contract sends each block's FP32 residual h (24,576 bytes/row), followed by
+rank-local K/V/IK pieces for the prefix layers (1,280 bytes/row/layer/rank). Hello metadata binds cut, block, prompt
+length, token digest and identity. Both endpoints print
+`identity mm-layercut-v1 rtx=cuda-fp32id L[0,K) pair=IDENTITY L[K,60)`;
+`--cut-pair-identity` on CUDA must match the pair profile. `--codec bp` retains lossless bp-v1.
+See the [checked-in kit](../scripts/bench/layercut/README.md) for launch scripts, exact metadata layout,
+planning inputs, staging bounds, timing limitations and the pending qualification procedure.

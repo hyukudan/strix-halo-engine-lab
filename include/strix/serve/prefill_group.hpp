@@ -59,6 +59,7 @@ struct PrefillGroupCapacity {
     std::uint32_t split_class_mask = 0;
     std::uint32_t rejected_class_mask = 0;
     const char* reason = "eligible-routes-only";
+    bool fast = false;  // the owner runs non-exact levers (a FAST profile): see qualify_fast
 
     [[nodiscard]] bool accepts(std::uint32_t route) const noexcept {
         return members >= 2U && window_rows != 0U && (route & rejected_class_mask) == 0U;
@@ -83,6 +84,7 @@ struct PrefillGroupPolicy {
     std::uint32_t max_members = kDefaultMaxMembers;
     std::uint32_t max_rows = kDefaultMaxRows;      // summed rows of one group pass
     std::uint32_t short_rows = kDefaultShortRows;  // the family's short limit: only rows < short_rows group
+    bool explicit_mode = false;                    // STRIX_SERVE_PREFILL_GROUP was set (auto or 0)
 
     [[nodiscard]] constexpr bool groups() const noexcept { return mode == Mode::automatic && max_members > 1U && short_rows > 1U; }
     [[nodiscard]] constexpr const char* name() const noexcept { return mode == Mode::off ? "off" : "auto"; }
@@ -106,6 +108,7 @@ struct PrefillGroupPolicy {
         p.mode = family_default;
         p.short_rows = short_rows_limit;
         if (const std::string s = env("STRIX_SERVE_PREFILL_GROUP"); !s.empty()) {
+            p.explicit_mode = true;
             if (s == "auto" || s == "1" || s == "on") p.mode = Mode::automatic;
             else if (s == "0" || s == "off") p.mode = Mode::off;
             else throw std::invalid_argument("STRIX_SERVE_PREFILL_GROUP is auto or 0, not '" + s + "'");
@@ -124,6 +127,17 @@ struct PrefillGroupPolicy {
     }
 };
 
+// FAST qualification of a family's group pass (the identity fixture "every member of a FAST group == its solo FAST run",
+// logits and state on every rank, passed on the family's nodes = fast_qualified). Until then a FAST capacity groups only
+// under an explicit STRIX_SERVE_PREFILL_GROUP=auto and otherwise reports pending-group-fast-identity; an explicit 0 always
+// wins. Exact capacities are unchanged.
+[[nodiscard]] inline PrefillGroupCapacity qualify_fast(PrefillGroupCapacity cap, const PrefillGroupPolicy& policy, bool fast_qualified) noexcept {
+    if (cap.fast && !fast_qualified && !policy.explicit_mode && cap.members >= 2U) {
+        cap.members = 0U;
+        cap.reason = "pending-group-fast-identity";
+    }
+    return cap;
+}
 // Members of the next prefill pass, as candidate ids in arrival order (empty only when there is no candidate).
 //   candidates     prompts ready for their prefill now, oldest first (strictly increasing arrival_seq)
 //   cost           the family's measured pass cost (a + b x rows)

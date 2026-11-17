@@ -589,6 +589,16 @@ void test_namespace() {
     setenv("STRIX_DS41_FAST_MOE", "1", 1);
     const auto fast_moe = ds::prefix_namespace_from_env(false);
     unsetenv("STRIX_DS41_FAST_MOE");
+    // the bounded decoder replay: its own identity per bound; "0" is off (the exact namespace)
+    setenv("STRIX_DS41_DECODER_REPLAY", "128", 1);
+    const auto replay128 = ds::prefix_namespace_from_env(false);
+    setenv("STRIX_DS41_DECODER_REPLAY", "256", 1);
+    const auto replay256 = ds::prefix_namespace_from_env(false);
+    setenv("STRIX_DS41_DECODER_REPLAY", "0", 1);
+    const auto replay_off = ds::prefix_namespace_from_env(false);
+    unsetenv("STRIX_DS41_DECODER_REPLAY");
+    expect(replay128.tag != base.tag && replay256.tag != replay128.tag && replay_off.tag == base.tag,
+           "namespace: the bounded decoder replay has its own identity per bound, off keeps the exact one");
     expect(fast_attn.tag != base.tag && fast_moe.tag != base.tag && fast_attn.tag != fast_moe.tag && fast_attn.tag != bf16.tag,
            "namespace: FAST attention / MoE levers change cache identity");
     expect(ds::prefix_namespace_from_env(false).tag == base.tag, "namespace: FAST levers unset = the exact identity");

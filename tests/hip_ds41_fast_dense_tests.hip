@@ -4,6 +4,7 @@
 // --no-timing: one repetition (the ctest form). Both modes first check the packed weight decode (all scales x codes) and
 // that every form of the policy gives form 0's bits; --forms [reps [rounds [rows]]] times the forms on DS41 chunk shapes.
 #include "core/f16_dense_q8a8.hpp"
+#include "strix/ds41_attention.hpp"
 #include "strix/hip_ds41_layer.hpp"
 #include "hip_ds41_fast_dense_args.hpp"
 
@@ -52,6 +53,59 @@ template <class F> double timed(F&& f, unsigned reps) {
     for (unsigned i = 0; i < reps; ++i) f();
     ck(hipDeviceSynchronize(), "sync");
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
+}
+
+// The DS41 flash prologue's query math (hip_ds41_attention_flash.inl query16: FP32 q, rope512 on the pairs of dims
+// 448..511 of each 512-wide head; then frag_from_f32 = to_bf16 per value), one thread per 16-dim chunk.
+__global__ void prologue_image(const float* q, const strix::ds41::attn::RopeRow* rope, unsigned rows, unsigned count, std::uint16_t* out) {
+    const std::size_t i = blockIdx.x * 256ULL + threadIdx.x;
+    if (i >= std::size_t{rows} * count / 16U) return;
+    const unsigned r = static_cast<unsigned>(i * 16U / count), chunk = static_cast<unsigned>(i * 16U % count % 512U / 16U);
+    float x[16];
+    for (unsigned k = 0; k < 16U; ++k) x[k] = q[i * 16U + k];
+    if (chunk >= 28U)
+        for (unsigned k = 0; k < 8U; ++k) {
+            const unsigned p = 8U * (chunk - 28U) + k;
+            strix::ds41::attn::rope_pair(x[2U * k], x[2U * k + 1U], rope[r].c[p], rope[r].s[p], false);
+        }
+    for (unsigned k = 0; k < 16U; ++k) out[i * 16U + k] = strix::attn_core::tile::to_operand<strix::attn_core::tile::Operand::bf16>(x[k]);
+}
+// enqueue_q_b_rope_image (q_b's image for the flash core's query_op) against the prologue on the FAST FP32 output:
+// bitwise equal, taken from the FAST dense rule's rows on, declined (nothing launched) below.
+bool run_image(strix::ds41::Q8A8DensePrefillView v, const Dev<float>& fast, const Case& c, unsigned reps) {
+    namespace attn = strix::ds41::attn;
+    std::vector<attn::RopeRow> hr(c.rows);
+    std::uniform_real_distribution<float> th(-3.14159F, 3.14159F);
+    for (auto& row : hr)
+        for (unsigned p = 0; p < attn::kRopePairs; ++p) {
+            const float t = th(rng);
+            row.c[p] = std::cos(t), row.s[p] = std::sin(t);
+        }
+    Dev<attn::RopeRow> dr(c.rows);
+    dr.up(hr);
+    Dev<std::uint16_t> image(std::size_t{c.rows} * c.count), ref(std::size_t{c.rows} * c.count);
+    strix::ds41::set_fast_dense(1);
+    v.out = fast.p;  // run()'s FAST FP32 output; the image form does not write it
+    const bool want = c.rows >= 128U && c.parts == 1U && !c.acc && c.count % 512U == 0U;
+    const bool taken = strix::ds41::enqueue_q_b_rope_image(v, image.p, dr.p, nullptr);
+    if (!taken) {
+        std::printf("img %5u %5u | declined %s\n", c.rows, c.count, want ? "FAIL" : "ok");
+        return !want;
+    }
+    if (!want) {
+        std::printf("img %5u %5u | unexpected admission FAIL\n", c.rows, c.count);
+        return false;
+    }
+    const double ti = timed([&] { (void)strix::ds41::enqueue_q_b_rope_image(v, image.p, dr.p, nullptr); }, reps);
+    const unsigned chunks = c.rows * c.count / 16U;
+    hipLaunchKernelGGL(prologue_image, dim3((chunks + 255U) / 256U), dim3(256), 0, nullptr, fast.p, dr.p, c.rows, c.count, ref.p);
+    ck(hipDeviceSynchronize(), "image sync");
+    const auto hi = image.down(), hp = ref.down();
+    std::size_t diff = 0;
+    for (std::size_t i = 0; i < hi.size(); ++i) diff += hi[i] != hp[i];
+    const bool ok = want && diff == 0U;
+    std::printf("img %5u %5u | image %8.4f ms | differing %zu of %zu %s\n", c.rows, c.count, ti, diff, hi.size(), ok ? "ok" : "FAIL");
+    return ok;
 }
 
 bool run(const Case& c, unsigned reps) {
@@ -128,7 +182,8 @@ bool run(const Case& c, unsigned reps) {
     const bool ok = geometry_equal && bad == 0U && (lever ? rel > 0.0 && rel < 3e-3 : rel == 0.0);
     std::printf("fd %5u %5u %5u parts %u acc %d | exact %8.4f | fast %8.4f | w8 %8.4f w16 %8.4f | rule %2u | rel_l2 %.3e %s\n", c.rows,
                 c.in, c.count, c.parts, int(c.acc), te, tf, tw[0], tw[1], q8a8::waves_for(c.rows, c.in), rel, ok ? "ok" : "FAIL");
-    return ok;
+    const bool image_ok = run_image(v, fast, c, reps);
+    return ok && image_ok;
 }
 
 namespace q8a8 = strix::core::f16_dense_tall::q8a8;
@@ -264,6 +319,79 @@ bool forms(const Shape& c, unsigned reps, unsigned rounds) {
     (void)hipEventDestroy(e0), (void)hipEventDestroy(e1);
     return equal;
 }
+
+// Batched form (grid z) against one call per group, bit for bit; with rounds, strict ABAB timing (median of warm rounds).
+// The o-groups layout of DS41: input row = groups x in (group g at column g * in), output row = groups x count.
+bool batched(const char* name, unsigned rows, unsigned in, unsigned count, unsigned groups, unsigned reps, unsigned rounds) {
+    const unsigned row_bytes = in / 32U * 34U, width = in * groups, outs = count * groups;
+    std::vector<std::uint8_t> w(std::size_t{outs} * row_bytes + 64U);
+    std::uniform_int_distribution<int> code(-127, 127);
+    std::uniform_real_distribution<float> scale(0.0005F, 0.02F), step(0.002F, 0.05F);
+    for (std::size_t b = 0; b < std::size_t{outs} * (in / 32U); ++b) {
+        const _Float16 d = static_cast<_Float16>(scale(rng));
+        std::memcpy(&w[b * 34U], &d, 2);
+        for (unsigned i = 0; i < 32U; ++i) w[b * 34U + 2U + i] = static_cast<std::uint8_t>(static_cast<std::int8_t>(code(rng)));
+    }
+    std::vector<std::int8_t> a(std::size_t{rows} * width);
+    for (auto& x : a) x = static_cast<std::int8_t>(code(rng));
+    std::vector<float> dl(std::size_t{rows} * (width / 32U));
+    for (auto& x : dl) x = step(rng);
+    Dev<std::uint8_t> dw(w.size());
+    Dev<std::int8_t> da(a.size());
+    Dev<float> dd(dl.size()), base(std::size_t{rows} * outs), out(std::size_t{rows} * outs);
+    dw.up(w), da.up(a), dd.up(dl);
+    q8a8::View f{};
+    f.weight = dw.p, f.codes = da.p, f.deltas = dd.p, f.row_bytes = row_bytes, f.in = in, f.count = count, f.rows = rows;
+    f.x_stride = width, f.out_stride = outs, f.out = base.p;
+    const auto per_group = [&](float* y) {
+        for (unsigned g = 0; g < groups; ++g) {
+            auto v = f;
+            v.weight = dw.p + std::size_t{g} * count * row_bytes, v.codes = da.p + g * in, v.deltas = dd.p + g * in / 32U;
+            v.out = y + g * count;
+            q8a8::enqueue(v, nullptr);
+        }
+    };
+    const auto one = [&](float* y) {
+        auto v = f;
+        v.out = y, v.batch = groups, v.batch_in = in, v.batch_out = count, v.batch_weight_bytes = std::uint64_t{count} * row_bytes;
+        q8a8::enqueue(v, nullptr);
+    };
+    if (!q8a8::supported(f)) {
+        std::fprintf(stderr, "FAIL unsupported batched shape %s\n", name);
+        return false;
+    }
+    ck(hipMemset(base.p, 0xff, base.n * sizeof(float)), "poison"), ck(hipMemset(out.p, 0x7f, out.n * sizeof(float)), "poison");
+    per_group(base.p), one(out.p);
+    ck(hipDeviceSynchronize(), "batched");
+    const auto hb = base.down(), ho = out.down();
+    const bool equal = std::memcmp(hb.data(), ho.data(), hb.size() * sizeof(float)) == 0;
+    if (!rounds) {
+        std::printf("bt %-5s %5u %5u %5u x %u groups | batched bit-equal %s\n", name, rows, in, count, groups, equal ? "ok" : "FAIL");
+        return equal;
+    }
+    hipEvent_t e0, e1;
+    ck(hipEventCreate(&e0), "event"), ck(hipEventCreate(&e1), "event");
+    const auto timed_ms = [&](auto&& g) {
+        ck(hipEventRecord(e0, nullptr), "record");
+        for (unsigned i = 0; i < reps; ++i) g();
+        ck(hipEventRecord(e1, nullptr), "record");
+        ck(hipEventSynchronize(e1), "event sync");
+        float ms = 0.0F;
+        ck(hipEventElapsedTime(&ms, e0, e1), "elapsed");
+        return double(ms) / reps;
+    };
+    std::vector<double> ta, tb;
+    for (unsigned r = 0; r < rounds; ++r) ta.push_back(timed_ms([&] { per_group(out.p); })), tb.push_back(timed_ms([&] { one(out.p); }));
+    const auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v.size() % 2U ? v[v.size() / 2U] : 0.5 * (v[v.size() / 2U - 1U] + v[v.size() / 2U]);
+    };
+    const double ma = median({ta.begin() + 1, ta.end()}), mb = median({tb.begin() + 1, tb.end()});
+    std::printf("bt %-5s %5u %5u %5u x %u groups | per-group %8.4f | batched %8.4f ms (warm median, %u rounds ABAB) | d %+8.4f | %s\n",
+                name, rows, in, count, groups, ma, mb, rounds, mb - ma, equal ? "bits ok" : "BITS FAIL");
+    (void)hipEventDestroy(e0), (void)hipEventDestroy(e1);
+    return equal;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -280,6 +408,9 @@ int main(int argc, char** argv) {
                                 {"q_a", rows, 5120, 1280, 1, 1},  {"kv", rows, 5120, 512, 1, 1}};
         bool ok = decode_check();
         for (const auto& s : shapes) ok = forms(s, reps, rounds) && ok;
+        // o_a's 8 groups: one batched launch against 8 calls (the 1024-row chunk and the 256-row S1 layers)
+        ok = batched("o_a", rows, 4096, 1024, 8, reps, rounds) && ok;
+        ok = batched("o_a", 256, 4096, 1024, 8, reps, rounds) && ok;
         for (unsigned k = 0; k < kFormCount; ++k)
             std::printf("census form %u: %8.3f ms per layer-chunk (d %+7.3f) | x113 layer-chunks (11.6K rank 0) %8.1f ms (d %+6.1f)\n",
                         kForms[k], chunk_ms[k], chunk_ms[k] - chunk_ms[0], 113.0 * chunk_ms[k], 113.0 * (chunk_ms[k] - chunk_ms[0]));
@@ -293,12 +424,17 @@ int main(int argc, char** argv) {
     const Shape small[] = {{"s1", 256, 1280, 2048, 1, 1}, {"s2", 300, 1024, 1000, 1, 1}, {"s3", 513, 256, 40, 1, 1},
                            {"s4", 640, 1024, 1024, 2, 1}};
     for (const auto& s : small) ok = forms(s, 1U, 0U) && ok;
+    // batched form bit-equal to the per-group calls: partial row block, partial last tile (remainder launch), 2 / 8 groups
+    ok = batched("b1", 300, 1024, 1000, 2, 1U, 0U) && ok;
+    ok = batched("b2", 1024, 4096, 1024, 8, 1U, 0U) && ok;
+    ok = batched("b3", 513, 256, 40, 3, 1U, 0U) && ok;
     // q_b-like (in 1024 / 1536, many outputs), o-like (in 4096, two K parts of 4096), partial last tile, accumulate, small
     const Case cases[] = {
         {64, 1024, 512, 1, false},    {128, 1024, 2048, 1, false},  {256, 1024, 2048, 1, false},  {512, 1024, 4096, 1, false},
         {1024, 1024, 4096, 1, false}, {2048, 1024, 8192, 1, false}, {4096, 1024, 8192, 1, false}, {1024, 1536, 4096, 1, false},
         {1024, 4096, 1024, 1, false}, {1024, 8192, 1024, 2, false}, {2048, 8192, 1024, 2, false}, {1024, 4096, 4096, 1, false},
         {300, 1024, 1000, 1, false},  {513, 256, 40, 1, false},    {256, 1024, 512, 1, true},
+        {129, 1024, 512, 1, false},   {300, 1024, 512, 1, false},  {513, 256, 512, 1, false},
     };
     for (const auto& c : cases) ok = run(c, reps) && ok;
     strix::ds41::set_fast_dense(-1);

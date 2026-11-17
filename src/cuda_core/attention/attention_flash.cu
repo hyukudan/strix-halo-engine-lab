@@ -262,24 +262,17 @@ cudaError_t attention_prefill_flash(const AttentionDims& d, const float* q, cons
     const FlashPlan pl = flash_plan(rows, d.heads, static_cast<std::uint32_t>(sms), tail, tail_warps);
     const std::uint32_t nqb = (rows + QB - 1) / QB;
     const dim3 grid(pl.jobs);
+    // Attributes belong to the current device; CUDA serializes the update.
     if (pipe == FlashPipe::swz3) {
-        static bool attr = false;
-        if (!attr) {
-            if (auto e = cudaFuncSetAttribute(flash_kernel<SwzLayout>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<SwzLayout>());
-                e != cudaSuccess)
-                return e;
-            attr = true;
-        }
+        if (auto e = cudaFuncSetAttribute(flash_kernel<SwzLayout>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<SwzLayout>());
+            e != cudaSuccess)
+            return e;
         flash_kernel<SwzLayout><<<grid, 256, smem_bytes<SwzLayout>(), stream>>>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, nqb,
                                                                                  pl.full, pl.tail_warps);
     } else {
-        static bool attr = false;
-        if (!attr) {
-            if (auto e = cudaFuncSetAttribute(flash_kernel<PadLayout>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<PadLayout>());
-                e != cudaSuccess)
-                return e;
-            attr = true;
-        }
+        if (auto e = cudaFuncSetAttribute(flash_kernel<PadLayout>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<PadLayout>());
+            e != cudaSuccess)
+            return e;
         flash_kernel<PadLayout><<<grid, 256, smem_bytes<PadLayout>(), stream>>>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, nqb,
                                                                                  pl.full, pl.tail_warps);
     }

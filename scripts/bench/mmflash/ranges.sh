@@ -22,11 +22,27 @@ SESS=${MMF_SESSIONS:-cpros8k,ccode8k,cdata8k} CAP=${MMF_CAP:-8256} SECS=${MMF_SE
 mkdir -p "$K/tk" "$K/cmp" || exit 2
 : > "$S"; : > "$K/cmp/expected.tsv"
 say() { echo "$*" >> "$S"; }
+declare -A flash_ranges=() index_ranges=() flash_modes=() onsets=()
+parse_candidate() {
+  local a=$1
+  [[ $a =~ ^f([0-9]+)-([0-9]+)m(11|12)(i([0-9]+)-([0-9]+))?$ ]] || return 1
+  flash_ranges[$a]=${BASH_REMATCH[1]}-${BASH_REMATCH[2]}
+  flash_modes[$a]=$(( ${BASH_REMATCH[3]} - 10 ))
+  index_ranges[$a]=${BASH_REMATCH[4]#i}
+  local onset=$((10#${BASH_REMATCH[1]}))
+  if [[ -n ${BASH_REMATCH[4]} ]] && (( 10#${BASH_REMATCH[5]} < onset )); then onset=$((10#${BASH_REMATCH[5]})); fi
+  onsets[$a]=$onset
+}
+nulls_for() {
+  local a=$1 n; shift
+  for n in "$@"; do case $n in n${onsets[$a]}s*) printf '%s\n' "$n";; esac; done
+}
 env_of() {
   case $1 in
     e*) echo "STRIX_MM_PF_MSA_FLASH=0";;
     n*) local x=${1#n}; echo "STRIX_MM_PF_MSA_FLASH=0 STRIX_MM_DIAG_ATTN_ULP=${x%%s*}:${x##*s}";;
-    f*) local x=${1#f}; echo "STRIX_MM_PF_MSA_FLASH=$(( ${x##*m} - 10 )) STRIX_MM_PF_MSA_FLASH_LAYERS=${x%%m*}";;
+    f*) local ix=${index_ranges[$1]}
+        echo "STRIX_MM_PF_MSA_FLASH=${flash_modes[$1]} STRIX_MM_PF_MSA_FLASH_LAYERS=${flash_ranges[$1]}${ix:+ STRIX_MM_PF_IDX_WMMA=1 STRIX_MM_PF_IDX_WMMA_LAYERS=$ix}";;
     d*) local x=${1#d} r s g; r=${x%%s*}; s=${x#*s}; g=${s##*g}; s=${s%%g*}; echo "STRIX_MM_PF_MSA_FLASH=0 STRIX_MM_DIAG_ATTN_ULP=$r:$s:$g";;
     *) return 1;;
   esac
@@ -34,9 +50,10 @@ env_of() {
 [[ $REF =~ ^[A-Za-z0-9._-]+$ ]] && [ "$REF" != . ] && [ "$REF" != .. ] || exit 64
 declare -A seen=()
 for a in "$@"; do
-  [[ $a =~ ^(e[A-Za-z0-9._-]+|n[0-9]+s[0-9]+|f[0-9]+-[0-9]+m(11|12)|d[0-9]+-[0-9]+s[0-9]+g[0-9]+)$ ]] || exit 64
+  [[ $a =~ ^(e[A-Za-z0-9._-]+|n[0-9]+s[0-9]+|f[0-9]+-[0-9]+m(11|12)(i[0-9]+-[0-9]+)?|d[0-9]+-[0-9]+s[0-9]+g[0-9]+)$ ]] || exit 64
   [ -z "${seen[$a]:-}" ] || exit 64
   seen[$a]=1
+  case $a in f*) parse_candidate "$a" || exit 64;; esac
   case $a in f*|d*) printf '%s\t%s\tabsolute\n' "$a-abs" "$a" >> "$K/cmp/expected.tsv";; esac
   case $a in f*) printf '%s\t%s\tfloor\n' "$a" "$a" >> "$K/cmp/expected.tsv";; esac
 done
@@ -74,9 +91,10 @@ for a in "$@"; do
   ok "$a" || { say "  $a: not sealed"; continue; }
   compare "$a-abs" "$MMF_RUN/$REF" "$MMF_RUN/$a" --ranks 0 1 "${T[@]}"
   [ "${a#f}" = "$a" ] && continue
-  o=${a#f}; o=${o%%-*}; nl=(); missing_null=0
-  for n in "$@"; do case $n in n${o}s*)
-    nl+=(--null-arm "$MMF_RUN/$n"); ok "$n" || missing_null=1;; esac; done
+  nl=(); missing_null=0
+  while IFS= read -r n; do
+    nl+=(--null-arm "$MMF_RUN/$n"); ok "$n" || missing_null=1
+  done < <(nulls_for "$a" "$@")
   [ "$missing_null" = 0 ] || { say "  $a: INCOMPLETE null population"; continue; }
   compare "$a" "$MMF_RUN/$REF" "$MMF_RUN/$a" --ranks 0 1 "${T[@]}" --dnll-rule floor --engine minimax \
       --profile fast-prefill "${nl[@]}"

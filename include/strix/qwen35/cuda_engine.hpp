@@ -26,8 +26,9 @@ namespace strix::qwen35 {
 
 enum class PackFormat : std::uint8_t { bf16, q8_0 };
 // TURBO weight source (owner requirement): off = exact pack as is; native = TURBO policy without weight change;
-// onfly = BF16 2-D weights rounded at load to NVFP4 (RTN per 16, kept only in VRAM). `converted` is not implemented yet.
-enum class TurboWeights : std::uint8_t { off, native, onfly };
+// onfly = BF16 2-D weights rounded at load to NVFP4 (RTN per 16, kept only in VRAM). converted = the same NVFP4 bytes read from a pack written by save_converted_pack (no BF16 source,
+// no conversion; the pack decides which tensors are NVFP4, e.g. lm_head).
+enum class TurboWeights : std::uint8_t { off, native, onfly, converted };
 // Prefill arithmetic policy for CudaEngine::prefill (the large-M path). exact: dense on the large-M tensor-core GEMM with the decode
 // reduction order + decode attention in 32-row windows + sequential GDN: bitwise equal to forward_rows windows + commit.
 // flash: exact dense, causal flash attention (bf16 P, online softmax; FAST attention, differs from decode attention).
@@ -54,6 +55,10 @@ struct EngineOptions {
     PrefillArith prefill_arith = PrefillArith::exact;
     std::uint32_t prefill_chunk = 2048;  // rows per large-M chunk (multiple of 128, <= 8192); buffers are allocated on first use
     std::uint32_t prefill_slots = 2;     // chunks in flight (1..2): 2 overlaps the sequential GDN kernel of one chunk with the GEMMs of the next
+    // bounded submission (cuda_core/submit_window.hpp): the host queues at most this many chunks ahead of the GPU (waits on
+    // chunk i - N before queuing chunk i). Scheduling only, bitwise. 0 = unbounded (whole prefill queued before one sync).
+    std::uint32_t prefill_inflight = 3;
+    std::uint32_t prefill_ramp = 0;      // > 0: first chunks grow ramp, 2*ramp, ... (< prefill_chunk) from idle; 0 = off
     bool prefill_big = true;             // false: prefill() runs forward_rows windows of 32 + commit (reference / fallback)
     // Long-context prefill attention (non-exact prefill policies only; the exact policy keeps attention_decode).
     // flash_pipe: shared-memory pipeline of the flash kernel (scheduling only, bitwise equal across pipes).
@@ -75,8 +80,11 @@ struct EngineOptions {
         : std::string("-pf-") + pf_names[static_cast<unsigned>(o.prefill_arith)] + (o.prefill_attn8 ? "-a8" : "");
     if (o.turbo_weights == TurboWeights::off) return "qwen35-cuda-exact-" + a + "-v1" + pf;
     if (o.turbo_weights == TurboWeights::native) return "qwen35-turbo-native-" + a + "-v1" + pf;
+    // converted packs hold the onfly bytes: same arithmetic identity as onfly (prefix caches may be shared)
     return "qwen35-turbo-nvfp4-onfly-rtn16-v2-retained-" + a + (o.turbo_lm_head ? "" : "-lmhead-bf16") + pf;
 }
+// Writes the onfly NVFP4 weights of the BF16 gguf `src` as a converted pack at `out` (use with TurboWeights::converted). Returns bytes.
+std::uint64_t save_converted_pack(const std::string& src, const std::string& out, const EngineOptions& opt);
 // Effective-config text (identity, prefix-cache key, every lever).
 void print_effective_config(const EngineOptions& o, const char* dense_arith, std::FILE* f);
 
@@ -97,6 +105,8 @@ struct SlotRows {
 
 class CudaEngine {
 public:
+    using Rows = RowsOut;  // shared MtpChain binding (strix/spec/mtp_chain.hpp)
+    using LogitRows = qwen35::LogitRows;
     ~CudaEngine();
     CudaEngine(const CudaEngine&) = delete;
     CudaEngine& operator=(const CudaEngine&) = delete;

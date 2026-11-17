@@ -16,6 +16,7 @@
 //   Timing (informational, only after a clean gate).
 // usage: hip_glm_prefill_tests CASES_DIR [--no-timing]
 // Fixture-free dense gate: STRIX_GLM_PF_TEST_ONLY=dense; opt-in 8K paired timing: STRIX_GLM_PF_DENSE_BENCH=1.
+#include "glm/prefill/glm_pf_mla_wmma.hpp"
 #include "glm/kernels/glm_dsa.hpp"
 #include "glm/kernels/glm_tier_a.hpp"
 #include "glm/prefill/glm_prefill.hpp"
@@ -1437,6 +1438,7 @@ void test_dsa(const std::string& cases, std::mt19937& g) {
             const std::size_t nq = static_cast<std::size_t>(C) * H * kKvLora;
             const std::size_t ne = static_cast<std::size_t>(C) * H * P::kEStride, no = static_cast<std::size_t>(C) * H * kMlaDim;
             float *qt[2], *ep[2], *ob[2], *out[2];
+            const auto exact_calls = P::mla_wmma::calls.load();
             for (unsigned v = 0; v < 2; ++v) {  // separate poisoned buffers prevent a missed v3 store inheriting v2's result
                 qt[v] = poison<float>(nq + guard);
                 ep[v] = poison<float>(ne + guard);
@@ -1444,6 +1446,7 @@ void test_dsa(const std::string& cases, std::mt19937& g) {
                 out[v] = poison<float>(no + guard);
                 P::mla_attention_rows_versions(slot.s, tk, nn, q, kv, H, qt[v], ep[v], ob[v], out[v], C, nullptr, 7, 7, v + 2);
             }
+            check(P::mla_wmma::calls.load() == exact_calls, "explicit v2/v3 executed no WMMA GEMMs");
             bool same = true;
             auto compare = [&](const float* a, const float* b, std::size_t count) {
                 const auto x = down(a, count + guard), y = down(b, count + guard);
@@ -1460,6 +1463,34 @@ void test_dsa(const std::string& cases, std::mt19937& g) {
             compare(ob[0], ob[1], nq);
             compare(out[0], out[1], no);
             check(same, "MLA 7/7/3 == 7/7/2 bitwise intermediates/output/guards, C=129 H=" + std::to_string(H));
+            if (H == 32) {
+                // Select FAST explicitly: neither this gate nor its image arms inherit environment policy.
+                // Empty and tail key lists also exercise the flash producer, independently of q-tilde format.
+                auto counts = std::vector<std::uint32_t>(C, nt);
+                counts[0] = 0;
+                counts.back() = 1;
+                hok(hipMemcpy(nn, counts.data(), counts.size() * sizeof(counts[0]), hipMemcpyHostToDevice), "image counts");
+                for (unsigned image = 0; image < 2; ++image) {
+                    const auto before = P::mla_wmma::calls.load();
+                    P::mla_attention_rows_selected(slot.s, tk, nn, q, kv, H, qt[image], ep[image], ob[image], out[image],
+                        C, nullptr, 7, 23, 3, 0, {P::mla_gemm::Arithmetic::wmma, image != 0, true});
+                    check(P::mla_wmma::calls.load() == before + 2, "explicit FAST executed absorb and out WMMA");
+                }
+                check(bits_eq(down(qt[0], nq / 2), down(qt[1], nq / 2)), "o-bar image toggle preserves q-tilde image");
+                const auto raw = down(ob[0], nq);
+                const auto packed = down(reinterpret_cast<const std::uint16_t*>(ob[1]), nq);
+                bool image_same = true;
+                for (std::size_t j = 0; j < nq; ++j) {
+                    const _Float16 h = static_cast<_Float16>(raw[j]);
+                    std::uint16_t bits;
+                    std::memcpy(&bits, &h, sizeof(bits));
+                    image_same &= packed[j] == bits;
+                }
+                check(image_same, "flash FP16 o-bar image == conversion of FP32 flash output, including empty/tail keys");
+                check(bits_eq(down(out[0], no), down(out[1], no)), "flash producer/WMMA consumer image toggle bitwise");
+                std::fill(counts.begin(), counts.end(), nt);
+                hok(hipMemcpy(nn, counts.data(), counts.size() * sizeof(counts[0]), hipMemcpyHostToDevice), "restore counts");
+            }
             // Same full piece as an MTP consumer: internal windows must cover
             // every output and keep qt/e/ob inside their smaller poisoned arenas.
             // Odd windows move rows across GEMM/score CTA groups; the last piece

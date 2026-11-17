@@ -132,6 +132,14 @@ struct ApiConfig {
     bool stream_receipts = true;
     // Resolved engine support: enable only after every constrained selection path executes it.
     bool engine_logprobs = false, engine_logit_transforms = false;
+    // How the engine's logprobs are computed, stated in /v1/capabilities and every scored receipt (strix/logprob_partials.hpp):
+    // "serial-host" = the full target row on the host, FP64; "device-partials" = FP32 vocabulary-slice partials on the
+    // device (192 B per row and slice), merged in FP64 on the host. Values are the raw target row unless the request's
+    // logit transforms are active on a route that applies them (receipt "values": "transformed").
+    std::string scoring_execution = "serial-host";
+    std::string scoring_precision = "fp64-host";
+    // Prompt-token scores (request field prompt_logprobs): no engine executes them yet; false refuses the field with 400.
+    bool engine_prompt_logprobs = false;
     bool engine_constraints = false;
     bool engine_thinking_budget = false;
     // Anthropic thinking.budget_tokens: false (default) = accepted and stated as not enforced (the request keeps speculative

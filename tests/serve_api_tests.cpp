@@ -510,6 +510,35 @@ void test_queue_wait_work_until() {
     }
 }
 
+void test_ticket_emissions() {
+    for (const bool trace : {false, true}) {
+        GenerationQueue queue;
+        GenerationJob job;
+        job.prompt = {1U};
+        job.trace_emissions = trace;
+        const auto ticket = queue.submit(std::move(job));
+        const std::vector<std::uint32_t> first{2U, 3U}, last{4U};
+        ticket->publish(first);
+        ticket->publish({});
+        ticket->publish(last);
+        GenerationStats stats;
+        stats.generated_tokens = 3;
+        ticket->finish(std::move(stats));
+        const auto result = ticket->stats();
+        check(result.emission_trace == trace, "publication trace is request opt-in");
+        check(result.token_emissions.size() == (trace ? 2U : 0U), "trace counts committed nonempty groups only");
+        if (trace) {
+            check(result.token_emissions[0].count == 2U && result.token_emissions[1].count == 1U &&
+                  result.token_emissions[1].steady_ns >= result.token_emissions[0].steady_ns,
+                  "trace preserves group counts and monotonic publication times");
+        }
+        bool done = false;
+        check(ticket->wait(std::chrono::milliseconds(0), done) == std::vector<std::uint32_t>({2U, 3U, 4U}) && done,
+              "trace does not change ticket output or completion");
+        queue.shutdown();
+    }
+}
+
 // GenerationTicket::wake ends one wait() without tokens (set before the wait counts, so no lost wakeup), and a
 // cancelled ticket waited with wake_on_cancel=false blocks until the finish instead of returning at once.
 void test_ticket_wake() {
@@ -1342,6 +1371,7 @@ int main() try {
     test_batched_queue();
     test_queue_wait_work_until();
     test_ticket_wake();
+    test_ticket_emissions();
     test_queue_caller_orders();
     test_queue_cancel_replenishment();
     const auto tokenizer = tiny_tokenizer();
@@ -1457,6 +1487,13 @@ int main() try {
     std::thread http_thread([&] { server.serve(); });
     std::thread engine_thread([&] { queue.run(engine); });
     const std::string auth = "Authorization: Bearer secret\r\n";
+    for (const char* value : {"1.5", "1e100", "1e999", "-1", "17", "true", "\"8\""}) {
+        const auto reply = http(port, "POST", "/v1/completions",
+            std::string("{\"model\":\"test-model\",\"prompt\":\"hello\",\"max_tokens\":1,\"window_rows\":") + value + "}", auth);
+        const auto error = parse_json(reply.body);
+        check(reply.status == 400 && at(at(error, "error"), "type").as_string() == "invalid_request_error" &&
+              at(at(error, "error"), "param").as_string() == "window_rows", "invalid window_rows is a client error");
+    }
     const auto first_choice = [](const Json& j) -> const Json& { return at(j, "choices").as_array().at(0); };
     for (const bool server_default : {false, true}) {
         const auto headers = auth + std::string("X-Test-Config: thinking-") + (server_default ? "on" : "off") + "\r\n";
@@ -1503,6 +1540,28 @@ int main() try {
 
     try {
     {
+        const auto plain = http(port, "POST", "/v1/chat/completions",
+            R"({"messages":[{"role":"user","content":"Hi"}],"max_tokens":3})", auth);
+        check(plain.status == 200 && !at(parse_json(plain.body), "strix").find("token_emissions"),
+              "publication trace absent by default");
+        const auto traced = http(port, "POST", "/v1/chat/completions",
+            R"({"messages":[{"role":"user","content":"Hi"}],"max_tokens":3,"return_token_emissions":true})", auth);
+        const auto result = parse_json(traced.body);
+        const auto& trace = at(at(result, "strix"), "token_emissions");
+        std::int64_t previous = 0, count = 0;
+        for (const auto& event : at(trace, "events").as_array()) {
+            check(event.as_array()[0].as_int() >= previous, "wire emission times monotonic");
+            previous = event.as_array()[0].as_int();
+            count += event.as_array()[1].as_int();
+        }
+        check(traced.status == 200 && at(trace, "clock").as_string() == "steady_ns" &&
+              at(trace, "includes_stop_tokens").as_bool() && count == at(at(result, "usage"), "completion_tokens").as_int(),
+              "wire publication counts match final usage without logprobs");
+        const auto invalid = http(port, "POST", "/v1/chat/completions",
+            R"({"messages":[{"role":"user","content":"Hi"}],"return_token_emissions":1})", auth);
+        check(invalid.status == 400, "malformed trace request refused before admission");
+    }
+    {
         const auto mode = auth + "X-Test-Config: constraints\r\n";
         const auto call = [&](const std::string& path, Json body, bool stream) {
             body.set("stream", Json(stream)); return http(port, "POST", path, body.dump(), mode);
@@ -1518,6 +1577,11 @@ int main() try {
         double sum = 0; for (std::size_t i = 0; i < tokenizer->vocab_size(); ++i) sum += std::exp((i == 'a' || i == 'b' ? 2.0 : i == 'c' ? -1.0 : -100.0) - 2);
         check(at(scores.as_array()[0], "logprob").as_double() == -std::log(sum), "wire logprob exactly equals reference");
         check(at(at(result, "strix"), "scoring").find("basis")->as_string() == "target-row-log-softmax", "score basis receipt");
+        check(at(at(result, "strix"), "scoring").find("values")->as_string() == "raw", "score values receipt: raw target row");
+        check(at(at(at(result, "strix"), "scoring"), "execution").as_string() == constrained_config.scoring_execution,
+              "score receipt execution matches configured route");
+        check(at(at(at(result, "strix"), "scoring"), "precision").as_string() == constrained_config.scoring_precision,
+              "score receipt precision matches configured route");
         for(const auto* marker:{"ROUTE_MTP","ROUTE_OFF"}) {
             auto routed=base;routed.set("messages",parse_json(std::string("[{\"role\":\"user\",\"content\":\"")+marker+"\"}]"));
             const auto wire=parse_json(call("/v1/chat/completions",routed,false).body);
@@ -1550,6 +1614,15 @@ int main() try {
             if (at(e,"type").as_string() == "response.output_text.delta") for (const auto& score : at(e,"logprobs").as_array()) response_stream.push(score);
         check(response_stream.dump() == scores.dump(), "Responses delta scores match nonstream");
         for (const auto n : {-1,21}) { auto b = parse_json(base.dump()); b.set("top_logprobs",Json(n)); check(call("/v1/chat/completions",b,false).status == 400,"top logprobs bounds"); }
+        {  // prompt-token scores: no engine executes them; the field is refused explicitly on every route, never ignored
+            auto b = parse_json(base.dump()); b.set("prompt_logprobs", Json(1));
+            const auto refused = call("/v1/chat/completions", b, false);
+            check(refused.status == 400 && refused.body.find("prompt_logprobs") != std::string::npos, "prompt_logprobs refused explicitly (chat)");
+            auto legacy = parse_json(R"({"prompt":"Hi","max_tokens":2,"prompt_logprobs":0})");
+            check(call("/v1/completions", legacy, false).status == 400, "prompt_logprobs refused explicitly (completions)");
+            auto neutral = parse_json(base.dump()); neutral.set("prompt_logprobs", Json());
+            check(call("/v1/chat/completions", neutral, false).status == 200, "prompt_logprobs null is neutral");
+        }
         for (const auto n : {-1,6}) { auto b = parse_json(completion.dump()); b.set("logprobs",Json(n)); check(call("/v1/completions",b,false).status == 400,"completion logprobs bounds"); }
         for (const auto* field : {"presence_penalty","frequency_penalty","repetition_penalty"}) {
             for (const auto value : {-3.0, 11.0}) { auto b = parse_json(base.dump()); b.set(field,Json(value)); check(call("/v1/chat/completions",b,false).status == 400,"transform bounds"); }
