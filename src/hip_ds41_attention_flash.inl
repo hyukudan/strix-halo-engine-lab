@@ -86,6 +86,31 @@ struct FlashAttentionQ16Policy : FlashAttentionPolicy {
     }
 };
 
+// policy ds41-decoder-replay-bounded-v1: the window keys from the layer's key_floor (visible_keys_floor); the ring slots of
+// the real positions. Its own instantiation of the flash core: FlashAttentionPolicy's code is untouched.
+struct FlashAttentionFloorPolicy : FlashAttentionPolicy {
+    __device__ static __forceinline__ unsigned count(const Args& v, unsigned wg) {
+        unsigned nw;
+        return visible_keys_floor(v, row(v, wg), nw);
+    }
+    __device__ static __forceinline__ unsigned key(const Args& v, unsigned wg, unsigned j) {
+        const unsigned r = row(v, wg);
+        const std::uint64_t p = v.pos[r], span = p + 1U - v.key_floor;
+        const unsigned nw = span < kWindow ? static_cast<unsigned>(span) : kWindow;
+        if (j < nw) {
+            unsigned slot = static_cast<unsigned>((p + 1U - nw) % v.capacity) + j;
+            if (slot >= v.capacity) slot -= v.capacity;
+            return slot;
+        }
+        return v.capacity + v.idx[static_cast<std::size_t>(r) * v.topk + j - nw];
+    }
+};
+// both: the floored window keys and the q_b epilogue's BF16 query image (same bits as each form alone)
+struct FlashAttentionFloorQ16Policy : FlashAttentionFloorPolicy {
+    __device__ static __forceinline__ const std::uint16_t* query_op(const Args& v, unsigned wg) {
+        return FlashAttentionQ16Policy::query_op(v, wg);
+    }
+};
 // the row's single partial (slot 0) through the unchanged combine
 __global__ __launch_bounds__(32) void attention_flash_combine_kernel(AttentionView v) {
     attention_combine_head(v, blockIdx.y, blockIdx.x, threadIdx.x, 1U);

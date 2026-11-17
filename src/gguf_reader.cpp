@@ -50,6 +50,8 @@ public:
             }
             info.metadata.push_back(std::move(entry));
         }
+        info.metadata_count = metadata_count;
+        info.metadata_end = position_;
         apply_alignment(info);
 
         info.tensors.reserve(to_size(tensor_count));
@@ -310,6 +312,7 @@ private:
     }
 
     static bool valid_ggml_type(std::uint32_t type) {
+        if (type == kNvfp4TilePack) return true;
         if (type == type_strix_iu4_g64) {  // private IU4 g64 dense pack (core/iu4.hpp), see gguf_reader.hpp
             return true;
         }

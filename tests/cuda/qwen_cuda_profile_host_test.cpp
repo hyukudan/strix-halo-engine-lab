@@ -181,7 +181,7 @@ void overrides() {
     check(refuses({"--gdn-fp16-chunk", "1"}), "gdn_fp16_chunk refused on CUDA");
     check(refuses({"--hc-mma", "maybe"}), "malformed boolean refused");
     check(refuses({"--profile", "fast", "--profile", "default"}), "duplicate --profile");
-    check(refuses({"--profile", "turbo"}), "unknown profile");
+    check(refuses({"--profile", "turbo-x"}), "unknown profile");  // turbo itself resolves (turbo_binding)
     check(refuses({"--profile"}), "missing profile value");
     check(refuses({}, Env{{"STRIX_QPF2K_GDN_FP16_CHUNK", "1"}}), "HIP-only env refused on CUDA");
     check(refuses({"--release-by-layer"}, {}, qo::Entry::serve), "serve refuses an unexplained release-by-layer");
@@ -347,11 +347,38 @@ void snapshot_forms() {
 }
 }  // namespace
 
+// TURBO (qwen-turbo-v1) through the one resolver: serve == CLI == strix/cuda/qwen_turbo.hpp, weight toggle only (the
+// exact CUDA prefill forms), lever options refused, and no turbo field outside turbo.
+void turbo_binding() {
+    const Env none;
+    const auto request = parse(with_paths({"--profile", "turbo", "--turbo-weights", "onfly", "--blocks", "1024,2048"}), none);
+    const auto serve = qo::resolve(request, qo::Entry::serve), cli = qo::resolve(request, qo::Entry::cli);
+    const auto direct = strix::cuda::qwen_turbo::resolve({request.profile, request.inputs, false});
+    const auto plain = one({}, qo::Entry::serve);
+    check(serve.resolution.is_turbo() && serve.config.turbo_onfly_nvfp4 && cli.config.turbo_onfly_nvfp4 && direct.onfly_nvfp4,
+          "turbo: onfly effective in both entries");
+    check(!serve.config.turbo_namespace.empty() && serve.config.turbo_namespace == cli.config.turbo_namespace &&
+              serve.config.turbo_namespace == direct.cache_namespace, "turbo: namespace of the qwen_turbo resolver");
+    check(!serve.choice.fast() && !cli.choice.fast() && serve.contract == plain.contract, "turbo: exact CUDA prefill forms");
+    check(diff(serve.config, cli.config) == std::set<std::string>({"decode", "export_state", "release_by_layer"}),
+          "turbo: same values in both entries");
+    check(!plain.config.turbo_onfly_nvfp4 && plain.config.turbo_namespace.empty() &&
+              qo::effective_config_json(plain).find("turbo_weights") == std::string::npos &&
+              qo::effective_config_json(serve).find("\"turbo_weights\"") != std::string::npos,
+          "turbo: effective config field only under turbo");
+    bool threw = false;
+    try {
+        (void)qo::resolve(parse(with_paths({"--profile", "turbo", "--prefill-moe-route-bf16", "1"}), none), qo::Entry::serve);
+    } catch (const std::invalid_argument&) { threw = true; }
+    check(threw, "turbo: CUDA lever option refused");
+}
+
 int main() {
     try {
         profiles();
         overrides();
         common_options();
+        turbo_binding();
         flat_blocks();
         identities();
         effective_config();

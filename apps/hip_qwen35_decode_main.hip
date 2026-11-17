@@ -2,7 +2,10 @@
 // Prompt goes through windows of up to --rows tokens (forward_commit), then greedy decode (one row per step).
 // Home: specific = app glue; engine in include/strix/qwen35/hip_engine.hpp, kernels shared.
 #include <algorithm>
+#include <fstream>
+#include <iterator>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -54,7 +57,7 @@ int main(int argc, char** argv) try {
     using namespace strix::qwen35;
     std::string model, dump, ids_arg = "1";
     unsigned wide = 0;
-    unsigned gen = 16, rows = 1, maxpos = 0;
+    unsigned gen = 16, rows = 1, maxpos = 0, repeat = 1;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -69,10 +72,17 @@ int main(int argc, char** argv) try {
         else if (a == "--dump-logits") dump = next();
         else if (a == "--iu4-reference") strix::core::dense_iu4::set_reference(true);  // exactness gate: dequantised-pack reference form
         else if (a == "--max-pos") maxpos = strix::core::parse_u32(next());
+        else if (a == "--repeat") repeat = std::max(1U, strix::core::parse_u32(next()));  // prefills per process (reset between): first = cold, last = warm
         else throw std::invalid_argument("unknown flag " + a);
     }
     if (model.empty() || rows < 1U || rows > HipEngine::max_rows())
-        throw std::invalid_argument("usage: --model GGUF [--prompt-ids 1,2,3] [--gen N] [--rows 1..16] [--dump-logits FILE] [--iu4-reference] [--max-pos N]");
+        throw std::invalid_argument("usage: --model GGUF [--prompt-ids 1,2,3] [--gen N] [--rows 1..16] [--dump-logits FILE] [--iu4-reference] [--max-pos N] [--repeat N]; --prompt-ids @FILE reads the list from FILE");
+    if (!ids_arg.empty() && ids_arg[0] == '@') {  // long prompts exceed the per-argument limit of the OS
+        std::ifstream f(ids_arg.substr(1));
+        if (!f) throw std::invalid_argument("cannot read " + ids_arg.substr(1));
+        ids_arg.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        while (!ids_arg.empty() && std::isspace(static_cast<unsigned char>(ids_arg.back()))) ids_arg.pop_back();
+    }
     const auto prompt = parse_ids(ids_arg);
     if (prompt.empty()) throw std::invalid_argument("empty prompt");
     strix::core::require_capacity(prompt.size(), gen, 0xFFFFFFFFULL);
@@ -101,8 +111,11 @@ int main(int argc, char** argv) try {
             E->read_logits(o, n, dumped.data() + at);
         }
     };
-    const auto t_pf0 = std::chrono::steady_clock::now();
     unsigned last_n = 0;
+    double pf_ms = 0.0;
+    for (unsigned pass = 0; pass < repeat; ++pass) {
+    if (pass) { E->reset(); dumped.clear(); }
+    const auto t_pf0 = std::chrono::steady_clock::now();
     if (wide) {
         for (std::size_t at = 0; at < prompt.size();) {
             const unsigned n = unsigned(std::min<std::size_t>(wide, prompt.size() - at));
@@ -123,7 +136,11 @@ int main(int argc, char** argv) try {
         forward(last_n, prompt.data() + at);
         at += last_n;
     }
-    const double pf_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pf0).count();
+    pf_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pf0).count();
+    if (repeat > 1U)
+        std::printf("prefill %u/%u (%s): %zu tokens %.1f ms = %.1f tok/s\n", pass + 1U, repeat,
+                    pass == 0U ? "cold" : pass + 1U == repeat ? "warm" : "mid", prompt.size(), pf_ms, double(prompt.size()) * 1000.0 / pf_ms);
+    }
     std::printf("prompt %zu tokens: %.1f ms\n", prompt.size(), pf_ms);
     std::vector<int> generated{int(dump.empty() ? top[0] : top[last_n - 1U])};
 

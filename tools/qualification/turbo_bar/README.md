@@ -60,9 +60,13 @@ Per position, float64 over the full vocabulary, for an ordered pair a->b: KL(a||
 Bar per metric: `d = m(E->T) - m(E->R) - delta`, verdict against limit 0 (delta default 0.0). Tasks: for each
 item `d = s_R - s_T - delta` (success, paired) and `s_E - s_T` reported next to it with discordant counts.
 
-CI = the wider envelope of the Student t interval and a seeded percentile bootstrap over units (`stats.py`).
+Continuous CI = the wider envelope of the Student t interval and a seeded percentile bootstrap over units (`stats.py`).
+Paired binary tasks instead bound the two discordant probabilities with simultaneous exact binomial
+(Clopper-Pearson) bounds, allocating `(1-level)/4` to each of four tails. Their difference is a conservative
+interval even with no observed discordances; 128 identical successes cannot clear a 0.01 loss margin.
 PASS iff CI_hi < limit; FAIL iff CI_lo > limit; otherwise INCONCLUSIVE with
-`n_needed = ceil(n * (halfwidth / |limit - mean|)^2)` and "enlarge sample". Fewer than 3 units is INCONCLUSIVE.
+`n_needed = ceil(n * (halfwidth / |limit - mean|)^2)` and "enlarge sample" (a heuristic, not a power guarantee).
+Fewer than 3 units is INCONCLUSIVE.
 Where a task or retrieval cell is at a ceiling for all arms, declare a positive margin before freezing.
 Retrieval first averages keys within each haystack, then gives each declared matrix cell equal weight.
 Its conservative interval averages simultaneous cell bounds (Bonferroni levels); bootstrap units within
