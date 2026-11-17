@@ -10,13 +10,15 @@ Positions are averaged per parent; the parent is the statistical unit. The bar p
   python -m tools.qualification.turbo_bar.losses analyze --layout layout.json --out losses.json
 """
 import argparse
+import copy
 import sys
+from pathlib import Path
 
 import numpy as np
 
 from tools.qualification.option_qual import metrics, records
 from tools.qualification.turbo_bar import spool, stats
-from tools.qualification.turbo_bar.common import canon_sha, read_ids, read_json, safe_name, write_json
+from tools.qualification.turbo_bar.common import canon_sha, read_ids, read_json, safe_name, sha256_file, write_json
 
 METRICS = ("kl", "dis", "dnll")
 METRIC_LABEL = {"kl": "KL", "dis": "top-1 disagreement", "dnll": "dNLL"}
@@ -133,7 +135,65 @@ def combine(verdicts):
     return "PASS" if v and all(x == "PASS" for x in v) else "INCONCLUSIVE"
 
 
+def freeze_layout(layout, manifest, corpus):
+    layout["frozen_inputs"] = {"manifest": copy.deepcopy(manifest), "corpus": copy.deepcopy(corpus),
+                               "cases_sha256": canon_sha(layout["cases"])}
+    return layout
+
+
+def validate_layout(layout):
+    # Unbound synthetic analyses carry no experiment identity. A saved experiment
+    # must retain its original inputs; old layouts must be rebuilt, not trusted.
+    if not (layout.get("manifest") or {}).get("core_sha256"):
+        if layout.get("arm_sha256") or layout.get("frozen_inputs"):
+            raise ValueError("missing frozen manifest identity")
+        return
+    from tools.qualification.turbo_bar import manifest as mf
+    from tools.qualification.turbo_bar.run_logits import arm_spec, validate_output
+    frozen = layout.get("frozen_inputs")
+    if not frozen:
+        raise ValueError("layout lacks frozen inputs; rebuild the layout")
+    m, corpus = frozen["manifest"], frozen["corpus"]
+    identity = {"version": m["version"], "core_sha256": mf.core_sha(m)}
+    if (layout["manifest"] != identity or m["frozen"]["core_sha256"] != identity["core_sha256"]
+            or (layout.get("E", "E"), layout.get("R", "R"), layout.get("Erep", "Erep")) != ("E", "R", "Erep")
+            or canon_sha(corpus) != m["protocol"]["corpus_sha256"]
+            or layout["margins"] != m["protocol"]["margins"]
+            or layout["bootstrap"] != m["protocol"]["bootstrap"]
+            or layout["arm_sha256"] != {a: canon_sha(arm_spec(m, a)) for a in layout["T"]}
+            or canon_sha(layout["cases"]) != frozen["cases_sha256"]):
+        raise ValueError("layout differs from frozen inventory or protocol")
+    sources = {c["source"] for c in layout["cases"]}
+    inventory = {f"{c['case']}/{source}": c for c in corpus["cases"] for source in sources}
+    if (len(layout["cases"]) != len(inventory)
+            or {c["case"] for c in layout["cases"]} != inventory.keys()):
+        raise ValueError("layout differs from frozen case inventory")
+    arms = {layout.get("E", "E"), layout.get("R", "R"), layout.get("Erep", "Erep"), *layout["T"]}
+    if layout.get("control"):
+        arms.add(layout["control"])
+    for c in layout["cases"]:
+        original = inventory[c["case"]]
+        if (set(c["files"]) != arms or c["source"] not in ("spread", "continuation")
+                or any(c[k] != original[k] for k in ("parent", "category", "length", "split"))):
+            raise ValueError("layout differs from frozen case inventory")
+        for arm, path in c["files"].items():
+            saved = c["validated_files"][arm]
+            contract = saved["contract"]
+            spec = arm_spec(m, arm)
+            keys = ("prompt_ids", "positions") if c["source"] == "spread" else ("prompt_ids", "cont_ids")
+            expected = {"manifest_core_sha256": identity["core_sha256"], "manifest_version": m["version"],
+                        "arm": arm, "arm_sha256": canon_sha(spec), "case": original["case"], "source": c["source"],
+                        "binary_sha256": spec["binary"]["sha256"], "weights_sha256": [w["sha256"] for w in spec["weights"]],
+                        "identity": spec["identity"], "prefill_rows": contract["prefill_rows"],
+                        **{k + "_sha256": original[k + "_sha256"] for k in keys}}
+            side = validate_output(path, expected)
+            if (contract != expected or side["payload_sha256"] != saved["payload_sha256"]
+                    or sha256_file(Path(path).with_suffix(".json")) != saved["sidecar_sha256"]):
+                raise ValueError("logit payload or sidecar replaced since layout creation")
+
+
 def analyze(layout):
+    validate_layout(layout)
     E, R, Ts = layout.get("E", "E"), layout.get("R", "R"), layout["T"]
     erep, ctrl = layout.get("Erep", "Erep"), layout.get("control")
     margins = layout.get("margins", {})
@@ -263,14 +323,17 @@ def build_layout(corpus_dir, spread_dir, arms, cont_dir=None, margins=None, mani
                 raise ValueError("spread selection count differs from prescribed corpus")
             if source == "continuation" and len(read_ids(Path(corpus_dir) / c["cont_ids"])) != 256:
                 raise ValueError("qualification requires 256 continuation tokens")
+            validated_files = {}
             for arm, path in files.items():
                 side = read_json(Path(path).with_suffix(".json"))
                 expected = output_contract(manifest, arm, c, corpus_dir, source,
                                            side.get("contract", {}).get("prefill_rows") if source == "spread" else None)
-                validate_output(path, expected)
+                side = validate_output(path, expected)
+                validated_files[arm] = {"contract": expected, "payload_sha256": side["payload_sha256"],
+                                        "sidecar_sha256": sha256_file(Path(path).with_suffix(".json"))}
             cases.append({"case": f"{c['case']}/{source}", "parent": c["parent"], "category": c["category"],
                           "length": c["length"], "source": source, "format": fmt, "files": files,
-                          "split": c["split"], "expected_positions": expected_positions})
+                          "split": c["split"], "expected_positions": expected_positions, "validated_files": validated_files})
     return cases
 
 
@@ -296,10 +359,11 @@ def main(argv=None):
         Ts = [n for n in names if n.startswith("T:")]
         cases = build_layout(a.corpus, a.spread, names, a.continuation, manifest=m)
         proto = m["protocol"]
-        write_json(a.out, {"E": "E", "R": "R", "T": Ts, "Erep": "Erep", "control": a.control, "cases": cases,
+        layout = {"E": "E", "R": "R", "T": Ts, "Erep": "Erep", "control": a.control, "cases": cases,
                            "arm_sha256": {n: canon_sha(m["arms"][n]) for n in Ts},
                            "margins": proto["margins"], "bootstrap": proto["bootstrap"],
-                           "manifest": {"version": m["version"], "core_sha256": (m["frozen"] or {}).get("core_sha256")}})
+                           "manifest": {"version": m["version"], "core_sha256": (m["frozen"] or {}).get("core_sha256")}}
+        write_json(a.out, freeze_layout(layout, m, read_json(Path(a.corpus) / "corpus.json")))
         return 0
     res = analyze(read_json(a.layout))
     write_json(a.out, res)

@@ -39,6 +39,9 @@ struct Options {
     std::uint32_t slots = 1;        // independent sequences (decode rows), each with its own KV / index-key cache
     std::uint64_t capacity = 8256;  // positions per slot
     std::uint32_t max_rows = 4096;  // rows per forward call (prefill chunk / gate); sizes the activations
+    // Prefill unit cap in max_rows chunks; group width can cap it further and units may cross layer-cut blocks.
+    // 0 = STRIX_MM_PF_GROUP. Bit-neutral: chunk bits do not depend on the unit (strix/pair/prefill_group.hpp).
+    std::uint32_t unit_chunks = 0;
 };
 
 struct LoadReport {
@@ -90,6 +93,13 @@ public:
     // rows and arguments); step() of OTHER slots may run between two resumes, on both ranks in the same order. cancel
     // abandons it (the slot's caches are then partial). While open: no prefill / gate / copy_slot / state rows / set_taps.
     void prefill_begin(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0);
+    using CutFetch = std::function<void(std::uint64_t row0, std::size_t rows, float* h_device_dst, hipStream_t)>;
+    // Fetches residual h at the cut. Caller retains fetched host rows until the stream has consumed them.
+    // link_relay: only rank 0 calls `fetch`; its rows reach rank 1 over the pair link in one control exchange per
+    // chunk, enqueued at the same point of the schedule on both ranks (before the chunk's first layer, so it is ordered
+    // with the layer collectives on the same stream). Bytes are those rank 0 fetched: no arithmetic change.
+    void prefill_begin_cut(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0,
+                           unsigned first_layer, CutFetch fetch, bool link_relay = false);
     bool prefill_resume(unsigned layers, std::uint32_t* next);
     void prefill_cancel();
     using PfTaskId = std::uint64_t;

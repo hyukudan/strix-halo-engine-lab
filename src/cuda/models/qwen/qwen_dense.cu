@@ -17,14 +17,28 @@
 //             (:221-236); v_mul u*q (:238); scalar dot v_dual_fmac_f32 sum = w * x + sum over features tid, tid+256, ...
 //             ascending (:281); LDS tree strides 128..1, v_add_f32 (:301-401); 1/(1 + expf(-s)) (:416-457, IEEE div).
 #include "strix/env_flags.hpp"
+#include "strix/lever.hpp"
+#include "../../core/imma_tile.cuh"
+#include "strix/cuda/core/decode_rows.hpp"
 #include "strix/cuda/qwen_dense.hpp"
+#include "strix/cuda/core/nvfp4_a8.cuh"
+#include "../../core/imma_dense.cuh"
+#include "../../weight/arch/sm120_sources.cuh"
+
+#include <unordered_map>
 
 #include <cuda_fp16.h>
 
+#include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 
 namespace strix::cuda::qwen_dense {
+#ifdef STRIX_QWEN_DENSE_TEST_DISPATCH
+// Defined by the test executable; absent from production builds.
+void test_dispatch(std::uint32_t rows, bool one_pass);
+#endif
 namespace {
 
 // STRIX_QRTX_DECODE_KERNELS=0: keep the tiled kernels at rows <= 8 too (reference seam for the decode-shaped ones).
@@ -33,10 +47,44 @@ bool decode_rows_enabled() {
     return on;
 }
 
-constexpr int kBM = 128, kBN = 128, kKB = 4, kThreads = 256, kRowWords = 36;
-constexpr int kStageA = kBM * kRowWords * 4, kStageB = kBN * kRowWords * 4, kStageD = kKB * kBM * 4;
-constexpr int kStage = kStageA + kStageB + kStageD;
-constexpr int kSmem = 2 * kStage;
+// STRIX_QRTX_DENSE_TILE2=0: the first tiled kernel (project_kernel) instead of project_tile2_kernel. Bitwise: same chain per output.
+inline constexpr strix::lever::Decl dense_tile2_lever{
+    .name = "qwen_dense_tile2", .env = "STRIX_QRTX_DENSE_TILE2", .exactness = strix::lever::Exactness::bitwise,
+    .default_on = true, .source = "tests/cuda/qwen_dense_tests.cu: byte equality vs project_kernel"};
+bool dense_tile2_enabled() {
+    static const bool on = strix::lever::select(dense_tile2_lever, {}).on;
+    return on;
+}
+
+// STRIX_QRTX_DENSE_T2_REMAP=0: the first tile2 weight loader (17 lanes per row, two capped CTAs per SM). Bitwise.
+inline constexpr strix::lever::Decl dense_t2_remap_lever{
+    .name = "qwen_dense_t2_remap", .env = "STRIX_QRTX_DENSE_T2_REMAP", .exactness = strix::lever::Exactness::bitwise,
+    .default_on = true, .source = "tests/cuda/qwen_dense_tests.cu --bench-shape: equal output hashes, 5 site shapes"};
+bool dense_t2_remap_enabled() {
+    static const bool on = strix::lever::select(dense_t2_remap_lever, {}).on;
+    return on;
+}
+
+// STRIX_QRTX_DENSE_T2_A16=0: the remap loader (4-byte .ca copies) instead of the aligned-window loader (16-byte .cg
+// copies of the 80-byte aligned window that holds a stage's 68 raw bytes). Bitwise: the same raw bytes reach the reader,
+// which adds the window's word shift. Needs row_bytes % 16 == 0 and 16-aligned segments (launcher check).
+inline constexpr strix::lever::Decl dense_t2_a16_lever{
+    .name = "qwen_dense_t2_a16", .env = "STRIX_QRTX_DENSE_T2_A16", .exactness = strix::lever::Exactness::bitwise,
+    .default_on = false, .source = "qwen_dense_tests --bench-shape 16-11: equal hashes, 2-stage ring +13 % slower (L2 bytes, see RTXFAST6R)"};
+bool dense_t2_a16_enabled() {
+    static const bool on = strix::lever::select(dense_t2_a16_lever, {}).on;
+    return on;
+}
+
+// STRIX_QRTX_DENSE_T4=0: tile2 (2 K blocks per stage, 4-byte weight copies) instead of project_tile4_kernel (4 K blocks
+// per stage, 8-byte weight copies). Bitwise: same per-output chain, blocks ascending. Needs the remap lever on.
+inline constexpr strix::lever::Decl dense_t4_lever{
+    .name = "qwen_dense_t4", .env = "STRIX_QRTX_DENSE_T4", .exactness = strix::lever::Exactness::bitwise,
+    .default_on = false, .source = "tests/cuda/qwen_dense_tests.cu --bench-shape: equal output hashes, 5 site shapes"};
+bool dense_t4_enabled() {
+    static const bool on = strix::lever::select(dense_t4_lever, {}).on;
+    return on;
+}
 
 __device__ __forceinline__ std::uint32_t bf16_bits(float v) {
     const std::uint32_t b = __float_as_uint(v);
@@ -98,40 +146,64 @@ __global__ __launch_bounds__(256) void quantize_kernel(std::uint32_t rows, std::
 // float(dot) = bits - 1.5*2^23, one exact subtraction). Every thread owns 64 (row, output) accumulators and walks the
 // blocks in ascending order: the HIP chain acc = fma(dw * delta, float(dot), acc), unchanged by tiling.
 // Pipeline: stages of 4 blocks (codes 128 x 128 B, raw Q8_0 bytes 128 x 136 B, deltas 4 x 128), cp.async double buffer.
-struct KSeg { const unsigned char* w; void* out; std::uint64_t stride; std::uint32_t begin, end; };
-struct KSite {
-    KSeg seg[kMaxSegments];
-    std::uint32_t nseg, width, outputs;
-    const float* gate;
-    std::uint64_t gate_stride;
-};
-
-__device__ __forceinline__ unsigned find_seg(const KSite& s, std::uint32_t n) {
-    unsigned m = 0;
-    while (m + 1U < s.nseg && n >= s.seg[m].end) ++m;
-    return m;
+using KSite = core::dense_a8::Site<kMaxSegments>;
+using KSeg = core::dense_a8::KSeg;
+using NoCapture = core::dense_a8::NoCapture;
+#ifdef STRIX_WFMT_CAPTURE
+using PartialCapture = core::dense_a8::PartialCapture;
+using core::dense_a8::PartialCaptureConfig;
+using core::dense_a8::partial_capture_config;
+#endif
+bool rows_ksplit_enabled() {
+    static const bool on = strix::envcfg::flag("STRIX_QRTX_ROWS_KSPLIT", true);
+    return on;
 }
-__device__ __forceinline__ void cp_async4(void* smem, const void* g, bool ok) {
-    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" ::"r"(s), "l"(g), "r"(ok ? 4 : 0));
+// 9..16-row windows: one k-split pass with 16 padded rows (default) or STRIX_QRTX_DENSE_ROWS16=0 = two <= 8-row pieces
+bool rows16_enabled() {
+    static const bool on = strix::envcfg::flag("STRIX_QRTX_DENSE_ROWS16", true);
+    return on;
 }
-__device__ __forceinline__ void cp_async16(void* smem, const void* g, bool ok) {
-    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(g), "r"(ok ? 16 : 0));
+// Decode rows (rows <= 8) policy of main's streamed form (#680, rtxmax2 receipts; kernels in core/imma_dense.cuh
+// project_rows_cp_kernel / project_rows_ks_kernel<KO>). Selection (qwen_rows_glue_exact_test --time on the RTX PRO 6000,
+// us/call old ks -> cp): small sites win (shared gate/up 2.7 MB 5.65 -> 3.76 at 1 row, shared down 1.4 MB 3.60 -> 2.98),
+// large sites lose (gdn in 44 MB 36.1 -> 43.6 at 8 rows, gdn out 16.7 MB 15.2 -> 20.2 at 1 row) except K = 6144 at 8 rows
+// (24.3 -> 22.5). STRIX_QRTX_ROWS_CP: unset/"auto" = by site (weight bytes <= STRIX_QRTX_ROWS_CP_MB, default 4, or
+// K >= 6144 at 8 rows), 1 = every fitting site, 0 = never (old K-split kernel everywhere). Bits are identical in every mode.
+int rows_cp_mode() {
+    static const int mode = [] {
+        const char* e = strix::envcfg::text("STRIX_QRTX_ROWS_CP");
+        if (e == nullptr || *e == 0 || std::strcmp(e, "auto") == 0) return 2;
+        return std::atoi(e) != 0 ? 1 : 0;
+    }();
+    return mode;
 }
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-__device__ __forceinline__ void cp_async_wait1() { asm volatile("cp.async.wait_group 1;\n" ::); }
-
-__device__ __forceinline__ void imma(int (&d)[4], const std::uint32_t (&a)[4], const std::uint32_t (&b)[2]) {
-    constexpr int kMagic = 0x4B400000;
-    asm volatile(
-        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
-        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(kMagic));
+bool rows_cp_enabled() { return rows_cp_mode() != 0; }
+bool rows_cp_wanted(const KSite& k, unsigned rows) {
+    const int mode = rows_cp_mode();
+    if (mode != 2) return mode == 1;
+    static const double limit = [] {
+        const char* e = strix::envcfg::text("STRIX_QRTX_ROWS_CP_MB");
+        return (e != nullptr && *e != 0 ? std::atof(e) : 4.0) * 1048576.0;
+    }();
+    const double bytes = static_cast<double>(k.outputs) * (k.width / 32U) * 34.0;
+    return bytes <= limit || (rows >= 8U && k.width >= 6144U);
 }
-
-template <Store S>
-__device__ __forceinline__ void store_value(const KSite& site, std::uint32_t row, std::uint32_t n, float acc) {
+// K-split outputs per CTA (#680): STRIX_QRTX_KSO = 2 / 4 / 8, unset = 4 at >= 128 blocks per row, else 8.
+int rows_ks_out(std::uint32_t nblocks) {
+    static const int ko = [] { const char* e = strix::envcfg::text("STRIX_QRTX_KSO"); return e ? std::atoi(e) : 0; }();
+    return ko ? ko : (nblocks >= 128U ? 4 : 8);
+}
+struct DenseNumeric {
+    using Site = KSite;
+    static bool decode_rows_enabled() { return ::strix::cuda::qwen_dense::decode_rows_enabled(); }
+    static bool rows_ksplit_enabled() { return ::strix::cuda::qwen_dense::rows_ksplit_enabled(); }
+    static bool rows_cp_enabled() { return ::strix::cuda::qwen_dense::rows_cp_enabled(); }
+    static bool rows_cp_wanted(const KSite& k, unsigned rows) { return ::strix::cuda::qwen_dense::rows_cp_wanted(k, rows); }
+    static int rows_ks_out(std::uint32_t nblocks) { return ::strix::cuda::qwen_dense::rows_ks_out(nblocks); }
+    static bool dense_tile2_enabled() { return ::strix::cuda::qwen_dense::dense_tile2_enabled(); }
+    static bool dense_t2_remap_enabled() { return ::strix::cuda::qwen_dense::dense_t2_remap_enabled(); }
+    template <Store S>
+    __device__ __forceinline__ static void store(const KSite& site, std::uint32_t row, std::uint32_t n, float acc) {
     const float y = acc != acc ? __uint_as_float(kCanonicalNan) : acc;   // dense_a8_canonical (:1101)
     const KSeg& sg = site.seg[find_seg(site, n)];
     const std::uint64_t at = static_cast<std::uint64_t>(row) * sg.stride + (n - sg.begin);
@@ -143,362 +215,19 @@ __device__ __forceinline__ void store_value(const KSite& site, std::uint32_t row
         static_cast<std::uint16_t*>(sg.out)[at] = static_cast<std::uint16_t>(bf16_bits(gated));
     }
 }
-
-template <Store S>
-__global__ __launch_bounds__(kThreads) void project_kernel(KSite site, std::uint32_t rows, const std::int8_t* codes,
-                                                          const float* deltas, std::uint32_t pitch) {
-    extern __shared__ __align__(16) unsigned char smem[];
-    const int tid = static_cast<int>(threadIdx.x), lane = tid & 31, warp = tid >> 5, gid = lane >> 2, tig = lane & 3;
-    const int wm = warp & 1, wn = warp >> 1;
-    const std::uint32_t m0 = blockIdx.y * kBM, n0 = blockIdx.x * kBN;
-    const std::uint32_t width = site.width, nblocks = width / 32U, row_bytes = nblocks * 34U;
-    const std::uint32_t stages = (nblocks + kKB - 1U) / kKB;
-
-    // Weight loader: thread -> output row ln of the tile, half of its words.
-    const int ln = tid >> 1, half = tid & 1;
-    const std::uint32_t gn = n0 + static_cast<std::uint32_t>(ln);
-    const bool nvalid = gn < site.outputs;
-    const unsigned char* wrow = site.seg[0].w;
-    if (nvalid) {
-        const KSeg& sg = site.seg[find_seg(site, gn)];
-        wrow = sg.w + static_cast<std::uint64_t>(gn - sg.begin) * row_bytes;
+    static bool dense_t2_a16_enabled() { return ::strix::cuda::qwen_dense::dense_t2_a16_enabled(); }
+    static bool dense_t4_enabled() { return ::strix::cuda::qwen_dense::dense_t4_enabled(); }
+    // Diagnostics (microbench only, scheduling-only), as in #735's launcher: ring depth of the aligned-window
+    // tile2 (2 default, 3 or 4) and the shared-memory carveout hint in percent (< 0: none).
+    static int dense_t2_ring_stages() {
+        static const int ns = [] { const char* e = strix::envcfg::text("STRIX_QRTX_DENSE_T2_NS"); return e && e[0] ? std::atoi(e) : 2; }();
+        return ns;
     }
-    const auto load_stage = [&](std::uint32_t s, int buf) {
-        unsigned char* base = smem + buf * kStage;
-        auto* A = reinterpret_cast<std::uint32_t*>(base);
-        auto* B = reinterpret_cast<std::uint32_t*>(base + kStageA);
-        auto* D = reinterpret_cast<float*>(base + kStageA + kStageB);
-        const std::uint32_t kb0 = s * kKB, nb = min(static_cast<std::uint32_t>(kKB), nblocks - kb0);
-        const std::uint32_t chunks = nb * 2U;
-        for (std::uint32_t i = static_cast<std::uint32_t>(tid); i < kBM * chunks; i += kThreads) {
-            const std::uint32_t r = i / chunks, c = i % chunks, gr = m0 + r;
-            const bool ok = gr < rows;
-            const std::int8_t* src = ok ? codes + static_cast<std::uint64_t>(gr) * width + kb0 * 32U + c * 16U : codes;
-            cp_async16(A + r * kRowWords + c * 4U, src, ok);
-        }
-        const std::uint32_t words = 17U * nb / 2U, h0 = half ? (words + 1U) / 2U : 0U, h1 = half ? words : (words + 1U) / 2U;
-        const auto* wsrc = reinterpret_cast<const std::uint32_t*>(wrow + static_cast<std::uint64_t>(kb0) * 34U);
-        for (std::uint32_t w = h0; w < h1; ++w)
-            cp_async4(B + ln * kRowWords + w, nvalid ? wsrc + w : reinterpret_cast<const std::uint32_t*>(site.seg[0].w), nvalid);
-        for (std::uint32_t i = static_cast<std::uint32_t>(tid); i < nb * kBM; i += kThreads) {
-            const std::uint32_t j = i / kBM, r = i % kBM, gr = m0 + r;
-            const bool ok = gr < rows;
-            cp_async4(D + j * kBM + r, ok ? deltas + static_cast<std::uint64_t>(kb0 + j) * pitch + gr : deltas, ok);
-        }
-    };
-
-    float acc[4][4][4];
-#pragma unroll
-    for (int a = 0; a < 4; ++a)
-#pragma unroll
-        for (int b = 0; b < 4; ++b)
-#pragma unroll
-            for (int e = 0; e < 4; ++e) acc[a][b][e] = 0.0F;
-
-    load_stage(0U, 0);
-    cp_async_commit();
-    for (std::uint32_t s = 0; s < stages; ++s) {
-        if (s + 1U < stages) load_stage(s + 1U, static_cast<int>((s + 1U) & 1U));
-        cp_async_commit();
-        cp_async_wait1();
-        __syncthreads();
-        const unsigned char* base = smem + (s & 1U) * kStage;
-        const auto* A = reinterpret_cast<const std::uint32_t*>(base);
-        const auto* B = reinterpret_cast<const std::uint32_t*>(base + kStageA);
-        const auto* D = reinterpret_cast<const float*>(base + kStageA + kStageB);
-        const std::uint32_t nb = min(static_cast<std::uint32_t>(kKB), nblocks - s * kKB);
-        for (std::uint32_t j = 0; j < nb; ++j) {   // blocks ascending: the HIP chain order
-            std::uint32_t a[4][4];
-            float dl[4][2];
-#pragma unroll
-            for (int mt = 0; mt < 4; ++mt) {
-                const int r = wm * 64 + mt * 16 + gid;
-                a[mt][0] = A[r * kRowWords + j * 8U + tig];
-                a[mt][1] = A[(r + 8) * kRowWords + j * 8U + tig];
-                a[mt][2] = A[r * kRowWords + j * 8U + 4U + tig];
-                a[mt][3] = A[(r + 8) * kRowWords + j * 8U + 4U + tig];
-                dl[mt][0] = D[j * kBM + r];
-                dl[mt][1] = D[j * kBM + r + 8];
-            }
-            // Block j of the stage starts at byte 34 j: its scale there, its codes at 34 j + 2 (even j: two bytes into a
-            // word, realigned with a byte permute; odd j: word aligned).
-            const bool even = (j & 1U) == 0U;
-            const std::uint32_t qword = even ? 17U * j / 2U : (17U * j + 1U) / 2U;
-            const std::uint32_t sword = even ? 17U * j / 2U : (17U * j - 1U) / 2U;
-            std::uint32_t b[4][2];
-            float dw[4][2];
-#pragma unroll
-            for (int nt = 0; nt < 4; ++nt) {
-                const std::uint32_t* W = B + (wn * 32 + nt * 8 + gid) * kRowWords + qword + tig;
-                if (even) { b[nt][0] = __byte_perm(W[0], W[1], 0x5432); b[nt][1] = __byte_perm(W[4], W[5], 0x5432); }
-                else { b[nt][0] = W[0]; b[nt][1] = W[4]; }
-#pragma unroll
-                for (int c = 0; c < 2; ++c) {
-                    const std::uint32_t sw = B[(wn * 32 + nt * 8 + 2 * tig + c) * kRowWords + sword];
-                    const unsigned short h = static_cast<unsigned short>(even ? (sw & 0xffffU) : (sw >> 16U));
-                    dw[nt][c] = __half2float(__ushort_as_half(h));   // exact
-                }
-            }
-#pragma unroll
-            for (int mt = 0; mt < 4; ++mt)
-#pragma unroll
-                for (int nt = 0; nt < 4; ++nt) {
-                    int d[4];
-                    imma(d, a[mt], b[nt]);
-#pragma unroll
-                    for (int e = 0; e < 4; ++e) {
-                        const float dot = __fsub_rn(__int_as_float(d[e]), 12582912.0F);   // exact float(dot_b)
-                        const float p = __fmul_rn(dw[nt][e & 1], dl[mt][e >> 1]);         // v_mul_f32 dw * delta
-                        acc[mt][nt][e] = __fmaf_rn(p, dot, acc[mt][nt][e]);               // v_fmac_f32
-                    }
-                }
-        }
-        __syncthreads();
+    static int dense_carveout_percent() {
+        const char* cv = strix::envcfg::text("STRIX_QRTX_DENSE_CARVEOUT");
+        return cv && cv[0] ? std::atoi(cv) : -1;
     }
-#pragma unroll
-    for (int mt = 0; mt < 4; ++mt)
-#pragma unroll
-        for (int hh = 0; hh < 2; ++hh) {
-            const std::uint32_t row = m0 + static_cast<std::uint32_t>(wm * 64 + mt * 16 + gid + 8 * hh);
-            if (row >= rows) continue;
-#pragma unroll
-            for (int nt = 0; nt < 4; ++nt)
-#pragma unroll
-                for (int c = 0; c < 2; ++c) {
-                    const std::uint32_t n = n0 + static_cast<std::uint32_t>(wn * 32 + nt * 8 + 2 * tig + c);
-                    if (n < site.outputs) store_value<S>(site, row, n, acc[mt][nt][2 * hh + c]);
-                }
-        }
-}
-
-// ---------------------------------------------------------------------------------------------------------------------
-// Decode projection (rows <= 8): the same per-(row, output) chain acc = fma(dw * delta, float(dot_b), acc) over blocks
-// b ascending, laid out for few rows. A quad of lanes owns one output: lane q takes codes 8q..8q+7 of each block and
-// holds partial integer dots for all RP rows (RP = rows padded to 1, 2, 4 or 8). The exact group dots are completed by
-// integer adds across the quad (order-free): for RP <= 2 a full xor reduction (every lane then runs the chains, lane 0
-// stores); for RP >= 4 a transpose-reduce (xor 2 then xor 1, each level keeping half of the rows), so lane q finishes
-// rows (q >> 1) * RP/2 + (q & 1) * RP/4 .. + RP/4 and runs only their chains. Activations sit in shared memory.
-constexpr unsigned kRowsThreads = 128, kRowsQuads = kRowsThreads / 4;
-template <Store S, unsigned R, unsigned RP>
-__global__ __launch_bounds__(kRowsThreads) void project_rows_kernel(KSite site, const std::int8_t* codes, const float* deltas,
-                                                                   std::uint32_t pitch) {
-    extern __shared__ __align__(16) unsigned char smem[];
-    const std::uint32_t width = site.width, nblocks = width / 32U, row_bytes = nblocks * 34U;
-    auto* A = reinterpret_cast<std::uint32_t*>(smem);                        // [RP][width / 4]
-    auto* D = reinterpret_cast<float*>(smem + RP * width);                   // [RP][nblocks]
-    for (std::uint32_t i = threadIdx.x; i < RP * width / 4U; i += kRowsThreads) {
-        const std::uint32_t r = i / (width / 4U), w = i % (width / 4U);
-        A[i] = r < R ? reinterpret_cast<const std::uint32_t*>(codes + static_cast<std::uint64_t>(r) * width)[w] : 0U;
-    }
-    for (std::uint32_t i = threadIdx.x; i < RP * nblocks; i += kRowsThreads)
-        D[i] = i / nblocks < R ? deltas[static_cast<std::uint64_t>(i % nblocks) * pitch + i / nblocks] : 0.0F;
-    __syncthreads();
-    const unsigned q = threadIdx.x & 3U;
-    const std::uint32_t n = blockIdx.x * kRowsQuads + threadIdx.x / 4U;
-    const bool valid = n < site.outputs;
-    const unsigned char* wrow = site.seg[0].w;
-    if (valid) {
-        const KSeg& sg = site.seg[find_seg(site, n)];
-        wrow = sg.w + static_cast<std::uint64_t>(n - sg.begin) * row_bytes;
-    }
-    constexpr unsigned OWN = RP >= 4U ? RP / 4U : RP;                        // rows whose chains this lane runs
-    const unsigned first = RP >= 4U ? (q >> 1U) * (RP / 2U) + (q & 1U) * (RP / 4U) : 0U;
-    float acc[OWN];
-#pragma unroll
-    for (unsigned r = 0; r < OWN; ++r) acc[r] = 0.0F;
-#pragma unroll 4
-    for (std::uint32_t b = 0; b < nblocks; ++b) {
-        const auto* h = reinterpret_cast<const unsigned short*>(wrow + 34U * b);   // 2-byte aligned
-        const float dw = __half2float(__ushort_as_half(valid ? h[0] : static_cast<unsigned short>(0)));
-        const unsigned short* c = h + 1U + 4U * q;
-        const std::uint32_t w0 = valid ? static_cast<std::uint32_t>(c[0]) | (static_cast<std::uint32_t>(c[1]) << 16U) : 0U;
-        const std::uint32_t w1 = valid ? static_cast<std::uint32_t>(c[2]) | (static_cast<std::uint32_t>(c[3]) << 16U) : 0U;
-        int dot[RP];
-#pragma unroll
-        for (unsigned r = 0; r < RP; ++r) {
-            const std::uint32_t* a = A + r * (width / 4U) + b * 8U + 2U * q;
-            dot[r] = __dp4a(static_cast<int>(w1), static_cast<int>(a[1]), __dp4a(static_cast<int>(w0), static_cast<int>(a[0]), 0));
-        }
-        if constexpr (RP >= 4U) {
-            const bool hi2 = (q & 2U) != 0U, hi1 = (q & 1U) != 0U;
-#pragma unroll
-            for (unsigned i = 0; i < RP / 2U; ++i) {
-                const int keep = hi2 ? dot[i + RP / 2U] : dot[i], send = hi2 ? dot[i] : dot[i + RP / 2U];
-                dot[i] = keep + __shfl_xor_sync(0xffffffffU, send, 2);
-            }
-#pragma unroll
-            for (unsigned i = 0; i < RP / 4U; ++i) {
-                const int keep = hi1 ? dot[i + RP / 4U] : dot[i], send = hi1 ? dot[i] : dot[i + RP / 4U];
-                dot[i] = keep + __shfl_xor_sync(0xffffffffU, send, 1);
-            }
-        } else {
-#pragma unroll
-            for (unsigned r = 0; r < RP; ++r) {
-                dot[r] += __shfl_xor_sync(0xffffffffU, dot[r], 1);
-                dot[r] += __shfl_xor_sync(0xffffffffU, dot[r], 2);
-            }
-        }
-#pragma unroll
-        for (unsigned i = 0; i < OWN; ++i) {
-            const float p = __fmul_rn(dw, D[(first + i) * nblocks + b]);    // v_mul_f32 dw * delta
-            acc[i] = __fmaf_rn(p, static_cast<float>(dot[i]), acc[i]);      // v_fmac_f32 (float(dot) exact, |dot| < 2^24)
-        }
-    }
-    if (!valid || (RP < 4U && q != 0U)) return;
-#pragma unroll
-    for (unsigned i = 0; i < OWN; ++i)
-        if (first + i < R) store_value<S>(site, first + i, n, acc[i]);
-}
-
-template <Store S, unsigned R> cudaError_t launch_rows_r(cudaStream_t stream, const KSite& k, const std::int8_t* codes,
-                                                        const float* deltas, std::uint32_t pitch) {
-    constexpr unsigned RP = R <= 1U ? 1U : R <= 2U ? 2U : R <= 4U ? 4U : 8U;
-    const std::uint32_t smem = RP * k.width + RP * (k.width / 32U) * 4U;
-    static std::once_flag once;
-    static cudaError_t attr = cudaSuccess;
-    std::call_once(once, [] {
-        attr = cudaFuncSetAttribute(project_rows_kernel<S, R, RP>, cudaFuncAttributeMaxDynamicSharedMemorySize, 8 * 6144 + 8 * 192 * 4);
-    });
-    if (attr != cudaSuccess) return attr;
-    project_rows_kernel<S, R, RP><<<(k.outputs + kRowsQuads - 1U) / kRowsQuads, kRowsThreads, smem, stream>>>(k, codes, deltas, pitch);
-    return cudaGetLastError();
-}
-template <Store S> cudaError_t launch_rows(cudaStream_t stream, const KSite& k, std::uint32_t rows, const std::int8_t* codes,
-                                           const float* deltas, std::uint32_t pitch) {
-    switch (rows) {
-    case 1: return launch_rows_r<S, 1>(stream, k, codes, deltas, pitch);
-    case 2: return launch_rows_r<S, 2>(stream, k, codes, deltas, pitch);
-    case 3: return launch_rows_r<S, 3>(stream, k, codes, deltas, pitch);
-    case 4: return launch_rows_r<S, 4>(stream, k, codes, deltas, pitch);
-    case 5: return launch_rows_r<S, 5>(stream, k, codes, deltas, pitch);
-    case 6: return launch_rows_r<S, 6>(stream, k, codes, deltas, pitch);
-    case 7: return launch_rows_r<S, 7>(stream, k, codes, deltas, pitch);
-    default: return launch_rows_r<S, 8>(stream, k, codes, deltas, pitch);
-    }
-}
-
-// ---------------------------------------------------------------------------------------------------------------------
-// Decode projection, K-split form (rows <= 8; default, STRIX_QRTX_ROWS_KSPLIT=0 = project_rows_kernel). Same chain per
-// (row, output) as project_rows_kernel: acc = fma(dw * delta, float(dot_b), acc) over blocks b ascending, so the outputs
-// are bit-identical. Only the integer block dots (exact, order-free) are computed K-parallel: warp w owns blocks
-// 8w .. 8w + 7 (quad j = block 8w + j, lane q = codes 8q .. 8q + 7 as above) and keeps their activation codes in
-// registers, then walks the CTA's kKsOut outputs reading 272 contiguous weight bytes per output (the old mapping read 8
-// rows per warp instruction) and leaves the finished dots in shared memory. One thread per (output, row) then runs the
-// FP32 chain in block order. A CTA covers kKsOut outputs, so 2,560-output projections fill the card (320 CTAs, was 80)
-// and the activations are read once per CTA from L1 instead of being staged per 32 outputs.
-constexpr unsigned kKsOut = 8;
-bool rows_ksplit_enabled() {
-    static const bool on = strix::envcfg::flag("STRIX_QRTX_ROWS_KSPLIT", true);
-    return on;
-}
-template <Store S, unsigned R, unsigned RP>
-__global__ __launch_bounds__(1024) void project_rows_ks_kernel(KSite site, const std::int8_t* codes, const float* deltas,
-                                                              std::uint32_t pitch) {
-    extern __shared__ __align__(16) unsigned char smem[];
-    const std::uint32_t width = site.width, nblocks = width / 32U, row_bytes = nblocks * 34U;
-    auto* DOT = reinterpret_cast<int*>(smem);                                         // [nblocks][kKsOut][RP]
-    auto* DW = reinterpret_cast<float*>(smem + nblocks * kKsOut * RP * 4U);          // [nblocks][kKsOut]
-    auto* D = DW + nblocks * kKsOut;                                                  // [nblocks][RP]
-    for (std::uint32_t i = threadIdx.x; i < RP * nblocks; i += blockDim.x)
-        D[i] = i % RP < R ? deltas[static_cast<std::uint64_t>(i / RP) * pitch + i % RP] : 0.0F;
-    const unsigned lane = threadIdx.x & 31U, q = lane & 3U;
-    const std::uint32_t blk = (threadIdx.x >> 5U) * 8U + (lane >> 2U);
-    const bool active = blk < nblocks;
-    std::uint32_t a0[RP], a1[RP];
-#pragma unroll
-    for (unsigned r = 0; r < RP; ++r) {
-        const auto* a = reinterpret_cast<const std::uint32_t*>(codes + static_cast<std::uint64_t>(r) * width) + blk * 8U + 2U * q;
-        a0[r] = active && r < R ? a[0] : 0U;
-        a1[r] = active && r < R ? a[1] : 0U;
-    }
-    constexpr unsigned OWN = RP >= 4U ? RP / 4U : RP;
-    const unsigned first = RP >= 4U ? (q >> 1U) * (RP / 2U) + (q & 1U) * (RP / 4U) : 0U;
-    const std::uint32_t n0 = blockIdx.x * kKsOut;
-#pragma unroll 2
-    for (unsigned o = 0; o < kKsOut; ++o) {
-        const std::uint32_t n = n0 + o;
-        const bool valid = active && n < site.outputs;
-        const unsigned char* wrow = site.seg[0].w;
-        if (n < site.outputs) {
-            const KSeg& sg = site.seg[find_seg(site, n)];
-            wrow = sg.w + static_cast<std::uint64_t>(n - sg.begin) * row_bytes;
-        }
-        const auto* h = reinterpret_cast<const unsigned short*>(wrow + 34U * (active ? blk : 0U));
-        const float dw = __half2float(__ushort_as_half(valid ? h[0] : static_cast<unsigned short>(0)));
-        const unsigned short* c = h + 1U + 4U * q;
-        const std::uint32_t w0 = valid ? static_cast<std::uint32_t>(c[0]) | (static_cast<std::uint32_t>(c[1]) << 16U) : 0U;
-        const std::uint32_t w1 = valid ? static_cast<std::uint32_t>(c[2]) | (static_cast<std::uint32_t>(c[3]) << 16U) : 0U;
-        int dot[RP];
-#pragma unroll
-        for (unsigned r = 0; r < RP; ++r)
-            dot[r] = __dp4a(static_cast<int>(w1), static_cast<int>(a1[r]), __dp4a(static_cast<int>(w0), static_cast<int>(a0[r]), 0));
-        if constexpr (RP >= 4U) {
-            const bool hi2 = (q & 2U) != 0U, hi1 = (q & 1U) != 0U;
-#pragma unroll
-            for (unsigned i = 0; i < RP / 2U; ++i) {
-                const int keep = hi2 ? dot[i + RP / 2U] : dot[i], send = hi2 ? dot[i] : dot[i + RP / 2U];
-                dot[i] = keep + __shfl_xor_sync(0xffffffffU, send, 2);
-            }
-#pragma unroll
-            for (unsigned i = 0; i < RP / 4U; ++i) {
-                const int keep = hi1 ? dot[i + RP / 4U] : dot[i], send = hi1 ? dot[i] : dot[i + RP / 4U];
-                dot[i] = keep + __shfl_xor_sync(0xffffffffU, send, 1);
-            }
-        } else {
-#pragma unroll
-            for (unsigned r = 0; r < RP; ++r) {
-                dot[r] += __shfl_xor_sync(0xffffffffU, dot[r], 1);
-                dot[r] += __shfl_xor_sync(0xffffffffU, dot[r], 2);
-            }
-        }
-        if (active && (RP >= 4U || q == 0U)) {
-            int* out = DOT + (blk * kKsOut + o) * RP + first;
-#pragma unroll
-            for (unsigned i = 0; i < OWN; ++i) out[i] = dot[i];
-            if (q == 0U) DW[blk * kKsOut + o] = dw;
-        }
-    }
-    __syncthreads();
-    for (std::uint32_t t = threadIdx.x; t < kKsOut * R; t += blockDim.x) {
-        const std::uint32_t o = t / R, r = t % R, n = n0 + o;
-        if (n >= site.outputs) continue;
-        float acc = 0.0F;
-        for (std::uint32_t b = 0; b < nblocks; ++b) {
-            const float p = __fmul_rn(DW[b * kKsOut + o], D[b * RP + r]);                       // v_mul_f32 dw * delta
-            acc = __fmaf_rn(p, static_cast<float>(DOT[(b * kKsOut + o) * RP + r]), acc);        // v_fmac_f32
-        }
-        store_value<S>(site, r, n, acc);
-    }
-}
-
-template <Store S, unsigned R> cudaError_t launch_rows_ks_r(cudaStream_t stream, const KSite& k, const std::int8_t* codes,
-                                                           const float* deltas, std::uint32_t pitch) {
-    constexpr unsigned RP = R <= 1U ? 1U : R <= 2U ? 2U : R <= 4U ? 4U : 8U;
-    const std::uint32_t nb = k.width / 32U, smem = nb * (kKsOut * RP + kKsOut + RP) * 4U;
-    static std::once_flag once;
-    static cudaError_t attr = cudaSuccess;
-    std::call_once(once, [] {
-        attr = cudaFuncSetAttribute(project_rows_ks_kernel<S, R, RP>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    256 * (kKsOut * 8 + kKsOut + 8) * 4);
-    });
-    if (attr != cudaSuccess) return attr;
-    project_rows_ks_kernel<S, R, RP><<<(k.outputs + kKsOut - 1U) / kKsOut, 32U * ((nb + 7U) / 8U), smem, stream>>>(k, codes, deltas, pitch);
-    return cudaGetLastError();
-}
-template <Store S> cudaError_t launch_rows_ks(cudaStream_t stream, const KSite& k, std::uint32_t rows, const std::int8_t* codes,
-                                              const float* deltas, std::uint32_t pitch) {
-    switch (rows) {
-    case 1: return launch_rows_ks_r<S, 1>(stream, k, codes, deltas, pitch);
-    case 2: return launch_rows_ks_r<S, 2>(stream, k, codes, deltas, pitch);
-    case 3: return launch_rows_ks_r<S, 3>(stream, k, codes, deltas, pitch);
-    case 4: return launch_rows_ks_r<S, 4>(stream, k, codes, deltas, pitch);
-    case 5: return launch_rows_ks_r<S, 5>(stream, k, codes, deltas, pitch);
-    case 6: return launch_rows_ks_r<S, 6>(stream, k, codes, deltas, pitch);
-    case 7: return launch_rows_ks_r<S, 7>(stream, k, codes, deltas, pitch);
-    default: return launch_rows_ks_r<S, 8>(stream, k, codes, deltas, pitch);
-    }
-}
-
+};
 // ---------------------------------------------------------------------------------------------------------------------
 // rows_shared_activation_scalar_kernel (src/hip_shared_expert_launcher.hip:535-562), 256 threads, blockIdx.y = row.
 __global__ __launch_bounds__(256) void shared_activation_kernel(float* workspace_base, std::uint64_t workspace_stride,
@@ -529,21 +258,101 @@ __global__ __launch_bounds__(256) void shared_activation_kernel(float* workspace
         workspace[intermediate] = __fdiv_rn(1.0F, __fadd_rn(1.0F, amdmath::amd_expf(tables, -scratch[0])));
 }
 
-template <Store S> cudaError_t launch_project(cudaStream_t stream, const KSite& k, std::uint32_t rows, const std::int8_t* codes,
-                                              const float* deltas, std::uint32_t pitch) {
-    if (rows <= 8U && k.width <= 6144U && decode_rows_enabled())
-        return rows_ksplit_enabled() ? launch_rows_ks<S>(stream, k, rows, codes, deltas, pitch)
-                                     : launch_rows<S>(stream, k, rows, codes, deltas, pitch);
-    static std::once_flag once;
-    static cudaError_t attr = cudaSuccess;
-    std::call_once(once, [] { attr = cudaFuncSetAttribute(project_kernel<S>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem); });
-    if (attr != cudaSuccess) return attr;
-    const dim3 grid((k.outputs + kBN - 1U) / kBN, (rows + kBM - 1U) / kBM);
-    project_kernel<S><<<grid, kThreads, kSmem, stream>>>(k, rows, codes, deltas, pitch);
+
+
+
+
+// TURBO onfly route: the shared nvfp4-a8-v1 GEMV bound through this site's segments and store forms.
+namespace a8 = strix::cuda::core::nvfp4_a8;
+struct K4Site {
+    KSite k;
+    const std::uint8_t* codes[kMaxSegments];
+    const std::uint8_t* scales[kMaxSegments];
+    float half_ts[kMaxSegments];
+};
+template <Store S> struct Nvfp4Policy {
+    K4Site s;
+    std::uint32_t row_base;
+    __device__ __forceinline__ std::uint32_t outputs() const { return s.k.outputs; }
+    __device__ __forceinline__ a8::Row operand(std::uint32_t n) const {
+        const unsigned m = find_seg(s.k, n);
+        const std::uint64_t i = n - s.k.seg[m].begin;
+        return {s.codes[m] + i * (s.k.width / 2U), s.scales[m] + i * (s.k.width / 16U), s.half_ts[m]};
+    }
+    __device__ __forceinline__ void store(std::uint32_t r, std::uint32_t n, float y) const {
+        DenseNumeric::store<S>(s.k, row_base + r, n, y);   // main's store_value (body moved with #713)
+    }
+};
+// Launch shape (rows per warp chunk = blockIdx.y split, outputs per warp): parallelism only, the bits never change.
+std::uint32_t onfly_rw_hook = 0, onfly_out_hook = 0;   // test / tuning hooks (0 = the measured table below)
+template <Store S, std::uint32_t OUT, std::uint32_t RMAX>
+cudaError_t launch_nvfp4_shape(cudaStream_t stream, const Nvfp4Policy<S>& p, std::uint32_t rows, const std::int8_t* codes,
+                               const float* deltas, std::uint32_t pitch) {
+    constexpr std::uint32_t kWarps = 8;
+    const dim3 grid((p.s.k.outputs + OUT * kWarps - 1U) / (OUT * kWarps), (rows + RMAX - 1U) / RMAX);
+    a8::rows_gemv_kernel<Nvfp4Policy<S>, OUT, RMAX, kWarps>
+        <<<grid, kWarps * 32U, 0, stream>>>(p, rows, p.s.k.width, codes, p.s.k.width, deltas, pitch);
     return cudaGetLastError();
+}
+template <Store S, std::uint32_t OUT>
+cudaError_t launch_nvfp4_rw(cudaStream_t stream, const Nvfp4Policy<S>& p, std::uint32_t rw, std::uint32_t rows,
+                            const std::int8_t* codes, const float* deltas, std::uint32_t pitch) {
+    switch (rw) {
+    case 1: return launch_nvfp4_shape<S, OUT, 1>(stream, p, rows, codes, deltas, pitch);
+    case 2: return launch_nvfp4_shape<S, OUT, 2>(stream, p, rows, codes, deltas, pitch);
+    case 4: return launch_nvfp4_shape<S, OUT, 4>(stream, p, rows, codes, deltas, pitch);
+    default: return launch_nvfp4_shape<S, OUT, 8>(stream, p, rows, codes, deltas, pitch);
+    }
+}
+template <Store S> cudaError_t launch_nvfp4(cudaStream_t stream, const K4Site& site, std::uint32_t rows,
+                                            const std::int8_t* codes, const float* deltas, std::uint32_t pitch) {
+    if (rows > 65535U * 8U) return cudaErrorInvalidValue;
+    std::uint32_t rw = onfly_rw_hook, out = onfly_out_hook;
+    // Measured table (nvfp4_a8_bench, PRO sm_120 2.8 GHz, Flash-Next shapes, best of rows-per-warp 1/2/4/8 x outputs 1/2):
+    // wide sites (>= 8192 outputs: GDN / QSA in) want min(pow2(rows), 8) rows per warp, one output per warp up to 2 rows;
+    // narrow sites (GDN / QSA out, shared expert) want half the rows per warp and one output per warp.
+    const bool wide = site.k.outputs >= 8192U;
+    std::uint32_t p2 = 1;
+    while (p2 < rows && p2 < 8U) p2 <<= 1U;
+    if (rw == 0) rw = wide ? p2 : (rows <= 2U ? 1U : (p2 / 2U < 8U ? p2 / 2U : 8U));
+    if (out == 0) out = wide && rows > 2U ? 2U : 1U;
+    const Nvfp4Policy<S> p{site, 0};
+    return out == 1U ? launch_nvfp4_rw<S, 1>(stream, p, rw, rows, codes, deltas, pitch)
+                     : launch_nvfp4_rw<S, 2>(stream, p, rw, rows, codes, deltas, pitch);
+}
+
+std::unordered_map<const void*, OnflyImage>& onfly_images() {
+    static std::unordered_map<const void*, OnflyImage> images;
+    return images;
+}
+thread_local bool onfly_scope = false;
+
+// Every segment registered with the site's shape -> the NVFP4 operands; any miss keeps the whole site on Q8_0.
+bool onfly_site(const Site& site, const KSite& k, K4Site& out) {
+    if (!onfly_scope || onfly_images().empty() || site.width % 32U != 0U) return false;
+    out.k = k;
+    for (std::uint32_t m = 0; m < site.segments; ++m) {
+        const auto it = onfly_images().find(site.segment[m].weight);
+        if (it == onfly_images().end() || it->second.width != site.width || it->second.outputs != site.segment[m].outputs)
+            return false;
+        out.codes[m] = it->second.codes;
+        out.scales[m] = it->second.scales;
+        out.half_ts[m] = 0.5F * it->second.tensor_scale;
+    }
+    return true;
 }
 
 }  // namespace
+
+void onfly_register(const void* q8_weight, const OnflyImage& image) { onfly_images()[q8_weight] = image; }
+void onfly_clear() { onfly_images().clear(); }
+std::size_t onfly_count() { return onfly_images().size(); }
+void onfly_set_launch(std::uint32_t rows_per_warp, std::uint32_t outputs_per_warp) {
+    onfly_rw_hook = rows_per_warp;
+    onfly_out_hook = outputs_per_warp;
+}
+OnflyScope::OnflyScope(bool on) : previous_(onfly_scope) { onfly_scope = on; }
+OnflyScope::~OnflyScope() { onfly_scope = previous_; }
 
 cudaError_t quantize(cudaStream_t stream, std::uint32_t rows, std::uint32_t width, Input type, const void* input,
                      std::uint64_t input_stride, std::int8_t* codes, float* deltas, std::uint32_t pitch) {
@@ -556,7 +365,8 @@ cudaError_t quantize(cudaStream_t stream, std::uint32_t rows, std::uint32_t widt
     return cudaGetLastError();
 }
 
-cudaError_t project(cudaStream_t stream, const Site& site, std::uint32_t rows, const std::int8_t* codes, const float* deltas,
+template<class Capture>
+cudaError_t project_observed(cudaStream_t stream, const Site& site, std::uint32_t rows, const std::int8_t* codes, const float* deltas,
                     std::uint32_t pitch) {
     if (!rows) return cudaSuccess;
     if (site.width == 0U || site.width % 64U != 0U || site.segments == 0U || site.segments > kMaxSegments || pitch < rows ||
@@ -572,14 +382,72 @@ cudaError_t project(cudaStream_t stream, const Site& site, std::uint32_t rows, c
         n += s.outputs;
     }
     k.nseg = site.segments; k.width = site.width; k.outputs = n; k.gate = site.gate; k.gate_stride = site.gate_stride;
-    switch (site.store) {
-    case Store::f32: return launch_project<Store::f32>(stream, k, rows, codes, deltas, pitch);
-    case Store::f32_round_bf16: return launch_project<Store::f32_round_bf16>(stream, k, rows, codes, deltas, pitch);
-    case Store::bf16: return launch_project<Store::bf16>(stream, k, rows, codes, deltas, pitch);
-    case Store::bf16_gated: return launch_project<Store::bf16_gated>(stream, k, rows, codes, deltas, pitch);
+    if (K4Site k4{}; onfly_site(site, k, k4)) {
+        switch (site.store) {
+        case Store::f32: return launch_nvfp4<Store::f32>(stream, k4, rows, codes, deltas, pitch);
+        case Store::f32_round_bf16: return launch_nvfp4<Store::f32_round_bf16>(stream, k4, rows, codes, deltas, pitch);
+        case Store::bf16: return launch_nvfp4<Store::bf16>(stream, k4, rows, codes, deltas, pitch);
+        case Store::bf16_gated: return launch_nvfp4<Store::bf16_gated>(stream, k4, rows, codes, deltas, pitch);
+        }
+        return cudaErrorInvalidValue;
     }
-    return cudaErrorInvalidValue;
+    const auto dispatch = [&](const KSite& ks, std::uint32_t r, const std::int8_t* c, const float* d) -> cudaError_t {
+        switch (site.store) {
+        case Store::f32: return core::dense_a8::launch_project<Store::f32, weight::Q8ImmaSource, DenseNumeric, Capture>(stream, ks, r, c, d, pitch);
+        case Store::f32_round_bf16: return core::dense_a8::launch_project<Store::f32_round_bf16, weight::Q8ImmaSource, DenseNumeric, Capture>(stream, ks, r, c, d, pitch);
+        case Store::bf16: return core::dense_a8::launch_project<Store::bf16, weight::Q8ImmaSource, DenseNumeric, Capture>(stream, ks, r, c, d, pitch);
+        case Store::bf16_gated: return core::dense_a8::launch_project<Store::bf16_gated, weight::Q8ImmaSource, DenseNumeric, Capture>(stream, ks, r, c, d, pitch);
+        }
+        return cudaErrorInvalidValue;
+    };
+    // 9..16 rows (core::decode_rows_max): <= 8-row decode pieces. A piece sees rows r0.. through offset codes / deltas /
+    // outputs / gates; each (row, output) chain is row-local, so the bits are the tiled kernel's.
+    if (rows > core::kDecodePieceRows && rows <= core::decode_rows_max() && k.width <= 6144U && decode_rows_enabled() &&
+        rows_ksplit_enabled() && rows16_enabled()) {
+#ifdef STRIX_QWEN_DENSE_TEST_DISPATCH
+        test_dispatch(rows, true);
+#endif
+        switch (site.store) {   // one weight pass for 9..16 rows
+        case Store::f32: return core::dense_a8::launch_rows_ks<Store::f32, weight::Q8ImmaSource, DenseNumeric, Capture>(stream, k, rows, codes, deltas, pitch);
+        case Store::f32_round_bf16: return core::dense_a8::launch_rows_ks<Store::f32_round_bf16, weight::Q8ImmaSource, DenseNumeric, Capture>(stream, k, rows, codes, deltas, pitch);
+        case Store::bf16: return core::dense_a8::launch_rows_ks<Store::bf16, weight::Q8ImmaSource, DenseNumeric, Capture>(stream, k, rows, codes, deltas, pitch);
+        case Store::bf16_gated: return core::dense_a8::launch_rows_ks<Store::bf16_gated, weight::Q8ImmaSource, DenseNumeric, Capture>(stream, k, rows, codes, deltas, pitch);
+        }
+        return cudaErrorInvalidValue;
+    }
+    if (rows > core::kDecodePieceRows && rows <= core::decode_rows_max() && k.width <= 6144U && decode_rows_enabled()) {
+#ifdef STRIX_QWEN_DENSE_TEST_DISPATCH
+        test_dispatch(rows, false);
+#endif
+        const std::uint64_t elem = site.store == Store::f32 || site.store == Store::f32_round_bf16 ? 4U : 2U;
+        for (std::uint32_t r0 = 0; r0 < rows; r0 += core::kDecodePieceRows) {
+            KSite piece = k;
+            for (std::uint32_t m = 0; m < k.nseg; ++m)
+                piece.seg[m].out = static_cast<unsigned char*>(k.seg[m].out) + std::uint64_t{r0} * k.seg[m].stride * elem;
+            if (piece.gate) piece.gate += std::uint64_t{r0} * k.gate_stride;
+            const cudaError_t e = dispatch(piece, std::min(rows - r0, core::kDecodePieceRows), codes + std::uint64_t{r0} * k.width, deltas + r0);
+            if (e != cudaSuccess) return e;
+        }
+        return cudaSuccess;
+    }
+    return dispatch(k, rows, codes, deltas);
 }
+
+cudaError_t project(cudaStream_t stream, const Site& site, std::uint32_t rows, const std::int8_t* codes,
+                    const float* deltas, std::uint32_t pitch) {
+    return project_observed<NoCapture>(stream, site, rows, codes, deltas, pitch);
+}
+#ifdef STRIX_WFMT_CAPTURE
+cudaError_t capture_project_partials(cudaStream_t stream, const Site& site, std::uint32_t rows,
+                                    const std::int8_t* codes, const float* deltas, std::uint32_t pitch, float* partials) {
+    unsigned outputs = 0;
+    for (unsigned i = 0; i < site.segments; ++i) outputs += site.segment[i].outputs;
+    const PartialCaptureConfig capture{partials, rows, outputs};
+    const auto copied = cudaMemcpyToSymbol(partial_capture_config, &capture, sizeof(capture), 0, cudaMemcpyHostToDevice);
+    if (copied != cudaSuccess) return copied;
+    return project_observed<PartialCapture>(stream, site, rows, codes, deltas, pitch);
+}
+#endif
 
 cudaError_t quantize_project(cudaStream_t stream, const Site& site, std::uint32_t rows, Input type, const void* input,
                              std::uint64_t input_stride, std::int8_t* codes, float* deltas, std::uint32_t pitch) {

@@ -73,6 +73,14 @@ phase() {
     client_pid=''
     return "$rc"
 }
+# Readiness without an external client (a node without curl used to wait out the whole ticket with the server
+# long READY): one HTTP/1.0 GET over bash /dev/tcp, ready on a 2xx status line.
+http_ready() (
+    exec 9<>"/dev/tcp/127.0.0.1/$port" || exit 1
+    printf 'GET %s HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' "$ready" >&9
+    IFS= read -r -t 2 status <&9 || exit 1
+    [[ $status =~ ^HTTP/[0-9.]+[[:space:]]2[0-9][0-9] ]]
+) 2>/dev/null
 if [[ -n $peer_cmd ]]; then
     peer_run_dir=${KIT_PEER_OUT:-$out}/$tag-r1
     timeout -k 1 "$(kit_left)" ssh -n -o BatchMode=yes -o ConnectTimeout=3 "$KIT_PEER" \
@@ -89,7 +97,7 @@ url=http://127.0.0.1:$port
 up=0; ready_end=$(($(date +%s) + ready_s))
 while (($(kit_left) > 16 && $(date +%s) < ready_end)); do
     if [[ -n $ready_log ]]; then grep -aqE "$ready_log" "$sdir/stderr" "$sdir/stdout" 2>/dev/null && { up=1; break; }
-    else curl -fsS -m 1 "$url$ready" >/dev/null 2>&1 && { up=1; break; }; fi
+    else http_ready && { up=1; break; }; fi
     kill -0 "$spid" 2>/dev/null || break
     sleep 0.2
  done

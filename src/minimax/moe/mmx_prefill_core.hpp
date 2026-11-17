@@ -67,9 +67,9 @@ __device__ __forceinline__ void item_pipe(const Item& it, unsigned bx, unsigned 
     return Core::item_pipe<Bits, MT, G, FullRows, Simplify>(it, bx, by, bz);
 }
 
-template <int Bits, int MT, int G, bool Simplify, bool Packed = false, bool Tail = false>
+template <int Bits, int MT, int G, bool Simplify, bool Packed = false, bool Tail = false, int Tiles = 2>
 __device__ __forceinline__ void pipe_or_tail(const Item& it, unsigned bx, unsigned by, unsigned bz) {
-    return PipeCore<Packed, Tail>::template pipe_or_tail<Bits, MT, G, Simplify>(it, bx, by, bz);
+    return PipeCore<Packed, Tail>::template pipe_or_tail<Bits, MT, G, Simplify, Tiles>(it, bx, by, bz);
 }
 
 // Tail class MT (1..7) on the pipelined loop (STRIX_MMX_PREFILL_PIPE_TAIL); same partials as item_core_v3.
@@ -115,6 +115,28 @@ __global__ __launch_bounds__(128) void grouped_pipe_kernel(const Item* items, un
         case 5: pipe_or_tail<5, MT, G, Simplify, Packed, Tail>(it, bx, by, bz); break;
         case 6: pipe_or_tail<6, MT, G, Simplify, Packed, Tail>(it, bx, by, bz); break;
         default: pipe_or_tail<8, MT, G, Simplify, Packed, Tail>(it, bx, by, bz); break;
+    }
+}
+
+// N16 PIPE (STRIX_MMX_PREFILL_PIPE_N16): the items and grid of grouped_pipe_kernel<8, 4>, 8 waves of one output tile
+// each (item_pipe Tiles 1, half the accumulators per lane). Same partials.
+template <bool Simplify = false, bool Packed = false, bool Tail = false>
+__global__ __launch_bounds__(256) void grouped_pipe_n16_kernel(const Item* items, unsigned count) {
+    unsigned lo = 0, hi = count;
+    while (hi - lo > 1) {
+        const unsigned mid = (lo + hi) / 2;
+        if (items[mid].cta_begin <= blockIdx.x) lo = mid;
+        else hi = mid;
+    }
+    const Item it = items[lo];
+    const unsigned local = blockIdx.x - it.cta_begin;
+    const unsigned bx = local % it.gx, by = (local / it.gx) % it.gy, bz = local / (it.gx * it.gy);
+    switch (it.bits) {
+        case 3: pipe_or_tail<3, 8, 4, Simplify, Packed, Tail, 1>(it, bx, by, bz); break;
+        case 4: pipe_or_tail<4, 8, 4, Simplify, Packed, Tail, 1>(it, bx, by, bz); break;
+        case 5: pipe_or_tail<5, 8, 4, Simplify, Packed, Tail, 1>(it, bx, by, bz); break;
+        case 6: pipe_or_tail<6, 8, 4, Simplify, Packed, Tail, 1>(it, bx, by, bz); break;
+        default: pipe_or_tail<8, 8, 4, Simplify, Packed, Tail, 1>(it, bx, by, bz); break;
     }
 }
 

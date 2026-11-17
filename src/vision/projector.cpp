@@ -19,8 +19,10 @@ bool Encoder::project_device() {
     return on;
 }
 
-const char* Encoder::effective_arithmetic() {
-    return project_device() ? "vision-f16-v1-project-device-f64-v1" : kArithmetic;
+const char* Encoder::effective_arithmetic(unsigned attention_terms) {
+    const bool two = attention_terms == 2U;
+    if (project_device()) return two ? "vision-f16-attn2-v1-project-device-f64-v1" : "vision-f16-v1-project-device-f64-v1";
+    return two ? kArithmeticAttn2 : kArithmetic;
 }
 
 layout::ProjectorGeometry layout::merge_geometry(unsigned grid_h, unsigned grid_w, unsigned ratio) {

@@ -5,7 +5,7 @@ import sys
 root = Path(__file__).resolve().parents[2]
 driver = (root / 'src/cuda/models/qwen/qwen_prefill_driver.cu').read_text()
 start = driver.index('    const std::uint32_t valid_before = S.mtp_pooled_valid;')
-body = driver.index('    for (std::uint32_t k = 0; k < (dexec ? 0U : depth);', start)
+body = driver.index('    for (std::uint32_t k = k0; k < (dexec ? k0 : k1);', start)
 catch = driver.index('    } catch (...) {', body)
 end = driver.index('    if (!per_step_sync) {', catch)
 qsa = (root / 'src/cuda/models/qwen/qwen_qsa.cu').read_text()
@@ -14,6 +14,7 @@ Path(sys.argv[1]).write_text('''
 void transaction(bool capture, bool replay) {
     const unsigned depth = 2, pending = 7;
     const int dexec = replay ? 1 : 0;
+    const unsigned k0 = 0, k1 = depth;  // one draft segment (the second segment reuses the same capture path)
 ''' + driver[start:body] + '''
     ck(step(), "device work");
     if (capture) {

@@ -98,13 +98,23 @@ void block_pool(const std::uint16_t* raw_index, std::uint32_t first_block, std::
 // block_score_pooled_rows_kernel<Rows,4>: block_scores[r][b] for b < complete(r) of every row with complete(r) > 512.
 void block_scores(const float* index_query, std::uint32_t rows, std::uint64_t first_position, const float* pooled_keys,
     float* block_scores, std::uint32_t max_blocks, cudaStream_t stream);
+// Explicit form (tests / microbench): tree = block_score_tree_kernel (default, STRIX_QRTX_QSA_SCORE_TREE), false = the
+// warp-shuffle block_score_kernel. Both write the same bits to the same entries.
+enum class ScoreForm : std::uint8_t { shuffle = 0, tree = 1 };
+void block_scores_form(ScoreForm form, const float* index_query, std::uint32_t rows, std::uint64_t first_position,
+    const float* pooled_keys, float* block_scores, std::uint32_t max_blocks, cudaStream_t stream);
 // select_rows_kernel: selected[r][0..count(r)) (also sets the selected block scores to -inf, as HIP).
 void select_rows(float* block_scores, std::uint32_t max_blocks, std::uint32_t rows, std::uint64_t first_position,
     std::uint32_t* selected, cudaStream_t stream);
 // attention_score_rows_group256_kernel<64,12,16> + attention_softmax_rows_kernel<64> +
 // attention_output_rows_group_prefetch_kernel<64,12>. scores: [rows][24][2051] workspace.
 void attention(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
-    const std::uint16_t* kv, float* scores, float* attention_output, const amdmath::Tables& tables, cudaStream_t stream);
+    const std::uint16_t* kv, float* scores, float* attention_output, const amdmath::Tables& tables, cudaStream_t stream,
+    bool mma = false);
+// FAST form (Config::forms.qsa_mma): scores + softmax + values + gate in one flash kernel on BF16 tensor cores, FP32 accumulation.
+// Same selected[] / kv / q_gate inputs; no scores workspace. Numerically close to attention(), not bit-identical.
+void attention_mma(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
+    const std::uint16_t* kv, float* attention_output, cudaStream_t stream);
 
 // The three kernels of attention() separately (same arguments).
 void attention_scores(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
@@ -150,7 +160,9 @@ void layer_core_multi(const RowBuffers& rows_buf, const SegmentState* segments, 
 // so one captured launch serves every position; values and operation order are those of layer_core.
 struct MultiShape {
     std::uint32_t rows = 0, pool_grid = 0, score_grid = 0, slot_runs = 0;
+    dim3 tree_grid{0U, 0U, 0U};  // tree scorer: (row tiles, block tiles, segments) covering the largest segment
     bool head_all = false;
+    bool tree_aligned = true;  // every segment's pooled keys 16-B aligned (tree scorer admission, else the shuffle scorer)
 };
 // host: validates, fills the map, this window's eager shape and the pooled-valid counts after it (valid_after[count]);
 // false = outside the multi-launch shapes (layer_core per segment). Throws on invalid positions before any state changes.
@@ -168,6 +180,7 @@ void prepare_replay(const SegmentState* segments, std::uint32_t count, const Wor
 // indexer projection, 3 norms, store, pool (blocks needed by the last row), then per chunk of workspace.chunk_rows rows:
 // block scores, selection, attention. Positions < first_position must already be in `state`.
 void layer_core(const RowBuffers& rows_buf, std::uint32_t rows, std::uint64_t first_position, const LayerWeights& w,
-    const LayerState& state, const RopeTable* cs, const amdmath::Tables& tables, Workspace& ws, cudaStream_t stream);
+    const LayerState& state, const RopeTable* cs, const amdmath::Tables& tables, Workspace& ws, cudaStream_t stream,
+    bool mma_attention = false);
 
 }  // namespace strix::cuda::qwen_qsa

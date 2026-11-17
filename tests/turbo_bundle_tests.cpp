@@ -82,7 +82,9 @@ void families() {
     generic(ds, p::Name::turbo, none, r);
     require(find(r, "attention_f16wmma") != nullptr && find(r, "attention_f16wmma")->value == "2", "ds41 turbo attention = bf16flash");
     require(find(r, "dense_f16") != nullptr && find(r, "dense_f16")->value == "1", "ds41 turbo dense f16");
-    require(profile_table.size() == 7, "ds41 keeps seven rows after replacing pending Engram");
+    require(profile_table.size() == 9, "ds41 keeps nine rows (pending Engram replaced, opt-in shared_f16 and moe_f16wmma added)");
+    require(find(r, "shared_f16") == nullptr || find(r, "shared_f16")->value != "1", "ds41 turbo does not turn on shared_f16");
+    require(find(r, "moe_f16wmma") == nullptr || find(r, "moe_f16wmma")->value != "1", "ds41 turbo does not turn on moe_f16wmma");
     std::size_t engram_rows = 0;
     for (const auto& row : profile_table)
         if (std::string_view(row.env) == "STRIX_DS41_FAST_ENGRAM") ++engram_rows;
@@ -99,8 +101,8 @@ void families() {
 
     const p::Engine mm{"minimax-pair", "", strix::minimax::defaults::profile_table, false, "minimax-turbo-v1"};
     generic(mm, p::Name::turbo, none, r);
-    require(strix::minimax::defaults::profile_table.size() == 7, "minimax retains six base rows plus explicit-only TP2 exchange row");
-    for (const char* lever : {"idx_wmma", "idx_wmma_layers"}) {
+    require(strix::minimax::defaults::profile_table.size() == 9, "minimax retains six base rows, the FAST router rows and explicit-only TP2 exchange row");
+    for (const char* lever : {"idx_wmma", "idx_wmma_layers", "router_wmma", "router_wmma_layers"}) {
         const auto* e = find(r, lever);
         require(e != nullptr && e->status == p::Status::builtin && e->value == e->lever->builtin &&
                     std::string_view(e->lever->value[3]).empty() && !e->lever->runnable[3],

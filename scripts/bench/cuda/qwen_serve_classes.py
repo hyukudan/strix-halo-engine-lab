@@ -1,7 +1,11 @@
 """Qwen served decode by prompt class (prose / edit / json) at C1 / C4 / C8 against one running server.
 
 Each class has 8 distinct prompts. Pass 1 ("cold": first requests of the process) runs the C1 reference of every
-prompt alone, then C4 (prompts 0-3) and C8 (all 8) concurrently; pass 2 ("warm") repeats C1 for prompts 0-1, C4 and C8.
+prompt alone, then C4 (prompts 0-3) and C8 (all 8) concurrently; pass 2 ("warm") repeats C1 for the first --warm-c1
+prompts (default all 8, so cold and warm C1 means cover the SAME prompts), then C4 and C8.
+A C1 request that ends before --min-decode-tokens (the model stops early, e.g. prose slice 0 ends with end-of-text
+after 1 token) has no meaningful decode rate: its line carries short=1 and qwen_serve_summary.py leaves it out of the
+C1 decode means (rtxmax3: averaging a 1-token request into a 2-prompt warm mean made warm look 22 % slower than cold).
 Every concurrent stream must equal its C1 ids (same_as_C1). The ids of every request are written to OUT.ids (one JSON
 line per request) so two server arms can be compared for identity.
 
@@ -19,8 +23,12 @@ from urllib.parse import urlsplit
 from pathlib import Path
 
 
+EXTRA = {}  # --extra-json: request fields merged into every body (measurement switches, e.g. {"copy_rows": 8})
+
+
 def stream(base, prompt, max_tokens, timeout):
     body = dict(prompt=prompt, max_tokens=max_tokens, temperature=0, stream=True, return_token_ids=True)
+    body.update(EXTRA)
     req = urllib.request.Request(base + '/v1/completions', json.dumps(body).encode(), {'Content-Type': 'application/json'})
     t0 = time.perf_counter()
     first, usage, strix, error = None, None, None, None
@@ -48,7 +56,9 @@ def stream(base, prompt, max_tokens, timeout):
     rtx = (strix or {}).get('rtx', {})
     return dict(t_first=first, t_end=t1, ttft=(first - t0) if first else None, wall=t1 - t0,
                 tokens=(usage or {}).get('completion_tokens'), ids=rtx.get('ids'), error=error, done=done,
-                decode_tps=(strix or {}).get('decode_tokens_per_second'))
+                decode_tps=(strix or {}).get('decode_tokens_per_second'), tpc=rtx.get('tokens_per_cycle'), cf=rtx.get('copy_first_steps'),
+                cx=rtx.get('context_extended_steps'), cr=rtx.get('context_rows'), hu=rtx.get('context_host_us'),
+                rps=rtx.get('rows_per_step'), cw=rtx.get('copy_wide_steps'))
 
 
 def response_error(result, max_tokens, reference=None):
@@ -130,12 +140,18 @@ def main():
     ap.add_argument('--classes', default='prose,edit,json')
     ap.add_argument('--max-tokens', type=int, default=128)
     ap.add_argument('--health-s', type=int, default=600)
+    ap.add_argument('--warm-c1', type=int, default=8, help='C1 prompts repeated in the warm pass (same prompts as cold)')
+    ap.add_argument('--min-decode-tokens', type=int, default=16, help='C1 requests with fewer tokens are flagged short=1')
+    ap.add_argument('--conc', default='4,8', help='concurrent levels after C1 (comma list; empty = C1 only)')
+    ap.add_argument('--extra-json', default='', help='JSON object merged into every request body (per-request switches)')
     a = ap.parse_args()
     if a.probe_endpoint:
         print(probe_endpoint(a.base))
         return
     if not all((a.out, a.prompts, a.tokenizer, a.prose_ids)) or a.max_tokens <= 0:
         ap.error('out, --prompts, --tokenizer, --prose-ids and positive --max-tokens are required')
+    if a.extra_json:
+        EXTRA.update(json.loads(a.extra_json))
     from tokenizers import Tokenizer  # local tokenizer.json, no download
     tok = Tokenizer.from_file(a.tokenizer)
     kit = json.loads(Path(a.prompts).read_text(encoding='utf-8'))
@@ -171,15 +187,16 @@ def main():
         for cls in a.classes.split(','):
             P = sets[cls]
             ref = []
-            for i, p in enumerate(P if pas == 'cold' else P[:2]):
+            for i, p in enumerate(P if pas == 'cold' else P[:a.warm_c1]):
                 r = stream(a.base, p, a.max_tokens, 900)
                 check(r, sets[cls + '_ref'][i] if pas == 'warm' else None)
                 ref.append(r['ids'])
                 ids_out.write(json.dumps(dict(pas=pas, cls=cls, c=1, i=i, ids=r['ids'])) + '\n')
-                say(f'{pas} {cls} C1 i={i} prompt={len(p)} tokens={r["tokens"]} decode_tps={r["decode_tps"]} err={r["error"]}')
+                say(f'{pas} {cls} C1 i={i} prompt={len(p)} tokens={r["tokens"]} decode_tps={r["decode_tps"]} '
+                    f'short={int((r["tokens"] or 0) < a.min_decode_tokens)} tpc={r["tpc"]} cf={r["cf"]} cx={r["cx"]} cr={r["cr"]} hu={r["hu"]} rps={r["rps"]} cw={r.get("cw")} err={r["error"]}')
             if pas == 'cold':
                 sets[cls + '_ref'] = ref
-            for c in (4, 8):
+            for c in [int(x) for x in a.conc.split(',') if x.strip()]:
                 res, wall = barrier(c, lambda i: stream(a.base, P[i], a.max_tokens, 900))
                 toks = sum((r.get('tokens') or 0) for r in res)
                 same = sum(check(r, sets[cls + '_ref'][i]) for i, r in enumerate(res))

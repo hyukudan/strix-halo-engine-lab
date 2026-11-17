@@ -15,6 +15,7 @@ Status resolve_family_weights(const FamilyPlanInputs& in, FamilyPlans& out) {
     std::ostringstream text; Status overall{Error::ok,{}};
     for (std::size_t i=0; i<result.weights.size(); ++i) {
         ResolveRequest r{}; r.tensor=&result.weights[i]; r.hardware=in.hardware; r.workload=in.workload;
+        r.build_identity=in.build_identity;
         r.required_arithmetic=in.arithmetic[i]; r.incumbent=in.incumbents[i]; r.maximum_permission=in.permission; r.allow_fast=in.allow_fast;
         apply_decision_override(r,in.measured_decisions_override);
         Plan plan{}; auto status=resolve(*in.registry,r,in.candidates,in.qualifications,plan);

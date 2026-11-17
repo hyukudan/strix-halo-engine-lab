@@ -21,11 +21,12 @@ struct RopeRow {
     float c[32], s[32];
 };
 
-// One prompt sequence of the batch: rows [row0, row0 + rows) are its positions [0, rows) (prefill from position 0).
+// One prompt sequence: rows [row0, row0 + rows) have positions [pos0, pos0 + rows). Default pos0=0 preserves full prefill.
 // Caches are this sequence's, every layer: k/v [layers][cap][4][128] BF16, ik [layers][cap][128] BF16.
 struct SeqView {
     std::uint32_t row0, rows, cap;
     std::uint16_t *k, *v, *ik;
+    std::uint32_t pos0 = 0;  // absolute position of row0; zero preserves whole-prompt calls
 };
 
 void embed(const std::uint16_t* table, const std::uint32_t* tokens, std::size_t rows, float* out, cudaStream_t s);
@@ -59,5 +60,6 @@ void msa_attend(const SeqView* seqs_d, const std::uint32_t* row_seq, std::size_t
 // K [n][256], V [n][256], index key [n][128], rank r = KV heads 2r, 2r + 1). dst points at the layer's block.
 extern double g_attn_prof[3];  // MM_RTX_PROFILE: msa_attend sub-phases (scores, select, attend), seconds
 void export_layer(const SeqView& seq, unsigned layer, unsigned rank, std::uint64_t n, std::uint8_t* dst, cudaStream_t s);
+void export_layer(const SeqView& seq, unsigned layer, unsigned rank, std::uint64_t r0, std::uint64_t n, std::uint8_t* dst, cudaStream_t s);
 
 }  // namespace strix::minimax::rtxpf::cuda

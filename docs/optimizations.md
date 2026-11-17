@@ -4669,7 +4669,8 @@ kernel (mode 10): one work-group = 4 waves, each wave owns every fourth 16-key t
 it (bf16 WMMA QK straight from the key rows, FP32 online softmax inside the wave, bf16 WMMA PV from a wave-private
 transposed value tile), with no barrier in the key loop; the four per-wave states are merged once per row. Selection,
 block lists and the K/V caches are the exact path's. Value 1 rounds queries and probabilities to bf16 (16 WMMA per
-tile); value 2 carries both as two bf16 terms, hi + lo (32 WMMA per tile, operand rounding 2^-17 instead of 2^-9).
+tile); value 2 carries both as two bf16 terms, hi + lo (32 WMMA per tile, operand rounding max(2^-16 |x|, h) instead of
+max(2^-8 |x|, h); bounds by format and range in `src/attn_core/two_term_model.hpp`).
 
 - **Preconditions:** prefill windows of more than 8 rows with the in-block MSA mode active (`STRIX_MM_PF_MSA_REWORK` not 0); other windows keep the exact kernel.
 - **Automatic selection:** per layer when enabled: layers 40-59 use the flash core, the others the exact kernel. `STRIX_MM_PF_MSA_FLASH_LAYERS` (layer-set grammar, e.g. `30-59`) changes the layers. Unset, every layer keeps the exact kernel, so exact mode keeps its bytes. It is not a default of the FAST_I4 format: there the same layer set changes the output more than the gate allows (see evidence).
@@ -5268,3 +5269,12 @@ a route a lever does not admit. TILE64 (instead of the tier split), tier mode 2 
 fork, the union cap and the build-time DPP reductions replace or depend on other choices and are separate arms.
 `--print-effective-config` ends the prefill block with an `allon` object (mode, one entry per lever with its resolved value
 and class). Test plan and lever census: [all-on guide](models/qwen3.8/allon.md).
+
+### DeepSeek V4.1 group prefill under the FAST profile
+
+**Engine:** `deepseek`. **Control:** `STRIX_SERVE_PREFILL_GROUP=auto|0`. **Default:** auto, also under `STRIX_DS41_FAST_PREFILL=1` and each single FAST lever (`strix::ds41::kGroupFastQualified`; `false` restores "FAST groups only with an explicit auto", reason `pending-group-fast-identity`).
+
+Several short waiting prompts run as one device prefill pass under the FAST levers. Each member keeps its solo arithmetic: a shared route plan (`include/strix/prefill_dense_plan.hpp`, `include/strix/ds41_dense_plan.hpp`) gives every projection site's route (batch / exact dense / FAST dense) and K split from the member's own rows, split and cone; members group only with equal plans, and the pass pins the exact dense kernels where the members' route is exact (the FAST dense 128-row threshold never sees the summed rows). Flash attention runs on per-member BF16 mirrors. Still solo: the FP16 hipBLASLt backend (`fp16-solver-geometry-unpinned`) and diagnostic outputs (`diagnostic-output-not-segmented`).
+- **Off switch:** `STRIX_SERVE_PREFILL_GROUP=0`
+- **Exactness evidence:** pair runs, same eight prompts solo (one at a time) and grouped in one server: every member's logits and exported-state hashes equal its solo run on both ranks, under exact (solo hashes equal to the previous main), the FAST profile, FAST_DENSE, FAST_MOE, FAST_ATTN=2, and the FAST profile with `STRIX_DS41_FAST_DENSE_MIN_ROWS=64` (groups of 125 rows across the threshold).
+- **Measured gain:** FAST profile, eight requests x 256 tokens: whole run 99.9 -> 102.7 tok/s (+2.8 %), admission 1,428 -> 865 ms; four requests about +1 % (noisy).

@@ -43,6 +43,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <locale>
 #include <optional>
 #include <set>
 #include <string>
@@ -1877,6 +1878,31 @@ inline void apply_prefix_cache_environment(Options& o, Lookup lookup) {
     }
 }
 
+inline std::vector<std::uint64_t> read_teacher_logits_rows(std::istream& input) {
+    std::vector<std::uint64_t> rows;
+    while (input >> std::ws && input.peek() != std::char_traits<char>::eof()) {
+        if (rows.size() == 65536U)
+            throw std::invalid_argument("teacher logits rows file must list 1..65536 positions");
+        // C++20 array extraction reads at most 20 characters plus the terminator.
+        // Reject a longer word before consuming or allocating its remaining bytes.
+        char word[21]{};
+        input >> word;
+        const auto next = input.peek();
+        if (next != std::char_traits<char>::eof() && !std::isspace(static_cast<char>(next), input.getloc()))
+            throw std::invalid_argument("teacher logits rows must be ascending decimal positions");
+        const std::string_view token(word);
+        std::uint64_t row = 0;
+        const auto parsed = std::from_chars(token.data(), token.data() + token.size(), row);
+        if (parsed.ec != std::errc{} || parsed.ptr != token.data() + token.size() ||
+            (!rows.empty() && row <= rows.back()))
+            throw std::invalid_argument("teacher logits rows must be ascending decimal positions");
+        rows.push_back(row);
+    }
+    if (input.bad()) throw std::invalid_argument("cannot read teacher logits rows file");
+    if (rows.empty()) throw std::invalid_argument("teacher logits rows file must list 1..65536 positions");
+    return rows;
+}
+
 // The serve options a --serve-config file may set for this CLI (src/serve/serve_config.cpp expands them in front of
 // the command line; the parser below validates and resolves them exactly as the equivalent flags).
 inline std::span<const strix::serve::config_file::Option> hip_serve_config_options() {
@@ -2224,17 +2250,7 @@ inline Options parse_options(
                 throw std::invalid_argument("teacher logits rows requires a nonempty path");
             std::ifstream rows_file{std::string(value)};
             if (!rows_file) throw std::invalid_argument("cannot read teacher logits rows file");
-            std::string word;
-            while (rows_file >> word) {
-                std::uint64_t row = 0;
-                const auto parsed = std::from_chars(word.data(), word.data() + word.size(), row);
-                if (parsed.ec != std::errc{} || parsed.ptr != word.data() + word.size() ||
-                    (!options.teacher_logits_rows.empty() && row <= options.teacher_logits_rows.back()))
-                    throw std::invalid_argument("teacher logits rows must be ascending decimal positions");
-                options.teacher_logits_rows.push_back(row);
-            }
-            if (options.teacher_logits_rows.empty() || options.teacher_logits_rows.size() > 65536U)
-                throw std::invalid_argument("teacher logits rows file must list 1..65536 positions");
+            options.teacher_logits_rows = read_teacher_logits_rows(rows_file);
             options.teacher_logits_rows_supplied = true;
             continue;
         }

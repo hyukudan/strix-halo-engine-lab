@@ -1,3 +1,4 @@
+#include "strix/ds41_dense_plan.hpp"
 #include "strix/device/hip_gate.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/dist/open_transport.hpp"
@@ -590,6 +591,7 @@ struct PrefillOutcome {
     double insert_seconds = 0.0;  // part of prefill_seconds: the state exports and cache inserts at piece ends
     std::uint64_t state_fnv = 0;  // STRIX_DS41_SERVE_PREFILL_LOG=1 only: FNV-1a of the exported state's serialized bytes
     std::uint32_t group_k = 0, group_n = 0;  // member k (1-based) of a group pass of n members; 0/0 = a solo prefill
+    std::uint32_t group_class = 0;           // the members' route class (DevicePrefill::route_class: split / joint / dense routes)
 };
 
 // STRIX_DS41_SERVE_PREFILL_LOG=1 (both ranks): the prefill lines carry state_fnv and the group position.
@@ -1224,6 +1226,7 @@ public:
             o.handoff_seconds = std::chrono::duration<double>(Clock::now() - t2).count() - ins;
             o.group_k = static_cast<std::uint32_t>(i + 1U);
             o.group_n = static_cast<std::uint32_t>(members.size());
+            o.group_class = prefill_->route_class(static_cast<std::uint32_t>(prompt.size()));
             o.seconds = std::chrono::duration<double>(Clock::now() - t0).count();
         }
         return outs;
@@ -1618,7 +1621,9 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
     ready.set("rank", serve::Json(1));
     ready.set("group_id", serve::Json(a.group_id));
     ready.set("epoch", serve::Json(a.epoch));
-    if (prefill) (void)pair_group_agreement(fwd, prefill_group_policy(), prefill->group_capacity());
+    // the same FAST qualification as rank 0 (the agreement is the pair minimum either way)
+    if (prefill) (void)pair_group_agreement(fwd, prefill_group_policy(),
+                                            serve::qualify_fast(prefill->group_capacity(), prefill_group_policy(), strix::ds41::kGroupFastQualified));
     if (prefill) prefill->reconcile(fwd, 1U);
     warm_up(a, fwd, prefill, stage, dog, 1U);
     event(ready);
@@ -1634,7 +1639,7 @@ void follow(const Args& initial, BatchForward& fwd, Watchdog& dog, const Prefill
         if (prefill_log_enabled()) {
             std::fprintf(stderr, "rank 1 prefill slot %u: %u tokens, resume %u, %u pieces; token %u logits_fnv %016llx state_fnv %016llx; %.3f s", slot, tokens,
                          o.resume, o.pieces, o.next_token, static_cast<unsigned long long>(o.logits), static_cast<unsigned long long>(o.state_fnv), o.seconds);
-            if (o.group_n != 0U) std::fprintf(stderr, " group %u/%u", o.group_k, o.group_n);
+            if (o.group_n != 0U) std::fprintf(stderr, " group %u/%u contract %u class %#x", o.group_k, o.group_n, strix::ds41::kGroupContractVersion, o.group_class);
             std::fprintf(stderr, "\n");
         }
     };
@@ -2240,7 +2245,11 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
     }
     const auto prefill_owner = make_prefill(a.prefill_rows);  // after the drafter (follow() does the same)
     SlotPrefill* const prefill = prefill_owner.get();
-    const auto group_pair = prefill ? pair_group_agreement(fwd, group_policy_own, prefill->group_capacity())
+    // FAST profile: grouped only after its identity fixture (strix::ds41::kGroupFastQualified) or with an explicit auto;
+    // the qualified own capacity then enters the pair agreement (both ranks group alike)
+    const auto own_capacity = prefill ? serve::qualify_fast(prefill->group_capacity(), group_policy_own, strix::ds41::kGroupFastQualified)
+                                      : serve::PrefillGroupCapacity{0U};
+    const auto group_pair = prefill ? pair_group_agreement(fwd, group_policy_own, own_capacity)
                                     : serve::PrefillGroupAgreement{group_policy_own, serve::PrefillGroupCapacity{0U}};
     const auto& group_policy = group_pair.policy;
     const auto& group_capacity = group_pair.capacity;
@@ -2972,7 +2981,7 @@ void lead(const Args& initial, BatchForward& fwd, strix::dist::Communicator& com
                          prefill->disk_seconds() > 0.0 ? static_cast<double>(prefill->disk_bytes()) / prefill->disk_seconds() / 1e9 : 0.0);
         if (disk_failed) std::fprintf(stderr, " DISK READ FAILED on a rank: path forgotten, ran as a miss");
         if (prefill_log_enabled()) std::fprintf(stderr, " state_fnv %016llx", static_cast<unsigned long long>(o.state_fnv));
-        if (o.group_n != 0U) std::fprintf(stderr, " group %u/%u", o.group_k, o.group_n);
+        if (o.group_n != 0U) std::fprintf(stderr, " group %u/%u contract %u class %#x", o.group_k, o.group_n, strix::ds41::kGroupContractVersion, o.group_class);
         std::fprintf(stderr, "\n");
         const std::lock_guard lock(state.mutex);
         ++state.prefills;

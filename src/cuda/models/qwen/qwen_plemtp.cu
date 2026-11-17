@@ -2,7 +2,10 @@
 // Exactness: every HIP floating-point instruction is one explicit IEEE operation here (__fmaf_rn/__fmul_rn/__fadd_rn/
 // __fdiv_rn/__fsqrt_rn) with the operand order of the gfx1151 ISA (disassembly of hip_ple_launcher);
 // rsqrtf/expf are the gfx1151 emulations of amd_math.cuh.
+#include "../../weight/arch/sm120_sources.cuh"
 #include "strix/cuda/qwen_plemtp.hpp"
+#include "../../core/mma_tile.cuh"
+#include "strix/env_flags.hpp"
 
 #include <cuda_fp16.h>
 
@@ -229,14 +232,14 @@ __global__ __launch_bounds__(256) void ple_project_kernel(const std::uint16_t* _
 #pragma unroll
         for (unsigned o = 0; o < kProjOuts; ++o) {
             const std::uint8_t* blk = wrow[o] + (f / 32U) * 34U;
-            const float d = __half2float(__ushort_as_half(*reinterpret_cast<const unsigned short*>(blk)));
+            const float d = weight::Q8Block::scale(blk);
             const unsigned short* q = reinterpret_cast<const unsigned short*>(blk + 2U + f % 32U);
             float c[8];
 #pragma unroll
             for (unsigned i = 0; i < 4; ++i) {
                 const unsigned short pair = q[i];
-                c[2 * i] = __fmul_rn(d, static_cast<float>(static_cast<std::int8_t>(pair & 0xffU)));
-                c[2 * i + 1] = __fmul_rn(d, static_cast<float>(static_cast<std::int8_t>(pair >> 8U)));
+                c[2 * i] = __fmul_rn(d, static_cast<float>(weight::Q8Block::pair_code(pair, 0)));
+                c[2 * i + 1] = __fmul_rn(d, static_cast<float>(weight::Q8Block::pair_code(pair, 1)));
             }
 #pragma unroll
             for (unsigned r = 0; r < kProjRows; ++r)
@@ -471,7 +474,7 @@ __global__ void mtp_q8_to_q4_kernel(const std::uint8_t* q8, std::uint64_t blocks
     const float scale = half_at(src);
     float values[32], mx = 0.0F, amax = 0.0F;
     for (unsigned i = 0; i < 32; ++i) {
-        values[i] = __fmul_rn(scale, static_cast<float>(static_cast<std::int8_t>(src[2 + i])));
+        values[i] = __fmul_rn(scale, static_cast<float>(weight::Q8Block::code(src, i)));
         if (fabsf(values[i]) > amax) { amax = fabsf(values[i]); mx = values[i]; }
     }
     const float d = __fmul_rn(mx, -0.125F);
@@ -507,7 +510,7 @@ __global__ void mtp_embedding_kernel(const std::uint8_t* table, std::uint32_t vo
     std::uint32_t token = tokens[row];
     if (token >= vocab) { if (status && f == 0) atomicOr(status, 1U); token = 0; }
     const std::uint8_t* blk = table + (static_cast<std::uint64_t>(token) * (kHidden / 32U) + f / 32U) * 34U;
-    out[static_cast<std::uint64_t>(row) * kHidden + f] = f2bf(__fmul_rn(half_at(blk), static_cast<float>(static_cast<std::int8_t>(blk[2 + f % 32U]))));
+    out[static_cast<std::uint64_t>(row) * kHidden + f] = f2bf(__fmul_rn(half_at(blk), static_cast<float>(weight::Q8Block::code(blk, f % 32U))));
 }
 
 // 2. mtp_input_norms<1024> (hip_mtp_input_fusion.hip:54-79): block 0 embedding (2560), block 1 wide hidden (10240).
@@ -590,6 +593,41 @@ __global__ __launch_bounds__(256) void mtp_fused_projection_kernel(const float* 
     }
 }
 
+// 3b. FAST form (Config::forms.mtp_mma): the same projection on FP16 tensor cores (core/mma_tile.cuh), FP32 accumulation,
+// per-32-K Q4 scale epilogue. Streams: s = 0 is the embedding half (x[0:2560] against weight blocks 0..79), s = 1..4 the four
+// HC streams (x[2560 s : +2560] against weight blocks 80..159, the same weights). CTA 128 rows x 128 outputs; the embedding
+// accumulator stays in registers while the four HC streams run, the epilogue is the exact kernel's rounding chain.
+using MtpTile = strix::cuda::core::mma::Tile<8>;
+__global__ __launch_bounds__(256) void mtp_fused_projection_mma_kernel(const float* normalized, const std::uint8_t* eh_q4,
+    std::uint32_t rows, std::uint16_t* fused, MtpRounding rd) {
+    __shared__ MtpTile::Smem sm;
+    const unsigned n0 = blockIdx.x * 128U, m0 = blockIdx.y * 128U;
+    constexpr std::uint64_t ld = kHidden + kExpanded;
+    float emb[2][8][4], acc[2][8][4];
+    MtpTile::run(emb, sm, normalized, ld, m0, rows, eh_q4, kMtpEhRowQ4, n0, kHidden / 32);
+    for (unsigned s = 0; s < kHc; ++s) {
+        MtpTile::run(acc, sm, normalized + kHidden * (s + 1U), ld, m0, rows, eh_q4 + (kHidden / 32U) * 18U, kMtpEhRowQ4, n0, kHidden / 32);
+#pragma unroll
+        for (int mi = 0; mi < 2; ++mi)
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const unsigned r = m0 + MtpTile::row(mi, 2 * h);
+                    if (r >= rows) continue;
+                    unsigned packed = 0;
+#pragma unroll
+                    for (int c = 0; c < 2; ++c) {
+                        const float e = emb[mi][j][2 * h + c], a = acc[mi][j][2 * h + c];
+                        const float pe = rd.projection_bf16 ? bf16f(f2bf_quiet(e)) : e;
+                        const float pa = rd.projection_bf16 ? bf16f(f2bf_quiet(a)) : a;
+                        packed |= static_cast<unsigned>(f2bf_quiet(__fadd_rn(pe, pa))) << (16 * c);
+                    }
+                    *reinterpret_cast<unsigned*>(fused + static_cast<std::uint64_t>(r) * kExpanded + s * kHidden + n0 + MtpTile::col(j, 0)) = packed;
+                }
+    }
+}
+
 // 4. prepare_hyper_norm_kernel<bf16> (hip_hyper_mix_launcher.hip:662-688), grid (4 streams, rows).
 __global__ __launch_bounds__(256) void mtp_hyper_norm_kernel(const std::uint16_t* fused, const float* norm, float eps,
     float* out, am::Tables t) {
@@ -629,7 +667,7 @@ __global__ __launch_bounds__(512) void mtp_hyper_low_kernel(const float* hc_norm
             const float scale = half_at(blk);
 #pragma unroll
             for (unsigned j = 0; j < 4U; ++j)
-                coef[o][s][j] = __fmul_rn(scale, static_cast<float>(static_cast<std::int8_t>(blk[2U + 4U * (lane % 8U) + j])));
+                coef[o][s][j] = __fmul_rn(scale, static_cast<float>(weight::Q8Block::code(blk, 4U * (lane % 8U) + j)));
         }
 #pragma unroll
     for (unsigned r = 0; r < kSplitRows; ++r) {
@@ -675,7 +713,7 @@ __global__ __launch_bounds__(128) void mtp_hyper_output_kernel(const float* hc_n
         const std::uint8_t* blk = w + b * 34U;
         const float scale = half_at(blk);
         for (unsigned k = 0; k < 32U; ++k)
-            gate = __fmaf_rn(lr[b * 32U + k], __fmul_rn(scale, static_cast<float>(static_cast<std::int8_t>(blk[2U + k]))), gate);
+            gate = __fmaf_rn(lr[b * 32U + k], __fmul_rn(scale, static_cast<float>(weight::Q8Block::code(blk, k))), gate);
     }
     sig[stream * 32U + lane] = __fdiv_rn(1.0F, __fadd_rn(1.0F, am::amd_expf(tb, -gate)));
     __syncthreads();
@@ -707,7 +745,7 @@ __global__ __launch_bounds__(256) void mtp_cache_projection_kernel(const std::ui
         if (kind == 0) w = bf16f(index_k[static_cast<std::uint64_t>(out) * kHidden + f]);
         else {
             const std::uint8_t* blk = q8 + (static_cast<std::uint64_t>(out) * (kHidden / 32U) + f / 32U) * 34U;
-            w = __fmul_rn(half_at(blk), static_cast<float>(static_cast<std::int8_t>(blk[2U + f % 32U])));
+            w = __fmul_rn(half_at(blk), static_cast<float>(weight::Q8Block::code(blk, f % 32U)));
         }
 #pragma unroll
         for (unsigned r = 0; r < kLinRows; ++r)
@@ -728,6 +766,231 @@ __global__ __launch_bounds__(256) void mtp_cache_projection_kernel(const std::ui
         if (kind == 0) index_out[row * kMtpIndexDim + out] = v;
         else if (kind == 1) k_out[row * kMtpKvWidth + out] = v;
         else v_out[row * kMtpKvWidth + out] = v;
+    }
+}
+
+// ---- Decode-side (rows <= 8) forms, EXACT vs the kernels above: same per-output FP32 chains, only operand staging / row
+// predication / vector loads differ. Selector STRIX_QRTX_MTP_STEP (default on), launcher branch rows <= 8.
+__device__ __forceinline__ float4 ldf4(const float* p) { return *reinterpret_cast<const float4*>(p); }
+__device__ __forceinline__ float pick4(const float4& v, unsigned c) { return c == 0 ? v.x : c == 1 ? v.y : c == 2 ? v.z : v.w; }
+
+// Same chain as mtp_fused_projection_kernel; R rows per CTA predicated by r0 + r < rows (no clamped duplicate rows), x by float4.
+template <unsigned R>
+__global__ __launch_bounds__(256) void mtp_fused_projection_v2_kernel(const float* normalized, const std::uint8_t* eh_q4,
+    std::uint32_t rows, std::uint16_t* fused, MtpRounding rd) {
+    const unsigned lane = threadIdx.x & 31U, o = blockIdx.x * 8U + (threadIdx.x >> 5U), r0 = blockIdx.y * R;
+    if (o >= kHidden) return;
+    const std::uint8_t* packed = eh_q4 + static_cast<std::uint64_t>(o) * kMtpEhRowQ4;
+    float emb[R], sums[R][kHc];
+#pragma unroll
+    for (unsigned r = 0; r < R; ++r) { emb[r] = 0.0F; for (unsigned s = 0; s < kHc; ++s) sums[r][s] = 0.0F; }
+#pragma unroll 2
+    for (unsigned base = 8U * lane; base < kHidden; base += 256U) {
+        const std::uint8_t* e = packed + (base / 32U) * 18U;
+        const std::uint8_t* wq = packed + ((kHidden + base) / 32U) * 18U;
+        const float es = half_at(e), ws = half_at(wq);
+        const unsigned j0 = base % 32U, sh = j0 >= 16U ? 4U : 0U;
+        const std::uint16_t* pe = reinterpret_cast<const std::uint16_t*>(e + 2U + (j0 & 15U));
+        const std::uint16_t* pw = reinterpret_cast<const std::uint16_t*>(wq + 2U + (j0 & 15U));
+        std::uint32_t we[4], ww[4];
+#pragma unroll
+        for (unsigned t = 0; t < 4; ++t) { we[t] = pe[t]; ww[t] = pw[t]; }
+        float ce[8], cw[8];
+#pragma unroll
+        for (unsigned i = 0; i < 8; ++i) {
+            const unsigned ne = ((we[i >> 1U] >> (8U * (i & 1U))) >> sh) & 15U, nw = ((ww[i >> 1U] >> (8U * (i & 1U))) >> sh) & 15U;
+            ce[i] = __fmul_rn(es, static_cast<float>(static_cast<int>(ne) - 8));
+            cw[i] = __fmul_rn(ws, static_cast<float>(static_cast<int>(nw) - 8));
+        }
+#pragma unroll
+        for (unsigned r = 0; r < R; ++r) {
+            if (r0 + r < rows) {
+                const float* x = normalized + static_cast<std::uint64_t>(r0 + r) * (kHidden + kExpanded);
+                float4 xa[1 + kHc][2];
+                xa[0][0] = ldf4(x + base); xa[0][1] = ldf4(x + base + 4U);
+#pragma unroll
+                for (unsigned s = 0; s < kHc; ++s) { xa[1 + s][0] = ldf4(x + kHidden + s * kHidden + base); xa[1 + s][1] = ldf4(x + kHidden + s * kHidden + base + 4U); }
+#pragma unroll
+                for (unsigned i = 0; i < 8; ++i) {
+                    emb[r] = __fmaf_rn(ce[i], pick4(xa[0][i >> 2U], i & 3U), emb[r]);
+#pragma unroll
+                    for (unsigned s = 0; s < kHc; ++s) sums[r][s] = __fmaf_rn(cw[i], pick4(xa[1 + s][i >> 2U], i & 3U), sums[r][s]);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned r = 0; r < R; ++r)
+#pragma unroll
+        for (unsigned d = 16U; d; d >>= 1U) {
+            emb[r] = __fadd_rn(emb[r], __shfl_xor_sync(0xffffffffU, emb[r], d));
+#pragma unroll
+            for (unsigned s = 0; s < kHc; ++s) sums[r][s] = __fadd_rn(sums[r][s], __shfl_xor_sync(0xffffffffU, sums[r][s], d));
+        }
+    if (lane) return;
+#pragma unroll
+    for (unsigned r = 0; r < R; ++r) {
+        if (r0 + r >= rows) break;
+        const float projected = rd.projection_bf16 ? bf16f(f2bf_quiet(emb[r])) : emb[r];
+        for (unsigned s = 0; s < kHc; ++s) {
+            const float sk = rd.projection_bf16 ? bf16f(f2bf_quiet(sums[r][s])) : sums[r][s];
+            fused[static_cast<std::uint64_t>(r0 + r) * kExpanded + s * kHidden + o] = f2bf_quiet(__fadd_rn(projected, sk));
+        }
+    }
+}
+
+// Block tree 128..1 of 256 per-thread partials: smem stages 128/64/32, last five stages in warp 0 by xor shuffles (lane 0 = same pairs).
+__device__ __forceinline__ float tree256_shfl(float* sums, unsigned lane, float v) {
+    sums[lane] = v;
+    __syncthreads();
+    if (lane < 128U) sums[lane] = __fadd_rn(sums[lane], sums[lane + 128U]);
+    __syncthreads();
+    if (lane < 64U) sums[lane] = __fadd_rn(sums[lane], sums[lane + 64U]);
+    __syncthreads();
+    float t = 0.0F;
+    if (lane < 32U) {
+        t = __fadd_rn(sums[lane], sums[lane + 32U]);
+#pragma unroll
+        for (unsigned d = 16U; d; d >>= 1U) t = __fadd_rn(t, __shfl_xor_sync(0xffffffffU, t, d));
+    }
+    return t;  // valid in lane 0
+}
+
+template <unsigned K>
+__device__ __forceinline__ void mtp_norm_body(const std::uint16_t* in, const float* w, float* out, const MtpRounding& rd, float* sums, float& inv_s) {
+    const unsigned lane = threadIdx.x;
+    float v[K], g[K];
+#pragma unroll
+    for (unsigned k = 0; k < K; ++k) { v[k] = bf16f(in[lane + 256U * k]); g[k] = w[lane + 256U * k]; }
+    float sum = 0.0F;
+#pragma unroll
+    for (unsigned k = 0; k < K; ++k) sum = __fmaf_rn(v[k], v[k], sum);
+    const float t = tree256_shfl(sums, lane, sum);
+    if (lane == 0) inv_s = __fdiv_rn(1.0F, __fsqrt_rn(__fadd_rn(__fdiv_rn(t, static_cast<float>(K * 256U)), rd.epsilon)));
+    __syncthreads();
+    const float inverse = inv_s;
+#pragma unroll
+    for (unsigned k = 0; k < K; ++k) {
+        const float gain = rd.gemma_offset ? __fadd_rn(1.0F, g[k]) : g[k];
+        const float x = __fmul_rn(__fmul_rn(v[k], inverse), gain);
+        out[lane + 256U * k] = rd.normalized_bf16 ? bf16f(f2bf_quiet(x)) : x;
+    }
+}
+
+__global__ __launch_bounds__(256) void mtp_input_norms_v2_kernel(const std::uint16_t* embedding, const std::uint16_t* hidden,
+    const float* enorm, const float* hnorm, float* normalized, MtpRounding rd) {
+    __shared__ float sums[256];
+    __shared__ float inv_s;
+    const unsigned row = blockIdx.y;
+    float* out = normalized + static_cast<std::uint64_t>(row) * (kHidden + kExpanded);
+    if (blockIdx.x != 0U) mtp_norm_body<kExpanded / 256U>(hidden + static_cast<std::uint64_t>(row) * kExpanded, hnorm, out + kHidden, rd, sums, inv_s);
+    else mtp_norm_body<kHidden / 256U>(embedding + static_cast<std::uint64_t>(row) * kHidden, enorm, out, rd, sums, inv_s);
+}
+
+// Same chain as mtp_hyper_output_kernel; each warp stages its contiguous 32 x 340 B weight rows by coalesced uint4 into smem.
+constexpr unsigned kHyperRowBytes = (kMtpRank / 32U) * 34U;   // 340
+__global__ __launch_bounds__(128) void mtp_hyper_output_v2_kernel(const float* hc_normalized, const float* low,
+    const std::uint8_t* up, std::uint16_t* hidden0, am::Tables tb) {
+    __shared__ __align__(16) std::uint8_t stage[kHc][32U * kHyperRowBytes];
+    __shared__ float sig[kHc * 32U];
+    const unsigned lane = threadIdx.x & 31U, stream = threadIdx.x >> 5U, row = blockIdx.y;
+    const unsigned feature = blockIdx.x * 32U + lane;
+    {
+        const uint4* src = reinterpret_cast<const uint4*>(up + (static_cast<std::uint64_t>(stream) * kHidden + blockIdx.x * 32U) * kHyperRowBytes);
+        uint4* dst = reinterpret_cast<uint4*>(stage[stream]);
+        constexpr unsigned n = 32U * kHyperRowBytes / 16U;   // 680
+        uint4 t[(n + 31U) / 32U];
+#pragma unroll
+        for (unsigned i = 0; i < (n + 31U) / 32U; ++i) if (lane + 32U * i < n) t[i] = src[lane + 32U * i];
+#pragma unroll
+        for (unsigned i = 0; i < (n + 31U) / 32U; ++i) if (lane + 32U * i < n) dst[lane + 32U * i] = t[i];
+    }
+    __syncwarp();
+    const std::uint8_t* w = stage[stream] + lane * kHyperRowBytes;
+    const float* lr = low + static_cast<std::uint64_t>(row) * kMtpRank;
+    float gate = 0.0F;
+    for (unsigned b = 0; b < kMtpRank / 32U; ++b) {
+        const std::uint8_t* blk = w + b * 34U;
+        const float scale = __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(blk)));
+#pragma unroll
+        for (unsigned k = 0; k < 32U; k += 4U) {
+            const float4 l = ldf4(lr + b * 32U + k);
+            const std::uint32_t a = *reinterpret_cast<const std::uint16_t*>(blk + 2U + k), c = *reinterpret_cast<const std::uint16_t*>(blk + 4U + k);
+            gate = __fmaf_rn(l.x, __fmul_rn(scale, static_cast<float>(static_cast<std::int8_t>(a & 255U))), gate);
+            gate = __fmaf_rn(l.y, __fmul_rn(scale, static_cast<float>(static_cast<std::int8_t>(a >> 8U))), gate);
+            gate = __fmaf_rn(l.z, __fmul_rn(scale, static_cast<float>(static_cast<std::int8_t>(c & 255U))), gate);
+            gate = __fmaf_rn(l.w, __fmul_rn(scale, static_cast<float>(static_cast<std::int8_t>(c >> 8U))), gate);
+        }
+    }
+    sig[stream * 32U + lane] = __fdiv_rn(1.0F, __fadd_rn(1.0F, am::amd_expf(tb, -gate)));
+    __syncthreads();
+    if (stream == 0U) {
+        float mixed = 0.0F;
+        for (unsigned t = 0; t < kHc; ++t)
+            mixed = __fmaf_rn(hc_normalized[static_cast<std::uint64_t>(row) * kExpanded + t * kHidden + feature], sig[t * 32U + lane], mixed);
+        hidden0[static_cast<std::uint64_t>(row) * kHidden + feature] = f2bf(__fdiv_rn(mixed, static_cast<float>(kHc)));
+    }
+}
+
+// Same chain as mtp_cache_projection_kernel; rows beyond `rows` not computed, fixed unroll, last tree stages by shuffle.
+__global__ __launch_bounds__(256) void mtp_cache_projection_v2_kernel(const std::uint16_t* hidden0, std::uint32_t rows,
+    const std::uint16_t* index_k, const std::uint8_t* kq, const std::uint8_t* vq, float* index_out, float* k_out, float* v_out) {
+    __shared__ float scratch[kLinRows][256];
+    const unsigned lane = threadIdx.x, r0 = blockIdx.y * kLinRows;
+    const unsigned nr = min(kLinRows, rows - r0);
+    unsigned out = blockIdx.x;
+    int kind = 0;
+    if (out >= kMtpIndexDim) { out -= kMtpIndexDim; kind = 1; if (out >= kMtpKvWidth) { out -= kMtpKvWidth; kind = 2; } }
+    const std::uint8_t* q8 = kind == 1 ? kq : vq;
+    float wv[kHidden / 256U];
+#pragma unroll
+    for (unsigned k = 0; k < kHidden / 256U; ++k) {
+        const unsigned f = lane + 256U * k;
+        if (kind == 0) wv[k] = bf16f(index_k[static_cast<std::uint64_t>(out) * kHidden + f]);
+        else {
+            const std::uint8_t* blk = q8 + (static_cast<std::uint64_t>(out) * (kHidden / 32U) + f / 32U) * 34U;
+            wv[k] = __fmul_rn(half_at(blk), static_cast<float>(static_cast<std::int8_t>(blk[2U + f % 32U])));
+        }
+    }
+    float sum[kLinRows];
+#pragma unroll
+    for (unsigned r = 0; r < kLinRows; ++r) sum[r] = 0.0F;
+#pragma unroll
+    for (unsigned r = 0; r < kLinRows; ++r) {
+        if (r < nr) {
+            float hv[kHidden / 256U];
+#pragma unroll
+            for (unsigned k = 0; k < kHidden / 256U; ++k) hv[k] = bf16f(hidden0[static_cast<std::uint64_t>(r0 + r) * kHidden + lane + 256U * k]);
+#pragma unroll
+            for (unsigned k = 0; k < kHidden / 256U; ++k) sum[r] = __fmaf_rn(hv[k], wv[k], sum[r]);
+        }
+    }
+#pragma unroll
+    for (unsigned r = 0; r < kLinRows; ++r) if (r < nr) scratch[r][lane] = sum[r];
+    __syncthreads();
+#pragma unroll
+    for (unsigned stride = 128U; stride >= 64U; stride >>= 1U) {
+        if (lane < stride)
+#pragma unroll
+            for (unsigned r = 0; r < kLinRows; ++r) if (r < nr) scratch[r][lane] = __fadd_rn(scratch[r][lane], scratch[r][lane + stride]);
+        __syncthreads();
+    }
+    if (lane < 32U) {
+#pragma unroll
+        for (unsigned r = 0; r < kLinRows; ++r) {
+            if (r < nr) {
+                float t = __fadd_rn(scratch[r][lane], scratch[r][lane + 32U]);
+#pragma unroll
+                for (unsigned d = 16U; d; d >>= 1U) t = __fadd_rn(t, __shfl_xor_sync(0xffffffffU, t, d));
+                if (lane == 0) {
+                    const float v = rnd_bf16(t);
+                    const std::uint64_t row = r0 + r;
+                    if (kind == 0) index_out[row * kMtpIndexDim + out] = v;
+                    else if (kind == 1) k_out[row * kMtpKvWidth + out] = v;
+                    else v_out[row * kMtpKvWidth + out] = v;
+                }
+            }
+        }
     }
 }
 
@@ -804,6 +1067,18 @@ MtpWorkspaceViews mtp_workspace_views(void* workspace, std::uint32_t rows) {
         reinterpret_cast<float*>(b + l.value)};
 }
 
+void launch_mtp_fused_projection(const float* normalized, const void* eh_q4, std::uint32_t rows, std::uint16_t* fused,
+    const MtpRounding& rd, cudaStream_t stream) {
+    if (!rows) return;
+    if (rd.mma)
+        mtp_fused_projection_mma_kernel<<<dim3(kHidden / 128U, (rows + 127U) / 128U), 256, 0, stream>>>(normalized,
+            static_cast<const std::uint8_t*>(eh_q4), rows, fused, rd);
+    else
+        mtp_fused_projection_kernel<<<dim3(kHidden / 8U, (rows + kFuseRows - 1U) / kFuseRows), 256, 0, stream>>>(normalized,
+            static_cast<const std::uint8_t*>(eh_q4), rows, fused, rd);
+    check(cudaGetLastError(), "MTP fused projection launch");
+}
+
 void launch_mtp_cache_rows(const MtpWeights& w, const MtpRounding& rd, const std::uint16_t* hidden,
     const std::uint32_t* next_tokens, std::uint32_t rows, std::uint64_t position0, std::uint16_t* kv, std::uint16_t* raw_index,
     void* workspace, std::uint32_t* status, const amdmath::Tables& tables, cudaStream_t stream, const std::uint64_t* position_dev) {
@@ -814,15 +1089,30 @@ void launch_mtp_cache_rows(const MtpWeights& w, const MtpRounding& rd, const std
     check(cudaMemsetAsync(first_bad, 0xff, 4, stream), "MTP first-bad reset");
     mtp_embedding_kernel<<<dim3(kHidden / 256U, rows), 256, 0, stream>>>(static_cast<const std::uint8_t*>(w.token_embd), w.vocab,
         next_tokens, v.embedding, status);
-    mtp_input_norms_kernel<<<dim3(2, rows), 256, 0, stream>>>(v.embedding, hidden, w.enorm, w.hnorm, v.normalized, rd);
-    mtp_fused_projection_kernel<<<dim3(kHidden / 8U, (rows + kFuseRows - 1U) / kFuseRows), 256, 0, stream>>>(v.normalized,
+    // STRIX_QRTX_MTP_STEP=0: old decode-side kernels (reference). rows <= 8 only; many-row forms below untouched.
+    static const bool step_v2 = strix::envcfg::flag("STRIX_QRTX_MTP_STEP", true);
+    const bool v2 = step_v2 && rows <= 8U;
+    const bool v2_up = v2 && (reinterpret_cast<std::uintptr_t>(w.hc_up) & 15U) == 0U;
+    if (v2) mtp_input_norms_v2_kernel<<<dim3(2, rows), 256, 0, stream>>>(v.embedding, hidden, w.enorm, w.hnorm, v.normalized, rd);
+    else mtp_input_norms_kernel<<<dim3(2, rows), 256, 0, stream>>>(v.embedding, hidden, w.enorm, w.hnorm, v.normalized, rd);
+    // FAST MTP rounding (rd.mma): the tensor-core projection at every row count, as before the decode-step forms.
+    if (rd.mma) launch_mtp_fused_projection(v.normalized, w.eh_q4, rows, v.fused, rd, stream);
+    else if (v2 && rows == 1U) mtp_fused_projection_v2_kernel<1><<<dim3(kHidden / 8U, 1), 256, 0, stream>>>(v.normalized,
+        static_cast<const std::uint8_t*>(w.eh_q4), rows, v.fused, rd);
+    else if (v2) mtp_fused_projection_v2_kernel<4><<<dim3(kHidden / 8U, (rows + 3U) / 4U), 256, 0, stream>>>(v.normalized,
+        static_cast<const std::uint8_t*>(w.eh_q4), rows, v.fused, rd);
+    else mtp_fused_projection_kernel<<<dim3(kHidden / 8U, (rows + kFuseRows - 1U) / kFuseRows), 256, 0, stream>>>(v.normalized,
         static_cast<const std::uint8_t*>(w.eh_q4), rows, v.fused, rd);
     mtp_hyper_norm_kernel<<<dim3(kHc, rows), 256, 0, stream>>>(v.fused, w.hc_norm, rd.epsilon, v.hc_normalized, tables);
     mtp_hyper_low_kernel<<<dim3(kMtpRank / kSplitOuts, (rows + kSplitRows - 1U) / kSplitRows), 512, 0, stream>>>(v.hc_normalized,
         static_cast<const std::uint8_t*>(w.hc_down), rows, v.low, tables);
-    mtp_hyper_output_kernel<<<dim3(kHidden / 32U, rows), 128, 0, stream>>>(v.hc_normalized, v.low,
+    if (v2_up) mtp_hyper_output_v2_kernel<<<dim3(kHidden / 32U, rows), 128, 0, stream>>>(v.hc_normalized, v.low,
         static_cast<const std::uint8_t*>(w.hc_up), v.hidden0, tables);
-    mtp_cache_projection_kernel<<<dim3(kMtpIndexDim + 2U * kMtpKvWidth, (rows + kLinRows - 1U) / kLinRows), 256, 0, stream>>>(
+    else mtp_hyper_output_kernel<<<dim3(kHidden / 32U, rows), 128, 0, stream>>>(v.hc_normalized, v.low,
+        static_cast<const std::uint8_t*>(w.hc_up), v.hidden0, tables);
+    if (v2) mtp_cache_projection_v2_kernel<<<dim3(kMtpIndexDim + 2U * kMtpKvWidth, (rows + kLinRows - 1U) / kLinRows), 256, 0, stream>>>(
+        v.hidden0, rows, w.index_k, static_cast<const std::uint8_t*>(w.k), static_cast<const std::uint8_t*>(w.v), v.index_key, v.key, v.value);
+    else mtp_cache_projection_kernel<<<dim3(kMtpIndexDim + 2U * kMtpKvWidth, (rows + kLinRows - 1U) / kLinRows), 256, 0, stream>>>(
         v.hidden0, rows, w.index_k, static_cast<const std::uint8_t*>(w.k), static_cast<const std::uint8_t*>(w.v), v.index_key, v.key, v.value);
     mtp_key_norm_rope_kernel<<<dim3(kMtpKvHeads, rows), 256, 0, stream>>>(v.key, w.k_norm, w.rope_cs, w.rope_positions, position0,
         position_dev, rd.epsilon, status, tables);

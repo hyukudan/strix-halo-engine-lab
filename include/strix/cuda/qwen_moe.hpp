@@ -21,6 +21,7 @@
 #include <cstdint>
 
 #include "strix/cuda/amd_math.cuh"
+#include "strix/qwen_weight_packs.hpp"
 
 namespace strix::cuda::qwen_moe {
 
@@ -73,12 +74,15 @@ struct Rows {
     std::uint64_t rawdot_capacity = 0;
 };
 
+// Explicit FAST contract; defaults preserve the historical source/arithmetic.
+using ExpertArithmetic=::strix::qwen_packs::ExpertArithmetic;
 struct Weights {
     std::uint32_t gate_type = type_q4_k;       // 12 or 13 (gate and up share it)
     const std::uint8_t* gate = nullptr;        // [experts][ffn][hidden/256 blocks]
     const std::uint8_t* up = nullptr;
     std::uint32_t down_type = type_q5_1;       // 7 or 8
     const std::uint8_t* down = nullptr;        // [experts][hidden][ffn/32 blocks]
+    ExpertArithmetic arithmetic=ExpertArithmetic::incumbent;
 };
 
 // The single steps (tests) and the whole routed MoE of one layer. Any rows >= 1 is accepted (the HIP entry requires
@@ -86,18 +90,21 @@ struct Weights {
 // DeferredMoeFirstError {domain, bits} (include/strix/deferred_moe_status.hpp).
 void enqueue_prologue(const Rows&, std::uint32_t rows, std::uint32_t clear_words, cudaStream_t);
 void enqueue_csr(const Rows&, std::uint32_t rows, cudaStream_t);
-void enqueue_project(const Rows&, std::uint32_t rows, const Weights&, const amdmath::Tables&, cudaStream_t);
-void enqueue_down(const Rows&, std::uint32_t rows, const Weights&, cudaStream_t);
+// moe_mma: FAST form (Config::forms.moe_mma): single-FP32-chain IMMA project/down on the A8 types, bit-changing.
+void enqueue_project(const Rows&, std::uint32_t rows, const Weights&, const amdmath::Tables&, cudaStream_t, bool moe_mma = false);
+void enqueue_down(const Rows&, std::uint32_t rows, const Weights&, cudaStream_t, bool moe_mma = false);
 void enqueue_merge(const Rows&, std::uint32_t rows, cudaStream_t);
 void enqueue_commit(const Rows&, std::uint32_t rows, std::uint32_t* record, cudaStream_t);
 // enqueue() = prologue + routed (csr, project, down; the native FAST branch included) + combine (merge, commit):
 // tiered residency (strix/cuda/tiered_experts.hpp) runs its publish/gather kernels between these parts.
-void enqueue_routed(const Rows&, std::uint32_t rows, const Weights&, const amdmath::Tables&, cudaStream_t);
+// enqueue_routed() and enqueue() return whether candidate MMA arithmetic was dispatched (native experts fall back).
+bool enqueue_routed(const Rows&, std::uint32_t rows, const Weights&, const amdmath::Tables&, cudaStream_t, bool moe_mma = false);
 void enqueue_combine(const Rows&, std::uint32_t rows, std::uint32_t* record, cudaStream_t);
-void enqueue(const Rows&, std::uint32_t rows, std::uint32_t clear_words, const Weights&, const amdmath::Tables&,
-             std::uint32_t* record, cudaStream_t);
+bool enqueue(const Rows&, std::uint32_t rows, std::uint32_t clear_words, const Weights&, const amdmath::Tables&,
+             std::uint32_t* record, cudaStream_t, bool moe_mma = false);
 // True when the expert types are not the A8 profile's (gate Q4_K/Q5_K with down Q5_1/Q8_0): enqueue() then runs the native
 // FAST path (any cuda_qwen_quant.cuh type; needs Rows::intermediates for the FP32 h values).
 [[nodiscard]] bool native_types(const Weights&);
+[[nodiscard]] bool gsq_types(const Weights&);
 
 }  // namespace strix::cuda::qwen_moe

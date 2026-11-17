@@ -17,6 +17,7 @@
 #include "strix/qwen_prefill_schedule.hpp"
 #include "strix/cuda/qwen_route_bf16.hpp"
 #include "strix/cuda/qwen_mtp_diagnostic.hpp"
+#include "strix/qwen_weight_packs.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -40,6 +41,12 @@ struct Config {
     std::vector<std::uint32_t> block_schedule{1024, 2048, 4096, 8192};  // rows per block; the last entry repeats
     bool tail_large = true;           // rotate final remainder to front; same count and capacity (--block-schedule default = off)
     std::uint32_t final_block_rows = 0; // optional tail reservation within loaded max block
+    // Fit the block capacity to the VRAM left after weights, decode buffers and session 0 (strix/rows_fit.hpp): the block
+    // workspace is allocated last and steps down by 1024 rows until it fits with block_fit_reserve_mib free; the schedule is
+    // clamped to the fitted capacity. Bitwise (block rows never change the per-row arithmetic). Off: allocate the schedule
+    // maximum before the decode buffers and refuse when anything later does not fit (the pre-fit behaviour).
+    bool block_fit = false;
+    std::uint32_t block_fit_reserve_mib = 512;
     int device = 0;
     bool ple_host_pinned = true;       // per_layer_token_embd (28.8 GB) in pinned host memory, gathered on the host
     // Release per layer: every block's KV/index rows of layer l, and in the last block each GDN layer's recurrent/conv
@@ -65,8 +72,25 @@ struct Config {
     // Explicit unqualified CUDA A8 route-storage candidate. Omitted: environment;
     // false: individual OFF. Baseline/defaults/exact masters always suppress it.
     std::optional<bool> moe_route_bf16;
+    // Frozen by the common resolver; direct API callers resolve once at construction.
+    std::optional<qwen_route::Policy> route_policy;
     // Explicit source diagnostic only: does not admit ordinary product MTP.
     bool diagnostic_bf16_mtp = false;
+    // TURBO onfly weights (--profile turbo --turbo-weights onfly, resolved by strix/cuda/qwen_turbo.hpp): convert the
+    // dense Q8_0 roles to NVFP4 once at load (onfly-nvfp4-rtn-g16, nvfp4-a8-v1) and read them in decode windows.
+    // false (default, exact, FAST): nothing converted, every route and byte unchanged.
+    bool turbo_onfly_nvfp4 = false;
+    // TURBO cache namespace (strix::profile::turbo::cache_namespace); empty outside turbo. Part of the prefix identity.
+    std::string turbo_namespace;
+    // Prefill arithmetic forms of the FAST profile (CUDA numerical identities, include/strix/profiles/qwen_cuda.hpp).
+    // All false = the exact CUDA path. Set only by the profile resolver (or its named overrides), never by getenv here.
+    struct Forms {
+        bool hc_mma = false;   // hyper-connection projection / output on FP16 tensor cores, FP32 accumulation
+        bool mtp_mma = false;  // MTP fused projection on FP16 tensor cores, FP32 accumulation
+        bool qsa_mma = false;  // QSA prefill attention (scores and output) on FP16 tensor cores, FP32 accumulation
+        bool moe_mma = false;  // routed-MoE prefill project/down: int8 IMMA block dots, ONE FP32 FMA chain per output (not the HIP four)
+    } forms;
+    qwen_packs::ExpertArithmetic expert_arithmetic=qwen_packs::ExpertArithmetic::incumbent;
 };
 
 // Diagnostic snapshot, not the node wire or a portable session/cache format.
@@ -103,6 +127,9 @@ struct Timing {
     double total_s = 0, first_block_s = 0;
     std::vector<double> block_s;       // per block, device time
     std::uint64_t rows = 0;
+    // Forms dispatched by this run, reported only after successful device synchronization.
+    Config::Forms executed_forms;
+    bool executed_moe_route_bf16 = false;
 };
 
 // One decode/verify step: rows consecutive tokens at positions [position, position + rows) continuing the session
@@ -251,7 +278,8 @@ public:
     // excluded; decode windows of the other sessions may keep running), else finalized as prefill_wait().
     std::optional<PrefillChunk> prefill_poll();
     [[nodiscard]] bool prefill_pending() const;
-    // Cohort verify window: the sessions' rows concatenated session-major (total 1..8 rows, distinct sessions). The
+    // Cohort verify window: the sessions' rows concatenated session-major (total 1..16 rows, <= 8 distinct sessions;
+    // windows of 9..16 rows, also one session's copy window, run the row-independent families prefill-shaped). The
     // row-independent families (dense A8, HC, router, shared expert, routed MoE, LM head, argmax) run once over all rows;
     // GDN cores, QSA attention, PLE tails and conv histories run per session on its own state and positions. Every row's
     // bits equal the same session's verify() alone. Results are per cohort entry. commit_cohort(keep[i]) (1 <= keep[i] <=

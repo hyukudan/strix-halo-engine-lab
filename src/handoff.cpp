@@ -44,6 +44,7 @@ double secs(Clock::time_point a, Clock::time_point b) { return std::chrono::dura
 // ---- sockets ---------------------------------------------------------------------------------------------------
 #ifdef _WIN32
 using sock_t = SOCKET;
+using sock_count_t = int;
 constexpr sock_t kBad = INVALID_SOCKET;
 void close_sock(sock_t s) { ::closesocket(s); }
 // Winsock does not wake a recv()/send() blocked on another thread on shutdown(); CancelIoEx does (the call then
@@ -63,6 +64,7 @@ void net_init() { static NetInit once; }
 int last_error() { return WSAGetLastError(); }
 #else
 using sock_t = int;
+using sock_count_t = std::size_t;
 constexpr sock_t kBad = -1;
 void close_sock(sock_t s) { ::close(s); }
 void shutdown_sock(sock_t s) { ::shutdown(s, SHUT_RDWR); }
@@ -113,7 +115,7 @@ void set_timeout(sock_t s, std::chrono::milliseconds t, bool send_side) {
 void send_all(sock_t s, const void* p, std::size_t n) {
     const char* b = static_cast<const char*>(p);
     while (n) {
-        const auto k = ::send(s, b, static_cast<int>(std::min<std::size_t>(n, std::size_t{1} << 24)), kSendFlags);
+        const auto k = ::send(s, b, static_cast<sock_count_t>(std::min<std::size_t>(n, std::size_t{1} << 24)), kSendFlags);
         if (k <= 0) throw std::runtime_error("handoff: send failed (error " + std::to_string(last_error()) + ")");
         b += k;
         n -= static_cast<std::size_t>(k);
@@ -128,7 +130,7 @@ void recv_all(sock_t s, void* p, std::size_t n) {
     static const int flags = envcfg::flag("STRIX_HANDOFF_RECV_WAITALL", true) ? MSG_WAITALL : 0;
     char* b = static_cast<char*>(p);
     while (n) {
-        const auto k = ::recv(s, b, static_cast<int>(std::min<std::size_t>(n, std::size_t{1} << 24)), flags);
+        const auto k = ::recv(s, b, static_cast<sock_count_t>(std::min<std::size_t>(n, std::size_t{1} << 24)), flags);
         if (k == 0) throw std::runtime_error("handoff: connection closed by the peer");
         if (k < 0) throw std::runtime_error("handoff: receive failed, cancelled or timed out (error " + std::to_string(last_error()) + ")");
         b += k;
@@ -517,6 +519,7 @@ struct Sender::Impl {
         Frame f;
         std::vector<bp_codec::Region> regions;
         Release release;
+        bool identity = false;  // uncoded even in a bp-v1 session
     };
     struct Output {
         Frame f;
@@ -531,6 +534,7 @@ struct Sender::Impl {
     std::deque<std::deque<Output>> outputs;  // deque: MSVC deque moves are not noexcept, a vector would copy
     bool closed = false, aborted = false, encoder_finished = false;
     std::exception_ptr error;
+    std::function<void(std::exception_ptr)> failure_notify;
     std::size_t queued_wire = 0;
     std::uint32_t next_seq = 0;
     std::uint64_t wire_total = 0, plain_total = 0, pieces = 0;
@@ -550,9 +554,10 @@ struct Sender::Impl {
 
     // First failure: latch, wake every thread, and cut the sockets so a writer blocked in send() returns too.
     void fail(std::exception_ptr e) {
+        std::function<void(std::exception_ptr)> notify;
         {
             std::lock_guard<std::mutex> g(m);
-            if (!error) error = e;
+            if (!error) { error = e; notify = failure_notify; }
             aborted = true;
             cv.notify_all();
         }
@@ -562,6 +567,9 @@ struct Sender::Impl {
             pcv.notify_all();
         }
         shutdown_all();
+        if (notify) notify(e);
+        // Workers own their in-flight pieces; queued pieces can be released now, outside m.
+        drop_queues();
     }
 
     // Hash + encode one piece (identity: hash only, the bytes stay the caller's). Runs on the encoder thread or, for a
@@ -575,7 +583,7 @@ struct Sender::Impl {
         hash_descriptor(h, out.f);
         for (const auto& r : in.regions) h.update(r.data, r.bytes);
         out.f.hash = h.digest();
-        if (codec == Codec::bp_v1 && plain > 0) {
+        if (codec == Codec::bp_v1 && plain > 0 && !in.identity) {
             out.wire = bp_codec::encode(in.regions, pool.get(), opt.encode);
             out.f.codec = static_cast<std::uint8_t>(Codec::bp_v1);
             out.f.wire_bytes = out.wire.size();
@@ -778,7 +786,8 @@ Sender::~Sender() {
     if (impl_ && !impl_->finished && !impl_->finishing) abort("sender destroyed before finish()");
 }
 
-void Sender::submit(const PieceHeader& header, std::span<const bp_codec::Region> regions, std::function<void()> release) {
+void Sender::submit(const PieceHeader& header, std::span<const bp_codec::Region> regions, std::function<void()> release,
+                    bool identity) {
     auto& I = *impl_;
     std::size_t bytes = 0;
     for (const auto& r : regions) bytes += r.bytes;
@@ -811,6 +820,7 @@ void Sender::submit(const PieceHeader& header, std::span<const bp_codec::Region>
     in.f.seq = I.next_seq++;
     in.regions.assign(regions.begin(), regions.end());
     in.release = std::move(rel);
+    in.identity = identity;
     I.inputs.push_back(std::move(in));
     I.cv.notify_all();
 }
@@ -875,25 +885,24 @@ Reply Sender::finish() {
 
 void Sender::abort(std::string_view why) noexcept {
     auto& I = *impl_;
-    {
-        std::lock_guard<std::mutex> g(I.m);
-        if (!I.error) I.error = std::make_exception_ptr(std::runtime_error("handoff: sender aborted: " + std::string(why)));
-        I.aborted = true;
-        I.closed = true;
-        I.cv.notify_all();
-    }
-    I.dead = true;
-    {
-        std::lock_guard<std::mutex> g(I.pm);
-        I.pcv.notify_all();
-    }
     // A writer may be inside a frame: cutting the sockets makes the receiver fail on a short frame instead of ever
     // accepting a partial piece. It also wakes a finish() waiting for the reply on another thread.
-    I.shutdown_all();
+    I.fail(std::make_exception_ptr(std::runtime_error("handoff: sender aborted: " + std::string(why))));
     if (I.finishing.exchange(true)) return;  // finish() is running elsewhere: it joins, releases and rethrows
     I.join_all();
     I.drop_queues();
     I.finished = true;
+}
+
+void Sender::on_failure(std::function<void(std::exception_ptr)> notify) {
+    auto& I = *impl_;
+    std::exception_ptr error;
+    {
+        std::lock_guard<std::mutex> g(I.m);
+        I.failure_notify = notify;
+        error = I.error;
+    }
+    if (error && notify) notify(error);
 }
 
 SenderStats Sender::stats() const {

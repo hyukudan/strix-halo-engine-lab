@@ -176,7 +176,7 @@ inline Environment requested_prefill_environment(Get get) {
             "STRIX_KNOWN_WINDOW_ROUTER_ROWS", "STRIX_KNOWN_PREFIX_PREFILL_ROWS",
             "STRIX_RTX_EXPORT_STATE", "STRIX_QRTX_STEP_DUMP", "STRIX_PROMPT_BATCH_ROWS", "STRIX_PREFILL_LOGITS_DIGEST",
             "STRIX_PREFILL_EXACT_FP16", "STRIX_QPF2K_T16K", "STRIX_MODEL_COPY_ALL", "STRIX_PLE_RECLAIM_DECODE_BYTES",
-            "STRIX_QSA_UNION_MERGE", "STRIX_QSA_SCORE_ROWS64", "STRIX_QSA_POOL_PACKED", "STRIX_QSA_DECODE_POOL",
+            "STRIX_QSA_UNION_MERGE", "STRIX_QSA_SCORE_ROWS64", "STRIX_QSA_SCORE_SPLIT_LOADS", "STRIX_QSA_INDEX_BAND", "STRIX_QSA_POOL_PACKED", "STRIX_QSA_DECODE_POOL",
             "STRIX_QSA_DECODE_SELECT", "STRIX_QSA_DECODE_POOL_BF16", "STRIX_QSA_DECODE_POOL_CHECK", "STRIX_PREFILL_MOE_MERGE_VEC", "STRIX_QSA_CACHE_ONLY", "STRIX_PREFILL_FINAL_CONE", "STRIX_HOST_WAIT", "STRIX_QWEN_ROUTER_BF16", "STRIX_Q6P",
             "STRIX_QPF2K_GDN_CHUNK16", "STRIX_QPF2K_GDN_CHUNK16_MAX_ROWS", "STRIX_QPF2K_GDN_COOP_LAUNCH",
             "STRIX_QSA_DECODE_FUSED_MAXIMA", "STRIX_QSA_DECODE_ATTN_V2", "STRIX_QSA_DECODE_VALUE_V2", "STRIX_MOE_R1_GLUE_FUSE", "STRIX_QWEN_DECODE_FUSE",
@@ -188,7 +188,8 @@ inline Environment requested_prefill_environment(Get get) {
             "STRIX_QPF2K_HC_RECOMPUTE_NORM", "STRIX_INTPREFILL_MOE_TUNE", "STRIX_QPF2K_MOE", "STRIX_QPF2K_MOE_SMALL", "STRIX_QPF2K_QSA_BUDGET", "STRIX_QPF2K_MOE_DIRECT_B"})
         if (!(qpf2k::pre_injected_moe_marker && std::string_view(name) == "STRIX_QPF2K_MOE_DEFAULTED"))
             if (const char* value = get(name)) env.emplace(name, value);
-    for (const char* name : {"STRIX_TURBO_ONFLY_GROUPS", "STRIX_TURBO_ONFLY_SCALE"})
+    for (const char* name : {"STRIX_TURBO_ONFLY_GROUPS", "STRIX_TURBO_ONFLY_SCALE",
+            "STRIX_IU4_ROW_REDUCTION", "STRIX_IU4_R8_SINGLE_DECODE"})
         if (const char* value = get(name)) env.emplace(name, value);
     for (const char* name : {"STRIX_BITCALC_LOGITS_OUT", "STRIX_BITCALC_FORCE_TOKENS"})
         if (get(name)) env.emplace(name, "1");
@@ -200,7 +201,7 @@ inline Environment requested_prefill_environment(Get get) {
     return env;
 }
 inline Environment requested_prefill_environment() {
-    return requested_prefill_environment([](const char* name) { return std::getenv(name); });
+    return requested_prefill_environment([](const char* name) { return ::strix::envcfg::text(name); });
 }
 inline void apply_measured_prompt_organization(Options& o) {
     o.q51_slot_parallel_down = true;
@@ -2341,6 +2342,7 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     }, o.baseline, config.gsq_owner), true);
     item("STRIX_QSA_UNION_MERGE", qpf2k::long_context_item_suppression("STRIX_QSA_UNION_MERGE", config.gsq_owner), true);
     item("STRIX_QSA_SCORE_ROWS64", qpf2k::long_context_item_suppression("STRIX_QSA_SCORE_ROWS64", config.gsq_owner), true);
+    item("STRIX_QSA_SCORE_SPLIT_LOADS", qpf2k::long_context_item_suppression("STRIX_QSA_SCORE_SPLIT_LOADS", config.gsq_owner), true);
     item("STRIX_QSA_DECODE_POOL", pool_off, true);
     item("STRIX_QSA_DECODE_SELECT", select_off, true);
     item("STRIX_QSA_DECODE_POOL_BF16", bf16_off, true);
@@ -2349,6 +2351,10 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     // Chunk-16 GDN core: enabled = auto by call length (or "1": every eligible call); same suppressions.
     item("STRIX_QPF2K_GDN_CHUNK16", qpf2k::long_context_item_suppression("STRIX_QPF2K_GDN_CHUNK16", config.gsq_owner), true);
     item("STRIX_PREFILL_MOE_MERGE_VEC", qpf2k::long_context_item_suppression("STRIX_PREFILL_MOE_MERGE_VEC", config.gsq_owner), false);
+    const auto band = config.environment.find("STRIX_QSA_INDEX_BAND");
+    out << "},\"qsa_index_band\":{\"requested\":"
+        << (band != config.environment.end() && !band->second.empty() && band->second[0] != '0' ? "true" : "false")
+        << ",\"read_once_per_process\":true,\"identity\":\"exact-selected-set\"";
     out << "},\"gdn_core_launch\":{\"requested\":";
     const auto coop = config.environment.find("STRIX_QPF2K_GDN_COOP_LAUNCH");
     if (coop != config.environment.end()) out << serve::Json(coop->second).dump();
@@ -2375,11 +2381,23 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
         << "\",\"reserved_device_bytes\":" << config.router_bf16_reservation.device_bytes
         << ",\"setup_host_bytes\":" << config.router_bf16_reservation.setup_host_bytes
         << ",\"qualification\":\"per-tensor-bit-check\",\"phase\":\"pending-model-load\"}";
-    if (o.turbo.active()) out << ",\"turbo_weights\":{\"source\":\"" << (o.turbo.active() ? "onfly" : "native") << "\",\"bits\":" << o.turbo.bits
+    out << ",\"turbo_weights\":{\"source\":\"" << (o.turbo.active() ? "onfly" : "native") << "\",\"bits\":" << o.turbo.bits
         << ",\"identity\":\"" << (o.turbo.active() ? o.turbo.identity() : std::string("native")) << "\",\"groups\":\""
         << (o.turbo.active() ? strix::onfly_i4::groups_text(o.turbo.groups) : std::string("none")) << "\",\"scale_rule\":\""
         << strix::onfly_i4::scale_rule_name(o.turbo.scale_rule) << "\",\"scope\":\""
-        << (o.turbo.active() ? std::string(strix::onfly_i4::kScopeNote) : std::string("native packs")) << "\"}";
+        << (o.turbo.active() ? std::string(strix::onfly_i4::kScopeNote) : std::string("native packs")) << "\""
+        << ",\"row_decode\":{\"requested\":\"" << core::iu4_rows::single_decode_policy_name(o.turbo.row_decode.requested)
+        << "\",\"effective\":\"" << core::iu4_rows::single_decode_policy_name(o.turbo.row_decode.effective)
+        << "\",\"enabled\":" << (o.turbo.row_decode.effective == core::iu4_rows::SingleDecodePolicy::split ? "false" : "true")
+        << ",\"reason\":\"" << o.turbo.row_decode.reason
+        << "\",\"automatic_scope\":\"rows7-8-k6144-n2560\",\"device_requirement\":\"gfx1151-wave32\""
+        << ",\"phase\":\"" << (o.turbo.row_decode.effective == core::iu4_rows::SingleDecodePolicy::automatic ?
+            "pending-device-and-shape" : "resolved") << "\"}"
+        << ",\"row_reduction\":{\"requested\":\"" << core::iu4_rows::row_reduction_name(o.turbo.row_reduction.requested)
+        << "\",\"effective\":\"" << (o.turbo.row_reduction.active ? core::iu4_rows::row_reduction_name(o.turbo.row_reduction.effective) : "native")
+        << "\",\"contract\":\"" << (o.turbo.row_reduction.active ? core::iu4_rows::row_reduction_contract(o.turbo.row_reduction.effective) : "native")
+        << "\",\"quality_gate_pending\":" << (o.turbo.row_reduction.effective == core::iu4_rows::RowReduction::canonical ? "true" : "false")
+        << ",\"scope\":\"IU4 G64/G96 reductions; native weights unchanged\"}}";
     out << ",\"hc_lowband_policy\":" << (config.environment.contains("STRIX_QPF2K_HC_LOWBAND") ?
         std::strtoul(config.environment.at("STRIX_QPF2K_HC_LOWBAND").c_str(), nullptr, 0) : 0U);
     out << ",\"hc_lowband_route\":\"exact-fp16-output-only\"";
