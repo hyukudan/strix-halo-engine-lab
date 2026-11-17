@@ -9,8 +9,9 @@
 // src/prompt_terminal_diagnostics.cpp; include/strix/session/checkpoint_io.hpp;
 // src/session/checkpoint_io.cpp. The recursive session scope detects the last
 // two additions; extending the audit's other exact scopes is separate work.
-{"CMakeLists.txt", 0x631474f71751bf4bULL},
-{"apps/minimax_rank_main.cpp", 0x24b4bb241e079920ULL},
+{"CMakeLists.txt", 0x9d538f6da012179dULL},
+{"apps/minimax_layercut.inc", 0x92d2fe37dc07e424ULL},
+{"apps/minimax_rank_main.cpp", 0xdac8d94112063ebbULL},
 {"apps/minimax_serve_main.cpp", 0x901f15e2f283f377ULL},
 {"cmake/StrixSession.cmake", 0x1fbbb6c55e80be02ULL},
 {"include/strix/bp_codec.hpp", 0x879520c3a673e0acULL},
@@ -26,7 +27,8 @@
 {"include/strix/minimax_layercut.hpp", 0xf48039f9151fe9f1ULL},
 {"include/strix/minimax_moe.hpp", 0x9be1e1331cfecd43ULL},
 {"include/strix/minimax_msa.hpp", 0xa0a6110622dc918bULL},
-{"include/strix/serve/engine.hpp", 0xa7fd82fe54e7678aULL},
+{"include/strix/prefill_headless.hpp", 0xf242052dcb4a1b87ULL},
+{"include/strix/serve/engine.hpp", 0xc7f79066a864c703ULL},
 {"include/strix/serve/session_runtime.hpp", 0xc2ab1eaeb7bfd9f2ULL},
 {"include/strix/session/backend.hpp", 0xcb84ff80943799d5ULL},
 {"include/strix/session/backend_cpu.hpp", 0xd51c05740b5ae454ULL},
