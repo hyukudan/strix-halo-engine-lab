@@ -252,11 +252,11 @@ int main(int argc, char** argv) {
         bc.copy = sources.find("copy") != std::string::npos;
         bc.chain = sources.find("chain") != std::string::npos;
         bc.hybrid = sources.find("hybrid") != std::string::npos;
-        auto mtp_chain = S.make_chain();
+        sp::ChainDrafter* mtp_chain = S.has_chain() ? &S.make_chain() : nullptr;
         OracleChain oracle_chain(ref, oracle);
         sp::ChainDrafter* chain = nullptr;
         if (oracle >= 0.0) chain = &oracle_chain;
-        else if (S.has_chain()) chain = &mtp_chain;
+        else chain = mtp_chain;
         if (sources == "none") { bc.copy = bc.chain = bc.hybrid = false; }
         sp::BlockDrafter drafter(bc, chain);
         if (seed_costs) {  // engine's measured verify wall per window shape (commit full), 3 reps each
@@ -324,7 +324,7 @@ int main(int argc, char** argv) {
                     (unsigned long long)by_source[2], mean_e, quantile(per_step, 0.5), quantile(per_step, 0.9),
                     1000.0 * double(out.size() - 1) / wall, wall / double(std::max<std::size_t>(per_step.size(), 1)), best,
                     (unsigned long long)drafter.hybrid_blocks, (unsigned long long)drafter.hybrid_ext_accepted,
-                    (unsigned long long)drafter.hybrid_ext_proposed, (unsigned long long)S.chain_calls, (unsigned long long)S.chain_rows);
+                    (unsigned long long)drafter.hybrid_ext_proposed, (unsigned long long)S.chain_calls(), (unsigned long long)S.chain_rows());
         std::printf("stats %s\n", st.json().c_str());
         if (!ref.empty()) {
             std::printf("EXACT: %s (%zu tokens compared, %zu mismatches)%s\n", bad == 0 ? "PASS" : "FAIL", std::min(out.size(), ref.size()), bad,

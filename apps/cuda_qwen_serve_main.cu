@@ -683,12 +683,16 @@ private:
         if (job.on_progress) job.on_progress({serve::GenerationPhase::decode, s.n, 0, s.n});
         s.phase = Phase::decode;
         s.ctx.reset();
-        if (mtp_ && context_mode_ != qc::ContextMode::off) {
+        // request field "ngram_draft" (shared serve API): false = no context drafter for this request, true = the
+        // configured mode (first when the server's is off); unset = the server's mode
+        const qc::ContextMode mode = !job.ngram_draft ? context_mode_
+            : !*job.ngram_draft ? qc::ContextMode::off : context_mode_ != qc::ContextMode::off ? context_mode_ : qc::ContextMode::first;
+        if (mtp_ && mode != qc::ContextMode::off) {
             // the drafter's context is what the session holds; the pending (last prompt) token joins at the first step
-            s.ctx = std::make_unique<qc::ContextDraft>(context_mode_);
+            s.ctx = std::make_unique<qc::ContextDraft>(mode);
             s.ctx->drafter.reset(std::span<const std::uint32_t>(job.prompt.data(), s.n - 1));
         }
-        s.stream = qc::Stream{s.session, job.prompt[s.n - 1], s.n - 1, job.draft_depth_max, s.ctx.get()};
+        s.stream = qc::Stream{s.session, job.prompt[s.n - 1], s.n - 1, job.draft_depth_max, s.ctx.get(), job.copy_rows};
         s.st.finish = "length";
         if (job.max_tokens == 0) finish(s, {}, "length");
     }
@@ -804,10 +808,12 @@ private:
         std::string extra = head;
         for (std::size_t i = 0; i < s.emitted.size() && i < 4096; ++i) extra += (i ? "," : "") + std::to_string(s.emitted[i]);
         extra += "]";
-        if (s.ctx) extra += std::string(",\"context_draft\":\"") + qc::context_mode_name(context_mode_) + "\",\"copy_first_steps\":" +
+        if (s.ctx) extra += std::string(",\"context_draft\":\"") + qc::context_mode_name(s.ctx->mode) + "\",\"copy_first_steps\":" +
             std::to_string(s.ctx->copy_first_steps) + ",\"context_extended_steps\":" + std::to_string(s.ctx->extended_steps) +
             ",\"context_rows\":" + std::to_string(s.ctx->context_rows) + ",\"copy_first_accepted\":" + std::to_string(s.ctx->context_accepted) +
-            ",\"context_host_us\":" + std::to_string(static_cast<long long>(s.ctx->host_us));
+            ",\"context_host_us\":" + std::to_string(static_cast<long long>(s.ctx->host_us)) +
+            ",\"copy_wide_steps\":" + std::to_string(s.ctx->wide_steps) + ",\"copy_wide_rows\":" + std::to_string(s.ctx->wide_rows) +
+            ",\"copy_wide_accepted\":" + std::to_string(s.ctx->wide_accepted);
         extra += ",\"prefix_cached\":" + std::to_string(st.cached_tokens) + ",\"prefix_restore_ms\":" + std::to_string(s.prefix_restore_ms)
             + ",\"prefix_capture_ms\":" + std::to_string(s.prefix_capture_ms) + "}";
         st.engine_extra.emplace_back("rtx", extra);
@@ -861,6 +867,10 @@ int main(int argc, char** argv) {
         std::cerr << "strix-cuda-qwen-serve: loading " << o.engine.model_gguf << std::endl;
         if (!o.engine.mtp_sidecar_gguf.empty() && o.mtp_depth > 0) std::cerr << "strix-cuda-qwen-serve: " << strix::mtp_depth_state_line(o.min_p) << ", mtp_depth=" << o.mtp_depth
             << ", context_draft=" << qc::context_mode_name(qc::context_mode_default())
+            << ", copy_rows=" << qc::copy_rows_default() << ", copy_wide=" << (qc::copy_wide_switch() < 0 ? "auto" : qc::copy_wide_switch() ? "on" : "off")
+            << " (effective " << ((qc::copy_wide_switch() < 0 ? qc::copy_wide_pays(qc::copy_rows_default(), qc::copy_wide_model()) : qc::copy_wide_switch() == 1) ? "on" : "off")
+            << ": wide " << qc::copy_wide_model().wide_ms << " ms vs 8-row " << qc::copy_wide_model().narrow_a_ms + 8 * qc::copy_wide_model().narrow_b_ms
+            << " ms), copy_wide_accept=" << qc::copy_wide_accept_default()
             << ", context_draft_effective=" << qc::context_mode_name(o.http_slots > 1 ? qc::context_mode_default() : qc::ContextMode::off)
             << ", context_draft_applicable=" << (o.http_slots > 1 ? "cohort" : "no (single-slot loop)") << std::endl;
         qp::Prefill engine(o.engine);

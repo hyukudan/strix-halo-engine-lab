@@ -59,6 +59,10 @@ struct MetadataEntry {
 // Strix NVFP4 tile pack (converted weights, see strix::cuda_core nvfp4): dimensions [in, out], data is out/16 x in/128 records of
 // 1152 bytes (the cuda_core tile layout). Not the upstream GGML NVFP4 layout; the id is outside the upstream range.
 inline constexpr std::uint32_t kNvfp4TilePack = 43;
+// Private (non-ggml) tensor type: shared IU4 g64 dense projection, N outputs x K inputs (core/iu4.hpp): tiles
+// [K/16][N/16][column within tile][K within tile / 2] signed nibbles, then FP16 scales [N][K/64]. Geometry per row of K:
+// K/64 blocks of 64 elements, 34 bytes (32 nibble bytes + 2 scale bytes), N % 64 == 0.
+inline constexpr std::uint32_t type_strix_iu4_g64 = 200;
 
 struct TensorTypeGeometry {
     std::uint64_t block_elements = 0;

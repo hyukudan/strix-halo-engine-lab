@@ -2559,7 +2559,8 @@ struct Engine::Impl {
         std::size_t c0 = 0, c = 0, chunks = 0, m = 1, rows = 0;  // next chunk's first row / index; the open unit's members, rows
         unsigned first_layer = 0;
         Engine::CutFetch cut_fetch;
-        unsigned layer = 0;                                      // next layer of the open chunk / group (0: not started)
+        bool cut_link = false;                                   // rank 0's fetched rows go to rank 1 over the pair link
+        unsigned layer = 0;                                     // next layer of the open chunk / group (0: not started)
         std::uint64_t output_fnv = 14695981039346656037ULL;
         strix::core::LayerSet idx_wmma_executed;  // successful submissions, published only after the completion fence
         Engine::PfTaskId id = 0, parent = 0;
@@ -2608,15 +2609,25 @@ struct Engine::Impl {
     }
 
     void prefill_begin_cut(std::uint32_t slot, std::span<const std::uint32_t> toks, std::uint64_t pos0,
-                           unsigned first_layer, Engine::CutFetch fetch) {
+                           unsigned first_layer, Engine::CutFetch fetch, bool link_relay) {
         if (first_layer == 0 || first_layer >= kLayers || !fetch)
             throw std::invalid_argument("prefill_begin_cut: first_layer / fetch");
         prefill_begin(slot, toks, pos0);
         task.first_layer = first_layer;
         task.cut_fetch = std::move(fetch);
+        task.cut_link = link_relay;
     }
     void fetch_cut(std::uint64_t row0, std::size_t rows) {
-        task.cut_fetch(row0, rows, h, nullptr);
+        if (!task.cut_link || opt.rank == 0) task.cut_fetch(row0, rows, h, nullptr);
+        if (task.cut_link) {
+            // Rank 0's rows to rank 1 on the null stream, after rank 0's H2D and before the norm below; the reverse
+            // direction of the symmetric exchange carries hn, which that norm rewrites on both ranks.
+            dist::Tag tag;
+            tag.kind = static_cast<std::uint32_t>(dist::TagKind::control);
+            tag.request = controls++;
+            comm.exchange(nullptr, opt.rank == 0 ? static_cast<const void*>(h) : static_cast<const void*>(hn),
+                          opt.rank == 0 ? static_cast<void*>(hn) : static_cast<void*>(h), rows * kHidden * sizeof(float), tag);
+        }
         // Exactly post_exchange's norm: 256 strided fmaf chains, tree 128..1, IEEE sqrt/div,
         // (h*r)*(1+w). No residual addition: h already contains both producer partials.
         hipLaunchKernelGGL(rmsnorm_gemma_kernel, dim3(static_cast<unsigned>(rows)), dim3(256), 0, nullptr,
@@ -3641,9 +3652,9 @@ void Engine::prefill_begin(std::uint32_t slot, std::span<const std::uint32_t> to
     impl_->prefill_begin(slot, tokens, pos0);
 }
 void Engine::prefill_begin_cut(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0,
-                               unsigned first_layer, CutFetch fetch) {
+                               unsigned first_layer, CutFetch fetch, bool link_relay) {
     impl_->no_task("prefill_begin_cut");
-    impl_->prefill_begin_cut(slot, tokens, pos0, first_layer, std::move(fetch));
+    impl_->prefill_begin_cut(slot, tokens, pos0, first_layer, std::move(fetch), link_relay);
 }
 bool Engine::prefill_resume(unsigned layers, std::uint32_t* next) { return impl_->prefill_resume(layers, next); }
 void Engine::prefill_cancel() { impl_->prefill_cancel(); }

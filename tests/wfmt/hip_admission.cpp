@@ -45,6 +45,58 @@ void addressing() {
     s.k_offset_bytes=0;w.has_byte_strides=true;w.byte_strides[0]=256;
     expect(!validate_launch(w,s,1,2,2),"declared stride mismatch admitted");
 }
+WeightView trellis_tensor(std::uint64_t n,std::uint64_t k,unsigned bits,bool gemma) {
+    WeightView w{};
+    w.storage={gemma?"exl3.gemma.transport":"exl3.mul1.tiles16",1};
+    w.shape={{n,k,0,0},2};
+    w.parameters.bits=bits;
+    const std::uint64_t trellis=(n/16)*(k/16)*32*bits;
+    w.payload.range.bytes=gemma?2*(n+k)+trellis:trellis;
+    if(!gemma) {
+        w.sidecars.push_back({"input_scale",Scalar::f16,{{{k,0,0,0}},1},{nullptr,{0,2*k}}});
+        w.sidecars.push_back({"output_scale",Scalar::f16,{{{n,0,0,0}},1},{nullptr,{0,2*n}}});
+    }
+    return w;
+}
+// Heterogeneous experts: every resident expert is admitted against its own sidecars, the launch spans the whole ring, and a
+// nominal packed row (K * bits / 8, Gemma's LinearView::row_bytes) is never accepted as a stride.
+void trellis() {
+    // Exact payloads and sidecars, with matching launches: only H128 tails fail.
+    for(bool gemma:{false,true})
+        for(const std::uint64_t n:{16ULL,128ULL,256ULL,272ULL})
+            for(const std::uint64_t k:{16ULL,128ULL,256ULL,272ULL}) {
+                const auto w=trellis_tensor(n,k,gemma?4U:3U,gemma);
+                const LaunchShape shape{1,n,k,0,k,n,0};
+                expect(bool(validate_trellis_launch(w,shape,gemma))==(n%128U==0 && k%128U==0),
+                       "matching trellis shape must contain complete H128 blocks");
+            }
+    LaunchShape s{129,256,256,0,256,256,0};
+    for(const bool gemma:{false,true}) {
+        auto w=trellis_tensor(256,256,4,gemma);
+        expect(bool(validate_trellis_launch(w,s,gemma)),"whole-tensor trellis launch rejected");
+        for(const std::uint64_t rows:{1ULL,7ULL,129ULL,257ULL}) {auto c=s;c.m=rows;expect(bool(validate_trellis_launch(w,c,gemma)),"chunked row count rejected");}
+        auto bad=s;bad.row_stride_bytes=256*4/8;
+        expect(!validate_trellis_launch(w,bad,gemma),"nominal row_bytes accepted as a stride");
+        bad=s;bad.k_offset_bytes=32;expect(!validate_trellis_launch(w,bad,gemma),"trellis K prefix admitted");
+        bad=s;bad.n=128;expect(!validate_trellis_launch(w,bad,gemma),"trellis output slice admitted");
+        bad=s;bad.k=128;expect(!validate_trellis_launch(w,bad,gemma),"trellis K slice admitted");
+        bad=s;bad.m=0;expect(!validate_trellis_launch(w,bad,gemma),"zero rows admitted");
+        auto t=w;--t.payload.range.bytes;expect(!validate_trellis_launch(t,s,gemma),"truncated payload admitted");
+        t=w;++t.payload.range.bytes;expect(!validate_trellis_launch(t,s,gemma),"oversized payload admitted");
+        t=w;t.parameters.bits=7;if(gemma) expect(!validate_trellis_launch(t,s,gemma),"unsupported Gemma bits admitted");
+        t=w;t.storage={gemma?"exl3.mul1.tiles16":"exl3.gemma.transport",1};expect(!validate_trellis_launch(t,s,gemma),"wrong transport admitted");
+        t=trellis_tensor(272,256,4,gemma);expect(!validate_trellis_launch(t,s,gemma),"shape differs from launch");
+    }
+    // mul1: each expert needs its own sidecars; one expert's sidecars never stand in for another's.
+    auto a=trellis_tensor(256,256,3,false),b=a;
+    b.sidecars.pop_back();expect(!validate_trellis_launch(b,s,false),"expert without svh admitted");
+    b=a;b.sidecars[0].data.range.bytes=2*128;expect(!validate_trellis_launch(b,s,false),"short suh admitted");
+    b=a;b.sidecars.push_back(a.sidecars[0]);expect(!validate_trellis_launch(b,s,false),"duplicate suh admitted");
+    b=a;b.sidecars[1].scalar=Scalar::bf16;expect(!validate_trellis_launch(b,s,false),"wrong svh scalar admitted");
+    // Gemma payload carries suh | svh itself.
+    auto g=trellis_tensor(256,256,4,true);g.sidecars.push_back(a.sidecars[0]);
+    expect(!validate_trellis_launch(g,s,true),"Gemma transport with canonical sidecars admitted");
+}
 void q6_span() {
     auto w=tensor(65536,131072,32,26);
     LaunchShape s{1,65536,131072,106496,131072,65536,0};
@@ -72,7 +124,7 @@ void bytes() {
 int main(int argc,char** argv) try {
     if(argc!=2) throw std::runtime_error("expected addressing, q6-span or bytes");
     const std::string_view name=argv[1];
-    if(name=="addressing") addressing();
+    if(name=="addressing") {addressing();trellis();}
     else if(name=="q6-span") q6_span();
     else if(name=="bytes") bytes();
     else throw std::runtime_error("unknown test");
