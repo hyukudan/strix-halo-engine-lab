@@ -68,7 +68,9 @@ void mla_attention_rows(const dev::DsaSlot& slot, const std::uint32_t* tokens, c
                         hipStream_t s);
 void mla_attention_rows(const dev::DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
                         const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
-                        hipStream_t s, unsigned query_window);
+                        hipStream_t s, unsigned query_window, unsigned max_keys = ~0U);
+// max_keys: host upper bound of every row's list length (attn_core causal_list_bound of the chunk end; ~0U = unknown,
+// the list capacity kMaxTokens). Selects the FAST flash core's Pf loads only (bitwise either way).
 
 // Scores v7 (heads 32; heads 64 runs v5) and o-bar v10 are the defaults (STRIX_GLM_PF_SCORES=6 / STRIX_GLM_PF_OBAR=7
 // restore the previous ones); STRIX_GLM_PF_OBAR=6 opts into o-bar v6 (exact, slower: not a default).
