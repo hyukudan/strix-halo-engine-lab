@@ -1,3 +1,4 @@
+#include "strix/cuda/core/decode_rows.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -37,8 +38,8 @@ int cudaStreamEndCapture(int, cudaGraph_t* out) {
 void cudaGraphDestroy(cudaGraph_t) { --graphs; }
 int cudaGetDevice(int* dev) { *dev = 0; return cudaSuccess; }
 int cudaDeviceGetAttribute(int* count, int, int) { *count = 80; return cudaSuccess; }
-namespace strix::envcfg { bool flag(const char*, bool value) { return value; } }
 bool decode_rows_enabled() { return true; }
+namespace core = strix::cuda::core;  // production calls core::decode_rows_max() (the real host-safe header)
 struct Workspace { unsigned max_blocks = 65536, chunk_rows = 8; };
 struct MultiShape { unsigned rows = 0, pool_grid = 0, score_grid = 0, slot_runs = 0; bool head_all = false; };
 namespace qsa {

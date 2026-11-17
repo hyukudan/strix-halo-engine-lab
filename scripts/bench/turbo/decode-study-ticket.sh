@@ -23,7 +23,7 @@ PORT=$((18950 + RANDOM % 40))
 echo "== $TAG $(date -Is) $(hostname) bin $(sha256sum "$BIN" | cut -c1-16) env [$E] arms $ARMS" > "$OUT/log.txt"
 ( while :; do echo "$(date +%s.%N) $(grep -h "\*" /sys/class/drm/card*/device/pp_dpm_sclk 2>/dev/null | head -1) busy=$(head -n1 /sys/class/drm/card*/device/gpu_busy_percent 2>/dev/null | head -1) mem_kb=$(awk '/MemAvailable:/{print $2}' /proc/meminfo)"; sleep 0.25; done ) > $OUT/clk.txt 2>/dev/null &
 CP=$!
-SRVENV="STRIX_MTP_DRAFT_LOG=1 STRIX_CYCLE_TIMING=1 STRIX_SERVE_RECEIPT=1 STRIX_MTP_BATCH_LOG=2 STRIX_HTTP_EAGER_SLOTS=${SLOTS:-8} $E" SRVTIME=$((LEFT-($(date +%s)-T0))) bash "$ADAPTER" "$BIN" "$PORT" "$OUT/srv.err" --http-batch 16 ${XARGS:-} &
+SRVENV="STRIX_MTP_DRAFT_LOG=1 STRIX_CYCLE_TIMING=1 STRIX_SERVE_RECEIPT=1 STRIX_MTP_BATCH_LOG=2 STRIX_HTTP_EAGER_SLOTS=${SLOTS:-8} $E" SRVTIME=$((LEFT-($(date +%s)-T0))) bash "$ADAPTER" "$BIN" "$PORT" "$OUT/srv.err" --http-batch "${TURBODEC_HTTP_BATCH:-16}" ${XARGS:-} &
 SP=$!
 python3 -I "$SCRIPT_DIR/decode-study-startup-sampler.py" "$SP" "$BIN" "$OUT/startup-proc.jsonl" &
 PP=$!

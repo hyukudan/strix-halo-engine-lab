@@ -609,6 +609,13 @@ failure may prevent final report delivery; inspect retained evidence privately.
 the state handed to the pair, the pair alone, the CUDA device alone), cold and warm, in one detached run with a phase
 breakdown, GPU clocks per token and a host-node link probe (RTT and useful throughput both ways).
 
+### FAST prefill router product (GLM, MiniMax)
+
+[`scripts/bench/router-wmma/`](../scripts/bench/router-wmma/) holds the device unit gate and timing (`unit.sh BUILD_DIR
+OUT_DIR`: exact vs every WMMA launch form, overflow fallback rows, GPU clock and MemAvailable), the GLM TP2 scored
+prefill (`glm_score.sh PEER BIN MODEL PROMPT OUT [ENV...]`, last 256 rows) and its FAST gate comparison
+(`score_cmp.py REF CAND PROMPT`: KL <= 0.02, top-1 >= 93 %, dNLL <= +0.01).
+
 ### MiniMax pair: chunk-invariant linear order
 
 `STRIX_MMX_PF_ORDER=invariant` is the default (table item `pf_order`; `adaptive` is the off switch and the

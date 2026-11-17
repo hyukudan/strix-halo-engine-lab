@@ -69,6 +69,7 @@
 #include "strix/dist/communicator.hpp"
 #include "xport/borrowed_transport.hpp"
 #include "strix/bp_codec.hpp"
+#include "strix/pair/state_relay.hpp"
 #include "strix/minimax_layercut.hpp"
 #include <condition_variable>
 #include <mutex>
@@ -96,6 +97,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <functional>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -372,8 +374,15 @@ int listen_on(std::uint16_t port) {
     if (::bind(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 || ::listen(s, 4) != 0) throw std::runtime_error("offload-listen: bind/listen");
     return s;
 }
+// relay(local, remote, seq): one symmetric host exchange with the peer rank (remote empty = not wanted).
+using RelayX = std::function<void(std::span<const std::byte>, std::span<std::byte>, std::uint64_t)>;
+
+// Frames 'MMRX' / 'MMRB' carry the rank's whole K/V/IK block; with index keys once (strix/pair/state_owners.hpp, the
+// producer's --ik-once) 'MMRI' / 'MMRJ': rank 0 gets the whole block and relays the IK part to rank 1 on the pair link
+// (strix/pair/state_relay.hpp, hash checked), rank 1 gets the K/V head only. Both ranks agree on the mode at the first
+// frame. The imported bytes are the same in both modes; "state digest" folds every imported block to show it.
 std::vector<std::uint32_t> listen_session(mm::Engine& eng, int lfd, const std::string& name, const std::vector<std::uint32_t>& prompt, int steps,
-                                          const std::string& out_dir, unsigned req) {
+                                          const std::string& out_dir, unsigned req, const RelayX& relay, std::size_t relay_chunk) {
     const std::size_t rows = prompt.size() - 1;
     std::printf("rank %u offload-listen %s #%u: waiting\n", eng.rank(), name.c_str(), req);
     std::fflush(stdout);
@@ -387,29 +396,59 @@ std::vector<std::uint32_t> listen_session(mm::Engine& eng, int lfd, const std::s
     static strix::bp_codec::WorkerPool pool(4);
     const auto t0 = Clock::now();
     double t_first = -1, t_import = 0, t_decode = 0;
-    std::uint64_t wire_bytes = 0;
+    std::uint64_t wire_bytes = 0, digest = 0, seq = 1;
     unsigned layers = 0;
+    int mode = -1;  // -1 = not agreed yet, 0 = per-rank copies, 1 = index keys once
+    double t_relay = 0;
+    const std::size_t kv = rows * 1024;
+    const auto prompt_hash = strix::pair::state::state_hash(reinterpret_cast<const std::uint8_t*>(prompt.data()), prompt.size() * sizeof(prompt[0]));
+    const auto name_hash = strix::pair::state::state_hash(reinterpret_cast<const std::uint8_t*>(name.data()), name.size());
     for (;;) {
         std::uint32_t hdr32[2];
         std::uint64_t hdr64[2];
         read_full(fd, hdr32, 8);
         read_full(fd, hdr64, 16);
-        const bool bp = hdr32[0] == 0x42524d4dU;
-        if (hdr32[0] != 0x58524d4dU && !bp) throw std::runtime_error("offload-listen: bad frame");
-        if (hdr32[1] == 0xffffffffU) break;
-        if (hdr64[0] != rows || (!bp && hdr64[1] != block.size())) throw std::runtime_error("offload-listen: row count differs from the prompt");
+        const std::uint32_t m = hdr32[0];
+        const bool bp = m == 0x42524d4dU || m == 0x4A524d4dU, once = m == 0x49524d4dU || m == 0x4A524d4dU;
+        if (m != 0x58524d4dU && m != 0x42524d4dU && !once) throw std::runtime_error("offload-listen: bad frame");
+        const bool end = hdr32[1] == 0xffffffffU;
+        if (mode < 0) {  // both ranks at their first frame: the same mode or both refuse
+            if (once && !relay) throw std::runtime_error("offload-listen: index keys once needs the pair link");
+            const std::uint64_t mine[1] = {once ? 1U : 0U};
+            std::uint64_t peer[1] = {2};
+            if (relay) relay(std::as_bytes(std::span(mine)), std::as_writable_bytes(std::span(peer)), seq++);
+            if (relay && peer[0] != mine[0])
+                throw std::runtime_error("offload-listen: the ranks got different hand-off modes (index keys once on one rank only)");
+            mode = once ? 1 : 0;
+        } else if (!end && (mode == 1) != once) {
+            throw std::runtime_error("offload-listen: hand-off mode changed inside a session");
+        }
+        if (mode == 1)
+            strix::pair::state::relay_agree({req, prompt_hash, hdr32[1], 0, hdr64[0], name_hash}, relay, seq++);
+        if (end) break;
+        // Plain bytes this rank receives: the whole block, or the K/V head on rank 1 with index keys once.
+        const std::size_t plain = once && eng.rank() == 1 ? kv : block.size();
+        if (hdr64[0] != rows || (!bp && hdr64[1] != plain)) throw std::runtime_error("offload-listen: row count differs from the prompt");
         wire_bytes += hdr64[1];
+        const std::span<std::uint8_t> dst(block.data(), plain);
         if (bp) {
             wire.resize(hdr64[1]);
             read_full(fd, wire.data(), wire.size());
             const auto d0 = Clock::now();
-            if (strix::bp_codec::decoded_size(wire) != block.size()) throw std::runtime_error("offload-listen: bp-v1 size differs");
-            strix::bp_codec::decode(wire, block, &pool);
+            if (strix::bp_codec::decoded_size(wire) != plain) throw std::runtime_error("offload-listen: bp-v1 size differs");
+            strix::bp_codec::decode(wire, dst, &pool);
             t_decode += secs(d0, Clock::now());
         } else {
-            read_full(fd, block.data(), block.size());
+            read_full(fd, dst.data(), dst.size());
         }
         if (t_first < 0) t_first = secs(t0, Clock::now());
+        if (once) {  // rank 0 -> rank 1: the IK part of the block, [rows * 1024, rows * 1280)
+            const auto r0 = Clock::now();
+            seq = strix::pair::state::relay_piece(eng.rank() == 0, true, std::span<std::uint8_t>(block.data() + kv, block.size() - kv),
+                                                  relay_chunk, relay, strix::pair::state::state_hash, seq);
+            t_relay += secs(r0, Clock::now());
+        }
+        digest = (digest * 0x100000001B3ULL) ^ strix::pair::state::state_hash(block.data(), block.size());
         const auto a = Clock::now();
         eng.import_layer(0, hdr32[1], 0, rows, block.data());
         t_import += secs(a, Clock::now());
@@ -430,11 +469,11 @@ std::vector<std::uint32_t> listen_session(mm::Engine& eng, int lfd, const std::s
         const mm::Row row{0, gen.back(), prompt.size() + gen.size() - 1};
         gen.push_back(eng.step({&row, 1})[0]);
     }
-    std::printf("rank %u offload-listen %s #%u: %u layers, %.1f MB on the wire (%.3f of plain), first frame %.3f s, all received %.3f s "
-                "after accept, decode %.3f s, import %.3f s, last row %.3f s; tokens fnv %016llx ids:",
-                eng.rank(), name.c_str(), req, layers, static_cast<double>(wire_bytes) / 1e6,
+    std::printf("rank %u offload-listen %s #%u: %u layers, mode %s, %.1f MB on the wire (%.3f of plain), first frame %.3f s, all received "
+                "%.3f s after accept, decode %.3f s, relay %.3f s, import %.3f s, last row %.3f s; state digest %016llx; tokens fnv %016llx ids:",
+                eng.rank(), name.c_str(), req, layers, mode == 1 ? "ik-once" : "per-rank", static_cast<double>(wire_bytes) / 1e6,
                 static_cast<double>(wire_bytes) / static_cast<double>(std::max<std::size_t>(1, layers * block.size())), t_first, t_recv, t_decode,
-                t_import, t_last,
+                t_relay, t_import, t_last, static_cast<unsigned long long>(digest),
                 static_cast<unsigned long long>(fnv(gen.data(), gen.size() * 4)));
     for (auto t : gen) std::printf(" %u", t);
     std::printf("\n");
@@ -1987,6 +2026,16 @@ int main(int argc, char** argv) {
             }
             hs = fnv(g.data(), g.size() * 4, hs);
         }
+        // The pair link for the hand-off relay (index keys once): the communicator's host path on its own control tag
+        // space ("MI"), between engine calls, so the transport is idle. Chunks fit the communicator's buffers.
+        const std::size_t relay_chunk = std::min<std::size_t>(comm.max_bytes(), std::size_t{32} << 20);
+        const RelayX relay = [&comm](std::span<const std::byte> out, std::span<std::byte> in, std::uint64_t seq) {
+        strix::dist::Tag tag;
+        tag.kind = static_cast<std::uint32_t>(strix::dist::TagKind::control);
+        tag.layer = 0x4D490000U;  // "MI": hand-off relay
+        tag.request = seq;
+        comm.exchange_host(out, in, tag);
+        };
         for (const auto& s : offload_listens) {  // NAME:PROMPT:PORT:STEPS:COUNT
             std::vector<std::string> f;
             for (std::size_t p = 0, q; p <= s.size(); p = q + 1) {
@@ -1998,7 +2047,7 @@ int main(int argc, char** argv) {
             const auto prompt = read_u32(f[1]);
             const int lfd = listen_on(static_cast<std::uint16_t>(std::stoi(f[2]) + static_cast<int>(opt.rank)));
             for (unsigned i = 0; i < static_cast<unsigned>(std::stoi(f[4])); ++i) {
-                const auto g = listen_session(eng, lfd, f[0], prompt, std::stoi(f[3]), out_dir, i);
+                const auto g = listen_session(eng, lfd, f[0], prompt, std::stoi(f[3]), out_dir, i, relay, relay_chunk);
                 const auto it = offloaded.find(f[0]);
                 if (it != offloaded.end()) {
                     std::size_t first = 0;

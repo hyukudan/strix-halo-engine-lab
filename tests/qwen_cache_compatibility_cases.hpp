@@ -48,7 +48,9 @@ inline std::string without_added_prefill_reports(std::string text) {
             "compact_stage_images_requested", "hc_lowband_policy", "hc_lowband_route", "index_batch", "qwen_router_bf16",
             "early_setup", "eager_code_load", "hip_enable_deferred_loading", "t16k_policy", "profile", "prefill_moe_route_bf16",
             "prefill_storage_identity", "prefill_storage_identity_hash",
-            "prefill_moe_route_bf16_reason", "prefill_fast_components"}) {
+            "prefill_moe_route_bf16_reason", "prefill_fast_components",
+            // Reported for native weights too since the IU4 row-decode/reduction resolver report (additive).
+            "turbo_weights"}) {
         const auto needle = std::string("\"") + key + "\":";
         const auto start = text.find(needle);
         if (start == std::string::npos) continue;

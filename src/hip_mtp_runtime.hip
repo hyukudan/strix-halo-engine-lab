@@ -877,6 +877,32 @@ void HipMtpRuntime::enable_draft_chain(HipMtpDraftHeadConfig config,bool exact) 
         }
         hip_check_message(hipStreamSynchronize(static_cast<hipStream_t>(p.owner->stream())),"MTP draft HC injection copies");
     }
+    if(envcfg::flag("STRIX_MTP_WEIGHT_LOG",false)) {
+        const auto& t=p.owner->tensors();const auto& binding=p.owner->shared_target();
+        const auto target_sha=model_content_identity_hex(binding.target_model_content_identity);
+        const auto sidecar_sha=model_content_identity_hex(binding.sidecar_model_content_identity);
+        const auto log=[&](const char* group,const MtpTensorView& v,const char* special=nullptr) {
+            if(!v.manifest || !v.runtime)return;
+            const bool shared=binding.target_runtime && std::any_of(binding.target_runtime->tensors.begin(),binding.target_runtime->tensors.end(),
+                [&](const auto& r){return r.address==v.runtime->address && r.bytes==v.runtime->bytes;});
+            const bool q4=hip_mtp_draft_q4(reinterpret_cast<const void*>(v.runtime->address))!=nullptr;
+            std::fprintf(stderr,"mtp-weight path=draft group=%s tensor=%s source=%s source_sha256=%s ggml=%u effective=%s bytes=%llu\n",
+                group,v.manifest->name.c_str(),shared?"shared-target":"sidecar",shared?target_sha.c_str():sidecar_sha.c_str(),
+                v.manifest->ggml_type,special?special:(q4?"q4_0-draft-v1":"native"),static_cast<unsigned long long>(v.runtime->bytes));
+        };
+        log("embedding",t.embedding);log("input_norm",t.enorm);log("hidden_norm",t.hnorm);log("input_projection",t.eh_projection);
+        log("attention_hyper_norm",t.attention_hc_norm);log("attention_hyper_down",t.attention_hc_down);log("attention_hyper_up",t.attention_hc_up);
+        log("attention_hyper_inject",t.attention_hc_inject,exact?"native":"native-q8-dequant-fp32");
+        log("query",t.query);log("key",t.key);log("value",t.value);log("attention_output",t.attention_output);
+        log("query_norm",t.query_norm);log("key_norm",t.key_norm);log("index_query",t.index_query);log("index_key",t.index_key);
+        log("index_query_norm",t.index_query_norm);log("index_key_norm",t.index_key_norm);
+        log("mlp_hyper_norm",t.mlp_hc_norm);log("mlp_hyper_down",t.mlp_hc_down);log("mlp_hyper_up",t.mlp_hc_up);
+        log("mlp_hyper_inject",t.mlp_hc_inject,exact?"native":"native-q8-dequant-fp32");
+        log("router",t.router);log("expert_gate",t.expert_gate);log("expert_up",t.expert_up);log("expert_down",t.expert_down);
+        log("shared_gate",t.shared_gate);log("shared_up",t.shared_up);log("shared_down",t.shared_down);log("shared_scalar_gate",t.shared_scalar_gate);
+        log("head_norm",t.head_norm);log("head_down",t.head_down);log("head_up",t.head_up);
+        log("lm_head",t.lm_head,config.q4?"q4_0-head-gather-v1":(config.full?"native-full":"native-subset-gather"));
+    }
     p.draft=std::make_unique<HipMtpDraftHead>(reinterpret_cast<const void*>(head.runtime->address),std::move(config),p.owner->stream());
 }
 const HipMtpDraftHead* HipMtpRuntime::draft_head() const noexcept {return impl_->draft.get();}
