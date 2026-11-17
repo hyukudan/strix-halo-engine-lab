@@ -101,7 +101,7 @@ int main(int argc, char** argv) try {
     if (prompt.empty()) throw std::invalid_argument("empty prompt");
     strix::core::require_capacity(prompt.size(), gen, 0xFFFFFFFFULL);
     const auto required = prompt.size() + gen;
-    if (!maxpos) maxpos = static_cast<unsigned>(required);
+    if (!maxpos) maxpos = static_cast<unsigned>(required) + HipEngine::max_rows();  // + one verify window (speculation)
     strix::core::require_capacity(0, required, maxpos);
 
     HipEngineOptions opt;
