@@ -106,10 +106,6 @@ inline bool take(int argc, char** argv, int& i, Request& r) {
         const auto v = next();
         const auto n = number(a, v, qp::kMaxBlockRows);
         c.final_block_rows = static_cast<std::uint32_t>(n);
-    } else if (a == "--mtp-defer-prompt") {  // Config::defer_prompt_mtp: the first token before the prompt's MTP rows
-        const auto v = next();
-        if (v != "on" && v != "off") throw std::invalid_argument("--mtp-defer-prompt is on or off");
-        c.defer_prompt_mtp = v == "on";
     } else if (a == "--blocks") {
         r.blocks_typed = true;
         c.block_schedule.clear();
@@ -134,9 +130,15 @@ inline bool take(int argc, char** argv, int& i, Request& r) {
 inline void apply(const cp::Choice& choice, qp::Config& config) {
     config.forms = {choice.hc_mma, choice.mtp_mma, choice.qsa_mma, choice.moe_mma};
     config.moe_route_bf16 = choice.moe_route_bf16;  // explicit: the resolver already read the environment
-    // TURBO expert row: an explicit --expert-arithmetic other than incumbent keeps its own contract.
+    // Config::defer_prompt_mtp (exact): the lever row `mtp_defer_prompt` (--mtp-defer-prompt on|off, env, fast profile).
+    config.defer_prompt_mtp = config.defer_prompt_mtp || choice.mtp_defer_prompt;
+    // TURBO / FAST expert rows: an explicit --expert-arithmetic other than incumbent keeps its own contract.
+    if (choice.expert_turbo && choice.expert_fast)
+        throw std::invalid_argument("--expert-turbo and --expert-fast select different expert arithmetics; set one");
     if (choice.expert_turbo && config.expert_arithmetic == qwen_packs::ExpertArithmetic::incumbent)
         config.expert_arithmetic = qwen_packs::ExpertArithmetic::gsq_i8_turbo;
+    if (choice.expert_fast && config.expert_arithmetic == qwen_packs::ExpertArithmetic::incumbent)
+        config.expert_arithmetic = qwen_packs::ExpertArithmetic::gsq_bf16_mma;
 }
 
 inline qp::Config resolve_route(qp::Config config, const pr::Lookup& lookup = {}) {
@@ -270,6 +272,15 @@ inline std::string effective_config_json(const Resolved& r) {
         turbo.set("cache_namespace", J(c.turbo_namespace));
         turbo.set("decode_arithmetic", J(std::string(c.turbo_onfly_nvfp4 ? "nvfp4-a8-v1 (dense Q8_0 roles converted at load)" : "native pack")));
         out.set("turbo_weights", std::move(turbo));
+    }
+    // FAST bundle (kFastBundle): under --profile fast, or whenever the effective values are the bundle; absent otherwise,
+    // so every other effective config keeps its bytes.
+    const auto bundle = cp::fast_bundle_status(r.choice, c.expert_arithmetic == qwen_packs::ExpertArithmetic::gsq_bf16_mma);
+    if (r.resolution.profile == pr::Name::fast || !bundle.id.empty()) {
+        auto fb = J::object();
+        fb.set("id", J(bundle.id.empty() ? std::string("none") : bundle.id));
+        fb.set("detail", J(bundle.detail));
+        out.set("fast_bundle", std::move(fb));
     }
     out.set("form_identities", J(cp::form_identities(r.choice)));
     out.set("resolution", ::strix::serve::parse_json(r.resolution.json()));

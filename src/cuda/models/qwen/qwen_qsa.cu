@@ -2,7 +2,7 @@
 // HIP references: src/hip_indexed_attention_launcher.hip (H: line numbers below), ISA
 // the gfx1151 disassembly of hip_indexed_attention_launcher (S: line numbers).
 // Every FP operation is an explicit IEEE intrinsic (__fadd_rn, __fmul_rn, __fmaf_rn, __fdiv_rn) in the HIP order.
-#include "../../core/attention_tile.cuh"
+#include "../../core/attention_rowgroup.cuh"
 #include "qsa_fused_order.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/cuda/core/decode_rows.hpp"
@@ -1101,108 +1101,46 @@ bool fused_enabled() {
 }
 
 // ------------------------------------------------------------------------------------------------------------------
-// FAST form (Config::forms.qsa_mma): the whole attention of a prefill row (scores + softmax + weighted values + gate) as one
-// flash kernel on BF16 tensor cores (core/attention_tile.cuh). CTA = (KV head, row), 3 warps; the row's selected keys are
-// split in chunks of 16 (warp w owns chunks w, w+3, ...); the 12 heads of the KV head are the M rows (padded to 16 with
-// zeros). K / V chunks of a warp stream through a 3-slot cp.async ring (two items in flight); the KV cache is BF16 so no
-// conversion. Per warp running (max, sum, O) in registers, merged through shared memory. Keys past count are excluded
-// exactly (P = 0). Not bit-comparable with the exact path: BF16 Q, base-2 online softmax with ex2.approx, P in BF16,
-// gate via __expf; accumulation FP32.
-constexpr unsigned kMmaWarps = 3, kMmaChunk = 16, kMmaQS = kHeadDim + 8U, kMmaSlot = kMmaChunk * kMmaQS;  // elements
-constexpr std::size_t kMmaSmem = (16U * kMmaQS + kMmaWarps * 3U * kMmaSlot) * sizeof(std::uint16_t);
-static_assert(kMmaSmem <= 99U * 1024U, "qsa mma msm");
-__global__ __launch_bounds__(kMmaWarps * 32, 1) void attention_mma_kernel(const float* __restrict__ q_gate,
-    std::uint64_t first_position, const std::uint32_t* __restrict__ all_selected, const std::uint16_t* __restrict__ kv,
-    float* __restrict__ output) {
-    extern __shared__ __align__(16) std::uint16_t msm[];
-    std::uint16_t* const qs = msm;
-    const unsigned tid = threadIdx.x, warp = tid >> 5U, lane = tid & 31U;
-    const auto kvh = blockIdx.x, r = blockIdx.y;
-    const auto count = selected_count(first_position + r);
-    const unsigned nchunks = (count + kMmaChunk - 1U) / kMmaChunk;
-    const unsigned mine = nchunks > warp ? (nchunks - warp + kMmaWarps - 1U) / kMmaWarps : 0U;
-    const float* qrow = q_gate + static_cast<std::uint64_t>(r) * kQGateWidth + static_cast<std::uint64_t>(kvh) * kG * kHeadDim * 2ULL;
-    for (unsigned i = tid; i < 16U * kHeadDim; i += kMmaWarps * 32U) {
-        const unsigned h = i / kHeadDim, d = i % kHeadDim;
-        qs[h * kMmaQS + d] = h < kG ? to_bf16(qrow[static_cast<std::uint64_t>(h) * kHeadDim * 2ULL + d]) : static_cast<std::uint16_t>(0);
+// FAST form (Config::forms.qsa_mma, identity qwen-cuda-qsa-f16mma-v2): the whole attention of a prefill row (scores +
+// softmax + weighted values + gate) on BF16 tensor cores through the shared row-group core (core/attention_rowgroup.cuh).
+// Four neighbouring rows walk the union of their selections (selected[] is ascending: blocks, then the tail, see
+// select_kernel_body), so each K/V row is gathered from L2 once per 4 rows instead of once per row; one warp per row with
+// its 12 heads as the M rows. Numerics: BF16 Q (RNE), BF16 K/V (the cache), FP32 accumulation, base-2 online softmax with
+// ex2.approx over the union chunks ascending, P in BF16, attn = round_bf16(O / l), gate via __expf. Not bit-comparable
+// with the exact path (v1, the per-row 3-warp kernel, merged three warp partials and is retired).
+struct QsaRowgroup {
+    static constexpr unsigned D = kHeadDim, Heads = kG, Rows = 4, Cap = kMaxSelected;
+    static constexpr float kScaleLog2 = 0.0625F * 1.44269504088896341F;  // 1/sqrt(256) * log2(e)
+    const float* q_gate;
+    std::uint64_t first_position;
+    const std::uint32_t* selected;
+    const std::uint16_t* kv;
+    float* output;
+    std::uint32_t rows;
+    __device__ unsigned count(unsigned row) const { return selected_count(first_position + row); }
+    __device__ std::uint32_t key(unsigned row, unsigned j) const { return selected[static_cast<std::uint64_t>(row) * kMaxSelected + j]; }
+    __device__ const std::uint16_t* key_row(std::uint32_t token, unsigned kvh) const {
+        return kv + static_cast<std::uint64_t>(token) * (kKvWidth * 2ULL) + static_cast<std::uint64_t>(kvh) * kHeadDim;
     }
-    __syncthreads();
-    namespace cp = strix::cuda::core::ptx;
-    namespace at = strix::cuda::core::attn;
-    std::uint16_t* const ring = msm + 16U * kMmaQS + warp * 3U * kMmaSlot;
-    const std::uint32_t* selected = all_selected + static_cast<std::uint64_t>(r) * kMaxSelected;
-    const auto issue = [&](unsigned item) {  // item 2c = K of local chunk c, 2c + 1 = V
-        if (item < 2U * mine) {
-            const unsigned chunk = warp + kMmaWarps * (item >> 1U), slot = chunk * kMmaChunk + (lane & 15U);
-            const auto tok = slot < count ? selected[slot] : 0U;
-            const std::uint16_t* src = kv + static_cast<std::uint64_t>(kvh) * kHeadDim + ((item & 1U) ? kKvWidth : 0U) + lane * 8U;
-            std::uint16_t* dst = ring + (item % 3U) * kMmaSlot + lane * 8U;
-#pragma unroll
-            for (unsigned i = 0; i < kMmaChunk; ++i) {
-                const auto t = __shfl_sync(kFull, tok, static_cast<int>(i));
-                cp::cp_async16(dst + i * kMmaQS, src + static_cast<std::uint64_t>(t) * (kKvWidth * 2ULL));
-            }
-        }
-        cp::cp_async_commit();
-    };
-    constexpr int NT = kHeadDim / 8;
-    float o[NT][4];
-#pragma unroll
-    for (int i = 0; i < NT; ++i) { o[i][0] = 0.0F; o[i][1] = 0.0F; o[i][2] = 0.0F; o[i][3] = 0.0F; }
-    float m[2] = {__uint_as_float(0xff800000U), __uint_as_float(0xff800000U)}, l[2] = {0.0F, 0.0F};
-    constexpr float kScale = 0.0625F * 1.44269504088896341F;  // 1/sqrt(256) * log2(e)
-    issue(0U); issue(1U);
-#pragma unroll 1
-    for (unsigned c = 0; c < mine; ++c) {
-        const unsigned valid = min(kMmaChunk, count - (warp + kMmaWarps * c) * kMmaChunk);
-        cp::cp_async_wait<1>();
-        __syncwarp();
-        issue(2U * c + 2U);
-        float s[2][4];
-        at::qk_tile16<kHeadDim, kMmaQS, kMmaQS>(s, qs, ring + ((2U * c) % 3U) * kMmaSlot, lane);
-        unsigned pa[4];
-        at::online_softmax16<NT>(s, valid, kScale, m, l, o, pa, lane);
-        cp::cp_async_wait<1>();
-        __syncwarp();
-        issue(2U * c + 3U);
-        at::pv_tile16<kHeadDim, kMmaQS>(o, pa, ring + ((2U * c + 1U) % 3U) * kMmaSlot, lane);
+    __device__ const std::uint16_t* value_row(std::uint32_t token, unsigned kvh) const { return key_row(token, kvh) + kKvWidth; }
+    __device__ float query(unsigned row, unsigned kvh, unsigned h, unsigned d) const {
+        return q_gate[static_cast<std::uint64_t>(row) * kQGateWidth + static_cast<std::uint64_t>(kvh * kG + h) * kHeadDim * 2ULL + d];
     }
-    cp::cp_async_wait<0>();
-    __syncthreads();
-    // merge the warps: O [warp][12][256] f32 over the ring memory, m / l [warp][16] over the Q tile
-    float* const ow = reinterpret_cast<float*>(msm + 16U * kMmaQS) + warp * (16U * kHeadDim);
-    float* const ml = reinterpret_cast<float*>(msm);
-    const unsigned g = lane >> 2U, t = lane & 3U;
-    l[0] += __shfl_xor_sync(kFull, l[0], 1); l[0] += __shfl_xor_sync(kFull, l[0], 2);
-    l[1] += __shfl_xor_sync(kFull, l[1], 1); l[1] += __shfl_xor_sync(kFull, l[1], 2);
-    if (t == 0) {
-        ml[warp * 32U + g] = m[0]; ml[warp * 32U + 16U + g] = l[0];
-        ml[warp * 32U + g + 8U] = m[1]; ml[warp * 32U + 16U + g + 8U] = l[1];
-    }
-#pragma unroll
-    for (int i = 0; i < NT; ++i) {
-        *reinterpret_cast<float2*>(ow + g * kHeadDim + i * 8 + 2 * t) = make_float2(o[i][0], o[i][1]);
-        *reinterpret_cast<float2*>(ow + (g + 8U) * kHeadDim + i * 8 + 2 * t) = make_float2(o[i][2], o[i][3]);
-    }
-    __syncthreads();
-    const float* const qg = q_gate + static_cast<std::uint64_t>(r) * kQGateWidth;
-    float* const out = output + static_cast<std::uint64_t>(r) * kAttnWidth;
-    for (unsigned i = tid; i < kG * kHeadDim; i += kMmaWarps * 32U) {
-        const unsigned h = i / kHeadDim, f = i % kHeadDim;
-        float mx = ml[h];
-        for (unsigned w = 1; w < kMmaWarps; ++w) mx = fmaxf(mx, ml[w * 32U + h]);
-        float num = 0.0F, den = 0.0F;
-        for (unsigned w = 0; w < kMmaWarps; ++w) {
-            const float a = at::ex2(ml[w * 32U + h] - mx);
-            num += a * reinterpret_cast<const float*>(msm + 16U * kMmaQS)[w * (16U * kHeadDim) + h * kHeadDim + f];
-            den += a * ml[w * 32U + 16U + h];
-        }
+    __device__ void store2(unsigned row, unsigned kvh, unsigned h, unsigned d, float a0, float a1) const {
         const auto head = kvh * kG + h;
-        const float attn = round_bf16(num / den);
-        const float gate = round_bf16(1.0F / (1.0F + __expf(-qg[static_cast<std::uint64_t>(head) * kHeadDim * 2ULL + kHeadDim + f])));
-        out[static_cast<std::uint64_t>(head) * kHeadDim + f] = round_bf16(attn * gate);
+        const float* g = q_gate + static_cast<std::uint64_t>(row) * kQGateWidth + static_cast<std::uint64_t>(head) * kHeadDim * 2ULL + kHeadDim + d;
+        const float g0 = round_bf16(1.0F / (1.0F + __expf(-g[0]))), g1 = round_bf16(1.0F / (1.0F + __expf(-g[1])));
+        *reinterpret_cast<float2*>(output + static_cast<std::uint64_t>(row) * kAttnWidth + static_cast<std::uint64_t>(head) * kHeadDim + d) =
+            make_float2(round_bf16(round_bf16(a0) * g0), round_bf16(round_bf16(a1) * g1));
     }
-}
+};
+namespace rg = strix::cuda::core::rowgroup;
+using QsaRg = rg::Shape<QsaRowgroup>;
+static_assert(QsaRg::FlashSmem <= 48U * 1024U && QsaRg::UnionSmem <= 99U * 1024U, "qsa rowgroup smem");
+// attention() hands its scores workspace ([rows][24][2051] f32) to the FAST form: 4 rows need 41 KB of union, scores give 788 KB.
+static_assert(rg::workspace_bytes<QsaRowgroup>(1) <= std::size_t{QsaRowgroup::Rows} * kHeads * kMaxSelected * sizeof(float), "union fits the scores workspace");
+__global__ __launch_bounds__(256) void qsa_union_kernel(QsaRowgroup p, rg::Union u) { rg::union_body(p, u); }
+__global__ __launch_bounds__(QsaRg::Threads, 2) void qsa_rowgroup_kernel(QsaRowgroup p, rg::Union u) { rg::flash_body(p, u); }
 
 // ------------------------------------------------------------------------------------------------------------------
 // Multi-segment launches (decode cohort windows, layer_core_multi): one launch per step for every session of a window.
@@ -1457,7 +1395,7 @@ void attention_values(const float* q_gate, std::uint32_t rows, std::uint64_t fir
 }
 void attention(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
     const std::uint16_t* kv, float* scores, float* attention_output, const amdmath::Tables& tables, cudaStream_t stream, bool mma) {
-    if (mma) { attention_mma(q_gate, rows, first_position, selected, kv, attention_output, stream); return; }
+    if (mma) { attention_mma(q_gate, rows, first_position, selected, kv, scores, attention_output, stream); return; }
     // the decode shape keeps the per-head output kernels (attention_values); the fused form serves the prefill shape
     if (fused_enabled() && !(rows <= core::decode_rows_max() && decode_rows_enabled())) {
         attention_fused(q_gate, rows, first_position, selected, kv, attention_output, tables, stream);
@@ -1485,16 +1423,24 @@ void attention_fused(const float* q_gate, std::uint32_t rows, std::uint64_t firs
         q_gate, first_position, selected, kv, attention_output, tables);
     check(cudaGetLastError(), "fused attention launch");
 }
+std::size_t attention_mma_workspace_bytes(std::uint32_t rows) {
+    return rg::workspace_bytes<QsaRowgroup>((rows + QsaRowgroup::Rows - 1U) / QsaRowgroup::Rows);
+}
 void attention_mma(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
-    const std::uint16_t* kv, float* attention_output, cudaStream_t stream) {
+    const std::uint16_t* kv, void* workspace, float* attention_output, cudaStream_t stream) {
     if (!rows) return;
     static const bool attr = [] {
-        check(cudaFuncSetAttribute(attention_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kMmaSmem)), "mma smem attr");
+        check(cudaFuncSetAttribute(qsa_union_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(QsaRg::UnionSmem)), "union smem attr");
         return true;
     }();
     (void)attr;
-    attention_mma_kernel<<<dim3(kKvHeads, rows), kMmaWarps * 32U, kMmaSmem, stream>>>(q_gate, first_position, selected, kv, attention_output);
-    check(cudaGetLastError(), "attention_mma launch");
+    const unsigned tiles = (rows + QsaRowgroup::Rows - 1U) / QsaRowgroup::Rows;
+    const QsaRowgroup p{q_gate, first_position, selected, kv, attention_output, rows};
+    const auto u = rg::carve<QsaRowgroup>(workspace, tiles);
+    qsa_union_kernel<<<tiles, 256, QsaRg::UnionSmem, stream>>>(p, u);
+    check(cudaGetLastError(), "qsa union launch");
+    qsa_rowgroup_kernel<<<dim3(kKvHeads, tiles), QsaRg::Threads, QsaRg::FlashSmem, stream>>>(p, u);
+    check(cudaGetLastError(), "qsa rowgroup launch");
 }
 
 void layer_core(const RowBuffers& b, std::uint32_t rows, std::uint64_t first_position, const LayerWeights& w,

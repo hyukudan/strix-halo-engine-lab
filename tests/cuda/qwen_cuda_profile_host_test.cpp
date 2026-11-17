@@ -113,6 +113,71 @@ std::string status(const qo::Resolved& r, const char* lever) {
     return e ? std::string(pr::status_name(e->status)) : "absent";
 }
 
+// The RTX Qwen FAST bundle (cp::kFastBundle) through the one resolver: the fast column selects exactly its members, serve ==
+// CLI == prefill service, the id is decided on effective values, any differing member leaves the bundle with a reason, the
+// exact deferral row is an ordinary lever (option, env, off), and the expert rows of FAST and TURBO are exclusive.
+std::string bundle_id(const qo::Resolved& r) {
+    return cp::fast_bundle_status(r.choice, r.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::gsq_bf16_mma).id;
+}
+std::string bundle_detail(const qo::Resolved& r) {
+    return cp::fast_bundle_status(r.choice, r.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::gsq_bf16_mma).detail;
+}
+void fast_bundle() {
+    const std::string id(cp::kFastBundle);
+    for (const auto e : {qo::Entry::serve, qo::Entry::cli, qo::Entry::prefill_service}) {
+        const auto r = one({"--profile", "fast"}, e);
+        check(bundle_id(r) == id, "fast is the bundle in every entry: " + bundle_detail(r));
+        const auto json = qo::effective_config_json(r);
+        check(json.find("\"fast_bundle\"") != std::string::npos && json.find("\"" + id + "\"") != std::string::npos,
+              "effective config prints the bundle id");
+        check(bundle_detail(r).find("expert_fast,qsa_mma,hc_mma,mtp_defer_prompt") != std::string::npos &&
+                  bundle_detail(r).find("provisional") != std::string::npos, "bundle detail: members, provisional: " + bundle_detail(r));
+    }
+    const auto plain = one({}, qo::Entry::serve);
+    check(bundle_id(plain).empty() && qo::effective_config_json(plain).find("fast_bundle") == std::string::npos,
+          "default: no bundle, no field (effective config bytes kept)");
+    check(qo::numerical_identity(one({"--profile", "fast"}, qo::Entry::serve).config).hash != qo::numerical_identity(plain.config).hash,
+          "the bundle has its own numerical identity");
+    // Each member overridden leaves the bundle, with the member named; the other members stay.
+    const std::pair<Args, const char*> outside[] = {
+        {{"--profile", "fast", "--qsa-mma", "off"}, "qsa_mma off"},
+        {{"--profile", "fast", "--hc-mma", "off"}, "hc_mma off"},
+        {{"--profile", "fast", "--expert-fast", "off"}, "experts are not"},
+        {{"--profile", "fast", "--mtp-defer-prompt", "off"}, "mtp_defer_prompt off"},
+        {{"--profile", "fast", "--mtp-mma", "on"}, "mtp_mma on"},
+        {{"--profile", "fast", "--expert-fast", "off", "--moe-mma", "on"}, "moe_mma on"},
+    };
+    for (const auto& [args, why] : outside) {
+        same_request(std::string("fast-outside-") + why, args);
+        const auto r = one(args, qo::Entry::serve);
+        check(bundle_id(r).empty() && bundle_detail(r).find(why) != std::string::npos, std::string("outside: ") + bundle_detail(r));
+        const auto json = qo::effective_config_json(r);
+        check(json.find("\"fast_bundle\"") != std::string::npos && json.find("\"none\"") != std::string::npos,
+              std::string("fast profile prints id none when outside: ") + why);
+    }
+    auto r = one({"--profile", "fast", "--expert-fast", "off"}, qo::Entry::cli);
+    check(r.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::incumbent && r.config.forms.hc_mma && status(r, "expert_fast") == "off",
+          "--expert-fast off keeps the pack's experts, other members stay");
+    r = one({"--profile", "fast"}, qo::Entry::serve, Env{{"STRIX_QRTX_EXPERT_FAST", "0"}});
+    check(r.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::incumbent, "STRIX_QRTX_EXPERT_FAST=0 reaches through the lookup");
+    check(refuses({"--profile", "fast", "--moe-mma", "on"}), "bf16mma experts + single-chain moe_mma: refused (unqualified composition)");
+    // Same values set one by one under the default profile ARE the bundle (decided on effective values).
+    const Args explicit_members{"--expert-fast", "on", "--qsa-mma", "on", "--hc-mma", "on", "--mtp-defer-prompt", "on"};
+    r = one(explicit_members, qo::Entry::serve);
+    check(bundle_id(r) == id && qo::effective_config_json(r).find("\"fast_bundle\"") != std::string::npos, "explicit members: " + bundle_detail(r));
+    r = one({"--expert-arithmetic", "gsq-iq-bf16mma-cuda-v1", "--profile", "fast", "--expert-fast", "off"}, qo::Entry::serve);
+    check(bundle_id(r) == id, "explicit --expert-arithmetic bf16mma keeps the bundle arithmetic: " + bundle_detail(r));
+    // The exact deferral row: option, env, off; never a bit-changing contract.
+    r = one({"--mtp-defer-prompt", "on"}, qo::Entry::cli);
+    check(r.config.defer_prompt_mtp && r.contract == "qwen-cuda;prefill=exact" && status(r, "mtp_defer_prompt") == "explicit-cli",
+          "--mtp-defer-prompt on: exact contract, explicit");
+    r = one({}, qo::Entry::serve, Env{{"STRIX_QRTX_MTP_DEFER_PROMPT", "1"}});
+    check(r.config.defer_prompt_mtp && r.contract == "qwen-cuda;prefill=exact", "STRIX_QRTX_MTP_DEFER_PROMPT=1 through the lookup");
+    check(!one({}, qo::Entry::cli).config.defer_prompt_mtp, "default: prompt MTP not deferred");
+    check(refuses({"--mtp-defer-prompt", "maybe"}), "--mtp-defer-prompt is on or off");
+    check(refuses({"--profile", "turbo", "--expert-fast", "on"}, {}, qo::Entry::serve), "FAST and TURBO expert rows are exclusive");
+}
+
 void profiles() {
     for (const auto& a : {Args{}, Args{"--profile", "default"}, Args{"--profile", "exact"}}) {
         same_request("exact", a);
@@ -124,9 +189,17 @@ void profiles() {
     check(one({"--profile", "exact"}, qo::Entry::cli).resolution.json() == one({"--profile", "default"}, qo::Entry::cli).resolution.json(), "exact is an alias of default");
     same_request("fast", {"--profile", "fast"});
     const auto fast = one({"--profile", "fast"}, qo::Entry::serve);
-    check(fast.config.forms.hc_mma && fast.config.forms.mtp_mma && fast.config.forms.qsa_mma && fast.config.forms.moe_mma, "fast: the four forms on");
-    check(fast.contract == "qwen-cuda;prefill=fast;forms=hc_mma,mtp_mma,qsa_mma,moe_mma;moe_route_bf16=0", "fast contract: " + fast.contract);
-    for (const char* f : {"hc_mma", "mtp_mma", "qsa_mma", "moe_mma"}) check(status(fast, f) == "provisional", std::string("fast: ") + f + " provisional");
+    // fast = the FAST bundle: bf16mma experts + row-group QSA + HC MMA + deferred prompt MTP; moe_mma / mtp_mma not members.
+    check(fast.config.forms.hc_mma && fast.config.forms.qsa_mma && !fast.config.forms.mtp_mma && !fast.config.forms.moe_mma,
+          "fast: the bundle's two forms on, mtp_mma / moe_mma off");
+    check(fast.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::gsq_bf16_mma && fast.config.defer_prompt_mtp,
+          "fast: bf16mma experts and deferred prompt MTP");
+    check(fast.contract == "qwen-cuda;prefill=fast;forms=hc_mma,qsa_mma;moe_route_bf16=0+gsq-iq-bf16mma-cuda-v1", "fast contract: " + fast.contract);
+    for (const char* f : {"hc_mma", "qsa_mma", "expert_fast"}) check(status(fast, f) == "provisional", std::string("fast: ") + f + " provisional");
+    check(status(fast, "mtp_defer_prompt") == "profile", "fast: exact deferral applied by the profile (qualified exact row): " + status(fast, "mtp_defer_prompt"));
+    for (const char* f : {"mtp_mma", "moe_mma", "expert_turbo"}) check(status(fast, f) == "absent", std::string("fast: ") + f + " not selected");
+    check(cp::form_identities(fast.choice) == "qwen-cuda-hc-f16mma-v1,qwen-cuda-qsa-f16mma-v2", "fast identities: " + cp::form_identities(fast.choice));
+    fast_bundle();
     for (const char* f : {"moe_route_bf16", "qsa_budget", "gdn_fp16_chunk", "output_head"})
         check(status(fast, f) == "pending", std::string("fast: ") + f + " pending (listed, not used)");
     check(fast.config.moe_route_bf16 == false, "fast: pending route storage is not applied");
@@ -141,14 +214,14 @@ void profiles() {
 void overrides() {
     same_request("fast-hc-off", {"--profile", "fast", "--hc-mma", "off"});
     auto r = one({"--profile", "fast", "--hc-mma", "off"}, qo::Entry::cli);
-    check(!r.config.forms.hc_mma && r.config.forms.mtp_mma && r.config.forms.qsa_mma && r.config.forms.moe_mma, "--hc-mma off wins over the profile");
+    check(!r.config.forms.hc_mma && !r.config.forms.mtp_mma && r.config.forms.qsa_mma && !r.config.forms.moe_mma, "--hc-mma off wins over the profile");
     check(status(r, "hc_mma") == "off", "hc_mma status off");
-    check(r.contract == "qwen-cuda;prefill=fast;forms=mtp_mma,qsa_mma,moe_mma;moe_route_bf16=0", r.contract);
+    check(r.contract == "qwen-cuda;prefill=fast;forms=qsa_mma;moe_route_bf16=0+gsq-iq-bf16mma-cuda-v1", r.contract);
     // moe_mma: option and env of the table row, CLI beats env, off wins over the fast profile.
     same_request("fast-moe-off", {"--profile", "fast", "--moe-mma", "off"});
     r = one({"--profile", "fast", "--moe-mma", "off"}, qo::Entry::cli);
     check(!r.config.forms.moe_mma && r.config.forms.hc_mma && status(r, "moe_mma") == "off", "--moe-mma off wins over the profile");
-    check(r.contract == "qwen-cuda;prefill=fast;forms=hc_mma,mtp_mma,qsa_mma;moe_route_bf16=0", r.contract);
+    check(r.contract == "qwen-cuda;prefill=fast;forms=hc_mma,qsa_mma;moe_route_bf16=0+gsq-iq-bf16mma-cuda-v1", r.contract);
     Env moe_env{{"STRIX_QRTX_MOE_MMA", "0"}};
     same_request("fast-env-moe-off", {"--profile", "fast"}, moe_env);
     r = one({"--profile", "fast"}, qo::Entry::serve, moe_env);
@@ -177,7 +250,9 @@ void overrides() {
     // The route storage: explicit option, env, or --allow-pending (unqualified).
     r = one({"--prefill-moe-route-bf16", "on"}, qo::Entry::cli);
     check(r.config.moe_route_bf16 == true && r.contract == "qwen-cuda;prefill=fast;forms=none;moe_route_bf16=1", "route storage on: " + r.contract);
-    r = one({"--profile", "fast", "--allow-pending"}, qo::Entry::cli);
+    // The bundle's bf16mma experts refuse the route storage (qwen_options.hpp resolve: unqualified composition).
+    check(refuses({"--profile", "fast", "--allow-pending"}), "fast bundle + pending route storage: refused, never silent");
+    r = one({"--profile", "fast", "--expert-fast", "off", "--allow-pending"}, qo::Entry::cli);
     check(r.config.moe_route_bf16 == true && status(r, "moe_route_bf16") == "unqualified", "--allow-pending runs the route storage as unqualified");
     check(status(r, "qsa_budget") == "pending", "not-runnable rows stay pending under --allow-pending");
     env = {{"STRIX_QPF2K_MOE_ROUTE_BF16", "1"}};
@@ -255,7 +330,7 @@ void identities() {
     std::uint64_t legacy = 14695981039346656037ULL;
     for (const char ch : std::string(base)) { legacy ^= static_cast<unsigned char>(ch); legacy *= 1099511628211ULL; }
     check(qo::handoff_numerical_id(base, {}) == legacy, "exact hand-off id keeps its historical value");
-    check(cp::form_identities({false, true, true, true}) == "qwen-cuda-hc-f16mma-v1,qwen-cuda-mtp-f16mma-v1,qwen-cuda-qsa-f16mma-v1", "form identities");
+    check(cp::form_identities({false, true, true, true}) == "qwen-cuda-hc-f16mma-v1,qwen-cuda-mtp-f16mma-v1,qwen-cuda-qsa-f16mma-v2", "form identities");
     // Prefix-cache identity: forms enter only when on.
     const auto dir = fs::temp_directory_path() / "strix_qwen_cuda_profile_host_test";
     fs::create_directories(dir / "tables");
@@ -388,9 +463,11 @@ void turbo_binding() {
     check(bf.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::gsq_bf16_mma,
           "turbo: an explicit expert arithmetic wins over the row");
     const auto fast = qo::resolve(parse(with_paths({"--profile", "fast"}), none), qo::Entry::serve);
-    check(fast.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::incumbent && !fast.choice.expert_turbo &&
-              plain.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::incumbent,
-          "turbo row selects nothing outside turbo");
+    check(fast.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::gsq_bf16_mma && !fast.choice.expert_turbo &&
+              fast.choice.expert_fast && plain.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::incumbent,
+          "turbo row selects nothing outside turbo (fast selects the FAST expert row instead)");
+    check(!serve.choice.expert_fast && serve.choice.mtp_mma && serve.choice.mtp_defer_prompt,
+          "turbo: FAST expert row kept out (turbo cell off); mtp_mma and the exact deferral stay in TURBO");
     bool threw = false;
     try {
         (void)qo::resolve(parse(with_paths({"--profile", "turbo", "--prefill-moe-route-bf16", "1"}), none), qo::Entry::serve);

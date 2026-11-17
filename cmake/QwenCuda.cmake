@@ -180,6 +180,13 @@ target_compile_options(qwen_qsa_fused_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--
 add_executable(qwen_qsa_fused_order_test tests/cuda/qwen_qsa_fused_order_test.cpp)
 target_include_directories(qwen_qsa_fused_order_test PRIVATE src/cuda/models/qwen)
 add_test(NAME qwen_qsa_fused_order COMMAND qwen_qsa_fused_order_test)
+# Shared row-group attention core: union-list invariant on the host (no GPU) and the device fixture
+# qwen_qsa_rowgroup_test <tables dir> [--no-timing] (FAST qsa_mma v2 vs the exact path, union byte-compare, timing).
+add_executable(rowgroup_union_host_test tests/cuda/rowgroup_union_host_test.cpp)
+add_test(NAME rowgroup_union_host COMMAND rowgroup_union_host_test)
+add_executable(qwen_qsa_rowgroup_test tests/cuda/qwen_qsa_rowgroup_test.cu)
+target_link_libraries(qwen_qsa_rowgroup_test PRIVATE strix_qwen_cuda)
+target_compile_options(qwen_qsa_rowgroup_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
 # QSA index scores: shared-tree form == warp-shuffle form byte for byte (device, no model) + --bench timing
 add_executable(qwen_qsa_score_tree_test tests/cuda/qwen_qsa_score_tree_test.cu)
 target_link_libraries(qwen_qsa_score_tree_test PRIVATE strix_qwen_cuda)
