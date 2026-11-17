@@ -108,6 +108,7 @@ std::uint64_t qwen_fingerprint(const strix::decode_cli::Options& options, const 
 void minimax() {
     env("STRIX_MMX_MODEL_FORMAT", "fast_i4");
     env("STRIX_MMX_PF_IU4", nullptr);
+    mmoe::set_prefill_moe_order(0);  // fixture's adaptive reference, independent of the launching environment
     MiniMaxPolicies p;
     const auto on = p.fingerprint();
     env("STRIX_MMX_PF_IU4", "0");
