@@ -41,7 +41,7 @@ std::vector<float> transpose_rows(const std::vector<float>& a, std::size_t cols,
 
 }  // namespace
 
-LayerBlob build_layer(Pack& pack, unsigned L) {
+LayerBlob build_layer(Pack& pack, unsigned L, bool residual_only) {
     LayerBlob blob;
     Builder bd{blob};
     blob.bytes.reserve(std::size_t{2800} << 20);
@@ -63,7 +63,7 @@ LayerBlob build_layer(Pack& pack, unsigned L) {
     blob.iq_w = bd.floats(pack.floats(a + "index_q_norm.weight"));
     blob.ik_w = bd.floats(pack.floats(a + "index_k_norm.weight"));
     blob.w_post = bd.floats(pack.floats(lp + "post_attention_layernorm.weight"));
-    blob.w_next = bd.floats(pack.floats(L + 1 < kLayers ? kP + "layers." + std::to_string(L + 1) + ".input_layernorm.weight" : kP + "norm.weight"));
+    blob.w_next = residual_only ? bd.floats(std::vector<float>(kHidden, 0.0F)) : bd.floats(pack.floats(L + 1 < kLayers ? kP + "layers." + std::to_string(L + 1) + ".input_layernorm.weight" : kP + "norm.weight"));
     blob.moe = L >= kFirstMoe;
     auto mlp = [&](unsigned r, const std::string& pre, const char* const* nm, unsigned inter) {
         MlpRef m;

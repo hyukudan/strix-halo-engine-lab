@@ -15,6 +15,7 @@
 #include "strix/serve/cycle_receipt.hpp"
 #include "strix/serve/deepseek_chat.hpp"
 #include "strix/serve/prefill_group.hpp"
+#include "strix/ds41_dense_plan.hpp"
 #include "strix/serve/session_api.hpp"
 #include "strix/serve/session_reservation.hpp"
 #include "strix/serve/session_runtime.hpp"
