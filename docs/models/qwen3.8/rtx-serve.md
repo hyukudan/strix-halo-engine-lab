@@ -160,3 +160,19 @@ generation setting, CUDA sm_120 and a 534 W configured GPU cap gave:
 
 These are window timings, not whole-model generation throughput or a claim about
 all request mixes. Tiered execution and numerical quality qualification are unchanged.
+
+### Native expert shared-memory layout
+
+The shared native expert kernels use padded group storage and vector loads to
+avoid bank conflicts, retaining their arithmetic order. The 60-case capture is
+byte-identical; all 20 native cases also retain stable capture digests across
+four timing runs. No extra numerical route or control is introduced.
+
+A matched served C1 prefill pair on an RTX PRO 6000 at a configured 534 W used
+the same GSQ IQ3_S model files, exact prefill, 8,076 actual prompt tokens,
+prefix caching off and one emitted token. Warm prefill rose from 407.9 to
+925.6 tokens/s (19.800 to 8.725 seconds), a 2.27× improvement in this cell.
+The first requests measured 406.4 and 1,019.9 tokens/s. This is one process per
+arm and two request-order observations, not an all-workload speed claim.
+The timing client saved output counts rather than token IDs; bitwise evidence
+comes from the separate native capture tests, not this full-model timing pair.
