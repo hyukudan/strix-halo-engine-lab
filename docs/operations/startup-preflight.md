@@ -111,4 +111,3 @@ New records serialize only controlled identifiers, enumerations and numbers.
 They omit paths, host/account names, PIDs, process lists, command lines, device
 serials/BDFs, raw errors and raw environment/configuration. This boundary applies
 to these records, not every existing engine log.
-`scripts/bench/rtx/rows-mma-check.sh COORD_ROOT TEST_BINARY OUTPUT_DIR` runs the synthetic CUDA row-dot comparison with an oldest-waiter atomic FIFO lock and the shared GPU guard. Announce the test brief first; it requires PRO index 0 at 534 W, a shared STOP latch, and bounds both arms together to 180 seconds. Raw hashes and per-site timing logs are retained; this is not a model quality or serving benchmark.

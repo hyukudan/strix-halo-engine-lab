@@ -163,12 +163,6 @@ bool rows16_enabled() {
     static const bool on = strix::envcfg::flag("STRIX_QRTX_DENSE_ROWS16", true);
     return on;
 }
-// 5..16-row K-split windows: integer block dots by m16n8k32 instead of dp4a (core/imma_dense.cuh rows_mma_dots). Same
-// DOT / scale / FP32 chain, so the bits are identical; opt-in (STRIX_QRTX_ROWS_MMA=1) until the RTX PRO timing is taken.
-bool rows_mma_enabled() {
-    static const bool on = strix::envcfg::flag("STRIX_QRTX_ROWS_MMA", false);
-    return on;
-}
 // Decode rows (rows <= 8) policy of main's streamed form (#680, rtxmax2 receipts; kernels in core/imma_dense.cuh
 // project_rows_cp_kernel / project_rows_ks_kernel<KO>). Selection (qwen_rows_glue_exact_test --time on the RTX PRO 6000,
 // us/call old ks -> cp): small sites win (shared gate/up 2.7 MB 5.65 -> 3.76 at 1 row, shared down 1.4 MB 3.60 -> 2.98),
@@ -206,7 +200,6 @@ struct DenseNumeric {
     static bool rows_cp_enabled() { return ::strix::cuda::qwen_dense::rows_cp_enabled(); }
     static bool rows_cp_wanted(const KSite& k, unsigned rows) { return ::strix::cuda::qwen_dense::rows_cp_wanted(k, rows); }
     static int rows_ks_out(std::uint32_t nblocks) { return ::strix::cuda::qwen_dense::rows_ks_out(nblocks); }
-    static bool rows_mma_enabled() { return ::strix::cuda::qwen_dense::rows_mma_enabled(); }
     static bool dense_tile2_enabled() { return ::strix::cuda::qwen_dense::dense_tile2_enabled(); }
     static bool dense_t2_remap_enabled() { return ::strix::cuda::qwen_dense::dense_t2_remap_enabled(); }
     template <Store S>
