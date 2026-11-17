@@ -6764,15 +6764,21 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                         qpf2k_maxima_row_stride = maxima_stride;
                         return;
                     }
-                    const auto launch = [&]<unsigned RowsPerCta>() {
+                    const auto launch_split = [&]<unsigned RowsPerCta, bool S>() {
                         if (pool->packed)
-                            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, RowsPerCta, W, false, false, true, 1U, false, true>),
+                            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, RowsPerCta, W, false, false, true, 1U, false, true, S>),
                                 dim3((tiles + W - 1U) / W, Rows / RowsPerCta), dim3(W * 32U), 0, stream, scores, static_cast<const void*>(pool->packed),
                                 scored_blocks, a.index_dim, maxima, maxima_stride, static_cast<const uint2*>(qpf2k_key_ranges(pool->capacity)));
                         else
-                            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, RowsPerCta, W>), dim3((tiles + W - 1U) / W, Rows / RowsPerCta),
+                            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::score_kernel<Rows, RowsPerCta, W, false, false, true, 1U, false, false, S>),
+                                dim3((tiles + W - 1U) / W, Rows / RowsPerCta),
                                 dim3(W * 32U), 0, stream, scores, static_cast<const float*>(pool->keys), scored_blocks, a.index_dim, maxima, maxima_stride,
                                 static_cast<const uint2*>(qpf2k_key_ranges(pool->capacity)));
+                    };
+                    // STRIX_QSA_SCORE_SPLIT_LOADS (qsa_flash::score_split_loads): same bits, no query-SGPR spills.
+                    const auto launch = [&]<unsigned RowsPerCta>() {
+                        if (qsa_flash::score_split_loads()) launch_split.template operator()<RowsPerCta, true>();
+                        else launch_split.template operator()<RowsPerCta, false>();
                     };
                     // 64-row groups use the stage batch's rows-per-CTA policy (qsa_flash::score_rows): this path scores every group above
                     // 65536 blocks, where the stage batch declines. Same bits for every RowsPerCta (tests/qsa_score_rows.hip).

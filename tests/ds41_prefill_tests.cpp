@@ -297,11 +297,59 @@ void test_moe_schedule() {
     expect(!moe_joint_layer(606, 605, 1024) && !moe_joint_layer(0, 0, 0), "joint layer: above max_rows, or max_rows 0, never");
 }
 
+void test_bounded_plan() {
+    using strix::ds41::plan_bounded_replay;
+    const strix::ds41::SuffixReplayGeometry g;  // 40 layers, first decoder 20, window 128, draft 128 rows x 3 layers
+    for (const std::uint32_t R : {128U, 256U, 512U, 1024U}) {
+        for (const std::uint64_t T : {2952ULL, 11594ULL, 32768ULL}) {
+            const auto p = plan_bounded_replay(g, 0, T, R);
+            bool ok = p.layers.size() == 40U && p.encoder_output_begin == 0U && p.ring_rows == 0U;
+            for (const auto& l : p.layers) {
+                const std::uint64_t want = l.layer < 20U ? 0U : (T - R) / 256U * 256U;
+                ok = ok && l.out_begin == want && l.kv_begin == want;
+            }
+            ok = ok && p.replay_row_layers == T * 20U + (T - (T - R) / 256U * 256U) * 20U && p.full_row_layers == T * 40U;
+            expect(ok, "bounded plan: encoder every row, every decoder layer its fixed-floor suffix (R " + std::to_string(R) + ", T " + std::to_string(T) + ")");
+        }
+    }
+    // a prompt shorter than the bound: every row everywhere (the full prefill's rows, keys floored at 0)
+    const auto shortp = plan_bounded_replay(g, 0, 100, 128);
+    expect(shortp.layers[39].out_begin == 0U && shortp.layers[20].kv_begin == 0U, "bounded plan: a prompt within the bound runs every row");
+    strix::ds41::SuffixReplayGeometry gd = g;
+    gd.draft_rows = 512;
+    bool draft_rejected = false;
+    try { (void)plan_bounded_replay(gd, 0, 8192, 256); }
+    catch (const std::invalid_argument& e) {
+        const std::string message = e.what();
+        draft_rejected = message.find("draft_rows = 512") != std::string::npos && message.find("R = 256") != std::string::npos;
+    }
+    expect(draft_rejected, "bounded plan refuses oversized draft with both values");
+    for (const auto draft : {0U, 128U, 256U}) {
+        gd.draft_rows = draft;
+        const auto pd = plan_bounded_replay(gd, 0, 1001, 256);
+        for (const auto window_rows : {8U, 16U}) {
+            const auto floor = strix::ds41::bounded_replay_key_floor(1001, 256);
+            expect(floor == 512U && pd.layers[20].out_begin / window_rows * window_rows == floor &&
+                   pd.layers[39].kv_begin == floor && pd.layers[19].out_begin == 0U,
+                   "bounded plan accepts draft <= R with identical fixed floor for windows 8 and 16");
+        }
+    }
+    const auto p8 = plan_bounded_replay(g, 0, 8192, 128);
+    expect(p8.replay_row_layers - 8192U * 20U == 5'120U, "bounded 8K plan: fixed floor covers 256 rows per decoder");
+    std::uint32_t rejected = 0;
+    for (const std::uint32_t R : {0U, 100U, 200U}) {
+        try { (void)plan_bounded_replay(g, 0, 8192, R); } catch (const std::invalid_argument&) { ++rejected; }
+    }
+    try { (void)plan_bounded_replay(g, 8192, 8192, 128); } catch (const std::invalid_argument&) { ++rejected; }
+    expect(rejected == 4U, "bounded plan rejects a bound that is not a positive multiple of the window, and no new row");
+}
+
 int main() {
     test_routes();
     test_plan();
     test_moe_schedule();
     test_moe_growth();
+    test_bounded_plan();
     // Bounded replay must leave complete final rings, all requested head rows,
     // and the encoder/source-cache inputs. Exercise unaligned prompt lengths
     // and call sizes, as well as the 8K/32K qualification shapes.

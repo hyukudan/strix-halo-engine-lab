@@ -22,6 +22,8 @@
 #include "strix/cuda/qwen_gdn.hpp"
 #include "../../../attn_core/recurrent_state.hpp"
 
+#include "strix/env_flags.hpp"
+
 #include <stdexcept>
 #include <type_traits>
 
@@ -265,13 +267,14 @@ __global__ __launch_bounds__(256) void decay_kernel(Rows rows, std::uint32_t cou
     if (i >= count * kValueHeads) return;
     decay[i] = am::amd_expf(t, rows.gate[static_cast<std::uint64_t>(i / kValueHeads) * rows.stride + i % kValueHeads]);
 }
+// Fused (decode): decays == nullptr and the staging fetch computes decay = amd_expf(gate) itself (the value decay_kernel stores).
 // ST = stored element of the state (f32 = incumbent code; f16 / bf16: FP32 arithmetic, widened on load, narrowed on store).
 // RR (16-bit only) = round the register state through the stored type after EVERY row (decode / window / commit replay: as
 // if stored per token); prefill (RR false) keeps FP32 inside the call and narrows once at the end. Elements of one thread
 // are G*128 apart, so the 16-bit access is scalar through the codec.
-template <unsigned G, RecurrentStateType ST, bool RR>
+template <unsigned G, RecurrentStateType ST, bool RR, bool Fused = false>
 __device__ __forceinline__ void recurrence_body(const Rows& rows, std::uint32_t count, const float* state_in, float* state_out,
-    const float* __restrict__ decays) {
+    const float* __restrict__ decays, const am::Tables* tables = nullptr) {
     using Sh = RecShape<G>;
     constexpr unsigned Columns = Sh::Columns, Threads = Sh::Threads, K = Sh::K, Chunk = Sh::Chunk, KQ = Sh::KQ, VQ = Sh::VQ;
     static_assert(Chunk * 64 % Threads == 0 && 2 * Chunk <= Threads);
@@ -302,7 +305,8 @@ __device__ __forceinline__ void recurrence_body(const Rows& rows, std::uint32_t 
         }
         if (thread < 2U * Chunk && first + thread % Chunk < count)
             scalar = thread < Chunk ? rows.beta[static_cast<std::uint64_t>(first + thread) * rows.stride + value_head]
-                                    : decays[(first + thread - Chunk) * kValueHeads + value_head];
+                   : Fused ? am::amd_expf(*tables, rows.gate[static_cast<std::uint64_t>(first + thread - Chunk) * rows.stride + value_head])
+                           : decays[(first + thread - Chunk) * kValueHeads + value_head];
     };
     const auto commit = [&](RecStage<G>& s) {
 #pragma unroll
@@ -412,6 +416,161 @@ __global__ __launch_bounds__(RecShape<G>::Threads) void recurrence_multi_kernel(
 }
 
 
+// ---------------------------------------------------------------------------------------------------------------- decode
+// Decode windows (1..8 rows, one segment). Same arithmetic as K3/K4/K5, fewer launches and shorter dependent chains
+// (STRIX_QRTX_GDN_DECODE): front = gates + conv(+prepass +raw copy) in one kernel, recurrence with decay folded in, and
+// at commit the recurrence replay + conv rollback in one launch.
+constexpr unsigned kDecConvBlocks = kKeyHeads * 2U + kValueHeads;  // 80, 128 channels each
+constexpr unsigned kDecGateBlocks = kValueHeads * 2U;               // 96, one head (beta heads then alpha heads) each
+
+// gates_kernel<R,1> arithmetic with R == count rows and every operand load hoisted (kHidden = 10 x 256: lane chain
+// f = lane + 256 i, ascending, one fma per step from +0 as in gates_kernel).
+template <unsigned R>
+__device__ __forceinline__ void gates_dec_body(const std::uint16_t* __restrict__ input, std::uint64_t input_stride, const Rows& rows,
+    const float* __restrict__ beta_w, const float* __restrict__ alpha_w, const float* __restrict__ dt, const float* __restrict__ a,
+    const am::Tables& t, unsigned head0) {
+    constexpr unsigned N = kHidden / 256U;
+    static_assert(N * 256U == kHidden);
+    __shared__ float scratch[R][256];
+    __shared__ float totals[R];
+    const unsigned lane = threadIdx.x;
+    const bool alpha = head0 >= kValueHeads;
+    const unsigned out0 = head0 - (alpha ? kValueHeads : 0U);
+    const float* weights = (alpha ? alpha_w : beta_w) + static_cast<std::uint64_t>(out0) * kHidden;
+    float w[N], x[N][R];
+#pragma unroll
+    for (unsigned i = 0; i < N; ++i) {
+        w[i] = weights[lane + i * 256U];
+#pragma unroll
+        for (unsigned r = 0; r < R; ++r) x[i][r] = bf16_to_float(input[static_cast<std::uint64_t>(r) * input_stride + lane + i * 256U]);
+    }
+    float sum[R];
+#pragma unroll
+    for (unsigned r = 0; r < R; ++r) sum[r] = 0.0F;
+#pragma unroll
+    for (unsigned i = 0; i < N; ++i)
+#pragma unroll
+        for (unsigned r = 0; r < R; ++r) sum[r] = __fmaf_rn(x[i][r], w[i], sum[r]);
+#pragma unroll
+    for (unsigned r = 0; r < R; ++r) scratch[r][lane] = sum[r];
+    __syncthreads();
+    for (unsigned stride = 128U; stride > 32U; stride >>= 1U) {
+        if (lane < stride)
+#pragma unroll
+            for (unsigned i = 0; i < R; ++i) scratch[i][lane] = __fadd_rn(scratch[i][lane], scratch[i][lane + stride]);
+        __syncthreads();
+    }
+    const unsigned wave = lane / 32U, l = lane % 32U;
+    for (unsigned i = wave; i < R; i += 8U) {
+        float total = __fadd_rn(scratch[i][l], scratch[i][l + 32U]);
+#pragma unroll
+        for (int d = 16; d; d >>= 1) total = __fadd_rn(total, __shfl_xor_sync(kFull, total, d));
+        if (l == 0U) totals[i] = total;
+    }
+    __syncthreads();
+    if (lane < R) {
+        const unsigned row = lane;
+        const float raw = round_bf16(totals[row]);
+        const std::uint64_t offset = static_cast<std::uint64_t>(row) * rows.stride + out0;
+        if (alpha) {
+            const float biased = __fadd_rn(raw, dt[out0]);
+            float sp;
+            if (biased > 20.0F) sp = biased;
+            else {
+                const float e = am::amd_expf(t, biased);
+                sp = biased < -20.0F ? e : am::amd_log1pf(t, e);
+            }
+            rows.gate[offset] = __fmul_rn(a[out0], sp);
+        } else {
+            rows.beta[offset] = round_bf16(__fdiv_rn(1.0F, __fadd_rn(1.0F, am::amd_expf(t, -raw))));
+        }
+    }
+}
+
+// conv_prepass_kernel + conv_kernel (chunk 0, count <= 8) + the raw_qkv copy for one 128-channel block. The block owns its
+// channels exclusively: it stages the 3 history rows and the raw rows in shared memory (and copies raw FP32 rows to
+// raw_qkv), synchronises, stores the new history (raw rows count-4..count-1 = raw[count-1+i]), then runs conv_body's math.
+template <unsigned R>
+__device__ __forceinline__ void conv_dec_body(const Rows& rows, std::uint16_t* __restrict__ conv_state, float* __restrict__ raw_qkv,
+    const float* __restrict__ conv_w, float epsilon, const am::Tables& t, unsigned block) {
+    __shared__ std::uint16_t raw[R + 3U][kHeadDim];
+    const unsigned thread = threadIdx.x, lane = thread % 32U, wave = thread / 32U;
+    const unsigned base = block * kHeadDim;
+    const bool is_qk = block < kKeyHeads * 2U, is_key = is_qk && block >= kKeyHeads;
+    for (unsigned i = thread; i < (R + 3U) * kHeadDim; i += 256U) {
+        const unsigned rr = i / kHeadDim, c = i % kHeadDim;
+        if (rr < 3U) raw[rr][c] = conv_state[static_cast<std::uint64_t>(base + c) * kConvKernel + rr + 1U];
+        else {
+            const float v = rows.qkv[static_cast<std::uint64_t>(rr - 3U) * rows.stride + base + c];
+            if (raw_qkv) raw_qkv[static_cast<std::uint64_t>(rr - 3U) * kConvWidth + base + c] = v;
+            raw[rr][c] = float_to_bf16(v);
+        }
+    }
+    float weight[4][kConvKernel];
+#pragma unroll
+    for (unsigned part = 0; part < 4U; ++part)
+#pragma unroll
+        for (unsigned i = 0; i < kConvKernel; ++i)
+            weight[part][i] = conv_w[static_cast<std::uint64_t>(base + part * 32U + lane) * kConvKernel + i];
+    const float q_scale = is_key ? 1.0F : am::amd_rsqrtf(t, static_cast<float>(kHeadDim));
+    __syncthreads();
+    if (thread < kHeadDim)
+#pragma unroll
+        for (unsigned i = 0; i < kConvKernel; ++i)
+            conv_state[static_cast<std::uint64_t>(base + thread) * kConvKernel + i] = raw[R - 1U + i][thread];
+    for (unsigned local = wave; local < R; local += 8U) {
+        float value[4], square[4];
+#pragma unroll
+        for (unsigned part = 0; part < 4U; ++part) {
+            const unsigned channel = part * 32U + lane;
+            float sum = __fmaf_rn(bf16_to_float(raw[local][channel]), weight[part][0], 0.0F);
+#pragma unroll
+            for (unsigned i = 1; i < kConvKernel; ++i) sum = __fmaf_rn(bf16_to_float(raw[local + i][channel]), weight[part][i], sum);
+            const float silu = __fdiv_rn(sum, __fadd_rn(1.0F, am::amd_expf(t, -sum)));
+            value[part] = round_bf16(silu);
+            square[part] = __fmul_rn(value[part], value[part]);
+        }
+        if (is_qk) {
+            const float inverse = am::amd_rsqrtf(t, __fadd_rn(key_sum(square), epsilon));
+#pragma unroll
+            for (unsigned part = 0; part < 4U; ++part) value[part] = __fmul_rn(__fmul_rn(value[part], inverse), q_scale);
+        }
+        float* out = rows.qkv + static_cast<std::uint64_t>(local) * rows.stride + base + lane;
+#pragma unroll
+        for (unsigned part = 0; part < 4U; ++part) out[part * 32U] = value[part];
+    }
+}
+template <unsigned R>
+__global__ __launch_bounds__(256) void decode_front_kernel(const std::uint16_t* __restrict__ input, std::uint64_t input_stride,
+    Rows rows, const float* __restrict__ beta_w, const float* __restrict__ alpha_w, const float* __restrict__ dt,
+    const float* __restrict__ a, const float* __restrict__ conv_w, float epsilon, am::Tables t, DevRef<std::uint16_t> conv_ref,
+    float* __restrict__ raw_qkv) {
+    if (blockIdx.x < kDecConvBlocks) conv_dec_body<R>(rows, conv_ref.get(), raw_qkv, conv_w, epsilon, t, blockIdx.x);
+    else gates_dec_body<R>(input, input_stride, rows, beta_w, alpha_w, dt, a, t, blockIdx.x - kDecConvBlocks);
+}
+
+// Recurrence with the decay folded in; blocks >= kValueHeads * 4 (only when launched with them: the commit replay) are the
+// conv rollback (conv_rollback_kernel over 32 * G channels per block) of the same commit.
+template <unsigned G>
+__global__ __launch_bounds__(RecShape<G>::Threads) void recurrence_dec_kernel(Rows rows, std::uint32_t count, DevRef<float> in_ref,
+    DevRef<float> out_ref, am::Tables t, const float* __restrict__ raw_qkv, const std::uint16_t* __restrict__ before,
+    std::uint16_t* __restrict__ conv_state) {
+    constexpr unsigned kRecBlocks = kValueHeads * (kHeadDim / 32U);
+    if (blockIdx.x < kRecBlocks) {
+        recurrence_body<G, RecurrentStateType::f32, false, true>(rows, count, in_ref.get(), out_ref.get(), nullptr, &t);
+        return;
+    }
+    const unsigned ch = (blockIdx.x - kRecBlocks) * RecShape<G>::Threads + threadIdx.x;
+    if (ch >= kConvWidth) return;
+#pragma unroll
+    for (unsigned i = 0; i < kConvKernel; ++i) {
+        const int row = static_cast<int>(count) - 4 + static_cast<int>(i);
+        conv_state[static_cast<std::uint64_t>(ch) * kConvKernel + i] = row >= 0
+            ? float_to_bf16(raw_qkv[static_cast<std::uint64_t>(row) * kConvWidth + ch])
+            : before[static_cast<std::uint64_t>(ch) * kConvKernel + static_cast<unsigned>(row + 4)];
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------------- K6
 // gdn_prefill_norm_rows_kernel (:3000-3029): one warp per (row, head); inv = rsqrtf(key_sum(v^2)/128 + eps);
 // result = ((v*inv)*w[c])*(1/(1+expf(-z))). A8: dense_a8_quantize_lane (hip_q8_rows_gemv.hpp:1147-1159, contract off).
@@ -464,6 +623,55 @@ void check_rows(const Rows& rows) {
         throw std::invalid_argument("qwen_gdn: missing row workspace");
 }
 
+
+bool decode_fused_enabled() {
+    static const bool on = strix::envcfg::flag("STRIX_QRTX_GDN_DECODE", true);
+    return on;
+}
+void check_aligned(const Rows& rows) {
+    if (rows.stride % 4U || reinterpret_cast<std::uintptr_t>(rows.qkv) % 16U)
+        throw std::invalid_argument("qwen_gdn: qkv rows must be 16-byte aligned");
+}
+// recurrence_dec_kernel launch: the recurrence blocks plus (raw_qkv != nullptr) the conv rollback blocks
+void launch_recurrence_dec(const Rows& rows, std::uint32_t count, DevRef<float> state_in, DevRef<float> state_out,
+    const float* raw_qkv, const std::uint16_t* before, std::uint16_t* conv_state, const amdmath::Tables& t, cudaStream_t stream,
+    Tuning tuning) {
+    const auto go = [&](auto kernel, unsigned g) {
+        const unsigned rec = kValueHeads * (kHeadDim / 32U), extra = raw_qkv ? (kConvWidth + 32U * g - 1U) / (32U * g) : 0U;
+        kernel<<<rec + extra, 32U * g, 0, stream>>>(rows, count, state_in, state_out, t, raw_qkv, before, conv_state);
+    };
+    switch (tuning.lanes) {
+    case 2: go(recurrence_dec_kernel<2>, 2); break;
+    case 4: go(recurrence_dec_kernel<4>, 4); break;
+    case 8: go(recurrence_dec_kernel<8>, 8); break;
+    case 16: go(recurrence_dec_kernel<16>, 16); break;
+    default: throw std::invalid_argument("qwen_gdn: lanes must be 2, 4, 8 or 16");
+    }
+    check(cudaGetLastError(), "recurrence decode launch");
+}
+template <unsigned R>
+void front_go(const std::uint16_t* input, std::uint64_t input_stride, const Rows& rows, const Weights& w, const amdmath::Tables& t,
+    DevRef<std::uint16_t> conv_state, float* raw_qkv, cudaStream_t stream) {
+    decode_front_kernel<R><<<kDecConvBlocks + kDecGateBlocks, 256, 0, stream>>>(input, input_stride, rows, w.beta, w.alpha, w.dt,
+        w.a, w.conv, w.qk_l2_epsilon, t, conv_state, raw_qkv);
+}
+// K3 + K4 (+ raw copy) + K5 of a 1..8-row window: front kernel, then the recurrence with the decay folded in
+void launch_decode_core(const std::uint16_t* input, std::uint64_t input_stride, const Rows& rows, std::uint32_t count,
+    DevRef<std::uint16_t> conv_state, DevRef<float> state_in, DevRef<float> state_out, float* raw_qkv, const Weights& w,
+    const amdmath::Tables& t, cudaStream_t stream, Tuning tuning) {
+    switch (count) {
+    case 1: front_go<1>(input, input_stride, rows, w, t, conv_state, raw_qkv, stream); break;
+    case 2: front_go<2>(input, input_stride, rows, w, t, conv_state, raw_qkv, stream); break;
+    case 3: front_go<3>(input, input_stride, rows, w, t, conv_state, raw_qkv, stream); break;
+    case 4: front_go<4>(input, input_stride, rows, w, t, conv_state, raw_qkv, stream); break;
+    case 5: front_go<5>(input, input_stride, rows, w, t, conv_state, raw_qkv, stream); break;
+    case 6: front_go<6>(input, input_stride, rows, w, t, conv_state, raw_qkv, stream); break;
+    case 7: front_go<7>(input, input_stride, rows, w, t, conv_state, raw_qkv, stream); break;
+    default: front_go<8>(input, input_stride, rows, w, t, conv_state, raw_qkv, stream); break;
+    }
+    check(cudaGetLastError(), "decode front launch");
+    launch_recurrence_dec(rows, count, state_in, state_out, nullptr, nullptr, nullptr, t, stream, tuning);
+}
 }  // namespace
 
 std::size_t conv_scratch_bytes(std::uint32_t count) {
@@ -571,6 +779,22 @@ void launch_recurrence_ref(const Rows& rows, std::uint32_t count, DevRef<float> 
 }
 }  // namespace
 
+void launch_commit_replay(const Rows& rows, std::uint32_t keep, const float* state_in, float* state_out, const float* raw_qkv,
+    const std::uint16_t* conv_before, std::uint16_t* conv_state, void* scratch, const amdmath::Tables& t, cudaStream_t stream,
+    Tuning tuning) {
+    // PROVISIONAL decline for 16-bit state: fused staging reads/writes f32 state directly
+    // through recurrence_dec_kernel (src/cuda/models/qwen/qwen_gdn.cu:554); use the typed split path.
+    if (decode_fused_enabled() && keep && tuning.state_type == RecurrentStateType::f32) {
+        check_rows(rows);
+        check_aligned(rows);
+        launch_recurrence_dec(rows, keep, DevRef<float>{const_cast<float*>(state_in)}, DevRef<float>{state_out}, raw_qkv, conv_before,
+            conv_state, t, stream, tuning);
+        return;
+    }
+    launch_recurrence_split(rows, keep, state_in, state_out, scratch, t, stream, tuning);
+    launch_conv_rollback(raw_qkv, keep, conv_before, conv_state, stream);
+}
+
 void launch_norm(const Rows& rows, std::uint32_t count, const Weights& w, const amdmath::Tables& t, cudaStream_t stream,
     const A8Out* a8) {
     check_rows(rows);
@@ -590,6 +814,14 @@ void launch_core(const std::uint16_t* input, std::uint64_t input_stride, const R
 void launch_core_split(const std::uint16_t* input, std::uint64_t input_stride, const Rows& rows, std::uint32_t count,
     std::uint16_t* conv_state, const float* state_in, float* state_out, float* raw_qkv, void* scratch, const Weights& w,
     const amdmath::Tables& t, cudaStream_t stream, const A8Out* a8, Tuning tuning) {
+    if (count >= 1 && count <= 8 && decode_fused_enabled() && tuning.state_type == RecurrentStateType::f32) {
+        check_rows(rows);
+        check_aligned(rows);
+        launch_decode_core(input, input_stride, rows, count, DevRef<std::uint16_t>{conv_state}, DevRef<float>{const_cast<float*>(state_in)},
+            DevRef<float>{state_out}, raw_qkv, w, t, stream, tuning);
+        launch_norm(rows, count, w, t, stream, a8);
+        return;
+    }
     launch_gates(input, input_stride, rows, count, w, t, stream);
     if (raw_qkv)
         check(cudaMemcpy2DAsync(raw_qkv, std::size_t{kConvWidth} * 4U, rows.qkv, rows.stride * 4U, std::size_t{kConvWidth} * 4U, count,
@@ -660,6 +892,13 @@ void launch_core_multi(const std::uint16_t* input, std::uint64_t input_stride, c
 void launch_core_split_ref(const std::uint16_t* input, std::uint64_t input_stride, const Rows& rows, std::uint32_t count,
     DevRef<std::uint16_t> conv_state, DevRef<float> state_in, DevRef<float> state_out, float* raw_qkv, void* scratch,
     const Weights& w, const amdmath::Tables& t, cudaStream_t stream, const A8Out* a8, Tuning tuning) {
+    if (count >= 1 && count <= 8 && decode_fused_enabled() && tuning.state_type == RecurrentStateType::f32) {
+        check_rows(rows);
+        check_aligned(rows);
+        launch_decode_core(input, input_stride, rows, count, conv_state, state_in, state_out, raw_qkv, w, t, stream, tuning);
+        launch_norm(rows, count, w, t, stream, a8);
+        return;
+    }
     launch_gates(input, input_stride, rows, count, w, t, stream);
     if (raw_qkv)
         check(cudaMemcpy2DAsync(raw_qkv, std::size_t{kConvWidth} * 4U, rows.qkv, rows.stride * 4U, std::size_t{kConvWidth} * 4U, count,

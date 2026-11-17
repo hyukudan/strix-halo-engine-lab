@@ -60,6 +60,7 @@ struct WeightCaps {
     std::array<bool, 3> source{true, false, false};  // native always
     std::array<bool, 9> bits{};                      // bits[b]: onfly / converted at b bits
     std::string_view onfly_method = "rtn-g32";       // identity of the onfly rounding (group size, scales, Hadamard)
+    std::string_view onfly_element = "int";          // element family of the onfly image: int (INT4 ...) | nvfp (E2M1)
     std::string_view onfly_pending = "onfly low-bit load is not implemented in this build";
     std::string_view converted_pending = "converted low-bit pack loader is not implemented in this build";
 };
@@ -81,14 +82,17 @@ struct Weights {
     Source requested = Source::native, effective = Source::native;
     unsigned requested_bits = 0, effective_bits = 0;  // 0: the pack's own widths (native)
     std::string pack{}, method{};
+    std::string element = "int";                      // onfly element family (WeightCaps::onfly_element)
     std::string origin = "builtin";                   // builtin | profile | env | cli
     std::string reason{};                             // why requested != effective; empty: honoured
 
     [[nodiscard]] bool honoured() const { return reason.empty(); }
-    // Named identity per source and width: "native", "onfly-int4-rtn-g32", "converted-int4".
+    // Named identity per source, element and width: "native", "onfly-int4-rtn-g32", "onfly-nvfp4-rtn-g16",
+    // "converted-int4".
     [[nodiscard]] std::string identity() const {
         if (effective == Source::native) return "native";
-        std::string out = std::string(source_name(effective)) + "-int" + std::to_string(effective_bits);
+        const std::string& e = effective == Source::onfly ? element : std::string("int");
+        std::string out = std::string(source_name(effective)) + "-" + e + std::to_string(effective_bits);
         if (effective == Source::onfly && !method.empty()) out += "-" + method;
         return out;
     }
@@ -140,7 +144,10 @@ inline Weights resolve_weights(bool turbo, const WeightsRequest& cli, const Env&
     if (!w.reason.empty()) { w.pack.clear(); return w; }  // effective stays native; require_honoured() refuses
     w.effective = w.requested;
     w.effective_bits = w.requested_bits;
-    if (w.effective == Source::onfly) w.method = std::string(caps.onfly_method);
+    if (w.effective == Source::onfly) {
+        w.method = std::string(caps.onfly_method);
+        w.element = std::string(caps.onfly_element);
+    }
     return w;
 }
 
