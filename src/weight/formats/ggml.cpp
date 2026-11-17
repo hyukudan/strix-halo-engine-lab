@@ -24,7 +24,9 @@ std::span<const FormatDescriptor> ggml_formats() {
   descriptor({"gguf.iq1_m",1},"GGUF:29",quantized_linear,false,fixed<256,56>),
   descriptor({"gguf.tq1_0",1},"GGUF:34",quantized_linear,false,fixed<256,54>),
   descriptor({"gguf.tq2_0",1},"GGUF:35",quantized_linear,false,fixed<256,66>),
-  descriptor({"gguf.q2_0.strix",1},"GGUF:42",quantized_linear,true,fixed<64,18>,true)
+  descriptor({"gguf.q2_0.strix",1},"GGUF:42",quantized_linear,true,fixed<64,18>,true),
+  // Private IU4 g64 dense pack (core/iu4.hpp): container geometry only, no ggml semantic decoder.
+  descriptor({"gguf.iu4_g64.strix",1},"GGUF:200",quantized_linear,false,fixed<64,34>)
  };
  return formats;
 }

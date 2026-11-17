@@ -96,4 +96,4 @@ parts.append("cudaError_t attr_flash() {" + text + "return cudaSuccess; }")
 text = (root / "apps/hip_qwen35_spec_main.hip").read_text()
 a = text.index("    std::size_t bad =")
 b = text.index(";", a) + 1
-(out / "audit_lengths.inc").write_text("std::size_t incomplete(const std::vector<unsigned>& out, const std::vector<unsigned>& ref, unsigned n_gen) {" + text[a:b] + "return bad; }")
+(out / "audit_lengths.inc").write_text("std::size_t incomplete(const std::vector<unsigned>& out, const std::vector<unsigned>& ref, unsigned n_gen) { const unsigned n_run = n_gen;" + text[a:b] + "return bad; }")

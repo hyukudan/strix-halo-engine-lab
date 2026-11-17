@@ -1,6 +1,7 @@
 #include "minimax/engine/route_identity.hpp"
 #include "core/layer_set.hpp"
 #include "core/i4_shadow.hpp"
+#include "core/f16_dense_tall.hpp"
 #include "core/hip_range_weight_loader.hpp"
 #include "minimax/engine/mm_fast_i4.hpp"
 // MiniMax M3.1 Flash engine, TP2 (see include/strix/minimax/engine.hpp and qualification notes).
@@ -536,6 +537,7 @@ struct Layer {
     _Float16 *wiq16b = nullptr, *wik16b = nullptr;
     _Float16* wip = nullptr;  // packed index projection (pack_index_proj layout); only the selected layouts are resident
     float *wiq = nullptr, *wik = nullptr, *norm[4] = {}, *w_post = nullptr, *w_next = nullptr, *wr = nullptr, *wb = nullptr;
+    core::f16_dense_tall::DeviceStorage<std::uint16_t> wr16;  // FAST router weights, owned even during constructor unwinding
     bool moe = false;
     Mlp dense, shared;
     std::vector<Mlp> experts;
@@ -718,6 +720,12 @@ struct Engine::Impl {
     bool pf_router_batch = true;               // STRIX_MM_PF_ROUTER_BATCH: prefill only, default ON (prefill measurement exact); =0 off
     unsigned pf_router_rows = 32;               // STRIX_MM_PF_ROUTER_ROWS: 32 (default: tiled scores, weights read once per 16 rows), 4 or 8; same bits
     float* router_scratch = nullptr;           // tiled router scores [2][128][rows] (STRIX_MM_PF_ROUTER_ROWS=32)
+    // STRIX_MM_PF_ROUTER_WMMA=1 (FAST mm-pf-router-wmma-v1, opt-in; defaults::prefill_policy): the tiled router's product
+    // on the shared FP16 WMMA core for the layers of STRIX_MM_PF_ROUTER_WMMA_LAYERS (default 40-59), same scores scratch
+    // and selection; router_flags = its overflow guard (T rows, zero).
+    bool pf_router_wmma = false;
+    strix::core::LayerSet pf_router_wmma_layers;
+    core::f16_dense_tall::DeviceStorage<std::uint32_t> router_flags;
     bool pf_tx_uncached = false;              // STRIX_MM_PF_TX_UNCACHED: prefill producers write uncached TX
     bool pf_inplace = false;                   // STRIX_MM_PFX_INPLACE: o_proj / FFN outputs written straight into the TX slot
     bool pf_async_start = true, pf_late_src_fence = true;
@@ -1068,6 +1076,15 @@ struct Engine::Impl {
             lib.upload_raw(kP + "embed_tokens.weight", embed);
         }
         layers.resize(kLayers);
+        {   // FAST router product (opt-in): the one resolver's switch and layer set; its layers get FP16 weights below
+            const auto rp = defaults::prefill_policy(strix::envcfg::text);
+            pf_router_wmma = rp.router_wmma;
+            if (pf_router_wmma) {
+                pf_router_wmma_layers = strix::core::parse_layer_set(rp.router_wmma_layers.c_str(), 0, kLayers, "STRIX_MM_PF_ROUTER_WMMA_LAYERS");
+                std::fprintf(stderr, "prefill identity mm-pf-router-wmma-v1 FAST (router product on the FP16 WMMA core, form %s, layers %s)\n",
+                             moe::hip::router_wmma_form(), rp.router_wmma_layers.c_str());
+            }
+        }
         for (unsigned L = 0; L < kLayers; ++L) {
             Layer& y = layers[L];
             const std::string lp = kP + "layers." + std::to_string(L) + ".", a = lp + "self_attn.", b = lp + "block_sparse_moe.";
@@ -1132,6 +1149,11 @@ struct Engine::Impl {
             } else {
                 y.wr = dupload(pack.floats(b + "gate.weight"));
                 y.wb = dupload(pack.floats(b + "e_score_correction_bias"));
+                if (pf_router_wmma && pf_router_wmma_layers.test(L)) {  // converted once; the FP32 copy stays (fallback)
+                    y.wr16.reset(dalloc<std::uint16_t>(std::size_t{kExperts} * kHidden));
+                    moe::hip::convert_router_f16(y.wr, y.wr16.get(), nullptr);
+                    hip_ok(hipStreamSynchronize(nullptr), "router f16");
+                }
                 if (moe_opt) {
                     auto raw = [&](const std::string& pre, const char* const* nm) {
                         return mmoe::ExpertSlices{lib.raw_out(pre + nm[0], rank * kExpertLocal, kExpertLocal),
@@ -1464,6 +1486,10 @@ struct Engine::Impl {
         ids_d = route_d;
         wts4_d = reinterpret_cast<float*>(route_d + T * kTopE);
         router_scratch = dalloc<float>(moe::hip::router_tiled_scratch_floats(static_cast<std::uint32_t>(T)));  // any router form can be selected later
+        if (pf_router_wmma) {
+            router_flags.reset(dalloc<std::uint32_t>(T));
+            hip_ok(hipMemset(router_flags.get(), 0, T * sizeof(std::uint32_t)), "router flags");
+        }
         part = dalloc<float>(T * kHidden);
         remote = dalloc<float>(T * kHidden);
         if (pf != nullptr && pf->options().depth < pf_group) {
@@ -1683,6 +1709,13 @@ struct Engine::Impl {
         ++xb_warm_o_count;
     }
 
+    // The FP16 router weights of the layer whose FP32 router weights are `w` (nullptr: not a FAST router layer).
+    const std::uint16_t* router_f16(const float* w) const {
+        if (!pf_router_wmma || w == nullptr) return nullptr;
+        for (const Layer& y : layers)
+            if (y.wr == w) return y.wr16.get();
+        return nullptr;
+    }
     // Every post-exchange launch of the engine (STRIX_MM_XB_POSTILP selects the loads-first form, same bits).
     void enqueue_post(moe::hip::PostExchangeView view, hipStream_t stream) {
         view.ilp = xb_postilp ? xb_postilp_mode : 0U;
@@ -1691,8 +1724,13 @@ struct Engine::Impl {
             const float* router_w = view.router_w;
             view.router_w = nullptr;
             moe::hip::enqueue_post_exchange(view, stream);
+            const std::uint16_t* w16 = router_f16(router_w);
             // Tiled scores only on the measured piece sizes (1024..4096 rows); other piece sizes keep the 8-row form.
-            if (pf_router_rows == 32 && router_scratch != nullptr && view.rows >= 1024 && view.rows <= 4096)
+            if (w16 != nullptr && router_scratch != nullptr && router_flags != nullptr) {  // FAST mm-pf-router-wmma-v1 layer
+                moe::hip::enqueue_router_wmma(view.rows, view.y, router_w, w16, view.bias, view.ids, view.weights, router_scratch,
+                                              router_flags.get(), stream);
+                strix::route::launched(strix::route::Product::router, strix::route::Family::f16_wmma, view.rows);
+            } else if (pf_router_rows == 32 && router_scratch != nullptr && view.rows >= 1024 && view.rows <= 4096)
                 moe::hip::enqueue_router_tiled(view.rows, view.y, router_w, view.bias, view.ids, view.weights, router_scratch, stream);
             else
                 moe::hip::enqueue_router_batch(view.rows, view.y, router_w, view.bias, view.ids, view.weights, pf_router_rows == 4 ? 4U : 8U, stream);

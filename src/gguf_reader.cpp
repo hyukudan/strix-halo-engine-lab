@@ -310,6 +310,9 @@ private:
     }
 
     static bool valid_ggml_type(std::uint32_t type) {
+        if (type == type_strix_iu4_g64) {  // private IU4 g64 dense pack (core/iu4.hpp), see gguf_reader.hpp
+            return true;
+        }
         if (type == 42) {  // Q2_0: block 64, fp16 d + 2-bit codes (GSQ-RCO builds)
             return true;
         }
