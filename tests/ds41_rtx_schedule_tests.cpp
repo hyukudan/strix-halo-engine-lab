@@ -18,6 +18,17 @@
 static void budget_tests() {
     using namespace strix::ds41::rtx;
     constexpr double gib = 1073741824.0;
+    {   // a profile / memory_gib cap is the whole card: the use before this process comes off this process's allowance
+        constexpr std::uint64_t G = 1073741824ULL;
+        assert(card_cap_allowance_gib(32.0, 16 * G) == 16.0);                // PRO, 16 GiB external, rtx-5090-32 profile
+        assert(budget_bytes(card_cap_allowance_gib(32.0, 16 * G + 12345)) == 32 * G - 16 * G - 12345);  // byte exact
+        assert(card_cap_allowance_gib(32.0, 0) == 32.0);                     // no baseline (no NVML): charged whole, unchanged
+        assert(card_cap_allowance_gib(-1.0, 16 * G) == -1.0);                // no cap stays no cap
+        bool refused = false;
+        try { (void)card_cap_allowance_gib(24.0, 24 * G); } catch (const std::runtime_error&) { refused = true; }
+        assert(refused);                                                     // never fails open into "no cap"
+        std::cout << "PASS whole-card cap -> process allowance (profile cap minus the device's prior use)\n";
+    }
     constexpr std::uint64_t unit = 9953280, down = 3870720, MiB = 1ULL << 20;
     const auto same = [](const TierPlan& a, const TierPlan& b) {
         return a.resident == b.resident && a.pinned == b.pinned && a.disk == b.disk && a.inclusive == b.inclusive && a.spare_blocks == b.spare_blocks &&
