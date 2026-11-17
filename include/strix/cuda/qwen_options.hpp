@@ -317,34 +317,61 @@ inline cp::Choice choice_of(const qp::Config& c) {
 inline std::string config_arithmetic_contract(const qp::Config& c) {
     return with_expert_arithmetic(cp::arithmetic_contract(choice_of(c)), c.expert_arithmetic);
 }
-// Routed-expert arithmetic class the loaded engine dispatches (qwen_moe enqueue_routed): native IQ FP32 SIMT kernels
-// whenever a layer's expert types are native (qwen_moe::native_types, independent of --moe-mma), else the GSQ A8 dot4
-// contract, else the A8 form. Names are the wfmt capture classes (tests/cuda/qwen_moe_wfmt_capture.inc).
-inline std::string_view expert_dispatch_class(qwen_packs::ExpertArithmetic expert, bool moe_mma, bool native_experts) {
-    if (native_experts) return "cuda-native-iq-fp32@1";
-    if (expert == qwen_packs::ExpertArithmetic::gsq_a8_dot4) return qwen_packs::gsq_a8_contract;
-    return moe_mma ? "cuda-moe-mma@1" : "cuda-four-chain-imma@1";
+// Routed-expert arithmetic classes the loaded engine MAY dispatch (qwen_moe enqueue_routed), from load-time facts only.
+// native_experts (Prefill::native_experts) is true when ANY layer has native expert types: it proves the native IQ FP32
+// class is present (independent of --moe-mma) but cannot exclude A8 layers, so the A8 classes stay possible. When it
+// is false no layer is native and every layer takes the A8 route. --moe-mma is a requested form, not an execution
+// fact: prefill windows request it (run_block passes moe_mma && !window), decode windows never do and enqueue_routed
+// may fall back on decode rows, so a request for MMA keeps the four-chain class possible. Names are the wfmt capture
+// classes (tests/cuda/qwen_moe_wfmt_capture.inc).
+inline std::vector<std::string_view> expert_possible_classes(qwen_packs::ExpertArithmetic expert, bool moe_mma,
+                                                             bool native_experts) {
+    std::vector<std::string_view> out;
+    if (native_experts) out.push_back("cuda-native-iq-fp32@1");
+    if (expert == qwen_packs::ExpertArithmetic::gsq_a8_dot4) {
+        out.push_back(qwen_packs::gsq_a8_contract);
+    } else {
+        if (moe_mma) out.push_back("cuda-moe-mma@1");
+        out.push_back("cuda-four-chain-imma@1");
+    }
+    return out;
 }
-// Status receipt from loaded facts (Prefill::weight_pack_id / native_experts / moe_rows). Reporting only: the
-// declared contract, numerical identity and hand-off ids keep their bytes.
+// Status receipt from loaded facts (Prefill::weight_pack_id / native_experts / moe_rows) plus the declared form. The
+// scope is load-time presence: the class each window executed is reported per run (Timing::executed_forms) and is
+// not observed here. Reporting only: the declared contract, numerical identity and hand-off ids keep their bytes.
 inline ::strix::serve::Json expert_dispatch_json(const qp::Config& c, std::string_view weight_pack, bool native_experts,
                                                  const qp::MoeRowsPolicy& rows) {
     using J = ::strix::serve::Json;
     auto out = J::object();
     out.set("engine", J(std::string("cuda-qwen-moe")));
-    out.set("arithmetic", J(std::string(expert_dispatch_class(c.expert_arithmetic, c.forms.moe_mma, native_experts))));
+    out.set("scope", J(std::string("loaded-presence")));
+    auto classes = J::array();
+    for (const auto cls : expert_possible_classes(c.expert_arithmetic, c.forms.moe_mma, native_experts))
+        classes.push(J(std::string(cls)));
+    out.set("possible_classes", std::move(classes));
+    out.set("native_class", J(std::string(native_experts ? "present" : "absent")));
+    out.set("layer_mix", J(std::string(native_experts ? "unknown" : "a8-route-only")));
+    out.set("executed_class", J(std::string("not-observed")));
     out.set("declared_expert_arithmetic", J(std::string(qwen_packs::expert_arithmetic_name(c.expert_arithmetic))));
+    out.set("declared_moe_mma", J(c.forms.moe_mma));
     out.set("declared_contract", J(config_arithmetic_contract(c)));
     auto source = J::object();
     source.set("weight_pack", J(std::string(weight_pack)));
     source.set("native_experts", J(native_experts));
     source.set("moe_window_rows_effective", J(rows.effective));
     out.set("source", std::move(source));
-    out.set("reason", J(std::string(native_experts
-        ? "loaded expert types have no A8 route: native IQ FP32 kernels (the moe_mma form does not apply to experts)"
-        : c.expert_arithmetic == qwen_packs::ExpertArithmetic::gsq_a8_dot4
-            ? "loaded GSQ expert types under the explicit GSQ A8 dot4 contract"
-            : "loaded A8 expert types: the declared moe_mma form selects the expert arithmetic")));
+    out.set("reason", J(std::string(
+        (native_experts
+            ? "at least one layer has native expert types (native IQ FP32, independent of --moe-mma); the loaded fact "
+              "is any-layer, so A8 layers are not excluded"
+            : "no layer has native expert types: every layer takes the A8 route") +
+        std::string(c.expert_arithmetic == qwen_packs::ExpertArithmetic::gsq_a8_dot4
+            ? "; A8 layers run the explicit GSQ A8 dot4 contract"
+            : c.forms.moe_mma
+                ? "; --moe-mma is requested for prefill windows only (decode windows and the decode-row fallback run "
+                  "four-chain IMMA)"
+                : "; A8 layers run four-chain IMMA") +
+        "; per-window executed class is not observed by this receipt")));
     return out;
 }
 // Preserve historical route-only bytes; every enabled prefill form changes the snapshot target.
