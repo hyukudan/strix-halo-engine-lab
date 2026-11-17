@@ -23,6 +23,8 @@
 #include "strix/qwen35/config.hpp"
 #include "strix/qwen35/engine_types.hpp"
 
+namespace strix::spec { class DraftRows; }
+
 namespace strix::qwen35 {
 
 enum class PackFormat : std::uint8_t { bf16, q8_0 };
@@ -172,6 +174,12 @@ public:
     };
     MtpOut mtp_forward(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0,
                     bool want_top = true);  // want_top=false: skip lm_head + argmax (logits/top null): KV/hidden only
+    // Draft-only MTP head over a vocabulary subset (strix/spec/draft_rows.hpp, group 16 = one NVFP4 tile of the head):
+    // before each head launch the engine copies the rows' new tiles into a compact head (device-to-device, no
+    // re-quantisation) and maps the argmax back to token ids on the device, so MtpOut::top stays a token id. MtpOut::logits
+    // then hold the compact rows. nullptr = the full head (default). Requires an NVFP4 lm_head; the caller keeps `rows`
+    // alive while set. Drafts only steer acceptance: verify emits the target's own tokens either way.
+    void set_draft_rows(strix::spec::DraftRows* rows);
 
     // Host copies (synchronize the stream).
     void read_logits(const RowsOut& o, std::uint32_t row, float* host_vocab) const;

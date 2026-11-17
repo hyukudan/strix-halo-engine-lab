@@ -102,7 +102,7 @@ private:
     bool step_learned_ = false;
     double step_ms_;                          // marginal ms per extra chain step
     std::vector<double> model_ms_;            // scratch: Arbiter model_draft_ms table
-    std::array<std::array<double, 2>, 8> ext_{};  // hybrid extension (accept, reject) per depth
+    std::array<std::array<double, 2>, 16> ext_{};  // hybrid extension (accept, reject) per depth (chain_max_k <= 16)
 };
 
 // What BlockSpeculator needs from an engine: R-row verify of [anchor, drafts...] and a prefix commit.
