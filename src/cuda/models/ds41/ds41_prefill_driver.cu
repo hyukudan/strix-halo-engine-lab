@@ -1766,7 +1766,8 @@ CudaPrefill::CudaPrefill(const std::filesystem::path& gguf, const CudaPrefillOpt
                     streamed[l] = static_cast<std::uint64_t>(s[l - o.first_layer]) * static_cast<std::uint64_t>(expert_bytes);
                 const auto room = ds41::host_memory_room();
                 const double pinnable = room.known ? host_pin_headroom(double(room.free_physical), double(room.free_commit),
-                    o.host_commit_floor_gib * double(1ULL << 30)) : 0.0;
+                    o.host_commit_floor_gib * double(1ULL << 30))
+                    : o.host_tier_implicit ? 0.0 : -1.0;  // unknown: an opportunistic tier stays file-only, an explicit one is refused
                 const auto pick = resolve_host_pin_order(o.host_pin_order, streamed, o.host_expert_gib, pinnable, o.file_ring_mib, sp.slots);
                 o.host_pin_order = pick.order;
                 o.host_expert_gib = pick.host_gib;

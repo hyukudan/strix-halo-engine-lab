@@ -10,6 +10,10 @@ import tempfile
 import unittest
 
 ROOT, BASH = Path(sys.argv[1]), sys.argv[2]
+# scratch under the build tree when given (out-of-tree builds have no ROOT/build), else the system temp
+WORK = Path(sys.argv[3]) if len(sys.argv) > 3 else None
+if WORK is not None:
+    WORK.mkdir(parents=True, exist_ok=True)
 del sys.argv[1:]
 GOOD = dict(tokens=2, http_status=200, sha256='a' * 64, logits_fnv='b' * 16,
             next_token=7, wall_s=1.0, seconds={'prefill': 0.5})
@@ -27,7 +31,7 @@ class BenchmarkTests(unittest.TestCase):
         missing = copy.deepcopy(GOOD)
         del missing['sha256']
         cases.append(([missing, missing], False))
-        with tempfile.TemporaryDirectory(dir=ROOT / 'build') as td:
+        with tempfile.TemporaryDirectory(dir=WORK) as td:
             out = Path(td)
             for records, success in cases:
                 with self.subTest(records=records):
@@ -37,7 +41,7 @@ class BenchmarkTests(unittest.TestCase):
                     self.assertEqual(p.returncode == 0, success, p.stdout + p.stderr)
 
     def test_matrix_failure_propagation_and_cleanup(self):
-        with tempfile.TemporaryDirectory(dir=ROOT / 'build') as td:
+        with tempfile.TemporaryDirectory(dir=WORK) as td:
             root = Path(td)
             scripts = root / 'scripts/bench/cuda'
             scripts.mkdir(parents=True)

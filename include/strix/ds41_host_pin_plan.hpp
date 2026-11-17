@@ -211,6 +211,11 @@ inline HostPinChoice resolve_host_pin_order(HostPinOrder requested, std::span<co
         const auto ring = resolve_file_ring(requested, host_gib, ring_mib, slots);
         return {requested, ring.host_gib, ring.ring_mib, -1.0, "explicit order"};
     }
+    // pinnable_bytes < 0: host memory telemetry unknown, so the automatic order admits no pinned budget. A budget the
+    // caller asked for is refused with this reason instead of silently dropped; an explicit order pins without telemetry.
+    if (pinnable_bytes < 0.0 && host_gib > 0.0)
+        throw std::runtime_error("host pin order auto: host memory telemetry unavailable, the requested host budget is refused "
+                                 "(pass an explicit host pin order to pin it without telemetry)");
     double streamed = 0.0;
     for (const auto b : streamed_bytes) streamed += static_cast<double>(b);
     const double available_gib = std::max(0.0, pinnable_bytes) / double(1ULL << 30);

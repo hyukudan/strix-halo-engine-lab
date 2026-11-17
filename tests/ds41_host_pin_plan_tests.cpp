@@ -133,7 +133,15 @@ int main() try {
         check(big.layer_file_bytes > 10e9);
         const auto small = resolve_host_pin_order(HostPinOrder::automatic, streamed, 68.0, 80.0 * one_gib, 0, 2);  // F = 73.8 - 73.0
         check(small.order == HostPinOrder::layer && small.host_gib == 68.0 && small.ring_mib == kLegacyFileRingMib);
-        const auto unknown = resolve_host_pin_order(HostPinOrder::automatic, streamed, 56.0, -1.0, 0, 2);     // F = 73.8 - 60.1
+        // unknown telemetry: an asked-for budget is refused loudly (not dropped); without one the order is layer, nothing pinned
+        bool refused = false;
+        try {
+            (void)resolve_host_pin_order(HostPinOrder::automatic, streamed, 56.0, -1.0, 0, 2);
+        } catch (const std::runtime_error&) {
+            refused = true;
+        }
+        check(refused);
+        const auto unknown = resolve_host_pin_order(HostPinOrder::automatic, streamed, 0.0, -1.0, 0, 2);
         check(unknown.order == HostPinOrder::layer && unknown.host_gib == 0.0);
         const auto forced = resolve_host_pin_order(HostPinOrder::layer, streamed, 56.0, -1.0, 0, 2);
         check(forced.order == HostPinOrder::layer && forced.ring_mib == kLegacyFileRingMib && forced.layer_file_bytes < 0.0);

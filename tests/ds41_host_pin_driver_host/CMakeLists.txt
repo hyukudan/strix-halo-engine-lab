@@ -22,6 +22,6 @@ endif()
 add_test(NAME strix-ds41-host-pin-driver-tests COMMAND strix-ds41-host-pin-driver-tests)
 if(STRIX_HOST_PIN_BASH)
     add_test(NAME strix-ds41-prefill-matrix-kit-tests COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/matrix_tests.py"
-        "${STRIX_ROOT}" "${STRIX_HOST_PIN_BASH}")
+        "${STRIX_ROOT}" "${STRIX_HOST_PIN_BASH}" "${CMAKE_CURRENT_BINARY_DIR}/matrix-scratch")
     set_tests_properties(strix-ds41-prefill-matrix-kit-tests PROPERTIES TIMEOUT 90)
 endif()
