@@ -46,22 +46,27 @@ inline constexpr Lever table[] = {
      .target = "qwen-cuda-hc-f16mma-v1", .off = "0",
      .source = "hyper-connection projection/output on FP16 tensor cores, FP32 accumulation; qualification in progress; changes logits",
      .provisional = {false, true, false}},
+    // Not a member of the FAST bundle (kFastBundle): it only changes the draft head, which the prompt-logit gate does not
+    // see, and under the bundle's mtp_defer_prompt its rows run after the first token (no TTFT effect). Explicit in fast;
+    // its turbo cell keeps it in TURBO as before.
     {.name = "mtp_mma", .env = "STRIX_QRTX_MTP_MMA", .option = "--mtp-mma",
-     .value = {"", "1", ""}, .builtin = "0",
-     .kind = Kind::bit_changing, .ready = {true, false, true}, .runnable = {false, true, false},
+     .value = {"", "", "", "1"}, .builtin = "0",
+     .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {false, true, false, true},
      .target = "qwen-cuda-mtp-f16mma-v1", .off = "0",
      .source = "MTP fused projection on FP16 tensor cores, FP32 accumulation; qualification in progress; changes logits",
-     .provisional = {false, true, false}},
+     .provisional = {false, true, false, true}},
     {.name = "qsa_mma", .env = "STRIX_QRTX_QSA_MMA", .option = "--qsa-mma",
      .value = {"", "1", ""}, .builtin = "0",
      .kind = Kind::bit_changing, .ready = {true, false, true}, .runnable = {false, true, false},
      .target = "qwen-cuda-qsa-f16mma-v2", .off = "0",
-     .source = "QSA prefill attention on FP16 tensor cores, FP32 accumulation; qualification in progress; changes logits",
+     .source = "QSA prefill attention on the shared row-group core (core/attention_rowgroup.cuh: union of 4 rows' keys, BF16 "
+               "tensor cores, FP32 accumulation); union byte-equal in its fixture; logit gate pending; changes logits",
      .provisional = {false, true, false}},
-    // turbo cell "0" (builtin): TURBO experts are the integer expert_turbo row; the single-chain moe_mma form refuses a
-    // non-incumbent expert arithmetic (qwen_options.hpp resolve), and `--moe-mma on` stays available explicitly.
+    // fast cell empty and turbo cell "0" (builtin): FAST experts are the expert_fast row, TURBO experts the integer
+    // expert_turbo row; the single-chain moe_mma form refuses a non-incumbent expert arithmetic (qwen_options.hpp resolve),
+    // and `--moe-mma on` (with `--expert-fast off` under fast) stays available explicitly, e.g. for a non-GSQ pack.
     {.name = "moe_mma", .env = "STRIX_QRTX_MOE_MMA", .option = "--moe-mma",
-     .value = {"", "1", "", "0"}, .builtin = "0",
+     .value = {"", "", "", "0"}, .builtin = "0",
      .kind = Kind::bit_changing, .ready = {true, false, true, true}, .runnable = {false, true, false, true},
      .target = "qwen-cuda-moe-i8fma-v1", .off = "0",
      .source = "routed-MoE prefill gate/up and down on int8 tensor cores with one FP32 FMA chain per output; qualification in progress; changes logits",
@@ -75,8 +80,33 @@ inline constexpr Lever table[] = {
      .target = "gsq-iq-i8mma-turbo-cuda-v1", .off = "0",
      .source = "routed GSQ experts: A8 int8 activations x integer codes on int8 IMMA, one FP32 FMA per group; TURBO bar pending; changes logits",
      .provisional = {false, false, false, true}},
+    // FAST only: routed GSQ experts on BF16 tensor cores (gsq-iq-bf16mma-cuda-v1), the expert member of the FAST bundle.
+    // Same admission as expert_turbo: GSQ expert storage only (another pack refuses the start); `--expert-fast off` (or
+    // STRIX_QRTX_EXPERT_FAST=0) keeps the pack's own experts; an explicit --expert-arithmetic keeps its own contract.
+    {.name = "expert_fast", .env = "STRIX_QRTX_EXPERT_FAST", .option = "--expert-fast",
+     .value = {"", "1", "", "0"}, .builtin = "0",
+     .kind = Kind::bit_changing, .ready = {true, false, true, true}, .runnable = {false, true, false, false},
+     .target = "gsq-iq-bf16mma-cuda-v1", .off = "0",
+     .source = "routed GSQ experts: BF16 activations x exact BF16 codes on tensor cores, FP32 accumulation; alone: logit gate "
+               "PASS (pooled KL 0.00679, top-1 0.9912, dNLL -0.00145); bundle gate pending; changes logits",
+     .provisional = {false, true, false, false}},
+    // Exact (logits and state unchanged): the prompt's MTP rows run after the first token, as the identical call. Member
+    // of the FAST bundle (moves the MTP prompt K/V out of TTFT); runs only with an MTP sidecar.
+    {.name = "mtp_defer_prompt", .env = "STRIX_QRTX_MTP_DEFER_PROMPT", .option = "--mtp-defer-prompt",
+     .value = {"", "1", ""}, .builtin = "0",
+     .kind = Kind::exact, .ready = {true, true, true, true}, .runnable = {true, true, true, true},
+     .target = "", .off = "0",
+     .source = "deferred prompt MTP rows: exact (the identical MTP call after the first token; MTP fixture byte-equal)"},
 };
 inline std::span<const Lever> levers() { return table; }
+
+// The RTX Qwen FAST bundle = the fast column above: its members are the rows the fast profile selects, qualified TOGETHER
+// by one logit gate (KL <= 0.02, top-1 >= 0.93, dNLL <= 0.01 against the exact reference). The id names that set; any
+// member overridden (or any other bit-changing lever on) leaves the run outside the bundle (fast_bundle_status says why).
+// Not a member: qsa fused (exact opt-in STRIX_QRTX_QSA_FUSED): with qsa_mma on, attention() returns from the FAST core
+// before the fused branch (qwen_qsa.cu attention), so it would change nothing in the bundle's prefill.
+inline constexpr std::string_view kFastBundle = "qwen-cuda-fast-bundle-v1";
+inline constexpr std::string_view kFastBundleMembers[] = {"expert_fast", "qsa_mma", "hc_mma", "mtp_defer_prompt"};
 
 inline constexpr std::string_view kHcIdentity = "qwen-cuda-hc-f16mma-v1";
 inline constexpr std::string_view kMtpIdentity = "qwen-cuda-mtp-f16mma-v1";
@@ -87,6 +117,8 @@ inline constexpr std::string_view kMoeIdentity = "qwen-cuda-moe-i8fma-v1";
 struct Choice {
     bool moe_route_bf16 = false, hc_mma = false, mtp_mma = false, qsa_mma = false, moe_mma = false;
     bool expert_turbo = false;  // maps to Config::expert_arithmetic (its identity is the arithmetic name, not a form)
+    bool expert_fast = false;   // likewise (gsq-iq-bf16mma-cuda-v1)
+    bool mtp_defer_prompt = false;  // exact: Config::defer_prompt_mtp
     bool fast() const { return moe_route_bf16 || hc_mma || mtp_mma || qsa_mma || moe_mma; }
     bool operator==(const Choice&) const = default;
 };
@@ -110,7 +142,35 @@ inline Choice choose(const pr::Resolution& r) {
     c.qsa_mma = lever_on(r, "qsa_mma");
     c.moe_mma = lever_on(r, "moe_mma");
     c.expert_turbo = lever_on(r, "expert_turbo");
+    c.expert_fast = lever_on(r, "expert_fast");
+    c.mtp_defer_prompt = lever_on(r, "mtp_defer_prompt");
     return c;
+}
+// Flip together with the members' fast-column `ready` cells when the whole-bundle gate receipt passes.
+inline constexpr bool kFastBundleQualified = false;
+// Whether a resolved run IS the FAST bundle, decided on the effective values (not on how they were set): the expert
+// arithmetic (expert_bf16mma = Config::expert_arithmetic is gsq-iq-bf16mma-cuda-v1), forms exactly {hc_mma, qsa_mma}, no
+// route storage, and the prompt MTP deferred. id empty = outside the bundle; detail names every differing member.
+struct BundleStatus {
+    std::string id, detail;
+};
+inline BundleStatus fast_bundle_status(const Choice& c, bool expert_bf16mma) {
+    std::string missing;
+    const auto need = [&](bool ok, std::string_view what) {
+        if (!ok) missing += (missing.empty() ? "" : ", ") + std::string(what);
+    };
+    need(expert_bf16mma, "experts are not gsq-iq-bf16mma-cuda-v1");
+    need(c.qsa_mma, "qsa_mma off");
+    need(c.hc_mma, "hc_mma off");
+    need(c.mtp_defer_prompt, "mtp_defer_prompt off");
+    need(!c.moe_mma, "moe_mma on (not a member)");
+    need(!c.mtp_mma, "mtp_mma on (not a member)");
+    need(!c.moe_route_bf16, "moe_route_bf16 on (not a member)");
+    if (!missing.empty()) return {"", "outside " + std::string(kFastBundle) + ": " + missing};
+    std::string members;
+    for (const auto m : kFastBundleMembers) members += (members.empty() ? "" : ",") + std::string(m);
+    return {std::string(kFastBundle), "members " + members + (kFastBundleQualified ? "; qualified" :
+        "; provisional: the whole-bundle logit gate has not passed")};
 }
 inline std::string forms_list(const Choice& c) {
     std::string out;
