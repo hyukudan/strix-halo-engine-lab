@@ -6,6 +6,7 @@
 //   down/proj : decode once per tile + register blocking + fold (and the code view) == the per-chunk route, bit for bit.
 // No GPU. Release build, ctest; failures print and return 1 (no dialogs).
 #include "../../src/cuda/core/native_reuse.hpp"
+#include "../../src/cuda/core/native_mma.hpp"
 #include "../../src/cuda/weight/ggml_sources.cuh"
 
 #include <algorithm>
@@ -360,6 +361,181 @@ static void print_budgets() {
                 nr::TransposeFold<4>::shuffles(), nr::TransposeFold<8>::shuffles(), nr::TransposeFold<16>::shuffles(), nr::TransposeFold<32>::shuffles());
 }
 
+// ---- gsq-iq-bf16mma-cuda-v1 (native_mma.hpp): fragment geometry, exact conversions, hi/lo split, tile DAG ------------
+// The device sum order inside one MMA is the hardware's, so this oracle checks (a) that the kernel's register code pairs
+// every logical k exactly once on both operands, (b) that the operands are exact, and (c) the contract's error bound on
+// the tile DAG (FP32 half sums, fma group scales) against a double reference, beside the FP32-chain class for scale.
+namespace nm = strix::cuda::core::native_mma;
+static float bf16v(float v) { return nm::bf16_float(nm::bf16_rn(v)); }
+static double elem(u32 reg, u32 e) { return double(nm::bf16_float((reg >> (16U * e)) & 0xFFFFU)); }
+static u32 pair(float lo, float hi) { return nm::bf16_rn(lo) | (nm::bf16_rn(hi) << 16U); }
+
+static void test_mma_geometry(std::mt19937& rng) {
+    std::uniform_int_distribution<int> ci(-127, 127), xi(-200, 200);
+    for (int trial = 0; trial < 64; ++trial) {
+        float x[16][32]; int code[8][32];
+        for (auto& r : x) for (float& v : r) v = bf16v(float(xi(rng)) * 0.25F);
+        for (auto& r : code) for (int& c : r) c = ci(rng);
+        for (u32 h = 0; h < 2U; ++h) {
+            double A[16][16] = {}, B[16][8] = {}; int fa[16][16] = {}, fb[16][8] = {};
+            for (u32 lane = 0; lane < 32U; ++lane) {
+                const u32 g = lane / 4U, k = 16U * h + 4U * (lane % 4U);
+                u32 a[4];
+                nm::a_regs(pair(x[g][k], x[g][k + 1]), pair(x[g][k + 2], x[g][k + 3]), pair(x[g + 8][k], x[g + 8][k + 1]),
+                           pair(x[g + 8][k + 2], x[g + 8][k + 3]), a);
+                for (u32 r = 0; r < 4U; ++r) for (u32 e = 0; e < 2U; ++e) {
+                    const u32 row = nm::a_row(lane, r), p = nm::a_slot(lane, r, e);
+                    A[row][p] = elem(a[r], e); ++fa[row][p];
+                }
+                const u32 wi = nm::word_index(lane, h), col = nm::b_col(lane);
+                u32 word = 0;
+                for (u32 j = 0; j < 4U; ++j) word |= (u32(code[col][4U * wi + j]) & 255U) << (8U * j);
+                u32 b[2]; nm::code_pairs(word, b[0], b[1]);
+                for (u32 r = 0; r < 2U; ++r) for (u32 e = 0; e < 2U; ++e) {
+                    const u32 p = nm::b_slot(lane, r, e);
+                    B[p][col] = elem(b[r], e); ++fb[p][col];
+                }
+            }
+            for (u32 row = 0; row < 16U; ++row) for (u32 p = 0; p < 16U; ++p) {
+                check(fa[row][p] == 1 && A[row][p] == double(x[row][nm::logical_k(h, p)]), "mma A slot", h, row * 16U + p);
+                if (row < 8U) check(fb[p][row] == 1 && B[p][row] == double(code[row][nm::logical_k(h, p)]), "mma B slot", h, p * 8U + row);
+            }
+            for (u32 r = 0; r < 16U; ++r) for (u32 c = 0; c < 8U; ++c) {
+                double d = 0.0, ref = 0.0;
+                for (u32 p = 0; p < 16U; ++p) d += A[r][p] * B[p][c];
+                for (u32 k = 16U * h; k < 16U * h + 16U; ++k) ref += double(x[r][k]) * double(code[c][k]);
+                check(d == ref, "mma half sum", h, r * 8U + c);
+            }
+        }
+    }
+    int fc[16][8] = {};
+    for (u32 lane = 0; lane < 32U; ++lane) for (u32 i = 0; i < 4U; ++i) {
+        ++fc[nm::c_row(lane, i)][nm::c_col(lane, i)];
+        check(nm::b_col(nm::scale_lane(lane, i)) == nm::c_col(lane, i), "mma scale lane", lane, i);
+    }
+    for (u32 r = 0; r < 16U; ++r) for (u32 c = 0; c < 8U; ++c) check(fc[r][c] == 1, "mma C element", r, c);
+}
+
+static void test_mma_conversions(std::mt19937& rng) {
+    for (int c = -128; c <= 127; ++c) {
+        const float f = nm::bf16_float(nm::code_bf16(c));
+        check(f == float(c) && bits(f) == bits(float(c)), "code bf16 exact", u32(c + 128), 0);
+    }
+    std::uniform_int_distribution<u32> any;
+    for (int i = 0; i < 4096; ++i) {
+        const u32 w = any(rng); u32 b0, b1; nm::code_pairs(w, b0, b1);
+        for (u32 j = 0; j < 4U; ++j)
+            check(elem(j < 2U ? b0 : b1, j & 1U) == double(std::int8_t((w >> (8U * j)) & 255U)), "code pairs", w, j);
+    }
+    // bf16_rn against a direct nearest-even choice; specials: +-0, +-inf, max finite (overflows), subnormals.
+    std::vector<u32> pats = {0U, 0x80000000U, 0x7F800000U, 0xFF800000U, 0x7F7FFFFFU, 0x00000001U, 0x807FFFFFU, 0x00018000U, 0x3F808000U, 0x3F818000U};
+    for (int i = 0; i < 200000; ++i) pats.push_back(any(rng));
+    for (u32 u : pats) {
+        if ((u & 0x7FFFFFFFU) > 0x7F800000U) continue;
+        float x; std::memcpy(&x, &u, 4);
+        const u32 lo = u >> 16U, up = lo + 1U;
+        const double dl = std::fabs(double(x) - double(nm::bf16_float(lo)));
+        const double du = std::isinf(nm::bf16_float(up)) ? std::ldexp(1.0, 128) - std::fabs(double(x)) : std::fabs(double(nm::bf16_float(up)) - double(x));
+        const u32 want = (u & 0xFFFFU) == 0U ? lo : (dl < du || (dl == du && !(lo & 1U))) ? lo : up;
+        check(nm::bf16_rn(x) == want, "bf16 rn", u, 0);
+    }
+    // Split: |x - (hi + lo)| <= 2^-17 |x| for normal x; +-0 reconstruct exactly.
+    std::normal_distribution<float> nd(0.0F, 1.0F); std::uniform_int_distribution<int> ex(-100, 100);
+    double worst = 0.0;
+    for (int i = 0; i < 200000; ++i) {
+        const float x = std::ldexp(nd(rng), ex(rng));
+        if (x == 0.0F || !std::isnormal(x)) continue;
+        u32 hi, lo; nm::split(x, hi, lo);
+        const double rel = std::fabs(double(x) - (double(nm::bf16_float(hi)) + double(nm::bf16_float(lo)))) / std::fabs(double(x));
+        worst = std::max(worst, rel);
+        check(rel <= std::ldexp(1.0, -17), "split bound", bits(x), 0);
+    }
+    for (float z : {0.0F, -0.0F}) { u32 hi, lo; nm::split(z, hi, lo); check(nm::bf16_float(hi) + nm::bf16_float(lo) == 0.0F && (hi & 0x7FFFU) == 0U && lo == 0U, "split zero", bits(z), 0); }
+    std::printf("mma split: worst relative residual %.3g (bound 2^-17 = %.3g)\n", worst, std::ldexp(1.0, -17));
+}
+
+static double g_mma_worst = 0.0, g_fp32_worst = 0.0;
+// One tile of `count` rows through the project and down DAG of the tensor-core kernels, at reduced widths with the same
+// stage / block geometry (hidden 512: 4 project stages, 4 down blocks; ffn 128: 2 project blocks, 2 down stages).
+static void test_mma_tile(u32 tg, u32 td, u32 count, std::mt19937& rng) {
+    constexpr u32 hidden = 512U, ffn = 128U;
+    const auto gg = qt::geometry(tg), gd = qt::geometry(td);
+    const std::size_t grow = hidden / gg.block_elements * gg.block_bytes, drow = ffn / gd.block_elements * gd.block_bytes;
+    const auto gate = random_rows(tg, ffn, hidden, rng), up = random_rows(tg, ffn, hidden, rng), down = random_rows(td, hidden, ffn, rng);
+    std::normal_distribution<float> nd(0.0F, 1.0F);
+    std::vector<float> x(std::size_t(count) * hidden);
+    for (float& v : x) v = bf16v(nd(rng));
+    if (count > 1U) x[1] = -0.0F;
+    const bool gh = tg == qt::t_iq2_s, dh = td == qt::t_iq2_s;
+    // Model of one (row, output): FP32 half sums of exact products, then fma with the group scale; double reference.
+    auto dot = [&](bool halves, u32 t, const u8* wrow, const float* in, u32 width, bool split_in, double& ref, double& mag, float& fp32) {
+        float acc = 0.0F; ref = 0.0; mag = 0.0; fp32 = 0.0F;
+        for (u32 g = 0; g < width / 32U; ++g) {
+            const Codes cw = factor(t, wrow, g);
+            double half[2] = {0.0, 0.0};
+            for (u32 k = 0; k < 32U; ++k) {
+                double v = double(in[32U * g + k]);
+                if (split_in) { u32 hi, lo; nm::split(in[32U * g + k], hi, lo); v = double(nm::bf16_float(hi)) + double(nm::bf16_float(lo)); }
+                half[k >> 4] += v * double(cw.c[k]);
+                const double w = double(cw.s[k >> 4]) * double(cw.c[k]);
+                ref += w * double(in[32U * g + k]); mag += std::fabs(w * double(in[32U * g + k]));
+                fp32 = std::fmaf(cw.s[k >> 4] * float(cw.c[k]), in[32U * g + k], fp32);
+            }
+            if (halves) { acc = std::fmaf(float(half[0]), cw.s[0], acc); acc = std::fmaf(float(half[1]), cw.s[1], acc); }
+            else acc = std::fmaf(float(half[0] + half[1]), cw.s[0], acc);
+        }
+        return acc;
+    };
+    auto judge = [&](float got, double ref, double mag, float fp32, u32 groups, bool split_in, const char* what, u32 i) {
+        if (!std::isfinite(mag) || mag == 0.0) return;
+        const double tol = (2.0 * groups + 4.0) * std::ldexp(1.0, -24) * mag + (split_in ? std::ldexp(1.0, -17) * mag : 0.0);
+        check(std::fabs(double(got) - ref) <= tol, what, count, i);
+        g_mma_worst = std::max(g_mma_worst, std::fabs(double(got) - ref) / mag);
+        g_fp32_worst = std::max(g_fp32_worst, std::fabs(double(fp32) - ref) / mag);
+    };
+    std::vector<int> wp(std::size_t(count) * ffn, 0), wd(std::size_t(count) * hidden, 0);
+    std::vector<float> h(std::size_t(count) * ffn, 0.0F);
+    for (u32 by = 0; by < ffn / nm::kProjectOutputs; ++by)
+        for (u32 warp = 0; warp < nm::kThreads / 32U; ++warp)
+            for (u32 lane = 0; lane < 32U; ++lane)
+                for (u32 m = 0; m < nm::m_blocks(count); ++m)
+                    for (u32 i = 0; i < 4U; ++i) {
+                        const u32 row = 16U * m + nm::c_row(lane, i), o = nm::project_output(by, warp, nm::c_col(lane, i));
+                        if (row >= count) continue;
+                        ++wp[std::size_t(row) * ffn + o];
+                        double ref, mag; float fp32;
+                        const float gv = dot(gh, tg, gate.data() + o * grow, &x[std::size_t(row) * hidden], hidden, false, ref, mag, fp32);
+                        judge(gv, ref, mag, fp32, hidden / 32U, false, "mma project gate", row * ffn + o);
+                        const float uv = dot(gh, tg, up.data() + o * grow, &x[std::size_t(row) * hidden], hidden, false, ref, mag, fp32);
+                        judge(uv, ref, mag, fp32, hidden / 32U, false, "mma project up", row * ffn + o);
+                        h[std::size_t(row) * ffn + o] = gv / (1.0F + std::exp(-gv)) * uv;
+                    }
+    for (std::size_t i = 0; i < wp.size(); ++i) check(wp[i] == 1, "mma project coverage", count, u32(i));
+    for (u32 by = 0; by < hidden / nm::kDownOutputs; ++by)
+        for (u32 warp = 0; warp < nm::kThreads / 32U; ++warp)
+            for (u32 n = 0; n < 2U; ++n)
+                for (u32 lane = 0; lane < 32U; ++lane)
+                    for (u32 m = 0; m < nm::m_blocks(count); ++m)
+                        for (u32 i = 0; i < 4U; ++i) {
+                            const u32 row = 16U * m + nm::c_row(lane, i), o = nm::down_output(by, warp, n, nm::c_col(lane, i));
+                            if (row >= count) continue;
+                            ++wd[std::size_t(row) * hidden + o];
+                            double ref, mag; float fp32;
+                            const float dv = dot(dh, td, down.data() + o * drow, &h[std::size_t(row) * ffn], ffn, true, ref, mag, fp32);
+                            judge(dv, ref, mag, fp32, ffn / 32U, true, "mma down", row * hidden + o);
+                        }
+    for (std::size_t i = 0; i < wd.size(); ++i) check(wd[i] == 1, "mma down coverage", count, u32(i));
+    // Staging coverage of the kernels' loops: project copies word t % 64 of rows t / 64 + 4 i; down thread t owns
+    // values 16 (t % 4) .. of row t / 4 (hi and lo planes alike).
+    std::vector<int> sp(std::size_t(count) * nm::kProjectK, 0), sd(std::size_t(count) * nm::kDownK, 0);
+    for (u32 t = 0; t < nm::kThreads; ++t) {
+        for (u32 r = t >> 6; r < count; r += nm::kThreads / 64U) { ++sp[r * nm::kProjectK + 2U * (t & 63U)]; ++sp[r * nm::kProjectK + 2U * (t & 63U) + 1U]; }
+        if ((t >> 2) < count) for (u32 k = 0; k < 16U; ++k) ++sd[(t >> 2) * nm::kDownK + 16U * (t & 3U) + k];
+    }
+    for (std::size_t i = 0; i < sp.size(); ++i) check(sp[i] == 1, "mma project staging", count, u32(i));
+    for (std::size_t i = 0; i < sd.size(); ++i) check(sd[i] == 1, "mma down staging", count, u32(i));
+}
+
 int main() {
     std::mt19937 rng(20261117U);
     test_codes(rng);
@@ -377,6 +553,14 @@ int main() {
     }
     test_tile_mapping(nr::LaneSeed::direct, qt::t_iq4_nl, 1U, true, rng);
     test_tile_mapping(nr::LaneSeed::zero_seeded, qt::t_iq3_s, 1U, true, rng);
+    test_mma_geometry(rng);
+    test_mma_conversions(rng);
+    for (u32 count : {1U, 9U, 37U, 64U}) {
+        u32 n = 0;
+        for (u32 tg : {qt::t_iq3_xxs, qt::t_iq3_s, qt::t_iq2_s, qt::t_iq4_xs, qt::t_q2_0})
+            test_mma_tile(tg, (n++ & 1U) ? qt::t_q2_0 : qt::t_iq4_nl, count, rng);
+    }
+    std::printf("mma tile DAG: worst |err| / sum|terms| %.3g (FP32 chain class on the same items %.3g)\n", g_mma_worst, g_fp32_worst);
     print_budgets();
     std::printf("native_reuse host test: %s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;

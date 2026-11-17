@@ -526,8 +526,8 @@ struct Prefill::Impl : BlockFields {
 void Prefill::Impl::upload_model() {
     // Retain admission of the original merged headers. `info` below describes device storage after transcode.
     admission = qwen_packs::admit_model(cfg.model_gguf,qwen_packs::expert_arithmetic_name(cfg.expert_arithmetic));
-    if(cfg.expert_arithmetic==qwen_packs::ExpertArithmetic::gsq_a8_dot4 && cfg.forms.moe_mma)
-        throw std::invalid_argument("GSQ A8: single-chain moe_mma composition unqualified");
+    if(cfg.expert_arithmetic!=qwen_packs::ExpertArithmetic::incumbent && cfg.forms.moe_mma)
+        throw std::invalid_argument("explicit GSQ expert arithmetic: single-chain moe_mma composition unqualified");
     if (!admission.pack) throw std::runtime_error("Qwen weight pack not admitted: " + admission.reason);
     constexpr std::uint64_t kChunk = std::uint64_t{256} << 20;
     std::uint8_t* staging[2] = {nullptr, nullptr};
@@ -664,7 +664,7 @@ void Prefill::Impl::upload_model() {
         probe.down_type = lw[l].down_type;
         native_experts = native_experts || moe::native_types(probe);
     }
-    if(cfg.expert_arithmetic==qwen_packs::ExpertArithmetic::gsq_a8_dot4 && route_policy.enabled)
+    if(cfg.expert_arithmetic!=qwen_packs::ExpertArithmetic::incumbent && route_policy.enabled)
         qwen_route::require_composition(true,qwen_route::Composition::other_weight_pack);
     // Validate the route against source admission. FAST dense transcodes may still have A8 experts.
     if (admission.pack->arithmetic == "exact" && native_experts)

@@ -1042,5 +1042,7 @@ __global__ __launch_bounds__(kNativeThreads) void native_down_kernel(const std::
     }
 }
 
-
 } // namespace strix::cuda::core::moe_a8
+
+// FAST tensor-core expert kernels (gsq-iq-bf16mma-cuda-v1); they use the tile constants and helpers above.
+#include "moe_a8_mma.cuh"

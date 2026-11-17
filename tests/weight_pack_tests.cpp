@@ -42,6 +42,10 @@ int main() {
         check(selected.pack && selected.pack->id=="qwen38-gsq-rco-iq3s-a8-v1","explicit A8 selects supported GSQ pack");
         check(selected.pack && selected.pack->arithmetic=="fast:gsq-iq3s-a8-dot4-cuda-v1","GSQ A8 names new FAST contract");
         check(selected.fingerprint==legacy.fingerprint,"arithmetic selection retains source inventory identity");
+        const auto bf16=admit(inv.view(),strix::qwen_packs::gsq_bf16_contract);
+        check(bf16.pack && bf16.pack->id=="qwen38-gsq-rco-iq3s-bf16mma-v1","explicit BF16 MMA selects its own GSQ pack");
+        check(bf16.pack && bf16.pack->arithmetic=="fast:gsq-iq-bf16mma-cuda-v1","GSQ BF16 MMA names its FAST contract");
+        check(bf16.fingerprint==legacy.fingerprint,"BF16 MMA selection retains source inventory identity");
         check(!admit(inv.view(),"unknown-arithmetic").pack,"unknown arithmetic cannot fall back");
         const auto wrong=layer(t::q4_k,t::q4_k,t::q8_0,t::q8_0,t::bf16);
         check(!admit(wrong.view(),strix::qwen_packs::gsq_a8_contract).pack,"explicit GSQ rejects legacy arithmetic storage");
