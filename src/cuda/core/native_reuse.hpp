@@ -97,13 +97,28 @@ STRIX_NATIVE_REUSE_HD bool next_stage(LaneSeed seed, unsigned groups, unsigned m
         if (position_groups(seed, tree_position(n), groups) != 0U) { next_m = n; next_group = tree_position(n); return true; }
     return false;
 }
+// Thread -> item map of moe_a8.cuh native_project_kernel (K = 2 outputs per matrix) and native_down_kernel (K = 4): 256
+// threads over a 64-row tile, warp w owns rows 8 w .. 8 w + 7 (warp-uniform skip of rows past the tile), lane = 2 og + rh,
+// a thread owns rows row(t, i) = 8 w + 4 rh + i (i < 4) and outputs output(t, k) = og + 16 k (k < K). Per 4 k-values a
+// thread reads 4 X rows and K (x matrices) W rows with one LDS.128 each and issues 16 K (x matrices) FMAs: every shared
+// operand feeds 2 K or 4 FMAs instead of 2 (the 1024-thread map of 2 rows x 2 items). Inside a quarter warp (8 lanes) the
+// X reads touch 2 rows and the W reads 4 consecutive outputs: distinct 16-byte bank quads at pitch 36 (host test).
+template <unsigned K> struct MicroTile {
+    static constexpr unsigned threads = 256U, rows = 4U, outputs = K, tile_rows = 64U, tile_outputs = 16U * K;
+    STRIX_NATIVE_REUSE_HD static constexpr unsigned row(unsigned t, unsigned i) { return (t >> 5) * 8U + (t & 1U) * 4U + i; }
+    STRIX_NATIVE_REUSE_HD static constexpr unsigned output(unsigned t, unsigned k) { return ((t & 31U) >> 1) + 16U * k; }
+};
+
 // Binary counter over N items: push(m, v) with m = 0..31 in order; after push(31, v), v holds the root of every item,
 // bitwise butterfly_root of the 32 lane values (host test). Levels 0..2 change every 1, 2, 4 pushes and use constant slot
 // indices (registers in a kernel); levels 3 and 4 are touched only at m = 7, 15, 23, 31, so a kernel instantiates Deep =
 // volatile float to keep them in thread-local memory (24 accesses per item set) instead of the register budget. The branches
-// depend only on m (warp-uniform).
-template <unsigned N, class Deep = float> struct TreeCounter {
-    float s[3][N];
+// depend only on m (warp-uniform). Mid = volatile float also moves level 2 (touched at m % 4 == 3, 8 of 32 pushes) out of
+// the register budget, for a kernel whose items fill it (native_project_kernel: 16 items x chain + leaf + levels 0..1).
+// The additions and their order do not depend on Deep or Mid.
+template <unsigned N, class Deep = float, class Mid = float> struct TreeCounter {
+    float s[2][N];
+    Mid s2[N];
     Deep d[2][N];
     STRIX_NATIVE_REUSE_HD static void fold(const float (&older)[N], float (&v)[N]) {
         for (unsigned i = 0; i < N; ++i) v[i] = add_rn(older[i], v[i]);
@@ -116,8 +131,8 @@ template <unsigned N, class Deep = float> struct TreeCounter {
         fold(s[0], v);
         if (!(m & 2U)) { keep(s[1], v); return; }
         fold(s[1], v);
-        if (!(m & 4U)) { keep(s[2], v); return; }
-        fold(s[2], v);
+        if (!(m & 4U)) { for (unsigned i = 0; i < N; ++i) s2[i] = v[i]; return; }
+        for (unsigned i = 0; i < N; ++i) v[i] = add_rn(float(s2[i]), v[i]);
         if (!(m & 8U)) { for (unsigned i = 0; i < N; ++i) d[0][i] = v[i]; return; }
         for (unsigned i = 0; i < N; ++i) v[i] = add_rn(float(d[0][i]), v[i]);
         if (!(m & 16U)) { for (unsigned i = 0; i < N; ++i) d[1][i] = v[i]; return; }
