@@ -81,6 +81,15 @@ bool hc_inject_vec_enabled() {
     static const bool on = strix::lever::select(hc_inject_vec_lever, {}).on;
     return on;
 }
+// STRIX_QRTX_HC_OUTPUT_BATCHED=0: the fused exact output epilogue computes its sigmoids one at a time again (each one's two
+// table gathers consumed by branches before the next starts). Bitwise: amd_expf_batch = amd_expf per element (same operations).
+inline constexpr strix::lever::Decl hc_output_batched_lever{
+    .name = "qwen_hc_output_batched_sigmoid", .env = "STRIX_QRTX_HC_OUTPUT_BATCHED", .exactness = strix::lever::Exactness::bitwise,
+    .default_on = true, .source = "wave4/next1112/rtx_hc3-REPORT.md: hc3 fixture hashes equal, exhaustive 2^32 sigmoid batch check"};
+bool hc_output_batched_enabled() {
+    static const bool on = strix::lever::select(hc_output_batched_lever, {}).on;
+    return on;
+}
 
 __device__ __forceinline__ float bf16_to_float(std::uint16_t v) { return __uint_as_float(static_cast<std::uint32_t>(v) << 16U); }
 // HIP store_activation (hip_hyper_mix_launcher.hip:202-214, hip_runtime_launchers.hip:118-128): RNE, no NaN case.
@@ -96,6 +105,16 @@ __device__ __forceinline__ float half_bits_to_float(std::uint16_t h) { return we
 // sigmoid(x) = 1.0F / (1.0F + expf(-x)) (hip_hyper_mix_launcher.hip:399-404; ISA [P], [O]).
 __device__ __forceinline__ float amd_sigmoid(const am::Tables& t, float x) {
     return __fdiv_rn(1.0F, __fadd_rn(1.0F, am::amd_expf(t, -x)));
+}
+// amd_sigmoid of N independent values (bits of amd_sigmoid per element; table gathers batched: amd_math.cuh amd_expf_batch).
+template <unsigned N>
+__device__ __forceinline__ void amd_sigmoid_batch(const am::Tables& t, const float (&x)[N], float (&y)[N]) {
+    float m[N];
+#pragma unroll
+    for (unsigned i = 0; i < N; ++i) m[i] = -x[i];
+    am::amd_expf_batch<N>(t, m, y);
+#pragma unroll
+    for (unsigned i = 0; i < N; ++i) y[i] = __fdiv_rn(1.0F, __fadd_rn(1.0F, y[i]));
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -394,8 +413,14 @@ constexpr unsigned kOutRows = hcs::kOutRows, kOutThreads = hcs::kOutThreads;
 // float4 slots of the idle lows buffer, 2 rows per iteration, one copy of the sigmoid code instead of 128 inline copies = 1.24 MB of
 // SASS that every CTA re-fetched): see include/strix/cuda/qwen_hc_exact_shape.hpp. Layout and loop shape only: same values.
 constexpr unsigned kOutLowPitch = hcs::kOutLowPitch, kOutHalfRows = hcs::kOutHalfRows, kOutMixRows = hcs::kOutMixRows;
+// Batched epilogue step: the same 2 rows x 4 streams = 8 sigmoids per step (same inline code size as the per-element loop,
+// whose 8 copies already fill the loop body), but 2 dependent gather round trips per step instead of 16.
+constexpr unsigned kOutSigRows = kOutMixRows;
 
-template <bool Fused, bool Compact = false>
+// Batched (lever qwen_hc_output_batched_sigmoid, default on): the fused epilogue takes kOutSigRows rows x 4 streams per step and
+// computes their sigmoids with amd_sigmoid_batch (all table gathers issued before the first is consumed). Same values, same
+// mix order; only the memory schedule differs. Off: the per-element amd_sigmoid loop (kOutMixRows rows per step).
+template <bool Fused, bool Compact = false, bool Batched = false>
 __global__ __launch_bounds__(128) void hc_output_kernel(const float* __restrict__ normalized, std::uint32_t rows,
     const std::uint32_t* __restrict__ up_codes, const float* __restrict__ up_scales, std::uint16_t* __restrict__ output,
     float* __restrict__ gates, am::Tables t, const std::uint16_t* __restrict__ xin = nullptr, const float* __restrict__ xnorm = nullptr) {
@@ -483,6 +508,36 @@ __global__ __launch_bounds__(128) void hc_output_kernel(const float* __restrict_
         for (unsigned r = 0; r < kOutHalfRows; ++r)
             slots[r * kOutThreads + threadIdx.x] = h == 0U ? make_float4(g[0][r], g[1][r], g[2][r], g[3][r])
                 : make_float4(g[0][kOutHalfRows + r], g[1][kOutHalfRows + r], g[2][kOutHalfRows + r], g[3][kOutHalfRows + r]);
+        if constexpr (Batched) {
+#pragma unroll 1
+            for (unsigned r0 = 0; r0 < kOutHalfRows; r0 += kOutSigRows) {
+                float n[kOutSigRows][kStreams], gs[kOutSigRows * kStreams], sig[kOutSigRows * kStreams];
+#pragma unroll
+                for (unsigned i = 0; i < kOutSigRows; ++i) {
+                    const unsigned row = row0 + kOutHalfRows * h + r0 + i;
+#pragma unroll
+                    for (unsigned s = 0; s < kStreams; ++s) {
+                        if (row >= rows) n[i][s] = 0.0F;
+                        else if constexpr (Compact)
+                            n[i][s] = norm_value(xin[static_cast<std::size_t>(row) * kWide + s * kHidden + f],
+                                                 normalized[static_cast<std::size_t>(row) * kNormalizedPitch + s], wn[s]);
+                        else n[i][s] = normalized[static_cast<std::size_t>(row) * kNormalizedPitch + s * kHidden + f];
+                    }
+                    const float4 gv = slots[(r0 + i) * kOutThreads + threadIdx.x];
+                    gs[i * kStreams + 0U] = gv.x; gs[i * kStreams + 1U] = gv.y; gs[i * kStreams + 2U] = gv.z; gs[i * kStreams + 3U] = gv.w;
+                }
+                amd_sigmoid_batch(t, gs, sig);
+#pragma unroll
+                for (unsigned i = 0; i < kOutSigRows; ++i) {
+                    const unsigned row = row0 + kOutHalfRows * h + r0 + i;
+                    float mixed = 0.0F;
+#pragma unroll
+                    for (unsigned s = 0; s < kStreams; ++s) mixed = __fmaf_rn(n[i][s], sig[i * kStreams + s], mixed);
+                    if (row < rows) output[static_cast<std::size_t>(row) * kHidden + f] = float_to_bf16(__fmul_rn(mixed, 0.25F));
+                }
+            }
+            continue;
+        }
 #pragma unroll 1
         for (unsigned r0 = 0; r0 < kOutHalfRows; r0 += kOutMixRows) {
             float n[kOutMixRows][kStreams], sig[kOutMixRows][kStreams];
@@ -1730,9 +1785,16 @@ void hc_mix(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream, u
         a.packed.down_codes, a.packed.down_scales, a.inject, a.normalized, a.injection, tables);
     check(cudaGetLastError(), "projection launch");
     const dim3 out_grid((a.rows + kOutRows - 1U) / kOutRows, kHidden / kOutThreads);
-    if ((stages & 4U) && !a.gates && compact)
+    const bool batched = hc_output_batched(a, hc_output_batched_enabled());
+    if ((stages & 4U) && !a.gates && compact && batched)
+        hc_output_kernel<true, true, true><<<out_grid, kOutThreads, 0, stream>>>(a.normalized, a.rows, a.packed.up_codes,
+            a.packed.up_scales, a.output, nullptr, tables, a.input, a.norm);
+    else if ((stages & 4U) && !a.gates && compact)
         hc_output_kernel<true, true><<<out_grid, kOutThreads, 0, stream>>>(a.normalized, a.rows, a.packed.up_codes, a.packed.up_scales,
             a.output, nullptr, tables, a.input, a.norm);
+    else if ((stages & 4U) && !a.gates && batched)
+        hc_output_kernel<true, false, true><<<out_grid, kOutThreads, 0, stream>>>(a.normalized, a.rows, a.packed.up_codes,
+            a.packed.up_scales, a.output, nullptr, tables);
     else if ((stages & 4U) && !a.gates)
         hc_output_kernel<true><<<out_grid, kOutThreads, 0, stream>>>(a.normalized, a.rows, a.packed.up_codes, a.packed.up_scales,
             a.output, nullptr, tables);

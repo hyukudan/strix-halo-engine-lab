@@ -80,7 +80,17 @@ int main() try {
     rejects([&] { (void)hc::hc_compact_workspace(a, 2U, true, true); });
     a.input = input; a.norm = nullptr;
     rejects([&] { (void)hc::hc_compact_workspace(a, 4U, true, true); });
-    std::puts("HC full/staged/compact/alignment admission passed");
+    // Exact fused output epilogue form: default (-1) follows the lever; an explicit per-call choice wins over it.
+    {
+        hc::HcMixArgs e;
+        require(e.output_batched == -1);
+        require(hc::hc_output_batched(e, true) && !hc::hc_output_batched(e, false));
+        e.output_batched = 0;
+        require(!hc::hc_output_batched(e, true) && !hc::hc_output_batched(e, false));
+        e.output_batched = 1;
+        require(hc::hc_output_batched(e, true) && hc::hc_output_batched(e, false));
+    }
+    std::puts("HC full/staged/compact/alignment admission + output epilogue form passed");
     return 0;
 } catch (const std::exception& error) {
     std::fprintf(stderr, "%s\n", error.what());
