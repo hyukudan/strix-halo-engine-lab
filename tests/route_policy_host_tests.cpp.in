@@ -7,6 +7,7 @@
 #include "minimax/engine/mm_fast_i4.hpp"
 #include "minimax/engine/route_identity.hpp"
 #include "moe_core/grouped_policy.hpp"
+#include "xport/exchange_format.hpp"
 #include "glm/prefill/glm_pf_exact.hpp"
 #include "glm/prefill/glm_pf_dense_policy.hpp"
 #include "glm/prefill/glm_pf_wmma.hpp"
@@ -65,6 +66,7 @@ namespace defaults {
 namespace route = strix::minimax::route;
 namespace fast_i4 = strix::minimax::engine::fast_i4;
 struct MiniMaxPolicies {
+    strix::xport::ExchangeFormat pf_fmt = strix::xport::ExchangeFormat::f32;
     static constexpr unsigned kFirstMoe = 3, kLayers = 62;
     struct { unsigned rank = 0; } opt;
     bool model_fast_i4 = true, fp32_prefill = false, moe_opt = true;
