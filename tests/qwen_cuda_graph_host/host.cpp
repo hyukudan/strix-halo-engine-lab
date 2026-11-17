@@ -9,6 +9,12 @@
 // No assert/abort: failures are ordinary process exits, including on Windows.
 constexpr unsigned kMaxStepRows = 8, kMaxSegments = 8, kScoreRowsPerWave = 4;
 constexpr unsigned kMaxSelected = 2048, kRun = 128;
+constexpr unsigned kTreeRows = 64, kTreeSeg = 256;  // tree scorer tiles (qwen_qsa.cu)
+struct dim3 {
+    unsigned x = 0, y = 0, z = 0;
+    dim3() = default;
+    dim3(unsigned a, unsigned b = 1U, unsigned c = 1U) : x(a), y(b), z(c) {}
+};
 constexpr int cudaSuccess = 0, cudaStreamCaptureModeRelaxed = 0, cudaMemcpyHostToDevice = 0;
 constexpr int cudaDevAttrMultiProcessorCount = 0;
 enum cudaStreamCaptureStatus { cudaStreamCaptureStatusNone, active, invalidated };
@@ -41,7 +47,12 @@ int cudaDeviceGetAttribute(int* count, int, int) { *count = 80; return cudaSucce
 bool decode_rows_enabled() { return true; }
 namespace core = strix::cuda::core;  // production calls core::decode_rows_max() (the real host-safe header)
 struct Workspace { unsigned max_blocks = 65536, chunk_rows = 8; };
-struct MultiShape { unsigned rows = 0, pool_grid = 0, score_grid = 0, slot_runs = 0; bool head_all = false; };
+struct MultiShape {
+    unsigned rows = 0, pool_grid = 0, score_grid = 0, slot_runs = 0;
+    dim3 tree_grid{0U, 0U, 0U};
+    bool head_all = false;
+    bool tree_aligned = true;
+};
 namespace qsa {
 struct LayerState { void *kv, *index, *pooled; std::uint32_t* valid; };
 struct SegmentState { unsigned rows; std::uint64_t pos; LayerState state; };
