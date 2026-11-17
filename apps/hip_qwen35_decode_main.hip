@@ -15,6 +15,7 @@
 
 #include "strix/qwen35/hip_engine.hpp"
 #include "../src/core/dense_linear.hpp"
+#include "../src/core/dense_linear_iu4.hpp"
 
 namespace {
 std::string sysfs_clock() {
@@ -66,11 +67,12 @@ int main(int argc, char** argv) try {
         else if (a == "--rows") rows = strix::core::parse_u32(next());
         else if (a == "--wide") wide = strix::core::parse_u32(next());  // prompt windows of N rows, last-row logits only (N > 16 = FAST wide prefill)
         else if (a == "--dump-logits") dump = next();
+        else if (a == "--iu4-reference") strix::core::dense_iu4::set_reference(true);  // exactness gate: dequantised-pack reference form
         else if (a == "--max-pos") maxpos = strix::core::parse_u32(next());
         else throw std::invalid_argument("unknown flag " + a);
     }
     if (model.empty() || rows < 1U || rows > HipEngine::max_rows())
-        throw std::invalid_argument("usage: --model GGUF [--prompt-ids 1,2,3] [--gen N] [--rows 1..16] [--dump-logits FILE] [--max-pos N]");
+        throw std::invalid_argument("usage: --model GGUF [--prompt-ids 1,2,3] [--gen N] [--rows 1..16] [--dump-logits FILE] [--iu4-reference] [--max-pos N]");
     const auto prompt = parse_ids(ids_arg);
     if (prompt.empty()) throw std::invalid_argument("empty prompt");
     strix::core::require_capacity(prompt.size(), gen, 0xFFFFFFFFULL);

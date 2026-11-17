@@ -3,6 +3,7 @@
 #include "strix/env_flags.hpp"
 #include "strix/pair/chain.hpp"
 #include "strix/handoff.hpp"
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
@@ -52,9 +53,37 @@ public:
     }
 };
 inline constexpr std::uint32_t kAct = 0x4C43'4101U, kKv = 0x4C43'4B02U;
-enum class Act { relay, direct };
-inline const char* act_name(Act a) { return a == Act::relay ? "relay" : "direct"; }
-struct Cli { std::optional<std::string> split, cut, block, act; };
+inline constexpr std::uint32_t kMetaV2 = 2;  // Meta::version of the ACT-first contract (Pieces)
+// relay: rank 0 forwards ACT to rank 1 over TCP (--cut-relay); link: over the pair link inside the engine (one control
+// exchange per chunk); direct: the producer sends ACT to both ranks. relay and link send the same bytes from the producer.
+enum class Act { relay, direct, link };
+// act-first: Meta v2, ACT urgent over every producer link, KV in the gaps (fragments); fifo: Meta v1, ACT -> KV -> next block.
+enum class Xport { act_first, fifo };
+inline const char* xport_name(Xport x) { return x == Xport::act_first ? "act-first" : "fifo"; }
+inline const char* act_name(Act a) { return a == Act::relay ? "relay" : a == Act::link ? "link" : "direct"; }
+struct Cli { std::optional<std::string> split, cut, block, act, xport, kv_frag; };
+// Consume shared policy flags before an engine's execution parser sees the remaining arguments.
+// Recognition and value consumption live together, including for flags added to this contract later.
+inline Cli take_cli(int& argc, char** argv, int first) {
+    Cli cli;
+    int out = std::min(first, argc);
+    for (int i = first; i < argc; ++i) {
+        const std::string_view flag = argv[i];
+        std::optional<std::string>* value = nullptr;
+        if (flag == "--split") value = &cli.split;
+        else if (flag == "--cut") value = &cli.cut;
+        else if (flag == "--cut-block") value = &cli.block;
+        else if (flag == "--cut-act") value = &cli.act;
+        else if (flag == "--cut-xport") value = &cli.xport;
+        else if (flag == "--cut-kv-frag") value = &cli.kv_frag;
+        if (!value) { argv[out++] = argv[i]; continue; }
+        if (i + 1 >= argc) throw std::invalid_argument("missing value for " + std::string(flag));
+        *value = argv[++i];
+    }
+    argc = out;
+    argv[out] = nullptr;
+    return cli;
+}
 struct Inputs {
     chain::ModelShape model;
     std::uint64_t rows = 0;
@@ -63,7 +92,9 @@ struct Inputs {
 struct Resolved {
     chain::Split split = chain::Split::device_only;
     std::uint32_t cut = 0, block = 2048;
-    Act act = Act::relay;
+    Act act = Act::link;  // measured bitwise-equal to relay and faster (layer-cut ABAB receipts); relay = the TCP off switch
+    Xport xport = Xport::act_first;
+    std::uint32_t kv_frag = 1024;  // act-first: KV rows per piece (bounds how long a new ACT waits behind one KV piece)
     bool planned = false;
     std::uint32_t first = 0;
     std::string reason, lines;
@@ -93,7 +124,9 @@ inline Resolved resolve(const Cli& cli, const Inputs& input, Lookup env = [](con
     auto s = read(cli.split, "STRIX_SPLIT", "device-only");
     auto c = read(cli.cut, "STRIX_SPLIT_CUT", "auto");
     auto b = read(cli.block, "STRIX_SPLIT_BLOCK", "2048");
-    auto a = read(cli.act, "STRIX_SPLIT_ACT", "relay");
+    auto a = read(cli.act, "STRIX_SPLIT_ACT", "link");
+    auto x = read(cli.xport, "STRIX_SPLIT_XPORT", "act-first");
+    auto f = read(cli.kv_frag, "STRIX_SPLIT_KV_FRAG", "1024");
     Resolved out;
     if (s.text == "device-only") out.split = chain::Split::device_only;
     else if (s.text == "handoff-full") out.split = chain::Split::handoff;
@@ -102,7 +135,13 @@ inline Resolved resolve(const Cli& cli, const Inputs& input, Lookup env = [](con
     else throw std::invalid_argument("STRIX_SPLIT: expected device-only|handoff-full|layer-cut|auto");
     if (a.text == "relay") out.act = Act::relay;
     else if (a.text == "direct") out.act = Act::direct;
-    else throw std::invalid_argument("STRIX_SPLIT_ACT: expected relay|direct");
+    else if (a.text == "link") out.act = Act::link;
+    else throw std::invalid_argument("STRIX_SPLIT_ACT: expected relay|direct|link");
+    if (x.text == "act-first") out.xport = Xport::act_first;
+    else if (x.text == "fifo") out.xport = Xport::fifo;
+    else throw std::invalid_argument("STRIX_SPLIT_XPORT: expected act-first|fifo");
+    out.kv_frag = number(f.text, "STRIX_SPLIT_KV_FRAG");
+    if (out.kv_frag == 0 || out.kv_frag % 16 != 0) throw std::invalid_argument("STRIX_SPLIT_KV_FRAG: expected positive multiple of 16");
     if (c.text != "auto") {
         out.cut = number(c.text, "STRIX_SPLIT_CUT");
         if (out.cut == 0 || out.cut >= input.model.layers) throw std::invalid_argument("STRIX_SPLIT_CUT: outside [1,L-1]");
@@ -146,6 +185,8 @@ inline Resolved resolve(const Cli& cli, const Inputs& input, Lookup env = [](con
     line("cut", std::to_string(out.cut), c.origin);
     line("block", std::to_string(out.block), b.origin);
     line("act", act_name(out.act), a.origin);
+    line("xport", xport_name(out.xport), x.origin);
+    line("kv_frag", std::to_string(out.kv_frag), f.origin);
     return out;
 }
 struct Block { std::uint64_t row0; std::uint32_t rows; };
@@ -192,7 +233,9 @@ inline Meta unpack(std::span<const std::uint8_t> v) {
 }
 inline void validate(const Meta& m, const Meta& expected, std::uint32_t layers) {
     const auto bad = [](const char* s) { throw std::invalid_argument(std::string("layercut meta mismatch: ") + s); };
-    if (m.version != 1 || m.version != expected.version) bad("version");
+    // expected.version 0 = any supported contract (the receiver then follows the producer's): 1 = ACT -> all KV -> next
+    // block on one ordered sequence; 2 = ACT blocks and per-layer KV row fragments on independent cursors (ACT first).
+    if ((m.version != 1 && m.version != kMetaV2) || (expected.version != 0 && m.version != expected.version)) bad("version");
     if (m.cut == 0 || m.cut >= layers || m.cut != expected.cut) bad("cut");
     if (m.block == 0 || m.block % 16 != 0 || m.block != expected.block) bad("block");
     if (m.hidden == 0 || m.hidden != expected.hidden) bad("hidden");
@@ -206,15 +249,21 @@ inline std::uint64_t token_fnv(std::span<const std::uint32_t> toks) {
     return h;
 }
 // Checks order/coverage even when a valid handoff manifest describes incomplete or duplicated model pieces.
+// Meta v1: one sequence ACT(b) -> KV(b, layer 0..cut-1) -> block b + 1. Meta v2: ACT blocks in block order on their own
+// cursor; KV of each layer in contiguous row fragments (any size, row0 = that layer's cursor) interleaved freely with ACT
+// and other layers, so a producer can send ACT first and KV in the gaps. Both: no gap, no duplicate, END needs everything.
 class Pieces {
     Meta m_;
     bool act_, kv_, relay_;
     std::uint64_t row_ = 0;
     std::uint32_t block_ = 0, layer_ = 0;
     bool want_act_;
+    std::vector<std::uint64_t> kv_row_;  // v2: next row per layer
 public:
-    Pieces(Meta m, bool act, bool kv, bool relay) : m_(std::move(m)), act_(act), kv_(kv), relay_(relay), want_act_(act) {}
+    Pieces(Meta m, bool act, bool kv, bool relay) : m_(std::move(m)), act_(act), kv_(kv), relay_(relay), want_act_(act),
+        kv_row_(m_.version == kMetaV2 ? m_.cut : 0U, 0) {}
     void accept(const handoff::PieceHeader& p, std::size_t bytes, std::uint64_t state_row_bytes) {
+        if (m_.version == kMetaV2) { accept_v2(p, bytes, state_row_bytes); return; }
         const auto rows = std::min<std::uint64_t>(m_.block, m_.rows - row_);
         const bool act = want_act_;
         if (row_ >= m_.rows || p.row0 != row_ || p.rows != rows ||
@@ -226,7 +275,31 @@ public:
         if (!act && ++layer_ < m_.cut) return;
         row_ += rows; ++block_; layer_ = 0; want_act_ = act_;
     }
-    void finish() const { if (row_ != m_.rows) throw std::invalid_argument("layercut END: incomplete coverage"); }
+    void finish() const {
+        if (m_.version == kMetaV2) {
+            if (act_ && row_ != m_.rows) throw std::invalid_argument("layercut END: incomplete ACT coverage");
+            for (const auto r : kv_row_) if (kv_ && r != m_.rows) throw std::invalid_argument("layercut END: incomplete KV coverage");
+            return;
+        }
+        if (row_ != m_.rows) throw std::invalid_argument("layercut END: incomplete coverage");
+    }
+private:
+    void accept_v2(const handoff::PieceHeader& p, std::size_t bytes, std::uint64_t state_row_bytes) {
+        if (p.kind == kAct) {
+            const auto rows = row_ < m_.rows ? std::min<std::uint64_t>(m_.block, m_.rows - row_) : 0;
+            if (!act_ || rows == 0 || p.row0 != row_ || p.rows != rows || p.index != block_ ||
+                p.flags != (relay_ ? handoff::kRelay : 0U) || bytes != rows * std::uint64_t{m_.hidden} * 4)
+                throw std::invalid_argument("layercut v2 ACT piece: index/flags/range/size/order mismatch");
+            row_ += rows; ++block_;
+            return;
+        }
+        if (p.kind != kKv || !kv_ || p.index >= kv_row_.size() || p.flags != 0U)
+            throw std::invalid_argument("layercut v2 piece: unexpected kind/layer/flags");
+        auto& at = kv_row_[p.index];
+        if (p.row0 != at || p.rows == 0 || p.rows > m_.rows - at || bytes != p.rows * state_row_bytes)
+            throw std::invalid_argument("layercut v2 KV piece: gap/duplicate/range/size mismatch");
+        at += p.rows;
+    }
 };
 // Component-major block -> component-major full layer; widths are bytes/row of K, V, IK.
 inline void scatter_state(std::span<std::uint8_t> dst, std::span<const std::uint8_t> src,
