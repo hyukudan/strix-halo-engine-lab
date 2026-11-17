@@ -689,8 +689,11 @@ struct ApiService::Impl {
         out.set("prefill_progress", Json(config.engine_progress));
         out.set("thinking_budget", Json(config.engine_thinking_budget));
         out.set("thinking_budget_policy", config.engine_thinking_budget ? Json("thinking-budget-v1") : Json());
+        out.set("prompt_logprobs", Json(config.engine_prompt_logprobs));
         out.set("logprobs", Json(config.engine_logprobs)); out.set("penalties", Json(config.engine_logit_transforms)); out.set("logit_bias", Json(config.engine_logit_transforms));
-        Json scoring = Json::object(); scoring.set("max_top_logprobs", Json(20)); scoring.set("basis", Json("target-row-log-softmax")); scoring.set("execution", Json("serial-host"));
+        Json scoring = Json::object(); scoring.set("max_top_logprobs", Json(20)); scoring.set("basis", Json("target-row-log-softmax")); scoring.set("execution", Json(config.scoring_execution));
+        scoring.set("precision", Json(config.scoring_precision)); scoring.set("values", Json(config.engine_logit_transforms ? "raw, or transformed when logit transforms are active" : "raw"));
+        scoring.set("prompt_logprobs", Json(config.engine_prompt_logprobs));
         if (config.engine_logprobs) out.set("scoring", std::move(scoring));
         if (config.engine_logit_transforms) { Json t = Json::object(); t.set("identity", Json("logit-transform-v1")); t.set("execution", Json("serial-host")); t.set("sampling", Json(false)); out.set("logit_transforms", std::move(t)); }
         out.set("json_object", Json(config.engine_constraints));
@@ -1186,6 +1189,8 @@ struct ApiService::Impl {
             if (completion && n > 0) bad("top_logprobs", "completions uses logprobs in [0,5]");
             top = completion ? top : static_cast<std::uint32_t>(n); scores = scores || top > 0;
         }
+        if (const auto* v = body.find("prompt_logprobs"); v && !v->is_null() && !config.engine_prompt_logprobs)
+            bad("prompt_logprobs", "this engine does not score prompt tokens (see /v1/capabilities)");
         if (scores && !config.engine_logprobs) bad(body.find("logprobs") || body.find("include") ? "logprobs" : "top_logprobs", "this engine does not execute logprobs (see /v1/capabilities)");
         if (t.active() && !config.engine_logit_transforms) bad(t.presence != 0 ? "presence_penalty" : t.frequency != 0 ? "frequency_penalty" : t.repetition != 1 ? "repetition_penalty" : "logit_bias", "this engine does not execute logit transforms (see /v1/capabilities)");
         if (!scores && !t.active()) return base;
@@ -1291,7 +1296,7 @@ struct ApiService::Impl {
         spec->thinking = std::move(thinking);
         return spec;
     }
-    static void selection_json(Json& out, const ConstraintSpec& spec, const ConstraintVerdict& verdict) {
+    void selection_json(Json& out, const ConstraintSpec& spec, const ConstraintVerdict& verdict) const {
         out.set("selection_execution",Json(verdict.execution));
         out.set("selection_fallback",verdict.execution_fallback.empty()?Json():Json(verdict.execution_fallback));
         if (spec.transform.active()) {
@@ -1301,6 +1306,9 @@ struct ApiService::Impl {
         }
         if (spec.logprobs) {
             Json scoring = Json::object(); scoring.set("basis", Json("target-row-log-softmax"));
+            scoring.set("execution", Json(config.scoring_execution));
+            scoring.set("precision", Json(config.scoring_precision));
+            scoring.set("values", Json(spec.transform.active() ? "transformed" : "raw"));
             scoring.set("transform", Json(spec.transform.active() ? "logit-transform-v1" : "none")); scoring.set("constrained", Json(bool(spec.program)));
             out.set("scoring", std::move(scoring));
         }
@@ -1482,6 +1490,7 @@ struct ApiService::Impl {
     std::shared_ptr<GenerationTicket> submit(std::vector<std::uint32_t> prompt, std::uint32_t max_tokens, const SamplingParameters& sampling,
         const Json& body, std::uint32_t stable_prefix = 0, std::shared_ptr<const ConstraintSpec> spec = {}, std::shared_ptr<GenerationContext> context = {}) {
         (void)bool_or(body, "return_token_ids", false); // reject malformed presentation before admission
+        const bool trace_emissions = bool_or(body, "return_token_emissions", false);
         if (api_request_scope) {
             auto& scope = *api_request_scope;
             scope.observation.request_id = current_request_id;
@@ -1496,6 +1505,7 @@ struct ApiService::Impl {
             }
         }
         GenerationJob job;
+        job.trace_emissions = trace_emissions;
         job.family_context = std::move(context);
         job.constraint = std::move(spec);
         if (const auto* policy = body.find("state_cache")) {
@@ -1540,6 +1550,21 @@ struct ApiService::Impl {
                 throw ApiError(400, "invalid_request_error", "draft_depth_max must be an integer in [0, 8]", "draft_depth_max");
             job.draft_depth_max = static_cast<std::uint32_t>(depth->as_int());
         }
+        if (const auto* rows = body.find("copy_rows"); rows && !rows->is_null()) {
+            if (!rows->is_number() || rows->as_int() < 0 || rows->as_int() > 16)
+                throw ApiError(400, "invalid_request_error", "copy_rows must be an integer in [0, 16]", "copy_rows");
+            job.copy_rows = static_cast<std::uint32_t>(rows->as_int());
+        }
+        if (const auto* rows = body.find("window_rows"); rows && !rows->is_null()) {
+            std::int64_t value = -1;
+            try { value = rows->as_int(); }
+            catch (const JsonError&) {
+                throw ApiError(400, "invalid_request_error", "window_rows must be an integer in [0, 16]", "window_rows");
+            }
+            if (value < 0 || value > 16)
+                throw ApiError(400, "invalid_request_error", "window_rows must be an integer in [0, 16]", "window_rows");
+            job.window_rows = static_cast<std::uint32_t>(value);
+        }
         if (const auto* tool = body.find("tool_draft"); tool && !tool->is_null()) {
             if (!tool->is_bool()) throw ApiError(400, "invalid_request_error", "tool_draft must be a boolean", "tool_draft");
             job.tool_draft = tool->as_bool();
@@ -1549,7 +1574,7 @@ struct ApiService::Impl {
             job.ngram_peers = peers->as_bool();
         }
         if (!job.session_id.empty() && (job.ngram_draft.value_or(false) || job.tool_draft.value_or(false) ||
-            job.ngram_peers.value_or(false) || job.draft_depth_max))
+            job.ngram_peers.value_or(false) || job.draft_depth_max || job.copy_rows || job.window_rows))
             throw ApiError(400, "invalid_request_error", "session mode requires its fixed draft policy; request draft overrides are unsupported");
         if (api_request_scope) {
             job.client_gone = [connection = api_request_scope->connection] { return connection->gone(); };
@@ -1629,9 +1654,22 @@ struct ApiService::Impl {
             config.timed_completion_envelope ? "invalid_request_error" : "server_error", o.error, "", o.stats.error_code);
     }
     // "return_token_ids": true adds the generated token IDs (stop token included) for exactness checks.
-    static Json engine_json(const Outcome& o, const std::string& note, const Json& body) { return with_media(engine_json_text(o, note, body)); }
-    static Json engine_json_text(const Outcome& o, const std::string& note, const Json& body) {
+    Json engine_json(const Outcome& o, const std::string& note, const Json& body) const { return with_media(engine_json_text(o, note, body)); }
+    Json engine_json_text(const Outcome& o, const std::string& note, const Json& body) const {
         Json e = Json::object();
+        if (o.stats.emission_trace) {
+            Json trace = Json::object(), events = Json::array();
+            trace.set("clock", Json("steady_ns"));
+            trace.set("includes_stop_tokens", Json(true));
+            for (const auto& event : o.stats.token_emissions) {
+                Json pair = Json::array();
+                pair.push(Json(event.steady_ns));
+                pair.push(Json(event.count));
+                events.push(std::move(pair));
+            }
+            trace.set("events", std::move(events));
+            e.set("token_emissions", std::move(trace));
+        }
         if (bool_or(body, "return_token_ids", false)) {
             Json ids = Json::array();
             for (const auto id : o.token_ids) ids.push(Json(static_cast<std::int64_t>(id)));

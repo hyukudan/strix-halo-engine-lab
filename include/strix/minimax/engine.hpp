@@ -90,6 +90,13 @@ public:
     // rows and arguments); step() of OTHER slots may run between two resumes, on both ranks in the same order. cancel
     // abandons it (the slot's caches are then partial). While open: no prefill / gate / copy_slot / state rows / set_taps.
     void prefill_begin(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0);
+    using CutFetch = std::function<void(std::uint64_t row0, std::size_t rows, float* h_device_dst, hipStream_t)>;
+    // Fetches residual h at the cut. Caller retains fetched host rows until the stream has consumed them.
+    // link_relay: only rank 0 calls `fetch`; its rows reach rank 1 over the pair link in one control exchange per
+    // chunk, enqueued at the same point of the schedule on both ranks (before the chunk's first layer, so it is ordered
+    // with the layer collectives on the same stream). Bytes are those rank 0 fetched: no arithmetic change.
+    void prefill_begin_cut(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0,
+                           unsigned first_layer, CutFetch fetch, bool link_relay = false);
     bool prefill_resume(unsigned layers, std::uint32_t* next);
     void prefill_cancel();
     using PfTaskId = std::uint64_t;
@@ -214,6 +221,13 @@ public:
     [[nodiscard]] bool prefill_index_tile() const;
     void set_prefill_msa_batch(bool on);  // STRIX_MM_PF_MSA_BATCH, default off; prefill only
     [[nodiscard]] bool prefill_msa_batch() const;
+    void set_prefill_headless(bool on);  // STRIX_MM_PF_HEADLESS, default on: last layer cache-only for headless chunks (exact)
+    [[nodiscard]] bool prefill_headless() const;
+    void set_prefill_dense_mlp(bool on);  // STRIX_MM_PF_DENSE_MLP, default on: layers 0..2 dense MLP on the v4 core (== strix_gemm bits)
+    [[nodiscard]] bool prefill_dense_mlp() const;
+    [[nodiscard]] std::uint64_t prefill_dense_mlp_count() const;  // submitted dense MLP pieces; read between tasks
+    [[nodiscard]] std::uint64_t prefill_headless_chunks() const;  // cumulative successful cache-only chunks on this rank
+    [[nodiscard]] std::size_t prefill_headless_expected(std::size_t rows) const;  // qualification target, independent of admission
     void set_prefill_msa_rework(unsigned mode);  // STRIX_MM_PF_MSA_REWORK=0..10; prefill only, default 10
     [[nodiscard]] unsigned prefill_msa_rework() const;
     void set_prefill_attend4(bool on);  // STRIX_MM_PF_ATTEND4, default off; prefill only

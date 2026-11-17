@@ -308,33 +308,14 @@ template <unsigned TC, bool CF> __global__ __launch_bounds__(256) void proj_wmma
     __shared__ tall::Storage<TC> lds;
     tall::core<TC>(v.x, kProjIn, v.rows, IndexColsOrder<CF>{{v.w, v.iq, v.ik}}, lds);
 }
-// x16 form: x rounded to FP16 once (RNE, the core's own cast: same bits) into k-tile-major tiles, element (g, r, j)
-// at (g * rows + r) * 64 + j for input k = 64 g + j, so a CTA's stage reads 128 rows x 128 contiguous bytes (16 KB)
-// instead of 128 rows 24 KB apart (measured: rows-major FP32 x streams at 93-114 GB/s with 16-32 CTAs, the DRAM
-// pages / translations of thousands of lockstep rows; x read once by one column block alone: 4096 rows 1079 us).
-__global__ __launch_bounds__(256) void x16_tiles_kernel(const float* __restrict__ x, _Float16* __restrict__ xt, unsigned rows) {
-    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * 256U + threadIdx.x;  // one chunk of 8 inputs
-    if (i >= static_cast<std::size_t>(rows) * kChunks) return;
-    const unsigned r = static_cast<unsigned>(i / kChunks), c = static_cast<unsigned>(i % kChunks);
-    const float4 a = *reinterpret_cast<const float4*>(x + static_cast<std::size_t>(r) * kProjIn + c * 8U);
-    const float4 b = *reinterpret_cast<const float4*>(x + static_cast<std::size_t>(r) * kProjIn + c * 8U + 4U);
-    using H8 = _Float16 __attribute__((ext_vector_type(8)));
-    const H8 h = {static_cast<_Float16>(a.x), static_cast<_Float16>(a.y), static_cast<_Float16>(a.z), static_cast<_Float16>(a.w),
-                  static_cast<_Float16>(b.x), static_cast<_Float16>(b.y), static_cast<_Float16>(b.z), static_cast<_Float16>(b.w)};
-    *reinterpret_cast<H8*>(xt + (static_cast<std::size_t>(c / 8U) * rows + r) * 64U + (c % 8U) * 8U) = h;
-}
-struct IndexColsX16 : IndexColsOrder<true> {
-    const _Float16* xt;
-    unsigned rows;
-    __device__ __forceinline__ tall::Half16 fragment(unsigned row, unsigned unit) const {
-        using GH16 = const tall::Half16 __attribute__((address_space(1)));
-        const _Float16* p = tall::detail::uniform(xt) + (static_cast<std::size_t>(unit / 4U) * tall::detail::uni(rows) + row) * 64U + (unit % 4U) * 16U;
-        return *(GH16*)p;
-    }
-};
+// x16 form: the shared core tile form (core/f16_dense_tall.hpp X16Cols / enqueue_x16_tiles: x rounded to FP16 once,
+// k-tile-major, column-fast), same bits as the FP32 x path. Here: x read once by one column block alone, 4096 rows
+// 1079 us; the tiles + WMMA 1229 us vs slab 2753 us.
+using IndexColsX16 = tall::X16Cols<IndexCols>;
+static_assert(kFastTilesRows == tall::kX16Rows, "index_proj: the FAST regime threshold is the shared x16 crossover");
 __global__ __launch_bounds__(256) void proj_wmma_x16_kernel(IndexProjView v, const _Float16* xt) {
     __shared__ tall::Storage<4> lds;
-    tall::core<4>(v.x, kProjIn, v.rows, IndexColsX16{{{v.w, v.iq, v.ik}}, xt, v.rows}, lds);
+    tall::core<4>(v.x, kProjIn, v.rows, IndexColsX16{{v.w, v.iq, v.ik}, xt, v.rows}, lds);
 }
 // Diagnostics (bench only): mode 1 = every row reads x row (row % 128): the x stream stays in cache (wrong
 // outputs); mode 2 = the production kernel with at most 192 VGPRs (8 waves per SIMD: 2 CTAs per CU), same bits.
@@ -492,8 +473,7 @@ void enqueue_index_proj_wmma_x16(const IndexProjView& v, _Float16* xt, hipStream
     if (v.rows == 0 || static_cast<std::uint64_t>(v.rows) * kProjIn * 4U >= (std::uint64_t{1} << 32U))
         throw std::invalid_argument("index_proj wmma x16: rows must be 1 .. 174762");
     if (convert) {
-        const std::size_t n = static_cast<std::size_t>(v.rows) * kChunks;
-        hipLaunchKernelGGL(x16_tiles_kernel, dim3(static_cast<unsigned>((n + 255U) / 256U)), dim3(256), 0, stream, v.x, xt, v.rows);
+        tall::enqueue_x16_tiles(v.x, xt, v.rows, kProjIn, stream);
     }
     hipLaunchKernelGGL(proj_wmma_x16_kernel, dim3(kWmmaTiles / 4U, (v.rows + tall::kRows - 1U) / tall::kRows), dim3(256), 0, stream, v,
                        static_cast<const _Float16*>(xt));
@@ -528,10 +508,11 @@ void enqueue_index_proj(const IndexProjView& v, hipStream_t stream) {
     else enqueue_index_proj_slab(v, stream);  // same bits as enqueue_index_proj_tiled
 }
 
-void index_proj_fork(const IndexProjView& v, hipStream_t main, hipStream_t side, hipEvent_t forked) {
+void index_proj_fork(const IndexProjView& v, hipStream_t main, hipStream_t side, hipEvent_t forked, _Float16* fast_xt) {
     hip_check(hipEventRecord(forked, main), "index_proj fork record");
     hip_check(hipStreamWaitEvent(side, forked, 0), "index_proj fork wait");
-    enqueue_index_proj(v, side);
+    if (fast_xt != nullptr) enqueue_index_proj_fast(v, fast_xt, side);
+    else enqueue_index_proj(v, side);
 }
 
 void index_proj_join(hipStream_t main, hipStream_t side, hipEvent_t joined) {

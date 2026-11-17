@@ -1,5 +1,6 @@
 #include "strix/ds41_fast_profile.hpp"
 #include "strix/deepseek41_prefix_cache.hpp"
+#include "strix/turbo.hpp"
 
 #include "strix/ds41_attention.hpp"
 #include "strix/env_flags.hpp"
@@ -510,6 +511,9 @@ std::string prefix_continuation_decline() {
     if (fp::dense_on())
         add("FAST dense ds41-dense-f16-v1 selects its route by the rows of each piece (dense_min_rows=" +
             std::to_string(fp::dense_min_rows()) + "): a cache hit or another cut changes the arithmetic of the same prompt");
+    if (fp::shared_on())
+        add("FAST shared ds41-shared-f16-v1 selects its route by the locally owned rows of each piece (dense_min_rows=" +
+            std::to_string(fp::dense_min_rows()) + "): a cache hit or another cut changes the arithmetic of the same prompt");
     return why;
 }
 
@@ -537,7 +541,11 @@ PrefixNamespace prefix_namespace_from_env(bool expert_tp_decode) {
     if (strix::ds41::fast_profile::dense_on())
         t += "prefill_dense=q8a8-f16-v1;dense_min_rows=" + std::to_string(strix::ds41::fast_profile::dense_min_rows()) + ";";
     if (strix::ds41::fast_profile::engram_on()) t += "prefill_engram=f16wmma-v1;";
-    if (strix::ds41::fast_profile::shared_on()) t += "prefill_shared=q8a8-f16-v1;";
+    if (strix::ds41::fast_profile::shared_on()) {
+        t += "prefill_shared=q8a8-f16-v1;";
+        if (!strix::ds41::fast_profile::dense_on())
+            t += "dense_min_rows=" + std::to_string(strix::ds41::fast_profile::dense_min_rows()) + ";";
+    }
     if (strix::ds41::fast_profile::moe_on() && strix::ds41::fast_profile::moe_f16_on()) t += "prefill_moe=f16wmma-v1;";
     // FAST MoE: every routed entry takes the relaxed kernels whatever the chunking and route selectors (window / sparse
     // paths are off under the lever), so its arithmetic is one identity
@@ -563,7 +571,14 @@ PrefixNamespace prefix_namespace_from_env(bool expert_tp_decode) {
                               "STRIX_DS41_PREFILL_FP16_WSPLIT"})
             t += std::string(k + 11) + "=" + env_or(k) + ";";
 
+    // FAST policy ds41-decoder-replay-bounded-v1: a bounded run's decoder state is not the full prefill's
+    if (const auto replay = env_or("STRIX_DS41_DECODER_REPLAY"); !replay.empty() && replay != "0")
+        t += "prefill_decoder=replay-bounded-v1:rows=" + replay + ";";
     t += std::string("decode=") + (expert_tp_decode ? "ds41-expert-tp2-i1152-v1" : "ep") + ";";
+    // TURBO (--profile turbo): versioned name + effective levers + weight identity, exported by the shared profile
+    // resolver (strix/turbo.hpp); absent outside turbo, so every legacy namespace keeps its text and tag.
+    if (const auto turbo = strix::profile::turbo::exported_namespace(); !turbo.empty())
+        t += turbo + ";";
     const auto* b = reinterpret_cast<const std::byte*>(t.data());
     PrefixNamespace ns;
     ns.text = t;

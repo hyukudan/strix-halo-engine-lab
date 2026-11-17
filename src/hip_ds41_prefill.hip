@@ -9,6 +9,8 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include "strix/lever_cache.hpp"
+
 #include "moe_core/grouped_integer_decode.hpp"
 #include "moe_core/grouped_a8_f16.hpp"
 #include "ds41_integer_operand.hpp"  // shared tiled core route (STRIX_DS41_PF_CORE=1, FAST_I4)
@@ -441,11 +443,11 @@ StageLayout stage_layout(unsigned width, unsigned batch_rows) {
 }
 // STRIX_DS41_PREFILL_STAGE=1 keeps 16-row batches on the stage kernels (comparison only).
 bool stage_forced() {
-    static const bool forced = [] {
+    static strix::lever_cache<bool> forced{[] {
         const char* v = std::getenv("STRIX_DS41_PREFILL_STAGE");
         return v != nullptr && std::strcmp(v, "1") == 0;
-    }();
-    return forced;
+    }};
+    return forced.get();
 }
 // Prefill kernel forms (moe_kernel_tuning().prefill, STRIX_DS41_MOE_PREFILL): 0 = the original decoders; 1 = the lean
 // decoders (same integers, see decode_lean); 2 = lean with the IQ2_XXS sign table (decode_signs); 3 = the lean decoders
@@ -671,7 +673,8 @@ void enqueue_prefill_router(const RouterView& view, void* stream) {
         view.top_k > view.experts || (view.image_rows && !view.bias_image))
         throw std::invalid_argument("ds41 prefill router view is inconsistent");
     const auto queue = static_cast<hipStream_t>(stream);
-    static const bool wide = strix::envcfg::flag("STRIX_DS41_PREFILL_ROUTER_WIDE", true);
+    static strix::lever_cache<bool> wide_cache{[] { return strix::envcfg::flag("STRIX_DS41_PREFILL_ROUTER_WIDE", true); }};
+    const bool wide = wide_cache.get();
     RouterView v = view;
     v.wide_stage = wide && view.wide_stage && view.hidden % 4U == 0U && reinterpret_cast<std::uintptr_t>(view.x) % 16U == 0U &&
                    reinterpret_cast<std::uintptr_t>(view.weight) % 16U == 0U;
@@ -722,9 +725,9 @@ bool ds41_f16_moe_weights_fit(WeightFormat format, const void* data, std::uint64
     return true;
 }
 bool fast_moe() {
-    static const bool env = fast_profile::moe_on();  // the lever or STRIX_DS41_FAST_PREFILL
+    static strix::lever_cache<bool> env{[] { return fast_profile::moe_on(); }};  // the lever or STRIX_DS41_FAST_PREFILL
     // a running DevicePrefill's own precision first (strix/ds41_prefill_precision.hpp), else the override or env
-    return effective_fast(&PrefillPrecision::fast_moe, fast_moe_mode, env);
+    return effective_fast(&PrefillPrecision::fast_moe, fast_moe_mode, env.get());
 }
 // FAST lever ds41-moe-f16wmma-v1 (with fast_moe): the relaxed kernels' FP16-operand form. Per execution (PrefillPrecision), else
 // STRIX_DS41_FAST_MOE_F16; no process-wide setter.
@@ -753,11 +756,11 @@ int pf_core_policy_of(const char* raw) {
     throw std::invalid_argument(std::string("STRIX_DS41_PF_CORE: expected 0, 1, moe or dense, got '") + raw + "'");
 }
 int pf_core_env() {
-    static const int policy = [] {
+    static strix::lever_cache<int> policy{[] {
         const char* raw = strix::envcfg::text("STRIX_DS41_PF_CORE");
         return raw ? pf_core_policy_of(raw) : int(pf_core_auto);
-    }();
-    return policy;
+    }};
+    return policy.get();
 }
 constexpr int pf_core_unset = -2;
 int pf_core_override = pf_core_unset;
