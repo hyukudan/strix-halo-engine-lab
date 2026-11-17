@@ -7,6 +7,15 @@ from tools.qualification.turbo_bar import tasks
 
 
 class TaskTests(unittest.TestCase):
+    def test_math_requires_complete_integer_field(self):
+        for suffix in ('.5', '/2', 'e2', 'E+2', ' dollars', ',5', '**.5', '\nextra'):
+            with self.subTest(suffix=suffix):
+                self.assertFalse(tasks.score_math('ANSWER: 42' + suffix, {'answer': 42}))
+        for reply in ('ANSWER: 42', 'Reasoning\nANSWER: **42**', 'ANSWER: +42\n'):
+            self.assertTrue(tasks.score_math(reply, {'answer': 42}))
+        self.assertTrue(tasks.score_math('ANSWER: -1,234', {'answer': -1234}))
+        self.assertFalse(tasks.score_math('ANSWER: 42\nANSWER: 42/2', {'answer': 42}))
+
     @classmethod
     def setUpClass(cls):
         cls.items = tasks.generate()
@@ -48,7 +57,10 @@ class TaskTests(unittest.TestCase):
                   if any(isinstance(v, int) and not isinstance(v, bool) for v in x["check"]["arguments"].values()))
         c = it["check"]
         good = json.dumps({"name": c["name"], "arguments": c["arguments"]})
-        self.assertTrue(tasks.score_item(it, "Sure: " + good))
+        self.assertTrue(tasks.score_item(it, " \n" + good + "\t"))
+        for reply in ("Sure: " + good, good + " trailing", good + good, "[" + good + "]",
+                      "```json\n" + good + "\n```", "Sure: " + good + " trailing"):
+            self.assertFalse(tasks.score_item(it, reply), reply)
         self.assertFalse(tasks.score_item(it, json.dumps({"name": c["name"], "arguments": dict(c["arguments"], extra=1)})))
         self.assertFalse(tasks.score_item(it, json.dumps({"name": "other", "arguments": c["arguments"]})))
         k = next(k for k, v in c["arguments"].items() if isinstance(v, int) and not isinstance(v, bool))

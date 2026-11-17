@@ -137,7 +137,18 @@ struct Inputs {
     Lookup env;
     bool allow_pending = false;
     ::strix::profile::turbo::WeightsRequest weights{};  // --turbo-weights / --turbo-weight-bits / --turbo-weights-pack
+    // What the calling backend loads (nullptr: kWeightCaps of the HIP engine). The CUDA engine passes kCudaWeightCaps.
+    const ::strix::profile::turbo::WeightCaps* caps = nullptr;
 };
+// CUDA engine (sm_120): onfly 4-bit = NVFP4 images of the dense Q8_0 roles (src/cuda/qwen_prefill_driver.cu
+// convert_onfly, shared core strix/cuda/core/nvfp4_a8.hpp); converted packs need the owner's OK (pending).
+inline constexpr ::strix::profile::turbo::WeightCaps kCudaWeightCaps{
+    {true, true, false},
+    {false, false, false, false, true, false, false, false, false},
+    "rtn-g16",
+    "nvfp",
+    "onfly low-bit load is not implemented in this build",
+    "converted low-bit pack loader is not implemented in this build (needs the owner's OK)"};
 using ::strix::profile::environment;
 // Export provenance survives a future re-exec. A changed inherited value
 // is explicit again; matching profile exports retain their original status.
@@ -150,7 +161,7 @@ inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<con
     const char* allow = environment(inputs.env, "STRIX_QWEN_PROFILE_ALLOW_PENDING");
     const bool allow_pending = inputs.allow_pending || (allow && std::string_view(allow) == "1");
     out.weights = ::strix::profile::turbo::resolve_weights(out.is_turbo(), inputs.weights,
-        [&inputs](const char* key) { return environment(inputs.env, key); }, kWeightCaps);
+        [&inputs](const char* key) { return environment(inputs.env, key); }, inputs.caps ? *inputs.caps : kWeightCaps);
     for (const auto& lever : rows) {
         const auto column = ::strix::profile::value_column(lever, profile);  // empty turbo cell: the fast cell
         const std::string* cli = nullptr;

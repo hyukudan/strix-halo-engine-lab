@@ -3,6 +3,7 @@
 // Each app keeps only its own non-engine options and calls take() for the rest; resolve() then turns the request into a
 // Config for its entry, and names every value that differs between entries (serve_differences) with its reason.
 #include "strix/cuda/qwen_prefill.hpp"
+#include "strix/cuda/qwen_turbo.hpp"
 #include "strix/profiles/qwen_cuda.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/lever.hpp"
@@ -129,8 +130,20 @@ inline Resolved resolve(const Request& r, Entry entry, std::string_view default_
     out.entry = entry;
     out.config = r.engine;
     auto& c = out.config;
-    out.resolution = cp::resolve(r.profile.value_or(pr::Name::standard), r.inputs);
-    out.choice = cp::choose(out.resolution);
+    const auto profile = r.profile.value_or(pr::Name::standard);
+    if (profile == pr::Name::turbo) {
+        // TURBO on CUDA (qwen-turbo-v1) is the weight toggle over the exact CUDA route: strix/cuda/qwen_turbo.hpp
+        // resolves it with no lever rows, so the empty turbo cells never inherit the FAST forms of this table, and a
+        // lever option is refused rather than accepted and ignored. Throws when the weight request cannot be honoured.
+        if (!r.inputs.cli.empty())
+            throw std::invalid_argument("Qwen CUDA: --profile turbo takes no lever options (its rows have no CUDA binding)");
+        const auto turbo = ::strix::cuda::qwen_turbo::resolve({r.profile, r.inputs, r.print_effective_config});
+        out.resolution = turbo.resolution;
+        ::strix::cuda::qwen_turbo::apply(turbo, c);
+    } else {
+        out.resolution = cp::resolve(profile, r.inputs);
+        out.choice = cp::choose(out.resolution);
+    }
     apply(out.choice, c);
     c.route_policy.reset(); // a new request resolves its supplied environment once
     c = resolve_route(std::move(c), r.inputs.env);
@@ -203,6 +216,13 @@ inline std::string effective_config_json(const Resolved& r) {
     route.set("effective", J(c.route_policy->enabled));
     route.set("reason", J(std::string(c.route_policy->reason)));
     out.set("route_storage", std::move(route));
+    if (r.resolution.is_turbo()) {  // absent outside turbo: every other effective config keeps its bytes
+        auto turbo = J::object();
+        turbo.set("onfly_nvfp4", J(c.turbo_onfly_nvfp4));
+        turbo.set("cache_namespace", J(c.turbo_namespace));
+        turbo.set("decode_arithmetic", J(std::string(c.turbo_onfly_nvfp4 ? "nvfp4-a8-v1 (dense Q8_0 roles converted at load)" : "native pack")));
+        out.set("turbo_weights", std::move(turbo));
+    }
     out.set("form_identities", J(cp::form_identities(r.choice)));
     out.set("resolution", ::strix::serve::parse_json(r.resolution.json()));
     auto notices = J::array();

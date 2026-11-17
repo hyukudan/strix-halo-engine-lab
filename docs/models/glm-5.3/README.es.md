@@ -303,10 +303,12 @@ opciones: [guía de GLM RTX](../../../src/cuda/models/glm/README.md).
 rango; solo motores con su capa MTP) deja que el productor RTX haga el prefill de los prompts largos y entregue a cada
 rango su estado. Ambos rangos preparan la entrega y votan (la vinculación autenticada y después ambos restaurados) antes
 de ejecutar el último token del prompt; cualquier fallo antes de ese voto vuelve al prefill propio del par en los dos
-rangos, y un fallo dentro de las operaciones colectivas del último token detiene el servidor (fatal). `--import-dsa-once`
-(con `dsa_once` del productor) envía el estado DSA solo al rango 0, que lo retransmite al rango 1 por el enlace del par
-(8K: de 480 a 316 MB en el enlace del productor, con tokens iguales a los de la entrega de la versión 1). `--import-index-tail`
-(en todos los rangos, con `index_tail` del productor; versión 3, o 4 con `--import-dsa-once`) envía la clave y la puerta
+rangos, y un fallo dentro de las operaciones colectivas del último token detiene el servidor (fatal). DSA una vez (entrega versión 2,
+predeterminada en un par con `--import-listen`; `--no-import-dsa-once` o `STRIX_HANDOFF_SHARED_ONCE=0` vuelve a la
+versión 1) envía el estado DSA solo al rango 0, que lo retransmite al rango 1 por el enlace del par con hash comprobado
+(8K: de 480 a 316 MB en el enlace del productor, de 4,05 a 2,67 s a 1 GbE; 32K: de 1.461 a 807 MB, de 12,38 a 6,90 s;
+la carga del rango 1 es idéntica byte a byte a la de la versión 1, tokens iguales). `--import-index-tail`
+(en todos los rangos, con `index_tail` del productor; versión 3, o 4 con DSA una vez) envía la clave y la puerta
 del índice DSA solo del bloque de pool abierto (`P % 4` filas): los bloques cerrados viajan como sus filas de pool FP32,
 que es lo único que leen los kernels de decode, prefill y MTP (`include/strix/block_summary_state.hpp`). 32K: de 806,92 a
 605,62 MB para los dos rangos con DSA una vez; 128K: −805,28 MB. Opcional; `tests/hip_glm_dsa_tests.hip` comprueba la

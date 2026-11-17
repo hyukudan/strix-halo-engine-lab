@@ -40,7 +40,10 @@ def one(i, res, t0):
                   "cycles": st.get("mtp_cycles"), "ids_sha": hashlib.sha256(json.dumps(ids).encode()).hexdigest()[:16],
                   "finish": j["choices"][0]["finish_reason"]}
     except Exception as e:
-        res[i] = {"lane": i, "error": repr(e)}
+        res[i] = {"lane": i, "error": repr(e)}; return
+    res[i]["request_sha256"] = hashlib.sha256(json.dumps(json.loads(req.data), sort_keys=True).encode()).hexdigest()
+    if os.environ.get("TURBODEC_KEEP_TOKEN_IDS") == "1":
+        res[i]["token_ids"] = ids
 
 def arm(name):
     n = int(name[1:]); t0 = time.time(); res = [None] * n

@@ -14,7 +14,8 @@ add_library(strix_qwen_cuda STATIC
     src/cuda/models/qwen/qwen_prefill_driver.cu src/cuda/models/qwen/qwen_hc.cu src/cuda/models/qwen/qwen_dense.cu
     src/cuda/models/qwen/qwen_gdn.cu src/cuda/models/qwen/qwen_qsa.cu src/cuda/models/qwen/qwen_moe.cu
     src/cuda/models/qwen/qwen_plemtp.cu src/cuda/models/qwen/qwen_mtp_draft.cu src/cuda/models/qwen/qwen_transcode.cu src/cuda/tiered_experts.cu
-    ${STRIX_CUDA_CORE_AMD_MATH_SOURCES} src/gguf_reader.cpp)
+    ${STRIX_CUDA_CORE_AMD_MATH_SOURCES} src/gguf_reader.cpp
+    src/cuda/core/nvfp4_a8.cu src/cuda/core/nvfp4_a8_reference.cpp src/cuda/core/nvfp4_reference.cpp)
 target_include_directories(strix_qwen_cuda PUBLIC include src/cuda/models/qwen)
 # Tiered expert residency: the host planner/resolver and the CPU routed-expert executor (bitwise = the card's A8 chains).
 # Only the library targets are needed; the Qwen-only build has no strix_target_warnings, so a no-op stands in for it.
@@ -53,8 +54,11 @@ add_test(NAME qwen_prefill_schedule COMMAND qwen_prefill_schedule_test)
 add_test(NAME qwen_handoff_codec COMMAND qwen_handoff_codec_test)
 add_executable(qwen_decode_e2e tests/cuda/qwen_decode_e2e.cu)
 target_link_libraries(qwen_decode_e2e PRIVATE strix_qwen_cuda strix_qwen_handoff)
-# Dense IMMA site tests and --bench-shape microbench (production qwen_dense.cu from strix_qwen_cuda; GPU index 0 only).
-add_executable(qwen_dense_tests tests/cuda/qwen_dense_tests.cu)
+# Dense IMMA site tests, --bench-shape / --bench-rows microbenches (GPU index 0 only). An instrumented copy of the
+# production qwen_dense.cu (dispatch counter) is compiled in with the library's options; the archive's dense object is not linked.
+add_executable(qwen_dense_tests tests/cuda/qwen_dense_tests.cu src/cuda/models/qwen/qwen_dense.cu)
+target_compile_definitions(qwen_dense_tests PRIVATE STRIX_QWEN_DENSE_TEST_DISPATCH)
+target_compile_options(qwen_dense_tests PRIVATE $<TARGET_PROPERTY:strix_qwen_cuda,COMPILE_OPTIONS>)
 target_link_libraries(qwen_dense_tests PRIVATE strix_qwen_cuda)
 add_test(NAME qwen_dense_host COMMAND qwen_dense_tests)
 add_executable(qwen_hc_workspace_host_test tests/cuda/qwen_hc_workspace_host_test.cpp)
@@ -66,12 +70,30 @@ if(Python3_Interpreter_FOUND AND STRIX_IDENT_BASH)
     add_test(NAME qwen_ident_host COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda/qwen_ident_host_test.py)
 endif()
 target_include_directories(qwen_dense_tests PRIVATE tests/cuda)
-target_compile_options(qwen_dense_tests PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+set_source_files_properties(tests/cuda/qwen_dense_tests.cu PROPERTIES COMPILE_OPTIONS "--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false")
 if(MSVC)
     target_compile_options(qwen_dense_tests PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
+# TURBO onfly (qwen-turbo-v1): shared nvfp4-a8-v1 core vs its host oracles, the Qwen dense binding, and the one
+# resolver (serve == CLI).
+add_executable(nvfp4_a8_test tests/cuda/nvfp4_a8_test.cu)
+target_link_libraries(nvfp4_a8_test PRIVATE strix_qwen_cuda)
+target_compile_options(nvfp4_a8_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+add_test(NAME nvfp4_a8 COMMAND nvfp4_a8_test)
+add_executable(nvfp4_a8_bench tests/cuda/nvfp4_a8_bench.cu)
+target_link_libraries(nvfp4_a8_bench PRIVATE strix_qwen_cuda)
+add_executable(qwen_turbo_resolver_test tests/cuda/qwen_turbo_resolver_test.cu)
+target_link_libraries(qwen_turbo_resolver_test PRIVATE strix_qwen_cuda strix_qwen_prefix)
+add_test(NAME qwen_turbo_resolver COMMAND qwen_turbo_resolver_test)
 add_executable(qwen_decode_bench tests/cuda/qwen_decode_bench.cu)
 target_link_libraries(qwen_decode_bench PRIVATE strix_qwen_cuda)
+foreach(arm IN ITEMS 0 1)
+    add_test(NAME qwen_dense_rows16_${arm} COMMAND ${CMAKE_COMMAND} -E env
+        STRIX_QRTX_DENSE_ROWS16=${arm} STRIX_CUDA_DECODE_ROWS_MAX=16 STRIX_QRTX_DECODE_KERNELS=1
+        STRIX_QRTX_ROWS_KSPLIT=1 STRIX_QRTX_ROWS_CP=0 STRIX_QRTX_KSO=4
+        $<TARGET_FILE:qwen_dense_tests> --rows16 ${arm})
+    set_tests_properties(qwen_dense_rows16_${arm} PROPERTIES LABELS gpu RUN_SERIAL TRUE)
+endforeach()
 add_executable(strix-cuda-qwen-serve apps/cuda_qwen_serve_main.cu)
 # Shared MTP window controllers (also linked by the HIP engine): measured-cost depth/rows policy and its host adapter.
 add_library(strix_mtp_depth STATIC src/mtp_window_controller.cpp src/mtp_depth_window_controller.cpp src/serve/row_budget.cpp
