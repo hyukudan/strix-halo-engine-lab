@@ -90,6 +90,10 @@ public:
     // rows and arguments); step() of OTHER slots may run between two resumes, on both ranks in the same order. cancel
     // abandons it (the slot's caches are then partial). While open: no prefill / gate / copy_slot / state rows / set_taps.
     void prefill_begin(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0);
+    using CutFetch = std::function<void(std::uint64_t row0, std::size_t rows, float* h_device_dst, hipStream_t)>;
+    // Fetches residual h at the cut. Caller retains fetched host rows until the stream has consumed them.
+    void prefill_begin_cut(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0,
+                           unsigned first_layer, CutFetch fetch);
     bool prefill_resume(unsigned layers, std::uint32_t* next);
     void prefill_cancel();
     using PfTaskId = std::uint64_t;

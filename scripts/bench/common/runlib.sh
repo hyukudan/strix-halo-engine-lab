@@ -32,9 +32,10 @@ kit_left() {
 # kit_fits NEED: true when at least NEED seconds (+3 s margin) remain.
 kit_fits() { (($(kit_left) > $1 + 3)); }
 
-# Drop inherited engine levers so an arm only sees what it names (KIT_KEEP_ENV lists exceptions).
+# Drop inherited engine levers; device binding is infrastructure, not an arm's tuning.
+# KIT_KEEP_ENV lists additional exceptions.
 kit_clean_env() {
-    local v keep=" ${KIT_KEEP_ENV:-} "
+    local v keep=" STRIX_DEVICES STRIX_DEVICE ${KIT_KEEP_ENV:-} "
     for v in $(env | sed -n 's/^\(STRIX_[A-Z0-9_]*\)=.*/\1/p'); do
         [[ $keep == *" $v "* ]] || unset "$v"
     done
