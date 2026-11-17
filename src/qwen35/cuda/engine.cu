@@ -908,6 +908,7 @@ struct CudaEngine::Impl {
             allocations.push_back(std::move(owner));
             return p;
         }
+        cc::GdnChunkWork gdn_ws;  // FAST gdn-chunk16 workspace (prefill_gdn chunk16 only; ws null = serial delta rule)
         float *x = nullptr, *xn = nullptr, *z = nullptr, *gout = nullptr, *raw = nullptr, *qkvc = nullptr, *ar = nullptr, *br = nullptr,
               *qg = nullptr, *q = nullptr, *k = nullptr, *v = nullptr, *ao = nullptr, *hid = nullptr, *scr = nullptr;
         std::uint32_t *ids = nullptr, *wpos = nullptr, *pos = nullptr, *cpar = nullptr;
@@ -976,6 +977,10 @@ struct CudaEngine::Impl {
         sl.qkvc = sl.alloc<float>(static_cast<std::size_t>(C) * gd.conv_channels());
         sl.ar = sl.alloc<float>(static_cast<std::size_t>(C) * gd.value_heads);
         sl.br = sl.alloc<float>(static_cast<std::size_t>(C) * gd.value_heads);
+        if (opt.prefill_gdn == PrefillGdn::chunk16 && opt.prefill_arith != PrefillArith::exact) {  // 215 MB per slot at C = 4096
+            sl.gdn_ws.floats = cc::gdn_chunk_workspace_floats(gd, C);
+            sl.gdn_ws.ws = sl.alloc<float>(sl.gdn_ws.floats);
+        }
         sl.qg = sl.alloc<float>(static_cast<std::size_t>(C) * c.q_gate_width());
         sl.q = sl.alloc<float>(static_cast<std::size_t>(C) * c.heads * c.head_dim);
         sl.k = sl.alloc<float>(static_cast<std::size_t>(C) * c.kv_width());
@@ -1159,7 +1164,7 @@ struct CudaEngine::Impl {
                 pf_gemm(sl, w.alpha, sl.xn, rows, sl.ar, nullptr, cc::BigEpi::none);
                 const auto& cl = commit_layers[gi++];
                 CK(cc::gdn_prefill_layer(gd, cl.layer, cl.state, cc::GdnWindow{sl.raw, sl.qkvc, sl.ar, sl.br}, sl.z, sl.gout, rows, c.rms_eps,
-                                         sl.cpar, sl.st));
+                                         sl.cpar, sl.gdn_ws, sl.st));
                 pf_gemm(sl, w.out, sl.gout, rows, sl.x, sl.x, cc::BigEpi::residual);
                 pf_dirty(sl);
             } else {
@@ -1514,6 +1519,10 @@ void print_effective_config(const EngineOptions& o, const char* arith, std::FILE
                  o.turbo_bits, o.turbo_weights >= TurboWeights::onfly ? (o.turbo_lm_head ? "nvfp4" : "bf16") : "n/a", o.multi_gemv ? "on" : "off");
     std::fprintf(f, "  prefill-arith: %s\n  prefill-big: %s\n  prefill-chunk: %u\n  prefill-slots: %u\n  prefill-admission: pending model/device; execution reports route/reason\n",
                  prefill_arith_name(o.prefill_arith), o.prefill_big ? "on" : "off", o.prefill_chunk, o.prefill_slots);
+    std::fprintf(f, "  prefill-gdn: %s\n",
+                 o.prefill_arith == PrefillArith::exact ? "serial (exact prefill keeps the decode windows)"
+                 : o.prefill_gdn == PrefillGdn::chunk16 ? "chunk16 (FAST gdn-chunk16-f32-v1, identity -gdnc16)"
+                                                        : "serial (decode recurrence, bitwise)");
     std::fprintf(f, "  prefill-inflight: %u%s (bounded submission, scheduling only, bitwise)\n  prefill-ramp: %u%s\n", o.prefill_inflight,
                  o.prefill_inflight ? " chunks" : " = unbounded", o.prefill_ramp, o.prefill_ramp ? " rows first chunk, doubling to prefill-chunk" : " (off)");
     if (o.turbo_weights >= TurboWeights::onfly)
