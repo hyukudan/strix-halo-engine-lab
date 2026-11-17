@@ -4,7 +4,7 @@
 //  - seam: 25,616 B per row at a whole- or half-layer cut (qwen_prefill_pipeline.hpp Seam).
 //  - state crossing to the decoder: QSA layers (layer % 4 == 3) carry KV + indices 2,304 B/row; the MTP held
 //    layer adds 2,304 B/row and 20,480 B fixed on the last stage; each GDN layer carries a recurrent matrix and a
-//    convolution history of fixed size; layer 1 (PLE) a 10,240 x 9 BF16 convolution (src/cuda/qwen_prefill_driver.cu
+//    convolution history of fixed size; layer 1 (PLE) a 10,240 x 9 BF16 convolution (src/cuda/models/qwen/qwen_prefill_driver.cu
 //    export: recurrent_matrix / gdn_convolution / ple_convolution / mtp.held). Total 29,952 B/row + ~116.4 MB.
 #include "strix/pair/chain.hpp"
 #include "strix/qwen_prefill_pipeline.hpp"

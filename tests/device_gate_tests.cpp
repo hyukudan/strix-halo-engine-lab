@@ -403,6 +403,37 @@ void host_wait() {
     }
     require(refused, "host wait: unknown text is refused");
 }
+void code_load() {
+    // Policy: explicit HIP value (even empty) and STRIX_EAGER_CODE_LOAD=0 both decline; otherwise the value is set once.
+    std::vector<std::string> puts;
+    auto put = [&](const char* name, const char* value) { puts.push_back(std::string(name) + "=" + value); return true; };
+    auto env = [](const char* strix, const char* hip) {
+        return [=](const char* name) -> const char* {
+            return std::string(name) == "STRIX_EAGER_CODE_LOAD" ? strix : std::string(name) == "HIP_ENABLE_DEFERRED_LOADING" ? hip : nullptr;
+        };
+    };
+    require(apply_eager_code_loading(true, env(nullptr, nullptr), put) && puts == std::vector<std::string>{"HIP_ENABLE_DEFERRED_LOADING=0"},
+        "code load: default sets HIP_ENABLE_DEFERRED_LOADING=0");
+    require(!apply_eager_code_loading(true, env("0", nullptr), put), "code load: STRIX_EAGER_CODE_LOAD=0 declines");
+    require(!apply_eager_code_loading(true, env("1", ""), put), "code load: an explicit (empty) HIP value wins");
+    require(!apply_eager_code_loading(true, env(nullptr, "1"), put), "code load: explicit deferred HIP value wins");
+    require(!apply_eager_code_loading(false, env(nullptr, nullptr), put) && puts.size() == 1U, "code load: disabled engine policy");
+    rejects([&] { (void)apply_eager_code_loading(true, env(nullptr, nullptr), [](const char*, const char*) { return false; }); },
+        "cannot configure", "code load: a refused setenv is an error");
+    char arg0[] = "x";
+    char* argv[] = {arg0, nullptr};
+    eager_code_load_or_restart(argv, CodeLoad::engine);  // engine-owned: never restarts
+    set_env("STRIX_EAGER_CODE_LOAD", "");
+    set_env("HIP_ENABLE_DEFERRED_LOADING", "0");
+    require(code_load_receipt() == "code load: eager (HIP_ENABLE_DEFERRED_LOADING=0)", "code load: eager receipt");
+    require(code_load_receipt(CodeLoad::engine) == "code load: eager (engine policy)", "code load: engine receipt");
+    set_env("STRIX_EAGER_CODE_LOAD", "0");
+    set_env("HIP_ENABLE_DEFERRED_LOADING", "");
+    require(code_load_receipt() == "code load: deferred (STRIX_EAGER_CODE_LOAD=0)", "code load: declined receipt");
+    set_env("STRIX_EAGER_CODE_LOAD", "");
+    require(split_process_arguments(std::string_view("a\0\0b\0", 5)) == std::vector<std::string>{"a", "", "b"} &&
+                split_process_arguments("cut").empty(), "code load: restart arguments");
+}
 } // namespace
 
 int main() {
@@ -419,6 +450,7 @@ int main() {
         entry_points();
         units();
         host_wait();
+        code_load();
     } catch (const std::exception& e) {
         std::cerr << "device gate tests: " << e.what() << '\n';
         return 1;

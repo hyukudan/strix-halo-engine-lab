@@ -11,12 +11,12 @@ scratch = pathlib.Path(tempfile.gettempdir())
 binary = pathlib.Path(sys.argv[1]).resolve()
 
 def copy_scope(dest):
-    for rel in ("src/minimax", "src/moe_core", "src/dspark_common", "src/xport",
+    for rel in ("src/minimax", "src/cuda/models/minimax", "src/moe_core", "src/dspark_common", "src/xport",
                 "include/strix/minimax", "include/strix/session", "src/session"):
         shutil.copytree(root / rel, dest / rel)
     (dest / "include/strix/serve").mkdir(parents=True)
     shutil.copy2(root / "include/strix/serve/session_runtime.hpp", dest / "include/strix/serve/session_runtime.hpp")
-    for rel in ("CMakeLists.txt", "cmake/StrixSession.cmake", "src/serve/engine.cpp",
+    for rel in ("src/hip/weight/trellis_sources.hpp", "CMakeLists.txt", "cmake/StrixSession.cmake", "src/serve/engine.cpp",
                 "src/serve/session_runtime.cpp", "include/strix/serve/engine.hpp"):
         target = dest / rel
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -39,6 +39,12 @@ with tempfile.TemporaryDirectory(prefix="reviewed-", dir=scratch) as temp:
     copy_scope(baseline)
     good = audit(baseline)
     assert good.returncode == 0, good.stdout
+    moved = baseline / "src/hip/weight/trellis_sources.hpp"
+    original = moved.read_bytes()
+    moved.write_bytes(original.replace(b"float materialize(", b"float changed_materialize("))
+    changed_helper = audit(baseline)
+    assert changed_helper.returncode != 0 and "src/hip/weight/trellis_sources.hpp" in changed_helper.stdout, changed_helper.stdout
+    moved.write_bytes(original)
     # The historical source snapshot is the reviewed receipt baseline. CRLF
     # must not create a mismatch because the production audit normalizes it.
     crlf = baseline / "src/minimax/engine/mm_pack.cpp"

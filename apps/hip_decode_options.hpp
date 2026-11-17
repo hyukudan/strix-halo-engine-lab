@@ -2,6 +2,7 @@
 #include "strix/deploy/binding.hpp"
 #include "strix/serve/serve_config.hpp"
 #pragma once
+#include "strix/env_flags.hpp"
 #include "strix/rotary_descriptor.hpp"
 #include "strix/qsa_committed_pool.hpp"
 #include <iostream>
@@ -29,6 +30,7 @@
 #include <array>
 #include "strix/token_sampling.hpp"
 #include "strix/mtp_draft_profiles.hpp"
+#include "strix/onfly_i4.hpp"
 #include "qwen_mtp_bundle.hpp"
 #include "strix/session/speculation_default.hpp"
 #include "strix/mtp_depth_window_controller.hpp"
@@ -41,6 +43,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <locale>
 #include <optional>
 #include <set>
 #include <string>
@@ -134,6 +137,7 @@ struct MtpCliOptions {
     std::string conversion,normalized_rounding,projection_rounding,sidecar_residency;
     std::uint64_t sidecar_bytes=0,header_bytes=0,sidecar_retained_bytes=0,sidecar_setup_bytes=0;
     std::uint64_t golden_max_bytes=0,replay_host_bytes=0,runtime_bytes=0,target_capture_bytes=0;
+    bool runtime_automatic=false; // only the automatically discovered bundle may grow its runtime budget
     std::uint64_t policy_identity=0;
     std::uint32_t candidate_depth=0,window_rows=0;
     // Adaptive verifier: several prefix owners (window_rows is the largest) and the
@@ -255,6 +259,9 @@ struct Options {
     bool early_setup = true;
     bool eager_code_load = true;
     bool qwen_router_bf16 = true;
+    // TURBO+ onfly INT4 weights: as typed (CLI) and as resolved by initialize_prefill_config (CLI + environment).
+    strix::onfly_i4::Request turbo_request;
+    strix::onfly_i4::Resolved turbo;
     bool baseline = false;
     std::string suppressed_yarn_request;
     bool print_effective_config = false;
@@ -418,6 +425,8 @@ struct Options {
     // Smaller tiled blocks (descending) for the remainder after the last complete T-row block; by default the
     // sizes of default_known_prefill_tail_rows below T (D-056), none with `--known-prefix-tail-rows none`.
     std::vector<std::uint32_t> known_prefix_tail_rows;
+    // tail sizes added only because --mtp-copy-wide-rows verifies on them (not requested or chosen for prompts)
+    std::vector<std::uint32_t> known_prefix_wide_only_tail_rows;
     bool known_prefix_tail_rows_off = false;
     // STRIX_QPF2K_SCHED bit 8: the smallest default tail size before pruning (MTP capture-slot bound; 0 = unused)
     std::uint32_t known_prefix_tail_capture_rows = 0;
@@ -445,6 +454,10 @@ struct Options {
     // Automatic single-route admission, invoked with all ordinary owners resident.
     std::function<void()> cache_attach_ready, cache_attach_rollback;
     unsigned prefix_batch_cert = 0; // 0 off, 1 strict L0, 2 capture-only, 3 unqualified L1 (capture only)
+    // Batch restore admits only the solo suffix class (qwen_suffix_solo_class): no nested prompts, no prompt groups,
+    // no prompt-window cohorts. resolve_batch_cache_scheduler finalizes this after HTTP slot admission.
+    bool batch_cache_solo = false;
+    std::string batch_cache_solo_reason = "not-batch";
     bool prefix_cache = true;
     bool prefix_cache_inflight = true, prefix_cache_disk = true, prefix_cache_durable = true;
     bool prefix_fair_reclaim_idle = true; // Retention policy only; excluded from execution records.
@@ -1208,7 +1221,6 @@ inline void validate_release_manifest(const Options& o) {
 // Resolve compatibility before route-dependent validation. A cap never enables missing prerequisites.
 inline std::string http_batch_incompatibility(const Options& o) {
     if (o.rtx_state_import) return "single-only state import";
-    if (!o.mtp.copy_wide_rows.empty()) return "single-only copy-wide";
     if (!o.mtp.window_prefix || !o.mtp.draft_chain ||
         o.mtp.window_rows_set != std::vector<std::uint32_t>{2U, 4U, 8U})
         return "missing prefix windows, draft chain or rows 2,4,8";
@@ -1317,8 +1329,19 @@ inline void apply_default_known_prefill_tails(Options& options, const char* sche
     // --mtp-copy-wide-rows: each wide size runs on a tail owner of exactly that many rows (descending order kept).
     auto& tails = options.known_prefix_tail_rows;
     for (const auto wide : options.mtp.copy_wide_rows)
-        if (wide < options.known_prefix_prefill_rows && std::find(tails.begin(), tails.end(), wide) == tails.end())
+        if (wide < options.known_prefix_prefill_rows && std::find(tails.begin(), tails.end(), wide) == tails.end()) {
             tails.insert(std::upper_bound(tails.begin(), tails.end(), wide, std::greater<std::uint32_t>()), wide);
+            options.known_prefix_wide_only_tail_rows.push_back(wide);
+        }
+}
+
+// Whether a tail owner of `rows` tiles prompts. Under a split prefill profile the wide copy cycle verifies on its own
+// decode-profile owners (tiled.wide), so a tail size added only for it stays out of prompt tiling: the prompt is cut
+// exactly as without --mtp-copy-wide-rows (same blocks, same numerics, same tokens). Without a split profile the wide
+// cycle verifies on these tail owners, which then also tile prompts (as before).
+[[nodiscard]] inline bool known_prefix_tail_tiles_prompts(const Options& options, std::uint32_t rows, bool split_prefill_profile) {
+    const auto& w = options.known_prefix_wide_only_tail_rows;
+    return !split_prefill_profile || std::find(w.begin(), w.end(), rows) == w.end();
 }
 
 inline void validate_known_prefill_options(const Options& options) {
@@ -1559,6 +1582,15 @@ inline void validate_resolved_gdn_islands(const Options& options) {
         throw std::invalid_argument("GDN islands require resolved D1 and virtual/prefetch input with virtual output");
 }
 
+// The single resolver of the wide copy cycle (--mtp-copy-wide-rows). The CLI runs it for its one request; the
+// HTTP server runs it only while exactly one request is live, and STRIX_MTP_SERVE_WIDE=0 (serve_switch=false)
+// forces it off there. Returns the configured sizes (descending) or empty. Both routes call this, never the raw option.
+[[nodiscard]] inline std::vector<std::uint32_t> mtp_wide_copy_rows_effective(const Options& o,
+    bool serve_switch=strix::envcfg::flag("STRIX_MTP_SERVE_WIDE",true)) {
+    if(!o.mtp.enabled || !o.mtp.ngram_copy_edit || o.mtp.copy_wide_rows.empty()) return {};
+    if(o.http_serve && !serve_switch) return {};
+    return o.mtp.copy_wide_rows;
+}
 inline void validate_mtp_cli(const Options& o,bool resolved=false) {
     const auto& m=o.mtp;
     // HTTP can supply its tiled owner after host memory admission. Validate the
@@ -1625,9 +1657,12 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
     if(m.ngram_draft && (!m.draft_chain || !m.window_rows || !m.window_prefix || m.sample_options || m.metadata_only || !m.cohort.empty()))
         throw std::invalid_argument("--mtp-ngram-draft requires --mtp-draft-chain, prefix target windows, greedy selection and one request");
     if(!m.copy_wide_rows.empty()) {
-        if(!m.ngram_copy_edit || !tiled || o.http_batch || m.metadata_only || !m.golden_dump.empty())
+        if(!m.ngram_copy_edit || !tiled || m.metadata_only || !m.golden_dump.empty())
             throw std::invalid_argument("--mtp-copy-wide-rows requires --mtp-ngram-draft=copy or =wide on the tiled MTP prompt, "
                 "one request and no golden dump");
+        // The HTTP route resolves its tiled prefill (and with it the tail sizes) after admission: the resolved
+        // validation (validate_resolved_mtp_cli) checks the sizes then.
+        if(resolved || !http_prefill_pending(o))
         for(const auto wide:m.copy_wide_rows)
             if(std::find(o.known_prefix_tail_rows.begin(),o.known_prefix_tail_rows.end(),wide)==o.known_prefix_tail_rows.end())
                 throw std::invalid_argument("--mtp-copy-wide-rows requires a tiled tail block of each listed size "
@@ -1680,7 +1715,11 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
                 throw std::invalid_argument("MTP cohort request requires 3..4097 prompt tokens within the context and a pinned golden");
     }
 }
+inline void validate_onfly_i4_routes(const Options& o) {
+    onfly_i4::require_serial(o.turbo.active(), !o.mtp.cohort.empty() || (o.http_serve && o.http_batch));
+}
 inline void validate_resolved_mtp_cli(const Options& o) {
+    validate_onfly_i4_routes(o);
     validate_mtp_cli(o,true);
     if(o.mtp.enabled && o.mtp.window_rows && (!o.deferred_moe_status || !o.virtual_q8_gdn_input || !o.prefetch_q8_gdn_input ||
        !o.virtual_q8_gdn_output || !o.wave8_q8_gdn_input || !o.wave8_q8_gdn_output))
@@ -1839,6 +1878,31 @@ inline void apply_prefix_cache_environment(Options& o, Lookup lookup) {
     }
 }
 
+inline std::vector<std::uint64_t> read_teacher_logits_rows(std::istream& input) {
+    std::vector<std::uint64_t> rows;
+    while (input >> std::ws && input.peek() != std::char_traits<char>::eof()) {
+        if (rows.size() == 65536U)
+            throw std::invalid_argument("teacher logits rows file must list 1..65536 positions");
+        // C++20 array extraction reads at most 20 characters plus the terminator.
+        // Reject a longer word before consuming or allocating its remaining bytes.
+        char word[21]{};
+        input >> word;
+        const auto next = input.peek();
+        if (next != std::char_traits<char>::eof() && !std::isspace(static_cast<char>(next), input.getloc()))
+            throw std::invalid_argument("teacher logits rows must be ascending decimal positions");
+        const std::string_view token(word);
+        std::uint64_t row = 0;
+        const auto parsed = std::from_chars(token.data(), token.data() + token.size(), row);
+        if (parsed.ec != std::errc{} || parsed.ptr != token.data() + token.size() ||
+            (!rows.empty() && row <= rows.back()))
+            throw std::invalid_argument("teacher logits rows must be ascending decimal positions");
+        rows.push_back(row);
+    }
+    if (input.bad()) throw std::invalid_argument("cannot read teacher logits rows file");
+    if (rows.empty()) throw std::invalid_argument("teacher logits rows file must list 1..65536 positions");
+    return rows;
+}
+
 // The serve options a --serve-config file may set for this CLI (src/serve/serve_config.cpp expands them in front of
 // the command line; the parser below validates and resolves them exactly as the equivalent flags).
 inline std::span<const strix::serve::config_file::Option> hip_serve_config_options() {
@@ -1952,6 +2016,7 @@ inline Options parse_options(
                 for (auto& arg:expanded) pointers.push_back(arg.data());
                 auto result=parse_options(static_cast<int>(pointers.size()),pointers.data(),defer_qpf2k_defaults,
                     off?"serial-retry":bundle);
+                result.mtp.runtime_automatic = !off && decision.source=="default";
                 if (off) {result.mtp_bundle_path.clear();result.yarn_decode_source="env";}
                 else verify_mtp_bundle_sidecar(result.mtp.sidecar,result.mtp.sidecar_sha256,result.mtp.sidecar_bytes);
                 return result;
@@ -2083,6 +2148,23 @@ inline Options parse_options(
         // A supplied controller or organization owns its route, including values
         // equal to the incumbent defaults. Arithmetic alone can select a prompt pair.
         // The opt-in route-dot storage candidate is a product arithmetic switch.
+        // TURBO+ weight source (strix/onfly_i4.hpp): a weight-format switch, not a route-owning option.
+        {
+            using Req = strix::onfly_i4::Request;
+            bool turbo_flag = false;
+            for (const auto& [flag, field] : {std::pair<std::string_view, std::string Req::*>{"--turbo-onfly-groups", &Req::groups},
+                                              {"--turbo-onfly-scale-rule", &Req::scale_rule}}) {
+                if (argument != flag && !(argument.starts_with(flag) && argument.size() > flag.size() && argument[flag.size()] == '=')) continue;
+                const auto value = argument == flag ? (index + 1 < argc ? std::string_view(argv[++index]) : std::string_view{})
+                                                    : argument.substr(flag.size() + 1U);
+                if (value.empty() || value.starts_with("--")) throw std::invalid_argument(std::string(flag) + " requires a value");
+                if (!(options.turbo_request.*field).empty()) throw std::invalid_argument("duplicate " + std::string(flag));
+                options.turbo_request.*field = std::string(value);
+                turbo_flag = true;
+                break;
+            }
+            if (turbo_flag) continue;
+        }
         if (argument.starts_with("--") && argument != "--generate" && !argument.starts_with("--generate=") &&
             argument != "--context" && !argument.starts_with("--context=") && argument != "--unqualified-context" &&
             !argument.starts_with("--optimization-profile") && argument != "--prefill-moe-route-bf16" &&
@@ -2168,17 +2250,7 @@ inline Options parse_options(
                 throw std::invalid_argument("teacher logits rows requires a nonempty path");
             std::ifstream rows_file{std::string(value)};
             if (!rows_file) throw std::invalid_argument("cannot read teacher logits rows file");
-            std::string word;
-            while (rows_file >> word) {
-                std::uint64_t row = 0;
-                const auto parsed = std::from_chars(word.data(), word.data() + word.size(), row);
-                if (parsed.ec != std::errc{} || parsed.ptr != word.data() + word.size() ||
-                    (!options.teacher_logits_rows.empty() && row <= options.teacher_logits_rows.back()))
-                    throw std::invalid_argument("teacher logits rows must be ascending decimal positions");
-                options.teacher_logits_rows.push_back(row);
-            }
-            if (options.teacher_logits_rows.empty() || options.teacher_logits_rows.size() > 65536U)
-                throw std::invalid_argument("teacher logits rows file must list 1..65536 positions");
+            options.teacher_logits_rows = read_teacher_logits_rows(rows_file);
             options.teacher_logits_rows_supplied = true;
             continue;
         }
@@ -3464,6 +3536,12 @@ inline Options parse_options(
         } else spec.context = static_cast<std::uint32_t>(options.context_tokens);
         options.deployment_spec = std::make_shared<const strix::deploy::Spec>(std::move(spec));
     }
+    // CLI and server share this refusal. Capacity never opts into experimental arithmetic.
+    // Validate a known native prompt's complete extent even when --context was omitted.
+    if (!yarn_factor || options.baseline)
+        (void)strix::validate_qwen_rotary_request(0, options.context_explicit,
+            std::max(options.context_tokens, static_cast<std::uint64_t>(options.tokens.size()) + options.generate_tokens),
+            options.baseline);
     options.rotary = strix::validate_qwen_rotary_request(yarn_factor,
         options.context_explicit, options.context_tokens, options.baseline);
     options.mtp_native_bundle = !options.mtp_bundle_path.empty() && options.rotary.mode()!=strix::RotaryMode::yarn;

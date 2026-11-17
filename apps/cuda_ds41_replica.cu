@@ -82,13 +82,13 @@
 #include "strix/env_flags.hpp"
 #include "strix/ds41_replica_census.hpp"
 #include "strix/model_content_hash.hpp"
-#include "strix/cuda_ds41_dspark.hpp"
-#include "strix/cuda_ds41_attention.hpp"
-#include "strix/cuda_ds41_core.hpp"
-#include "strix/cuda_ds41_hot_residency.hpp"
-#include "strix/cuda_ds41_prefill.hpp"
-#include "strix/cuda_ds41_router_v2.hpp"
-#include "strix/cuda_ds41_tier_site.hpp"
+#include "strix/cuda/ds41_dspark.hpp"
+#include "strix/cuda/ds41_attention.hpp"
+#include "strix/cuda/ds41_core.hpp"
+#include "strix/cuda/ds41_hot_residency.hpp"
+#include "strix/cuda/ds41_prefill.hpp"
+#include "strix/cuda/ds41_router_v2.hpp"
+#include "strix/cuda/ds41_tier_site.hpp"
 #include "strix/deepseek41_attention_state.hpp"
 #include "strix/deepseek41_model.hpp"
 #include "strix/ds41_dspark_driver.hpp"
@@ -103,7 +103,7 @@
 #include "cuda_ds41_session_draft.hpp"
 #include "cuda_ds41_replica_budget.hpp"
 
-#include "strix/cuda_ds41_moe_v2.hpp"
+#include "strix/cuda/ds41_moe_v2.hpp"
 
 #include <cuda_runtime.h>
 
