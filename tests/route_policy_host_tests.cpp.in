@@ -172,6 +172,31 @@ void glm_equivalent() {
         different(defaults, glm_fingerprint());
         env("STRIX_GLM_PF_IDXPROJ_WMMA", nullptr);
     }
+    {  // FAST fused attention core and its o-bar image: the server pairs on this fingerprint alone, so both must enter it
+        const auto rearm = [] { strix::env_arms::generation_ref().fetch_add(1); };  // switches resolved once per arm
+        env("STRIX_GLM_PF_ATTN_WMMA", "1");
+        env("STRIX_GLM_PF_ATTN_WMMA_T", "16");
+        rr::require_same_route(defaults, glm_fingerprint(1));
+        env("STRIX_GLM_PF_ATTN_WMMA_T", "32");
+        different(defaults, glm_fingerprint());
+        env("STRIX_GLM_PF_ATTN_WMMA_T", nullptr);
+        env("STRIX_GLM_PF_ATTN_WMMA", "0");
+        different(defaults, glm_fingerprint());
+        env("STRIX_GLM_PF_ATTN_WMMA", nullptr);
+        env("STRIX_GLM_PF_MLA_OB16", "0");
+        rearm();
+        rr::require_same_route(defaults, glm_fingerprint(1));
+        env("STRIX_GLM_PF_MLA_OB16", "1");
+        rearm();
+        different(defaults, glm_fingerprint());
+        env("STRIX_GLM_PF_ATTN_WMMA", "0");  // without the fused core there is no o-bar image to store
+        const auto no_core = glm_fingerprint();
+        env("STRIX_GLM_PF_MLA_OB16", nullptr);
+        rearm();
+        rr::require_same_route(no_core, glm_fingerprint(1));
+        env("STRIX_GLM_PF_ATTN_WMMA", nullptr);
+        rr::require_same_route(defaults, glm_fingerprint(1));
+    }
     // FAST WMMA selected: the auto floor is 32 rows; the exact route's is 64 (glm_pf_dense_policy.hpp).
     env("STRIX_GLM_PF_EXACT_X_MIN_ROWS", "32");
     rr::require_same_route(defaults, glm_fingerprint(1));

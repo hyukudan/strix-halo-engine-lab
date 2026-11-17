@@ -15,6 +15,7 @@
 #include "strix/route_receipt.hpp"
 #include "strix/serve/prefill_interleave.hpp"
 #include "glm/prefill/glm_pf_dense_policy.hpp"
+#include "glm/prefill/glm_pf_attn_wmma.hpp"
 #include "glm/prefill/glm_pf_exact.hpp"
 #include "glm/prefill/glm_pf_wmma.hpp"
 
@@ -45,6 +46,14 @@ inline std::uint64_t record_route_levers(std::string_view entry, unsigned rank, 
     rr::lever("glm.pf_kda_wmma", kda, pf::kda_wmma::enabled() ? "1" : "0");
     rr::lever("glm.pf_mla_wmma", asked("STRIX_GLM_PF_MLA_WMMA"), pf::mla_wmma::enabled() ? "1" : "0");
     rr::lever("glm.pf_mla_gemm_heads", asked("STRIX_GLM_PF_MLA_GEMM_HEADS"), pf::mla_gemm::heads_mid() ? "1" : "0");
+    // The fused MLA/DSA core (glm-pf-attn-wmma, its own bits; the key block orders the online softmax) and the FP16 o-bar
+    // image it can store for the WMMA out GEMM (STRIX_GLM_PF_MLA_OB16, measured not bitwise) change the prefill
+    // arithmetic: the server's hello pairs on this fingerprint alone (the rank CLI also votes kPfAttnWmmaConfig).
+    const bool attn_on = pf::attn_wmma::enabled();
+    rr::lever("glm.pf_attn_wmma", asked("STRIX_GLM_PF_ATTN_WMMA") + ":t=" + asked("STRIX_GLM_PF_ATTN_WMMA_T"),
+              attn_on ? "1:t=" + std::to_string(pf::attn_wmma::block_keys()) : std::string("0"));
+    rr::lever("glm.pf_mla_ob16", asked("STRIX_GLM_PF_MLA_OB16"),
+              attn_on && pf::mla_wmma::enabled() && pf::mla_wmma::ob16() ? "1" : "0");
     rr::lever("glm.pf_idxproj_wmma", asked("STRIX_GLM_PF_IDXPROJ_WMMA"), pf::idxproj_wmma::enabled() ? "1" : "0");
     rr::lever("glm.pf_x16", asked("STRIX_GLM_PF_X16"), pf::kda_wmma::x16_enabled() ? "1" : "0", rr::Reason::selected, false);
     rr::lever("glm.pf_router_wmma", asked("STRIX_GLM_PF_ROUTER_WMMA"),
