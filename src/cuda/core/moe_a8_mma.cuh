@@ -31,16 +31,23 @@ __device__ __forceinline__ void mma_rows(const std::uint16_t* base, unsigned pit
     const uint2 r1 = *reinterpret_cast<const uint2*>(base + (row + 8U) * pitch + k);
     native_mma::a_regs(r0.x, r0.y, r1.x, r1.y, a);
 }
-// B registers and C-column scales of one weight row (column g of this lane) for one group. C element i of a lane is
-// column 2 q + (i & 1): its scale comes from the lanes that own those columns (lanes 8 q and 8 q + 4).
+// Field bytes of one weight row (column g of this lane) for one group: the lane's two words (word_index h = 0, 1) and the
+// scales. Loads only, so the loops issue them one group ahead (weights do not depend on the shared-memory stage).
 template <class Decode>
-__device__ __forceinline__ void mma_weights(const std::uint8_t* row, unsigned group, unsigned lane, unsigned (&b)[2][2],
-                                            float (&scale)[2][2]) {
+__device__ __forceinline__ typename Decode::Raw mma_raw(const std::uint8_t* row, unsigned group, unsigned lane) {
+    return Decode::load(row, group, native_mma::word_index(lane, 0U), native_mma::word_index(lane, 1U));
+}
+// B registers and C-column scales of that row and group from its fields (branch-free decode, codebook in shared memory).
+// C element i of a lane is column 2 q + (i & 1): its scale comes from the lanes that own those columns (lanes 8 q and
+// 8 q + 4).
+template <class Decode>
+__device__ __forceinline__ void mma_weights(const typename Decode::Raw& raw, unsigned group, const weight::GsqSmemGrid& grid,
+                                            unsigned lane, unsigned (&b)[2][2], float (&scale)[2][2]) {
     namespace nm = native_mma;
 #pragma unroll
-    for (unsigned h = 0; h < 2U; ++h) nm::code_pairs(Decode::word(row, group, nm::word_index(lane, h)), b[h][0], b[h][1]);
+    for (unsigned h = 0; h < 2U; ++h) nm::code_pairs(Decode::word(raw, h, nm::word_index(lane, h), grid), b[h][0], b[h][1]);
     float first = 0.0F, second = 0.0F;
-    Decode::scales(row, group, first, second);
+    Decode::scales(raw, group, first, second);
     scale[0][0] = __shfl_sync(0xFFFFFFFFU, first, nm::scale_lane(lane, 0U));
     scale[0][1] = __shfl_sync(0xFFFFFFFFU, first, nm::scale_lane(lane, 1U));
     if constexpr (Decode::halves) {
@@ -73,13 +80,16 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_project_kernel(cons
     const unsigned expert = csr.tile_experts[ts.tile];
     __shared__ alignas(16) std::uint16_t X[2][kNativeTileRows][kMmaProjectPitch];
     __shared__ unsigned row_of[kNativeTileRows], slot_of[kNativeTileRows];
+    __shared__ std::uint32_t grid_words[Decode::grid_words ? Decode::grid_words : 1U];  // the type's codebook (<= 8 KB)
     const unsigned t = threadIdx.x, lane = t & 31U, warp = t >> 5, g = lane >> 2, q = lane & 3U;
     const unsigned out_base = native_mma::project_output(ts.slice, warp, 0U);
     if (t < kNativeTileRows) {
         const unsigned a = t < count ? t : 0U;
         row_of[t] = csr.rows[tile_begin + a]; slot_of[t] = csr.slots[tile_begin + a];
     }
+    weight::gsq_grid_fill<T>(grid_words, t, kMmaThreads);
     __syncthreads();
+    const weight::GsqSmemGrid grid{grid_words};
     // Thread t copies word t % 64 of rows t / 64 + 4 i. Rows >= count are not written: an MMA row reaches only its own C
     // row, and those C rows are never stored.
     const auto load = [&](unsigned buf, unsigned s) {
@@ -103,6 +113,10 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_project_kernel(cons
 #pragma unroll
             for (unsigned i = 0; i < 4U; ++i) acc[m][mat][i] = 0.0F;
     load(0U, 0U);
+    // Weight fields of the next group are loaded before this group's decode and MMAs (and across the stage barrier):
+    // the global round trip overlaps one group of work. The last group re-loads itself (no branch, no read past the row).
+    constexpr unsigned groups = stages * groups_per_stage;
+    typename Decode::Raw ahead[2] = {mma_raw<Decode>(wrow[0], 0U, lane), mma_raw<Decode>(wrow[1], 0U, lane)};
 #pragma unroll 1
     for (unsigned s = 0; s < stages; ++s) {
         cp_wait_all();
@@ -111,11 +125,14 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_project_kernel(cons
         const std::uint16_t* xs = &X[s & 1U][0][0];
 #pragma unroll
         for (unsigned j = 0; j < groups_per_stage; ++j) {
-            const unsigned group = s * groups_per_stage + j;
+            const unsigned group = s * groups_per_stage + j, next = group + 1U < groups ? group + 1U : group;
+            const typename Decode::Raw raw[2] = {ahead[0], ahead[1]};
+            ahead[0] = mma_raw<Decode>(wrow[0], next, lane);
+            ahead[1] = mma_raw<Decode>(wrow[1], next, lane);
             unsigned b[2][2][2];
             float scale[2][2][2];
-            mma_weights<Decode>(wrow[0], group, lane, b[0], scale[0]);
-            mma_weights<Decode>(wrow[1], group, lane, b[1], scale[1]);
+            mma_weights<Decode>(raw[0], group, grid, lane, b[0], scale[0]);
+            mma_weights<Decode>(raw[1], group, grid, lane, b[1], scale[1]);
 #pragma unroll
             for (unsigned m = 0; m < 4U; ++m) {
                 if (m >= mblocks) break;
@@ -169,13 +186,16 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_down_kernel(const s
     __shared__ alignas(16) std::uint16_t Xh[2][kNativeTileRows][kMmaDownPitch];
     __shared__ alignas(16) std::uint16_t Xl[2][kNativeTileRows][kMmaDownPitch];
     __shared__ unsigned row_of[kNativeTileRows], slot_of[kNativeTileRows];
+    __shared__ std::uint32_t grid_words[Decode::grid_words ? Decode::grid_words : 1U];  // the type's codebook (none: 4 B)
     const unsigned t = threadIdx.x, lane = t & 31U, warp = t >> 5, g = lane >> 2, q = lane & 3U;
     const unsigned out_base = native_mma::down_output(ts.slice, warp, 0U, 0U);
     if (t < kNativeTileRows) {
         const unsigned a = t < count ? t : 0U;
         row_of[t] = csr.rows[tile_begin + a]; slot_of[t] = csr.slots[tile_begin + a];
     }
+    weight::gsq_grid_fill<T>(grid_words, t, kMmaThreads);
     __syncthreads();
+    const weight::GsqSmemGrid grid{grid_words};
     // Thread t holds 16 h values of the next stage (row t / 4, values 16 (t % 4) ..) in registers across the MMAs and then
     // writes their hi / lo halves: the split needs the values, so this is a register prefetch, not a shared-memory copy.
     const unsigned sr = t >> 2, sk = 16U * (t & 3U);
@@ -222,6 +242,9 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_down_kernel(const s
 #pragma unroll
             for (unsigned i = 0; i < 4U; ++i) acc[m][n][i] = 0.0F;
     fetch(0U); put(0U);
+    // Weight fields one group ahead, as in the project kernel (the last group re-loads itself).
+    constexpr unsigned groups = stages * groups_per_stage;
+    typename Decode::Raw ahead[2] = {mma_raw<Decode>(wrow[0], 0U, lane), mma_raw<Decode>(wrow[1], 0U, lane)};
     __syncthreads();
 #pragma unroll 1
     for (unsigned s = 0; s < stages; ++s) {
@@ -231,11 +254,14 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_down_kernel(const s
         const std::uint16_t* xl = &Xl[s & 1U][0][0];
 #pragma unroll
         for (unsigned j = 0; j < groups_per_stage; ++j) {
-            const unsigned group = s * groups_per_stage + j;
+            const unsigned group = s * groups_per_stage + j, next = group + 1U < groups ? group + 1U : group;
+            const typename Decode::Raw raw[2] = {ahead[0], ahead[1]};
+            ahead[0] = mma_raw<Decode>(wrow[0], next, lane);
+            ahead[1] = mma_raw<Decode>(wrow[1], next, lane);
             unsigned b[2][2][2];
             float scale[2][2][2];
-            mma_weights<Decode>(wrow[0], group, lane, b[0], scale[0]);
-            mma_weights<Decode>(wrow[1], group, lane, b[1], scale[1]);
+            mma_weights<Decode>(raw[0], group, grid, lane, b[0], scale[0]);
+            mma_weights<Decode>(raw[1], group, grid, lane, b[1], scale[1]);
 #pragma unroll
             for (unsigned m = 0; m < 4U; ++m) {
                 if (m >= mblocks) break;
