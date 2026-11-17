@@ -4009,6 +4009,82 @@ int main(int argc, char** arguments) {
             expect(kept.options.numerical_profile==sidecar.options.numerical_profile && !kept.options.prefill_profile_automatic &&
                 !kept.options.prefill_numerical_profile,
                 "sidecar MTP server with the FP16 off switch keeps its previous decode and prefill arithmetic");
+            // Issue 758: an explicit-sidecar server with the recipe's MTP windows must carry the window organization;
+            // each missing prerequisite is refused at resolution, naming its flags, instead of after the model load.
+            auto organized=sidecar_argv;
+            organized.insert(organized.end(),{"--deferred-moe-status","--virtual-q8-gdn-input","--prefetch-q8-gdn-input",
+                "--virtual-q8-gdn-output","--wave8-q8-gdn-input","--wave8-q8-gdn-output","--q4k-a8g32-gate-up",
+                "--grouped-exact-q51-down","--q51-slot-parallel-down","--context","33280"});
+            const auto served_without_hc=resolve(RequestedOptions{parse(organized),{}},memory);
+            expect(!served_without_hc.options.known_prefix_prefill_rows &&
+                served_without_hc.serve_prefill_notice.find("MTP window hyper-mix requires resolved --parallel-hyper-mix")!=std::string::npos,
+                "window hyper-mix without the HC organization is refused at resolution, naming the flags");
+            organized.insert(organized.end(),{"--parallel-hyper-mix","--staged-hyper-projections","--fused-staged-hyper-mix",
+                "--typed-fused-hyper-projections","--prefetch-typed-hyper-rows","--prefetch-q8-hyper-output"});
+            const auto served_without_head=resolve(RequestedOptions{parse(organized),{}},memory);
+            expect(!served_without_head.options.known_prefix_prefill_rows &&
+                served_without_head.serve_prefill_notice.find("MTP target windows require resolved --virtual-q8-lm-head")!=std::string::npos,
+                "greedy window rows without the virtual Q8 LM head are refused at resolution, naming the flags");
+            // With the virtual Q8 LM head the shared route adds its prefetch/wave8 pair; the explicit organization keeps
+            // the QSA input, shared-expert and lane-chain organizations off.
+            organized.emplace_back("--virtual-q8-lm-head");
+            const auto served_organized=resolve(RequestedOptions{parse(organized),{}},memory);
+            expect(served_organized.error.empty() && served_organized.options.known_prefix_prefill_rows==8192 &&
+                served_organized.options.automatic_prefill && mtp_tiled_prompt(served_organized.options) &&
+                served_organized.options.prefetch_q8_lm_head && served_organized.options.wave8_q8_lm_head &&
+                served_organized.options.wave8_q8_gdn_input,
+                "minimal MTP-window organization server admits automatic T8192");
+            validate_http_serve(served_organized.options);
+            {
+                // The serving memory check registers the prompt compiler requests: their plans must follow the
+                // options, as in the decode builder ("... requires opt-in" otherwise).
+                auto organized_options=served_organized.options;
+                expect(!organized_options.prefetch_q8_qsa_input && !organized_options.prefetch_q8_shared_expert &&
+                    !organized_options.lane_chain_hyper_output,
+                    "minimal MTP-window organization keeps the QSA, shared-expert and lane-chain organizations off");
+                const auto req=prompt_compiler_requests(organized_options,model,manifest);
+                expect(req.binding.qsa_input_prefetch_layers.empty() && req.catalog.qsa_input_prefetch_layers.empty() &&
+                    req.binding.shared_expert_prefetch_layers.empty() && req.catalog.shared_expert_prefetch_layers.empty() &&
+                    req.binding.lane_chain_hyper_output_eligible_steps.empty(),
+                    "prompt compiler requests carry no layer/step lists for disabled organizations");
+                qsa_input_prefetch::validate_layers(model,req.binding.prefetch_q8_qsa_input,req.binding.qsa_input_prefetch_layers);
+                shared_expert_prefetch::validate_layers(model.hidden_layers,req.binding.prefetch_q8_shared_expert,
+                    req.binding.shared_expert_prefetch_layers);
+                organized_options.prefetch_q8_qsa_input=organized_options.prefetch_q8_shared_expert=true;
+                organized_options.lane_chain_hyper_output=true;
+                const auto enabled=prompt_compiler_requests(organized_options,model,manifest);
+                expect(!enabled.binding.qsa_input_prefetch_layers.empty() && !enabled.binding.shared_expert_prefetch_layers.empty() &&
+                    !enabled.binding.lane_chain_hyper_output_eligible_steps.empty(),
+                    "enabled organizations keep their layer and step plans");
+            }
+            {
+                // A server without target windows whose low-level organization keeps its decode profile (no virtual
+                // Q8 LM head) keeps its LM head: the shared route no longer adds the LM-head pair, which made every
+                // automatic tile fail "prefetch Q8 LM head requires resolved virtual Q8 LM head".
+                auto plain=mtp_fixture(); plain.insert(plain.begin()+5,13,"1");
+                plain.insert(plain.end(),{"--http-serve","--http-batch","0","--context","33280","--deferred-moe-status",
+                    "--virtual-q8-gdn-input","--prefetch-q8-gdn-input","--virtual-q8-gdn-output","--wave8-q8-gdn-input",
+                    "--wave8-q8-gdn-output","--q4k-a8g32-gate-up","--grouped-exact-q51-down","--q51-slot-parallel-down"});
+                const auto served_plain=resolve(RequestedOptions{parse(plain),{}},memory);
+                expect(served_plain.options.known_prefix_prefill_rows==8192 && !served_plain.options.virtual_q8_lm_head &&
+                    !served_plain.options.prefetch_q8_lm_head && !served_plain.options.wave8_q8_lm_head,
+                    "server without the virtual Q8 LM head admits automatic T8192 without the LM-head pair");
+            }
+            auto drafted=sidecar_argv;
+            drafted.insert(drafted.end(),{"--mtp-draft-chain","--mtp-spec-min-p","0.7","--mtp-draft-q4",
+                "--mtp-draft-vocab","auto:draft-vocab","--mtp-draft-context-vocab","4096","--context","33280"});
+            // Without that organization the server takes the decode profile, which is qualified at context 8192;
+            // any other explicit context needs --unqualified-context, the same rule as the single-request command.
+            const auto served_drafted=resolve(RequestedOptions{parse(drafted),{}},memory);
+            expect(!served_drafted.options.known_prefix_prefill_rows &&
+                served_drafted.serve_prefill_notice.find("explicit tiled configuration required")!=std::string::npos,
+                "recipe server without organization flags at context 33280 needs --unqualified-context");
+            drafted.emplace_back("--unqualified-context");
+            const auto served_unqualified=resolve(RequestedOptions{parse(drafted),{}},memory);
+            expect(served_unqualified.options.known_prefix_prefill_rows==8192 && served_unqualified.options.automatic_prefill &&
+                served_unqualified.options.numerical_profile==dense_a8_profile && served_unqualified.options.virtual_q8_lm_head &&
+                served_unqualified.options.prefetch_q8_lm_head,
+                "recipe server with --unqualified-context adopts the decode profile and admits automatic T8192");
         }
         expect(fast.options.known_prefix_tail_rows==std::vector<std::uint32_t>({1024,256,64,16}),
             "HTTP keeps all tail owners for future requests");

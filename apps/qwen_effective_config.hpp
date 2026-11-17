@@ -203,13 +203,20 @@ inline Environment requested_prefill_environment(Get get) {
 inline Environment requested_prefill_environment() {
     return requested_prefill_environment([](const char* name) { return ::strix::envcfg::text(name); });
 }
+// Launch/copy organizations only, never arithmetic. The LM-head pair schedules the virtual Q8 LM head, which is a
+// numerical choice of the resolved base (the automatic decode profile sets it). A base without it (for example a
+// server whose explicit MTP-window organization keeps its own decode profile) keeps its LM head, instead of
+// failing "prefetch Q8 LM head requires resolved virtual Q8 LM head" at every tile (issue 758). Every base that
+// carries the virtual Q8 LM head gets the same items as before.
 inline void apply_measured_prompt_organization(Options& o) {
     o.q51_slot_parallel_down = true;
     o.batched_moe_activation = true;
     o.wave8_q8_gdn_input = true;
     o.wave8_q8_gdn_output = true;
-    o.prefetch_q8_lm_head = true;
-    o.wave8_q8_lm_head = true;
+    if (o.virtual_q8_lm_head) {
+        o.prefetch_q8_lm_head = true;
+        o.wave8_q8_lm_head = true;
+    }
     o.wave8_q8_qsa_output = true;
 }
 inline constexpr DecodeNumericalProfile dense_a8_profile =

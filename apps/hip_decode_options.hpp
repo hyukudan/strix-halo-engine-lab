@@ -1727,6 +1727,20 @@ inline void validate_resolved_mtp_cli(const Options& o) {
     if(o.mtp.enabled && o.mtp.window_expert_union && (!o.q4k_a8g32_gate_up || !o.grouped_exact_q51_down ||
        !o.q51_slot_parallel_down || !o.deferred_moe_status))
         throw std::invalid_argument("MTP window expert union requires resolved A8, grouped Q5_1, slot-parallel down and D1");
+    // The window's hyper-mix rows exist only on the parallel/staged/fused typed-Q8 HC kernel with row and output
+    // prefetch (known_hyper_rows_id); without it the window refused only after the model load (issue 758).
+    if(o.mtp.enabled && o.mtp.window_hyper_mix && (!o.parallel_hyper_mix || !o.staged_hyper_projections ||
+       !o.fused_staged_hyper_mix || !o.typed_hyper_projection || !o.prefetch_typed_hyper_rows || !o.prefetch_q8_hyper_output))
+        throw std::invalid_argument("MTP window hyper-mix requires resolved --parallel-hyper-mix --staged-hyper-projections "
+            "--fused-staged-hyper-mix --typed-fused-hyper-projections --prefetch-typed-hyper-rows --prefetch-q8-hyper-output");
+    // Every window verifies its rows with the greedy multi-row head (hip_mtp_window_verifier.hip), which exists only on
+    // the virtual Q8 LM head kernels (known_head_id: prefetch8 load or wave8); without it the server refused only after
+    // the model load ("known-window greedy rows require ..."). STRIX_MTP_GREEDY_ROWS=0 keeps per-row selectors.
+    const char* greedy_rows=strix::envcfg::text("STRIX_MTP_GREEDY_ROWS");
+    if(o.mtp.enabled && o.mtp.window_rows && !(greedy_rows && std::string_view(greedy_rows)=="0") &&
+       !o.virtual_q8_lm_head)
+        throw std::invalid_argument("MTP target windows require resolved --virtual-q8-lm-head "
+            "(greedy window rows; STRIX_MTP_GREEDY_ROWS=0 keeps per-row selectors)");
 }
 
 inline std::string yarn_route_refusal(const Options& o) {

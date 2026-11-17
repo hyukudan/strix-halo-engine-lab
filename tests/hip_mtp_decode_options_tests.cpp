@@ -541,6 +541,14 @@ int main(){try{
     require(failed,"MTP target windows cannot silently enable D1 or paired GDN optimizations");
     selected.deferred_moe_status=selected.virtual_q8_gdn_input=selected.prefetch_q8_gdn_input=selected.virtual_q8_gdn_output=
         selected.wave8_q8_gdn_input=selected.wave8_q8_gdn_output=true;
+    // Issue 758: the greedy window rows run only on the virtual Q8 LM head, which the resolved decode profile (or
+    // --virtual-q8-lm-head) supplies; a resolved route without it is refused before any model load.
+    bool head_rejected=false;
+    try{strix::decode_cli::validate_resolved_mtp_cli(selected);}catch(const std::invalid_argument& e){
+        head_rejected=std::string(e.what()).starts_with("MTP target windows require resolved --virtual-q8-lm-head");
+    }
+    require(head_rejected,"MTP target windows without the virtual Q8 LM head are refused, naming the flag");
+    selected.virtual_q8_lm_head=true;
     strix::decode_cli::validate_resolved_mtp_cli(selected);
     // The union is a separate opt-in target-window consumer, never an implicit
     // prerequisite-completing optimization or a known-prefix alias.
@@ -560,7 +568,7 @@ int main(){try{
             !options.q4k_a8g32_gate_up && !options.grouped_exact_q51_down && !options.q51_slot_parallel_down &&
             !options.deferred_moe_status,
             "real parser preserves explicit union budget and leaves all execution prerequisites unchanged");
-        options.context_tokens=8192;
+        options.context_tokens=8192;options.virtual_q8_lm_head=true;
         options.deferred_moe_status=options.virtual_q8_gdn_input=options.prefetch_q8_gdn_input=
             options.virtual_q8_gdn_output=options.wave8_q8_gdn_input=options.wave8_q8_gdn_output=true;
         bool missing_prerequisites=false;
