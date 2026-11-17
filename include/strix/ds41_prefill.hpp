@@ -130,6 +130,27 @@ bool try_grow_moe_scratch(std::unique_ptr<Scratch>& current, std::uint64_t bytes
         return false;
     }
 }
+// ---- Bounded decoder replay (FAST policy ds41-decoder-replay-bounded-v1; NOT bit-equal to a full prefill) ----
+//
+// The encoder layers run every new row as above; every decoder layer runs only its last `bound` rows:
+// out_begin = kv_begin = max(cached, floor), and a row s of a decoder layer reads the window keys
+// max(kv_begin, s - window + 1) .. s (the key floor; no window key of that layer before the cut). The first decoder
+// layer still projects every row's compressed KV and index keys (the engine's x0 = 0): those keys stay readable.
+// Policy identity: floor = round_down(max(T - R, 0), 256), independent of window_rows.
+// 256 is the largest legal scheduling window (attn::kMaxCallRows); v1 scheduling windows must divide it.
+// draft_rows > R is refused.
+// `bound` is a positive multiple of the attention window;
+// the ring after the run then holds rows total - window .. total - 1 of every decoder layer, as a full prefill's.
+// The smallest bound the DS41 FAST quality gate qualifies (20 prompts x (the prefill's last row + 64 teacher-forced rows
+// from the bounded state), USER rule KL <= 0.02, top-1 >= 93 %, dNLL <= null mean + 2 sd): R = 256 passes (dNLL +0.00632
+// against +0.00991), R = 128 fails (+0.01406). Engines refuse smaller bounds; the planner itself takes any.
+inline constexpr std::uint32_t bounded_replay_floor_unit = 256;
+[[nodiscard]] constexpr std::uint64_t bounded_replay_key_floor(std::uint64_t total, std::uint32_t bound) {
+    return total > bound ? (total - bound) / bounded_replay_floor_unit * bounded_replay_floor_unit : 0U;
+}
+inline constexpr std::uint32_t bounded_replay_min_rows = 256;
+[[nodiscard]] SuffixReplayPlan plan_bounded_replay(const SuffixReplayGeometry& geometry, std::uint64_t cached, std::uint64_t total,
+                                                   std::uint32_t bound);
 
 // Routed-MoE schedule of a row-split pair prefill. Bitwise: the MoE's rows are independent, so neither the window size
 // nor the joint / two-pass form changes a row's bits; only the number of expert reads and launches changes.

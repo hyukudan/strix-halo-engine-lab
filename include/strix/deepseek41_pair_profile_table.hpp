@@ -31,9 +31,14 @@ inline constexpr std::array<strix::profile::Lever, 7> profile_table{{
      {true, false, true, false}, {true, true, true, false}, "", "0", "explicit FAST bundle; native qualification required", false, {}, true},
     {"dense_min_rows", "STRIX_DS41_FAST_DENSE_MIN_ROWS", "", {"", "", "", ""}, "128", strix::profile::Kind::bit_changing,
      {true, false, true, false}, {true, true, true, false}, "", "", "FAST dense dispatch threshold", false, {}, true},
+    // Prefill only: FAST policy ds41-decoder-replay-bounded-v1 (value R rows, a multiple of 128): every decoder layer runs
+    // its last R rows, window keys floored at the cut, its dense products in the exact form (bounded run == full run
+    // with the floor, bit for bit; not bit-equal to the full decode). Explicit only, OFF in default / fast / quality;
+    // set, it enters the profile fingerprint (rank agreement, prefix-cache identity). The turbo cell (R=128 under
+    // ds41-replay-r128) stays pending: v1 refuses bounds below 256.
     {"decoder_replay", "STRIX_DS41_DECODER_REPLAY", "", {"", "", "", "128"}, "0", strix::profile::Kind::bit_changing,
-     {true, false, true, false}, {false, false, false, false}, "", "0",
-     "pending: decoder replay R=128 under the turbo identity ds41-replay-r128 (open PR #605 admits R >= 256 only; R=256 stays the alternative)", false, {}, true},
+     {true, false, true, false}, {true, true, true, false}, "", "0",
+     "explicit FAST policy ds41-decoder-replay-bounded-v1, R >= 256 (smaller bounds refused); not qualified on its key floor round_down(T - R, 256) (the R = 256 gate ran on the floor T - R), so no profile sets it; turbo R=128 (ds41-replay-r128) pending", false, {}, true},
     // Prefill only: the Engram KV projection on the shared FP16 WMMA core (ds41-engram-f16wmma-v1); views whose x would overflow FP16
     // keep the exact kernel. Explicit only (not a FAST bundle member) until its qualification receipt.
     {"engram_f16wmma", "STRIX_DS41_FAST_ENGRAM", "", {"", "", "", ""}, "0", strix::profile::Kind::bit_changing,

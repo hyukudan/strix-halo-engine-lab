@@ -218,11 +218,29 @@ execution or a deliberately rewritten manifest. CLI engine/profile labels are
 checked against the sealed witness. This change defines the consumer contract;
 it does not add a native witness producer. Runs without producer evidence cannot
 use the floor rule; do not create evidence by relabelling existing runs.
+
+Producer: `strix-deepseek41-prefill-quality MODEL manifest.tsv OUT RANK BUDGET GATE_DIR` (gate mode). Per prompt
+of n tokens each arm prefills P = (n - 64) / 128 * 128 rows from position 0 with the arm's policy (the
+exact suffix replay, or `fast3b<R>`'s bounded decoder replay), then teacher-forces the 64 rows [P, P + 64)
+from that state. Rank 0 writes 65 rows per prompt (the prefill's last row, then the 64) as
+`GATE_DIR/<arm>/q-<prompt>-tf-r0.f32`, the prompt's first P + 64 tokens as `GATE_DIR/tok/<prompt>.u32` and
+`GATE_DIR/<arm>/execution-r0.json` from the executed configuration (profile `exact` for `exact` and the
+`n_l0_s<seed>` layer-0 nulls, `fast-prefill` for `fast3` / `fast3b<R>`). When the prompts run in several
+processes (one per GPU ticket), `merge_parts.py RUNDIR RUN ARM...` joins the per-process witnesses of an arm
+(refusing any disagreement on binary, model, numerical configuration, profile or control, a prompt in two
+parts, or a dump that no longer matches its entry) into one with `run_id` `RUN-ARM`; then `seal --rows 65
+--execution-witness` and `compare --ranks 0`.
 Mean plus two sample standard deviations from three controls is an empirical
 policy threshold, not a confidence bound or model-fidelity result. Synthetic
 host tests establish validation and arithmetic only; compiler, native execution,
 model fidelity and complete-workload qualification remain separate gates.
 
+DS41 gate arms explicitly disable inherited decoder replay unless their label sets a bound.
+Witnesses record the resolved replay mode and hash the actual target and effective overlay
+contents; both ranks must agree on that content. The producer uses `row_split=false` and
+128-aligned prefill boundaries. Its evidence does not qualify row-split serving or arbitrary
+tails. Whole-run replay rejects snapshots, group passes and decoder deferral; serving needs
+an explicit admission contract for scheduler/cache operations before qualification.
 ### Onset-matched floor (MiniMax FAST prefill)
 
 ```sh
