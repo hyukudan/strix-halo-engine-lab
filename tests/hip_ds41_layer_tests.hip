@@ -433,7 +433,7 @@ void synthetic(std::mt19937& rng) {
                        counters.down() == std::vector<std::uint32_t>(hc_site_counter_count(sr), 0U),
                    "site launch with the canonical sum in place bitwise, rows=" + std::to_string(sr) + " pass " + std::to_string(pass));
             // Decode/batch use the non-collapse mix site, with the same input policy.
-            for (const int form : {1, 2}) {
+            for (const std::uint32_t form : {1U, 2U}) {
                 t.collapse_out = nullptr;
                 t.form = form;
                 sterm.up(std::vector<float>(std::size_t{sr} * n, -1.0F));
