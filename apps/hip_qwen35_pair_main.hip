@@ -67,8 +67,11 @@ std::vector<std::uint32_t> read_ids(std::string arg) {
     std::vector<std::uint32_t> r;
     std::stringstream ss(arg);
     std::string t;
-    while (std::getline(ss, t, ','))
-        if (t.find_first_not_of(" \t\r\n") != std::string::npos) r.push_back(strix::core::parse_u32(t.substr(t.find_first_not_of(" \t\r\n"))));
+    while (std::getline(ss, t, ',')) {
+        const auto b = t.find_first_not_of(" \t\r\n");
+        if (b == std::string::npos) continue;
+        r.push_back(strix::core::parse_u32(t.substr(b, t.find_last_not_of(" \t\r\n") + 1U - b)));
+    }
     return r;
 }
 std::vector<std::uint32_t> parse_list(const std::string& s) {
