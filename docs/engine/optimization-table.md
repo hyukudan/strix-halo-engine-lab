@@ -92,6 +92,7 @@ environment variable, the shipped value, the value that restores the previous pa
 | minimax-pair | markov_topc_v2 | `STRIX_MM_MARKOV_TOPC` | v2 | v1 | Markov measurement: top-C v2 = v1 canonical set / scores / picks (payload gates v1/v2 vs CPU) |
 | minimax-pair | pf_msa_batch | `STRIX_MM_PF_MSA_BATCH` | 1 | 0 | Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 % |
 | minimax-pair | pf_dense_mlp | `STRIX_MM_PF_DENSE_MLP` | 1 | 0 | Prefill: exact (== strix_gemm bitwise, the pf_dense_qkv contract); dense MLP of layers 0-2 on the v4 core for 4096-row pieces |
+| minimax-pair | pf_flash_keys | `STRIX_MM_PF_FLASH_KEYS` | 2 | 0 | Prefill: schedule only, same bits (FAST flash output fnv identical); key fragments in two halves around the value loads (attn_core kKsKeysHalves) |
 | minimax-pair | pf_headless | `STRIX_MM_PF_HEADLESS` | 1 | 0 | Prefill: exact (state + final rows fnv identical); last layer cache-only for every chunk but the last (strix/prefill_headless.hpp) |
 | minimax-pair | pf_attend4 | `STRIX_MM_PF_ATTEND4` | 1 | 0 | Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 % |
 | minimax-pair | pf_router_batch | `STRIX_MM_PF_ROUTER_BATCH` | 1 | 0 | Prefill measurement: exact, pfall TTFT 1K -17 %, 8K -20 % |

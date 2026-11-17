@@ -227,6 +227,10 @@ public:
     void set_prefill_headless(bool on);  // STRIX_MM_PF_HEADLESS, default on: last layer cache-only for headless chunks (exact)
     [[nodiscard]] bool prefill_headless() const;
     void set_prefill_dense_mlp(bool on);  // STRIX_MM_PF_DENSE_MLP, default on: layers 0..2 dense MLP on the v4 core (== strix_gemm bits)
+    void set_prefill_flash_keys(unsigned mode);  // STRIX_MM_PF_FLASH_KEYS, default 2 (key halves): FAST flash key-load schedule (same bits)
+    unsigned prefill_flash_keys() const;
+    unsigned prefill_flash_mode() const;  // effective FAST admission: 0 = declined, 1/2 = operand terms
+    std::array<std::uint64_t, 3> prefill_flash_launches() const;  // successful submissions by key schedule
     [[nodiscard]] bool prefill_dense_mlp() const;
     [[nodiscard]] std::uint64_t prefill_dense_mlp_count() const;  // submitted dense MLP pieces; read between tasks
     [[nodiscard]] std::uint64_t prefill_headless_chunks() const;  // cumulative successful cache-only chunks on this rank

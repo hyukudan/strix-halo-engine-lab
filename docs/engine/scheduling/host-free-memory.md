@@ -29,6 +29,8 @@ its first device allocation:
   bytes, and release it together. The load then finds the memory free;
 - it never takes more than `MemAvailable` minus a 4 GiB reserve, changes no system setting and needs no
   privilege. The workers are child processes, so the caller's resident size does not grow.
+  A worker that exits before reporting causes the pass to fail closed; surviving workers release their
+  memory and are reaped. A partial pass is not reported as successful.
 
 The pass costs about one second per 5 GiB it has to take back, so it is **opt-in**:
 `STRIX_HOST_FREE_PREPARE=1` (workers: `STRIX_HOST_FREE_PREPARE_THREADS`, default 16). Use it for a cold

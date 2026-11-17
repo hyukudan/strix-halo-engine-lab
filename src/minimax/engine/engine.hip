@@ -697,6 +697,10 @@ struct Engine::Impl {
     // STRIX_MM_PF_HEADLESS (default ON, exact): the last layer of a headless chunk runs cache-only (strix/prefill_headless.hpp):
     // q/k/v + index projections and the cache prep unchanged, no attention / o_proj / exchanges / FFN for that chunk.
     bool pf_headless = true;
+    // STRIX_MM_PF_FLASH_KEYS (default 2 = key halves, schedule only, same bits): FAST flash key-fragment load schedule
+    // (PrefillView::flash_keys; 0 = incumbent, 1 = keys first). Bench: scripts/bench/mmattn.
+    unsigned pf_flash_keys = 2;
+    std::array<std::uint64_t, 3> pf_flash_launches{};
     // STRIX_MM_PF_DENSE_MLP (default ON, exact): the dense MLP of layers 0..kFirstMoe-1 (gate + up, then down) on the v4
     // prefill core for 4096-row pieces (dense_mlp), the q/k/v core contract (== strix_gemm bitwise); 0 keeps strix_gemm.
     bool pf_dense_mlp = true;
@@ -918,6 +922,11 @@ struct Engine::Impl {
         pf_attend4 = env_flag("STRIX_MM_PF_ATTEND4", true);
         pf_msa_batch = env_flag("STRIX_MM_PF_MSA_BATCH", true);
         pf_headless = env_flag("STRIX_MM_PF_HEADLESS", true);
+        if (const char* value = strix::envcfg::text("STRIX_MM_PF_FLASH_KEYS")) {
+            const std::string mode(value);
+            if (mode != "0" && mode != "1" && mode != "2") throw std::invalid_argument("STRIX_MM_PF_FLASH_KEYS must be 0, 1 or 2");
+            pf_flash_keys = static_cast<unsigned>(mode[0] - '0');
+        }
         pf_dense_mlp = env_flag("STRIX_MM_PF_DENSE_MLP", true);
         if (const char* value = std::getenv("STRIX_MM_PF_IDX_CONC")) {
             const std::string mode(value);
@@ -2249,12 +2258,12 @@ struct Engine::Impl {
                             dv.q16_lo = pf_msa_flash == 2 ? reinterpret_cast<const std::uint16_t*>(q) + n * kQLocal + r0 * kQLocal : nullptr;
                         }
                         dv.ticket = pf_ticket;
-                        const mfused::PrefillView pfv{dv, static_cast<std::uint32_t>(n), pos0, pf_msa_windows, 0, pf_idx_tile && n > 8, pf_idx_rows, n > 8 ? (pf_msa_flash != 0 && pf_msa_rework != 0 && pf_msa_flash_layers.test(L) ? 10U + pf_msa_flash : pf_msa_rework) : 0U};
+                        const mfused::PrefillView pfv{dv, static_cast<std::uint32_t>(n), pos0, pf_msa_windows, 0, pf_idx_tile && n > 8, pf_idx_rows, n > 8 ? (pf_msa_flash != 0 && pf_msa_rework != 0 && pf_msa_flash_layers.test(L) ? 10U + pf_msa_flash : pf_msa_rework) : 0U, pf_flash_keys};
                         if (cache_only) {
                             mfused::enqueue_prefill_cache_only(pfv, nullptr, tl ? PrefillTimeline::msa_mark : nullptr, tl);
                             did_cache_only = true;
                         } else {
-                            mfused::enqueue_prefill(pfv, nullptr, tl ? PrefillTimeline::msa_mark : nullptr, tl);
+                            mfused::enqueue_prefill(pfv, nullptr, tl ? PrefillTimeline::msa_mark : nullptr, tl, &pf_flash_launches);
                         }
                         break;
                     }
@@ -3864,6 +3873,17 @@ void Engine::set_prefill_dense_mlp(bool on) {
     impl_->pf_dense_mlp = on;
 }
 bool Engine::prefill_dense_mlp() const { return impl_->pf_dense_mlp; }
+void Engine::set_prefill_flash_keys(unsigned mode) {
+    impl_->no_task("set_prefill_flash_keys");
+    if (mode > 2) throw std::invalid_argument("prefill flash keys must be 0, 1 or 2");
+    impl_->pf_flash_keys = mode;
+}
+unsigned Engine::prefill_flash_keys() const { return impl_->pf_flash_keys; }
+unsigned Engine::prefill_flash_mode() const {
+    return defaults::msa_flash_decline_reason(impl_->pf_msa_rework != 0, impl_->attn_prefill_fused,
+                                             impl_->pf_msa_flash_layers.count()) == nullptr ? impl_->pf_msa_flash : 0U;
+}
+std::array<std::uint64_t, 3> Engine::prefill_flash_launches() const { return impl_->pf_flash_launches; }
 std::uint64_t Engine::prefill_dense_mlp_count() const { return impl_->pf_dense_mlp_calls; }
 std::uint64_t Engine::prefill_headless_chunks() const { return impl_->pf_headless_chunks; }
 std::size_t Engine::prefill_headless_expected(std::size_t rows) const {

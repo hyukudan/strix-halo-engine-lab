@@ -977,8 +977,51 @@ std::map<std::string, std::vector<std::uint32_t>> g_session_tokens;
 // weak, so binaries linked against a library without it still link (`--ab pftiled` then refuses).
 extern "C" void strix_trellis_lab_set_wmma_tiled(int on) __attribute__((weak));
 
+// A/B evidence is local to this engine and each completed prefill, never inferred from equal hashes.
+struct FlashKeysAB {
+    mm::Engine* eng;
+    unsigned saved;
+    std::array<std::uint64_t, 3> before{};
+    FlashKeysAB(mm::Engine& engine, bool active) : eng(active ? &engine : nullptr), saved(engine.prefill_flash_keys()) {
+        if (eng != nullptr && eng->prefill_flash_mode() == 0)
+            throw std::invalid_argument("--ab pfflashkeys: NOT EXERCISED (flash admission disabled)");
+    }
+    void restore() {
+        if (eng != nullptr) {
+            eng->set_prefill_flash_keys(saved);
+            eng = nullptr;
+        }
+    }
+    // Unwinding restore never throws (a throw here would terminate and hide the original error); restore() still throws.
+    ~FlashKeysAB() {
+        try {
+            restore();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "--ab pfflashkeys: restoring the flash key schedule failed: %s\n", e.what());
+        }
+    }
+    void begin() { if (eng != nullptr) before = eng->prefill_flash_launches(); }
+    void finish(int arm, std::uint64_t state, std::uint64_t out) const {
+        if (eng == nullptr) return;
+        auto counts = eng->prefill_flash_launches();
+        for (std::size_t i = 0; i < counts.size(); ++i) counts[i] -= before[i];
+        const unsigned expected = arm % 2 == 0 ? 0U : 2U;
+        const unsigned schedule = eng->prefill_flash_keys();
+        const unsigned mode = eng->prefill_flash_mode();
+        const bool exercised = mode != 0 && schedule == expected && counts[expected] != 0 &&
+                               counts[1] == 0 && counts[2U - expected] == 0;
+        std::printf("rank %u ab-pfflashkeys: arm %d schedule=%u flash=%u launches[0,1,2]=%llu,%llu,%llu "
+                    "state=%016llx final-rows=%016llx %s\n", eng->rank(), arm, schedule, mode,
+                    static_cast<unsigned long long>(counts[0]), static_cast<unsigned long long>(counts[1]),
+                    static_cast<unsigned long long>(counts[2]), static_cast<unsigned long long>(state),
+                    static_cast<unsigned long long>(out), exercised ? "EXERCISED" : "NOT EXERCISED");
+        if (!exercised) g_exact_fail = true;
+    }
+};
+
 std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vector<std::uint32_t>& prompt, int block,
                       const std::vector<std::uint32_t>* reference) {
+    FlashKeysAB flash_keys(eng, flag == "pfflashkeys");
     const int pipe0 = strix::minimax::moe::opt::prefill_pipe_override();
     struct RestorePipe {
         bool active;
@@ -1087,6 +1130,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
         }
         else if (flag == "pfmsa") eng.set_prefill_msa_batch(on);
         else if (flag == "pfdensemlp") eng.set_prefill_dense_mlp(on);  // layers 0-2 dense MLP: strix_gemm (A) / v4 core (B)
+        else if (flag == "pfflashkeys") eng.set_prefill_flash_keys(on ? 2U : 0U);  // FAST flash: incumbent loads (A) / key halves (B)
         else if (flag == "pfheadless") eng.set_prefill_headless(on);  // last layer of headless chunks: full (A) / cache-only (B)
         else if (flag == "pfattn4") eng.set_prefill_attend4(on);
         else if (flag == "pfidxconc") eng.set_prefill_index_concurrent(on ? idx_conc_b : 0);
@@ -1176,13 +1220,14 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     std::vector<double> ttft[2], step_ms[2];
     std::vector<std::uint32_t> first(6);
     std::vector<std::uint64_t> states, outs;  // per arm: K/V/IK state FNV, final-rows FNV (this rank only; never in the cross-rank hash)
-    const bool hash_state = ((flag == "pfattn4" || flag == "pfmsa" || flag == "pfheadless" || flag == "pfdensemlp" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall")) || (state_fnv_on() && (flag == "pfx" || flag == "pfil" || flag == "pfxip" || std::getenv("STRIX_MM_AB_STATE") != nullptr));
+    const bool hash_state = ((flag == "pfattn4" || flag == "pfmsa" || flag == "pfheadless" || flag == "pfdensemlp" || flag == "pfflashkeys" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall")) || (state_fnv_on() && (flag == "pfx" || flag == "pfil" || flag == "pfxip" || std::getenv("STRIX_MM_AB_STATE") != nullptr));
     // pfattn4 / pfmsa / pfmsarework / mtfit / core8 / pftab / pfgufuse / pfidx / pftxuc / pfrouter / pfidxconc / pfkvtile / pftiled: A B A B A B A (every B bracketed by two A prefills); the other prefill flags: A B A B A B
     const int prefills = flag == "attn" || flag == "linears" || flag == "xfer" || flag == "idxdec" || flag == "idxconc" || flag == "xbfold" || flag == "xbwait" || flag == "xbinplace" || flag == "xbboth" || flag == "xbprep" || flag == "xbpub" || flag == "xbwarm" || flag == "xbwarmo" || flag == "moegrid" || flag == "moepipe" || flag == "xbilp" || flag == "xbset" ? 1 : (flag == "pfattn4" || flag == "pfmsa" || flag == "pfmsarework" || flag == "mtfit" || flag == "core8" || flag == "pftab" || flag == "pfgufuse" || flag == "pftails" || flag == "pfpair" || flag == "pfidx" || flag == "pftxuc" || flag == "pfpipe" || flag == "pfrouter" || flag == "pfrouterrows" || flag == "core8v2" || flag == "pfidxconc" || flag == "pfkvtile" || flag == "pftiled" || flag == "pfall" || flag == "pfi4") ? 7 : 6;  // idxattn: both  // decode-only flags: one prefill, no TTFT cells
     first.resize(static_cast<std::size_t>(prefills));
     std::vector<std::uint64_t> dense_mlp_calls;
     for (int r = 0; r < prefills; ++r) {
         set(r % 2 == 1);
+        flash_keys.begin();
         const auto dense_before = eng.prefill_dense_mlp_count();
         const auto headless_before = eng.prefill_headless_chunks();
         const auto t0 = Clock::now();
@@ -1202,6 +1247,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
         if (hash_state) {
             states.push_back(eng.state_fnv(0, prompt.size()));
             outs.push_back(eng.prefill_out_fnv());
+            flash_keys.finish(r, states.back(), outs.back());
         }
     }
     // xb flags: A B A B A B A (every B bracketed), and matched replay: every block re-decodes the SAME positions with
@@ -1275,6 +1321,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
     else if (flag == "pftiled") strix_trellis_lab_set_wmma_tiled(-1);
     else if (flag == "pfheadless") eng.set_prefill_headless(start_arm);
     else if (flag == "pfdensemlp") eng.set_prefill_dense_mlp(start_arm);
+    else if (flag == "pfflashkeys") flash_keys.restore();
     else if (flag == "pfi4") strix::minimax::moe::opt::set_prefill_iu4(-1);
     else if (flag == "pfall") {
         eng.set_prefill_msa_batch(msa0);
