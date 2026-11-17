@@ -50,6 +50,13 @@ struct BlockConfig {
     double hybrid_switch_in = 1.05;   // the extension must beat the copy-only block by this factor
     double chain_seed_step_ms = 1.5;  // chain wall seed per chain step until measured (engine: MTP layer + lm_head)
     double chain_seed_flush_ms = 1.5; // first step after a verify (catch-up of the accepted rows)
+    // true: the seeds ARE the cost model. The chain costs flush + step x (k - 1) and is never learned from walls, and the
+    // Arbiter prices verify windows from seed_verify_ms only (ArbiterConfig::learn_costs = false), so every decision is a
+    // pure function of the seeds and the acceptance history: deterministic for a fixed prompt. Learned walls froze a depth
+    // at its first sample (the subset head's one-off materialisation, ~10 ms, landed in one depth's mean and that depth was
+    // never chosen again): measured on CUDA dense 27B, three identical Japanese runs gave 80 / 115 / 99 tok/s and k = 15 /
+    // k = 1 / k = 1 where k = 3 was the optimum. false = the previous learned form.
+    bool fixed_costs = false;
     std::function<double()> clock_ms; // wall clock in ms (default steady_clock); tests inject a virtual clock
 };
 
