@@ -1048,6 +1048,14 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-host-lane-tests)
     add_test(NAME strix-host-lane-tests COMMAND strix-host-lane-tests)
     set_tests_properties(strix-host-lane-tests PROPERTIES LABELS "cpu" TIMEOUT 120)
+    # Free host memory before a device load: the populate plan (pure policy) and the no-op entry.
+    add_executable(strix-host-free-memory-tests tests/host_free_memory_tests.cpp)
+    target_include_directories(strix-host-free-memory-tests PRIVATE src include)
+    target_link_libraries(strix-host-free-memory-tests PRIVATE Threads::Threads)
+    target_compile_features(strix-host-free-memory-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-host-free-memory-tests)
+    add_test(NAME strix-host-free-memory-tests COMMAND strix-host-free-memory-tests)
+    set_tests_properties(strix-host-free-memory-tests PROPERTIES LABELS "cpu" TIMEOUT 120)
     # Shared weight-load queue: overlapped reads, per-ticket staging inside a resident budget, one publication wait.
     add_executable(strix-weight-load-queue-tests tests/weight_load_queue_tests.cpp)
     target_include_directories(strix-weight-load-queue-tests PRIVATE src include)
@@ -1273,6 +1281,12 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-prefix-queue-protection-tests)
     add_test(NAME strix-prefix-queue-protection-tests COMMAND strix-prefix-queue-protection-tests)
     set_tests_properties(strix-prefix-queue-protection-tests PROPERTIES LABELS "cpu" TIMEOUT 120)
+    # Server start: phase line and overlapped start work (strix/serve/startup_phases.hpp).
+    add_executable(strix-serve-startup-phases-tests tests/serve_startup_phases_tests.cpp)
+    target_link_libraries(strix-serve-startup-phases-tests PRIVATE strix_core Threads::Threads)
+    strix_target_warnings(strix-serve-startup-phases-tests)
+    add_test(NAME strix-serve-startup-phases-tests COMMAND strix-serve-startup-phases-tests)
+    set_tests_properties(strix-serve-startup-phases-tests PROPERTIES LABELS "cpu" TIMEOUT 120)
     add_test(NAME strix-prefill-option-cache-write COMMAND strix-prefix-state-cache-tests
         --write-option-checkpoint "${CMAKE_CURRENT_BINARY_DIR}/prefill-option-cache")
     add_test(NAME strix-prefill-option-cache-read COMMAND strix-prefix-state-cache-tests
@@ -3774,6 +3788,14 @@ int main() { return 0; }"
         strix_target_warnings(strix-hip-qsa-index-score-wmma-tests)
         add_test(NAME strix-hip-qsa-index-score-wmma-tests COMMAND strix-hip-qsa-index-score-wmma-tests)
         set_tests_properties(strix-hip-qsa-index-score-wmma-tests PROPERTIES ENVIRONMENT "STRIX_QPF2K_SCORE_ROWS=auto")
+
+        add_executable(strix-hip-qsa-index-band-tests tests/qsa_index_band.hip)
+        target_include_directories(strix-hip-qsa-index-band-tests PRIVATE include src)
+        set_target_properties(strix-hip-qsa-index-band-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_compile_options(strix-hip-qsa-index-band-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+        strix_target_warnings(strix-hip-qsa-index-band-tests)
+        add_test(NAME strix-hip-qsa-index-band-tests COMMAND strix-hip-qsa-index-band-tests)
+        set_tests_properties(strix-hip-qsa-index-band-tests PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "STRIX_QSA_INDEX_BAND=1")
 
         add_executable(strix-hip-qsa-output-projection-tests tests/hip_qsa_output_projection_tests.hip)
         target_compile_definitions(strix-hip-qsa-output-projection-tests PRIVATE STRIX_BUILD_QSA_OUTPUT_PROJECTION_DIAGNOSTIC=1)

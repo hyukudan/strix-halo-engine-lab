@@ -1,6 +1,8 @@
 #include "strix/hip_mtp_prime_rows.hpp"
 #include <type_traits>
 #include "strix/env_flags.hpp"
+#include "attn_core/index_score_wmma.hpp"
+#include "attn_core/index_score_band.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_check.hpp"
 #include "strix/qsa_prefill_stage_plan.hpp"
@@ -5652,6 +5654,7 @@ struct Qpf2kSelectBatch {
     float* arena = nullptr;
     std::uint64_t capacity = 0, used = 0; // floats
     std::vector<qsa_flash::SelectRow> rows;
+    std::vector<qsa_flash::BandRow> bands;
     std::vector<Qpf2kSelectGroup> traced;
     std::uint32_t ratio = 0, topk = 0;
 };
@@ -5674,6 +5677,39 @@ uint2* qpf2k_key_ranges(std::uint32_t capacity, bool allow_allocation_failure = 
         size = capacity;
     }
     return ranges;
+}
+// The norm arena follows the key-range arena's pool lifetime. Its last float is
+// the call bound; stream-ordered growth of scored prefixes makes deferred readers
+// safe to use the most recent (conservative) bound until their mandatory flush.
+struct Qpf2kBandNorms { float* values = nullptr; unsigned capacity = 0; };
+Qpf2kBandNorms& qpf2k_band_norm_arena() { static Qpf2kBandNorms a; return a; }
+float* qpf2k_key_norms(unsigned capacity, bool allow_allocation_failure = false) {
+    auto& a = qpf2k_band_norm_arena();
+    if (capacity > a.capacity) {
+        void* p = nullptr;
+        const auto status = hipMalloc(&p, (std::size_t{capacity} + 1U) * sizeof(float));
+        if (allow_allocation_failure && status == hipErrorOutOfMemory) return nullptr;
+        check_hip(status, "QSA band norm allocation");
+        if (a.values) {
+            check_hip(hipStreamSynchronize(hip_execution_stream()), "QSA band norm resize sync");
+            // Existing ranges/norms remain valid if only the reservation grows.
+            check_hip(hipMemcpy(p, a.values, std::size_t{a.capacity} * sizeof(float), hipMemcpyDeviceToDevice), "QSA band norm grow copy");
+            check_hip(hipFree(a.values), "QSA band norm free");
+        }
+        a.values = static_cast<float*>(p); a.capacity = capacity;
+    }
+    return a.values;
+}
+const float* qpf2k_band_bound() {
+    const auto& a = qpf2k_band_norm_arena();
+    return a.values + a.capacity;
+}
+// Kmax of the call from the pool's own keys (the same operand the scorer reads; see key_norm_max_kernel).
+void qpf2k_band_reduce(unsigned capacity, const void* keys, bool packed, unsigned blocks, hipStream_t stream) {
+    (void)qpf2k_key_norms(capacity);  // the bound slot lives at the end of this arena
+    hipLaunchKernelGGL(qsa_flash::key_norm_max_kernel, dim3(1), dim3(1024), 0, stream, keys, packed, blocks,
+        const_cast<float*>(qpf2k_band_bound()));
+    check_hip(hipGetLastError(), "QSA band bound reduction");
 }
 // STRIX_QPF2K_QSA_TRACE=1 (diagnostic, independent of STRIX_QPF2K_QSA; synchronizes once per prefill call): hashes of every
 // prefill group row's block scores before / after selection, its selected tokens and its attention output
@@ -6666,6 +6702,7 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
     // STRIX_QPF2K_QSA bit 1: the scorer below left the group maxima here; the selection then runs qsa_flash::select_kernel.
     float* qpf2k_maxima = staged ? staged->maxima : nullptr;
     std::uint32_t qpf2k_maxima_row_stride = staged ? staged->maxima_stride : qpf2k_maxima_stride;
+    bool band_scored = staged && qsa_flash::index_band();
     // Deferred (batched) selection only where nothing reads this group's selections before the call's flush: 64-row
     // groups of the fast prefill profile with BF16 KV, whose union / attend go to the call's attend batch.
     const bool qpf2k_defer = Rows == 64U && !cohort_slot && qpf2k_select_batch().active && config.qsa_fast_prefill &&
@@ -6693,7 +6730,8 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                 // STRIX_QPF2K_QSA bit 0: the new blocks' magnitude ranges for the scorer's guard.
                 if constexpr (Rows >= 16U) if (!cohort_slot && (qpf2k_qsa_mask() & 1U)) {
                     hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::key_range_kernel<>), dim3((scored_blocks - pool->valid + 255U) / 256U), dim3(256), 0, stream,
-                        static_cast<const float*>(pool->keys), pool->valid, scored_blocks - pool->valid, qpf2k_key_ranges(pool->capacity));
+                        static_cast<const float*>(pool->keys), pool->valid, scored_blocks - pool->valid, qpf2k_key_ranges(pool->capacity),
+                        nullptr, 0U, qsa_flash::index_band() ? qpf2k_key_norms(pool->capacity) : nullptr);
                     check_hip(hipGetLastError(), "QSA prefill key-range launch");
                 }
                 pool->valid = scored_blocks;
@@ -6755,6 +6793,16 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
                         qpf2k_maxima = buffer;
                     }
                     qpf2k_launch_score.fetch_add(1U, std::memory_order_relaxed);
+                    if (qsa_flash::index_band() && maxima) {
+                        qpf2k_band_reduce(pool->capacity, pool->packed ? static_cast<const void*>(pool->packed) : pool->keys,
+                            pool->packed != nullptr, scored_blocks, stream);
+                        qsa_flash::launch_index_band<Rows, false>(scores,
+                            pool->packed ? static_cast<const void*>(pool->packed) : pool->keys, pool->packed != nullptr,
+                            scored_blocks, a.index_dim, maxima, maxima_stride, nullptr, 1U, stream);
+                        band_scored = true;
+                        qpf2k_maxima_row_stride = maxima_stride;
+                        return;
+                    }
                     if (qpf2k_index_score_wmma_active && config.qsa_fast_prefill &&
                         model.attention_kv_storage == AttentionKvStorage::bf16) {
                         qsa_flash::launch_index_score_wmma<Rows, false>(scores,
@@ -6885,18 +6933,31 @@ void enqueue_qsa_known_rows(const QsaKnownRows<Rows>& prepared, const HipIndexed
         mtp_selection_checks.push_back(std::make_unique<MtpPoolSelectionCheck>(config.committed_pool,
             HipQsaPoolRowDescriptor{w.index_query,w.block_scores,w.selected_indices,sr.visible,sr.complete_blocks,sr.block_topk,0U,nullptr},stream));
     }
+    qsa_flash::BandRow band{};
+    if (band_scored) {
+        band.keys = pool->packed ? static_cast<const void*>(pool->packed) : pool->keys;
+        band.packed = pool->packed != nullptr;
+        band.ranges = qpf2k_key_ranges(pool->capacity); band.kmax = qpf2k_band_bound();
+        band.scored_blocks = staged ? staged->blocks : scored_blocks; band.head_dim = a.index_dim;
+    }
     bool qpf2k_deferred = false;
     if ((subparts & 8U) && qpf2k_maxima && qpf2k_defer) {
         auto& sb = qpf2k_select_batch();
         sb.ratio = s0.ratio; sb.topk = s0.block_topk;
-        for (unsigned r = 0; r < Rows; ++r)
+        for (unsigned r = 0; r < Rows; ++r) {
+            band.query = band_scored ? scores.index_query[r] : nullptr;
             sb.rows.push_back(qsa_flash::SelectRow{select.block_scores[r], select.selected[r], qpf2k_maxima + static_cast<std::uint64_t>(r) * qpf2k_maxima_row_stride,
                 select.visible[r], select.preserve_scores ? 1U : 0U});
+            if (qsa_flash::index_band()) sb.bands.push_back(band);
+        }
         qpf2k_launch_select.fetch_add(1U, std::memory_order_relaxed);
         qpf2k_deferred = true;
     } else if ((subparts & 8U) && qpf2k_maxima) {
         qpf2k_launch_select.fetch_add(1U, std::memory_order_relaxed);
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::select_kernel<Rows>), dim3(Rows), dim3(kSelectThreads), 0, stream, select,
+        if (band_scored)
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::select_band_kernel<Rows>), dim3(Rows), dim3(kSelectThreads), 0, stream,
+                select, scores, static_cast<const float*>(qpf2k_maxima), qpf2k_maxima_row_stride, s0.ratio, s0.block_topk, band);
+        else hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_flash::select_kernel<Rows>), dim3(Rows), dim3(kSelectThreads), 0, stream, select,
             static_cast<const float*>(qpf2k_maxima), qpf2k_maxima_row_stride, s0.ratio, s0.block_topk);
     } else if (subparts & 8U) {
         if (Rows >= 16U && !cohort_slot && qpf2k_trace_enabled()) qpf2k_launch_prod_select.fetch_add(1U, std::memory_order_relaxed);
@@ -7316,7 +7377,7 @@ std::uint64_t implementation_identity(
 
 bool qsa_prefill_bundle_closed() noexcept {
     const auto& select=qpf2k_select_batch();const auto& index=qpf2k_index_batch();const auto& attend=qsa_fast_batch();
-    return !select.active && select.rows.empty() && select.traced.empty() && !index.active && index.groups.empty() &&
+    return !select.active && select.rows.empty() && select.bands.empty() && select.traced.empty() && !index.active && index.groups.empty() &&
         !attend.active && attend.groups.empty();
 }
 
@@ -7527,7 +7588,7 @@ std::vector<std::uint8_t> qsa_prefill_attention_outputs(const std::vector<QsaKno
 void qpf2k_select_flush(hipStream_t stream) {
     auto& sb = qpf2k_select_batch();
     if (!sb.rows.empty()) {
-        struct Slot { qsa_flash::SelectRow* rows = nullptr; std::size_t capacity = 0; hipEvent_t done = nullptr; bool pending = false; };
+        struct Slot { qsa_flash::SelectRow* rows = nullptr; qsa_flash::BandRow* bands = nullptr; std::size_t capacity = 0; hipEvent_t done = nullptr; bool pending = false; };
         static std::array<Slot, 8> ring;
         static unsigned next = 0;
         auto& slot = ring[next];
@@ -7536,20 +7597,28 @@ void qpf2k_select_flush(hipStream_t stream) {
         if (!slot.done) check_hip(hipEventCreateWithFlags(&slot.done, hipEventDisableTiming), "QSA select batch event");
         if (sb.rows.size() > slot.capacity) {
             if (slot.rows) check_hip(hipHostFree(slot.rows), "QSA select batch slot free");
-            slot.rows = nullptr;
+            if (slot.bands) check_hip(hipHostFree(slot.bands), "QSA select band slot free");
+            slot.rows = nullptr; slot.bands = nullptr;
             slot.capacity = std::max<std::size_t>(sb.rows.size(), 8192U);
             check_hip(hipHostMalloc(reinterpret_cast<void**>(&slot.rows), slot.capacity * sizeof(qsa_flash::SelectRow), hipHostMallocDefault),
                 "QSA select batch slot allocation");
         }
         std::copy(sb.rows.begin(), sb.rows.end(), slot.rows);
-        hipLaunchKernelGGL(qsa_flash::select_batch_kernel, dim3(static_cast<std::uint32_t>(sb.rows.size())), dim3(kSelectThreads), 0, stream,
+        if (!sb.bands.empty()) {
+            if (sb.bands.size() != sb.rows.size()) throw std::logic_error("QSA selection band descriptor count");
+            if (!slot.bands) check_hip(hipHostMalloc(reinterpret_cast<void**>(&slot.bands),
+                slot.capacity * sizeof(qsa_flash::BandRow), hipHostMallocDefault), "QSA select band slot allocation");
+            std::copy(sb.bands.begin(), sb.bands.end(), slot.bands);
+            hipLaunchKernelGGL(qsa_flash::select_band_batch_kernel, dim3(static_cast<std::uint32_t>(sb.rows.size())), dim3(kSelectThreads), 0, stream,
+                slot.rows, slot.bands, sb.ratio, sb.topk);
+        } else hipLaunchKernelGGL(qsa_flash::select_batch_kernel, dim3(static_cast<std::uint32_t>(sb.rows.size())), dim3(kSelectThreads), 0, stream,
             slot.rows, sb.ratio, sb.topk);
         qpf2k_launch_select_batch.fetch_add(1U, std::memory_order_relaxed);
         qpf2k_select_batch_rows.fetch_add(sb.rows.size(), std::memory_order_relaxed);
         check_hip(hipGetLastError(), "QSA select batch launch");
         check_hip(hipEventRecord(slot.done, stream), "QSA select batch slot record");
         slot.pending = true;
-        sb.rows.clear();
+        sb.rows.clear(); sb.bands.clear();
     }
     for (const auto& g : sb.traced) {
         std::array<std::uint64_t, 64> position = g.position;
@@ -7604,6 +7673,7 @@ void enqueue_qsa_prefill_rows(const std::vector<QsaKnownRows<8U>>& tiles, const 
             } else shared.handoff.recorded(reinterpret_cast<std::uintptr_t>(submission_stream));
         }
     }, [] {
+        qpf2k_select_batch().bands.clear();
         clear_qsa_pending(qsa_fast_batch(),qpf2k_select_batch(),qpf2k_index_batch(),qsa_exact_maxima,qsa_exact_maxima_stride);
     });
     static const unsigned mode = [] {

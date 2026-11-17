@@ -34,6 +34,9 @@ struct Device {
     double tail_ms_per_row = 0.0;         // final norm / head when this device runs the last layer
     double block_fixed_ms = 0.0;          // per-block launch, sync and staging cost
     double capacity_bytes = 0.0;          // weight budget; checked only when the model declares weight bytes
+    // Measured per-row cost multiplier by block rows {rows, factor}, ascending rows (piecewise linear in log2 rows,
+    // clamped at both ends; empty = 1). Small units cost more per row (launches, fixed waits, smaller GEMMs).
+    std::vector<std::pair<std::uint32_t, double>> unit_scale{};
 };
 struct Link {                             // between device i and i+1
     double forward_bytes_per_ms = 0.0;    // useful rate towards i+1 (0: no link)
@@ -95,6 +98,18 @@ inline double range_sum(const std::vector<double>& values, std::uint32_t begin, 
     for (auto layer = begin; layer < end; ++layer) sum += values[layer];
     return sum;
 }
+inline double unit_factor(const std::vector<std::pair<std::uint32_t, double>>& scale, double rows) {
+    if (scale.empty() || !(rows > 0.0)) return 1.0;
+    if (rows <= scale.front().first) return scale.front().second;
+    for (std::size_t i = 1; i < scale.size(); ++i) {
+        if (rows <= scale[i].first) {
+            const double a = std::log2(double(scale[i - 1].first)), b = std::log2(double(scale[i].first));
+            const double t = b > a ? (std::log2(rows) - a) / (b - a) : 1.0;
+            return scale[i - 1].second + t * (scale[i].second - scale[i - 1].second);
+        }
+    }
+    return scale.back().second;
+}
 inline std::uint32_t owner(const std::vector<std::uint32_t>& cuts, std::uint32_t first, std::uint32_t layer) {
     std::uint32_t stage = 0;
     while (stage + 2U < cuts.size() && layer >= cuts[stage + 1U]) ++stage;
@@ -142,7 +157,8 @@ inline Plan evaluate(const std::vector<Device>& devices, const std::vector<Link>
         for (auto hop = own; hop < decoder; ++hop) { forward_state[hop] += model.state_bytes_per_row[layer]; forward_fixed[hop] += model.state_fixed_bytes[layer]; }
         for (auto hop = decoder; hop < own; ++hop) { reverse_state[hop] += model.state_bytes_per_row[layer]; reverse_fixed[hop] += model.state_fixed_bytes[layer]; }
     }
-    struct Resource { double fixed = 0.0, per_row = 0.0; std::string name; };
+    struct Resource { double fixed = 0.0, per_row = 0.0; std::string name; const std::vector<std::pair<std::uint32_t, double>>* scale = nullptr; };
+    const auto row_cost = [](const Resource& r, double n) { return n * r.per_row * (r.scale ? detail::unit_factor(*r.scale, n) : 1.0); };
     std::vector<Resource> resources;
     for (auto device = first; device <= end; ++device) {
         if (device <= plan.last) {
@@ -150,7 +166,7 @@ inline Plan evaluate(const std::vector<Device>& devices, const std::vector<Link>
             const auto& d = devices[device];
             auto per_row = detail::range_sum(d.layer_ms_per_row, plan.cuts[s], plan.cuts[s + 1U]);
             if (device == plan.last) per_row += d.tail_ms_per_row;
-            resources.push_back({d.block_fixed_ms, per_row, "stage " + d.name});
+            resources.push_back({d.block_fixed_ms, per_row, "stage " + d.name, &d.unit_scale});
         }
         if (device < end) {
             const auto bytes = (device < plan.last ? model.seam_bytes_per_row : 0.0) + forward_state[device];
@@ -175,7 +191,7 @@ inline Plan evaluate(const std::vector<Device>& devices, const std::vector<Link>
         const auto block_rows = static_cast<double>(j + 1U == plan.blocks ? rows - j * block : block);
         double previous = 0.0;
         for (std::size_t r = 0; r < resources.size(); ++r) {
-            done[r] = std::max(previous, done[r]) + resources[r].fixed + block_rows * resources[r].per_row;
+            done[r] = std::max(previous, done[r]) + resources[r].fixed + row_cost(resources[r], block_rows);
             previous = done[r];
         }
         double relay = 0.0;
@@ -193,7 +209,7 @@ inline Plan evaluate(const std::vector<Device>& devices, const std::vector<Link>
     plan.makespan_ms = done.back();
     double best_block = -1.0;
     for (const auto& resource : resources) {
-        const auto t = resource.fixed + static_cast<double>(block) * resource.per_row;
+        const auto t = resource.fixed + row_cost(resource, static_cast<double>(block));
         (resource.name.starts_with("stage") ? plan.stage_block_ms : plan.hop_block_ms).push_back(t);
         if (t > best_block) { best_block = t; plan.bottleneck = resource.name; }
     }

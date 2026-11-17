@@ -39,6 +39,9 @@ struct Options {
     std::uint32_t slots = 1;        // independent sequences (decode rows), each with its own KV / index-key cache
     std::uint64_t capacity = 8256;  // positions per slot
     std::uint32_t max_rows = 4096;  // rows per forward call (prefill chunk / gate); sizes the activations
+    // Prefill unit cap in max_rows chunks; group width can cap it further and units may cross layer-cut blocks.
+    // 0 = STRIX_MM_PF_GROUP. Bit-neutral: chunk bits do not depend on the unit (strix/pair/prefill_group.hpp).
+    std::uint32_t unit_chunks = 0;
 };
 
 struct LoadReport {

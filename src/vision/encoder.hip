@@ -1,12 +1,16 @@
-// HIP runner of the shared vision encoder, arithmetic identity "vision-f16-v1" (class FAST).
-// The device projector (default on) uses the separate identity returned by effective_arithmetic().
+// HIP runner of the shared vision encoder, arithmetic identity "vision-f16-attn2-v1" (default: two-term attention)
+// or "vision-f16-v1" (EncoderOptions::attention_terms 1, one-term attention), class FAST.
+// The device projector (default on) adds its identity suffix: see Encoder::effective_arithmetic().
 //
 // Every linear (patch embedding over flattened patches, qkv, out, MLP, projector) is the shared dense FP16 tall GEMM
 // (core/f16_dense_tall.hpp): weights as FP16 panels with a power-of-two tensor scale (undone exactly in the FP32
 // epilogue), activations rounded to FP16 by the core, FP32 accumulation. Attention is the shared dense flash core
 // (attn_core/dense_flash_prefill.hpp) under a non-causal policy: mask::bidir_* gives every row a window of n logical
 // keys and the policy backs logical key p with physical key p % n, so the causal core computes full bidirectional
-// attention unchanged. Norms, activations, rotary rotation, residual and the softmax stay FP32.
+// attention unchanged. The attention operands Q, K, V, P are hi + lo FP16 terms by default (the core's kTerms 2:
+// hi.hi + hi.lo + lo.hi per product, ~3 x 2^-22 |ab| instead of ~2^-10 |ab| for normal f16 remainders, 2^-25
+// absolute below; bounds in attn_core/two_term_model.hpp; 3x the attention WMMA); attention_terms
+// 1 is the one-term form. Norms, activations, rotary rotation, residual and the softmax stay FP32.
 // Buffers: encoder_layout.hpp (the same numbers plan() reports). Input pads of the GEMM (in % 128) are zero columns.
 #include "strix/vision/encoder.hpp"
 
@@ -289,6 +293,8 @@ struct PackArgs {
     float* q;
     _Float16* k;
     _Float16* vt;
+    _Float16* klo;   // two-term attention: lo terms of k / vt (tile::to_operand2), null for one term
+    _Float16* vtlo;
     unsigned* failure;
     unsigned qstride, row0, n, slot0, heads, d, dp, w, vstride, half;
 };
@@ -319,6 +325,13 @@ __global__ __launch_bounds__(256) void pack_kernel(PackArgs a) {
         bad |= !__builtin_isfinite(static_cast<float>(kh)) || !__builtin_isfinite(static_cast<float>(vh));
         a.k[static_cast<std::size_t>(a.slot0 + slot) * hw + e] = kh;
         a.vt[static_cast<std::size_t>(e) * a.vstride + a.slot0 + slot] = vh;
+        if (a.klo) {
+            using attn_core::tile::Operand;
+            a.klo[static_cast<std::size_t>(a.slot0 + slot) * hw + e] =
+                __builtin_bit_cast(_Float16, attn_core::tile::to_operand2<Operand::f16>(kv).lo);
+            a.vtlo[static_cast<std::size_t>(e) * a.vstride + a.slot0 + slot] =
+                __builtin_bit_cast(_Float16, attn_core::tile::to_operand2<Operand::f16>(vv).lo);
+        }
     }
     if (bad) atomicOr(a.failure, kOperandRange);
 }
@@ -348,13 +361,17 @@ struct AttnArgs {
     float* out;          // [row][head][dp]
     const _Float16* k;   // [slot][heads * dp]
     const _Float16* vt;  // [heads * dp][vstride]
+    const _Float16* klo;   // two-term: lo terms of k, vt (same layouts)
+    const _Float16* vtlo;
     unsigned* failure;
     unsigned n, row0, slot0, heads, vstride;
 };
 inline constexpr unsigned kPositions = 64;  // query rows per work-group: 4 waves share every staged K/V tile
-template <unsigned D, unsigned DP>
+// Terms: FP16 terms per attention operand (EncoderOptions::attention_terms): 2 = hi + lo (default), 1 = one term.
+template <unsigned D, unsigned DP, unsigned Terms>
 struct BidirPolicy {
     using Args = AttnArgs;
+    static constexpr unsigned kTerms = Terms;
     using Shape = attn_core::dense::Shape<DP, 1, 1, kPositions>;
     static constexpr float kInvSqrt = D == 64U ? 0.125F : D == 72U ? 0.11785113019775792F : 0.11180339887498948F;
     static constexpr float kScaleLog2 = kInvSqrt * 1.44269504088896341F;
@@ -374,6 +391,12 @@ struct BidirPolicy {
     }
     __device__ static const std::uint16_t* value_t(const Args& a, unsigned kvh, unsigned d) {
         return reinterpret_cast<const std::uint16_t*>(a.vt + static_cast<std::size_t>(kvh * DP + d) * a.vstride + a.slot0);
+    }
+    __device__ static const std::uint16_t* key_lo(const Args& a, unsigned p, unsigned kvh) {
+        return reinterpret_cast<const std::uint16_t*>(a.klo + static_cast<std::size_t>(a.slot0 + p) * (a.heads * DP) + kvh * DP);
+    }
+    __device__ static const std::uint16_t* value_t_lo(const Args& a, unsigned kvh, unsigned d) {
+        return reinterpret_cast<const std::uint16_t*>(a.vtlo + static_cast<std::size_t>(kvh * DP + d) * a.vstride + a.slot0);
     }
     __device__ static unsigned* failure(const Args& a) { return a.failure; }
 };
@@ -644,13 +667,17 @@ struct Encoder::Impl {
         hipLaunchKernelGGL(norm_kernel, dim3(rows), dim3(256), 0, stream, x, pitch, y, pitch, cfg.width, w.as<const float>(),
                            b.as<const float>(), cfg.eps, cfg.norm == EncoderConfig::Norm::layernorm ? 1U : 0U);
     }
-    void attention(const AttnArgs& a, unsigned d) const {
+    template <unsigned Terms> void attention_terms(const AttnArgs& a, unsigned d) const {
         switch (d) {
-        case 64: attn_core::dense::launch<BidirPolicy<64, 64>>(a, a.heads, stream); break;
-        case 72: attn_core::dense::launch<BidirPolicy<72, 80>>(a, a.heads, stream); break;
-        case 80: attn_core::dense::launch<BidirPolicy<80, 80>>(a, a.heads, stream); break;
+        case 64: attn_core::dense::launch<BidirPolicy<64, 64, Terms>>(a, a.heads, stream); break;
+        case 72: attn_core::dense::launch<BidirPolicy<72, 80, Terms>>(a, a.heads, stream); break;
+        case 80: attn_core::dense::launch<BidirPolicy<80, 80, Terms>>(a, a.heads, stream); break;
         default: throw std::invalid_argument("vision encoder: head dimension");
         }
+    }
+    void attention(const AttnArgs& a, unsigned d) const {
+        if (a.klo) attention_terms<2>(a, d);
+        else attention_terms<1>(a, d);
     }
     void sync(const char* what) const {
         ck(hipStreamSynchronize(stream), what);
@@ -677,12 +704,14 @@ struct Encoder::Impl {
 Encoder::Encoder(EncoderConfig cfg, EncoderOptions opt) : impl_(std::make_unique<Impl>()) {
     std::string why;
     if (!hip_supported(cfg, &why)) throw std::invalid_argument("vision encoder: " + why);
+    if (opt.attention_terms != 1U && opt.attention_terms != 2U) throw std::invalid_argument("vision encoder: attention_terms is 1 or 2");
     impl_->cfg = std::move(cfg);
     impl_->opt = opt;
     impl_->stream = static_cast<hipStream_t>(opt.stream);
     impl_->failure = Dev(layout::kAlign);
 }
 Encoder::~Encoder() = default;
+const char* Encoder::arithmetic() const { return effective_arithmetic(impl_->opt.attention_terms); }
 
 void Encoder::load(const EncoderWeights& w) {
     auto& im = *impl_;
@@ -828,6 +857,8 @@ EncoderOutput Encoder::run(const PatchGrid& grid, const PositionInputs& pos, Enc
     float* const o = f32(g.o);
     auto* const k = reinterpret_cast<_Float16*>(take(g.k));
     auto* const vt = reinterpret_cast<_Float16*>(take(g.vt));
+    auto* const klo = g.klo ? reinterpret_cast<_Float16*>(take(g.klo)) : nullptr;
+    auto* const vtlo = g.vtlo ? reinterpret_cast<_Float16*>(take(g.vtlo)) : nullptr;
     float* const lo = f32(g.lo);
     float* const ylo = f32(g.ylo);
     float* const mid = f32(g.mid);
@@ -886,10 +917,10 @@ EncoderOutput Encoder::run(const PatchGrid& grid, const PositionInputs& pos, Enc
         unsigned row0 = 0, slot0 = 0;
         for (const unsigned end : tiles) {
             const unsigned n = end - row0, cap = layout::key_slots(n);
-            const PackArgs pa{qkv, dcos, dsin, q, k, vt, im.failure.as<unsigned>(), g.q16, row0, n, slot0, g.heads, g.d, g.dp, g.w, slots,
+            const PackArgs pa{qkv, dcos, dsin, q, k, vt, klo, vtlo, im.failure.as<unsigned>(), g.q16, row0, n, slot0, g.heads, g.d, g.dp, g.w, slots,
                               c.rope_pairing == EncoderConfig::RopePairing::half ? 1U : 0U};
             hipLaunchKernelGGL(pack_kernel, dim3(cap), dim3(256), 0, stream, pa);
-            const AttnArgs aa{q, ao, k, vt, im.failure.as<unsigned>(), n, row0, slot0, g.heads, slots};
+            const AttnArgs aa{q, ao, k, vt, klo, vtlo, im.failure.as<unsigned>(), n, row0, slot0, g.heads, slots};
             im.attention(aa, g.d);
             row0 = end;
             slot0 += cap;

@@ -2679,8 +2679,10 @@ struct Engine::Impl {
         task.i4.begin(pos0 + toks.size(), i4_min_rows);
         task.chunks = (toks.size() + opt.max_rows - 1) / opt.max_rows;
         const bool module = pf != nullptr && pf_on && !pf_force_comm;
-        task.grouped = pf_interleave && (module || pf_comm_interleave) && !profiling && !(taps_on && tap_sink) && task.chunks >= 2;
-        task.m = task.grouped ? std::min<std::size_t>(pf_group, task.chunks) : 1;  // the first unit (as prefill_resume sets it)
+        // Options::unit_chunks caps a unit (layer-cut: one unit per block); 1 = chunk-serial. Bit-neutral either way.
+        task.grouped = pf_interleave && (module || pf_comm_interleave) && !profiling && !(taps_on && tap_sink) && task.chunks >= 2 &&
+                       opt.unit_chunks != 1;
+        task.m = task.grouped ? std::min<std::size_t>(unit_width(), task.chunks) : 1;  // the first unit (as prefill_resume sets it)
         task.rows = route::unit_rows(task.m, opt.max_rows, toks.size());
         task.open = true;
         if (auto* t = child_bank ? child_timeline.get() : timeline.get()) t->begin();
@@ -2745,7 +2747,7 @@ struct Engine::Impl {
             unsigned left = budget;
             while (task.c0 < toks.size()) {
                 if (task.layer == 0) {
-                    task.m = task.grouped ? std::min<std::size_t>(pf_group, task.chunks - task.c) : 1;
+                    task.m = task.grouped ? std::min<std::size_t>(unit_width(), task.chunks - task.c) : 1;
                     task.rows = route::unit_rows(task.m, opt.max_rows, toks.size() - task.c0);
                 }
                 if (left == 0) break;
@@ -2904,6 +2906,7 @@ struct Engine::Impl {
     }
 
     // Rows [0, min(rows of the open chunk, kMaxStepRows)) of h and hn (a group's member 0 uses the base buffers) and taps.
+    std::size_t unit_width() const { return opt.unit_chunks >= 2 ? std::min<std::size_t>(pf_group, opt.unit_chunks) : pf_group; }
     std::size_t saved_rows() const { return std::min<std::size_t>({kMaxStepRows, static_cast<std::size_t>(opt.max_rows), task.rows}); }
     void save_rows() {
         const std::size_t r = saved_rows();

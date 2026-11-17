@@ -208,10 +208,10 @@ described in [Declare the GPU to use](#declare-the-gpu-to-use).
 
 MiniMax M3.1 has an experimental block pipeline: CUDA computes layers `[0,K)` and the HIP TP2 pair computes
 `[K,60)`, including the first token's head on the last prompt row. Select it explicitly with
-`mm-rtx-prefill MODEL_DIR ROPE.bin OUTPUT_DIR cut:PROMPT.u32 --layer-cut K --cut-block 2048 --send NODE0_IP:PORT0,NODE1_IP:PORT1 --repeat 2`.
+`mm-rtx-prefill MODEL_DIR ROPE.bin OUTPUT_DIR cut:PROMPT.u32 --layer-cut K --cut-block 4096 --send NODE0_IP:PORT0,NODE1_IP:PORT1 --repeat 2`.
 The existing routes keep their defaults; layer-cut's compiler, native execution, fidelity and full-workload gates are pending.
 
-Both ranks use `--layercut-listen NAME:PROMPT.u32:BASE_PORT:STEPS:COUNT --cut K --cut-block 2048`.
+Both ranks use `--layercut-listen NAME:PROMPT.u32:BASE_PORT:STEPS:COUNT --cut K --cut-block 4096` (a multiple of the pair identity's chunk rows, 4096 by default).
 `--cut-act relay` (default) adds rank 0 `--cut-relay HOST:PORT` and rank 1 `--cut-relay-listen PORT`;
 `--cut-act direct` sends activations to both ranks. Rank r's producer listener uses BASE_PORT+r.
 Shared controls are `--split` / `STRIX_SPLIT` (default `device-only`), `--cut` / `STRIX_SPLIT_CUT`,

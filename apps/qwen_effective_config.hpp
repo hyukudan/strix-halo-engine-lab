@@ -176,7 +176,7 @@ inline Environment requested_prefill_environment(Get get) {
             "STRIX_KNOWN_WINDOW_ROUTER_ROWS", "STRIX_KNOWN_PREFIX_PREFILL_ROWS",
             "STRIX_RTX_EXPORT_STATE", "STRIX_QRTX_STEP_DUMP", "STRIX_PROMPT_BATCH_ROWS", "STRIX_PREFILL_LOGITS_DIGEST",
             "STRIX_PREFILL_EXACT_FP16", "STRIX_QPF2K_T16K", "STRIX_MODEL_COPY_ALL", "STRIX_PLE_RECLAIM_DECODE_BYTES",
-            "STRIX_QSA_UNION_MERGE", "STRIX_QSA_SCORE_ROWS64", "STRIX_QSA_SCORE_SPLIT_LOADS", "STRIX_QSA_POOL_PACKED", "STRIX_QSA_DECODE_POOL",
+            "STRIX_QSA_UNION_MERGE", "STRIX_QSA_SCORE_ROWS64", "STRIX_QSA_SCORE_SPLIT_LOADS", "STRIX_QSA_INDEX_BAND", "STRIX_QSA_POOL_PACKED", "STRIX_QSA_DECODE_POOL",
             "STRIX_QSA_DECODE_SELECT", "STRIX_QSA_DECODE_POOL_BF16", "STRIX_QSA_DECODE_POOL_CHECK", "STRIX_PREFILL_MOE_MERGE_VEC", "STRIX_QSA_CACHE_ONLY", "STRIX_PREFILL_FINAL_CONE", "STRIX_HOST_WAIT", "STRIX_QWEN_ROUTER_BF16", "STRIX_Q6P",
             "STRIX_QPF2K_GDN_CHUNK16", "STRIX_QPF2K_GDN_CHUNK16_MAX_ROWS", "STRIX_QPF2K_GDN_COOP_LAUNCH",
             "STRIX_QSA_DECODE_FUSED_MAXIMA", "STRIX_QSA_DECODE_ATTN_V2", "STRIX_QSA_DECODE_VALUE_V2", "STRIX_MOE_R1_GLUE_FUSE", "STRIX_QWEN_DECODE_FUSE",
@@ -2351,6 +2351,10 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     // Chunk-16 GDN core: enabled = auto by call length (or "1": every eligible call); same suppressions.
     item("STRIX_QPF2K_GDN_CHUNK16", qpf2k::long_context_item_suppression("STRIX_QPF2K_GDN_CHUNK16", config.gsq_owner), true);
     item("STRIX_PREFILL_MOE_MERGE_VEC", qpf2k::long_context_item_suppression("STRIX_PREFILL_MOE_MERGE_VEC", config.gsq_owner), false);
+    const auto band = config.environment.find("STRIX_QSA_INDEX_BAND");
+    out << "},\"qsa_index_band\":{\"requested\":"
+        << (band != config.environment.end() && !band->second.empty() && band->second[0] != '0' ? "true" : "false")
+        << ",\"read_once_per_process\":true,\"identity\":\"exact-selected-set\"";
     out << "},\"gdn_core_launch\":{\"requested\":";
     const auto coop = config.environment.find("STRIX_QPF2K_GDN_COOP_LAUNCH");
     if (coop != config.environment.end()) out << serve::Json(coop->second).dump();

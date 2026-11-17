@@ -51,6 +51,7 @@
 //   --decode-check PROMPT.u32:K                      decode steps (true tokens) vs teacher-forced logits, last K rows
 //   --deadline SECONDS                               skip later parts once rank 0 has run this long
 //   --slots S --capacity C --max-rows R              engine sizes (defaults 8 / 8256 / 4096)
+//   --unit-chunks N                                  prefill unit cap in chunks (0 = STRIX_MM_PF_GROUP, 1 = chunk-serial)
 // --offload NAME:PROMPT.u32:STEPS RTX-prefill reference form: prefill rows
 //                                                     [0, P-1), export this rank's state rows to
 //                                                     OUT_DIR/state-NAME-rank<r>.bin, then the last prompt row as a decode
@@ -1819,13 +1820,24 @@ int main(int argc, char** argv) {
             else if (a == "--slots") opt.slots = static_cast<std::uint32_t>(std::stoul(next()));
             else if (a == "--capacity") opt.capacity = std::stoull(next());
             else if (a == "--max-rows") opt.max_rows = static_cast<std::uint32_t>(std::stoul(next()));
+            else if (a == "--unit-chunks") opt.unit_chunks = static_cast<std::uint32_t>(std::stoul(next()));  // prefill unit cap (bit-neutral)
             else if (strix::minimax::session::parse_option(session_options,a,next)) {}
             else throw std::invalid_argument("unknown option " + a);
         }
         if (!layercut_listens.empty()) {
             if (cut_cfg.split != lc::chain::Split::layer_cut || opt.rank >= 2 || cut_relay_port > 65535)
                 throw std::invalid_argument("--layercut-listen needs layer-cut policy, rank 0/1 and valid relay port");
-            opt.max_rows = std::min(opt.max_rows, cut_cfg.block);
+            // A chunk-dependent pair identity keeps the pair-alone chunk rows (the resolver made the block a multiple of
+            // them) and caps unit width at a block; group width may cap it further or grouping may be disabled.
+            // Units may cross block boundaries. The row-invariant FP32 identity may shrink its chunks to the block.
+            if (cut_cfg.grain != 0) {
+                if (cut_cfg.grain != opt.max_rows || cut_cfg.block % opt.max_rows != 0)
+                    throw std::logic_error("layercut: block / pair chunk identity grain mismatch");
+                opt.unit_chunks = cut_cfg.block / opt.max_rows;
+            } else {
+                opt.max_rows = std::min(opt.max_rows, cut_cfg.block);
+                opt.unit_chunks = 1;
+            }
             std::printf("%s", cut_cfg.lines.c_str());
         } else if (cut_cfg.split != lc::chain::Split::device_only)
             throw std::invalid_argument("--split: pair split execution needs --layercut-listen");

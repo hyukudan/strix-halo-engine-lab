@@ -44,6 +44,7 @@ double secs(Clock::time_point a, Clock::time_point b) { return std::chrono::dura
 // ---- sockets ---------------------------------------------------------------------------------------------------
 #ifdef _WIN32
 using sock_t = SOCKET;
+using sock_count_t = int;
 constexpr sock_t kBad = INVALID_SOCKET;
 void close_sock(sock_t s) { ::closesocket(s); }
 // Winsock does not wake a recv()/send() blocked on another thread on shutdown(); CancelIoEx does (the call then
@@ -63,6 +64,7 @@ void net_init() { static NetInit once; }
 int last_error() { return WSAGetLastError(); }
 #else
 using sock_t = int;
+using sock_count_t = std::size_t;
 constexpr sock_t kBad = -1;
 void close_sock(sock_t s) { ::close(s); }
 void shutdown_sock(sock_t s) { ::shutdown(s, SHUT_RDWR); }
@@ -113,7 +115,7 @@ void set_timeout(sock_t s, std::chrono::milliseconds t, bool send_side) {
 void send_all(sock_t s, const void* p, std::size_t n) {
     const char* b = static_cast<const char*>(p);
     while (n) {
-        const auto k = ::send(s, b, static_cast<int>(std::min<std::size_t>(n, std::size_t{1} << 24)), kSendFlags);
+        const auto k = ::send(s, b, static_cast<sock_count_t>(std::min<std::size_t>(n, std::size_t{1} << 24)), kSendFlags);
         if (k <= 0) throw std::runtime_error("handoff: send failed (error " + std::to_string(last_error()) + ")");
         b += k;
         n -= static_cast<std::size_t>(k);
@@ -128,7 +130,7 @@ void recv_all(sock_t s, void* p, std::size_t n) {
     static const int flags = envcfg::flag("STRIX_HANDOFF_RECV_WAITALL", true) ? MSG_WAITALL : 0;
     char* b = static_cast<char*>(p);
     while (n) {
-        const auto k = ::recv(s, b, static_cast<int>(std::min<std::size_t>(n, std::size_t{1} << 24)), flags);
+        const auto k = ::recv(s, b, static_cast<sock_count_t>(std::min<std::size_t>(n, std::size_t{1} << 24)), flags);
         if (k == 0) throw std::runtime_error("handoff: connection closed by the peer");
         if (k < 0) throw std::runtime_error("handoff: receive failed, cancelled or timed out (error " + std::to_string(last_error()) + ")");
         b += k;

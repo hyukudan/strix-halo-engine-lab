@@ -132,6 +132,7 @@ inline constexpr PrefillLever kPrefillLevers[] = {
     {"STRIX_DS41_FAST_I4_SCOPE", PrefillLeverClass::reload},
     {"STRIX_DS41_FAST_MOE", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
     {"STRIX_DS41_FAST_MOE_DOWN_ROWS", PrefillLeverClass::runtime},  // getenv on every call
+    {"STRIX_DS41_FAST_MOE_F16", PrefillLeverClass::reload},  // startup pair resolver / profile table row (MoE FP16 operands)
     {"STRIX_DS41_FAST_MOE_ORDER", PrefillLeverClass::runtime},  // getenv on every call
     {"STRIX_DS41_FAST_PREFILL", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
     {"STRIX_DS41_FAST_SHARED", PrefillLeverClass::reload},  // startup pair resolver / profile table row (shared expert FAST)

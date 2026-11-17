@@ -206,6 +206,8 @@ inline constexpr std::array yarn_environment_rules{
     // WMMA_PIN, HC_UPCOPY and ROUTER_SELECT reorganize the MoE merge, dense WMMA registers, HC up-weight
     // reads and router selection.
     YarnEnvironmentRule{"STRIX_QSA_UNION_MERGE", YarnEnvironmentClass::off_switch, "0|1"},
+    // Changes only index scoring/selection over already-rotated Q/K; exact selected set.
+    YarnEnvironmentRule{"STRIX_QSA_INDEX_BAND", YarnEnvironmentClass::off_switch, "0|1"},
     YarnEnvironmentRule{"STRIX_QSA_SCORE_ROWS64", YarnEnvironmentClass::off_switch, "0|1"},
     YarnEnvironmentRule{"STRIX_PREFILL_MOE_MERGE_VEC", YarnEnvironmentClass::off_switch, "0|1"},
     YarnEnvironmentRule{"STRIX_QPF2K_WMMA_PIN", YarnEnvironmentClass::off_switch, "0|1"},

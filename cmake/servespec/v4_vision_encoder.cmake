@@ -66,5 +66,16 @@ if(STRIX_ENABLE_HIP_RUNTIME AND TARGET strix_hip_runtime)
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee -Wall -Wextra)
         target_include_directories(strix-f16-dense-tall-hip-tests PRIVATE "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/include")
         target_link_libraries(strix-f16-dense-tall-hip-tests PRIVATE strix_hip_runtime)
+        # Device self-test of the shared dense flash core's one- and two-term operands against the host model of its
+        # products and order and against exact attention (small residuals, cancellation, tails; two_term_model.hpp).
+        # Run strix-dense-flash-terms-hip-tests explicitly and record its result; host CTest does not run it.
+        # Causal single-split evidence only: no cyclic placement, split-K merge, production packing or image fidelity.
+        add_executable(strix-dense-flash-terms-hip-tests "${CMAKE_SOURCE_DIR}/tests/hip_dense_flash_terms_tests.hip")
+        set_target_properties(strix-dense-flash-terms-hip-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_compile_options(strix-dense-flash-terms-hip-tests PRIVATE
+            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee -Wall -Wextra)
+        target_include_directories(strix-dense-flash-terms-hip-tests PRIVATE "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/include")
+        target_link_libraries(strix-dense-flash-terms-hip-tests PRIVATE strix_hip_runtime)
     endif()
 endif()

@@ -833,6 +833,7 @@ struct DevicePrefill::Impl {
         opts.fast_engram = req.fast_engram || ds41::fast_profile::engram_on();
         static strix::lever_cache<bool> shared_on{[] { return ds41::fast_profile::shared_on(); }};
         opts.fast_shared = req.fast_shared || shared_on.get();
+        opts.fast_moe_f16 = req.fast_moe_f16 || ds41::fast_profile::moe_f16_on();
         // Per-shape selector of the FP16 backend: STRIX_DS41_PREFILL_FP16_PROJ (comma list of q_a, kv, q_b, o_a, o_b),
         // STRIX_DS41_PREFILL_FP16_MIN_ROWS (calls of at least that many rows), STRIX_DS41_PREFILL_APPROX_LAYERS=first-end,
         // STRIX_DS41_PREFILL_FP16_A8=1 (operands from the A8 codes)
@@ -1739,6 +1740,7 @@ void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions& p) {
     o.decoder_replay_override = p.decoder_replay_override;
     o.fast_engram = p.fast_engram;
     o.fast_shared = p.fast_shared;
+    o.fast_moe_f16 = p.fast_moe_f16;
     // no process-wide switch: run_from installs these options as the precision of its own execution (another
     // DevicePrefill of the process keeps its own; strix/ds41_prefill_precision.hpp)
     impl_->rebuild_dense_classes();             // the FAST dense routes of this owner changed
@@ -1762,7 +1764,7 @@ std::uint32_t DevicePrefill::positions() const noexcept { return impl_->rows_don
 PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std::uint32_t start) {
     auto& m = *impl_;
     // this object's FAST dense / MoE precision for every dispatch of the run (thread of the run: caller or task worker)
-    const ds41::PrefillPrecisionScope precision_scope(ds41::PrefillPrecision{m.options.fast_dense, m.options.fast_moe});
+    const ds41::PrefillPrecisionScope precision_scope(ds41::PrefillPrecision{m.options.fast_dense, m.options.fast_moe, m.options.fast_moe_f16});
     // provided embedding rows of this run (none: text, nothing below changes)
     const strix::session::EmbedSplice embeds = std::exchange(m.embed_run, {});
     const ds41::RnWideOff own_kernels;  // the prefill keeps its own Q8_0 x A8 kernels (P12: the multi-row form is -1 %)

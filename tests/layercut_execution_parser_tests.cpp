@@ -4,7 +4,12 @@
 
 namespace lc = strix::pair::layercut;
 namespace mlc = strix::minimax::layercut;
-// Only the prompt reader is substituted; all argument parsing below comes from the production adapter.
+// Only the prompt reader, the engine chunk default and the policy suffix are substituted; all argument parsing and
+// the pair identity below come from the production adapter.
+namespace mm { struct Options { std::uint32_t max_rows = mlc::pair_chunk_rows; }; }
+namespace strix::minimax::defaults {
+inline std::string prefill_identity(const lc::Lookup&) { return "test-policy"; }
+}
 std::vector<std::uint32_t> read_u32(const std::string&) { return std::vector<std::uint32_t>(4096, 1); }
 #include "cut_arguments_under_test.inc"
 
@@ -13,7 +18,7 @@ void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(m
 int main() try {
     std::vector<std::string> args{"rank", "MODEL_DIR", "0", "usb4-auto", "OUT_DIR",
         "--cut-xport", "fifo", "--layercut-listen", "test:prompt.u32:1234:1:1",
-        "--cut", "1", "--cut-kv-frag", "256", "--cut-block", "2048", "--cut-act", "link",
+        "--cut", "1", "--cut-kv-frag", "256", "--cut-block", "4096", "--cut-act", "link",
         "--split", "layer-cut", "--session", "keep-this-value"};
     std::vector<char*> argv;
     for (auto& arg : args) argv.push_back(arg.data());
@@ -21,7 +26,7 @@ int main() try {
     int argc = static_cast<int>(args.size());
     const auto cut = cut_arguments(argc, argv.data());
     require(cut.config.xport == lc::Xport::fifo && cut.config.kv_frag == 256, "transport values resolved");
-    require(cut.config.cut == 1 && cut.config.block == 2048 && cut.listens.size() == 1, "other cut values retained");
+    require(cut.config.cut == 1 && cut.config.block == 4096 && cut.listens.size() == 1, "other cut values retained");
     // Execution continues over the remaining argv, without taking the inspection early exit.
     unsigned consumed = 0;
     for (int i = 5; i < argc; ++i) {

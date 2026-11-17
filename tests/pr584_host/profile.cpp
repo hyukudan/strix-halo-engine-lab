@@ -95,6 +95,18 @@ int main() {
             }, {}, {});
             require(exported(r, "STRIX_DS41_FAST_SHARED") == "1", "serve / prefill CLI resolve a different shared-expert value");
         }
+        // ds41-moe-f16wmma-v1: the same explicit-lever contract
+        const auto m16 = resolve({{"STRIX_DS41_FAST_MOE_F16", "1"}});
+        require(!agrees(off, m16) && exported(m16, "STRIX_DS41_FAST_MOE_F16") == "1", "MoE FP16 lever not exported / admitted asymmetric");
+        require(std::none_of(bundle.set_env.begin(), bundle.set_env.end(),
+                             [](const auto& kv) { return kv.first == "STRIX_DS41_FAST_MOE_F16" && kv.second == "1"; }),
+                "bundle selects the unqualified MoE FP16 lever");
+        for (const pd::App app : {pd::App::serve, pd::App::prefill}) {
+            const auto r = pd::resolve(app, {}, [](const char* key) -> const char* {
+                return std::string(key) == "STRIX_DS41_FAST_MOE_F16" ? "1" : std::string(key) == "STRIX_DS41_BASELINE" ? "1" : nullptr;
+            }, {}, {});
+            require(exported(r, "STRIX_DS41_FAST_MOE_F16") == "1", "serve / prefill CLI resolve a different MoE FP16 value");
+        }
         const auto report = pd::describe(pd::App::rank, bundle);
         require(report.find("STRIX_DS41_FAST_DENSE=1") != std::string::npos &&
                 report.find("STRIX_DS41_FAST_DENSE_MIN_ROWS=128") != std::string::npos, "effective report omits dense policy");

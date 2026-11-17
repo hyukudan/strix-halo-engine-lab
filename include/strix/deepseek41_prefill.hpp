@@ -53,6 +53,9 @@ struct PrefillOptions {
     // (swiglu_a8) between them, as the CUDA backend's FAST shared expert; calls under STRIX_DS41_FAST_DENSE_MIN_ROWS rows and
     // views the core does not take keep the exact expert kernels. Resolved like fast_engram.
     bool fast_shared = false;
+    // FAST lever ds41-moe-f16wmma-v1 (STRIX_DS41_FAST_MOE_F16=1, explicit; acts with fast_moe): the relaxed routed-expert kernels
+    // in their FP16-operand form (A8 rows and decoded weights rounded once to FP16, FP32 accumulation over the whole K).
+    bool fast_moe_f16 = false;
     // Diagnostics/selection for the non-exact paths (no effect while both switches above are off, except null_ulp_layer):
     // projection bits 1 q_a, 2 kv, 4 q_b, 8 o_a, 16 o_b; layers [approx_layer_first, approx_layer_end); FP16 only at
     // calls of at least fp16_min_rows rows; fp16_keep_a8: FP16 operands from the A8 codes (the exact path's activations)
@@ -403,6 +406,10 @@ public:
     //   diagnostic-output-not-segmented trace / stream hashes / routing loads / quality head rows / null ULP / embed extras
     //                                   report one sequence's run
     //   shared-fast-group-unqualified FAST shared expert retains its solo-only admission
+    //   moe-f16-fast-group-unqualified  FAST MoE FP16 operands (ds41-moe-f16wmma-v1) keep the solo-only admission they were
+    //                                   qualified under. PROVISIONAL (owner dspf2k): the row scaling is per row
+    //                                   (relaxed_f16_exponents, src/hip_ds41_prefill_relaxed.inl), so the fixture "group
+    //                                   member i == solo run i under FAST MoE F16" lifts it.
     //   engram-fast-flag-per-view       FAST Engram (ds41-engram-f16wmma-v1) takes its exact fallback for a whole view when
     //                                   any x of the view would overflow FP16 (one flag per view: engram_x_f16_scan,
     //                                   src/hip_ds41_layer.hip enqueue_engram_f16_wmma); a group view spans members, so one
@@ -413,6 +420,7 @@ public:
         if (o.trace || o.stream_hashes || o.routing_loads || o.quality_head_rows > 1U || o.null_ulp_layer >= 0 || o.verify_embed_extras)
             return "diagnostic-output-not-segmented";
         if (o.fast_shared) return "shared-fast-group-unqualified";
+        if (o.fast_moe_f16) return "moe-f16-fast-group-unqualified";
         if (o.fast_engram) return "engram-fast-flag-per-view";
         return nullptr;
     }
