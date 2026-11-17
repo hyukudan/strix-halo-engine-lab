@@ -5067,6 +5067,29 @@ int main(int argc, char** arguments) {
             return effective_config_json(printed);
         };
         const auto has = [](const std::string& text, const char* field) { return text.find(field) != std::string::npos; };
+        // Split-load reporting preserves the request and reports every suppression.
+        for (const char* value : {"0", "1"}) {
+            ::setenv("STRIX_QSA_SCORE_SPLIT_LOADS", value, 1);
+            expect(requested_prefill_environment().at("STRIX_QSA_SCORE_SPLIT_LOADS") == value,
+                "requested environment retains the split-load switch");
+            expect(has(items(sized, false), value[0] == '0' ?
+                "\"STRIX_QSA_SCORE_SPLIT_LOADS\":{\"enabled\":false,\"suppression\":\"explicit-off\"}" :
+                "\"STRIX_QSA_SCORE_SPLIT_LOADS\":{\"enabled\":true,\"suppression\":null}"),
+                "split-load reporting honors explicit OFF and ON");
+        }
+        ::setenv("STRIX_QPF2K_DEFAULTS", "0", 1);
+        expect(has(items(sized, false), "\"STRIX_QSA_SCORE_SPLIT_LOADS\":{\"enabled\":false,\"suppression\":\"STRIX_QPF2K_DEFAULTS=0\"}"),
+            "master OFF suppresses explicit split-load ON");
+        ::unsetenv("STRIX_QPF2K_DEFAULTS");
+        expect(has(items(sized, true), "\"STRIX_QSA_SCORE_SPLIT_LOADS\":{\"enabled\":false,\"suppression\":\"gsq\"}"),
+            "GSQ suppresses explicit split-load ON");
+        qpf2k::baseline = true;
+        expect(has(items(sized, false), "\"STRIX_QSA_SCORE_SPLIT_LOADS\":{\"enabled\":false,\"suppression\":\"baseline\"}"),
+            "baseline suppresses explicit split-load ON");
+        qpf2k::baseline = false;
+        ::unsetenv("STRIX_QSA_SCORE_SPLIT_LOADS");
+        expect(has(items(sized, false), "\"STRIX_QSA_SCORE_SPLIT_LOADS\":{\"enabled\":true,\"suppression\":null}"),
+            "split loads report default ON");
         auto plain = items(sized, false);
         expect(has(plain, "\"STRIX_QSA_UNION_MERGE\":{\"enabled\":true,\"suppression\":null}") &&
             has(plain, "\"STRIX_QSA_SCORE_ROWS64\":{\"enabled\":true,\"suppression\":null}") &&
