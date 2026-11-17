@@ -66,6 +66,8 @@ constexpr ScopeRule scope_rules[] = {
     {"include/strix", "bp_codec.", false, "header of bp_codec.cpp"},
 };
 constexpr const char* exact_scope_files[] = {
+    // The MoE input transforms and their local helpers moved out of moe_core.
+    "src/hip/weight/trellis_sources.hpp",
     "cmake/StrixSession.cmake", "include/strix/serve/engine.hpp",
     "src/serve/engine.cpp", "src/serve/session_runtime.cpp"};
 void source_coverage(const fs::path& source_root = fs::path(STRIX_ROUTE_SOURCE_DIR)) {

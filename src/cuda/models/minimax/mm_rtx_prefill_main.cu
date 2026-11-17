@@ -18,7 +18,7 @@
 //                    strix-minimax-rank --offload-listen as soon as the layer is done (one sender thread per rank);
 //                    rank 0 returns the last row's token, which ends the TTFT clock
 //   --layer-cut K    prefix-resident block pipeline to --layercut-listen (one full prompt)
-//   --cut-block C --cut-act relay|direct --cut-pair-identity ID; --split/--cut share env resolution
+//   --cut-block C --cut-act relay|direct --cut-xport act-first|fifo --cut-kv-frag ROWS --cut-pair-identity ID; --split/--cut share env resolution
 //   --print-effective-config   inspect split policy without CUDA work
 //   --codec bp       hand-off frames bp-v1 encoded (lossless; the ranks decode before importing)
 //   --replay-state DIR --send ...  no GPU: stream DIR/state-NAME-rank<r>.bin (a finished prefill) layer by layer to the
@@ -31,6 +31,7 @@
 #include "minimax/rtxpf/fp32_identity.hpp"
 #include "strix/bp_codec.hpp"
 #include "strix/minimax_layercut.hpp"
+#include "strix/handoff_lanes.hpp"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -426,7 +427,7 @@ int main(int argc, char** argv) {
         bool print_effective = false;
         std::string cut_pair_identity = "default";
         std::string send_to;
-        bool codec_bp = false;
+        bool codec_bp = false, abab_xport = false;
         int resident = -1, pinned_n = -1;
         std::string replay_dir, blob_cache;
         struct Prompt {
@@ -445,6 +446,8 @@ int main(int argc, char** argv) {
             if (a == "--cut") { cut_cli.cut = cut_value(); continue; }
             if (a == "--cut-block") { cut_cli.block = cut_value(); continue; }
             if (a == "--cut-act") { cut_cli.act = cut_value(); continue; }
+            if (a == "--cut-xport") { cut_cli.xport = cut_value(); continue; }
+            if (a == "--cut-kv-frag") { cut_cli.kv_frag = cut_value(); continue; }
             if (a == "--cut-pair-identity") { cut_pair_identity = cut_value(); continue; }
             if (a == "--print-effective-config") { print_effective = true; continue; }
             if (a == "--layers") { n_layers = static_cast<unsigned>(std::stoul(argv[++i])); continue; }
@@ -452,6 +455,7 @@ int main(int argc, char** argv) {
             if (a == "--repeat") { repeat = static_cast<unsigned>(std::stoul(argv[++i])); continue; }
             if (a == "--send") { send_to = argv[++i]; continue; }
             if (a == "--codec") { codec_bp = std::string(argv[++i]) == "bp"; continue; }
+            if (a == "--abab-xport") { abab_xport = true; continue; }  // bench: layer-cut runs alternate xport (the resolved one first)
             if (a == "--replay-state") { replay_dir = argv[++i]; continue; }
             if (a == "--pinned") { pinned_n = std::stoi(argv[++i]); continue; }
             if (a == "--blob-cache") { blob_cache = argv[++i]; continue; }
@@ -669,7 +673,7 @@ int main(int argc, char** argv) {
         }
 
         if (layer_cut) {
-            run_layercut(cut_cfg, st, table, w_in0, rope_d, prompts[0].tokens, send_to, cut_pair_identity, repeat, codec_bp);
+            run_layercut(cut_cfg, st, table, w_in0, rope_d, prompts[0].tokens, send_to, cut_pair_identity, repeat, codec_bp, abab_xport);
             return 0;
         }
         // groups: gate mode = all prompts batched in one pass; timing mode = one prompt at a time

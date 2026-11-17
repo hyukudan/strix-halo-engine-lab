@@ -2572,11 +2572,35 @@
         "load_u32",
         "reader",
         "rows",
-        "scale",
         "transform_block",
         "transform_block_at",
         "transform_block_values",
         "volatile"
+      ],
+      "images": [
+        "exl3.mul1.tiles16",
+        "exl3.gemma.transport"
+      ]
+    },
+    {
+      "id": "hip-trellis:src/hip/weight/trellis_sources.hpp",
+      "source": "src/hip/weight/trellis_sources.hpp",
+      "backend": "hip",
+      "formats": [],
+      "arithmetic": "trellis-mul1-legacy; Gemma g4-exl3-v1 v2 v3 WMMA-pf-v1 addressing only",
+      "migration": "P08",
+      "owner": "shared-weight-layer-maintainer",
+      "status": "migrated",
+      "capture": "legacy-public-entrypoint",
+      "operations": [
+        "STRIX_WFMT_GEMMA_SOURCE",
+        "input_block",
+        "kernels",
+        "scale",
+        "suh_bytes",
+        "svh_bytes",
+        "tile",
+        "tiles16"
       ],
       "images": [
         "exl3.mul1.tiles16",
@@ -5232,6 +5256,7 @@
     "src/hip/weight/gsq_group_codec.hpp",
     "src/hip/weight/gsq_plan.hpp",
     "src/hip/weight/gsq_sources.hpp",
+    "src/hip/weight/trellis_sources.hpp",
     "src/hip_deepseek41_batch_forward.hip",
     "src/hip_ds41_formats.hip",
     "src/hip_ds41_layer.hip",
