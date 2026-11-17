@@ -24,7 +24,8 @@ int main() try {
         if (setenv(key, value, 1) != 0) throw std::runtime_error("set test env");
 #endif
     };
-    for (const char* key : {"STRIX_SPLIT", "STRIX_SPLIT_CUT", "STRIX_SPLIT_BLOCK", "STRIX_SPLIT_ACT"}) set_env(key, "");
+    for (const char* key : {"STRIX_SPLIT", "STRIX_SPLIT_CUT", "STRIX_SPLIT_BLOCK", "STRIX_SPLIT_ACT", "STRIX_SPLIT_XPORT",
+                            "STRIX_SPLIT_KV_FRAG"}) set_env(key, "");
     require(lc::resolve({}, input).split == lc::chain::Split::device_only, "envcfg default");
     set_env("STRIX_SPLIT", "layer-cut"); set_env("STRIX_SPLIT_CUT", "7");
     require(lc::resolve({}, input).cut == 7, "actual envcfg lookup");
@@ -37,7 +38,7 @@ int main() try {
     std::map<std::string, std::string> env;
     auto lookup = [&](const char* k) -> const char* { auto it = env.find(k); return it == env.end() ? nullptr : it->second.c_str(); };
     auto r = lc::resolve({}, input, lookup);
-    require(r.split == lc::chain::Split::device_only && r.block == 2048 && r.act == lc::Act::relay, "default route");
+    require(r.split == lc::chain::Split::device_only && r.block == 2048 && r.act == lc::Act::link, "default route");
     require(r.lines.find("split split device-only (default)") != std::string::npos, "default origin");
     env = {{"STRIX_SPLIT", "layer-cut"}, {"STRIX_SPLIT_CUT", "12"}, {"STRIX_SPLIT_BLOCK", "512"}, {"STRIX_SPLIT_ACT", "direct"}};
     r = lc::resolve({}, input, lookup);
@@ -127,6 +128,63 @@ int main() try {
     for (auto desc : lc::blocks(m.rows, m.block)) {
         act_only.accept({lc::kAct, b++, strix::handoff::kRelay, desc.row0, desc.rows}, std::size_t{desc.rows} * 24576, 1280);
         for (unsigned l = 0; l < m.cut; ++l) kv_only.accept({lc::kKv, l, 0, desc.row0, desc.rows}, std::size_t{desc.rows} * 1280, 1280);
+    }
+    // Meta v2 (act-first): ACT blocks in block order; KV of each layer in contiguous row fragments, interleaved freely
+    // with ACT and other layers; no gap, no duplicate, END needs both coverages. expected.version 0 = follow the producer.
+    {
+        auto m2 = m; m2.version = lc::kMetaV2;
+        auto any = m; any.version = 0;
+        lc::validate(m2, any, 60); lc::validate(m, any, 60);
+        auto v3 = m; v3.version = 3;
+        rejects([&] { lc::validate(v3, any, 60); }, "version");
+        rejects([&] { lc::validate(m, m2, 60); }, "version");
+        for (bool relay : {false, true}) {
+            lc::Pieces order(m2, true, true, relay);
+            const auto sched = lc::blocks(m2.rows, m2.block);
+            // KV of layer 1 rows [0,16) before any ACT; then every ACT; then the rest in reverse layer order, 8-row fragments
+            order.accept({lc::kKv, 1, 0, 0, 16}, 16 * 1280, 1280);
+            std::uint32_t bb = 0;
+            for (auto desc : sched)
+                order.accept({lc::kAct, bb++, relay ? strix::handoff::kRelay : 0U, desc.row0, desc.rows}, std::size_t{desc.rows} * 24576, 1280);
+            rejects([&] { order.finish(); }, "incomplete KV");
+            for (unsigned l = m2.cut; l-- > 0;)
+                for (std::uint64_t row = l == 1 ? 16 : 0; row < m2.rows; row += 8) {
+                    const auto rows = std::min<std::uint64_t>(8, m2.rows - row);
+                    order.accept({lc::kKv, l, 0, row, rows}, static_cast<std::size_t>(rows) * 1280, 1280);
+                }
+            order.finish();
+        }
+        lc::Pieces v2(m2, true, true, false);
+        v2.accept({lc::kKv, 1, 0, 0, 16}, 16 * 1280, 1280);
+        rejects([&] { v2.accept({lc::kKv, 1, 0, 0, 16}, 16 * 1280, 1280); }, "KV piece");       // duplicate
+        rejects([&] { v2.accept({lc::kKv, 0, 0, 8, 8}, 8 * 1280, 1280); }, "KV piece");         // gap
+        rejects([&] { v2.accept({lc::kKv, 0, 0, 0, 20}, 20 * 1280, 1280); }, "KV piece");       // past the prompt
+        rejects([&] { v2.accept({lc::kKv, 0, 0, 0, 8}, 8 * 1280 - 1, 1280); }, "KV piece");     // size
+        rejects([&] { v2.accept({lc::kKv, m2.cut, 0, 0, 8}, 8 * 1280, 1280); }, "piece");       // layer
+        rejects([&] { v2.accept({lc::kKv, 0, strix::handoff::kRelay, 0, 8}, 8 * 1280, 1280); }, "piece");
+        rejects([&] { v2.accept({lc::kAct, 1, 0, 16, 3}, 3 * 24576, 1280); }, "ACT piece");     // ACT out of order
+        v2.accept({lc::kAct, 0, 0, 0, 16}, 16 * 24576, 1280);
+        rejects([&] { v2.accept({lc::kAct, 1, 0, 16, 3}, 3 * 24576 + 4, 1280); }, "ACT piece"); // ACT size
+        rejects([&] { v2.finish(); }, "incomplete ACT");
+        lc::Pieces kv_only2(m2, false, true, false);
+        rejects([&] { kv_only2.accept({lc::kAct, 0, 0, 0, 16}, 16 * 24576, 1280); }, "ACT piece");
+        lc::Pieces act_only2(m2, true, false, true);
+        rejects([&] { act_only2.accept({lc::kKv, 0, 0, 0, 16}, 16 * 1280, 1280); }, "piece");
+        act_only2.accept({lc::kAct, 0, strix::handoff::kRelay, 0, 16}, 16 * 24576, 1280);
+        act_only2.accept({lc::kAct, 1, strix::handoff::kRelay, 16, 3}, 3 * 24576, 1280);
+        act_only2.finish();
+        // resolver: act-first by default, fifo = the v1 off switch, fragments are multiples of 16
+        for (const char* key : {"STRIX_SPLIT", "STRIX_SPLIT_CUT", "STRIX_SPLIT_BLOCK", "STRIX_SPLIT_ACT", "STRIX_SPLIT_XPORT",
+                                "STRIX_SPLIT_KV_FRAG"}) set_env(key, "");
+        require(lc::resolve({}, input).xport == lc::Xport::act_first && lc::resolve({}, input).kv_frag == 1024, "xport default");
+        lc::Cli fifo; fifo.xport = "fifo"; fifo.kv_frag = "256";
+        require(lc::resolve(fifo, input).xport == lc::Xport::fifo && lc::resolve(fifo, input).kv_frag == 256, "xport cli");
+        lc::Cli bad_frag; bad_frag.kv_frag = "100";
+        rejects([&] { (void)lc::resolve(bad_frag, input); }, "STRIX_SPLIT_KV_FRAG");
+        lc::Cli lk; lk.act = "link";
+        require(lc::resolve(lk, input).act == lc::Act::link && std::string(lc::act_name(lc::Act::link)) == "link", "act link");
+        lc::Cli bad_x; bad_x.xport = "lifo";
+        rejects([&] { (void)lc::resolve(bad_x, input); }, "STRIX_SPLIT_XPORT");
     }
     kv_only.finish(); act_only.finish();
     // Verify scatter reconstructs all three component planes, including a short tail.

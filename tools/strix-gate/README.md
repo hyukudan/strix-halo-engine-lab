@@ -218,11 +218,29 @@ execution or a deliberately rewritten manifest. CLI engine/profile labels are
 checked against the sealed witness. This change defines the consumer contract;
 it does not add a native witness producer. Runs without producer evidence cannot
 use the floor rule; do not create evidence by relabelling existing runs.
+
+Producer: `strix-deepseek41-prefill-quality MODEL manifest.tsv OUT RANK BUDGET GATE_DIR` (gate mode). Per prompt
+of n tokens each arm prefills P = (n - 64) / 128 * 128 rows from position 0 with the arm's policy (the
+exact suffix replay, or `fast3b<R>`'s bounded decoder replay), then teacher-forces the 64 rows [P, P + 64)
+from that state. Rank 0 writes 65 rows per prompt (the prefill's last row, then the 64) as
+`GATE_DIR/<arm>/q-<prompt>-tf-r0.f32`, the prompt's first P + 64 tokens as `GATE_DIR/tok/<prompt>.u32` and
+`GATE_DIR/<arm>/execution-r0.json` from the executed configuration (profile `exact` for `exact` and the
+`n_l0_s<seed>` layer-0 nulls, `fast-prefill` for `fast3` / `fast3b<R>`). When the prompts run in several
+processes (one per GPU ticket), `merge_parts.py RUNDIR RUN ARM...` joins the per-process witnesses of an arm
+(refusing any disagreement on binary, model, numerical configuration, profile or control, a prompt in two
+parts, or a dump that no longer matches its entry) into one with `run_id` `RUN-ARM`; then `seal --rows 65
+--execution-witness` and `compare --ranks 0`.
 Mean plus two sample standard deviations from three controls is an empirical
 policy threshold, not a confidence bound or model-fidelity result. Synthetic
 host tests establish validation and arithmetic only; compiler, native execution,
 model fidelity and complete-workload qualification remain separate gates.
 
+DS41 gate arms explicitly disable inherited decoder replay unless their label sets a bound.
+Witnesses record the resolved replay mode and hash the actual target and effective overlay
+contents; both ranks must agree on that content. The producer uses `row_split=false` and
+128-aligned prefill boundaries. Its evidence does not qualify row-split serving or arbitrary
+tails. Whole-run replay rejects snapshots, group passes and decoder deferral; serving needs
+an explicit admission contract for scheduler/cache operations before qualification.
 ### Onset-matched floor (MiniMax FAST prefill)
 
 ```sh
@@ -248,8 +266,11 @@ prompts and reference) the candidate must pass all of (`MM_FLOOR` in the script)
 
 The absolute KL / top-1 / dNLL verdict is printed and stored (`pooled.abs_pass`) as a reference.
 The candidate must differ from the reference only in its FAST layer set: every receipt lever other
-than `minimax.msa_flash` must be equal, and so must every recorded switch outside the explicit
-FAST allowlist (`STRIX_MM_PF_MSA_FLASH`, `STRIX_MM_PF_MSA_FLASH_LAYERS`, `STRIX_MM_FAST_PREFILL`).
+than `minimax.msa_flash` / `minimax.linear_order` must be equal, and so must every recorded switch outside
+the explicit FAST allowlist (`STRIX_MM_PF_MSA_FLASH`, `STRIX_MM_PF_MSA_FLASH_LAYERS`, `STRIX_MM_FAST_PREFILL`,
+`STRIX_MMX_PF_ORDER`). The chunk-invariant linear order (`minimax.linear_order` =
+`invariant:mmx-pf-linear-s1-v1`) changes MoE / dense rounding in every layer, so its FAST layer set is all 60 layers:
+onset 0, layer-0 one-ulp nulls, and an exact reference that differs only by `STRIX_MMX_PF_ORDER`.
 Receipts omit defaulted switches and cannot distinguish them from unconsulted switches; a
 one-sided entry outside that allowlist is therefore refused, even if it explicitly selects a default.
 Mean + 2 sd of three controls is a policy threshold, not a bound: a candidate drawn exactly like

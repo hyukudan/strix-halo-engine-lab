@@ -25,7 +25,10 @@ using ::strix::profile::kind_name;
 using ::strix::profile::status_name;
 #include "strix/qwen_profile_table.hpp"
 inline std::span<const Lever> levers() { return table; }
-inline Name parse(std::string_view value) { return ::strix::profile::parse(value); }  // default|fast|quality|turbo
+inline Name parse(std::string_view value) {
+    if (value == "exact") return Name::standard;
+    return ::strix::profile::parse(value);
+}  // default|fast|quality|turbo
 inline constexpr std::string_view kTurboVersion = "qwen-turbo-v1";
 // Weight sources this build loads under turbo (onfly / converted flip to runnable with their loaders).
 inline constexpr ::strix::profile::turbo::WeightCaps kWeightCaps{
@@ -134,7 +137,18 @@ struct Inputs {
     Lookup env;
     bool allow_pending = false;
     ::strix::profile::turbo::WeightsRequest weights{};  // --turbo-weights / --turbo-weight-bits / --turbo-weights-pack
+    // What the calling backend loads (nullptr: kWeightCaps of the HIP engine). The CUDA engine passes kCudaWeightCaps.
+    const ::strix::profile::turbo::WeightCaps* caps = nullptr;
 };
+// CUDA engine (sm_120): onfly 4-bit = NVFP4 images of the dense Q8_0 roles (src/cuda/qwen_prefill_driver.cu
+// convert_onfly, shared core strix/cuda/core/nvfp4_a8.hpp); converted packs need the owner's OK (pending).
+inline constexpr ::strix::profile::turbo::WeightCaps kCudaWeightCaps{
+    {true, true, false},
+    {false, false, false, false, true, false, false, false, false},
+    "rtn-g16",
+    "nvfp",
+    "onfly low-bit load is not implemented in this build",
+    "converted low-bit pack loader is not implemented in this build (needs the owner's OK)"};
 using ::strix::profile::environment;
 // Export provenance survives a future re-exec. A changed inherited value
 // is explicit again; matching profile exports retain their original status.
@@ -147,7 +161,7 @@ inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<con
     const char* allow = environment(inputs.env, "STRIX_QWEN_PROFILE_ALLOW_PENDING");
     const bool allow_pending = inputs.allow_pending || (allow && std::string_view(allow) == "1");
     out.weights = ::strix::profile::turbo::resolve_weights(out.is_turbo(), inputs.weights,
-        [&inputs](const char* key) { return environment(inputs.env, key); }, kWeightCaps);
+        [&inputs](const char* key) { return environment(inputs.env, key); }, inputs.caps ? *inputs.caps : kWeightCaps);
     for (const auto& lever : rows) {
         const auto column = ::strix::profile::value_column(lever, profile);  // empty turbo cell: the fast cell
         const std::string* cli = nullptr;
@@ -244,7 +258,8 @@ inline bool metadata_environment(std::string_view key) {
 inline bool policy_option(std::string_view key) {
     return key == "--profile" || key == "--allow-pending";
 }
-inline bool take_option(int argc, char** argv, int& i, std::optional<Name>& profile, Inputs& inputs) {
+inline bool take_option(int argc, char** argv, int& i, std::optional<Name>& profile, Inputs& inputs,
+        std::span<const Lever> rows = levers()) {
     const std::string_view arg = argv[i];
     const auto equal = arg.find('=');
     const auto key = arg.substr(0, equal);
@@ -259,7 +274,7 @@ inline bool take_option(int argc, char** argv, int& i, std::optional<Name>& prof
         return true;
     }
     const Lever* lever = nullptr;
-    for (const auto& row : levers()) if (!row.native_option && key == row.option) lever = &row;
+    for (const auto& row : rows) if (!row.native_option && key == row.option) lever = &row;
     if (key != "--profile" && !lever) return false;
     const auto value = equal != std::string_view::npos ? arg.substr(equal + 1U) :
         (i + 1 < argc ? std::string_view(argv[++i]) : std::string_view{});

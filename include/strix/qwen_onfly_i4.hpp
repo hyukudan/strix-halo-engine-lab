@@ -2,6 +2,7 @@
 // Host-only census of the TURBO+ onfly INT4 copies (candidate tensors and reserved device bytes), shared by the
 // prefill admission plan, the effective-config print and the loader (hip_qwen_onfly_i4.cpp).
 #include "core/iu4_onfly.hpp"
+#include "core/iu4_rows_plan.hpp"
 #include "strix/model_manifest.hpp"
 #include "strix/onfly_i4.hpp"
 

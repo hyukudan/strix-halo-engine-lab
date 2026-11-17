@@ -9,7 +9,7 @@ inline bool has_startup_handshake(unsigned world, const std::string& xch, bool d
     return world == 2 && xch == "comm" && decode && !reference_gate;
 }
 // Teacher-forced scoring (--tf) on two comm ranks also runs the agreement so the per-rank FAST prefill switches
-// (kPfWmmaConfig/kPfAttnWmmaConfig/kPfKdaWmmaConfig) are verified. Rows stay on the no-handshake fallback (fixed, never promoted),
+// (kPfWmmaConfig/kPfAttnWmmaConfig/kPfKdaWmmaConfig/kPfIdxProjWmmaConfig/kPfRouterWmmaConfig) are verified. Rows stay on the no-handshake fallback (fixed, never promoted),
 // so the agreement only checks config bits there; both ranks run the same --tf command and reach the same merges.
 // Chunked-prefill TTFT (--pf-ttft) uses the same config-only agreement, so world-2 FAST prefill runs warm and cold pairs in one
 // process; its rows also stay on the fixed fallback (has_startup_handshake is false there) and no exchange is added.
@@ -33,6 +33,7 @@ inline constexpr std::uint32_t kFastI4Config = 1U << 13;  // STRIX_GLM_MODEL_FOR
 inline constexpr std::uint32_t kPfAttnWmmaConfig = 1U << 14;  // FAST attention core (glm-pf-attn-wmma) on this rank
 inline constexpr std::uint32_t kPfKdaWmmaConfig = 1U << 17;  // FAST KDA projections (glm-pf-kda-wmma-v1) on this rank
 inline constexpr std::uint32_t kPfIdxProjWmmaConfig = 1U << 18;  // FAST indexer projections (glm-pf-idxproj-wmma-v1)
+inline constexpr std::uint32_t kPfRouterWmmaConfig = 1U << 20;  // FAST prefill router product (glm-pf-router-wmma-v1) on this rank
 inline constexpr std::uint32_t kPfMlaWmmaConfig = 1U << 19;  // FAST MLA absorb/out GEMMs (glm-pf-mla-wmma-v1) on this rank
 inline constexpr unsigned kIdxWmmaShift = 15;  // 2 bits: STRIX_IDX_WMMA mode (0 off, 1 bf16, 2 f16) on this rank
 

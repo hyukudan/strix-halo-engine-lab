@@ -1457,6 +1457,13 @@ int main() try {
     std::thread http_thread([&] { server.serve(); });
     std::thread engine_thread([&] { queue.run(engine); });
     const std::string auth = "Authorization: Bearer secret\r\n";
+    for (const char* value : {"1.5", "1e100", "1e999", "-1", "17", "true", "\"8\""}) {
+        const auto reply = http(port, "POST", "/v1/completions",
+            std::string("{\"model\":\"test-model\",\"prompt\":\"hello\",\"max_tokens\":1,\"window_rows\":") + value + "}", auth);
+        const auto error = parse_json(reply.body);
+        check(reply.status == 400 && at(at(error, "error"), "type").as_string() == "invalid_request_error" &&
+              at(at(error, "error"), "param").as_string() == "window_rows", "invalid window_rows is a client error");
+    }
     const auto first_choice = [](const Json& j) -> const Json& { return at(j, "choices").as_array().at(0); };
     for (const bool server_default : {false, true}) {
         const auto headers = auth + std::string("X-Test-Config: thinking-") + (server_default ? "on" : "off") + "\r\n";
