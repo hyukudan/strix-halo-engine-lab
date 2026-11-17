@@ -75,6 +75,10 @@ struct Config {
     strix::residency::Options residency;
     // false: run() keeps the state on the device only (no D2H staging, no pieces): a decode session that never hands off.
     bool export_state = true;
+    // prefill_chunk (decode sessions): the MTP predictor rows of the block that completes the prompt are not computed
+    // before the chunk returns but later, as the identical single call on the engine stream (see mtp_deferred()), so
+    // the first verify window does not wait for draft-only work. Same bits in every row; off = computed in the chunk.
+    bool defer_prompt_mtp = false;
     // Explicit unqualified CUDA A8 route-storage candidate. Omitted: environment;
     // false: individual OFF. Baseline/defaults/exact masters always suppress it.
     std::optional<bool> moe_route_bf16;
@@ -332,6 +336,13 @@ public:
     // draft attention (each session's MTP KV/index/pooled cache and position), routed Q8 experts and the selection run per
     // session. Every chain equals draft(session, ...) bit for bit (tokens and probabilities). Results in request order.
     std::vector<Draft> draft_cohort(const std::vector<DraftRequest>& requests);
+    // Config::defer_prompt_mtp: true while the session's prompt MTP rows are still to be computed. They only feed draft
+    // chains, so a caller may verify the pending token alone (no draft) first. Every reader of those rows (draft,
+    // draft_cohort, row export, snapshots) and every prefill that reuses the block buffers computes them first;
+    // a fresh prefill, an import, a resize or a destroy of the session discards them.
+    bool mtp_deferred(SessionId session) const;
+    // Enqueues the session's deferred MTP rows on the engine stream (no host wait); no-op when none are deferred.
+    void mtp_settle(SessionId session);
     // CUDA graphs of the verify windows (default: on unless STRIX_QRTX_GRAPHS=0). Graphs are keyed by the cohort layout
     // (session, rows, GDN buffer parity per entry), one eager warm-up per key first, LRU-capped (STRIX_QRTX_GRAPH_CACHE).
     void set_graphs(bool on);
