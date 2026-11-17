@@ -16,6 +16,11 @@
 // BOs are TTM pages, not movable); STRIX_HOST_ANON_PIN=1/0 forces it. Only allocations of at least kMinBytes take the
 // pinned path: small buffers are revalidated cheaply and keep hipHostMalloc. If the mlock or the long-term pin is
 // refused (RLIMIT_MEMLOCK), the allocation falls back to the exact hipHostMalloc: an unpinned anon range buys nothing.
+//
+// The runtime's own host memory (queues, kernel arguments, signals, code objects, buffers below kMinBytes) stays on
+// shmem userptr pages the lever cannot re-home: start_runtime_map_lock() keeps those maps mlocked (host_map_lock.hpp)
+// from the start gate on, under the same lever.
+#include "strix/host_map_lock.hpp"
 #include "strix/lever.hpp"
 
 #include <hip/hip_runtime.h>
@@ -26,10 +31,12 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <map>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace strix::host_pin {
@@ -116,6 +123,29 @@ inline hipError_t release(void* host) noexcept {
     if (rec.ring >= 0) ::close(rec.ring);
     ::munmap(host, rec.bytes);
     return e;
+}
+
+// The runtime's shmem host maps mlocked on fault (host_map_lock.hpp): one pass now, then one every 500 ms for the
+// maps the runtime creates later (stream queues, lazily allocated tables). A pass reads /proc/self/maps once and calls
+// mlock2 only for a map that is new; nothing is populated. Once per process; a no-op while the lever is off.
+inline void start_runtime_map_lock(std::FILE* receipt) {
+    if (!enabled()) return;
+    static std::once_flag once;
+    std::call_once(once, [receipt] {
+        auto* tracker = new host_map_lock::Tracker();  // lives as long as the process (the pass thread is detached)
+        const host_map_lock::Pass first = host_map_lock::lock_runtime_shared_maps(*tracker);
+        if (receipt != nullptr) {
+            std::fprintf(receipt, "host map lock: %zu runtime shmem maps, %.1f MiB, mlocked on fault (refused %zu), rescan 500 ms\n",
+                         first.maps, static_cast<double>(first.bytes) / 1048576.0, first.refused);
+            std::fflush(receipt);
+        }
+        std::thread([tracker] {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                (void)host_map_lock::lock_runtime_shared_maps(*tracker);
+            }
+        }).detach();
+    });
 }
 
 // One receipt line (bytes held on the pinned path, how many lost the mlock or the pin).

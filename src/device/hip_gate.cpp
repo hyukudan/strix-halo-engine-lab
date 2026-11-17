@@ -1,6 +1,7 @@
 #include "strix/device/hip_gate.hpp"
 
 #include "strix/device/hip_enumerator.hpp"
+#include "strix/pinned_host.hpp"
 #include "strix/power/sampler.hpp"
 #include "strix/route_receipt.hpp"
 
@@ -59,6 +60,13 @@ void bind_hip_main(int& argc, char** argv, std::FILE* receipt, CodeLoad code_loa
         std::fprintf(stderr, "%s\n", e.what());
         std::fflush(stderr);
         std::exit(2);
+    }
+    // The runtime's shmem host maps (queues, kernel arguments, code objects) off the reclaim LRU, and out of compaction
+    // under vm.compact_unevictable_allowed=0: a migrated page evicts every queue of the process (pinned_host.hpp).
+    try {
+        strix::host_pin::start_runtime_map_lock(receipt);
+    } catch (const std::exception& e) {
+        if (receipt) std::fprintf(receipt, "host map lock: not started (%s)\n", e.what());
     }
 }
 
