@@ -678,8 +678,9 @@ void test_split_frame() {
     namespace sx = strix::xport;
     const auto& row = md::split_frame_row();
     check(std::string(row.name) == "mm_split_frame" && row.regime.crossover == 4, "split frame row");
-    const auto automatic = sx::split_frame_policy(row, nullptr);
-    check(!automatic.on(1) && !automatic.on(3) && automatic.on(4) && automatic.on(8), "split frame auto crossover 4 rows");
+    const auto unset = sx::split_frame_policy(row, nullptr);
+    check(!unset.on(1) && !unset.on(4) && !unset.on(8) && !unset.on(1024), "unqualified split frame stays off by default");
+    check(!sx::split_frame_policy(row, "").on(8), "empty split frame stays off");
     check(!sx::split_frame_policy(row, "0").on(8), "split frame explicit 0");
     check(sx::split_frame_policy(row, "1").on(2) && !sx::split_frame_policy(row, "1").on(1), "split frame explicit 1, never 1 row");
     bool rejected = false;
@@ -695,7 +696,7 @@ void test_split_frame() {
     const auto a = md::split_frame_policy();
     (void)md::print_or_apply("serve", 5, serve_argv);
     const auto b = md::split_frame_policy();
-    check(a.mode == b.mode && a.crossover == b.crossover && a.mode == automatic.mode, "rank and serve resolve the same split policy");
+    check(a.mode == b.mode && a.crossover == b.crossover && a.mode == unset.mode, "rank and serve resolve the same split policy");
 }
 
 // FAST prefill profile (mm_profile_table.hpp): bundle expansion, explicit-OFF precedence, FAST_I4 exclusion, legacy

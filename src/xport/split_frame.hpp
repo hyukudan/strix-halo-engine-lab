@@ -70,20 +70,21 @@ struct SplitFramePolicy {
     }
 };
 
-// `raw`: the switch text (nullptr / empty = automatic, "0", "1"; anything else throws, like lever::select).
+// No production regime is qualified yet: unset/empty stays OFF. Explicit 0/1 retains the diagnostic controls.
+// The crossover is a pending hypothesis, not admission evidence; activate automatic mode only after real route qualification.
 [[nodiscard]] inline SplitFramePolicy split_frame_policy(const lever::Decl& row, const char* raw) {
     const lever::Choice c = lever::select(row, lever::Inputs{1}, raw);  // validates the text
     SplitFramePolicy p;
     p.crossover = row.regime.crossover;
     if (c.origin == lever::Origin::explicit_switch) p.mode = c.on ? SplitFramePolicy::Mode::on : SplitFramePolicy::Mode::off;
-    else p.mode = SplitFramePolicy::Mode::automatic;
+    else p.mode = SplitFramePolicy::Mode::off;
     return p;
 }
 
 // Reads the process environment once and records the decision for --print-effective-config.
 [[nodiscard]] inline SplitFramePolicy split_frame_policy(const lever::Decl& row) {
     const std::string env(row.env);
-    const char* raw = std::getenv(env.c_str());
+    const char* raw = strix::envcfg::text(env.c_str());
     const SplitFramePolicy p = split_frame_policy(row, raw);
     envcfg::record(env.c_str(), raw != nullptr && *raw != '\0' ? raw : nullptr, p.describe());
     return p;

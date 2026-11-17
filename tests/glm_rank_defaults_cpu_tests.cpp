@@ -214,10 +214,10 @@ void test_item_off_switches() {
     CHECK(m1.mtp.value == "1" && m1.prefill == "ref");
     CHECK(resolve(cat(plain, {"--decode-xch", "comm"}), {}).decode_xch.value == "comm");
     CHECK(resolve(plain, {{"STRIX_GLM_DECODE_XCH", "comm"}}).decode_xch.value == "comm");
-    {   // glm_split_frame (xport/split_frame.hpp): automatic from 4 rows, one resolution for CLI and serve
+    {   // glm_split_frame (xport/split_frame.hpp): pending route stays OFF, one resolution for CLI and serve
         const auto sf = resolve(plain, {});
-        CHECK(sf.split_frame.source == "default" && sf.split_policy.mode == strix::xport::SplitFramePolicy::Mode::automatic);
-        CHECK(!sf.split_policy.on(1) && !sf.split_policy.on(3) && sf.split_policy.on(4) && sf.split_policy.on(8));
+        CHECK(sf.split_frame.source == "default" && sf.split_policy.mode == strix::xport::SplitFramePolicy::Mode::off);
+        CHECK(!sf.split_policy.on(1) && !sf.split_policy.on(3) && !sf.split_policy.on(4) && !sf.split_policy.on(8));
         CHECK(resolve(plain, {{"STRIX_XPORT_SPLIT_ROWS", "0"}}).split_policy.mode == strix::xport::SplitFramePolicy::Mode::off);
         const auto forced = resolve(plain, {{"STRIX_XPORT_SPLIT_ROWS", "1"}});
         CHECK(forced.split_frame.source == "explicit" && forced.split_policy.on(2) && !forced.split_policy.on(1));
