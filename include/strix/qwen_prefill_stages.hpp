@@ -57,10 +57,19 @@ inline std::vector<pair::StageStep> local_order(std::uint32_t stages, std::uint6
 
 // Even map of 2v stages over `layers` whole layers (identity emulation and the v > 1 default before a measured table).
 inline pair::StageMap even_map(std::uint32_t v, std::uint32_t layers) {
-    if (v == 0U || 2U * v > layers) throw std::invalid_argument("qwen stage map: bad virtual stage count");
+    if (v == 0U || v > layers / 2U) throw std::invalid_argument("qwen stage map: bad virtual stage count");  // no 2v wrap
     pair::StageMap map;
-    for (std::uint32_t s = 0; s <= 2U * v; ++s) map.cuts.push_back(pair::StageCut(s * layers / (2U * v)));
+    const std::uint64_t stages = 2ULL * v;
+    for (std::uint64_t s = 0; s <= stages; ++s) map.cuts.push_back(pair::StageCut(static_cast<std::uint32_t>(s * layers / stages)));
     map.validate(layers);
     return map;
+}
+
+// A serial row has no seam (the pair path refuses such a plan too): with more than one stage, every stage step would
+// run its whole model for that row on the one emulated session. One stage runs the plan as the unsplit step loop.
+inline void require_stage_seams(std::uint32_t stages, std::uint64_t serial_rows) {
+    if (stages > 1U && serial_rows)
+        throw std::invalid_argument("stage emulation plan has " + std::to_string(serial_rows) +
+            " serial rows (no seam for a serial row; the tail owners must cover the prompt on the 16-row grain)");
 }
 } // namespace strix::qwen_pp

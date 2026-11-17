@@ -712,6 +712,19 @@ void stage_checks() {
     bool threw = false;
     try { (void)strix::qwen_pp::stage_range(map, 6U); } catch (const std::out_of_range&) { threw = true; }
     require(threw);
+    // virtual stage counts: 0, more than layers / 2 and the values whose 2v wraps (to 0: a division by zero) are refused
+    for (const std::uint32_t bad : {0U, 25U, 0x80000000U, 0x80000001U, 0xFFFFFFFFU}) {
+        bool refused = false;
+        try { (void)strix::qwen_pp::even_map(bad, 48U); } catch (const std::invalid_argument&) { refused = true; }
+        require(refused);
+    }
+    require(strix::qwen_pp::even_map(24U, 48U).text().size() > 0U && strix::qwen_pp::even_map(24U, 48U).stages() == 48U);
+    // serial tail rows: refused when split into stages, accepted unsplit or when the tail owners cover the prompt
+    bool serial_refused = false;
+    try { strix::qwen_pp::require_stage_seams(2U, 5U); } catch (const std::invalid_argument&) { serial_refused = true; }
+    require(serial_refused);
+    strix::qwen_pp::require_stage_seams(1U, 5U);
+    strix::qwen_pp::require_stage_seams(6U, 0U);
     // Every (s, c) once; (s-1, c) and (s, c-1) before (s, c).
     for (const std::uint64_t chunks : {1ULL, 3ULL, 4ULL, 9ULL}) {
         const auto order = strix::qwen_pp::local_order(6U, chunks);

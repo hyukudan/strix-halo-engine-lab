@@ -5875,6 +5875,8 @@ static int run_decode_entry(
             for (auto& tail : known_tail_backends)  // only owners smaller than the emulated tile
                 if (tail->logical_rows() < emulate_req.logical_rows) emulate_chunks.set_tail_backend(*tail);
             const auto emulate_units = emulate_chunks.cold_plan().size();
+            strix::qwen_pp::require_stage_seams(emulate_stages,
+                strix::known_prompt_pipeline_plan(emulate_chunks.cold_plan()).serial_rows);
             std::vector<strix::KnownPromptChunkStageView> emulate_views(emulate_stages, emulate_chunks.stage_view());
             std::vector<strix::qwen_pp::StageFrontier> emulate_frontiers(emulate_stages,
                 strix::qwen_pp::StageFrontier{session.next_position, session.committed_tokens, session.arithmetic_lineage});
