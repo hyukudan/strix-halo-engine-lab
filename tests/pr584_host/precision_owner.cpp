@@ -2,6 +2,7 @@
 // The production dispatch switches (fast_dense_on in src/hip_ds41_layer.hip, fast_moe in src/hip_ds41_prefill.hip) are
 // extracted verbatim; extract.py also asserts that DevicePrefill::run_from installs its own options as the scope below.
 #include "strix/ds41_prefill_precision.hpp"
+#include "strix/prefill_dense_plan.hpp"
 
 #include <cstdio>
 #include <stdexcept>
@@ -16,6 +17,18 @@ int fast_dense_mode = -1;
 int fast_moe_mode = -1;
 #include "fast_dense_on.inc"
 #include "fast_moe.inc"
+struct DispatchView { bool exact; unsigned rows; };
+bool dense_launched = false;
+bool enqueue_fast_dense(const DispatchView& v, void*) {
+    dense_launched = v.rows >= 128U;  // supported shape; launches are stubbed
+    return dense_launched;
+}
+bool dispatch(const DispatchView& v) {
+    void* stream = nullptr;
+    dense_launched = false;
+#include "dense_dispatch.inc"
+    return true;
+}
 }  // namespace strix::ds41
 
 namespace {
@@ -28,13 +41,38 @@ struct Object {
     bool fast_dense, fast_moe;
     struct Routes { bool dense, moe; };
     Routes run() const {
-        const ds41::PrefillPrecisionScope precision_scope(ds41::PrefillPrecision{fast_dense, fast_moe});
+        const struct { ds41::PrefillPrecision options; } m{{fast_dense, fast_moe}};
+#include "execution_precision.inc"
         return {ds41::fast_dense_on(), ds41::fast_moe()};
+    }
+    bool planned_fast() const {
+        const ds41::PrefillPrecision options{fast_dense, fast_moe};
+#include "planner_fast.inc"
+    }
+    bool dispatch(bool grouped) const {
+        const struct { ds41::PrefillPrecision options; } m{{fast_dense, fast_moe}};
+#include "execution_precision.inc"
+        strix::prefill_plan::DenseRule rule;
+        rule.fast = planned_fast();
+        rule.fast_min_rows = 128U;
+        const bool exact = grouped && rule.route(160U) != strix::prefill_plan::DenseRoute::dense_fast;
+        (void)ds41::dispatch({exact, grouped ? 320U : 160U});
+        return ds41::dense_launched;
     }
 };
 }  // namespace
 
 int main() try {
+    Object first{false, false}, second{false, false};
+    for (const int mode : {-1, 0, 1}) {
+        ds41::fast_dense_mode = mode;
+        first.fast_dense = true;  // serialized OFF-to-ON of A leaves B's options alone
+        require(first.dispatch(false) && first.dispatch(true), "A solo/group take FAST despite override");
+        require(!second.dispatch(false) && !second.dispatch(true), "B solo/group stay exact after A changes");
+        second.fast_dense = true;
+        require(second.dispatch(false) && second.dispatch(true), "B solo/group switch together to FAST");
+        second.fast_dense = false;
+    }
     const Object a{true, true}, b{false, false};
     // the old set_precision_for_new_sequence of A wrote the process-wide modes; leave them as A left them
     ds41::fast_dense_mode = ds41::fast_moe_mode = 1;

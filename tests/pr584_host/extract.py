@@ -26,6 +26,8 @@ def function(marker):
 
 
 methods = function("bool flash_attn_at(") + "\n"
+if "std::uint32_t min_ratio() const" in source:
+    methods += function("std::uint32_t min_ratio() const") + "\n"
 if "void prepare_flash_mirrors()" in source:
     methods += function("void prepare_flash_mirrors()")
 (out / "methods.inc").write_text(methods)
@@ -33,6 +35,15 @@ if "void prepare_flash_mirrors()" in source:
 run_from = function("PrefillResult DevicePrefill::run_from(")
 head = run_from[:run_from.index("const strix::session::EmbedSplice embeds")]
 assert "PrefillPrecisionScope" in head and "m.options.fast_dense, m.options.fast_moe" in head, "run_from must install its own precision first"
+(out / "execution_precision.inc").write_text(re.search(r"    const ds41::PrefillPrecisionScope[^;]+;", head)[0])
+group = function("std::vector<PrefillResult> DevicePrefill::run_group(")
+assert "common = run_from(tokens, 0U);" in group, "group dispatch must use the scoped run_from"
+assert "prefill_plan::fingerprint(member_plans)" in group and "n, cls & 0xFFU, rows_fnv" in group, "exchange canonical plans, not local dense ordinals"
+assert "static_cast<std::uint32_t>(dense_fingerprint >> 32)" in group, "exchange both fingerprint words"
+classes = function("void rebuild_dense_classes()")
+assert "if (options.chunk_rows != 0U && rows > options.chunk_rows) continue;" in classes, "unrepresented multi-chunk rows stay solo"
+planner = function("prefill_plan::DensePlan dense_plan(")
+(out / "planner_fast.inc").write_text("return " + re.search(r"u.fast = ([^;]+);", planner)[1] + ";")
 # DAYAUDIT 5: export_state() after run_group (single sequence discarded: rows 0, last row "local") must refuse
 (out / "export_state.inc").write_text(function("AttentionState DevicePrefill::export_state() const"))
 exp_seq = function("static AttentionState export_sequence(")
@@ -58,6 +69,7 @@ assert end < source.index('hipEventRecord(m.chunk_ready, st)', end)
 source = read("src/core/f16_dense_q8a8.hpp")
 (out / "parts.inc").write_text(function("inline void enqueue_parts("))
 source = read("src/hip_ds41_layer.hip")
+(out / "dense_dispatch.inc").write_text(re.search(r"if \(!v.exact && fast_dense_on\(\) && enqueue_fast_dense\(v, stream\)\) return false;", source)[0])
 (out / "dense.inc").write_text(function("static strix::core::f16_dense_tall::q8a8::View fast_dense_view(")
                                  + "\n" + function("static bool enqueue_fast_dense("))
 (out / "fast_dense_on.inc").write_text(function("static bool fast_dense_on()"))
