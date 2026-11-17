@@ -4669,7 +4669,8 @@ kernel (mode 10): one work-group = 4 waves, each wave owns every fourth 16-key t
 it (bf16 WMMA QK straight from the key rows, FP32 online softmax inside the wave, bf16 WMMA PV from a wave-private
 transposed value tile), with no barrier in the key loop; the four per-wave states are merged once per row. Selection,
 block lists and the K/V caches are the exact path's. Value 1 rounds queries and probabilities to bf16 (16 WMMA per
-tile); value 2 carries both as two bf16 terms, hi + lo (32 WMMA per tile, operand rounding 2^-17 instead of 2^-9).
+tile); value 2 carries both as two bf16 terms, hi + lo (32 WMMA per tile, operand rounding max(2^-16 |x|, h) instead of
+max(2^-8 |x|, h); bounds by format and range in `src/attn_core/two_term_model.hpp`).
 
 - **Preconditions:** prefill windows of more than 8 rows with the in-block MSA mode active (`STRIX_MM_PF_MSA_REWORK` not 0); other windows keep the exact kernel.
 - **Automatic selection:** per layer when enabled: layers 40-59 use the flash core, the others the exact kernel. `STRIX_MM_PF_MSA_FLASH_LAYERS` (layer-set grammar, e.g. `30-59`) changes the layers. Unset, every layer keeps the exact kernel, so exact mode keeps its bytes. It is not a default of the FAST_I4 format: there the same layer set changes the output more than the gate allows (see evidence).

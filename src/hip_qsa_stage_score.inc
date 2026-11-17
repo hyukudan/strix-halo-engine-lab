@@ -2,7 +2,12 @@
 // All grid geometry and template choices come from the original call maximum.
 void qpf2k_stage_score_launch(const qsa_flash::ScoreGroup<64U>* descriptors,
     const void* keys, bool packed, const uint2* ranges, std::uint32_t index_dim,
-    std::uint32_t max_blocks, std::uint32_t first, std::uint32_t count, hipStream_t stream) {
+    std::uint32_t max_blocks, std::uint32_t first, std::uint32_t count, hipStream_t stream, bool allow_band = true) {
+    if (allow_band && qsa_flash::index_band()) {
+        qsa_flash::launch_index_band<64U, true>(QsaRowsScoreViews<64U>{}, keys, packed, max_blocks,
+            index_dim, nullptr, 0U, descriptors + first, count, stream);
+        return;
+    }
     constexpr unsigned W = qsa_flash::kScoreWaves;
     const auto score = [&]<unsigned R, bool S>() {
         if (packed)

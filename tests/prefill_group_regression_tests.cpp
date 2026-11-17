@@ -209,6 +209,12 @@ int main() {
     options = {}; options.fast_dense = true; options.fast_moe = true; options.fast_engram = true;
     check(!DevicePrefill::group_options_supported(options), "FAST Engram group declined");
     check(std::string(DevicePrefill::group_decline_reason(options)) == "engram-fast-flag-per-view", "FAST Engram decline names its cause");
+    options = {}; options.fast_shared = true;
+    check(!DevicePrefill::group_options_supported(options), "FAST shared expert group declined");
+    check(std::string(DevicePrefill::group_decline_reason(options)) == "shared-fast-group-unqualified", "FAST shared decline names its cause");
+    options = {}; options.fast_moe = true; options.fast_moe_f16 = true;
+    check(!DevicePrefill::group_options_supported(options), "FAST MoE FP16 operands group declined");
+    check(std::string(DevicePrefill::group_decline_reason(options)) == "moe-f16-fast-group-unqualified", "FAST MoE FP16 decline names its cause");
     dense_plan_tests();
     qualification_tests();
 

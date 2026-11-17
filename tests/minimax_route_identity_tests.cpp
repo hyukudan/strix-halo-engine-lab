@@ -5,6 +5,7 @@
 #include "minimax/engine/route_identity.hpp"
 #include "minimax/engine/mm_defaults.hpp"
 #include "minimax/rtxpf/fp32_identity.hpp"
+#include "strix/session/prefill_session.hpp"
 
 #include <array>
 #include <filesystem>
@@ -399,6 +400,57 @@ void config_receipts() {
     }
     require(receipts == 2 && entries == 2 * values.size(), "incomplete rank/serve effective-config receipts");
 }
+void refreshed_selector_proofs() {
+    const strix::session::LayerUnits units{17, 16, 2};
+    require(units.total() == 4 && units.piece_rows_at(2) == 1 &&
+            !units.all_pieces_pausable([](std::uint32_t rows) { return rows == 16; }) &&
+            units.all_pieces_pausable([](std::uint32_t rows) { return rows <= 16; }),
+            "shared prefill units must admit the short tail before starting");
+    using namespace strix::minimax::defaults;
+    for (const char* value : {"0", "1", "2", "254", "256", "510"}) {
+        const Lookup env = [value](const char* key) -> const char* {
+            return std::string_view(key) == "STRIX_MMX_PREFILL_PIPE_TAIL" ? value : nullptr;
+        };
+        bool found = false;
+        for (const auto& resolved : resolve(env))
+            if (std::string_view(resolved.item->env) == "STRIX_MMX_PREFILL_PIPE_TAIL") {
+                found = true;
+                require(resolved.value == value, "pipe-tail override must survive resolution");
+            }
+        require(found && allow("prefill-pipe-tail").category == 'a', "pipe-tail census");
+    }
+    const Lookup l30 = [](const char* key) -> const char* {
+        if (std::string_view(key) == "STRIX_MM_PF_MSA_FLASH") return "1";
+        if (std::string_view(key) == "STRIX_MM_PF_MSA_FLASH_LAYERS") return "30-59";
+        return nullptr;
+    };
+    require(prefill_policy(l30).policies == "msa-flash-bf16-l30-v1" &&
+            allow("prefill-msa-flash-l30").category == 'b', "named lossy l30 policy");
+    // Device-only and serving selectors: retain explicit source wiring checks alongside
+    // their dedicated native/host gates, without claiming host numerical qualification.
+    struct Wiring { const char* id; const char* path; const char* required; };
+    constexpr Wiring wiring[] = {
+        {"serve-cycle-pack", "include/strix/session/cycle_pack.hpp", R"("STRIX_SERVE_CYCLE_PACK", lever::Exactness::bitwise, false)"},
+        {"prefill-pipe-n16", "src/minimax/moe/mmx_prefill.hip", "mode == 2 && !g_pipe_n16_pair"},
+        {"prefill-pipe-n16", "src/minimax/moe/mmx_prefill.hip", R"(env_choice("STRIX_MMX_PREFILL_PIPE_N16", 0, {"0", "1", "auto"}))"},
+        {"prefill-pipe-tail", "src/minimax/moe/mmx_prefill.hip", "v == 1U ? 0x7FU : v >> 1U"},
+        {"serve-conversation", "src/minimax/serve/minimax_lead.hpp", R"(flag("STRIX_MM_SERVE_CONVERSATION", false, strix::EnvFlagMatch::exact))"},
+        {"serve-conversation", "src/minimax/serve/serve_runtime.cpp", "eng.set_unaligned_resume(conversation_agreed)"},
+        {"serve-token-memo", "src/minimax/serve/minimax_api.cpp", "TokenMemo::enabled_by_default()"},
+        {"serve-token-memo", "src/minimax/serve/minimax_api.cpp", "tokenizer->encode_marked(tail,true,marks)"},
+        {"route-receipt", "apps/minimax_rank_main.cpp", "strix::route::compare_ranks("},
+        {"route-receipt", "apps/minimax_rank_main.cpp", "strix::minimax::defaults::check_peer("},
+        {"route-receipt", "src/minimax/serve/serve_runtime.cpp", "strix::route::compare_ranks("},
+        {"route-receipt", "src/minimax/serve/serve_runtime.cpp", "strix::minimax::defaults::check_peer("},
+    };
+    for (const auto& row : wiring) {
+        (void)allow(row.id);
+        std::ifstream input(fs::path(STRIX_ROUTE_SOURCE_DIR) / row.path, std::ios::binary);
+        require(input.good(), std::string("cannot inspect selector source: ") + row.path);
+        const std::string source((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        require(source.find(row.required) != std::string::npos, std::string("selector wiring drift: ") + row.id);
+    }
+}
 // Host policy/source contract only: allocation and device equality need native gates.
 void host_pin_selector() {
     const auto& entry = allow("host-anon-pin");
@@ -466,6 +518,7 @@ int main(int argc, char** argv) {
         // Source fingerprints are an audit aid, not a CI gate: any edit to a MiniMax source would fail them.
         if (argc >= 2) source_coverage(argc == 3 ? fs::path(argv[2]) : fs::path(STRIX_ROUTE_SOURCE_DIR));
         selector_boundary_proofs();
+        refreshed_selector_proofs();
         host_pin_selector();
         std::set<std::string_view> ids;
         std::array<unsigned, 3> counts{};

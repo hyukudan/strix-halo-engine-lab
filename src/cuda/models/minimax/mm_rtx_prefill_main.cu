@@ -428,7 +428,7 @@ int main(int argc, char** argv) {
         unsigned n_layers = kLayers, repeat = 1;
         lc::Cli cut_cli;
         bool print_effective = false;
-        std::string cut_pair_identity = "default";
+        std::string cut_pair_identity = mlc::default_pair_identity();
         std::string send_to;
         bool codec_bp = false, abab_xport = false;
         strix::pair::state::SharedOnceMode ik_mode;  // off / on / alternating replay; last option wins
@@ -486,6 +486,9 @@ int main(int argc, char** argv) {
         cut_input.rtx_rows_s = strix::envcfg::number<double>("STRIX_SPLIT_RTX_ROWS_S", 0, 0);
         cut_input.pair_rows_s = strix::envcfg::number<double>("STRIX_SPLIT_PAIR_ROWS_S", 0, 0);
         cut_input.link_mbps = strix::envcfg::number<double>("STRIX_SPLIT_LINK_MBPS", 0, 0);
+        // Same resolver as the pair listener: the declared pair identity names its chunk rows (identity grain).
+        cut_input.pair_grain = lc::identity_grain(cut_pair_identity);
+        if (cut_input.pair_grain == mlc::pair_chunk_rows) cut_input.pair_unit_scale = mlc::pair_unit_scale();
         const auto cut_cfg = lc::resolve(cut_cli, cut_input);
         if (print_effective || cut_cfg.split == lc::chain::Split::layer_cut) std::printf("%s", cut_cfg.lines.c_str());
         if (print_effective) return 0;

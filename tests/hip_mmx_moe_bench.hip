@@ -36,6 +36,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <initializer_list>
 #include <numeric>
 #include <random>
 #include <string>
@@ -1507,9 +1508,10 @@ struct Bench {
     // MT8 kernel switches; routes in the router layout with each row's slots rotated (the planner sorts them); an
     // invalid row (repeated id) is reported by prefill_moe_device_check.
     void test_prefill_device() {
-        struct Arm { const char* name; int pipe, pair, core8, tails; };
+        struct Arm { const char* name; int pipe, pair, core8, tails, n16 = -1; };
         const Arm arms[] = {{"default", -1, -1, -1, -1}, {"pipe0", 0, -1, 0, -1}, {"core8.1", 0, -1, 1, -1}, {"core8.2", 0, -1, 2, -1},
-                            {"pipe.pair", 1, 1, 0, -1}, {"pipe2.pair", 2, 1, 0, -1}, {"pipe2", 2, 0, 0, -1}, {"tails0", -1, -1, -1, 0}};
+                            {"pipe.pair", 1, 1, 0, -1}, {"pipe2.pair", 2, 1, 0, -1}, {"pipe2", 2, 0, 0, -1}, {"tails0", -1, -1, -1, 0},
+                            {"pipe.n16", 1, -1, 0, -1, 1}, {"pipe2.n16", 2, -1, 0, -1, 1}};
         opt::ExpertSlices* ex_d = nullptr;
         for (unsigned T : {5U, 16U, 100U, 333U, 2048U, 4096U}) {
             Prefill q = make_prefill(T);
@@ -1538,6 +1540,7 @@ struct Bench {
             for (const Arm& arm : arms) {
                 if (arm.pipe >= 0) opt::set_prefill_pipe(arm.pipe);
                 if (arm.pair >= 0) opt::set_prefill_pipe_pair(arm.pair);
+                if (arm.n16 >= 0) opt::set_prefill_pipe_n16(arm.n16);
                 if (arm.core8 >= 0) opt::set_prefill_core8(arm.core8);
                 if (arm.tails >= 0) opt::set_prefill_tail_stream(arm.tails);
                 check(opt::prefill_moe_device_plan(T), "device plan selected");
@@ -1548,6 +1551,7 @@ struct Bench {
                 opt::prefill_moe_device_check();
                 opt::set_prefill_pipe(-1);
                 opt::set_prefill_pipe_pair(-1);
+                opt::set_prefill_pipe_n16(-1);
                 opt::set_prefill_core8(-1);
                 opt::set_prefill_tail_stream(-1);
                 std::size_t at = 0;
@@ -2034,6 +2038,21 @@ struct Bench {
                     std::printf("%s: partials, transformed inputs, down inputs, output bitwise\n", cell.c_str());
                 }
             }
+            {  // N16 PIPE (8 waves of one output tile) on every MT8 call vs production (pairs auto)
+                struct RestoreN16 { ~RestoreN16() { opt::set_prefill_pipe_n16(-1); } } restore_n16;
+                for (int pipe : {1, 2}) {
+                    opt::set_prefill_pipe_n16(0);
+                    const PfDump plain = run_dump(q, mtfit, true, 0, 0, false, nullptr, false, pipe);
+                    opt::set_prefill_pipe_n16(1);
+                    const PfDump n16 = run_dump(q, mtfit, true, 0, 0, false, nullptr, false, pipe);
+                    const bool exact = plain.part == n16.part && plain.xt == n16.xt && plain.at == n16.at &&
+                                       same_bits(plain.out, n16.out) && off.part == n16.part && same_bits(off.out, n16.out);
+                    const std::string cell = "pipe n16 PIPE=" + std::to_string(pipe) + " mtfit=" + std::to_string(mtfit) + " " + name;
+                    check(exact, cell + " raw partials/transformed inputs/down inputs/output");
+                    if (!exact) throw std::runtime_error(cell + " failed bitwise qualification");
+                    std::printf("%s: partials, transformed inputs, down inputs, output bitwise\n", cell.c_str());
+                }
+            }
             for (int core8 : {1, 2}) {
                 const PfDump on = run_dump(q, mtfit, true, core8);
                 const bool part = off.part == on.part, xt = off.xt == on.xt, at = off.at == on.at;
@@ -2389,19 +2408,23 @@ struct Bench {
     }
     // M4 auto-select receipt: whole MoE call, production PIPE (A) vs paired bands (B), 10 A B B A blocks per T, real
     // routes. Per block delta = mean(B) / mean(A) - 1; mean and a normal 95 % interval over the blocks.
+    // Cells "n16abba T": production (A, pairs auto) vs the N16 PIPE on every MT8 call (B), same receipt.
     void bench_pair_abba() {
-        struct Restore { ~Restore() { opt::set_prefill_pipe_pair(-1);  opt::set_prefill_mtfit(-1); } } restore;
-        for (unsigned T : {1024U, 2048U, 4096U}) {
-            const std::string cell = "pairabba T" + std::to_string(T);
+        bench_moe_abba("pairabba", "pair", {1024U, 2048U, 4096U}, [](int on) { opt::set_prefill_pipe_pair(on); });
+        bench_moe_abba("n16abba", "n16", {512U, 1024U, 1536U, 2048U, 4096U, 8192U}, [](int on) { opt::set_prefill_pipe_n16(on); });
+    }
+    template <class Set> void bench_moe_abba(const char* prefix, const char* label, std::initializer_list<unsigned> ts, Set set) {
+        struct Restore { ~Restore() { opt::set_prefill_pipe_pair(-1); opt::set_prefill_pipe_n16(-1); opt::set_prefill_mtfit(-1); } } restore;
+        for (unsigned T : ts) {
+            const std::string cell = std::string(prefix) + " T" + std::to_string(T);
             if (!wanted(cell)) continue;
             Prefill q = make_prefill_routes(T);
             hipEvent_t e0, e1;
             hip_ok(hipEventCreate(&e0), "abba event");
             hip_ok(hipEventCreate(&e1), "abba event");
-            auto call = [&](int pair) {
-                
+            auto call = [&](int on) {
                 opt::set_prefill_mtfit(1);
-                opt::set_prefill_pipe_pair(pair);
+                set(on);
                 hip_ok(hipDeviceSynchronize(), "abba idle");
                 hip_ok(hipEventRecord(e0, nullptr), "abba e0");
                 for (int i = 0; i < 4; ++i) prefill_B(q);
@@ -2425,8 +2448,8 @@ struct Bench {
             for (double d : delta) mean += d / static_cast<double>(delta.size());
             for (double d : delta) var += (d - mean) * (d - mean) / static_cast<double>(delta.size() - 1);
             const double half = 1.96 * std::sqrt(var / static_cast<double>(delta.size()));
-            std::printf("%s: MoE call A %.3f ms B(pair) %.3f ms | per-block B/A-1 mean %+.2f %% (95 %% CI %+.2f..%+.2f %%), %d of %zu blocks faster\n",
-                        cell.c_str(), sa / 20.0, sb / 20.0, 100.0 * mean, 100.0 * (mean - half), 100.0 * (mean + half),
+            std::printf("%s: MoE call A %.3f ms B(%s) %.3f ms | per-block B/A-1 mean %+.2f %% (95 %% CI %+.2f..%+.2f %%), %d of %zu blocks faster\n",
+                        cell.c_str(), sa / 20.0, label, sb / 20.0, 100.0 * mean, 100.0 * (mean - half), 100.0 * (mean + half),
                         static_cast<int>(std::count_if(delta.begin(), delta.end(), [](double d) { return d < 0; })), delta.size());
             std::fflush(stdout);
             (void)hipEventDestroy(e0);
@@ -2689,12 +2712,12 @@ struct Bench {
         run_dense_v4({down}, v4Out[0], got, T, ws, bytes, 0);
         hip_ok(hipDeviceSynchronize(), "dense MLP sync");
         const auto actA = d2h(libOut[0], hidden), actB = d2h(v4Out[0], hidden);
-        const auto outA = d2h(ref, output), outB = d2h(got[0], output);
+        const auto mlpA = d2h(ref, output), mlpB = d2h(got[0], output);
         const auto finite = [](const std::vector<float>& x) {
             return std::all_of(x.begin(), x.end(), [](float v) { return std::isfinite(v); });
         };
-        const bool same = finite(actA) && finite(actB) && finite(outA) && finite(outB) &&
-                          same_bits(actA, actB) && same_bits(outA, outB);
+        const bool same = finite(actA) && finite(actB) && finite(mlpA) && finite(mlpB) &&
+                          same_bits(actA, actB) && same_bits(mlpA, mlpB);
         check(same, "dense_v4 composed SwiGLU/down differs or contains poison");
         std::printf("dense_v4 chain rank %u bits %u/%u/%u T%u: %s\n", o.rank, gu[0]->copies[0].dev.bits,
                     gu[1]->copies[0].dev.bits, down->copies[0].dev.bits, T, same ? "bitwise" : "DIFF");
@@ -3468,10 +3491,21 @@ template <int MT, bool Packed> __global__ __launch_bounds__(128) void pipe_tail_
     const unsigned local = blockIdx.x, bx = local % it.gx, by = (local / it.gx) % it.gy, bz = local / (it.gx * it.gy);
     pipe_tail_arm<MT, Packed>(it, bx, by, bz);
 }
+// N16 PIPE (item_pipe Tiles 1, 256 threads) on MT8 blocks; Tail false sends partial blocks to the scalar core.
+template <bool Packed, bool Tail> __global__ __launch_bounds__(256) void pipe_n16_new_kernel(opt::pfk::Item it) {
+    const unsigned local = blockIdx.x, bx = local % it.gx, by = (local / it.gx) % it.gy, bz = local / (it.gx * it.gy);
+    switch (it.bits) {
+        case 3: opt::pfk::pipe_or_tail<3, 8, 4, false, Packed, Tail, 1>(it, bx, by, bz); break;
+        case 4: opt::pfk::pipe_or_tail<4, 8, 4, false, Packed, Tail, 1>(it, bx, by, bz); break;
+        case 5: opt::pfk::pipe_or_tail<5, 8, 4, false, Packed, Tail, 1>(it, bx, by, bz); break;
+        case 6: opt::pfk::pipe_or_tail<6, 8, 4, false, Packed, Tail, 1>(it, bx, by, bz); break;
+        default: opt::pfk::pipe_or_tail<8, 8, 4, false, Packed, Tail, 1>(it, bx, by, bz); break;
+    }
+}
 
 template <int MT>
 std::size_t pipe_tail_cells(const std::uint32_t* trellis_d, unsigned bits, unsigned in, unsigned out, std::mt19937& rng) {
-    const std::vector<unsigned> row_set = MT == 8 ? std::vector<unsigned>{113, 120, 127} : std::vector<unsigned>{1, 15, 17, 47, 100, 112, 120};
+    const std::vector<unsigned> row_set = MT == 8 ? std::vector<unsigned>{113, 120, 127, 128, 256} : std::vector<unsigned>{1, 15, 17, 47, 100, 112, 120};
     const unsigned tiles_k = in / 16;
     std::size_t cells = 0;
     for (const unsigned live : row_set)
@@ -3525,11 +3559,18 @@ std::size_t pipe_tail_cells(const std::uint32_t* trellis_d, unsigned bits, unsig
                 std::vector<std::uint32_t> ref(n), got(n);
                 hip_ok(hipMemcpy(ref.data(), a_d, n * 4, hipMemcpyDeviceToHost), "pipe tail ref");
                 check_output(ref, "reference");
-                for (const bool packed : {false, true}) {
+                // Arms 0 / 1: PIPE scalar / packed decode. MT 8 also 2 / 3: N16 PIPE scalar / packed (row guard on
+                // item_pipe), 4: N16 packed with the partial blocks on the scalar core (Tail false).
+                for (int a = 0; a < (MT == 8 ? 5 : 2); ++a) {
+                    const bool packed = a == 1 || a >= 3;
                     hip_ok(hipMemset(b_d, 0xA5, n * 4), "pipe tail sentinel");
                     it.part = b_d;
-                    const char* arm = packed ? "packed" : "scalar";
-                    if (packed) hipLaunchKernelGGL((pipe_tail_new_kernel<MT, true>), grid, dim3(128), 0, nullptr, it);
+                    const char* names[] = {"scalar", "packed", "n16 scalar", "n16 packed", "n16 packed v3 tail"};
+                    const char* arm = names[a];
+                    if (a == 2) hipLaunchKernelGGL((pipe_n16_new_kernel<false, true>), grid, dim3(256), 0, nullptr, it);
+                    else if (a == 3) hipLaunchKernelGGL((pipe_n16_new_kernel<true, true>), grid, dim3(256), 0, nullptr, it);
+                    else if (a == 4) hipLaunchKernelGGL((pipe_n16_new_kernel<true, false>), grid, dim3(256), 0, nullptr, it);
+                    else if (packed) hipLaunchKernelGGL((pipe_tail_new_kernel<MT, true>), grid, dim3(128), 0, nullptr, it);
                     else hipLaunchKernelGGL((pipe_tail_new_kernel<MT, false>), grid, dim3(128), 0, nullptr, it);
                     hip_ok(hipGetLastError(), (cell + " " + arm + " launch").c_str());
                     hip_ok(hipMemcpy(got.data(), b_d, n * 4, hipMemcpyDeviceToHost), "pipe tail got");
@@ -3576,7 +3617,7 @@ void test_prefill_pipe_tail() {
         }
     }
     hip_ok(hipDeviceSynchronize(), "pipe tail sync");
-    std::printf("test_prefill_pipe_tail: PASS, %zu cells bitwise (partials memcmp vs item_core_v3, NaN padded rows)\n", cells);
+    std::printf("test_prefill_pipe_tail: PASS, %zu cells bitwise (partials memcmp vs item_core_v3, NaN padded rows; MT8 also N16 PIPE)\n", cells);
 }
 
 }  // namespace
