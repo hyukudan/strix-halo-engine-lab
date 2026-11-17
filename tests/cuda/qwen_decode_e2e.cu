@@ -8,6 +8,7 @@
 // prefill and requires every row's argmax and logits digest to equal the serial step's. With a ref file (node greedy
 // tokens, comma/space separated), the serial tokens must equal its first G entries.
 #include "strix/cuda/qwen_prefill.hpp"
+#include "strix/cuda/qwen_turbo.hpp"
 #include "qwen_decode_test_plan.hpp"
 #include "strix/model_content_hash.hpp"
 
@@ -53,12 +54,22 @@ static Digest chain_step(const Digest& prev, std::uint64_t position, const Diges
     return strix::sha256_bytes(in);
 }
 
-int main(int argc, char** argv) {
+int main(int argc_all, char** argv_all) {
+    // Profile / TURBO weight options anywhere (same resolver as strix-cuda-qwen-serve); the rest is positional.
+    strix::cuda::qwen_turbo::Request turbo;
+    std::vector<char*> rest{argv_all[0]};
+    for (int i = 1; i < argc_all; ++i)
+        if (!strix::cuda::qwen_turbo::take_option(argc_all, argv_all, i, turbo)) rest.push_back(argv_all[i]);
+    const auto resolved = strix::cuda::qwen_turbo::resolve(turbo);
+    if (turbo.print_effective_config) { std::printf("%s", resolved.effective_config().c_str()); return 0; }
+    const int argc = static_cast<int>(rest.size());
+    char** argv = rest.data();
     if (argc < 7) {
-        std::fprintf(stderr, "usage: qwen_decode_e2e tables rope max_positions tokens N G [ref]\n");
+        std::fprintf(stderr, "usage: qwen_decode_e2e [--profile turbo --turbo-weights onfly] tables rope max_positions tokens N G [ref]\n");
         return 1;
     }
     qp::Config c;
+    strix::cuda::qwen_turbo::apply(resolved, c);
     c.model_gguf = std::getenv("STRIX_QWEN_GGUF") ? std::getenv("STRIX_QWEN_GGUF") : "Qwen3.8-Flash-Next-UD-Q4_K_XL-merged.gguf";
     if (const char* s = std::getenv("STRIX_QWEN_MTP")) c.mtp_sidecar_gguf = s;
     c.tables_dir = argv[1];

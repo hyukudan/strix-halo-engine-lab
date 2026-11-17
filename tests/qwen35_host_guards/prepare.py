@@ -75,7 +75,8 @@ code = text[a:b] + "sampled = true; } }"
 (out / "audit_bench.inc").write_text("void bench() {" + code)
 text = (root / "apps/cuda_qwen35_decode_main.cu").read_text()
 a = text.index("        if (pf_repeat == 0)")
-b = text.index("        if (bwp)", a)
+# The argument checks end where the first early-exit mode (pack save, bandwidth probe) starts.
+b = min(text.find(m, a) for m in ("        if (!save_pack.empty())", "        if (bwp)") if text.find(m, a) > a)
 (out / "audit_cli.inc").write_text("void cli(unsigned pf_repeat, unsigned pf_slots) {" + text[a:b] + "}")
 
 # Keep host attribute initialization verbatim, replacing only the kernel symbol/size.

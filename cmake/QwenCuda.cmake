@@ -13,7 +13,8 @@ include(${CMAKE_CURRENT_LIST_DIR}/StrixCudaBackend.cmake)
 add_library(strix_qwen_cuda STATIC
     src/cuda/models/qwen/qwen_prefill_driver.cu src/cuda/models/qwen/qwen_hc.cu src/cuda/models/qwen/qwen_dense.cu
     src/cuda/models/qwen/qwen_gdn.cu src/cuda/models/qwen/qwen_qsa.cu src/cuda/models/qwen/qwen_moe.cu
-    src/cuda/models/qwen/qwen_plemtp.cu src/cuda/models/qwen/qwen_mtp_draft.cu src/cuda/models/qwen/qwen_transcode.cu src/cuda/tiered_experts.cu src/cuda/weight/registry.cu ${STRIX_CUDA_CORE_AMD_MATH_SOURCES} src/gguf_reader.cpp)
+    src/cuda/models/qwen/qwen_plemtp.cu src/cuda/models/qwen/qwen_mtp_draft.cu src/cuda/models/qwen/qwen_transcode.cu src/cuda/tiered_experts.cu src/cuda/weight/registry.cu ${STRIX_CUDA_CORE_AMD_MATH_SOURCES} src/gguf_reader.cpp
+    src/cuda/core/nvfp4_a8.cu src/cuda/core/nvfp4_a8_reference.cpp src/cuda/core/nvfp4_reference.cpp)
 target_include_directories(strix_qwen_cuda PUBLIC include src/cuda/models/qwen PRIVATE src)
 target_link_libraries(strix_qwen_cuda PUBLIC strix-weight)
 # Tiered expert residency: the host planner/resolver and the CPU routed-expert executor (bitwise = the card's A8 chains).
@@ -78,6 +79,17 @@ set_source_files_properties(tests/cuda/qwen_dense_tests.cu PROPERTIES COMPILE_OP
 if(MSVC)
     target_compile_options(qwen_dense_tests PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
+# TURBO onfly (qwen-turbo-v1): shared nvfp4-a8-v1 core vs its host oracles, the Qwen dense binding, and the one
+# resolver (serve == CLI).
+add_executable(nvfp4_a8_test tests/cuda/nvfp4_a8_test.cu)
+target_link_libraries(nvfp4_a8_test PRIVATE strix_qwen_cuda)
+target_compile_options(nvfp4_a8_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+add_test(NAME nvfp4_a8 COMMAND nvfp4_a8_test)
+add_executable(nvfp4_a8_bench tests/cuda/nvfp4_a8_bench.cu)
+target_link_libraries(nvfp4_a8_bench PRIVATE strix_qwen_cuda)
+add_executable(qwen_turbo_resolver_test tests/cuda/qwen_turbo_resolver_test.cu)
+target_link_libraries(qwen_turbo_resolver_test PRIVATE strix_qwen_cuda strix_qwen_prefix)
+add_test(NAME qwen_turbo_resolver COMMAND qwen_turbo_resolver_test)
 add_executable(qwen_decode_bench tests/cuda/qwen_decode_bench.cu)
 target_link_libraries(qwen_decode_bench PRIVATE strix_qwen_cuda)
 foreach(arm IN ITEMS 0 1)

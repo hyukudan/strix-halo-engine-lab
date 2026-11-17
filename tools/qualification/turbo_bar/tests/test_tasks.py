@@ -57,7 +57,10 @@ class TaskTests(unittest.TestCase):
                   if any(isinstance(v, int) and not isinstance(v, bool) for v in x["check"]["arguments"].values()))
         c = it["check"]
         good = json.dumps({"name": c["name"], "arguments": c["arguments"]})
-        self.assertTrue(tasks.score_item(it, "Sure: " + good))
+        self.assertTrue(tasks.score_item(it, " \n" + good + "\t"))
+        for reply in ("Sure: " + good, good + " trailing", good + good, "[" + good + "]",
+                      "```json\n" + good + "\n```", "Sure: " + good + " trailing"):
+            self.assertFalse(tasks.score_item(it, reply), reply)
         self.assertFalse(tasks.score_item(it, json.dumps({"name": c["name"], "arguments": dict(c["arguments"], extra=1)})))
         self.assertFalse(tasks.score_item(it, json.dumps({"name": "other", "arguments": c["arguments"]})))
         k = next(k for k, v in c["arguments"].items() if isinstance(v, int) and not isinstance(v, bool))

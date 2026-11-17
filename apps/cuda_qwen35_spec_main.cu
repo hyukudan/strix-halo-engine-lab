@@ -101,8 +101,8 @@ int main(int argc, char** argv) {
             else if (a == "--label") label = next();
             else if (a == "--turbo-weights") {
                 const std::string v = next();
-                if (v != "off" && v != "native" && v != "onfly") throw std::runtime_error("--turbo-weights expects off|native|onfly");
-                turbo = v == "onfly" ? q::TurboWeights::onfly : v == "native" ? q::TurboWeights::native : q::TurboWeights::off;
+                if (v != "off" && v != "native" && v != "onfly" && v != "converted") throw std::runtime_error("--turbo-weights expects off|native|onfly|converted");
+                turbo = v == "converted" ? q::TurboWeights::converted : v == "onfly" ? q::TurboWeights::onfly : v == "native" ? q::TurboWeights::native : q::TurboWeights::off;
             } else if (a == "--turbo-lm-head") {
                 const std::string v = next();
                 if (v != "nvfp4" && v != "bf16") throw std::runtime_error("--turbo-lm-head expects nvfp4|bf16");

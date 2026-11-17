@@ -580,15 +580,12 @@ def strict_eq(a, b):
 
 
 def first_json_object(text):
-    dec = json.JSONDecoder()
-    for m in re.finditer(r"\{", text):
-        try:
-            obj, _ = dec.raw_decode(text[m.start():])
-        except ValueError:
-            continue
-        if isinstance(obj, dict):
-            return obj
-    return None
+    """Accept only a complete JSON object, with optional surrounding whitespace."""
+    try:
+        obj = json.loads(text.strip())
+    except ValueError:
+        return None
+    return obj if isinstance(obj, dict) else None
 
 
 def score_json(reply, check):

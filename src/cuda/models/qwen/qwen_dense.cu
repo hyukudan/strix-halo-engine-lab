@@ -21,8 +21,11 @@
 #include "../../core/imma_tile.cuh"
 #include "strix/cuda/core/decode_rows.hpp"
 #include "strix/cuda/qwen_dense.hpp"
+#include "strix/cuda/core/nvfp4_a8.cuh"
 #include "../../core/imma_dense.cuh"
 #include "../../weight/arch/sm120_sources.cuh"
+
+#include <unordered_map>
 
 #include <cuda_fp16.h>
 
@@ -259,7 +262,97 @@ __global__ __launch_bounds__(256) void shared_activation_kernel(float* workspace
 
 
 
+// TURBO onfly route: the shared nvfp4-a8-v1 GEMV bound through this site's segments and store forms.
+namespace a8 = strix::cuda::core::nvfp4_a8;
+struct K4Site {
+    KSite k;
+    const std::uint8_t* codes[kMaxSegments];
+    const std::uint8_t* scales[kMaxSegments];
+    float half_ts[kMaxSegments];
+};
+template <Store S> struct Nvfp4Policy {
+    K4Site s;
+    std::uint32_t row_base;
+    __device__ __forceinline__ std::uint32_t outputs() const { return s.k.outputs; }
+    __device__ __forceinline__ a8::Row operand(std::uint32_t n) const {
+        const unsigned m = find_seg(s.k, n);
+        const std::uint64_t i = n - s.k.seg[m].begin;
+        return {s.codes[m] + i * (s.k.width / 2U), s.scales[m] + i * (s.k.width / 16U), s.half_ts[m]};
+    }
+    __device__ __forceinline__ void store(std::uint32_t r, std::uint32_t n, float y) const {
+        DenseNumeric::store<S>(s.k, row_base + r, n, y);   // main's store_value (body moved with #713)
+    }
+};
+// Launch shape (rows per warp chunk = blockIdx.y split, outputs per warp): parallelism only, the bits never change.
+std::uint32_t onfly_rw_hook = 0, onfly_out_hook = 0;   // test / tuning hooks (0 = the measured table below)
+template <Store S, std::uint32_t OUT, std::uint32_t RMAX>
+cudaError_t launch_nvfp4_shape(cudaStream_t stream, const Nvfp4Policy<S>& p, std::uint32_t rows, const std::int8_t* codes,
+                               const float* deltas, std::uint32_t pitch) {
+    constexpr std::uint32_t kWarps = 8;
+    const dim3 grid((p.s.k.outputs + OUT * kWarps - 1U) / (OUT * kWarps), (rows + RMAX - 1U) / RMAX);
+    a8::rows_gemv_kernel<Nvfp4Policy<S>, OUT, RMAX, kWarps>
+        <<<grid, kWarps * 32U, 0, stream>>>(p, rows, p.s.k.width, codes, p.s.k.width, deltas, pitch);
+    return cudaGetLastError();
+}
+template <Store S, std::uint32_t OUT>
+cudaError_t launch_nvfp4_rw(cudaStream_t stream, const Nvfp4Policy<S>& p, std::uint32_t rw, std::uint32_t rows,
+                            const std::int8_t* codes, const float* deltas, std::uint32_t pitch) {
+    switch (rw) {
+    case 1: return launch_nvfp4_shape<S, OUT, 1>(stream, p, rows, codes, deltas, pitch);
+    case 2: return launch_nvfp4_shape<S, OUT, 2>(stream, p, rows, codes, deltas, pitch);
+    case 4: return launch_nvfp4_shape<S, OUT, 4>(stream, p, rows, codes, deltas, pitch);
+    default: return launch_nvfp4_shape<S, OUT, 8>(stream, p, rows, codes, deltas, pitch);
+    }
+}
+template <Store S> cudaError_t launch_nvfp4(cudaStream_t stream, const K4Site& site, std::uint32_t rows,
+                                            const std::int8_t* codes, const float* deltas, std::uint32_t pitch) {
+    if (rows > 65535U * 8U) return cudaErrorInvalidValue;
+    std::uint32_t rw = onfly_rw_hook, out = onfly_out_hook;
+    // Measured table (nvfp4_a8_bench, PRO sm_120 2.8 GHz, Flash-Next shapes, best of rows-per-warp 1/2/4/8 x outputs 1/2):
+    // wide sites (>= 8192 outputs: GDN / QSA in) want min(pow2(rows), 8) rows per warp, one output per warp up to 2 rows;
+    // narrow sites (GDN / QSA out, shared expert) want half the rows per warp and one output per warp.
+    const bool wide = site.k.outputs >= 8192U;
+    std::uint32_t p2 = 1;
+    while (p2 < rows && p2 < 8U) p2 <<= 1U;
+    if (rw == 0) rw = wide ? p2 : (rows <= 2U ? 1U : (p2 / 2U < 8U ? p2 / 2U : 8U));
+    if (out == 0) out = wide && rows > 2U ? 2U : 1U;
+    const Nvfp4Policy<S> p{site, 0};
+    return out == 1U ? launch_nvfp4_rw<S, 1>(stream, p, rw, rows, codes, deltas, pitch)
+                     : launch_nvfp4_rw<S, 2>(stream, p, rw, rows, codes, deltas, pitch);
+}
+
+std::unordered_map<const void*, OnflyImage>& onfly_images() {
+    static std::unordered_map<const void*, OnflyImage> images;
+    return images;
+}
+thread_local bool onfly_scope = false;
+
+// Every segment registered with the site's shape -> the NVFP4 operands; any miss keeps the whole site on Q8_0.
+bool onfly_site(const Site& site, const KSite& k, K4Site& out) {
+    if (!onfly_scope || onfly_images().empty() || site.width % 32U != 0U) return false;
+    out.k = k;
+    for (std::uint32_t m = 0; m < site.segments; ++m) {
+        const auto it = onfly_images().find(site.segment[m].weight);
+        if (it == onfly_images().end() || it->second.width != site.width || it->second.outputs != site.segment[m].outputs)
+            return false;
+        out.codes[m] = it->second.codes;
+        out.scales[m] = it->second.scales;
+        out.half_ts[m] = 0.5F * it->second.tensor_scale;
+    }
+    return true;
+}
+
 }  // namespace
+
+void onfly_register(const void* q8_weight, const OnflyImage& image) { onfly_images()[q8_weight] = image; }
+void onfly_clear() { onfly_images().clear(); }
+std::size_t onfly_count() { return onfly_images().size(); }
+void onfly_set_launch(std::uint32_t rows_per_warp, std::uint32_t outputs_per_warp) {
+    onfly_rw_hook = rows_per_warp;
+    onfly_out_hook = outputs_per_warp;
+}
+OnflyScope::OnflyScope(bool on) : previous_(onfly_scope) { onfly_scope = on; }
+OnflyScope::~OnflyScope() { onfly_scope = previous_; }
 
 cudaError_t quantize(cudaStream_t stream, std::uint32_t rows, std::uint32_t width, Input type, const void* input,
                      std::uint64_t input_stride, std::int8_t* codes, float* deltas, std::uint32_t pitch) {
@@ -289,6 +382,15 @@ cudaError_t project_observed(cudaStream_t stream, const Site& site, std::uint32_
         n += s.outputs;
     }
     k.nseg = site.segments; k.width = site.width; k.outputs = n; k.gate = site.gate; k.gate_stride = site.gate_stride;
+    if (K4Site k4{}; onfly_site(site, k, k4)) {
+        switch (site.store) {
+        case Store::f32: return launch_nvfp4<Store::f32>(stream, k4, rows, codes, deltas, pitch);
+        case Store::f32_round_bf16: return launch_nvfp4<Store::f32_round_bf16>(stream, k4, rows, codes, deltas, pitch);
+        case Store::bf16: return launch_nvfp4<Store::bf16>(stream, k4, rows, codes, deltas, pitch);
+        case Store::bf16_gated: return launch_nvfp4<Store::bf16_gated>(stream, k4, rows, codes, deltas, pitch);
+        }
+        return cudaErrorInvalidValue;
+    }
     const auto dispatch = [&](const KSite& ks, std::uint32_t r, const std::int8_t* c, const float* d) -> cudaError_t {
         switch (site.store) {
         case Store::f32: return core::dense_a8::launch_project<Store::f32, weight::Q8ImmaSource, DenseNumeric, Capture>(stream, ks, r, c, d, pitch);
