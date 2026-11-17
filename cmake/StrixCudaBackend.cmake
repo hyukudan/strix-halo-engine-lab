@@ -17,3 +17,4 @@ target_include_directories(strix_cuda_core INTERFACE "${_strix_cuda_root}/includ
 # Core sources compiled into the model library that uses them, so they keep that library's exact arithmetic flags.
 set(STRIX_CUDA_CORE_AMD_MATH_SOURCES "${STRIX_CUDA_ROOT}/core/amd_math_tables.cu")
 set(STRIX_CUDA_CORE_TRELLIS_SOURCES "${STRIX_CUDA_ROOT}/core/trellis.cu")
+set(STRIX_CUDA_CORE_DENSE_SOURCES "${STRIX_CUDA_ROOT}/core/dense/q8_a8_imma.cu")

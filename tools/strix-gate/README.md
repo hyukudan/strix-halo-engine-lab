@@ -248,8 +248,11 @@ prompts and reference) the candidate must pass all of (`MM_FLOOR` in the script)
 
 The absolute KL / top-1 / dNLL verdict is printed and stored (`pooled.abs_pass`) as a reference.
 The candidate must differ from the reference only in its FAST layer set: every receipt lever other
-than `minimax.msa_flash` must be equal, and so must every recorded switch outside the explicit
-FAST allowlist (`STRIX_MM_PF_MSA_FLASH`, `STRIX_MM_PF_MSA_FLASH_LAYERS`, `STRIX_MM_FAST_PREFILL`).
+than `minimax.msa_flash` / `minimax.linear_order` must be equal, and so must every recorded switch outside
+the explicit FAST allowlist (`STRIX_MM_PF_MSA_FLASH`, `STRIX_MM_PF_MSA_FLASH_LAYERS`, `STRIX_MM_FAST_PREFILL`,
+`STRIX_MMX_PF_ORDER`). The chunk-invariant linear order (`minimax.linear_order` =
+`invariant:mmx-pf-linear-s1-v1`) changes MoE / dense rounding in every layer, so its FAST layer set is all 60 layers:
+onset 0, layer-0 one-ulp nulls, and an exact reference that differs only by `STRIX_MMX_PF_ORDER`.
 Receipts omit defaulted switches and cannot distinguish them from unconsulted switches; a
 one-sided entry outside that allowlist is therefore refused, even if it explicitly selects a default.
 Mean + 2 sd of three controls is a policy threshold, not a bound: a candidate drawn exactly like

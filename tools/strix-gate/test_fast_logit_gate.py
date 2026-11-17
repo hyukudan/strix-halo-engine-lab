@@ -488,7 +488,7 @@ class MiniMaxFloor(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def receipt(self, rank, fast=None, extra="b"):
+    def receipt(self, rank, fast=None, extra="b", order=None):
         flash = "0" if fast is None else f"{fast[0] - 10}:layers=" + "".join("1" if fast[1] <= L else "0" for L in range(60))
         doc = {"schema": "strix-route-receipt-v1", "scope": "process", "engine": "minimax", "rank": rank, "fingerprint": "f",
                "levers": [{"name": "minimax.moe_prefill_format", "requested": "default", "effective": "exl3", "reason": "disabled"},
@@ -498,9 +498,12 @@ class MiniMaxFloor(unittest.TestCase):
                                     "STRIX_MM_QUALITY_OUT": f"/runs/{rank}-{fast}-{extra}-{self.rng.integers(1 << 30)}/q"}}}
         if fast is not None:
             doc["switches"]["set"]["STRIX_MM_PF_MSA_FLASH_LAYERS"] = f"{fast[1]}-59"
+        if order is not None:
+            doc["levers"].append({"name": "minimax.linear_order", "requested": "invariant", "effective": order, "reason": "selected"})
+            doc["switches"]["set"]["STRIX_MMX_PF_ORDER"] = "invariant"
         return "strix-route-receipt " + json.dumps(doc)
 
-    def mm_arm(self, name, logits, fast=None, control=None, extra="b", log=None, prompts=("p",)):
+    def mm_arm(self, name, logits, fast=None, control=None, extra="b", log=None, prompts=("p",), order=None):
         """Dumps for two ranks, an engine log per rank, then `witness` and `seal` exactly as a launcher would."""
         d = self.root / name
         d.mkdir()
@@ -508,7 +511,7 @@ class MiniMaxFloor(unittest.TestCase):
         for rank, (lo, hi) in enumerate(((0, MW[0]), (MW[0], sum(MW)))):
             for prompt in prompts:
                 logits[:, lo:hi].astype("<f4").tofile(d / f"q-{prompt}-tf-r{rank}.f32")
-            lines = ["mm rank: load", self.receipt(rank, fast, extra)]
+            lines = ["mm rank: load", self.receipt(rank, fast, extra, order)]
             if control is not None:
                 lines += [f"DIAG attn ulp: layer {control[0]} seed {control[1]} rows {min(64, MT - p)} pos0 {p} values 99"
                           f" prompt {json.dumps(prompt)}" for prompt in prompts for p in (0, 64)]
@@ -562,10 +565,19 @@ class MiniMaxFloor(unittest.TestCase):
             want = sum(comb(20, j) * 0.6 ** j * 0.4 ** (20 - j) for j in range(w, 21))
             self.assertAlmostEqual(g.binom_sf(w, 20, 0.6), want, places=12)
 
+    def test_witness_linear_order(self):
+        """The invariant linear order is a FAST layer set over every layer: onset 0, config equal to the exact base."""
+        e, _ = self.mm_arm("e", self.ref)
+        c, _ = self.mm_arm("c", self.noisy(0.1, 2), order="invariant:mmx-pf-linear-s1-v1")
+        we, wc = (json.loads((d / "execution-r0.json").read_text(encoding="utf-8")) for d in (e, c))
+        self.assertEqual(wc["profile"], "fast-prefill")
+        self.assertEqual(wc["fast"], {"policy": "mmx-pf-linear-s1-v1", "msa_flash_mode": 0, "layers": list(range(60))})
+        self.assertIsNone(g.config_difference(we["config"], wc["config"]))
+
     def test_witness_index_proj_member(self):
         """minimax.index_proj_wmma joins the FAST layer set (union); absent lever = off; its switches are FAST-only."""
-        def run(fast, idx, evidence=True, event_rank=0, event_tokens=16, event_layers=None):
-            doc = json.loads(self.receipt(0, fast)[len("strix-route-receipt "):])
+        def run(fast, idx, evidence=True, event_rank=0, event_tokens=16, event_layers=None, order=None):
+            doc = json.loads(self.receipt(0, fast, order=order)[len("strix-route-receipt "):])
             if idx is not None:
                 doc["levers"].append({"name": "minimax.index_proj_wmma", "requested": "1", "effective": idx, "reason": "selected"})
                 doc["switches"]["set"]["STRIX_MM_PF_IDX_WMMA"] = "1"
@@ -579,6 +591,13 @@ class MiniMaxFloor(unittest.TestCase):
         both = run((11, 40), on)
         self.assertEqual(both["fast"], {"policy": "msa-flash+index-proj", "msa_flash_mode": 11, "layers": list(range(40, 60))})
         self.assertEqual(both["profile"], "fast-prefill")
+        combined = run((11, 40), on, order="invariant:mmx-pf-linear-s1-v1")
+        self.assertEqual(combined["fast"], {"policy": "mmx-pf-linear-s1-v1+msa-flash+index-proj",
+                                            "msa_flash_mode": 11, "layers": list(range(60))})
+        self.assertEqual(combined["profile"], "fast-prefill")
+        self.assertIsNone(g.config_difference(run(None, None)["config"], combined["config"]))
+        with self.assertRaises(g.GateError):
+            run((11, 40), on, evidence=False, order="invariant:mmx-pf-linear-s1-v1")
         alone = run(None, "1:layers=" + "".join("1" if 30 <= L else "0" for L in range(60)))
         self.assertEqual(alone["fast"], {"policy": "index-proj", "msa_flash_mode": 10, "layers": list(range(30, 60))})
         self.assertEqual(run((11, 40), "0")["fast"]["policy"], "msa-flash")

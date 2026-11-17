@@ -63,8 +63,15 @@ capture and replay). Numerical identity is part of the plan (FMA or not, FTZ, di
 type, top-k ties, split-K, rounding): a core selects only between variants of the same identity, by capability and
 shape. Order:
 
-1. **Dense IMMA tile** (`core/dense/`, mirrors `src/core/linear_plan.hpp`, `tiled_core.hpp`, `integer_plan.hpp`):
-   `ds41_core_mma.cu` (tiled Q8_0 x A8) first; the DeepSeek and Qwen CMake lists then name the core library.
+1. **Dense IMMA tile (extracted; native qualification pending)** (`core/dense/q8_a8_imma.cu`): tiled Q8_0 x A8 kernels, repack and tuning dispatch
+   share `include/strix/cuda/core/{types,plan,dense}.hpp`; old DeepSeek signatures remain field-by-field adapters.
+   `include/strix/device/runtime.hpp` provides a capability-query binding, but the execution path does not consume it;
+   plan SM fields are metadata checks, not device admission. Workspace and stream stay caller-owned.
+   This intermediate extraction still uses model helpers, a fixed HC epilogue and process-global tuning.
+   Shared helpers, an explicit epilogue policy and immutable owner-level tuning remain follow-up work before concurrent multi-engine use.
+   The extraction gate compares every built CUDA object's and executable's SASS against the base build, moved
+   symbols declared one by one with `--symbol-rename OLD=NEW` (an undeclared namespace move is a difference);
+   this is an instruction-preserving move, with no new numerical or workload qualification claim.
 2. **Common numerics and norms** (`core/norms/`): `ds41_cuda_common.{cuh,cu}` (device, workspace, stream, event
    helpers become `core/runtime` pieces), `ds41_core_norm.cu`, Qwen `hc` with the AMD-identical math
    (`include/strix/cuda/amd_math.cuh` is already in core), MiniMax Gemma norms; one interface, separate arithmetic

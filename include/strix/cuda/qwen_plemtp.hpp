@@ -120,6 +120,7 @@ struct MtpRounding {
     bool projection_bf16 = true;     // --mtp-projection-rounding bf16-rne (production)
     bool gemma_offset = false;       // effective-norm conversion: gain = w (production); gemma: 1 + w
     float epsilon = 1e-6F;
+    bool mma = false;                // FAST: fused projection on FP16 tensor cores (qwen_prefill::Config::forms.mtp_mma)
 };
 [[nodiscard]] std::uint64_t mtp_workspace_bytes(std::uint32_t rows);
 // hidden: BF16 wide rows h_i [rows][10240]; next_tokens: device [rows]; kv / raw_index: cache bases (row p at p * 1024 /
@@ -129,6 +130,10 @@ void launch_mtp_cache_rows(const MtpWeights& w, const MtpRounding& rounding, con
     const std::uint32_t* next_tokens, std::uint32_t rows, std::uint64_t position0, std::uint16_t* kv, std::uint16_t* raw_index,
     void* workspace, std::uint32_t* status, const amdmath::Tables& tables, cudaStream_t stream,
     const std::uint64_t* position_dev = nullptr);  // non-null: position0 read from device memory (graph replays)
+
+// The fused Q4 projection alone (tests / timing): normalized [rows][12800] FP32 -> fused [rows][10240] BF16.
+void launch_mtp_fused_projection(const float* normalized, const void* eh_q4, std::uint32_t rows, std::uint16_t* fused,
+    const MtpRounding& rounding, cudaStream_t stream);
 
 // Intermediate views of the workspace (tests): offsets in bytes for `rows` rows.
 struct MtpWorkspaceViews {
