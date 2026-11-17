@@ -117,15 +117,19 @@ Options with_environment(Options in) {
     return in;
 }
 
-BudgetCap budget_cap(const Options& opt, std::uint64_t card_total) {
+BudgetCap budget_cap(const Options& opt, const CardBytes& card) {
     BudgetCap c;
-    c.bytes = card_total;
-    if (opt.vram_budget && (!opt.device_cap || opt.vram_budget <= opt.device_cap)) {
-        c.bytes = opt.vram_budget;
-        c.source = "residency";
-    } else if (opt.device_cap) {
-        c.bytes = opt.device_cap;
-        c.source = "device_profile";
+    c.bytes = opt.vram_budget ? opt.vram_budget : card.total;
+    c.available = std::min(card.free, c.bytes);
+    if (opt.vram_budget) c.source = "residency";
+    if (opt.device_cap) {
+        const auto used = card.total > card.free ? card.total - card.free : 0;
+        const auto available = opt.device_cap > used ? opt.device_cap - used : 0;
+        if (available < c.available || (!opt.vram_budget && available == c.available)) {
+            c.bytes = opt.device_cap;
+            c.available = std::min(card.free, available);
+            c.source = "device_profile";
+        }
     }
     return c;
 }
@@ -135,11 +139,11 @@ Decision resolve(const Options& opt, const ModelBytes& m, const CardBytes& card,
     Decision d;
     d.positions_requested = s.positions;
     d.positions = s.positions;
-    const BudgetCap applied = budget_cap(opt, card.total);
+    const BudgetCap applied = budget_cap(opt, card);
     const std::uint64_t cap = applied.bytes;
     d.cap = cap;
     d.cap_source = applied.source;
-    d.budget = std::min(card.free, cap);
+    d.budget = applied.available;
     if (m.expert_bytes.size() != m.layers || m.layers == 0 || m.experts == 0) {
         d.error = "residency: model bytes inconsistent (expert_bytes size != layers, or empty)";
         d.reason = d.error;

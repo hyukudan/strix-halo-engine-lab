@@ -12,7 +12,7 @@ Bound today: Qwen3.8-Flash-Next on the CUDA route (`strix-cuda-qwen-serve`, `qwe
 | Flag / environment | Values | Meaning |
 |---|---|---|
 | `--expert-residency` / `STRIX_EXPERT_RESIDENCY` | `auto` (default), `full`, `tiered` | `auto` = `full` when everything fits the budget, `tiered` otherwise |
-| `--vram-budget-gib` / `STRIX_VRAM_BUDGET_GIB` | number, e.g. `8` or `7.5` | card bytes the engine may use (default: the bound device profile's memory budget when one is declared, else the whole card; when both are set the smaller wins); emulates a smaller card on a bigger one |
+| `--vram-budget-gib` / `STRIX_VRAM_BUDGET_GIB` | number, e.g. `8` or `7.5` | card bytes the engine may use (default: the bound device profile's memory budget when one is declared, else the whole card; existing physical usage is subtracted from that device cap first; an explicit residency budget limits the engine allowance further); emulates a smaller card on a bigger one |
 | `STRIX_TIER_CPU_THREADS` | integer | CPU expert threads (default min(16, hardware threads)) |
 
 `strix-cuda-qwen-serve --print-effective-config` resolves without loading the model and prints the choice and its

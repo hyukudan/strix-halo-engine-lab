@@ -77,18 +77,18 @@ struct Decision {
     std::uint32_t slots_per_layer = 0;  // uniform, excludes the zero slot
     std::uint32_t positions = 0;
     std::uint32_t positions_requested = 0;
-    // budget = min(card free, cap); cap_source: card | residency (--vram-budget-gib / STRIX_VRAM_BUDGET_GIB) | device_profile
+    // budget is the engine allowance after live usage; cap_source: card | residency (--vram-budget-gib / STRIX_VRAM_BUDGET_GIB) | device_profile
     std::uint64_t cap = 0;
     std::string cap_source = "card";
 };
 
-// The cap the budget plans for, before the live free bytes: the smaller of the explicit residency budget and the
-// device profile's cap (an explicit budget wins a tie), else the card total. `source` names which one applied.
+// Resolve the engine allowance: the explicit residency budget limits this engine; the device profile caps
+// total card usage, so existing physical usage is subtracted first. An explicit allowance wins a tie.
 struct BudgetCap {
-    std::uint64_t bytes = 0;
+    std::uint64_t bytes = 0, available = 0;
     std::string source = "card";
 };
-BudgetCap budget_cap(const Options&, std::uint64_t card_total);
+BudgetCap budget_cap(const Options&, const CardBytes&);
 
 Decision resolve(const Options&, const ModelBytes&, const CardBytes&, const SessionBytes&, const HostBytes&);
 // {"expert_residency":...,"reason":...,"vram_budget_bytes":...,"expert_pool_bytes":...,"slots_per_layer":...,
