@@ -179,7 +179,7 @@ int main(int argc, char** argv) {
             else if (a == "--max-pos") max_pos = strix::core::parse_u32(next());
             else if (a == "--prefill-arith") pf_arith = next();
             else if (a == "--flash-pipe") flash_pipe = next();         // pad2|swz3 (bitwise equal; scheduling only)
-            else if (a == "--flash-tail") flash_tail = next();         // split|off (bitwise equal; scheduling only; default off, opt-in)
+            else if (a == "--flash-tail") flash_tail = next();         // split|off (bitwise equal; scheduling only; default split)
             else if (a == "--prefill-attn8") pf_attn8 = next();        // on|off: e4m3 flash attention (FAST, identity -a8)
             else if (a == "--prefill-chunk") pf_chunk = strix::core::parse_u32(next());
             else if (a == "--prefill-wave-min") pf_wave_min = strix::core::parse_u32(next());  // 0 = off; wave-aligned steps
