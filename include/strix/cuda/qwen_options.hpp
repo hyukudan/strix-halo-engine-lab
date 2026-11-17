@@ -76,6 +76,12 @@ inline bool take(int argc, char** argv, int& i, Request& r) {
     auto& c = r.engine;
     if (a == "--print-effective-config") r.print_effective_config = true;
     else if (a == "--model") c.model_gguf = next();
+    else if (a == "--expert-arithmetic") {
+        const auto value=next();
+        if(value=="incumbent") c.expert_arithmetic=qwen_packs::ExpertArithmetic::incumbent;
+        else if(value==qwen_packs::gsq_a8_contract) c.expert_arithmetic=qwen_packs::ExpertArithmetic::gsq_a8_dot4;
+        else throw std::invalid_argument("--expert-arithmetic requires incumbent or gsq-iq3s-a8-dot4-cuda-v1");
+    }
     else if (a == "--mtp-sidecar") c.mtp_sidecar_gguf = next();
     else if (a == "--draft-vocab") c.draft_vocab = next();
     else if (a == "--tables") c.tables_dir = next();
@@ -156,6 +162,11 @@ inline Resolved resolve(const Request& r, Entry entry, std::string_view default_
         }
     }
     out.contract = cp::arithmetic_contract(out.choice);
+    if(c.expert_arithmetic==qwen_packs::ExpertArithmetic::gsq_a8_dot4) {
+        if(c.forms.moe_mma) throw std::invalid_argument("GSQ A8: single-chain moe_mma composition unqualified; use --moe-mma off");
+        if(c.route_policy->enabled) throw std::invalid_argument("GSQ A8: native IQ RouteBF16 composition unqualified");
+        out.contract+="+"+std::string(qwen_packs::gsq_a8_contract);
+    }
     const auto name = [&](std::string n, std::string v, std::string why) { out.differences.push_back({std::move(n), std::move(v), std::move(why)}); };
     if (entry == Entry::serve) {
         if (r.release_by_layer.value_or(false))
@@ -210,6 +221,7 @@ inline std::string effective_config_json(const Resolved& r) {
     out.set("entry", J(entry_name(r.entry)));
     out.set("profile", J(pr::name(r.resolution.profile)));
     out.set("arithmetic_contract", J(r.contract));
+    out.set("expert_arithmetic",J(std::string(qwen_packs::expert_arithmetic_name(c.expert_arithmetic))));
     out.set("forms", forms_json(c.forms, c.moe_route_bf16.value_or(false)));
     auto route = J::object();
     route.set("requested", J(c.route_policy->requested));
@@ -271,6 +283,10 @@ inline ::strix::cuda::qwen_route::Identity numerical_identity(const qp::Config& 
         id.prefill = "cuda-qwen-a8-prefill+forms-v1";
         id.hash = route::hash_part(id.hash, forms);
     }
+    if(c.expert_arithmetic==qwen_packs::ExpertArithmetic::gsq_a8_dot4) {
+        id.prefill="cuda-qwen-gsq-a8-prefill-v1";
+        id.hash=route::hash_part(id.hash,qwen_packs::gsq_a8_contract);
+    }
     return id;
 }
 // Hand-off producer id: the exact CUDA path keeps its historical id bytes; a FAST arithmetic folds its contract in, so an
@@ -278,5 +294,11 @@ inline ::strix::cuda::qwen_route::Identity numerical_identity(const qp::Config& 
 inline std::uint64_t handoff_numerical_id(std::string_view exact_name, const cp::Choice& choice) {
     if (!choice.fast()) return fnv64(exact_name);
     return fnv64(std::string(exact_name) + "|" + cp::arithmetic_contract(choice) + "|" + cp::form_identities(choice));
+}
+inline std::uint64_t handoff_numerical_id_config(std::string_view exact_name,const qp::Config& config) {
+    if(config.expert_arithmetic==qwen_packs::ExpertArithmetic::incumbent)
+        return handoff_numerical_id(exact_name,choice_of(config));
+    return fnv64(std::string(exact_name)+"|"+cp::arithmetic_contract(choice_of(config))+"|"+
+                 cp::form_identities(choice_of(config))+"|"+std::string(qwen_packs::gsq_a8_contract));
 }
 }  // namespace strix::cuda::qwen_options

@@ -2,6 +2,7 @@
 // the same weights and activations as the exact kernels. FMA is written with explicit intrinsics (the translation
 // unit is built without contraction like the others).
 
+#include "../../weight/arch/sm120_sources.cuh"
 #include "../../core/ptx.cuh"
 #include "../../core/reduce.cuh"
 #include "ds41_cuda_common.cuh"
@@ -53,7 +54,7 @@ struct Shape {
     static_assert(s_bytes % 16 == 0 && x_bytes % 16 == 0 && stage % 16 == 0, "stage alignment");
 };
 
-template <int BT, int BN, int WM, int WN, int KG, int STAGES>
+template <int BT, int BN, int WM, int WN, int KG, int STAGES, class Source = ::strix::cuda::weight::Q8Ds41TileSource>
 __global__ void __launch_bounds__(32 * WM * WN) q8_fast_kernel(const Args a) {
     using S = Shape<BT, BN, WM, WN, KG, STAGES>;
     constexpr int MT = S::MT, NT = S::NT, TPB = S::threads;
@@ -133,7 +134,7 @@ __global__ void __launch_bounds__(32 * WM * WN) q8_fast_kernel(const Args a) {
             for (int i = 0; i < MT; ++i) {
                 const std::uint32_t tl = wm * MT + i;
                 const uint4 w = ws[tl * 32U + lane];
-                const float s0 = __half2float(ss[tl * 16U + gid]), s1 = __half2float(ss[tl * 16U + gid + 8U]);
+                const float s0 = Source::scale_bits(__half_as_ushort(ss[tl * 16U + gid])), s1 = Source::scale_bits(__half_as_ushort(ss[tl * 16U + gid + 8U]));
 #pragma unroll
                 for (int n = 0; n < NT; ++n) {
                     int c[4];

@@ -53,6 +53,7 @@ std::set<std::string> diff(const qp::Config& a, const qp::Config& b) {
     std::set<std::string> d;
     const auto ne = [&](const char* name, bool differs) { if (differs) d.insert(name); };
     ne("model_gguf", a.model_gguf != b.model_gguf);
+    ne("expert_arithmetic",a.expert_arithmetic!=b.expert_arithmetic);
     ne("mtp_sidecar_gguf", a.mtp_sidecar_gguf != b.mtp_sidecar_gguf);
     ne("tables_dir", a.tables_dir != b.tables_dir);
     ne("rope_table", a.rope_table != b.rope_table);
@@ -375,6 +376,19 @@ void turbo_binding() {
 
 int main() {
     try {
+        const Args expert={"--expert-arithmetic","gsq-iq3s-a8-dot4-cuda-v1"};
+        same_request("explicit GSQ arithmetic",expert);
+        const auto native=one({},qo::Entry::cli);
+        const auto gsq=one(expert,qo::Entry::cli);
+        check(native.config.expert_arithmetic==strix::qwen_packs::ExpertArithmetic::incumbent,"omitted expert arithmetic preserves incumbent");
+        check(gsq.config.expert_arithmetic==strix::qwen_packs::ExpertArithmetic::gsq_a8_dot4,"explicit GSQ parsed once");
+        check(gsq.contract.find("gsq-iq3s-a8-dot4-cuda-v1")!=std::string::npos,"GSQ contract named");
+        check(qo::effective_config_json(gsq).find("gsq-iq3s-a8-dot4-cuda-v1")!=std::string::npos,"GSQ effective config names arithmetic");
+        check(qo::numerical_identity(gsq.config).hash!=qo::numerical_identity(native.config).hash,"GSQ snapshots have independent numerical identity");
+        check(qo::handoff_numerical_id_config("old",gsq.config)!=qo::handoff_numerical_id_config("old",native.config),"GSQ handoffs cannot masquerade as native");
+        check(qo::handoff_numerical_id_config("old",native.config)==qo::handoff_numerical_id("old",qo::choice_of(native.config)),"incumbent handoff bytes preserved");
+        check(refuses({"--expert-arithmetic","unknown"}),"unknown expert arithmetic rejected");
+        check(refuses({"--expert-arithmetic","gsq-iq3s-a8-dot4-cuda-v1","--moe-mma","on"}),"GSQ single-chain composition rejects explicitly");
         profiles();
         overrides();
         common_options();

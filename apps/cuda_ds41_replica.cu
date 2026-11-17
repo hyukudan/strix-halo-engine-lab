@@ -407,8 +407,10 @@ int main(int argc, char** argv) {
         if (!std::isfinite(g) || g <= 0.0 || g > 65536.0) usage(("bad value of " + name + ": " + v + " (GiB > 0, or none)").c_str());
         return g;
     };
-    if (const char* v = std::getenv("STRIX_DS41_VRAM_TOTAL_GIB"); v && *v) caps.vram_total_gib = total_gib_value("STRIX_DS41_VRAM_TOTAL_GIB", v);
-    if (const char* v = std::getenv("STRIX_DS41_RAM_TOTAL_GIB"); v && *v) caps.ram_total_gib = total_gib_value("STRIX_DS41_RAM_TOTAL_GIB", v);
+    // Given flags / env win over the bound device's declared budget (profile / memory_gib; strix/device/budget.hpp).
+    std::optional<double> vram_given, ram_given;
+    if (const char* v = std::getenv("STRIX_DS41_VRAM_TOTAL_GIB"); v && *v) vram_given = caps.vram_total_gib = total_gib_value("STRIX_DS41_VRAM_TOTAL_GIB", v);
+    if (const char* v = std::getenv("STRIX_DS41_RAM_TOTAL_GIB"); v && *v) ram_given = caps.ram_total_gib = total_gib_value("STRIX_DS41_RAM_TOTAL_GIB", v);
     std::string receipt, cache_kind = "tierstream";
     bool chat_logits = false, moe_v1b3 = false, router_form0 = false, qakv_auto = false, dsrtxk_on = true, fuse_on = true, flush_ready = false;
     std::uint32_t wb_alt = 0;  // --wb-alt N: chats phases alternate the spare target --spares / 0 every N decode tokens
@@ -632,8 +634,8 @@ int main(int argc, char** argv) {
             if (disk_queue != strix::ds41::cuda::kDiskQueueAuto && (disk_queue > 64 || v.find_first_not_of("0123456789") != std::string::npos))
                 usage("--disk-queue must be auto or 0..64");
         }
-        else if (a == "--vram-total-gib") caps.vram_total_gib = total_gib_value(a, next());
-        else if (a == "--ram-total-gib") caps.ram_total_gib = total_gib_value(a, next());
+        else if (a == "--vram-total-gib") vram_given = caps.vram_total_gib = total_gib_value(a, next());
+        else if (a == "--ram-total-gib") ram_given = caps.ram_total_gib = total_gib_value(a, next());
         else if (a == "--vram-margin-gib" || a == "--ram-margin-gib") {
             const double g = gib_or_auto(-1.0);
             if (g < 0.0) usage(("bad value of " + a + " (GiB >= 0)").c_str());
@@ -790,6 +792,17 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "profile %s: %s (--allow-pending: benchmarks only)\n", rprof::name(prof.name), prof.qualification().c_str());
     }
     parse_args(launch_args);
+    {   // ONE budget resolver for the CLI and the server (this binary is both): --vram-total-gib / --ram-total-gib and
+        // their env twins > the bound entry's profile / memory_gib (--device-profile NAME) > no cap (today's path).
+        strix::device::BudgetOverrides given;
+        given.vram_total_gib = vram_given;
+        given.ram_total_gib = ram_given;
+        const auto budget = strix::device::route_budget(strix::device::bind_cuda(), given);
+        caps.vram_total_gib = budget.device_gib();
+        caps.ram_total_gib = budget.host_gib();
+        if (budget.device_capped() || budget.host_capped())
+            std::fprintf(stderr, "ds41-replica: memory budget %s\n", budget.json().c_str());
+    }
     namespace fs = std::filesystem;
     // --drafter: decided before the load (the arena default and the planner then see no drafter when it is off). The
     // expert room is a pre-load estimate (strix/ds41_rtx_drafter_select.hpp): caps minus margins minus the trunk's

@@ -217,6 +217,13 @@ struct GenerationJob {
     std::function<bool()> client_gone = {}; // connection lifetime guarded by the shared frontend
     // Resolves the virtual ids of prompt (strix/session/embed_rows.hpp); null: the prompt holds none.
     std::shared_ptr<const session::EmbedTable> embeds = {};
+    // Diagnostic only: record committed publish groups without requesting scores or changing decode.
+    bool trace_emissions = false;
+};
+
+struct TokenEmission {
+    std::int64_t steady_ns = 0;
+    std::uint64_t count = 0;
 };
 
 struct GenerationStats {
@@ -246,6 +253,8 @@ struct GenerationStats {
     // Steady-clock nanoseconds of the job's execution span, stamped by the queue when the job finishes (0: not
     // stamped). The power receipt of a request is taken over this span, not over the time its response is rendered.
     std::int64_t exec_begin_ns = 0, exec_end_ns = 0;
+    bool emission_trace = false;
+    std::vector<TokenEmission> token_emissions;
 };
 
 // A request-local failure preserves its terminal receipt without poisoning the engine.
@@ -304,6 +313,8 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable changed_;
     std::vector<std::uint32_t> pending_;
+    bool trace_emissions_ = false;
+    std::vector<TokenEmission> token_emissions_;
     std::shared_ptr<GenerationOutput> output_;
     GenerationProgress progress_;
     GenerationStats stats_;

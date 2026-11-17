@@ -121,3 +121,22 @@ only those two CPU checks. The gate runs the tail-large default;
 and asset settings. The `xsched:TOKENS:N[:R]` job runs one prompt under the
 original order, tail-large and (R > 0) an R-row final-block reservation, and
 requires every exported component to be byte-identical across them.
+
+## Weight packs (shared admission)
+
+The Qwen CUDA engine admits a GGUF through `include/strix/weight_pack.hpp` (shared, model-agnostic) with the packs
+the family declares in `include/strix/qwen_weight_packs.hpp`: `qwen38-ud-q4kxl-a8-v1` (product file, exact A8 kernels),
+`qwen38-gsq-rco-iq3s-v1` (ISTA-DASLab GSQ-RCO IQ3_S and siblings; FAST: dense tensors transcoded to Q8_0 at load,
+routed experts native IQ) and `qwen38-gguf-native-v1` (any other decodable mix, unqualified). The model path selects
+the pack; `strix-cuda-qwen-serve --print-effective-config --model M --tables T --rope-table R` prints the pack id,
+arithmetic class, route, tensor fingerprint and type census without loading weights, and the engine load runs the
+same admission (the `loaded` receipt carries `weight_pack`, `pack_arithmetic`, `pack_fingerprint`).
+Admission uses original merged headers, before upload changes storage types. Gate/up tensors in each layer must
+share a type. Inspection consumes device options but performs no device discovery or binding.
+The fingerprint identifies the named type/dimension inventory, not weight contents or numerical behavior;
+it hashes host-native integer bytes and is not a portable persistent-cache key. Admission borrows its pack
+declaration, which must outlive the receipt. Host fixtures do not qualify device execution or model fidelity.
+Served prefill by length for any OpenAI-compatible server: `scripts/bench/common/prefill_client.py` (a
+`serve-decode.sh --client-cmd` client; finite positive client TTFT and measured positive usage.prompt_tokens are
+required). Rows preserve input order without cold/warm labels or length grouping. `tools/serve_bench.py` reports
+`peak_1s_tok_s` only with measured per-chunk token counts; ordinary SSE text plus final usage leaves it null.

@@ -2,6 +2,7 @@
 // Exactness: every HIP floating-point instruction is one explicit IEEE operation here (__fmaf_rn/__fmul_rn/__fadd_rn/
 // __fdiv_rn/__fsqrt_rn) with the operand order of the gfx1151 ISA (disassembly of hip_ple_launcher);
 // rsqrtf/expf are the gfx1151 emulations of amd_math.cuh.
+#include "../../weight/arch/sm120_sources.cuh"
 #include "strix/cuda/qwen_plemtp.hpp"
 #include "../../core/mma_tile.cuh"
 #include "strix/env_flags.hpp"
@@ -231,14 +232,14 @@ __global__ __launch_bounds__(256) void ple_project_kernel(const std::uint16_t* _
 #pragma unroll
         for (unsigned o = 0; o < kProjOuts; ++o) {
             const std::uint8_t* blk = wrow[o] + (f / 32U) * 34U;
-            const float d = __half2float(__ushort_as_half(*reinterpret_cast<const unsigned short*>(blk)));
+            const float d = weight::Q8Block::scale(blk);
             const unsigned short* q = reinterpret_cast<const unsigned short*>(blk + 2U + f % 32U);
             float c[8];
 #pragma unroll
             for (unsigned i = 0; i < 4; ++i) {
                 const unsigned short pair = q[i];
-                c[2 * i] = __fmul_rn(d, static_cast<float>(static_cast<std::int8_t>(pair & 0xffU)));
-                c[2 * i + 1] = __fmul_rn(d, static_cast<float>(static_cast<std::int8_t>(pair >> 8U)));
+                c[2 * i] = __fmul_rn(d, static_cast<float>(weight::Q8Block::pair_code(pair, 0)));
+                c[2 * i + 1] = __fmul_rn(d, static_cast<float>(weight::Q8Block::pair_code(pair, 1)));
             }
 #pragma unroll
             for (unsigned r = 0; r < kProjRows; ++r)
@@ -473,7 +474,7 @@ __global__ void mtp_q8_to_q4_kernel(const std::uint8_t* q8, std::uint64_t blocks
     const float scale = half_at(src);
     float values[32], mx = 0.0F, amax = 0.0F;
     for (unsigned i = 0; i < 32; ++i) {
-        values[i] = __fmul_rn(scale, static_cast<float>(static_cast<std::int8_t>(src[2 + i])));
+        values[i] = __fmul_rn(scale, static_cast<float>(weight::Q8Block::code(src, i)));
         if (fabsf(values[i]) > amax) { amax = fabsf(values[i]); mx = values[i]; }
     }
     const float d = __fmul_rn(mx, -0.125F);
@@ -509,7 +510,7 @@ __global__ void mtp_embedding_kernel(const std::uint8_t* table, std::uint32_t vo
     std::uint32_t token = tokens[row];
     if (token >= vocab) { if (status && f == 0) atomicOr(status, 1U); token = 0; }
     const std::uint8_t* blk = table + (static_cast<std::uint64_t>(token) * (kHidden / 32U) + f / 32U) * 34U;
-    out[static_cast<std::uint64_t>(row) * kHidden + f] = f2bf(__fmul_rn(half_at(blk), static_cast<float>(static_cast<std::int8_t>(blk[2 + f % 32U]))));
+    out[static_cast<std::uint64_t>(row) * kHidden + f] = f2bf(__fmul_rn(half_at(blk), static_cast<float>(weight::Q8Block::code(blk, f % 32U))));
 }
 
 // 2. mtp_input_norms<1024> (hip_mtp_input_fusion.hip:54-79): block 0 embedding (2560), block 1 wide hidden (10240).
@@ -666,7 +667,7 @@ __global__ __launch_bounds__(512) void mtp_hyper_low_kernel(const float* hc_norm
             const float scale = half_at(blk);
 #pragma unroll
             for (unsigned j = 0; j < 4U; ++j)
-                coef[o][s][j] = __fmul_rn(scale, static_cast<float>(static_cast<std::int8_t>(blk[2U + 4U * (lane % 8U) + j])));
+                coef[o][s][j] = __fmul_rn(scale, static_cast<float>(weight::Q8Block::code(blk, 4U * (lane % 8U) + j)));
         }
 #pragma unroll
     for (unsigned r = 0; r < kSplitRows; ++r) {
@@ -712,7 +713,7 @@ __global__ __launch_bounds__(128) void mtp_hyper_output_kernel(const float* hc_n
         const std::uint8_t* blk = w + b * 34U;
         const float scale = half_at(blk);
         for (unsigned k = 0; k < 32U; ++k)
-            gate = __fmaf_rn(lr[b * 32U + k], __fmul_rn(scale, static_cast<float>(static_cast<std::int8_t>(blk[2U + k]))), gate);
+            gate = __fmaf_rn(lr[b * 32U + k], __fmul_rn(scale, static_cast<float>(weight::Q8Block::code(blk, k))), gate);
     }
     sig[stream * 32U + lane] = __fdiv_rn(1.0F, __fadd_rn(1.0F, am::amd_expf(tb, -gate)));
     __syncthreads();
@@ -744,7 +745,7 @@ __global__ __launch_bounds__(256) void mtp_cache_projection_kernel(const std::ui
         if (kind == 0) w = bf16f(index_k[static_cast<std::uint64_t>(out) * kHidden + f]);
         else {
             const std::uint8_t* blk = q8 + (static_cast<std::uint64_t>(out) * (kHidden / 32U) + f / 32U) * 34U;
-            w = __fmul_rn(half_at(blk), static_cast<float>(static_cast<std::int8_t>(blk[2U + f % 32U])));
+            w = __fmul_rn(half_at(blk), static_cast<float>(weight::Q8Block::code(blk, f % 32U)));
         }
 #pragma unroll
         for (unsigned r = 0; r < kLinRows; ++r)

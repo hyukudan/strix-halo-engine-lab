@@ -17,6 +17,7 @@
 #include "strix/qwen_prefill_schedule.hpp"
 #include "strix/cuda/qwen_route_bf16.hpp"
 #include "strix/cuda/qwen_mtp_diagnostic.hpp"
+#include "strix/qwen_weight_packs.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -83,6 +84,7 @@ struct Config {
         bool qsa_mma = false;  // QSA prefill attention (scores and output) on FP16 tensor cores, FP32 accumulation
         bool moe_mma = false;  // routed-MoE prefill project/down: int8 IMMA block dots, ONE FP32 FMA chain per output (not the HIP four)
     } forms;
+    qwen_packs::ExpertArithmetic expert_arithmetic=qwen_packs::ExpertArithmetic::incumbent;
 };
 
 // Diagnostic snapshot, not the node wire or a portable session/cache format.
