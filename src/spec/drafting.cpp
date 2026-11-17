@@ -116,9 +116,10 @@ Arbiter::Arbiter(ArbiterConfig config) : config_(std::move(config)) {
         std::adjacent_find(w.begin(), w.end()) != w.end() || w.back() > max_proposal + 1)
         throw std::invalid_argument("arbiter windows must be ascending, unique, start at 1 and be <= 65 rows");
     if (!(config_.switch_in >= 1.0) || !(config_.half_life_tokens > 0.0) || !(config_.cost_weight_cap >= 1.0) ||
-        !(config_.cost_aging > 0.0 && config_.cost_aging <= 1.0) || !(config_.frontier_loss >= 0.0))
+        !(config_.cost_aging > 0.0 && config_.cost_aging <= 1.0) || !(config_.frontier_loss >= 0.0) ||
+        !(config_.retreat_horizon >= 0.0))
         throw std::invalid_argument("arbiter: switch_in >= 1, half_life_tokens > 0, cost_weight_cap >= 1, aging in (0, 1], "
-                                    "frontier_loss >= 0");
+                                    "frontier_loss >= 0, retreat_horizon >= 0");
     for (auto& c : cost_) { c.ms.assign(w.back() + 1, 0.0); c.weight.assign(w.back() + 1, 0.0); c.seed.assign(w.back() + 1, 0.0); }
 }
 
@@ -351,8 +352,12 @@ void Arbiter::observe(const Outcome& o, std::span<const std::uint32_t> emitted) 
         // A streak of first-row misses bars the drafter only when it is improbable under the learned first-row rate
         // (a streak of m has probability (1 - r1)^m): at ~66 % acceptance two misses in a row are routine and must not
         // idle the drafter for probe_every passes (measured: 58-71 % serial passes on prose at 64-69 % acceptance).
-        const double r1 = std::min(survival(Source::model, 0, 1), 0.999);
-        const auto streak = std::uint32_t(std::min(16.0, std::ceil(std::log(config_.retreat_confidence) / std::log(1.0 - r1))));
+        // Over the evidence horizon H (ArbiterConfig::retreat_horizon) a streak of m starts by chance about H r1 (1 - r1)^m
+        // times, so m is the shortest streak with H r1 (1 - r1)^m <= retreat_confidence (H = 0: per pass, (1 - r1)^m).
+        const double r1 = std::clamp(survival(Source::model, 0, 1), 1e-3, 0.999);
+        const double chance = config_.retreat_horizon > 0.0
+            ? std::min(1.0, config_.retreat_confidence / (config_.retreat_horizon * r1)) : config_.retreat_confidence;
+        const auto streak = std::uint32_t(std::min(16.0, std::ceil(std::log(chance) / std::log(1.0 - r1))));
         if (model_misses_ >= std::max(config_.retreat_misses, streak)) { model_barred_until_ = passes_ + config_.probe_every; model_misses_ = 0; }
     }
     if (o.source == Source::lookup) {
@@ -360,8 +365,8 @@ void Arbiter::observe(const Outcome& o, std::span<const std::uint32_t> emitted) 
         if (lookup_misses_ >= config_.retreat_misses) { lookup_barred_ = true; lookup_misses_ = 0; }
     }
     auto& c = cost_[context_bin(o.context)];
-    for (auto& w : c.weight) w *= config_.cost_aging;
-    if (o.rows > 0 && o.rows < c.ms.size() && o.verify_ms > 0.0) {
+    if (config_.learn_costs) for (auto& w : c.weight) w *= config_.cost_aging;
+    if (config_.learn_costs && o.rows > 0 && o.rows < c.ms.size() && o.verify_ms > 0.0) {
         auto& w = c.weight[o.rows];
         c.ms[o.rows] = (c.ms[o.rows] * w + o.verify_ms) / (w + 1.0);
         w = std::min(w + 1.0, config_.cost_weight_cap);

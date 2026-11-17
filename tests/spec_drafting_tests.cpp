@@ -145,6 +145,39 @@ void copy_tests() {
              static_cast<unsigned long long>(rese.passes), static_cast<unsigned long long>(res.passes));
 }
 
+// Retreat over the evidence horizon (ArbiterConfig::retreat_horizon): at a 0.64 first-row rate (CUDA dense 27B Japanese
+// prose) a streak of 6 first-row misses is routine over 256 passes and must not bar the drafter for probe_every serial
+// passes; the per-pass form (horizon 0) bars it at 5. A streak of 16 still bars it in both forms.
+void retreat_horizon_tests() {
+    for (const double horizon : {0.0, 256.0}) {
+        sp::ArbiterConfig config;
+        config.windows = {1, 2, 3, 4, 5, 6, 7, 8};
+        config.retreat_horizon = horizon;
+        sp::Arbiter a(config);
+        for (std::uint32_t w = 1; w <= 8; ++w) a.seed_cost(w, 13.30 + 0.113 * double(w - 1));
+        const std::vector<double> draft{0.634, 1.268, 1.902, 2.536, 3.170, 3.804, 4.438};
+        sp::StepInput in;
+        in.model_max_k = 7;
+        in.model_draft_ms = draft;
+        const std::vector<std::uint32_t> tokens(8, 1);
+        const auto pass = [&](std::uint32_t accepted) {
+            a.observe({sp::Source::model, 0, 3, accepted, 4, 13.6, 1.9},
+                      std::span<const std::uint32_t>(tokens.data(), accepted + 1));
+        };
+        for (std::uint32_t i = 0; i < 300; ++i) {  // first-row rate 0.64, then 0.5 per depth
+            (void)a.decide(in);
+            pass(i * 37 % 100 < 64 ? (i % 2 ? 1U : 2U) : 0U);
+        }
+        for (int i = 0; i < 6; ++i) { (void)a.decide(in); pass(0); }
+        auto d = a.decide(in);
+        if (horizon > 0.0) SP_CHECK(d.source == sp::Source::model, "horizon %.0f: 6 routine misses barred the drafter", horizon);
+        else SP_CHECK(d.source == sp::Source::serial, "per-pass form: 6 misses at r1 0.64 bar the drafter (the old rule)");
+        for (int i = 0; i < 16; ++i) { (void)a.decide(in); pass(0); }
+        d = a.decide(in);
+        SP_CHECK(d.source == sp::Source::serial, "horizon %.0f: 22 misses in a row must bar the drafter", horizon);
+    }
+}
+
 void arbiter_tests() {
     sp::ArbiterConfig config;
     config.windows = {1, 2, 4, 8};
@@ -488,6 +521,7 @@ int main() {
     index_tests();
     copy_tests();
     arbiter_tests();
+    retreat_horizon_tests();
     ds_arbiter_tests();
     frontier_tests();
     pricing_tests();
