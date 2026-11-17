@@ -40,6 +40,40 @@ __device__ __forceinline__ void mma_s8(const uint4& a, int b0, int b1, int c[4])
                  : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(b0), "r"(b1), "r"(0));
 }
 
+// D += A (16x16 f16, row) x B (16x8 f16, col), FP32 accumulation in place (sm_80+; FAST forms only: the
+// accumulation order inside the instruction is the hardware's, so callers own a named numerical identity).
+__device__ __forceinline__ void mma_f16(float (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
+                                        unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// D += A (16x16 bf16, row) x B (16x8 bf16, col), FP32 accumulation in place.
+__device__ __forceinline__ void mma_bf16(float (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
+                                         unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// mma_s8 with a caller-chosen accumulator seed (every d[i] starts at `seed`; exact integer arithmetic).
+__device__ __forceinline__ void mma_s8_seeded(int (&d)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
+                                              unsigned b1, int seed) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
+                 : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(seed));
+}
+
+// ldmatrix .trans: the 8x8 b16 tiles transposed (B operands stored k-contiguous by row).
+__device__ __forceinline__ void ldsm_x4_trans(unsigned (&r)[4], const void* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_addr(p)));
+}
+__device__ __forceinline__ void ldsm_x2(unsigned (&r)[2], const void* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n" : "=r"(r[0]), "=r"(r[1]) : "r"(smem_addr(p)));
+}
+
 }  // namespace
 }  // namespace strix::cuda::core::ptx
 

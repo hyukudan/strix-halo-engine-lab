@@ -3,7 +3,7 @@
 # GPU samples every second (index, MiB, util, SM MHz) beside every arm. Ends with OUT/summary.txt.
 #   SERVE_EXE   server executable (strix-cuda-qwen-serve)
 #   SERVE_ARGS  model / tables / sidecar / port / slot flags (the deploy declaration's values)
-#   ARMS        "A|ENV=v ENV2=v ;; B|ENV=w"   (name|environment of the arm)
+#   ARMS        "A|ENV=v ENV2=v ;; B|ENV=w ## --profile fast"   (name|environment of the arm [## extra server flags of the arm])
 #   ORDER       arm names in run order, e.g. "A B A B A B"
 #   CLIENT      classes client command with exactly one local HTTP URL; the arm's output path is appended
 #   OUT         output directory;  GPU_INDEX (default 0): the nvidia-smi index the server is pinned to
@@ -34,11 +34,13 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
-declare -A ENVS
+declare -A ENVS FLAGS
 IFS=';' read -ra LIST <<< "${ARMS//;;/;}"
 for spec in "${LIST[@]}"; do
   [ -n "${spec// /}" ] || continue
-  ENVS[$(echo "$spec" | cut -d'|' -f1 | tr -d ' ')]=$(echo "$spec" | cut -d'|' -f2)
+  n=$(echo "$spec" | cut -d'|' -f1 | tr -d ' '); rest=$(echo "$spec" | cut -d'|' -f2-)
+  ENVS[$n]=${rest%%##*}
+  FLAGS[$n]=""; [[ "$rest" == *"##"* ]] && FLAGS[$n]=${rest#*##}
 done
 echo "start $(date +%T) smi $(smi)" > "$OUT/summary.txt"
 k=0; failed=0
@@ -49,7 +51,7 @@ for name in $ORDER; do
     sha256sum "$SERVE_EXE" || exit 1
   } > "$A/launch.txt" || exit 1
   # shellcheck disable=SC2086
-  env CUDA_VISIBLE_DEVICES=$GPU_INDEX ${ENVS[$name]} "$SERVE_EXE" $SERVE_ARGS > "$A/serve.log" 2>&1 &
+  env CUDA_VISIBLE_DEVICES=$GPU_INDEX ${ENVS[$name]} "$SERVE_EXE" $SERVE_ARGS ${FLAGS[$name]} > "$A/serve.log" 2>&1 &
   SPID=$!
   printf 'pid %s\n' "$SPID" >> "$A/launch.txt"
   deadline=$((SECONDS + ${READY_S:-600}))

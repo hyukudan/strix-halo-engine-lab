@@ -18,6 +18,8 @@
 //   * Translation units are built with --fmad=false -prec-div=true -prec-sqrt=true -ftz=false (no contraction, IEEE
 //     division and root, denormals kept), so FP32 code written in the declared order gives the reference bits.
 
+#include "strix/cuda/core/types.hpp"
+
 #include <cuda_runtime_api.h>
 
 #include <atomic>
@@ -173,12 +175,7 @@ struct F32Weights {
 };
 // A8 activations of `rows` rows (quantize_a8 per row): codes [row][stride], deltas and sums [row][stride / 32].
 // width <= stride is the part a site reads; stride and width multiples of 32.
-struct A8Rows {
-    std::int8_t* codes = nullptr;
-    float* deltas = nullptr;
-    std::int32_t* sums = nullptr;
-    std::uint32_t rows = 0, width = 0, stride = 0;
-};
+using A8Rows = ::strix::cuda::core::A8Rows;
 // Device storage for an A8Rows view.
 struct A8Buffer {
     DeviceBuffer<std::int8_t> codes;

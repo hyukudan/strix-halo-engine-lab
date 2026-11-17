@@ -190,6 +190,9 @@ struct GenerationJob {
     // Request field "draft_depth_max" (batched decoding, measurement): at most this many predictor drafts per
     // cycle for this request (0/absent = the engine's setting). Drafts only: never the request's output.
     std::uint32_t draft_depth_max = 0;
+    // Request field "copy_rows" (measurement): the widest context-copy verify window of this request in rows (1..16;
+    // <= 8 = no wide copy window; 0/absent = the engine's setting). Drafts only: never the request's output.
+    std::uint32_t copy_rows = 0;
     // Request field "tool_draft" (batched decoding): strict tool-call frame proposals on/off for this request;
     // unset = the engine's setting (on by default; STRIX_BATCH_TOOL_DRAFT=0 turns it off). Drafts only.
     std::optional<bool> tool_draft;

@@ -4,10 +4,11 @@
 // last prompt row is the first step). Prints each token with the SHA-256 of its FP32 logits row (the node's
 // STRIX_SERIAL_LOGITS_DIGEST) and the node's step chain SHA256(prev || consumed position LE8 || row SHA256)
 // (STRIX_MTP_STEP_LOGITS_DIGEST, include/strix/mtp_step_logits_digest.hpp).
-// Batch-width invariance: replays the same prompt + generated tokens as verify windows of T = 2..8 rows from a fresh
+// Batch-width invariance: replays the same prompt + generated tokens as verify windows of T = 2..STRIX_QWEN_TMAX (default 8, up to 16) rows from a fresh
 // prefill and requires every row's argmax and logits digest to equal the serial step's. With a ref file (node greedy
 // tokens, comma/space separated), the serial tokens must equal its first G entries.
 #include "strix/cuda/qwen_prefill.hpp"
+#include "qwen_decode_test_plan.hpp"
 #include "strix/model_content_hash.hpp"
 
 #include <array>
@@ -69,7 +70,12 @@ int main(int argc, char** argv) {
     const auto prompt_all = tokens_of(argv[4]);
     const auto n = static_cast<std::uint64_t>(std::atoll(argv[5]));
     const auto g = static_cast<std::uint32_t>(std::atoi(argv[6]));
-    if (n < 2 || n > prompt_all.size() || g == 0) { std::fprintf(stderr, "bad N/G\n"); return 1; }
+    const auto tmax = strix::cuda::decode_test::max_width();
+    const auto required = strix::cuda::decode_test::rollback_rows_required(tmax);
+    if (n < 2 || n > prompt_all.size() || g < required) {
+        std::fprintf(stderr, "bad N/G: require valid N and G >= %u for full rollback coverage and continuation\n", required);
+        return 1;
+    }
     std::vector<std::uint32_t> ref;
     if (argc > 7) ref = tokens_of(argv[7]);
     std::printf("loading...\n");
@@ -114,14 +120,17 @@ int main(int argc, char** argv) {
         bad += !ok;
     }
     // batch-width invariance: windows of T rows over [n-1, n-1+g) (the last window may be shorter)
-    for (std::uint32_t t = 2; t <= 8; ++t) {
+    // STRIX_QWEN_TMAX (default 8, up to 16): the widest window; 9..16 = one session's copy window (prefill-shaped families)
+    for (std::uint32_t t = 2; t <= tmax; ++t) {
         std::vector<std::uint32_t> pre(seq.begin(), seq.begin() + static_cast<std::ptrdiff_t>(n));
         p.run(pre, n - 1, drop);
         std::uint32_t diff = 0;
+        strix::cuda::decode_test::Coverage coverage;
         for (std::uint32_t i = 0; i < g; i += t) {
             const auto rows = std::min(t, g - i);
             const auto pos = n - 1 + i;
             const auto r = p.step(&seq[pos], rows, pos, true);
+            coverage.observe(rows, t);
             for (std::uint32_t k = 0; k < rows; ++k) {
                 const auto d = row_sha(r.logits.data() + std::uint64_t{k} * (r.logits.size() / rows), r.logits.size() / rows);
                 if (r.argmax[k] != gen[i + k] || d != digest[i + k]) {
@@ -131,19 +140,21 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        std::printf("T=%u %s (%u differing rows of %u)\n", t, diff == 0 ? "BIT-IDENTICAL" : "DIFFER", diff, g);
-        bad += diff != 0;
+        std::printf("T=%u %s (%u differing rows of %u)\n", t, !coverage.full_window ? "INCOMPLETE" : diff == 0 ? "BIT-IDENTICAL" : "DIFFER", diff, g);
+        bad += diff != 0 || !coverage.full_window;
     }
     // rollback: windows of T rows over the greedy sequence, committing only `keep` rows (cycling 1..T), so the next
     // window recomputes the dropped rows from rolled-back GDN/conv/PLE/n-gram state; every row must equal serial.
-    for (const std::uint32_t t : {8U, 3U}) {
+    for (std::uint32_t t = 2; t <= tmax; ++t) {
         std::vector<std::uint32_t> pre(seq.begin(), seq.begin() + static_cast<std::ptrdiff_t>(n));
         p.run(pre, n - 1, drop);
         std::uint32_t diff = 0, windows = 0, rows_done = 0;
+        strix::cuda::decode_test::Coverage coverage;
         for (std::uint32_t i = 0; i < g;) {
             const auto rows = std::min(t, g - i);
             const auto pos = n - 1 + i;
             const auto r = p.verify(&seq[pos], rows, pos, true);
+            coverage.observe(rows, t);
             for (std::uint32_t k = 0; k < rows; ++k) {
                 const auto d = row_sha(r.logits.data() + std::uint64_t{k} * (r.logits.size() / rows), r.logits.size() / rows);
                 if (r.argmax[k] != gen[i + k] || d != digest[i + k]) {
@@ -154,13 +165,14 @@ int main(int argc, char** argv) {
             }
             const auto keep = std::min(rows, 1U + windows % t);
             p.commit(keep);
+            coverage.commit(rows, t, keep);
             i += keep;
             rows_done += rows;
             ++windows;
         }
-        std::printf("rollback T=%u %s (%u windows, %u rows computed, %u differing)\n", t, diff == 0 ? "BIT-IDENTICAL" : "DIFFER",
+        std::printf("rollback T=%u %s (%u windows, %u rows computed, %u differing)\n", t, !coverage.complete(t) ? "INCOMPLETE" : diff == 0 ? "BIT-IDENTICAL" : "DIFFER",
                     windows, rows_done, diff);
-        bad += diff != 0;
+        bad += diff != 0 || !coverage.complete(t);
     }
     // spec invariance: MTP draft chain + verify window + commit(accepted); tokens and logits rows == serial (MTP off)
     if (!c.mtp_sidecar_gguf.empty()) {

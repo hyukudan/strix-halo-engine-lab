@@ -25,6 +25,7 @@
 #include "moe_core/int4_layer_policy.hpp"
 #include "glm/prefill/glm_pf_exact_moe.hpp"
 #include "glm/prefill/glm_pf_wmma.hpp"
+#include "glm/prefill/glm_pf_router_wmma.hpp"
 #include "glm/engine/glm_lib.hpp"
 #include "glm/engine/glm_pack.hpp"
 #include "glm/engine/glm_r1b.hpp"
@@ -605,6 +606,7 @@ struct Engine::Impl {
     unsigned null_elem = 0;
     float *X = nullptr, *X2 = nullptr, *F = nullptr, *mix = nullptr, *xc = nullptr, *xn = nullptr, *part = nullptr;
     float *logits = nullptr, *rlog = nullptr, *wts = nullptr, *hfin = nullptr, *hidden = nullptr, *amv = nullptr;
+    std::uint32_t* rflags = nullptr;  // guard flags of the FAST prefill router (glm-pf-router-wmma-v1), RW rows, zero
     float *dg = nullptr, *du = nullptr, *da = nullptr;
     std::uint32_t *ids = nullptr, *tok_d = nullptr, *ami = nullptr, *slot_d = nullptr;
     std::uint64_t* pos_d = nullptr;
@@ -1738,6 +1740,7 @@ struct Engine::Impl {
         hidden = lib.buffer<float>(RW * kHidden);
         logits = lib.buffer<float>(R * std::max<std::size_t>(vocab_n, kExperts));
         rlog = lib.buffer<float>(RW * kExperts);
+        if (glm::pf::router_wmma::enabled()) rflags = lib.state<std::uint32_t>(RW);  // zeroed; FAST router only
         wts = lib.buffer<float>(RW * kTopE);
         ids = lib.buffer<std::uint32_t>(RW * kTopE);
         tok_d = lib.buffer<std::uint32_t>(RW);
@@ -1835,6 +1838,14 @@ struct Engine::Impl {
         if (route_log && route_log_d != nullptr && cur_layer < kLayers + 1)
             hip_ok(hipMemcpyAsync(route_log_d + static_cast<std::size_t>(cur_layer) * kTopE, ids, kTopE * 4, hipMemcpyDeviceToDevice, stream), "route log");
     }
+    // Prefill router logits of `rows` rows starting at engine row `row0`: the exact R1 chains (dense_rows), or the FAST
+    // product on the shared WMMA core (glm-pf-router-wmma-v1, opt-in; D::route after it is unchanged).
+    void pf_router(const float* x, const MoeLayerWeights& w, float* log, unsigned rows, std::size_t row0, hipStream_t s) {
+        if (rflags != nullptr && glm::pf::router_wmma::supported(rows))
+            glm::pf::router_wmma::logits(x, w.router, log, rows, rflags + row0, s);
+        else
+            glm::pf::dense_rows(x, w.router, D::WType::F16, kHidden, 0, kExperts, log, rows, s);
+    }
     void router_route_impl(const float* x, const MoeLayerWeights& w, unsigned R) {
         if (r1b) {  // default generated identity: blocked router logits; selection / weights (R5 / R14) unchanged
             const int variant = strix::glm::r1b::dense_variant();
@@ -1931,7 +1942,7 @@ struct Engine::Impl {
                 float* log = rlog + q * kExperts;
                 std::uint32_t* id = ids + q * kTopE;
                 float* wt = wts + q * kTopE;
-                glm::pf::dense_rows(x, w.moew.router, D::WType::F16, kHidden, 0, kExperts, log, h.count, stream);
+                pf_router(x, w.moew, log, h.count, q, stream);
                 D::route(log, w.moew.bias, id, wt, h.count, stream);
                 if (pf->moe_by_row()) {
                     const unsigned B = std::clamp(pf->moe_row_block(), 1U, 8U);
@@ -2105,7 +2116,7 @@ struct Engine::Impl {
                     auto* wt = wts + std::size_t{first} * kTopE;
                     auto* log = rlog + std::size_t{first} * kExperts;
                     // Router and matrix-specific MoE input transforms stay replicated.
-                    glm::pf::dense_rows(x, w.moew.router, D::WType::F16, kHidden, 0, kExperts, log, count, half_stream);
+                    pf_router(x, w.moew, log, count, first, half_stream);
                     D::route(log, w.moew.bias, id, wt, count, half_stream);
                     if (pf->moe_by_row()) {
                         const unsigned B = std::clamp(pf->moe_row_block(), 1U, 8U);
@@ -2336,7 +2347,7 @@ struct Engine::Impl {
             const float* produced = nullptr;  // the FFN partial when its producer wrote the TX slot
             if (w.moe) {
                 if (pfc) {  // chunk rows: the row-tiled router chain (== decode bits) + R14 route
-                    glm::pf::dense_rows(xn, w.moew.router, D::WType::F16, kHidden, 0, kExperts, rlog, R, stream);
+                    pf_router(xn, w.moew, rlog, R, 0, stream);
                     D::route(rlog, w.moew.bias, ids, wts, R, stream);
                     if (pf->moe_by_row()) {  // the engine's MoE seam, blocks of <= 8 rows: the decode identity (batch invariant)
                         const unsigned B = std::clamp(pf->moe_row_block(), 1U, 8U);
@@ -2781,7 +2792,7 @@ struct Engine::Impl {
         add_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, stream>>>(m_z, part, m_r, n);  // r = z + attn
         D::GlmNorm::run(m_r, w.post_norm, D::WType::BF16, kHidden, kEps, xn, R, stream);
         if (pfc) {
-            glm::pf::dense_rows(xn, w.moew.router, D::WType::F16, kHidden, 0, kExperts, rlog, R, stream);
+            pf_router(xn, w.moew, rlog, R, 0, stream);
             D::route(rlog, w.moew.bias, ids, wts, R, stream);
             if (pf->moe_by_row()) {
                 const unsigned B = std::clamp(pf->moe_row_block(), 1U, 8U);

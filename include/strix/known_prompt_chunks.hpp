@@ -126,6 +126,15 @@ struct KnownPromptChunkFrontier {
 // is sticky, is called only between chunks and does not destroy those owners.
 // On a backend error the cursor cannot resume; its counters describe only
 // completed calls, not rollback of an opaque possibly poisoned target.
+// One stage's cursor frontier (pair interleaved virtual stages: one cursor per rank, a frontier per stage).
+struct KnownPromptChunkStageView {
+    KnownPromptChunkProgress progress;
+    KnownPromptChunkUnit last_unit;
+    int balanced = -1;
+    std::vector<float> logits;
+    std::optional<std::uint32_t> selection;
+    bool has_logits = false;
+};
 class KnownPromptChunkCursor final {
 public:
     KnownPromptChunkCursor(KnownPromptChunkRequest request,
@@ -153,6 +162,10 @@ public:
     [[nodiscard]] const SerialGreedyRequestResult& finish_greedy();
     [[nodiscard]] const KnownPromptChunkProgress& progress() const noexcept { return progress_; }
     [[nodiscard]] KnownPromptChunkFrontier frontier() const noexcept;
+    // Thin per-stage accessors: a copy of this cursor's frontier (a stage's starting view) and an exchange of the
+    // frontier with a stage's view around each (stage, chunk) step. Never while a deferred block is pending.
+    [[nodiscard]] KnownPromptChunkStageView stage_view() const;
+    void swap_stage(KnownPromptChunkStageView& view);
     [[nodiscard]] const std::optional<SerialGreedyRequestResult>& generation() const noexcept { return generation_; }
 private:
     KnownPromptChunkRequest request_;

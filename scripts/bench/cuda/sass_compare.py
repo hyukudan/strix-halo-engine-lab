@@ -11,7 +11,8 @@ Symbol mappings apply to baseline definitions and call targets, never substrings
                   [--symbol-rename OLD=NEW] [--cuobjdump PATH] [--out report.txt] [--no-exe]
 
 Exit 0 requires nonzero CUDA coverage in every pair and no differences or errors.
-Only paired executables with successful, empty disassembly are treated as host-only.
+Paired executables and explicitly declared added CUDA objects (--new-host-only PATH)
+are treated as host-only only after successful, empty disassembly.
 """
 import argparse
 import os
@@ -112,6 +113,8 @@ def main():
     ap.add_argument('--new', action='append', required=True)
     ap.add_argument('--rename', action='append', default=[], help='old/path=new/path for moved artifacts')
     ap.add_argument('--symbol-rename', action='append', default=[], help='exact old_symbol=new_symbol for reviewed moves')
+    ap.add_argument('--new-host-only', action='append', default=[], metavar='PATH',
+                    help='added relative CUDA object path requiring successful empty disassembly')
     ap.add_argument('--cuobjdump', default=shutil.which('cuobjdump') or 'cuobjdump')
     ap.add_argument('--out')
     ap.add_argument('--no-exe', action='store_true', help='objects only (faster)')
@@ -121,6 +124,7 @@ def main():
     try:
         rename = mappings(a.rename, paths=True)
         symbols = mappings(a.symbol_rename)
+        host_only = mappings([path + '=' + path for path in a.new_host_only], paths=True)
     except ValueError as error:
         ap.error(str(error))
     lines, same, diff = [], 0, 0
@@ -131,6 +135,10 @@ def main():
             targets = [rename.get(x, x) for x in fb]
             if len(set(targets)) != len(targets):
                 raise ValueError('artifact mapping collision')
+            added = set(fn) - set(targets)
+            for name in host_only:
+                if name not in added or not name.endswith(OBJ):
+                    raise ValueError('host-only declaration is not an added object: ' + name)
         except (OSError, ValueError) as error:
             diff += 1
             lines.append('ERROR ' + str(error))
@@ -162,6 +170,16 @@ def main():
             lines.append('DIFF %s: functions %d/%d, only-base %d, only-new %d, body differs %d %s'
                          % (name, len(kb), len(kn), len(kb - kn), len(kn - kb), len(bad), bad[:2]))
         for name in sorted(set(fn) - set(targets)):
+            if name in host_only:
+                try:
+                    if sass(a.cuobjdump, fn[name]):
+                        raise ValueError('declared host-only object has SASS: ' + name)
+                except (OSError, ValueError) as error:
+                    diff += 1
+                    lines.append('ERROR ' + str(error))
+                else:
+                    lines.append('NEW-HOST-ONLY ' + name)
+                continue
             diff += 1
             lines.append('NEW-ONLY ' + name)
         if not coverage:

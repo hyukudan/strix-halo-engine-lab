@@ -25,7 +25,10 @@ using ::strix::profile::kind_name;
 using ::strix::profile::status_name;
 #include "strix/qwen_profile_table.hpp"
 inline std::span<const Lever> levers() { return table; }
-inline Name parse(std::string_view value) { return ::strix::profile::parse(value); }  // default|fast|quality|turbo
+inline Name parse(std::string_view value) {
+    if (value == "exact") return Name::standard;
+    return ::strix::profile::parse(value);
+}  // default|fast|quality|turbo
 inline constexpr std::string_view kTurboVersion = "qwen-turbo-v1";
 // Weight sources this build loads under turbo (onfly / converted flip to runnable with their loaders).
 inline constexpr ::strix::profile::turbo::WeightCaps kWeightCaps{
@@ -244,7 +247,8 @@ inline bool metadata_environment(std::string_view key) {
 inline bool policy_option(std::string_view key) {
     return key == "--profile" || key == "--allow-pending";
 }
-inline bool take_option(int argc, char** argv, int& i, std::optional<Name>& profile, Inputs& inputs) {
+inline bool take_option(int argc, char** argv, int& i, std::optional<Name>& profile, Inputs& inputs,
+        std::span<const Lever> rows = levers()) {
     const std::string_view arg = argv[i];
     const auto equal = arg.find('=');
     const auto key = arg.substr(0, equal);
@@ -259,7 +263,7 @@ inline bool take_option(int argc, char** argv, int& i, std::optional<Name>& prof
         return true;
     }
     const Lever* lever = nullptr;
-    for (const auto& row : levers()) if (!row.native_option && key == row.option) lever = &row;
+    for (const auto& row : rows) if (!row.native_option && key == row.option) lever = &row;
     if (key != "--profile" && !lever) return false;
     const auto value = equal != std::string_view::npos ? arg.substr(equal + 1U) :
         (i + 1 < argc ? std::string_view(argv[++i]) : std::string_view{});

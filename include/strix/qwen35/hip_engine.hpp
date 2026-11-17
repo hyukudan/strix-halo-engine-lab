@@ -8,6 +8,7 @@
 //   from the saved raw inputs; k == 0 restores only. Rows are bitwise equal to row-by-row decode (every reduction order is
 //   independent of the row count).
 // Home: specific (model layer composition: qwen35 GDN/attention interleave); every kernel is shared (backend core).
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -29,10 +30,23 @@ struct HipEngineOptions {
 struct HipRowsOut {
     const float* logits = nullptr;       // device [rows][vocab] (all) or [1][vocab] (last); null for none
     const std::uint32_t* top = nullptr;  // device [rows] argmax (lowest index on ties) (all) or [1] (last)
+    // Only with an MTP layer loaded (load_mtp): per-row trunk hidden of EVERY row of the window (valid until the next forward).
+    const float* hidden_post = nullptr;  // device [rows][hidden] after the final norm
+    const float* hidden_pre = nullptr;   // device [rows][hidden] residual stream before the final norm
+};
+
+// MTP layer outputs (device pointers valid until the next mtp_forward); same contract as the CUDA engine's MtpOut.
+struct HipMtpOut {
+    const float* logits = nullptr;  // [rows][vocab] (want_top)
+    const std::uint32_t* top = nullptr;
+    const float* hidden_pre = nullptr;   // MTP block output before shared_head_norm
+    const float* hidden_post = nullptr;  // after shared_head_norm
 };
 
 class HipEngine {
 public:
+    using Rows = HipRowsOut;   // shared MtpChain binding (strix/spec/mtp_chain.hpp)
+    using MtpOut = HipMtpOut;
     using LogitRows = qwen35::LogitRows;
     ~HipEngine();
     HipEngine(const HipEngine&) = delete;
@@ -58,6 +72,23 @@ public:
     void read_top(const HipRowsOut& o, std::uint32_t rows, std::uint32_t* host) const;  // synchronizes
     void read_logits(const HipRowsOut& o, std::uint32_t rows, float* host) const;       // [rows][vocab], synchronizes
     void sync() const;
+
+    // MTP layer (blk.<layers>.* of a side GGUF: attn_norm, post_attention_norm, ffn_*, attn_q/k/v/output, q/k norms, nextn.enorm /
+    // hnorm / eh_proj / shared_head_norm; bf16 or q8_0 matrices, F32 norms). The embedding and lm_head are the trunk's.
+    // Call once after from_gguf; afterwards forward_rows / forward_commit also return hidden_pre / hidden_post (one extra final
+    // norm launch per pass; the logits path is unchanged). Without load_mtp nothing changes.
+    void load_mtp(const std::string& path);
+    [[nodiscard]] bool has_mtp() const;
+    [[nodiscard]] static constexpr std::uint32_t mtp_max_rows() { return 16U; }
+    // Row r runs at position pos0 + r with input token next_tokens[r] (the token FOLLOWING the hidden's position) and
+    // hidden_dev[r] = the trunk hidden of position pos0 + r. Rows are causal inside the call; earlier positions must have been
+    // written by earlier calls (own bf16 KV, positions explicit). want_top=false skips lm_head + argmax.
+    HipMtpOut mtp_forward(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0,
+                          bool want_top = true);
+    // Device helpers for the shared chain glue (all on the engine stream).
+    [[nodiscard]] float* alloc_f32(std::size_t n) const;
+    void free_f32(float* p) const;
+    void copy_f32_async(float* dst, const float* src, std::size_t n) const;
     // Timing only: set the committed length to `pos` WITHOUT computing (KV / state keep their contents; positions below pos are
     // whatever the cache holds). Used to sample window cost at long context without running the whole prefill.
     void bench_seek(std::uint32_t pos);

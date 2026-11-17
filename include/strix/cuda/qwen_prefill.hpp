@@ -65,8 +65,18 @@ struct Config {
     // Explicit unqualified CUDA A8 route-storage candidate. Omitted: environment;
     // false: individual OFF. Baseline/defaults/exact masters always suppress it.
     std::optional<bool> moe_route_bf16;
+    // Frozen by the common resolver; direct API callers resolve once at construction.
+    std::optional<qwen_route::Policy> route_policy;
     // Explicit source diagnostic only: does not admit ordinary product MTP.
     bool diagnostic_bf16_mtp = false;
+    // Prefill arithmetic forms of the FAST profile (CUDA numerical identities, include/strix/profiles/qwen_cuda.hpp).
+    // All false = the exact CUDA path. Set only by the profile resolver (or its named overrides), never by getenv here.
+    struct Forms {
+        bool hc_mma = false;   // hyper-connection projection / output on FP16 tensor cores, FP32 accumulation
+        bool mtp_mma = false;  // MTP fused projection on FP16 tensor cores, FP32 accumulation
+        bool qsa_mma = false;  // QSA prefill attention (scores and output) on FP16 tensor cores, FP32 accumulation
+        bool moe_mma = false;  // routed-MoE prefill project/down: int8 IMMA block dots, ONE FP32 FMA chain per output (not the HIP four)
+    } forms;
 };
 
 // Diagnostic snapshot, not the node wire or a portable session/cache format.
@@ -103,6 +113,9 @@ struct Timing {
     double total_s = 0, first_block_s = 0;
     std::vector<double> block_s;       // per block, device time
     std::uint64_t rows = 0;
+    // Forms dispatched by this run, reported only after successful device synchronization.
+    Config::Forms executed_forms;
+    bool executed_moe_route_bf16 = false;
 };
 
 // One decode/verify step: rows consecutive tokens at positions [position, position + rows) continuing the session
@@ -251,7 +264,8 @@ public:
     // excluded; decode windows of the other sessions may keep running), else finalized as prefill_wait().
     std::optional<PrefillChunk> prefill_poll();
     [[nodiscard]] bool prefill_pending() const;
-    // Cohort verify window: the sessions' rows concatenated session-major (total 1..8 rows, distinct sessions). The
+    // Cohort verify window: the sessions' rows concatenated session-major (total 1..16 rows, <= 8 distinct sessions;
+    // windows of 9..16 rows, also one session's copy window, run the row-independent families prefill-shaped). The
     // row-independent families (dense A8, HC, router, shared expert, routed MoE, LM head, argmax) run once over all rows;
     // GDN cores, QSA attention, PLE tails and conv histories run per session on its own state and positions. Every row's
     // bits equal the same session's verify() alone. Results are per cohort entry. commit_cohort(keep[i]) (1 <= keep[i] <=

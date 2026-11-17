@@ -1548,6 +1548,11 @@ struct ApiService::Impl {
                 throw ApiError(400, "invalid_request_error", "draft_depth_max must be an integer in [0, 8]", "draft_depth_max");
             job.draft_depth_max = static_cast<std::uint32_t>(depth->as_int());
         }
+        if (const auto* rows = body.find("copy_rows"); rows && !rows->is_null()) {
+            if (!rows->is_number() || rows->as_int() < 0 || rows->as_int() > 16)
+                throw ApiError(400, "invalid_request_error", "copy_rows must be an integer in [0, 16]", "copy_rows");
+            job.copy_rows = static_cast<std::uint32_t>(rows->as_int());
+        }
         if (const auto* tool = body.find("tool_draft"); tool && !tool->is_null()) {
             if (!tool->is_bool()) throw ApiError(400, "invalid_request_error", "tool_draft must be a boolean", "tool_draft");
             job.tool_draft = tool->as_bool();
@@ -1557,7 +1562,7 @@ struct ApiService::Impl {
             job.ngram_peers = peers->as_bool();
         }
         if (!job.session_id.empty() && (job.ngram_draft.value_or(false) || job.tool_draft.value_or(false) ||
-            job.ngram_peers.value_or(false) || job.draft_depth_max))
+            job.ngram_peers.value_or(false) || job.draft_depth_max || job.copy_rows))
             throw ApiError(400, "invalid_request_error", "session mode requires its fixed draft policy; request draft overrides are unsupported");
         if (api_request_scope) {
             job.client_gone = [connection = api_request_scope->connection] { return connection->gone(); };

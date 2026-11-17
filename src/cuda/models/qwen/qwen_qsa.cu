@@ -2,7 +2,9 @@
 // HIP references: src/hip_indexed_attention_launcher.hip (H: line numbers below), ISA
 // the gfx1151 disassembly of hip_indexed_attention_launcher (S: line numbers).
 // Every FP operation is an explicit IEEE intrinsic (__fadd_rn, __fmul_rn, __fmaf_rn, __fdiv_rn) in the HIP order.
+#include "../../core/attention_tile.cuh"
 #include "strix/env_flags.hpp"
+#include "strix/cuda/core/decode_rows.hpp"
 #include "strix/cuda/qwen_qsa.hpp"
 #include "strix/cuda/vram_guard.hpp"
 
@@ -42,8 +44,11 @@ void check(cudaError_t e, const char* what) {
 constexpr unsigned kIdxRows = 8, kIdxOuts = 4, kIdxOutputs = kIndexQWidth + kIndexDim, kIdxSlice = 64;
 constexpr unsigned kIdxPairs = kIdxRows * kIdxOuts;  // 32
 constexpr std::size_t kIdxSmem = kIdxRows * kHidden * sizeof(std::uint16_t) + kIdxPairs * 256U * sizeof(float);
-static_assert(kIdxSlice % kIdxOuts == 0 && kIdxOutputs % kIdxSlice == 0);
+// Decode form (rows <= 8): kIdxWide outputs per CTA (same per-output arithmetic), 640/kIdxWide CTAs instead of 10.
+constexpr unsigned kIdxWide = 4;
+static_assert(kIdxSlice % kIdxOuts == 0 && kIdxOutputs % kIdxSlice == 0 && kIdxWide % kIdxOuts == 0 && kIdxOutputs % kIdxWide == 0);
 
+template <unsigned kSlice>
 __global__ __launch_bounds__(256) void indexer_kernel(const std::uint16_t* __restrict__ hidden, std::uint32_t rows,
     const std::uint16_t* __restrict__ wq, const std::uint16_t* __restrict__ wk, float* __restrict__ iq, float* __restrict__ ik) {
     extern __shared__ __align__(16) unsigned char smem[];
@@ -59,7 +64,7 @@ __global__ __launch_bounds__(256) void indexer_kernel(const std::uint16_t* __res
         for (unsigned i = t; i < total; i += 256U) dst[i] = i < n ? src[i] : make_uint4(0, 0, 0, 0);
     }
     __syncthreads();
-    for (unsigned o0 = blockIdx.y * kIdxSlice; o0 < (blockIdx.y + 1U) * kIdxSlice; o0 += kIdxOuts) {
+    for (unsigned o0 = blockIdx.y * kSlice; o0 < (blockIdx.y + 1U) * kSlice; o0 += kIdxOuts) {
         float w[kIdxOuts][10];
 #pragma unroll
         for (unsigned oo = 0; oo < kIdxOuts; ++oo) {
@@ -748,6 +753,197 @@ __global__ __launch_bounds__(kOutThreads) void attention_output_head_kernel(cons
     attention_output_head_kernel_body(q_gate, first_position, all_selected, kv, all_scores, output, tables);
 }
 
+// STRIX_QRTX_QSA_HEAD (default 1): same per-thread chains (s0/s1 = fma(w[slot], v, s), slots ascending from 0) and epilogue as the
+// body above, but the V rows (512 B per slot for this KV head) are streamed by cp.async into a ring of 7 stages x 8 slots
+// (6 stages in flight, one __syncthreads per stage) and the scores/tokens of every slot are preloaded once, so the walk over the
+// slots no longer pays one L2 round trip per 8 slots. Static smem 45 KB.
+constexpr unsigned kPipeKeys = 8, kPipeStages = 7, kVRowBytes = kHeadDim * 2U;
+__device__ __forceinline__ void qsa_cp16(void* dst, const void* src) {
+    const auto d = static_cast<unsigned>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(src) : "memory");
+}
+__device__ __forceinline__ void qsa_cp_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+template <int N>
+__device__ __forceinline__ void qsa_cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory"); }
+__device__ __forceinline__ void attention_output_head_pipe_body(const float* __restrict__ q_gate,
+    std::uint64_t first_position, const std::uint32_t* __restrict__ all_selected, const std::uint16_t* __restrict__ kv,
+    const float* __restrict__ all_scores, float* __restrict__ output, am::Tables tables) {
+    __shared__ __align__(16) unsigned char ring[kPipeStages * kPipeKeys * kVRowBytes];
+    __shared__ float ws[kMaxSelected];
+    __shared__ std::uint32_t tok[kMaxSelected];
+    const auto head = blockIdx.x, r = blockIdx.y, t = threadIdx.x, kvh = head / kG;
+    const auto count = selected_count(first_position + r);
+    const std::uint32_t* selected = all_selected + static_cast<std::uint64_t>(r) * kMaxSelected;
+    const float* scores = all_scores + (static_cast<std::uint64_t>(r) * kHeads + head) * kMaxSelected;
+    const std::uint16_t* vsrc = kv + kKvWidth + kvh * kHeadDim;
+    for (unsigned i = t; i < count; i += kOutThreads) { ws[i] = scores[i]; tok[i] = selected[i]; }
+    __syncthreads();
+    const unsigned nst = (count + kPipeKeys - 1U) / kPipeKeys;
+    auto issue = [&](unsigned st) {
+        if (st < nst) {
+            unsigned char* slot = ring + (st % kPipeStages) * kPipeKeys * kVRowBytes;
+            for (unsigned j = t; j < kPipeKeys * 32U; j += kOutThreads) {
+                const unsigned b = j >> 5U, key = st * kPipeKeys + b;
+                if (key < count) qsa_cp16(slot + b * kVRowBytes + (j & 31U) * 16U, vsrc + static_cast<std::uint64_t>(tok[key]) * (kKvWidth * 2ULL) + (j & 31U) * 8U);
+            }
+        }
+        qsa_cp_commit();
+    };
+#pragma unroll
+    for (unsigned s = 0; s + 1U < kPipeStages; ++s) issue(s);
+    float s0 = 0.0F, s1 = 0.0F;
+    for (unsigned st = 0; st < nst; ++st) {
+        qsa_cp_wait<static_cast<int>(kPipeStages) - 2>();
+        __syncthreads();
+        issue(st + kPipeStages - 1U);
+        const unsigned char* slot = ring + (st % kPipeStages) * kPipeKeys * kVRowBytes + 4U * t;
+        const unsigned n = min(kPipeKeys, count - st * kPipeKeys);
+        if (n == kPipeKeys) {
+#pragma unroll
+            for (unsigned b = 0; b < kPipeKeys; ++b) {
+                const auto raw = *reinterpret_cast<const std::uint32_t*>(slot + b * kVRowBytes);
+                const float w = ws[st * kPipeKeys + b];
+                s0 = __fmaf_rn(w, __uint_as_float(raw << 16U), s0);
+                s1 = __fmaf_rn(w, __uint_as_float(raw & 0xffff0000U), s1);
+            }
+        } else {
+            for (unsigned b = 0; b < n; ++b) {
+                const auto raw = *reinterpret_cast<const std::uint32_t*>(slot + b * kVRowBytes);
+                const float w = ws[st * kPipeKeys + b];
+                s0 = __fmaf_rn(w, __uint_as_float(raw << 16U), s0);
+                s1 = __fmaf_rn(w, __uint_as_float(raw & 0xffff0000U), s1);
+            }
+        }
+    }
+    const float* qg = q_gate + static_cast<std::uint64_t>(r) * kQGateWidth;
+    float* out = output + static_cast<std::uint64_t>(r) * kAttnWidth;
+#pragma unroll
+    for (unsigned e = 0; e < 2U; ++e) {
+        const auto f = 2U * t + e;
+        const float attn = round_bf16(e ? s1 : s0);
+        const float g = qg[static_cast<std::uint64_t>(head) * kHeadDim * 2ULL + kHeadDim + f];
+        const float gate = round_bf16(__fdiv_rn(1.0F, __fadd_rn(1.0F, am::amd_expf(tables, -g))));
+        out[static_cast<std::uint64_t>(head) * kHeadDim + f] = round_bf16(__fmul_rn(attn, gate));
+    }
+}
+__global__ __launch_bounds__(kOutThreads) void attention_output_head_pipe_kernel(const float* __restrict__ q_gate,
+    std::uint64_t first_position, const std::uint32_t* __restrict__ all_selected, const std::uint16_t* __restrict__ kv,
+    const float* __restrict__ all_scores, float* __restrict__ output, am::Tables tables) {
+    attention_output_head_pipe_body(q_gate, first_position, all_selected, kv, all_scores, output, tables);
+}
+bool head_pipe_enabled() {
+    static const bool on = strix::envcfg::flag("STRIX_QRTX_QSA_HEAD", true);
+    return on;
+}
+bool idx_wide_enabled() {
+    static const bool on = strix::envcfg::flag("STRIX_QRTX_QSA_IDX", true);
+    return on;
+}
+
+// ------------------------------------------------------------------------------------------------------------------
+// FAST form (Config::forms.qsa_mma): the whole attention of a prefill row (scores + softmax + weighted values + gate) as one
+// flash kernel on BF16 tensor cores (core/attention_tile.cuh). CTA = (KV head, row), 3 warps; the row's selected keys are
+// split in chunks of 16 (warp w owns chunks w, w+3, ...); the 12 heads of the KV head are the M rows (padded to 16 with
+// zeros). K / V chunks of a warp stream through a 3-slot cp.async ring (two items in flight); the KV cache is BF16 so no
+// conversion. Per warp running (max, sum, O) in registers, merged through shared memory. Keys past count are excluded
+// exactly (P = 0). Not bit-comparable with the exact path: BF16 Q, base-2 online softmax with ex2.approx, P in BF16,
+// gate via __expf; accumulation FP32.
+constexpr unsigned kMmaWarps = 3, kMmaChunk = 16, kMmaQS = kHeadDim + 8U, kMmaSlot = kMmaChunk * kMmaQS;  // elements
+constexpr std::size_t kMmaSmem = (16U * kMmaQS + kMmaWarps * 3U * kMmaSlot) * sizeof(std::uint16_t);
+static_assert(kMmaSmem <= 99U * 1024U, "qsa mma msm");
+__global__ __launch_bounds__(kMmaWarps * 32, 1) void attention_mma_kernel(const float* __restrict__ q_gate,
+    std::uint64_t first_position, const std::uint32_t* __restrict__ all_selected, const std::uint16_t* __restrict__ kv,
+    float* __restrict__ output) {
+    extern __shared__ __align__(16) std::uint16_t msm[];
+    std::uint16_t* const qs = msm;
+    const unsigned tid = threadIdx.x, warp = tid >> 5U, lane = tid & 31U;
+    const auto kvh = blockIdx.x, r = blockIdx.y;
+    const auto count = selected_count(first_position + r);
+    const unsigned nchunks = (count + kMmaChunk - 1U) / kMmaChunk;
+    const unsigned mine = nchunks > warp ? (nchunks - warp + kMmaWarps - 1U) / kMmaWarps : 0U;
+    const float* qrow = q_gate + static_cast<std::uint64_t>(r) * kQGateWidth + static_cast<std::uint64_t>(kvh) * kG * kHeadDim * 2ULL;
+    for (unsigned i = tid; i < 16U * kHeadDim; i += kMmaWarps * 32U) {
+        const unsigned h = i / kHeadDim, d = i % kHeadDim;
+        qs[h * kMmaQS + d] = h < kG ? to_bf16(qrow[static_cast<std::uint64_t>(h) * kHeadDim * 2ULL + d]) : static_cast<std::uint16_t>(0);
+    }
+    __syncthreads();
+    namespace cp = strix::cuda::core::ptx;
+    namespace at = strix::cuda::core::attn;
+    std::uint16_t* const ring = msm + 16U * kMmaQS + warp * 3U * kMmaSlot;
+    const std::uint32_t* selected = all_selected + static_cast<std::uint64_t>(r) * kMaxSelected;
+    const auto issue = [&](unsigned item) {  // item 2c = K of local chunk c, 2c + 1 = V
+        if (item < 2U * mine) {
+            const unsigned chunk = warp + kMmaWarps * (item >> 1U), slot = chunk * kMmaChunk + (lane & 15U);
+            const auto tok = slot < count ? selected[slot] : 0U;
+            const std::uint16_t* src = kv + static_cast<std::uint64_t>(kvh) * kHeadDim + ((item & 1U) ? kKvWidth : 0U) + lane * 8U;
+            std::uint16_t* dst = ring + (item % 3U) * kMmaSlot + lane * 8U;
+#pragma unroll
+            for (unsigned i = 0; i < kMmaChunk; ++i) {
+                const auto t = __shfl_sync(kFull, tok, static_cast<int>(i));
+                cp::cp_async16(dst + i * kMmaQS, src + static_cast<std::uint64_t>(t) * (kKvWidth * 2ULL));
+            }
+        }
+        cp::cp_async_commit();
+    };
+    constexpr int NT = kHeadDim / 8;
+    float o[NT][4];
+#pragma unroll
+    for (int i = 0; i < NT; ++i) { o[i][0] = 0.0F; o[i][1] = 0.0F; o[i][2] = 0.0F; o[i][3] = 0.0F; }
+    float m[2] = {__uint_as_float(0xff800000U), __uint_as_float(0xff800000U)}, l[2] = {0.0F, 0.0F};
+    constexpr float kScale = 0.0625F * 1.44269504088896341F;  // 1/sqrt(256) * log2(e)
+    issue(0U); issue(1U);
+#pragma unroll 1
+    for (unsigned c = 0; c < mine; ++c) {
+        const unsigned valid = min(kMmaChunk, count - (warp + kMmaWarps * c) * kMmaChunk);
+        cp::cp_async_wait<1>();
+        __syncwarp();
+        issue(2U * c + 2U);
+        float s[2][4];
+        at::qk_tile16<kHeadDim, kMmaQS, kMmaQS>(s, qs, ring + ((2U * c) % 3U) * kMmaSlot, lane);
+        unsigned pa[4];
+        at::online_softmax16<NT>(s, valid, kScale, m, l, o, pa, lane);
+        cp::cp_async_wait<1>();
+        __syncwarp();
+        issue(2U * c + 3U);
+        at::pv_tile16<kHeadDim, kMmaQS>(o, pa, ring + ((2U * c + 1U) % 3U) * kMmaSlot, lane);
+    }
+    cp::cp_async_wait<0>();
+    __syncthreads();
+    // merge the warps: O [warp][12][256] f32 over the ring memory, m / l [warp][16] over the Q tile
+    float* const ow = reinterpret_cast<float*>(msm + 16U * kMmaQS) + warp * (16U * kHeadDim);
+    float* const ml = reinterpret_cast<float*>(msm);
+    const unsigned g = lane >> 2U, t = lane & 3U;
+    l[0] += __shfl_xor_sync(kFull, l[0], 1); l[0] += __shfl_xor_sync(kFull, l[0], 2);
+    l[1] += __shfl_xor_sync(kFull, l[1], 1); l[1] += __shfl_xor_sync(kFull, l[1], 2);
+    if (t == 0) {
+        ml[warp * 32U + g] = m[0]; ml[warp * 32U + 16U + g] = l[0];
+        ml[warp * 32U + g + 8U] = m[1]; ml[warp * 32U + 16U + g + 8U] = l[1];
+    }
+#pragma unroll
+    for (int i = 0; i < NT; ++i) {
+        *reinterpret_cast<float2*>(ow + g * kHeadDim + i * 8 + 2 * t) = make_float2(o[i][0], o[i][1]);
+        *reinterpret_cast<float2*>(ow + (g + 8U) * kHeadDim + i * 8 + 2 * t) = make_float2(o[i][2], o[i][3]);
+    }
+    __syncthreads();
+    const float* const qg = q_gate + static_cast<std::uint64_t>(r) * kQGateWidth;
+    float* const out = output + static_cast<std::uint64_t>(r) * kAttnWidth;
+    for (unsigned i = tid; i < kG * kHeadDim; i += kMmaWarps * 32U) {
+        const unsigned h = i / kHeadDim, f = i % kHeadDim;
+        float mx = ml[h];
+        for (unsigned w = 1; w < kMmaWarps; ++w) mx = fmaxf(mx, ml[w * 32U + h]);
+        float num = 0.0F, den = 0.0F;
+        for (unsigned w = 0; w < kMmaWarps; ++w) {
+            const float a = at::ex2(ml[w * 32U + h] - mx);
+            num += a * reinterpret_cast<const float*>(msm + 16U * kMmaQS)[w * (16U * kHeadDim) + h * kHeadDim + f];
+            den += a * ml[w * 32U + 16U + h];
+        }
+        const auto head = kvh * kG + h;
+        const float attn = round_bf16(num / den);
+        const float gate = round_bf16(1.0F / (1.0F + __expf(-qg[static_cast<std::uint64_t>(head) * kHeadDim * 2ULL + kHeadDim + f])));
+        out[static_cast<std::uint64_t>(head) * kHeadDim + f] = round_bf16(attn * gate);
+    }
+}
+
 // ------------------------------------------------------------------------------------------------------------------
 // Multi-segment launches (decode cohort windows, layer_core_multi): one launch per step for every session of a window.
 // Every block (score kernel: every wave) belongs to one segment and runs the single-call body with that segment's
@@ -837,6 +1033,13 @@ __global__ __launch_bounds__(kOutThreads) void attention_output_head_multi_kerne
     const unsigned seg = seg_of(map, blockIdx.y);
     attention_output_head_kernel_body(q_gate, base_position(map, seg), all_selected, map.kv[seg], all_scores, output, tables);
 }
+template <class MapArg>
+__global__ __launch_bounds__(kOutThreads) void attention_output_head_multi_pipe_kernel(const float* __restrict__ q_gate, MapArg mapa,
+    const std::uint32_t* __restrict__ all_selected, const float* __restrict__ all_scores, float* __restrict__ output, am::Tables tables) {
+    const SegmentMap& map = map_of(mapa);
+    const unsigned seg = seg_of(map, blockIdx.y);
+    attention_output_head_pipe_body(q_gate, base_position(map, seg), all_selected, map.kv[seg], all_scores, output, tables);
+}
 
 }  // namespace
 
@@ -867,12 +1070,15 @@ void indexer_projection(const std::uint16_t* hidden, std::uint32_t rows, const L
     float* index_key, cudaStream_t stream) {
     if (!rows) return;
     static const bool attr = [] {
-        check(cudaFuncSetAttribute(indexer_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kIdxSmem)), "indexer smem attr");
+        check(cudaFuncSetAttribute(indexer_kernel<kIdxSlice>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kIdxSmem)), "indexer smem attr");
+        check(cudaFuncSetAttribute(indexer_kernel<kIdxWide>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kIdxSmem)), "indexer smem attr");
         return true;
     }();
     (void)attr;
-    const dim3 grid((rows + kIdxRows - 1U) / kIdxRows, (kIdxOutputs + kIdxSlice - 1U) / kIdxSlice);
-    indexer_kernel<<<grid, 256, kIdxSmem, stream>>>(hidden, rows, w.index_q_proj, w.index_k_proj, index_query, index_key);
+    if (rows <= kIdxRows && idx_wide_enabled())
+        indexer_kernel<kIdxWide><<<dim3(1, kIdxOutputs / kIdxWide), 256, kIdxSmem, stream>>>(hidden, rows, w.index_q_proj, w.index_k_proj, index_query, index_key);
+    else
+    indexer_kernel<kIdxSlice><<<dim3((rows + kIdxRows - 1U) / kIdxRows, (kIdxOutputs + kIdxSlice - 1U) / kIdxSlice), 256, kIdxSmem, stream>>>(hidden, rows, w.index_q_proj, w.index_k_proj, index_query, index_key);
     check(cudaGetLastError(), "indexer launch");
 }
 
@@ -942,7 +1148,10 @@ void attention_softmax(std::uint32_t rows, std::uint64_t first_position, float* 
 void attention_values(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
     const std::uint16_t* kv, const float* scores, float* attention_output, const amdmath::Tables& tables, cudaStream_t stream) {
     if (!rows) return;
-    if (rows <= 8U && decode_rows_enabled())
+    if (rows <= core::decode_rows_max() && decode_rows_enabled() && head_pipe_enabled())   // per-(head, row) blocks: any row count
+        attention_output_head_pipe_kernel<<<dim3(kHeads, rows), kOutThreads, 0, stream>>>(q_gate, first_position, selected, kv, scores,
+            attention_output, tables);
+    else if (rows <= core::decode_rows_max() && decode_rows_enabled())
         attention_output_head_kernel<<<dim3(kHeads, rows), kOutThreads, 0, stream>>>(q_gate, first_position, selected, kv, scores,
             attention_output, tables);
     else
@@ -951,14 +1160,26 @@ void attention_values(const float* q_gate, std::uint32_t rows, std::uint64_t fir
     check(cudaGetLastError(), "output launch");
 }
 void attention(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
-    const std::uint16_t* kv, float* scores, float* attention_output, const amdmath::Tables& tables, cudaStream_t stream) {
+    const std::uint16_t* kv, float* scores, float* attention_output, const amdmath::Tables& tables, cudaStream_t stream, bool mma) {
+    if (mma) { attention_mma(q_gate, rows, first_position, selected, kv, attention_output, stream); return; }
     attention_scores(q_gate, rows, first_position, selected, kv, scores, stream);
     attention_softmax(rows, first_position, scores, tables, stream);
     attention_values(q_gate, rows, first_position, selected, kv, scores, attention_output, tables, stream);
 }
+void attention_mma(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
+    const std::uint16_t* kv, float* attention_output, cudaStream_t stream) {
+    if (!rows) return;
+    static const bool attr = [] {
+        check(cudaFuncSetAttribute(attention_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kMmaSmem)), "mma smem attr");
+        return true;
+    }();
+    (void)attr;
+    attention_mma_kernel<<<dim3(kKvHeads, rows), kMmaWarps * 32U, kMmaSmem, stream>>>(q_gate, first_position, selected, kv, attention_output);
+    check(cudaGetLastError(), "attention_mma launch");
+}
 
 void layer_core(const RowBuffers& b, std::uint32_t rows, std::uint64_t first_position, const LayerWeights& w,
-    const LayerState& state, const RopeTable* cs, const amdmath::Tables& tables, Workspace& ws, cudaStream_t stream) {
+    const LayerState& state, const RopeTable* cs, const amdmath::Tables& tables, Workspace& ws, cudaStream_t stream, bool mma_attention) {
     if (!rows) return;
     if (first_position + rows > static_cast<std::uint64_t>(ws.max_blocks) * kRatio + kRatio)
         throw std::invalid_argument("qwen_qsa layer_core: workspace too small for the positions");
@@ -985,7 +1206,7 @@ void layer_core(const RowBuffers& b, std::uint32_t rows, std::uint64_t first_pos
         block_scores(b.index_query + static_cast<std::uint64_t>(c) * kIndexQWidth, n, p0, pooled, ws.block_scores, ws.max_blocks, stream);
         select_rows(ws.block_scores, ws.max_blocks, n, p0, ws.selected, stream);
         attention(b.q_gate + static_cast<std::uint64_t>(c) * kQGateWidth, n, p0, ws.selected, state.kv, ws.scores,
-            b.attention_output + static_cast<std::uint64_t>(c) * kAttnWidth, tables, stream);
+            b.attention_output + static_cast<std::uint64_t>(c) * kAttnWidth, tables, stream, mma_attention);
     }
 }
 
@@ -1017,7 +1238,7 @@ bool prepare_multi(const SegmentState* segs, std::uint32_t n, const Workspace& w
     map.first_row[n] = rows;
     // the output kernel per-segment layer_core chooses for each segment (head kernel: <= 8 rows with the decode kernels on);
     // the multi launch needs one choice for all, else per segment
-    const bool head_all = max_rows <= 8U && decode_rows_enabled(), rows_all = !decode_rows_enabled() || min_rows > 8U;
+    const bool head_all = max_rows <= core::decode_rows_max() && decode_rows_enabled(), rows_all = !decode_rows_enabled() || min_rows > core::decode_rows_max();
     if (rows > ws.chunk_rows || score_wave || !(head_all || rows_all)) return false;  // outside the multi-launch shapes
     // pooled keys per session (host-side valid counts, as layer_core), block-score waves, attention slots
     std::uint32_t pool = 0, waves = 0, slots = 0;
@@ -1082,7 +1303,10 @@ void launch_multi(const RowBuffers& b, MapArg map, const MultiShape& shape, cons
     softmax_multi_kernel<<<dim3(kHeads, rows), 256, 0, stream>>>(ws.scores, map, tables);
     check(cudaGetLastError(), "softmax multi launch");
     // keyed on the segment rows (as per-segment layer_core), not on the window total
-    if (shape.head_all)
+    if (shape.head_all && head_pipe_enabled())
+        attention_output_head_multi_pipe_kernel<<<dim3(kHeads, rows), kOutThreads, 0, stream>>>(b.q_gate, map, ws.selected, ws.scores,
+            b.attention_output, tables);
+    else if (shape.head_all)
         attention_output_head_multi_kernel<<<dim3(kHeads, rows), kOutThreads, 0, stream>>>(b.q_gate, map, ws.selected, ws.scores,
             b.attention_output, tables);
     else
@@ -1123,7 +1347,7 @@ bool graph_shape(const std::uint32_t* seg_rows, std::uint32_t n, const Workspace
         min_rows = std::min(min_rows, seg_rows[i]);
         waves += (seg_rows[i] + kScoreRowsPerWave - 1U) / kScoreRowsPerWave * chunks;
     }
-    const bool head_all = max_rows <= 8U && decode_rows_enabled(), rows_all = !decode_rows_enabled() || min_rows > 8U;
+    const bool head_all = max_rows <= core::decode_rows_max() && decode_rows_enabled(), rows_all = !decode_rows_enabled() || min_rows > core::decode_rows_max();
     if (rows > ws.chunk_rows || score_wave || !(head_all || rows_all)) return false;
     static const std::uint32_t sms = [] {
         int dev = 0, count = 0;

@@ -28,7 +28,8 @@ inline std::uint32_t validate_cut(std::uint32_t cut, const LegalCuts& legal) {
 // runs the embedding/PLE prelude and the seam pack. Falls back to 24 when 23 is not a legal boundary.
 // STRIX_QWEN_PF_PIPE_CUT=24 restores the even split. With stage B timed honestly (it drains the device before
 // waiting for a frame) the stages at 23 are 10.0-10.1 s and 10.2 s at 32K; half-layer cuts 22.5 and 23.5 measured
-// 11.82-11.85 s against 11.61-11.69 s at 23, so 23 stays.
+// 11.82-11.85 s against 11.61-11.69 s at 23, so 23 stays. Since then (length chunk policy, faster QSA) the
+// half cut 23.5 wins below 64K context and loses at 128K: qwen.pair_half_cut (below) picks it per prompt.
 inline constexpr std::uint32_t measured_default_cut = 23U;
 inline std::uint32_t parse_cut(const char* value, const LegalCuts& legal) {
     std::uint32_t cut = legal[measured_default_cut] ? measured_default_cut : 24U;
@@ -269,12 +270,23 @@ inline constexpr lever::Decl chunk_policy_lever{
 inline constexpr lever::Decl single_tiles_lever{
     "qwen.pair_single_tiles", "STRIX_QWEN_PAIR_SINGLE_TILES", lever::Exactness::bitwise, true, {}, {},
     "pair receipts 14-nov: 8K single route 1,752 tok/s at 4,096-row tiles, one node 1,853-1,867"};
+// qwen.pair_half_cut: without an explicit cut or a cost file, seam inside layer 23 (23.5: stage A also runs the
+// QSA attention of layer 23) instead of after it. Stage B holds 7 of the 12 QSA layers at cut 23 and is the
+// critical stage; the attention block it hands over (~0.3 s at 32K, ~1.65 s at 128K) is smaller than the stage
+// gap below 64K and larger at 128K (gap ~1.3 s: stage A becomes critical). ON below 65,537 context tokens
+// (largest measured win), off from there; "0" keeps 23 everywhere, "1" forces 23.5. Bitwise: placement only.
+inline constexpr lever::Decl half_cut_lever{
+    "qwen.pair_half_cut", "STRIX_QWEN_PAIR_HALF_CUT", lever::Exactness::bitwise, false,
+    {lever::Axis::context, 65537U, true, false}, {},
+    "pair receipts 17-nov (exact / FAST ms, 23 vs 23.5): 8K 3,320 / 3,051 vs 3,285 / 3,003; 32K 11,176 / 10,111 vs "
+    "11,105 / 10,023 (5 / 4 pairs); 64K 21,604 / 19,634 vs 21,512 / 19,369; 128K 42,489 / 38,123 vs 42,714 / 38,404"};
 enum class PairExecution { handoff, prefill_only };
 struct PairPolicy {
     lever::Choice chunk_policy;
     lever::Choice single_tiles;
     PairExecution execution = PairExecution::handoff;
     bool baseline = false;
+    lever::Choice half_cut;
 };
 // Select once before read-only inspection and retain these choices for execution.
 inline PairPolicy resolve_pair_policy(std::uint64_t prompt, PairExecution execution, bool baseline) {
@@ -284,7 +296,15 @@ inline PairPolicy resolve_pair_policy(std::uint64_t prompt, PairExecution execut
         if (baseline) { row.default_on = false; row.regime = {}; }
         return lever::select(row, inputs);
     };
-    return {select(chunk_policy_lever), select(single_tiles_lever), execution, baseline};
+    return {select(chunk_policy_lever), select(single_tiles_lever), execution, baseline, select(half_cut_lever)};
+}
+// The stage cut without a cost file: an explicit STRIX_QWEN_PF_PIPE_CUT wins, else the measured default 23, or
+// 23.5 where qwen.pair_half_cut is on and layer 23 can carry a feed-forward seam.
+inline pair::StageCut resolve_stage_cut(const char* value, const LegalCuts& legal, const LegalCuts& legal_half,
+                                        bool half_cut) {
+    const auto cut = parse_stage_cut(value, legal, legal_half);
+    if (value || !half_cut || cut.half || cut.layer != measured_default_cut || !legal_half[cut.layer]) return cut;
+    return pair::StageCut(cut.layer, true);
 }
 inline std::string inspect_pair_policy(std::string_view config, const PairPolicy& policy) {
     using serve::Json;
@@ -298,6 +318,7 @@ inline std::string inspect_pair_policy(std::string_view config, const PairPolicy
     out.as_object().emplace_back("qwen_pair", Json::Object{
         {std::string(chunk_policy_lever.env), control(policy.chunk_policy)},
         {std::string(single_tiles_lever.env), control(policy.single_tiles)},
+        {std::string(half_cut_lever.env), control(policy.half_cut)},
         {"execution", policy.execution == PairExecution::handoff ? "handoff" : "prefill-only"},
         {"route", "pending-device-admission"}, {"tile_rows", nullptr}});
     return out.dump();

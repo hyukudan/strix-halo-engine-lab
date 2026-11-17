@@ -68,6 +68,8 @@ constexpr ScopeRule scope_rules[] = {
 constexpr const char* exact_scope_files[] = {
     "include/strix/prefill_headless.hpp",
     "include/strix/pinned_host.hpp", "include/strix/lever.hpp", "src/dist_communicator.cpp",
+    // The MoE input transforms and their local helpers moved out of moe_core.
+    "src/hip/weight/trellis_sources.hpp",
     "cmake/StrixSession.cmake", "include/strix/serve/engine.hpp",
     "src/serve/engine.cpp", "src/serve/session_runtime.cpp"};
 void source_coverage(const fs::path& source_root = fs::path(STRIX_ROUTE_SOURCE_DIR)) {
@@ -325,7 +327,8 @@ void config_receipts() {
         require(config.find(std::string("STRIX_MMX_PF_ORDER.requested=") +
                             (asked ? asked : "default") + "\n") != std::string::npos,
                 "requested chunk order inspection");
-        const bool invariant = asked && std::string_view(asked) == "invariant";
+        // Unset resolves the pf_order table default (invariant); an empty value is explicit and stays adaptive.
+        const bool invariant = !asked || std::string_view(asked) == "invariant";
         require(config.find(std::string("STRIX_MMX_PF_ORDER.effective=") +
                             (invariant ? "invariant" : "adaptive") + "\n") != std::string::npos,
                 "effective chunk order inspection");
