@@ -898,7 +898,9 @@ __global__ __launch_bounds__(site_threads) void hc_site_collapse_kernel(HcSiteVi
 }
 using SiteFastKernel = void (*)(HcSiteView, unsigned, unsigned, unsigned, unsigned);
 template <unsigned G> SiteFastKernel site_fast_kernel(bool expand, bool mix, bool terms) {
-    if (terms) return mix ? hc_site_fast_kernel<true, true, G, true> : hc_site_fast_kernel<true, false, G, true>;
+    if constexpr (G <= 4U) {
+        if (terms) return mix ? hc_site_fast_kernel<true, true, G, true> : hc_site_fast_kernel<true, false, G, true>;
+    }
     return expand ? (mix ? hc_site_fast_kernel<true, true, G> : hc_site_fast_kernel<true, false, G>)
                   : (mix ? hc_site_fast_kernel<false, true, G> : hc_site_fast_kernel<false, false, G>);
 }
@@ -2347,7 +2349,9 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
                            partial_blocks, norm_chunks);
     } else {
         // Tiles of g rows per partial block (1, 2, 4 or 8) and norm parts of `part` chunks per block (1-8).
-        const unsigned g = v.tile ? v.tile : v.rows == 1 ? 1U : v.rows == 2 ? 2U : 4U;
+        unsigned g = v.tile ? v.tile : v.rows == 1 ? 1U : v.rows == 2 ? 2U : 4U;
+        // The canonical-input G8 mix variant spills; keep rows independent and use the existing G4 geometry.
+        if (v.sub_low && g > 4U) g = 4U;
         unsigned part = v.norm_part ? v.norm_part : v.rows == 1 ? 1U : v.rows == 2 ? 2U : 4U;  // measured (cold fn, R 1-8)
         part = part < norm_chunks ? part : norm_chunks;
         const unsigned tiles = (v.rows + g - 1U) / g;
