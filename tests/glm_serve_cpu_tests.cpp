@@ -60,10 +60,15 @@ bool throws_with(F&& f, const std::string& needle) {
 struct Pipe {
     std::mutex m;
     std::condition_variable cv;
+    bool corrupt_dsa = false;  // one payload chunk, after successful prepare/header exchanges
     std::deque<std::vector<std::byte>> q[2];  // q[r]: blocks sent by rank r, not yet taken
     void xchg(unsigned rank, std::span<const std::byte> local, std::span<std::byte> remote) {
         std::unique_lock<std::mutex> l(m);
         q[rank].emplace_back(local.begin(), local.end());
+        if (corrupt_dsa && rank == 0 && local.size() == 64) {
+            q[rank].back()[0] ^= std::byte{1};
+            corrupt_dsa = false;
+        }
         cv.notify_all();
         if (!cv.wait_for(l, std::chrono::seconds(10), [&] { return !q[1 - rank].empty(); }))
             throw std::runtime_error("pipe: the peer never exchanged");
@@ -797,7 +802,93 @@ void audit601_regressions(bool imports) {
     }
 }
 
+void import_route_receipts() {
+    // ---- per-request route receipts: an imported prompt reports imported_tokens + route rtx; a refused one, its fallback
+    for (const int variant : {0, 1, 2, 3, 4}) {  // success, staging failure, relay success, unavailable, corrupt payload
+        const bool fail = variant == 1, dsa = variant >= 2, relay_fail = variant >= 3;
+        Loopback lb;
+        FakeEng e(4), e1(4);
+        Pipe pipe;
+        e.stops = e1.stops = false;
+        e.fail_expect = fail;
+        e.pipe = e1.pipe = &pipe;
+        e1.rank = 1;
+        e1.relay_fail = variant == 3;
+        pipe.corrupt_dsa = variant == 4;
+        gs::Channel ch(lb.side(0), 0), c1(lb.side(1), 1);
+        std::thread follower([&] { gs::follow(e1, c1, hello_for(4, 4096, 2), 4, 4096); });
+        ch.hello(hello_for(4, 4096, 2));
+        sv::GenerationQueue queue(8);
+        gs::LeadConfig lc;
+        lc.slots = 4;
+        lc.capacity = 4096;
+        lc.heartbeat_seconds = 0.01;
+        lc.prefill_chunk = 64;
+        lc.rtx_prefill = [](std::span<const std::uint32_t>, std::uint32_t) { return true; };
+        lc.import_min_tokens = 100;
+        lc.state_digest = true;
+        lc.import_dsa_once = dsa;
+        std::atomic<bool> stop{false};
+        gs::Lead<FakeEng> lead(e, ch, queue, lc, stop);
+        std::thread runner([&] { lead.loop(); });
+        sv::GenerationJob j;
+        j.prompt.assign(300, 9U);
+        j.max_tokens = 4;
+        auto t = queue.submit(std::move(j));
+        if (variant == 4) {
+            bool completed = false;
+            while (!completed) (void)t->wait(std::chrono::milliseconds(100), completed);
+        }
+        sv::GenerationJob k;
+        k.prompt = prompts(1)[0];  // short: never routed
+        k.max_tokens = 4;
+        auto u = queue.submit(std::move(k));
+        bool done = false, done_u = false;
+        while (!done) (void)t->wait(std::chrono::milliseconds(100), done);
+        while (!done_u) (void)u->wait(std::chrono::milliseconds(100), done_u);
+        stop.store(true);
+        runner.join();
+        follower.join();
+        const auto st = t->stats(), su = u->stats();
+        std::string route;
+        for (const auto& [name, value] : st.engine_extra)
+            if (name == "prefill_route") route = value;
+        if (!fail && !relay_fail) CHECK(st.imported_tokens == 299 && route.find("\"route\":\"rtx\"") != std::string::npos && lead.stats().imported_tokens == 299);
+        if (fail) {  // the fallback drops the hand-off on both ranks at once (import_drop)
+            CHECK(st.imported_tokens == 0 && route.find("\"fallback\":\"rank0_staging_failed\"") != std::string::npos);
+            CHECK(!e.dropped.empty() && e.dropped == e1.dropped);
+        }
+        if (dsa && !relay_fail) {  // both ranks relayed inside import_state's replay; rank 1 restored its full state
+            CHECK(route.find("\"dsa_once\":true") != std::string::npos && route.find("\"relay_bytes\":407") != std::string::npos);
+            CHECK(e1.relayed == relay_full(1) && e1.last_relay.chunks == 7);
+            bool logged = false;
+            for (const auto& line : e1.log) logged = logged || (line.rfind("import ", 0) == 0 && line.find(" dsa") != std::string::npos);
+            CHECK(logged);
+        }
+        if (relay_fail) {  // header or checksum failure: both abort, then local prefill and later requests remain usable
+            CHECK(st.imported_tokens == 0 && route.find("\"fallback\":\"both_restore_failed\"") != std::string::npos);
+            CHECK(lead.stats().imports == 0 && lead.stats().import_fallbacks == 1);
+            bool aborted0 = false, aborted1 = false;
+            for (const auto& line : e.log) aborted0 = aborted0 || line.find("(import abort)") != std::string::npos;
+            for (const auto& line : e1.log) aborted1 = aborted1 || line.find("(import abort)") != std::string::npos;
+            CHECK(aborted0 && aborted1);
+            CHECK(e.suffix_collectives == 0 && e1.suffix_collectives == 0);
+            CHECK(t->error().empty() && u->error().empty());
+        }
+        CHECK(su.imported_tokens == 0 && su.engine_extra.empty());
+        const auto dg = lead.take_digests();  // one per request, right after its prefill, rank 1's gathered by rank 0
+        CHECK(dg.size() == 2 && dg[0].rank0.size() == 4 && dg[0].rank0 == dg[0].rank1 && dg[1].rank0 == dg[1].rank1);
+        CHECK(!route.empty() && sv::parse_json(route).is_object());
+        static const char* names[] = {"imported", "staging fails", "imported, DSA once", "DSA once, rank 1 cannot relay", "DSA once, corrupt payload"};
+        std::printf("route receipt (%s): %s\n", names[variant], route.c_str());
+    }
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--audit656-import") {
+        import_route_receipts();
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && (std::string(argv[1]) == "--audit601-geometry" || std::string(argv[1]) == "--audit601-import")) {
         audit601_regressions(std::string(argv[1]) == "--audit601-import");
         return failures == 0 ? 0 : 1;
@@ -1661,78 +1752,7 @@ int main(int argc, char** argv) {
         std::printf("decode-first interleave (%s, %d steps between chunks): %d chunks of the 640-token prompt, expected step pattern: %s\n", grouped ? "grouped" : "single", steps_between, chunks,
                     violations == 0 ? "yes" : "NO");
     }
-    // ---- per-request route receipts: an imported prompt reports imported_tokens + route rtx; a refused one, its fallback
-    for (const int variant : {0, 1, 2, 3}) {  // imported / staging fails / imported 'DSA once' / 'DSA once', rank 1 cannot relay
-        const bool fail = variant == 1, dsa = variant >= 2, relay_fail = variant == 3;
-        Loopback lb;
-        FakeEng e(4), e1(4);
-        Pipe pipe;
-        e.stops = e1.stops = false;
-        e.fail_expect = fail;
-        e.pipe = e1.pipe = &pipe;
-        e1.rank = 1;
-        e1.relay_fail = relay_fail;
-        gs::Channel ch(lb.side(0), 0), c1(lb.side(1), 1);
-        std::thread follower([&] { gs::follow(e1, c1, hello_for(4, 4096, 2), 4, 4096); });
-        ch.hello(hello_for(4, 4096, 2));
-        sv::GenerationQueue queue(8);
-        gs::LeadConfig lc;
-        lc.slots = 4;
-        lc.capacity = 4096;
-        lc.heartbeat_seconds = 0.01;
-        lc.prefill_chunk = 64;
-        lc.rtx_prefill = [](std::span<const std::uint32_t>, std::uint32_t) { return true; };
-        lc.import_min_tokens = 100;
-        lc.state_digest = true;
-        lc.import_dsa_once = dsa;
-        std::atomic<bool> stop{false};
-        gs::Lead<FakeEng> lead(e, ch, queue, lc, stop);
-        std::thread runner([&] { lead.loop(); });
-        sv::GenerationJob j;
-        j.prompt.assign(300, 9U);
-        j.max_tokens = 4;
-        auto t = queue.submit(std::move(j));
-        sv::GenerationJob k;
-        k.prompt = prompts(1)[0];  // short: never routed
-        k.max_tokens = 4;
-        auto u = queue.submit(std::move(k));
-        bool done = false, done_u = false;
-        while (!done) (void)t->wait(std::chrono::milliseconds(100), done);
-        while (!done_u) (void)u->wait(std::chrono::milliseconds(100), done_u);
-        stop.store(true);
-        runner.join();
-        follower.join();
-        const auto st = t->stats(), su = u->stats();
-        std::string route;
-        for (const auto& [name, value] : st.engine_extra)
-            if (name == "prefill_route") route = value;
-        if (!fail && !relay_fail) CHECK(st.imported_tokens == 299 && route.find("\"route\":\"rtx\"") != std::string::npos && lead.stats().imported_tokens == 299);
-        if (fail) {  // the fallback drops the hand-off on both ranks at once (import_drop)
-            CHECK(st.imported_tokens == 0 && route.find("\"fallback\":\"rank0_staging_failed\"") != std::string::npos);
-            CHECK(!e.dropped.empty() && e.dropped == e1.dropped);
-        }
-        if (dsa && !relay_fail) {  // both ranks relayed inside import_state's replay; rank 1 restored its full state
-            CHECK(route.find("\"dsa_once\":true") != std::string::npos && route.find("\"relay_bytes\":407") != std::string::npos);
-            CHECK(e1.relayed == relay_full(1) && e1.last_relay.chunks == 7);
-            bool logged = false;
-            for (const auto& line : e1.log) logged = logged || (line.rfind("import ", 0) == 0 && line.find(" dsa") != std::string::npos);
-            CHECK(logged);
-        }
-        if (relay_fail) {  // the relay failed on both ranks at its header: import_abort on both, the prompt prefilled itself
-            CHECK(st.imported_tokens == 0 && route.find("\"fallback\":\"both_restore_failed\"") != std::string::npos);
-            CHECK(lead.stats().imports == 0 && lead.stats().import_fallbacks == 1);
-            bool aborted0 = false, aborted1 = false;
-            for (const auto& line : e.log) aborted0 = aborted0 || line.find("(import abort)") != std::string::npos;
-            for (const auto& line : e1.log) aborted1 = aborted1 || line.find("(import abort)") != std::string::npos;
-            CHECK(aborted0 && aborted1);
-        }
-        CHECK(su.imported_tokens == 0 && su.engine_extra.empty());
-        const auto dg = lead.take_digests();  // one per request, right after its prefill, rank 1's gathered by rank 0
-        CHECK(dg.size() == 2 && dg[0].rank0.size() == 4 && dg[0].rank0 == dg[0].rank1 && dg[1].rank0 == dg[1].rank1);
-        CHECK(!route.empty() && sv::parse_json(route).is_object());
-        static const char* names[] = {"imported", "staging fails", "imported, DSA once", "DSA once, rank 1 cannot relay"};
-        std::printf("route receipt (%s): %s\n", names[variant], route.c_str());
-    }
+    import_route_receipts();
     // ---- a prompt waiting for its RTX state does not hold the admission: a short prompt behind it is served meanwhile
     {
         Loopback lb;

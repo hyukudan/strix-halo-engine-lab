@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/device/budget.hpp"
 #include "strix/device/declaration.hpp"
 
 #include <cstdint>
@@ -65,6 +66,7 @@ struct Request {
     std::string select; // declared device id; empty = the single eligible device
     int ordinal = -1;   // an operator-given runtime index: it must name an eligible device, it is never an identity
     std::string role;   // optional: the device must carry this role
+    std::string profile; // optional: --device-profile / STRIX_DEVICE_PROFILE, replaces the entry's profile and memory_gib
 };
 
 struct Bound {
@@ -74,6 +76,9 @@ struct Bound {
     // The declared NPU and CPU units (not excluded), for the lanes that give them work. Empty without a declaration:
     // a unit that is not a GPU is never implicit.
     std::vector<Descriptor> units;
+    // The memory every route plans for on this binding (budget.hpp), resolved once from the entry's profile /
+    // memory_gib and the cpu unit's memory_gib. Routes apply their own flags through resolve_budget's overrides.
+    MemoryBudget budget;
 };
 
 // Thrown for every refusal; what() is the one line to show the operator.
@@ -97,6 +102,7 @@ struct Verdict {
 struct Environment {
     std::string devices_path; // STRIX_DEVICES, else the per-user default file when it exists, else empty
     std::string select;       // STRIX_DEVICE
+    std::string profile;      // STRIX_DEVICE_PROFILE
 };
 [[nodiscard]] Environment read_environment();
 [[nodiscard]] std::string default_devices_path(); // may not exist; empty when no home directory is known
@@ -121,8 +127,11 @@ struct Environment {
 struct CommandLine {
     std::string devices_path;
     std::string select;
+    std::string profile; // --device-profile NAME
 };
 [[nodiscard]] CommandLine take_command_line(int& argc, char** argv);
+// The budget a route plans for: the binding's resolved budget with the route's own flags applied over it.
+[[nodiscard]] MemoryBudget route_budget(const Bound& bound, const BudgetOverrides& overrides);
 
 // True when the command line asks for help (`--help` or `-h`). A main that prints its usage and exits before its
 // gate call answers on a machine without a visible GPU (package smoke tests, containers). The gate itself never

@@ -3,6 +3,8 @@
 #include "minimax/engine/route_identity.hpp"
 
 #include "minimax/moe/mmx_prefill_core.hpp"
+#include "minimax/attn/msa_norm_rope.hpp"  // the q image: the flash prologue's norm + RoPE
+#include "../../attn_core/wmma_types.hpp"   // and its operand rounding
 #include "minimax/moe/mmx_trellis_device.hpp"
 #include "core/activation_quant.hpp"
 #include "core/trellis_codec.hpp"
@@ -15,6 +17,7 @@
 #endif
 #include "moe_core/device_plan.hpp"
 #include "moe_core/grouped_policy.hpp"
+#include "core/linear_plan.hpp"  // fixed_linear_contract: rows-free dense K chain (invariant order)
 #include "strix/env_flags.hpp"
 #include "strix/route_receipt.hpp"
 
@@ -38,10 +41,12 @@ unsigned gemm_tile_rows(unsigned input, unsigned output, unsigned bits, unsigned
 unsigned gemm_splits(unsigned input, unsigned output, unsigned bits, unsigned rows) {
     return route::gemm_splits(input, output, bits, rows);
 }
-// MoE numeric order contract (STRIX_MMX_PF_ORDER): adaptive (default, today's identity: S from the expert's rows in the
-// chunk) or invariant (shared kGroupedSingleChainContract, S = 1 for gate, up and down: bits independent of chunking).
-// Test fixture only: change this between synchronized calls on one host thread;
-// never mutate it during engine execution or concurrent planning.
+// MoE numeric order contract (STRIX_MMX_PF_ORDER): invariant (default via the pf_order table item; shared
+// kGroupedSingleChainContract, S = 1 for gate, up and down: bits independent of chunking) or adaptive (off switch and
+// baseline; former identity: S from the expert's rows in the chunk).
+// The override is for test fixtures and for the engine's one load-time decline of a defaulted invariant order
+// (require_invariant_dense, on the loading thread before any execution or planning). Change it only between
+// synchronized calls on one host thread; never mutate it during engine execution or concurrent planning.
 namespace { int g_order_override = -1; }  // -1 = STRIX_MMX_PF_ORDER, 0 = adaptive, 1 = invariant
 void set_prefill_moe_order(int invariant) {
     if (invariant < -1 || invariant > 1) throw std::invalid_argument("set_prefill_moe_order: value must be -1, 0 or 1");
@@ -54,6 +59,15 @@ const ::strix::moe_core::GroupedSplitContract& prefill_moe_order() {
         return ::strix::moe_core::resolve_grouped_order(strix::envcfg::text("STRIX_MMX_PF_ORDER"));
     }();
     return c;
+}
+bool prefill_order_invariant() { return prefill_moe_order().invariant(); }
+// Dense v4 split: invariant binds the shared rows-free contract (one ascending K16 chain per output, S = 1 for every
+// MiniMax q/k/v/o matrix: the split the adaptive policy already picks for >= 1024-row pieces); adaptive keeps the
+// library's rows-dependent split (== strix_gemm bitwise).
+unsigned prefill_dense_splits(unsigned input, unsigned output, unsigned bits, unsigned rows) {
+    if (prefill_order_invariant())
+        return static_cast<unsigned>(::strix::core::fixed_linear_contract(static_cast<int>(input), kDenseFixedSplits).splits);
+    return gemm_splits(input, output, bits, rows);
 }
 
 namespace {
@@ -415,6 +429,10 @@ struct DenseArgs {
     _Float16* xt[kMaxDenseJobs];
     const float* part[kMaxDenseJobs];
     float* out[kMaxDenseJobs];
+    std::uint16_t* image[kMaxDenseJobs];     // PrefillDenseJob::image (null: out)
+    std::uint16_t* image_lo[kMaxDenseJobs];
+    const float* image_w[kMaxDenseJobs];
+    const msa::RopeRow* image_rope[kMaxDenseJobs];
     unsigned n[kMaxDenseJobs], splits[kMaxDenseJobs];
     unsigned count, rows, k;
 };
@@ -456,6 +474,29 @@ __global__ __launch_bounds__(256) void dense_finish_kernel(DenseArgs a) {
     const unsigned nb = a.n[m] / 128U, row = q / nb, b = q % nb;
     float v[4];
     finish_block(a.part[m], a.splits[m], a.rows, row, a.n[m], b, a.svh[m], lane, v);
+    if (a.image[m] != nullptr) {  // wave-uniform: block b = one 128-dim head of the row
+        // the flash prologue's layout (msa_norm_rope.hpp): lane l takes dims 4l..4l+3; dim d is on lane d & 31, slot
+        // d >> 5 = l >> 3 (moves only, no arithmetic)
+        namespace tile = strix::attn_core::tile;
+        constexpr tile::Operand O = tile::Operand::bf16;
+        float x[4];
+#pragma unroll
+        for (unsigned i = 0; i < 4U; ++i) {
+            const int src = static_cast<int>((4U * lane + i) & 31U);
+            const float t0 = __shfl(v[0], src, 32), t1 = __shfl(v[1], src, 32), t2 = __shfl(v[2], src, 32), t3 = __shfl(v[3], src, 32);
+            const unsigned s = lane >> 3U;
+            x[i] = s == 0U ? t0 : s == 1U ? t1 : s == 2U ? t2 : t3;
+        }
+        msa::norm_rope_lane(x, a.image_w[m], a.image_rope[m][row], lane);
+        const std::size_t at = static_cast<std::size_t>(row) * a.n[m] + b * 128U + lane * 4U;
+        *reinterpret_cast<uint2*>(a.image[m] + at) = make_uint2(tile::pack2<O>(x[0], x[1]), tile::pack2<O>(x[2], x[3]));
+        if (a.image_lo[m] != nullptr) {
+#pragma unroll
+            for (unsigned d = 0; d < 4U; ++d) x[d] -= tile::operand_value<O>(tile::to_operand<O>(x[d]));
+            *reinterpret_cast<uint2*>(a.image_lo[m] + at) = make_uint2(tile::pack2<O>(x[0], x[1]), tile::pack2<O>(x[2], x[3]));
+        }
+        return;
+    }
 #pragma unroll
     for (int j = 0; j < 4; ++j)
         a.out[m][static_cast<std::size_t>(row) * a.n[m] + b * 128U + lane + 32U * static_cast<unsigned>(j)] = v[j];
@@ -2075,7 +2116,7 @@ DensePlan make_dense_plan(const PrefillDenseJob* jobs, unsigned count, unsigned 
             w.svh == nullptr || jobs[m].out == nullptr)
             throw std::invalid_argument("minimax prefill dense: jobs need one input width and outputs % 128 == 0");
         if (!dense_bits_supported(w.bits)) throw std::invalid_argument("minimax prefill dense: unsupported bit width");
-        p.splits[m] = gemm_splits(w.input, w.output, w.bits, rows);
+        p.splits[m] = prefill_dense_splits(w.input, w.output, w.bits, rows);
         p.off_xt[m] = off;
         off += align256(std::size_t{p.tpad} * p.k * 2);
         p.off_part[m] = off;
@@ -2177,6 +2218,8 @@ void enqueue_prefill_dense(const PrefillDenseJob* jobs, unsigned count, const fl
         a.xt[m] = reinterpret_cast<_Float16*>(ws + p.off_xt[m]);
         a.part[m] = reinterpret_cast<const float*>(ws + p.off_part[m]);
         a.out[m] = jobs[m].out;
+        a.image[m] = jobs[m].image, a.image_lo[m] = jobs[m].image_lo, a.image_w[m] = jobs[m].image_w;
+        a.image_rope[m] = static_cast<const msa::RopeRow*>(jobs[m].image_rope);
         a.n[m] = jobs[m].w.output;
         a.splits[m] = p.splits[m];
         waves += rows * (jobs[m].w.output / 128);

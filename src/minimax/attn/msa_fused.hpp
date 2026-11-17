@@ -82,6 +82,11 @@ struct DecodeView {
     // block [grid][4].
     std::uint64_t* phase = nullptr;
     std::uint64_t* phase_index = nullptr;
+    // Prefill FAST flash (modes 11 / 12) only, when non-null: the q projection finish's BF16 image of q after norm +
+    // RoPE (same layout as q; mmx_prefill.hip dense_finish_kernel) and, mode 12, its lo terms. The flash core reads
+    // them through query_op with the bits of its own prologue; q is then not written.
+    const std::uint16_t* q16 = nullptr;
+    const std::uint16_t* q16_lo = nullptr;
 };
 
 // Single sequence, consecutive positions. Scratch has scratch_windows independent 16-row regions.
@@ -100,6 +105,11 @@ struct PrefillView {
 using PrefillStageMarker = void (*)(void* user, const char* category, bool before);
 void enqueue_prefill(const PrefillView& v, hipStream_t stream,
                      PrefillStageMarker marker = nullptr, void* user = nullptr);
+// Cache-only stage of a headless chunk (strix/prefill_headless.hpp): the same view contract and the same prep launch as
+// enqueue_prefill (K / V / index-key cache rows, same bits), no index scoring, selection or attention; the view's
+// attention outputs are not written.
+void enqueue_prefill_cache_only(const PrefillView& v, hipStream_t stream,
+                                PrefillStageMarker marker = nullptr, void* user = nullptr);
 // Score the prepared cache for [first_window, ceil(rows/16)); scratch is not rebased.
 // Exposed for index-only timing and byte comparisons; single sequence, two index heads.
 void enqueue_prefill_index(const PrefillView& v, hipStream_t stream);

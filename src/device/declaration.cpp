@@ -1,5 +1,6 @@
 #include "strix/device/declaration.hpp"
 
+#include "strix/device/profiles.hpp"
 #include "strix/model_description.hpp"
 
 #include <algorithm>
@@ -112,7 +113,8 @@ Descriptor parse_device(const std::string& id, const Value& v) {
     const std::string key = "devices." + id;
     const auto& t = table(v, key);
     only(t, {"kind", "vendor", "arch", "uuid", "pci", "name", "memory_bytes", "attach", "roles", "excluded", "reason", "cores",
-             "byte_cap_gbytes_ps", "driver", "firmware", "corun_qualification"}, key + ".");
+             "byte_cap_gbytes_ps", "driver", "firmware", "corun_qualification", "profile", "memory_gib",
+             "bandwidth_gbytes_ps", "units", "count", "interconnect"}, key + ".");
     Descriptor d;
     d.id = id;
     try {
@@ -129,9 +131,49 @@ Descriptor parse_device(const std::string& id, const Value& v) {
         if (d.kind != Kind::npu && find(t, name)) bad(key + "." + std::string(name), "only a kind = \"npu\" unit takes this key");
     for (const std::string_view name : {"uuid", "pci", "attach", "memory_bytes"})
         if (cpu && find(t, name)) bad(key + "." + std::string(name), "a cpu unit takes no " + std::string(name));
+    for (const std::string_view name : {"profile", "bandwidth_gbytes_ps", "units", "count", "interconnect"})
+        if (d.kind != Kind::gpu && find(t, name)) bad(key + "." + std::string(name), "only a GPU entry takes this key");
+    if (d.kind == Kind::npu && find(t, "memory_gib")) bad(key + ".memory_gib", "only a GPU or the cpu unit takes this key");
+    const Profile* profile = nullptr;
+    if (const auto* x = find(t, "profile")) {
+        d.profile = string(*x, key + ".profile");
+        profile = find_profile(d.profile);
+        if (!profile) bad(key + ".profile", "unknown profile " + d.profile + "; known: " + profile_names());
+    }
     const auto* vendor = find(t, "vendor");
-    if (!vendor && !cpu) bad(key + ".vendor", "required");
     if (vendor) d.vendor = parse_vendor(string(*vendor, key + ".vendor"));
+    if (profile && !profile->vendor.empty()) {
+        const Vendor implied = parse_vendor(profile->vendor);
+        if (vendor && d.vendor != implied)
+            bad(key + ".vendor", std::string(vendor_name(d.vendor)) + " contradicts profile " + d.profile);
+        d.vendor = implied;
+    } else if (!vendor && !cpu) {
+        bad(key + ".vendor", "required");
+    }
+    if (const auto* x = find(t, "memory_gib")) {
+        const double gib = rate(*x, key + ".memory_gib");
+        if (gib <= 0.0) bad(key + ".memory_gib", "must be positive (omit the key for no declared budget)");
+        d.budget_bytes = static_cast<std::uint64_t>(std::llround(gib * 1073741824.0));
+    }
+    if (profile && profile->name == "custom" && d.budget_bytes == 0) bad(key + ".memory_gib", "required with profile custom");
+    if (const auto* x = find(t, "bandwidth_gbytes_ps")) d.bandwidth_gbytes_ps = rate(*x, key + ".bandwidth_gbytes_ps");
+    if (const auto* x = find(t, "units")) d.units = static_cast<std::uint32_t>(integer(*x, key + ".units"));
+    if (const auto* x = find(t, "count")) {
+        const auto n = integer(*x, key + ".count");
+        if (n < 1 || n > 64) bad(key + ".count", "expected 1 to 64");
+        d.count = static_cast<std::uint32_t>(n);
+    }
+    if (const auto* x = find(t, "interconnect")) {
+        d.interconnect = lower(string(*x, key + ".interconnect"));
+        if (!find_interconnect(d.interconnect)) {
+            std::string known;
+            for (const auto& i : interconnects()) known += (known.empty() ? "" : ", ") + std::string(i.name);
+            bad(key + ".interconnect", "unknown class " + d.interconnect + " (no catalogue device has NVLink); known: " + known);
+        }
+    }
+    if (d.count > 1 && d.interconnect.empty()) bad(key + ".interconnect", "required with count > 1");
+    if (d.count > 1 && (find(t, "uuid") || find(t, "pci")))
+        bad(key + ".count", "a shape of several devices takes no identity: declare each bound card as its own entry");
     if (const auto* x = find(t, "arch")) d.arch = lower(string(*x, key + ".arch"));
     try {
         if (const auto* x = find(t, "uuid")) d.uuid = normalise_uuid(string(*x, key + ".uuid"));
@@ -139,7 +181,11 @@ Descriptor parse_device(const std::string& id, const Value& v) {
     } catch (const std::invalid_argument& e) {
         bad(key, e.what());
     }
-    if (!cpu && d.uuid.empty() && d.pci.empty()) bad(key, "needs an identity: uuid or pci (an index is not an identity)");
+    if (!cpu && d.uuid.empty() && d.pci.empty()) {
+        if (!profile) bad(key, "needs an identity: uuid or pci (an index is not an identity), or a profile for a planned shape");
+        d.planned = true;
+    }
+    if (d.count > 1) d.planned = true;
     if (const auto* x = find(t, "name")) d.name = string(*x, key + ".name");
     if (const auto* x = find(t, "memory_bytes")) d.memory_bytes = integer(*x, key + ".memory_bytes");
     if (const auto* x = find(t, "attach")) {

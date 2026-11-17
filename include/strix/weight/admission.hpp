@@ -6,6 +6,12 @@ enum class Container : std::uint8_t { gguf, safetensors, pack };
 struct RawTensor {
   TensorId id{}; std::string name; std::string wire_dtype;
   std::uint32_t wire_type{}; Shape shape{}; Slice payload;
+  // Full logical extents as stored by the container (any rank). A tensor whose rank exceeds the
+  // WeightView rank (Shape::dims) is indexed opaquely: name, dtype, extents and byte range are
+  // kept, shape stays empty, and it can never be admitted as a WeightView. Engines that need such
+  // a tensor (for example a Conv3d patch embedding) read it by its byte range.
+  std::vector<std::uint64_t> extents;
+  bool opaque() const noexcept { return extents.size()>shape.dims.size(); }
 };
 struct TensorIndex {
   Container container{}; std::string schema;

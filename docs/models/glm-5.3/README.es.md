@@ -139,12 +139,12 @@ los límites de RAM libre, swap y GTT no cambian. Sin caché, el valor sigue sie
 
 ## Ejecución: una RTX PRO 6000
 
-Solo Windows, opcional (opt-in): compile con `pwsh src/glm/rtxpf/producer/build.ps1` contra una exportación del código
+Solo Windows, opcional (opt-in): compile con `pwsh src/cuda/models/glm/producer/build.ps1` contra una exportación del código
 de tierstream, genere una vez el archivo de unidades con `glm_unit_file.exe` y ejecute
 `decode_qualification_window.py --full-card --allow-gpu`. El propio servicio acepta también `--dgpu auto|<uuid>`
 para elegir la RTX PRO antes de iniciar CUDA (`off` se rechaza: no hay ruta en CPU). Todos los pasos, el commit fijado de tierstream y las
 opciones (`--profile`, `--print-effective-config`, `--vram-total-gib`) están en la
-[guía de GLM RTX](../../../src/glm/rtxpf/README.md).
+[guía de GLM RTX](../../../src/cuda/models/glm/README.md).
 
 <a id="how-fast"></a>
 
@@ -216,6 +216,7 @@ en GiB de los términos de ruta, espacio de trabajo, instalación/staging, segur
 | Prefill por fragmentos exacto, colapso de mezcla mHC y norma en un solo kernel (predeterminado; `STRIX_GLM_PF_MIXNORM=0` restablece los dos kernels) | prompts de benchmark de 8K / 32K (8,192 / 32,768 tokens), brazos activado / desactivado alternos | TTFT 8K **15.07 → 14.95 s** (−0.8 %, 544 → 548 tok/s), 32K **63.23 → 62.23 s** (−1.6 %, 518 → 527 tok/s, frente a la media de los brazos desactivados que lo rodean). Roofline: con 14.95 s para 8,192 tokens (548 tok/s) y 62.23 s para 32,768 tokens (527 tok/s), el prefill exacto del par funciona a cerca del 16 % / 15 % de su mínimo de cómputo solo de lineales (31.8 GFLOP/token en 2 x 54 TF = 2.4 s a 8K, 9.6 s a 32K); el límite que manda es la planificación exacta de los kernels, no el ancho de banda de memoria ni el cable: los lineales MoE y densos se ejecutan en teselas VALU FP32 para conservar la identidad bit a bit, y este cambio solo elimina un viaje de ida y vuelta a memoria por sitio de hiperconexión. | logits bit a bit iguales a las referencias en el par con 1K, 8K y 32K; gate de dispositivo bit a bit de 1 a 4096 filas y con valores especiales (solo pueden diferir las cargas de NaN propagados) |
 | Núcleos lineales WMMA FAST del prefill (`glm-pf-wmma-x`, opcional `STRIX_GLM_PF_WMMA=1`) | Prompts de benchmark de 8K / 32K, fragmentos de 8,192 filas, proceso nuevo por brazo | TTFT **15.45 → 12.94 s (−16.3 %)** a 8K y **62.3 → 51.2 s (−17.8 %)** a 32K (media de ambos órdenes); núcleos lineales del rango 0 a 8K: MoE 5.15 → 3.42 s, X3 densos 2.61 → 1.71 s | FAST, no es bit a bit el prefill exacto: comprobación de paridad de calidad prerregistrada superada a 1K / 8K / 32K; desactivado (`STRIX_GLM_PF_WMMA=0` o sin definir, predeterminado) igual a las anclas de logits exactas en ambos rangos |
 | Proyecciones KDA de pesos planos en WMMA, FAST (`glm-pf-kda-wmma-v1`, activo con `STRIX_GLM_PF_WMMA=1`; `STRIX_GLM_PF_KDA_WMMA=0` lo desactiva) | Prompts de benchmark de 8K / 32K, proceso nuevo por brazo, frente a FAST sin ello | Prefill 8K **9.25 → 9.05 s (−2.1 %)** (2 pares alternos), 32K **37.74 → 37.13 s (−1.6 %)** (2 ejecuciones sin / 3 con; se descarta una ejecución perturbada de cada brazo) | FAST, no bit a bit: teacher-forced 3 × 256 posiciones KL 0.0038 / 0.0004 / 0.0004 nats, top-1 98.0 / 100 / 100 %, cambio de NLL −0.006 / +0.001 / +0.002; desactivado conserva los bytes anteriores |
+| GEMMs MLA absorb / out en el núcleo compartido de teselas FP16 WMMA, FAST (`glm-pf-mla-wmma-v1`, activo con `STRIX_GLM_PF_WMMA=1`; `STRIX_GLM_PF_MLA_WMMA=0` lo desactiva), con imágenes bf16 de q-tilde y FP16 de o-bar | Prompts de benchmark de 8K / 32K, proceso nuevo por brazo, frente a FAST sin ello | Prefill 8K **8,504 → 8,399 s en caliente (−1,2 %), 9,847 → 9,489 s en frío (−3,6 %)** (3 pares alternos, antes de las imágenes q-tilde / o-bar; banco de capa con ambas −5,0 ms por llamada) | FAST, no bit a bit: puerta frente a FAST KL 0,0053, top-1 98,2 %, dNLL -0,0002 (1.536 filas prosa / código / chat) |
 | Núcleo de atención MLA/DSA fusionado FAST (`glm-pf-attn-wmma`, activo con `STRIX_GLM_PF_WMMA=1`; `STRIX_GLM_PF_ATTN_WMMA=0` lo desactiva) | Prompts de benchmark de 8K / 32K, fragmentos de 8,192 filas, proceso nuevo por brazo, frente a FAST sin el núcleo | Prefill 8K **10.600 → 9.695 s (−8.5 %)** (2 pares alternos), 32K **44.30 → 40.26 s (−9.1 %)** (una serie off / on / off); banco de capa: scores + softmax + o-bar 2.6× / 3.2× más rápido en las posiciones de 8K / 32K | FAST, no es bit a bit: KL de logits del prefill 7.8e-4 nats a 8K, top-1 y greedy iguales en 8 pasos de decode; el modo exacto no cambia (logits iguales a las anclas en ambos rangos); comprobación teacher-forced con 3 prompts pendiente |
 | Prefill por fragmentos exacto, expansión mHC y norma con dos filas por bloque (predeterminado; `STRIX_GLM_PF_HC_EXPAND_ROWS=1` restablece una fila por bloque) | prompt de benchmark de 8K (8,192 tokens), brazos activado / desactivado alternos, con las demás palancas exactas de prefill de esa compilación activadas | TTFT 8K **13.671 → 13.611 s** (−0.44 %, por encima de la dispersión de 0.024 s dentro de un brazo) | logits bit a bit iguales a las referencias en ambos rangos con 8K; gates de host y de dispositivo bit a bit frente al kernel de una fila |
 | Prefill por fragmentos exacto / FAST, transformación de entrada gate/up del MoE en orden de tokens (predeterminado; `STRIX_GLM_PF_IN_TOKEN=0` restaura la transformación por tiles) | prompts de benchmark de 8K / 32K, brazos activado / desactivado en ambos órdenes, proceso nuevo por brazo | TTFT FAST 8K **10.55 → 10.21 s** (mediana de 4 pares); exacto 8K 13.195 → 12.868 s; FAST 32K 43.49 → 42.39 s (un par); exacto 32K: 56.32 → 53.41 s y 57.63 → 55.52 s en dos pares (desactivado primero, activado primero): −2.9 / −2.1 s, media −2.5 s (−4.5 %), ficheros completos de logits idénticos en ambos rangos (un par anterior mostró −5.5 s por un brazo desactivado lento; no se reprodujo). | digests de logits y estado idénticos en todos los brazos en ambos rangos; ficheros completos de logits idénticos en los brazos exactos |
@@ -295,17 +296,19 @@ simultáneas por defecto con este presupuesto (auto, 76 % de los expertos en el 
 **0.77 / 0.75 tok/s** en caliente / en frío con 1K (media de dos cargas, bench de 24 tokens). Con el prefetch de archivo en dos etapas opcional
 (`--tier-landing-blocks 16`, tres unidades en franjas) el decode fue un 20-40 % más rápido que sin él en las mismas
 ventanas, con salida idéntica (las repeticiones variaron entre un 15 y un 55 %). Compilación, archivo de unidades y
-opciones: [guía de GLM RTX](../../../src/glm/rtxpf/README.md).
+opciones: [guía de GLM RTX](../../../src/cuda/models/glm/README.md).
 
 **Prefill en RTX hacia el par (FAST, desactivado por defecto).** `strix-glm5-serve --rtx-prefill HOST:PUERTO
 --import-listen IP:PUERTO --import-peer IP:PUERTO --import-key FICHERO --import-model-sha SHA` (`--import-listen` en cada
 rango; solo motores con su capa MTP) deja que el productor RTX haga el prefill de los prompts largos y entregue a cada
 rango su estado. Ambos rangos preparan la entrega y votan (la vinculación autenticada y después ambos restaurados) antes
 de ejecutar el último token del prompt; cualquier fallo antes de ese voto vuelve al prefill propio del par en los dos
-rangos, y un fallo dentro de las operaciones colectivas del último token detiene el servidor (fatal). `--import-dsa-once`
-(con `dsa_once` del productor) envía el estado DSA solo al rango 0, que lo retransmite al rango 1 por el enlace del par
-(8K: de 480 a 316 MB en el enlace del productor, con tokens iguales a los de la entrega de la versión 1). `--import-index-tail`
-(en todos los rangos, con `index_tail` del productor; versión 3, o 4 con `--import-dsa-once`) envía la clave y la puerta
+rangos, y un fallo dentro de las operaciones colectivas del último token detiene el servidor (fatal). DSA una vez (entrega versión 2,
+predeterminada en un par con `--import-listen`; `--no-import-dsa-once` o `STRIX_HANDOFF_SHARED_ONCE=0` vuelve a la
+versión 1) envía el estado DSA solo al rango 0, que lo retransmite al rango 1 por el enlace del par con hash comprobado
+(8K: de 480 a 316 MB en el enlace del productor, de 4,05 a 2,67 s a 1 GbE; 32K: de 1.461 a 807 MB, de 12,38 a 6,90 s;
+la carga del rango 1 es idéntica byte a byte a la de la versión 1, tokens iguales). `--import-index-tail`
+(en todos los rangos, con `index_tail` del productor; versión 3, o 4 con DSA una vez) envía la clave y la puerta
 del índice DSA solo del bloque de pool abierto (`P % 4` filas): los bloques cerrados viajan como sus filas de pool FP32,
 que es lo único que leen los kernels de decode, prefill y MTP (`include/strix/block_summary_state.hpp`). 32K: de 806,92 a
 605,62 MB para los dos rangos con DSA una vez; 128K: −805,28 MB. Opcional; `tests/hip_glm_dsa_tests.hip` comprueba la
@@ -334,5 +337,5 @@ RTX para prompts largos. Con el productor arrancado con su caché (primera petic
 El registro de cambios de cada palanca de GLM activada por defecto, con su ganancia medida, su evidencia de exactitud y
 su interruptor de desactivación, está en [ganancias medidas](../../measured-gains.es.md); el catálogo completo es
 [docs/optimizations.md](../../optimizations.md#glm). Compilación, fichero de unidades y opciones de GLM RTX:
-[guía de GLM RTX](../../../src/glm/rtxpf/README.md); notas del prefill nativo en RTX:
+[guía de GLM RTX](../../../src/cuda/models/glm/README.md); notas del prefill nativo en RTX:
 [docs/models/glm/rtx-prefill-native.md](../glm/rtx-prefill-native.md).

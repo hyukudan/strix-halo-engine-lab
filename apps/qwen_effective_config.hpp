@@ -7,6 +7,7 @@
 
 #include "strix/compact_stage_images.hpp"
 #include "strix/qwen_router_bf16.hpp"
+#include "strix/qwen_onfly_i4.hpp"
 #include "strix/qwen_allon.hpp"
 #include "hip_decode_options.hpp"
 #include "known_prefill_reservation.hpp"
@@ -187,6 +188,9 @@ inline Environment requested_prefill_environment(Get get) {
             "STRIX_QPF2K_HC_RECOMPUTE_NORM", "STRIX_INTPREFILL_MOE_TUNE", "STRIX_QPF2K_MOE", "STRIX_QPF2K_MOE_SMALL", "STRIX_QPF2K_QSA_BUDGET", "STRIX_QPF2K_MOE_DIRECT_B"})
         if (!(qpf2k::pre_injected_moe_marker && std::string_view(name) == "STRIX_QPF2K_MOE_DEFAULTED"))
             if (const char* value = get(name)) env.emplace(name, value);
+    for (const char* name : {"STRIX_TURBO_ONFLY_GROUPS", "STRIX_TURBO_ONFLY_SCALE",
+            "STRIX_IU4_ROW_REDUCTION", "STRIX_IU4_R8_SINGLE_DECODE"})
+        if (const char* value = get(name)) env.emplace(name, value);
     for (const char* name : {"STRIX_BITCALC_LOGITS_OUT", "STRIX_BITCALC_FORCE_TOKENS"})
         if (get(name)) env.emplace(name, "1");
     // OFF keeps the complete historical inspection image, including its environment map.
@@ -197,7 +201,7 @@ inline Environment requested_prefill_environment(Get get) {
     return env;
 }
 inline Environment requested_prefill_environment() {
-    return requested_prefill_environment([](const char* name) { return std::getenv(name); });
+    return requested_prefill_environment([](const char* name) { return ::strix::envcfg::text(name); });
 }
 inline void apply_measured_prompt_organization(Options& o) {
     o.q51_slot_parallel_down = true;
@@ -275,6 +279,14 @@ inline void account_qwen_router_bf16(PrefillRequirements& result, const ModelMan
     }
     result.organization["qwen_router_bf16_reserved_bytes"] = router.device_bytes;
     result.organization["qwen_router_bf16_setup_host_bytes"] = router.setup_host_bytes;
+}
+inline void account_qwen_onfly_i4(PrefillRequirements& result, const ModelManifest& manifest, const strix::onfly_i4::Resolved& turbo,
+    bool named_owners) {
+    const auto bytes = qwen_onfly_i4_reservation(manifest, turbo);
+    result.runtime_payload = prefill_checked_add(result.runtime_payload, bytes);
+    result.device_base = prefill_checked_add(result.device_base, bytes);
+    if (named_owners && bytes) result.owners["qwen_onfly_i4"] = bytes;
+    result.organization["qwen_onfly_i4_reserved_bytes"] = bytes;
 }
 struct PrefillNativePools {
     std::uint64_t host = 0, device = 0, mapped = 0;
@@ -527,6 +539,13 @@ inline EffectiveConfig initialize_prefill_config(const RequestedOptions& request
     result.options.early_setup = exact_defaults && request.options.early_setup && enabled("STRIX_QPF2K_EARLY_SETUP");
     result.options.eager_code_load = exact_defaults && request.options.eager_code_load && enabled("STRIX_EAGER_CODE_LOAD");
     result.options.qwen_router_bf16 = exact_defaults && env_is(result.environment, "STRIX_QWEN_ROUTER_BF16", "1") && enabled("STRIX_Q6P");
+    // TURBO+ weight source: one resolver for the CLI and the server (both build their Options through this function).
+    result.options.turbo = strix::onfly_i4::resolve(request.options.turbo_request, [&](const char* name) -> const char* {
+        const auto it = result.environment.find(name);
+        return it == result.environment.end() ? nullptr : it->second.c_str();
+    }, request.options.product_profile.weights.effective == strix::profile::turbo::Source::onfly);
+    result.options.product_profile.onfly = result.options.turbo;
+    validate_onfly_i4_routes(result.options);
     if (result.options.eager_code_load && !result.environment.contains("HIP_ENABLE_DEFERRED_LOADING"))
         result.environment["HIP_ENABLE_DEFERRED_LOADING"] = "0";
     result.prefill_option_mask = resolve_prefill_options([&](const char* name) -> const char* {
@@ -1805,7 +1824,7 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
     // options and model writers; no candidate reaches process switch readers yet.
     auto proposed = request;
     admit_product_profile(proposed.options);
-    qwen::profile::apply(proposed.options.product_profile, [&](const char* key, const char* value) {
+    qwen::profile::propose_exports(proposed.options.product_profile, [&](const char* key, const char* value) {
         if (!qwen::profile::metadata_environment(key)) proposed.environment[key] = value;
         return true;
     });
@@ -2037,6 +2056,8 @@ inline std::vector<std::string> effective_prefill_argv(const Options& o) {
     if (o.prefetch_q8_hyper_output) args.emplace_back("--prefetch-q8-hyper-output");
     if (o.lane_chain_hyper_output) args.emplace_back("--lane-chain-hyper-output");
     if (o.prefetch_q8_qsa_input) args.emplace_back("--prefetch-q8-qsa-input");
+    // Cache identity: caches never mix native and TURBO+ onfly weights (decode projections differ numerically).
+    if (o.turbo.active()) args.insert(args.end(), {"--turbo-weights-identity", o.turbo.identity()});
     if (o.parallel_moe_router) args.emplace_back("--parallel-moe-router");
     if (o.wave_moe_router_topk) args.emplace_back("--wave-moe-router-topk");
     if (o.virtual_q8_gdn_input) args.emplace_back("--virtual-q8-gdn-input");
@@ -2360,6 +2381,23 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
         << "\",\"reserved_device_bytes\":" << config.router_bf16_reservation.device_bytes
         << ",\"setup_host_bytes\":" << config.router_bf16_reservation.setup_host_bytes
         << ",\"qualification\":\"per-tensor-bit-check\",\"phase\":\"pending-model-load\"}";
+    out << ",\"turbo_weights\":{\"source\":\"" << (o.turbo.active() ? "onfly" : "native") << "\",\"bits\":" << o.turbo.bits
+        << ",\"identity\":\"" << (o.turbo.active() ? o.turbo.identity() : std::string("native")) << "\",\"groups\":\""
+        << (o.turbo.active() ? strix::onfly_i4::groups_text(o.turbo.groups) : std::string("none")) << "\",\"scale_rule\":\""
+        << strix::onfly_i4::scale_rule_name(o.turbo.scale_rule) << "\",\"scope\":\""
+        << (o.turbo.active() ? std::string(strix::onfly_i4::kScopeNote) : std::string("native packs")) << "\""
+        << ",\"row_decode\":{\"requested\":\"" << core::iu4_rows::single_decode_policy_name(o.turbo.row_decode.requested)
+        << "\",\"effective\":\"" << core::iu4_rows::single_decode_policy_name(o.turbo.row_decode.effective)
+        << "\",\"enabled\":" << (o.turbo.row_decode.effective == core::iu4_rows::SingleDecodePolicy::split ? "false" : "true")
+        << ",\"reason\":\"" << o.turbo.row_decode.reason
+        << "\",\"automatic_scope\":\"rows7-8-k6144-n2560\",\"device_requirement\":\"gfx1151-wave32\""
+        << ",\"phase\":\"" << (o.turbo.row_decode.effective == core::iu4_rows::SingleDecodePolicy::automatic ?
+            "pending-device-and-shape" : "resolved") << "\"}"
+        << ",\"row_reduction\":{\"requested\":\"" << core::iu4_rows::row_reduction_name(o.turbo.row_reduction.requested)
+        << "\",\"effective\":\"" << (o.turbo.row_reduction.active ? core::iu4_rows::row_reduction_name(o.turbo.row_reduction.effective) : "native")
+        << "\",\"contract\":\"" << (o.turbo.row_reduction.active ? core::iu4_rows::row_reduction_contract(o.turbo.row_reduction.effective) : "native")
+        << "\",\"quality_gate_pending\":" << (o.turbo.row_reduction.effective == core::iu4_rows::RowReduction::canonical ? "true" : "false")
+        << ",\"scope\":\"IU4 G64/G96 reductions; native weights unchanged\"}}";
     out << ",\"hc_lowband_policy\":" << (config.environment.contains("STRIX_QPF2K_HC_LOWBAND") ?
         std::strtoul(config.environment.at("STRIX_QPF2K_HC_LOWBAND").c_str(), nullptr, 0) : 0U);
     out << ",\"hc_lowband_route\":\"exact-fp16-output-only\"";

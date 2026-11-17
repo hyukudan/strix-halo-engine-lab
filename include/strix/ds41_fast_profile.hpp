@@ -27,6 +27,10 @@ inline bool dense_on() { const char* v = strix::fast_profile::lever(kBundle, kMe
 // FP16 WMMA core (STRIX_DS41_FAST_ENGRAM=1, policy ds41-engram-f16wmma-v1; src/hip_ds41_layer.hip). Changes logits.
 inline constexpr strix::fast_profile::Member kEngram{"STRIX_DS41_FAST_ENGRAM", "1", "ds41-engram-f16wmma-v1"};
 inline bool engram_on() { return strix::fast_profile::switch_on(strix::envcfg::text(kEngram.env)); }
+// Explicit FAST lever, not a bundle member until its qualification receipt: the prefill shared expert on the FAST dense
+// core (STRIX_DS41_FAST_SHARED=1, policy ds41-shared-f16-v1; src/hip_deepseek41_prefill.hip Op::shared_expert). Changes logits.
+inline constexpr strix::fast_profile::Member kShared{"STRIX_DS41_FAST_SHARED", "1", "ds41-shared-f16-v1"};
+inline bool shared_on() { return strix::fast_profile::switch_on(strix::envcfg::text(kShared.env)); }
 // Preserve decimal-prefix parsing and unsigned wrap, including zero and negative values.
 // Also accepts the canonical unsigned value exported by the pair resolver.
 inline unsigned dense_min_rows_value(const char* raw) {

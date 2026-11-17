@@ -1,5 +1,5 @@
 // CPU-only client exercising the production sender against the actual receiver.
-#include "glm/rtxpf/producer/sender.hpp"
+#include "cuda/models/glm/producer/sender.hpp"
 #include <chrono>
 #include <cstdlib>
 #include <iostream>

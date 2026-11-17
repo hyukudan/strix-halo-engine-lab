@@ -63,6 +63,8 @@ struct PrefillPolicy {
     bool idx_wmma = false;                         // index projections on the shared FP16 WMMA core (prefill rows > 8)
     std::string idx_wmma_layers;                   // canonical ranges of its layer set (builtin kIdxWmmaLayers)
     std::string idx_wmma_asked;                    // "default" or the explicit value
+    bool router_wmma = false;                      // STRIX_MM_PF_ROUTER_WMMA=1: FAST router product (mm-pf-router-wmma-v1)
+    std::string router_wmma_layers;                // its layer set (builtin kRouterWmmaLayers), canonical ranges
     std::string policies;                          // named FAST policies that run, '+'-joined; empty: none
     std::string note;                              // why a bundle member does not run; empty: none
 };
@@ -76,9 +78,20 @@ PrefillPolicy prefill_policy(const Lookup& env);
 strix::pair::PipelineChoice pair_pipeline_choice(std::uint64_t rows);
 const profile::Engine& profile_engine();                 // tag "minimax-pair", table profile_table
 profile::Resolution profile_resolution(const Lookup& env);
+// Product profile (default|fast|quality|turbo) and TURBO weight toggle of strix-minimax-rank and strix-minimax-serve:
+// print_or_apply() takes '--profile NAME' (a product name) and --turbo-weights / --turbo-weight-bits /
+// --turbo-weights-pack from argv and exports them (STRIX_MM_PRODUCT_PROFILE, STRIX_TURBO_WEIGHTS*) before anything
+// resolves, so both apps feed profile_resolution() the same values. The per-phase timing session is
+// '--timing-profile NAME:PROMPT.u32:STEPS'; the old '--profile NAME:PROMPT.u32:STEPS' stays accepted with one notice.
+inline constexpr const char* kProductProfileEnv = "STRIX_MM_PRODUCT_PROFILE";
+// The apps' own option loops call this: true when `a` is one of the options above (its value skipped). `timing`
+// (rank only; nullptr in serve) receives a timing session spec ('--timing-profile', or the old '--profile' spelling).
+bool product_option(const std::string& a, const std::function<std::string()>& next, std::string* timing);
 // Cache / receipt identity of the active prefill policies; empty with every governed row at its builtin and the EXL3
 // MoE format. This field's omission alone does not establish complete cache compatibility.
 std::string prefill_identity(const Lookup& env);
+// Effective STRIX_MMX_PF_ORDER (table default or explicit): "adaptive" or "invariant" (identity mmx-pf-linear-s1-v1).
+std::string linear_order(const Lookup& env);
 // Policy id of the index projection member for a canonical layer set ("minimax-index-proj-wmma-v1-l40-59").
 std::string idx_wmma_policy(const std::string& layers);
 // Rank agreement of the profile rows (strix::profile::check_peer over the process environment): both ranks call it at
@@ -98,6 +111,9 @@ void apply();
 // True when apply() exported `env` (the user did not set it): a default that cannot hold falls back with a notice
 // instead of failing.
 bool from_defaults(const char* env);
+// A defaulted item that cannot hold on this load: re-export `value` (normally the item's off form) so receipts and
+// cache identities name what runs, and print the reason. Throws if `env` was not exported by apply().
+void decline_default(const char* env, const char* value, const std::string& reason);
 
 // The USB4 transport names in session routes, whichever accepted spelling was requested
 // (strix::dist::negotiated_transport(requested, direct_live, kRouteHost, kRouteGpu)).

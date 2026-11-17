@@ -6,6 +6,7 @@
 // It is the correctness oracle of the XMX path (arch/xe2), not a fast path: XMX (DPAS) sums k in hardware order, so
 // device-vs-reference checks require a declared tolerance; host tests do not qualify device arithmetic.
 #include "fp16.hpp"
+#include "strix/weight/host_q8.hpp"
 
 #include <cstdint>
 #include <cstring>
@@ -25,7 +26,7 @@ struct Q8A8View {
 };
 
 inline bool supported(const Q8A8View& v) {
-    const std::uint64_t required = static_cast<std::uint64_t>(v.k_bytes) + static_cast<std::uint64_t>(v.in / 32U) * 34U;
+    const std::uint64_t required = static_cast<std::uint64_t>(v.k_bytes) + weight::Q8Storage::row_bytes(v.in);
     return v.weight && v.codes && v.deltas && v.out && v.rows && v.count && v.in &&
            v.in % 128U == 0U && v.x_stride % 32U == 0U && v.in <= v.x_stride &&
            required <= v.row_bytes && v.out_stride >= v.count;

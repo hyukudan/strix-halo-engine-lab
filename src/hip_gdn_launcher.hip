@@ -3,12 +3,16 @@
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/cohort_step_plan.hpp"
 #include "strix/hip_gdn_decode_fuse.hpp"
+#include "strix/hip_gdn_dims.hpp"
 #include "strix/gdn_recurrent_layout_diagnostic.hpp"
 #include "strix/hip_ggml_weight_formats.hpp"
 #ifdef STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC
 #include "strix/hip_gdn_lm_wave8_diagnostic.hpp"
 #endif
 #include "strix/hip_gdn_launcher.hpp"
+// A wide cohort step hands GDN up to kCohortWideMaxSessions sessions: the host segment tables must hold them all.
+static_assert(strix::gdn_window_cohort_max_segments >= strix::kCohortWideMaxSessions,
+              "GDN cohort segment capacity below the shared wide cohort session cap");
 #include "strix/recurrent_state_policy.hpp"
 #include "attn_core/recurrent_state.hpp"
 #include "hip_gdn_identity.hpp"
@@ -1104,6 +1108,7 @@ __device__ __forceinline__ float gdn_rows_tree_add(float lower, float upper) {
 }
 // qkv, z (and Q8 beta/alpha) segments from BF16 rows to BF16-rounded FP32 workspaces.
 template <unsigned Rows> struct GdnInputRowsSite {
+    static constexpr unsigned turbo_group = strix::onfly_i4::gdn_in;  // TURBO+ onfly INT4 g64 decode (q8_rows/iu4)
     static constexpr bool dense_trellis_inputs = true;
     using Input = std::uint16_t;
     static constexpr unsigned rows = Rows;
@@ -1124,6 +1129,7 @@ template <unsigned Rows> struct GdnInputRowsSite {
     }
 };
 template <unsigned Rows> struct GdnOutputRowsSite {
+    static constexpr unsigned turbo_group = strix::onfly_i4::gdn_out;  // TURBO+ onfly INT4 g64 decode (q8_rows/iu4)
     using Input = float;
     static constexpr unsigned rows = Rows;
     static constexpr bool fused_fma = true;  // Site::fma compiles to v_fmac_f32 (wide VOPD rows)
@@ -1683,6 +1689,84 @@ void recurrent_step_kernel(
             retained);
 }
 
+// Rows of one window in one launch: the retained state tile stays in registers from row to row (the per-row kernel above
+// reads and writes it through memory every row). Row r runs exactly the operations of recurrent_step_kernel on the
+// qkv / beta / gate / core of row r (strides below), in the same order, so the bits equal `rows` separate launches;
+// the stored state of row r is the retained value the next row loads (a float round trip is exact).
+__global__ __launch_bounds__(kRecurrentThreads)
+void recurrent_rows_kernel(
+    const float* qkv, const float* beta, const float* gate, float* state, float* core,
+    std::uint32_t key_heads, std::uint32_t value_heads, std::uint32_t head_dim, std::uint32_t rows,
+    std::uint64_t qkv_stride, std::uint64_t core_stride) {
+    const auto tile_count = head_dim / kValueTile;
+    const auto value_head = static_cast<std::uint32_t>(blockIdx.x) / tile_count;
+    const auto tile = static_cast<std::uint32_t>(blockIdx.x) % tile_count;
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x);
+    if (value_head >= value_heads || lane >= head_dim) return;
+    const auto key_head = value_head % key_heads;
+    const auto value_base = tile * kValueTile;
+    const auto q_base = static_cast<std::uint64_t>(key_head) * head_dim;
+    const auto k_base = static_cast<std::uint64_t>(key_heads) * head_dim + q_base;
+    const auto v_base = static_cast<std::uint64_t>(key_heads) * head_dim * 2ULL + static_cast<std::uint64_t>(value_head) * head_dim;
+    __shared__ float reduction[kRecurrentThreads * kValueTile];
+    __shared__ float deltas[kValueTile];
+    float retained[kValueTile];
+#pragma unroll
+    for (std::uint32_t column = 0; column < kValueTile; ++column)
+        retained[column] = state[(static_cast<std::uint64_t>(value_head) * head_dim + lane) * head_dim + value_base + column];
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        const float* q = qkv + r * qkv_stride;
+        const float* b = beta + static_cast<std::uint64_t>(r) * value_heads;
+        const float* g = gate + static_cast<std::uint64_t>(r) * value_heads;
+        float* out = core + r * core_stride;
+        const float decay = expf(g[value_head]);
+#pragma unroll
+        for (std::uint32_t column = 0; column < kValueTile; ++column) {
+            retained[column] = retained[column] * decay;
+            reduction[static_cast<std::size_t>(lane) * kValueTile + column] = retained[column] * q[k_base + lane];
+        }
+        __syncthreads();
+        for (std::uint32_t stride = kRecurrentThreads / 2U; stride > 0; stride >>= 1U) {
+            if (lane < stride) {
+#pragma unroll
+                for (std::uint32_t column = 0; column < kValueTile; ++column)
+                    reduction[static_cast<std::size_t>(lane) * kValueTile + column] +=
+                        reduction[static_cast<std::size_t>(lane + stride) * kValueTile + column];
+            }
+            __syncthreads();
+        }
+        if (lane == 0) {
+#pragma unroll
+            for (std::uint32_t column = 0; column < kValueTile; ++column)
+                deltas[column] = (q[v_base + value_base + column] - reduction[column]) * b[value_head];
+        }
+        __syncthreads();
+#pragma unroll
+        for (std::uint32_t column = 0; column < kValueTile; ++column) {
+            retained[column] += q[k_base + lane] * deltas[column];
+            reduction[static_cast<std::size_t>(lane) * kValueTile + column] = retained[column] * q[q_base + lane];
+        }
+        __syncthreads();
+        for (std::uint32_t stride = kRecurrentThreads / 2U; stride > 0; stride >>= 1U) {
+            if (lane < stride) {
+#pragma unroll
+                for (std::uint32_t column = 0; column < kValueTile; ++column)
+                    reduction[static_cast<std::size_t>(lane) * kValueTile + column] +=
+                        reduction[static_cast<std::size_t>(lane + stride) * kValueTile + column];
+            }
+            __syncthreads();
+        }
+        if (lane == 0) {
+#pragma unroll
+            for (std::uint32_t column = 0; column < kValueTile; ++column)
+                out[static_cast<std::uint64_t>(value_head) * head_dim + value_base + column] = reduction[column];
+        }
+        __syncthreads();  // the next row rewrites reduction[] and deltas[]
+    }
+#pragma unroll
+    for (std::uint32_t column = 0; column < kValueTile; ++column)
+        state[(static_cast<std::uint64_t>(value_head) * head_dim + lane) * head_dim + value_base + column] = retained[column];
+}
 #ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
 template <unsigned Rows> struct GdnRecurrentWindowPointers {
     const float* qkv[Rows];
@@ -2257,6 +2341,28 @@ __global__ void gated_rms_norm_kernel(
             norm_kind,
             threadIdx.x) *
         gate_value;
+}
+
+// Swish-gated variant (qwen35 dense): core = core * rsqrt(mean(core^2)+eps) * w * silu(z). Same reduction tree
+// as gated_rms_norm_kernel (the sigmoid kind keeps its own kernel, so its bits and ISA are untouched).
+__global__ void gated_rms_norm_swish_kernel(
+    float* core, const float* z, const void* norm_weights, SmallWeightKind norm_kind,
+    std::uint32_t heads, std::uint32_t head_dim, float epsilon) {
+    const auto head = static_cast<std::uint32_t>(blockIdx.x);
+    if (head >= heads || threadIdx.x >= head_dim) return;
+    __shared__ float scratch[kRecurrentThreads];
+    const auto index = (static_cast<std::uint64_t>(blockIdx.y) * heads + head) * head_dim + threadIdx.x;  // grid.y = window row
+    const float value = core[index];
+    scratch[threadIdx.x] = value * value;
+    __syncthreads();
+    for (std::uint32_t stride = kRecurrentThreads / 2U; stride > 0; stride >>= 1U) {
+        if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(scratch[0] / static_cast<float>(head_dim) + epsilon);
+    const float zv = z[index];
+    const float gate_value = zv / (1.0F + expf(-zv));
+    core[index] = value * inv * load_small(norm_weights, norm_kind, threadIdx.x) * gate_value;
 }
 
 // Deferred-commit window. Every arithmetic expression and reduction tree below
@@ -6529,12 +6635,12 @@ template <class Body> void gdn_window_rows_dispatch(std::size_t rows, Body&& bod
     }
 }
 struct GdnCohortBinding {
-    std::array<GdnWindowBinding, gdn_window_max_rows> segments;
+    std::array<GdnWindowBinding, gdn_window_cohort_max_segments> segments;
     std::size_t count = 0;
 };
 GdnCohortBinding bind_gdn_window_cohort(std::span<const HipGdnWindowCohortSegment> segments) {
-    if (segments.empty() || segments.size() > gdn_window_max_rows)
-        throw std::invalid_argument("GDN cohort window requires 1..8 session segments");
+    if (segments.empty() || segments.size() > gdn_window_cohort_max_segments)
+        throw std::invalid_argument("GDN cohort window requires 1..16 session segments");
     GdnCohortBinding out;
     for (std::size_t s = 0; s < segments.size(); ++s) {
         const auto& segment = segments[s];
@@ -6581,7 +6687,14 @@ template <class Body> void gdn_cohort_rows_dispatch(std::size_t rows, Body&& bod
 // legacy 2/4/8 rows, or 1..8 through the separate ANYSEG entry points.
 static void enqueue_gdn_window_segments(std::span<const GdnWindowCohortSegment> segments, const HipGdnLauncherConfig& config,
     hipStream_t stream, bool anyseg = false) {
-    if (segments.size() > gdn_window_max_rows) throw std::invalid_argument("GDN cohort segments exceed eight sessions");
+    if (segments.size() > gdn_window_cohort_max_segments) throw std::invalid_argument("GDN cohort segments exceed sixteen sessions");
+    // The kernel table holds eight segments: more sessions run as consecutive launches of at most eight. Every block
+    // reads and writes only its own segment's state, so the split changes no value.
+    if (segments.size() > gdn_window_max_rows) {
+        enqueue_gdn_window_segments(segments.first(gdn_window_max_rows), config, stream, anyseg);
+        enqueue_gdn_window_segments(segments.subspan(gdn_window_max_rows), config, stream, anyseg);
+        return;
+    }
     const auto shape = gdn_window_shape(config.model);
     GdnSegments all{};
     for (std::size_t s = 0; s < segments.size(); ++s) {
@@ -6633,8 +6746,8 @@ void gdn_window_cohort_enqueue(std::span<const GdnWindowCohortSegment> segments,
 #if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
     HipDenseTrellisScope arithmetic(config.dense_trellis_projections);
 #endif
-    if (segments.empty() || segments.size() > gdn_window_max_rows)
-        throw std::invalid_argument("GDN cohort window requires 1..8 session segments");
+    if (segments.empty() || segments.size() > gdn_window_cohort_max_segments)
+        throw std::invalid_argument("GDN cohort window requires 1..16 session segments");
     std::array<GdnWindowRow, gdn_window_cohort_max_rows> rows{};
     std::size_t count = 0;
     const auto& a = segments[0].layer;
@@ -6719,7 +6832,7 @@ void gdn_window_cohort_rows_preflight(std::span<const HipGdnWindowCohortSegment>
 }
 void gdn_window_cohort_rows_launch(std::span<const HipGdnWindowCohortSegment> segments) {
     const auto bound = bind_gdn_window_cohort(segments);
-    std::array<GdnWindowCohortSegment, gdn_window_max_rows> layers{};
+    std::array<GdnWindowCohortSegment, gdn_window_cohort_max_segments> layers{};
     for (std::size_t s = 0; s < bound.count; ++s)
         layers[s] = {bound.segments[s].layer, {bound.segments[s].rows.data(), bound.segments[s].count}, segments[s].config->control};
     gdn_window_cohort_enqueue({layers.data(), bound.count}, segments[0].config->gdn, hip_execution_stream());
@@ -8009,6 +8122,83 @@ void hip_gdn_decode_fuse_fixture(const HipGdnDecodeFuseFixture& v, bool fuse,
     hipLaunchKernelGGL(gated_rms_norm_kernel, dim3(v.value_heads), dim3(d), 0, stream,
         v.core, v.z, v.norm, kind, v.value_heads, d, v.rms_epsilon, status);
     check_hip(hipGetLastError(), "HIP GDN decode fusion fixture launch");
+}
+
+// Window forms of the per-row R1 helpers (the same bodies, the same per-row operation order: bitwise the per-row
+// launches). conv: one thread per channel walks the rows in order (its conv history is that channel's own state);
+// transform / normalize: grid.y = row. STRIX_GDN_DIMS_ROW_LAUNCH=1 keeps the old per-row launches.
+__global__ void conv_update_rows_kernel(float* qkv, std::uint16_t* conv_state, const void* conv_weights, SmallWeightKind kind,
+                                        std::uint32_t channels, std::uint32_t kernel_size, std::uint32_t rows) {
+    const auto channel = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (channel >= channels) return;
+    for (std::uint32_t r = 0; r < rows; ++r)
+        conv_update_body(qkv + static_cast<std::uint64_t>(r) * channels, conv_state, conv_weights, kind, kernel_size, channel);
+}
+__global__ void transform_beta_gate_rows_kernel(float* beta, float* gate, const void* dt, SmallWeightKind dt_kind, const void* a,
+                                                SmallWeightKind a_kind, std::uint32_t heads) {
+    const auto head = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (head >= heads) return;
+    const auto off = static_cast<std::uint64_t>(blockIdx.y) * heads;
+    transform_beta_gate_body(beta + off, gate + off, dt, dt_kind, a, a_kind, head);
+}
+__global__ void normalize_qk_rows_kernel(float* qkv, std::uint32_t key_heads, std::uint32_t head_dim, float epsilon,
+                                         std::uint64_t channels) {
+    __shared__ float scratch[kRecurrentThreads];
+    normalize_qk_body(qkv + static_cast<std::uint64_t>(blockIdx.y) * channels, key_heads, head_dim, epsilon,
+                      static_cast<std::uint32_t*>(nullptr), blockIdx.x, scratch);
+}
+static bool gdn_dims_row_launch() {
+    static const bool on = strix::envcfg::flag("STRIX_GDN_DIMS_ROW_LAUNCH", false);
+    return on;
+}
+
+void hip_gdn_decode_step_dims(const HipGdnDimsStep& v, void* stream_ptr) {
+    const auto stream = static_cast<hipStream_t>(stream_ptr);
+    constexpr unsigned d = kRecurrentThreads;
+    if (v.head_dim != d || v.value_heads % v.key_heads != 0U || v.kernel == 0U)
+        throw std::invalid_argument("hip_gdn_decode_step_dims: head_dim must be 128 and value_heads a multiple of key_heads");
+    const auto kind = small_weight_kind(v.small_type);
+    const unsigned channels = (2U * v.key_heads + v.value_heads) * d;
+    // Rows run one after the other (R1 per row): row r is bit-identical alone or in any window. The conv / transform / norm
+    // steps are per row (the conv history is sequential); the recurrence of all rows is ONE launch (state in registers).
+    const bool window = v.rows > 1U && !gdn_dims_row_launch();
+    if (window) {
+        hipLaunchKernelGGL(conv_update_rows_kernel, dim3((channels + kProjectionThreads - 1U) / kProjectionThreads),
+            dim3(kProjectionThreads), 0, stream, v.qkv, v.conv_state, v.conv, kind, channels, v.kernel, v.rows);
+        hipLaunchKernelGGL(transform_beta_gate_rows_kernel, dim3((v.value_heads + kProjectionThreads - 1U) / kProjectionThreads, v.rows),
+            dim3(kProjectionThreads), 0, stream, v.beta, v.gate, v.dt, kind, v.a, kind, v.value_heads);
+        hipLaunchKernelGGL(normalize_qk_rows_kernel, dim3(v.key_heads * 2U, v.rows), dim3(d), 0, stream,
+            v.qkv, v.key_heads, d, v.qk_epsilon, static_cast<std::uint64_t>(channels));
+    }
+    for (unsigned r = 0; !window && r < v.rows; ++r) {
+        float* qkv = v.qkv + std::size_t(r) * channels;
+        float* beta = v.beta + std::size_t(r) * v.value_heads;
+        float* gate = v.gate + std::size_t(r) * v.value_heads;
+        hipLaunchKernelGGL(conv_update_kernel, dim3((channels + kProjectionThreads - 1U) / kProjectionThreads),
+            dim3(kProjectionThreads), 0, stream, qkv, v.conv_state, v.conv, kind, channels, v.kernel,
+            static_cast<std::uint32_t*>(nullptr));
+        hipLaunchKernelGGL(transform_beta_gate_kernel, dim3((v.value_heads + kProjectionThreads - 1U) / kProjectionThreads),
+            dim3(kProjectionThreads), 0, stream, beta, gate, v.dt, kind, v.a, kind, v.value_heads);
+        hipLaunchKernelGGL(normalize_qk_kernel, dim3(v.key_heads * 2U), dim3(d), 0, stream,
+            qkv, v.key_heads, d, v.qk_epsilon, static_cast<std::uint32_t*>(nullptr));
+    }
+    hipLaunchKernelGGL(recurrent_rows_kernel, dim3(v.value_heads * (d / kValueTile)), dim3(d), 0, stream,
+        v.qkv, v.beta, v.gate, v.matrix, v.core, v.key_heads, v.value_heads, d, v.rows,
+        static_cast<std::uint64_t>(channels), static_cast<std::uint64_t>(v.value_heads) * d);
+    if (window && v.norm_kind == HipGdnGatedNorm::swish)
+        hipLaunchKernelGGL(gated_rms_norm_swish_kernel, dim3(v.value_heads, v.rows), dim3(d), 0, stream,
+            v.core, v.z, v.norm, kind, v.value_heads, d, v.rms_epsilon);
+    for (unsigned r = 0; !(window && v.norm_kind == HipGdnGatedNorm::swish) && r < v.rows; ++r) {
+        float* core = v.core + std::size_t(r) * v.value_heads * d;
+        const float* z = v.z + std::size_t(r) * v.value_heads * d;
+        if (v.norm_kind == HipGdnGatedNorm::swish)
+            hipLaunchKernelGGL(gated_rms_norm_swish_kernel, dim3(v.value_heads), dim3(d), 0, stream,
+                core, z, v.norm, kind, v.value_heads, d, v.rms_epsilon);
+        else
+            hipLaunchKernelGGL(gated_rms_norm_kernel, dim3(v.value_heads), dim3(d), 0, stream,
+                core, z, v.norm, kind, v.value_heads, d, v.rms_epsilon, static_cast<std::uint32_t*>(nullptr));
+    }
+    check_hip(hipGetLastError(), "HIP GDN dims decode step launch");
 }
 
 }  // namespace strix
