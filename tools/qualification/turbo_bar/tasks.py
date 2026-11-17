@@ -93,11 +93,17 @@ def math_item(rng):
 
 
 def score_math(reply, check):
-    found = re.findall(r"ANSWER:\s*\**\s*(-?[\d,]+)", reply)
-    if not found:
+    # The final field must be a whole integer. Support balanced bold around
+    # the value and conventional thousands separators, but no numeric suffix.
+    if "ANSWER:" not in reply:
+        return False
+    field = reply.rsplit("ANSWER:", 1)[1].strip()
+    if field.startswith("**") and field.endswith("**"):
+        field = field[2:-2].strip()
+    if not re.fullmatch(r"[+-]?(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)", field):
         return False
     try:
-        return int(found[-1].replace(",", "")) == int(check["answer"])
+        return int(field.replace(",", "")) == int(check["answer"])
     except ValueError:
         return False
 

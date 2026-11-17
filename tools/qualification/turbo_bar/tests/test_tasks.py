@@ -7,6 +7,15 @@ from tools.qualification.turbo_bar import tasks
 
 
 class TaskTests(unittest.TestCase):
+    def test_math_requires_complete_integer_field(self):
+        for suffix in ('.5', '/2', 'e2', 'E+2', ' dollars', ',5', '**.5', '\nextra'):
+            with self.subTest(suffix=suffix):
+                self.assertFalse(tasks.score_math('ANSWER: 42' + suffix, {'answer': 42}))
+        for reply in ('ANSWER: 42', 'Reasoning\nANSWER: **42**', 'ANSWER: +42\n'):
+            self.assertTrue(tasks.score_math(reply, {'answer': 42}))
+        self.assertTrue(tasks.score_math('ANSWER: -1,234', {'answer': -1234}))
+        self.assertFalse(tasks.score_math('ANSWER: 42\nANSWER: 42/2', {'answer': 42}))
+
     @classmethod
     def setUpClass(cls):
         cls.items = tasks.generate()

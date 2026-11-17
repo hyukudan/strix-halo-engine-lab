@@ -19,6 +19,7 @@
 #include "strix/env_flags.hpp"
 #include "strix/lever.hpp"
 #include "../../core/imma_tile.cuh"
+#include "strix/cuda/core/decode_rows.hpp"
 #include "strix/cuda/qwen_dense.hpp"
 #include "../../core/imma_dense.cuh"
 #include "../../weight/arch/sm120_sources.cuh"
@@ -279,13 +280,30 @@ cudaError_t project_observed(cudaStream_t stream, const Site& site, std::uint32_
         n += s.outputs;
     }
     k.nseg = site.segments; k.width = site.width; k.outputs = n; k.gate = site.gate; k.gate_stride = site.gate_stride;
-    switch (site.store) {
-    case Store::f32: return core::dense_a8::launch_project<Store::f32, weight::Q8ImmaSource, DenseNumeric, Capture>(stream, k, rows, codes, deltas, pitch);
-    case Store::f32_round_bf16: return core::dense_a8::launch_project<Store::f32_round_bf16, weight::Q8ImmaSource, DenseNumeric, Capture>(stream, k, rows, codes, deltas, pitch);
-    case Store::bf16: return core::dense_a8::launch_project<Store::bf16, weight::Q8ImmaSource, DenseNumeric, Capture>(stream, k, rows, codes, deltas, pitch);
-    case Store::bf16_gated: return core::dense_a8::launch_project<Store::bf16_gated, weight::Q8ImmaSource, DenseNumeric, Capture>(stream, k, rows, codes, deltas, pitch);
+    const auto dispatch = [&](const KSite& ks, std::uint32_t r, const std::int8_t* c, const float* d) -> cudaError_t {
+        switch (site.store) {
+        case Store::f32: return core::dense_a8::launch_project<Store::f32, weight::Q8ImmaSource, DenseNumeric, Capture>(stream, ks, r, c, d, pitch);
+        case Store::f32_round_bf16: return core::dense_a8::launch_project<Store::f32_round_bf16, weight::Q8ImmaSource, DenseNumeric, Capture>(stream, ks, r, c, d, pitch);
+        case Store::bf16: return core::dense_a8::launch_project<Store::bf16, weight::Q8ImmaSource, DenseNumeric, Capture>(stream, ks, r, c, d, pitch);
+        case Store::bf16_gated: return core::dense_a8::launch_project<Store::bf16_gated, weight::Q8ImmaSource, DenseNumeric, Capture>(stream, ks, r, c, d, pitch);
+        }
+        return cudaErrorInvalidValue;
+    };
+    // 9..16 rows (core::decode_rows_max): <= 8-row decode pieces. A piece sees rows r0.. through offset codes / deltas /
+    // outputs / gates; each (row, output) chain is row-local, so the bits are the tiled kernel's.
+    if (rows > core::kDecodePieceRows && rows <= core::decode_rows_max() && k.width <= 6144U && decode_rows_enabled()) {
+        const std::uint64_t elem = site.store == Store::f32 || site.store == Store::f32_round_bf16 ? 4U : 2U;
+        for (std::uint32_t r0 = 0; r0 < rows; r0 += core::kDecodePieceRows) {
+            KSite piece = k;
+            for (std::uint32_t m = 0; m < k.nseg; ++m)
+                piece.seg[m].out = static_cast<unsigned char*>(k.seg[m].out) + std::uint64_t{r0} * k.seg[m].stride * elem;
+            if (piece.gate) piece.gate += std::uint64_t{r0} * k.gate_stride;
+            const cudaError_t e = dispatch(piece, std::min(rows - r0, core::kDecodePieceRows), codes + std::uint64_t{r0} * k.width, deltas + r0);
+            if (e != cudaSuccess) return e;
+        }
+        return cudaSuccess;
     }
-    return cudaErrorInvalidValue;
+    return dispatch(k, rows, codes, deltas);
 }
 
 cudaError_t project(cudaStream_t stream, const Site& site, std::uint32_t rows, const std::int8_t* codes,

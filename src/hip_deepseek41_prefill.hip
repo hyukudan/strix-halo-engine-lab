@@ -32,6 +32,7 @@
 #include "strix/hip_ds41_rn_table.hpp"
 
 #include <hip/hip_runtime.h>
+#include "strix/lever_cache.hpp"
 
 #include <algorithm>
 #include <array>
@@ -371,7 +372,7 @@ bool prefill_hc_collapse() {
 }
 // STRIX_DS41_PREFILL_FINAL_KV=all (default since P17.5: 8K prefill +1.8 %, bitwise) | none | <comma-separated layers>
 bool prefill_final_kv(std::uint32_t layer) {
-    static const std::vector<bool> on = [] {
+    static strix::lever_cache<std::vector<bool>> on_cache{[] {
         std::vector<bool> r(1024, false);
         const char* v = std::getenv("STRIX_DS41_PREFILL_FINAL_KV");
         if (!v || !*v) return std::vector<bool>(1024, true);
@@ -388,7 +389,8 @@ bool prefill_final_kv(std::uint32_t layer) {
             i = j + 1U;
         }
         return r;
-    }();
+    }};
+    const std::vector<bool> on = on_cache.get();
     return layer < on.size() && on[layer];
 }
 
@@ -441,6 +443,8 @@ struct DevicePrefill::Impl {
     // this rank's rows), so the wait no longer leaves the GPU idle. Same kernel, same inputs: bitwise identical. Only
     // when the next unit boundary does not park (m.q is shared). Default on; STRIX_DS41_PREFILL_EARLY_QB=0: after.
     bool early_q_b = true;
+    bool staged_gather_allowed = true;  // not STRIX_DS41_PREFILL_STAGED_GATHER=0 (staged_gather also needs staged_half)
+    PrefillOptions requested;           // the options the object was constructed with: the base apply_levers resolves from
     Dev<std::uint32_t> pack_send, pack_recv;
     // sites run on the dense WMMA kernel instead of the batch kernel (STRIX_DS41_PREFILL_DENSE_SITES, comma list of
     // q_a, kv, q_b, o_a; default q_a,kv, faster on the dense kernel at 512 and 2048 rows; "none" = all on the batch
@@ -786,6 +790,100 @@ struct DevicePrefill::Impl {
         if (hipStreamSynchronize(s) != hipSuccess) throw std::runtime_error("deepseek41 prefill: rope tables");
         pos_base = base;
     }
+    // The per-object switches that change no allocation and no weight layout, resolved from the CURRENT environment and the
+    // requested options: the constructor and DevicePrefill::apply_levers both call this (one resolver, one set of defaults).
+    // Not here (they size buffers or select what is loaded; reload): EXPERT_TP, WINDOW, SLABS, OVERLAY, STAGED_HALF, MEM_GUARD.
+    void resolve_levers(PrefillOptions& opts, const PrefillOptions& req) {
+        opts.fp16_dense = req.fp16_dense;
+        opts.bf16_attention = req.bf16_attention;
+        opts.fast_attention = req.fast_attention;
+        opts.fast_attention_flash = req.fast_attention_flash;
+        opts.fp16_projections = req.fp16_projections;
+        opts.fp16_min_rows = req.fp16_min_rows;
+        opts.approx_layer_first = req.approx_layer_first;
+        opts.approx_layer_end = req.approx_layer_end;
+        opts.fp16_keep_a8 = req.fp16_keep_a8;
+        opts.fp16_fast = req.fp16_fast;
+        opts.fp16_wsplit = req.fp16_wsplit;
+        if(const char* e=std::getenv("STRIX_DS41_PREFILL_FP16_DENSE");e && std::string(e)=="1")opts.fp16_dense=true;
+        if(const char* e=std::getenv("STRIX_DS41_PREFILL_BF16_ATTN");e && std::string(e)=="1")opts.bf16_attention=true;
+        if (const char* e = ds41::fast_profile::attention(); ds41::fast_profile::attention_on()) {  // the lever or STRIX_DS41_FAST_PREFILL
+            opts.fast_attention = true;
+            if (e[0] == '2') opts.fast_attention_flash = true;  // ds41-attn-bf16flash-v1
+        }
+        opts.fast_dense = req.fast_dense || ds41::fast_profile::dense_on();
+        opts.fast_moe = req.fast_moe || ds41::fast_profile::moe_on();
+        opts.fast_engram = req.fast_engram || ds41::fast_profile::engram_on();
+        // Per-shape selector of the FP16 backend: STRIX_DS41_PREFILL_FP16_PROJ (comma list of q_a, kv, q_b, o_a, o_b),
+        // STRIX_DS41_PREFILL_FP16_MIN_ROWS (calls of at least that many rows), STRIX_DS41_PREFILL_APPROX_LAYERS=first-end,
+        // STRIX_DS41_PREFILL_FP16_A8=1 (operands from the A8 codes)
+        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_PROJ"); e != nullptr && *e != 0) {
+            std::uint32_t mask = 0;
+            std::stringstream ss(e);
+            for (std::string t; std::getline(ss, t, ',');) {
+                if (t == "q_a") mask |= 1U;
+                else if (t == "kv") mask |= 2U;
+                else if (t == "q_b") mask |= 4U;
+                else if (t == "o_a") mask |= 8U;
+                else if (t == "o_b") mask |= 16U;
+                else throw std::invalid_argument("STRIX_DS41_PREFILL_FP16_PROJ: " + t);
+            }
+            opts.fp16_projections = mask;
+        }
+        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_MIN_ROWS"); e != nullptr && *e != 0)
+            opts.fp16_min_rows = static_cast<std::uint32_t>(std::strtoul(e, nullptr, 10));
+        if (const char* e = std::getenv("STRIX_DS41_PREFILL_APPROX_LAYERS"); e != nullptr && *e != 0) {
+            char* end = nullptr;
+            opts.approx_layer_first = static_cast<std::uint32_t>(std::strtoul(e, &end, 10));
+            if (end == nullptr || *end != '-') throw std::invalid_argument("STRIX_DS41_PREFILL_APPROX_LAYERS: first-end");
+            opts.approx_layer_end = static_cast<std::uint32_t>(std::strtoul(end + 1, nullptr, 10));
+        }
+        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_A8"); e != nullptr && std::string(e) == "1") opts.fp16_keep_a8 = true;
+        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_FAST"); e != nullptr && std::string(e) == "1") opts.fp16_fast = true;
+        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_WSPLIT"); e != nullptr && std::string(e) == "1") opts.fp16_wsplit = true;
+        const char* v = std::getenv("STRIX_DS41_PREFILL_MOE_PERSIST");
+        moe_persist = !(v != nullptr && v[0] == '0');
+        v = std::getenv("STRIX_DS41_PREFILL_ASYNC_GATHER");
+        async_gather = !(v != nullptr && v[0] == '0');
+        v = std::getenv("STRIX_DS41_PREFILL_PACK");
+        pack = !(v != nullptr && v[0] == '0');
+        v = std::getenv("STRIX_DS41_PREFILL_JOINT");
+        moe_joint = v != nullptr && v[0] == '1';
+        v = std::getenv("STRIX_DS41_PREFILL_OVERLAP");
+        overlap = !(v != nullptr && v[0] == '0');
+        split_min_rows = req.split_min_rows;
+        if (v = std::getenv("STRIX_DS41_PREFILL_SPLIT_MIN_ROWS"); v != nullptr && *v != 0)
+            split_min_rows = static_cast<std::uint32_t>(std::strtoul(v, nullptr, 10));
+        joint_max_rows = req.joint_max_rows;
+        if (v = std::getenv("STRIX_DS41_PREFILL_JOINT_MAX_ROWS"); v != nullptr && *v != 0)
+            joint_max_rows = static_cast<std::uint32_t>(std::strtoul(v, nullptr, 10));
+        dense_q_a = true, dense_kv = true, dense_q_b = false, dense_o_a = false;  // the member defaults
+        dense_min_rows = 256;
+        if (v = std::getenv("STRIX_DS41_PREFILL_DENSE_SITES"); v != nullptr) {
+            const std::string list = std::string(",") + v + ",";
+            dense_q_a = list.find(",q_a,") != std::string::npos;
+            dense_kv = list.find(",kv,") != std::string::npos;
+            dense_q_b = list.find(",q_b,") != std::string::npos;
+            dense_o_a = list.find(",o_a,") != std::string::npos;
+        }
+        if (v = std::getenv("STRIX_DS41_PREFILL_DENSE_MIN_ROWS"); v != nullptr && *v != 0) dense_min_rows = static_cast<std::uint32_t>(std::stoul(v));
+        env_dense_q_b = dense_q_b;
+        env_dense_o_a = dense_o_a;
+        // the exact dense selector is the default (bitwise EQUAL, 2K -5.5 % / 8K -5.1 % TTFT);
+        // STRIX_DS41_DENSE_SELECT=0 = the loaded configuration above (STRIX_DS41_DENSE_TALL / PREFILL_DENSE_SITES)
+        dense_select = false;
+        if (v = std::getenv("STRIX_DS41_DENSE_SELECT"); !(v != nullptr && v[0] == '0' && v[1] == 0)) {
+            dense_select = true;
+            dense_q_b = true;
+            dense_o_a = true;
+        }
+        // row_split exchanges only: STAGED_GATHER (also needs staged_half, which the constructor decides) and EARLY_QB
+        v = std::getenv("STRIX_DS41_PREFILL_STAGED_GATHER");
+        staged_gather_allowed = !(v != nullptr && v[0] == '0');
+        staged_gather = staged_half && staged_gather_allowed;
+        v = std::getenv("STRIX_DS41_PREFILL_EARLY_QB");
+        early_q_b = !(opts.row_split && v != nullptr && v[0] == '0');
+    }
     // The same tables for rows at arbitrary positions (a group pass: every member's rows from position 0); the next
     // single-sequence run uploads its own again (pos_base invalid)
     void upload_row_positions(const std::vector<std::uint64_t>& positions, hipStream_t s) {
@@ -835,42 +933,8 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
         options.window_rows = ds41::prefill_tuning::attention_rows(rows, options.chunk_rows, ds41::attn::kHeads,
                                                                  options.max_positions, options.attention_lanes);
     }
-    if(const char* e=std::getenv("STRIX_DS41_PREFILL_FP16_DENSE");e && std::string(e)=="1")options.fp16_dense=true;
-    if(const char* e=std::getenv("STRIX_DS41_PREFILL_BF16_ATTN");e && std::string(e)=="1")options.bf16_attention=true;
-    if (const char* e = ds41::fast_profile::attention(); ds41::fast_profile::attention_on()) {  // the lever or STRIX_DS41_FAST_PREFILL
-        options.fast_attention = true;
-        if (e[0] == '2') options.fast_attention_flash = true;  // ds41-attn-bf16flash-v1
-    }
-    options.fast_dense = options.fast_dense || ds41::fast_profile::dense_on();
-    options.fast_moe = options.fast_moe || ds41::fast_profile::moe_on();
-    options.fast_engram = options.fast_engram || ds41::fast_profile::engram_on();
-    // Per-shape selector of the FP16 backend: STRIX_DS41_PREFILL_FP16_PROJ (comma list of q_a, kv, q_b, o_a, o_b),
-    // STRIX_DS41_PREFILL_FP16_MIN_ROWS (calls of at least that many rows), STRIX_DS41_PREFILL_APPROX_LAYERS=first-end,
-    // STRIX_DS41_PREFILL_FP16_A8=1 (operands from the A8 codes)
-    if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_PROJ"); e != nullptr && *e != 0) {
-        std::uint32_t mask = 0;
-        std::stringstream ss(e);
-        for (std::string t; std::getline(ss, t, ',');) {
-            if (t == "q_a") mask |= 1U;
-            else if (t == "kv") mask |= 2U;
-            else if (t == "q_b") mask |= 4U;
-            else if (t == "o_a") mask |= 8U;
-            else if (t == "o_b") mask |= 16U;
-            else throw std::invalid_argument("STRIX_DS41_PREFILL_FP16_PROJ: " + t);
-        }
-        options.fp16_projections = mask;
-    }
-    if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_MIN_ROWS"); e != nullptr && *e != 0)
-        options.fp16_min_rows = static_cast<std::uint32_t>(std::strtoul(e, nullptr, 10));
-    if (const char* e = std::getenv("STRIX_DS41_PREFILL_APPROX_LAYERS"); e != nullptr && *e != 0) {
-        char* end = nullptr;
-        options.approx_layer_first = static_cast<std::uint32_t>(std::strtoul(e, &end, 10));
-        if (end == nullptr || *end != '-') throw std::invalid_argument("STRIX_DS41_PREFILL_APPROX_LAYERS: first-end");
-        options.approx_layer_end = static_cast<std::uint32_t>(std::strtoul(end + 1, nullptr, 10));
-    }
-    if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_A8"); e != nullptr && std::string(e) == "1") options.fp16_keep_a8 = true;
-    if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_FAST"); e != nullptr && std::string(e) == "1") options.fp16_fast = true;
-    if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_WSPLIT"); e != nullptr && std::string(e) == "1") options.fp16_wsplit = true;
+    m.requested = requested;
+    m.resolve_levers(options, requested);  // the per-object switches (shared with apply_levers)
     m.moe_window_auto = options.moe_chunk_rows == 0U;
     if (m.moe_window_auto) options.moe_chunk_rows = 4096U;
     m.options = options;
@@ -883,34 +947,6 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
     if (options.attention_lanes == 0U || options.attention_lanes > 16U) throw std::invalid_argument("deepseek41 prefill: attention_lanes 1..16");
     if (options.moe_chunk_rows == 0U || options.moe_chunk_rows % options.chunk_rows != 0U)
         throw std::invalid_argument("deepseek41 prefill: moe_chunk_rows a multiple of chunk_rows");
-    if (const char* v = std::getenv("STRIX_DS41_PREFILL_MOE_PERSIST"); v != nullptr && v[0] == '0') m.moe_persist = false;
-    if (const char* v = std::getenv("STRIX_DS41_PREFILL_ASYNC_GATHER"); v != nullptr && v[0] == '0') m.async_gather = false;
-    if (const char* v = std::getenv("STRIX_DS41_PREFILL_PACK"); v != nullptr && v[0] == '0') m.pack = false;
-    if (const char* v = std::getenv("STRIX_DS41_PREFILL_JOINT"); v != nullptr && v[0] == '1') m.moe_joint = true;
-    if (const char* v = std::getenv("STRIX_DS41_PREFILL_OVERLAP"); v != nullptr && v[0] == '0') m.overlap = false;
-    m.split_min_rows = options.split_min_rows;
-    if (const char* v = std::getenv("STRIX_DS41_PREFILL_SPLIT_MIN_ROWS"); v != nullptr && *v != 0)
-        m.split_min_rows = static_cast<std::uint32_t>(std::strtoul(v, nullptr, 10));
-    m.joint_max_rows = options.joint_max_rows;
-    if (const char* v = std::getenv("STRIX_DS41_PREFILL_JOINT_MAX_ROWS"); v != nullptr && *v != 0)
-        m.joint_max_rows = static_cast<std::uint32_t>(std::strtoul(v, nullptr, 10));
-    if (const char* v = std::getenv("STRIX_DS41_PREFILL_DENSE_SITES"); v != nullptr) {
-        const std::string list = std::string(",") + v + ",";
-        m.dense_q_a = list.find(",q_a,") != std::string::npos;
-        m.dense_kv = list.find(",kv,") != std::string::npos;
-        m.dense_q_b = list.find(",q_b,") != std::string::npos;
-        m.dense_o_a = list.find(",o_a,") != std::string::npos;
-    }
-    if (const char* v = std::getenv("STRIX_DS41_PREFILL_DENSE_MIN_ROWS"); v != nullptr && *v != 0) m.dense_min_rows = static_cast<std::uint32_t>(std::stoul(v));
-    m.env_dense_q_b = m.dense_q_b;
-    m.env_dense_o_a = m.dense_o_a;
-    // the exact dense selector is the default (bitwise EQUAL, 2K -5.5 % / 8K -5.1 % TTFT);
-    // STRIX_DS41_DENSE_SELECT=0 = the loaded configuration above (STRIX_DS41_DENSE_TALL / PREFILL_DENSE_SITES)
-    if (const char* v = std::getenv("STRIX_DS41_DENSE_SELECT"); !(v != nullptr && v[0] == '0' && v[1] == 0)) {
-        m.dense_select = true;
-        m.dense_q_b = true;
-        m.dense_o_a = true;
-    }
     m.model = validate_target(read_file(gguf));
     m.plan = build_decode_plan(m.model, 0, options.layers);
     m.file = std::make_unique<Mapped>(gguf);
@@ -1181,9 +1217,7 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
                 m.staged_half = comm->send_staging(bytes) != nullptr;
                 if (!m.staged_half && bytes > before) comm->resize_bytes(before, false);
             }
-            m.staged_gather = m.staged_half;
-            if (const char* v = std::getenv("STRIX_DS41_PREFILL_STAGED_GATHER"); v != nullptr && v[0] == '0') m.staged_gather = false;
-            if (const char* v = std::getenv("STRIX_DS41_PREFILL_EARLY_QB"); v != nullptr && v[0] == '0') m.early_q_b = false;
+            m.staged_gather = m.staged_half && m.staged_gather_allowed;  // (STAGED_GATHER, EARLY_QB: Impl::resolve_levers)
         }
         m.half_own = Dev<float>(half_rows * H);
         m.half_other = Dev<float>(half_rows * H);
@@ -1634,6 +1668,19 @@ void DevicePrefill::set_precision_for_new_sequence(bool dense,bool attention) {
     impl_->options.fp16_dense=dense;impl_->options.bf16_attention=attention;impl_->broken=true;
 }
 
+void DevicePrefill::apply_levers() {
+    if (impl_->task) throw std::logic_error("cannot apply levers during a prefill task");
+    auto& m = *impl_;
+    PrefillOptions o = m.options;
+    m.resolve_levers(o, m.requested);
+#ifndef STRIX_DS41_PREFILL_FP16_LT
+    if (o.fp16_dense) throw std::invalid_argument("FP16 prefill backend not built");
+#endif
+    if (o.fast_attention && o.fast_attention_flash) m.prepare_flash_mirrors();
+    m.options = o;
+    m.broken = true;  // like set_precision_for_new_sequence: the next run() starts a new sequence
+}
+
 void DevicePrefill::set_dense_select(bool on) {
     if (impl_->task) throw std::logic_error("cannot change the dense selector during a prefill task");
     auto& m = *impl_;
@@ -1784,7 +1831,8 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     bool defer = false;
     {
         const std::uint32_t next_rows = std::exchange(m.defer_next, 0U);
-        static const bool defer_on = [] { const char* v = std::getenv("STRIX_DS41_DEFER_DECODER"); return !(v && std::strcmp(v, "0") == 0); }();
+        static strix::lever_cache<bool> defer_on_cache{[] { const char* v = std::getenv("STRIX_DS41_DEFER_DECODER"); return !(v && std::strcmp(v, "0") == 0); }};
+        const bool defer_on = defer_on_cache.get();
         if (next_rows != 0U && defer_on && m.options.cone && m.options.layers == c.num_hidden_layers && m.options.layers > first_decoder &&
             m.snap_points.empty() && (P0 + T) % W == 0U && grp == nullptr) {
             ds41::SuffixReplayGeometry g;
@@ -2231,9 +2279,10 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     for (std::uint32_t k = 0; k < engram_cols; ++k)
                         m.engram_ahead_requests.push_back({li, nids[std::size_t{t} * per_token + li * engram_cols + k]});
         }
-        static const bool ahead_log = strix::envcfg::flag("STRIX_DS41_ENGRAM_LOOKAHEAD_LOG", false);
+        static strix::lever_cache<bool> ahead_log_cache{[] { return strix::envcfg::flag("STRIX_DS41_ENGRAM_LOOKAHEAD_LOG", false); }};
+        const bool ahead_log = ahead_log_cache.get();
         const auto own_stats = ahead_log ? m.engram_reader->stats() : ds41::EngramReaderStats{};
-        const auto start_ahead = [&m, P0, T, own_stats] {  // after this run's own read (the reader serves one caller at a time)
+        const auto start_ahead = [&m, P0, T, own_stats, ahead_log] {  // after this run's own read (the reader serves one caller at a time)
             if (ahead_log) {
                 const auto s = m.engram_reader->stats();
                 std::fprintf(stderr, "engram lookahead: run at %u, %u rows: own read %llu requests, %llu cache hits, %llu misses, %.3f s busy; next run %zu requests\n",
@@ -2244,7 +2293,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
             }
             if (m.engram_ahead_requests.empty()) return;
             try {  // no thread: the next run reads its rows itself
-                m.engram_ahead = std::thread([&m] {
+                m.engram_ahead = std::thread([&m, ahead_log] {
                     const auto t0 = std::chrono::steady_clock::now();
                     try {
                         m.engram_ahead_out.resize(m.engram_ahead_requests.size() * 264U);
@@ -2275,7 +2324,8 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 // the same shared read-ahead loop to independently ready layers.
                 const std::size_t layer_requests = std::size_t{Tn} * engram_cols;
                 std::vector<std::size_t> offsets{0};
-                static const bool piece_read = strix::envcfg::flag("STRIX_DS41_ENGRAM_PIECE_READ", true, strix::EnvFlagMatch::exact);
+                static strix::lever_cache<bool> piece_read_cache{[] { return strix::envcfg::flag("STRIX_DS41_ENGRAM_PIECE_READ", true, strix::EnvFlagMatch::exact); }};
+                const bool piece_read = piece_read_cache.get();
                 if (engram_split_read && !engram_layer_blocks && Tn > 0U && piece_read) {
                     engram_piece_rows = m.task != nullptr && m.task->opt.engram_rows != 0U ? std::min(m.task->opt.engram_rows, C) : C;
                     engram_piece_blocks = (Tn + engram_piece_rows - 1U) / engram_piece_rows;
@@ -4229,7 +4279,8 @@ std::vector<PrefillResult> DevicePrefill::run_group(std::span<const PrefillSegme
 }
 
 void DevicePrefill::set_engram_lookahead(std::span<const std::uint32_t> next) {
-    static const bool on = [] { const char* v = std::getenv("STRIX_DS41_ENGRAM_LOOKAHEAD"); return !(v && std::strcmp(v, "0") == 0); }();
+    static strix::lever_cache<bool> on_cache{[] { const char* v = std::getenv("STRIX_DS41_ENGRAM_LOOKAHEAD"); return !(v && std::strcmp(v, "0") == 0); }};
+    const bool on = on_cache.get();
     impl_->engram_next.assign(next.begin(), next.end());
     if (!on) impl_->engram_next.clear();
 }
