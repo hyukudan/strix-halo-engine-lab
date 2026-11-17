@@ -265,11 +265,10 @@ int test_gdn() {
         auto *draw = dev(qkv), *dqc = devz<float>(R * C), *dout = devz<float>(R * hv * 128), *dst = dev(two), *dcs = dev(cs0);
         auto* dpar = devz<std::uint32_t>(1);
         cc::GdnWindow w{draw, dqc, dar, dbr};
-        if (cc::gdn_prefill_layer(d, L, {dcs, dst}, w, dz, dout, R, 1e-6f, dpar, nullptr) != cudaSuccess ||
-            cc::gdn_prefill_flip(dpar, nullptr) != cudaSuccess)
-            std::printf("gdn prefill launch fail\n");
+        CK(cc::gdn_prefill_layer(d, L, {dcs, dst}, w, dz, dout, R, 1e-6f, dpar, nullptr));
+        CK(cc::gdn_prefill_flip(dpar, nullptr));
         std::uint32_t par = 0;
-        cudaMemcpy(&par, dpar, 4, cudaMemcpyDeviceToHost);
+        CK(cudaMemcpy(&par, dpar, 4, cudaMemcpyDeviceToHost));
         const auto po = get(dout, R * hv * 128);
         const auto all = get(dst, two.size());
         const std::vector<float> ps(all.begin() + par * s0.size(), all.begin() + (par + 1) * s0.size());
