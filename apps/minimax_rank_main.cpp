@@ -930,9 +930,11 @@ extern "C" void strix_trellis_lab_set_wmma_tiled(int on) __attribute__((weak));
 struct FlashKeysAB {
     mm::Engine* eng;
     unsigned saved;
-    std::array<std::uint64_t, 3> before{};
-    FlashKeysAB(mm::Engine& engine, bool active) : eng(active ? &engine : nullptr), saved(engine.prefill_flash_keys()) {
-        if (eng != nullptr && eng->prefill_flash_mode() == 0)
+    bool msa_flash;
+    std::array<std::uint64_t, 7> before{};
+    FlashKeysAB(mm::Engine& engine, bool active, bool flash)
+        : eng(active || flash ? &engine : nullptr), saved(engine.prefill_flash_keys()), msa_flash(flash) {
+        if (active && eng->prefill_flash_mode() == 0)
             throw std::invalid_argument("--ab pfflashkeys: NOT EXERCISED (flash admission disabled)");
     }
     void restore() {
@@ -947,6 +949,18 @@ struct FlashKeysAB {
         if (eng == nullptr) return;
         auto counts = eng->prefill_flash_launches();
         for (std::size_t i = 0; i < counts.size(); ++i) counts[i] -= before[i];
+        if (msa_flash) {
+            const unsigned mode = eng->prefill_msa_flash(), rows = eng->prefill_rg_rows();
+            const auto launches = mode == 1 ? counts[3] : mode == 2 ? counts[4] : mode == 3 ?
+                                  (rows == 4 ? counts[5] : rows == 8 ? counts[6] : counts[5] + counts[6]) : 0;
+            const bool exercised = mode == 0 || launches != 0;
+            std::printf("rank %u ab-pfmsaflash: arm %c mode=%u rows=%u launches=%llu row-groups[4,8]=%llu,%llu %s\n",
+                        eng->rank(), arm % 2 == 1 ? 'B' : 'A', mode, rows,
+                        static_cast<unsigned long long>(launches), static_cast<unsigned long long>(counts[5]),
+                        static_cast<unsigned long long>(counts[6]), mode == 0 ? "OFF" : exercised ? "EXERCISED" : "NOT EXERCISED");
+            if (!exercised) g_exact_fail = true;
+            return;
+        }
         const unsigned expected = arm % 2 == 0 ? 0U : 2U;
         const unsigned schedule = eng->prefill_flash_keys();
         const unsigned mode = eng->prefill_flash_mode();
@@ -963,7 +977,7 @@ struct FlashKeysAB {
 
 std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vector<std::uint32_t>& prompt, int block,
                       const std::vector<std::uint32_t>* reference) {
-    FlashKeysAB flash_keys(eng, flag == "pfflashkeys");
+    FlashKeysAB flash_keys(eng, flag == "pfflashkeys", flag == "pfmsaflash");
     const int pipe0 = strix::minimax::moe::opt::prefill_pipe_override();
     struct RestorePipe {
         bool active;
@@ -1249,7 +1263,7 @@ std::uint64_t ab_flag(mm::Engine& eng, const std::string& flag, const std::vecto
         eng.set_prefill_msa_flash(flash0);
         eng.set_prefill_rg_rows(rg_rows0);
     }
-    if (flag == "pfmsarework") {
+    else if (flag == "pfmsarework") {
         eng.set_prefill_msa_rework(rework0);
         eng.set_prefill_msa_batch(msa0);
         eng.set_fused_prefill_attention(fused_prefill0);

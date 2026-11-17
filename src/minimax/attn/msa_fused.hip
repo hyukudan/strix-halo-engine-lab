@@ -2331,7 +2331,7 @@ std::size_t prefill_window_bytes(std::uint32_t max_blocks) {
 
 namespace {
 template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned windows, hipStream_t stream,
-                                              std::array<std::uint64_t, 3>* flash_launches) {
+                                              std::array<std::uint64_t, 7>* flash_launches) {
     if (windows == 0) return;
     const DecodeView& v = p.window;
     if (p.msa_rework != 0) {
@@ -2346,6 +2346,8 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
         const auto chunks = prefill_chunk_prefix(p.pos0 + scheduled.rows) -
                             prefill_chunk_prefix(p.pos0 + p.first_window * kMaxRows);
         if (p.msa_rework == 13) {
+            if (v.q16 != nullptr)
+                throw std::logic_error("minimax prefill row groups read FP32 q; the q image must not be written for mode 3");
             // FAST: one-term flash on the shared core's row-group form: 4 neighbouring rows of one KV group per block
             // share each K/V tile of their merged block lists (same selection and block lists as mode 11; one softmax
             // stream per row, so not mode 11's bytes).
@@ -2364,6 +2366,7 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
             if (rg == 8U) go(std::integral_constant<unsigned, 8>{});
             else go(std::integral_constant<unsigned, 4>{});
             hip_check(hipGetLastError(), "minimax prefill flash attend (row groups)");
+            if (flash_launches != nullptr) ++(*flash_launches)[rg == 8U ? 6U : 5U];
             return;
         }
         if (p.msa_rework == 11 || p.msa_rework == 12) {
@@ -2394,6 +2397,7 @@ template <bool DENSE> void launch_prefill_attend(const PrefillView& p, unsigned 
             else two ? go(std::true_type{}, U0{}) : go(std::false_type{}, U0{});
             hip_check(hipGetLastError(), "minimax prefill flash attend");
             if (flash_launches != nullptr) ++(*flash_launches)[p.flash_keys <= 2U ? p.flash_keys : 0U];
+            if (flash_launches != nullptr) ++(*flash_launches)[p.msa_rework == 11 ? 3U : 4U];
             return;
         }
         if (p.msa_rework == 10) {
@@ -2802,7 +2806,7 @@ void enqueue_prefill_cache_only(const PrefillView& p, hipStream_t stream, Prefil
 }
 
 void enqueue_prefill(const PrefillView& p, hipStream_t stream, PrefillStageMarker marker, void* user,
-                     std::array<std::uint64_t, 3>* flash_launches) {
+                     std::array<std::uint64_t, 7>* flash_launches) {
     check_prefill_view(p);
     const DecodeView& v = p.window;
     launch_prefill_prep(p, stream, marker, user);

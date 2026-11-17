@@ -15,11 +15,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -138,9 +140,19 @@ double median(std::vector<double> v) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    const unsigned rows = argc > 1 ? static_cast<unsigned>(std::atoi(argv[1])) : 4096U;
-    const int reps = argc > 2 ? std::atoi(argv[2]) : 20;
-    const int iters = argc > 3 ? std::atoi(argv[3]) : 64;
+    const auto positive = [](const char* text, int& value) {
+        const char* end = text + std::strlen(text);
+        const auto parsed = std::from_chars(text, end, value);
+        return parsed.ec == std::errc{} && parsed.ptr == end && value > 0;
+    };
+    int row_count = 4096, reps = 20, iters = 64;
+    if (argc > 4 || (argc > 1 && !positive(argv[1], row_count)) || (argc > 2 && !positive(argv[2], reps)) ||
+        (argc > 3 && !positive(argv[3], iters)) || reps > std::numeric_limits<int>::max() - 2 ||
+        iters == std::numeric_limits<int>::max()) {
+        std::fprintf(stderr, "usage: xslot_bench [rows=4096] [reps=20] [check_iters=64] (positive integers within loop limits)\n");
+        return 2;
+    }
+    const unsigned rows = static_cast<unsigned>(row_count);
     const std::size_t n = std::size_t{rows} * kHidden, bytes = n * sizeof(float);
     hipStream_t st;
     ck(hipStreamCreateWithFlags(&st, hipStreamNonBlocking), "stream");
@@ -160,12 +172,15 @@ int main(int argc, char** argv) {
     std::uint64_t* flag_h;
     std::uint64_t* flag_d;
     ck(hipHostMalloc(reinterpret_cast<void**>(&flag_h), 4096, hipHostMallocMapped | hipHostMallocCoherent), "flag");
+    __atomic_store_n(flag_h, 0, __ATOMIC_RELEASE);
     ck(hipHostGetDevicePointer(reinterpret_cast<void**>(&flag_d), flag_h, 0), "flag");
     // Floor: the post moves 6 rows of kHidden fp32 per row (h, p0, p1 read; h, y write; norm_w cached).
     const double post_mb = 5.0 * static_cast<double>(bytes) / 1e6;
     std::printf("xslot rows %u reps %d: post bytes %.1f MB (p0+p1 %.1f MB), producer write %.1f MB\n", rows, reps, post_mb,
                 2.0 * bytes / 1e6, bytes / 1e6);
+    bool stale = false;
     for (const char* kind : {"coh", "nc", "dev", "unc"}) {
+        __atomic_store_n(flag_h, 0, __ATOMIC_RELEASE);  // previous trial synchronized every consumer
         Buf p0 = alloc(kind, bytes), p1 = alloc(kind, bytes);
         std::vector<double> tp, tq, tw;
         for (int i = 0; i < reps + 2; ++i) {
@@ -216,12 +231,12 @@ int main(int argc, char** argv) {
                 bad_iters += b != 0;
             }
             std::printf("kind %-3s coherence: %d iters, %u bad iters, %u stale elements -> %s\n", kind, iters, bad_iters,
-                        total_bad, total_bad == 0 ? "OK" : "STALE");
-            __atomic_store_n(flag_h, 0, __ATOMIC_RELEASE);
+                        total_bad, bad_iters == 0 ? "OK" : "STALE");
+            stale |= bad_iters != 0;
         }
         release(p0);
         release(p1);
     }
     std::printf("done\n");
-    return 0;
+    return stale ? 1 : 0;
 }
