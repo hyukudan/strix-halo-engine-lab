@@ -66,6 +66,7 @@ bool same_values(const rd::Effective& a, const rd::Effective& b, std::string* wh
     d = diff("decode-xch", a.decode_xch.value, b.decode_xch.value) || d;
     d = diff("xch", a.xch, b.xch) || d;
     d = diff("max-rows", a.max_rows.value, b.max_rows.value) || d;
+    d = diff("split-frame", a.split_frame.value, b.split_frame.value) || d;
     for (const auto& it : rd::env_items()) d = diff(it.env, a.env.at(it.env).value, b.env.at(it.env).value) || d;
     return !d;
 }
@@ -213,6 +214,22 @@ void test_item_off_switches() {
     CHECK(m1.mtp.value == "1" && m1.prefill == "ref");
     CHECK(resolve(cat(plain, {"--decode-xch", "comm"}), {}).decode_xch.value == "comm");
     CHECK(resolve(plain, {{"STRIX_GLM_DECODE_XCH", "comm"}}).decode_xch.value == "comm");
+    {   // glm_split_frame (xport/split_frame.hpp): automatic from 4 rows, one resolution for CLI and serve
+        const auto sf = resolve(plain, {});
+        CHECK(sf.split_frame.source == "default" && sf.split_policy.mode == strix::xport::SplitFramePolicy::Mode::automatic);
+        CHECK(!sf.split_policy.on(1) && !sf.split_policy.on(3) && sf.split_policy.on(4) && sf.split_policy.on(8));
+        CHECK(resolve(plain, {{"STRIX_XPORT_SPLIT_ROWS", "0"}}).split_policy.mode == strix::xport::SplitFramePolicy::Mode::off);
+        const auto forced = resolve(plain, {{"STRIX_XPORT_SPLIT_ROWS", "1"}});
+        CHECK(forced.split_frame.source == "explicit" && forced.split_policy.on(2) && !forced.split_policy.on(1));
+        CHECK(resolve(cat(plain, {"--baseline"}), {}).split_policy.mode == strix::xport::SplitFramePolicy::Mode::off);
+        bool threw = false;
+        try { (void)resolve(plain, {{"STRIX_XPORT_SPLIT_ROWS", "maybe"}}); } catch (const std::invalid_argument&) { threw = true; }
+        CHECK(threw);
+        const rd::EnvGet none = [](const char*) -> const char* { return nullptr; };  // the serve resolver: same policy for the same request
+        const auto served = rd::resolve_serve(plain, false, none);
+        CHECK(served.split_frame.value == sf.split_frame.value && served.split_policy.mode == sf.split_policy.mode &&
+              served.split_policy.crossover == sf.split_policy.crossover);
+    }
     // auto-prefill exclusions (unchanged rules)
     CHECK(resolve(cat(plain, {"--spec", "1"}), {}).prefill == "ref");
     CHECK(resolve(cat(plain, {"--idcheck", "32"}), {}).prefill == "ref");

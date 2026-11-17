@@ -17,6 +17,7 @@
 #include "strix/engine_profile.hpp"
 #include "strix/glm_pair_profile_table.hpp"
 #include "strix/session/speculation_default.hpp"
+#include "xport/split_frame.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -238,6 +239,10 @@ struct Effective {
     bool kv_shard = false, kv_shard_auto = false;
     Value identity, prefill_requested, mtp, mtp_spec, spec, decode_xch, max_rows;
     Value prefill_units;  // STRIX_GLM_SERVE_PREFILL_UNITS (serving-only)
+    // Split-producer chunk frames of the decode exchanges (xport/split_frame.hpp; STRIX_XPORT_SPLIT_ROWS = 0 | 1 | unset).
+    // Resolved here once for CLI and serve (one resolver); the engine decides per step with split_policy.on(rows).
+    strix::xport::SplitFramePolicy split_policy;
+    Value split_frame;
     ModelFacts head;
     bool mtp_spec_candidate = false;
     unsigned kmax = 3;
@@ -310,6 +315,14 @@ inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& 
     if (const char* v = env("STRIX_GLM_DECODE_XCH")) e.decode_xch = {v, "explicit"};
     else if (r.decode_xch) e.decode_xch = {*r.decode_xch, "explicit"};
     else e.decode_xch = {e.baseline ? "comm" : "xfer", src_b};
+    {   // glm_split_frame: LNKS2 prediction (crossover 4 rows), ABAB pending; --baseline is the old path (off) unless explicit
+        static constexpr auto kSplitRow = strix::xport::split_frame_decl("glm_split_frame", 4, "LNKS2 prediction, ABAB pending");
+        const char* raw = env("STRIX_XPORT_SPLIT_ROWS");
+        const bool explicit_switch = raw != nullptr && *raw != '\0';
+        e.split_policy = strix::xport::split_frame_policy(kSplitRow, explicit_switch ? raw : nullptr);
+        if (e.baseline && !explicit_switch) e.split_policy.mode = strix::xport::SplitFramePolicy::Mode::off;
+        e.split_frame = {e.split_policy.describe(), explicit_switch ? "explicit" : e.baseline ? "baseline" : "default"};
+    }
     e.xch = r.xch;
     const bool g3_only = r.g3 && !r.decode_or_batch && r.idcheck == 0;
     const bool smoke_head = env_is(env, "STRIX_GLM_SMOKE_HEAD", "1");
@@ -440,6 +453,7 @@ inline std::string print(const Effective& e) {
          "; serving-only: a long prompt beside decoding requests pauses at layer boundaries of its max_rows pieces, "
          "8 decode rows reserved above max_rows; the CLI has no decode cohort and prefills whole prompts)\n";
     line("decode-xch", e.decode_xch);
+    line("split-frame", e.split_frame);
     line("max-rows", e.max_rows);
     if (max_rows_auto(e)) s += "effective max-rows-admission=startup-admission-and-rank-min (8192 candidate, 4096 fallback)\n";
     s += "effective xch=" + e.xch + "\n";

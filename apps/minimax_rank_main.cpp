@@ -1404,6 +1404,52 @@ void decode_check(mm::Engine& eng, const std::string& name, const std::vector<st
     std::fflush(stdout);
 }
 
+// Split-producer chunk frames A/B in one process (--split-ab PROMPT.u32:STEPS:R1,R2,...): per R, R slots (copies of the prompt's
+// prefill, one row each) and 7 blocks A B A B A B A (A = Engine::set_split_frame(0), B = 1) of STEPS R-row decode steps.
+// Block 0 decodes greedily; blocks 1..6 re-decode the SAME positions teacher-forced with block 0's tokens and must
+// reproduce its next tokens (every row). Both ranks run the same schedule, so the override flips at the same step.
+void split_ab(mm::Engine& eng, const std::vector<std::uint32_t>& prompt, int steps, const std::vector<unsigned>& rs, std::uint32_t slots) {
+    if (steps < 2 || prompt.empty()) throw std::invalid_argument("--split-ab: STEPS >= 2 and a non-empty prompt");
+    const std::size_t P = prompt.size();
+    for (unsigned R : rs) {
+        if (R == 0 || R > slots) throw std::invalid_argument("--split-ab: 1 <= R <= slots");
+        eng.set_split_frame(0);
+        const auto t0 = Clock::now();
+        const std::uint32_t first = eng.prefill(0, prompt, 0);
+        const double pf = secs(t0, Clock::now());
+        for (unsigned i = 1; i < R; ++i) eng.copy_slot(i, 0, P);
+        std::printf("rank %u split-ab R=%u: prefill %.3f s (%zu tokens)\n", eng.rank(), R, pf, P);
+        std::vector<std::vector<std::uint32_t>> gen(R, std::vector<std::uint32_t>{first});  // per row: input token, then outputs
+        std::vector<double> cell[7];
+        std::size_t diff = 0;
+        std::vector<mm::Row> rows(R);
+        for (int b = 0; b < 7; ++b) {
+            eng.set_split_frame(b % 2 == 1 ? 1 : 0);
+            for (int k = 0; k < steps; ++k) {
+                for (unsigned r = 0; r < R; ++r) rows[r] = {r, gen[r][static_cast<std::size_t>(k)], P + static_cast<std::size_t>(k)};
+                const auto a = Clock::now();
+                const auto out = eng.step(rows);
+                cell[b].push_back(secs(a, Clock::now()) * 1e3);
+                for (unsigned r = 0; r < R; ++r) {
+                    if (b == 0) gen[r].push_back(out[r]);
+                    else diff += out[r] != gen[r][static_cast<std::size_t>(k) + 1] ? 1U : 0U;
+                }
+            }
+        }
+        eng.set_split_frame(-1);
+        double m[7];
+        for (int b = 0; b < 7; ++b) m[b] = median(std::vector<double>(cell[b].begin() + 1, cell[b].end()));
+        const double a = median({m[0], m[2], m[4], m[6]}), bb = median({m[1], m[3], m[5]});
+        if (eng.rank() == 0)
+            std::printf("split-ab R=%u ctx=%zu A %.3f B %.3f delta %+.3f (%+.2f%%) A-blocks %.3f,%.3f,%.3f,%.3f B-blocks %.3f,%.3f,%.3f replay-diff %zu\n",
+                        R, P, a, bb, bb - a, (bb - a) / a * 100.0, m[0], m[2], m[4], m[6], m[1], m[3], m[5], diff);
+        std::printf("rank %u split-ab R=%u: matched replay %zu differences%s\n", eng.rank(), R, diff, diff == 0 ? " (IDENTICAL)" : " (DIFFER)");
+        if (diff != 0) g_exact_fail = true;
+        std::fflush(stdout);
+    }
+    eng.set_split_frame(-1);
+}
+
 // Batched decode: row i starts at position L - 8 i (teacher-forced first input = prompt[L - 8 i]) in slot i, whose
 // cache holds positions < L - 8 i (one prefill of the prompt in slot 0, copied). Each row's tokens in an N-row step
 // must equal the same row run alone (batch invariance).
@@ -1771,7 +1817,7 @@ int main(int argc, char** argv) {
         unsigned gate_layers = 6;
         bool tf_write = false, session_hash_only = false;
         double deadline = 1e9;
-        std::vector<std::string> sessions, batches, ab_runs, specs, dchecks, vtraces, offloads, offload_imports, offload_listens, xbchecks, selchecks;
+        std::vector<std::string> sessions, batches, split_abs, ab_runs, specs, dchecks, vtraces, offloads, offload_imports, offload_listens, xbchecks, selchecks;
         const auto& cut_cfg = cut_args.config;
         const auto& layercut_listens = cut_args.listens;
         const auto& cut_relay = cut_args.relay;
@@ -1804,6 +1850,7 @@ int main(int argc, char** argv) {
                 if (!timing.empty()) sessions.push_back("@" + timing);  // a session with per-phase timing
             }
             else if (a == "--batch") batches.push_back(next());
+            else if (a == "--split-ab") split_abs.push_back(next());
             else if (a == "--verify-trace") vtraces.push_back(next());
             else if (a == "--ab") ab_runs.push_back(next());
             else if (a == "--dspark-prior") (void)next();
@@ -2282,6 +2329,22 @@ int main(int argc, char** argv) {
             }
             const std::uint64_t bh = batch(eng, prompt, steps, ns, opt.slots);
             hs = fnv(&bh, 8, hs);
+        }
+        for (const auto& b : split_abs) {  // --split-ab PROMPT.u32:STEPS:R1,R2,...
+            if (!in_time()) {
+                std::printf("rank %u: split-ab %s skipped (deadline)\n", opt.rank, b.c_str());
+                continue;
+            }
+            const auto c1 = b.find(':'), c2 = b.find(':', c1 + 1);
+            const auto prompt = read_u32(b.substr(0, c1));
+            const int steps = std::stoi(b.substr(c1 + 1, c2 - c1 - 1));
+            std::vector<unsigned> rs;
+            for (std::size_t p = c2 + 1; p < b.size();) {
+                const auto e = b.find(',', p);
+                rs.push_back(static_cast<unsigned>(std::stoul(b.substr(p, e - p))));
+                p = e == std::string::npos ? b.size() : e + 1;
+            }
+            split_ab(eng, prompt, steps, rs, opt.slots);
         }
         // Both ranks must have produced the same tokens / residuals: compare the hashes through rank 0.
         const auto mine = static_cast<std::uint32_t>(hs ^ (hs >> 32U));

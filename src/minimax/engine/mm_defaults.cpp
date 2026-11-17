@@ -418,6 +418,16 @@ profile::ExecutionReceipt host_receipt(const Lookup& env) {
     return receipt;
 }
 
+const lever::Decl& split_frame_row() {
+    static constexpr lever::Decl row = xport::split_frame_decl("mm_split_frame", 4, "LNKS2 prediction, ABAB pending");
+    return row;
+}
+
+xport::SplitFramePolicy split_frame_policy() {
+    static const xport::SplitFramePolicy policy = xport::split_frame_policy(split_frame_row());  // once: CLI, serve and engine agree
+    return policy;
+}
+
 void apply() {
     std::lock_guard<std::mutex> g(g_mutex);
     if (g_applied) return;
@@ -746,6 +756,7 @@ bool print_or_apply(const std::string& app, int argc, char** argv) {
     if (app == "serve" && strix::session::speculation_environment_off(process_env(strix::session::speculation_environment)))
         (void)export_env("STRIX_MM_SERVE_DSPARK", "0", 0);
     apply();
+    (void)split_frame_policy();  // validate and record the lever on both entry points (rank CLI and serve)
     (void)pf_async_min_rows(process_env("STRIX_MM_PF_ASYNC_MIN_ROWS"));
     (void)effective_config(parse_cli(app, args), process_env);
     if (!print) {  // a weight request this build cannot honour refuses the run (printed, not refused, above)

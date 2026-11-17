@@ -652,6 +652,14 @@ struct Engine::Impl {
     bool xb_pub = false;       // STRIX_MM_XB_PUBLISH=1 (with XB_INPLACE): the in-place producer publishes itself (lean), no publish launch
     mmoe::PublishTarget xb_pt{};  // the target handed to the producers of the next exchange (flag null: none)
     bool xb_published = false;    // the producer enqueued for xb_tx carries xb_pt
+    // Split-producer chunk frames (STRIX_XPORT_SPLIT_ROWS, defaults::split_frame_policy): resolved once, decided per step by rows.
+    strix::xport::SplitFramePolicy split_policy{};
+    int split_override = -1;  // Engine::set_split_frame (benches): -1 resolved policy, 0 off, 1 on at every row count
+    [[nodiscard]] bool split_on(unsigned n) const { return split_override >= 0 ? (split_override == 1 && n != 0) : split_policy.on(n); }
+    bool xb_split_ask = false;                 // this message's producers may split (policy on for the rows, default producer forms)
+    bool xb_split = false;                     // the producer of xb_tx split it: the message is SplitLayout{n, 6144, 3072}
+    mmoe::PublishTarget xb_head_pt{};          // the head part's target (Channel::head_target)
+    static constexpr unsigned kSplitHead = kHidden / 2;
     unsigned xb_warm_mb = 8;      // STRIX_MM_XB_WARM=MB (0 = off; default 8, exchange boundary set): per exchange, warm up to MB of the next phase's weights
     hipStream_t xb_warm_stream = nullptr;  // side stream: waits for each message's TX flag, then the warm kernel
     unsigned* xb_warm_sink = nullptr;
@@ -905,6 +913,7 @@ struct Engine::Impl {
             std::printf("STRIX_MM_XB_PUBLISH: default ON needs the v4 linear core and the decode MoE overlap form; off\n");
             xb_pub = false;
         }
+        split_policy = defaults::split_frame_policy();  // the one resolution shared with the CLI / serve entry points
         if (const char* wm = std::getenv("STRIX_MM_XB_WARM")) xb_warm_mb = static_cast<unsigned>(std::strtoul(wm, nullptr, 10));
         if (const char* wo = std::getenv("STRIX_MM_XB_WARM_O")) xb_warm_o_mb = static_cast<unsigned>(std::strtoul(wo, nullptr, 10));
         const char* apf = std::getenv("STRIX_MM_ATTN_PREFILL");
@@ -1645,9 +1654,19 @@ struct Engine::Impl {
             xb_tx = static_cast<float*>(xf->tx());
             xb_pt = {};
             xb_published = false;
+            xb_split = false;
+            xb_split_ask = false;
+            xb_head_pt = {};
             if (xb_pub) {  // STRIX_MM_XB_PUBLISH: ... and publishes it itself (supported forms checked when the flag is set)
                 const auto t = xf->producer_target();
                 xb_pt = mmoe::PublishTarget{t.flag, t.counter, t.sequence};
+                // Split frame: only with the producer-published in-place TX slot (the default forms); the producers below
+                // decide per site whether they split, exchange_post reads xb_split. Rows decide, identically on both ranks.
+                if (split_on(static_cast<unsigned>(n))) {
+                    const auto hd = xf->head_target();
+                    xb_head_pt = mmoe::PublishTarget{hd.flag, hd.counter, hd.sequence};
+                    xb_split_ask = true;
+                }
             }
             return xb_tx;
         }
@@ -1790,9 +1809,16 @@ struct Engine::Impl {
             const auto warm_pt = xf->producer_target();  // this message's TX flag and sequence (STRIX_MM_XB_WARM gate)
             const bool inplace = xb_tx != nullptr && local == xb_tx;  // produced in the TX slot: publish only
             const bool self_pub = inplace && xb_published;          // ... by the producer itself (nothing to enqueue)
+            const bool split = inplace && self_pub && xb_split;     // the producers split the message (head, then tail)
             xb_tx = nullptr;
             xb_pt = {};
             xb_published = false;
+            xb_split = false;
+            xb_split_ask = false;
+            xb_head_pt = {};
+            // The head producer has published through head_target(); the host side of the protocol (Channel::split_head)
+            // must precede send(). Both ranks split the same messages (same rows, same layer kinds, same config).
+            if (split) xf->split_head(std::size_t{n} * kSplitHead * sizeof(float), mx::Publish::producer);
             // STRIX_MMX_FOLD=N (xport row fold): for at most N rows the pair sum p0 + p1 is computed by the exchange
             // progress thread before the RX flag; post_exchange reads one folded slot (x = h + folded, same bits).
             if (xb_fold && xf->can_fold(bytes)) xf->fold_next(strix::xport::RowFold::sum_f32);
@@ -1816,6 +1842,7 @@ struct Engine::Impl {
                 peer = static_cast<const float*>(backend.wait(xticket, xf->options().stream).remote);
             }
             wts4_d = reinterpret_cast<float*>(route_d + n * kTopE);
+            if (split) pv.split_head = kSplitHead;  // the local TX part, the peer's RX payload and the folded slot are chunk-major
             pv.part0 = opt.rank == 0 ? local : peer;
             pv.part1 = opt.rank == 0 ? peer : local;
             if (const void* folded = xf->last_folded()) {
@@ -2345,7 +2372,16 @@ struct Engine::Impl {
                 f32_linear(y.ro, attn, kQLocal, out, kHidden, n);
             } else if (lin_opt) {
                 const mmoe::LinearJob j{y.ro, attn, kQLocal, out, kHidden};
-                if (xb_pt.flag != nullptr && out == xb_tx) {  // STRIX_MM_XB_PUBLISH: o_proj publishes its TX message
+                if (xb_split_ask && xb_pt.flag != nullptr && out == xb_tx) {
+                    // Split frame: o_proj twice on output columns [0, 3072) then [3072, 6144) (linear v4, weights read once in
+                    // total, one prepare). Head part = first n * 3072 floats of the TX slot, tail part right after it.
+                    const mmoe::LinearJob jh{y.ro, attn, kQLocal, out, kSplitHead, 0, kSplitHead};
+                    const mmoe::LinearJob jt{y.ro, attn, kQLocal, out + n * kSplitHead, kSplitHead, kSplitHead, kHidden - kSplitHead};
+                    mmoe::enqueue_linears_publish(&jh, 1, static_cast<unsigned>(n), lin_ws, nullptr, xb_head_pt, false);
+                    mmoe::enqueue_linears_publish(&jt, 1, static_cast<unsigned>(n), lin_ws, nullptr, xb_pt, true);
+                    xb_published = true;
+                    xb_split = true;
+                } else if (xb_pt.flag != nullptr && out == xb_tx) {  // STRIX_MM_XB_PUBLISH: o_proj publishes its TX message
                     mmoe::enqueue_linears_publish(&j, 1, static_cast<unsigned>(n), lin_ws, nullptr, xb_pt, false);
                     xb_published = true;
                 } else {
@@ -2454,6 +2490,11 @@ struct Engine::Impl {
                 if (xb_pt.flag != nullptr && out == xb_tx) {  // STRIX_MM_XB_PUBLISH: the down/combine launch publishes
                     mv.pub = xb_pt;
                     xb_published = true;
+                    if (xb_split_ask && mmoe::moe_split_supported(static_cast<unsigned>(n))) {  // split frame: down + combine per half
+                        mv.split = true;
+                        mv.pub_head = xb_head_pt;
+                        xb_split = true;
+                    }
                 }
                 mmoe::enqueue_moe(mv, nullptr);
             } else if (f32) {  // prefill in the FP32 identity: host routes, grouped experts + shared, fixed-order combine
@@ -3652,6 +3693,8 @@ std::uint32_t Engine::prefill(std::uint32_t slot, std::span<const std::uint32_t>
     return impl_->prefill(slot, tokens, pos0);
 }
 std::vector<std::uint32_t> Engine::step(std::span<const Row> rows) { return impl_->step(rows); }
+void Engine::set_split_frame(int mode) { impl_->split_override = mode < 0 ? -1 : mode ? 1 : 0; }
+int Engine::split_frame() const { return impl_->split_override; }
 void Engine::set_taps(bool on) { impl_->set_taps(on); }
 const float* Engine::last_taps() const { return impl_->taps_d; }
 void Engine::set_prefill_tap_sink(PrefillTapSink sink) {

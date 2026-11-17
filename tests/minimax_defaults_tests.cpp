@@ -673,6 +673,31 @@ void test_turbo_product_profile() {
           "turbo: unbuilt onfly is printed as pending, never run silently");
 }
 
+// Split-producer chunk frames: one lever row, one policy for the rank CLI and serve entry points.
+void test_split_frame() {
+    namespace sx = strix::xport;
+    const auto& row = md::split_frame_row();
+    check(std::string(row.name) == "mm_split_frame" && row.regime.crossover == 4, "split frame row");
+    const auto automatic = sx::split_frame_policy(row, nullptr);
+    check(!automatic.on(1) && !automatic.on(3) && automatic.on(4) && automatic.on(8), "split frame auto crossover 4 rows");
+    check(!sx::split_frame_policy(row, "0").on(8), "split frame explicit 0");
+    check(sx::split_frame_policy(row, "1").on(2) && !sx::split_frame_policy(row, "1").on(1), "split frame explicit 1, never 1 row");
+    bool rejected = false;
+    try { (void)sx::split_frame_policy(row, "maybe"); } catch (const std::exception&) { rejected = true; }
+    check(rejected, "split frame invalid text rejected");
+    // Both entry points end with the same effective value (one cached resolution; the env is read once).
+    (void)::unsetenv("STRIX_XPORT_SPLIT_ROWS");
+    char flag[] = "--print-effective-config", app[] = "strix-minimax-rank", m[] = "M", r0[] = "0", tr[] = "usb4-auto", out[] = "OUT";
+    char rank_flag[] = "--rank";
+    char* rank_argv[] = {app, m, r0, tr, out, flag};
+    char* serve_argv[] = {app, m, rank_flag, r0, flag};
+    (void)md::print_or_apply("rank", 6, rank_argv);
+    const auto a = md::split_frame_policy();
+    (void)md::print_or_apply("serve", 5, serve_argv);
+    const auto b = md::split_frame_policy();
+    check(a.mode == b.mode && a.crossover == b.crossover && a.mode == automatic.mode, "rank and serve resolve the same split policy");
+}
+
 // FAST prefill profile (mm_profile_table.hpp): bundle expansion, explicit-OFF precedence, FAST_I4 exclusion, legacy
 // field omission with every row OFF, rank agreement.
 void test_fast_prefill_profile() {
@@ -1025,6 +1050,7 @@ int main(int argc, char** argv) {
         test_session_startup();
         test_apply();
         test_entry_points_host_defaults();
+        test_split_frame();
         test_fast_prefill_profile();
         test_router_wmma();
         test_turbo_product_profile();

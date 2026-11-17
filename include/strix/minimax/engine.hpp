@@ -310,6 +310,10 @@ public:
     void set_shared_first(bool on);  // STRIX_MM_SHARED_FIRST: shared expert overlaps the route copy (same sums)
     [[nodiscard]] bool shared_first() const;
     void set_profiling(bool on);  // STRIX_MM_PROFILE: synchronised per-phase times (slows the run)
+    // Bench-only override of the split-producer chunk frames: -1 resolved policy (default), 0 off, 1 on at every row count.
+    // Both ranks must flip at the same step.
+    void set_split_frame(int mode);
+    [[nodiscard]] int split_frame() const;
     void set_trace(bool on);      // StepTrace of every decode step (events only, same bits)
     [[nodiscard]] const StepTrace& last_trace() const;
     // prefill exchange module (src/minimax/pfx): set before load() (it sizes the per-chunk buffers);

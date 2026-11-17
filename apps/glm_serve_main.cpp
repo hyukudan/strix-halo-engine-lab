@@ -1018,6 +1018,8 @@ int main(int argc, char** argv) {
         if (id != "r1" && id != "r1b" && id != "r1b-all") throw std::invalid_argument("--identity r1|r1b|r1b-all");
         opt.identity = id == "r1" ? ge::IdentityMode::kR1 : id == "r1b" ? ge::IdentityMode::kR1b : ge::IdentityMode::kR1bAll;
         opt.decode_xfer = eff.decode_xch.value == "xfer";
+        opt.split_frame_mode = static_cast<unsigned>(eff.split_policy.mode);
+        opt.split_frame_crossover = static_cast<unsigned>(eff.split_policy.crossover);
         std::string prefill_mode = eff.prefill;
         if (prefill_mode != "ref" && prefill_mode != "gemv" && prefill_mode != "wmma")
             throw std::invalid_argument("prefill must resolve to ref, gemv or wmma");

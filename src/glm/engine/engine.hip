@@ -3,6 +3,7 @@
 #include <array>
 #include <exception>
 #include "xport/channel.hpp"
+#include "xport/split_frame.hpp"
 #include "xport/communicator_backend.hpp"
 #include "glm/xfer/glm_traits.hpp"
 #include "glm/rtxpf/import/glm_state_layout.hpp"
@@ -682,6 +683,23 @@ struct Engine::Impl {
         return forced < 0 ? xb_publish_env : forced != 0;
     }
     std::uint64_t xb_publish_count = 0;
+    // Split-producer chunk frames (Options::split_frame_*, resolved once by apps/glm_rank_defaults.hpp): a decode step of R rows
+    // exchanges attn_sum / ffn_sum as head (columns [0, 2048)) + tail parts when the policy says so for R. Both ranks run the
+    // same R, so the decision is identical on both. The head width is the half of the 4096 columns (16 Tier B blocks / 8 down groups).
+    static constexpr unsigned kSplitHead = kHidden / 2;
+    int split_override = -1;  // Engine::set_split_frame (benches): -1 resolved policy, 0 off, 1 on (R >= 2 only: no 1-row split down form)
+    [[nodiscard]] xport::SplitFramePolicy split_policy() const {
+        if (split_override >= 0) return {split_override == 1 ? xport::SplitFramePolicy::Mode::on : xport::SplitFramePolicy::Mode::off, 0};
+        return {static_cast<xport::SplitFramePolicy::Mode>(opt.split_frame_mode), opt.split_frame_crossover};
+    }
+    struct SplitMid {
+        Exchange* x;
+        unsigned rows, cols;
+    };
+    static void split_mid(void* p) {
+        const auto* m = static_cast<const SplitMid*>(p);
+        m->x->split_head(m->rows, m->cols);
+    }
     // MoE kernels (TP2 rank slices, I = 1024): default for world 2; STRIX_GLM_MOE=ref = DefaultMoe.
     const bool moe_fast = opt.world == 2 && !(std::getenv("STRIX_GLM_MOE") != nullptr && std::string(std::getenv("STRIX_GLM_MOE")) == "ref");
     // STRIX_GLM_MODEL_FORMAT=exl3 (default) | fast_i4. fast_i4 (lossy FAST identity glm-fast-i4): at load the routed
@@ -2307,6 +2325,12 @@ struct Engine::Impl {
         unsigned* const c1 = sp ? sp->row_flag : flag;  // C1 per row in spec mode
         const unsigned c1_stride = sp ? 1U : 0U;
         const bool mixnorm = pfc && glm::pf::hc_mix_norm_enabled();
+        // Split frames only on the default producers (Tier B o projection, FastMoe down_kernel) and the kernel-wait consumer; any
+        // other combination (comm exchange, pipe / core / fast_i4 MoE, prepared o) stays unsplit: the seams' splits_o /
+        // publishes_split and Exchange::producer_slot_split decide it per layer, identically on both ranks.
+        // R >= 2: the 1-row MoE launch (launch_rows_sg MaxR 1) has no split down form.
+        const bool split_on = !pfc && boundary_fused && xb_publish_on() && decode_xch != nullptr && R >= 2 && split_policy().on(R);
+        SplitMid split_ctx{xch.get(), R, kSplitHead};
         for (unsigned li = l0; li < l1; ++li) {
             LayerW& w = layers[li];
             cur_layer = li;
@@ -2330,7 +2354,20 @@ struct Engine::Impl {
                 CallCtx ca = c;
                 float* out = part;
                 if (boundary_fused && xb_publish_on() && attn->publishes()) {  // the o projection writes and publishes the TX slot
-                    const auto slot = xch->producer_slot(R, stream);
+                    if (split_on && (w.kda ? attn->splits_o(w.kdaw) : attn->splits_o(w.dsaw))) {  // head + tail parts, two launches
+                        const auto sl = xch->producer_slot_split(R, kSplitHead, stream);
+                        if (sl.data != nullptr) {
+                            ca.publish = sl.head;
+                            ca.publish_tail = sl.tail;
+                            ca.split_cols = kSplitHead;
+                            ca.split_mid = &split_mid;
+                            ca.split_mid_ctx = &split_ctx;
+                            out = sl.data;
+                            attn_produced = sl.data;
+                            ++xb_publish_count;
+                        }
+                    }
+                    const auto slot = attn_produced == nullptr ? xch->producer_slot(R, stream) : Exchange::ProducerSlot{};
                     if (slot.data != nullptr) {
                         ca.publish = slot.publish;
                         out = slot.data;
@@ -2373,7 +2410,21 @@ struct Engine::Impl {
                     router_route(xn, w.moew, R);
                     if (boundary_fused && xb_publish_on() && moe->publishes()) {
                         // The down kernel writes the partial into the TX slot and publishes it (pair/producer_publish).
-                        const auto slot = xch->producer_slot(R, stream);
+                        if (split_on && moe->publishes_split(w.moew)) {  // head + tail parts, down_kernel on the group halves
+                            const auto sl = xch->producer_slot_split(R, kSplitHead, stream);
+                            if (sl.data != nullptr) {
+                                CallCtx cp = c;
+                                cp.publish = sl.head;
+                                cp.publish_tail = sl.tail;
+                                cp.split_cols = kSplitHead;
+                                cp.split_mid = &split_mid;
+                                cp.split_mid_ctx = &split_ctx;
+                                moe->forward(w.moew, cp, xn, ids, wts, sl.data);
+                                produced = sl.data;
+                                ++xb_publish_count;
+                            }
+                        }
+                        const auto slot = produced == nullptr ? xch->producer_slot(R, stream) : Exchange::ProducerSlot{};
                         if (slot.data != nullptr) {
                             CallCtx cp = c;
                             cp.publish = slot.publish;
@@ -3241,6 +3292,8 @@ std::vector<float> Engine::gate_residual(std::span<const std::uint32_t> tokens, 
 }
 std::vector<std::uint8_t> Engine::state_bytes(std::uint32_t slot) const { return impl_->state_bytes(slot); }
 void Engine::set_profiling(bool on) { impl_->profiling = on; }
+void Engine::set_split_frame(int mode) { impl_->split_override = mode < 0 ? -1 : mode ? 1 : 0; }
+int Engine::split_frame() const { return impl_->split_override; }
 const Profile& Engine::profile() const { return impl_->prof; }
 std::uint32_t Engine::rank() const { return impl_->opt.rank; }
 

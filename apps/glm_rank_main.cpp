@@ -156,6 +156,9 @@ int main(int argc, char** argv) {
         bool pf_before_load = false, pf_swap_moe = false;
         std::uint64_t tf_stop = 0;
         unsigned idcheck_n = 0;
+        std::string split_ab_prompt;  // --split-ab PROMPT.u32:STEPS:R1,R2,...: in-process split-frame A/B (own prompt, not --prompt)
+        unsigned split_ab_steps = 0;
+        std::vector<unsigned> split_ab_rs;
         unsigned prompt_max = 0, ab_n = 0, aba_n = 0, aba3_n = 0, aba_xch_n = 0;
         std::string aba_xch_rows = "1";
         bool g3_sweep = false;
@@ -188,6 +191,20 @@ int main(int argc, char** argv) {
             else if (a == "--decode") decode_n = static_cast<unsigned>(std::stoul(next()));
             else if (a == "--prompt") prompt = next();
             else if (a == "--prompt-max") prompt_max = static_cast<unsigned>(std::stoul(next()));
+            else if (a == "--split-ab") {
+                const std::string v = next();
+                const auto c1 = v.find(':'), c2 = c1 == std::string::npos ? c1 : v.find(':', c1 + 1);
+                if (c2 == std::string::npos) throw std::invalid_argument("--split-ab PROMPT.u32:STEPS:R1,R2,...");
+                split_ab_prompt = v.substr(0, c1);
+                split_ab_steps = static_cast<unsigned>(std::stoul(v.substr(c1 + 1, c2 - c1 - 1)));
+                for (std::size_t q = c2 + 1; q < v.size();) {
+                    const auto e = v.find(',', q);
+                    split_ab_rs.push_back(static_cast<unsigned>(std::stoul(v.substr(q, e - q))));
+                    q = e == std::string::npos ? v.size() : e + 1;
+                }
+                if (split_ab_steps < 2 || split_ab_rs.empty()) throw std::invalid_argument("--split-ab: STEPS >= 2 and at least one R");
+                for (unsigned r : split_ab_rs) if (r < 2) throw std::invalid_argument("--split-ab: GLM splits only R >= 2");
+            }
             else if (a == "--ab") ab_n = static_cast<unsigned>(std::stoul(next()));
             else if (a == "--g3-sweep") g3_sweep = true;
             else if (a == "--aba-xch") aba_xch_n = static_cast<unsigned>(std::stoul(next()));
@@ -294,6 +311,8 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("--mtp-prefill-gate requires --spec 1 --mtp 1");
         if (eff.identity.source == "baseline") opt.identity = ge::IdentityMode::kR1;
         if (eff.decode_xch.source == "baseline") opt.decode_xfer = false;
+        opt.split_frame_mode = static_cast<unsigned>(eff.split_policy.mode);
+        opt.split_frame_crossover = static_cast<unsigned>(eff.split_policy.crossover);
         if (eff.baseline) std::printf("baseline: default-on optimizations off (old path), explicit settings kept\n");
         prefill_mode = eff.prefill_requested.value;
         if (prefill_mode != "ref" && prefill_mode != "gemv" && prefill_mode != "wmma" && prefill_mode != "auto")
@@ -315,6 +334,7 @@ int main(int argc, char** argv) {
             prefill_mode = rd::resolve_prefill_auto(opt.mtp, opt.spec, g3_only, smoke_head, mem_plan, r1b_all, idcheck_n, reference_gate, mtp_spec_on);
         if (prefill_mode != eff.prefill) throw std::logic_error("prefill resolution differs from --print-effective-config");
         if (batch_r > opt.slots) opt.slots = batch_r;
+        for (unsigned r : split_ab_rs) opt.slots = std::max<std::uint32_t>(opt.slots, r);
         if (g4_rmax > opt.slots) opt.slots = g4_rmax;
         if (mem_plan) {  // no peer, no weights: the engine stops after the admission check
             (void)::setenv("STRIX_GLM_LOAD_TEST", "1", 1);
@@ -1465,6 +1485,54 @@ int main(int argc, char** argv) {
             }
             eng.set_identity_mode(load_identity);
         }
+        bool split_ab_fail = false;
+        if (!split_ab_rs.empty()) {  // see --split-ab: A = Engine::set_split_frame(0), B = 1; A B A B A B A, blocks 1..6 replay block 0's tokens
+            const auto toks = read_u32(split_ab_prompt);
+            const std::size_t P = toks.size();
+            if (P == 0 || P + split_ab_steps > opt.capacity) throw std::invalid_argument("--split-ab: prompt + STEPS exceeds the capacity");
+            auto med = [](std::vector<double> v) {
+                std::sort(v.begin(), v.end());
+                return v.size() % 2 == 1 ? v[v.size() / 2] : 0.5 * (v[v.size() / 2 - 1] + v[v.size() / 2]);
+            };
+            for (unsigned R : split_ab_rs) {
+                eng.set_split_frame(0);
+                const auto t0 = Clock::now();
+                std::uint32_t first = 0;
+                for (unsigned r = 0; r < R; ++r) {  // no slot copy in the GLM engine: one prefill per slot (same prompt, same bits)
+                    eng.reset(r);
+                    first = eng.prefill(r, toks, 0);
+                }
+                std::printf("rank %u split-ab R=%u: prefill %.3f s (%zu tokens x %u slots)\n", opt.rank, R, secs(t0, Clock::now()), P, R);
+                std::vector<std::vector<std::uint32_t>> gen(R, std::vector<std::uint32_t>{first});
+                std::vector<double> cell[7];
+                std::size_t diff = 0;
+                std::vector<ge::Row> rows(R);
+                for (int b = 0; b < 7; ++b) {
+                    eng.set_split_frame(b % 2 == 1 ? 1 : 0);
+                    for (unsigned k = 0; k < split_ab_steps; ++k) {
+                        for (unsigned r = 0; r < R; ++r) rows[r] = ge::Row{r, gen[r][k], P + k};
+                        const auto a0 = Clock::now();
+                        const auto out = eng.step(rows);
+                        cell[b].push_back(1000.0 * secs(a0, Clock::now()));
+                        for (unsigned r = 0; r < R; ++r) {
+                            if (b == 0) gen[r].push_back(out[r]);
+                            else diff += out[r] != gen[r][k + 1] ? 1U : 0U;
+                        }
+                    }
+                }
+                eng.set_split_frame(-1);
+                double m[7];
+                for (int b = 0; b < 7; ++b) m[b] = med(std::vector<double>(cell[b].begin() + 1, cell[b].end()));
+                const double ma = med({m[0], m[2], m[4], m[6]}), mb = med({m[1], m[3], m[5]});
+                if (opt.rank == 0)
+                    std::printf("split-ab R=%u ctx=%zu A %.3f B %.3f delta %+.3f (%+.2f%%) A-blocks %.3f,%.3f,%.3f,%.3f B-blocks %.3f,%.3f,%.3f replay-diff %zu\n",
+                                R, P, ma, mb, mb - ma, (mb - ma) / ma * 100.0, m[0], m[2], m[4], m[6], m[1], m[3], m[5], diff);
+                std::printf("rank %u split-ab R=%u: matched replay %zu differences%s\n", opt.rank, R, diff, diff == 0 ? " (IDENTICAL)" : " (DIFFER)");
+                if (diff != 0) split_ab_fail = true;
+                std::fflush(stdout);
+            }
+            eng.set_split_frame(-1);
+        }
         if (batch_r > 0) {
             std::vector<ge::Row> rows(batch_r);
             std::vector<std::uint32_t> all;  // every step's tokens, row-major per step
@@ -1854,7 +1922,8 @@ int main(int argc, char** argv) {
             std::printf("rank %u pf modes complete\n", opt.rank);
         }
         std::printf("rank %u: done %.1f s\n", opt.rank, secs(t_start, Clock::now()));
-        return 0;
+        if (split_ab_fail) std::printf("rank %u: EXACTNESS FAILURE (split-ab replay)\n", opt.rank);
+        return split_ab_fail ? 4 : 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

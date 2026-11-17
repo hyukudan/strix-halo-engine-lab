@@ -39,7 +39,18 @@ struct StridedRoutePolicy {
 
 // Sum: exchange row fold (xport/row_fold.hpp). part0 is the folded slot = rank 0's partial + rank 1's partial, already
 // added by the exchange progress thread with the same binary32 addition; part1 is null. x = h + folded: same bits.
-template <unsigned Ilp, bool Sum = false>
+// Split: the partials are in the chunk-major split layout (xport::SplitLayout{rows, kHidden, v.split_head}); the sums and
+// their order are the unsplit kernel's, only the element addresses differ. Split = false is the unchanged kernel.
+struct SplitRow {
+    const float* base;
+    std::size_t o0, o1;  // element j of the row is base[(j < head ? o0 : o1) + j]
+    unsigned head;
+    __device__ const float* at(unsigned j) const { return base + (j < head ? o0 : o1) + j; }
+};
+__device__ __forceinline__ SplitRow split_row(const float* base, unsigned r, unsigned rows, unsigned head) {
+    return SplitRow{base, std::size_t{r} * head, std::size_t{rows} * head + std::size_t{r} * (kHidden - head) - head, head};
+}
+template <unsigned Ilp, bool Sum = false, bool Split = false>
 __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchangeView v) {
     __shared__ __attribute__((aligned(16))) float hs[kHidden];  // 16-byte aligned: mode 2 stages float4 rows here
     __shared__ __attribute__((aligned(16))) float ys[kHidden];
@@ -67,6 +78,11 @@ __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchang
     float* h = v.h + static_cast<std::size_t>(r) * kHidden;
     const float* p0 = v.part0 + static_cast<std::size_t>(r) * kHidden;
     const float* p1 = Sum ? nullptr : v.part1 + static_cast<std::size_t>(r) * kHidden;
+    [[maybe_unused]] SplitRow s0{}, s1{};
+    if constexpr (Split) {
+        s0 = split_row(v.part0, r, v.rows, v.split_head);
+        if constexpr (!Sum) s1 = split_row(v.part1, r, v.rows, v.split_head);
+    }
     float acc = 0.0F;
     if constexpr (Ilp == 2) {  // STRIX_MM_XB_POSTILP mode 2: the partials (GPU-uncached exchange slots) staged into LDS
         // with coalesced 16-byte loads (4x fewer uncached requests), then the plain chain reads them from LDS: same
@@ -75,7 +91,16 @@ __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchang
         const auto* p0v = reinterpret_cast<const float4*>(p0);
         const auto* p1v = reinterpret_cast<const float4*>(p1);
         for (unsigned k = t; k < kHidden / 4U; k += kNormThreads) {
-            if constexpr (Sum) {
+            if constexpr (Split) {  // a float4 never straddles the head boundary (head % 4 == 0)
+                const float4 x0 = *reinterpret_cast<const float4*>(s0.at(4U * k));
+                if constexpr (Sum) {
+                    reinterpret_cast<float4*>(hs)[k] = x0;
+                } else {
+                    const float4 x1 = *reinterpret_cast<const float4*>(s1.at(4U * k));
+                    reinterpret_cast<float4*>(hs)[k] = x0;
+                    reinterpret_cast<float4*>(ys)[k] = x1;
+                }
+            } else if constexpr (Sum) {
                 reinterpret_cast<float4*>(hs)[k] = p0v[k];
             } else {
                 const float4 x0 = p0v[k], x1 = p1v[k];
@@ -100,8 +125,13 @@ __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchang
         for (unsigned q = 0; q < kPer; ++q) {
             const unsigned j = t + q * kNormThreads;
             a[q] = h[j];
-            b[q] = p0[j];
-            c[q] = Sum ? 0.0F : p1[j];
+            if constexpr (Split) {
+                b[q] = *s0.at(j);
+                c[q] = Sum ? 0.0F : *s1.at(j);
+            } else {
+                b[q] = p0[j];
+                c[q] = Sum ? 0.0F : p1[j];
+            }
         }
 #pragma unroll
         for (unsigned q = 0; q < kPer; ++q) {
@@ -113,7 +143,9 @@ __global__ __launch_bounds__(kNormThreads) void post_exchange_kernel(PostExchang
         }
     } else {
         for (unsigned j = t; j < kHidden; j += kNormThreads) {
-            const float x = Sum ? h[j] + p0[j] : h[j] + (p0[j] + p1[j]);
+            float x;
+            if constexpr (Split) x = Sum ? h[j] + *s0.at(j) : h[j] + (*s0.at(j) + *s1.at(j));
+            else x = Sum ? h[j] + p0[j] : h[j] + (p0[j] + p1[j]);
             h[j] = x;
             hs[j] = x;
             acc = __builtin_fmaf(x, x, acc);
@@ -371,7 +403,16 @@ void enqueue_post_exchange(const PostExchangeView& v, hipStream_t stream) {
     }
     if (v.ilp == 2 && ((reinterpret_cast<std::uintptr_t>(v.part0) | reinterpret_cast<std::uintptr_t>(v.part1)) & 15U) != 0)
         throw std::invalid_argument("minimax post-exchange: ilp mode 2 needs 16-byte aligned partials");
-    if (v.part1 == nullptr) {  // folded exchange: part0 is the pair sum
+    if (v.split_head != 0) {  // split-producer chunk frame (opt-in): the same kernels with chunk-major partial addressing
+        if (v.split_head % 4U != 0 || v.split_head >= kHidden) throw std::invalid_argument("minimax post-exchange: bad split head");
+        if (v.part1 == nullptr) {
+            if (v.ilp == 2) hipLaunchKernelGGL((post_exchange_kernel<2, true, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+            else if (v.ilp == 1) hipLaunchKernelGGL((post_exchange_kernel<1, true, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+            else hipLaunchKernelGGL((post_exchange_kernel<0, true, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+        } else if (v.ilp == 2) hipLaunchKernelGGL((post_exchange_kernel<2, false, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+        else if (v.ilp == 1) hipLaunchKernelGGL((post_exchange_kernel<1, false, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+        else hipLaunchKernelGGL((post_exchange_kernel<0, false, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
+    } else if (v.part1 == nullptr) {  // folded exchange: part0 is the pair sum
         if (v.ilp == 2) hipLaunchKernelGGL((post_exchange_kernel<2, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
         else if (v.ilp == 1) hipLaunchKernelGGL((post_exchange_kernel<1, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);
         else hipLaunchKernelGGL((post_exchange_kernel<0, true>), dim3(v.rows), dim3(kNormThreads), 0, stream, v);

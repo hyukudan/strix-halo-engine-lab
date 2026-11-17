@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 #include "strix/engine_profile.hpp"
+#include "xport/split_frame.hpp"
 
 namespace strix::minimax::defaults {
 
@@ -28,6 +29,12 @@ using Item = profile::DefaultItem;
 inline constexpr const char* kBaselineEnv = "STRIX_MM_BASELINE";
 
 std::span<const Item> items();
+
+// Split-producer chunk frames (xport/split_frame.hpp): the lever row and its policy, resolved ONCE per process from
+// STRIX_XPORT_SPLIT_ROWS (CLI and serve call it from print_or_apply, the engine reads the same cached value).
+// Invalid text throws std::invalid_argument naming the variable. Not an Item: it has no on/off default value.
+const lever::Decl& split_frame_row();
+xport::SplitFramePolicy split_frame_policy();
 
 // Startup parameter, independent of the baseline switch (async start itself is
 // switched off by baseline). Zero restores unconditional grouped async start.

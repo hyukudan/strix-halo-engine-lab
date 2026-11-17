@@ -35,6 +35,9 @@ struct PostExchangeView {
     unsigned prep_jobs = 0;
     const std::uint16_t* prep_suh[4] = {nullptr, nullptr, nullptr, nullptr};
     void* prep_xt[4] = {nullptr, nullptr, nullptr, nullptr};  // _Float16 rows
+    // Split-producer chunk frame (xport/split_frame.hpp SplitLayout{rows, 6144, split_head}): when nonzero, part0 / part1
+    // (or the folded slot) hold columns [0, split_head) row-major then the rest row-major; 0 = plain R x 6144 rows.
+    unsigned split_head = 0;
 };
 void enqueue_post_exchange(const PostExchangeView& v, hipStream_t stream);
 
