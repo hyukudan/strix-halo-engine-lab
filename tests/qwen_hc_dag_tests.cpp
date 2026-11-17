@@ -132,7 +132,50 @@ static void model_inject_block(const std::vector<float>& x, u32 rows, u32 row0, 
     }
 }
 
+// ---- chunk pipeline of hc_projection_kernel (hs::proj_pipeline, the same template the kernel runs) ------------------------------
+// Every chunk's body sees its own coefficients and its own x tile (stored before a barrier), no request overwrites registers that were
+// not consumed yet, no store overwrites a buffer without a barrier after its last read, and every decode of chunk k > 0 runs after a
+// whole body that follows the request of chunk k (the load-to-use distance the schedule exists for).
+static void test_proj_pipeline() {
+    constexpr int none = -1;
+    int raw = none, next = none, coef = none, epoch = 0, bodies = 0, expect_body = 0;
+    int buf[2] = {none, none}, stored_epoch[2] = {-1, -1}, read_epoch[2] = {-1, -1};
+    int requests = 0, decodes = 0, stores = 0, barriers = 0, bodies_at_request = 0;
+    bool ok = true;
+    hs::proj_pipeline(
+        [&](u32 k) {
+            ok &= (raw == none || coef == raw) && (next == none || buf[next & 1] == next);  // previous words decoded, tile stored
+            raw = next = static_cast<int>(k);
+            bodies_at_request = bodies;
+            ++requests;
+        },
+        [&]() {
+            ok &= raw != none && (raw == 0 || bodies > bodies_at_request);
+            coef = raw;
+            ++decodes;
+        },
+        [&](u32 k) {
+            const int b = static_cast<int>(k & 1U);
+            ok &= next == static_cast<int>(k) && read_epoch[b] < epoch;
+            buf[b] = next;
+            stored_epoch[b] = epoch;
+            ++stores;
+        },
+        [&](u32 k) {
+            const int b = static_cast<int>(k & 1U);
+            ok &= static_cast<int>(k) == expect_body && coef == static_cast<int>(k) && buf[b] == static_cast<int>(k) && stored_epoch[b] < epoch;
+            read_epoch[b] = epoch;
+            ++expect_body;
+            ++bodies;
+        },
+        [&]() { ++epoch; ++barriers; });
+    const int n = static_cast<int>(hs::kProjChunks);
+    ok &= expect_body == n && requests == n && decodes == n && stores == n && barriers == n + 1;
+    check(ok, "projection pipeline: chunk k reads its own coefficients and x tile; decode of k > 0 one body after its request");
+}
+
 int main() {
+    test_proj_pipeline();
     std::mt19937 rng(0x48c2u);
     std::normal_distribution<float> nd(0.0F, 1.0F);
     std::uniform_int_distribution<int> code(-127, 127);

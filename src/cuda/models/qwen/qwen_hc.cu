@@ -256,16 +256,6 @@ __global__ __launch_bounds__(256, 1) void hc_projection_kernel(const float* x_ro
     const unsigned total_outputs = is_inject ? kStreams : kRank;
     const bool active = first < total_outputs;
 
-    const auto stage = [&](unsigned chunk, unsigned buffer) {
-#pragma unroll
-        for (unsigned m = 0; m < 2U; ++m) {
-            const unsigned e = threadIdx.x + 256U * m, r = e / 32U, k = e % 32U;
-            float4 v = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
-            if (row0 + r < rows)
-                v = load_x4<Compact>(x_rows, xin, xnorm, row0 + r, (chunk / 5U) * 640U + (chunk % 5U) * 128U + k * 4U);
-            xs[buffer][r][k] = v;
-        }
-    };
     const auto fetch = [&](unsigned chunk, float4 (&next)[2]) {
 #pragma unroll
         for (unsigned m = 0; m < 2U; ++m) {
@@ -304,23 +294,33 @@ __global__ __launch_bounds__(256, 1) void hc_projection_kernel(const float* x_ro
             }
         }
     };
-    stage(0U, 0U);
-    if (active) load_raw(0U);
-    __syncthreads();
-    for (unsigned chunk = 0; chunk < 80U; ++chunk) {
-        float4 next[2];
-        if (chunk + 1U < 80U) fetch(chunk + 1U, next);
+    // Chunk order: hcs::proj_pipeline (request chunk + 1 at the top, decode its coefficients after the body of chunk).
+    float c[kProjOutputs][4];
+    float4 next[2];
+    const auto request = [&](unsigned chunk) {  // x tile (every thread stages) and weight words (active warps) of one chunk
+        fetch(chunk, next);
+        if (active) load_raw(chunk);
+    };
+    const auto decode = [&]() {
+        if (!active) return;
+#pragma unroll
+        for (unsigned p = 0; p < kProjOutputs; ++p)
+#pragma unroll
+            for (unsigned j = 0; j < 4U; ++j)
+                // injection: FP32 weights (outputs 4..7 of the injection warp are zero, as HIP's padding);
+                // Q8: coefficient = scale * float(code), exact (:2967-2971)
+                c[p][j] = is_inject ? (p < 4U ? __uint_as_float(raw[4U * p + j]) : 0.0F) :
+                    __fmul_rn(__uint_as_float(raw[8U + p]), static_cast<float>(static_cast<signed char>((raw[p] >> (8U * j)) & 255U)));
+    };
+    const auto store = [&](unsigned chunk) {
+#pragma unroll
+        for (unsigned m = 0; m < 2U; ++m) {
+            const unsigned e = threadIdx.x + 256U * m;
+            xs[chunk & 1U][e / 32U][e % 32U] = next[m];
+        }
+    };
+    const auto body = [&](unsigned chunk) {
         if (active) {
-            float c[kProjOutputs][4];
-#pragma unroll
-            for (unsigned p = 0; p < kProjOutputs; ++p)
-#pragma unroll
-                for (unsigned j = 0; j < 4U; ++j)
-                    // injection: FP32 weights (outputs 4..7 of the injection warp are zero, as HIP's padding);
-                    // Q8: coefficient = scale * float(code), exact (:2967-2971)
-                    c[p][j] = is_inject ? (p < 4U ? __uint_as_float(raw[4U * p + j]) : 0.0F) :
-                        __fmul_rn(__uint_as_float(raw[8U + p]), static_cast<float>(static_cast<signed char>((raw[p] >> (8U * j)) & 255U)));
-            if (chunk + 1U < 80U) load_raw(chunk + 1U);
             const float4 (*x)[32] = xs[chunk & 1U];
             if (is_inject) {
 #pragma unroll
@@ -365,15 +365,8 @@ __global__ __launch_bounds__(256, 1) void hc_projection_kernel(const float* x_ro
             }
             }
         }
-        if (chunk + 1U < 80U) {  // buffer (chunk + 1) & 1 was last read in chunk - 1, before the barrier below
-#pragma unroll
-            for (unsigned m = 0; m < 2U; ++m) {
-                const unsigned e = threadIdx.x + 256U * m;
-                xs[(chunk + 1U) & 1U][e / 32U][e % 32U] = next[m];
-            }
-        }
-        __syncthreads();
-    }
+    };
+    hcs::proj_pipeline(request, decode, store, body, [] { __syncthreads(); });
     if (!active) return;
     if (is_inject) {  // lane i < 8 finishes item i = (row 2w + i / 4, output i % 4); every lane holds all 8 folded totals
         float v = inj_total[0];
