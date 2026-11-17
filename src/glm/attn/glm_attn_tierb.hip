@@ -337,7 +337,10 @@ __global__ __launch_bounds__(128) void group_kernel(Args a) {
     constexpr unsigned n0 = G0::template ctas<SG, TPW>() / (Part == 0 ? 1U : 2U), n1 = G1::template ctas<SG, TPW>();
     const unsigned b = blockIdx.x;
     if (b < M0 * n0) {
-        const unsigned finished = member_cta<G0, R, SG, Prime, TPW>(member(a, b / n0), part_local<G0, TPW, Part>(b % n0), a.rows, smem);
+        // Part 0 passes b % n0 itself: an inlined part_local() call, even an identity one, changed the default DSA b
+        // kernels' code (16 of 240 group_kernel instances); the constant condition emits only the live arm.
+        const unsigned finished = member_cta<G0, R, SG, Prime, TPW>(
+            member(a, b / n0), Part == 0 ? b % n0 : part_local<G0, TPW, Part>(b % n0), a.rows, smem);
         if constexpr (M0 == 1 && M1 == 0) {  // single-member launches (o_proj): the producer may publish its partial
             if (a.pub.on() && finished != 0) strix::pair::producer_publish(a.pub, a.pub_blocks, finished);
         } else {

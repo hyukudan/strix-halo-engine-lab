@@ -1485,8 +1485,9 @@ template <int Depth> void launch_overlap4_rows(const Args& a, hipStream_t stream
 }
 
 bool moe_split_supported(unsigned rows) {
-    // the default decode form (producer publish) with the down4 launches; the gate/up + down pipeline (rows 2..4) is not split
-    return producer_publish_supported() && !(rows >= 2 && rows <= 4 && moe_pipe() != 0);
+    // the default decode form (producer publish) with the down4 launches, two rows or more (enqueue_moe_profiled's
+    // guard); the gate/up + down pipeline (rows 2..4) is not split
+    return rows >= 2 && producer_publish_supported() && !(rows <= 4 && moe_pipe() != 0);
 }
 
 void enqueue_moe_profiled(const MoeView& v, hipStream_t stream, hipEvent_t* marks, hipEvent_t down_done) {

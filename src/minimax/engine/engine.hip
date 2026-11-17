@@ -654,8 +654,11 @@ struct Engine::Impl {
     bool xb_published = false;    // the producer enqueued for xb_tx carries xb_pt
     // Split-producer chunk frames (STRIX_XPORT_SPLIT_ROWS, defaults::split_frame_policy): resolved once, decided per step by rows.
     strix::xport::SplitFramePolicy split_policy{};
-    int split_override = -1;  // Engine::set_split_frame (benches): -1 resolved policy, 0 off, 1 on at every row count
-    [[nodiscard]] bool split_on(unsigned n) const { return split_override >= 0 ? (split_override == 1 && n != 0) : split_policy.on(n); }
+    int split_override = -1;  // Engine::set_split_frame (benches): -1 resolved policy, 0 off, 1 on (from SplitFramePolicy::kMinRows)
+    [[nodiscard]] bool split_on(unsigned n) const {
+        using P = strix::xport::SplitFramePolicy;
+        return split_override >= 0 ? P{split_override == 1 ? P::Mode::on : P::Mode::off, 0}.on(n) : split_policy.on(n);
+    }
     bool xb_split_ask = false;                 // this message's producers may split (policy on for the rows, default producer forms)
     bool xb_split = false;                     // the producer of xb_tx split it: the message is SplitLayout{n, 6144, 3072}
     mmoe::PublishTarget xb_head_pt{};          // the head part's target (Channel::head_target)

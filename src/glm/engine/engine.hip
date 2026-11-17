@@ -2355,15 +2355,15 @@ struct Engine::Impl {
                 float* out = part;
                 if (boundary_fused && xb_publish_on() && attn->publishes()) {  // the o projection writes and publishes the TX slot
                     if (split_on && (w.kda ? attn->splits_o(w.kdaw) : attn->splits_o(w.dsaw))) {  // head + tail parts, two launches
-                        const auto sl = xch->producer_slot_split(R, kSplitHead, stream);
-                        if (sl.data != nullptr) {
-                            ca.publish = sl.head;
-                            ca.publish_tail = sl.tail;
+                        const auto split_slot = xch->producer_slot_split(R, kSplitHead, stream);
+                        if (split_slot.data != nullptr) {
+                            ca.publish = split_slot.head;
+                            ca.publish_tail = split_slot.tail;
                             ca.split_cols = kSplitHead;
                             ca.split_mid = &split_mid;
                             ca.split_mid_ctx = &split_ctx;
-                            out = sl.data;
-                            attn_produced = sl.data;
+                            out = split_slot.data;
+                            attn_produced = split_slot.data;
                             ++xb_publish_count;
                         }
                     }
@@ -2411,16 +2411,16 @@ struct Engine::Impl {
                     if (boundary_fused && xb_publish_on() && moe->publishes()) {
                         // The down kernel writes the partial into the TX slot and publishes it (pair/producer_publish).
                         if (split_on && moe->publishes_split(w.moew)) {  // head + tail parts, down_kernel on the group halves
-                            const auto sl = xch->producer_slot_split(R, kSplitHead, stream);
-                            if (sl.data != nullptr) {
+                            const auto split_slot = xch->producer_slot_split(R, kSplitHead, stream);
+                            if (split_slot.data != nullptr) {
                                 CallCtx cp = c;
-                                cp.publish = sl.head;
-                                cp.publish_tail = sl.tail;
+                                cp.publish = split_slot.head;
+                                cp.publish_tail = split_slot.tail;
                                 cp.split_cols = kSplitHead;
                                 cp.split_mid = &split_mid;
                                 cp.split_mid_ctx = &split_ctx;
-                                moe->forward(w.moew, cp, xn, ids, wts, sl.data);
-                                produced = sl.data;
+                                moe->forward(w.moew, cp, xn, ids, wts, split_slot.data);
+                                produced = split_slot.data;
                                 ++xb_publish_count;
                             }
                         }

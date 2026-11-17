@@ -58,8 +58,11 @@ struct SplitFramePolicy {
     enum class Mode : std::uint8_t { automatic = 0, off = 1, on = 2 };
     Mode mode = Mode::off;
     std::uint64_t crossover = 0;
+    // No family has a one-row split producer form (the MiniMax and GLM MoE down launches split row groups), so even
+    // an explicit "1" never splits below two rows; engines and their bench overrides decide through on().
+    static constexpr unsigned kMinRows = 2;
     [[nodiscard]] constexpr bool on(unsigned rows) const {
-        if (mode == Mode::off || rows == 0) return false;
+        if (mode == Mode::off || rows < kMinRows) return false;
         return mode == Mode::on || rows >= crossover;
     }
     [[nodiscard]] std::string describe() const {
