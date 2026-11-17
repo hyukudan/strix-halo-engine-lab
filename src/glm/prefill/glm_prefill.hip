@@ -328,16 +328,23 @@ __global__ __launch_bounds__(kScanLanes * kScanV) void kda_scan_v5_kernel(unsign
 }
 
 // Scan v6: v5 with kda_prep_rows_kernel folded into the batch fill, so the prep launch and its scratch / beta round trip
-// through memory are gone (the scan reads qkv / f / b / the conv state directly: the same 512 floats per head and token it
-// read from scratch before). Wave w of the WG prepares token b0 + w of each batch of 8; lane l owns channels l + 32 m
-// (m = 0..3) of q, k and g and the own value columns l and l + 32. Raw inputs of the next batch are loaded into registers
-// before the current batch's tokens run and finished into the other LDS half after them (v5's pattern). Expressions =
-// kda_prep_rows_kernel (conv, silu, norms, gate, beta); the two L2 norms take lds_tree<128>'s pairing as an in-wave
-// butterfly: levels 64 and 32 inside the lane, levels 16 .. 1 by xor shuffles; IEEE addition is commutative, so both
-// lanes of each pair hold the same bits and every lane ends with the tree's sum. The per-token work is v5's except the
-// non-finite test, taken once on the final state: non-finite is absorbing for every state element (NaN stays NaN,
-// inf * 0 = NaN, inf times a finite non-zero or plus a finite value stays inf, an fma with a non-finite product or
-// addend stays non-finite), so "some token left a non-finite element" == "the final state has one".
+// through memory are gone (the scan reads qkv / f / b / the conv state directly, each raw row once per WG). Raw inputs go
+// through LDS, in place, never through registers held across the token loop (gfx11 has no global -> LDS load, so a value
+// staged into LDS costs a VGPR for as long as it is in flight): during token j of a batch, raw row b1 + j of the next
+// batch (b1 = b0 + 8) is loaded at the top of the token and stored at its end into the other buffer half (threads 0-127 raw
+// q, 128-255 raw k -> sq / sk; waves 0-3 f -> sd; waves 4-5 the own v columns -> sv; wave 6 lane 0 b -> sb): 2 VGPRs inside
+// one token (v5 carries 12 across the loop). hist holds the raw rows b1 - 3 .. b1 - 1 of the conv window (q 128, k 128,
+// own v 64): the conv state at the start, then rows 5 .. 7 of each batch, written by waves 5-7. finish(): barrier A (the
+// stage is complete), wave w reads the window of token b1 + w (rows w - 3 .. w of the stage, or hist) and its f / b,
+// barrier B, then writes the prepared values in place. Lane l owns channels l + 32 m (m = 0..3) of q, k and g and the own
+// value columns l and l + 32. The conv taps, dt_bias and A are re-read per batch (L2-resident; the barriers keep them from
+// being hoisted out of the loop) instead of being held in registers. Expressions = kda_prep_rows_kernel (conv, silu,
+// norms, gate, beta); the two L2 norms take lds_tree<128>'s pairing as an in-wave butterfly: levels 64 and 32 inside the
+// lane, levels 16 .. 1 by xor shuffles; IEEE addition is commutative, so both lanes of each pair hold the same bits and
+// every lane ends with the tree's sum. The per-token work is v5's except the non-finite test, taken once on the final
+// state: non-finite is absorbing for every state element (NaN stays NaN, inf * 0 = NaN, inf times a finite non-zero or
+// plus a finite value stays inf, an fma with a non-finite product or addend stays non-finite), so "some token left a
+// non-finite element" == "the final state has one". LDS 32,576 B (2 WGs per CU, as v5).
 // The conv state is read as the oldest inputs: kda_conv_commit_kernel must run after this kernel.
 static_assert(kScan5TB * 32U == kScanLanes * kScanV, "scan v6 prepares one batch token per wave");
 __device__ __forceinline__ float norm_tree128(const float* e) {  // e[m] = element l + 32 m of lane l
@@ -346,91 +353,145 @@ __device__ __forceinline__ float norm_tree128(const float* e) {  // e[m] = eleme
     for (unsigned hh = 16; hh > 0; hh >>= 1U) t = t + __shfl_xor(t, hh, 32);
     return t;
 }
-constexpr unsigned kScan6Ch = 10;  // per lane: q 4, k 4, own v 2
+constexpr unsigned kScan6Ch = 10;                       // per lane: q 4, k 4, own v 2
+constexpr unsigned kScan6Raw = 2U * kKdaDim + kScanV;  // hist columns: raw q 128, raw k 128, own v 64
+static_assert(kScanLanes * kScanV == 2U * kKdaDim && kScanV == 2U * 32U, "scan v6 stage element map");
 __global__ __launch_bounds__(kScanLanes * kScanV) void kda_scan_v6_kernel(KdaDev k, const float* qkv, const float* f,
                                                                           const float* b, const float* conv_state, float* S,
                                                                           float* o, unsigned* flag, unsigned C) {
     __shared__ float sq[2][kScan5TB][kKdaDim], sk[2][kScan5TB][kKdaDim], sd[2][kScan5TB][kKdaDim];
-    __shared__ float sv[2][kScan5TB][kScanV], sb[2][kScan5TB];
+    __shared__ float sv[2][kScan5TB][kScanV], sb[2][kScan5TB], hist[3][kScan6Raw];
     const unsigned H = k.heads, CH = H * kKdaDim;
     const unsigned h = blockIdx.x, tid = threadIdx.x, q = tid % kScanLanes, vl = tid / kScanLanes, v = blockIdx.y * kScanV + vl;
-    const unsigned w = tid / 32U, l = tid % 32U;
-    auto channel = [&](unsigned c) -> unsigned {  // qkv channel of register slot c
-        return c < 8 ? (c / 4) * CH + h * kKdaDim + l + 32U * (c % 4) : 2U * CH + h * kKdaDim + blockIdx.y * kScanV + l + 32U * (c - 8);
+    const unsigned w = static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(tid / 32U))), l = tid % 32U;
+    const unsigned vch = 2U * CH + h * kKdaDim + blockIdx.y * kScanV;  // qkv channel of own value column 0
+    auto channel = [&](unsigned c, unsigned ln) -> unsigned {          // qkv channel of register slot c of lane ln
+        return c < 8 ? (c / 4) * CH + h * kKdaDim + ln + 32U * (c % 4) : vch + ln + 32U * (c - 8);
+    };
+    auto hcol = [&](unsigned c, unsigned ln) -> unsigned {  // hist column of register slot c of lane ln
+        return c < 8 ? (c / 4) * kKdaDim + ln + 32U * (c % 4) : 2U * kKdaDim + ln + 32U * (c - 8);
     };
     float* Sh = S + static_cast<std::size_t>(h) * kKdaDim * kKdaDim;
     float st[kOwn];
 #pragma unroll
     for (unsigned i = 0; i < kOwn; ++i) st[i] = Sh[scan_key(q, i) * kKdaDim + v];
-    // Per-lane constants over the chunk, loaded once (finish() then runs on registers only): conv taps as BF16 pairs
-    // (tap 2j in the low half, 2j + 1 in the high half; unpacked to exactly bf16_to_float's value), dt_bias, exp(A).
-    std::uint32_t cwp[kScan6Ch][2];
-#pragma unroll
-    for (unsigned c = 0; c < kScan6Ch; ++c) {
-        const std::uint16_t* cw = k.conv_w + static_cast<std::size_t>(channel(c)) * kConvK;
-        cwp[c][0] = static_cast<std::uint32_t>(cw[0]) | (static_cast<std::uint32_t>(cw[1]) << 16U);
-        cwp[c][1] = static_cast<std::uint32_t>(cw[2]) | (static_cast<std::uint32_t>(cw[3]) << 16U);
-    }
-    float dtb[4];
-#pragma unroll
-    for (unsigned m = 0; m < 4; ++m) dtb[m] = k.dt_bias[h * kKdaDim + l + 32U * m];
-    const float expA = declared_exp(k.A_log[h]);
-    float rx[kScan6Ch][4] = {}, rf[4] = {}, rb = 0.0F;  // raw inputs of positions t - 3 .. t, f and b of token b0 + w
-    auto load = [&](unsigned b0) {
-        const unsigned r = b0 + w;
-        if (r >= C) return;
+    // Raw row r -> slot j of buffer buf. Element A: q (waves 0-3) / k (waves 4-7) channel tid % 128; element B: f (waves 0-3),
+    // own v column tid - 128 (waves 4-5), b (wave 6 lane 0). 449 values per row.
+    auto stage_load = [&](unsigned r, float& ea, float& eb) {
+        const std::size_t row = static_cast<std::size_t>(r) * 3 * CH;
+        ea = qkv[row + (tid / kKdaDim) * CH + h * kKdaDim + tid % kKdaDim];
+        if (w < 4) eb = f[static_cast<std::size_t>(r) * CH + h * kKdaDim + tid];
+        else if (w < 6) eb = qkv[row + vch + (tid - kKdaDim)];
+        else if (w == 6 && l == 0) eb = b[static_cast<std::size_t>(r) * H + h];
+    };
+    auto stage_store = [&](unsigned buf, unsigned j, float ea, float eb) {
+        if (w < 4) {
+            sq[buf][j][tid] = ea;
+            sd[buf][j][tid] = eb;
+        } else {
+            sk[buf][j][tid - kKdaDim] = ea;
+            if (w < 6) sv[buf][j][tid - kKdaDim] = eb;
+            else if (w == 6 && l == 0) sb[buf][j] = eb;
+        }
+    };
+    auto raw = [&](unsigned buf, int row, unsigned c, unsigned ln) -> float {  // raw input of slot c at batch row `row` (< 0: hist)
+        if (row < 0) return hist[3 + row][hcol(c, ln)];
+        if (c < 4) return sq[buf][row][ln + 32U * c];
+        if (c < 8) return sk[buf][row][ln + 32U * (c - 4)];
+        return sv[buf][row][ln + 32U * (c - 8)];
+    };
+    // = kda_prep_rows_kernel for token b1 + w into buffer buf, in place; entries past C stay stale and are never read.
+    // Before barrier B every wave only reads the stage / hist and computes; after it, wave w writes row w only, so waves
+    // 5-7 can still copy their own raw row (= conv history of the next batch) out of the stage before overwriting it.
+    auto finish = [&](unsigned buf, unsigned b1) {
+        const bool act = b1 + w < C;  // wave-uniform; every wave reaches both barriers
+        // The lane index is made opaque per call, so the per-lane address math below is redone per batch (a few VALU)
+        // instead of being hoisted out of the batch loop and held in VGPRs across the token loop.
+        unsigned ln = l;
+        asm volatile("" : "+v"(ln));
+        // Per-lane constants, issued before barrier A so their latency overlaps it: conv taps as BF16 pairs (tap 2j in the
+        // low half, 2j + 1 in the high half; unpacked to exactly bf16_to_float's value), dt_bias, A.
+        std::uint32_t cwp[kScan6Ch][2];
 #pragma unroll
         for (unsigned c = 0; c < kScan6Ch; ++c) {
-            const unsigned ch = channel(c);
+            const std::uint16_t* cw = k.conv_w + static_cast<std::size_t>(channel(c, ln)) * kConvK;
+            cwp[c][0] = static_cast<std::uint32_t>(cw[0]) | (static_cast<std::uint32_t>(cw[1]) << 16U);
+            cwp[c][1] = static_cast<std::uint32_t>(cw[2]) | (static_cast<std::uint32_t>(cw[3]) << 16U);
+        }
+        float dtb[4];
 #pragma unroll
-            for (unsigned j = 0; j < 3; ++j) {
-                const int m = static_cast<int>(r) - 3 + static_cast<int>(j);
-                rx[c][j] = m >= 0 ? qkv[static_cast<std::size_t>(m) * 3 * CH + ch] : conv_state[static_cast<std::size_t>(ch) * 3 + static_cast<unsigned>(3 + m)];
+        for (unsigned m = 0; m < 4; ++m) dtb[m] = k.dt_bias[h * kKdaDim + ln + 32U * m];
+        const float alog = k.A_log[h];
+        __syncthreads();  // A: the stage of buffer buf (and, for the first batch, hist) is complete
+        float pq[4] = {}, pk[4] = {}, pg[4] = {}, pv[2] = {}, pb = 0.0F;  // prepared values of token b1 + w
+        if (act) {
+            float out[kScan6Ch];
+#pragma unroll
+            for (unsigned c = 0; c < kScan6Ch; ++c) {  // inputs of positions t - 3 .. t: stage rows w - 3 .. w or hist
+                float acc = __builtin_fmaf(__builtin_bit_cast(float, cwp[c][0] << 16U), raw(buf, static_cast<int>(w) - 3, c, ln), 0.0F);
+                acc = __builtin_fmaf(__builtin_bit_cast(float, cwp[c][0] & 0xffff0000U), raw(buf, static_cast<int>(w) - 2, c, ln), acc);
+                acc = __builtin_fmaf(__builtin_bit_cast(float, cwp[c][1] << 16U), raw(buf, static_cast<int>(w) - 1, c, ln), acc);
+                acc = __builtin_fmaf(__builtin_bit_cast(float, cwp[c][1] & 0xffff0000U), raw(buf, static_cast<int>(w), c, ln), acc);
+                out[c] = silu(acc);
             }
-            rx[c][3] = qkv[static_cast<std::size_t>(r) * 3 * CH + ch];
-        }
+            float eq[4], ek[4];
 #pragma unroll
-        for (unsigned m = 0; m < 4; ++m) rf[m] = f[static_cast<std::size_t>(r) * CH + h * kKdaDim + l + 32U * m];
-        rb = b[static_cast<std::size_t>(r) * H + h];
-    };
-    auto finish = [&](unsigned buf, unsigned b0) {  // = kda_prep_rows_kernel for token b0 + w; entries past C stay stale, never read
-        if (b0 + w >= C) return;                     // wave-uniform: the butterflies below see whole waves only
-        float out[kScan6Ch];
+            for (unsigned m = 0; m < 4; ++m) {
+                eq[m] = __builtin_fmaf(out[m], out[m], 0.0F);
+                ek[m] = __builtin_fmaf(out[4 + m], out[4 + m], 0.0F);
+            }
+            const float nq = declared_sqrt(norm_tree128(eq) + kL2Eps), nk = declared_sqrt(norm_tree128(ek) + kL2Eps);
+            const float expA = declared_exp(alog);
 #pragma unroll
-        for (unsigned c = 0; c < kScan6Ch; ++c) {
-            float acc = __builtin_fmaf(__builtin_bit_cast(float, cwp[c][0] << 16U), rx[c][0], 0.0F);
-            acc = __builtin_fmaf(__builtin_bit_cast(float, cwp[c][0] & 0xffff0000U), rx[c][1], acc);
-            acc = __builtin_fmaf(__builtin_bit_cast(float, cwp[c][1] << 16U), rx[c][2], acc);
-            acc = __builtin_fmaf(__builtin_bit_cast(float, cwp[c][1] & 0xffff0000U), rx[c][3], acc);
-            out[c] = silu(acc);
+            for (unsigned m = 0; m < 4; ++m) {
+                pq[m] = (out[m] / nq) * kInvSqrt128;
+                pk[m] = out[4 + m] / nk;
+                pg[m] = declared_exp(kGateLow * sigmoid(expA * (sd[buf][w][ln + 32U * m] + dtb[m])));
+            }
+            pv[0] = out[8];
+            pv[1] = out[9];
+            pb = sigmoid(sb[buf][w]);
         }
-        float eq[4], ek[4];
+        __syncthreads();  // B: every window is read; row w of the stage now belongs to wave w alone
+        if (!act) return;
+        if (w >= kScan5TB - 3) {  // raw row b1 + w (w = 5..7) -> conv history of the next batch
+#pragma unroll
+            for (unsigned c = 0; c < kScan6Ch; ++c) hist[w - (kScan5TB - 3)][hcol(c, ln)] = raw(buf, static_cast<int>(w), c, ln);
+        }
 #pragma unroll
         for (unsigned m = 0; m < 4; ++m) {
-            eq[m] = __builtin_fmaf(out[m], out[m], 0.0F);
-            ek[m] = __builtin_fmaf(out[4 + m], out[4 + m], 0.0F);
+            const unsigned i = ln + 32U * m;
+            sq[buf][w][i] = pq[m];
+            sk[buf][w][i] = pk[m];
+            sd[buf][w][i] = pg[m];
         }
-        const float nq = declared_sqrt(norm_tree128(eq) + kL2Eps), nk = declared_sqrt(norm_tree128(ek) + kL2Eps);
-#pragma unroll
-        for (unsigned m = 0; m < 4; ++m) {
-            const unsigned i = l + 32U * m;
-            sq[buf][w][i] = (out[m] / nq) * kInvSqrt128;
-            sk[buf][w][i] = out[4 + m] / nk;
-            sd[buf][w][i] = declared_exp(kGateLow * sigmoid(expA * (rf[m] + dtb[m])));
-        }
-        sv[buf][w][l] = out[8];
-        sv[buf][w][l + 32U] = out[9];
-        if (l == 0) sb[buf][w] = sigmoid(rb);
+        sv[buf][w][ln] = pv[0];
+        sv[buf][w][ln + 32U] = pv[1];
+        if (l == 0) sb[buf][w] = pb;
     };
-    load(0);
-    finish(0, 0);
-    __syncthreads();
+    // First batch: hist = the conv state (inputs of positions -3 .. -1), rows 0 .. 7 staged directly (once per kernel).
+    for (unsigned e = tid; e < 3 * kScan6Raw; e += kScanLanes * kScanV) {
+        const unsigned i = e / kScan6Raw, c = e % kScan6Raw;
+        const unsigned ch = c < 2 * kKdaDim ? (c / kKdaDim) * CH + h * kKdaDim + c % kKdaDim : vch + (c - 2 * kKdaDim);
+        hist[i][c] = conv_state[static_cast<std::size_t>(ch) * 3 + i];
+    }
+#pragma unroll
+    for (unsigned j = 0; j < kScan5TB; ++j) {
+        if (j >= C) break;
+        float ea = 0.0F, eb = 0.0F;
+        stage_load(j, ea, eb);
+        stage_store(0, j, ea, eb);
+    }
     unsigned cur = 0;
     for (unsigned b0 = 0; b0 < C; b0 += kScan5TB, cur ^= 1U) {
-        const unsigned nb = C - b0 < kScan5TB ? C - b0 : kScan5TB;
-        const bool next = b0 + kScan5TB < C;
-        if (next) load(b0 + kScan5TB);
+        finish(cur, b0);  // batch b0 was staged into buffer cur by the previous batch's tokens (or above)
+        __syncthreads();
+        const unsigned nb = C - b0 < kScan5TB ? C - b0 : kScan5TB, b1 = b0 + kScan5TB;
+        const bool next = b1 < C;  // then nb = 8: tokens 0 .. 7 stage rows b1 .. b1 + 7 (those < C) into the other half
         for (unsigned j = 0; j < nb; ++j) {
+            const bool stage = next && b1 + j < C;
+            float ea = 0.0F, eb = 0.0F;
+            if (stage) stage_load(b1 + j, ea, eb);
             const float vv = sv[cur][j][vl];
             const float bt = sb[cur][j];
 #pragma unroll
@@ -440,9 +501,8 @@ __global__ __launch_bounds__(kScanLanes * kScanV) void kda_scan_v6_kernel(KdaDev
             for (unsigned i = 0; i < kOwn; ++i) st[i] = __builtin_fmaf(sk[cur][j][scan_key(q, i)], dlt, st[i]);
             const float ov = scan_tree_dpp(st, sq[cur][j], q);
             if (q == 0) o[(static_cast<std::size_t>(b0 + j) * H + h) * kKdaDim + v] = ov;
+            if (stage) stage_store(cur ^ 1U, j, ea, eb);
         }
-        if (next) finish(cur ^ 1U, b0 + kScan5TB);
-        __syncthreads();
     }
     bool bad = false;
 #pragma unroll

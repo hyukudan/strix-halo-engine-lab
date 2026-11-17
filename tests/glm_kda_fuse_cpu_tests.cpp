@@ -167,10 +167,109 @@ bool fused_matches(const Prep& p, const std::vector<float>& scr, const std::vect
     return ok;
 }
 
+// kda_scan_v6_kernel's LDS schedule for WG (h, y), simulated slot by slot: rows of the next batch staged in place into the
+// other buffer half (stage_load / stage_store element map), conv history hist[3][320] (the conv state first, then raw rows
+// 5..7 of each batch, copied by waves 5-7 after barrier B), finish() reading windows / f / b before barrier B and writing
+// the prepared row w in place after it (waves in reverse order: each wave touches only its own row and hist row).
+// Bitwise checks: (a) every value finish() reads is the input kda_prep_rows_kernel reads for that token (qkv row t - 3 + i
+// or the conv state, f, b), (b) for every token the scan reads that token's prepared q, k, exp g, v and beta.
+bool staged_matches(const Prep& p, const std::vector<float>& scr, const std::vector<float>& beta) {
+    const unsigned H = p.H, C = p.C, CH = H * kD, kRaw = 2 * kD + kV;
+    const float stale = std::bit_cast<float>(0x7fc0deadU);
+    bool ok = true;
+    for (unsigned h = 0; h < H; ++h)
+        for (unsigned y = 0; y < kD / kV; ++y) {
+            std::vector<float> sq(2 * kTB * kD, stale), sk(sq), sd(sq), sv(2 * kTB * kV, stale), sb(2 * kTB, stale), hist(3 * kRaw, stale);
+            const unsigned vch = 2 * CH + h * kD + y * kV;
+            auto slot = [](unsigned buf, unsigned row) -> std::size_t { return static_cast<std::size_t>(buf) * kTB + row; };
+            auto hcol = [](unsigned c, unsigned l) -> unsigned { return c < 8 ? (c / 4) * kD + l + 32 * (c % 4) : 2 * kD + l + 32 * (c - 8); };
+            auto stage = [&](unsigned buf, unsigned b1) {  // tokens j = 0..7 of the running batch stage row b1 + j
+                for (unsigned j = 0; j < kTB && b1 + j < C; ++j)
+                    for (unsigned tid = 0; tid < 256; ++tid) {
+                        const unsigned w = tid / 32, l = tid % 32, r = b1 + j;
+                        const std::size_t row = static_cast<std::size_t>(r) * 3 * CH;
+                        const float ea = p.qkv[row + (tid / kD) * CH + h * kD + tid % kD];
+                        if (w < 4) {
+                            sq[slot(buf, j) * kD + tid] = ea;
+                            sd[slot(buf, j) * kD + tid] = p.f[static_cast<std::size_t>(r) * CH + h * kD + tid];
+                        } else {
+                            sk[slot(buf, j) * kD + tid - kD] = ea;
+                            if (w < 6) sv[slot(buf, j) * kV + tid - kD] = p.qkv[row + vch + (tid - kD)];
+                            else if (w == 6 && l == 0) sb[slot(buf, j)] = p.b[static_cast<std::size_t>(r) * H + h];
+                        }
+                    }
+            };
+            auto raw = [&](unsigned buf, int row, unsigned c, unsigned l) -> float {
+                if (row < 0) return hist[static_cast<std::size_t>(3 + row) * kRaw + hcol(c, l)];
+                const std::size_t at = slot(buf, static_cast<unsigned>(row));
+                if (c < 4) return sq[at * kD + l + 32 * c];
+                if (c < 8) return sk[at * kD + l + 32 * (c - 4)];
+                return sv[at * kV + l + 32 * (c - 8)];
+            };
+            auto finish = [&](unsigned buf, unsigned b1) {
+                for (unsigned w = 0; w < kTB; ++w) {  // before barrier B: reads only
+                    const unsigned t = b1 + w;
+                    if (t >= C) continue;
+                    for (unsigned l = 0; l < 32; ++l) {
+                        for (unsigned c = 0; c < 10; ++c) {
+                            const unsigned ch = c < 8 ? (c / 4) * CH + h * kD + l + 32 * (c % 4) : vch + l + 32 * (c - 8);
+                            for (unsigned i = 0; i < 4; ++i) {
+                                const int m = static_cast<int>(t) - 3 + static_cast<int>(i);
+                                const float want = m >= 0 ? p.qkv[static_cast<std::size_t>(m) * 3 * CH + ch]
+                                                          : p.conv_state[static_cast<std::size_t>(ch) * 3 + static_cast<unsigned>(3 + m)];
+                                ok = ok && bits(raw(buf, static_cast<int>(w + i) - 3, c, l)) == bits(want);
+                            }
+                        }
+                        for (unsigned m = 0; m < 4; ++m)
+                            ok = ok && bits(sd[slot(buf, w) * kD + l + 32 * m]) == bits(p.f[static_cast<std::size_t>(t) * CH + h * kD + l + 32 * m]);
+                    }
+                    ok = ok && bits(sb[slot(buf, w)]) == bits(p.b[static_cast<std::size_t>(t) * H + h]);
+                }
+                for (unsigned wr = 0; wr < kTB; ++wr) {  // after barrier B, waves in reverse order
+                    const unsigned w = kTB - 1 - wr, t = b1 + w;
+                    if (t >= C) continue;
+                    if (w >= kTB - 3)
+                        for (unsigned l = 0; l < 32; ++l)
+                            for (unsigned c = 0; c < 10; ++c) hist[(w - (kTB - 3)) * kRaw + hcol(c, l)] = raw(buf, static_cast<int>(w), c, l);
+                    const float* sc = scr.data() + (static_cast<std::size_t>(t) * H + h) * 4 * kD;
+                    for (unsigned i = 0; i < kD; ++i) {
+                        sq[slot(buf, w) * kD + i] = sc[i];
+                        sk[slot(buf, w) * kD + i] = sc[kD + i];
+                        sd[slot(buf, w) * kD + i] = declared_exp(sc[3 * kD + i]);
+                    }
+                    for (unsigned i = 0; i < kV; ++i) sv[slot(buf, w) * kV + i] = sc[2 * kD + y * kV + i];
+                    sb[slot(buf, w)] = beta[static_cast<std::size_t>(t) * H + h];
+                }
+            };
+            for (unsigned e = 0; e < 3 * kRaw; ++e) {  // first batch: hist = the conv state
+                const unsigned i = e / kRaw, c = e % kRaw;
+                const unsigned ch = c < 2 * kD ? (c / kD) * CH + h * kD + c % kD : vch + (c - 2 * kD);
+                hist[e] = p.conv_state[static_cast<std::size_t>(ch) * 3 + i];
+            }
+            stage(0, 0);
+            unsigned cur = 0;
+            for (unsigned b0 = 0; b0 < C; b0 += kTB, cur ^= 1U) {
+                finish(cur, b0);
+                const unsigned nb = C - b0 < kTB ? C - b0 : kTB;
+                for (unsigned j = 0; j < nb; ++j) {  // what the scan reads for token b0 + j
+                    const std::size_t rh = static_cast<std::size_t>(b0 + j) * H + h;
+                    const float* sc = scr.data() + rh * 4 * kD;
+                    for (unsigned i = 0; i < kD; ++i)
+                        ok = ok && bits(sq[slot(cur, j) * kD + i]) == bits(sc[i]) && bits(sk[slot(cur, j) * kD + i]) == bits(sc[kD + i]) &&
+                             bits(sd[slot(cur, j) * kD + i]) == bits(declared_exp(sc[3 * kD + i]));
+                    for (unsigned i = 0; i < kV; ++i) ok = ok && bits(sv[slot(cur, j) * kV + i]) == bits(sc[2 * kD + y * kV + i]);
+                    ok = ok && bits(sb[slot(cur, j)]) == bits(beta[rh]);
+                }
+                if (b0 + kTB < C) stage(cur ^ 1U, b0 + kTB);  // staged during the tokens above, into the other half
+            }
+        }
+    return ok;
+}
+
 void test_prep(std::mt19937& g) {
     std::normal_distribution<float> nd(0.0F, 1.0F);
     std::uniform_int_distribution<unsigned> u16(0, 0xffffU);
-    for (unsigned C : {1U, 2U, 3U, 4U, 13U, 17U}) {
+    for (unsigned C : {1U, 2U, 3U, 4U, 9U, 13U, 17U, 24U, 41U}) {
         Prep p;
         p.H = 2;
         p.C = C;
@@ -195,6 +294,8 @@ void test_prep(std::mt19937& g) {
         char tag[160];
         std::snprintf(tag, sizeof(tag), "fused prep mapping == kda_prep_rows_kernel (q, k, v, exp g, beta), H=2, C=%u, both value tiles", C);
         check(fused_matches(p, scr, beta), tag);
+        std::snprintf(tag, sizeof(tag), "v6 LDS stage / conv history schedule reads the prep inputs and serves the prepared rows, H=2, C=%u", C);
+        check(staged_matches(p, scr, beta), tag);
     }
 }
 
@@ -240,7 +341,7 @@ void test_absorbing(std::mt19937& g) {
         const unsigned n_inj = trial % 4;  // 0 .. 3 injected specials anywhere (some cancel or overflow, some not)
         for (unsigned j = 0; j < n_inj; ++j) {
             const float s = specials[g() % (sizeof(specials) / sizeof(specials[0]))];
-            const unsigned t = g() % T, i = g() % kD;
+            const unsigned t = static_cast<unsigned>(g() % T), i = static_cast<unsigned>(g() % kD);
             switch (g() % 5) {
                 case 0: d[t * kD + i] = s; break;
                 case 1: k[t * kD + i] = s; break;
