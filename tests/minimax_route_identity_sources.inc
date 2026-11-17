@@ -11,7 +11,7 @@
 // src/prompt_terminal_diagnostics.cpp; include/strix/session/checkpoint_io.hpp;
 // src/session/checkpoint_io.cpp. The recursive session scope detects the last
 // two additions; extending the audit's other exact scopes is separate work.
-{"CMakeLists.txt", 0xf5a9fda61d95397eULL},
+{"CMakeLists.txt", 0x3a2ea338bfeb7f5bULL},
 {"apps/minimax_layercut.inc", 0x75446613989ee5ebULL},
 {"apps/minimax_rank_main.cpp", 0x31a776ab65720860ULL},
 {"apps/minimax_serve_main.cpp", 0x901f15e2f283f377ULL},
@@ -124,9 +124,9 @@
 {"src/minimax/moe/mmx_moe.hip", 0x3d7157536736b240ULL},
 {"src/minimax/moe/mmx_moe.hpp", 0xb9d08456ae07920cULL},
 {"src/minimax/moe/mmx_moe_traits.hpp", 0x8dc548751f4e9c34ULL},
-{"src/minimax/moe/mmx_prefill.hip", 0xc836e91573a5972fULL},
+{"src/minimax/moe/mmx_prefill.hip", 0x9a7488465d07b8e1ULL},
 {"src/minimax/moe/mmx_prefill.hpp", 0x07dd7f09a2d65704ULL},
-{"src/minimax/moe/mmx_prefill_core.hpp", 0x57f6991ca18d2dbdULL},
+{"src/minimax/moe/mmx_prefill_core.hpp", 0xc003bbe30f363f44ULL},
 {"src/minimax/moe/mmx_prefill_iu4.inc", 0xdb25d34a9233aff9ULL},
 {"src/minimax/moe/mmx_trellis_device.hpp", 0x11cfbcfe7d145fe4ULL},
 {"src/minimax/pfx/pf_crc.cpp", 0xefbe65eb2a3ec54dULL},
