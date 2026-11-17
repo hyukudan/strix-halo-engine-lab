@@ -3,6 +3,8 @@
 // Prefills rows [0, N-1), then reports: serial greedy steps (T = 1), verify windows of T = 2..8 rows over the serial
 // tokens (ms per window), and MTP speculative decode (depth 7, min-p STRIX_QWEN_MIN_P or 0.7) when a sidecar is set.
 #include "strix/cuda/qwen_prefill.hpp"
+#include "strix/env_flags.hpp"
+#include "strix/residency/residency_cli.hpp"
 
 #include <cuda_profiler_api.h>
 
@@ -10,6 +12,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -30,27 +33,53 @@ static std::vector<std::uint32_t> tokens_of(const std::string& path) {
     return t;
 }
 
-int main(int argc, char** argv) {
+static int bench_main(int argc, char** argv) {
     if (argc < 7) { std::fprintf(stderr, "usage: qwen_decode_bench tables rope max_positions tokens N G\n"); return 1; }
     qp::Config c;
     c.model_gguf = std::getenv("STRIX_QWEN_GGUF") ? std::getenv("STRIX_QWEN_GGUF") : "Qwen3.8-Flash-Next-UD-Q4_K_XL-merged.gguf";
     if (const char* s = std::getenv("STRIX_QWEN_MTP")) c.mtp_sidecar_gguf = s;
     if (const char* v = std::getenv("STRIX_QWEN_DRAFT_VOCAB")) c.draft_vocab = v;
+    if (const char* v = strix::envcfg::text("STRIX_QWEN_EXPERT_TRACE")) c.expert_trace = v;  // EXTR01 router trace
     c.tables_dir = argv[1];
     c.rope_table = argv[2];
     c.max_positions = static_cast<std::uint32_t>(std::atoi(argv[3]));
     c.release_by_layer = false;
     c.decode = true;
-    const auto prompt = tokens_of(argv[4]);
-    const auto n = static_cast<std::uint64_t>(std::atoll(argv[5]));
+    // tokens: one file or several joined by '+', all run on one model load; N = 0 takes each whole prompt
+    std::vector<std::string> files;
+    for (std::string list = argv[4]; !list.empty();) {
+        const auto cut = list.find('+');
+        files.push_back(list.substr(0, cut));
+        list = cut == std::string::npos ? std::string() : list.substr(cut + 1);
+    }
+    const auto n_arg = static_cast<std::uint64_t>(std::atoll(argv[5]));
     const auto g = static_cast<std::uint32_t>(std::atoi(argv[6]));
-    if (n < 2 || n > prompt.size() || g < 8) { std::fprintf(stderr, "bad N/G\n"); return 1; }
+    // optional flags after the six positionals: --expert-residency auto|full|tiered, --vram-budget-gib N, --print-effective-config
+    // (the same consumer and environment fold as the server: strix/residency/residency_cli.hpp)
+    strix::residency::CliOptions residency_cli;
+    try {
+        const std::vector<std::string> args(argv, argv + argc);
+        const auto stop = strix::residency::consume_cli_tail(args, 7, residency_cli);
+        if (stop != args.size()) { std::fprintf(stderr, "unknown option %s\n", args[stop].c_str()); return 1; }
+        c.residency = strix::residency::finish_cli(residency_cli);
+    } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
+    if (residency_cli.print_effective_config) {
+        const auto plan = qp::plan_residency(c);
+        std::printf("{\"residency\":%s}\n", plan.json.c_str());
+        return plan.decision.ok ? 0 : 3;
+    }
     qp::Prefill p(c);
     std::printf("loaded %s\n", p.describe().c_str());
+    std::printf("residency %s\n", p.residency_json().c_str());
     const qp::Sink drop = [](const qp::Piece&) {};
+    cudaProfilerStart();  // nsys --capture-range=cudaProfilerApi: decode only, not the upload
+    for (const auto& file : files) {
+    const auto prompt = tokens_of(file);
+    const std::uint64_t n = n_arg == 0 ? prompt.size() : n_arg;
+    if (n < 2 || n > prompt.size() || g < 8) { std::fprintf(stderr, "bad N/G\n"); return 1; }
+    std::printf("prompt %s n=%llu g=%u\n", file.c_str(), static_cast<unsigned long long>(n), g);
     std::vector<std::uint32_t> seq(prompt.begin(), prompt.begin() + static_cast<std::ptrdiff_t>(n));
     p.run(seq, n - 1, drop);
-    cudaProfilerStart();  // nsys --capture-range=cudaProfilerApi: decode only, not the upload
     std::vector<double> ms;
     for (std::uint32_t i = 0; i < g; ++i) {
         const auto t0 = Clock::now();
@@ -59,6 +88,11 @@ int main(int argc, char** argv) {
         seq.push_back(r.argmax[0]);
     }
     const auto med = [](const std::vector<double>& v) { const std::size_t k = v.size(); return k % 2 ? v[k / 2] : 0.5 * (v[k / 2 - 1] + v[k / 2]); };
+    {   // identity receipt: FNV-1a of the greedy tokens of the serial decode (compare routes / residency modes)
+        std::uint64_t h = 1469598103934665603ULL;
+        for (std::size_t i = n; i < seq.size(); ++i) { h ^= seq[i]; h *= 1099511628211ULL; }
+        std::printf("tokens fnv %016llx (%zu)\n", static_cast<unsigned long long>(h), seq.size() - n);
+    }
     std::sort(ms.begin(), ms.end());
     std::printf("serial T=1: median %.2f ms (%.1f tok/s), min %.2f\n", med(ms), 1000.0 / med(ms), ms[0]);
     for (std::uint32_t t = 2; t <= 8; ++t) {
@@ -102,6 +136,17 @@ int main(int argc, char** argv) {
         std::printf("spec depth 7: %.1f tok/s, %.2f tokens/window, draft %.2f ms/window, verify+commit %.2f ms/window\n",
                     produced / sec, static_cast<double>(produced) / windows, draft_ms / windows, verify_ms / windows);
     }
+    std::printf("receipt %s\n", p.residency_receipt_json().c_str());  // tiered: hit rate, promotions, host time; full: nothing new
+    }
     cudaProfilerStop();
     return 0;
+}
+
+int main(int argc, char** argv) {
+    try {
+        return bench_main(argc, argv);
+    } catch (const std::exception& e) {  // an engine refusal (device gate, residency decision, file) with its reason
+        std::fprintf(stderr, "qwen_decode_bench: %s\n", e.what());
+        return 2;
+    }
 }

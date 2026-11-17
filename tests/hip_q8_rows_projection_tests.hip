@@ -3,6 +3,8 @@
 #include "strix/hip_shared_expert_launcher.hpp"
 #include "strix/q6p_registry.hpp"
 #include "strix/env_flags.hpp"
+#include "core/iu4_onfly.hpp"
+#include "core/wmma_tiled.hpp"
 
 #include <hip/hip_runtime.h>
 #include <algorithm>
@@ -284,6 +286,53 @@ float median_us(const Fixture& f, Mode mode, bool cold, const Buffer& flush, hip
     std::sort(samples.begin(), samples.end());
     return samples[samples.size() / 2U];
 }
+// Diagnostic only: one load-time conversion per fixture; native and IU4 use the same production site.
+// Bandwidth is logical unique weight bytes / GPU event time, not measured DRAM traffic. At rows 7/8
+// the IU4 kernel loads its weights twice through the cache; report that separately from unique bytes.
+void onfly_decode_bench(hipStream_t stream) {
+    Buffer flush(256ULL << 20U);
+    check(hipMemset(reinterpret_cast<void*>(flush.address), 1, flush.bytes), "init flush");
+    for (const auto site : sites) {
+        const auto [width, outputs] = model_shape(site);
+        for (const unsigned rows : {1U, 2U, 4U, 8U}) {
+            Fixture f(site, rows, width, outputs); f.prepare(0);
+            const auto exact = f.run(Mode::rows, stream);
+            const auto exact_a8 = f.run(Mode::rows_a8, stream);
+            Buffer packed(core::onfly::copy_bytes(outputs, width));
+            auto* base = reinterpret_cast<std::uint8_t*>(packed.address);
+            check(core::convert_q8_0_iu4(reinterpret_cast<const std::uint8_t*>(f.weights.address),
+                static_cast<int>(width), static_cast<int>(outputs), base,
+                reinterpret_cast<std::uint16_t*>(base + core::onfly::packed_bytes(core::onfly::padded_outputs(outputs), width)),
+                stream, core::iu4_scale_rule_fast_full), "onfly fixture convert");
+            check(hipStreamSynchronize(stream), "onfly fixture convert complete");
+            const auto* original = reinterpret_cast<const void*>(f.weights.address);
+            q6p::iu4::register_tensor(original, {base, outputs, width});
+            {
+                const q6p::iu4::SuspendScope native;
+                require(f.run(Mode::rows, stream) == exact, "onfly benchmark native arm changed bits");
+                require(f.run(Mode::rows_a8, stream) == exact_a8, "onfly benchmark native A8 arm changed bits");
+            }
+            for (const bool cold : {true, false}) for (const auto mode : {Mode::rows, Mode::rows_a8}) {
+                float native_us = 0.0F;
+                {
+                    const q6p::iu4::SuspendScope native;
+                    native_us = median_us(f, mode, cold, flush, stream);
+                }
+                const auto before = q6p::iu4::launches.load();
+                const auto onfly_us = median_us(f, mode, cold, flush, stream);
+                const auto launches = q6p::iu4::launches.load() - before;
+                const auto bytes = launches ? packed.bytes : f.weights.bytes;
+                std::cout << "onfly-bench site=" << name(site) << " rows=" << rows << " mode=" << (mode == Mode::rows ? "exact" : "dense-a8")
+                    << " cache=" << (cold ? "cold" : "warm")
+                    << " native_us=" << native_us << " onfly_us=" << onfly_us << " native_bytes=" << f.weights.bytes
+                    << " onfly_bytes=" << bytes << " native_GBs=" << static_cast<double>(f.weights.bytes) / native_us / 1000.0
+                    << " onfly_GBs=" << static_cast<double>(bytes) / onfly_us / 1000.0 << " iu4_launches=" << launches
+                    << " pack_loads=" << (launches && rows >= 7U ? 2U : 1U) << '\n';
+            }
+            q6p::iu4::unregister_tensor(original, base);
+        }
+    }
+}
 void shared_down_r8_cases(hipStream_t stream) {
     unsigned cases = 0;
     // Includes partial output waves, unusual Q8 scales/codes, nonfinite inputs,
@@ -365,6 +414,11 @@ void wide_bench(hipStream_t stream) {
 int main() try {
     hipStream_t stream = nullptr;
     check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "create stream");
+    if (strix::envcfg::flag("STRIX_Q8_ROWS_ONFLY_BENCH", false)) {
+        onfly_decode_bench(stream);
+        check(hipStreamDestroy(stream), "destroy stream");
+        return 0;
+    }
     std::uint32_t cases = 0;
     shared_down_r8_cases(stream);
     if (std::getenv("STRIX_SHARED_DOWN_R8_ONLY")) {
