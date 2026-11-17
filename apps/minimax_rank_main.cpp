@@ -60,6 +60,8 @@
 //                                                     PORT + r; per request the layers arrive as they finish and are
 //                                                     imported at once; rank 0 returns the last row's token to the
 //                                                     sender (its TTFT clock); repeated COUNT times (one connection each)
+//   --layercut-listen NAME:PROMPT.u32:PORT:STEPS:COUNT --cut K [--cut-block C] [--cut-act relay|direct]
+//   --cut-relay HOST:PORT (rank 0) / --cut-relay-listen PORT (rank 1): activation-only relay
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/minimax/engine.hpp"
 #include "../src/minimax/model_graph.hpp"
@@ -67,6 +69,12 @@
 #include "strix/dist/communicator.hpp"
 #include "xport/borrowed_transport.hpp"
 #include "strix/bp_codec.hpp"
+#include "strix/minimax_layercut.hpp"
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <limits>
+#include <climits>
 #include "minimax/moe/mmx_prefill.hpp"
 #include "minimax/xfer/minimax_xfer.hpp"
 #include "minimax/pfx/pf_exchange.hpp"
@@ -115,6 +123,9 @@ std::uint64_t fnv(const void* p, std::size_t bytes, std::uint64_t h = 1469598103
     for (std::size_t i = 0; i < bytes; ++i) h = (h ^ b[i]) * 1099511628211ULL;
     return h;
 }
+
+std::vector<std::uint32_t> read_u32(const std::string& path);
+#include "minimax_layercut.inc"
 
 // The transport shared in turn by the communicator and the exchange module (shared exchange form).
 using Borrowed = strix::xport::BorrowedTransport<
@@ -1665,12 +1676,15 @@ int main(int argc, char** argv) {
     // GPU of a node keeps working (declared=implicit).
     strix::device::bind_hip_main(argc, argv);
     // Defaults-on resolver before anything reads a switch; --print-effective-config prints the resolved configuration.
-    if (strix::minimax::defaults::print_or_apply("rank", argc, argv)) return 0;
+    try {
+    const auto cut_args = cut_arguments(argc, argv);
+    if (strix::minimax::defaults::print_or_apply("rank", argc, argv)) {
+        std::printf("%s", cut_args.config.lines.c_str()); return 0;
+    }
     if (argc < 5) {
         std::fprintf(stderr, "usage: %s MODEL_DIR RANK TRANSPORT OUT_DIR [options] [--print-model-graph] [--print-plan]\n", argv[0]);
         return 2;
     }
-    try {
         const auto t_start = Clock::now();
         strix::minimax::session::RunOptions session_options;
         mm::Options opt;
@@ -1686,6 +1700,10 @@ int main(int argc, char** argv) {
         bool tf_write = false, session_hash_only = false;
         double deadline = 1e9;
         std::vector<std::string> sessions, batches, ab_runs, specs, dchecks, vtraces, offloads, offload_imports, offload_listens, xbchecks, selchecks;
+        const auto& cut_cfg = cut_args.config;
+        const auto& layercut_listens = cut_args.listens;
+        const auto& cut_relay = cut_args.relay;
+        const auto cut_relay_port = cut_args.relay_port;
         std::vector<std::string> session_hash_files;
         std::string dspark_dir = std::string(argv[1]) + "/dspark", dspark_exl3;
         std::vector<std::string> dspark_heads;
@@ -1708,6 +1726,8 @@ int main(int argc, char** argv) {
             else if (a == "--offload") offloads.push_back(next());
             else if (a == "--offload-import") offload_imports.push_back(next());
             else if (a == "--offload-listen") offload_listens.push_back(next());
+            else if (a == "--layercut-listen" || a == "--cut-relay" || a == "--cut-relay-listen" ||
+                     a == "--split" || a == "--cut" || a == "--cut-block" || a == "--cut-act") (void)next();
             else if (std::string timing; strix::minimax::defaults::product_option(a, next, &timing)) {
                 if (!timing.empty()) sessions.push_back("@" + timing);  // a session with per-phase timing
             }
@@ -1731,6 +1751,13 @@ int main(int argc, char** argv) {
             else if (strix::minimax::session::parse_option(session_options,a,next)) {}
             else throw std::invalid_argument("unknown option " + a);
         }
+        if (!layercut_listens.empty()) {
+            if (cut_cfg.split != lc::chain::Split::layer_cut || opt.rank >= 2 || cut_relay_port > 65535)
+                throw std::invalid_argument("--layercut-listen needs layer-cut policy, rank 0/1 and valid relay port");
+            opt.max_rows = std::min(opt.max_rows, cut_cfg.block);
+            std::printf("%s", cut_cfg.lines.c_str());
+        } else if (cut_cfg.split != lc::chain::Split::device_only)
+            throw std::invalid_argument("--split: pair split execution needs --layercut-listen");
         const strix::minimax::graph::Attachments graph_attachments{
             !specs.empty() || session_options.draft || !dspark_heads.empty() || !dspark_exl3.empty(),
             !dspark_exl3.empty(), static_cast<std::uint32_t>(dspark_heads.size())};
@@ -1985,6 +2012,25 @@ int main(int argc, char** argv) {
                 hs = fnv(g.data(), g.size() * 4, hs);
             }
             ::close(lfd);
+        }
+        for (const auto& s : layercut_listens) {
+            const auto f = cut_fields(s);
+            const auto prompt = read_u32(f[1]);
+            const auto port = lc::number(f[2], "--layercut-listen PORT");
+            const auto steps = lc::number(f[3], "--layercut-listen STEPS");
+            const auto count = lc::number(f[4], "--layercut-listen COUNT");
+            if (port == 0 || port + opt.rank > 65535 || count == 0 || steps > INT_MAX ||
+                prompt.empty() || prompt.size() + steps > opt.capacity)
+                throw std::invalid_argument("--layercut-listen port/count/prompt/capacity");
+            strix::handoff::Listener listener(static_cast<std::uint16_t>(port + opt.rank));
+            std::unique_ptr<strix::handoff::Listener> relay_listener;
+            if (opt.rank == 1 && cut_relay_port != 0)
+                relay_listener = std::make_unique<strix::handoff::Listener>(static_cast<std::uint16_t>(cut_relay_port));
+            for (unsigned i = 0; i < count; ++i) {
+                const auto g = layercut_session(eng, listener, relay_listener.get(), cut_relay, cut_cfg, prompt,
+                    static_cast<int>(steps), f[0], out_dir, i);
+                hs = fnv(g.data(), g.size() * 4, hs);
+            }
         }
         // DSpark speculative sessions: same prompt and length as the --session of the same NAME must give the same ids.
         std::unique_ptr<ds::DraftFile> draft_file;

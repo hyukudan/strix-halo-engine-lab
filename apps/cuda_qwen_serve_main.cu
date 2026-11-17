@@ -34,6 +34,7 @@
 #include "cuda_qwen_serve_policy.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/cuda/qwen_cohort.hpp"
+#include "strix/cuda/qwen_options.hpp"
 #include "strix/cuda/qwen_prefill.hpp"
 #include "strix/residency/residency_cli.hpp"
 #include "strix/serve/api.hpp"
@@ -65,6 +66,7 @@ std::string strix::render_preflight(const PreflightObservation&, const Preflight
 namespace qp = strix::cuda::qwen_prefill;
 namespace qc = strix::cuda::qwen_cohort;
 namespace px = strix::cuda::qwen_prefix;
+namespace qo = strix::cuda::qwen_options;
 namespace serve = strix::serve;
 using Clock = std::chrono::steady_clock;
 
@@ -74,7 +76,8 @@ std::atomic<bool> g_stop{false};
 void on_signal(int) { g_stop.store(true); }
 
 struct Options {
-    qp::Config engine;
+    qp::Config engine;                          // from the shared parser (qwen_options.hpp), serve role applied
+    std::string effective_config;               // --print-effective-config: JSON, printed instead of serving
     px::Settings prefix;
     std::string bind = "127.0.0.1", api_key_file, model_id = "qwen3.8-flash-next";
     int port = 8090;
@@ -96,9 +99,7 @@ struct Options {
 Options parse(int argc, char** argv) {
     Options o;
     if (const char* v = std::getenv("STRIX_QRTX_PREFIX_CACHE")) o.prefix.enabled = v[0] != '0';
-    o.engine.decode = true;
-    o.engine.export_state = false;
-    o.engine.release_by_layer = false;
+    qo::Request request;  // common engine + profile options; serve differences are named in resolve()
     if (const char* v = std::getenv("STRIX_QRTX_HTTP_SLOTS")) o.http_slots = static_cast<std::uint32_t>(std::stoul(v));
     if (const char* v = std::getenv("STRIX_QRTX_SLOT_MARGIN_MIB")) o.slot_margin_mib = static_cast<std::uint32_t>(std::stoul(v));
     strix::residency::CliOptions residency_cli;
@@ -125,6 +126,7 @@ Options parse(int argc, char** argv) {
             if (end != value.size() || count > UINT32_MAX) throw std::invalid_argument(a + " token count out of range");
             return static_cast<std::uint32_t>(count);
         };
+        if (qo::take(argc, argv, i, request)) continue;
         if (a == "--prefix-cache") {
             const auto value = next();
             if (value != "on" && value != "off") throw std::invalid_argument("--prefix-cache is on or off");
@@ -134,12 +136,6 @@ Options parse(int argc, char** argv) {
         else if (a == "--prefix-cache-stride") o.prefix.stride = cache_count();
         else if (a == "--prefix-cache-host-mb") o.prefix.host_bytes = mib();
         else if (a == "--prefix-cache-vram-mb") o.prefix.vram_bytes = mib();
-        else if (a == "--model") o.engine.model_gguf = next();
-        else if (a == "--mtp-sidecar") o.engine.mtp_sidecar_gguf = next();
-        else if (a == "--draft-vocab") o.engine.draft_vocab = next();
-        else if (a == "--tables") o.engine.tables_dir = next();
-        else if (a == "--rope-table") o.engine.rope_table = next();
-        else if (a == "--max-positions") o.engine.max_positions = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--bind") o.bind = next();
         else if (a == "--port") o.port = std::stoi(next());
         else if (a == "--api-key-file") o.api_key_file = next();
@@ -160,17 +156,17 @@ Options parse(int argc, char** argv) {
         else if (a == "--cohort-depth") o.cohort_depth = next();
         else if (strix::residency::consume_cli_arg(a, next, residency_cli)) {}  // --expert-residency, --vram-budget-gib, --print-effective-config
         else if (a == "--slot-margin-mib") o.slot_margin_mib = static_cast<std::uint32_t>(std::stoul(next()));
-        else if (a == "--block-rows") {
-            const auto r = static_cast<std::uint32_t>(std::stoul(next()));
-            if (r < 1024 || r % 16) throw std::invalid_argument("--block-rows must be a multiple of 16 and >= 1024");
-            o.engine.block_schedule = {r};
-        }
         else throw std::invalid_argument("unknown option " + a);
     }
-    if (o.engine.model_gguf.empty() || o.engine.tables_dir.empty() || o.engine.rope_table.empty())
-        throw std::invalid_argument("--model, --tables and --rope-table are required");
+    const auto resolved = qo::resolve(request, qo::Entry::serve);
+    o.engine = resolved.config;
+    if (!request.print_effective_config) {
+        for (const auto& n : resolved.resolution.notices()) std::cerr << n << std::endl;
+        std::cerr << "strix-cuda-qwen-serve: arithmetic " << resolved.contract << std::endl;
+    }
+    if (request.print_effective_config) o.effective_config = qo::effective_config_json(resolved);
     o.engine.residency = strix::residency::finish_cli(residency_cli);  // flags win over STRIX_EXPERT_RESIDENCY / STRIX_VRAM_BUDGET_GIB
-    o.print_effective_config = residency_cli.print_effective_config;
+    o.print_effective_config = request.print_effective_config;
     if (const char* v = std::getenv("STRIX_QRTX_COHORT"); v && v[0] == '0') o.http_slots = 1;
     if (o.http_slots == 0) throw std::invalid_argument("--http-slots must be >= 1");
     if (const char* v = strix::envcfg::text("STRIX_QRTX_SESSION_RESERVE")) o.session.per_request = std::string(v) != "max";
@@ -439,6 +435,7 @@ private:
         std::vector<std::uint64_t> capture_points;
         double prefix_restore_ms = 0, prefix_capture_ms = 0;
         qc::Stream stream;
+        std::unique_ptr<qc::ContextDraft> ctx;  // context copy/n-gram drafter of this request (STRIX_QRTX_CONTEXT_DRAFT)
         serve::GenerationStats st;
         Clock::time_point t0, t_decode;
         double prefill_gpu_ms = 0;   // overlapped chunks: GPU time on the prefill stream (events)
@@ -685,7 +682,13 @@ private:
         s.st.prefill_ms = std::chrono::duration<double, std::milli>(s.t_decode - s.t0).count();
         if (job.on_progress) job.on_progress({serve::GenerationPhase::decode, s.n, 0, s.n});
         s.phase = Phase::decode;
-        s.stream = qc::Stream{s.session, job.prompt[s.n - 1], s.n - 1, job.draft_depth_max};
+        s.ctx.reset();
+        if (mtp_ && context_mode_ != qc::ContextMode::off) {
+            // the drafter's context is what the session holds; the pending (last prompt) token joins at the first step
+            s.ctx = std::make_unique<qc::ContextDraft>(context_mode_);
+            s.ctx->drafter.reset(std::span<const std::uint32_t>(job.prompt.data(), s.n - 1));
+        }
+        s.stream = qc::Stream{s.session, job.prompt[s.n - 1], s.n - 1, job.draft_depth_max, s.ctx.get()};
         s.st.finish = "length";
         if (job.max_tokens == 0) finish(s, {}, "length");
     }
@@ -748,11 +751,14 @@ private:
                 finish(s, step.error, "length");
                 continue;
             }
-            if (lone) dh_->finish_fixed(opt.depth, step.tokens.size() - 1, std::chrono::duration<double, std::milli>(Clock::now() - ts).count(),
-                                        step.drafted == opt.depth && step.rows == opt.depth + 1U);
+            // Context windows do not measure predictor acceptance or its whole-step cost.
+            if (lone && step.drafted > 0 && step.context_proposed == 0) dh_->finish_fixed(opt.depth, step.mtp_accepted, std::chrono::duration<double, std::milli>(Clock::now() - ts).count(),
+                                        step.drafted == opt.depth && step.mtp_proposed == opt.depth && step.rows == opt.depth + 1U);
             ++s.st.cycles;
-            s.st.proposed += step.drafted;
-            s.st.accepted += step.tokens.size() - 1;
+            s.st.proposed += step.mtp_proposed;
+            s.st.accepted += step.mtp_accepted;
+            s.st.ngram_rows += step.context_proposed;
+            s.st.ngram_accepted += step.context_accepted;
             s.rows += step.rows;
             s.window_sessions += step.window_sessions;
             s.max_window_sessions = std::max<std::uint64_t>(s.max_window_sessions, step.window_sessions);
@@ -797,7 +803,12 @@ private:
             static_cast<double>(e_.session_bytes(s.session)) / 1048576.0, s.admit_free_mib, live_slots());
         std::string extra = head;
         for (std::size_t i = 0; i < s.emitted.size() && i < 4096; ++i) extra += (i ? "," : "") + std::to_string(s.emitted[i]);
-        extra += "],\"prefix_cached\":" + std::to_string(st.cached_tokens) + ",\"prefix_restore_ms\":" + std::to_string(s.prefix_restore_ms)
+        extra += "]";
+        if (s.ctx) extra += std::string(",\"context_draft\":\"") + qc::context_mode_name(context_mode_) + "\",\"copy_first_steps\":" +
+            std::to_string(s.ctx->copy_first_steps) + ",\"context_extended_steps\":" + std::to_string(s.ctx->extended_steps) +
+            ",\"context_rows\":" + std::to_string(s.ctx->context_rows) + ",\"copy_first_accepted\":" + std::to_string(s.ctx->context_accepted) +
+            ",\"context_host_us\":" + std::to_string(static_cast<long long>(s.ctx->host_us));
+        extra += ",\"prefix_cached\":" + std::to_string(st.cached_tokens) + ",\"prefix_restore_ms\":" + std::to_string(s.prefix_restore_ms)
             + ",\"prefix_capture_ms\":" + std::to_string(s.prefix_capture_ms) + "}";
         st.engine_extra.emplace_back("rtx", extra);
         queue_.finish(*s.job, std::move(st), error);
@@ -811,6 +822,7 @@ private:
     px::Cache& cache_;
     std::vector<Slot> slots_;
     bool mtp_ = false;
+    const qc::ContextMode context_mode_ = qc::context_mode_default();
     std::unique_ptr<strix::MtpDepthHost> dh_;  // measured-cost lone-stream depth (STRIX_MTP_CONTROLLER=depth)
     std::uint32_t max_chunk_ = 1024, auto_rows_ = 256, first_rows_ = 0, fit_n_ = 0, inflight_steps_ = 0;
     Slot* inflight_ = nullptr;  // overlap: the slot whose chunk is on the prefill stream
@@ -833,18 +845,24 @@ int main(int argc, char** argv) {
     }
     // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
     // excluded or undeclared card, restricts the process to the chosen one and prints the "device:" receipt line.
-    strix::device::bind_cuda_main(argc, argv);
     try {
+        const auto device_cli = strix::device::take_command_line(argc, argv);
         auto o = parse(argc, argv);
+        strix::device::Request device_request;
+        device_request.select = device_cli.select;
+        strix::device::bind_cuda(std::move(device_request), device_cli.devices_path);
         if (o.print_effective_config) {
             // No model load: the residency decision from the GGUF headers and the live card/host numbers.
             const auto plan = qp::plan_residency(o.engine);
-            std::cout << "{\"model\":\"" << o.engine.model_gguf << "\",\"max_positions_requested\":" << o.engine.max_positions
+            std::cout << o.effective_config.substr(0, o.effective_config.size() - 1) << ",\"model\":\"" << o.engine.model_gguf << "\",\"max_positions_requested\":" << o.engine.max_positions
                       << ",\"residency\":" << plan.json << "}" << std::endl;
             return plan.decision.ok ? 0 : 3;
         }
         std::cerr << "strix-cuda-qwen-serve: loading " << o.engine.model_gguf << std::endl;
-        if (!o.engine.mtp_sidecar_gguf.empty() && o.mtp_depth > 0) std::cerr << "strix-cuda-qwen-serve: " << strix::mtp_depth_state_line(o.min_p) << ", mtp_depth=" << o.mtp_depth << std::endl;
+        if (!o.engine.mtp_sidecar_gguf.empty() && o.mtp_depth > 0) std::cerr << "strix-cuda-qwen-serve: " << strix::mtp_depth_state_line(o.min_p) << ", mtp_depth=" << o.mtp_depth
+            << ", context_draft=" << qc::context_mode_name(qc::context_mode_default())
+            << ", context_draft_effective=" << qc::context_mode_name(o.http_slots > 1 ? qc::context_mode_default() : qc::ContextMode::off)
+            << ", context_draft_applicable=" << (o.http_slots > 1 ? "cohort" : "no (single-slot loop)") << std::endl;
         qp::Prefill engine(o.engine);
         o.engine.max_positions = engine.max_positions();  // resolved limit for admission, cache and capabilities
         std::cerr << "strix-cuda-qwen-serve: loaded " << engine.describe() << std::endl;

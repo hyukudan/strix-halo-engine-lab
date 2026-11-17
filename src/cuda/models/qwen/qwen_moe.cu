@@ -23,6 +23,7 @@
 //   so d*sc and dm*mn are exact in FP32, and sc*r (< 2^23), mn*s (< 2^18) are exact too: both sides are the exact product
 //   d*sc*r rounded once (same for zero signs, infinities and NaN). Every other operation is HIP's, in HIP's order.
 #include "strix/env_flags.hpp"
+#include "../../core/imma_tile.cuh"
 #include "strix/cuda/qwen_moe.hpp"
 #include "strix/cuda/qwen_quant.cuh"
 #include "strix/cuda/qwen_route_bf16.hpp"
@@ -232,6 +233,43 @@ __global__ __launch_bounds__(1024) void csr_kernel(Rows v, std::uint32_t rows) {
 //   pair = c0 + c1; acc[p] = acc[p] + pair;      fold (Chains::fold :782-785): (acc0 + acc1) + (acc2 + acc3).
 // Pipeline: cp.async of K block b+1 (codes, raw weight blocks, deltas/sums) while block b computes.
 constexpr unsigned kProjThreads = 512U, kProjOuts = 64U, kAStride = 272U;
+// Serial down_activation_quantize of a tile's g/u values (Gt, Ut: [tile_rows][OUTS] FP32): shared by the exact and the moe_mma
+// project kernels (code motion only: the exact kernel's bytes are unchanged).
+template <unsigned OUTS, unsigned THREADS>
+__device__ __forceinline__ void project_activation_tile(const float* Gt, const float* Ut, const Rows& v, const amdmath::Tables& tables,
+                                                        const unsigned* row_of, const unsigned* slot_of, unsigned count, unsigned out0) {
+    const Csr& csr = v.csr;
+    const unsigned lane = threadIdx.x & 31U, warp = threadIdx.x >> 5;
+    // Serial down_activation_quantize per (assignment, 32-output group), one warp per job (known_rows.hip:888-909).
+    const bool write_intermediates = v.intermediates.base != nullptr;
+    for (unsigned job = warp; job < count * (OUTS / 32U); job += THREADS / 32U) {
+        const unsigned a = job / (OUTS / 32U), quad = job % (OUTS / 32U), r = row_of[a], slot = slot_of[a];
+        const unsigned feature = out0 + 32U * quad + lane, at_slot = slot * 2U * ffn + feature;
+        const float gv = Gt[a * OUTS + 32U * quad + lane], uv = Ut[a * OUTS + 32U * quad + lane];
+        const float ex = amdmath::amd_expf(tables, -gv);
+        const float hv = __fmul_rn(__fdiv_rn(gv, __fadd_rn(1.0F, ex)), uv);
+        float* output = write_intermediates ? at(v.intermediates, r) : nullptr;
+        if (output) output[at_slot + ffn] = canon(uv);
+        const unsigned bad = __ballot_sync(0xffffffffU, !finite(gv) || !finite(uv) || !finite(hv));
+        if (bad != 0U) {
+            if (output) output[at_slot] = canon(gv);
+            if (lane == 0) { atomicOr(at(v.status, r), projection_nonfinite); atomicOr(csr.summary, projection_nonfinite); }
+            continue;
+        }
+        float x = fabsf(hv);
+        for (int s = 16; s != 0; s /= 2) x = fmaxf(x, __shfl_xor_sync(0xffffffffU, x, s));
+        const bool tiny = x > 0.0F && x < 0x1p-119F;
+        const float delta = x == 0.0F || tiny ? 1.0F : __fdiv_rn(x, 127.0F);
+        const float rounded = tiny ? 0.0F : rintf(__fdiv_rn(hv, delta));
+        const int code = static_cast<int>(fminf(127.0F, fmaxf(-127.0F, rounded)));
+        int sum = code;
+        for (int s = 16; s != 0; s /= 2) sum += __shfl_xor_sync(0xffffffffU, sum, s);
+        if (output) output[at_slot] = hv;
+        at(v.down_codes, r)[slot * ffn + feature] = static_cast<std::int8_t>(code);
+        if (lane == 0) { at(v.down_deltas, r)[slot * (ffn / 32U) + feature / 32U] = delta; at(v.down_sums, r)[slot * (ffn / 32U) + feature / 32U] = sum; }
+    }
+}
+
 template <bool Q5K> struct ProjLayout {
     static constexpr unsigned WB = Q5K ? 176U : 144U, QS = Q5K ? 48U : 16U;
     static constexpr unsigned a_bytes = tile_rows * kAStride, w_bytes = 2U * kProjOuts * WB, es_bytes = tile_rows * 64U;
@@ -388,34 +426,7 @@ __global__ __launch_bounds__(kProjThreads, 1) void project_kernel(const std::uin
                 }
     }
     __syncthreads();
-    // Serial down_activation_quantize per (assignment, 32-output group), one warp per job (known_rows.hip:888-909).
-    const bool write_intermediates = v.intermediates.base != nullptr;
-    for (unsigned job = warp; job < count * 2U; job += kProjThreads / 32U) {
-        const unsigned a = job >> 1, quad = job & 1U, r = row_of[a], slot = slot_of[a];
-        const unsigned feature = out0 + 32U * quad + lane, at_slot = slot * 2U * ffn + feature;
-        const float gv = Gt[a * kProjOuts + 32U * quad + lane], uv = Ut[a * kProjOuts + 32U * quad + lane];
-        const float ex = amdmath::amd_expf(tables, -gv);
-        const float hv = __fmul_rn(__fdiv_rn(gv, __fadd_rn(1.0F, ex)), uv);
-        float* output = write_intermediates ? at(v.intermediates, r) : nullptr;
-        if (output) output[at_slot + ffn] = canon(uv);
-        const unsigned bad = __ballot_sync(0xffffffffU, !finite(gv) || !finite(uv) || !finite(hv));
-        if (bad != 0U) {
-            if (output) output[at_slot] = canon(gv);
-            if (lane == 0) { atomicOr(at(v.status, r), projection_nonfinite); atomicOr(csr.summary, projection_nonfinite); }
-            continue;
-        }
-        float x = fabsf(hv);
-        for (int s = 16; s != 0; s /= 2) x = fmaxf(x, __shfl_xor_sync(0xffffffffU, x, s));
-        const bool tiny = x > 0.0F && x < 0x1p-119F;
-        const float delta = x == 0.0F || tiny ? 1.0F : __fdiv_rn(x, 127.0F);
-        const float rounded = tiny ? 0.0F : rintf(__fdiv_rn(hv, delta));
-        const int code = static_cast<int>(fminf(127.0F, fmaxf(-127.0F, rounded)));
-        int sum = code;
-        for (int s = 16; s != 0; s /= 2) sum += __shfl_xor_sync(0xffffffffU, sum, s);
-        if (output) output[at_slot] = hv;
-        at(v.down_codes, r)[slot * ffn + feature] = static_cast<std::int8_t>(code);
-        if (lane == 0) { at(v.down_deltas, r)[slot * (ffn / 32U) + feature / 32U] = delta; at(v.down_sums, r)[slot * (ffn / 32U) + feature / 32U] = sum; }
-    }
+    project_activation_tile<kProjOuts, kProjThreads>(Gt, Ut, v, tables, row_of, slot_of, count, out0);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -585,6 +596,356 @@ __global__ __launch_bounds__(kDownThreads) void down_kernel(const std::uint8_t* 
             *reinterpret_cast<float2*>(at(v.rawdots, row_of[r]) + slot_of[r] * hidden + o) = make_float2(out[0], out[1]);
             }
         }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// moe_mma FAST form (Config::forms.moe_mma, identity qwen-cuda-moe-i8fma-v1): the same int8 IMMA block dots as the exact
+// kernels (activations stay int8, one m16n8k32 IMMA = one exact 32-K group dot) but ONE FP32 chain per output instead of four:
+//   project (Q4_K/Q5_K): acc = fma(e*dsc, float(dot), acc); acc = fma(-dmn, e*s, acc)   per group, groups ascending
+//   down (Q5_1/Q8_0):    acc = fma(e*d,  float(dot), acc); acc = fma(m, e*s, acc)       (Q8_0: first only)
+// with e = activation delta, s = activation sum, dsc = d*sc, dmn = dm*mn. The FMAs (and the pre-multiplied e*s) round differently
+// from the HIP chains, so outputs differ by FP32 rounding noise: a bit-changing form, never part of the exact profile. The single
+// chain frees registers: a warp owns MT 16-row m-tiles x 16 outputs, so every unpacked weight fragment feeds MT IMMAs and A comes
+// from ldmatrix (core::imma::load_a_frag). Tiles stay the CSR's <= 64 assignments (partial tiles: rows >= count replicate row 0,
+// warps whose first row is past `count` skip). CTA outputs = 16 * NW.
+#ifndef MOE_FP_MT
+#define MOE_FP_MT 1
+#endif
+#ifndef MOE_FP_NW
+#define MOE_FP_NW 4
+#endif
+#ifndef MOE_FD_MT
+#define MOE_FD_MT 2
+#endif
+#ifndef MOE_FD_NW
+#define MOE_FD_NW 4
+#endif
+template <bool Q5K, unsigned MT, unsigned NW> struct FastProjLayout {
+    static_assert(MT == 1U || MT == 2U || MT == 4U);
+    static constexpr unsigned OUTS = 16U * NW, WR = 4U / MT, THREADS = 32U * WR * NW;
+    static constexpr unsigned WB = Q5K ? 176U : 144U, QS = Q5K ? 48U : 16U;
+    static constexpr unsigned a_bytes = tile_rows * kAStride, w_bytes = 2U * OUTS * WB, es_bytes = tile_rows * 64U;
+    static constexpr unsigned stage = a_bytes + w_bytes + es_bytes;
+    static constexpr unsigned scales = 2U * stage;  // D[2][8][OUTS], DM[2][8][OUTS], E[8][64], ES[8][64]
+    static constexpr unsigned rowinfo = scales + (4U * 8U * OUTS + 2U * 8U * 64U) * 4U;
+    static constexpr unsigned total = rowinfo + 2U * tile_rows * 4U;
+    static_assert(2U * tile_rows * OUTS * 4U <= scales, "g/u tile reuses the stages");
+};
+
+template <bool Q5K, unsigned MT, unsigned NW>
+__global__ __launch_bounds__(FastProjLayout<Q5K, MT, NW>::THREADS, 1) void project_fast_kernel(
+    const std::uint8_t* gate, const std::uint8_t* up, Rows v, amdmath::Tables tables) {
+    using L = FastProjLayout<Q5K, MT, NW>;
+    constexpr unsigned OUTS = L::OUTS, THREADS = L::THREADS, WR = L::WR;
+    const Csr& csr = v.csr;
+    if ((csr.summary[0] & ~projection_nonfinite) || blockIdx.x >= *csr.tile_count) return;
+    const unsigned begin = csr.tile_begins[blockIdx.x], count = csr.tile_begins[blockIdx.x + 1U] - begin;
+    const unsigned expert = csr.tile_experts[blockIdx.x], out0 = blockIdx.y * OUTS;
+    extern __shared__ __align__(16) unsigned char smem[];
+    float* D = reinterpret_cast<float*>(smem + L::scales);  // [m][j][o]
+    float* DM = D + 2U * 8U * OUTS;
+    float* E = DM + 2U * 8U * OUTS;                          // [j][row]
+    float* ES = E + 8U * 64U;                                // e * s
+    unsigned* row_of = reinterpret_cast<unsigned*>(smem + L::rowinfo);
+    unsigned* slot_of = row_of + tile_rows;
+    const unsigned t = threadIdx.x, lane = t & 31U, warp = t >> 5;
+    if (t < tile_rows) {
+        const unsigned a = t < count ? t : 0U;
+        row_of[t] = csr.rows[begin + a]; slot_of[t] = csr.slots[begin + a];
+    }
+    __syncthreads();
+    const auto load = [&](unsigned b) {
+        unsigned char* st = smem + (b & 1U) * L::stage;
+        for (unsigned i = t; i < tile_rows * 16U; i += THREADS) {
+            const unsigned r = i >> 4, c = i & 15U;
+            cp16(st + r * kAStride + 16U * c, at(v.codes, row_of[r]) + 256U * b + 16U * c);
+        }
+        constexpr unsigned CH = L::WB / 16U;
+        for (unsigned i = t; i < 2U * OUTS * CH; i += THREADS) {
+            const unsigned m = i / (OUTS * CH), rem = i % (OUTS * CH), o = rem / CH, c = rem % CH;
+            const std::uint8_t* w = (m ? up : gate) + ((static_cast<std::uint64_t>(expert) * ffn + out0 + o) * (hidden / 256U) + b) * L::WB;
+            cp16(st + L::a_bytes + (m * OUTS + o) * L::WB + 16U * c, w + 16U * c);
+        }
+        for (unsigned i = t; i < tile_rows * 4U; i += THREADS) {
+            const unsigned r = i >> 2, c = i & 3U;
+            const void* src = c < 2U ? static_cast<const void*>(at(v.deltas, row_of[r]) + 8U * b + 4U * c)
+                                     : static_cast<const void*>(at(v.sums, row_of[r]) + 8U * b + 4U * (c - 2U));
+            cp16(st + L::a_bytes + L::w_bytes + r * 64U + 16U * c, src);
+        }
+        cp_commit();
+    };
+    const unsigned g = lane >> 2, q = lane & 3U, wr = warp % WR, wn = warp / WR, rbase = 16U * MT * wr;
+    const bool active = rbase < count;
+    float acc[MT][2][2][4];
+#pragma unroll
+    for (unsigned mt = 0; mt < MT; ++mt)
+#pragma unroll
+        for (unsigned m = 0; m < 2U; ++m)
+#pragma unroll
+            for (unsigned n = 0; n < 2U; ++n)
+#pragma unroll
+                for (unsigned e = 0; e < 4U; ++e) acc[mt][m][n][e] = 0.0F;
+    constexpr unsigned blocks = hidden / 256U;
+    load(0U);
+#pragma unroll 1
+    for (unsigned b = 0; b < blocks; ++b) {
+        cp_wait_all();
+        __syncthreads();
+        if (b + 1U < blocks) load(b + 1U);
+        const unsigned char* st = smem + (b & 1U) * L::stage;
+        const unsigned char* A = st;
+        const unsigned char* W = st + L::a_bytes;
+        const unsigned char* AS = st + L::a_bytes + L::w_bytes;
+        for (unsigned i = t; i < 2U * 8U * OUTS; i += THREADS) {
+            const unsigned m = i / (8U * OUTS), j = (i / OUTS) & 7U, o = i % OUTS;
+            const uint4 h = *reinterpret_cast<const uint4*>(W + (m * OUTS + o) * L::WB);
+            D[i] = __fmul_rn(half_bits(h.x & 65535U), static_cast<float>(factor(h, j, false)));
+            DM[i] = __fmul_rn(half_bits(h.x >> 16U), static_cast<float>(factor(h, j, true)));
+        }
+        for (unsigned i = t; i < 8U * 64U; i += THREADS) {
+            const unsigned j = i >> 6, r = i & 63U;
+            const float ev = reinterpret_cast<const float*>(AS + r * 64U)[j];
+            E[i] = ev;
+            ES[i] = __fmul_rn(ev, static_cast<float>(reinterpret_cast<const int*>(AS + r * 64U + 32U)[j]));
+        }
+        __syncthreads();
+        if (!active) continue;
+#pragma unroll
+        for (unsigned p = 0; p < 4U; ++p) {
+            unsigned wv[2][2][4];
+#pragma unroll
+            for (unsigned m = 0; m < 2U; ++m)
+#pragma unroll
+                for (unsigned n = 0; n < 2U; ++n) {
+                    const unsigned char* wq = W + (m * OUTS + 16U * wn + 8U * n + g) * L::WB;
+                    wv[m][n][0] = lds32(wq + L::QS + 32U * p + 4U * q); wv[m][n][1] = lds32(wq + L::QS + 32U * p + 16U + 4U * q);
+                    if constexpr (Q5K) { wv[m][n][2] = lds32(wq + 16U + 4U * q); wv[m][n][3] = lds32(wq + 32U + 4U * q); }
+                }
+#pragma unroll
+            for (unsigned G = 0; G < 2U; ++G) {
+                const unsigned j = 2U * p + G;
+                std::uint32_t a[MT][4];
+                float e[MT][2], es[MT][2];
+#pragma unroll
+                for (unsigned mt = 0; mt < MT; ++mt) {
+                    core::imma::load_a_frag(a[mt], A + (rbase + 16U * mt) * kAStride + 32U * j, kAStride, static_cast<int>(lane));
+                    const unsigned r0 = rbase + 16U * mt + g;
+                    e[mt][0] = E[j * 64U + r0]; e[mt][1] = E[j * 64U + r0 + 8U];
+                    es[mt][0] = ES[j * 64U + r0]; es[mt][1] = ES[j * 64U + r0 + 8U];
+                }
+#pragma unroll
+                for (unsigned m = 0; m < 2U; ++m)
+#pragma unroll
+                    for (unsigned n = 0; n < 2U; ++n) {
+                        constexpr unsigned mask = 0x0f0f0f0fU;
+                        std::uint32_t bb[2] = {(wv[m][n][0] >> (4U * G)) & mask, (wv[m][n][1] >> (4U * G)) & mask};
+                        if constexpr (Q5K) {
+                            bb[0] |= ((wv[m][n][2] >> j) & 0x01010101U) << 4U; bb[1] |= ((wv[m][n][3] >> j) & 0x01010101U) << 4U;
+                        }
+                        const unsigned oc = 16U * wn + 8U * n + 2U * q;
+                        const float2 dd = *reinterpret_cast<const float2*>(D + (m * 8U + j) * OUTS + oc);
+                        const float2 mm = *reinterpret_cast<const float2*>(DM + (m * 8U + j) * OUTS + oc);
+#pragma unroll
+                        for (unsigned mt = 0; mt < MT; ++mt) {
+                            int c[4];
+                            core::imma::mma_seeded(c, a[mt], bb);
+#pragma unroll
+                            for (unsigned el = 0; el < 4U; ++el) {
+                                const unsigned hr = el >> 1, col = el & 1U;
+                                const float x = core::imma::block_acc(c[el], e[mt][hr], col ? dd.y : dd.x, acc[mt][m][n][el]);
+                                acc[mt][m][n][el] = __fmaf_rn(-(col ? mm.y : mm.x), es[mt][hr], x);
+                            }
+                        }
+                    }
+            }
+        }
+    }
+    __syncthreads();
+    float* Gt = reinterpret_cast<float*>(smem);  // [64 rows][OUTS]
+    float* Ut = Gt + tile_rows * OUTS;
+    if (active) {
+#pragma unroll
+        for (unsigned mt = 0; mt < MT; ++mt)
+#pragma unroll
+            for (unsigned m = 0; m < 2U; ++m)
+#pragma unroll
+                for (unsigned n = 0; n < 2U; ++n)
+#pragma unroll
+                    for (unsigned el = 0; el < 4U; ++el) {
+                        const unsigned r = rbase + 16U * mt + g + 8U * (el >> 1), o = 16U * wn + 8U * n + 2U * q + (el & 1U);
+                        (m ? Ut : Gt)[r * OUTS + o] = acc[mt][m][n][el];
+                    }
+    }
+    __syncthreads();
+    project_activation_tile<OUTS, THREADS>(Gt, Ut, v, tables, row_of, slot_of, count, out0);
+}
+
+template <bool Q51> struct FastDownGeom { static constexpr unsigned WB = Q51 ? 24U : 34U, WS = Q51 ? 112U : 144U; };
+template <bool Q51, unsigned MT, unsigned NW> struct FastDownLayout {
+    static_assert(MT == 1U || MT == 2U || MT == 4U);
+    static constexpr unsigned OUTS = 16U * NW, WR = 4U / MT, THREADS = 32U * WR * NW;
+    static constexpr unsigned WB = FastDownGeom<Q51>::WB, WS = FastDownGeom<Q51>::WS;
+    static constexpr unsigned a_bytes = tile_rows * kDAStride, w_bytes = OUTS * WS, es_bytes = tile_rows * 32U;
+    static constexpr unsigned stage = a_bytes + w_bytes + es_bytes;
+    static constexpr unsigned scales = 2U * stage;  // Dv[4][OUTS], Mv[4][OUTS], E[4][64], ES[4][64]
+    static constexpr unsigned rowinfo = scales + (2U * 4U * OUTS + 2U * 4U * 64U) * 4U;
+    static constexpr unsigned total = rowinfo + 2U * tile_rows * 4U;
+};
+
+template <bool Q51, bool RouteBF16, unsigned MT, unsigned NW>
+__global__ __launch_bounds__(FastDownLayout<Q51, MT, NW>::THREADS) void down_fast_kernel(const std::uint8_t* weights, Rows v) {
+    using L = FastDownLayout<Q51, MT, NW>;
+    constexpr unsigned OUTS = L::OUTS, THREADS = L::THREADS, WR = L::WR;
+    const Csr& csr = v.csr;
+    if (csr.summary[0] || blockIdx.x >= *csr.tile_count) return;
+    const unsigned begin = csr.tile_begins[blockIdx.x], count = csr.tile_begins[blockIdx.x + 1U] - begin;
+    const unsigned expert = csr.tile_experts[blockIdx.x], out0 = blockIdx.y * OUTS;
+    extern __shared__ __align__(16) unsigned char smem[];
+    float* Dv = reinterpret_cast<float*>(smem + L::scales);  // [j][o]
+    float* Mv = Dv + 4U * OUTS;
+    float* E = Mv + 4U * OUTS;                               // [j][row]
+    float* ES = E + 4U * 64U;
+    unsigned* row_of = reinterpret_cast<unsigned*>(smem + L::rowinfo);
+    unsigned* slot_of = row_of + tile_rows;
+    const unsigned t = threadIdx.x, lane = t & 31U;
+    if (t < tile_rows) {
+        const unsigned a = t < count ? t : 0U;
+        row_of[t] = csr.rows[begin + a]; slot_of[t] = csr.slots[begin + a];
+    }
+    __syncthreads();
+    constexpr unsigned groups = ffn / 32U;
+    const auto load = [&](unsigned c) {
+        unsigned char* st = smem + (c & 1U) * L::stage;
+        for (unsigned i = t; i < tile_rows * 8U; i += THREADS) {
+            const unsigned r = i >> 3, k = i & 7U;
+            cp16(st + r * kDAStride + 16U * k, at(v.down_codes, row_of[r]) + slot_of[r] * ffn + 128U * c + 16U * k);
+        }
+        if constexpr (Q51) {
+            for (unsigned i = t; i < OUTS * 6U; i += THREADS) {
+                const unsigned o = i / 6U, k = i % 6U;
+                const std::uint8_t* w = weights + ((static_cast<std::uint64_t>(expert) * hidden + out0 + o) * groups + 4U * c) * L::WB;
+                cp16(st + L::a_bytes + o * L::WS + 16U * k, w + 16U * k);
+            }
+        } else {
+            for (unsigned i = t; i < OUTS * 17U; i += THREADS) {
+                const unsigned o = i / 17U, k = i % 17U;
+                const std::uint8_t* w = weights + ((static_cast<std::uint64_t>(expert) * hidden + out0 + o) * groups + 4U * c) * L::WB;
+                cp8(st + L::a_bytes + o * L::WS + 8U * k, w + 8U * k);
+            }
+        }
+        for (unsigned i = t; i < tile_rows * 2U; i += THREADS) {
+            const unsigned r = i >> 1, k = i & 1U;
+            const void* src = k == 0U ? static_cast<const void*>(at(v.down_deltas, row_of[r]) + slot_of[r] * groups + 4U * c)
+                                      : static_cast<const void*>(at(v.down_sums, row_of[r]) + slot_of[r] * groups + 4U * c);
+            cp16(st + L::a_bytes + L::w_bytes + r * 32U + 16U * k, src);
+        }
+        cp_commit();
+    };
+    const unsigned warp = t >> 5;
+    const unsigned g = lane >> 2, q = lane & 3U, wr = warp % WR, wn = warp / WR, rbase = 16U * MT * wr;
+    const bool active = rbase < count;
+    float acc[MT][2][4];
+#pragma unroll
+    for (unsigned mt = 0; mt < MT; ++mt)
+#pragma unroll
+        for (unsigned n = 0; n < 2U; ++n)
+#pragma unroll
+            for (unsigned e = 0; e < 4U; ++e) acc[mt][n][e] = 0.0F;
+    constexpr unsigned chunks = groups / 4U;
+    load(0U);
+#pragma unroll 1
+    for (unsigned c = 0; c < chunks; ++c) {
+        cp_wait_all();
+        __syncthreads();
+        if (c + 1U < chunks) load(c + 1U);
+        const unsigned char* st = smem + (c & 1U) * L::stage;
+        const unsigned char* A = st;
+        const unsigned char* W = st + L::a_bytes;
+        const unsigned char* AS = st + L::a_bytes + L::w_bytes;
+        for (unsigned i = t; i < 4U * OUTS; i += THREADS) {
+            const unsigned j = i / OUTS, o = i % OUTS;
+            const unsigned short* h = reinterpret_cast<const unsigned short*>(W + o * L::WS + j * L::WB);
+            Dv[i] = half_bits(h[0]);
+            Mv[i] = Q51 ? half_bits(h[1]) : 0.0F;
+        }
+        for (unsigned i = t; i < 4U * 64U; i += THREADS) {
+            const unsigned j = i >> 6, r = i & 63U;
+            const float ev = reinterpret_cast<const float*>(AS + r * 32U)[j];
+            E[i] = ev;
+            ES[i] = __fmul_rn(ev, static_cast<float>(reinterpret_cast<const int*>(AS + r * 32U + 16U)[j]));
+        }
+        __syncthreads();
+        if (!active) continue;
+#pragma unroll
+        for (unsigned j = 0; j < 4U; ++j) {
+            std::uint32_t a[MT][4];
+            float e[MT][2], es[MT][2];
+#pragma unroll
+            for (unsigned mt = 0; mt < MT; ++mt) {
+                core::imma::load_a_frag(a[mt], A + (rbase + 16U * mt) * kDAStride + 32U * j, kDAStride, static_cast<int>(lane));
+                const unsigned r0 = rbase + 16U * mt + g;
+                e[mt][0] = E[j * 64U + r0]; e[mt][1] = E[j * 64U + r0 + 8U];
+                es[mt][0] = ES[j * 64U + r0]; es[mt][1] = ES[j * 64U + r0 + 8U];
+            }
+#pragma unroll
+            for (unsigned n = 0; n < 2U; ++n) {
+                const unsigned ob = 16U * wn + 8U * n;
+                const unsigned char* blk = W + (ob + g) * L::WS + j * L::WB;
+                std::uint32_t bb[2];
+                if constexpr (Q51) {
+                    const unsigned qh = lds32(blk + 4U), qs = lds32(blk + 8U + 4U * q);
+                    const unsigned l = (qh >> (4U * q)) & 15U, u = (qh >> (16U + 4U * q)) & 15U;
+                    bb[0] = (qs & 0x0f0f0f0fU) | ((l * 0x00204081U) & 0x01010101U) << 4U;
+                    bb[1] = ((qs >> 4U) & 0x0f0f0f0fU) | ((u * 0x00204081U) & 0x01010101U) << 4U;
+                } else {
+                    const unsigned base = j * L::WB + 2U;
+                    const unsigned char* row = W + (ob + g) * L::WS;
+                    if (base & 3U) {
+                        const unsigned al = base & ~3U;
+                        const unsigned x0 = lds32(row + al + 4U * q), x1 = lds32(row + al + 4U * q + 4U);
+                        const unsigned y0 = lds32(row + al + 16U + 4U * q), y1 = lds32(row + al + 16U + 4U * q + 4U);
+                        bb[0] = __byte_perm(x0, x1, 0x5432U); bb[1] = __byte_perm(y0, y1, 0x5432U);
+                    } else {
+                        bb[0] = lds32(row + base + 4U * q); bb[1] = lds32(row + base + 16U + 4U * q);
+                    }
+                }
+                const unsigned oc = ob + 2U * q;
+                const float2 dd = *reinterpret_cast<const float2*>(Dv + j * OUTS + oc);
+                const float2 mm = *reinterpret_cast<const float2*>(Mv + j * OUTS + oc);
+#pragma unroll
+                for (unsigned mt = 0; mt < MT; ++mt) {
+                    int r[4];
+                    core::imma::mma_seeded(r, a[mt], bb);
+#pragma unroll
+                    for (unsigned el = 0; el < 4U; ++el) {
+                        const unsigned hr = el >> 1, col = el & 1U;
+                        float x = core::imma::block_acc(r[el], e[mt][hr], col ? dd.y : dd.x, acc[mt][n][el]);
+                        if constexpr (Q51) x = __fmaf_rn(col ? mm.y : mm.x, es[mt][hr], x);
+                        acc[mt][n][el] = x;
+                    }
+                }
+            }
+        }
+    }
+    if (!active) return;
+#pragma unroll
+    for (unsigned mt = 0; mt < MT; ++mt)
+#pragma unroll
+        for (unsigned n = 0; n < 2U; ++n)
+#pragma unroll
+            for (unsigned hr = 0; hr < 2U; ++hr) {
+                const unsigned r = rbase + 16U * mt + g + 8U * hr;
+                if (r >= count) continue;
+                const float out0v = acc[mt][n][2U * hr], out1v = acc[mt][n][2U * hr + 1U];
+                const unsigned o = out0 + 16U * wn + 8U * n + 2U * q;
+                if constexpr (RouteBF16) {
+                    const auto index = static_cast<std::uint64_t>(slot_of[r]) * hidden + o;
+                    moe_route_store<true>(at(v.rawdots, row_of[r]), index, out0v);
+                    moe_route_store<true>(at(v.rawdots, row_of[r]), index + 1U, out1v);
+                } else {
+                    *reinterpret_cast<float2*>(at(v.rawdots, row_of[r]) + slot_of[r] * hidden + o) = make_float2(out0v, out1v);
+                }
+            }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1005,13 +1366,28 @@ void enqueue_csr(const Rows& v, std::uint32_t rows, cudaStream_t s) {
     csr_kernel<<<1, 1024, 0, s>>>(v, rows);
     check(cudaGetLastError(), "MoE CSR");
 }
-void enqueue_project(const Rows& v, std::uint32_t rows, const Weights& w, const amdmath::Tables& tables, cudaStream_t s) {
+void enqueue_project(const Rows& v, std::uint32_t rows, const Weights& w, const amdmath::Tables& tables, cudaStream_t s, bool moe_mma) {
     if (rows <= kRowsMax && decode_rows_enabled()) {
         const dim3 grid(csr_sizes(rows).max_tiles, ffn / 32U);
         if (w.gate_type == type_q5_k) project_rows_kernel<true><<<grid, 1024, 0, s>>>(w.gate, w.up, v, tables);
         else if (w.gate_type == type_q4_k) project_rows_kernel<false><<<grid, 1024, 0, s>>>(w.gate, w.up, v, tables);
         else throw std::invalid_argument("MoE gate type");
         check(cudaGetLastError(), "MoE gate/up rows");
+        return;
+    }
+    if (moe_mma) {
+        constexpr unsigned MT = MOE_FP_MT, NW = MOE_FP_NW;
+        const dim3 grid(csr_sizes(rows).max_tiles, ffn / (16U * NW));
+        if (w.gate_type == type_q5_k) {
+            using L = FastProjLayout<true, MT, NW>;
+            static bool once = (set_smem(project_fast_kernel<true, MT, NW>, L::total), true); (void)once;
+            project_fast_kernel<true, MT, NW><<<grid, L::THREADS, L::total, s>>>(w.gate, w.up, v, tables);
+        } else if (w.gate_type == type_q4_k) {
+            using L = FastProjLayout<false, MT, NW>;
+            static bool once = (set_smem(project_fast_kernel<false, MT, NW>, L::total), true); (void)once;
+            project_fast_kernel<false, MT, NW><<<grid, L::THREADS, L::total, s>>>(w.gate, w.up, v, tables);
+        } else throw std::invalid_argument("MoE gate type");
+        check(cudaGetLastError(), "MoE gate/up moe_mma");
         return;
     }
     const dim3 grid(csr_sizes(rows).max_tiles, ffn / kProjOuts);
@@ -1025,13 +1401,28 @@ void enqueue_project(const Rows& v, std::uint32_t rows, const Weights& w, const 
     check(cudaGetLastError(), "MoE gate/up");
 }
 template <bool RouteBF16>
-void enqueue_down_storage(const Rows& v, std::uint32_t rows, const Weights& w, cudaStream_t s) {
+void enqueue_down_storage(const Rows& v, std::uint32_t rows, const Weights& w, cudaStream_t s, bool moe_mma) {
     if (rows <= kRowsMax && decode_rows_enabled()) {
         const dim3 grid(csr_sizes(rows).max_tiles, hidden / 8U);
         if (w.down_type == type_q5_1) down_rows_kernel<true, RouteBF16><<<grid, 256, 0, s>>>(w.down, v);
         else if (w.down_type == type_q8_0) down_rows_kernel<false, RouteBF16><<<grid, 256, 0, s>>>(w.down, v);
         else throw std::invalid_argument("MoE down type");
         check(cudaGetLastError(), "MoE down rows");
+        return;
+    }
+    if (moe_mma) {
+        constexpr unsigned MT = MOE_FD_MT, NW = MOE_FD_NW;
+        const dim3 grid(csr_sizes(rows).max_tiles, hidden / (16U * NW));
+        if (w.down_type == type_q5_1) {
+            using L = FastDownLayout<true, MT, NW>;
+            static bool once = (set_smem(down_fast_kernel<true, RouteBF16, MT, NW>, L::total), true); (void)once;
+            down_fast_kernel<true, RouteBF16, MT, NW><<<grid, L::THREADS, L::total, s>>>(w.down, v);
+        } else if (w.down_type == type_q8_0) {
+            using L = FastDownLayout<false, MT, NW>;
+            static bool once = (set_smem(down_fast_kernel<false, RouteBF16, MT, NW>, L::total), true); (void)once;
+            down_fast_kernel<false, RouteBF16, MT, NW><<<grid, L::THREADS, L::total, s>>>(w.down, v);
+        } else throw std::invalid_argument("MoE down type");
+        check(cudaGetLastError(), "MoE down moe_mma");
         return;
     }
     const dim3 grid(csr_sizes(rows).max_tiles, hidden / kDownOuts);
@@ -1051,12 +1442,12 @@ void validate_route_storage(const Rows& v, std::uint32_t rows) {
 }
 } // namespace
 
-void enqueue_down(const Rows& v, std::uint32_t rows, const Weights& w, cudaStream_t s) {
+void enqueue_down(const Rows& v, std::uint32_t rows, const Weights& w, cudaStream_t s, bool moe_mma) {
     validate_route_storage(v, rows);
     if (v.route_bf16 && native_types(w))
         qwen_route::require_composition(true, qwen_route::Composition::other_weight_pack);
-    if (v.route_bf16) enqueue_down_storage<true>(v, rows, w, s);
-    else enqueue_down_storage<false>(v, rows, w, s);
+    if (v.route_bf16) enqueue_down_storage<true>(v, rows, w, s, moe_mma);
+    else enqueue_down_storage<false>(v, rows, w, s, moe_mma);
 }
 void enqueue_merge(const Rows& v, std::uint32_t rows, cudaStream_t s) {
     validate_route_storage(v, rows);
@@ -1074,7 +1465,7 @@ bool native_types(const Weights& w) {
     return !(a8_gate && a8_down);
 }
 
-void enqueue_routed(const Rows& v, std::uint32_t rows, const Weights& w, const amdmath::Tables& tables, cudaStream_t s) {
+void enqueue_routed(const Rows& v, std::uint32_t rows, const Weights& w, const amdmath::Tables& tables, cudaStream_t s, bool moe_mma) {
     validate_route_storage(v, rows);
     if (v.route_bf16 && native_types(w))
         qwen_route::require_composition(true, qwen_route::Composition::other_weight_pack);
@@ -1090,8 +1481,8 @@ void enqueue_routed(const Rows& v, std::uint32_t rows, const Weights& w, const a
         check(cudaGetLastError(), "MoE native down");
         return;
     }
-    enqueue_project(v, rows, w, tables, s);
-    enqueue_down(v, rows, w, s);
+    enqueue_project(v, rows, w, tables, s, moe_mma);
+    enqueue_down(v, rows, w, s, moe_mma);
 }
 void enqueue_combine(const Rows& v, std::uint32_t rows, std::uint32_t* record, cudaStream_t s) {
     enqueue_merge(v, rows, s);
@@ -1099,12 +1490,12 @@ void enqueue_combine(const Rows& v, std::uint32_t rows, std::uint32_t* record, c
 }
 
 void enqueue(const Rows& v, std::uint32_t rows, std::uint32_t clear_words, const Weights& w, const amdmath::Tables& tables,
-             std::uint32_t* record, cudaStream_t s) {
+             std::uint32_t* record, cudaStream_t s, bool moe_mma) {
     validate_route_storage(v, rows);
     if (v.route_bf16 && native_types(w))
         qwen_route::require_composition(true, qwen_route::Composition::other_weight_pack);
     enqueue_prologue(v, rows, clear_words, s);
-    enqueue_routed(v, rows, w, tables, s);
+    enqueue_routed(v, rows, w, tables, s, moe_mma);
     enqueue_combine(v, rows, record, s);
 }
 

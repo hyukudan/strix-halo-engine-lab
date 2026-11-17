@@ -21,7 +21,9 @@ spec.loader.exec_module(client)
 
 
 def good():
-    return dict(ids=[7, 8], tokens=2, error=None, done=True, t_first=1, t_end=2, decode_tps=2)
+    # Every key stream() returns, including the drafting counters the report prints (None = not reported).
+    return dict(ids=[7, 8], tokens=2, error=None, done=True, t_first=1, t_end=2, decode_tps=2,
+                tpc=None, cf=None, cx=None, cr=None, hu=None, rps=None)
 
 
 class Responses(unittest.TestCase):
