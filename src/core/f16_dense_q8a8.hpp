@@ -28,6 +28,13 @@ struct View {
     std::uint32_t in, count, rows, x_stride, out_stride;
     std::uint32_t tile0;         // first column tile of the launch (set by enqueue)
     std::uint32_t accumulate;    // out += sum
+    // Batched form (grid z): `batch` independent products of the same shape in ONE launch; product z reads
+    // weight + z * batch_weight_bytes, codes + z * batch_in, deltas + z * batch_in / 32 and writes out + z * batch_out.
+    // Each product's bits are those of its own call (scheduling only). 0 or 1 = one product (the fields are not read).
+    // Caller guarantees disjoint output regions across products (including every row, also when accumulating).
+    // supported() checks shape admission only; it does not check output overlap or allocation extents.
+    std::uint32_t batch = 0U, batch_in = 0U, batch_out = 0U;
+    std::uint64_t batch_weight_bytes = 0U;
 };
 
 // Forms (bits of the kernel template; every form gives the contract's bits):
@@ -113,6 +120,13 @@ template <class E> struct StoreImage {
 
 template <unsigned TC, unsigned Waves, unsigned Form> __global__ __launch_bounds__(32 * Waves) void kernel(View v) {
     __shared__ Storage<TC> lds;
+    if (v.batch > 1U) {  // product blockIdx.z of a batched launch (CTA-uniform)
+        const unsigned z = blockIdx.z;
+        v.weight += static_cast<std::size_t>(z) * v.batch_weight_bytes;
+        v.codes += static_cast<std::size_t>(z) * v.batch_in;
+        v.deltas += static_cast<std::size_t>(z) * (v.batch_in / 32U);
+        v.out += static_cast<std::size_t>(z) * v.batch_out;
+    }
     core<TC>(nullptr, v.in, v.rows, Cols<Waves, Form>{v}, lds, Store{v.count, v.tile0, v.accumulate});
 }
 template <unsigned TC, unsigned Waves, class E>
@@ -122,7 +136,8 @@ __global__ __launch_bounds__(32 * Waves) void kernel_image(View v, std::uint16_t
 }
 
 inline bool supported(const View& v) {
-    return ::strix::weight::hip::Q8F16Source::supported(v);
+    return ::strix::weight::hip::Q8F16Source::supported(v) &&
+           (v.batch <= 1U || (v.batch <= 65535U && v.batch_in % 32U == 0U));
 }
 
 // Rows per weight read = 16 * waves (the same bits either way). waves 0 = the rule: STRIX_F16_Q8A8_WAVES (8 or 16) when
@@ -146,12 +161,13 @@ inline unsigned form_for(unsigned form = kFormRule) {
 template <unsigned Waves, unsigned Form> inline void launch(View v, hipStream_t stream) {
     const unsigned tiles = (v.count + 15U) / 16U, gx = (v.rows + 16U * Waves - 1U) / (16U * Waves);
     const Plan pl = plan(tiles, v.rows, true);
+    const unsigned gz = v.batch > 1U ? v.batch : 1U;  // batched form: one product per grid z
     v.tile0 = 0U;
-    if (pl.full) hipLaunchKernelGGL((kernel<16, Waves, Form>), dim3(gx, pl.full), dim3(32U * Waves), 0, stream, v);
+    if (pl.full) hipLaunchKernelGGL((kernel<16, Waves, Form>), dim3(gx, pl.full, gz), dim3(32U * Waves), 0, stream, v);
     v.tile0 = 16U * pl.full;
-    if (pl.tc == 1U) hipLaunchKernelGGL((kernel<1, Waves, Form>), dim3(gx, pl.gy), dim3(32U * Waves), 0, stream, v);
-    if (pl.tc == 2U) hipLaunchKernelGGL((kernel<2, Waves, Form>), dim3(gx, pl.gy), dim3(32U * Waves), 0, stream, v);
-    if (pl.tc == 4U) hipLaunchKernelGGL((kernel<4, Waves, Form>), dim3(gx, pl.gy), dim3(32U * Waves), 0, stream, v);
+    if (pl.tc == 1U) hipLaunchKernelGGL((kernel<1, Waves, Form>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v);
+    if (pl.tc == 2U) hipLaunchKernelGGL((kernel<2, Waves, Form>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v);
+    if (pl.tc == 4U) hipLaunchKernelGGL((kernel<4, Waves, Form>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v);
 }
 template <unsigned Waves> inline void launch_form(const View& v, unsigned form, hipStream_t stream) {
     if (form == kWPacked) launch<Waves, kWPacked>(v, stream);

@@ -46,7 +46,7 @@ set_tests_properties(strix-handoff-lanes-tests strix-handoff-lanes-failed-write
 
 # Compile the actual rank adapter parser without pulling in the HIP execution functions.
 file(READ "${root}/apps/minimax_layercut.inc" adapter)
-string(FIND "${adapter}" "std::vector<std::string> cut_fields(" parser_start)
+string(FIND "${adapter}" "std::string cut_pair_identity(" parser_start)
 string(FIND "${adapter}" "std::vector<std::uint32_t> layercut_session(" parser_end)
 math(EXPR parser_size "${parser_end} - ${parser_start}")
 string(SUBSTRING "${adapter}" ${parser_start} ${parser_size} parser)
@@ -61,6 +61,39 @@ else()
     target_compile_options(strix-layercut-execution-parser-tests PRIVATE -Wall -Wextra -Werror -Wshadow -Wsign-conversion)
 endif()
 add_test(NAME strix-layercut-execution-parser-tests COMMAND strix-layercut-execution-parser-tests)
+
+# Compile the actual argument paths without the GPU code surrounding them. Keep
+# the source slices live at configure time so these tests cannot use stale copies.
+function(argument_slice source begin end output)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${root}/${source}")
+    file(READ "${root}/${source}" content)
+    string(FIND "${content}" "${begin}" first)
+    string(FIND "${content}" "${end}" last)
+    if(first LESS 0 OR last LESS_EQUAL first)
+        message(FATAL_ERROR "Argument test source boundaries changed: ${source}")
+    endif()
+    math(EXPR length "${last} - ${first}")
+    string(SUBSTRING "${content}" ${first} ${length} fragment)
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/${output}" "${fragment}")
+endfunction()
+argument_slice(apps/minimax_layercut.inc "std::string cut_pair_identity(" "std::vector<std::uint32_t> layercut_session(" rank_arguments.inc)
+argument_slice(src/cuda/models/minimax/mm_rtx_prefill_main.cu "            if (a == \"--layer-cut\")" "            if (a == \"--layers\")" producer_arguments.inc)
+argument_slice(src/cuda/models/minimax/mm_rtx_prefill_main.cu "        lc::Inputs cut_input{" "        if (print_effective ||" producer_resolution.inc)
+add_executable(strix-layercut-arguments-tests "${root}/tests/layercut_arguments_tests.cpp")
+target_include_directories(strix-layercut-arguments-tests PRIVATE "${root}/include" "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_features(strix-layercut-arguments-tests PRIVATE cxx_std_20)
+if(MSVC)
+    target_compile_options(strix-layercut-arguments-tests PRIVATE /W4 /WX /EHsc /wd4996)
+else()
+    target_compile_options(strix-layercut-arguments-tests PRIVATE -Wall -Wextra -Werror -Wshadow -Wsign-conversion)
+endif()
+add_test(NAME strix-layercut-rank-arguments COMMAND strix-layercut-arguments-tests rank)
+find_program(powershell NAMES pwsh powershell)
+if(powershell)
+    add_test(NAME strix-layercut-wrapper-arguments COMMAND "${powershell}" -NoProfile -File
+        "${root}/tests/layercut_wrapper_tests.ps1" -Binary "$<TARGET_FILE:strix-layercut-arguments-tests>"
+        -Scratch "${CMAKE_CURRENT_BINARY_DIR}/wrapper-fixture")
+endif()
 add_executable(strix-pair-layercut-startup-tests "${root}/tests/pair_layercut_startup_tests.cpp"
     "${root}/src/handoff.cpp" "${root}/src/bp_codec.cpp")
 target_include_directories(strix-pair-layercut-startup-tests PRIVATE "${root}/include")

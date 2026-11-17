@@ -50,7 +50,9 @@ inline std::string without_added_prefill_reports(std::string text) {
             "prefill_storage_identity", "prefill_storage_identity_hash",
             "prefill_moe_route_bf16_reason", "prefill_fast_components",
             // Reported for native weights too since the IU4 row-decode/reduction resolver report (additive).
-            "turbo_weights"}) {
+            "turbo_weights",
+            // Explicit-only QSA index band request report (default off; additive).
+            "qsa_index_band"}) {
         const auto needle = std::string("\"") + key + "\":";
         const auto start = text.find(needle);
         if (start == std::string::npos) continue;

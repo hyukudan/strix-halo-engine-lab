@@ -125,18 +125,22 @@ inline constexpr PrefillLever kPrefillLevers[] = {
     {"STRIX_DS41_FAST_ATTN", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
     {"STRIX_DS41_FAST_ATTN_Q16", PrefillLeverClass::reload},  // static once per process (hip_deepseek41_prefill.hip)
     {"STRIX_DS41_FAST_DENSE", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
+    {"STRIX_DS41_FAST_DENSE_BATCH", PrefillLeverClass::cached},  // scheduling only (batched o_a groups), same bits
     {"STRIX_DS41_FAST_DENSE_MIN_ROWS", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
     {"STRIX_DS41_FAST_ENGRAM", PrefillLeverClass::reload},  // startup pair resolver exports the Engram policy
     {"STRIX_DS41_FAST_I4", PrefillLeverClass::runtime},
     {"STRIX_DS41_FAST_I4_SCOPE", PrefillLeverClass::reload},
     {"STRIX_DS41_FAST_MOE", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
     {"STRIX_DS41_FAST_MOE_DOWN_ROWS", PrefillLeverClass::runtime},  // getenv on every call
+    {"STRIX_DS41_FAST_MOE_F16", PrefillLeverClass::reload},  // startup pair resolver / profile table row (MoE FP16 operands)
     {"STRIX_DS41_FAST_MOE_ORDER", PrefillLeverClass::runtime},  // getenv on every call
     {"STRIX_DS41_FAST_PREFILL", PrefillLeverClass::reload},  // startup pair resolver (deepseek41_pair_defaults) reads/exports it once
+    {"STRIX_DS41_FAST_SHARED", PrefillLeverClass::reload},  // startup pair resolver / profile table row (shared expert FAST)
     {"STRIX_DS41_FP16_CACHE", PrefillLeverClass::reload},
     {"STRIX_DS41_FP16_CACHE_READONLY", PrefillLeverClass::reload},
     {"STRIX_DS41_FP16_TUNE", PrefillLeverClass::reload},
     {"STRIX_DS41_FP8_W", PrefillLeverClass::cached},  // launch shape only (outputs per wave), not a layout
+    {"STRIX_DS41_HC_COLLAPSE_ONCE", PrefillLeverClass::cached},  // scheduling only (hc collapse site), same bits
     {"STRIX_DS41_HC_SITE", PrefillLeverClass::reload},
     {"STRIX_DS41_HC_SITE_FAST", PrefillLeverClass::cached},
     {"STRIX_DS41_HOST_EXCHANGE", PrefillLeverClass::reload},

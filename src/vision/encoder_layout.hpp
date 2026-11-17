@@ -37,10 +37,12 @@ struct Geometry {
     unsigned w = 0, wp = 0, w16 = 0, heads = 0, d = 0, dp = 0, hw = 0, q16 = 0, p = 0, pp = 0;
     unsigned m1 = 0, m116 = 0, m = 0, mp = 0, chunk = 0;
     bool compact = false, split = false, learned = false, rope = false;
+    unsigned attn_terms = 1;  // EncoderOptions::attention_terms
     // bytes
     std::size_t patches = 0, pos = 0, trig = 0, x = 0, nrm = 0, qkv = 0, q = 0, ao = 0, cmp = 0, o = 0, k = 0, vt = 0;
+    std::size_t klo = 0, vtlo = 0;  // two-term attention: lo terms of k, vt
     std::size_t lo = 0, ylo = 0, mid = 0, act = 0, o2 = 0, mlo = 0, mylo = 0;
-    std::size_t fixed() const { return patches + pos + 2U * trig + x + nrm + qkv + q + ao + cmp + o + k + vt + lo + ylo; }
+    std::size_t fixed() const { return patches + pos + 2U * trig + x + nrm + qkv + q + ao + cmp + o + k + vt + klo + vtlo + lo + ylo; }
     std::size_t mlp() const { return mid + act + o2 + mlo + mylo; }
 };
 
@@ -77,6 +79,8 @@ inline Geometry geometry(const EncoderConfig& c, unsigned rows, unsigned slots, 
     g.cmp = g.compact ? aligned(n * g.wp * 4U) : 0U;
     g.o = aligned(n * g.w16 * 4U);
     g.k = g.vt = aligned(std::size_t{slots} * g.hw * 2U);
+    g.attn_terms = opt.attention_terms;
+    if (g.attn_terms == 2U) g.klo = g.vtlo = g.k;
     if (g.split) {
         g.lo = aligned(n * std::max(g.pp, g.wp) * 4U);
         g.ylo = aligned(n * std::max(g.q16, g.w16) * 4U);

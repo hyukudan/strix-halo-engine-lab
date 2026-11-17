@@ -31,14 +31,14 @@ The relay listener is a separate port on rank 1. No script assumes a machine or 
 ```bash
 bash scripts/bench/layercut/run_pair.sh \
   ./build/strix-minimax-rank ./model ./prompt.u32 \
-  PEER_SSH_HOST PEER_IP 46000 46010 24 2048 64 2 ./layercut-out
+  PEER_SSH_HOST PEER_IP 46000 46010 24 4096 64 2 ./layercut-out
 ```
 
 Then on the CUDA PC:
 
 ```powershell
 ./scripts/bench/layercut/run_pc.ps1 -ModelDir ./model -Rope ./rope.bin -Prompt ./prompt.u32 `
-  -Node0 NODE0_IP -Node1 NODE1_IP -Port0 46000 -Port1 46001 -K 24 -C 2048 -Repeat 2
+  -Node0 NODE0_IP -Node1 NODE1_IP -Port0 46000 -Port1 46001 -K 24 -Repeat 2
 ```
 
 `--layer-cut K` implies resident timing mode with exactly the prefix layers loaded. An explicitly supplied
@@ -47,17 +47,21 @@ cold and subsequent runs warm. Both ranks finish their requested decode steps be
 The node script uses relay. For direct mode launch both ranks with `--cut-act direct` and omit relay controls;
 use `-Act direct` on the PC. `-Codec bp` selects lossless bp-v1 for every repetition of this route.
 
-The default pair identity is `default`. For the FP32 pair profile, set `STRIX_MM_PREFILL_IDENTITY=fp32`
+The default pair identity is `default/c4096`: production prefill bits depend on the pair's chunk boundaries (a row's
+MoE K split class follows the rows its expert holds in that chunk), so the identity names the pair-alone chunk rows
+(`--max-rows`, default 4096) and every block must be a multiple of them (identity grain; the resolver refuses other
+blocks and `auto` only proposes multiples). For the FP32 pair profile, set `STRIX_MM_PREFILL_IDENTITY=fp32`
 on both nodes (the node script forwards it to rank 1) and use `-PairIdentity fp32` on the PC. Additional active
 prefill policies append `;` and the existing prefill policy identity. Copy that exact string into
 `--cut-pair-identity`; a mismatch is refused before compute.
+Omitting `-C` in the PC wrapper leaves block selection to the shared resolver, including environment overrides.
 
 ## Controls and planning
 
 The shared resolver is `include/strix/pair/layercut.hpp`: CLI overrides environment, then defaults.
 `--split` / `STRIX_SPLIT`: `device-only` (default), `handoff-full`, `layer-cut`, `auto`.
 `--cut` / `STRIX_SPLIT_CUT`: 1..59 or `auto`; `--cut-block` / `STRIX_SPLIT_BLOCK`: positive multiple of 16,
-or `auto` (default 2048); `--cut-act` / `STRIX_SPLIT_ACT`: `link` (default), `relay` or `direct`.
+or `auto` (default: the identity grain, 4096 for the default pair identity, else 2048); `--cut-act` / `STRIX_SPLIT_ACT`: `link` (default), `relay` or `direct`.
 `link` sends the same producer bytes as `relay`, but rank 0's rows reach rank 1 over the pair's own link inside the
 engine (one control exchange per prefill chunk, at the same schedule point on both ranks); no relay ports.
 `--cut-xport` / `STRIX_SPLIT_XPORT`: `act-first` (default; contract v2) or `fifo` (v1, the previous order, off switch).
@@ -72,6 +76,9 @@ For an automatic field, callers supply the model shape, prompt length and declar
 `STRIX_SPLIT_RTX_ROWS_S`, `STRIX_SPLIT_PAIR_ROWS_S`, plus `STRIX_SPLIT_LINK_MBPS` (decimal MB/s), or
 `STRIX_HANDOFF_LINK=1gbe|2.5gbe|10gbe|usb4` (118/290/1180/4600 MB/s).
 The shared `pair::chain::choose` performs the search; these rates seed a prediction, never qualification.
+The grain-based cost scale is a planning estimate from whole-model 8K timings; it does not qualify other policy
+suffixes, transports, hardware, layer ranges or tails. Qualification requires matching profiles and complete workloads;
+repetitions within one process do not establish interleaved A/B gains.
 For executing the cut experiment, keep `--split layer-cut` and use automatic cut/block as needed on **both** sides
 with identical inputs. General `auto` may resolve to the pair's device-only route; it must not be interpreted as
 an executable CUDA-only/decode route. The CUDA executable refuses that outcome. Planner predictions currently
@@ -113,6 +120,8 @@ a compute-stream wait. Slot reuse can wait on the host. Receiver activations use
 condition variable; KV stages all N rows per prefix layer in host memory and scatters component planes before import.
 The pair recomputes the cut's input Gemma norm with the same reduction as post-exchange and supports grouped chunk units.
 An existing group can await several ACT blocks before launching; it is not forced to serial chunks.
+The block sets a unit-width cap, not an exact scheduling unit: group width may cap it further and grouping can be
+disabled. Units can cross block boundaries (for example, three-chunk blocks with group width two).
 
 ## Receipts and gates still required
 
@@ -136,9 +145,10 @@ No native execution or fidelity result is established by the host tests (native 
 
 - Ports: rank r listens on BASE_PORT + r, so the relay port of rank 1 must differ from BASE_PORT + 1; the producer sends
   to HOST0:BASE_PORT,HOST1:BASE_PORT+1.
-- Pipelining needs the pair's prefill unit (chunk rows x interleave group) to be at most one block: run the ranks with
-  `STRIX_MM_PF_GROUP=2 --max-rows C/2` for `--cut-block C`. With the default group (4) an 8K prompt is one unit and the
-  pair starts only after the last block (no overlap).
+- Pipelining: the listener runs each block as one prefill unit (`block / max-rows` chunks, bit-neutral) so the pair
+  starts on the first block. Keep the pair-alone `--max-rows`; the old `STRIX_MM_PF_GROUP=2 --max-rows C/2` recipe
+  changed the pair's chunk identity (logits differ from the pair alone) and is refused for the default identity.
+- Unit gate (bit-neutral): a `--session` with `--unit-chunks 1` prints the same state / final-rows fnv as the default.
 - Exactness gate: ranks with `STRIX_MM_PREFILL_IDENTITY=fp32` and the producer with `--cut-pair-identity fp32`; the
   layer-cut "state fnv" line must equal the node-only FP32 `--session` state fnv on both ranks.
 - Quality: `STRIX_MM_QUALITY_OUT=PREFIX STRIX_MM_QUALITY_ROWS=N` on the ranks dumps the prefill logits of a `--session`

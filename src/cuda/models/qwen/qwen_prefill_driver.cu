@@ -35,6 +35,7 @@
 #include <filesystem>
 #include "strix/cuda/vram_guard.hpp"
 #include "strix/qwen_weight_packs.hpp"
+#include "strix/rows_fit.hpp"
 
 #include "strix/cuda/amd_math_tables.hpp"
 
@@ -55,6 +56,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -484,6 +486,7 @@ struct Prefill::Impl : BlockFields {
     std::uint64_t onfly_source_bytes = 0, onfly_image_bytes = 0;
     double onfly_seconds = 0;
     void convert_onfly();
+    std::string block_fit_note;  // "8192->6144 rows (reserve 512 MiB)" when the block fit reduced the capacity
     std::uint32_t transcoded = 0;              // tensors transcoded at load
     StateCopyStream state_copy;
     cudaStream_t state_copy_stream(SessionState& s) {
@@ -502,6 +505,7 @@ struct Prefill::Impl : BlockFields {
     void upload_mtp();
     void allocate();
     void allocate_block(std::uint32_t rows, std::uint32_t qsa_chunk, bool engine_set);
+    void allocate_fitted_block();
     static void free_block(BlockFields& b) noexcept;
     int stream_priority_high = 0, stream_priority_low = 0;  // cudaDeviceGetStreamPriorityRange (greatest, least)
     // ---- prefill overlap: a second BlockFields set (own stream and scratch) for prefill chunks enqueued while decode
@@ -518,7 +522,9 @@ struct Prefill::Impl : BlockFields {
 
 void Prefill::Impl::upload_model() {
     // Retain admission of the original merged headers. `info` below describes device storage after transcode.
-    admission = qwen_packs::admit_model(cfg.model_gguf);
+    admission = qwen_packs::admit_model(cfg.model_gguf,qwen_packs::expert_arithmetic_name(cfg.expert_arithmetic));
+    if(cfg.expert_arithmetic==qwen_packs::ExpertArithmetic::gsq_a8_dot4 && cfg.forms.moe_mma)
+        throw std::invalid_argument("GSQ A8: single-chain moe_mma composition unqualified");
     if (!admission.pack) throw std::runtime_error("Qwen weight pack not admitted: " + admission.reason);
     constexpr std::uint64_t kChunk = std::uint64_t{256} << 20;
     std::uint8_t* staging[2] = {nullptr, nullptr};
@@ -650,10 +656,13 @@ void Prefill::Impl::upload_model() {
             lw[l].p[k_ffn_down_exps_weight] = const_cast<void*>(tier->slot_down(l));
         }
         moe::Weights probe;
+        probe.arithmetic=cfg.expert_arithmetic;
         probe.gate_type = lw[l].gate_type;
         probe.down_type = lw[l].down_type;
         native_experts = native_experts || moe::native_types(probe);
     }
+    if(cfg.expert_arithmetic==qwen_packs::ExpertArithmetic::gsq_a8_dot4 && route_policy.enabled)
+        qwen_route::require_composition(true,qwen_route::Composition::other_weight_pack);
     // Validate the route against source admission. FAST dense transcodes may still have A8 experts.
     if (admission.pack->arithmetic == "exact" && native_experts)
         throw std::logic_error(std::string("Qwen weight pack ") + std::string(admission.pack->id) + " disagrees with the expert route");
@@ -895,11 +904,58 @@ void Prefill::Impl::allocate_block(std::uint32_t rows, std::uint32_t qsa_chunk, 
     }
 }
 
+// Block fit (Config::block_fit, strix/rows_fit.hpp): the engine block set is the one consumer whose size is a free
+// choice, so it is allocated after weights, decode buffers, draft and session 0, with the largest capacity (1024-row
+// steps from the schedule maximum) that still leaves block_fit_reserve_mib free; the schedule is clamped to it.
+// Bitwise: block rows only change how many rows a launch covers.
+void Prefill::Impl::allocate_fitted_block() {
+    const auto want = round_up(*std::max_element(cfg.block_schedule.begin(), cfg.block_schedule.end()), 16U);
+    const std::uint64_t reserve = std::uint64_t{cfg.block_fit_reserve_mib} << 20U;
+    const auto drop = [&] {  // the engine stream lives in BlockFields but is not the block's: keep it
+        cudaStream_t keep = stream;
+        stream = nullptr;
+        free_block(static_cast<BlockFields&>(*this));
+        stream = keep;
+    };
+    // Tier routes are fixed-size per row and outside BlockFields (drop keeps them): allocate them for the
+    // largest capacity first, so the reserve check below sees them; the kernels read the [cap][kTopK] prefix.
+    if (tier) tier_routes = dev_zero<std::uint32_t>(std::uint64_t{want} * kTopK, "tier slot routes");
+    std::uint64_t fit_free_mib = 0, fit_total_mib = 0;
+    const auto fit = strix::rows_fit::fit(want, std::min<std::uint32_t>(want, 1024U), 1024U, [&](std::uint32_t rows) {
+        try {
+            allocate_block(rows, std::min<std::uint32_t>(rows, 1024U), true);
+        } catch (const std::runtime_error& e) {
+            const std::string_view what(e.what());
+            if (what.find("VRAM full") == std::string_view::npos && what.find("out of memory") == std::string_view::npos) throw;
+            drop();
+            return false;
+        }
+        std::size_t free_bytes = 0, total_bytes = 0;
+        ck(cudaMemGetInfo(&free_bytes, &total_bytes), "block fit");
+        if (free_bytes >= reserve) {
+            fit_free_mib = free_bytes >> 20U;  // counter: CUDA-visible free VRAM left by the chosen capacity
+            fit_total_mib = total_bytes >> 20U;
+            return true;
+        }
+        drop();
+        return false;
+    });
+    if (fit.reduced()) {
+        cfg.block_schedule = strix::rows_fit::clamp_schedule(cfg.block_schedule, cap);
+        cfg.final_block_rows = std::min(cfg.final_block_rows, cap);
+        block_fit_note = std::to_string(fit.want) + "->" + std::to_string(cap) + " rows (reserve " +
+                         std::to_string(cfg.block_fit_reserve_mib) + " MiB; CUDA free " + std::to_string(fit_free_mib) +
+                         " of " + std::to_string(fit_total_mib) + " MiB)";
+    }
+}
+
 void Prefill::Impl::allocate() {
     gdn_stride = 10240 + 6144 + 48 + 48 + 6144;
     const auto rows = round_up(*std::max_element(cfg.block_schedule.begin(), cfg.block_schedule.end()), 16U);
-    allocate_block(rows, std::min<std::uint32_t>(rows, 1024U), true);
-    if (tier) tier_routes = dev_zero<std::uint32_t>(std::uint64_t{cap} * kTopK, "tier slot routes");
+    if (!cfg.block_fit) {  // fit: block and tier routes after session 0 (allocate_fitted_block)
+        allocate_block(rows, std::min<std::uint32_t>(rows, 1024U), true);
+        if (tier) tier_routes = dev_zero<std::uint32_t>(std::uint64_t{cap} * kTopK, "tier slot routes");
+    }
     if (cfg.decode) {
         head_logits = dev_zero<float>(std::uint64_t{kMaxWindowRows} * hc::kVocab, "head logits");
         argmax_dev = dev_zero<std::uint32_t>(kMaxWindowRows, "argmax");
@@ -1243,6 +1299,7 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
     m.allocate();
     m.upload_draft();
     m.new_session(config.session_positions ? config.session_positions : config.max_positions);  // session 0: the single-session API
+    if (m.cfg.block_fit) m.allocate_fitted_block();  // last: the block capacity takes what the fixed buffers left
     {
         const char* v = std::getenv("STRIX_QRTX_GRAPHS");
         m.use_graphs = !(v && v[0] == '0');
@@ -1278,6 +1335,10 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
     if (m.state_type != RecurrentStateType::f32) {  // f32 keeps the original receipt bytes
         m.describe.pop_back();
         m.describe += std::string(",\"recurrent_state\":\"") + recurrent_state_type_name(m.state_type) + "\"}";
+    }
+    if (!m.block_fit_note.empty()) {  // only when the fit reduced the capacity: other receipts keep their bytes
+        m.describe.pop_back();
+        m.describe += ",\"block_fit\":\"" + m.block_fit_note + "\"}";
     }
     if (m.route_policy.enabled) {
         const auto id = numerical_identity();
@@ -1555,6 +1616,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         mr.output = {routed_out, kHidden * 2};
         mr.csr = csr;
         moe::Weights ew;
+        ew.arithmetic=cfg.expert_arithmetic;
         ew.gate_type = lw[l].gate_type;
         ew.down_type = lw[l].down_type;
         ew.gate = static_cast<const std::uint8_t*>(lw[l].p[k_ffn_gate_exps_weight]);

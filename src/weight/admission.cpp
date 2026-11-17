@@ -42,7 +42,25 @@ Status normalise(const Registry& registry,const TensorIndex& index,const RawTens
     WeightView w{};w.tensor=raw.id;w.shape=raw.shape;w.payload=raw.payload;w.parameters=params;
     w.storage=index.container==Container::gguf?gguf_format(raw.wire_type):safetensors_format(raw.wire_dtype);
     // A caller must explicitly select this semantic schema, then all companion dtype/shape rules are verified.
-    if(params.transform=="block.e4m3-e8m0.32x32@1") {
+    if(params.transform=="strix.nvfp4.safetensors@1") {
+        if(index.container!=Container::safetensors || index.schema!=params.transform || !raw.name.ends_with(".codes") ||
+           raw.wire_dtype!="U8" || raw.shape.rank!=2 || !raw.shape.dims[0] || !raw.shape.dims[1] ||
+           raw.shape.dims[1]>UINT64_MAX/2 || raw.shape.dims[1]%32)
+            return {Error::malformed,"invalid canonical NVFP4 code tensor"};
+        const auto base=raw.name.substr(0,raw.name.size()-6);
+        const auto* scales=named(index,base+".block_scales");const auto* tensor=named(index,base+".tensor_scale");
+        if(!scales || scales->wire_dtype!="U8" || scales->shape.rank!=2 || scales->shape.dims[0]!=raw.shape.dims[0] ||
+           scales->shape.dims[1]!=raw.shape.dims[1]/8 || !tensor || tensor->wire_dtype!="F32" ||
+           tensor->shape.rank!=1 || tensor->shape.dims[0]!=1)
+            return {Error::malformed,"canonical NVFP4 requires U8 block scales and F32[1] tensor scale"};
+        w.storage={"nvidia.nvfp4",1};w.shape={{{raw.shape.dims[0],raw.shape.dims[1]*2,0,0}},2};
+        w.sidecars.push_back({"block_scales",Scalar::e4m3fn,scales->shape,scales->payload});
+        w.sidecars.push_back({"tensor_scale",Scalar::f32,tensor->shape,tensor->payload});
+        w.parameters.bits=4;w.parameters.group_size=16;
+        w.parameters.scale_encoding="e4m3fn";w.parameters.transform.clear();
+        // Packed nibbles use descriptor addressing, never scalar byte strides.
+        w.has_byte_strides=false;
+    }else if(params.transform=="block.e4m3-e8m0.32x32@1") {
         if(raw.wire_dtype!="F8_E4M3" || raw.shape.rank!=2 || raw.shape.dims[0]%32 || raw.shape.dims[1]%32 || !raw.name.ends_with(".weight"))return {Error::malformed,"invalid native FP8 weight schema"};
         const auto* scale=named(index,raw.name.substr(0,raw.name.size()-7)+".scale");
         if(!scale || scale->wire_dtype!="F8_E8M0" || scale->shape.rank!=2 || scale->shape.dims[0]!=raw.shape.dims[0]/32 || scale->shape.dims[1]!=raw.shape.dims[1]/32)return {Error::malformed,"native FP8 requires exact E8M0 block scale grid"};

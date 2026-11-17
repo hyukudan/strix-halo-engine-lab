@@ -2,6 +2,8 @@
 // changed/new selectors, update their allow-table and tests, then update hashes.
 // Additional linked host dependency census (source coverage only; fingerprint
 // admission remains PENDING, with no numerical/native qualification):
+// include/strix/route_receipt.hpp; include/strix/serve/token_memo.hpp;
+// src/serve/token_memo.cpp; include/strix/serve/bpe_tokenizer.hpp;
 // cmake/StrixStateCache.cmake; include/strix/prefix_state_cache.hpp;
 // src/prefix_state_cache.cpp; include/strix/session_state_cache.hpp;
 // src/session_state_cache.cpp; include/strix/rotary_descriptor.hpp;
@@ -9,9 +11,9 @@
 // src/prompt_terminal_diagnostics.cpp; include/strix/session/checkpoint_io.hpp;
 // src/session/checkpoint_io.cpp. The recursive session scope detects the last
 // two additions; extending the audit's other exact scopes is separate work.
-{"CMakeLists.txt", 0xc58bbad8dcfecdbdULL},
-{"apps/minimax_layercut.inc", 0x92d2fe37dc07e424ULL},
-{"apps/minimax_rank_main.cpp", 0x5d3d31ee83507652ULL},
+{"CMakeLists.txt", 0xcfdfcabff3d7574bULL},
+{"apps/minimax_layercut.inc", 0x75446613989ee5ebULL},
+{"apps/minimax_rank_main.cpp", 0x4753e1273f565d22ULL},
 {"apps/minimax_serve_main.cpp", 0x901f15e2f283f377ULL},
 {"cmake/StrixSession.cmake", 0x1fbbb6c55e80be02ULL},
 {"include/strix/bp_codec.hpp", 0x879520c3a673e0acULL},
@@ -19,13 +21,13 @@
 {"include/strix/hip_minimax_msa.hpp", 0x52145037fe615f8dULL},
 {"include/strix/lever.hpp", 0xe020f2925ab29ca5ULL},
 {"include/strix/minimax/asset_input.hpp", 0x3725e30a2f3f875eULL},
-{"include/strix/minimax/engine.hpp", 0x60d70dbd251a95c3ULL},
+{"include/strix/minimax/engine.hpp", 0x723a8c8b62f8f2a1ULL},
 {"include/strix/minimax/model_assets.hpp", 0xa790b5a573cb1c78ULL},
 {"include/strix/minimax/model_description.hpp", 0x43e5a5e20f99b59fULL},
 {"include/strix/minimax/prefill_types.hpp", 0xcafc0a642b0144a2ULL},
 {"include/strix/minimax/session_cache.hpp", 0x8981f1d4f94fd5f1ULL},
 {"include/strix/minimax/session_startup.hpp", 0x47364fdf8f566ae2ULL},
-{"include/strix/minimax_layercut.hpp", 0xf48039f9151fe9f1ULL},
+{"include/strix/minimax_layercut.hpp", 0x62abe794529d4e5eULL},
 {"include/strix/minimax_moe.hpp", 0x9be1e1331cfecd43ULL},
 {"include/strix/minimax_msa.hpp", 0xa0a6110622dc918bULL},
 {"include/strix/pinned_host.hpp", 0xba3ccbc4f64ff08aULL},
@@ -62,7 +64,7 @@
 {"src/cuda/models/minimax/mm_rtx_layercut.inc", 0x2c529dbc8b4a3405ULL},
 {"src/cuda/models/minimax/mm_rtx_pack.cpp", 0x78f70c6b89731637ULL},
 {"src/cuda/models/minimax/mm_rtx_pack.hpp", 0x59615297c683dc0cULL},
-{"src/cuda/models/minimax/mm_rtx_prefill_main.cu", 0xf04b3d6a569e0b4bULL},
+{"src/cuda/models/minimax/mm_rtx_prefill_main.cu", 0xae964d3cb95286c8ULL},
 {"src/cuda/models/minimax/mm_rtx_weights.cpp", 0xd9797684167a03cfULL},
 {"src/cuda/models/minimax/mm_rtx_weights.hpp", 0xd5fea8b712c2ab1aULL},
 {"src/cuda/models/minimax/ptxas.bat", 0x1bed18cc1bcf4a37ULL},
@@ -102,7 +104,7 @@
 {"src/minimax/engine/deployment.hpp", 0xa8eb8e035ac39158ULL},
 {"src/minimax/engine/draft_lin.hip", 0xcd2fdd10ff5d6745ULL},
 {"src/minimax/engine/draft_lin.hpp", 0x05d11d75108270edULL},
-{"src/minimax/engine/engine.hip", 0xbbf4ae3452d18f50ULL},
+{"src/minimax/engine/engine.hip", 0x6c43cdf2ae74a8e8ULL},
 {"src/minimax/engine/mm_common.hpp", 0x0e913051697aba7fULL},
 {"src/minimax/engine/mm_defaults.cpp", 0xfe06bf43cf6ca916ULL},
 {"src/minimax/engine/mm_defaults.hpp", 0xefeb8e77222a5aa6ULL},
@@ -119,9 +121,9 @@
 {"src/minimax/moe/mmx_moe.hip", 0xe43940e96d991005ULL},
 {"src/minimax/moe/mmx_moe.hpp", 0x05698ea07b619950ULL},
 {"src/minimax/moe/mmx_moe_traits.hpp", 0x8dc548751f4e9c34ULL},
-{"src/minimax/moe/mmx_prefill.hip", 0x9b5192bfa09db95dULL},
-{"src/minimax/moe/mmx_prefill.hpp", 0x1b737da8ad30103dULL},
-{"src/minimax/moe/mmx_prefill_core.hpp", 0x969e06b21a3e8979ULL},
+{"src/minimax/moe/mmx_prefill.hip", 0x0aed2a32372a23c6ULL},
+{"src/minimax/moe/mmx_prefill.hpp", 0x07dd7f09a2d65704ULL},
+{"src/minimax/moe/mmx_prefill_core.hpp", 0xde21cc79800243f4ULL},
 {"src/minimax/moe/mmx_prefill_iu4.inc", 0xdb25d34a9233aff9ULL},
 {"src/minimax/moe/mmx_trellis_device.hpp", 0x11cfbcfe7d145fe4ULL},
 {"src/minimax/pfx/pf_crc.cpp", 0xefbe65eb2a3ec54dULL},
@@ -153,7 +155,7 @@
 {"src/minimax/serve/paired_state.hpp", 0xa5891c9412ebeef8ULL},
 {"src/minimax/serve/serve_runner.cpp", 0xcbeb5e1cbe21e726ULL},
 {"src/minimax/serve/serve_runner.hpp", 0xde46bc4cac4041caULL},
-{"src/minimax/serve/serve_runtime.cpp", 0xcd6a529ea20284c3ULL},
+{"src/minimax/serve/serve_runtime.cpp", 0x7afc678b8f183313ULL},
 {"src/minimax/serve/serve_runtime.hpp", 0xde818f0193612460ULL},
 {"src/minimax/serve/session_engine.cpp", 0xc184480e740115daULL},
 {"src/minimax/serve/session_engine.hpp", 0xc22ac14b6f2ea4dbULL},
@@ -175,7 +177,7 @@
 {"src/moe_core/device_plan.hpp", 0xd11705be6d35d151ULL},
 {"src/moe_core/device_plan_index.hpp", 0x123ba19e0be85987ULL},
 {"src/moe_core/exl3_trellis.hpp", 0x609c2bb7f95699c4ULL},
-{"src/moe_core/grouped_core.hpp", 0x80e99be3df2f4e6dULL},
+{"src/moe_core/grouped_core.hpp", 0xb3b2397545ca754bULL},
 {"src/moe_core/grouped_f16.hpp", 0xd4c01c860bfe9c98ULL},
 {"src/moe_core/grouped_integer_decode.hpp", 0xe4193b966715f39cULL},
 {"src/moe_core/grouped_policy.hpp", 0xf13a686d282542d3ULL},

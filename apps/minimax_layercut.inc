@@ -10,9 +10,11 @@ struct CutPinned {
     ~CutPinned() { (void)hipHostFree(data); }
     CutPinned(const CutPinned&) = delete;
 };
-std::string cut_pair_identity() {
+// The pair part's identity. Production bits depend on the chunk boundaries (pair::layercut::identity_grain), so the
+// default identity names its chunk rows (the pair-alone --max-rows); FP32 is row-invariant (gate T1).
+std::string cut_pair_identity(std::uint32_t chunk_rows) {
     const char* p = strix::envcfg::text("STRIX_MM_PREFILL_IDENTITY");
-    std::string id = p && std::string_view(p) == "fp32" ? "fp32" : "default";
+    std::string id = p && std::string_view(p) == "fp32" ? "fp32" : "default/c" + std::to_string(chunk_rows);
     const auto policies = strix::minimax::defaults::prefill_identity([](const char* k) { return strix::envcfg::text(k); });
     if (!policies.empty()) id += ";" + policies;
     return id;
@@ -31,6 +33,7 @@ struct CutArguments {
     std::vector<std::string> listens;
     std::string relay;
     unsigned relay_port = 0;
+    std::uint32_t chunk_rows = mm::Options{}.max_rows;  // the pair-alone chunk (--max-rows)
 };
 CutArguments cut_arguments(int& argc, char** argv) {
     CutArguments args;
@@ -44,12 +47,15 @@ CutArguments cut_arguments(int& argc, char** argv) {
         if (flag == "--layercut-listen") args.listens.push_back(next());
         else if (flag == "--cut-relay") args.relay = next();
         else if (flag == "--cut-relay-listen") args.relay_port = lc::number(next(), "--cut-relay-listen");
+        else if (flag == "--max-rows") args.chunk_rows = lc::number(next(), "--max-rows");
     }
     lc::Inputs input{mlc::chain_shape()};
     if (!args.listens.empty()) {
         if (!cli.split) cli.split = "layer-cut";
         input.rows = read_u32(cut_fields(args.listens.front())[1]).size();
     }
+    input.pair_grain = lc::route_identity_grain(cli, cut_pair_identity(args.chunk_rows));
+    if (input.pair_grain == mlc::pair_chunk_rows) input.pair_unit_scale = mlc::pair_unit_scale();
     input.rtx_rows_s = strix::envcfg::number<double>("STRIX_SPLIT_RTX_ROWS_S", 0, 0);
     input.pair_rows_s = strix::envcfg::number<double>("STRIX_SPLIT_PAIR_ROWS_S", 0, 0);
     input.link_mbps = strix::envcfg::number<double>("STRIX_SPLIT_LINK_MBPS", 0, 0);
@@ -74,7 +80,7 @@ std::vector<std::uint32_t> layercut_session(mm::Engine& eng, strix::handoff::Lis
     std::unique_ptr<strix::handoff::Session> relay_session;
     std::unique_ptr<strix::handoff::Sender> relay_sender;
     const auto start = Clock::now();
-    const std::string id = mlc::identity(cfg.cut, cut_pair_identity());
+    const std::string id = mlc::identity(cfg.cut, cut_pair_identity(cfg.grain != 0 ? cfg.grain : mm::Options{}.max_rows));
     lc::Meta expected{0, cfg.cut, cfg.block, mlc::hidden, prompt.size(), lc::token_fnv(prompt), id};
     const auto check_hello = [&](const strix::handoff::Hello& h) {
         if (h.model != mlc::format || h.rank != eng.rank() || h.world != 2)
