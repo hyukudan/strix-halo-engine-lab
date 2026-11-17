@@ -19,6 +19,7 @@
 #include "strix/cuda_core/dense.hpp"
 #include "strix/device/cuda_enumerator.hpp"
 #include "strix/qwen35/cuda_engine.hpp"
+#include "strix/qwen35/prefill_controls.hpp"
 
 namespace q = strix::qwen35;
 
@@ -268,23 +269,14 @@ int main(int argc, char** argv) {
         opt.prefill_slots = pf_slots;
         opt.prefill_inflight = pf_inflight;
         opt.prefill_ramp = pf_ramp;
-        if (print_cfg) {
-            opt.multi_gemv = multi;
-            q::print_effective_config(opt, arith_name.c_str(), stdout);
-            return 0;
-        }
-        if (flash_pipe == "swz3") opt.flash_pipe = strix::cuda_core::FlashPipe::swz3;
-        else if (flash_pipe == "pad2") opt.flash_pipe = strix::cuda_core::FlashPipe::pad2;
-        else if (!flash_pipe.empty()) throw std::runtime_error("--flash-pipe expects pad2|swz3");
-        if (flash_tail == "off") opt.flash_tail = strix::cuda_core::FlashTail::off;
-        else if (flash_tail == "split") opt.flash_tail = strix::cuda_core::FlashTail::split;
-        else if (!flash_tail.empty()) throw std::runtime_error("--flash-tail expects split|off");
-        if (pf_attn8 == "on") opt.prefill_attn8 = true;
-        else if (pf_attn8 == "off") opt.prefill_attn8 = false;
-        else if (!pf_attn8.empty()) throw std::runtime_error("--prefill-attn8 expects on|off");
+        q::resolve_flash_controls(opt, flash_pipe, flash_tail, pf_attn8);
         opt.use_graphs = graphs;
         opt.multi_gemv = multi;
         opt.pdl = pdl;
+        if (print_cfg) {
+            q::print_effective_config(opt, arith_name.c_str(), stdout);
+            return 0;
+        }
         std::unique_ptr<q::CudaEngine> E;
         const std::uint64_t total_ctx = ctx_fill + (slots ? static_cast<std::uint64_t>(n_gen) * (ab_pairs + 1) * 2 : 0) + prompt.size() + prompt_len + static_cast<std::uint64_t>(n_gen) * decode_rows + 64;
         opt.max_positions = static_cast<std::uint32_t>(std::max<std::uint64_t>(max_pos, total_ctx));
