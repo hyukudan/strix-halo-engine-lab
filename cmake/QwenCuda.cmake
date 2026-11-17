@@ -152,6 +152,14 @@ target_compile_options(qwen_qsa_multi_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--
 add_executable(qwen_qsa_mma_test tests/cuda/qwen_qsa_mma_test.cu)
 target_link_libraries(qwen_qsa_mma_test PRIVATE strix_qwen_cuda)
 target_compile_options(qwen_qsa_mma_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+# QSA exact fused attention == three-kernel exact attention byte for byte + ABAB timing (device, no model):
+# qwen_qsa_fused_test <tables dir> [--no-timing]; its softmax-order / index invariants on the host (no GPU).
+add_executable(qwen_qsa_fused_test tests/cuda/qwen_qsa_fused_test.cu)
+target_link_libraries(qwen_qsa_fused_test PRIVATE strix_qwen_cuda)
+target_compile_options(qwen_qsa_fused_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+add_executable(qwen_qsa_fused_order_test tests/cuda/qwen_qsa_fused_order_test.cpp)
+target_include_directories(qwen_qsa_fused_order_test PRIVATE src/cuda/models/qwen)
+add_test(NAME qwen_qsa_fused_order COMMAND qwen_qsa_fused_order_test)
 # QSA index scores: shared-tree form == warp-shuffle form byte for byte (device, no model) + --bench timing
 add_executable(qwen_qsa_score_tree_test tests/cuda/qwen_qsa_score_tree_test.cu)
 target_link_libraries(qwen_qsa_score_tree_test PRIVATE strix_qwen_cuda)
