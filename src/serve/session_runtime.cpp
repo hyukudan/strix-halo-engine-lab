@@ -377,13 +377,17 @@ struct SessionRuntime::Impl {
             auto hit = cache->lookup(l.taken.job.prompt, hooks.identity);
             if (!hit) ++misses;
             else {
-                ++hits;
-                const bool restored = hooks.prompt_restart_cache ? store.restore_prompt(l.handle,hit->state) :
-                    (store.restore(l.handle,hit->state),true);
+                // Same accounting as the turn branch: a family that declines the
+                // prompt restart (lane untouched) is a miss, not a hit.
+                bool restored = false;
+                try {
+                    restored = hooks.prompt_restart_cache ? store.restore_prompt(l.handle,hit->state) :
+                        (store.restore(l.handle,hit->state),true);
+                } catch (...) { ++restore_failed; throw; }
                 if (restored) {
                     require(frontier(l) == session::Frontier{hit->state.consumed, {}}, "cache restore frontier mismatch");
-                    l.offset = hit->state.tokens.size(); l.stats.cached_tokens += l.offset;
-                }
+                    l.offset = hit->state.tokens.size(); l.stats.cached_tokens += l.offset; ++hits;
+                } else ++misses;
             }
         }
         if(hooks.ready) hooks.ready(l.view());
