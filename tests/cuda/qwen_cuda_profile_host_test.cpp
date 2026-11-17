@@ -408,16 +408,16 @@ void block_fit() {
     check(refuses({}, bad, qo::Entry::serve), "STRIX_QRTX_BLOCK_FIT accepts 0 or 1 only");
 }
 
-// Routed-MoE window rows (qwen_cuda_moe_real_rows): old padded form by default until qualified; requested/effective/reason;
+// Routed-MoE window rows (qwen_cuda_moe_real_rows): qualified real-row form by default; requested/effective/reason;
 // tiered and prefill keep the padded rows; no numerical identity change.
 void moe_window_rows() {
     namespace qp = strix::cuda::qwen_prefill;
-    check(!qp::moe_real_rows_lever.default_on && qp::moe_real_rows_lever.exactness == strix::lever::Exactness::bitwise,
-          "moe_real_rows: bitwise organization, default off (old padded form) until the timing receipt qualifies it");
+    check(qp::moe_real_rows_lever.default_on && qp::moe_real_rows_lever.exactness == strix::lever::Exactness::bitwise,
+          "moe_real_rows: bitwise organization, qualified default on; explicit off restores padded form");
     const Env on{{"STRIX_QRTX_MOE_REAL_ROWS", "1"}}, off{{"STRIX_QRTX_MOE_REAL_ROWS", "0"}}, bad{{"STRIX_QRTX_MOE_REAL_ROWS", "yes"}};
     for (const auto e : {qo::Entry::serve, qo::Entry::cli, qo::Entry::prefill_service}) {
         const auto d = one({}, e), y = one({}, e, on), n = one({}, e, off);
-        check(!d.config.moe_real_rows && d.moe_real_rows_origin == "default", "default: padded rows, origin default");
+        check(d.config.moe_real_rows && d.moe_real_rows_origin == "default", "default: real rows, origin default");
         check(y.config.moe_real_rows && y.moe_real_rows_origin == "explicit", "STRIX_QRTX_MOE_REAL_ROWS=1 requests real rows");
         check(!n.config.moe_real_rows && n.moe_real_rows_origin == "explicit", "STRIX_QRTX_MOE_REAL_ROWS=0 is explicit off");
         check(qo::numerical_identity(y.config).hash == qo::numerical_identity(d.config).hash &&
@@ -430,11 +430,11 @@ void moe_window_rows() {
         };
         const auto row = row_of(y);
         check(row.find("requested")->as_bool() && row.find("source")->as_string() == "explicit" &&
-                  !row.find("qualified_default")->as_bool() && row.find("lever")->as_string() == "qwen_cuda_moe_real_rows" &&
+                  row.find("qualified_default")->as_bool() && row.find("lever")->as_string() == "qwen_cuda_moe_real_rows" &&
                   row.find("tiered")->as_string().find("padded") != std::string::npos &&
                   row.find("restart")->as_string().find("separate processes") != std::string::npos,
               "effective config names requested/source/qualification/tiered fallback/restart semantics");
-        check(!row_of(d).find("requested")->as_bool(), "default effective config: not requested");
+        check(row_of(d).find("requested")->as_bool(), "default effective config: requested");
     }
     same_request("real rows requested", {}, on);
     check(refuses({}, bad, qo::Entry::serve), "STRIX_QRTX_MOE_REAL_ROWS accepts 0 or 1 only");

@@ -52,7 +52,7 @@ struct Config {
     // and run the routed experts on the window's real rows only; false = the padded 16-row block (the old form). Read once
     // when the engine is built (a change needs a new engine / process). Prefill blocks and tiered engines keep the padded
     // rows either way (moe_rows_policy below); the engine reports what it applied in moe_rows_receipt_json().
-    bool moe_real_rows = false;
+    bool moe_real_rows = true;
     int device = 0;
     bool ple_host_pinned = true;       // per_layer_token_embd (28.8 GB) in pinned host memory, gathered on the host
     // Release per layer: every block's KV/index rows of layer l, and in the last block each GDN layer's recurrent/conv
@@ -167,12 +167,11 @@ struct GraphCounters {
 // its real rows instead of the padded 16-row block, so the padding rows (token 0 over stale core rows, never read back) no
 // longer stream their experts' bytes nor raise the window-wide CSR failure word. Organizational: real-row bits unchanged
 // (native window gate T=2..16 + partial-accept rollback, bit-identical), so no new numerical identity. Every entry
-// (CLI = serve); only decode windows change; prefill blocks and tiered engines keep the padded rows. OFF by default until
-// the whole-workload timing receipt qualifies it; then default ON with STRIX_QRTX_MOE_REAL_ROWS=0 as the off switch.
+// (CLI = serve); only decode windows change; prefill blocks and tiered engines keep the padded rows. ON by default; STRIX_QRTX_MOE_REAL_ROWS=0 restores the padded form.
 // Read once when the engine is built: an A/B needs two processes.
 inline constexpr ::strix::lever::Decl moe_real_rows_lever{
     .name = "qwen_cuda_moe_real_rows", .env = "STRIX_QRTX_MOE_REAL_ROWS", .exactness = ::strix::lever::Exactness::bitwise,
-    .default_on = false, .source = "native window and rollback bitwise gate qualified; production default awaits whole-workload qualification"};
+    .default_on = true, .source = "native window/rollback and poisoned-padding gates; paired T9/T12 window timing with T8/T16 controls"};
 
 // Routed-MoE rows of a decode window: requested (Config::moe_real_rows) -> effective for this engine, with the reason.
 // One rule for the engine and the host tests. Organizational only: each row's routed chain does not depend on the other
@@ -183,7 +182,7 @@ struct MoeRowsPolicy {
     const char* reason = "";
 };
 [[nodiscard]] inline MoeRowsPolicy moe_rows_policy(bool requested, bool tiered) {
-    if (!requested) return {false, false, "padded: 9..15-row windows route all 16 block rows (default until qualified)"};
+    if (!requested) return {false, false, "padded: 9..15-row windows route all 16 block rows (explicit off)"};
     if (tiered) return {true, false, "padded: tiered expert residency keeps the 16-row block (slot publish/gather unchanged)"};
     return {true, true, "real rows: 9..15-row windows route their real rows; prefill blocks stay padded"};
 }

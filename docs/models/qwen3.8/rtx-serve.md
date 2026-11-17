@@ -131,3 +131,30 @@ the 128-register cap; `STRIX_QRTX_DENSE_T2_REMAP=0` restores the first loader). 
 2560 x 13312 2.570 -> 1.837, 6144 x 2560 1.227 -> 0.838, 2560 x 1280 0.282 -> 0.207, 640 x 2560 0.162 -> 0.131 ms
 (218 -> 303 TOPS on the largest site). Without any load the same kernel runs 1.529 ms and without the FP32 chain
 3.040 ms: the stage is bound by the weight loader, not by the chain.
+
+### Routed MoE rows in decode windows
+
+Fully resident CUDA Qwen MoE engines route and execute only the real rows of a
+9–15-row verification window, rather than also processing its padding to 16 rows.
+This organization is on by default for CLI and serving. Prefill blocks and tiered
+expert residency retain their existing padded execution. Dense models have no
+routed-expert work to eliminate.
+
+`STRIX_QRTX_MOE_REAL_ROWS=0` restores padded execution. The shared resolver reports
+`engine.moe_window_rows` in effective configuration; the loaded engine receipt adds
+requested/effective policy, fallback reason and window counts. A change requires a
+new engine/process. The numerical identity and real-row arithmetic are unchanged.
+
+Qualification includes bitwise native verification and partial-accept rollback for
+T=2–16, plus poisoned-padding operator checks. Paired old/new and reversed-order
+native window measurements on the qualified full-resident profile gave:
+
+| Window rows | Padded median (ms) | Real-row median (ms) |
+|---|---:|---:|
+| 8 (control) | 17.465 | 17.445 |
+| 9 | 49.815 | 45.105 |
+| 12 | 51.030 | 47.705 |
+| 16 (control) | 51.325 | 51.480 |
+
+These are window timings, not whole-model generation throughput or a claim about
+all request mixes. Tiered execution and numerical quality qualification are unchanged.
