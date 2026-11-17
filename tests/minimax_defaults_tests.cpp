@@ -1013,17 +1013,17 @@ void test_tp2_exchange_format() {
     const auto p0 = md::prefill_policy(lookup(off));
     check(p0.exchange_fmt == strix::xport::ExchangeFormat::f32 && p0.policies.empty(), "tp2 exchange: default f32, no policy");
     const EnvMap f32{{"STRIX_TP2_EXCHANGE_FMT", "f32"}};
-    check(md::prefill_identity(lookup(f32)).empty() && fp(f32) == fp(off), "tp2 exchange: explicit f32 keeps the legacy identity");
+    check(md::prefill_identity(lookup(f32)) == kOrderId && fp(f32) == fp(off), "tp2 exchange: explicit f32 keeps the legacy identity");
     const EnvMap f16{{"STRIX_TP2_EXCHANGE_FMT", "f16"}};
     const auto p = md::prefill_policy(lookup(f16));
     check(p.exchange_fmt == strix::xport::ExchangeFormat::f16 && p.policies == "tp2-xchg-f16-v0" && p.msa_flash == 0,
           "tp2 exchange: explicit f16 = named FAST policy");
-    check(md::prefill_identity(lookup(f16)) == "tp2_exchange_fmt=f16", "tp2 exchange: f16 enters the cache identity");
+    check(md::prefill_identity(lookup(f16)) == "tp2_exchange_fmt=f16;" + kOrderId, "tp2 exchange: f16 enters the cache identity");
     check(fp(f16) != fp(off), "tp2 exchange: f16 enters the rank-agreement fingerprint");
     const EnvMap stack{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_TP2_EXCHANGE_FMT", "f16"}};
     const auto ps = md::prefill_policy(lookup(stack));
     check(ps.policies == "msa-flash-bf16-l40-v1+tp2-xchg-f16-v0", "tp2 exchange: joins the bundle's policy list: " + ps.policies);
-    check(md::prefill_identity(lookup(stack)) == "prefill_msa=msa-flash-bf16-l40-v1;tp2_exchange_fmt=f16",
+    check(md::prefill_identity(lookup(stack)) == "prefill_msa=msa-flash-bf16-l40-v1;tp2_exchange_fmt=f16;prefill_router=mm-pf-router-wmma-v1-l40-59;" + kOrderId,
           "tp2 exchange: bundle identity keeps its MSA field: " + md::prefill_identity(lookup(stack)));
     for (const auto& bad : {EnvMap{{"STRIX_TP2_EXCHANGE_FMT", "f16"}, {"STRIX_MM_BASELINE", "1"}},
                             EnvMap{{"STRIX_TP2_EXCHANGE_FMT", "bf16"}}, EnvMap{{"STRIX_TP2_EXCHANGE_FMT", "F16"}}}) {
