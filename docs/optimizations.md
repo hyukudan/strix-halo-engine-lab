@@ -5268,3 +5268,12 @@ a route a lever does not admit. TILE64 (instead of the tier split), tier mode 2 
 fork, the union cap and the build-time DPP reductions replace or depend on other choices and are separate arms.
 `--print-effective-config` ends the prefill block with an `allon` object (mode, one entry per lever with its resolved value
 and class). Test plan and lever census: [all-on guide](models/qwen3.8/allon.md).
+
+### DeepSeek V4.1 group prefill under the FAST profile
+
+**Engine:** `deepseek`. **Control:** `STRIX_SERVE_PREFILL_GROUP=auto|0`. **Default:** auto, also under `STRIX_DS41_FAST_PREFILL=1` and each single FAST lever (`strix::ds41::kGroupFastQualified`; `false` restores "FAST groups only with an explicit auto", reason `pending-group-fast-identity`).
+
+Several short waiting prompts run as one device prefill pass under the FAST levers. Each member keeps its solo arithmetic: a shared route plan (`include/strix/prefill_dense_plan.hpp`, `include/strix/ds41_dense_plan.hpp`) gives every projection site's route (batch / exact dense / FAST dense) and K split from the member's own rows, split and cone; members group only with equal plans, and the pass pins the exact dense kernels where the members' route is exact (the FAST dense 128-row threshold never sees the summed rows). Flash attention runs on per-member BF16 mirrors. Still solo: the FP16 hipBLASLt backend (`fp16-solver-geometry-unpinned`) and diagnostic outputs (`diagnostic-output-not-segmented`).
+- **Off switch:** `STRIX_SERVE_PREFILL_GROUP=0`
+- **Exactness evidence:** pair runs, same eight prompts solo (one at a time) and grouped in one server: every member's logits and exported-state hashes equal its solo run on both ranks, under exact (solo hashes equal to the previous main), the FAST profile, FAST_DENSE, FAST_MOE, FAST_ATTN=2, and the FAST profile with `STRIX_DS41_FAST_DENSE_MIN_ROWS=64` (groups of 125 rows across the threshold).
+- **Measured gain:** FAST profile, eight requests x 256 tokens: whole run 99.9 -> 102.7 tok/s (+2.8 %), admission 1,428 -> 865 ms; four requests about +1 % (noisy).

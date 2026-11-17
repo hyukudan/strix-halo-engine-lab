@@ -32,7 +32,7 @@ struct LayerBlob {
     std::size_t wik = 0, q_w = 0, k_w = 0, iq_w = 0, ik_w = 0, w_post = 0, w_next = 0, router = 0, bias = 0;
     bool moe = false;
 };
-LayerBlob build_layer(Pack& pack, unsigned layer);
+LayerBlob build_layer(Pack& pack, unsigned layer, bool residual_only = false);
 
 // Kernel view of a blob placed at `base` (device).
 struct DevMat {

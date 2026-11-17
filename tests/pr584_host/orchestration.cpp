@@ -60,6 +60,10 @@ struct DevicePrefill {
         unsigned prefill_capacity = 4096;
         int stream = 7;
         bool fast_attn_at(unsigned) const { return options.fast_attention && !options.bf16_attention; }
+        struct SeqState { unsigned prefill_capacity = 0; Dev<std::uint16_t> ring16, kv16; };
+        std::vector<SeqState> group;  // group-pass members (their own flash mirrors)
+        int dense_rebuilds = 0;
+        void rebuild_dense_classes() { ++dense_rebuilds; }
 #include "methods.inc"
     };
     std::unique_ptr<Impl> impl_ = std::make_unique<Impl>();
@@ -105,6 +109,7 @@ void ring_test() {
         const Section sec_pe[]{{0}};
         const auto seq_ring = [&](unsigned) -> auto& { return m.prefill_ring; };
         const auto seq_capacity = [&](unsigned) { return m.prefill_capacity; };
+        const auto seq_ring16 = [&](unsigned) { return m.ring16.p; };
         const auto entries_of = [&](unsigned, Section, const std::uint64_t* pos, std::uint32_t* packed) {
             Entries fe;
             fe.ring = m.prefill_ring.p;
@@ -126,18 +131,35 @@ void ring_test() {
 }
 void precision_test() {
     DevicePrefill pre;
+    auto& m = *pre.impl_;
+    m.group.resize(2);
+    m.group[0].prefill_capacity = 512U;
+    m.group[1].prefill_capacity = 768U;
     PrefillOptions p;
     p.fast_attention = p.fast_attention_flash = true;
     pre.set_precision_for_new_sequence(p);
-    auto& m = *pre.impl_;
     require(m.ring16.p && m.kv16.p && m.flash_attn_at(0), "new flash arm did not prepare mirrors");
     require(m.ring16.n == std::size_t{m.prefill_capacity} * attn::kHeadDim, "ring allocation size");
     const auto rows = std::size_t{m.prefill_capacity} - m.options.window_rows - attn::kWindow;
     require(m.kv16.n == (rows / 2U + 1U) * attn::kHeadDim, "densest compressed allocation size");
     const int allocated = allocations;
+    std::vector<const std::uint16_t*> member_buffers;
+    for (const auto& member : m.group) {
+        require(member.ring16.p && member.kv16.p && member.ring16.p != m.ring16.p && member.kv16.p != m.kv16.p,
+                "member mirrors allocated independently of solo");
+        require(member.ring16.n == std::size_t{member.prefill_capacity} * attn::kHeadDim, "member ring capacity");
+        const auto member_rows = std::size_t{member.prefill_capacity} - m.options.window_rows - attn::kWindow;
+        require(member.kv16.n == (member_rows / 2U + 1U) * attn::kHeadDim, "member compressed capacity");
+        member_buffers.push_back(member.ring16.p);
+        member_buffers.push_back(member.kv16.p);
+    }
+    require(member_buffers[0] != member_buffers[2] && member_buffers[1] != member_buffers[3], "members own distinct mirrors");
     pre.set_precision_for_new_sequence(PrefillOptions{});
     pre.set_precision_for_new_sequence(p);
     require(allocations == allocated && m.flash_attn_at(0), "mirror reuse between arms");
+    for (std::size_t i = 0; i < m.group.size(); ++i)
+        require(m.group[i].ring16.p == member_buffers[2U * i] && m.group[i].kv16.p == member_buffers[2U * i + 1U],
+                "member mirror reuse between arms");
     PrefillOptions fast = p;
     fast.fast_dense = fast.fast_moe = true;
     pre.set_precision_for_new_sequence(fast);

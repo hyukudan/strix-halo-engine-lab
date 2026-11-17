@@ -22,6 +22,7 @@
 #include "strix/hip_ds41_expert_tp.hpp"
 #include "strix/ds41_moe.hpp"
 #include "strix/ds41_prefill.hpp"
+#include "strix/ds41_dense_plan.hpp"
 #include "strix/ds41_weight_overlay.hpp"
 #include "strix/hip_ds41_attention.hpp"
 #include "strix/hip_ds41_formats.hpp"
@@ -400,6 +401,11 @@ struct PrefillGroupPlan {
     std::vector<std::uint32_t> seg_row0, seg_rows;  // per member: its first concatenated row, its rows
     std::vector<std::uint64_t> pos;                 // per concatenated row: its position (its row in its member)
     bool split = false, joint = false;              // the members' class: row-split attention, joint MoE pass
+    // [layer][site] of this rank: the members' common dense route (strix/ds41_dense_plan.hpp; none: no member runs it).
+    // A site runs with it, never re-selected from the summed rows: dense_exact pins the exact kernels (the FAST form's
+    // 128-row threshold would otherwise take summed short members), dense_fast leaves the selector (every member is at
+    // or above the threshold, so is the sum), batch_exact keeps the batch kernel (q_b / o_a under dense_min_rows).
+    std::vector<prefill_plan::DenseRoute> dense;
 };
 
 struct DevicePrefill::Impl {
@@ -496,6 +502,65 @@ struct DevicePrefill::Impl {
         return ds41::enqueue_q8_0_a8_dense_prefill(v,st);
     }
 
+    // ---- the route plan of a fresh solo run (strix/ds41_dense_plan.hpp), shared by the group pass and the bounded replay ----
+    // The selectors as run_from applies them on a fresh solo run of `rows` rows: q_a / kv take the dense entry when
+    // dense_q_a / dense_kv (any rows), q_b / o_a from dense_min_rows rows (dense_q_b / dense_o_a), o_b always; inside it the
+    // FAST form (options.fast_dense, installed by run_from's execution precision scope for solo and group dispatch)
+    // from STRIX_DS41_FAST_DENSE_MIN_ROWS rows. fast_supported
+    // stays true: q8a8::supported does not depend on rows, so where a member's route is dense_fast the group's selector over
+    // the summed rows decides as the member's did; claiming support can only split a group, never pin a member away from its
+    // solo form. The FP16 backend (fp16_dense) is not planned: a group pass declines it.
+    prefill_plan::DensePlan dense_plan(std::uint32_t rows) const {
+        const auto& c = model.config;
+        const bool split = distributed() && options.row_split && rows >= split_min_rows;
+        const bool tp = distributed() && options.tp_attention && !split;
+        const std::uint32_t ranks = distributed() ? 2U : 1U, OL = c.o_groups * c.o_lora_rank;
+        std::vector<prefill_plan::DenseRule> rules(std::size_t{ranks} * ds41::kDenseSites);
+        for (std::uint32_t r = 0; r < ranks; ++r)
+            for (std::uint32_t site = 0; site < ds41::kDenseSites; ++site) {
+                auto& u = rules[std::size_t{r} * ds41::kDenseSites + site];
+                u.fast = options.fast_dense;
+                u.fast_min_rows = ds41::fast_profile::dense_min_rows();
+                switch (site) {
+                case ds41::kDenseQa: u.dense = dense_q_a, u.k = c.hidden_size; break;
+                case ds41::kDenseKv: u.dense = dense_kv, u.k = c.hidden_size; break;
+                case ds41::kDenseQb: u.dense = dense_q_b, u.dense_min_rows = dense_min_rows, u.k = c.q_lora_rank; break;
+                case ds41::kDenseOa: u.dense = dense_o_a, u.dense_min_rows = dense_min_rows, u.k = c.num_attention_heads * c.head_dim / c.o_groups; break;
+                default:  // o_b: h0 + h1 (TP: this rank's K-half, the halves summed by the exchange)
+                    u.k = OL / 2U, u.k_offset = tp ? r * (OL / 2U) : 0U, u.k_parts = tp ? 1U : 2U;
+                    break;
+                }
+            }
+        std::vector<ds41::DenseConeRows> cone;
+        if (options.cone && options.layers == c.num_hidden_layers) {  // run_from's cone of a fresh run (no snapshot points)
+            ds41::SuffixReplayGeometry g;
+            g.layers = c.num_hidden_layers;
+            g.draft_rows = options.draft_rows;
+            const std::uint32_t W = options.window_rows;
+            cone.resize(options.layers);
+            for (const auto& pl : ds41::plan_suffix_replay(g, 0U, rows).layers) {
+                if (pl.layer >= options.layers) continue;
+                cone[pl.layer] = {static_cast<std::uint32_t>(pl.kv_begin / W * W), static_cast<std::uint32_t>(pl.out_begin / W * W)};
+            }
+        }
+        ds41::DenseRunGeometry g;
+        g.rows = rows, g.window_rows = options.window_rows, g.chunk_rows = options.chunk_rows, g.world = ranks, g.split = split;
+        g.layers = options.layers, g.cone = cone;
+        return ds41::plan_dense(g, rules);
+    }
+    // route_class bits 8..15 per member rows 1..group_rows: the interned signature of dense_plan(rows); rebuilt when a
+    // selector changes (set_precision_for_new_sequence, set_dense_select)
+    std::vector<std::uint32_t> dense_class;
+    void rebuild_dense_classes() {
+        dense_class.assign(group.empty() ? 0U : std::size_t{options.group_rows} + 1U, DevicePrefill::kSoloRouteClass);
+        prefill_plan::DenseClassTable table;
+        for (std::uint32_t rows = 1; rows < dense_class.size(); ++rows) {
+            if (options.chunk_rows != 0U && rows > options.chunk_rows) continue;  // no complete plan: solo only
+            const auto id = table.intern(prefill_plan::signature(dense_plan(rows)));
+            if (id < 256U) dense_class[rows] = id << 8;
+        }
+    }
+
     // row_split MoE: PrefillMoe::enqueue_half_joint (one route build and expert pass over the peer's and this rank's
     // rows; opt-in, STRIX_DS41_PREFILL_JOINT=1. Default: two passes, peer rows first; P11: joint -4 % at 2K, 0 at 16K)
     bool moe_joint = false;
@@ -572,16 +637,27 @@ struct DevicePrefill::Impl {
         return true;
     }
     std::uint32_t prefill_capacity = 0;
-    void prepare_flash_mirrors() {
-        if (ring16.p != nullptr) return;
+    // the smallest non-zero compression ratio of the layers (0: none)
+    std::uint32_t min_ratio() const {
         std::uint32_t ratio = 0;
         for (const auto& role : roles) if (role.ratio != 0U && (ratio == 0U || role.ratio < ratio)) ratio = role.ratio;
-        const std::size_t rows = std::size_t{prefill_capacity} - options.window_rows - ds41::attn::kWindow;
-        Dev<std::uint16_t> ring(std::size_t{prefill_capacity} * ds41::attn::kHeadDim);
-        Dev<std::uint16_t> compressed_mirror(ratio != 0U ? (rows / ratio + 1U) * ds41::attn::kHeadDim : 0U);
-        ring.zero(stream);
-        ring16 = std::move(ring);
-        kv16 = std::move(compressed_mirror);
+        return ratio;
+    }
+    // the mirrors of the solo sequence and of every group member (a member's: its prefill_capacity ring slots, its
+    // group_rows / ratio + 1 compressed entries; one pair per member, reused by every layer as the solo pair is)
+    void prepare_flash_mirrors() {
+        const std::uint32_t ratio = min_ratio();
+        const auto make = [&](std::uint32_t capacity, Dev<std::uint16_t>& ring16_out, Dev<std::uint16_t>& kv16_out) {
+            if (ring16_out.p != nullptr) return;
+            const std::size_t rows = std::size_t{capacity} - options.window_rows - ds41::attn::kWindow;
+            Dev<std::uint16_t> ring(std::size_t{capacity} * ds41::attn::kHeadDim);
+            Dev<std::uint16_t> compressed_mirror(ratio != 0U ? (rows / ratio + 1U) * ds41::attn::kHeadDim : 0U);
+            ring.zero(stream);
+            ring16_out = std::move(ring);
+            kv16_out = std::move(compressed_mirror);
+        };
+        make(prefill_capacity, ring16, kv16);
+        for (auto& sq : group) make(sq.prefill_capacity, sq.ring16, sq.kv16);
     }
     // Group pass (run_group; PrefillOptions::group_members > 0): one sequence state per member beside the full-size one
     // above (attn / prefill_ring / rows_done / local_rows_done / last_row_local are the solo sequence's), sized for
@@ -590,6 +666,7 @@ struct DevicePrefill::Impl {
     struct SeqState {
         std::vector<LayerState> attn;
         Dev<std::uint8_t> prefill_ring;
+        Dev<std::uint16_t> ring16, kv16;  // ds41-attn-bf16flash-v1: the member's BF16 mirrors (prepare_flash_mirrors)
         std::uint32_t prefill_capacity = 0;
         std::uint32_t rows_done = 0, local_rows_done = 0;
         bool last_row_local = true;
@@ -1207,7 +1284,9 @@ DevicePrefill::DevicePrefill(const std::filesystem::path& gguf, const PrefillOpt
                 m.gseed_local[j] = Dev<float>(N * options.draft_rows * hc * H);
                 m.gseed_peer[j] = Dev<float>(N * options.draft_rows * hc * H);
             }
+        if (m.options.fast_attention && m.options.fast_attention_flash) m.prepare_flash_mirrors();  // the members' BF16 mirrors
     }
+    m.rebuild_dense_classes();
     check(hipStreamSynchronize(m.stream), "setup");
     if (options.warmup_rows != 0U) {  // one run of a dummy prompt (first launches, scratch first touch); the next run starts fresh
         const std::uint32_t n = std::min<std::uint32_t>(options.warmup_rows, options.max_rows != 0U ? options.max_rows : options.max_positions);
@@ -1562,6 +1641,7 @@ void DevicePrefill::set_dense_select(bool on) {
     m.dense_q_b = on || m.env_dense_q_b;
     m.dense_o_a = on || m.env_dense_o_a;
     m.broken = true;
+    m.rebuild_dense_classes();  // the routes of q_b / o_a changed
 }
 
 void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions& p) {
@@ -1586,6 +1666,7 @@ void DevicePrefill::set_precision_for_new_sequence(const PrefillOptions& p) {
     o.fast_engram = p.fast_engram;
     // no process-wide switch: run_from installs these options as the precision of its own execution (another
     // DevicePrefill of the process keeps its own; strix/ds41_prefill_precision.hpp)
+    impl_->rebuild_dense_classes();             // the FAST dense routes of this owner changed
 }
 
 PrefillResult DevicePrefill::run(std::span<const std::uint32_t> tokens) {
@@ -2057,6 +2138,18 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
     const auto seq_attn = [&](std::uint32_t sg) -> std::vector<Impl::LayerState>& { return grp != nullptr ? m.group[sg].attn : m.attn; };
     const auto seq_ring = [&](std::uint32_t sg) -> Dev<std::uint8_t>& { return grp != nullptr ? m.group[sg].prefill_ring : m.prefill_ring; };
     const auto seq_capacity = [&](std::uint32_t sg) { return grp != nullptr ? m.group[sg].prefill_capacity : m.prefill_capacity; };
+    // BF16 mirrors of member sg's ring / compressed entries (ds41-attn-bf16flash-v1; solo: the full-size ones)
+    const auto seq_ring16 = [&](std::uint32_t sg) -> std::uint16_t* { return grp != nullptr ? m.group[sg].ring16.p : m.ring16.p; };
+    const auto seq_kv16 = [&](std::uint32_t sg) -> std::uint16_t* { return grp != nullptr ? m.group[sg].kv16.p : m.kv16.p; };
+    // group pass: this rank's dense route of (layer, site) (PrefillGroupPlan::dense); solo: none (the selectors decide)
+    const auto grp_route = [&](std::uint32_t layer, std::uint32_t site) {
+        return grp != nullptr ? grp->dense.at(std::size_t{layer} * ds41::kDenseSites + site) : prefill_plan::DenseRoute::none;
+    };
+    const auto pin_exact = [&](std::uint32_t layer, std::uint32_t site) { return grp_route(layer, site) == prefill_plan::DenseRoute::dense_exact; };
+    const auto grp_dense = [&](std::uint32_t layer, std::uint32_t site) {
+        const auto r = grp_route(layer, site);
+        return r == prefill_plan::DenseRoute::dense_exact || r == prefill_plan::DenseRoute::dense_fast;
+    };
     m.candidates.zero(st);
 
     // Engram rows of every token (hash of the whole prompt): inline with overlap
@@ -2559,6 +2652,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                 v.x_stride = H;
                 v.out = s.op == Op::q_a ? m.qr.p + std::size_t{r0} * QA : m.kv.p + std::size_t{r0} * D;
                 v.out_stride = v.count;
+                v.exact = pin_exact(layer, s.op == Op::q_a ? ds41::kDenseQa : ds41::kDenseKv);
                 m.dense(v, m.x.p + std::size_t{r0} * H, st, fp16);
                 break;
             }
@@ -2644,7 +2738,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     v.ring = seq_ring(sg).p;
                     attn::hip::enqueue_window_write(v, st);
                     if (m.flash_attn_at(layer))   // the entries just written, as BF16
-                        attn::hip::enqueue_attention_flash_mirror({v.ring, m.ring16.p, v.pos, n, v.capacity, true}, st);
+                        attn::hip::enqueue_attention_flash_mirror({v.ring, seq_ring16(sg), v.pos, n, v.capacity, true}, st);
                 };
                 const auto compress = [&](Impl::LayerState& L, const float* ckv, const float* cscore, std::uint32_t w0, std::uint32_t n) {
                     attn::hip::CompressView v{};
@@ -2682,7 +2776,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         v.out = m.q.p;
                         v.out_stride = QL;
                         m.fast(&v, 1U, n, m.qr16.p + std::size_t{r0} * QA, QA, nullptr, st);
-                    } else if (fp16_q_b || (m.dense_q_b && grp == nullptr && n >= m.dense_min_rows)) {  // a group pass: never (its class has no dense rows)
+                    } else if (fp16_q_b || (m.dense_q_b && (grp != nullptr ? grp_dense(layer, ds41::kDenseQb) : n >= m.dense_min_rows))) {  // a group pass: the members' route
                         ds41::Q8A8DensePrefillView v;
                         v.weight = q8_rows(m.dev(p + "attn_q_b.weight"), std::size_t{head0} * c.head_dim, QA);
                         v.width = QA;
@@ -2693,10 +2787,11 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         v.x_stride = QA;
                         v.out = m.q.p;
                         v.out_stride = QL;
+                        v.exact = pin_exact(layer, ds41::kDenseQb);
                         // flash layers: q's BF16 image after RoPE into m.q's own memory (u16, QL per row; nothing else
                         // reads m.q there), row i with the RoPE row of chunk row r0 + i (the attention's rope + w0)
                         const attn::RopeRow* qrope = (r.rope == attn::RopeKind::window ? m.lrope_window.p : m.lrope_comp.p) + r0;
-                        if (!fp16_q_b && q16_layer && ds41::enqueue_q_b_rope_image(v, reinterpret_cast<std::uint16_t*>(m.q.p), qrope, st))
+                        if (!v.exact && !fp16_q_b && q16_layer && ds41::enqueue_q_b_rope_image(v, reinterpret_cast<std::uint16_t*>(m.q.p), qrope, st))
                             q16_chunk = true;
                         else
                             m.dense(v, m.qr.p + std::size_t{r0} * QA, st, fp16_q_b);
@@ -2825,7 +2920,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                             // Publish received keys before chunk_ready on both exchange paths.
                             if (fe.ring_rows && m.flash_attn_at(layer))
                                 attn::hip::enqueue_attention_flash_mirror(
-                                    {seq_ring(sg).p, m.ring16.p, fe.ring_pos, fe.ring_rows, seq_capacity(sg), true}, st);
+                                    {seq_ring(sg).p, seq_ring16(sg), fe.ring_pos, fe.ring_rows, seq_capacity(sg), true}, st);
                         }
                     }
                     for (std::uint32_t sg = 0; sg < nseg; ++sg) {
@@ -2874,9 +2969,14 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                     if (w.row0 >= R0.k0) ring_write(w.seg, (mine ? m.kv.p : m.peer_kv.p) + at, w.row0, w.rows, rope_rows + w.row0);
                     if (r.owns_kv) compress(Lof(w.seg), (mine ? m.ckv.p : m.peer_ckv.p) + at, (mine ? m.cscore.p : m.peer_cscore.p) + at, w.row0, w.rows);
                 }
-                if (m.flash_attn_at(layer) && r.ratio != 0U) {   // the layer's compressed entries so far, as BF16
-                    const std::uint32_t entries = T / m.roles[static_cast<std::size_t>(r.kv_source)].ratio;
-                    attn::hip::enqueue_attention_flash_mirror({m.attn[static_cast<std::size_t>(r.kv_source)].kv_cache.p, m.kv16.p, nullptr, entries, 0U, false}, st);
+                if (m.flash_attn_at(layer) && r.ratio != 0U) {   // the layer's compressed entries so far, as BF16 (per member: its own cache)
+                    const std::uint32_t src_ratio = m.roles[static_cast<std::size_t>(r.kv_source)].ratio;
+                    for (std::uint32_t sg = 0; sg < nseg; ++sg) {
+                        const std::uint32_t entries = (grp != nullptr ? grp->seg_rows[sg] : T) / src_ratio;  // never T for a member's cache
+                        if (entries != 0U)
+                            attn::hip::enqueue_attention_flash_mirror({seq_attn(sg)[static_cast<std::size_t>(r.kv_source)].kv_cache.p, seq_kv16(sg), nullptr,
+                                                                       entries, 0U, false}, st);
+                    }
                 }
                 mark_part(1);
                 if (defer && layer >= first_decoder) return;  // deferred: the compressed entries are in; no rows, no ring save
@@ -3007,8 +3107,10 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         if(m.bf16_at(layer)) attn::hip::enqueue_attention_bf16_prefill(v,ls);
                         else if (m.flash_attn_at(layer)) {
                             if (heads % 32U != 0U) throw std::invalid_argument("ds41-attn-bf16flash-v1: requires a multiple of 32 heads");
-                            v.ring16 = m.ring16.p;
-                            v.kv16 = m.kv16.p;
+                            v.ring16 = seq_ring16(win.seg);
+                            v.kv16 = seq_kv16(win.seg);
+                            if (v.ring16 == nullptr || (r.ratio != 0U && v.kv16 == nullptr))
+                                throw std::logic_error("ds41-attn-bf16flash-v1: missing mirror of the window's sequence");
                             if (q16_chunk) v.q16 = reinterpret_cast<const std::uint16_t*>(m.q.p) + std::size_t{w0 - r0} * QL;
                             attn::hip::enqueue_attention_flash_prefill(v, ls);
                             if (!flash_reported) {
@@ -3058,13 +3160,14 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                                 d.out=m.o_low.p+g*c.o_lora_rank;d.out_stride=OLL;
                                 m.dense(d,m.o.p+g*v.width,st,true);
                             }
-                        } else if (m.dense_o_a && grp == nullptr && n >= m.dense_min_rows) {
+                        } else if (m.dense_o_a && (grp != nullptr ? grp_dense(layer, ds41::kDenseOa) : n >= m.dense_min_rows)) {
                             // one dense call per o-group (the same group products as the grouped batch kernel)
                             o_low_quantized = o_low_a8;
                             for (unsigned g = 0; g < groups; ++g) {
                                 ds41::Q8A8DensePrefillView d;
                                 d.weight = q8_rows(v.weight, std::size_t{g} * c.o_lora_rank, v.width);
                                 d.width = v.width;
+                                d.exact = pin_exact(layer, ds41::kDenseOa);
                                 d.count = c.o_lora_rank;
                                 d.rows = n;
                                 d.x_stride = QL;
@@ -3097,6 +3200,7 @@ PrefillResult DevicePrefill::run_from(std::span<const std::uint32_t> tokens, std
                         v.x_stride = OLL;
                         v.out = m.y.p + std::size_t{r0} * H;
                         v.out_stride = H;
+                        v.exact = pin_exact(layer, ds41::kDenseOb);
                         if (tp) {
                             // this rank's K-half, exchanged; y = h0 + h1
                             v.k_offset = m.options.rank * (OL / 2U);
@@ -3952,18 +4056,23 @@ std::uint32_t DevicePrefill::route_class(std::uint32_t rows) const noexcept {
     // Every row-count threshold of a fresh solo run of `rows` rows that can change its bits, evaluated on its own rows:
     //   bit 0: the row-split attention (world 2, rows >= split_min_rows; below: the tensor-parallel form)
     //   bit 1: the joint MoE pass of the row split (rows <= joint_max_rows, or STRIX_DS41_PREFILL_JOINT=1)
-    //   bit 2: calls of at least dense_min_rows rows (q_b / o_a on the dense kernels; a group pass refuses this class)
-    // Not encoded (the kernels are documented bitwise equal whichever runs: "same bits"): f16 rows lanes / tiled / wide,
-    // the dense q_a / kv selector's tall forms, MoE sparse vs dense experts (every entry is the declared product), the hc
-    // site's tile, the cone, the Engram read pieces. The non-exact paths (fp16 / bf16 / fast attention / fast MoE) switch on
-    // rows too (fp16_min_rows); a group pass refuses them.
+    //   bits 8..15: the dense route class: every projection site's route (batch / exact dense / FAST dense) and K split on
+    //     each rank and layer, from the member's own rows, split and cone (Impl::dense_plan; it replaces PR #591's bit 2,
+    //     which refused q_b / o_a dense rows, and covers the FAST dense form's 128-row threshold)
+    //   kSoloRouteClass: rows outside 1..group_rows or more than 256 distinct plans (group_capacity rejects the bit)
+    // Not encoded (bitwise equal whichever runs: "same bits"): f16 rows lanes / tiled / wide, the dense selector's tall /
+    // CTA / wave forms (each output row is its own K chain), MoE sparse vs dense experts and the relaxed MoE's batch
+    // packing (every entry is the declared product of its row), the hc site's tile, the Engram read pieces; attention
+    // (exact, BF16, f16wmma, flash) runs per window on the member's own view, with no row-count switch.
     std::uint32_t k = 0;
     const bool split = m.distributed() && m.options.row_split && rows >= m.split_min_rows;
     if (split) k |= 1U;
     if (split && (m.moe_joint || rows <= m.joint_max_rows)) k |= 2U;
-    if (rows >= m.dense_min_rows) k |= 4U;
+    k |= rows != 0U && rows < m.dense_class.size() ? m.dense_class[rows] : kSoloRouteClass;
     return k;
 }
+
+prefill_plan::DensePlan DevicePrefill::dense_plan(std::uint32_t rows) const { return impl_->dense_plan(rows); }
 
 std::uint32_t DevicePrefill::group_members() const noexcept { return static_cast<std::uint32_t>(impl_->group.size()); }
 std::uint32_t DevicePrefill::group_rows() const noexcept { return impl_->group.empty() ? 0U : impl_->options.group_rows; }
@@ -3972,16 +4081,18 @@ serve::PrefillGroupCapacity DevicePrefill::group_capacity() const noexcept {
     const auto& m = *impl_;
     const auto& o = m.options;
     serve::PrefillGroupCapacity cap;
-    cap.members = group_options_supported(o) ? m.group.size() : 0U;
+    const char* declined = group_decline_reason(o);
+    cap.members = declined == nullptr ? m.group.size() : 0U;
     cap.rows = std::min(o.chunk_rows, o.max_rows != 0U ? o.max_rows : o.max_positions);
     cap.member_rows = group_rows();
     cap.window_rows = o.window_rows;
     if (m.cand_window_bytes != 0U) cap.windows = m.candidates.n / m.cand_window_bytes;
     cap.local_rows = m.streams[0].n / (std::size_t{m.model.config.hc_mult} * m.model.config.hidden_size);
     cap.split_class_mask = 1U;
-    cap.rejected_class_mask = 4U;
-    cap.reason = !group_options_supported(o) ? "unsupported-options" :
-                 cap.members < 2U ? "no-group-storage" : "eligible-routes-only; dense-kernel-rows-solo";
+    cap.rejected_class_mask = kSoloRouteClass;  // the dense route class of every member is represented (bit 2 of #591 retired)
+    cap.fast = o.fast_dense || o.fast_moe || o.fast_attention || o.bf16_attention;
+    cap.reason = declined != nullptr ? declined :
+                 cap.members < 2U ? "no-group-storage" : "eligible-routes-only; member-dense-dispatch-mismatch-solo";
     return cap;
 }
 
@@ -4009,6 +4120,15 @@ std::uint64_t DevicePrefill::group_state_bytes(const PrefillOptions& o) {
     per_member += std::uint64_t{o.draft_rows} * 3U * 4U * 8192U * 4U * 3U;
     // head scratch per member: the last row, its quantisation, the logits blocks (both vocabulary slices), candidates
     per_member += 8192U * 4U * 2U + 8192U + 8192U / 32U * 8U + 2U * 65536U * 4U * 2U + 1024U;
+    // ds41-attn-bf16flash-v1: the member's BF16 mirrors (prepare_flash_mirrors): the window ring and the compressed entries
+    const bool flash = o.fast_attention_flash || ds41::fast_profile::attention_flash();
+    if (flash) {
+        std::uint32_t rmin = 0;
+        for (std::uint32_t l = 0; l < o.layers; ++l) if (roles[l].ratio != 0U && (rmin == 0U || roles[l].ratio < rmin)) rmin = roles[l].ratio;
+        per_member += 2ULL * attn::kHeadDim * ((pg + o.window_rows + attn::kWindow) + (rmin != 0U ? pg / rmin + 1U : 0U)) + 2U * 256U;
+    }
+    if (per_member != 0U && o.group_members > std::numeric_limits<std::uint64_t>::max() / per_member)
+        throw std::overflow_error("deepseek41 prefill: group_state_bytes overflows");
     return per_member * o.group_members;
 }
 
@@ -4020,7 +4140,10 @@ std::vector<PrefillResult> DevicePrefill::run_group(std::span<const PrefillSegme
     if (n < 2U || n > m.group.size()) throw std::invalid_argument("deepseek41 prefill: run_group takes 2..group_members sequences");
     const auto& o = m.options;
     if (!group_options_supported(o))
-        throw std::logic_error("deepseek41 prefill: run_group supports the exact path only (no fp16 / bf16 / fast / trace / stream hashes / routing loads / quality head)");
+        throw std::logic_error(std::string("deepseek41 prefill: run_group declined: ") + group_decline_reason(o));
+    if (m.options.fast_attention && m.options.fast_attention_flash)
+        for (std::uint32_t i = 0; i < n; ++i)
+            if (m.group[i].ring16.p == nullptr) throw std::logic_error("deepseek41 prefill: run_group: flash-member-mirror-missing");
     if (!m.embed_next.empty()) throw std::invalid_argument("deepseek41 prefill: run_group refuses an embedding splice");
     if (!m.snap_next.empty()) throw std::invalid_argument("deepseek41 prefill: run_group refuses snapshot points");
     const std::uint32_t max_rows = o.max_rows != 0U ? o.max_rows : o.max_positions;
@@ -4028,11 +4151,15 @@ std::vector<PrefillResult> DevicePrefill::run_group(std::span<const PrefillSegme
     std::vector<std::uint32_t> tokens;
     std::uint32_t windows = 0, total = 0;
     const std::uint32_t cls = route_class(static_cast<std::uint32_t>(segments[0].tokens.size()));
-    if ((cls & 4U) != 0U) throw std::invalid_argument("deepseek41 prefill: run_group: the members have dense-kernel rows (too long for a group)");
+    if ((cls & kSoloRouteClass) != 0U) throw std::invalid_argument("deepseek41 prefill: run_group: member-dense-route-class-unrepresented");
+    std::vector<prefill_plan::DensePlan> member_plans;
+    member_plans.reserve(n);
     for (const auto& seg : segments) {
         const auto rows = static_cast<std::uint32_t>(seg.tokens.size());
         if (rows == 0U || rows > o.group_rows) throw std::invalid_argument("deepseek41 prefill: a group member has 0 rows or more than group_rows");
-        if (route_class(rows) != cls) throw std::invalid_argument("deepseek41 prefill: the group members have different route classes");
+        if ((route_class(rows) & 0xFFU) != (cls & 0xFFU)) throw std::invalid_argument("deepseek41 prefill: the group members have different route classes");
+        if (route_class(rows) != cls) throw std::invalid_argument("deepseek41 prefill: run_group: member-dense-dispatch-mismatch");
+        member_plans.push_back(m.dense_plan(rows));
         plan.seg_row0.push_back(total);
         plan.seg_rows.push_back(rows);
         for (std::uint32_t i = 0; i < rows; ++i) plan.pos.push_back(i);
@@ -4046,6 +4173,31 @@ std::vector<PrefillResult> DevicePrefill::run_group(std::span<const PrefillSegme
         throw std::invalid_argument("deepseek41 prefill: the group's windows exceed the candidate slots");
     plan.split = (cls & 1U) != 0U;
     plan.joint = (cls & 2U) != 0U;
+    {   // the members' common route of every site of this rank (equal classes: no two members that run a site differ)
+        std::vector<const prefill_plan::DensePlan*> ptr;
+        for (const auto& mp : member_plans) ptr.push_back(&mp);
+        plan.dense.resize(std::size_t{o.layers} * ds41::kDenseSites);
+        bool mismatch = false;
+        for (std::uint32_t l = 0; l < o.layers; ++l)
+            for (std::uint32_t site = 0; site < ds41::kDenseSites; ++site)
+                plan.dense[std::size_t{l} * ds41::kDenseSites + site] = prefill_plan::common_route(ptr, o.rank, l, site, mismatch);
+        if (mismatch) throw std::logic_error("deepseek41 prefill: run_group: member-dense-dispatch-mismatch (equal classes, different routes)");
+    }
+    if (m.distributed()) {  // both ranks: the same contract, members and canonical plans before the first layer collective
+        std::uint32_t rows_fnv = 2166136261U;
+        for (const auto r : plan.seg_rows) rows_fnv = (rows_fnv ^ r) * 16777619U;
+        const auto dense_fingerprint = prefill_plan::fingerprint(member_plans);
+        const std::array<std::uint32_t, 10> mine{ds41::kGroupContractVersion, n, cls & 0xFFU, rows_fnv, m.options.fast_dense ? 1U : 0U,
+                                                m.options.fast_moe ? 1U : 0U,
+                                                m.options.fast_attention ? (m.options.fast_attention_flash ? 2U : 1U) : 0U,
+                                                m.options.bf16_attention ? 1U : 0U,
+                                                static_cast<std::uint32_t>(dense_fingerprint),
+                                                static_cast<std::uint32_t>(dense_fingerprint >> 32)};
+        std::array<std::uint32_t, 10> other{};
+        m.options.communicator->exchange_host(std::as_bytes(std::span(mine)), std::as_writable_bytes(std::span(other)),
+                                              dist::Tag{static_cast<std::uint32_t>(dist::TagKind::control), 0x67727031U, n});
+        if (other != mine) throw std::runtime_error("deepseek41 prefill: run_group: the ranks disagree on the group contract / members / dense plans");
+    }
     m.defer_next = 0;  // exact levers off in a group pass: decoder deferral, Engram lookahead (snapshot points refused above)
     m.engram_next.clear();
     m.group_results.clear();

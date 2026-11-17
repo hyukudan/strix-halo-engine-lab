@@ -1209,7 +1209,8 @@ static int run_decode_entry(
     // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
     // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
     // GPU of a node keeps working (declared=implicit). A retry re-enters here with the flags already removed.
-    strix::device::bind_hip_main(argc, argv);
+    // Eager code loading is resolved below by this engine's own policy (--no-eager-code-load, baseline, defaults off).
+    strix::device::bind_hip_main(argc, argv, stderr, strix::device::CodeLoad::engine);
     // Host wait policy of this engine (shared home: strix/device/hip_gate.hpp; STRIX_HOST_WAIT overrides): blocking.
     // The runtime's own schedule busy-waits (one host core at 100 % for the whole prefill) for no measured speed.
     try {
@@ -1403,21 +1404,9 @@ static int run_decode_entry(
     // Inspection predicts this policy without changing the process environment.
     // A value set here is already too late for this image, so restart it once with the value in its
     // environment; the restarted image finds the value set and continues without restarting again.
-    if (!options.print_effective_config && !options.print_cache_family &&
-        strix::decode_cli::apply_eager_code_loading(options.eager_code_load && !options.baseline &&
-            !(std::getenv("STRIX_QPF2K_DEFAULTS") && std::getenv("STRIX_QPF2K_DEFAULTS")[0] == '0'),
-            [](const char* name) { return std::getenv(name); },
-            [](const char* name, const char* value) { return ::setenv(name, value, 0) == 0; })) {
-        std::fflush(nullptr);
-        std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
-        const auto original = strix::decode_cli::split_process_arguments(
-            std::string((std::istreambuf_iterator<char>(cmdline)), std::istreambuf_iterator<char>()));
-        std::vector<char*> restart;
-        for (const auto& argument : original) restart.push_back(const_cast<char*>(argument.c_str()));
-        restart.push_back(nullptr);
-        ::execv("/proc/self/exe", original.empty() ? argv : restart.data());
-        std::fprintf(stderr, "eager code loading: restart failed (%s); continuing with deferred loading\n",
-            std::strerror(errno));
+    if (!options.print_effective_config && !options.print_cache_family) {
+        strix::device::restart_with_eager_code_loading(options.eager_code_load && !options.baseline &&
+            strix::envcfg::flag("STRIX_QPF2K_DEFAULTS", true, strix::EnvFlagMatch::first_character), argv);
     }
     if (allon_active)
         std::fprintf(stderr, "qwen allon long-prompt gate: rows=%zu, off: %s\n",
