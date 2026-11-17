@@ -36,7 +36,9 @@ enum class TurboWeights : std::uint8_t { off, native, onfly, converted };
 // fast: flash + activation split of ONE bf16 term (mma1; nvfp4 weights are unchanged: their activation is f16 already).
 // fast2: flash + two bf16 terms (mma2).
 // fast8: fast + nvfp4 weights on the e4m3 x e4m3 mma (activation per-row e4m3, weight e2m1*e4m3 rounded to e4m3): TURBO/FAST, quality-gated.
-enum class PrefillArith : std::uint8_t { exact, flash, fast, fast2, fast8 };
+// fast4: fast + nvfp4 weights on the block-scaled e2m1 x e2m1 mma (activation per-row NVFP4: row scale, e4m3 per 16, e2m1), gate and
+//        up fused (strix/cuda/core/nvfp4_tile.hpp, nvfp4-tile-mma-f32-v1): W4A4 FAST, quality-gated, opt-in only.
+enum class PrefillArith : std::uint8_t { exact, flash, fast, fast2, fast8, fast4 };
 [[nodiscard]] const char* prefill_arith_name(PrefillArith a);
 
 struct EngineOptions {
@@ -83,7 +85,7 @@ struct EngineOptions {
 // Named identity of the arithmetic + weight source; also the prefix-cache key (caches never mix identities).
 [[nodiscard]] inline std::string engine_identity(const EngineOptions& o) {
     static const char* names[] = {"fp32", "mma3", "mma2", "mma1"};
-    static const char* pf_names[] = {"exact", "flash", "fast", "fast2", "fast8"};
+    static const char* pf_names[] = {"exact", "flash", "fast", "fast2", "fast8", "fast4"};
     const std::string a = names[static_cast<unsigned>(o.dense_arithmetic)];
     // a non-exact prefill policy is a different arithmetic identity (prefix caches never mix them)
     const std::string pf = o.prefill_arith == PrefillArith::exact

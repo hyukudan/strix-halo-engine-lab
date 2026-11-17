@@ -19,7 +19,9 @@ namespace strix::cuda_core::operand_cache {
 // off: never. auto: only the operand classes whose per-call expansion was measured as a cost (FAST8 e4m3), under the budget.
 // on: every expandable class (also exact f16 / q8 bf16, 2 bytes per element), under the same budget.
 enum class Mode : std::uint8_t { off, automatic, on };
-enum class Kind : std::uint8_t { e4m3, f16, q8_bf16 };
+// e2m1_tile: FAST4 NVFP4 weight in the W tile staging layout of strix/cuda/core/nvfp4_tile.hpp (a byte permutation of the decode
+// records, 0.5625 B per element); same per-call traffic argument as e4m3 (the whole weight re-staged per chunk).
+enum class Kind : std::uint8_t { e4m3, f16, q8_bf16, e2m1_tile };
 
 [[nodiscard]] inline const char* mode_name(Mode m) {
     return m == Mode::off ? "off" : m == Mode::on ? "on" : "auto";
@@ -35,7 +37,7 @@ enum class Kind : std::uint8_t { e4m3, f16, q8_bf16 };
     return true;
 }
 [[nodiscard]] inline bool admits(Mode m, Kind k) {
-    return m == Mode::on || (m == Mode::automatic && k == Kind::e4m3);
+    return m == Mode::on || (m == Mode::automatic && (k == Kind::e4m3 || k == Kind::e2m1_tile));
 }
 
 constexpr std::uint64_t kAlign = 256;
@@ -51,6 +53,7 @@ constexpr std::uint64_t kNone = ~0ULL;
     const std::uint64_t e = static_cast<std::uint64_t>(out) * in;
     if (k == Kind::e4m3) return e;
     if (k == Kind::f16) return e * 2;
+    if (k == Kind::e2m1_tile) return e / 16 * 9;  // == nvfp4::tile::w_tile_bytes (out % 16 == 0, in % 128 == 0)
     return scales_offset(k, out, in) + e / 32 * 4;
 }
 

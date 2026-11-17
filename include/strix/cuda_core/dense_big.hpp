@@ -20,6 +20,11 @@ namespace strix::cuda_core {
 // Concurrent streams need one context each; a context binds to its first device.
 // The implicit context is isolated by host thread/device. Drain its stream before release.
 [[nodiscard]] bool dense_big_fast8_supported();
+// FAST4 (W4A4, identity nvfp4-tile-mma-f32-v1 of strix/cuda/core/nvfp4_tile.hpp): nvfp4 weights x per-row NVFP4 activations on the
+// block-scaled e2m1 mma (sm_120). Bit-changing and quality-gated like FAST8; never selected implicitly.
+[[nodiscard]] bool dense_big_fast4_supported();
+// Operand class of a prefill (selects the activation split and the resident operand kind).
+enum class BigClass : std::uint8_t { exact, fast8, fast4 };
 struct BigCtx;
 [[nodiscard]] BigCtx* dense_big_ctx_create();
 void dense_big_ctx_destroy(BigCtx* ctx);
@@ -31,6 +36,7 @@ struct BigAct {
     int terms = 3;
     bool f16 = false;  // f16 plane (nvfp4 weights) instead of bf16 planes
     bool f8 = false;   // FAST/TURBO: e4m3 plane + row scales (nvfp4 weights only; dense_big_gemm then runs the e4m3 x e4m3 mma kernel)
+    bool f4 = false;   // FAST4: NVFP4 X tile + row scales (nvfp4 weights only; dense_big_gemm then runs the e2m1 tile GEMM)
 };
 
 enum class BigEpi : std::uint8_t {
@@ -45,6 +51,12 @@ enum class BigEpi : std::uint8_t {
 // rows <= max rows given to dense_big_reserve. `in` % 32 == 0.
 cudaError_t dense_big_split(const float* x, std::uint32_t rows, std::uint32_t in, WeightFormat fmt, int terms, BigAct* out,
                             cudaStream_t stream, BigCtx* ctx = nullptr, bool f8 = false);
+// FAST4 split: x (FP32 [rows][in], 16-byte aligned, in % 128 == 0) -> NVFP4 X tile + per-row scales (dense_big_fast4_supported()).
+cudaError_t dense_big_split4(const float* x, std::uint32_t rows, std::uint32_t in, BigAct* out, cudaStream_t stream, BigCtx* ctx = nullptr);
+// FAST4 fused gate/up: y[r][c] = silu(gate_r[c]) * up_r[c] in ONE GEMM (gate and up 16-row tiles of the same channels side by side
+// in each warp, SwiGLU in registers; same rounding steps as BigEpi::silu_mul on two GEMMs). a must come from dense_big_split4.
+cudaError_t dense_big_glu4(const DenseWeight& gate, const DenseWeight& up, const BigAct& a, float* y, cudaStream_t stream,
+                           BigCtx* ctx = nullptr);
 // y[r][o] = epilogue(W x_r), r < a.rows. The planes must come from dense_big_split with the same format class as w.
 cudaError_t dense_big_gemm(const DenseWeight& w, const BigAct& a, float* y, const float* aux, BigEpi epi, cudaStream_t stream,
                            BigCtx* ctx = nullptr);
@@ -68,14 +80,15 @@ struct BigCacheReport {
     std::uint64_t arena_bytes = 0, wanted_bytes = 0, budget_bytes = 0;
     std::uint32_t admitted = 0, rejected = 0;
     bool f8 = false;
+    bool f4 = false;
 };
 [[nodiscard]] BigOperandCache* dense_big_cache_create();
 void dense_big_cache_destroy(BigOperandCache* cache);  // the caller drains every stream that used it first
 // Plans (first fit in the given order under operand_cache::budget(mode, free, total, cap_bytes)) and allocates the arena once on
-// the current device. f8 selects the FAST8 operand class (e4m3 for nvfp4) instead of the exact classes (f16 for nvfp4, bf16 +
-// scales for q8_0); classes the mode does not admit and bf16 weights (no expansion) are skipped. A second call returns the
+// the current device. cls selects the operand class: fast8 = e4m3, fast4 = the e2m1 W tile (nvfp4), exact = f16 (nvfp4) / bf16 +
+// scales for q8_0; classes the mode does not admit and bf16 weights (no expansion) are skipped. A second call returns the
 // first report.
-cudaError_t dense_big_cache_reserve(BigOperandCache* cache, const DenseWeight* weights, std::size_t n, bool f8,
+cudaError_t dense_big_cache_reserve(BigOperandCache* cache, const DenseWeight* weights, std::size_t n, BigClass cls,
                                     operand_cache::Mode mode, std::uint64_t cap_bytes, BigCacheReport* report);
 // Every dense_big_gemm on ctx consults `cache` (nullptr detaches). Several contexts (streams) may share one cache.
 void dense_big_ctx_attach_cache(BigCtx* ctx, BigOperandCache* cache);
