@@ -111,12 +111,35 @@ def census(path, rows, emitted):
             g["shapes"][shape] = g["shapes"].get(shape, 0) + 1
     if not experts or not topk:
         raise ValueError("expert counts unavailable; cannot infer active MoE bytes")
+    # Storage eligibility does not establish a consumer, numerical qualification,
+    # or a full-matrix read: embeddings are sparse lookups, so keep them separate.
+    known = ("attn_qkv.weight", "attn_gate.weight", "ssm_out.weight",
+             "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
+             "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight")
+    remaining = {}
+    for name, dims, kind, _ in tensors:
+        if kind != 8 or len(dims) != 2 or dims[0] % 64 or name.endswith(known):
+            continue
+        # Strip the block number, retaining the tensor's semantic suffix.
+        role = name.split(".", 2)[2] if name.startswith("blk.") else name
+        r = remaining.setdefault(role, {"tensors": 0, "q8_bytes": 0, "int4_bytes": 0,
+                                       "shapes": {}, "read_kind": "lookup" if "token_embd" in name else "projection"})
+        r["tensors"] += 1
+        r["q8_bytes"] += math.prod(dims) // 32 * 34
+        r["int4_bytes"] += math.ceil(dims[1] / 64) * 64 * dims[0] * 17 // 32
+        shape = "x".join(map(str, dims))
+        r["shapes"][shape] = r["shapes"].get(shape, 0) + 1
+    remaining_saving = sum(r["q8_bytes"] - r["int4_bytes"] for r in remaining.values()
+                           if r["read_kind"] == "projection")
     exact = [dense + moe * min(experts, topk * u) / experts for u in (1, rows)]
     return {"schema": "decode-layout/v1", "metadata": meta, "groups": groups,
             "dense_bytes_per_pass": dense, "all_expert_bytes": moe,
             "embedding_bytes_excluded": embed, "verify_rows": rows,
             "emitted_per_pass": emitted, "onfly_copy_bytes": sum(g["int4_bytes"] for g in groups.values()),
             "unconsumed_shared_down_copy_bytes": unused,
+            "unconverted_storage_eligible_q8_2d": remaining,
+            "unconverted_projection_logical_saved_bytes": remaining_saving,
+            "unconverted_projection_byte_saving_at_243GBs_ms": remaining_saving / 243e6,
             "unconsumed_copy_bytes": fallback_copy,
             "q8_fallback_tensors": fallback_tensors,
             "logical_saved_bytes_per_pass": saving,

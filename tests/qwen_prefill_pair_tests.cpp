@@ -214,6 +214,24 @@ void half_cut_checks() {
     require(parse_stage_cut(nullptr, legal, legal_half) == StageCut(measured_default_cut));
     require(parse_stage_cut("24", legal, legal_half) == StageCut(24U));
     require(parse_stage_cut("22.5", legal, legal_half) == StageCut(22U, true));
+    // qwen.pair_half_cut: the unset default becomes 23.5 only when on and layer 23 can carry the seam; an explicit
+    // cut always wins; a fallback default (23 illegal -> 24) never turns into an unmeasured half cut.
+    {
+        LegalCuts half23 = legal_half; half23[23] = true;
+        require(resolve_stage_cut(nullptr, legal, half23, true) == StageCut(23U, true));
+        require(resolve_stage_cut(nullptr, legal, half23, false) == StageCut(23U));
+        require(resolve_stage_cut(nullptr, legal, legal_half, true) == StageCut(23U));
+        require(resolve_stage_cut("23", legal, half23, true) == StageCut(23U));
+        require(resolve_stage_cut("22.5", legal, half23, false) == StageCut(22U, true));
+        LegalCuts no23 = legal; no23[23] = false; half23[24] = true;
+        require(resolve_stage_cut(nullptr, no23, half23, true) == StageCut(24U));
+        namespace lv = strix::lever;
+        for (const std::uint64_t ctx : {8192ULL, 32768ULL, 65536ULL})
+            require(lv::select(half_cut_lever, {0U, ctx, 0U}, nullptr).on);
+        require(!lv::select(half_cut_lever, {0U, 65537U, 0U}, nullptr).on && !lv::select(half_cut_lever, {0U, 131072U, 0U}, nullptr).on);
+        require(!lv::select(half_cut_lever, {0U, 0U, 0U}, nullptr).on);
+        require(!lv::select(half_cut_lever, {0U, 32768U, 0U}, "0").on && lv::select(half_cut_lever, {0U, 131072U, 0U}, "1").on);
+    }
     for (const char* bad : {"21.5", "0.5", "48.5", "22.25", "22.5 "}) {
         bool rejected = false;
         try { (void)parse_stage_cut(bad, legal, legal_half); } catch (const std::invalid_argument&) { rejected = true; }

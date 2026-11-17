@@ -33,6 +33,7 @@
 #include "strix/hip_q6p_pack.hpp"
 #include "strix/hip_qwen_router_bf16.hpp"
 #include "strix/hip_qwen_onfly_i4.hpp"
+#include <map>
 #include "strix/qwen_router_bf16.hpp"
 #include "strix/hip_dense_trellis_pack.hpp"
 #include "strix/q6p_registry.hpp"
@@ -1851,6 +1852,8 @@ static int run_decode_entry(
         }
     }
     strix::decode_cli::require_effective_prefill_execution(effective);
+    strix::core::iu4_rows::configure_execution_policy({effective.options.turbo.row_decode.effective,
+                                                     effective.options.turbo.row_reduction.effective});
     std::unique_ptr<strix::decode_cli::YarnMemoryWatchdog> yarn_watchdog;
     if (yarn) yarn_watchdog = std::make_unique<strix::decode_cli::YarnMemoryWatchdog>();
     strix::decode_cli::YarnMemoryWatchdogScope yarn_watchdog_scope(yarn_watchdog.get());
@@ -2706,6 +2709,37 @@ static int run_decode_entry(
                   << onfly_i4_owner->source_bytes << " Q8_0 bytes -> " << onfly_i4_owner->copy_bytes << " INT4 bytes in "
                   << onfly_i4_owner->convert_seconds << " s (" << strix::onfly_i4::groups_text(options.turbo.groups) << ")\n";
     }
+    if (strix::envcfg::flag("STRIX_MTP_WEIGHT_LOG", false)) {
+        // The family adapter supplies tensor names; registry ownership and the
+        // shared projection's admitted K groups determine the effective form.
+        std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> groups;
+        for (std::size_t index = 0; index < manifest.tensors.size(); ++index) {
+            const auto& tensor = manifest.tensors[index];
+            const auto* runtime = strix::find_runtime_tensor_binding(model_residency.binding(), static_cast<std::uint32_t>(index));
+            if (!runtime || !runtime->address) continue;
+            std::string name = tensor.name;
+            if (name.starts_with("blk.")) {
+                const auto end = name.find('.', 4U);
+                if (end != std::string::npos) name.erase(0U, end + 1U);
+            }
+            const auto* address = reinterpret_cast<const void*>(runtime->address);
+            std::string form = "native";
+            if (const auto* packed = strix::q6p::find(address))
+                form = packed->kind == strix::q6p::Kind::bf16 ? "bf16-copy" : "q6p32-copy";
+            const bool copy = std::any_of(onfly_i4_owner->copies.begin(), onfly_i4_owner->copies.end(),
+                [&](const auto& c) { return c.original == address; });
+            if (copy && tensor.dimensions.size() == 2U) {
+                const auto g = tensor.dimensions[0] / 64U;
+                form = g == 32U || g == 40U || g == 64U || g == 96U ? options.turbo.identity() : "native-unused-i4-copy";
+            }
+            const std::string key = name + " ggml=" + std::to_string(tensor.ggml_type) + " effective=" + form;
+            auto& total = groups[key]; ++total.first; total.second += tensor.byte_size;
+        }
+        for (const auto& [group, total] : groups)
+            std::cerr << "mtp-weight path=verify_and_commit source_sha256=" << admitted_content << " group=" << group
+                      << " tensors=" << total.first << " source_bytes=" << total.second
+                      << " scope=decode-r1-r8 commit=reuse-verified-state wide_iu4=off\n";
+    }
     optimization_profile_receipt += "  \"qwen_router_bf16_enabled\":" + std::string(options.qwen_router_bf16 ? "true" : "false") + ",\n" +
         "  \"qwen_router_bf16_bytes\":" + std::to_string(router_bf16_owner->bytes) + ",\n" +
         "  \"qwen_router_bf16_tensors\":" + std::to_string(router_bf16_owner->copies.size()) + ",\n" +
@@ -3513,7 +3547,8 @@ static int run_decode_entry(
                 strix::qwen_pp::parse_stage_cut(pair_cut_env, pair_legal, pair_legal_half)) :
                 strix::qwen_pp::choose_cut(pair_costs, pair_legal, pair_legal_half);
         } else {
-            const auto pair_cut = strix::qwen_pp::parse_stage_cut(pair_cut_env, pair_legal, pair_legal_half);
+            const auto pair_cut = strix::qwen_pp::resolve_stage_cut(pair_cut_env, pair_legal, pair_legal_half,
+                pair_policy->half_cut.on);
             pair_prediction.cut = pair_cut.layer;
             pair_prediction.half = pair_cut.half;
         }
@@ -5859,7 +5894,8 @@ static int run_decode_entry(
 #endif
                 throw std::runtime_error("pair prefill layer range update failed");
             std::fprintf(stderr, "qwen-pair rank=%u cut=%s cut-source=%s cost-bucket=%llu predicted-A-ms=%.3f predicted-B-ms=%.3f prediction=%s\n",
-                pair_rank, pair_cut_text.c_str(), pair_cut_env ? "explicit" : (pair_cost_env ? "cost-model" : "measured-default"),
+                pair_rank, pair_cut_text.c_str(), pair_cut_env ? "explicit" : (pair_cost_env ? "cost-model" :
+                    (pair_policy && pair_policy->half_cut.on ? "measured-default-half" : "measured-default")),
                 static_cast<unsigned long long>(pair_bucket), pair_prediction.a * static_cast<double>(options.tokens.size()),
                 pair_prediction.b * static_cast<double>(options.tokens.size()), pair_cost_env ? "compute-only" : "unavailable");
             // Deployment may already have exchanged measured facts and plan IDs on its own link.

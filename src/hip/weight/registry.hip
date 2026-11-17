@@ -65,13 +65,21 @@ std::span<const SourceRegistration> sources() noexcept {
         STRIX_GSQ_REGISTER("gguf.iq2_s",::strix::gsq_a8::type_iq2_s,0),
         STRIX_GSQ_REGISTER("gguf.iq4_xs",::strix::gsq_a8::type_iq4_xs,0),
         STRIX_GSQ_REGISTER("gguf.iq4_nl",::strix::gsq_a8::type_iq4_nl,64),
-        STRIX_GSQ_REGISTER("gguf.q2_0.strix",::strix::gsq_a8::type_q2_0,128)
+        STRIX_GSQ_REGISTER("gguf.q2_0.strix",::strix::gsq_a8::type_q2_0,128),
+        {{"exl3.mul1.tiles16",1},"trellis-tile","trellis-mul1-legacy",16,4,0,0,true,true,validate_trellis_mul1},
+        {{"exl3.gemma.transport",1},"trellis-tile","g4-exl3-v1",16,2,0,0,true,true,validate_gemma_transport},
+        {{"exl3.gemma.transport",1},"trellis-tile","g4-exl3-v2",16,2,0,0,true,true,validate_gemma_transport},
+        {{"exl3.gemma.transport",1},"trellis-tile","g4-exl3-v3",16,2,0,0,true,true,validate_gemma_transport},
+        {{"exl3.gemma.transport",1},"trellis-tile","g4-exl3-wmma-pf-v1",16,2,0,0,true,true,validate_gemma_transport}
     };
     return table;
 }
 #undef STRIX_GSQ_REGISTER
 const SourceRegistration* find_source(FormatId storage,std::string_view protocol) noexcept {
-    for(const auto& s:sources()) if(s.storage==storage && s.protocol==protocol) return &s;
+    return find_unique_source(sources(),storage,protocol);
+}
+const SourceRegistration* find_source(FormatId storage,std::string_view protocol,std::string_view arithmetic) noexcept {
+    for(const auto& s:sources()) if(s.storage==storage && s.protocol==protocol && s.arithmetic==arithmetic) return &s;
     return nullptr;
 }
 }  // namespace strix::weight::hip

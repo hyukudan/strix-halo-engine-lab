@@ -2,6 +2,7 @@
 // The production dispatch switches (fast_dense_on in src/hip_ds41_layer.hip, fast_moe in src/hip_ds41_prefill.hip) are
 // extracted verbatim; extract.py also asserts that DevicePrefill::run_from installs its own options as the scope below.
 #include "strix/ds41_prefill_precision.hpp"
+#include "strix/lever_cache.hpp"
 #include "strix/prefill_dense_plan.hpp"
 
 #include <cstdio>

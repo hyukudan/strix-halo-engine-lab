@@ -103,7 +103,11 @@ struct CudaPrefillOptions {
     bool service_host_buffers = false;
     bool reserve_export_capture = false;
     double host_expert_gib = 0.0;                   // budget of pinned host memory for expert layers
-    HostPinOrder host_pin_order = HostPinOrder::layer;  // deadline: pin streamed suffix; early: ascending fill; both exclude idle-preload slots
+    HostPinOrder host_pin_order = HostPinOrder::automatic;  // auto (default): interleave or layer by the measured table
+                                                        // (strix::ds41::resolve_host_pin_order); interleave: file-tier layers placed where the
+                                                        // disk read hides behind host copies; layer: old ascending fill; deadline / early
+    std::uint32_t file_ring_mib = 0;                // pinned file-read ring (64 MiB pages, >= 128): disk read-ahead of the copy stream;
+                                                        // 0 = auto (strix::ds41::resolve_file_ring: 4 GiB out of the host budget under interleave)
     std::uint32_t slots = 2;                        // device slots for non-resident layers (0: none; decode-only objects)
     // TIMING ONLY (not the model's bits): host-tier layers beyond this many share the pinned copies of the first ones
     // (real transfers, wrong weights), to measure a RAM tier larger than the free memory (0: off).
@@ -554,6 +558,7 @@ public:
     // Empty when no multi-location reader is active; otherwise a comma-prefixed JSON member.
     [[nodiscard]] std::string weight_io_fields() const;
     [[nodiscard]] std::string describe() const;                // tiers, budgets, sizes (one line of JSON)
+    [[nodiscard]] const CudaPrefillOptions& effective_options() const;  // the options after the load-time resolvers
     // Device copy of a model tensor's GGUF bytes (uploaded on first use and kept by this object; e.g. a drafter on the
     // same device reads token_embd.weight / output.weight from here instead of holding its own copies).
     [[nodiscard]] const std::uint8_t* device_tensor(const std::string& name);

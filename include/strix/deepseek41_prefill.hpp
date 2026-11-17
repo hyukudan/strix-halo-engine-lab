@@ -304,6 +304,8 @@ public:
     // > 1 a cone run computes no teacher rows, only its last row's logits: the quality runner's gate mode prefills with
     // the cone and teacher-forces the continuation (extend) without it.
     void set_cone(bool on);
+    // Re-resolve the per-object STRIX_DS41_PREFILL_* / DENSE_* switches from the current environment and the construction options (resident runner arms); allocation and weight-layout switches are not touched.
+    void apply_levers();
     // The whole prompt from position 0 (a fresh sequence).
     PrefillResult run(std::span<const std::uint32_t> tokens);
     // The next piece of the same sequence: tokens at positions [rows so far, + tokens.size()), reading the attention

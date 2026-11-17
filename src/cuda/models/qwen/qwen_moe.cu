@@ -24,6 +24,7 @@
 //   d*sc*r rounded once (same for zero signs, infinities and NaN). Every other operation is HIP's, in HIP's order.
 #include "strix/env_flags.hpp"
 #include "../../core/imma_tile.cuh"
+#include "strix/cuda/core/decode_rows.hpp"
 #include "strix/cuda/qwen_moe.hpp"
 #include "strix/cuda/qwen_quant.cuh"
 #include "strix/cuda/qwen_route_bf16.hpp"
@@ -1367,7 +1368,9 @@ void enqueue_csr(const Rows& v, std::uint32_t rows, cudaStream_t s) {
     check(cudaGetLastError(), "MoE CSR");
 }
 void enqueue_project(const Rows& v, std::uint32_t rows, const Weights& w, const amdmath::Tables& tables, cudaStream_t s, bool moe_mma) {
-    if (rows <= kRowsMax && decode_rows_enabled()) {
+    // Decode-shaped rows: up to core::decode_rows_max() (9..16 rows: the tile loop below runs chunks of 8). Under the FAST
+    // moe_mma form the cut stays at kRowsMax, so 9..16-row FAST launches keep the qualified tensor-core form.
+    if (rows <= (moe_mma ? kRowsMax : core::decode_rows_max()) && decode_rows_enabled()) {
         const dim3 grid(csr_sizes(rows).max_tiles, ffn / 32U);
         if (w.gate_type == type_q5_k) project_rows_kernel<true><<<grid, 1024, 0, s>>>(w.gate, w.up, v, tables);
         else if (w.gate_type == type_q4_k) project_rows_kernel<false><<<grid, 1024, 0, s>>>(w.gate, w.up, v, tables);
@@ -1402,7 +1405,9 @@ void enqueue_project(const Rows& v, std::uint32_t rows, const Weights& w, const 
 }
 template <bool RouteBF16>
 void enqueue_down_storage(const Rows& v, std::uint32_t rows, const Weights& w, cudaStream_t s, bool moe_mma) {
-    if (rows <= kRowsMax && decode_rows_enabled()) {
+    // Decode-shaped rows: up to core::decode_rows_max() (9..16 rows: the tile loop below runs chunks of 8). Under the FAST
+    // moe_mma form the cut stays at kRowsMax, so 9..16-row FAST launches keep the qualified tensor-core form.
+    if (rows <= (moe_mma ? kRowsMax : core::decode_rows_max()) && decode_rows_enabled()) {
         const dim3 grid(csr_sizes(rows).max_tiles, hidden / 8U);
         if (w.down_type == type_q5_1) down_rows_kernel<true, RouteBF16><<<grid, 256, 0, s>>>(w.down, v);
         else if (w.down_type == type_q8_0) down_rows_kernel<false, RouteBF16><<<grid, 256, 0, s>>>(w.down, v);

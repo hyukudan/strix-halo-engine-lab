@@ -1,4 +1,4 @@
-#ifdef _MSC_VER
+#if defined(_MSC_VER) && !defined(_CRT_SECURE_NO_WARNINGS)
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 // MiniMax M3.1 defaults-on resolver: the table of default-ON items, the baseline master switch and the canonical
@@ -274,6 +274,17 @@ PrefillPolicy prefill_policy(const Lookup& env) {
                   (!packed ? "index WMMA requires STRIX_MM_INDEX_PROJ=attn" : "index WMMA requires the default prefill identity");
     }
     if (p.idx_wmma) p.policies += (p.policies.empty() ? "" : "+") + idx_wmma_policy(p.idx_wmma_layers);
+    // FAST router product (bundle member or its own switch): the layers it runs on; layers without a router (dense)
+    // are ignored. Admitted like the flash member (EXL3 MoE base only); an explicit value wins.
+    const char* router = env("STRIX_MM_PF_ROUTER_WMMA");
+    if (fp::set(router) && std::strcmp(router, "0") != 0 && std::strcmp(router, "1") != 0)
+        throw std::invalid_argument("STRIX_MM_PF_ROUTER_WMMA must be 0 or 1");
+    const auto rit = p.canonical.find("STRIX_MM_PF_ROUTER_WMMA");
+    const char* rlayers = env("STRIX_MM_PF_ROUTER_WMMA_LAYERS");
+    const auto rmask = strix::core::parse_layer_set(fp::set(rlayers) ? rlayers : kRouterWmmaLayers, 0, kMsaLayers,
+                                                    "STRIX_MM_PF_ROUTER_WMMA_LAYERS");
+    p.router_wmma_layers = fp::layer_ranges(kMsaLayers, [&](unsigned l) { return rmask.test(l); });
+    p.router_wmma = rit != p.canonical.end() && rit->second == "1" && rmask.count() != 0;
     return p;
 }
 
@@ -314,6 +325,9 @@ profile::Resolution profile_resolution(const Lookup& env) {
             return !p.idx_wmma && p.idx_wmma_asked == "default" ? nullptr : p.idx_wmma ? "1" : "0";
         if (std::strcmp(key, "STRIX_MM_PF_IDX_WMMA_LAYERS") == 0)
             return p.idx_wmma ? p.idx_wmma_layers.c_str() : nullptr;
+        // The same for the FAST router product: unset or 0 is the builtin, its layer set counts only while it runs.
+        if (std::strcmp(key, "STRIX_MM_PF_ROUTER_WMMA") == 0) return p.router_wmma ? "1" : nullptr;
+        if (std::strcmp(key, "STRIX_MM_PF_ROUTER_WMMA_LAYERS") == 0) return p.router_wmma ? p.router_wmma_layers.c_str() : nullptr;
         return base(key);
     };
     // Product profile: '--profile NAME' of rank and serve, exported by print_or_apply() (one value for both apps).
@@ -373,6 +387,7 @@ std::string prefill_identity(const Lookup& env) {
     }
     std::string out = msa.empty() ? std::string() : "prefill_msa=" + msa;
     if (!idx.empty()) out += std::string(out.empty() ? "" : ";") + "prefill_idxproj=" + idx;
+    if (p.router_wmma) out += std::string(out.empty() ? "" : ";") + "prefill_router=mm-pf-router-wmma-v1-l" + p.router_wmma_layers;
     if (fast_i4_format(env)) out += std::string(out.empty() ? "" : ";") + "moe_prefill_format=fast_i4";
     // Chunk-invariant linear order (MoE gate/up/down + dense q/k/v/o, fixed S = 1): different bits from the adaptive
     // order, so a parked state written under one never restores into the other.
@@ -637,7 +652,7 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
         const auto id = prefill_identity(env);
         const bool bundle_requested = strix::fast_profile::switch_on(env(kFastBundle.env));
         const auto pipeline_reference = pair_pipeline_choice(8192U);
-        o << "prefill.fast_profile=" << (bundle_requested && pf.msa_flash != 0 ? kFastBundle.profile : "off") << "\n"
+        o << "prefill.fast_profile=" << (bundle_requested && (pf.msa_flash != 0 || pf.router_wmma) ? kFastBundle.profile : "off") << "\n"
           << "prefill.fast_profile_requested=" << (bundle_requested ? kFastBundle.profile : "off") << "\n"
           << "prefill.msa_flash_requested=" << pf.msa_flash_requested << "\n"
           << "prefill.msa_flash_source=" << pf.msa_flash_asked << "\n"

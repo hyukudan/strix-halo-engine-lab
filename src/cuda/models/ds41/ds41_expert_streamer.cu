@@ -22,7 +22,7 @@ namespace {
 double seconds_since(std::chrono::steady_clock::time_point t) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
 }
-constexpr std::size_t kStaging = 4, kStagingBytes = std::size_t{64} << 20;
+constexpr std::size_t kStagingBytes = std::size_t{64} << 20;  // one file-read ring page (StreamerPlan::staging_pages)
 
 }  // namespace
 
@@ -91,13 +91,41 @@ ExpertStreamer::ExpertStreamer(FileReader& file, StreamerPlan plan) : file_(file
     const std::uint32_t E = p_.experts;
     if (p_.order.size() < p_.end || p_.resident.size() < p_.end || p_.stream_tier.size() < p_.end || p_.extents.size() < p_.end)
         throw std::invalid_argument("ds41 expert streamer: plan does not cover the layers");
-    STRIX_CUDA_CHECK(cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking));
-    staging_.resize(kStaging);
-    for (auto& st : staging_) {
-        st.buf = std::make_unique<PinnedBytes>(kStagingBytes + 2U * FileReader::alignment);
-        st.done = std::make_unique<Event>();
-        pinned_bytes_ += st.buf->size();
+    p_.host_pin_choice.ring_mib = p_.staging_pages * 64U;
+    auto ring = allocate_file_ring(p_.host_pin_choice, p_.automatic_ring_growth, 2U * FileReader::alignment,
+        [&] {
+            const auto room = ds41::host_memory_room();
+            return room.known ? host_pin_headroom(double(room.free_physical), double(room.free_commit),
+                p_.host_commit_floor_gib * double(1ULL << 30)) : 0.0;
+        }, [&](std::uint32_t pages, bool optional) {
+            staging_.resize(pages);
+            for (auto& st : staging_) {
+                if (optional) {
+                    std::uint32_t waits = 0;
+                    HostPinReason reason{};
+                    st.buf = PinnedBytes::try_alloc_floor(kStagingBytes + 2U * FileReader::alignment,
+                        p_.host_commit_floor_gib, std::chrono::steady_clock::now(), waits, true, false, reason);
+                    if (!st.buf) return false;
+                } else st.buf = std::make_unique<PinnedBytes>(kStagingBytes + 2U * FileReader::alignment);
+                st.done = std::make_unique<Event>();
+                pinned_bytes_ += st.buf->size();
+            }
+            return true;
+        }, [&] { staging_.clear(); pinned_bytes_ = 0; });
+    if (ring.ring_mib != p_.host_pin_choice.ring_mib) {
+        std::vector<std::uint64_t> bytes(p_.end, 0);
+        const auto eb = p_.expert_bytes[0] + p_.expert_bytes[1] + p_.expert_bytes[2];
+        for (std::uint32_t l = p_.first; l < p_.end; ++l) bytes[l] = std::uint64_t{E - p_.resident[l]} * eb;
+        const auto host = ordered_host_layers(ring.order, bytes, p_.slots, ring.host_gib * double(1ULL << 30), 0.0);
+        ring.layer_file_bytes = 0.0;
+        for (std::uint32_t l = p_.first; l < p_.end; ++l) {
+            if (!p_.fixed_stream_tiers) p_.stream_tier[l] = host[l] ? ExpertTier::host : ExpertTier::file;
+            if (p_.stream_tier[l] == ExpertTier::file) ring.layer_file_bytes += double(bytes[l]);
+        }
     }
+    p_.host_pin_choice = ring;
+    p_.staging_pages = ring.ring_mib / 64U;
+    STRIX_CUDA_CHECK(cudaStreamCreateWithFlags(&copy_, cudaStreamNonBlocking));
     resident_.resize(p_.end);
     perm_.resize(p_.end);
     host_.resize(p_.end);

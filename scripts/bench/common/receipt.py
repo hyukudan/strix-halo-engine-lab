@@ -94,6 +94,19 @@ def pair_receipts(paths, expected=0):
     return reasons
 
 
+def pair_verdict_line(paths):
+    """One line for the folded pair arm: VALID only if every rank is; each rank's own reasons named."""
+    recs = [json.loads(read_text(p) or "{}") for p in paths]
+    tag = recs[0].get("tag") or "missing-rank"
+    if all(r.get("valid") for r in recs):
+        return "== %s PAIR VALID" % tag
+    own = []
+    for i, r in enumerate(recs):
+        why = [x for x in r.get("invalid_reasons", ["missing receipt"]) if x != "pair rank invalid or missing receipt"]
+        own.append("r%d: %s" % (i, "; ".join(why) or "-"))
+    return "== %s PAIR INVALID[%s]" % (tag, " | ".join(own))
+
+
 def read_text(path):
     try:
         with open(path, encoding="utf-8", errors="replace") as stream:
@@ -418,7 +431,10 @@ def main(argv=None):
     s.add_argument("--strict-klog", action="store_true", help="kernel-log events invalidate instead of warning")
     args = p.parse_args(argv)
     if args.cmd == "pair":
-        return bool(pair_receipts(args.paths, args.expected))
+        reasons = pair_receipts(args.paths, args.expected)
+        # The per-rank '== tag VALID' lines are printed before this fold; this line is the pair arm's verdict.
+        print(pair_verdict_line(args.paths))
+        return bool(reasons)
     {"meta": cmd_meta, "summarize": cmd_summarize}[args.cmd](args)
 
 
