@@ -137,6 +137,7 @@ inline constexpr PrefillLever kPrefillLevers[] = {
     {"STRIX_DS41_FP16_CACHE_READONLY", PrefillLeverClass::reload},
     {"STRIX_DS41_FP16_TUNE", PrefillLeverClass::reload},
     {"STRIX_DS41_FP8_W", PrefillLeverClass::cached},  // launch shape only (outputs per wave), not a layout
+    {"STRIX_DS41_HC_COLLAPSE_ONCE", PrefillLeverClass::cached},  // scheduling only (hc collapse site), same bits
     {"STRIX_DS41_HC_SITE", PrefillLeverClass::reload},
     {"STRIX_DS41_HC_SITE_FAST", PrefillLeverClass::cached},
     {"STRIX_DS41_HOST_EXCHANGE", PrefillLeverClass::reload},
