@@ -917,8 +917,15 @@ struct CudaEngine::Impl {
         cc::BigAct act[2];
         bool have[2] = {false, false};
     };
+    struct CacheDel {
+        void operator()(cc::BigOperandCache* p) const { cc::dense_big_cache_destroy(p); }
+    };
     struct Pf {
         std::uint32_t C = 0;
+        // resident expanded operands shared by every slot context; declared before sl so it is destroyed after the slots have
+        // drained their streams
+        std::unique_ptr<cc::BigOperandCache, CacheDel> cache;
+        bool cache_tried = false;
         std::vector<std::unique_ptr<Slot>> sl;
         int terms = 3;
         // e4m3 KV shadow (opt.prefill_attn8): per attention layer, allocated on first use; positions < sh_end mirror the BF16 cache.
@@ -1009,6 +1016,29 @@ struct CudaEngine::Impl {
             pf_make_slot(*slot, pf.C);
             pf.sl.push_back(std::move(slot));
         }
+        pf_cache_init();
+        for (const auto& slot : pf.sl) cc::dense_big_ctx_attach_cache(slot->bc, pf.cache.get());
+    }
+
+    // Resident expanded operands (cuda_engine.hpp prefill_operand_cache): planned once, after the slot scratch exists, over every
+    // projection in use order; filled lazily by the first GEMM of each weight. Bitwise neutral; admission is reported once.
+    void pf_cache_init() {
+        if (pf.cache_tried) return;
+        pf.cache_tried = true;
+        if (opt.prefill_operand_cache == cc::operand_cache::Mode::off) return;
+        if (opt.prefill_operand_cache == cc::operand_cache::Mode::automatic && opt.prefill_arith != PrefillArith::fast8) return;
+        std::vector<cc::DenseWeight> ws;
+        for (const LayerW& w : L)
+            for (const cc::DenseWeight* d : {&w.qkv, &w.gate, &w.beta, &w.alpha, &w.out, &w.q, &w.k, &w.v, &w.o, &w.ffn_gate, &w.ffn_up, &w.ffn_down})
+                if (d->data != nullptr) ws.push_back(*d);
+        pf.cache.reset(cc::dense_big_cache_create());
+        cc::BigCacheReport r;
+        CK(cc::dense_big_cache_reserve(pf.cache.get(), ws.data(), ws.size(), opt.prefill_arith == PrefillArith::fast8, opt.prefill_operand_cache,
+                                       static_cast<std::uint64_t>(opt.prefill_operand_cache_cap_mib) << 20, &r));
+        if (!opt.quiet)
+            std::fprintf(stderr, "prefill operand cache: %s; class %s; %u resident, %u not admitted; %.2f of %.2f GiB wanted (budget %.2f GiB); bitwise neutral\n",
+                         cc::operand_cache::mode_name(opt.prefill_operand_cache), r.f8 ? "e4m3 (FAST8)" : "exact (f16/q8)", r.admitted, r.rejected,
+                         r.arena_bytes / 1073741824.0, r.wanted_bytes / 1073741824.0, r.budget_bytes / 1073741824.0);
     }
 
     [[nodiscard]] int pf_terms() const {
@@ -1479,6 +1509,14 @@ void print_effective_config(const EngineOptions& o, const char* arith, std::FILE
                  o.flash_pipe == cuda_core::FlashPipe::swz3 ? "swz3" : "pad2",
                  o.prefill_arith == PrefillArith::exact ? "n/a (exact prefill keeps attention_decode)"
                  : o.prefill_attn8 ? "on (e4m3 shadow KV + e4m3 flash, bit-changing, identity -a8)" : "off");
+    const char* oc = o.prefill_operand_cache == cuda_core::operand_cache::Mode::off ? "per-call weight expansion"
+                     : o.prefill_operand_cache == cuda_core::operand_cache::Mode::on
+                         ? "every expanded class (FAST8 e4m3, exact f16 / q8) resident, expanded once"
+                         : (o.prefill_arith == PrefillArith::fast8 ? "FAST8 e4m3 operands resident, expanded once"
+                                                                    : "inactive (auto admits FAST8 e4m3 only; exact classes need on)");
+    std::fprintf(f, "  prefill-operand-cache: %s: %s; budget free VRAM - max(4 GiB, 10 %% total)%s; bitwise neutral (same operand bytes, same kernel)\n",
+                 cuda_core::operand_cache::mode_name(o.prefill_operand_cache), oc,
+                 o.prefill_operand_cache_cap_mib ? ", capped by --prefill-operand-cache-cap-mib" : "");
 }
 
 const Config& CudaEngine::config() const { return p_->c; }
