@@ -78,6 +78,25 @@ static double run(const Case& c, bool timing, std::size_t& bad) {
         out[f].resize(sn);
         CK(cudaMemcpy(out[f].data(), ds, sn * 4, cudaMemcpyDeviceToHost));
     }
+    // 16-B alignment admission: the tree form with query rows / pooled keys one float off a 16-B boundary must give the
+    // shuffle scorer's bytes (scalar fallback), not a misaligned float4 load
+    std::size_t misaligned = 0;
+    {
+        float *mq = nullptr, *mk = nullptr;
+        CK(cudaMalloc(&mq, (qn + 1U) * 4));
+        CK(cudaMalloc(&mk, (kn + 1U) * 4));
+        CK(cudaMemcpy(mq + 1, hq.data(), qn * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(mk + 1, hk.data(), kn * 4, cudaMemcpyHostToDevice));
+        CK(cudaMemset(ds, 0x7F, sn * 4));
+        q::block_scores_form(q::ScoreForm::tree, mq + 1, c.rows, c.p0, mk + 1, ds, max_blocks, nullptr);
+        CK(cudaDeviceSynchronize());
+        std::vector<float> mo(sn);
+        CK(cudaMemcpy(mo.data(), ds, sn * 4, cudaMemcpyDeviceToHost));
+        for (std::size_t i = 0; i < sn; ++i) misaligned += std::memcmp(&out[0][i], &mo[i], 4) != 0;
+        CK(cudaFree(mq));
+        CK(cudaFree(mk));
+    }
+    bad += misaligned;
     if (timing) {
         cudaEvent_t e0, e1;
         CK(cudaEventCreate(&e0));
@@ -109,8 +128,8 @@ static double run(const Case& c, bool timing, std::size_t& bad) {
         const std::uint64_t complete = (c.p0 + r + 1U) / q::kRatio;
         if (complete > q::kTopK) pairs += static_cast<double>(complete);
     }
-    std::printf("rows=%u p0=%llu adv=%d written=%zu mismatch=%zu", c.rows, static_cast<unsigned long long>(c.p0), c.adversarial ? 1 : 0,
-                written, diff);
+    std::printf("rows=%u p0=%llu adv=%d written=%zu mismatch=%zu misaligned_mismatch=%zu", c.rows, static_cast<unsigned long long>(c.p0),
+                c.adversarial ? 1 : 0, written, diff, misaligned);
     if (timing)
         std::printf(" shuffle_ms=%.3f tree_ms=%.3f ratio=%.3f pairs/ns shuffle %.2f tree %.2f", ms_form[0], ms_form[1],
                     ms_form[1] / ms_form[0], pairs / (ms_form[0] * 1e6), pairs / (ms_form[1] * 1e6));

@@ -333,6 +333,9 @@ bool score_tree_enabled() {
     static const bool on = strix::lever::select(score_tree_lever, {}).on;
     return on;
 }
+// The tree body reads the query rows and pooled keys as float4; the shuffle scorer reads floats. A base pointer that is
+// not 16-B aligned gets the shuffle scorer (same bits) instead of a misaligned vector load.
+bool tree_aligned(const void* p) { return (reinterpret_cast<std::uintptr_t>(p) & 15U) == 0U; }
 constexpr unsigned kTreeRows = 64, kTreeTile = 32, kTreeSeg = 256;
 static_assert(kIndexHeads == 4U && kIndexDim == 128U, "block_score_tree_kernel maps 4 heads x 128 features");
 __device__ __forceinline__ void block_score_tree_body(const float* __restrict__ index_query, std::uint32_t rows,
@@ -1229,7 +1232,7 @@ void block_scores_form(ScoreForm form, const float* index_query, std::uint32_t r
     if (!rows) return;
     const auto scored = static_cast<std::uint32_t>((first_position + rows) / kRatio);  // complete blocks of the last row
     if (scored <= kTopK) return;
-    if (form == ScoreForm::tree) {
+    if (form == ScoreForm::tree && tree_aligned(index_query) && tree_aligned(pooled_keys)) {
         const dim3 grid((rows + kTreeRows - 1U) / kTreeRows, (scored + kTreeSeg - 1U) / kTreeSeg);
         block_score_tree_kernel<<<grid, 256, 0, stream>>>(index_query, rows, first_position, pooled_keys, scored, scores, max_blocks);
         check(cudaGetLastError(), "block score tree launch");
@@ -1398,6 +1401,7 @@ bool prepare_multi(const SegmentState* segs, std::uint32_t n, const Workspace& w
     shape.pool_grid = pool;
     shape.score_grid = (waves + 7U) / 8U;
     shape.tree_grid = dim3(tree_x, tree_y, n);
+    for (std::uint32_t i = 0; i < n; ++i) shape.tree_aligned = shape.tree_aligned && tree_aligned(map.pooled[i]);
     shape.slot_runs = (slots + kRun - 1U) / kRun;
     return true;
 }
@@ -1421,7 +1425,7 @@ void launch_multi(const RowBuffers& b, MapArg map, const MultiShape& shape, cons
         block_pool_multi_kernel<<<shape.pool_grid, kIndexDim, 0, stream>>>(map, w.index_k_norm, cs, tables);
         check(cudaGetLastError(), "block pool multi launch");
     }
-    if (shape.score_grid && score_tree_enabled()) {
+    if (shape.score_grid && score_tree_enabled() && shape.tree_aligned && tree_aligned(b.index_query)) {
         block_score_tree_multi_kernel<<<shape.tree_grid, 256, 0, stream>>>(b.index_query, map, ws.block_scores, ws.max_blocks);
         check(cudaGetLastError(), "block score tree multi launch");
     } else if (shape.score_grid) {
@@ -1506,6 +1510,9 @@ void prepare_replay(const SegmentState* segs, std::uint32_t n, const Workspace& 
     std::uint32_t valid_after[kMaxSegments] = {};
     if (!prepare_multi(segs, n, ws, map, shape, valid_after))
         throw std::logic_error("qwen_qsa prepare_replay: window outside the captured multi-launch shape");
+    // a captured graph keeps the scorer chosen at capture: refuse pooled keys the captured tree scorer cannot read
+    if (score_tree_enabled() && !shape.tree_aligned)
+        throw std::logic_error("qwen_qsa prepare_replay: pooled keys not 16-B aligned for the captured tree scorer");
     for (std::uint32_t i = 0; i < n; ++i)
         if (segs[i].state.pooled) *segs[i].state.pooled_valid = valid_after[i];
 }

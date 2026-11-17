@@ -162,6 +162,7 @@ struct MultiShape {
     std::uint32_t rows = 0, pool_grid = 0, score_grid = 0, slot_runs = 0;
     dim3 tree_grid{0U, 0U, 0U};  // tree scorer: (row tiles, block tiles, segments) covering the largest segment
     bool head_all = false;
+    bool tree_aligned = true;  // every segment's pooled keys 16-B aligned (tree scorer admission, else the shuffle scorer)
 };
 // host: validates, fills the map, this window's eager shape and the pooled-valid counts after it (valid_after[count]);
 // false = outside the multi-launch shapes (layer_core per segment). Throws on invalid positions before any state changes.
