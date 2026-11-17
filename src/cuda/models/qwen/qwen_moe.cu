@@ -245,7 +245,6 @@ using Q4Source=weight::OperandSource<weight::GgmlTag<12>,weight::SignedA8Tag,Ope
 using Q5Source=weight::OperandSource<weight::GgmlTag<13>,weight::SignedA8Tag,OperandArch,weight::CudaFourChainImma>;
 using Q51Source=weight::OperandSource<weight::GgmlTag<7>,weight::SignedA8Tag,OperandArch,weight::CudaFourChainImma>;
 using Q8Source=weight::OperandSource<weight::GgmlTag<8>,weight::SignedA8Tag,OperandArch,weight::CudaFourChainImma>;
-using NativeSource=weight::OperandSource<weight::RuntimeGgmlTag,weight::NativeScalarTag,OperandArch,weight::CudaNativeFp32>;
 bool decode_rows_enabled() { static const bool on=strix::envcfg::flag("STRIX_QRTX_DECODE_KERNELS",true); return on; }
 template<class K> void set_smem(K kernel,unsigned bytes);
 
@@ -498,9 +497,14 @@ bool enqueue_routed(const Rows& v, std::uint32_t rows, const Weights& w, const a
         if (quant::geometry(w.gate_type).block_elements == 0 || quant::geometry(w.down_type).block_elements == 0)
             throw std::invalid_argument("MoE expert type without a decoder");
         const unsigned tiles = csr_sizes(rows).max_tiles;
-        native_project_kernel<NativeSource,MoeBinding><<<dim3(tiles, ffn / 32U), 1024, 0, s>>>(w.gate, w.up, w.gate_type, v);
+        // The storage type binds the compile-time typed decoder (bitwise the runtime-type values; see with_native_source).
+        weight::with_native_source<OperandArch>(w.gate_type, [&]<class Source>() {
+            native_project_kernel<Source,MoeBinding><<<dim3(tiles, ffn / 32U), 1024, 0, s>>>(w.gate, w.up, w.gate_type, v);
+        });
         check(cudaGetLastError(), "MoE native gate/up");
-        native_down_kernel<NativeSource,MoeBinding><<<dim3(tiles, hidden / 32U), 1024, 0, s>>>(w.down, w.down_type, v);
+        weight::with_native_source<OperandArch>(w.down_type, [&]<class Source>() {
+            native_down_kernel<Source,MoeBinding><<<dim3(tiles, hidden / 32U), 1024, 0, s>>>(w.down, w.down_type, v);
+        });
         check(cudaGetLastError(), "MoE native down");
         return false;   // native experts: candidate MMA arithmetic did not run
     }

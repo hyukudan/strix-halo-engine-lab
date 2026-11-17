@@ -896,7 +896,8 @@ __global__ __launch_bounds__(1024) void native_project_kernel(const std::uint8_t
     }
 }
 // grid (tiles, hidden / 32), 1024 threads: warp w = hidden output 32 * blockIdx.y + w; lanes 0..19 own the 20 groups of
-// 640. Writes rawdots[row][slot * hidden + o].
+// 640. Writes rawdots[row][slot * hidden + o]. A lane's group depends only on (expert, o, lane), so it is decoded once
+// per tile and applied to every chunk (same values, same j order per assignment as decoding it per chunk).
 template <class Source, class Binding>
 __global__ __launch_bounds__(1024) void native_down_kernel(const std::uint8_t* down, std::uint32_t type, typename Binding::Rows v) {
     constexpr unsigned hidden=Binding::hidden, ffn=Binding::ffn, projection_nonfinite=Binding::projection_nonfinite;
@@ -911,6 +912,8 @@ __global__ __launch_bounds__(1024) void native_down_kernel(const std::uint8_t* d
     const unsigned t = threadIdx.x, lane = t & 31U, warp = t >> 5, o = blockIdx.y * 32U + warp;
     const std::uint64_t row_bytes = Source::row_bytes(type,ffn);
     const std::uint8_t* w = down + (static_cast<std::uint64_t>(expert) * hidden + o) * row_bytes;
+    float wv[32];
+    if (lane < ffn / 32U) Source::decode(type, w, lane, wv);
     for (unsigned base = 0; base < total; base += kNativeChunk) {
         const unsigned count = min(total - base, kNativeChunk);
         __syncthreads();
@@ -928,8 +931,6 @@ __global__ __launch_bounds__(1024) void native_down_kernel(const std::uint8_t* d
 #pragma unroll
         for (unsigned a = 0; a < kNativeChunk; ++a) acc[a] = 0.0F;
         if (lane < ffn / 32U) {
-            float wv[32];
-            Source::decode(type, w, lane, wv);
 #pragma unroll
             for (unsigned a = 0; a < kNativeChunk; ++a) {
                 if (a >= count) break;
