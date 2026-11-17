@@ -65,6 +65,13 @@ __device__ __forceinline__ void imma(int (&d)[4], const std::uint32_t (&a)[4], c
         : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(kMagic));
 }
+// Plain integer m16n8k32 (C = 0): d = the exact int32 dot of the 32-code block (|d| <= 32 * 127 * 128, no overflow).
+__device__ __forceinline__ void imma_dot(int (&d)[4], const std::uint32_t (&a)[4], const std::uint32_t (&b)[2]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(0));
+}
 
 
 
@@ -666,7 +673,60 @@ constexpr unsigned kKsOut = 8;
 
 // 9..16 rows (RP 16, one pass over the weights instead of two 8-row pieces): same (row, output) chains; the form runs
 // at most 768 threads (width <= 6144), so its bound is 768 and the 32 activation registers per thread do not spill.
-template <auto S, unsigned R, unsigned RP, unsigned KO, class Source, class Numeric, class Capture = NoCapture>
+// Integer block dots of the K-split form on the tensor cores (M = true; STRIX_QRTX_ROWS_MMA, RP 8 / 16): warp w owns
+// blocks 8w .. 8w + 7 (as the dp4a form) and issues one m16n8k32 per block for the CTA's KO (<= 8) outputs. Lane
+// (g = lane / 4, q = lane % 4) holds the A rows g / g + 8 and the B output g with codes 8q .. 8q + 3 at logical k 4q ..
+// 4q + 3 and codes 8q + 4 .. 8q + 7 at k 16 + 4q ..: the same permutation of k in A and B, so every dot is the same
+// exact integer sum. DOT / DW land in the dp4a form's layout and the FP32 chain below is untouched: bit-identical.
+template <unsigned R, unsigned RP, unsigned KO, class Source, class Site>
+__device__ __forceinline__ void rows_mma_dots(const Site& site, const std::int8_t* codes, std::uint32_t width, std::uint32_t nblocks,
+                                              std::uint32_t row_bytes, int* DOT, float* DW) {
+    static_assert((RP == 8U || RP == 16U) && KO <= 8U, "MMA dots: 8 / 16 padded rows, <= 8 outputs per CTA");
+    const unsigned lane = threadIdx.x & 31U, g = lane >> 2U, q = lane & 3U;
+    const std::uint32_t b0 = (threadIdx.x >> 5U) * 8U;
+    std::uint32_t a[8][4];
+#pragma unroll
+    for (unsigned j = 0; j < 8U; ++j) {
+        const std::uint32_t b = b0 + j;
+        const bool lo = b < nblocks && g < R, hi = b < nblocks && g + 8U < R;
+        const auto* x0 = reinterpret_cast<const std::uint32_t*>(codes + static_cast<std::uint64_t>(lo ? g : 0U) * width) + (lo ? b : 0U) * 8U + 2U * q;
+        const auto* x1 = reinterpret_cast<const std::uint32_t*>(codes + static_cast<std::uint64_t>(hi ? g + 8U : 0U) * width) + (hi ? b : 0U) * 8U + 2U * q;
+        a[j][0] = lo ? x0[0] : 0U;
+        a[j][2] = lo ? x0[1] : 0U;
+        a[j][1] = hi ? x1[0] : 0U;
+        a[j][3] = hi ? x1[1] : 0U;
+    }
+    const std::uint32_t n = blockIdx.x * KO + g;
+    const bool valid = g < KO && n < site.outputs;
+    const unsigned char* wrow = site.seg[0].w;
+    if (valid) {
+        const KSeg& sg = site.seg[find_seg(site, n)];
+        wrow = sg.w + static_cast<std::uint64_t>(n - sg.begin) * row_bytes;
+    }
+    const unsigned o0 = 2U * q;
+#pragma unroll
+    for (unsigned j = 0; j < 8U; ++j) {
+        const std::uint32_t b = b0 + j;
+        if (b >= nblocks) break;   // warp-uniform: the MMA below runs with the whole warp
+        const auto* h = reinterpret_cast<const unsigned short*>(wrow + Source::kBlockBytes * (valid ? b : 0U));
+        const unsigned short* c = h + 1U + 4U * q;
+        const std::uint32_t w[2] = {valid ? Source::word(c, 0) : 0U, valid ? Source::word(c, 1) : 0U};
+        if (q == 0U && g < KO) DW[b * KO + g] = Source::scale_bits(valid ? h[0] : static_cast<unsigned short>(0));
+        int d[4];
+        imma_dot(d, a[j], w);
+        int* out = DOT + b * KO * RP;   // C: rows g (d0, d1) / g + 8 (d2, d3), outputs o0 (d0, d2) / o0 + 1 (d1, d3)
+        if (o0 < KO) {
+            if (g < R) out[o0 * RP + g] = d[0];
+            if (g + 8U < R) out[o0 * RP + g + 8U] = d[2];
+        }
+        if (o0 + 1U < KO) {
+            if (g < R) out[(o0 + 1U) * RP + g] = d[1];
+            if (g + 8U < R) out[(o0 + 1U) * RP + g + 8U] = d[3];
+        }
+    }
+}
+
+template <auto S, unsigned R, unsigned RP, unsigned KO, class Source, class Numeric, class Capture = NoCapture, bool M = false>
 __global__ __launch_bounds__(RP > 8U ? 768 : 1024) void project_rows_ks_kernel(typename Numeric::Site site, const std::int8_t* codes, const float* deltas,
                                                               std::uint32_t pitch) {
     extern __shared__ __align__(16) unsigned char smem[];
@@ -676,61 +736,65 @@ __global__ __launch_bounds__(RP > 8U ? 768 : 1024) void project_rows_ks_kernel(t
     auto* D = DW + nblocks * KO;                                                  // [nblocks][RP]
     for (std::uint32_t i = threadIdx.x; i < RP * nblocks; i += blockDim.x)
         D[i] = i % RP < R ? deltas[static_cast<std::uint64_t>(i / RP) * pitch + i % RP] : 0.0F;
-    const unsigned lane = threadIdx.x & 31U, q = lane & 3U;
-    const std::uint32_t blk = (threadIdx.x >> 5U) * 8U + (lane >> 2U);
-    const bool active = blk < nblocks;
-    std::uint32_t a0[RP], a1[RP];
-#pragma unroll
-    for (unsigned r = 0; r < RP; ++r) {
-        const auto* a = reinterpret_cast<const std::uint32_t*>(codes + static_cast<std::uint64_t>(r) * width) + blk * 8U + 2U * q;
-        a0[r] = active && r < R ? a[0] : 0U;
-        a1[r] = active && r < R ? a[1] : 0U;
-    }
-    constexpr unsigned OWN = RP >= 4U ? RP / 4U : RP;
-    const unsigned first = RP >= 4U ? (q >> 1U) * (RP / 2U) + (q & 1U) * (RP / 4U) : 0U;
     const std::uint32_t n0 = blockIdx.x * KO;
+    if constexpr (M) {
+        rows_mma_dots<R, RP, KO, Source>(site, codes, width, nblocks, row_bytes, DOT, DW);
+    } else {
+        const unsigned lane = threadIdx.x & 31U, q = lane & 3U;
+        const std::uint32_t blk = (threadIdx.x >> 5U) * 8U + (lane >> 2U);
+        const bool active = blk < nblocks;
+        std::uint32_t a0[RP], a1[RP];
+#pragma unroll
+        for (unsigned r = 0; r < RP; ++r) {
+            const auto* a = reinterpret_cast<const std::uint32_t*>(codes + static_cast<std::uint64_t>(r) * width) + blk * 8U + 2U * q;
+            a0[r] = active && r < R ? a[0] : 0U;
+            a1[r] = active && r < R ? a[1] : 0U;
+        }
+        constexpr unsigned OWN = RP >= 4U ? RP / 4U : RP;
+        const unsigned first = RP >= 4U ? (q >> 1U) * (RP / 2U) + (q & 1U) * (RP / 4U) : 0U;
 #pragma unroll 2
-    for (unsigned o = 0; o < KO; ++o) {
-        const std::uint32_t n = n0 + o;
-        const bool valid = active && n < site.outputs;
-        const unsigned char* wrow = site.seg[0].w;
-        if (n < site.outputs) {
-            const KSeg& sg = site.seg[find_seg(site, n)];
-            wrow = sg.w + static_cast<std::uint64_t>(n - sg.begin) * row_bytes;
-        }
-        const auto* h = reinterpret_cast<const unsigned short*>(wrow + Source::kBlockBytes * (active ? blk : 0U));
-        const float dw = Source::scale_bits(valid ? h[0] : static_cast<unsigned short>(0));
-        const unsigned short* c = h + 1U + 4U * q;
-        const std::uint32_t w0 = valid ? Source::word(c, 0) : 0U;
-        const std::uint32_t w1 = valid ? Source::word(c, 1) : 0U;
-        int dot[RP];
-#pragma unroll
-        for (unsigned r = 0; r < RP; ++r)
-            dot[r] = __dp4a(static_cast<int>(w1), static_cast<int>(a1[r]), __dp4a(static_cast<int>(w0), static_cast<int>(a0[r]), 0));
-        if constexpr (RP >= 4U) {
-            const bool hi2 = (q & 2U) != 0U, hi1 = (q & 1U) != 0U;
-#pragma unroll
-            for (unsigned i = 0; i < RP / 2U; ++i) {
-                const int keep = hi2 ? dot[i + RP / 2U] : dot[i], send = hi2 ? dot[i] : dot[i + RP / 2U];
-                dot[i] = keep + __shfl_xor_sync(0xffffffffU, send, 2);
+        for (unsigned o = 0; o < KO; ++o) {
+            const std::uint32_t n = n0 + o;
+            const bool valid = active && n < site.outputs;
+            const unsigned char* wrow = site.seg[0].w;
+            if (n < site.outputs) {
+                const KSeg& sg = site.seg[find_seg(site, n)];
+                wrow = sg.w + static_cast<std::uint64_t>(n - sg.begin) * row_bytes;
             }
+            const auto* h = reinterpret_cast<const unsigned short*>(wrow + Source::kBlockBytes * (active ? blk : 0U));
+            const float dw = Source::scale_bits(valid ? h[0] : static_cast<unsigned short>(0));
+            const unsigned short* c = h + 1U + 4U * q;
+            const std::uint32_t w0 = valid ? Source::word(c, 0) : 0U;
+            const std::uint32_t w1 = valid ? Source::word(c, 1) : 0U;
+            int dot[RP];
 #pragma unroll
-            for (unsigned i = 0; i < RP / 4U; ++i) {
-                const int keep = hi1 ? dot[i + RP / 4U] : dot[i], send = hi1 ? dot[i] : dot[i + RP / 4U];
-                dot[i] = keep + __shfl_xor_sync(0xffffffffU, send, 1);
+            for (unsigned r = 0; r < RP; ++r)
+                dot[r] = __dp4a(static_cast<int>(w1), static_cast<int>(a1[r]), __dp4a(static_cast<int>(w0), static_cast<int>(a0[r]), 0));
+            if constexpr (RP >= 4U) {
+                const bool hi2 = (q & 2U) != 0U, hi1 = (q & 1U) != 0U;
+#pragma unroll
+                for (unsigned i = 0; i < RP / 2U; ++i) {
+                    const int keep = hi2 ? dot[i + RP / 2U] : dot[i], send = hi2 ? dot[i] : dot[i + RP / 2U];
+                    dot[i] = keep + __shfl_xor_sync(0xffffffffU, send, 2);
+                }
+#pragma unroll
+                for (unsigned i = 0; i < RP / 4U; ++i) {
+                    const int keep = hi1 ? dot[i + RP / 4U] : dot[i], send = hi1 ? dot[i] : dot[i + RP / 4U];
+                    dot[i] = keep + __shfl_xor_sync(0xffffffffU, send, 1);
+                }
+            } else {
+#pragma unroll
+                for (unsigned r = 0; r < RP; ++r) {
+                    dot[r] += __shfl_xor_sync(0xffffffffU, dot[r], 1);
+                    dot[r] += __shfl_xor_sync(0xffffffffU, dot[r], 2);
+                }
             }
-        } else {
+            if (active && (RP >= 4U || q == 0U)) {
+                int* out = DOT + (blk * KO + o) * RP + first;
 #pragma unroll
-            for (unsigned r = 0; r < RP; ++r) {
-                dot[r] += __shfl_xor_sync(0xffffffffU, dot[r], 1);
-                dot[r] += __shfl_xor_sync(0xffffffffU, dot[r], 2);
+                for (unsigned i = 0; i < OWN; ++i) out[i] = dot[i];
+                if (q == 0U) DW[blk * KO + o] = dw;
             }
-        }
-        if (active && (RP >= 4U || q == 0U)) {
-            int* out = DOT + (blk * KO + o) * RP + first;
-#pragma unroll
-            for (unsigned i = 0; i < OWN; ++i) out[i] = dot[i];
-            if (q == 0U) DW[blk * KO + o] = dw;
         }
     }
     __syncthreads();
@@ -747,7 +811,7 @@ __global__ __launch_bounds__(RP > 8U ? 768 : 1024) void project_rows_ks_kernel(t
     }
 }
 
-template <auto S, unsigned R, unsigned KO, class Source, class Numeric, class Capture = NoCapture> cudaError_t launch_rows_ks_o(cudaStream_t stream, const typename Numeric::Site& k, const std::int8_t* codes,
+template <auto S, unsigned R, unsigned KO, class Source, class Numeric, class Capture = NoCapture, bool M = false> cudaError_t launch_rows_ks_o(cudaStream_t stream, const typename Numeric::Site& k, const std::int8_t* codes,
                                                            const float* deltas, std::uint32_t pitch) {
     constexpr unsigned RP = R <= 1U ? 1U : R <= 2U ? 2U : R <= 4U ? 4U : R <= 8U ? 8U : 16U;
     // 256 blocks = width 8192 bound of the <= 8-row forms; RP 16 forms take width <= 6144 (192 blocks)
@@ -756,16 +820,26 @@ template <auto S, unsigned R, unsigned KO, class Source, class Numeric, class Ca
     static std::once_flag once;
     static cudaError_t attr = cudaSuccess;
     std::call_once(once, [] {
-        attr = cudaFuncSetAttribute(project_rows_ks_kernel<S, R, RP, KO, Source, Numeric, Capture>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        attr = cudaFuncSetAttribute(project_rows_ks_kernel<S, R, RP, KO, Source, Numeric, Capture, M>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     static_cast<int>(kAttr));
     });
     if (attr != cudaSuccess) return attr;
-    project_rows_ks_kernel<S, R, RP, KO, Source, Numeric, Capture><<<(k.outputs + KO - 1U) / KO, 32U * ((nb + 7U) / 8U), smem, stream>>>(k, codes, deltas, pitch);
+    project_rows_ks_kernel<S, R, RP, KO, Source, Numeric, Capture, M><<<(k.outputs + KO - 1U) / KO, 32U * ((nb + 7U) / 8U), smem, stream>>>(k, codes, deltas, pitch);
     return cudaGetLastError();
 }
 template <auto S, unsigned R, class Source, class Numeric, class Capture = NoCapture> cudaError_t launch_rows_ks_r(cudaStream_t stream, const typename Numeric::Site& k, const std::int8_t* codes,
                                                            const float* deltas, std::uint32_t pitch) {
     const int pick = Numeric::rows_ks_out(k.width / 32U);   // #680: outputs per CTA (policy + env stay with the engine)
+    if constexpr (R > 4U) {   // RP 8 / 16: integer dots on the tensor cores (same bits), engine switch
+        if (Numeric::rows_mma_enabled()) {
+            if constexpr (R > 8U)
+                return pick == 2 ? launch_rows_ks_o<S, R, 2, Source, Numeric, Capture, true>(stream, k, codes, deltas, pitch)
+                                 : launch_rows_ks_o<S, R, 4, Source, Numeric, Capture, true>(stream, k, codes, deltas, pitch);
+            return pick == 4 ? launch_rows_ks_o<S, R, 4, Source, Numeric, Capture, true>(stream, k, codes, deltas, pitch)
+                 : pick == 2 ? launch_rows_ks_o<S, R, 2, Source, Numeric, Capture, true>(stream, k, codes, deltas, pitch)
+                             : launch_rows_ks_o<S, R, 8, Source, Numeric, Capture, true>(stream, k, codes, deltas, pitch);
+        }
+    }
     if constexpr (R > 8U) {   // RP 16: KO 4 (192 blocks: 64.5 KB of shared memory), KO 2 on request
         return pick == 2 ? launch_rows_ks_o<S, R, 2, Source, Numeric, Capture>(stream, k, codes, deltas, pitch)
                          : launch_rows_ks_o<S, R, 4, Source, Numeric, Capture>(stream, k, codes, deltas, pitch);

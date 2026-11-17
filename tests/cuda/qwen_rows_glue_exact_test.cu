@@ -1,4 +1,5 @@
-// Decode-rows exactness + timing test for src/cuda/models/qwen/qwen_dense.cu (project / quantize / shared_expert at rows 1..8).
+// Decode-rows exactness + timing test for src/cuda/models/qwen/qwen_dense.cu (project / quantize / shared_expert at rows 1..16;
+// STRIX_T_MAXROWS=8 = the old 1..8 set). STRIX_QRTX_ROWS_MMA=1 vs unset must give the same HASH lines (bit-identical).
 // The new kernels are default ON with env off switches (STRIX_QRTX_ROWS_CP, ...); run this exe once per setting:
 //   qwen_rows_glue_exact_test [--time]  > log      prints "HASH <case> rows=<r> <fnv64 of every output byte>" and (--time) "TIME ..."
 //   qwen_rows_glue_exact_test --compare old.log new.log   (host only) -> PASS/FAIL counts
@@ -68,6 +69,8 @@ int main(int argc, char** argv) {
     cudaStream_t st; CK(cudaStreamCreate(&st));
     cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
     const char* only = std::getenv("STRIX_T_ONLY"); const char* onlyr = std::getenv("STRIX_T_ROWS");
+    const char* maxr_env = std::getenv("STRIX_T_MAXROWS");
+    const std::uint32_t maxr = std::min<std::uint32_t>(16, maxr_env ? static_cast<std::uint32_t>(std::atoi(maxr_env)) : 16U);
     for (auto& c : cases) {
         if (only && std::strcmp(only, c.name)) continue;
         const std::uint32_t nb = c.width / 32;
@@ -85,31 +88,31 @@ int main(int argc, char** argv) {
                 }
                 unsigned char* p; CK(cudaMalloc(&p, h.size() + 64)); CK(cudaMemcpy(p, h.data(), h.size(), cudaMemcpyHostToDevice)); w[k].push_back(p);
             }
-        for (std::uint32_t rows = 1; rows <= 8; ++rows) {
+        for (std::uint32_t rows = 1; rows <= maxr; ++rows) {
             if (onlyr && rows != static_cast<std::uint32_t>(std::atoi(onlyr))) continue;
             std::vector<std::uint16_t> hin(static_cast<std::size_t>(rows) * c.width);
             for (auto& x : hin) x = bf(nd(rng) * (1.0F + (rng() % 8)));
             std::uint16_t* din; CK(cudaMalloc(&din, hin.size() * 2)); CK(cudaMemcpy(din, hin.data(), hin.size() * 2, cudaMemcpyHostToDevice));
-            std::int8_t* codes; float* deltas; CK(cudaMalloc(&codes, 8 * c.width + 64)); CK(cudaMalloc(&deltas, nb * pitch * 4 + 64));
+            std::int8_t* codes; float* deltas; CK(cudaMalloc(&codes, 16 * c.width + 64)); CK(cudaMalloc(&deltas, nb * pitch * 4 + 64));
             CK(qd::quantize(st, rows, c.width, qd::Input::bf16, din, c.width, codes, deltas, pitch));
             std::vector<void*> outs; std::vector<std::size_t> osz;
             auto make_site = [&](int k, std::vector<void*>* ob, float* gate) {
                 qd::Site s{}; s.store = c.store; s.width = c.width; s.segments = static_cast<std::uint32_t>(c.outs.size());
                 for (std::size_t m = 0; m < c.outs.size(); ++m) {
                     const std::size_t es = (c.store == qd::Store::f32 || c.store == qd::Store::f32_round_bf16) ? 4 : 2;
-                    const std::size_t bytes = es * 8 * c.outs[m] + 64;
+                    const std::size_t bytes = es * 16 * c.outs[m] + 64;
                     void* o; if (ob->size() <= m) { CK(cudaMalloc(&o, bytes)); CK(cudaMemset(o, 0xAB, bytes)); ob->push_back(o); osz.push_back(bytes); }
                     s.segment[m] = {w[k][m], c.outs[m], (*ob)[m], c.outs[m]};
                 }
                 s.gate = gate; s.gate_stride = 1; return s;
             };
-            float* gate; CK(cudaMalloc(&gate, 64)); { float g[8]; for (auto& x : g) x = 0.25F + (rng() % 100) / 50.0F; CK(cudaMemcpy(gate, g, 32, cudaMemcpyHostToDevice)); }
+            float* gate; CK(cudaMalloc(&gate, 64)); { float g[16]; for (auto& x : g) x = 0.25F + (rng() % 100) / 50.0F; CK(cudaMemcpy(gate, g, 64, cudaMemcpyHostToDevice)); }
             qd::Site s0 = make_site(0, &outs, gate);
             CK(qd::project(st, s0, rows, codes, deltas, pitch)); CK(cudaStreamSynchronize(st));
             std::vector<unsigned char> all;
             for (std::size_t m = 0; m < outs.size(); ++m) { std::vector<unsigned char> h(osz[m]); CK(cudaMemcpy(h.data(), outs[m], osz[m], cudaMemcpyDeviceToHost)); all.insert(all.end(), h.begin(), h.end()); }
             std::printf("HASH %s rows=%u %016llx\n", c.name, rows, static_cast<unsigned long long>(fnv(all)));
-            if (timing && c.timed && (rows == 1 || rows == 4 || rows == 8)) {
+            if (timing && c.timed && (rows == 1 || rows == 4 || rows == 8 || rows == 12 || rows == 16)) {
                 std::vector<qd::Site> sites; for (int k = 0; k < copies; ++k) sites.push_back(make_site(k, &outs, gate));
                 for (int k = 0; k < copies; ++k) CK(qd::project(st, sites[k], rows, codes, deltas, pitch));   // warm
                 CK(cudaStreamSynchronize(st));
