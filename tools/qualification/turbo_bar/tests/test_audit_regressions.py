@@ -22,9 +22,9 @@ def http_fixture(items, suite="tasks"):
             "protocol": {"contexts": [8192], "seeds": [1234], "suites": {suite: suite_record(items)}}}
 
 
-def task_items():
+def task_items(per_split=3):
     return [{"id": f"{k}-{s}-{i}", "kind": k, "split": s, "messages": [], "check": {}, "max_tokens": 1}
-            for k in ("math", "code", "needle", "json") for s in ("explore", "confirm") for i in range(3)]
+            for k in ("math", "code", "needle", "json") for s in ("explore", "confirm") for i in range(per_split)]
 
 
 def scored(m, arm, suite="tasks"):
@@ -111,7 +111,9 @@ class AuditRegressions(unittest.TestCase):
             report._load_scored(self.tmp, "T:a", m, "tasks")
 
     def test_task_pairing_cannot_intersect_away_failures(self):
-        m = http_fixture(task_items())
+        # 8 paired items per split: the exact conservative binary bound (stats.binary_ci) needs n >= 7 to show a
+        # uniform T win at margin 0 (1 - (0.05/4)**(1/n) <= 0.5); 3 items stay INCONCLUSIVE by design.
+        m = http_fixture(task_items(8))
         for arm in ("E", "R", "T:a"):
             write_jsonl(self.tmp / f"scored.{safe_name(arm)}.jsonl", scored(m, arm))
         res = report.task_results(self.tmp, m, ["T:a"], 0, {"B": 100, "seed": 1})
