@@ -335,11 +335,8 @@ cudaError_t attention_prefill_flash8(const AttentionDims& d, const float* q, con
                                      const KvShadowE4m3& sh, std::uint32_t pos0, std::uint32_t rows, float* out, cudaStream_t stream) {
     if (d.head_dim != D || rows == 0 || d.kv_heads == 0 || d.heads % d.kv_heads != 0 || d.heads / d.kv_heads > 8 || pos0 + rows > d.max_positions)
         return cudaErrorInvalidValue;
-    static bool attr = false;
-    if (!attr) {
-        if (auto e = cudaFuncSetAttribute(flash8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM); e != cudaSuccess) return e;
-        attr = true;
-    }
+    // Attributes belong to the current device; CUDA serializes the update.
+    if (auto e = cudaFuncSetAttribute(flash8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM); e != cudaSuccess) return e;
     const Shadow s{sh.k8, sh.ks, sh.v8t, sh.vs, attn8_capacity(d)};
     flash8_kernel<<<dim3((rows + QB - 1) / QB, d.heads), 256, SMEM, stream>>>(d, q, qv, gate, gv, s, pos0, rows, out);
     return cudaGetLastError();
