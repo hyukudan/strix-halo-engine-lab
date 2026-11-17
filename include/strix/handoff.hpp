@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -116,14 +117,19 @@ public:
     Sender(const Sender&) = delete;
     Sender& operator=(const Sender&) = delete;
 
-    // `width` hints the element size of the bytes (2 for BF16, 4 for FP32) to the codec.
-    void submit(const PieceHeader& header, std::span<const bp_codec::Region> regions, std::function<void()> release = {});
+    // `width` hints the element size of the bytes (2 for BF16, 4 for FP32) to the codec. `identity` sends this piece
+    // uncoded even in a bp-v1 session (every receiver accepts an identity frame; a latency-critical piece skips the codec).
+    void submit(const PieceHeader& header, std::span<const bp_codec::Region> regions, std::function<void()> release = {},
+                bool identity = false);
     void submit(const PieceHeader& header, std::vector<std::uint8_t> bytes, std::uint32_t width = 1);
     // Every piece on the wire, END + manifest sent on every stream; waits for and returns the receiver's reply.
     // Rethrows the first transport or encoder error.
     Reply finish();
     // Safe from any thread, also while finish() waits on another one (which then throws).
     void abort(std::string_view why) noexcept;
+    // One failure observer; also called immediately for an already failed Sender. Runs outside Sender locks,
+    // must not throw or call this Sender. Captures must outlive the Sender (or use weak ownership).
+    void on_failure(std::function<void(std::exception_ptr)> notify);
     [[nodiscard]] SenderStats stats() const;
     [[nodiscard]] Codec codec() const noexcept;
 

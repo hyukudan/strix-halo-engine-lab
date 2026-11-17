@@ -12,6 +12,7 @@
 #pragma once
 #include "strix/weight/admission.hpp"
 
+#include "strix/residency/expert_residency.hpp"
 #include "strix/qwen_prefill_trace.hpp"
 #include "strix/qwen_prefill_schedule.hpp"
 #include "strix/cuda/qwen_route_bf16.hpp"
@@ -52,11 +53,20 @@ struct Config {
     // Decode with a sidecar: the MTP draft head covers these token ids (little-endian uint32 file, e.g.
     // data/draft-vocab/core64k.bin); empty = the whole vocabulary. Drafts never change committed tokens.
     std::string draft_vocab;
+    // Diagnostic: append every block's router selections (all rows, all layers) to this EXTR01 file
+    // (scripts/bench/residency/residency_sim.py). Forces eager windows (no graphs); empty = off, no change.
+    std::string expert_trace;
+    // Expert residency (docs/engine/memory/expert-residency.md): automatic = fully resident when the model fits the card
+    // budget (today's route, nothing new happens), else tiered (hot experts on the card, the rest computed on the host,
+    // bitwise equal). The caller applies strix::residency::with_environment before constructing the engine.
+    strix::residency::Options residency;
     // false: run() keeps the state on the device only (no D2H staging, no pieces): a decode session that never hands off.
     bool export_state = true;
     // Explicit unqualified CUDA A8 route-storage candidate. Omitted: environment;
     // false: individual OFF. Baseline/defaults/exact masters always suppress it.
     std::optional<bool> moe_route_bf16;
+    // Frozen by the common resolver; direct API callers resolve once at construction.
+    std::optional<qwen_route::Policy> route_policy;
     // Explicit source diagnostic only: does not admit ordinary product MTP.
     bool diagnostic_bf16_mtp = false;
     // TURBO onfly weights (--profile turbo --turbo-weights onfly, resolved by strix/cuda/qwen_turbo.hpp): convert the
@@ -65,6 +75,14 @@ struct Config {
     bool turbo_onfly_nvfp4 = false;
     // TURBO cache namespace (strix::profile::turbo::cache_namespace); empty outside turbo. Part of the prefix identity.
     std::string turbo_namespace;
+    // Prefill arithmetic forms of the FAST profile (CUDA numerical identities, include/strix/profiles/qwen_cuda.hpp).
+    // All false = the exact CUDA path. Set only by the profile resolver (or its named overrides), never by getenv here.
+    struct Forms {
+        bool hc_mma = false;   // hyper-connection projection / output on FP16 tensor cores, FP32 accumulation
+        bool mtp_mma = false;  // MTP fused projection on FP16 tensor cores, FP32 accumulation
+        bool qsa_mma = false;  // QSA prefill attention (scores and output) on FP16 tensor cores, FP32 accumulation
+        bool moe_mma = false;  // routed-MoE prefill project/down: int8 IMMA block dots, ONE FP32 FMA chain per output (not the HIP four)
+    } forms;
 };
 
 // Diagnostic snapshot, not the node wire or a portable session/cache format.
@@ -101,6 +119,9 @@ struct Timing {
     double total_s = 0, first_block_s = 0;
     std::vector<double> block_s;       // per block, device time
     std::uint64_t rows = 0;
+    // Forms dispatched by this run, reported only after successful device synchronization.
+    Config::Forms executed_forms;
+    bool executed_moe_route_bf16 = false;
 };
 
 // One decode/verify step: rows consecutive tokens at positions [position, position + rows) continuing the session
@@ -151,6 +172,19 @@ struct CohortRows {
     std::uint32_t rows = 0;
     std::uint64_t position = 0;
 };
+
+// The residency decision of a configuration, resolved from the GGUF headers and the live card/host numbers without
+// loading the model (the same function the engine calls before its upload).
+struct ResidencyPlan {
+    strix::residency::ModelBytes model;
+    strix::residency::CardBytes card;
+    strix::residency::SessionBytes session;
+    strix::residency::HostBytes host;
+    strix::residency::Decision decision;
+    std::uint32_t block_rows = 0;     // rows per prefill block in the decided mode (tiered: the exchange's rows)
+    std::string json;                 // decision_json + the numbers it used
+};
+[[nodiscard]] ResidencyPlan plan_residency(const Config& config);
 
 class Prefill {
 public:
@@ -271,6 +305,15 @@ public:
 
     // Diagnostics for the bitwise gates: the wide residual rows after layer 47 of the last run (BF16 [rows][10240]).
     [[nodiscard]] std::string describe() const;
+    // Residency: the decision JSON (mode, reason, pool, slots, positions) and, tiered only, the receipt JSON (hit rate,
+    // promotions, host time); the receipt of a fully resident engine is {"expert_residency":"full"}.
+    [[nodiscard]] bool tiered() const;
+    [[nodiscard]] std::string residency_json() const;
+    [[nodiscard]] std::string residency_receipt_json() const;
+    // Resolved card budget (tiered or an explicit cap, including full mode; 0 = full mode without an explicit cap) and the
+    // device bytes it holds once loaded (measured): a server admits sessions against budget - engine bytes.
+    [[nodiscard]] std::uint64_t card_budget_bytes() const;
+    [[nodiscard]] std::uint64_t engine_device_bytes() const;
     [[nodiscard]] qwen_route::Identity numerical_identity() const;
     [[nodiscard]] qwen_route::Policy route_storage_policy() const;
     // No window/chunk in flight. Armed MTP includes committed predictor pairs and

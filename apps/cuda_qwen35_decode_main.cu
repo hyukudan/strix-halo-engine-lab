@@ -160,6 +160,7 @@ int main(int argc, char** argv) {
         std::string arith_name = "mma3";
         std::string pf_arith, pf_dump;            // --prefill-arith exact|flash|fast|fast2: large-M prefill (absent: windows of --rows)
         std::uint32_t pf_chunk = 2048, pf_repeat = 1, pf_slots = 2;
+        std::uint32_t pf_inflight = q::EngineOptions{}.prefill_inflight, pf_ramp = 0;  // bounded submission / ramp
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
             auto next = [&]() -> std::string {
@@ -179,6 +180,8 @@ int main(int argc, char** argv) {
             else if (a == "--prefill-chunk") pf_chunk = strix::core::parse_u32(next());
             else if (a == "--prefill-dump") pf_dump = next();  // last-token logits of the LAST prefill (float32 [vocab])
             else if (a == "--prefill-slots") pf_slots = strix::core::parse_u32(next());
+            else if (a == "--prefill-inflight") pf_inflight = strix::core::parse_u32(next());  // chunks queued ahead of the GPU, 0 = unbounded
+            else if (a == "--prefill-ramp") pf_ramp = strix::core::parse_u32(next());          // first chunk rows, doubling; 0 = off
             else if (a == "--prefill-repeat") pf_repeat = strix::core::parse_u32(next());
             else if (a == "--layers") layers_override = strix::core::parse_u32(next());
             else if (a == "--graphs") graphs = next() != "0";
@@ -245,6 +248,8 @@ int main(int argc, char** argv) {
         }
         opt.prefill_chunk = pf_chunk;
         opt.prefill_slots = pf_slots;
+        opt.prefill_inflight = pf_inflight;
+        opt.prefill_ramp = pf_ramp;
         if (print_cfg) {
             opt.multi_gemv = multi;
             q::print_effective_config(opt, arith_name.c_str(), stdout);

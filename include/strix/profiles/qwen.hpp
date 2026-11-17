@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/engine_profile.hpp"
+#include "strix/onfly_i4.hpp"
 #include "strix/prefill_identity.hpp"
 #include <array>
 #include <cstdlib>
@@ -24,14 +25,20 @@ using ::strix::profile::kind_name;
 using ::strix::profile::status_name;
 #include "strix/qwen_profile_table.hpp"
 inline std::span<const Lever> levers() { return table; }
-inline Name parse(std::string_view value) { return ::strix::profile::parse(value); }  // default|fast|quality|turbo
+inline Name parse(std::string_view value) {
+    if (value == "exact") return Name::standard;
+    return ::strix::profile::parse(value);
+}  // default|fast|quality|turbo
 inline constexpr std::string_view kTurboVersion = "qwen-turbo-v1";
 // Weight sources this build loads under turbo (onfly / converted flip to runnable with their loaders).
-inline constexpr ::strix::profile::turbo::WeightCaps kWeightCaps{};
+inline constexpr ::strix::profile::turbo::WeightCaps kWeightCaps{
+    {true, true, false}, {false, false, false, false, true, false, false, false, false}, "rtn-g64",
+    "onfly INT4 g64 is built for decode dense projections only (qwen)", "converted low-bit pack loader is not implemented in this build"};
 struct Resolution {
     Name profile = Name::standard;
     std::vector<Entry> entries;
     ::strix::profile::turbo::Weights weights{};  // weight toggle (native outside turbo)
+    ::strix::onfly_i4::Resolved onfly{};
     bool is_turbo() const { return profile == Name::turbo; }
     std::string versioned() const { return is_turbo() ? std::string(kTurboVersion) : std::string(name(profile)); }
     // Effective lever values (not how they were set), as in the shared strix::profile::Resolution::fingerprint().
@@ -110,7 +117,8 @@ struct Resolution {
             auto t = serve::Json::object();
             t.set("version", serve::Json(std::string(kTurboVersion)));
             t.set("weights_requested", serve::Json(weights.requested_text()));
-            t.set("weights", serve::Json(weights.identity()));
+            t.set("weights", serve::Json(onfly.active() ? onfly.identity() : weights.identity()));
+            if (onfly.active()) t.set("onfly", serve::parse_json(onfly.json()));
             t.set("weights_origin", serve::Json(weights.origin));
             t.set("weights_reason", serve::Json(weights.reason));
             t.set("cache_namespace", serve::Json(cache_namespace()));
@@ -149,7 +157,7 @@ inline std::string marker(Name profile, Status status, std::string_view value) {
     return std::string(name(profile)) + ":" + status_name(status) + ":" + std::string(value);
 }
 inline Resolution resolve(Name profile, const Inputs& inputs = {}, std::span<const Lever> rows = levers()) {
-    Resolution out{profile, {}, {}};
+    Resolution out{profile, {}, {}, {}};
     const char* allow = environment(inputs.env, "STRIX_QWEN_PROFILE_ALLOW_PENDING");
     const bool allow_pending = inputs.allow_pending || (allow && std::string_view(allow) == "1");
     out.weights = ::strix::profile::turbo::resolve_weights(out.is_turbo(), inputs.weights,
@@ -250,7 +258,8 @@ inline bool metadata_environment(std::string_view key) {
 inline bool policy_option(std::string_view key) {
     return key == "--profile" || key == "--allow-pending";
 }
-inline bool take_option(int argc, char** argv, int& i, std::optional<Name>& profile, Inputs& inputs) {
+inline bool take_option(int argc, char** argv, int& i, std::optional<Name>& profile, Inputs& inputs,
+        std::span<const Lever> rows = levers()) {
     const std::string_view arg = argv[i];
     const auto equal = arg.find('=');
     const auto key = arg.substr(0, equal);
@@ -265,7 +274,7 @@ inline bool take_option(int argc, char** argv, int& i, std::optional<Name>& prof
         return true;
     }
     const Lever* lever = nullptr;
-    for (const auto& row : levers()) if (!row.native_option && key == row.option) lever = &row;
+    for (const auto& row : rows) if (!row.native_option && key == row.option) lever = &row;
     if (key != "--profile" && !lever) return false;
     const auto value = equal != std::string_view::npos ? arg.substr(equal + 1U) :
         (i + 1 < argc ? std::string_view(argv[++i]) : std::string_view{});

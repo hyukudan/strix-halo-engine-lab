@@ -194,7 +194,7 @@ __global__ void msa_prep_kernel(const SeqView* seqs, const std::uint32_t* row_se
     const std::size_t row = blockIdx.x;
     const unsigned head = blockIdx.y, lane = threadIdx.x;
     const SeqView sq = seqs[row_seq[row]];
-    const std::uint64_t pos = row - sq.row0;
+    const std::uint64_t pos = row - sq.row0 + sq.pos0;
     const RopeRow& rr = rope[pos];
     float x[4];
     if (head < 64) {
@@ -249,7 +249,7 @@ __global__ void index_scores_kernel(const SeqView* seqs, const std::uint32_t* ro
     std::uint64_t count = 0;
     if (live) {
         sq = seqs[row_seq[row]];
-        count = row - sq.row0 + 1;
+        count = row - sq.row0 + sq.pos0 + 1;
         for (unsigned i = lane; i < 128; i += 32) qs[w][i] = iq[(row * 4 + g) * 128 + i];
     }
     __syncwarp();
@@ -279,7 +279,7 @@ __global__ void select_kernel(const SeqView* seqs, const std::uint32_t* row_seq,
     if (item >= rows * 4) return;
     const std::size_t row = item / 4;
     const SeqView sq = seqs[row_seq[row]];
-    const std::uint64_t count = row - sq.row0 + 1, blocks = (count + kBlock - 1) / kBlock;
+    const std::uint64_t count = row - sq.row0 + sq.pos0 + 1, blocks = (count + kBlock - 1) / kBlock;
     std::uint32_t* out = sel + item * kTopK;
     if (blocks <= kTopK) {
         for (std::uint32_t b = 0; b < blocks; ++b) out[b] = b;
@@ -319,7 +319,7 @@ __global__ void attend_kernel(const SeqView* seqs, const std::uint32_t* row_seq,
     const std::size_t row = warp / 64;
     const unsigned h = static_cast<unsigned>(warp % 64), g = h / 16;
     const SeqView sq = seqs[row_seq[row]];
-    const std::uint64_t count = row - sq.row0 + 1;
+    const std::uint64_t count = row - sq.row0 + sq.pos0 + 1;
     float qv[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) qv[i] = q[(row * 64 + h) * 128 + 4 * lane + i];
@@ -392,7 +392,7 @@ __global__ __launch_bounds__(256) void index_scores_tiled_kernel(const SeqView* 
     const uint2 tile = tiles[blockIdx.x];  // (first row, rows)
     const unsigned g = blockIdx.y, b = blockIdx.z, t = threadIdx.x;
     const SeqView sq = seqs[row_seq[tile.x]];
-    const std::uint64_t last_count = tile.x + tile.y - sq.row0;  // visible positions of the tile's last row
+    const std::uint64_t last_count = tile.x + tile.y - sq.row0 + sq.pos0;  // visible positions of the tile's last row
     if (static_cast<std::uint64_t>(b) * kBlock >= last_count || (last_count + kBlock - 1) / kBlock <= kTopK) return;
     for (unsigned i = t; i < 128 * 32; i += 256) {
         const unsigned key = i / 32, q4 = i % 32;
@@ -411,7 +411,7 @@ __global__ __launch_bounds__(256) void index_scores_tiled_kernel(const SeqView* 
     }
     __syncthreads();
     const unsigned r = t / 8;
-    const std::uint64_t count = static_cast<std::uint64_t>(tile.x) + r - sq.row0 + 1;
+    const std::uint64_t count = static_cast<std::uint64_t>(tile.x) + r - sq.row0 + sq.pos0 + 1;
     float best = neg_inf();
     if (r < tile.y && (count + kBlock - 1) / kBlock > kTopK) {
         for (unsigned j = 0; j < 16; ++j) {
@@ -457,7 +457,7 @@ __global__ __launch_bounds__(512) void attend_shared_kernel(const SeqView* seqs,
     const std::size_t row = blockIdx.x;
     const unsigned g = blockIdx.y, w = threadIdx.x / 32, lane = threadIdx.x & 31U, h = 16 * g + w;
     const SeqView sq = seqs[row_seq[row]];
-    const std::uint64_t count = row - sq.row0 + 1;
+    const std::uint64_t count = row - sq.row0 + sq.pos0 + 1;
     for (unsigned i = lane; i < 128; i += 32) qs[w * 128 + i] = q[(row * 64 + h) * 128 + i];
     const float* qh = qs + w * 128;
     const std::uint32_t* blocks = sel + (row * 4 + g) * kTopK;
@@ -630,7 +630,11 @@ void msa_attend(const SeqView* seqs_d, const std::uint32_t* row_seq, std::size_t
     sl.lap(2);
 }
 void export_layer(const SeqView& seq, unsigned layer, unsigned rank, std::uint64_t n, std::uint8_t* dst, cudaStream_t s) {
-    const std::size_t base = static_cast<std::size_t>(layer) * seq.cap;
+    export_layer(seq, layer, rank, 0, n, dst, s);
+}
+void export_layer(const SeqView& seq, unsigned layer, unsigned rank, std::uint64_t r0, std::uint64_t n, std::uint8_t* dst, cudaStream_t s) {
+    if (r0 > seq.cap || n > seq.cap - r0 || rank >= 2) throw std::invalid_argument("export_layer: bad range/rank");
+    const std::size_t base = static_cast<std::size_t>(layer) * seq.cap + r0;
     // K and V: rows of 4 heads x 128 BF16 (1024 B) in the cache, this rank's 2 heads (512 B) per row in the blob
     check(cudaMemcpy2DAsync(dst, 512, reinterpret_cast<const std::uint8_t*>(seq.k + base * 512) + rank * 512, 1024, 512, n,
                             cudaMemcpyDeviceToHost, s), "export k");

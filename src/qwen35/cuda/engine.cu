@@ -19,6 +19,7 @@
 #include "strix/cuda_core/norms.hpp"
 #include "strix/cuda_core/dense_big.hpp"
 #include "strix/cuda_core/rope.hpp"
+#include "strix/cuda_core/submit_window.hpp"
 #include "strix/gguf_reader.hpp"
 #include "../../core/dense_linear.hpp"
 
@@ -337,6 +338,8 @@ struct CudaEngine::Impl {
     std::vector<cc::GdnCommitLayer> commit_layers;
 
     std::uint32_t committed = 0, last_rows = 0;
+    std::vector<cudaEvent_t> last_chunk_ends;  // prefill(): end event of each queued chunk (SubmitWindow input)
+    std::uint32_t last_window_waits = 0;       // host waits the bounded submission issued in the last prefill
     bool graphs_on = true;
     struct Graph {
         cc::UniqueHandle<cudaGraphExec_t, cudaGraphExecDestroy> exec;
@@ -1090,11 +1093,16 @@ struct CudaEngine::Impl {
             }
             return o;
         }
-        const std::uint32_t C = opt.prefill_chunk, nchunks = 1 + (n - 1) / C, H = c.hidden;
+        const std::uint32_t C = opt.prefill_chunk, H = c.hidden;
+        // chunk plan (optional ramp from idle) + bounded submission: cuda_core/submit_window.hpp
+        const auto plan = cc::plan_chunks(n, C, opt.prefill_ramp, 128);
+        const std::uint32_t nchunks = static_cast<std::uint32_t>(plan.size());
         pf_init(std::min<std::uint32_t>(std::max<std::uint32_t>(1, opt.prefill_slots), nchunks));
         pf.terms = pf_terms();
         const std::uint32_t nslots = static_cast<std::uint32_t>(pf.sl.size());
-        if (!opt.quiet) std::fprintf(stderr, "prefill effective slots: %u\n", std::min(nslots, nchunks));
+        if (!opt.quiet)
+            std::fprintf(stderr, "prefill effective slots: %u; chunks: %u (first %u rows, ramp %u); inflight: %u%s\n", std::min(nslots, nchunks),
+                         nchunks, plan.front().rows, opt.prefill_ramp, opt.prefill_inflight, opt.prefill_inflight ? " chunks" : " (unbounded)");
         CK(cudaStreamSynchronize(s));
         std::uint32_t par0 = 0;
         CK(cudaMemcpy(&par0, d_parity, 4, cudaMemcpyDeviceToHost));
@@ -1116,16 +1124,22 @@ struct CudaEngine::Impl {
         CK(cudaEventRecord(start, s));
         ev.resize(static_cast<std::size_t>(nchunks) * c.layers);
         for (auto& e : ev) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+        cc::SubmitWindow window{opt.prefill_inflight};
+        last_chunk_ends.clear();
         for (std::uint32_t ci = 0; ci < nchunks; ++ci) {
             Slot& sl = *pf.sl[ci % nslots];
+            // at most prefill_inflight chunks queued ahead of the GPU: wait for chunk ci - N's last layer (scheduling only)
+            if (ci > 0) last_chunk_ends.push_back(ev[static_cast<std::size_t>(ci) * c.layers - 1]);
+            CK(window.admit(last_chunk_ends.data(), ci));
             if (ci < nslots) CK(cudaStreamWaitEvent(sl.st, start, 0));
-            const std::uint32_t p = ci * C, r = std::min<std::uint32_t>(C, n - p);
+            const std::uint32_t p = plan[ci].pos, r = plan[ci].rows;
             pf_chunk(sl, tokens + p, r, committed + p, (par0 + ci) & 1u, ci ? &ev[static_cast<std::size_t>(ci - 1) * c.layers] : nullptr,
                      &ev[static_cast<std::size_t>(ci) * c.layers]);
         }
         Slot& last = *pf.sl[(nchunks - 1) % nslots];
         CK(cudaStreamWaitEvent(s, ev[static_cast<std::size_t>(nchunks) * c.layers - 1], 0));
-        const std::uint32_t rl = n - (nchunks - 1) * C;
+        const std::uint32_t rl = plan.back().rows;
+        last_window_waits = window.waits;
         // last token: final norm + lm_head on its row, exported through the decode buffers (row 0)
         CK(cudaMemcpyAsync(x, last.x + static_cast<std::size_t>(rl - 1) * H, static_cast<std::size_t>(H) * 4, cudaMemcpyDeviceToDevice, s));
         const cc::GroupedView h1{1, 1, H, H, H};
@@ -1301,6 +1315,8 @@ void print_effective_config(const EngineOptions& o, const char* arith, std::FILE
                  o.turbo_bits, o.turbo_weights == TurboWeights::onfly ? (o.turbo_lm_head ? "nvfp4" : "bf16") : "n/a", o.multi_gemv ? "on" : "off");
     std::fprintf(f, "  prefill-arith: %s\n  prefill-big: %s\n  prefill-chunk: %u\n  prefill-slots: %u\n  prefill-admission: pending model/device; execution reports route/reason\n",
                  prefill_arith_name(o.prefill_arith), o.prefill_big ? "on" : "off", o.prefill_chunk, o.prefill_slots);
+    std::fprintf(f, "  prefill-inflight: %u%s (bounded submission, scheduling only, bitwise)\n  prefill-ramp: %u%s\n", o.prefill_inflight,
+                 o.prefill_inflight ? " chunks" : " = unbounded", o.prefill_ramp, o.prefill_ramp ? " rows first chunk, doubling to prefill-chunk" : " (off)");
     if (o.turbo_weights == TurboWeights::onfly)
         std::fprintf(f, "  format: NVFP4 e2m1 + e4m3/16 + FP32 global; RTN; GEMV f16 mma, FP32 accumulate, activations RN f16, rows 1..32 bitwise row-invariant\n");
 }

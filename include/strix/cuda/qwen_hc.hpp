@@ -13,10 +13,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 #include <cuda_runtime.h>
 
-#include "strix/cuda/amd_math.cuh"
+namespace strix::cuda::amdmath { struct Tables; }
 
 namespace strix::cuda::qwen_hc {
 
@@ -36,6 +37,14 @@ struct HcPacked {
 [[nodiscard]] HcPacked hc_packed_view(void* base) noexcept;  // base: cudaMalloc'ed, hc_packed_bytes(), 16-byte aligned
 void hc_pack(const void* down_q8, const void* up_q8, const HcPacked& packed, cudaStream_t stream);
 
+// full preserves every normalized value. compact stores only the four stream inverses
+// at [row][0..3] plus low values at [row][kWide..kNormalizedPitch); input/norm must
+// remain live and unchanged through all stages, with 8/16-byte alignment respectively.
+// Select the same explicit layout for every staged call. Compact does not support gates.
+// automatic is allowed only for a complete call: its workspace is private scratch,
+// and the governed compact lever, alignment and decode route determine its layout.
+enum class HcWorkspaceLayout { full, compact, automatic };
+
 struct HcMixArgs {
     const std::uint16_t* input = nullptr;  // expanded BF16 [rows][10240]
     const float* norm = nullptr;           // hc_*_norm / output_hc_norm F32 [10240]
@@ -48,7 +57,23 @@ struct HcMixArgs {
     std::uint16_t* output = nullptr;       // BF16 [rows][2560]
     float* gates = nullptr;                // optional scratch [rows][4][2560]: split the sigmoid/mix epilogue into its own
                                            // full-occupancy kernel (same values; nullptr = fused output kernel)
+    bool mma = false;                      // FAST form (Config::forms.hc_mma): projection + output on FP16 tensor cores, FP32 acc
+                                           // (prefill-sized windows only; false = the exact kernels)
+    HcWorkspaceLayout workspace_layout = HcWorkspaceLayout::full;
 };
+// One host admission decision, shared by all producers and consumers (including MMA).
+inline bool hc_compact_workspace(const HcMixArgs& a, unsigned stages, bool enabled, bool decode_rows) {
+    if (a.workspace_layout == HcWorkspaceLayout::full) return false;
+    const bool eligible = !a.gates && a.input && a.norm &&
+        (reinterpret_cast<std::uintptr_t>(a.input) & 7U) == 0U &&
+        (reinterpret_cast<std::uintptr_t>(a.norm) & 15U) == 0U;
+    if (a.workspace_layout == HcWorkspaceLayout::compact) {
+        if (!eligible) throw std::invalid_argument("qwen_hc compact workspace: requires aligned input/norm and no gates");
+        return true;  // explicit staged format, independent of automatic policy
+    }
+    if (stages != 15U) throw std::invalid_argument("qwen_hc automatic workspace requires all stages");
+    return enabled && eligible && (a.mma || a.rows > 8U || !decode_rows);
+}
 // rows_prepare_hyper_norm + wide2_splitk_hyper_projection<8,Vopd> + wide2_hyper_output<u16,32,RowsFirst> (3 launches).
 // stages (test/timing seam): bit 0 norm, bit 1 projection, bit 2 output (gates), bit 3 split epilogue alone.
 void hc_mix(const HcMixArgs& args, const amdmath::Tables& tables, cudaStream_t stream, unsigned stages = 15U);

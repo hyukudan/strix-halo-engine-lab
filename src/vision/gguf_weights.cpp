@@ -118,7 +118,7 @@ Tensor GgufWeights::tensor(std::string_view name) {
     weight::TensorIndex index; index.container = weight::Container::gguf; index.owner = owner;
     weight::RawTensor raw; raw.id = weight::tensor_id(*owner,t.name); raw.name = t.name; raw.wire_type = t.ggml_type;
     raw.shape.rank = static_cast<std::uint8_t>(t.dimensions.size());
-    std::reverse_copy(t.dimensions.begin(), t.dimensions.end(), raw.shape.dims.begin());
+    std::reverse_copy(t.dimensions.begin(), t.dimensions.end(), raw.shape.dims.begin()); raw.extents.assign(t.dimensions.rbegin(), t.dimensions.rend());
     raw.payload = {owner,{t.absolute_offset,t.byte_size}}; index.tensors.push_back(raw);
     weight::WeightMap admitted;
     auto status = weight::bind_vision(index,admitted);

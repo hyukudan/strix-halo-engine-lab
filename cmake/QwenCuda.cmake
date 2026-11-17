@@ -13,9 +13,21 @@ include(${CMAKE_CURRENT_LIST_DIR}/StrixCudaBackend.cmake)
 add_library(strix_qwen_cuda STATIC
     src/cuda/models/qwen/qwen_prefill_driver.cu src/cuda/models/qwen/qwen_hc.cu src/cuda/models/qwen/qwen_dense.cu
     src/cuda/models/qwen/qwen_gdn.cu src/cuda/models/qwen/qwen_qsa.cu src/cuda/models/qwen/qwen_moe.cu
-    src/cuda/models/qwen/qwen_plemtp.cu src/cuda/models/qwen/qwen_mtp_draft.cu src/cuda/models/qwen/qwen_transcode.cu ${STRIX_CUDA_CORE_AMD_MATH_SOURCES} src/gguf_reader.cpp
+    src/cuda/models/qwen/qwen_plemtp.cu src/cuda/models/qwen/qwen_mtp_draft.cu src/cuda/models/qwen/qwen_transcode.cu src/cuda/tiered_experts.cu
+    ${STRIX_CUDA_CORE_AMD_MATH_SOURCES} src/gguf_reader.cpp
     src/cuda/core/nvfp4_a8.cu src/cuda/core/nvfp4_a8_reference.cpp src/cuda/core/nvfp4_reference.cpp)
 target_include_directories(strix_qwen_cuda PUBLIC include src/cuda/models/qwen)
+# Tiered expert residency: the host planner/resolver and the CPU routed-expert executor (bitwise = the card's A8 chains).
+# Only the library targets are needed; the Qwen-only build has no strix_target_warnings, so a no-op stands in for it.
+if(NOT COMMAND strix_target_warnings)
+    function(strix_target_warnings target)
+    endfunction()
+endif()
+include(${CMAKE_CURRENT_LIST_DIR}/StrixResidency.cmake)
+if(NOT TARGET strix_backend_cpu)
+    include(${CMAKE_CURRENT_LIST_DIR}/StrixBackendCpu.cmake)
+endif()
+target_link_libraries(strix_qwen_cuda PUBLIC strix_residency strix_backend_cpu)
 # Every Qwen CUDA binary resolves its device through the start gate (strix-devices-v1) before its first allocation.
 include(${CMAKE_CURRENT_LIST_DIR}/StrixDevice.cmake)
 target_link_libraries(strix_qwen_cuda PUBLIC strix_device strix_cuda_core)
@@ -42,6 +54,23 @@ add_test(NAME qwen_prefill_schedule COMMAND qwen_prefill_schedule_test)
 add_test(NAME qwen_handoff_codec COMMAND qwen_handoff_codec_test)
 add_executable(qwen_decode_e2e tests/cuda/qwen_decode_e2e.cu)
 target_link_libraries(qwen_decode_e2e PRIVATE strix_qwen_cuda strix_qwen_handoff)
+# Dense IMMA site tests and --bench-shape microbench (production qwen_dense.cu from strix_qwen_cuda; GPU index 0 only).
+add_executable(qwen_dense_tests tests/cuda/qwen_dense_tests.cu)
+target_link_libraries(qwen_dense_tests PRIVATE strix_qwen_cuda)
+add_test(NAME qwen_dense_host COMMAND qwen_dense_tests)
+add_executable(qwen_hc_workspace_host_test tests/cuda/qwen_hc_workspace_host_test.cpp)
+target_include_directories(qwen_hc_workspace_host_test PRIVATE include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+add_test(NAME qwen_hc_workspace_host COMMAND qwen_hc_workspace_host_test)
+find_package(Python3 QUIET COMPONENTS Interpreter)
+find_program(STRIX_IDENT_BASH bash)
+if(Python3_Interpreter_FOUND AND STRIX_IDENT_BASH)
+    add_test(NAME qwen_ident_host COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda/qwen_ident_host_test.py)
+endif()
+target_include_directories(qwen_dense_tests PRIVATE tests/cuda)
+target_compile_options(qwen_dense_tests PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+if(MSVC)
+    target_compile_options(qwen_dense_tests PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
 # TURBO onfly (qwen-turbo-v1): shared nvfp4-a8-v1 core vs its host oracles, the Qwen dense binding, and the one
 # resolver (serve == CLI).
 add_executable(nvfp4_a8_test tests/cuda/nvfp4_a8_test.cu)
@@ -56,10 +85,17 @@ add_test(NAME qwen_turbo_resolver COMMAND qwen_turbo_resolver_test)
 add_executable(qwen_decode_bench tests/cuda/qwen_decode_bench.cu)
 target_link_libraries(qwen_decode_bench PRIVATE strix_qwen_cuda)
 add_executable(strix-cuda-qwen-serve apps/cuda_qwen_serve_main.cu)
-target_link_libraries(strix-cuda-qwen-serve PRIVATE strix_qwen_cuda strix_serve_win)
-add_test(NAME qwen_cuda_inspect_without_device
-    COMMAND "${CMAKE_COMMAND}" "-DSERVER=$<TARGET_FILE:strix-cuda-qwen-serve>"
-            -P "${CMAKE_SOURCE_DIR}/tests/cuda/inspect_without_device.cmake")
+# Shared MTP window controllers (also linked by the HIP engine): measured-cost depth/rows policy and its host adapter.
+add_library(strix_mtp_depth STATIC src/mtp_window_controller.cpp src/mtp_depth_window_controller.cpp src/serve/row_budget.cpp
+            src/mtp_context_draft.cpp)
+target_include_directories(strix_mtp_depth PUBLIC include)
+add_executable(qwen_mtp_depth_host_test tests/cuda/qwen_mtp_depth_host_test.cpp)
+target_link_libraries(qwen_mtp_depth_host_test PRIVATE strix_mtp_depth)
+add_test(NAME qwen_mtp_depth_host COMMAND qwen_mtp_depth_host_test)
+add_executable(qwen_mtp_draft_split_test tests/mtp_draft_split_tests.cpp)
+target_link_libraries(qwen_mtp_draft_split_test PRIVATE strix_mtp_depth)
+add_test(NAME qwen_mtp_draft_split COMMAND qwen_mtp_draft_split_test)
+target_link_libraries(strix-cuda-qwen-serve PRIVATE strix_qwen_cuda strix_serve_win strix_mtp_depth)
 if(MSVC)
     target_compile_options(strix-cuda-qwen-serve PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
@@ -77,11 +113,15 @@ add_executable(qwen_session_reservation_test tests/session_reservation_tests.cpp
 target_include_directories(qwen_session_reservation_test PRIVATE include)
 add_test(NAME qwen_session_reservation COMMAND qwen_session_reservation_test)
 add_executable(qwen_cohort_e2e tests/cuda/qwen_cohort_e2e.cu)
-target_link_libraries(qwen_cohort_e2e PRIVATE strix_qwen_cuda strix_qwen_handoff)
+target_link_libraries(qwen_cohort_e2e PRIVATE strix_qwen_cuda strix_qwen_handoff strix_mtp_depth)
 # Multi-segment QSA core == per-segment layer_core on random data (device, no model): qwen_qsa_multi_test <tables dir>
 add_executable(qwen_qsa_multi_test tests/cuda/qwen_qsa_multi_test.cu)
 target_link_libraries(qwen_qsa_multi_test PRIVATE strix_qwen_cuda)
 target_compile_options(qwen_qsa_multi_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+# QSA FAST attention form (qsa_mma) vs exact attention on random inputs + timing: qwen_qsa_mma_test <tables dir>
+add_executable(qwen_qsa_mma_test tests/cuda/qwen_qsa_mma_test.cu)
+target_link_libraries(qwen_qsa_mma_test PRIVATE strix_qwen_cuda)
+target_compile_options(qwen_qsa_mma_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
 
 # Prefix storage and compatibility planning are host-only; no CUDA initialization in their tests.
 add_library(strix_qwen_prefix STATIC src/prefix_state_cache.cpp src/cuda/models/qwen/qwen_prefix_identity.cpp)
@@ -133,6 +173,13 @@ if(MSVC)
 else()
     target_compile_options(qwen_bf16_mtp_e2e PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>)
 endif()
+
+# rtxmax exact decode kernels: each new kernel is byte-compared with the old form on random data (device, no model).
+foreach(_qx draft_step gdn_decode hc_rows qsa_decode rows_glue)
+    add_executable(qwen_${_qx}_exact_test tests/cuda/qwen_${_qx}_exact_test.cu)
+    target_link_libraries(qwen_${_qx}_exact_test PRIVATE strix_qwen_cuda)
+    target_compile_options(qwen_${_qx}_exact_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+endforeach()
 # 16-bit recurrent state (STRIX_RECURRENT_STATE=f16|bf16) in the CUDA GDN recurrence: codec bit-equality with the host,
 # per-row rounding equalities, f32 incumbent bits. Needs the GPU (index 0 only: set CUDA_VISIBLE_DEVICES=0).
 add_executable(qwen_gdn_state16_test tests/cuda/qwen_gdn_state16_test.cu)
@@ -143,3 +190,27 @@ if(MSVC)
 endif()
 add_test(NAME qwen_gdn_state16 COMMAND qwen_gdn_state16_test)
 set_tests_properties(qwen_gdn_state16 PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=0")
+
+# Profile resolution of the CUDA Qwen apps: one resolver, one engine-option parser, named serve/CLI differences (host-only).
+add_executable(qwen_cuda_profile_host_test tests/cuda/qwen_cuda_profile_host_test.cpp)
+target_link_libraries(qwen_cuda_profile_host_test PRIVATE strix_qwen_prefix)
+add_test(NAME qwen_cuda_profile_host COMMAND qwen_cuda_profile_host_test)
+# Gate kit: teacher-forced logit dump (layout of tools/strix-gate/fast_logit_gate.py); see scripts/bench/cuda/qwen_fast/README.md.
+add_executable(qwen_tf_logits tests/cuda/qwen_tf_logits.cu)
+target_link_libraries(qwen_tf_logits PRIVATE strix_qwen_cuda strix_qwen_handoff)
+if(MSVC)
+    target_compile_options(qwen_tf_logits PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
+# GPU unit test of tiered expert residency: full route vs tiered route (CPU executor) on random weights, bitwise.
+add_executable(qwen_tiered_moe_tests tests/cuda/qwen_tiered_moe_tests.cu)
+target_link_libraries(qwen_tiered_moe_tests PRIVATE strix_qwen_cuda)
+target_compile_options(qwen_tiered_moe_tests PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
+if(MSVC)
+    target_compile_options(qwen_tiered_moe_tests PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
+
+# serve == bench residency command line (host only, no CUDA)
+add_executable(strix-expert-residency-parity-tests tests/expert_residency_parity_tests.cpp)
+target_link_libraries(strix-expert-residency-parity-tests PRIVATE strix_residency)
+add_test(NAME strix-expert-residency-parity-tests COMMAND strix-expert-residency-parity-tests)

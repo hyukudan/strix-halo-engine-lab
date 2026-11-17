@@ -1496,8 +1496,11 @@ __global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8Dense
     if constexpr (Lean >= 1) asm volatile("" : "+v"(magic));
     // Lean >= 2: the activation codes as a buffer (raw, stride 0, offsets in bytes) and each row's byte offset
     const std::size_t abytes = static_cast<std::size_t>(v.rows) * v.x_stride;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wsign-conversion"  // num_records is int in some ROCm builtins, unsigned in others (clamped value)
     [[maybe_unused]] const __amdgpu_buffer_rsrc_t abuf = __builtin_amdgcn_make_buffer_rsrc(
         const_cast<std::int8_t*>(v.codes), static_cast<short>(0), static_cast<int>(abytes < 0x7fffffffU ? abytes : std::size_t{0x7fffffffU}), 0x31004000);
+#pragma clang diagnostic pop
     [[maybe_unused]] unsigned aoff[RT];
 #pragma unroll
     for (unsigned rt = 0; rt < RT; ++rt) {
@@ -1506,8 +1509,11 @@ __global__ __launch_bounds__(32 * tall_waves) void q8_0_a8_tall_kernel(Q8A8Dense
     }
     // Lean >= 3: the weight tensor as a buffer and each output row's byte offset (K-offset included)
     const std::size_t wbytes = static_cast<std::size_t>(v.count) * row_bytes;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wsign-conversion"  // num_records is int in some ROCm builtins, unsigned in others (clamped value)
     [[maybe_unused]] const __amdgpu_buffer_rsrc_t wbuf = __builtin_amdgcn_make_buffer_rsrc(
         const_cast<std::uint8_t*>(v.weight), static_cast<short>(0), static_cast<int>(wbytes < 0x7fffffffU ? wbytes : std::size_t{0x7fffffffU}), 0x31004000);
+#pragma clang diagnostic pop
     [[maybe_unused]] unsigned woff[OT];
 #pragma unroll
     for (unsigned t = 0; t < OT; ++t) {
@@ -3374,7 +3380,7 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
                                      std::uint64_t{v.k_offset} + 2ULL * v.width <= v.row_width &&
                                      std::uint64_t{v.x_stride} >= 2ULL * v.width)),
             "Q8_0 x A8 dense prefill view");
-    if (fast_dense_on() && enqueue_fast_dense(v, stream)) return false;
+    if (!v.exact && fast_dense_on() && enqueue_fast_dense(v, stream)) return false;
     if (pf_core_dense()) return enqueue_q8_0_a8_dense_prefill_core(v, stream);
     if (v.k_parts == 2U) {
         // one launch for both parts in form 822 from 896 rows (gfx1151 bench: -2 % at 896, -5..-7 % at 1024 rows; fewer rows
