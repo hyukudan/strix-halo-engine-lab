@@ -27,15 +27,11 @@ void enqueue_quantize_a8(const QuantizeA8View& view, cudaStream_t stream);
 // (per_group 0 = count: a plain projection; 1024 for the grouped attn_output_a). With accumulate the result is
 // out = out + product (the K-split sites, q8_0_a8_split_rows: one call per part in part order, the first without).
 // Every row count gives the bits of the one-row product (decode kernel up to 8 rows per pass, more rows in passes).
-// Tiled form of a Q8_0 tensor for the tensor-core kernel (src/cuda/models/ds41/ds41_core_mma.cu): per 16-row tile and 32-weight
+// Tiled form of a Q8_0 tensor for the tensor-core kernel (src/cuda/core/dense/q8_a8_imma.cu): per 16-row tile and 32-weight
 // group, 512 bytes of codes in mma fragment order and 16 FP16 scales. Same weights, same products (bitwise).
 // rows a multiple of 16. Tensors that share an input can be concatenated row-wise before the repack (q_a + kv,
 // shared gate + up) and run as one site.
-struct Q8Tiled {
-    const std::uint8_t* codes = nullptr;   // [rows / 16][width / 32][32 lanes][16 bytes]
-    const std::uint16_t* scales = nullptr; // [rows / 16][width / 32][16]
-    std::uint32_t rows = 0, width = 0;
-};
+using Q8Tiled = ::strix::cuda::core::Q8Tiled;
 [[nodiscard]] std::size_t q8_tiled_code_bytes(std::uint32_t rows, std::uint32_t width);
 [[nodiscard]] std::size_t q8_tiled_scale_count(std::uint32_t rows, std::uint32_t width);
 struct Q8TiledBuffer {

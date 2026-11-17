@@ -29,12 +29,14 @@
 //       __shfl_down tree adds (+146..).
 #include "strix/env_flags.hpp"
 #include "strix/lever.hpp"
+#include "strix/cuda/core/decode_rows.hpp"
 #include "strix/cuda/qwen_hc.hpp"
 #include "strix/cuda/amd_math.cuh"
 #include "../../core/mma_tile.cuh"
 
 #include <cuda_fp16.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <stdexcept>
@@ -1550,7 +1552,17 @@ void hc_mix_rows(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stre
     case 5: hc_mix_rows_r<5>(a, tables, stream); break;
     case 6: hc_mix_rows_r<6>(a, tables, stream); break;
     case 7: hc_mix_rows_r<7>(a, tables, stream); break;
-    default: hc_mix_rows_r<8>(a, tables, stream); break;
+    case 8: hc_mix_rows_r<8>(a, tables, stream); break;
+    // 9..16 rows (core::decode_rows_max, split forms only): R is only the row bound of the 2-row groups, so each row's
+    // chains are the R = 8 ones (OG 8, RG 2, RO 2)
+    case 9: hc_mix_rows_g<9, 8U, 2U, 2U>(a, tables, stream, true); break;
+    case 10: hc_mix_rows_g<10, 8U, 2U, 2U>(a, tables, stream, true); break;
+    case 11: hc_mix_rows_g<11, 8U, 2U, 2U>(a, tables, stream, true); break;
+    case 12: hc_mix_rows_g<12, 8U, 2U, 2U>(a, tables, stream, true); break;
+    case 13: hc_mix_rows_g<13, 8U, 2U, 2U>(a, tables, stream, true); break;
+    case 14: hc_mix_rows_g<14, 8U, 2U, 2U>(a, tables, stream, true); break;
+    case 15: hc_mix_rows_g<15, 8U, 2U, 2U>(a, tables, stream, true); break;
+    default: hc_mix_rows_g<16, 8U, 2U, 2U>(a, tables, stream, true); break;
     }
 }
 bool route_split_enabled() {
@@ -1609,7 +1621,8 @@ void hc_mix(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream, u
                 a.output, tables);
         return;
     }
-    if (!compact && a.rows <= 8U && stages == 15U && !a.gates && decode_rows_enabled()) {
+    const bool rows_form = a.rows <= 8U || (a.rows <= core::decode_rows_max() && hc_rows_split_enabled());
+    if (!compact && rows_form && stages == 15U && !a.gates && decode_rows_enabled()) {
         hc_mix_rows(a, tables, stream);
         return;
     }
@@ -1666,6 +1679,13 @@ void combine(const std::uint16_t* shared, const std::uint16_t* routed, std::uint
 }
 void route_logits(const std::uint16_t* hidden, const float* gate_inp, std::uint32_t rows, float* logits, cudaStream_t stream) {
     if (!rows) return;
+    // 9..16 rows (core::decode_rows_max): <= 8-row pieces (hidden / logits rows are dense; each row's logits are its own)
+    if (rows > core::kDecodePieceRows && rows <= core::decode_rows_max() && decode_rows_enabled()) {
+        for (std::uint32_t r0 = 0; r0 < rows; r0 += core::kDecodePieceRows)
+            route_logits(hidden + std::size_t{r0} * kHidden, gate_inp, std::min(rows - r0, core::kDecodePieceRows),
+                         logits + std::size_t{r0} * kExperts, stream);
+        return;
+    }
     if (rows <= 8U && decode_rows_enabled()) {
         switch (rows) {
         case 1: route_rows_r<1>(hidden, gate_inp, logits, stream); break;

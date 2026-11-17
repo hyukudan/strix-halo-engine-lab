@@ -70,3 +70,14 @@ slot: 1 row = a decode lane, more = a verify/prefill window) with per-session at
 session run alone (`qwen35_cuda_engine_test` section 4; `strix-cuda-qwen35-decode --slots N --slots-verify` on real packs).
 Windows commit with `commit_slots(accept[])` (partial accept supported). Bench: `--slots N --arms 8,4,1 --ab-pairs 3 --n-gen S
 --ctx-fill C` (strict ABAB, host-timed steps incl. token read-back, SM clock). `StepPlanner`/`plan_rows` lane rows map 1:1 to groups.
+
+## Bounded prefill submission (CUDA, scheduling only)
+A long prefill is queued chunk by chunk through `cuda_core::SubmitWindow` (`include/strix/cuda_core/submit_window.hpp`):
+before the host queues chunk i it waits for chunk i - N to finish, so at most N chunks are queued ahead of the GPU instead
+of the whole prompt before one sync. Same kernels, same per-stream order and event dependencies: output is bitwise
+identical (logits hashes equal at 8K and 32K, throughput neutral). `strix-cuda-qwen35-decode` flags:
+- `--prefill-inflight N` (default 3): chunks queued ahead of the GPU; `0` = unbounded (the previous form, off switch).
+- `--prefill-ramp R` (default 0 = off): the first chunks grow R, 2R, 4R, ... rows (multiples of 128, below
+  `--prefill-chunk`) so the card steps up from idle. It changes chunk boundaries, so it is exact only where the prefill
+  is chunk-size invariant (measured for this model); it stays off by default.
+Both values are printed by `--print-effective-config` and in the prefill line (`chunks`, `inflight`).

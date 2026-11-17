@@ -112,16 +112,26 @@ float half_to_float(std::uint16_t h) {
     return s ? -v : v;
 }
 
-Pack::Pack(std::string dir) : dir_(std::move(dir)) {
+Pack::Pack(std::string dir, unsigned prefix_layers) : dir_(std::move(dir)) {
     const Json idx = parse(slurp(dir_ + "/model.safetensors.index.json"));
     std::map<std::string, std::uint32_t> file_id;
     std::vector<std::string> names;
     for (const auto& [name, f] : idx.obj.at("weight_map").obj) {
+        if (prefix_layers != 0) {
+            const std::string lp = "language_model.model.layers.";
+            bool keep = name == "language_model.model.embed_tokens.weight";
+            if (name.compare(0, lp.size(), lp) == 0) {
+                const auto dot = name.find('.', lp.size());
+                keep = dot != std::string::npos && std::stoul(name.substr(lp.size(), dot - lp.size())) < prefix_layers;
+            }
+            if (!keep) continue;
+        }
         if (file_id.count(f.str) == 0) {
             file_id[f.str] = static_cast<std::uint32_t>(names.size());
             names.push_back(f.str);
         }
     }
+    try {
     for (std::uint32_t i = 0; i < names.size(); ++i) {
         const std::string path = dir_ + "/" + names[i];
         std::FILE* f = std::fopen(path.c_str(), "rb");
@@ -143,6 +153,10 @@ Pack::Pack(std::string dir) : dir_(std::move(dir)) {
             ti.bytes = static_cast<std::uint64_t>(off[1].num) - static_cast<std::uint64_t>(off[0].num);
             tensors_[name] = ti;
         }
+    }
+    } catch (...) {
+        for (auto* f : files_) std::fclose(f);
+        throw;
     }
 }
 

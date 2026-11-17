@@ -61,6 +61,33 @@ cudaError_t project(cudaStream_t stream, const Site& site, std::uint32_t rows, c
 cudaError_t quantize_project(cudaStream_t stream, const Site& site, std::uint32_t rows, Input type, const void* input,
                              std::uint64_t input_stride, std::int8_t* codes, float* deltas, std::uint32_t pitch);
 
+// TURBO onfly weights (profile qwen-turbo-v1, --turbo-weights onfly): a Q8_0 weight converted once at load to the
+// shared core's NVFP4 image (strix/cuda/core/nvfp4_a8.hpp, arithmetic nvfp4-a8-v1, same A8 activations). project()
+// takes the NVFP4 route only inside an OnflyScope (the driver opens it for decode windows, every row count) and only
+// when EVERY segment of the site is registered; otherwise the Q8_0 route runs unchanged. Register before the first
+// decode, never concurrently with project(). Without registrations every route is the exact one, byte for byte.
+struct OnflyImage {
+    const std::uint8_t* codes = nullptr;   // [outputs][width / 2]
+    const std::uint8_t* scales = nullptr;  // [outputs][width / 16]
+    float tensor_scale = 1;
+    std::uint32_t outputs = 0, width = 0;
+};
+void onfly_register(const void* q8_weight, const OnflyImage& image);
+void onfly_clear();
+std::size_t onfly_count();
+// Tuning / test hook of the NVFP4 launch shape (rows per warp 1|2|4|8, outputs per warp 1|2; 0 = measured table).
+// Shape changes parallelism only: every output is bitwise the same.
+void onfly_set_launch(std::uint32_t rows_per_warp, std::uint32_t outputs_per_warp);
+class OnflyScope {  // thread-local: the host thread that enqueues the decode window
+public:
+    explicit OnflyScope(bool on);
+    ~OnflyScope();
+    OnflyScope(const OnflyScope&) = delete;
+    OnflyScope& operator=(const OnflyScope&) = delete;
+private:
+    bool previous_;
+};
+
 // Shared expert of the MLP half (HIP known_shared_prefill_enqueue, src/hip_shared_expert_launcher.hip:2071-2107).
 struct SharedExpert {
     const void* gate_q8 = nullptr;   // ffn_gate_shexp  Q8_0 [intermediate][hidden]

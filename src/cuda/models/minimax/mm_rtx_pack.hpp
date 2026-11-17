@@ -28,7 +28,7 @@ struct Exl3Host {
 
 class Pack {
 public:
-    explicit Pack(std::string dir);
+    explicit Pack(std::string dir, unsigned prefix_layers = 0);  // 0: original full pack
     ~Pack();
     Pack(const Pack&) = delete;
     Pack& operator=(const Pack&) = delete;
