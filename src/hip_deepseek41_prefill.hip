@@ -811,56 +811,7 @@ struct DevicePrefill::Impl {
     // requested options: the constructor and DevicePrefill::apply_levers both call this (one resolver, one set of defaults).
     // Not here (they size buffers or select what is loaded; reload): EXPERT_TP, WINDOW, SLABS, OVERLAY, STAGED_HALF, MEM_GUARD.
     void resolve_levers(PrefillOptions& opts, const PrefillOptions& req) {
-        opts.fp16_dense = req.fp16_dense;
-        opts.bf16_attention = req.bf16_attention;
-        opts.fast_attention = req.fast_attention;
-        opts.fast_attention_flash = req.fast_attention_flash;
-        opts.fp16_projections = req.fp16_projections;
-        opts.fp16_min_rows = req.fp16_min_rows;
-        opts.approx_layer_first = req.approx_layer_first;
-        opts.approx_layer_end = req.approx_layer_end;
-        opts.fp16_keep_a8 = req.fp16_keep_a8;
-        opts.fp16_fast = req.fp16_fast;
-        opts.fp16_wsplit = req.fp16_wsplit;
-        if(const char* e=std::getenv("STRIX_DS41_PREFILL_FP16_DENSE");e && std::string(e)=="1")opts.fp16_dense=true;
-        if(const char* e=std::getenv("STRIX_DS41_PREFILL_BF16_ATTN");e && std::string(e)=="1")opts.bf16_attention=true;
-        if (const char* e = ds41::fast_profile::attention(); ds41::fast_profile::attention_on()) {  // the lever or STRIX_DS41_FAST_PREFILL
-            opts.fast_attention = true;
-            if (e[0] == '2') opts.fast_attention_flash = true;  // ds41-attn-bf16flash-v1
-        }
-        opts.fast_dense = req.fast_dense || ds41::fast_profile::dense_on();
-        opts.fast_moe = req.fast_moe || ds41::fast_profile::moe_on();
-        opts.fast_engram = req.fast_engram || ds41::fast_profile::engram_on();
-        static strix::lever_cache<bool> shared_on{[] { return ds41::fast_profile::shared_on(); }};
-        opts.fast_shared = req.fast_shared || shared_on.get();
-        opts.fast_moe_f16 = req.fast_moe_f16 || ds41::fast_profile::moe_f16_on();
-        // Per-shape selector of the FP16 backend: STRIX_DS41_PREFILL_FP16_PROJ (comma list of q_a, kv, q_b, o_a, o_b),
-        // STRIX_DS41_PREFILL_FP16_MIN_ROWS (calls of at least that many rows), STRIX_DS41_PREFILL_APPROX_LAYERS=first-end,
-        // STRIX_DS41_PREFILL_FP16_A8=1 (operands from the A8 codes)
-        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_PROJ"); e != nullptr && *e != 0) {
-            std::uint32_t mask = 0;
-            std::stringstream ss(e);
-            for (std::string t; std::getline(ss, t, ',');) {
-                if (t == "q_a") mask |= 1U;
-                else if (t == "kv") mask |= 2U;
-                else if (t == "q_b") mask |= 4U;
-                else if (t == "o_a") mask |= 8U;
-                else if (t == "o_b") mask |= 16U;
-                else throw std::invalid_argument("STRIX_DS41_PREFILL_FP16_PROJ: " + t);
-            }
-            opts.fp16_projections = mask;
-        }
-        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_MIN_ROWS"); e != nullptr && *e != 0)
-            opts.fp16_min_rows = static_cast<std::uint32_t>(std::strtoul(e, nullptr, 10));
-        if (const char* e = std::getenv("STRIX_DS41_PREFILL_APPROX_LAYERS"); e != nullptr && *e != 0) {
-            char* end = nullptr;
-            opts.approx_layer_first = static_cast<std::uint32_t>(std::strtoul(e, &end, 10));
-            if (end == nullptr || *end != '-') throw std::invalid_argument("STRIX_DS41_PREFILL_APPROX_LAYERS: first-end");
-            opts.approx_layer_end = static_cast<std::uint32_t>(std::strtoul(end + 1, nullptr, 10));
-        }
-        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_A8"); e != nullptr && std::string(e) == "1") opts.fp16_keep_a8 = true;
-        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_FAST"); e != nullptr && std::string(e) == "1") opts.fp16_fast = true;
-        if (const char* e = std::getenv("STRIX_DS41_PREFILL_FP16_WSPLIT"); e != nullptr && std::string(e) == "1") opts.fp16_wsplit = true;
+        DevicePrefill::resolve_option_levers(opts, req);  // the PrefillOptions part (header: shared with the serve)
         const char* v = std::getenv("STRIX_DS41_PREFILL_MOE_PERSIST");
         moe_persist = !(v != nullptr && v[0] == '0');
         v = std::getenv("STRIX_DS41_PREFILL_ASYNC_GATHER");

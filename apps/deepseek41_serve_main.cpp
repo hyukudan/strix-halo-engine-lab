@@ -659,12 +659,10 @@ strix::deepseek41::PrefillOptions slot_prefill_options(const Args& a, BatchForwa
     o.expert_tp = strix::ds41::expert_tp::enabled_from_env();  // the batch forward's expert TP (dup layout)
     if (!a.dspark.empty()) o.draft_rows = a.dspark_seed_rows;  // the drafter's seed (both ranks hold it)
     // DAYAUDIT 6: no group storage (device states and their budget) when the options the prefill resolves (the FAST
-    // profile, the one resolver strix/ds41_fast_profile.hpp) take no group pass: group_capacity() would refuse them
-    auto resolved = o;
-    resolved.fast_attention = resolved.fast_attention || strix::ds41::fast_profile::attention_on();
-    resolved.fast_attention_flash = resolved.fast_attention_flash || strix::ds41::fast_profile::attention_flash();
-    resolved.fast_dense = resolved.fast_dense || strix::ds41::fast_profile::dense_on();
-    resolved.fast_moe = resolved.fast_moe || strix::ds41::fast_profile::moe_on();
+    // profile, the one resolver strix/ds41_fast_profile.hpp) take no group pass: group_capacity() would refuse them.
+    // The options the object will run with come from the device prefill's own resolver (FAST shared / MoE FP16 /
+    // Engram and FP16 dense included), not a partial copy of it.
+    const auto resolved = strix::deepseek41::DevicePrefill::resolved_options(o);
     if (const auto gp = prefill_group_policy();
         gp.storage_rows(a.context) >= kMinRows && strix::deepseek41::DevicePrefill::group_options_supported(resolved)) {
         o.group_members = gp.max_members;

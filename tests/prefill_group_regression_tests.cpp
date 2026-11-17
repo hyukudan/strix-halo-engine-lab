@@ -20,6 +20,67 @@ std::size_t planned(const std::vector<GroupCandidate>& c, PrefillGroupCapacity c
     return plan_prefill_group(c, {}, {}, std::numeric_limits<double>::infinity(), cap).size();
 }
 
+void put_env(const char* name, const char* value) {  // value nullptr: unset
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) setenv(name, value, 1); else unsetenv(name);
+#endif
+    strix::lever_environment_changed();
+}
+// The serve's group admission (apps/deepseek41_serve_main.cpp slot_prefill_options) asks the device prefill's own
+// option resolver: every environment lever that group_decline_reason refuses must reach that decision, or the serve
+// reserves group states (group_state_bytes in its memory room) that group_capacity() then never uses.
+void resolved_option_tests() {
+    using strix::deepseek41::DevicePrefill;
+    const char* names[] = {"STRIX_DS41_FAST_PREFILL", "STRIX_DS41_FAST_ATTN", "STRIX_DS41_FAST_MOE", "STRIX_DS41_FAST_DENSE",
+                           "STRIX_DS41_FAST_ENGRAM", "STRIX_DS41_FAST_SHARED", "STRIX_DS41_FAST_MOE_F16",
+                           "STRIX_DS41_PREFILL_FP16_DENSE", "STRIX_DS41_PREFILL_BF16_ATTN", "STRIX_DS41_PREFILL_FP16_PROJ"};
+    const auto clear = [&] { for (const char* n : names) put_env(n, nullptr); };
+    const strix::deepseek41::PrefillOptions plain;
+    const auto reason = [](const strix::deepseek41::PrefillOptions& o) {
+        const char* r = DevicePrefill::group_decline_reason(o);
+        return std::string(r ? r : "");
+    };
+    clear();
+    check(DevicePrefill::group_options_supported(DevicePrefill::resolved_options(plain)), "resolved exact options group");
+    put_env("STRIX_DS41_FAST_PREFILL", "1");
+    {
+        const auto r = DevicePrefill::resolved_options(plain);
+        check(r.fast_attention && r.fast_attention_flash && r.fast_dense && r.fast_moe, "FAST bundle resolved");
+        check(DevicePrefill::group_options_supported(r), "FAST bundle still groups");
+    }
+    clear();
+    const struct { const char* env; const char* value; const char* reason; } declined[] = {
+        {"STRIX_DS41_FAST_SHARED", "1", "shared-fast-group-unqualified"},
+        {"STRIX_DS41_FAST_ENGRAM", "1", "engram-fast-flag-per-view"},
+        {"STRIX_DS41_PREFILL_FP16_DENSE", "1", "fp16-solver-geometry-unpinned"},
+    };
+    for (const auto& d : declined) {
+        put_env(d.env, d.value);
+        // the request carries no lever: only the environment resolution sees it (the old serve copy did not)
+        check(DevicePrefill::group_options_supported(plain), "request alone has no declining lever");
+        check(reason(DevicePrefill::resolved_options(plain)) == d.reason, d.env);
+        clear();
+    }
+    put_env("STRIX_DS41_FAST_MOE", "1");
+    put_env("STRIX_DS41_FAST_MOE_F16", "1");
+    check(reason(DevicePrefill::resolved_options(plain)) == "moe-f16-fast-group-unqualified", "FAST MoE FP16 from env declined");
+    clear();
+    strix::deepseek41::PrefillOptions req;
+    req.fast_dense = true;
+    req.fp16_min_rows = 77U;
+    {
+        const auto r = DevicePrefill::resolved_options(req);
+        check(r.fast_dense && r.fp16_min_rows == 77U && !r.fast_moe, "request values kept");
+    }
+    put_env("STRIX_DS41_PREFILL_FP16_PROJ", "bogus");
+    bool threw = false;
+    try { (void)DevicePrefill::resolved_options(plain); } catch (const std::invalid_argument&) { threw = true; }
+    check(threw, "malformed FP16_PROJ refused before construction");
+    clear();
+}
+
 namespace pp = strix::prefill_plan;
 namespace d4 = strix::ds41;
 // rules of every site: dense entry everywhere, q_b / o_a from 256 rows, FAST dense from 128 rows when `fast`
@@ -215,6 +276,7 @@ int main() {
     options = {}; options.fast_moe = true; options.fast_moe_f16 = true;
     check(!DevicePrefill::group_options_supported(options), "FAST MoE FP16 operands group declined");
     check(std::string(DevicePrefill::group_decline_reason(options)) == "moe-f16-fast-group-unqualified", "FAST MoE FP16 decline names its cause");
+    resolved_option_tests();
     dense_plan_tests();
     qualification_tests();
 
