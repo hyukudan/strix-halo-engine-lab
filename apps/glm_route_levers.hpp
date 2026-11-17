@@ -6,11 +6,14 @@
 #include <cstdlib>
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "strix/env_flags.hpp"
 #include "strix/route_receipt.hpp"
+#include "strix/serve/prefill_interleave.hpp"
 #include "glm/prefill/glm_pf_dense_policy.hpp"
 #include "glm/prefill/glm_pf_exact.hpp"
 #include "glm/prefill/glm_pf_wmma.hpp"
@@ -74,17 +77,53 @@ inline pf::dense_policy::Chunk record_prefill_chunk(std::string_view entry, bool
 }
 
 
-// Dry run (--print-effective-config of either entry point): the same resolver over an environment that is resolved
-// but not applied. `apply_pending(set)` calls set(name, value) for every value the app would set if unset.
+// Dry run (--print-effective-config of either entry point): an environment that is resolved but not applied.
+// `apply_pending(set)` calls set(name, value) for every value the app would set if unset; lookups see those values
+// first, then the process environment (an explicit value always wins, as in the applied run).
+class PendingEnv {
+public:
+    template<class ApplyPending>
+    explicit PendingEnv(ApplyPending&& apply_pending) {
+        apply_pending([this](const char* name, const char* value) { if (std::getenv(name) == nullptr) pending_[name] = value; });
+    }
+    const char* operator()(const char* name) const {
+        const auto it = pending_.find(name);
+        return it != pending_.end() ? it->second.c_str() : static_cast<const char*>(std::getenv(name));
+    }
+
+private:
+    std::map<std::string, std::string> pending_;
+};
+
 template<class ApplyPending>
 inline pf::dense_policy::Chunk pending_prefill_chunk(bool explicit_request, unsigned requested, unsigned world, unsigned max_rows,
                                                      std::string_view prefill, ApplyPending&& apply_pending) {
-    std::map<std::string, std::string> pending;
-    apply_pending([&](const char* name, const char* value) { if (std::getenv(name) == nullptr) pending[name] = value; });
-    return pf::dense_policy::resolve_chunk(explicit_request, requested, world, max_rows, prefill, [&](const char* name) {
-        const auto it = pending.find(name);
-        return it != pending.end() ? it->second.c_str() : static_cast<const char*>(std::getenv(name));
-    });
+    const PendingEnv env(std::forward<ApplyPending>(apply_pending));
+    return pf::dense_policy::resolve_chunk(explicit_request, requested, world, max_rows, prefill, env);
+}
+
+// The server's prefill interleave (strix/serve/prefill_interleave.hpp) with the GLM route identity: on the chunked exact
+// route, grouping base chunks into one call is admitted only when every dense call keeps the base calls' core
+// (pf::dense_policy::choose / call_rows). One definition for the live server and its --print-effective-config dry run,
+// so the printed policy is the one that admits prompts. `env` is read once here, never inside the callback.
+template<class Env>
+inline strix::serve::PrefillInterleave serve_prefill_interleave(std::string_view mode, unsigned max_rows, unsigned pipeline,
+                                                                Env&& env) {
+    auto policy = strix::serve::PrefillInterleave::from_env(env);
+    if (mode == "gemv") {
+        namespace dp = pf::dense_policy;
+        const auto choice = dp::choose(0, env);
+        policy.route_identity = [choice, max_rows, pipeline](std::size_t tokens) -> std::optional<unsigned> {
+            const auto rows = dp::call_rows(static_cast<unsigned>(tokens), max_rows, pipeline);
+            if (!choice.automatic) return choice.route;
+            if (rows.min < choice.min_rows && rows.max >= choice.min_rows) return std::nullopt;
+            return rows.min >= choice.min_rows ? dp::kX3r8 : dp::kTm;
+        };
+    }
+    return policy;
+}
+inline strix::serve::PrefillInterleave serve_prefill_interleave(std::string_view mode, unsigned max_rows, unsigned pipeline) {
+    return serve_prefill_interleave(mode, max_rows, pipeline, strix::envcfg::text);
 }
 
 }  // namespace strix::glm

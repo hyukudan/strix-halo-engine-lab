@@ -23,7 +23,7 @@
 #endif
 
 namespace rr = strix::route;
-@GLM_INTERLEAVE@
+using strix::glm::serve_prefill_interleave;  // apps/glm_route_levers.hpp (the server binds the same definition)
 void require(bool value, const char* message) {
     if (!value) throw std::runtime_error(message);
 }
@@ -216,6 +216,34 @@ void glm_serve_chunk() {
         const auto http = strix::glm::record_prefill_chunk("http", false, 0, 2, 4096, "gemv");
         rr::require_same_route(cli_fp, http_fp);
         require(same(cli, http), "server and CLI resolve the same serving chunk");
+        {   // --print-effective-config of the server (dry run): the app-set values are pending, not applied, yet the
+            // printed interleave is the live one (same route identity per call size, same description).
+            const auto live = serve_prefill_interleave("gemv", 4096, 2);
+            env("STRIX_GLM_PF_EXACT_X", nullptr);
+            env("STRIX_GLM_PF_PIPELINE", nullptr);
+            const strix::glm::PendingEnv pending([](const auto& set) {
+                set("STRIX_GLM_PF_EXACT_X", "auto");
+                set("STRIX_GLM_PF_PIPELINE", "2");
+            });
+            const unsigned pipeline = strix::glm::xfer::prefill_pipeline(1, pending("STRIX_GLM_PF_PIPELINE"));
+            require(pipeline == 2, "dry run sees the app-set pipeline");
+            const auto dry = serve_prefill_interleave("gemv", 4096, pipeline, pending);
+            require(std::getenv("STRIX_GLM_PF_EXACT_X") == nullptr, "dry run applies nothing");
+            const auto unapplied = serve_prefill_interleave("gemv", 4096, 2, [](const char* n) { return static_cast<const char*>(std::getenv(n)); });
+            require(live.route_identity && dry.route_identity, "gemv interleave keeps routes");
+            require(dry.describe(512) == live.describe(512), "dry-run interleave description equals the live one");
+            for (std::size_t tokens : {1U, 31U, 32U, 63U, 64U, 100U, 129U, 512U, 1024U, 2048U, 4096U, 4097U, 4200U, 8192U, 12000U})
+                require(dry.route_identity(tokens) == live.route_identity(tokens), "dry-run route identity equals the live one");
+            require(unapplied.route_identity(4096) != live.route_identity(4096),
+                    "discriminating: the unapplied environment would resolve another route");
+            require(serve_prefill_interleave("ref", 4096, 2, pending).route_identity == nullptr, "reference prefill: no route identity");
+            env("STRIX_GLM_PF_EXACT_X", "0");  // an explicit value wins over the pending default (set if unset)
+            const strix::glm::PendingEnv explicit_off([](const auto& set) { set("STRIX_GLM_PF_EXACT_X", "auto"); });
+            require(serve_prefill_interleave("gemv", 4096, 2, explicit_off).route_identity(4096) == std::optional<unsigned>(dp::kTm),
+                    "explicit STRIX_GLM_PF_EXACT_X wins in the dry run");
+            env("STRIX_GLM_PF_EXACT_X", "auto");
+            env("STRIX_GLM_PF_PIPELINE", "2");
+        }
         {   // The decode-cohort grouping of that chunk (serving only: named in the effective config). Without a decode
             // cohort (the CLI, an idle server) the prompt is one call; a grouped chunk keeps the base chunk's route.
             namespace sv = strix::serve;

@@ -113,20 +113,7 @@ namespace sp = strix::glm::spec;
 namespace gi = strix::glm::import;
 #include "glm_deploy.inc"
 
-strix::serve::PrefillInterleave serve_prefill_interleave(std::string_view mode, unsigned max_rows, unsigned pipeline) {
-    auto policy = strix::serve::PrefillInterleave::from_env(strix::envcfg::text);
-    if (mode == "gemv") {
-        namespace dp = strix::glm::pf::dense_policy;
-        const auto choice = dp::choose(0, strix::envcfg::text);
-        policy.route_identity = [choice, max_rows, pipeline](std::size_t tokens) -> std::optional<unsigned> {
-            const auto rows = dp::call_rows(static_cast<unsigned>(tokens), max_rows, pipeline);
-            if (!choice.automatic) return choice.route;
-            if (rows.min < choice.min_rows && rows.max >= choice.min_rows) return std::nullopt;
-            return rows.min >= choice.min_rows ? dp::kX3r8 : dp::kTm;
-        };
-    }
-    return policy;
-}
+using strix::glm::serve_prefill_interleave;  // apps/glm_route_levers.hpp: one definition for the live run and the dry run
 
 std::atomic<bool> g_stop{false};
 std::atomic<int> g_signal{0};
@@ -883,10 +870,12 @@ int main(int argc, char** argv) {
             else if (a == "--baseline") rank_args.push_back(a);
             // Product profile: resolved by the shared resolver in rd::scan, the same rule as strix-glm5-rank.
             else if (a == "--allow-pending") rank_args.push_back(a);
-            else if (a == strix::profile::turbo::kWeightsOption || a == strix::profile::turbo::kBitsOption ||
-                     a == strix::profile::turbo::kPackOption) {  // the same weight toggle as strix-glm5-rank
+            else if (const std::string key = a.substr(0, a.find('='));
+                     key == strix::profile::turbo::kWeightsOption || key == strix::profile::turbo::kBitsOption ||
+                     key == strix::profile::turbo::kPackOption) {  // the same weight toggle as strix-glm5-rank
+                // Both spellings, as strix::profile::take_options reads them: "--opt VALUE" and "--opt=VALUE".
                 rank_args.push_back(a);
-                rank_args.push_back(next());
+                if (key.size() == a.size()) rank_args.push_back(next());
             }
             else if (a == "--profile" || a.rfind("--profile=", 0) == 0) {
                 const std::string name = a == "--profile" ? next() : a.substr(10);
@@ -991,13 +980,18 @@ int main(int argc, char** argv) {
         }
         if (print_config) {
             std::fputs(rd::print(eff).c_str(), stdout);
-            {   // Dry run: the shared chunk resolver over the resolved (not yet applied) environment.
-                const auto chunk = strix::glm::pending_prefill_chunk(
-                    prefill_chunk_explicit, prefill_chunk, opt.world, static_cast<unsigned>(std::stoul(eff.max_rows.value)), eff.prefill,
-                    [&](const std::function<void(const char*, const char*)>& set) { rd::apply_env(eff, set); });
+            {   // Dry run: the shared chunk and interleave resolvers over the resolved (not yet applied) environment,
+                // so app-set values (STRIX_GLM_PF_EXACT_X, STRIX_GLM_PF_PIPELINE) count as in the live run.
+                const auto apply_pending = [&](const std::function<void(const char*, const char*)>& set) { rd::apply_env(eff, set); };
+                const unsigned rows = static_cast<unsigned>(std::stoul(eff.max_rows.value));
+                const auto chunk = strix::glm::pending_prefill_chunk(prefill_chunk_explicit, prefill_chunk, opt.world, rows, eff.prefill,
+                                                                     apply_pending);
                 std::fputs(strix::glm::pf::dense_policy::chunk_line(chunk).c_str(), stdout);
                 prefill_chunk = chunk.tokens;
-                std::fputs(("effective serve-" + strix::serve::PrefillInterleave::from_env(strix::envcfg::text).describe(prefill_chunk) + "\n").c_str(), stdout);
+                const strix::glm::PendingEnv pending(apply_pending);
+                const unsigned pipeline = strix::glm::xfer::prefill_pipeline(opt.pf_pipeline, pending("STRIX_GLM_PF_PIPELINE"));
+                std::fputs(("effective serve-" + serve_prefill_interleave(eff.prefill, rows, pipeline, pending).describe(prefill_chunk) + "\n").c_str(),
+                           stdout);
             }
             std::printf("serve slots=%u capacity=%llu batch=%s short-first=%s prefill-chunk=%u (mtp %d) c1-mtp=%s kmax=%u adaptive=%d cycles/round=%u\n",
                         opt.slots, static_cast<unsigned long long>(opt.capacity), serial ? "serial" : "on", short_first ? "on" : "off", prefill_chunk,
