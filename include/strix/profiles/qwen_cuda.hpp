@@ -54,7 +54,7 @@ inline constexpr Lever table[] = {
     {.name = "qsa_mma", .env = "STRIX_QRTX_QSA_MMA", .option = "--qsa-mma",
      .value = {"", "1", ""}, .builtin = "0",
      .kind = Kind::bit_changing, .ready = {true, false, true}, .runnable = {false, true, false},
-     .target = "qwen-cuda-qsa-f16mma-v1", .off = "0",
+     .target = "qwen-cuda-qsa-f16mma-v2", .off = "0",
      .source = "QSA prefill attention on FP16 tensor cores, FP32 accumulation; qualification in progress; changes logits",
      .provisional = {false, true, false}},
     {.name = "moe_mma", .env = "STRIX_QRTX_MOE_MMA", .option = "--moe-mma",
@@ -68,7 +68,7 @@ inline std::span<const Lever> levers() { return table; }
 
 inline constexpr std::string_view kHcIdentity = "qwen-cuda-hc-f16mma-v1";
 inline constexpr std::string_view kMtpIdentity = "qwen-cuda-mtp-f16mma-v1";
-inline constexpr std::string_view kQsaIdentity = "qwen-cuda-qsa-f16mma-v1";
+inline constexpr std::string_view kQsaIdentity = "qwen-cuda-qsa-f16mma-v2";
 inline constexpr std::string_view kMoeIdentity = "qwen-cuda-moe-i8fma-v1";
 
 // The runnable levers a resolution selects. Pending, off and builtin-off rows select nothing.
@@ -111,7 +111,7 @@ inline std::string arithmetic_contract(const Choice& c) {
     return "qwen-cuda;prefill=fast;forms=" + (forms.empty() ? std::string("none") : forms) +
         ";moe_route_bf16=" + (c.moe_route_bf16 ? "1" : "0");
 }
-// Identities of the selected forms, e.g. "qwen-cuda-hc-f16mma-v1,qwen-cuda-qsa-f16mma-v1".
+// Identities of the selected forms, e.g. "qwen-cuda-hc-f16mma-v1,qwen-cuda-qsa-f16mma-v2".
 inline std::string form_identities(const Choice& c) {
     std::string out;
     const auto add = [&](bool on, std::string_view id) { if (on) out += (out.empty() ? "" : ",") + std::string(id); };
