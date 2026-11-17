@@ -1470,7 +1470,8 @@ bool native_types(const Weights& w) {
     return !(a8_gate && a8_down);
 }
 
-void enqueue_routed(const Rows& v, std::uint32_t rows, const Weights& w, const amdmath::Tables& tables, cudaStream_t s, bool moe_mma) {
+bool enqueue_routed(const Rows& v, std::uint32_t rows, const Weights& w, const amdmath::Tables& tables, cudaStream_t s,
+                    bool moe_mma) {
     validate_route_storage(v, rows);
     if (v.route_bf16 && native_types(w))
         qwen_route::require_composition(true, qwen_route::Composition::other_weight_pack);
@@ -1484,24 +1485,27 @@ void enqueue_routed(const Rows& v, std::uint32_t rows, const Weights& w, const a
         check(cudaGetLastError(), "MoE native gate/up");
         native_down_kernel<<<dim3(tiles, hidden / 32U), 1024, 0, s>>>(w.down, w.down_type, v);
         check(cudaGetLastError(), "MoE native down");
-        return;
+        return false;   // native experts: candidate MMA arithmetic did not run
     }
     enqueue_project(v, rows, w, tables, s, moe_mma);
     enqueue_down(v, rows, w, s, moe_mma);
+    // enqueue_project / enqueue_down_storage run the rows kernels for at most kRowsMax rows with the decode kernels on: no MMA ran.
+    return moe_mma && !(rows <= kRowsMax && decode_rows_enabled());
 }
 void enqueue_combine(const Rows& v, std::uint32_t rows, std::uint32_t* record, cudaStream_t s) {
     enqueue_merge(v, rows, s);
     enqueue_commit(v, rows, record, s);
 }
 
-void enqueue(const Rows& v, std::uint32_t rows, std::uint32_t clear_words, const Weights& w, const amdmath::Tables& tables,
+bool enqueue(const Rows& v, std::uint32_t rows, std::uint32_t clear_words, const Weights& w, const amdmath::Tables& tables,
              std::uint32_t* record, cudaStream_t s, bool moe_mma) {
     validate_route_storage(v, rows);
     if (v.route_bf16 && native_types(w))
         qwen_route::require_composition(true, qwen_route::Composition::other_weight_pack);
     enqueue_prologue(v, rows, clear_words, s);
-    enqueue_routed(v, rows, w, tables, s, moe_mma);
+    const bool dispatched = enqueue_routed(v, rows, w, tables, s, moe_mma);
     enqueue_combine(v, rows, record, s);
+    return dispatched;
 }
 
 }  // namespace strix::cuda::qwen_moe

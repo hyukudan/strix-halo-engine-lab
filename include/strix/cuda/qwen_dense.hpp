@@ -57,6 +57,12 @@ cudaError_t quantize(cudaStream_t stream, std::uint32_t rows, std::uint32_t widt
 cudaError_t project(cudaStream_t stream, const Site& site, std::uint32_t rows, const std::int8_t* codes, const float* deltas,
                     std::uint32_t pitch);
 
+#ifdef STRIX_WFMT_CAPTURE
+// Diagnostic instantiation of the same arithmetic: [K/32][rows][sum outputs].
+cudaError_t capture_project_partials(cudaStream_t stream, const Site& site, std::uint32_t rows,
+                                    const std::int8_t* codes, const float* deltas, std::uint32_t pitch, float* partials);
+#endif
+
 // quantize + project; codes needs rows * site.width bytes, deltas (site.width / 32) * pitch floats.
 cudaError_t quantize_project(cudaStream_t stream, const Site& site, std::uint32_t rows, Input type, const void* input,
                              std::uint64_t input_stride, std::int8_t* codes, float* deltas, std::uint32_t pitch);

@@ -58,6 +58,7 @@
 #include <vector>
 
 #include "strix/preflight.hpp"
+#include "strix/qwen_weight_packs.hpp"
 
 // The node's preflight (src/preflight.cpp) is POSIX-only; it is reached only through ApiConfig::health_record, which this
 // server does not set.
@@ -164,7 +165,14 @@ Options parse(int argc, char** argv) {
         for (const auto& n : resolved.resolution.notices()) std::cerr << n << std::endl;
         std::cerr << "strix-cuda-qwen-serve: arithmetic " << resolved.contract << std::endl;
     }
-    if (request.print_effective_config) o.effective_config = qo::effective_config_json(resolved);
+    if (request.print_effective_config) {
+        auto config = serve::parse_json(qo::effective_config_json(resolved));
+        if (!o.engine.model_gguf.empty()) {
+            const auto admission = strix::qwen_packs::admit_model(o.engine.model_gguf);
+            config.set("weight_pack", strix::weight_pack::to_json(admission));
+        }
+        o.effective_config = config.dump();
+    }
     o.engine.residency = strix::residency::finish_cli(residency_cli);  // flags win over STRIX_EXPERT_RESIDENCY / STRIX_VRAM_BUDGET_GIB
     o.print_effective_config = request.print_effective_config;
     if (const char* v = std::getenv("STRIX_QRTX_COHORT"); v && v[0] == '0') o.http_slots = 1;

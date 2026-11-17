@@ -98,6 +98,11 @@ void block_pool(const std::uint16_t* raw_index, std::uint32_t first_block, std::
 // block_score_pooled_rows_kernel<Rows,4>: block_scores[r][b] for b < complete(r) of every row with complete(r) > 512.
 void block_scores(const float* index_query, std::uint32_t rows, std::uint64_t first_position, const float* pooled_keys,
     float* block_scores, std::uint32_t max_blocks, cudaStream_t stream);
+// Explicit form (tests / microbench): tree = block_score_tree_kernel (default, STRIX_QRTX_QSA_SCORE_TREE), false = the
+// warp-shuffle block_score_kernel. Both write the same bits to the same entries.
+enum class ScoreForm : std::uint8_t { shuffle = 0, tree = 1 };
+void block_scores_form(ScoreForm form, const float* index_query, std::uint32_t rows, std::uint64_t first_position,
+    const float* pooled_keys, float* block_scores, std::uint32_t max_blocks, cudaStream_t stream);
 // select_rows_kernel: selected[r][0..count(r)) (also sets the selected block scores to -inf, as HIP).
 void select_rows(float* block_scores, std::uint32_t max_blocks, std::uint32_t rows, std::uint64_t first_position,
     std::uint32_t* selected, cudaStream_t stream);
@@ -155,7 +160,9 @@ void layer_core_multi(const RowBuffers& rows_buf, const SegmentState* segments, 
 // so one captured launch serves every position; values and operation order are those of layer_core.
 struct MultiShape {
     std::uint32_t rows = 0, pool_grid = 0, score_grid = 0, slot_runs = 0;
+    dim3 tree_grid{0U, 0U, 0U};  // tree scorer: (row tiles, block tiles, segments) covering the largest segment
     bool head_all = false;
+    bool tree_aligned = true;  // every segment's pooled keys 16-B aligned (tree scorer admission, else the shuffle scorer)
 };
 // host: validates, fills the map, this window's eager shape and the pooled-valid counts after it (valid_after[count]);
 // false = outside the multi-launch shapes (layer_core per segment). Throws on invalid positions before any state changes.

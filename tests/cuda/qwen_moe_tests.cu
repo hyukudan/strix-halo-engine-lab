@@ -923,11 +923,27 @@ static void fast_dump(const am::Tables& tables, const char* path) {
     }
     std::fclose(out);
 }
+#ifdef STRIX_WFMT_CAPTURE
+#include "qwen_moe_wfmt_capture.inc"
+#endif
 int main(int argc, char** argv) {
+#ifdef STRIX_WFMT_CAPTURE
+    if (argc == 5 && std::string_view(argv[1]) == "--wfmt-backend-capture" &&
+        std::string_view(argv[3]) == "--tables") {
+        CK(cudaSetDevice(0));
+        am::Tables tables = am::load_tables(argv[4]);
+        wfmt_capture(tables,argv[2]);
+        am::free_tables(tables);
+        return 0;
+    }
+#endif
     if (argc < 2) { std::printf("usage: qwen_moe_tests <tables dir> [bench|fixture]\n"); return 2; }
     const std::string mode = argc > 2 ? argv[2] : "";
     CK(cudaSetDevice(0));
     am::Tables tables = am::load_tables(argv[1]);
+#ifdef STRIX_WFMT_CAPTURE
+    if (mode.rfind("wfmt-capture=", 0) == 0) { wfmt_capture(tables,mode.c_str()+13); am::free_tables(tables); return 0; }
+#endif
     if (mode == "fixture") { fixture_replay(tables); std::printf("%s: %d failures, %llu bytes compared\n", g_fail ? "FAIL" : "PASS", g_fail, g_checked); return g_fail ? 1 : 0; }
     if (mode == "fastmma" || mode == "fastmma-check") {
         fast_tests(tables);
