@@ -28,6 +28,8 @@ cudaError_t dense_rows(const DenseWeight&, const float*, float*, std::uint32_t, 
     return cudaSuccess;
 }
 std::size_t attention_scratch_floats(int, unsigned) { return 8; }
+// attention.hpp (CUDA bf16 types) stays out of host builds; the engine Pf state holds e4m3 KV shadows by value.
+struct KvShadowE4m3 { std::uint8_t *k8 = nullptr; float* ks = nullptr; std::uint8_t* v8t = nullptr; float* vs = nullptr; };
 }
 struct Engine {
     using PrefillArith = q::PrefillArith;
@@ -144,7 +146,7 @@ int main() {
     check(live_allocations.empty(), "686-4 table owner cleanup and device restore");
     for (int device = 0; device < 2; ++device) {
         current_device = device;
-        CK(attr_big()); CK(attr_big8()); CK(attr_flash());
+        CK(attr_big()); CK(attr_big8()); CK(attr_flash(0)); CK(attr_flash(1));
         for (int kernel = 1; kernel <= 3; ++kernel)
             check(attributes[{device, kernel}] != 0, "686-4 attributes initialized on each device");
     }

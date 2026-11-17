@@ -920,7 +920,26 @@ struct CudaEngine::Impl {
         std::uint32_t C = 0;
         std::vector<std::unique_ptr<Slot>> sl;
         int terms = 3;
+        // e4m3 KV shadow (opt.prefill_attn8): per attention layer, allocated on first use; positions < sh_end mirror the BF16 cache.
+        std::vector<cc::KvShadowE4m3> sh;
+        std::uint32_t sh_end = 0, sh_from = 0, start = 0;
     } pf;
+    [[nodiscard]] bool attn8_on() const { return opt.prefill_attn8 && opt.prefill_arith != PrefillArith::exact; }
+    void pf_shadow_init() {
+        if (!pf.sh.empty()) return;
+        const std::size_t bytes = cc::kv_shadow_e4m3_bytes(ad), p8 = cc::attn8_capacity(ad), kvd = static_cast<std::size_t>(c.kv_heads) * p8 * c.head_dim;
+        for (std::uint32_t l = 0; l < c.layers; ++l) {
+            cc::KvShadowE4m3 s8;
+            if (L[l].attn) {
+                auto* base = alloc<std::uint8_t>(bytes, true);
+                s8.k8 = base;
+                s8.v8t = base + kvd;
+                s8.ks = reinterpret_cast<float*>(base + 2 * kvd);
+                s8.vs = s8.ks + static_cast<std::size_t>(c.kv_heads) * p8;
+            }
+            pf.sh.push_back(s8);
+        }
+    }
 
     [[nodiscard]] const char* big_fallback() const {
         if (!opt.prefill_big) return "disabled";
@@ -1037,7 +1056,14 @@ struct CudaEngine::Impl {
                                         sl.ao + static_cast<std::size_t>(r0) * c.heads * D, sl.scr, sl.st));
             }
         } else {
-            CK(cc::attention_prefill_flash(ad, sl.q, qdst, sl.qg + D, qsrc, kc[l], vc[l], pos0, rows, sl.ao, sl.st));
+            if (attn8_on()) {
+                // the first chunk also re-quantises positions written since the shadow was last in sync (decode commits, truncation)
+                const std::uint32_t from = pos0 == pf.start ? pf.sh_from : pos0;
+                CK(cc::kv_shadow_e4m3(ad, kc[l], vc[l], pf.sh[l], from, pos0 + rows - from, sl.st));
+                CK(cc::attention_prefill_flash8(ad, sl.q, qdst, sl.qg + D, qsrc, pf.sh[l], pos0, rows, sl.ao, sl.st));
+            } else {
+                CK(cc::attention_prefill_flash(ad, sl.q, qdst, sl.qg + D, qsrc, kc[l], vc[l], pos0, rows, sl.ao, sl.st, opt.flash_pipe, opt.flash_tail));
+            }
         }
         pf_dirty(sl);
         pf_gemm(sl, w.o, sl.ao, rows, sl.x, sl.x, cc::BigEpi::residual);
@@ -1104,6 +1130,11 @@ struct CudaEngine::Impl {
         const std::uint32_t nchunks = static_cast<std::uint32_t>(plan.size());
         pf_init(std::min<std::uint32_t>(std::max<std::uint32_t>(1, opt.prefill_slots), nchunks));
         pf.terms = pf_terms();
+        if (attn8_on()) {
+            pf_shadow_init();
+            pf.start = committed;
+            pf.sh_from = std::min(pf.sh_end, committed);
+        }
         const std::uint32_t nslots = static_cast<std::uint32_t>(pf.sl.size());
         if (!opt.quiet)
             std::fprintf(stderr, "prefill effective slots: %u; chunks: %u (first %u rows, ramp %u); inflight: %u%s\n", std::min(nslots, nchunks),
@@ -1157,6 +1188,7 @@ struct CudaEngine::Impl {
         CK(cudaMemcpyAsync(d_parity, &par_end, 4, cudaMemcpyHostToDevice, s));
         CK(cudaStreamSynchronize(s));  // the staging copy above and the event pool are released after this point
         committed += n;
+        if (attn8_on()) pf.sh_end = committed;
         RowsOut o;
         o.logits = want == LogitRows::none ? nullptr : logits;
         o.top = want == LogitRows::none ? nullptr : d_top;
@@ -1419,6 +1451,12 @@ void print_effective_config(const EngineOptions& o, const char* arith, std::FILE
                  o.prefill_inflight ? " chunks" : " = unbounded", o.prefill_ramp, o.prefill_ramp ? " rows first chunk, doubling to prefill-chunk" : " (off)");
     if (o.turbo_weights >= TurboWeights::onfly)
         std::fprintf(f, "  format: NVFP4 e2m1 + e4m3/16 + FP32 global; RTN; GEMV f16 mma, FP32 accumulate, activations RN f16, rows 1..32 bitwise row-invariant\n");
+    std::fprintf(f, "  prefill-flash-tail: %s (scheduling only, bitwise equal; split = partial last wave as fewer-warp jobs)\n",
+                 o.flash_tail == cuda_core::FlashTail::split ? "split" : "off");
+    std::fprintf(f, "  prefill-flash-pipe: %s (scheduling only, bitwise equal across pipes)\n  prefill-attn8: %s\n",
+                 o.flash_pipe == cuda_core::FlashPipe::swz3 ? "swz3" : "pad2",
+                 o.prefill_arith == PrefillArith::exact ? "n/a (exact prefill keeps attention_decode)"
+                 : o.prefill_attn8 ? "on (e4m3 shadow KV + e4m3 flash, bit-changing, identity -a8)" : "off");
 }
 
 const Config& CudaEngine::config() const { return p_->c; }

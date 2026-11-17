@@ -13,10 +13,24 @@ namespace strix::cuda_core {
 namespace {
 
 constexpr int QB = 128, KT = 32, D = 256;
-constexpr int K_STRIDE = 544, V_STRIDE = 528;  // bytes
-constexpr int K_TILE_BYTES = KT * K_STRIDE, V_TILE_BYTES = KT * V_STRIDE;
-constexpr int STAGE_BYTES = K_TILE_BYTES + V_TILE_BYTES;
-constexpr int SMEM_BYTES = 2 * STAGE_BYTES;
+
+// Shared-memory layouts of one K/V tile stage (byte offsets inside a stage). Both give conflict-free K LDS.64 and V ldmatrix;
+// the arithmetic per row is identical (same tiles, same order), so every layout produces the same bits.
+struct PadLayout {  // FlashPipe::pad2: rows padded (K 544 B, V 528 B), 2 stages, prefetch distance 1, two barriers per tile
+    static constexpr int STAGES = 2, K_TILE = KT * 544, STAGE = K_TILE + KT * 528;
+    __device__ static std::uint32_t k_chunk(std::uint32_t r, std::uint32_t ch) { return r * 544 + ch * 16; }
+    __device__ static std::uint32_t k_read(std::uint32_t r, int ks, int q4) { return r * 544 + 32 * ks + 8 * q4; }
+    __device__ static std::uint32_t v_chunk(std::uint32_t key, std::uint32_t ch) { return K_TILE + key * 528 + ch * 16; }
+};
+struct SwzLayout {  // FlashPipe::swz3: dense 512-B rows, XOR swizzle (K 32-B units ^ row&3, V 16-B chunks ^ key&7), 3 stages,
+                    // prefetch distance 2, one barrier per tile
+    static constexpr int STAGES = 3, K_TILE = KT * 512, STAGE = K_TILE + KT * 512;
+    __device__ static std::uint32_t k_chunk(std::uint32_t r, std::uint32_t ch) { return r * 512 + ((((ch >> 1) ^ (r & 3)) << 5) | ((ch & 1) << 4)); }
+    __device__ static std::uint32_t k_read(std::uint32_t r, int ks, int q4) { return r * 512 + ((ks ^ (r & 3)) << 5) + 8 * q4; }
+    __device__ static std::uint32_t v_chunk(std::uint32_t key, std::uint32_t ch) { return K_TILE + key * 512 + ((ch ^ (key & 7)) << 4); }
+};
+template <class LY>
+constexpr int smem_bytes() { return LY::STAGES * LY::STAGE; }
 
 __device__ __forceinline__ void cp16(std::uint32_t smem_addr, const void* g) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem_addr), "l"(g));
@@ -35,6 +49,7 @@ __device__ __forceinline__ void ldsm_x4_trans(std::uint32_t (&r)[4], std::uint32
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
 }
 
+template <class LY>
 __device__ __forceinline__ void load_kv_tile(std::uint32_t smem_stage, const __nv_bfloat16* kbase, const __nv_bfloat16* vbase, std::uint32_t key0,
                                              std::uint32_t nkeys_total) {
     // 32 keys x 512 B for K and V: 1024 16-byte chunks each over 256 threads
@@ -42,18 +57,29 @@ __device__ __forceinline__ void load_kv_tile(std::uint32_t smem_stage, const __n
     for (int i = 0; i < 4; ++i) {
         const std::uint32_t idx = threadIdx.x + 256 * i, r = idx >> 5, ch = idx & 31;
         const std::uint32_t key = min(key0 + r, nkeys_total - 1);
-        cp16(smem_stage + r * K_STRIDE + ch * 16, kbase + static_cast<std::size_t>(key) * D + ch * 8);
-        cp16(smem_stage + K_TILE_BYTES + r * V_STRIDE + ch * 16, vbase + static_cast<std::size_t>(key) * D + ch * 8);
+        cp16(smem_stage + LY::k_chunk(r, ch), kbase + static_cast<std::size_t>(key) * D + ch * 8);
+        cp16(smem_stage + LY::v_chunk(r, ch), vbase + static_cast<std::size_t>(key) * D + ch * 8);
     }
 }
 
+template <class LY>
 __global__ void __launch_bounds__(256, 1)
     flash_kernel(AttentionDims d, const float* q, GroupedView qv, const float* gate, GroupedView gv, const __nv_bfloat16* kc, const __nv_bfloat16* vc,
-                 std::uint32_t pos0, std::uint32_t rows, float* out) {
+                 std::uint32_t pos0, std::uint32_t rows, float* out, std::uint32_t nqb, std::uint32_t n_full, std::uint32_t tail_w) {
     extern __shared__ __align__(16) unsigned char smem[];
-    const std::uint32_t qb = gridDim.x - 1 - blockIdx.x;  // heavy (late) blocks first
-    const std::uint32_t head = blockIdx.y, G = d.heads / d.kv_heads, kvh = head / G;
+    // job -> tile (linear order = the former 2D grid: head-major, x fastest). Jobs below n_full are whole tiles (8 warps); the rest
+    // split the remaining tiles into 8 / tail_w jobs of tail_w active warps (inactive warps still copy K/V and meet every barrier).
+    std::uint32_t tile = blockIdx.x, wlo = 0, wn = 8;
+    if (blockIdx.x >= n_full) {
+        const std::uint32_t k = blockIdx.x - n_full, per = 8 / tail_w;
+        tile = n_full + k / per;
+        wlo = (k % per) * tail_w;
+        wn = tail_w;
+    }
+    const std::uint32_t qb = nqb - 1 - tile % nqb;  // heavy (late) blocks first
+    const std::uint32_t head = tile / nqb, G = d.heads / d.kv_heads, kvh = head / G;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, q4 = lane & 3;
+    const bool act = static_cast<std::uint32_t>(warp) - wlo < wn;  // warp-uniform
     const std::uint32_t row_base = qb * QB, wrow0 = row_base + warp * 16;
     const std::uint32_t nkeys = pos0 + min(rows, row_base + QB);  // keys any row of this block may see
     const std::uint32_t ntiles = (nkeys + KT - 1) / KT;
@@ -61,9 +87,12 @@ __global__ void __launch_bounds__(256, 1)
     const __nv_bfloat16* vbase = vc + static_cast<std::size_t>(kvh) * d.max_positions * D;
     const std::uint32_t smem_base = static_cast<std::uint32_t>(__cvta_generic_to_shared(smem));
 
-    // prefetch tile 0
-    load_kv_tile(smem_base, kbase, vbase, 0, nkeys);
-    asm volatile("cp.async.commit_group;");
+    // prefetch tiles 0 .. STAGES - 2 (one commit group per tile slot; empty groups past the end keep the count uniform)
+#pragma unroll
+    for (int st = 0; st < LY::STAGES - 1; ++st) {
+        if (st < static_cast<int>(ntiles)) load_kv_tile<LY>(smem_base + st * LY::STAGE, kbase, vbase, st * KT, nkeys);
+        asm volatile("cp.async.commit_group;");
+    }
 
     // Q fragments (rows g and g + 8 of the warp's 16)
     std::uint32_t qa[16][4];
@@ -87,17 +116,35 @@ __global__ void __launch_bounds__(256, 1)
     const float sl2 = d.scale * 1.4426950408889634f;
     const std::uint32_t qpos0 = pos0 + wrow0 + g, qpos1 = qpos0 + 8;
 
+    std::uint32_t stage_idx = 0;  // t % STAGES
     for (std::uint32_t t = 0; t < ntiles; ++t) {
-        const std::uint32_t stage = (t & 1) * STAGE_BYTES;
-        if (t + 1 < ntiles) {
-            load_kv_tile(smem_base + ((t + 1) & 1) * STAGE_BYTES, kbase, vbase, (t + 1) * KT, nkeys);
-            asm volatile("cp.async.commit_group;\ncp.async.wait_group 1;" ::: "memory");
+        const std::uint32_t stage = stage_idx * LY::STAGE;
+        if constexpr (LY::STAGES == 2) {
+            if (t + 1 < ntiles) {
+                load_kv_tile<LY>(smem_base + (stage_idx ^ 1) * LY::STAGE, kbase, vbase, (t + 1) * KT, nkeys);
+                asm volatile("cp.async.commit_group;\ncp.async.wait_group 1;" ::: "memory");
+            } else {
+                asm volatile("cp.async.wait_group 0;" ::: "memory");
+            }
+            __syncthreads();
         } else {
-            asm volatile("cp.async.wait_group 0;" ::: "memory");
+            // committed groups: tiles 0 .. t + STAGES - 2; tile t has landed once at most STAGES - 2 groups are pending
+            asm volatile("cp.async.wait_group %0;" ::"n"(LY::STAGES - 2) : "memory");
+            __syncthreads();  // tile t visible to every warp, and every warp is done with tile t - 1, whose stage is refilled now
+            const std::uint32_t t_load = t + LY::STAGES - 1;
+            if (t_load < ntiles) {
+                const std::uint32_t ls = stage_idx == 0 ? LY::STAGES - 1 : stage_idx - 1;  // (t + STAGES - 1) % STAGES
+                load_kv_tile<LY>(smem_base + ls * LY::STAGE, kbase, vbase, t_load * KT, nkeys);
+            }
+            asm volatile("cp.async.commit_group;");
         }
-        __syncthreads();
+        stage_idx = stage_idx + 1 == static_cast<std::uint32_t>(LY::STAGES) ? 0 : stage_idx + 1;
+        if (!act) {  // copy/barrier participant only
+            if constexpr (LY::STAGES == 2) __syncthreads();
+            continue;
+        }
         const unsigned char* sK = smem + stage;
-        const std::uint32_t sV = smem_base + stage + K_TILE_BYTES;
+        const std::uint32_t sV = smem_base + stage;
         float s[4][4];
 #pragma unroll
         for (int nt = 0; nt < 4; ++nt) s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.0f;
@@ -105,7 +152,7 @@ __global__ void __launch_bounds__(256, 1)
         for (int ks = 0; ks < 16; ++ks) {
 #pragma unroll
             for (int nt = 0; nt < 4; ++nt) {
-                const uint2 b = *reinterpret_cast<const uint2*>(sK + (nt * 8 + g) * K_STRIDE + (16 * ks + 4 * q4) * 2);
+                const uint2 b = *reinterpret_cast<const uint2*>(sK + LY::k_read(nt * 8 + g, ks, q4));
                 mma_bf16(s[nt], qa[ks], b.x, b.y);
             }
         }
@@ -162,13 +209,14 @@ __global__ void __launch_bounds__(256, 1)
             for (int np = 0; np < 16; ++np) {
                 std::uint32_t b[4];
                 const std::uint32_t key = 16 * j + ((lane >> 3) & 1) * 8 + (lane & 7), dcol = 8 * (2 * np + (lane >> 4));
-                ldsm_x4_trans(b, sV + key * V_STRIDE + dcol * 2);
+                ldsm_x4_trans(b, sV + LY::v_chunk(key, dcol / 8));
                 mma_bf16(o[2 * np], a, b[0], b[1]);
                 mma_bf16(o[2 * np + 1], a, b[2], b[3]);
             }
         }
-        __syncthreads();
+        if constexpr (LY::STAGES == 2) __syncthreads();
     }
+    if (!act) return;  // no barrier below
     // finalize
     l0 += __shfl_xor_sync(0xffffffffu, l0, 1);
     l0 += __shfl_xor_sync(0xffffffffu, l0, 2);
@@ -202,13 +250,58 @@ __global__ void iota_kernel(std::uint32_t* p, std::uint32_t n, std::uint32_t bas
 
 cudaError_t attention_prefill_flash(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate, const GroupedView& gv,
                                     const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache, std::uint32_t pos0, std::uint32_t rows,
-                                    float* out, cudaStream_t stream) {
+                                    float* out, cudaStream_t stream, FlashPipe pipe, FlashTail tail, std::uint32_t tail_warps) {
     if (d.head_dim != D || rows == 0 || d.kv_heads == 0 || d.heads % d.kv_heads != 0 || d.heads / d.kv_heads > 8 || pos0 + rows > d.max_positions)
         return cudaErrorInvalidValue;
+    static int sms = 0;
+    if (sms == 0 && tail != FlashTail::off) {
+        int dev = 0;
+        if (auto e = cudaGetDevice(&dev); e != cudaSuccess) return e;
+        if (auto e = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev); e != cudaSuccess) return e;
+    }
+    const FlashPlan pl = flash_plan(rows, d.heads, static_cast<std::uint32_t>(sms), tail, tail_warps);
+    const std::uint32_t nqb = (rows + QB - 1) / QB;
+    const dim3 grid(pl.jobs);
     // Attributes belong to the current device; CUDA serializes the update.
-    if (auto e = cudaFuncSetAttribute(flash_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES); e != cudaSuccess) return e;
-    flash_kernel<<<dim3((rows + QB - 1) / QB, d.heads), 256, SMEM_BYTES, stream>>>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out);
+    if (pipe == FlashPipe::swz3) {
+        if (auto e = cudaFuncSetAttribute(flash_kernel<SwzLayout>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<SwzLayout>());
+            e != cudaSuccess)
+            return e;
+        flash_kernel<SwzLayout><<<grid, 256, smem_bytes<SwzLayout>(), stream>>>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, nqb,
+                                                                                 pl.full, pl.tail_warps);
+    } else {
+        if (auto e = cudaFuncSetAttribute(flash_kernel<PadLayout>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<PadLayout>());
+            e != cudaSuccess)
+            return e;
+        flash_kernel<PadLayout><<<grid, 256, smem_bytes<PadLayout>(), stream>>>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, nqb,
+                                                                                 pl.full, pl.tail_warps);
+    }
     return cudaGetLastError();
+}
+
+FlashPlan flash_plan(std::uint32_t rows, std::uint32_t heads, std::uint32_t sms, FlashTail tail, std::uint32_t tail_warps) {
+    FlashPlan p;
+    p.tiles = (rows + QB - 1) / QB * heads;
+    p.full = p.jobs = p.tiles;
+    if (tail == FlashTail::off || sms == 0 || p.tiles <= sms) return p;  // no partial wave behind a full one
+    const std::uint32_t r = p.tiles % sms;
+    if (r == 0) return p;
+    std::uint32_t w = 0;
+    if (tail_warps == 1 || tail_warps == 2 || tail_warps == 4) {
+        w = tail_warps;
+    } else {
+        for (std::uint32_t c : {1u, 2u, 4u})
+            if (r * (8 / c) <= sms) {
+                w = c;
+                break;
+            }
+    }
+    if (w == 0) return p;
+    p.full = p.tiles - r;
+    p.tail_tiles = r;
+    p.tail_warps = w;
+    p.jobs = p.full + r * (8 / w);
+    return p;
 }
 
 cudaError_t iota_u32(std::uint32_t* p, std::uint32_t n, std::uint32_t base, std::uint32_t step, cudaStream_t stream) {

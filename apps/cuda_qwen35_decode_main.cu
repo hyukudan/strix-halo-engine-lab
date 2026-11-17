@@ -158,6 +158,7 @@ int main(int argc, char** argv) {
         bool slots_verify = false, graphs = true, multi = true, bwp = false, pdl = false, print_cfg = false;
         q::EngineOptions topt;  // TURBO levers (defaults = exact)
         std::string arith_name = "mma3";
+        std::string flash_pipe, flash_tail, pf_attn8;
         std::string pf_arith, pf_dump;            // --prefill-arith exact|flash|fast|fast2: large-M prefill (absent: windows of --rows)
         std::uint32_t pf_chunk = 2048, pf_repeat = 1, pf_slots = 2;
         std::uint32_t pf_inflight = q::EngineOptions{}.prefill_inflight, pf_ramp = 0;  // bounded submission / ramp
@@ -177,6 +178,9 @@ int main(int argc, char** argv) {
             else if (a == "--decode-rows") decode_rows = strix::core::parse_u32(next());
             else if (a == "--max-pos") max_pos = strix::core::parse_u32(next());
             else if (a == "--prefill-arith") pf_arith = next();
+            else if (a == "--flash-pipe") flash_pipe = next();         // pad2|swz3 (bitwise equal; scheduling only)
+            else if (a == "--flash-tail") flash_tail = next();         // split|off (bitwise equal; scheduling only; default split)
+            else if (a == "--prefill-attn8") pf_attn8 = next();        // on|off: e4m3 flash attention (FAST, identity -a8)
             else if (a == "--prefill-chunk") pf_chunk = strix::core::parse_u32(next());
             else if (a == "--prefill-dump") pf_dump = next();  // last-token logits of the LAST prefill (float32 [vocab])
             else if (a == "--prefill-slots") pf_slots = strix::core::parse_u32(next());
@@ -241,6 +245,11 @@ int main(int argc, char** argv) {
                 "[--graphs 0|1] [--dump-logits F]");
         std::vector<std::uint32_t> prompt;
         if (!ids_arg.empty()) {
+            if (ids_arg[0] == '@') {  // --prompt-ids @FILE: comma-separated ids in a file (long prompts exceed the command line)
+                std::ifstream pf(ids_arg.substr(1));
+                if (!pf) throw std::runtime_error("cannot open " + ids_arg.substr(1));
+                ids_arg.assign(std::istreambuf_iterator<char>(pf), std::istreambuf_iterator<char>());
+            }
             std::stringstream ss(ids_arg);
             std::string t;
             while (std::getline(ss, t, ',')) prompt.push_back(strix::core::parse_u32(t));
@@ -264,6 +273,15 @@ int main(int argc, char** argv) {
             q::print_effective_config(opt, arith_name.c_str(), stdout);
             return 0;
         }
+        if (flash_pipe == "swz3") opt.flash_pipe = strix::cuda_core::FlashPipe::swz3;
+        else if (flash_pipe == "pad2") opt.flash_pipe = strix::cuda_core::FlashPipe::pad2;
+        else if (!flash_pipe.empty()) throw std::runtime_error("--flash-pipe expects pad2|swz3");
+        if (flash_tail == "off") opt.flash_tail = strix::cuda_core::FlashTail::off;
+        else if (flash_tail == "split") opt.flash_tail = strix::cuda_core::FlashTail::split;
+        else if (!flash_tail.empty()) throw std::runtime_error("--flash-tail expects split|off");
+        if (pf_attn8 == "on") opt.prefill_attn8 = true;
+        else if (pf_attn8 == "off") opt.prefill_attn8 = false;
+        else if (!pf_attn8.empty()) throw std::runtime_error("--prefill-attn8 expects on|off");
         opt.use_graphs = graphs;
         opt.multi_gemv = multi;
         opt.pdl = pdl;
