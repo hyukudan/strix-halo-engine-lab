@@ -122,7 +122,7 @@ const std::map<std::string, std::string> kFormer = {
     {"STRIX_MMX_MOE_PIPE", "0"},
     {"STRIX_MM_PF_HEADLESS", "0"},
     {"STRIX_MM_PF_DENSE_MLP", "0"},         {"STRIX_MMX_PF_ORDER", "adaptive"},
-    {"STRIX_MM_PF_FLASH_KEYS", "0"},
+    {"STRIX_MM_PF_FLASH_KEYS", "0"},         {"STRIX_MM_PF_MSA_RG_ROWS", "4"},
 };
 // Cache identity field of the default chunk-invariant linear order (table item pf_order).
 const std::string kOrderId = "prefill_order=mmx-pf-linear-s1-v1";
@@ -797,7 +797,7 @@ void test_fast_prefill_profile() {
     }
     {
         bool threw = false;
-        const EnvMap bad_mode{{"STRIX_MM_PF_MSA_FLASH", "3"}}, bad_layers{{"STRIX_MM_PF_MSA_FLASH_LAYERS", "70"}};
+        const EnvMap bad_mode{{"STRIX_MM_PF_MSA_FLASH", "4"}}, bad_layers{{"STRIX_MM_PF_MSA_FLASH_LAYERS", "70"}};
         try { (void)md::prefill_policy(lookup(bad_mode)); } catch (const std::invalid_argument&) { threw = true; }
         check(threw, "fast profile: invalid flash mode rejected");
         threw = false;
