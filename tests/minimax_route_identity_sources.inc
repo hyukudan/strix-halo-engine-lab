@@ -9,9 +9,9 @@
 // src/prompt_terminal_diagnostics.cpp; include/strix/session/checkpoint_io.hpp;
 // src/session/checkpoint_io.cpp. The recursive session scope detects the last
 // two additions; extending the audit's other exact scopes is separate work.
-{"CMakeLists.txt", 0x9d538f6da012179dULL},
+{"CMakeLists.txt", 0x5fc1ec09f74b80dfULL},
 {"apps/minimax_layercut.inc", 0x92d2fe37dc07e424ULL},
-{"apps/minimax_rank_main.cpp", 0xdac8d94112063ebbULL},
+{"apps/minimax_rank_main.cpp", 0x21ea381c8185ba08ULL},
 {"apps/minimax_serve_main.cpp", 0x901f15e2f283f377ULL},
 {"cmake/StrixSession.cmake", 0x1fbbb6c55e80be02ULL},
 {"include/strix/bp_codec.hpp", 0x879520c3a673e0acULL},
