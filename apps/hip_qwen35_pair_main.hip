@@ -174,7 +174,7 @@ std::unique_ptr<strix::dist::Transport> open_link(const strix::device::Topology&
     strix::dist::OpenTransportOptions o;
     o.usb.rank = i_am_lower ? 0U : 1U;
     std::string spec = a.transport;
-    const auto port = std::to_string(a.port + lower);
+    const auto port = std::to_string(strix::pair::chain::line_port(a.port, lower));
     if (spec == "tcp") {
         std::string host = t.nodes.at(lower).host;
         if (host.empty()) host = a.peer;
@@ -233,32 +233,19 @@ int main(int argc, char** argv) try {
     namespace pp = strix::qwen35::pair_plan;
     auto table = pp::layer_table(info.tensors, cfg.layers);
     const auto N = topo.size();
-    bool memory_known = true;
-    double max_tflops = 0.0;
-    for (const auto& n : topo.nodes) { memory_known &= n.memory_bytes > 0U; max_tflops = std::max(max_tflops, n.fp16_tflops); }
-    std::vector<pp::Rank> ranks;
-    for (const auto& n : topo.nodes) {
-        pp::Rank r;
-        r.name = n.id;
-        r.capacity_bytes = double(n.memory_bytes);
-        const double base = a.prefill_rate > 0.0 ? a.prefill_rate : 1.0;
-        r.prefill_rows_per_s = max_tflops > 0.0 && n.fp16_tflops > 0.0 ? base * n.fp16_tflops / max_tflops : base;
-        r.read_bytes_per_ms = n.memory_gbytes_ps * 1e6;
-        ranks.push_back(r);
-    }
-    std::vector<pp::Hop> hops;
-    for (std::uint32_t r = 0; r + 1U < N; ++r) {
-        const auto ls = topo.links_between(r, r + 1U);
-        if (ls.empty()) throw std::invalid_argument("ranks must be declared on a line: no link between " + topo.nodes[r].id + " and " + topo.nodes[r + 1U].id);
-        hops.push_back({topo.direct_gbytes_ps(r, r + 1U) * 1e6, ls.front()->rtt_us / 1000.0});
-    }
-    // Layer-owned decode: no rank needs the whole model, so the chain's decoder admission does not apply; stage memory is
-    // checked below per rank when every node declares its memory (follow-up: a layer-owned-state mode in chain.hpp).
+    // Ranks, memory, rates and line links from the declaration (shared binding, pair/chain_topology.hpp).
+    namespace chain = strix::pair::chain;
+    const auto ranks = chain::ranks(topo, a.prefill_rate > 0.0 ? a.prefill_rate : 1.0);
+    const auto hops = chain::line_hops(topo);
+    // Layer-owned decode: every stage keeps its layers' state, no rank needs the whole model. With every node's memory
+    // declared, the planner admits each stage (its weights + embed/head + its KV rows at max positions + its GDN
+    // state) and only fitting plans compete; undeclared memory leaves memory unchecked (weights cleared).
     auto shape = pp::shape(cfg, table, required);
-    shape.weight_bytes.clear();
+    if (!chain::memory_declared(topo)) shape.weight_bytes.clear();
     const auto devices = pp::devices(cfg, ranks);
-    const auto request = pp::request(prompt.size(), a.wide, N, required, double(a.gen), a.placement);
-    const auto choice = strix::pair::chain::choose(devices, pp::links(hops), shape, request);
+    auto request = pp::request(prompt.size(), a.wide, N, a.maxpos, double(a.gen), a.placement);
+    request.layer_owned_state = true;
+    const auto choice = chain::choose(devices, chain::links(hops), shape, request);
     const auto& plan = choice.best;
     std::printf("%s\n", pp::describe(plan, devices, prompt.size()).c_str());
     if (!plan.valid) return 2;
@@ -267,15 +254,6 @@ int main(int argc, char** argv) try {
     layers::Placement place{plan.cuts, me - plan.first};
     place.check();
     const unsigned L = cfg.layers;
-    if (memory_known) {   // this stage: its layers + embedding (first) + head (last) + its KV rows + its GDN state
-        double need = 0.0;
-        for (unsigned l = place.first(); l < place.last(); ++l)
-            need += table.weight_bytes[l] + shape.state_bytes_per_row[l] * double(a.maxpos) + shape.state_fixed_bytes[l];
-        if (place.embeds()) need += table.embed_bytes;
-        if (place.head()) need += table.head_bytes;
-        if (need > double(topo.local().memory_bytes))
-            throw std::runtime_error("stage weights and state do not fit " + topo.local().id);
-    }
     std::printf("stage %u/%u on %s: layers [%u, %u) embed=%d head=%d\n", place.stage, place.stages(), topo.local().id.c_str(),
                 place.first(), place.last(), int(place.embeds()), int(place.head()));
 

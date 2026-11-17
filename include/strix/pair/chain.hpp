@@ -79,6 +79,10 @@ struct Request {
     std::uint32_t max_stages = 0;          // 0: as many as devices
     std::uint64_t state_rows = 0;          // prefix rows the memory admission reserves (context); 0: the prompt rows
     double decode_tokens = 0.0;            // decode tokens expected after the prefill: objective += tokens x decode ms
+    // Layer-owned state (a layer pipeline that also decodes in stages): every stage keeps its layers' state for the
+    // decode, no device takes the whole model, so the admission checks each stage (weights + its state) and not the
+    // decoder's whole-model fit. false keeps the handoff admission (the decoder owns everything after the prefill).
+    bool layer_owned_state = false;
 };
 struct Plan {
     bool valid = false;
@@ -130,7 +134,7 @@ inline std::uint32_t owner(const std::vector<std::uint32_t>& cuts, std::uint32_t
 // Evaluates one fully specified plan (first, decoder, cuts, block); fills timing or the reject reason.
 inline Plan evaluate(const std::vector<Device>& devices, const std::vector<Link>& links, const ModelShape& model,
     std::uint64_t rows, std::uint32_t first, std::uint32_t decoder, std::vector<std::uint32_t> cuts, std::uint32_t block,
-    std::uint64_t state_rows = 0) {
+    std::uint64_t state_rows = 0, bool layer_owned_state = false) {
     Plan plan;
     plan.first = first;
     plan.decoder = decoder;
@@ -175,11 +179,13 @@ inline Plan evaluate(const std::vector<Device>& devices, const std::vector<Link>
                 state_of(plan.cuts[s], plan.cuts[s + 1U]);
             if (need > device.capacity_bytes) return reject("weights and prefix state do not fit " + device.name);
         }
-        const auto& owner = devices[decoder];
-        if (!(owner.capacity_bytes > 0.0)) return reject("capacity undeclared for " + owner.name);
-        const auto whole = detail::range_sum(model.weight_bytes, 0U, model.layers) + model.embed_bytes + model.head_bytes +
-            state_of(0U, model.layers);
-        if (whole > owner.capacity_bytes) return reject("decoder " + owner.name + " cannot hold the whole model and state");
+        if (!layer_owned_state) {   // layer-owned state: the stage admission above is the whole check
+            const auto& owner = devices[decoder];
+            if (!(owner.capacity_bytes > 0.0)) return reject("capacity undeclared for " + owner.name);
+            const auto whole = detail::range_sum(model.weight_bytes, 0U, model.layers) + model.embed_bytes + model.head_bytes +
+                state_of(0U, model.layers);
+            if (whole > owner.capacity_bytes) return reject("decoder " + owner.name + " cannot hold the whole model and state");
+        }
     }
     if (!model.read_bytes_per_token.empty() && devices[decoder].read_bytes_per_ms > 0.0) {
         if (model.read_bytes_per_token.size() != model.layers) return reject("model read shape mismatch");
@@ -400,7 +406,8 @@ inline Choice choose(const std::vector<Device>& devices, const std::vector<Link>
                     if (index == count) {
                         for (const auto block : blocks) {
                             charge(1U);
-                            auto plan = evaluate(devices, links, model, request.rows, first, decoder, cuts, block, request.state_rows);
+                            auto plan = evaluate(devices, links, model, request.rows, first, decoder, cuts, block, request.state_rows,
+                                                 request.layer_owned_state);
                             if (!plan.stage_block_ms.empty()) charge(plan.blocks * (plan.stage_block_ms.size() + plan.hop_block_ms.size() +
                                 (plan.last > decoder ? plan.last - decoder : 0U)));
                             if (better(plan, run_best) || (!run_best.valid && !plan.valid && run_best.reason == "no legal cut set"))

@@ -31,7 +31,7 @@ inline HipMtpTargetHiddenTicket run_pair_tiled_mtp_prompt(std::span<const std::u
         const auto costs=qwen_pp::load_costs(costs_env,tokens.size());
         route_costs=costs;
         prediction=cut_env?qwen_pp::predict_cut(costs,qwen_pp::parse_stage_cut(cut_env,legal,legal_half)):
-            qwen_pp::choose_cut(costs,legal,legal_half);
+            qwen_pp::choose_cut(costs,legal,legal_half,strix::pair::chain::process_stage_cost_scale());
     } else {
         const auto cut=qwen_pp::parse_stage_cut(cut_env,legal,legal_half);
         prediction.cut=cut.layer;prediction.half=cut.half;

@@ -13,7 +13,7 @@
 #include <string_view>
 #include <vector>
 
-#include "strix/pair/chain.hpp"
+#include "strix/pair/chain_topology.hpp"
 #include "strix/qwen35/config.hpp"
 
 namespace strix::qwen35::pair_plan {
@@ -91,58 +91,15 @@ inline std::vector<double> prefill_shape(const Config& c) {
     return s;
 }
 
-// One rank as declared (topology / device declaration, or measured once and cached). No lab constants.
-struct Rank {
-    std::string name;
-    double capacity_bytes = 0.0;       // usable memory for weights + state
-    double prefill_rows_per_s = 0.0;   // whole-model prefill rate of this rank alone (0: never runs layers)
-    double read_bytes_per_ms = 0.0;    // decode stream rate (bytes/ms); 0: no decode prediction
-    double block_fixed_ms = 0.0;
-};
-struct Hop { double bytes_per_ms = 0.0, latency_ms = 0.0; };  // rank i <-> rank i+1, both directions
-
+// Ranks, hops, override and the receipt line are the shared topology binding (strix/pair/chain_topology.hpp);
+// this binding adds only the model's relative per-layer cost shape.
+using Rank = chain::RankDecl;
+using Hop = chain::HopDecl;
+using chain::apply_override;
+using chain::describe;
+using chain::links;
 inline std::vector<chain::Device> devices(const Config& c, std::span<const Rank> ranks) {
-    const auto shape_ref = prefill_shape(c);
-    std::vector<chain::Device> out;
-    out.reserve(ranks.size());
-    for (const auto& r : ranks) {
-        chain::Device d;
-        d.name = r.name;
-        if (r.prefill_rows_per_s > 0.0) d.layer_ms_per_row = chain::scaled_costs(r.prefill_rows_per_s, c.layers, shape_ref);
-        d.block_fixed_ms = r.block_fixed_ms;
-        d.capacity_bytes = r.capacity_bytes;
-        d.read_bytes_per_ms = r.read_bytes_per_ms;
-        out.push_back(std::move(d));
-    }
-    return out;
-}
-inline std::vector<chain::Link> links(std::span<const Hop> hops) {
-    std::vector<chain::Link> out;
-    for (const auto& h : hops) out.push_back({h.bytes_per_ms, h.bytes_per_ms, h.latency_ms});
-    return out;
-}
-
-// Explicit override, one value for CLI and server: "auto" (default), "single" (one rank prefills and decodes),
-// "cut:A[,B...]" (exactly that many interior cuts; 0 leaves one to the planner).
-inline void apply_override(std::string_view text, chain::Request& request) {
-    if (text.empty() || text == "auto") { request.split = chain::Split::auto_plan; return; }
-    if (text == "single") { request.split = chain::Split::device_only; return; }
-    if (!text.starts_with("cut:")) throw std::invalid_argument("placement override must be auto, single or cut:A[,B...]");
-    request.split = chain::Split::layer_cut;
-    request.cuts.clear();
-    std::uint32_t value = 0;
-    bool digits = false;
-    for (std::size_t i = 4; i <= text.size(); ++i) {
-        if (i == text.size() || text[i] == ',') {
-            if (!digits) throw std::invalid_argument("placement override cut list is empty or malformed");
-            request.cuts.push_back(value);
-            value = 0; digits = false;
-        } else if (text[i] >= '0' && text[i] <= '9') {
-            value = value * 10U + static_cast<std::uint32_t>(text[i] - '0'); digits = true;
-        } else {
-            throw std::invalid_argument("placement override cut list is malformed");
-        }
-    }
+    return chain::devices(ranks, c.layers, prefill_shape(c));
 }
 
 // Bits: a pair prefill equals the one-node prefill only with the same windows, so the block is the engine's
@@ -159,16 +116,4 @@ inline chain::Request request(std::uint64_t rows, std::uint32_t prefill_rows, st
     return q;
 }
 
-// One effective-config line (CLI = serve): the decision and its reason.
-inline std::string describe(const chain::Plan& p, const std::vector<chain::Device>& ranks, std::uint64_t rows) {
-    std::ostringstream o;
-    o << "placement " << (p.valid ? "valid" : "refused") << " stages=" << p.stages() << " ranks=";
-    for (std::uint32_t s = 0; s < p.stages(); ++s) o << (s ? "," : "") << ranks[p.first + s].name;
-    o << " cuts=";
-    for (std::size_t i = 0; i < p.cuts.size(); ++i) o << (i ? "," : "") << p.cuts[i];
-    o << " block=" << p.block << " decoder=" << (p.decoder < ranks.size() ? ranks[p.decoder].name : std::string("?"))
-      << " prefill_ms=" << p.wall_ms << " prefill_rows_per_s=" << p.rows_per_s(rows)
-      << " decode_ms_per_token=" << p.decode_ms_per_token << " reason=\"" << p.reason << "\"";
-    return o.str();
-}
 } // namespace strix::qwen35::pair_plan

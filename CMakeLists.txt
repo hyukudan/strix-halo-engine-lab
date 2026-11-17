@@ -6108,6 +6108,17 @@ if(BUILD_TESTING)
         PASS_REGULAR_EXPRESSION "chosen card[.][.]card decoder=card cuts=0/48")
     add_test(NAME strix-qwen-chain-plan-invalid-numbers COMMAND ${CMAKE_COMMAND}
         -DPLANNER=$<TARGET_FILE:strix-qwen-chain-plan> -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_chain_cli.cmake)
+    # Shared placement over N ranks from the topology declaration: N-stage balance (balance_split = its N = 2 form,
+    # bit-identical), chain planner topology binding (1-4 ranks, unequal memory / speed, slow link, lab plan unchanged),
+    # Qwen MoE cut with rank speeds, host mesh collectives and facts exchange over N.
+    if(TARGET strix_device)
+        add_executable(strix-pair-topology-plan-tests tests/pair_topology_plan_tests.cpp)
+        target_include_directories(strix-pair-topology-plan-tests PRIVATE include src)
+        target_compile_features(strix-pair-topology-plan-tests PRIVATE cxx_std_20)
+        target_link_libraries(strix-pair-topology-plan-tests PRIVATE strix_device strix_serve_json Threads::Threads)
+        strix_target_warnings(strix-pair-topology-plan-tests)
+        add_test(NAME strix-pair-topology-plan-tests COMMAND strix-pair-topology-plan-tests)
+    endif()
     add_executable(strix-qwen-prefill-pair-tests tests/qwen_prefill_pair_tests.cpp)
     target_include_directories(strix-qwen-prefill-pair-tests PRIVATE include src)
     target_compile_features(strix-qwen-prefill-pair-tests PRIVATE cxx_std_20)

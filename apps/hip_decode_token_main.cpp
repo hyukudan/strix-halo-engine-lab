@@ -1,4 +1,6 @@
 #include "strix/pair/link_flags.hpp"
+#include "strix/pair/chain_topology.hpp"
+#include "strix/device/process_topology.hpp"
 #include "strix/weight/admission.hpp"
 #include "strix/device/hip_gate.hpp"
 #include "strix/env_flags.hpp"
@@ -3524,7 +3526,7 @@ static int run_decode_entry(
             pair_cost_bucket = pair_costs;
             pair_prediction = pair_cut_env ? strix::qwen_pp::predict_cut(pair_costs,
                 strix::qwen_pp::parse_stage_cut(pair_cut_env, pair_legal, pair_legal_half)) :
-                strix::qwen_pp::choose_cut(pair_costs, pair_legal, pair_legal_half);
+                strix::qwen_pp::choose_cut(pair_costs, pair_legal, pair_legal_half, strix::pair::chain::process_stage_cost_scale());
         } else {
             const auto pair_cut = strix::qwen_pp::resolve_stage_cut(pair_cut_env, pair_legal, pair_legal_half,
                 pair_policy->half_cut.on);

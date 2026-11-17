@@ -103,5 +103,18 @@ identity, discovery, the link-graph bridge), target `strix-device-topology-tests
   on a protocol-level rate keep it as a named calibration row there (relay host path 4,400 MB/s; layer-cut handoff
   118 / 290 / 1,180 / 4,600 MB/s; host egress 125 MB/s). Rule: declared measurement > calibration of the class > class
   nominal. No file, or the lab's two-node `usb4` file without a measurement, gives exactly the former numbers.
+- One placement planner for layer chains (`include/strix/pair/chain.hpp`), bound to the declaration by
+  `include/strix/pair/chain_topology.hpp`: ranks in rank order on a line, memory per node, prefill rate scaled by each
+  node's `fp16_tflops` over the fastest one, line links at the declared rate. With every node's memory declared, a
+  layer-owned pipeline (stages keep their layers' state for decode) only accepts plans whose stages fit, so a smaller
+  node gets fewer layers instead of a failed start. Bound by the Qwen dense pair route (any number of ranks).
+- Stage balance over N ranks (`include/strix/pair/balance.hpp` `balance_chain`, one cost vector per rank); the
+  two-rank `balance_split` is its N = 2 form with the same cut bit for bit. The Qwen MoE pair cut (measured cost
+  file) scales each rank's costs by the declared speed (`stage_cost_scale`); equal or undeclared nodes scale by 1.0.
+- Host collectives over N ranks (`include/strix/dist/mesh.hpp`: ordered all-gather / all-reduce over pairwise
+  exchanges) and the deploy facts exchange over N (`exchange_facts`; `exchange_pair_facts` is its N = 2 form, same
+  wire record).
 
-Tests: `tests/device_topology_bindings_tests.cpp`, target `strix-device-topology-bindings-tests`.
+Tests: `tests/device_topology_bindings_tests.cpp`, target `strix-device-topology-bindings-tests`;
+`tests/pair_topology_plan_tests.cpp`, target `strix-pair-topology-plan-tests` (1-4 ranks, unequal memory, a slow rank,
+a slow link, the lab plan unchanged).

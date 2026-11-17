@@ -99,5 +99,19 @@ antigua, identidad, descubrimiento, puente al grafo de enlaces), objetivo `strix
   por el host 4.400 MB/s; traspaso por corte de capas 118 / 290 / 1.180 / 4.600 MB/s; salida del host 125 MB/s).
   Regla: medida declarada > calibración de la clase > nominal de la clase. Sin fichero, o con el fichero de dos nodos
   `usb4` del laboratorio sin medida, salen exactamente los números anteriores.
+- Un solo planificador de colocación para cadenas de capas (`include/strix/pair/chain.hpp`), enlazado a la
+  declaración por `include/strix/pair/chain_topology.hpp`: rangos en orden en una línea, memoria por nodo, ritmo de
+  prefill escalado por el `fp16_tflops` de cada nodo frente al más rápido, enlaces de la línea al ritmo declarado. Con
+  la memoria de todos los nodos declarada, una tubería con estado por capa solo acepta planes cuyas etapas caben: un
+  nodo más pequeño recibe menos capas en vez de un arranque fallido. Lo usa la ruta de pareja de Qwen denso (N rangos).
+- Equilibrio de etapas sobre N rangos (`include/strix/pair/balance.hpp` `balance_chain`, un vector de costes por
+  rango); `balance_split` de dos rangos es su forma N = 2, con el mismo corte bit a bit. El corte de pareja de Qwen MoE
+  (fichero de costes medido) escala los costes de cada rango por su velocidad declarada (`stage_cost_scale`); nodos
+  iguales o sin declarar escalan por 1,0.
+- Colectivas de host sobre N rangos (`include/strix/dist/mesh.hpp`: all-gather / all-reduce ordenados con
+  intercambios por parejas) e intercambio de hechos de despliegue sobre N (`exchange_facts`; `exchange_pair_facts` es
+  su forma N = 2, mismo registro en el cable).
 
-Pruebas: `tests/device_topology_bindings_tests.cpp`, objetivo `strix-device-topology-bindings-tests`.
+Pruebas: `tests/device_topology_bindings_tests.cpp`, objetivo `strix-device-topology-bindings-tests`;
+`tests/pair_topology_plan_tests.cpp`, objetivo `strix-pair-topology-plan-tests` (1-4 rangos, memoria desigual, un rango
+lento, un enlace lento, el plan del laboratorio sin cambios).
