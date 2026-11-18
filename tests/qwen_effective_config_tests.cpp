@@ -4098,8 +4098,10 @@ int main(int argc, char** arguments) {
             // any other explicit context needs --unqualified-context, the same rule as the single-request command.
             const auto served_drafted=resolve(RequestedOptions{parse(drafted),{}},memory);
             expect(!served_drafted.options.known_prefix_prefill_rows &&
-                served_drafted.serve_prefill_notice.find("explicit tiled configuration required")!=std::string::npos,
-                "recipe server without organization flags at context 33280 needs --unqualified-context");
+                served_drafted.serve_prefill_notice.find("explicit tiled configuration required")!=std::string::npos &&
+                served_drafted.serve_prefill_notice.find("decode profile not adopted: context-not-qualified "
+                    "(context 33280 needs --unqualified-context)")!=std::string::npos,
+                "recipe server without organization flags at context 33280 names --unqualified-context in its notice");
             drafted.emplace_back("--unqualified-context");
             const auto served_unqualified=resolve(RequestedOptions{parse(drafted),{}},memory);
             expect(served_unqualified.options.known_prefix_prefill_rows==8192 && served_unqualified.options.automatic_prefill &&

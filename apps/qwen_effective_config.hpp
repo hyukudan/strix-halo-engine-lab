@@ -1229,6 +1229,9 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
         return notice("memory observation unavailable; explicit tiled configuration required");
     constexpr std::uint64_t gib = UINT64_C(1) << 30U;
     std::string attempts;
+    // Why the single-request decode profile was not adopted (last tile tried); named in a declined notice so
+    // the user is not sent to low-level organization flags when one switch would do (issue 758).
+    std::string adoption_declined;
     // The shared route rule, asked for the largest request this context admits. Serving adds its own
     // constraints: the resolved decode arithmetic stays, every resident slot must still fit beside a
     // T16384 owner, and STRIX_SERVE_T16K=0 / STRIX_SERVE_ROUTE=0 keep the earlier owner / arithmetic.
@@ -1303,7 +1306,13 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
                     candidate = std::move(adopted);
                     adopted_organization = std::move(organization);
                     decode_adopted = true;
-                } catch (const std::exception& error) { decode_declined = error.what(); governed_mtp_exclusion = false; }
+                } catch (const std::exception& error) {
+                    decode_declined = error.what(); governed_mtp_exclusion = false;
+                    if (decode_declined.find("context-not-qualified") != std::string::npos)
+                        decode_declined += " (context " + std::to_string(candidate.context_tokens) +
+                            " needs --unqualified-context)";
+                    adoption_declined = decode_declined;
+                }
             }
             fp16_declined = resolve_prompt_route(candidate,requested,capabilities,shape).arithmetic_fallback;
             if (!decode_declined.empty() && !fp16_declined.empty()) fp16_declined += " (" + decode_declined + ")";
@@ -1483,7 +1492,8 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
             attempts += "T" + std::to_string(rows) + ":" + error.what() + "; ";
         }
     }
-    notice(attempts + "explicit tiled configuration required");
+    notice(attempts + (adoption_declined.empty() ? std::string() :
+        "decode profile not adopted: " + adoption_declined + "; ") + "explicit tiled configuration required");
 }
 // Stage A is pure: no host budget estimate, device work or directory probes.
 inline std::string cache_defaults_suppression(const Options& o, const Environment& env) {
