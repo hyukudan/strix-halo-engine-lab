@@ -126,6 +126,69 @@ int test_dense() {
     return test_dense_arith(cc::DenseArith::mma1, 1280);
 }
 
+// norm_kernel loads gain / z together with x (one batch before any store) instead of inside the store loop. Invariant:
+// rms == host emulation of the documented order (thread t sums x[t + 256 i] ascending, xor butterfly 16..1, warps 0..7,
+// inv = 1 / sqrt(ss / n + eps), y = (x * inv) * gain) bit for bit; gated swish == rms * silu(z) bit for bit; gated in
+// place (y == z) == out of place. n 5120 (NREG 20, the verify rms) and n 128 x 48 groups (the GDN gated norm).
+static float f_mul(float a, float b) { volatile float r = a * b; return r; }
+static float f_add(float a, float b) { volatile float r = a + b; return r; }
+static float host_rms_inv(const float* x, std::uint32_t n, float eps) {
+    float v[256];
+    for (std::uint32_t t = 0; t < 256; ++t) {
+        float p = 0.0f;
+        for (std::uint32_t idx = t; idx < n; idx += 256) p = f_add(p, f_mul(x[idx], x[idx]));
+        v[t] = p;
+    }
+    for (std::uint32_t w = 0; w < 8; ++w)
+        for (std::uint32_t off = 16; off > 0; off >>= 1) {
+            float nv[32];
+            for (std::uint32_t l = 0; l < 32; ++l) nv[l] = f_add(v[w * 32 + l], v[w * 32 + (l ^ off)]);
+            for (std::uint32_t l = 0; l < 32; ++l) v[w * 32 + l] = nv[l];
+        }
+    float s = v[0];
+    for (std::uint32_t w = 1; w < 8; ++w) s = f_add(s, v[w * 32]);
+    volatile float q = s / static_cast<float>(n);
+    q = q + eps;
+    volatile float r = std::sqrt(static_cast<float>(q));
+    volatile float inv = 1.0f / r;
+    return inv;
+}
+__global__ void silu_mul_ref(float* y, const float* z, std::uint32_t count) {
+    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) y[i] = __fmul_rn(y[i], __fdiv_rn(z[i], __fadd_rn(1.0f, expf(-z[i]))));
+}
+int test_norm_batched_loads() {
+    for (std::uint32_t n : {5120u, 128u}) {
+        const std::uint32_t groups = n == 128 ? 48 : 1;
+        for (std::uint32_t rows : {1u, 8u, 16u}) {
+            const std::size_t cnt = static_cast<std::size_t>(rows) * groups * n;
+            std::vector<float> x(cnt), gain(n), z(cnt);
+            for (auto& e : x) e = rnd(2.0f);
+            for (auto& e : gain) e = rnd(1.0f);
+            for (auto& e : z) e = rnd(3.0f);
+            auto *dx = dev(x), *dg = dev(gain), *dz = dev(z), *dy = devz<float>(cnt), *dy2 = devz<float>(cnt);
+            const cc::GroupedView v{rows, groups, n, 0, 0};
+            CK(cc::rmsnorm(dx, v, dg, dy, v, 1e-6f, nullptr));
+            const auto y = get(dy, cnt);
+            std::vector<float> ref(cnt);
+            for (std::size_t b = 0; b < static_cast<std::size_t>(rows) * groups; ++b) {
+                const float inv = host_rms_inv(x.data() + b * n, n, 1e-6f);
+                for (std::uint32_t i = 0; i < n; ++i) ref[b * n + i] = f_mul(f_mul(x[b * n + i], inv), gain[i]);
+            }
+            CHECK(bits_equal(y, ref), "rmsnorm n %u rows %u != host order emulation", n, rows);
+            CK(cc::gated_rmsnorm(dx, v, dg, dz, v, cc::GateKind::swish, dy2, v, 1e-6f, nullptr));
+            silu_mul_ref<<<static_cast<unsigned>((cnt + 255) / 256), 256>>>(dy, dz, static_cast<std::uint32_t>(cnt));
+            CK(cudaGetLastError());
+            const auto gated = get(dy2, cnt);
+            CHECK(bits_equal(gated, get(dy, cnt)), "gated n %u rows %u != rms * silu(z)", n, rows);
+            CK(cc::gated_rmsnorm(dx, v, dg, dz, v, cc::GateKind::swish, dz, v, 1e-6f, nullptr));  // y aliases z
+            CHECK(bits_equal(get(dz, cnt), gated), "in-place gated n %u rows %u", n, rows);
+            for (float* p : {dx, dg, dz, dy, dy2}) cudaFree(p);
+        }
+    }
+    return 0;
+}
+
 int test_norms_rope() {
     const std::uint32_t rows = 5, groups = 3, n = 300;
     std::vector<float> x(rows * groups * n), gain(n), z(x.size());
@@ -490,7 +553,7 @@ static int test_nvfp4_fused() {
 
 int main() {
     if (cudaSetDevice(0) != cudaSuccess) return 2;
-    int rc = test_dense() | test_norms_rope() | test_attention() | test_attention_schedule() | test_gdn() | test_nvfp4_fused();
+    int rc = test_dense() | test_norms_rope() | test_norm_batched_loads() | test_attention() | test_attention_schedule() | test_gdn() | test_nvfp4_fused();
     // repeat determinism is covered by the identical-bits checks (each compares two separate launches)
     std::printf(g_fail || rc ? "cuda_core_test: FAILED (%d checks)\n" : "cuda_core_test: PASS\n", g_fail);
     return (g_fail || rc) ? 1 : 0;
