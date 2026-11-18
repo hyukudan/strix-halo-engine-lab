@@ -1633,6 +1633,7 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-gdn-output-admission-tests)
     add_test(NAME strix-gdn-output-admission-tests COMMAND strix-gdn-output-admission-tests)
     add_executable(strix-flash-pf-policy-tests tests/flash_pf_policy_tests.cpp)
+    target_compile_features(strix-flash-pf-policy-tests PRIVATE cxx_std_20)  # links no strix_core: MSVC default is C++14
     target_include_directories(strix-flash-pf-policy-tests PRIVATE src)
     strix_target_warnings(strix-flash-pf-policy-tests)
     add_test(NAME strix-flash-pf-policy-tests COMMAND strix-flash-pf-policy-tests)

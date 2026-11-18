@@ -43,6 +43,9 @@ zero-based run and first differing element, before publishing a successful recei
 `--print-effective-config` prints the resolved profile (levers with status, forms, serve differences, arithmetic contract).
 Each prompt needs rows + 2 <= tokens <= `--max-positions` (default 32768). Dump layout: `q-NAME-tf-r0.f32` = [rows][vocab] FP32.
 Exit codes of gate.sh: 0 pass, 1 fail, 2 identity or input error.
+`--arms exact,fast,compare` (the default) selects the steps. To keep one model load per time-capped GPU turn, run `--arms exact`
+then `--arms fast,compare` with the same `--out`. A compare refuses (rc 2) if a sealed arm dir is missing.
+CPU test: `python tests/qwen_fast_gate_arms_tests.py`.
 
 This target-logit gate does not qualify MTP draft/cache fidelity or speculative acceptance. MTP forms remain
 provisional until a separate draft/cache check and a complete speculative-workload gate pass on native hardware.
