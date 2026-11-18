@@ -11,6 +11,7 @@
 
 #include <cuda_fp16.h>
 
+#include "strix/cuda_core/norms.hpp"
 #include "strix/cuda_core/nvfp4.hpp"
 
 namespace cc = strix::cuda_core;
@@ -403,8 +404,38 @@ static void test_pdl_chain(std::uint32_t split_target, std::mt19937& rng) {
     cc::nvfp4_set_split_target(0);  // back to the default target
 }
 
+// --ncu-probe R: the verify out proj (5120 x 6144, ks 48, + residual) three times, then the hidden-size RMSNorm
+// (n 5120, R rows) three times, on random data; for a one-instance profiler run (skip 2 launches of the kernel, count 1).
+static void ncu_probe(std::uint32_t rows) {
+    std::mt19937 rng(77);
+    std::vector<void*> owned;
+    const cc::DenseWeight B = make_weight(5120, 6144, rng, owned);
+    std::vector<float> h(static_cast<std::size_t>(rows) * 6144);
+    for (auto& v : h) v = std::uniform_real_distribution<float>(-1.f, 1.f)(rng);
+    float *dx, *dr, *dy, *dg;
+    CK(cudaMalloc(&dx, h.size() * 4));
+    CK(cudaMemcpy(dx, h.data(), h.size() * 4, cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&dr, static_cast<std::size_t>(rows) * 5120 * 4));
+    CK(cudaMemcpy(dr, h.data(), static_cast<std::size_t>(rows) * 5120 * 4, cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&dy, static_cast<std::size_t>(rows) * 5120 * 4));
+    CK(cudaMalloc(&dg, 5120 * 4));
+    CK(cudaMemcpy(dg, h.data(), 5120 * 4, cudaMemcpyHostToDevice));
+    for (int i = 0; i < 3; ++i) CK(cc::nvfp4_dense_rows(B, dx, dy, rows, dr, 0));
+    const cc::GroupedView v{rows, 1, 5120, 0, 0};
+    for (int i = 0; i < 3; ++i) CK(cc::rmsnorm(dy, v, dg, dr, v, 1e-6f, 0));
+    CK(cudaDeviceSynchronize());
+    std::printf("ncu probe rows %u: out proj ks %u x3, rmsnorm 5120 x3 done\n", rows, cc::nvfp4_split_k(5120, 6144));
+    for (float* q : {dx, dr, dy, dg}) CK(cudaFree(q));
+    for (void* q : owned) CK(cudaFree(q));
+}
+
 int main(int argc, char** argv) {
     const std::string a = argc > 1 ? argv[1] : "";
+    if (a == "--ncu-probe") {
+        CK(cudaSetDevice(0));
+        ncu_probe(argc > 2 ? static_cast<std::uint32_t>(std::atoi(argv[2])) : 8u);
+        return 0;
+    }
     if (argc > 2) cc::nvfp4_set_split_target(static_cast<std::uint32_t>(std::atoi(argv[2])));
     CK(cudaSetDevice(0));
     cudaDeviceProp p;
