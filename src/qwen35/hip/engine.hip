@@ -532,6 +532,7 @@ struct HipEngine::Impl {
     int *d_ids = nullptr, *d_arg = nullptr;
     unsigned committed = 0, pending = 0;
     unsigned own_begin = 0, own_end = 0;  // owned layer range (HipEngineOptions::layer_begin / layer_end)
+    unsigned stage_begin = 0, stage_end = 0;  // prefill stage range inside the owned one (set_stage; default = owned)
     unsigned win_vt_from = 0;             // vt_from of the current window (set by its first range)
     // Wide-window attention (rows > 16, FAST): shared flash over the BF16 cache (attn_core/dense_decode_flash.hpp).
     // vt_valid = positions whose V^T copy matches the cache (any other cache write lowers it).
@@ -605,6 +606,7 @@ struct HipEngine::Impl {
         own_begin = opt.layer_begin;
         own_end = opt.layer_end ? opt.layer_end : cfg.layers;
         if (own_begin >= own_end || own_end > cfg.layers) throw std::invalid_argument("owned layer range must be 0 <= begin < end <= layers");
+        stage_begin = own_begin; stage_end = own_end;
         HK(hipStreamCreate(&stream));
         if (own_begin == 0U) embd = loader.load("token_embd");
         if (own_end == cfg.layers) { onorm = loader.load("output_norm"); head = loader.load("output"); }
@@ -771,7 +773,7 @@ struct HipEngine::Impl {
         }
         const unsigned nb = (n * H + 255U) / 256U;
         const bool flash = wide_flash(n);
-        if (first == own_begin) {  // once per window: a later range of the same window (one-process cut) reuses it
+        if (first == stage_begin) {  // once per window: a later range of the same window (one-process cut) reuses it
             win_vt_from = std::min(vt_valid, pos);
             vt_valid = flash ? pos + n : win_vt_from;
         }
@@ -854,7 +856,7 @@ struct HipEngine::Impl {
         }
         HK(hipGetLastError());
         if (defer) pending = n;
-        else if (last == own_end) committed += n;
+        else if (last == stage_end) committed += n;
         return out;
     }
 
@@ -1056,6 +1058,50 @@ void HipEngine::read_top(const HipRowsOut& o, std::uint32_t rows, std::uint32_t*
 void HipEngine::read_logits(const HipRowsOut& o, std::uint32_t rows, float* host) const {
     HK(hipMemcpyAsync(host, o.logits, std::size_t(rows) * p_->V * 4U, hipMemcpyDeviceToHost, p_->stream));
     HK(hipStreamSynchronize(p_->stream));
+}
+void HipEngine::set_stage(std::uint32_t first, std::uint32_t last) {
+    auto& p = *p_;
+    if (first >= last || first < p.own_begin || last > p.own_end) throw std::invalid_argument("set_stage: range outside the owned layers");
+    if (p.pending) throw std::logic_error("set_stage: a deferred window is pending");
+    p.stage_begin = first; p.stage_end = last;
+}
+std::size_t HipEngine::state_bytes(std::uint32_t first, std::uint32_t last) const {
+    const auto& p = *p_;
+    if (first >= last || first < p.own_begin || last > p.own_end) throw std::invalid_argument("state_bytes: range outside the owned layers");
+    std::size_t total = 0;
+    for (auto l = first; l < last; ++l)
+        total += p.gdn_index[l] != ~0U ? p.sb + p.cb : 2U * std::size_t(p.committed) * p.KW * 2U;
+    return total;
+}
+void HipEngine::export_state(std::uint32_t first, std::uint32_t last, void* host) const {
+    auto& p = *p_;
+    if (p.pending) throw std::logic_error("export_state: a deferred window is pending");
+    auto* out = static_cast<std::byte*>(host);
+    const auto copy = [&](const void* d, std::size_t bytes) {
+        HK(hipMemcpyAsync(out, d, bytes, hipMemcpyDeviceToHost, p.stream)); out += bytes; };
+    (void)state_bytes(first, last);   // range check
+    for (auto l = first; l < last; ++l) {
+        const auto& y = p.L[l];
+        if (p.gdn_index[l] != ~0U) { copy(p.gdn_buf.committed_at(std::size_t(p.gdn_index[l]) * p.sb / 4U), p.sb); copy(y.conv_state, p.cb); }
+        else { const auto kv = std::size_t(p.committed) * p.KW * 2U; copy(y.k_cache, kv); copy(y.v_cache, kv); }
+    }
+    HK(hipStreamSynchronize(p.stream));
+}
+void HipEngine::import_state(std::uint32_t first, std::uint32_t last, std::uint32_t positions, const void* host) {
+    auto& p = *p_;
+    if (p.pending) throw std::logic_error("import_state: a deferred window is pending");
+    if (positions != p.committed) throw std::invalid_argument("import_state: positions differ from this rank's committed count");
+    const auto* in = static_cast<const std::byte*>(host);
+    const auto copy = [&](void* d, std::size_t bytes) {
+        HK(hipMemcpyAsync(d, in, bytes, hipMemcpyHostToDevice, p.stream)); in += bytes; };
+    (void)state_bytes(first, last);   // range check
+    for (auto l = first; l < last; ++l) {
+        auto& y = p.L[l];
+        if (p.gdn_index[l] != ~0U) { copy(p.gdn_buf.committed_at(std::size_t(p.gdn_index[l]) * p.sb / 4U), p.sb); copy(y.conv_state, p.cb); }
+        else { const auto kv = std::size_t(p.committed) * p.KW * 2U; copy(y.k_cache, kv); copy(y.v_cache, kv); }
+    }
+    p.vt_valid = 0;   // imported V rows: the V^T copy is rebuilt from the cache by the next wide window
+    HK(hipStreamSynchronize(p.stream));
 }
 void HipEngine::bench_seek(std::uint32_t pos) {
     if (pos > p_->opt.max_positions) throw std::invalid_argument("bench_seek beyond max_positions");

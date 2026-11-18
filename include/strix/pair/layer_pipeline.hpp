@@ -29,6 +29,7 @@ namespace strix::pair::layers {
 inline constexpr std::uint64_t seam_magic = 0x31454e4950594c53ULL;   // "SLYPINE1"
 inline constexpr std::uint64_t hidden_magic = 0x31444e4459414c53ULL; // decode hidden row
 inline constexpr std::uint64_t token_magic = 0x314e4b5459414c53ULL;  // decode token relay
+inline constexpr std::uint64_t state_magic = 0x31544154535941ULL;    // end-of-prefill state relay to the decoder
 enum Word : std::size_t { w_magic = 0, w_start = 2, w_rows = 3, w_bytes = 4, w_identity = 5, w_tokens = 6, w_cut = 7 };
 
 inline std::uint64_t fnv(std::uint64_t hash, std::span<const std::uint32_t> values) {
@@ -91,6 +92,10 @@ struct StageOps {
 struct PrefillStats {
     double wait_ms = 0, seal_ms = 0, total_ms = 0;
     std::vector<double> window_ms;   // forward enqueue + its seam work, per window
+    // Per-window timeline (host clock). wait: acquire of the input frame. sync: the consumer's load + fence (it drains the
+    // previous window's GPU work) or the producer's seal (it drains this window's). enqueue: the forward call.
+    // The GPU work of a rank's windows is hidden in sync (+ enqueue, which overlaps it); wait is the rank idling on its input.
+    std::vector<double> wait_window_ms, sync_window_ms, enqueue_window_ms;
 };
 
 // One prefill on this rank. `in`: consumer pipe from the previous stage (null on the first), `out`: producer pipe to the
@@ -112,9 +117,12 @@ inline PrefillStats prefill(const Placement& p, std::span<const std::uint32_t> p
         const auto tokens = prompt.subspan(win.start, win.rows);
         const auto bytes = std::size_t(win.rows) * ops.row_bytes;
         const auto t0 = Clock::now();
+        double wait = 0, sync = 0;
         if (in) {
             auto& frame = in->acquire(w);
-            stats.wait_ms += ms(Clock::now() - t0);
+            wait = ms(Clock::now() - t0);
+            stats.wait_ms += wait;
+            const auto l0 = Clock::now();
             const auto& h = frame.header;
             if (h[w_start] != win.start || h[w_rows] != win.rows || h[w_tokens] != fnv(14695981039346656037ULL, tokens) ||
                 h[w_cut] != p.first())
@@ -122,8 +130,11 @@ inline PrefillStats prefill(const Placement& p, std::span<const std::uint32_t> p
             ops.seam(frame, false, bytes);
             ops.fence();            // the slot is reused only after its rows are in the engine
             in->release(w);
+            sync += ms(Clock::now() - l0);
         }
+        const auto e0 = Clock::now();
         ops.forward(tokens, win, p.head() && w + 1U == ws.size());
+        stats.enqueue_window_ms.push_back(ms(Clock::now() - e0));
         if (out) {
             const auto s0 = Clock::now();
             auto& frame = out->acquire(w);
@@ -136,8 +147,12 @@ inline PrefillStats prefill(const Placement& p, std::span<const std::uint32_t> p
             ops.seam(frame, true, bytes);
             if (frame.staging) frame.staging->seal(bytes);
             out->release(w);
-            stats.seal_ms += ms(Clock::now() - s0);
+            const auto seal = ms(Clock::now() - s0);
+            stats.seal_ms += seal;
+            sync += seal;
         }
+        stats.wait_window_ms.push_back(wait);
+        stats.sync_window_ms.push_back(sync);
         stats.window_ms.push_back(ms(Clock::now() - t0));
     }
     if (in) in->finish(ws.size());
@@ -208,6 +223,81 @@ inline DecodeStats decode(const Placement& p, std::uint32_t first_token, std::ui
         out.ids.push_back(token);
     }
     out.total_ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+    return out;
+}
+
+// End-of-prefill relay of every stage's layer state to ONE decoder stage (the planner's handoff plan: the decoder owns
+// the whole model, decode then runs there alone at single-rank cost instead of crossing every cut per token).
+// Messages travel along the line towards `decoder`: a stage below it forwards what it received from below plus its own
+// state downwards (to stage + 1), a stage above it forwards upwards (to stage - 1). Each message: 6 header words
+// {state_magic, first layer, last layer, bytes, CRC, token + 1 (0: none)} + the state bytes. The head stage attaches
+// the prefill's first token. The decoder calls `load` once per other stage and returns the first token.
+struct RelayOps {
+    std::function<std::vector<std::byte>()> save;   // this stage's layer state [first, last)
+    std::function<void(std::uint32_t first, std::uint32_t last, std::span<const std::byte>)> load;   // decoder only
+};
+struct RelayStats { std::uint32_t token = 0; std::uint64_t bytes = 0; double ms = 0; };
+inline RelayStats relay_state(const Placement& p, std::uint32_t decoder, std::uint32_t first_token, const Link* up,
+                              const Link* down, const RelayOps& ops) {
+    using Clock = std::chrono::steady_clock;
+    p.check();
+    if (decoder >= p.stages()) throw std::invalid_argument("state relay: decoder stage outside the plan");
+    if ((up != nullptr) == p.embeds() || (down != nullptr) == p.head())
+        throw std::invalid_argument("layer pipeline: links do not match the stage (up: not first, down: not last)");
+    const auto start = Clock::now();
+    RelayStats out;
+    struct Message { std::uint64_t words[6]; std::vector<std::byte> bytes; };
+    const auto receive_all = [&](const Link* from) {
+        std::vector<Message> got;
+        std::uint64_t count = 0;
+        from->receive(std::as_writable_bytes(std::span(&count, 1)));
+        for (std::uint64_t i = 0; i < count; ++i) {
+            Message m;
+            from->receive(std::as_writable_bytes(std::span(m.words)));
+            if (m.words[0] != state_magic) throw std::runtime_error("state relay: bad message header");
+            m.bytes.resize(static_cast<std::size_t>(m.words[3]));
+            from->receive(m.bytes);
+            SeamCrc crc; crc.update(m.bytes);
+            if (crc.value() != m.words[4]) throw std::runtime_error("state relay: CRC mismatch");
+            got.push_back(std::move(m));
+        }
+        return got;
+    };
+    const auto send_all = [&](const Link* to, const std::vector<Message>& all) {
+        const std::uint64_t count = all.size();
+        to->send(std::as_bytes(std::span(&count, 1)));
+        for (const auto& m : all) { to->send(std::as_bytes(std::span(m.words))); to->send(m.bytes); }
+    };
+    const auto own = [&] {
+        Message m;
+        m.bytes = ops.save();
+        SeamCrc crc; crc.update(m.bytes);
+        m.words[0] = state_magic; m.words[1] = p.first(); m.words[2] = p.last(); m.words[3] = m.bytes.size();
+        m.words[4] = crc.value(); m.words[5] = p.head() ? std::uint64_t(first_token) + 1U : 0U;
+        return m;
+    };
+    if (p.stage != decoder) {
+        const bool below = p.stage < decoder;
+        std::vector<Message> all;
+        if (below && up) all = receive_all(up);        // from stage - 1
+        if (!below && down) all = receive_all(down);   // from stage + 1
+        all.push_back(own());
+        for (const auto& m : all) out.bytes += m.bytes.size();
+        send_all(below ? down : up, all);
+    } else {
+        std::vector<Message> all;
+        if (up && p.stage > 0U) all = receive_all(up);
+        if (down) { auto more = receive_all(down); for (auto& m : more) all.push_back(std::move(m)); }
+        bool token = p.head();
+        out.token = first_token;
+        for (const auto& m : all) {
+            ops.load(static_cast<std::uint32_t>(m.words[1]), static_cast<std::uint32_t>(m.words[2]), m.bytes);
+            out.bytes += m.bytes.size();
+            if (m.words[5]) { out.token = static_cast<std::uint32_t>(m.words[5] - 1U); token = true; }
+        }
+        if (all.size() + 1U != p.stages() || !token) throw std::runtime_error("state relay: decoder did not receive every stage");
+    }
+    out.ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
     return out;
 }
 } // namespace strix::pair::layers
