@@ -3515,6 +3515,17 @@ int main() { return 0; }"
         strix_target_warnings(strix-hip-gdn-retained-window-tests)
         add_test(NAME strix-hip-gdn-retained-window-tests COMMAND strix-hip-gdn-retained-window-tests)
 
+        # Rollback replay of the qwen35 HIP engine: in-place replay of k rows (chunked cols core + rows tail) == the
+        # out-of-place verify window of k rows (rows_kernel), state / outputs / conv history bitwise, k = 1..16.
+        add_executable(strix-hip-gdn-dims-replay-tests tests/hip_gdn_dims_replay_tests.hip)
+        set_target_properties(strix-hip-gdn-dims-replay-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_link_libraries(strix-hip-gdn-dims-replay-tests PRIVATE strix_hip_runtime)
+        target_compile_options(strix-hip-gdn-dims-replay-tests PRIVATE
+            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        strix_target_warnings(strix-hip-gdn-dims-replay-tests)
+        add_test(NAME strix-hip-gdn-dims-replay-tests COMMAND strix-hip-gdn-dims-replay-tests)
+
         add_executable(strix-hip-gdn-deferred-window-tests tests/hip_gdn_deferred_window_tests.hip)
         set_target_properties(strix-hip-gdn-deferred-window-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
