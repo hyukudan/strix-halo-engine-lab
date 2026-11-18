@@ -69,7 +69,8 @@ double quantile(std::vector<double> v, double p) {
     return v[std::min<std::size_t>(v.size() - 1, std::size_t(p * double(v.size())))];
 }
 // One spec arm: controller form, draft head, chain cap (see --arms).
-struct ArmSpec { std::string tag; std::uint32_t frontier = 8; bool continuation = true; double loss = 0.05; bool subset = false; std::uint32_t cap = 7; };
+struct ArmSpec { std::string tag; std::uint32_t frontier = 8; bool continuation = true; double loss = 0.05; bool subset = false; std::uint32_t cap = 7;
+                 bool fixed = false; };
 ArmSpec parse_arm(const std::string& name, std::uint32_t chain_k) {
     ArmSpec a;
     a.cap = chain_k;
@@ -81,9 +82,10 @@ ArmSpec parse_arm(const std::string& name, std::uint32_t chain_k) {
         return a;
     }
     std::string base = name;
+    if (base.size() > 1 && base.back() == 'd') { a.fixed = true; base.pop_back(); }  // fixed cost model (--cost-model)
     if (base.size() > 2 && base.compare(base.size() - 2, 2, "15") == 0) { a.cap = 15; base.resize(base.size() - 2); }
     if (base == "sub") a.subset = true;
-    else if (base != "new") throw std::runtime_error("--arms: N, new, sub, new15 or sub15 (got " + name + ")");
+    else if (base != "new") throw std::runtime_error("--arms: N, new, sub, new15 or sub15, each optionally + d (got " + name + ")");
     a.frontier = sp::ArbiterConfig{}.frontier_every;
     a.loss = sp::ArbiterConfig{}.frontier_loss;
     a.tag = name;
@@ -104,6 +106,10 @@ int main(int argc, char** argv) {
         //   new = the ArbiterConfig defaults (continuation prior, probe charged its cost), full head;
         //   sub = new + the draft-only subset head (--draft-core groups of 16 ids + --draft-pack files chosen by the prompt +
         //   prompt / emitted ids); a "15" suffix (new15, sub15) = chain cap 15. Drafts never change emitted tokens.
+        //   A trailing "d" (newd, subd, new15d, sub15d) = deterministic controller: BlockConfig::fixed_costs with the work
+        //   model --cost-model V1,VROW,DA,DB: verify V(r) = V1 + VROW (r - 1) ms, draft DA + DB f ms per position with
+        //   f = draft head rows / vocab (1 = full head). Defaults = PRO 6000 receipts of this identity (cc_decode3-STATE.md).
+        double cm_v1 = 13.30, cm_vrow = 0.113, cm_da = 0.370, cm_db = 0.454;
         std::vector<std::string> arms{"new"};
         std::uint32_t draft_core = sp::DraftRowsConfig{}.core_groups, draft_fallback = sp::DraftRowsConfig{}.fallback_groups;
         std::string draft_pack;
@@ -133,6 +139,12 @@ int main(int argc, char** argv) {
             else if (a == "--check") check = next() != "0";
             else if (a == "--graphs") graphs = next() != "0";
             else if (a == "--seed-costs") seed_costs = next() != "0";
+            else if (a == "--cost-model") {
+                const std::string v = next();
+                if (std::sscanf(v.c_str(), "%lf,%lf,%lf,%lf", &cm_v1, &cm_vrow, &cm_da, &cm_db) != 4 || !(cm_v1 > 0.0) ||
+                    !(cm_vrow >= 0.0) || !(cm_da > 0.0) || !(cm_db >= 0.0))
+                    throw std::runtime_error("--cost-model V1,VROW,DA,DB (ms; V1 > 0, DA > 0)");
+            }
             else if (a == "--chain-hidden") chain_hidden = next();
             else if (a == "--max-pos") max_pos = strix::core::parse_u32(next());
             else if (a == "--label") label = next();
@@ -345,8 +357,37 @@ int main(int argc, char** argv) {
                 if (oracle >= 0.0) chain = &oracle_chain;
                 else chain = mtp_chain;
                 if (sources == "none") { bc.copy = bc.chain = bc.hybrid = false; }
+                if (arm.subset && !draft_rows) {
+                    sp::DraftRowsConfig dc;
+                    dc.vocab = E->config().vocab;
+                    dc.group = 16;  // one NVFP4 tile of the head
+                    dc.core_groups = draft_core;
+                    dc.fallback_groups = draft_fallback;
+                    for (std::size_t b = 0, e = 0; b < draft_pack.size(); b = e + 1) {
+                        e = draft_pack.find(',', b);
+                        if (e == std::string::npos) e = draft_pack.size();
+                        if (e > b) dc.packs.push_back(sp::DraftRows::read_ids(draft_pack.substr(b, e - b), dc.vocab));
+                    }
+                    draft_rows = std::make_unique<sp::DraftRows>(std::move(dc));
+                }
+                if (arm.subset) {
+                    draft_rows->begin(prompt);
+                    draft_rows->admit(std::span<const std::uint32_t>(&anchor, 1));
+                }
+                E->set_draft_rows(arm.subset ? draft_rows.get() : nullptr);
+                double fixed_draft_ms = 0.0;
+                if (arm.fixed) {  // the work model prices every decision; walls are reported, never learned
+                    const double f = arm.subset ? double(draft_rows->rows()) / double(E->config().vocab) : 1.0;
+                    fixed_draft_ms = cm_da + cm_db * f;
+                    bc.fixed_costs = true;
+                    bc.chain_seed_flush_ms = bc.chain_seed_step_ms = fixed_draft_ms;
+                }
                 sp::BlockDrafter drafter(bc, chain);
-                if (seed_costs) {  // engine's measured verify wall per window shape (commit full), 3 reps each
+                if (arm.fixed) {
+                    for (std::uint32_t r = 1; r <= bc.max_block; ++r) drafter.seed_verify_ms(r, cm_v1 + cm_vrow * double(r - 1));
+                    std::printf("costs[%s]: fixed model V(r) = %.3f + %.4f (r-1) ms, draft %.3f ms per position\n", tag.c_str(),
+                                cm_v1, cm_vrow, fixed_draft_ms);
+                } else if (seed_costs) {  // engine's measured verify wall per window shape (commit full), 3 reps each
                     std::vector<std::uint32_t> t(32, anchor);
                     for (const std::uint32_t r : {1U, 2U, 4U, 8U, 16U, 32U}) {
                         double sum = 0;
@@ -363,24 +404,6 @@ int main(int argc, char** argv) {
                 drafter.commit(prompt);
                 std::vector<std::uint32_t> out{anchor};
                 drafter.commit(std::span<const std::uint32_t>(out.data(), 1));
-                if (arm.subset && !draft_rows) {
-                    sp::DraftRowsConfig dc;
-                    dc.vocab = E->config().vocab;
-                    dc.group = 16;  // one NVFP4 tile of the head
-                    dc.core_groups = draft_core;
-                    dc.fallback_groups = draft_fallback;
-                    for (std::size_t b = 0, e = 0; b < draft_pack.size(); b = e + 1) {
-                        e = draft_pack.find(',', b);
-                        if (e == std::string::npos) e = draft_pack.size();
-                        if (e > b) dc.packs.push_back(sp::DraftRows::read_ids(draft_pack.substr(b, e - b), dc.vocab));
-                    }
-                    draft_rows = std::make_unique<sp::DraftRows>(std::move(dc));
-                }
-                if (arm.subset) {
-                    draft_rows->begin(prompt);
-                    draft_rows->admit(std::span<const std::uint32_t>(out.data(), 1));
-                }
-                E->set_draft_rows(arm.subset ? draft_rows.get() : nullptr);
                 sp::BlockSpeculator spec(drafter, S);
                 spec.start(anchor);
                 std::vector<double> tick_ms{0.0};  // wall at each step end (relative), tokens cumulative in cum

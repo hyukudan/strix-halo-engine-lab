@@ -21,6 +21,12 @@ std::uint64_t mix(std::uint64_t x) {
 
 double g_clock = 0.0;  // virtual ms
 double g_chain_step = 1.5;  // virtual ms per chain step
+// Wall-clock disturbances (determinism test): jitter in [0, g_jitter) ms per call and a one-off g_spike on the first draft
+// call (on CUDA the subset head's materialisation lands there). g_fixed = BlockConfig::fixed_costs with the fake's costs.
+double g_jitter = 0.0, g_spike = 0.0;
+std::uint64_t g_jitter_seed = 0;
+bool g_fixed = false;
+double noise(std::uint64_t k) { return g_jitter * double(mix(k * 0x9e3779b9ULL + g_jitter_seed) % 1000) / 1000.0; }
 
 // The "model": response[i] is the greedy token at response position i (a pure function of the position: a valid
 // deterministic target). Prompt = `prompt` tokens, which the response re-emits with sparse edits (code-edit class).
@@ -67,7 +73,7 @@ struct FakeTarget final : sp::VerifyTarget {
             greedy.push_back(pos + 1 < w.response.size() ? w.response[pos + 1] : 7);
         }
         last.assign(tokens.begin(), tokens.end());
-        g_clock += 10.0 + 0.15 * double(tokens.size());  // memory-bound verify: nearly flat in rows
+        g_clock += 10.0 + 0.15 * double(tokens.size()) + noise(verifies);  // memory-bound verify: nearly flat in rows
     }
     void commit(std::uint32_t k) override {
         BD_CHECK(k >= 1 && k <= last.size(), "commit %u of %zu", k, last.size());
@@ -90,7 +96,7 @@ struct FakeChain final : sp::ChainDrafter {
             const bool right = double(mix(pos * 977 + 5) % 1000) / 1000.0 < accuracy;
             out.push_back(pos < w.response.size() && right ? w.response[pos] : 5);
         }
-        g_clock += g_chain_step * double(prefix.size() + k);
+        g_clock += g_chain_step * double(prefix.size() + k) + noise(calls + (1ULL << 40)) + (calls == 1 ? g_spike : 0.0);
     }
     void accept(std::span<const std::uint32_t> emitted) override { stream_len += std::uint32_t(emitted.size()); }
 };
@@ -99,6 +105,7 @@ struct Run {
     std::vector<std::uint32_t> out;
     std::uint64_t steps = 0, hybrid = 0, chain_blocks = 0, copy_blocks = 0, serial_steps = 0;
     std::uint32_t max_rows = 0;
+    std::vector<std::uint32_t> trace;  // per step: source * 100 + drafts verified
 };
 
 // legal_rows / capacity: the caller binds StepParams::max_rows = min(backend rows, context room), as the engine apps do.
@@ -109,9 +116,15 @@ Run run(const World& w, std::uint32_t n_tokens, double accuracy, bool copy, bool
     cfg.copy = copy; cfg.chain = chain; cfg.hybrid = hybrid;
     cfg.arbiter.frontier_every = frontier_every;
     cfg.clock_ms = [] { return g_clock; };
+    if (g_fixed) {  // the fake's true costs as the fixed model: chain g_chain_step per position, verify 10 + 0.15 r + commit 0.2
+        cfg.fixed_costs = true;
+        cfg.chain_seed_flush_ms = cfg.chain_seed_step_ms = g_chain_step;
+    }
     FakeChain fc(w, accuracy);
     sp::BlockDrafter drafter(cfg, chain || hybrid ? &fc : nullptr);
-    if (seed_costs)
+    if (g_fixed)
+        for (std::uint32_t r = 1; r <= 32; ++r) drafter.seed_verify_ms(r, 10.2 + 0.15 * double(r));
+    else if (seed_costs)
         for (const std::uint32_t r : {1U, 2U, 4U, 8U, 16U, 32U}) drafter.seed_verify_ms(r, 10.0 + 0.15 * double(r));
     FakeTarget target(w);
     target.legal_rows = legal_rows;
@@ -141,6 +154,7 @@ Run run(const World& w, std::uint32_t n_tokens, double accuracy, bool copy, bool
         BD_CHECK(rec.emitted >= 1 && rec.emitted <= p.remaining, "emitted %u remaining %u", rec.emitted, p.remaining);
         BD_CHECK(r.out.size() == before + rec.emitted, "out size");
         ++r.steps;
+        r.trace.push_back(std::uint32_t(rec.source) * 100 + rec.proposed);
         r.max_rows = std::max(r.max_rows, rec.rows);
         r.hybrid += rec.copy > 0 && rec.ext > 0;
         r.chain_blocks += rec.source == sp::Source::model;
@@ -246,6 +260,52 @@ int main() {
                 BD_CHECK(r.out[i] == w.response[i], "frontier %u: token %u differs from serial", every, i);
             std::printf("frontier %u: %llu steps for %u tokens, %.1f virtual ms\n", every, (unsigned long long)r.steps, n, g_clock);
         }
+    }
+    {  // Deterministic controller (BlockConfig::fixed_costs): one prompt under three wall clocks (exact; jitter < 3 ms per
+       // call; jitter + a 12 ms spike on the first draft call) takes the SAME decision at every step and emits the serial
+       // truth. The learned form is printed beside it: there the decisions follow the clock.
+        const auto w = make_world("prose", 40, n, 21);
+        g_chain_step = 0.64;  // per drafted position vs a ~10.5 ms verify: the CUDA dense CJK subset head ratio
+        std::vector<std::uint32_t> ref;
+        std::uint32_t learned_differs = 0;
+        std::vector<std::uint32_t> learned_ref;
+        for (int variant = 0; variant < 3; ++variant)
+            for (const bool fixed : {true, false}) {
+                g_fixed = fixed;
+                g_jitter = variant ? 3.0 : 0.0;
+                g_spike = variant == 2 ? 12.0 : 0.0;
+                g_jitter_seed = std::uint64_t(variant) * 1000003ULL;
+                g_clock = 0.0;
+                const auto r = run(w, n, 0.6, true, true, true, true);
+                for (std::uint32_t i = 0; i < n; ++i)
+                    BD_CHECK(r.out[i] == w.response[i], "determinism variant %d fixed %d: token %u differs", variant, int(fixed), i);
+                std::uint32_t hist[33] = {}, serial = 0;
+                for (const auto t : r.trace) {
+                    if (t / 100 == std::uint32_t(sp::Source::model)) ++hist[std::min<std::uint32_t>(t % 100, 32)];
+                    serial += t / 100 == std::uint32_t(sp::Source::serial);
+                }
+                std::uint32_t mode_k = 0;
+                for (std::uint32_t k = 1; k <= 32; ++k) if (hist[k] > hist[mode_k]) mode_k = k;
+                std::printf("determinism variant %d %s: %zu steps, serial %u, model k mode %u (%u passes), %.1f virtual ms\n", variant,
+                            fixed ? "fixed  " : "learned", r.trace.size(), serial, mode_k, hist[mode_k], g_clock);
+                if (fixed) {
+                    if (variant == 0) ref = r.trace;
+                    std::size_t at = 0;
+                    while (at < ref.size() && at < r.trace.size() && ref[at] == r.trace[at]) ++at;
+                    BD_CHECK(r.trace == ref, "fixed costs: variant %d decision differs at step %zu (%u vs %u)", variant, at,
+                             at < r.trace.size() ? r.trace[at] : 0U, at < ref.size() ? ref[at] : 0U);
+                    // fake optimum at a 0.6 per-position rate: k = 3 (k = 2..5 within 4 %)
+                    BD_CHECK(mode_k >= 2 && mode_k <= 5, "fixed costs: model k mode %u, want 2..5", mode_k);
+                    BD_CHECK(serial * 10 < r.trace.size(), "fixed costs: %u serial of %zu steps", serial, r.trace.size());
+                } else {
+                    if (variant == 0) learned_ref = r.trace;
+                    else learned_differs += r.trace != learned_ref;
+                }
+            }
+        std::printf("determinism: fixed costs identical in 3 of 3 clocks; learned costs differ in %u of 2\n", learned_differs);
+        g_fixed = false;
+        g_jitter = g_spike = 0.0;
+        g_chain_step = 1.5;
     }
     std::printf("block drafter tests ok: %d cases, copy blocks %llu, chain blocks %llu, hybrid blocks %llu; edit %.2f vs serial %.2f ms/token\n",
                 cases, (unsigned long long)copies, (unsigned long long)chains, (unsigned long long)hybrids, tok_ms_all_loop, tok_ms_serial);
