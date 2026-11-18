@@ -286,6 +286,7 @@ struct BlockFields {
     float* moe_deltas = nullptr;
     std::int32_t* moe_dsums = nullptr;
     float* moe_inter = nullptr;                // native path: FP32 h per (row, slot)
+    std::int8_t *moe_lo = nullptr, *moe_dlo = nullptr;  // TURBO v2 only: second int8 limbs of moe_codes / moe_dcodes
     moe::Csr csr{};
     std::uint16_t* tap = nullptr;              // wide rows after layer 47 (MTP)
     // A prefill block keeps its layer-47 rows after the first kMaxWindowRows rows, where the decode windows put theirs
@@ -927,6 +928,10 @@ void Prefill::Impl::allocate_block(std::uint32_t rows, std::uint32_t qsa_chunk, 
     moe_raw = dev_zero<float>(R * kTopK * kHidden, "moe raw dots");
     }
     if (native_experts) moe_inter = dev_zero<float>(R * kTopK * 2 * 640, "moe native h");
+    if (cfg.expert_arithmetic == qwen_packs::ExpertArithmetic::gsq_i8_turbo2) {
+        moe_lo = dev_zero<std::int8_t>(R * kHidden, "moe TURBO v2 input limb");
+        moe_dlo = dev_zero<std::int8_t>(R * kTopK * 640, "moe TURBO v2 down limb");
+    }
     const auto sz = moe::csr_sizes(cap);
     csr.summary = dev_zero<std::uint32_t>(32, "csr");
     csr.offsets = dev_zero<std::uint32_t>(kExperts + 1, "csr");
@@ -1689,6 +1694,8 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         mr.down_codes = {moe_dcodes, kTopK * 640};
         mr.down_deltas = {moe_ddeltas, kTopK * 640 / 32 * 4};
         mr.down_sums = {moe_dsums, kTopK * 640 / 32 * 4};
+        mr.lo_codes = {moe_lo, kHidden};
+        mr.down_lo_codes = {moe_dlo, kTopK * 640};
         mr.route_bf16 = route_policy.enabled;
         mr.rawdot_capacity = route_policy.enabled ? qwen_route::layout(cap, true).bytes : 0U;
         mr.rawdots = {moe_raw, qwen_route::row_bytes(route_policy.enabled)};
@@ -2865,7 +2872,7 @@ void Prefill::Impl::free_block(BlockFields& b) noexcept {
     void* dev[] = {b.ids, b.emb, b.wide_a, b.wide_b, b.hidden, b.step_out, b.injection, b.normalized, b.codes, b.deltas, b.gdn_rows,
                    b.gdn_scratch, b.q_gate, b.qk, b.qv, b.index_q, b.index_k, b.attn_out, b.logits, b.routes, b.route_w, b.shared_out,
                    b.routed_out, b.combined, b.shared_ws, b.moe_sums, b.moe_status, b.moe_acc, b.moe_ddeltas, b.moe_raw, b.moe_codes,
-                   b.moe_dcodes, b.moe_deltas, b.moe_dsums, b.moe_inter, b.csr.summary, b.csr.offsets, b.csr.touched, b.csr.rows,
+                   b.moe_dcodes, b.moe_deltas, b.moe_dsums, b.moe_inter, b.moe_lo, b.moe_dlo, b.csr.summary, b.csr.offsets, b.csr.touched, b.csr.rows,
                    b.csr.slots, b.csr.batch_experts, b.csr.batch_begins, b.csr.tile_count, b.csr.tile_experts, b.csr.tile_begins, b.tap,
                    b.ple_ids, b.ple_rows, b.ple_keys, b.ple_values, b.ple_gates, b.ple_status, b.mtp_ws, b.mtp_next, b.mtp_status};
     for (void* d : dev) if (d) cudaFree(d);

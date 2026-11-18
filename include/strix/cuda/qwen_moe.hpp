@@ -72,6 +72,10 @@ struct Rows {
     // rawdot allocation capacity; stride remains in BYTES in both formats.
     bool route_bf16 = false;
     std::uint64_t rawdot_capacity = 0;
+    // TURBO v2 only (gsq-iq-i8mma-turbo-cuda-v2, src/cuda/core/turbo_i8.hpp): second int8 limb of the A8 input codes and
+    // of the A8 down codes, same geometry as codes / down_codes. Null unless that contract is selected.
+    Strided<std::int8_t> lo_codes;             // [hidden]
+    Strided<std::int8_t> down_lo_codes;        // [top_k * ffn]
 };
 
 // Explicit FAST contract; defaults preserve the historical source/arithmetic.

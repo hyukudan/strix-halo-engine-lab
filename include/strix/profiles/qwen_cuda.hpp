@@ -165,23 +165,53 @@ inline constexpr bool kFastBundleQualified = false;
 struct BundleStatus {
     std::string id, detail;
 };
-inline BundleStatus fast_bundle_status(const Choice& c, bool expert_bf16mma) {
-    std::string missing;
-    const auto need = [&](bool ok, std::string_view what) {
-        if (!ok) missing += (missing.empty() ? "" : ", ") + std::string(what);
-    };
-    need(expert_bf16mma, "experts are not gsq-iq-bf16mma-cuda-v1");
-    need(c.qsa_mma, "qsa_mma off");
-    need(c.hc_mma, "hc_mma off");
-    need(c.mtp_defer_prompt, "mtp_defer_prompt off");
-    need(!c.moe_mma, "moe_mma on (not a member)");
-    need(!c.mtp_mma, "mtp_mma on (not a member)");
-    need(!c.moe_route_bf16, "moe_route_bf16 on (not a member)");
-    if (!missing.empty()) return {"", "outside " + std::string(kFastBundle) + ": " + missing};
-    std::string members;
-    for (const auto m : kFastBundleMembers) members += (members.empty() ? "" : ",") + std::string(m);
-    return {std::string(kFastBundle), "members " + members + (kFastBundleQualified ? "; qualified" :
+namespace bundle_detail {
+struct Missing {
+    std::string text;
+    void need(bool ok, std::string_view what) {
+        if (!ok) text += (text.empty() ? "" : ", ") + std::string(what);
+    }
+};
+inline BundleStatus status(std::string_view id, std::span<const std::string_view> members, const Missing& m, bool qualified) {
+    if (!m.text.empty()) return {"", "outside " + std::string(id) + ": " + m.text};
+    std::string list;
+    for (const auto x : members) list += (list.empty() ? "" : ",") + std::string(x);
+    return {std::string(id), "members " + list + (qualified ? "; qualified" :
         "; provisional: the whole-bundle logit gate has not passed")};
+}
+}  // namespace bundle_detail
+inline BundleStatus fast_bundle_status(const Choice& c, bool expert_bf16mma) {
+    bundle_detail::Missing m;
+    m.need(expert_bf16mma, "experts are not gsq-iq-bf16mma-cuda-v1");
+    m.need(c.qsa_mma, "qsa_mma off");
+    m.need(c.hc_mma, "hc_mma off");
+    m.need(c.mtp_defer_prompt, "mtp_defer_prompt off");
+    m.need(!c.moe_mma, "moe_mma on (not a member)");
+    m.need(!c.mtp_mma, "mtp_mma on (not a member)");
+    m.need(!c.moe_route_bf16, "moe_route_bf16 on (not a member)");
+    return bundle_detail::status(kFastBundle, kFastBundleMembers, m, kFastBundleQualified);
+}
+
+// The RTX Qwen TURBO bundle = the turbo column: the FAST bundle's forms (hc_mma, qsa_mma, the exact prompt-MTP deferral)
+// with the integer TURBO experts (gsq-iq-i8mma-turbo-cuda-v1) in place of the BF16 FAST experts, plus mtp_mma (draft head
+// only; under the deferral its rows run after the first token) and the pack's own dense weights. One id for the set that the
+// TURBO logit gate qualifies (FAST thresholds, against the exact reference). Any member overridden (another expert
+// arithmetic, --turbo-weights onfly, a form off, moe_mma or route storage on) leaves the run outside it.
+inline constexpr std::string_view kTurboBundle = "qwen-cuda-turbo-bundle-v1";
+inline constexpr std::string_view kTurboBundleMembers[] = {"expert_turbo", "qsa_mma", "hc_mma", "mtp_mma", "mtp_defer_prompt"};
+// Flip when the TURBO gate receipts (8K, 32K, short/code/structured) pass.
+inline constexpr bool kTurboBundleQualified = false;
+inline BundleStatus turbo_bundle_status(const Choice& c, bool expert_i8turbo_v1, bool native_weights) {
+    bundle_detail::Missing m;
+    m.need(expert_i8turbo_v1, "experts are not gsq-iq-i8mma-turbo-cuda-v1");
+    m.need(c.qsa_mma, "qsa_mma off");
+    m.need(c.hc_mma, "hc_mma off");
+    m.need(c.mtp_mma, "mtp_mma off");
+    m.need(c.mtp_defer_prompt, "mtp_defer_prompt off");
+    m.need(native_weights, "dense weights not the pack's (--turbo-weights onfly)");
+    m.need(!c.moe_mma, "moe_mma on (not a member)");
+    m.need(!c.moe_route_bf16, "moe_route_bf16 on (not a member)");
+    return bundle_detail::status(kTurboBundle, kTurboBundleMembers, m, kTurboBundleQualified);
 }
 inline std::string forms_list(const Choice& c) {
     std::string out;

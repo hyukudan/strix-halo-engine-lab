@@ -943,6 +943,7 @@ int main(int argc, char** argv) {
     am::Tables tables = am::load_tables(argv[1]);
 #ifdef STRIX_WFMT_CAPTURE
     if (mode.rfind("wfmt-capture=", 0) == 0) { wfmt_capture(tables,mode.c_str()+13); am::free_tables(tables); return 0; }
+    if (mode == "turbo-probe") { const int rc = turbo_probe(tables); am::free_tables(tables); return rc; }
 #endif
     if (mode == "fixture") { fixture_replay(tables); std::printf("%s: %d failures, %llu bytes compared\n", g_fail ? "FAIL" : "PASS", g_fail, g_checked); return g_fail ? 1 : 0; }
     if (mode == "fastmma" || mode == "fastmma-check") {
