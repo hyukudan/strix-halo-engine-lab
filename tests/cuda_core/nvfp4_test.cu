@@ -299,6 +299,110 @@ static void bench() {
     }
 }
 
+// Programmatic dependent launch + L2 prefetch on fp4_gemv / fp4_reduce are scheduling only: a dependent chain
+// A(x) -> B(a) + x -> gate/up(b) -> A(b) -> B(a) + b -> gate/up(b2) run with PDL on (stream, then a CUDA graph replayed
+// three times) must equal the serialised form (PDL off) bit for bit; rows 1/8/16, ks 40/48/40 and ks 1 (split target 1).
+static cc::DenseWeight make_weight(std::uint32_t out, std::uint32_t in, std::mt19937& rng, std::vector<void*>& owned) {
+    std::normal_distribution<float> nd(0.f, 0.02f);
+    std::vector<float> w(static_cast<std::size_t>(out) * in);
+    for (auto& v : w) v = nd(rng);
+    float* d_w;
+    CK(cudaMalloc(&d_w, w.size() * 4));
+    CK(cudaMemcpy(d_w, w.data(), w.size() * 4, cudaMemcpyHostToDevice));
+    void* d_t;
+    CK(cudaMalloc(&d_t, cc::nvfp4_bytes(out, in)));
+    float gs = 0;
+    CK(cc::nvfp4_quantize_f32(d_w, out, in, d_t, &gs, 0));
+    CK(cudaFree(d_w));
+    owned.push_back(d_t);
+    cc::DenseWeight W;
+    W.data = d_t;
+    W.format = cc::WeightFormat::nvfp4;
+    W.out = out;
+    W.in = in;
+    W.gscale = gs;
+    return W;
+}
+
+static void test_pdl_chain(std::uint32_t split_target, std::mt19937& rng) {
+    constexpr std::uint32_t kH = 5120, kI = 6144, kF = 1024;
+    std::vector<void*> owned;
+    const cc::DenseWeight A = make_weight(kI, kH, rng, owned), B = make_weight(kH, kI, rng, owned);
+    const cc::DenseWeight G = make_weight(kF, kH, rng, owned), U = make_weight(kF, kH, rng, owned);
+    cc::nvfp4_set_split_target(split_target);
+    std::printf("-- pdl chain: split target %u, ks A %u B %u gate/up %u\n", split_target, cc::nvfp4_split_k(kI, kH),
+                cc::nvfp4_split_k(kH, kI), cc::nvfp4_split_k(kF, kH));
+    cudaStream_t s;
+    CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+    for (std::uint32_t rows : {1u, 8u, 16u}) {
+        std::uniform_real_distribution<float> ud(-1.f, 1.f);
+        std::vector<float> x(static_cast<std::size_t>(rows) * kH);
+        for (auto& v : x) v = ud(rng);
+        const std::size_t na = static_cast<std::size_t>(rows) * kI, nb = static_cast<std::size_t>(rows) * kH,
+                          nc = static_cast<std::size_t>(rows) * kF;
+        float *dx, *da, *db, *db2, *dc;
+        CK(cudaMalloc(&dx, nb * 4));
+        CK(cudaMalloc(&da, na * 4));
+        CK(cudaMalloc(&db, nb * 4));
+        CK(cudaMalloc(&db2, nb * 4));
+        CK(cudaMalloc(&dc, nc * 4));
+        CK(cudaMemcpy(dx, x.data(), nb * 4, cudaMemcpyHostToDevice));
+        auto chain = [&]() {
+            CK(cc::nvfp4_dense_rows(A, dx, da, rows, nullptr, s));
+            CK(cc::nvfp4_dense_rows(B, da, db, rows, dx, s));
+            CK(cc::nvfp4_gate_up_silu_rows(G, U, db, dc, rows, s));
+            CK(cc::nvfp4_dense_rows(A, db, da, rows, nullptr, s));
+            CK(cc::nvfp4_dense_rows(B, da, db2, rows, db, s));
+            CK(cc::nvfp4_gate_up_silu_rows(G, U, db2, dc, rows, s));
+        };
+        auto snap = [&]() {
+            CK(cudaStreamSynchronize(s));
+            std::vector<float> o(na + 2 * nb + nc);
+            CK(cudaMemcpy(o.data(), da, na * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(o.data() + na, db, nb * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(o.data() + na + nb, db2, nb * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(o.data() + na + 2 * nb, dc, nc * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemsetAsync(da, 0xFF, na * 4, s));  // poison: a skipped or early write cannot pass
+            CK(cudaMemsetAsync(db, 0xFF, nb * 4, s));
+            CK(cudaMemsetAsync(db2, 0xFF, nb * 4, s));
+            CK(cudaMemsetAsync(dc, 0xFF, nc * 4, s));
+            return o;
+        };
+        auto same = [](const std::vector<float>& p, const std::vector<float>& q) {
+            return p.size() == q.size() && std::memcmp(p.data(), q.data(), p.size() * 4) == 0;
+        };
+        cc::set_programmatic_launch(false);
+        chain();
+        const std::vector<float> ref = snap();
+        cc::set_programmatic_launch(true);
+        chain();
+        const bool stream_ok = same(snap(), ref);
+        cudaGraph_t g;
+        cudaGraphExec_t ge;
+        CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+        chain();
+        CK(cudaStreamEndCapture(s, &g));
+        CK(cudaGraphInstantiate(&ge, g, 0));
+        bool graph_ok = true;
+        for (int rep = 0; rep < 3; ++rep) {
+            CK(cudaGraphLaunch(ge, s));
+            graph_ok = same(snap(), ref) && graph_ok;
+        }
+        CK(cudaGraphExecDestroy(ge));
+        CK(cudaGraphDestroy(g));
+        char what[160];
+        std::snprintf(what, sizeof what, "pdl chain rows %u split target %u: stream == serial, graph x3 == serial", rows,
+                      split_target);
+        expect(stream_ok && graph_ok, what);
+        for (float* p : {dx, da, db, db2, dc}) CK(cudaFree(p));
+    }
+    CK(cudaStreamSynchronize(s));
+    cc::nvfp4_release_workspace(s);
+    CK(cudaStreamDestroy(s));
+    for (void* p : owned) CK(cudaFree(p));
+    cc::nvfp4_set_split_target(0);  // back to the default target
+}
+
 int main(int argc, char** argv) {
     const std::string a = argc > 1 ? argv[1] : "";
     if (argc > 2) cc::nvfp4_set_split_target(static_cast<std::uint32_t>(std::atoi(argv[2])));
@@ -312,6 +416,11 @@ int main(int argc, char** argv) {
         test_shape(48, 5120, rng);
         test_shape(1024, 6144, rng);
         test_shape(5120, 17408, rng);
+        if (argc <= 2) {  // the chain sets its own split targets (argv[2] overrides the target for the shapes/bench)
+            std::mt19937 rng2(4321);
+            test_pdl_chain(1000, rng2);
+            test_pdl_chain(1, rng2);
+        }
         std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "ALL PASS", g_fail);
     }
     if (a != "--test-only") bench();

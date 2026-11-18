@@ -154,6 +154,10 @@ struct Jobs {
 template <int RB, int MT>
 __global__ void __launch_bounds__(kWarpsPerBlock * 32) fp4_gemv(const Jobs jobs, const float* x, std::uint32_t in, std::uint32_t rows) {
     extern __shared__ uint2 xs_dyn[];
+    // PDL (scheduling only): the dependent kernel may launch once every block started; this block's first weight records
+    // (constant data) are requested BEFORE pdl_wait, so the weight stream overlaps the predecessor's tail. x, part and y
+    // are touched only after pdl_wait. The arithmetic below is unchanged.
+    pdl_trigger();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     int ji = 0;
 #pragma unroll
@@ -186,10 +190,25 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) fp4_gemv(const Jobs jobs,
 #pragma unroll
         for (int rb = 0; rb < RB; ++rb) acc[mt][rb][0] = acc[mt][rb][1] = acc[mt][rb][2] = acc[mt][rb][3] = 0.f;
 
+    // Before pdl_wait (constant data only): record c0 of each tile goes to registers (`cur`) and record c0 + 1, when this
+    // block has one, is requested into L2 (lanes 0..8 = its 9 lines; no register). A full resident wave then holds at most
+    // 2 records per tile in flight (<= ~21 MB of L2 even for ks == 1 shapes).
+    {
+        constexpr std::uint32_t kLines = kNvfp4RecordBytes / 128;
+        static_assert(kNvfp4RecordBytes % 128 == 0, "records are whole 128-byte lines");
+        if (c0 + 1 < c1 && static_cast<std::uint32_t>(lane) < kLines) {
+#pragma unroll
+            for (int mt = 0; mt < MT; ++mt)
+                if (on[mt])
+                    prefetch_l2(base[mt] + static_cast<std::size_t>(c0 + 1) * kNvfp4RecordBytes +
+                                static_cast<std::size_t>(lane) * 128);
+        }
+    }
     LoadRegs cur[MT], nxt[MT];
 #pragma unroll
     for (int mt = 0; mt < MT; ++mt)
         if (on[mt] && c0 < c1) cur[mt] = load_record(base[mt] + static_cast<std::size_t>(c0) * kNvfp4RecordBytes, lane);
+    pdl_wait();
     for (std::uint32_t c = c0; c < c1; ++c) {
         const std::uint32_t cs = (c - c0) % kSlab;
         if (cs == 0) {
@@ -244,6 +263,8 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) fp4_gemv(const Jobs jobs,
 
 // grid (blocks over the largest job, njobs): finalises split-K and fused jobs.
 __global__ void fp4_reduce(const Jobs jobs, std::uint32_t rows) {
+    pdl_trigger();
+    pdl_wait();
     const Job& J = jobs.j[blockIdx.y];
     if (J.ks <= 1 && J.w[1] == nullptr) return;
     const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -280,12 +301,14 @@ cudaError_t launch_gemv(Jobs& jobs, const float* x, std::uint32_t in, std::uint3
         fused = fused || jobs.j[q].w[1] != nullptr;
         any_split = any_split || jobs.j[q].ks > 1;
     }
-    fp4_gemv<RB, MT><<<dim3(gx, maxks, fused ? 2 : 1), kWarpsPerBlock * 32, kSlab * RB * 2048, s>>>(jobs, x, in, rows);
-    cudaError_t e = cudaGetLastError();
+    // Both launches carry the programmatic-serialization attribute (off switch: set_programmatic_launch(false) gives the
+    // previous fully serialised form; same kernels, same bits).
+    cudaError_t e = launch_pdl_smem(fp4_gemv<RB, MT>, dim3(gx, maxks, fused ? 2 : 1), dim3(kWarpsPerBlock * 32),
+                                    static_cast<std::size_t>(kSlab) * RB * 2048, s, jobs, x, in, rows);
     if (e != cudaSuccess || (!any_split && !fused)) return e;
     const std::size_t n = static_cast<std::size_t>(maxout) * rows;
-    fp4_reduce<<<dim3(static_cast<unsigned>((n + 255) / 256), static_cast<unsigned>(jobs.n)), 256, 0, s>>>(jobs, rows);
-    return cudaGetLastError();
+    return launch_pdl(fp4_reduce, dim3(static_cast<unsigned>((n + 255) / 256), static_cast<unsigned>(jobs.n)), dim3(256), s,
+                      jobs, rows);
 }
 
 cudaError_t launch_by_rows(Jobs& jobs, const float* x, std::uint32_t in, std::uint32_t rows, cudaStream_t s) {

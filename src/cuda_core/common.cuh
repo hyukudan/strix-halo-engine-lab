@@ -4,6 +4,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace strix::cuda_core {
@@ -15,17 +16,22 @@ namespace strix::cuda_core {
 __device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 
+// L2 prefetch of one 128-byte line (no register, no ordering against pdl_wait): the way a kernel streams its constant
+// weights before pdl_wait.
+__device__ __forceinline__ void prefetch_l2(const void* p) { asm volatile("prefetch.global.L2 [%0];" ::"l"(p)); }
+
 inline bool& pdl_enabled() {
     static bool on = true;
     return on;
 }
 
 template <class... KArgs, class... Args>
-cudaError_t launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, cudaStream_t stream, Args... args) {
+cudaError_t launch_pdl_smem(void (*kernel)(KArgs...), dim3 grid, dim3 block, std::size_t smem, cudaStream_t stream,
+                            Args... args) {
     cudaLaunchConfig_t cfg{};
     cfg.gridDim = grid;
     cfg.blockDim = block;
-    cfg.dynamicSmemBytes = 0;
+    cfg.dynamicSmemBytes = smem;
     cfg.stream = stream;
     cudaLaunchAttribute at[1];
     at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -33,6 +39,11 @@ cudaError_t launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, cudaStre
     cfg.attrs = at;
     cfg.numAttrs = pdl_enabled() ? 1 : 0;
     return cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
+}
+
+template <class... KArgs, class... Args>
+cudaError_t launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, cudaStream_t stream, Args... args) {
+    return launch_pdl_smem(kernel, grid, block, 0, stream, args...);
 }
 
 // Single points for transcendentals (a HIP twin swaps these for its own bit-matched versions).
