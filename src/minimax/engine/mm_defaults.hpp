@@ -97,6 +97,11 @@ profile::Resolution profile_resolution(const Lookup& env);
 // resolves, so both apps feed profile_resolution() the same values. The per-phase timing session is
 // '--timing-profile NAME:PROMPT.u32:STEPS'; the old '--profile NAME:PROMPT.u32:STEPS' stays accepted with one notice.
 inline constexpr const char* kProductProfileEnv = "STRIX_MM_PRODUCT_PROFILE";
+// True when the product profile is 'fast' and the FAST bundle switch (STRIX_MM_FAST_PREFILL) is unset: print_or_apply()
+// then exports the qualified bundle (mm-fast-pf-v2, gate PASS 8K + 32K), so '--profile fast' runs what its gate
+// qualified, with the same members, fingerprint and cache identity as the switch. A set switch, "0" included, wins;
+// default / quality / turbo never select it here (turbo keeps its own pending rows).
+bool fast_profile_selects_bundle(const Lookup& env);
 // The apps' own option loops call this: true when `a` is one of the options above (its value skipped). `timing`
 // (rank only; nullptr in serve) receives a timing session spec ('--timing-profile', or the old '--profile' spelling).
 bool product_option(const std::string& a, const std::function<std::string()>& next, std::string* timing);
