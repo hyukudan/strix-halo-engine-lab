@@ -550,17 +550,26 @@ int main(int argc, char** argv) {
         ncu_probe(argc > 2 ? static_cast<std::uint32_t>(std::atoi(argv[2])) : 8u);
         return 0;
     }
-    if (argc > 2) cc::nvfp4_set_split_target(static_cast<std::uint32_t>(std::atoi(argv[2])));
+    // argv[2]: a split target (EXACT policy) or "fast" (the FAST split policy of strix/split_k_policy.hpp for device 0)
+    const bool fast_split = argc > 2 && std::string(argv[2]) == "fast";
+    if (argc > 2 && !fast_split) cc::nvfp4_set_split_target(static_cast<std::uint32_t>(std::atoi(argv[2])));
     CK(cudaSetDevice(0));
+    if (fast_split) CK(cc::nvfp4_set_split_profile(true));
     cudaDeviceProp p;
     CK(cudaGetDeviceProperties(&p, 0));
     std::printf("device 0: %s cc %d.%d SMs %d\n", p.name, p.major, p.minor, p.multiProcessorCount);
+    std::printf("split policy: %s\n", cc::nvfp4_split_identity());
     if (a != "--bench-only") {
         std::mt19937 rng(1234);
         test_shape(256, 512, rng);
         test_shape(48, 5120, rng);
         test_shape(1024, 6144, rng);
         test_shape(5120, 17408, rng);
+        if (fast_split) {  // shapes with a FAST row: host reference + rows 1..32 invariance at the FAST split factor
+            std::printf("fast split: ks 5120x6144 %u, 6144x5120 %u\n", cc::nvfp4_split_k(5120, 6144), cc::nvfp4_split_k(6144, 5120));
+            test_shape(5120, 6144, rng);
+            test_shape(6144, 5120, rng);
+        }
         if (argc <= 2) {  // the chain sets its own split targets (argv[2] overrides the target for the shapes/bench)
             std::mt19937 rng2(4321);
             test_pdl_chain(1000, rng2);

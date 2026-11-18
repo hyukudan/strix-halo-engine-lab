@@ -159,7 +159,7 @@ int main(int argc, char** argv) {
         bool slots_verify = false, graphs = true, multi = true, bwp = false, pdl = false, print_cfg = false;
         q::EngineOptions topt;  // TURBO levers (defaults = exact)
         std::string arith_name = "mma3";
-        std::string flash_pipe, flash_tail, pf_attn8, dump_cont, pf_ocache, pf_ocache_cap;
+        std::string flash_pipe, flash_tail, pf_attn8, dump_cont, pf_ocache, pf_ocache_cap, split_k_arg;
         std::string pf_arith, pf_dump;            // --prefill-arith exact|flash|fast|fast2: large-M prefill (absent: windows of --rows)
         std::string pf_gdn;                       // --prefill-gdn serial|chunk16 (EngineOptions::prefill_gdn; ignored under exact)
         std::string pf_norm_fold;                 // --prefill-norm-fold on|off (EngineOptions::prefill_norm_fold; FAST4 only, bitwise)
@@ -186,6 +186,7 @@ int main(int argc, char** argv) {
             else if (a == "--flash-pipe") flash_pipe = next();         // pad2|swz3 (bitwise equal; scheduling only)
             else if (a == "--flash-tail") flash_tail = next();         // split|off (bitwise equal; scheduling only; default split)
             else if (a == "--prefill-attn8") pf_attn8 = next();        // on|off: e4m3 flash attention (FAST, identity -a8)
+            else if (a == "--split-k") split_k_arg = next();           // exact|fast: NVFP4 split-K policy (fast = FAST, identity -skf1)
             else if (a == "--prefill-operand-cache") pf_ocache = next();          // auto|on|off: resident expanded weights (bitwise neutral)
             else if (a == "--prefill-operand-cache-cap-mib") pf_ocache_cap = next();  // arena cap in MiB, 0 = budget only
             else if (a == "--prefill-chunk") pf_chunk = strix::core::parse_u32(next());
@@ -284,6 +285,7 @@ int main(int argc, char** argv) {
         opt.prefill_ramp = pf_ramp;
         q::resolve_flash_controls(opt, flash_pipe, flash_tail, pf_attn8);
         q::resolve_operand_cache(opt, pf_ocache, pf_ocache_cap);
+        q::resolve_split_k(opt, split_k_arg, opt.prefill_arith != q::PrefillArith::exact);
         opt.use_graphs = graphs;
         opt.multi_gemv = multi;
         opt.pdl = pdl;

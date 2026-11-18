@@ -12,6 +12,7 @@
 #include <mutex>
 
 #include "../common.cuh"
+#include "strix/split_k_policy.hpp"
 
 namespace strix::cuda_core {
 namespace {
@@ -64,7 +65,10 @@ __device__ __forceinline__ void mma16816(float (&c)[4], std::uint32_t a0, std::u
 
 // ---------------------------------------------------------------------------------------------------------------- GEMV
 constexpr int kWarpsPerBlock = 4;
-std::uint32_t g_target_warps = 1000;  // split-K target (depends on the shape only, never on rows)
+// split-K policy (strix/split_k_policy.hpp): depends on the shape and the process-wide profile, never on rows
+std::uint32_t g_target_warps = split_k::kExactTarget;  // EXACT target (test hook: nvfp4_set_split_target)
+split_k::Profile g_split_profile = split_k::Profile::exact;
+split_k::Device g_split_device{};
 
 struct LoadRegs {
     uint4 d0, d1, sc;
@@ -438,11 +442,28 @@ cudaError_t quantize(const void* src, std::uint32_t out, std::uint32_t in, void*
 
 }  // namespace
 
-void nvfp4_set_split_target(std::uint32_t warps) { g_target_warps = warps ? warps : 1000; }
+void nvfp4_set_split_target(std::uint32_t warps) { g_target_warps = warps ? warps : split_k::kExactTarget; }
+
+cudaError_t nvfp4_set_split_profile(bool fast) {
+    split_k::Device d{};
+    if (fast) {
+        int dev = 0, sms = 0, major = 0, minor = 0;
+        cudaError_t e = cudaGetDevice(&dev);
+        if (e == cudaSuccess) e = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        if (e == cudaSuccess) e = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        if (e == cudaSuccess) e = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        if (e != cudaSuccess) return e;
+        d = {static_cast<std::uint32_t>(sms), static_cast<std::uint32_t>(10 * major + minor)};
+    }
+    g_split_device = d;
+    g_split_profile = fast ? split_k::Profile::fast : split_k::Profile::exact;
+    return cudaSuccess;
+}
+
+const char* nvfp4_split_identity() { return split_k::identity(g_split_profile, g_split_device).data(); }
 
 std::uint32_t nvfp4_split_k(std::uint32_t out, std::uint32_t in) {
-    const std::uint32_t nch = in >> 7, groups = std::max<std::uint32_t>(1, (out / 16 + 15) / 16);
-    return std::clamp<std::uint32_t>((g_target_warps + groups / 2) / groups, 1, nch);
+    return split_k::factor(split_k::target(g_split_profile, g_split_device, out, in, g_target_warps), out, in);
 }
 
 cudaError_t nvfp4_quantize_bf16(const void* bf16, std::uint32_t out, std::uint32_t in, void* dst, float* gscale,
