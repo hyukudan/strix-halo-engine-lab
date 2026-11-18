@@ -157,6 +157,31 @@ double break_even_emitted(double plain_ms, double verify_ms, double draft_ms) {
     return (verify_ms + draft_ms) / plain_ms;
 }
 
+std::vector<double> moe_verify_seed_ms(const MoeVerifyBytes& m, double plain_ms, double gbps, std::uint32_t max_rows) {
+    if (!(plain_ms > 0.0) || !(gbps > 0.0) || max_rows == 0U)
+        throw std::invalid_argument("block_parallel: moe_verify_seed_ms needs plain_ms > 0, gbps > 0, max_rows > 0");
+    const double fixed_ms = plain_ms - verify_gb(m, 1U) / gbps * 1000.0;
+    if (fixed_ms < 0.0) throw std::invalid_argument("block_parallel: verify bytes exceed the plain wall at gbps");
+    std::vector<double> ms(max_rows);
+    for (std::uint32_t r = 1; r <= max_rows; ++r) ms[r - 1U] = fixed_ms + verify_gb(m, r) / gbps * 1000.0;
+    return ms;
+}
+
+MoeVerifyBytes hy4_verify_bytes() {
+    // Decode trace (one node, one token): q8_rows Linears 6.00 GB, absorbed K_b / V_b 0.56, BF16 head 0.74, F32 router
+    // 0.25 = 7.55 GB read once per pass; routed experts 1.74 + 1.27 = 3.01 GB = 16 x 41 x 4.59 MB.
+    constexpr double elems = 1536.0 * 1536.0;
+    constexpr double expert_bytes = 2.0 * elems * 144.0 / 256.0 + elems * 210.0 / 256.0;  // Q4_K gate + up, Q6_K down
+    MoeVerifyBytes m;
+    m.per_row_gb = 0.046;  // selected latent keys + indexer group keys of one row at short context
+    m.fixed_gb = 7.55 - m.per_row_gb;
+    m.expert_gb = expert_bytes * 1e-9;
+    m.experts = 512U;
+    m.top_k = 16U;
+    m.moe_layers = 41U;
+    return m;
+}
+
 double expected_emitted(double alpha, std::uint32_t rows) {
     double e = 0.0, a = 1.0;
     for (std::uint32_t i = 0; i < rows; ++i) {
