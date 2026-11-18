@@ -64,5 +64,5 @@ namespace strix::glm::pf {
 void mla_attention_rows_selected(const dev::DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n,
     const float* q, const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o,
     unsigned C, hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v, unsigned query_window,
-    mla_gemm::Dispatch dispatch);
+    mla_gemm::Dispatch dispatch, unsigned max_keys = ~0U);  // max_keys: host bound of every row's list (~0U unknown)
 }  // namespace strix::glm::pf

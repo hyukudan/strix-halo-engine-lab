@@ -84,6 +84,13 @@ __device__ __forceinline__ void pipe_tail(const Item& it, unsigned bx, unsigned 
     return PipeCore<Packed, true>::template pipe_tail<Bits, MT, Simplify>(it, bx, by, bz);
 }
 
+// pipe_tail's loop (G = min(MT, 4)) on one mtfit remainder block, K split 1, with the caller's epilogue for the
+// accumulators (rows past it.rows hold the padded rows' values; the caller guards them as PipePartialStore does).
+template <int Bits, int MT, bool Simplify, bool Packed, class Epi>
+__device__ __forceinline__ void pipe_tail_run(const Item& it, unsigned bx, unsigned by, Epi epi) {
+    PipeCore<Packed, true>::template item_pipe_run<Bits, MT, (MT < 4 ? MT : 4), Simplify, 2>(it, bx, by, 0, epi);
+}
+
 template <int Bits, bool Simplify>
 __device__ __forceinline__ void item_pipe_pair(const Item& it, unsigned bx, unsigned by, unsigned bz, Half16* exchange) {
     return Core::item_pipe_pair<Bits, Simplify>(it, bx, by, bz, exchange);

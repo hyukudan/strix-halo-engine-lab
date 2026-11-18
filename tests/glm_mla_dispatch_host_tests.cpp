@@ -11,7 +11,7 @@ using hipStream_t = void*;
 struct DsaSlot {};
 struct Call {
     mla_gemm::Dispatch dispatch;
-    unsigned gemm, rows;
+    unsigned gemm, rows, max_keys;
     const float* q;
     float* out;
 };
@@ -25,8 +25,8 @@ unsigned mla_gemm_version() { return 3; }
 unsigned attention_scratch_rows(unsigned c, unsigned window) { return window ? std::min(c, window) : c; }
 void mla_attention_rows_impl(const DsaSlot&, const std::uint32_t*, const std::uint32_t*, const float* q,
     const std::uint16_t*, unsigned, float*, float*, float*, float* out, unsigned c, hipStream_t,
-    unsigned, unsigned, unsigned gemm, const mla_gemm::Dispatch& dispatch) {
-    calls.at(call_count++) = {dispatch, gemm, c, q, out};
+    unsigned, unsigned, unsigned gemm, const mla_gemm::Dispatch& dispatch, unsigned max_keys) {
+    calls.at(call_count++) = {dispatch, gemm, c, max_keys, q, out};
 }
 #include "mla_wrappers.inc"
 }  // namespace strix::glm::pf
@@ -54,6 +54,7 @@ void dispatch_test(bool expected_fast) {
             nullptr, nullptr, nullptr, out.data(), 129, nullptr, 7, 7, gemm);
         check(P::call_count == 1 && !P::calls[0].dispatch.use_wmma(true) && P::calls[0].gemm == gemm,
               "explicit exact GEMM selector survives FAST environment");
+        check(P::calls[0].max_keys == ~0U, "explicit version wrapper keeps unknown list bound");
         P::call_count = 0;
         P::mla_attention_rows_versions({}, tokens.data(), counts.data(), q.data(), nullptr, 32,
             nullptr, nullptr, nullptr, out.data(), 129, nullptr, 7, 7, gemm, 128);
@@ -62,6 +63,8 @@ void dispatch_test(bool expected_fast) {
         for (unsigned i = 0; i < P::call_count; ++i)
             check(!P::calls[i].dispatch.use_wmma(true) && P::calls[i].gemm == gemm,
                   "windowed exact selector survives FAST environment");
+        for (unsigned i = 0; i < P::call_count; ++i)
+            check(P::calls[i].max_keys == ~0U, "windowed version wrapper keeps unknown list bound");
         check(P::calls[1].q == q.data() + 128U * 32U * P::kMlaDim &&
               P::calls[1].out == out.data() + 128U * 32U * P::kMlaDim, "window origins preserved");
     }
@@ -69,16 +72,20 @@ void dispatch_test(bool expected_fast) {
     P::mla_attention_rows({}, tokens.data(), counts.data(), q.data(), nullptr, 32,
         nullptr, nullptr, nullptr, out.data(), 129, nullptr);
     P::mla_attention_rows({}, tokens.data(), counts.data(), q.data(), nullptr, 32,
-        nullptr, nullptr, nullptr, out.data(), 129, nullptr, 128);
+        nullptr, nullptr, nullptr, out.data(), 129, nullptr, 128, 319U);
     check(P::call_count == 3, "ordinary wrappers dispatch full and windowed calls");
+    check(P::calls[0].max_keys == ~0U && P::calls[1].max_keys == 319U && P::calls[2].max_keys == 319U,
+          "ordinary unwindowed default and every bounded window preserve list bounds");
     for (unsigned i = 0; i < P::call_count; ++i)
         check(P::calls[i].dispatch.use_wmma(true) == expected_fast && !P::calls[i].dispatch.use_wmma(false),
               "ordinary dispatch uses automatic arithmetic with eligibility fallback");
     P::call_count = 0;
     P::mla_attention_rows_selected({}, tokens.data(), counts.data(), q.data(), nullptr, 32,
         nullptr, nullptr, nullptr, out.data(), 129, nullptr, 7, 23, 3, 128,
-        {P::mla_gemm::Arithmetic::wmma, false, false});
+        {P::mla_gemm::Arithmetic::wmma, false, false}, 228U);
     check(P::call_count == 2, "explicit FAST windows dispatched");
+    check(P::calls[0].max_keys == 228U && P::calls[1].max_keys == 228U,
+          "explicit FAST windows preserve the caller list bound");
     for (unsigned i = 0; i < P::call_count; ++i)
         check(P::calls[i].dispatch.use_wmma(true) && !P::calls[i].dispatch.ob16 && !P::calls[i].dispatch.heads_mid,
               "explicit FAST/image/placement policy is independent of environment");

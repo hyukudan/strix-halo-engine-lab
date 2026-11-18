@@ -193,7 +193,10 @@ void dispatch_rows(unsigned rows, const Tensor& w, const Tensor& up, const float
 }
 // ---- wide windows (rows > 16): FAST dense-q8a8-f16-v1 of the shared f16_dense_tall core --------------------------------
 // One engine per process binds these scratch buffers (set by Impl); rows beyond the exact 16-row sweep go through them.
-using WideScratch = core::DenseWideScratch;
+// + xt: FP16 x tiles of the x16 form of the IU4 wide GEMM (rows x max inputs, f16_dense_tall::x16_bytes).
+struct WideScratch : core::DenseWideScratch {
+    _Float16* xt = nullptr;
+};
 
 // A8 of 32-value groups, one wave per group (as quantize_a8: amax / 127, rint, clamp +-127; delta 1 for zero or tiny groups).
 __global__ void a8_quant_kernel(const float* x, unsigned inputs, std::int8_t* codes, float* deltas) {
@@ -210,6 +213,10 @@ __global__ void a8_quant_kernel(const float* x, unsigned inputs, std::int8_t* co
     codes[at] = static_cast<std::int8_t>(q);
     if (lane == 0) deltas[std::size_t(blockIdx.y) * groups + group] = dl;
 }
+// The gated-unit expression of silu_mul_kernel, for the shared x16 tile producer (f16_dense_tall::x16_tiles_map2_kernel).
+struct SiluMul {
+    __device__ __forceinline__ static float apply(float g, float u) { return dl::silu(g) * u; }
+};
 __global__ void silu_mul_kernel(const float* g, const float* u, float* out, std::size_t n) {
     for (std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += std::size_t(gridDim.x) * blockDim.x)
         out[i] = dl::silu(g[i]) * u[i];
@@ -273,20 +280,50 @@ bool wide_iu4_ok(const Tensor& t, const WideScratch& wide, unsigned rows) {
     return wide.codes && t.fmt == kIu4Fmt && !core::dense_iu4::reference_flag() && t.inputs % 128U == 0U && t.outputs % 16U == 0U &&
            std::uint64_t(rows) * t.inputs * 4U < (1ULL << 32U);
 }
-void wide_iu4(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s) {
-    core::f16_dense_tall::iu4a16::enqueue(wide_iu4_view(w, x, out, rows), s);
+// x16 form (same bits) where iu4a16::x16_pays; STRIX_DENSE_X16=0 keeps the direct form everywhere.
+bool wide_iu4_x16(const Tensor& w, const WideScratch& wide, unsigned rows) {
+    static const bool on = strix::envcfg::flag("STRIX_DENSE_X16", true);
+    return on && wide.xt && core::f16_dense_tall::iu4a16::x16_pays(rows, w.inputs, w.outputs);
+}
+// xt: the x16 tiles of x already written (enqueue_x16_tiles), or nullptr for the direct form.
+void wide_iu4(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s, const _Float16* xt = nullptr) {
+    if (xt) core::f16_dense_tall::iu4a16::enqueue_x16(wide_iu4_view(w, x, out, rows), xt, s);
+    else core::f16_dense_tall::iu4a16::enqueue(wide_iu4_view(w, x, out, rows), s);
 }
 void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s, const WideScratch& wide, const Iu4Scratch& iu4) {
     if (rows > 16U && wide_ok(w, wide)) {
         wide_quant(x, w.inputs, rows, s, wide);
         wide_dense(w, out, rows, s, wide);
     } else if (rows > 16U && wide_iu4_ok(w, wide, rows)) {
-        wide_iu4(w, x, out, rows, s);
+        const bool x16 = wide_iu4_x16(w, wide, rows);
+        if (x16) core::f16_dense_tall::enqueue_x16_tiles(x, wide.xt, rows, w.inputs, s);
+        wide_iu4(w, x, out, rows, s, x16 ? wide.xt : nullptr);
     } else {  // not a Q8_0 shape the WMMA core takes: exact 16-row sweeps
         core::dense_row_sweeps(rows, [&](unsigned r, unsigned count) {
             linear16(w, x + std::size_t(r) * w.inputs, out + std::size_t(r) * w.outputs, count, s, iu4);
         });
     }
+}
+void glu(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned rows, hipStream_t s, const WideScratch& wide, const Iu4Scratch& iu4);
+void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s, const WideScratch& wide, const Iu4Scratch& iu4);
+// out = down(SiLU(gate x) * up x). Wide IU4 windows whose down GEMM takes the x16 form get h as x16 tiles straight from the
+// SiLU pass (x16_tiles_map2_kernel<SiluMul>: no FP32 h, no separate tile pass; same bits). wide.xt holds the tiles of x
+// for gate / up, then (stream order, after up) the tiles of h for down. STRIX_DENSE_GLU_X16=0: glu + linear.
+void mlp(const Tensor& g, const Tensor& u, const Tensor& d, const float* x, float* h, float* out, unsigned rows, hipStream_t s,
+         const WideScratch& wide, const Iu4Scratch& iu4) {
+    static const bool fuse = strix::envcfg::flag("STRIX_DENSE_GLU_X16", true);
+    if (fuse && rows > 16U && !wide_ok(g, wide) && wide_iu4_ok(g, wide, rows) && wide_iu4_ok(u, wide, rows) && wide_iu4_ok(d, wide, rows) &&
+        g.outputs == u.outputs && d.inputs == g.outputs && wide_iu4_x16(d, wide, rows)) {
+        const bool x16 = wide_iu4_x16(g, wide, rows);
+        if (x16) core::f16_dense_tall::enqueue_x16_tiles(x, wide.xt, rows, g.inputs, s);
+        wide_iu4(g, x, wide.g, rows, s, x16 ? wide.xt : nullptr);
+        wide_iu4(u, x, wide.u, rows, s, x16 ? wide.xt : nullptr);
+        core::f16_dense_tall::enqueue_x16_tiles_map2<SiluMul>(wide.g, wide.u, wide.xt, rows, g.outputs, s);
+        wide_iu4(d, h, out, rows, s, wide.xt);  // h is not read by the x16 form
+        return;
+    }
+    glu(g, u, x, h, rows, s, wide, iu4);
+    linear(d, h, out, rows, s, wide, iu4);
 }
 void glu(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned rows, hipStream_t s, const WideScratch& wide, const Iu4Scratch& iu4) {
     if (rows > 16U && wide_ok(g, wide) && wide_ok(u, wide) && g.outputs == u.outputs) {
@@ -295,8 +332,10 @@ void glu(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned 
         wide_dense(u, wide.u, rows, s, wide);
         silu_mul_kernel<<<1024, 256, 0, s>>>(wide.g, wide.u, out, std::size_t(rows) * g.outputs);
     } else if (rows > 16U && wide_iu4_ok(g, wide, rows) && wide_iu4_ok(u, wide, rows) && g.outputs == u.outputs) {
-        wide_iu4(g, x, wide.g, rows, s);
-        wide_iu4(u, x, wide.u, rows, s);
+        const bool x16 = wide_iu4_x16(g, wide, rows);  // gate and up share one tile pass of x
+        if (x16) core::f16_dense_tall::enqueue_x16_tiles(x, wide.xt, rows, g.inputs, s);
+        wide_iu4(g, x, wide.g, rows, s, x16 ? wide.xt : nullptr);
+        wide_iu4(u, x, wide.u, rows, s, x16 ? wide.xt : nullptr);
         silu_mul_kernel<<<1024, 256, 0, s>>>(wide.g, wide.u, out, std::size_t(rows) * g.outputs);
     } else {
         core::dense_row_sweeps(rows, [&](unsigned r, unsigned count) {
@@ -391,7 +430,7 @@ struct HipEngine::Impl {
                         qn, ctx, gu, logits}) fr(p);
         for (auto* p : {conv_all, bak_conv}) fr(p);
         fr(d_ids); fr(d_arg);
-        fr(wide.codes); fr(wide.deltas); fr(wide.g); fr(wide.u);
+        fr(wide.codes); fr(wide.deltas); fr(wide.g); fr(wide.u); fr(wide.xt);
         fr(iu4.xh); fr(iu4.g); fr(iu4.u);
         if (stream) (void)hipStreamDestroy(stream);
     }
@@ -476,6 +515,7 @@ struct HipEngine::Impl {
             alloc0(&wide.deltas, std::size_t(RS) * (maxin / 32U) * 4U);
             alloc0(&wide.g, std::size_t(RS) * I * 4U);
             alloc0(&wide.u, std::size_t(RS) * I * 4U);
+            alloc0(&wide.xt, core::f16_dense_tall::x16_bytes(RS, unsigned(maxin)));
             // flash attention of the wide windows: geometry the shared adapter is instantiated for (Dim 256, GQA group 6)
             if (D == 256U && cfg.heads == 6U * cfg.kv_heads) {
                 vt_stride = (opt.max_positions + 15U) / 16U * 16U;
@@ -577,8 +617,7 @@ struct HipEngine::Impl {
             }
             add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H);
             rmsnorm(x, y.post_norm, H, cfg.rms_eps, xn, n, stream);
-            glu(y.gate, y.up, xn, gu, n, stream, wide, iu4);
-            linear(y.down, gu, proj, n, stream, wide, iu4);
+            mlp(y.gate, y.up, y.down, xn, gu, proj, n, stream, wide, iu4);
             add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H);
         }
         HipRowsOut out;
@@ -669,8 +708,7 @@ struct HipEngine::Impl {
         linear(y.o, ctx, proj, n, stream, wide, iu4);
         add_kernel<<<nb, 256, 0, stream>>>(mtp.mx, proj, n * H);
         rmsnorm(mtp.mx, y.post_norm, H, cfg.rms_eps, mtp.mxn, n, stream);
-        glu(y.gate, y.up, mtp.mxn, gu, n, stream, wide, iu4);
-        linear(y.down, gu, proj, n, stream, wide, iu4);
+        mlp(y.gate, y.up, y.down, mtp.mxn, gu, proj, n, stream, wide, iu4);
         add_kernel<<<nb, 256, 0, stream>>>(mtp.mx, proj, n * H);
         rmsnorm(mtp.mx, mtp.shnorm, H, cfg.rms_eps, mtp.mxn, n, stream);  // mx (pre-norm block output) stays intact for 'pre'
         HipMtpOut o;

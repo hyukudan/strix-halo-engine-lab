@@ -32,11 +32,31 @@ __device__ __forceinline__ std::uint16_t to_bf16(float x) {
 }
 __device__ __forceinline__ float from_bf16(std::uint32_t h) { return __builtin_bit_cast(float, h << 16U); }
 
+// NeoX RoPE (cos, sin) of position pos, frequency index i < rot_dim / 2: the one expression of both prep forms.
+__device__ __forceinline__ void rope_cs(const Params& p, unsigned pos, unsigned i, float& c, float& s) {
+    const double ang = double(pos) * pow(p.theta, -2.0 * double(i) / double(p.rot_dim));
+    c = float(cos(ang));
+    s = float(sin(ang));
+}
+// rope[2 * (row * half + i) + {0, 1}] = rope_cs(pos0 + row, i) for the window's rows: evaluated once per (row, i) instead of
+// once per (row, q/k head, lane) inside prep (FP64 pow/cos/sin; 56x fewer for 24 + 4 heads of Dim 256, rot_dim 64).
+__global__ void __launch_bounds__(256) rope_table_kernel(Params p, float* rope) {
+    const unsigned half = p.rot_dim / 2U, idx = blockIdx.x * 256U + threadIdx.x;
+    if (idx >= p.rows * half)
+        return;
+    float c, s;
+    rope_cs(p, p.pos0 + idx / half, idx % half, c, s);
+    rope[2U * idx] = c;
+    rope[2U * idx + 1U] = s;
+}
+
 // grid (rows, heads + 2 * kv_heads): [0,heads) q, [heads, heads+kv) k, then v. block = Dim threads.
-template <unsigned Dim>
+// Table = true: (cos, sin) from rope (rope_table_kernel of the same window), the same floats as the inline form.
+template <unsigned Dim, bool Table = false>
 __global__ void __launch_bounds__(Dim) prep_kernel(Params p, const float* q_in, const float* k_in, const float* v_in,
                                                    const float* q_gain, const float* k_gain, float* q_out,
-                                                   std::uint16_t* k_cache, std::uint16_t* v_cache) {
+                                                   std::uint16_t* k_cache, std::uint16_t* v_cache,
+                                                   const float* rope = nullptr) {
     static_assert(Dim % 64U == 0U);
     __shared__ float red[Dim];
     __shared__ float vec[Dim];
@@ -64,8 +84,13 @@ __global__ void __launch_bounds__(Dim) prep_kernel(Params p, const float* q_in, 
     const unsigned half = p.rot_dim / 2U;
     if (t < p.rot_dim) {
         const unsigned i = t % half;
-        const double ang = double(pos) * pow(p.theta, -2.0 * double(i) / double(p.rot_dim));
-        const float c = float(cos(ang)), s = float(sin(ang));
+        float c, s;
+        if constexpr (Table) {
+            c = rope[2U * (row * half + i)];
+            s = rope[2U * (row * half + i) + 1U];
+        } else {
+            rope_cs(p, pos, i, c, s);
+        }
         y = t < half ? vec[t] * c - vec[t + half] * s : vec[t] * c + vec[t - half] * s;
     }
     if (is_q)

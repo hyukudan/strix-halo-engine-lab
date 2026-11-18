@@ -123,9 +123,13 @@ template <unsigned G, unsigned Cc, unsigned W, unsigned Chunk> struct ColsStageT
     alignas(16) float value[Chunk][Shape::columns];
     float beta[Chunk], decay[Chunk];
 };
+// Configuration shared by every binder of the recurrence core (Qwen MoE prefill, hip_gdn_decode_step_dims): 4 lanes x
+// 32 keys, 2 columns per lane, 4 waves = 64 columns per block, chunks of 8 rows, SGPR beta (Opt 2), pinned decay (Nan 3).
+struct ColsDefault { static constexpr unsigned G = 4U, C = 2U, W = 4U, Chunk = 8U, Opt = 2U; };
+// Rows: per-tensor row strides (include/strix/gdn_recurrence_rows.hpp); addresses only, the values are the same.
 template <GdnRecurrentStorage Storage, unsigned G, unsigned Cc, unsigned W, unsigned Chunk, unsigned Opt = 2U, unsigned Nan = 3U>
 __global__ __launch_bounds__(W * 32U)
-void gdn_qpf2k_cols_kernel(GdnPrefillRows rows, std::uint32_t count, float* state, std::uint32_t key_heads, const unsigned* decay_nan) {
+void gdn_qpf2k_cols_kernel(gdn_recurrence::Rows rows, std::uint32_t count, float* state, std::uint32_t key_heads, const unsigned* decay_nan) {
 #pragma clang fp contract(off)
     if (decay_nan_skip<Nan>(decay_nan)) return;
     using Shape = ColsShape<G, Cc, W>;
@@ -149,7 +153,7 @@ void gdn_qpf2k_cols_kernel(GdnPrefillRows rows, std::uint32_t count, float* stat
         for (unsigned i = 0; i < KeyQuads; ++i) {
             const auto q = thread + i * Threads, row = q / 64U, within = q % 64U;
             if (Chunk * 64U % Threads == 0U || q < Chunk * 64U) {
-                const float* source = rows.qkv + (first + row) * rows.stride + key_offset +
+                const float* source = rows.qkv + (first + row) * rows.qkv_stride + key_offset +
                     (within < 32U ? key_width + within * 4U : (within - 32U) * 4U);
                 key_query[i] = *reinterpret_cast<const float4*>(source);
             }
@@ -158,11 +162,11 @@ void gdn_qpf2k_cols_kernel(GdnPrefillRows rows, std::uint32_t count, float* stat
         for (unsigned i = 0; i < ValueQuads; ++i) {
             const auto q = thread + i * Threads, row = q / (Columns / 4U);
             if (q < Chunk * Columns / 4U)
-                values[i] = *reinterpret_cast<const float4*>(rows.qkv + (first + row) * rows.stride + value_offset +
+                values[i] = *reinterpret_cast<const float4*>(rows.qkv + (first + row) * rows.qkv_stride + value_offset +
                     q % (Columns / 4U) * 4U);
         }
         if (thread < 2U * Chunk)
-            scalar = (thread < Chunk ? rows.beta : rows.gate)[(first + thread % Chunk) * rows.stride + value_head];
+            scalar = (thread < Chunk ? rows.beta : rows.gate)[(first + thread % Chunk) * rows.scalar_stride + value_head];
     };
     const auto commit = [&](Stage& s) {
 #pragma unroll
@@ -204,7 +208,7 @@ void gdn_qpf2k_cols_kernel(GdnPrefillRows rows, std::uint32_t count, float* stat
         const float* value = &s.value[0][local];
         const float* beta = s.beta;
         const float* decay = s.decay;
-        float* core = rows.core + first * rows.stride + value_head * 128U + column;
+        float* core = rows.core + first * rows.core_stride + value_head * 128U + column;
 #pragma unroll 1
         for (unsigned r = 0; r < Chunk; ++r) {
             float k[K];
@@ -249,7 +253,7 @@ void gdn_qpf2k_cols_kernel(GdnPrefillRows rows, std::uint32_t count, float* stat
 #pragma unroll
                 for (unsigned c = 0; c < Cc; ++c) core[c] = out[c];
             }
-            key += G * Shape::pitch / 4U; query += G * Shape::pitch / 4U; value += Columns; ++beta; ++decay; core += rows.stride;
+            key += G * Shape::pitch / 4U; query += G * Shape::pitch / 4U; value += Columns; ++beta; ++decay; core += rows.core_stride;
         }
         if (more) commit(stage[buffer ^ 1U]);
         gdn_lds_barrier();
