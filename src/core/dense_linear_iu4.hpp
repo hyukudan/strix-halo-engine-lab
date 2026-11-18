@@ -14,9 +14,11 @@
 //     bitwise those of a call with fewer rows. Passing the real count instead took `r >= nrows` exits inside the
 //     unrolled row loops of every k-tile: measured on Strix 27B IU4 verify windows rows 3 / 6 / 12 = 127.1 / 130.6 /
 //     140.7 ms vs rows 4 / 8 / 16 = 76.5 / 82.6 / 126.8 ms (hip_dense_dec3-STATE.md). Default: core
-//     calls of up to 8 rows (R <= 8: one call, every weight word read once; R = 16: two 8-row calls), bitwise equal
-//     to the chunked form (per-row op order is identical). One call over 16 rows was measured slower (rows 16
-//     verify 272.8 vs 220.7 ms, Strix 27B IU4) and spills (private segment 144 B): not offered.
+//     rows per weight sweep from strix/decode_weight_sweep.hpp (every weight word read once per sweep). Scalar
+//     activations (default): one sweep of up to 16 rows, the activation words loaded in 8-row chunks (SGPR budget);
+//     the 16-row bucket used to run two 8-row sweeps and stream the weights twice. Vector activations: 8 rows per
+//     sweep (one 16-row sweep in that form measured slower, 272.8 vs 220.7 ms, and spilled 144 B). Bitwise equal to
+//     the chunked form either way (per-row op order is identical).
 //     STRIX_IU4_ROW_REUSE=0 selects the old 4-row chunk calls (weights re-streamed per chunk).
 // Home: shared (backend core, HIP): no model names; any dense projection can bind it (qwen35 now).
 #if defined(__HIPCC__)
@@ -28,6 +30,7 @@
 #include <stdexcept>
 
 #include "strix/decode_projection_group.hpp"
+#include "strix/decode_weight_sweep.hpp"
 #include "strix/env_flags.hpp"
 #include "iu4_x_pairs.hpp"
 #include "w4a16.hpp"
@@ -150,10 +153,12 @@ inline bool scalar_x() {
 // The template instance of rows bucket R for `inputs`: f.template operator()<MaxG, Rc, UX>() launches it.
 template <unsigned R, class F>
 void dispatch_bucket(unsigned inputs, F&& f) {
-    constexpr unsigned C = R >= 8U ? 4U : R, M = R > 8U ? 8U : R;
+    // Rows per weight sweep (strix/decode_weight_sweep.hpp): scalar activations 16 (one stream for any window), vector 8.
+    constexpr unsigned C = R >= 8U ? 4U : R, M = ::strix::decode::sweep_rows(R, ::strix::decode::kHipIu4VectorX),
+                       MX = ::strix::decode::sweep_rows(R, ::strix::decode::kHipIu4ScalarX);
     const bool mid = R <= 4U || row_reuse(), sx = scalar_x();
     const auto pick = [&]<unsigned G>() {
-        if (sx) f.template operator()<G, M, true>();
+        if (sx) f.template operator()<G, MX, true>();
         else if (mid) f.template operator()<G, M, false>();
         else f.template operator()<G, C, false>();
     };
