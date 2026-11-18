@@ -149,6 +149,12 @@ inline bool scalar_x() {
     static const bool on = envcfg::flag("STRIX_IU4_SCALAR_X", true) && row_reuse();  // recorded in the effective config
     return on;
 }
+// STRIX_IU4_ONE_SWEEP: 1 (default) = scalar-activation windows of 9..16 rows read the weights once (one 16-row sweep,
+// strix/decode_weight_sweep.hpp), 0 = the previous two 8-row sweeps. Same rows bitwise either way; rows <= 8 unaffected.
+inline bool one_sweep() {
+    static const bool on = envcfg::flag("STRIX_IU4_ONE_SWEEP", true);  // recorded in the effective config
+    return on;
+}
 
 // The template instance of rows bucket R for `inputs`: f.template operator()<MaxG, Rc, UX>() launches it.
 template <unsigned R, class F>
@@ -156,9 +162,10 @@ void dispatch_bucket(unsigned inputs, F&& f) {
     // Rows per weight sweep (strix/decode_weight_sweep.hpp): scalar activations 16 (one stream for any window), vector 8.
     constexpr unsigned C = R >= 8U ? 4U : R, M = ::strix::decode::sweep_rows(R, ::strix::decode::kHipIu4VectorX),
                        MX = ::strix::decode::sweep_rows(R, ::strix::decode::kHipIu4ScalarX);
-    const bool mid = R <= 4U || row_reuse(), sx = scalar_x();
+    const bool mid = R <= 4U || row_reuse(), sx = scalar_x(), one = MX == M || one_sweep();
     const auto pick = [&]<unsigned G>() {
-        if (sx) f.template operator()<G, MX, true>();
+        if (sx && one) f.template operator()<G, MX, true>();
+        else if (sx) f.template operator()<G, M, true>();
         else if (mid) f.template operator()<G, M, false>();
         else f.template operator()<G, C, false>();
     };
