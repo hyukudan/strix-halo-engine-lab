@@ -218,6 +218,130 @@ int test_attention() {
     return 0;
 }
 
+// Frozen copy of the decode attention phases A and C as they were before the load batching (one K load per position per
+// warp, V unroll 4), test-only: the library kernels must write bit-identical scratch (scores, chunk max, chunk denominators,
+// chunk value partials); the unchanged combine then gives identical outputs.
+namespace attn_v0 {
+using namespace strix::cuda_core;
+constexpr std::uint32_t CH = 256;
+__global__ void __launch_bounds__(256) scores(cc::AttentionDims d, const float* q, cc::GroupedView qv, const __nv_bfloat16* kc,
+                                              const std::uint32_t* pos0p, float* sscores, float* scmax) {
+    const std::uint32_t chunk = blockIdx.x, kvh = blockIdx.y, r = blockIdx.z;
+    const std::uint32_t len = *pos0p + r + 1, base = chunk * CH;
+    if (base >= len) return;
+    const std::uint32_t G = d.heads / d.kv_heads, lane = threadIdx.x & 31, w = threadIdx.x >> 5, mc = cc::attn_max_chunks(d);
+    float qr[8][8];
+    for (int g = 0; g < 8; ++g)
+        if (g < static_cast<int>(G))
+            for (int j = 0; j < 8; ++j) qr[g][j] = q[static_cast<std::size_t>(r) * qv.rs() + static_cast<std::size_t>(kvh * G + g) * qv.gs() + lane * 8 + j];
+    float mx[8];
+    for (int g = 0; g < 8; ++g) mx[g] = __int_as_float(0xff800000);
+    const std::uint32_t end = min(len, base + CH);
+    const __nv_bfloat16* kb = kc + static_cast<std::size_t>(kvh) * d.max_positions * 256 + lane * 8;
+    for (std::uint32_t p = base + w; p < end; p += 8) {
+        const uint4 u = __ldg(reinterpret_cast<const uint4*>(kb + static_cast<std::size_t>(p) * 256));
+        const float kf[8] = {bf16_lo(u.x), bf16_hi(u.x), bf16_lo(u.y), bf16_hi(u.y), bf16_lo(u.z), bf16_hi(u.z), bf16_lo(u.w), bf16_hi(u.w)};
+        for (int g = 0; g < 8; ++g) {
+            if (g < static_cast<int>(G)) {
+                float dot = 0.0f;
+                for (int j = 0; j < 8; ++j) dot = __fadd_rn(dot, __fmul_rn(qr[g][j], kf[j]));
+                dot = warp_sum_xor(dot);
+                const float s = __fmul_rn(dot, d.scale);
+                mx[g] = fmaxf(mx[g], s);
+                if (lane == 0) sscores[(static_cast<std::size_t>(r) * d.heads + kvh * G + g) * d.max_positions + p] = s;
+            }
+        }
+    }
+    __shared__ float wm[8][8];
+    for (int g = 0; g < 8; ++g) wm[w][g] = mx[g];
+    __syncthreads();
+    if (threadIdx.x < G) {
+        float m = wm[0][threadIdx.x];
+        for (int i = 1; i < 8; ++i) m = fmaxf(m, wm[i][threadIdx.x]);
+        scmax[(static_cast<std::size_t>(r) * d.heads + kvh * G + threadIdx.x) * mc + chunk] = m;
+    }
+}
+__global__ void __launch_bounds__(256) values(cc::AttentionDims d, const __nv_bfloat16* vc, const std::uint32_t* pos0p,
+                                              const float* sscores, const float* scmax, float* sdpart, float* spart) {
+    const std::uint32_t chunk = blockIdx.x, kvh = blockIdx.y, r = blockIdx.z;
+    const std::uint32_t len = *pos0p + r + 1, base = chunk * CH;
+    if (base >= len) return;
+    const std::uint32_t G = d.heads / d.kv_heads, t = threadIdx.x, lane = t & 31, w = t >> 5;
+    const std::uint32_t mc = cc::attn_max_chunks(d), nch = (len + CH - 1) / CH;
+    __shared__ float mg[8];
+    __shared__ float es[8][CH];
+    __shared__ float red[8];
+    if (w < G) {
+        const float* cm = scmax + (static_cast<std::size_t>(r) * d.heads + kvh * G + w) * mc;
+        float m = __int_as_float(0xff800000);
+        for (std::uint32_t c = lane; c < nch; c += 32) m = fmaxf(m, cm[c]);
+        for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+        if (lane == 0) mg[w] = m;
+    }
+    __syncthreads();
+    const std::uint32_t p = base + t;
+    for (std::uint32_t g = 0; g < G; ++g) {
+        float e = 0.0f;
+        if (p < len) e = cc_expf(__fsub_rn(sscores[(static_cast<std::size_t>(r) * d.heads + kvh * G + g) * d.max_positions + p], mg[g]));
+        es[g][t] = e;
+        const float ds = block_sum256(e, red);
+        if (t == 0) sdpart[(static_cast<std::size_t>(r) * d.heads + kvh * G + g) * mc + chunk] = ds;
+    }
+    __syncthreads();
+    float acc[8];
+    for (int g = 0; g < 8; ++g) acc[g] = 0.0f;
+    const std::uint32_t n = (len - base) < CH ? (len - base) : CH;
+    const __nv_bfloat16* vp = vc + (static_cast<std::size_t>(kvh) * d.max_positions + base) * 256 + t;
+#pragma unroll 4
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const float vv = __bfloat162float(vp[static_cast<std::size_t>(i) * 256]);
+        for (int g = 0; g < 8; ++g)
+            if (g < static_cast<int>(G)) acc[g] = __fadd_rn(acc[g], __fmul_rn(es[g][i], vv));
+    }
+    for (int g = 0; g < 8; ++g)
+        if (g < static_cast<int>(G)) spart[((static_cast<std::size_t>(r) * d.heads + kvh * G + g) * mc + chunk) * 256 + t] = acc[g];
+}
+}  // namespace attn_v0
+
+// Multi-chunk decode attention (4 chunks, G = 6 as the 27B dense model): positions crossing the load batches and the
+// 256-position chunks, rows 1 / 8 / 16. The library scratch must equal the frozen v0 schedule bit for bit.
+int test_attention_schedule() {
+    cc::AttentionDims d; d.heads = 24; d.kv_heads = 4; d.head_dim = 256; d.scale = 1.0f / 16.0f; d.max_positions = 1024;
+    const std::uint32_t P = d.max_positions, KV = d.kv_heads * 256u, RMAX = 16, mc = cc::attn_max_chunks(d);
+    std::vector<float> kf(static_cast<std::size_t>(P) * KV), vf(kf.size());
+    for (auto& e : kf) e = rnd(1.0f);
+    for (auto& e : vf) e = rnd(1.0f);
+    auto *dk = dev(kf), *dv = dev(vf);
+    auto *kc = devz<__nv_bfloat16>(static_cast<std::size_t>(P) * KV), *vc = devz<__nv_bfloat16>(static_cast<std::size_t>(P) * KV);
+    for (std::uint32_t p = 0; p < P; p += 16) CK(cc::kv_store(d, dk + static_cast<std::size_t>(p) * KV, dv + static_cast<std::size_t>(p) * KV, kc, vc, dpos(p), 16, nullptr));
+    std::vector<float> q(static_cast<std::size_t>(RMAX) * d.heads * 256), gt(q.size());
+    for (auto& e : q) e = rnd(2.0f);
+    for (auto& e : gt) e = rnd(2.0f);
+    const std::size_t nsc = cc::attention_scratch_floats(d, RMAX);
+    auto *dq = dev(q), *dgt = dev(gt), *dout = devz<float>(q.size()), *sa = devz<float>(nsc), *sb = devz<float>(nsc);
+    const struct { std::uint32_t pos0, rows; } cases[] = {{0, 1},   {6, 1},   {7, 8},   {56, 9},   {63, 1},    {248, 16}, {255, 1},
+                                                           {256, 8}, {300, 1}, {500, 16}, {511, 8},   {700, 16}, {1000, 8}, {1023, 1}};
+    for (const auto& cs : cases) {
+        const std::uint32_t R = cs.rows;
+        const cc::GroupedView qv{R, d.heads, 256, 0, 0};
+        auto* p0 = dpos(cs.pos0);
+        CK(cudaMemset(sa, 0, nsc * 4));
+        CK(cudaMemset(sb, 0, nsc * 4));
+        CK(cc::attention_decode(d, dq, qv, dgt, qv, kc, vc, p0, R, dout, sa, nullptr));
+        // same carve as the library: scores [R][heads][P] | cmax [R][heads][mc] | dpart [R][heads][mc] | part [R][heads][mc][256]
+        const std::size_t rh = static_cast<std::size_t>(R) * d.heads;
+        float *bs = sb, *bm = bs + rh * P, *bd = bm + rh * mc, *bp = bd + rh * mc;
+        attn_v0::scores<<<dim3(mc, d.kv_heads, R), 256>>>(d, dq, qv, kc, p0, bs, bm);
+        attn_v0::values<<<dim3(mc, d.kv_heads, R), 256>>>(d, vc, p0, bs, bm, bd, bp);
+        CK(cudaDeviceSynchronize());
+        const std::size_t used = rh * P + 2 * rh * mc + rh * mc * 256;
+        CHECK(bits_equal(get(sa, used), get(sb, used)), "attention schedule pos0 %u rows %u: scratch differs from v0", cs.pos0, R);
+        cudaFree(p0);
+    }
+    cudaFree(dk); cudaFree(dv); cudaFree(kc); cudaFree(vc); cudaFree(dq); cudaFree(dgt); cudaFree(dout); cudaFree(sa); cudaFree(sb);
+    return 0;
+}
+
 int test_gdn() {
     cc::GdnDims d; d.key_heads = 4; d.value_heads = 12; d.key_dim = 128; d.value_dim = 128;
     const std::uint32_t C = d.conv_channels(), R = 6, hv = d.value_heads, K = 128;
@@ -366,7 +490,7 @@ static int test_nvfp4_fused() {
 
 int main() {
     if (cudaSetDevice(0) != cudaSuccess) return 2;
-    int rc = test_dense() | test_norms_rope() | test_attention() | test_gdn() | test_nvfp4_fused();
+    int rc = test_dense() | test_norms_rope() | test_attention() | test_attention_schedule() | test_gdn() | test_nvfp4_fused();
     // repeat determinism is covered by the identical-bits checks (each compares two separate launches)
     std::printf(g_fail || rc ? "cuda_core_test: FAILED (%d checks)\n" : "cuda_core_test: PASS\n", g_fail);
     return (g_fail || rc) ? 1 : 0;
