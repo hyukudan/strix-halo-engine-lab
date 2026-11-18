@@ -30,6 +30,20 @@ You only need this page to inspect a path, to debug, or to move the engine to di
 
 Named profiles exist for Qwen, the DeepSeek pair, Gemma4/Nemotron and `strix-glm5-rank`.
 MiniMax has no named product profile: `--profile NAME:PROMPT.u32:STEPS` runs a timed session.
+The CUDA Qwen dense 27B CLIs (`strix-cuda-qwen35-decode`, `strix-cuda-qwen35-spec`) take the same word, `--profile exact|default|fast|quality`
+(`exact` = `default`; `turbo` is refused: no TURBO bar for this engine yet). One table, `include/strix/profiles/qwen_dense_cuda.hpp`, resolved by
+the shared resolver for both CLIs: `fast` turns on each lever only in the regime where its gate passed; an explicit option wins and
+`exact` changes nothing (same options, same `--print-effective-config` bytes). Under `fast` the effective config adds a `profile:` block
+(each lever, its status and why a pending row is off) and a `profile-fingerprint`. The engine identity names every applied lever.
+
+| Lever (option) | `fast` turns it on when | Off switch |
+|---|---|---|
+| `--prefill-arith fast4` | decode CLI large prefill, `--turbo-weights onfly\|converted` (W4A4 gate 8K/32K passed) | `--prefill-arith exact` |
+| `--prefill-gdn chunk16` | same regime (gated together with FAST4) | `--prefill-gdn serial` |
+| `--prefill-attn8 on` | same regime, prompt of at least 32,768 tokens (32K gate passed; no 8K gate) | `--prefill-attn8 off` |
+| `--split-k fast` | not yet (pending its gate; promoting it is one row in `qualified`) | `--split-k exact` |
+
+The spec CLI prefills through decode windows, so only `split_k` is offered there.
 GLM rank accepts `--profile default|fast|quality` (also `--profile=NAME`); its bare `--profile` still enables kernel timing
 and can be combined with a named profile. GLM `fast` sets only `STRIX_GLM_PF_WMMA=1`; an explicit environment
 value wins, and `--baseline` / `STRIX_GLM_BASELINE=1` vetoes the profile addition. `quality` uses default settings

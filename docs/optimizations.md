@@ -4906,6 +4906,23 @@ the longest cached prefix of its token ids and prefills only the rest.
 - **Measured gain:** No throughput figure published yet. Follow-up agent turns report 48,128-49,664 restored tokens in `cached_tokens`.
 - **Implementation / evidence:** [Qwen RTX serve guide](models/qwen3.8/rtx-serve.md#prompt-prefix-cache), [cache](../apps/cuda_qwen_prefix_cache.hpp)
 
+<a id="qwen-dense-cuda-profile"></a>
+
+### Qwen dense 27B CUDA product profile
+
+**Engine:** `qwen-rtx` (dense 27B). **Control:** `--profile exact|default|fast|quality` on `strix-cuda-qwen35-decode` and `strix-cuda-qwen35-spec`. **Default:** `exact` (no option changed).
+
+One word selects every FAST lever qualified for the run's regime (weights source, route, prompt length), from the data table
+`include/strix/profiles/qwen_dense_cuda.hpp`, through the shared resolver (`strix::profile::resolve`). Both CLIs resolve the same table.
+
+- **Preconditions:** `fast` applies `--prefill-arith fast4` + `--prefill-gdn chunk16` on the decode CLI's large prefill with `--turbo-weights onfly|converted`, and `--prefill-attn8 on` from 32,768 prompt tokens. Every other regime (exact pack, native NVFP4, the spec CLI's windows) keeps its levers pending and runs exact. `--split-k fast` is pending until its gate. `turbo` is refused.
+- **Automatic selection:** none outside `--profile fast`; `quality` has no rows here and equals `default`.
+- **Fallback notice:** the `profile:` block of the effective config lists each lever as `profile`, `explicit-cli`, `off` or `pending` with the regime it needs.
+- **Exactness evidence:** `exact` leaves every option and the effective config unchanged (host test `strix-qwen35-dense-profile-host-tests`). FAST levers carry their own identities (`-pf-fast4`, `-gdnc16`, `-a8`, `-skf1`) and their gates: FAST4 + chunk16 8K / 32K passed; attn8 32K passed.
+- **Off switch:** `--profile exact` (or no word), or the lever's own option (`--prefill-arith exact`, `--prefill-gdn serial`, `--prefill-attn8 off`, `--split-k exact`).
+- **Measured gain:** none of its own (selection only): the levers' figures apply, e.g. FAST4 + chunk16 at 8K 13,437-13,714 tok/s.
+- **Implementation / evidence:** [profile table](../include/strix/profiles/qwen_dense_cuda.hpp), [toggles](toggles.md#profiles-exact-vs-fast)
+
 ## Platform (kernel)
 
 <a id="platform-perfopt"></a>

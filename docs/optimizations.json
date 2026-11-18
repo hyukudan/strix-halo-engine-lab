@@ -3261,5 +3261,6 @@
     "preconditions": "Each lever keeps its own admission (route, shape, model assets, MTP/HTTP exclusions) and declines by itself with its own notice; an explicit per-lever value wins; STRIX_BASELINE=1 vetoes the profile.",
     "off_switch": "unset STRIX_QWEN_ALLON (or 0)",
     "doc_anchor": "docs/optimizations.md#qwen-all-on-composition-profile"
-  }
+  },
+  {"engine":"qwen-rtx","name":"Qwen dense 27B CUDA product profile","flag_or_env":"--profile exact|default|fast|quality (strix-cuda-qwen35-decode, strix-cuda-qwen35-spec)","default":"exact (no option changed)","exact":"exact leaves every option and the effective config unchanged (strix-qwen35-dense-profile-host-tests); FAST levers keep their own identities and gates (FAST4 + chunk16 8K/32K passed; attn8 32K passed)","gain":"none of its own (selection only); FAST4 + chunk16 8K 13,437-13,714 tok/s","preconditions":"fast: --prefill-arith fast4 + --prefill-gdn chunk16 on the decode CLI large prefill with --turbo-weights onfly|converted; --prefill-attn8 on from 32,768 prompt tokens; --split-k fast pending; turbo refused","off_switch":"--profile exact or the lever's own option","doc_anchor":"docs/optimizations.md#qwen-dense-cuda-profile"}
 ]

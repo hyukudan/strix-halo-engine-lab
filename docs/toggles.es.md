@@ -30,6 +30,20 @@ Solo necesitas esta página para inspeccionar una ruta, depurar o llevar el moto
 
 Existen perfiles con nombre para Qwen, el par DeepSeek, Gemma4/Nemotron y `strix-glm5-rank`.
 MiniMax no tiene perfiles de producto con nombre: `--profile NAME:PROMPT.u32:STEPS` ejecuta una sesión con tiempos.
+Las CLI CUDA de Qwen denso 27B (`strix-cuda-qwen35-decode`, `strix-cuda-qwen35-spec`) aceptan la misma palabra, `--profile exact|default|fast|quality`
+(`exact` = `default`; `turbo` se rechaza: este motor aún no tiene barra TURBO). Una sola tabla, `include/strix/profiles/qwen_dense_cuda.hpp`, resuelta por
+el resolvedor compartido para ambas CLI: `fast` enciende cada palanca solo en el régimen donde pasó su gate; una opción explícita gana y
+`exact` no cambia nada (mismas opciones, mismos bytes de `--print-effective-config`). Con `fast` la configuración efectiva añade un bloque
+`profile:` (cada palanca, su estado y por qué una fila pendiente sigue apagada) y un `profile-fingerprint`. La identidad del motor nombra cada palanca aplicada.
+
+| Palanca (opción) | `fast` la enciende cuando | Interruptor de apagado |
+|---|---|---|
+| `--prefill-arith fast4` | prefill grande de la CLI de decode, `--turbo-weights onfly\|converted` (gate W4A4 8K/32K superado) | `--prefill-arith exact` |
+| `--prefill-gdn chunk16` | mismo régimen (cualificado junto con FAST4) | `--prefill-gdn serial` |
+| `--prefill-attn8 on` | mismo régimen, prompt de al menos 32.768 tokens (gate 32K superado; sin gate 8K) | `--prefill-attn8 off` |
+| `--split-k fast` | aún no (pendiente de su gate; promoverla es una fila en `qualified`) | `--split-k exact` |
+
+La CLI spec hace el prefill con ventanas de decode, así que allí solo se ofrece `split_k`.
 GLM rank acepta `--profile default|fast|quality` (también `--profile=NAME`); `--profile` sin valor sigue activando
 los tiempos de kernels y se puede combinar con un perfil con nombre. En GLM, `fast` solo activa `STRIX_GLM_PF_WMMA=1`;
 un valor explícito del entorno prevalece y `--baseline` / `STRIX_GLM_BASELINE=1` veta la adición del perfil.

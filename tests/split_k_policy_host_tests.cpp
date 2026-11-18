@@ -1,8 +1,7 @@
-// Split-K policy (strix/split_k_policy.hpp) and its one CLI resolution (strix/qwen35/prefill_controls.hpp resolve_split_k).
+// Split-K policy (strix/split_k_policy.hpp); its CLI resolution is the split_k lever of strix/profiles/qwen_dense_cuda.hpp.
 // EXACT invariant: the policy's factor at the EXACT target equals the pre-policy NVFP4 formula on every shape, so the EXACT
 // identity keeps its bits. FAST: the table's split factors are the measured ones, keyed by device, never by rows.
 #include "strix/split_k_policy.hpp"
-#include "strix/qwen35/prefill_controls.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -29,10 +28,6 @@ std::uint32_t old_split_k(std::uint32_t target, std::uint32_t out, std::uint32_t
     const std::uint32_t v = (target + groups / 2) / groups;
     return v < 1 ? 1 : (nch < v ? nch : v);  // std::clamp(v, 1, nch) for nch >= 1
 }
-
-struct Options {
-    sk::Profile nvfp4_split = sk::Profile::exact;
-};
 
 constexpr sk::Device kPro{188, 120};
 }  // namespace
@@ -90,31 +85,8 @@ int main() {
             check(!(sk::kFastV1[j].device == r.device && sk::kFastV1[j].out == r.out && sk::kFastV1[j].in == r.in), "duplicate row");
     }
 
-    // 6. One resolution for the decode and the speculative CLI: same words -> same policy; empty = exact while the FAST
-    //    gate has not been qualified; a bad word throws and leaves the options unchanged.
-    using strix::qwen35::resolve_split_k;
-    for (const std::string_view word : {std::string_view{}, std::string_view{"exact"}, std::string_view{"fast"}}) {
-        Options decode_cli, spec_cli;
-        resolve_split_k(decode_cli, word, false);
-        resolve_split_k(spec_cli, word, false);
-        check(decode_cli.nvfp4_split == spec_cli.nvfp4_split, "decode / spec CLI resolve differently");
-        const sk::Profile want_p = word == "fast" ? sk::Profile::fast : sk::Profile::exact;
-        check(decode_cli.nvfp4_split == want_p, "explicit word");
-        Options fast_class;
-        resolve_split_k(fast_class, word, true);
-        const bool default_fast = strix::qwen35::kSplitKFastQualified;
-        check(fast_class.nvfp4_split == (word.empty() ? (default_fast ? sk::Profile::fast : sk::Profile::exact) : want_p),
-              "default in the FAST class");
-    }
-    Options keep;
-    keep.nvfp4_split = sk::Profile::fast;
-    bool threw = false;
-    try {
-        resolve_split_k(keep, "fast2", true);
-    } catch (const std::runtime_error& e) {
-        threw = std::string(e.what()).find("expects") != std::string::npos;
-    }
-    check(threw && keep.nvfp4_split == sk::Profile::fast, "bad --split-k value");
+    // 6. The CLI resolution of split_k (decode == spec, per tier, the one-row flip) is the product profile's lever:
+    //    tests/qwen35_dense_profile_host_tests.cpp.
 
     std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "ALL PASS", g_fail);
     return g_fail ? 1 : 0;

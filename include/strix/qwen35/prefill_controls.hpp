@@ -5,7 +5,6 @@
 #include <string_view>
 #include "strix/cuda_core/attention_policy.hpp"
 #include "strix/cuda_core/operand_cache_plan.hpp"
-#include "strix/split_k_policy.hpp"
 
 namespace strix::qwen35 {
 // Host-only resolution shared by inspection and execution. Scheduling controls preserve
@@ -41,15 +40,7 @@ void resolve_operand_cache(Options& options, std::string_view mode, std::string_
     options.prefill_operand_cache_cap_mib = cap;
 }
 
-// NVFP4 GEMV split-K policy (strix/split_k_policy.hpp), ONE resolution for the decode and the speculative CLI.
-// "exact" = target 1000, today's bits (the off switch); "fast" = FAST nvfp4-splitk-fast-v1 (bit-changing, quality-gated).
-// Empty = the default: exact while kSplitKFastQualified is false; once the FAST gate receipt flips it, fast whenever the
-// caller's run is already in the FAST class (fast_class), exact otherwise. A bad value throws before anything changes.
-inline constexpr bool kSplitKFastQualified = false;
-template<class Options>
-void resolve_split_k(Options& options, std::string_view value, bool fast_class) {
-    if (!value.empty() && value != "exact" && value != "fast") throw std::runtime_error("--split-k expects exact|fast");
-    const bool fast = value.empty() ? kSplitKFastQualified && fast_class : value == "fast";
-    options.nvfp4_split = fast ? split_k::Profile::fast : split_k::Profile::exact;
-}
+// The bit-changing tier levers (prefill_arith, prefill_gdn, prefill_attn8, split_k) are resolved by the ONE product
+// profile resolver of this engine (strix/profiles/qwen_dense_cuda.hpp: --profile exact|fast + per-lever overrides), shared
+// by the decode and the speculative CLI. The scheduling-only controls above stay here.
 }  // namespace strix::qwen35

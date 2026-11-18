@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -20,6 +21,7 @@
 #include "strix/device/cuda_enumerator.hpp"
 #include "strix/qwen35/cuda_engine.hpp"
 #include "strix/qwen35/prefill_controls.hpp"
+#include "strix/profiles/qwen_dense_cuda.hpp"
 
 namespace q = strix::qwen35;
 
@@ -159,9 +161,10 @@ int main(int argc, char** argv) {
         bool slots_verify = false, graphs = true, multi = true, bwp = false, pdl = false, print_cfg = false;
         q::EngineOptions topt;  // TURBO levers (defaults = exact)
         std::string arith_name = "mma3";
-        std::string flash_pipe, flash_tail, pf_attn8, dump_cont, pf_ocache, pf_ocache_cap, split_k_arg;
+        std::string flash_pipe, flash_tail, dump_cont, pf_ocache, pf_ocache_cap;
+        std::optional<strix::profile::Name> profile;  // --profile exact|default|fast|quality (strix/profiles/qwen_dense_cuda.hpp)
+        strix::profile::Pairs lever_cli;             // per-lever options: override the profile, recorded as explicit
         std::string pf_arith, pf_dump;            // --prefill-arith exact|flash|fast|fast2: large-M prefill (absent: windows of --rows)
-        std::string pf_gdn;                       // --prefill-gdn serial|chunk16 (EngineOptions::prefill_gdn; ignored under exact)
         std::string pf_norm_fold;                 // --prefill-norm-fold on|off (EngineOptions::prefill_norm_fold; FAST4 only, bitwise)
         std::uint32_t pf_chunk = 2048, pf_repeat = 1, pf_slots = 2, pf_wave_min = 0;
         std::uint32_t pf_inflight = q::EngineOptions{}.prefill_inflight, pf_ramp = 0;  // bounded submission / ramp
@@ -180,13 +183,14 @@ int main(int argc, char** argv) {
             else if (a == "--rows") rows_cap = strix::core::parse_u32(next());
             else if (a == "--decode-rows") decode_rows = strix::core::parse_u32(next());
             else if (a == "--max-pos") max_pos = strix::core::parse_u32(next());
-            else if (a == "--prefill-arith") pf_arith = next();
-            else if (a == "--prefill-gdn") pf_gdn = next();
+            else if (a == "--profile") profile = strix::qwen35::profile::parse(next());  // one tier word; exact = default
+            else if (a == "--prefill-arith") lever_cli.emplace_back("prefill_arith", next());
+            else if (a == "--prefill-gdn") lever_cli.emplace_back("prefill_gdn", next());  // serial|chunk16 (FAST, -gdnc16)
             else if (a == "--prefill-norm-fold") pf_norm_fold = next();
             else if (a == "--flash-pipe") flash_pipe = next();         // pad2|swz3 (bitwise equal; scheduling only)
             else if (a == "--flash-tail") flash_tail = next();         // split|off (bitwise equal; scheduling only; default split)
-            else if (a == "--prefill-attn8") pf_attn8 = next();        // on|off: e4m3 flash attention (FAST, identity -a8)
-            else if (a == "--split-k") split_k_arg = next();           // exact|fast: NVFP4 split-K policy (fast = FAST, identity -skf1)
+            else if (a == "--prefill-attn8") lever_cli.emplace_back("prefill_attn8", next());        // on|off: e4m3 flash attention (FAST, identity -a8)
+            else if (a == "--split-k") lever_cli.emplace_back("split_k", next());           // exact|fast: NVFP4 split-K policy (fast = FAST, identity -skf1)
             else if (a == "--prefill-operand-cache") pf_ocache = next();          // auto|on|off: resident expanded weights (bitwise neutral)
             else if (a == "--prefill-operand-cache-cap-mib") pf_ocache_cap = next();  // arena cap in MiB, 0 = budget only
             else if (a == "--prefill-chunk") pf_chunk = strix::core::parse_u32(next());
@@ -265,32 +269,28 @@ int main(int argc, char** argv) {
             while (std::getline(ss, t, ',')) prompt.push_back(strix::core::parse_u32(t));
         }
         q::EngineOptions opt = topt;
-        if (!pf_arith.empty()) {
-            if (pf_arith == "windows") opt.prefill_big = false;  // reference: prefill() runs forward_rows windows of 32 + commit
-            else if (pf_arith == "exact") opt.prefill_arith = q::PrefillArith::exact;
-            else if (pf_arith == "flash") opt.prefill_arith = q::PrefillArith::flash;
-            else if (pf_arith == "fast") opt.prefill_arith = q::PrefillArith::fast;
-            else if (pf_arith == "fast2") opt.prefill_arith = q::PrefillArith::fast2;
-            else if (pf_arith == "fast8") opt.prefill_arith = q::PrefillArith::fast8;
-            else if (pf_arith == "fast4") opt.prefill_arith = q::PrefillArith::fast4;
-            else throw std::runtime_error("--prefill-arith expects windows|exact|flash|fast|fast2|fast8|fast4");
-        }
-        // FAST gdn-chunk16-f32-v1 changes bits: identity suffix -gdnc16 (cuda_engine.hpp); ignored under --prefill-arith exact
-        if (!pf_gdn.empty()) opt.prefill_gdn = q::parse_prefill_gdn(pf_gdn);
+        // ONE resolver for the tier word and the per-lever options (decode CLI = large-M prefill route; the spec CLI
+        // resolves the same table on its windows route). EXACT touches no option.
+        namespace qp = strix::qwen35::profile;
+        const auto resolved = qp::resolve(profile, qp::regime_of(opt, qp::Route::large_prefill, prompt.empty() ? prompt_len : prompt.size()), lever_cli);
+        qp::apply(opt, *resolved);
+        if (const auto* e = resolved->find("prefill_arith"); e && e->status != strix::profile::Status::builtin && e->status != strix::profile::Status::pending)
+            pf_arith = e->value;  // the large-M prefill route of this CLI follows the resolved arithmetic
+        const std::string profile_text = qp::describe(*resolved);
         if (!pf_norm_fold.empty()) opt.prefill_norm_fold = q::parse_prefill_norm_fold(pf_norm_fold);
         opt.prefill_chunk = pf_chunk;
         opt.prefill_wave_min_tokens = pf_wave_min;
         opt.prefill_slots = pf_slots;
         opt.prefill_inflight = pf_inflight;
         opt.prefill_ramp = pf_ramp;
-        q::resolve_flash_controls(opt, flash_pipe, flash_tail, pf_attn8);
+        q::resolve_flash_controls(opt, flash_pipe, flash_tail, "");
         q::resolve_operand_cache(opt, pf_ocache, pf_ocache_cap);
-        q::resolve_split_k(opt, split_k_arg, opt.prefill_arith != q::PrefillArith::exact);
         opt.use_graphs = graphs;
         opt.multi_gemv = multi;
         opt.pdl = pdl;
         if (print_cfg) {
             q::print_effective_config(opt, arith_name.c_str(), stdout);
+            std::fputs(profile_text.c_str(), stdout);
             return 0;
         }
         std::unique_ptr<q::CudaEngine> E;
@@ -305,6 +305,7 @@ int main(int argc, char** argv) {
         }
         const auto& cfg = E->config();
         q::print_effective_config(E->options(), arith_name.c_str(), stderr);
+        std::fputs(profile_text.c_str(), stderr);
         std::fprintf(stderr, "  nvfp4 tensors: %u, weight bytes per pass %.2f GB\n", E->nvfp4_tensors(), static_cast<double>(E->weight_bytes()) / 1e9);
         std::fprintf(stderr, "qwen35: layers %u hidden %u inter %u vocab %u heads %u/%u hd %u gdn %u/%u x %u mtp %d\n", cfg.layers,
                      cfg.hidden, cfg.intermediate, cfg.vocab, cfg.heads, cfg.kv_heads, cfg.head_dim, cfg.gdn_key_heads,

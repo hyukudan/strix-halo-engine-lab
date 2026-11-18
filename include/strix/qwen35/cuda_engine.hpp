@@ -108,7 +108,7 @@ struct EngineOptions {
     // under free VRAM - max(4 GiB, 10 % total) and prefill_operand_cache_cap_mib (0 = no cap). off = per-call expansion.
     cuda_core::operand_cache::Mode prefill_operand_cache = cuda_core::operand_cache::Mode::automatic;
     std::uint32_t prefill_operand_cache_cap_mib = 0;
-    // NVFP4 GEMV split-K policy (strix/split_k_policy.hpp; resolved by prefill_controls.hpp resolve_split_k): exact = target
+    // NVFP4 GEMV split-K policy (strix/split_k_policy.hpp; resolved by the profile resolver strix/profiles/qwen_dense_cuda.hpp, lever split_k): exact = target
     // 1000 (today's bits); fast = FAST nvfp4-splitk-fast-v1 (per-shape targets for the device, identity suffix "-skf1").
     split_k::Profile nvfp4_split = split_k::Profile::exact;
 };
