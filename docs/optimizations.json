@@ -842,6 +842,50 @@
   },
   {
     "engine": "qwen",
+    "name": "Plain decode MoE slot merge in the A8 down launch",
+    "flag_or_env": "STRIX_MOE_R1_TAIL_FOLD",
+    "default": "1 (eager plain one-row decode, with STRIX_MOE_R1_GLUE_FUSE)",
+    "exact": "Byte-identical: device fixture strix-hip-moe-kquant-tests r1-slot-merge-tail (four down kernels, sticky status, non-finite and BF16-overflowing weights, invalid route, preset record, K 1/7/10) vs the down launch plus the incumbent tail; Qwen MoE 8K logits + 64 decode ids equal to main.",
+    "gain": "48 fewer launches per Qwen MoE token; 8K + 64 decode tokens 45.00 / 44.84 vs 44.47 / 44.68 ms/step (one pair per ticket, not a speed claim).",
+    "preconditions": "Eager deferred-status q4k-a8 runtime with A8 down, top_k <= 16, hidden % 64 == 0.",
+    "off_switch": "STRIX_MOE_R1_TAIL_FOLD=0",
+    "doc_anchor": "docs/optimizations.md#qwen-plain-decode-step"
+  },
+  {
+    "engine": "qwen",
+    "name": "Qwen 27B HIP decode launch fusion",
+    "flag_or_env": "STRIX_DECODE_FUSE",
+    "default": "1",
+    "exact": "Same arithmetic, same bits: plain decode ids equal to main over 128 tokens, speculative ids equal to plain over 1,200 tokens (Qwen 27B IU4).",
+    "gain": "plain decode 128 tokens 71.47 vs 70.26 ms/token (one pair per ticket, not a speed claim).",
+    "preconditions": "Qwen 27B dense HIP engine; prepared rows for IU4 projections of windows <= 16 rows.",
+    "off_switch": "STRIX_DECODE_FUSE=0",
+    "doc_anchor": "docs/optimizations.md#qwen27-hip-decode-step"
+  },
+  {
+    "engine": "qwen",
+    "name": "Qwen 27B HIP one IU4 weight sweep for 9..16-row windows",
+    "flag_or_env": "STRIX_IU4_ONE_SWEEP",
+    "default": "1",
+    "exact": "Same rows bitwise (host test decode-weight-sweep; decode and speculative ids above).",
+    "gain": "One weight stream instead of two for 9..16-row decode / verify windows; no separate timing.",
+    "preconditions": "Scalar-activation IU4 windows of 9..16 rows.",
+    "off_switch": "STRIX_IU4_ONE_SWEEP=0",
+    "doc_anchor": "docs/optimizations.md#qwen27-hip-decode-step"
+  },
+  {
+    "engine": "qwen",
+    "name": "Qwen 27B HIP EXACT 64-row prefill windows",
+    "flag_or_env": "--wide-exact N (decode app), --prefill-rows N --prefill-exact (spec app)",
+    "default": "spec app: 64-row EXACT windows when every large dense projection is IU4 (16 rows otherwise); decode app: 16-row windows; pair app: --wide N FAST class",
+    "exact": "Every row bitwise the 16-row result: 2,048-token last-row logits bitwise and 4 ids equal (Qwen 27B IU4).",
+    "gain": "prefill 2,048 tokens --wide 16 132.5 / 132.5 vs --wide-exact 64 189.6 / 188.7 tok/s cold / warm (one ticket, not a speed claim).",
+    "preconditions": "IU4 large dense projections (qwen35::resolve_prefill_rows).",
+    "off_switch": "--prefill-rows 16 (spec app); omit --wide-exact (decode app)",
+    "doc_anchor": "docs/optimizations.md#qwen27-hip-decode-step"
+  },
+  {
+    "engine": "qwen",
     "name": "R1 GDN preparation fusion",
     "flag_or_env": "STRIX_QWEN_DECODE_FUSE",
     "default": "OFF (opt-in: STRIX_QWEN_DECODE_FUSE=1)",

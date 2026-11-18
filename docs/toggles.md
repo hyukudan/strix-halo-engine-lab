@@ -106,6 +106,8 @@ The tables below list the curated flags. The full list of environment variables 
 | `--prefill auto` | glm | `auto` | Picks the prefill path. | - |
 | `--prefill-chunk N` | glm | 512 | Prefill chunk size in rows. | Larger with more compute; smaller with less memory. |
 | `--prefill-path device` | deepseek serve | `device` | Prefill on the GPU. | - |
+| `--wide-exact N` | qwen (27B HIP decode app) | off (16-row windows) | EXACT prefill windows of N rows, every row bitwise the 16-row result; only when every large dense projection is IU4 (other formats resolve to 16 rows). `--wide N` (> 16) is the FAST wide class. [Details](optimizations.md#qwen27-hip-decode-step). | 64 measured best on Strix (exact attention costs more per row in wider grids). |
+| `--prefill-rows N`, `--prefill-exact` | qwen (27B HIP spec app) | 64-row EXACT windows (IU4 dense projections; 16 rows otherwise) | `--prefill-rows 16` = 16-row windows; N > 16 = the FAST wide class unless `--prefill-exact` is given. [Details](optimizations.md#qwen27-hip-decode-step). | - |
 | `--vision FILE` | deepseek serve (rank 0) | off | Image input: loads the vision GGUF and accepts `image_url` parts. Needs `--prefill-path device`. [Image input](engine/vision.md). | - |
 | `STRIX_VISION_RESIDENT` | deepseek serve | 1 | `1`: the image tower is uploaded at start; `0`: on the first image. | `0` to keep the memory free until an image arrives. |
 | `STRIX_VISION_CACHE_MIB` | deepseek serve | 256 | Size of the image embed cache in MiB; `0` disables storing. | Larger when the same images repeat. |
@@ -350,11 +352,12 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_SERVE_T16K` | qwen | ON: T16384 owner when the context admits a 32,768-token request and every resident slot fits; `0` keeps T8192 | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 | `STRIX_SERVE_FP16_MTP` | qwen | ON: explicit-sidecar MTP servers keep the automatic FP16 prefill arithmetic with the unqualified fast options off; `0` declines it | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 
-### Decode, MTP and DSpark (22)
+### Decode, MTP and DSpark (24)
 
 | Toggle | Engine | Default | Details |
 |---|---|---|---|
 | `STRIX_BATCH_TOOL_DRAFT` | qwen | ON (batched decoding) | [qwen-tool-draft](optimizations.md#qwen-tool-draft) |
+| `STRIX_DECODE_FUSE` | qwen (27B HIP) | 1 | [qwen27-hip-decode-step](optimizations.md#qwen27-hip-decode-step) |
 | `STRIX_DS41_DECODE_PREFETCH` | deepseek | auto | [ds-prefetch](optimizations.md#ds-prefetch) |
 | `STRIX_DS41_DEFER_DECODER` | deepseek | on | [ds-defer-decoder](optimizations.md#ds-defer-decoder) |
 | `STRIX_DS41_DSPARK_CALIB` | deepseek | auto | [ds-warm](optimizations.md#ds-warm) |
@@ -368,6 +371,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_MM_SERVE_DSPARK` | minimax | auto | [mm-serve-dspark](optimizations.md#mm-serve-dspark) |
 | `STRIX_MM_SERVE_DSPARK_STAGE` | minimax | 1 | [mm-serve-dspark-stage](optimizations.md#mm-serve-dspark-stage) |
 | `STRIX_MOE_R1_GLUE_FUSE` | qwen | 1 (eager plain one-row decode) | [qwen-plain-decode-step](optimizations.md#qwen-plain-decode-step) |
+| `STRIX_MOE_R1_TAIL_FOLD` | qwen | 1 (eager plain one-row decode, with `STRIX_MOE_R1_GLUE_FUSE`) | [qwen-plain-decode-step](optimizations.md#qwen-plain-decode-step) |
 | `STRIX_QSA_DECODE_ATTN_V2` | qwen | 1 (eager plain one-row decode) | [qwen-plain-decode-step](optimizations.md#qwen-plain-decode-step) |
 | `STRIX_QSA_DECODE_FUSED_MAXIMA` | qwen | 1 (eager plain one-row decode) | [qwen-plain-decode-step](optimizations.md#qwen-plain-decode-step) |
 | `STRIX_QSA_DECODE_POOL` | qwen | 1 (plain append-only serial decode) | [qwen-qsa-decode-pool](optimizations.md#qwen-qsa-decode-pool) |
@@ -424,7 +428,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_QSA_DECODE_POOL_BF16` | qwen | 1 (plain append-only serial decode un... | [qwen-qsa-decode-pool](optimizations.md#qwen-qsa-decode-pool) |
 | `STRIX_QWEN_ROUTER_BF16` | qwen | OFF (opt-in: STRIX_QWEN_ROUTER_BF16=1) | [qwen-exact-bf16-router-weights](optimizations.md#qwen-exact-bf16-router-weights) |
 
-### Kernel paths (121)
+### Kernel paths (122)
 
 | Toggle | Engine | Default | Details |
 |---|---|---|---|
@@ -495,6 +499,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_GLM_SERVE_PREFILL_UNITS` | glm | 1 | a long prompt admitted under load is cut into layer units, not token chunks; `0` = token chunks; [GLM page](models/glm-5.3/README.md) |
 | `STRIX_GLM_STEP_FLAG` | glm | 1 (engine default) | [glm-step-flag](optimizations.md#glm-step-flag) |
 | `STRIX_GLM_TIERB` | glm | fused | [glm-attn-tierb-fused](optimizations.md#glm-attn-tierb-fused) |
+| `STRIX_IU4_ONE_SWEEP` | qwen (27B HIP) | 1 | [qwen27-hip-decode-step](optimizations.md#qwen27-hip-decode-step) |
 | `STRIX_LM_HEAD_COHORT_LEAN` | qwen | 1 | [qwen-lm-head-cohort-lean](optimizations.md#qwen-lm-head-cohort-lean) |
 | `STRIX_LM_HEAD_ROWS_LEAN` | qwen | 2 | [qwen-lm-head-rows-lean](optimizations.md#qwen-lm-head-rows-lean) |
 | `STRIX_MINIMAX_GU4_SCALAR` | minimax | ON (build time) | [mm-gu4](optimizations.md#mm-gu4) |
