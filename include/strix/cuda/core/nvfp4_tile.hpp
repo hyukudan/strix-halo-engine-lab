@@ -115,6 +115,40 @@ STRIX_NVFP4_TILE_HD std::uint32_t out_row(std::uint32_t tile_m, std::uint32_t wm
 STRIX_NVFP4_TILE_HD std::uint32_t glu_channel(std::uint32_t tile_m, std::uint32_t wm, std::uint32_t p, std::uint32_t g, std::uint32_t z) {
     return glu_slot_tile(tile_m, wm * 4 + 2 * p) * 16 + g + 8 * (z >> 1);
 }
+
+// ---- producer of one 128-K stage: kStageWRecs weight records then kStageXRecs activation records, copied verbatim in 16-byte
+// chunks c = 0 .. kStageChunks - 1. Chunk c of stage ks reads operand `which` (0 = w, 1 = w2 (GLU up), 2 = x) at byte
+// base + ks * step (zero-filled when !ok) and lands at stage offset dst. Nothing but ks depends on the stage, so the kernel resolves
+// a chunk once per thread and pays one multiply-add per stage.
+inline constexpr std::uint32_t kStageWRecs = 8, kStageXRecs = 32;
+inline constexpr std::uint32_t kStageChunksW = kStageWRecs * kWRec / 16, kStageChunks = kStageChunksW + kStageXRecs * kXRec / 16;
+struct StageChunk {
+    std::size_t base;
+    std::uint32_t dst, step, which;
+    bool ok;
+};
+STRIX_NVFP4_TILE_HD StageChunk stage_chunk(std::uint32_t c, std::uint32_t tile_m, std::uint32_t tile_n, bool glu, std::uint32_t ks_count,
+                                           std::uint32_t w_tiles, std::uint32_t x_tiles) {
+    StageChunk r{};
+    if (c < kStageChunksW) {
+        const std::uint32_t s = c / (kWRec / 16), off = (c % (kWRec / 16)) * 16;
+        const std::uint32_t t = glu ? glu_slot_tile(tile_m, s) : a_slot_tile(tile_m, s);
+        r.ok = t < w_tiles;
+        r.which = glu && (s & 1) ? 1U : 0U;
+        r.base = static_cast<std::size_t>(r.ok ? t : 0) * ks_count * kWRec + off;
+        r.dst = s * kWRec + off;
+        r.step = kWRec;
+    } else {
+        const std::uint32_t c2 = c - kStageChunksW, j = c2 / (kXRec / 16), off = (c2 % (kXRec / 16)) * 16;
+        const std::uint32_t t = tile_n * kStageXRecs + j;
+        r.ok = t < x_tiles;
+        r.which = 2;
+        r.base = static_cast<std::size_t>(r.ok ? t : 0) * ks_count * kXRec + off;
+        r.dst = kStageWRecs * kWRec + j * kXRec + off;
+        r.step = kXRec;
+    }
+    return r;
+}
 STRIX_NVFP4_TILE_HD std::uint32_t act_row(std::uint32_t tile_n, std::uint32_t wn, std::uint32_t nt, std::uint32_t t, std::uint32_t z) {
     return (tile_n * 32 + wn * 8 + nt) * 8 + 2 * t + (z & 1);
 }

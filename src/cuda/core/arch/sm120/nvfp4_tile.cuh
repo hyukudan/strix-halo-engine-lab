@@ -48,23 +48,31 @@ __global__ void __launch_bounds__(kThreads, 1) gemm_kernel(const GemmArgs a) {
     const bool glu = a.epi == Epi::glu;
     const std::uint32_t tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, wm = warp & 1, wn = warp >> 1;
     const std::uint32_t sbase = static_cast<std::uint32_t>(__cvta_generic_to_shared(smem));
-    // one stage = the 8 weight records and the 32 activation records of input block ks, copied verbatim
+    // one stage = the 8 weight records and the 32 activation records of input block ks, copied verbatim. Thread tid copies the
+    // 16-byte chunks c = tid + i * kThreads (i < kPer, c < kChunks). Which record / tile / source a chunk reads does not depend on ks,
+    // so its source base, ks stride, shared offset and predicates are computed ONCE here; a stage then costs kPer cp.async plus one
+    // multiply-add each. (Recomputing them per stage in a rolled, divergent loop was ~1,860 clk per 128-K stage serialised after the
+    // barrier: the tensor pipe sat at 52 %, ncu rtx_dense2 11-18.) Same bytes to the same shared offsets: the result is bitwise equal.
+    constexpr std::uint32_t kPer = (kChunks + kThreads - 1) / kThreads;
+    static_assert(kSlotsA == kStageWRecs && kSlotsB == kStageXRecs && kChunks == kStageChunks, "producer contract (nvfp4_tile.hpp)");
+    const std::uint8_t* src[kPer];
+    std::uint32_t dst[kPer], step[kPer];
+    bool live[kPer], okc[kPer];
+#pragma unroll
+    for (std::uint32_t i = 0; i < kPer; ++i) {
+        const std::uint32_t c = tid + i * kThreads;
+        const StageChunk q = stage_chunk(c, tm, tn, glu, KS, wtiles, ntiles);
+        live[i] = c < kChunks;
+        okc[i] = live[i] && q.ok;
+        src[i] = (q.which == 2 ? a.x : q.which == 1 ? a.w2 : a.w) + q.base;
+        dst[i] = q.dst;
+        step[i] = q.step;
+    }
     auto load = [&](std::uint32_t stage, std::uint32_t ks) {
         const std::uint32_t st = sbase + stage * kStage;
-        for (std::uint32_t c = tid; c < kChunks; c += kThreads) {
-            if (c < kChunksA) {
-                const std::uint32_t s = c / (kWRec / 16), off = (c % (kWRec / 16)) * 16;
-                const std::uint32_t t = glu ? glu_slot_tile(tm, s) : a_slot_tile(tm, s);
-                const std::uint8_t* W = glu && (s & 1) ? a.w2 : a.w;
-                const bool ok = t < wtiles;
-                cp16(st + s * kWRec + off, W + (static_cast<std::size_t>(ok ? t : 0) * KS + ks) * kWRec + off, ok);
-            } else {
-                const std::uint32_t c2 = c - kChunksA, j = c2 / (kXRec / 16), off = (c2 % (kXRec / 16)) * 16;
-                const std::uint32_t t = tn * kSlotsB + j;
-                const bool ok = t < ntiles;
-                cp16(st + kAStage + j * kXRec + off, a.x + (static_cast<std::size_t>(ok ? t : 0) * KS + ks) * kXRec + off, ok);
-            }
-        }
+#pragma unroll
+        for (std::uint32_t i = 0; i < kPer; ++i)
+            if (live[i]) cp16(st + dst[i], src[i] + static_cast<std::size_t>(ks) * step[i], okc[i]);
     };
     float acc[4][8][4];
 #pragma unroll

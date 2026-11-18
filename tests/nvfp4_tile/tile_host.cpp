@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <vector>
 
 #include "strix/cuda_core/operand_cache_plan.hpp"
 #include "tile_ref.hpp"
@@ -200,6 +201,47 @@ void test_quantize_and_contract() {
     g.epi = T::Epi::residual;
     CHECK(!T::valid(g));  // residual needs aux
 }
+
+// Producer of one gemm_kernel stage: the hoisted form (stage_chunk: base + ks * step, resolved once per thread) must address the
+// same bytes as the per-stage form ((t * KS + ks) * rec + off) for every chunk and stage, and one stage must fill each shared byte
+// of [0, kStageWRecs * kWRec + kStageXRecs * kXRec) exactly once.
+void test_stage_chunks(std::uint32_t out, std::uint32_t in, std::uint32_t rows, bool glu) {
+    const std::uint32_t KS = in / T::kK, rows_pad = T::rows_padded(rows), wtiles = out / 16, ntiles = rows_pad / 8;
+    const std::uint32_t tiles_m = glu ? (2 * out + T::kCtaOut - 1) / T::kCtaOut : (out + T::kCtaOut - 1) / T::kCtaOut;
+    const std::uint32_t tiles_n = rows_pad / T::kCtaRows, stage = T::kStageWRecs * T::kWRec + T::kStageXRecs * T::kXRec;
+    static_assert(T::kStageChunks * 16 == T::kStageWRecs * T::kWRec + T::kStageXRecs * T::kXRec, "stage chunks");
+    for (std::uint32_t tm = 0; tm < tiles_m; ++tm)
+        for (std::uint32_t tn = 0; tn < tiles_n; ++tn) {
+            std::vector<int> cover(stage, 0);
+            for (std::uint32_t c = 0; c < T::kStageChunks; ++c) {
+                const T::StageChunk q = T::stage_chunk(c, tm, tn, glu, KS, wtiles, ntiles);
+                std::uint32_t t, rec, off, dst, which;
+                if (c < T::kStageChunksW) {  // per-stage form of the original kernel loop
+                    const std::uint32_t s = c / (T::kWRec / 16);
+                    off = (c % (T::kWRec / 16)) * 16;
+                    t = glu ? T::glu_slot_tile(tm, s) : T::a_slot_tile(tm, s);
+                    which = glu && (s & 1) ? 1U : 0U;
+                    rec = T::kWRec;
+                    dst = s * T::kWRec + off;
+                    CHECK(q.ok == (t < wtiles));
+                } else {
+                    const std::uint32_t c2 = c - T::kStageChunksW, j = c2 / (T::kXRec / 16);
+                    off = (c2 % (T::kXRec / 16)) * 16;
+                    t = tn * T::kStageXRecs + j;
+                    which = 2;
+                    rec = T::kXRec;
+                    dst = T::kStageWRecs * T::kWRec + j * T::kXRec + off;
+                    CHECK(q.ok == (t < ntiles));
+                }
+                CHECK(q.which == which && q.dst == dst && q.step == rec);
+                for (const std::uint32_t ks : {0U, 1U, KS - 1})
+                    CHECK(q.base + static_cast<std::size_t>(ks) * q.step ==
+                          (static_cast<std::size_t>(q.ok ? t : 0) * KS + ks) * rec + off);
+                for (std::uint32_t b = 0; b < 16; ++b) ++cover[q.dst + b];
+            }
+            for (const int n : cover) CHECK(n == 1);
+        }
+}
 }  // namespace
 
 int main() {
@@ -209,10 +251,13 @@ int main() {
     test_gemm(256, 384, 300, 21);  // two weight tiles x two activation tiles
     test_glu(80, 128, 20, 31);     // GLU with a partial 64-channel tile
     test_quantize_and_contract();
+    test_stage_chunks(48, 256, 40, false);    // partial weight tile (wtiles 3 < 8 slots), padded rows
+    test_stage_chunks(256, 384, 300, false);  // two weight tiles x two activation tiles
+    test_stage_chunks(80, 128, 20, true);     // GLU, partial 64-channel tile (w2 slots)
     if (g_fail) {
         std::fprintf(stderr, "nvfp4_tile_host: %d failures\n", g_fail);
         return 1;
     }
-    std::printf("nvfp4_tile_host: PASS (layouts, fragments, coordinates, GLU, quantiser, contract)\n");
+    std::printf("nvfp4_tile_host: PASS (layouts, fragments, coordinates, GLU, quantiser, contract, stage producer)\n");
     return 0;
 }
