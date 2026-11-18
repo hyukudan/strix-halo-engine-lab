@@ -27,6 +27,7 @@
 #include <concepts>
 #include <cstdint>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 #include "strix/spec/block_drafter.hpp"
@@ -117,6 +118,19 @@ public:
         // rows 0..emitted-1 of the last verify are committed; emitted[i] follows row i
         push_hidden(last_, static_cast<std::uint32_t>(emitted.size()), emitted.data());
     }
+    // Tree verify: the committed rows are the path's rows (emitted[i] follows verify row rows[i]); each run of consecutive
+    // rows is one copy, so a linear path (0, 1, ..) is the same single copy as accept().
+    void accept_path(std::span<const std::uint32_t> emitted, std::span<const std::uint32_t> rows) override {
+        if (last_rows_ == 0) return;
+        if (rows.size() != emitted.size()) throw std::invalid_argument("MtpChain: path rows != emitted tokens");
+        for (std::size_t i = 0; i < rows.size();) {
+            std::size_t j = i + 1;
+            while (j < rows.size() && rows[j] == rows[j - 1] + 1) ++j;
+            if (rows[j - 1] >= last_rows_) throw std::invalid_argument("MtpChain: path row outside the last verify");
+            push_hidden(last_, static_cast<std::uint32_t>(j - i), emitted.data() + i, rows[i]);
+            i = j;
+        }
+    }
 
     [[nodiscard]] std::uint64_t calls() const { return calls_; }    // mtp_forward calls (flush chunks + chain steps)
     [[nodiscard]] std::uint64_t rows() const { return rows_; }
@@ -203,8 +217,8 @@ private:
             Dev::copy(e_, carry_, pre_ ? m.hidden_pre : m.hidden_post, hid_);
         }
     }
-    void push_hidden(const Rows& o, std::uint32_t rows, const std::uint32_t* next_tokens) {
-        const float* src = pre_ ? o.hidden_pre : o.hidden_post;
+    void push_hidden(const Rows& o, std::uint32_t rows, const std::uint32_t* next_tokens, std::uint32_t first = 0) {
+        const float* src = (pre_ ? o.hidden_pre : o.hidden_post) + std::size_t(first) * hid_;
         std::uint32_t done = 0;
         while (done < rows) {
             if (next_.size() == ring_n_) flush();

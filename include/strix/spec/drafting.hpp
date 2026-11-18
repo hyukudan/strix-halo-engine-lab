@@ -280,6 +280,11 @@ struct SpecStats {
     std::array<std::uint64_t, 32> lookup_us_hist{};  // [i]: proposal host time in [2^(i-3), 2^(i-2)) us
     double lookup_us_max = 0;
     std::size_t index_bytes = 0;
+    // Token-tree siblings (block_drafter.hpp): [d-1] rejections at main-chain depth d that had a drafter runner-up
+    // (trials) and those where the runner-up was the target's token (hits), recorded whether or not the sibling row was
+    // placed, so a linear run measures q_d; rows = sibling rows verified, taken = siblings accepted (+1 token each).
+    std::array<std::uint64_t, 16> sibling_trials{}, sibling_hits{};
+    std::uint64_t sibling_rows = 0, sibling_taken = 0;
     void record(const Outcome& outcome, std::uint32_t emitted_this_pass);
     void lookup_time(double us);
     [[nodiscard]] double lookup_us_quantile(double q) const;  // upper bucket edge

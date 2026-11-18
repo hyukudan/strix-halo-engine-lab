@@ -673,6 +673,15 @@ std::string SpecStats::json() const {
              num(cost_fit.beta) + ",\"kappa\":" + num(cost_fit.kappa) + ",\"weight\":" + num(cost_fit.weight) + ",\"kv\":\"" +
              (cost_fit.kv_open ? "open" : "closed") + "\",\"ctx\":" + num(cost_fit.context) +
              ",\"skipped\":" + std::to_string(cost_fit.skipped) + "}";
+    std::size_t sdepth = sibling_trials.size();
+    while (sdepth > 0 && sibling_trials[sdepth - 1] == 0) --sdepth;
+    if (sdepth > 0 || sibling_rows > 0) {  // token-tree siblings: runner-up probe per depth + rows placed / taken
+        j += ",\"sibling\":{\"trials\":[";
+        for (std::size_t d = 0; d < sdepth; ++d) j += (d ? "," : "") + std::to_string(sibling_trials[d]);
+        j += "],\"hits\":[";
+        for (std::size_t d = 0; d < sdepth; ++d) j += (d ? "," : "") + std::to_string(sibling_hits[d]);
+        j += "],\"rows\":" + std::to_string(sibling_rows) + ",\"taken\":" + std::to_string(sibling_taken) + "}";
+    }
     j += "}";
     return j;
 }

@@ -139,6 +139,7 @@ Block BlockDrafter::next(const StepParams& params, const PrelaunchFn* launch) {
                 learn_chain_ms(n + pick, b.draft_ms);
                 b.ext = std::uint32_t(std::min<std::size_t>(ext.size(), pick));
                 b.drafts.insert(b.drafts.end(), ext.begin(), ext.begin() + std::ptrdiff_t(b.ext));
+                take_runner_ups(b, n, b.ext);
             }
         }
     } else {
@@ -149,12 +150,111 @@ Block BlockDrafter::next(const StepParams& params, const PrelaunchFn* launch) {
         if (b.drafts.size() > d.k) b.drafts.resize(d.k);
         b.ext = std::uint32_t(b.drafts.size());
         if (b.drafts.empty()) b.source = Source::serial;
+        else take_runner_ups(b, 0, b.ext);
     }
+    if (b.source != Source::serial) place_siblings(b, params);
     return b;
 }
 
+void BlockDrafter::take_runner_ups(Block& b, std::uint32_t first, std::uint32_t n) const {
+    if (!chain_ || n == 0) return;
+    const auto ru = chain_->runner_ups();  // aligned with the chain's last `out` (n positions from drafts[first])
+    if (ru.empty()) return;
+    b.alts.resize(b.drafts.size(), kNoToken);
+    for (std::uint32_t j = 0; j < n && j < ru.size() && first + j < b.drafts.size(); ++j)
+        b.alts[first + j] = ru[j] != b.drafts[first + j] ? ru[j] : kNoToken;
+}
+
+double BlockDrafter::sibling_q(std::uint32_t depth) const {
+    const auto& p = config_.sibling_prior;
+    if (depth < 1 || depth > sib_q_.size()) return p[0] / (p[0] + p[1]);
+    const auto& h = sib_q_[depth - 1];
+    return (h[0] + p[0]) / (h[0] + h[1] + p[0] + p[1]);
+}
+
+// Cost rule (header comment): candidates by expected gain g_j = q_j R_{j-1} (1 - s_j), kept while g > c x max(E / T,
+// serial rate), i.e. the block's tokens per ms rises and no row buys a token dearer than serial decode pays (E, T =
+// the Arbiter's expected tokens / ms of the block, c = the next row's price).
+void BlockDrafter::place_siblings(Block& b, const StepParams& params) const {
+    const auto k = std::uint32_t(b.drafts.size());
+    if (!config_.siblings || params.tree_rows == 0 || b.alts.size() != k || k == 0) return;
+    const std::uint32_t cap = std::min(params.max_rows, params.tree_rows);
+    struct Cand { double gain; std::uint32_t j; };
+    std::vector<Cand> cand;
+    double reach = 1.0;  // R_{j-1}: the main path survives to depth j - 1
+    for (std::uint32_t j = 1; j <= k; ++j) {
+        double s;
+        if (b.source == Source::lookup && j <= b.copy) s = arbiter_.survival(Source::lookup, b.bucket, j);
+        else s = arbiter_.survival(Source::model, 0, b.source == Source::lookup ? j - b.copy : j);
+        if (b.alts[j - 1] != kNoToken) cand.push_back({sibling_q(j) * reach * (1.0 - s), j});
+        reach *= s;
+    }
+    std::stable_sort(cand.begin(), cand.end(), [](const Cand& x, const Cand& y) { return x.gain > y.gain; });
+    double tokens = std::max(b.decision.expected_tokens, 1.0);
+    double ms = std::max(b.decision.expected_ms, arbiter_.verify_ms(k + 1, params.context));
+    // A token is worth at least what serial decode pays for it: an exploratory (probe) block below the serial rate
+    // must not buy rows that only lift it toward serial.
+    const double serial_rate = 1.0 / std::max(arbiter_.verify_ms(1, params.context), 1e-9);
+    b.sib.assign(k, 0);
+    for (const auto& c : cand) {
+        const std::uint32_t rows = k + 1 + b.siblings;
+        if (rows >= cap) break;
+        const double price = std::max(0.0, arbiter_.verify_ms(rows + 1, params.context) - arbiter_.verify_ms(rows, params.context));
+        const double rate = std::max(tokens / ms, serial_rate);  // tokens per ms a row's price must beat
+        if (!(c.gain > 0.0) || c.gain <= price * rate) break;   // sorted: no later candidate pays either
+        b.sib[c.j - 1] = 1;
+        ++b.siblings;
+        tokens += c.gain;
+        ms += price;
+    }
+    if (b.siblings == 0) b.sib.clear();
+}
+
+void Block::tree_rows(std::uint32_t anchor, TreeRows& out) const {
+    out.tokens.assign(1, anchor);
+    out.parent.assign(1, -1);
+    out.node.assign(1, 0);
+    out.depth.assign(1, 0);
+    std::int32_t last_main = 0;
+    for (std::uint32_t j = 0; j < drafts.size(); ++j) {
+        if (j < sib.size() && sib[j]) {  // leaf sibling first: the chain node's parent stays the last non-leaf row
+            out.tokens.push_back(alts[j]);
+            out.parent.push_back(last_main);
+            out.node.push_back(-std::int32_t(j + 1));
+            out.depth.push_back(j + 1);
+        }
+        out.tokens.push_back(drafts[j]);
+        out.parent.push_back(last_main);
+        out.node.push_back(std::int32_t(j + 1));
+        out.depth.push_back(j + 1);
+        last_main = std::int32_t(out.tokens.size() - 1);
+    }
+}
+
+TreeAccept accept_tree(const TreeRows& rows, std::span<const std::uint32_t> greedy) {
+    if (greedy.size() != rows.tokens.size()) throw std::runtime_error("accept_tree: greedy rows != tree rows");
+    TreeAccept a;
+    a.path.assign(1, 0);
+    std::uint32_t cur = 0;
+    for (;;) {
+        const std::uint32_t g = greedy[cur];
+        std::int32_t next = -1;
+        for (std::uint32_t r = cur + 1; r < rows.tokens.size(); ++r)
+            if (rows.parent[r] == std::int32_t(cur) && rows.tokens[r] == g && (next < 0 || rows.node[r] > 0)) next = std::int32_t(r);
+        if (next < 0) break;
+        cur = std::uint32_t(next);
+        a.path.push_back(cur);
+        a.emitted.push_back(rows.tokens[cur]);
+        if (rows.node[cur] > 0) ++a.main;
+        else a.sibling = true;
+    }
+    a.emitted.push_back(greedy[cur]);
+    return a;
+}
+
 void BlockDrafter::observe(const Block& b, std::uint32_t accepted, double verify_ms,
-                           std::span<const std::uint32_t> emitted, std::uint64_t context) {
+                           std::span<const std::uint32_t> emitted, std::uint64_t context,
+                           std::span<const std::uint32_t> path) {
     Outcome o;
     o.source = b.source;
     o.bucket = b.bucket;
@@ -178,12 +278,28 @@ void BlockDrafter::observe(const Block& b, std::uint32_t accepted, double verify
                 }
             }
     }
+    // Runner-up probe: at a rejection of main depth a + 1, emitted[a] is the target's token there (the correction, or the
+    // sibling the tree took). Learned whether or not the sibling row was placed.
+    const auto main_k = std::uint32_t(b.drafts.size());
+    if (b.alts.size() == main_k && accepted < main_k && b.alts[accepted] != kNoToken && accepted < emitted.size()) {
+        const bool hit = emitted[accepted] == b.alts[accepted];
+        if (accepted < sib_q_.size()) {
+            sib_q_[accepted][hit ? 0 : 1] += 1.0;
+            ++stats_.sibling_trials[accepted];
+            stats_.sibling_hits[accepted] += hit;
+        }
+        if (hit && accepted < b.sib.size() && b.sib[accepted]) ++stats_.sibling_taken;
+    }
+    stats_.sibling_rows += b.siblings;
     stats_.record(o, std::uint32_t(emitted.size()));
     arbiter_.observe(o, emitted);
     stats_.cost_fit = arbiter_.cost_fit();  // printed in strix-spec-stats (context cost mode and coefficients)
     stats_.has_cost_fit = true;
     proposer_.commit(emitted);
-    if (chain_) chain_->accept(emitted);
+    if (chain_) {
+        if (path.empty()) chain_->accept(emitted);
+        else chain_->accept_path(emitted, path);
+    }
 }
 
 namespace {
@@ -230,37 +346,60 @@ void RoundTraceWriter::round(const RoundRecord& r) {
 
 StepRecord BlockSpeculator::step(std::vector<std::uint32_t>& out, const StepParams& params) {
     StepRecord r;
+    StepParams p = params;
+    p.tree_rows = target_.tree_rows();
     // Verify pre-launch: the target enqueues the verify of [anchor, host prefix, device drafts] inside the chain call,
     // before the drafted ids are read back (the host launch overlaps the GPU draft). launched_rows = its row count.
+    // A tree target (p.tree_rows > 0) is not pre-launched: the drafter places sibling rows only after the chain ids are
+    // read (Block::siblings is decided in drafter_.next after the prelaunch callback), so an enqueued linear verify could
+    // not carry them. Both features stay available; a target that reports tree rows takes the read-then-verify order.
     std::size_t launched_rows = 0;
     const PrelaunchFn launch = [&](std::span<const std::uint32_t> prefix, const DraftFeed& feed) {
         host_rows_.assign(1, anchor_);
         host_rows_.insert(host_rows_.end(), prefix.begin(), prefix.end());
         if (target_.verify_launch_fed(host_rows_, feed)) launched_rows = host_rows_.size() + feed.k;
     };
-    auto block = drafter_.next(params, prelaunch_ ? &launch : nullptr);
+    auto block = drafter_.next(p, (prelaunch_ && p.tree_rows == 0) ? &launch : nullptr);
     if (block.decision.rows == 0) {
         if (launched_rows != 0) throw std::logic_error("block speculator: verify pre-launched for an empty block");
         return r;
     }
-    rows_.assign(1, anchor_);
-    rows_.insert(rows_.end(), block.drafts.begin(), block.drafts.end());
-    const double t0 = drafter_.now_ms();
-    if (launched_rows != 0) {
-        if (launched_rows != rows_.size()) throw std::logic_error("block speculator: pre-launched verify has the wrong row count");
-        target_.verify_collect(rows_, greedy_);
-        ++prelaunched_;
-    } else {
-        target_.verify(rows_, greedy_);
-    }
-    if (greedy_.size() != rows_.size()) throw std::runtime_error("block speculator: target returned the wrong row count");
     std::uint32_t accepted = 0;
-    while (accepted < block.drafts.size() && block.drafts[accepted] == greedy_[accepted]) ++accepted;
-    target_.commit(accepted + 1);
-    const double verify_ms = drafter_.now_ms() - t0;
-    std::vector<std::uint32_t> emitted(block.drafts.begin(), block.drafts.begin() + accepted);
-    emitted.push_back(greedy_[accepted]);
-    drafter_.observe(block, accepted, verify_ms, emitted, params.context);
+    std::vector<std::uint32_t> emitted;
+    double verify_ms = 0.0;
+    if (block.siblings == 0) {  // linear block: the original rows and commit, bitwise
+        rows_.assign(1, anchor_);
+        rows_.insert(rows_.end(), block.drafts.begin(), block.drafts.end());
+        const double t0 = drafter_.now_ms();
+        if (launched_rows != 0) {
+            if (launched_rows != rows_.size()) throw std::logic_error("block speculator: pre-launched verify has the wrong row count");
+            target_.verify_collect(rows_, greedy_);
+            ++prelaunched_;
+        } else {
+            target_.verify(rows_, greedy_);
+        }
+        if (greedy_.size() != rows_.size()) throw std::runtime_error("block speculator: target returned the wrong row count");
+        while (accepted < block.drafts.size() && block.drafts[accepted] == greedy_[accepted]) ++accepted;
+        target_.commit(accepted + 1);
+        verify_ms = drafter_.now_ms() - t0;
+        emitted.assign(block.drafts.begin(), block.drafts.begin() + accepted);
+        emitted.push_back(greedy_[accepted]);
+        drafter_.observe(block, accepted, verify_ms, emitted, params.context);
+    } else {
+        if (launched_rows != 0) throw std::logic_error("block speculator: verify pre-launched for a tree block");
+        block.tree_rows(anchor_, tree_);
+        const double t0 = drafter_.now_ms();
+        target_.verify_tree(tree_, greedy_);
+        if (greedy_.size() != tree_.tokens.size()) throw std::runtime_error("block speculator: target returned the wrong row count");
+        auto acc = accept_tree(tree_, greedy_);
+        target_.commit_path(acc.path);
+        verify_ms = drafter_.now_ms() - t0;
+        accepted = acc.main;
+        emitted = std::move(acc.emitted);
+        r.sibling_taken = acc.sibling;
+        drafter_.observe(block, accepted, verify_ms, emitted, params.context, acc.path);
+    }
+    r.siblings = block.siblings;
     if (sink_) {
         RoundRecord rec;
         rec.context = params.context;

@@ -301,6 +301,29 @@ int main() {
         sp::MtpChain<FakeFedEngine, HostDev> c4(f4, false, 3, 8);
         MC_CHECK(!c4.draft_prelaunch({}, 2, out, grab), "engine without the pre-launch hooks: declined");
     }
+    {  // token tree: the accepted path's verify rows (0, 2, 4) are caught up, not rows 0..2
+        FakeEngine et;
+        sp::MtpChain<FakeEngine, HostDev> ct(et, false, 3, 8);
+        ct.observe_prefill(pf, 5, prompt, 99);
+        ct.draft({}, 2, out);
+        std::vector<float> th(5 * kH, 0.0F);
+        for (unsigned i = 0; i < 5; ++i) th[i * kH] = 100.0F + 10.0F * float(i);
+        FakeRows tr;
+        tr.hidden_post = tr.hidden_pre = th.data();
+        ct.observe_verify(tr, 5);
+        const std::uint32_t path[3] = {0, 2, 4}, temitted[3] = {601, 602, 603};
+        ct.accept_path(temitted, path);
+        const auto b0 = et.calls.size();
+        ct.draft({}, 1, out);
+        MC_CHECK(et.calls.size() == b0 + 1 && et.calls[b0].tokens == std::vector<std::uint32_t>({601, 602, 603}), "tree catch-up tokens");
+        MC_CHECK(et.calls[b0].hidden0 == std::vector<float>({100.0F, 120.0F, 140.0F}), "tree catch-up hidden = path rows");
+        const std::uint32_t lin[2] = {0, 1}, lemitted[2] = {604, 605};  // a linear path = one copy, as accept()
+        ct.observe_verify(tr, 5);
+        ct.accept_path(lemitted, lin);
+        const auto b1 = et.calls.size();
+        ct.draft({}, 1, out);
+        MC_CHECK(et.calls[b1].hidden0 == std::vector<float>({100.0F, 110.0F}), "linear path hidden");
+    }
     std::puts("spec_mtp_chain_tests: PASS");
     return 0;
 }
