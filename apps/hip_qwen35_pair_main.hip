@@ -136,6 +136,7 @@ int self_cut(const Args& a, const std::vector<std::uint32_t>& prompt) {
     HipEngineOptions opt;
     opt.max_positions = a.maxpos;
     opt.prefill_rows = a.wide;
+    opt.wide_exact = false;  // --wide N > 16 stays the FAST wide class here (the engine default is now EXACT wide windows)
     const auto t0 = Clock::now();
     auto E = HipEngine::from_gguf(a.model, opt);
     std::printf("load time %.1f s\n", ms_since(t0) / 1000.0);
@@ -260,6 +261,7 @@ int main(int argc, char** argv) try {
     HipEngineOptions opt;
     opt.max_positions = a.maxpos;
     opt.prefill_rows = a.wide;
+    opt.wide_exact = false;  // --wide N > 16 stays the FAST wide class here (the engine default is now EXACT wide windows)
     opt.layer_begin = place.first();
     opt.layer_end = place.last();
     const auto t_load = Clock::now();
