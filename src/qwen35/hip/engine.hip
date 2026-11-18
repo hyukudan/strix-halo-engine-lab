@@ -317,7 +317,8 @@ void glu16(const Tensor& g, const Tensor& u, const float* x, float* out, unsigne
             return silu_mul_kernel<<<256, 256, 0, s>>>(iu4.g, iu4.u, out, std::size_t(rows) * g.outputs);
         }
         if (!ready) core::dense_iu4::prepare(x, iu4.xh, g.inputs, rows, s);
-        if (decode_fuse()) {  // gate + up: one projection-group launch
+        if (decode_fuse() && rows <= kMaxRows) {  // gate + up: one projection-group launch (groups take <= 16 rows;
+                                                  // EXACT wide windows run each projection on the core's wide grid)
             core::dense_iu4::run_group({{g.data, g.outputs, iu4.g}, {u.data, u.outputs, iu4.u}}, g.inputs, iu4.xh, rows, s);
         } else {
             core::dense_iu4::run(g.data, g.inputs, g.outputs, iu4.xh, iu4.g, rows, s);
