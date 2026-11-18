@@ -21,6 +21,7 @@
 // Exactness: drafts are arbitrary ids; BlockSpeculator's greedy verify keeps emitted == serial greedy decode.
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <vector>
 
@@ -103,9 +104,35 @@ public:
     [[nodiscard]] std::uint64_t anchor_pos() const { return anchor_pos_; }
     [[nodiscard]] std::span<const float> last_confidence() const { return confidence_; }
 
+    // The drafter's confidence as a per-row prior (opt-in; unbound = the previous behaviour bit for bit). After the block
+    // pass (its cost is flat in k, so it is already paid) a model block without a prefix keeps the k' <= k proposals that
+    // maximise (1 + sum_j prod_{i<=j} p_i) / (verify_ms(k' + 1) + draft_ms), p_i = calibrated acceptance of row i given
+    // its prefix accepted, learned per confidence bin from the verified rows. A block whose rows' bins lack evidence is
+    // not trimmed. k' = 0 (a plain step) keeps one row every explore_every times so the first-row bins keep learning.
+    // Only the rows verified change; emitted tokens never do.
+    struct RowPriorConfig {
+        std::uint32_t bins = 8;           // confidence bins over [0, 1]
+        double min_evidence = 8.0;        // decayed labels a bin needs before it prices a row
+        double half_life = 256.0;         // labels
+        double draft_ms = 0.0;            // the block pass (part of the pass the rate divides by)
+        std::uint32_t explore_every = 16;
+    };
+    void bind_row_prior(std::function<double(std::uint32_t rows)> verify_ms, RowPriorConfig config);
+    [[nodiscard]] double row_prior(float confidence) const;  // calibrated acceptance; < 0: no evidence (or unbound)
+    [[nodiscard]] std::uint64_t trimmed() const { return trimmed_; }
+
 private:
+    [[nodiscard]] std::uint32_t trim(std::uint32_t k);
+    void label(std::span<const std::uint32_t> emitted);
+    [[nodiscard]] std::size_t bin_of(float confidence) const;
     BlockPolicy policy_;
     BlockForward& forward_;
+    std::function<double(std::uint32_t)> row_verify_ms_;
+    RowPriorConfig row_cfg_{};
+    std::vector<std::array<double, 2>> bins_;  // decayed (accepted, rejected) per confidence bin
+    std::vector<std::uint32_t> pending_;       // verified proposals of the last model block (labelled on accept)
+    std::vector<float> pending_conf_;
+    std::uint64_t trimmed_ = 0, zero_picks_ = 0;
     std::uint32_t anchor_ = 0;
     std::uint64_t anchor_pos_ = 0;
     std::uint64_t passes_ = 0;
@@ -148,5 +175,76 @@ struct MoeVerifyBytes {
 // absorbed K_b / V_b, BF16 head, F32 router), selected K/V per row, one routed expert of one layer (Q4_K gate + up
 // 1536 x 1536 each, Q6_K down 1536 x 1536 = 4.59 MB), 512 experts top 16 on 41 MoE layers.
 [[nodiscard]] MoeVerifyBytes hy4_verify_bytes();
+
+// Verify cost of a routed-MoE target in the terms a pass actually spends (any backend, any topology):
+//   ms(R) = fixed_ms + trips x trip_ms + per_row_ms x R + per_expert_ms x reads(R)
+// reads(R) = expert-layer reads of the pass: distinct experts of the R rows summed over the MoE layers when the kernel
+// groups the rows' experts (grouped), top_k x layers x R when it reads every row's experts. Exchanges are paid once per
+// pass. Scheduling only: tokens never change.
+struct MoeVerifyCost {
+    double fixed_ms = 0.0;       // per pass: weights read once + launch boundaries + host
+    double per_expert_ms = 0.0;  // one routed expert of one layer
+    double per_row_ms = 0.0;     // per verify row (selected K/V, activations)
+    std::uint32_t experts = 0, top_k = 0, layers = 0;
+    double trip_ms = 0.0;        // one rank exchange
+    std::uint32_t trips = 0;     // exchanges per pass (0 on one node)
+    bool grouped = true;
+};
+// Seed from bytes: every rank reads 1 / ranks of every weight (TP), plain_ms is the R = 1 wall of that topology and fixes
+// fixed_ms. One node, grouped: seed_ms(c, R) equals moe_verify_seed_ms(m, plain_ms, gbps, R)[R - 1].
+// Throws std::invalid_argument on a bad geometry or when the bytes of one row exceed the wall.
+[[nodiscard]] MoeVerifyCost moe_verify_cost(const MoeVerifyBytes& m, double plain_ms, double gbps, std::uint32_t ranks = 1,
+                                            double trip_ms = 0.0, std::uint32_t trips = 0, bool grouped = true);
+// Prior reads of R rows: grouped = layers x uniform_distinct_experts (an upper bound: adjacent tokens share experts),
+// ungrouped = layers x top_k x R.
+[[nodiscard]] double prior_reads(const MoeVerifyCost& c, std::uint32_t rows);
+[[nodiscard]] double verify_ms(const MoeVerifyCost& c, std::uint32_t rows, double reads);
+[[nodiscard]] inline double seed_ms(const MoeVerifyCost& c, std::uint32_t rows) {
+    return verify_ms(c, rows, prior_reads(c, rows));
+}
+
+// The cost learned online from the walls: a ridge fit of (fixed + trips x trip, per_row, per_expert) toward the seed with
+// forgetting, on the reads the engine counted in each pass. A direction the walls do not identify (an ungrouped kernel
+// has reads proportional to R; a single window) keeps the seed's split while the price at the observed rows follows the
+// walls, so an ill-conditioned fit never invents a slope (kvcost2: collinear online fits). A wall off the prediction by
+// more than `clip` is skipped once and clipped when it repeats (one stall cannot move the price). reads(R) is learned per
+// content as a ratio to the prior (route overlap of adjacent rows) and extends to an unseen R from the nearest seen R.
+// Bind: BlockConfig::fixed_costs = true and BlockDrafter::seed_verify_ms(R, table[R - 1]) after every observe (the
+// Arbiter's context term stays on top). Deterministic: a fixed sequence of observations gives bitwise the same prices.
+struct MoeFitConfig {
+    double half_life = 64.0;        // passes: an older wall weighs half after this many
+    double ridge = 4.0;             // pass-equivalents pulling the per-row and per-expert slopes toward the seed
+    double ridge_fixed = 0.01;      // the same for the per-pass term: the first wall sets the scale, the seed the shape
+    double clip = 0.25;             // relative residual beyond which a wall is skipped once / clipped on repeat
+    double reads_half_life = 32.0;  // passes: route-overlap ratio per R
+};
+class MoeVerifyFit {
+public:
+    explicit MoeVerifyFit(const MoeVerifyCost& seed, MoeFitConfig config = {});
+    void observe(std::uint32_t rows, double reads, double ms);
+    void observe(std::uint32_t rows, double ms) { observe(rows, reads(rows), ms); }  // engine without a read counter
+    [[nodiscard]] double reads(std::uint32_t rows) const;      // learned, else the prior
+    [[nodiscard]] double verify_ms(std::uint32_t rows) const;  // fitted at reads(rows), non-decreasing in rows
+    [[nodiscard]] std::vector<double> table(std::uint32_t rows) const;  // [R - 1] = verify_ms(R), R = 1 .. rows
+    [[nodiscard]] const MoeVerifyCost& seed() const { return seed_; }
+    [[nodiscard]] MoeVerifyCost current() const;  // seed geometry and trips with the fitted coefficients
+    [[nodiscard]] std::uint64_t passes() const { return passes_; }
+    [[nodiscard]] std::uint64_t skipped() const { return skipped_; }
+
+    static constexpr std::uint32_t max_rows = 32;
+
+private:
+    [[nodiscard]] double raw_ms(std::uint32_t rows, double reads) const;
+    void solve();
+    MoeVerifyCost seed_;
+    MoeFitConfig config_;
+    double unit_reads_ = 1.0;                    // reads of one row (top_k x layers): feature scale
+    std::array<double, 3> theta0_{}, theta_{};   // (fixed + trips x trip, per_row, per_expert x unit_reads_)
+    std::array<double, 9> xx_{};
+    std::array<double, 3> xy_{};
+    std::array<double, max_rows + 1> ratio_{}, ratio_w_{};  // [R]: observed / prior reads
+    std::uint64_t passes_ = 0, skipped_ = 0;
+    bool last_skipped_ = false;
+};
 
 }  // namespace strix::spec
