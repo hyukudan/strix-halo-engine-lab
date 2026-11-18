@@ -73,6 +73,9 @@ struct VerifyRows {
     float *g = nullptr, *up = nullptr, *act = nullptr, *rlog = nullptr, *rw = nullptr, *z = nullptr, *rawdots = nullptr,
           *acc = nullptr, *routed = nullptr, *shared = nullptr, *logits = nullptr;
     std::uint32_t *ids = nullptr, *dpos = nullptr;
+    // routed experts of the window in the shared A8 union rows form (strix/moe/expert_union.hpp): per-row A8 scratch + plan
+    std::uint8_t *ucodes = nullptr, *udeltas = nullptr, *usums = nullptr, *upout = nullptr, *udcodes = nullptr,
+                 *uddeltas = nullptr, *udsums = nullptr, *uplan = nullptr;
     std::uint8_t* greedy_partials = nullptr;
     std::uint64_t greedy_bytes = 0;
     std::size_t engram_row_bytes = 0;
@@ -99,6 +102,14 @@ void allocate_verify() {
     vr.g = alloc<float>(R * ff); vr.up = alloc<float>(R * ff); vr.act = alloc<float>(R * ff);
     vr.rlog = alloc<float>(R * c.experts); vr.rw = alloc<float>(R * K); vr.ids = alloc<std::uint32_t>(R * K);
     vr.z = alloc<float>(R * L); vr.rawdots = alloc<float>(R * K * L); vr.acc = alloc<float>(R * L);
+    {
+        const std::size_t I = c.expert_ff;
+        vr.ucodes = alloc<std::uint8_t>(R * L); vr.udeltas = alloc<std::uint8_t>(R * (L / 32U) * 4U);
+        vr.usums = alloc<std::uint8_t>(R * (L / 32U) * 4U); vr.upout = alloc<std::uint8_t>(R * K * 2U * I * 4U);
+        vr.udcodes = alloc<std::uint8_t>(R * K * I); vr.uddeltas = alloc<std::uint8_t>(R * K * (I / 32U) * 4U);
+        vr.udsums = alloc<std::uint8_t>(R * K * (I / 32U) * 4U);
+        vr.uplan = alloc<std::uint8_t>(strix::moe::expert_union::plan_bytes);
+    }
     vr.routed = alloc<float>(R * h); vr.shared = alloc<float>(R * h);
     vr.dpos = alloc<std::uint32_t>(4U * R);
     vr.pos_host = static_cast<std::uint32_t*>(vr.pos_pin.get(4U * R * sizeof(std::uint32_t), hipHostMallocDefault));
@@ -321,6 +332,41 @@ void expert_row(std::uint32_t l, const float* z_r, const std::uint32_t* ids_r, f
     a8::enqueue_down_rawdots(dq, db, s);
 }
 
+// The window's routed experts in the shared union rows form: every distinct expert of the R rows is read once (Q4_K gate / up,
+// K-quant down) and the rows that chose it are computed with their own A8 codes: raw[r][K][latent] bitwise == expert_row(r)
+// for every r (tests/hip_moe_a8_union_tests.hip); 5 launches per layer instead of 5 x R.
+void expert_rows_union(std::uint32_t l, std::uint32_t R) {
+    const auto& wg = t(blk(l, "ffn_gate_exps.weight"));
+    const auto& wu = t(blk(l, "ffn_up_exps.weight"));
+    const auto& wd = t(blk(l, "ffn_down_exps.weight"));
+    std::uint32_t* const ps = dstatus_all + 8U * std::size_t{l};
+    std::uint32_t* const ds = ps + 4;
+    const auto dev = [](const void* p, std::uint64_t bytes) { return a8::DeviceBytes{reinterpret_cast<std::uintptr_t>(p), bytes}; };
+    const std::uint64_t K = c.top_k, I = c.expert_ff, L = c.latent, n = R;
+    const a8::DeviceBytes plan = dev(vr.uplan, strix::moe::expert_union::plan_bytes);
+    a8::Request rq;
+    rq.enabled = true;
+    rq.approved_numerical_identity = a8::numerical_identity_for_gate_type(wg.type);
+    rq.input = a8::InputKind::fp32;
+    rq.shape = {c.latent, c.expert_ff, c.experts, c.top_k, R};
+    rq.gate_type = wg.type;
+    rq.up_type = wu.type;
+    a8::Bindings b{dev(vr.z, n * L * 4U), dev(wg.p, wg.bytes), dev(wu.p, wu.bytes), dev(vr.ids, n * K * 4U), dev(vr.ucodes, n * L),
+                   dev(vr.udeltas, n * (L / 32U) * 4U), dev(vr.usums, n * (L / 32U) * 4U), dev(ps, 4U), dev(vr.upout, n * K * 2U * I * 4U)};
+    a8::enqueue_probe_union(rq, b, plan, s);
+    a8::DownRequest dq;
+    dq.enabled = true;
+    dq.approved_numerical_identity = a8::down_numerical_identity(wd.type);
+    dq.shape = {c.latent, c.expert_ff, c.experts, c.top_k};
+    dq.weight_type = wd.type;
+    dq.swiglu_limit = c.swiglu_limit;
+    a8::DownBindings db{dev(vr.upout, n * K * 2U * I * 4U), dev(wd.p, wd.bytes), dev(vr.ids, n * K * 4U), dev(vr.udcodes, n * K * I),
+                        dev(vr.uddeltas, n * K * (I / 32U) * 4U), dev(vr.udsums, n * K * (I / 32U) * 4U),
+                        dev(vr.rawdots, n * K * L * 4U), dev(ds, 4U), {0U, 0U}};
+    a8::enqueue_down_activation_quantize_union(dq, db, R, plan, s);
+    a8::enqueue_down_rawdots_union(dq, db, R, plan, s);
+}
+
 void ffn_vrows(std::uint32_t l, std::uint32_t R) {  // vr.xn -> vr.f
     const std::uint32_t h = c.hidden;
     if (c.dense[l]) {
@@ -333,7 +379,13 @@ void ffn_vrows(std::uint32_t l, std::uint32_t R) {  // vr.xn -> vr.f
         linear_vrows(blk(l, "ffn_gate_inp.weight"), vr.xn, h, c.experts, R, vr.rlog, false);
         strix::moe_core::enqueue_route_wave<strix::moe::preset::hy4, DeclaredMath>(vr.rlog, t(blk(l, "exp_probs_b.bias")).f(), vr.ids, vr.rw, R, s);
         linear_vrows(blk(l, "ffn_routed_down.weight"), vr.xn, h, c.latent, R, vr.z);
-        for (std::uint32_t r = 0; r < R; ++r) expert_row(l, vr.z + r * L, vr.ids + r * K, vr.rawdots + r * K * L);
+        // STRIX_HY4_ROWS_EXPERT_UNION=1: the shared union rows form (bitwise == the per-row loop); off until its ticket measures it.
+        static const bool expert_union = strix::envcfg::flag("STRIX_HY4_ROWS_EXPERT_UNION", false);
+        const bool kquant_down = t(blk(l, "ffn_down_exps.weight")).type == 12U || t(blk(l, "ffn_down_exps.weight")).type == 14U;
+        if (expert_union && R > 1U && t(blk(l, "ffn_gate_exps.weight")).type == 12U && kquant_down)
+            expert_rows_union(l, R);
+        else
+            for (std::uint32_t r = 0; r < R; ++r) expert_row(l, vr.z + r * L, vr.ids + r * K, vr.rawdots + r * K * L);
         glu::launch_epilogue<glu::Round::bf16>(vr.rawdots, nullptr, L, R * K * L, vr.rawdots, s);  // each expert's down output
         strix::moe_core::enqueue_combine<strix::moe::CombineForm::bf16_steps, 16U, 1536U>(vr.rw, vr.rawdots, nullptr, vr.acc, R, s);
         linear_vrows(blk(l, "ffn_routed_up.weight"), vr.acc, c.latent, h, R, vr.routed);
