@@ -131,9 +131,9 @@ int main() {
             check(rejects([&] { (void)q::parse_prefill_norm_fold(bad); }), "prefill-norm-fold rejects other spellings");
         q::EngineOptions f = a;
         f.prefill_arith = q::PrefillArith::fast4;
-        check(!f.prefill_norm_fold, "prefill-norm-fold opt-in until measured");
+        check(f.prefill_norm_fold, "prefill-norm-fold default on (bitwise, measured)");
         const std::string off_id = engine_identity(f);
-        f.prefill_norm_fold = true;
+        f.prefill_norm_fold = false;
         check(engine_identity(f) == off_id, "prefill-norm-fold keeps the FAST4 identity (bitwise)");
     }
     check(portable_sampler() == 0, "POSIX clock sampler compiles and closes");

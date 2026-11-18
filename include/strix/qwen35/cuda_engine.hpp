@@ -78,9 +78,9 @@ struct EngineOptions {
     PrefillArith prefill_arith = PrefillArith::exact;
     PrefillGdn prefill_gdn = PrefillGdn::serial;  // ignored (and not in the identity) under prefill_arith exact
     // FAST4 only: the hidden RMSNorms (attn / post) are folded into the A-operand quantiser (cuda_core dense_big_norm_split4), so
-    // no f32 normalised rows are written and re-read. Bitwise equal to rmsnorm + quantise (no identity suffix); a non-FAST4 consumer
-    // gets the f32 rows materialised on demand. Opt-in until its identity + timing run on the device.
-    bool prefill_norm_fold = false;
+    // no f32 normalised rows are written and re-read. Bitwise equal to norm + quantise (no identity suffix); a non-FAST4 consumer gets the f32 rows materialised on demand.
+    // Default on: identity PASS + strict A/B x3 on the device (8K FAST4 + chunk16 -4.4 %); --prefill-norm-fold off is the rollback.
+    bool prefill_norm_fold = true;
     std::uint32_t prefill_chunk = 2048;  // rows per large-M chunk (multiple of 128, <= 8192); buffers are allocated on first use
     // Wave-aligned steps (strix/wave_fit.hpp, scheduling only, bitwise): prompts of >= this many tokens step by the largest
     // rows <= prefill_chunk whose flash grid fills whole waves (4096 -> 3968 on 188 SMs: flash +16 % at 128K, bench). 0 = off
