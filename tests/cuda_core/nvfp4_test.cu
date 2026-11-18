@@ -302,7 +302,8 @@ static void bench() {
 
 // Programmatic dependent launch + L2 prefetch on fp4_gemv / fp4_reduce are scheduling only: a dependent chain
 // A(x) -> B(a) + x -> gate/up(b) -> A(b) -> B(a) + b -> gate/up(b2) run with PDL on (stream, then a CUDA graph replayed
-// three times) must equal the serialised form (PDL off) bit for bit; rows 1/8/16, ks 40/48/40 and ks 1 (split target 1).
+// three times) must equal the serialised form (PDL off) bit for bit; rows 1/8/16/24/32, ks 40/48/40 and ks 1 (split target 1),
+// plain and with a spin kernel forcing the pre-wait overlap at each of the six calls. Why this is complete: common.cuh.
 static cc::DenseWeight make_weight(std::uint32_t out, std::uint32_t in, std::mt19937& rng, std::vector<void*>& owned) {
     std::normal_distribution<float> nd(0.f, 0.02f);
     std::vector<float> w(static_cast<std::size_t>(out) * in);
@@ -325,7 +326,86 @@ static cc::DenseWeight make_weight(std::uint32_t out, std::uint32_t in, std::mt1
     return W;
 }
 
+// Test-only PDL helpers. g_test_pdl mirrors cc::set_programmatic_launch for the test kernels below.
+static bool g_test_pdl = false;
+__device__ __forceinline__ void t_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
+__device__ __forceinline__ void t_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+__device__ __forceinline__ void t_spin(unsigned long long ns) {
+    unsigned long long t0, t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    do asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); while (t - t0 < ns);
+}
+// Releases its successor at entry, waits for its predecessor (keeps the chain transitive), then spins: every kernel behind
+// it that may run code before its own wait runs that code now, while nothing after this point has been written yet.
+__global__ void pdl_spin_kernel(unsigned long long ns) {
+    t_trigger();
+    t_wait();
+    t_spin(ns);
+}
+// Negative control: the writer releases at entry and writes after a spin; reader_early reads BEFORE its wait (contract
+// violation), reader_late after it.
+__global__ void hz_writer(float* buf, unsigned long long ns) {
+    t_trigger();
+    t_wait();
+    t_spin(ns);
+    buf[0] = 1.f;
+}
+__global__ void hz_reader(const float* buf, float* out, int early) {
+    float v = early ? *static_cast<const volatile float*>(buf) : 0.f;
+    t_trigger();
+    t_wait();
+    out[0] = early ? v : buf[0];
+}
+template <class... K, class... A>
+static cudaError_t launch_test(void (*k)(K...), cudaStream_t s, A... a) {
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = dim3(1);
+    cfg.blockDim = dim3(32);
+    cfg.stream = s;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = at;
+    cfg.numAttrs = g_test_pdl ? 1 : 0;
+    return cudaLaunchKernelEx(&cfg, k, static_cast<K>(a)...);
+}
+
+// The stress below can only prove something if a pre-wait read of a predecessor's output IS caught: with PDL the early reader
+// must see the old value (0), the late reader and the serial form the new one (1).
+static void pdl_hazard_control() {
+    cudaStream_t s;
+    CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+    float *buf, *out;
+    CK(cudaMalloc(&buf, 4));
+    CK(cudaMalloc(&out, 4));
+    auto run = [&](bool pdl, int early) {
+        g_test_pdl = pdl;
+        CK(cudaMemsetAsync(buf, 0, 4, s));
+        CK(cudaMemsetAsync(out, 0xFF, 4, s));
+        CK(launch_test(hz_writer, s, buf, 200000ull));
+        CK(launch_test(hz_reader, s, static_cast<const float*>(buf), out, early));
+        float v = -1.f;
+        CK(cudaMemcpyAsync(&v, out, 4, cudaMemcpyDeviceToHost, s));
+        CK(cudaStreamSynchronize(s));
+        g_test_pdl = false;
+        return v;
+    };
+    const float serial_early = run(false, 1), pdl_early = run(true, 1), pdl_late = run(true, 0);
+    std::printf("-- pdl hazard control: serial early %g, pdl early %g, pdl late %g\n", static_cast<double>(serial_early),
+                static_cast<double>(pdl_early), static_cast<double>(pdl_late));
+    expect(serial_early == 1.f && pdl_early == 0.f && pdl_late == 1.f,
+           "pdl hazard control: a read before the wait is caught (pdl early 0), after the wait is not (1)");
+    CK(cudaFree(buf));
+    CK(cudaFree(out));
+    CK(cudaStreamDestroy(s));
+}
+
 static void test_pdl_chain(std::uint32_t split_target, std::mt19937& rng) {
+    static bool control_done = false;
+    if (!control_done) {
+        control_done = true;
+        pdl_hazard_control();
+    }
     constexpr std::uint32_t kH = 5120, kI = 6144, kF = 1024;
     std::vector<void*> owned;
     const cc::DenseWeight A = make_weight(kI, kH, rng, owned), B = make_weight(kH, kI, rng, owned);
@@ -347,26 +427,45 @@ static void test_pdl_chain(std::uint32_t split_target, std::mt19937& rng) {
         CK(cudaMalloc(&db, nb * 4));
         CK(cudaMalloc(&db2, nb * 4));
         CK(cudaMalloc(&dc, nc * 4));
-        CK(cudaMemcpy(dx, x.data(), nb * 4, cudaMemcpyHostToDevice));
-        auto chain = [&]() {
-            CK(cc::nvfp4_dense_rows(A, dx, da, rows, nullptr, s));
-            CK(cc::nvfp4_dense_rows(B, da, db, rows, dx, s));
-            CK(cc::nvfp4_gate_up_silu_rows(G, U, db, dc, rows, s));
-            CK(cc::nvfp4_dense_rows(A, db, da, rows, nullptr, s));
-            CK(cc::nvfp4_dense_rows(B, da, db2, rows, db, s));
-            CK(cc::nvfp4_gate_up_silu_rows(G, U, db2, dc, rows, s));
-        };
-        auto snap = [&]() {
-            CK(cudaStreamSynchronize(s));
-            std::vector<float> o(na + 2 * nb + nc);
-            CK(cudaMemcpy(o.data(), da, na * 4, cudaMemcpyDeviceToHost));
-            CK(cudaMemcpy(o.data() + na, db, nb * 4, cudaMemcpyDeviceToHost));
-            CK(cudaMemcpy(o.data() + na + nb, db2, nb * 4, cudaMemcpyDeviceToHost));
-            CK(cudaMemcpy(o.data() + na + 2 * nb, dc, nc * 4, cudaMemcpyDeviceToHost));
-            CK(cudaMemsetAsync(da, 0xFF, na * 4, s));  // poison: a skipped or early write cannot pass
+        // Everything on s and synchronised: s is NonBlocking, so a legacy-stream cudaMemcpy from pageable memory is NOT
+        // ordered before work on s (its DMA may still be in flight when it returns). That let the serial reference read dx
+        // before it landed (RTX chains 10:40 / 11:10: serial NaN or different in every element, PDL runs stable).
+        CK(cudaMemcpyAsync(dx, x.data(), nb * 4, cudaMemcpyHostToDevice, s));
+        auto poison = [&]() {  // a skipped write, or a read before the producer wrote, cannot pass
+            CK(cudaMemsetAsync(da, 0xFF, na * 4, s));
             CK(cudaMemsetAsync(db, 0xFF, nb * 4, s));
             CK(cudaMemsetAsync(db2, 0xFF, nb * 4, s));
             CK(cudaMemsetAsync(dc, 0xFF, nc * 4, s));
+        };
+        poison();
+        CK(cudaStreamSynchronize(s));
+        // spin_at k (0..5): a PDL spin kernel before call k, so every kernel from k on that may run before its wait does so
+        // while k's inputs are still being produced / poisoned (forced overlap, not left to timing). -1: plain chain.
+        auto chain = [&](int spin_at) {
+            auto spin = [&](int here) {
+                if (spin_at == here) CK(launch_test(pdl_spin_kernel, s, 50000ull));
+            };
+            spin(0);
+            CK(cc::nvfp4_dense_rows(A, dx, da, rows, nullptr, s));
+            spin(1);
+            CK(cc::nvfp4_dense_rows(B, da, db, rows, dx, s));
+            spin(2);
+            CK(cc::nvfp4_gate_up_silu_rows(G, U, db, dc, rows, s));
+            spin(3);
+            CK(cc::nvfp4_dense_rows(A, db, da, rows, nullptr, s));
+            spin(4);
+            CK(cc::nvfp4_dense_rows(B, da, db2, rows, db, s));
+            spin(5);
+            CK(cc::nvfp4_gate_up_silu_rows(G, U, db2, dc, rows, s));
+        };
+        auto snap = [&]() {
+            std::vector<float> o(na + 2 * nb + nc);
+            CK(cudaMemcpyAsync(o.data(), da, na * 4, cudaMemcpyDeviceToHost, s));
+            CK(cudaMemcpyAsync(o.data() + na, db, nb * 4, cudaMemcpyDeviceToHost, s));
+            CK(cudaMemcpyAsync(o.data() + na + nb, db2, nb * 4, cudaMemcpyDeviceToHost, s));
+            CK(cudaMemcpyAsync(o.data() + na + 2 * nb, dc, nc * 4, cudaMemcpyDeviceToHost, s));
+            CK(cudaStreamSynchronize(s));
+            poison();
             return o;
         };
         // Compares one run with the serial reference; on a difference prints, per output buffer (da = K1/K4, db = K2,
@@ -392,32 +491,48 @@ static void test_pdl_chain(std::uint32_t split_target, std::mt19937& rng) {
             }
             return false;
         };
-        cc::set_programmatic_launch(false);
-        chain();
+        auto set_pdl = [](bool on) {
+            cc::set_programmatic_launch(on);
+            g_test_pdl = on;
+        };
+        set_pdl(false);
+        chain(-1);
         const std::vector<float> ref = snap();
-        cc::set_programmatic_launch(true);
+        chain(2);  // the serial form with a spin in the middle: a second, independent reference
+        const bool ref_ok = same(snap(), ref, "serial2", 0);
+        char what[200];
+        std::snprintf(what, sizeof what, "pdl chain rows %u split target %u: serial reference stable (x2)", rows, split_target);
+        expect(ref_ok, what);
+        set_pdl(true);
         bool stream_ok = true;
-        for (int rep = 0; rep < 4; ++rep) {  // repeated: the failure this guards against is timing-dependent
-            chain();
+        for (int rep = 0; rep < 4; ++rep) {
+            chain(-1);
             stream_ok = same(snap(), ref, "stream", rep) && stream_ok;
         }
-        cudaGraph_t g;
-        cudaGraphExec_t ge;
-        CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
-        chain();
-        CK(cudaStreamEndCapture(s, &g));
-        CK(cudaGraphInstantiate(&ge, g, 0));
-        bool graph_ok = true;
-        for (int rep = 0; rep < 3; ++rep) {
-            CK(cudaGraphLaunch(ge, s));
-            graph_ok = same(snap(), ref, "graph", rep) && graph_ok;
+        for (int at = 0; at < 6; ++at) {  // forced overlap: spin before each call in turn
+            chain(at);
+            stream_ok = same(snap(), ref, "stream-spin", at) && stream_ok;
         }
-        CK(cudaGraphExecDestroy(ge));
-        CK(cudaGraphDestroy(g));
-        char what[160];
-        std::snprintf(what, sizeof what, "pdl chain rows %u split target %u: stream x4 == serial, graph x3 == serial", rows,
+        bool graph_ok = true;
+        for (int at = -1; at < 6; ++at) {
+            cudaGraph_t g;
+            cudaGraphExec_t ge;
+            CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+            chain(at);
+            CK(cudaStreamEndCapture(s, &g));
+            CK(cudaGraphInstantiate(&ge, g, 0));
+            for (int rep = 0; rep < (at < 0 ? 3 : 1); ++rep) {
+                CK(cudaGraphLaunch(ge, s));
+                graph_ok = same(snap(), ref, at < 0 ? "graph" : "graph-spin", at < 0 ? rep : at) && graph_ok;
+            }
+            CK(cudaGraphExecDestroy(ge));
+            CK(cudaGraphDestroy(g));
+        }
+        std::snprintf(what, sizeof what,
+                      "pdl chain rows %u split target %u: stream x4 + spin x6 == serial, graph x3 + spin x6 == serial", rows,
                       split_target);
         expect(stream_ok && graph_ok, what);
+        CK(cudaStreamSynchronize(s));  // the poison memsets of the last snap() are still queued on s
         for (float* p : {dx, da, db, db2, dc}) CK(cudaFree(p));
     }
     CK(cudaStreamSynchronize(s));

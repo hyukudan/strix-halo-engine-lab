@@ -13,11 +13,14 @@ namespace strix::cuda_core {
 // finished (once every predecessor block has called pdl_trigger or exited); it MUST call pdl_wait() before reading anything the
 // predecessor wrote or writing anything the predecessor reads. Work before pdl_wait may only touch constant data (weights, committed
 // state that nothing in the same graph writes). pdl_wait returns after the predecessor grid completed and its writes are visible.
-// Depth rule: call pdl_trigger AFTER pdl_wait. Then a successor can launch only once its predecessor's predecessor completed,
-// so at most one kernel runs ahead (pre-wait, constants only). A trigger before the wait lets a whole chain of small grids be
-// launched while an earlier kernel still streams a buffer that a later kernel rewrites and a still later one reads: the NVFP4
-// chain (nvfp4_test test_pdl_chain, ks 1, rows 16) then differed from serial order. Kernels still triggering at entry
-// (rope, norms, attention, gdn, dense, dense_mma) follow this rule as their owners move them.
+// Why that is enough at any chain depth (transitivity): if every PDL kernel reaches pdl_wait in at least one block of every
+// launch (an early `return` before it is allowed only for blocks that cannot be all of the grid), then "K_n completed" implies
+// "K_n-1 completed", so when K_n passes its wait every earlier kernel has completed and is visible. Only pre-wait code ever
+// overlaps earlier kernels, and it touches constants only. The two conditions per kernel are the whole correctness contract;
+// no pair table is needed and pdl_trigger placement does not affect correctness. Trigger placement is a resource choice: after
+// the wait, at most one kernel sits in its pre-wait region (bounds the weight prefetch held in L2: fp4_gemv); at entry, a
+// chain of small grids can all sit pre-wait at once. Proof by test: nvfp4_test test_pdl_chain forces the overlap with a spin
+// kernel before each call, and its hazard control shows a pre-wait read of a predecessor's output is caught.
 __device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 
