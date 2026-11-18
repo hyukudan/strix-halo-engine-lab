@@ -565,6 +565,11 @@ int main(int argc, char** argv) {
         test_shape(48, 5120, rng);
         test_shape(1024, 6144, rng);
         test_shape(5120, 17408, rng);
+        if (fast_split) {  // shapes with a FAST row: host reference + rows 1..32 invariance at the FAST split factor
+            std::printf("fast split: ks 5120x6144 %u, 6144x5120 %u\n", cc::nvfp4_split_k(5120, 6144), cc::nvfp4_split_k(6144, 5120));
+            test_shape(5120, 6144, rng);
+            test_shape(6144, 5120, rng);
+        }
         if (argc <= 2) {  // the chain sets its own split targets (argv[2] overrides the target for the shapes/bench)
             std::mt19937 rng2(4321);
             test_pdl_chain(1000, rng2);
