@@ -102,7 +102,7 @@ __global__ void __launch_bounds__(128) conv_pre_kernel(const float* __restrict__
     const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
     float s0 = conv_state[c * 3], s1 = conv_state[c * 3 + 1], s2 = conv_state[c * 3 + 2];  // committed state: written only outside the graph
     pdl_wait();
-    pdl_trigger();  // after the wait: early-launch depth rule (common.cuh)
+    pdl_trigger();  // after the wait: at most one dependent grid waits ahead of the running one
     const bool qk = blockIdx.x < qk_blocks;
     const float scale = blockIdx.x < q_blocks ? qscale : 1.0f;
     constexpr std::uint32_t kB = kConvBatch;
