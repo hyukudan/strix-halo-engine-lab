@@ -1422,6 +1422,12 @@ if(BUILD_TESTING)
     target_compile_features(strix-dense-rows-tile-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-dense-rows-tile-tests)
     add_test(NAME strix-dense-rows-tile-tests COMMAND strix-dense-rows-tile-tests)
+    # Wave form of the head-family dense kernel: leaf map and tree pairs (bits of the single-row reduction).
+    add_executable(strix-dense-rows-wave-tests tests/dense_rows_wave_tests.cpp)
+    target_include_directories(strix-dense-rows-wave-tests PRIVATE include)
+    target_compile_features(strix-dense-rows-wave-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-dense-rows-wave-tests)
+    add_test(NAME strix-dense-rows-wave-tests COMMAND strix-dense-rows-wave-tests)
     add_executable(strix-serve-deepseek-chat-tests tests/serve_deepseek_chat_tests.cpp)
     target_link_libraries(strix-serve-deepseek-chat-tests PRIVATE strix_serve)
     strix_target_warnings(strix-serve-deepseek-chat-tests)
@@ -3593,6 +3599,15 @@ int main() { return 0; }"
         strix_target_warnings(strix-hip-ops-dense-rows-tests)
         add_test(NAME strix-hip-ops-dense-rows-tests COMMAND strix-hip-ops-dense-rows-tests)
         set_tests_properties(strix-hip-ops-dense-rows-tests PROPERTIES SKIP_RETURN_CODE 77)
+        # Wave form of launch_hip_dense_rows rows 1 == block form, batched rmsnorm_row == loop form (bitwise); timing printed.
+        add_executable(strix-hip-dense-rows-wave-tests tests/hip_dense_rows_wave_tests.hip)
+        set_target_properties(strix-hip-dense-rows-wave-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_include_directories(strix-hip-dense-rows-wave-tests PRIVATE include src)
+        target_link_libraries(strix-hip-dense-rows-wave-tests PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-dense-rows-wave-tests)
+        add_test(NAME strix-hip-dense-rows-wave-tests COMMAND strix-hip-dense-rows-wave-tests)
+        set_tests_properties(strix-hip-dense-rows-wave-tests PROPERTIES SKIP_RETURN_CODE 77)
         # Rows tile of launch_hip_dense_rows == one single-row launch per row (bitwise); router timing printed.
         add_executable(strix-hip-dense-rows-tile-tests tests/hip_dense_rows_tile_tests.hip)
         set_target_properties(strix-hip-dense-rows-tile-tests PROPERTIES
