@@ -222,7 +222,9 @@ The MTP target windows of a sidecar recipe (for example
 target organization, and the server checks it before loading the model, naming the missing
 flags: the D1/paired wave8 GDN and A8/grouped Q5_1/slot-parallel-down flags, the six hyper-mix
 flags (window hyper-mix), and `--virtual-q8-lm-head --prefetch-q8-lm-head` (the greedy window
-rows run on that LM head; the automatic owner adds the prefetch itself, an explicit T needs it).
+rows run on that LM head; the automatic owner adds the prefetch itself unless `STRIX_SERVE_ROUTE=0`,
+an explicit T needs it). Runs that build no window (`--mtp-golden-dump`, a fixed single-request
+session) are not held to the hyper-mix and LM-head checks.
 The calibration golden is dumped once with the tiled single-request command, so that its
 calibration rows are those the server replays (a golden from a non-tiled command is refused with
 `calibration row geometry differs`):
@@ -250,7 +252,8 @@ STRIX_SERVE_T16K=0 strix-hip-decode-token MODEL.gguf "${IDS[@]}" --generate 64 \
 
 On one 124 GiB Strix Halo node with the 111.3 GB UD-Q4_K_XL target and the distill-G sidecar,
 the server line reads `Qwen serve-prefill: automatic T8192`, four slots are built and
-`strix serve: listening` follows after 34-94 s (first chat request answered). For an explicit T add
+`strix serve: listening` follows after 37 s (first chat request answered; 34-94 s across the seven
+verified automatic and explicit-T starts). For an explicit T add
 `--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T` with all four
 budgets: workspace at least T x 998,400 bytes (8,178,892,800 at T8192, so 4 GiB is refused
 with the message above and 8 GiB admits it), metadata
