@@ -515,6 +515,90 @@ __global__ void nvfp4_test_epilogue(const float* gate, const float* up, float* y
     if (i < out) y[i] = __fmul_rn(cc::cc_silu(gate[i]), up[i]);
 }
 
+// GDN conv rows across the row-batch boundary (R = 20 > 16 rows per batch): windows of 20 / 1 / 7 rows and the prefill entry
+// give bitwise the same conv output and delta output. Uses only the public API, so the same file builds against the previous
+// serial conv loop: the digest line must be equal between that binary and this one (schedule-only change).
+int test_conv_row_batch() {
+    cc::GdnDims d; d.key_heads = 2; d.value_heads = 6; d.key_dim = 128; d.value_dim = 128;
+    const std::uint32_t C = d.conv_channels(), R = 20, hv = d.value_heads, K = 128;
+    std::vector<float> convw(C * 4), a(hv), dt(hv), ng(128), qkv(R * C), z(R * hv * 128), ar(R * hv), br(R * hv);
+    for (auto& e : convw) e = rnd(0.5f);
+    for (auto& e : a) e = -std::exp(rnd(1.0f));
+    for (auto& e : dt) e = rnd(1.0f);
+    for (auto& e : ng) e = 0.5f + rnd(0.3f);
+    for (auto& e : qkv) e = rnd(1.0f);
+    for (auto& e : z) e = rnd(1.0f);
+    for (auto& e : ar) e = rnd(1.0f);
+    for (auto& e : br) e = rnd(1.0f);
+    std::vector<float> s0(static_cast<std::size_t>(hv) * K * K), cs0(C * 3);
+    for (auto& e : s0) e = rnd(0.2f);
+    for (auto& e : cs0) e = rnd(0.5f);
+    auto *dcw = dev(convw), *da = dev(a), *ddt = dev(dt), *dng = dev(ng), *dz = dev(z), *dar = dev(ar), *dbr = dev(br);
+    cc::GdnLayer L{dcw, da, ddt, dng};
+    // chunk == 0: prefill entry over all R rows. Returns 0, or 2 on a CUDA error (CK).
+    auto run = [&](std::uint32_t chunk, std::vector<float>& qcv, std::vector<float>& outv) -> int {
+        std::vector<float> two(2 * s0.size(), 0.0f);
+        std::copy(s0.begin(), s0.end(), two.begin());
+        auto *draw = dev(qkv), *dqc = devz<float>(R * C), *dout = devz<float>(R * hv * 128), *dst = dev(two), *dcs = dev(cs0);
+        auto* dpar = devz<std::uint32_t>(1);
+        if (chunk == 0) {
+            cc::GdnWindow w{draw, dqc, dar, dbr};
+            CK(cc::gdn_prefill_layer(d, L, {dcs, dst}, w, dz, dout, R, 1e-6f, dpar, nullptr));
+        } else {
+            for (std::uint32_t r = 0; r < R; r += chunk) {
+                const std::uint32_t n = std::min(chunk, R - r);
+                cc::GdnWindow w{draw + r * C, dqc + r * C, dar + r * hv, dbr + r * hv};
+                CK(cc::gdn_window(d, L, {dcs, dst}, w, dz + r * hv * 128, dout + r * hv * 128, n, 1e-6f, dpar, nullptr));
+                cc::GdnCommitLayer cl{L, {dcs, dst}, w};
+                CK(cc::gdn_commit(d, &cl, 1, n, n, dpar, nullptr));
+            }
+        }
+        CK(cudaDeviceSynchronize());
+        qcv = get(dqc, R * C);
+        outv = get(dout, R * hv * 128);
+        cudaFree(draw); cudaFree(dqc); cudaFree(dout); cudaFree(dst); cudaFree(dcs); cudaFree(dpar);
+        return 0;
+    };
+    std::vector<float> q20, o20, q1, o1, q7, o7, qp, op;
+    if (run(20, q20, o20) | run(1, q1, o1) | run(7, q7, o7) | run(0, qp, op)) return 2;
+    CHECK(bits_equal(q20, q1) && bits_equal(o20, o1), "conv rows=20 vs rows=1 not bitwise");
+    CHECK(bits_equal(q20, q7) && bits_equal(o20, o7), "conv rows=20 vs rows=7 not bitwise");
+    CHECK(bits_equal(q20, qp) && bits_equal(o20, op), "conv prefill vs windows not bitwise");
+    auto fnv = [](const std::vector<float>& v) {
+        std::uint64_t h = 1469598103934665603ull;
+        for (float f : v) { std::uint32_t u; std::memcpy(&u, &f, 4); for (int i = 0; i < 4; ++i) { h ^= (u >> (8 * i)) & 0xffu; h *= 1099511628211ull; } }
+        return static_cast<unsigned long long>(h);
+    };
+    std::printf("conv digest qc %016llx out %016llx\n", fnv(q20), fnv(o20));
+    cudaFree(dcw); cudaFree(da); cudaFree(ddt); cudaFree(dng); cudaFree(dz); cudaFree(dar); cudaFree(dbr);
+    {  // kernel probe at the Qwen 27B dense GDN shape (16 key / 48 value heads): 40 windows of 8 rows, then 40 of 16 rows, no
+       // commit (state unchanged), for an nsys kernel trace of conv_pre_kernel; nothing is checked here.
+        cc::GdnDims P; P.key_heads = 16; P.value_heads = 48; P.key_dim = 128; P.value_dim = 128;
+        const std::uint32_t PC = P.conv_channels(), PR = 16, ph = P.value_heads;
+        std::vector<float> pw(PC * 4), pa(ph), pdt(ph), png(128), praw(PR * PC), pz(PR * ph * 128), par_(PR * ph), pbr(PR * ph);
+        std::vector<float> pst(2 * static_cast<std::size_t>(ph) * K * K), pcs(PC * 3);
+        for (auto* v : {&pw, &pdt, &praw, &pz, &par_, &pbr, &pst, &pcs}) for (auto& e : *v) e = rnd(0.5f);
+        for (auto& e : pa) e = -std::exp(rnd(1.0f));
+        for (auto& e : png) e = 0.5f + rnd(0.3f);
+        auto *dw = dev(pw), *dpa = dev(pa), *dpdt = dev(pdt), *dpng = dev(png), *dpraw = dev(praw), *dpz = dev(pz);
+        auto *dpar_ = dev(par_), *dpbr = dev(pbr), *dpst = dev(pst), *dpcs = dev(pcs);
+        auto *dpqc = devz<float>(PR * PC), *dpout = devz<float>(PR * ph * 128);
+        auto* dpp = devz<std::uint32_t>(1);
+        cc::GdnLayer PL{dw, dpa, dpdt, dpng};
+        cc::GdnWindow pwin{dpraw, dpqc, dpar_, dpbr};
+        for (std::uint32_t rows : {8u, 16u})
+            for (int it = 0; it < 40; ++it) CK(cc::gdn_window(P, PL, {dpcs, dpst}, pwin, dpz, dpout, rows, 1e-6f, dpp, nullptr));
+        CK(cudaDeviceSynchronize());
+        for (void* p : {static_cast<void*>(dw), static_cast<void*>(dpa), static_cast<void*>(dpdt), static_cast<void*>(dpng),
+                        static_cast<void*>(dpraw), static_cast<void*>(dpz), static_cast<void*>(dpar_), static_cast<void*>(dpbr),
+                        static_cast<void*>(dpst), static_cast<void*>(dpcs), static_cast<void*>(dpqc), static_cast<void*>(dpout),
+                        static_cast<void*>(dpp)})
+            cudaFree(p);
+        std::printf("conv probe: 40 windows x rows 8, 16 at 16/48 heads done\n");
+    }
+    return 0;
+}
+
 static int test_nvfp4_fused() {
     constexpr std::uint32_t in = 256;
     cc::nvfp4_set_split_target(0);
@@ -553,7 +637,7 @@ static int test_nvfp4_fused() {
 
 int main() {
     if (cudaSetDevice(0) != cudaSuccess) return 2;
-    int rc = test_dense() | test_norms_rope() | test_norm_batched_loads() | test_attention() | test_attention_schedule() | test_gdn() | test_nvfp4_fused();
+    int rc = test_dense() | test_norms_rope() | test_norm_batched_loads() | test_attention() | test_attention_schedule() | test_gdn() | test_conv_row_batch() | test_nvfp4_fused();
     // repeat determinism is covered by the identical-bits checks (each compares two separate launches)
     std::printf(g_fail || rc ? "cuda_core_test: FAILED (%d checks)\n" : "cuda_core_test: PASS\n", g_fail);
     return (g_fail || rc) ? 1 : 0;
