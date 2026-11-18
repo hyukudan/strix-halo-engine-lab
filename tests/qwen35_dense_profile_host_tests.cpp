@@ -1,7 +1,8 @@
 // CUDA Qwen dense product profile (strix/profiles/qwen_dense_cuda.hpp): one tier word over the shared resolver.
 // Invariants: EXACT (no word, `exact`, `default`) changes no option and prints nothing (effective config byte-identical);
-// FAST turns on exactly the levers qualified for the regime; explicit options override; the decode and the spec CLI
-// resolve split_k identically for every tier; promoting a lever is one `qualified` row; turbo is refused.
+// FAST turns on exactly the levers qualified for the regime (split_k = nvfp4-splitk-fast-v1 on the spec windows route) and
+// prints their identities; `--split-k exact` under fast gives back the EXACT options; explicit options override; the
+// decode and the spec CLI resolve split_k identically except the one named fast-tier case; turbo is refused.
 #include "strix/profiles/qwen_dense_cuda.hpp"
 
 #include <cstdio>
@@ -72,7 +73,8 @@ int main() {
                     check(text.empty(), "EXACT printed profile text (effective config not byte-identical)");
                 }
 
-    // 2. FAST, decode CLI (large prefill), NVFP4 onfly/converted: fast4 + chunk16; attn8 only from 32K; split_k pending.
+    // 2. FAST, decode CLI (large prefill), NVFP4 onfly/converted: fast4 + chunk16; attn8 only from 32K; split_k pending
+    //    there (qualified on the spec windows route only: no composition receipt with fast4 + chunk16).
     for (const auto w : {TurboWeights::onfly, TurboWeights::converted}) {
         std::string text;
         const Options o8 = run(Name::fast, w, qp::Route::large_prefill, 8192, {}, &text);
@@ -81,24 +83,55 @@ int main() {
         check(text.find("prefill_arith = fast4 [profile]") != std::string::npos, "FAST text lists prefill_arith");
         check(text.find("prefill_attn8 = off [pending]") != std::string::npos && text.find("prompt >= 32768") != std::string::npos,
               "FAST text explains attn8 regime");
-        check(text.find("split_k = exact [pending]") != std::string::npos && text.find("no gate receipt yet") != std::string::npos,
+        check(text.find("split_k = exact [pending]") != std::string::npos &&
+                  text.find("qualified only for nvfp4-rtn (onfly/converted) / windows (spec CLI)") != std::string::npos,
               "FAST text explains split_k");
+        check(text.find("prefill_arith = fast4 [profile] fast4 (nvfp4-tile-mma-f32-v1") != std::string::npos,
+              "FAST text prints the identity of an applied lever");
         check(text.find("profile-fingerprint: ") != std::string::npos, "FAST fingerprint line");
         const Options o32 = run(Name::fast, w, qp::Route::large_prefill, 32768);
         check(o32.prefill_arith == PrefillArith::fast4 && o32.prefill_gdn == PrefillGdn::chunk16 && o32.prefill_attn8, "FAST 32K adds attn8");
     }
-    // FAST in unqualified weight regimes and on the spec windows route: nothing changes.
-    for (const auto t : all_t) {
-        for (const auto w : {TurboWeights::off, TurboWeights::native}) {
+    // FAST in unqualified weight regimes: nothing changes on either route.
+    for (const auto t : all_t)
+        for (const auto w : {TurboWeights::off, TurboWeights::native})
+            for (const auto route : all_r) {
+                Options want;
+                want.turbo_weights = w;
+                check(run(Name::fast, w, route, t) == want, "FAST applied a lever in an unqualified weight regime");
+            }
+    // 2b. FAST on the spec windows route, NVFP4 onfly/converted: exactly split_k fast (nvfp4-splitk-fast-v1), at every
+    //     prompt length; the off switch --split-k exact gives back the EXACT options bit for bit.
+    for (const auto t : all_t)
+        for (const auto w : {TurboWeights::onfly, TurboWeights::converted}) {
+            std::string text;
             Options want;
             want.turbo_weights = w;
-            check(run(Name::fast, w, qp::Route::large_prefill, t) == want, "FAST applied in an unqualified weight regime");
+            Options fast_want = want;
+            fast_want.nvfp4_split = Split::fast;
+            check(run(Name::fast, w, qp::Route::windows, t, {}, &text) == fast_want, "FAST windows: split_k fast only");
+            check(text.find("split_k = fast [profile] fast (nvfp4-splitk-fast-v1, identity -skf1)") != std::string::npos,
+                  "FAST windows text names nvfp4-splitk-fast-v1");
+            check(text.find("prefill_") == std::string::npos, "FAST windows text lists a lever not offered there");
+            check(run(Name::fast, w, qp::Route::windows, t, {{"split_k", "exact"}}) == want, "--split-k exact under fast != EXACT");
         }
-        for (const auto w : all_w) {
-            Options want;
-            want.turbo_weights = w;
-            check(run(Name::fast, w, qp::Route::windows, t) == want, "FAST applied a lever on the spec windows route");
+
+    // 2c. Registry: every qualified row names a lever of the table that is offered on its route, carries a receipt, and
+    //     split_k is qualified exactly once (NVFP4 onfly/converted, spec windows route).
+    {
+        int split_rows = 0;
+        for (const auto& q : qp::qualified) {
+            bool in_table = false;
+            for (const auto& lever : qp::table) in_table |= q.lever == lever.name;
+            check(in_table && qp::offered(q.lever, q.route) && !q.receipt.empty(), "qualified row without lever / route / receipt");
+            if (q.lever == "split_k") {
+                ++split_rows;
+                check(q.weights == qp::Weights::nvfp4_rtn && q.route == qp::Route::windows && q.min_prompt_tokens == 0,
+                      "split_k qualified outside its receipt regime");
+            }
+            check(q.weights != qp::Weights::exact_pack && q.weights != qp::Weights::nvfp4_native, "row for an ungated weight source");
         }
+        check(split_rows == 1, "split_k must have exactly one qualified row");
     }
     // quality: no quality rows -> default levers.
     {
@@ -137,11 +170,12 @@ int main() {
         check(throws([] { (void)qp::parse("fastest"); }, "--profile"), "bad profile word");
     }
 
-    // 4. Parity: the decode CLI (large prefill) and the spec CLI (windows) resolve split_k identically for every tier and
-    //    every explicit word, in every weight regime; and after the one-row flip both turn it on under fast.
+    // 4. Parity: the decode CLI (large prefill) and the spec CLI (windows) resolve split_k identically for every explicit
+    //    word and for every tier except fast, in every weight regime. The one named difference: under fast the spec route
+    //    is qualified and the decode route is pending (composition with fast4 + chunk16 not gated). Adding the decode row
+    //    (the one-row flip) makes the two equal again.
     std::vector<qp::Qualified> flipped(std::begin(qp::qualified), std::end(qp::qualified));
     flipped.push_back({"split_k", qp::Weights::nvfp4_rtn, qp::Route::large_prefill, 0, "test"});
-    flipped.push_back({"split_k", qp::Weights::nvfp4_rtn, qp::Route::windows, 0, "test"});
     for (const auto& rows : {std::span<const qp::Qualified>(qp::qualified), std::span<const qp::Qualified>(flipped)})
         for (const auto profile : {std::optional<Name>{}, std::optional<Name>{Name::fast}, std::optional<Name>{Name::quality}})
             for (const char* word : {"", "exact", "fast"})
@@ -149,12 +183,14 @@ int main() {
                     const Pairs cli = *word ? Pairs{{"split_k", word}} : Pairs{};
                     const Split dec = run(profile, w, qp::Route::large_prefill, 8192, cli, nullptr, rows).nvfp4_split;
                     const Split spec = run(profile, w, qp::Route::windows, 8192, cli, nullptr, rows).nvfp4_split;
-                    check(dec == spec, "decode / spec CLI resolve split_k differently");
                     const bool flipped_rows = rows.size() != std::size(qp::qualified);
-                    const bool want_fast = *word ? std::string(word) == "fast"
-                                                 : flipped_rows && profile == Name::fast &&
-                                                       (w == TurboWeights::onfly || w == TurboWeights::converted);
-                    check(dec == (want_fast ? Split::fast : Split::exact), "split_k value per tier / flip row");
+                    const bool rtn = w == TurboWeights::onfly || w == TurboWeights::converted;
+                    const bool fast_tier = !*word && profile == Name::fast && rtn;
+                    const bool want_spec = *word ? std::string(word) == "fast" : fast_tier;
+                    const bool want_dec = *word ? std::string(word) == "fast" : fast_tier && flipped_rows;
+                    check(spec == (want_spec ? Split::fast : Split::exact), "spec CLI split_k value per tier");
+                    check(dec == (want_dec ? Split::fast : Split::exact), "decode CLI split_k value per tier / flip row");
+                    check(dec == spec || (fast_tier && !flipped_rows), "decode / spec CLI differ outside the named case");
                 }
 
     std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "ALL PASS", g_fail);

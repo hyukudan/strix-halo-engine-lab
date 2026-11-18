@@ -57,7 +57,8 @@ inline constexpr Lever table[] = {
     {.name = "split_k", .env = "", .option = "--split-k", .value = {"", "fast", "", ""}, .builtin = "exact",
      .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
      .target = "fast (nvfp4-splitk-fast-v1, identity -skf1)", .off = "exact",
-     .source = "NVFP4 GEMV split-K FAST targets (strix/split_k_policy.hpp); pending gate g1a/g1b + timing"},
+     .source = "NVFP4 GEMV split-K FAST targets (strix/split_k_policy.hpp, 188-SM cc 12.0 rows); gate EXACT -> FAST pooled "
+               "KL 0.00000 top-1 0.9990 dNLL -0.00000; spec verify -0.08 .. -0.12 ms/step (2 ABAB pairs)"},
 };
 
 // Levers that act on the windowed forward_rows path (the spec CLI prefills through it: cuda_spec.hpp prefill). The
@@ -77,9 +78,19 @@ inline constexpr Qualified qualified[] = {
      "52dd7d1f0: FAST4 + chunk16 gate 8K / 32K PASS (converted NVFP4 pack); 8K 13,437-13,714 tok/s"},
     {"prefill_gdn", Weights::nvfp4_rtn, Route::large_prefill, 0, "52dd7d1f0: gated with fast4 (same windows)"},
     {"prefill_attn8", Weights::nvfp4_rtn, Route::large_prefill, 32768,
-     "RTX-CHAIN-1305 rtx_dense6 g32a: 32K 2/2 windows PASS; 8K gate not run"},
-    // nvfp4-splitk-fast-v1: add {"split_k", Weights::nvfp4_rtn, Route::large_prefill, 0, "<g1a/g1b receipt>"} and the same
-    // row with Route::windows when the gate and the timing pass.
+     "with fast4 + chunk16: 32K gate 2/2 windows PASS (KL 0.00589); 8K gate not run"},
+    // nvfp4-splitk-fast-v1 on the spec CLI (converted NVFP4 pack, RTX PRO 6000 at 600 W, greedy, sub15d): quality gate
+    // EXACT -> FAST 4 windows x 512 rows pooled KL 0.00000 (q99 9.5e-06), top-1 0.9990, dNLL -0.00000; spec ids == FAST
+    // serial x1200 on code / think / en / ja; two strict A/B pairs (exact, fast, exact, fast; 3 runs each): verify
+    // 14.068 / 14.079 -> 13.993 / 13.980 ms per step (think), 14.936 / 14.937 -> 14.849 / 14.812 (code); tok/s think
+    // 262.02 / 261.66 -> 263.83 / 263.90, code 334.32 / 333.94 -> 335.53 / 336.18. No other lever is offered on this
+    // route, so FAST-before == EXACT.
+    {"split_k", Weights::nvfp4_rtn, Route::windows, 0,
+     "gate EXACT -> FAST pooled KL 0.00000 top-1 0.9990; spec ids == FAST serial x1200 (4 contents); "
+     "verify -0.6 % think, -0.7 % code (RTX PRO 6000, 600 W)"},
+    // Decode CLI (large prefill) row: NOT added. There `fast` already applies fast4 + chunk16 and the composition
+    // fast4 + chunk16 + skf1 has no joint gate receipt (G1 measured split-K alone, FAST-before == EXACT). Condition to add
+    // {"split_k", Weights::nvfp4_rtn, Route::large_prefill, 0, ...}: a composition gate of that bundle against fast4 + chunk16.
 };
 
 inline bool offered(std::string_view lever, Route route) {
@@ -207,6 +218,7 @@ inline std::string describe(const Resolved& r) {
     if (res.quality_fallback()) out += "    no quality rows for this engine: default levers\n";
     for (const auto& e : res.entries) {
         out += "    " + std::string(e.lever->name) + " = " + e.value + " [" + sp::status_name(e.status) + "]";
+        if (e.status == sp::Status::set) out += " " + std::string(e.lever->target);  // the identity the profile turned on
         if (e.status == sp::Status::pending) out += " pending " + e.target + ": " + e.reason;
         out += "\n";
     }

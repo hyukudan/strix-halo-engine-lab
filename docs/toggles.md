@@ -34,14 +34,15 @@ The CUDA Qwen dense 27B CLIs (`strix-cuda-qwen35-decode`, `strix-cuda-qwen35-spe
 (`exact` = `default`; `turbo` is refused: no TURBO bar for this engine yet). One table, `include/strix/profiles/qwen_dense_cuda.hpp`, resolved by
 the shared resolver for both CLIs: `fast` turns on each lever only in the regime where its gate passed; an explicit option wins and
 `exact` changes nothing (same options, same `--print-effective-config` bytes). Under `fast` the effective config adds a `profile:` block
-(each lever, its status and why a pending row is off) and a `profile-fingerprint`. The engine identity names every applied lever.
+(each lever, its status, the identity a `profile` row turns on, and why a pending row is off) and a `profile-fingerprint`. The engine
+identity names every applied lever.
 
 | Lever (option) | `fast` turns it on when | Off switch |
 |---|---|---|
 | `--prefill-arith fast4` | decode CLI large prefill, `--turbo-weights onfly\|converted` (W4A4 gate 8K/32K passed) | `--prefill-arith exact` |
 | `--prefill-gdn chunk16` | same regime (gated together with FAST4) | `--prefill-gdn serial` |
 | `--prefill-attn8 on` | same regime, prompt of at least 32,768 tokens (32K gate passed; no 8K gate) | `--prefill-attn8 off` |
-| `--split-k fast` | not yet (pending its gate; promoting it is one row in `qualified`) | `--split-k exact` |
+| `--split-k fast` | spec CLI (decode windows), `--turbo-weights onfly\|converted`: FAST `nvfp4-splitk-fast-v1` (gate passed; spec verify 0.6-0.7 % faster). Decode CLI: pending (its `fast` already applies FAST4; that combination has no gate yet) | `--split-k exact` |
 
 The spec CLI prefills through decode windows, so only `split_k` is offered there.
 GLM rank accepts `--profile default|fast|quality` (also `--profile=NAME`); its bare `--profile` still enables kernel timing

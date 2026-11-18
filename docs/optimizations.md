@@ -4915,13 +4915,31 @@ the longest cached prefix of its token ids and prefills only the rest.
 One word selects every FAST lever qualified for the run's regime (weights source, route, prompt length), from the data table
 `include/strix/profiles/qwen_dense_cuda.hpp`, through the shared resolver (`strix::profile::resolve`). Both CLIs resolve the same table.
 
-- **Preconditions:** `fast` applies `--prefill-arith fast4` + `--prefill-gdn chunk16` on the decode CLI's large prefill with `--turbo-weights onfly|converted`, and `--prefill-attn8 on` from 32,768 prompt tokens. Every other regime (exact pack, native NVFP4, the spec CLI's windows) keeps its levers pending and runs exact. `--split-k fast` is pending until its gate. `turbo` is refused.
+- **Preconditions:** `fast` applies `--prefill-arith fast4` + `--prefill-gdn chunk16` on the decode CLI's large prefill with `--turbo-weights onfly|converted`, and `--prefill-attn8 on` from 32,768 prompt tokens. On the spec CLI's decode windows with `--turbo-weights onfly|converted` it applies `--split-k fast` ([split-K FAST](#qwen-dense-cuda-splitk-fast)). Every other regime (exact pack, native NVFP4; split-K on the decode CLI, where `fast` already applies FAST4 and that combination has no gate) keeps its levers pending and runs exact. `turbo` is refused.
 - **Automatic selection:** none outside `--profile fast`; `quality` has no rows here and equals `default`.
-- **Fallback notice:** the `profile:` block of the effective config lists each lever as `profile`, `explicit-cli`, `off` or `pending` with the regime it needs.
-- **Exactness evidence:** `exact` leaves every option and the effective config unchanged (host test `strix-qwen35-dense-profile-host-tests`). FAST levers carry their own identities (`-pf-fast4`, `-gdnc16`, `-a8`, `-skf1`) and their gates: FAST4 + chunk16 8K / 32K passed; attn8 32K passed.
+- **Fallback notice:** the `profile:` block of the effective config lists each lever as `profile` (with the identity it turns on), `explicit-cli`, `off` or `pending` with the regime it needs.
+- **Exactness evidence:** `exact` leaves every option and the effective config unchanged (host test `strix-qwen35-dense-profile-host-tests`). FAST levers carry their own identities (`-pf-fast4`, `-gdnc16`, `-a8`, `-skf1`) and their gates: FAST4 + chunk16 8K / 32K passed; attn8 32K passed; split-K FAST passed.
 - **Off switch:** `--profile exact` (or no word), or the lever's own option (`--prefill-arith exact`, `--prefill-gdn serial`, `--prefill-attn8 off`, `--split-k exact`).
-- **Measured gain:** none of its own (selection only): the levers' figures apply, e.g. FAST4 + chunk16 at 8K 13,437-13,714 tok/s.
+- **Measured gain:** none of its own (selection only): the levers' figures apply, e.g. FAST4 + chunk16 at 8K 13,437-13,714 tok/s; split-K FAST on the spec CLI below.
 - **Implementation / evidence:** [profile table](../include/strix/profiles/qwen_dense_cuda.hpp), [toggles](toggles.md#profiles-exact-vs-fast)
+
+<a id="qwen-dense-cuda-splitk-fast"></a>
+
+### Qwen dense 27B CUDA NVFP4 GEMV split-K FAST (`nvfp4-splitk-fast-v1`)
+
+**Engine:** `qwen-rtx` (dense 27B). **Control:** `--split-k exact|fast` on `strix-cuda-qwen35-decode` and `strix-cuda-qwen35-spec`; `--profile fast` sets `fast` on the spec CLI. **Default:** `exact`. **Class:** FAST (bit-changing, quality-gated).
+
+The NVFP4 GEMV splits K so that a call aims at 1,000 blocks (EXACT `nvfp4-splitk-exact-v1`). FAST keeps the same partial products
+and uses fewer, longer K ranges per block on the shapes where a split-target sweep measured a gain (`include/strix/split_k_policy.hpp`,
+rows for 188 SMs / cc 12.0: four projections at target 250, the fused gate+up pair at 500; the down projection keeps 1,000).
+A device without a row runs the EXACT targets.
+
+- **Preconditions:** NVFP4 weights (`--turbo-weights onfly|converted`); the table rows match the device (RTX PRO 6000 Blackwell).
+- **Automatic selection:** `--profile fast` on the spec CLI (decode windows). On the decode CLI it stays pending: there `fast` already applies FAST4 + chunk16, and that combination has no gate yet.
+- **Exactness evidence:** FAST identity `-skf1`. Gate EXACT -> FAST, 4 windows x 512 rows (converted pack): pooled KL 0.00000 (q99 9.5e-06), top-1 0.9990, dNLL -0.00000 (bar KL <= 0.02, top-1 >= 0.93, dNLL <= 0.01). Spec ids == FAST serial x1200 on code, think, English and Japanese prose; `--split-k exact` ids == the EXACT serial x1200.
+- **Off switch:** `--split-k exact` (also under `--profile fast`), or `--profile exact`.
+- **Measured gain:** RTX PRO 6000 at 600 W, converted NVFP4 pack, greedy spec decode (sub15d), 1,200 tokens, two strict A/B pairs of 3 runs each: think 262.02 / 261.66 -> 263.83 / 263.90 tok/s (+0.7 / +0.9 %), verify 14.07 / 14.08 -> 13.99 / 13.98 ms per step; code 334.32 / 333.94 -> 335.53 / 336.18 tok/s (+0.4 / +0.7 %, within 3x the run spread), verify 14.94 / 14.94 -> 14.85 / 14.81 ms per step. GPU clocks 2,550-2,750 MHz across the four runs.
+- **Implementation / evidence:** [policy](../include/strix/split_k_policy.hpp), [GEMV](../src/cuda_core/dense/nvfp4.cu), [policy test](../tests/split_k_policy_host_tests.cpp), [profile test](../tests/qwen35_dense_profile_host_tests.cpp)
 
 ## Platform (kernel)
 

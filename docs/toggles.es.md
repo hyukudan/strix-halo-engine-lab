@@ -34,14 +34,15 @@ Las CLI CUDA de Qwen denso 27B (`strix-cuda-qwen35-decode`, `strix-cuda-qwen35-s
 (`exact` = `default`; `turbo` se rechaza: este motor aún no tiene barra TURBO). Una sola tabla, `include/strix/profiles/qwen_dense_cuda.hpp`, resuelta por
 el resolvedor compartido para ambas CLI: `fast` enciende cada palanca solo en el régimen donde pasó su gate; una opción explícita gana y
 `exact` no cambia nada (mismas opciones, mismos bytes de `--print-effective-config`). Con `fast` la configuración efectiva añade un bloque
-`profile:` (cada palanca, su estado y por qué una fila pendiente sigue apagada) y un `profile-fingerprint`. La identidad del motor nombra cada palanca aplicada.
+`profile:` (cada palanca, su estado, la identidad que enciende una fila `profile` y por qué una fila pendiente sigue apagada) y un
+`profile-fingerprint`. La identidad del motor nombra cada palanca aplicada.
 
 | Palanca (opción) | `fast` la enciende cuando | Interruptor de apagado |
 |---|---|---|
 | `--prefill-arith fast4` | prefill grande de la CLI de decode, `--turbo-weights onfly\|converted` (gate W4A4 8K/32K superado) | `--prefill-arith exact` |
 | `--prefill-gdn chunk16` | mismo régimen (cualificado junto con FAST4) | `--prefill-gdn serial` |
 | `--prefill-attn8 on` | mismo régimen, prompt de al menos 32.768 tokens (gate 32K superado; sin gate 8K) | `--prefill-attn8 off` |
-| `--split-k fast` | aún no (pendiente de su gate; promoverla es una fila en `qualified`) | `--split-k exact` |
+| `--split-k fast` | CLI spec (ventanas de decode), `--turbo-weights onfly\|converted`: FAST `nvfp4-splitk-fast-v1` (gate superado; verify de spec 0,6-0,7 % más rápido). CLI de decode: pendiente (su `fast` ya aplica FAST4; esa combinación aún no tiene gate) | `--split-k exact` |
 
 La CLI spec hace el prefill con ventanas de decode, así que allí solo se ofrece `split_k`.
 GLM rank acepta `--profile default|fast|quality` (también `--profile=NAME`); `--profile` sin valor sigue activando
