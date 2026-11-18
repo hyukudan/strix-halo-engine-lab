@@ -187,6 +187,9 @@ void invalid() {
     const std::string two = head + "[nodes.a]\nrank = 0\nprofile = \"strix-halo-128\"\n[nodes.b]\nrank = 1\nprofile = \"strix-halo-128\"\n";
     rejects([&] { (void)parse_topology("schema = \"strix-devices-v1\"\n[nodes.a]\nrank = 0\n"); }, "expected strix-topology-v1", "schema");
     rejects([&] { (void)parse_topology(head); }, "nodes: required", "no node");
+    // table() takes the key as a view: a non-table value still names the literal key in the error.
+    rejects([&] { (void)parse_topology(head + "nodes = 3\n"); }, "nodes: expected a table", "nodes not a table");
+    rejects([&] { (void)parse_topology(head + "links = 1\n[nodes.a]\nrank = 0\n"); }, "links: expected a table", "links not a table");
     rejects([&] { (void)parse_topology(head + "[nodes.a]\nrank = 0\ncolour = 1\n"); }, "nodes.a.colour: unknown key", "unknown key");
     rejects([&] { (void)parse_topology(head + "[nodes.a]\nprofile = \"strix-halo-128\"\n"); }, "nodes.a.rank: required", "rank");
     rejects([&] { (void)parse_topology(head + "[nodes.a]\nrank = 1\n"); }, "ranks are 0..0", "rank gap");

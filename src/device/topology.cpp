@@ -37,9 +37,11 @@ constexpr double kGiB = 1073741824.0;
 
 [[noreturn]] void bad(const std::string& key, const std::string& what) { throw std::invalid_argument(key + ": " + what); }
 
-const Table& table(const Value& v, const std::string& key) {
+// The returned reference aliases `v` only. `key` is a view (not a reference bound to a temporary std::string) so a
+// literal key at the call site creates no temporary that the result could appear to outlive.
+const Table& table(const Value& v, std::string_view key) {
     if (const auto* t = std::get_if<Table>(&v.data)) return *t;
-    bad(key, "expected a table");
+    bad(std::string(key), "expected a table");
 }
 std::string string(const Value& v, const std::string& key) {
     if (const auto* s = std::get_if<std::string>(&v.data)) return *s;
