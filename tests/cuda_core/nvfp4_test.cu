@@ -1,5 +1,6 @@
 // NVFP4 (TURBO weights): converter vs host RTN reference, GEMV vs host dequant reference, rows 1..32 bitwise row
 // invariance, and a bandwidth microbench on the 27B shapes. Run: cuda_core_nvfp4_test [--bench-only|--test-only].
+// Cross-kernel weight read-ahead (bitwise + cold chain timing): cuda_core_nvfp4_test --readahead [rows] [window us] [reps].
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -543,12 +544,145 @@ static void ncu_probe(std::uint32_t rows) {
     for (void* q : owned) CK(cudaFree(q));
 }
 
+// Cross-kernel weight read-ahead (nvfp4_set_readahead). S = 3 sets of the verify chain out 6144->5120 -> window ->
+// gate+up 5120->17408 (x2) -> window -> down 17408->5120 (+resid), 168 MB of weights a set (> 3x L2 over the sets, so a
+// set's weights are cold at its turn), captured as ONE graph; the window is a one-block spin of `win_ns` (no memory, as
+// the reduce / norm / recurrent / attention windows). Off vs on: every output bitwise equal (a prefetch has no
+// architectural effect), and the on capture really holds one read-ahead node per GEMV after the first (non-vacuous).
+// Timing: graph replays, us per chain, cold weights.
+static void clone_weight(const cc::DenseWeight& src, cc::DenseWeight& dst, std::vector<void*>& owned) {
+    dst = src;
+    void* p = nullptr;
+    CK(cudaMalloc(&p, cc::nvfp4_bytes(src.out, src.in)));
+    CK(cudaMemcpy(p, src.data, cc::nvfp4_bytes(src.out, src.in), cudaMemcpyDeviceToDevice));
+    owned.push_back(p);
+    dst.data = p;
+}
+
+static void test_readahead(std::uint32_t rows, unsigned long long win_ns, int reps, bool pdl) {
+    constexpr int S = 3;
+    std::mt19937 rng(777);
+    std::vector<void*> owned;
+    struct Set {
+        cc::DenseWeight o, g, u, d;
+        float *h, *hid, *y;
+    };
+    Set base{};
+    base.o = make_weight(5120, 6144, rng, owned);
+    base.g = make_weight(17408, 5120, rng, owned);
+    base.u = make_weight(17408, 5120, rng, owned);
+    base.d = make_weight(5120, 17408, rng, owned);
+    std::vector<Set> sets(S);
+    for (int i = 0; i < S; ++i) {
+        if (i == 0) {
+            sets[0] = base;
+        } else {
+            clone_weight(base.o, sets[i].o, owned);
+            clone_weight(base.g, sets[i].g, owned);
+            clone_weight(base.u, sets[i].u, owned);
+            clone_weight(base.d, sets[i].d, owned);
+        }
+        CK(cudaMalloc(&sets[i].h, static_cast<std::size_t>(rows) * 5120 * 4));
+        CK(cudaMalloc(&sets[i].hid, static_cast<std::size_t>(rows) * 17408 * 4));
+        CK(cudaMalloc(&sets[i].y, static_cast<std::size_t>(rows) * 5120 * 4));
+    }
+    std::vector<float> hx(static_cast<std::size_t>(rows) * 6144);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (float& v : hx) v = nd(rng);
+    float* dx = nullptr;
+    CK(cudaMalloc(&dx, hx.size() * 4));
+    CK(cudaMemcpy(dx, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice));
+    cudaStream_t s;
+    CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+    cc::set_programmatic_launch(pdl);
+    auto chain = [&]() {
+        for (const Set& t : sets) {
+            CK(cc::nvfp4_dense_rows(t.o, dx, t.h, rows, nullptr, s));
+            pdlh::probe_holder<<<1, 32, 0, s>>>(win_ns);
+            CK(cc::nvfp4_gate_up_silu_rows(t.g, t.u, t.h, t.hid, rows, s));
+            pdlh::probe_holder<<<1, 32, 0, s>>>(win_ns);
+            CK(cc::nvfp4_dense_rows(t.d, t.hid, t.y, rows, t.h, s));
+        }
+    };
+    struct Arm {
+        std::size_t nodes = 0;
+        std::uint64_t bytes = 0;
+        double us = 0;
+        std::vector<float> out;
+    } arm[2];
+    for (int m = 0; m < 2; ++m) {
+        cc::nvfp4_set_readahead(m);
+        (void)cc::nvfp4_take_readahead_bytes();
+        cudaGraph_t g;
+        CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+        chain();
+        CK(cudaStreamEndCapture(s, &g));
+        arm[m].bytes = cc::nvfp4_take_readahead_bytes();
+        CK(cudaGraphGetNodes(g, nullptr, &arm[m].nodes));
+        cudaGraphExec_t ge;
+        CK(cudaGraphInstantiate(&ge, g, 0));
+        for (const Set& t : sets)
+            for (float* q : {t.h, t.hid, t.y}) CK(cudaMemsetAsync(q, 0xFF, rows * 4, s));  // poison the first row
+        CK(cudaGraphLaunch(ge, s));
+        CK(cudaStreamSynchronize(s));
+        for (const Set& t : sets) {
+            const std::size_t n0 = arm[m].out.size();
+            arm[m].out.resize(n0 + static_cast<std::size_t>(rows) * (5120 + 17408 + 5120));
+            float* o = arm[m].out.data() + n0;
+            CK(cudaMemcpy(o, t.h, static_cast<std::size_t>(rows) * 5120 * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(o + rows * 5120, t.hid, static_cast<std::size_t>(rows) * 17408 * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(o + rows * (5120 + 17408), t.y, static_cast<std::size_t>(rows) * 5120 * 4, cudaMemcpyDeviceToHost));
+        }
+        cudaEvent_t e0, e1;
+        CK(cudaEventCreate(&e0));
+        CK(cudaEventCreate(&e1));
+        CK(cudaGraphLaunch(ge, s));  // warm the instantiation
+        CK(cudaEventRecord(e0, s));
+        for (int r = 0; r < reps; ++r) CK(cudaGraphLaunch(ge, s));
+        CK(cudaEventRecord(e1, s));
+        CK(cudaEventSynchronize(e1));
+        float ms = 0;
+        CK(cudaEventElapsedTime(&ms, e0, e1));
+        arm[m].us = 1000.0 * ms / (reps * S);
+        CK(cudaEventDestroy(e0));
+        CK(cudaEventDestroy(e1));
+        CK(cudaGraphExecDestroy(ge));
+        CK(cudaGraphDestroy(g));
+    }
+    cc::nvfp4_set_readahead(-1);
+    cc::set_programmatic_launch(true);
+    const bool same = arm[0].out.size() == arm[1].out.size() &&
+                      std::memcmp(arm[0].out.data(), arm[1].out.data(), arm[0].out.size() * 4) == 0;
+    const bool added = arm[0].bytes == 0 && arm[1].bytes > 0 && arm[1].nodes == arm[0].nodes + (3 * S - 1);
+    expect(same, "read-ahead: graph outputs bitwise equal off vs on");
+    expect(added, "read-ahead: one side node per GEMV after the first (on), none (off)");
+    std::printf("RA rows %u win %llu us pdl %d: nodes off %zu on %zu, last head %.1f MB | bitwise %s | off %.2f us on %.2f us "
+                "per chain (%+.1f %%)\n",
+                rows, win_ns / 1000, pdl ? 1 : 0, arm[0].nodes, arm[1].nodes, arm[1].bytes / 1048576.0, same ? "yes" : "NO",
+                arm[0].us, arm[1].us, 100.0 * (arm[1].us - arm[0].us) / arm[0].us);
+    CK(cudaStreamDestroy(s));
+    CK(cudaFree(dx));
+    for (const Set& t : sets)
+        for (float* q : {t.h, t.hid, t.y}) CK(cudaFree(q));
+    for (void* q : owned) CK(cudaFree(q));
+}
+
 int main(int argc, char** argv) {
     const std::string a = argc > 1 ? argv[1] : "";
     if (a == "--ncu-probe") {
         CK(cudaSetDevice(0));
         ncu_probe(argc > 2 ? static_cast<std::uint32_t>(std::atoi(argv[2])) : 8u);
         return 0;
+    }
+    if (a == "--readahead") {  // [rows] [window us] [reps]: both PDL forms, bitwise + timing
+        CK(cudaSetDevice(0));
+        const std::uint32_t rows = argc > 2 ? static_cast<std::uint32_t>(std::atoi(argv[2])) : 8u;
+        const unsigned long long win = argc > 3 ? 1000ull * static_cast<unsigned long long>(std::atoi(argv[3])) : 20000ull;
+        const int reps = argc > 4 ? std::atoi(argv[4]) : 20;
+        test_readahead(rows, win, reps, false);
+        test_readahead(rows, win, reps, true);
+        std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "ALL PASS", g_fail);
+        return g_fail ? 1 : 0;
     }
     // argv[2]: a split target (EXACT policy) or "fast" (the FAST split policy of strix/split_k_policy.hpp for device 0)
     const bool fast_split = argc > 2 && std::string(argv[2]) == "fast";
@@ -574,6 +708,7 @@ int main(int argc, char** argv) {
             std::mt19937 rng2(4321);
             test_pdl_chain(1000, rng2);
             test_pdl_chain(1, rng2);
+            test_readahead(8, 20000ull, 3, false);
         }
         std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "ALL PASS", g_fail);
     }

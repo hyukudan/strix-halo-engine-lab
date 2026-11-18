@@ -4,7 +4,11 @@
 
 #include <cuda_fp16.h>
 
+#include "strix/decode_weight_sweep.hpp"
+#include "strix/lever.hpp"
+
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -295,6 +299,137 @@ using WorkspaceKey = std::pair<int, cudaStream_t>;
 std::mutex workspace_mutex;
 std::map<WorkspaceKey, std::unique_ptr<Nvfp4Workspace>> workspaces;
 
+// ------------------------------------------------------------------------------------------------- weight read-ahead
+// Rule and geometry: strix/decode_weight_sweep.hpp (read-ahead). The GEMV's block (bx, k, z) reads, for its 4 MT tiles
+// m = bx * 4 MT + t, records [k nch / ks, (k + 1) nch / ks) (fp4_gemv above): that is readahead_piece with
+// tiles_per_block = 4 MT. One thread per piece issues one bulk L2 prefetch of the piece's contiguous records. No
+// register, shared or global result is written: the consumer GEMV computes exactly what it computes without it.
+struct ReadaheadArgs {
+    ::strix::decode::ReadaheadGrid g;
+    const unsigned char* w[::strix::decode::kReadaheadMaxJobs][2];
+    unsigned long long pieces;  // lead blocks x tiles_per_block
+};
+
+__global__ void fp4_readahead(const ReadaheadArgs a) {
+    const unsigned long long stride = static_cast<unsigned long long>(gridDim.x) * blockDim.x;
+    for (unsigned long long i = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x; i < a.pieces;
+         i += stride) {
+        const ::strix::decode::ReadaheadPiece p =
+            ::strix::decode::readahead_piece(a.g, i / a.g.tiles_per_block, static_cast<unsigned>(i % a.g.tiles_per_block));
+        if (p.c1 <= p.c0) continue;
+        const unsigned char* src =
+            a.w[p.job][p.plane] + (static_cast<std::size_t>(p.tile) * a.g.chunks + p.c0) * kNvfp4RecordBytes;
+        const unsigned bytes = (p.c1 - p.c0) * kNvfp4RecordBytes;
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(src), "r"(bytes) : "memory");
+    }
+}
+
+// STRIX_CUDA_WEIGHT_READAHEAD: bitwise (prefetch only); OFF until its timing receipt (no-model bench + ABAB) exists.
+inline constexpr ::strix::lever::Decl readahead_lever{
+    .name = "cuda_weight_readahead", .env = "STRIX_CUDA_WEIGHT_READAHEAD", .exactness = ::strix::lever::Exactness::bitwise,
+    .default_on = false, .source = "tests/cuda_core/nvfp4_test.cu --readahead: graph on/off bitwise; timing pending"};
+int g_readahead_mode = -1;
+std::atomic<std::uint64_t> g_readahead_last{0};
+
+bool readahead_on() {
+    if (g_readahead_mode >= 0) return g_readahead_mode == 1;
+    static const bool on = ::strix::lever::select(readahead_lever, {}).on;
+    return on;
+}
+
+// Per (device, stream): the last GEMV node captured and its capture id.
+struct ReadaheadSite {
+    unsigned long long capture = 0;
+    cudaGraphNode_t gemv = nullptr;
+};
+std::mutex readahead_mutex;
+std::map<WorkspaceKey, ReadaheadSite> readahead_sites;
+
+cudaError_t capture_info(cudaStream_t s, cudaStreamCaptureStatus* st, unsigned long long* id, cudaGraph_t* graph,
+                         const cudaGraphNode_t** deps, std::size_t* ndeps) {
+#if CUDART_VERSION >= 13000
+    return cudaStreamGetCaptureInfo(s, st, id, graph, deps, nullptr, ndeps);
+#else
+    return cudaStreamGetCaptureInfo(s, st, id, graph, deps, ndeps);
+#endif
+}
+
+// Before a GEMV is captured: when the previous GEMV on this stream belongs to the same capture, add the read-ahead node
+// (depends on that GEMV only, nothing depends on it: a leaf of the graph, so the stream order is unchanged).
+cudaError_t readahead_before(const Jobs& jobs, std::uint32_t in, int tiles_per_block, std::uint32_t gx,
+                             std::uint32_t maxks, bool fused, cudaStream_t s) {
+    if (!readahead_on()) return cudaSuccess;
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    unsigned long long id = 0;
+    cudaGraph_t graph = nullptr;
+    const cudaGraphNode_t* deps = nullptr;
+    std::size_t ndeps = 0;
+    cudaError_t e = capture_info(s, &st, &id, &graph, &deps, &ndeps);
+    if (e != cudaSuccess || st != cudaStreamCaptureStatusActive) return e;
+    int device = 0;
+    if ((e = cudaGetDevice(&device)) != cudaSuccess) return e;
+    cudaGraphNode_t after = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(readahead_mutex);
+        const auto it = readahead_sites.find({device, s});
+        if (it != readahead_sites.end() && it->second.capture == id) after = it->second.gemv;
+    }
+    if (after == nullptr) return cudaSuccess;
+    int l2 = 0;
+    if ((e = cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, device)) != cudaSuccess) return e;
+    ReadaheadArgs a{};
+    a.g.jobs = static_cast<unsigned>(jobs.n);
+    a.g.chunks = in >> 7;
+    a.g.tiles_per_block = static_cast<unsigned>(tiles_per_block);
+    a.g.gx = gx;
+    a.g.gy = maxks;
+    a.g.gz = fused ? 2U : 1U;
+    unsigned long long total = 0;
+    for (int q = 0; q < jobs.n; ++q) {
+        const Job& J = jobs.j[q];
+        a.g.tiles[q] = J.out / 16;
+        a.g.ks[q] = J.ks;
+        a.g.planes[q] = J.w[1] != nullptr ? 2U : 1U;
+        a.w[q][0] = J.w[0];
+        a.w[q][1] = J.w[1];
+        total += static_cast<unsigned long long>(a.g.planes[q]) * nvfp4_bytes(J.out, in);
+    }
+    const unsigned long long budget = ::strix::decode::readahead_budget(total, static_cast<unsigned long long>(l2));
+    const unsigned long long lead = ::strix::decode::readahead_lead_blocks(a.g, kNvfp4RecordBytes, budget);
+    a.pieces = lead * a.g.tiles_per_block;
+    if (a.pieces == 0) return cudaSuccess;
+    unsigned long long bytes = 0;
+    for (unsigned long long b = 0; b < lead; ++b) bytes += ::strix::decode::readahead_block_records(a.g, b) * kNvfp4RecordBytes;
+    void* args[] = {&a};
+    cudaKernelNodeParams p{};
+    p.func = reinterpret_cast<void*>(fp4_readahead);
+    p.gridDim = dim3(static_cast<unsigned>(std::min<unsigned long long>(64, (a.pieces + 255) / 256)));
+    p.blockDim = dim3(256);
+    p.sharedMemBytes = 0;
+    p.kernelParams = args;
+    cudaGraphNode_t node = nullptr;
+    if ((e = cudaGraphAddKernelNode(&node, graph, &after, 1, &p)) != cudaSuccess) return e;
+    g_readahead_last.store(bytes);
+    return cudaSuccess;
+}
+
+// After a GEMV kernel was captured: remember its node (the stream's single dependency right after the launch).
+cudaError_t readahead_after(cudaStream_t s) {
+    if (!readahead_on()) return cudaSuccess;
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    unsigned long long id = 0;
+    cudaGraph_t graph = nullptr;
+    const cudaGraphNode_t* deps = nullptr;
+    std::size_t ndeps = 0;
+    cudaError_t e = capture_info(s, &st, &id, &graph, &deps, &ndeps);
+    if (e != cudaSuccess || st != cudaStreamCaptureStatusActive) return e;
+    int device = 0;
+    if ((e = cudaGetDevice(&device)) != cudaSuccess) return e;
+    std::lock_guard<std::mutex> lock(readahead_mutex);
+    readahead_sites[{device, s}] = ReadaheadSite{id, ndeps == 1 ? deps[0] : nullptr};
+    return cudaSuccess;
+}
+
 template <int RB, int MT>
 cudaError_t launch_gemv(Jobs& jobs, const float* x, std::uint32_t in, std::uint32_t rows, cudaStream_t s) {
     std::uint32_t gx = 0, maxks = 1, maxout = 0;
@@ -309,8 +444,11 @@ cudaError_t launch_gemv(Jobs& jobs, const float* x, std::uint32_t in, std::uint3
     }
     // Both launches carry the programmatic-serialization attribute (off switch: set_programmatic_launch(false) gives the
     // previous fully serialised form; same kernels, same bits).
-    cudaError_t e = launch_pdl_smem(fp4_gemv<RB, MT>, dim3(gx, maxks, fused ? 2 : 1), dim3(kWarpsPerBlock * 32),
-                                    static_cast<std::size_t>(kSlab) * RB * 2048, s, jobs, x, in, rows);
+    cudaError_t e = readahead_before(jobs, in, kWarpsPerBlock * MT, gx, maxks, fused, s);
+    if (e != cudaSuccess) return e;
+    e = launch_pdl_smem(fp4_gemv<RB, MT>, dim3(gx, maxks, fused ? 2 : 1), dim3(kWarpsPerBlock * 32),
+                        static_cast<std::size_t>(kSlab) * RB * 2048, s, jobs, x, in, rows);
+    if (e == cudaSuccess) e = readahead_after(s);
     if (e != cudaSuccess || (!any_split && !fused)) return e;
     const std::size_t n = static_cast<std::size_t>(maxout) * rows;
     return launch_pdl(fp4_reduce, dim3(static_cast<unsigned>((n + 255) / 256), static_cast<unsigned>(jobs.n)), dim3(256), s,
@@ -467,6 +605,8 @@ cudaError_t nvfp4_set_split_profile(bool fast) {
 const char* nvfp4_split_identity() { return split_k::identity(g_split_profile, g_split_device).data(); }
 
 split_k::Device nvfp4_split_device() { return g_split_device; }
+void nvfp4_set_readahead(int mode) { g_readahead_mode = mode < 0 ? -1 : (mode > 0 ? 1 : 0); }
+std::uint64_t nvfp4_take_readahead_bytes() { return g_readahead_last.exchange(0); }
 
 std::uint32_t nvfp4_split_k(std::uint32_t out, std::uint32_t in) {
     return split_k::factor(split_k::target(g_split_profile, g_split_device, out, in, g_target_warps), out, in);

@@ -94,6 +94,13 @@ split_k::Device nvfp4_split_device();
 cudaError_t nvfp4_device_key(split_k::Device* key);
 // Split-K factor used for (out, in) (diagnostics / tests).
 std::uint32_t nvfp4_split_k(std::uint32_t out, std::uint32_t in);
+// Cross-kernel weight read-ahead under graph capture (strix/decode_weight_sweep.hpp rule; bitwise: prefetch only):
+// when a GEMV is captured after another GEMV on the same stream, a side node that depends only on that previous GEMV
+// prefetches the head of this GEMV's weights into L2 while the window kernels between the two run.
+// mode -1 = lever STRIX_CUDA_WEIGHT_READAHEAD (default off until measured), 0 = off, 1 = on.
+void nvfp4_set_readahead(int mode);
+// Bytes requested by the last read-ahead node added (0 = none since the last call), for tests.
+std::uint64_t nvfp4_take_readahead_bytes();
 
 // Large-M prefill support (src/cuda_core/dense/dense_big.cu): expands a tile-layout tensor to f16 [out][in] (e2m1 * e4m3, EXACT,
 // WITHOUT gscale). Inside every 32-input block the elements are stored in the mma k-fragment order (position 8q + 4s + 2p + e holds
