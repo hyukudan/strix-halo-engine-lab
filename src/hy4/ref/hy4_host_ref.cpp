@@ -475,6 +475,10 @@ struct HostRef::State {
     // per layer: per position, the expanded keys [heads][qk_head] and values [heads][v_head]
     std::vector<std::vector<Vec>> keys, values;
     std::vector<std::vector<Vec>> token_keys, group_keys;  // indexed layers
+    // taps (read only, no bit change): per layer per position the latent row [kv_lora normed | qk_rope roped], and
+    // the last step's hc_head output before / after output_norm
+    std::vector<std::vector<Vec>> latents;
+    Vec head_in, head_out;
     Vec logits;
     std::uint32_t next = 0;
 
@@ -484,6 +488,7 @@ struct HostRef::State {
         values.resize(c.layers);
         token_keys.resize(c.layers);
         group_keys.resize(c.layers);
+        latents.resize(c.layers);
     }
     const Vec& t(const std::string& name) const { return w.tensor(name); }
 
@@ -547,6 +552,9 @@ struct HostRef::State {
         auto ckv = linear(t(blk(l, "attn_kv_a_mqa.weight")), xn, std::size_t{kl} + c.qk_rope);
         const auto lat = rms_norm(ckv.data(), kl, t(blk(l, "attn_kv_a_norm.weight")).data(), c.rms_eps);
         rope(ckv.data() + kl, c.qk_rope, q, theta);
+        Vec tap(lat);
+        tap.insert(tap.end(), ckv.begin() + kl, ckv.end());
+        latents[l].push_back(std::move(tap));
         // expanded per-head keys and values (attn_k_b: per head kv_lora rows of qk_nope; attn_v_b: v_head rows of kv_lora)
         const auto& kb = t(blk(l, "attn_k_b.weight"));
         const auto& vb = t(blk(l, "attn_v_b.weight"));
@@ -704,8 +712,9 @@ struct HostRef::State {
             hc_update(x, fm, ffn(l, xf));
         }
         const auto hm = hc_mix(x, t("output_hc_fn.weight"), t("output_hc_base.weight"), t("output_hc_scale.weight"), 4U, c.rms_eps, c.hc_eps);
-        const auto y = rms_norm(hc_collapse(x, hm, h), &t("output_norm.weight"), c.rms_eps);
-        logits = linear(t("output.weight"), y, c.vocab, false);
+        head_in = hc_collapse(x, hm, h);
+        head_out = rms_norm(head_in, &t("output_norm.weight"), c.rms_eps);
+        logits = linear(t("output.weight"), head_out, c.vocab, false);
         next = static_cast<std::uint32_t>(std::max_element(logits.begin(), logits.end()) - logits.begin());
         ++pos;
         return logits;
@@ -718,5 +727,14 @@ const std::vector<float>& HostRef::step(std::uint32_t token) { return state_->st
 std::uint32_t HostRef::position() const noexcept { return state_->pos; }
 std::uint32_t HostRef::next_token() const noexcept { return state_->next; }
 const Config& HostRef::config() const noexcept { return state_->c; }
+const std::vector<float>& HostRef::latent_row(std::uint32_t layer, std::uint32_t position) const {
+    if (layer >= state_->latents.size() || position >= state_->latents[layer].size())
+        throw std::out_of_range("hy4 ref: latent_row outside the fed positions");
+    return state_->latents[layer][position];
+}
+const std::vector<float>& HostRef::last_hidden(bool normed) const {
+    if (state_->pos == 0U) throw std::out_of_range("hy4 ref: last_hidden before the first step");
+    return normed ? state_->head_out : state_->head_in;
+}
 
 }  // namespace strix::hy4
