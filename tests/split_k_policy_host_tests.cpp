@@ -76,6 +76,23 @@ int main() {
     check(sk::identity(sk::Profile::fast, kPro) == sk::kFastName && sk::identity(sk::Profile::exact, kPro) == sk::kExactName,
           "identity names");
 
+    // 4b. Effective-policy text of the config print: the identity the device runs + its key; FAST requested on a device
+    //     without rows says FAST was requested and the bits are EXACT (review condition 1).
+    {
+        const std::string on = sk::effective_text(sk::Profile::fast, kPro, "188 SMs cc 12.0");
+        check(on.starts_with("fast nvfp4-splitk-fast-v1 on 188 SMs cc 12.0"), "FAST text on the table device");
+        const std::string off = sk::effective_text(sk::Profile::fast, sk::Device{170, 120}, "170 SMs cc 12.0");
+        check(off.starts_with("FAST requested, bits EXACT: nvfp4-splitk-exact-v1 on 170 SMs cc 12.0") &&
+                  off.find("fast-v1") == std::string::npos,
+              "FAST text off the table device");
+        const std::string ex = sk::effective_text(sk::Profile::exact, kPro, "188 SMs cc 12.0");
+        check(ex.starts_with("exact nvfp4-splitk-exact-v1 on 188 SMs cc 12.0") && ex.find("FAST") == std::string::npos,
+              "EXACT text");
+        check(sk::effective_text(sk::Profile::fast, sk::Device{}, "").find("unknown device") != std::string::npos,
+              "unknown device text");
+        std::printf("text: %s\ntext: %s\ntext: %s\n", on.c_str(), off.c_str(), ex.c_str());
+    }
+
     // 5. Table hygiene: one row per (device, out, in); every row changes something (target != EXACT) and was a measured arm.
     for (std::size_t i = 0; i < std::size(sk::kFastV1); ++i) {
         const sk::Rule& r = sk::kFastV1[i];

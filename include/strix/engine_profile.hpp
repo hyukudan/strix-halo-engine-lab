@@ -177,6 +177,14 @@ struct Resolution {
         return nullptr;
     }
     [[nodiscard]] bool quality_fallback() const { return profile == Name::quality && !engine->quality_rows; }
+    // True when the profile column changed at least one lever (set, provisional or unqualified); false when every lever
+    // is builtin, pending, off or explicit. Display only: not part of the fingerprint.
+    [[nodiscard]] bool profile_applied() const {
+        for (const auto& entry : entries)
+            if (entry.status == Status::set || entry.status == Status::provisional || entry.status == Status::unqualified)
+                return true;
+        return false;
+    }
     // "qualified"; else "qualification in progress: <rows>" for provisional columns and/or "unqualified: <rows>"
     // when --allow-pending ran pending columns, separated by "; ".
     [[nodiscard]] std::string qualification() const {

@@ -1718,6 +1718,24 @@ std::unique_ptr<CudaEngine> CudaEngine::synthetic(const Config& cfg, PackFormat 
     return e;
 }
 
+void print_split_policy(const EngineOptions& o, std::FILE* f) {
+    // The device key of the process policy once an engine init() set it, else of the current device (the key init()
+    // records). The effective identity is split_k::identity(option, key) == nvfp4_split_identity() after init(o).
+    split_k::Device d = cc::nvfp4_split_device();
+    const bool set = d.units != 0;
+    const bool known = set || cc::nvfp4_device_key(&d) == cudaSuccess;
+    if (!known) d = {};
+    char key[64] = "";
+    if (known) std::snprintf(key, sizeof key, "%u SMs cc %u.%u", d.units, d.arch / 10, d.arch % 10);
+    std::string line = "  split-k: " + split_k::effective_text(o.nvfp4_split, d, key);
+    if (o.nvfp4_split == split_k::Profile::fast)
+        line += split_k::fast_applies(d) ? "; identity -skf1; --split-k exact = off"
+                                         : "; identity -skf1 names the request: ids and caches must not cross devices";
+    if (set && split_k::identity(o.nvfp4_split, d) != std::string_view(cc::nvfp4_split_identity()))
+        line += std::string("; process policy ") + cc::nvfp4_split_identity() + " (another engine's init(); last init() wins)";
+    std::fprintf(f, "%s\n", line.c_str());
+}
+
 void print_effective_config(const EngineOptions& o, const char* arith, std::FILE* f) {
     static const char* names[] = {"fp32", "mma3", "mma2", "mma1"};
     arith = names[static_cast<unsigned>(o.dense_arithmetic)];
@@ -1740,11 +1758,7 @@ void print_effective_config(const EngineOptions& o, const char* arith, std::FILE
                  o.prefill_inflight ? " chunks" : " = unbounded", o.prefill_ramp, o.prefill_ramp ? " rows first chunk, doubling to prefill-chunk" : " (off)");
     if (o.turbo_weights >= TurboWeights::onfly)
         std::fprintf(f, "  format: NVFP4 e2m1 + e4m3/16 + FP32 global; RTN; GEMV f16 mma, FP32 accumulate, activations RN f16, rows 1..32 bitwise row-invariant\n");
-    if (o.turbo_weights != TurboWeights::off)
-        std::fprintf(f, "  split-k: %s\n", o.nvfp4_split == split_k::Profile::fast
-                         ? "fast (FAST nvfp4-splitk-fast-v1, identity -skf1: per-shape targets for this device's SM count + "
-                           "compute capability, shapes / devices without a row keep 1000; --split-k exact = off)"
-                         : "exact (nvfp4-splitk-exact-v1: target 1000 for every shape)");
+    if (o.turbo_weights != TurboWeights::off) print_split_policy(o, f);
     std::fprintf(f, "  prefill-flash-tail: %s (scheduling only, bitwise equal; split = partial last wave as fewer-warp jobs)\n",
                  o.flash_tail == cuda_core::FlashTail::split ? "split" : "off");
     if (o.prefill_wave_min_tokens == 0) std::fprintf(f, "  prefill-wave-steps: off (steps of prefill_chunk; --prefill-wave-min N turns it on)\n");

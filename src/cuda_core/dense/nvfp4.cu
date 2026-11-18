@@ -444,23 +444,29 @@ cudaError_t quantize(const void* src, std::uint32_t out, std::uint32_t in, void*
 
 void nvfp4_set_split_target(std::uint32_t warps) { g_target_warps = warps ? warps : split_k::kExactTarget; }
 
+cudaError_t nvfp4_device_key(split_k::Device* key) {
+    int dev = 0, sms = 0, major = 0, minor = 0;
+    cudaError_t e = cudaGetDevice(&dev);
+    if (e == cudaSuccess) e = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    if (e == cudaSuccess) e = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+    if (e == cudaSuccess) e = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+    if (e != cudaSuccess) return e;
+    *key = {static_cast<std::uint32_t>(sms), static_cast<std::uint32_t>(10 * major + minor)};
+    return cudaSuccess;
+}
+
 cudaError_t nvfp4_set_split_profile(bool fast) {
+    // the key is recorded under EXACT too (reporting only: target() ignores the device under EXACT)
     split_k::Device d{};
-    if (fast) {
-        int dev = 0, sms = 0, major = 0, minor = 0;
-        cudaError_t e = cudaGetDevice(&dev);
-        if (e == cudaSuccess) e = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-        if (e == cudaSuccess) e = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-        if (e == cudaSuccess) e = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-        if (e != cudaSuccess) return e;
-        d = {static_cast<std::uint32_t>(sms), static_cast<std::uint32_t>(10 * major + minor)};
-    }
+    if (const cudaError_t e = nvfp4_device_key(&d); e != cudaSuccess) return e;
     g_split_device = d;
     g_split_profile = fast ? split_k::Profile::fast : split_k::Profile::exact;
     return cudaSuccess;
 }
 
 const char* nvfp4_split_identity() { return split_k::identity(g_split_profile, g_split_device).data(); }
+
+split_k::Device nvfp4_split_device() { return g_split_device; }
 
 std::uint32_t nvfp4_split_k(std::uint32_t out, std::uint32_t in) {
     return split_k::factor(split_k::target(g_split_profile, g_split_device, out, in, g_target_warps), out, in);

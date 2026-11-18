@@ -197,6 +197,18 @@ int main() {
                     check(dec == spec || (fast_tier && !flipped_rows), "decode / spec CLI differ outside the named case");
                 }
 
+    // 4. A tier word that turned nothing on is not called "qualified" (exact pack: every lever pending; review finding 7).
+    {
+        std::string text;
+        const Options o = run(Name::fast, TurboWeights::off, qp::Route::windows, 300, {}, &text);
+        check(o == Options{}, "FAST on the exact pack changed an option");
+        check(text.find("nothing applied by the profile") != std::string::npos && text.find("; qualified;") == std::string::npos,
+              "FAST that applied nothing must not print 'qualified'");
+        run(Name::fast, TurboWeights::onfly, qp::Route::windows, 300, {}, &text);
+        check(text.find("; qualified;") != std::string::npos && text.find("nothing applied") == std::string::npos,
+              "FAST that applied split_k prints 'qualified'");
+    }
+
     std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "ALL PASS", g_fail);
     return g_fail ? 1 : 0;
 }

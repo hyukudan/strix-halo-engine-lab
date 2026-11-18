@@ -19,6 +19,7 @@
 // workspace sizing call the same function). HIP: the dense IU4 GEMV reduces its K-waves inside the block (no cross-block
 // split), so it has no row here; a HIP split core binds this same interface with HIP device keys.
 #include <cstdint>
+#include <string>
 #include <string_view>
 
 namespace strix::split_k {
@@ -79,6 +80,19 @@ inline constexpr Rule kFastV1[] = {
 // Identity of the effective split policy on a device.
 [[nodiscard]] constexpr std::string_view identity(Profile p, Device d) {
     return p == Profile::fast && fast_applies(d) ? kFastName : kExactName;
+}
+
+// Effective-policy text for the config print: the identity the device really runs and its key. device_key is the
+// backend's wording of d ("188 SMs cc 12.0"; empty = unknown device). FAST requested on a device without rows says that
+// FAST was requested and the bits are EXACT.
+[[nodiscard]] inline std::string effective_text(Profile requested, Device d, std::string_view device_key) {
+    const std::string on = " on " + std::string(device_key.empty() ? std::string_view("an unknown device") : device_key);
+    if (requested == Profile::exact)
+        return "exact " + std::string(kExactName) + on + " (target " + std::to_string(kExactTarget) + " for every shape)";
+    if (fast_applies(d))
+        return "fast " + std::string(kFastName) + on + " (per-shape targets of this device's rows; shapes without a row keep " +
+               std::to_string(kExactTarget) + ")";
+    return "FAST requested, bits EXACT: " + std::string(kExactName) + on + " (no FAST row for this device)";
 }
 
 // Split factor for a target: groups = ceil((out / tile_out) / tiles_per_block) (>= 1), ks = round(target / groups)

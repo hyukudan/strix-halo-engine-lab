@@ -237,6 +237,8 @@ int main(int argc, char** argv) {
         }
         const auto& cfg = E->config();
         std::printf("identity: %s\n", E->identity().c_str());
+        // the split policy the device really runs (also for --split-k fast without a tier word)
+        if (opt.turbo_weights != q::TurboWeights::off) q::print_split_policy(E->options(), stderr);
         if (prompt.empty()) {
             std::uint64_t s = 99;
             for (std::uint32_t i = 0; i < prompt_len; ++i) prompt.push_back(std::uint32_t(mix(s + i) % cfg.vocab));

@@ -1,5 +1,6 @@
 #include "strix/qwen35/cuda_engine.hpp"
 #include "strix/cuda_core/nvfp4.hpp"
+#include "strix/profiles/qwen_dense_cuda.hpp"
 #include "../../src/core/dense_linear.hpp"
 #include "../../src/cuda_core/dense/dense_mma.hpp"
 #include <algorithm>
@@ -135,6 +136,33 @@ int main() {
         const std::string off_id = engine_identity(f);
         f.prefill_norm_fold = false;
         check(engine_identity(f) == off_id, "prefill-norm-fold keeps the FAST4 identity (bitwise)");
+    }
+    {  // NVFP4 split-K policy -> identity on the real EngineOptions (review condition 2): EXACT has no "-skf1"; FAST ends in
+       // "-skf1" for every NVFP4 source; without NVFP4 weights FAST and EXACT are one identity; qp::apply sets the option.
+        namespace q = strix::qwen35;
+        namespace qp = strix::qwen35::profile;
+        for (const q::TurboWeights w : {q::TurboWeights::native, q::TurboWeights::onfly, q::TurboWeights::converted}) {
+            q::EngineOptions f;
+            f.turbo_weights = w;
+            const std::string exact_id = engine_identity(f);
+            check(exact_id.find("skf1") == std::string::npos, "default identity carries no -skf1");
+            f.nvfp4_split = strix::split_k::Profile::fast;
+            check(engine_identity(f) == exact_id + "-skf1", "FAST split identity = EXACT identity + -skf1");
+        }
+        q::EngineOptions off;
+        off.turbo_weights = q::TurboWeights::off;
+        const std::string off_id = engine_identity(off);
+        off.nvfp4_split = strix::split_k::Profile::fast;
+        check(engine_identity(off) == off_id, "turbo off: split policy is not part of the identity (no NVFP4 tensor)");
+        for (const char* word : {"fast", "default"}) {
+            q::EngineOptions o;
+            o.turbo_weights = q::TurboWeights::converted;
+            const auto r = qp::resolve(strix::profile::parse(word), qp::regime_of(o, qp::Route::windows, 300), {});
+            qp::apply(o, *r);
+            const bool fast = std::string_view(word) == "fast";
+            check((o.nvfp4_split == strix::split_k::Profile::fast) == fast, "qp::apply on EngineOptions sets nvfp4_split");
+            check(engine_identity(o).ends_with("-skf1") == fast, "resolved tier -> identity suffix");
+        }
     }
     check(portable_sampler() == 0, "POSIX clock sampler compiles and closes");
     check(std::isinf(maxrel({NAN}, {0.0})) && std::isinf(maxrel({0.0F}, {INFINITY})), "nonfinite qualification rejection");

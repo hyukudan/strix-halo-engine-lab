@@ -110,6 +110,9 @@ struct EngineOptions {
     std::uint32_t prefill_operand_cache_cap_mib = 0;
     // NVFP4 GEMV split-K policy (strix/split_k_policy.hpp; resolved by the profile resolver strix/profiles/qwen_dense_cuda.hpp, lever split_k): exact = target
     // 1000 (today's bits); fast = FAST nvfp4-splitk-fast-v1 (per-shape targets for the device, identity suffix "-skf1").
+    // Process-wide: the policy is core state (nvfp4_set_split_profile), so every live CudaEngine of a process shares one
+    // split policy and the last init() wins. The "-skf1" suffix names the request; on a device without FAST rows the bits
+    // are EXACT (print_split_policy reports the effective policy and the device key).
     split_k::Profile nvfp4_split = split_k::Profile::exact;
 };
 
@@ -134,6 +137,9 @@ struct EngineOptions {
 std::uint64_t save_converted_pack(const std::string& src, const std::string& out, const EngineOptions& opt);
 // Effective-config text (identity, prefix-cache key, every lever).
 void print_effective_config(const EngineOptions& o, const char* dense_arith, std::FILE* f);
+// The "  split-k:" line of the effective config: the split policy the device really runs (identity, SM count, compute
+// capability); FAST requested on a device without rows prints "FAST requested, bits EXACT". Turbo weights only.
+void print_split_policy(const EngineOptions& o, std::FILE* f);
 
 // Outputs of the last forward (device pointers, valid until the next forward on this engine).
 struct RowsOut {

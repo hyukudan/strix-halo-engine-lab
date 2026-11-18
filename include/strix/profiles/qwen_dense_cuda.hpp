@@ -212,8 +212,10 @@ void apply(Options& o, const Resolved& r) {
 inline std::string describe(const Resolved& r) {
     const auto& res = r.resolution;
     if (res.profile == Name::standard) return {};
+    // a tier word that turned nothing on is not called "qualified" (its levers are builtin, pending, off or explicit)
+    const std::string qual = res.profile_applied() ? res.qualification() : "nothing applied by the profile";
     std::string out = "  profile: " + std::string(sp::name(res.profile)) + " (" + std::string(res.engine->tag) + "; " +
-                      res.qualification() + "; regime weights " + weights_name(r.regime.weights) + ", route " +
+                      qual + "; regime weights " + weights_name(r.regime.weights) + ", route " +
                       route_name(r.regime.route) + ", prompt " + std::to_string(r.regime.prompt_tokens) + " tokens)\n";
     if (res.quality_fallback()) out += "    no quality rows for this engine: default levers\n";
     for (const auto& e : res.entries) {
