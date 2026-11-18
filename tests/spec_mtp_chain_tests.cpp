@@ -1,10 +1,12 @@
 // Shared MTP chain glue (strix/spec/mtp_chain.hpp) against a fake engine whose "device" is host memory: checks the lazy
 // catch-up bookkeeping (position / successor token / hidden row pairing of every mtp_forward call, chunking, carry hidden of
-// chain steps, accept() after a partial verify) without any GPU.
+// chain steps, accept() after a partial verify) without any GPU, and that the device-fed chain (engine feed hooks) issues the
+// same calls and proposes the same ids as the host-fed chain with at most one synchronizing read per draft.
 #include "strix/spec/mtp_chain.hpp"
 
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -61,6 +63,66 @@ struct HostDev {
     static void release(FakeEngine&, float* p) { delete[] p; }
     static void copy(FakeEngine&, float* d, const float* s, std::size_t n) { std::memcpy(d, s, n * sizeof(float)); }
 };
+// The same fake with the device-feed hooks: the feed is host memory; a step's input id comes from a slot unless given.
+struct FakeFedEngine : FakeEngine {
+    static constexpr std::uint32_t kMtpFeedSlots = 64;
+    std::uint32_t feed[kMtpFeedSlots]{};
+    unsigned feed_reads = 0;
+    FakeMtpOut mtp_step_fed(const std::uint32_t* in_host, std::uint32_t in_slot, std::uint32_t out_slot, const float* hidden,
+                            std::uint32_t pos, bool want_top) {
+        const std::uint32_t t = in_host ? *in_host : feed[in_slot];
+        const FakeMtpOut o = mtp_forward(&t, hidden, 1, pos, want_top);
+        if (want_top) feed[out_slot] = o.top[0];
+        return o;
+    }
+    void mtp_feed_put(std::uint32_t slot, const std::uint32_t* top) { feed[slot] = *top; }
+    void mtp_feed_read(std::uint32_t n, std::uint32_t* host) {
+        ++feed_reads;
+        std::memcpy(host, feed, n * 4U);
+    }
+};
+static_assert(!sp::MtpFeedEngine<FakeEngine> && sp::MtpFeedEngine<FakeFedEngine>, "feed hook detection");
+
+// One scripted sequence (flush chunks, chain steps, catch-up, copy prefixes, drafts without a flush, a k past the feed);
+// returns every proposed id in order and the chain's synchronizing reads per draft (max).
+template <class Eng>
+std::vector<std::uint32_t> scenario(Eng& e, std::uint64_t& max_reads_per_draft, bool& fed) {
+    sp::MtpChain<Eng, HostDev> chain(e, false, 3, 8);
+    fed = chain.device_feed();
+    std::vector<std::uint32_t> all, out;
+    max_reads_per_draft = 0;
+    auto draft = [&](std::vector<std::uint32_t> prefix, std::uint32_t k) {
+        const auto r0 = chain.host_reads();
+        chain.draft(prefix, k, out);
+        max_reads_per_draft = std::max<std::uint64_t>(max_reads_per_draft, chain.host_reads() - r0);
+        all.insert(all.end(), out.begin(), out.end());
+        all.push_back(0xFFFFFFFFu);
+    };
+    auto verify_accept = [&](std::vector<std::uint32_t> emitted, float h) {
+        std::vector<float> vh(emitted.size() * kH, 0.0F);
+        for (std::size_t i = 0; i < emitted.size(); ++i) vh[i * kH] = h + float(i);
+        FakeRows vr;
+        vr.hidden_post = vr.hidden_pre = vh.data();
+        chain.observe_verify(vr, static_cast<std::uint32_t>(emitted.size()));
+        chain.accept(emitted);
+    };
+    const std::uint32_t prompt[5] = {11, 12, 13, 14, 15};
+    std::vector<float> hid(5 * kH, 0.0F);
+    for (unsigned i = 0; i < 5; ++i) hid[i * kH] = 10.0F * float(i);
+    FakeRows pf;
+    pf.hidden_post = pf.hidden_pre = hid.data();
+    chain.observe_prefill(pf, 5, prompt, 99);
+    draft({}, 4);              // flush 3 + 2 rows, 3 chain steps
+    verify_accept({out[0], 77}, 100.0F);
+    draft({}, 1);              // flush only
+    verify_accept({out[0], 78, 79}, 200.0F);
+    draft({8, 9}, 3);          // flush, 2 prefix steps, 2 chain steps
+    draft({}, 2);              // no flush: draft 0 is the host d1, its step reads it by value
+    draft({5}, 1);             // no flush, one prefix step, no chain step
+    verify_accept({41}, 300.0F);
+    draft({}, 70);             // k + 1 past the feed: host path
+    return all;
+}
 }  // namespace
 
 int main() {
@@ -117,6 +179,38 @@ int main() {
     e.calls.clear();
     chain.observe_prefill(br, 20, toks.data(), 4);
     MC_CHECK(!e.calls.empty() && e.calls[0].pos0 == 0, "ring full forces an in-order flush from position 0");
+
+    // device feed == host feed: same mtp calls (tokens, hidden rows, positions, want_top) and the same proposals
+    FakeEngine he;
+    FakeFedEngine fe;
+    std::uint64_t host_reads = 0, fed_reads = 0;
+    bool host_fed = true, fed_fed = false;
+    const auto hp = scenario(he, host_reads, host_fed);
+    const auto fp = scenario(fe, fed_reads, fed_fed);
+    MC_CHECK(!host_fed && fed_fed, "feed detection: host %d fed %d", int(host_fed), int(fed_fed));
+    MC_CHECK(hp == fp, "device-fed proposals differ from host-fed (%zu vs %zu ids)", hp.size(), fp.size());
+    MC_CHECK(he.calls.size() == fe.calls.size(), "call count %zu vs %zu", he.calls.size(), fe.calls.size());
+    for (std::size_t i = 0; i < he.calls.size(); ++i)
+        MC_CHECK(he.calls[i].tokens == fe.calls[i].tokens && he.calls[i].hidden0 == fe.calls[i].hidden0 &&
+                     he.calls[i].pos0 == fe.calls[i].pos0 && he.calls[i].want_top == fe.calls[i].want_top,
+                 "call %zu differs", i);
+    MC_CHECK(fed_reads == 70, "the k = 70 draft falls back to one read per position (max %llu)", (unsigned long long)fed_reads);
+    MC_CHECK(host_reads == 70, "host path reads once per position (max %llu)", (unsigned long long)host_reads);
+    std::uint64_t fed_small = 0;
+    {
+        FakeFedEngine f2;
+        sp::MtpChain<FakeFedEngine, HostDev> c2(f2, false, 3, 8);
+        FakeRows p2;
+        p2.hidden_post = p2.hidden_pre = hid.data();
+        c2.observe_prefill(p2, 5, prompt, 99);
+        c2.draft({}, 6, out);
+        fed_small = c2.host_reads();
+        MC_CHECK(f2.feed_reads == 1 && fed_small == 1, "a fed draft of 6 reads once (%u)", f2.feed_reads);
+        c2.set_device_feed(false);
+        const auto before_off = c2.host_reads();
+        c2.draft({}, 3, out);
+        MC_CHECK(!c2.device_feed() && c2.host_reads() - before_off == 2, "rollback: host reads per step");
+    }
     std::puts("spec_mtp_chain_tests: PASS");
     return 0;
 }
