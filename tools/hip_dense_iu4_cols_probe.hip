@@ -84,7 +84,7 @@ int main(int argc, char** argv) {
                 CK(hipMemset(split, 0xFF, std::size_t(16) * sh.n * 4U));
                 for (const auto& r : *s) {
                     const auto c = tp::scaled(r, 64U);
-                    iu4::run_cols(w, sh.k, sh.n, c.begin, c.size(), xh, split, sh.n, rows, nullptr);
+                    iu4::run_cols(w, sh.k, sh.n, c.begin, c.size(), xh, split + c.begin, sh.n, rows, nullptr);
                 }
                 CK(hipMemcpy(b.data(), split, b.size() * 4U, hipMemcpyDeviceToHost));
                 same = same && std::memcmp(a.data(), b.data(), a.size() * 4U) == 0;
@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
             for (int h = 0; h < 2; ++h) {
                 const auto c = tp::scaled(se[std::size_t(h)], 64U);
                 t_half[h] = time_us([&](int i) {
-                    iu4::run_cols(w + std::size_t(unsigned(i) % copies) * tb, sh.k, sh.n, c.begin, c.size(), xh, split, sh.n, rows, nullptr);
+                    iu4::run_cols(w + std::size_t(unsigned(i) % copies) * tb, sh.k, sh.n, c.begin, c.size(), xh, split + c.begin, sh.n, rows, nullptr);
                 }, iters);
             }
             const double gb_full = double(tb) / t_full / 1e3, gb_half = double(tb) / 2.0 / std::max(t_half[0], t_half[1]) / 1e3;
