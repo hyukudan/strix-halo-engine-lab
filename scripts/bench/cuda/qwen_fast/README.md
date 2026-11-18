@@ -58,4 +58,7 @@ FAST bundle `qwen-cuda-fast-bundle-v1` (`--profile fast`: FAST experts `gsq-iq-b
 - Gate coverage so far: 2K and 8K prose (pooled and per member), 32K pooled (one 32K prompt is below the per-prompt
   top-1 bound), and short code / structured prompts (pooled and per prompt). Long code and other languages are not gated.
 - The arithmetic contract of a FAST run with forms carries the forms' versioned identities (`;ids=...`).
-- `hc_mma` is refused at load, with a reason, for a model whose HC norm / inject weights break its FP16 range bound.
+- `hc_mma` (`qwen-cuda-hc-f16mma-v2`) shifts the FP16 inject operand by one per-model power of two (undone exactly in
+  the FP32 epilogue), so no non-zero inject weight rounds to FP16 zero; the load prints the range and the shift. It is
+  refused at load, with a reason, only when the HC norm weights break the FP16 activation bound, a weight is non-finite,
+  or the inject range exceeds what a shift can represent (about 2^40). v1 dropped 6 weights of the Qwen3.8 pack.
