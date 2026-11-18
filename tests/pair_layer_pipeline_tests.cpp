@@ -42,7 +42,7 @@ struct Toy {
     unsigned committed = 0;
     unsigned stage_end;   // windows commit at the stage end (a relay decoder owns more layers than its stage runs)
     Toy(const Weights& w, unsigned b, unsigned e, unsigned max_rows)
-        : m(w), begin(b), end(e), stage_end(e), rec(std::size_t(w.layers) * H), hist(std::size_t(w.layers) * H), x(std::size_t(max_rows) * H), logits(V) {}
+        : m(w), begin(b), end(e), rec(std::size_t(w.layers) * H), hist(std::size_t(w.layers) * H), x(std::size_t(max_rows) * H), logits(V), stage_end(e) {}
     void range(unsigned first, unsigned last, const std::uint32_t* tokens, unsigned rows, bool head) {
         if (first < begin || last > end) throw std::logic_error("toy: layer outside the owned range");
         if (first == 0U)
