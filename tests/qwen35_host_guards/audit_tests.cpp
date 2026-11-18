@@ -86,9 +86,14 @@ void wide_iu4(const Tensor&, const float*, float*, unsigned, hipStream_t, const 
 bool wide_iu4_x16(const Tensor&, const WideScratch&, unsigned) { return false; }
 struct SiluMul {};
 namespace strix::core::f16_dense_tall {
+struct TileRne {};
 void enqueue_x16_tiles(const float*, Half*, unsigned, unsigned, hipStream_t) { runtime_require(false); }
-template <class F> void enqueue_x16_tiles_map2(const float*, const float*, Half*, unsigned, unsigned, hipStream_t) { runtime_require(false); }
+template <class F, class Q = TileRne> void enqueue_x16_tiles_map2(const float*, const float*, Half*, unsigned, unsigned, hipStream_t) { runtime_require(false); }
 }
+// engine.hip tile quantiser policy of the x16 producers (STRIX_DENSE_FAST4_EMU gate instrument): the default cast only.
+template <class Q> struct WithQ { using type = Q; };
+template <class K> void with_tile_quantiser(K&& k) { k(WithQ<core::f16_dense_tall::TileRne>{}); }
+void x16_tiles(const float*, Half*, unsigned, unsigned, hipStream_t) { runtime_require(false); }
 void silu_mul_host(const float*, const float*, float*, std::size_t) {}
 #include "audit_hip.inc"
 #include "audit_cli.inc"
