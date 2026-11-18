@@ -115,7 +115,7 @@ int main(int argc, char** argv) {
         std::string draft_pack;
         std::unique_ptr<sp::DraftRows> draft_rows;
         std::uint32_t idle_ms = 0;  // host sleep (GPU idle) before every spec run: thermal gaps inside one ticket
-        bool cost_table = false, check = true, graphs = true, seed_costs = true, turbo_lm_head = true;
+        bool cost_table = false, check = true, graphs = true, seed_costs = true, turbo_lm_head = true, pdl = false;
         q::TurboWeights turbo = q::TurboWeights::off;
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
@@ -138,6 +138,7 @@ int main(int argc, char** argv) {
             else if (a == "--trace") trace_n = strix::core::parse_u32(next());
             else if (a == "--check") check = next() != "0";
             else if (a == "--graphs") graphs = next() != "0";
+            else if (a == "--pdl") pdl = next() != "0";  // EngineOptions::pdl, as the decode CLI
             else if (a == "--seed-costs") seed_costs = next() != "0";
             else if (a == "--cost-model") {
                 const std::string v = next();
@@ -209,6 +210,7 @@ int main(int argc, char** argv) {
         opt.use_graphs = graphs;
         opt.turbo_weights = turbo;
         opt.turbo_lm_head = turbo_lm_head;
+        opt.pdl = pdl;
         opt.max_positions = std::max<std::uint32_t>(max_pos, std::uint32_t(std::max<std::size_t>(longest, prompt_len) + n_gen + 128 +
                                                                           (cost_table ? 4096 : 0)));
         std::unique_ptr<q::CudaEngine> E;
