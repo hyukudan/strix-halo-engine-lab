@@ -5,7 +5,7 @@
 //   --spec N: plain greedy N ids (timed), reset, the same prompt again, speculative decode N ids through the shared
 //     strix::spec layer (copy proposer + Arbiter, rows <= --max-rows): SPEC ids_equal, tok/s both, accepted per pass.
 // strix-hy4-rows PART.gguf... --ids-file F [--context N] [--prompt-rows N] [--reps K] [--spec N] [--max-rows R]
-//   [--verify-ms a,b,...] [--gbps G] [--label NAME]
+//   [--verify-ms a,b,...] [--gbps G]; --content LABEL=PATH (repeatable) instead of --ids-file: one spec run per content
 #include "hy4/hip/hy4_hip_forward.hpp"
 #include "hy4/hip/hy4_hip_rows.hpp"
 #include "strix/spec/block_parallel.hpp"
@@ -19,6 +19,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -91,15 +92,20 @@ int main(int argc, char** argv) {
         hb::ForwardOptions o;
         o.context = 2048;
         o.verify_rows = hb::rows::kMaxVerifyRows;
-        std::vector<std::uint32_t> prompt;
+        std::vector<std::pair<std::string, std::vector<std::uint32_t>>> contents;  // (label, prompt ids)
         std::uint32_t reps = 10, spec_n = 0, max_rows = hb::rows::kMaxVerifyRows;
         std::vector<double> verify_ms;
         double gbps = 207.0;
-        std::string label = "prompt";
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
             const bool more = i + 1 < argc;
-            if (a == "--ids-file" && more) prompt = read_ids(argv[++i]);
+            if (a == "--ids-file" && more) contents.emplace_back("prompt", read_ids(argv[++i]));
+            else if (a == "--content" && more) {  // LABEL=PATH
+                const std::string v = argv[++i];
+                const auto eq = v.find('=');
+                if (eq == std::string::npos) throw std::invalid_argument("--content LABEL=PATH");
+                contents.emplace_back(v.substr(0, eq), read_ids(v.substr(eq + 1U)));
+            }
             else if (a == "--context" && more) o.context = static_cast<std::uint32_t>(std::stoul(argv[++i]));
             else if (a == "--prompt-rows" && more) o.prompt_rows = static_cast<std::uint32_t>(std::stoul(argv[++i]));
             else if (a == "--reps" && more) reps = static_cast<std::uint32_t>(std::stoul(argv[++i]));
@@ -107,11 +113,12 @@ int main(int argc, char** argv) {
             else if (a == "--max-rows" && more) max_rows = static_cast<std::uint32_t>(std::stoul(argv[++i]));
             else if (a == "--verify-ms" && more) verify_ms = read_list(argv[++i]);
             else if (a == "--gbps" && more) gbps = std::stod(argv[++i]);
-            else if (a == "--label" && more) label = argv[++i];
             else if (!a.empty() && a[0] != '-') o.parts.emplace_back(a);
             else throw std::invalid_argument("unknown argument " + a);
         }
-        if (o.parts.empty() || prompt.empty()) throw std::invalid_argument("usage: strix-hy4-rows PART.gguf... --ids-file F [...]");
+        if (o.parts.empty() || contents.empty() || contents.front().second.empty())
+            throw std::invalid_argument("usage: strix-hy4-rows PART.gguf... --ids-file F | --content L=F ... [...]");
+        const auto& prompt = contents.front().second;
         const double t_load = now_ms();
         hb::Forward f(o);
         std::printf("load %.1f s, %u verify rows, prompt %zu ids (%s), context %u\n", (now_ms() - t_load) / 1000.0, o.verify_rows,
@@ -122,6 +129,7 @@ int main(int argc, char** argv) {
         if (spec_n == 0U) {
             // ---- bench: plain digests at G positions, rows of the same tokens
             constexpr std::uint32_t G = hb::rows::kMaxVerifyRows;
+            std::vector<double> curve;
             std::vector<std::uint32_t> t{anchor};
             std::vector<std::uint64_t> plain_fnv;
             std::vector<float> state;
@@ -168,39 +176,49 @@ int main(int argc, char** argv) {
                 }
                 std::printf("verify R%u median %.2f ms (min %.2f) = %.2f ms/row\n", R, median(ms), *std::min_element(ms.begin(), ms.end()),
                             median(ms) / R);
+                curve.push_back(median(ms));
             }
+            // Arbiter seeds R = 1..8 from the measured R = 1, 2, 4, 8 (linear between them): --verify-ms of the spec ticket
+            const double s1 = curve[0], s2 = curve[1], s4 = curve[2], s8 = curve[3];
+            std::printf("seed --verify-ms %.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f\n", s1, s2, (s2 + s4) / 2.0, s4, s4 + (s8 - s4) / 4.0,
+                        s4 + (s8 - s4) / 2.0, s4 + 3.0 * (s8 - s4) / 4.0, s8);
             return equal == total ? 0 : 2;
         }
-        // ---- spec: plain greedy reference, then the speculative decode from the same prompt state
-        std::vector<std::uint32_t> plain{anchor};
-        const double p0 = now_ms();
-        while (plain.size() < spec_n) plain.push_back(f.step_greedy(plain.back()));
-        const double plain_ms = now_ms() - p0;
-        const double step_ms = plain_ms / static_cast<double>(spec_n - 1U);
-        if (verify_ms.empty()) verify_ms = strix::spec::moe_verify_seed_ms(strix::spec::hy4_verify_bytes(), step_ms, gbps, max_rows);
-        hb::rows::SpecOptions so;
-        so.max_rows = max_rows;
-        so.verify_ms = verify_ms;
-        const std::uint32_t anchor2 = prime(f, prompt, batched);
-        if (anchor2 != anchor) throw std::runtime_error("repeat prompt anchor differs");
-        const auto res = hb::rows::spec_decode(f, prompt, anchor, spec_n, so);
-        std::size_t first_bad = res.ids.size() == plain.size() ? plain.size() : std::min(res.ids.size(), plain.size());
-        for (std::size_t i = 0; i < std::min(res.ids.size(), plain.size()); ++i)
-            if (res.ids[i] != plain[i]) {
-                first_bad = i;
-                break;
-            }
-        const bool equal = first_bad == plain.size() && res.ids.size() == plain.size();
-        const double gen = static_cast<double>(spec_n - 1U);
-        std::printf("seeds");
-        for (const double v : verify_ms) std::printf(" %.1f", v);
-        std::printf(" ms\nrows histogram");
-        for (std::size_t r = 1; r < res.rows_hist.size(); ++r) std::printf(" R%zu:%llu", r, static_cast<unsigned long long>(res.rows_hist[r]));
-        std::printf("\nSPEC %s ids_equal %d (first diff %zu) plain %.2f tok/s (%.2f ms/token) spec %.2f tok/s passes %zu E %.3f proposed %llu accepted %llu\n",
-                    label.c_str(), equal ? 1 : 0, first_bad, 1000.0 * gen / plain_ms, step_ms, 1000.0 * gen / res.wall_ms, res.steps.size(),
-                    res.steps.empty() ? 0.0 : gen / static_cast<double>(res.steps.size()), static_cast<unsigned long long>(res.proposed),
-                    static_cast<unsigned long long>(res.accepted));
-        return equal ? 0 : 3;
+        // ---- spec, per content: plain greedy reference, then the speculative decode from the same prompt state
+        int rc = 0;
+        for (std::size_t ci = 0; ci < contents.size(); ++ci) {
+            const auto& [label, ids] = contents[ci];
+            const std::uint32_t first_id = ci == 0U ? anchor : prime(f, ids, batched);
+            std::vector<std::uint32_t> plain{first_id};
+            const double p0 = now_ms();
+            while (plain.size() < spec_n) plain.push_back(f.step_greedy(plain.back()));
+            const double plain_ms = now_ms() - p0;
+            const double step_ms = plain_ms / static_cast<double>(spec_n - 1U);
+            hb::rows::SpecOptions so;
+            so.max_rows = max_rows;
+            so.verify_ms = verify_ms.empty() ? strix::spec::moe_verify_seed_ms(strix::spec::hy4_verify_bytes(), step_ms, gbps, max_rows) : verify_ms;
+            if (prime(f, ids, batched) != first_id) throw std::runtime_error("repeat prompt anchor differs (" + label + ")");
+            const auto res = hb::rows::spec_decode(f, ids, first_id, spec_n, so);
+            std::size_t first_bad = std::min(res.ids.size(), plain.size());
+            for (std::size_t i = 0; i < first_bad; ++i)
+                if (res.ids[i] != plain[i]) {
+                    first_bad = i;
+                    break;
+                }
+            const bool equal = res.ids == plain;
+            const double gen = static_cast<double>(spec_n - 1U);
+            std::printf("%s seeds", label.c_str());
+            for (const double v : so.verify_ms) std::printf(" %.1f", v);
+            std::printf(" ms; rows histogram");
+            for (std::size_t r = 1; r < res.rows_hist.size(); ++r) std::printf(" R%zu:%llu", r, static_cast<unsigned long long>(res.rows_hist[r]));
+            std::printf("\nSPEC %s ids_equal %d (first diff %zu) plain %.2f tok/s (%.2f ms/token) spec %.2f tok/s passes %zu E %.3f proposed %llu accepted %llu\n",
+                        label.c_str(), equal ? 1 : 0, first_bad, 1000.0 * gen / plain_ms, step_ms, 1000.0 * gen / res.wall_ms, res.steps.size(),
+                        res.steps.empty() ? 0.0 : gen / static_cast<double>(res.steps.size()), static_cast<unsigned long long>(res.proposed),
+                        static_cast<unsigned long long>(res.accepted));
+            std::fflush(stdout);
+            if (!equal) rc = 3;
+        }
+        return rc;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strix-hy4-rows: %s\n", e.what());
         return 1;
