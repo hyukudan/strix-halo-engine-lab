@@ -61,7 +61,7 @@ std::vector<int> parse_ids(const std::string& s) {
 
 int main(int argc, char** argv) try {
     using namespace strix::qwen35;
-    std::string model, dump, ids_arg = "1", mtp_arg = "auto";
+    std::string model, dump, ids_arg = "1", mtp_arg = "auto", draft_pack;
     bool draft_rows_on = true;
     unsigned wide = 0;
     unsigned gen = 16, rows = 1, maxpos = 0, repeat = 1;
@@ -82,6 +82,7 @@ int main(int argc, char** argv) try {
         else if (a == "--repeat") repeat = std::max(1U, strix::core::parse_u32(next()));  // prefills per process (reset between): first = cold, last = warm
         else if (a == "--mtp") mtp_arg = next();      // auto (default: the model's own MTP layer) | off | side GGUF
         else if (a == "--no-mtp") mtp_arg = "off";
+        else if (a == "--draft-pack") draft_pack = next();  // F1,F2: id packs of the draft subset (hip_spec_defaults.hpp)
         else if (a == "--draft-rows") {               // on (default) | off: draft-only subset head vs the full head
             const std::string v = next();
             if (v != "on" && v != "off") throw std::invalid_argument("--draft-rows on|off");
@@ -90,7 +91,7 @@ int main(int argc, char** argv) try {
         else throw std::invalid_argument("unknown flag " + a);
     }
     if (model.empty() || rows < 1U || rows > HipEngine::max_rows())
-        throw std::invalid_argument("usage: --model GGUF [--prompt-ids 1,2,3] [--gen N] [--rows 1..16] [--dump-logits FILE] [--iu4-reference] [--max-pos N] [--repeat N]; --prompt-ids @FILE reads the list from FILE");
+        throw std::invalid_argument("usage: --model GGUF [--prompt-ids 1,2,3] [--gen N] [--rows 1..16] [--dump-logits FILE] [--iu4-reference] [--mtp auto|off|F] [--draft-rows on|off] [--draft-pack F1,F2] [--max-pos N] [--repeat N]; --prompt-ids @FILE reads the list from FILE");
     if (!ids_arg.empty() && ids_arg[0] == '@') {  // long prompts exceed the per-argument limit of the OS
         std::ifstream f(ids_arg.substr(1));
         if (!f) throw std::invalid_argument("cannot read " + ids_arg.substr(1));
@@ -113,13 +114,13 @@ int main(int argc, char** argv) try {
     std::printf("load time %.1f s\n", load_s);
     const unsigned V = E->vocab();
     // Speculation: one shared resolver (hip_spec_defaults.hpp). --dump-logits needs every position's logits: one row per step.
-    auto plan = resolve_hip_dense_spec(model, dump.empty() ? mtp_arg : std::string("off"), draft_rows_on);
+    auto plan = resolve_hip_dense_spec(model, dump.empty() ? mtp_arg : std::string("off"), draft_rows_on, draft_pack);
     std::unique_ptr<HipMtpChain> chain;
     std::unique_ptr<strix::spec::DraftRows> drows;
     if (!plan.mtp_source.empty()) {
         E->load_mtp(plan.mtp_source);
         chain = std::make_unique<HipMtpChain>(*E, false, HipEngine::mtp_max_rows());
-        if (plan.draft_rows) drows = std::make_unique<strix::spec::DraftRows>(hip_dense_draft_rows_config(V));
+        if (plan.draft_rows) drows = std::make_unique<strix::spec::DraftRows>(hip_dense_draft_rows_config(V, plan));
     }
     std::printf("spec: %s (mtp %s%s%s), draft rows %s\n", chain ? "mtp" : "off", plan.mtp_reason.c_str(),
                 plan.mtp_source.empty() ? "" : " ", plan.mtp_source.c_str(), drows ? "subset" : "full");

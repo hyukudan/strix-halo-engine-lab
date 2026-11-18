@@ -240,6 +240,7 @@ int run_mtp_ref(q::HipEngine& E, const std::string& model, const std::string& mt
 int main(int argc, char** argv) try {
     std::string model, ids_file, label = "run", sources, mtp_file, chain_hidden = "post", dump_ref, dump_out;
     std::uint32_t n_gen = 256, max_block = 16, max_pos = 0, pf_bench = 0, trace_n = 0, prefill_rows = 16, chain_k = 7, ref_n = 0;
+    std::string draft_pack;
     bool check = true, cost_table = false, pf_sample = false, seed_costs = false, pf_twice = false, mtp_ref = false, draft_rows_on = true;
     std::uint32_t copy_arm = 0;
     for (int i = 1; i < argc; ++i) {
@@ -265,6 +266,7 @@ int main(int argc, char** argv) try {
         else if (a == "--label") label = next();
         else if (a == "--mtp") mtp_file = next();                  // auto (default) | off | side GGUF with blk.<layers>.* (MTP head)
         else if (a == "--draft-rows") draft_rows_on = next() != "off";  // on (default) | off: draft-only subset head
+        else if (a == "--draft-pack") draft_pack = next();  // F1,F2: id packs of the draft subset (hip_spec_defaults.hpp)
         else if (a == "--chain-hidden") chain_hidden = next();      // post | pre (hidden fed to the MTP layer)
         else if (a == "--chain-k") chain_k = strix::core::parse_u32(next());
         else if (a == "--copy-arm") copy_arm = strix::core::parse_u32(next());  // also run the copy-only baseline for N tokens
@@ -274,7 +276,7 @@ int main(int argc, char** argv) try {
         else if (a == "--dump-out") dump_out = next();              // speculative emitted ids -> file
         else throw std::invalid_argument("unknown argument " + a);
     }
-    const auto plan = q::resolve_hip_dense_spec(model, mtp_file.empty() ? std::string("auto") : mtp_file, draft_rows_on);  // ONE resolver
+    const auto plan = q::resolve_hip_dense_spec(model, mtp_file.empty() ? std::string("auto") : mtp_file, draft_rows_on, draft_pack);  // ONE resolver
     mtp_file = plan.mtp_source;
     std::printf("spec plan: mtp %s %s, draft rows %s\n", plan.mtp_reason.c_str(), mtp_file.c_str(), plan.draft_rows ? "subset" : "full");
     if (sources.empty()) sources = mtp_file.empty() ? "copy" : "copy,chain,hybrid";
@@ -480,7 +482,7 @@ int main(int argc, char** argv) try {
         drafter.commit(std::span<const std::uint32_t>(out.data(), 1));
         const bool drows_on = use_chain && chain_glue && plan.draft_rows;
         if (drows_on) {
-            if (!drows) drows = std::make_unique<sp::DraftRows>(q::hip_dense_draft_rows_config(vocab));
+            if (!drows) drows = std::make_unique<sp::DraftRows>(q::hip_dense_draft_rows_config(vocab, plan));
             drows->begin(prompt);
             drows->admit(std::span<const std::uint32_t>(out.data(), 1));
         }
