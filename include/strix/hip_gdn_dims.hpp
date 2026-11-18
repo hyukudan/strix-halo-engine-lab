@@ -17,6 +17,10 @@ struct HipGdnDimsStep {
     std::uint32_t small_type = 0, key_heads = 16, value_heads = 48, head_dim = 128, kernel = 4, rows = 1;
     float qk_epsilon = 1e-6F, rms_epsilon = 1e-6F;
     HipGdnGatedNorm norm_kind = HipGdnGatedNorm::swish;
+    // Where the recurrence stores the state after the last row (same layout as `matrix`); nullptr = in place. The kernel
+    // loads `matrix` once before any store, so out of place is bitwise the in-place result and leaves `matrix` intact
+    // (a verify window's checkpoint, src/core/window_state_buffers.hpp).
+    float* matrix_out = nullptr;
 };
 void hip_gdn_decode_step_dims(const HipGdnDimsStep& step, void* stream);
 } // namespace strix

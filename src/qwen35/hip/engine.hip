@@ -1,5 +1,6 @@
 // qwen35 HIP window engine (see include/strix/qwen35/hip_engine.hpp). Moved from apps/hip_qwen35_decode_main.hip and extended
-// with the multi-token verify window (forward_rows + commit(k), deferred GDN commit by snapshot + replay).
+// with the multi-token verify window (forward_rows + commit(k)): the window writes the GDN matrices to a spare buffer
+// (core/window_state_buffers.hpp); commit(all) swaps the buffers' roles, commit(k < rows) replays k rows on the untouched one.
 // Binds shared cores only: core/dense_linear (gemv_rows + weight_decode), attn_core/dense_decode, ops/norm/norm_device,
 // hip_gdn_decode_step_dims (R1 GDN launcher path, swish gated norm).
 // Home: specific = layer composition; every kernel is shared.
@@ -27,6 +28,7 @@
 #include "../../attn_core/dense_decode_flash.hpp"
 #include "../../core/dense_linear.hpp"
 #include "../../core/dense_linear_iu4.hpp"
+#include "../../core/window_state_buffers.hpp"
 #include "../../core/f16_dense_iu4.hpp"
 #include "../../core/f16_dense_q8a8.hpp"
 #include "../../ops/norm/norm_device.hpp"
@@ -373,7 +375,8 @@ struct HipEngine::Impl {
     unsigned n_gdn = 0;
     std::size_t sb = 0, cb = 0;       // GDN matrix bytes / conv bytes per layer
     std::size_t pass_weight_bytes = 0, kv_pos_bytes = 0;
-    float *gdn_all = nullptr, *bak_state = nullptr;
+    float *gdn_all = nullptr, *bak_state = nullptr;  // allocations; roles (committed / window target) live in gdn_buf
+    core::WindowStateBuffers<float> gdn_buf;
     std::uint16_t *conv_all = nullptr, *bak_conv = nullptr;
     float *raw_qkv = nullptr, *raw_beta = nullptr, *raw_gate = nullptr, *core_r = nullptr;
     float *x = nullptr, *xn = nullptr, *qkv = nullptr, *z = nullptr, *beta = nullptr, *gate = nullptr, *core = nullptr, *proj = nullptr,
@@ -461,6 +464,7 @@ struct HipEngine::Impl {
         alloc0(&conv_all, cb * n_gdn);
         alloc0(&bak_state, sb * n_gdn);
         alloc0(&bak_conv, cb * n_gdn);
+        gdn_buf = core::WindowStateBuffers<float>(gdn_all, bak_state);
         alloc0(&raw_qkv, std::size_t(n_gdn) * kMaxRows * GC * 4U);
         alloc0(&raw_beta, std::size_t(n_gdn) * kMaxRows * GH * 4U);
         alloc0(&raw_gate, std::size_t(n_gdn) * kMaxRows * GH * 4U);
@@ -534,15 +538,21 @@ struct HipEngine::Impl {
     }
 
     void reset_state() {
-        HK(hipMemsetAsync(gdn_all, 0, sb * n_gdn, stream));
+        HK(hipMemsetAsync(gdn_buf.committed(), 0, sb * n_gdn, stream));
         HK(hipMemsetAsync(conv_all, 0, cb * n_gdn, stream));
         committed = pending = 0;
         HK(hipStreamSynchronize(stream));
     }
 
-    // Restore the pre-window GDN state and replay the first k rows of the window (k may be 0).
-    void restore_and_replay(unsigned k) {
-        HK(hipMemcpyAsync(gdn_all, bak_state, sb * n_gdn, hipMemcpyDeviceToDevice, stream));
+    // Every GDN layer's matrix = its slice of the committed buffer (after load and after each role swap).
+    void point_gdn_layers() {
+        for (unsigned l = 0; l < cfg.layers; ++l)
+            if (gdn_index[l] != ~0U) L[l].gdn_state = gdn_buf.committed_at(std::size_t(gdn_index[l]) * sb / 4U);
+    }
+
+    // Partial accept / discard: the window wrote its GDN state to the spare buffer, so the committed buffer still holds the
+    // pre-window state (no restore copy). Restore the conv history (updated in place) and replay the first k rows (k may be 0).
+    void rollback(unsigned k) {
         HK(hipMemcpyAsync(conv_all, bak_conv, cb * n_gdn, hipMemcpyDeviceToDevice, stream));
         if (k == 0U) return;
         for (unsigned l = 0; l < cfg.layers; ++l) {
@@ -564,14 +574,12 @@ struct HipEngine::Impl {
         if (n < 1U || n > (defer ? kMaxRows : std::max(kMaxRows, opt.prefill_rows)))
             throw std::invalid_argument("rows must be 1..16 (decode windows) or 1..prefill_rows (forward_commit)");
         if (n > kMaxRows && want == LogitRows::all) throw std::invalid_argument("wide windows return last-row or no logits");
-        if (pending) { restore_and_replay(0U); pending = 0; }  // an uncommitted window is discarded
+        if (pending) { rollback(0U); pending = 0; }  // an uncommitted window is discarded
         core::require_capacity(committed, n, opt.max_positions);
         core::validate_token_ids(tokens, n, cfg.vocab);
         const unsigned pos = committed;
-        if (defer) {
-            HK(hipMemcpyAsync(bak_state, gdn_all, sb * n_gdn, hipMemcpyDeviceToDevice, stream));
-            HK(hipMemcpyAsync(bak_conv, conv_all, cb * n_gdn, hipMemcpyDeviceToDevice, stream));
-        }
+        // GDN matrices: a deferred window reads the committed buffer and writes the spare (gdn_buf), no snapshot copy.
+        if (defer) HK(hipMemcpyAsync(bak_conv, conv_all, cb * n_gdn, hipMemcpyDeviceToDevice, stream));
         HK(hipMemcpyAsync(d_ids, tokens, n * 4U, hipMemcpyHostToDevice, stream));
         embed_kernel<<<n, 256, 0, stream>>>(embd.data, embd.fmt, embd.row_bytes, H, d_ids, x);
         const unsigned nb = (n * H + 255U) / 256U;
@@ -597,6 +605,7 @@ struct HipEngine::Impl {
                 g.small_type = 0; g.key_heads = cfg.gdn_key_heads; g.value_heads = GH; g.head_dim = cfg.gdn_key_dim;
                 g.kernel = cfg.gdn_conv_kernel; g.rows = n; g.qk_epsilon = 1e-6F; g.rms_epsilon = cfg.rms_eps;
                 g.norm_kind = HipGdnGatedNorm::swish;
+                if (defer) g.matrix_out = gdn_buf.target_at(std::size_t(gdn_index[l]) * sb / 4U);  // committed slice stays the checkpoint
                 hip_gdn_decode_step_dims(g, stream);
                 linear(y.out, core, proj, n, stream, wide, iu4);
             } else {
@@ -799,7 +808,12 @@ void HipEngine::commit(std::uint32_t k) {
     auto& p = *p_;
     if (!p.pending) throw std::logic_error("commit without a pending window");
     if (k > p.pending) throw std::invalid_argument("commit(k): k > rows");
-    if (k < p.pending) p.restore_and_replay(k);
+    if (k < p.pending) {
+        p.rollback(k);
+    } else {  // all rows accepted: the spare holds the window's final GDN state
+        p.gdn_buf.accept_all();
+        p.point_gdn_layers();
+    }
     p.committed += k;
     p.pending = 0;
 }

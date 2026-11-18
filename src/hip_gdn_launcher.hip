@@ -1694,12 +1694,14 @@ void recurrent_step_kernel(
 // reads and writes it through memory every row). Row r runs exactly the operations of recurrent_step_kernel on the
 // qkv / beta / gate / core of row r (strides below), in the same order, so the bits equal `rows` separate launches;
 // the stored state of row r is the retained value the next row loads (a float round trip is exact).
+// `state` is loaded once before any store and the final tile goes to `state_out` (== state for in place): out of place
+// leaves `state` untouched with bitwise the same stored result (verify windows keep it as the checkpoint).
 // The reduction buffer's physical index is the form F (gdn_recurrent_lds_index.hpp): column_major (default) is
 // conflict-free; lane_major is the original placement (STRIX_GDN_ROWS_LDS_LANE_MAJOR=1). Same elements, pairs, order.
 template <gdn_recurrent_lds::Form F>
 __global__ __launch_bounds__(kRecurrentThreads)
 void recurrent_rows_kernel(
-    const float* qkv, const float* beta, const float* gate, float* state, float* core,
+    const float* qkv, const float* beta, const float* gate, const float* state, float* state_out, float* core,
     std::uint32_t key_heads, std::uint32_t value_heads, std::uint32_t head_dim, std::uint32_t rows,
     std::uint64_t qkv_stride, std::uint64_t core_stride) {
     const auto tile_count = head_dim / kValueTile;
@@ -1769,7 +1771,7 @@ void recurrent_rows_kernel(
     }
 #pragma unroll
     for (std::uint32_t column = 0; column < kValueTile; ++column)
-        state[(static_cast<std::uint64_t>(value_head) * head_dim + lane) * head_dim + value_base + column] = retained[column];
+        state_out[(static_cast<std::uint64_t>(value_head) * head_dim + lane) * head_dim + value_base + column] = retained[column];
 }
 #ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
 template <unsigned Rows> struct GdnRecurrentWindowPointers {
@@ -8194,7 +8196,7 @@ void hip_gdn_decode_step_dims(const HipGdnDimsStep& v, void* stream_ptr) {
     const auto rows_kernel = gdn_rows_lds_lane_major() ? recurrent_rows_kernel<gdn_recurrent_lds::Form::lane_major>
                                                        : recurrent_rows_kernel<gdn_recurrent_lds::Form::column_major>;
     hipLaunchKernelGGL(rows_kernel, dim3(v.value_heads * (d / kValueTile)), dim3(d), 0, stream,
-        v.qkv, v.beta, v.gate, v.matrix, v.core, v.key_heads, v.value_heads, d, v.rows,
+        v.qkv, v.beta, v.gate, v.matrix, v.matrix_out ? v.matrix_out : v.matrix, v.core, v.key_heads, v.value_heads, d, v.rows,
         static_cast<std::uint64_t>(channels), static_cast<std::uint64_t>(v.value_heads) * d);
     if (window && v.norm_kind == HipGdnGatedNorm::swish)
         hipLaunchKernelGGL(gated_rms_norm_swish_kernel, dim3(v.value_heads, v.rows), dim3(d), 0, stream,
