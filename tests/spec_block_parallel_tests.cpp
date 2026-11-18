@@ -92,10 +92,13 @@ void layout_tests() {
     BP_CHECK(sp::max_drafts(h) == 5 && sp::proposal_row(h, 0) == 1 && sp::proposal_row(h, 4) == 5, "dfly2 rows");
     BP_CHECK(sp::max_drafts(sp::ds41_dspark()) == 5 && sp::proposal_row(sp::ds41_dspark(), 0) == 0, "dspark rows");
     BP_CHECK(sp::max_drafts(sp::g4_dflash()) == 7, "dflash rows");
+    BP_CHECK(h.mask == sp::BlockMask::causal && !h.correction, "dfly2 measured numerics: causal block, correction off");
+    auto b = h;
+    b.mask = sp::BlockMask::bidirectional;
     std::vector<std::uint32_t> ids;
-    sp::block_ids(h, 77, {}, 2, ids);  // bidirectional: the whole block runs even for k = 2
+    sp::block_ids(b, 77, {}, 2, ids);  // bidirectional: the whole block runs even for k = 2
     BP_CHECK(ids.size() == 6 && ids[0] == 77 && ids[1] == 120009 && ids[5] == 120009, "dfly2 ids");
-    BP_CHECK(sp::row_visible(h, 1, 5) && sp::row_visible(h, 5, 0) && !sp::row_visible(h, 6, 0), "bidirectional");
+    BP_CHECK(sp::row_visible(b, 1, 5) && sp::row_visible(b, 5, 0) && !sp::row_visible(b, 6, 0), "bidirectional");
     auto c = h;
     c.mask = sp::BlockMask::causal;
     c.prefix_in_block = true;

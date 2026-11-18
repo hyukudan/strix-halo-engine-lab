@@ -56,9 +56,11 @@ BlockPolicy hy4_dfly2() {
     p.fill_token = 120009U;
     p.kv = KvSource::target_share;
     p.share_budget = 2048U;  // dfly_target_index_topk
-    p.mask = BlockMask::bidirectional;
+    // causal + correction off: measured on the official drafter (strix-hy4-dfly accept, oracle taps, 89 anchors): E 2.43
+    // causal vs 1.84 bidirectional; every hidden_correction placement tried lowers E (the hook stays for its owner).
+    p.mask = BlockMask::causal;
     p.fusion = Fusion::slot0;
-    p.correction = true;
+    p.correction = false;
     p.draft_layers = 5U;
     p.target_layer_count = 5U;
     p.target_layers = {25, 29, 33, 37, 41, 0, 0, 0};

@@ -106,6 +106,11 @@ public:
     [[nodiscard]] std::uint32_t position() const noexcept;
     [[nodiscard]] std::uint32_t next_token() const noexcept;  // argmax of the last logits, lower index on ties
     [[nodiscard]] const Config& config() const noexcept;
+    // Read-only taps for a drafter that shares this model's state (DFly2 KV Share + last-layer hidden); no bit change.
+    // The latent row of `layer` at `position`: [kv_lora (kv_a_norm output) | qk_rope (after RoPE)], as cached.
+    [[nodiscard]] const std::vector<float>& latent_row(std::uint32_t layer, std::uint32_t position) const;
+    // The last step's hc_head output (the one stream before output_norm) or, when `normed`, the output_norm output.
+    [[nodiscard]] const std::vector<float>& last_hidden(bool normed) const;
 
 private:
     struct State;

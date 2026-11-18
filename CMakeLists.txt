@@ -1018,6 +1018,13 @@ strix_target_warnings(strix_hy4_ref)
 add_executable(strix-hy4-ref apps/hy4_ref_main.cpp)
 target_link_libraries(strix-hy4-ref PRIVATE strix_hy4_ref)
 strix_target_warnings(strix-hy4-ref)
+# DFly2 drafter tools on the oracle: target-state taps of a greedy run (the drafter's KV-share / hidden inputs).
+add_library(strix_hy4_dfly_ref STATIC src/hy4/ref/hy4_dfly_ref.cpp)
+target_link_libraries(strix_hy4_dfly_ref PUBLIC strix_hy4_ref)
+strix_target_warnings(strix_hy4_dfly_ref)
+add_executable(strix-hy4-dfly apps/hy4_dfly_main.cpp)
+target_link_libraries(strix-hy4-dfly PRIVATE strix_hy4_dfly_ref)
+strix_target_warnings(strix-hy4-dfly)
 
 # Host-only serving front end (no GPU): JSON, tokenizer, chat template, HTTP and the API mapping.
 add_library(strix_serve STATIC
@@ -1365,6 +1372,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-hy4-host-ref-tests PRIVATE strix_hy4_ref)
     strix_target_warnings(strix-hy4-host-ref-tests)
     add_test(NAME strix-hy4-host-ref-tests COMMAND strix-hy4-host-ref-tests ${STRIX_HY4_GGUF})
+    # DFly2 drafter host reference: synthetic tiny drafter + target view (causal prefix, KV share, slot-0 hidden, switches).
+    add_executable(strix-hy4-dfly-ref-tests tests/hy4_dfly_ref_tests.cpp)
+    target_link_libraries(strix-hy4-dfly-ref-tests PRIVATE strix_hy4_dfly_ref)
+    strix_target_warnings(strix-hy4-dfly-ref-tests)
+    add_test(NAME strix-hy4-dfly-ref-tests COMMAND strix-hy4-dfly-ref-tests)
     # Hy4 HIP binding plan (stage map: every stage a shared entry; cache plan on the shared cache-row layouts).
     add_executable(strix-hy4-hip-plan-tests tests/hy4_hip_plan_tests.cpp)
     target_link_libraries(strix-hy4-hip-plan-tests PRIVATE strix_hy4_ref)
