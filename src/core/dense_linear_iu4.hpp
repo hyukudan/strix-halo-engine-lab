@@ -8,7 +8,12 @@
 //     address: broadcast, L1 resident).
 //   - One block = 8 waves = 64 output columns; the 8 waves split K in contiguous ranges of K / 8 (G / 8 = MaxG K64
 //     groups each), reduce their partial sums in LDS in a fixed ascending order (deterministic, no atomics).
-//   - Rows are padded to the bucket R (1/2/4/8/16); rows past nrows are neither computed nor stored. Default: core
+//   - Rows are padded to the bucket R (1/2/4/8/16); a core call that holds any real row computes all of its Rc rows
+//     (rows past nrows read stale scratch rows: the caller's xh must hold R rows) and only rows < nrows are stored.
+//     Each row's dot products are independent of the other rows (same operands, same order), so stored rows are
+//     bitwise those of a call with fewer rows. Passing the real count instead took `r >= nrows` exits inside the
+//     unrolled row loops of every k-tile: measured on Strix 27B IU4 verify windows rows 3 / 6 / 12 = 127.1 / 130.6 /
+//     140.7 ms vs rows 4 / 8 / 16 = 76.5 / 82.6 / 126.8 ms (hip_dense_dec3-STATE.md). Default: core
 //     calls of up to 8 rows (R <= 8: one call, every weight word read once; R = 16: two 8-row calls), bitwise equal
 //     to the chunked form (per-row op order is identical). One call over 16 rows was measured slower (rows 16
 //     verify 272.8 vs 220.7 ms, Strix 27B IU4) and spills (private segment 144 B): not offered.
@@ -74,9 +79,9 @@ __global__ void __launch_bounds__(32 * kWaves) kernel(const std::uint8_t* w, uns
 #pragma unroll
     for (unsigned h = 0; h * Rc < R; ++h) {
         if (h * Rc >= nrows) break;
-        const unsigned n = nrows - h * Rc;
+        // all Rc rows of a call that holds a real row (the full-bucket instruction stream); the store keeps r < nrows
         w4a16::wave_rows<Rc, KT, MaxG, false, false, UX>(w, ws, outputs, inputs, k0, k0 + KT, quad * 4U, xh + std::size_t(h * Rc) * inputs + k0 * 16U,
-                                       inputs, lane, n < Rc ? n : Rc,
+                                       inputs, lane, Rc,
                                        [&](unsigned, unsigned r, unsigned column, float value) { res[h * Rc + r][column & 1U] += value; });
     }
     const unsigned rel = (lane >> 3U) * 16U + 2U * (lane & 7U);
@@ -102,10 +107,11 @@ inline bool row_reuse() {
     return on;
 }
 // STRIX_IU4_SCALAR_X: 1 = pre-paired activations read through scalar loads (w4a16 UniformX: same dot2 operands and
-// order, bitwise equal), unset/0 = natural layout through vector broadcast loads (the measured incumbent). Opt-in until
-// its node A/B. One switch for prepare() and run() (layout and kernel must agree); off under STRIX_IU4_ROW_REUSE=0.
+// order, bitwise equal; default since its node A/B: plain 75.73 -> 72.27 ms/token, verify rows 8 118.9 -> 82.6 ms,
+// logits bitwise, HDD2-T1), 0 = natural layout through vector broadcast loads (the previous form). One switch for
+// prepare() and run() (layout and kernel must agree); off under STRIX_IU4_ROW_REUSE=0.
 inline bool scalar_x() {
-    static const bool on = envcfg::flag("STRIX_IU4_SCALAR_X", false) && row_reuse();  // recorded in the effective config
+    static const bool on = envcfg::flag("STRIX_IU4_SCALAR_X", true) && row_reuse();  // recorded in the effective config
     return on;
 }
 

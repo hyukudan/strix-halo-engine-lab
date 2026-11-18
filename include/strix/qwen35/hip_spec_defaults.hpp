@@ -17,6 +17,7 @@
 #include <string>
 #include <vector>
 
+#include "strix/qwen35/hip_dense_spec_costs.hpp"
 #include "strix/qwen35/hip_engine.hpp"
 #include "strix/qwen35/iu4_draft_head.hpp"
 #include "strix/spec/block_drafter.hpp"
@@ -68,22 +69,11 @@ inline spec::DraftRowsConfig hip_dense_draft_rows_config(std::uint32_t vocab, co
     return c;
 }
 
-// Shape of the verify-window cost (ms per pass at rows 1/2/4/8/12/16, Strix Halo gfx1151, 27B IU4 pack, 4.1K context;
-// rows <= 8 are one weight stream, rows > 8 two). The arbiter takes it as the curve's shape; measured walls set the scale
-// and replace it where measured (strix/spec/drafting.hpp Arbiter::seed_cost), so no timing runs at startup.
-inline constexpr std::uint32_t kHipDenseVerifyRows[] = {1U, 2U, 4U, 8U, 12U, 16U};
-inline constexpr double kHipDenseVerifyMs[] = {79.0, 81.3, 92.0, 123.7, 200.4, 220.7};
-
-// Drafting block of the qwen35 HIP family: windows up to 16 rows (the engine's max), chain depth 7 (rows 9+ re-stream the
-// weights: 200 ms at 12 rows), lookup + MTP chain + hybrid. Chain step seed = byte estimate per draft position (MTP layer +
-// head at ~182 GB/s), replaced by the measured wall after the first steps.
-inline spec::BlockConfig hip_dense_block_config(const HipDenseSpecPlan& plan) {
-    spec::BlockConfig bc;
-    bc.max_block = HipEngine::max_rows();
-    bc.chain_max_k = 7U;
-    bc.chain = bc.hybrid = !plan.mtp_source.empty();
-    bc.chain_seed_step_ms = plan.draft_rows ? 4.0 : 9.0;
-    return bc;
+// Drafting block of the qwen35 HIP family: windows up to 16 rows (the engine's max), lookup + MTP chain + hybrid, priced
+// by the node work model (hip_dense_spec_costs.hpp: fixed costs, chain cap 15, the CUDA sub15d arm's mechanism) unless
+// `fixed` is false (the previous learned form, cap 7). head_fraction = draft head rows / vocab (1 = full head).
+inline spec::BlockConfig hip_dense_block_config(const HipDenseSpecPlan& plan, bool fixed, double head_fraction) {
+    return hip_dense_spec_block_config(HipEngine::max_rows(), !plan.mtp_source.empty(), fixed, head_fraction);
 }
 
 // Device glue of the shared MTP chain (strix/spec/mtp_chain.hpp) over HipEngine.

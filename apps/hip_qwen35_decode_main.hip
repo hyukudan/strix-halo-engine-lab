@@ -62,7 +62,7 @@ std::vector<int> parse_ids(const std::string& s) {
 int main(int argc, char** argv) try {
     using namespace strix::qwen35;
     std::string model, dump, ids_arg = "1", mtp_arg = "auto", draft_pack;
-    bool draft_rows_on = true;
+    bool draft_rows_on = true, fixed_costs = true;
     unsigned wide = 0;
     unsigned gen = 16, rows = 1, maxpos = 0, repeat = 1;
     for (int i = 1; i < argc; ++i) {
@@ -88,10 +88,15 @@ int main(int argc, char** argv) try {
             if (v != "on" && v != "off") throw std::invalid_argument("--draft-rows on|off");
             draft_rows_on = v == "on";
         }
+        else if (a == "--spec-costs") {               // fixed (default: node work model, hip_dense_spec_costs.hpp) | learned (previous form)
+            const std::string v = next();
+            if (v != "fixed" && v != "learned") throw std::invalid_argument("--spec-costs fixed|learned");
+            fixed_costs = v == "fixed";
+        }
         else throw std::invalid_argument("unknown flag " + a);
     }
     if (model.empty() || rows < 1U || rows > HipEngine::max_rows())
-        throw std::invalid_argument("usage: --model GGUF [--prompt-ids 1,2,3] [--gen N] [--rows 1..16] [--dump-logits FILE] [--iu4-reference] [--mtp auto|off|F] [--draft-rows on|off] [--draft-pack F1,F2] [--max-pos N] [--repeat N]; --prompt-ids @FILE reads the list from FILE");
+        throw std::invalid_argument("usage: --model GGUF [--prompt-ids 1,2,3] [--gen N] [--rows 1..16] [--dump-logits FILE] [--iu4-reference] [--mtp auto|off|F] [--draft-rows on|off] [--draft-pack F1,F2] [--spec-costs fixed|learned] [--max-pos N] [--repeat N]; --prompt-ids @FILE reads the list from FILE");
     if (!ids_arg.empty() && ids_arg[0] == '@') {  // long prompts exceed the per-argument limit of the OS
         std::ifstream f(ids_arg.substr(1));
         if (!f) throw std::invalid_argument("cannot read " + ids_arg.substr(1));
@@ -188,18 +193,29 @@ int main(int argc, char** argv) try {
         }
     });
     std::uint64_t steps = 0, accepted = 0;
+    std::string spec_lines;  // k histogram + strix-spec-stats (per-depth offered / accepted, verify walls per rows)
     const auto t0 = std::chrono::steady_clock::now();
     if (chain) {  // exact speculation: every window is verified; emitted tokens are the target's greedy tokens
         namespace sp = strix::spec;
-        sp::BlockDrafter drafter(hip_dense_block_config(plan), chain.get());
-        for (std::size_t i = 0; i < std::size(kHipDenseVerifyRows); ++i) drafter.seed_verify_ms(kHipDenseVerifyRows[i], kHipDenseVerifyMs[i]);
-        drafter.commit(uprompt);
         std::vector<std::uint32_t> out{std::uint32_t(generated[0])};
-        drafter.commit(std::span<const std::uint32_t>(out.data(), 1));
-        if (drows) {
+        if (drows) {  // the subset is chosen by the prompt first: its share of the head is the draft price (fixed costs)
             drows->begin(uprompt);
             drows->admit(std::span<const std::uint32_t>(out.data(), 1));
         }
+        const double head_fraction = drows ? double(drows->rows()) / double(V) : 1.0;
+        const bool scalar_x = strix::core::dense_iu4::scalar_x();
+        const auto bc = hip_dense_block_config(plan, fixed_costs, head_fraction);
+        sp::BlockDrafter drafter(bc, chain.get());
+        hip_dense_seed_verify(drafter, bc.max_block, fixed_costs, scalar_x);
+        std::printf("spec config: costs %s, verify ms r1 %.1f r2 %.1f r3 %.1f r4 %.1f r8 %.1f r16 %.1f (iu4 scalar_x %d), "
+                    "draft flush %.2f step %.2f ms (head %.1f %%), chain cap %u, max block %u, sources copy%s%s\n",
+                    fixed_costs ? "fixed" : "learned", hip_dense_verify_ms(1, scalar_x), hip_dense_verify_ms(2, scalar_x),
+                    hip_dense_verify_ms(3, scalar_x), hip_dense_verify_ms(4, scalar_x), hip_dense_verify_ms(8, scalar_x),
+                    hip_dense_verify_ms(16, scalar_x), int(scalar_x), bc.chain_seed_flush_ms, bc.chain_seed_step_ms,
+                    100.0 * head_fraction, bc.chain_max_k, bc.max_block, bc.chain ? ",chain" : "", bc.hybrid ? ",hybrid" : "");
+        drafter.commit(uprompt);
+        drafter.commit(std::span<const std::uint32_t>(out.data(), 1));
+        std::uint64_t k_hist[HipEngine::max_rows()] = {};  // drafts verified per step
         E->set_draft_rows(drows.get());
         sp::EngineVerifyTarget<HipEngine> target(*E);
         target.set_observer([&](const HipRowsOut& o, std::uint32_t r) { chain->observe_verify(o, r); });
@@ -214,10 +230,15 @@ int main(int argc, char** argv) try {
             if (r.emitted == 0) break;
             ++steps;
             accepted += r.accepted;
+            ++k_hist[std::min<std::uint32_t>(r.proposed, HipEngine::max_rows() - 1U)];
             if (drows) drows->admit(std::span<const std::uint32_t>(out.data() + out.size() - r.emitted, r.emitted));
         }
         E->set_draft_rows(nullptr);
         generated.assign(out.begin(), out.end());
+        std::string hist;
+        for (std::uint32_t k = 0; k < HipEngine::max_rows(); ++k)
+            if (k_hist[k]) hist += " " + std::to_string(k) + ":" + std::to_string(k_hist[k]);
+        spec_lines = "k hist (drafts verified: steps):" + hist + "\n" + drafter.stats().line() + "\n";
     } else {
         for (unsigned s = 1; s < gen; ++s) {
             const int id = generated.back();
@@ -235,6 +256,7 @@ int main(int argc, char** argv) try {
         std::printf("spec: %zu tokens in %llu steps, E %.2f tokens/step (accepted drafts %llu), %.2f ms/step%s\n", generated.size() - 1U,
                     (unsigned long long)steps, double(generated.size() - 1U) / double(steps), (unsigned long long)accepted,
                     ms / double(steps), drows ? (", " + drows->describe()).c_str() : "");
+    std::fputs(spec_lines.c_str(), stdout);
     if (generated.size() > 1U) {
         const double per = ms / double(generated.size() - 1U);
         const double bytes = double(E->weight_bytes()) + double(E->state_bytes_per_pass()) + double(E->kv_bytes_per_position()) * double(E->committed());
