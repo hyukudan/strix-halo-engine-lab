@@ -66,7 +66,7 @@ struct EngineOptions {
     std::uint32_t max_positions = 4096;  // KV capacity per attention layer (and for the MTP layer)
     bool use_graphs = true;              // CUDA graph per (rows, logits mode)
     bool multi_gemv = true;              // one launch for GEMVs sharing x (q|k|v, qkv|z|beta|alpha); bitwise equal either way
-    bool pdl = false;                    // (measured +0.27 ms loss at C1: off) programmatic dependent launch + weight L2 prefetch between kernels
+    bool pdl = false;                    // experimental, default off: programmatic dependent launch + weight L2 prefetch between kernels
     bool load_mtp = true;                // read blk.<layers> (MTP) tensors when present
     bool quiet = false;
     // TURBO levers (default off = exact BF16/q8_0 identity). Each lever is individually switchable.
@@ -193,6 +193,15 @@ public:
     };
     MtpOut mtp_forward(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0,
                     bool want_top = true);  // want_top=false: skip lm_head + argmax (logits/top null): KV/hidden only
+    // Device-fed MTP chain (strix/spec/mtp_chain.hpp): one row at `pos` whose input id is *in_host (by value) or, with
+    // in_host null, the id in feed slot in_slot on the device; want_top also stores the row's draft id in slot out_slot.
+    // The chain enqueues a whole draft without host round trips and reads the ids once (mtp_feed_read). Same kernels and
+    // operands as mtp_forward(rows 1), so the drafted ids are bitwise those of the host-fed chain.
+    static constexpr std::uint32_t kMtpFeedSlots = 64;
+    MtpOut mtp_step_fed(const std::uint32_t* in_host, std::uint32_t in_slot, std::uint32_t out_slot, const float* hidden_dev,
+                        std::uint32_t pos, bool want_top = true);
+    void mtp_feed_put(std::uint32_t slot, const std::uint32_t* top_dev);  // slot = *top_dev (async, device to device)
+    void mtp_feed_read(std::uint32_t n, std::uint32_t* host) const;       // host[0..n) = slots 0..n-1 (synchronizes)
     // Draft-only MTP head over a vocabulary subset (strix/spec/draft_rows.hpp, group 16 = one NVFP4 tile of the head):
     // before each head launch the engine copies the rows' new tiles into a compact head (device-to-device, no
     // re-quantisation) and maps the argmax back to token ids on the device, so MtpOut::top stays a token id. MtpOut::logits
