@@ -1054,9 +1054,9 @@ evidence below was measured with FP32 pools.
 
 <a id="qwen-plain-decode-step"></a>
 
-### Plain decode step: grouped QSA attention, fused selection maxima, two-launch MoE glue
+### Plain decode step: grouped QSA attention, fused selection maxima, two-launch MoE glue, slot merge in the A8 down launch
 
-**Engine:** `qwen`. **Controls:** `STRIX_QSA_DECODE_ATTN_V2`, `STRIX_QSA_DECODE_VALUE_V2`, `STRIX_QSA_DECODE_FUSED_MAXIMA`, `STRIX_MOE_R1_GLUE_FUSE`. **Default:** 1 each.
+**Engine:** `qwen`. **Controls:** `STRIX_QSA_DECODE_ATTN_V2`, `STRIX_QSA_DECODE_VALUE_V2`, `STRIX_QSA_DECODE_FUSED_MAXIMA`, `STRIX_MOE_R1_GLUE_FUSE`, `STRIX_MOE_R1_TAIL_FOLD`. **Default:** 1 each.
 
 Four exact changes to the one-row (plain, non-MTP) decode step, each with its own switch:
 
@@ -1071,14 +1071,50 @@ Four exact changes to the one-row (plain, non-MTP) decode step, each with its ow
 - `STRIX_MOE_R1_GLUE_FUSE`: the routed experts step with A8 down runs its glue in two launches instead of nine (one CTA
   clears the accumulation, checks routes and weights and quantizes; one CTA merges, scans for non-finite values,
   commits and publishes the first-error record), with the same per-element work and status semantics.
+- `STRIX_MOE_R1_TAIL_FOLD` (needs the glue fuse): the second glue launch goes away; the A8 down launch merges its own
+  slot partials. Per 64-row output tile the last slot block to arrive (an atomic ticket after a device fence) runs the
+  incumbent merge for its rows: +0 seed, slots in index order, the same `v_fmac` operand roles, the same commit
+  threshold; the last tile commits, sets status bit 8 and merges the first-error record, then clears the tickets.
+  Contract `include/strix/moe_slot_merge.hpp`; 48 fewer launches per Qwen MoE token.
 
 - **Preconditions:** Eager plain one-row decode (CLI serial route, either rope route); BF16 KV, head_dim 256, a multiple of four query heads per KV head; no device graph, graph position or status word. The fused maxima need the serial decode pool's own scores with the maxima selection (`STRIX_QSA_DECODE_SELECT`) and are declined under `STRIX_QSA_DECODE_POOL_CHECK=1`. The MoE glue needs the A8 down profile with deferred MoE status. MTP windows, prefill tiles and cohorts are untouched.
 - **Automatic selection:** On when unset; `=0`, `--baseline`, `STRIX_BASELINE=1` and `STRIX_QPF2K_DEFAULTS=0` turn each off; GSQ checkpoints keep the three QSA items off. All four are allowed on the explicit YaRN route.
 - **Fallback notice:** Unadmitted shapes and routes run the previous kernels without a notice.
 - **Exactness evidence:** Byte-identical by construction and fixture: `strix-hip-qsa-window-attn-v2-tests` (score, probabilities and value/gate output vs `attention_score_kernel` + `attention_softmax_kernel` + `attention_output_kernel`, NaN keys and queries), `strix-hip-qsa-decode-pool-bf16-tests` (scores and group maxima vs the scorer plus `row_maxima_kernel`, 1..262,144 blocks, non-finite keys, canaries), `strix-hip-q4k-a8-probe-tests` (serial prologue vs clear + route checks + quantizer for every error class) and `strix-hip-moe-r1-glue-tail-tests` (tail vs merge, finite scan, commit and publication: sticky status, +-inf, NaN payloads, BF16 overflow, invalid route, preset record). Full model: a 2,304-token prompt (576 complete blocks, above the 512-block selection) and a 32,768-token prompt (64 steps) give byte-identical full FP32 logits for every decode step ON vs OFF vs ON, tokens identical at 1K and 32K.
-- **Off switch:** STRIX_QSA_DECODE_ATTN_V2=0, STRIX_QSA_DECODE_VALUE_V2=0, STRIX_QSA_DECODE_FUSED_MAXIMA=0, STRIX_MOE_R1_GLUE_FUSE=0
+- **Off switch:** STRIX_QSA_DECODE_ATTN_V2=0, STRIX_QSA_DECODE_VALUE_V2=0, STRIX_QSA_DECODE_FUSED_MAXIMA=0, STRIX_MOE_R1_GLUE_FUSE=0, STRIX_MOE_R1_TAIL_FOLD=0 (the two-launch glue)
 - **Measured gain:** plain decode, prose prompt, 256 tokens, ON vs all four switches off, interleaved ABAB on one node: 1K 43.95 -> 41.59 ms/step (-5.4 %), 32K 46.75 -> 43.92 ms/step (-6.1 %), 262K (explicit YaRN factor 2, default prefill, 128 tokens) 49.46 -> 45.91 ms/step (-7.2 %, 20.2 -> 21.8 tok/s); tokens identical in every pair
 - **Implementation / evidence:** [QSA launcher](../src/hip_indexed_attention_launcher.hip), [pooled scorer](../src/hip_qsa_pooled_score.inc), [MoE experts launcher](../src/hip_moe_experts_launcher.hip), [A8 probe](../src/hip_moe_q4k_a8_probe.hip)
+
+<a id="qwen27-hip-decode-step"></a>
+
+### Qwen 27B HIP: decode launch fusion, one IU4 sweep for 16-row windows, EXACT 64-row prefill windows
+
+**Engine:** `qwen` (27B dense, HIP). **Controls:** `STRIX_DECODE_FUSE`, `STRIX_IU4_ONE_SWEEP`, `--wide-exact N` (decode
+app), `--prefill-rows N --prefill-exact` (spec app). **Default:** 1 each; the spec app takes 64-row EXACT prefill windows,
+the decode app keeps 16-row windows unless `--wide-exact N`, the pair app keeps `--wide N` on the FAST class.
+
+- `STRIX_DECODE_FUSE`: each residual add folds into the next RMS norm, and for windows of <= 16 rows the norms and the
+  SiLU pass store the prepared FP16 rows of the next IU4 projections (one prepare per input instead of one per
+  projection); projections of the same prepared rows run as one launch (`include/strix/decode_projection_group.hpp`).
+- `STRIX_IU4_ONE_SWEEP`: scalar-activation windows of 9..16 rows read the IU4 weights once (one 16-row sweep,
+  `include/strix/decode_weight_sweep.hpp`) instead of two 8-row sweeps; rows <= 8 are unaffected.
+- EXACT wide prefill windows: the 16-row arithmetic over 64-row windows; the IU4 dense projections take one row-block
+  grid launch per window (`src/core/dense_iu4_rows.hpp`: the 8-row blocks of a column block share its weight slice
+  through the cache), GDN and attention keep their exact kernels. Only when every large dense projection the engine
+  loads is IU4 (`qwen35::resolve_prefill_rows`); a Q8_0 / BF16 file resolves to 16-row windows with a notice until it
+  has its own identity and timing ticket.
+
+- **Preconditions:** Qwen 27B dense on the HIP engine; IU4 dense projections for the wide windows and the prepared rows.
+- **Fallback notice:** The engine prints `prefill windows: N -> 16 rows` when a non-IU4 projection declines the wide form.
+- **Exactness evidence:** Same arithmetic, same bits by construction. Qwen 27B IU4: 2,048-token prefill last-row logits
+  bitwise (`--wide 16` vs `--wide-exact 64`, 4 decoded ids equal); speculative decode ids equal to plain decode over
+  1,200 tokens; plain decode ids equal to main over 128 tokens; GDN rollback replay device test PASS.
+- **Off switch:** STRIX_DECODE_FUSE=0, STRIX_IU4_ONE_SWEEP=0; `--prefill-rows 16` (spec app) for 16-row prefill windows.
+- **Measured gain:** One Strix Halo node, Qwen 27B IU4, one ticket per row, not a speed claim: prefill 2,048 tokens,
+  decode app `--wide 16` 132.5 / 132.5 tok/s vs `--wide-exact 64` 189.6 / 188.7 tok/s (cold / warm; the wide arm ran at
+  the lower clock); plain decode 128 tokens 71.47 vs 70.26 ms/token (one pair per ticket).
+- **Implementation / evidence:** [engine](../src/qwen35/hip/engine.hip), [IU4 dense core](../src/core/dense_linear_iu4.hpp),
+  [row-block grid](../src/core/dense_iu4_rows.hpp), [options](../include/strix/qwen35/hip_engine.hpp)
 
 <a id="qwen-decode-fuse"></a>
 

@@ -23,17 +23,36 @@ namespace strix::qwen35 {
 struct HipEngineOptions {
     std::uint32_t max_positions = 4096;  // KV capacity per full-attention layer
     bool quiet = false;
-    // forward_commit window width. 16 = exact (the serial arithmetic). > 16 = FAST policy dense-q8a8-f16-v1 (shared
-    // core::f16_dense_tall::q8a8: A8 activations x Q8_0 weights, FP16 WMMA; IU4 weights: dense-iu4a16-f16-v1 of
-    // core::f16_dense_tall::iu4a16, FP16 activations x decoded IU4) for the dense projections of those wide windows;
-    // GDN and attention keep their exact kernels. Decode windows (forward_rows) stay <= 16 rows.
-    std::uint32_t prefill_rows = 16;
+    // forward_commit window width. <= 16: the 16-row exact windows. > 16 with wide_exact: EXACT wide windows (below).
+    // > 16 without wide_exact: FAST policy dense-q8a8-f16-v1 (shared core::f16_dense_tall::q8a8: A8 activations x Q8_0
+    // weights, FP16 WMMA; IU4 weights: dense-iu4a16-f16-v1 of core::f16_dense_tall::iu4a16, FP16 activations x decoded
+    // IU4) for the dense projections of those wide windows; GDN and attention keep their exact kernels. Decode windows
+    // (forward_rows) stay <= 16 rows.
+    // Default: 64-row EXACT windows. Measured on Strix 27B IU4 (one node): every row bitwise the 16-row result (last-row
+    // logits + generated ids at 2K and 4K, widths 32..512), 2K warm 131.6-132.8 -> 185.2-187.4 tok/s (3 ABAB pairs),
+    // 4K 128.3 -> 160.6 tok/s; 64 rows beat 128 / 256 / 512 (the exact decode attention costs more per row in wider
+    // grids: 4K attend 0.79 -> 2.10 ms/row at 512 rows). Rollback: prefill_rows = 16 (or wide_exact = false for FAST).
+    std::uint32_t prefill_rows = 64;
+    // prefill_rows > 16 in the EXACT class instead of FAST: the 16-row arithmetic over wide windows (IU4 dense projections
+    // through core::dense_iu4::run's row-block grid: the 8-row blocks of a column block share its weight slice through the
+    // cache instead of re-streaming it per 8 rows; Q8_0 / BF16 keep 16-row sweeps; exact decode attention, GDN dims rows =
+    // window). Every row is bitwise the 16-row result by construction (and by the tickets above).
+    bool wide_exact = true;
     // Owned layer range [layer_begin, layer_end) of a multi-rank layer split (layer_end 0 = every layer: one rank, today's
     // engine). Only the owned layers' weights, KV cache and recurrent state are loaded; the embedding is loaded when the
     // range starts at layer 0, the final norm and head when it ends at the last layer.
     std::uint32_t layer_begin = 0;
     std::uint32_t layer_end = 0;
 };
+
+// Window rows the engine uses for a requested forward_commit width. EXACT wide windows (wide_exact, rows > 16) were
+// measured on IU4 dense projections only (Strix 27B IU4: every large projection and the head IU4, ssm_alpha / ssm_beta
+// Q8_0). When any large dense projection the engine loads is in another format (all_large_iu4 false) the window
+// resolves to the 16-row exact form: the rows are bitwise the same either way, only the unmeasured wide form is not
+// taken. Provisional until an identity + timing ticket on a Q8_0 or BF16 27B file. The FAST class is not affected.
+[[nodiscard]] constexpr std::uint32_t resolve_prefill_rows(std::uint32_t requested, bool wide_exact, bool all_large_iu4) noexcept {
+    return wide_exact && requested > 16U && !all_large_iu4 ? 16U : requested;
+}
 
 struct HipRowsOut {
     const float* logits = nullptr;       // device [rows][vocab] (all) or [1][vocab] (last); null for none

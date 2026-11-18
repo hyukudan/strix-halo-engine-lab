@@ -80,7 +80,11 @@ unsigned limit = 0;
 float* base_out = nullptr;
 std::vector<unsigned> seen;
 std::vector<const void*> scratch_seen;
-struct Iu4Scratch { void *xh = nullptr, *g = nullptr, *u = nullptr; };
+// engine.hip Iu4Scratch.rows: the rows its FP16 scratch holds (16, or the EXACT wide window). The EXACT wide branch takes
+// only IU4 weights (kIu4Fmt, type 200 as wide_iu4_ok below); the audited tensors are bf16 / q8_0, so it is not reached here.
+struct Iu4Scratch { void *xh = nullptr, *g = nullptr, *u = nullptr; unsigned rows = 16U; };
+constexpr unsigned kMaxRows = 16U;
+constexpr unsigned kIu4Fmt = 200U;
 void linear16(const Tensor&, const float*, float* out, unsigned rows, hipStream_t, const Iu4Scratch&) {
     // The dispatcher computes the 1/2/4/8/16 bucket but stores only `rows` rows (dense_linear::kernel and
     // dense_linear_iu4 `nrows` guards); pad rows are only read, inside the engine's 16-row scratch.

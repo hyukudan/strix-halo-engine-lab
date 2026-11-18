@@ -14,9 +14,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <initializer_list>
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "strix/env_flags.hpp"
@@ -255,6 +257,16 @@ __global__ void silu_mul_kernel(const float* g, const float* u, float* out, std:
     for (std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += std::size_t(gridDim.x) * blockDim.x)
         out[i] = dl::silu(g[i]) * u[i];
 }
+// silu_mul_kernel + store(i, out[i]) (the next projection's prepared input): same product, one launch less.
+template <class Store>
+__global__ void silu_mul_store_kernel(const float* g, const float* u, float* out, std::size_t n, Store store) {
+    for (std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += std::size_t(gridDim.x) * blockDim.x) {
+        float v = dl::silu(g[i]) * u[i];
+        out[i] = v;
+        asm volatile("" : "+v"(v));  // FP32 product rounded before the FP16 conversion (no mixed-precision fold)
+        store(i, v);
+    }
+}
 bool wide_ok(const Tensor& t, const WideScratch& wide) { return wide.codes && t.fmt == 8U && t.inputs % 128U == 0U && t.outputs % 16U == 0U; }
 // out[r][o] for rows > 16 from already quantized activations (codes / deltas in wide).
 void wide_dense(const Tensor& w, float* out, unsigned rows, hipStream_t s, const WideScratch& wide) {
@@ -272,7 +284,8 @@ void wide_quant(const float* x, unsigned inputs, unsigned rows, hipStream_t s, c
 }
 // ---- IU4 g64 pack (ggml type 200): shared W4A16 core, third dense weight format -----------------------------------------
 // FP16 activation rows and F32 gate / up rows of the 16-row windows; non-owning view, the engine Impl owns the allocations.
-struct Iu4Scratch { _Float16* xh = nullptr; float *g = nullptr, *u = nullptr; };
+// rows: their row capacity (16, or the EXACT wide window rounded up to dense_iu4::kWideRows).
+struct Iu4Scratch { _Float16* xh = nullptr; float *g = nullptr, *u = nullptr; unsigned rows = 16U; };
 constexpr unsigned kIu4Fmt = gguf::type_strix_iu4_g64;
 void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s, const WideScratch& wide, const Iu4Scratch& iu4);
 void linear16(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s, const Iu4Scratch& iu4) {
@@ -284,7 +297,15 @@ void linear16(const Tensor& w, const float* x, float* out, unsigned rows, hipStr
         core::dense_iu4::linear(w.data, w.inputs, w.outputs, x, iu4.xh, out, rows, s);
     } else throw std::runtime_error("dense projection needs bf16, q8_0 or iu4 weights");
 }
-void glu16(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned rows, hipStream_t s, const Iu4Scratch& iu4) {
+// STRIX_DECODE_FUSE (default on; 0 = the separate launches): decode launch fusion, see run_range.
+bool decode_fuse() {
+    static const bool on = strix::envcfg::flag("STRIX_DECODE_FUSE", true);
+    return on;
+}
+// Decode launch fusion (rows <= 16, one sweep): ready = iu4.xh already holds x prepared by its producer (norm epilogue);
+// h16 = the SiLU pass of an IU4 gate / up (no reference flag) also stores out prepared for the next IU4 projection.
+void glu16(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned rows, hipStream_t s, const Iu4Scratch& iu4,
+           bool ready = false, bool h16 = false) {
     if (g.fmt != u.fmt || g.outputs != u.outputs) throw std::runtime_error("gate/up mismatch");
     if (g.fmt == 30U) dispatch_rows<wd::Format::bf16, dl::Epilogue::silu_mul>(rows, g, u, x, out, s);
     else if (g.fmt == 8U) dispatch_rows<wd::Format::q8_0, dl::Epilogue::silu_mul>(rows, g, u, x, out, s);
@@ -295,11 +316,53 @@ void glu16(const Tensor& g, const Tensor& u, const float* x, float* out, unsigne
             core::dense_iu4::reference(u.data, u.inputs, u.outputs, x, iu4.u, rows, s);
             return silu_mul_kernel<<<256, 256, 0, s>>>(iu4.g, iu4.u, out, std::size_t(rows) * g.outputs);
         }
-        core::dense_iu4::prepare(x, iu4.xh, g.inputs, rows, s);
-        core::dense_iu4::run(g.data, g.inputs, g.outputs, iu4.xh, iu4.g, rows, s);
-        core::dense_iu4::run(u.data, u.inputs, u.outputs, iu4.xh, iu4.u, rows, s);
+        if (!ready) core::dense_iu4::prepare(x, iu4.xh, g.inputs, rows, s);
+        if (decode_fuse() && rows <= kMaxRows) {  // gate + up: one projection-group launch (groups take <= 16 rows;
+                                                  // EXACT wide windows run each projection on the core's wide grid)
+            core::dense_iu4::run_group({{g.data, g.outputs, iu4.g}, {u.data, u.outputs, iu4.u}}, g.inputs, iu4.xh, rows, s);
+        } else {
+            core::dense_iu4::run(g.data, g.inputs, g.outputs, iu4.xh, iu4.g, rows, s);
+            core::dense_iu4::run(u.data, u.inputs, u.outputs, iu4.xh, iu4.u, rows, s);
+        }
+        if (h16) {  // gate / up have read xh (stream order): it now takes the prepared rows of out
+            return silu_mul_store_kernel<<<256, 256, 0, s>>>(iu4.g, iu4.u, out, std::size_t(rows) * g.outputs,
+                                                             core::dense_iu4::prepared_store(iu4.xh));
+        }
         silu_mul_kernel<<<256, 256, 0, s>>>(iu4.g, iu4.u, out, std::size_t(rows) * g.outputs);
     } else throw std::runtime_error("gate/up need bf16, q8_0 or iu4");
+}
+// linear() whose input x may already be prepared in iu4.xh (ready, rows <= 16): an IU4 projection runs on those rows;
+// any other projection takes the normal path (an IU4 re-prepare of the same x writes the same bytes).
+void linear_ready(const Tensor& w, const float* x, bool ready, float* out, unsigned rows, hipStream_t s, const WideScratch& wide,
+                  const Iu4Scratch& iu4) {
+    if (ready && rows <= kMaxRows && w.fmt == kIu4Fmt && iu4.xh && !core::dense_iu4::reference_flag())
+        return core::dense_iu4::run(w.data, w.inputs, w.outputs, iu4.xh, out, rows, s);
+    linear(w, x, out, rows, s, wide, iu4);
+}
+// Projections of the same prepared rows iu4.xh as ONE launch (decode step plan, strix/decode_projection_group.hpp) when
+// every member is an IU4 projection of one input width (rows <= 16, no reference flag, fusion on); otherwise each runs
+// as linear_ready(). Same block body and operands per output: same bits.
+void group_ready(std::initializer_list<std::pair<const Tensor*, float*>> members, const float* x, bool ready, unsigned rows,
+                 hipStream_t s, const WideScratch& wide, const Iu4Scratch& iu4) {
+    bool one = ready && decode_fuse() && rows <= kMaxRows && iu4.xh && !core::dense_iu4::reference_flag() &&
+               members.size() <= core::dense_iu4::kGroupMax;
+    for (const auto& m : members) one = one && m.first->fmt == kIu4Fmt && m.first->inputs == members.begin()->first->inputs;
+    if (!one) {
+        for (const auto& m : members) linear_ready(*m.first, x, ready, m.second, rows, s, wide, iu4);
+        return;
+    }
+    core::dense_iu4::Member list[core::dense_iu4::kGroupMax]{};
+    unsigned n = 0;
+    for (const auto& m : members) list[n++] = {m.first->data, m.first->outputs, m.second};
+    core::dense_iu4::run_group(list, n, members.begin()->first->inputs, iu4.xh, rows, s);
+}
+// mlp() of a window of rows <= 16 whose x is already prepared in iu4.xh (norm epilogue): gate / up run on it, and for an
+// IU4 gate / up / down the SiLU pass prepares h, so down runs without its own prepare. Same arithmetic as mlp().
+void mlp_ready(const Tensor& g, const Tensor& u, const Tensor& d, const float* x, float* h, float* out, unsigned rows, hipStream_t s,
+               const WideScratch& wide, const Iu4Scratch& iu4) {
+    const bool h16 = g.fmt == kIu4Fmt && d.fmt == kIu4Fmt && !core::dense_iu4::reference_flag();  // glu16's IU4 branch
+    glu16(g, u, x, h, rows, s, iu4, true, h16);
+    linear_ready(d, h, h16, out, rows, s, wide, iu4);
 }
 // rows > 16 over IU4 weights: FAST dense-iu4a16-f16-v1 (f16_dense_iu4.hpp), the same opt-in as the Q8_0 wide windows
 // (prefill_rows > 16 allocates the wide scratch). The exact reference flag keeps the 16-row sweeps.
@@ -359,6 +422,8 @@ void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStrea
         const bool x16 = wide_iu4_x16(w, wide, rows);
         if (x16) x16_tiles(x, wide.xt, rows, w.inputs, s);
         wide_iu4(w, x, out, rows, s, x16 ? wide.xt : nullptr);
+    } else if (rows > kMaxRows && w.fmt == kIu4Fmt && rows <= iu4.rows) {  // EXACT wide window: one shared-core call (bitwise)
+        linear16(w, x, out, rows, s, iu4);
     } else {  // not a Q8_0 shape the WMMA core takes: exact 16-row sweeps
         core::dense_row_sweeps(rows, [&](unsigned r, unsigned count) {
             linear16(w, x + std::size_t(r) * w.inputs, out + std::size_t(r) * w.outputs, count, s, iu4);
@@ -400,6 +465,8 @@ void glu(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned 
         wide_iu4(g, x, wide.g, rows, s, x16 ? wide.xt : nullptr);
         wide_iu4(u, x, wide.u, rows, s, x16 ? wide.xt : nullptr);
         silu_mul_kernel<<<1024, 256, 0, s>>>(wide.g, wide.u, out, std::size_t(rows) * g.outputs);
+    } else if (rows > kMaxRows && g.fmt == kIu4Fmt && u.fmt == kIu4Fmt && rows <= iu4.rows) {  // EXACT wide window (bitwise)
+        glu16(g, u, x, out, rows, s, iu4);
     } else {
         core::dense_row_sweeps(rows, [&](unsigned r, unsigned count) {
             glu16(g, u, x + std::size_t(r) * g.inputs, out + std::size_t(r) * g.outputs, count, s, iu4);
@@ -408,6 +475,17 @@ void glu(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned 
 }
 void rmsnorm(const float* x, const Tensor& gain, unsigned n, float eps, float* y, unsigned rows, hipStream_t s) {
     ops::norm::rmsnorm_kernel<NormTraits, 256><<<rows, 256, 0, s>>>(x, reinterpret_cast<const float*>(gain.data), 0, n, eps, y);
+}
+// Decode launch fusion through the shared norm core: res != nullptr = x += res first (the residual add of the previous
+// block); xh != nullptr = also the prepared FP16 rows of y for the following IU4 projections (rows <= 16).
+void rmsnorm_fused(float* x, const float* res, const Tensor& gain, unsigned n, float eps, float* y, unsigned rows, _Float16* xh,
+                   hipStream_t s) {
+    const float* w = reinterpret_cast<const float*>(gain.data);
+    if (!res && !xh) return rmsnorm(x, gain, n, eps, y, rows, s);
+    if (!xh) return ops::norm::rmsnorm_fused_kernel<NormTraits, 256, true><<<rows, 256, 0, s>>>(x, res, w, 0, n, eps, y, ops::norm::NoStore{});
+    const auto st = core::dense_iu4::prepared_store(xh);
+    if (res) ops::norm::rmsnorm_fused_kernel<NormTraits, 256, true><<<rows, 256, 0, s>>>(x, res, w, 0, n, eps, y, st);
+    else ops::norm::rmsnorm_fused_kernel<NormTraits, 256, false><<<rows, 256, 0, s>>>(x, nullptr, w, 0, n, eps, y, st);
 }
 
 // Raw GDN inputs of a window (qkv | beta | gate projections, before the in-place conv / transform) -> replay slot.
@@ -584,13 +662,29 @@ struct HipEngine::Impl {
         if (!opt.quiet)
             std::printf("loaded %.2f GiB (layers %u, hidden %u, vocab %u, GDN layers %u)\n", double(loader.total()) / double(1ULL << 30),
                         cfg.layers, H, V, n_gdn);
+        {  // EXACT wide windows only over IU4 large dense projections (qwen35::resolve_prefill_rows)
+            const Tensor* other = nullptr;
+            const auto note = [&](const Tensor& t) { if (!other && t.data && t.fmt != kIu4Fmt) other = &t; };
+            for (unsigned l = own_begin; l < own_end; ++l) {
+                const auto& y = L[l];
+                for (const Tensor* t : {&y.gate, &y.up, &y.down, &y.qkv, &y.z, &y.out, &y.q, &y.k, &y.v, &y.o}) note(*t);
+            }
+            note(head);
+            const unsigned requested = opt.prefill_rows;
+            opt.prefill_rows = qwen35::resolve_prefill_rows(requested, opt.wide_exact, other == nullptr);
+            if (!opt.quiet && opt.prefill_rows != requested)
+                std::printf("prefill windows: %u -> %u rows (EXACT wide windows need IU4 dense projections; a format %u tensor is loaded)\n",
+                            requested, opt.prefill_rows, other->fmt);
+        }
         const unsigned RS = std::max(kMaxRows, opt.prefill_rows);  // scratch rows (wide prefill windows)
         auto fm = [&](float** p, std::size_t n) { alloc0(p, n * RS * 4U); };
         fm(&x, H); fm(&xn, H); fm(&qkv, GC); fm(&z, GV); fm(&beta, GH); fm(&gate, GH); fm(&core, GV); fm(&proj, H);
         fm(&q_in, 2U * QW); fm(&kk, KW); fm(&vv, KW); fm(&qn, QW); fm(&ctx, QW); fm(&gu, I); alloc0(&logits, std::size_t(V) * kMaxRows * 4U);
         fm(&core_r, GV);
         alloc0(&d_ids, RS * 4U);
-        if (RS > kMaxRows) {
+        // EXACT wide windows (opt.wide_exact): no FAST scratch, so the dense projections take the exact core (one Grid2 call
+        // per window over IU4, 16-row sweeps otherwise) and attention the exact decode form (no V^T / flash workspace).
+        if (RS > kMaxRows && !opt.wide_exact) {
             std::size_t maxin = std::max<std::size_t>(H, I);
             alloc0(&wide.codes, std::size_t(RS) * maxin);
             alloc0(&wide.deltas, std::size_t(RS) * (maxin / 32U) * 4U);
@@ -607,10 +701,13 @@ struct HipEngine::Impl {
                 alloc0(&ffail, 4U);
             }
         }
-        {  // IU4 dense weights; sized for the widest dense input / gate-up output of a kMaxRows window (~3 MB)
-            alloc0(&iu4.xh, std::size_t(kMaxRows) * std::max<std::size_t>(H, I) * sizeof(_Float16));
-            alloc0(&iu4.g, std::size_t(kMaxRows) * I * 4U);
-            alloc0(&iu4.u, std::size_t(kMaxRows) * I * 4U);
+        {  // IU4 dense weights; sized for the widest dense input / gate-up output of a kMaxRows window (~3 MB), or of the
+           // EXACT wide window rounded up to the core's row block (512 rows: ~89 MB)
+            const std::size_t IR = opt.wide_exact && RS > kMaxRows ? core::dense_iu4::wide_xh_rows(RS) : kMaxRows;
+            iu4.rows = unsigned(IR);
+            alloc0(&iu4.xh, IR * std::max<std::size_t>(H, I) * sizeof(_Float16));
+            alloc0(&iu4.g, IR * I * 4U);
+            alloc0(&iu4.u, IR * I * 4U);
         }
         alloc0(&d_arg, kMaxRows * 4U);
     }
@@ -679,12 +776,19 @@ struct HipEngine::Impl {
             vt_valid = flash ? pos + n : win_vt_from;
         }
         const unsigned vt_from = win_vt_from;
+        // Decode launch fusion (STRIX_DECODE_FUSE, default on; 0 = the separate launches): each residual add folds into the
+        // next norm, and for rows <= 16 the norms / the SiLU pass store the prepared FP16 rows of the next IU4 projections
+        // (one prepare per input instead of one per projection). Same arithmetic, same bits.
+        const bool fuse = decode_fuse();
+        const bool pre = fuse && n <= kMaxRows && iu4.xh && !core::dense_iu4::reference_flag();
+        _Float16* const xh_pre = pre ? iu4.xh : nullptr;
+        const float* carry = nullptr;  // the previous MLP output, not yet added to x
         for (unsigned l = first; l < last; ++l) {
             auto& y = L[l];
-            rmsnorm(x, y.attn_norm, H, cfg.rms_eps, xn, n, stream);
+            rmsnorm_fused(x, carry, y.attn_norm, H, cfg.rms_eps, xn, n, xh_pre, stream);
+            carry = nullptr;
             if (gdn_index[l] != ~0U) {
-                linear(y.qkv, xn, qkv, n, stream, wide, iu4);
-                linear(y.z, xn, z, n, stream, wide, iu4);
+                group_ready({{&y.qkv, qkv}, {&y.z, z}}, xn, pre, n, stream, wide, iu4);
                 linear(y.beta, xn, beta, n, stream, wide, iu4);
                 linear(y.alpha, xn, gate, n, stream, wide, iu4);
                 if (defer) {
@@ -702,9 +806,7 @@ struct HipEngine::Impl {
                 hip_gdn_decode_step_dims(g, stream);
                 linear(y.out, core, proj, n, stream, wide, iu4);
             } else {
-                linear(y.q, xn, q_in, n, stream, wide, iu4);
-                linear(y.k, xn, kk, n, stream, wide, iu4);
-                linear(y.v, xn, vv, n, stream, wide, iu4);
+                group_ready({{&y.q, q_in}, {&y.k, kk}, {&y.v, vv}}, xn, pre, n, stream, wide, iu4);
                 attn_core::dense_decode::Params p{n, cfg.heads, cfg.kv_heads, 2U * D, cfg.rotary_dim, pos, cfg.rms_eps,
                                                   1.0F / std::sqrt(float(D)), cfg.rope_theta, true};
                 if (flash)
@@ -716,10 +818,16 @@ struct HipEngine::Impl {
                                                          reinterpret_cast<const float*>(y.knorm.data), qn, y.k_cache, y.v_cache, ctx, stream);
                 linear(y.o, ctx, proj, n, stream, wide, iu4);
             }
-            add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H);
-            rmsnorm(x, y.post_norm, H, cfg.rms_eps, xn, n, stream);
-            mlp(y.gate, y.up, y.down, xn, gu, proj, n, stream, wide, iu4);
-            add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H);
+            if (fuse) {
+                rmsnorm_fused(x, proj, y.post_norm, H, cfg.rms_eps, xn, n, xh_pre, stream);
+            } else {
+                add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H);
+                rmsnorm(x, y.post_norm, H, cfg.rms_eps, xn, n, stream);
+            }
+            if (pre) mlp_ready(y.gate, y.up, y.down, xn, gu, proj, n, stream, wide, iu4);
+            else mlp(y.gate, y.up, y.down, xn, gu, proj, n, stream, wide, iu4);
+            if (fuse && l + 1U < last) carry = proj;  // added by the next layer's input norm (a range end flushes it)
+            else add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H);
         }
         HipRowsOut out;
         if (mtp.ok && last == cfg.layers) {  // trunk hidden of every row for the MTP chain (same final norm as the logits path)

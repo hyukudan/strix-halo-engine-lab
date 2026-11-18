@@ -2,6 +2,7 @@
 // plan the family validates, then mutated (missing tensor, wrong head count, wrong arch, wrong shape/type).
 #include "strix/model_family_registry.hpp"
 #include "strix/qwen35/config.hpp"
+#include "strix/qwen35/hip_engine.hpp"
 
 #include <cstdint>
 #include <cstring>
@@ -164,6 +165,18 @@ int main(int argc, char** argv) try {
     }
 
     if (failures == 0) std::cout << "qwen35 config tests passed\n";
+    // HIP 27B window rows (qwen35::resolve_prefill_rows): EXACT wide windows only over IU4 large dense projections;
+    // 16-row windows and the FAST class keep the requested width; a non-IU4 projection resolves an EXACT wide request
+    // to the 16-row exact form. The engine default (64-row EXACT) stays 64 on an all-IU4 load.
+    {
+        using strix::qwen35::resolve_prefill_rows;
+        static_assert(resolve_prefill_rows(64U, true, true) == 64U && resolve_prefill_rows(64U, true, false) == 16U);
+        static_assert(resolve_prefill_rows(512U, false, false) == 512U && resolve_prefill_rows(16U, true, false) == 16U);
+        static_assert(resolve_prefill_rows(0U, true, false) == 0U && resolve_prefill_rows(17U, true, false) == 16U);
+        const strix::qwen35::HipEngineOptions defaults;
+        expect(resolve_prefill_rows(defaults.prefill_rows, defaults.wide_exact, true) == 64U, "IU4 load keeps the 64-row EXACT default");
+        expect(resolve_prefill_rows(defaults.prefill_rows, defaults.wide_exact, false) == 16U, "non-IU4 load resolves to 16-row windows");
+    }
     return failures == 0 ? 0 : 1;
 } catch (const std::exception& e) {
     std::cerr << "FAIL: unexpected exception: " << e.what() << '\n';

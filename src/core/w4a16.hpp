@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include "core/iu4_rows_plan.hpp"
+#include "strix/decode_weight_sweep.hpp"
 
 namespace strix::core::w4a16 {
 
@@ -93,7 +94,16 @@ __device__ __forceinline__ void wave_rows(const std::uint8_t* wq, const std::uin
         const unsigned sh = 16U * (gi & 1U);
         const float s0 = static_cast<float>(__builtin_bit_cast(_Float16, static_cast<std::uint16_t>(sc[0][gi / 2U] >> sh)));
         const float s1 = static_cast<float>(__builtin_bit_cast(_Float16, static_cast<std::uint16_t>(sc[1][gi / 2U] >> sh)));
-        constexpr int Chunk = ChunkedRows ? 4 : R;
+        // XRows: UniformX rows whose activation words are held in SGPRs at once (8 words per row; 8 rows = 64 SGPRs,
+        // 16 would pass the 106-SGPR wave limit). Rows past XRows take another load + wait per k-tile; each row's
+        // operands and dot2 order are unchanged, so every row is bitwise the same for any XRows. R <= 8: one chunk.
+        constexpr int OperandRows = static_cast<int>(::strix::decode::kHipIu4ScalarX.operand_rows);
+        constexpr int XRows = UniformX && R > OperandRows ? OperandRows : R;
+        static_assert(R % XRows == 0, "activation chunks cover the rows bucket");
+        constexpr int Chunk = ChunkedRows ? 4 : XRows;
+        // UniformX indexes xw by the row inside its activation chunk: row chunks must nest inside it. (The vector form
+        // keeps its previous loop: one activation chunk, row chunks of 4 may pass a bucket under 4 rows.)
+        static_assert(!UniformX || XRows % Chunk == 0, "row chunks nest inside activation chunks");
         float dot[StoreDots ? Chunk : R][2] = {};
 #pragma unroll
         for (unsigned t = 0; t < 4U; ++t) {
@@ -104,21 +114,24 @@ __device__ __forceinline__ void wave_rows(const std::uint8_t* wq, const std::uin
             for (unsigned q = 0; q < 4U; ++q)
 #pragma unroll
                 for (unsigned j = 0; j < 4U; ++j) wn[q][j] = nibble_pair(wv[q], 4U * j);
-            // UniformX: every row's words of this k-tile are requested before the first is used (scalar loads complete
-            // out of order, so each use waits lgkmcnt(0): one exposed latency per k-tile instead of one per row).
-            [[maybe_unused]] std::uint32_t xw[UniformX ? R : 1][8];
+#pragma unroll
+            for (int xb = 0; xb < R; xb += XRows) {
+            // UniformX: every row's words of this activation chunk are requested before the first is used (scalar loads
+            // complete out of order, so each use waits lgkmcnt(0): one exposed latency per chunk and k-tile, not per row).
+            [[maybe_unused]] std::uint32_t xw[UniformX ? XRows : 1][8];
             if constexpr (UniformX) {
 #pragma unroll
-                for (int r = 0; r < R; ++r) {
+                for (int i = 0; i < XRows; ++i) {
+                    const int r = xb + i;
                     if (static_cast<unsigned>(r) >= nrows) break;
                     const auto* xr = (const ConstU32*)(x32) +  // address-space cast (C-style only)
                                      (static_cast<std::size_t>(r) * xs_stride + (k + t - k0) * 16U) / 2U;
 #pragma unroll
-                    for (unsigned j = 0; j < 8U; ++j) xw[r][j] = xr[j];
+                    for (unsigned j = 0; j < 8U; ++j) xw[i][j] = xr[j];
                 }
             }
 #pragma unroll
-            for (int h = 0; h < R; h += Chunk) {
+            for (int h = xb; h < xb + XRows; h += Chunk) {
 #pragma unroll
             for (int r = 0; r < Chunk; ++r) {
                 const unsigned row = static_cast<unsigned>(h + r);
@@ -134,8 +147,8 @@ __device__ __forceinline__ void wave_rows(const std::uint8_t* wq, const std::uin
                 if constexpr (UniformX) {  // pre-paired words (core/iu4_x_pairs.hpp): already the dot2 operands
 #pragma unroll
                     for (unsigned j = 0; j < 4U; ++j) {
-                        pl[j] = __builtin_bit_cast(Half2, xw[row][j]);
-                        ph[j] = __builtin_bit_cast(Half2, xw[row][4U + j]);
+                        pl[j] = __builtin_bit_cast(Half2, xw[row - static_cast<unsigned>(xb)][j]);
+                        ph[j] = __builtin_bit_cast(Half2, xw[row - static_cast<unsigned>(xb)][4U + j]);
                     }
                 } else {
                     const auto* xr = x32 + (static_cast<std::size_t>(row) * xs_stride + (k + t - k0) * 16U) / 2U;
@@ -166,6 +179,7 @@ __device__ __forceinline__ void wave_rows(const std::uint8_t* wq, const std::uin
                 // scheduling; neither fence emits a device barrier or wait.
                 asm volatile("" ::: "memory");
                 __builtin_amdgcn_sched_barrier(0);
+            }
             }
             }
         }

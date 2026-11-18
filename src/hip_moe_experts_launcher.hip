@@ -24,6 +24,7 @@
 #include "strix/hip_q51_grouped_down_probe.hpp"
 #include "strix/hip_moe_a8_down.hpp"
 #endif
+#include "strix/moe_slot_merge.hpp"
 // Self-contained format headers (STRIX_GGML_KINDS_GSQ, hip_ggml, gsq_a8) are needed with the A8 runtime OFF too.
 #include "strix/hip_ggml_weight_formats.hpp"
 #include "strix/gsq_a8_groups.hpp"
@@ -267,15 +268,8 @@ __device__ void store_activation(
 __device__ void store_activation(
     std::uint16_t* destination,
     float value) {
-    const auto bits =
-        __float_as_uint(value);
-    const auto rounded =
-        bits +
-        0x7fffU +
-        ((bits >> 16U) & 1U);
-    *destination =
-        static_cast<std::uint16_t>(
-            rounded >> 16U);
+    // One rounding with the in-launch slot-merge commit (strix/moe_slot_merge.hpp).
+    *destination = moe_slot_merge::bf16_rne(__float_as_uint(value));
 }
 
 __device__ std::uint8_t iq4_local_scale(
@@ -1336,6 +1330,13 @@ bool moe_r1_glue_fuse_enabled() {
     static const bool on = qpf2k::long_context_item_enabled("STRIX_MOE_R1_GLUE_FUSE", false);
     return on && !qpf2k::baseline;
 }
+// STRIX_MOE_R1_TAIL_FOLD (default on, needs the glue fuse): the separate one-CTA tail above goes away; the A8 down
+// launch merges its own slot partials (strix/moe_slot_merge.hpp, bitwise the same tail). 48 fewer launches per
+// Qwen MoE token. Off with STRIX_MOE_R1_TAIL_FOLD=0 (the two-launch glue), the baseline or STRIX_QPF2K_DEFAULTS=0.
+bool moe_r1_tail_fold_enabled() {
+    static const bool on = qpf2k::long_context_item_enabled("STRIX_MOE_R1_TAIL_FOLD", false);
+    return on && !qpf2k::baseline;
+}
 void enqueue_serial_tail_for_test(bool fused, const float* rawdots, const std::uint32_t* routes,
     const float* route_weights, std::uint32_t hidden_size, std::uint32_t experts, std::uint32_t top_k,
     float* accumulation, std::uint16_t* output, std::uint32_t* status, void* record, hipStream_t stream) {
@@ -1503,9 +1504,14 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
     const bool glue_fuse = prepared.a8_down_request && config.deferred_moe_status && aggregate == nullptr &&
         layout.status_offset == layout.accumulation_offset + layout.accumulation_bytes && layout.accumulation_bytes % 4U == 0U &&
         moe_r1_glue_fuse_enabled();
+    // The slot-merge tickets directly follow the status word, so the same prologue clear zeroes them.
+    const bool tail_fold = glue_fuse && layout.ticket_offset == layout.status_offset + 4U &&
+        layout.ticket_bytes == 4ULL * moe_slot_merge::ticket_words(config.hidden_size) &&
+        config.top_k <= moe_slot_merge::max_slots && moe_r1_tail_fold_enabled();
     if (glue_fuse) {
         moe_q4k_a8::enqueue_serial_prologue_probe(request,bindings,accumulation,
-            static_cast<unsigned>(layout.accumulation_bytes / 4U),weights,hip_execution_stream());
+            static_cast<unsigned>((layout.accumulation_bytes + (tail_fold ? 4U + layout.ticket_bytes : 0U)) / 4U),
+            weights,hip_execution_stream());
     } else {
     check_hip(hipMemsetAsync(accumulation,0,
         static_cast<std::size_t>(layout.accumulation_bytes + 4),hip_execution_stream()),
@@ -1548,7 +1554,24 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
     }
     scan(workspace,2U*config.intermediate_size*config.top_k);
     }
-    if (glue_fuse) {
+    if (tail_fold) {
+        // The ordered slot merge, finite test, commit and record run inside the down launch (bitwise the tail below).
+        moe_q4k_a8::SlotMergeTail tail;
+        tail.tickets = reinterpret_cast<std::uint32_t*>(temporary.address + layout.ticket_offset);
+        tail.route_weights = weights;
+        tail.accumulation = accumulation;
+        tail.output = reinterpret_cast<void*>(output.address);
+        tail.output_bf16 = std::is_same_v<Storage, std::uint16_t>;
+        tail.bf16_commit = config.activation == HipActivationStorage::bf16;
+        tail.record = hip_deferred_moe_status();
+        tail.domain = static_cast<std::uint32_t>(DeferredMoeDomain::q4k_a8);
+        moe_q4k_a8::enqueue_down_rawdots(*prepared.a8_down_request,prepared.a8_down_bindings,tail,hip_execution_stream());
+        if (config.q4k_a8_stats) {
+            auto& counter = prepared.a8_down_request->weight_type == 7U ?
+                config.q4k_a8_stats->a8_down_q51_submissions : config.q4k_a8_stats->a8_down_q80_submissions;
+            counter.fetch_add(1,std::memory_order_relaxed);
+        }
+    } else if (glue_fuse) {
         moe_q4k_a8::enqueue_down_rawdots(*prepared.a8_down_request,
             prepared.a8_down_bindings,hip_execution_stream());
         hipLaunchKernelGGL(HIP_KERNEL_NAME(q4k_a8_serial_tail_kernel<Storage>),dim3(1),dim3(1024),0,hip_execution_stream(),

@@ -13,6 +13,8 @@
 #include "strix/model_runtime_binding.hpp"
 #ifdef STRIX_HAS_EXPERIMENTAL_Q4K_A8_RUNTIME
 #include "q4k_a8_oracle.hpp"
+#include "strix/hip_moe_a8_down.hpp"
+#include "strix/moe_slot_merge.hpp"
 #endif
 
 #include <hip/hip_fp16.h>
@@ -476,6 +478,120 @@ static void r1_glue_tail() {
     for (void* p : {static_cast<void*>(rawdots), static_cast<void*>(weights), static_cast<void*>(accumulation), static_cast<void*>(routes),
             static_cast<void*>(status), static_cast<void*>(output), record}) check(hipFree(p), "tail free");
 }
+// STRIX_MOE_R1_TAIL_FOLD: the A8 down launch with the in-launch slot merge (SlotMergeTail) against the same down
+// launch without it followed by the incumbent one-CTA tail, on the real rawdots of the down kernels: Q5_1 and Q8_0;
+// with r1-slot-merge-tail-gsq (run under STRIX_GSQ_Q20_A8=1) also Q2_0 and IQ4_NL. Bytes of rawdots, accumulation, output, status, aggregate and the first-error record equal; the
+// ticket words are zero afterwards. Cases of r1_glue_tail moved to inputs the down launch keeps: sticky status,
+// +inf / NaN / BF16-overflowing route weights, an invalid route, an already-set record, -0 weights, K = 1 and K = 7.
+static void r1_slot_merge_tail(bool gsq_types) {
+    namespace a8 = strix::moe_q4k_a8;
+    namespace sm = strix::moe_slot_merge;
+    constexpr std::uint32_t hidden = 512U, width = 256U, experts = 4U, max_k = 10U;
+    constexpr std::array<std::uint32_t, 4> types{7U, 8U, 42U, 20U};
+    const std::size_t type_count = gsq_types ? types.size() : 2U;  // Q2_0 / IQ4_NL down need STRIX_GSQ_Q20_A8=1
+    const std::uint64_t row_bytes_max = a8::down_row_bytes(8U, width);
+    const std::size_t weight_bytes_max = static_cast<std::size_t>(experts) * hidden * row_bytes_max;
+    const std::uint32_t words = sm::ticket_words(hidden);
+    void *intermediates = nullptr, *weights = nullptr, *routes = nullptr, *codes = nullptr, *deltas = nullptr,
+        *sums = nullptr, *rawdots = nullptr, *status = nullptr, *aggregate = nullptr, *route_weights = nullptr,
+        *accumulation = nullptr, *output = nullptr, *record = nullptr, *tickets = nullptr;
+    check(hipMalloc(&intermediates, max_k * 2U * width * 4U), "slot merge intermediates");
+    check(hipMalloc(&weights, weight_bytes_max), "slot merge weights");
+    check(hipMalloc(&routes, max_k * 4U), "slot merge routes"); check(hipMalloc(&codes, max_k * width), "slot merge codes");
+    check(hipMalloc(&deltas, max_k * (width / 32U) * 4U), "slot merge deltas");
+    check(hipMalloc(&sums, max_k * (width / 32U) * 4U), "slot merge sums");
+    check(hipMalloc(&rawdots, max_k * hidden * 4U), "slot merge rawdots");
+    check(hipMalloc(&status, 4U), "slot merge status"); check(hipMalloc(&aggregate, 4U), "slot merge aggregate");
+    check(hipMalloc(&route_weights, max_k * 4U), "slot merge route weights");
+    check(hipMalloc(&accumulation, hidden * 4U), "slot merge accumulation");
+    check(hipMalloc(&output, hidden * 2U), "slot merge output"); check(hipMalloc(&record, 8U), "slot merge record");
+    check(hipMalloc(&tickets, words * 4U), "slot merge tickets");
+    check(hipMemset(tickets, 0, words * 4U), "slot merge tickets clear");
+    hipStream_t stream = nullptr;
+    check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "slot merge stream");
+    const auto view = [](void* p, std::uint64_t bytes) { return a8::DeviceBytes{reinterpret_cast<std::uintptr_t>(p), bytes}; };
+    std::uint32_t seed = 0x51a7U;
+    const auto next = [&] { seed = seed * 1664525U + 1013904223U; return seed; };
+    for (std::uint32_t c = 0; c < 10U; ++c) {
+        const std::uint32_t type = types[c % type_count];
+        const std::uint32_t top_k = c == 8U ? 1U : c == 9U ? 7U : max_k;
+        const std::uint64_t weight_bytes = static_cast<std::uint64_t>(experts) * hidden * a8::down_row_bytes(type, width);
+        // Every byte below 0x40: each f16 scale or offset the decoders read is finite and below 2.
+        std::vector<unsigned char> w(static_cast<std::size_t>(weight_bytes));
+        for (auto& b : w) b = static_cast<unsigned char>(next() & 0x3fU);
+        std::vector<float> inter(static_cast<std::size_t>(top_k) * 2U * width);
+        for (auto& v : inter) v = std::ldexp(static_cast<float>(static_cast<int>(next() % 2001U) - 1000), -9);
+        std::vector<std::uint32_t> r(top_k);
+        std::vector<float> rw(top_k);
+        for (std::uint32_t i = 0; i < top_k; ++i) { r[i] = next() % experts; rw[i] = std::ldexp(static_cast<float>(next() % 1000U + 1U), -10); }
+        const std::uint32_t initial = c == 1U ? 2U : 0U;
+        if (c == 2U) rw[3] = std::numeric_limits<float>::infinity();
+        if (c == 3U) rw[top_k - 1U] = std::bit_cast<float>(0x7fc00123U);
+        if (c == 4U) rw[0] = 3.4e38F;
+        if (c == 5U) r[6] = experts;
+        std::array<std::uint32_t, 2> preset{0U, 0U};
+        if (c == 6U) { preset = {3U, 1U}; rw[2] = -std::numeric_limits<float>::infinity(); }
+        if (c == 7U) for (auto& v : rw) v = -0.0F;
+        a8::DownRequest request;
+        request.enabled = true; request.approved_numerical_identity = a8::down_numerical_identity(type);
+        request.shape = {hidden, width, experts, top_k}; request.weight_type = type;
+        const std::uint64_t groups = static_cast<std::uint64_t>(top_k) * (width / 32U);
+        const a8::DownBindings bindings{view(intermediates, inter.size() * 4U), view(weights, weight_bytes),
+            view(routes, top_k * 4U), view(codes, static_cast<std::uint64_t>(top_k) * width), view(deltas, groups * 4U),
+            view(sums, groups * 4U), view(rawdots, static_cast<std::uint64_t>(top_k) * hidden * 4U), view(status, 4U),
+            view(aggregate, 4U)};
+        std::array<std::vector<unsigned char>, 6> result[2];
+        std::vector<std::uint32_t> left(words, 1U);
+        for (const bool folded : {false, true}) {
+            check(hipMemcpy(intermediates, inter.data(), inter.size() * 4U, hipMemcpyHostToDevice), "slot merge inter up");
+            check(hipMemcpy(weights, w.data(), w.size(), hipMemcpyHostToDevice), "slot merge weights up");
+            check(hipMemcpy(routes, r.data(), top_k * 4U, hipMemcpyHostToDevice), "slot merge routes up");
+            check(hipMemcpy(route_weights, rw.data(), top_k * 4U, hipMemcpyHostToDevice), "slot merge route weights up");
+            check(hipMemset(rawdots, 0x3c, max_k * hidden * 4U), "slot merge rawdots poison");
+            check(hipMemset(accumulation, 0xa5, hidden * 4U), "slot merge poison");
+            if (c != 5U) check(hipMemset(accumulation, 0, hidden * 4U), "slot merge clear");
+            check(hipMemset(output, 0x5a, hidden * 2U), "slot merge output poison");
+            check(hipMemcpy(status, &initial, 4U, hipMemcpyHostToDevice), "slot merge status");
+            check(hipMemset(aggregate, 0, 4U), "slot merge aggregate");
+            check(hipMemcpy(record, preset.data(), 8U, hipMemcpyHostToDevice), "slot merge record");
+            a8::enqueue_down_activation_quantize(request, bindings, stream);
+            if (folded) {
+                a8::SlotMergeTail tail;
+                tail.tickets = static_cast<std::uint32_t*>(tickets);
+                tail.route_weights = static_cast<const float*>(route_weights);
+                tail.accumulation = static_cast<float*>(accumulation);
+                tail.output = output; tail.output_bf16 = true; tail.bf16_commit = true; tail.record = record;
+                tail.domain = static_cast<std::uint32_t>(strix::DeferredMoeDomain::q4k_a8);
+                a8::enqueue_down_rawdots(request, bindings, tail, stream);
+            } else {
+                a8::enqueue_down_rawdots(request, bindings, stream);
+                strix::enqueue_q4k_a8_serial_tail_for_test(true, static_cast<const float*>(rawdots),
+                    static_cast<const std::uint32_t*>(routes), static_cast<const float*>(route_weights), hidden, experts, top_k,
+                    static_cast<float*>(accumulation), static_cast<std::uint16_t*>(output), static_cast<std::uint32_t*>(status),
+                    record, stream);
+            }
+            check(hipStreamSynchronize(stream), "slot merge run");
+            auto& out = result[folded ? 1 : 0];
+            const std::array<std::pair<const void*, std::size_t>, 6> reads{{{rawdots, std::size_t{top_k} * hidden * 4U},
+                {accumulation, hidden * 4U}, {output, hidden * 2U}, {status, 4U}, {aggregate, 4U}, {record, 8U}}};
+            for (std::size_t i = 0; i < reads.size(); ++i) {
+                out[i].resize(reads[i].second);
+                check(hipMemcpy(out[i].data(), reads[i].first, reads[i].second, hipMemcpyDeviceToHost), "slot merge read");
+            }
+            if (folded) check(hipMemcpy(left.data(), tickets, words * 4U, hipMemcpyDeviceToHost), "slot merge tickets read");
+        }
+        const bool same = result[0] == result[1];
+        const bool zero = std::all_of(left.begin(), left.end(), [](std::uint32_t v) { return v == 0U; });
+        std::uint32_t bits = 0; std::memcpy(&bits, result[1][3].data(), 4U);
+        expect(same, "R1 slot-merge tail differs from the down launch plus the incumbent tail");
+        expect(zero, "R1 slot-merge tail left a ticket word set");
+        std::printf("r1 slot merge tail case %u type %u K %u status %u %s tickets %s\n", c, type, top_k, bits,
+            same ? "SAME" : "DIFFER", zero ? "ZERO" : "SET");
+    }
+    check(hipStreamDestroy(stream), "slot merge stream destroy");
+    for (void* p : {intermediates, weights, routes, codes, deltas, sums, rawdots, status, aggregate, route_weights, accumulation,
+            output, record, tickets}) check(hipFree(p), "slot merge free");
+}
 #endif
 int main(int argc, char** argv) try {
     const unsigned int requested_mode = argc > 1 ? static_cast<unsigned int>(std::stoul(argv[1])) : 0U;
@@ -487,6 +603,10 @@ int main(int argc, char** argv) try {
     }
     if (argc > 2 && std::string(argv[2]) == "r1-glue-tail") {
         r1_glue_tail();
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 2 && (std::string(argv[2]) == "r1-slot-merge-tail" || std::string(argv[2]) == "r1-slot-merge-tail-gsq")) {
+        r1_slot_merge_tail(std::string(argv[2]) == "r1-slot-merge-tail-gsq");
         return failures == 0 ? 0 : 1;
     }
 #endif

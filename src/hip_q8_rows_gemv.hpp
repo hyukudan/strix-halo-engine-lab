@@ -39,6 +39,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_ext.h>
 #include <hip/hip_runtime.h>
+#include "strix/decode_projection_group.hpp"
 #include "strix/env_flags.hpp"
 #include "core/gemv_rows.hpp"
 
@@ -120,9 +121,7 @@ constexpr unsigned pow2u(unsigned v) { return v <= 1U ? 1U : 2U * pow2u((v + 1U)
 
 __device__ __forceinline__ const unsigned char* segment_row(const Segments& s, std::uint32_t out, std::uint32_t width,
     unsigned& m, std::uint32_t& row) {
-    m = 0;
-    while (m + 1U < s.count && out >= s.first[m + 1U]) ++m;
-    row = out - s.first[m];
+    ::strix::decode::locate(s.first, s.count, out, m, row);  // decode step plan: projection group index
     return s.weights[m] + static_cast<std::uint64_t>(row) * (width / 32U) * 34U;
 }
 template <unsigned Outs>
@@ -311,9 +310,10 @@ template<unsigned Outs> using Q8Fetch = ::strix::weight::hip::Q8Fetch<Outs>;
 // Q6P32 segments: weights[m] is the Q6P32 copy of a tensor with exactly the
 // segment's outputs as rows.
 __device__ __forceinline__ q6p::Row segment_row_q6(const Segments& s, std::uint32_t out, std::uint32_t width) {
-    unsigned m = 0;
-    while (m + 1U < s.count && out >= s.first[m + 1U]) ++m;
-    return q6p::row_of(s.weights[m], width, out - s.first[m]);
+    unsigned m;
+    std::uint32_t row;
+    ::strix::decode::locate(s.first, s.count, out, m, row);
+    return q6p::row_of(s.weights[m], width, row);
 }
 template<unsigned Outs> using Q6Fetch = ::strix::weight::hip::Q6Fetch<Outs>;
 
@@ -1840,11 +1840,12 @@ __global__ __launch_bounds__(kThreads) void project_rows_dense_a8_gsq_kernel(Sit
 #pragma unroll
             for (unsigned o = 0; o < Outs; ++o) {
                 const std::uint32_t out = min(g * Outs + o, site.outputs - 1U);
-                unsigned m = 0;
-                while (m + 1U < site.segments.count && out >= site.segments.first[m + 1U]) ++m;
+                unsigned m;
+                std::uint32_t local;
+                ::strix::decode::locate(site.segments.first, site.segments.count, out, m, local);
                 const std::uint32_t type = site.segments.types[m] ? site.segments.types[m] : 8U;
                 const unsigned char* row = site.segments.weights[m] +
-                    static_cast<std::uint64_t>(out - site.segments.first[m]) * gsq_a8::dense_row_bytes(type, width);
+                    static_cast<std::uint64_t>(local) * gsq_a8::dense_row_bytes(type, width);
                 gsq_dense_dispatch(type, [&]<std::uint32_t T>() {
                     const auto x = gsq_a8::dense_group<T>(row, b);
 #pragma unroll
