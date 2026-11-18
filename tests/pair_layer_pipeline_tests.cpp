@@ -176,8 +176,10 @@ std::vector<Result> run_chain(const Weights& m, const std::vector<std::uint32_t>
                 std::uint32_t first = p.head() ? t.top() : 0U;
                 if (relay_decoder != ~0U) {
                     layers::RelayOps r;
-                    r.save = [&] { return t.save(p.first(), p.last()); };
-                    r.load = [&](std::uint32_t f, std::uint32_t l, std::span<const std::byte> b) { t.load(f, l, b); };
+                    r.save = [&](std::uint32_t layer) { return t.save(layer, layer + 1U); };
+                    r.load = [&](std::uint32_t layer, std::span<const std::byte> b) { t.load(layer, layer + 1U, b); };
+                    if (relay_decoder % 2U) r.checksum = [](std::span<const std::byte> b) {   // an injected checksum (odd decoders)
+                        std::uint32_t h = 2166136261U; for (auto v : b) { h ^= std::to_integer<std::uint32_t>(v); h *= 16777619U; } return h; };
                     const auto rs = layers::relay_state(p, relay_decoder, first, up ? &lu : nullptr, down ? &ld : nullptr, r);
                     if (!decoder) return;
                     first = rs.token;

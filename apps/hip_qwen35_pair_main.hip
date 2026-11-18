@@ -374,19 +374,20 @@ int main(int argc, char** argv) try {
         if (up) { ru.send = [&](std::span<const std::byte> b) { up->send(b); }; ru.receive = [&](std::span<std::byte> b) { up->receive(b); }; }
         if (down) { rd.send = [&](std::span<const std::byte> b) { down->send(b); }; rd.receive = [&](std::span<std::byte> b) { down->receive(b); }; }
         layers::RelayOps rops;
-        rops.save = [&] {
-            std::vector<std::byte> img(E->state_bytes(place.first(), place.last()));
-            E->export_state(place.first(), place.last(), img.data());
+        rops.save = [&](std::uint32_t layer) {
+            std::vector<std::byte> img(E->state_bytes(layer, layer + 1U));
+            E->export_state(layer, layer + 1U, img.data());
             return img;
         };
-        rops.load = [&](std::uint32_t lay_first, std::uint32_t lay_last, std::span<const std::byte> img) {
-            if (img.size() != E->state_bytes(lay_first, lay_last)) throw std::runtime_error("state relay: byte count differs from this engine's layers");
-            E->import_state(lay_first, lay_last, E->committed(), img.data());
+        rops.load = [&](std::uint32_t layer, std::span<const std::byte> img) {
+            if (img.size() != E->state_bytes(layer, layer + 1U)) throw std::runtime_error("state relay: byte count differs from this engine's layer");
+            E->import_state(layer, layer + 1U, E->committed(), img.data());
         };
+        rops.checksum = [](std::span<const std::byte> img) { return strix::dist::crc32c(img); };   // hardware CRC32C
         barrier();
         const auto rs = layers::relay_state(place, decoder_stage, first_token, up ? &ru : nullptr, down ? &rd : nullptr, rops);
-        std::printf("state relay stage %u -> decoder stage %u: %.1f MB in %.1f ms\n", place.stage, decoder_stage,
-                    double(rs.bytes) / 1e6, rs.ms);
+        std::printf("state relay stage %u -> decoder stage %u: %.1f MB in %llu layer messages, %.1f ms\n", place.stage, decoder_stage,
+                    double(rs.bytes) / 1e6, static_cast<unsigned long long>(rs.messages), rs.ms);
         if (!decodes_here) return 0;
         first_token = rs.token;
         E->set_stage(0U, L);
