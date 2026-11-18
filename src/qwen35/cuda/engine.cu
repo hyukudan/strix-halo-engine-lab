@@ -427,6 +427,8 @@ struct CudaEngine::Impl {
 
     void init() {
         cc::set_programmatic_launch(opt.pdl);
+        // split-K policy before the workspace bound below, graphs and prefill tables (all follow nvfp4_split_k)
+        CK(cc::nvfp4_set_split_profile(opt.nvfp4_split == split_k::Profile::fast));
         gd = {c.gdn_key_heads, c.gdn_key_dim, c.gdn_value_heads, c.gdn_value_dim, c.gdn_conv_kernel};
         ad.heads = c.heads;
         ad.kv_heads = c.kv_heads;
@@ -1685,6 +1687,11 @@ void print_effective_config(const EngineOptions& o, const char* arith, std::FILE
                  o.prefill_inflight ? " chunks" : " = unbounded", o.prefill_ramp, o.prefill_ramp ? " rows first chunk, doubling to prefill-chunk" : " (off)");
     if (o.turbo_weights >= TurboWeights::onfly)
         std::fprintf(f, "  format: NVFP4 e2m1 + e4m3/16 + FP32 global; RTN; GEMV f16 mma, FP32 accumulate, activations RN f16, rows 1..32 bitwise row-invariant\n");
+    if (o.turbo_weights != TurboWeights::off)
+        std::fprintf(f, "  split-k: %s\n", o.nvfp4_split == split_k::Profile::fast
+                         ? "fast (FAST nvfp4-splitk-fast-v1, identity -skf1: per-shape targets for this device's SM count + "
+                           "compute capability, shapes / devices without a row keep 1000; --split-k exact = off)"
+                         : "exact (nvfp4-splitk-exact-v1: target 1000 for every shape)");
     std::fprintf(f, "  prefill-flash-tail: %s (scheduling only, bitwise equal; split = partial last wave as fewer-warp jobs)\n",
                  o.flash_tail == cuda_core::FlashTail::split ? "split" : "off");
     if (o.prefill_wave_min_tokens == 0) std::fprintf(f, "  prefill-wave-steps: off (steps of prefill_chunk; --prefill-wave-min N turns it on)\n");

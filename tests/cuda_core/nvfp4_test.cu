@@ -550,11 +550,15 @@ int main(int argc, char** argv) {
         ncu_probe(argc > 2 ? static_cast<std::uint32_t>(std::atoi(argv[2])) : 8u);
         return 0;
     }
-    if (argc > 2) cc::nvfp4_set_split_target(static_cast<std::uint32_t>(std::atoi(argv[2])));
+    // argv[2]: a split target (EXACT policy) or "fast" (the FAST split policy of strix/split_k_policy.hpp for device 0)
+    const bool fast_split = argc > 2 && std::string(argv[2]) == "fast";
+    if (argc > 2 && !fast_split) cc::nvfp4_set_split_target(static_cast<std::uint32_t>(std::atoi(argv[2])));
     CK(cudaSetDevice(0));
+    if (fast_split) CK(cc::nvfp4_set_split_profile(true));
     cudaDeviceProp p;
     CK(cudaGetDeviceProperties(&p, 0));
     std::printf("device 0: %s cc %d.%d SMs %d\n", p.name, p.major, p.minor, p.multiProcessorCount);
+    std::printf("split policy: %s\n", cc::nvfp4_split_identity());
     if (a != "--bench-only") {
         std::mt19937 rng(1234);
         test_shape(256, 512, rng);

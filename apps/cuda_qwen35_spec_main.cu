@@ -18,6 +18,7 @@
 #include "strix/cuda_core/dense.hpp"
 #include "strix/qwen35/cuda_engine.hpp"
 #include "strix/qwen35/cuda_spec.hpp"
+#include "strix/qwen35/prefill_controls.hpp"
 #include "strix/spec/draft_rows.hpp"
 
 #include <memory>
@@ -96,7 +97,7 @@ ArmSpec parse_arm(const std::string& name, std::uint32_t chain_k) {
 int main(int argc, char** argv) {
     strix::device::bind_cuda_main(argc, argv);
     try {
-        std::string model, synth, ids_arg, ids_file, sources = "copy,chain,hybrid", chain_hidden = "post", label = "run";
+        std::string model, synth, ids_arg, ids_file, sources = "copy,chain,hybrid", chain_hidden = "post", label = "run", split_k_arg;
         std::uint32_t n_gen = 256, prompt_len = 64, layers_override = 0, max_pos = 0, max_block = 32, chain_k = 7;
         double oracle = -1.0;
         std::uint32_t trace_n = 0, pairs = 1;
@@ -139,6 +140,7 @@ int main(int argc, char** argv) {
             else if (a == "--check") check = next() != "0";
             else if (a == "--graphs") graphs = next() != "0";
             else if (a == "--pdl") pdl = next() != "0";  // EngineOptions::pdl, as the decode CLI
+            else if (a == "--split-k") split_k_arg = next();  // exact|fast, the decode CLI's resolver (resolve_split_k)
             else if (a == "--seed-costs") seed_costs = next() != "0";
             else if (a == "--cost-model") {
                 const std::string v = next();
@@ -211,6 +213,8 @@ int main(int argc, char** argv) {
         opt.turbo_weights = turbo;
         opt.turbo_lm_head = turbo_lm_head;
         opt.pdl = pdl;
+        // no FAST prefill policy in this CLI (prefill_arith stays exact): the default is the same exact as the decode CLI's
+        q::resolve_split_k(opt, split_k_arg, opt.prefill_arith != q::PrefillArith::exact);
         opt.max_positions = std::max<std::uint32_t>(max_pos, std::uint32_t(std::max<std::size_t>(longest, prompt_len) + n_gen + 128 +
                                                                           (cost_table ? 4096 : 0)));
         std::unique_ptr<q::CudaEngine> E;
