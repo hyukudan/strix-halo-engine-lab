@@ -180,9 +180,10 @@ void test_quantize_and_contract() {
     T::GemmArgs g;
     CHECK(!T::valid(g));
     std::uint8_t b = 0;
-    float f = 0;
+    std::vector<float> ybuf(40 * 48), rsbuf(256), auxbuf(40 * 48);
     g.w = g.x = &b;
-    g.rs = g.y = &f;
+    g.rs = rsbuf.data();
+    g.y = ybuf.data();
     g.out = 48;
     g.in = 256;
     g.rows = 40;
@@ -200,6 +201,46 @@ void test_quantize_and_contract() {
     CHECK(T::valid(g));
     g.epi = T::Epi::residual;
     CHECK(!T::valid(g));  // residual needs aux
+    // epilogue aliasing contract: aux is y (in place) or disjoint from it; rs never overlaps y
+    g.aux = ybuf.data();
+    CHECK(T::valid(g));
+    g.aux = auxbuf.data();
+    CHECK(T::valid(g));
+    g.aux = ybuf.data() + 1;
+    CHECK(!T::valid(g));  // partial overlap: another thread's store could land before this thread's aux load
+    g.aux = ybuf.data();
+    g.rs = ybuf.data() + 40 * 48 - 1;
+    CHECK(!T::valid(g));  // row scales inside y
+    g.rs = rsbuf.data();
+    CHECK(T::valid(g));
+}
+
+// Epilogue ownership: gemm_kernel issues all of a thread's rs / aux loads before its y stores. That is bitwise equal to the
+// per-element load-after-store order iff every output element of the launch is touched (read as aux, written as y) by exactly one
+// (CTA, thread) and every row scale it loads is a valid row. Enumerate the kernel's own coordinate functions over every CTA, warp,
+// lane and accumulator slot and check that each in-range (row, out) element is owned exactly once.
+void test_epilogue_ownership(std::uint32_t out, std::uint32_t rows, bool glu) {
+    constexpr std::uint32_t kThreads = 256;  // gemm_kernel: 8 warps, wm = warp & 1, wn = warp >> 1
+    const std::uint32_t rp = T::rows_padded(rows), tiles_n = rp / T::kCtaRows;
+    const std::uint32_t tiles_m = glu ? (out + T::kCtaOut / 2 - 1) / (T::kCtaOut / 2) : (out + T::kCtaOut - 1) / T::kCtaOut;
+    std::vector<std::uint8_t> owner(static_cast<std::size_t>(rows) * out, 0);
+    for (std::uint32_t tm = 0; tm < tiles_m; ++tm)
+        for (std::uint32_t tn = 0; tn < tiles_n; ++tn)
+            for (std::uint32_t tid = 0; tid < kThreads; ++tid) {
+                const std::uint32_t lane = tid & 31, warp = tid >> 5, wm = warp & 1, wn = warp >> 1, g = lane >> 2, t = lane & 3;
+                for (std::uint32_t nt = 0; nt < 8; ++nt)
+                    for (std::uint32_t z = 0; z < 4; ++z) {
+                        const std::uint32_t r = T::act_row(tn, wn, nt, t, z);
+                        CHECK(r == T::act_row(tn, wn, nt, t, z & 1));  // slot z uses the hoisted scale rsv[nt][z & 1]
+                        if (r >= rows) continue;
+                        for (std::uint32_t k = 0; k < (glu ? 2u : 4u); ++k) {
+                            const std::uint32_t o = glu ? T::glu_channel(tm, wm, k, g, z) : T::out_row(tm, wm, k, g, z);
+                            if (o >= out) continue;
+                            ++owner[static_cast<std::size_t>(r) * out + o];
+                        }
+                    }
+            }
+    for (std::uint8_t c : owner) CHECK(c == 1);
 }
 
 // Producer of one gemm_kernel stage: the hoisted form (stage_chunk: base + ks * step, resolved once per thread) must address the
@@ -254,10 +295,14 @@ int main() {
     test_stage_chunks(48, 256, 40, false);    // partial weight tile (wtiles 3 < 8 slots), padded rows
     test_stage_chunks(256, 384, 300, false);  // two weight tiles x two activation tiles
     test_stage_chunks(80, 128, 20, true);     // GLU, partial 64-channel tile (w2 slots)
+    test_epilogue_ownership(48, 40, false);     // partial weight tile, padded rows
+    test_epilogue_ownership(256, 300, false);   // two weight tiles x two activation tiles
+    test_epilogue_ownership(80, 20, true);      // GLU, partial 64-channel tile
+    test_epilogue_ownership(5120, 4096, false); // engine residual shape (down / o)
     if (g_fail) {
         std::fprintf(stderr, "nvfp4_tile_host: %d failures\n", g_fail);
         return 1;
     }
-    std::printf("nvfp4_tile_host: PASS (layouts, fragments, coordinates, GLU, quantiser, contract, stage producer)\n");
+    std::printf("nvfp4_tile_host: PASS (layouts, fragments, coordinates, GLU, quantiser, contract, stage producer, epilogue ownership)\n");
     return 0;
 }

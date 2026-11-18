@@ -114,14 +114,37 @@ __global__ void __launch_bounds__(kThreads, 1) gemm_kernel(const GemmArgs a) {
         }
     }
     cp_wait<0>();
+    // Epilogue loads first, stores after. y may alias aux (the residual GEMMs run in place) and, as plain pointers, rs too, so the
+    // compiler may not move a load above an earlier store: written per element, the residual path was 128 LDG -> FADD -> STG chains
+    // per thread and rs was re-read after every store, each paying a full memory latency while the CTA held its SM (+0.19-0.20 ms
+    // per residual launch, ~20K clk per store/glu tile; rtx_dense3 11-18). Every output element is read (aux) and written (y) only
+    // by the thread that owns its accumulator (gemm_args_ok: aux == y or disjoint, rs disjoint from y), so this thread's loads may
+    // all go before its stores: the row scales once, then per nt the 16 aux values. Same operations on the same values: bitwise.
     const std::uint32_t g = lane >> 2, t = lane & 3;
+    const bool use_aux = a.epi == Epi::residual || a.epi == Epi::silu_mul;
+    float rsv[8][2];
 #pragma unroll
     for (std::uint32_t nt = 0; nt < 8; ++nt)
+#pragma unroll
+        for (std::uint32_t j = 0; j < 2; ++j) {
+            const std::uint32_t r = act_row(tn, wn, nt, t, j);
+            rsv[nt][j] = r < a.rows ? a.rs[r] : 0.f;
+        }
+#pragma unroll
+    for (std::uint32_t nt = 0; nt < 8; ++nt) {
+        float av[4][4];  // [z][mt]: this thread's residual / silu_mul operands of tile column nt
+#pragma unroll
+        for (std::uint32_t z = 0; z < 4; ++z)
+#pragma unroll
+            for (std::uint32_t mt = 0; mt < 4; ++mt) {
+                const std::uint32_t r = act_row(tn, wn, nt, t, z), o = out_row(tm, wm, mt, g, z);
+                av[z][mt] = use_aux && r < a.rows && o < a.out ? a.aux[static_cast<std::size_t>(r) * a.out + o] : 0.f;
+            }
 #pragma unroll
         for (std::uint32_t z = 0; z < 4; ++z) {
             const std::uint32_t r = act_row(tn, wn, nt, t, z);
             if (r >= a.rows) continue;
-            const float rs = a.rs[r];
+            const float rs = rsv[nt][z & 1];
             const std::size_t yrow = static_cast<std::size_t>(r) * a.out;
             if (glu) {
 #pragma unroll
@@ -138,12 +161,13 @@ __global__ void __launch_bounds__(kThreads, 1) gemm_kernel(const GemmArgs a) {
                     const std::uint32_t o = out_row(tm, wm, mt, g, z);
                     if (o >= a.out) continue;
                     float v = __fmul_rn(acc[mt][nt][z], __fmul_rn(a.gs, rs));
-                    if (a.epi == Epi::residual) v = __fadd_rn(a.aux[yrow + o], v);
-                    else if (a.epi == Epi::silu_mul) v = __fmul_rn(strix::cuda_core::cc_silu(a.aux[yrow + o]), v);
+                    if (a.epi == Epi::residual) v = __fadd_rn(av[z][mt], v);
+                    else if (a.epi == Epi::silu_mul) v = __fmul_rn(strix::cuda_core::cc_silu(av[z][mt]), v);
                     a.y[yrow + o] = v;
                 }
             }
         }
+    }
 }
 
 // one CTA per row; rows >= `rows` (padding up to rows_pad) are written as zero codes / scales / rs.

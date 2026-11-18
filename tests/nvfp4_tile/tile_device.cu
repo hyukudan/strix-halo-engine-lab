@@ -162,7 +162,7 @@ void check_glu(std::uint32_t ch, std::uint32_t in, std::uint32_t rows, std::uint
 }
 
 // timing of one shape with random tiles (no reference): median of 20 launches after 3 warm-ups
-void bench(const char* name, std::uint32_t out, std::uint32_t in, std::uint32_t rows, bool glu) {
+void bench(const char* name, std::uint32_t out, std::uint32_t in, std::uint32_t rows, bool glu, bool residual = false) {
     const std::uint32_t rp = T::rows_padded(rows);
     std::uint8_t *w = nullptr, *w2 = nullptr, *xt = nullptr;
     float *rs = nullptr, *y = nullptr, *x = nullptr;
@@ -186,7 +186,11 @@ void bench(const char* name, std::uint32_t out, std::uint32_t in, std::uint32_t 
     g.in = in;
     g.rows = rows;
     g.rows_pad = rp;
-    g.epi = glu ? T::Epi::glu : T::Epi::store;
+    g.epi = glu ? T::Epi::glu : residual ? T::Epi::residual : T::Epi::store;
+    if (residual) {  // in place (aux == y), as the engine's down / o / ssm_out GEMMs
+        CU(cudaMemset(y, 0, static_cast<std::size_t>(rows) * out * 4));
+        g.aux = y;
+    }
     cudaEvent_t a, b;
     CU(cudaEventCreate(&a));
     CU(cudaEventCreate(&b));
@@ -231,6 +235,8 @@ int main(int argc, char** argv) {
         bench("qkv", 10240, 5120, rows, false);   // GDN qkv
         bench("o", 5120, 6144, rows, false);      // GDN out / attention o
         bench("kv", 1024, 5120, rows, false);     // attention k (and v)
+        bench("down_r", 5120, 17408, rows, false, true);  // FFN down, residual in place (engine form)
+        bench("o_r", 5120, 6144, rows, false, true);      // GDN out / attention o, residual in place (engine form)
         return 0;
     }
     check_gemm("store", 48, 256, 40, T::Epi::store, 11);
