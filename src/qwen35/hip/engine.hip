@@ -14,9 +14,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <initializer_list>
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "strix/env_flags.hpp"
@@ -294,6 +296,11 @@ void linear16(const Tensor& w, const float* x, float* out, unsigned rows, hipStr
         core::dense_iu4::linear(w.data, w.inputs, w.outputs, x, iu4.xh, out, rows, s);
     } else throw std::runtime_error("dense projection needs bf16, q8_0 or iu4 weights");
 }
+// STRIX_DECODE_FUSE (default on; 0 = the separate launches): decode launch fusion, see run_range.
+bool decode_fuse() {
+    static const bool on = strix::envcfg::flag("STRIX_DECODE_FUSE", true);
+    return on;
+}
 // Decode launch fusion (rows <= 16, one sweep): ready = iu4.xh already holds x prepared by its producer (norm epilogue);
 // h16 = the SiLU pass of an IU4 gate / up (no reference flag) also stores out prepared for the next IU4 projection.
 void glu16(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned rows, hipStream_t s, const Iu4Scratch& iu4,
@@ -309,8 +316,12 @@ void glu16(const Tensor& g, const Tensor& u, const float* x, float* out, unsigne
             return silu_mul_kernel<<<256, 256, 0, s>>>(iu4.g, iu4.u, out, std::size_t(rows) * g.outputs);
         }
         if (!ready) core::dense_iu4::prepare(x, iu4.xh, g.inputs, rows, s);
-        core::dense_iu4::run(g.data, g.inputs, g.outputs, iu4.xh, iu4.g, rows, s);
-        core::dense_iu4::run(u.data, u.inputs, u.outputs, iu4.xh, iu4.u, rows, s);
+        if (decode_fuse()) {  // gate + up: one projection-group launch
+            core::dense_iu4::run_group({{g.data, g.outputs, iu4.g}, {u.data, u.outputs, iu4.u}}, g.inputs, iu4.xh, rows, s);
+        } else {
+            core::dense_iu4::run(g.data, g.inputs, g.outputs, iu4.xh, iu4.g, rows, s);
+            core::dense_iu4::run(u.data, u.inputs, u.outputs, iu4.xh, iu4.u, rows, s);
+        }
         if (h16) {  // gate / up have read xh (stream order): it now takes the prepared rows of out
             return silu_mul_store_kernel<<<256, 256, 0, s>>>(iu4.g, iu4.u, out, std::size_t(rows) * g.outputs,
                                                              core::dense_iu4::prepared_store(iu4.xh));
@@ -325,6 +336,23 @@ void linear_ready(const Tensor& w, const float* x, bool ready, float* out, unsig
     if (ready && rows <= kMaxRows && w.fmt == kIu4Fmt && iu4.xh && !core::dense_iu4::reference_flag())
         return core::dense_iu4::run(w.data, w.inputs, w.outputs, iu4.xh, out, rows, s);
     linear(w, x, out, rows, s, wide, iu4);
+}
+// Projections of the same prepared rows iu4.xh as ONE launch (decode step plan, strix/decode_projection_group.hpp) when
+// every member is an IU4 projection of one input width (rows <= 16, no reference flag, fusion on); otherwise each runs
+// as linear_ready(). Same block body and operands per output: same bits.
+void group_ready(std::initializer_list<std::pair<const Tensor*, float*>> members, const float* x, bool ready, unsigned rows,
+                 hipStream_t s, const WideScratch& wide, const Iu4Scratch& iu4) {
+    bool one = ready && decode_fuse() && rows <= kMaxRows && iu4.xh && !core::dense_iu4::reference_flag() &&
+               members.size() <= core::dense_iu4::kGroupMax;
+    for (const auto& m : members) one = one && m.first->fmt == kIu4Fmt && m.first->inputs == members.begin()->first->inputs;
+    if (!one) {
+        for (const auto& m : members) linear_ready(*m.first, x, ready, m.second, rows, s, wide, iu4);
+        return;
+    }
+    core::dense_iu4::Member list[core::dense_iu4::kGroupMax]{};
+    unsigned n = 0;
+    for (const auto& m : members) list[n++] = {m.first->data, m.first->outputs, m.second};
+    core::dense_iu4::run_group(list, n, members.begin()->first->inputs, iu4.xh, rows, s);
 }
 // mlp() of a window of rows <= 16 whose x is already prepared in iu4.xh (norm epilogue): gate / up run on it, and for an
 // IU4 gate / up / down the SiLU pass prepares h, so down runs without its own prepare. Same arithmetic as mlp().
@@ -726,7 +754,7 @@ struct HipEngine::Impl {
         // Decode launch fusion (STRIX_DECODE_FUSE, default on; 0 = the separate launches): each residual add folds into the
         // next norm, and for rows <= 16 the norms / the SiLU pass store the prepared FP16 rows of the next IU4 projections
         // (one prepare per input instead of one per projection). Same arithmetic, same bits.
-        static const bool fuse = strix::envcfg::flag("STRIX_DECODE_FUSE", true);
+        const bool fuse = decode_fuse();
         const bool pre = fuse && n <= kMaxRows && iu4.xh && !core::dense_iu4::reference_flag();
         _Float16* const xh_pre = pre ? iu4.xh : nullptr;
         const float* carry = nullptr;  // the previous MLP output, not yet added to x
@@ -735,8 +763,7 @@ struct HipEngine::Impl {
             rmsnorm_fused(x, carry, y.attn_norm, H, cfg.rms_eps, xn, n, xh_pre, stream);
             carry = nullptr;
             if (gdn_index[l] != ~0U) {
-                linear_ready(y.qkv, xn, pre, qkv, n, stream, wide, iu4);
-                linear_ready(y.z, xn, pre, z, n, stream, wide, iu4);
+                group_ready({{&y.qkv, qkv}, {&y.z, z}}, xn, pre, n, stream, wide, iu4);
                 linear(y.beta, xn, beta, n, stream, wide, iu4);
                 linear(y.alpha, xn, gate, n, stream, wide, iu4);
                 if (defer) {
@@ -754,9 +781,7 @@ struct HipEngine::Impl {
                 hip_gdn_decode_step_dims(g, stream);
                 linear(y.out, core, proj, n, stream, wide, iu4);
             } else {
-                linear_ready(y.q, xn, pre, q_in, n, stream, wide, iu4);
-                linear_ready(y.k, xn, pre, kk, n, stream, wide, iu4);
-                linear_ready(y.v, xn, pre, vv, n, stream, wide, iu4);
+                group_ready({{&y.q, q_in}, {&y.k, kk}, {&y.v, vv}}, xn, pre, n, stream, wide, iu4);
                 attn_core::dense_decode::Params p{n, cfg.heads, cfg.kv_heads, 2U * D, cfg.rotary_dim, pos, cfg.rms_eps,
                                                   1.0F / std::sqrt(float(D)), cfg.rope_theta, true};
                 if (flash)
