@@ -5,7 +5,9 @@
 //     of the contract's x16 * w16 products (tolerance 2^-10 of sum |terms|: FP32 WMMA accumulation), columns past
 //     count untouched; 16-wave CTAs give the same bits as 8-wave CTAs;
 //  3. the x16 form (enqueue_x16_tiles + enqueue_x16, column-fast) gives the direct form's bits, 8 and 16 waves;
-//  4. x16 tiles of a producer (enqueue_x16_tiles_map2) == the tile pass over the producer's stored FP32 values.
+//  4. x16 tiles of a producer (enqueue_x16_tiles_map2) == the tile pass over the producer's stored FP32 values;
+//  5. A4 emulation tiles (a4_tiles::Emu, g32 / g64 / Hadamard-128 g32) of both producers == a4_tiles::reference.
+#include "core/a4_tiles.hpp"
 #include "core/f16_dense_iu4.hpp"
 #include "core/iu4.hpp"
 
@@ -33,6 +35,7 @@ __global__ void decode_kernel(iu::View v, std::uint16_t* out) {
 }
 
 // 4. x16 tiles of a producer: x16_tiles_map2_kernel<Mul> == x16_tiles_kernel over the stored FP32 products, bit for bit.
+template <class Q> struct Tag { using type = Q; };
 struct Mul {
     __device__ __forceinline__ static float apply(float a, float b) { return a / (1.0F + expf(-a)) * b; }
 };
@@ -172,6 +175,55 @@ int main() {
         std::printf("producer tiles: map2 vs stored products + tile pass %s\n", same ? "bitwise" : "DIFFER");
         failures += !same;
         CHECK(hipFree(da)); CHECK(hipFree(db)); CHECK(hipFree(dp)); CHECK(hipFree(t1)); CHECK(hipFree(t2));
+    }
+    {  // 5. A4 emulation tiles (core/a4_tiles.hpp Emu<G, Rotate>) == the host reference, bit for bit, both producers
+        const unsigned R = 37U, K = 384U;
+        const std::size_t n = std::size_t(R) * K;
+        std::mt19937 rng(11);
+        std::normal_distribution<float> nd(0.0F, 1.0F);
+        std::vector<float> x(n), ones(n, 1.0F);
+        for (std::size_t i = 0; i < n; ++i) x[i] = nd(rng) * (i % 97U == 0U ? 40.0F : 1.0F);  // sparse outliers
+        for (unsigned k = 0; k < 64U; ++k) x[std::size_t(3) * K + k] = 0.0F;                  // an all-zero group
+        float *dx = nullptr, *d1 = nullptr, *dp = nullptr;
+        _Float16 *t1 = nullptr, *t2 = nullptr;
+        CHECK(hipMalloc(&dx, n * 4U)); CHECK(hipMalloc(&d1, n * 4U)); CHECK(hipMalloc(&dp, n * 4U));
+        CHECK(hipMalloc(&t1, n * 2U)); CHECK(hipMalloc(&t2, n * 2U));
+        CHECK(hipMemcpy(dx, x.data(), n * 4U, hipMemcpyHostToDevice)); CHECK(hipMemcpy(d1, ones.data(), n * 4U, hipMemcpyHostToDevice));
+        // map2 quantises the producer's values Mul(x, 1) = SiLU(x): its reference input is the stored products (section 4
+        // proves the producer's FP32 values equal them bit for bit).
+        mul_kernel<<<unsigned((n + 255U) / 256U), 256>>>(dx, d1, dp, n);
+        std::vector<float> prod(n);
+        CHECK(hipMemcpy(prod.data(), dp, n * 4U, hipMemcpyDeviceToHost));
+        auto arm = [&](auto tag, const char* name, unsigned group, bool rotate) {
+            using Q = typename decltype(tag)::type;
+            tall::enqueue_x16_tiles<Q>(dx, t1, R, K, 0);
+            tall::enqueue_x16_tiles_map2<Mul, Q>(dx, d1, t2, R, K, 0);
+            CHECK(hipGetLastError()); CHECK(hipDeviceSynchronize());
+            std::vector<std::uint16_t> h1(n), h2(n);
+            CHECK(hipMemcpy(h1.data(), t1, n * 2U, hipMemcpyDeviceToHost)); CHECK(hipMemcpy(h2.data(), t2, n * 2U, hipMemcpyDeviceToHost));
+            unsigned bad1 = 0U, bad2 = 0U;
+            std::vector<float> row(K), row2(K);
+            for (unsigned r = 0; r < R; ++r) {
+                std::memcpy(row.data(), x.data() + std::size_t(r) * K, K * 4U);
+                std::memcpy(row2.data(), prod.data() + std::size_t(r) * K, K * 4U);
+                strix::core::a4_tiles::reference(row.data(), K, group, rotate);
+                strix::core::a4_tiles::reference(row2.data(), K, group, rotate);
+                for (unsigned k = 0; k < K; ++k) {
+                    const std::size_t at = (std::size_t(k / 64U) * R + r) * 64U + k % 64U;
+                    bad1 += h1[at] != __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(row[k]));
+                    bad2 += h2[at] != __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(row2[k]));
+                }
+            }
+            std::printf("a4 emu %s: tiles vs host reference: %u / %u of %zu differ (tile pass / map2)\n", name, bad1, bad2, n);
+            failures += (bad1 + bad2) != 0U;
+            return 0;  // CHECK returns 1 on a HIP error
+        };
+        namespace a4 = strix::core::a4_tiles;
+        arm(Tag<a4::Emu<32U, false>>{}, "g32", 32U, false);
+        arm(Tag<a4::Emu<64U, false>>{}, "g64", 64U, false);
+        arm(Tag<a4::Emu<32U, true>>{}, "h128g32", 32U, true);
+        arm(Tag<a4::Emu<64U, true>>{}, "h128g64", 64U, true);
+        CHECK(hipFree(dx)); CHECK(hipFree(d1)); CHECK(hipFree(dp)); CHECK(hipFree(t1)); CHECK(hipFree(t2));
     }
     std::printf("%s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;

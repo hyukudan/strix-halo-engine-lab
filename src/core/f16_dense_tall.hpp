@@ -311,9 +311,14 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
 // column blocks of one row block share its tiles through L2.
 inline constexpr unsigned kX16Rows = 2048;  // measured crossover (MiniMax index projection ABAB: 1024 direct, 2048 x16)
 inline std::size_t x16_bytes(unsigned rows, unsigned in) { return static_cast<std::size_t>(rows) * in * 2U; }
-// One thread per 8-input chunk (in % 64 == 0).
-template <int = 0> __global__ __launch_bounds__(256) void x16_tiles_kernel(const float* __restrict__ x, _Float16* __restrict__ xt,
-                                                                          unsigned rows, unsigned in) {
+// Tile quantiser of the producers (Q::apply on the lane's 8 FP32 values before the FP16 cast). TileRne = the core's
+// cast alone (the x16 contract above); a4_tiles::Emu<G, Rotate> = the A4 groups of the W4A4 class (gate emulation).
+struct TileRne {
+    template <class V8> __device__ __forceinline__ static void apply(V8&) {}
+};
+// One thread per 8-input chunk (in % 64 == 0; a quantiser with lane groups needs in % 128 == 0).
+template <class Q = TileRne> __global__ __launch_bounds__(256) void x16_tiles_kernel(const float* __restrict__ x, _Float16* __restrict__ xt,
+                                                                                    unsigned rows, unsigned in) {
     const unsigned chunks = in / 8U;
     const std::size_t i = static_cast<std::size_t>(blockIdx.x) * 256U + threadIdx.x;
     if (i >= static_cast<std::size_t>(rows) * chunks) return;
@@ -321,19 +326,22 @@ template <int = 0> __global__ __launch_bounds__(256) void x16_tiles_kernel(const
     const float4 a = *reinterpret_cast<const float4*>(x + static_cast<std::size_t>(r) * in + c * 8U);
     const float4 b = *reinterpret_cast<const float4*>(x + static_cast<std::size_t>(r) * in + c * 8U + 4U);
     using H8 = _Float16 __attribute__((ext_vector_type(8)));
-    const H8 h = {static_cast<_Float16>(a.x), static_cast<_Float16>(a.y), static_cast<_Float16>(a.z), static_cast<_Float16>(a.w),
-                  static_cast<_Float16>(b.x), static_cast<_Float16>(b.y), static_cast<_Float16>(b.z), static_cast<_Float16>(b.w)};
+    using F8 = float __attribute__((ext_vector_type(8)));
+    F8 v = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+    Q::apply(v);
+    const H8 h = {static_cast<_Float16>(v[0]), static_cast<_Float16>(v[1]), static_cast<_Float16>(v[2]), static_cast<_Float16>(v[3]),
+                  static_cast<_Float16>(v[4]), static_cast<_Float16>(v[5]), static_cast<_Float16>(v[6]), static_cast<_Float16>(v[7])};
     *reinterpret_cast<H8*>(xt + (static_cast<std::size_t>(c / 8U) * rows + r) * 64U + (c % 8U) * 8U) = h;
 }
-inline void enqueue_x16_tiles(const float* x, _Float16* xt, unsigned rows, unsigned in, hipStream_t s) {
+template <class Q = TileRne> inline void enqueue_x16_tiles(const float* x, _Float16* xt, unsigned rows, unsigned in, hipStream_t s) {
     const std::size_t n = static_cast<std::size_t>(rows) * (in / 8U);
-    if (n) hipLaunchKernelGGL(x16_tiles_kernel<>, dim3(static_cast<unsigned>((n + 255U) / 256U)), dim3(256), 0, s, x, xt, rows, in);
+    if (n) hipLaunchKernelGGL(x16_tiles_kernel<Q>, dim3(static_cast<unsigned>((n + 255U) / 256U)), dim3(256), 0, s, x, xt, rows, in);
 }
 // x16 tiles of an elementwise producer: element (r, k) = fp16_rne(F::apply(a[r][k], b[r][k])) (e.g. a gated linear unit's
 // SiLU(g) * u, F supplied by the engine). Same bits as storing the FP32 values and running x16_tiles_kernel: the FP32
 // result is pinned in a register (asm) so the compiler cannot fold its last multiply into the FP16 conversion
 // (v_fma_mix: one rounding instead of two). Saves the FP32 store and the tile pass's read of it.
-template <class F> __global__ __launch_bounds__(256) void x16_tiles_map2_kernel(const float* __restrict__ a, const float* __restrict__ b,
+template <class F, class Q = TileRne> __global__ __launch_bounds__(256) void x16_tiles_map2_kernel(const float* __restrict__ a, const float* __restrict__ b,
                                                                               _Float16* __restrict__ xt, unsigned rows, unsigned in) {
     const unsigned chunks = in / 8U;
     const std::size_t i = static_cast<std::size_t>(blockIdx.x) * 256U + threadIdx.x;
@@ -343,18 +351,22 @@ template <class F> __global__ __launch_bounds__(256) void x16_tiles_map2_kernel(
     using F8 = float __attribute__((ext_vector_type(8)));
     using H8 = _Float16 __attribute__((ext_vector_type(8)));
     const F8 va = *reinterpret_cast<const F8*>(a + at), vb = *reinterpret_cast<const F8*>(b + at);  // two b128 loads each
-    H8 h;
+    F8 v;
 #pragma unroll
     for (unsigned j = 0; j < 8U; ++j) {
-        float v = F::apply(va[j], vb[j]);
-        asm volatile("" : "+v"(v));
-        h[j] = static_cast<_Float16>(v);
+        float t = F::apply(va[j], vb[j]);
+        asm volatile("" : "+v"(t));
+        v[j] = t;
     }
+    Q::apply(v);
+    H8 h;
+#pragma unroll
+    for (unsigned j = 0; j < 8U; ++j) h[j] = static_cast<_Float16>(v[j]);
     *reinterpret_cast<H8*>(xt + (static_cast<std::size_t>(c / 8U) * rows + r) * 64U + (c % 8U) * 8U) = h;
 }
-template <class F> inline void enqueue_x16_tiles_map2(const float* a, const float* b, _Float16* xt, unsigned rows, unsigned in, hipStream_t s) {
+template <class F, class Q = TileRne> inline void enqueue_x16_tiles_map2(const float* a, const float* b, _Float16* xt, unsigned rows, unsigned in, hipStream_t s) {
     const std::size_t n = static_cast<std::size_t>(rows) * (in / 8U);
-    if (n) hipLaunchKernelGGL(x16_tiles_map2_kernel<F>, dim3(static_cast<unsigned>((n + 255U) / 256U)), dim3(256), 0, s, a, b, xt, rows, in);
+    if (n) x16_tiles_map2_kernel<F, Q><<<dim3(static_cast<unsigned>((n + 255U) / 256U)), dim3(256), 0, s>>>(a, b, xt, rows, in);
 }
 // Cols mixin: Base's tile / stage hooks, A fragments from the x16 tiles, column-fast CTA order
 // (launch dim3(column blocks, row blocks)).

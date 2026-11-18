@@ -29,6 +29,16 @@ STRIX_INT_HD inline int a4_code(int value, float step) {
     const int q = int(::rintf(float(value) / step));
     return q < -7 ? -7 : (q > 7 ? 7 : q);
 }
+// The same A4 rule on FP32 values (a group quantised directly, no A8 step): step = amax / 7 (1 for a zero or an
+// underflowing group), code = rint(v / step) clamped to +-7 (a NaN quotient gives code 0).
+STRIX_INT_HD inline float a4_step_f(float amax) {
+    const float s = amax / 7.0f;
+    return s > 0.0f ? s : 1.0f;
+}
+STRIX_INT_HD inline int a4_code_f(float value, float step) {
+    const float q = ::rintf(value / step);
+    return q < -7.0f ? -7 : (q > 7.0f ? 7 : (q == q ? int(q) : 0));
+}
 // High-class-bit-first butterfly. Low-bit-first changes the output bits.
 STRIX_INT_HD inline float tree32(float (&v)[32]) {
     for (unsigned s = 16; s; s /= 2)
