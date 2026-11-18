@@ -73,7 +73,7 @@ void bind_hip_main(int& argc, char** argv, std::FILE* receipt, CodeLoad code_loa
             [](const char* name) { return ::unsetenv(name) == 0; }, [&] { return restart_own_image(argv); }))
         std::fprintf(stderr, "runtime host memory: restart failed (%s); continuing with user pages\n", std::strerror(error));
     {  // effective config: the lever with the mode this image really runs in (the same line for every entry point)
-        const char* policy = std::getenv("STRIX_HOST_DRIVER_PAGES");
+        const char* policy = strix::envcfg::text("STRIX_HOST_DRIVER_PAGES");  // recorded again below with the effective mode
         strix::envcfg::record("STRIX_HOST_DRIVER_PAGES", policy != nullptr && *policy != '\0' ? policy : nullptr,
                               runtime_host_memory_is_driver_pages(std::getenv(kRuntimePagedMemory)) ? "1" : "0");
     }
