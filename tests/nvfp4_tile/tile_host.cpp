@@ -12,7 +12,7 @@
 #include <map>
 #include <vector>
 
-#include "strix/cuda_core/operand_cache_plan.hpp"
+#include "strix/weight/operand_cache_plan.hpp"
 #include "tile_ref.hpp"
 
 namespace {
@@ -102,7 +102,7 @@ void test_layouts(std::uint32_t out, std::uint32_t in) {
     std::vector<int> hit(T::w_tile_bytes(out, in), 0);
     for (std::size_t i = 0; i < hit.size(); ++i) ++hit[T::repack_dst(i, in)];
     for (int h : hit) CHECK(h == 1);
-    CHECK(strix::cuda_core::operand_cache::entry_bytes(strix::cuda_core::operand_cache::Kind::e2m1_tile, out, in) == T::w_tile_bytes(out, in));
+    CHECK(strix::weight::operand_cache::entry_bytes(strix::weight::operand_cache::Kind::e2m1_tile, out, in) == T::w_tile_bytes(out, in));
 }
 
 void test_gemm(std::uint32_t out, std::uint32_t in, std::uint32_t rows, std::uint32_t seed) {

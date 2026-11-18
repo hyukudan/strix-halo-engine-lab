@@ -1,8 +1,9 @@
-// Host oracle for the resident expanded-operand cache (strix/cuda_core/operand_cache_plan.hpp) and its shared CLI resolver.
+// Host oracle for the resident expanded-operand cache (strix/weight/operand_cache_plan.hpp) and its shared CLI resolver.
 // Invariants: (1) admitted entries never overlap and stay inside the arena, so every cached operand keeps exactly the bytes of its
 // own expansion (the GEMM reads identical operands with and without the cache); (2) each entry is filled exactly once and every
 // later use, on any stream, is ordered after the fill; (3) admission is deterministic first fit under the budget; (4) the default
 // and the CLI resolve to the same values.
+#include "strix/weight/operand_cache_plan.hpp"
 #include "strix/qwen35/prefill_controls.hpp"
 
 #include <cstdint>
@@ -11,7 +12,9 @@
 #include <string>
 #include <vector>
 
-namespace oc = strix::cuda_core::operand_cache;
+namespace oc = strix::weight::operand_cache;
+static_assert(&oc::plan == &strix::cuda_core::operand_cache::plan && &oc::budget == &strix::cuda_core::operand_cache::budget,
+              "the forwarding header aliases the shared planner");
 
 static int g_fail = 0;
 #define REQUIRE(c)                                                                  \
