@@ -112,6 +112,18 @@ public:
     [[nodiscard]] std::size_t hidden_row_bytes() const;
     void export_hidden(float* host, std::uint32_t rows) const;       // device -> host, synchronizes
     void import_hidden(const float* host, std::uint32_t rows) const; // host -> hidden_rows(), stream-ordered
+    // Stage range of a rank that owns more layers than it runs in the prefill (the decoder of a relayed plan): windows run
+    // [first, last) and commit at `last`. Default = the owned range (unchanged behaviour); set_stage(layer_begin(),
+    // layer_end()) restores it before the decode.
+    void set_stage(std::uint32_t first, std::uint32_t last);
+    // Layer state of [first, last) at the committed positions: per layer in order, GDN = recurrent matrix + conv history,
+    // attention = K then V rows [0, committed) (position-major). export synchronizes; import requires no pending window
+    // and the same committed count, overwrites those layers' state and drops the V^T copy (rebuilt from the cache by the
+    // next wide window: same bytes). Bytes cross unchanged, so a decoder that imports every other stage's layers holds
+    // exactly the single-rank state.
+    [[nodiscard]] std::size_t state_bytes(std::uint32_t first, std::uint32_t last) const;
+    void export_state(std::uint32_t first, std::uint32_t last, void* host) const;
+    void import_state(std::uint32_t first, std::uint32_t last, std::uint32_t positions, const void* host);
     [[nodiscard]] void* stream_handle() const;          // hipStream_t of every launch (staging copies order on it)
 
     void read_top(const HipRowsOut& o, std::uint32_t rows, std::uint32_t* host) const;  // synchronizes

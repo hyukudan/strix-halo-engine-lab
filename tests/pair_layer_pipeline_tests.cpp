@@ -40,8 +40,9 @@ struct Toy {
     unsigned begin, end;
     std::vector<float> rec, hist, x, logits;
     unsigned committed = 0;
+    unsigned stage_end;   // windows commit at the stage end (a relay decoder owns more layers than its stage runs)
     Toy(const Weights& w, unsigned b, unsigned e, unsigned max_rows)
-        : m(w), begin(b), end(e), rec(std::size_t(w.layers) * H), hist(std::size_t(w.layers) * H), x(std::size_t(max_rows) * H), logits(V) {}
+        : m(w), begin(b), end(e), stage_end(e), rec(std::size_t(w.layers) * H), hist(std::size_t(w.layers) * H), x(std::size_t(max_rows) * H), logits(V) {}
     void range(unsigned first, unsigned last, const std::uint32_t* tokens, unsigned rows, bool head) {
         if (first < begin || last > end) throw std::logic_error("toy: layer outside the owned range");
         if (first == 0U)
@@ -69,7 +70,19 @@ struct Toy {
                 logits[v] = acc;
             }
         }
-        if (last == end) committed += rows;
+        if (last == stage_end) committed += rows;
+    }
+    // Layer state of [first, last): recurrent + history rows (the engine's export_state / import_state shape).
+    std::vector<std::byte> save(unsigned first, unsigned last) const {
+        std::vector<std::byte> b(std::size_t(last - first) * H * 8U);
+        std::memcpy(b.data(), &rec[std::size_t(first) * H], std::size_t(last - first) * H * 4U);
+        std::memcpy(b.data() + std::size_t(last - first) * H * 4U, &hist[std::size_t(first) * H], std::size_t(last - first) * H * 4U);
+        return b;
+    }
+    void load(unsigned first, unsigned last, std::span<const std::byte> b) {
+        if (first < begin || last > end || b.size() != std::size_t(last - first) * H * 8U) throw std::logic_error("toy: bad state load");
+        std::memcpy(&rec[std::size_t(first) * H], b.data(), std::size_t(last - first) * H * 4U);
+        std::memcpy(&hist[std::size_t(first) * H], b.data() + std::size_t(last - first) * H * 4U, std::size_t(last - first) * H * 4U);
     }
     std::uint32_t top() const {
         std::uint32_t best = 0;
@@ -119,7 +132,8 @@ Result reference(const Weights& m, const std::vector<std::uint32_t>& prompt, uns
 }
 
 std::vector<Result> run_chain(const Weights& m, const std::vector<std::uint32_t>& prompt, unsigned width, unsigned gen,
-                              const std::vector<std::uint32_t>& cuts, std::uint64_t bad_identity_stage = ~0ULL) {
+                              const std::vector<std::uint32_t>& cuts, std::uint64_t bad_identity_stage = ~0ULL,
+                              std::uint32_t relay_decoder = ~0U) {
     const unsigned stages = unsigned(cuts.size() - 1U);
     std::vector<std::unique_ptr<Channel>> links;
     for (unsigned i = 0; i + 1U < stages; ++i) links.push_back(std::make_unique<Channel>());
@@ -131,7 +145,9 @@ std::vector<Result> run_chain(const Weights& m, const std::vector<std::uint32_t>
         threads.emplace_back([&, s] {
             try {
                 layers::Placement p{cuts, s};
-                Toy t(m, cuts[s], cuts[s + 1U], width);
+                const bool decoder = s == relay_decoder;   // relay: the decoder owns every layer, runs its stage
+                Toy t(m, decoder ? 0U : cuts[s], decoder ? m.layers : cuts[s + 1U], width);
+                t.stage_end = cuts[s + 1U];
                 const std::uint64_t identity = s == bad_identity_stage ? 2U : 1U;
                 std::unique_ptr<Pipe> in, outp;
                 Channel* up = s ? links[s - 1U].get() : nullptr;      // dir 0: down the line, dir 1: up the line
@@ -156,13 +172,26 @@ std::vector<Result> run_chain(const Weights& m, const std::vector<std::uint32_t>
                 layers::Link lu, ld;
                 if (up) { lu.send = [up](std::span<const std::byte> b) { up->send(1, b); }; lu.receive = [up](std::span<std::byte> b) { up->receive(0, b); }; }
                 if (down) { ld.send = [down](std::span<const std::byte> b) { down->send(0, b); }; ld.receive = [down](std::span<std::byte> b) { down->receive(1, b); }; }
+                layers::Placement dp = p;
+                std::uint32_t first = p.head() ? t.top() : 0U;
+                if (relay_decoder != ~0U) {
+                    layers::RelayOps r;
+                    r.save = [&] { return t.save(p.first(), p.last()); };
+                    r.load = [&](std::uint32_t f, std::uint32_t l, std::span<const std::byte> b) { t.load(f, l, b); };
+                    const auto rs = layers::relay_state(p, relay_decoder, first, up ? &lu : nullptr, down ? &ld : nullptr, r);
+                    if (!decoder) return;
+                    first = rs.token;
+                    t.stage_end = m.layers;
+                    dp = layers::Placement{{0U, m.layers}, 0U};
+                    up = nullptr; down = nullptr;
+                }
                 layers::DecodeOps d;
                 d.row_bytes = row_bytes;
-                d.forward = [&](std::uint32_t tok, bool head) { t.range(p.first(), p.last(), &tok, 1U, head); };
+                d.forward = [&](std::uint32_t tok, bool head) { t.range(dp.first(), dp.last(), &tok, 1U, head); };
                 d.top = [&] { return t.top(); };
                 d.export_row = [&](std::span<std::byte> b) { std::memcpy(b.data(), t.x.data(), row_bytes); };
                 d.import_row = [&](std::span<const std::byte> b) { std::memcpy(t.x.data(), b.data(), row_bytes); };
-                out[s].ids = layers::decode(p, p.head() ? t.top() : 0U, gen, up ? &lu : nullptr, down ? &ld : nullptr, d).ids;
+                out[s].ids = layers::decode(dp, first, gen, up ? &lu : nullptr, down ? &ld : nullptr, d).ids;
             } catch (const std::exception& e) {
                 out[s].error = e.what();
                 if (s) links[s - 1U]->close();
@@ -207,6 +236,19 @@ int main() {
                "cuts " + text(cuts) + " last-row logits bytes differ from one rank");
         ++checked;
     }
+    // relay to one decoder (every stage of every plan): the decoder's ids equal one rank, the others decode nothing
+    unsigned relayed = 0;
+    for (const auto& cuts : plans) {
+        for (std::uint32_t dec = 0; dec + 1U < cuts.size(); ++dec) {
+            const auto r = run_chain(m, prompt, width, gen, cuts, ~0ULL, dec);
+            for (std::size_t s = 0; s < r.size(); ++s) {
+                expect(r[s].error.empty(), "relay cuts " + text(cuts) + " decoder " + std::to_string(dec) + " stage " + std::to_string(s) + " error: " + r[s].error);
+                if (s == dec) expect(r[s].ids == ref.ids, "relay cuts " + text(cuts) + " decoder " + std::to_string(dec) + " ids differ from one rank");
+                else expect(r[s].ids.empty(), "relay: a non-decoder stage decoded");
+            }
+            ++relayed;
+        }
+    }
     // a stage with another model/plan identity is refused by name (and nothing hangs)
     const auto bad = run_chain(m, prompt, width, gen, {0, 3, 7}, 1U);
     expect(bad[1].error.find("seam header mismatch") != std::string::npos, "identity mismatch refused: got '" + bad[1].error + "'");
@@ -215,6 +257,6 @@ int main() {
     try { layers::Placement{{0, 3, 3, 7}, 0}.check(); } catch (const std::invalid_argument&) { threw = true; }
     expect(threw, "non-increasing cuts refused");
     if (failures) { std::fprintf(stderr, "%d failure(s)\n", failures); return 1; }
-    std::printf("PASS: layer pipeline over N ranks (%u plans, N=1..4, ids and logits bytes equal to one rank)\n", checked);
+    std::printf("PASS: layer pipeline over N ranks (%u plans, N=1..4, ids and logits bytes equal to one rank; %u relayed decodes equal)\n", checked, relayed);
     return 0;
 }
