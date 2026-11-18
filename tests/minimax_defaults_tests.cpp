@@ -1035,6 +1035,36 @@ void test_entry_points_host_defaults() {
         if (row.optimization) check(md::host_default_value(row, "rank", lookup(base)) == nullptr, std::string(row.name) + " off under the baseline");
 }
 
+// '--profile fast' = the qualified bundle mm-fast-pf-v2: the product profile selects STRIX_MM_FAST_PREFILL only while
+// the switch is unset (a set switch, "0" included, wins). After print_or_apply's export the run is the switch's run:
+// same members and cache identity; the receipt rows carry both members (the switch is provenance, not a table row).
+void test_fast_product_profile_bundle() {
+    const char* pp = md::kProductProfileEnv;
+    check(!md::fast_profile_selects_bundle(lookup(EnvMap{})), "product bundle: no profile, no bundle");
+    for (const char* name : {"default", "quality", "turbo", "junk"})
+        check(!md::fast_profile_selects_bundle(lookup(EnvMap{{pp, name}})), "product bundle: only fast selects it");
+    check(md::fast_profile_selects_bundle(lookup(EnvMap{{pp, "fast"}})), "product bundle: fast selects it");
+    check(!md::fast_profile_selects_bundle(lookup(EnvMap{{pp, "fast"}, {"STRIX_MM_FAST_PREFILL", "0"}})),
+          "product bundle: explicit 0 wins");
+    check(!md::fast_profile_selects_bundle(lookup(EnvMap{{pp, "fast"}, {"STRIX_MM_FAST_PREFILL", "1"}})),
+          "product bundle: a set switch needs no export");
+    const EnvMap exported{{pp, "fast"}, {"STRIX_MM_FAST_PREFILL", "1"}};  // what print_or_apply leaves for --profile fast
+    const EnvMap switched{{"STRIX_MM_FAST_PREFILL", "1"}};
+    const auto p = md::prefill_policy(lookup(exported));
+    check(p.msa_flash == 1 && p.policies == "msa-flash-bf16-l40-v1" && p.router_wmma && p.router_wmma_layers == "40-59",
+          "product bundle: fast runs both qualified members");
+    check(md::prefill_identity(lookup(exported)) == md::prefill_identity(lookup(switched)),
+          "product bundle: same cache identity as the switch");
+    {   // The fingerprint names the profile; the governed rows carry both members, as for the switch.
+        const auto r = md::profile_resolution(lookup(exported));
+        check(r.find("msa_flash") != nullptr && r.find("msa_flash")->value == "1" && r.find("router_wmma") != nullptr &&
+                  r.find("router_wmma")->value == "1" && r.qualification() == "qualified",
+              "product bundle: receipt rows carry both members");
+    }
+    const auto q = md::prefill_policy(lookup(EnvMap{{pp, "fast"}, {"STRIX_MM_FAST_PREFILL", "0"}}));
+    check(q.msa_flash == 0 && !q.router_wmma, "product bundle: opt-out under fast runs exact");
+}
+
 // Shared TP2 exchange format (xport/exchange_format.hpp) through the one MiniMax resolver: default f32 everywhere with
 // the legacy identity and fingerprint; an explicit f16 is the named FAST policy tp2-xchg-f16-v0 (identity field,
 // fingerprint input, effective-config line); the exact baseline refuses it; bf16 / junk are refused.
@@ -1089,6 +1119,7 @@ int main(int argc, char** argv) {
         test_entry_points_host_defaults();
         test_split_frame();
         test_fast_prefill_profile();
+        test_fast_product_profile_bundle();
         test_tp2_exchange_format();
         test_router_wmma();
         test_turbo_product_profile();

@@ -353,6 +353,12 @@ profile::Resolution profile_resolution(const Lookup& env) {
     return profile::resolve(profile_engine(), in);
 }
 
+bool fast_profile_selects_bundle(const Lookup& env) {
+    const char* name = env(kProductProfileEnv);
+    return name != nullptr && profile::is_name(name) && profile::parse(name) == profile::Name::fast &&
+           !strix::fast_profile::set(env(kFastBundle.env));
+}
+
 bool product_option(const std::string& a, const std::function<std::string()>& next, std::string* timing) {
     if (a == profile::turbo::kWeightsOption || a == profile::turbo::kBitsOption || a == profile::turbo::kPackOption) {
         (void)next();  // exported by print_or_apply()
@@ -773,6 +779,10 @@ bool print_or_apply(const std::string& app, int argc, char** argv) {
     // shared opt-out: DSpark off unless STRIX_MM_SERVE_DSPARK is set (must precede apply(), which exports the default)
     if (app == "serve" && strix::session::speculation_environment_off(process_env(strix::session::speculation_environment)))
         (void)export_env("STRIX_MM_SERVE_DSPARK", "0", 0);
+    // Product profile 'fast' = the qualified FAST bundle mm-fast-pf-v2, exported before any reader (prefill_policy,
+    // the device-side fast_profile::lever, rank agreement) so '--profile fast' is the same run, receipt and cache
+    // identity as STRIX_MM_FAST_PREFILL=1 (the bundle switch stays requested provenance, not a profile_table row).
+    if (fast_profile_selects_bundle(process_env)) (void)export_env(kFastBundle.env, "1", 0);
     apply();
     (void)split_frame_policy();  // validate and record the lever on both entry points (rank CLI and serve)
     (void)pf_async_min_rows(process_env("STRIX_MM_PF_ASYNC_MIN_ROWS"));
