@@ -1734,13 +1734,15 @@ inline void validate_resolved_mtp_cli(const Options& o) {
         throw std::invalid_argument("MTP window hyper-mix requires resolved --parallel-hyper-mix --staged-hyper-projections "
             "--fused-staged-hyper-mix --typed-fused-hyper-projections --prefetch-typed-hyper-rows --prefetch-q8-hyper-output");
     // Every window verifies its rows with the greedy multi-row head (hip_mtp_window_verifier.hip), which exists only on
-    // the virtual Q8 LM head kernels (known_head_id: prefetch8 load or wave8); without it the server refused only after
-    // the model load ("known-window greedy rows require ..."). STRIX_MTP_GREEDY_ROWS=0 keeps per-row selectors.
+    // the virtual Q8 LM head with row prefetch (known_head_id: prefetch8 load or wave8 marker). The server builds its
+    // windows at startup and refused only after the model load ("known-window greedy rows require ..."); its automatic
+    // owner receives the prefetch from the shared prompt organization, an explicit T must name it. The single-request
+    // command keeps its existing rule here. STRIX_MTP_GREEDY_ROWS=0 keeps per-row selectors.
     const char* greedy_rows=strix::envcfg::text("STRIX_MTP_GREEDY_ROWS");
     if(o.mtp.enabled && o.mtp.window_rows && !(greedy_rows && std::string_view(greedy_rows)=="0") &&
-       !o.virtual_q8_lm_head)
-        throw std::invalid_argument("MTP target windows require resolved --virtual-q8-lm-head "
-            "(greedy window rows; STRIX_MTP_GREEDY_ROWS=0 keeps per-row selectors)");
+       (!o.virtual_q8_lm_head || (o.http_serve && !o.prefetch_q8_lm_head)))
+        throw std::invalid_argument(std::string("MTP target windows require resolved --virtual-q8-lm-head")+
+            (o.http_serve?" --prefetch-q8-lm-head":"")+" (greedy window rows; STRIX_MTP_GREEDY_ROWS=0 keeps per-row selectors)");
 }
 
 inline std::string yarn_route_refusal(const Options& o) {

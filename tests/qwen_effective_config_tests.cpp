@@ -4036,6 +4036,27 @@ int main(int argc, char** arguments) {
                 "minimal MTP-window organization server admits automatic T8192");
             validate_http_serve(served_organized.options);
             {
+                // An explicit T keeps the user's organization (no shared prompt overlay): the window head also needs
+                // --prefetch-q8-lm-head, refused at resolution instead of after the model load (node: greedy rows).
+                auto explicit_t=organized;
+                explicit_t.insert(explicit_t.end(),{"--known-prefix-window","--known-prefix-full-rows",
+                    "--known-prefix-prefill-rows","8192","--known-prefix-workspace-budget-bytes","68719476736",
+                    "--known-prefix-host-metadata-budget-bytes","2147483648","--known-prefix-uma-budget-bytes","124889595904",
+                    "--known-prefix-host-headroom-bytes","4294967296"});
+                const auto outcome=[&](const std::vector<std::string>& argv) {
+                    try { const auto r=resolve(RequestedOptions{parse(argv),{}},memory);
+                        return std::pair<std::string,std::uint32_t>{r.error,r.options.known_prefix_prefill_rows};
+                    } catch (const std::exception& e) { return std::pair<std::string,std::uint32_t>{e.what(),0U}; }
+                };
+                const auto missing=outcome(explicit_t);
+                expect(missing.first.find("MTP target windows require resolved --virtual-q8-lm-head --prefetch-q8-lm-head")!=
+                    std::string::npos, "explicit-T server without LM-head prefetch is refused at resolution, naming the flag");
+                explicit_t.emplace_back("--prefetch-q8-lm-head");
+                const auto admitted=outcome(explicit_t);
+                expect(admitted.first.empty() && admitted.second==8192U,
+                    "explicit-T server with the virtual Q8 LM head and its prefetch admits T8192");
+            }
+            {
                 // The serving memory check registers the prompt compiler requests: their plans must follow the
                 // options, as in the decode builder ("... requires opt-in" otherwise).
                 auto organized_options=served_organized.options;
