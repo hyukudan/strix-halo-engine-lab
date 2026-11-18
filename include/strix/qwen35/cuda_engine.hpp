@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -47,6 +48,12 @@ enum class PrefillArith : std::uint8_t { exact, flash, fast, fast2, fast8, fast4
 //   chunk16 = FAST gdn-chunk16-f32-v1 (strix/cuda_core/gdn_chunk.hpp): 16-row chunks, FP32, all SMs; bits differ (identity
 //             suffix -gdnc16), opt-in until its logit gate passes.
 enum class PrefillGdn : std::uint8_t { serial, chunk16 };
+// CLI / option spelling of PrefillGdn ("serial" | "chunk16"); anything else is rejected, never mapped to a default.
+[[nodiscard]] inline PrefillGdn parse_prefill_gdn(const std::string& s) {
+    if (s == "serial") return PrefillGdn::serial;
+    if (s == "chunk16") return PrefillGdn::chunk16;
+    throw std::invalid_argument("--prefill-gdn expects serial|chunk16, got '" + s + "'");
+}
 
 struct EngineOptions {
     cuda_core::DenseArith dense_arithmetic = cuda_core::dense_arith();
