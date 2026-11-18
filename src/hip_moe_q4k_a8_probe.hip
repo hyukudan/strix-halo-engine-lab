@@ -720,9 +720,10 @@ __device__ void slot_merge_epilogue(const SlotMergeTail& t,const float* rawdots,
     namespace sm=strix::moe_slot_merge;
     if(t.tickets==nullptr) return;
     __shared__ unsigned last,initial,flagged;
+    __threadfence(); // every writing lane releases its partials device-wide
     __syncthreads();
     if(threadIdx.x==0) {
-        __threadfence(); // release this block's partials before its ticket
+        __threadfence(); // and orders them before this block's ticket
         last=sm::last_arrival(atomicAdd(&t.tickets[blockIdx.x],1U),gridDim.y)?1U:0U;
     }
     __syncthreads();
@@ -744,6 +745,7 @@ __device__ void slot_merge_epilogue(const SlotMergeTail& t,const float* rawdots,
         const float value=written?current:t.accumulation[out];
         if(sm::fails_commit(__float_as_uint(value),t.bf16_commit)) atomicOr(&t.tickets[sm::nonfinite_word(hidden)],1U);
     }
+    __threadfence(); // the merging lanes release the accumulation and the flag
     __syncthreads();
     if(threadIdx.x==0) {
         t.tickets[blockIdx.x]=0U; // every arrival of this tile is in
