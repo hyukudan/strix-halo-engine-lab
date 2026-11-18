@@ -35,10 +35,10 @@ struct Env {
         if (put_ok) values[name] = value;
         return put_ok;
     }
-    unsigned apply(bool default_applies = false) {
+    unsigned apply(bool default_applies = false, dev::HostRegistration registration = dev::HostRegistration::engine_pages) {
         return dev::apply_runtime_host_driver_pages([&](const char* name) { return get(name); },
                                                     [&](const char* name, const char* value) { return put(name, value); },
-                                                    default_applies);
+                                                    default_applies, registration);
     }
     bool driver_pages() const { return dev::runtime_host_memory_is_driver_pages(get(dev::kRuntimePagedMemory)); }
     // every value of the set is present with the policy's value
@@ -117,6 +117,48 @@ void environment_step() {
         bool failed = false;
         try { (void)env.apply(); } catch (const std::runtime_error&) { failed = true; }
         require(failed && !env.driver_pages(), "a failed insert is an error, not a silent user-pages run");
+    }
+}
+
+// The declared host registration (F3/F8): a binary that registers the model file mapping never takes the default, and an
+// explicit "1" is refused with a reason before anything is inserted; "0" and unset stay accepted.
+void registration_step() {
+    using dev::HostRegistration;
+    static_assert(dev::runtime_host_pages_default(HostRegistration::engine_pages, true));
+    static_assert(!dev::runtime_host_pages_default(HostRegistration::engine_pages, false));
+    static_assert(!dev::runtime_host_pages_default(HostRegistration::model_file, true));
+    static_assert(!dev::runtime_host_pages_default(HostRegistration::model_file, false));
+    {
+        Env env;  // unset policy on a model-file binary: nothing, even where the device memory is host memory
+        require(env.apply(dev::runtime_host_pages_default(HostRegistration::model_file, true), HostRegistration::model_file) == 0 &&
+                    env.puts == 0, "model-file binary must decline the default");
+    }
+    {
+        Env env;
+        env.values["STRIX_HOST_DRIVER_PAGES"] = "1";
+        bool refused = false;
+        try {
+            (void)env.apply(false, HostRegistration::model_file);
+        } catch (const std::invalid_argument& e) {
+            refused = std::string_view(e.what()).find("STRIX_HOST_DRIVER_PAGES=1 refused") != std::string_view::npos;
+        }
+        require(refused && env.puts == 0, "explicit 1 on a model-file binary must be refused with a reason, nothing inserted");
+    }
+    {
+        Env env;
+        env.values["STRIX_HOST_DRIVER_PAGES"] = "0";
+        require(env.apply(false, HostRegistration::model_file) == 0 && env.puts == 0, "0 stays accepted on a model-file binary");
+    }
+    {
+        Env env;  // an explicit runtime value always wins: no refusal, nothing inserted
+        env.values["STRIX_HOST_DRIVER_PAGES"] = "1";
+        env.values[dev::kRuntimePagedMemory] = "1";
+        require(env.apply(false, HostRegistration::model_file) == 0 && env.puts == 0, "explicit runtime value wins before the refusal");
+    }
+    {
+        Env env;  // engine-pages binaries keep the switch
+        env.values["STRIX_HOST_DRIVER_PAGES"] = "1";
+        require(env.apply(false, HostRegistration::engine_pages) == kAll && env.whole_set(), "explicit 1 still applies to engine-pages binaries");
     }
 }
 
@@ -247,8 +289,13 @@ void direct_io_sources(const std::filesystem::path& root) {
             "the runtime value must be inserted before the eager-code restart and settled after it");
     // One resolver for every entry point (command line and serving alike): the default is decided in the start gate
     // only, from the topology probe and the code-load policy, and the effective mode is recorded there.
-    require(gate.find("const bool host_pages_default = code_load == CodeLoad::shared && kfd_gpus_share_host_memory();") != std::string::npos,
-            "the default must come from the topology probe and the shared code-load policy");
+    require(gate.find("const bool host_pages_default = runtime_host_pages_default(registration, kfd_gpus_share_host_memory());") != std::string::npos,
+            "the default must come from the topology probe and the binary's declared host registration");
+    require(gate.find("host_pages_default, registration);") != std::string::npos, "the declaration must reach the resolver (refusal of 1)");
+    // Every main that registers the model file mapping declares it (F3/F8): the default is declined and "1" refused there.
+    for (const char* file : {"apps/hip_decode_token_main.cpp", "apps/hip_model_residency_main.cpp"})
+        require(read(root / file).find("strix::device::HostRegistration::model_file") != std::string::npos,
+                std::string("model-file registration not declared at the start gate: ") + file);
     require(gate.find("strix::envcfg::record(\"STRIX_HOST_DRIVER_PAGES\"") != std::string::npos, "effective mode must be recorded");
     for (const char* file : {"include/strix/pinned_host.hpp", "src/core/hip_weight_uploader.hpp", "apps/minimax_rank_main.cpp"})
         require(read(root / file).find("apply_runtime_host_driver_pages(") == std::string::npos,
@@ -260,6 +307,7 @@ void direct_io_sources(const std::filesystem::path& root) {
 int main() {
     try {
         environment_step();
+        registration_step();
         restart_step();
         receipt_lines();
         topology_probe();

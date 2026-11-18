@@ -37,9 +37,9 @@
 //
 // Policy (STRIX_HOST_DRIVER_PAGES): "1" = on, "0" = the runtime defaults, unset = ON when the default applies: every
 // GPU of the driver's topology keeps its device memory in host memory (kfd_gpus_share_host_memory(), read from sysfs
-// before the runtime exists) and the binary uses the shared code-load policy. Binaries with their own policy register
-// model file mappings with the runtime (src/hip_model_residency.cpp), which has not been run without shared virtual
-// memory: they keep the runtime defaults until their owner has a receipt, and still take the switch.
+// before the runtime exists) and the binary registers only its own pinned pages (HostRegistration::engine_pages).
+// Binaries that register the model file mapping with the runtime (HostRegistration::model_file, src/hip_model_residency.cpp)
+// keep the runtime defaults and refuse "1": the runtime refuses that registration without shared virtual memory.
 // An explicitly supplied HSA_USERPTR_FOR_PAGED_MEM always wins, even empty: nothing is inserted then. Any other value
 // of the set that is already present is kept as supplied.
 
@@ -138,12 +138,30 @@ enum class KfdNodeMemory {
     return any;
 }
 
+// What a binary registers with the runtime as GPU-visible host memory (declared by its main(), hip_gate.hpp).
+enum class HostRegistration {
+    engine_pages,  // only the engine's own pinned anonymous buffers (strix/pinned_host.hpp): the default may apply
+    model_file,    // also the model FILE mapping (src/hip_model_residency.cpp create_impl): without shared virtual
+                   // memory the runtime refuses that registration ("hipHostRegister(model range): invalid argument",
+                   // measured 8K one node, 2 of 2 runs), so the default never applies and "1" is refused
+};
+// Whether the unset policy turns driver pages on for this binary.
+[[nodiscard]] constexpr bool runtime_host_pages_default(HostRegistration registration, bool gpus_share_host_memory) {
+    return registration == HostRegistration::engine_pages && gpus_share_host_memory;
+}
+
 // Inserts the values of the set that are absent. Returns which (bit i = kRuntimeImmovableHostMemory[i]); 0 = nothing
-// changed. The caller makes sure a restarted image sees them.
+// changed. The caller makes sure a restarted image sees them. Throws std::invalid_argument for STRIX_HOST_DRIVER_PAGES=1
+// on a binary that registers the model file mapping (the mode cannot work there; nothing is inserted).
 template<class Get, class Put>
-inline unsigned apply_runtime_host_driver_pages(Get get, Put put, bool default_applies) {
+inline unsigned apply_runtime_host_driver_pages(Get get, Put put, bool default_applies,
+                                                HostRegistration registration = HostRegistration::engine_pages) {
     if (get(kRuntimePagedMemory) != nullptr) return 0;
     const lever::Choice choice = lever::select(kHostDriverPages, lever::Inputs{}, get("STRIX_HOST_DRIVER_PAGES"));
+    if (choice.origin == lever::Origin::explicit_switch && choice.on && registration == HostRegistration::model_file)
+        throw std::invalid_argument(
+            "STRIX_HOST_DRIVER_PAGES=1 refused: this binary registers the model file mapping with the HIP runtime, which "
+            "refuses that registration without shared virtual memory (hipHostRegister: invalid argument); unset it or use 0");
     if (!(choice.origin == lever::Origin::explicit_switch ? choice.on : choice.on && default_applies)) return 0;
     unsigned inserted = 0;
     for (std::size_t i = 0; i < kRuntimeImmovableHostMemory.size(); ++i) {

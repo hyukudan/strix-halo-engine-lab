@@ -1212,7 +1212,8 @@ static int run_decode_entry(
     // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
     // GPU of a node keeps working (declared=implicit). A retry re-enters here with the flags already removed.
     // Eager code loading is resolved below by this engine's own policy (--no-eager-code-load, baseline, defaults off).
-    strix::device::bind_hip_main(argc, argv, stderr, strix::device::CodeLoad::engine);
+    strix::device::bind_hip_main(argc, argv, stderr, strix::device::CodeLoad::engine,
+                                 strix::device::HostRegistration::model_file);
     // Host wait policy of this engine (shared home: strix/device/hip_gate.hpp; STRIX_HOST_WAIT overrides): blocking.
     // The runtime's own schedule busy-waits (one host core at 100 % for the whole prefill) for no measured speed.
     try {

@@ -49,20 +49,21 @@ const Bound& bind_hip(Request request, const std::string& devices_path, std::FIL
     return *state.bound;
 }
 
-void bind_hip_main(int& argc, char** argv, std::FILE* receipt, CodeLoad code_load) {
+void bind_hip_main(int& argc, char** argv, std::FILE* receipt, CodeLoad code_load, HostRegistration registration) {
     // Runtime host memory mode first (runtime_host_memory.hpp): the eager-code restart then carries every value in one
     // exec. Still here afterwards with values this image inserted: restart for them, or roll them back.
-    // The default applies where the device memory is host memory, to binaries on the shared code-load policy.
-    // Declined for the engine policy (Qwen, apps/hip_decode_token_main.cpp): it registers the model FILE mapping
-    // (src/hip_model_residency.cpp create_impl) and with HSA_USE_SVM=0 that registration is refused
-    // ("hipHostRegister(model range): invalid argument", measured 8K one node, STRIX_HOST_DRIVER_PAGES=1, 2 of 2 runs).
-    // Its GPU-visible file pages are kept from evicting by the lock/unlock order of registered_backing_lifetime.hpp.
-    const bool host_pages_default = code_load == CodeLoad::shared && kfd_gpus_share_host_memory();
+    // The default applies where the device memory is host memory, to binaries that register only their own pinned pages.
+    // Binaries that register the model FILE mapping (HostRegistration::model_file: apps/hip_decode_token_main.cpp,
+    // apps/hip_model_residency_main.cpp; src/hip_model_residency.cpp create_impl) decline it and refuse "1": with
+    // HSA_USE_SVM=0 that registration is refused ("hipHostRegister(model range): invalid argument", measured 8K one node,
+    // 2 of 2 runs). Their GPU-visible file pages are kept from evicting by registered_backing_lifetime.hpp's lock order.
+    // Independent of the code-load policy (CodeLoad only decides who applies eager code loading).
+    const bool host_pages_default = runtime_host_pages_default(registration, kfd_gpus_share_host_memory());
     unsigned host_pages_inserted = 0;
     try {
         host_pages_inserted = apply_runtime_host_driver_pages(
             [](const char* name) { return strix::envcfg::text(name); },
-            [](const char* name, const char* value) { return ::setenv(name, value, 0) == 0; }, host_pages_default);
+            [](const char* name, const char* value) { return ::setenv(name, value, 0) == 0; }, host_pages_default, registration);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "%s\n", e.what());
         std::fflush(stderr);
