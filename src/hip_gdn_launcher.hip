@@ -8142,6 +8142,44 @@ __global__ void conv_update_rows_kernel(float* qkv, std::uint16_t* conv_state, c
     for (std::uint32_t r = 0; r < rows; ++r)
         conv_update_body(qkv + static_cast<std::uint64_t>(r) * channels, conv_state, conv_weights, kind, kernel_size, channel);
 }
+// Register-ring form of conv_update_rows_kernel (Taps = the conv kernel size): row r runs conv_update_body's operations
+// on the same values in the same order (shift the history, BF16 of the new input, sum over taps 0..Taps-1 from +0, SiLU,
+// BF16 rounding); the history and the taps live in registers instead of the per-row global store / load round trip of
+// conv_state, and the inputs of Ahead rows are loaded together. The history is written back after the last row. Same bits.
+template <unsigned Taps, unsigned Ahead = 8U>
+__global__ void conv_update_rows_ring_kernel(float* qkv, std::uint16_t* conv_state, const void* conv_weights, SmallWeightKind kind,
+                                             std::uint32_t channels, std::uint32_t rows) {
+    const auto channel = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (channel >= channels) return;
+    std::uint16_t* state = conv_state + static_cast<std::uint64_t>(channel) * Taps;
+    std::uint16_t ring[Taps];
+    float weight[Taps];
+#pragma unroll
+    for (unsigned i = 0; i < Taps; ++i) {
+        ring[i] = state[i];
+        weight[i] = load_small(conv_weights, kind, static_cast<std::uint64_t>(channel) * Taps + i);
+    }
+    for (std::uint32_t r0 = 0; r0 < rows; r0 += Ahead) {
+        float in[Ahead];
+#pragma unroll
+        for (unsigned j = 0; j < Ahead; ++j)
+            if (r0 + j < rows) in[j] = qkv[static_cast<std::uint64_t>(r0 + j) * channels + channel];
+#pragma unroll
+        for (unsigned j = 0; j < Ahead; ++j) {
+            if (r0 + j >= rows) break;
+#pragma unroll
+            for (unsigned i = 0; i + 1U < Taps; ++i) ring[i] = ring[i + 1U];
+            ring[Taps - 1U] = float_to_bf16(in[j]);
+            float sum = 0.0F;
+#pragma unroll
+            for (unsigned i = 0; i < Taps; ++i) sum += bf16_to_float(ring[i]) * weight[i];
+            const float silu = sum / (1.0F + expf(-sum));
+            qkv[static_cast<std::uint64_t>(r0 + j) * channels + channel] = round_bf16(silu);
+        }
+    }
+#pragma unroll
+    for (unsigned i = 0; i < Taps; ++i) state[i] = ring[i];
+}
 __global__ void transform_beta_gate_rows_kernel(float* beta, float* gate, const void* dt, SmallWeightKind dt_kind, const void* a,
                                                 SmallWeightKind a_kind, std::uint32_t heads) {
     const auto head = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -8161,6 +8199,11 @@ static bool gdn_rows_lds_lane_major() {
     return on;
 }
 // Off switch of the shared chunked recurrence core in the window path (bits are the same either way: A/B timing, rollback).
+// Off switch of the register-ring window conv (bits are the same either way: A/B timing, rollback).
+static bool gdn_dims_conv_ring() {
+    static const bool on = strix::envcfg::flag("STRIX_GDN_DIMS_CONV_RING", true);
+    return on;
+}
 static bool gdn_dims_cols() {
     static const bool on = strix::envcfg::flag("STRIX_GDN_DIMS_COLS", true);
     return on;
@@ -8180,9 +8223,13 @@ void hip_gdn_decode_step_dims(const HipGdnDimsStep& v, void* stream_ptr) {
     // Rows run one after the other (R1 per row): row r is bit-identical alone or in any window. The conv / transform / norm
     // steps are per row (the conv history is sequential); the recurrence of all rows is ONE launch (state in registers).
     const bool window = v.rows > 1U && !gdn_dims_row_launch();
-    if (window) {
+    if (window && v.kernel == kGdnWindowKernel && gdn_dims_conv_ring())
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(conv_update_rows_ring_kernel<kGdnWindowKernel>), dim3((channels + kProjectionThreads - 1U) / kProjectionThreads),
+            dim3(kProjectionThreads), 0, stream, v.qkv, v.conv_state, v.conv, kind, channels, v.rows);
+    else if (window)
         hipLaunchKernelGGL(conv_update_rows_kernel, dim3((channels + kProjectionThreads - 1U) / kProjectionThreads),
             dim3(kProjectionThreads), 0, stream, v.qkv, v.conv_state, v.conv, kind, channels, v.kernel, v.rows);
+    if (window) {
         hipLaunchKernelGGL(transform_beta_gate_rows_kernel, dim3((v.value_heads + kProjectionThreads - 1U) / kProjectionThreads, v.rows),
             dim3(kProjectionThreads), 0, stream, v.beta, v.gate, v.dt, kind, v.a, kind, v.value_heads);
         hipLaunchKernelGGL(normalize_qk_rows_kernel, dim3(v.key_heads * 2U, v.rows), dim3(d), 0, stream,
