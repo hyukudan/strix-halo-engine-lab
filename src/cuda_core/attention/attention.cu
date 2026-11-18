@@ -9,6 +9,10 @@ namespace {
 
 constexpr std::uint32_t CH = kAttnChunk;  // 256 positions per chunk
 constexpr int D = 256;
+// Loads in flight per warp (scores: K rows of positions p, p+8, ...) and per thread (values: V elements, double-buffered).
+// Decode attention at short context is bound by DRAM latency, not bandwidth; these only change when loads are issued.
+constexpr int kScoreBatch = 8;
+constexpr int kValueBatch = 32;
 
 __global__ void kv_store_kernel(AttentionDims d, const float* k, const float* v, __nv_bfloat16* kc, __nv_bfloat16* vc,
                                 const std::uint32_t* pos0p, RowMap rm) {
@@ -67,19 +71,44 @@ __global__ void __launch_bounds__(256) attn_scores_kernel(AttentionDims d, const
     for (int g = 0; g < 8; ++g) mx[g] = __int_as_float(0xff800000);
     const std::uint32_t end = min(len, base + CH);
     const __nv_bfloat16* kb = kc + static_cast<std::size_t>(kvh) * d.max_positions * D + lane * 8;
-    for (std::uint32_t p = base + w; p < end; p += 8) {
-        const uint4 u = __ldg(reinterpret_cast<const uint4*>(kb + static_cast<std::size_t>(p) * D));
-        const float kf[8] = {bf16_lo(u.x), bf16_hi(u.x), bf16_lo(u.y), bf16_hi(u.y), bf16_lo(u.z), bf16_hi(u.z), bf16_lo(u.w), bf16_hi(u.w)};
+    // Loads of kScoreBatch positions (p, p+8, ...) are issued together and the next batch is issued before the current one
+    // is computed, so a warp waits for memory about once per batch instead of once per position. The batch is staged in
+    // shared memory (each lane reads back only its own slots) so the position loop stays rolled: code size as before.
+    // Per-position arithmetic and the ascending position order are unchanged (bitwise).
+    __shared__ uint4 kst[kScoreBatch][8][32];
+    uint4 u[kScoreBatch];
 #pragma unroll
-        for (int g = 0; g < 8; ++g) {
-            if (g < static_cast<int>(G)) {
-                float dot = 0.0f;
+    for (int b = 0; b < kScoreBatch; ++b) {
+        const std::uint32_t p = base + w + 8u * static_cast<std::uint32_t>(b);
+        u[b] = p < end ? __ldg(reinterpret_cast<const uint4*>(kb + static_cast<std::size_t>(p) * D)) : make_uint4(0, 0, 0, 0);
+    }
+    for (std::uint32_t p0 = base + w; p0 < end; p0 += 8u * kScoreBatch) {
 #pragma unroll
-                for (int j = 0; j < 8; ++j) dot = __fadd_rn(dot, __fmul_rn(qr[g][j], kf[j]));
-                dot = warp_sum_xor(dot);
-                const float s = __fmul_rn(dot, d.scale);
-                mx[g] = fmaxf(mx[g], s);
-                if (lane == 0) sc.scores[(static_cast<std::size_t>(r) * d.heads + kvh * G + g) * d.max_positions + p] = s;
+        for (int b = 0; b < kScoreBatch; ++b) kst[b][w][lane] = u[b];
+        const std::uint32_t p1 = p0 + 8u * kScoreBatch;
+#pragma unroll
+        for (int b = 0; b < kScoreBatch; ++b) {
+            const std::uint32_t p = p1 + 8u * static_cast<std::uint32_t>(b);
+            u[b] = p < end ? __ldg(reinterpret_cast<const uint4*>(kb + static_cast<std::size_t>(p) * D)) : make_uint4(0, 0, 0, 0);
+        }
+#pragma unroll 1
+        for (std::uint32_t b = 0; b < static_cast<std::uint32_t>(kScoreBatch); ++b) {
+            const std::uint32_t p = p0 + 8u * b;
+            if (p >= end) break;  // warp-uniform
+            const uint4 k4 = kst[b][w][lane];
+            const float kf[8] = {bf16_lo(k4.x), bf16_hi(k4.x), bf16_lo(k4.y), bf16_hi(k4.y),
+                                 bf16_lo(k4.z), bf16_hi(k4.z), bf16_lo(k4.w), bf16_hi(k4.w)};
+#pragma unroll
+            for (int g = 0; g < 8; ++g) {
+                if (g < static_cast<int>(G)) {
+                    float dot = 0.0f;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) dot = __fadd_rn(dot, __fmul_rn(qr[g][j], kf[j]));
+                    dot = warp_sum_xor(dot);
+                    const float s = __fmul_rn(dot, d.scale);
+                    mx[g] = fmaxf(mx[g], s);
+                    if (lane == 0) sc.scores[(static_cast<std::size_t>(r) * d.heads + kvh * G + g) * d.max_positions + p] = s;
+                }
             }
         }
     }
@@ -120,12 +149,22 @@ __global__ void __launch_bounds__(256) attn_values_kernel(AttentionDims d, const
     }
     __syncthreads();
     const std::uint32_t p = base + t;
-    for (std::uint32_t g = 0; g < G; ++g) {
+    // The G scores of this thread are loaded together (one memory wait, not one per head); the expf and the block tree of
+    // each head are unchanged and run in the same head order.
+    float sv[8];
+#pragma unroll
+    for (int g = 0; g < 8; ++g)
+        sv[g] = (g < static_cast<int>(G) && p < len)
+                    ? sc.scores[(static_cast<std::size_t>(r) * d.heads + kvh * G + static_cast<std::uint32_t>(g)) * d.max_positions + p]
+                    : 0.0f;
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+        if (g >= static_cast<int>(G)) break;  // block-uniform
         float e = 0.0f;
-        if (p < len) e = cc_expf(__fsub_rn(sc.scores[(static_cast<std::size_t>(r) * d.heads + kvh * G + g) * d.max_positions + p], mg[g]));
+        if (p < len) e = cc_expf(__fsub_rn(sv[g], mg[g]));
         es[g][t] = e;
         const float ds = block_sum256(e, red);
-        if (t == 0) sc.dpart[(static_cast<std::size_t>(r) * d.heads + kvh * G + g) * mc + chunk] = ds;
+        if (t == 0) sc.dpart[(static_cast<std::size_t>(r) * d.heads + kvh * G + static_cast<std::uint32_t>(g)) * mc + chunk] = ds;
     }
     __syncthreads();
     float acc[8];
@@ -133,12 +172,32 @@ __global__ void __launch_bounds__(256) attn_values_kernel(AttentionDims d, const
     for (int g = 0; g < 8; ++g) acc[g] = 0.0f;
     const std::uint32_t n = (len - base) < CH ? (len - base) : CH;
     const __nv_bfloat16* vp = vc + (static_cast<std::size_t>(kvh) * d.max_positions + base) * D + t;
-#pragma unroll 4
-    for (std::uint32_t i = 0; i < n; ++i) {
-        const float vv = __bfloat162float(vp[static_cast<std::size_t>(i) * D]);
+    // V in batches of kValueBatch positions: the next batch is issued before the current one is accumulated, so a thread
+    // waits for memory about once per batch. The batch is staged in shared memory (each thread reads back only its own
+    // column) so the accumulation loop stays rolled. Accumulation stays ascending in i, rounded mul then add (bitwise).
+    __shared__ __nv_bfloat16 vst[kValueBatch][CH];
+    const __nv_bfloat16 vzero = __ushort_as_bfloat16(static_cast<unsigned short>(0));
+    __nv_bfloat16 u[kValueBatch];
 #pragma unroll
-        for (int g = 0; g < 8; ++g)
-            if (g < static_cast<int>(G)) acc[g] = __fadd_rn(acc[g], __fmul_rn(es[g][i], vv));
+    for (int b = 0; b < kValueBatch; ++b) u[b] = static_cast<std::uint32_t>(b) < n ? vp[static_cast<std::size_t>(b) * D] : vzero;
+    for (std::uint32_t i0 = 0; i0 < n; i0 += kValueBatch) {
+#pragma unroll
+        for (int b = 0; b < kValueBatch; ++b) vst[b][t] = u[b];
+        const std::uint32_t i1 = i0 + kValueBatch;
+#pragma unroll
+        for (int b = 0; b < kValueBatch; ++b) {
+            const std::uint32_t i = i1 + static_cast<std::uint32_t>(b);
+            u[b] = i < n ? vp[static_cast<std::size_t>(i) * D] : vzero;
+        }
+        const std::uint32_t nb = min(n - i0, static_cast<std::uint32_t>(kValueBatch));
+#pragma unroll 4
+        for (std::uint32_t b = 0; b < nb; ++b) {
+            const float vv = __bfloat162float(vst[b][t]);
+            const std::uint32_t i = i0 + b;
+#pragma unroll
+            for (int g = 0; g < 8; ++g)
+                if (g < static_cast<int>(G)) acc[g] = __fadd_rn(acc[g], __fmul_rn(es[g][i], vv));
+        }
     }
 #pragma unroll
     for (int g = 0; g < 8; ++g)

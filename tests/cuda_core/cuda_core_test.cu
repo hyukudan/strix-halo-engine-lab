@@ -126,6 +126,69 @@ int test_dense() {
     return test_dense_arith(cc::DenseArith::mma1, 1280);
 }
 
+// norm_kernel loads gain / z together with x (one batch before any store) instead of inside the store loop. Invariant:
+// rms == host emulation of the documented order (thread t sums x[t + 256 i] ascending, xor butterfly 16..1, warps 0..7,
+// inv = 1 / sqrt(ss / n + eps), y = (x * inv) * gain) bit for bit; gated swish == rms * silu(z) bit for bit; gated in
+// place (y == z) == out of place. n 5120 (NREG 20, the verify rms) and n 128 x 48 groups (the GDN gated norm).
+static float f_mul(float a, float b) { volatile float r = a * b; return r; }
+static float f_add(float a, float b) { volatile float r = a + b; return r; }
+static float host_rms_inv(const float* x, std::uint32_t n, float eps) {
+    float v[256];
+    for (std::uint32_t t = 0; t < 256; ++t) {
+        float p = 0.0f;
+        for (std::uint32_t idx = t; idx < n; idx += 256) p = f_add(p, f_mul(x[idx], x[idx]));
+        v[t] = p;
+    }
+    for (std::uint32_t w = 0; w < 8; ++w)
+        for (std::uint32_t off = 16; off > 0; off >>= 1) {
+            float nv[32];
+            for (std::uint32_t l = 0; l < 32; ++l) nv[l] = f_add(v[w * 32 + l], v[w * 32 + (l ^ off)]);
+            for (std::uint32_t l = 0; l < 32; ++l) v[w * 32 + l] = nv[l];
+        }
+    float s = v[0];
+    for (std::uint32_t w = 1; w < 8; ++w) s = f_add(s, v[w * 32]);
+    volatile float q = s / static_cast<float>(n);
+    q = q + eps;
+    volatile float r = std::sqrt(static_cast<float>(q));
+    volatile float inv = 1.0f / r;
+    return inv;
+}
+__global__ void silu_mul_ref(float* y, const float* z, std::uint32_t count) {
+    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) y[i] = __fmul_rn(y[i], __fdiv_rn(z[i], __fadd_rn(1.0f, expf(-z[i]))));
+}
+int test_norm_batched_loads() {
+    for (std::uint32_t n : {5120u, 128u}) {
+        const std::uint32_t groups = n == 128 ? 48 : 1;
+        for (std::uint32_t rows : {1u, 8u, 16u}) {
+            const std::size_t cnt = static_cast<std::size_t>(rows) * groups * n;
+            std::vector<float> x(cnt), gain(n), z(cnt);
+            for (auto& e : x) e = rnd(2.0f);
+            for (auto& e : gain) e = rnd(1.0f);
+            for (auto& e : z) e = rnd(3.0f);
+            auto *dx = dev(x), *dg = dev(gain), *dz = dev(z), *dy = devz<float>(cnt), *dy2 = devz<float>(cnt);
+            const cc::GroupedView v{rows, groups, n, 0, 0};
+            CK(cc::rmsnorm(dx, v, dg, dy, v, 1e-6f, nullptr));
+            const auto y = get(dy, cnt);
+            std::vector<float> ref(cnt);
+            for (std::size_t b = 0; b < static_cast<std::size_t>(rows) * groups; ++b) {
+                const float inv = host_rms_inv(x.data() + b * n, n, 1e-6f);
+                for (std::uint32_t i = 0; i < n; ++i) ref[b * n + i] = f_mul(f_mul(x[b * n + i], inv), gain[i]);
+            }
+            CHECK(bits_equal(y, ref), "rmsnorm n %u rows %u != host order emulation", n, rows);
+            CK(cc::gated_rmsnorm(dx, v, dg, dz, v, cc::GateKind::swish, dy2, v, 1e-6f, nullptr));
+            silu_mul_ref<<<static_cast<unsigned>((cnt + 255) / 256), 256>>>(dy, dz, static_cast<std::uint32_t>(cnt));
+            CK(cudaGetLastError());
+            const auto gated = get(dy2, cnt);
+            CHECK(bits_equal(gated, get(dy, cnt)), "gated n %u rows %u != rms * silu(z)", n, rows);
+            CK(cc::gated_rmsnorm(dx, v, dg, dz, v, cc::GateKind::swish, dz, v, 1e-6f, nullptr));  // y aliases z
+            CHECK(bits_equal(get(dz, cnt), gated), "in-place gated n %u rows %u", n, rows);
+            for (float* p : {dx, dg, dz, dy, dy2}) cudaFree(p);
+        }
+    }
+    return 0;
+}
+
 int test_norms_rope() {
     const std::uint32_t rows = 5, groups = 3, n = 300;
     std::vector<float> x(rows * groups * n), gain(n), z(x.size());
@@ -215,6 +278,130 @@ int test_attention() {
     for (std::uint32_t r = 0; r < R; ++r)
         CK(cc::attention_decode(d, dq + r * 1536, cc::GroupedView{1, 6, 256, 0, 0}, dgt + r * 1536, cc::GroupedView{1, 6, 256, 0, 0}, kc, vc, dpos(pos0 + r), 1, dout1 + r * 1536, dsc, nullptr));
     CHECK(bits_equal(o, get(dout1, q.size())), "attention rows invariance");
+    return 0;
+}
+
+// Frozen copy of the decode attention phases A and C as they were before the load batching (one K load per position per
+// warp, V unroll 4), test-only: the library kernels must write bit-identical scratch (scores, chunk max, chunk denominators,
+// chunk value partials); the unchanged combine then gives identical outputs.
+namespace attn_v0 {
+using namespace strix::cuda_core;
+constexpr std::uint32_t CH = 256;
+__global__ void __launch_bounds__(256) scores(cc::AttentionDims d, const float* q, cc::GroupedView qv, const __nv_bfloat16* kc,
+                                              const std::uint32_t* pos0p, float* sscores, float* scmax) {
+    const std::uint32_t chunk = blockIdx.x, kvh = blockIdx.y, r = blockIdx.z;
+    const std::uint32_t len = *pos0p + r + 1, base = chunk * CH;
+    if (base >= len) return;
+    const std::uint32_t G = d.heads / d.kv_heads, lane = threadIdx.x & 31, w = threadIdx.x >> 5, mc = cc::attn_max_chunks(d);
+    float qr[8][8];
+    for (int g = 0; g < 8; ++g)
+        if (g < static_cast<int>(G))
+            for (int j = 0; j < 8; ++j) qr[g][j] = q[static_cast<std::size_t>(r) * qv.rs() + static_cast<std::size_t>(kvh * G + g) * qv.gs() + lane * 8 + j];
+    float mx[8];
+    for (int g = 0; g < 8; ++g) mx[g] = __int_as_float(0xff800000);
+    const std::uint32_t end = min(len, base + CH);
+    const __nv_bfloat16* kb = kc + static_cast<std::size_t>(kvh) * d.max_positions * 256 + lane * 8;
+    for (std::uint32_t p = base + w; p < end; p += 8) {
+        const uint4 u = __ldg(reinterpret_cast<const uint4*>(kb + static_cast<std::size_t>(p) * 256));
+        const float kf[8] = {bf16_lo(u.x), bf16_hi(u.x), bf16_lo(u.y), bf16_hi(u.y), bf16_lo(u.z), bf16_hi(u.z), bf16_lo(u.w), bf16_hi(u.w)};
+        for (int g = 0; g < 8; ++g) {
+            if (g < static_cast<int>(G)) {
+                float dot = 0.0f;
+                for (int j = 0; j < 8; ++j) dot = __fadd_rn(dot, __fmul_rn(qr[g][j], kf[j]));
+                dot = warp_sum_xor(dot);
+                const float s = __fmul_rn(dot, d.scale);
+                mx[g] = fmaxf(mx[g], s);
+                if (lane == 0) sscores[(static_cast<std::size_t>(r) * d.heads + kvh * G + g) * d.max_positions + p] = s;
+            }
+        }
+    }
+    __shared__ float wm[8][8];
+    for (int g = 0; g < 8; ++g) wm[w][g] = mx[g];
+    __syncthreads();
+    if (threadIdx.x < G) {
+        float m = wm[0][threadIdx.x];
+        for (int i = 1; i < 8; ++i) m = fmaxf(m, wm[i][threadIdx.x]);
+        scmax[(static_cast<std::size_t>(r) * d.heads + kvh * G + threadIdx.x) * mc + chunk] = m;
+    }
+}
+__global__ void __launch_bounds__(256) values(cc::AttentionDims d, const __nv_bfloat16* vc, const std::uint32_t* pos0p,
+                                              const float* sscores, const float* scmax, float* sdpart, float* spart) {
+    const std::uint32_t chunk = blockIdx.x, kvh = blockIdx.y, r = blockIdx.z;
+    const std::uint32_t len = *pos0p + r + 1, base = chunk * CH;
+    if (base >= len) return;
+    const std::uint32_t G = d.heads / d.kv_heads, t = threadIdx.x, lane = t & 31, w = t >> 5;
+    const std::uint32_t mc = cc::attn_max_chunks(d), nch = (len + CH - 1) / CH;
+    __shared__ float mg[8];
+    __shared__ float es[8][CH];
+    __shared__ float red[8];
+    if (w < G) {
+        const float* cm = scmax + (static_cast<std::size_t>(r) * d.heads + kvh * G + w) * mc;
+        float m = __int_as_float(0xff800000);
+        for (std::uint32_t c = lane; c < nch; c += 32) m = fmaxf(m, cm[c]);
+        for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+        if (lane == 0) mg[w] = m;
+    }
+    __syncthreads();
+    const std::uint32_t p = base + t;
+    for (std::uint32_t g = 0; g < G; ++g) {
+        float e = 0.0f;
+        if (p < len) e = cc_expf(__fsub_rn(sscores[(static_cast<std::size_t>(r) * d.heads + kvh * G + g) * d.max_positions + p], mg[g]));
+        es[g][t] = e;
+        const float ds = block_sum256(e, red);
+        if (t == 0) sdpart[(static_cast<std::size_t>(r) * d.heads + kvh * G + g) * mc + chunk] = ds;
+    }
+    __syncthreads();
+    float acc[8];
+    for (int g = 0; g < 8; ++g) acc[g] = 0.0f;
+    const std::uint32_t n = (len - base) < CH ? (len - base) : CH;
+    const __nv_bfloat16* vp = vc + (static_cast<std::size_t>(kvh) * d.max_positions + base) * 256 + t;
+#pragma unroll 4
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const float vv = __bfloat162float(vp[static_cast<std::size_t>(i) * 256]);
+        for (int g = 0; g < 8; ++g)
+            if (g < static_cast<int>(G)) acc[g] = __fadd_rn(acc[g], __fmul_rn(es[g][i], vv));
+    }
+    for (int g = 0; g < 8; ++g)
+        if (g < static_cast<int>(G)) spart[((static_cast<std::size_t>(r) * d.heads + kvh * G + g) * mc + chunk) * 256 + t] = acc[g];
+}
+}  // namespace attn_v0
+
+// Multi-chunk decode attention (4 chunks, G = 6 as the 27B dense model): positions crossing the load batches and the
+// 256-position chunks, rows 1 / 8 / 16. The library scratch must equal the frozen v0 schedule bit for bit.
+int test_attention_schedule() {
+    cc::AttentionDims d; d.heads = 24; d.kv_heads = 4; d.head_dim = 256; d.scale = 1.0f / 16.0f; d.max_positions = 1024;
+    const std::uint32_t P = d.max_positions, KV = d.kv_heads * 256u, RMAX = 16, mc = cc::attn_max_chunks(d);
+    std::vector<float> kf(static_cast<std::size_t>(P) * KV), vf(kf.size());
+    for (auto& e : kf) e = rnd(1.0f);
+    for (auto& e : vf) e = rnd(1.0f);
+    auto *dk = dev(kf), *dv = dev(vf);
+    auto *kc = devz<__nv_bfloat16>(static_cast<std::size_t>(P) * KV), *vc = devz<__nv_bfloat16>(static_cast<std::size_t>(P) * KV);
+    for (std::uint32_t p = 0; p < P; p += 16) CK(cc::kv_store(d, dk + static_cast<std::size_t>(p) * KV, dv + static_cast<std::size_t>(p) * KV, kc, vc, dpos(p), 16, nullptr));
+    std::vector<float> q(static_cast<std::size_t>(RMAX) * d.heads * 256), gt(q.size());
+    for (auto& e : q) e = rnd(2.0f);
+    for (auto& e : gt) e = rnd(2.0f);
+    const std::size_t nsc = cc::attention_scratch_floats(d, RMAX);
+    auto *dq = dev(q), *dgt = dev(gt), *dout = devz<float>(q.size()), *sa = devz<float>(nsc), *sb = devz<float>(nsc);
+    const struct { std::uint32_t pos0, rows; } cases[] = {{0, 1},   {6, 1},   {7, 8},   {56, 9},   {63, 1},    {248, 16}, {255, 1},
+                                                           {256, 8}, {300, 1}, {500, 16}, {511, 8},   {700, 16}, {1000, 8}, {1023, 1}};
+    for (const auto& cs : cases) {
+        const std::uint32_t R = cs.rows;
+        const cc::GroupedView qv{R, d.heads, 256, 0, 0};
+        auto* p0 = dpos(cs.pos0);
+        CK(cudaMemset(sa, 0, nsc * 4));
+        CK(cudaMemset(sb, 0, nsc * 4));
+        CK(cc::attention_decode(d, dq, qv, dgt, qv, kc, vc, p0, R, dout, sa, nullptr));
+        // same carve as the library: scores [R][heads][P] | cmax [R][heads][mc] | dpart [R][heads][mc] | part [R][heads][mc][256]
+        const std::size_t rh = static_cast<std::size_t>(R) * d.heads;
+        float *bs = sb, *bm = bs + rh * P, *bd = bm + rh * mc, *bp = bd + rh * mc;
+        attn_v0::scores<<<dim3(mc, d.kv_heads, R), 256>>>(d, dq, qv, kc, p0, bs, bm);
+        attn_v0::values<<<dim3(mc, d.kv_heads, R), 256>>>(d, vc, p0, bs, bm, bd, bp);
+        CK(cudaDeviceSynchronize());
+        const std::size_t used = rh * P + 2 * rh * mc + rh * mc * 256;
+        CHECK(bits_equal(get(sa, used), get(sb, used)), "attention schedule pos0 %u rows %u: scratch differs from v0", cs.pos0, R);
+        cudaFree(p0);
+    }
+    cudaFree(dk); cudaFree(dv); cudaFree(kc); cudaFree(vc); cudaFree(dq); cudaFree(dgt); cudaFree(dout); cudaFree(sa); cudaFree(sb);
     return 0;
 }
 
@@ -328,6 +515,94 @@ __global__ void nvfp4_test_epilogue(const float* gate, const float* up, float* y
     if (i < out) y[i] = __fmul_rn(cc::cc_silu(gate[i]), up[i]);
 }
 
+// GDN conv rows across the row-batch boundary (R = 20 > 16 rows per batch): windows of 20 / 1 / 7 rows and the prefill entry
+// give bitwise the same conv output and delta output. Uses only the public API, so the same file builds against the previous
+// serial conv loop: the digest line must be equal between that binary and this one (schedule-only change).
+int test_conv_row_batch() {
+    cc::GdnDims d; d.key_heads = 2; d.value_heads = 6; d.key_dim = 128; d.value_dim = 128;
+    const std::uint32_t C = d.conv_channels(), R = 20, hv = d.value_heads, K = 128;
+    std::vector<float> convw(C * 4), a(hv), dt(hv), ng(128), qkv(R * C), z(R * hv * 128), ar(R * hv), br(R * hv);
+    for (auto& e : convw) e = rnd(0.5f);
+    for (auto& e : a) e = -std::exp(rnd(1.0f));
+    for (auto& e : dt) e = rnd(1.0f);
+    for (auto& e : ng) e = 0.5f + rnd(0.3f);
+    for (auto& e : qkv) e = rnd(1.0f);
+    for (auto& e : z) e = rnd(1.0f);
+    for (auto& e : ar) e = rnd(1.0f);
+    for (auto& e : br) e = rnd(1.0f);
+    std::vector<float> s0(static_cast<std::size_t>(hv) * K * K), cs0(C * 3);
+    for (auto& e : s0) e = rnd(0.2f);
+    for (auto& e : cs0) e = rnd(0.5f);
+    auto *dcw = dev(convw), *da = dev(a), *ddt = dev(dt), *dng = dev(ng), *dz = dev(z), *dar = dev(ar), *dbr = dev(br);
+    cc::GdnLayer L{dcw, da, ddt, dng};
+    // chunk == 0: prefill entry over all R rows. Returns 0, or 2 on a CUDA error (CK).
+    auto run = [&](std::uint32_t chunk, std::vector<float>& qcv, std::vector<float>& outv) -> int {
+        std::vector<float> two(2 * s0.size(), 0.0f);
+        std::copy(s0.begin(), s0.end(), two.begin());
+        auto *draw = dev(qkv), *dqc = devz<float>(R * C), *dout = devz<float>(R * hv * 128), *dst = dev(two), *dcs = dev(cs0);
+        auto* dpar = devz<std::uint32_t>(1);
+        if (chunk == 0) {
+            cc::GdnWindow w{draw, dqc, dar, dbr};
+            CK(cc::gdn_prefill_layer(d, L, {dcs, dst}, w, dz, dout, R, 1e-6f, dpar, nullptr));
+        } else {
+            for (std::uint32_t r = 0; r < R; r += chunk) {
+                const std::uint32_t n = std::min(chunk, R - r);
+                cc::GdnWindow w{draw + r * C, dqc + r * C, dar + r * hv, dbr + r * hv};
+                CK(cc::gdn_window(d, L, {dcs, dst}, w, dz + r * hv * 128, dout + r * hv * 128, n, 1e-6f, dpar, nullptr));
+                cc::GdnCommitLayer cl{L, {dcs, dst}, w};
+                CK(cc::gdn_commit(d, &cl, 1, n, n, dpar, nullptr));
+            }
+        }
+        CK(cudaDeviceSynchronize());
+        qcv = get(dqc, R * C);
+        outv = get(dout, R * hv * 128);
+        cudaFree(draw); cudaFree(dqc); cudaFree(dout); cudaFree(dst); cudaFree(dcs); cudaFree(dpar);
+        return 0;
+    };
+    std::vector<float> q20, o20, q1, o1, q7, o7, qp, op;
+    if (run(20, q20, o20) | run(1, q1, o1) | run(7, q7, o7) | run(0, qp, op)) return 2;
+    CHECK(bits_equal(q20, q1) && bits_equal(o20, o1), "conv rows=20 vs rows=1 not bitwise");
+    CHECK(bits_equal(q20, q7) && bits_equal(o20, o7), "conv rows=20 vs rows=7 not bitwise");
+    CHECK(bits_equal(q20, qp) && bits_equal(o20, op), "conv prefill vs windows not bitwise");
+    auto fnv = [](const std::vector<float>& v) {
+        std::uint64_t h = 1469598103934665603ull;
+        for (float f : v) { std::uint32_t u; std::memcpy(&u, &f, 4); for (int i = 0; i < 4; ++i) { h ^= (u >> (8 * i)) & 0xffu; h *= 1099511628211ull; } }
+        return static_cast<unsigned long long>(h);
+    };
+    std::printf("conv digest qc %016llx out %016llx\n", fnv(q20), fnv(o20));
+    cudaFree(dcw); cudaFree(da); cudaFree(ddt); cudaFree(dng); cudaFree(dz); cudaFree(dar); cudaFree(dbr);
+    {  // kernel probe at the Qwen 27B dense GDN shape (16 key / 48 value heads): 40 windows of 8 rows, then 40 of 16 rows, no
+       // commit (state unchanged), for an nsys kernel trace of conv_pre_kernel; nothing is checked here.
+        cc::GdnDims P; P.key_heads = 16; P.value_heads = 48; P.key_dim = 128; P.value_dim = 128;
+        const std::uint32_t PC = P.conv_channels(), PR = 16, ph = P.value_heads;
+        std::vector<float> pw(PC * 4), pa(ph), pdt(ph), png(128), praw(PR * PC), pz(PR * ph * 128), par_(PR * ph), pbr(PR * ph);
+        std::vector<float> pst(2 * static_cast<std::size_t>(ph) * K * K), pcs(PC * 3);
+        for (auto* v : {&pw, &pdt, &praw, &pz, &par_, &pbr, &pst, &pcs}) for (auto& e : *v) e = rnd(0.5f);
+        for (auto& e : pa) e = -std::exp(rnd(1.0f));
+        for (auto& e : png) e = 0.5f + rnd(0.3f);
+        auto *dw = dev(pw), *dpa = dev(pa), *dpdt = dev(pdt), *dpng = dev(png), *dpraw = dev(praw), *dpz = dev(pz);
+        auto *dpar_ = dev(par_), *dpbr = dev(pbr), *dpst = dev(pst), *dpcs = dev(pcs);
+        auto *dpqc = devz<float>(PR * PC), *dpout = devz<float>(PR * ph * 128);
+        auto* dpp = devz<std::uint32_t>(1);
+        cc::GdnLayer PL{dw, dpa, dpdt, dpng};
+        cc::GdnWindow pwin{dpraw, dpqc, dpar_, dpbr};
+        // synchronised per window: no early-launched predecessor, so a conv_pre_kernel duration is its own execution
+        // (under PDL a block waiting in griddepcontrol.wait would be counted as kernel time)
+        for (std::uint32_t rows : {8u, 16u})
+            for (int it = 0; it < 40; ++it) {
+                CK(cc::gdn_window(P, PL, {dpcs, dpst}, pwin, dpz, dpout, rows, 1e-6f, dpp, nullptr));
+                CK(cudaDeviceSynchronize());
+            }
+        for (void* p : {static_cast<void*>(dw), static_cast<void*>(dpa), static_cast<void*>(dpdt), static_cast<void*>(dpng),
+                        static_cast<void*>(dpraw), static_cast<void*>(dpz), static_cast<void*>(dpar_), static_cast<void*>(dpbr),
+                        static_cast<void*>(dpst), static_cast<void*>(dpcs), static_cast<void*>(dpqc), static_cast<void*>(dpout),
+                        static_cast<void*>(dpp)})
+            cudaFree(p);
+        std::printf("conv probe: 40 windows x rows 8, 16 at 16/48 heads done\n");
+    }
+    return 0;
+}
+
 static int test_nvfp4_fused() {
     constexpr std::uint32_t in = 256;
     cc::nvfp4_set_split_target(0);
@@ -366,7 +641,7 @@ static int test_nvfp4_fused() {
 
 int main() {
     if (cudaSetDevice(0) != cudaSuccess) return 2;
-    int rc = test_dense() | test_norms_rope() | test_attention() | test_gdn() | test_nvfp4_fused();
+    int rc = test_dense() | test_norms_rope() | test_norm_batched_loads() | test_attention() | test_attention_schedule() | test_gdn() | test_conv_row_batch() | test_nvfp4_fused();
     // repeat determinism is covered by the identical-bits checks (each compares two separate launches)
     std::printf(g_fail || rc ? "cuda_core_test: FAILED (%d checks)\n" : "cuda_core_test: PASS\n", g_fail);
     return (g_fail || rc) ? 1 : 0;

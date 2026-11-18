@@ -41,6 +41,12 @@ STRIX_NVFP4_TILE_HD std::size_t w_tile_bytes(std::uint32_t out, std::uint32_t in
     return static_cast<std::size_t>(out / 16) * (in / kK) * kWRec;
 }
 STRIX_NVFP4_TILE_HD std::uint32_t rows_padded(std::uint32_t rows) { return (rows + kCtaRows - 1) / kCtaRows * kCtaRows; }
+// The RMSNorm-fused quantiser (norm_quantize_enqueue) keeps a row in 256 threads x <= 32 registers and in * 4 bytes of shared memory
+// (<= 32 KiB, under the 48 KiB static launch limit): rows of width kK * j up to 8192. Wider rows use rmsnorm + quantize_enqueue.
+inline constexpr std::uint32_t kNormQuantMaxIn = 8192;
+inline constexpr std::uint32_t kGatedNormHead = 128;  // head width of the gated (GDN) normaliser = cuda_core kGatedHead
+static_assert(kK % kGatedNormHead == 0, "norm_quantize_fits(in) implies whole gated-norm heads");
+STRIX_NVFP4_TILE_HD bool norm_quantize_fits(std::uint32_t in) { return in != 0 && in % kK == 0 && in <= kNormQuantMaxIn; }
 STRIX_NVFP4_TILE_HD std::size_t x_tile_bytes(std::uint32_t rows_pad, std::uint32_t in) {
     return static_cast<std::size_t>(rows_pad / 8) * (in / kK) * kXRec;
 }
@@ -115,6 +121,40 @@ STRIX_NVFP4_TILE_HD std::uint32_t out_row(std::uint32_t tile_m, std::uint32_t wm
 STRIX_NVFP4_TILE_HD std::uint32_t glu_channel(std::uint32_t tile_m, std::uint32_t wm, std::uint32_t p, std::uint32_t g, std::uint32_t z) {
     return glu_slot_tile(tile_m, wm * 4 + 2 * p) * 16 + g + 8 * (z >> 1);
 }
+
+// ---- producer of one 128-K stage: kStageWRecs weight records then kStageXRecs activation records, copied verbatim in 16-byte
+// chunks c = 0 .. kStageChunks - 1. Chunk c of stage ks reads operand `which` (0 = w, 1 = w2 (GLU up), 2 = x) at byte
+// base + ks * step (zero-filled when !ok) and lands at stage offset dst. Nothing but ks depends on the stage, so the kernel resolves
+// a chunk once per thread and pays one multiply-add per stage.
+inline constexpr std::uint32_t kStageWRecs = 8, kStageXRecs = 32;
+inline constexpr std::uint32_t kStageChunksW = kStageWRecs * kWRec / 16, kStageChunks = kStageChunksW + kStageXRecs * kXRec / 16;
+struct StageChunk {
+    std::size_t base;
+    std::uint32_t dst, step, which;
+    bool ok;
+};
+STRIX_NVFP4_TILE_HD StageChunk stage_chunk(std::uint32_t c, std::uint32_t tile_m, std::uint32_t tile_n, bool glu, std::uint32_t ks_count,
+                                           std::uint32_t w_tiles, std::uint32_t x_tiles) {
+    StageChunk r{};
+    if (c < kStageChunksW) {
+        const std::uint32_t s = c / (kWRec / 16), off = (c % (kWRec / 16)) * 16;
+        const std::uint32_t t = glu ? glu_slot_tile(tile_m, s) : a_slot_tile(tile_m, s);
+        r.ok = t < w_tiles;
+        r.which = glu && (s & 1) ? 1U : 0U;
+        r.base = static_cast<std::size_t>(r.ok ? t : 0) * ks_count * kWRec + off;
+        r.dst = s * kWRec + off;
+        r.step = kWRec;
+    } else {
+        const std::uint32_t c2 = c - kStageChunksW, j = c2 / (kXRec / 16), off = (c2 % (kXRec / 16)) * 16;
+        const std::uint32_t t = tile_n * kStageXRecs + j;
+        r.ok = t < x_tiles;
+        r.which = 2;
+        r.base = static_cast<std::size_t>(r.ok ? t : 0) * ks_count * kXRec + off;
+        r.dst = kStageWRecs * kWRec + j * kXRec + off;
+        r.step = kXRec;
+    }
+    return r;
+}
 STRIX_NVFP4_TILE_HD std::uint32_t act_row(std::uint32_t tile_n, std::uint32_t wn, std::uint32_t nt, std::uint32_t t, std::uint32_t z) {
     return (tile_n * 32 + wn * 8 + nt) * 8 + 2 * t + (z & 1);
 }
@@ -136,12 +176,21 @@ struct GemmArgs {
     std::uint32_t out = 0, in = 0, rows = 0, rows_pad = 0;
     Epi epi = Epi::store;
 };
-// host validation of the shape contract (no device work)
+STRIX_NVFP4_TILE_HD bool bytes_disjoint(const void* p, std::size_t pb, const void* q, std::size_t qb) {
+    const std::uintptr_t a = reinterpret_cast<std::uintptr_t>(p), b = reinterpret_cast<std::uintptr_t>(q);
+    return a + pb <= b || b + qb <= a;
+}
+// host validation of the shape contract (no device work). Aliasing contract of the epilogue (it issues all of a thread's rs / aux
+// loads before that thread's y stores): each y element is read only by the thread that writes it, so aux is y itself (in place)
+// or disjoint from y, and rs never overlaps y.
 STRIX_NVFP4_TILE_HD bool valid(const GemmArgs& a) {
     if (!a.w || !a.x || !a.rs || !a.y || a.out == 0 || a.out % 16 || a.in == 0 || a.in % kK || a.rows == 0) return false;
     if (a.rows_pad != rows_padded(a.rows)) return false;
     if ((a.epi == Epi::residual || a.epi == Epi::silu_mul) && !a.aux) return false;
     if (a.epi == Epi::glu && !a.w2) return false;
+    const std::size_t ybytes = static_cast<std::size_t>(a.rows) * a.out * sizeof(float);
+    if (!bytes_disjoint(a.rs, static_cast<std::size_t>(a.rows_pad) * sizeof(float), a.y, ybytes)) return false;
+    if (a.aux && a.aux != a.y && !bytes_disjoint(a.aux, ybytes, a.y, ybytes)) return false;
     return true;
 }
 }  // namespace strix::cuda::core::nvfp4::tile

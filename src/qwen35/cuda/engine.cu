@@ -288,11 +288,25 @@ __global__ void set_inputs_kernel(InputPack in, std::uint32_t* pos, std::uint32_
     if (threadIdx.x < cc::kMaxRows) ids[threadIdx.x] = in.ids[threadIdx.x];
 }
 __global__ void zero_u32_kernel(std::uint32_t* p) { *p = 0; }
-// Draft subset head: compact row -> token id (slot group_of[row / group], row % group), in place on the argmax output.
-__global__ void draft_map_kernel(std::uint32_t* top, const std::uint32_t* group_of, std::uint32_t rows, std::uint32_t group) {
+// Draft head output. Subset head (group_of set): compact row -> token id (slot group_of[row / group], row % group), in place
+// on the argmax output. Device-fed MTP chain (feed_out set): the last row's token id is also stored in the chain's feed slot.
+__global__ void draft_map_kernel(std::uint32_t* top, const std::uint32_t* group_of, std::uint32_t rows, std::uint32_t group,
+                                 std::uint32_t* feed_out) {
     if (threadIdx.x < rows) {
-        const std::uint32_t t = top[threadIdx.x];
-        top[threadIdx.x] = group_of[t / group] * group + t % group;
+        std::uint32_t t = top[threadIdx.x];
+        if (group_of) {
+            t = group_of[t / group] * group + t % group;
+            top[threadIdx.x] = t;
+        }
+        if (feed_out && threadIdx.x + 1 == rows) *feed_out = t;
+    }
+}
+// Device-fed MTP chain step: the input id is the previous step's draft, read from the feed on the device (no host round trip).
+__global__ void fed_inputs_kernel(const std::uint32_t* feed, std::uint32_t slot, std::uint32_t pos0, std::uint32_t* pos,
+                                  std::uint32_t* ids) {
+    if (threadIdx.x == 0) {
+        *pos = pos0;
+        ids[0] = feed[slot];
     }
 }
 
@@ -345,6 +359,7 @@ struct CudaEngine::Impl {
     std::uint32_t *d_ids = nullptr, *d_pos = nullptr, *d_top = nullptr, *d_parity = nullptr;
     void* d_argws = nullptr;
     std::uint32_t *d_mids = nullptr, *d_mpos = nullptr, *d_mtop = nullptr;
+    std::uint32_t* d_feed = nullptr;  // device-fed MTP chain: drafted ids, CudaEngine::kMtpFeedSlots entries
     // Draft-only subset head (set_draft_rows): compact NVFP4 tiles of `head` + slot -> source tile table.
     strix::spec::DraftRows* drows = nullptr;
     unsigned char* dhead = nullptr;
@@ -366,6 +381,9 @@ struct CudaEngine::Impl {
     };
     std::unordered_map<std::uint32_t, Graph> graphs;
     std::uint64_t last_nodes = 0;
+    // One-row MTP body graphs keyed by the hidden input pointer (the chain's carry buffer); pointers seen once ran eagerly.
+    std::vector<std::pair<const float*, Graph>> mtp_graphs;
+    std::vector<const float*> mtp_eager;
 
     template <class T>
     T* alloc(std::size_t n, bool zero = false) {
@@ -466,6 +484,7 @@ struct CudaEngine::Impl {
             d_mids = alloc<std::uint32_t>(RM);
             d_mpos = alloc<std::uint32_t>(1);
             d_mtop = alloc<std::uint32_t>(RM);
+            d_feed = alloc<std::uint32_t>(CudaEngine::kMtpFeedSlots, true);
             const std::size_t n = static_cast<std::size_t>(c.kv_heads) * opt.max_positions * c.head_dim;
             mkc = alloc<__nv_bfloat16>(n, true);
             mvc = alloc<__nv_bfloat16>(n, true);
@@ -671,6 +690,7 @@ struct CudaEngine::Impl {
         (void)cudaSetDevice(device);
         if (s) (void)cudaStreamSynchronize(s);
         graphs.clear();
+        mtp_graphs.clear();
         ss.graphs.clear();
         if (s) cc::nvfp4_release_workspace(s);
         pf.sl.clear();  // drain slot streams before freeing shared model/state buffers
@@ -930,6 +950,13 @@ struct CudaEngine::Impl {
         std::uint32_t act_in = 0, act_rows = 0;
         cc::BigAct act[2];
         bool have[2] = {false, false};
+        // FAST4 norm fold: xn = rmsnorm(x, norm_gain) is PENDING (never written) while norm_gain != nullptr; pf_act quantises it
+        // straight from x or materialises the f32 rows. A GEMM writing x drops a pending xn (xn_dead: reading it would be an error).
+        const float* norm_gain = nullptr;
+        bool xn_dead = false;
+        // The same for the chunked GDN output: gout holds the raw delta-rule rows and its gated RMSNorm (gain gout_gain, gate z) is
+        // PENDING while gout_gain != nullptr (gdn_prefill_layer ran with defer_norm); pf_act folds it into the ssm_out quantiser.
+        const float* gout_gain = nullptr;
     };
     struct CacheDel {
         void operator()(cc::BigOperandCache* p) const { cc::dense_big_cache_destroy(p); }
@@ -1083,6 +1110,24 @@ struct CudaEngine::Impl {
             sl.act_rows = rows;
         }
         const int cls = w.format == cc::WeightFormat::nvfp4 ? 1 : 0;
+        if (x == sl.xn && sl.xn_dead) throw std::logic_error("prefill: normalised rows read after their residual source was overwritten");
+        if (x == sl.gout && sl.gout_gain != nullptr && !sl.have[cls]) {
+            if (cls == 1 && opt.prefill_arith == PrefillArith::fast4 && w.in == gd.v_width()) {
+                CK(cc::dense_big_gated_norm_split4(sl.gout, sl.z, sl.gout_gain, c.rms_eps, rows, w.in, &sl.act[1], sl.st, sl.bc));
+                sl.have[1] = true;
+            } else {  // any other consumer: apply the norm in place first (the unfolded chunked path)
+                CK(cc::gdn_chunk_norm(gd, sl.gout_gain, sl.z, sl.gout, rows, c.rms_eps, sl.st));
+                sl.gout_gain = nullptr;
+            }
+        }
+        if (x == sl.xn && sl.norm_gain != nullptr && !sl.have[cls]) {
+            if (cls == 1 && opt.prefill_arith == PrefillArith::fast4 && w.in == c.hidden) {
+                CK(cc::dense_big_norm_split4(sl.x, sl.norm_gain, c.rms_eps, rows, w.in, &sl.act[1], sl.st, sl.bc));
+                sl.have[1] = true;
+            } else {
+                pf_norm_materialise(sl, rows);
+            }
+        }
         if (!sl.have[cls] && cls == 1 && opt.prefill_arith == PrefillArith::fast4) {
             CK(cc::dense_big_split4(x, rows, w.in, &sl.act[cls], sl.st, sl.bc));
             sl.have[cls] = true;
@@ -1097,15 +1142,37 @@ struct CudaEngine::Impl {
         sl.have[0] = sl.have[1] = false;
     }
 
+    // xn = rmsnorm(x, gain) ahead of its GEMM consumers. FAST4 + prefill_norm_fold: left pending, so each consumer's A operand is
+    // quantised straight from x (cuda_core dense_big_norm_split4, bitwise equal to rmsnorm + dense_big_split4) and the f32 rows are
+    // neither written nor re-read; any other consumer gets them materialised first (pf_act).
+    void pf_norm(Slot& sl, const float* gain, std::uint32_t rows) {
+        pf_dirty(sl);
+        sl.xn_dead = false;
+        if (opt.prefill_norm_fold && opt.prefill_arith == PrefillArith::fast4 && cc::dense_big_norm_split4_fits(c.hidden)) {
+            sl.norm_gain = gain;
+            return;
+        }
+        sl.norm_gain = nullptr;
+        const cc::GroupedView hv{rows, 1, c.hidden, c.hidden, c.hidden};
+        CK(cc::rmsnorm(sl.x, hv, gain, sl.xn, hv, c.rms_eps, sl.st));
+    }
+    void pf_norm_materialise(Slot& sl, std::uint32_t rows) {
+        const cc::GroupedView hv{rows, 1, c.hidden, c.hidden, c.hidden};
+        CK(cc::rmsnorm(sl.x, hv, sl.norm_gain, sl.xn, hv, c.rms_eps, sl.st));
+        sl.norm_gain = nullptr;
+    }
+
     void pf_gemm(Slot& sl, const cc::DenseWeight& w, const float* x, std::uint32_t rows, float* y, const float* aux, cc::BigEpi epi) {
         const cc::BigAct& a = pf_act(sl, x, rows, w);
+        if (y == sl.x && sl.norm_gain != nullptr) {  // x is overwritten: a still pending xn can no longer be produced
+            sl.norm_gain = nullptr;
+            sl.xn_dead = true;
+        }
         CK(cc::dense_big_gemm(w, a, y, aux, epi, sl.st, sl.bc));
     }
 
     void pf_mlp(Slot& sl, const LayerW& w, std::uint32_t rows) {
-        const cc::GroupedView hv{rows, 1, c.hidden, c.hidden, c.hidden};
-        CK(cc::rmsnorm(sl.x, hv, w.post_norm, sl.xn, hv, c.rms_eps, sl.st));
-        pf_dirty(sl);
+        pf_norm(sl, w.post_norm, rows);
         if (opt.prefill_arith == PrefillArith::fast4 && w.ffn_gate.format == cc::WeightFormat::nvfp4 && w.ffn_up.format == cc::WeightFormat::nvfp4) {
             // FAST4: gate and up in ONE GEMM, SwiGLU in registers (no f32 gate round trip through hid)
             CK(cc::dense_big_glu4(w.ffn_gate, w.ffn_up, pf_act(sl, sl.xn, rows, w.ffn_gate), sl.hid, sl.st, sl.bc));
@@ -1157,8 +1224,6 @@ struct CudaEngine::Impl {
     // layer l (null for the first chunk); mine[l] is recorded after this chunk's layer l.
     void pf_chunk(Slot& sl, const std::uint32_t* tokens, std::uint32_t rows, std::uint32_t pos0, std::uint32_t read_side,
                   const cudaEvent_t* prev, cudaEvent_t* mine) {
-        const std::uint32_t H = c.hidden;
-        const cc::GroupedView hv{rows, 1, H, H, H};
         CK(cudaMemcpyAsync(sl.ids, tokens, static_cast<std::size_t>(rows) * 4, cudaMemcpyHostToDevice, sl.st));
         CK(cudaMemcpyAsync(sl.pos, &pos0, 4, cudaMemcpyHostToDevice, sl.st));
         CK(cudaMemcpyAsync(sl.cpar, &read_side, 4, cudaMemcpyHostToDevice, sl.st));
@@ -1168,16 +1233,20 @@ struct CudaEngine::Impl {
         for (std::uint32_t l = 0; l < c.layers; ++l) {
             const LayerW& w = L[l];
             if (prev != nullptr) CK(cudaStreamWaitEvent(sl.st, prev[l], 0));
-            CK(cc::rmsnorm(sl.x, hv, w.attn_norm, sl.xn, hv, c.rms_eps, sl.st));
-            pf_dirty(sl);
+            pf_norm(sl, w.attn_norm, rows);
             if (!w.attn) {
                 pf_gemm(sl, w.qkv, sl.xn, rows, sl.raw, nullptr, cc::BigEpi::none);
                 pf_gemm(sl, w.gate, sl.xn, rows, sl.z, nullptr, cc::BigEpi::none);
                 pf_gemm(sl, w.beta, sl.xn, rows, sl.br, nullptr, cc::BigEpi::none);
                 pf_gemm(sl, w.alpha, sl.xn, rows, sl.ar, nullptr, cc::BigEpi::none);
                 const auto& cl = commit_layers[gi++];
+                // FAST4 norm fold on the chunked path: the gated RMSNorm is left pending and folded into the ssm_out A operand (bitwise)
+                cc::GdnChunkWork gw = sl.gdn_ws;
+                gw.defer_norm = opt.prefill_norm_fold && opt.prefill_arith == PrefillArith::fast4 && gw.ws != nullptr &&
+                                w.out.format == cc::WeightFormat::nvfp4 && cc::dense_big_norm_split4_fits(gd.v_width());
                 CK(cc::gdn_prefill_layer(gd, cl.layer, cl.state, cc::GdnWindow{sl.raw, sl.qkvc, sl.ar, sl.br}, sl.z, sl.gout, rows, c.rms_eps,
-                                         sl.cpar, sl.gdn_ws, sl.st));
+                                         sl.cpar, gw, sl.st));
+                sl.gout_gain = gw.defer_norm ? cl.layer.norm_gain : nullptr;
                 pf_gemm(sl, w.out, sl.gout, rows, sl.x, sl.x, cc::BigEpi::residual);
                 pf_dirty(sl);
             } else {
@@ -1319,12 +1388,54 @@ struct CudaEngine::Impl {
         if (rows == 0 || rows > RM) throw std::runtime_error("mtp_forward: bad rows/pos0");
         core::require_capacity(pos0, rows, opt.max_positions);
         core::validate_token_ids(next_tokens, rows, c.vocab);
-        const std::uint32_t H = c.hidden;
         InputPack in{};
         in.pos0 = pos0;
         for (std::uint32_t i = 0; i < rows; ++i) in.ids[i] = next_tokens[i];
         set_inputs_kernel<<<1, 32, 0, s>>>(in, d_mpos, d_mids);
         CK(cudaGetLastError());
+        mtp_body_launch(hidden_dev, rows);
+        CudaEngine::MtpOut o;
+        if (want_top) mtp_head(rows, nullptr, o);
+        o.hidden_pre = mx;
+        o.hidden_post = mxn;
+        return o;
+    }
+    // Device-fed chain step (one row): input id by value (in_host) or from feed slot in_slot; the draft goes to slot out_slot.
+    CudaEngine::MtpOut mtp_fed(const std::uint32_t* in_host, std::uint32_t in_slot, std::uint32_t out_slot, const float* hidden_dev,
+                               std::uint32_t pos, bool want_top) {
+        if (!mtp_ok) throw std::runtime_error("mtp_step_fed: no MTP tensors loaded");
+        if (in_slot >= CudaEngine::kMtpFeedSlots || out_slot >= CudaEngine::kMtpFeedSlots)
+            throw std::runtime_error("mtp_step_fed: feed slot out of range");
+        core::require_capacity(pos, 1, opt.max_positions);
+        if (in_host) {
+            core::validate_token_ids(in_host, 1, c.vocab);
+            InputPack in{};
+            in.pos0 = pos;
+            in.ids[0] = *in_host;
+            set_inputs_kernel<<<1, 32, 0, s>>>(in, d_mpos, d_mids);
+        } else {  // the slot holds an argmax id of an earlier step (< vocab by construction)
+            fed_inputs_kernel<<<1, 32, 0, s>>>(d_feed, in_slot, pos, d_mpos, d_mids);
+        }
+        CK(cudaGetLastError());
+        mtp_body_launch(hidden_dev, 1);
+        CudaEngine::MtpOut o;
+        if (want_top) mtp_head(1, d_feed + out_slot, o);
+        o.hidden_pre = mx;
+        o.hidden_post = mxn;
+        return o;
+    }
+    void mtp_feed_put(std::uint32_t slot, const std::uint32_t* top_dev) {
+        if (!mtp_ok || slot >= CudaEngine::kMtpFeedSlots) throw std::runtime_error("mtp_feed_put: no MTP tensors or bad slot");
+        CK(cudaMemcpyAsync(d_feed + slot, top_dev, 4, cudaMemcpyDeviceToDevice, s));
+    }
+    void mtp_feed_read(std::uint32_t n, std::uint32_t* host) {
+        if (!mtp_ok || n > CudaEngine::kMtpFeedSlots) throw std::runtime_error("mtp_feed_read: no MTP tensors or bad count");
+        CK(cudaMemcpyAsync(host, d_feed, static_cast<std::size_t>(n) * 4, cudaMemcpyDeviceToHost, s));
+        CK(cudaStreamSynchronize(s));
+    }
+    // MTP block body on rows whose ids / positions are in d_mids / d_mpos: mx = block output, mxn = shared-head norm of mx.
+    void mtp_body(const float* hidden_dev, std::uint32_t rows) {
+        const std::uint32_t H = c.hidden;
         const cc::GroupedView src{rows, 1, H, H, H}, dst{rows, 1, H, 2 * H, H};
         CK(cc::embedding_rows(embd, d_mids, mtmp, rows, s));
         CK(cc::rmsnorm(mtmp, src, m_enorm, mcat, dst, c.rms_eps, s));
@@ -1337,27 +1448,67 @@ struct CudaEngine::Impl {
         mlp(M, b, rows);
         // mx holds the block output (pre mtp.norm); the hidden export needs it intact, so normalise into mxn.
         CK(cc::rmsnorm(mx, hv, m_shnorm, mxn, hv, c.rms_eps, s));
-        CudaEngine::MtpOut o;
-        if (want_top && drows) {  // draft-only subset head: same tiles, compact out; ids mapped back on the device
+    }
+    // A chain step (rows 1, stable hidden pointer = the chain's carry) replays one captured graph of the body: ids and position
+    // are device-side, as in the verify graph, so the same operands run without ~24 stream-ordered launch gaps. The first call
+    // per pointer runs eagerly (any lazy workspace growth happens outside a capture); flush chunks (rows > 1) stay eager.
+    void mtp_body_launch(const float* hidden_dev, std::uint32_t rows) {
+        if (!graphs_on || rows != 1) {
+            mtp_body(hidden_dev, rows);
+            return;
+        }
+        for (auto& [p, g] : mtp_graphs)
+            if (p == hidden_dev) {
+                CK(cudaGraphLaunch(g.exec.get(), s));
+                return;
+            }
+        if (std::find(mtp_eager.begin(), mtp_eager.end(), hidden_dev) == mtp_eager.end()) {
+            if (mtp_eager.size() >= 8) mtp_eager.erase(mtp_eager.begin());
+            mtp_eager.push_back(hidden_dev);
+            mtp_body(hidden_dev, rows);
+            return;
+        }
+        cc::UniqueHandle<cudaGraph_t, cudaGraphDestroy> g;
+        CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+        try {
+            mtp_body(hidden_dev, rows);
+        } catch (...) {
+            cudaGraph_t dummy = nullptr;
+            cudaStreamEndCapture(s, &dummy);
+            if (dummy) cudaGraphDestroy(dummy);
+            throw;
+        }
+        CK(cudaStreamEndCapture(s, g.put()));
+        Graph gr;
+        CK(cudaGraphInstantiate(gr.exec.put(), g.get(), 0));
+        std::size_t n = 0;
+        CK(cudaGraphGetNodes(g.get(), nullptr, &n));
+        gr.nodes = n;
+        if (mtp_graphs.size() >= 4) mtp_graphs.erase(mtp_graphs.begin());
+        mtp_graphs.emplace_back(hidden_dev, std::move(gr));
+        CK(cudaGraphLaunch(mtp_graphs.back().second.exec.get(), s));
+    }
+    // Draft head on mxn rows -> o.logits / o.top (token ids); feed_out (device-fed chain) also receives the last row's id.
+    void mtp_head(std::uint32_t rows, std::uint32_t* feed_out, CudaEngine::MtpOut& o) {
+        if (drows) {  // draft-only subset head: same tiles, compact out; ids mapped back on the device
             draft_rows_sync();
             cc::DenseWeight w = head;
             w.data = dhead;
             w.out = drows->rows();
             CK(cc::dense_rows(w, mxn, mlogits, rows, nullptr, s, opt.dense_arithmetic));
             CK(cc::argmax_rows(mlogits, w.out, rows, d_mtop, d_argws, s));
-            draft_map_kernel<<<1, 32, 0, s>>>(d_mtop, d_dmap, rows, 16U);
+            draft_map_kernel<<<1, 32, 0, s>>>(d_mtop, d_dmap, rows, 16U, feed_out);
             CK(cudaGetLastError());
-            o.logits = mlogits;
-            o.top = d_mtop;
-        } else if (want_top) {
+        } else {
             CK(cc::dense_rows(head, mxn, mlogits, rows, nullptr, s, opt.dense_arithmetic));
             CK(cc::argmax_rows(mlogits, c.vocab, rows, d_mtop, d_argws, s));
-            o.logits = mlogits;
-            o.top = d_mtop;
+            if (feed_out) {
+                draft_map_kernel<<<1, 32, 0, s>>>(d_mtop, nullptr, rows, 16U, feed_out);
+                CK(cudaGetLastError());
+            }
         }
-        o.hidden_pre = mx;
-        o.hidden_post = mxn;
-        return o;
+        o.logits = mlogits;
+        o.top = d_mtop;
     }
 };
 
@@ -1579,6 +1730,10 @@ void print_effective_config(const EngineOptions& o, const char* arith, std::FILE
                  o.prefill_arith == PrefillArith::exact ? "serial (exact prefill keeps the decode windows)"
                  : o.prefill_gdn == PrefillGdn::chunk16 ? "chunk16 (FAST gdn-chunk16-f32-v1, identity -gdnc16)"
                                                         : "serial (decode recurrence, bitwise)");
+    std::fprintf(f, "  prefill-norm-fold: %s\n",
+                 o.prefill_arith != PrefillArith::fast4 ? "n/a (FAST4 only)"
+                 : o.prefill_norm_fold ? "on (hidden RMSNorm + chunked-GDN gated RMSNorm folded into the FAST4 quantiser, bitwise)"
+                                       : "off (rmsnorm + quantise)");
     std::fprintf(f, "  prefill-inflight: %u%s (bounded submission, scheduling only, bitwise)\n  prefill-ramp: %u%s\n", o.prefill_inflight,
                  o.prefill_inflight ? " chunks" : " = unbounded", o.prefill_ramp, o.prefill_ramp ? " rows first chunk, doubling to prefill-chunk" : " (off)");
     if (o.turbo_weights >= TurboWeights::onfly)
@@ -1637,6 +1792,12 @@ CudaEngine::MtpOut CudaEngine::mtp_forward(const std::uint32_t* next_tokens, con
                                            std::uint32_t pos0, bool want_top) {
     return p_->mtp(next_tokens, hidden_dev, rows, pos0, want_top);
 }
+CudaEngine::MtpOut CudaEngine::mtp_step_fed(const std::uint32_t* in_host, std::uint32_t in_slot, std::uint32_t out_slot,
+                                            const float* hidden_dev, std::uint32_t pos, bool want_top) {
+    return p_->mtp_fed(in_host, in_slot, out_slot, hidden_dev, pos, want_top);
+}
+void CudaEngine::mtp_feed_put(std::uint32_t slot, const std::uint32_t* top_dev) { p_->mtp_feed_put(slot, top_dev); }
+void CudaEngine::mtp_feed_read(std::uint32_t n, std::uint32_t* host) const { p_->mtp_feed_read(n, host); }
 void CudaEngine::read_logits(const RowsOut& o, std::uint32_t row, float* host) const {
     CK(cudaMemcpyAsync(host, o.logits + static_cast<std::size_t>(row) * p_->c.vocab, static_cast<std::size_t>(p_->c.vocab) * 4,
                        cudaMemcpyDeviceToHost, p_->s));

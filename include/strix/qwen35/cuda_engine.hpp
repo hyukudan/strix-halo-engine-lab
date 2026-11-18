@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -47,13 +48,25 @@ enum class PrefillArith : std::uint8_t { exact, flash, fast, fast2, fast8, fast4
 //   chunk16 = FAST gdn-chunk16-f32-v1 (strix/cuda_core/gdn_chunk.hpp): 16-row chunks, FP32, all SMs; bits differ (identity
 //             suffix -gdnc16), opt-in until its logit gate passes.
 enum class PrefillGdn : std::uint8_t { serial, chunk16 };
+// CLI / option spelling of PrefillGdn ("serial" | "chunk16"); anything else is rejected, never mapped to a default.
+[[nodiscard]] inline PrefillGdn parse_prefill_gdn(const std::string& s) {
+    if (s == "serial") return PrefillGdn::serial;
+    if (s == "chunk16") return PrefillGdn::chunk16;
+    throw std::invalid_argument("--prefill-gdn expects serial|chunk16, got '" + s + "'");
+}
+// CLI spelling of EngineOptions::prefill_norm_fold ("on" | "off"); anything else is rejected.
+[[nodiscard]] inline bool parse_prefill_norm_fold(const std::string& s) {
+    if (s == "on") return true;
+    if (s == "off") return false;
+    throw std::invalid_argument("--prefill-norm-fold expects on|off, got '" + s + "'");
+}
 
 struct EngineOptions {
     cuda_core::DenseArith dense_arithmetic = cuda_core::dense_arith();
     std::uint32_t max_positions = 4096;  // KV capacity per attention layer (and for the MTP layer)
     bool use_graphs = true;              // CUDA graph per (rows, logits mode)
     bool multi_gemv = true;              // one launch for GEMVs sharing x (q|k|v, qkv|z|beta|alpha); bitwise equal either way
-    bool pdl = false;                    // (measured +0.27 ms loss at C1: off) programmatic dependent launch + weight L2 prefetch between kernels
+    bool pdl = false;                    // experimental, default off: programmatic dependent launch + weight L2 prefetch between kernels
     bool load_mtp = true;                // read blk.<layers> (MTP) tensors when present
     bool quiet = false;
     // TURBO levers (default off = exact BF16/q8_0 identity). Each lever is individually switchable.
@@ -64,6 +77,12 @@ struct EngineOptions {
     // Large-M prefill (CudaEngine::prefill). Default exact = bitwise equal to the windowed path.
     PrefillArith prefill_arith = PrefillArith::exact;
     PrefillGdn prefill_gdn = PrefillGdn::serial;  // ignored (and not in the identity) under prefill_arith exact
+    // FAST4 only: the hidden RMSNorms (attn / post) and, on the chunked GDN path, the gated RMSNorm of the ssm_out input are folded
+    // into the A-operand quantiser (cuda_core dense_big_norm_split4 / dense_big_gated_norm_split4), so no f32 normalised rows are
+    // written and re-read. Bitwise equal to norm + quantise (no identity suffix); a non-FAST4 consumer gets the f32 rows materialised
+    // on demand. Default on: identity PASS + strict A/B x3 on the device for the hidden fold (8K FAST4 + chunk16 -4.4 %);
+    // --prefill-norm-fold off is the rollback.
+    bool prefill_norm_fold = true;
     std::uint32_t prefill_chunk = 2048;  // rows per large-M chunk (multiple of 128, <= 8192); buffers are allocated on first use
     // Wave-aligned steps (strix/wave_fit.hpp, scheduling only, bitwise): prompts of >= this many tokens step by the largest
     // rows <= prefill_chunk whose flash grid fills whole waves (4096 -> 3968 on 188 SMs: flash +16 % at 128K, bench). 0 = off
@@ -174,6 +193,15 @@ public:
     };
     MtpOut mtp_forward(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0,
                     bool want_top = true);  // want_top=false: skip lm_head + argmax (logits/top null): KV/hidden only
+    // Device-fed MTP chain (strix/spec/mtp_chain.hpp): one row at `pos` whose input id is *in_host (by value) or, with
+    // in_host null, the id in feed slot in_slot on the device; want_top also stores the row's draft id in slot out_slot.
+    // The chain enqueues a whole draft without host round trips and reads the ids once (mtp_feed_read). Same kernels and
+    // operands as mtp_forward(rows 1), so the drafted ids are bitwise those of the host-fed chain.
+    static constexpr std::uint32_t kMtpFeedSlots = 64;
+    MtpOut mtp_step_fed(const std::uint32_t* in_host, std::uint32_t in_slot, std::uint32_t out_slot, const float* hidden_dev,
+                        std::uint32_t pos, bool want_top = true);
+    void mtp_feed_put(std::uint32_t slot, const std::uint32_t* top_dev);  // slot = *top_dev (async, device to device)
+    void mtp_feed_read(std::uint32_t n, std::uint32_t* host) const;       // host[0..n) = slots 0..n-1 (synchronizes)
     // Draft-only MTP head over a vocabulary subset (strix/spec/draft_rows.hpp, group 16 = one NVFP4 tile of the head):
     // before each head launch the engine copies the rows' new tiles into a compact head (device-to-device, no
     // re-quantisation) and maps the argmax back to token ids on the device, so MtpOut::top stays a token id. MtpOut::logits

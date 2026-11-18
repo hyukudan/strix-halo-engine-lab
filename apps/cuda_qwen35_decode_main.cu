@@ -161,6 +161,8 @@ int main(int argc, char** argv) {
         std::string arith_name = "mma3";
         std::string flash_pipe, flash_tail, pf_attn8, dump_cont, pf_ocache, pf_ocache_cap;
         std::string pf_arith, pf_dump;            // --prefill-arith exact|flash|fast|fast2: large-M prefill (absent: windows of --rows)
+        std::string pf_gdn;                       // --prefill-gdn serial|chunk16 (EngineOptions::prefill_gdn; ignored under exact)
+        std::string pf_norm_fold;                 // --prefill-norm-fold on|off (EngineOptions::prefill_norm_fold; FAST4 only, bitwise)
         std::uint32_t pf_chunk = 2048, pf_repeat = 1, pf_slots = 2, pf_wave_min = 0;
         std::uint32_t pf_inflight = q::EngineOptions{}.prefill_inflight, pf_ramp = 0;  // bounded submission / ramp
         for (int i = 1; i < argc; ++i) {
@@ -179,6 +181,8 @@ int main(int argc, char** argv) {
             else if (a == "--decode-rows") decode_rows = strix::core::parse_u32(next());
             else if (a == "--max-pos") max_pos = strix::core::parse_u32(next());
             else if (a == "--prefill-arith") pf_arith = next();
+            else if (a == "--prefill-gdn") pf_gdn = next();
+            else if (a == "--prefill-norm-fold") pf_norm_fold = next();
             else if (a == "--flash-pipe") flash_pipe = next();         // pad2|swz3 (bitwise equal; scheduling only)
             else if (a == "--flash-tail") flash_tail = next();         // split|off (bitwise equal; scheduling only; default split)
             else if (a == "--prefill-attn8") pf_attn8 = next();        // on|off: e4m3 flash attention (FAST, identity -a8)
@@ -270,6 +274,9 @@ int main(int argc, char** argv) {
             else if (pf_arith == "fast4") opt.prefill_arith = q::PrefillArith::fast4;
             else throw std::runtime_error("--prefill-arith expects windows|exact|flash|fast|fast2|fast8|fast4");
         }
+        // FAST gdn-chunk16-f32-v1 changes bits: identity suffix -gdnc16 (cuda_engine.hpp); ignored under --prefill-arith exact
+        if (!pf_gdn.empty()) opt.prefill_gdn = q::parse_prefill_gdn(pf_gdn);
+        if (!pf_norm_fold.empty()) opt.prefill_norm_fold = q::parse_prefill_norm_fold(pf_norm_fold);
         opt.prefill_chunk = pf_chunk;
         opt.prefill_wave_min_tokens = pf_wave_min;
         opt.prefill_slots = pf_slots;

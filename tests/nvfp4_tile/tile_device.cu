@@ -12,6 +12,8 @@
 #include <vector>
 
 #include "strix/cuda/core/nvfp4_tile_cuda.hpp"
+#include "strix/cuda_core/gdn.hpp"
+#include "strix/cuda_core/norms.hpp"
 #include "tile_ref.hpp"
 
 namespace {
@@ -161,8 +163,154 @@ void check_glu(std::uint32_t ch, std::uint32_t in, std::uint32_t rows, std::uint
         CU(cudaFree(p));
 }
 
+// RMSNorm folded into the quantiser: norm_quantize_enqueue(x, gain) must give the X tile + rs of cuda_core rmsnorm(x, gain) followed
+// by quantize_enqueue, byte for byte (also with a null gain and padding rows); repeated launches bitwise identical.
+void check_norm_quant(std::uint32_t rows, std::uint32_t in, bool with_gain, std::uint32_t seed) {
+    namespace cc = strix::cuda_core;
+    const std::uint32_t rp = T::rows_padded(rows);
+    auto hx = random_x(rows, in, seed);
+    for (std::size_t i = 0; i < hx.size(); ++i) hx[i] *= static_cast<float>(1 + (i * 2654435761u >> 7) % 61) * 0.37f;  // spread magnitudes
+    std::vector<float> hg(in);
+    for (std::uint32_t i = 0; i < in; ++i) hg[i] = 0.25f + static_cast<float>((i * 40503u + seed) % 997) / 400.f;
+    float* dx = up(hx);
+    float* dg = up(hg);
+    float *dxn = nullptr, *drs_a = nullptr, *drs_b = nullptr;
+    std::uint8_t *dxt_a = nullptr, *dxt_b = nullptr;
+    const std::size_t tb = T::x_tile_bytes(rp, in);
+    CU(cudaMalloc(&dxn, hx.size() * sizeof(float)));
+    CU(cudaMalloc(&dxt_a, tb));
+    CU(cudaMalloc(&dxt_b, tb));
+    CU(cudaMalloc(&drs_a, rp * sizeof(float)));
+    CU(cudaMalloc(&drs_b, rp * sizeof(float)));
+    const float eps = 1e-6f;
+    const cc::GroupedView v{rows, 1, in, in, in};
+    CU(cc::rmsnorm(dx, v, with_gain ? dg : nullptr, dxn, v, eps, nullptr));
+    CU(T::quantize_enqueue(dxn, rows, in, dxt_a, drs_a, nullptr));
+    CU(cudaMemset(dxt_b, 0xa5, tb));
+    CU(T::norm_quantize_enqueue(dx, with_gain ? dg : nullptr, eps, rows, in, dxt_b, drs_b, nullptr));
+    const auto ta = down(dxt_a, tb), tb1 = down(dxt_b, tb);
+    const auto ra = down(drs_a, rp), rb1 = down(drs_b, rp);
+    CU(T::norm_quantize_enqueue(dx, with_gain ? dg : nullptr, eps, rows, in, dxt_b, drs_b, nullptr));
+    const auto tb2 = down(dxt_b, tb);
+    const auto rb2 = down(drs_b, rp);
+    const bool same = ta == tb1 && std::memcmp(ra.data(), rb1.data(), rp * 4) == 0;
+    const bool det = tb1 == tb2 && std::memcmp(rb1.data(), rb2.data(), rp * 4) == 0;
+    const bool ok = same && det;
+    if (!ok) ++g_fail;
+    std::printf("TILE CHECK %-10s in=%u rows=%u gain=%d bitwise-vs-rmsnorm+quantize=%d deterministic=%d %s\n", "norm_quant", in, rows,
+                with_gain ? 1 : 0, same ? 1 : 0, det ? 1 : 0, ok ? "PASS" : "FAIL");
+    for (void* p : {static_cast<void*>(dx), static_cast<void*>(dg), static_cast<void*>(dxn), static_cast<void*>(dxt_a),
+                    static_cast<void*>(dxt_b), static_cast<void*>(drs_a), static_cast<void*>(drs_b)})
+        CU(cudaFree(p));
+}
+
+// GDN gated RMSNorm folded into the quantiser: gated_norm_quantize_enqueue(x, z, gain) must give the X tile + rs of cuda_core
+// gdn_chunk_norm (in place on a copy of x) followed by quantize_enqueue, byte for byte; repeated launches bitwise identical.
+void check_gated_norm_quant(std::uint32_t rows, std::uint32_t in, std::uint32_t seed) {
+    namespace cc = strix::cuda_core;
+    const std::uint32_t rp = T::rows_padded(rows), heads = in / T::kGatedNormHead;
+    auto hx = random_x(rows, in, seed);
+    for (std::size_t i = 0; i < hx.size(); ++i) hx[i] *= static_cast<float>(1 + (i * 2654435761u >> 7) % 61) * 0.37f;
+    auto hz = random_x(rows, in, seed + 7);
+    for (std::size_t i = 0; i < hz.size(); ++i) hz[i] *= 3.0f;
+    std::vector<float> hg(T::kGatedNormHead);
+    for (std::uint32_t i = 0; i < T::kGatedNormHead; ++i) hg[i] = 0.25f + static_cast<float>((i * 40503u + seed) % 997) / 400.f;
+    float* dx = up(hx);
+    float* dref = up(hx);
+    float* dz = up(hz);
+    float* dg = up(hg);
+    float *drs_a = nullptr, *drs_b = nullptr;
+    std::uint8_t *dxt_a = nullptr, *dxt_b = nullptr;
+    const std::size_t tb = T::x_tile_bytes(rp, in);
+    CU(cudaMalloc(&dxt_a, tb));
+    CU(cudaMalloc(&dxt_b, tb));
+    CU(cudaMalloc(&drs_a, rp * sizeof(float)));
+    CU(cudaMalloc(&drs_b, rp * sizeof(float)));
+    const float eps = 1e-6f;
+    const cc::GdnDims d{16, 128, heads, 128, 4};
+    CU(cc::gdn_chunk_norm(d, dg, dz, dref, rows, eps, nullptr));
+    CU(T::quantize_enqueue(dref, rows, in, dxt_a, drs_a, nullptr));
+    CU(cudaMemset(dxt_b, 0xa5, tb));
+    CU(T::gated_norm_quantize_enqueue(dx, dz, dg, eps, rows, in, dxt_b, drs_b, nullptr));
+    const auto ta = down(dxt_a, tb), tb1 = down(dxt_b, tb);
+    const auto ra = down(drs_a, rp), rb1 = down(drs_b, rp);
+    CU(T::gated_norm_quantize_enqueue(dx, dz, dg, eps, rows, in, dxt_b, drs_b, nullptr));
+    const auto tb2 = down(dxt_b, tb);
+    const auto rb2 = down(drs_b, rp);
+    const bool same = ta == tb1 && std::memcmp(ra.data(), rb1.data(), rp * 4) == 0;
+    const bool det = tb1 == tb2 && std::memcmp(rb1.data(), rb2.data(), rp * 4) == 0;
+    const bool ok = same && det;
+    if (!ok) ++g_fail;
+    std::printf("TILE CHECK %-10s in=%u rows=%u heads=%u bitwise-vs-gdn_chunk_norm+quantize=%d deterministic=%d %s\n", "gnorm_quant", in,
+                rows, heads, same ? 1 : 0, det ? 1 : 0, ok ? "PASS" : "FAIL");
+    for (void* p : {static_cast<void*>(dx), static_cast<void*>(dref), static_cast<void*>(dz), static_cast<void*>(dg),
+                    static_cast<void*>(dxt_a), static_cast<void*>(dxt_b), static_cast<void*>(drs_a), static_cast<void*>(drs_b)})
+        CU(cudaFree(p));
+}
+
+// timing of rmsnorm + quantize (two passes, f32 rows through memory) vs the folded producer: median of 20 after 3 warm-ups
+void bench_norm_quant(std::uint32_t rows, std::uint32_t in, std::uint32_t gdn_in) {
+    namespace cc = strix::cuda_core;
+    const std::uint32_t rp = T::rows_padded(rows);
+    float *x = nullptr, *xn = nullptr, *g = nullptr, *rs = nullptr;
+    std::uint8_t* xt = nullptr;
+    CU(cudaMalloc(&x, static_cast<std::size_t>(rows) * in * 4));
+    CU(cudaMalloc(&xn, static_cast<std::size_t>(rows) * in * 4));
+    CU(cudaMalloc(&g, in * 4));
+    CU(cudaMalloc(&xt, T::x_tile_bytes(rp, in)));
+    CU(cudaMalloc(&rs, rp * 4));
+    CU(cudaMemset(x, 0x3c, static_cast<std::size_t>(rows) * in * 4));
+    CU(cudaMemset(g, 0x3f, in * 4));
+    const cc::GroupedView v{rows, 1, in, in, in};
+    cudaEvent_t a, b;
+    CU(cudaEventCreate(&a));
+    CU(cudaEventCreate(&b));
+    auto timed = [&](auto&& f) {
+        for (int i = 0; i < 3; ++i) f();
+        std::vector<float> ms;
+        for (int i = 0; i < 20; ++i) {
+            CU(cudaEventRecord(a));
+            f();
+            CU(cudaEventRecord(b));
+            CU(cudaEventSynchronize(b));
+            float t = 0;
+            CU(cudaEventElapsedTime(&t, a, b));
+            ms.push_back(t);
+        }
+        std::sort(ms.begin(), ms.end());
+        return ms[ms.size() / 2];
+    };
+    const float sep = timed([&] {
+        CU(cc::rmsnorm(x, v, g, xn, v, 1e-6f, nullptr));
+        CU(T::quantize_enqueue(xn, rows, in, xt, rs, nullptr));
+    });
+    const float fused = timed([&] { CU(T::norm_quantize_enqueue(x, g, 1e-6f, rows, in, xt, rs, nullptr)); });
+    std::printf("TILE BENCH norm_quant in=%u rows=%u separate_ms=%.4f fused_ms=%.4f saved_ms=%.4f\n", in, rows, sep, fused, sep - fused);
+    if (gdn_in != 0) {  // GDN gated RMSNorm (gdn_chunk_norm in place, then quantize) vs gated_norm_quantize_enqueue; z = x buffer
+        float *gx = nullptr, *gz = nullptr;
+        CU(cudaMalloc(&gx, static_cast<std::size_t>(rows) * gdn_in * 4));
+        CU(cudaMalloc(&gz, static_cast<std::size_t>(rows) * gdn_in * 4));
+        CU(cudaMemset(gx, 0x3c, static_cast<std::size_t>(rows) * gdn_in * 4));
+        CU(cudaMemset(gz, 0x3c, static_cast<std::size_t>(rows) * gdn_in * 4));
+        const cc::GdnDims d{16, 128, gdn_in / T::kGatedNormHead, 128, 4};
+        const float gsep = timed([&] {
+            CU(cc::gdn_chunk_norm(d, g, gz, gx, rows, 1e-6f, nullptr));
+            CU(T::quantize_enqueue(gx, rows, gdn_in, xt, rs, nullptr));
+        });
+        const float gfused = timed([&] { CU(T::gated_norm_quantize_enqueue(gx, gz, g, 1e-6f, rows, gdn_in, xt, rs, nullptr)); });
+        std::printf("TILE BENCH gnorm_quant in=%u rows=%u separate_ms=%.4f fused_ms=%.4f saved_ms=%.4f\n", gdn_in, rows, gsep, gfused,
+                    gsep - gfused);
+        CU(cudaFree(gx));
+        CU(cudaFree(gz));
+    }
+    for (void* p : {static_cast<void*>(x), static_cast<void*>(xn), static_cast<void*>(g), static_cast<void*>(xt), static_cast<void*>(rs)})
+        CU(cudaFree(p));
+    CU(cudaEventDestroy(a));
+    CU(cudaEventDestroy(b));
+}
+
 // timing of one shape with random tiles (no reference): median of 20 launches after 3 warm-ups
-void bench(const char* name, std::uint32_t out, std::uint32_t in, std::uint32_t rows, bool glu) {
+void bench(const char* name, std::uint32_t out, std::uint32_t in, std::uint32_t rows, bool glu, bool residual = false) {
     const std::uint32_t rp = T::rows_padded(rows);
     std::uint8_t *w = nullptr, *w2 = nullptr, *xt = nullptr;
     float *rs = nullptr, *y = nullptr, *x = nullptr;
@@ -186,7 +334,11 @@ void bench(const char* name, std::uint32_t out, std::uint32_t in, std::uint32_t 
     g.in = in;
     g.rows = rows;
     g.rows_pad = rp;
-    g.epi = glu ? T::Epi::glu : T::Epi::store;
+    g.epi = glu ? T::Epi::glu : residual ? T::Epi::residual : T::Epi::store;
+    if (residual) {  // in place (aux == y), as the engine's down / o / ssm_out GEMMs
+        CU(cudaMemset(y, 0, static_cast<std::size_t>(rows) * out * 4));
+        g.aux = y;
+    }
     cudaEvent_t a, b;
     CU(cudaEventCreate(&a));
     CU(cudaEventCreate(&b));
@@ -231,6 +383,9 @@ int main(int argc, char** argv) {
         bench("qkv", 10240, 5120, rows, false);   // GDN qkv
         bench("o", 5120, 6144, rows, false);      // GDN out / attention o
         bench("kv", 1024, 5120, rows, false);     // attention k (and v)
+        bench("down_r", 5120, 17408, rows, false, true);  // FFN down, residual in place (engine form)
+        bench("o_r", 5120, 6144, rows, false, true);      // GDN out / attention o, residual in place (engine form)
+        bench_norm_quant(rows, 5120, 6144);               // attn / post RMSNorm (hidden rows) + GDN gated RMSNorm (ssm_out input)
         return 0;
     }
     check_gemm("store", 48, 256, 40, T::Epi::store, 11);
@@ -240,6 +395,12 @@ int main(int argc, char** argv) {
     check_gemm("store", 1024, 5120, 24, T::Epi::store, 61);  // model K
     check_glu(80, 128, 20, 31);
     check_glu(192, 1024, 300, 71);
+    check_norm_quant(300, 5120, true, 81);   // model width, padding rows 300..511
+    check_norm_quant(257, 384, false, 91);   // null gain, NREG 2 -> bucket 8
+    check_norm_quant(64, 8192, true, 101);   // widest fused row (NREG 32)
+    check_gated_norm_quant(300, 6144, 111);  // model width (48 heads), padding rows 300..511
+    check_gated_norm_quant(257, 384, 121);   // 3 heads: half-filled 256-thread step, NREG 2 -> bucket 8
+    check_gated_norm_quant(64, 8192, 131);   // widest fused row (64 heads, NREG 32)
     std::printf("nvfp4_tile_device: %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
 }
