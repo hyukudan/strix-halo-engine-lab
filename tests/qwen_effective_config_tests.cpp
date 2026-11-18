@@ -4043,8 +4043,8 @@ int main(int argc, char** arguments) {
                     "--known-prefix-prefill-rows","8192","--known-prefix-workspace-budget-bytes","68719476736",
                     "--known-prefix-host-metadata-budget-bytes","2147483648","--known-prefix-uma-budget-bytes","124889595904",
                     "--known-prefix-host-headroom-bytes","4294967296"});
-                const auto outcome=[&](const std::vector<std::string>& argv) {
-                    try { const auto r=resolve(RequestedOptions{parse(argv),{}},memory);
+                const auto outcome=[&](const std::vector<std::string>& case_argv) {
+                    try { const auto r=resolve(RequestedOptions{parse(case_argv),{}},memory);
                         return std::pair<std::string,std::uint32_t>{r.error,r.options.known_prefix_prefill_rows};
                     } catch (const std::exception& e) { return std::pair<std::string,std::uint32_t>{e.what(),0U}; }
                 };
