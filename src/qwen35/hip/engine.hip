@@ -29,6 +29,7 @@
 #include "../../core/dense_linear.hpp"
 #include "../../core/dense_linear_iu4.hpp"
 #include "../../core/window_state_buffers.hpp"
+#include "../../core/a4_tiles.hpp"
 #include "../../core/f16_dense_iu4.hpp"
 #include "../../core/f16_dense_q8a8.hpp"
 #include "../../ops/norm/norm_device.hpp"
@@ -313,10 +314,37 @@ bool wide_iu4_ok(const Tensor& t, const WideScratch& wide, unsigned rows) {
     return wide.codes && t.fmt == kIu4Fmt && !core::dense_iu4::reference_flag() && t.inputs % 128U == 0U && t.outputs % 16U == 0U &&
            std::uint64_t(rows) * t.inputs * 4U < (1ULL << 32U);
 }
-// x16 form (same bits) where iu4a16::x16_pays; STRIX_DENSE_X16=0 keeps the direct form everywhere.
+// STRIX_DENSE_FAST4_EMU = 0 (default) | g32 | g64 | h32 | h64: gate instrument of the planned W4A4 class (core/a4_tiles.hpp):
+// every wide IU4 GEMM reads A4-quantised x16 tiles (groups of 32 / 64; h32 / h64 = Hadamard-128 then groups of 32 / 64) through
+// the unchanged exact core. Changes the logits, moves no work; not a FAST option (never in a profile or ready set).
+int fast4_emu() {
+    static const int mode = [] {
+        const int m = strix::envcfg::choice("STRIX_DENSE_FAST4_EMU", {"0", "g32", "g64", "h32", "h64"}, 0);
+        if (m) std::fprintf(stderr, "qwen35-hip: FAST4 EMULATION dense-a4%s-emu-v1 on the wide IU4 GEMMs (gate instrument)\n",
+                            m == 1 ? "g32" : m == 2 ? "g64" : m == 3 ? "h128g32" : "h128g64");
+        return m;
+    }();
+    return mode;
+}
+template <class Q> struct WithQ { using type = Q; };
+template <class K> void with_tile_quantiser(K&& k) {
+    namespace a4 = core::a4_tiles;
+    switch (fast4_emu()) {
+    case 1: k(WithQ<a4::Emu<32U, false>>{}); break;
+    case 2: k(WithQ<a4::Emu<64U, false>>{}); break;
+    case 3: k(WithQ<a4::Emu<32U, true>>{}); break;
+    case 4: k(WithQ<a4::Emu<64U, true>>{}); break;
+    default: k(WithQ<core::f16_dense_tall::TileRne>{}); break;
+    }
+}
+void x16_tiles(const float* x, _Float16* xt, unsigned rows, unsigned in, hipStream_t s) {
+    with_tile_quantiser([&](auto q) { core::f16_dense_tall::enqueue_x16_tiles<typename decltype(q)::type>(x, xt, rows, in, s); });
+}
+// x16 form (same bits) where iu4a16::x16_pays; STRIX_DENSE_X16=0 keeps the direct form everywhere (the FAST4 emulation
+// needs the tiles: x16 everywhere).
 bool wide_iu4_x16(const Tensor& w, const WideScratch& wide, unsigned rows) {
     static const bool on = strix::envcfg::flag("STRIX_DENSE_X16", true);
-    return on && wide.xt && core::f16_dense_tall::iu4a16::x16_pays(rows, w.inputs, w.outputs);
+    return wide.xt && (fast4_emu() != 0 || (on && core::f16_dense_tall::iu4a16::x16_pays(rows, w.inputs, w.outputs)));
 }
 // xt: the x16 tiles of x already written (enqueue_x16_tiles), or nullptr for the direct form.
 void wide_iu4(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s, const _Float16* xt = nullptr) {
@@ -329,7 +357,7 @@ void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStrea
         wide_dense(w, out, rows, s, wide);
     } else if (rows > 16U && wide_iu4_ok(w, wide, rows)) {
         const bool x16 = wide_iu4_x16(w, wide, rows);
-        if (x16) core::f16_dense_tall::enqueue_x16_tiles(x, wide.xt, rows, w.inputs, s);
+        if (x16) x16_tiles(x, wide.xt, rows, w.inputs, s);
         wide_iu4(w, x, out, rows, s, x16 ? wide.xt : nullptr);
     } else {  // not a Q8_0 shape the WMMA core takes: exact 16-row sweeps
         core::dense_row_sweeps(rows, [&](unsigned r, unsigned count) {
@@ -348,10 +376,12 @@ void mlp(const Tensor& g, const Tensor& u, const Tensor& d, const float* x, floa
     if (fuse && rows > 16U && !wide_ok(g, wide) && wide_iu4_ok(g, wide, rows) && wide_iu4_ok(u, wide, rows) && wide_iu4_ok(d, wide, rows) &&
         g.outputs == u.outputs && d.inputs == g.outputs && wide_iu4_x16(d, wide, rows)) {
         const bool x16 = wide_iu4_x16(g, wide, rows);
-        if (x16) core::f16_dense_tall::enqueue_x16_tiles(x, wide.xt, rows, g.inputs, s);
+        if (x16) x16_tiles(x, wide.xt, rows, g.inputs, s);
         wide_iu4(g, x, wide.g, rows, s, x16 ? wide.xt : nullptr);
         wide_iu4(u, x, wide.u, rows, s, x16 ? wide.xt : nullptr);
-        core::f16_dense_tall::enqueue_x16_tiles_map2<SiluMul>(wide.g, wide.u, wide.xt, rows, g.outputs, s);
+        with_tile_quantiser([&](auto q) {
+            core::f16_dense_tall::enqueue_x16_tiles_map2<SiluMul, typename decltype(q)::type>(wide.g, wide.u, wide.xt, rows, g.outputs, s);
+        });
         wide_iu4(d, h, out, rows, s, wide.xt);  // h is not read by the x16 form
         return;
     }
@@ -366,7 +396,7 @@ void glu(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned 
         silu_mul_kernel<<<1024, 256, 0, s>>>(wide.g, wide.u, out, std::size_t(rows) * g.outputs);
     } else if (rows > 16U && wide_iu4_ok(g, wide, rows) && wide_iu4_ok(u, wide, rows) && g.outputs == u.outputs) {
         const bool x16 = wide_iu4_x16(g, wide, rows);  // gate and up share one tile pass of x
-        if (x16) core::f16_dense_tall::enqueue_x16_tiles(x, wide.xt, rows, g.inputs, s);
+        if (x16) x16_tiles(x, wide.xt, rows, g.inputs, s);
         wide_iu4(g, x, wide.g, rows, s, x16 ? wide.xt : nullptr);
         wide_iu4(u, x, wide.u, rows, s, x16 ? wide.xt : nullptr);
         silu_mul_kernel<<<1024, 256, 0, s>>>(wide.g, wide.u, out, std::size_t(rows) * g.outputs);
@@ -419,7 +449,8 @@ struct HipEngine::Impl {
     std::uint16_t *conv_all = nullptr, *bak_conv = nullptr;
     float *raw_qkv = nullptr, *raw_beta = nullptr, *raw_gate = nullptr, *core_r = nullptr;
     float *x = nullptr, *xn = nullptr, *qkv = nullptr, *z = nullptr, *beta = nullptr, *gate = nullptr, *core = nullptr, *proj = nullptr,
-          *q_in = nullptr, *kk = nullptr, *vv = nullptr, *qn = nullptr, *ctx = nullptr, *gu = nullptr, *logits = nullptr;
+          *q_in = nullptr, *kk = nullptr, *vv = nullptr, *qn = nullptr, *ctx = nullptr, *gu = nullptr, *logits = nullptr,
+          *wide_logits = nullptr;  // all rows of a wide window (quality-gate dumps only; allocated on first use)
     int *d_ids = nullptr, *d_arg = nullptr;
     unsigned committed = 0, pending = 0;
     // Wide-window attention (rows > 16, FAST): shared flash over the BF16 cache (attn_core/dense_decode_flash.hpp).
@@ -468,7 +499,7 @@ struct HipEngine::Impl {
         for (auto& y : L) { fr(y.k_cache); fr(y.v_cache); fr(y.v_t); }
         fr(fws); fr(ffail);
         for (auto* p : {gdn_all, bak_state, raw_qkv, raw_beta, raw_gate, core_r, x, xn, qkv, z, beta, gate, core, proj, q_in, kk, vv,
-                        qn, ctx, gu, logits}) fr(p);
+                        qn, ctx, gu, logits, wide_logits}) fr(p);
         for (auto* p : {conv_all, bak_conv}) fr(p);
         fr(d_ids); fr(d_arg);
         fr(dhead); fr(d_dmap);
@@ -613,7 +644,6 @@ struct HipEngine::Impl {
     HipRowsOut run(const std::uint32_t* tokens, unsigned n, LogitRows want, bool defer) {
         if (n < 1U || n > (defer ? kMaxRows : std::max(kMaxRows, opt.prefill_rows)))
             throw std::invalid_argument("rows must be 1..16 (decode windows) or 1..prefill_rows (forward_commit)");
-        if (n > kMaxRows && want == LogitRows::all) throw std::invalid_argument("wide windows return last-row or no logits");
         if (pending) { rollback(0U); pending = 0; }  // an uncommitted window is discarded
         core::require_capacity(committed, n, opt.max_positions);
         core::validate_token_ids(tokens, n, cfg.vocab);
@@ -676,10 +706,19 @@ struct HipEngine::Impl {
         }
         if (want != LogitRows::none) {
             const unsigned first = want == LogitRows::last ? n - 1U : 0U, m = want == LogitRows::last ? 1U : n;
+            // All rows of a wide window (quality-gate dumps): the head in 16-row slices (the arithmetic of the
+            // last-row path) into wide_logits; top = the last row's argmax.
+            float* lg = logits;
+            if (m > kMaxRows) {
+                if (!wide_logits) alloc0(&wide_logits, std::size_t(V) * std::max(kMaxRows, opt.prefill_rows) * 4U);
+                lg = wide_logits;
+            }
             rmsnorm(x + std::size_t(first) * H, onorm, H, cfg.rms_eps, xn, m, stream);
-            linear(head, xn, logits, m, stream, wide, iu4);
-            argmax_kernel<<<m, 1024, 0, stream>>>(logits, V, d_arg);
-            out.logits = logits;
+            for (unsigned r = 0; r < m; r += kMaxRows)
+                linear(head, xn + std::size_t(r) * H, lg + std::size_t(r) * V, std::min(kMaxRows, m - r), stream, wide, iu4);
+            if (m > kMaxRows) argmax_kernel<<<1, 1024, 0, stream>>>(lg + std::size_t(m - 1U) * V, V, d_arg);
+            else argmax_kernel<<<m, 1024, 0, stream>>>(lg, V, d_arg);
+            out.logits = lg;
             out.top = reinterpret_cast<const std::uint32_t*>(d_arg);
         }
         HK(hipGetLastError());

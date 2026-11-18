@@ -64,6 +64,8 @@ int main(int argc, char** argv) try {
     std::string model, dump, ids_arg = "1", mtp_arg = "auto", draft_pack;
     bool draft_rows_on = true, fixed_costs = true;
     unsigned wide = 0;
+    bool dump_window = false;
+    unsigned tf_rows = 0;
     unsigned gen = 16, rows = 1, maxpos = 0, repeat = 1;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -77,6 +79,8 @@ int main(int argc, char** argv) try {
         else if (a == "--rows") rows = strix::core::parse_u32(next());
         else if (a == "--wide") wide = strix::core::parse_u32(next());  // prompt windows of N rows, last-row logits only (N > 16 = FAST wide prefill)
         else if (a == "--dump-logits") dump = next();
+        else if (a == "--dump-window") dump_window = true;
+        else if (a == "--tf-rows") tf_rows = strix::core::parse_u32(next());  // with --wide: the last N prompt tokens as <= 16-row windows (row path), all logits  // with --wide and --gen 0: dump every row of the last window
         else if (a == "--iu4-reference") strix::core::dense_iu4::set_reference(true);  // exactness gate: dequantised-pack reference form
         else if (a == "--max-pos") maxpos = strix::core::parse_u32(next());
         else if (a == "--repeat") repeat = std::max(1U, strix::core::parse_u32(next()));  // prefills per process (reset between): first = cold, last = warm
@@ -151,20 +155,30 @@ int main(int argc, char** argv) try {
     if (chain) chain->reset();
     const auto t_pf0 = std::chrono::steady_clock::now();
     if (wide) {
-        for (std::size_t at = 0; at < prompt.size();) {
-            const unsigned n = unsigned(std::min<std::size_t>(wide, prompt.size() - at));
+        // --tf-rows N: wide windows up to size - N (no logits), then N teacher-forced rows in <= 16-row windows (the
+        // decode row path, every row's logits dumped): the state a FAST prefill hands to decode, scored on exact rows.
+        const std::size_t wide_end = prompt.size() - std::min<std::size_t>(tf_rows, prompt.size() - 1U);
+        for (std::size_t at = 0; at < wide_end;) {
+            const unsigned n = unsigned(std::min<std::size_t>(wide, wide_end - at));
             std::vector<std::uint32_t> t(n);
             for (unsigned i = 0; i < n; ++i) t[i] = std::uint32_t(prompt[at + i]);
-            const bool last = at + n == prompt.size();
-            const auto o = E->forward_commit(t.data(), n, last ? LogitRows::last : LogitRows::none);
+            const bool last = at + n == prompt.size();  // false when --tf-rows leaves a tail
+            const bool rows_all = last && dump_window && !dump.empty();
+            const auto o = E->forward_commit(t.data(), n, last ? (rows_all ? LogitRows::all : LogitRows::last) : LogitRows::none);
             if (last) {
                 E->read_top(o, 1, top);
-                if (!dump.empty()) { dumped.resize(V); E->read_logits(o, 1, dumped.data()); }
+                const unsigned m = rows_all ? n : 1U;
+                if (!dump.empty()) { dumped.resize(std::size_t(m) * V); E->read_logits(o, m, dumped.data()); }
             }
             if (chain) chain->observe_prefill(o, n, t.data(), last ? top[0] : uprompt[at + n]);
             at += n;
         }
         last_n = 1;
+        for (std::size_t at = wide_end; at < prompt.size();) {
+            last_n = unsigned(std::min<std::size_t>(HipEngine::max_rows(), prompt.size() - at));
+            forward(last_n, prompt.data() + at);
+            at += last_n;
+        }
     } else
     for (std::size_t at = 0; at < prompt.size();) {
         last_n = unsigned(std::min<std::size_t>(rows, prompt.size() - at));

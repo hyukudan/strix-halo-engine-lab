@@ -101,6 +101,57 @@ template <int Kind> __global__ __launch_bounds__(256) void rate(int iters, float
     }
 }
 
+// FAST4 rescale arms (hip_dense5 STATE item 4; measurement only): per 16x16 tile and K64 weight group, the iu4 WMMAs of
+// a W4A4 class plus its per-element rescale, 4 tiles per wave, chains loop-carried (nothing hoistable). Kind 3: a4 g64,
+// C carries the magic 0x4B400000 (float(dot) = bits - 12582912 by v_sub), s = sa[r] * sw, acc = fma(f, s, acc);
+// Kind 4: a4 g32 (two K32 chains): t = f0 * sa0; t = fma(f1, sa1, t); acc = fma(t, sw, acc); Kind 5 = Kind 4 with
+// v_cvt_f32_i32 instead of the magic subtraction. Ops counted as WMMA work (16 x 16 x 16 x 2 per instruction).
+template <int Kind> __global__ __launch_bounds__(256) void rescale_rate(int iters, float* out) {
+    using I8 = int __attribute__((ext_vector_type(8)));
+    using I2 = int __attribute__((ext_vector_type(2)));
+    using F8 = float __attribute__((ext_vector_type(8)));
+    const unsigned t = threadIdx.x;
+    const I2 a = {int(t), int(t * 3U)}, b = {int(t ^ 1U), int(t ^ 2U)};
+    constexpr float kM = 12582912.0F;
+    F8 acc[4], sa0, sa1;
+    I8 c0[4], c1[4];
+    for (unsigned e = 0; e < 8U; ++e) {
+        sa0[e] = 1.0F + float((t + e) & 7U) * 0x1p-10F;
+        sa1[e] = 1.0F + float((t ^ e) & 7U) * 0x1p-11F;
+    }
+    for (unsigned q = 0; q < 4U; ++q)
+        for (unsigned e = 0; e < 8U; ++e) acc[q][e] = 0.0F, c0[q][e] = 0x4B400000, c1[q][e] = 0x4B400000;
+    float sw = 1.0F + float(t & 15U) * 0x1p-12F;
+    auto f32 = [&](int v) { return Kind == 5 ? float(v) : __builtin_bit_cast(float, v) - kM; };
+    for (int i = 0; i < iters; ++i) {
+        sw = sw * 0.99999994F;  // loop-variant weight scale
+#pragma unroll
+        for (unsigned q = 0; q < 4U; ++q) {
+            if constexpr (Kind == 3) {
+                c0[q] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, a, true, b, c0[q], false);
+                c0[q] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, a, true, b, c0[q], false);
+                c0[q] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, a, true, b, c0[q], false);
+                c0[q] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, a, true, b, c0[q], false);
+#pragma unroll
+                for (unsigned e = 0; e < 8U; ++e) acc[q][e] = __builtin_fmaf(f32(c0[q][e]), sa0[e] * sw, acc[q][e]);
+            } else {
+                c0[q] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, a, true, b, c0[q], false);
+                c0[q] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, a, true, b, c0[q], false);
+                c1[q] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, a, true, b, c1[q], false);
+                c1[q] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, a, true, b, c1[q], false);
+#pragma unroll
+                for (unsigned e = 0; e < 8U; ++e) {
+                    float v = f32(c0[q][e]) * sa0[e];
+                    v = __builtin_fmaf(f32(c1[q][e]), sa1[e], v);
+                    acc[q][e] = __builtin_fmaf(v, sw, acc[q][e]);
+                }
+            }
+        }
+    }
+    const float s = acc[0][0] + acc[1][1] + acc[2][2] + acc[3][3];
+    if (s == 1234.5F) out[t] = s;
+}
+
 template <class F> static double time_us(F&& launch, int reps = 20);
 __device__ __forceinline__ float act_silu(float g) { return g / (1.0F + expf(-g)); }
 struct ActSilu {
@@ -181,7 +232,23 @@ template <class C> static double run_arm(const C& c, const iu::View& v) {
     return time_us([&] { hipLaunchKernelGGL((pk<C>), g, dim3(512), 0, nullptr, c, v.x, v.in, v.rows, iu::Store{v.count, 0U, 0U}); });
 }
 
+// WMMA rate loops and the FAST4 rescale arms (argv[2] = "rates": only these).
+static int rates() {
+    float* o = nullptr;
+    CK(hipMalloc(&o, 4096));
+    const int iters = 4096;
+    const double ops = 640.0 * 256.0 / 32.0 * 4.0 * iters * 8192.0;  // blocks * waves * chains * iters * ops per WMMA
+    std::printf("rate f16 %.1f TOPS\n", ops / time_us([&] { hipLaunchKernelGGL(rate<0>, dim3(640), dim3(256), 0, nullptr, iters, o); }, 5) / 1e6);
+    std::printf("rate iu8 %.1f TOPS\n", ops / time_us([&] { hipLaunchKernelGGL(rate<1>, dim3(640), dim3(256), 0, nullptr, iters, o); }, 5) / 1e6);
+    std::printf("rate iu4 %.1f TOPS\n", ops / time_us([&] { hipLaunchKernelGGL(rate<2>, dim3(640), dim3(256), 0, nullptr, iters, o); }, 5) / 1e6);
+    const double ops16 = ops * 4.0;  // 4 tiles x 4 WMMAs per iteration (the rate loops: 4 x 1)
+    std::printf("rate a4g64-magic %.1f TOPS\n", ops16 / time_us([&] { hipLaunchKernelGGL(rescale_rate<3>, dim3(640), dim3(256), 0, nullptr, iters, o); }, 5) / 1e6);
+    std::printf("rate a4g32-magic %.1f TOPS\n", ops16 / time_us([&] { hipLaunchKernelGGL(rescale_rate<4>, dim3(640), dim3(256), 0, nullptr, iters, o); }, 5) / 1e6);
+    std::printf("rate a4g32-cvt %.1f TOPS\n", ops16 / time_us([&] { hipLaunchKernelGGL(rescale_rate<5>, dim3(640), dim3(256), 0, nullptr, iters, o); }, 5) / 1e6);
+    return 0;
+}
 int main(int argc, char** argv) {
+    if (argc > 2 && argv[2][0] == 'r') return rates();
     const unsigned rows = argc > 1 ? unsigned(std::atoi(argv[1])) : 512U;
     const unsigned shapes[][2] = {{5120U, 17408U}, {17408U, 5120U}, {5120U, 10240U}};
     Bufs b{};
@@ -227,12 +294,5 @@ int main(int argc, char** argv) {
         }));
     }
     prep_arms(rows);
-    float* o = nullptr;
-    CK(hipMalloc(&o, 4096));
-    const int iters = 4096;
-    const double ops = 640.0 * 256.0 / 32.0 * 4.0 * iters * 8192.0;  // blocks * waves * chains * iters * ops per WMMA
-    std::printf("rate f16 %.1f TOPS\n", ops / time_us([&] { hipLaunchKernelGGL(rate<0>, dim3(640), dim3(256), 0, nullptr, iters, o); }, 5) / 1e6);
-    std::printf("rate iu8 %.1f TOPS\n", ops / time_us([&] { hipLaunchKernelGGL(rate<1>, dim3(640), dim3(256), 0, nullptr, iters, o); }, 5) / 1e6);
-    std::printf("rate iu4 %.1f TOPS\n", ops / time_us([&] { hipLaunchKernelGGL(rate<2>, dim3(640), dim3(256), 0, nullptr, iters, o); }, 5) / 1e6);
-    return 0;
+    return rates();
 }
