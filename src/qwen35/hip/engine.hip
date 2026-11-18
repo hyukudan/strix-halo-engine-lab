@@ -193,7 +193,10 @@ void dispatch_rows(unsigned rows, const Tensor& w, const Tensor& up, const float
 }
 // ---- wide windows (rows > 16): FAST dense-q8a8-f16-v1 of the shared f16_dense_tall core --------------------------------
 // One engine per process binds these scratch buffers (set by Impl); rows beyond the exact 16-row sweep go through them.
-using WideScratch = core::DenseWideScratch;
+// + xt: FP16 x tiles of the x16 form of the IU4 wide GEMM (rows x max inputs, f16_dense_tall::x16_bytes).
+struct WideScratch : core::DenseWideScratch {
+    _Float16* xt = nullptr;
+};
 
 // A8 of 32-value groups, one wave per group (as quantize_a8: amax / 127, rint, clamp +-127; delta 1 for zero or tiny groups).
 __global__ void a8_quant_kernel(const float* x, unsigned inputs, std::int8_t* codes, float* deltas) {
@@ -273,15 +276,24 @@ bool wide_iu4_ok(const Tensor& t, const WideScratch& wide, unsigned rows) {
     return wide.codes && t.fmt == kIu4Fmt && !core::dense_iu4::reference_flag() && t.inputs % 128U == 0U && t.outputs % 16U == 0U &&
            std::uint64_t(rows) * t.inputs * 4U < (1ULL << 32U);
 }
-void wide_iu4(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s) {
-    core::f16_dense_tall::iu4a16::enqueue(wide_iu4_view(w, x, out, rows), s);
+// x16 form (same bits) where iu4a16::x16_pays; STRIX_DENSE_X16=0 keeps the direct form everywhere.
+bool wide_iu4_x16(const Tensor& w, const WideScratch& wide, unsigned rows) {
+    static const bool on = strix::envcfg::flag("STRIX_DENSE_X16", true);
+    return on && wide.xt && core::f16_dense_tall::iu4a16::x16_pays(rows, w.inputs, w.outputs);
+}
+// xt: the x16 tiles of x already written (enqueue_x16_tiles), or nullptr for the direct form.
+void wide_iu4(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s, const _Float16* xt = nullptr) {
+    if (xt) core::f16_dense_tall::iu4a16::enqueue_x16(wide_iu4_view(w, x, out, rows), xt, s);
+    else core::f16_dense_tall::iu4a16::enqueue(wide_iu4_view(w, x, out, rows), s);
 }
 void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s, const WideScratch& wide, const Iu4Scratch& iu4) {
     if (rows > 16U && wide_ok(w, wide)) {
         wide_quant(x, w.inputs, rows, s, wide);
         wide_dense(w, out, rows, s, wide);
     } else if (rows > 16U && wide_iu4_ok(w, wide, rows)) {
-        wide_iu4(w, x, out, rows, s);
+        const bool x16 = wide_iu4_x16(w, wide, rows);
+        if (x16) core::f16_dense_tall::enqueue_x16_tiles(x, wide.xt, rows, w.inputs, s);
+        wide_iu4(w, x, out, rows, s, x16 ? wide.xt : nullptr);
     } else {  // not a Q8_0 shape the WMMA core takes: exact 16-row sweeps
         core::dense_row_sweeps(rows, [&](unsigned r, unsigned count) {
             linear16(w, x + std::size_t(r) * w.inputs, out + std::size_t(r) * w.outputs, count, s, iu4);
@@ -295,8 +307,10 @@ void glu(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned 
         wide_dense(u, wide.u, rows, s, wide);
         silu_mul_kernel<<<1024, 256, 0, s>>>(wide.g, wide.u, out, std::size_t(rows) * g.outputs);
     } else if (rows > 16U && wide_iu4_ok(g, wide, rows) && wide_iu4_ok(u, wide, rows) && g.outputs == u.outputs) {
-        wide_iu4(g, x, wide.g, rows, s);
-        wide_iu4(u, x, wide.u, rows, s);
+        const bool x16 = wide_iu4_x16(g, wide, rows);  // gate and up share one tile pass of x
+        if (x16) core::f16_dense_tall::enqueue_x16_tiles(x, wide.xt, rows, g.inputs, s);
+        wide_iu4(g, x, wide.g, rows, s, x16 ? wide.xt : nullptr);
+        wide_iu4(u, x, wide.u, rows, s, x16 ? wide.xt : nullptr);
         silu_mul_kernel<<<1024, 256, 0, s>>>(wide.g, wide.u, out, std::size_t(rows) * g.outputs);
     } else {
         core::dense_row_sweeps(rows, [&](unsigned r, unsigned count) {
@@ -391,7 +405,7 @@ struct HipEngine::Impl {
                         qn, ctx, gu, logits}) fr(p);
         for (auto* p : {conv_all, bak_conv}) fr(p);
         fr(d_ids); fr(d_arg);
-        fr(wide.codes); fr(wide.deltas); fr(wide.g); fr(wide.u);
+        fr(wide.codes); fr(wide.deltas); fr(wide.g); fr(wide.u); fr(wide.xt);
         fr(iu4.xh); fr(iu4.g); fr(iu4.u);
         if (stream) (void)hipStreamDestroy(stream);
     }
@@ -476,6 +490,7 @@ struct HipEngine::Impl {
             alloc0(&wide.deltas, std::size_t(RS) * (maxin / 32U) * 4U);
             alloc0(&wide.g, std::size_t(RS) * I * 4U);
             alloc0(&wide.u, std::size_t(RS) * I * 4U);
+            alloc0(&wide.xt, core::f16_dense_tall::x16_bytes(RS, unsigned(maxin)));
             // flash attention of the wide windows: geometry the shared adapter is instantiated for (Dim 256, GQA group 6)
             if (D == 256U && cfg.heads == 6U * cfg.kv_heads) {
                 vt_stride = (opt.max_positions + 15U) / 16U * 16U;

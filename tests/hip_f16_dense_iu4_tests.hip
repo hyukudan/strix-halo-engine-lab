@@ -3,7 +3,8 @@
 //     words is not equivalent: the compiler folds their known bits), bit for bit vs host_w16 (any NaN matches any NaN);
 //  2. a GEMM with a partial row CTA, a remainder column launch and a partial last column tile: error vs a double sum
 //     of the contract's x16 * w16 products (tolerance 2^-10 of sum |terms|: FP32 WMMA accumulation), columns past
-//     count untouched; 16-wave CTAs give the same bits as 8-wave CTAs.
+//     count untouched; 16-wave CTAs give the same bits as 8-wave CTAs;
+//  3. the x16 form (enqueue_x16_tiles + enqueue_x16, column-fast) gives the direct form's bits, 8 and 16 waves.
 #include "core/f16_dense_iu4.hpp"
 #include "core/iu4.hpp"
 
@@ -115,6 +116,27 @@ int main() {
         std::printf("gemm: worst |err|/sum|terms| %.3g, columns past count written %u, 8 vs 16 waves %s\n", worst, untouched_bad,
                     same ? "bitwise" : "DIFFER");
         failures += !(worst < 1.0 / 1024.0) + (untouched_bad != 0U) + !same;
+        {  // 3. x16 form (tiles of x, column-fast) vs the direct form, 8 and 16 waves
+            _Float16* dxt = nullptr;
+            float* dz = nullptr;
+            CHECK(hipMalloc(&dxt, tall::x16_bytes(R, K))); CHECK(hipMalloc(&dz, std::size_t(R) * N * 4U));
+            tall::enqueue_x16_tiles(dx, dxt, R, K, 0);
+            std::vector<float> got(std::size_t(R) * N);
+            unsigned bad = 0;
+            for (unsigned waves : {8U, 16U}) {
+                std::vector<float> sentinel(std::size_t(R) * N, -12345.0F);
+                CHECK(hipMemcpy(dz, sentinel.data(), sentinel.size() * 4U, hipMemcpyHostToDevice));
+                iu::View vz = v;
+                vz.out = dz;
+                iu::enqueue_x16(vz, dxt, 0, waves);
+                CHECK(hipGetLastError()); CHECK(hipDeviceSynchronize());
+                CHECK(hipMemcpy(got.data(), dz, got.size() * 4U, hipMemcpyDeviceToHost));
+                bad += std::memcmp(got.data(), y16.data(), got.size() * 4U) != 0;
+            }
+            std::printf("x16 form: 8 / 16 waves vs direct %s\n", bad ? "DIFFER" : "bitwise (columns past count untouched)");
+            failures += bad != 0U;
+            CHECK(hipFree(dxt)); CHECK(hipFree(dz));
+        }
         CHECK(hipFree(dw)); CHECK(hipFree(dx)); CHECK(hipFree(dy));
     }
     std::printf("%s\n", failures ? "FAIL" : "PASS");

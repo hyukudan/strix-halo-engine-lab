@@ -103,6 +103,13 @@ template <unsigned TC, unsigned Waves> __global__ __launch_bounds__(32 * Waves) 
     __shared__ Storage<TC> lds;
     core<TC>(v.x, v.in, v.rows, Cols<Waves>{v}, lds, Store{v.count, v.tile0, v.accumulate});
 }
+// x16 form: A fragments from the FP16 x tiles of f16_dense_tall (enqueue_x16_tiles: the core's own RNE cast done once per
+// input), CTAs column-fast (X16Cols): same bits as kernel (the core's x16 contract). Pays when the FP32 x re-read per
+// column block misses the caches (see x16_pays).
+template <unsigned TC, unsigned Waves> __global__ __launch_bounds__(32 * Waves) void kernel_x16(View v, const _Float16* xt) {
+    __shared__ Storage<TC> lds;
+    core<TC>(v.x, v.in, v.rows, X16Cols<Cols<Waves>>{{v}, xt, v.rows}, lds, Store{v.count, v.tile0, v.accumulate});
+}
 
 inline bool supported(const View& v) {
     return v.weight && v.scale && v.x && v.out && v.rows && v.count && v.in && v.in % 128U == 0U && v.n % 16U == 0U &&
@@ -117,20 +124,46 @@ inline unsigned waves_for(unsigned rows, unsigned in, unsigned waves = 0U) {
     return waves == 8U || waves == 16U ? waves : rows >= 512U && (in >= 8192U || rows < 1024U) ? 16U : 8U;
 }
 
-template <unsigned Waves> inline void launch(View v, hipStream_t stream) {
+// The plan's launches (full 16-tile CTAs, then the remainder width): k(width constant, grid, view with tile0 set).
+// ColumnFast: grid (column blocks, row blocks), the order of the x16 form.
+template <unsigned Waves, bool ColumnFast = false, class K> inline void launch_plan(View v, K&& k) {
     const unsigned tiles = (v.count + 15U) / 16U, gx = (v.rows + 16U * Waves - 1U) / (16U * Waves);
     const Plan pl = plan(tiles, v.rows, true);
+    const auto grid = [&](unsigned cols) { return ColumnFast ? dim3(cols, gx) : dim3(gx, cols); };
     v.tile0 = 0U;
-    if (pl.full) hipLaunchKernelGGL((kernel<16, Waves>), dim3(gx, pl.full), dim3(32U * Waves), 0, stream, v);
+    if (pl.full) k(std::integral_constant<unsigned, 16U>{}, grid(pl.full), v);
     v.tile0 = 16U * pl.full;
-    if (pl.tc == 1U) hipLaunchKernelGGL((kernel<1, Waves>), dim3(gx, pl.gy), dim3(32U * Waves), 0, stream, v);
-    if (pl.tc == 2U) hipLaunchKernelGGL((kernel<2, Waves>), dim3(gx, pl.gy), dim3(32U * Waves), 0, stream, v);
-    if (pl.tc == 4U) hipLaunchKernelGGL((kernel<4, Waves>), dim3(gx, pl.gy), dim3(32U * Waves), 0, stream, v);
+    if (pl.tc == 1U) k(std::integral_constant<unsigned, 1U>{}, grid(pl.gy), v);
+    if (pl.tc == 2U) k(std::integral_constant<unsigned, 2U>{}, grid(pl.gy), v);
+    if (pl.tc == 4U) k(std::integral_constant<unsigned, 4U>{}, grid(pl.gy), v);
+}
+template <unsigned Waves> inline void launch(View v, hipStream_t stream) {
+    launch_plan<Waves>(v, [&](auto tc, dim3 grid, const View& w) {
+        hipLaunchKernelGGL((kernel<decltype(tc)::value, Waves>), grid, dim3(32U * Waves), 0, stream, w);
+    });
 }
 
 // Caller checks supported(v) and the launch error (hipGetLastError).
 inline void enqueue(const View& v, hipStream_t stream, unsigned waves = 0U) {
     if (waves_for(v.rows, v.in, waves) == 16U) launch<16>(v, stream);
     else launch<8>(v, stream);
+}
+// x16 form of enqueue: xt = enqueue_x16_tiles(v.x, xt, v.rows, v.in) of the same x (x16_bytes(rows, in)); same bits.
+inline void enqueue_x16(const View& v, const _Float16* xt, hipStream_t stream, unsigned waves = 0U) {
+    const auto go = [&](auto wv) {
+        constexpr unsigned W = decltype(wv)::value;
+        launch_plan<W, true>(v, [&](auto tc, dim3 grid, const View& w) {
+            hipLaunchKernelGGL((kernel_x16<decltype(tc)::value, W>), grid, dim3(32U * W), 0, stream, w, xt);
+        });
+    };
+    if (waves_for(v.rows, v.in, waves) == 16U) go(std::integral_constant<unsigned, 16U>{});
+    else go(std::integral_constant<unsigned, 8U>{});
+}
+// Where the x16 form was measured faster on gfx1151 (hd4 probe, 512 rows, tile pass included): FP32 x above 16 MiB
+// (17408 -> 5120: 3163 -> 2266 us; x = 35.6 MB is re-read from DRAM by each of the 20 column blocks, the FP16 tiles fit
+// the 32 MB MALL) and n >= 10240 (5120 -> 17408: 2202 -> 2121 us, 5120 -> 10240: 1305 -> 1246 us). Narrower shapes keep
+// the direct form until measured; so do windows below the measured 512 rows.
+inline bool x16_pays(unsigned rows, unsigned in, unsigned n) {
+    return rows >= 512U && (n >= 10240U || std::uint64_t(rows) * in * 4U > (std::uint64_t(16) << 20U));
 }
 }  // namespace strix::core::f16_dense_tall::iu4a16
