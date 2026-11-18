@@ -240,6 +240,44 @@ void pricing_tests() {
     BP_CHECK(near(sp::break_even_emitted(10.40, 23.37, 2.43), 2.481, 0.001), "break-even");
     BP_CHECK(near(sp::expected_emitted(0.75, 6), 3.2881, 1e-4) && sp::expected_emitted(0.5, 1) == 1.0, "emitted");
 }
+
+// HY4 verify seed table: bytes give the shape, the measured plain wall (57.7 ms, EXACT one node) the scale. Invariant:
+// priced with the measured DFly2 survival (CPU reference), prose never pays for 3+ verify rows and copy-heavy text does.
+void seed_tests() {
+    const sp::MoeVerifyBytes m = sp::hy4_verify_bytes();
+    BP_CHECK(near(sp::verify_gb(m, 1), 10.56, 0.01), "hy4 plain bytes %.4f (trace 10.56)", sp::verify_gb(m, 1));
+    BP_CHECK(near(m.expert_gb * 1e3, 4.5896, 1e-3), "expert MB %.4f", m.expert_gb * 1e3);
+    const std::vector<double> ms = sp::moe_verify_seed_ms(m, 57.7, 207.0, 8);
+    BP_CHECK(ms.size() == 8U && near(ms[0], 57.7, 1e-9), "row 1 = plain wall %.4f", ms[0]);
+    for (std::size_t r = 1; r < ms.size(); ++r) BP_CHECK(ms[r] > ms[r - 1], "monotone at %zu", r + 1);
+    // Each extra row reads ~15 new experts of 41 layers: +12..+15 ms per row, verify(4) ~ 1.7 x plain (not ~1.1 x).
+    BP_CHECK(ms[1] - ms[0] > 12.0 && ms[1] - ms[0] < 15.0, "row 2 marginal %.3f", ms[1] - ms[0]);
+    BP_CHECK(ms[3] > 1.6 * ms[0] && ms[3] < 1.8 * ms[0], "verify(4) %.3f", ms[3]);
+    const double prose[5] = {0.53, 0.10, 0.02, 0.0, 0.0}, golden[5] = {0.90, 0.83, 0.66, 0.45, 0.21};
+    const double draft_ms = 13.0;  // DFly2 device pass prior: 2.43 GB at ~207 GB/s + launches
+    const auto best = [&](const double (&run)[5], double& score) {
+        std::uint32_t pick = 1;
+        score = 1.0 / ms[0];
+        double emitted = 1.0;
+        for (std::uint32_t r = 2; r <= 6; ++r) {
+            emitted += run[r - 2];
+            const double s = emitted / (ms[r - 1] + draft_ms);
+            if (s > score) score = s, pick = r;
+        }
+        return pick;
+    };
+    double sp_, sg = 0.0;
+    const std::uint32_t rp = best(prose, sp_), rg = best(golden, sg);
+    std::printf("hy4 seeds ms R1..8:");
+    for (const double v : ms) std::printf(" %.1f", v);
+    std::printf("\nhy4 best rows: prose %u (%.1f tok/s), golden %u (%.1f tok/s), plain %.1f\n", rp, 1e3 * sp_, rg, 1e3 * sg,
+                1e3 / ms[0]);
+    BP_CHECK(rp <= 2U && 1e3 * sp_ < 1.10 * 1e3 / ms[0], "prose picks %u at %.2f tok/s", rp, 1e3 * sp_);
+    BP_CHECK(rg >= 4U && rg <= 6U && sg > 1.6 / ms[0], "golden picks %u at %.2f tok/s", rg, 1e3 * sg);
+    bool threw = false;
+    try { (void)sp::moe_verify_seed_ms(m, 40.0, 207.0, 4); } catch (const std::invalid_argument&) { threw = true; }
+    BP_CHECK(threw, "bytes above the plain wall must throw");
+}
 }  // namespace
 
 int main() {
@@ -247,6 +285,7 @@ int main() {
     cost_tests();
     prefix_tests();
     pricing_tests();
+    seed_tests();
     controller_tests();
     std::printf("spec block_parallel tests PASS\n");
     return 0;

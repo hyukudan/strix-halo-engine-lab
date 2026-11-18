@@ -135,4 +135,18 @@ struct MoeVerifyBytes {
 // Mean emitted tokens per step for per-depth acceptance alpha and `rows` verify rows: sum_{i<rows} alpha^i.
 [[nodiscard]] double expected_emitted(double alpha, std::uint32_t rows);
 
+// Verify seed table of the Arbiter (BlockDrafter::seed_verify_ms / Arbiter::seed_cost) from the bytes of a routed-MoE
+// verify pass: ms[R - 1] = fixed + verify_gb(m, R) / gbps for R = 1 .. max_rows, where fixed = plain_ms - verify_gb(m, 1)
+// / gbps is the measured non-streaming part of a plain step (launch boundaries, host). A sparse MoE (top_k << experts)
+// pays nearly one new expert set per extra row, so its curve is steep where a dense target's is flat; seeding it flat
+// makes the seeded-cost Arbiter (fixed_costs) over-draft on low-acceptance text. Scheduling only: tokens never change.
+// gbps in GB/s, ms in ms. Throws std::invalid_argument when plain_ms or gbps is not > 0, max_rows is 0 or the bytes of
+// one row exceed the plain wall at gbps.
+[[nodiscard]] std::vector<double> moe_verify_seed_ms(const MoeVerifyBytes& m, double plain_ms, double gbps,
+                                                    std::uint32_t max_rows);
+// HY4-flash target, one node (pack geometry + decode kernel trace): non-expert bytes read once per pass (Q8_0 Linears,
+// absorbed K_b / V_b, BF16 head, F32 router), selected K/V per row, one routed expert of one layer (Q4_K gate + up
+// 1536 x 1536 each, Q6_K down 1536 x 1536 = 4.59 MB), 512 experts top 16 on 41 MoE layers.
+[[nodiscard]] MoeVerifyBytes hy4_verify_bytes();
+
 }  // namespace strix::spec
