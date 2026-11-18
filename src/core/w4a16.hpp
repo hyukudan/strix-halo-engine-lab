@@ -21,6 +21,8 @@ using Float2 = float __attribute__((ext_vector_type(2)));
 // completion waits. Preserve the local address space explicitly for dot staging.
 using LocalFloat2 = Float2 __attribute__((address_space(3)));
 using U4 = std::uint32_t __attribute__((ext_vector_type(4)));
+// Constant address space: wave-uniform loads through it are scalar (s_load, lgkmcnt).
+using ConstU32 = const std::uint32_t __attribute__((address_space(4)));
 
 // Nibbles at bit s and 16 + s of w as FP16 pair (exact): ((n ^ 8) | 0x6400) = 1024 + n + 8 (two's complement n), - 1032.
 __device__ __forceinline__ Half2 nibble_pair(std::uint32_t w, unsigned s) {
@@ -52,7 +54,13 @@ __device__ __forceinline__ float dot8(std::uint32_t w, const Half2 (&p)[4], floa
 // ChunkedRows bounds activation scheduling to four rows while reusing each
 // decoded weight stage for every row. StoreDots optionally keeps group dots in
 // caller-provided R*32 Float2 LDS elements per wave, preserving their FP32 bits.
-template<int R, unsigned KPS, unsigned MaxG, bool ChunkedRows = false, bool StoreDots = false, class Emit>
+// UniformX: xs is global memory in the pre-paired layout (core/iu4_x_pairs.hpp) that no wave writes during the kernel,
+// and k0 / xs / xs_stride are wave-uniform (the caller passes a readfirstlane wave index). The activation words are then
+// read with scalar loads (constant address space): every lane needs the same words, so they belong in SGPRs, they are
+// already the dot2 operands (no per-row pairing), and their waits use lgkmcnt instead of vmcnt. On the vector path each row's broadcast global load sits behind the weight ring
+// refills in the in-order vmcnt queue, so its s_waitcnt vmcnt(0) also waits for the DRAM refills of the next k-tiles
+// (prefetch defeated once per row and k-tile). Same operands, same dot2 order: bitwise equal to UniformX = false.
+template<int R, unsigned KPS, unsigned MaxG, bool ChunkedRows = false, bool StoreDots = false, bool UniformX = false, class Emit>
 __device__ __forceinline__ void wave_rows(const std::uint8_t* wq, const std::uint16_t* ws, unsigned N, unsigned K, unsigned k0,
                                           unsigned k1, unsigned col0, const _Float16* xs, unsigned xs_stride, unsigned lane,
                                           unsigned nrows, Emit&& emit, Float2* staged_dot = nullptr) {
@@ -96,6 +104,19 @@ __device__ __forceinline__ void wave_rows(const std::uint8_t* wq, const std::uin
             for (unsigned q = 0; q < 4U; ++q)
 #pragma unroll
                 for (unsigned j = 0; j < 4U; ++j) wn[q][j] = nibble_pair(wv[q], 4U * j);
+            // UniformX: every row's words of this k-tile are requested before the first is used (scalar loads complete
+            // out of order, so each use waits lgkmcnt(0): one exposed latency per k-tile instead of one per row).
+            [[maybe_unused]] std::uint32_t xw[UniformX ? R : 1][8];
+            if constexpr (UniformX) {
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    if (static_cast<unsigned>(r) >= nrows) break;
+                    const auto* xr = (const ConstU32*)(x32) +  // address-space cast (C-style only)
+                                     (static_cast<std::size_t>(r) * xs_stride + (k + t - k0) * 16U) / 2U;
+#pragma unroll
+                    for (unsigned j = 0; j < 8U; ++j) xw[r][j] = xr[j];
+                }
+            }
 #pragma unroll
             for (int h = 0; h < R; h += Chunk) {
 #pragma unroll
@@ -109,11 +130,19 @@ __device__ __forceinline__ void wave_rows(const std::uint8_t* wq, const std::uin
                         dot[d][0] = previous[0]; dot[d][1] = previous[1];
                     } else dot[d][0] = dot[d][1] = 0.0F;
                 }
-                const auto* xr = x32 + (static_cast<std::size_t>(row) * xs_stride + (k + t - k0) * 16U) / 2U;
-                const std::uint32_t lo[4] = {xr[0], xr[1], xr[2], xr[3]}, hi[4] = {xr[4], xr[5], xr[6], xr[7]};
                 Half2 pl[4], ph[4];
-                pair_activations(lo, pl);
-                pair_activations(hi, ph);
+                if constexpr (UniformX) {  // pre-paired words (core/iu4_x_pairs.hpp): already the dot2 operands
+#pragma unroll
+                    for (unsigned j = 0; j < 4U; ++j) {
+                        pl[j] = __builtin_bit_cast(Half2, xw[row][j]);
+                        ph[j] = __builtin_bit_cast(Half2, xw[row][4U + j]);
+                    }
+                } else {
+                    const auto* xr = x32 + (static_cast<std::size_t>(row) * xs_stride + (k + t - k0) * 16U) / 2U;
+                    const std::uint32_t lo[4] = {xr[0], xr[1], xr[2], xr[3]}, hi[4] = {xr[4], xr[5], xr[6], xr[7]};
+                    pair_activations(lo, pl);
+                    pair_activations(hi, ph);
+                }
 #pragma unroll
                 for (unsigned j = 0; j < 4U; ++j) {
                     dot[d][0] = __builtin_amdgcn_fdot2(wn[0][j], pl[j], dot[d][0], false);
