@@ -479,15 +479,16 @@ static void r1_glue_tail() {
             static_cast<void*>(status), static_cast<void*>(output), record}) check(hipFree(p), "tail free");
 }
 // STRIX_MOE_R1_TAIL_FOLD: the A8 down launch with the in-launch slot merge (SlotMergeTail) against the same down
-// launch without it followed by the incumbent one-CTA tail, on the real rawdots of every down kernel (Q5_1, Q8_0,
-// Q2_0, IQ4_NL). Bytes of rawdots, accumulation, output, status, aggregate and the first-error record equal; the
+// launch without it followed by the incumbent one-CTA tail, on the real rawdots of the down kernels: Q5_1 and Q8_0;
+// with r1-slot-merge-tail-gsq (run under STRIX_GSQ_Q20_A8=1) also Q2_0 and IQ4_NL. Bytes of rawdots, accumulation, output, status, aggregate and the first-error record equal; the
 // ticket words are zero afterwards. Cases of r1_glue_tail moved to inputs the down launch keeps: sticky status,
 // +inf / NaN / BF16-overflowing route weights, an invalid route, an already-set record, -0 weights, K = 1 and K = 7.
-static void r1_slot_merge_tail() {
+static void r1_slot_merge_tail(bool gsq_types) {
     namespace a8 = strix::moe_q4k_a8;
     namespace sm = strix::moe_slot_merge;
     constexpr std::uint32_t hidden = 512U, width = 256U, experts = 4U, max_k = 10U;
     constexpr std::array<std::uint32_t, 4> types{7U, 8U, 42U, 20U};
+    const std::size_t type_count = gsq_types ? types.size() : 2U;  // Q2_0 / IQ4_NL down need STRIX_GSQ_Q20_A8=1
     const std::uint64_t row_bytes_max = a8::down_row_bytes(8U, width);
     const std::size_t weight_bytes_max = static_cast<std::size_t>(experts) * hidden * row_bytes_max;
     const std::uint32_t words = sm::ticket_words(hidden);
@@ -512,7 +513,7 @@ static void r1_slot_merge_tail() {
     std::uint32_t seed = 0x51a7U;
     const auto next = [&] { seed = seed * 1664525U + 1013904223U; return seed; };
     for (std::uint32_t c = 0; c < 10U; ++c) {
-        const std::uint32_t type = types[c % types.size()];
+        const std::uint32_t type = types[c % type_count];
         const std::uint32_t top_k = c == 8U ? 1U : c == 9U ? 7U : max_k;
         const std::uint64_t weight_bytes = static_cast<std::uint64_t>(experts) * hidden * a8::down_row_bytes(type, width);
         // Every byte below 0x40: each f16 scale or offset the decoders read is finite and below 2.
@@ -604,8 +605,8 @@ int main(int argc, char** argv) try {
         r1_glue_tail();
         return failures == 0 ? 0 : 1;
     }
-    if (argc > 2 && std::string(argv[2]) == "r1-slot-merge-tail") {
-        r1_slot_merge_tail();
+    if (argc > 2 && (std::string(argv[2]) == "r1-slot-merge-tail" || std::string(argv[2]) == "r1-slot-merge-tail-gsq")) {
+        r1_slot_merge_tail(std::string(argv[2]) == "r1-slot-merge-tail-gsq");
         return failures == 0 ? 0 : 1;
     }
 #endif
