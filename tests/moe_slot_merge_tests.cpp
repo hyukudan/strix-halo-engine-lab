@@ -138,6 +138,7 @@ void run_case(std::mt19937& rng, std::uint32_t hidden, std::uint32_t top_k, int 
     if (mode == 2) s.status = 2U;                                                         // entry error: no merge
     if (mode == 3) { s.rawdots[5] = 3.3e38F; s.weights[0] = 1.0F; }                       // rounds to bf16 inf
     if (mode == 4) { s.routes[top_k - 1U] = s.experts; s.status = 1U; }                   // invalid route
+    if (mode == 5) s.routes[top_k / 2U] = s.experts;                                      // invalid route, clean status
     Result seed;
     seed.accumulation.assign(hidden, 0.0F);
     seed.output.assign(hidden, 0x5555U);
@@ -169,9 +170,9 @@ int main() {
     expect(sm::bf16_rne(0x3f808000U) == 0x3f80U && sm::bf16_rne(0x3f818000U) == 0x3f82U, "bf16 ties to even");
     const std::uint32_t shapes[][2] = {{2560U, 10U}, {2048U, 8U}, {256U, 1U}, {1024U, 4U}, {2560U, 1U}};
     for (const auto& shape : shapes)
-        for (int mode = 0; mode < 5; ++mode) {
+        for (int mode = 0; mode < 6; ++mode) {
             static const char* names[] = {"clean step bitwise", "nonfinite -> status 8, no commit",
-                "entry status -> no merge", "bf16 overflow fails commit", "invalid route"};
+                "entry status -> no merge", "bf16 overflow fails commit", "invalid route", "invalid route, clean status"};
             run_case(rng, shape[0], shape[1], mode, names[mode]);
         }
     if (failures != 0) {

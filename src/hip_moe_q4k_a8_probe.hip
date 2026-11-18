@@ -719,27 +719,40 @@ __device__ void slot_merge_epilogue(const SlotMergeTail& t,const float* rawdots,
     unsigned* status,unsigned hidden,unsigned experts) {
     namespace sm=strix::moe_slot_merge;
     if(t.tickets==nullptr) return;
-    __shared__ unsigned last,initial,flagged;
+    __shared__ unsigned last,initial,flagged,first_invalid;
+    __shared__ float slot_weight[sm::max_slots];
     __threadfence(); // every writing lane releases its partials device-wide
     __syncthreads();
     if(threadIdx.x==0) {
         __threadfence(); // and orders them before this block's ticket
         last=sm::last_arrival(atomicAdd(&t.tickets[blockIdx.x],1U),gridDim.y)?1U:0U;
+        first_invalid=gridDim.y;
     }
     __syncthreads();
     if(last==0U) return;
     __threadfence(); // acquire: every slot partial of this row tile is visible
     if(threadIdx.x==0) initial=*static_cast<volatile unsigned*>(status);
+    // One parallel load of the route weights and the first invalid route (the kernel wrote global memory, so these
+    // are vector loads: staged once instead of one dependent round trip per slot).
+    if(threadIdx.x<gridDim.y) {
+        slot_weight[threadIdx.x]=t.route_weights[threadIdx.x];
+        if(routes[threadIdx.x]>=experts) atomicMin(&first_invalid,threadIdx.x);
+    }
     __syncthreads();
     if(initial==0U && threadIdx.x<sm::tile_rows) {
         const unsigned out=blockIdx.x*sm::tile_rows+threadIdx.x;
+        // The incumbent loop stops at the first invalid route and then writes nothing: the same outcome.
+        const bool written=first_invalid==gridDim.y;
         float current=0.0F;
-        bool written=true;
-        for(unsigned slot=0;slot<gridDim.y;++slot) {
-            if(routes[slot]>=experts) {written=false;break;}
-            const float weight=t.route_weights[slot];
-            const float dot=rawdots[static_cast<std::uint64_t>(slot)*hidden+out];
-            asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(current) : "s"(weight), "v"(dot));
+        if(written) {
+            float dots[sm::max_slots];
+#pragma unroll
+            for(unsigned slot=0;slot<sm::max_slots;++slot)
+                if(slot<gridDim.y) dots[slot]=rawdots[static_cast<std::uint64_t>(slot)*hidden+out];
+#pragma unroll
+            for(unsigned slot=0;slot<sm::max_slots;++slot)
+                if(slot<gridDim.y) // incumbent roles: weight src0, partial src1, accumulator +0-seeded
+                    asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(current) : "v"(slot_weight[slot]), "v"(dots[slot]));
         }
         if(written) t.accumulation[out]=current;
         const float value=written?current:t.accumulation[out];
@@ -820,8 +833,8 @@ void enqueue_down_activation_quantize(const DownRequest& r,const DownBindings& b
 void enqueue_down_rawdots(const DownRequest& r,const DownBindings& b,const SlotMergeTail& tail,hipStream_t stream) {
     down_admit(r,b,stream);
     if(tail.tickets && (!tail.route_weights || !tail.accumulation || !tail.output || !tail.record ||
-        r.shape.hidden%strix::moe_slot_merge::tile_rows!=0U))
-        throw std::invalid_argument("A8 down slot-merge tail requires weights, accumulation, output, record and H % 64 == 0");
+        r.shape.hidden%strix::moe_slot_merge::tile_rows!=0U || r.shape.top_k>strix::moe_slot_merge::max_slots))
+        throw std::invalid_argument("A8 down slot-merge tail requires weights, accumulation, output, record, H % 64 == 0, K <= 16");
     if(r.weight_type==gsq_a8::type_iq4_nl) {
         down_rawdots_iq<gsq_a8::type_iq4_nl><<<dim3(r.shape.hidden/64U,r.shape.top_k),256,0,stream>>>(
             reinterpret_cast<const unsigned char*>(b.weights.address),reinterpret_cast<const unsigned*>(b.routes.address),

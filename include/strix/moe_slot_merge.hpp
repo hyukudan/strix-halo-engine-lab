@@ -22,6 +22,8 @@ namespace strix::moe_slot_merge {
 
 // Output rows owned by one down block (one row tile of the ticket).
 inline constexpr std::uint32_t tile_rows = 64U;
+// Most slots one merge stages in registers (the runtime admits top_k <= 10).
+inline constexpr std::uint32_t max_slots = 16U;
 // Status bit the incumbent tail ORs in when any output fails the commit threshold.
 inline constexpr std::uint32_t nonfinite_status = 8U;
 

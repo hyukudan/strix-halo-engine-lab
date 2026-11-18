@@ -1506,7 +1506,8 @@ void launch_q4k_a8_typed(const HipMoeExpertsLauncherConfig& config,
         moe_r1_glue_fuse_enabled();
     // The slot-merge tickets directly follow the status word, so the same prologue clear zeroes them.
     const bool tail_fold = glue_fuse && layout.ticket_offset == layout.status_offset + 4U &&
-        layout.ticket_bytes == 4ULL * moe_slot_merge::ticket_words(config.hidden_size) && moe_r1_tail_fold_enabled();
+        layout.ticket_bytes == 4ULL * moe_slot_merge::ticket_words(config.hidden_size) &&
+        config.top_k <= moe_slot_merge::max_slots && moe_r1_tail_fold_enabled();
     if (glue_fuse) {
         moe_q4k_a8::enqueue_serial_prologue_probe(request,bindings,accumulation,
             static_cast<unsigned>((layout.accumulation_bytes + (tail_fold ? 4U + layout.ticket_bytes : 0U)) / 4U),
