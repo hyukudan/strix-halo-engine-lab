@@ -101,7 +101,9 @@ __device__ __forceinline__ void wave_rows(const std::uint8_t* wq, const std::uin
         constexpr int XRows = UniformX && R > OperandRows ? OperandRows : R;
         static_assert(R % XRows == 0, "activation chunks cover the rows bucket");
         constexpr int Chunk = ChunkedRows ? 4 : XRows;
-        static_assert(XRows % Chunk == 0, "row chunks nest inside activation chunks");
+        // UniformX indexes xw by the row inside its activation chunk: row chunks must nest inside it. (The vector form
+        // keeps its previous loop: one activation chunk, row chunks of 4 may pass a bucket under 4 rows.)
+        static_assert(!UniformX || XRows % Chunk == 0, "row chunks nest inside activation chunks");
         float dot[StoreDots ? Chunk : R][2] = {};
 #pragma unroll
         for (unsigned t = 0; t < 4U; ++t) {
