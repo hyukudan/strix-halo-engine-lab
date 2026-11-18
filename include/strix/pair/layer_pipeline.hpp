@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "strix/pair/pipe.hpp"
+#include "strix/pair/stage_map.hpp"
 
 namespace strix::pair::layers {
 inline constexpr std::uint64_t seam_magic = 0x31454e4950594c53ULL;   // "SLYPINE1"
@@ -88,6 +89,10 @@ struct StageOps {
     std::function<void(PipeFrame& frame, bool save, std::size_t bytes)> seam;
     std::function<void()> fence;
     std::size_t row_bytes = 0;
+    // Interleaved stages (prefill over a StageMap, below): run layers [first, last) for one window; first == 0 embeds
+    // `tokens`, a later range finds its rows loaded by `seam`. Not used by the Placement form.
+    std::function<void(std::span<const std::uint32_t> tokens, const Window& window, std::uint32_t first, std::uint32_t last,
+                       bool head)> range;
 };
 struct PrefillStats {
     double wait_ms = 0, seal_ms = 0, total_ms = 0;
@@ -174,6 +179,8 @@ struct DecodeOps {
     std::function<void(std::span<std::byte>)> export_row;        // synchronizes
     std::function<void(std::span<const std::byte>)> import_row;  // host bytes stay valid until the next forward returns
     std::size_t row_bytes = 0;
+    // Interleaved stages (decode over a StageMap, below): one row through layers [first, last); first == 0 embeds `token`.
+    std::function<void(std::uint32_t token, std::uint32_t first, std::uint32_t last, bool head)> range;
 };
 struct DecodeStats { std::vector<std::uint32_t> ids; double total_ms = 0; };
 
@@ -308,6 +315,138 @@ inline RelayStats relay_state(const Placement& p, std::uint32_t decoder, std::ui
         if (received + mine != p.cuts.back() || !token) throw std::runtime_error("state relay: decoder did not receive every layer");
     }
     out.ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+    return out;
+}
+
+// Interleaved virtual stages on two ranks (strix/pair/stage_map.hpp): the 2v stages of a StageMap alternate between the
+// ranks (stage s on rank s % 2) and every layer's sequence state stays with the rank that owns its stage, in prefill AND
+// decode. Each rank runs its (stage, chunk) steps in the shared StagePipes order (groups of chunks, depth-first); every
+// stage still takes the windows in prompt order, so each layer sees the same windows in the same order as the
+// single-rank path: the bits equal the one-node prefill at the same width. Fill + drain cost one stage (P / 2v) instead
+// of one half-pass (P / 2): wall ~ chunks x P / 2 + P / 2v + hops (regime.hpp interleaved_wall_ms).
+// Whole-layer cuts only: a half cut splits a layer inside the engine and is not a layer range.
+inline void check_stage_map(const StageMap& map, unsigned rank, bool range_bound) {
+    map.validate(map.layers());
+    if (rank > 1U) throw std::invalid_argument("layer pipeline: a stage map runs on ranks 0 and 1");
+    if (!range_bound) throw std::invalid_argument("layer pipeline: a stage map needs the engine's range hook");
+    for (const auto& cut : map.cuts)
+        if (cut.half) throw std::invalid_argument("layer pipeline: stage maps run whole-layer cuts (a half cut is not a layer range)");
+}
+
+// Consumer-side header check of a StageMap seam (StagePipes checks [42]-[44] first): the cut word names the boundary's cut.
+inline std::function<std::size_t(const PipeHeader&, std::uint64_t)> stage_validator(
+    std::uint64_t identity, const StageMap& map, std::uint32_t max_rows, std::size_t row_bytes) {
+    return [=](const PipeHeader& h, std::uint64_t sequence) {
+        const std::uint64_t boundary = map.stages() > 2U ? h[43] : 0U;   // wire v3 (v = 1) has the one boundary
+        if (h[w_magic] != seam_magic || h[1] != sequence || boundary + 1U >= map.stages() ||
+            h[w_cut] != map.cuts[static_cast<std::size_t>(boundary) + 1U].wire() || h[w_identity] != identity ||
+            h[w_rows] == 0U || h[w_rows] > max_rows || h[w_bytes] != h[w_rows] * row_bytes)
+            throw std::runtime_error("layer pipeline stage seam header mismatch (model, plan, prompt, cut or window)");
+        return static_cast<std::size_t>(h[w_bytes]);
+    };
+}
+
+// One prefill on this rank over `pipes` (built for the same map with chunks == windows(prompt, width).size() and
+// options.validate = stage_validator). Engine hooks: ops.range (layers of one stage), ops.seam, ops.fence.
+inline PrefillStats prefill(const StageMap& map, unsigned rank, std::span<const std::uint32_t> prompt, std::uint32_t width,
+                            std::uint64_t identity, StagePipes& pipes, const StageOps& ops) {
+    using Clock = std::chrono::steady_clock;
+    const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+    check_stage_map(map, rank, static_cast<bool>(ops.range));
+    const auto ws = windows(prompt.size(), width);
+    if (pipes.chunks() != ws.size() || pipes.map().fnv() != map.fnv())
+        throw std::invalid_argument("layer pipeline: stage pipes were built for another map or window count");
+    const std::uint32_t last_stage = map.stages() - 1U;
+    PrefillStats stats;
+    stats.window_ms.assign(ws.size(), 0.0);
+    const auto begin = Clock::now();
+    for (const auto step : pipes.order()) {
+        const auto& win = ws[static_cast<std::size_t>(step.chunk)];
+        const auto tokens = prompt.subspan(win.start, win.rows);
+        const auto bytes = std::size_t(win.rows) * ops.row_bytes;
+        const auto t0 = Clock::now();
+        if (step.stage > 0U) {
+            const std::uint32_t boundary = step.stage - 1U;
+            auto& frame = pipes.acquire_in(step.chunk, boundary);
+            stats.wait_ms += ms(Clock::now() - t0);
+            const auto& h = frame.header;
+            if (h[w_start] != win.start || h[w_rows] != win.rows || h[w_tokens] != fnv(14695981039346656037ULL, tokens))
+                throw std::runtime_error("layer pipeline stage seam window does not match this stage's window (position, rows, tokens)");
+            ops.seam(frame, false, bytes);
+            ops.fence();            // the slot is reused only after its rows are in the engine
+            pipes.release_in(step.chunk, boundary);
+        }
+        ops.range(tokens, win, map.cuts[step.stage].layer, map.cuts[step.stage + 1U].layer,
+                  step.stage == last_stage && step.chunk + 1U == ws.size());
+        if (step.stage < last_stage) {
+            const auto s0 = Clock::now();
+            auto& frame = pipes.acquire_out(step.chunk, step.stage);   // StagePipes owns [1], [41], [43], [44]
+            auto& h = frame.header;
+            h[w_magic] = seam_magic; h[w_start] = win.start; h[w_rows] = win.rows; h[w_bytes] = bytes; h[w_identity] = identity;
+            h[w_tokens] = fnv(14695981039346656037ULL, tokens); h[w_cut] = map.cuts[step.stage + 1U].wire();
+            frame.resize(bytes);
+            ops.seam(frame, true, bytes);
+            if (frame.staging) frame.staging->seal(bytes);
+            pipes.release_out(step.chunk, step.stage);
+            stats.seal_ms += ms(Clock::now() - s0);
+        }
+        stats.window_ms[static_cast<std::size_t>(step.chunk)] += ms(Clock::now() - t0);
+    }
+    pipes.finish();
+    stats.total_ms = ms(Clock::now() - begin);
+    return stats;
+}
+
+// Greedy decode over the same map: per token the row visits the 2v stages in order (one hop per boundary: 4 header words
+// + one row, CRC), then the head rank (the last stage is odd: rank 1) relays the token to rank 0. `peer`: ordered duplex
+// link to the other rank (after StagePipes::finish()). 2v hops per token instead of 2: the planner charges decode tokens.
+inline DecodeStats decode(const StageMap& map, unsigned rank, std::uint32_t first_token, std::uint32_t count, const Link& peer,
+                          const DecodeOps& ops) {
+    check_stage_map(map, rank, static_cast<bool>(ops.range));
+    const std::uint32_t stages = map.stages();
+    const bool head_rank = map.owner(stages - 1U) == rank;
+    std::vector<std::byte> message(32U + ops.row_bytes);   // 4 header words + one row
+    const auto relay = [&](std::uint32_t token, std::uint64_t step) {
+        std::uint64_t words[4] = {token_magic, step, token, 0};
+        if (head_rank) {
+            peer.send(std::as_bytes(std::span(words)));
+            return token;
+        }
+        peer.receive(std::as_writable_bytes(std::span(words)));
+        if (words[0] != token_magic || words[1] != step || words[3] != 0U) throw std::runtime_error("layer pipeline token relay out of order");
+        return static_cast<std::uint32_t>(words[2]);
+    };
+    using Clock = std::chrono::steady_clock;
+    const auto start = Clock::now();
+    DecodeStats out;
+    if (count == 0U) return out;
+    std::uint32_t token = relay(head_rank ? first_token : 0U, 0U);
+    out.ids.push_back(token);
+    for (std::uint64_t step = 1; step < count; ++step) {
+        for (std::uint32_t s = 0; s < stages; ++s) {
+            if (map.owner(s) != rank) continue;
+            if (s > 0U) {
+                peer.receive(message);
+                std::uint64_t h[4];
+                std::memcpy(h, message.data(), sizeof h);
+                SeamCrc crc; crc.update(std::span(message).subspan(32U));
+                if (h[0] != hidden_magic || h[1] != step * stages + s - 1U || h[2] != ops.row_bytes || h[3] != crc.value())
+                    throw std::runtime_error("layer pipeline decode row mismatch (order, size or CRC)");
+                ops.import_row(std::span<const std::byte>(message).subspan(32U));
+            }
+            ops.range(token, map.cuts[s].layer, map.cuts[s + 1U].layer, s + 1U == stages);
+            if (s + 1U < stages) {
+                ops.export_row(std::span(message).subspan(32U));
+                SeamCrc crc; crc.update(std::span<const std::byte>(message).subspan(32U));
+                const std::uint64_t h[4] = {hidden_magic, step * stages + s, ops.row_bytes, crc.value()};
+                std::memcpy(message.data(), h, sizeof h);
+                peer.send(message);
+            }
+        }
+        token = relay(head_rank ? ops.top() : 0U, step);
+        out.ids.push_back(token);
+    }
+    out.total_ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
     return out;
 }
 } // namespace strix::pair::layers
