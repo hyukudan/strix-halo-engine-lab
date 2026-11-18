@@ -662,6 +662,20 @@ struct HipEngine::Impl {
         if (!opt.quiet)
             std::printf("loaded %.2f GiB (layers %u, hidden %u, vocab %u, GDN layers %u)\n", double(loader.total()) / double(1ULL << 30),
                         cfg.layers, H, V, n_gdn);
+        {  // EXACT wide windows only over IU4 large dense projections (qwen35::resolve_prefill_rows)
+            const Tensor* other = nullptr;
+            const auto note = [&](const Tensor& t) { if (!other && t.data && t.fmt != kIu4Fmt) other = &t; };
+            for (unsigned l = own_begin; l < own_end; ++l) {
+                const auto& y = L[l];
+                for (const Tensor* t : {&y.gate, &y.up, &y.down, &y.qkv, &y.z, &y.out, &y.q, &y.k, &y.v, &y.o}) note(*t);
+            }
+            note(head);
+            const unsigned requested = opt.prefill_rows;
+            opt.prefill_rows = qwen35::resolve_prefill_rows(requested, opt.wide_exact, other == nullptr);
+            if (!opt.quiet && opt.prefill_rows != requested)
+                std::printf("prefill windows: %u -> %u rows (EXACT wide windows need IU4 dense projections; a format %u tensor is loaded)\n",
+                            requested, opt.prefill_rows, other->fmt);
+        }
         const unsigned RS = std::max(kMaxRows, opt.prefill_rows);  // scratch rows (wide prefill windows)
         auto fm = [&](float** p, std::size_t n) { alloc0(p, n * RS * 4U); };
         fm(&x, H); fm(&xn, H); fm(&qkv, GC); fm(&z, GV); fm(&beta, GH); fm(&gate, GH); fm(&core, GV); fm(&proj, H);

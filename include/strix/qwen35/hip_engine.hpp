@@ -45,6 +45,15 @@ struct HipEngineOptions {
     std::uint32_t layer_end = 0;
 };
 
+// Window rows the engine uses for a requested forward_commit width. EXACT wide windows (wide_exact, rows > 16) were
+// measured on IU4 dense projections only (Strix 27B IU4: every large projection and the head IU4, ssm_alpha / ssm_beta
+// Q8_0). When any large dense projection the engine loads is in another format (all_large_iu4 false) the window
+// resolves to the 16-row exact form: the rows are bitwise the same either way, only the unmeasured wide form is not
+// taken. Provisional until an identity + timing ticket on a Q8_0 or BF16 27B file. The FAST class is not affected.
+[[nodiscard]] constexpr std::uint32_t resolve_prefill_rows(std::uint32_t requested, bool wide_exact, bool all_large_iu4) noexcept {
+    return wide_exact && requested > 16U && !all_large_iu4 ? 16U : requested;
+}
+
 struct HipRowsOut {
     const float* logits = nullptr;       // device [rows][vocab] (all) or [1][vocab] (last); null for none
     const std::uint32_t* top = nullptr;  // device [rows] argmax (lowest index on ties) (all) or [1] (last)
