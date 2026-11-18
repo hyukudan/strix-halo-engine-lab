@@ -347,6 +347,7 @@ struct Prefill::Impl : BlockFields {
     // open cohort window (session i at its window_offset) until commit_cohort.
     bool window = false;                       // run_block in window mode (GDN rows kept per layer, split state)
     Config::Forms executed_forms;
+    int hc_inject_exp = 0;                     // hc_mma FP16 inject operand exponent (upload_model admission; qwen_hc_fp16_range.hpp)
     bool executed_moe_route_bf16 = false;
     bool cohort_open = false;
     std::vector<SessionState*> cohort;         // the sessions of the open window, in cohort order
@@ -707,7 +708,11 @@ void Prefill::Impl::upload_model() {
                 hr::scan_inject(scan, host.data(), 4U * kWide);
             }
         if (const auto why = hr::refusal(scan); !why.empty())
-            throw std::runtime_error("hc_mma (qwen-cuda-hc-f16mma-v1) refused for this model: " + why);
+            throw std::runtime_error("hc_mma (qwen-cuda-hc-f16mma-v2) refused for this model: " + why);
+        hc_inject_exp = hr::inject_exp(scan);  // every non-zero inject weight survives FP16 (no silent drop)
+        std::fprintf(stderr, "hc_mma admission: inject |w| %.4g .. %.4g, operand shift 2^%d (%zu weights would round to FP16 zero "
+                     "and %zu to subnormals unshifted)\n", static_cast<double>(scan.inject_min_nonzero_abs),
+                     static_cast<double>(scan.inject_max_abs), hc_inject_exp, scan.inject_underflow, scan.inject_subnormal);
     }
     if(cfg.expert_arithmetic!=qwen_packs::ExpertArithmetic::incumbent && route_policy.enabled)
         qwen_route::require_composition(true,qwen_route::Composition::other_weight_pack);
@@ -1502,6 +1507,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         a.injection = injection;
         a.output = hidden;
         a.mma = cfg.forms.hc_mma && !window;  // FAST form on run()'s prefill blocks only; verify/step windows stay exact
+        a.inject_exp = hc_inject_exp;
         a.workspace_layout = hc::HcWorkspaceLayout::automatic;
         hc::hc_mix(a, tables, stream);
         executed_forms.hc_mma |= a.mma;

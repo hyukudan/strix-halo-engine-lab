@@ -43,7 +43,7 @@ inline constexpr Lever table[] = {
     {.name = "hc_mma", .env = "STRIX_QRTX_HC_MMA", .option = "--hc-mma",
      .value = {"", "1", ""}, .builtin = "0",
      .kind = Kind::bit_changing, .ready = {true, false, true}, .runnable = {false, true, false},
-     .target = "qwen-cuda-hc-f16mma-v1", .off = "0",
+     .target = "qwen-cuda-hc-f16mma-v2", .off = "0",
      .source = "hyper-connection projection/output on FP16 tensor cores, FP32 accumulation; qualification in progress; changes logits",
      .provisional = {false, true, false}},
     // Not a member of the FAST bundle (kFastBundle): it only changes the draft head, which the prompt-logit gate does not
@@ -108,7 +108,7 @@ inline std::span<const Lever> levers() { return table; }
 inline constexpr std::string_view kFastBundle = "qwen-cuda-fast-bundle-v1";
 inline constexpr std::string_view kFastBundleMembers[] = {"expert_fast", "qsa_mma", "hc_mma", "mtp_defer_prompt"};
 
-inline constexpr std::string_view kHcIdentity = "qwen-cuda-hc-f16mma-v1";
+inline constexpr std::string_view kHcIdentity = "qwen-cuda-hc-f16mma-v2";
 inline constexpr std::string_view kMtpIdentity = "qwen-cuda-mtp-f16mma-v1";
 inline constexpr std::string_view kQsaIdentity = "qwen-cuda-qsa-bf16mma-v2";
 inline constexpr std::string_view kMoeIdentity = "qwen-cuda-moe-i8fma-v1";
@@ -178,7 +178,7 @@ inline std::string forms_list(const Choice& c) {
         if (on) out += (out.empty() ? "" : ",") + std::string(name);
     return out;
 }
-// Identities of the selected forms, e.g. "qwen-cuda-hc-f16mma-v1,qwen-cuda-qsa-bf16mma-v2".
+// Identities of the selected forms, e.g. "qwen-cuda-hc-f16mma-v2,qwen-cuda-qsa-bf16mma-v2".
 inline std::string form_identities(const Choice& c) {
     std::string out;
     const auto add = [&](bool on, std::string_view id) { if (on) out += (out.empty() ? "" : ",") + std::string(id); };

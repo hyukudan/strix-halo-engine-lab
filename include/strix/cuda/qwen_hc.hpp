@@ -59,6 +59,8 @@ struct HcMixArgs {
                                            // full-occupancy kernel (same values; nullptr = fused output kernel)
     bool mma = false;                      // FAST form (Config::forms.hc_mma): projection + output on FP16 tensor cores, FP32 acc
                                            // (prefill-sized windows only; false = the exact kernels)
+    int inject_exp = 0;                    // mma only: FP16 inject operand = w * 2^inject_exp, accumulator * 2^-inject_exp
+                                           // (qwen_hc_fp16_range.hpp inject_exp; 0 = v1 rounding; the exact kernels ignore it)
     HcWorkspaceLayout workspace_layout = HcWorkspaceLayout::full;
     int output_batched = -1;               // exact fused output epilogue: -1 = lever qwen_hc_output_batched_sigmoid (default on),
                                            // 0 = per-element sigmoids, 1 = batched table gathers (same bits; test/timing seam)

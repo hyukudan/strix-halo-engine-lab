@@ -74,7 +74,7 @@ names = ['hc_mma', 'mtp_mma', 'qsa_mma', 'moe_mma']
 if set(forms) != set(names + ['moe_route_bf16']) or any(type(v) is not bool for v in forms.values()):
     raise SystemExit('invalid resolved forms')
 expert = c['expert_arithmetic']  # 'incumbent' or the expert contract (e.g. the FAST bundle's gsq-iq-bf16mma-cuda-v1)
-ids = ['qwen-cuda-hc-f16mma-v1', 'qwen-cuda-mtp-f16mma-v1',
+ids = ['qwen-cuda-hc-f16mma-v2', 'qwen-cuda-mtp-f16mma-v1',
        'qwen-cuda-qsa-bf16mma-v2', 'qwen-cuda-moe-i8fma-v1']
 form_ids = ','.join(i for n, i in zip(names, ids) if forms[n])
 contract = 'qwen-cuda;prefill=exact'

@@ -590,7 +590,7 @@ template <unsigned MT, unsigned NW, bool Compact = false>
 __global__ __launch_bounds__(NW * 32U, 1) void hc_projection_mma_kernel(const float* x_rows, std::uint32_t rows,
     const std::int8_t* __restrict__ down_codes, const float* __restrict__ down_scales, const float* __restrict__ inject,
     float* low_rows, float* __restrict__ injection, am::Tables t_, const std::uint16_t* __restrict__ xin,
-    const float* __restrict__ xnorm) {
+    const float* __restrict__ xnorm, float inj_scale, float inj_unscale) {
     using Cfg = ProjCfg<MT, NW>;
     constexpr unsigned kT = Cfg::kThreads, kBM = Cfg::kRowsCta, kNR = Cfg::kOutCta;
     constexpr unsigned kXI = (kBM * 16U + kT - 1U) / kT, kSI = (kNR + kT - 1U) / kT, kIK = (MT + NW - 1U) / NW;
@@ -663,8 +663,12 @@ __global__ __launch_bounds__(NW * 32U, 1) void hc_projection_mma_kernel(const fl
                 const float* p = inject + static_cast<std::size_t>(g) * kWide + c * 64U + b * 32U + 8U * t;
                 v0 = *reinterpret_cast<const float4*>(p); v1 = *reinterpret_cast<const float4*>(p + 4);
             }
-            iw[b][0] = v0.x; iw[b][1] = v0.y; iw[b][2] = v0.z; iw[b][3] = v0.w;
-            iw[b][4] = v1.x; iw[b][5] = v1.y; iw[b][6] = v1.z; iw[b][7] = v1.w;
+            // v2 operand shift: w * 2^e is exact in FP32 (power of two), so the FP16 rounding below is the only rounding
+            // and no non-zero weight reaches FP16 zero (qwen_hc_fp16_range.hpp); inj_scale = 1 is v1 bit for bit.
+            iw[b][0] = __fmul_rn(v0.x, inj_scale); iw[b][1] = __fmul_rn(v0.y, inj_scale);
+            iw[b][2] = __fmul_rn(v0.z, inj_scale); iw[b][3] = __fmul_rn(v0.w, inj_scale);
+            iw[b][4] = __fmul_rn(v1.x, inj_scale); iw[b][5] = __fmul_rn(v1.y, inj_scale);
+            iw[b][6] = __fmul_rn(v1.z, inj_scale); iw[b][7] = __fmul_rn(v1.w, inj_scale);
         }
     };
 
@@ -730,10 +734,12 @@ __global__ __launch_bounds__(NW * 32U, 1) void hc_projection_mma_kernel(const fl
         }
         __syncthreads();
     }
-    // Epilogue (exact kernels' FP32 code): scaled = total / 4, sigmoid.
+    // Epilogue (exact kernels' FP32 code): scaled = total / 4, sigmoid. The inject total is also unshifted: inj_unscale =
+    // 2^-(e+2), a power of two, so v * inj_unscale is v / 2^e / 4 correctly rounded (== __fdiv_rn(v, 4) when e = 0).
     const auto finish = [&](float v0, float v1, unsigned row, unsigned o, bool inj) {
         if (row >= rows) return;
-        const float s0 = __fdiv_rn(v0, static_cast<float>(kStreams)), s1 = __fdiv_rn(v1, static_cast<float>(kStreams));
+        const float s0 = inj ? __fmul_rn(v0, inj_unscale) : __fdiv_rn(v0, static_cast<float>(kStreams));
+        const float s1 = inj ? __fmul_rn(v1, inj_unscale) : __fdiv_rn(v1, static_cast<float>(kStreams));
         const float g0 = fast_sigmoid(s0), g1 = fast_sigmoid(s1);
         if (inj) {
             if (o < kStreams) {
@@ -775,7 +781,8 @@ void launch_projection_mma_c(const HcMixArgs& a, const am::Tables& tables, cudaS
     }();
     (void)attr;
     hc_projection_mma_kernel<MT, NW, Compact><<<dim3((a.rows + Cfg::kRowsCta - 1U) / Cfg::kRowsCta, 8U / NW), Cfg::kThreads, Cfg::kSmem, stream>>>(
-        a.normalized, a.rows, a.packed.down_codes, a.packed.down_scales, a.inject, a.normalized, a.injection, tables, a.input, a.norm);
+        a.normalized, a.rows, a.packed.down_codes, a.packed.down_scales, a.inject, a.normalized, a.injection, tables, a.input, a.norm,
+        std::ldexp(1.0F, a.inject_exp), std::ldexp(1.0F, -(a.inject_exp + 2)));
 }
 template <unsigned MT, unsigned NW>
 void launch_projection_mma(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream, bool compact) {
