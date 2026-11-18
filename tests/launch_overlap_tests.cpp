@@ -84,10 +84,10 @@ enum : std::uint32_t {
     WQKVZ = 100, WOUT, WGU, WDOWN, WQKV, WO, WGU2, WDOWN2
 };
 
-// Facts per kernel (read in source, shared/pdl-fix): fp4_gemv pre-wait = weight records only, waits in block (x,0,0) of
+// Facts per kernel (read in the kernel sources): fp4_gemv pre-wait = weight records only, waits in block (x,0,0) of
 // every launch (nvfp4.cu fp4_gemv), release after the wait; fp4_reduce waits first, releases after it; norm_kernel
 // releases at entry, waits, then reads (norms.cu); conv_pre reads conv_state before its wait (gdn.cu:41); the other
-// attention / GDN / rope kernels touch only constant data before their wait and release at entry (dec_nvfp4_verify3 audit).
+// attention / GDN / rope kernels touch only constant data before their wait and release at entry.
 void gemv(std::vector<ov::Launch>& c, std::uint32_t w, std::uint32_t x, bool reduce, std::uint32_t y, std::uint32_t resid) {
     c.push_back(k("fp4_gemv", true, true, {{w, R, PRE}, {x, R, POST}, {PART, W, POST}}));
     if (!reduce) return;

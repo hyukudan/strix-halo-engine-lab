@@ -26,7 +26,7 @@ __global__ void __launch_bounds__(256)
     // gain / z for all NREG elements are loaded with x, in one batch BEFORE the first store. Inside the store loop each
     // such load had to wait for the previous store (possible aliasing): NREG dependent global round trips per block.
     // Every element is read and written by this thread only, so hoisting the reads is the same program; the per-element
-    // ops and the reduction order are unchanged.
+    // ops and the reduction order are unchanged. Precondition: y overlaps x / z only as the identical buffer, or not at all.
     float xr[NREG];
     [[maybe_unused]] float gr[NREG];
     [[maybe_unused]] float zr[NREG];

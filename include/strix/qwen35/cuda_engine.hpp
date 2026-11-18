@@ -53,7 +53,7 @@ struct EngineOptions {
     std::uint32_t max_positions = 4096;  // KV capacity per attention layer (and for the MTP layer)
     bool use_graphs = true;              // CUDA graph per (rows, logits mode)
     bool multi_gemv = true;              // one launch for GEMVs sharing x (q|k|v, qkv|z|beta|alpha); bitwise equal either way
-    bool pdl = false;                    // (measured +0.27 ms loss at C1: off) programmatic dependent launch + weight L2 prefetch between kernels
+    bool pdl = false;                    // experimental, default off: programmatic dependent launch + weight L2 prefetch between kernels
     bool load_mtp = true;                // read blk.<layers> (MTP) tensors when present
     bool quiet = false;
     // TURBO levers (default off = exact BF16/q8_0 identity). Each lever is individually switchable.
