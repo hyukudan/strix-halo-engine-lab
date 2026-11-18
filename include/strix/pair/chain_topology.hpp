@@ -122,7 +122,10 @@ inline void apply_override(std::string_view text, Request& request) {
             request.cuts.push_back(value);
             value = 0; digits = false;
         } else if (text[i] >= '0' && text[i] <= '9') {
-            value = value * 10U + static_cast<std::uint32_t>(text[i] - '0'); digits = true;
+            const auto digit = static_cast<std::uint32_t>(text[i] - '0');
+            // Refuse instead of wrapping: "cut:4294967299" must not become cut 3.
+            if (value > (UINT32_MAX - digit) / 10U) throw std::invalid_argument("placement override cut value out of range");
+            value = value * 10U + digit; digits = true;
         } else {
             throw std::invalid_argument("placement override cut list is malformed");
         }

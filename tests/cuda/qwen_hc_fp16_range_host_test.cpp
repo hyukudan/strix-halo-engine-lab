@@ -85,6 +85,19 @@ int main() {
         const double ref = x * static_cast<double>(six[4]) * 0.25;
         check(v1 == 0.0 && std::fabs(v2 - ref) <= std::ldexp(std::fabs(ref), -11), "dropped term restored");
     }
+    {  // all-denormal-scale inject tensors: the shift would be 2^e with e > 124 (2^e inf or 2^-(e+2) not normal): refused
+        hr::Scan tiny, edge;
+        std::vector<float> w = {0x1p-120F, 0x1p-121F};  // max < 2^-119: e = 134, ldexp(1.0F, 134) = inf
+        hr::scan_inject(tiny, w.data(), w.size());
+        check(hr::inject_exp(tiny) == 134 && !std::isfinite(std::ldexp(1.0F, hr::inject_exp(tiny))) &&
+                  hr::refusal(tiny).find("outside the float scale range") != std::string::npos,
+              "denormal-scale inject refused: " + hr::refusal(tiny));
+        w = {0x1.8p-110F};  // max < 2^-109: e = 124, the largest admitted shift; both scales normal
+        hr::scan_inject(edge, w.data(), w.size());
+        const int e = hr::inject_exp(edge);
+        check(e == 124 && hr::refusal(edge).empty() && std::isnormal(std::ldexp(1.0F, e)) && std::isnormal(std::ldexp(1.0F, -(e + 2))),
+              "edge shift 2^124 admitted: " + hr::refusal(edge));
+    }
     {  // the real pack's measured range (min 2.0664e-9 = 2^-28.85, max 1.32) is admitted; 2^-41 .. 1 is not representable
         hr::Scan s, r, big;
         std::vector<float> w = {2.0664e-09F, 1.32F, 0.25F};

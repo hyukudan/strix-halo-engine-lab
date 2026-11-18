@@ -27,6 +27,7 @@ inline constexpr float kFp16Max = 65504.0F;
 inline constexpr float kActivationLimit = kFp16Max / 8.0F;  // bound on sqrt(kHidden) * max|norm w|
 inline constexpr float kFp16ZeroBelow = 0x1p-25F;          // |w| <= this rounds to FP16 zero (round half to even)
 inline constexpr int kInjectTopExp = 15;                   // shifted max|w| < 2^15 (half of FP16's 65504 range)
+inline constexpr int kInjectExpMax = 124;                  // 2^e and 2^-(e+2) stay normal floats for |e| <= 124
 
 struct Scan {
     float norm_max_abs = 0.0F;
@@ -73,6 +74,13 @@ inline std::string refusal(const Scan& s) {
     if (!(bound < kActivationLimit))
         add("sqrt(2560) * max|norm w| = " + std::to_string(bound) + " >= 65504/8 (FP16 activation range)");
     const int e = inject_exp(s);
+    // The kernel receives 2^e and 2^-(e+2) as floats (qwen_hc.cu launch): both must be normal floats, or the operand turns
+    // into inf (NaN logits) or the unscale into 0 (the inject term vanishes). Only an all-denormal-scale tensor reaches this.
+    if (e > kInjectExpMax || e < -kInjectExpMax) {
+        add("inject operand shift 2^" + std::to_string(e) + " is outside the float scale range (|e| <= " +
+            std::to_string(kInjectExpMax) + ")");
+        return out;
+    }
     if (std::isfinite(s.inject_min_nonzero_abs) && std::ldexp(s.inject_min_nonzero_abs, e) <= kFp16ZeroBelow) {
         char buf[160];
         std::snprintf(buf, sizeof buf, "inject |w| range %.4g .. %.4g exceeds FP16 with the 2^%d shift (min rounds to zero)",

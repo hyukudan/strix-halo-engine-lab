@@ -93,6 +93,14 @@ void tables_and_override() {
     bool threw = false;
     try { pp::apply_override("cut:", q); } catch (const std::invalid_argument&) { threw = true; }
     require(threw, "malformed override refused");
+    // uint32 overflow is refused, not wrapped (4294967299 = 2^32 + 3 used to parse as cut 3); the maximum still parses.
+    for (const char* big : {"cut:4294967299", "cut:24,4294967296", "cut:99999999999"}) {
+        threw = false;
+        try { pp::apply_override(big, q); } catch (const std::invalid_argument&) { threw = true; }
+        require(threw, (std::string("overflowing cut refused: ") + big).c_str());
+    }
+    pp::apply_override("cut:4294967295", q);
+    require(q.cuts == std::vector<std::uint32_t>{4294967295U}, "UINT32_MAX cut parses exactly");
 }
 
 void one_rank() {

@@ -191,6 +191,11 @@ void invalid() {
     rejects([&] { (void)parse_topology(head + "[nodes.a]\nprofile = \"strix-halo-128\"\n"); }, "nodes.a.rank: required", "rank");
     rejects([&] { (void)parse_topology(head + "[nodes.a]\nrank = 1\n"); }, "ranks are 0..0", "rank gap");
     rejects([&] { (void)parse_topology(head + "[nodes.a]\nrank = 0\n[nodes.b]\nrank = 0\n"); }, "declared twice", "rank repeat");
+    // memory_gib is range-checked before llround: 1e30 GiB is not undefined behaviour, 1e-12 GiB is not 0 bytes ("no limit").
+    const std::string node = head + "[nodes.a]\nrank = 0\nprofile = \"strix-halo-128\"\nmemory_gib = ";
+    rejects([&] { (void)parse_topology(node + "1e30\n"); }, "nodes.a.memory_gib: out of range", "memory_gib overflow");
+    rejects([&] { (void)parse_topology(node + "1e-12\n"); }, "nodes.a.memory_gib: out of range", "memory_gib rounds to 0 bytes");
+    require(parse_topology(node + "0.5\n").nodes[0].memory_bytes == 536870912ULL, "fractional memory_gib still parses");
     rejects([&] { (void)parse_topology(head + "[nodes.a]\nrank = 0\nprofile = \"tpu-9\"\n"); }, "unknown profile tpu-9", "profile");
     rejects([&] { (void)parse_topology(head + "[nodes.a]\nrank = 0\nprofile = \"custom\"\n"); }, "required with profile custom", "custom");
     rejects([&] { (void)parse_topology(head + "[nodes.a]\nrank = 0\nmemory_gib = 0\n"); }, "expected a positive number", "memory");

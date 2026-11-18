@@ -101,7 +101,11 @@ TopologyNode parse_node(const std::string& id, const Value& v) {
         const double gib = positive(*x, key + ".memory_gib");
         // Not capped by the profile: a unified-memory profile's size depends on the node's GTT setting. The observation
         // (observe()) refuses a declared size above what the node reports.
-        n.memory_bytes = static_cast<std::uint64_t>(std::llround(gib * kGiB));
+        // Range check before the conversion: llround of >= 2^63 is undefined, and a size that rounds to 0 bytes would read as
+        // "no limit" downstream.
+        const double bytes = gib * kGiB;
+        if (!(bytes >= 0.5 && bytes < 9.0e18)) bad(key + ".memory_gib", "out of range (1 byte .. 8 EiB)");
+        n.memory_bytes = static_cast<std::uint64_t>(std::llround(bytes));
         n.memory_source = FactSource::declared;
     }
     if (profile && profile->name == "custom" && !find(t, "memory_gib")) bad(key + ".memory_gib", "required with profile custom");
