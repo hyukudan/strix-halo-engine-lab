@@ -548,6 +548,20 @@ int main(){try{
         head_rejected=std::string(e.what()).starts_with("MTP target windows require resolved --virtual-q8-lm-head");
     }
     require(head_rejected,"MTP target windows without the virtual Q8 LM head are refused, naming the flag");
+    // A golden dump and a fixed single-request session build no window (hip_mtp_decode_bridge.hpp allocate_window):
+    // the two window-only refusals (greedy head rows, window hyper-mix) must not reach them; the server still builds.
+    {
+        auto no_window=selected;no_window.mtp.window_hyper_mix=true;
+        no_window.mtp.golden_dump="window-free.dump";no_window.mtp.golden.clear();no_window.mtp.golden_sha256.clear();
+        require(!strix::decode_cli::mtp_builds_target_windows(no_window),"a golden dump builds no target window");
+        strix::decode_cli::validate_resolved_mtp_cli(no_window);
+        auto fixed=selected;fixed.mtp.window_hyper_mix=true;fixed.session_mtp_fixed=true;
+        require(!strix::decode_cli::mtp_builds_target_windows(fixed),"a fixed single-request session builds no target window");
+        strix::decode_cli::validate_resolved_mtp_cli(fixed);
+        fixed.http_serve=true;
+        require(strix::decode_cli::mtp_builds_target_windows(fixed),"a fixed session under the server builds its windows");
+        require(strix::decode_cli::mtp_builds_target_windows(selected),"an ordinary window request builds its windows");
+    }
     selected.virtual_q8_lm_head=true;
     strix::decode_cli::validate_resolved_mtp_cli(selected);
     // The union is a separate opt-in target-window consumer, never an implicit

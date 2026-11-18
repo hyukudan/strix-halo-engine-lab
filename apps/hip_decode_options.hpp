@@ -1718,6 +1718,11 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
 inline void validate_onfly_i4_routes(const Options& o) {
     onfly_i4::require_serial(o.turbo.active(), !o.mtp.cohort.empty() || (o.http_serve && o.http_batch));
 }
+// A run builds its MTP target windows only outside a golden dump and outside a fixed single-request session
+// (apps/hip_mtp_decode_bridge.hpp allocate_window, apps/hip_decode_token_main.cpp window_factory_for).
+inline bool mtp_builds_target_windows(const Options& o) {
+    return o.mtp.enabled && o.mtp.window_rows && o.mtp.golden_dump.empty() && (!o.session_mtp_fixed || o.http_serve);
+}
 inline void validate_resolved_mtp_cli(const Options& o) {
     validate_onfly_i4_routes(o);
     validate_mtp_cli(o,true);
@@ -1729,7 +1734,9 @@ inline void validate_resolved_mtp_cli(const Options& o) {
         throw std::invalid_argument("MTP window expert union requires resolved A8, grouped Q5_1, slot-parallel down and D1");
     // The window's hyper-mix rows exist only on the parallel/staged/fused typed-Q8 HC kernel with row and output
     // prefetch (known_hyper_rows_id); without it the window refused only after the model load (issue 758).
-    if(o.mtp.enabled && o.mtp.window_hyper_mix && (!o.parallel_hyper_mix || !o.staged_hyper_projections ||
+    // Runs that build no window (golden dump, fixed single-request session) keep their earlier admission.
+    const bool builds_windows=mtp_builds_target_windows(o);
+    if(builds_windows && o.mtp.window_hyper_mix && (!o.parallel_hyper_mix || !o.staged_hyper_projections ||
        !o.fused_staged_hyper_mix || !o.typed_hyper_projection || !o.prefetch_typed_hyper_rows || !o.prefetch_q8_hyper_output))
         throw std::invalid_argument("MTP window hyper-mix requires resolved --parallel-hyper-mix --staged-hyper-projections "
             "--fused-staged-hyper-mix --typed-fused-hyper-projections --prefetch-typed-hyper-rows --prefetch-q8-hyper-output");
@@ -1739,7 +1746,7 @@ inline void validate_resolved_mtp_cli(const Options& o) {
     // owner receives the prefetch from the shared prompt organization, an explicit T must name it. The single-request
     // command keeps its existing rule here. STRIX_MTP_GREEDY_ROWS=0 keeps per-row selectors.
     const char* greedy_rows=strix::envcfg::text("STRIX_MTP_GREEDY_ROWS");
-    if(o.mtp.enabled && o.mtp.window_rows && !(greedy_rows && std::string_view(greedy_rows)=="0") &&
+    if(builds_windows && !(greedy_rows && std::string_view(greedy_rows)=="0") &&
        (!o.virtual_q8_lm_head || (o.http_serve && !o.prefetch_q8_lm_head)))
         throw std::invalid_argument(std::string("MTP target windows require resolved --virtual-q8-lm-head")+
             (o.http_serve?" --prefetch-q8-lm-head":"")+" (greedy window rows; STRIX_MTP_GREEDY_ROWS=0 keeps per-row selectors)");
