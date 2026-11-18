@@ -12,17 +12,17 @@ enum class Mode : int { rms = 0, gated_swish = 1, gated_sigmoid = 2, l2 = 3 };
 // write (one global read per element instead of two). Padding terms are 0 (p + 0*0 == p for p >= 0).
 template <Mode M, int NREG>
 __global__ void __launch_bounds__(256)
-    norm_kernel(const float* x, GroupedView xv, const float* gain, const float* z, GroupedView zv, float* y, GroupedView yv,
-                float eps, float scale) {
+    norm_kernel(const After<const float> x, GroupedView xv, const float* gain, const After<const float> z, GroupedView zv,
+                const After<float> y, GroupedView yv, float eps, float scale) {
     __shared__ float red[8];
     pdl_trigger();
-    pdl_wait();
+    const PdlWaited waited = pdl_wait();
     const std::uint32_t r = blockIdx.y, g = blockIdx.x, n = xv.n;
-    const float* xp = x + static_cast<std::size_t>(r) * xv.rs() + static_cast<std::size_t>(g) * xv.gs();
-    float* yp = y + static_cast<std::size_t>(r) * yv.rs() + static_cast<std::size_t>(g) * yv.gs();
+    const float* xp = x(waited) + static_cast<std::size_t>(r) * xv.rs() + static_cast<std::size_t>(g) * xv.gs();
+    float* yp = y(waited) + static_cast<std::size_t>(r) * yv.rs() + static_cast<std::size_t>(g) * yv.gs();
     constexpr bool kGated = M == Mode::gated_swish || M == Mode::gated_sigmoid;
     [[maybe_unused]] const float* zp = nullptr;
-    if constexpr (kGated) zp = z + static_cast<std::size_t>(r) * zv.rs() + static_cast<std::size_t>(g) * zv.gs();
+    if constexpr (kGated) zp = z(waited) + static_cast<std::size_t>(r) * zv.rs() + static_cast<std::size_t>(g) * zv.gs();
     // gain / z for all NREG elements are loaded with x, in one batch BEFORE the first store. Inside the store loop each
     // such load had to wait for the previous store (possible aliasing): NREG dependent global round trips per block.
     // Every element is read and written by this thread only, so hoisting the reads is the same program; the per-element
