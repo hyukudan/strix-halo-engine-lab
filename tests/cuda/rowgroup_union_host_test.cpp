@@ -1,10 +1,11 @@
-// Host oracle for the row-group union (src/cuda/core/rowgroup_union.hpp), the invariant of the shared row-group attention core:
+// Host oracle for the row-group union (strix/attn_rowgroup_union.hpp), the invariant of the shared row-group attention core:
 //   every row r sees exactly its own selected keys (with multiplicity) among the union entries carrying mask bit r;
 //   for strictly ascending lists the union is the sorted set union, no key twice, positions 0..U-1 all written.
 // The device union_body (core/attention_rowgroup.cuh) runs these same functions in parallel: owned flags, per-list exclusive
 // prefix of owned keys, rank_and_mask scatter; a non-ascending list switches the tile to the concatenation. This test runs
 // that algorithm sequentially and compares it with std::set reasoning. No GPU.
-#include "../../src/cuda/core/rowgroup_union.hpp"
+#include "strix/attn_rowgroup_union.hpp"
+#include "../../src/cuda/core/rowgroup_union.hpp"  // forwarding declarations
 
 #include <algorithm>
 #include <cstdint>
@@ -14,7 +15,9 @@
 #include <set>
 #include <vector>
 
-namespace rg = strix::cuda::core::rowgroup;
+namespace rg = strix::attn::rowgroup;
+static_assert(&rg::lower_bound == &strix::cuda::core::rowgroup::lower_bound && &rg::owned == &strix::cuda::core::rowgroup::owned,
+              "the forwarding declarations name the shared functions");
 
 namespace {
 constexpr unsigned R = 4, Cap = 2051;
