@@ -55,7 +55,7 @@ struct ModelShape {
     // Memory admission and decode prediction (all optional; zero / empty keeps the plan of a binder that omits them).
     double embed_bytes = 0.0;                // resident on the first stage and on the decoder
     double head_bytes = 0.0;                 // final norm + head: resident on the last stage and the decoder, read per token
-    std::vector<double> read_bytes_per_token; // per layer: decode bytes read per token (weights + state); empty: none
+    std::vector<double> read_bytes_per_token{}; // per layer: decode bytes read per token (weights + state); empty: none
 };
 // Split toggle (one value for CLI and server, resolved here): auto_plan searches everything; device_only keeps the
 // prefill on one device that also decodes; handoff runs one device and moves the whole state to another decoder;
