@@ -9,15 +9,21 @@ namespace strix::spec {
 
 namespace {
 constexpr std::uint32_t chain_steps_cap = 96;  // table size: copy prefix + extension steps
+
+ArbiterConfig arbiter_config(const BlockConfig& c) {
+    ArbiterConfig a = c.arbiter;
+    if (c.fixed_costs) a.learn_costs = false;
+    return a;
+}
 }
 
 BlockDrafter::BlockDrafter(BlockConfig config, ChainDrafter* chain)
-    : config_(std::move(config)), chain_(chain), proposer_(config_.proposer), arbiter_(config_.arbiter),
+    : config_(std::move(config)), chain_(chain), proposer_(config_.proposer), arbiter_(arbiter_config(config_)),
       chain_ms_(chain_steps_cap + 1, 0.0), chain_w_(chain_steps_cap + 1, 0.0), step_ms_(config_.chain_seed_step_ms) {
     if (config_.max_block < 1 || config_.max_block > config_.arbiter.windows.back())
         throw std::invalid_argument("block drafter: max_block must be within the arbiter windows");
     if (config_.chain_max_k < 1 || config_.chain_max_k > ext_.size())
-        throw std::invalid_argument("block drafter: chain_max_k in 1..8");
+        throw std::invalid_argument("block drafter: chain_max_k in 1..16");
     if (!config_.clock_ms) config_.clock_ms = [] {
         using clock = std::chrono::steady_clock;
         return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();
@@ -28,6 +34,7 @@ double BlockDrafter::now_ms() const { return config_.clock_ms(); }
 
 double BlockDrafter::chain_ms(std::uint32_t steps) const {
     steps = std::clamp<std::uint32_t>(steps, 1, chain_steps_cap);
+    if (config_.fixed_costs) return config_.chain_seed_flush_ms + config_.chain_seed_step_ms * double(steps - 1);
     if (chain_w_[steps] > 0.0) return chain_ms_[steps];
     for (std::uint32_t j = steps - 1; j >= 1; --j)
         if (chain_w_[j] > 0.0)  // no measured slope yet: proportional to the nearest measured depth
@@ -40,7 +47,7 @@ double BlockDrafter::chain_ms(std::uint32_t steps) const {
 
 void BlockDrafter::learn_chain_ms(std::uint32_t steps, double ms) {
     steps = std::clamp<std::uint32_t>(steps, 1, chain_steps_cap);
-    if (!(ms > 0.0)) return;
+    if (config_.fixed_costs || !(ms > 0.0)) return;
     // marginal step cost from the nearest other measured depth
     for (std::uint32_t d = 1; d < chain_steps_cap; ++d) {
         const std::uint32_t lo = steps > d ? steps - d : 0, hi = steps + d;

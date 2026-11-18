@@ -4,6 +4,7 @@
 #include "strix/spec/drafting.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -142,6 +143,39 @@ void copy_tests() {
     const auto rese = run_loop(prompt, truth, config, 12.0);
     SP_CHECK(rese.passes > res.passes, "expensive rows should cost passes (%llu vs %llu)",
              static_cast<unsigned long long>(rese.passes), static_cast<unsigned long long>(res.passes));
+}
+
+// Retreat over the evidence horizon (ArbiterConfig::retreat_horizon): at a 0.64 first-row rate (CUDA dense 27B Japanese
+// prose) a streak of 6 first-row misses is routine over 256 passes and must not bar the drafter for probe_every serial
+// passes; the per-pass form (horizon 0) bars it at 5. A streak of 16 still bars it in both forms.
+void retreat_horizon_tests() {
+    for (const double horizon : {0.0, 256.0}) {
+        sp::ArbiterConfig config;
+        config.windows = {1, 2, 3, 4, 5, 6, 7, 8};
+        config.retreat_horizon = horizon;
+        sp::Arbiter a(config);
+        for (std::uint32_t w = 1; w <= 8; ++w) a.seed_cost(w, 13.30 + 0.113 * double(w - 1));
+        const std::vector<double> draft{0.634, 1.268, 1.902, 2.536, 3.170, 3.804, 4.438};
+        sp::StepInput in;
+        in.model_max_k = 7;
+        in.model_draft_ms = draft;
+        const std::vector<std::uint32_t> tokens(8, 1);
+        const auto pass = [&](std::uint32_t accepted) {
+            a.observe({sp::Source::model, 0, 3, accepted, 4, 13.6, 1.9},
+                      std::span<const std::uint32_t>(tokens.data(), accepted + 1));
+        };
+        for (std::uint32_t i = 0; i < 300; ++i) {  // first-row rate 0.64, then 0.5 per depth
+            (void)a.decide(in);
+            pass(i * 37 % 100 < 64 ? (i % 2 ? 1U : 2U) : 0U);
+        }
+        for (int i = 0; i < 6; ++i) { (void)a.decide(in); pass(0); }
+        auto d = a.decide(in);
+        if (horizon > 0.0) SP_CHECK(d.source == sp::Source::model, "horizon %.0f: 6 routine misses barred the drafter", horizon);
+        else SP_CHECK(d.source == sp::Source::serial, "per-pass form: 6 misses at r1 0.64 bar the drafter (the old rule)");
+        for (int i = 0; i < 16; ++i) { (void)a.decide(in); pass(0); }
+        d = a.decide(in);
+        SP_CHECK(d.source == sp::Source::serial, "horizon %.0f: 22 misses in a row must bar the drafter", horizon);
+    }
 }
 
 void arbiter_tests() {
@@ -326,13 +360,171 @@ void ds_arbiter_tests() {
     const auto r16 = ds_copy_run(16, 6, 15);
     SP_CHECK(r16.last_k == 15 && r16.last_expected >= 15.0, "16-row copy window predicts %.2f tokens (k %u)", r16.last_expected, r16.last_k);
 }
+
+// Frontier probe (ArbiterConfig::frontier_every). Replays the measured prose shape of the CUDA dense 27B MTP chain
+// (q27 D2 receipts: verify ~13.2 ms + ~0.25 ms/row, 0.85 ms per chain step, conditional acceptance 0.759 at depth 1,
+// 0.667 at depth 2, then 0.6) with the first probe missing at row 1, as in the receipt that stayed at k = 1 for 290 passes.
+struct FrontierRun {
+    std::uint32_t max_k_after_first = 0;
+    double tokens = 0, ms = 0;
+    std::uint64_t probes = 0, model = 0, k1 = 0, k_sum = 0;
+    [[nodiscard]] double tok_s() const { return 1000.0 * tokens / ms; }
+    [[nodiscard]] double mean_k() const { return model ? double(k_sum) / double(model) : 0.0; }
+};
+// One content shape: verify(rows) = v1 + per_row * (rows - 1), draft = per_call ms per drafted position (k MTP head calls),
+// conditional acceptance rate[j] at depth j + 1, chain cap, and whether the first model pass misses at row 1.
+struct Shape { double v1, per_row, per_call; std::vector<double> rate; std::uint32_t cap = 7; bool first_miss = false; };
+// The controller forms: f0 = before cc_decode (no probe, flat prior), f8 = cc_decode 854325dbb (unpriced probe every 8,
+// flat prior), now = the defaults (continuation prior, probe charged its cost).
+sp::ArbiterConfig form(int f) {
+    sp::ArbiterConfig c;
+    c.windows.clear();
+    for (std::uint32_t w = 1; w <= 32; ++w) c.windows.push_back(w);
+    if (f == 0 || f == 8) { c.model_continuation = false; c.frontier_loss = 1.0; c.frontier_every = std::uint32_t(f); }
+    return c;
+}
+
+FrontierRun replay(const sp::ArbiterConfig& config, const Shape& sh, std::uint64_t seed, int passes = 600) {
+    sp::Arbiter a(config);
+    const auto verify = [&](std::uint32_t rows) { return sh.v1 + sh.per_row * double(rows - 1); };
+    for (const std::uint32_t r : {1U, 2U, 4U, 8U, 16U, 32U}) a.seed_cost(r, verify(r));
+    std::vector<double> draft;
+    for (std::uint32_t k = 1; k <= sh.cap; ++k) draft.push_back(sh.per_call * double(k));
+    Rng rng{seed};
+    FrontierRun run;
+    std::vector<std::uint32_t> emitted;
+    for (int pass = 0; pass < passes; ++pass) {
+        sp::StepInput in;
+        in.model_max_k = sh.cap;
+        in.model_draft_ms = draft;
+        const auto d = a.decide(in);
+        SP_CHECK(d.rows >= d.k + 1 && d.k <= sh.cap, "illegal decision rows %u k %u", d.rows, d.k);
+        std::uint32_t acc = 0;
+        if (d.source == sp::Source::model) {
+            if (pass > 0 || !sh.first_miss)  // first_miss: the first probe misses at row 1 (the stuck receipt's start)
+                while (acc < d.k && double(rng.next(1000)) / 1000.0 < sh.rate[std::min<std::size_t>(acc, sh.rate.size() - 1)]) ++acc;
+            if (pass > 0) {
+                run.max_k_after_first = std::max(run.max_k_after_first, d.k);
+                ++run.model;
+                run.k1 += d.k == 1;
+                run.k_sum += d.k;
+            }
+            run.probes += d.probe;
+        }
+        const double ms = verify(d.rows) + (d.source == sp::Source::model ? draft[d.k - 1] : 0.0);
+        emitted.assign(acc + 1, 1U);
+        a.observe({d.source, 0, d.k, acc, d.rows, verify(d.rows), d.source == sp::Source::model ? draft[d.k - 1] : 0.0}, emitted);
+        run.tokens += double(acc + 1);
+        run.ms += ms;
+    }
+    return run;
+}
+
+// The q27 D2 prose shape that stayed at k = 1 (first probe misses at row 1).
+const Shape stuck_prose{13.2, 0.25, 0.85, {0.759, 0.667, 0.6, 0.55, 0.5, 0.5, 0.5, 0.5}, 7, true};
+FrontierRun frontier_run(std::uint32_t frontier_every, std::uint64_t seed) { return replay(form(int(frontier_every)), stuck_prose, seed); }
+
+// Shapes of the cd1-cd5 receipts (RTX PRO 6000, 1,200 tokens): verify by rows from the step lines, 0.83 ms per drafted
+// position, conditional acceptance by depth from the stats depth_offered / depth_accepted (f8 runs).
+const Shape ja_f8{13.65, 0.05, 0.83, {0.638, 0.469, 0.475, 0.338, 0.5}};
+const Shape en_f8{13.45, 0.08, 0.83, {0.756, 0.578, 0.497, 0.463, 0.47}};
+const Shape code_f8{13.70, 0.06, 0.83, {0.941, 0.918, 0.900, 0.855, 0.891, 0.909, 0.857, 0.87}};
+const Shape think_f8{13.85, 0.05, 0.83, {0.844, 0.801, 0.825, 0.829, 0.826, 0.780, 0.782, 0.79}};
+
+// Pricing: the model reproduces the measured f8 tok/s within 10 % (ja 120.9, en 134.6, code 283.4, think 209.4: replay E is
+// chain-only, so code/think replays sit above the receipts by their serial/lookup passes), and the new form never loses
+// to f8 by more than noise; Japanese must come back to >= the f0 receipt shape (k = 3 instead of 4-5).
+void pricing_tests() {
+    struct Case { const char* name; const Shape* sh; double measured_f8; double tol; };
+    const Case cases[] = {{"ja", &ja_f8, 120.9, 0.10}, {"en", &en_f8, 134.6, 0.10}, {"code", &code_f8, 283.4, 0.12},
+                          {"think", &think_f8, 209.4, 0.12}};
+    for (const auto& c : cases) {
+        double f8 = 0, now = 0, k8 = 0, kn = 0;
+        for (const std::uint64_t seed : {1ULL, 7ULL, 42ULL}) {
+            const auto a = replay(form(8), *c.sh, seed, 1200), b = replay(form(-1), *c.sh, seed, 1200);
+            f8 += a.tok_s() / 3.0; now += b.tok_s() / 3.0; k8 += a.mean_k() / 3.0; kn += b.mean_k() / 3.0;
+        }
+        std::printf("pricing %s: f8 replay %.1f tok/s (k %.2f; measured %.1f) | now %.1f tok/s (k %.2f) %+.1f %%\n", c.name, f8, k8,
+                    c.measured_f8, now, kn, 100.0 * (now / f8 - 1.0));
+        SP_CHECK(std::abs(f8 / c.measured_f8 - 1.0) <= c.tol, "%s: f8 replay %.1f not within %.0f %% of the receipt %.1f", c.name, f8,
+                 100.0 * c.tol, c.measured_f8);
+        SP_CHECK(now >= 0.99 * f8, "%s: new pricing %.1f below f8 %.1f", c.name, now, f8);
+    }
+    double ja_now = 0, ja_f8_rate = 0, ja_k = 0;
+    for (const std::uint64_t seed : {1ULL, 7ULL, 42ULL}) {
+        const auto b = replay(form(-1), ja_f8, seed, 1200);
+        ja_now += b.tok_s() / 3.0; ja_k += b.mean_k() / 3.0;
+        ja_f8_rate += replay(form(8), ja_f8, seed, 1200).tok_s() / 3.0;
+    }
+    SP_CHECK(ja_now >= 1.03 * ja_f8_rate && ja_k < 3.6, "ja: now %.1f tok/s k %.2f vs f8 %.1f (expected >= +3 %%, k ~3)", ja_now, ja_k,
+             ja_f8_rate);
+    // Deeper caps are priced, not taken blindly: code with a cheap draft (0.45 ms, subset head) and cap 15 runs deeper than 7
+    // and gains; with today's 0.83 ms the cap-15 arm must not lose against cap 7.
+    for (const double per_call : {0.45, 0.83}) {
+        Shape deep = code_f8, capped = code_f8;
+        deep.per_call = capped.per_call = per_call;
+        deep.cap = 15;
+        double r15 = 0, r7 = 0, k15 = 0;
+        for (const std::uint64_t seed : {1ULL, 7ULL, 42ULL}) {
+            const auto a = replay(form(-1), deep, seed, 1200);
+            r15 += a.tok_s() / 3.0; k15 += a.mean_k() / 3.0;
+            r7 += replay(form(-1), capped, seed, 1200).tok_s() / 3.0;
+        }
+        std::printf("cap code %.2f ms/call: cap 7 %.1f tok/s | cap 15 %.1f tok/s (k %.2f)\n", per_call, r7, r15, k15);
+        SP_CHECK(r15 >= 0.99 * r7, "cap 15 loses: %.1f vs %.1f", r15, r7);
+        if (per_call < 0.5) SP_CHECK(k15 > 7.5 && r15 > 1.03 * r7, "cheap draft: cap 15 k %.2f, %.1f vs %.1f", k15, r15, r7);
+    }
+}
+
+void frontier_tests() {
+    for (const std::uint64_t seed : {1ULL, 7ULL, 42ULL}) {
+        const auto old_form = frontier_run(0, seed);
+        const auto fixed = frontier_run(sp::ArbiterConfig{}.frontier_every, seed);
+        // The previous form stays at k = 1 (the receipt; only a rare retreat + deep re-probe can free it); the frontier
+        // probe learns deeper depths and leaves k = 1.
+        SP_CHECK(double(old_form.k1) >= 0.8 * double(old_form.model), "old form: k = 1 on %llu of %llu model passes",
+                 static_cast<unsigned long long>(old_form.k1), static_cast<unsigned long long>(old_form.model));
+        SP_CHECK(fixed.max_k_after_first >= 2 && double(fixed.k1) < 0.5 * double(fixed.model), "frontier: max k %u, k = 1 on %llu of %llu",
+                 fixed.max_k_after_first, static_cast<unsigned long long>(fixed.k1), static_cast<unsigned long long>(fixed.model));
+        const double old_rate = old_form.tokens / old_form.ms, new_rate = fixed.tokens / fixed.ms;
+        std::printf("frontier seed %llu: off %.2f tok/step %.1f tok/s | on %.2f tok/step %.1f tok/s (max k %u, probes %llu)\n",
+                    static_cast<unsigned long long>(seed), old_form.tokens / 600.0, 1000.0 * old_rate, fixed.tokens / 600.0,
+                    1000.0 * new_rate, fixed.max_k_after_first, static_cast<unsigned long long>(fixed.probes));
+        SP_CHECK(new_rate > 1.10 * old_rate, "frontier gain %.3f below +10 %%", new_rate / old_rate);
+        // The continuation prior prices an unexplored depth at r_1^2, so the k = 1 absorbing state is gone even with the probe
+        // off; the defaults (continuation + charged probe) keep the f8 gain on this shape.
+        auto no_probe = form(-1);
+        no_probe.frontier_every = 0;
+        const auto cont = replay(no_probe, stuck_prose, seed), now = replay(form(-1), stuck_prose, seed);
+        std::printf("frontier seed %llu: continuation, probe off %.1f tok/s (k = 1 on %llu of %llu) | defaults %.1f tok/s\n",
+                    static_cast<unsigned long long>(seed), cont.tok_s(), static_cast<unsigned long long>(cont.k1),
+                    static_cast<unsigned long long>(cont.model), now.tok_s());
+        SP_CHECK(double(cont.k1) < 0.5 * double(cont.model) && cont.tok_s() > 1.10 * 1000.0 * old_rate, "continuation stays stuck");
+        SP_CHECK(now.tok_s() >= 0.98 * 1000.0 * new_rate, "defaults %.1f below f8 %.1f on the stuck shape", now.tok_s(), 1000.0 * new_rate);
+    }
+    // Black-box drafters (model_pass_ms) are priced on their measured rate: no frontier probe changes their k.
+    sp::ArbiterConfig config;
+    sp::Arbiter a(config);
+    for (int pass = 0; pass < 64; ++pass) {
+        sp::StepInput in;
+        in.model_max_k = 7;
+        in.model_pass_tokens = 3.0;
+        in.model_pass_ms = 20.0;
+        const auto d = a.decide(in);
+        SP_CHECK(d.source != sp::Source::model || d.k == 7, "black-box k %u", d.k);
+        a.observe({d.source, 0, d.k, 1, d.rows, 20.0, 0.0}, std::vector<std::uint32_t>(2, 1U));
+    }
+}
 } // namespace
 
 int main() {
     index_tests();
     copy_tests();
     arbiter_tests();
+    retreat_horizon_tests();
     ds_arbiter_tests();
+    frontier_tests();
+    pricing_tests();
     std::printf("PASS strix-spec-drafting-tests\n");
     return 0;
 }

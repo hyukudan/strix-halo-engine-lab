@@ -12,9 +12,17 @@
 #include <string_view>
 
 namespace strix::core {
-// Exact small-row sweeps: never round a logical tail up into adjacent storage.
+// Row sweeps of a dense projection. rows <= 16 (decode / verify / draft windows): ONE call of the real count; the bound
+// kernel pads to its 1/2/4/8/16 bucket inside, reads pad rows only inside the caller's 16-row scratch and stores only
+// rows < count (dense_linear::kernel `nrows`, dense_linear_iu4 `nrows`). Per-row results are bucket-independent, so the
+// stored rows are bitwise those of the power-of-two split; the split re-streamed every weight per sweep (Strix 27B IU4
+// verify rows 3 / 6 / 7 / 12 = 129 / 133 / 191 / 144 ms vs rows 4 / 8 / 16 = 78 / 85 / 132 ms, hip_dense_dec4).
+// rows > 16 (exact wide prefill windows): 16-row sweeps, then the tail split in powers of two so no call rounds a
+// logical tail up into storage past the window.
 template <class F>
 void dense_row_sweeps(unsigned rows, F&& run) {
+    if (rows == 0U) return;
+    if (rows <= 16U) return static_cast<void>(run(0U, rows));
     unsigned offset = 0;
     for (unsigned tile = 16; tile; tile /= 2)
         while (rows - offset >= tile) {
@@ -82,9 +90,10 @@ __device__ __forceinline__ float wave_sum32(float v) {
 }
 __device__ __forceinline__ float silu(float x) { return x / (1.0F + expf(-x)); }
 
-// 4 waves per block, T outputs per wave. grid = ceil(outputs / (4 * T)).
+// 4 waves per block, T outputs per wave. grid = ceil(outputs / (4 * T)). Computes the Rows bucket (x must hold Rows
+// rows: pad rows are read, never stored) and stores rows < nrows only.
 template <unsigned Rows, unsigned T, weight_decode::Format Format, Epilogue Ep>
-__global__ void __launch_bounds__(128) kernel(View w, View up, const float* x, float* out) {
+__global__ void __launch_bounds__(128) kernel(View w, View up, const float* x, float* out, unsigned nrows) {
     const unsigned first = (blockIdx.x * 4U + threadIdx.x / 32U) * T, lane = threadIdx.x % 32U;
     constexpr unsigned Streams = Ep == Epilogue::silu_mul ? 2U : 1U;
     const auto inputs = w.inputs, outputs = w.outputs;
@@ -93,7 +102,7 @@ __global__ void __launch_bounds__(128) kernel(View w, View up, const float* x, f
 #define GEMV_ROWS_LOAD_CHUNK(row, start) weight_decode::Chunk<Format>(row, start)
 #define GEMV_ROWS_LANE_SUM(partial) wave_sum32(partial)
 #define GEMV_ROWS_STORE(row, o, sa, sb)                                                                              \
-    if (lane == 0 && (o) < outputs)                                                                                \
+    if (lane == 0 && (o) < outputs && (row) < nrows)                                                               \
     out[std::size_t(row) * outputs + (o)] = Ep == Epilogue::silu_mul ? silu(sa) * (sb) : (sa)
 #include "gemv_rows_direct.inc"
 #undef GEMV_ROWS_WEIGHT_ROW

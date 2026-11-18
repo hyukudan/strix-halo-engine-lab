@@ -116,8 +116,10 @@ Arbiter::Arbiter(ArbiterConfig config) : config_(std::move(config)) {
         std::adjacent_find(w.begin(), w.end()) != w.end() || w.back() > max_proposal + 1)
         throw std::invalid_argument("arbiter windows must be ascending, unique, start at 1 and be <= 65 rows");
     if (!(config_.switch_in >= 1.0) || !(config_.half_life_tokens > 0.0) || !(config_.cost_weight_cap >= 1.0) ||
-        !(config_.cost_aging > 0.0 && config_.cost_aging <= 1.0))
-        throw std::invalid_argument("arbiter: switch_in >= 1, half_life_tokens > 0, cost_weight_cap >= 1, aging in (0, 1]");
+        !(config_.cost_aging > 0.0 && config_.cost_aging <= 1.0) || !(config_.frontier_loss >= 0.0) ||
+        !(config_.retreat_horizon >= 0.0))
+        throw std::invalid_argument("arbiter: switch_in >= 1, half_life_tokens > 0, cost_weight_cap >= 1, aging in (0, 1], "
+                                    "frontier_loss >= 0, retreat_horizon >= 0");
     for (auto& c : cost_) { c.ms.assign(w.back() + 1, 0.0); c.weight.assign(w.back() + 1, 0.0); c.seed.assign(w.back() + 1, 0.0); }
 }
 
@@ -195,14 +197,21 @@ double Arbiter::expected(Source source, std::uint32_t bucket, std::uint32_t k) c
     const auto& table = source == Source::lookup ? lookup_[std::min(bucket, lookup_buckets - 1)] : model_;
     const auto& prior = source == Source::lookup ? config_.lookup_prior : config_.model_prior;
     const double z = source == Source::lookup ? config_.lookup_sd : config_.model_sd;
-    double e = 1.0, alive = 1.0, bound = 1.0;
+    // Continuation (ArbiterConfig::model_continuation): the prior mean of S_j follows the shallower bounds geometrically.
+    const bool continuation = source == Source::model && config_.model_continuation;
+    const double w = prior[0] + prior[1];
+    double e = 1.0, alive = 1.0, bound = 1.0, before = 1.0;  // bound = B_{j-1}, before = B_{j-2}
     for (std::uint32_t j = 1; j <= k; ++j) {
         const auto& beta = table[source == Source::lookup ? lookup_class(bucket, j) : depth_class(j)];
         const double n = beta.a + beta.b;
-        if (!(n > 0.0)) break;
-        alive *= beta.a / n;
-        const double q = (alive * n + prior[0]) / (n + prior[0] + prior[1]);
-        bound = std::min(bound, std::max(0.0, q - z * std::sqrt(q * (1.0 - q) / (n + prior[0] + prior[1] + 1.0))));
+        if (!(n > 0.0) && !continuation) break;
+        // Prior mass m_j * w; the flat form keeps prior[0] itself (bit-identical to the previous expression).
+        const bool flat = !continuation || j == 1;
+        const double m = flat ? prior[0] / w : before > 0.0 ? bound * bound / before : 0.0;
+        alive = n > 0.0 ? alive * beta.a / n : m;  // no evidence at depth j: the continuation stands in for S_j
+        const double q = std::min(1.0, (alive * n + (flat ? prior[0] : m * w)) / (n + w));
+        before = bound;
+        bound = std::min(bound, std::max(0.0, q - z * std::sqrt(q * (1.0 - q) / (n + w + 1.0))));
         e += bound;
     }
     return e;
@@ -278,6 +287,22 @@ Decision Arbiter::decide(const StepInput& input) {
         pick = current;
     if (pick == std::size_t(Source::model) && passes_ < model_barred_until_) pick = 0;
     Decision d = best[pick].d;
+    // Frontier probe: the winning per-depth drafter offers one depth more than its evidence covers, at a bounded rate
+    // (ArbiterConfig::frontier_every); otherwise a first-row miss on the first probe pins it at k = 1 (see the config).
+    if (d.source == Source::model && !black_box && config_.frontier_every > 0 && d.k < model_n &&
+        passes_ >= last_frontier_ + config_.frontier_every) {
+        const auto& next = model_[depth_class(d.k + 1)];
+        const auto k = d.k + 1;
+        const auto rows = physical(k + 1);
+        if (next.a + next.b < config_.frontier_evidence && rows != 0 && rows <= input.max_rows) {
+            // Charged: the probe runs only while its own priced score stays within frontier_loss of the pick.
+            const double tokens = expected(Source::model, 0, k), ms = verify_ms(rows, ctx) + draft_ms(k);
+            if (tokens / std::max(ms, 1e-9) >= best[pick].score * (1.0 - config_.frontier_loss)) {
+                d = Decision{Source::model, k, rows, rows > k + 1, tokens, ms, true};
+                last_frontier_ = passes_;
+            }
+        }
+    }
     // Exploration of the learned drafter at its deepest legal k: first measurements, then re-probes.
     const bool explore = model_passes_ < config_.min_model_passes || passes_ >= last_model_ + config_.probe_every;
     if (model_n > 0 && d.source != Source::model && explore && black_box) {
@@ -327,8 +352,12 @@ void Arbiter::observe(const Outcome& o, std::span<const std::uint32_t> emitted) 
         // A streak of first-row misses bars the drafter only when it is improbable under the learned first-row rate
         // (a streak of m has probability (1 - r1)^m): at ~66 % acceptance two misses in a row are routine and must not
         // idle the drafter for probe_every passes (measured: 58-71 % serial passes on prose at 64-69 % acceptance).
-        const double r1 = std::min(survival(Source::model, 0, 1), 0.999);
-        const auto streak = std::uint32_t(std::min(16.0, std::ceil(std::log(config_.retreat_confidence) / std::log(1.0 - r1))));
+        // Over the evidence horizon H (ArbiterConfig::retreat_horizon) a streak of m starts by chance about H r1 (1 - r1)^m
+        // times, so m is the shortest streak with H r1 (1 - r1)^m <= retreat_confidence (H = 0: per pass, (1 - r1)^m).
+        const double r1 = std::clamp(survival(Source::model, 0, 1), 1e-3, 0.999);
+        const double chance = config_.retreat_horizon > 0.0
+            ? std::min(1.0, config_.retreat_confidence / (config_.retreat_horizon * r1)) : config_.retreat_confidence;
+        const auto streak = std::uint32_t(std::min(16.0, std::ceil(std::log(chance) / std::log(1.0 - r1))));
         if (model_misses_ >= std::max(config_.retreat_misses, streak)) { model_barred_until_ = passes_ + config_.probe_every; model_misses_ = 0; }
     }
     if (o.source == Source::lookup) {
@@ -336,8 +365,8 @@ void Arbiter::observe(const Outcome& o, std::span<const std::uint32_t> emitted) 
         if (lookup_misses_ >= config_.retreat_misses) { lookup_barred_ = true; lookup_misses_ = 0; }
     }
     auto& c = cost_[context_bin(o.context)];
-    for (auto& w : c.weight) w *= config_.cost_aging;
-    if (o.rows > 0 && o.rows < c.ms.size() && o.verify_ms > 0.0) {
+    if (config_.learn_costs) for (auto& w : c.weight) w *= config_.cost_aging;
+    if (config_.learn_costs && o.rows > 0 && o.rows < c.ms.size() && o.verify_ms > 0.0) {
         auto& w = c.weight[o.rows];
         c.ms[o.rows] = (c.ms[o.rows] * w + o.verify_ms) / (w + 1.0);
         w = std::min(w + 1.0, config_.cost_weight_cap);

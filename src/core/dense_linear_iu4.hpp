@@ -8,7 +8,12 @@
 //     address: broadcast, L1 resident).
 //   - One block = 8 waves = 64 output columns; the 8 waves split K in contiguous ranges of K / 8 (G / 8 = MaxG K64
 //     groups each), reduce their partial sums in LDS in a fixed ascending order (deterministic, no atomics).
-//   - Rows are padded to the bucket R (1/2/4/8/16); rows past nrows are neither computed nor stored. Default: core
+//   - Rows are padded to the bucket R (1/2/4/8/16); a core call that holds any real row computes all of its Rc rows
+//     (rows past nrows read stale scratch rows: the caller's xh must hold R rows) and only rows < nrows are stored.
+//     Each row's dot products are independent of the other rows (same operands, same order), so stored rows are
+//     bitwise those of a call with fewer rows. Passing the real count instead took `r >= nrows` exits inside the
+//     unrolled row loops of every k-tile: measured on Strix 27B IU4 verify windows rows 3 / 6 / 12 = 127.1 / 130.6 /
+//     140.7 ms vs rows 4 / 8 / 16 = 76.5 / 82.6 / 126.8 ms (hip_dense_dec3-STATE.md). Default: core
 //     calls of up to 8 rows (R <= 8: one call, every weight word read once; R = 16: two 8-row calls), bitwise equal
 //     to the chunked form (per-row op order is identical). One call over 16 rows was measured slower (rows 16
 //     verify 272.8 vs 220.7 ms, Strix 27B IU4) and spills (private segment 144 B): not offered.
@@ -22,6 +27,7 @@
 #include <stdexcept>
 
 #include "strix/env_flags.hpp"
+#include "iu4_x_pairs.hpp"
 #include "w4a16.hpp"
 
 namespace strix::core::dense_iu4 {
@@ -47,13 +53,24 @@ __global__ void to_f16_kernel(const float* x, _Float16* h, std::size_t count) {
         h[i] = static_cast<_Float16>(v != v ? v : fminf(65504.0F, fmaxf(-65504.0F, v)));
     }
 }
+// Same conversion, stored in the pre-paired layout of the scalar-activation core (permutation inside 8-k blocks; rows
+// start on block boundaries because inputs % 64 == 0).
+template <int = 0>
+__global__ void to_f16_paired_kernel(const float* x, _Float16* h, std::size_t count) {
+    for (std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += std::size_t(gridDim.x) * blockDim.x) {
+        const float v = x[i];
+        h[iu4_pairs::paired_index(i)] = static_cast<_Float16>(v != v ? v : fminf(65504.0F, fmaxf(-65504.0F, v)));
+    }
+}
 
-template <unsigned R, unsigned MaxG, unsigned Rc = R>
+template <unsigned R, unsigned MaxG, unsigned Rc = R, bool UX = false>
 __global__ void __launch_bounds__(32 * kWaves) kernel(const std::uint8_t* w, unsigned inputs, unsigned outputs, const _Float16* xh,
                                                       float* out, unsigned nrows) {
     constexpr unsigned S = kWaves, KT = MaxG * 4U;
     __shared__ float part[R * S * 64];
-    const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x / 32U, quad = blockIdx.x;
+    // UX: wave index made wave-uniform (SGPR) so the activation reads of w4a16::wave_rows<..., UniformX> are scalar loads.
+    const unsigned lane = threadIdx.x & 31U, quad = blockIdx.x;
+    const unsigned wave = UX ? __builtin_amdgcn_readfirstlane(threadIdx.x / 32U) : threadIdx.x / 32U;
     const auto* ws = reinterpret_cast<const std::uint16_t*>(w + packed_bytes(outputs, inputs));
     const unsigned k0 = wave * KT;
     float res[R][2];
@@ -62,9 +79,9 @@ __global__ void __launch_bounds__(32 * kWaves) kernel(const std::uint8_t* w, uns
 #pragma unroll
     for (unsigned h = 0; h * Rc < R; ++h) {
         if (h * Rc >= nrows) break;
-        const unsigned n = nrows - h * Rc;
-        w4a16::wave_rows<Rc, KT, MaxG>(w, ws, outputs, inputs, k0, k0 + KT, quad * 4U, xh + std::size_t(h * Rc) * inputs + k0 * 16U,
-                                       inputs, lane, n < Rc ? n : Rc,
+        // all Rc rows of a call that holds a real row (the full-bucket instruction stream); the store keeps r < nrows
+        w4a16::wave_rows<Rc, KT, MaxG, false, false, UX>(w, ws, outputs, inputs, k0, k0 + KT, quad * 4U, xh + std::size_t(h * Rc) * inputs + k0 * 16U,
+                                       inputs, lane, Rc,
                                        [&](unsigned, unsigned r, unsigned column, float value) { res[h * Rc + r][column & 1U] += value; });
     }
     const unsigned rel = (lane >> 3U) * 16U + 2U * (lane & 7U);
@@ -89,23 +106,34 @@ inline bool row_reuse() {
     static const bool on = envcfg::flag("STRIX_IU4_ROW_REUSE", true);  // recorded in the effective config
     return on;
 }
+// STRIX_IU4_SCALAR_X: 1 = pre-paired activations read through scalar loads (w4a16 UniformX: same dot2 operands and
+// order, bitwise equal; default since its node A/B: plain 75.73 -> 72.27 ms/token, verify rows 8 118.9 -> 82.6 ms,
+// logits bitwise, HDD2-T1), 0 = natural layout through vector broadcast loads (the previous form). One switch for
+// prepare() and run() (layout and kernel must agree); off under STRIX_IU4_ROW_REUSE=0.
+inline bool scalar_x() {
+    static const bool on = envcfg::flag("STRIX_IU4_SCALAR_X", true) && row_reuse();  // recorded in the effective config
+    return on;
+}
 
 template <unsigned R>
 void launch_bucket(const std::uint8_t* w, unsigned inputs, unsigned outputs, const _Float16* xh, float* out, unsigned rows, hipStream_t s) {
     const dim3 grid(outputs / 64U), block(32U * kWaves);
     constexpr unsigned C = R >= 8U ? 4U : R, M = R > 8U ? 8U : R;
-    const bool mid = R <= 4U || row_reuse();
+    const bool mid = R <= 4U || row_reuse(), sx = scalar_x();
     switch (inputs / 512U) {
     case 10U:
-        if (mid) kernel<R, 10U, M><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
+        if (sx) kernel<R, 10U, M, true><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
+        else if (mid) kernel<R, 10U, M><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
         else kernel<R, 10U, C><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
         break;
     case 12U:
-        if (mid) kernel<R, 12U, M><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
+        if (sx) kernel<R, 12U, M, true><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
+        else if (mid) kernel<R, 12U, M><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
         else kernel<R, 12U, C><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
         break;
     default:
-        if (mid) kernel<R, 34U, M><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
+        if (sx) kernel<R, 34U, M, true><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
+        else if (mid) kernel<R, 34U, M><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
         else kernel<R, 34U, C><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
         break;
     }
@@ -139,7 +167,8 @@ inline void reference(const std::uint8_t* w, unsigned inputs, unsigned outputs, 
 
 // Converts the F32 activations once; several projections of the same x (q/k/v, gate/up) share the prepared rows.
 inline void prepare(const float* x, _Float16* xh, unsigned inputs, unsigned rows, hipStream_t s) {
-    to_f16_kernel<0><<<64, 256, 0, s>>>(x, xh, std::size_t(rows) * inputs);
+    if (scalar_x()) to_f16_paired_kernel<0><<<64, 256, 0, s>>>(x, xh, std::size_t(rows) * inputs);
+    else to_f16_kernel<0><<<64, 256, 0, s>>>(x, xh, std::size_t(rows) * inputs);
 }
 // xh: FP16 rows from prepare(); out: F32 [rows][outputs]; rows 1..16.
 inline void run(const std::uint8_t* w, unsigned inputs, unsigned outputs, const _Float16* xh, float* out, unsigned rows, hipStream_t s) {

@@ -19,8 +19,11 @@
 
 #include "strix/cuda_core/attention_policy.hpp"
 #include "strix/cuda_core/dense.hpp"
+#include "strix/cuda_core/operand_cache_plan.hpp"
 #include "strix/qwen35/config.hpp"
 #include "strix/qwen35/engine_types.hpp"
+
+namespace strix::spec { class DraftRows; }
 
 namespace strix::qwen35 {
 
@@ -71,6 +74,12 @@ struct EngineOptions {
     cuda_core::FlashTail flash_tail = cuda_core::FlashTail::split;
     // attn8: e4m3 flash attention over an e4m3 shadow of the KV cache (bit-changing, own identity suffix "-a8"; FAST gate required).
     bool prefill_attn8 = false;
+    // Resident expanded prefill operands (strix/cuda_core/operand_cache_plan.hpp, shared dense_big core): each NVFP4 / q8_0 weight
+    // is expanded into its MMA operand once per engine instead of once per chunk, slot and request. Bitwise neutral (same bytes,
+    // same kernel). auto = FAST8 e4m3 operands only (the measured per-call cost), on = also the exact f16 / q8 operands; both
+    // under free VRAM - max(4 GiB, 10 % total) and prefill_operand_cache_cap_mib (0 = no cap). off = per-call expansion.
+    cuda_core::operand_cache::Mode prefill_operand_cache = cuda_core::operand_cache::Mode::automatic;
+    std::uint32_t prefill_operand_cache_cap_mib = 0;
 };
 
 // Named identity of the arithmetic + weight source; also the prefix-cache key (caches never mix identities).
@@ -156,6 +165,12 @@ public:
     };
     MtpOut mtp_forward(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0,
                     bool want_top = true);  // want_top=false: skip lm_head + argmax (logits/top null): KV/hidden only
+    // Draft-only MTP head over a vocabulary subset (strix/spec/draft_rows.hpp, group 16 = one NVFP4 tile of the head):
+    // before each head launch the engine copies the rows' new tiles into a compact head (device-to-device, no
+    // re-quantisation) and maps the argmax back to token ids on the device, so MtpOut::top stays a token id. MtpOut::logits
+    // then hold the compact rows. nullptr = the full head (default). Requires an NVFP4 lm_head; the caller keeps `rows`
+    // alive while set. Drafts only steer acceptance: verify emits the target's own tokens either way.
+    void set_draft_rows(strix::spec::DraftRows* rows);
 
     // Host copies (synchronize the stream).
     void read_logits(const RowsOut& o, std::uint32_t row, float* host_vocab) const;

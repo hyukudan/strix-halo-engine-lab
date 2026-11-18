@@ -82,9 +82,33 @@ struct ArbiterConfig {
     std::uint32_t retreat_misses = 2;   // consecutive first-row misses that bar a source (lookup: until new evidence;
                                         // never a black-box drafter: its measured rate already prices its misses)
     double retreat_confidence = 0.01;   // learned drafter: bar only a miss streak at most this probable under its rate
+    // ... over this many passes (the evidence horizon), not per pass: per pass, a 0.64 first-row rate barred after 5 misses,
+    // which happens by chance ~2.3 times per 580 passes (measured on CUDA dense 27B Japanese prose: 33-566 serial passes per
+    // 1,200 tokens, ~4.7 % at 32 serial passes per bar), while a miss pass costs only its drafts. 0 = the per-pass form.
+    double retreat_horizon = 256.0;
     double min_lookup_evidence = 4.0;   // observations a lookup bucket needs before lookup may run (fresh buckets:
                                         // depth 1; resumed copy buckets: one hazard per emitted position)
     std::uint32_t min_model_passes = 3; // the learned drafter runs this often before it is compared
+    // Frontier probe (per-depth learned drafter only): expected() credits nothing to a depth no proposal has reached, and a
+    // drafter that wins at k only learns depths <= k + 1 of what it offers, so after a first-row miss on the first probe it
+    // stayed at k = 1 for good (measured: 290 of 291 MTP passes at depth 1, E 1.76, where depth 2 was worth ~0.5 token).
+    // While the model arm wins at k and depth k + 1 has decayed evidence below frontier_evidence, it offers k + 1 once every
+    // frontier_every passes. 0 = off (the previous form). Drafts never change emitted tokens; this only prices depth.
+    std::uint32_t frontier_every = 8;
+    double frontier_evidence = 0.5;
+    // The probe is charged its cost: it fires only when its priced score (expected tokens / (verify + draft ms)) is within
+    // frontier_loss of the pick, so it can cost at most frontier_loss / frontier_every of the throughput per pass.
+    double frontier_loss = 0.05;
+    // Per-depth learned drafter: the cumulative survival S_j is shrunk toward the geometric continuation of the shallower
+    // depths (m_j = B_{j-1}^2 / B_{j-2}, m_1 = the prior mean) instead of the flat prior mean, and a depth without evidence is
+    // priced at m_j. The flat mean (false, the previous form) pulls deep, little-evidenced S_j up toward 0.5: measured on the
+    // CUDA dense 27B Japanese prose, S_4 0.048 was priced 0.12 and the arm ran k = 4-5 instead of the k = 3 optimum (-3.8 %).
+    // Lookup sources keep the flat prior (their depth is bounded by the proposal). Only k changes; tokens never do.
+    bool model_continuation = true;
+    // false: measured walls never enter a decision; the seeded cost model (seed_cost) prices every window, so decide() is a
+    // pure function of the seeds and the acceptance history (deterministic for a fixed prompt). Walls are still reported by
+    // the caller's stats. true (the previous form): every pass's wall is folded into the window's cost.
+    bool learn_costs = true;
     double cost_weight_cap = 8.0;       // verify-cost EWMA: a new wall weighs >= 1/(cap+1)
     double cost_aging = 0.995;          // per pass, every window's weight decays (stale windows re-learn fast)
     double lookup_overhead_ms = 0.0;    // extra cost of a lookup pass (the proposal itself is computed every step: sunk)
@@ -164,7 +188,7 @@ private:
     std::vector<Pending> pending_;  // unresolved lookup proposals, oldest first (at most max_proposal)
     std::array<Costs, context_bins> cost_{};
     Source last_ = Source::serial;
-    std::uint64_t passes_ = 0, last_model_ = 0, model_passes_ = 0, model_barred_until_ = 0;
+    std::uint64_t passes_ = 0, last_model_ = 0, model_passes_ = 0, model_barred_until_ = 0, last_frontier_ = 0;
     std::uint32_t model_misses_ = 0, lookup_misses_ = 0;
     bool last_black_box_ = false;  // the last model decision used the drafter's measured rate (no retreat for it)
     bool lookup_barred_ = false;

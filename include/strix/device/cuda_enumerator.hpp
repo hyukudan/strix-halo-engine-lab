@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/device/eager_code_load.hpp"
 #include "strix/device/gate.hpp"
 
 #include <cuda_runtime.h>
@@ -66,6 +67,12 @@ inline const Bound& bind_cuda(Request request = {}, const std::string& devices_p
     const std::lock_guard<std::mutex> lock(process.mutex);
     const auto fail = [](const std::string& why) -> void { throw Refusal("device gate: refusing to start: " + why); };
     if (!process.bound) {
+        // Before the first CUDA call (the driver reads it at cuInit): eager module loading, shared policy with HIP.
+        const auto get = [](const char* name) { return strix::envcfg::text(name); };
+        const bool eager_set = apply_eager_cuda_module_loading(get, [](const char* name, const char* value) {
+            try { set_process_environment(name, value); } catch (const Refusal&) { return false; }
+            return true;
+        });
         request.vendor = Vendor::nvidia;
         Bound chosen;
         if (auto listed = query_nvidia_smi()) {
@@ -92,7 +99,7 @@ inline const Bound& bind_cuda(Request request = {}, const std::string& devices_p
         chosen.visible = *match;
         if (const auto status = cudaSetDevice(0); status != cudaSuccess) fail(std::string("cudaSetDevice failed: ") + cudaGetErrorString(status));
         if (receipt) {
-            std::fprintf(receipt, "%s\n", receipt_line(chosen).c_str());
+            std::fprintf(receipt, "%s\n%s\n", receipt_line(chosen).c_str(), cuda_code_load_receipt(get, eager_set).c_str());
             std::fflush(receipt);
         }
         process.bound = std::move(chosen);

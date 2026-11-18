@@ -1695,12 +1695,14 @@ void recurrent_step_kernel(
 // reads and writes it through memory every row). Row r runs exactly the operations of recurrent_step_kernel on the
 // qkv / beta / gate / core of row r (strides below), in the same order, so the bits equal `rows` separate launches;
 // the stored state of row r is the retained value the next row loads (a float round trip is exact).
+// `state` is loaded once before any store and the final tile goes to `state_out` (== state for in place): out of place
+// leaves `state` untouched with bitwise the same stored result (verify windows keep it as the checkpoint).
 // The reduction buffer's physical index is the form F (gdn_recurrent_lds_index.hpp): column_major (default) is
 // conflict-free; lane_major is the original placement (STRIX_GDN_ROWS_LDS_LANE_MAJOR=1). Same elements, pairs, order.
 template <gdn_recurrent_lds::Form F>
 __global__ __launch_bounds__(kRecurrentThreads)
 void recurrent_rows_kernel(
-    const float* qkv, const float* beta, const float* gate, float* state, float* core,
+    const float* qkv, const float* beta, const float* gate, const float* state, float* state_out, float* core,
     std::uint32_t key_heads, std::uint32_t value_heads, std::uint32_t head_dim, std::uint32_t rows,
     std::uint64_t qkv_stride, std::uint64_t core_stride) {
     const auto tile_count = head_dim / kValueTile;
@@ -1770,7 +1772,7 @@ void recurrent_rows_kernel(
     }
 #pragma unroll
     for (std::uint32_t column = 0; column < kValueTile; ++column)
-        state[(static_cast<std::uint64_t>(value_head) * head_dim + lane) * head_dim + value_base + column] = retained[column];
+        state_out[(static_cast<std::uint64_t>(value_head) * head_dim + lane) * head_dim + value_base + column] = retained[column];
 }
 #ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
 template <unsigned Rows> struct GdnRecurrentWindowPointers {
@@ -8253,8 +8255,11 @@ void hip_gdn_decode_step_dims(const HipGdnDimsStep& v, void* stream_ptr) {
     // row-layer on the 48 x 128 x 128 shape vs ~8.7 us for rows_kernel) runs the first multiple of its chunk; rows_kernel
     // continues from the state it stored. Same operations, operand pairs and order as rows_kernel: the same bits
     // (include/strix/gdn_recurrence_rows.hpp). STRIX_GDN_DIMS_COLS=0: rows_kernel for every row.
+    // A deferred verify window writes its state to v.matrix_out and keeps v.matrix as the checkpoint; the chunked core
+    // updates its state in place, so such a window runs rows_kernel for every row (in -> out, the measured decode form).
     using QCols = qpf2k_gdn::ColsDefault;
-    const auto part = gdn_recurrence::split(window && gdn_dims_cols() ? v.rows : 0U, QCols::Chunk);
+    const bool in_place = v.matrix_out == nullptr || v.matrix_out == v.matrix;
+    const auto part = gdn_recurrence::split(window && in_place && gdn_dims_cols() ? v.rows : 0U, QCols::Chunk);
     const gdn_recurrence::Rows all{v.qkv, v.beta, v.gate, v.core, channels, v.value_heads, static_cast<std::uint64_t>(v.value_heads) * d};
     if (part.bulk)
         hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_qpf2k_cols_kernel<GdnRecurrentStorage::key_value, QCols::G, QCols::C, QCols::W,
@@ -8263,7 +8268,8 @@ void hip_gdn_decode_step_dims(const HipGdnDimsStep& v, void* stream_ptr) {
             all, part.bulk, v.matrix, v.key_heads, static_cast<const unsigned*>(nullptr));   // Nan 3 (pinned): the flag is not read
     if (const auto tail = gdn_recurrence::advance(all, part.bulk); part.bulk < v.rows)
         hipLaunchKernelGGL(rows_kernel, dim3(v.value_heads * (d / kValueTile)), dim3(d), 0, stream,
-            tail.qkv, tail.beta, tail.gate, v.matrix, tail.core, v.key_heads, v.value_heads, d, v.rows - part.bulk,
+            tail.qkv, tail.beta, tail.gate, v.matrix, v.matrix_out ? v.matrix_out : v.matrix, tail.core,
+            v.key_heads, v.value_heads, d, v.rows - part.bulk,
             static_cast<std::uint64_t>(channels), static_cast<std::uint64_t>(v.value_heads) * d);
     if (window && v.norm_kind == HipGdnGatedNorm::swish)
         hipLaunchKernelGGL(gated_rms_norm_swish_kernel, dim3(v.value_heads, v.rows), dim3(d), 0, stream,
