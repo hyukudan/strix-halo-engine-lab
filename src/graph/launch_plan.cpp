@@ -47,6 +47,7 @@ private:
     std::uint32_t rows_;
     const FusionPolicy& f_;
     std::vector<int> owner_;
+    std::vector<int> head_src_;  // per launch: the writer of its head's first input when the launch opened
     std::map<std::string_view, int> writer_;
 
     const StageDecl& d(std::uint32_t i) const { return *p_.instances[i].decl; }
@@ -67,6 +68,7 @@ private:
         l.layer = p_.instances[i].layer;
         l.rows = rows_;
         p_.launches.push_back(std::move(l));
+        head_src_.push_back(writer(d(i).in[0]));
         owner_[i] = back();
     }
     void join(std::uint32_t i, int launch, std::vector<std::uint32_t> Launch::*part) {
@@ -147,7 +149,9 @@ private:
         if (s.op == Op::linear) {  // rule 1
             for (int k = back(); k >= 0 && p_.launches[static_cast<std::size_t>(k)].layer == in.layer; --k) {
                 const auto h = p_.launches[static_cast<std::size_t>(k)].stages.front();
-                if (d(h).op != Op::linear || d(h).in[0] != s.in[0] || p_.instances[h].format != in.format) continue;
+                if (d(h).op != Op::linear || d(h).in[0] != s.in[0] || p_.instances[h].format != in.format ||
+                    head_src_[static_cast<std::size_t>(k)] != writer(s.in[0]))
+                    continue;  // a different value in the same buffer name is a different input
                 bool ready = true;
                 for (const auto b : s.in)
                     if (!b.empty() && producer(b) >= k) ready = false;

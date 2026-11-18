@@ -147,6 +147,20 @@ void contracts() {
     g.layers = {0U, 0U};
     check(format_of(g, "w", 0) == Format::q4_k && format_of(g, "w", 1) == Format::q6_k && format_of(g, "v", 1) == Format::q8_0,
           "format_of: later rules win, layer lists");
+    // fused rule 1 groups by input VALUE: a buffer name rewritten in between is a different input
+    static constexpr StageDecl rw[] = {
+        {.id = "n1", .op = Op::norm, .in = {"x"}, .out = "xn", .reduce = true},
+        {.id = "a", .op = Op::linear, .in = {"xn"}, .out = "ya", .operand = weights("wa", 64, 64)},
+        {.id = "n2", .op = Op::norm, .in = {"ya"}, .out = "xn", .reduce = true},
+        {.id = "b", .op = Op::linear, .in = {"xn"}, .out = "yb", .operand = weights("wb", 64, 64)},
+        {.id = "c", .op = Op::linear, .in = {"xn"}, .out = "yc", .operand = weights("wc", 64, 64)},
+    };
+    g.layer = rw;
+    g.layers = {0U};
+    const auto p = launch_plan(g, 0U, 1U, {.mode = Fusion::fused});
+    check(p.launches.size() == 2U && p.launches[0].stages.size() == 1U && p.launches[1].stages.size() == 2U &&
+              p.launches[1].prologue.size() == 1U,
+          "fused: no group across a rewritten input; b + c grouped with n2 as prologue");
 }
 
 void rows() {
