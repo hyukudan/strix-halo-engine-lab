@@ -77,9 +77,11 @@ struct EngineOptions {
     // Large-M prefill (CudaEngine::prefill). Default exact = bitwise equal to the windowed path.
     PrefillArith prefill_arith = PrefillArith::exact;
     PrefillGdn prefill_gdn = PrefillGdn::serial;  // ignored (and not in the identity) under prefill_arith exact
-    // FAST4 only: the hidden RMSNorms (attn / post) are folded into the A-operand quantiser (cuda_core dense_big_norm_split4), so
-    // no f32 normalised rows are written and re-read. Bitwise equal to norm + quantise (no identity suffix); a non-FAST4 consumer gets the f32 rows materialised on demand.
-    // Default on: identity PASS + strict A/B x3 on the device (8K FAST4 + chunk16 -4.4 %); --prefill-norm-fold off is the rollback.
+    // FAST4 only: the hidden RMSNorms (attn / post) and, on the chunked GDN path, the gated RMSNorm of the ssm_out input are folded
+    // into the A-operand quantiser (cuda_core dense_big_norm_split4 / dense_big_gated_norm_split4), so no f32 normalised rows are
+    // written and re-read. Bitwise equal to norm + quantise (no identity suffix); a non-FAST4 consumer gets the f32 rows materialised
+    // on demand. Default on: identity PASS + strict A/B x3 on the device for the hidden fold (8K FAST4 + chunk16 -4.4 %);
+    // --prefill-norm-fold off is the rollback.
     bool prefill_norm_fold = true;
     std::uint32_t prefill_chunk = 2048;  // rows per large-M chunk (multiple of 128, <= 8192); buffers are allocated on first use
     // Wave-aligned steps (strix/wave_fit.hpp, scheduling only, bitwise): prompts of >= this many tokens step by the largest

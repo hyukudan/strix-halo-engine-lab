@@ -934,6 +934,9 @@ struct CudaEngine::Impl {
         // straight from x or materialises the f32 rows. A GEMM writing x drops a pending xn (xn_dead: reading it would be an error).
         const float* norm_gain = nullptr;
         bool xn_dead = false;
+        // The same for the chunked GDN output: gout holds the raw delta-rule rows and its gated RMSNorm (gain gout_gain, gate z) is
+        // PENDING while gout_gain != nullptr (gdn_prefill_layer ran with defer_norm); pf_act folds it into the ssm_out quantiser.
+        const float* gout_gain = nullptr;
     };
     struct CacheDel {
         void operator()(cc::BigOperandCache* p) const { cc::dense_big_cache_destroy(p); }
@@ -1088,6 +1091,15 @@ struct CudaEngine::Impl {
         }
         const int cls = w.format == cc::WeightFormat::nvfp4 ? 1 : 0;
         if (x == sl.xn && sl.xn_dead) throw std::logic_error("prefill: normalised rows read after their residual source was overwritten");
+        if (x == sl.gout && sl.gout_gain != nullptr && !sl.have[cls]) {
+            if (cls == 1 && opt.prefill_arith == PrefillArith::fast4 && w.in == gd.v_width()) {
+                CK(cc::dense_big_gated_norm_split4(sl.gout, sl.z, sl.gout_gain, c.rms_eps, rows, w.in, &sl.act[1], sl.st, sl.bc));
+                sl.have[1] = true;
+            } else {  // any other consumer: apply the norm in place first (the unfolded chunked path)
+                CK(cc::gdn_chunk_norm(gd, sl.gout_gain, sl.z, sl.gout, rows, c.rms_eps, sl.st));
+                sl.gout_gain = nullptr;
+            }
+        }
         if (x == sl.xn && sl.norm_gain != nullptr && !sl.have[cls]) {
             if (cls == 1 && opt.prefill_arith == PrefillArith::fast4 && w.in == c.hidden) {
                 CK(cc::dense_big_norm_split4(sl.x, sl.norm_gain, c.rms_eps, rows, w.in, &sl.act[1], sl.st, sl.bc));
@@ -1208,8 +1220,13 @@ struct CudaEngine::Impl {
                 pf_gemm(sl, w.beta, sl.xn, rows, sl.br, nullptr, cc::BigEpi::none);
                 pf_gemm(sl, w.alpha, sl.xn, rows, sl.ar, nullptr, cc::BigEpi::none);
                 const auto& cl = commit_layers[gi++];
+                // FAST4 norm fold on the chunked path: the gated RMSNorm is left pending and folded into the ssm_out A operand (bitwise)
+                cc::GdnChunkWork gw = sl.gdn_ws;
+                gw.defer_norm = opt.prefill_norm_fold && opt.prefill_arith == PrefillArith::fast4 && gw.ws != nullptr &&
+                                w.out.format == cc::WeightFormat::nvfp4 && cc::dense_big_norm_split4_fits(gd.v_width());
                 CK(cc::gdn_prefill_layer(gd, cl.layer, cl.state, cc::GdnWindow{sl.raw, sl.qkvc, sl.ar, sl.br}, sl.z, sl.gout, rows, c.rms_eps,
-                                         sl.cpar, sl.gdn_ws, sl.st));
+                                         sl.cpar, gw, sl.st));
+                sl.gout_gain = gw.defer_norm ? cl.layer.norm_gain : nullptr;
                 pf_gemm(sl, w.out, sl.gout, rows, sl.x, sl.x, cc::BigEpi::residual);
                 pf_dirty(sl);
             } else {
@@ -1613,7 +1630,7 @@ void print_effective_config(const EngineOptions& o, const char* arith, std::FILE
                                                         : "serial (decode recurrence, bitwise)");
     std::fprintf(f, "  prefill-norm-fold: %s\n",
                  o.prefill_arith != PrefillArith::fast4 ? "n/a (FAST4 only)"
-                 : o.prefill_norm_fold ? "on (hidden RMSNorm folded into the FAST4 quantiser, bitwise)"
+                 : o.prefill_norm_fold ? "on (hidden RMSNorm + chunked-GDN gated RMSNorm folded into the FAST4 quantiser, bitwise)"
                                        : "off (rmsnorm + quantise)");
     std::fprintf(f, "  prefill-inflight: %u%s (bounded submission, scheduling only, bitwise)\n  prefill-ramp: %u%s\n", o.prefill_inflight,
                  o.prefill_inflight ? " chunks" : " = unbounded", o.prefill_ramp, o.prefill_ramp ? " rows first chunk, doubling to prefill-chunk" : " (off)");

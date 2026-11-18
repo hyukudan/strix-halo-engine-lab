@@ -15,5 +15,10 @@ cudaError_t quantize_enqueue(const float* x, std::uint32_t rows, std::uint32_t i
 // bit-identical X tile + rs, with no normalised row written to memory. Requires norm_quantize_fits(in); gain may be null (no gain).
 cudaError_t norm_quantize_enqueue(const float* x, const float* gain, float eps, std::uint32_t rows, std::uint32_t in, std::uint8_t* x_tile,
                                   float* rs, cudaStream_t stream);
+// The GDN value-head gated RMSNorm (cuda_core gdn_chunk_norm: per kGatedNormHead-wide head h of row r, y = x * inv_h * gain[pos] *
+// silu(z)) quantised as quantize_enqueue would quantise its f32 output: bit-identical X tile + rs. x and z: rows x in (stride in), gain:
+// kGatedNormHead values. Requires norm_quantize_fits(in) (in % kK == 0 implies whole heads).
+cudaError_t gated_norm_quantize_enqueue(const float* x, const float* z, const float* gain, float eps, std::uint32_t rows,
+                                        std::uint32_t in, std::uint8_t* x_tile, float* rs, cudaStream_t stream);
 cudaError_t gemm_enqueue(const GemmArgs& args, cudaStream_t stream);
 }  // namespace strix::cuda::core::nvfp4::tile

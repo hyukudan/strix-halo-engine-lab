@@ -7,6 +7,7 @@
 #include "strix/cuda_core/gdn_chunk.hpp"
 
 #include "../common.cuh"
+#include "gated_norm.cuh"
 
 namespace strix::cuda_core {
 namespace {
@@ -293,9 +294,12 @@ __global__ void __launch_bounds__(128) chunk_scan_kernel(const float* __restrict
     }
 }
 
-// ---- K3: gated RMSNorm (swish gate) of one (row, value head); same formula as the serial kernel's epilogue.
+// ---- K3: gated RMSNorm (swish gate) of one (row, value head); same formula as the serial kernel's epilogue. The arithmetic is
+// gated_norm.cuh, shared with the FAST4 folded quantiser (nvfp4_tile.cuh GatedHeadNorm), which relies on warp q holding positions
+// 32 q .. 32 q + 31 in lane order.
 __global__ void __launch_bounds__(128) chunk_norm_kernel(float* __restrict__ out, const float* __restrict__ z,
                                                          const float* __restrict__ gain, GdnDims d, float eps) {
+    static_assert(static_cast<unsigned>(D) == kGatedHead, "chunk_norm: one CTA = one gated-norm head");
     __shared__ float red[4];
     const std::uint32_t h = blockIdx.x, r = blockIdx.y, t = threadIdx.x;
     const std::size_t o = static_cast<std::size_t>(r) * d.v_width() + h * D + t;
@@ -303,11 +307,7 @@ __global__ void __launch_bounds__(128) chunk_norm_kernel(float* __restrict__ out
     const float s = warp_sum_xor(__fmul_rn(acc, acc));
     if ((t & 31) == 0) red[t >> 5] = s;
     __syncthreads();
-    const float ss = __fadd_rn(__fadd_rn(__fadd_rn(red[0], red[1]), red[2]), red[3]);
-    const float inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(ss, 128.0f), eps)));
-    float v = __fmul_rn(acc, inv);
-    v = __fmul_rn(v, gain[t]);
-    out[o] = __fmul_rn(v, cc_silu(z[o]));
+    out[o] = gated_head_value(acc, gated_head_inv(red[0], red[1], red[2], red[3], eps), gain[t], z[o]);
 }
 
 }  // namespace
@@ -326,7 +326,15 @@ cudaError_t gdn_chunk_delta(const GdnDims& d, const GdnLayer& layer, const GdnSt
     chunk_scan_kernel<<<dim3(d.value_heads, gc::kDim / gc::kVTile), 128, 0, stream>>>(win.qkv_c, w.ws, state.delta_base, out, d, rows,
                                                                                      parity_dev);
     if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
-    chunk_norm_kernel<<<dim3(d.value_heads, rows), 128, 0, stream>>>(out, z, layer.norm_gain, d, eps);
+    if (w.defer_norm) return cudaSuccess;
+    return gdn_chunk_norm(d, layer.norm_gain, z, out, rows, eps, stream);
+}
+
+cudaError_t gdn_chunk_norm(const GdnDims& d, const float* norm_gain, const float* z, float* out, std::uint32_t rows, float eps,
+                           cudaStream_t stream) {
+    if (d.value_dim != gc::kDim || rows == 0 || rows > 65535u || norm_gain == nullptr || z == nullptr || out == nullptr)
+        return cudaErrorInvalidValue;
+    chunk_norm_kernel<<<dim3(d.value_heads, rows), 128, 0, stream>>>(out, z, norm_gain, d, eps);
     return cudaGetLastError();
 }
 

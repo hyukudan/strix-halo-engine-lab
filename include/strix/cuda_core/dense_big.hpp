@@ -59,6 +59,10 @@ cudaError_t dense_big_split4(const float* x, std::uint32_t rows, std::uint32_t i
 [[nodiscard]] bool dense_big_norm_split4_fits(std::uint32_t in);
 cudaError_t dense_big_norm_split4(const float* x, const float* gain, float eps, std::uint32_t rows, std::uint32_t in, BigAct* out,
                                   cudaStream_t stream, BigCtx* ctx = nullptr);
+// The same for the GDN value-head gated RMSNorm: bit for bit gdn_chunk_norm(gain, z -> x in place) followed by dense_big_split4(x),
+// with x left un-normalised. Same width rule (dense_big_norm_split4_fits); gain = the layer's norm_gain (128 values).
+cudaError_t dense_big_gated_norm_split4(const float* x, const float* z, const float* gain, float eps, std::uint32_t rows, std::uint32_t in,
+                                        BigAct* out, cudaStream_t stream, BigCtx* ctx = nullptr);
 // FAST4 fused gate/up: y[r][c] = silu(gate_r[c]) * up_r[c] in ONE GEMM (gate and up 16-row tiles of the same channels side by side
 // in each warp, SwiGLU in registers; same rounding steps as BigEpi::silu_mul on two GEMMs). a must come from dense_big_split4.
 cudaError_t dense_big_glu4(const DenseWeight& gate, const DenseWeight& up, const BigAct& a, float* y, cudaStream_t stream,

@@ -12,6 +12,7 @@
 
 #include "strix/cuda/core/nvfp4_tile.hpp"
 #include "../../../../cuda_core/common.cuh"
+#include "../../../../cuda_core/gdn/gated_norm.cuh"
 
 namespace strix::cuda::core::nvfp4::tile::sm120 {
 constexpr std::uint32_t kThreads = 256, kStages = 3, kSlotsA = 8, kSlotsB = 32;
@@ -243,15 +244,74 @@ __global__ void __launch_bounds__(256) quantize_kernel(const float* __restrict__
     for (std::uint32_t q = threadIdx.x; q < groups; q += blockDim.x) quantize_group(row + 4 * q, ts, r, q, in, xt);
 }
 
-// The hidden RMSNorm folded into the quantiser: the FAST4 A operand straight from the residual stream, no f32 normalised row in
-// memory. The row arithmetic is cuda_core norm_kernel<rms> verbatim (src/cuda_core/norms/norms.cu): thread t holds x[t + 256 i],
-// p += x*x in ascending i (padding terms 0 add +0), block_sum256, inv = 1 / sqrt(ss / n + eps), y = (x * inv) * gain; so the f32 row
-// equals rmsnorm's output bit for bit, and the exact max + quantize_group give the same codes / scales / rs as rmsnorm followed by
-// quantize_kernel. One CTA per row, NREG * 256 >= in; dynamic smem in * 4 bytes holds the normalised row for the 16-group pass.
-template <int NREG>
-__global__ void __launch_bounds__(256) norm_quantize_kernel(const float* __restrict__ x, const float* __restrict__ gain, float eps,
-                                                            std::uint32_t rows, std::uint32_t in, std::uint8_t* __restrict__ xt,
-                                                            float* __restrict__ rs) {
+// Row normalisers folded into the quantiser (norm_quantize_kernel's Norm trait). apply() turns thread t's elements v[i] = x[t + 256 i]
+// (idx < in; padding entries are 0) into the normalised values with the arithmetic of the norm kernel they replace, so the f32 row
+// equals that kernel's output bit for bit and the exact max + quantize_group give the same codes / scales / rs as norm -> quantise.
+//
+// RmsRowNorm: cuda_core norm_kernel<rms> verbatim (src/cuda_core/norms/norms.cu): ascending per-thread p += x*x (padding adds +0),
+// block_sum256, inv = 1 / sqrt(ss / n + eps), y = (x * inv) * gain (gain may be null).
+struct RmsRowNorm {
+    const float* gain;
+    float eps;
+    template <int NREG>
+    __device__ __forceinline__ void apply(float (&v)[NREG], std::uint32_t, std::uint32_t in, float* red) const {
+        float p = 0.0f;
+#pragma unroll
+        for (int i = 0; i < NREG; ++i) p = __fadd_rn(p, __fmul_rn(v[i], v[i]));
+        const float ss = ::strix::cuda_core::block_sum256(p, red);
+        const float inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(ss, static_cast<float>(in)), eps)));
+#pragma unroll
+        for (int i = 0; i < NREG; ++i) {
+            const std::uint32_t idx = threadIdx.x + 256u * i;
+            if (idx < in) {
+                const float y = __fmul_rn(v[i], inv);
+                v[i] = gain != nullptr ? __fmul_rn(y, gain[idx]) : y;
+            }
+        }
+    }
+};
+
+// GatedHeadNorm: the GDN value-head gated RMSNorm of gdn_chunk.cu chunk_norm_kernel (one CTA per (head, row), 128 threads). Here warp
+// w at step i holds the 32 consecutive elements 256 i + 32 w + lane = head 2 i + (w >> 2), quarter w & 3, lane = position & 31: the
+// same warp_sum_xor input in the same lane order as chunk_norm's warp (w & 3) of that head, so the same partial; the four partials
+// and the inv / gain / silu chain are cuda_core gated_head_inv / gated_head_value (gdn/gated_norm.cuh), shared with chunk_norm.
+// z: the gate rows (stride in), gain: kGatedHead values. Requires in % kGatedHead == 0 and in <= 64 heads.
+struct GatedHeadNorm {
+    const float* z;
+    const float* gain;
+    float eps;
+    template <int NREG>
+    __device__ __forceinline__ void apply(float (&v)[NREG], std::uint32_t r, std::uint32_t in, float*) const {
+        namespace cc = ::strix::cuda_core;
+        static_assert(cc::kGatedHead == 128 && kGatedNormHead == cc::kGatedHead, "two heads per 256-thread step; one head width");
+        __shared__ float part[2 * NREG][4];
+        const std::uint32_t lane = threadIdx.x & 31u, w = threadIdx.x >> 5;
+#pragma unroll
+        for (int i = 0; i < NREG; ++i) {
+            if (256u * i + 32u * w < in) {  // warp-uniform: in % 128 == 0
+                const float s = cc::warp_sum_xor(__fmul_rn(v[i], v[i]));
+                if (lane == 0) part[2 * i + (w >> 2)][w & 3u] = s;
+            }
+        }
+        __syncthreads();
+        const float* zr = z + static_cast<std::size_t>(r) * in;
+#pragma unroll
+        for (int i = 0; i < NREG; ++i) {
+            const std::uint32_t idx = threadIdx.x + 256u * i;
+            if (idx < in) {
+                const float* q = part[idx / cc::kGatedHead];
+                v[i] = cc::gated_head_value(v[i], cc::gated_head_inv(q[0], q[1], q[2], q[3], eps), gain[idx % cc::kGatedHead], zr[idx]);
+            }
+        }
+    }
+};
+
+// A row normaliser (Norm, above) folded into the quantiser: the FAST4 A operand straight from the un-normalised rows, no f32
+// normalised row in memory. One CTA per row, NREG * 256 >= in; dynamic smem in * 4 bytes holds the normalised row for the 16-group
+// pass.
+template <int NREG, class Norm>
+__global__ void __launch_bounds__(256) norm_quantize_kernel(const float* __restrict__ x, const Norm nm, std::uint32_t rows,
+                                                            std::uint32_t in, std::uint8_t* __restrict__ xt, float* __restrict__ rs) {
     extern __shared__ float4 nq_row4[];
     __shared__ float red[8];
     const std::uint32_t r = blockIdx.x, groups = in / 16;
@@ -261,26 +321,20 @@ __global__ void __launch_bounds__(256) norm_quantize_kernel(const float* __restr
     }
     float* const yrow = reinterpret_cast<float*>(nq_row4);
     const float* xp = x + static_cast<std::size_t>(r) * in;
-    float xr[NREG];
-    float p = 0.0f;
+    float v[NREG];
 #pragma unroll
     for (int i = 0; i < NREG; ++i) {
         const std::uint32_t idx = threadIdx.x + 256u * i;
-        xr[i] = idx < in ? xp[idx] : 0.0f;
+        v[i] = idx < in ? xp[idx] : 0.0f;
     }
-#pragma unroll
-    for (int i = 0; i < NREG; ++i) p = __fadd_rn(p, __fmul_rn(xr[i], xr[i]));
-    const float ss = ::strix::cuda_core::block_sum256(p, red);
-    const float inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(ss, static_cast<float>(in)), eps)));
+    nm.apply(v, r, in, red);
     float amax = 0.f;
 #pragma unroll
     for (int i = 0; i < NREG; ++i) {
         const std::uint32_t idx = threadIdx.x + 256u * i;
         if (idx < in) {
-            float v = __fmul_rn(xr[i], inv);
-            if (gain != nullptr) v = __fmul_rn(v, gain[idx]);
-            yrow[idx] = v;
-            amax = fmaxf(amax, fabsf(v));
+            yrow[idx] = v[i];
+            amax = fmaxf(amax, fabsf(v[i]));
         }
     }
 #pragma unroll

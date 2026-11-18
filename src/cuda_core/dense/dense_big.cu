@@ -919,6 +919,15 @@ cudaError_t dense_big_norm_split4(const float* x, const float* gain, float eps, 
                        [&](std::uint8_t* xt, float* rs) { return ftile::norm_quantize_enqueue(x, gain, eps, rows, in, xt, rs, s); });
 }
 
+cudaError_t dense_big_gated_norm_split4(const float* x, const float* z, const float* gain, float eps, std::uint32_t rows, std::uint32_t in,
+                                        BigAct* out, cudaStream_t s, BigCtx* ctx) {
+    if (!dense_big_fast4_supported()) return cudaErrorNotSupported;
+    if (x == nullptr || z == nullptr || gain == nullptr || !ftile::norm_quantize_fits(in)) return cudaErrorInvalidValue;
+    return split4_into(rows, in, out, ctx, [&](std::uint8_t* xt, float* rs) {
+        return ftile::gated_norm_quantize_enqueue(x, z, gain, eps, rows, in, xt, rs, s);
+    });
+}
+
 namespace {
 // W tile operand of w: the resident entry (repacked once) or, without a cache, a per-call repack into the context scratch at `slot`
 // (0 or 1, so a fused gate/up call keeps both operands live).

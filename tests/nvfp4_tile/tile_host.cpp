@@ -348,6 +348,36 @@ void test_stage_chunks(std::uint32_t out, std::uint32_t in, std::uint32_t rows, 
 }
 }  // namespace
 
+// GatedHeadNorm (arch/sm120/nvfp4_tile.cuh) is bitwise equal to gdn_chunk.cu chunk_norm_kernel only if, in the 256-thread row CTA,
+// warp w at register step i holds exactly the 32 elements that chunk_norm's warp (position >> 5) of one head holds, in the same lane
+// order (warp_sum_xor is order-sensitive), each (head, quarter) once, and the warp-uniform guard 256 i + 32 w < in equals every
+// lane's idx < in. Checked for every register bucket the launcher can pick.
+void test_gated_norm_fold_mapping() {
+    static_assert(2 * T::kGatedNormHead == 256 && T::kK % T::kGatedNormHead == 0);
+    for (const std::uint32_t in : {384u, 6144u, 8192u}) {
+        CHECK(T::norm_quantize_fits(in) && in % T::kGatedNormHead == 0);
+        const std::uint32_t need = (in + 255) / 256, heads = in / T::kGatedNormHead;
+        for (const std::uint32_t nreg : {8u, 16u, 24u, 32u}) {
+            if (nreg < need) continue;
+            std::vector<int> seen(static_cast<std::size_t>(heads) * 4, 0);
+            for (std::uint32_t i = 0; i < nreg; ++i)
+                for (std::uint32_t w = 0; w < 8; ++w) {
+                    const bool warp_live = 256 * i + 32 * w < in;
+                    const std::uint32_t h = 2 * i + (w >> 2), q = w & 3;
+                    if (warp_live) ++seen[static_cast<std::size_t>(h) * 4 + q];
+                    for (std::uint32_t lane = 0; lane < 32; ++lane) {
+                        const std::uint32_t idx = 256 * i + 32 * w + lane;
+                        CHECK((idx < in) == warp_live);
+                        if (idx >= in) continue;
+                        const std::uint32_t pos = idx % T::kGatedNormHead;  // chunk_norm thread of this element
+                        CHECK(idx / T::kGatedNormHead == h && (pos >> 5) == q && (pos & 31) == lane);
+                    }
+                }
+            for (const int s : seen) CHECK(s == 1);
+        }
+    }
+}
+
 int main() {
     test_layouts(48, 256);
     test_layouts(32, 384);
@@ -363,10 +393,11 @@ int main() {
     test_epilogue_ownership(80, 20, true);      // GLU, partial 64-channel tile
     test_epilogue_ownership(5120, 4096, false); // engine residual shape (down / o)
     test_norm_quant_fold();
+    test_gated_norm_fold_mapping();
     if (g_fail) {
         std::fprintf(stderr, "nvfp4_tile_host: %d failures\n", g_fail);
         return 1;
     }
-    std::printf("nvfp4_tile_host: PASS (layouts, fragments, coordinates, GLU, quantiser, contract, stage producer, epilogue ownership, norm fold)\n");
+    std::printf("nvfp4_tile_host: PASS (layouts, fragments, coordinates, GLU, quantiser, contract, stage producer, epilogue ownership, norm fold, gated norm fold)\n");
     return 0;
 }
