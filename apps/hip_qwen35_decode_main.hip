@@ -61,8 +61,8 @@ std::vector<int> parse_ids(const std::string& s) {
 
 int main(int argc, char** argv) try {
     using namespace strix::qwen35;
-    std::string model, dump, ids_arg = "1", mtp_arg = "auto", draft_pack;
-    bool draft_rows_on = true, fixed_costs = true;
+    std::string model, dump, ids_arg = "1";
+    HipDenseSpecArgs spec_args;  // the family's shared speculation flags (hip_dense_spec_costs.hpp)
     unsigned wide = 0;
     bool dump_window = false;
     unsigned tf_rows = 0;
@@ -79,28 +79,17 @@ int main(int argc, char** argv) try {
         else if (a == "--rows") rows = strix::core::parse_u32(next());
         else if (a == "--wide") wide = strix::core::parse_u32(next());  // prompt windows of N rows, last-row logits only (N > 16 = FAST wide prefill)
         else if (a == "--dump-logits") dump = next();
-        else if (a == "--dump-window") dump_window = true;
-        else if (a == "--tf-rows") tf_rows = strix::core::parse_u32(next());  // with --wide: the last N prompt tokens as <= 16-row windows (row path), all logits  // with --wide and --gen 0: dump every row of the last window
+        else if (a == "--dump-window") dump_window = true;  // with --wide and --dump-logits: every row of the last wide window
+        else if (a == "--tf-rows") tf_rows = strix::core::parse_u32(next());  // with --wide: the last N prompt tokens as <= 16-row windows (row path), all logits
         else if (a == "--iu4-reference") strix::core::dense_iu4::set_reference(true);  // exactness gate: dequantised-pack reference form
         else if (a == "--max-pos") maxpos = strix::core::parse_u32(next());
         else if (a == "--repeat") repeat = std::max(1U, strix::core::parse_u32(next()));  // prefills per process (reset between): first = cold, last = warm
-        else if (a == "--mtp") mtp_arg = next();      // auto (default: the model's own MTP layer) | off | side GGUF
-        else if (a == "--no-mtp") mtp_arg = "off";
-        else if (a == "--draft-pack") draft_pack = next();  // F1,F2: id packs of the draft subset (hip_spec_defaults.hpp)
-        else if (a == "--draft-rows") {               // on (default) | off: draft-only subset head vs the full head
-            const std::string v = next();
-            if (v != "on" && v != "off") throw std::invalid_argument("--draft-rows on|off");
-            draft_rows_on = v == "on";
-        }
-        else if (a == "--spec-costs") {               // fixed (default: node work model, hip_dense_spec_costs.hpp) | learned (previous form)
-            const std::string v = next();
-            if (v != "fixed" && v != "learned") throw std::invalid_argument("--spec-costs fixed|learned");
-            fixed_costs = v == "fixed";
-        }
+        else if (a == "--no-mtp") spec_args.mtp = "off";
+        else if (parse_hip_dense_spec_arg(a, next, spec_args)) {}  // --mtp, --draft-rows, --draft-pack, --spec-costs
         else throw std::invalid_argument("unknown flag " + a);
     }
     if (model.empty() || rows < 1U || rows > HipEngine::max_rows())
-        throw std::invalid_argument("usage: --model GGUF [--prompt-ids 1,2,3] [--gen N] [--rows 1..16] [--dump-logits FILE] [--iu4-reference] [--mtp auto|off|F] [--draft-rows on|off] [--draft-pack F1,F2] [--spec-costs fixed|learned] [--max-pos N] [--repeat N]; --prompt-ids @FILE reads the list from FILE");
+        throw std::invalid_argument("usage: --model GGUF [--prompt-ids 1,2,3] [--gen N] [--rows 1..16] [--dump-logits FILE] [--iu4-reference] [--mtp auto|off|F] [--draft-rows on|off] [--draft-pack F1,F2] [--spec-costs calibrated|table|learned] [--wide N] [--tf-rows N] [--dump-window] [--max-pos N] [--repeat N]; --prompt-ids @FILE reads the list from FILE");
     if (!ids_arg.empty() && ids_arg[0] == '@') {  // long prompts exceed the per-argument limit of the OS
         std::ifstream f(ids_arg.substr(1));
         if (!f) throw std::invalid_argument("cannot read " + ids_arg.substr(1));
@@ -123,7 +112,7 @@ int main(int argc, char** argv) try {
     std::printf("load time %.1f s\n", load_s);
     const unsigned V = E->vocab();
     // Speculation: one shared resolver (hip_spec_defaults.hpp). --dump-logits needs every position's logits: one row per step.
-    auto plan = resolve_hip_dense_spec(model, dump.empty() ? mtp_arg : std::string("off"), draft_rows_on, draft_pack);
+    auto plan = resolve_hip_dense_spec(model, spec_args, !dump.empty());
     std::unique_ptr<HipMtpChain> chain;
     std::unique_ptr<strix::spec::DraftRows> drows;
     if (!plan.mtp_source.empty()) {
@@ -193,6 +182,18 @@ int main(int argc, char** argv) try {
     }
     std::printf("prompt %zu tokens: %.1f ms\n", prompt.size(), pf_ms);
     std::vector<int> generated{int(dump.empty() ? top[0] : top[last_n - 1U])};
+    // Speculation costs of this device (hip_spec_defaults.hpp hip_dense_measure_costs): after the prompt, before the decode
+    // clock starts; discarded windows, the committed state is untouched.
+    const bool scalar_x = strix::core::dense_iu4::scalar_x();
+    HipDenseCosts costs = hip_dense_table_costs(scalar_x);
+    if (chain) {
+        const auto tc = std::chrono::steady_clock::now();
+        costs = hip_dense_measure_costs(*E, plan.costs, scalar_x, std::uint32_t(generated[0]));
+        std::printf("spec costs: %s (%s), %.0f ms
+", hip_dense_cost_mode_name(plan.costs),
+                    costs.source == HipDenseCostSource::calibrated ? "measured on this device" : "compiled table, FALLBACK",
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc).count());
+    }
 
     std::atomic<bool> run{true};
     std::atomic<long> clk_sum{0}, clk_n{0}, busy_sum{0};
@@ -217,16 +218,16 @@ int main(int argc, char** argv) try {
             drows->admit(std::span<const std::uint32_t>(out.data(), 1));
         }
         const double head_fraction = drows ? double(drows->rows()) / double(V) : 1.0;
-        const bool scalar_x = strix::core::dense_iu4::scalar_x();
-        const auto bc = hip_dense_block_config(plan, fixed_costs, head_fraction);
+        const auto bc = hip_dense_block_config(plan, head_fraction, costs);
         sp::BlockDrafter drafter(bc, chain.get());
-        hip_dense_seed_verify(drafter, bc.max_block, fixed_costs, scalar_x);
-        std::printf("spec config: costs %s, verify ms r1 %.1f r2 %.1f r3 %.1f r4 %.1f r8 %.1f r16 %.1f (iu4 scalar_x %d), "
+        hip_dense_seed_verify(drafter, bc.max_block, bc.fixed_costs, costs);
+        std::printf("spec config: costs %s (%s), verify ms r1 %.1f r2 %.1f r3 %.1f r4 %.1f r8 %.1f r16 %.1f (iu4 scalar_x %d), "
                     "draft flush %.2f step %.2f ms (head %.1f %%), chain cap %u, max block %u, sources copy%s%s\n",
-                    fixed_costs ? "fixed" : "learned", hip_dense_verify_ms(1, scalar_x), hip_dense_verify_ms(2, scalar_x),
-                    hip_dense_verify_ms(3, scalar_x), hip_dense_verify_ms(4, scalar_x), hip_dense_verify_ms(8, scalar_x),
-                    hip_dense_verify_ms(16, scalar_x), int(scalar_x), bc.chain_seed_flush_ms, bc.chain_seed_step_ms,
-                    100.0 * head_fraction, bc.chain_max_k, bc.max_block, bc.chain ? ",chain" : "", bc.hybrid ? ",hybrid" : "");
+                    hip_dense_cost_mode_name(plan.costs), costs.source == HipDenseCostSource::calibrated ? "calibrated" : "table",
+                    hip_dense_verify_ms(costs, 1), hip_dense_verify_ms(costs, 2), hip_dense_verify_ms(costs, 3),
+                    hip_dense_verify_ms(costs, 4), hip_dense_verify_ms(costs, 8), hip_dense_verify_ms(costs, 16), int(scalar_x),
+                    bc.chain_seed_flush_ms, bc.chain_seed_step_ms, 100.0 * head_fraction, bc.chain_max_k, bc.max_block,
+                    bc.chain ? ",chain" : "", bc.hybrid ? ",hybrid" : "");
         drafter.commit(uprompt);
         drafter.commit(std::span<const std::uint32_t>(out.data(), 1));
         std::uint64_t k_hist[HipEngine::max_rows()] = {};  // drafts verified per step

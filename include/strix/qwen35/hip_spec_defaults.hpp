@@ -9,9 +9,13 @@
 //   draft packs --draft-pack F1,F2: id files (tools/build_draft_vocab.py, e.g. --script cjk) that join the subset when
 //               the prompt holds >= pack_min_hits of their ids outside the core (the CUDA dense app's flag and rule).
 //               Without one, a non-Latin request drafts only the core + prompt + emitted ids of its script.
+//   costs       --spec-costs calibrated (default: this device's walls, hip_dense_measure_costs) | table (compiled
+//               fallback) | learned (previous form). Flags parse through parse_hip_dense_spec_arg (hip_dense_spec_costs.hpp):
+//               both apps accept the same flags with the same meaning and end with the same plan, block config and costs.
 // Speculation is exact: verify windows are bitwise equal to row-by-row decode (hip_engine.hpp), and drafts (MTP layer
 // precision, head subset) only steer how many tokens a window accepts, never which tokens are emitted.
 // Home: shared host resolver of the qwen35 HIP family (both apps call it); the mechanisms are shared (strix/spec).
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -31,16 +35,23 @@ struct HipDenseSpecPlan {
     std::string mtp_reason;  // "model" | "file" | "off" | "absent"
     bool draft_rows = false;
     std::vector<std::string> draft_packs;  // pack id files (comma list of --draft-pack)
+    HipDenseCostMode costs = HipDenseCostMode::calibrated;
 };
 
-// `mtp`: "auto" / "" / "off" / "none" / path; `draft_rows`: false = full head (off switch).
-inline HipDenseSpecPlan resolve_hip_dense_spec(const std::string& model, const std::string& mtp, bool draft_rows,
-                                               const std::string& draft_packs = {}) {
+// `mtp`: "auto" / "" / "off" / "none" / path; `draft_rows`: false = full head (off switch). `has_layer` answers whether
+// the model GGUF carries the MTP layer (HipEngine::has_mtp_layer in the apps; a stand-in in host tests).
+// `plain` = the run needs every position's logits (--dump-logits): no speculation, whatever the flags say.
+template <class HasLayer>
+HipDenseSpecPlan resolve_hip_dense_spec(const std::string& model, const HipDenseSpecArgs& args, bool plain, HasLayer&& has_layer) {
     HipDenseSpecPlan p;
+    p.costs = args.costs;
+    const std::string mtp = plain ? std::string("off") : args.mtp;
+    const bool draft_rows = args.draft_rows;
+    const std::string& draft_packs = args.draft_packs;
     if (mtp == "off" || mtp == "none") {
         p.mtp_reason = "off";
     } else if (mtp.empty() || mtp == "auto") {
-        if (HipEngine::has_mtp_layer(model)) {
+        if (has_layer(model)) {
             p.mtp_source = model;
             p.mtp_reason = "model";
         } else {
@@ -58,6 +69,9 @@ inline HipDenseSpecPlan resolve_hip_dense_spec(const std::string& model, const s
     }
     return p;
 }
+inline HipDenseSpecPlan resolve_hip_dense_spec(const std::string& model, const HipDenseSpecArgs& args, bool plain = false) {
+    return resolve_hip_dense_spec(model, args, plain, [](const std::string& m) { return HipEngine::has_mtp_layer(m); });
+}
 
 // Subset rows of the draft head: the shared DraftRows defaults (core + fallback prefix, prompt and emitted ids) at the IU4
 // tile-column granularity.
@@ -72,8 +86,30 @@ inline spec::DraftRowsConfig hip_dense_draft_rows_config(std::uint32_t vocab, co
 // Drafting block of the qwen35 HIP family: windows up to 16 rows (the engine's max), lookup + MTP chain + hybrid, priced
 // by the node work model (hip_dense_spec_costs.hpp: fixed costs, chain cap 15, the CUDA sub15d arm's mechanism) unless
 // `fixed` is false (the previous learned form, cap 7). head_fraction = draft head rows / vocab (1 = full head).
-inline spec::BlockConfig hip_dense_block_config(const HipDenseSpecPlan& plan, bool fixed, double head_fraction) {
-    return hip_dense_spec_block_config(HipEngine::max_rows(), !plan.mtp_source.empty(), fixed, head_fraction);
+inline spec::BlockConfig hip_dense_block_config(const HipDenseSpecPlan& plan, double head_fraction, const HipDenseCosts& costs) {
+    return hip_dense_spec_block_config(HipEngine::max_rows(), !plan.mtp_source.empty(), plan.costs != HipDenseCostMode::learned,
+                                       head_fraction, costs);
+}
+// The plan's costs for this engine (F7: nothing lab-specific by default). calibrated: after the prompt (real context),
+// one warm-up and one timed verify window per row bucket (1 / 2 / 4 / 8 / 16 rows), each discarded (commit(0): the
+// committed state is untouched, as for any rejected window); about 2 x (V1 + V2 + V4 + V8 + V16), ~0.9 s on a 27B pack.
+// Invalid walls fall back to the table (source table, reported). table / learned: the compiled table.
+template <class Engine>
+HipDenseCosts hip_dense_measure_costs(Engine& e, HipDenseCostMode mode, bool scalar_x, std::uint32_t token) {
+    if (mode != HipDenseCostMode::calibrated) return hip_dense_table_costs(scalar_x);
+    std::uint32_t t[Engine::max_rows()];
+    for (auto& v : t) v = token;
+    const std::uint32_t rows[5] = {1U, 2U, 4U, 8U, 16U};
+    double walls[5] = {};
+    for (int pass = 0; pass < 2; ++pass)  // pass 0 warms every bucket's kernels (first launches), pass 1 is timed
+        for (std::uint32_t i = 0; i < 5U; ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
+            (void)e.forward_rows(t, rows[i], Engine::LogitRows::all);  // the verify target's request (spec/engine_target.hpp)
+            e.commit(0);
+            e.sync();
+            walls[i] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        }
+    return hip_dense_calibrated_costs(walls, e.weight_bytes(), e.mtp_weight_bytes(), e.head_weight_bytes(), scalar_x);
 }
 
 // Device glue of the shared MTP chain (strix/spec/mtp_chain.hpp) over HipEngine.

@@ -62,6 +62,8 @@ public:
     [[nodiscard]] std::uint32_t prefill_rows() const;  // widest forward_commit window (options)
     [[nodiscard]] std::uint32_t committed() const;
     [[nodiscard]] std::uint64_t weight_bytes() const;          // bytes read per pass (all weights but the embedding table)
+    [[nodiscard]] std::uint64_t head_weight_bytes() const;     // output head bytes (read by every full-head row pass)
+    [[nodiscard]] std::uint64_t mtp_weight_bytes() const;      // MTP layer bytes (0 before load_mtp)
     [[nodiscard]] std::uint64_t state_bytes_per_pass() const;  // GDN state read + write per pass
     [[nodiscard]] std::uint32_t kv_bytes_per_position() const;
     void reset();  // committed length 0, recurrent state zero, window discarded

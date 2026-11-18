@@ -443,7 +443,7 @@ struct HipEngine::Impl {
     std::vector<unsigned> gdn_index;  // layer -> index among GDN layers (or ~0u)
     unsigned n_gdn = 0;
     std::size_t sb = 0, cb = 0;       // GDN matrix bytes / conv bytes per layer
-    std::size_t pass_weight_bytes = 0, kv_pos_bytes = 0;
+    std::size_t pass_weight_bytes = 0, kv_pos_bytes = 0, mtp_bytes = 0;
     float *gdn_all = nullptr, *bak_state = nullptr;  // allocations; roles (committed / window target) live in gdn_buf
     core::WindowStateBuffers<float> gdn_buf;
     std::uint16_t *conv_all = nullptr, *bak_conv = nullptr;
@@ -786,6 +786,10 @@ struct HipEngine::Impl {
         mtp.hnorm = loader.load(b + "nextn.hnorm");
         mtp.shnorm = loader.load(b + "nextn.shared_head_norm");
         mtp.eh = loader.load(b + "nextn.eh_proj");
+        mtp_bytes = 0;
+        for (const Tensor* t : {&y.attn_norm, &y.post_norm, &y.gate, &y.up, &y.down, &y.q, &y.k, &y.v, &y.o, &y.qnorm, &y.knorm,
+                                &mtp.enorm, &mtp.hnorm, &mtp.shnorm, &mtp.eh})
+            mtp_bytes += t->bytes;
         for (const Tensor* t : {&y.attn_norm, &y.post_norm, &y.qnorm, &y.knorm, &mtp.enorm, &mtp.hnorm, &mtp.shnorm})
             if (t->fmt != 0U) throw std::runtime_error("MTP norms must be F32");
         if (mtp.eh.inputs != 2U * H || mtp.eh.outputs != H || y.q.outputs != 2U * QW || y.k.outputs != KW || y.gate.outputs != I)
@@ -875,6 +879,8 @@ std::uint32_t HipEngine::vocab() const { return p_->V; }
 std::uint32_t HipEngine::prefill_rows() const { return std::max(kMaxRows, p_->opt.prefill_rows); }
 std::uint32_t HipEngine::committed() const { return p_->committed; }
 std::uint64_t HipEngine::weight_bytes() const { return p_->pass_weight_bytes; }
+std::uint64_t HipEngine::head_weight_bytes() const { return p_->head.bytes; }
+std::uint64_t HipEngine::mtp_weight_bytes() const { return p_->mtp_bytes; }
 std::uint64_t HipEngine::state_bytes_per_pass() const { return 2ULL * p_->sb * p_->n_gdn; }
 std::uint32_t HipEngine::kv_bytes_per_position() const { return std::uint32_t(p_->kv_pos_bytes); }
 void HipEngine::reset() { p_->reset_state(); }
