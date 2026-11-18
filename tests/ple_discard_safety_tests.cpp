@@ -160,6 +160,18 @@ void lifetime() {
     events.clear();  // A required lock that fails registers nothing and unlocks what it locked.
     refuses([&] { acquire_all({1,2,3}, 0, 3, 0, 0); });
     expect(events == std::vector<std::string>{"mlock1","mlock2","munlock1","munlock2"});
+    // Teardown unlock: one call per contiguous run, a gap (failed unregister / other merged range) starts a new run.
+    events.clear();
+    {
+        strix::CoalescedUnlock runs([&](std::uintptr_t base, std::uint64_t bytes) {
+            events.emplace_back("munlock" + std::to_string(base) + "+" + std::to_string(bytes));
+        });
+        runs.add(0x1000, 0x1000); runs.add(0x2000, 0x1000); runs.add(0x3000, 0);  // contiguous, empty ignored
+        runs.add(0x5000, 0x1000); runs.add(0x6000, 0x2000);                     // gap at 0x3000..0x5000
+        runs.add(0x1000, 0x1000);                                                // out of order: own call
+        runs.flush(); runs.flush();                                              // flush is idempotent
+    }
+    expect(events == std::vector<std::string>{"munlock4096+8192","munlock20480+12288","munlock4096+4096"});
     events.clear();
     expect(strix::retire_registered_backings(std::vector<int>{},
         [&] { events.emplace_back("drain"); },

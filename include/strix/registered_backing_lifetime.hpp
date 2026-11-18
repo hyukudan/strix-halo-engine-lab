@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -57,6 +58,30 @@ void acquire_locked_backings(const Ranges& ranges, Lock lock, Unlock unlock, Acq
         throw;
     }
 }
+// Teardown unlock in runs: an unregistered range can still be mapped to the GPU until it is unmapped (measured: unlocking
+// each piece after every piece was unregistered still evicted the process's queues ~0.7-1.1 s), so unlock never splits a
+// locked VMA. Address-ordered contiguous ranges are merged into one unlock call whose ends are the locked run's own VMA
+// boundaries. add() order must be ascending for a run to merge; any other order only costs more calls. No allocation.
+template<class Unlock>
+class CoalescedUnlock {
+public:
+    explicit CoalescedUnlock(Unlock unlock) : unlock_(unlock) {}
+    void add(std::uintptr_t base, std::uint64_t bytes) {
+        if (bytes == 0) return;
+        if (bytes_ != 0 && base == base_ + bytes_) { bytes_ += bytes; return; }
+        flush();
+        base_ = base;
+        bytes_ = bytes;
+    }
+    void flush() {
+        if (bytes_ != 0) unlock_(base_, bytes_);
+        bytes_ = 0;
+    }
+private:
+    Unlock unlock_;
+    std::uintptr_t base_ = 0;
+    std::uint64_t bytes_ = 0;
+};
 // Consumers must already be closed to new work. A failed drain/unregister
 // forbids unlocking/discarding the affected backing; the owner retains it.
 // Every unregister precedes the first unlock (ORDER above).

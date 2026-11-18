@@ -1079,6 +1079,14 @@ void HipModelResidency::release() noexcept {
 #if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
     std::vector<std::uintptr_t> failed_registrations;
 #endif
+    // One munlock per contiguous locked run (registered_backing_lifetime.hpp CoalescedUnlock): never split a locked VMA.
+    CoalescedUnlock unlock_runs([](std::uintptr_t base, std::uint64_t bytes) {
+#if defined(__linux__) && defined(MLOCK_ONFAULT)
+        (void)munlock(reinterpret_cast<const void*>(base), static_cast<std::size_t>(bytes));
+#else
+        (void)base; (void)bytes;
+#endif
+    });
     const bool retired = retire_registered_backings(registered_ranges_, drain, [&](const auto& range) {
         const auto error = copy_tier_ != HipModelCopyTier::none ?
             selective_unregister(reinterpret_cast<void*>(range.host_base)) : hipHostUnregister(reinterpret_cast<void*>(range.host_base));
@@ -1089,13 +1097,10 @@ void HipModelResidency::release() noexcept {
 #endif
         }
         return error == hipSuccess;
-    }, [](const auto& range) {
-#if defined(__linux__) && defined(MLOCK_ONFAULT)
-        if (range.locked) (void)munlock(reinterpret_cast<const void*>(range.host_base), static_cast<std::size_t>(range.bytes));
-#else
-        (void)range;
-#endif
+    }, [&](const auto& range) {
+        if (range.locked) unlock_runs.add(range.host_base, range.bytes);
     });
+    unlock_runs.flush();
     if (!retired) unregister_failed = true;
     if (unregister_failed && !mapping_owner_) {
         std::fputs("model residency: unregister failed on borrowed backing; terminating without unmapping\n",stderr);
