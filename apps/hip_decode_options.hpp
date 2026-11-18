@@ -1726,12 +1726,25 @@ inline bool mtp_builds_target_windows(const Options& o) {
 inline void validate_resolved_mtp_cli(const Options& o) {
     validate_onfly_i4_routes(o);
     validate_mtp_cli(o,true);
-    if(o.mtp.enabled && o.mtp.window_rows && (!o.deferred_moe_status || !o.virtual_q8_gdn_input || !o.prefetch_q8_gdn_input ||
-       !o.virtual_q8_gdn_output || !o.wave8_q8_gdn_input || !o.wave8_q8_gdn_output))
-        throw std::invalid_argument("MTP target windows require resolved D1 and explicit paired wave8 GDN configuration");
-    if(o.mtp.enabled && o.mtp.window_expert_union && (!o.q4k_a8g32_gate_up || !o.grouped_exact_q51_down ||
-       !o.q51_slot_parallel_down || !o.deferred_moe_status))
-        throw std::invalid_argument("MTP window expert union requires resolved A8, grouped Q5_1, slot-parallel down and D1");
+    // Each refusal names the flags whose resolved option is still off (issue 758: the user adds exactly those).
+    const auto missing=[](std::initializer_list<std::pair<bool,const char*>> terms) {
+        std::string names;
+        for(const auto& [present,flag]:terms) if(!present) names+=std::string(names.empty()?"":" ")+flag;
+        return names;
+    };
+    if(o.mtp.enabled && o.mtp.window_rows) {
+        const auto absent=missing({{o.deferred_moe_status,"--deferred-moe-status"},{o.virtual_q8_gdn_input,"--virtual-q8-gdn-input"},
+            {o.prefetch_q8_gdn_input,"--prefetch-q8-gdn-input"},{o.virtual_q8_gdn_output,"--virtual-q8-gdn-output"},
+            {o.wave8_q8_gdn_input,"--wave8-q8-gdn-input"},{o.wave8_q8_gdn_output,"--wave8-q8-gdn-output"}});
+        if(!absent.empty())
+            throw std::invalid_argument("MTP target windows require resolved D1 and explicit paired wave8 GDN configuration; missing "+absent);
+    }
+    if(o.mtp.enabled && o.mtp.window_expert_union) {
+        const auto absent=missing({{o.q4k_a8g32_gate_up,"--q4k-a8g32-gate-up"},{o.grouped_exact_q51_down,"--grouped-exact-q51-down"},
+            {o.q51_slot_parallel_down,"--q51-slot-parallel-down"},{o.deferred_moe_status,"--deferred-moe-status"}});
+        if(!absent.empty())
+            throw std::invalid_argument("MTP window expert union requires resolved A8, grouped Q5_1, slot-parallel down and D1; missing "+absent);
+    }
     // The window's hyper-mix rows exist only on the parallel/staged/fused typed-Q8 HC kernel with row and output
     // prefetch (known_hyper_rows_id); without it the window refused only after the model load (issue 758).
     // Runs that build no window (golden dump, fixed single-request session) keep their earlier admission.

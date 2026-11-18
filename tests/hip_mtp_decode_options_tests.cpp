@@ -539,6 +539,15 @@ int main(){try{
     auto selected=parse(wide);selected.context_tokens=8192;
     bool failed=false;try{strix::decode_cli::validate_resolved_mtp_cli(selected);}catch(const std::invalid_argument&){failed=true;}
     require(failed,"MTP target windows cannot silently enable D1 or paired GDN optimizations");
+    {
+        // The refusal names exactly the flags still off, so the user can add them (issue 758 docs promise).
+        auto partial=selected;partial.deferred_moe_status=partial.virtual_q8_gdn_input=partial.prefetch_q8_gdn_input=
+            partial.virtual_q8_gdn_output=true;
+        std::string message;
+        try{strix::decode_cli::validate_resolved_mtp_cli(partial);}catch(const std::invalid_argument& e){message=e.what();}
+        require(message=="MTP target windows require resolved D1 and explicit paired wave8 GDN configuration; "
+            "missing --wave8-q8-gdn-input --wave8-q8-gdn-output","the D1/wave8 window refusal names the missing flags only");
+    }
     selected.deferred_moe_status=selected.virtual_q8_gdn_input=selected.prefetch_q8_gdn_input=selected.virtual_q8_gdn_output=
         selected.wave8_q8_gdn_input=selected.wave8_q8_gdn_output=true;
     // Issue 758: the greedy window rows run only on the virtual Q8 LM head, which the resolved decode profile (or
@@ -588,7 +597,8 @@ int main(){try{
         bool missing_prerequisites=false;
         try{strix::decode_cli::validate_resolved_mtp_cli(options);}catch(const std::invalid_argument& e){
             missing_prerequisites=std::string(e.what())==
-                "MTP window expert union requires resolved A8, grouped Q5_1, slot-parallel down and D1";
+                "MTP window expert union requires resolved A8, grouped Q5_1, slot-parallel down and D1; "
+                "missing --q4k-a8g32-gate-up --grouped-exact-q51-down --q51-slot-parallel-down";
         }
         require(missing_prerequisites,"resolved union rejects absent A8/grouped/slot prerequisites specifically");
         options.q4k_a8g32_gate_up=options.grouped_exact_q51_down=options.q51_slot_parallel_down=true;
