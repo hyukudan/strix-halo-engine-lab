@@ -30,6 +30,13 @@ cudaError_t dense_rows(const DenseWeight&, const float*, float*, std::uint32_t, 
 std::size_t attention_scratch_floats(int, unsigned) { return 8; }
 // attention.hpp (CUDA bf16 types) stays out of host builds; the engine Pf state holds e4m3 KV shadows by value.
 struct KvShadowE4m3 { std::uint8_t *k8 = nullptr; float* ks = nullptr; std::uint8_t* v8t = nullptr; float* vs = nullptr; };
+// gdn.hpp (CUDA __host__ __device__ dims) stays out too: the engine Slot holds the chunk16 workspace by value; the audit only
+// sizes it. The resident operand cache is never created here (pf_cache_init below is a stand-in), so attach sees nullptr.
+struct GdnChunkWork { float* ws = nullptr; std::size_t floats = 0; };
+template <class Dims> std::size_t gdn_chunk_workspace_floats(const Dims&, std::uint32_t rows) { return rows; }
+void dense_big_cache_destroy(BigOperandCache*) {}
+void dense_big_ctx_attach_cache(BigCtx*, BigOperandCache*) {}
+bool dense_big_fast4_supported() { return false; }  // FAST4 is not audited here (generic-build answer); fast8 is, extracted
 }
 struct Engine {
     using PrefillArith = q::PrefillArith;
@@ -52,6 +59,13 @@ struct Engine {
     cudaStream_t s = nullptr;
     cc::DenseWeight head;
     float *xn = nullptr, *logits = nullptr;
+    using PrefillGdn = q::PrefillGdn;
+    struct CacheDel {  // as engine.cu
+        void operator()(cc::BigOperandCache* p) const { cc::dense_big_cache_destroy(p); }
+    };
+    // engine.cu pf_cache_init plans the resident operand cache on the device (operand_cache_plan); no cache in the audit:
+    // dense_big_gemm then expands operands per call, the path the audited fallbacks and admission run on.
+    void pf_cache_init() { pf.cache_tried = true; }
 #include "audit_engine.inc"
 };
 
