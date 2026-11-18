@@ -190,8 +190,7 @@ int main(int argc, char** argv) try {
     if (chain) {
         const auto tc = std::chrono::steady_clock::now();
         costs = hip_dense_measure_costs(*E, plan.costs, scalar_x, std::uint32_t(generated[0]));
-        std::printf("spec costs: %s (%s), %.0f ms
-", hip_dense_cost_mode_name(plan.costs),
+        std::printf("spec costs: %s (%s), %.0f ms\n", hip_dense_cost_mode_name(plan.costs),
                     costs.source == HipDenseCostSource::calibrated ? "measured on this device" : "compiled table, FALLBACK",
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc).count());
     }

@@ -22,6 +22,7 @@
 
 #include "strix/qwen35/hip_engine.hpp"
 #include "strix/qwen35/hip_spec_defaults.hpp"
+#include "../src/core/dense_linear_iu4.hpp"  // dense_iu4::scalar_x (the costs' bucket form)
 #include "strix/spec/block_drafter.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/spec/engine_target.hpp"
