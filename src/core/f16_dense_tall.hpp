@@ -113,9 +113,14 @@ constexpr bool b_ring_ok(unsigned tc, unsigned ahead) {
     return true;
 }
 static_assert(b_ring_ok(1, 1) && b_ring_ok(2, 2) && b_ring_ok(4, 2) && b_ring_ok(16, 2) && b_ring_ok(16, 3));
-__device__ __forceinline__ Half16 staged_fragment(const std::uint32_t* p) {
+// B fragment as 8 dwords (two 16-byte LDS loads), bit-cast to 16 halves only as the WMMA operand: a <16 x half> value
+// held across the ring makes gfx11 true16 codegen split and re-pack every dword (v_lshrrev_b32 16 + v_mov_b16 .h per
+// dword: 16 no-op VALU per WMMA, measured 1,026 of 1,458 VALU per 64 WMMA in the q8a8 loop). Bits identical either way
+// (the same fix as tiled_core.hpp / f16_tile_gemm.hpp / hip_moe_prefill_core2.inc).
+typedef std::uint32_t Frag __attribute__((ext_vector_type(8), aligned(16)));
+__device__ __forceinline__ Frag staged_fragment(const std::uint32_t* p) {
     struct { U4 l, h; } v{*reinterpret_cast<const U4*>(p), *reinterpret_cast<const U4*>(p + 4)};
-    return __builtin_bit_cast(Half16, v);
+    return __builtin_bit_cast(Frag, v);
 }
 }  // namespace detail
 
@@ -264,14 +269,14 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
                     const Half16 a = frag_half(ar);
                     if (kk + 1U < 4U || more) ar = frag_load(u0 + kk + 1U);
                     detail::sched_fence();
-                    Half16 b[kAhead + 1U];
+                    detail::Frag b[kAhead + 1U];  // 8 dwords each; Half16 only at the WMMA (see staged_fragment)
 #pragma unroll
                     for (unsigned t = 0; t < kAhead; ++t) b[t] = detail::staged_fragment(&lds.w[16U * t + c][kk * 8U]);
                     detail::sched_fence();
 #pragma unroll
                     for (unsigned t = 0; t < TC; ++t) {
                         if (t + kAhead < TC) b[(t + kAhead) % (kAhead + 1U)] = detail::staged_fragment(&lds.w[16U * (t + kAhead) + c][kk * 8U]);
-                        acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b[t % (kAhead + 1U)], acc[t]);
+                        acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, __builtin_bit_cast(Half16, b[t % (kAhead + 1U)]), acc[t]);
 #if defined(STRIX_WFMT_CAPTURE) && STRIX_WFMT_CAPTURE
                         if constexpr (requires { cols.capture_partial(acc[t]); }) cols.capture_partial(acc[t]);
 #endif
