@@ -2,6 +2,7 @@
 #include "strix/cuda_core/dense_big.hpp"
 #include "strix/spec/engine_target.hpp"
 #include "../../src/core/dense_linear.hpp"
+#include "strix/env_flags.hpp"
 #include <algorithm>
 #include <memory>
 #include <stdexcept>
@@ -55,7 +56,10 @@ struct Engine {
 #include "audit_engine.inc"
 };
 
-using WideScratch = core::DenseWideScratch;
+// engine.hip WideScratch: the dense scratch plus the x16 tile buffer of the IU4 wide windows (_Float16 there; the audit
+// never stores a tile, so a 16-bit stand-in keeps this host test free of _Float16).
+using Half = std::uint16_t;
+struct WideScratch : core::DenseWideScratch { Half* xt = nullptr; };
 using hipStream_t = void*;
 struct Tensor { unsigned fmt = 30, inputs = 1, outputs = 1; };
 unsigned limit = 0;
@@ -77,7 +81,14 @@ void wide_quant(const float*, unsigned, unsigned, hipStream_t, const WideScratch
 void wide_dense(const Tensor&, float*, unsigned, hipStream_t, const WideScratch& w) { scratch_seen.push_back(w.codes); }
 // The IU4 wide windows take only type-200 weights; the audited tensors are bf16 / q8_0, as in the real predicate.
 bool wide_iu4_ok(const Tensor& t, const WideScratch& w, unsigned) { return w.codes && t.fmt == 200U; }
-void wide_iu4(const Tensor&, const float*, float*, unsigned, hipStream_t) { runtime_require(false); }
+void wide_iu4(const Tensor&, const float*, float*, unsigned, hipStream_t, const Half* = nullptr) { runtime_require(false); }
+// x16 tile form of the IU4 wide windows (core/f16_dense_tall.hpp producers); unreachable here (no type-200 weights).
+bool wide_iu4_x16(const Tensor&, const WideScratch&, unsigned) { return false; }
+struct SiluMul {};
+namespace strix::core::f16_dense_tall {
+void enqueue_x16_tiles(const float*, Half*, unsigned, unsigned, hipStream_t) { runtime_require(false); }
+template <class F> void enqueue_x16_tiles_map2(const float*, const float*, Half*, unsigned, unsigned, hipStream_t) { runtime_require(false); }
+}
 void silu_mul_host(const float*, const float*, float*, std::size_t) {}
 #include "audit_hip.inc"
 #include "audit_cli.inc"
@@ -133,7 +144,9 @@ int main() {
         check(shape, "dec4 one call per <= 16-row window, power-of-two tails above");
     }
     std::int8_t ca = 0, cb = 0;
-    WideScratch a{&ca, nullptr, nullptr, nullptr}, b{&cb, nullptr, nullptr, nullptr};
+    WideScratch a, b;
+    a.codes = &ca;
+    b.codes = &cb;
     Tensor q8{8, 128, 16};
     linear(q8, nullptr, nullptr, 64, nullptr, a, Iu4Scratch{});
     linear(q8, nullptr, nullptr, 32, nullptr, b, Iu4Scratch{});
