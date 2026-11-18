@@ -154,10 +154,9 @@ struct Jobs {
 template <int RB, int MT>
 __global__ void __launch_bounds__(kWarpsPerBlock * 32) fp4_gemv(const Jobs jobs, const float* x, std::uint32_t in, std::uint32_t rows) {
     extern __shared__ uint2 xs_dyn[];
-    // PDL (scheduling only): the dependent kernel may launch once every block started; this block's first weight records
-    // (constant data) are requested BEFORE pdl_wait, so the weight stream overlaps the predecessor's tail. x, part and y
-    // are touched only after pdl_wait. The arithmetic below is unchanged.
-    pdl_trigger();
+    // PDL (scheduling only): this block's first weight records (constant data) are requested BEFORE pdl_wait, so the
+    // weight stream overlaps the predecessor's tail. x, part and y are touched only after pdl_wait, and the dependent
+    // kernel is released (pdl_trigger) only after it too (depth rule, common.cuh). The arithmetic below is unchanged.
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     int ji = 0;
 #pragma unroll
@@ -209,6 +208,7 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) fp4_gemv(const Jobs jobs,
     for (int mt = 0; mt < MT; ++mt)
         if (on[mt] && c0 < c1) cur[mt] = load_record(base[mt] + static_cast<std::size_t>(c0) * kNvfp4RecordBytes, lane);
     pdl_wait();
+    pdl_trigger();
     for (std::uint32_t c = c0; c < c1; ++c) {
         const std::uint32_t cs = (c - c0) % kSlab;
         if (cs == 0) {
@@ -263,8 +263,8 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) fp4_gemv(const Jobs jobs,
 
 // grid (blocks over the largest job, njobs): finalises split-K and fused jobs.
 __global__ void fp4_reduce(const Jobs jobs, std::uint32_t rows) {
-    pdl_trigger();
     pdl_wait();
+    pdl_trigger();  // after the wait: depth rule (common.cuh)
     const Job& J = jobs.j[blockIdx.y];
     if (J.ks <= 1 && J.w[1] == nullptr) return;
     const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;

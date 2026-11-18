@@ -13,6 +13,11 @@ namespace strix::cuda_core {
 // finished (once every predecessor block has called pdl_trigger or exited); it MUST call pdl_wait() before reading anything the
 // predecessor wrote or writing anything the predecessor reads. Work before pdl_wait may only touch constant data (weights, committed
 // state that nothing in the same graph writes). pdl_wait returns after the predecessor grid completed and its writes are visible.
+// Depth rule: call pdl_trigger AFTER pdl_wait. Then a successor can launch only once its predecessor's predecessor completed,
+// so at most one kernel runs ahead (pre-wait, constants only). A trigger before the wait lets a whole chain of small grids be
+// launched while an earlier kernel still streams a buffer that a later kernel rewrites and a still later one reads: the NVFP4
+// chain (nvfp4_test test_pdl_chain, ks 1, rows 16) then differed from serial order. Kernels still triggering at entry
+// (rope, norms, attention, gdn, dense, dense_mma) follow this rule as their owners move them.
 __device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
 

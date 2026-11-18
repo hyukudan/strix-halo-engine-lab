@@ -335,7 +335,7 @@ static void test_pdl_chain(std::uint32_t split_target, std::mt19937& rng) {
                 cc::nvfp4_split_k(kH, kI), cc::nvfp4_split_k(kF, kH));
     cudaStream_t s;
     CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
-    for (std::uint32_t rows : {1u, 8u, 16u}) {
+    for (std::uint32_t rows : {1u, 8u, 16u, 24u, 32u}) {  // every fp4_gemv template (<1,4> <2,4> <3,2> <4,2>)
         std::uniform_real_distribution<float> ud(-1.f, 1.f);
         std::vector<float> x(static_cast<std::size_t>(rows) * kH);
         for (auto& v : x) v = ud(rng);
@@ -369,15 +369,38 @@ static void test_pdl_chain(std::uint32_t split_target, std::mt19937& rng) {
             CK(cudaMemsetAsync(dc, 0xFF, nc * 4, s));
             return o;
         };
-        auto same = [](const std::vector<float>& p, const std::vector<float>& q) {
-            return p.size() == q.size() && std::memcmp(p.data(), q.data(), p.size() * 4) == 0;
+        // Compares one run with the serial reference; on a difference prints, per output buffer (da = K1/K4, db = K2,
+        // db2 = K5, dc = K3r/K6r), the number of differing elements and the first one (row, column, bits).
+        auto same = [&](const std::vector<float>& p, const std::vector<float>& q, const char* side, int rep) {
+            if (p.size() == q.size() && std::memcmp(p.data(), q.data(), p.size() * 4) == 0) return true;
+            const char* names[4] = {"da", "db", "db2", "dc"};
+            const std::size_t lo[5] = {0, na, na + nb, na + 2 * nb, na + 2 * nb + nc};
+            const std::uint32_t cols[4] = {kI, kH, kH, kF};
+            for (int b = 0; b < 4; ++b) {
+                std::size_t ndiff = 0, first = 0;
+                for (std::size_t i = lo[b]; i < lo[b + 1]; ++i)
+                    if (std::memcmp(&p[i], &q[i], 4) != 0 && ndiff++ == 0) first = i - lo[b];
+                if (ndiff == 0) {
+                    std::printf("   diff rows %u %s rep %d %s: equal\n", rows, side, rep, names[b]);
+                    continue;
+                }
+                std::uint32_t got = 0, want = 0;
+                std::memcpy(&got, &p[lo[b] + first], 4);
+                std::memcpy(&want, &q[lo[b] + first], 4);
+                std::printf("   diff rows %u %s rep %d %s: %zu of %zu differ, first [row %zu col %zu] serial %08x got %08x\n",
+                            rows, side, rep, names[b], ndiff, lo[b + 1] - lo[b], first / cols[b], first % cols[b], want, got);
+            }
+            return false;
         };
         cc::set_programmatic_launch(false);
         chain();
         const std::vector<float> ref = snap();
         cc::set_programmatic_launch(true);
-        chain();
-        const bool stream_ok = same(snap(), ref);
+        bool stream_ok = true;
+        for (int rep = 0; rep < 4; ++rep) {  // repeated: the failure this guards against is timing-dependent
+            chain();
+            stream_ok = same(snap(), ref, "stream", rep) && stream_ok;
+        }
         cudaGraph_t g;
         cudaGraphExec_t ge;
         CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
@@ -387,12 +410,12 @@ static void test_pdl_chain(std::uint32_t split_target, std::mt19937& rng) {
         bool graph_ok = true;
         for (int rep = 0; rep < 3; ++rep) {
             CK(cudaGraphLaunch(ge, s));
-            graph_ok = same(snap(), ref) && graph_ok;
+            graph_ok = same(snap(), ref, "graph", rep) && graph_ok;
         }
         CK(cudaGraphExecDestroy(ge));
         CK(cudaGraphDestroy(g));
         char what[160];
-        std::snprintf(what, sizeof what, "pdl chain rows %u split target %u: stream == serial, graph x3 == serial", rows,
+        std::snprintf(what, sizeof what, "pdl chain rows %u split target %u: stream x4 == serial, graph x3 == serial", rows,
                       split_target);
         expect(stream_ok && graph_ok, what);
         for (float* p : {dx, da, db, db2, dc}) CK(cudaFree(p));
