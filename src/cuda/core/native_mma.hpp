@@ -61,6 +61,20 @@ STRIX_NATIVE_MMA_HD unsigned scale_lane(unsigned lane, unsigned i) { return 8U *
 // Block geometry (kernels and oracle): 8 warps; a tile has <= 64 rows = 4 m16 blocks.
 inline constexpr unsigned kThreads = 256U, kProjectOutputs = 64U, kDownOutputs = 128U, kProjectK = 128U, kDownK = 64U;
 STRIX_NATIVE_MMA_HD unsigned m_blocks(unsigned count) { return (count + 15U) >> 4U; }
+// Decode-tile form of the tensor-core expert kernels. A tile holds one expert's rows of the step and a row routes to an
+// expert at most once (top-k experts are distinct), so a step of rows <= 16 gives every tile <= 16 rows = one m16
+// block. Those launches bind kDecodeMBlocks accumulators (8 floats instead of 32) and spend the freed registers on a
+// kDecodeAhead-deep ring of weight fields: the loads of the next kDecodeAhead groups are in flight while a group is
+// decoded and multiplied (the tile form keeps a one-group lookahead). Each output's MMA and scale-FMA sequence over the
+// groups is unchanged, so both forms are bitwise the same arithmetic; only the load schedule and the tile capacity differ.
+inline constexpr unsigned kTileMBlocks = 4U, kDecodeMBlocks = 1U, kTileAhead = 1U, kDecodeAhead = 3U;
+STRIX_NATIVE_MMA_HD bool decode_form(unsigned rows) { return rows <= 16U * kDecodeMBlocks; }
+// Group held by ring slot `slot` after group `group` was taken (slot 0 = the next group to consume; the kernels load
+// ring_group(group, ahead, groups) into the last slot). Past the last group a slot re-loads `group` itself (never
+// consumed, never past the weight row): with ahead = 1 this is the tile form's `next` expression.
+STRIX_NATIVE_MMA_HD unsigned ring_group(unsigned group, unsigned slot, unsigned groups) {
+    return group + slot < groups ? group + slot : group;
+}
 // Output of C column col: project warp w owns outputs 8 w .. of both matrices; down warp w owns 16 w .. in two n8 blocks.
 STRIX_NATIVE_MMA_HD unsigned project_output(unsigned block_y, unsigned warp, unsigned col) { return block_y * kProjectOutputs + 8U * warp + col; }
 STRIX_NATIVE_MMA_HD unsigned down_output(unsigned block_y, unsigned warp, unsigned n, unsigned col) {

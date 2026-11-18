@@ -600,8 +600,43 @@ static void test_mma_raster() {
     }
 }
 
+// Decode-tile form of the tensor-core expert kernels (native_mma::decode_form / ring_group): (1) a D-deep ring hands the
+// groups to the MMAs in order 0 .. groups - 1, each loaded before use, never past the last group, and D = 1 is the tile
+// form's one-group lookahead (next = group + 1, the last re-loads itself); (2) a decode-form step has <= 16 rows, and with
+// distinct top-k experts per row every tile (one expert's rows) fits the kDecodeMBlocks m16 blocks.
+static void test_mma_decode_form(std::mt19937& rng) {
+    for (u32 depth = 1; depth <= 4U; ++depth)
+        for (u32 groups = 1; groups <= 96U; ++groups) {
+            std::vector<u32> ring(depth);
+            for (u32 i = 0; i < depth; ++i) ring[i] = nm::ring_group(0U, i, groups);
+            for (u32 group = 0; group < groups; ++group) {
+                check(ring[0] == group, "mma ring order", depth, groups * 1000U + group);
+                for (u32 i = 0; i + 1U < depth; ++i) ring[i] = ring[i + 1U];
+                ring[depth - 1U] = nm::ring_group(group, depth, groups);
+                check(ring[depth - 1U] < groups, "mma ring bound", depth, groups * 1000U + group);
+                if (depth == 1U) check(ring[0] == (group + 1U < groups ? group + 1U : group), "mma ring tile form", groups, group);
+            }
+        }
+    check(nm::kTileMBlocks * 16U == 64U && nm::kTileAhead == 1U, "mma tile form constants", 0U, 0U);
+    for (u32 rows = 1; rows <= 64U; ++rows) {
+        check(nm::decode_form(rows) == (rows <= 16U * nm::kDecodeMBlocks), "mma decode form", 0U, rows);
+        if (!nm::decode_form(rows)) continue;
+        std::vector<u32> per_expert(512U, 0U);
+        for (u32 r = 0; r < rows; ++r) {
+            std::vector<u32> pick;
+            while (pick.size() < 10U) {
+                const u32 e = u32(rng() % 512U);
+                if (std::find(pick.begin(), pick.end(), e) == pick.end()) pick.push_back(e);
+            }
+            for (u32 e : pick) ++per_expert[e];
+        }
+        for (u32 e = 0; e < 512U; ++e) check(nm::m_blocks(per_expert[e]) <= nm::kDecodeMBlocks, "mma decode tile capacity", rows, e);
+    }
+}
+
 int main() {
     std::mt19937 rng(20261117U);
+    test_mma_decode_form(rng);
     test_codes(rng);
     test_fold<1>(rng, 64); test_fold<2>(rng, 64); test_fold<4>(rng, 64); test_fold<8>(rng, 64);
     test_fold<16>(rng, 64); test_fold<32>(rng, 64); test_fold<128>(rng, 16);

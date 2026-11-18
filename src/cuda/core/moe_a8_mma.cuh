@@ -62,11 +62,37 @@ __device__ __forceinline__ void mma_scale_acc(float (&acc)[4], const float (&p)[
     for (unsigned i = 0; i < 4U; ++i) acc[i] = __fmaf_rn(p[i], scale[i & 1U], acc[i]);
 }
 
+// Weight-field ring of depth D (native_mma::ring_group): slot 0 is the group consumed next. Loads only, issued D groups
+// ahead; D = 1 is the one-group lookahead of the tile form.
+template <class Decode, unsigned D>
+__device__ __forceinline__ void ring_fill(typename Decode::Raw (&ring)[D][2], const std::uint8_t* row0, const std::uint8_t* row1,
+                                          unsigned groups, unsigned lane) {
+#pragma unroll
+    for (unsigned i = 0; i < D; ++i) {
+        const unsigned group = native_mma::ring_group(0U, i, groups);
+        ring[i][0] = mma_raw<Decode>(row0, group, lane);
+        ring[i][1] = mma_raw<Decode>(row1, group, lane);
+    }
+}
+// After the caller copied slot 0 (group `group`): shift the ring and load group ring_group(group, D) into the last slot.
+template <class Decode, unsigned D>
+__device__ __forceinline__ void ring_advance(typename Decode::Raw (&ring)[D][2], const std::uint8_t* row0, const std::uint8_t* row1,
+                                             unsigned group, unsigned groups, unsigned lane) {
+    const unsigned next = native_mma::ring_group(group, D, groups);
+#pragma unroll
+    for (unsigned i = 0; i + 1U < D; ++i) { ring[i][0] = ring[i + 1U][0]; ring[i][1] = ring[i + 1U][1]; }
+    ring[D - 1U][0] = mma_raw<Decode>(row0, next, lane);
+    ring[D - 1U][1] = mma_raw<Decode>(row1, next, lane);
+}
+
 // grid (tiles, ffn / 64), tile-major raster (native_mma::tile_major), 256 threads. Writes h = native_activation(gate, up) into intermediates[row][slot * 2 * ffn + o]
 // with the exact route's layout and fail-closed flags. Gate and up of one output are in the same lane (same C element).
-template <unsigned T, class Binding>
+// MB m16 blocks per tile and a D-deep weight ring: (kTileMBlocks, kTileAhead) for any tile, (kDecodeMBlocks,
+// kDecodeAhead) when native_mma::decode_form(rows) holds for the launch; bitwise the same outputs (see native_mma.hpp).
+template <unsigned T, class Binding, unsigned MB = native_mma::kTileMBlocks, unsigned D = native_mma::kTileAhead>
 __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_project_kernel(const std::uint8_t* gate, const std::uint8_t* up,
                                                                             typename Binding::Rows v) {
+    static_assert(MB >= 1U && MB <= native_mma::kTileMBlocks && D >= 1U, "tile capacity and ring depth");
     using Decode = weight::GsqDecode<T>;
     constexpr unsigned hidden = Binding::hidden, ffn = Binding::ffn, projection_nonfinite = Binding::projection_nonfinite;
     constexpr unsigned stages = hidden / kMmaProjectK, groups_per_stage = kMmaProjectK / 32U;
@@ -78,7 +104,11 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_project_kernel(cons
     if (csr.summary[0] || ts.tile >= *csr.tile_count) return;
     const unsigned tile_begin = csr.tile_begins[ts.tile], count = csr.tile_begins[ts.tile + 1U] - tile_begin;
     const unsigned expert = csr.tile_experts[ts.tile];
-    __shared__ alignas(16) std::uint16_t X[2][kNativeTileRows][kMmaProjectPitch];
+    if constexpr (MB < native_mma::kTileMBlocks) if (count > 16U * MB) {  // decode form over a wider tile: fail closed
+        if (threadIdx.x == 0U) atomicOr(csr.summary, projection_nonfinite);
+        return;
+    }
+    __shared__ alignas(16) std::uint16_t X[2][16U * MB][kMmaProjectPitch];
     __shared__ unsigned row_of[kNativeTileRows], slot_of[kNativeTileRows];
     __shared__ std::uint32_t grid_words[Decode::grid_words ? Decode::grid_words : 1U];  // the type's codebook (<= 8 KB)
     const unsigned t = threadIdx.x, lane = t & 31U, warp = t >> 5, g = lane >> 2, q = lane & 3U;
@@ -104,19 +134,20 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_project_kernel(cons
     };
     const std::uint64_t wr = std::uint64_t(expert) * ffn + out_base + g;
     const std::uint8_t* wrow[2] = {gate + wr * row_bytes, up + wr * row_bytes};
-    const unsigned mblocks = native_mma::m_blocks(count);  // block-uniform
-    float acc[4][2][4];
+    const unsigned mblocks = native_mma::m_blocks(count);  // block-uniform, <= MB
+    float acc[MB][2][4];
 #pragma unroll
-    for (unsigned m = 0; m < 4U; ++m)
+    for (unsigned m = 0; m < MB; ++m)
 #pragma unroll
         for (unsigned mat = 0; mat < 2U; ++mat)
 #pragma unroll
             for (unsigned i = 0; i < 4U; ++i) acc[m][mat][i] = 0.0F;
     load(0U, 0U);
-    // Weight fields of the next group are loaded before this group's decode and MMAs (and across the stage barrier):
-    // the global round trip overlaps one group of work. The last group re-loads itself (no branch, no read past the row).
+    // Weight fields of the next D groups are loaded before this group's decode and MMAs (and across the stage barrier):
+    // the global round trips overlap D groups of work. The last groups re-load the last one (no read past the row).
     constexpr unsigned groups = stages * groups_per_stage;
-    typename Decode::Raw ahead[2] = {mma_raw<Decode>(wrow[0], 0U, lane), mma_raw<Decode>(wrow[1], 0U, lane)};
+    typename Decode::Raw ahead[D][2];
+    ring_fill<Decode>(ahead, wrow[0], wrow[1], groups, lane);
 #pragma unroll 1
     for (unsigned s = 0; s < stages; ++s) {
         cp_wait_all();
@@ -125,16 +156,15 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_project_kernel(cons
         const std::uint16_t* xs = &X[s & 1U][0][0];
 #pragma unroll
         for (unsigned j = 0; j < groups_per_stage; ++j) {
-            const unsigned group = s * groups_per_stage + j, next = group + 1U < groups ? group + 1U : group;
-            const typename Decode::Raw raw[2] = {ahead[0], ahead[1]};
-            ahead[0] = mma_raw<Decode>(wrow[0], next, lane);
-            ahead[1] = mma_raw<Decode>(wrow[1], next, lane);
+            const unsigned group = s * groups_per_stage + j;
+            const typename Decode::Raw raw[2] = {ahead[0][0], ahead[0][1]};
+            ring_advance<Decode>(ahead, wrow[0], wrow[1], group, groups, lane);
             unsigned b[2][2][2];
             float scale[2][2][2];
             mma_weights<Decode>(raw[0], group, grid, lane, b[0], scale[0]);
             mma_weights<Decode>(raw[1], group, grid, lane, b[1], scale[1]);
 #pragma unroll
-            for (unsigned m = 0; m < 4U; ++m) {
+            for (unsigned m = 0; m < MB; ++m) {
                 if (m >= mblocks) break;
                 unsigned a0[4], a1[4];
                 mma_rows(xs, kMmaProjectPitch, 16U * m + g, 32U * j + 4U * q, a0);
@@ -154,7 +184,7 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_project_kernel(cons
         }
     }
 #pragma unroll
-    for (unsigned m = 0; m < 4U; ++m)
+    for (unsigned m = 0; m < MB; ++m)
 #pragma unroll
         for (unsigned i = 0; i < 4U; ++i) {
             const unsigned row = 16U * m + native_mma::c_row(lane, i);
@@ -168,9 +198,10 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_project_kernel(cons
 
 // grid (tiles, hidden / 128), tile-major raster (native_mma::tile_major), 256 threads. Reads h from intermediates[row][slot * 2 * ffn + k] and writes FP32
 // rawdots[row][slot * hidden + o] (the exact route's storage; merge / commit unchanged). h enters as hi + lo BF16
-// (native_mma::split); both MMAs of a half share the code fragment.
-template <unsigned T, class Binding>
+// (native_mma::split); both MMAs of a half share the code fragment. MB and D as in the project kernel.
+template <unsigned T, class Binding, unsigned MB = native_mma::kTileMBlocks, unsigned D = native_mma::kTileAhead>
 __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_down_kernel(const std::uint8_t* down, typename Binding::Rows v) {
+    static_assert(MB >= 1U && MB <= native_mma::kTileMBlocks && D >= 1U, "tile capacity and ring depth");
     namespace nm = native_mma;
     using Decode = weight::GsqDecode<T>;
     constexpr unsigned hidden = Binding::hidden, ffn = Binding::ffn;
@@ -183,8 +214,12 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_down_kernel(const s
     if (csr.summary[0] || ts.tile >= *csr.tile_count) return;
     const unsigned tile_begin = csr.tile_begins[ts.tile], count = csr.tile_begins[ts.tile + 1U] - tile_begin;
     const unsigned expert = csr.tile_experts[ts.tile];
-    __shared__ alignas(16) std::uint16_t Xh[2][kNativeTileRows][kMmaDownPitch];
-    __shared__ alignas(16) std::uint16_t Xl[2][kNativeTileRows][kMmaDownPitch];
+    if constexpr (MB < native_mma::kTileMBlocks) if (count > 16U * MB) {  // as in the project kernel: fail closed
+        if (threadIdx.x == 0U) atomicOr(csr.summary, Binding::projection_nonfinite);
+        return;
+    }
+    __shared__ alignas(16) std::uint16_t Xh[2][16U * MB][kMmaDownPitch];
+    __shared__ alignas(16) std::uint16_t Xl[2][16U * MB][kMmaDownPitch];
     __shared__ unsigned row_of[kNativeTileRows], slot_of[kNativeTileRows];
     __shared__ std::uint32_t grid_words[Decode::grid_words ? Decode::grid_words : 1U];  // the type's codebook (none: 4 B)
     const unsigned t = threadIdx.x, lane = t & 31U, warp = t >> 5, g = lane >> 2, q = lane & 3U;
@@ -233,18 +268,19 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_down_kernel(const s
     const std::uint8_t* wrow[2];
 #pragma unroll
     for (unsigned n = 0; n < 2U; ++n) wrow[n] = down + (std::uint64_t(expert) * hidden + out_base + 8U * n + g) * row_bytes;
-    const unsigned mblocks = native_mma::m_blocks(count);  // block-uniform
-    float acc[4][2][4];
+    const unsigned mblocks = native_mma::m_blocks(count);  // block-uniform, <= MB
+    float acc[MB][2][4];
 #pragma unroll
-    for (unsigned m = 0; m < 4U; ++m)
+    for (unsigned m = 0; m < MB; ++m)
 #pragma unroll
         for (unsigned n = 0; n < 2U; ++n)
 #pragma unroll
             for (unsigned i = 0; i < 4U; ++i) acc[m][n][i] = 0.0F;
     fetch(0U); put(0U);
-    // Weight fields one group ahead, as in the project kernel (the last group re-loads itself).
+    // Weight fields D groups ahead, as in the project kernel (the last groups re-load the last one).
     constexpr unsigned groups = stages * groups_per_stage;
-    typename Decode::Raw ahead[2] = {mma_raw<Decode>(wrow[0], 0U, lane), mma_raw<Decode>(wrow[1], 0U, lane)};
+    typename Decode::Raw ahead[D][2];
+    ring_fill<Decode>(ahead, wrow[0], wrow[1], groups, lane);
     __syncthreads();
 #pragma unroll 1
     for (unsigned s = 0; s < stages; ++s) {
@@ -254,16 +290,15 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_down_kernel(const s
         const std::uint16_t* xl = &Xl[s & 1U][0][0];
 #pragma unroll
         for (unsigned j = 0; j < groups_per_stage; ++j) {
-            const unsigned group = s * groups_per_stage + j, next = group + 1U < groups ? group + 1U : group;
-            const typename Decode::Raw raw[2] = {ahead[0], ahead[1]};
-            ahead[0] = mma_raw<Decode>(wrow[0], next, lane);
-            ahead[1] = mma_raw<Decode>(wrow[1], next, lane);
+            const unsigned group = s * groups_per_stage + j;
+            const typename Decode::Raw raw[2] = {ahead[0][0], ahead[0][1]};
+            ring_advance<Decode>(ahead, wrow[0], wrow[1], group, groups, lane);
             unsigned b[2][2][2];
             float scale[2][2][2];
             mma_weights<Decode>(raw[0], group, grid, lane, b[0], scale[0]);
             mma_weights<Decode>(raw[1], group, grid, lane, b[1], scale[1]);
 #pragma unroll
-            for (unsigned m = 0; m < 4U; ++m) {
+            for (unsigned m = 0; m < MB; ++m) {
                 if (m >= mblocks) break;
                 unsigned h0[4], l0[4], h1[4], l1[4];
                 mma_rows(xh, kMmaDownPitch, 16U * m + g, 32U * j + 4U * q, h0);
@@ -289,7 +324,7 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_down_kernel(const s
         __syncthreads();
     }
 #pragma unroll
-    for (unsigned m = 0; m < 4U; ++m)
+    for (unsigned m = 0; m < MB; ++m)
 #pragma unroll
         for (unsigned n = 0; n < 2U; ++n)
 #pragma unroll

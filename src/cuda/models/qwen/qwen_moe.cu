@@ -488,24 +488,33 @@ bool native_types(const Weights& w) {
 
 // gsq-iq-bf16mma-cuda-v1 (FAST, explicit selection only): the GSQ storage type binds the tensor-core kernels at compile
 // time. Same CSR tiles, input rows, intermediates and rawdots as the native route; merge / commit are unchanged.
-template <unsigned G> void launch_mma_project(const Rows& v, const Weights& w, unsigned tiles, cudaStream_t s) {
-    native_mma_project_kernel<G, MoeBinding><<<dim3(tiles, ffn / kMmaProjectOutputs), kMmaThreads, 0, s>>>(w.gate, w.up, v);
+namespace native_mma = ::strix::cuda::core::native_mma;
+// Steps of native_mma::decode_form(rows) bind the decode-tile trait (one m16 block, deep weight ring): bitwise the same.
+template <unsigned G> void launch_mma_project(const Rows& v, const Weights& w, unsigned tiles, bool decode, cudaStream_t s) {
+    const dim3 grid(tiles, ffn / kMmaProjectOutputs);
+    if (decode)
+        native_mma_project_kernel<G, MoeBinding, native_mma::kDecodeMBlocks, native_mma::kDecodeAhead><<<grid, kMmaThreads, 0, s>>>(w.gate, w.up, v);
+    else native_mma_project_kernel<G, MoeBinding><<<grid, kMmaThreads, 0, s>>>(w.gate, w.up, v);
 }
-template <unsigned D> void launch_mma_down(const Rows& v, const Weights& w, unsigned tiles, cudaStream_t s) {
-    native_mma_down_kernel<D, MoeBinding><<<dim3(tiles, hidden / kMmaDownOutputs), kMmaThreads, 0, s>>>(w.down, v);
+template <unsigned T> void launch_mma_down(const Rows& v, const Weights& w, unsigned tiles, bool decode, cudaStream_t s) {
+    const dim3 grid(tiles, hidden / kMmaDownOutputs);
+    if (decode)
+        native_mma_down_kernel<T, MoeBinding, native_mma::kDecodeMBlocks, native_mma::kDecodeAhead><<<grid, kMmaThreads, 0, s>>>(w.down, v);
+    else native_mma_down_kernel<T, MoeBinding><<<grid, kMmaThreads, 0, s>>>(w.down, v);
 }
-void enqueue_mma_experts(const Rows& v, const Weights& w, unsigned tiles, cudaStream_t s) {
+void enqueue_mma_experts(const Rows& v, std::uint32_t rows, const Weights& w, unsigned tiles, cudaStream_t s) {
+    const bool decode = native_mma::decode_form(rows);
     switch (w.gate_type) {
-    case 18: launch_mma_project<18>(v, w, tiles, s); break;
-    case 21: launch_mma_project<21>(v, w, tiles, s); break;
-    case 22: launch_mma_project<22>(v, w, tiles, s); break;
-    case 23: launch_mma_project<23>(v, w, tiles, s); break;
-    case 42: launch_mma_project<42>(v, w, tiles, s); break;
+    case 18: launch_mma_project<18>(v, w, tiles, decode, s); break;
+    case 21: launch_mma_project<21>(v, w, tiles, decode, s); break;
+    case 22: launch_mma_project<22>(v, w, tiles, decode, s); break;
+    case 23: launch_mma_project<23>(v, w, tiles, decode, s); break;
+    case 42: launch_mma_project<42>(v, w, tiles, decode, s); break;
     default: throw std::invalid_argument("gsq-iq-bf16mma-cuda-v1: gate storage");
     }
     check(cudaGetLastError(), "MoE tensor-core gate/up");
-    if (w.down_type == 20) launch_mma_down<20>(v, w, tiles, s);
-    else if (w.down_type == 42) launch_mma_down<42>(v, w, tiles, s);
+    if (w.down_type == 20) launch_mma_down<20>(v, w, tiles, decode, s);
+    else if (w.down_type == 42) launch_mma_down<42>(v, w, tiles, decode, s);
     else throw std::invalid_argument("gsq-iq-bf16mma-cuda-v1: down storage");
     check(cudaGetLastError(), "MoE tensor-core down");
 }
@@ -553,7 +562,7 @@ bool enqueue_routed(const Rows& v, std::uint32_t rows, const Weights& w, const a
             throw std::invalid_argument("MoE expert type without a decoder");
         const unsigned tiles = csr_sizes(rows).max_tiles;
         if (w.arithmetic == ExpertArithmetic::gsq_bf16_mma) {
-            enqueue_mma_experts(v, w, tiles, s);
+            enqueue_mma_experts(v, rows, w, tiles, s);
             return false;   // tensor-core GSQ experts: the moe_mma candidate form did not run
         }
         if (w.arithmetic == ExpertArithmetic::gsq_i8_turbo) {
