@@ -586,9 +586,13 @@ int test_conv_row_batch() {
         auto* dpp = devz<std::uint32_t>(1);
         cc::GdnLayer PL{dw, dpa, dpdt, dpng};
         cc::GdnWindow pwin{dpraw, dpqc, dpar_, dpbr};
+        // synchronised per window: no early-launched predecessor, so a conv_pre_kernel duration is its own execution
+        // (under PDL a block waiting in griddepcontrol.wait would be counted as kernel time)
         for (std::uint32_t rows : {8u, 16u})
-            for (int it = 0; it < 40; ++it) CK(cc::gdn_window(P, PL, {dpcs, dpst}, pwin, dpz, dpout, rows, 1e-6f, dpp, nullptr));
-        CK(cudaDeviceSynchronize());
+            for (int it = 0; it < 40; ++it) {
+                CK(cc::gdn_window(P, PL, {dpcs, dpst}, pwin, dpz, dpout, rows, 1e-6f, dpp, nullptr));
+                CK(cudaDeviceSynchronize());
+            }
         for (void* p : {static_cast<void*>(dw), static_cast<void*>(dpa), static_cast<void*>(dpdt), static_cast<void*>(dpng),
                         static_cast<void*>(dpraw), static_cast<void*>(dpz), static_cast<void*>(dpar_), static_cast<void*>(dpbr),
                         static_cast<void*>(dpst), static_cast<void*>(dpcs), static_cast<void*>(dpqc), static_cast<void*>(dpout),
