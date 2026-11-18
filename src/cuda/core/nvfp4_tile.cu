@@ -32,6 +32,37 @@ cudaError_t quantize_enqueue(const float* x, std::uint32_t rows, std::uint32_t i
     return cudaGetLastError();
 }
 
+namespace {
+// One launch of the folded quantiser with row normaliser nm; NREG bucket = the smallest of 8/16/24/32 holding in / 256 elements per
+// thread (padding entries are 0 and add +0 / sit outside every head: any bucket >= the need gives the same bits).
+template <class Norm>
+cudaError_t norm_quantize_launch(const float* x, const Norm& nm, std::uint32_t rows, std::uint32_t in, std::uint8_t* x_tile, float* rs,
+                                 cudaStream_t stream) {
+    if (!norm_quantize_fits(in)) return cudaErrorInvalidValue;
+    if (!x || !x_tile || !rs || rows == 0 || reinterpret_cast<std::uintptr_t>(x) % 16) return cudaErrorInvalidValue;
+    if (auto e = capability(); e != cudaSuccess) return e;
+    const unsigned grid = rows_padded(rows);
+    const std::size_t smem = static_cast<std::size_t>(in) * sizeof(float);
+    const std::uint32_t nreg = (in + 255) / 256;
+    if (nreg <= 8) sm120::norm_quantize_kernel<8, Norm><<<grid, 256, smem, stream>>>(x, nm, rows, in, x_tile, rs);
+    else if (nreg <= 16) sm120::norm_quantize_kernel<16, Norm><<<grid, 256, smem, stream>>>(x, nm, rows, in, x_tile, rs);
+    else if (nreg <= 24) sm120::norm_quantize_kernel<24, Norm><<<grid, 256, smem, stream>>>(x, nm, rows, in, x_tile, rs);
+    else sm120::norm_quantize_kernel<32, Norm><<<grid, 256, smem, stream>>>(x, nm, rows, in, x_tile, rs);
+    return cudaGetLastError();
+}
+}  // namespace
+
+cudaError_t norm_quantize_enqueue(const float* x, const float* gain, float eps, std::uint32_t rows, std::uint32_t in, std::uint8_t* x_tile,
+                                  float* rs, cudaStream_t stream) {
+    return norm_quantize_launch(x, sm120::RmsRowNorm{gain, eps}, rows, in, x_tile, rs, stream);
+}
+
+cudaError_t gated_norm_quantize_enqueue(const float* x, const float* z, const float* gain, float eps, std::uint32_t rows,
+                                        std::uint32_t in, std::uint8_t* x_tile, float* rs, cudaStream_t stream) {
+    if (!z || !gain || in % kGatedNormHead) return cudaErrorInvalidValue;
+    return norm_quantize_launch(x, sm120::GatedHeadNorm{z, gain, eps}, rows, in, x_tile, rs, stream);
+}
+
 cudaError_t gemm_enqueue(const GemmArgs& a, cudaStream_t stream) {
     if (!valid(a)) return cudaErrorInvalidValue;
     if (auto e = capability(); e != cudaSuccess) return e;

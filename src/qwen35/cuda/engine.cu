@@ -952,6 +952,13 @@ struct CudaEngine::Impl {
         std::uint32_t act_in = 0, act_rows = 0;
         cc::BigAct act[2];
         bool have[2] = {false, false};
+        // FAST4 norm fold: xn = rmsnorm(x, norm_gain) is PENDING (never written) while norm_gain != nullptr; pf_act quantises it
+        // straight from x or materialises the f32 rows. A GEMM writing x drops a pending xn (xn_dead: reading it would be an error).
+        const float* norm_gain = nullptr;
+        bool xn_dead = false;
+        // The same for the chunked GDN output: gout holds the raw delta-rule rows and its gated RMSNorm (gain gout_gain, gate z) is
+        // PENDING while gout_gain != nullptr (gdn_prefill_layer ran with defer_norm); pf_act folds it into the ssm_out quantiser.
+        const float* gout_gain = nullptr;
     };
     struct CacheDel {
         void operator()(cc::BigOperandCache* p) const { cc::dense_big_cache_destroy(p); }
@@ -1105,6 +1112,24 @@ struct CudaEngine::Impl {
             sl.act_rows = rows;
         }
         const int cls = w.format == cc::WeightFormat::nvfp4 ? 1 : 0;
+        if (x == sl.xn && sl.xn_dead) throw std::logic_error("prefill: normalised rows read after their residual source was overwritten");
+        if (x == sl.gout && sl.gout_gain != nullptr && !sl.have[cls]) {
+            if (cls == 1 && opt.prefill_arith == PrefillArith::fast4 && w.in == gd.v_width()) {
+                CK(cc::dense_big_gated_norm_split4(sl.gout, sl.z, sl.gout_gain, c.rms_eps, rows, w.in, &sl.act[1], sl.st, sl.bc));
+                sl.have[1] = true;
+            } else {  // any other consumer: apply the norm in place first (the unfolded chunked path)
+                CK(cc::gdn_chunk_norm(gd, sl.gout_gain, sl.z, sl.gout, rows, c.rms_eps, sl.st));
+                sl.gout_gain = nullptr;
+            }
+        }
+        if (x == sl.xn && sl.norm_gain != nullptr && !sl.have[cls]) {
+            if (cls == 1 && opt.prefill_arith == PrefillArith::fast4 && w.in == c.hidden) {
+                CK(cc::dense_big_norm_split4(sl.x, sl.norm_gain, c.rms_eps, rows, w.in, &sl.act[1], sl.st, sl.bc));
+                sl.have[1] = true;
+            } else {
+                pf_norm_materialise(sl, rows);
+            }
+        }
         if (!sl.have[cls] && cls == 1 && opt.prefill_arith == PrefillArith::fast4) {
             CK(cc::dense_big_split4(x, rows, w.in, &sl.act[cls], sl.st, sl.bc));
             sl.have[cls] = true;
@@ -1119,15 +1144,37 @@ struct CudaEngine::Impl {
         sl.have[0] = sl.have[1] = false;
     }
 
+    // xn = rmsnorm(x, gain) ahead of its GEMM consumers. FAST4 + prefill_norm_fold: left pending, so each consumer's A operand is
+    // quantised straight from x (cuda_core dense_big_norm_split4, bitwise equal to rmsnorm + dense_big_split4) and the f32 rows are
+    // neither written nor re-read; any other consumer gets them materialised first (pf_act).
+    void pf_norm(Slot& sl, const float* gain, std::uint32_t rows) {
+        pf_dirty(sl);
+        sl.xn_dead = false;
+        if (opt.prefill_norm_fold && opt.prefill_arith == PrefillArith::fast4 && cc::dense_big_norm_split4_fits(c.hidden)) {
+            sl.norm_gain = gain;
+            return;
+        }
+        sl.norm_gain = nullptr;
+        const cc::GroupedView hv{rows, 1, c.hidden, c.hidden, c.hidden};
+        CK(cc::rmsnorm(sl.x, hv, gain, sl.xn, hv, c.rms_eps, sl.st));
+    }
+    void pf_norm_materialise(Slot& sl, std::uint32_t rows) {
+        const cc::GroupedView hv{rows, 1, c.hidden, c.hidden, c.hidden};
+        CK(cc::rmsnorm(sl.x, hv, sl.norm_gain, sl.xn, hv, c.rms_eps, sl.st));
+        sl.norm_gain = nullptr;
+    }
+
     void pf_gemm(Slot& sl, const cc::DenseWeight& w, const float* x, std::uint32_t rows, float* y, const float* aux, cc::BigEpi epi) {
         const cc::BigAct& a = pf_act(sl, x, rows, w);
+        if (y == sl.x && sl.norm_gain != nullptr) {  // x is overwritten: a still pending xn can no longer be produced
+            sl.norm_gain = nullptr;
+            sl.xn_dead = true;
+        }
         CK(cc::dense_big_gemm(w, a, y, aux, epi, sl.st, sl.bc));
     }
 
     void pf_mlp(Slot& sl, const LayerW& w, std::uint32_t rows) {
-        const cc::GroupedView hv{rows, 1, c.hidden, c.hidden, c.hidden};
-        CK(cc::rmsnorm(sl.x, hv, w.post_norm, sl.xn, hv, c.rms_eps, sl.st));
-        pf_dirty(sl);
+        pf_norm(sl, w.post_norm, rows);
         if (opt.prefill_arith == PrefillArith::fast4 && w.ffn_gate.format == cc::WeightFormat::nvfp4 && w.ffn_up.format == cc::WeightFormat::nvfp4) {
             // FAST4: gate and up in ONE GEMM, SwiGLU in registers (no f32 gate round trip through hid)
             CK(cc::dense_big_glu4(w.ffn_gate, w.ffn_up, pf_act(sl, sl.xn, rows, w.ffn_gate), sl.hid, sl.st, sl.bc));
@@ -1179,8 +1226,6 @@ struct CudaEngine::Impl {
     // layer l (null for the first chunk); mine[l] is recorded after this chunk's layer l.
     void pf_chunk(Slot& sl, const std::uint32_t* tokens, std::uint32_t rows, std::uint32_t pos0, std::uint32_t read_side,
                   const cudaEvent_t* prev, cudaEvent_t* mine) {
-        const std::uint32_t H = c.hidden;
-        const cc::GroupedView hv{rows, 1, H, H, H};
         CK(cudaMemcpyAsync(sl.ids, tokens, static_cast<std::size_t>(rows) * 4, cudaMemcpyHostToDevice, sl.st));
         CK(cudaMemcpyAsync(sl.pos, &pos0, 4, cudaMemcpyHostToDevice, sl.st));
         CK(cudaMemcpyAsync(sl.cpar, &read_side, 4, cudaMemcpyHostToDevice, sl.st));
@@ -1190,16 +1235,20 @@ struct CudaEngine::Impl {
         for (std::uint32_t l = 0; l < c.layers; ++l) {
             const LayerW& w = L[l];
             if (prev != nullptr) CK(cudaStreamWaitEvent(sl.st, prev[l], 0));
-            CK(cc::rmsnorm(sl.x, hv, w.attn_norm, sl.xn, hv, c.rms_eps, sl.st));
-            pf_dirty(sl);
+            pf_norm(sl, w.attn_norm, rows);
             if (!w.attn) {
                 pf_gemm(sl, w.qkv, sl.xn, rows, sl.raw, nullptr, cc::BigEpi::none);
                 pf_gemm(sl, w.gate, sl.xn, rows, sl.z, nullptr, cc::BigEpi::none);
                 pf_gemm(sl, w.beta, sl.xn, rows, sl.br, nullptr, cc::BigEpi::none);
                 pf_gemm(sl, w.alpha, sl.xn, rows, sl.ar, nullptr, cc::BigEpi::none);
                 const auto& cl = commit_layers[gi++];
+                // FAST4 norm fold on the chunked path: the gated RMSNorm is left pending and folded into the ssm_out A operand (bitwise)
+                cc::GdnChunkWork gw = sl.gdn_ws;
+                gw.defer_norm = opt.prefill_norm_fold && opt.prefill_arith == PrefillArith::fast4 && gw.ws != nullptr &&
+                                w.out.format == cc::WeightFormat::nvfp4 && cc::dense_big_norm_split4_fits(gd.v_width());
                 CK(cc::gdn_prefill_layer(gd, cl.layer, cl.state, cc::GdnWindow{sl.raw, sl.qkvc, sl.ar, sl.br}, sl.z, sl.gout, rows, c.rms_eps,
-                                         sl.cpar, sl.gdn_ws, sl.st));
+                                         sl.cpar, gw, sl.st));
+                sl.gout_gain = gw.defer_norm ? cl.layer.norm_gain : nullptr;
                 pf_gemm(sl, w.out, sl.gout, rows, sl.x, sl.x, cc::BigEpi::residual);
                 pf_dirty(sl);
             } else {
@@ -1683,6 +1732,10 @@ void print_effective_config(const EngineOptions& o, const char* arith, std::FILE
                  o.prefill_arith == PrefillArith::exact ? "serial (exact prefill keeps the decode windows)"
                  : o.prefill_gdn == PrefillGdn::chunk16 ? "chunk16 (FAST gdn-chunk16-f32-v1, identity -gdnc16)"
                                                         : "serial (decode recurrence, bitwise)");
+    std::fprintf(f, "  prefill-norm-fold: %s\n",
+                 o.prefill_arith != PrefillArith::fast4 ? "n/a (FAST4 only)"
+                 : o.prefill_norm_fold ? "on (hidden RMSNorm + chunked-GDN gated RMSNorm folded into the FAST4 quantiser, bitwise)"
+                                       : "off (rmsnorm + quantise)");
     std::fprintf(f, "  prefill-inflight: %u%s (bounded submission, scheduling only, bitwise)\n  prefill-ramp: %u%s\n", o.prefill_inflight,
                  o.prefill_inflight ? " chunks" : " = unbounded", o.prefill_ramp, o.prefill_ramp ? " rows first chunk, doubling to prefill-chunk" : " (off)");
     if (o.turbo_weights >= TurboWeights::onfly)

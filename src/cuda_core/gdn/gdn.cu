@@ -394,6 +394,7 @@ cudaError_t gdn_prefill_layer(const GdnDims& d, const GdnLayer& layer, const Gdn
                               float* out, std::uint32_t rows, float eps, const std::uint32_t* parity_dev, const GdnChunkWork& chunk,
                               cudaStream_t stream) {
     if (d.key_dim != 128 || d.value_dim != 128 || d.conv_kernel != 4 || rows == 0) return cudaErrorInvalidValue;
+    if (chunk.defer_norm && chunk.ws == nullptr) return cudaErrorInvalidValue;  // the serial kernel always applies the norm itself
     const std::uint32_t C = d.conv_channels();
     const float qscale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d.key_dim)));
     conv_prefill_kernel<<<dim3(C / 128, (rows + kConvRows - 1) / kConvRows), 128, 0, stream>>>(

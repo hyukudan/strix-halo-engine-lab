@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -48,6 +49,18 @@ enum class PrefillArith : std::uint8_t { exact, flash, fast, fast2, fast8, fast4
 //   chunk16 = FAST gdn-chunk16-f32-v1 (strix/cuda_core/gdn_chunk.hpp): 16-row chunks, FP32, all SMs; bits differ (identity
 //             suffix -gdnc16), opt-in until its logit gate passes.
 enum class PrefillGdn : std::uint8_t { serial, chunk16 };
+// CLI / option spelling of PrefillGdn ("serial" | "chunk16"); anything else is rejected, never mapped to a default.
+[[nodiscard]] inline PrefillGdn parse_prefill_gdn(const std::string& s) {
+    if (s == "serial") return PrefillGdn::serial;
+    if (s == "chunk16") return PrefillGdn::chunk16;
+    throw std::invalid_argument("--prefill-gdn expects serial|chunk16, got '" + s + "'");
+}
+// CLI spelling of EngineOptions::prefill_norm_fold ("on" | "off"); anything else is rejected.
+[[nodiscard]] inline bool parse_prefill_norm_fold(const std::string& s) {
+    if (s == "on") return true;
+    if (s == "off") return false;
+    throw std::invalid_argument("--prefill-norm-fold expects on|off, got '" + s + "'");
+}
 
 struct EngineOptions {
     cuda_core::DenseArith dense_arithmetic = cuda_core::dense_arith();
@@ -65,6 +78,12 @@ struct EngineOptions {
     // Large-M prefill (CudaEngine::prefill). Default exact = bitwise equal to the windowed path.
     PrefillArith prefill_arith = PrefillArith::exact;
     PrefillGdn prefill_gdn = PrefillGdn::serial;  // ignored (and not in the identity) under prefill_arith exact
+    // FAST4 only: the hidden RMSNorms (attn / post) and, on the chunked GDN path, the gated RMSNorm of the ssm_out input are folded
+    // into the A-operand quantiser (cuda_core dense_big_norm_split4 / dense_big_gated_norm_split4), so no f32 normalised rows are
+    // written and re-read. Bitwise equal to norm + quantise (no identity suffix); a non-FAST4 consumer gets the f32 rows materialised
+    // on demand. Default on: identity PASS + strict A/B x3 on the device for the hidden fold (8K FAST4 + chunk16 -4.4 %);
+    // --prefill-norm-fold off is the rollback.
+    bool prefill_norm_fold = true;
     std::uint32_t prefill_chunk = 2048;  // rows per large-M chunk (multiple of 128, <= 8192); buffers are allocated on first use
     // Wave-aligned steps (strix/wave_fit.hpp, scheduling only, bitwise): prompts of >= this many tokens step by the largest
     // rows <= prefill_chunk whose flash grid fills whole waves (4096 -> 3968 on 188 SMs: flash +16 % at 128K, bench). 0 = off
