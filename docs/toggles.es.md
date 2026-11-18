@@ -24,12 +24,12 @@ Solo necesitas esta página para inspeccionar una ruta, depurar o llevar el moto
 
 | Perfil | Qué hace |
 |---|---|
-| `--profile default` | Ruta de producción actual; no exporta cambios de perfil. Es el valor por defecto. |
-| `--profile fast` | Añade solo opciones cualificadas que cambian bits. Las filas aún no cualificadas siguen apagadas (ver `--allow-pending`). |
+| `--profile exact` (alias `default`) | Ruta de producción actual; no exporta cambios de perfil. Es el valor por defecto. |
+| `--profile fast` | Añade todas las opciones cualificadas que cambian bits y las filas elegidas para fast antes de su recibo (marcadas "qualification in progress" en el recibo). Las demás siguen apagadas (ver `--allow-pending`). Par DeepSeek: el paquete `ds41-fast-pf-v1` (expandido igual que `STRIX_DS41_FAST_PREFILL=1`) más `STRIX_DS41_FAST_ENGRAM`, `STRIX_DS41_FAST_SHARED` y `STRIX_DS41_FAST_MOE_F16`; MiniMax: el paquete `mm-fast-pf-v2` (como `STRIX_MM_FAST_PREFILL=1`). Un interruptor puesto, `0` incluido, manda. |
 | `--profile quality` | Un pack de mayor precisión donde existe (Nemotron EXL3). Si no, igual que `default`. |
 
 Existen perfiles con nombre para Qwen, el par DeepSeek, Gemma4/Nemotron y `strix-glm5-rank`.
-MiniMax no tiene perfiles de producto con nombre: `--profile NAME:PROMPT.u32:STEPS` ejecuta una sesión con tiempos.
+MiniMax acepta las mismas palabras (`--profile exact|fast|...`); `--profile NAME:PROMPT.u32:STEPS` sigue ejecutando una sesión con tiempos.
 Las CLI CUDA de Qwen denso 27B (`strix-cuda-qwen35-decode`, `strix-cuda-qwen35-spec`) aceptan la misma palabra, `--profile exact|default|fast|quality`
 (`exact` = `default`; `turbo` se rechaza: este motor aún no tiene barra TURBO). Una sola tabla, `include/strix/profiles/qwen_dense_cuda.hpp`, resuelta por
 el resolvedor compartido para ambas CLI: `fast` enciende cada palanca solo en el régimen donde pasó su gate; una opción explícita gana y
