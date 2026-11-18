@@ -2741,8 +2741,10 @@ struct Bench {
         // band 0 = MT8 PIPE CTAs; 4 / 8 = tall bands (full bands + PIPE tiles + tail at 1700 rows).
         struct RestoreBand { ~RestoreBand() { opt::set_prefill_dense_band(-1); } } restore_band;
         for (int band : {0, 4, 8})
-        // 1023: 7 full tiles in the PIPE epilogue + a 127-row MT8-class remainder on partials and dense_finish_kernel
-        for (unsigned T : {9U, 17U, 100U, 129U, 1023U, 1024U, 1700U, 4096U}) {
+        // 1023: 7 full tiles in the PIPE epilogue + a 127-row MT8-class remainder on partials and dense_finish_kernel.
+        // Under the PIPE tail (STRIX_MMX_PREFILL_PIPE_TAIL=1, K split 1) the MT 1..7 remainders take the fused epilogue
+        // too: 9 / 17 / 100 alone (no full tile), 129 (MT1), 1135 (8 tiles + 111 rows, MT7), 1700 (MT3).
+        for (unsigned T : {9U, 17U, 100U, 129U, 1023U, 1024U, 1135U, 1700U, 4096U}) {
             if (band != 0 && T < 1024U) continue;
             opt::set_prefill_dense_band(band);
             for (const auto& g : dense_v4_groups()) {

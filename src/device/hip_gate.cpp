@@ -1,6 +1,7 @@
 #include "strix/device/hip_gate.hpp"
 
 #include "strix/device/hip_enumerator.hpp"
+#include "strix/device/process_topology.hpp"
 #include "strix/power/sampler.hpp"
 #include "strix/route_receipt.hpp"
 
@@ -55,6 +56,9 @@ void bind_hip_main(int& argc, char** argv, std::FILE* receipt, CodeLoad code_loa
         request.select = cli.select;
         request.profile = cli.profile;
         (void)bind_hip(std::move(request), cli.devices_path, receipt);
+        // Node topology (strix-topology-v1): keep --topology/--node for the family; `topology:` beside `device:`.
+        keep_topology_command_line(take_topology_command_line(argc, argv));
+        if (const auto line = gate_topology_line(argc, argv); receipt && !line.empty()) std::fprintf(receipt, "%s\n", line.c_str());
     } catch (const std::exception& e) {
         std::fprintf(stderr, "%s\n", e.what());
         std::fflush(stderr);

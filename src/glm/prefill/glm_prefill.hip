@@ -3520,20 +3520,22 @@ static void topk_overlap_diag(const std::uint32_t* tokens, const std::uint32_t* 
                 z[0][2], z[0][3], z[1][0], z[1][1], z[1][2], z[1][3]);
 }
 static void mla_flash_rows(const DsaSlot& sl, const std::uint32_t* tokens, const std::uint32_t* n, const float* qt, float* ob, unsigned C,
-                    unsigned keys, bool q16, hipStream_t s, bool ob16 = false) {
+                    unsigned keys, bool q16, hipStream_t s, bool ob16, unsigned max_keys) {
     namespace M = strix::attn_core::sparse;
     topk_overlap_diag(tokens, n, C, s);
     const GlmMlaFlashPolicy::Args a{sl.latent, tokens, n, qt, ob};
     using O16 = GlmMlaFlashOb16<GlmMlaFlashPolicy>;
     using QO16 = GlmMlaFlashOb16<GlmMlaFlashQ16Policy>;
-    if (ob16 && q16 && keys == 16) M::launch_flash_rows<QO16, 16>(a, C, s);
-    else if (ob16 && q16) M::launch_flash_rows<QO16, 32>(a, C, s);
-    else if (ob16 && keys == 16) M::launch_flash_rows<O16, 16>(a, C, s);
-    else if (ob16) M::launch_flash_rows<O16, 32>(a, C, s);
-    else if (q16 && keys == 16) M::launch_flash_rows<GlmMlaFlashQ16Policy, 16>(a, C, s);
-    else if (q16) M::launch_flash_rows<GlmMlaFlashQ16Policy, 32>(a, C, s);
-    else if (keys == 16) M::launch_flash_rows<GlmMlaFlashPolicy, 16>(a, C, s);
-    else M::launch_flash_rows<GlmMlaFlashPolicy, 32>(a, C, s);
+    // Pf auto bound (host, no sync): the caller's causal bound, never above the list capacity kMaxTokens.
+    const unsigned mk = std::min(max_keys, kMaxTokens);
+    if (ob16 && q16 && keys == 16) M::launch_flash_rows<QO16, 16>(a, C, s, mk);
+    else if (ob16 && q16) M::launch_flash_rows<QO16, 32>(a, C, s, mk);
+    else if (ob16 && keys == 16) M::launch_flash_rows<O16, 16>(a, C, s, mk);
+    else if (ob16) M::launch_flash_rows<O16, 32>(a, C, s, mk);
+    else if (q16 && keys == 16) M::launch_flash_rows<GlmMlaFlashQ16Policy, 16>(a, C, s, mk);
+    else if (q16) M::launch_flash_rows<GlmMlaFlashQ16Policy, 32>(a, C, s, mk);
+    else if (keys == 16) M::launch_flash_rows<GlmMlaFlashPolicy, 16>(a, C, s, mk);
+    else M::launch_flash_rows<GlmMlaFlashPolicy, 32>(a, C, s, mk);
     ok(hipGetLastError(), "glm pf mla flash (attn-wmma)");
     attn_wmma::calls.fetch_add(1, std::memory_order_relaxed);
 }
@@ -3579,7 +3581,8 @@ bool mla_gemm_wmma(const float* x, const std::uint16_t* kv_b, unsigned heads, un
 
 static void mla_attention_rows_impl(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
                         const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
-                        hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v, const mla_gemm::Dispatch& dispatch) {
+                        hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v, const mla_gemm::Dispatch& dispatch,
+                        unsigned max_keys) {
     if (C == 0) return;
     if (heads != 32 && heads != 64) throw std::runtime_error("glm pf mla_attention_rows: heads must be 32 or 64");
     if (gemm_v != 1 && gemm_v != 2 && gemm_v != 3) throw std::runtime_error("glm pf mla_attention_rows_versions: unsupported gemm version");
@@ -3598,7 +3601,7 @@ static void mla_attention_rows_impl(const DsaSlot& slot, const std::uint32_t* to
         mla_mark(2, s);
         mla_mark(3, s);
         const bool ob16 = dispatch.ob16 && mla_wmma_selected(ob, kv_b, heads, C, dispatch);  // out GEMM on WMMA: FP16 o-bar image
-        mla_flash_rows(slot, tokens, n, qt, ob, C, keys, q16, s, ob16);
+        mla_flash_rows(slot, tokens, n, qt, ob, C, keys, q16, s, ob16, max_keys);
         mla_mark(4, s);
         if (mla_gemm_wmma<true>(ob, kv_b, heads, C, o, s, dispatch, false, ob16)) {
         } else if (gemm_v == 3) mla_gemm_rows_v3_kernel<true><<<g3_grid(kMlaDim, C, heads, dispatch.heads_mid), 256, 0, s>>>(ob, kv_b, heads, C, o, dispatch.heads_mid);
@@ -3677,21 +3680,22 @@ static void mla_attention_rows_impl(const DsaSlot& slot, const std::uint32_t* to
 void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
                         const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
                         hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v) {
-    mla_attention_rows_impl(slot, tokens, n, q, kv_b, heads, qt, e, ob, o, C, s, scores_v, obar_v, gemm_v, {});
+    mla_attention_rows_impl(slot, tokens, n, q, kv_b, heads, qt, e, ob, o, C, s, scores_v, obar_v, gemm_v, {}, ~0U);
 }
 
 void mla_attention_rows_selected(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
                         const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
                         hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v, unsigned query_window,
-                        mla_gemm::Dispatch dispatch) {
+                        mla_gemm::Dispatch dispatch, unsigned max_keys) {
     if (C == 0) return;
     const unsigned Q = attention_scratch_rows(C, query_window);
     // All KV is already appended/selected. Reuse qt/e/ob on the existing stream;
     // only the query/list/count/output origins move. No recursion or extra waits.
+    // max_keys bounds every row of the call, so it also bounds each window.
     for (unsigned begin = 0; begin < C; begin += Q) {
         const std::size_t offset = std::size_t{begin} * heads * kMlaDim;
         mla_attention_rows_impl(slot, tokens + std::size_t{begin} * kMaxTokens, n + begin, q + offset,
-            kv_b, heads, qt, e, ob, o + offset, std::min(Q, C - begin), s, scores_v, obar_v, gemm_v, dispatch);
+            kv_b, heads, qt, e, ob, o + offset, std::min(Q, C - begin), s, scores_v, obar_v, gemm_v, dispatch, max_keys);
     }
 }
 
@@ -3699,7 +3703,7 @@ void mla_attention_rows_versions(const DsaSlot& slot, const std::uint32_t* token
                         const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
                         hipStream_t s, unsigned scores_v, unsigned obar_v, unsigned gemm_v, unsigned query_window) {
     mla_attention_rows_selected(slot, tokens, n, q, kv_b, heads, qt, e, ob, o, C, s,
-                                scores_v, obar_v, gemm_v, query_window, {});
+                                scores_v, obar_v, gemm_v, query_window, {}, ~0U);
 }
 
 void mla_attention_rows(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
@@ -3707,15 +3711,15 @@ void mla_attention_rows(const DsaSlot& slot, const std::uint32_t* tokens, const 
                         hipStream_t s) {
     mla_attention_rows_impl(slot, tokens, n, q, kv_b, heads, qt, e, ob, o, C, s,
         mla_v1() ? 1U : scores_version(), mla_v1() ? 1U : obar_env_version(heads), mla_gemm_version(),
-        mla_gemm::automatic_dispatch());
+        mla_gemm::automatic_dispatch(), ~0U);
 }
 
 void mla_attention_rows(const DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
                         const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
-                        hipStream_t s, unsigned query_window) {
+                        hipStream_t s, unsigned query_window, unsigned max_keys) {
     mla_attention_rows_selected(slot, tokens, n, q, kv_b, heads, qt, e, ob, o, C, s,
         mla_v1() ? 1U : scores_version(), mla_v1() ? 1U : obar_env_version(heads), mla_gemm_version(),
-        query_window, mla_gemm::automatic_dispatch());
+        query_window, mla_gemm::automatic_dispatch(), max_keys);
 }
 
 }  // namespace strix::glm::pf
