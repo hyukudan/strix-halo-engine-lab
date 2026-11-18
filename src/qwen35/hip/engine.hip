@@ -208,18 +208,19 @@ dl::View view(const Tensor& t) { return {t.data, t.inputs, t.outputs, t.row_byte
 // activations per weight and is L2-bound: 16 rows 827 ms, T=2 414, T=4 305-323); gate/up (two accumulator sets) keep T=2
 // (T=4 spills 176-252 B/lane scratch). Rows <= 8: two outputs per wave (unchanged).
 template <unsigned Rows, wd::Format F, dl::Epilogue E>
-void launch_dense(const Tensor& w, const Tensor& up, const float* x, float* out, hipStream_t s) {
+void launch_dense(const Tensor& w, const Tensor& up, const float* x, float* out, unsigned rows, hipStream_t s) {
     constexpr unsigned T = Rows <= 8U ? 2U : (E == dl::Epilogue::silu_mul ? 2U : 4U);
-    dl::kernel<Rows, T, F, E><<<(w.outputs + 4U * T - 1U) / (4U * T), 128, 0, s>>>(view(w), view(up), x, out);
+    dl::kernel<Rows, T, F, E><<<(w.outputs + 4U * T - 1U) / (4U * T), 128, 0, s>>>(view(w), view(up), x, out, rows);
 }
-// Rows are padded to the next of 1/2/4/8/16 over kMaxRows-sized scratch; every row is independent.
+// Rows are padded to the next of 1/2/4/8/16 over kMaxRows-sized scratch (pad rows read, not stored); every row is
+// independent.
 template <wd::Format F, dl::Epilogue E>
 void dispatch_rows(unsigned rows, const Tensor& w, const Tensor& up, const float* x, float* out, hipStream_t s) {
-    if (rows <= 1U) launch_dense<1, F, E>(w, up, x, out, s);
-    else if (rows <= 2U) launch_dense<2, F, E>(w, up, x, out, s);
-    else if (rows <= 4U) launch_dense<4, F, E>(w, up, x, out, s);
-    else if (rows <= 8U) launch_dense<8, F, E>(w, up, x, out, s);
-    else launch_dense<16, F, E>(w, up, x, out, s);
+    if (rows <= 1U) launch_dense<1, F, E>(w, up, x, out, rows, s);
+    else if (rows <= 2U) launch_dense<2, F, E>(w, up, x, out, rows, s);
+    else if (rows <= 4U) launch_dense<4, F, E>(w, up, x, out, rows, s);
+    else if (rows <= 8U) launch_dense<8, F, E>(w, up, x, out, rows, s);
+    else launch_dense<16, F, E>(w, up, x, out, rows, s);
 }
 // ---- wide windows (rows > 16): FAST dense-q8a8-f16-v1 of the shared f16_dense_tall core --------------------------------
 // One engine per process binds these scratch buffers (set by Impl); rows beyond the exact 16-row sweep go through them.

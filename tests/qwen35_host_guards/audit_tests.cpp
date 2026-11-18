@@ -64,10 +64,10 @@ std::vector<unsigned> seen;
 std::vector<const void*> scratch_seen;
 struct Iu4Scratch { void *xh = nullptr, *g = nullptr, *u = nullptr; };
 void linear16(const Tensor&, const float*, float* out, unsigned rows, hipStream_t, const Iu4Scratch&) {
-    // Model the existing dispatcher's physical row rounding.
-    unsigned physical = 1;
-    while (physical < rows) physical *= 2;
-    runtime_require(out >= base_out && out + physical <= base_out + limit);
+    // The dispatcher computes the 1/2/4/8/16 bucket but stores only `rows` rows (dense_linear::kernel and
+    // dense_linear_iu4 `nrows` guards); pad rows are only read, inside the engine's 16-row scratch.
+    runtime_require(rows >= 1U && rows <= 16U);
+    runtime_require(out >= base_out && out + rows <= base_out + limit);
     seen.push_back(rows);
 }
 void glu16(const Tensor& g, const Tensor&, const float* x, float* out, unsigned rows, hipStream_t s, const Iu4Scratch& iu4) {
@@ -125,6 +125,12 @@ int main() {
         glu(Tensor{}, Tensor{}, v.data(), v.data(), n, nullptr, WideScratch{}, Iu4Scratch{});
         unsigned sum = 0; for (auto count : seen) sum += count;
         check(sum == 2 * n, "686-2 exact logical tails");
+        // hip_dense_dec4: a window of <= 16 rows is ONE call (one weight pass), never a power-of-two split; wider
+        // windows keep 16-row sweeps and a power-of-two tail (no call rounds a tail past the window).
+        bool shape = n > 16U ? true : seen == std::vector<unsigned>{n, n};
+        if (n > 16U)
+            for (std::size_t i = 0; i < seen.size(); ++i) shape = shape && (seen[i] & (seen[i] - 1U)) == 0U;
+        check(shape, "dec4 one call per <= 16-row window, power-of-two tails above");
     }
     std::int8_t ca = 0, cb = 0;
     WideScratch a{&ca, nullptr, nullptr, nullptr}, b{&cb, nullptr, nullptr, nullptr};
