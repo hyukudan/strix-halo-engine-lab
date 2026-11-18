@@ -2,6 +2,7 @@
 #include "strix/q6p_registry.hpp"
 #include "strix/moe_q4k_a8_contract.hpp"
 #include "strix/gsq_a8_groups.hpp"
+#include "strix/moe_slot_merge.hpp"
 #include <array>
 #include <limits>
 #include <stdexcept>
@@ -91,6 +92,12 @@ RuntimeWorkspace build_runtime_workspace(std::uint64_t hidden, std::uint64_t row
         l.down_sums_offset = align256(l.down_deltas_offset + l.down_deltas_bytes);
         l.down_sums_bytes = l.down_deltas_bytes;
         l.total_bytes = align256(l.down_sums_offset + l.down_sums_bytes);
+        // Slot-merge tickets in the pad between status and codes: one ordered clear covers accumulation, status
+        // and tickets (H <= 2560 -> 42 words <= the 63-word pad).
+        l.ticket_offset = l.status_offset + 4U;
+        l.ticket_bytes = 4ULL * moe_slot_merge::ticket_words(static_cast<std::uint32_t>(hidden));
+        if (l.ticket_offset + l.ticket_bytes > l.codes_offset)
+            throw std::invalid_argument("Q4K A8 runtime slot-merge tickets exceed the status pad");
     }
     return l;
 }

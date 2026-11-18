@@ -10,4 +10,18 @@ namespace strix::moe_q4k_a8 {
 // as a successful session by this API.
 void enqueue_down_activation_quantize(const DownRequest&,const DownBindings&,hipStream_t);
 void enqueue_down_rawdots(const DownRequest&,const DownBindings&,hipStream_t);
+// Same rawdots, plus the ordered expert-slot merge, finite test, commit and first-error publication inside the
+// same launch (strix/moe_slot_merge.hpp): bitwise the incumbent separate serial tail, so the caller enqueues no
+// tail. tickets: moe_slot_merge::ticket_words(hidden) words, zero on entry (the caller's prologue clears them);
+// the launch leaves them zero. output holds bf16 bits when output_bf16, else f32.
+struct SlotMergeTail {
+    std::uint32_t* tickets=nullptr;
+    const float* route_weights=nullptr;
+    float* accumulation=nullptr;
+    void* output=nullptr;
+    bool output_bf16=false, bf16_commit=false;
+    void* record=nullptr; // strix::DeferredMoeFirstError
+    std::uint32_t domain=0;
+};
+void enqueue_down_rawdots(const DownRequest&,const DownBindings&,const SlotMergeTail&,hipStream_t);
 }
