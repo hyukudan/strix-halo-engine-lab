@@ -37,6 +37,9 @@ struct Device {
     // Measured per-row cost multiplier by block rows {rows, factor}, ascending rows (piecewise linear in log2 rows,
     // clamped at both ends; empty = 1). Small units cost more per row (launches, fixed waits, smaller GEMMs).
     std::vector<std::pair<std::uint32_t, double>> unit_scale{};
+    // Decode read rate (bytes/ms) of this device as the decoder: weights + state streamed per token. 0: undeclared,
+    // the plan then carries no decode prediction and the decode term of the objective is 0.
+    double read_bytes_per_ms = 0.0;
 };
 struct Link {                             // between device i and i+1
     double forward_bytes_per_ms = 0.0;    // useful rate towards i+1 (0: no link)
@@ -49,6 +52,10 @@ struct ModelShape {
     std::vector<double> state_bytes_per_row; // per layer: prefix state growing with rows (KV, indices)
     std::vector<double> state_fixed_bytes;   // per layer: state of fixed size (recurrent matrices, convolutions)
     std::vector<double> weight_bytes;        // per layer, optional (empty: memory unchecked)
+    // Memory admission and decode prediction (all optional; zero / empty keeps the plan of a binder that omits them).
+    double embed_bytes = 0.0;                // resident on the first stage and on the decoder
+    double head_bytes = 0.0;                 // final norm + head: resident on the last stage and the decoder, read per token
+    std::vector<double> read_bytes_per_token{}; // per layer: decode bytes read per token (weights + state); empty: none
 };
 // Split toggle (one value for CLI and server, resolved here): auto_plan searches everything; device_only keeps the
 // prefill on one device that also decodes; handoff runs one device and moves the whole state to another decoder;
@@ -70,6 +77,12 @@ struct Request {
     std::vector<std::uint32_t> decoders;   // devices allowed to own the state after the prefill
     std::function<bool(std::uint32_t)> legal_cut; // empty: every layer boundary is legal
     std::uint32_t max_stages = 0;          // 0: as many as devices
+    std::uint64_t state_rows = 0;          // prefix rows the memory admission reserves (context); 0: the prompt rows
+    double decode_tokens = 0.0;            // decode tokens expected after the prefill: objective += tokens x decode ms
+    // Layer-owned state (a layer pipeline that also decodes in stages): every stage keeps its layers' state for the
+    // decode, no device takes the whole model, so the admission checks each stage (weights + its state) and not the
+    // decoder's whole-model fit. false keeps the handoff admission (the decoder owns everything after the prefill).
+    bool layer_owned_state = false;
 };
 struct Plan {
     bool valid = false;
@@ -83,6 +96,7 @@ struct Plan {
     std::vector<double> stage_block_ms;    // per stage, one full block
     std::vector<double> hop_block_ms;      // per forward hop first..max(last,decoder)-1, one full block
     std::string bottleneck;                // slowest resource of a full block
+    double decode_ms_per_token = 0.0;      // decoder alone after the prefill (0: rate or reads undeclared)
     std::string reason;
     std::uint32_t stages() const { return static_cast<std::uint32_t>(cuts.empty() ? 0U : cuts.size() - 1U); }
     double rows_per_s(std::uint64_t rows) const { return wall_ms > 0.0 ? static_cast<double>(rows) * 1000.0 / wall_ms : 0.0; }
@@ -119,7 +133,8 @@ inline std::uint32_t owner(const std::vector<std::uint32_t>& cuts, std::uint32_t
 
 // Evaluates one fully specified plan (first, decoder, cuts, block); fills timing or the reject reason.
 inline Plan evaluate(const std::vector<Device>& devices, const std::vector<Link>& links, const ModelShape& model,
-    std::uint64_t rows, std::uint32_t first, std::uint32_t decoder, std::vector<std::uint32_t> cuts, std::uint32_t block) {
+    std::uint64_t rows, std::uint32_t first, std::uint32_t decoder, std::vector<std::uint32_t> cuts, std::uint32_t block,
+    std::uint64_t state_rows = 0, bool layer_owned_state = false) {
     Plan plan;
     plan.first = first;
     plan.decoder = decoder;
@@ -143,10 +158,39 @@ inline Plan evaluate(const std::vector<Device>& devices, const std::vector<Link>
         if (device.layer_ms_per_row.size() != model.layers) return reject("no layer costs for " + device.name);
         if (!model.weight_bytes.empty()) {
             if (model.weight_bytes.size() != model.layers) return reject("model weight shape mismatch");
-            const auto need = detail::range_sum(model.weight_bytes, plan.cuts[s], plan.cuts[s + 1U]);
+            const auto need = detail::range_sum(model.weight_bytes, plan.cuts[s], plan.cuts[s + 1U]) +
+                (s == 0U ? model.embed_bytes : 0.0) + (s + 1U == stages ? model.head_bytes : 0.0);
             if (!(device.capacity_bytes > 0.0)) return reject("capacity undeclared for " + device.name);
             if (need > device.capacity_bytes) return reject("weights do not fit " + device.name);
         }
+    }
+    // Memory admission beyond the weights (declared weights only): a stage also holds the prefix state of its layers
+    // at the admitted rows; the decoder owns the whole state after the prefill and decodes the whole model alone.
+    if (!model.weight_bytes.empty()) {
+        const double admitted = static_cast<double>(state_rows == 0U ? rows : state_rows);
+        const auto state_of = [&](std::uint32_t begin, std::uint32_t end) {
+            return detail::range_sum(model.state_bytes_per_row, begin, end) * admitted +
+                   detail::range_sum(model.state_fixed_bytes, begin, end);
+        };
+        for (std::uint32_t s = 0; s < stages; ++s) {
+            const auto& device = devices[first + s];
+            const auto need = detail::range_sum(model.weight_bytes, plan.cuts[s], plan.cuts[s + 1U]) +
+                (s == 0U ? model.embed_bytes : 0.0) + (s + 1U == stages ? model.head_bytes : 0.0) +
+                state_of(plan.cuts[s], plan.cuts[s + 1U]);
+            if (need > device.capacity_bytes) return reject("weights and prefix state do not fit " + device.name);
+        }
+        if (!layer_owned_state) {   // layer-owned state: the stage admission above is the whole check
+            const auto& owner = devices[decoder];
+            if (!(owner.capacity_bytes > 0.0)) return reject("capacity undeclared for " + owner.name);
+            const auto whole = detail::range_sum(model.weight_bytes, 0U, model.layers) + model.embed_bytes + model.head_bytes +
+                state_of(0U, model.layers);
+            if (whole > owner.capacity_bytes) return reject("decoder " + owner.name + " cannot hold the whole model and state");
+        }
+    }
+    if (!model.read_bytes_per_token.empty() && devices[decoder].read_bytes_per_ms > 0.0) {
+        if (model.read_bytes_per_token.size() != model.layers) return reject("model read shape mismatch");
+        plan.decode_ms_per_token = (detail::range_sum(model.read_bytes_per_token, 0U, model.layers) + model.head_bytes) /
+                                   devices[decoder].read_bytes_per_ms;
     }
     // Forward resources: stage first, hop first, ..., stage last, then state-only hops up to the decoder.
     const auto end = std::max(plan.last, decoder);
@@ -249,10 +293,34 @@ inline Choice choose(const std::vector<Device>& devices, const std::vector<Link>
         if (work > work_left) throw std::invalid_argument("chain search work limit exceeded");
         work_left -= work;
     };
-    const auto better = [](const Plan& a, const Plan& b) {
+    // Objective: prefill wall plus the expected decode on the chosen decoder (decode_tokens 0: the wall alone).
+    const auto objective = [&](const Plan& p) { return p.wall_ms + request.decode_tokens * p.decode_ms_per_token; };
+    const auto better = [&](const Plan& a, const Plan& b) {
         if (!b.valid) return a.valid;
         if (!a.valid) return false;
-        return a.wall_ms < b.wall_ms * (1.0 - 1e-12);
+        return objective(a) < objective(b) * (1.0 - 1e-12);
+    };
+    // Exact pruning for any device count. A flow shop's makespan, so the wall, is at least the sum of the block times of
+    // any one stage resource (done[r][j] >= done[r][j-1] + t_r(j) and the last resource finishes last). Placed stages
+    // give that bound directly; the layers not yet placed cost at least their cheapest remaining device each, and the
+    // remaining stages share them, so the slowest of them carries at least the mean. Within one run (fixed decoder) the
+    // decode term is a constant, so a cut prefix whose bound exceeds the run's best wall cannot win and is skipped;
+    // evaluation order and tie rules are unchanged, so the chosen plan and every candidate are those of the full search.
+    std::vector<std::vector<double>> prefix(devices.size());
+    for (std::size_t d = 0; d < devices.size(); ++d)
+        if (devices[d].layer_ms_per_row.size() == model.layers) {
+            prefix[d].assign(model.layers + 1U, 0.0);
+            for (std::uint32_t l = 0; l < model.layers; ++l) prefix[d][l + 1U] = prefix[d][l] + devices[d].layer_ms_per_row[l];
+        }
+    const auto block_sum = [&](std::uint32_t block, auto&& time_of_rows) {
+        const auto full = request.rows / block, rest = request.rows % block;
+        return static_cast<double>(full) * time_of_rows(static_cast<double>(block)) +
+               (rest != 0U ? time_of_rows(static_cast<double>(rest)) : 0.0);
+    };
+    const auto stage_bound = [&](std::uint32_t device, std::uint32_t begin, std::uint32_t end, std::uint32_t block) {
+        const auto& d = devices[device];
+        const auto per_row = prefix[device][end] - prefix[device][begin];
+        return block_sum(block, [&](double n) { return d.block_fixed_ms + n * per_row * detail::unit_factor(d.unit_scale, n); });
     };
     if (request.split == Split::layer_cut && (request.cuts.empty() || request.cuts.size() + 1U > devices.size()))
         throw std::invalid_argument("layer-cut split needs 1 .. devices-1 interior cuts");
@@ -277,11 +345,69 @@ inline Choice choose(const std::vector<Device>& devices, const std::vector<Link>
                 run_best.reason = "no legal cut set";
                 std::vector<std::uint32_t> cuts(count + 1U, 0U);
                 cuts.back() = model.layers;
+                // Per remaining-stage set (stages index..count-1): suffix sums of the cheapest per-layer cost among
+                // those devices; empty when one of them has no costs (every completion is then rejected anyway).
+                std::vector<std::vector<double>> rest_suffix(count);
+                for (std::uint32_t index = 1; index < count; ++index) {
+                    bool costed = true;
+                    for (auto d = first + index; d < first + count; ++d) costed = costed && !prefix[d].empty();
+                    if (!costed) continue;
+                    auto& suffix = rest_suffix[index];
+                    suffix.assign(model.layers + 1U, 0.0);
+                    for (auto l = model.layers; l-- > 0U;) {
+                        double cheapest = std::numeric_limits<double>::infinity();
+                        for (auto d = first + index; d < first + count; ++d) cheapest = std::min(cheapest, devices[d].layer_ms_per_row[l]);
+                        suffix[l] = suffix[l + 1U] + cheapest;
+                    }
+                }
+                // Lower bounds of every completion of cuts[0..index] (stage index-1 just placed), minimum over blocks.
+                // Machine bound of a flow shop: the last block leaves the last resource no earlier than (first block
+                // through every resource before s) + (all blocks on s) + (last block through every resource after s);
+                // hops count as 0. `placed` uses placed stages only (non-decreasing in cuts[index]); `whole` adds the
+                // remaining stages: their last-block times (cheapest device per layer, smallest fixed) and their mean.
+                const auto bounds = [&](std::uint32_t index, double& placed, double& whole) {
+                    placed = whole = std::numeric_limits<double>::infinity();
+                    for (std::uint32_t s = 0; s < index; ++s) if (prefix[first + s].empty()) { placed = whole = 0.0; return; }
+                    const auto remaining = count - index;
+                    const bool costed = !rest_suffix[index].empty();
+                    const auto cheap_rows = costed ? rest_suffix[index][cuts[index]] : 0.0;
+                    const auto rest_total = [&](double n) {  // sum over the remaining stages of one n-row block, at least
+                        if (!costed) return 0.0;
+                        double fixed = std::numeric_limits<double>::infinity(), factor = std::numeric_limits<double>::infinity();
+                        for (auto d = first + index; d < first + count; ++d) {
+                            fixed = std::min(fixed, devices[d].block_fixed_ms);
+                            factor = std::min(factor, detail::unit_factor(devices[d].unit_scale, n));
+                        }
+                        return static_cast<double>(remaining) * fixed + n * cheap_rows * factor;
+                    };
+                    const auto one = [&](std::uint32_t s, double n) {
+                        const auto& d = devices[first + s];
+                        return d.block_fixed_ms + n * (prefix[first + s][cuts[s + 1U]] - prefix[first + s][cuts[s]]) * detail::unit_factor(d.unit_scale, n);
+                    };
+                    for (const auto block : blocks) {
+                        const auto n1 = static_cast<double>(request.rows >= block ? block : request.rows);
+                        const auto nl = static_cast<double>(request.rows % block != 0U ? request.rows % block : block);
+                        double p = 0.0, head = 0.0;
+                        for (std::uint32_t s = 0; s < index; ++s) {
+                            double tail = 0.0;
+                            for (auto later = s + 1U; later < index; ++later) tail += one(later, nl);
+                            p = std::max(p, head + stage_bound(first + s, cuts[s], cuts[s + 1U], block) + tail);
+                            head += one(s, n1);
+                        }
+                        const auto rest_last = rest_total(nl);
+                        double w = p + rest_last;
+                        if (costed && remaining > 0U)
+                            w = std::max(w, head + block_sum(block, [&](double n) { return rest_total(n) / static_cast<double>(remaining); }));
+                        placed = std::min(placed, p);
+                        whole = std::min(whole, w);
+                    }
+                };
                 const std::function<void(std::uint32_t)> place = [&](std::uint32_t index) {
                     if (index == count) {
                         for (const auto block : blocks) {
                             charge(1U);
-                            auto plan = evaluate(devices, links, model, request.rows, first, decoder, cuts, block);
+                            auto plan = evaluate(devices, links, model, request.rows, first, decoder, cuts, block, request.state_rows,
+                                                 request.layer_owned_state);
                             if (!plan.stage_block_ms.empty()) charge(plan.blocks * (plan.stage_block_ms.size() + plan.hop_block_ms.size() +
                                 (plan.last > decoder ? plan.last - decoder : 0U)));
                             if (better(plan, run_best) || (!run_best.valid && !plan.valid && run_best.reason == "no legal cut set"))
@@ -294,6 +420,13 @@ inline Choice choose(const std::vector<Device>& devices, const std::vector<Link>
                         charge(1U);
                         if (!legal(cut) || (forced != 0U && cut != forced)) continue;
                         cuts[index] = cut;
+                        if (run_best.valid) {
+                            double placed = 0.0, whole = 0.0;
+                            bounds(index, placed, whole);
+                            const auto limit = run_best.wall_ms * (1.0 + 1e-8);
+                            if (placed > limit) break;      // stage index-1 only grows with the cut
+                            if (whole > limit) continue;
+                        }
                         place(index + 1U);
                     }
                 };

@@ -199,3 +199,17 @@ record bytes; unchanged MMA controls are reused.
 
 The implementation lives in `src/cuda/core/moe_a8.cuh` and
 `src/cuda/weight/gsq_sources.cuh`; the Qwen adapter only selects the shared source.
+
+### Served 8,076-token cell on the integrated build
+
+RTX PRO 6000 Blackwell at a 600 W power limit (read, not set), the same GSQ IQ3_S model files, 8,076 actual
+chat-template prompt tokens, prefix cache off, one fresh server process per row, model files in the page cache:
+
+| Path | Client | First request TTFT | Second request TTFT | Numerical check on the same build |
+|---|---|---:|---:|---|
+| Exact defaults | 64 greedy tokens, MTP sidecar loaded | 2,565.2 ms (3,148 tok/s) | 2,565.8 ms (3,148 tok/s) | greedy ids (8,076 x2 + 2K prompts) and 256 teacher-forced logit rows byte-equal to the previous main build |
+| `--profile fast` (`qwen-cuda-fast-bundle-v1`, `hc_mma` v2) | 1 token, under a kernel trace | 1,144.5 ms (7,056 tok/s) | 1,144.5 ms (7,056 tok/s) | FAST gate PASS: 8K pooled KL 0.00198, top-1 0.9941; 32K KL 0.00621, top-1 0.9688; short code / structured KL 0.00030, top-1 0.9969 |
+
+The previous main build took 19,984.6 / 19,735.0 ms for the exact row in the same run frame. Each row is one
+process and two request observations, not an all-workload figure; the FAST row's time was taken under an Nsight
+Systems kernel trace (warm kernel sum 1,173.4 ms on two streams). `--profile fast` stays opt-in and provisional.

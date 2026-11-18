@@ -270,9 +270,10 @@ template <class Deep> static void test_tree_order(std::mt19937& rng, u32 trials)
 }
 
 // Host replica of the per-tile kernels of src/cuda/core/moe_a8.cuh (native_project_kernel / native_down_kernel): the same
-// lane map (rows wr * 8 + rl + 4 i, outputs per output warp), the stage schedule walked with next_stage exactly as the
-// kernel's double buffer does, the leaf rule of each route and TreeCounter<4, volatile float>. Every (row, output) of the
-// tile must be written exactly once and equal the butterfly route (lane_value + butterfly_root) bit for bit.
+// thread map (native_reuse::MicroTile: 256 threads, rows 8 w + 4 rh + i, outputs og + 16 k), the stage schedule walked with
+// next_stage exactly as the kernel's double buffer does, the leaf rule of each route and the kernel's TreeCounter<16, ...>.
+// Every (row, output, matrix) of the tile must be written exactly once and equal the butterfly route (lane_value +
+// butterfly_root) bit for bit.
 static void test_tile_mapping(nr::LaneSeed seed, u32 t, u32 count, bool specials, std::mt19937& rng) {
     const bool project = seed == nr::LaneSeed::zero_seeded;
     const u32 width = project ? 2560U : 640U, groups = width / 32U, outputs = project ? 32U : 64U;
@@ -299,48 +300,73 @@ static void test_tile_mapping(nr::LaneSeed seed, u32 t, u32 count, bool specials
         return nr::butterfly_root(v);
     };
     std::vector<u32> written(std::size_t(count) * outputs * mats, 0U);
-    for (u32 warp = 0; warp < 32U; ++warp)
-        for (u32 lane = 0; lane < 32U; ++lane) {
-            const u32 r0 = (warp & 7U) * 8U + (lane & 3U);
-            if ((warp & 7U) * 8U >= count) continue;  // inactive warp: never stores
-            u32 rows[2] = {r0, r0 + 4U}, item_o[4], item_m[4], item_r[4];
-            for (u32 i = 0; i < 2U; ++i)
-                for (u32 k = 0; k < 2U; ++k) {
-                    const u32 it = 2U * i + k;
-                    item_r[it] = rows[i];
-                    item_o[it] = project ? (warp >> 3) * 8U + (lane >> 2) : (warp >> 3) * 16U + (lane >> 2) + 8U * k;
-                    item_m[it] = project ? k : 0U;
-                }
-            nr::TreeCounter<4, volatile float> tree;
-            float leaf[4];
-            u32 sm = 0, sg = 0, stages = 0;  // the stage the double buffer holds (stage 0 = group 0)
-            bool more = true;
-            for (u32 m = 0; m < 32U; ++m) {
-                const u32 l = nr::tree_position(m), nt = nr::position_groups(seed, l, groups);
-                for (float& f : leaf) f = 0.0F;
-                for (u32 tt = 0; tt < nt; ++tt) {
-                    check(more && sm == m && sg == l + 32U * tt, "stage schedule", t, m);
-                    for (u32 it = 0; it < 4U; ++it) {
-                        const u32 a = std::min(item_r[it], count - 1U);  // rows >= count compute on any data, never stored
-                        const float* w = wrow(item_m[it], item_o[it]) + 32U * sg;
-                        float acc = 0.0F;
-                        for (u32 j = 0; j < 32U; ++j) acc = nr::fma_rn(w[j], x[std::size_t(a) * width + 32U * sg + j], acc);
-                        leaf[it] = project ? nr::add_rn(leaf[it], acc) : acc;
-                    }
-                    more = nr::next_stage(seed, groups, m, tt, sm, sg);
-                    ++stages;
-                }
-                tree.push(m, leaf);
+    using PT = nr::MicroTile<2>;
+    using DT = nr::MicroTile<4>;
+    check(PT::tile_outputs == 32U && DT::tile_outputs == 64U && PT::threads == 256U, "micro-tile block shape", t, 0);
+    for (u32 th = 0; th < 256U; ++th) {
+        if ((th >> 5) * 8U >= count) continue;  // inactive warp: never stores
+        u32 item_o[16], item_m[16], item_r[16];
+        for (u32 i = 0; i < 4U; ++i)
+            for (u32 c = 0; c < 4U; ++c) {
+                const u32 it = 4U * i + c;  // project: c = 2 k + mat; down: c = k
+                item_r[it] = project ? PT::row(th, i) : DT::row(th, i);
+                item_o[it] = project ? PT::output(th, c >> 1) : DT::output(th, c);
+                item_m[it] = project ? (c & 1U) : 0U;
             }
-            check(!more && stages == groups, "every group staged once", t, stages);
-            for (u32 it = 0; it < 4U; ++it) {
-                if (item_r[it] >= count) continue;
-                const std::size_t idx = (std::size_t(item_r[it]) * outputs + item_o[it]) * mats + item_m[it];
-                ++written[idx];
-                check(same(reference(item_r[it], item_m[it], item_o[it]), leaf[it]), project ? "project tile map" : "down tile map", t, u32(idx));
+        nr::TreeCounter<16, volatile float, volatile float> tree;
+        float leaf[16];
+        u32 sm = 0, sg = 0, stages = 0;  // the stage the double buffer holds (stage 0 = group 0)
+        bool more = true;
+        for (u32 m = 0; m < 32U; ++m) {
+            const u32 l = nr::tree_position(m), nt = nr::position_groups(seed, l, groups);
+            for (float& f : leaf) f = 0.0F;
+            for (u32 tt = 0; tt < nt; ++tt) {
+                check(more && sm == m && sg == l + 32U * tt, "stage schedule", t, m);
+                for (u32 it = 0; it < 16U; ++it) {
+                    const u32 a = std::min(item_r[it], count - 1U);  // rows >= count compute on any data, never stored
+                    const float* w = wrow(item_m[it], item_o[it]) + 32U * sg;
+                    float acc = 0.0F;
+                    for (u32 j = 0; j < 32U; ++j) acc = nr::fma_rn(w[j], x[std::size_t(a) * width + 32U * sg + j], acc);
+                    leaf[it] = project ? nr::add_rn(leaf[it], acc) : acc;
+                }
+                more = nr::next_stage(seed, groups, m, tt, sm, sg);
+                ++stages;
+            }
+            tree.push(m, leaf);
+        }
+        check(!more && stages == groups, "every group staged once", t, stages);
+        for (u32 it = 0; it < 16U; ++it) {
+            if (item_r[it] >= count) continue;
+            const std::size_t idx = (std::size_t(item_r[it]) * outputs + item_o[it]) * mats + item_m[it];
+            ++written[idx];
+            check(same(reference(item_r[it], item_m[it], item_o[it]), leaf[it]), project ? "project tile map" : "down tile map", t, u32(idx));
+        }
+    }
+    check(std::all_of(written.begin(), written.end(), [](u32 n) { return n == 1U; }), "tile map writes every item once", t, count);
+}
+
+// The micro-tile's shared-memory reads, per quarter warp (the LDS.128 phase): X rows and W outputs at pitch 36 floats must
+// hit distinct 16-byte bank quads (or the same address), for every k-step q; and the 256 threads cover each tile item once.
+template <unsigned K> static void test_micro_tile_banks() {
+    using MT = nr::MicroTile<K>;
+    std::vector<u32> cover(std::size_t(MT::tile_rows) * MT::tile_outputs, 0U);
+    for (u32 th = 0; th < MT::threads; ++th)
+        for (u32 i = 0; i < MT::rows; ++i)
+            for (u32 k = 0; k < K; ++k) ++cover[std::size_t(MT::row(th, i)) * MT::tile_outputs + MT::output(th, k)];
+    check(std::all_of(cover.begin(), cover.end(), [](u32 n) { return n == 1U; }), "micro-tile covers every item once", K, 0);
+    for (u32 q = 0; q < 8U; ++q)
+        for (u32 base = 0; base < MT::threads; base += 8U) {
+            for (u32 i = 0; i < MT::rows + K; ++i) {  // X read i (i < rows) or W read k = i - rows
+                u32 addr[8], quad[8];
+                for (u32 l = 0; l < 8U; ++l) {
+                    const u32 th = base + l, line = i < MT::rows ? MT::row(th, i) : MT::output(th, i - MT::rows);
+                    addr[l] = line * 36U + 4U * q;
+                    quad[l] = (addr[l] / 4U) % 8U;
+                }
+                for (u32 l = 0; l < 8U; ++l)
+                    for (u32 n = 0; n < l; ++n) check(addr[l] == addr[n] || quad[l] != quad[n], "micro-tile bank quad", K, base + l);
             }
         }
-    check(std::all_of(written.begin(), written.end(), [](u32 n) { return n == 1U; }), "tile map writes every item once", t, count);
 }
 
 static void print_budgets() {
@@ -536,6 +562,44 @@ static void test_mma_tile(u32 tg, u32 td, u32 count, std::mt19937& rng) {
     for (std::size_t i = 0; i < sd.size(); ++i) check(sd[i] == 1, "mma down staging", count, u32(i));
 }
 
+// Tile-major raster of the FAST kernels (native_mma::tile_major) on their launch grids (tiles, ffn / 64) and
+// (tiles, hidden / 128): every (tile, slice) is owned by exactly one block, the slices of a tile are consecutive in dispatch
+// order, the blocks past tile_count are exactly (tiles - tile_count) x slices, and each tile still writes every output of
+// both kernels once (project_output / down_output unchanged).
+static void test_mma_raster() {
+    constexpr u32 ffn = 640U, hidden = 2560U;
+    for (u32 slices : {ffn / nm::kProjectOutputs, hidden / nm::kDownOutputs}) {
+        const bool project = slices == ffn / nm::kProjectOutputs;
+        for (u32 tiles : {1U, 2U, 9U, 65U, 1262U, 1775U}) {
+            std::vector<u8> seen(std::size_t(tiles) * slices, 0);
+            const u32 tile_count = tiles > 2U ? tiles - 2U : tiles;
+            u32 exited = 0, prev_tile = 0;
+            for (u32 by = 0; by < slices; ++by)
+                for (u32 bx = 0; bx < tiles; ++bx) {
+                    const nm::TileSlice ts = nm::tile_major(bx, by, tiles, slices);
+                    const u32 l = bx + tiles * by;
+                    check(ts.tile < tiles && ts.slice < slices, "mma raster range", tiles, l);
+                    if (ts.tile < tiles && ts.slice < slices) ++seen[std::size_t(ts.tile) * slices + ts.slice];
+                    check(ts.slice == l % slices && (l == 0U || ts.tile == prev_tile + (ts.slice == 0U ? 1U : 0U)),
+                          "mma raster tile-major order", tiles, l);
+                    prev_tile = ts.tile;
+                    exited += ts.tile >= tile_count ? 1U : 0U;
+                }
+            for (std::size_t i = 0; i < seen.size(); ++i) check(seen[i] == 1, "mma raster bijection", tiles, u32(i));
+            check(exited == (tiles - tile_count) * slices, "mma raster early exit", tiles, exited);
+            std::vector<u8> out(project ? ffn : hidden, 0);
+            for (u32 s = 0; s < slices; ++s)
+                for (u32 w = 0; w < nm::kThreads / 32U; ++w)
+                    for (u32 n = 0; n < (project ? 1U : 2U); ++n)
+                        for (u32 c = 0; c < 8U; ++c) {
+                            const u32 o = project ? nm::project_output(s, w, c) : nm::down_output(s, w, n, c);
+                            if (o < out.size()) ++out[o];
+                        }
+            for (std::size_t i = 0; i < out.size(); ++i) check(out[i] == 1, "mma raster output cover", slices, u32(i));
+        }
+    }
+}
+
 int main() {
     std::mt19937 rng(20261117U);
     test_codes(rng);
@@ -553,8 +617,10 @@ int main() {
     }
     test_tile_mapping(nr::LaneSeed::direct, qt::t_iq4_nl, 1U, true, rng);
     test_tile_mapping(nr::LaneSeed::zero_seeded, qt::t_iq3_s, 1U, true, rng);
+    test_micro_tile_banks<2>(); test_micro_tile_banks<4>();
     test_mma_geometry(rng);
     test_mma_conversions(rng);
+    test_mma_raster();
     for (u32 count : {1U, 9U, 37U, 64U}) {
         u32 n = 0;
         for (u32 tg : {qt::t_iq3_xxs, qt::t_iq3_s, qt::t_iq2_s, qt::t_iq4_xs, qt::t_q2_0})

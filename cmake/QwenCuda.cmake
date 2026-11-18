@@ -150,6 +150,14 @@ add_test(NAME qwen_cohort_plan COMMAND qwen_cohort_plan_test)
 add_executable(native_reuse_host_test tests/cuda/native_reuse_host_test.cpp)
 target_include_directories(native_reuse_host_test PRIVATE include)
 add_test(NAME native_reuse_host COMMAND native_reuse_host_test)
+# TURBO integer expert contract (gsq-iq-i8mma-turbo-cuda-v1): CPU oracle of placement, exact group dots and order.
+add_executable(turbo_i8_host_test tests/cuda/turbo_i8_host_test.cpp)
+target_include_directories(turbo_i8_host_test PRIVATE include)
+add_test(NAME turbo_i8_host COMMAND turbo_i8_host_test)
+# Shared GSQ weight decode (FAST / TURBO / exact native): word-level branch-free decode == reference code(), all types.
+add_executable(gsq_decode_host_test tests/cuda/gsq_decode_host_test.cpp)
+target_include_directories(gsq_decode_host_test PRIVATE include)
+add_test(NAME gsq_decode_host COMMAND gsq_decode_host_test)
 # per-request session reservation + the serve's ONE RESOLVER check (host only)
 add_executable(qwen_session_reservation_test tests/session_reservation_tests.cpp)
 target_include_directories(qwen_session_reservation_test PRIVATE include)
@@ -172,6 +180,13 @@ target_compile_options(qwen_qsa_fused_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--
 add_executable(qwen_qsa_fused_order_test tests/cuda/qwen_qsa_fused_order_test.cpp)
 target_include_directories(qwen_qsa_fused_order_test PRIVATE src/cuda/models/qwen)
 add_test(NAME qwen_qsa_fused_order COMMAND qwen_qsa_fused_order_test)
+# Shared row-group attention core: union-list invariant on the host (no GPU) and the device fixture
+# qwen_qsa_rowgroup_test <tables dir> [--no-timing] (FAST qsa_mma v2 vs the exact path, union byte-compare, timing).
+add_executable(rowgroup_union_host_test tests/cuda/rowgroup_union_host_test.cpp)
+add_test(NAME rowgroup_union_host COMMAND rowgroup_union_host_test)
+add_executable(qwen_qsa_rowgroup_test tests/cuda/qwen_qsa_rowgroup_test.cu)
+target_link_libraries(qwen_qsa_rowgroup_test PRIVATE strix_qwen_cuda)
+target_compile_options(qwen_qsa_rowgroup_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
 # QSA index scores: shared-tree form == warp-shuffle form byte for byte (device, no model) + --bench timing
 add_executable(qwen_qsa_score_tree_test tests/cuda/qwen_qsa_score_tree_test.cu)
 target_link_libraries(qwen_qsa_score_tree_test PRIVATE strix_qwen_cuda)
@@ -253,6 +268,10 @@ set_tests_properties(qwen_gdn_state16 PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVIC
 add_executable(qwen_cuda_profile_host_test tests/cuda/qwen_cuda_profile_host_test.cpp)
 target_link_libraries(qwen_cuda_profile_host_test PRIVATE strix_qwen_prefix)
 add_test(NAME qwen_cuda_profile_host COMMAND qwen_cuda_profile_host_test)
+# FAST hc_mma model admission: the FP16 range bound on HC norm / inject weights (host-only).
+add_executable(qwen_hc_fp16_range_host_test tests/cuda/qwen_hc_fp16_range_host_test.cpp)
+target_include_directories(qwen_hc_fp16_range_host_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME qwen_hc_fp16_range_host COMMAND qwen_hc_fp16_range_host_test)
 # Gate kit: teacher-forced logit dump (layout of tools/strix-gate/fast_logit_gate.py); see scripts/bench/cuda/qwen_fast/README.md.
 add_executable(qwen_tf_logits tests/cuda/qwen_tf_logits.cu)
 target_link_libraries(qwen_tf_logits PRIVATE strix_qwen_cuda strix_qwen_handoff)

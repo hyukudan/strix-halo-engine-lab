@@ -64,12 +64,30 @@ bool hc_compact_norm_enabled() {
     static const bool on = strix::lever::select(hc_compact_norm_lever, {}).on;
     return on;
 }
+// STRIX_QRTX_HC_EXACT_FULL=0: exact automatic calls above the rows-form cap use the compact layout again (the admission before
+// this lever). Bitwise: layout only (hc_compact_workspace in qwen_hc.hpp).
+inline constexpr strix::lever::Decl hc_exact_full_lever{
+    .name = "qwen_hc_exact_full_workspace", .env = "STRIX_QRTX_HC_EXACT_FULL", .exactness = strix::lever::Exactness::bitwise,
+    .default_on = true, .source = "wave4 rtx_integ t1b hc fixture, sm_120 8076 rows: full mix 4.045 ms vs compact 4.227, hashes equal"};
+bool hc_exact_full_enabled() {
+    static const bool on = strix::lever::select(hc_exact_full_lever, {}).on;
+    return on;
+}
 // STRIX_QRTX_HC_INJECT_VEC=0: the scalar inject kernel (one element per thread). Bitwise.
 inline constexpr strix::lever::Decl hc_inject_vec_lever{
     .name = "qwen_hc_inject_vec", .env = "STRIX_QRTX_HC_INJECT_VEC", .exactness = strix::lever::Exactness::bitwise,
     .default_on = true, .source = "scripts/bench/cuda/qwen_fast/ident.sh: exact and FAST logit dumps byte-identical on/off"};
 bool hc_inject_vec_enabled() {
     static const bool on = strix::lever::select(hc_inject_vec_lever, {}).on;
+    return on;
+}
+// STRIX_QRTX_HC_OUTPUT_BATCHED=0: the fused exact output epilogue computes its sigmoids one at a time again (each one's two
+// table gathers consumed by branches before the next starts). Bitwise: amd_expf_batch = amd_expf per element (same operations).
+inline constexpr strix::lever::Decl hc_output_batched_lever{
+    .name = "qwen_hc_output_batched_sigmoid", .env = "STRIX_QRTX_HC_OUTPUT_BATCHED", .exactness = strix::lever::Exactness::bitwise,
+    .default_on = true, .source = "wave4/next1112/rtx_hc3-REPORT.md: hc3 fixture hashes equal, exhaustive 2^32 sigmoid batch check"};
+bool hc_output_batched_enabled() {
+    static const bool on = strix::lever::select(hc_output_batched_lever, {}).on;
     return on;
 }
 
@@ -87,6 +105,16 @@ __device__ __forceinline__ float half_bits_to_float(std::uint16_t h) { return we
 // sigmoid(x) = 1.0F / (1.0F + expf(-x)) (hip_hyper_mix_launcher.hip:399-404; ISA [P], [O]).
 __device__ __forceinline__ float amd_sigmoid(const am::Tables& t, float x) {
     return __fdiv_rn(1.0F, __fadd_rn(1.0F, am::amd_expf(t, -x)));
+}
+// amd_sigmoid of N independent values (bits of amd_sigmoid per element; table gathers batched: amd_math.cuh amd_expf_batch).
+template <unsigned N>
+__device__ __forceinline__ void amd_sigmoid_batch(const am::Tables& t, const float (&x)[N], float (&y)[N]) {
+    float m[N];
+#pragma unroll
+    for (unsigned i = 0; i < N; ++i) m[i] = -x[i];
+    am::amd_expf_batch<N>(t, m, y);
+#pragma unroll
+    for (unsigned i = 0; i < N; ++i) y[i] = __fdiv_rn(1.0F, __fadd_rn(1.0F, y[i]));
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -228,16 +256,6 @@ __global__ __launch_bounds__(256, 1) void hc_projection_kernel(const float* x_ro
     const unsigned total_outputs = is_inject ? kStreams : kRank;
     const bool active = first < total_outputs;
 
-    const auto stage = [&](unsigned chunk, unsigned buffer) {
-#pragma unroll
-        for (unsigned m = 0; m < 2U; ++m) {
-            const unsigned e = threadIdx.x + 256U * m, r = e / 32U, k = e % 32U;
-            float4 v = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
-            if (row0 + r < rows)
-                v = load_x4<Compact>(x_rows, xin, xnorm, row0 + r, (chunk / 5U) * 640U + (chunk % 5U) * 128U + k * 4U);
-            xs[buffer][r][k] = v;
-        }
-    };
     const auto fetch = [&](unsigned chunk, float4 (&next)[2]) {
 #pragma unroll
         for (unsigned m = 0; m < 2U; ++m) {
@@ -276,23 +294,33 @@ __global__ __launch_bounds__(256, 1) void hc_projection_kernel(const float* x_ro
             }
         }
     };
-    stage(0U, 0U);
-    if (active) load_raw(0U);
-    __syncthreads();
-    for (unsigned chunk = 0; chunk < 80U; ++chunk) {
-        float4 next[2];
-        if (chunk + 1U < 80U) fetch(chunk + 1U, next);
+    // Chunk order: hcs::proj_pipeline (request chunk + 1 at the top, decode its coefficients after the body of chunk).
+    float c[kProjOutputs][4];
+    float4 next[2];
+    const auto request = [&](unsigned chunk) {  // x tile (every thread stages) and weight words (active warps) of one chunk
+        fetch(chunk, next);
+        if (active) load_raw(chunk);
+    };
+    const auto decode = [&]() {
+        if (!active) return;
+#pragma unroll
+        for (unsigned p = 0; p < kProjOutputs; ++p)
+#pragma unroll
+            for (unsigned j = 0; j < 4U; ++j)
+                // injection: FP32 weights (outputs 4..7 of the injection warp are zero, as HIP's padding);
+                // Q8: coefficient = scale * float(code), exact (:2967-2971)
+                c[p][j] = is_inject ? (p < 4U ? __uint_as_float(raw[4U * p + j]) : 0.0F) :
+                    __fmul_rn(__uint_as_float(raw[8U + p]), static_cast<float>(static_cast<signed char>((raw[p] >> (8U * j)) & 255U)));
+    };
+    const auto store = [&](unsigned chunk) {
+#pragma unroll
+        for (unsigned m = 0; m < 2U; ++m) {
+            const unsigned e = threadIdx.x + 256U * m;
+            xs[chunk & 1U][e / 32U][e % 32U] = next[m];
+        }
+    };
+    const auto body = [&](unsigned chunk) {
         if (active) {
-            float c[kProjOutputs][4];
-#pragma unroll
-            for (unsigned p = 0; p < kProjOutputs; ++p)
-#pragma unroll
-                for (unsigned j = 0; j < 4U; ++j)
-                    // injection: FP32 weights (outputs 4..7 of the injection warp are zero, as HIP's padding);
-                    // Q8: coefficient = scale * float(code), exact (:2967-2971)
-                    c[p][j] = is_inject ? (p < 4U ? __uint_as_float(raw[4U * p + j]) : 0.0F) :
-                        __fmul_rn(__uint_as_float(raw[8U + p]), static_cast<float>(static_cast<signed char>((raw[p] >> (8U * j)) & 255U)));
-            if (chunk + 1U < 80U) load_raw(chunk + 1U);
             const float4 (*x)[32] = xs[chunk & 1U];
             if (is_inject) {
 #pragma unroll
@@ -337,15 +365,8 @@ __global__ __launch_bounds__(256, 1) void hc_projection_kernel(const float* x_ro
             }
             }
         }
-        if (chunk + 1U < 80U) {  // buffer (chunk + 1) & 1 was last read in chunk - 1, before the barrier below
-#pragma unroll
-            for (unsigned m = 0; m < 2U; ++m) {
-                const unsigned e = threadIdx.x + 256U * m;
-                xs[(chunk + 1U) & 1U][e / 32U][e % 32U] = next[m];
-            }
-        }
-        __syncthreads();
-    }
+    };
+    hcs::proj_pipeline(request, decode, store, body, [] { __syncthreads(); });
     if (!active) return;
     if (is_inject) {  // lane i < 8 finishes item i = (row 2w + i / 4, output i % 4); every lane holds all 8 folded totals
         float v = inj_total[0];
@@ -385,8 +406,14 @@ constexpr unsigned kOutRows = hcs::kOutRows, kOutThreads = hcs::kOutThreads;
 // float4 slots of the idle lows buffer, 2 rows per iteration, one copy of the sigmoid code instead of 128 inline copies = 1.24 MB of
 // SASS that every CTA re-fetched): see include/strix/cuda/qwen_hc_exact_shape.hpp. Layout and loop shape only: same values.
 constexpr unsigned kOutLowPitch = hcs::kOutLowPitch, kOutHalfRows = hcs::kOutHalfRows, kOutMixRows = hcs::kOutMixRows;
+// Batched epilogue step: the same 2 rows x 4 streams = 8 sigmoids per step (same inline code size as the per-element loop,
+// whose 8 copies already fill the loop body), but 2 dependent gather round trips per step instead of 16.
+constexpr unsigned kOutSigRows = kOutMixRows;
 
-template <bool Fused, bool Compact = false>
+// Batched (lever qwen_hc_output_batched_sigmoid, default on): the fused epilogue takes kOutSigRows rows x 4 streams per step and
+// computes their sigmoids with amd_sigmoid_batch (all table gathers issued before the first is consumed). Same values, same
+// mix order; only the memory schedule differs. Off: the per-element amd_sigmoid loop (kOutMixRows rows per step).
+template <bool Fused, bool Compact = false, bool Batched = false>
 __global__ __launch_bounds__(128) void hc_output_kernel(const float* __restrict__ normalized, std::uint32_t rows,
     const std::uint32_t* __restrict__ up_codes, const float* __restrict__ up_scales, std::uint16_t* __restrict__ output,
     float* __restrict__ gates, am::Tables t, const std::uint16_t* __restrict__ xin = nullptr, const float* __restrict__ xnorm = nullptr) {
@@ -474,6 +501,36 @@ __global__ __launch_bounds__(128) void hc_output_kernel(const float* __restrict_
         for (unsigned r = 0; r < kOutHalfRows; ++r)
             slots[r * kOutThreads + threadIdx.x] = h == 0U ? make_float4(g[0][r], g[1][r], g[2][r], g[3][r])
                 : make_float4(g[0][kOutHalfRows + r], g[1][kOutHalfRows + r], g[2][kOutHalfRows + r], g[3][kOutHalfRows + r]);
+        if constexpr (Batched) {
+#pragma unroll 1
+            for (unsigned r0 = 0; r0 < kOutHalfRows; r0 += kOutSigRows) {
+                float n[kOutSigRows][kStreams], gs[kOutSigRows * kStreams], sig[kOutSigRows * kStreams];
+#pragma unroll
+                for (unsigned i = 0; i < kOutSigRows; ++i) {
+                    const unsigned row = row0 + kOutHalfRows * h + r0 + i;
+#pragma unroll
+                    for (unsigned s = 0; s < kStreams; ++s) {
+                        if (row >= rows) n[i][s] = 0.0F;
+                        else if constexpr (Compact)
+                            n[i][s] = norm_value(xin[static_cast<std::size_t>(row) * kWide + s * kHidden + f],
+                                                 normalized[static_cast<std::size_t>(row) * kNormalizedPitch + s], wn[s]);
+                        else n[i][s] = normalized[static_cast<std::size_t>(row) * kNormalizedPitch + s * kHidden + f];
+                    }
+                    const float4 gv = slots[(r0 + i) * kOutThreads + threadIdx.x];
+                    gs[i * kStreams + 0U] = gv.x; gs[i * kStreams + 1U] = gv.y; gs[i * kStreams + 2U] = gv.z; gs[i * kStreams + 3U] = gv.w;
+                }
+                amd_sigmoid_batch(t, gs, sig);
+#pragma unroll
+                for (unsigned i = 0; i < kOutSigRows; ++i) {
+                    const unsigned row = row0 + kOutHalfRows * h + r0 + i;
+                    float mixed = 0.0F;
+#pragma unroll
+                    for (unsigned s = 0; s < kStreams; ++s) mixed = __fmaf_rn(n[i][s], sig[i * kStreams + s], mixed);
+                    if (row < rows) output[static_cast<std::size_t>(row) * kHidden + f] = float_to_bf16(__fmul_rn(mixed, 0.25F));
+                }
+            }
+            continue;
+        }
 #pragma unroll 1
         for (unsigned r0 = 0; r0 < kOutHalfRows; r0 += kOutMixRows) {
             float n[kOutMixRows][kStreams], sig[kOutMixRows][kStreams];
@@ -533,7 +590,7 @@ template <unsigned MT, unsigned NW, bool Compact = false>
 __global__ __launch_bounds__(NW * 32U, 1) void hc_projection_mma_kernel(const float* x_rows, std::uint32_t rows,
     const std::int8_t* __restrict__ down_codes, const float* __restrict__ down_scales, const float* __restrict__ inject,
     float* low_rows, float* __restrict__ injection, am::Tables t_, const std::uint16_t* __restrict__ xin,
-    const float* __restrict__ xnorm) {
+    const float* __restrict__ xnorm, float inj_scale, float inj_unscale) {
     using Cfg = ProjCfg<MT, NW>;
     constexpr unsigned kT = Cfg::kThreads, kBM = Cfg::kRowsCta, kNR = Cfg::kOutCta;
     constexpr unsigned kXI = (kBM * 16U + kT - 1U) / kT, kSI = (kNR + kT - 1U) / kT, kIK = (MT + NW - 1U) / NW;
@@ -606,8 +663,12 @@ __global__ __launch_bounds__(NW * 32U, 1) void hc_projection_mma_kernel(const fl
                 const float* p = inject + static_cast<std::size_t>(g) * kWide + c * 64U + b * 32U + 8U * t;
                 v0 = *reinterpret_cast<const float4*>(p); v1 = *reinterpret_cast<const float4*>(p + 4);
             }
-            iw[b][0] = v0.x; iw[b][1] = v0.y; iw[b][2] = v0.z; iw[b][3] = v0.w;
-            iw[b][4] = v1.x; iw[b][5] = v1.y; iw[b][6] = v1.z; iw[b][7] = v1.w;
+            // v2 operand shift: w * 2^e is exact in FP32 (power of two), so the FP16 rounding below is the only rounding
+            // and no non-zero weight reaches FP16 zero (qwen_hc_fp16_range.hpp); inj_scale = 1 is v1 bit for bit.
+            iw[b][0] = __fmul_rn(v0.x, inj_scale); iw[b][1] = __fmul_rn(v0.y, inj_scale);
+            iw[b][2] = __fmul_rn(v0.z, inj_scale); iw[b][3] = __fmul_rn(v0.w, inj_scale);
+            iw[b][4] = __fmul_rn(v1.x, inj_scale); iw[b][5] = __fmul_rn(v1.y, inj_scale);
+            iw[b][6] = __fmul_rn(v1.z, inj_scale); iw[b][7] = __fmul_rn(v1.w, inj_scale);
         }
     };
 
@@ -673,10 +734,12 @@ __global__ __launch_bounds__(NW * 32U, 1) void hc_projection_mma_kernel(const fl
         }
         __syncthreads();
     }
-    // Epilogue (exact kernels' FP32 code): scaled = total / 4, sigmoid.
+    // Epilogue (exact kernels' FP32 code): scaled = total / 4, sigmoid. The inject total is also unshifted: inj_unscale =
+    // 2^-(e+2), a power of two, so v * inj_unscale is v / 2^e / 4 correctly rounded (== __fdiv_rn(v, 4) when e = 0).
     const auto finish = [&](float v0, float v1, unsigned row, unsigned o, bool inj) {
         if (row >= rows) return;
-        const float s0 = __fdiv_rn(v0, static_cast<float>(kStreams)), s1 = __fdiv_rn(v1, static_cast<float>(kStreams));
+        const float s0 = inj ? __fmul_rn(v0, inj_unscale) : __fdiv_rn(v0, static_cast<float>(kStreams));
+        const float s1 = inj ? __fmul_rn(v1, inj_unscale) : __fdiv_rn(v1, static_cast<float>(kStreams));
         const float g0 = fast_sigmoid(s0), g1 = fast_sigmoid(s1);
         if (inj) {
             if (o < kStreams) {
@@ -718,7 +781,8 @@ void launch_projection_mma_c(const HcMixArgs& a, const am::Tables& tables, cudaS
     }();
     (void)attr;
     hc_projection_mma_kernel<MT, NW, Compact><<<dim3((a.rows + Cfg::kRowsCta - 1U) / Cfg::kRowsCta, 8U / NW), Cfg::kThreads, Cfg::kSmem, stream>>>(
-        a.normalized, a.rows, a.packed.down_codes, a.packed.down_scales, a.inject, a.normalized, a.injection, tables, a.input, a.norm);
+        a.normalized, a.rows, a.packed.down_codes, a.packed.down_scales, a.inject, a.normalized, a.injection, tables, a.input, a.norm,
+        std::ldexp(1.0F, a.inject_exp), std::ldexp(1.0F, -(a.inject_exp + 2)));
 }
 template <unsigned MT, unsigned NW>
 void launch_projection_mma(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream, bool compact) {
@@ -1679,7 +1743,10 @@ template <unsigned R> void route_rows_r(const std::uint16_t* hidden, const float
 void hc_mix(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream, unsigned stages) {
     if (!a.rows) return;
     if (a.rows > 65535U * kProjRows) throw std::invalid_argument("qwen_hc mix: too many rows");
-    const bool compact = hc_compact_workspace(a, stages, hc_compact_norm_enabled(), decode_rows_enabled());
+    // rows_cap = the rows_form bound below: an exact automatic call that the rows forms can take is never made compact.
+    const unsigned rows_cap = hc_rows_split_enabled() ? core::decode_rows_max() : 8U;
+    const bool compact = hc_compact_workspace(a, stages, hc_compact_norm_enabled(), decode_rows_enabled(), rows_cap,
+        hc_exact_full_enabled());
     if ((stages & 1U) && compact) hc_norm_kernel<true><<<dim3(a.rows, kStreams), 256U, 0, stream>>>(a.input, a.norm, a.epsilon, a.normalized, tables);
     else if (stages & 1U) hc_norm_kernel<<<dim3(a.rows, kStreams), 256U, 0, stream>>>(a.input, a.norm, a.epsilon, a.normalized, tables);
     check(cudaGetLastError(), "norm launch");
@@ -1718,9 +1785,16 @@ void hc_mix(const HcMixArgs& a, const am::Tables& tables, cudaStream_t stream, u
         a.packed.down_codes, a.packed.down_scales, a.inject, a.normalized, a.injection, tables);
     check(cudaGetLastError(), "projection launch");
     const dim3 out_grid((a.rows + kOutRows - 1U) / kOutRows, kHidden / kOutThreads);
-    if ((stages & 4U) && !a.gates && compact)
+    const bool batched = hc_output_batched(a, hc_output_batched_enabled());
+    if ((stages & 4U) && !a.gates && compact && batched)
+        hc_output_kernel<true, true, true><<<out_grid, kOutThreads, 0, stream>>>(a.normalized, a.rows, a.packed.up_codes,
+            a.packed.up_scales, a.output, nullptr, tables, a.input, a.norm);
+    else if ((stages & 4U) && !a.gates && compact)
         hc_output_kernel<true, true><<<out_grid, kOutThreads, 0, stream>>>(a.normalized, a.rows, a.packed.up_codes, a.packed.up_scales,
             a.output, nullptr, tables, a.input, a.norm);
+    else if ((stages & 4U) && !a.gates && batched)
+        hc_output_kernel<true, false, true><<<out_grid, kOutThreads, 0, stream>>>(a.normalized, a.rows, a.packed.up_codes,
+            a.packed.up_scales, a.output, nullptr, tables);
     else if ((stages & 4U) && !a.gates)
         hc_output_kernel<true><<<out_grid, kOutThreads, 0, stream>>>(a.normalized, a.rows, a.packed.up_codes, a.packed.up_scales,
             a.output, nullptr, tables);

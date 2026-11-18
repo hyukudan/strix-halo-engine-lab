@@ -66,6 +66,15 @@ STRIX_NATIVE_MMA_HD unsigned project_output(unsigned block_y, unsigned warp, uns
 STRIX_NATIVE_MMA_HD unsigned down_output(unsigned block_y, unsigned warp, unsigned n, unsigned col) {
     return block_y * kDownOutputs + 16U * warp + 8U * n + col;
 }
+// Tile-major raster. The kernels are launched on grid (tiles, slices) and blocks are dispatched in linear order
+// L = x + grid_x * y. Reading L as (tile = L / slices, slice = L % slices) makes the output slices of one tile consecutive,
+// so they run together and share the tile's activations (project X, down h) in L2 instead of re-reading them once per
+// full sweep over all tiles. A bijection of [0, grid_x) x [0, slices); the arithmetic of every output is unchanged.
+struct TileSlice { unsigned tile, slice; };
+STRIX_NATIVE_MMA_HD TileSlice tile_major(unsigned block_x, unsigned block_y, unsigned grid_x, unsigned slices) {
+    const unsigned l = block_x + grid_x * block_y;
+    return TileSlice{l / slices, l % slices};
+}
 
 STRIX_NATIVE_MMA_HD std::uint32_t f32_bits(float x) { std::uint32_t u; std::memcpy(&u, &x, 4); return u; }
 STRIX_NATIVE_MMA_HD float bits_f32(std::uint32_t u) { float x; std::memcpy(&x, &u, 4); return x; }

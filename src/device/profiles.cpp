@@ -1,4 +1,5 @@
 #include "strix/device/profiles.hpp"
+#include "strix/device/link_class.hpp"
 
 #include <iomanip>
 #include <sstream>
@@ -38,18 +39,24 @@ const std::vector<Profile> kCatalogue = {
      "set memory_gib (and optionally bandwidth_gbytes_ps, units) in the entry"},
 };
 
+// A view of the one link-class table (link_class.hpp): names, order and notes for `count = N` shapes; the rates are
+// the class rates (no second copy of a number).
+Interconnect from_class(std::string_view name, std::string_view note) {
+    const auto* c = find_link_class(name);
+    return {c->name, c->gbytes_ps, c->rtt_us, note};
+}
 const std::vector<Interconnect> kInterconnects = {
-    {"pcie5x16", 50.0, 5.0, "peer copies through the host bridge, no NVLink"},
-    {"pcie4x16", 25.0, 5.0, "peer copies through the host bridge"},
-    {"pcie4x4", 7.0, 5.0, ""},
-    {"oculink4x4", 7.0, 5.0, ""},
-    {"pcie3x4", 3.2, 5.0, ""},
-    {"usb4", 4.58, 30.0, "measured between our two nodes"},
-    {"100gbe", 11.5, 20.0, ""},
-    {"25gbe", 2.8, 60.0, ""},
-    {"10gbe", 1.1, 100.0, ""},
-    {"2.5gbe", 0.29, 150.0, ""},
-    {"1gbe", 0.118, 200.0, ""},
+    from_class("pcie5x16", "peer copies through the host bridge, no NVLink"),
+    from_class("pcie4x16", "peer copies through the host bridge"),
+    from_class("pcie4x4", ""),
+    from_class("oculink4x4", ""),
+    from_class("pcie3x4", ""),
+    from_class("usb4", "measured between our two nodes"),
+    from_class("100gbe", ""),
+    from_class("25gbe", ""),
+    from_class("10gbe", ""),
+    from_class("2.5gbe", ""),
+    from_class("1gbe", ""),
 };
 
 std::string num(double v) {

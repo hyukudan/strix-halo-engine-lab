@@ -90,7 +90,8 @@ inline bool take(int argc, char** argv, int& i, Request& r) {
         if(value=="incumbent") c.expert_arithmetic=qwen_packs::ExpertArithmetic::incumbent;
         else if(value==qwen_packs::gsq_a8_contract) c.expert_arithmetic=qwen_packs::ExpertArithmetic::gsq_a8_dot4;
         else if(value==qwen_packs::gsq_bf16_contract) c.expert_arithmetic=qwen_packs::ExpertArithmetic::gsq_bf16_mma;
-        else throw std::invalid_argument("--expert-arithmetic requires incumbent, gsq-iq3s-a8-dot4-cuda-v1 or gsq-iq-bf16mma-cuda-v1");
+        else if(value==qwen_packs::gsq_i8_turbo_contract) c.expert_arithmetic=qwen_packs::ExpertArithmetic::gsq_i8_turbo;
+        else throw std::invalid_argument("--expert-arithmetic requires incumbent, gsq-iq3s-a8-dot4-cuda-v1, gsq-iq-bf16mma-cuda-v1 or gsq-iq-i8mma-turbo-cuda-v1");
     }
     else if (a == "--mtp-sidecar") c.mtp_sidecar_gguf = next();
     else if (a == "--draft-vocab") c.draft_vocab = next();
@@ -105,10 +106,6 @@ inline bool take(int argc, char** argv, int& i, Request& r) {
         const auto v = next();
         const auto n = number(a, v, qp::kMaxBlockRows);
         c.final_block_rows = static_cast<std::uint32_t>(n);
-    } else if (a == "--mtp-defer-prompt") {  // Config::defer_prompt_mtp: the first token before the prompt's MTP rows
-        const auto v = next();
-        if (v != "on" && v != "off") throw std::invalid_argument("--mtp-defer-prompt is on or off");
-        c.defer_prompt_mtp = v == "on";
     } else if (a == "--blocks") {
         r.blocks_typed = true;
         c.block_schedule.clear();
@@ -133,6 +130,15 @@ inline bool take(int argc, char** argv, int& i, Request& r) {
 inline void apply(const cp::Choice& choice, qp::Config& config) {
     config.forms = {choice.hc_mma, choice.mtp_mma, choice.qsa_mma, choice.moe_mma};
     config.moe_route_bf16 = choice.moe_route_bf16;  // explicit: the resolver already read the environment
+    // Config::defer_prompt_mtp (exact): the lever row `mtp_defer_prompt` (--mtp-defer-prompt on|off, env, fast profile).
+    config.defer_prompt_mtp = config.defer_prompt_mtp || choice.mtp_defer_prompt;
+    // TURBO / FAST expert rows: an explicit --expert-arithmetic other than incumbent keeps its own contract.
+    if (choice.expert_turbo && choice.expert_fast)
+        throw std::invalid_argument("--expert-turbo and --expert-fast select different expert arithmetics; set one");
+    if (choice.expert_turbo && config.expert_arithmetic == qwen_packs::ExpertArithmetic::incumbent)
+        config.expert_arithmetic = qwen_packs::ExpertArithmetic::gsq_i8_turbo;
+    if (choice.expert_fast && config.expert_arithmetic == qwen_packs::ExpertArithmetic::incumbent)
+        config.expert_arithmetic = qwen_packs::ExpertArithmetic::gsq_bf16_mma;
 }
 
 inline qp::Config resolve_route(qp::Config config, const pr::Lookup& lookup = {}) {
@@ -159,14 +165,13 @@ inline Resolved resolve(const Request& r, Entry entry, std::string_view default_
     auto& c = out.config;
     const auto profile = r.profile.value_or(pr::Name::standard);
     if (profile == pr::Name::turbo) {
-        // TURBO on CUDA (qwen-turbo-v1) is the weight toggle over the exact CUDA route: strix/cuda/qwen_turbo.hpp
-        // resolves it with no lever rows, so the empty turbo cells never inherit the FAST forms of this table, and a
-        // lever option is refused rather than accepted and ignored. Throws when the weight request cannot be honoured.
-        if (!r.inputs.cli.empty())
-            throw std::invalid_argument("Qwen CUDA: --profile turbo takes no lever options (its rows have no CUDA binding)");
-        const auto turbo = ::strix::cuda::qwen_turbo::resolve({r.profile, r.inputs, r.print_effective_config});
+        // TURBO on CUDA (qwen-turbo-v1): the weight toggle of strix/cuda/qwen_turbo.hpp plus this engine's lever table read
+        // through its turbo cells: every FAST form (empty turbo cell = fast cell) and the TURBO-only integer expert row.
+        // Lever options override rows as in every other profile. Throws when the weight request cannot be honoured.
+        const auto turbo = ::strix::cuda::qwen_turbo::resolve({r.profile, r.inputs, r.print_effective_config}, cp::levers());
         out.resolution = turbo.resolution;
         ::strix::cuda::qwen_turbo::apply(turbo, c);
+        out.choice = cp::choose(out.resolution);
     } else {
         out.resolution = cp::resolve(profile, r.inputs);
         out.choice = cp::choose(out.resolution);
@@ -267,6 +272,15 @@ inline std::string effective_config_json(const Resolved& r) {
         turbo.set("cache_namespace", J(c.turbo_namespace));
         turbo.set("decode_arithmetic", J(std::string(c.turbo_onfly_nvfp4 ? "nvfp4-a8-v1 (dense Q8_0 roles converted at load)" : "native pack")));
         out.set("turbo_weights", std::move(turbo));
+    }
+    // FAST bundle (kFastBundle): under --profile fast, or whenever the effective values are the bundle; absent otherwise,
+    // so every other effective config keeps its bytes.
+    const auto bundle = cp::fast_bundle_status(r.choice, c.expert_arithmetic == qwen_packs::ExpertArithmetic::gsq_bf16_mma);
+    if (r.resolution.profile == pr::Name::fast || !bundle.id.empty()) {
+        auto fb = J::object();
+        fb.set("id", J(bundle.id.empty() ? std::string("none") : bundle.id));
+        fb.set("detail", J(bundle.detail));
+        out.set("fast_bundle", std::move(fb));
     }
     out.set("form_identities", J(cp::form_identities(r.choice)));
     out.set("resolution", ::strix::serve::parse_json(r.resolution.json()));
@@ -398,6 +412,10 @@ inline ::strix::cuda::qwen_route::Identity numerical_identity(const qp::Config& 
     if(c.expert_arithmetic==qwen_packs::ExpertArithmetic::gsq_bf16_mma) {
         id.prefill="cuda-qwen-gsq-bf16mma-prefill-v1";
         id.hash=route::hash_part(id.hash,qwen_packs::gsq_bf16_contract);
+    }
+    if(c.expert_arithmetic==qwen_packs::ExpertArithmetic::gsq_i8_turbo) {
+        id.prefill="cuda-qwen-gsq-i8turbo-prefill-v1";
+        id.hash=route::hash_part(id.hash,qwen_packs::gsq_i8_turbo_contract);
     }
     return id;
 }

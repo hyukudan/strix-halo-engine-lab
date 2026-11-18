@@ -267,7 +267,8 @@ int main(int argc, char** argv) {
             else if (pf_arith == "fast") opt.prefill_arith = q::PrefillArith::fast;
             else if (pf_arith == "fast2") opt.prefill_arith = q::PrefillArith::fast2;
             else if (pf_arith == "fast8") opt.prefill_arith = q::PrefillArith::fast8;
-            else throw std::runtime_error("--prefill-arith expects windows|exact|flash|fast|fast2|fast8");
+            else if (pf_arith == "fast4") opt.prefill_arith = q::PrefillArith::fast4;
+            else throw std::runtime_error("--prefill-arith expects windows|exact|flash|fast|fast2|fast8|fast4");
         }
         opt.prefill_chunk = pf_chunk;
         opt.prefill_wave_min_tokens = pf_wave_min;

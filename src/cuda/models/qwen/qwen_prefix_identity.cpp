@@ -61,9 +61,9 @@ IdentityFields identity_fields(const qwen_prefill::Config& c, std::uint32_t bloc
     // TURBO states never alias exact / FAST ones; outside turbo no field (legacy identities byte-identical).
     if (!c.turbo_namespace.empty()) put("turbo.namespace", c.turbo_namespace);
     // FAST prefill forms: only when on, so every OFF key keeps its bytes. A FAST prefix is never served to an exact request.
-    if (c.forms.hc_mma) put("form.hc_mma", "qwen-cuda-hc-f16mma-v1");
+    if (c.forms.hc_mma) put("form.hc_mma", "qwen-cuda-hc-f16mma-v2");
     if (c.forms.mtp_mma) put("form.mtp_mma", "qwen-cuda-mtp-f16mma-v1");
-    if (c.forms.qsa_mma) put("form.qsa_mma", "qwen-cuda-qsa-f16mma-v1");
+    if (c.forms.qsa_mma) put("form.qsa_mma", "qwen-cuda-qsa-bf16mma-v2");
     if (c.forms.moe_mma) put("form.moe_mma", "qwen-cuda-moe-i8fma-v1");
     model("model", c.model_gguf);
     model("mtp", c.mtp_sidecar_gguf);

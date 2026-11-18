@@ -354,16 +354,26 @@ cudaError_t gdn_commit(const GdnDims& d, const GdnCommitLayer* layers, std::uint
 
 cudaError_t gdn_prefill_layer(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
                               float* out, std::uint32_t rows, float eps, const std::uint32_t* parity_dev, cudaStream_t stream) {
+    return gdn_prefill_layer(d, layer, state, win, z, out, rows, eps, parity_dev, GdnChunkWork{}, stream);
+}
+
+cudaError_t gdn_prefill_layer(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
+                              float* out, std::uint32_t rows, float eps, const std::uint32_t* parity_dev, const GdnChunkWork& chunk,
+                              cudaStream_t stream) {
     if (d.key_dim != 128 || d.value_dim != 128 || d.conv_kernel != 4 || rows == 0) return cudaErrorInvalidValue;
     const std::uint32_t C = d.conv_channels();
     const float qscale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d.key_dim)));
     conv_prefill_kernel<<<dim3(C / 128, (rows + kConvRows - 1) / kConvRows), 128, 0, stream>>>(
         layer.conv_w, state.conv, win.raw, win.qkv_c, C, rows, d.key_heads, 2 * d.key_heads, qscale);
     if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
-    DeltaArgs a{state.delta_base, win.qkv_c, win.a_raw, win.b_raw, layer.ssm_a, layer.dt_bias, layer.norm_gain, z, out,
-                nullptr, nullptr};
-    delta_window_kernel<<<dim3(d.value_heads), 128, 0, stream>>>(a, d, rows, parity_dev, eps, GdnSlotTable{});
-    if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
+    if (chunk.ws != nullptr) {  // FAST gdn-chunk16-f32-v1 (gdn_chunk.cu)
+        if (auto e = gdn_chunk_delta(d, layer, state, win, z, out, rows, eps, parity_dev, chunk, stream); e != cudaSuccess) return e;
+    } else {
+        DeltaArgs a{state.delta_base, win.qkv_c, win.a_raw, win.b_raw, layer.ssm_a, layer.dt_bias, layer.norm_gain, z, out,
+                    nullptr, nullptr};
+        delta_window_kernel<<<dim3(d.value_heads), 128, 0, stream>>>(a, d, rows, parity_dev, eps, GdnSlotTable{});
+        if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
+    }
     CommitBatch b{};
     b.a[0] = DeltaArgs{state.delta_base, win.qkv_c, win.a_raw, win.b_raw, layer.ssm_a, layer.dt_bias, nullptr, nullptr, nullptr, state.conv, win.raw};
     conv_commit_kernel<<<dim3(C / 128, 1), 128, 0, stream>>>(b, C, rows);

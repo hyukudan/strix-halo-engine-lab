@@ -921,6 +921,7 @@ struct CudaEngine::Impl {
             allocations.push_back(std::move(owner));
             return p;
         }
+        cc::GdnChunkWork gdn_ws;  // FAST gdn-chunk16 workspace (prefill_gdn chunk16 only; ws null = serial delta rule)
         float *x = nullptr, *xn = nullptr, *z = nullptr, *gout = nullptr, *raw = nullptr, *qkvc = nullptr, *ar = nullptr, *br = nullptr,
               *qg = nullptr, *q = nullptr, *k = nullptr, *v = nullptr, *ao = nullptr, *hid = nullptr, *scr = nullptr;
         std::uint32_t *ids = nullptr, *wpos = nullptr, *pos = nullptr, *cpar = nullptr;
@@ -989,6 +990,10 @@ struct CudaEngine::Impl {
         sl.qkvc = sl.alloc<float>(static_cast<std::size_t>(C) * gd.conv_channels());
         sl.ar = sl.alloc<float>(static_cast<std::size_t>(C) * gd.value_heads);
         sl.br = sl.alloc<float>(static_cast<std::size_t>(C) * gd.value_heads);
+        if (opt.prefill_gdn == PrefillGdn::chunk16 && opt.prefill_arith != PrefillArith::exact) {  // 215 MB per slot at C = 4096
+            sl.gdn_ws.floats = cc::gdn_chunk_workspace_floats(gd, C);
+            sl.gdn_ws.ws = sl.alloc<float>(sl.gdn_ws.floats);
+        }
         sl.qg = sl.alloc<float>(static_cast<std::size_t>(C) * c.q_gate_width());
         sl.q = sl.alloc<float>(static_cast<std::size_t>(C) * c.heads * c.head_dim);
         sl.k = sl.alloc<float>(static_cast<std::size_t>(C) * c.kv_width());
@@ -1039,23 +1044,31 @@ struct CudaEngine::Impl {
         if (pf.cache_tried) return;
         pf.cache_tried = true;
         if (opt.prefill_operand_cache == cc::operand_cache::Mode::off) return;
-        if (opt.prefill_operand_cache == cc::operand_cache::Mode::automatic && opt.prefill_arith != PrefillArith::fast8) return;
+        if (opt.prefill_operand_cache == cc::operand_cache::Mode::automatic && opt.prefill_arith != PrefillArith::fast8 &&
+            opt.prefill_arith != PrefillArith::fast4)
+            return;
         std::vector<cc::DenseWeight> ws;
         for (const LayerW& w : L)
             for (const cc::DenseWeight* d : {&w.qkv, &w.gate, &w.beta, &w.alpha, &w.out, &w.q, &w.k, &w.v, &w.o, &w.ffn_gate, &w.ffn_up, &w.ffn_down})
                 if (d->data != nullptr) ws.push_back(*d);
         pf.cache.reset(cc::dense_big_cache_create());
         cc::BigCacheReport r;
-        CK(cc::dense_big_cache_reserve(pf.cache.get(), ws.data(), ws.size(), opt.prefill_arith == PrefillArith::fast8, opt.prefill_operand_cache,
+        CK(cc::dense_big_cache_reserve(pf.cache.get(), ws.data(), ws.size(), pf_class(), opt.prefill_operand_cache,
                                        static_cast<std::uint64_t>(opt.prefill_operand_cache_cap_mib) << 20, &r));
         if (!opt.quiet)
             std::fprintf(stderr, "prefill operand cache: %s; class %s; %u resident, %u not admitted; %.2f of %.2f GiB wanted (budget %.2f GiB); bitwise neutral\n",
-                         cc::operand_cache::mode_name(opt.prefill_operand_cache), r.f8 ? "e4m3 (FAST8)" : "exact (f16/q8)", r.admitted, r.rejected,
+                         cc::operand_cache::mode_name(opt.prefill_operand_cache), r.f4 ? "e2m1 tile (FAST4)" : r.f8 ? "e4m3 (FAST8)" : "exact (f16/q8)", r.admitted, r.rejected,
                          r.arena_bytes / 1073741824.0, r.wanted_bytes / 1073741824.0, r.budget_bytes / 1073741824.0);
     }
 
+    [[nodiscard]] cc::BigClass pf_class() const {
+        return opt.prefill_arith == PrefillArith::fast4   ? cc::BigClass::fast4
+               : opt.prefill_arith == PrefillArith::fast8 ? cc::BigClass::fast8
+                                                          : cc::BigClass::exact;
+    }
     [[nodiscard]] int pf_terms() const {
-        if (opt.prefill_arith == PrefillArith::fast || opt.prefill_arith == PrefillArith::fast8) return 1;
+        if (opt.prefill_arith == PrefillArith::fast || opt.prefill_arith == PrefillArith::fast8 || opt.prefill_arith == PrefillArith::fast4)
+            return 1;
         if (opt.prefill_arith == PrefillArith::fast2) return 2;
         const auto a = opt.dense_arithmetic;
         return a == cc::DenseArith::mma3 ? 3 : a == cc::DenseArith::mma2 ? 2 : 1;
@@ -1070,7 +1083,10 @@ struct CudaEngine::Impl {
             sl.act_rows = rows;
         }
         const int cls = w.format == cc::WeightFormat::nvfp4 ? 1 : 0;
-        if (!sl.have[cls]) {
+        if (!sl.have[cls] && cls == 1 && opt.prefill_arith == PrefillArith::fast4) {
+            CK(cc::dense_big_split4(x, rows, w.in, &sl.act[cls], sl.st, sl.bc));
+            sl.have[cls] = true;
+        } else if (!sl.have[cls]) {
             CK(cc::dense_big_split(x, rows, w.in, w.format, pf.terms, &sl.act[cls], sl.st, sl.bc, opt.prefill_arith == PrefillArith::fast8));
             sl.have[cls] = true;
         }
@@ -1090,8 +1106,13 @@ struct CudaEngine::Impl {
         const cc::GroupedView hv{rows, 1, c.hidden, c.hidden, c.hidden};
         CK(cc::rmsnorm(sl.x, hv, w.post_norm, sl.xn, hv, c.rms_eps, sl.st));
         pf_dirty(sl);
-        pf_gemm(sl, w.ffn_gate, sl.xn, rows, sl.hid, nullptr, cc::BigEpi::none);
-        pf_gemm(sl, w.ffn_up, sl.xn, rows, sl.hid, sl.hid, cc::BigEpi::silu_mul);  // y = silu(gate) * up, in place
+        if (opt.prefill_arith == PrefillArith::fast4 && w.ffn_gate.format == cc::WeightFormat::nvfp4 && w.ffn_up.format == cc::WeightFormat::nvfp4) {
+            // FAST4: gate and up in ONE GEMM, SwiGLU in registers (no f32 gate round trip through hid)
+            CK(cc::dense_big_glu4(w.ffn_gate, w.ffn_up, pf_act(sl, sl.xn, rows, w.ffn_gate), sl.hid, sl.st, sl.bc));
+        } else {
+            pf_gemm(sl, w.ffn_gate, sl.xn, rows, sl.hid, nullptr, cc::BigEpi::none);
+            pf_gemm(sl, w.ffn_up, sl.xn, rows, sl.hid, sl.hid, cc::BigEpi::silu_mul);  // y = silu(gate) * up, in place
+        }
         pf_dirty(sl);
         pf_gemm(sl, w.ffn_down, sl.hid, rows, sl.x, sl.x, cc::BigEpi::residual);
         pf_dirty(sl);
@@ -1156,7 +1177,7 @@ struct CudaEngine::Impl {
                 pf_gemm(sl, w.alpha, sl.xn, rows, sl.ar, nullptr, cc::BigEpi::none);
                 const auto& cl = commit_layers[gi++];
                 CK(cc::gdn_prefill_layer(gd, cl.layer, cl.state, cc::GdnWindow{sl.raw, sl.qkvc, sl.ar, sl.br}, sl.z, sl.gout, rows, c.rms_eps,
-                                         sl.cpar, sl.st));
+                                         sl.cpar, sl.gdn_ws, sl.st));
                 pf_gemm(sl, w.out, sl.gout, rows, sl.x, sl.x, cc::BigEpi::residual);
                 pf_dirty(sl);
             } else {
@@ -1173,6 +1194,8 @@ struct CudaEngine::Impl {
         core::validate_token_ids(tokens, n, c.vocab);
         if (opt.prefill_arith == PrefillArith::fast8 && !cc::dense_big_fast8_supported())
             throw std::invalid_argument("prefill: FAST8 implementation unavailable for this build/device");
+        if (opt.prefill_arith == PrefillArith::fast4 && !cc::dense_big_fast4_supported())
+            throw std::invalid_argument("prefill: FAST4 implementation unavailable for this build/device");
         const char* fallback = big_fallback();
         if (!opt.quiet) std::fprintf(stderr, "prefill route: %s; reason: %s; chunk: %u; requested slots: %u\n",
                                     fallback ? "windows" : "large", fallback ? fallback : "admitted", opt.prefill_chunk, opt.prefill_slots);
@@ -1552,6 +1575,10 @@ void print_effective_config(const EngineOptions& o, const char* arith, std::FILE
                  o.turbo_bits, o.turbo_weights >= TurboWeights::onfly ? (o.turbo_lm_head ? "nvfp4" : "bf16") : "n/a", o.multi_gemv ? "on" : "off");
     std::fprintf(f, "  prefill-arith: %s\n  prefill-big: %s\n  prefill-chunk: %u\n  prefill-slots: %u\n  prefill-admission: pending model/device; execution reports route/reason\n",
                  prefill_arith_name(o.prefill_arith), o.prefill_big ? "on" : "off", o.prefill_chunk, o.prefill_slots);
+    std::fprintf(f, "  prefill-gdn: %s\n",
+                 o.prefill_arith == PrefillArith::exact ? "serial (exact prefill keeps the decode windows)"
+                 : o.prefill_gdn == PrefillGdn::chunk16 ? "chunk16 (FAST gdn-chunk16-f32-v1, identity -gdnc16)"
+                                                        : "serial (decode recurrence, bitwise)");
     std::fprintf(f, "  prefill-inflight: %u%s (bounded submission, scheduling only, bitwise)\n  prefill-ramp: %u%s\n", o.prefill_inflight,
                  o.prefill_inflight ? " chunks" : " = unbounded", o.prefill_ramp, o.prefill_ramp ? " rows first chunk, doubling to prefill-chunk" : " (off)");
     if (o.turbo_weights >= TurboWeights::onfly)
@@ -1568,8 +1595,9 @@ void print_effective_config(const EngineOptions& o, const char* arith, std::FILE
     const char* oc = o.prefill_operand_cache == cuda_core::operand_cache::Mode::off ? "per-call weight expansion"
                      : o.prefill_operand_cache == cuda_core::operand_cache::Mode::on
                          ? "every expanded class (FAST8 e4m3, exact f16 / q8) resident, expanded once"
-                         : (o.prefill_arith == PrefillArith::fast8 ? "FAST8 e4m3 operands resident, expanded once"
-                                                                    : "inactive (auto admits FAST8 e4m3 only; exact classes need on)");
+                         : o.prefill_arith == PrefillArith::fast8 ? "FAST8 e4m3 operands resident, expanded once"
+                         : o.prefill_arith == PrefillArith::fast4 ? "FAST4 e2m1 tile operands resident, repacked once (byte permutation)"
+                                                                  : "inactive (auto admits FAST8 e4m3 / FAST4 e2m1 tiles only; exact classes need on)";
     std::fprintf(f, "  prefill-operand-cache: %s: %s; budget free VRAM - max(4 GiB, 10 %% total)%s; bitwise neutral (same operand bytes, same kernel)\n",
                  cuda_core::operand_cache::mode_name(o.prefill_operand_cache), oc,
                  o.prefill_operand_cache_cap_mib ? ", capped by --prefill-operand-cache-cap-mib" : "");
@@ -1600,7 +1628,7 @@ void CudaEngine::commit(std::uint32_t k) { p_->commit_rows(k); }
 RowsOut CudaEngine::prefill(const std::uint32_t* tokens, std::uint32_t n, LogitRows want) { return p_->prefill(tokens, n, want); }
 bool CudaEngine::prefill_is_big() const { return p_->big_supported(); }
 const char* prefill_arith_name(PrefillArith a) {
-    static const char* n[] = {"exact", "flash", "fast", "fast2", "fast8"};
+    static const char* n[] = {"exact", "flash", "fast", "fast2", "fast8", "fast4"};
     return n[static_cast<int>(a)];
 }
 void CudaEngine::set_draft_rows(strix::spec::DraftRows* rows) { p_->set_draft_rows(rows); }

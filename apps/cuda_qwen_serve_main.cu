@@ -1,6 +1,9 @@
 // Qwen3.8-Flash-Next serving on an RTX card: the node's OpenAI/Anthropic API front end (strix::serve: chat template,
 // GGUF BPE tokenizer, SSE, /tokenize, /health) over the CUDA engine (qwen_prefill::Prefill). Greedy decode; every
-// committed token is bit-identical to the Strix Halo node's dense-A8 decode, with or without MTP drafts.
+// committed token is bit-identical to the Strix Halo node's dense-A8 decode, with or without MTP drafts, under the exact
+// (default) profile. `--profile fast` (bundle qwen-cuda-fast-bundle-v1) is not bit-identical: its FAST experts
+// (gsq-iq-bf16mma-cuda-v1) also run in the decode step and MTP verify windows, so they change generated-token logits; its
+// hc_mma / qsa_mma forms run only on prefill blocks and act on decode through the prompt's K/V and recurrent state.
 //
 //   strix-cuda-qwen-serve --model M.gguf --tables DIR --rope-table rope_cs.bin [--mtp-sidecar S.gguf --draft-vocab V.bin]
 //       [--max-positions 32768] [--bind 127.0.0.1] [--port 8090] [--api-key-file F] [--model-id ID]

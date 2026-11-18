@@ -60,11 +60,12 @@ struct Resolved {
     }
 };
 
-// Resolves and validates (throws when a turbo weight request cannot be honoured).
-inline Resolved resolve(const Request& r) {
+// Resolves and validates (throws when a turbo weight request cannot be honoured). `rows`: the engine's lever table read
+// through its turbo cells (the Qwen CUDA engine passes strix/profiles/qwen_cuda.hpp); empty: the weight toggle alone.
+inline Resolved resolve(const Request& r, std::span<const pq::Lever> rows = {}) {
     pq::Inputs inputs = r.inputs;
     inputs.caps = &pq::kCudaWeightCaps;
-    Resolved out{pq::resolve(r.profile.value_or(pq::Name::standard), inputs, {}), false, {}};
+    Resolved out{pq::resolve(r.profile.value_or(pq::Name::standard), inputs, rows), false, {}};
     out.resolution.weights.require_honoured();
     out.onfly_nvfp4 = out.resolution.is_turbo() && out.resolution.weights.effective == tb::Source::onfly;
     out.cache_namespace = out.resolution.cache_namespace();

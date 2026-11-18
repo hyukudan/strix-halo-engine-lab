@@ -818,31 +818,40 @@ __global__ __launch_bounds__(256) void down_rows_kernel(const std::uint8_t* weig
 // per group, the lane leaves, and the root of the lane-0 xor butterfly.
 //
 // Work mapping (per tile, tree-ordered, K-staged): one block = one CSR tile (<= 64 assignments of one expert) x a block of
-// outputs. A thread owns whole items over the full K range (project: 2 rows x 1 output x {gate, up}; down: 2 rows x 2
-// outputs). K is staged one 32-value group at a time in the tree order of native_reuse::tree_position, and the butterfly
-// root is formed by native_reuse::TreeCounter in registers (the same additions, no shuffles). Each weight group is decoded
-// once per tile into shared memory and applied to every row of the tile; each activation group is staged once per block
-// (BF16 -> FP32 bits at staging) and applied to every output of the block. Stages are double-buffered: the next group's
-// loads and decodes are issued before this group's FMA, one barrier per stage.
-// Lane map: row lane rl = lane & 3, output lane ol = lane >> 2; row warp wr = warp & 7, output warp wo = warp >> 3. A
-// thread's rows are wr * 8 + rl + 4 i (i < 2), so one LDS.128 of X reads 4 rows (64 B) and one of W reads 8 outputs (128 B).
+// outputs. A thread owns whole items over the full K range: native_reuse::MicroTile, 4 rows x 2 outputs x {gate, up}
+// (project) or 4 rows x 4 outputs (down), 256 threads. K is staged one 32-value group at a time in the tree order of
+// native_reuse::tree_position, and the butterfly root is formed by native_reuse::TreeCounter in registers (the same additions,
+// no shuffles). Each weight group is decoded once per tile into shared memory and applied to every row of the tile; each
+// activation group is staged once per block (BF16 -> FP32 bits at staging) and applied to every output of the block. Stages
+// are double-buffered: the next group's loads and decodes are issued before this group's FMA, one barrier per stage.
+// Cost model (rtx_expert_rca): the stage is bound by the L1/shared data pipe, one 128-byte wavefront per SM cycle, and a
+// warp's LDS.128 takes 4 wavefronts (quarter-warp phases) even when its lanes share rows or outputs. The micro-tile reads one
+// shared float per 2 FMAs instead of one per FMA: 64 LDS.128 per 512 FFMA per warp-stage (was 32 per 128).
 constexpr unsigned kNativeTileRows = tile_rows;
-constexpr unsigned kNativeThreads = 1024U;
+constexpr unsigned kNativeThreads = 256U;
 constexpr unsigned kNativeProjectOutputs = 32U;  // gate and up of 32 outputs per block: grid (tiles, ffn / 32)
 constexpr unsigned kNativeDownOutputs = 64U;     // grid (tiles, hidden / 64)
-// Floats per staged group: 16 B aligned rows; 4 consecutive rows or 8 consecutive outputs start on distinct bank quads.
+// Floats per staged group: 16 B aligned rows; consecutive outputs start on distinct bank quads.
 constexpr unsigned kNativePitch = 36U;
-constexpr unsigned kNativeStageThreads = kNativeTileRows * 8U;  // X staging: 8 threads x 4 values per row
-constexpr unsigned kNativeDecodeBase = kNativeThreads - 64U;    // the last two warps decode the next stage's 64 groups
-static_assert(kNativeTileRows == 64U, "the native tile mapping covers 8 row warps x 8 rows");
+constexpr unsigned kNativeStageTasks = kNativeTileRows * 8U;            // X staging: 8 tasks x 4 values per row
+constexpr unsigned kNativeStagePerThread = kNativeStageTasks / kNativeThreads;
+constexpr unsigned kNativeDecodeBase = kNativeThreads - 64U;            // the last two warps decode the next stage's 64 groups
+using NativeProjectTile = native_reuse::MicroTile<2>;
+using NativeDownTile = native_reuse::MicroTile<4>;
+static_assert(kNativeTileRows == 64U && NativeProjectTile::tile_rows == kNativeTileRows, "the native tile map covers 8 row warps x 8 rows");
+static_assert(NativeProjectTile::threads == kNativeThreads && NativeDownTile::threads == kNativeThreads, "one block shape");
+static_assert(NativeProjectTile::tile_outputs == kNativeProjectOutputs && NativeDownTile::tile_outputs == kNativeDownOutputs,
+              "the micro-tile covers the block's outputs");
+static_assert(kNativeStageTasks % kNativeThreads == 0U, "whole staging tasks per thread");
 // Completes this thread's cp.async copies; the clobber keeps the shared-memory reads that follow after it.
 __device__ __forceinline__ void native_copies_done() { asm volatile("cp.async.wait_all;" ::: "memory"); }
 
-// grid (tiles, ffn / 32), 1024 threads. Writes h = native_activation(gate, up) into intermediates[row][slot * 2 * ffn + o].
+// grid (tiles, ffn / 32), 256 threads. Writes h = native_activation(gate, up) into intermediates[row][slot * 2 * ffn + o].
 template <class Source, class Binding>
-__global__ __launch_bounds__(kNativeThreads) void native_project_kernel(const std::uint8_t* gate, const std::uint8_t* up,
-                                                                        std::uint32_t type, typename Binding::Rows v) {
+__global__ __launch_bounds__(kNativeThreads, 2) void native_project_kernel(const std::uint8_t* gate, const std::uint8_t* up,
+                                                                           std::uint32_t type, typename Binding::Rows v) {
     namespace nr = native_reuse;
+    using MT = NativeProjectTile;
     constexpr unsigned hidden=Binding::hidden, ffn=Binding::ffn, projection_nonfinite=Binding::projection_nonfinite;
     constexpr unsigned groups = hidden / 32U;
     constexpr nr::LaneSeed seed = nr::LaneSeed::zero_seeded;
@@ -856,34 +865,47 @@ __global__ __launch_bounds__(kNativeThreads) void native_project_kernel(const st
     __shared__ alignas(16) float W[2][2][kNativeProjectOutputs][kNativePitch];
     __shared__ alignas(16) std::uint16_t R[2][kNativeTileRows][32];  // BF16 bits of the next stage (cp.async)
     __shared__ unsigned row_of[kNativeTileRows], slot_of[kNativeTileRows];
-    const unsigned t = threadIdx.x, lane = t & 31U, warp = t >> 5;
-    const unsigned r0 = (warp & 7U) * 8U + (lane & 3U), ol = (warp >> 3) * 8U + (lane >> 2);
-    const bool active = (warp & 7U) * 8U < count;  // warp-uniform: the warp has at least one row of the tile
+    const unsigned t = threadIdx.x;
+    const unsigned r0 = MT::row(t, 0U), o0 = MT::output(t, 0U);
+    const bool active = (t >> 5) * 8U < count;  // warp-uniform: the warp has at least one row of the tile
     const unsigned out_base = blockIdx.y * kNativeProjectOutputs;
     if (t < kNativeTileRows) {
         const unsigned a = t < count ? t : 0U;
         row_of[t] = csr.rows[tile_begin + a]; slot_of[t] = csr.slots[tile_begin + a];
     }
     __syncthreads();
-    const unsigned sr = t >> 3, sp = t & 7U;
-    const bool stager = t < kNativeStageThreads, sload = stager && sr < count;
-    const std::uint16_t* srow = sload ? at(v.input, row_of[sr]) + 4U * sp : nullptr;
-    const bool copy = (reinterpret_cast<std::uintptr_t>(srow) & 3U) == 0U;  // 4-byte copies need a 4-byte aligned row
+    // Staging task u of this thread: row (t + 256 u) / 8, values 4 ((t + 256 u) % 8) .. + 3 of the group.
+    const std::uint16_t* srow[kNativeStagePerThread];
+    bool sload[kNativeStagePerThread], copy[kNativeStagePerThread];
+#pragma unroll
+    for (unsigned u = 0; u < kNativeStagePerThread; ++u) {
+        const unsigned task = t + kNativeThreads * u, sr = task >> 3, sp = task & 7U;
+        sload[u] = sr < count;
+        srow[u] = sload[u] ? at(v.input, row_of[sr]) + 4U * sp : nullptr;
+        copy[u] = (reinterpret_cast<std::uintptr_t>(srow[u]) & 3U) == 0U;  // 4-byte copies need a 4-byte aligned row
+    }
     // Issue the next stage's BF16 bits (no registers held across the FMA); rows >= count stage +0 and are never stored.
     auto load_x = [&](unsigned buf, unsigned g) {
-        if (sload && copy) {
-            ptx::cp_async4(&R[buf][sr][4U * sp], srow + 32U * g);
-            ptx::cp_async4(&R[buf][sr][4U * sp + 2U], srow + 32U * g + 2U);
+#pragma unroll
+        for (unsigned u = 0; u < kNativeStagePerThread; ++u) {
+            const unsigned task = t + kNativeThreads * u, sr = task >> 3, sp = task & 7U;
+            if (sload[u] && copy[u]) {
+                ptx::cp_async4(&R[buf][sr][4U * sp], srow[u] + 32U * g);
+                ptx::cp_async4(&R[buf][sr][4U * sp + 2U], srow[u] + 32U * g + 2U);
+            }
         }
     };
-    // After the FMA: each stager converts the four values it copied (BF16 -> FP32 is the bit shift of the old route).
+    // After the FMA: each task converts the four values it copied (BF16 -> FP32 is the bit shift of the old route).
     auto store_x = [&](unsigned buf, unsigned g) {
-        if (stager) {
+        native_copies_done();
+#pragma unroll
+        for (unsigned u = 0; u < kNativeStagePerThread; ++u) {
+            const unsigned task = t + kNativeThreads * u, sr = task >> 3, sp = task & 7U;
             uint2 p = make_uint2(0U, 0U);
-            if (sload && copy) { native_copies_done(); p = *reinterpret_cast<const uint2*>(&R[buf][sr][4U * sp]); }
-            else if (sload) {
-                p.x = unsigned(srow[32U * g]) | unsigned(srow[32U * g + 1U]) << 16U;
-                p.y = unsigned(srow[32U * g + 2U]) | unsigned(srow[32U * g + 3U]) << 16U;
+            if (sload[u] && copy[u]) p = *reinterpret_cast<const uint2*>(&R[buf][sr][4U * sp]);
+            else if (sload[u]) {
+                p.x = unsigned(srow[u][32U * g]) | unsigned(srow[u][32U * g + 1U]) << 16U;
+                p.y = unsigned(srow[u][32U * g + 2U]) | unsigned(srow[u][32U * g + 3U]) << 16U;
             }
             *reinterpret_cast<float4*>(&X[buf][sr][4U * sp]) = make_float4(__uint_as_float(p.x << 16U), __uint_as_float(p.x & 0xFFFF0000U),
                                                                            __uint_as_float(p.y << 16U), __uint_as_float(p.y & 0xFFFF0000U));
@@ -899,38 +921,41 @@ __global__ __launch_bounds__(kNativeThreads) void native_project_kernel(const st
     };
     load_x(0U, 0U); store_x(0U, 0U); decode_w(0U, 0U);  // stage 0 = group tree_position(0) = 0
     __syncthreads();
-    nr::TreeCounter<4, volatile float> tree;  // item 2 i + mat: row r0 + 4 i, matrix mat (0 gate, 1 up)
+    // Item n = 4 i + 2 k + mat: row r0 + i, output o0 + 16 k, matrix mat (0 gate, 1 up). Tree levels 2..4 in local memory.
+    nr::TreeCounter<16, volatile float, volatile float> tree;
     unsigned s = 0;
-    float leaf[4];  // zero-seeded lane leaf ((+0 + p_l) + p_{l+32}) + p_{l+64}; after push(31) the butterfly roots
+    float leaf[16];  // zero-seeded lane leaf ((+0 + p_l) + p_{l+32}) + p_{l+64}; after push(31) the butterfly roots
     for (unsigned m = 0; m < 32U; ++m) {
         const unsigned nt = nr::position_groups(seed, nr::tree_position(m), groups);
 #pragma unroll
-        for (unsigned i = 0; i < 4U; ++i) leaf[i] = 0.0F;
+        for (unsigned n = 0; n < 16U; ++n) leaf[n] = 0.0F;
         for (unsigned tt = 0; tt < nt; ++tt, ++s) {
             const unsigned buf = s & 1U;
             unsigned next_m = 0, next_g = 0;
             const bool more = nr::next_stage(seed, groups, m, tt, next_m, next_g);
             if (more) { load_x(buf ^ 1U, next_g); decode_w(buf ^ 1U, next_g); }
             if (active) {
-                const float4* x0 = reinterpret_cast<const float4*>(&X[buf][r0][0]);
-                const float4* x1 = reinterpret_cast<const float4*>(&X[buf][r0 + 4U][0]);
-                const float4* wg = reinterpret_cast<const float4*>(&W[buf][0][ol][0]);
-                const float4* wu = reinterpret_cast<const float4*>(&W[buf][1][ol][0]);
-                float acc[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+                float acc[16];
+#pragma unroll
+                for (unsigned n = 0; n < 16U; ++n) acc[n] = 0.0F;
 #pragma unroll
                 for (unsigned q = 0; q < 8U; ++q) {  // j = 4 q .. 4 q + 3 ascending in every chain
-                    const float4 a = x0[q], b = x1[q], g4 = wg[q], u4 = wu[q];
-                    acc[0] = __fmaf_rn(g4.x, a.x, acc[0]); acc[1] = __fmaf_rn(u4.x, a.x, acc[1]);
-                    acc[2] = __fmaf_rn(g4.x, b.x, acc[2]); acc[3] = __fmaf_rn(u4.x, b.x, acc[3]);
-                    acc[0] = __fmaf_rn(g4.y, a.y, acc[0]); acc[1] = __fmaf_rn(u4.y, a.y, acc[1]);
-                    acc[2] = __fmaf_rn(g4.y, b.y, acc[2]); acc[3] = __fmaf_rn(u4.y, b.y, acc[3]);
-                    acc[0] = __fmaf_rn(g4.z, a.z, acc[0]); acc[1] = __fmaf_rn(u4.z, a.z, acc[1]);
-                    acc[2] = __fmaf_rn(g4.z, b.z, acc[2]); acc[3] = __fmaf_rn(u4.z, b.z, acc[3]);
-                    acc[0] = __fmaf_rn(g4.w, a.w, acc[0]); acc[1] = __fmaf_rn(u4.w, a.w, acc[1]);
-                    acc[2] = __fmaf_rn(g4.w, b.w, acc[2]); acc[3] = __fmaf_rn(u4.w, b.w, acc[3]);
+                    float4 w[4];  // one X row live at a time: 20 operand registers, not 32
+#pragma unroll
+                    for (unsigned c = 0; c < 4U; ++c) w[c] = reinterpret_cast<const float4*>(&W[buf][c & 1U][o0 + 16U * (c >> 1)][0])[q];
+#pragma unroll
+                    for (unsigned i = 0; i < 4U; ++i) {
+                        const float4 a = reinterpret_cast<const float4*>(&X[buf][r0 + i][0])[q];
+#pragma unroll
+                        for (unsigned c = 0; c < 4U; ++c) {
+                            float& r = acc[4U * i + c];
+                            r = __fmaf_rn(w[c].x, a.x, r); r = __fmaf_rn(w[c].y, a.y, r);
+                            r = __fmaf_rn(w[c].z, a.z, r); r = __fmaf_rn(w[c].w, a.w, r);
+                        }
+                    }
                 }
 #pragma unroll
-                for (unsigned i = 0; i < 4U; ++i) leaf[i] = __fadd_rn(leaf[i], acc[i]);
+                for (unsigned n = 0; n < 16U; ++n) leaf[n] = __fadd_rn(leaf[n], acc[n]);
             }
             if (more) store_x(buf ^ 1U, next_g);
             __syncthreads();
@@ -938,20 +963,24 @@ __global__ __launch_bounds__(kNativeThreads) void native_project_kernel(const st
         tree.push(m, leaf);
     }
 #pragma unroll
-    for (unsigned i = 0; i < 2U; ++i) {
-        const unsigned row = r0 + 4U * i;
+    for (unsigned i = 0; i < 4U; ++i) {
+        const unsigned row = r0 + i;
         if (row < count) {
-            const float h = Binding::native_activation(leaf[2U * i], leaf[2U * i + 1U]);
-            at(v.intermediates, row_of[row])[slot_of[row] * 2U * ffn + out_base + ol] = h;
-            if (!isfinite(h)) { atomicOr(at(v.status, row_of[row]), projection_nonfinite); atomicOr(csr.summary, projection_nonfinite); }
+#pragma unroll
+            for (unsigned k = 0; k < 2U; ++k) {
+                const float h = Binding::native_activation(leaf[4U * i + 2U * k], leaf[4U * i + 2U * k + 1U]);
+                at(v.intermediates, row_of[row])[slot_of[row] * 2U * ffn + out_base + o0 + 16U * k] = h;
+                if (!isfinite(h)) { atomicOr(at(v.status, row_of[row]), projection_nonfinite); atomicOr(csr.summary, projection_nonfinite); }
+            }
         }
     }
 }
-// grid (tiles, hidden / 64), 1024 threads. Writes rawdots[row][slot * hidden + o]. Lane leaves are direct (p_l for l < 20 of
+// grid (tiles, hidden / 64), 256 threads. Writes rawdots[row][slot * hidden + o]. Lane leaves are direct (p_l for l < 20 of
 // the 20 groups of ffn 640, the literal +0 otherwise).
 template <class Source, class Binding>
-__global__ __launch_bounds__(kNativeThreads) void native_down_kernel(const std::uint8_t* down, std::uint32_t type, typename Binding::Rows v) {
+__global__ __launch_bounds__(kNativeThreads, 2) void native_down_kernel(const std::uint8_t* down, std::uint32_t type, typename Binding::Rows v) {
     namespace nr = native_reuse;
+    using MT = NativeDownTile;
     constexpr unsigned hidden=Binding::hidden, ffn=Binding::ffn;
     constexpr unsigned groups = ffn / 32U;
     constexpr nr::LaneSeed seed = nr::LaneSeed::direct;
@@ -964,28 +993,35 @@ __global__ __launch_bounds__(kNativeThreads) void native_down_kernel(const std::
     __shared__ alignas(16) float X[2][kNativeTileRows][kNativePitch];
     __shared__ alignas(16) float W[2][kNativeDownOutputs][kNativePitch];
     __shared__ unsigned row_of[kNativeTileRows], slot_of[kNativeTileRows];
-    const unsigned t = threadIdx.x, lane = t & 31U, warp = t >> 5;
-    const unsigned r0 = (warp & 7U) * 8U + (lane & 3U), o0 = (warp >> 3) * 16U + (lane >> 2);
-    const bool active = (warp & 7U) * 8U < count;
+    const unsigned t = threadIdx.x;
+    const unsigned r0 = MT::row(t, 0U), o0 = MT::output(t, 0U);
+    const bool active = (t >> 5) * 8U < count;
     const unsigned out_base = blockIdx.y * kNativeDownOutputs;
     if (t < kNativeTileRows) {
         const unsigned a = t < count ? t : 0U;
         row_of[t] = csr.rows[tile_begin + a]; slot_of[t] = csr.slots[tile_begin + a];
     }
     __syncthreads();
-    const unsigned sr = t >> 3, sp = t & 7U;
-    const bool stager = t < kNativeStageThreads, sload = stager && sr < count;
-    const float* srow = sload ? at(v.intermediates, row_of[sr]) + slot_of[sr] * 2U * ffn + 4U * sp : nullptr;
+    const float* srow[kNativeStagePerThread];
+#pragma unroll
+    for (unsigned u = 0; u < kNativeStagePerThread; ++u) {
+        const unsigned task = t + kNativeThreads * u, sr = task >> 3, sp = task & 7U;
+        srow[u] = sr < count ? at(v.intermediates, row_of[sr]) + slot_of[sr] * 2U * ffn + 4U * sp : nullptr;
+    }
     // The next stage's h values go straight to shared memory (cp.async, no registers held across the FMA).
     auto load_x = [&](unsigned buf, unsigned g) {
-        if (sload) {
 #pragma unroll
-            for (unsigned k = 0; k < 4U; ++k) ptx::cp_async4(&X[buf][sr][4U * sp + k], srow + 32U * g + k);
-        } else if (stager) {
-            *reinterpret_cast<float4*>(&X[buf][sr][4U * sp]) = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+        for (unsigned u = 0; u < kNativeStagePerThread; ++u) {
+            const unsigned task = t + kNativeThreads * u, sr = task >> 3, sp = task & 7U;
+            if (srow[u]) {
+#pragma unroll
+                for (unsigned k = 0; k < 4U; ++k) ptx::cp_async4(&X[buf][sr][4U * sp + k], srow[u] + 32U * g + k);
+            } else {
+                *reinterpret_cast<float4*>(&X[buf][sr][4U * sp]) = make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+            }
         }
     };
-    auto store_x = [&]() { if (sload) native_copies_done(); };
+    auto store_x = [&]() { native_copies_done(); };
     const bool decoder = t >= kNativeDecodeBase;
     const unsigned dout = (t - kNativeDecodeBase) & 63U;
     const std::uint8_t* drow = decoder ? down + (static_cast<std::uint64_t>(expert) * hidden + out_base + dout) *
@@ -995,34 +1031,35 @@ __global__ __launch_bounds__(kNativeThreads) void native_down_kernel(const std::
     };
     load_x(0U, 0U); store_x(); decode_w(0U, 0U);
     __syncthreads();
-    nr::TreeCounter<4, volatile float> tree;  // item 2 i + k: row r0 + 4 i, output o0 + 8 k
+    // Item n = 4 i + k: row r0 + i, output o0 + 16 k.
+    nr::TreeCounter<16, volatile float> tree;
     unsigned s = 0;
-    float leaf[4];  // direct lane leaf p_l (nt == 0: the literal +0 lane value); after push(31) the butterfly roots
+    float leaf[16];  // direct lane leaf p_l (nt == 0: the literal +0 lane value); after push(31) the butterfly roots
     for (unsigned m = 0; m < 32U; ++m) {
         const unsigned nt = nr::position_groups(seed, nr::tree_position(m), groups);  // 0 or 1
 #pragma unroll
-        for (unsigned i = 0; i < 4U; ++i) leaf[i] = 0.0F;
+        for (unsigned n = 0; n < 16U; ++n) leaf[n] = 0.0F;
         if (nt != 0U) {
             const unsigned buf = s & 1U;
             unsigned next_m = 0, next_g = 0;
             const bool more = nr::next_stage(seed, groups, m, 0U, next_m, next_g);
             if (more) { load_x(buf ^ 1U, next_g); decode_w(buf ^ 1U, next_g); }
             if (active) {
-                const float4* x0 = reinterpret_cast<const float4*>(&X[buf][r0][0]);
-                const float4* x1 = reinterpret_cast<const float4*>(&X[buf][r0 + 4U][0]);
-                const float4* w0 = reinterpret_cast<const float4*>(&W[buf][o0][0]);
-                const float4* w1 = reinterpret_cast<const float4*>(&W[buf][o0 + 8U][0]);
 #pragma unroll
                 for (unsigned q = 0; q < 8U; ++q) {
-                    const float4 a = x0[q], b = x1[q], c = w0[q], d = w1[q];
-                    leaf[0] = __fmaf_rn(c.x, a.x, leaf[0]); leaf[1] = __fmaf_rn(d.x, a.x, leaf[1]);
-                    leaf[2] = __fmaf_rn(c.x, b.x, leaf[2]); leaf[3] = __fmaf_rn(d.x, b.x, leaf[3]);
-                    leaf[0] = __fmaf_rn(c.y, a.y, leaf[0]); leaf[1] = __fmaf_rn(d.y, a.y, leaf[1]);
-                    leaf[2] = __fmaf_rn(c.y, b.y, leaf[2]); leaf[3] = __fmaf_rn(d.y, b.y, leaf[3]);
-                    leaf[0] = __fmaf_rn(c.z, a.z, leaf[0]); leaf[1] = __fmaf_rn(d.z, a.z, leaf[1]);
-                    leaf[2] = __fmaf_rn(c.z, b.z, leaf[2]); leaf[3] = __fmaf_rn(d.z, b.z, leaf[3]);
-                    leaf[0] = __fmaf_rn(c.w, a.w, leaf[0]); leaf[1] = __fmaf_rn(d.w, a.w, leaf[1]);
-                    leaf[2] = __fmaf_rn(c.w, b.w, leaf[2]); leaf[3] = __fmaf_rn(d.w, b.w, leaf[3]);
+                    float4 w[4];  // one X row live at a time
+#pragma unroll
+                    for (unsigned k = 0; k < 4U; ++k) w[k] = reinterpret_cast<const float4*>(&W[buf][o0 + 16U * k][0])[q];
+#pragma unroll
+                    for (unsigned i = 0; i < 4U; ++i) {
+                        const float4 a = reinterpret_cast<const float4*>(&X[buf][r0 + i][0])[q];
+#pragma unroll
+                        for (unsigned k = 0; k < 4U; ++k) {
+                            float& r = leaf[4U * i + k];
+                            r = __fmaf_rn(w[k].x, a.x, r); r = __fmaf_rn(w[k].y, a.y, r);
+                            r = __fmaf_rn(w[k].z, a.z, r); r = __fmaf_rn(w[k].w, a.w, r);
+                        }
+                    }
                 }
             }
             if (more) store_x();
@@ -1032,12 +1069,12 @@ __global__ __launch_bounds__(kNativeThreads) void native_down_kernel(const std::
         tree.push(m, leaf);
     }
 #pragma unroll
-    for (unsigned i = 0; i < 2U; ++i) {
-        const unsigned row = r0 + 4U * i;
+    for (unsigned i = 0; i < 4U; ++i) {
+        const unsigned row = r0 + i;
         if (row < count) {
             float* dst = at(v.rawdots, row_of[row]) + slot_of[row] * hidden + out_base + o0;
-            dst[0] = leaf[2U * i];
-            dst[8] = leaf[2U * i + 1U];
+#pragma unroll
+            for (unsigned k = 0; k < 4U; ++k) dst[16U * k] = leaf[4U * i + k];
         }
     }
 }

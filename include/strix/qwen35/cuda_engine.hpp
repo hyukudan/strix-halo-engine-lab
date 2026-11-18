@@ -38,8 +38,15 @@ enum class TurboWeights : std::uint8_t { off, native, onfly, converted };
 // fast: flash + activation split of ONE bf16 term (mma1; nvfp4 weights are unchanged: their activation is f16 already).
 // fast2: flash + two bf16 terms (mma2).
 // fast8: fast + nvfp4 weights on the e4m3 x e4m3 mma (activation per-row e4m3, weight e2m1*e4m3 rounded to e4m3): TURBO/FAST, quality-gated.
-enum class PrefillArith : std::uint8_t { exact, flash, fast, fast2, fast8 };
+// fast4: fast + nvfp4 weights on the block-scaled e2m1 x e2m1 mma (activation per-row NVFP4: row scale, e4m3 per 16, e2m1), gate and
+//        up fused (strix/cuda/core/nvfp4_tile.hpp, nvfp4-tile-mma-f32-v1): W4A4 FAST, quality-gated, opt-in only.
+enum class PrefillArith : std::uint8_t { exact, flash, fast, fast2, fast8, fast4 };
 [[nodiscard]] const char* prefill_arith_name(PrefillArith a);
+// GDN delta rule of the large-M prefill (non-exact prefill policies only; the exact policy keeps the decode windows):
+//   serial  = the decode recurrence row by row (gdn.hpp gdn_prefill_layer), bitwise equal to the windows.
+//   chunk16 = FAST gdn-chunk16-f32-v1 (strix/cuda_core/gdn_chunk.hpp): 16-row chunks, FP32, all SMs; bits differ (identity
+//             suffix -gdnc16), opt-in until its logit gate passes.
+enum class PrefillGdn : std::uint8_t { serial, chunk16 };
 
 struct EngineOptions {
     cuda_core::DenseArith dense_arithmetic = cuda_core::dense_arith();
@@ -56,6 +63,7 @@ struct EngineOptions {
     // multi_gemv (above) is also the TURBO multi-launch lever.
     // Large-M prefill (CudaEngine::prefill). Default exact = bitwise equal to the windowed path.
     PrefillArith prefill_arith = PrefillArith::exact;
+    PrefillGdn prefill_gdn = PrefillGdn::serial;  // ignored (and not in the identity) under prefill_arith exact
     std::uint32_t prefill_chunk = 2048;  // rows per large-M chunk (multiple of 128, <= 8192); buffers are allocated on first use
     // Wave-aligned steps (strix/wave_fit.hpp, scheduling only, bitwise): prompts of >= this many tokens step by the largest
     // rows <= prefill_chunk whose flash grid fills whole waves (4096 -> 3968 on 188 SMs: flash +16 % at 128K, bench). 0 = off
@@ -85,12 +93,13 @@ struct EngineOptions {
 // Named identity of the arithmetic + weight source; also the prefix-cache key (caches never mix identities).
 [[nodiscard]] inline std::string engine_identity(const EngineOptions& o) {
     static const char* names[] = {"fp32", "mma3", "mma2", "mma1"};
-    static const char* pf_names[] = {"exact", "flash", "fast", "fast2", "fast8"};
+    static const char* pf_names[] = {"exact", "flash", "fast", "fast2", "fast8", "fast4"};
     const std::string a = names[static_cast<unsigned>(o.dense_arithmetic)];
     // a non-exact prefill policy is a different arithmetic identity (prefix caches never mix them)
     const std::string pf = o.prefill_arith == PrefillArith::exact
         ? ""
-        : std::string("-pf-") + pf_names[static_cast<unsigned>(o.prefill_arith)] + (o.prefill_attn8 ? "-a8" : "");
+        : std::string("-pf-") + pf_names[static_cast<unsigned>(o.prefill_arith)] + (o.prefill_attn8 ? "-a8" : "") +
+              (o.prefill_gdn == PrefillGdn::chunk16 ? "-gdnc16" : "");
     if (o.turbo_weights == TurboWeights::off) return "qwen35-cuda-exact-" + a + "-v1" + pf;
     if (o.turbo_weights == TurboWeights::native) return "qwen35-turbo-native-" + a + "-v1" + pf;
     // converted packs hold the onfly bytes: same arithmetic identity as onfly (prefix caches may be shared)
