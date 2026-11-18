@@ -284,7 +284,8 @@ void wide_quant(const float* x, unsigned inputs, unsigned rows, hipStream_t s, c
 }
 // ---- IU4 g64 pack (ggml type 200): shared W4A16 core, third dense weight format -----------------------------------------
 // FP16 activation rows and F32 gate / up rows of the 16-row windows; non-owning view, the engine Impl owns the allocations.
-struct Iu4Scratch { _Float16* xh = nullptr; float *g = nullptr, *u = nullptr; };
+// rows: their row capacity (16, or the EXACT wide window rounded up to dense_iu4::kWideRows).
+struct Iu4Scratch { _Float16* xh = nullptr; float *g = nullptr, *u = nullptr; unsigned rows = 16U; };
 constexpr unsigned kIu4Fmt = gguf::type_strix_iu4_g64;
 void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s, const WideScratch& wide, const Iu4Scratch& iu4);
 void linear16(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s, const Iu4Scratch& iu4) {
@@ -420,6 +421,8 @@ void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStrea
         const bool x16 = wide_iu4_x16(w, wide, rows);
         if (x16) x16_tiles(x, wide.xt, rows, w.inputs, s);
         wide_iu4(w, x, out, rows, s, x16 ? wide.xt : nullptr);
+    } else if (rows > kMaxRows && w.fmt == kIu4Fmt && rows <= iu4.rows) {  // EXACT wide window: one shared-core call (bitwise)
+        linear16(w, x, out, rows, s, iu4);
     } else {  // not a Q8_0 shape the WMMA core takes: exact 16-row sweeps
         core::dense_row_sweeps(rows, [&](unsigned r, unsigned count) {
             linear16(w, x + std::size_t(r) * w.inputs, out + std::size_t(r) * w.outputs, count, s, iu4);
@@ -461,6 +464,8 @@ void glu(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned 
         wide_iu4(g, x, wide.g, rows, s, x16 ? wide.xt : nullptr);
         wide_iu4(u, x, wide.u, rows, s, x16 ? wide.xt : nullptr);
         silu_mul_kernel<<<1024, 256, 0, s>>>(wide.g, wide.u, out, std::size_t(rows) * g.outputs);
+    } else if (rows > kMaxRows && g.fmt == kIu4Fmt && u.fmt == kIu4Fmt && rows <= iu4.rows) {  // EXACT wide window (bitwise)
+        glu16(g, u, x, out, rows, s, iu4);
     } else {
         core::dense_row_sweeps(rows, [&](unsigned r, unsigned count) {
             glu16(g, u, x + std::size_t(r) * g.inputs, out + std::size_t(r) * g.outputs, count, s, iu4);
@@ -662,7 +667,9 @@ struct HipEngine::Impl {
         fm(&q_in, 2U * QW); fm(&kk, KW); fm(&vv, KW); fm(&qn, QW); fm(&ctx, QW); fm(&gu, I); alloc0(&logits, std::size_t(V) * kMaxRows * 4U);
         fm(&core_r, GV);
         alloc0(&d_ids, RS * 4U);
-        if (RS > kMaxRows) {
+        // EXACT wide windows (opt.wide_exact): no FAST scratch, so the dense projections take the exact core (one Grid2 call
+        // per window over IU4, 16-row sweeps otherwise) and attention the exact decode form (no V^T / flash workspace).
+        if (RS > kMaxRows && !opt.wide_exact) {
             std::size_t maxin = std::max<std::size_t>(H, I);
             alloc0(&wide.codes, std::size_t(RS) * maxin);
             alloc0(&wide.deltas, std::size_t(RS) * (maxin / 32U) * 4U);
@@ -679,10 +686,13 @@ struct HipEngine::Impl {
                 alloc0(&ffail, 4U);
             }
         }
-        {  // IU4 dense weights; sized for the widest dense input / gate-up output of a kMaxRows window (~3 MB)
-            alloc0(&iu4.xh, std::size_t(kMaxRows) * std::max<std::size_t>(H, I) * sizeof(_Float16));
-            alloc0(&iu4.g, std::size_t(kMaxRows) * I * 4U);
-            alloc0(&iu4.u, std::size_t(kMaxRows) * I * 4U);
+        {  // IU4 dense weights; sized for the widest dense input / gate-up output of a kMaxRows window (~3 MB), or of the
+           // EXACT wide window rounded up to the core's row block (512 rows: ~89 MB)
+            const std::size_t IR = opt.wide_exact && RS > kMaxRows ? core::dense_iu4::wide_xh_rows(RS) : kMaxRows;
+            iu4.rows = unsigned(IR);
+            alloc0(&iu4.xh, IR * std::max<std::size_t>(H, I) * sizeof(_Float16));
+            alloc0(&iu4.g, IR * I * 4U);
+            alloc0(&iu4.u, IR * I * 4U);
         }
         alloc0(&d_arg, kMaxRows * 4U);
     }

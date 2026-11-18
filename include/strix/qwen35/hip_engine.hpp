@@ -33,6 +33,11 @@ struct HipEngineOptions {
     // range starts at layer 0, the final norm and head when it ends at the last layer.
     std::uint32_t layer_begin = 0;
     std::uint32_t layer_end = 0;
+    // prefill_rows > 16 in the EXACT class instead of FAST: the 16-row arithmetic over wide windows (IU4 dense projections
+    // through core::dense_iu4::run's row-block grid, one weight stream per window instead of one per 8 rows; Q8_0 / BF16
+    // keep 16-row sweeps; exact decode attention, GDN dims rows = window). Every row is bitwise the 16-row result by
+    // construction; default OFF until the logits / ids tickets prove it on the model (then it becomes the default window).
+    bool wide_exact = false;
 };
 
 struct HipRowsOut {

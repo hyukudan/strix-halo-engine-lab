@@ -64,6 +64,7 @@ int main(int argc, char** argv) try {
     std::string model, dump, ids_arg = "1";
     HipDenseSpecArgs spec_args;  // the family's shared speculation flags (hip_dense_spec_costs.hpp)
     unsigned wide = 0;
+    bool wide_exact = false;
     bool dump_window = false;
     unsigned tf_rows = 0;
     unsigned gen = 16, rows = 1, maxpos = 0, repeat = 1;
@@ -78,6 +79,7 @@ int main(int argc, char** argv) try {
         else if (a == "--gen") gen = strix::core::parse_u32(next());
         else if (a == "--rows") rows = strix::core::parse_u32(next());
         else if (a == "--wide") wide = strix::core::parse_u32(next());  // prompt windows of N rows, last-row logits only (N > 16 = FAST wide prefill)
+        else if (a == "--wide-exact") { wide = strix::core::parse_u32(next()); wide_exact = true; }  // the same windows, EXACT class (bitwise to --wide 16)
         else if (a == "--dump-logits") dump = next();
         else if (a == "--dump-window") dump_window = true;  // with --wide and --dump-logits: every row of the last wide window
         else if (a == "--tf-rows") tf_rows = strix::core::parse_u32(next());  // with --wide: the last N prompt tokens as <= 16-row windows (row path), all logits
@@ -106,6 +108,7 @@ int main(int argc, char** argv) try {
     HipEngineOptions opt;
     opt.max_positions = maxpos;
     opt.prefill_rows = wide;
+    opt.wide_exact = wide_exact;
     const auto t_load0 = std::chrono::steady_clock::now();
     auto E = HipEngine::from_gguf(model, opt);
     const double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load0).count();

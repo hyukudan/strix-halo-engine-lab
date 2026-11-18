@@ -242,6 +242,7 @@ int run_mtp_ref(q::HipEngine& E, const std::string& model, const std::string& mt
 int main(int argc, char** argv) try {
     std::string model, ids_file, label = "run", sources, mtp_file, chain_hidden = "post", dump_ref, dump_out;
     std::uint32_t n_gen = 256, max_block = 0, max_pos = 0, pf_bench = 0, trace_n = 0, prefill_rows = 16, chain_k = 0, ref_n = 0;
+    bool prefill_exact = false;
     q::HipDenseSpecArgs spec_args;  // the family's shared speculation flags: the same parser and resolver as strix-hip-qwen35-decode
     bool check = true, cost_table = false, pf_sample = false, pf_twice = false, mtp_ref = false;
     std::uint32_t copy_arm = 0;
@@ -263,6 +264,7 @@ int main(int argc, char** argv) try {
         else if (a == "--pf-sample") pf_sample = true;
         else if (a == "--pf-twice") pf_twice = true;  // two full prefills: cold first, warm last
         else if (a == "--prefill-rows") prefill_rows = strix::core::parse_u32(next());  // >16 = FAST wide windows (dense-q8a8-f16-v1)
+        else if (a == "--prefill-exact") prefill_exact = true;  // with --prefill-rows > 16: EXACT wide windows (bitwise to 16)
         else if (a == "--seed-costs") spec_args.costs = next() != "0" ? q::HipDenseCostMode::calibrated : q::HipDenseCostMode::learned;  // previous name
         else if (a == "--trace") trace_n = strix::core::parse_u32(next());
         else if (a == "--label") label = next();
@@ -298,6 +300,7 @@ int main(int argc, char** argv) try {
     if (pf_bench) opt.max_positions = std::max(opt.max_positions, pf_bench + 64U);
     opt.quiet = true;
     opt.prefill_rows = prefill_rows;
+    opt.wide_exact = prefill_exact;
     auto E = q::HipEngine::from_gguf(model, opt);
     if (!mtp_file.empty()) E->load_mtp(mtp_file);
     const auto vocab = E->config().vocab;

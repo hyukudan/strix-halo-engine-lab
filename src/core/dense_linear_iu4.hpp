@@ -32,13 +32,16 @@
 #include "strix/decode_projection_group.hpp"
 #include "strix/decode_weight_sweep.hpp"
 #include "strix/env_flags.hpp"
+#include "dense_iu4_rows.hpp"
 #include "iu4_x_pairs.hpp"
 #include "w4a16.hpp"
 
 namespace strix::core::dense_iu4 {
 
 inline constexpr unsigned kWaves = 8U;
-inline constexpr unsigned kMaxRows = 16U;
+inline constexpr unsigned kMaxRows = dense_iu4_rows::kMaxRows;
+inline constexpr unsigned kWideRows = dense_iu4_rows::kWideRows;
+inline constexpr std::size_t wide_xh_rows(std::size_t rows) { return dense_iu4_rows::xh_rows(rows); }
 
 inline constexpr std::size_t packed_bytes(unsigned outputs, unsigned inputs) { return std::size_t(outputs) * inputs / 2U; }
 inline constexpr std::size_t tensor_bytes(unsigned outputs, unsigned inputs) {
@@ -74,11 +77,23 @@ __device__ __forceinline__ _Float16 to_f16_value(float v) {
 
 // One block's 64 output columns (quad) of one tensor; kernel and group_kernel below differ only in how they pick
 // (tensor, quad) from blockIdx.
-template <unsigned R, unsigned MaxG, unsigned Rc, bool UX>
+// Grid2 (exact wide windows, rows > 16; kernel only): block (x, y) = rows [x R, x R + R) of the 64-column block y. Same
+// instruction stream per block as the 1-D form (only the row / column offsets come from the block index); the R-row blocks
+// of one column block are adjacent in dispatch order, so they read its weight slice while it is L2 / MALL resident instead
+// of re-streaming it from DRAM once per R rows. Stored rows are bitwise those of run() with <= 16 rows (row independence
+// above); xh must hold the rows rounded up to R (pad rows are read, never stored).
+template <unsigned R, unsigned MaxG, unsigned Rc, bool UX, bool Grid2 = false>
 __device__ __forceinline__ void block_body(const std::uint8_t* w, unsigned inputs, unsigned outputs, const _Float16* xh, float* out,
                                            unsigned nrows, unsigned quad) {
     constexpr unsigned S = kWaves, KT = MaxG * 4U;
     __shared__ float part[R * S * 64];
+    if constexpr (Grid2) {
+        static_assert(R == dense_iu4_rows::kWideRows, "the wide grid plan owns the row block size");
+        const auto b = dense_iu4_rows::block(blockIdx.x, nrows);
+        xh += std::size_t(b.row0) * inputs;
+        out += std::size_t(b.row0) * outputs;
+        nrows = b.rows;
+    }
     // UX: wave index made wave-uniform (SGPR) so the activation reads of w4a16::wave_rows<..., UniformX> are scalar loads.
     const unsigned lane = threadIdx.x & 31U;
     const unsigned wave = UX ? __builtin_amdgcn_readfirstlane(threadIdx.x / 32U) : threadIdx.x / 32U;
@@ -112,10 +127,10 @@ __device__ __forceinline__ void block_body(const std::uint8_t* w, unsigned input
     }
 }
 
-template <unsigned R, unsigned MaxG, unsigned Rc = R, bool UX = false>
+template <unsigned R, unsigned MaxG, unsigned Rc = R, bool UX = false, bool Grid2 = false>
 __global__ void __launch_bounds__(32 * kWaves) kernel(const std::uint8_t* w, unsigned inputs, unsigned outputs, const _Float16* xh,
                                                       float* out, unsigned nrows) {
-    block_body<R, MaxG, Rc, UX>(w, inputs, outputs, xh, out, nrows, blockIdx.x);
+    block_body<R, MaxG, Rc, UX, Grid2>(w, inputs, outputs, xh, out, nrows, Grid2 ? blockIdx.y : blockIdx.x);
 }
 
 // Projection group (decode step plan, strix/decode_projection_group.hpp): projections of the same prepared rows xh
@@ -175,11 +190,13 @@ void dispatch_bucket(unsigned inputs, F&& f) {
     default: pick.template operator()<34U>(); break;
     }
 }
-template <unsigned R>
+// Grid2 = false: one launch of the R bucket over all rows (rows <= 16). Grid2 = true (R = kWideRows): ceil(rows / R)
+// row chunks per column block (block_body above).
+template <unsigned R, bool Grid2 = false>
 void launch_bucket(const std::uint8_t* w, unsigned inputs, unsigned outputs, const _Float16* xh, float* out, unsigned rows, hipStream_t s) {
-    const dim3 grid(outputs / 64U), block(32U * kWaves);
+    const dim3 grid = Grid2 ? dim3(dense_iu4_rows::blocks(rows), outputs / 64U) : dim3(outputs / 64U), block(32U * kWaves);
     dispatch_bucket<R>(inputs, [&]<unsigned G, unsigned Rc, bool UX>() {
-        kernel<R, G, Rc, UX><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
+        kernel<R, G, Rc, UX, Grid2><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
     });
 }
 template <unsigned R>
@@ -230,10 +247,13 @@ inline void prepare(const float* x, _Float16* xh, unsigned inputs, unsigned rows
     if (scalar_x()) to_f16_paired_kernel<0><<<64, 256, 0, s>>>(x, xh, std::size_t(rows) * inputs);
     else to_f16_kernel<0><<<64, 256, 0, s>>>(x, xh, std::size_t(rows) * inputs);
 }
-// xh: FP16 rows from prepare(); out: F32 [rows][outputs]; rows 1..16.
+// xh: FP16 rows from prepare(); out: F32 [rows][outputs]. rows 1..16: the decode / verify buckets (unchanged). rows > 16
+// (exact wide prefill windows): one Grid2 launch of kWideRows-row blocks (dense_iu4_rows.hpp); xh must hold
+// wide_xh_rows(rows) rows.
 inline void run(const std::uint8_t* w, unsigned inputs, unsigned outputs, const _Float16* xh, float* out, unsigned rows, hipStream_t s) {
-    if (!supported(outputs, inputs) || rows == 0U || rows > kMaxRows) throw std::runtime_error("iu4 dense projection: unsupported shape or rows");
-    if (rows <= 1U) launch_bucket<1>(w, inputs, outputs, xh, out, rows, s);
+    if (!supported(outputs, inputs) || rows == 0U) throw std::runtime_error("iu4 dense projection: unsupported shape or rows");
+    if (rows > kMaxRows) launch_bucket<kWideRows, true>(w, inputs, outputs, xh, out, rows, s);
+    else if (rows <= 1U) launch_bucket<1>(w, inputs, outputs, xh, out, rows, s);
     else if (rows <= 2U) launch_bucket<2>(w, inputs, outputs, xh, out, rows, s);
     else if (rows <= 4U) launch_bucket<4>(w, inputs, outputs, xh, out, rows, s);
     else if (rows <= 8U) launch_bucket<8>(w, inputs, outputs, xh, out, rows, s);
