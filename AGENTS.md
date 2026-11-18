@@ -38,6 +38,38 @@ each engine only adapts it. This is the default for new work, not a later refact
   states what moves to shared code and which engines adopt it next.
 - Reviews reject new engine-local copies of logic that already exists, or obviously belongs, in a
   shared home.
+- One kernel family per operation class and backend: tall / dense GEMM, MoE grouped GEMM, attention,
+  recurrence (GDN), hyper-connection, engram lookup, weight decoders, LM head. An engine that needs
+  different operands or an epilogue adds a trait to that family. A second family in a model directory
+  is a defect: the change that finds it binds the engine to the shared family and deletes the private
+  one in the same change set, with the bitwise (EXACT) or gated (FAST) proof.
+- Backend split: tile and window planning, operand scheduling policy, quantisation contracts and
+  identities, decoder tables, gates, cost models, placement and the option resolver are
+  backend-neutral shared code that CUDA and HIP both bind. Only kernel bodies are per backend, and
+  they live in that backend's shared home (`src/cuda/core`, `src/core`), never in a model directory.
+  Work done for one device that another engine or backend can reuse lands in the shared home first.
+- Operand classes are chosen from the measured peak of the device for each class (for example the
+  integer 4-bit by 4-bit tensor rate against the FP16 rate), not from habit; a FAST class uses the
+  narrowest class that passes its gate, as a trait of the shared kernel under a versioned identity.
+- No device, node count, memory size, link or measured cost of one laboratory is compiled in:
+  such values come from the device and topology declarations or from a calibration at load.
+
+## Adding a model
+
+Support for a new model is a binding, not a new engine:
+
+1. Write the forward pass down stage by stage and map every stage to the shared component that
+   already implements that mechanism on each backend. The closest existing family is extended, not
+   copied.
+2. The model directory holds only what no other model can use: the tensor naming map (as data the
+   shared loader consumes), numerics the model requires, its family adapter and `models/<model>.toml`.
+   Tokenizer, chat template, quant decoders, loaders, caches, speculation, serving, placement and
+   every kernel come from shared code.
+3. A stage with no shared implementation is built in the shared home as a trait or policy of an
+   existing core, so the next model gets it; a piece that today is private to another engine is
+   moved to the shared home and that engine is re-bound to it (byte-compared) in the same work.
+4. The pull request carries the table `stage | shared component | model-specific code` and lists
+   every new file under the model directory with the reason it cannot be shared.
 
 # Production defaults for humans and coding agents
 
