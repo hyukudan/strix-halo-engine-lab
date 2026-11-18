@@ -4,7 +4,8 @@
 //  2. a GEMM with a partial row CTA, a remainder column launch and a partial last column tile: error vs a double sum
 //     of the contract's x16 * w16 products (tolerance 2^-10 of sum |terms|: FP32 WMMA accumulation), columns past
 //     count untouched; 16-wave CTAs give the same bits as 8-wave CTAs;
-//  3. the x16 form (enqueue_x16_tiles + enqueue_x16, column-fast) gives the direct form's bits, 8 and 16 waves.
+//  3. the x16 form (enqueue_x16_tiles + enqueue_x16, column-fast) gives the direct form's bits, 8 and 16 waves;
+//  4. x16 tiles of a producer (enqueue_x16_tiles_map2) == the tile pass over the producer's stored FP32 values.
 #include "core/f16_dense_iu4.hpp"
 #include "core/iu4.hpp"
 
@@ -29,6 +30,15 @@ __global__ void decode_kernel(iu::View v, std::uint16_t* out) {
             out[std::size_t(o) * 64U + 8U * q + 2U * p] = std::uint16_t(nb[q][p] & 0xffffU);
             out[std::size_t(o) * 64U + 8U * q + 2U * p + 1U] = std::uint16_t(nb[q][p] >> 16U);
         }
+}
+
+// 4. x16 tiles of a producer: x16_tiles_map2_kernel<Mul> == x16_tiles_kernel over the stored FP32 products, bit for bit.
+struct Mul {
+    __device__ __forceinline__ static float apply(float a, float b) { return a / (1.0F + expf(-a)) * b; }
+};
+__global__ void mul_kernel(const float* a, const float* b, float* out, std::size_t n) {
+    const std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = Mul::apply(a[i], b[i]);
 }
 
 static bool is_nan16(std::uint16_t b) { return (b & 0x7c00U) == 0x7c00U && (b & 0x3ffU); }
@@ -138,6 +148,30 @@ int main() {
             CHECK(hipFree(dxt)); CHECK(hipFree(dz));
         }
         CHECK(hipFree(dw)); CHECK(hipFree(dx)); CHECK(hipFree(dy));
+    }
+    {  // 4. producer tiles vs stored products + tile pass
+        const unsigned R = 130U, K = 384U;
+        const std::size_t n = std::size_t(R) * K;
+        std::mt19937 rng(9);
+        std::uniform_real_distribution<float> ua(-8.0F, 8.0F);
+        std::vector<float> a(n), b(n);
+        for (auto& f : a) f = ua(rng);
+        for (auto& f : b) f = ua(rng) * 1.0e-3F;
+        float *da = nullptr, *db = nullptr, *dp = nullptr;
+        _Float16 *t1 = nullptr, *t2 = nullptr;
+        CHECK(hipMalloc(&da, n * 4U)); CHECK(hipMalloc(&db, n * 4U)); CHECK(hipMalloc(&dp, n * 4U));
+        CHECK(hipMalloc(&t1, n * 2U)); CHECK(hipMalloc(&t2, n * 2U));
+        CHECK(hipMemcpy(da, a.data(), n * 4U, hipMemcpyHostToDevice)); CHECK(hipMemcpy(db, b.data(), n * 4U, hipMemcpyHostToDevice));
+        mul_kernel<<<unsigned((n + 255U) / 256U), 256>>>(da, db, dp, n);
+        tall::enqueue_x16_tiles(dp, t1, R, K, 0);
+        tall::enqueue_x16_tiles_map2<Mul>(da, db, t2, R, K, 0);
+        CHECK(hipGetLastError()); CHECK(hipDeviceSynchronize());
+        std::vector<std::uint16_t> h1(n), h2(n);
+        CHECK(hipMemcpy(h1.data(), t1, n * 2U, hipMemcpyDeviceToHost)); CHECK(hipMemcpy(h2.data(), t2, n * 2U, hipMemcpyDeviceToHost));
+        const bool same = std::memcmp(h1.data(), h2.data(), n * 2U) == 0;
+        std::printf("producer tiles: map2 vs stored products + tile pass %s\n", same ? "bitwise" : "DIFFER");
+        failures += !same;
+        CHECK(hipFree(da)); CHECK(hipFree(db)); CHECK(hipFree(dp)); CHECK(hipFree(t1)); CHECK(hipFree(t2));
     }
     std::printf("%s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;

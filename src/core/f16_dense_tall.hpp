@@ -329,6 +329,33 @@ inline void enqueue_x16_tiles(const float* x, _Float16* xt, unsigned rows, unsig
     const std::size_t n = static_cast<std::size_t>(rows) * (in / 8U);
     if (n) hipLaunchKernelGGL(x16_tiles_kernel<>, dim3(static_cast<unsigned>((n + 255U) / 256U)), dim3(256), 0, s, x, xt, rows, in);
 }
+// x16 tiles of an elementwise producer: element (r, k) = fp16_rne(F::apply(a[r][k], b[r][k])) (e.g. a gated linear unit's
+// SiLU(g) * u, F supplied by the engine). Same bits as storing the FP32 values and running x16_tiles_kernel: the FP32
+// result is pinned in a register (asm) so the compiler cannot fold its last multiply into the FP16 conversion
+// (v_fma_mix: one rounding instead of two). Saves the FP32 store and the tile pass's read of it.
+template <class F> __global__ __launch_bounds__(256) void x16_tiles_map2_kernel(const float* __restrict__ a, const float* __restrict__ b,
+                                                                              _Float16* __restrict__ xt, unsigned rows, unsigned in) {
+    const unsigned chunks = in / 8U;
+    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * 256U + threadIdx.x;
+    if (i >= static_cast<std::size_t>(rows) * chunks) return;
+    const unsigned r = static_cast<unsigned>(i / chunks), c = static_cast<unsigned>(i % chunks);
+    const std::size_t at = static_cast<std::size_t>(r) * in + c * 8U;
+    using F8 = float __attribute__((ext_vector_type(8)));
+    using H8 = _Float16 __attribute__((ext_vector_type(8)));
+    const F8 va = *reinterpret_cast<const F8*>(a + at), vb = *reinterpret_cast<const F8*>(b + at);  // two b128 loads each
+    H8 h;
+#pragma unroll
+    for (unsigned j = 0; j < 8U; ++j) {
+        float v = F::apply(va[j], vb[j]);
+        asm volatile("" : "+v"(v));
+        h[j] = static_cast<_Float16>(v);
+    }
+    *reinterpret_cast<H8*>(xt + (static_cast<std::size_t>(c / 8U) * rows + r) * 64U + (c % 8U) * 8U) = h;
+}
+template <class F> inline void enqueue_x16_tiles_map2(const float* a, const float* b, _Float16* xt, unsigned rows, unsigned in, hipStream_t s) {
+    const std::size_t n = static_cast<std::size_t>(rows) * (in / 8U);
+    if (n) hipLaunchKernelGGL(x16_tiles_map2_kernel<F>, dim3(static_cast<unsigned>((n + 255U) / 256U)), dim3(256), 0, s, a, b, xt, rows, in);
+}
 // Cols mixin: Base's tile / stage hooks, A fragments from the x16 tiles, column-fast CTA order
 // (launch dim3(column blocks, row blocks)).
 template <class Base> struct X16Cols : Base {

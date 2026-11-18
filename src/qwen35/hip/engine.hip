@@ -213,6 +213,10 @@ __global__ void a8_quant_kernel(const float* x, unsigned inputs, std::int8_t* co
     codes[at] = static_cast<std::int8_t>(q);
     if (lane == 0) deltas[std::size_t(blockIdx.y) * groups + group] = dl;
 }
+// The gated-unit expression of silu_mul_kernel, for the shared x16 tile producer (f16_dense_tall::x16_tiles_map2_kernel).
+struct SiluMul {
+    __device__ __forceinline__ static float apply(float g, float u) { return dl::silu(g) * u; }
+};
 __global__ void silu_mul_kernel(const float* g, const float* u, float* out, std::size_t n) {
     for (std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += std::size_t(gridDim.x) * blockDim.x)
         out[i] = dl::silu(g[i]) * u[i];
@@ -299,6 +303,27 @@ void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStrea
             linear16(w, x + std::size_t(r) * w.inputs, out + std::size_t(r) * w.outputs, count, s, iu4);
         });
     }
+}
+void glu(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned rows, hipStream_t s, const WideScratch& wide, const Iu4Scratch& iu4);
+void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s, const WideScratch& wide, const Iu4Scratch& iu4);
+// out = down(SiLU(gate x) * up x). Wide IU4 windows whose down GEMM takes the x16 form get h as x16 tiles straight from the
+// SiLU pass (x16_tiles_map2_kernel<SiluMul>: no FP32 h, no separate tile pass; same bits). wide.xt holds the tiles of x
+// for gate / up, then (stream order, after up) the tiles of h for down. STRIX_DENSE_GLU_X16=0: glu + linear.
+void mlp(const Tensor& g, const Tensor& u, const Tensor& d, const float* x, float* h, float* out, unsigned rows, hipStream_t s,
+         const WideScratch& wide, const Iu4Scratch& iu4) {
+    static const bool fuse = strix::envcfg::flag("STRIX_DENSE_GLU_X16", true);
+    if (fuse && rows > 16U && !wide_ok(g, wide) && wide_iu4_ok(g, wide, rows) && wide_iu4_ok(u, wide, rows) && wide_iu4_ok(d, wide, rows) &&
+        g.outputs == u.outputs && d.inputs == g.outputs && wide_iu4_x16(d, wide, rows)) {
+        const bool x16 = wide_iu4_x16(g, wide, rows);
+        if (x16) core::f16_dense_tall::enqueue_x16_tiles(x, wide.xt, rows, g.inputs, s);
+        wide_iu4(g, x, wide.g, rows, s, x16 ? wide.xt : nullptr);
+        wide_iu4(u, x, wide.u, rows, s, x16 ? wide.xt : nullptr);
+        core::f16_dense_tall::enqueue_x16_tiles_map2<SiluMul>(wide.g, wide.u, wide.xt, rows, g.outputs, s);
+        wide_iu4(d, h, out, rows, s, wide.xt);  // h is not read by the x16 form
+        return;
+    }
+    glu(g, u, x, h, rows, s, wide, iu4);
+    linear(d, h, out, rows, s, wide, iu4);
 }
 void glu(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned rows, hipStream_t s, const WideScratch& wide, const Iu4Scratch& iu4) {
     if (rows > 16U && wide_ok(g, wide) && wide_ok(u, wide) && g.outputs == u.outputs) {
@@ -592,8 +617,7 @@ struct HipEngine::Impl {
             }
             add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H);
             rmsnorm(x, y.post_norm, H, cfg.rms_eps, xn, n, stream);
-            glu(y.gate, y.up, xn, gu, n, stream, wide, iu4);
-            linear(y.down, gu, proj, n, stream, wide, iu4);
+            mlp(y.gate, y.up, y.down, xn, gu, proj, n, stream, wide, iu4);
             add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H);
         }
         HipRowsOut out;
@@ -684,8 +708,7 @@ struct HipEngine::Impl {
         linear(y.o, ctx, proj, n, stream, wide, iu4);
         add_kernel<<<nb, 256, 0, stream>>>(mtp.mx, proj, n * H);
         rmsnorm(mtp.mx, y.post_norm, H, cfg.rms_eps, mtp.mxn, n, stream);
-        glu(y.gate, y.up, mtp.mxn, gu, n, stream, wide, iu4);
-        linear(y.down, gu, proj, n, stream, wide, iu4);
+        mlp(y.gate, y.up, y.down, mtp.mxn, gu, proj, n, stream, wide, iu4);
         add_kernel<<<nb, 256, 0, stream>>>(mtp.mx, proj, n * H);
         rmsnorm(mtp.mx, mtp.shnorm, H, cfg.rms_eps, mtp.mxn, n, stream);  // mx (pre-norm block output) stays intact for 'pre'
         HipMtpOut o;
