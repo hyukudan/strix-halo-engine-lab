@@ -165,7 +165,8 @@ int main(int argc, char** argv) try {
         last_n = 1;
         for (std::size_t at = wide_end; at < prompt.size();) {
             last_n = unsigned(std::min<std::size_t>(HipEngine::max_rows(), prompt.size() - at));
-            forward(last_n, prompt.data() + at);
+            const auto o = forward(last_n, prompt.data() + at);
+            if (chain) chain->observe_prefill(o, last_n, uprompt.data() + at, at + last_n == prompt.size() ? top[0] : uprompt[at + last_n]);
             at += last_n;
         }
     } else
