@@ -879,15 +879,18 @@ bool dense_big_fast4_supported() {
 #endif
 }
 
-cudaError_t dense_big_split4(const float* x, std::uint32_t rows, std::uint32_t in, BigAct* out, cudaStream_t s, BigCtx* ctx) {
+namespace {
+// The FAST4 X tile + row scales of one activation into the context scratch; `quantise(x_tile, rs)` enqueues the producer.
+template <class Quantise>
+cudaError_t split4_into(std::uint32_t rows, std::uint32_t in, BigAct* out, BigCtx* ctx, Quantise quantise) {
     if (!dense_big_fast4_supported()) return cudaErrorNotSupported;
-    if (x == nullptr || out == nullptr || rows == 0 || in % ftile::kK != 0) return cudaErrorInvalidValue;
+    if (out == nullptr || rows == 0 || in % ftile::kK != 0) return cudaErrorInvalidValue;
     Scratch& S = ctx ? *ctx : scratch();
     if (auto e = bind_device(S); e != cudaSuccess) return e;
     const std::uint32_t rp = ftile::rows_padded(rows);
     if (auto e = grow(&S.planes[1], &S.planes_bytes[1], ftile::x_tile_bytes(rp, in)); e != cudaSuccess) return e;
     if (auto e = grow(reinterpret_cast<void**>(&S.rscale), &S.rscale_bytes, static_cast<std::uint64_t>(rp) * 4); e != cudaSuccess) return e;
-    if (auto e = ftile::quantize_enqueue(x, rows, in, static_cast<std::uint8_t*>(S.planes[1]), S.rscale, s); e != cudaSuccess) return e;
+    if (auto e = quantise(static_cast<std::uint8_t*>(S.planes[1]), S.rscale); e != cudaSuccess) return e;
     *out = BigAct{};
     out->planes = S.planes[1];
     out->rows = rows;
@@ -897,6 +900,23 @@ cudaError_t dense_big_split4(const float* x, std::uint32_t rows, std::uint32_t i
     out->f16 = true;  // the nvfp4 weight class
     out->f4 = true;
     return cudaSuccess;
+}
+}  // namespace
+
+cudaError_t dense_big_split4(const float* x, std::uint32_t rows, std::uint32_t in, BigAct* out, cudaStream_t s, BigCtx* ctx) {
+    if (!dense_big_fast4_supported()) return cudaErrorNotSupported;
+    if (x == nullptr) return cudaErrorInvalidValue;
+    return split4_into(rows, in, out, ctx, [&](std::uint8_t* xt, float* rs) { return ftile::quantize_enqueue(x, rows, in, xt, rs, s); });
+}
+
+bool dense_big_norm_split4_fits(std::uint32_t in) { return ftile::norm_quantize_fits(in); }
+
+cudaError_t dense_big_norm_split4(const float* x, const float* gain, float eps, std::uint32_t rows, std::uint32_t in, BigAct* out,
+                                  cudaStream_t s, BigCtx* ctx) {
+    if (!dense_big_fast4_supported()) return cudaErrorNotSupported;
+    if (x == nullptr || !ftile::norm_quantize_fits(in)) return cudaErrorInvalidValue;
+    return split4_into(rows, in, out, ctx,
+                       [&](std::uint8_t* xt, float* rs) { return ftile::norm_quantize_enqueue(x, gain, eps, rows, in, xt, rs, s); });
 }
 
 namespace {

@@ -41,6 +41,10 @@ STRIX_NVFP4_TILE_HD std::size_t w_tile_bytes(std::uint32_t out, std::uint32_t in
     return static_cast<std::size_t>(out / 16) * (in / kK) * kWRec;
 }
 STRIX_NVFP4_TILE_HD std::uint32_t rows_padded(std::uint32_t rows) { return (rows + kCtaRows - 1) / kCtaRows * kCtaRows; }
+// The RMSNorm-fused quantiser (norm_quantize_enqueue) keeps a row in 256 threads x <= 32 registers and in * 4 bytes of shared memory
+// (<= 32 KiB, under the 48 KiB static launch limit): rows of width kK * j up to 8192. Wider rows use rmsnorm + quantize_enqueue.
+inline constexpr std::uint32_t kNormQuantMaxIn = 8192;
+STRIX_NVFP4_TILE_HD bool norm_quantize_fits(std::uint32_t in) { return in != 0 && in % kK == 0 && in <= kNormQuantMaxIn; }
 STRIX_NVFP4_TILE_HD std::size_t x_tile_bytes(std::uint32_t rows_pad, std::uint32_t in) {
     return static_cast<std::size_t>(rows_pad / 8) * (in / kK) * kXRec;
 }

@@ -32,6 +32,21 @@ cudaError_t quantize_enqueue(const float* x, std::uint32_t rows, std::uint32_t i
     return cudaGetLastError();
 }
 
+cudaError_t norm_quantize_enqueue(const float* x, const float* gain, float eps, std::uint32_t rows, std::uint32_t in, std::uint8_t* x_tile,
+                                  float* rs, cudaStream_t stream) {
+    if (!norm_quantize_fits(in)) return cudaErrorInvalidValue;
+    if (!x || !x_tile || !rs || rows == 0 || reinterpret_cast<std::uintptr_t>(x) % 16) return cudaErrorInvalidValue;
+    if (auto e = capability(); e != cudaSuccess) return e;
+    const unsigned grid = rows_padded(rows);
+    const std::size_t smem = static_cast<std::size_t>(in) * sizeof(float);
+    const std::uint32_t nreg = (in + 255) / 256;  // padding terms add +0: any bucket >= nreg gives rmsnorm's bits
+    if (nreg <= 8) sm120::norm_quantize_kernel<8><<<grid, 256, smem, stream>>>(x, gain, eps, rows, in, x_tile, rs);
+    else if (nreg <= 16) sm120::norm_quantize_kernel<16><<<grid, 256, smem, stream>>>(x, gain, eps, rows, in, x_tile, rs);
+    else if (nreg <= 24) sm120::norm_quantize_kernel<24><<<grid, 256, smem, stream>>>(x, gain, eps, rows, in, x_tile, rs);
+    else sm120::norm_quantize_kernel<32><<<grid, 256, smem, stream>>>(x, gain, eps, rows, in, x_tile, rs);
+    return cudaGetLastError();
+}
+
 cudaError_t gemm_enqueue(const GemmArgs& a, cudaStream_t stream) {
     if (!valid(a)) return cudaErrorInvalidValue;
     if (auto e = capability(); e != cudaSuccess) return e;

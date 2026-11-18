@@ -170,18 +170,59 @@ __global__ void __launch_bounds__(kThreads, 1) gemm_kernel(const GemmArgs a) {
     }
 }
 
+// Padding row r (rows..rows_pad-1): zero codes / scales / rs.
+__device__ __forceinline__ void zero_row(std::uint32_t r, std::uint32_t in, std::uint8_t* __restrict__ xt, float* __restrict__ rs) {
+    for (std::uint32_t q = threadIdx.x; q < in / 16; q += blockDim.x) {
+        *reinterpret_cast<std::uint32_t*>(xt + x_code_byte(r, 16 * q, in)) = 0u;
+        *reinterpret_cast<std::uint32_t*>(xt + x_code_byte(r, 16 * q + 8, in)) = 0u;
+        xt[x_scale_byte(r, q, in)] = 0;
+    }
+    if (threadIdx.x == 0) rs[r] = 0.f;
+}
+
+// THE activation quantiser of the family (one rule for every producer): 16 values of row r, group q, row scale ts -> e4m3 group scale
+// (a16 / 6 / ts, saturated at 448) and 16 e2m1 codes (v / (scale * ts), clamped to +-6, round to nearest even).
+__device__ __forceinline__ void quantize_group(const float4* g4, float ts, std::uint32_t r, std::uint32_t q, std::uint32_t in,
+                                               std::uint8_t* __restrict__ xt) {
+    float v[16];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float4 f = g4[i];
+        v[4 * i] = f.x;
+        v[4 * i + 1] = f.y;
+        v[4 * i + 2] = f.z;
+        v[4 * i + 3] = f.w;
+    }
+    float a16 = 0.f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) a16 = fmaxf(a16, fabsf(v[i]));
+    __nv_fp8_e4m3 sc;
+    sc.__x = 0;
+    float scale = 0.f;
+    if (ts > 0.f) {
+        sc.__x = __nv_cvt_float_to_fp8(fminf(448.f, __fdiv_rn(__fdiv_rn(a16, 6.f), ts)), __NV_SATFINITE, __NV_E4M3);
+        scale = __fmul_rn(static_cast<float>(sc), ts);
+    }
+    std::uint32_t word[2] = {0u, 0u};
+#pragma unroll
+    for (int p = 0; p < 8; ++p) {
+        const float u = scale != 0.f ? fminf(6.f, fmaxf(-6.f, __fdiv_rn(v[2 * p], scale))) : 0.f;
+        const float w = scale != 0.f ? fminf(6.f, fmaxf(-6.f, __fdiv_rn(v[2 * p + 1], scale))) : 0.f;
+        const std::uint32_t b = __nv_cvt_float2_to_fp4x2(make_float2(u, w), __NV_E2M1, cudaRoundNearest);
+        word[p >> 2] |= (b & 0xffu) << (8 * (p & 3));
+    }
+    *reinterpret_cast<std::uint32_t*>(xt + x_code_byte(r, 16 * q, in)) = word[0];
+    *reinterpret_cast<std::uint32_t*>(xt + x_code_byte(r, 16 * q + 8, in)) = word[1];
+    xt[x_scale_byte(r, q, in)] = sc.__x;
+}
+
 // one CTA per row; rows >= `rows` (padding up to rows_pad) are written as zero codes / scales / rs.
 __global__ void __launch_bounds__(256) quantize_kernel(const float* __restrict__ x, std::uint32_t rows, std::uint32_t in,
                                                        std::uint8_t* __restrict__ xt, float* __restrict__ rs) {
     __shared__ float red[8];
     const std::uint32_t r = blockIdx.x, groups = in / 16;
     if (r >= rows) {
-        for (std::uint32_t q = threadIdx.x; q < groups; q += blockDim.x) {
-            *reinterpret_cast<std::uint32_t*>(xt + x_code_byte(r, 16 * q, in)) = 0u;
-            *reinterpret_cast<std::uint32_t*>(xt + x_code_byte(r, 16 * q + 8, in)) = 0u;
-            xt[x_scale_byte(r, q, in)] = 0;
-        }
-        if (threadIdx.x == 0) rs[r] = 0.f;
+        zero_row(r, in, xt, rs);
         return;
     }
     const float4* row = reinterpret_cast<const float4*>(x + static_cast<std::size_t>(r) * in);
@@ -199,38 +240,59 @@ __global__ void __launch_bounds__(256) quantize_kernel(const float* __restrict__
     for (int w = 1; w < 8; ++w) amax = fmaxf(amax, red[w]);
     const float ts = __fdiv_rn(amax, kRowScaleDiv);
     if (threadIdx.x == 0) rs[r] = ts;
-    for (std::uint32_t q = threadIdx.x; q < groups; q += blockDim.x) {
-        float v[16];
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const float4 f = row[4 * q + i];
-            v[4 * i] = f.x;
-            v[4 * i + 1] = f.y;
-            v[4 * i + 2] = f.z;
-            v[4 * i + 3] = f.w;
-        }
-        float a16 = 0.f;
-#pragma unroll
-        for (int i = 0; i < 16; ++i) a16 = fmaxf(a16, fabsf(v[i]));
-        __nv_fp8_e4m3 sc;
-        sc.__x = 0;
-        float scale = 0.f;
-        if (ts > 0.f) {
-            sc.__x = __nv_cvt_float_to_fp8(fminf(448.f, __fdiv_rn(__fdiv_rn(a16, 6.f), ts)), __NV_SATFINITE, __NV_E4M3);
-            scale = __fmul_rn(static_cast<float>(sc), ts);
-        }
-        std::uint32_t word[2] = {0u, 0u};
-#pragma unroll
-        for (int p = 0; p < 8; ++p) {
-            const float u = scale != 0.f ? fminf(6.f, fmaxf(-6.f, __fdiv_rn(v[2 * p], scale))) : 0.f;
-            const float w = scale != 0.f ? fminf(6.f, fmaxf(-6.f, __fdiv_rn(v[2 * p + 1], scale))) : 0.f;
-            const std::uint32_t b = __nv_cvt_float2_to_fp4x2(make_float2(u, w), __NV_E2M1, cudaRoundNearest);
-            word[p >> 2] |= (b & 0xffu) << (8 * (p & 3));
-        }
-        *reinterpret_cast<std::uint32_t*>(xt + x_code_byte(r, 16 * q, in)) = word[0];
-        *reinterpret_cast<std::uint32_t*>(xt + x_code_byte(r, 16 * q + 8, in)) = word[1];
-        xt[x_scale_byte(r, q, in)] = sc.__x;
+    for (std::uint32_t q = threadIdx.x; q < groups; q += blockDim.x) quantize_group(row + 4 * q, ts, r, q, in, xt);
+}
+
+// The hidden RMSNorm folded into the quantiser: the FAST4 A operand straight from the residual stream, no f32 normalised row in
+// memory. The row arithmetic is cuda_core norm_kernel<rms> verbatim (src/cuda_core/norms/norms.cu): thread t holds x[t + 256 i],
+// p += x*x in ascending i (padding terms 0 add +0), block_sum256, inv = 1 / sqrt(ss / n + eps), y = (x * inv) * gain; so the f32 row
+// equals rmsnorm's output bit for bit, and the exact max + quantize_group give the same codes / scales / rs as rmsnorm followed by
+// quantize_kernel. One CTA per row, NREG * 256 >= in; dynamic smem in * 4 bytes holds the normalised row for the 16-group pass.
+template <int NREG>
+__global__ void __launch_bounds__(256) norm_quantize_kernel(const float* __restrict__ x, const float* __restrict__ gain, float eps,
+                                                            std::uint32_t rows, std::uint32_t in, std::uint8_t* __restrict__ xt,
+                                                            float* __restrict__ rs) {
+    extern __shared__ float4 nq_row4[];
+    __shared__ float red[8];
+    const std::uint32_t r = blockIdx.x, groups = in / 16;
+    if (r >= rows) {
+        zero_row(r, in, xt, rs);
+        return;
     }
+    float* const yrow = reinterpret_cast<float*>(nq_row4);
+    const float* xp = x + static_cast<std::size_t>(r) * in;
+    float xr[NREG];
+    float p = 0.0f;
+#pragma unroll
+    for (int i = 0; i < NREG; ++i) {
+        const std::uint32_t idx = threadIdx.x + 256u * i;
+        xr[i] = idx < in ? xp[idx] : 0.0f;
+    }
+#pragma unroll
+    for (int i = 0; i < NREG; ++i) p = __fadd_rn(p, __fmul_rn(xr[i], xr[i]));
+    const float ss = ::strix::cuda_core::block_sum256(p, red);
+    const float inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(ss, static_cast<float>(in)), eps)));
+    float amax = 0.f;
+#pragma unroll
+    for (int i = 0; i < NREG; ++i) {
+        const std::uint32_t idx = threadIdx.x + 256u * i;
+        if (idx < in) {
+            float v = __fmul_rn(xr[i], inv);
+            if (gain != nullptr) v = __fmul_rn(v, gain[idx]);
+            yrow[idx] = v;
+            amax = fmaxf(amax, fabsf(v));
+        }
+    }
+#pragma unroll
+    for (int d = 16; d; d >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, d));
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = amax;
+    __syncthreads();  // red and the whole normalised row are visible after this
+    amax = red[0];
+#pragma unroll
+    for (int w = 1; w < 8; ++w) amax = fmaxf(amax, red[w]);
+    const float ts = __fdiv_rn(amax, kRowScaleDiv);
+    if (threadIdx.x == 0) rs[r] = ts;
+    for (std::uint32_t q = threadIdx.x; q < groups; q += blockDim.x) quantize_group(nq_row4 + 4 * q, ts, r, q, in, xt);
 }
 
 // one thread per source byte: a byte permutation from the decode record layout to the W tile layout.

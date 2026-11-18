@@ -87,6 +87,7 @@ for name, marker, stop, kernel in [("big", "cudaError_t launch(", "    BigArgs b
     text = body(big, marker)
     text = text[text.index("{", text.index(marker)) + 1:text.index(stop)]
     text = re.sub(r"    using C = [^;]+;", "", text)
+    text = re.sub(r"    if \(!epilogue_alias_ok\([^;]+;", "", text)  # argument contract, not attribute initialisation
     text = re.sub(r"big_kernel(?:_f8)?<[^>]+>", str(kernel), text).replace("C::SMEM", "1")
     parts.append("cudaError_t attr_" + name + "() {" + text + "return cudaSuccess; }")
 text = body("src/cuda_core/attention/attention_flash.cu", "cudaError_t attention_prefill_flash(")

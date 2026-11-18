@@ -5,6 +5,7 @@
 //  3. The CTA / warp / accumulator coordinates write every (row, output) exactly once, in plain and in fused gate/up (GLU) mode,
 //     and GLU pairs gate and up of the same channels.
 //  4. Quantiser: zero rows and padding rows are zero; per-row scale rule; cache entry size = tile size.
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -219,6 +220,68 @@ void test_quantize_and_contract() {
 // per-element load-after-store order iff every output element of the launch is touched (read as aux, written as y) by exactly one
 // (CTA, thread) and every row scale it loads is a valid row. Enumerate the kernel's own coordinate functions over every CTA, warp,
 // lane and accumulator slot and check that each in-range (row, out) element is owned exactly once.
+// Host model of the RMSNorm folded into the quantiser (sm120 norm_quantize_kernel = cuda_core norm_kernel<rms> arithmetic): thread t
+// adds x[t + 256 i]^2 for i < nreg in ascending order (padding terms 0), 32-lane xor butterfly, the 8 warp sums added 0..7.
+std::vector<float> norm_rows(const std::vector<float>& x, const std::vector<float>& gain, std::uint32_t rows, std::uint32_t in,
+                             std::uint32_t nreg, float eps) {
+    std::vector<float> y(x.size());
+    for (std::uint32_t r = 0; r < rows; ++r) {
+        const float* xr = x.data() + static_cast<std::size_t>(r) * in;
+        float lane[256];
+        for (std::uint32_t t = 0; t < 256; ++t) {
+            float p = 0.0f;
+            for (std::uint32_t i = 0; i < nreg; ++i) {
+                const std::uint32_t idx = t + 256 * i;
+                const float v = idx < in ? xr[idx] : 0.0f;
+                const float sq = v * v;
+                p = p + sq;
+            }
+            lane[t] = p;
+        }
+        float warp[8];
+        for (std::uint32_t w = 0; w < 8; ++w) {
+            float* l = lane + 32 * w;
+            for (std::uint32_t off = 16; off > 0; off >>= 1) {
+                float n[32];
+                for (std::uint32_t k = 0; k < 32; ++k) n[k] = l[k] + l[k ^ off];
+                std::memcpy(l, n, sizeof n);
+            }
+            warp[w] = l[0];
+        }
+        float ss = warp[0];
+        for (std::uint32_t w = 1; w < 8; ++w) ss = ss + warp[w];
+        const float inv = 1.0f / std::sqrt(ss / static_cast<float>(in) + eps);
+        for (std::uint32_t k = 0; k < in; ++k) {
+            const float v = xr[k] * inv;
+            y[static_cast<std::size_t>(r) * in + k] = v * gain[k];
+        }
+    }
+    return y;
+}
+
+void test_norm_quant_fold() {
+    // contract of the fused producer: width a multiple of kK, <= 8192 (32 registers x 256 threads, in * 4 bytes of shared memory)
+    CHECK(T::norm_quantize_fits(5120) && T::norm_quantize_fits(T::kK) && T::norm_quantize_fits(T::kNormQuantMaxIn));
+    CHECK(!T::norm_quantize_fits(0) && !T::norm_quantize_fits(5120 + 64) && !T::norm_quantize_fits(T::kNormQuantMaxIn + T::kK));
+    static_assert(T::kNormQuantMaxIn * sizeof(float) <= 48u * 1024u && T::kNormQuantMaxIn <= 32u * 256u);
+    // the register bucket is free: padding terms add +0, so every bucket >= ceil(in / 256) gives rmsnorm's bits, hence the same tile
+    for (const std::uint32_t in : {384u, 5120u, 8192u}) {
+        const std::uint32_t rows = 6, need = (in + 255) / 256;
+        auto x = random_x(rows, in, 7 + in);
+        std::vector<float> g(in);
+        for (std::uint32_t k = 0; k < in; ++k) g[k] = 0.25f + static_cast<float>((k * 40503u) % 997) / 400.f;
+        const auto y0 = norm_rows(x, g, rows, in, need, 1e-6f);
+        for (const std::uint32_t nreg : {8u, 16u, 24u, 32u}) {
+            if (nreg < need) continue;
+            const auto y1 = norm_rows(x, g, rows, in, nreg, 1e-6f);
+            CHECK(std::memcmp(y0.data(), y1.data(), y0.size() * sizeof(float)) == 0);
+            const Act a0 = quantize(y0, rows, in), a1 = quantize(y1, rows, in);
+            CHECK(a0.tile == a1.tile && std::memcmp(a0.rs.data(), a1.rs.data(), a0.rs.size() * sizeof(float)) == 0);
+        }
+        CHECK(quantize(y0, rows, in).rs[3] == 0.f);  // the all-zero row normalises to zeros: rs 0
+    }
+}
+
 void test_epilogue_ownership(std::uint32_t out, std::uint32_t rows, bool glu) {
     constexpr std::uint32_t kThreads = 256;  // gemm_kernel: 8 warps, wm = warp & 1, wn = warp >> 1
     const std::uint32_t rp = T::rows_padded(rows), tiles_n = rp / T::kCtaRows;
@@ -299,10 +362,11 @@ int main() {
     test_epilogue_ownership(256, 300, false);   // two weight tiles x two activation tiles
     test_epilogue_ownership(80, 20, true);      // GLU, partial 64-channel tile
     test_epilogue_ownership(5120, 4096, false); // engine residual shape (down / o)
+    test_norm_quant_fold();
     if (g_fail) {
         std::fprintf(stderr, "nvfp4_tile_host: %d failures\n", g_fail);
         return 1;
     }
-    std::printf("nvfp4_tile_host: PASS (layouts, fragments, coordinates, GLU, quantiser, contract, stage producer, epilogue ownership)\n");
+    std::printf("nvfp4_tile_host: PASS (layouts, fragments, coordinates, GLU, quantiser, contract, stage producer, epilogue ownership, norm fold)\n");
     return 0;
 }

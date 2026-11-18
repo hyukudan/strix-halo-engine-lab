@@ -124,6 +124,18 @@ int main() {
         f.prefill_arith = q::PrefillArith::exact;
         check(engine_identity(f).find("gdnc16") == std::string::npos, "chunk16 ignored under the exact prefill policy");
     }
+    {  // --prefill-norm-fold: strict on|off; bitwise scheduling of bytes -> never part of the engine identity
+        namespace q = strix::qwen35;
+        check(q::parse_prefill_norm_fold("on") && !q::parse_prefill_norm_fold("off"), "prefill-norm-fold on|off");
+        for (const char* bad : {"", "1", "ON", "auto", "on "})
+            check(rejects([&] { (void)q::parse_prefill_norm_fold(bad); }), "prefill-norm-fold rejects other spellings");
+        q::EngineOptions f = a;
+        f.prefill_arith = q::PrefillArith::fast4;
+        check(!f.prefill_norm_fold, "prefill-norm-fold opt-in until measured");
+        const std::string off_id = engine_identity(f);
+        f.prefill_norm_fold = true;
+        check(engine_identity(f) == off_id, "prefill-norm-fold keeps the FAST4 identity (bitwise)");
+    }
     check(portable_sampler() == 0, "POSIX clock sampler compiles and closes");
     check(std::isinf(maxrel({NAN}, {0.0})) && std::isinf(maxrel({0.0F}, {INFINITY})), "nonfinite qualification rejection");
     return failures ? 1 : 0;
