@@ -113,7 +113,11 @@ int main() {
             check(text.find("split_k = fast [profile] fast (nvfp4-splitk-fast-v1, identity -skf1)") != std::string::npos,
                   "FAST windows text names nvfp4-splitk-fast-v1");
             check(text.find("prefill_") == std::string::npos, "FAST windows text lists a lever not offered there");
-            check(run(Name::fast, w, qp::Route::windows, t, {{"split_k", "exact"}}) == want, "--split-k exact under fast != EXACT");
+            std::string off_text;
+            check(run(Name::fast, w, qp::Route::windows, t, {{"split_k", "exact"}}, &off_text) == want, "--split-k exact under fast != EXACT");
+            // the off switch prints as [off] (shared resolver: explicit value == the lever's off value) and turns no identity on
+            check(off_text.find("split_k = exact [off]") != std::string::npos && off_text.find("-skf1") == std::string::npos,
+                  "FAST windows --split-k exact text: split_k = exact [off], no -skf1");
         }
 
     // 2c. Registry: every qualified row names a lever of the table that is offered on its route, carries a receipt, and
