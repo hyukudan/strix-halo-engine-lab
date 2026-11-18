@@ -85,6 +85,18 @@ inline Overrides expand(const Bundle& b, const Getenv& raw, const Admit& admit =
     return out;
 }
 
+// The environment a bundle expands from once the product profile is known: when the bundle switch is unset and
+// `selected` (the value the resolved profile column applies to the switch row; empty: none) is not empty, the switch
+// reads `selected`; an explicitly set switch ("0" included) and every other variable read `raw`. A product profile
+// that selects the bundle therefore runs the same members and canonical values as setting the switch.
+inline Getenv profile_switch(const Bundle& b, std::string selected, Getenv raw) {
+    return [key = std::string(b.env), selected = std::move(selected), raw = std::move(raw)](const char* name) -> const char* {
+        const char* v = raw(name);
+        if (!set(v) && !selected.empty() && key == name) return selected.c_str();
+        return v;
+    };
+}
+
 // The lookup the profile resolution reads: overrides first, then the raw environment (empty = unset).
 inline Getenv lookup(const Overrides& overrides, Getenv raw) {
     return [&overrides, raw = std::move(raw)](const char* key) -> const char* {

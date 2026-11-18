@@ -1638,6 +1638,14 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-turbo-bundle-tests)
     add_test(NAME strix-turbo-bundle-tests COMMAND strix-turbo-bundle-tests)
     set_tests_properties(strix-turbo-bundle-tests PROPERTIES LABELS "cpu;profile" TIMEOUT 60)
+    # One shared check of the tier word over every engine table: a qualified (or provisional) FAST row is in the
+    # resolved fast set, fast != exact when one exists, exact enables no bit-changing row.
+    add_executable(strix-profile-fast-set-tests tests/profile_fast_set_tests.cpp src/minimax/engine/mm_defaults.cpp)
+    target_link_libraries(strix-profile-fast-set-tests PRIVATE strix_core strix_serve_json)
+    target_include_directories(strix-profile-fast-set-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    strix_target_warnings(strix-profile-fast-set-tests)
+    add_test(NAME strix-profile-fast-set-tests COMMAND strix-profile-fast-set-tests)
+    set_tests_properties(strix-profile-fast-set-tests PROPERTIES LABELS "cpu;profile" TIMEOUT 60)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME strix-turbo-kit-tests COMMAND ${Python3_EXECUTABLE} -B

@@ -77,15 +77,16 @@ struct Engine {
     turbo::WeightCaps weight_caps{};        // weight sources / widths this build can load under turbo
 };
 
+// Tier words: exact | fast | turbo; `exact` is the default column (spelled "default" in receipts, kept as an alias).
 inline Name parse(std::string_view value) {
-    if (value == "default") return Name::standard;
+    if (value == "default" || value == "exact") return Name::standard;
     if (value == "fast") return Name::fast;
     if (value == "quality") return Name::quality;
     if (value == "turbo") return Name::turbo;
-    throw std::invalid_argument("--profile must be default, fast, quality or turbo (got '" + std::string(value) + "')");
+    throw std::invalid_argument("--profile must be exact (default), fast, quality or turbo (got '" + std::string(value) + "')");
 }
 inline bool is_name(std::string_view value) {
-    return value == "default" || value == "fast" || value == "quality" || value == "turbo";
+    return value == "default" || value == "exact" || value == "fast" || value == "quality" || value == "turbo";
 }
 inline const char* name(Name value) {
     switch (value) {
@@ -500,7 +501,7 @@ inline void take_options(const Engine& engine, std::vector<std::string>& args, I
             // '--profile WORD' with a plain word that is not a profile name is a typo ('--profile fastt'); a path, a
             // NAME:... session, an option ('--profile --x') or a '--profile=...' token belongs to the app.
             if (equal == std::string::npos && !value.empty() && !is_name(value) && value.find_first_of("-:/.=") == std::string::npos)
-                throw std::invalid_argument("--profile must be default, fast, quality or turbo (got '" + value + "')");
+                throw std::invalid_argument("--profile must be exact (default), fast, quality or turbo (got '" + value + "')");
             if (is_name(value)) {
                 if (inputs.profile) throw std::invalid_argument("duplicate --profile");
                 inputs.profile = parse(value);

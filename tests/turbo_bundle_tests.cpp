@@ -91,8 +91,8 @@ void families() {
     require(engram_rows == 1 && find(r, "engram_wmma") == nullptr, "one real Engram row per env");
     const auto* engram = find(r, "engram_f16wmma");
     require(engram != nullptr && engram->status == p::Status::builtin && engram->value == "0" &&
-                std::string_view(engram->lever->value[3]).empty() && !engram->lever->runnable[3],
-            "ds41 real Engram stays explicit-only outside turbo");
+                engram->lever->value[3] == engram->lever->builtin && !engram->lever->runnable[3],
+            "ds41 Engram is not a turbo member (turbo cell = builtin; fast selects it)");
     require(find(r, "decoder_replay") != nullptr && find(r, "decoder_replay")->status == p::Status::pending, "ds41 replay pending");
     generic(ds, p::Name::fast, none, r);
     require(find(r, "attention_f16wmma")->requested == "1", "ds41 fast unchanged (f16wmma)");
