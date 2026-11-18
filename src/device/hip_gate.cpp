@@ -53,6 +53,10 @@ void bind_hip_main(int& argc, char** argv, std::FILE* receipt, CodeLoad code_loa
     // Runtime host memory mode first (runtime_host_memory.hpp): the eager-code restart then carries every value in one
     // exec. Still here afterwards with values this image inserted: restart for them, or roll them back.
     // The default applies where the device memory is host memory, to binaries on the shared code-load policy.
+    // Declined for the engine policy (Qwen, apps/hip_decode_token_main.cpp): it registers the model FILE mapping
+    // (src/hip_model_residency.cpp create_impl) and with HSA_USE_SVM=0 that registration is refused
+    // ("hipHostRegister(model range): invalid argument", measured 8K one node, STRIX_HOST_DRIVER_PAGES=1, 2 of 2 runs).
+    // Its GPU-visible file pages are kept from evicting by the lock/unlock order of registered_backing_lifetime.hpp.
     const bool host_pages_default = code_load == CodeLoad::shared && kfd_gpus_share_host_memory();
     unsigned host_pages_inserted = 0;
     try {
