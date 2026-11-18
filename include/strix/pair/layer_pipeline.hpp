@@ -228,15 +228,18 @@ inline DecodeStats decode(const Placement& p, std::uint32_t first_token, std::ui
 
 // End-of-prefill relay of every stage's layer state to ONE decoder stage (the planner's handoff plan: the decoder owns
 // the whole model, decode then runs there alone at single-rank cost instead of crossing every cut per token).
-// Messages travel along the line towards `decoder`: a stage below it forwards what it received from below plus its own
-// state downwards (to stage + 1), a stage above it forwards upwards (to stage - 1). Each message: 6 header words
-// {state_magic, first layer, last layer, bytes, CRC, token + 1 (0: none)} + the state bytes. The head stage attaches
-// the prefill's first token. The decoder calls `load` once per other stage and returns the first token.
+// Messages travel along the line towards `decoder`: a stage below it forwards what arrives from below plus its own
+// layers downwards (to stage + 1), a stage above it forwards upwards (to stage - 1). One message per layer, so the
+// sender's export of layer l + 1 overlaps the receiver's check and import of layer l. The head stage attaches the
+// prefill's first token. The decoder calls `load` once per layer it does not run and returns the first token.
 struct RelayOps {
-    std::function<std::vector<std::byte>()> save;   // this stage's layer state [first, last)
-    std::function<void(std::uint32_t first, std::uint32_t last, std::span<const std::byte>)> load;   // decoder only
+    std::function<std::vector<std::byte>(std::uint32_t layer)> save;          // one layer's state on this stage
+    std::function<void(std::uint32_t layer, std::span<const std::byte>)> load; // decoder only
+    // Checksum of one message's bytes; empty = SeamCrc (bytewise table). A binder with a hardware CRC32C passes it:
+    // the relay moves the whole KV + recurrent state once, a few hundred MB at long contexts.
+    std::function<std::uint32_t(std::span<const std::byte>)> checksum;
 };
-struct RelayStats { std::uint32_t token = 0; std::uint64_t bytes = 0; double ms = 0; };
+struct RelayStats { std::uint32_t token = 0; std::uint64_t bytes = 0, messages = 0; double ms = 0; };
 inline RelayStats relay_state(const Placement& p, std::uint32_t decoder, std::uint32_t first_token, const Link* up,
                               const Link* down, const RelayOps& ops) {
     using Clock = std::chrono::steady_clock;
@@ -245,57 +248,64 @@ inline RelayStats relay_state(const Placement& p, std::uint32_t decoder, std::ui
     if ((up != nullptr) == p.embeds() || (down != nullptr) == p.head())
         throw std::invalid_argument("layer pipeline: links do not match the stage (up: not first, down: not last)");
     const auto start = Clock::now();
+    const auto check_sum = [&](std::span<const std::byte> b) {
+        if (ops.checksum) return ops.checksum(b);
+        SeamCrc crc; crc.update(b); return crc.value();
+    };
     RelayStats out;
-    struct Message { std::uint64_t words[6]; std::vector<std::byte> bytes; };
-    const auto receive_all = [&](const Link* from) {
-        std::vector<Message> got;
-        std::uint64_t count = 0;
-        from->receive(std::as_writable_bytes(std::span(&count, 1)));
-        for (std::uint64_t i = 0; i < count; ++i) {
-            Message m;
-            from->receive(std::as_writable_bytes(std::span(m.words)));
-            if (m.words[0] != state_magic) throw std::runtime_error("state relay: bad message header");
-            m.bytes.resize(static_cast<std::size_t>(m.words[3]));
-            from->receive(m.bytes);
-            SeamCrc crc; crc.update(m.bytes);
-            if (crc.value() != m.words[4]) throw std::runtime_error("state relay: CRC mismatch");
-            got.push_back(std::move(m));
-        }
-        return got;
-    };
-    const auto send_all = [&](const Link* to, const std::vector<Message>& all) {
-        const std::uint64_t count = all.size();
-        to->send(std::as_bytes(std::span(&count, 1)));
-        for (const auto& m : all) { to->send(std::as_bytes(std::span(m.words))); to->send(m.bytes); }
-    };
-    const auto own = [&] {
+    // One message per layer, streamed: {state_magic, layer, bytes, checksum, token + 1 (0: none)} + bytes. A link
+    // carries a count first; a forwarding stage passes each message on as it arrives, then appends its own layers.
+    struct Message { std::uint64_t words[5]{}; std::vector<std::byte> bytes; };
+    const auto get_msg = [&](const Link* from) {
         Message m;
-        m.bytes = ops.save();
-        SeamCrc crc; crc.update(m.bytes);
-        m.words[0] = state_magic; m.words[1] = p.first(); m.words[2] = p.last(); m.words[3] = m.bytes.size();
-        m.words[4] = crc.value(); m.words[5] = p.head() ? std::uint64_t(first_token) + 1U : 0U;
+        from->receive(std::as_writable_bytes(std::span(m.words)));
+        if (m.words[0] != state_magic) throw std::runtime_error("state relay: bad message header");
+        m.bytes.resize(static_cast<std::size_t>(m.words[2]));
+        from->receive(m.bytes);
+        if (check_sum(m.bytes) != m.words[3]) throw std::runtime_error("state relay: checksum mismatch");
         return m;
     };
+    const auto put_msg = [&](const Link* to, const Message& m) { to->send(std::as_bytes(std::span(m.words))); to->send(m.bytes); };
+    const auto own = [&](std::uint32_t layer) {
+        Message m;
+        m.bytes = ops.save(layer);
+        m.words[0] = state_magic; m.words[1] = layer; m.words[2] = m.bytes.size(); m.words[3] = check_sum(m.bytes);
+        m.words[4] = p.head() ? std::uint64_t(first_token) + 1U : 0U;
+        return m;
+    };
+    const auto count_from = [&](const Link* from) {
+        std::uint64_t count = 0;
+        if (from) from->receive(std::as_writable_bytes(std::span(&count, 1)));
+        return count;
+    };
+    const std::uint64_t mine = p.last() - p.first();
     if (p.stage != decoder) {
         const bool below = p.stage < decoder;
-        std::vector<Message> all;
-        if (below && up) all = receive_all(up);        // from stage - 1
-        if (!below && down) all = receive_all(down);   // from stage + 1
-        all.push_back(own());
-        for (const auto& m : all) out.bytes += m.bytes.size();
-        send_all(below ? down : up, all);
+        const Link* from = below ? up : down;   // the far side of the line (null at the end)
+        const Link* to = below ? down : up;
+        const auto incoming = count_from(from);
+        const std::uint64_t count = incoming + mine;
+        to->send(std::as_bytes(std::span(&count, 1)));
+        for (std::uint64_t i = 0; i < incoming; ++i) { const auto m = get_msg(from); out.bytes += m.bytes.size(); put_msg(to, m); }
+        for (auto layer = p.first(); layer < p.last(); ++layer) { const auto m = own(layer); out.bytes += m.bytes.size(); put_msg(to, m); }
+        out.messages = count;
     } else {
-        std::vector<Message> all;
-        if (up && p.stage > 0U) all = receive_all(up);
-        if (down) { auto more = receive_all(down); for (auto& m : more) all.push_back(std::move(m)); }
         bool token = p.head();
         out.token = first_token;
-        for (const auto& m : all) {
-            ops.load(static_cast<std::uint32_t>(m.words[1]), static_cast<std::uint32_t>(m.words[2]), m.bytes);
-            out.bytes += m.bytes.size();
-            if (m.words[5]) { out.token = static_cast<std::uint32_t>(m.words[5] - 1U); token = true; }
+        std::uint64_t received = 0;
+        for (const Link* from : {p.stage > 0U ? up : nullptr, down}) {
+            const auto count = count_from(from);
+            for (std::uint64_t i = 0; i < count; ++i) {
+                const auto m = get_msg(from);
+                if (m.words[1] >= p.first() && m.words[1] < p.last()) throw std::runtime_error("state relay: a layer of the decoder's own stage");
+                ops.load(static_cast<std::uint32_t>(m.words[1]), m.bytes);
+                out.bytes += m.bytes.size();
+                if (m.words[4]) { out.token = static_cast<std::uint32_t>(m.words[4] - 1U); token = true; }
+                ++received;
+            }
         }
-        if (all.size() + 1U != p.stages() || !token) throw std::runtime_error("state relay: decoder did not receive every stage");
+        out.messages = received;
+        if (received + mine != p.cuts.back() || !token) throw std::runtime_error("state relay: decoder did not receive every layer");
     }
     out.ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
     return out;
