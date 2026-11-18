@@ -1,6 +1,7 @@
 #include "strix/file_snapshot.hpp"
 #include "strix/hip_ds41_expert_backend.hpp"
 #include "strix/hip_check.hpp"
+#include "strix/pinned_host.hpp"
 #include "strix/device/hip_gate.hpp"
 
 #include "strix/ds41_formats.hpp"
@@ -58,11 +59,14 @@ struct Pinned {
     T* p = nullptr;
     std::size_t n = 0;
     Pinned() = default;
-    explicit Pinned(std::size_t count) : n(count) {
-        check(hipHostMalloc(reinterpret_cast<void**>(&p), std::max<std::size_t>(count, 1) * sizeof(T), hipHostMallocDefault), "hipHostMalloc");
+    // direct_io: the buffer is an O_DIRECT read target (strix/pinned_host.hpp allocate_io).
+    explicit Pinned(std::size_t count, bool direct_io = false) : n(count) {
+        const std::size_t bytes = std::max<std::size_t>(count, 1) * sizeof(T);
+        check(direct_io ? strix::host_pin::allocate_io(reinterpret_cast<void**>(&p), bytes, hipHostMallocDefault)
+                        : hipHostMalloc(reinterpret_cast<void**>(&p), bytes, hipHostMallocDefault), "hipHostMalloc");
     }
     ~Pinned() {
-        if (p != nullptr) (void)hipHostFree(p);
+        if (p != nullptr) (void)strix::host_pin::release(p);
     }
     Pinned(const Pinned&) = delete;
     Pinned& operator=(const Pinned&) = delete;
@@ -83,7 +87,7 @@ public:
         if (fd_ < 0) fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd_ < 0) throw std::runtime_error("hip expert backend: cannot open " + path);
         strix::LoaderCapture::record(path, fd_);
-        buffer_ = Pinned<std::uint8_t>(chunk + 2U * align);
+        buffer_ = Pinned<std::uint8_t>(chunk + 2U * align, true);
     }
     ~Loader() {
         if (fd_ >= 0) ::close(fd_);

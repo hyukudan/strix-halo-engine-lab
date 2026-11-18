@@ -5,7 +5,7 @@ unprivileged user can read.
 
 | file | what it does | run |
 |---|---|---|
-| `kfdevmon.c` | `LD_PRELOAD` probe for the process it is loaded into: its own KFD SMI events (queue eviction with trigger SVM / USERPTR / TTM, restore, unmap) and every KFD allocation (userptr ones with a backtrace and the owning `/proc/self/maps` line). | `gcc -O2 -shared -fPIC -o kfdevmon.so kfdevmon.c -ldl -lpthread`; `LD_PRELOAD=./kfdevmon.so KFDEVMON_OUT=<prefix> <engine ...>` (`KFDEVMON_BT=0`: no backtraces) |
+| `kfdevmon.c` | `LD_PRELOAD` probe for the process it is loaded into: its own KFD SMI events (queue eviction with trigger SVM / USERPTR / TTM, restore, unmap) and every KFD allocation (userptr ones with a backtrace and the owning `/proc/self/maps` line). | `gcc -O2 -shared -fPIC -o kfdevmon.so kfdevmon.c -ldl -lpthread`; `LD_PRELOAD=./kfdevmon.so KFDEVMON_OUT=<prefix> <engine ...>` (`KFDEVMON_BT=0`: no backtraces; `KFDEVMON_BT=2`: every allocation and every shared-virtual-memory range the runtime sets, each with a backtrace: finds lazy allocations and GPU-visible host ranges the engine did not create) |
 | `evsample.py` | Node sampler: every `evicted_ms` change of every KFD process with the `/proc/vmstat` deltas (reclaim, swap, compaction, migration) of the 2 s before it, `MemAvailable` / page cache / `GPUActive`, and the GPU busy timeline at 4 Hz (busy segments = timed windows). | `python3 evsample.py SECONDS OUT [PERIOD]` |
 | `kvstress.py` | Controlled memory pressure from the measuring ticket itself: streams files through the page cache (kswapd + large-folio compaction) and churns `MADV_HUGEPAGE` anonymous memory sized to `MemAvailable - FLOOR`; drops the cache it read at exit. Run it only inside your own GPU ticket. | `python3 kvstress.py SECONDS ANON_GB FLOOR_GB CHUNK_GB FILE...` |
 | `kvmicro.hip` | Micro A/B: holds `GTT_GB` of device memory, 850 MB of host buffers in the engine's shape, and times a ~1 ms GPU kernel reading host memory; prints stalls and its own `evicted_ms`. Modes: `none` (hipHostMalloc), `mlock`, `shmpin` (mlock + io_uring pin of ROCr's shmem host maps), `anonpin` (the `STRIX_HOST_ANON_PIN` allocator: private anonymous + MADV_DONTFORK + mlock + io_uring pin + hipHostRegister). `HSA_USERPTR_FOR_PAGED_MEM=0` in the environment tests GTT-backed host memory (O_DIRECT check included). | `hipcc --offload-arch=gfx1151 -O2 -o kvmicro kvmicro.hip -lhsa-runtime64`; `kvmicro SECS GTT_GB HOST_MB MODE [ODIRECT_FILE]` |
@@ -31,3 +31,15 @@ that rank's monitor log. Offsets in the output are relative to the marker, with 
 The legacy sampler repeats rolling vmstat deltas across EV records and PIDs. Its totals cannot be recovered
 by summing or deduplicating those observations. Counter totals require a separate timestamped cumulative
 vmstat stream sampled once per interval independently of EVs; this report does not claim such totals.
+
+## Pair ticket: evictions per prefill window
+
+| file | what it does | run |
+|---|---|---|
+| `pair-evict.sh` | One MiniMax pair ticket (one arm): the `minimax/fast-gate` timing route plus `OUT/evict.txt` with the evicted milliseconds of each rank before the first prefill, inside each prefill window and after the last, the compaction / migration counter deltas of both nodes over the ticket, and for rank 0 the runtime host-memory receipt with its count of shared anonymous host maps. | `pair-evict.sh OUT BIN MODEL_DIR ARM 'ENV' name=ids.u32[,...]` (inside a pair GPU turn, `KIT_PEER` set) |
+
+Use it with one session (the request right after load) and with three (reaches about 35 s after load, where the
+deferred compaction pass lands). Where the device memory is host memory the engine keeps every GPU-visible host page
+immovable by default (`include/strix/device/runtime_host_memory.hpp`): compaction counters still move, the `ev` lines
+stay at `+0` in the load and in every window. `STRIX_HOST_DRIVER_PAGES=0` in `ENV` is the reference arm (runtime
+defaults). A monitor log (`kfdevmon.c`, `KFDEVMON_BT=2`) of a default run has no `SVM` line and no eviction event.

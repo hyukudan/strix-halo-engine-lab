@@ -23,6 +23,7 @@
 //       their CRC compared with the received / read ones; in peer mode rank 0 re-reads its source chunks and rank 1
 //       re-reads the same chunks from its own copy of the files, and every chunk CRC is compared.
 #include "strix/dist/communicator.hpp"
+#include "strix/pinned_host.hpp"
 #include "dist_crc32c_parallel.hpp"
 
 #include <hip/hip_runtime.h>
@@ -136,10 +137,11 @@ static_assert(sizeof(Trailer) == kTrailer);
 class Ring {
 public:
     Ring() {
-        for (auto& s : slot_) hip_ok(hipHostMalloc(reinterpret_cast<void**>(&s), kChunk + 4096, hipHostMallocDefault), "pinned slot");
+        // allocate_io: the slots are O_DIRECT read targets (strix/pinned_host.hpp).
+        for (auto& s : slot_) hip_ok(strix::host_pin::allocate_io(reinterpret_cast<void**>(&s), kChunk + 4096, hipHostMallocDefault), "pinned slot");
     }
     ~Ring() {
-        for (auto* s : slot_) (void)hipHostFree(s);
+        for (auto* s : slot_) (void)strix::host_pin::release(s);
     }
     Ring(const Ring&) = delete;
     Ring& operator=(const Ring&) = delete;

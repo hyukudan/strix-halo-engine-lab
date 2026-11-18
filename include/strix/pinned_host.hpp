@@ -16,6 +16,8 @@
 // BOs are TTM pages, not movable); STRIX_HOST_ANON_PIN=1/0 forces it. Only allocations of at least kMinBytes take the
 // pinned path: small buffers are revalidated cheaply and keep hipHostMalloc. If the mlock or the long-term pin is
 // refused (RLIMIT_MEMLOCK), the allocation falls back to the exact hipHostMalloc: an unpinned anon range buys nothing.
+#include "strix/device/runtime_host_memory.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/lever.hpp"
 
 #include <hip/hip_runtime.h>
@@ -99,7 +101,41 @@ inline Registry& registry() { static Registry r; return r; }
     return hipSuccess;
 }
 
-// hipHostFree for memory from allocate() (either path).
+// The runtime's host-memory mode of this process (device/runtime_host_memory.hpp), read once.
+[[nodiscard]] inline bool runtime_driver_pages() {
+    static const bool on = device::runtime_host_memory_is_driver_pages(strix::envcfg::text(device::kRuntimePagedMemory));
+    return on;
+}
+
+// allocate() for a buffer that is ALSO a direct-I/O target (O_DIRECT reads, fixed I/O buffers: the kernel takes page
+// references). Runtime memory made of driver pages cannot be one, so in that mode every size takes the engine's own
+// anonymous pages, and a refused lock or pin keeps the registered anonymous mapping (movable until released, but a
+// valid I/O target) instead of falling back to the runtime. Otherwise: exactly allocate().
+[[nodiscard]] inline hipError_t allocate_io(void** host, std::size_t bytes, unsigned flags) {
+    if (device::host_io_route(runtime_driver_pages()) == device::HostIoRoute::shared_allocator) return allocate(host, bytes, flags);
+    const std::size_t page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+    const std::size_t size = (std::max<std::size_t>(bytes, 1) + page - 1) / page * page;
+    void* p = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+    if (p == MAP_FAILED) return hipErrorOutOfMemory;
+    (void)::madvise(p, size, MADV_DONTFORK);
+    Pinned rec{size, -1, ::mlock(p, size) == 0};
+    rec.ring = rec.locked ? long_term_pin(p, size) : -1;
+    const unsigned reg = hipHostRegisterMapped | ((flags & hipHostMallocCoherent) ? 0U : hipExtHostRegisterCoarseGrained);
+    if (const hipError_t e = hipHostRegister(p, size, reg); e != hipSuccess) {
+        if (rec.ring >= 0) ::close(rec.ring);
+        ::munmap(p, size);
+        return e;
+    }
+    auto& r = registry();
+    std::lock_guard<std::mutex> lock(r.m);
+    if (rec.ring < 0) ++r.unpinned;
+    r.bytes += size;
+    r.live.emplace(p, rec);
+    *host = p;
+    return hipSuccess;
+}
+
+// hipHostFree for memory from allocate() / allocate_io() (either path).
 inline hipError_t release(void* host) noexcept {
     if (host == nullptr) return hipSuccess;
     Pinned rec;

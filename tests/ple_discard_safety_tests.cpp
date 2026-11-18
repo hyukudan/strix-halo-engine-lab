@@ -125,8 +125,53 @@ void lifetime() {
         [&] { events.emplace_back("drain"); },
         [&](int range) { events.emplace_back("unregister" + std::to_string(range)); return range != 2; },
         [&](int range) { events.emplace_back("munlock" + std::to_string(range)); }));
-    expect(events == std::vector<std::string>{"drain","unregister1","munlock1","unregister2","unregister3","munlock3"});
-    // The failed range stays locked even when its neighbors retire successfully.
+    // Every unregister precedes the first munlock (no VMA split next to a live registration); the failed range stays
+    // locked even when its neighbors retire successfully.
+    expect(events == std::vector<std::string>{"drain","unregister1","unregister2","unregister3","munlock1","munlock3"});
+    // Acquire: every range is locked before the first registration; the owner gets the lock flag with the range.
+    events.clear();
+    const auto acquire_all = [&](const std::vector<int>& ranges, int lock_fails, int lock_throws, int register_fails,
+                                 int alias_fails) {
+        strix::acquire_locked_backings(ranges,
+            [&](int range) {
+                if (range == lock_throws) throw std::runtime_error("required lock");
+                events.emplace_back("mlock" + std::to_string(range));
+                return range != lock_fails;
+            },
+            [&](int range) { events.emplace_back("munlock" + std::to_string(range)); },
+            [&](int range, bool locked, const auto& handed) {
+                strix::acquire_registered_backing(
+                    [&] { if (range == register_fails) throw std::runtime_error("register");
+                          events.emplace_back("register" + std::to_string(range)); },
+                    [&] { events.emplace_back(std::string(locked ? "track-locked" : "track") + std::to_string(range)); handed(); },
+                    [&] { if (range == alias_fails) throw std::runtime_error("alias"); });
+            });
+    };
+    acquire_all({1,2,3}, 2, 0, 0, 0);
+    expect(events == std::vector<std::string>{"mlock1","mlock2","mlock3","register1","track-locked1","register2","track2",
+        "register3","track-locked3"});
+    events.clear();  // Registration failure: the untracked locked ranges are unlocked here, the tracked one is the owner's.
+    refuses([&] { acquire_all({1,2,3}, 0, 0, 2, 0); });
+    expect(events == std::vector<std::string>{"mlock1","mlock2","mlock3","register1","track-locked1","munlock2","munlock3"});
+    events.clear();  // Alias failure after tracking: the owner already holds range 2 and unlocks it on release.
+    refuses([&] { acquire_all({1,2,3}, 0, 0, 0, 2); });
+    expect(events == std::vector<std::string>{"mlock1","mlock2","mlock3","register1","track-locked1","register2",
+        "track-locked2","munlock3"});
+    events.clear();  // A required lock that fails registers nothing and unlocks what it locked.
+    refuses([&] { acquire_all({1,2,3}, 0, 3, 0, 0); });
+    expect(events == std::vector<std::string>{"mlock1","mlock2","munlock1","munlock2"});
+    // Teardown unlock: one call per contiguous run, a gap (failed unregister / other merged range) starts a new run.
+    events.clear();
+    {
+        strix::CoalescedUnlock runs([&](std::uintptr_t base, std::uint64_t bytes) {
+            events.emplace_back("munlock" + std::to_string(base) + "+" + std::to_string(bytes));
+        });
+        runs.add(0x1000, 0x1000); runs.add(0x2000, 0x1000); runs.add(0x3000, 0);  // contiguous, empty ignored
+        runs.add(0x5000, 0x1000); runs.add(0x6000, 0x2000);                     // gap at 0x3000..0x5000
+        runs.add(0x1000, 0x1000);                                                // out of order: own call
+        runs.flush(); runs.flush();                                              // flush is idempotent
+    }
+    expect(events == std::vector<std::string>{"munlock4096+8192","munlock20480+12288","munlock4096+4096"});
     events.clear();
     expect(strix::retire_registered_backings(std::vector<int>{},
         [&] { events.emplace_back("drain"); },

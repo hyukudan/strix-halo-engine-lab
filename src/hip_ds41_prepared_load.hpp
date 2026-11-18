@@ -1,6 +1,7 @@
 #pragma once
 #include "strix/ds41_prepared_load.hpp"
 #include "strix/ds41_expert_tp.hpp"
+#include "strix/pinned_host.hpp"
 #include <hip/hip_runtime.h>
 #include <chrono>
 #include <cstdio>
@@ -42,14 +43,15 @@ public:
             else std::fprintf(stderr, "prepared rank %u REJECT %s; legacy fallback\n", rank_, e.what());
         }
     }
-    ~HipLoader() { if (pinned_) (void)hipHostFree(pinned_); }
+    ~HipLoader() { if (pinned_) (void)strix::host_pin::release(pinned_); }
     bool active() const noexcept { return bool(reader_); }
     bool load(const std::string& name, std::uint64_t bytes, std::uint8_t* dst, hipStream_t stream) {
         if (!reader_) return false;
         try {
             if (!pinned_) {
                 const auto pin_start = std::chrono::steady_clock::now();
-                if (hipHostMalloc(reinterpret_cast<void**>(&pinned_), staging_slots * chunk_bytes + 4096, hipHostMallocDefault) != hipSuccess)
+                // allocate_io: the slots are O_DIRECT read targets (strix/pinned_host.hpp).
+                if (strix::host_pin::allocate_io(reinterpret_cast<void**>(&pinned_), staging_slots * chunk_bytes + 4096, hipHostMallocDefault) != hipSuccess)
                     throw std::runtime_error("pin allocation failed");
                 pin_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - pin_start).count();
             }
