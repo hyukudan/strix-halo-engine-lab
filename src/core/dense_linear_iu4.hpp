@@ -62,6 +62,10 @@ __global__ void to_f16_paired_kernel(const float* x, _Float16* h, std::size_t co
         h[iu4_pairs::paired_index(i)] = static_cast<_Float16>(v != v ? v : fminf(65504.0F, fmaxf(-65504.0F, v)));
     }
 }
+// The same conversion (expression of the two kernels above) for producer epilogues.
+__device__ __forceinline__ _Float16 to_f16_value(float v) {
+    return static_cast<_Float16>(v != v ? v : fminf(65504.0F, fmaxf(-65504.0F, v)));
+}
 
 template <unsigned R, unsigned MaxG, unsigned Rc = R, bool UX = false>
 __global__ void __launch_bounds__(32 * kWaves) kernel(const std::uint8_t* w, unsigned inputs, unsigned outputs, const _Float16* xh,
@@ -165,6 +169,15 @@ inline void reference(const std::uint8_t* w, unsigned inputs, unsigned outputs, 
     reference_kernel<0><<<(outputs + 127U) / 128U, 128, 0, s>>>(w, inputs, outputs, x, out, rows);
 }
 
+// prepare() as a producer epilogue (decode launch fusion): a kernel that computes x (a norm, a SiLU product) calls
+// store(i, x[i]) with the F32 value it stores, i = row * inputs + k; same conversion and layout as prepare(), so run()
+// reads the same bytes and the prepare launch is gone. One sweep of rows <= kMaxRows (xh holds those rows).
+struct PreparedStore {
+    _Float16* h;
+    bool paired;
+    __device__ void operator()(std::size_t i, float v) const { h[paired ? iu4_pairs::paired_index(i) : i] = to_f16_value(v); }
+};
+inline PreparedStore prepared_store(_Float16* xh) { return {xh, scalar_x()}; }
 // Converts the F32 activations once; several projections of the same x (q/k/v, gate/up) share the prepared rows.
 inline void prepare(const float* x, _Float16* xh, unsigned inputs, unsigned rows, hipStream_t s) {
     if (scalar_x()) to_f16_paired_kernel<0><<<64, 256, 0, s>>>(x, xh, std::size_t(rows) * inputs);

@@ -39,6 +39,15 @@ int main() {
         for (const int s : seen) once = once && s == 1;
         CHECK(once);
     }
+    // Producer epilogues (dense_iu4::PreparedStore, decode launch fusion): a norm block of row r stores element k at
+    // paired_index(r * inputs + k), a flat SiLU pass at paired_index(i). Both equal prepare()'s flat layout for a whole
+    // window of 1..16 rows only if the permutation is row-local: paired_index(r * inputs + k) == r * inputs + paired_index(k).
+    std::size_t row_local = 0;
+    for (const std::size_t inputs : {5120U, 6144U, 17408U})
+        for (std::size_t r = 0; r < 16U; ++r)
+            for (std::size_t k = 0; k < inputs; k += 7U, ++row_local)
+                CHECK(paired_index(r * inputs + k) == r * inputs + paired_index(k));
+    CHECK(row_local > 0U);
     // Spelled-out order of one block: (x0,x4) (x1,x5) (x2,x6) (x3,x7).
     const std::size_t expect[8] = {0U, 2U, 4U, 6U, 1U, 3U, 5U, 7U};
     for (std::size_t j = 0; j < 8U; ++j) CHECK(paired_index(40U + j) == 40U + expect[j]);
