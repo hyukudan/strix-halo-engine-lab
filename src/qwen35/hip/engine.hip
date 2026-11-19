@@ -909,7 +909,7 @@ struct HipEngine::Impl {
         });
     }
     // silu(gate) * up of the mlp share into out [rows][gun] (as glu16).
-    void tp_glu(const Tensor& g, const Tensor& u, const float* xin, float* out, unsigned rows) {
+    void tp_gate_up(const Tensor& g, const Tensor& u, const float* xin, float* out, unsigned rows) {
         core::dense_row_sweeps(rows, [&](unsigned r, unsigned m) {
             core::dense_iu4::prepare(xin + std::size_t(r) * H, iu4.xh, H, m, stream);
             core::dense_iu4::run_cols(g.data, H, I, tp.gu0, tp.gun, iu4.xh, iu4.g, tp.gun, m, stream);
@@ -932,8 +932,8 @@ struct HipEngine::Impl {
         if (w.fmt == kIu4Fmt) tp_cols(w, x, first, count, out, count, rows);
         else linear(tp_sub(w, first, count), x, out, rows, stream, wide, iu4);
     }
-    void tp_part_glu(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned rows) {
-        if (g.fmt == kIu4Fmt) tp_glu(g, u, x, out, rows);
+    void tp_part_gate_up(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned rows) {
+        if (g.fmt == kIu4Fmt) tp_gate_up(g, u, x, out, rows);
         else glu(tp_sub(g, tp.gu0, tp.gun), tp_sub(u, tp.gu0, tp.gun), x, out, rows, stream, wide, iu4);
     }
     void tp_upload(int** dst, const std::vector<std::int32_t>& v) {
@@ -1145,7 +1145,7 @@ struct HipEngine::Impl {
             tp_join(tp.hid, n, proj);
             add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H);
             rmsnorm(x, y.post_norm, H, cfg.rms_eps, xn, n, stream);
-            tp_glu(y.gate, y.up, xn, slot, n);
+            tp_gate_up(y.gate, y.up, xn, slot, n);
             const bool xh = tp_join_x(tp.mlp, n, gu);
             tp_cols_x(y.down, gu, xh, tp.oc0, tp.ocn, slot, tp.ocn, n);
             tp_join(tp.hid, n, proj);
@@ -1418,7 +1418,7 @@ struct HipEngine::Impl {
         tp_join(tp.hid, n, proj);
         add_kernel<<<nb, 256, 0, stream>>>(mtp.mx, proj, n * H);
         rmsnorm(mtp.mx, y.post_norm, H, cfg.rms_eps, mtp.mxn, n, stream);
-        tp_part_glu(y.gate, y.up, mtp.mxn, slot, n);
+        tp_part_gate_up(y.gate, y.up, mtp.mxn, slot, n);
         tp_join(tp.mlp, n, gu);
         tp_part(y.down, gu, tp.oc0, tp.ocn, slot, n);
         tp_join(tp.hid, n, proj);
