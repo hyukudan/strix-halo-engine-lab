@@ -3352,5 +3352,16 @@
     "preconditions": "CUDA decode attention through cuda_core::attention_decode with more than one row (Qwen 27B dense verify / draft / plain) on a measured device and head shape (shared table: sm_120 with 188 SMs, 24 q / 4 kv, Dim 256); others keep the one-row grid (same bits).",
     "off_switch": "STRIX_DECODE_ATTN_ROW_SHARE=0",
     "doc_anchor": "docs/optimizations.md#qwen27-cuda-decode-attn-row-share"
+  },
+  {
+    "engine": "qwen-rtx",
+    "name": "Qwen 27B CUDA spec: K/V-only MTP catch-up",
+    "flag_or_env": "--mtp-catchup kv|full",
+    "default": "kv",
+    "exact": "EXACT: catch-up chunks nobody reads issue the same K/V projections in the same order; ids, steps and k histogram equal to full (one pair, large prompt route).",
+    "gain": "RTX PRO 6000 Blackwell, 28,187-token prompt, large prompt route, one pair: MTP feed 1.960 -> 0.091 s; decode unchanged. Not yet measured: the default windows route.",
+    "preconditions": "Engines with the mtp_kv hook (CUDA Qwen 27B dense spec CLI); others unchanged.",
+    "off_switch": "--mtp-catchup full",
+    "doc_anchor": "docs/optimizations.md#qwen27-cuda-mtp-kv-catchup"
   }
 ]
