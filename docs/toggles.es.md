@@ -29,7 +29,7 @@ Solo necesitas esta página para inspeccionar una ruta, depurar o llevar el moto
 | `--profile quality` | Un pack de mayor precisión donde existe (Nemotron EXL3). Si no, igual que `default`. |
 | `--profile` en `strix-cuda-ds41-prefill-service` | Servicio de prefill DS41 RTX: acepta la misma palabra (`exact`/`default`, `fast`; `STRIX_DS41_PROFILE`) y `--allow-pending` que la réplica, con el mismo resolutor (`strix/profiles/ds41_rtx.hpp`). Hoy todas las filas fast están pendientes (listadas en `levers`, nunca usadas), así que `fast` se ejecuta como `exact`. |
 
-Existen perfiles con nombre para Qwen, el par DeepSeek, Gemma4/Nemotron y `strix-glm5-rank`.
+Existen perfiles con nombre para Qwen, el par DeepSeek, Gemma4/Nemotron y `strix-glm5-rank`. Todos los analizadores de la palabra, Gemma 4 y el productor GLM RTX incluidos, aceptan `exact` (= `default`) con el analizador compartido; los motores sin columna TURBO rechazan `turbo` con ese motivo.
 MiniMax acepta las mismas palabras (`--profile exact|fast|...`); `--profile NAME:PROMPT.u32:STEPS` sigue ejecutando una sesión con tiempos.
 Las CLI CUDA de Qwen denso 27B (`strix-cuda-qwen35-decode`, `strix-cuda-qwen35-spec`) aceptan la misma palabra, `--profile exact|default|fast|quality`
 (`exact` = `default`; `turbo` se rechaza: este motor aún no tiene barra TURBO). Una sola tabla, `include/strix/profiles/qwen_dense_cuda.hpp`, resuelta por

@@ -29,7 +29,7 @@ You only need this page to inspect a path, to debug, or to move the engine to di
 | `--profile quality` | A higher-precision pack where one exists (Nemotron EXL3). Otherwise equal to `default`. |
 | `--profile` on `strix-cuda-ds41-prefill-service` | DS41 RTX prefill service: takes the same word (`exact`/`default`, `fast`; `STRIX_DS41_PROFILE`) and `--allow-pending` as the replica, through the same resolver (`strix/profiles/ds41_rtx.hpp`). Today every fast row is pending (listed in `levers`, never used), so `fast` runs as `exact`. |
 
-Named profiles exist for Qwen, the DeepSeek pair, Gemma4/Nemotron and `strix-glm5-rank`.
+Named profiles exist for Qwen, the DeepSeek pair, Gemma4/Nemotron and `strix-glm5-rank`. Every word parser, Gemma 4 and the GLM RTX producer included, takes `exact` (= `default`) through the shared tier parser; engines without a TURBO column refuse `turbo` with that reason.
 MiniMax takes the same words (`--profile exact|fast|...`); `--profile NAME:PROMPT.u32:STEPS` still runs a timed session.
 The CUDA Qwen dense 27B CLIs (`strix-cuda-qwen35-decode`, `strix-cuda-qwen35-spec`) take the same word, `--profile exact|default|fast|quality`
 (`exact` = `default`; `turbo` is refused: no TURBO bar for this engine yet). One table, `include/strix/profiles/qwen_dense_cuda.hpp`, resolved by
@@ -161,7 +161,7 @@ Pair setup: [pair-setup.md](pair-setup.md).
 
 | Flag | Engine | Default | What it does |
 |---|---|---|---|
-| `--profile default\|fast\|quality` | qwen, deepseek pair, gemma4/nemotron, glm rank | `default` | See [Profiles](#profiles-exact-vs-fast). |
+| `--profile exact\|default\|fast\|quality` | qwen, deepseek pair, gemma4/nemotron, glm rank | `exact` (= `default`) | See [Profiles](#profiles-exact-vs-fast). |
 | `--profile` (bare) | glm rank | off | Kernel timing; preserved alongside named profiles. |
 | `--profile NAME:PROMPT.u32:STEPS` | minimax rank | off | Timed session, not a product profile. |
 | `--allow-pending` | pair apps | off | Lets `fast` apply rows that are not qualified yet. |
