@@ -416,6 +416,48 @@ inline bool applied(Status status) {
     return status == Status::set || status == Status::unqualified || status == Status::provisional;
 }
 
+// FAST gate ledger: one passing FAST quality-gate receipt for one lever value of one engine, kept as data next to the
+// engine's profile table. The ledger, not the row's cell, is what says a value passed its gate, so a checker can see
+// "gated but not selected": the resolved `fast` set must apply every ledger value, and every bit-changing fast cell
+// marked qualified must have a ledger receipt (or belong to a word-qualified FAST bundle, strix/fast_profile.hpp
+// Bundle::profile_receipt). Engines qualified per regime keep a regime ledger of the same shape
+// (strix/profiles/qwen_dense_cuda.hpp `qualified`).
+struct FastGate {
+    std::string_view lever;    // row name
+    std::string_view value;    // the fast value the gate passed
+    std::string_view receipt;  // gate receipt (public docs anchor)
+};
+
+// First ledger defect of `engine` (empty: none). `covered`: row names qualified by a word-qualified bundle receipt.
+inline std::string fast_gate_defect(const Engine& engine, std::span<const FastGate> ledger,
+                                    std::span<const std::string_view> covered = {}) {
+    Inputs request;
+    request.profile = Name::fast;
+    request.env = [](const char*) -> const char* { return nullptr; };
+    const auto resolved = resolve(engine, request);
+    const std::string tag(engine.tag);
+    for (const auto& gate : ledger) {
+        const std::string where = tag + "/" + std::string(gate.lever) + "=" + std::string(gate.value);
+        if (gate.receipt.empty()) return where + ": FAST gate ledger row without a receipt";
+        const Entry* entry = resolved.find(gate.lever);
+        if (entry == nullptr) return where + ": FAST gate receipt names no profile row";
+        if (!applied(entry->status) || entry->value != gate.value)
+            return where + ": gated but not selected by --profile fast (" + std::string(gate.receipt) + ")";
+    }
+    constexpr auto fast = static_cast<unsigned>(Name::fast);
+    for (const auto& row : engine.table) {
+        if (row.kind == Kind::exact || !row.ready[fast] || row.provisional[fast] || row.value[fast].empty() ||
+            row.value[fast] == row.builtin)
+            continue;
+        bool receipted = false;
+        for (const auto& gate : ledger) receipted = receipted || (gate.lever == row.name && gate.value == row.value[fast]);
+        for (const auto name : covered) receipted = receipted || name == row.name;
+        if (!receipted)
+            return tag + "/" + std::string(row.name) + ": bit-changing fast cell marked qualified without a FAST gate receipt";
+    }
+    return {};
+}
+
 // Variables an adapter exports after resolution: every applied profile column, plus every row whose value the
 // resolver canonicalized (`canonical`: e.g. a FAST bundle's expanded members, strix/fast_profile.hpp), so the
 // execution readers see the same values as the receipt, the rank agreement and the cache identity.

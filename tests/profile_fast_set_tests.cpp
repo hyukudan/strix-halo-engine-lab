@@ -6,8 +6,10 @@
 //   - fast resolves to the same set as exact while such a row exists,
 //   - the exact column enables a bit-changing row, or a qualified fast cell carries no receipt,
 //   - a FAST bundle qualified for the word (fast_profile::Bundle::profile_receipt) has a member whose fast cell is not
-//     qualified with the member's value (the gated lever never runs under the word: the original MiniMax defect).
-// Negative fixtures prove the checker fails on both forms of that defect. MiniMax is also checked through its resolver
+//     qualified with the member's value (the gated lever never runs under the word: the original MiniMax defect),
+//   - a FAST gate ledger receipt (strix::profile::FastGate) names a value the resolved fast set does not apply, or a
+//     bit-changing fast cell is marked qualified without a ledger receipt or a word-qualified bundle.
+// Negative fixtures prove the checker fails on every form of that defect (bundle member and single lever). MiniMax is also checked through its resolver
 // (prefill_policy / profile_resolution / prefill_identity under STRIX_MM_PRODUCT_PROFILE alone: no export).
 // Tables: DeepSeek V4.1 pair, GLM pair, MiniMax pair, Qwen Flash-Next HIP and CUDA, CUDA Qwen dense (per-regime
 // qualification rows). Host-only.
@@ -131,6 +133,29 @@ void check_bundle(std::string_view tag, std::span<const p::Lever> rows, const st
     if (!fixture) std::printf("%-22s bundle %s: word-qualified (%s)\n", std::string(tag).c_str(), bundle.profile, bundle.profile_receipt);
 }
 
+// Rows qualified for the word by a bundle receipt (empty when the bundle is a switch only).
+std::vector<std::string_view> bundle_rows(std::span<const p::Lever> rows, const strix::fast_profile::Bundle& bundle) {
+    std::vector<std::string_view> out;
+    if (bundle.profile_receipt == nullptr) return out;
+    for (const auto& m : bundle.members)
+        for (const auto& l : rows)
+            if (l.env == m.env) out.push_back(l.name);
+    return out;
+}
+
+// The FAST gate ledger (strix::profile::FastGate): every receipted value is in the resolved fast set and every
+// qualified bit-changing fast cell has a receipt. An engine adds a `fast_gates` ledger beside its table when a single
+// lever passes its gate; today every qualified bit-changing FAST cell is a member of a word-qualified bundle.
+void check_gates(std::string_view tag, std::span<const p::Lever> rows, std::span<const p::FastGate> ledger,
+                 std::span<const std::string_view> covered = {}) {
+    const p::Engine engine{tag, "", rows};
+    const auto defect = p::fast_gate_defect(engine, ledger, covered);
+    require(defect.empty(), defect);
+    if (!fixture)
+        std::printf("%-22s FAST gate ledger: %zu receipt(s), %zu bundle row(s)\n", std::string(tag).c_str(), ledger.size(),
+                    covered.size());
+}
+
 // The checker itself: both forms of the original MiniMax defect must fail.
 void negative_fixtures() {
     namespace md = strix::minimax::defaults;
@@ -148,6 +173,20 @@ void negative_fixtures() {
     must_fail("qualified fast row with an empty fast cell", [&] { check_table("minimax-fixture-b", rows_b); });
     must_fail("gated bundle member with an empty qualified fast cell",
               [&] { check_bundle("minimax-fixture-b", rows_b, md::kFastBundle); });
+    // The single-lever form (no bundle): the gate receipt is in the ledger, the fast cell is empty, ready[fast]=false.
+    auto rows_c = md::profile_table;
+    for (auto& l : rows_c)
+        if (l.name == "router_wmma") {
+            l.value[kFast] = "";
+            l.ready[kFast] = false;
+        }
+    const p::FastGate gate_c[] = {{"router_wmma", "1", "fixture receipt"}};
+    const std::string_view flash_row[] = {"msa_flash"};
+    must_fail("gated single lever outside a bundle: empty fast cell, ready[fast]=false",
+              [&] { check_gates("minimax-fixture-c", rows_c, gate_c, flash_row); });
+    // The converse: a bit-changing fast cell marked qualified with no ledger receipt and no word-qualified bundle.
+    must_fail("qualified bit-changing fast cell without a FAST gate receipt",
+              [&] { check_gates("minimax-fixture-d", md::profile_table, {}); });
 }
 
 void tier_words() {
@@ -254,6 +293,19 @@ int main() {
     check_table("qwen-cuda", strix::qwen::cuda_profile::table);
     check_table("qwen35-hip-dense", strix::qwen35::hip_profile::table);
     qwen_dense_regimes();
+    {
+        namespace dp = strix::deepseek41::pair_defaults;
+        namespace md = strix::minimax::defaults;
+        const auto ds41_rows = bundle_rows(dp::profile_table, strix::ds41::fast_profile::kBundle);
+        const auto mm_rows = bundle_rows(md::profile_table, md::kFastBundle);
+        check_gates("deepseek41-pair", dp::profile_table, {}, ds41_rows);
+        check_gates("glm-pair", strix::glm::rank_defaults::product_profile_table, {});
+        check_gates("deepseek41-rtx", strix::ds41::rtx::profile::shared_rows(), {});
+        check_gates("minimax-pair", md::profile_table, {}, mm_rows);
+        check_gates("qwen-hip", strix::qwen::profile::table, {});
+        check_gates("qwen-cuda", strix::qwen::cuda_profile::table, {});
+        check_gates("qwen35-hip-dense", strix::qwen35::hip_profile::table, {});
+    }
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
