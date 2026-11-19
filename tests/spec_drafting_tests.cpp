@@ -491,7 +491,9 @@ double device_wall(std::uint32_t rows, double ctx, double shared = 1.0, double k
     return 12.2 + (rows >= 9 ? 1.1 : 0.0) + (rows >= 17 ? 4.0 : 0.0) + kappa * (ctx / 1024.0) * (1.0 + shared * (r - 1.0)) + 0.08;
 }
 // mode: spec::set_context_cost value ("off" = the previous context-blind seeds, "online" = the default fit, "0.0699" = fixed).
-FrontierRun replay_ctx(const CtxCase& c, const std::string& mode, std::uint64_t seed, double shared = 1.0, int passes = 600) {
+// wall_scale: the device runs this much slower (a warmer run of the same binary); ks: the chosen k per pass.
+FrontierRun replay_ctx(const CtxCase& c, const std::string& mode, std::uint64_t seed, double shared = 1.0, int passes = 600,
+                       double wall_scale = 1.0, std::vector<std::uint32_t>* ks = nullptr) {
     auto config = form(-1);
     config.learn_costs = false;  // BlockConfig::fixed_costs
     sp::set_context_cost(config, mode);
@@ -499,7 +501,7 @@ FrontierRun replay_ctx(const CtxCase& c, const std::string& mode, std::uint64_t 
     for (std::uint32_t r = 1; r <= 32; ++r) a.seed_cost(r, 13.30 + 0.113 * double(r - 1));
     std::vector<double> seeded_draft;
     for (std::uint32_t k = 1; k <= 15; ++k) seeded_draft.push_back(0.494 * double(k));
-    const auto wall = [&](std::uint32_t rows) { return device_wall(rows, c.ctx, shared); };
+    const auto wall = [&](std::uint32_t rows) { return wall_scale * device_wall(rows, c.ctx, shared); };
     Rng rng{seed};
     FrontierRun run;
     std::vector<std::uint32_t> emitted;
@@ -515,6 +517,7 @@ FrontierRun replay_ctx(const CtxCase& c, const std::string& mode, std::uint64_t 
             ++run.model;
             run.k_sum += d.k;
         }
+        if (ks) ks->push_back(d.source == sp::Source::model ? d.k : 0U);
         const double draft = d.source == sp::Source::model ? c.draft * double(d.k) : 0.0;
         emitted.assign(acc + 1, 1U);
         a.observe({d.source, 0, d.k, acc, d.rows, wall(d.rows), draft, in.context}, emitted);
@@ -707,6 +710,27 @@ void cost_fit_tests() {
         };
         const auto off = run("off"), on = run("online");
         SP_CHECK(off.tokens == on.tokens && off.ms == on.ms && off.k_sum == on.k_sum, "walls == seeds: online must decide as off");
+    }
+    // Exactness gates that compare k (K/V-only vs full MTP catch-up, close_spec w0 / w0k): two runs of one binary differ
+    // only in their walls (w0 17.185 vs w0k 17.281 ms per step, +0.56 %). off / fixed: the k sequence is a function of the
+    // seeds and the acceptance history alone, whatever the walls; online: priced from the walls, it may move at 28K
+    // (identified context), so such a gate must run off / fixed.
+    {
+        const auto& c = ctx_cases[0];  // code 28K
+        bool online_moved = false;
+        for (const double scale : {1.0056, 1.02, 1.05}) {
+            for (const char* mode : {"off", "0.0699"}) {
+                std::vector<std::uint32_t> a, b;
+                replay_ctx(c, mode, 11, 1.0, 300, 1.0, &a);
+                replay_ctx(c, mode, 11, 1.0, 300, scale, &b);
+                SP_CHECK(!a.empty() && a == b, "%s: k sequence moved with walls x%.4f", mode, scale);
+            }
+            std::vector<std::uint32_t> a, b;
+            replay_ctx(c, "online", 11, 1.0, 300, 1.0, &a);
+            replay_ctx(c, "online", 11, 1.0, 300, scale, &b);
+            online_moved = online_moved || a != b;
+        }
+        SP_CHECK(online_moved, "online: walls x1.0056..1.05 never moved k (the gate's premise no longer holds; recheck)");
     }
     // Learned costs (DS41 dspark, Gemma4, HIP 'learned'): measured walls price windows; the fit never applies there.
     {

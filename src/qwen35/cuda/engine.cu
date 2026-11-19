@@ -1439,6 +1439,18 @@ struct CudaEngine::Impl {
         CK(cudaGetLastError());
         mtp_body(hidden_dev, rows, true);
     }
+    // MTP K/V rows [pos0, pos0 + rows) to the host, head-major (cache layout [kv_heads][max_positions][head_dim]).
+    void mtp_kv_read(std::uint32_t pos0, std::uint32_t rows, std::uint16_t* k_host, std::uint16_t* v_host) {
+        if (!mtp_ok) throw std::runtime_error("mtp_kv_read: no MTP tensors loaded");
+        if (rows == 0 || pos0 > opt.max_positions || rows > opt.max_positions - pos0)
+            throw std::runtime_error("mtp_kv_read: rows outside the cache");
+        const std::size_t D = c.head_dim, row_bytes = D * sizeof(__nv_bfloat16);
+        const std::size_t width = static_cast<std::size_t>(rows) * row_bytes, pitch = opt.max_positions * row_bytes;
+        CK(cudaStreamSynchronize(s));
+        CK(cudaMemcpy2DAsync(k_host, width, mkc + pos0 * D, pitch, width, c.kv_heads, cudaMemcpyDeviceToHost, s));
+        CK(cudaMemcpy2DAsync(v_host, width, mvc + pos0 * D, pitch, width, c.kv_heads, cudaMemcpyDeviceToHost, s));
+        CK(cudaStreamSynchronize(s));
+    }
     CudaEngine::MtpOut mtp(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0, bool want_top) {
         if (!mtp_ok) throw std::runtime_error("mtp_forward: no MTP tensors loaded");
         if (rows == 0 || rows > RM) throw std::runtime_error("mtp_forward: bad rows/pos0");
@@ -1876,6 +1888,9 @@ CudaEngine::MtpOut CudaEngine::mtp_forward(const std::uint32_t* next_tokens, con
 }
 void CudaEngine::mtp_kv(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0) {
     p_->mtp_kv(next_tokens, hidden_dev, rows, pos0);
+}
+void CudaEngine::mtp_kv_read(std::uint32_t pos0, std::uint32_t rows, std::uint16_t* k_host, std::uint16_t* v_host) const {
+    p_->mtp_kv_read(pos0, rows, k_host, v_host);
 }
 CudaEngine::MtpOut CudaEngine::mtp_step_fed(const std::uint32_t* in_host, std::uint32_t in_slot, std::uint32_t out_slot,
                                             const float* hidden_dev, std::uint32_t pos, bool want_top) {

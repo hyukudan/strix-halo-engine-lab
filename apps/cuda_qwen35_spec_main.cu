@@ -118,7 +118,9 @@ int main(int argc, char** argv) {
         //   f = draft head rows / vocab (1 = full head). Defaults = PRO 6000 receipts of this identity (cc_decode3-STATE.md).
         //   --cost-kv online|off|KV = the context cost of those arms (spec::set_context_cost, shared with every binder):
         //   online (default) fits it from this device's verify walls (ArbiterConfig::cost_fit), off = context-blind seeds
-        //   (the previous form), KV = fixed ms per verify row per 1,024 context positions (deterministic A/B).
+        //   (the previous form), KV = fixed ms per verify row per 1,024 context positions (deterministic A/B). Only off / KV
+        //   make k a pure function of the seeds and the acceptance history: online prices k from this run's measured walls
+        //   (Arbiter::fit_fold), so two runs of one binary may choose a different k at a marginal step (ids never change).
         double cm_v1 = 13.30, cm_vrow = 0.113, cm_da = 0.370, cm_db = 0.454;
         std::string cost_kv = "online";
         std::vector<std::string> arms{"new"};
@@ -128,8 +130,10 @@ int main(int argc, char** argv) {
         std::uint32_t idle_ms = 0;  // host sleep (GPU idle) before every spec run: thermal gaps inside one ticket
         bool cost_table = false, check = true, graphs = true, seed_costs = true, turbo_lm_head = true, pdl = false;
         // --prefill-route large: opt-in. --mtp-catchup kv = default (K/V-only MTP catch-up where the engine has the hook;
-        // its device gate compares ids / steps / k histogram with full), full = the off switch.
+        // its device gate compares ids / steps / k histogram with full under --cost-kv off and the MTP K/V bytes through
+        // --mtp-kv-dump), full = the off switch.
         bool pf_large = false, kv_catchup = true;
+        std::string mtp_kv_dump;  // --mtp-kv-dump DIR: after each spec run, the MTP K/V of the prompt rows (raw bf16 bits)
         std::uint32_t pf_chunk = 0;                 // --prefill-chunk N (large route; 0 = EngineOptions default)
         q::TurboWeights turbo = q::TurboWeights::off;
         for (int i = 1; i < argc; ++i) {
@@ -210,6 +214,7 @@ int main(int argc, char** argv) {
             else if (a == "--pairs") { pairs = strix::core::parse_u32(next()); if (pairs == 0) throw std::runtime_error("--pairs >= 1"); }
             else if (a == "--ids-out") ids_out = next();
             else if (a == "--spec-trace") spec_trace = next();
+            else if (a == "--mtp-kv-dump") mtp_kv_dump = next();
             else if (a == "--turbo-weights") {
                 const std::string v = next();
                 if (v != "off" && v != "native" && v != "onfly" && v != "converted") throw std::runtime_error("--turbo-weights expects off|native|onfly|converted");
@@ -230,7 +235,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error("usage: (--model F.gguf | --synthetic-full bf16|q8_0 [--layers N]) [--prompt-ids a,b | --prompt-file F | --prompt-len N] "
                                      "[--n-gen N] [--sources copy,chain,hybrid|none] [--oracle ACC] [--cost-table] [--check 0|1] [--max-block 1..32] "
                                      "[--frontier N | --arms 0,8,new,sub,new15,sub15 --pairs P] [--draft-core G] [--draft-fallback G] [--draft-pack F1,F2] [--idle-ms MS] [--ids-out DIR] [--spec-trace DIR] "
-                                     "[--prefill-route windows|large [--prefill-chunk N] [--prefill-arith A] [--prefill-gdn G] [--prefill-attn8 on|off]] [--mtp-catchup full|kv]  (--prompt-file accepts F1,F2,...: one engine load)");
+                                     "[--prefill-route windows|large [--prefill-chunk N] [--prefill-arith A] [--prefill-gdn G] [--prefill-attn8 on|off]] [--mtp-catchup full|kv] [--mtp-kv-dump DIR]  (--prompt-file accepts F1,F2,...: one engine load)");
         // (label, ids) per prompt; --prompt-file takes a comma list (label = file stem), each prompt runs serial + spec arms.
         std::vector<std::pair<std::string, std::vector<std::uint32_t>>> prompts;
         if (!ids_arg.empty()) prompts.emplace_back(label, parse_ids(ids_arg));
@@ -572,6 +577,28 @@ int main(int argc, char** argv) {
                 if (arm.subset) std::printf("draft[%s]: %s\n", tag.c_str(), draft_rows->describe().c_str());
                 E->set_draft_rows(nullptr);
                 if (!ids_out.empty()) write_ids(tag.substr(0, tag.find('/')) + ".spec-" + arm.tag + "-p" + std::to_string(pair) + ".ids", out);
+                if (!mtp_kv_dump.empty() && S.has_chain()) {
+                    // The prompt rows of the MTP K/V (the only rows a K/V-only catch-up chunk writes; decode catch-up ends
+                    // in a full call in both modes): raw bf16 bits K then V, head-major; FNV-1a 64 of each printed.
+                    const auto P = static_cast<std::uint32_t>(prompt.size());
+                    const std::size_t n = std::size_t(E->config().kv_heads) * P * E->config().head_dim;
+                    std::vector<std::uint16_t> kb(n), vb(n);
+                    E->mtp_kv_read(0, P, kb.data(), vb.data());
+                    const auto fnv = [](const std::vector<std::uint16_t>& b) {
+                        std::uint64_t h = 1469598103934665603ull;
+                        for (const std::uint16_t w : b)
+                            for (int i = 0; i < 2; ++i) h = (h ^ ((w >> (8 * i)) & 0xffu)) * 1099511628211ull;
+                        return h;
+                    };
+                    const std::string f = mtp_kv_dump + "/" + tag.substr(0, tag.find('/')) + ".mtpkv-" + arm.tag + "-p" + std::to_string(pair) + ".bin";
+                    std::ofstream o(f, std::ios::binary);
+                    o.write(reinterpret_cast<const char*>(kb.data()), std::streamsize(n * 2));
+                    o.write(reinterpret_cast<const char*>(vb.data()), std::streamsize(n * 2));
+                    if (!o) throw std::runtime_error("cannot write " + f);
+                    std::printf("mtpkv[%s]: rows %u kv_heads %u head_dim %u catch-up %s k %016llx v %016llx\n", tag.c_str(), P,
+                                E->config().kv_heads, E->config().head_dim, kv_catchup ? "kv" : "full",
+                                (unsigned long long)fnv(kb), (unsigned long long)fnv(vb));
+                }
                 if (!ref.empty()) {
                     std::printf("EXACT[%s]: %s (%zu tokens compared, %zu mismatches)\n", tag.c_str(), bad == 0 ? "PASS" : "FAIL",
                                 std::min(out.size(), ref.size()), bad);

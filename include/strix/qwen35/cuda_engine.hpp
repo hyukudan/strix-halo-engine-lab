@@ -217,6 +217,10 @@ public:
     // kernels and operands up to kv_store) and computes nothing else; no output. For catch-up rows whose block output and
     // draft nobody reads (strix/spec/mtp_chain.hpp MtpKvEngine).
     void mtp_kv(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0);
+    // Witness of the MTP K/V (exactness gates: K/V-only vs full catch-up): copies cache rows [pos0, pos0 + rows) of every
+    // K/V head to the host as bf16 bit patterns, head-major [kv_heads][rows][head_dim] (k_host, v_host: kv_heads * rows *
+    // head_dim each). Synchronizes the stream; not for the decode path.
+    void mtp_kv_read(std::uint32_t pos0, std::uint32_t rows, std::uint16_t* k_host, std::uint16_t* v_host) const;
     // Device-fed MTP chain (strix/spec/mtp_chain.hpp): one row at `pos` whose input id is *in_host (by value) or, with
     // in_host null, the id in feed slot in_slot on the device; want_top also stores the row's draft id in slot out_slot.
     // The chain enqueues a whole draft without host round trips and reads the ids once (mtp_feed_read). Same kernels and

@@ -125,7 +125,9 @@ public:
     [[nodiscard]] std::uint64_t host_reads() const { return reads_; }  // synchronizing id reads issued by the chain
     // K/V-only catch-up (engines with MtpKvEngine): off = the incumbent calls (rollback); on = catch-up chunks whose outputs
     // nobody reads only write the MTP K/V (same K/V bits, so the same drafts). On by default where the engine has the hook;
-    // its device gate compares ids, steps and the k histogram with the full catch-up.
+    // its device gate compares the MTP K/V bytes of the prompt rows, ids, steps and the k histogram with the full catch-up
+    // under a wall-independent controller (CUDA sub15d --cost-kv off: an online context cost prices k from the run's own
+    // verify walls, so k may differ between any two runs; the K/V and the drafts do not).
     void set_kv_catchup(bool on) { kv_catchup_ = on; }
     [[nodiscard]] bool kv_catchup() const { return MtpKvEngine<Engine> && kv_catchup_; }
     [[nodiscard]] std::uint64_t kv_calls() const { return kv_calls_; }  // K/V-only catch-up calls (not in calls())
