@@ -218,7 +218,7 @@ public:
     // With the exact decode attention: exact many-row prefill matches non-a8 decode; a8 prefill matches g4-a8-v1 decode.
     // EXL3 keeps its own core order; WMMA prefill never matches decode rows.
     bool prefill_matches_decode() const override { return prefill_matches_decode_; }
-    PrefillRows prefill_rows(KvTxn& transaction, std::span<const std::uint32_t> tokens, bool hidden, bool taps) override {
+    PrefillRows prefill_rows(KvTxn& transaction, std::span<const std::uint32_t> tokens, HiddenDemand hidden, bool taps) override {
         if (!prefill_) throw std::logic_error("many-row prefill is off");
         auto chunk = prefill_->forward(transaction,tokens,false,false,hidden,taps,true);
         PrefillRows out;
@@ -226,7 +226,7 @@ public:
         out.tap_view = chunk.pinned_taps; out.hidden_view = chunk.pinned_hidden; out.levers = chunk.levers; out.host_ms = chunk.host_ms;
         return out;
     }
-    std::vector<PrefillRows> prefill_rows_batch(std::span<const PrefillItem> items, bool hidden, bool taps) override {
+    std::vector<PrefillRows> prefill_rows_batch(std::span<const PrefillItem> items, HiddenDemand hidden, bool taps) override {
         if (!prefill_) throw std::logic_error("many-row prefill is off");
         std::vector<prefill::PrefillSegment> segments;
         for (const auto& item : items) segments.push_back({item.transaction,item.tokens});

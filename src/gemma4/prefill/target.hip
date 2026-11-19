@@ -562,15 +562,15 @@ void DevicePrefill::use_canonical_kernel(bool enabled) {
     impl_->stats.canonical_kernel = impl_->stats.attention == AttentionMode::canonical && enabled;
 }
 void DevicePrefill::keep_last_row(bool keep) { impl_->keep_last_row = keep; }
-ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned> input, bool all_logits, bool logits, bool hidden,
+ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned> input, bool all_logits, bool logits, HiddenDemand hidden,
                                    bool taps, bool views) {
     const PrefillSegment one{&transaction, input};
     return std::move(pass({&one, 1}, all_logits, logits, hidden, taps, views).front());
 }
-std::vector<ChunkResult> DevicePrefill::forward_batch(std::span<const PrefillSegment> segments, bool hidden, bool taps, bool views) {
+std::vector<ChunkResult> DevicePrefill::forward_batch(std::span<const PrefillSegment> segments, HiddenDemand hidden, bool taps, bool views) {
     return pass(segments, false, false, hidden, taps, views);
 }
-std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> segments, bool all_logits, bool logits, bool hidden,
+std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> segments, bool all_logits, bool logits, HiddenDemand demand,
                                              bool taps, bool views) {
     using Clock = std::chrono::steady_clock;
     const auto entered = Clock::now();
@@ -597,6 +597,11 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
         n += rows;
     }
     if (n > chunk_rows) throw std::invalid_argument("prefill row or position bounds");
+    // Hidden rows exported: every row (all_rows), or each segment's last row alone (last_committed: one per segment).
+    // Only a single-segment last_committed pass narrows (the plan keeps the pass's last row, not each segment's).
+    const bool hidden = demand != HiddenDemand::none, hidden_every = demand == HiddenDemand::all_rows,
+               hidden_last = demand == HiddenDemand::last_committed;
+    const auto hidden_floats = std::size_t(hidden_every ? n : unsigned(parts.size())) * c.hidden;
     // Announced before any device work: no graph capture starts on another thread until this pass returns.
     const gpu::PrefillInFlight in_flight;
     // KV_QUEUE: the commit publishes this pass's rows on the queue that wrote them.
@@ -634,8 +639,8 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
     const auto liveness = !stage_a && !stage_b && lever_enabled(lever_last_kv)
         ? lv::plan(c.layers, [&](unsigned l) { return c.layer[l].producer == l; },
                    {.taps = want_taps ? std::span<const std::uint32_t>(tap_layers) : std::span<const std::uint32_t>{},
-                    .every_row = all_logits || hidden,
-                    .head_row = logits || b.keep_last_row,
+                    .every_row = all_logits || hidden_every || (hidden_last && parts.size() > 1),
+                    .head_row = logits || b.keep_last_row || hidden_last,
                     .tail_row_invariant = b.stats.attention == AttentionMode::canonical && b.stats.linears == Linears::exact})
         : lv::Plan{c.layers, c.layers, false, false};
     if (liveness.narrows()) result.levers |= lever_last_kv;
@@ -643,6 +648,11 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
     unsigned live = n, read_base = 0;
     Part tail_part{};
     std::span<const Part> live_parts(parts);
+    // b.x row holding segment s's last row after the final norm: row live - 1 for one segment (row 0 once narrowed),
+    // the segment's own last row otherwise (a multi-segment pass keeps every row).
+    const auto hidden_row = [&](std::size_t s) {
+        return parts.size() == 1 ? std::size_t(live - 1) : std::size_t(parts[s].first) + parts[s].rows - 1;
+    };
     try {
         b.queue_io = queue_io_enabled(); b.staged = 0;
         for (const auto& p : parts) {
@@ -989,8 +999,13 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
             checked(hipMemcpyAsync(b.last_row.data(), b.x.as<float>() + std::size_t(live - 1) * c.hidden, std::size_t(c.hidden) * sizeof(float),
                                    hipMemcpyDeviceToDevice, b.queue));
         }
-        if (pinned && hidden)
-            checked(hipMemcpyAsync(b.pinned_hidden, b.x.data(), std::size_t(n) * c.hidden * sizeof(float), hipMemcpyDeviceToHost, b.queue));
+        // last_committed: row live - 1 of each segment's end (live = 1 once narrowed: the pass's last row is row 0).
+        if (pinned && hidden_every)
+            checked(hipMemcpyAsync(b.pinned_hidden, b.x.data(), hidden_floats * sizeof(float), hipMemcpyDeviceToHost, b.queue));
+        else if (pinned && hidden_last)
+            for (std::size_t s = 0; s < parts.size(); ++s)
+                checked(hipMemcpyAsync(b.pinned_hidden + s * c.hidden, b.x.as<float>() + hidden_row(s) * c.hidden,
+                                       std::size_t(c.hidden) * sizeof(float), hipMemcpyDeviceToHost, b.queue));
         gpu::synchronize(b.queue);
         if (taps_issued) checked(hipEventSynchronize(b.copied));
         // Stage B consumed the seam frame (its copies finished above): the slot may take the next chunk.
@@ -1023,8 +1038,13 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
         }
         if (taps_checked) result.levers |= lever_device_finite;
         if (all_logits) { result.all_logits.resize(std::size_t(n) * c.vocab); b.get(result.all_logits.data(), b.logits, result.all_logits.size() * sizeof(float)); }
-        if (hidden && pinned) result.pinned_hidden = {b.pinned_hidden, std::size_t(n) * c.hidden};
-        else if (hidden) { result.hidden.resize(std::size_t(n) * c.hidden); b.get(result.hidden.data(), b.x, result.hidden.size() * sizeof(float)); }
+        if (hidden && pinned) result.pinned_hidden = {b.pinned_hidden, hidden_floats};
+        else if (hidden_every) { result.hidden.resize(hidden_floats); b.get(result.hidden.data(), b.x, result.hidden.size() * sizeof(float)); }
+        else if (hidden_last) {
+            result.hidden.resize(hidden_floats);
+            for (std::size_t s = 0; s < parts.size(); ++s)
+                b.get(result.hidden.data() + s * c.hidden, b.x, std::size_t(c.hidden) * sizeof(float), hidden_row(s) * c.hidden * sizeof(float));
+        }
         for (const auto& p : parts) p.tx->evaluated = true;
         // The pass completed with a zero failure word: its flash pack rows are valid (as fp16_mirror_confirm).
         for (const auto& p : parts)
@@ -1047,7 +1067,7 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
         auto& r = out[s];
         r.rows = p.rows; r.vocab = result.vocab; r.tap_width = result.tap_width; r.levers = result.levers; r.host_ms = result.host_ms;
         const auto t0 = std::size_t(p.first) * result.tap_width, tn = std::size_t(p.rows) * result.tap_width;
-        const auto h0 = std::size_t(p.first) * c.hidden, hn = std::size_t(p.rows) * c.hidden;
+        const auto h0 = (hidden_last ? s : std::size_t(p.first)) * c.hidden, hn = (hidden_last ? 1U : std::size_t(p.rows)) * c.hidden;
         if (!result.pinned_taps.empty()) r.pinned_taps = result.pinned_taps.subspan(t0, tn);
         if (!result.taps.empty()) r.taps.assign(result.taps.begin() + std::ptrdiff_t(t0), result.taps.begin() + std::ptrdiff_t(t0 + tn));
         if (!result.pinned_hidden.empty()) r.pinned_hidden = result.pinned_hidden.subspan(h0, hn);
