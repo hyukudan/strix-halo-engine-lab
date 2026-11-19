@@ -5173,6 +5173,32 @@ warp for their stage. The stage holds the same bytes at the same offsets and eve
 - **Measured gain:** Operator bench reported for RTX PRO 6000, 4,096 rows, no model, strict ABAB in one process: bulk / lsu = 0.934 gate/up GLU, 0.921 down, 0.929 down (residual), 0.850 o, 0.858 o (residual), 0.846 k/v, 0.977 q/k/v. The lsu form is reported as neutral versus main within noise on 7 shapes. These are operator-level results, not an end-to-end prefill qualification; retain lsu by default until that is measured.
 - **Implementation / evidence:** [tile contract](../include/strix/cuda/core/nvfp4_tile.hpp), [sm_120 kernel](../src/cuda/core/arch/sm120/nvfp4_tile.cuh), [dense_big binding](../src/cuda_core/dense/dense_big.cu), [fixture](../tests/nvfp4_tile/tile_device.cu)
 
+<a id="qwen-dense-cuda-pf-tf32-h16"></a>
+
+### Qwen dense 27B CUDA prefill: TF32 GDN chunk scan and BF16 FFN hidden rows (FAST, opt-in)
+
+**Engine:** `qwen-rtx` (dense 27B). **Control:** `--prefill-gdn chunk16tc` and `--prefill-hid bf16` on `strix-cuda-qwen35-decode` (large prefill route). **Default:** off (`chunk16` / `f32`); `--profile fast` does not turn either on until its quality gate passes. **Class:** FAST (bit-changing, quality-gated).
+
+Two traits of shared kernel families, no new family:
+
+- `chunk16tc` (`gdn-chunk16-tf32-v1`, identity `-gdnc16t`): the K2 scan of the chunked GDN prefill
+  (`src/cuda_core/gdn/gdn_chunk.cu`) runs its products on `mma.m16n8k8.tf32` with FP32 accumulation; the FP32 state stays in
+  accumulator fragments for the whole launch (a key permutation inside each 8-key block makes the C fragment of one product
+  the A fragment of the next). Only product operands are rounded to TF32; sums, decays and the state stay FP32; the chunks
+  and the K1 workspace are those of `chunk16`.
+- `bf16` hidden rows (`nvfp4-tile-h16-v1`, identity `-h16`): the fused gate/up epilogue of the FAST4 tile GEMM stores
+  H = silu(gate) * up as BF16 (round to nearest even) and the down operand is quantised from those rows by the same
+  quantiser core (exact widening). A compile-time trait of the tile kernels: the FP32 instantiations carry no H16 code.
+
+- **Preconditions:** decode CLI large prefill; `bf16` hidden rows need `--prefill-arith fast4` and NVFP4 FFN weights.
+- **Automatic selection:** none (no `qualified` regime in `include/strix/profiles/qwen_dense_cuda.hpp`).
+- **Exactness evidence:** `--profile exact` cannot reach either trait (host test `strix-qwen35-dense-profile-host-tests`);
+  the FP32 scan kernels and the FP32 tile instantiations are machine-code identical to the code without the traits.
+  Quality gate: not passed yet.
+- **Off switch:** `--prefill-gdn chunk16` (or `serial`), `--prefill-hid f32`.
+- **Measured gain:** not yet measured end to end (timed rounds follow the gate).
+- **Implementation / evidence:** [GDN chunk family](../src/cuda_core/gdn/gdn_chunk.cu), [tile family](../src/cuda/core/arch/sm120/nvfp4_tile.cuh), [GDN host test](../tests/gdn_chunk/gdn_chunk_host.cpp), [tile host test](../tests/nvfp4_tile/tile_host.cpp), [profile test](../tests/qwen35_dense_profile_host_tests.cpp)
+
 ## Platform (kernel)
 
 <a id="platform-perfopt"></a>
