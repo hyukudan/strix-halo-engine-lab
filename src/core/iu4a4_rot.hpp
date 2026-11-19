@@ -46,6 +46,9 @@ static_assert(std::int64_t{kBlock} * 49 * kUMax < (std::int64_t{1} << 24), "a bl
 // Activation side, one row of `in` inputs (in % kBlock == 0, in <= kMaxInputs). `y` holds the row and is rotated in
 // place; codes[in], u[in / kGroupA]. Returns base_m.
 STRIX_ROT_HD inline float quantise_row(float* y, unsigned in, std::int8_t* codes, std::uint8_t* u) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
     float amax_m = 0.0f, bad = 0.0f;
     bool finite = true;
     for (unsigned b = 0; b < in; b += kBlock) a4_tiles::fwht128(y + b);
@@ -106,8 +109,12 @@ STRIX_ROT_HD inline void put_code(std::uint8_t* packed, unsigned k, unsigned n, 
 
 // Weight side, one column n of one block b, from the g64 pack (codes + fp16 scales [N][K/64] as raw bits) into the
 // rotated pack (same tile layout) + FP32 step wstep[n * (K / kBlock) + b]. Load-time; host or one device thread.
-STRIX_ROT_HD inline void requantise_block(const std::uint8_t* src, const std::uint16_t* src_scales, unsigned in, unsigned outputs,
-                                         unsigned n, unsigned b, std::uint8_t* dst, float* wstep) {
+// requantise_codes writes the codes and returns the step (a device kernel stores it in its own layout).
+STRIX_ROT_HD inline float requantise_codes(const std::uint8_t* src, const std::uint16_t* src_scales, unsigned in, unsigned outputs,
+                                          unsigned n, unsigned b, std::uint8_t* dst) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
     float v[kBlock];
     for (unsigned i = 0; i < kBlock; ++i) {
         const unsigned k = b * kBlock + i;
@@ -119,12 +126,19 @@ STRIX_ROT_HD inline void requantise_block(const std::uint8_t* src, const std::ui
     for (unsigned i = 0; i < kBlock; ++i) amax = a4_tiles::fabs_(v[i]) > amax ? a4_tiles::fabs_(v[i]) : amax;
     const float step = integer_math::a4_step_f(amax);
     for (unsigned i = 0; i < kBlock; ++i) put_code(dst, b * kBlock + i, n, outputs, integer_math::a4_code_f(v[i], step));
-    wstep[std::size_t(n) * (in / kBlock) + b] = step;
+    return step;
+}
+STRIX_ROT_HD inline void requantise_block(const std::uint8_t* src, const std::uint16_t* src_scales, unsigned in, unsigned outputs,
+                                         unsigned n, unsigned b, std::uint8_t* dst, float* wstep) {
+    wstep[std::size_t(n) * (in / kBlock) + b] = requantise_codes(src, src_scales, in, outputs, n, b, dst);
 }
 
 // The bit-defined dot of one output (row codes/u/base, rotated column n of the requantised pack).
 STRIX_ROT_HD inline float dot(const std::int8_t* acodes, const std::uint8_t* u, float base, const std::uint8_t* wpack,
                              const float* wstep, unsigned in, unsigned outputs, unsigned n) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
     std::int32_t c = 0;
     float acc = 0.0f;
     for (unsigned b = 0; b < in / kBlock; ++b) {
