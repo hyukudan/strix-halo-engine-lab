@@ -82,7 +82,9 @@ __device__ __forceinline__ _Float16 to_f16_value(float v) {
 // of one column block are adjacent in dispatch order, so they read its weight slice while it is L2 / MALL resident instead
 // of re-streaming it from DRAM once per R rows. Stored rows are bitwise those of run() with <= 16 rows (row independence
 // above); xh must hold the rows rounded up to R (pad rows are read, never stored).
-template <unsigned R, unsigned MaxG, unsigned Rc, bool UX, bool Grid2 = false>
+// Share = true (cols_kernel only): store at (out_stride, out_quad) instead of (outputs, quad); false compiles to the
+// full-launch store (the share parameters are dead).
+template <unsigned R, unsigned MaxG, unsigned Rc, bool UX, bool Grid2 = false, bool Share = false>
 __device__ __forceinline__ void block_body(const std::uint8_t* w, unsigned inputs, unsigned outputs, const _Float16* xh, float* out,
                                            unsigned nrows, unsigned quad, unsigned out_stride, unsigned out_quad) {
     constexpr unsigned S = kWaves, KT = MaxG * 4U;
@@ -123,7 +125,8 @@ __device__ __forceinline__ void block_body(const std::uint8_t* w, unsigned input
         float sum = part[(r * S) * 64U + c];
 #pragma unroll
         for (unsigned s = 1; s < S; ++s) sum += part[(r * S + s) * 64U + c];
-        out[std::size_t(r) * out_stride + out_quad * 64U + c] = sum;
+        if constexpr (Share) out[std::size_t(r) * out_stride + out_quad * 64U + c] = sum;
+        else out[std::size_t(r) * outputs + quad * 64U + c] = sum;
     }
 }
 
@@ -141,7 +144,7 @@ __global__ void __launch_bounds__(32 * kWaves) kernel(const std::uint8_t* w, uns
 template <unsigned R, unsigned MaxG, unsigned Rc = R, bool UX = false>
 __global__ void __launch_bounds__(32 * kWaves) cols_kernel(const std::uint8_t* w, unsigned inputs, unsigned outputs, const _Float16* xh,
                                                            float* out, unsigned nrows, unsigned quad0, unsigned out_stride) {
-    block_body<R, MaxG, Rc, UX>(w, inputs, outputs, xh, out, nrows, quad0 + blockIdx.x, out_stride, blockIdx.x);
+    block_body<R, MaxG, Rc, UX, false, true>(w, inputs, outputs, xh, out, nrows, quad0 + blockIdx.x, out_stride, blockIdx.x);
 }
 
 // Projection group (decode step plan, strix/decode_projection_group.hpp): projections of the same prepared rows xh
