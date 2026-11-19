@@ -94,6 +94,7 @@ int main(int argc, char** argv) {
         o.verify_rows = hb::rows::kMaxVerifyRows;
         std::vector<std::pair<std::string, std::vector<std::uint32_t>>> contents;  // (label, prompt ids)
         std::uint32_t reps = 10, spec_n = 0, max_rows = hb::rows::kMaxVerifyRows;
+        bool union_ab = false;  // bench: rows check + strict ABAB verify timing, expert union off / on (one load)
         std::vector<double> verify_ms;
         double gbps = 207.0;
         for (int i = 1; i < argc; ++i) {
@@ -113,6 +114,7 @@ int main(int argc, char** argv) {
             else if (a == "--max-rows" && more) max_rows = static_cast<std::uint32_t>(std::stoul(argv[++i]));
             else if (a == "--verify-ms" && more) verify_ms = read_list(argv[++i]);
             else if (a == "--gbps" && more) gbps = std::stod(argv[++i]);
+            else if (a == "--union-ab") union_ab = true;
             else if (!a.empty() && a[0] != '-') o.parts.emplace_back(a);
             else throw std::invalid_argument("unknown argument " + a);
         }
@@ -140,7 +142,10 @@ int main(int argc, char** argv) {
             }
             for (std::uint32_t i = 0; i < G; ++i) f.rewind();
             std::uint32_t equal = 0, total = 0;
+            const std::vector<int> arms = union_ab ? std::vector<int>{0, 1} : std::vector<int>{-1};
+            for (const int arm : arms) {
             for (const std::uint32_t R : {1U, 2U, 4U, 8U}) {
+                if (arm >= 0) f.set_rows_expert_union(arm == 1);
                 f.forward_rows(std::span<const std::uint32_t>(t.data(), R), true);
                 const auto& lg = f.rows_logits();
                 const auto g = f.rows_greedy();
@@ -155,7 +160,9 @@ int main(int argc, char** argv) {
                 f.commit_rows(0);
                 equal += bits;
                 total += R;
-                std::printf("ROWS R%u logits_bitwise %u/%u greedy %u/%u\n", R, bits, R, ids, R);
+                std::printf("ROWS%s R%u logits_bitwise %u/%u greedy %u/%u\n", arm < 0 ? "" : arm == 1 ? " union" : " perrow", R, bits, R, ids,
+                            R);
+            }
             }
             std::printf("ROWS_BITWISE %u/%u\n", equal, total);
             std::vector<double> step_ms;
@@ -167,13 +174,19 @@ int main(int argc, char** argv) {
             }
             std::printf("step median %.2f ms (min %.2f)\n", median(step_ms), *std::min_element(step_ms.begin(), step_ms.end()));
             for (const std::uint32_t R : {1U, 2U, 4U, 8U}) {
-                std::vector<double> ms;
-                for (std::uint32_t k = 0; k < reps; ++k) {
-                    const double t0 = now_ms();
-                    f.forward_rows(std::span<const std::uint32_t>(t.data(), R), false);
-                    ms.push_back(now_ms() - t0);
-                    f.commit_rows(0);
-                }
+                std::vector<double> ms, ms_off;  // union_ab: strict ABAB per rep (off, on); ms = the arm the seeds use (on)
+                for (std::uint32_t k = 0; k < reps; ++k)
+                    for (const int arm : arms) {
+                        if (arm >= 0) f.set_rows_expert_union(arm == 1);
+                        const double t0 = now_ms();
+                        f.forward_rows(std::span<const std::uint32_t>(t.data(), R), false);
+                        (arm == 0 ? ms_off : ms).push_back(now_ms() - t0);
+                        f.commit_rows(0);
+                    }
+                if (union_ab)
+                    std::printf("verify R%u perrow median %.2f ms union median %.2f ms (min %.2f / %.2f) delta %.2f ms\n", R, median(ms_off),
+                                median(ms), *std::min_element(ms_off.begin(), ms_off.end()), *std::min_element(ms.begin(), ms.end()),
+                                median(ms) - median(ms_off));
                 std::printf("verify R%u median %.2f ms (min %.2f) = %.2f ms/row\n", R, median(ms), *std::min_element(ms.begin(), ms.end()),
                             median(ms) / R);
                 curve.push_back(median(ms));

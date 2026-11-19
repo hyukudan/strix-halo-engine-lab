@@ -76,6 +76,9 @@ struct VerifyRows {
     // routed experts of the window in the shared A8 union rows form (strix/moe/expert_union.hpp): per-row A8 scratch + plan
     std::uint8_t *ucodes = nullptr, *udeltas = nullptr, *usums = nullptr, *upout = nullptr, *udcodes = nullptr,
                  *uddeltas = nullptr, *udsums = nullptr, *uplan = nullptr;
+    // the window's routed experts in the union rows form (each distinct expert read once; bitwise == the per-row loop).
+    // Default from STRIX_HY4_ROWS_EXPERT_UNION (kExpertUnionDefault when unset); Forward::set_rows_expert_union overrides.
+    bool expert_union = false;
     std::uint8_t* greedy_partials = nullptr;
     std::uint64_t greedy_bytes = 0;
     std::size_t engram_row_bytes = 0;
@@ -91,6 +94,7 @@ VerifyRows vr;
 void allocate_verify() {
     const std::size_t R = vr.max, h = c.hidden, hmax = 64U * c.v_head, row = c.kv_lora + c.qk_rope, K = c.top_k, L = c.latent;
     const std::size_t qmax = 64U * std::size_t{c.qk_head()};
+    vr.expert_union = strix::envcfg::flag("STRIX_HY4_ROWS_EXPERT_UNION", rows::kExpertUnionDefault);
     vr.x0 = alloc<float>(R * 4U * h); vr.x1 = alloc<float>(R * 4U * h);
     vr.u = alloc<float>(R * h); vr.xn = alloc<float>(R * h); vr.f = alloc<float>(R * h);
     vr.partial = alloc<float>(std::max(hcc::mix_partial_floats<kSub>(vr.max, c.hidden), hcc::mix_partial_floats<kHead>(vr.max, c.hidden)));
@@ -379,10 +383,8 @@ void ffn_vrows(std::uint32_t l, std::uint32_t R) {  // vr.xn -> vr.f
         linear_vrows(blk(l, "ffn_gate_inp.weight"), vr.xn, h, c.experts, R, vr.rlog, false);
         strix::moe_core::enqueue_route_wave<strix::moe::preset::hy4, DeclaredMath>(vr.rlog, t(blk(l, "exp_probs_b.bias")).f(), vr.ids, vr.rw, R, s);
         linear_vrows(blk(l, "ffn_routed_down.weight"), vr.xn, h, c.latent, R, vr.z);
-        // STRIX_HY4_ROWS_EXPERT_UNION=1: the shared union rows form (bitwise == the per-row loop); off until its ticket measures it.
-        static const bool expert_union = strix::envcfg::flag("STRIX_HY4_ROWS_EXPERT_UNION", false);
         const bool kquant_down = t(blk(l, "ffn_down_exps.weight")).type == 12U || t(blk(l, "ffn_down_exps.weight")).type == 14U;
-        if (expert_union && R > 1U && t(blk(l, "ffn_gate_exps.weight")).type == 12U && kquant_down)
+        if (vr.expert_union && R > 1U && t(blk(l, "ffn_gate_exps.weight")).type == 12U && kquant_down)
             expert_rows_union(l, R);
         else
             for (std::uint32_t r = 0; r < R; ++r) expert_row(l, vr.z + r * L, vr.ids + r * K, vr.rawdots + r * K * L);
