@@ -9,8 +9,9 @@
 
 namespace strix::xport::tp_gather {
 
-// Values follow dist::TagKind (communicator.hpp) so the Runtime converts a dist::Tag by value.
-enum class Kind : std::uint32_t { control = 0, half_sum = 1, raw_slots = 2, argmax = 3 };
+// Values follow dist::TagKind (communicator.hpp) so the Runtime converts a dist::Tag by value (checked by the
+// static_assert in tp_gather_hip.hpp).
+enum class Kind : std::uint32_t { half_sum = 1, raw_slots = 2, argmax = 3, control = 4 };
 struct Tag { Kind kind = Kind::raw_slots; std::uint32_t layer = 0; std::uint64_t step = 0; };
 struct Schedule {
     static constexpr std::size_t row_bytes(unsigned rows) { return rows; }
