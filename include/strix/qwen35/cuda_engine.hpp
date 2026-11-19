@@ -59,6 +59,21 @@ enum class PrefillGdn : std::uint8_t { serial, chunk16, chunk16tc };
     if (s == "chunk16tc") return PrefillGdn::chunk16tc;
     throw std::invalid_argument("--prefill-gdn expects serial|chunk16|chunk16tc, got '" + s + "'");
 }
+// FFN hidden rows H = silu(gate) * up of the FAST4 large-M prefill, between the fused gate/up GEMM and the down quantiser:
+//   f32  = FP32 rows (nvfp4-tile-mma-f32-v1 as gated with fast4).
+//   bf16 = FAST nvfp4-tile-h16-v1: the glu epilogue rounds each FP32 product to BF16 (RNE) and the down operand is quantised from
+//          those rows (same quantiser rule on the exact widening): half the H bytes written and read; identity suffix -h16.
+// Acts only under prefill_arith fast4 with NVFP4 gate / up / down weights; ignored (and not in the identity) otherwise.
+enum class PrefillHid : std::uint8_t { f32, bf16 };
+[[nodiscard]] inline PrefillHid parse_prefill_hid(const std::string& s) {
+    if (s == "f32") return PrefillHid::f32;
+    if (s == "bf16") return PrefillHid::bf16;
+    throw std::invalid_argument("--prefill-hid expects f32|bf16, got '" + s + "'");
+}
+// The ONE spelling table of each enum lever for the profile applier (strix/profiles/qwen_dense_cuda.hpp apply() finds these by
+// argument-dependent lookup on the option's type): a resolved value is converted exactly as the per-lever CLI option would be.
+[[nodiscard]] inline PrefillGdn parse_lever_value(PrefillGdn, const std::string& s) { return parse_prefill_gdn(s); }
+[[nodiscard]] inline PrefillHid parse_lever_value(PrefillHid, const std::string& s) { return parse_prefill_hid(s); }
 // CLI spelling of EngineOptions::prefill_norm_fold ("on" | "off"); anything else is rejected.
 [[nodiscard]] inline bool parse_prefill_norm_fold(const std::string& s) {
     if (s == "on") return true;
@@ -88,6 +103,7 @@ struct EngineOptions {
     // Large-M prefill (CudaEngine::prefill). Default exact = bitwise equal to the windowed path.
     PrefillArith prefill_arith = PrefillArith::exact;
     PrefillGdn prefill_gdn = PrefillGdn::serial;  // ignored (and not in the identity) under prefill_arith exact
+    PrefillHid prefill_hid = PrefillHid::f32;     // FAST4 FFN hidden rows (see PrefillHid); ignored unless prefill_arith fast4
     // FAST4 only: the hidden RMSNorms (attn / post) and, on the chunked GDN path, the gated RMSNorm of the ssm_out input are folded
     // into the A-operand quantiser (cuda_core dense_big_norm_split4 / dense_big_gated_norm_split4), so no f32 normalised rows are
     // written and re-read. Bitwise equal to norm + quantise (no identity suffix); a non-FAST4 consumer gets the f32 rows materialised
@@ -144,7 +160,8 @@ struct EngineOptions {
     const std::string pf = (o.prefill_arith == PrefillArith::exact
         ? std::string()
         : std::string("-pf-") + pf_names[static_cast<unsigned>(o.prefill_arith)] + (o.prefill_attn8 ? "-a8" : "") +
-              (o.prefill_gdn == PrefillGdn::chunk16 ? "-gdnc16" : o.prefill_gdn == PrefillGdn::chunk16tc ? "-gdnc16t" : "")) +
+              (o.prefill_gdn == PrefillGdn::chunk16 ? "-gdnc16" : o.prefill_gdn == PrefillGdn::chunk16tc ? "-gdnc16t" : "") +
+              (o.prefill_arith == PrefillArith::fast4 && o.prefill_hid == PrefillHid::bf16 ? "-h16" : "")) +
           (o.decode_attn8 ? "-d8" : "");
     if (o.turbo_weights == TurboWeights::off) return "qwen35-cuda-exact-" + a + "-v1" + pf;
     // the FAST split policy changes the NVFP4 GEMV summation order (decode, verify and the exact prefill's split ranges)

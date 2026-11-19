@@ -913,6 +913,13 @@ cudaError_t dense_big_split4(const float* x, std::uint32_t rows, std::uint32_t i
     return split4_into(rows, in, out, ctx, [&](std::uint8_t* xt, float* rs) { return ftile::quantize_enqueue(x, rows, in, xt, rs, s); });
 }
 
+cudaError_t dense_big_split4(const std::uint16_t* x_bf16, std::uint32_t rows, std::uint32_t in, BigAct* out, cudaStream_t s, BigCtx* ctx) {
+    if (!dense_big_fast4_supported()) return cudaErrorNotSupported;
+    if (x_bf16 == nullptr) return cudaErrorInvalidValue;
+    return split4_into(rows, in, out, ctx,
+                       [&](std::uint8_t* xt, float* rs) { return ftile::quantize_enqueue(x_bf16, rows, in, xt, rs, s); });
+}
+
 bool dense_big_norm_split4_fits(std::uint32_t in) { return ftile::norm_quantize_fits(in); }
 
 cudaError_t dense_big_norm_split4(const float* x, const float* gain, float eps, std::uint32_t rows, std::uint32_t in, BigAct* out,
@@ -968,7 +975,10 @@ cudaError_t gemm4(Scratch& S, const DenseWeight& w, const BigAct& a, float* y, c
 }
 }  // namespace
 
-cudaError_t dense_big_glu4(const DenseWeight& gate, const DenseWeight& up, const BigAct& a, float* y, cudaStream_t s, BigCtx* ctx) {
+namespace {
+// one fused gate/up launch; exactly one of y (FP32 rows) / y16 (BF16 rows, nvfp4-tile-h16-v1) is set
+cudaError_t glu4(const DenseWeight& gate, const DenseWeight& up, const BigAct& a, float* y, std::uint16_t* y16, cudaStream_t s,
+                 BigCtx* ctx) {
     if (!a.f4 || !dense_big_fast4_supported()) return cudaErrorInvalidValue;
     if (gate.format != WeightFormat::nvfp4 || up.format != WeightFormat::nvfp4 || gate.out != up.out || gate.in != up.in ||
         a.in != gate.in || !dense_big_supported(gate) || !dense_big_supported(up))
@@ -981,6 +991,7 @@ cudaError_t dense_big_glu4(const DenseWeight& gate, const DenseWeight& up, const
     g.x = static_cast<const std::uint8_t*>(a.planes);
     g.rs = S.rscale;
     g.y = y;
+    g.y16 = y16;
     g.gs = gate.gscale;
     g.gs2 = up.gscale;
     g.out = gate.out;
@@ -990,6 +1001,17 @@ cudaError_t dense_big_glu4(const DenseWeight& gate, const DenseWeight& up, const
     g.epi = ftile::Epi::glu;
     g.feed = S.feed;
     return ftile::gemm_enqueue(g, s);
+}
+}  // namespace
+
+cudaError_t dense_big_glu4(const DenseWeight& gate, const DenseWeight& up, const BigAct& a, float* y, cudaStream_t s, BigCtx* ctx) {
+    if (y == nullptr) return cudaErrorInvalidValue;
+    return glu4(gate, up, a, y, nullptr, s, ctx);
+}
+cudaError_t dense_big_glu4(const DenseWeight& gate, const DenseWeight& up, const BigAct& a, std::uint16_t* y_bf16, cudaStream_t s,
+                           BigCtx* ctx) {
+    if (y_bf16 == nullptr) return cudaErrorInvalidValue;
+    return glu4(gate, up, a, nullptr, y_bf16, s, ctx);
 }
 
 cudaError_t dense_big_gemm(const DenseWeight& w, const BigAct& a, float* y, const float* aux, BigEpi epi, cudaStream_t s, BigCtx* ctx) {

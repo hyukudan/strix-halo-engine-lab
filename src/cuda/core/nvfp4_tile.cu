@@ -31,6 +31,13 @@ cudaError_t quantize_enqueue(const float* x, std::uint32_t rows, std::uint32_t i
     sm120::quantize_kernel<<<rows_padded(rows), 256, 0, stream>>>(x, rows, in, x_tile, rs);
     return cudaGetLastError();
 }
+cudaError_t quantize_enqueue(const std::uint16_t* x, std::uint32_t rows, std::uint32_t in, std::uint8_t* x_tile, float* rs,
+                             cudaStream_t stream) {
+    if (!x || !x_tile || !rs || rows == 0 || in == 0 || in % kK || reinterpret_cast<std::uintptr_t>(x) % 16) return cudaErrorInvalidValue;
+    if (auto e = capability(); e != cudaSuccess) return e;
+    sm120::quantize_kernel<<<rows_padded(rows), 256, 0, stream>>>(x, rows, in, x_tile, rs);
+    return cudaGetLastError();
+}
 
 namespace {
 // One launch of the folded quantiser with row normaliser nm; NREG bucket = the smallest of 8/16/24/32 holding in / 256 elements per

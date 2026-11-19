@@ -216,6 +216,83 @@ void test_quantize_and_contract() {
     CHECK(T::valid(g));
 }
 
+// nvfp4-tile-h16-v1: the BF16 output trait of the glu epilogue (contract), the RNE rounding the device fixture compares against, and
+// what BF16 H does to the down operand (the e2m1 codes of the rounded rows vs the FP32 rows; informational bound for the gate).
+void test_h16() {
+    std::uint8_t b = 0;
+    std::vector<float> ybuf(40 * 48), rsbuf(256);
+    std::vector<std::uint16_t> y16buf(40 * 48);
+    T::GemmArgs g;
+    g.w = g.w2 = g.x = &b;
+    g.rs = rsbuf.data();
+    g.y = ybuf.data();
+    g.out = 48;
+    g.in = 256;
+    g.rows = 40;
+    g.rows_pad = 256;
+    g.epi = T::Epi::glu;
+    CHECK(T::valid(g));
+    g.y16 = y16buf.data();
+    CHECK(!T::valid(g));  // exactly one output form
+    g.y = nullptr;
+    CHECK(T::valid(g));
+    g.epi = T::Epi::store;
+    CHECK(!T::valid(g));  // BF16 output is a glu trait only
+    g.epi = T::Epi::residual;
+    g.aux = rsbuf.data();
+    CHECK(!T::valid(g));
+    g.aux = nullptr;
+    g.epi = T::Epi::glu;
+    g.rs = reinterpret_cast<const float*>(y16buf.data() + 40 * 48 - 2);
+    CHECK(!T::valid(g));  // row scales inside the BF16 rows (2-byte elements: the byte extent is rows x out x 2)
+    g.rs = reinterpret_cast<const float*>(y16buf.data() + 40 * 48);
+    CHECK(T::valid(g));   // adjacent, disjoint
+    g.y16 = nullptr;
+    CHECK(!T::valid(g));  // no output
+
+    const auto bits = [](std::uint32_t u) {
+        float f = 0.f;
+        std::memcpy(&f, &u, 4);
+        return tile_ref::bf16_rn_bits(f);
+    };
+    CHECK(bits(0x3f800000u) == 0x3f80u);
+    CHECK(bits(0x3f808000u) == 0x3f80u);  // tie, even kept
+    CHECK(bits(0x3f818000u) == 0x3f82u);  // tie, odd rounds up to even
+    CHECK(bits(0x3f808001u) == 0x3f81u);
+    CHECK(bits(0xbf80ffffu) == 0xbf81u);
+    CHECK(bits(0x80000000u) == 0x8000u);
+    CHECK(bits(0x7f7fffffu) == 0x7f80u);  // FLT_MAX rounds to +inf (RNE overflow)
+    CHECK((bits(0x7fc00001u) & 0x7fc0u) == 0x7fc0u);
+    for (std::uint32_t u = 0; u < 0x7f800000u; u += 0x00123457u) {  // widening is exact and rounding is idempotent on it
+        const std::uint16_t h = bits(u);
+        CHECK(tile_ref::bf16_rn_bits(tile_ref::bf16_widen(h)) == h);
+    }
+
+    // H-like rows (silu(a) * b, a, b ~ N(0, 1)) at the model's down width: e2m1 codes / e4m3 scales / rs of the rounded rows
+    const std::uint32_t rows = 16, in = 17408;
+    std::mt19937 rng(97);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> h(static_cast<std::size_t>(rows) * in), h16(h.size());
+    for (std::size_t i = 0; i < h.size(); ++i) {
+        const float a = nd(rng), c = nd(rng);
+        h[i] = static_cast<float>(tile_ref::silu(a)) * c;
+        h16[i] = tile_ref::bf16_widen(tile_ref::bf16_rn_bits(h[i]));
+    }
+    const Act qa = quantize(h, rows, in), qb = quantize(h16, rows, in);
+    std::size_t codes_changed = 0, scales_changed = 0;
+    for (std::size_t i = 0; i < qa.codes.size(); ++i)
+        codes_changed += ((qa.codes[i] ^ qb.codes[i]) & 0x0fu ? 1u : 0u) + ((qa.codes[i] ^ qb.codes[i]) & 0xf0u ? 1u : 0u);
+    for (std::size_t i = 0; i < qa.scales.size(); ++i) scales_changed += qa.scales[i] != qb.scales[i] ? 1u : 0u;
+    double rs_rel = 0;
+    for (std::uint32_t r = 0; r < rows; ++r) rs_rel = std::fmax(rs_rel, std::fabs(static_cast<double>(qb.rs[r]) / qa.rs[r] - 1.0));
+    const double cf = static_cast<double>(codes_changed) / static_cast<double>(h.size());
+    const double sf = static_cast<double>(scales_changed) / static_cast<double>(qa.scales.size());
+    std::printf("H16 STAT rows=%u in=%u e2m1 codes changed %.3f %% e4m3 scales changed %.3f %% rs rel %.2e\n", rows, in, 100 * cf, 100 * sf,
+                rs_rel);
+    CHECK(rs_rel <= 1.0 / 256);  // BF16 relative rounding of the row maximum
+    CHECK(cf < 0.05 && sf < 0.05);
+}
+
 // Epilogue ownership: gemm_kernel issues all of a thread's rs / aux loads before its y stores. That is bitwise equal to the
 // per-element load-after-store order iff every output element of the launch is touched (read as aux, written as y) by exactly one
 // (CTA, thread) and every row scale it loads is a valid row. Enumerate the kernel's own coordinate functions over every CTA, warp,
@@ -457,6 +534,7 @@ int main() {
     test_epilogue_ownership(5120, 4096, false); // engine residual shape (down / o)
     test_norm_quant_fold();
     test_gated_norm_fold_mapping();
+    test_h16();
     if (g_fail) {
         std::fprintf(stderr, "nvfp4_tile_host: %d failures\n", g_fail);
         return 1;

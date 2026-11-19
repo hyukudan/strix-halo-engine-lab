@@ -1264,6 +1264,21 @@ struct CudaEngine::Impl {
         pf_norm(sl, w.post_norm, rows);
         if (opt.prefill_arith == PrefillArith::fast4 && w.ffn_gate.format == cc::WeightFormat::nvfp4 && w.ffn_up.format == cc::WeightFormat::nvfp4) {
             // FAST4: gate and up in ONE GEMM, SwiGLU in registers (no f32 gate round trip through hid)
+            if (opt.prefill_hid == PrefillHid::bf16 && w.ffn_down.format == cc::WeightFormat::nvfp4) {
+                // FAST nvfp4-tile-h16-v1: H stored as BF16 rows (first half of hid) and the down operand quantised from them: half
+                // the H bytes written by the epilogue and read by the quantiser. The f32 rows of hid are never formed.
+                auto* const h16 = reinterpret_cast<std::uint16_t*>(sl.hid);
+                CK(cc::dense_big_glu4(w.ffn_gate, w.ffn_up, pf_act(sl, sl.xn, rows, w.ffn_gate), h16, sl.st, sl.bc));
+                pf_dirty(sl);
+                sl.act_x = sl.hid;  // pf_act of the down GEMM finds this operand (keyed by hid, the rows' storage)
+                sl.act_in = w.ffn_down.in;
+                sl.act_rows = rows;
+                CK(cc::dense_big_split4(static_cast<const std::uint16_t*>(h16), rows, w.ffn_down.in, &sl.act[1], sl.st, sl.bc));
+                sl.have[1] = true;
+                pf_gemm(sl, w.ffn_down, sl.hid, rows, sl.x, sl.x, cc::BigEpi::residual);
+                pf_dirty(sl);
+                return;
+            }
             CK(cc::dense_big_glu4(w.ffn_gate, w.ffn_up, pf_act(sl, sl.xn, rows, w.ffn_gate), sl.hid, sl.st, sl.bc));
         } else {
             pf_gemm(sl, w.ffn_gate, sl.xn, rows, sl.hid, nullptr, cc::BigEpi::none);
@@ -1839,6 +1854,11 @@ void print_effective_config(const EngineOptions& o, const char* arith, std::FILE
                  : o.prefill_gdn == PrefillGdn::chunk16tc
                      ? "chunk16tc (FAST gdn-chunk16-tf32-v1: chunk scan on TF32 tensor cores, FP32 state in registers, identity -gdnc16t)"
                      : "serial (decode recurrence, bitwise)");
+    std::fprintf(f, "  prefill-hid: %s\n",
+                 o.prefill_arith != PrefillArith::fast4 ? "n/a (FAST4 only)"
+                 : o.prefill_hid == PrefillHid::bf16
+                     ? "bf16 (FAST nvfp4-tile-h16-v1: glu epilogue stores BF16 H, down operand quantised from it, identity -h16)"
+                     : "f32");
     std::fprintf(f, "  prefill-norm-fold: %s\n",
                  o.prefill_arith != PrefillArith::fast4 ? "n/a (FAST4 only)"
                  : o.prefill_norm_fold ? "on (hidden RMSNorm + chunked-GDN gated RMSNorm folded into the FAST4 quantiser, bitwise)"
