@@ -5546,5 +5546,4 @@ decodes alone (a layer split only serialises one-row decode).
 - **Exactness evidence:** none on this tree yet. The default stays off until a pair run on this tree records the
   placement line, the relayed state size and time, decode tok/s and ids equal to the one-node reference, for both
   settings.
-- **Measured gain:** not measured on this tree (an earlier tree measured relay decode at one-node speed and above the
-  layer-owned decode; not claimed here).
+- **Measured gain:** not measured on this tree.

@@ -154,6 +154,9 @@ The tables below list the curated flags. The full list of environment variables 
 | `--engram-direct`, `--engram-mapped` | deepseek | `direct` | Engram table access. | `mapped` when memory is short. |
 | `--decode-xch xfer\|comm`, `STRIX_GLM_DECODE_XCH` | glm | `xfer` (`comm` in baseline) | Decode exchange mode. | Compare both on a different interconnect. |
 | `--wb-defer`, `--wb-stream`, `--ce-pacing` (`--no-*`) | deepseek-rtx | on | Write-back and copy-engine pacing. Also `STRIX_DS41_WB_STREAM`, `STRIX_DS41_CE_PACING`. | Off on links where the copy engine is not the bottleneck. |
+| `--tp-rank 0\|1`, `--tp-transport`, `--tp-rates A,B`, `--tp-trip-us`, `--tp-force` | qwen dense decode (HIP) | off (one node) | Exact tensor-parallel decode over two ranks: column / head shares, exact gathers. `--tp-rates` (GB/s per rank) overrides the topology rates, `--tp-trip-us` the measured trip latency, `--tp-force` keeps the group when the planner says it loses. [Entry](optimizations.md#qwen-27b-exact-tensor-parallel-decode-over-two-nodes). | Per-rank rates come from the topology declaration; a same-box pair measures its own trip at start-up. |
+| `--topology FILE --node ID`, `STRIX_TOPOLOGY` | qwen dense decode (HIP) | none | Topology declaration read for the tensor-parallel rates (`memory_gbytes_ps` of both nodes). | Declare each node's measured memory rate. |
+| `STRIX_PAIR_DECODE_RELAY=1` | qwen pair prefill (HIP) | off | After the layered prefill, moves each stage's layer state once to a node that holds the whole model and decodes there. Not measured on this tree. [Entry](optimizations.md#qwen-27b-pair-prefill-decode-relay-to-one-node). | When one node holds the whole model and the layer split serialises decode. |
 | `STRIX_DS41_OB_SPLIT=K` | deepseek | off | Splits the o_b exchange into K chunks that overlap compute. Exact. Slower on the host path. | Try on a faster interconnect or with GPU-direct. |
 
 Pair setup: [pair-setup.md](pair-setup.md).
