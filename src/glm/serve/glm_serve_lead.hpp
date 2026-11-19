@@ -652,7 +652,7 @@ private:
             runtime().publish_progress(p.a.state, {strix::serve::GenerationPhase::prefill, p.done, 0, n});
             return;
         }
-        if (cfg_.prefix_cache_bytes) store_prefix(p, out.at(0));
+        if (cfg_.prefix_cache_bytes) store_prefix(p);
         const auto ready = cfg_.prefix_cache_bytes ? Clock::now() : t1;
         const std::uint32_t slot = p.slot;
         Active a = std::move(p.a);
@@ -709,8 +709,8 @@ private:
         sync_prefix_stats();
     }
 
-    // Two-phase paired store (prompt-end at the end of prefill, reply-end at the end of a reply). `key` has `rows`
-    // restore rows (+ the MTP pending token). Returns true when both ranks admitted it.
+    // Two-phase paired store (prompt-end at the end of prefill, reply-end at the end of a reply). `key` is exactly the
+    // `rows` restored ids. Returns true when both ranks admitted it.
     bool store_snapshot(std::uint32_t slot, bool mtp, std::uint64_t rows, bool reply, std::vector<std::uint32_t>& key) {
         Control c;
         c.cmd = static_cast<std::uint32_t>(Cmd::prefix_prepare);
@@ -735,10 +735,14 @@ private:
         return ok;
     }
 
-    void store_prefix(Prefilling& p, std::uint32_t y0) {
+    // Prompt-end store: the key is the prompt, with or without MTP. The trunk rows [0, n) are exact for any
+    // continuation; the MTP row n - 1 pairs the last hidden with y0 instead of the follow-up's token n, a drafter-only
+    // difference that every chunk boundary of the chunked MTP prefill already makes (drafts are always verified).
+    // Keying on prompt + y0 missed every chat follow-up: the generation prompt ends inside "<think>" and the next
+    // request renders that turn as "<think></think>...", so its token n is "</think>", not y0.
+    void store_prefix(Prefilling& p) {
         auto key = request(p.a).prompt;
-        if (p.a.mtp_ok) key.push_back(y0);  // key length differs from the restore frontier
-        (void)store_snapshot(p.slot, p.a.mtp_ok, request(p.a).prompt.size(), false, key);
+        (void)store_snapshot(p.slot, p.a.mtp_ok, key.size(), false, key);
     }
 
     // Reply-end store (opt-in). The slot holds rows [0, pos): the prompt, then every emitted token except the last

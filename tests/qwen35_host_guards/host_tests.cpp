@@ -164,6 +164,31 @@ int main() {
             check(engine_identity(o).ends_with("-skf1") == fast, "resolved tier -> identity suffix");
         }
     }
+    {  // FAST decode attention (decode_attn8): own identity suffix "-d8" on every weight source; the registry row is pending
+       // (no qualified regime yet), so `fast` alone leaves it off and only the explicit --decode-attn8 on sets it.
+        namespace q = strix::qwen35;
+        namespace qp = strix::qwen35::profile;
+        for (const q::TurboWeights w : {q::TurboWeights::off, q::TurboWeights::native, q::TurboWeights::converted}) {
+            q::EngineOptions o;
+            o.turbo_weights = w;
+            const std::string id = engine_identity(o);
+            check(id.find("-d8") == std::string::npos, "default identity carries no -d8");
+            o.decode_attn8 = true;
+            check(engine_identity(o).find("-d8") != std::string::npos && engine_identity(o) != id, "decode_attn8 -> -d8 identity");
+        }
+        for (const auto route : {qp::Route::large_prefill, qp::Route::windows}) {
+            q::EngineOptions o;
+            o.turbo_weights = q::TurboWeights::converted;
+            const auto r = qp::resolve(strix::profile::parse("fast"), qp::regime_of(o, route, 65536), {});
+            qp::apply(o, *r);
+            check(!o.decode_attn8, "fast without a qualified decode_attn8 row leaves it off");
+            q::EngineOptions e;
+            e.turbo_weights = q::TurboWeights::converted;
+            const auto re = qp::resolve(std::nullopt, qp::regime_of(e, route, 65536), {{"decode_attn8", "on"}});
+            qp::apply(e, *re);
+            check(e.decode_attn8 && engine_identity(e).find("-d8") != std::string::npos, "--decode-attn8 on sets the option");
+        }
+    }
     check(portable_sampler() == 0, "POSIX clock sampler compiles and closes");
     check(std::isinf(maxrel({NAN}, {0.0})) && std::isinf(maxrel({0.0F}, {INFINITY})), "nonfinite qualification rejection");
     return failures ? 1 : 0;

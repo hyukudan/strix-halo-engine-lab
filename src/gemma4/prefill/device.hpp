@@ -210,6 +210,11 @@ class DevicePrefill {
     void use_canonical_kernel(bool enabled);
     // Turns per-op event timing (Stats::linear_ms/attention_ms/kernels) on or off.
     void set_profile(bool enabled);
+    // Whether a pass without logits keeps its last row for last_logits() (default true). A caller that never asks for
+    // a deferred head (the engine: the decode tail owns the prompt's last rows) passes false; then, by the shared row
+    // liveness rule (strix/prefill_row_liveness.hpp), no row of such a pass runs past the last K/V-owning layer
+    // that something reads.
+    void keep_last_row(bool keep);
   private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

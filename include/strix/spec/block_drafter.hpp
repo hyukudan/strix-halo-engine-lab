@@ -14,10 +14,19 @@
 // Exactness: drafts are arbitrary ids. BlockSpeculator verifies [anchor, drafts...] in one target pass, accepts the
 // longest prefix equal to the target's greedy rows, emits accepted drafts + the target's next token (the bonus or the
 // correction) and commits accepted + 1 rows. Emitted ids equal serial greedy decode for ANY block.
+//
+// VERIFY PRE-LAUNCH (scheduling only; same kernels, operands and stream order, so the bits are unchanged): a chain that
+// keeps its drafted ids on the device (engine feed slots) lets the target ENQUEUE the verify of [anchor, drafts] right
+// behind the draft work, before the ids are read back. The host launch of the verify (a CUDA graph of ~870 nodes takes
+// ~0.5 ms of host time) then runs while the GPU drafts instead of with the GPU idle. Both sides are optional
+// (ChainDrafter::draft_prelaunch, VerifyTarget::verify_launch_fed); either one declining falls back to the read-then-verify
+// order. Off unless BlockSpeculator::set_prelaunch(true).
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -25,6 +34,18 @@
 #include "strix/spec/drafting.hpp"
 
 namespace strix::spec {
+
+// Where the k drafts of one chain call live before they are read back (verify pre-launch). Draft j is in device feed
+// slot slot[j], or, when slot[j] == kHost, already on the host as host_id[j].
+struct DraftFeed {
+    static constexpr std::uint32_t kHost = 0xFFFFFFFFU;
+    static constexpr std::uint32_t kMax = 32;  // = the widest verify window
+    std::uint32_t k = 0;
+    std::array<std::uint32_t, kMax> slot{};
+    std::array<std::uint32_t, kMax> host_id{};
+};
+// prefix = the host tokens the chain consumed before its drafts (the hybrid copy span; empty for a chain-only block).
+using PrelaunchFn = std::function<void(std::span<const std::uint32_t> prefix, const DraftFeed& feed)>;
 
 // A learned drafter that continues the stream by a chain of tokens (e.g. a native MTP head).
 class ChainDrafter {
@@ -34,6 +55,17 @@ public:
     // chain state is advanced through them). Must not change committed target state; its own speculative state is
     // overwritten by accept().
     virtual void draft(std::span<const std::uint32_t> prefix, std::uint32_t k, std::vector<std::uint32_t>& out) = 0;
+    // Optional verify pre-launch: draft() with the same work and the same `out`, but after the draft work is enqueued and
+    // BEFORE the ids are read back it calls launch(prefix, feed) exactly once (feed.k == k). Returns false, having done
+    // nothing, when this draft cannot stay on the device; the caller then uses draft().
+    virtual bool draft_prelaunch(std::span<const std::uint32_t> prefix, std::uint32_t k, std::vector<std::uint32_t>& out,
+                                 const PrelaunchFn& launch) {
+        (void)prefix;
+        (void)k;
+        (void)out;
+        (void)launch;
+        return false;
+    }
     // The last verify pass emitted `emitted` (accepted drafts + next token): emitted[i] follows verify row i
     // (row 0 = the anchor). Rows 0..emitted.size()-1 are now committed target positions.
     virtual void accept(std::span<const std::uint32_t> emitted) = 0;
@@ -90,7 +122,8 @@ public:
     void commit(std::span<const std::uint32_t> tokens) { proposer_.commit(tokens); }
     // Engine's tabled verify wall at `rows` (shape of the cost curve; measured walls rescale it).
     void seed_verify_ms(std::uint32_t rows, double ms) { arbiter_.seed_cost(rows, ms); }
-    [[nodiscard]] Block next(const StepParams& params);
+    // launch (optional): handed to ChainDrafter::draft_prelaunch for every chain call of this block.
+    [[nodiscard]] Block next(const StepParams& params, const PrelaunchFn* launch = nullptr);
     // After the pass. verify_ms = wall of verify + commit (without drafting). emitted = accepted drafts + next token.
     void observe(const Block& block, std::uint32_t accepted, double verify_ms, std::span<const std::uint32_t> emitted,
                  std::uint64_t context);
@@ -125,6 +158,19 @@ public:
     virtual void verify(std::span<const std::uint32_t> tokens, std::vector<std::uint32_t>& greedy) = 0;
     // Accept the first k rows of the last verify (1 <= k <= rows); the rest is rolled back.
     virtual void commit(std::uint32_t k) = 0;
+    // Optional verify pre-launch: ENQUEUE (no host read, no wait) the verify of host_rows followed by the feed.k drafts of
+    // `feed`. Returns false, having enqueued nothing, when unsupported. After true, verify_collect(tokens) with tokens ==
+    // host_rows + the drafts completes it with the same result as verify(tokens).
+    virtual bool verify_launch_fed(std::span<const std::uint32_t> host_rows, const DraftFeed& feed) {
+        (void)host_rows;
+        (void)feed;
+        return false;
+    }
+    virtual void verify_collect(std::span<const std::uint32_t> tokens, std::vector<std::uint32_t>& greedy) {
+        (void)tokens;
+        (void)greedy;
+        throw std::logic_error("VerifyTarget::verify_collect without a pre-launched verify");
+    }
 };
 
 struct StepRecord {
@@ -176,6 +222,10 @@ public:
     BlockSpeculator(BlockDrafter& drafter, VerifyTarget& target) : drafter_(drafter), target_(target) {}
     // anchor = last emitted token (already committed to the drafter's stream, NOT in the target).
     void start(std::uint32_t anchor) { anchor_ = anchor; }
+    // Verify pre-launch (see the top of this file). Bits unchanged; off by default until its timing receipt.
+    void set_prelaunch(bool on) { prelaunch_ = on; }
+    [[nodiscard]] bool prelaunch() const { return prelaunch_; }
+    [[nodiscard]] std::uint64_t prelaunched_steps() const { return prelaunched_; }
     // One step; appends the emitted ids to `out`. Returns the record (emitted == 0: nothing to do).
     StepRecord step(std::vector<std::uint32_t>& out, const StepParams& params);
     [[nodiscard]] std::uint32_t anchor() const { return anchor_; }
@@ -187,7 +237,9 @@ private:
     VerifyTarget& target_;
     RoundSink* sink_ = nullptr;
     std::uint32_t anchor_ = 0;
-    std::vector<std::uint32_t> rows_, greedy_;
+    std::vector<std::uint32_t> rows_, greedy_, host_rows_;
+    bool prelaunch_ = false;
+    std::uint64_t prelaunched_ = 0;
 };
 
 }  // namespace strix::spec

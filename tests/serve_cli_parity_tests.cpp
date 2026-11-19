@@ -140,7 +140,27 @@ void minimax() {
     };
     gate("minimax", cli, server, allowed);
     // FAST prefill profile rows (mm_profile_table.hpp): every row is printed by both entry points and resolves the
-    // same with the bundle on, with an explicit OFF beating it, and on the FAST_I4 format (member not selected).
+    // same with the bundle on, with an explicit OFF beating it, and on the FAST_I4 format (member not selected); the
+    // same through the product word alone (STRIX_MM_PRODUCT_PROFILE=fast, as print_or_apply exports '--profile fast').
+    const std::string word = md::kProductProfileEnv;
+    for (const auto& keys : {std::map<std::string, std::string>{{word, "fast"}},
+                             std::map<std::string, std::string>{{word, "fast"}, {"STRIX_MM_FAST_PREFILL", "0"}},
+                             std::map<std::string, std::string>{{word, "fast"}, {"STRIX_MMX_MODEL_FORMAT", "fast_i4"}}}) {
+        const md::Lookup env = [&keys](const char* k) -> const char* {
+            const auto it = keys.find(k);
+            return it == keys.end() ? nullptr : it->second.c_str();
+        };
+        const auto c = sp::from_lines(md::effective_config(md::parse_cli("rank", {}), env));
+        const auto s = sp::from_lines(md::effective_config(md::parse_cli("serve", {}), env));
+        const bool selected = keys.size() == 1U;
+        const auto profile_line = [](const auto& lines) {
+            const auto it = lines.find("prefill.fast_profile");
+            return it == lines.end() ? std::string("absent") : it->second;
+        };
+        check(profile_line(c) == (selected ? "mm-fast-pf-v2" : "off") && profile_line(s) == profile_line(c),
+              "minimax: --profile fast word: prefill.fast_profile=" + profile_line(c) + " (rank) / " + profile_line(s) + " (serve)");
+        gate("minimax+word", c, s, allowed);
+    }
     for (const auto& keys : {std::map<std::string, std::string>{{"STRIX_MM_FAST_PREFILL", "1"}},
                              std::map<std::string, std::string>{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MM_PF_MSA_FLASH", "0"}},
                              std::map<std::string, std::string>{{"STRIX_MM_FAST_PREFILL", "1"}, {"STRIX_MMX_MODEL_FORMAT", "fast_i4"}},

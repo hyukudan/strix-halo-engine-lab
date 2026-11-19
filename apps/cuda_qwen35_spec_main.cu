@@ -127,6 +127,7 @@ int main(int argc, char** argv) {
         std::unique_ptr<sp::DraftRows> draft_rows;
         std::uint32_t idle_ms = 0;  // host sleep (GPU idle) before every spec run: thermal gaps inside one ticket
         bool cost_table = false, check = true, graphs = true, seed_costs = true, turbo_lm_head = true, pdl = false;
+        bool prelaunch = false;  // verify pre-launch: bits unchanged; default off until its timing receipt (DEFAULT ON WHEN PROVEN)
         q::TurboWeights turbo = q::TurboWeights::off;
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
@@ -150,8 +151,10 @@ int main(int argc, char** argv) {
             else if (a == "--check") check = next() != "0";
             else if (a == "--graphs") graphs = next() != "0";
             else if (a == "--pdl") pdl = next() != "0";  // EngineOptions::pdl, as the decode CLI
+            else if (a == "--prelaunch") prelaunch = next() != "0";  // verify pre-launch (BlockSpeculator::set_prelaunch)
             else if (a == "--profile") profile = strix::qwen35::profile::parse(next());  // one tier word; exact = default
             else if (a == "--split-k") lever_cli.emplace_back("split_k", next());  // exact|fast: overrides the profile
+            else if (a == "--decode-attn8") lever_cli.emplace_back("decode_attn8", next());  // on|off: e4m3 decode/verify attention (FAST, identity -d8)
             else if (a == "--seed-costs") seed_costs = next() != "0";
             else if (a == "--cost-model") {
                 const std::string v = next();
@@ -452,6 +455,7 @@ int main(int argc, char** argv) {
                     round_trace = std::make_unique<sp::RoundTraceWriter>(spec_trace + "/" + file + ".srt", label);
                     spec.set_round_sink(round_trace.get());
                 }
+                spec.set_prelaunch(prelaunch);
                 spec.start(anchor);
                 std::vector<double> tick_ms{0.0};  // wall at each step end (relative), tokens cumulative in cum
                 std::vector<std::uint32_t> cum{1};
@@ -511,6 +515,8 @@ int main(int argc, char** argv) {
                             (unsigned long long)drafter.hybrid_blocks, (unsigned long long)drafter.hybrid_ext_accepted,
                             (unsigned long long)drafter.hybrid_ext_proposed, (unsigned long long)(S.chain_calls() - calls0),
                             (unsigned long long)(S.chain_rows() - rows0));
+                std::printf("prelaunch[%s]: %s, pre-launched steps %llu of %zu\n", tag.c_str(), prelaunch ? "on" : "off",
+                            (unsigned long long)spec.prelaunched_steps(), per_step.size());
                 const double steps_n = double(std::max<std::size_t>(per_step.size(), 1));
                 std::string hist;
                 for (std::size_t k = 1; k < k_hist.size(); ++k)

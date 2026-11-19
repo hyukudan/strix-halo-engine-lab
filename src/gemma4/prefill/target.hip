@@ -6,6 +6,7 @@
 #include "gemma4/kernels/capture_guard.hpp"
 #include "gemma4/exl3/device.hpp"
 #include "pair.hpp"
+#include "strix/prefill_row_liveness.hpp"
 #include <hip/hip_runtime.h>
 #include <cstdlib>
 #include <string_view>
@@ -112,6 +113,8 @@ struct DevicePrefill::Impl {
     Buffer tokens, positions, reads, writes, scores, maxima, partials, failure, halves, maximum, attention_halves, global_halves, pair_halves, last_row;
     Buffer canonical_scores, canonical_denominators, canonical_packed, exl3_scratch, flash_workspace;
     unsigned table_positions = 0, stride = 0;
+    bool keep_last_row = true; // a pass without logits keeps its last row for last_logits()
+    bool last_row_dropped = false; // LAST_KV: the last pass ended at the caches, no final-norm row for last_logits()
     // QUEUE_IO: pinned staging for one pass's uploads (reused once the pass has synchronized).
     void* staging = nullptr;
     std::size_t staging_bytes = 0, staged = 0;
@@ -558,6 +561,7 @@ void DevicePrefill::set_profile(bool enabled) {
 void DevicePrefill::use_canonical_kernel(bool enabled) {
     impl_->stats.canonical_kernel = impl_->stats.attention == AttentionMode::canonical && enabled;
 }
+void DevicePrefill::keep_last_row(bool keep) { impl_->keep_last_row = keep; }
 ChunkResult DevicePrefill::forward(KvTxn& transaction, std::span<const unsigned> input, bool all_logits, bool logits, bool hidden,
                                    bool taps, bool views) {
     const PrefillSegment one{&transaction, input};
@@ -619,6 +623,26 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
     // failure fence, replaces the consumer's host scan of the same values.
     const bool device_finite = lever_enabled(lever_device_finite);
     bool taps_checked = false;
+    // LAST_KV (shared row-liveness rule, strix/prefill_row_liveness.hpp): every row runs up to the last layer that owns
+    // K/V (or the deepest consumed tap); above it only the pass's last row runs, and only when it is read (logits now,
+    // or kept for last_logits()). The last owner itself writes its K/V for every row and runs the rest of the layer for
+    // the read row alone. Kept rows run the same kernels on the same inputs: the many-row linears and canonical
+    // attention give a row the same bytes whatever rows share the call (README); the packed / flash attention routes
+    // and the WMMA / a8 linears are not declared row-invariant, so with them a read last row keeps the full stack. Off: STRIX_G4_PREFILL_LAST_KV=0.
+    // The pair stages ship every row through the seam (pair.hpp): not narrowed.
+    namespace lv = strix::prefill_liveness;
+    const auto liveness = !stage_a && !stage_b && lever_enabled(lever_last_kv)
+        ? lv::plan(c.layers, [&](unsigned l) { return c.layer[l].producer == l; },
+                   {.taps = want_taps ? std::span<const std::uint32_t>(tap_layers) : std::span<const std::uint32_t>{},
+                    .every_row = all_logits || hidden,
+                    .head_row = logits || b.keep_last_row,
+                    .tail_row_invariant = b.stats.attention == AttentionMode::canonical && b.stats.linears == Linears::exact})
+        : lv::Plan{c.layers, c.layers, false, false};
+    if (liveness.narrows()) result.levers |= lever_last_kv;
+    // Rows the layers run: n, then 1 (the pass's last row, moved to row 0) once the plan narrows.
+    unsigned live = n, read_base = 0;
+    Part tail_part{};
+    std::span<const Part> live_parts(parts);
     try {
         b.queue_io = queue_io_enabled(); b.staged = 0;
         for (const auto& p : parts) {
@@ -762,26 +786,51 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
             (void)seam(frame, false);
             x_ready = h[PairWord::x_ready] != 0;
         }
+        // LAST_KV: the pass's last row (row n - 1 of the last segment) moves to row 0 of the buffers the remaining work
+        // reads (residual, the layer input x, q when already projected, its PLE rows, its position); its K/V reads stay at n - 1.
+        const auto narrow = [&](std::size_t q_width) {
+            // The PLE rows are moved: their stage must have finished on this queue.
+            if (ple_pending) { checked(hipStreamWaitEvent(b.queue, b.ple_done, 0)); ple_pending = false; }
+            if (n > 1) {
+                const auto row = std::size_t(n - 1);
+                const auto move = [&](auto& buffer, std::size_t width) {
+                    checked(hipMemcpyAsync(buffer.template as<float>(), buffer.template as<float>() + row * width, width * sizeof(float),
+                                           hipMemcpyDeviceToDevice, b.queue));
+                };
+                move(b.residual, c.hidden); move(b.x, c.hidden); move(b.ple, std::size_t(c.layers) * c.ple_dim);
+                if (q_width) move(b.q, q_width);
+                // The q rotation of the remaining layers reads the row's position.
+                checked(hipMemcpyAsync(b.positions.as<std::uint64_t>(), b.positions.as<std::uint64_t>() + row, sizeof(std::uint64_t),
+                                       hipMemcpyDeviceToDevice, b.queue));
+            }
+            live = 1; read_base = n - 1;
+            tail_part = {parts.back().tx, 0, 1, parts.back().stride};
+            live_parts = {&tail_part, 1};
+        };
         for (unsigned l = first_layer; l < end_layer; ++l) {
+            if (liveness.cut() && l == liveness.full_layers && live == n) {
+                if (!liveness.tail) break; // nothing reads a row past the caches below
+                narrow(0);
+            }
             const auto& y = w.layer[l]; const auto& a = c.layer[l]; const auto d = a.head_dim;
             auto* layer_reads = b.reads.as<gpu::KvRead>() + std::size_t(l) * n;
             const bool global = a.attention == AttentionKind::global;
             const auto name = "layer." + std::to_string(l) + ".";
-            if (!x_ready) b.norm(b.residual, y.input_norm, b.x, n, c.hidden);
+            if (!x_ready) b.norm(b.residual, y.input_norm, b.x, live, c.hidden);
             x_ready = false;
             // Without the side queue, k and v read q's converted panels.
             const bool share = !side && a.producer == l && b.share_qkv_panels(name, y.q, y.k, y.v);
             const auto q_slot = unsigned(b.ranges.size());
             const auto kv = [&] {
                 if (share) { b.range_aliases.push_back({q_slot + 1, q_slot}); b.range_aliases.push_back({q_slot + 2, q_slot}); }
-                b.dot(name + "k", y.k, b.x.as<float>(), b.k.as<float>(), n, share); b.dot(name + "v", y.v, b.x.as<float>(), b.v.as<float>(), n, share || b.a8_same(y.k, y.v));
-                b.head(b.k, y.k_norm, n, c.kv_heads, d, global);
-                gpu::norm(b.v.as<float>(), {}, b.v.as<float>(), n * c.kv_heads, d, b.queue, b.failure.as<unsigned>());
-                gpu::store_overlay(b.k.as<float>(), b.v.as<float>(), b.writes.as<gpu::KvWrite>() + std::size_t(l) * n, n, c.kv_heads * d, b.queue);
+                b.dot(name + "k", y.k, b.x.as<float>(), b.k.as<float>(), live, share); b.dot(name + "v", y.v, b.x.as<float>(), b.v.as<float>(), live, share || b.a8_same(y.k, y.v));
+                b.head(b.k, y.k_norm, live, c.kv_heads, d, global);
+                gpu::norm(b.v.as<float>(), {}, b.v.as<float>(), live * c.kv_heads, d, b.queue, b.failure.as<unsigned>());
+                gpu::store_overlay(b.k.as<float>(), b.v.as<float>(), b.writes.as<gpu::KvWrite>() + std::size_t(l) * n, live, c.kv_heads * d, b.queue);
             };
             // The side queue forks after the input norm; ranges keep the order q, k, v.
             if (side && a.producer == l) b.fork();
-            b.dot(name + "q", y.q, b.x.as<float>(), b.q.as<float>(), n); b.head(b.q, y.q_norm, n, c.heads, d, global);
+            b.dot(name + "q", y.q, b.x.as<float>(), b.q.as<float>(), live); b.head(b.q, y.q_norm, live, c.heads, d, global);
             if (a.producer == l) {
                 if (side) {
                     b.on_side(b.joined, kv); checked(hipStreamWaitEvent(b.queue, b.joined, 0));
@@ -789,13 +838,19 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
                 }
                 else kv();
             }
+            // LAST_KV at the last owner: its K/V rows are written for every row; the rest of the layer is read only
+            // through the last row (or not at all).
+            if (liveness.cache_only_last && l + 1 == liveness.full_layers && live == n) {
+                if (!liveness.tail) break;
+                narrow(std::size_t(c.heads) * d);
+            }
             b.timing(b.stats.attention_ms, [&] {
             // One attention call per segment, with that segment's rows, KV reads and stride (as forward() alone).
-            for (const auto& p : parts) {
+            for (const auto& p : live_parts) {
             const auto rows = p.rows;
             auto* q = b.q.as<float>() + std::size_t(p.first) * c.heads * d;
             auto* att = b.att.as<float>() + std::size_t(p.first) * c.heads * d;
-            const auto* reads = layer_reads + p.first;
+            const auto* reads = layer_reads + read_base + p.first;
             if (b.stats.attention == AttentionMode::flash && global) {
                 // Stream-owned pack of the producer: rows [0, packed) are converted committed rows; this pass adds
                 // [min(packed, start), start + rows) once, at the producer layer (sharing layers read it as is).
@@ -833,7 +888,7 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
                                     b.stats.attention_packed ? (global ? b.global_halves : b.attention_halves).data() : nullptr,
                                     p.stride, global ? p.stride : std::min(p.stride, c.window + rows - 1), pack);
             } else if (!b.stats.canonical_kernel ||
-                       !canonical_attention(q, std::span<const gpu::KvRead>(all_reads).subspan(std::size_t(l) * n + p.first, rows), c.heads, d, att, b.failure.as<unsigned>(), b.queue,
+                       !canonical_attention(q, std::span<const gpu::KvRead>(all_reads).subspan(std::size_t(l) * n + read_base + p.first, rows), c.heads, d, att, b.failure.as<unsigned>(), b.queue,
                                             {b.canonical_scores.as<float>(), b.canonical_scores.size() / sizeof(float),
                                              b.canonical_denominators.as<float>(), b.canonical_packed.as<float>(),
                                              b.canonical_packed.size() / sizeof(float)})) {
@@ -846,56 +901,56 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
             }
             }
             });
-            b.dot(name + "o", y.o, b.att.as<float>(), b.out.as<float>(), n);
+            b.dot(name + "o", y.o, b.att.as<float>(), b.out.as<float>(), live);
             if (!ple_queued) { b.fork(); b.on_side(b.ple_done, ple_stage); ple_queued = true; }
             if (ple_pending) { checked(hipStreamWaitEvent(b.queue, b.ple_done, 0)); ple_pending = false; }
-            if (!b.add(b.out, y.post_attention_norm, n, {}, y.pre_ffn_norm)) b.norm(b.residual, y.pre_ffn_norm, b.x, n, c.hidden);
-            if (b.stats.linears == Linears::exact && b.exl3_ffn(name, y.gate, y.up, y.down, n)) {
+            if (!b.add(b.out, y.post_attention_norm, live, {}, y.pre_ffn_norm)) b.norm(b.residual, y.pre_ffn_norm, b.x, live, c.hidden);
+            if (b.stats.linears == Linears::exact && b.exl3_ffn(name, y.gate, y.up, y.down, live)) {
                 // EXL3 many-row FFN, down included.
             } else if (b.stats.linears != Linears::wmma) {
                 // The decode target's gate_up: gelu_tanh(gate) * up stored per element.
                 bool down_done = false;
                 if (y.gate.format == WeightFormat::exl3_mul1 || y.up.format == WeightFormat::exl3_mul1 || b.stats.linears == Linears::a8) {
                     // EXL3 packs: separate linears (each profiled), then the decode target's gelu product.
-                    b.dot(name + "gate", y.gate, b.x.as<float>(), b.gate.as<float>(), n);
-                    b.dot(name + "up", y.up, b.x.as<float>(), b.up.as<float>(), n, b.a8_same(y.gate, y.up));
-                    if (b.stats.linears == Linears::a8 && n > 8 && a8_prefill_supported(y.down)) {
-                        b.a8_down(name + "down", y.down, n);
+                    b.dot(name + "gate", y.gate, b.x.as<float>(), b.gate.as<float>(), live);
+                    b.dot(name + "up", y.up, b.x.as<float>(), b.up.as<float>(), live, b.a8_same(y.gate, y.up));
+                    if (b.stats.linears == Linears::a8 && live > 8 && a8_prefill_supported(y.down)) {
+                        b.a8_down(name + "down", y.down, live);
                         down_done = true;
                     } else
-                        b.record(name + "gelu_product", [&] { gpu::gelu_product(b.gate.as<float>(), b.up.as<float>(), n * c.inter, b.queue); });
+                        b.record(name + "gelu_product", [&] { gpu::gelu_product(b.gate.as<float>(), b.up.as<float>(), live * c.inter, b.queue); });
                 } else {
                     b.ranges.push_back({name + "gate", 0.0F}); b.ranges.push_back({name + "up", 0.0F});
                     b.record(name + "gate_up", [&] {
-                        gpu::gate_up_rows(y.gate, y.up, b.x.as<float>(), n, b.gate.as<float>(), b.queue, b.failure.as<unsigned>(),
+                        gpu::gate_up_rows(y.gate, y.up, b.x.as<float>(), live, b.gate.as<float>(), b.queue, b.failure.as<unsigned>(),
                                           gpu::rows_linear_enabled(), -1, b.up.as<float>(), -1, b.fuse);
-                    }, 4.0 * n * y.gate.inputs * y.gate.outputs, true);
+                    }, 4.0 * live * y.gate.inputs * y.gate.outputs, true);
                 }
-                if (!down_done) b.dot(name + "down", y.down, b.gate.as<float>(), b.out.as<float>(), n);
-            } else if (b.exl3_pair(name, y.gate, y.up, y.down, n)) {
-                b.dot(name + "down", y.down, b.gate.as<float>(), b.out.as<float>(), n, true);
+                if (!down_done) b.dot(name + "down", y.down, b.gate.as<float>(), b.out.as<float>(), live);
+            } else if (b.exl3_pair(name, y.gate, y.up, y.down, live)) {
+                b.dot(name + "down", y.down, b.gate.as<float>(), b.out.as<float>(), live, true);
             } else if (b.fused(name, y.gate, y.up, y.down)) {
-                b.gelu_pair(name, y.gate, y.up, n);
-                b.dot(name + "down", y.down, b.gate.as<float>(), b.out.as<float>(), n, true);
+                b.gelu_pair(name, y.gate, y.up, live);
+                b.dot(name + "down", y.down, b.gate.as<float>(), b.out.as<float>(), live, true);
             } else {
-                b.dot(name + "gate", y.gate, b.x.as<float>(), b.gate.as<float>(), n); b.dot(name + "up", y.up, b.x.as<float>(), b.up.as<float>(), n);
-                if (b.fuse) gpu::gelu_product_finite(b.gate.as<float>(), b.up.as<float>(), n * c.inter, b.failure.as<unsigned>(), b.queue);
-                else { gpu::gelu_product(b.gate.as<float>(), b.up.as<float>(), n * c.inter, b.queue); b.finite(b.gate, std::size_t(n) * c.inter); }
-                b.dot(name + "down", y.down, b.gate.as<float>(), b.out.as<float>(), n);
+                b.dot(name + "gate", y.gate, b.x.as<float>(), b.gate.as<float>(), live); b.dot(name + "up", y.up, b.x.as<float>(), b.up.as<float>(), live);
+                if (b.fuse) gpu::gelu_product_finite(b.gate.as<float>(), b.up.as<float>(), live * c.inter, b.failure.as<unsigned>(), b.queue);
+                else { gpu::gelu_product(b.gate.as<float>(), b.up.as<float>(), live * c.inter, b.queue); b.finite(b.gate, std::size_t(live) * c.inter); }
+                b.dot(name + "down", y.down, b.gate.as<float>(), b.out.as<float>(), live);
             }
-            b.add(b.out, y.post_ffn_norm, n);
-            b.dot(name + "ple_gate", y.ple_gate, b.residual.as<float>(), b.gate.as<float>(), n);
-            hipLaunchKernelGGL(ple_product, dim3((n * c.ple_dim + 255U) / 256U), dim3(256), 0, b.queue, b.gate.as<float>(),
-                               b.ple.as<float>(), n * c.ple_dim, c.ple_dim, c.layers, l, b.fused_flag());
+            b.add(b.out, y.post_ffn_norm, live);
+            b.dot(name + "ple_gate", y.ple_gate, b.residual.as<float>(), b.gate.as<float>(), live);
+            hipLaunchKernelGGL(ple_product, dim3((live * c.ple_dim + 255U) / 256U), dim3(256), 0, b.queue, b.gate.as<float>(),
+                               b.ple.as<float>(), live * c.ple_dim, c.ple_dim, c.layers, l, b.fused_flag());
             launched();
-            if (!b.fuse) b.finite(b.gate, std::size_t(n) * c.ple_dim);
-            b.dot(name + "ple_projection", y.ple_projection, b.gate.as<float>(), b.out.as<float>(), n); x_ready = b.add(b.out, y.post_ple_norm, n, y.scalar, l + 1 < c.layers ? w.layer[l + 1].input_norm : w.final_norm);
+            if (!b.fuse) b.finite(b.gate, std::size_t(live) * c.ple_dim);
+            b.dot(name + "ple_projection", y.ple_projection, b.gate.as<float>(), b.out.as<float>(), live); x_ready = b.add(b.out, y.post_ple_norm, live, y.scalar, l + 1 < c.layers ? w.layer[l + 1].input_norm : w.final_norm);
             if (want_taps) for (unsigned t = 0; t < 5; ++t) if (tap_layers[t] == l)
                 checked(hipMemcpy2DAsync(b.taps.as<float>() + t * c.hidden, 5ULL * c.hidden * sizeof(float), b.residual.data(),
-                                        std::size_t(c.hidden) * sizeof(float), std::size_t(c.hidden) * sizeof(float), n, hipMemcpyDeviceToDevice, b.queue));
-            if (want_taps && device_finite && l == last_tap) { b.finite(b.taps, std::size_t(n) * result.tap_width); taps_checked = true; }
+                                        std::size_t(c.hidden) * sizeof(float), std::size_t(c.hidden) * sizeof(float), live, hipMemcpyDeviceToDevice, b.queue));
+            if (want_taps && device_finite && l == last_tap) { b.finite(b.taps, std::size_t(live) * result.tap_width); taps_checked = true; }
             // The copy queue drains the taps while the remaining layers run.
-            if (pinned && want_taps && l == last_tap) { b.drain_taps(n, result.tap_width); taps_issued = true; }
+            if (pinned && want_taps && l == last_tap) { b.drain_taps(live, result.tap_width); taps_issued = true; }
         }
         if (want_taps && device_finite && !taps_checked && !stage_a) { b.finite(b.taps, std::size_t(n) * result.tap_width); taps_checked = true; }
         if (pinned && want_taps && !taps_issued && !stage_a) { b.drain_taps(n, result.tap_width); taps_issued = true; }
@@ -918,7 +973,9 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
             ps.pipe->release(ps.sequence);
             ps.seal_ms += std::chrono::duration<double, std::milli>(Clock::now() - sealing).count();
         }
-        if (!x_ready && !stage_a) b.norm(b.residual, w.final_norm, b.x, n, c.hidden);
+        const bool ended = liveness.ends_at_state();
+        b.last_row_dropped = ended;
+        if (!x_ready && !stage_a && !ended) b.norm(b.residual, w.final_norm, b.x, live, c.hidden);
         // Last-row-only head uses the same WMMA tile and K order. Qualification
         // can request every row without changing any already computed state.
         const unsigned head_rows = all_logits ? n : 1;
@@ -926,10 +983,10 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
         if (head) {
             if (b.queue_io) b.grow(b.logits, std::size_t(head_rows) * c.vocab * sizeof(float));
             else b.logits.resize(std::size_t(head_rows) * c.vocab * sizeof(float));
-            b.dot("head", w.head.data ? w.head : w.embedding, b.x.as<float>() + (all_logits ? 0 : std::size_t(n - 1) * c.hidden), b.logits.as<float>(), head_rows);
+            b.dot("head", w.head.data ? w.head : w.embedding, b.x.as<float>() + (all_logits ? 0 : std::size_t(live - 1) * c.hidden), b.logits.as<float>(), head_rows);
             gpu::cap_logits(b.logits.as<float>(), head_rows * c.vocab, b.queue); b.finite(b.logits, std::size_t(head_rows) * c.vocab);
-        } else if (!stage_a) {
-            checked(hipMemcpyAsync(b.last_row.data(), b.x.as<float>() + std::size_t(n - 1) * c.hidden, std::size_t(c.hidden) * sizeof(float),
+        } else if (!stage_a && !ended) {
+            checked(hipMemcpyAsync(b.last_row.data(), b.x.as<float>() + std::size_t(live - 1) * c.hidden, std::size_t(c.hidden) * sizeof(float),
                                    hipMemcpyDeviceToDevice, b.queue));
         }
         if (pinned && hidden)
@@ -1045,6 +1102,7 @@ void DevicePrefill::set_linear_policy(const LinearPolicy& policy) {
 }
 std::vector<float> DevicePrefill::last_logits() {
     auto& b = *impl_; const auto& w = b.w; const auto& c = w.config;
+    if (b.last_row_dropped) throw std::logic_error("prefill pass kept no last row (keep_last_row(false))");
     // Same head instruction sequence on the saved final-norm row; its range is
     // recorded after the deferring chunk's ranges, whose maxima slots are free.
     const auto index = b.ranges.size();
