@@ -361,7 +361,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_SERVE_T16K` | qwen | ON: T16384 owner when the context admits a 32,768-token request and every resident slot fits; `0` keeps T8192 | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 | `STRIX_SERVE_FP16_MTP` | qwen | ON: explicit-sidecar MTP servers keep the automatic FP16 prefill arithmetic with the unqualified fast options off; `0` declines it | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 
-### Decode, MTP y DSpark (25)
+### Decode, MTP y DSpark (26)
 
 | Toggle | Motor | Por defecto | Detalles |
 |---|---|---|---|
@@ -391,6 +391,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_QWEN_DECODE_FUSE` | qwen | ON (por defecto; STRIX_QWEN_DECODE_FUSE=0 restaura la secuencia de tres lanzamientos) | [qwen-decode-fuse](optimizations.md#qwen-decode-fuse) |
 | `STRIX_QWEN_YARN_MTP` | qwen | table-backed QSA MTP pool and rolling... | [qwen-yarn-mtp](optimizations.md#qwen-yarn-mtp) |
 | `STRIX_TOOL_DRAFT_PREFIX_GATE` | qwen | ON (batched decoding) | [qwen-tool-draft](optimizations.md#qwen-tool-draft) |
+| `STRIX_QRTX_COMMIT_ASYNC` | qwen-rtx | off | [qwen-rtx-commit-async](optimizations.md#qwen-rtx-commit-async) |
 
 ### Transporte del par (25)
 
