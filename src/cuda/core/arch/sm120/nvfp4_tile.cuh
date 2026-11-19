@@ -188,7 +188,8 @@ __device__ __forceinline__ void epilogue(const GemmArgs& a, const float (&acc)[4
 
 // ---- Feed::bulk (strix/cuda/core/nvfp4_tile.hpp). Warp kMmaWarps is the producer: it copies each record of a stage with ONE 1-D
 // bulk copy (TMA engine, async proxy) into a full / empty mbarrier ring, so no copy instruction enters the MMA warps' MIO queue
-// (rtx_dense5: 7 LDGSTS per thread per stage queued ahead of the kb0 fragments; moving them into the MMA window lost 4-7 %).
+// (a profile of the dense FAST4 prefill: 7 LDGSTS per thread per stage queued ahead of the kb0 fragments; moving them into
+// the MMA window lost 4-7 %).
 // The eight MMA warps wait for a stage and release it per warp: no CTA-wide barrier per stage. The records already sit in MMA
 // fragment order, so there is no tensor map, swizzle or ldmatrix. Same stage bytes at the same shared offsets (stage_record ==
 // the chunks of stage_chunk, tile_host), stage_mma and epilogue unchanged: bitwise equal to Feed::lsu.
