@@ -4952,11 +4952,11 @@ A row routes to an expert at most once, so a step of at most 16 rows gives every
 Those launches of the tensor-core GSQ expert kernels bind one accumulator block instead of four. The freed registers
 hold a three-group ring of weight fields in flight, where the tile form keeps a one-group lookahead.
 
-- **Preconditions:** CUDA Qwen MoE with `gsq_bf16_mma` experts (the FAST expert arithmetic); steps of at most 16 rows (decode, MTP verify windows). Prefill blocks keep the tile form; the exact profile runs no tensor-core experts.
+- **Preconditions:** CUDA Qwen MoE with `gsq_bf16_mma` experts (the FAST expert arithmetic); steps of at most 16 rows (decode, MTP verify windows, and a prefill block of at most 16 rows: a short prompt or a tail block). Prefill blocks of more than 16 rows keep the tile form; the exact profile runs no tensor-core experts.
 - **Automatic selection:** On in every profile (an absent lever row = on); the launch picks the form from the step's row count. A wider tile under the decode form fails closed.
-- **Exactness evidence:** Same MMAs and scale FMAs in the same order for every output (bitwise the tile form). The tile form compiles to the previous instructions for every type except the IQ2_S project kernel (schedule only, same floating-point opcode multiset). Greedy ids equal on prose, edit and json. Contract and bundle id unchanged; `qwen_cuda_profile_host_test` checks the switch, serve == CLI and the unchanged id.
+- **Exactness evidence:** Same MMAs and scale FMAs in the same order for every output (bitwise the tile form). The tile form compiles to the previous instructions for every type except the IQ2_S project kernel (schedule only, same floating-point opcode multiset). Greedy ids equal on prose, edit and json; teacher-forced FAST logits of the decode form identical to the tile form (`--expert-decode-tile off`) on 645 rows of five contents (prose, edit, json, code, an 8K prompt). Contract and bundle id unchanged; `qwen_cuda_profile_host_test` checks the switch, serve == CLI and the unchanged id.
 - **Off switch:** `--expert-decode-tile off`; `STRIX_QRTX_EXPERT_DECODE_TILE=0`
-- **Measured gain:** RTX PRO 6000, FAST served decode e2e: prose 127.22 -> 137.6 / 138.98, edit 342.37 -> 380.98 / 378.97, json 287.14 -> 316.32 / 317.26 tok/s (two runs).
+- **Measured gain:** RTX PRO 6000 600 W, FAST served decode e2e: prose 127.22 -> 137.6 / 138.98, edit 342.37 -> 380.98 / 378.97, json 287.14 -> 316.32 / 317.26 tok/s (one run before, two runs after).
 - **Implementation / evidence:** [kernels](../src/cuda/core/moe_a8_mma.cuh), [form constants](../src/cuda/core/native_mma.hpp), [lever row](../include/strix/profiles/qwen_cuda.hpp)
 
 <a id="qwen-dense-cuda-profile"></a>
