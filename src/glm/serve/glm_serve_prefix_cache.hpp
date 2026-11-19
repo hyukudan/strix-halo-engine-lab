@@ -131,12 +131,19 @@ public:
     std::uint64_t pending_bytes() const { return keep_.pending_bytes(); }
     std::uint64_t budget() const { return keep_.budget(); }
     std::size_t size() const { return keep_.size(); }
-    strix::serve::KeepStats stats() const { return keep_.stats(); }
+    // A paired store refused before it reached the keep (memory floor, budget bound, snapshot failure, peer vote).
+    void note_refused() { ++refused_; }
+    strix::serve::KeepStats stats() const {
+        auto k = keep_.stats();
+        k.refused += refused_;
+        return k;
+    }
     strix::serve::ConversationKeep& keep() { return keep_; }
     const strix::serve::ConversationKeep& keep() const { return keep_; }
 
 private:
     strix::serve::ConversationKeep keep_;
+    std::uint64_t refused_ = 0;
     std::list<std::pair<std::uint64_t, std::vector<std::uint8_t>>> payload_, pending_payload_;
 };
 

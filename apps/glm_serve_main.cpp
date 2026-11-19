@@ -1651,6 +1651,8 @@ int main(int argc, char** argv) {
             counter("strix_glm_serve_mtp_tokens_total", "Tokens emitted on the C1 MTP path.", st.mtp_tokens);
             counter("strix_glm_serve_mtp_seconds_total", "Wall time on the C1 MTP path.", st.mtp_seconds);
             counter("strix_glm_serve_mtp_enters_total", "Entries into the MTP path from plain steps.", st.mtp_enters);
+            counter("strix_glm_serve_mtp_bootstraps_total", "Entries into the MTP path seeded by the request's own MTP prefill.",
+                    st.mtp_bootstraps);
             counter("strix_glm_serve_mtp_leaves_total", "Exits from the MTP path (decoder closed at a cycle boundary).", st.mtp_leaves);
             counter("strix_glm_serve_g2_cycles_total", "Batched self-speculation cycles (one multi-slot verify each).", st.g2_cycles);
             counter("strix_glm_serve_g2_rows_total", "Rows of the batched self-speculation verifies.", st.g2_rows);
@@ -1660,6 +1662,7 @@ int main(int argc, char** argv) {
                 counter("strix_glm_serve_prefix_hits_total", "Prefix cache hits.", st.prefix_hits);
                 counter("strix_glm_serve_prefix_misses_total", "Prefix cache misses.", st.prefix_misses);
                 counter("strix_glm_serve_prefix_stores_total", "Paired prefix stores.", st.prefix_stores);
+                counter("strix_glm_serve_prefix_refused_total", "Paired prefix stores refused (reason on stderr).", st.prefix_refused);
                 counter("strix_glm_serve_prefix_evictions_total", "Prefix LRU evictions.", st.prefix_evictions);
                 m << "# TYPE strix_glm_serve_prefix_bytes gauge\nstrix_glm_serve_prefix_bytes " << st.prefix_bytes << '\n';
             }

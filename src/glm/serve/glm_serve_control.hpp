@@ -12,7 +12,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <span>
 #include <stdexcept>
@@ -399,13 +401,23 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
                 throw ProtocolError("prefix cache: invalid snapshot");
             ch.tokens(prompt, c.plen, sender);
             bool ok = false;
+            std::string why;  // a refused store names its reason (one stderr line per refusal, counted as refused)
+            bool keep_counted = false;
             try {
                 if constexpr (requires { eng.state_bytes_upto(c.pslot, c.ppos); eng.prefix_state_bound(c.ppos); }) {
                     bool available = false;
                     if constexpr (requires { eng.prefix_store_allowed(); }) available = eng.prefix_store_allowed();
                     else available = prefix_memory_available();
                     cache->commit(false);
-                    if (available && cache->can_stage(eng.prefix_state_bound(c.ppos), prompt.size())) {
+                    const std::uint64_t bound = eng.prefix_state_bound(c.ppos);
+                    if (!available) {
+                        const auto avail = prefix_memory_bytes();
+                        why = "host memory below the store floor (MemAvailable " +
+                              (avail ? std::to_string(*avail >> 20) + " MiB" : std::string("unknown")) + ")";
+                    } else if (!cache->can_stage(bound, prompt.size())) {
+                        why = "budget (bound " + std::to_string(bound) + " B, held " + std::to_string(cache->bytes()) + " of " +
+                              std::to_string(cache->budget()) + " B)";
+                    } else {
                         PrefixCache::Entry e;
                         e.id = c.prefix_id;
                         e.identity = c.prefix_identity;
@@ -414,10 +426,23 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
                         e.frontier = c.ppos;
                         e.ids = prompt;
                         e.state = eng.state_bytes_upto(c.pslot, c.ppos);
+                        const std::size_t got = e.state.size();
                         ok = cache->prepare(std::move(e));
+                        if (!ok) {  // the keep counts this refusal itself
+                            why = "keep refused the entry (" + std::to_string(got) + " B, bound " + std::to_string(bound) + " B)";
+                            keep_counted = true;
+                        }
                     }
+                } else {
+                    why = "engine has no snapshot support";
                 }
-            } catch (...) { ok = false; }
+            } catch (const std::exception& x) {
+                ok = false;
+                why = std::string("snapshot failed: ") + x.what();
+            } catch (...) {
+                ok = false;
+                why = "snapshot failed";
+            }
             if (!ok) cache->commit(false);
             // Both ranks report before the lead's commit decision. No token echo changes.
             Control vote;
@@ -426,7 +451,17 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
             vote.prefix_ok = ok ? 1U : 0U;
             vote.prefix_bytes = cache->pending_bytes();
             const auto peer = ch.exchange(vote);
-            if (!peer.prefix_ok || peer.prefix_id != c.prefix_id || peer.prefix_bytes != vote.prefix_bytes) cache->commit(false);
+            if (ok && (!peer.prefix_ok || peer.prefix_id != c.prefix_id || peer.prefix_bytes != vote.prefix_bytes)) {
+                why = !peer.prefix_ok ? std::string("peer refused")
+                                      : "rank layouts disagree (local " + std::to_string(vote.prefix_bytes) + " B, peer " +
+                                            std::to_string(peer.prefix_bytes) + " B)";
+                cache->commit(false);
+            }
+            if (!why.empty()) {
+                if (!keep_counted) cache->note_refused();
+                std::fprintf(stderr, "rank %u prefix store refused (id %llu, rows %llu): %s\n", ch.rank(),
+                             static_cast<unsigned long long>(c.prefix_id), static_cast<unsigned long long>(c.ppos), why.c_str());
+            }
             out.push_back(cache->pending_bytes() != 0 ? 1U : 0U);
             return out;
         }
