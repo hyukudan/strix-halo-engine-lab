@@ -6,6 +6,12 @@
 //   strix-hy4-dfly accept SHARD.safetensors TAPDIR[,TAPDIR...] [--variant V[;V...]]
 // drafts one DFly2 block (src/hy4/ref/hy4_dfly_ref) at every anchor of the greedy region of each taps run and prints the
 // acceptance against the target's greedy ids: E = 1 + mean accepted run (0..5), hit rate per proposal row, ms per block.
+//   strix-hy4-dfly mtp PART1.gguf [PART2.gguf] TAPDIR[,TAPDIR...] [--hidden pre|post] [--chain pre|post] [--depth D] [--threads T]
+// runs the pack's next-token (MTP) block (GGUF block `layers`, HostRef::nextn_step) over the target state of each taps
+// run: a teacher step at every fed position p (token ids[p+1], the target's hidden at p) fills the block's K/V; at every
+// anchor of the greedy region a chain of up to D drafts (each step feeds its own argmax and its own hidden: --chain pre
+// = x before shared_head_norm, post = shared_head_norm(x)) is compared with
+// the target's greedy ids, then rolled back. Prints P(run >= k) and E(d) = 1 + sum_{k<=d} P(run >= k), d = 1..D.
 // Files (little-endian): ids.txt (fed ids, then the last argmax), hidden_pre.f32 / hidden_post.f32 [P][hidden],
 // latents.f32 [kv layer][P][kv_lora + qk_rope], embed.f32 [P + 1][hidden] (row P = mask id), head.bf16
 // [vocab][hidden], manifest.txt.
@@ -16,6 +22,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <iomanip>
 #include <map>
 #include <memory>
 #include <span>
@@ -292,12 +299,98 @@ int kvb(int argc, char** argv) {
 
 }  // namespace
 
+// The pack's MTP block over taps runs (see the header comment): acceptance by chain depth.
+int mtp(int argc, char** argv) {
+    std::vector<std::filesystem::path> parts;
+    std::vector<std::string> dirs;
+    bool post = false, chain_post = false;
+    std::uint32_t depth = 6, threads = 1;
+    for (int i = 2; i < argc; ++i) {
+        const std::string a = argv[i];
+        const bool more = i + 1 < argc;
+        if (a == "--hidden" && more) post = std::string(argv[++i]) == "post";
+        else if (a == "--chain" && more) chain_post = std::string(argv[++i]) == "post";
+        else if (a == "--depth" && more) depth = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+        else if (a == "--threads" && more) threads = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+        else if (a.size() > 5 && a.ends_with(".gguf")) parts.emplace_back(a);
+        else {
+            std::stringstream in(a);
+            std::string d;
+            while (std::getline(in, d, ',')) dirs.push_back(d);
+        }
+    }
+    if (parts.empty() || dirs.empty() || depth == 0U)
+        throw std::invalid_argument("usage: strix-hy4-dfly mtp PART1.gguf [PART2.gguf] TAPDIR[,TAPDIR...] [--hidden pre|post] [--chain pre|post] [--depth D] [--threads T]");
+    strix::hy4::set_ref_threads(threads);
+    const auto config = Config::from_gguf(parts.front());
+    if (config.nextn != 1U) throw std::runtime_error("the pack has no next-token block");
+    auto weights = strix::hy4::pack_weights(parts);
+    std::vector<std::uint64_t> eligible_all(depth + 1U, 0U), reached_all(depth + 1U, 0U);
+    const auto report = [&](const std::string& name, const std::vector<std::uint64_t>& eligible, const std::vector<std::uint64_t>& reached,
+                            double ms, std::uint64_t steps) {
+        std::cout << "mtp " << name << " hidden=" << (post ? "post" : "pre") << " chain=" << (chain_post ? "post" : "pre") << " anchors " << eligible[1] << " P(run>=k)";
+        double e = 1.0;
+        std::ostringstream es;
+        es << std::fixed << std::setprecision(2);
+        for (std::uint32_t k = 1; k <= depth; ++k) {
+            const double pk = eligible[k] ? static_cast<double>(reached[k]) / static_cast<double>(eligible[k]) : 0.0;
+            e += pk;
+            std::cout << ' ' << std::fixed << std::setprecision(3) << pk;
+            es << ' ' << e;
+        }
+        std::cout << " | E(d=1.." << depth << ")" << es.str();
+        if (steps) std::cout << " | " << steps << " steps " << std::setprecision(1) << ms / static_cast<double>(steps) << " ms/step";
+        std::cout << std::endl;
+    };
+    for (const auto& dir : dirs) {
+        const auto m = read_manifest(dir);
+        const auto P = static_cast<std::uint32_t>(std::stoul(m.at("positions")));
+        const auto prompt = static_cast<std::uint32_t>(std::stoul(m.at("prompt")));
+        const auto ids = read_ids((std::filesystem::path(dir) / "ids.txt").string());
+        const auto hid = read_f32(std::filesystem::path(dir) / (post ? "hidden_post.f32" : "hidden_pre.f32"), std::size_t{P} * config.hidden);
+        if (ids.size() != P + 1U) throw std::runtime_error("ids.txt must hold the fed ids and the last argmax");
+        strix::hy4::HostRef ref(config, *weights);
+        std::vector<std::uint64_t> eligible(depth + 1U, 0U), reached(depth + 1U, 0U);
+        double ms = 0.0;
+        std::uint64_t steps = 0;
+        const auto timed = [&](std::uint32_t token, const std::vector<float>& h, std::uint32_t pos) {
+            const auto t0 = std::chrono::steady_clock::now();
+            auto out = ref.nextn_step(token, h, pos);
+            ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            ++steps;
+            return out;
+        };
+        for (std::uint32_t p = 0; p < P && p + 1U < ids.size(); ++p) {
+            const std::vector<float> h(hid.begin() + static_cast<std::ptrdiff_t>(std::size_t{p} * config.hidden),
+                                       hid.begin() + static_cast<std::ptrdiff_t>(std::size_t{p + 1U} * config.hidden));
+            auto cur = timed(ids[p + 1U], h, p);  // teacher step: the block's K/V at p; drafts the id at p + 2
+            if (p + 1U < prompt || p + 2U >= ids.size()) continue;  // anchors: the greedy region (ids[p + 2] is the target's)
+            for (std::uint32_t k = 1; k <= depth && p + 1U + k < ids.size(); ++k) {
+                ++eligible[k];
+                if (cur.argmax != ids[p + 1U + k]) {
+                    for (std::uint32_t r = k + 1U; r <= depth && p + 1U + r < ids.size(); ++r) ++eligible[r];
+                    break;
+                }
+                ++reached[k];
+                if (k == depth || p + 2U + k >= ids.size()) break;
+                cur = timed(cur.argmax, chain_post ? cur.normed : cur.hidden, p + k);  // chained draft: own argmax and own hidden
+            }
+            ref.nextn_truncate(p + 1U);
+        }
+        report(dir, eligible, reached, ms, steps);
+        for (std::uint32_t k = 0; k <= depth; ++k) { eligible_all[k] += eligible[k]; reached_all[k] += reached[k]; }
+    }
+    if (dirs.size() > 1U) report("pooled", eligible_all, reached_all, 0.0, 0U);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc >= 2 && std::string(argv[1]) == "taps") return taps(argc, argv);
         if (argc >= 2 && std::string(argv[1]) == "accept") return accept(argc, argv);
         if (argc >= 2 && std::string(argv[1]) == "kvb") return kvb(argc, argv);
-        std::cerr << "usage: strix-hy4-dfly taps|accept|kvb ...\n";
+        if (argc >= 2 && std::string(argv[1]) == "mtp") return mtp(argc, argv);
+        std::cerr << "usage: strix-hy4-dfly taps|accept|kvb|mtp ...\n";
         return 2;
     } catch (const std::exception& e) {
         std::cerr << "strix-hy4-dfly: " << e.what() << '\n';
