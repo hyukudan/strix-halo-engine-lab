@@ -455,6 +455,10 @@ if(BUILD_TESTING)
         # Source form of the shared EXACT dense decode attention (fp contraction pinned, one arithmetic copy).
         add_test(NAME strix-dense-decode-exact-form-tests
             COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/dense_decode_exact_form_tests.py)
+        # Kernel contract checker (tools/check_kernel_scratch.py): allowance / launch-budget parser, budget check and
+        # machine-code identity normalisation against planted controls; no GPU, no binary.
+        add_test(NAME strix-kernel-contract-self-test
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tools/check_kernel_scratch.py --self-test)
     endif()
     add_executable(strix-a4-tiles-host-tests tests/a4_tiles_host_tests.cpp)
     target_include_directories(strix-a4-tiles-host-tests PRIVATE src)
