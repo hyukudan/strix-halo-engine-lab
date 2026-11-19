@@ -22,6 +22,7 @@
 #include "ops/glu/glu_device.hpp"
 #include "ops/norm/norm_presets.hpp"
 #include "ops/rope/rope_device.hpp"
+#include "strix/a8_row_pitch.hpp"
 #include "strix/ds41_moe.hpp"
 #include "strix/engram/read_ahead.hpp"
 #include "strix/engram/row_reader.hpp"
@@ -437,7 +438,8 @@ struct Forward::Impl {
         pr.u = alloc<float>(R * h); pr.xn = alloc<float>(R * h); pr.f = alloc<float>(R * h);
         pr.partial = alloc<float>(std::max(hcc::mix_partial_floats<kSub>(rmax, c.hidden), hcc::mix_partial_floats<kHead>(1, c.hidden)));
         pr.mix = alloc<hcc::MixRow<kSub>>(R);
-        pr.codes = alloc<std::int8_t>(R * wide); pr.deltas = alloc<float>(R * wide / 32U); pr.sums = alloc<std::int32_t>(R * wide / 32U);
+        const std::size_t a8w = wide + strix::kA8PitchPadBytes;  // any strix::a8_row_pitch(x_stride <= wide) fits
+        pr.codes = alloc<std::int8_t>(R * a8w); pr.deltas = alloc<float>(R * a8w / 32U); pr.sums = alloc<std::int32_t>(R * a8w / 32U);
         pr.gate = alloc<float>(R * H * c.v_head); pr.qa = alloc<float>(R * c.q_lora); pr.qv = alloc<float>(R * H * c.qk_head());
         pr.ckv = alloc<float>(R * row); pr.ckn = alloc<float>(R * c.kv_lora);
         pr.qfull = alloc<float>(R * H * row); pr.qt = alloc<std::uint16_t>(R * H * row);
@@ -751,7 +753,10 @@ struct Forward::Impl {
                    std::uint32_t x_stride, float* y, std::uint32_t y_stride, std::uint32_t batch = 1U, std::uint32_t batch_in = 0U,
                    std::uint32_t batch_out = 0U, bool round = false, const float* bias = nullptr) {
         namespace q8 = strix::core::f16_dense_tall::q8a8;
-        strix::ds41::enqueue_quantize_a8(x, x_stride, R, pr.codes, pr.deltas, pr.sums, s);
+        // A8 rows at the shared operand pitch: a pitch that is a multiple of 8 KiB (K_b 16384, V_b 32768, o_proj 16384)
+        // aliases the 128 rows a CTA stage reads (strix/a8_row_pitch.hpp); same values, same bits.
+        const std::uint32_t pitch = strix::a8_row_pitch(x_stride);
+        strix::ds41::enqueue_quantize_a8(x, x_stride, R, pitch, pr.codes, pr.deltas, pr.sums, s);
         q8::View v{};
         v.weight = weights;
         v.codes = pr.codes;
@@ -761,7 +766,7 @@ struct Forward::Impl {
         v.in = width;
         v.count = outputs;
         v.rows = R;
-        v.x_stride = x_stride;
+        v.x_stride = pitch;
         v.out_stride = y_stride;
         v.batch = batch;
         v.batch_in = batch_in;
