@@ -1,6 +1,7 @@
 #include "head.cuh"
 #include "producer/head_select.hpp"
 #include "row_mma.cuh"
+#include "../../core/head_argmax.cuh"
 #include <cutlass/gemm/device/gemm_grouped.h>
 #include <cutlass/gemm/kernel/default_gemm_grouped.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
@@ -9,14 +10,12 @@
 namespace strix::glm::rtxpf {
 namespace {
 #include "projection.inl"
-__global__ __launch_bounds__(1024) void argmax_kernel(const float* x,unsigned n,U32* result) {
-    __shared__ float sv[1024];__shared__ U32 si[1024],sn[1024];unsigned l=threadIdx.x;
-    float best=0;U32 id=producer::no_token,bad=0;
-    for(unsigned j=l;j<n;j+=1024){float v=x[j];if(!isfinite(v)){++bad;continue;}if(producer::head_better(v,j,best,id)){best=v;id=j;}}
-    sv[l]=best;si[l]=id;sn[l]=bad;__syncthreads();
-    for(unsigned h=512;h;h/=2){if(l<h){if(producer::head_better(sv[l+h],si[l+h],sv[l],si[l])){sv[l]=sv[l+h];si[l]=si[l+h];}sn[l]+=sn[l+h];}__syncthreads();}
-    if(l==0){result[0]=si[0];result[1]=sn[0];result[2]=__float_as_uint(sv[0]);}
-}
+struct EmitChoice {  // HeadChoice words per row: token, nonfinite count, logit bits
+    U32* result;
+    __device__ void operator()(std::uint32_t row,const ::strix::head_argmax::Pick& p) const {
+        U32* r=result+4*row;r[0]=p.index;r[1]=p.nonfinite;r[2]=__float_as_uint(p.value);
+    }
+};
 }
 std::size_t head_decoded_bytes(){return std::size_t(head_hidden)*head_vocab*2;}
 std::size_t head_workspace_bytes(unsigned rows){return ((std::size_t(rows)*head_hidden*2+255)&~std::size_t(255))+std::size_t(rows)*head_vocab*4;}
@@ -32,7 +31,11 @@ cudaError_t enqueue_head(const HeadWeights& h,const float* x,float* logits,unsig
     output_transform<<<(rows*(head_vocab/128)+7)/8,256,0,s>>>(raw,logits,h.svh,rows,head_vocab);
     return cudaGetLastError();
 }
-cudaError_t enqueue_argmax(const float* x,unsigned n,U32* result,cudaStream_t s){
-    if(!x||!n||!result)return cudaErrorInvalidValue;argmax_kernel<<<1,1024,0,s>>>(x,n,result);return cudaGetLastError();
+std::size_t argmax_workspace_bytes(unsigned rows){return ::strix::head_argmax::workspace_bytes(rows);}
+cudaError_t enqueue_argmax(const float* x,unsigned n,unsigned rows,U32* result,void* workspace,cudaStream_t s){
+    if(!x||!n||!rows||rows>16||!result||!workspace)return cudaErrorInvalidValue;
+    ::strix::cuda::core::head_argmax::View v;v.logits=x;v.stride=n;v.count=n;v.rows=rows;
+    v.partial=static_cast<::strix::head_argmax::Pick*>(workspace);
+    return ::strix::cuda::core::head_argmax::pick_rows(v,EmitChoice{result},s);
 }
 }

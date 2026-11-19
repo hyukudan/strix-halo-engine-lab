@@ -19,9 +19,9 @@ off switches are in [performance](docs/performance.md) and [measured gains](docs
 | Qwen3.8-Flash-Next | 1 node | 62.44 tok/s (MTP, 1K code) | 1,885 tok/s at 8K, 1,845-1,856 at 32K, 1,755-1,762 at 128K (exact); 2,008 at 8K (`fast`, opt-in; quality qualification in progress) |
 | Qwen3.8-Flash-Next | 2 nodes (two replicas, server) | 158.1 tok/s total with 8 streams (68.2 with 1) | - |
 | Qwen3.8-Flash-Next | 2 nodes (pipelined prefill, opt-in) | - | 2,968 tok/s at 32K (exact), 3,191 (`fast`, opt-in; quality qualification in progress); below 28,672 prompt rows the pair runs the prompt on one node |
-| DeepSeek V4.1 Flash | pair | 70.6 tok/s (DSpark, code) | 1,165 tok/s at 8K, 1,285 at 32K (exact); 1,377 / 1,546 with the FAST prefill profile (opt-in; [floor-relative quality gate passed](docs/models/deepseek-v4.1/README.md#fast-prefill-quality-gate)) |
-| MiniMax M3.1 Flash | pair | 23.10 tok/s (1K) | 669 tok/s at 8K, 529 at 32K (exact) |
-| GLM-5.3 Flash | pair | 44.5 tok/s (MTP, code) | 664 tok/s at 8K (exact, warm second prefill), 642 at 32K (exact); `fast` (opt-in; quality qualification in progress) at 8K: 957 warm, 918 fresh process |
+| DeepSeek V4.1 Flash | pair | 70.6 tok/s (DSpark, code) | 1,140 tok/s at 8K, 1,264 at 32K (exact, warm second prefill); FAST prefill set (opt-in, explicit switches; the bundle `STRIX_DS41_FAST_PREFILL=1` passed its [floor-relative quality gate](docs/models/deepseek-v4.1/README.md#fast-prefill-quality-gate), the three levers added to it are in qualification; `--profile fast` selects the set after its own gate): 1,557 at 8K, 1,784 at 32K (warm) |
+| MiniMax M3.1 Flash | pair | 23.10 tok/s (1K) | 660 tok/s at 8K (exact, warm second prefill), 612 at 32K (exact, single prefill); `fast` (opt-in; quality gate passed at 8K and 32K): 704 at 8K (warm), 666 at 32K (single prefill) |
+| GLM-5.3 Flash | pair | 44.5 tok/s (MTP, code) | 655 tok/s at 8K (exact, warm second prefill), 642 at 32K (exact); FAST prefill (explicit `STRIX_GLM_PF_WMMA=1`; unqualified: fails the 8K quality gate, so `--profile fast` does not select it): 1,000 at 8K (warm), 949 at 32K (single prefill) |
 | Nemotron 3.5 Bolt E4B | 1 node | 91.9 tok/s (C1) | 2,780 tok/s at 8K, 2,336 at 32K (`fast`) |
 | Nemotron 3.5 Bolt E4B | 2 nodes (pipelined prefill, opt-in) | - | 4,804 tok/s at 8K, 3,965 at 32K (`fast`, same bytes as 1 node) |
 | MiniMax H3 | pair | 5 s 1344x768 clip with audio in 405.5 s | - |

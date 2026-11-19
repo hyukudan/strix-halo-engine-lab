@@ -229,7 +229,16 @@ PrefillPolicy prefill_policy(const Lookup& env) {
     PrefillPolicy p;
     // The MSA flash member runs on the exact EXL3 MoE base only (its gate fails on FAST_I4); an explicit value still wins.
     const bool i4 = fast_i4_format(env);
-    p.canonical = fp::expand(kFastBundle, env, [&](const fp::Member&) { return !i4; });
+    // The bundle switch as the product profile selects it (fp::profile_switch): '--profile fast' expands the same
+    // members, admission and canonical values as STRIX_MM_FAST_PREFILL=1; a set switch ("0" included) wins.
+    p.bundle_column = profile_column_selects_bundle(env);
+    p.bundle_from_profile = p.bundle_column && !fp::set(env(kFastBundle.env));
+    if (p.bundle_from_profile && baseline(env))
+        throw std::invalid_argument(std::string("--profile fast selects the FAST bundle ") + kFastBundle.profile + "; " +
+                                    kBaselineEnv + "=1 (--baseline) is the exact baseline: drop one of the two");
+    const fp::Getenv bundle_env = fp::profile_switch(kFastBundle, p.bundle_from_profile ? "1" : "", env);
+    p.canonical = fp::expand(kFastBundle, bundle_env, [&](const fp::Member&) { return !i4; });
+    if (p.bundle_from_profile) p.canonical.erase(kFastBundle.env);  // requested by the word, not by the switch
     const auto it = p.canonical.find(flash.env);
     const std::string mode = it != p.canonical.end() ? it->second : "0";
     p.msa_flash = mode == "0" ? 0U : static_cast<unsigned>(mode[0] - '0');
@@ -259,8 +268,9 @@ PrefillPolicy prefill_policy(const Lookup& env) {
         p.policies = p.msa_flash == 1 && msa_flash_policy(p.msa_flash_layers) != nullptr
                          ? std::string(msa_flash_policy(p.msa_flash_layers))
                          : std::string("msa-flash-bf16") + (p.msa_flash == 2 ? "-2term" : p.msa_flash == 3 ? "-rg4" : "") + "-l" + p.msa_flash_layers;
-    if (i4 && fp::switch_on(env(kFastBundle.env)) && !fp::set(raw))
-        p.note = std::string(flash.policy) + " not selected by " + kFastBundle.env + " on STRIX_MMX_MODEL_FORMAT=fast_i4";
+    if (i4 && fp::switch_on(bundle_env(kFastBundle.env)) && !fp::set(raw))
+        p.note = std::string(flash.policy) + " not selected by " + (p.bundle_from_profile ? "--profile fast" : kFastBundle.env) +
+                 " on STRIX_MMX_MODEL_FORMAT=fast_i4";
     // Index projections on the shared WMMA core (opt-in member, mm_profile_table.hpp kIdxWmmaPolicy).
     const char* iw = env("STRIX_MM_PF_IDX_WMMA");
     if (fp::set(iw) && std::strcmp(iw, "0") != 0 && std::strcmp(iw, "1") != 0)
@@ -335,8 +345,14 @@ profile::Resolution profile_resolution(const Lookup& env) {
     profile::Inputs in;
     in.env = [&](const char* key) -> const char* {
         // The layer set is read only while the flash attention runs: an unused setting is not part of the identity.
-        if (std::strcmp(key, "STRIX_MM_PF_MSA_FLASH") == 0)
-            return p.msa_flash == 0 && p.msa_flash_asked == "default" ? nullptr : effective_mode.c_str();
+        // Bundle members (msa_flash, router_wmma): where the product profile's column applies the bundle, a member
+        // that does not run reads "0" (switch 0, member 0, fast_i4 admission, static guard), and a member the word
+        // itself selected reads unset, so the row keeps the profile's status (receipt: word, not a user switch).
+        if (std::strcmp(key, "STRIX_MM_PF_MSA_FLASH") == 0) {
+            if (p.msa_flash == 0 && p.msa_flash_asked == "default" && !p.bundle_column) return nullptr;
+            if (p.bundle_from_profile && p.msa_flash_asked == "fast_prefill" && p.msa_flash == 1) return nullptr;
+            return effective_mode.c_str();
+        }
         if (std::strcmp(key, "STRIX_MM_PF_MSA_FLASH_LAYERS") == 0)
             return p.msa_flash == 0 ? nullptr : p.msa_flash_layers.c_str();
         if (std::strcmp(key, "STRIX_MM_PF_IDX_WMMA") == 0)
@@ -344,13 +360,38 @@ profile::Resolution profile_resolution(const Lookup& env) {
         if (std::strcmp(key, "STRIX_MM_PF_IDX_WMMA_LAYERS") == 0)
             return p.idx_wmma ? p.idx_wmma_layers.c_str() : nullptr;
         // The same for the FAST router product: unset or 0 is the builtin, its layer set counts only while it runs.
-        if (std::strcmp(key, "STRIX_MM_PF_ROUTER_WMMA") == 0) return p.router_wmma ? "1" : nullptr;
+        if (std::strcmp(key, "STRIX_MM_PF_ROUTER_WMMA") == 0) {
+            if (!p.router_wmma) return p.bundle_column ? "0" : nullptr;
+            return p.bundle_from_profile && !strix::fast_profile::set(env(key)) ? nullptr : "1";
+        }
         if (std::strcmp(key, "STRIX_MM_PF_ROUTER_WMMA_LAYERS") == 0) return p.router_wmma ? p.router_wmma_layers.c_str() : nullptr;
         return base(key);
     };
     // Product profile: '--profile NAME' of rank and serve, exported by print_or_apply() (one value for both apps).
     if (const char* name = env(kProductProfileEnv); name != nullptr && *name != 0) in.profile = profile::parse(name);
     return profile::resolve(profile_engine(), in);
+}
+
+bool profile_column_selects_bundle(const Lookup& env) {
+    const char* name = env(kProductProfileEnv);
+    if (name == nullptr || *name == 0 || !profile::is_name(name)) return false;
+    // The word's column alone (no environment): it selects the bundle when it applies every member's bundle value.
+    profile::Inputs in;
+    in.profile = profile::parse(name);
+    in.env = [](const char*) -> const char* { return nullptr; };
+    const auto r = profile::resolve(profile_engine(), in);
+    for (const auto& m : kFastBundle.members) {
+        bool applied = false;
+        for (const auto& e : r.entries)
+            if (e.lever->env == m.env) applied = profile::applied(e.status) && e.value == m.value;
+        if (!applied) return false;
+    }
+    return true;
+}
+
+bool fast_profile_selects_bundle(const Lookup& env) {
+    const bool column = profile_column_selects_bundle(env);  // reads the word first: the same reads with or without the switch
+    return column && !strix::fast_profile::set(env(kFastBundle.env));
 }
 
 bool product_option(const std::string& a, const std::function<std::string()>& next, std::string* timing) {
@@ -368,7 +409,7 @@ bool product_option(const std::string& a, const std::function<std::string()>& ne
     if (profile::is_name(value)) return true;  // the product profile, exported by print_or_apply()
     // Explicit compatibility: the old timing spelling NAME:PROMPT.u32:STEPS keeps working on rank, with one notice.
     if (timing == nullptr || value.find(':') == std::string::npos)
-        throw std::invalid_argument("--profile must be default, fast, quality or turbo (got '" + value +
+        throw std::invalid_argument("--profile must be exact (default), fast, quality or turbo (got '" + value +
                                     "'); the per-phase timing session is --timing-profile NAME:PROMPT.u32:STEPS");
     std::fprintf(stderr, "strix-minimax-rank: '--profile %s' is the old spelling of '--timing-profile %s'; "
                          "--profile now names the product profile\n", value.c_str(), value.c_str());
@@ -681,7 +722,7 @@ std::string effective_config(const Cli& cli, const Lookup& env) {
                   << "profile.cache_namespace=" << pr.cache_namespace() << "\n";
         }
         const auto id = prefill_identity(env);
-        const bool bundle_requested = strix::fast_profile::switch_on(env(kFastBundle.env));
+        const bool bundle_requested = pf.bundle_from_profile || strix::fast_profile::switch_on(env(kFastBundle.env));
         const auto pipeline_reference = pair_pipeline_choice(8192U);
         o << "prefill.fast_profile=" << (bundle_requested && (pf.msa_flash != 0 || pf.router_wmma) ? kFastBundle.profile : "off") << "\n"
           << "prefill.fast_profile_requested=" << (bundle_requested ? kFastBundle.profile : "off") << "\n"
@@ -773,6 +814,9 @@ bool print_or_apply(const std::string& app, int argc, char** argv) {
     // shared opt-out: DSpark off unless STRIX_MM_SERVE_DSPARK is set (must precede apply(), which exports the default)
     if (app == "serve" && strix::session::speculation_environment_off(process_env(strix::session::speculation_environment)))
         (void)export_env("STRIX_MM_SERVE_DSPARK", "0", 0);
+    // Product profile 'fast' = the qualified FAST bundle mm-fast-pf-v2: nothing is exported here; every reader (the
+    // engine, the cache identity, the rank agreement, this printing) resolves it from STRIX_MM_PRODUCT_PROFILE through
+    // prefill_policy() (fast_profile_selects_bundle + fast_profile::profile_switch).
     apply();
     (void)split_frame_policy();  // validate and record the lever on both entry points (rank CLI and serve)
     (void)pf_async_min_rows(process_env("STRIX_MM_PF_ASYNC_MIN_ROWS"));

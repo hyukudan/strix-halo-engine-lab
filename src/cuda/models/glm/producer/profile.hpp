@@ -75,7 +75,7 @@ struct Resolution {
     [[nodiscard]] std::string json(const std::function<std::string(std::string_view)>& effective = {}) const;
 };
 
-[[nodiscard]] Name parse(std::string_view value);  // default|fast|quality, else throws std::invalid_argument
+[[nodiscard]] Name parse(std::string_view value);  // exact (= default)|fast|quality, else throws std::invalid_argument
 [[nodiscard]] const char* name(Name profile);
 [[nodiscard]] const char* app_name(App app);
 

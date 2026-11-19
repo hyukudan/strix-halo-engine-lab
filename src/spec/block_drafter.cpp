@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 
 namespace strix::spec {
@@ -69,7 +70,11 @@ void BlockDrafter::learn_chain_ms(std::uint32_t steps, double ms) {
     w = std::min(w + 1.0, 8.0);
 }
 
-Block BlockDrafter::next(const StepParams& params) {
+Block BlockDrafter::next(const StepParams& params, const PrelaunchFn* launch) {
+    // Every chain call of this block: the pre-launch form when the caller asked for it and the chain supports it.
+    const auto chain_draft = [&](std::span<const std::uint32_t> prefix, std::uint32_t k, std::vector<std::uint32_t>& out) {
+        if (launch == nullptr || !chain_->draft_prelaunch(prefix, k, out, *launch)) chain_->draft(prefix, k, out);
+    };
     Block b;
     if (params.remaining == 0 || params.max_rows == 0) {
         b.decision = Decision{Source::serial, 0, 0, false, 0.0, 0.0, false};
@@ -129,7 +134,7 @@ Block BlockDrafter::next(const StepParams& params) {
             if (pick > 0) {
                 const double t0 = now_ms();
                 std::vector<std::uint32_t> ext;
-                chain_->draft(std::span<const std::uint32_t>(b.drafts.data(), n), pick, ext);
+                chain_draft(std::span<const std::uint32_t>(b.drafts.data(), n), pick, ext);
                 b.draft_ms = now_ms() - t0;
                 learn_chain_ms(n + pick, b.draft_ms);
                 b.ext = std::uint32_t(std::min<std::size_t>(ext.size(), pick));
@@ -138,7 +143,7 @@ Block BlockDrafter::next(const StepParams& params) {
         }
     } else {
         const double t0 = now_ms();
-        chain_->draft({}, d.k, b.drafts);
+        chain_draft({}, d.k, b.drafts);
         b.draft_ms = now_ms() - t0;
         learn_chain_ms(d.k, b.draft_ms);
         if (b.drafts.size() > d.k) b.drafts.resize(d.k);
@@ -181,14 +186,73 @@ void BlockDrafter::observe(const Block& b, std::uint32_t accepted, double verify
     if (chain_) chain_->accept(emitted);
 }
 
+namespace {
+void put_u32(std::vector<unsigned char>& b, std::uint32_t v) {
+    for (int i = 0; i < 4; ++i) b.push_back(static_cast<unsigned char>((v >> (8 * i)) & 0xFFU));
+}
+void put_u64(std::vector<unsigned char>& b, std::uint64_t v) {
+    for (int i = 0; i < 8; ++i) b.push_back(static_cast<unsigned char>((v >> (8 * i)) & 0xFFU));
+}
+void put_f32(std::vector<unsigned char>& b, double v) {
+    const auto f = static_cast<float>(v);
+    std::uint32_t u = 0;
+    std::memcpy(&u, &f, sizeof u);
+    put_u32(b, u);
+}
+}  // namespace
+
+RoundTraceWriter::RoundTraceWriter(const std::string& path, std::string_view label) {
+    file_ = std::fopen(path.c_str(), "wb");
+    if (!file_) throw std::runtime_error("round trace: cannot open " + path);
+    buf_ = {'S', 'R', 'T', '1'};
+    put_u32(buf_, 1);
+    put_u32(buf_, std::uint32_t(label.size()));
+    buf_.insert(buf_.end(), label.begin(), label.end());
+    std::fwrite(buf_.data(), 1, buf_.size(), file_);
+}
+
+RoundTraceWriter::~RoundTraceWriter() {
+    if (file_) std::fclose(file_);
+}
+
+void RoundTraceWriter::round(const RoundRecord& r) {
+    buf_ = {'R', 'R', 'E', 'C'};
+    put_u64(buf_, r.context);
+    for (const std::uint32_t v : {r.anchor, r.k, r.rows, r.accepted, r.copy, r.ext}) put_u32(buf_, v);
+    put_u32(buf_, std::uint32_t(r.source));  // u8 source + 3 zero bytes (little endian)
+    put_f32(buf_, r.verify_ms);
+    put_f32(buf_, r.draft_ms);
+    for (const std::uint32_t v : r.drafts) put_u32(buf_, v);
+    for (const std::uint32_t v : r.greedy) put_u32(buf_, v);
+    if (std::fwrite(buf_.data(), 1, buf_.size(), file_) != buf_.size()) throw std::runtime_error("round trace: write failed");
+    ++records_;
+}
+
 StepRecord BlockSpeculator::step(std::vector<std::uint32_t>& out, const StepParams& params) {
     StepRecord r;
-    auto block = drafter_.next(params);
-    if (block.decision.rows == 0) return r;
+    // Verify pre-launch: the target enqueues the verify of [anchor, host prefix, device drafts] inside the chain call,
+    // before the drafted ids are read back (the host launch overlaps the GPU draft). launched_rows = its row count.
+    std::size_t launched_rows = 0;
+    const PrelaunchFn launch = [&](std::span<const std::uint32_t> prefix, const DraftFeed& feed) {
+        host_rows_.assign(1, anchor_);
+        host_rows_.insert(host_rows_.end(), prefix.begin(), prefix.end());
+        if (target_.verify_launch_fed(host_rows_, feed)) launched_rows = host_rows_.size() + feed.k;
+    };
+    auto block = drafter_.next(params, prelaunch_ ? &launch : nullptr);
+    if (block.decision.rows == 0) {
+        if (launched_rows != 0) throw std::logic_error("block speculator: verify pre-launched for an empty block");
+        return r;
+    }
     rows_.assign(1, anchor_);
     rows_.insert(rows_.end(), block.drafts.begin(), block.drafts.end());
     const double t0 = drafter_.now_ms();
-    target_.verify(rows_, greedy_);
+    if (launched_rows != 0) {
+        if (launched_rows != rows_.size()) throw std::logic_error("block speculator: pre-launched verify has the wrong row count");
+        target_.verify_collect(rows_, greedy_);
+        ++prelaunched_;
+    } else {
+        target_.verify(rows_, greedy_);
+    }
     if (greedy_.size() != rows_.size()) throw std::runtime_error("block speculator: target returned the wrong row count");
     std::uint32_t accepted = 0;
     while (accepted < block.drafts.size() && block.drafts[accepted] == greedy_[accepted]) ++accepted;
@@ -197,6 +261,23 @@ StepRecord BlockSpeculator::step(std::vector<std::uint32_t>& out, const StepPara
     std::vector<std::uint32_t> emitted(block.drafts.begin(), block.drafts.begin() + accepted);
     emitted.push_back(greedy_[accepted]);
     drafter_.observe(block, accepted, verify_ms, emitted, params.context);
+    if (sink_) {
+        RoundRecord rec;
+        rec.context = params.context;
+        rec.source = block.source;
+        rec.anchor = anchor_;
+        rec.k = std::uint32_t(block.drafts.size());
+        rec.rows = block.rows();
+        rec.accepted = accepted;
+        rec.copy = block.copy;
+        rec.ext = block.ext;
+        rec.verify_ms = verify_ms;
+        rec.draft_ms = block.draft_ms;
+        rec.drafts = block.drafts;
+        rec.greedy = greedy_;
+        rec.emitted = emitted;
+        sink_->round(rec);
+    }
     out.insert(out.end(), emitted.begin(), emitted.end());
     anchor_ = emitted.back();
     r.source = block.source;

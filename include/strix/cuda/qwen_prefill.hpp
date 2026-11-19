@@ -109,6 +109,7 @@ struct Config {
         bool mtp_mma = false;  // MTP fused projection on FP16 tensor cores, FP32 accumulation
         bool qsa_mma = false;  // QSA prefill attention (scores and output) on FP16 tensor cores, FP32 accumulation
         bool moe_mma = false;  // routed-MoE prefill project/down: int8 IMMA block dots, ONE FP32 FMA chain per output (not the HIP four)
+        bool ple_a8 = false;   // PLE key/value projections on the shared dense A8 projection (qwen_dense, int8 tensor cores)
     } forms;
     qwen_packs::ExpertArithmetic expert_arithmetic=qwen_packs::ExpertArithmetic::incumbent;
 };

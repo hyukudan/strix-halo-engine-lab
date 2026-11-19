@@ -78,6 +78,7 @@ std::set<std::string> diff(const qp::Config& a, const qp::Config& b) {
     ne("forms.mtp_mma", a.forms.mtp_mma != b.forms.mtp_mma);
     ne("forms.qsa_mma", a.forms.qsa_mma != b.forms.qsa_mma);
     ne("forms.moe_mma", a.forms.moe_mma != b.forms.moe_mma);
+    ne("forms.ple_a8", a.forms.ple_a8 != b.forms.ple_a8);
     ne("expert_wide_tile", a.expert_wide_tile != b.expert_wide_tile);
     ne("expert_wide_min_rows", a.expert_wide_min_rows != b.expert_wide_min_rows);
     return d;
@@ -148,6 +149,7 @@ void fast_bundle() {
         {{"--profile", "fast", "--mtp-defer-prompt", "off"}, "mtp_defer_prompt off"},
         {{"--profile", "fast", "--mtp-mma", "on"}, "mtp_mma on"},
         {{"--profile", "fast", "--expert-fast", "off", "--moe-mma", "on"}, "moe_mma on"},
+        {{"--profile", "fast", "--ple-a8", "on"}, "ple_a8 on"},
     };
     for (const auto& [args, why] : outside) {
         same_request(std::string("fast-outside-") + why, args);
@@ -199,7 +201,7 @@ void profiles() {
     check(fast.contract == "qwen-cuda;prefill=fast;forms=hc_mma,qsa_mma;moe_route_bf16=0;ids=qwen-cuda-hc-f16mma-v2,qwen-cuda-qsa-bf16mma-v2+gsq-iq-bf16mma-cuda-v1", "fast contract: " + fast.contract);
     for (const char* f : {"hc_mma", "qsa_mma", "expert_fast"}) check(status(fast, f) == "provisional", std::string("fast: ") + f + " provisional");
     check(status(fast, "mtp_defer_prompt") == "profile", "fast: exact deferral applied by the profile (qualified exact row): " + status(fast, "mtp_defer_prompt"));
-    for (const char* f : {"mtp_mma", "moe_mma", "expert_turbo"}) check(status(fast, f) == "absent", std::string("fast: ") + f + " not selected");
+    for (const char* f : {"mtp_mma", "moe_mma", "expert_turbo", "ple_a8"}) check(status(fast, f) == "absent", std::string("fast: ") + f + " not selected");
     // expert_decode_tile: exact schedule trait of the tensor-core experts, on in every profile (absent row), off by option or
     // env, serve == CLI; the arithmetic contract and the bundle id do not change (bitwise the tile form).
     check(fast.config.expert_decode_tile && status(fast, "expert_decode_tile") == "absent", "fast: decode tile form on (absent row)");
@@ -210,6 +212,13 @@ void profiles() {
         check(!tile.config.expert_decode_tile && status(tile, "expert_decode_tile") == "off", "decode tile off by option / env: " + status(tile, "expert_decode_tile"));
         check(tile.contract == fast.contract && bundle_id(tile) == bundle_id(fast), "decode tile off: same contract and bundle id");
     }
+    // ple_a8: opt-in under fast; the form, its identity and the prefix contract follow the option, CLI = serve.
+    same_request("fast+ple_a8", {"--profile", "fast", "--ple-a8", "on"});
+    const auto ple = one({"--profile", "fast", "--ple-a8", "on"}, qo::Entry::serve);
+    check(ple.config.forms.ple_a8 && !fast.config.forms.ple_a8, "ple_a8: on only when asked");
+    check(ple.contract == "qwen-cuda;prefill=fast;forms=hc_mma,qsa_mma,ple_a8;moe_route_bf16=0;ids=qwen-cuda-hc-f16mma-v2,"
+                          "qwen-cuda-qsa-bf16mma-v2,qwen-cuda-ple-a8-v1+gsq-iq-bf16mma-cuda-v1", "ple_a8 contract: " + ple.contract);
+    check(status(ple, "ple_a8").rfind("explicit", 0) == 0, "ple_a8: explicit under fast: " + status(ple, "ple_a8"));
     // expert_wide_tile: exact schedule trait (128-row tiles), opt-in in every profile until its timing receipt; on by option
     // or env, serve == CLI; contract and bundle id unchanged (bitwise the tile form).
     check(!fast.config.expert_wide_tile, "fast: wide tile form off (opt-in)");

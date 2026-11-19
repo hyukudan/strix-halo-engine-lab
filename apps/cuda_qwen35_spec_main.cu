@@ -107,6 +107,7 @@ int main(int argc, char** argv) {
         double oracle = -1.0;
         std::uint32_t trace_n = 0, pairs = 1;
         std::string ids_out;
+        std::string spec_trace;  // --spec-trace DIR: round trace per spec run (diagnostic, no effect on ids; scripts/bench/spec)
         // Controller / draft-head arms per spec run, interleaved --pairs times (A B A B ...) on the same loaded engine:
         //   N (number) = the cc_decode form: frontier probe every N passes (0 = before it), flat prior, unpriced probe, full head;
         //   new = the ArbiterConfig defaults (continuation prior, probe charged its cost), full head;
@@ -126,6 +127,7 @@ int main(int argc, char** argv) {
         std::unique_ptr<sp::DraftRows> draft_rows;
         std::uint32_t idle_ms = 0;  // host sleep (GPU idle) before every spec run: thermal gaps inside one ticket
         bool cost_table = false, check = true, graphs = true, seed_costs = true, turbo_lm_head = true, pdl = false;
+        bool prelaunch = false;  // verify pre-launch: bits unchanged; default off until its timing receipt (DEFAULT ON WHEN PROVEN)
         q::TurboWeights turbo = q::TurboWeights::off;
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
@@ -149,8 +151,10 @@ int main(int argc, char** argv) {
             else if (a == "--check") check = next() != "0";
             else if (a == "--graphs") graphs = next() != "0";
             else if (a == "--pdl") pdl = next() != "0";  // EngineOptions::pdl, as the decode CLI
+            else if (a == "--prelaunch") prelaunch = next() != "0";  // verify pre-launch (BlockSpeculator::set_prelaunch)
             else if (a == "--profile") profile = strix::qwen35::profile::parse(next());  // one tier word; exact = default
             else if (a == "--split-k") lever_cli.emplace_back("split_k", next());  // exact|fast: overrides the profile
+            else if (a == "--decode-attn8") lever_cli.emplace_back("decode_attn8", next());  // on|off: e4m3 decode/verify attention (FAST, identity -d8)
             else if (a == "--seed-costs") seed_costs = next() != "0";
             else if (a == "--cost-model") {
                 const std::string v = next();
@@ -184,6 +188,7 @@ int main(int argc, char** argv) {
             else if (a == "--idle-ms") idle_ms = strix::core::parse_u32(next());
             else if (a == "--pairs") { pairs = strix::core::parse_u32(next()); if (pairs == 0) throw std::runtime_error("--pairs >= 1"); }
             else if (a == "--ids-out") ids_out = next();
+            else if (a == "--spec-trace") spec_trace = next();
             else if (a == "--turbo-weights") {
                 const std::string v = next();
                 if (v != "off" && v != "native" && v != "onfly" && v != "converted") throw std::runtime_error("--turbo-weights expects off|native|onfly|converted");
@@ -203,7 +208,7 @@ int main(int argc, char** argv) {
         if (model.empty() == synth.empty())
             throw std::runtime_error("usage: (--model F.gguf | --synthetic-full bf16|q8_0 [--layers N]) [--prompt-ids a,b | --prompt-file F | --prompt-len N] "
                                      "[--n-gen N] [--sources copy,chain,hybrid|none] [--oracle ACC] [--cost-table] [--check 0|1] [--max-block 1..32] "
-                                     "[--frontier N | --arms 0,8,new,sub,new15,sub15 --pairs P] [--draft-core G] [--draft-fallback G] [--draft-pack F1,F2] [--idle-ms MS] [--ids-out DIR]  (--prompt-file accepts F1,F2,...: one engine load)");
+                                     "[--frontier N | --arms 0,8,new,sub,new15,sub15 --pairs P] [--draft-core G] [--draft-fallback G] [--draft-pack F1,F2] [--idle-ms MS] [--ids-out DIR] [--spec-trace DIR]  (--prompt-file accepts F1,F2,...: one engine load)");
         // (label, ids) per prompt; --prompt-file takes a comma list (label = file stem), each prompt runs serial + spec arms.
         std::vector<std::pair<std::string, std::vector<std::uint32_t>>> prompts;
         if (!ids_arg.empty()) prompts.emplace_back(label, parse_ids(ids_arg));
@@ -443,6 +448,14 @@ int main(int argc, char** argv) {
                 std::vector<std::uint32_t> out{anchor};
                 drafter.commit(std::span<const std::uint32_t>(out.data(), 1));
                 sp::BlockSpeculator spec(drafter, S);
+                std::unique_ptr<sp::RoundTraceWriter> round_trace;
+                if (!spec_trace.empty()) {
+                    std::string file = tag;
+                    std::replace(file.begin(), file.end(), '/', '_');
+                    round_trace = std::make_unique<sp::RoundTraceWriter>(spec_trace + "/" + file + ".srt", label);
+                    spec.set_round_sink(round_trace.get());
+                }
+                spec.set_prelaunch(prelaunch);
                 spec.start(anchor);
                 std::vector<double> tick_ms{0.0};  // wall at each step end (relative), tokens cumulative in cum
                 std::vector<std::uint32_t> cum{1};
@@ -502,6 +515,8 @@ int main(int argc, char** argv) {
                             (unsigned long long)drafter.hybrid_blocks, (unsigned long long)drafter.hybrid_ext_accepted,
                             (unsigned long long)drafter.hybrid_ext_proposed, (unsigned long long)(S.chain_calls() - calls0),
                             (unsigned long long)(S.chain_rows() - rows0));
+                std::printf("prelaunch[%s]: %s, pre-launched steps %llu of %zu\n", tag.c_str(), prelaunch ? "on" : "off",
+                            (unsigned long long)spec.prelaunched_steps(), per_step.size());
                 const double steps_n = double(std::max<std::size_t>(per_step.size(), 1));
                 std::string hist;
                 for (std::size_t k = 1; k < k_hist.size(); ++k)
@@ -518,6 +533,9 @@ int main(int argc, char** argv) {
                                 std::min(out.size(), ref.size()), bad);
                     if (serial_ms > 0) std::printf("speedup vs serial: %.2fx\n", serial_ms / double(n_gen - 1) / (wall / double(out.size() - 1)));
                 }
+                if (round_trace)
+                    std::printf("spec-trace: content=%s rounds=%zu records=%llu ids_equal=%d\n", tag.c_str(), per_step.size(),
+                                static_cast<unsigned long long>(round_trace->records()), ref.empty() ? -1 : int(bad == 0));
                 bad_total += bad;
             }  // arms x pairs
         }  // prompts

@@ -42,6 +42,7 @@ enum Lever : std::uint32_t {
     lever_rows_tile_v2 = 1U << 4U, // ROWS_TILE_V2: per-shape many-row linear tiles (two-tile input staging)
     lever_decode24 = 1U << 5U, // DECODE24: Q4_K/Q6_K many-row decoders use the 24-bit integer multiply
     lever_shared_q6 = 1U << 6U, // SHARED_Q6: wide Q6_K many-row linears decode each weight once per workgroup (LDS)
+    lever_last_kv = 1U << 7U, // LAST_KV: rows stop at the last K/V-owning (or tapped) layer (strix/prefill_row_liveness.hpp)
 };
 struct LeverName {
     Lever bit;
@@ -56,6 +57,7 @@ inline constexpr LeverName lever_names[] = {
     {lever_rows_tile_v2, "rows_tile_v2", "STRIX_G4_PREFILL_ROWS_TILE_V2"},
     {lever_decode24, "decode24", "STRIX_G4_PREFILL_DECODE24"},
     {lever_shared_q6, "shared_q6", "STRIX_G4_PREFILL_SHARED_Q6"},
+    {lever_last_kv, "last_kv", "STRIX_G4_PREFILL_LAST_KV"},
 };
 [[nodiscard]] inline bool lever_enabled(Lever bit) {
     for (const auto& l : lever_names)

@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "strix/qwen35/hip_engine.hpp"
+#include "strix/profiles/qwen_dense_hip.hpp"
 #include "strix/qwen35/hip_spec_defaults.hpp"
 #include "strix/spec/engine_target.hpp"
 #include "../src/core/dense_linear.hpp"
@@ -60,6 +61,7 @@ std::vector<int> parse_ids(const std::string& s) {
 }  // namespace
 
 int main(int argc, char** argv) try {
+    strix::qwen35::hip_profile::take(strix::qwen35::hip_profile::App::decode, argc, argv);  // --profile exact|fast
     using namespace strix::qwen35;
     std::string model, dump, ids_arg = "1";
     HipDenseSpecArgs spec_args;  // the family's shared speculation flags (hip_dense_spec_costs.hpp)

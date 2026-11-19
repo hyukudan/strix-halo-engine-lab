@@ -750,6 +750,91 @@ int test_attention_row_share() {
     return 0;
 }
 
+// e4m3 shadow of LongAttn's caches (kv_shadow_e4m3 layout), zeroed once like the engine's.
+struct Shadow8 {
+    cc::KvShadowE4m3 s;
+    std::uint8_t* base = nullptr;
+    std::size_t bytes = 0;
+    bool init(const cc::AttentionDims& d) {
+        bytes = cc::kv_shadow_e4m3_bytes(d);
+        base = devz<std::uint8_t>(bytes);
+        const std::size_t p8 = cc::attn8_capacity(d), kvd = static_cast<std::size_t>(d.kv_heads) * p8 * d.head_dim;
+        s.k8 = base;
+        s.v8t = base + kvd;
+        s.ks = reinterpret_cast<float*>(base + 2 * kvd);
+        s.vs = s.ks + static_cast<std::size_t>(d.kv_heads) * p8;
+        return base != nullptr;
+    }
+    ~Shadow8() { cudaFree(base); }
+};
+
+// FAST8 decode attention (attention_decode8): (1) R verify rows give, per row, the same bits as a one-row call at that row's
+// position, even when the shadow keys past the row hold different (stale) data; (2) kv_shadow_e4m3_rows writes the same bytes
+// as kv_shadow_e4m3; (3) close to the exact BF16 attention_decode (relative L2, loose bound: catches indexing errors only).
+int test_attention_decode8() {
+    LongAttn a;
+    Shadow8 sh, sh2;
+    if (!a.init(32) || !sh.init(a.d) || !sh2.init(a.d)) { CHECK(false, "decode8: allocation failed"); return 2; }
+    const cc::AttentionDims& d = a.d;
+    const std::size_t HD = static_cast<std::size_t>(d.heads) * 256;
+    float* sc = devz<float>(cc::attention_decode8_scratch_floats(d, 32));
+    float *outR = devz<float>(32 * HD), *out1 = devz<float>(HD);
+    unsigned long long* dc = devz<unsigned long long>(1);
+    const struct { std::uint32_t pos0, rows; } cases[] = {{100, 1}, {2040, 16}, {4090, 12}, {6130, 32}, {33020, 12}, {131060, 12}};
+    double worst_rel = 0.0;
+    for (const auto& cs : cases) {
+        const std::uint32_t R = cs.rows, len = cs.pos0 + R;
+        const cc::GroupedView qv{R, d.heads, 256, 0, 0};
+        auto* p0 = dpos(cs.pos0);
+        CK(cc::kv_shadow_e4m3(d, a.kc, a.vc, sh.s, 0, len, nullptr));
+        CK(cc::attention_decode8(d, a.q, qv, a.gate, qv, sh.s, p0, R, outR, sc, nullptr));
+        // (3) vs exact BF16 attention
+        CK(cc::attention_decode(d, a.q, qv, a.gate, qv, a.kc, a.vc, p0, R, a.out, a.sa, nullptr));
+        CK(cudaDeviceSynchronize());
+        const auto e = get(a.out, R * HD), f = get(outR, R * HD);
+        double num = 0.0, den = 0.0;
+        for (std::size_t i = 0; i < e.size(); ++i) {
+            num += (static_cast<double>(f[i]) - e[i]) * (static_cast<double>(f[i]) - e[i]);
+            den += static_cast<double>(e[i]) * e[i];
+        }
+        const double rel = std::sqrt(num / std::max(den, 1e-30));
+        worst_rel = std::max(worst_rel, rel);
+        CHECK(rel < 0.25, "decode8 len %u rows %u: relative L2 vs exact %.4f", len, R, rel);
+        // (1) row r alone, with the keys past it re-quantised from the swapped caches (stale data a serial step would see)
+        for (std::uint32_t r = 0; r < R; ++r) {
+            const std::uint32_t pr = cs.pos0 + r;
+            if (pr + 1 < len) CK(cc::kv_shadow_e4m3(d, a.vc, a.kc, sh.s, pr + 1, len - pr - 1, nullptr));
+            auto* pp = dpos(pr);
+            const cc::GroupedView q1{1, d.heads, 256, 0, 0};
+            CK(cc::attention_decode8(d, a.q + r * HD, q1, a.gate + r * HD, q1, sh.s, pp, 1, out1, sc, nullptr));
+            CK(cudaMemset(dc, 0, 8));
+            count_diff<<<64, 256>>>(out1, outR + r * HD, HD, dc);
+            CK(cudaDeviceSynchronize());
+            const auto nd = get(dc, 1)[0];
+            CHECK(nd == 0, "decode8 len %u rows %u row %u: %llu floats differ from the one-row call", len, R, r, nd);
+            if (pr + 1 < len) CK(cc::kv_shadow_e4m3(d, a.kc, a.vc, sh.s, pr + 1, len - pr - 1, nullptr));
+            cudaFree(pp);
+        }
+        cudaFree(p0);
+    }
+    // (2) device-position quantiser == host-range quantiser (both shadows start zeroed)
+    {
+        CK(cudaMemset(sh.base, 0, sh.bytes));
+        auto* p0 = dpos(4090);
+        CK(cc::kv_shadow_e4m3(d, a.kc, a.vc, sh.s, 4090, 12, nullptr));
+        CK(cc::kv_shadow_e4m3_rows(d, a.kc, a.vc, sh2.s, p0, 12, nullptr));
+        CK(cudaMemset(dc, 0, 8));
+        count_diff<<<1024, 256>>>(reinterpret_cast<const float*>(sh.base), reinterpret_cast<const float*>(sh2.base), sh.bytes / 4, dc);
+        CK(cudaDeviceSynchronize());
+        const auto nd = get(dc, 1)[0];
+        CHECK(nd == 0, "decode8: kv_shadow_e4m3_rows differs from kv_shadow_e4m3 in %llu words", nd);
+        cudaFree(p0);
+    }
+    cudaFree(sc); cudaFree(outR); cudaFree(out1); cudaFree(dc);
+    std::printf("attention decode8: %zu cases, rows == one-row calls bitwise, worst relative L2 vs exact %.4f\n", std::size(cases), worst_rel);
+    return 0;
+}
+
 // Profiler target (--attn-ncu): exactly one attention_decode call per arm (off, then automatic) at 131,072 positions x
 // 12 rows on synthetic K/V, so a profiler filtered on the attention kernels sees 3 launches per arm.
 static int attn_ncu() {
@@ -823,6 +908,65 @@ static int attn_bench() {
     cc::set_decode_row_share(cc::DecodeRowShare::off);
     cudaEventDestroy(e0); cudaEventDestroy(e1);
     std::printf("attn-bench: done\n");
+    return 0;
+}
+
+// No-model kernel bench (--attn8-bench): ms per call, one layer (24 q / 4 kv heads, head_dim 256), synthetic K/V. Arms: exact
+// (attention_decode, automatic row share) and kv8 (attention_decode8 over the e4m3 shadow; shadow filled once, not timed),
+// alternated, median of 5 timed repeats of 10 calls after one warm-up repeat.
+static int attn8_bench() {
+    LongAttn a;
+    Shadow8 sh;
+    if (!a.init(16) || !sh.init(a.d)) { std::printf("attn8-bench: allocation failed\n"); return 2; }
+    float* sc = devz<float>(cc::attention_decode8_scratch_floats(a.d, 16));
+    CK(cc::kv_shadow_e4m3(a.d, a.kc, a.vc, sh.s, 0, kLongP, nullptr));
+    int dev = 0, sms = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    std::printf("attn8-bench device sms %d P %u chunk %u\n", sms, kLongP, cc::kAttn8Chunk);
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0); cudaEventCreate(&e1);
+    const std::uint32_t lens[] = {1024, 8192, 28672, 65536, 131072}, rowsv[] = {1, 4, 8, 12};
+    const char* names[] = {"exact", "kv8"};
+    cc::set_decode_row_share(cc::DecodeRowShare::automatic);
+    for (const auto len : lens) {
+        for (const auto R : rowsv) {
+            const cc::GroupedView qv{R, a.d.heads, 256, 0, 0};
+            auto* p0 = dpos(len - R);
+            // the shared per-layer entry: exact = BF16 row walk; kv8 = step-row shadow store + e4m3 walk (the engine's real cost)
+            auto call = [&](int arm) -> int {
+                CK(cc::attention_decode_kv(a.d, a.q, qv, a.gate, qv, a.kc, a.vc, arm == 0 ? nullptr : &sh.s, p0, R, a.out,
+                                           arm == 0 ? a.sa : sc, nullptr));
+                return 0;
+            };
+            std::vector<float> ms[2];
+            for (int rep = 0; rep < 6; ++rep) {
+                for (int arm = 0; arm < 2; ++arm) {
+                    if (call(arm) != 0) return 1;
+                    CK(cudaEventRecord(e0));
+                    for (int it = 0; it < 10; ++it)
+                        if (call(arm) != 0) return 1;
+                    CK(cudaEventRecord(e1));
+                    CK(cudaEventSynchronize(e1));
+                    float t = 0.0f;
+                    cudaEventElapsedTime(&t, e0, e1);
+                    if (rep > 0) ms[arm].push_back(t / 10.0f);
+                }
+            }
+            double med[2];
+            for (int arm = 0; arm < 2; ++arm) {
+                std::sort(ms[arm].begin(), ms[arm].end());
+                med[arm] = ms[arm][ms[arm].size() / 2];
+                std::printf("attn8-bench len %u rows %u arm %s ms %.4f (min %.4f max %.4f)\n", len, R, names[arm], med[arm], ms[arm].front(), ms[arm].back());
+            }
+            std::printf("attn8-bench len %u rows %u kv8/exact %.3f\n", len, R, med[1] / med[0]);
+            cudaFree(p0);
+        }
+    }
+    cc::set_decode_row_share(cc::DecodeRowShare::off);
+    cudaEventDestroy(e0); cudaEventDestroy(e1);
+    cudaFree(sc);
+    std::printf("attn8-bench: done\n");
     return 0;
 }
 
@@ -1064,13 +1208,19 @@ int main(int argc, char** argv) {
     if (cudaSetDevice(0) != cudaSuccess) return 2;
     if (argc > 1 && std::strcmp(argv[1], "--attn-bench") == 0) return attn_bench();
     if (argc > 1 && std::strcmp(argv[1], "--attn-ncu") == 0) return attn_ncu();
+    if (argc > 1 && std::strcmp(argv[1], "--attn8-bench") == 0) return attn8_bench();
+    if (argc > 1 && std::strcmp(argv[1], "--attn8") == 0) {  // FAST e4m3 decode attention only (rows == one-row bits), bounded ticket
+        const int r = test_attention_decode8();
+        std::printf(g_fail || r ? "cuda_core_test --attn8: FAILED (%d checks)\n" : "cuda_core_test --attn8: PASS\n", g_fail);
+        return (g_fail || r) ? 1 : 0;
+    }
     if (argc > 1 && std::strcmp(argv[1], "--attn-rows") == 0) {  // the row-walk tests only (short + long), for a bounded ticket
         const int r = test_attention_schedule() | test_attention_schedule(16, 2) | test_attention_schedule(8, 2) | test_attention_row_share();
         std::printf(g_fail || r ? "cuda_core_test --attn-rows: FAILED (%d checks)\n" : "cuda_core_test --attn-rows: PASS\n", g_fail);
         return (g_fail || r) ? 1 : 0;
     }
     int rc = test_dense() | test_norms_rope() | test_norm_batched_loads() | test_attention() | test_attention_schedule() | test_attention_schedule(16, 2) | test_attention_schedule(8, 2) |
-             test_attention_row_share() | test_gdn() | test_conv_row_batch() | test_nvfp4_fused();
+             test_attention_row_share() | test_attention_decode8() | test_gdn() | test_conv_row_batch() | test_nvfp4_fused();
     // repeat determinism is covered by the identical-bits checks (each compares two separate launches)
     std::printf(g_fail || rc ? "cuda_core_test: FAILED (%d checks)\n" : "cuda_core_test: PASS\n", g_fail);
     return (g_fail || rc) ? 1 : 0;

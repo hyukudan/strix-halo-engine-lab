@@ -6,6 +6,7 @@
 #if defined(STRIX_BUILD_MODEL_RESIDENCY_DIAGNOSTIC)
 #include "strix/hip_model_residency_diagnostic.hpp"
 #endif
+#include "strix/lever.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -305,6 +306,18 @@ struct HostRange {
     std::uint64_t begin = 0;
     std::uint64_t end = 0;
 };
+
+// STRIX_MODEL_PREFAULT=0: registration faults its own pages (one thread) as before. Page residency only.
+inline constexpr lever::Decl registration_prefault_lever{
+    .name = "model_registration_prefault", .env = "STRIX_MODEL_PREFAULT", .exactness = lever::Exactness::bitwise,
+    .default_on = true, .source = "docs/optimizations.md#registration-prefault: cold Qwen MoE GGUF load ON vs OFF"};
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> prefault_spans(const std::vector<HostRange>& ranges) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    spans.reserve(ranges.size());
+    for (const auto& range : ranges) spans.emplace_back(range.begin, range.end - range.begin);
+    return spans;
+}
 
 std::vector<HostRange> build_registration_ranges(
     const MappedModelFile& mapped,
@@ -689,6 +702,14 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
                 policy);
         if (!ranges.empty() && !result.selective_guard_)
             result.selective_guard_ = std::make_shared<const HipSetupQuiescenceGuard>();
+        // The driver pins a registered range by faulting every page from the registering thread: on a cold page
+        // cache that reads the file through one thread with the default read-around (Qwen MoE, 82.5 GB on
+        // gfx1151: 35.2 s). Read the same ranges into the page cache from parallel threads first, before any
+        // lock or registration; registration then maps resident pages. Same file bytes, same pages pinned.
+        if (!ranges.empty() && lever::select(registration_prefault_lever, {}).on) {
+            startup::Phase prefault_marker("registration_prefault");
+            (void)mapped.prefault_parallel(prefault_spans(ranges));
+        }
 
 #if defined(__linux__) && defined(MLOCK_ONFAULT)
         // Registered pages are kept off the reclaim LRU by default. A reclaimed or migrated page invalidates its

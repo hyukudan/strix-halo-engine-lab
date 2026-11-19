@@ -60,8 +60,8 @@ struct HcSiteView {
     const float* sub = nullptr;
     // Not null (both, with sub): the sublayer input is the canonical rank sum (sub[i] + sub_low[i]) + sub_high[i], the
     // expression and order of enqueue_canonical_sum, read where sub is read (no materialised sum); same bits. Row stride hidden.
-    // Only with collapse_out (the collapse site) or a view that runs the separate kernels (the other site kernels keep the
-    // stored-sub code: no runtime branch, no register cost).
+    // Non-collapse sites dispatch a compile-time canonical-input specialization; stored-input kernels
+    // retain their constant-null terms and have no runtime pointer branch.
     const float* sub_low = nullptr;
     const float* sub_high = nullptr;
     const float* residual = nullptr;

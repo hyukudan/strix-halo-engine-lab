@@ -1,7 +1,7 @@
 // Included inside strix::decode_cli after TiledMtpPrompt. This opt-in runner
 // keeps the ordinary single-node and plain pair handoff prompt paths unchanged.
 inline HipMtpTargetHiddenTicket run_pair_tiled_mtp_prompt(std::span<const std::uint32_t> tokens,
-    const ModelContract& model,const CompiledSerialExecution& compiled,MtpDecodeTargetParents::TiledPrompt& tiled,
+    const qwen_pp::PromptRoute& resolved,const ModelContract& model,const CompiledSerialExecution& compiled,MtpDecodeTargetParents::TiledPrompt& tiled,
     SerialSessionContext& session,HipMtpTargetHidden& target,HipMtpRuntime& runtime,
     const QualifiedMtpDraftPlan& qualified,const ActivatedMtpDraftPlan& activated,
     const ExecutionRuntimeResources& resources,DirectLaunchDispatcher& dispatcher,std::byte* held,std::string& receipt) {
@@ -26,10 +26,8 @@ inline HipMtpTargetHiddenTicket run_pair_tiled_mtp_prompt(std::span<const std::u
     const char* cut_env=std::getenv("STRIX_QWEN_PF_PIPE_CUT");
     const char* costs_env=std::getenv("STRIX_QWEN_PF_PIPE_COSTS");
     qwen_pp::CutPrediction prediction;
-    std::optional<qwen_pp::LayerCosts> route_costs;
     if(costs_env) {
         const auto costs=qwen_pp::load_costs(costs_env,tokens.size());
-        route_costs=costs;
         prediction=cut_env?qwen_pp::predict_cut(costs,qwen_pp::parse_stage_cut(cut_env,legal,legal_half)):
             qwen_pp::choose_cut(costs,legal,legal_half,strix::pair::chain::process_stage_cost_scale());
     } else {
@@ -62,10 +60,9 @@ inline HipMtpTargetHiddenTicket run_pair_tiled_mtp_prompt(std::span<const std::u
         if(unit->kind==QwenPlanKind::serial || unit->kind==QwenPlanKind::window) break;
         legal_rows=unit->end;
     }
-    auto route=qwen_pp::choose_prompt_route(tokens.size(),tiled.rows,
-        route_costs?&*route_costs:nullptr,prediction);
-    route.prefix=std::min(route.prefix,legal_rows);
-    if(route.prefix<=tiled.rows) route.prefix=0U;
+    // The CLI pair block resolved the route once (resolve_pair_route: length policy, cost file, single tiles);
+    // the hand-off runs that route, cut back to the rows the tiled plan carries.
+    const auto route=qwen_pp::handoff_route(resolved,legal_rows,tiled.rows);
     const auto all_tokens=tokens;
     if(!route.prefix) {
         if(rank==1U) return {};
