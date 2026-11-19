@@ -521,46 +521,33 @@ void enqueue_mma_experts(const Rows& v, std::uint32_t rows, const Weights& w, un
 
 // gsq-iq-i8mma-turbo-cuda-v1 (TURBO, profile row expert_turbo or explicit selection): int8 IMMA over the shared A8 input
 // codes (prologue) and the A8 down codes (project_activation_tile, run by the TURBO project kernel). Same CSR tiles;
-// rawdots in the native layout, merge / commit unchanged. gsq-iq-i8mma-turbo-cuda-v2 (explicit selection only): the same
-// kernels with a second int8 activation limb (Limbs = 2, src/cuda/core/turbo_i8.hpp); the input limb is written by
-// turbo_input_lo_kernel after the prologue, the down limb by the project epilogue. Grids keep (tiles, slices); the kernels
-// map blocks tile-major (native_mma::tile_major).
-template <unsigned G, unsigned L> void launch_turbo_project(const Rows& v, const Weights& w, const amdmath::Tables& tables,
-                                                            unsigned tiles, cudaStream_t s) {
-    core::moe_turbo::turbo_project_kernel<G, L, MoeBinding>
+// rawdots in the native layout, merge / commit unchanged. Grids keep (tiles, slices); the kernels map blocks tile-major
+// (native_mma::tile_major).
+template <unsigned G> void launch_turbo_project(const Rows& v, const Weights& w, const amdmath::Tables& tables, unsigned tiles,
+                                                cudaStream_t s) {
+    core::moe_turbo::turbo_project_kernel<G, MoeBinding>
         <<<dim3(tiles, ffn / core::moe_turbo::kTurboProjectOutputs), core::moe_turbo::kTurboThreads, 0, s>>>(w.gate, w.up, v, tables);
 }
-template <unsigned D, unsigned L> void launch_turbo_down(const Rows& v, const Weights& w, unsigned tiles, cudaStream_t s) {
-    core::moe_turbo::turbo_down_kernel<D, L, MoeBinding>
+template <unsigned D> void launch_turbo_down(const Rows& v, const Weights& w, unsigned tiles, cudaStream_t s) {
+    core::moe_turbo::turbo_down_kernel<D, MoeBinding>
         <<<dim3(tiles, hidden / core::moe_turbo::kTurboDownOutputs), core::moe_turbo::kTurboThreads, 0, s>>>(w.down, v);
 }
-template <unsigned L> void enqueue_turbo_limbs(const Rows& v, const Weights& w, const amdmath::Tables& tables, unsigned tiles,
-                                               cudaStream_t s) {
-    const std::string name(::strix::qwen_packs::expert_arithmetic_name(w.arithmetic));
-    switch (w.gate_type) {
-    case 18: launch_turbo_project<18, L>(v, w, tables, tiles, s); break;
-    case 21: launch_turbo_project<21, L>(v, w, tables, tiles, s); break;
-    case 22: launch_turbo_project<22, L>(v, w, tables, tiles, s); break;
-    case 23: launch_turbo_project<23, L>(v, w, tables, tiles, s); break;
-    case 42: launch_turbo_project<42, L>(v, w, tables, tiles, s); break;
-    default: throw std::invalid_argument(name + ": gate storage");
-    }
-    check(cudaGetLastError(), "MoE TURBO int8 gate/up");
-    if (w.down_type == 20) launch_turbo_down<20, L>(v, w, tiles, s);
-    else if (w.down_type == 42) launch_turbo_down<42, L>(v, w, tiles, s);
-    else throw std::invalid_argument(name + ": down storage");
-    check(cudaGetLastError(), "MoE TURBO int8 down");
-}
-void enqueue_turbo_experts(const Rows& v, std::uint32_t rows, const Weights& w, const amdmath::Tables& tables, unsigned tiles,
-                           cudaStream_t s) {
+void enqueue_turbo_experts(const Rows& v, const Weights& w, const amdmath::Tables& tables, unsigned tiles, cudaStream_t s) {
     if (!v.codes.base || !v.deltas.base || !v.down_codes.base || !v.down_deltas.base)
         throw std::invalid_argument("gsq-iq-i8mma-turbo-cuda-v1 needs the A8 input and down code buffers");
-    if (w.arithmetic != ExpertArithmetic::gsq_i8_turbo2) return enqueue_turbo_limbs<1>(v, w, tables, tiles, s);
-    if (!v.lo_codes.base || !v.down_lo_codes.base || !v.intermediates.base)
-        throw std::invalid_argument("gsq-iq-i8mma-turbo-cuda-v2 needs Rows::lo_codes, down_lo_codes and intermediates");
-    if (rows) core::moe_turbo::turbo_input_lo_kernel<MoeBinding><<<rows, 256, 0, s>>>(v);
-    check(cudaGetLastError(), "MoE TURBO v2 input limb");
-    enqueue_turbo_limbs<2>(v, w, tables, tiles, s);
+    switch (w.gate_type) {
+    case 18: launch_turbo_project<18>(v, w, tables, tiles, s); break;
+    case 21: launch_turbo_project<21>(v, w, tables, tiles, s); break;
+    case 22: launch_turbo_project<22>(v, w, tables, tiles, s); break;
+    case 23: launch_turbo_project<23>(v, w, tables, tiles, s); break;
+    case 42: launch_turbo_project<42>(v, w, tables, tiles, s); break;
+    default: throw std::invalid_argument("gsq-iq-i8mma-turbo-cuda-v1: gate storage");
+    }
+    check(cudaGetLastError(), "MoE TURBO int8 gate/up");
+    if (w.down_type == 20) launch_turbo_down<20>(v, w, tiles, s);
+    else if (w.down_type == 42) launch_turbo_down<42>(v, w, tiles, s);
+    else throw std::invalid_argument("gsq-iq-i8mma-turbo-cuda-v1: down storage");
+    check(cudaGetLastError(), "MoE TURBO int8 down");
 }
 
 bool enqueue_routed(const Rows& v, std::uint32_t rows, const Weights& w, const amdmath::Tables& tables, cudaStream_t s,
@@ -579,8 +566,8 @@ bool enqueue_routed(const Rows& v, std::uint32_t rows, const Weights& w, const a
             enqueue_mma_experts(v, rows, w, tiles, s);
             return false;   // tensor-core GSQ experts: the moe_mma candidate form did not run
         }
-        if (w.arithmetic == ExpertArithmetic::gsq_i8_turbo || w.arithmetic == ExpertArithmetic::gsq_i8_turbo2) {
-            enqueue_turbo_experts(v, rows, w, tables, tiles, s);
+        if (w.arithmetic == ExpertArithmetic::gsq_i8_turbo) {
+            enqueue_turbo_experts(v, w, tables, tiles, s);
             return false;   // TURBO integer GSQ experts: the moe_mma candidate form did not run
         }
         // The storage type binds the compile-time typed decoder (bitwise the runtime-type values; see with_native_source).

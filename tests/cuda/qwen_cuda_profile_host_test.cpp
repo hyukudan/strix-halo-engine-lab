@@ -484,29 +484,10 @@ void turbo_binding() {
         (void)qo::resolve(parse(with_paths({"--profile", "turbo", "--prefill-moe-route-bf16", "1"}), none), qo::Entry::serve);
     } catch (const std::invalid_argument&) { threw = true; }
     check(threw, "turbo: RouteBF16 with the TURBO expert arithmetic refused");
-    // TURBO v2 (two activation limbs, the arithmetic that passed the FAST rule on the standard fixture) composes with the
-    // FAST forms of the turbo profile through the same resolver: same values in both entries, its own contract and identity.
-    const auto v2req = parse(with_paths({"--profile", "turbo", "--expert-arithmetic", "gsq-iq-i8mma-turbo-cuda-v2"}), none);
-    const auto v2 = qo::resolve(v2req, qo::Entry::serve), v2cli = qo::resolve(v2req, qo::Entry::cli);
-    check(v2.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::gsq_i8_turbo2 &&
-              v2cli.config.expert_arithmetic == v2.config.expert_arithmetic && v2.choice == v2cli.choice,
-          "turbo v2: explicit TURBO v2 in both entries");
-    check(v2.choice.hc_mma && !v2.choice.mtp_mma && v2.choice.qsa_mma && !v2.choice.moe_mma && v2.choice.mtp_defer_prompt &&
-              !v2.config.expert_narrow,
-          "turbo v2: FAST forms and the deferral kept, moe_mma off");
-    check(v2.contract.find("gsq-iq-i8mma-turbo-cuda-v2") != std::string::npos &&
-              v2.contract.find("gsq-iq-i8mma-turbo-cuda-v1") == std::string::npos,
-          "turbo v2: contract names v2 only");
-    const auto h2 = qo::numerical_identity(v2.config).hash;
-    check(h2 != qo::numerical_identity(serve.config).hash && h2 != qo::numerical_identity(fast.config).hash &&
-              h2 != qo::numerical_identity(plain.config).hash,
-          "turbo v2: identity differs from turbo v1, FAST and exact");
-    const auto d2 = diff(v2.config, v2cli.config);
-    std::string d2s;
-    for (const auto& f : d2) d2s += " " + f;
-    // No --blocks here: the default request, so the named serve/CLI block_schedule difference applies (as in same_request).
-    check(d2 == std::set<std::string>({"decode", "export_state", "release_by_layer", "block_schedule"}),
-          "turbo v2: only the named entry differences (differing:" + d2s + ")");
+    // One TURBO expert arithmetic: the gated int8 form (v1). The two-limb v2 contract name is not selectable.
+    check(refuses({"--profile", "turbo", "--expert-arithmetic", "gsq-iq-i8mma-turbo-cuda-v2"}) &&
+              refuses({"--profile", "turbo", "--expert-arithmetic", "gsq-iq-i8mma-turbo-cuda-v2"}, {}, qo::Entry::serve),
+          "turbo: the two-limb v2 arithmetic is refused in both entries (v1 is the gated arithmetic)");
     // ONE TURBO identity: plain `--profile turbo` (pack weights) is the TURBO bundle in serve and CLI alike (same status
     // from the one resolver), named in the effective config; FAST and exact never print it; each override leaves it.
     const std::string tid(cp::kTurboBundle);
@@ -544,7 +525,6 @@ void turbo_binding() {
                   json.find("\"turbo_bundle\"") != std::string::npos && json.find("\"none\"") != std::string::npos,
               "turbo outside the bundle (" + why + "): " + tb.detail);
     };
-    outside({"--expert-arithmetic", "gsq-iq-i8mma-turbo-cuda-v2"}, "experts are not gsq-iq-i8mma-turbo-cuda-v1");
     outside({"--expert-turbo", "off"}, "experts are not gsq-iq-i8mma-turbo-cuda-v1");
     outside({"--hc-mma", "off"}, "hc_mma off");
     outside({"--qsa-mma", "off"}, "qsa_mma off");
@@ -770,15 +750,7 @@ int main() {
             check(qo::handoff_numerical_id_config("old",tu.config)!=qo::handoff_numerical_id_config("old",gsq.config) &&
                   qo::handoff_numerical_id_config("old",tu.config)!=qo::handoff_numerical_id_config("old",bf.config),"TURBO int8 handoff differs");
             check(refuses({"--expert-arithmetic","gsq-iq-i8mma-turbo-cuda-v1","--moe-mma","on"}),"TURBO int8 single-chain composition rejects explicitly");
-            // TURBO v2 (two int8 limbs): explicit only, its own contract and identity, distinct from v1.
-            const Args t2={"--expert-arithmetic","gsq-iq-i8mma-turbo-cuda-v2"};
-            same_request("explicit GSQ TURBO v2 arithmetic",t2);
-            const auto tv=one(t2,qo::Entry::cli);
-            check(tv.config.expert_arithmetic==strix::qwen_packs::ExpertArithmetic::gsq_i8_turbo2,"explicit TURBO v2 parsed");
-            check(tv.contract.find("gsq-iq-i8mma-turbo-cuda-v2")!=std::string::npos,"TURBO v2 contract named");
-            check(qo::numerical_identity(tv.config).hash!=qo::numerical_identity(tu.config).hash &&
-                  qo::numerical_identity(tv.config).hash!=qo::numerical_identity(native.config).hash,"TURBO v2 has its own numerical identity");
-            check(refuses({"--expert-arithmetic","gsq-iq-i8mma-turbo-cuda-v2","--moe-mma","on"}),"TURBO v2 single-chain composition rejects explicitly");
+            check(refuses({"--expert-arithmetic","gsq-iq-i8mma-turbo-cuda-v2"}),"no TURBO v2 arithmetic (one int8 expert form)");
         }
         profiles();
         overrides();

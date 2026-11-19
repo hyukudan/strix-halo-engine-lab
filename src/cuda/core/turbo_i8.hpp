@@ -88,35 +88,6 @@ STRIX_TURBO_I8_HD float fma_rn(float a, float b, float c) {
 }
 STRIX_TURBO_I8_HD float step(float acc, float dot, float e, float s) { return fma_rn(dot, mul_rn(e, s), acc); }
 
-// ---- v2: gsq-iq-i8mma-turbo-cuda-v2 = v1 plus a second int8 activation limb (same weights, same B fragments) ----
-// Per activation x with A8 delta e and A8 code c1 (the shared quantizers, unchanged):
-//   q = x / e (one IEEE RN division, the A8 quantizer's own), r = q - c1 (exact), c2 = clamp(rint(128 r), -127, 127).
-//   When c1 is the A8 code of x, |r| <= 0.5 so |c2| <= 64 (the clamp never binds), and x is represented as e (c1 + c2 / 128):
-//   error <= e / 256 per element (v1: e / 2), i.e. 128x lower amplitude.
-// Per (row, output) and group (two-scale: per half, ascending), from acc = +0:
-//   dot_hi = sum c1 * c_w, dot_lo = sum c2 * c_w (two exact int32 IMMA on the SAME B fragment, |dot_lo| < 2^22)
-//   es = e_x * s_w (one rounding); acc = fma(float(dot_hi), es, acc); acc = fma(dot_lo / 128, es, acc)
-// dot_lo / 128 is exact (power-of-two scaling of an exact integer), so the route stays bit-specified.
-inline constexpr const char* arithmetic_id_v2 = "gsq-iq-i8mma-turbo-cuda-v2";
-inline constexpr float kLoScale = 128.0F, kLoInv = 0.0078125F;  // 2^7, 2^-7
-inline constexpr int kLoMax = 64;
-STRIX_TURBO_I8_HD int lo_code(float x, float e, int c1) {
-#ifdef __CUDA_ARCH__
-    const float r = __fsub_rn(__fdiv_rn(x, e), static_cast<float>(c1));
-    return static_cast<int>(fminf(127.0F, fmaxf(-127.0F, rintf(__fmul_rn(r, kLoScale)))));
-#else
-    volatile float q = x / e;  // one IEEE RN division (as __fdiv_rn)
-    const float r = q - static_cast<float>(c1);
-    return static_cast<int>(std::fmin(127.0F, std::fmax(-127.0F, std::rint(r * kLoScale))));
-#endif
-}
-// dot_lo / 128 from the IMMA bits (C = magic): (magic + dot_lo) * 2^-7 - magic * 2^-7, one FMA of exact operands -> exact.
-STRIX_TURBO_I8_HD float lo_dot_float(std::uint32_t d_bits) { return fma_rn(bits_f32(d_bits), kLoInv, -kMagic * kLoInv); }
-STRIX_TURBO_I8_HD float step2(float acc, float dot_hi, float dot_lo_scaled, float e, float s) {
-    const float es = mul_rn(e, s);
-    return fma_rn(dot_lo_scaled, es, fma_rn(dot_hi, es, acc));
-}
-
 // Block geometry (kernels and oracle): 8 warps; a CSR tile has <= 64 rows = 4 m16 blocks; activations are staged 128
 // values (4 groups) per stage; row pitch 160 B puts the 8-byte A loads of rows g .. g + 3 on distinct bank octets.
 inline constexpr unsigned kThreads = 256U, kTileRows = 64U, kProjectOutputs = 64U, kDownOutputs = 128U, kStageK = 128U;

@@ -91,9 +91,7 @@ inline bool take(int argc, char** argv, int& i, Request& r) {
         else if(value==qwen_packs::gsq_a8_contract) c.expert_arithmetic=qwen_packs::ExpertArithmetic::gsq_a8_dot4;
         else if(value==qwen_packs::gsq_bf16_contract) c.expert_arithmetic=qwen_packs::ExpertArithmetic::gsq_bf16_mma;
         else if(value==qwen_packs::gsq_i8_turbo_contract) c.expert_arithmetic=qwen_packs::ExpertArithmetic::gsq_i8_turbo;
-        else if(value==qwen_packs::gsq_i8_turbo2_contract) c.expert_arithmetic=qwen_packs::ExpertArithmetic::gsq_i8_turbo2;
-        else throw std::invalid_argument("--expert-arithmetic requires incumbent, gsq-iq3s-a8-dot4-cuda-v1, gsq-iq-bf16mma-cuda-v1, "
-                                         "gsq-iq-i8mma-turbo-cuda-v1 or gsq-iq-i8mma-turbo-cuda-v2");
+        else throw std::invalid_argument("--expert-arithmetic requires incumbent, gsq-iq3s-a8-dot4-cuda-v1, gsq-iq-bf16mma-cuda-v1 or gsq-iq-i8mma-turbo-cuda-v1");
     }
     else if (a == "--mtp-sidecar") c.mtp_sidecar_gguf = next();
     else if (a == "--draft-vocab") c.draft_vocab = next();
@@ -465,10 +463,6 @@ inline ::strix::cuda::qwen_route::Identity numerical_identity(const qp::Config& 
     if(c.expert_arithmetic==qwen_packs::ExpertArithmetic::gsq_i8_turbo) {
         id.prefill="cuda-qwen-gsq-i8turbo-prefill-v1";
         id.hash=route::hash_part(id.hash,qwen_packs::gsq_i8_turbo_contract);
-    }
-    if(c.expert_arithmetic==qwen_packs::ExpertArithmetic::gsq_i8_turbo2) {
-        id.prefill="cuda-qwen-gsq-i8turbo2-prefill-v1";
-        id.hash=route::hash_part(id.hash,qwen_packs::gsq_i8_turbo2_contract);
     }
     if(c.expert_narrow) {  // per-regime experts: the prefill state depends on the rule (block rows decide the arithmetic)
         id.prefill="cuda-qwen-gsq-expert-regime-prefill-v1";

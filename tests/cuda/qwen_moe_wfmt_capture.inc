@@ -94,10 +94,10 @@ static void wfmt_capture(const am::Tables& tables,const char* directory) {
 }
 
 // TURBO stage probe (diagnostic, mode turbo-probe): one MoE layer per GSQ type pair, the SAME inputs and weights through
-// the production routes E (incumbent native FP32), F (gsq-iq-bf16mma), T1 / T2 (gsq-iq-i8mma-turbo v1 / v2). Per arm the
+// the production routes E (incumbent native FP32), F (gsq-iq-bf16mma), T (gsq-iq-i8mma-turbo-cuda-v1). Per arm the
 // rel-RMS against E of u (gate/up projection alone), h (SwiGLU output, the down input), rawdots (down) and acc (routed
 // sum). Inputs: Gaussian rows over a 2^-2..2^2 scale range plus four massive channels and 1 % x8 outliers (heavy-tailed
-// groups, as the model's MoE input). If the kernels follow their contracts T2 sits ~100x below T1 at every stage.
+// groups, as the model's MoE input).
 static void turbo_probe_inputs(State& s, std::mt19937& rng) {
     std::normal_distribution<float> nd(0.0F, 1.0F);
     std::uniform_real_distribution<float> uni(0.0F, 1.0F);
@@ -114,11 +114,6 @@ struct TurboProbeOut { std::vector<u8> inter, raw, acc; u32 bad = 0; };
 static TurboProbeOut turbo_probe_arm(const am::Tables& tables, const HostWeights& w, const State& s0, mo::ExpertArithmetic a) {
     State s = s0;
     Device d; upload_weights(d, w); upload_state(d, s, true);
-    i8 *lo = nullptr, *dlo = nullptr;
-    if (a == mo::ExpertArithmetic::gsq_i8_turbo2) {
-        lo = dalloc<i8>(size_t(s.T) * mo::hidden); dlo = dalloc<i8>(size_t(s.T) * mo::top_k * mo::ffn);
-        d.rows_view.lo_codes = {lo, mo::hidden}; d.rows_view.down_lo_codes = {dlo, mo::top_k * mo::ffn};
-    }
     d.weights.arithmetic = a;
     mo::enqueue(d.rows_view, s.T, mo::hidden, d.weights, tables, d.record, nullptr, false);
     CK(cudaDeviceSynchronize());
@@ -126,22 +121,20 @@ static TurboProbeOut turbo_probe_arm(const am::Tables& tables, const HostWeights
     const auto st = snap(d, s, V_status);
     for (u32 r = 0; r < s.T; ++r) o.bad |= *reinterpret_cast<const u32*>(st.data() + size_t(r) * stride_of(V_status));
     u32 summary = 0; CK(cudaMemcpy(&summary, d.summary, 4, cudaMemcpyDeviceToHost)); o.bad |= summary;
-    if (lo) cudaFree(lo);
-    if (dlo) cudaFree(dlo);
     free_device(d);
     return o;
 }
 static int turbo_probe(const am::Tables& tables) {
     std::mt19937 rng(0x7b3);
     int bad = 0;
-    std::printf("TURBO stage probe: rel-RMS vs E (incumbent native FP32) per stage, arms F | T1 | T2\n");
+    std::printf("TURBO stage probe: rel-RMS vs E (incumbent native FP32) per stage, arms F | T\n");
     for (const auto gt : {18U, 21U, 22U, 23U, 42U}) for (const auto dt : {20U, 42U}) {
         const auto w = wfmt_native_weights(gt, dt, rng);
         for (const auto T : {9U, 300U}) {
             State s; init_state(s, T); turbo_probe_inputs(s, rng);
             const auto e = turbo_probe_arm(tables, w, s, mo::ExpertArithmetic::incumbent);
             std::printf("PROBE g%u d%u T%3u", gt, dt, T);
-            for (const auto a : {mo::ExpertArithmetic::gsq_bf16_mma, mo::ExpertArithmetic::gsq_i8_turbo, mo::ExpertArithmetic::gsq_i8_turbo2}) {
+            for (const auto a : {mo::ExpertArithmetic::gsq_bf16_mma, mo::ExpertArithmetic::gsq_i8_turbo}) {
                 const auto x = turbo_probe_arm(tables, w, s, a);
                 double n[4] = {}, q[4] = {};  // u, h, raw, acc
                 for (u32 r = 0; r < T; ++r) {

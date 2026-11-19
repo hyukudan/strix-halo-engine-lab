@@ -27,15 +27,11 @@ inline constexpr std::string_view gsq_bf16_contract="gsq-iq-bf16mma-cuda-v1";
 // TURBO integer tensor-core GSQ experts (shared A8 int8 activations x integer codes, exact int32 group dots, one FP32 FMA per
 // group; src/cuda/core/turbo_i8.hpp). TURBO class: selected by the TURBO profile or explicitly, never by EXACT/FAST.
 inline constexpr std::string_view gsq_i8_turbo_contract="gsq-iq-i8mma-turbo-cuda-v1";
-// TURBO v2: v1 plus a second int8 limb per activation (A8 code c1 and c2 = rint(128 (x / e - c1)), |c2| <= 64) on the same
-// decoded weight fragment: 128x lower activation error than v1 at integer tensor-core speed (src/cuda/core/turbo_i8.hpp).
-inline constexpr std::string_view gsq_i8_turbo2_contract="gsq-iq-i8mma-turbo-cuda-v2";
-enum class ExpertArithmetic : std::uint8_t { incumbent, gsq_a8_dot4, gsq_bf16_mma, gsq_i8_turbo, gsq_i8_turbo2 };
+enum class ExpertArithmetic : std::uint8_t { incumbent, gsq_a8_dot4, gsq_bf16_mma, gsq_i8_turbo };
 inline constexpr std::string_view expert_arithmetic_name(ExpertArithmetic arithmetic) {
     return arithmetic==ExpertArithmetic::incumbent?"incumbent":
            arithmetic==ExpertArithmetic::gsq_a8_dot4?gsq_a8_contract:
-           arithmetic==ExpertArithmetic::gsq_bf16_mma?gsq_bf16_contract:
-           arithmetic==ExpertArithmetic::gsq_i8_turbo?gsq_i8_turbo_contract:gsq_i8_turbo2_contract;
+           arithmetic==ExpertArithmetic::gsq_bf16_mma?gsq_bf16_contract:gsq_i8_turbo_contract;
 }
 
 namespace t {
@@ -80,10 +76,6 @@ inline constexpr weight_pack::Decl gsq_bf16_pack{
 inline constexpr weight_pack::Decl gsq_i8_turbo_pack{
     "qwen38-gsq-rco-iq3s-i8turbo-v1","turbo:gsq-iq-i8mma-turbo-cuda-v1",
     "legacy dense images; routed GSQ integer codes x A8 int8 rows on int8 IMMA, one FP32 FMA per group (unqualified TURBO)",gsq_a8_rules};
-// Same storage rules; TURBO v2 arithmetic (two int8 activation limbs on int8 IMMA, explicit selection only, unqualified).
-inline constexpr weight_pack::Decl gsq_i8_turbo2_pack{
-    "qwen38-gsq-rco-iq3s-i8turbo-v2","turbo:gsq-iq-i8mma-turbo-cuda-v2",
-    "legacy dense images; routed GSQ integer codes x two-limb int8 rows on int8 IMMA, two FP32 FMA per group (unqualified TURBO)",gsq_a8_rules};
 
 inline constexpr std::array<weight_pack::Decl, 3> family{{
     {"qwen38-ud-q4kxl-a8-v1", "exact", "A8 dense + A8 MoE kernels (cuda-qwen-a8-*)", product_all},
@@ -95,11 +87,9 @@ inline constexpr std::array<weight_pack::Decl, 3> family{{
 
 inline weight_pack::Admission admit(std::span<const weight_pack::Tensor> tensors,std::string_view requested_arithmetic={}) {
     static constexpr std::array<weight_pack::TypePair, 1> paired{{{"_gate_exps", "_up_exps"}}};
-    if(requested_arithmetic==gsq_a8_contract || requested_arithmetic==gsq_bf16_contract || requested_arithmetic==gsq_i8_turbo_contract ||
-       requested_arithmetic==gsq_i8_turbo2_contract) {
+    if(requested_arithmetic==gsq_a8_contract || requested_arithmetic==gsq_bf16_contract || requested_arithmetic==gsq_i8_turbo_contract) {
         const auto* decl=requested_arithmetic==gsq_a8_contract?&gsq_a8_pack:
-                         requested_arithmetic==gsq_bf16_contract?&gsq_bf16_pack:
-                         requested_arithmetic==gsq_i8_turbo_contract?&gsq_i8_turbo_pack:&gsq_i8_turbo2_pack;
+                         requested_arithmetic==gsq_bf16_contract?&gsq_bf16_pack:&gsq_i8_turbo_pack;
         auto admission=weight_pack::admit(std::span<const weight_pack::Decl>(decl,1),tensors,paired);
         if(admission.pack) {
             bool gate=false,down=false;
