@@ -25,6 +25,7 @@ struct MtpServeRequest {
  std::string session_id,session_operation,session_durability;
  serve::CacheRetention cache_retention=serve::CacheRetention::server_policy;
  std::vector<std::uint32_t> prompt,stop_tokens;
+ std::uint32_t stable_prefix=0;
  std::uint32_t max_tokens=0;
  std::optional<bool> ngram_draft;
  std::function<bool(std::span<const std::uint32_t>)> on_tokens;

@@ -13,7 +13,7 @@ s=pathlib.Path(sys.argv[1]).read_bytes()
 a=b'class MtpBridgeEngine final'; z=b'inline std::atomic<bool>& http_serve_stop_requested()'
 assert s.count(a)==s.count(z)==1, 'bridge anchors must be unique'
 v=s[s.index(a):s.index(z)]
-assert hashlib.sha256(v).hexdigest()=='29c47c286f03fc956ae33998d6eb41272ec605b360d1520752bb5730072f628a', 'bridge changed'
+assert hashlib.sha256(v).hexdigest()=='522e23f2189ba3f36105c25100536440613d593dabf9cd0883c08ba47ef64cd9', 'bridge changed'
 p=pathlib.Path(sys.argv[2]);p.mkdir(parents=True,exist_ok=True)
 (p/'serial_bridge.inc').write_bytes(v)
 a=b'        // Serial native-control binding begin.'; z=b'        // Serial native-control binding end.'
