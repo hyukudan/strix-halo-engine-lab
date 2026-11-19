@@ -105,6 +105,7 @@ struct HipDenseSpecArgs {
     std::string draft_packs;
     HipDenseCostMode costs = HipDenseCostMode::calibrated;
     std::string cost_kv = "auto";  // --cost-kv auto|online|off|KV: context cost of the table / calibrated model (hip_dense_cost_kv)
+    bool costs_explicit = false;  // --spec-costs was given (exact TP decode refuses an explicit non-table choice)
 };
 [[nodiscard]] inline const char* hip_dense_cost_mode_name(HipDenseCostMode m) {
     return m == HipDenseCostMode::calibrated ? "calibrated" : m == HipDenseCostMode::table ? "table" : "learned";
@@ -122,6 +123,7 @@ bool parse_hip_dense_spec_arg(const std::string& flag, Next&& next, HipDenseSpec
         a.draft_packs = next();
     } else if (flag == "--spec-costs") {
         const std::string v = next();
+        a.costs_explicit = true;
         if (v == "calibrated") a.costs = HipDenseCostMode::calibrated;
         else if (v == "table" || v == "fixed") a.costs = HipDenseCostMode::table;
         else if (v == "learned") a.costs = HipDenseCostMode::learned;
