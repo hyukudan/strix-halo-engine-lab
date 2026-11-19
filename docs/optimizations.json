@@ -3398,5 +3398,16 @@
     "doc_anchor": "docs/optimizations.md#qwen-dense-cuda-verify-prelaunch"
   },
   {"engine":"qwen","name":"Qwen 27B exact tensor-parallel decode over two nodes","flag_or_env":"--tp-rank 0|1; --tp-transport; --tp-rates A,B; --tp-trip-us; --tp-force; --topology FILE --node ID; STRIX_TOPOLOGY; STRIX_TP_F16_GATHER; STRIX_TP_SPLIT_DRAFT","default":"off (one node) unless --tp-rank is given; the shared split planner keeps one node when the group does not win","exact":"Generated ids equal the one-node plain reference over 1,200 tokens (code prompt) with the levers on and off, and over 200 plain tokens.","gain":"Two nodes over USB4, EXACT, code prompt, 1,200 tokens with MTP speculation: one node 46.76 / 46.68 tok/s, tensor parallel 58.50 tok/s (+25 %).","preconditions":"Both ranks hold the model; per-rank read rates from --tp-rates or the topology declaration (no compiled default); the trip cost is measured at start-up and agreed by both ranks.","off_switch":"omit --tp-rank; STRIX_TP_F16_GATHER=0 / STRIX_TP_SPLIT_DRAFT=0 for the levers","doc_anchor":"docs/optimizations.md#qwen-27b-exact-tensor-parallel-decode-over-two-nodes"},
-  {"engine":"qwen","name":"Qwen 27B pair prefill: decode relay to one node","flag_or_env":"STRIX_PAIR_DECODE_RELAY","default":"off (layer-owned decode)","exact":"None on this tree yet.","gain":"Not measured on this tree.","preconditions":"Every node's memory declared; the chain planner chooses a decoder that holds the whole model.","off_switch":"STRIX_PAIR_DECODE_RELAY=0 or unset","doc_anchor":"docs/optimizations.md#qwen-27b-pair-prefill-decode-relay-to-one-node"}
+  {"engine":"qwen","name":"Qwen 27B pair prefill: decode relay to one node","flag_or_env":"STRIX_PAIR_DECODE_RELAY","default":"off (layer-owned decode)","exact":"None on this tree yet.","gain":"Not measured on this tree.","preconditions":"Every node's memory declared; the chain planner chooses a decoder that holds the whole model.","off_switch":"STRIX_PAIR_DECODE_RELAY=0 or unset","doc_anchor":"docs/optimizations.md#qwen-27b-pair-prefill-decode-relay-to-one-node"},
+  {
+    "engine": "hy4",
+    "name": "Verify rows: routed experts of the window read once (expert union)",
+    "flag_or_env": "STRIX_HY4_ROWS_EXPERT_UNION",
+    "default": "ON",
+    "exact": "Bitwise: every (row, slot, output) runs the single-row instruction sequence; rows == step logits 30/30 (R 1/2/4/8, per-row and union arms) on device.",
+    "gain": "One node, verify window, 10-rep A-B medians: R4 111.1 -> 91.6 ms, R8 187.3 -> 137.5 ms; code decode with the copy proposer 16.65 -> 20.16 tok/s (ids equal).",
+    "preconditions": "Hy4-flash verify rows (R <= 8, top-16 of 512) on the Q4_K x A8 C1 family with K-quant down.",
+    "off_switch": "STRIX_HY4_ROWS_EXPERT_UNION=0",
+    "doc_anchor": "docs/optimizations.md#hy4-rows-expert-union"
+  }
 ]
