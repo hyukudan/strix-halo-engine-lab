@@ -1,0 +1,17 @@
+{
+  "comment": "Hy4-flash gate prompts (G2 / G3 identity). Original project-owned text, raw completion prompts (no chat template, no BOS: the pack declares tokenizer.ggml.add_bos_token = false). Ids: <id>.ids, one id per line, produced by the shared tokenizer (strix-tokenize PACK encode). G4 quality reuses scripts/bench/prompts/kit.json plus gate-zh.",
+  "prompts": [
+    {
+      "id": "gate-en",
+      "category": "prose",
+      "lang": "en",
+      "text": "The lighthouse keeper wrote the name of every ship that passed in a small blue notebook. On the third night of the storm, a ship with no name"
+    },
+    {
+      "id": "gate-zh",
+      "category": "prose",
+      "lang": "zh",
+      "text": "小镇的图书馆每天早上八点开门。管理员先给窗台上的花浇水。今天她发现一本没有书名的旧书，"
+    }
+  ]
+}

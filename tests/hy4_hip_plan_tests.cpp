@@ -1,0 +1,247 @@
+// Hy4-flash HIP binding plan (src/hy4/hip/hy4_hip_plan.hpp): every stage names a shared entry, the layer order follows
+// the oracle's residual order (Engram, attention sublayer, FFN sublayer), and the cache plan uses the shared
+// cache-row layouts the readers expect. Optional argument: the first GGUF part of the pack (real layer schedule).
+#include "strix/hy4/presets.hpp"
+#include "hy4/hip/hy4_hip_plan.hpp"
+#include "strix/ds41_moe.hpp"
+#include "strix/pair/layer_pipeline.hpp"
+#include "strix/profiles/hy4.hpp"
+
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <algorithm>
+#include <random>
+#include <filesystem>
+#include <string>
+
+namespace hb = strix::hy4::hipbind;
+namespace cr = strix::attn::cache_rows;
+
+namespace {
+
+int failures = 0;
+#define CHECK(cond)                                                              \
+    do {                                                                         \
+        if (!(cond)) {                                                           \
+            std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
+            ++failures;                                                          \
+        }                                                                        \
+    } while (0)
+
+bool has(const std::vector<hb::Step>& s, hb::Stage st) {
+    for (const auto& x : s)
+        if (x.stage == st) return true;
+    return false;
+}
+
+void check_config(const strix::hy4::Config& c, const char* name) {
+    unsigned indexed = 0;
+    for (std::uint32_t l = 0; l < c.layers; ++l) {
+        const auto s = hb::layer_steps(c, l);
+        bool engram = false;
+        for (const auto e : c.engram_layers) engram = engram || e == l;
+        for (const auto& x : s) {
+            CHECK(!x.entry.empty() && !x.what.empty());
+        }
+        // residual order: Engram first (when present), the attention HC mix before the FFN HC mix, expand last
+        CHECK((s.front().stage == hb::Stage::engram_rows) == engram);
+        CHECK(s.back().stage == hb::Stage::hc_expand);
+        CHECK(has(s, hb::Stage::index_select) == (c.indexed[l] != 0U));
+        CHECK(has(s, hb::Stage::route) == (c.dense[l] == 0U));
+        indexed += c.indexed[l] != 0U ? 1U : 0U;
+        // caches: decode (1 row) and a 64-row chunk
+        for (const std::uint32_t rows : {1U, 64U}) {
+            const auto k = hb::layer_caches(c, l, 8192U, rows);
+            CHECK(k.latent.width == c.kv_lora + c.qk_rope);
+            if (c.indexed[l] == 0U) {
+                CHECK(cr::is_pow2(k.latent.ring) && k.latent.ring >= c.window - 1U + rows && k.latent_rows == k.latent.ring);
+                CHECK(k.token_rows == 0U && k.group_rows == 0U);
+            } else {
+                CHECK(k.latent.ring == 0U && k.latent_rows == 8192U);
+                CHECK(k.token_keys.width == c.index_dim && k.token_keys.ring == c.index_ratio - 1U + rows);
+                CHECK(k.group_rows == 8192U / c.index_ratio && k.group_keys.ring == 0U);
+            }
+        }
+    }
+    const auto head = hb::edge_steps(true);
+    CHECK(hb::edge_steps(false).front().stage == hb::Stage::embed && head.back().stage == hb::Stage::argmax);
+    for (const auto& x : head) CHECK(!x.entry.empty() && !x.what.empty());
+    const double gib = static_cast<double>(hb::cache_bytes(c, 131072U, 1U)) / 1073741824.0;
+    std::printf("%s: %u layers, %u indexed; caches at 128K decode %.3f GiB\n", name, c.layers, indexed, gib);
+}
+
+// Indexer binding constants (hy4_hip_plan.hpp): the device scan's head-weight scale is the oracle's fp32, the flash list
+// length the host passes equals the shared contract's expanded selection, and the token ring holds every slot a pool of
+// a launch of `rows` positions reads.
+// Batched prompt plan: windows start 8-aligned, are multiples of 8 and >= 16 (grouped expert prefill admission), cover
+// every position exactly once with the lead / tail steps; the indexed dense / select split of a window.
+void check_prompt_plan() {
+    for (const std::uint32_t rmax : {16U, 24U, 512U, 2048U, 4096U}) {
+        for (const std::uint32_t pos : {0U, 3U, 8U, 2045U}) {
+            for (const std::uint32_t count : {1U, 7U, 15U, 16U, 17U, 31U, 2048U, 4096U, 4100U, 4111U}) {
+                const auto p = hb::prompt_plan(pos, count, rmax);
+                std::uint32_t at = pos + p.lead, covered = p.lead + p.tail;
+                CHECK(p.lead < 8U || p.lead == count);
+                for (const auto& w : p.windows) {
+                    CHECK(w.p0 == at && w.p0 % 8U == 0U && hb::prompt_window_ok(w.rows) && w.rows <= rmax);
+                    at += w.rows;
+                    covered += w.rows;
+                }
+                CHECK(covered == count && p.tail < 16U);
+            }
+        }
+    }
+    const auto off = hb::prompt_plan(0U, 100U, 12U);  // inadmissible window: every position is a step
+    CHECK(off.lead == 100U && off.windows.empty() && off.tail == 0U);
+    CHECK(hb::index_dense_rows(0U, 2048U) == 2048U && hb::index_dense_rows(2040U, 16U) == 8U && hb::index_dense_rows(2048U, 16U) == 0U);
+    for (std::uint32_t t = 2040U; t < 2056U; ++t)
+        CHECK((t < 2040U + hb::index_dense_rows(2040U, 16U)) == strix::attn::group_indexer::dense(strix::hy4::preset::indexer, t));
+    static_assert(hb::kKbPadInput % 128U == 0U && hb::kKbPadInput >= 192U);
+}
+
+// The pair invariant: the shared layer pipeline's windows (the same on every stage), each run as stage_window_plan,
+// concatenate to the one-node prompt_plan from position 0 (same rows windows, same single steps, in order), so a stage
+// of the pair executes exactly the one-node prefill's work in the same order and its bits equal it.
+void check_stage_windows() {
+    for (const std::uint32_t rmax : {16U, 24U, 512U, 1024U, 2048U}) {
+        for (const std::uint32_t count : {1U, 7U, 15U, 16U, 17U, 31U, 32U, 1000U, 2048U, 4096U, 4100U, 4111U, 4119U, 16384U, 32768U}) {
+            const auto one = hb::prompt_plan(0U, count, rmax);
+            std::vector<hb::PromptWindow> wins;
+            std::uint32_t steps_mid = 0, tail = 0, at = 0;
+            const auto ws = strix::pair::layers::windows(count, rmax);
+            for (std::size_t k = 0; k < ws.size(); ++k) {
+                CHECK(ws[k].start == at);
+                const auto p = hb::stage_window_plan(ws[k].start, ws[k].rows, rmax);
+                CHECK(p.lead == 0U && p.windows.size() <= 1U);
+                for (const auto& w : p.windows) wins.push_back(w);
+                (k + 1U == ws.size() ? tail : steps_mid) += p.tail;
+                at += ws[k].rows;
+            }
+            CHECK(at == count && steps_mid == 0U && tail == one.tail && one.lead == 0U);
+            CHECK(wins.size() == one.windows.size());
+            for (std::size_t k = 0; k < std::min(wins.size(), one.windows.size()); ++k)
+                CHECK(wins[k].p0 == one.windows[k].p0 && wins[k].rows == one.windows[k].rows);
+        }
+    }
+    bool refused = false;
+    try {
+        (void)hb::stage_window_plan(8U, 16U, 16U);  // a window off the shared grid
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    CHECK(refused);
+    CHECK(hb::pair_cut(42U) == 21U);
+    // The flow-shop picker over a calibration (synthetic costs: the wide window 2.3 % cheaper per row).
+    const hb::PairWindowCost costs[] = {{1024U, 1000.0}, {2048U, 1954.0}};
+    CHECK(hb::pair_window_rows(16U, costs) == 1024U && hb::pair_window_rows(4096U, costs) == 1024U &&
+          hb::pair_window_rows(32768U, costs) == 1024U);
+    CHECK(hb::pair_window_rows(65536U, costs) == 2048U);
+    CHECK(hb::pair_window_rows(4096U, {}) == 0U);  // no calibration: the caller keeps its width
+    const hb::PairWindowCost unusable[] = {{0U, 5.0}, {1024U, 0.0}};
+    CHECK(hb::pair_window_rows(4096U, unusable) == 0U);
+}
+
+// The tier word through the shared resolver: default leaves the plain invocation (prompt position by position); the
+// batched prompt failed its gate, so fast leaves it pending (runs only with --allow-pending, stamped unqualified); an
+// explicit --prompt-rows wins and stamps the run unqualified; turbo is refused (no version).
+void check_profile() {
+    namespace sp = strix::profile;
+    const auto& engine = strix::hy4::profile::engine();
+    const auto rows = [&](std::vector<std::string> args, std::string* status) {
+        sp::Inputs in;
+        in.env = [](const char*) -> const char* { return nullptr; };
+        sp::take_options(engine, args, in);
+        const auto r = sp::resolve(engine, in);
+        const auto* e = r.find("prompt_rows");
+        if (e == nullptr) return std::string("missing");
+        *status = std::string(sp::status_name(e->status)) + " / " + r.qualification();
+        return e->value;
+    };
+    const auto is = [](sp::Status s, const char* q) { return std::string(sp::status_name(s)) + " / " + q; };
+    std::string st;
+    CHECK(rows({}, &st) == "0" && st == is(sp::Status::builtin, "qualified"));
+    CHECK(rows({"--profile", "default"}, &st) == "0" && st == is(sp::Status::builtin, "qualified"));
+    CHECK(rows({"--profile", "fast"}, &st) == "0" && st == is(sp::Status::pending, "qualified"));
+    CHECK(rows({"--profile", "fast", "--allow-pending"}, &st) == "2048" && st == is(sp::Status::unqualified, "unqualified: prompt_rows"));
+    CHECK(rows({"--profile", "fast", "--prompt-rows", "512"}, &st) == "512" &&
+          st == is(sp::Status::explicit_cli, "unqualified: prompt_rows"));
+    CHECK(rows({"--prompt-rows", "2048"}, &st) == "2048" && st == is(sp::Status::explicit_cli, "unqualified: prompt_rows"));
+    CHECK(rows({"--prompt-rows", "0"}, &st) == "0" && st == is(sp::Status::off, "qualified"));
+    bool refused = false;
+    try {
+        (void)rows({"--profile", "turbo"}, &st);
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    CHECK(refused);
+}
+
+void check_indexer_binding() {
+    namespace gi = strix::attn::group_indexer;
+    float scale = 0.0F;
+    const float oracle = (1.0F / strix::ds41::declared_sqrt(16.0F)) * (1.0F / strix::ds41::declared_sqrt(128.0F));
+    std::memcpy(&scale, &hb::kIndexHeadScaleBits, sizeof scale);
+    CHECK(scale == oracle);
+    CHECK(scale == gi::head_weight_scale(strix::hy4::preset::indexer));
+    static_assert(hb::kIndexListStride == 2048U);
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> u(-1.0F, 4.0F);
+    const std::uint32_t ts[] = {0U, 1U, 3U, 2043U, 2046U, 2047U, 2048U, 2049U, 2050U, 2051U, 2052U, 2055U, 3001U, 4095U, 4096U, 16383U, 32767U};
+    for (const auto t : ts) {
+        const unsigned P = gi::visible_groups(strix::hy4::preset::indexer, t);
+        std::vector<float> scores(P);
+        for (auto& x : scores) x = std::round(u(rng) * 8.0F) / 8.0F;  // coarse values: ties at the cut are exercised
+        const auto list = gi::expand_tokens(strix::hy4::preset::indexer, gi::select_groups(strix::hy4::preset::indexer, scores.data(), P), t);
+        CHECK(list.size() == hb::index_list_tokens(t));
+        CHECK(list.size() <= hb::kIndexListStride);
+        CHECK(!list.empty() && list.back() == t);
+        if (gi::dense(strix::hy4::preset::indexer, t)) CHECK(list.size() == t + 1U);
+    }
+    // Token ring (layer_caches: ratio - 1 + rows slots): a launch of rows positions ending at e pools every group whose
+    // 4th slot lies in the launch; the earliest such group starts at e - rows - 2, so ring >= rows + 3 keeps its keys.
+    for (unsigned rows : {1U, 2U, 7U, 64U, 512U}) {
+        const unsigned ring = gi::token_ring_slots(strix::hy4::preset::indexer, rows);
+        for (std::uint32_t e = rows + 8U; e < rows + 24U; ++e) {
+            const std::uint32_t lo = e + 1U - rows;
+            for (std::uint32_t g = lo / 4U; g * 4U + 3U <= e; ++g) {
+                if (g * 4U + 3U < lo) continue;
+                CHECK(e - g * 4U < ring);  // slot 4g is not yet overwritten by slot e
+            }
+        }
+    }
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    try {
+        const auto tiny = strix::hy4::Config::tiny();
+        check_config(tiny, "tiny");
+        check_indexer_binding();
+        check_prompt_plan();
+        check_stage_windows();
+        check_profile();
+        if (argc > 1 && std::filesystem::exists(argv[1])) {
+            const auto real = strix::hy4::Config::from_gguf(argv[1]);
+            check_config(real, "pack");
+            unsigned indexed = 0;
+            for (const auto x : real.indexed) indexed += x != 0U ? 1U : 0U;
+            CHECK(real.layers == 42U && indexed == 12U);
+            // 12 indexed layers x (1152 B latent + 64 B pooled key per token) + 30 sliding rings of 512 x 1152 B + 12
+            // token rings of 4 x 256 B (decode)
+            const std::uint64_t want = 12ULL * 131072ULL * 1152ULL + 12ULL * (131072ULL / 4ULL) * 256ULL + 30ULL * 512ULL * 1152ULL +
+                                       12ULL * 4ULL * 256ULL;
+            CHECK(hb::cache_bytes(real, 131072U, 1U) == want);
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "FAIL exception: %s\n", e.what());
+        return 1;
+    }
+    if (failures != 0) {
+        std::fprintf(stderr, "hy4 hip plan: %d failures\n", failures);
+        return 1;
+    }
+    std::printf("hy4 hip plan: PASS\n");
+    return 0;
+}

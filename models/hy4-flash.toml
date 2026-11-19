@@ -1,0 +1,7 @@
+schema = "strix-model/v1"
+name = "hy4-flash"
+
+# Descriptive entry for the Hy4-flash family (GGUF architecture hy_v4_flash). strix-serve --model hy4_flash selects the
+# hy4_flash ServiceFactory (src/hy4/serve/session_service.cpp): options, effective config and pack admission run on the
+# host; serving refuses until a device binding (hy4_hipbind / hy4_cudabind) exists. No runner selection, no measured
+# figures. Geometry, tensor names and shapes come from the pack (src/weight/adapters/hy4.cpp), not from this file.

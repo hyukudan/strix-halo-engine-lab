@@ -1,0 +1,13 @@
+name	args	status	contract
+strix-engram-core-tests	-	committed	shared Engram spec / hasher / row reader (include/strix/engram)
+strix-hc-contract-tests	-	committed	shared hyper-connection arithmetic, comb trait identity (include/strix/hc)
+strix-group-indexer-tests	-	committed	shared compressed group indexer, HY4 policy (include/strix/attn/group_indexer.hpp)
+strix-route-policy-tests	-	committed	shared router policy + SwiGLU clamp trait (include/strix/moe)
+strix-hy4-placement-tests	SRC:tests/data/hy4/q4km-component-bytes.tsv	committed	shared placement inputs, HY4 TP2 table (include/strix/pair/placement_inputs.hpp)
+strix-hy4-tokenizer-tests	PACK	committed	shared BPE tokenizer hy_v4 rule (pack header when PACK is given)
+strix-hy4-chat-tests	-	committed	HY4 chat template data on the shared chat kit
+strix-hy4-host-ref-tests	PACK	committed	CPU oracle hy4-host-ref-v1 on the tiny config (+ pack header config)
+hy4_serve_tests	-	committed	HY4 ServiceFactory on the shared serve shell, one resolver
+strix-wfmt-gguf-tensor-map-tests	-	committed	shared tensor naming map + GGUF type 43 by file (tests/wfmt build: --wfmt-build)
+strix-mla-contract-tests	-	committed	shared MLA attention contract: absorbed latent, list | window selection (hy4_attn)
+block-parallel-spec	-	pending	shared block-parallel drafter contract, DFly2 (hy4_spec, not committed)

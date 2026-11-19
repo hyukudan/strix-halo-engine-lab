@@ -72,3 +72,14 @@ defaults = ["include/strix/qwen35/config.hpp"]
 apps = ["apps/hip_qwen35_decode_main.hip", "apps/hip_qwen35_spec_main.hip",
         "apps/cuda_qwen35_decode_main.cu", "apps/cuda_qwen35_spec_main.cu", "tools/qwen35/ref_forward.py"]
 adapter = ["include/strix/qwen35/config.hpp"]
+
+[models.hy4_flash]
+name = "hy4-flash"
+description = "models/hy4-flash.toml"
+family = "hy4_flash"
+cmake = ""
+profile_tag = "hy4"
+allow_pending_env = ""
+defaults = ["src/hy4/serve/session_service.cpp"]
+apps = ["apps/strix_serve_main.cpp"]
+adapter = ["src/hy4/serve/session_service.hpp", "src/weight/adapters/hy4.cpp"]
