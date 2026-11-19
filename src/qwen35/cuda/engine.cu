@@ -290,8 +290,9 @@ __global__ void set_inputs_kernel(InputPack in, std::uint32_t* pos, std::uint32_
 __global__ void zero_u32_kernel(std::uint32_t* p) { *p = 0; }
 // Draft head output. Subset head (group_of set): compact row -> token id (slot group_of[row / group], row % group), in place
 // on the argmax output. Device-fed MTP chain (feed_out set): the last row's token id is also stored in the chain's feed slot.
+// top2 / feed_out2 (runner-up, token-tree siblings): the same map on the second id (0xFFFFFFFF = none stays none).
 __global__ void draft_map_kernel(std::uint32_t* top, const std::uint32_t* group_of, std::uint32_t rows, std::uint32_t group,
-                                 std::uint32_t* feed_out) {
+                                 std::uint32_t* feed_out, std::uint32_t* top2 = nullptr, std::uint32_t* feed_out2 = nullptr) {
     if (threadIdx.x < rows) {
         std::uint32_t t = top[threadIdx.x];
         if (group_of) {
@@ -299,6 +300,14 @@ __global__ void draft_map_kernel(std::uint32_t* top, const std::uint32_t* group_
             top[threadIdx.x] = t;
         }
         if (feed_out && threadIdx.x + 1 == rows) *feed_out = t;
+        if (top2) {
+            std::uint32_t u = top2[threadIdx.x];
+            if (group_of && u != 0xFFFFFFFFu) {
+                u = group_of[u / group] * group + u % group;
+                top2[threadIdx.x] = u;
+            }
+            if (feed_out2 && threadIdx.x + 1 == rows) *feed_out2 = u;
+        }
     }
 }
 // Device-fed MTP chain step: the input id is the previous step's draft, read from the feed on the device (no host round trip).
@@ -373,8 +382,9 @@ struct CudaEngine::Impl {
     float *mx = nullptr, *mxn = nullptr, *mcat = nullptr, *mtmp = nullptr, *mlogits = nullptr;
     std::uint32_t *d_ids = nullptr, *d_pos = nullptr, *d_top = nullptr, *d_parity = nullptr;
     void* d_argws = nullptr;
-    std::uint32_t *d_mids = nullptr, *d_mpos = nullptr, *d_mtop = nullptr;
-    std::uint32_t* d_feed = nullptr;  // device-fed MTP chain: drafted ids, CudaEngine::kMtpFeedSlots entries
+    std::uint32_t *d_mids = nullptr, *d_mpos = nullptr, *d_mtop = nullptr, *d_mtop2 = nullptr;  // d_mtop2: draft runner-ups
+    // device-fed MTP chain: drafted ids, CudaEngine::kMtpFeedSlots entries, then the same slots' runner-ups
+    std::uint32_t* d_feed = nullptr;
     // Verify pre-launch: pinned staging of the feed ids + the event that marks their copy (mtp_feed_read_async / _wait).
     cc::UniqueHandle<void*, cudaFreeHost> h_feed_owner;
     std::uint32_t* h_feed = nullptr;
@@ -505,7 +515,8 @@ struct CudaEngine::Impl {
             d_mids = alloc<std::uint32_t>(RM);
             d_mpos = alloc<std::uint32_t>(1);
             d_mtop = alloc<std::uint32_t>(RM);
-            d_feed = alloc<std::uint32_t>(CudaEngine::kMtpFeedSlots, true);
+            d_mtop2 = alloc<std::uint32_t>(RM);
+            d_feed = alloc<std::uint32_t>(2 * CudaEngine::kMtpFeedSlots, true);
             CK(cudaMallocHost(h_feed_owner.put(), CudaEngine::kMtpFeedSlots * sizeof(std::uint32_t)));
             h_feed = static_cast<std::uint32_t*>(h_feed_owner.get());
             CK(cudaEventCreateWithFlags(feed_ev.put(), cudaEventDisableTiming));
@@ -1521,6 +1532,19 @@ struct CudaEngine::Impl {
     void mtp_feed_put(std::uint32_t slot, const std::uint32_t* top_dev) {
         if (!mtp_ok || slot >= CudaEngine::kMtpFeedSlots) throw std::runtime_error("mtp_feed_put: no MTP tensors or bad slot");
         CK(cudaMemcpyAsync(d_feed + slot, top_dev, 4, cudaMemcpyDeviceToDevice, s));
+        // runner-up of a draft-head row travels with its id (the flush puts the last chunk row's prediction in slot 0)
+        // (any other source has no runner-up: the slot is cleared so a stale one is never read back)
+        const auto a = reinterpret_cast<std::uintptr_t>(top_dev), b0 = reinterpret_cast<std::uintptr_t>(d_mtop);
+        if (a >= b0 && a < b0 + static_cast<std::uintptr_t>(RM) * 4)
+            CK(cudaMemcpyAsync(d_feed + CudaEngine::kMtpFeedSlots + slot, d_mtop2 + (top_dev - d_mtop), 4, cudaMemcpyDeviceToDevice, s));
+        else
+            CK(cudaMemsetAsync(d_feed + CudaEngine::kMtpFeedSlots + slot, 0xFF, 4, s));
+    }
+    void mtp_feed_read2(std::uint32_t n, std::uint32_t* host, std::uint32_t* host2) {
+        if (!mtp_ok || n > CudaEngine::kMtpFeedSlots) throw std::runtime_error("mtp_feed_read2: no MTP tensors or bad count");
+        CK(cudaMemcpyAsync(host, d_feed, static_cast<std::size_t>(n) * 4, cudaMemcpyDeviceToHost, s));
+        CK(cudaMemcpyAsync(host2, d_feed + CudaEngine::kMtpFeedSlots, static_cast<std::size_t>(n) * 4, cudaMemcpyDeviceToHost, s));
+        CK(cudaStreamSynchronize(s));
     }
     void mtp_feed_read(std::uint32_t n, std::uint32_t* host) {
         if (!mtp_ok || n > CudaEngine::kMtpFeedSlots) throw std::runtime_error("mtp_feed_read: no MTP tensors or bad count");
@@ -1582,7 +1606,10 @@ struct CudaEngine::Impl {
         mtp_graphs.emplace_back(hidden_dev, std::move(gr));
         CK(cudaGraphLaunch(mtp_graphs.back().second.exec.get(), s));
     }
+    // Runner-up slot of a feed slot (nullptr stays nullptr).
+    std::uint32_t* feed2(std::uint32_t* feed_out) const { return feed_out ? feed_out + CudaEngine::kMtpFeedSlots : nullptr; }
     // Draft head on mxn rows -> o.logits / o.top (token ids); feed_out (device-fed chain) also receives the last row's id.
+    // The runner-up of every row (d_mtop2, and the feed slot's runner-up) comes from the same argmax launches.
     void mtp_head(std::uint32_t rows, std::uint32_t* feed_out, CudaEngine::MtpOut& o) {
         if (drows) {  // draft-only subset head: same tiles, compact out; ids mapped back on the device
             draft_rows_sync();
@@ -1590,14 +1617,14 @@ struct CudaEngine::Impl {
             w.data = dhead;
             w.out = drows->rows();
             CK(cc::dense_rows(w, mxn, mlogits, rows, nullptr, s, opt.dense_arithmetic));
-            CK(cc::argmax_rows(mlogits, w.out, rows, d_mtop, d_argws, s));
-            draft_map_kernel<<<1, 32, 0, s>>>(d_mtop, d_dmap, rows, 16U, feed_out);
+            CK(cc::argmax2_rows(mlogits, w.out, rows, d_mtop, d_mtop2, d_argws, s));
+            draft_map_kernel<<<1, 32, 0, s>>>(d_mtop, d_dmap, rows, 16U, feed_out, d_mtop2, feed2(feed_out));
             CK(cudaGetLastError());
         } else {
             CK(cc::dense_rows(head, mxn, mlogits, rows, nullptr, s, opt.dense_arithmetic));
-            CK(cc::argmax_rows(mlogits, c.vocab, rows, d_mtop, d_argws, s));
+            CK(cc::argmax2_rows(mlogits, c.vocab, rows, d_mtop, d_mtop2, d_argws, s));
             if (feed_out) {
-                draft_map_kernel<<<1, 32, 0, s>>>(d_mtop, nullptr, rows, 16U, feed_out);
+                draft_map_kernel<<<1, 32, 0, s>>>(d_mtop, nullptr, rows, 16U, feed_out, d_mtop2, feed2(feed_out));
                 CK(cudaGetLastError());
             }
         }
@@ -1920,6 +1947,9 @@ void CudaEngine::mtp_feed_wait(std::uint32_t n, std::uint32_t* host) { p_->mtp_f
 RowsOut CudaEngine::forward_rows_fed(const std::uint32_t* host_ids, std::uint32_t nhost, const std::uint32_t* slot,
                                      const std::uint32_t* host_vals, std::uint32_t k, LogitRows want) {
     return p_->forward_fed(host_ids, nhost, slot, host_vals, k, want);
+}
+void CudaEngine::mtp_feed_read2(std::uint32_t n, std::uint32_t* host, std::uint32_t* host2) const {
+    p_->mtp_feed_read2(n, host, host2);
 }
 void CudaEngine::read_logits(const RowsOut& o, std::uint32_t row, float* host) const {
     CK(cudaMemcpyAsync(host, o.logits + static_cast<std::size_t>(row) * p_->c.vocab, static_cast<std::size_t>(p_->c.vocab) * 4,

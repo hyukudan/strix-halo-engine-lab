@@ -37,9 +37,16 @@ cudaError_t embedding_rows(const DenseWeight& table, const std::uint32_t* ids, f
                            cudaStream_t stream);
 
 // out[r] = first maximum of the finite logits of row r (lowest index wins ties; 0xffffffff when the row has no finite
-// logit): the shared head pick (strix/head_argmax.hpp). workspace: kArgmaxWorkspaceBytes of device memory.
-constexpr std::size_t kArgmaxWorkspaceBytes = strix::head_argmax::workspace_bytes(kMaxRows);
+// logit): the shared head pick (strix/head_argmax.hpp). workspace: kArgmaxWorkspaceBytes of device memory, sized for the
+// runner-up trait (argmax2_rows, Pick2 partials) so one workspace serves both.
+constexpr std::size_t kArgmaxWorkspaceBytes = strix::head_argmax::workspace2_bytes(kMaxRows);
 cudaError_t argmax_rows(const float* logits, std::uint32_t vocab, std::uint32_t rows, std::uint32_t* out, void* workspace,
                         cudaStream_t stream);
+// Runner-up trait of the same shared head pick (Pick2): out[r] = the argmax_rows id (same comparisons in the same order),
+// out2[r] = the second finite logit in that order (value desc, index asc; 0xFFFFFFFF if none). Token-tree siblings
+// (strix/spec/block_drafter.hpp). gap (optional): gap[r] = value(out[r]) - value(out2[r]) (for logits: log p1 / p2, the
+// sibling selector's margin), NaN when there is no runner-up.
+cudaError_t argmax2_rows(const float* logits, std::uint32_t vocab, std::uint32_t rows, std::uint32_t* out, std::uint32_t* out2,
+                         void* workspace, cudaStream_t stream, float* gap = nullptr);
 
 }  // namespace strix::cuda_core

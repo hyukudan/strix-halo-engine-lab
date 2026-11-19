@@ -83,6 +83,25 @@ struct FakeFedEngine : FakeEngine {
     }
 };
 static_assert(!sp::MtpFeedEngine<FakeEngine> && sp::MtpFeedEngine<FakeFedEngine>, "feed hook detection");
+// The fed fake with the runner-up hook: a slot's runner-up is its id + 1000 (wherever the id came from).
+struct FakeRuEngine : FakeFedEngine {
+    std::uint32_t feed2[kMtpFeedSlots]{};
+    FakeMtpOut mtp_step_fed(const std::uint32_t* in_host, std::uint32_t in_slot, std::uint32_t out_slot, const float* hidden,
+                            std::uint32_t pos, bool want_top) {
+        const FakeMtpOut o = FakeFedEngine::mtp_step_fed(in_host, in_slot, out_slot, hidden, pos, want_top);
+        if (want_top) feed2[out_slot] = feed[out_slot] + 1000U;
+        return o;
+    }
+    void mtp_feed_put(std::uint32_t slot, const std::uint32_t* top) {
+        feed[slot] = *top;
+        feed2[slot] = *top + 1000U;
+    }
+    void mtp_feed_read2(std::uint32_t n, std::uint32_t* host, std::uint32_t* host2) {
+        mtp_feed_read(n, host);
+        std::memcpy(host2, feed2, n * 4U);
+    }
+};
+static_assert(sp::MtpRunnerUpEngine<FakeRuEngine> && !sp::MtpRunnerUpEngine<FakeFedEngine>, "runner-up hook detection");
 
 // The fed fake with the verify pre-launch hooks: the async read snapshots the slots into staging (what the device copy
 // sees in stream order); the wait returns that snapshot. `order` records a (async read), l (launch), w (wait).
@@ -323,6 +342,27 @@ int main() {
         const auto b1 = et.calls.size();
         ct.draft({}, 1, out);
         MC_CHECK(et.calls[b1].hidden0 == std::vector<float>({100.0F, 110.0F}), "linear path hidden");
+        MC_CHECK(ct.runner_ups().empty(), "no runner-up hook: no runner-ups");
+    }
+    {  // runner-ups ride with the ids: flushed d1 (slot 0), copy-prefix prediction (slot 1), chain steps, host d1 reuse
+        FakeRuEngine er;
+        sp::MtpChain<FakeRuEngine, HostDev> cr(er, false, 3, 8);
+        cr.observe_prefill(pf, 5, prompt, 99);
+        auto aligned = [&](const char* what) {
+            const auto ru = cr.runner_ups();
+            MC_CHECK(ru.size() == out.size(), "%s: %zu runner-ups for %zu drafts", what, ru.size(), out.size());
+            for (std::size_t j = 0; j < out.size(); ++j)
+                MC_CHECK(ru[j] == out[j] + 1000U, "%s: runner-up %zu = %u for draft %u", what, j, ru[j], out[j]);
+        };
+        cr.draft({}, 4, out);
+        aligned("flush + chain");
+        cr.draft({}, 2, out);
+        aligned("host d1, no flush");
+        cr.draft(std::vector<std::uint32_t>({8, 9}), 3, out);
+        aligned("copy prefix");
+        cr.set_device_feed(false);
+        cr.draft({}, 2, out);
+        MC_CHECK(cr.runner_ups().empty(), "host-fed draft: no runner-ups");
     }
     std::puts("spec_mtp_chain_tests: PASS");
     return 0;
