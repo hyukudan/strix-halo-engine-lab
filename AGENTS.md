@@ -71,6 +71,66 @@ Support for a new model is a binding, not a new engine:
 4. The pull request carries the table `stage | shared component | model-specific code` and lists
    every new file under the model directory with the reason it cannot be shared.
 
+# Performance tiers, quality gate and the route to main
+
+## Tiers (one mechanism: the shared `strix::profile` resolver, word `--profile exact|fast|turbo`)
+
+- **EXACT**: bitwise the reference path of the engine. No tolerance. An optimisation that keeps
+  every bit is an EXACT schedule change and needs an identity proof (ids, logits or state digest,
+  and identical machine code for untouched kernels). An engine whose device path has no bitwise
+  host reference names its reference class BASE and says so next to every number.
+- **FAST**: may change bits. A FAST lever needs (1) the quality gate below against the exact path
+  of the same engine and (2) a measured gain in the regime where it is enabled. There is no
+  minimum gain. Once both exist the lever is a registry row and is **on by default under
+  `--profile fast`** in that regime. Changing bits is not a defect in FAST; "gate not run" and
+  "gate failed" are the only reportable states.
+- **TURBO**: FAST plus levers that trade more quality for speed. Tiers are nested: the resolved
+  turbo set contains the fast set, each turbo lever is enabled only in regimes where a receipt
+  shows it faster than FAST, so TURBO is never slower than FAST. Explicit opt-in, never a default.
+  A lever that passes the FAST gate belongs in FAST.
+- Levers are data (name, versioned identity, receipts, regime, default per tier, off switch). The
+  server and the CLI resolve through the same code; a parity test covers it. A lever that wins in
+  some regimes ships with per-regime selection, not a global switch.
+
+## Quality gate for FAST levers
+
+- Limits, pooled over the gate set: KL <= 0.02, top-1 agreement >= 0.93, dNLL <= 0.01.
+- Per window the limit is `max(limit, 1.5 x the null of that same window)`, where the null is the
+  distance between two exact runs that differ only in evaluation order (one-ulp class). The
+  pooled limits stay absolute.
+- MoE engines: the lever arm replays the expert routes of the reference arm, so the gate measures
+  arithmetic and not route flips; the route flip rate of the free-running arm is reported.
+- dNLL is scored on token ids that neither arm generated, on at least 800 rows, with its standard
+  error printed. A verdict on fewer rows is provisional.
+- One gate tool for every engine; an engine only binds its route output and input.
+
+## Measuring
+
+- State class (EXACT / BASE / FAST / TURBO), hardware and power state with every number. Label
+  predictions as predictions. Do not benchmark while a key optimisation of the path is missing.
+- Multi-device: always report the one-device number, the multi-device number and their ratio, for
+  decode and for prefill. A plan that loses to one device is refused by the planner.
+- A negative result needs a device receipt (a bench), not only reasoning. A technique that is
+  known to work elsewhere and loses here is treated as an implementation defect until measured.
+- Kernel work requires reading the generated code (registers, spills, occupancy) and a no-model
+  bench before any model run.
+
+## Using several devices together
+
+Splitting a model across devices is a common facility, not an engine feature: the device and link
+description with measured costs, the capability table, the split planner with its cost model, the
+exchange contract and the channel interface are backend-neutral; a transport and a backend
+contribute only the channel body and the device-waited primitives; a model contributes only its
+stage declaration. See "Shared code first".
+
+## Route to main
+
+A change merges only with: an independent review that says GO, identity proof for every engine
+whose shared code changed, a clean build under the public CI warning set
+(`-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror`), and green CI. Pull request text
+carries `Docs:` and `Home:` lines, numbers only from receipts on the tree being merged, and no
+laboratory paths.
+
 # Production defaults for humans and coding agents
 
 The fast path is the default for all five public engines. Start with the plain command; let the
