@@ -29,7 +29,7 @@ namespace strix::hy4::hipbind::rows {
 inline constexpr std::uint32_t kMaxVerifyRows = 8;
 // Routed experts of a verify window in the shared A8 union rows form (each distinct expert read once, rows bitwise == the
 // per-row loop). Off switch: STRIX_HY4_ROWS_EXPERT_UNION=0.
-inline constexpr bool kExpertUnionDefault = false;
+inline constexpr bool kExpertUnionDefault = true;  // measured bitwise (ROWS 30/30) and faster at R >= 2
 
 // The decode step's device position words of a row at position p: {position, rope slot of its group, closing group, 0}.
 [[nodiscard]] constexpr std::array<std::uint32_t, 4> position_words(std::uint32_t p, std::uint32_t ratio) {
