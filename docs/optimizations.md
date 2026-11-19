@@ -2245,6 +2245,49 @@ at least 64 compared steps, matched == compared, gate pass, canonical position/s
 vectors equal; pressure must exercise bank/resurrection/mid-step collection. Pruning/controller/vocabulary can
 change acceptance, not committed target-greedy tokens. Compare within one load where supported (load spread ~10%).
 
+<a id="qwen27-cuda-decode-attn-row-share"></a>
+
+### Qwen 27B CUDA: decode attention walks the K/V cache once per kv head for several rows
+
+**Engine:** `qwen` (27B dense, CUDA: `strix-cuda-qwen35-spec`, `strix-cuda-qwen35-decode`). **Control:**
+`STRIX_DECODE_ATTN_ROW_SHARE` (default 1, the same switch as the HIP form). **Home:** shared (CUDA backend core
+`src/cuda_core/attention/attention.cu`, walk tables `include/strix/cuda_core/attention_row_walk.hpp`, plan
+`include/strix/attn_row_share.hpp`, the same plan and device-table registry as the HIP side).
+
+- Verify and draft rows of one kv head are grouped in walks; a walk loads each K (scores) and V (values) position once
+  for all its (row, q head) pairs. Per pair the operations and their order are the one-row form's (rounded multiply
+  then add per lane, the same butterfly and block-sum trees, the same running maxima), so scratch and output bits do
+  not depend on the walk.
+- The q heads of a kv head run as independent chains in one basic block; values keep the walk's weights transposed
+  (one 128-bit broadcast per four pairs). Shared walks run as a persistent item loop on two resident waves, so no
+  block is launched without work.
+- The walk length per active chunk count comes from the shared plan with the launch's occupancy floor, capped by the
+  device's measured table in the shared registry (`dense_decode_tables`, beside the HIP tables); one row, a short
+  prefix or the off switch run the one-row grid (one row per block, chunk fastest).
+- Devices: the automatic walk runs on measured (device, head shape) keys only: `sm_120` with 188 SMs (RTX PRO 6000
+  Blackwell), 24 q / 4 kv heads, Dim 256. Any other CUDA device or head shape keeps the one-row grid, as the HIP side
+  keeps its main schedule; a new device is enabled by adding its measured table. Every mode gives the same bits.
+- The kernel bodies (independent head chains, transposed weights, value batch 16, two blocks per SM) replace the
+  previous ones in every mode, rows 1 included; the switch selects the walk, not the previous kernels.
+
+- **Preconditions:** CUDA decode attention through `cuda_core::attention_decode` (Qwen 27B dense verify, draft and
+  plain steps) with more than one row.
+- **Fallback:** the one-row grid, silently: the walk is a pure schedule choice.
+- **Exactness evidence:** EXACT, bitwise. Device test against the frozen one-row kernels: 19 long cases (rows 1 / 2 /
+  3 / 4 / 5 / 7 / 12 / 13 / 16 at about 1K, 33K and 131K positions) x modes off / automatic / all, plus short
+  schedule cases at group widths 4 / 6 / 8: scratch (scores, chunk maxima, denominators, partials) and output equal.
+  Host test: every (chunk, kv head, walk) item exactly once for any persistent grid size.
+- **Off switch:** STRIX_DECODE_ATTN_ROW_SHARE=0 (one row per block in the current kernels).
+- **Measured gain:** kernel bench (one attention call, 24 q / 4 kv heads, Dim 256, RTX PRO 6000 Blackwell at 600 W;
+  automatic / off ms in the same binary): 1K rows 12 0.045 / 0.124; 32K rows 12 0.528 / 0.699; 131K rows 8 1.61 /
+  2.86, rows 12 2.15 / 4.31, rows 16 3.33 / 5.75; rows 1 equal. Model (Qwen 27B dense NVFP4, spec arm sub15d, one
+  run per arm): short code x 300, automatic 271.99 tok/s, ids equal to the serial reference; 28K code x 400, off
+  173.09 -> automatic 176.96 tok/s (verify 19.78 -> 19.26 ms per step); these two measure the switch only. Against the
+  previous kernels (the bench's frozen copy of them, same binary): every cell with 2-16 rows at 1K / 8K / 32K / 131K
+  takes at most 0.442 of their time (automatic / off at most 0.934). Model against a build of the previous kernels,
+  28K x 400 tokens, one run per arm, token ids equal: code 121.54 -> 176.56 tok/s (verify 28.84 -> 19.30 ms per step),
+  reasoning 130.54 -> 194.64, prose 101.29 -> 135.84.
+
 <a id="rtx-kernels"></a>
 
 ### Decode kernel bundle

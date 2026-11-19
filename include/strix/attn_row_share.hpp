@@ -7,7 +7,8 @@
 // The plan picks the largest compiled pair count that still leaves `min_blocks` blocks over all kv heads (the
 // backend's occupancy floor, measured per device), so a 1-row plain step keeps its parallelism and a 16-row verify
 // window stops re-reading K/V once per pair.
-// Home: shared (host shared policy): no backend, no model names; HIP binds it in attn_core/dense_decode.hpp.
+// Home: shared (host shared policy): no backend, no model names; HIP binds it in attn_core/dense_decode.hpp, CUDA in
+// cuda_core/attention_row_walk.hpp. Each backend's measured device tables sit side by side in dense_decode_tables.
 #include <cstddef>
 #include <string_view>
 
@@ -98,9 +99,26 @@ inline constexpr Band gfx1151_mp20_g6_kv4_d256[] = {
       {3U, 1U}, {2U, 1U}, {3U, 1U}, {3U, 1U}, {3U, 1U}}},
 };
 
+// sm_120 with 188 SMs (CUDA RTX PRO 6000), GQA group 6 x 4 kv heads, Dim 256. A CUDA block takes every q head of its kv
+// group, so a CUDA table counts rows (the plan's unit at group 1) and caps a walk: within the cap, plan() with the
+// device's occupancy floor picks the walk per active chunk count (cuda_core/attention_row_walk.hpp). One band; windows
+// past the table read the 16-row cap. Measured: no-model bench tests/cuda_core/cuda_core_test.cu --attn-bench (lengths
+// 1K 8K 32K 131K, rows 1-16): every cell with 2 or more rows is faster than one row per block (automatic / off <= 0.934)
+// and than the previous kernels (<= 0.442). 12 rows = the longest compiled walk, so the cap never binds; 1 row: one row
+// per block.
+inline constexpr Band sm120_mp188_g6_kv4_d256[] = {
+    {~0U,
+     {{1U, 1U},
+      {1U, 1U}, {12U, 1U}, {12U, 1U},
+      {12U, 1U}, {12U, 1U}, {12U, 1U}, {12U, 1U},
+      {12U, 1U}, {12U, 1U}, {12U, 1U}, {12U, 1U},
+      {12U, 1U}, {12U, 1U}, {12U, 1U}, {12U, 1U}, {12U, 1U}}},
+};
+
 // Device key: a table holds for the device and head shape it was measured on, nothing else. arch = the backend's
-// architecture name without feature suffix (HIP gcnArchName up to ':'), multiprocessors = the runtime's multiprocessor
-// count as reported (HIP multiProcessorCount: work-group processors on RDNA, 20 for a 40-CU gfx1151; CUDA SM count).
+// architecture name without feature suffix (HIP gcnArchName up to ':'; CUDA "sm_" + major * 10 + minor),
+// multiprocessors = the runtime's multiprocessor count as reported (HIP multiProcessorCount: work-group processors on
+// RDNA, 20 for a 40-CU gfx1151; CUDA SM count).
 struct DeviceTable {
     std::string_view arch;
     unsigned multiprocessors = 0U, group = 0U, kv_heads = 0U, head_dim = 0U;
@@ -110,6 +128,8 @@ struct DeviceTable {
 inline constexpr DeviceTable dense_decode_tables[] = {
     {"gfx1151", 20U, 6U, 4U, 256U, gfx1151_mp20_g6_kv4_d256,
      unsigned(sizeof(gfx1151_mp20_g6_kv4_d256) / sizeof(Band))},
+    {"sm_120", 188U, 6U, 4U, 256U, sm120_mp188_g6_kv4_d256,
+     unsigned(sizeof(sm120_mp188_g6_kv4_d256) / sizeof(Band))},
 };
 // The measured table of (device, shape), or nullptr: an unknown device or shape keeps the main schedule.
 constexpr const DeviceTable* find_table(std::string_view arch, unsigned multiprocessors, unsigned group,

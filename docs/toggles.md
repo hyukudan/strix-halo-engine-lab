@@ -373,6 +373,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 |---|---|---|---|
 | `STRIX_BATCH_TOOL_DRAFT` | qwen | ON (batched decoding) | [qwen-tool-draft](optimizations.md#qwen-tool-draft) |
 | `STRIX_DECODE_ATTN_ROW_SHARE` | qwen (27B HIP) | 1 | [qwen27-hip-decode-attn-row-share](optimizations.md#qwen27-hip-decode-attn-row-share) |
+| `STRIX_DECODE_ATTN_ROW_SHARE` | qwen (27B CUDA) | 1 | [qwen27-cuda-decode-attn-row-share](optimizations.md#qwen27-cuda-decode-attn-row-share) |
 | `STRIX_DECODE_FUSE` | qwen (27B HIP) | 1 | [qwen27-hip-decode-step](optimizations.md#qwen27-hip-decode-step) |
 | `STRIX_DS41_DECODE_PREFETCH` | deepseek | auto | [ds-prefetch](optimizations.md#ds-prefetch) |
 | `STRIX_DS41_DEFER_DECODER` | deepseek | on | [ds-defer-decoder](optimizations.md#ds-defer-decoder) |
