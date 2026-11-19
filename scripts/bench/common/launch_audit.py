@@ -18,6 +18,20 @@ import sqlite3
 import statistics
 
 
+def kernel_name(n):
+    """Drop the trailing parameter list (balanced parentheses from the end) and a leading 'void ': a demangled HIP/CUDA
+    name keeps '(anonymous namespace)' and template arguments, so distinct kernels stay distinct rows."""
+    n = n.strip()
+    if n.endswith(")"):
+        depth = 0
+        for i in range(len(n) - 1, -1, -1):
+            depth += {")": 1, "(": -1}.get(n[i], 0)
+            if depth == 0:
+                n = n[:i].rstrip()
+                break
+    return n[5:] if n.startswith("void ") else n
+
+
 def nsys_rows(path):
     c = sqlite3.connect(path)
     names = dict(c.execute("select id, value from StringIds"))
@@ -37,7 +51,7 @@ def rocprof_rows(path):
         regs = int(r.get("Arch_VGPR_Count", 0) or r.get("VGPR_Count", 0) or 0)
         smem = int(r.get("LDS_Block_Size", 0) or r.get("LDS_Size", 0) or 0)
         yield (int(r["Start_Timestamp"]), int(r["End_Timestamp"]), r.get("Queue_Id", r.get("Stream_Id", 0)), blocks, wg, regs,
-               smem, r["Kernel_Name"].split("(")[0])
+               smem, r["Kernel_Name"])
 
 
 def main():
@@ -52,7 +66,7 @@ def main():
     agg, last_end = {}, {}
     steps = 0
     for s, e, stream, grid, block, regs, smem, name in rows:
-        name = name[:72]
+        name = kernel_name(name)
         gap = s - last_end.get(stream, s)
         last_end[stream] = e
         k = agg.setdefault(name, {"n": 0, "t": 0, "grid": set(), "block": block, "regs": regs, "smem": smem, "gaps": []})
@@ -74,7 +88,7 @@ def main():
             continue
         gap = statistics.median(k["gaps"]) / 1e3 if k["gaps"] else float("nan")
         tail = f" | {k['t'] / 1e6 / steps:.3f}" if steps else ""
-        print(f"{name} | {k['n']} | {k['t'] / 1e6:.2f} | {k['t'] / k['n'] / 1e3:.1f} | {gmin}..{gmax} | {k['block']} | "
+        print(f"{name[:96]} | {k['n']} | {k['t'] / 1e6:.2f} | {k['t'] / k['n'] / 1e3:.1f} | {gmin}..{gmax} | {k['block']} | "
               f"{k['regs']} | {k['smem']} | {gap:.2f} | {flag}{tail}")
         shown += 1
         if shown >= a.top:
