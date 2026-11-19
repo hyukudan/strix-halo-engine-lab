@@ -27,7 +27,7 @@ namespace strix::graph {
 enum class Fusion : std::uint8_t { today, fused };
 
 struct EpilogueCap {
-    std::string_view entry, form;  // the producer entry takes this elementwise form in its store today
+    std::string_view entry = {}, form = {};  // the producer entry takes this elementwise form in its store today
 };
 struct FusionPolicy {
     Fusion mode = Fusion::today;
@@ -39,18 +39,18 @@ struct FusionPolicy {
 };
 
 struct Launch {
-    std::string_view entry;               // entry of the head stage
-    std::vector<std::uint32_t> stages;    // instance indices computed by the launch body (head first, group members)
-    std::vector<std::uint32_t> prologue;  // instance indices recomputed / applied on the launch input
-    std::vector<std::uint32_t> epilogue;  // instance indices applied in the launch store
+    std::string_view entry = {};               // entry of the head stage
+    std::vector<std::uint32_t> stages = {};    // instance indices computed by the launch body (head first, group members)
+    std::vector<std::uint32_t> prologue = {};  // instance indices recomputed / applied on the launch input
+    std::vector<std::uint32_t> epilogue = {};  // instance indices applied in the launch store
     std::uint32_t kernels = 1;            // today: kernels the entry call issues (fused: 1)
     std::int32_t layer = -1;
     std::uint32_t rows = 1;
 };
 
 struct LaunchPlan {
-    std::vector<Instance> instances;
-    std::vector<Launch> launches;
+    std::vector<Instance> instances = {};
+    std::vector<Launch> launches = {};
     // Kernel launches (sum of kernels), in total and for one layer (-1: before / after the trunk).
     [[nodiscard]] std::uint32_t kernel_count() const;
     [[nodiscard]] std::uint32_t kernel_count(std::int32_t layer) const;

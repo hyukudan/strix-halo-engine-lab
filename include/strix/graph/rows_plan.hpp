@@ -27,8 +27,8 @@ struct RowsStage {
 struct RowsPlan {
     RowsForm form = RowsForm::step;
     std::uint32_t rows = 1;
-    std::vector<Instance> instances;
-    std::vector<RowsStage> stages;
+    std::vector<Instance> instances = {};
+    std::vector<RowsStage> stages = {};
     double bytes = 0;
     std::uint64_t macs = 0;
 };

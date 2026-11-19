@@ -49,7 +49,7 @@ inline constexpr Traits attn_dense = 1U << 0, attn_gdn = 1U << 1, attn_window = 
 [[nodiscard]] std::uint64_t row_bytes(Format f, std::uint64_t width);
 
 struct Operand {
-    std::string_view tensor;           // tensor-map symbol (suffix after the layer prefix); empty = no weight read
+    std::string_view tensor = {};           // tensor-map symbol (suffix after the layer prefix); empty = no weight read
     std::uint64_t rows = 0, cols = 0;  // per item: output rows x input width (attend: heads x (qk + v) dims)
     std::uint64_t items = 1, read = 1;  // stacked items and items read per token row (experts 512 / 16; attend: keys)
 };
@@ -63,35 +63,35 @@ struct Operand {
 }
 
 struct StageDecl {
-    std::string_view id;     // unique in its table
+    std::string_view id = {};     // unique in its table
     Op op = Op::elementwise;
-    std::string_view form;   // op form (elementwise / combine / store kind), data for the fusion rules
-    std::string_view entry;  // shared entry this stage binds today (check mode)
-    std::string_view site;   // sublayer scope ("attn", "ffn", "seam", "edge", ...)
+    std::string_view form = {};   // op form (elementwise / combine / store kind), data for the fusion rules
+    std::string_view entry = {};  // shared entry this stage binds today (check mode)
+    std::string_view site = {};   // sublayer scope ("attn", "ffn", "seam", "edge", ...)
     std::string_view in[4] = {};
-    std::string_view out;
+    std::string_view out = {};
     Operand operand{};
-    std::string_view numeric;  // numeric contract name (contract types: package W1-2)
+    std::string_view numeric = {};  // numeric contract name (contract types: package W1-2)
     Rows rows = Rows::per_row;
     Split split = Split::none;
     std::uint8_t leaves = 0;     // 0 or 4 (canonical partial tree)
     bool reduce = false;         // needs the whole input vector (norm, weighted merge, top-k): no producer epilogue
     std::uint8_t kernels = 1;    // kernels this stage adds to today's entry call (0 = shares the previous stage's kernel)
-    std::string_view call;       // stages of one table with the same non-empty call run as ONE entry call today
+    std::string_view call = {};       // stages of one table with the same non-empty call run as ONE entry call today
     Traits when_all = 0, when_none = 0;  // layer guard (trait words)
     Pos pos = Pos::any;
 };
 
 struct FormatRule {
-    std::string_view tensor;  // empty = any tensor (default rule)
+    std::string_view tensor = {};  // empty = any tensor (default rule)
     Format format = Format::none;
     std::span<const std::uint32_t> layers = {};  // empty = every layer
 };
 
 struct StageGraph {
-    std::span<const StageDecl> before, layer, after;
-    std::vector<Traits> layers;              // one trait word per trunk layer
-    std::span<const FormatRule> formats;     // later rules win
+    std::span<const StageDecl> before = {}, layer = {}, after = {};
+    std::vector<Traits> layers = {};              // one trait word per trunk layer
+    std::span<const FormatRule> formats = {};     // later rules win
     std::uint32_t select_after = 0, group = 0;  // sparse attention position regimes (0 = none)
 };
 
@@ -112,7 +112,7 @@ struct Instance {
 // Layer trait words from flag lists (data in, words out): listed layers (or, with except, the others) get the trait.
 struct TraitList {
     Traits trait = 0;
-    std::span<const std::uint32_t> layers;
+    std::span<const std::uint32_t> layers = {};
     bool except = false;  // true: every layer NOT listed gets the trait
 };
 [[nodiscard]] std::vector<Traits> layer_traits(std::uint32_t layers, std::span<const TraitList> lists);
