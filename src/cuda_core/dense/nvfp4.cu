@@ -295,10 +295,6 @@ __global__ void fp4_reduce(const Jobs jobs, std::uint32_t rows) {
     J.y(waited)[idx] = v;
 }
 
-using WorkspaceKey = std::pair<int, cudaStream_t>;
-std::mutex workspace_mutex;
-std::map<WorkspaceKey, std::unique_ptr<Nvfp4Workspace>> workspaces;
-
 // ------------------------------------------------------------------------------------------------- weight read-ahead
 // Rule and geometry: strix/decode_weight_sweep.hpp (read-ahead). The GEMV's block (bx, k, z) reads, for its 4 MT tiles
 // m = bx * 4 MT + t, records [k nch / ks, (k + 1) nch / ks) (fp4_gemv above): that is readahead_piece with
@@ -343,7 +339,7 @@ struct ReadaheadSite {
     cudaGraphNode_t gemv = nullptr;
 };
 std::mutex readahead_mutex;
-std::map<WorkspaceKey, ReadaheadSite> readahead_sites;
+std::map<std::pair<int, cudaStream_t>, ReadaheadSite> readahead_sites;
 
 cudaError_t capture_info(cudaStream_t s, cudaStreamCaptureStatus* st, unsigned long long* id, cudaGraph_t* graph,
                          const cudaGraphNode_t** deps, std::size_t* ndeps) {
@@ -429,6 +425,10 @@ cudaError_t readahead_after(cudaStream_t s) {
     readahead_sites[{device, s}] = ReadaheadSite{id, ndeps == 1 ? deps[0] : nullptr};
     return cudaSuccess;
 }
+
+using WorkspaceKey = std::pair<int, cudaStream_t>;
+std::mutex workspace_mutex;
+std::map<WorkspaceKey, std::unique_ptr<Nvfp4Workspace>> workspaces;
 
 template <int RB, int MT>
 cudaError_t launch_gemv(Jobs& jobs, const float* x, std::uint32_t in, std::uint32_t rows, cudaStream_t s) {
