@@ -126,8 +126,8 @@ int main(int argc, char** argv) {
         std::unique_ptr<sp::DraftRows> draft_rows;
         std::uint32_t idle_ms = 0;  // host sleep (GPU idle) before every spec run: thermal gaps inside one ticket
         bool cost_table = false, check = true, graphs = true, seed_costs = true, turbo_lm_head = true, pdl = false;
-        // --prefill-route large (off until measured); --mtp-catchup kv = default (device gate passed: identical ids / steps /
-        // E / k histogram to full at 28,187 tokens, MTP feed 1.960 -> 0.091 s), full = the off switch.
+        // --prefill-route large: opt-in. --mtp-catchup kv = default (K/V-only MTP catch-up where the engine has the hook;
+        // its device gate compares ids / steps / k histogram with full), full = the off switch.
         bool pf_large = false, kv_catchup = true;
         std::uint32_t pf_chunk = 0;                 // --prefill-chunk N (large route; 0 = EngineOptions default)
         q::TurboWeights turbo = q::TurboWeights::off;
@@ -227,7 +227,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error("usage: (--model F.gguf | --synthetic-full bf16|q8_0 [--layers N]) [--prompt-ids a,b | --prompt-file F | --prompt-len N] "
                                      "[--n-gen N] [--sources copy,chain,hybrid|none] [--oracle ACC] [--cost-table] [--check 0|1] [--max-block 1..32] "
                                      "[--frontier N | --arms 0,8,new,sub,new15,sub15 --pairs P] [--draft-core G] [--draft-fallback G] [--draft-pack F1,F2] [--idle-ms MS] [--ids-out DIR] "
-                                     "[--prefill-route windows|large [--prefill-arith A] [--prefill-gdn G] [--prefill-attn8 on|off]] [--mtp-catchup full|kv]  (--prompt-file accepts F1,F2,...: one engine load)");
+                                     "[--prefill-route windows|large [--prefill-chunk N] [--prefill-arith A] [--prefill-gdn G] [--prefill-attn8 on|off]] [--mtp-catchup full|kv]  (--prompt-file accepts F1,F2,...: one engine load)");
         // (label, ids) per prompt; --prompt-file takes a comma list (label = file stem), each prompt runs serial + spec arms.
         std::vector<std::pair<std::string, std::vector<std::uint32_t>>> prompts;
         if (!ids_arg.empty()) prompts.emplace_back(label, parse_ids(ids_arg));

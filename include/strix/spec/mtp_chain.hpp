@@ -124,8 +124,8 @@ public:
     [[nodiscard]] bool device_feed() const { return MtpFeedEngine<Engine> && feed_; }
     [[nodiscard]] std::uint64_t host_reads() const { return reads_; }  // synchronizing id reads issued by the chain
     // K/V-only catch-up (engines with MtpKvEngine): off = the incumbent calls (rollback); on = catch-up chunks whose outputs
-    // nobody reads only write the MTP K/V (same K/V bits, so the same drafts). On by default where the engine has the hook
-    // (device gate: CUDA dense 27B, 28,187-token prompt, ids / steps / E / k histogram equal to the full catch-up).
+    // nobody reads only write the MTP K/V (same K/V bits, so the same drafts). On by default where the engine has the hook;
+    // its device gate compares ids, steps and the k histogram with the full catch-up.
     void set_kv_catchup(bool on) { kv_catchup_ = on; }
     [[nodiscard]] bool kv_catchup() const { return MtpKvEngine<Engine> && kv_catchup_; }
     [[nodiscard]] std::uint64_t kv_calls() const { return kv_calls_; }  // K/V-only catch-up calls (not in calls())

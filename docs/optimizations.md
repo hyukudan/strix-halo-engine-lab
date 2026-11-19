@@ -2302,6 +2302,24 @@ change acceptance, not committed target-greedy tokens. Compare within one load w
   28K x 400 tokens, one run per arm, token ids equal: code 121.54 -> 176.56 tok/s (verify 28.84 -> 19.30 ms per step),
   reasoning 130.54 -> 194.64, prose 101.29 -> 135.84.
 
+<a id="qwen27-cuda-mtp-kv-catchup"></a>
+
+### Qwen 27B CUDA spec: K/V-only MTP catch-up
+
+**Engine:** `qwen-rtx` (27B dense, CUDA: `strix-cuda-qwen35-spec`). **Control:** `--mtp-catchup kv|full`. **Default:**
+`kv` where the engine has the hook. **Home:** shared (host spec layer `include/strix/spec/mtp_chain.hpp`: the
+`MtpKvEngine` concept and the catch-up policy); the CUDA Qwen adapter supplies `mtp_kv` (`src/qwen35/cuda/engine.cu`).
+
+- The MTP chain catches up on committed positions lazily. A catch-up chunk whose block output and draft are never read
+  needs only the MTP layer's K/V; with the hook it issues the same K and V projections, in the same order and with the
+  same operands, and skips q, attention, o_proj, MLP, the MTP norm and the head. K/V bits and drafts are unchanged.
+- Engines without `mtp_kv` are unchanged (concept + `if constexpr`). HIP runs the same shared chain and adopts the
+  form by adding `mtp_kv` to its adapter.
+- Measured (EXACT, RTX PRO 6000 Blackwell, 28,187-token prompt, `--prefill-route large`, one pair): ids, steps and the
+  k histogram equal to `full`; MTP feed 1.960 s -> 0.091 s; decode unchanged (121.78 vs 121.39 tok/s).
+  Not yet measured: the default `windows` prompt route.
+- **Off switch:** `--mtp-catchup full`.
+
 <a id="rtx-kernels"></a>
 
 ### Decode kernel bundle
