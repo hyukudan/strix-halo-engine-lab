@@ -38,7 +38,7 @@ struct Geometry {
     [[nodiscard]] static Geometry tiny();      // test geometry with the same structure
 };
 
-// Numerics points the files on disk do not settle (wave4 hy4_w3c-STATE s3). The default is the measured choice; the
+// Numerics points the files on disk do not settle (settled by measured acceptance on this reference). The default is the measured choice; the
 // other values exist for the acceptance measurement only (strix-hy4-dfly accept --variant). Measured on the official
 // drafter + oracle taps (golden copy loop 29 anchors, prose 60): default E 2.43 (4.03 / 1.65); bidirectional 1.84,
 // h pre-norm 2.20, fusion eh 1.10, sigmoid mix 1.21 (bidir), every Correction placement lower (1.07 .. 2.37).
