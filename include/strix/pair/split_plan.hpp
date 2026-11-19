@@ -19,8 +19,9 @@
 // Costs are measured, never assumed: per-rank read rate (bytes/ms), a per-stage efficiency (the fraction of that rate the
 // stage's kernels reach), launch-bound fixed ms, and the exchange cost latency + bytes / rate (tp::TripCost). A segment
 // between two joins ends with a barrier: its time is the slowest rank's, then the exchange.
-// Home: shared (host shared). Bound by: qwen35 dense HIP exact TP decode (apps/hip_qwen35_decode_main.hip), hy4 placement
-// (include/strix/hy4/placement.hpp). Prefill windows (pair_pf) and verify rows (speculation) use the same stages.
+// Home: shared (host shared). Bound by: qwen35 dense HIP exact TP decode (apps/hip_qwen35_decode_main.hip; rates from the
+// topology declaration, trip cost measured at start-up: strix/pair/tp_inputs.hpp). Prefill windows and verify rows
+// (speculation) use the same stages.
 
 #include <algorithm>
 #include <cmath>

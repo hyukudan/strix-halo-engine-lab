@@ -5521,10 +5521,30 @@ Each rank loads the model and prefills alone (replicated, same bits), then decod
 (`core::dense_iu4::run_cols`, `include/strix/pair/column_split.hpp`, `tp_layout.hpp`) with exact joins: all-gathers and a
 split argmax. FP16 gathers feed the IU4 activation rows, whose first operation is the same FP16 conversion, and the
 MTP drafter is split by the trunk's shares. The verify-window costs are the compiled table on every rank, so both ranks
-choose the same windows; learned costs are refused.
+choose the same windows (labelled `table (forced: ranks must agree)`); an explicit `--spec-costs calibrated|learned`
+with `--tp-rank` is refused. Per-rank read rates come from the topology declaration (`memory_gbytes_ps` of both nodes,
+`--topology FILE --node ID` or `STRIX_TOPOLOGY`) or `--tp-rates`; there is no compiled default. The trip cost is
+measured at start-up over the gather form the decode runs (`include/strix/dist/link_cost.hpp` measure + agree, both
+ranks hold the same bits; `include/strix/pair/tp_inputs.hpp`); `--tp-trip-us` overrides only its latency. The gather
+binding is shared (`include/strix/pair/gather_link.hpp`, HIP side `src/xport/tp_gather_hip.hpp`), as are the join and
+split-argmax kernels (`src/core/tp_join.hpp`). The run's `tp link:` line splits the pass into `sync` (host blocked in
+the stream wait before a staged exchange), `link` (host time in the exchange) and `rest`.
 - **Off switch:** omit `--tp-rank`; `STRIX_TP_F16_GATHER=0` / `STRIX_TP_SPLIT_DRAFT=0` for the levers.
 - **Exactness evidence:** generated ids equal the one-node plain reference over 1,200 tokens (code prompt) with the
   levers on and off, and over 200 plain tokens. The one-node dense IU4 kernels compile to the same ISA as before; only
   the column-share kernel is new.
 - **Measured gain:** two Strix Halo nodes over USB4, EXACT, code prompt, 1,200 tokens with MTP speculation: one node
   46.76 / 46.68 tok/s, tensor parallel 58.50 tok/s in the same ticket (+25 %).
+
+### Qwen 27B pair prefill: decode relay to one node
+
+**Engine:** `qwen35` (HIP, pair layer split app `strix-hip-qwen35-pair`). **Control:** `STRIX_PAIR_DECODE_RELAY`.
+**Default:** off (layer-owned decode). With `=1` and every node's memory declared, the shared chain planner may choose
+a decoder that holds the whole model; after the layered prefill each stage's layer state moves to it once and it
+decodes alone (a layer split only serialises one-row decode).
+- **Off switch:** `STRIX_PAIR_DECODE_RELAY=0` or unset.
+- **Exactness evidence:** none on this tree yet. The default stays off until a pair run on this tree records the
+  placement line, the relayed state size and time, decode tok/s and ids equal to the one-node reference, for both
+  settings.
+- **Measured gain:** not measured on this tree (an earlier tree measured relay decode at one-node speed and above the
+  layer-owned decode; not claimed here).

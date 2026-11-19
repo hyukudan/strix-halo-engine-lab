@@ -3229,7 +3229,7 @@ int main() { return 0; }"
         target_include_directories(strix_qwen35_hip_engine PRIVATE src)  # attn_core headers include "attn_core/..."
         add_executable(strix-hip-qwen35-decode apps/hip_qwen35_decode_main.hip)
         set_target_properties(strix-hip-qwen35-decode PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-        target_link_libraries(strix-hip-qwen35-decode PRIVATE strix_qwen35_hip_engine strix_spec strix_dist)  # strix_dist: --tp-rank
+        target_link_libraries(strix-hip-qwen35-decode PRIVATE strix_qwen35_hip_engine strix_spec strix_dist strix_device)  # --tp-rank: pair link, topology rates
         # N-rank layer split over the topology declaration + shared planner + shared layer pipeline (one rank = the
         # decode app's path); --self-cut runs the one-process cut test of the engine's range hooks.
         add_executable(strix-hip-qwen35-pair apps/hip_qwen35_pair_main.hip)
@@ -6332,6 +6332,12 @@ if(BUILD_TESTING)
     target_compile_features(strix-pair-tp-layout-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-pair-tp-layout-tests)
     add_test(NAME strix-pair-tp-layout-tests COMMAND strix-pair-tp-layout-tests)
+    # Shared TP gather link (routes, slot swap, host waits, tag sequence) + placement inputs (rates, measured trip cost).
+    add_executable(strix-pair-tp-gather-tests tests/pair_tp_gather_tests.cpp)
+    target_include_directories(strix-pair-tp-gather-tests PRIVATE include)
+    target_compile_features(strix-pair-tp-gather-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-pair-tp-gather-tests)
+    add_test(NAME strix-pair-tp-gather-tests COMMAND strix-pair-tp-gather-tests)
     # Interleaved virtual stages of the layer pipeline (StageMap on two ranks): prefill + decode bitwise == one rank.
     add_executable(strix-pair-layer-stages-tests tests/pair_layer_stages_tests.cpp)
     target_include_directories(strix-pair-layer-stages-tests PRIVATE include)
