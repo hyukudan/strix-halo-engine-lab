@@ -25,7 +25,7 @@ Solo necesitas esta página para inspeccionar una ruta, depurar o llevar el moto
 | Perfil | Qué hace |
 |---|---|
 | `--profile exact` (alias `default`) | Ruta de producción actual; no exporta cambios de perfil. Es el valor por defecto. |
-| `--profile fast` | Añade todas las opciones cualificadas que cambian bits y las filas elegidas para fast antes de su recibo (marcadas "qualification in progress" en el recibo). Las demás siguen apagadas (ver `--allow-pending`). Par DeepSeek: el paquete `ds41-fast-pf-v1` (expandido igual que `STRIX_DS41_FAST_PREFILL=1`) más `STRIX_DS41_FAST_ENGRAM`, `STRIX_DS41_FAST_SHARED` y `STRIX_DS41_FAST_MOE_F16`; MiniMax: el paquete `mm-fast-pf-v2` (como `STRIX_MM_FAST_PREFILL=1`). Un interruptor puesto, `0` incluido, manda. |
+| `--profile fast` | Añade todas las opciones cualificadas que cambian bits y las filas elegidas para fast antes de su recibo (marcadas "qualification in progress" en el recibo). Las demás siguen apagadas (ver `--allow-pending`). MiniMax: el paquete cualificado `mm-fast-pf-v2` (los mismos miembros e identidad de prefill que `STRIX_MM_FAST_PREFILL=1`; rechazado con `--baseline`). Par GLM: nada (`STRIX_GLM_PF_WMMA` no está cualificado para fast: su conjunto FAST de prefill falla la puerta de calidad a 8K; solo corre si se pone explícitamente). Par DeepSeek: el paquete FAST y sus palancas Engram / experto compartido / MoE FP16 siguen explícitos hasta su puerta de calidad. Un interruptor puesto, `0` incluido, manda. |
 | `--profile quality` | Un pack de mayor precisión donde existe (Nemotron EXL3). Si no, igual que `default`. |
 
 Existen perfiles con nombre para Qwen, el par DeepSeek, Gemma4/Nemotron y `strix-glm5-rank`.
