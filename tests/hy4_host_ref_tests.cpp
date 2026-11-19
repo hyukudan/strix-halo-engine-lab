@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -174,17 +175,54 @@ void router() {
           "weights must use the unbiased scores");
 }
 
+std::vector<std::uint64_t> rows_of(const EngramRows& h, const std::vector<std::uint32_t>& tokens, std::uint32_t ordinal) {
+    std::vector<std::uint64_t> rows(h.columns());
+    h.at(tokens, static_cast<std::uint32_t>(tokens.size() - 1U), ordinal, rows);
+    return rows;
+}
+
 void engram_hash() {
-    const auto c = Config::tiny();
+    auto c = Config::tiny();
     const std::uint32_t pad = c.pad_token;
-    const auto rows = engram_rows(c, 0, {5, pad, pad});
-    check(rows.size() == c.engram_heads(), "rows per token");
-    for (std::size_t h = 0; h < rows.size(); ++h)
-        check(rows[h] >= c.head_offsets[h] && rows[h] < c.head_offsets[h] + c.head_sizes[h], "row outside head " + std::to_string(h));
+    const EngramRows h(c);
+    // window (t, t-1, t-2) = (5, pad, pad): the sequence start reads the pad id
+    const auto rows = rows_of(h, {5}, 0);
+    check(rows.size() == c.engram_heads() && rows == rows_of(h, {pad, pad, 5}, 0), "rows per token / start padding");
+    for (std::size_t k = 0; k < rows.size(); ++k)
+        check(rows[k] >= c.head_offsets[k] && rows[k] < c.head_offsets[k] + c.head_sizes[k], "row outside head " + std::to_string(k));
     // head 0 (order 2) by hand: (map[5] * m0) xor (map[pad] * m1) mod 13
     const std::int64_t p0 = std::int64_t{c.token_map[5]} * c.engram_mult[0], p1 = std::int64_t{c.token_map[pad]} * c.engram_mult[1];
     check(rows[0] == static_cast<std::uint64_t>((p0 ^ p1) % 13), "head 0 hash");
-    check(engram_rows(c, 0, {5, 6, pad}) != rows, "the previous token must change the rows");
+    check(rows_of(h, {6, 5}, 0) != rows, "the previous token must change the rows");
+    // second Engram layer: flat-table rows (head_offsets of layer 1), order-3 head by hand
+    const auto r1 = rows_of(h, {7, 6, 5}, 1);
+    const std::int64_t q0 = std::int64_t{c.token_map[5]} * c.engram_mult[3], q1 = std::int64_t{c.token_map[6]} * c.engram_mult[4],
+                       q2 = std::int64_t{c.token_map[7]} * c.engram_mult[5];
+    check(r1[2] == c.head_offsets[6] + static_cast<std::uint64_t>((q0 ^ q1 ^ q2) % 37), "layer 1 order-3 head by hand");
+    // b5_checks F2: ids at or past the reference table size read the pad's compressed id at every n-gram slot
+    // (the pack: 120,818..120,831 of the 120,832 map); ids below it are unchanged.
+    c.engram_table_size = 290;
+    const EngramRows cut(c);
+    for (std::uint32_t id = 290; id < c.vocab; ++id)
+        for (std::uint32_t e = 0; e < 2U; ++e) {
+            check(rows_of(cut, {id, 6, 5}, e) == rows_of(cut, {pad, 6, 5}, e), "unmapped id at slot t-2");
+            check(rows_of(cut, {7, id, 5}, e) == rows_of(cut, {7, pad, 5}, e), "unmapped id at slot t-1");
+            check(rows_of(cut, {7, 6, id}, e) == rows_of(cut, {7, 6, pad}, e), "unmapped id at slot t");
+            check(rows_of(h, {7, 6, id}, e) != rows_of(h, {7, 6, pad}, e) || c.token_map[id] == c.token_map[pad],
+                  "the full table keeps id " + std::to_string(id));
+        }
+    for (std::uint32_t id = 0; id < 290; ++id)
+        check(rows_of(cut, {id, 6, 5}, 1) == rows_of(h, {id, 6, 5}, 1), "ids below the table size unchanged");
+}
+
+// b5_checks F1: the Engram RMSNorm eps is torch nn.RMSNorm(eps=None) = FLT_EPSILON (2^-23), not finfo(bf16).eps.
+void engram_norm_eps() {
+    const Config c;
+    check(c.engram_norm_eps == std::numeric_limits<float>::epsilon(), "engram_norm_eps == 2^-23");
+    // a constant 1e-3 row of 96: x / sqrt(mean(x^2) + eps) = 0.94525 with 2^-23 (2^-7 gave 0.0113)
+    const float x = 1e-3F;
+    const float y = x / std::sqrt(x * x + c.engram_norm_eps);
+    check(std::fabs(y - 0.94525F) < 1e-4F, "rms of a constant 1e-3 row");
 }
 
 void pack_config(const std::string& path) {
@@ -276,6 +314,7 @@ int main(int argc, char** argv) {
         indexed_fallback();
         router();
         engram_hash();
+        engram_norm_eps();
         next_token_block();
         if (argc > 1) pack_config(argv[1]);
     } catch (const std::exception& error) {

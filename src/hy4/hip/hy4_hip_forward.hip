@@ -53,6 +53,7 @@
 #include <cstring>
 #include <map>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -205,6 +206,7 @@ struct Forward::Impl {
     Config c;
     std::uint32_t first = 0, last = 0, context = 0, pos = 0;
     std::vector<std::uint32_t> tokens;
+    std::optional<strix::hy4::EngramRows> engram_hash;  // the shared Engram hash (absent without Engram layers)
     hipStream_t s = nullptr;
     LoadReport report;
     StepTimes times;
@@ -620,9 +622,8 @@ struct Forward::Impl {
     void engram(std::uint32_t l, std::uint32_t ordinal, float* x) {
         const auto q = pos;
         if (tokens[q] == c.pad_token) return;  // masked position: the Engram output is zero
-        std::vector<std::uint32_t> window(c.ngram);
-        for (std::uint32_t k = 0; k < c.ngram; ++k) window[k] = q >= k ? tokens[q - k] : c.pad_token;
-        const auto rows = strix::hy4::engram_rows(c, ordinal, window);
+        std::vector<std::uint64_t> rows(c.engram_heads());
+        engram_hash->at(tokens, q, ordinal, rows);
         std::vector<strix::engram::RowRequest> req;
         for (const auto r : rows) req.push_back({0U, r});
         // pinned slot of this Engram ordinal: the copy never waits for the stream, so the host read overlaps the GPU's work
@@ -943,12 +944,16 @@ struct Forward::Impl {
         const std::uint32_t heads = c.engram_heads();
         std::vector<strix::engram::RowRequest> req;
         req.reserve(std::size_t{R} * heads);
-        std::vector<std::uint32_t> window(c.ngram);
+        if (engram_hash->columns() != heads) throw std::runtime_error("hy4 hip forward: Engram rows per position");
+        std::vector<std::uint64_t> rows(heads);
+        // The shared hash reads only the n-gram ending at q: hand it that tail of the sequence (tokens q - n + 1 .. q in
+        // order, shorter at the sequence start) so a window whose ids are not all in `tokens` yet hashes the same rows.
+        std::vector<std::uint32_t> tail(c.ngram);
         for (std::uint32_t r = 0; r < R; ++r) {
             const auto q = p0 + r;
-            for (std::uint32_t k = 0; k < c.ngram; ++k) window[k] = q >= k ? tok(q - k) : c.pad_token;
-            const auto rows = strix::hy4::engram_rows(c, ordinal, window);
-            if (rows.size() != heads) throw std::runtime_error("hy4 hip forward: Engram rows per position");
+            const std::uint32_t n = std::min<std::uint32_t>(q, c.ngram - 1U) + 1U;
+            for (std::uint32_t k = 0; k < n; ++k) tail[k] = tok(q + 1U - n + k);
+            engram_hash->at(std::span<const std::uint32_t>(tail.data(), n), n - 1U, ordinal, rows);
             for (const auto x : rows) req.push_back({0U, x});
         }
         return req;
@@ -1677,6 +1682,7 @@ Forward::Forward(const ForwardOptions& o) : impl_(std::make_unique<Impl>()) {
     if (o.parts.empty()) throw std::invalid_argument("hy4 hip forward: no pack parts");
     const auto full = Config::from_gguf(o.parts.front());
     impl_->c = o.depth == 0U ? full : full.truncated(o.depth);
+    if (!impl_->c.engram_layers.empty()) impl_->engram_hash.emplace(impl_->c);
     impl_->first = o.first;
     impl_->last = o.last == 0U ? impl_->c.layers : o.last;
     impl_->context = o.context;

@@ -16,6 +16,7 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <optional>
 #include <random>
 #include <set>
 #include <stdexcept>
@@ -127,12 +128,6 @@ void hc_update(Vec& streams, const HcMix& mix, const Vec& f) {
     Vec out(streams.size());
     hc::expand(hc_spec(f.size(), true, 0.0F, 0.0F), f, streams, mix, out);
     streams = std::move(out);
-}
-
-std::uint64_t positive_mod(std::int64_t value, std::uint64_t modulus) {
-    const auto m = static_cast<std::int64_t>(modulus);
-    const auto r = value % m;
-    return static_cast<std::uint64_t>(r < 0 ? r + m : r);
 }
 
 }  // namespace
@@ -455,28 +450,29 @@ void set_ref_threads(unsigned threads, std::size_t min_work) noexcept {
     g_min_work = min_work;
 }
 
-std::vector<std::uint64_t> engram_rows(const Config& c, std::uint32_t ordinal, const std::vector<std::uint32_t>& window) {
-    if (window.size() != c.ngram) throw std::invalid_argument("hy4 engram: window size");
-    std::vector<std::int64_t> p(c.ngram);
-    for (std::size_t s = 0; s < c.ngram; ++s) {
-        const auto id = window[s];
-        const auto mapped = c.token_map.at(id < c.token_map.size() ? id : c.pad_token);
-        // int64 product with wrap-around (two's complement), as the reference's int64 tensor arithmetic
-        p[s] = static_cast<std::int64_t>(static_cast<std::uint64_t>(static_cast<std::int64_t>(mapped)) *
-                                         static_cast<std::uint64_t>(c.engram_mult[ordinal * c.ngram + s]));
-    }
-    std::vector<std::uint64_t> rows;
-    std::int64_t running = p[0];
-    const auto eh = c.engram_heads();
-    for (std::uint32_t order = 2; order <= c.ngram; ++order) {
-        running ^= p[order - 1U];
-        for (std::uint32_t h = 0; h < c.heads_per_ngram; ++h) {
-            const auto head = (order - 2U) * c.heads_per_ngram + h;
-            const auto index = ordinal * eh + head;
-            rows.push_back(c.head_offsets[index] + positive_mod(running, c.head_sizes[index]));
-        }
-    }
-    return rows;
+engram::Spec engram_spec(const Config& c) {
+    EngramPackMeta m;
+    m.layers = c.engram_layers;
+    m.ngram_size = c.ngram;
+    m.heads_per_ngram = c.heads_per_ngram;
+    m.row_elements = c.engram_dim;
+    m.layer_multipliers = c.engram_mult;
+    m.head_vocab_sizes = c.head_sizes;
+    m.head_offsets = c.head_offsets;  // checked: the running sum of the moduli in layer order
+    m.pad_token_id = c.pad_token;
+    m.token_map = c.token_map;
+    m.lookup_table_size = c.engram_table_size;
+    return hy4::engram_spec(m);
+}
+
+EngramRows::EngramRows(const Config& c) : hasher_(engram_spec(c)) {
+    for (std::uint32_t e = 0; e < hasher_.layers(); ++e) base_.push_back(engram::layer_row_base(hasher_.spec(), e));
+}
+
+void EngramRows::at(std::span<const std::uint32_t> tokens, std::uint32_t q, std::uint32_t ordinal,
+                    std::span<std::uint64_t> rows) const {
+    hasher_.rows_at(tokens, q, ordinal, rows);
+    for (auto& r : rows) r += base_[ordinal];
 }
 
 // ---- the forward pass -----------------------------------------------------------------------------------------
@@ -495,8 +491,11 @@ struct HostRef::State {
     Vec logits;
     std::uint32_t next = 0;
 
+    std::optional<EngramRows> engram_hash;  // the shared hash (absent when the model has no Engram layer)
+
     State(Config config, Weights& weights) : c(std::move(config)), w(weights) {
         c.validate();
+        if (!c.engram_layers.empty()) engram_hash.emplace(c);
         const std::size_t blocks = std::size_t{c.layers} + c.nextn;  // text layers + the next-token block
         keys.resize(blocks);
         values.resize(blocks);
@@ -512,12 +511,10 @@ struct HostRef::State {
 
     void engram(std::uint32_t layer, std::uint32_t ordinal, Vec& x) {
         const auto h = c.hidden;
-        const auto pad = c.pad_token;
         const std::uint32_t q = pos;
-        if (tokens[q] == pad) return;  // masked: the output is zero
-        std::vector<std::uint32_t> window(c.ngram);
-        for (std::uint32_t s = 0; s < c.ngram; ++s) window[s] = q >= s ? tokens[q - s] : pad;
-        const auto rows = engram_rows(c, ordinal, window);
+        if (tokens[q] == c.pad_token) return;  // masked: the output is zero
+        std::vector<std::uint64_t> rows(engram_hash->columns());
+        engram_hash->at(tokens, q, ordinal, rows);
         const auto& lookup_norm = t(blk(layer, "engram_lookup_norm.weight"));
         Vec e;
         for (std::size_t head = 0; head < rows.size(); ++head) {
