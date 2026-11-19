@@ -23,6 +23,7 @@
 #include "ops/norm/norm_presets.hpp"
 #include "ops/rope/rope_device.hpp"
 #include "strix/ds41_moe.hpp"
+#include "strix/engram/read_ahead.hpp"
 #include "strix/engram/row_reader.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/hc/hc_contract.hpp"
@@ -263,7 +264,14 @@ struct Forward::Impl {
         float *e = nullptr, *kvout = nullptr;
     } pr;
     std::vector<const std::uint8_t*> kb_pad;
-    std::vector<std::uint8_t> engram_host;
+    // Prompt-window Engram read-ahead (engram_submit): tickets per Engram ordinal of the window starting at the key.
+    struct EngramWindow {
+        std::uint32_t rows = 0;
+        std::vector<std::uint64_t> tickets;
+    };
+    static constexpr std::uint64_t kNoEngramTicket = ~std::uint64_t{0};
+    std::map<std::uint32_t, EngramWindow> engram_windows;
+    std::unique_ptr<strix::engram::ReadAhead> engram_ahead;  // after engram_reader: destroyed (joined) before it
     std::vector<std::uint32_t> status_host;
 
     template <class T> T* alloc(std::size_t count) {
@@ -795,29 +803,74 @@ struct Forward::Impl {
         check(hipGetLastError(), "linear rows epilogue launch");
     }
 
-    void engram_rows_stage(std::uint32_t l, std::uint32_t ordinal, std::uint32_t p0, std::uint32_t R) {
+    // Engram row requests of window [p0, p0 + R) for one Engram ordinal; tok(q) is the token at position q.
+    template <class Tok> std::vector<strix::engram::RowRequest> engram_window_requests(std::uint32_t ordinal, std::uint32_t p0, std::uint32_t R,
+                                                                                    Tok&& tok) const {
         const std::uint32_t heads = c.engram_heads();
         std::vector<strix::engram::RowRequest> req;
         req.reserve(std::size_t{R} * heads);
-        std::vector<std::uint8_t> off(R, 0U);
-        bool any_off = false;
         std::vector<std::uint32_t> window(c.ngram);
         for (std::uint32_t r = 0; r < R; ++r) {
             const auto q = p0 + r;
-            if (tokens[q] == c.pad_token) { off[r] = 1U; any_off = true; }  // masked position: no Engram output
-            for (std::uint32_t k = 0; k < c.ngram; ++k) window[k] = q >= k ? tokens[q - k] : c.pad_token;
+            for (std::uint32_t k = 0; k < c.ngram; ++k) window[k] = q >= k ? tok(q - k) : c.pad_token;
             const auto rows = strix::hy4::engram_rows(c, ordinal, window);
             if (rows.size() != heads) throw std::runtime_error("hy4 hip forward: Engram rows per position");
             for (const auto x : rows) req.push_back({0U, x});
         }
-        engram_host.resize(req.size() * c.engram_dim);
-        engram_reader->read(req, engram_host);
-        check(hipMemcpyAsync(pr.erows, engram_host.data(), engram_host.size(), hipMemcpyHostToDevice, s), "engram rows upload");
+        return req;
+    }
+
+    // Read-ahead of a prompt window's Engram rows (the ids are known before the layers run): one block per Engram layer
+    // of this stage, in layer order, on the shared engram::ReadAhead worker. The bytes are RowReader::read's for the
+    // same requests (the incumbent synchronous read at the layer), so no bit changes; the read overlaps the GPU's
+    // layers instead of running after the MoE status sync of the layer before. A window already queued is kept.
+    template <class Tok> void engram_submit(std::uint32_t p0, std::uint32_t R, Tok&& tok) {
+        if (!engram_reader || engram_windows.count(p0) != 0U) return;
+        if (!engram_ahead) engram_ahead = std::make_unique<strix::engram::ReadAhead>(*engram_reader);
+        EngramWindow queued{R, std::vector<std::uint64_t>(c.engram_layers.size(), kNoEngramTicket)};
+        bool here = false;
+        for (std::uint32_t ord = 0; ord < c.engram_layers.size(); ++ord)
+            if (c.engram_layers[ord] >= first && c.engram_layers[ord] < last) {
+                queued.tickets[ord] = engram_ahead->submit(engram_window_requests(ord, p0, R, tok));
+                here = true;
+            }
+        if (here) engram_windows.emplace(p0, std::move(queued));
+    }
+
+    // Frees a window's read-ahead buffers (after the window sync: the uploads have consumed them).
+    void engram_release(std::uint32_t p0) noexcept {
+        const auto it = engram_windows.find(p0);
+        if (it == engram_windows.end()) return;
+        try {
+            for (const auto ticket : it->second.tickets)
+                if (ticket != kNoEngramTicket) engram_ahead->release(ticket);
+        } catch (...) {  // release only waits on the worker; nothing to recover
+        }
+        engram_windows.erase(it);
+    }
+    void engram_release_all() noexcept {
+        while (!engram_windows.empty()) engram_release(engram_windows.begin()->first);
+    }
+
+    void engram_rows_stage(std::uint32_t l, std::uint32_t ordinal, std::uint32_t p0, std::uint32_t R) {
+        const std::uint32_t heads = c.engram_heads();
+        std::vector<std::uint8_t> off(R, 0U);
+        bool any_off = false;
+        for (std::uint32_t r = 0; r < R; ++r)
+            if (tokens[p0 + r] == c.pad_token) { off[r] = 1U; any_off = true; }  // masked position: no Engram output
+        const auto win = engram_windows.find(p0);
+        if (win == engram_windows.end() || win->second.rows != R || win->second.tickets.at(ordinal) == kNoEngramTicket)
+            throw std::logic_error("hy4 hip forward: Engram rows of the window were not queued");
+        const auto host = engram_ahead->wait(win->second.tickets[ordinal]);
+        const std::size_t row_count = std::size_t{R} * heads;
+        if (host.size() != row_count * c.engram_dim) throw std::logic_error("hy4 hip forward: Engram read-ahead block size");
+        // the block stays allocated until engram_release after the window sync
+        check(hipMemcpyAsync(pr.erows, host.data(), host.size(), hipMemcpyHostToDevice, s), "engram rows upload");
         strix::engram::RowPrepView pv;
         pv.form = strix::engram::RowPrepForm::head_rms_bf16;
         pv.fmt = strix::engram::RowFormat{96U, strix::engram::RowScale::none};
         pv.rows = pr.erows;
-        pv.row_count = req.size();
+        pv.row_count = row_count;
         pv.out = pr.e;
         pv.norm_weight = t(blk(l, "engram_lookup_norm.weight")).f();
         pv.heads = heads;
@@ -1027,6 +1080,12 @@ struct Forward::Impl {
 
     // One window [p0, p0 + R) whose tokens are already in `tokens`; head = the last row's logits.
     void prefill_window(std::uint32_t p0, std::uint32_t R, bool head) {
+        engram_submit(p0, R, [this](std::uint32_t q) { return tokens[q]; });  // no-op when prefill() queued it ahead
+        struct EngramRelease {  // after the window sync below (or on a throw): the uploads have consumed the rows
+            Impl& m;
+            std::uint32_t at;
+            ~EngramRelease() { m.engram_release(at); }
+        } engram_release_guard{*this, p0};
         auto mark = std::chrono::steady_clock::now();
         const std::size_t n = 4U * std::size_t{c.hidden};
         if (first == 0U) {
@@ -1080,12 +1139,30 @@ struct Forward::Impl {
         for (std::uint32_t k = 0; k < plan.lead; ++k) out = &step(prompt[i++], state);
         const auto start = std::chrono::steady_clock::now();
         StepTimes sum{};
+        struct EngramReleaseAll {  // a failed window leaves no queued rows behind (the next prompt may reuse a position)
+            Impl& m;
+            ~EngramReleaseAll() { m.engram_release_all(); }
+        } engram_release_guard{*this};
         for (std::size_t wi = 0; wi < plan.windows.size(); ++wi) {
             const auto win = plan.windows[wi];
             if (win.p0 != pos) throw std::logic_error("hy4 hip forward: prompt plan position");
             for (std::uint32_t r = 0; r < win.rows; ++r) {
                 if (prompt[i] >= c.vocab) throw std::invalid_argument("hy4 hip forward: token outside the vocabulary");
                 tokens.push_back(prompt[i++]);
+            }
+            if (tokens.size() != std::size_t{win.p0} + win.rows) throw std::logic_error("hy4 hip forward: prompt history position");
+            // Engram read-ahead: this window's rows first, then the next window's (its ids are in the prompt), so the
+            // next window's reads run while this window computes.
+            engram_submit(win.p0, win.rows, [this](std::uint32_t q) { return tokens[q]; });
+            if (wi + 1U < plan.windows.size()) {
+                const auto nx = plan.windows[wi + 1U];
+                const std::size_t have = tokens.size();
+                bool ids_ok = nx.p0 == win.p0 + win.rows && i + nx.rows <= prompt.size();
+                for (std::uint32_t r = 0; ids_ok && r < nx.rows; ++r) ids_ok = prompt[i + r] < c.vocab;
+                if (ids_ok)  // else the window's own checks throw when it is reached
+                    engram_submit(nx.p0, nx.rows, [this, &prompt, have, i](std::uint32_t q) {
+                        return q < have ? tokens[q] : prompt[i + (q - have)];
+                    });
             }
             times = {};
             const bool head = wi + 1U == plan.windows.size() && plan.tail == 0U;
