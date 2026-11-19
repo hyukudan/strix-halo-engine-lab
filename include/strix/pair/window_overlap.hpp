@@ -16,14 +16,25 @@
 //   overlap serial path (drafter on stage 0)  P_ser   = D0 + a + hop + b + back_ids_and_hidden
 //   hit   P_hit  = max(D0 + s + a, b, (D0 + s + a + hop + b + back) / 2)   (stage 0, last stage, two windows in a ring)
 //   miss  P_miss = P_ser + s + w, w = max(0, (D0 + s + a) - (hop + b + back)): the doomed window is not abortable
-//   E     = h P_hit + (1 - h) P_miss; the committed tokens per window are the serial loop's, so speedup = P_split / E.
-// h is the share of windows whose speculative successor is on the path: every proposal accepted AND bonus == the
-// drafter's next guess, counted from the acceptance histogram (never assumed). Launching a speculative window pays
-// iff h >= h_min = (P_miss - P_ser) / ((P_ser - P_hit) + (P_miss - P_ser)): the gate is the pair's own arithmetic, not
-// a fixed share. The cut minimises E: on the hit path it balances D0 + s + a against b, i.e. it moves layers off the
+//   E     = h P_hit + (1 - h) P_miss per window; forms are ranked by ms per COMMITTED TOKEN (E / T), not per window.
+// The committed ids are the serial loop's (verification decides), but the tokens per window T need not be. A window
+// drafted speculatively starts before the target's hidden rows of window n are back. A drafter that reads only ids
+// proposes the same tokens either way (leave the speculative histogram empty). A drafter fed by the target's hidden
+// state (an MTP head) has no hidden for the guessed tokens and continues its own chain deeper, where acceptance is
+// lower: its speculative windows have their own measured histogram (h_S, T_S) beside the fresh one (h_F, T_F). A
+// window's successor is speculative with the hit rate of its own kind, so the share of speculative windows (= the
+// share on the hit path) is h = h_F / (1 + h_F - h_S) and T = (1 - h) T_F + h T_S; an empty speculative histogram
+// gives h = h_F and T = T_F. A hit = every proposal accepted AND bonus == the drafter's next guess, counted from the
+// histograms (never assumed). Overlap is admissible iff E / T <= P_ser / T_F (its own serial path); with equal
+// acceptance that is h >= h_min = (P_miss - P_ser) / ((P_ser - P_hit) + (P_miss - P_ser)): the gate is the pair's
+// own arithmetic, not a fixed share. The cut minimises E: on the hit path it balances D0 + s + a against b, i.e. it moves layers off the
 // drafter's device. A tensor-parallel form (both devices read every layer at once, joins per layer) is priced by the
 // split planner and passed in as `tensor_ms`, the pattern of strix/pair/regime.hpp PipelineCost::tp_ms_per_row:
 // the fastest admissible form wins, a more complex one only by `min_gain` (run noise).
+// Not offered as a form: the overlap's own serial path (drafter on stage 0, P_ser), although on unequal devices it can
+// be a better serial split than `split` (drafter on the last stage); it is reported as `p_serial` of the overlap.
+// No engine binds this planner yet: the first binder is the multi-device form evaluator (layers-overlap form), then a
+// first engine binding measured by a smoke run before any long run.
 // Links are strix::pair::chain::Link (one link type for every pair planner): USB4 nodes and two cards in one box are
 // the same model with different latency and rates.
 // Home: shared (host shared). The per-backend bodies it needs are each family's existing execution pieces: a stage-0
@@ -106,6 +117,8 @@ struct Estimate {
     bool admissible = false;
     std::uint32_t cut = 0;                 // split / overlap: first layer of stage 1; single: the device
     double ms = std::numeric_limits<double>::infinity();  // expected ms per window
+    double tokens = 1.0;                   // expected committed tokens per window
+    double ms_per_token = std::numeric_limits<double>::infinity();  // ms / tokens: what choose() ranks
     double p_hit = 0.0, p_miss = 0.0, p_serial = 0.0, h = 0.0, h_min = 0.0;  // overlap terms
     std::string reason;
 };
@@ -126,6 +139,12 @@ inline void check(const Window& w, const Pair& p) {
     if (w.rows == 0U || p.speed0 <= 0.0 || p.speed1 <= 0.0) throw std::invalid_argument("overlap: rows and speeds must be > 0");
 }
 inline double state_bytes(const Window& w, std::size_t cut) { return w.state_bytes.empty() ? 0.0 : sum(w.state_bytes, 0, cut); }
+// Every window commits at least its bonus token: unknown acceptance counts 1.
+inline double tokens(const Acceptance& acc) { return std::max(1.0, tokens_per_window(acc)); }
+inline void per_token(Estimate& e, double t) {
+    e.tokens = t;
+    if (std::isfinite(e.ms)) e.ms_per_token = e.ms / t;
+}
 }  // namespace detail
 
 // One device runs the whole window (draft included); the faster device wins, ties keep device 0.
@@ -166,14 +185,21 @@ inline double state_bytes(const Window& w, std::size_t cut) { return w.state_byt
     return e;
 }
 
-// Overlapped windows (drafter on stage 0): the cut minimising the expected window at the measured hit rate.
-// Inadmissible, with the reason, when there is no drafter, when h is below the break-even h_min at the best cut, or
+// Overlapped windows (drafter on stage 0): the cut minimising the expected window at the measured hit rates.
+// `fresh`: windows drafted after the true ids (and hidden rows) of the previous window; `speculative`: windows drafted
+// on the guess (empty: same as fresh, valid only for a drafter that reads ids only). Inadmissible, with the reason,
+// when there is no drafter, when ms per committed token is above the overlap's own serial path at the best cut, or
 // when a device cannot pay the extra bytes (second window, two stage-0 snapshots, the drafter on stage 0).
-[[nodiscard]] inline Estimate overlapped(const Window& w, const Pair& p, const Acceptance& acc, const Extra& x = {}) {
+[[nodiscard]] inline Estimate overlapped(const Window& w, const Pair& p, const Acceptance& fresh,
+                                         const Acceptance& speculative = {}, const Extra& x = {}) {
     detail::check(w, p);
     Estimate e;
     e.form = Form::overlap;
-    e.h = hit_rate(acc);
+    const double h_f = hit_rate(fresh), t_f = detail::tokens(fresh);
+    const bool same = windows(speculative) == 0U;
+    const double h_s = same ? h_f : hit_rate(speculative), t_s = same ? t_f : detail::tokens(speculative);
+    e.h = h_f > 0.0 ? h_f / (1.0 + h_f - h_s) : 0.0;
+    e.tokens = (1.0 - e.h) * t_f + e.h * t_s;
     if (w.draft_ms <= 0.0) { e.reason = "no drafter: nothing to guess the next window from"; return e; }
     const double rows = static_cast<double>(w.rows);
     const double hop = detail::message_ms(p.link.latency_ms, rows * w.hop_bytes_per_row, p.link.forward_bytes_per_ms);
@@ -215,8 +241,9 @@ inline double state_bytes(const Window& w, std::size_t cut) { return w.state_byt
                                 : "no legal cut";
         return e;
     }
-    if (e.h < e.h_min) {
-        e.reason = "hit rate below break-even: speculative windows lose";
+    e.ms_per_token = e.ms / e.tokens;
+    if (e.ms_per_token > e.p_serial / t_f) {
+        e.reason = "below break-even per committed token: speculative windows lose";
         return e;
     }
     e.admissible = true;
@@ -226,14 +253,15 @@ inline double state_bytes(const Window& w, std::size_t cut) { return w.state_byt
 struct Choice {
     Estimate chosen, single, split, overlap, tensor;
 };
-// The fastest admissible form; a later (more complex) form replaces the chosen one only by `min_gain`.
-// `tensor_ms` is the tensor-parallel window priced by the split planner (0: no tensor form for this binding).
-[[nodiscard]] inline Choice choose(const Window& w, const Pair& p, const Acceptance& acc, const Extra& x = {},
-                                   double tensor_ms = 0.0, const Policy& policy = {}) {
+// The fastest admissible form by ms per committed token; a later (more complex) form replaces the chosen one only by
+// `min_gain`. Serial forms commit the fresh tokens per window. `tensor_ms` is the tensor-parallel window priced by the
+// split planner (0: no tensor form for this binding).
+[[nodiscard]] inline Choice choose(const Window& w, const Pair& p, const Acceptance& fresh, const Acceptance& speculative = {},
+                                   const Extra& x = {}, double tensor_ms = 0.0, const Policy& policy = {}) {
     Choice c;
     c.single = single(w, p);
     c.split = split(w, p);
-    c.overlap = overlapped(w, p, acc, x);
+    c.overlap = overlapped(w, p, fresh, speculative, x);
     c.tensor.form = Form::tensor;
     if (tensor_ms > 0.0) {
         c.tensor.admissible = true;
@@ -241,9 +269,11 @@ struct Choice {
     } else {
         c.tensor.reason = "no tensor form declared";
     }
+    const double t_f = detail::tokens(fresh);
+    for (Estimate* e : {&c.single, &c.split, &c.tensor}) detail::per_token(*e, t_f);
     c.chosen = c.single;
     for (const Estimate* cand : {&c.split, &c.overlap, &c.tensor})
-        if (cand->admissible && cand->ms < c.chosen.ms * (1.0 - policy.min_gain)) c.chosen = *cand;
+        if (cand->admissible && cand->ms_per_token < c.chosen.ms_per_token * (1.0 - policy.min_gain)) c.chosen = *cand;
     return c;
 }
 

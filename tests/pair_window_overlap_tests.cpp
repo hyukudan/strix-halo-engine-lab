@@ -58,6 +58,18 @@ int main() try {
         require(near(o.h_min, 2.0 / 24.0), "h_min = loss / (gain + loss) = 2 / (22 + 2)");
         const ov::Choice c = ov::choose(w, p, a);
         require(c.chosen.form == ov::Form::overlap, "overlap chosen over single and serial split");
+        require(near(o.tokens, 2.0) && near(o.ms_per_token, 18.0) && near(c.single.ms_per_token, 22.0),
+                "ranked per committed token: T = 2 for every form");
+        const ov::Estimate same = ov::overlapped(w, p, a, a);
+        require(near(same.ms, o.ms) && near(same.h, 0.5) && near(same.tokens, 2.0), "speculative == fresh: the fresh model");
+        // A hidden-fed drafter whose speculative windows never accept (h_S 0, T_S 1): h = 0.5 / 1.5, T = 5 / 3,
+        // E = 24 / 3 + 2 x 48 / 3 = 40 -> 24 ms per token > P_ser / T_F = 23: overlap refused, one device chosen.
+        const ov::Acceptance cold = acceptance(0, 0, 10);
+        const ov::Estimate low = ov::overlapped(w, p, a, cold);
+        require(!low.admissible && near(low.h, 1.0 / 3.0) && near(low.tokens, 5.0 / 3.0) && near(low.ms, 40.0) &&
+                    low.reason.find("per committed token") != std::string::npos,
+                "lower speculative acceptance flips overlap to refused");
+        require(ov::choose(w, p, a, cold).chosen.form == ov::Form::single, "and one device decodes");
     }
     {  // the cut moves layers off the drafter's device: 40 x 1 ms, D 8, free link -> a + 8 = b at cut 16
         ov::Window w = equal_layers(40, 1.0, 8.0);
@@ -86,11 +98,11 @@ int main() try {
         ov::Extra x;
         x.drafter_bytes = 1e9;
         p.free0 = 5e8;
-        const ov::Choice c = ov::choose(w, p, acceptance(5, 5, 10), x);
+        const ov::Choice c = ov::choose(w, p, acceptance(5, 5, 10), {}, x);
         require(!c.overlap.admissible && c.overlap.reason.find("memory") != std::string::npos, "memory refusal named");
         require(c.chosen.form == ov::Form::single, "falls back to one device");
         p.free0 = 2e9;
-        const ov::Estimate o = ov::overlapped(w, p, acceptance(5, 5, 10), x);
+        const ov::Estimate o = ov::overlapped(w, p, acceptance(5, 5, 10), {}, x);
         // cut 1: s = 1 ms (1 MB at 1 MB/ms), stage0 = 15, b = 30 -> P_hit 30, P_miss = 44 + 1; cut 2 pays s = 2 and a
         // doomed window of 26 against b 20 (P_miss 52): the snapshot cost moves the cut towards stage 0.
         require(o.admissible && o.cut == 1U && near(o.p_hit, 30.0) && near(o.p_miss, 45.0),
@@ -116,10 +128,10 @@ int main() try {
         require(none.split.ms > none.single.ms, "the serial split loses on either link");
         // A tensor form with 2 joins per layer: compute halves, trips 128 x latency.
         const double tensor = (64.0 + 2.0 + 6.0) / 2.0 + 128.0 * p.link.latency_ms;
-        const ov::Choice tp = ov::choose(w, p, a, {}, tensor);
+        const ov::Choice tp = ov::choose(w, p, a, {}, {}, tensor);
         require(tp.chosen.form == ov::Form::tensor, "a cheap-join tensor form wins over overlap at h 0.5");
         const double slow_tensor = (64.0 + 2.0 + 6.0) / 2.0 + 128.0 * 0.2;  // a 200 us trip
-        require(ov::choose(w, p, a, {}, slow_tensor).chosen.form == ov::Form::overlap,
+        require(ov::choose(w, p, a, {}, {}, slow_tensor).chosen.form == ov::Form::overlap,
                 "a high-latency join hands the decode to overlap");
     }
     std::puts("pair_window_overlap_tests: OK");
