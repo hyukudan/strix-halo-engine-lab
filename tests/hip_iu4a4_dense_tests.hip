@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -21,8 +22,11 @@ std::uint32_t bits(float v) {
     return b;
 }
 bool same(float a, float b) { return (std::isnan(a) && std::isnan(b)) || bits(a) == bits(b); }
+struct Mul {  // map2 functor of the fixture (an engine passes its gated unit)
+    __device__ __forceinline__ static float apply(float a, float b) { return a * b; }
+};
 
-int run_case(unsigned rows, unsigned in, unsigned n, unsigned seed) {
+int run_case(unsigned rows, unsigned in, unsigned n, unsigned seed, bool map2 = false) {
     std::mt19937 g(seed);
     const unsigned mp = ad::padded_rows(rows), blocks = in / rot::kBlock;
     // Weights: random nibbles, FP16 scales 2^-10 .. 2^-4 with random mantissas.
@@ -39,16 +43,20 @@ int run_case(unsigned rows, unsigned in, unsigned n, unsigned seed) {
     if (rows > 3U) std::fill(x.begin() + 3 * std::ptrdiff_t(in), x.begin() + 4 * std::ptrdiff_t(in), 0.0f);
     if (rows > 5U) x[5U * std::size_t(in) + in / 2U] = std::nanf("");
     if (rows > 7U) x[7U * std::size_t(in) + 3U] = INFINITY, x[7U * std::size_t(in) + in - 1U] = std::nanf("");
+    // map2: the device gets (x, x2) and quantises x * x2; the reference quantises the stored FP32 product.
+    std::vector<float> x2(map2 ? x.size() : 0U), xq = x;
+    for (std::size_t i = 0; i < x2.size(); ++i) x2[i] = 0.5f + nd(g) * 0.25f, xq[i] = x[i] * x2[i];
 
     std::uint8_t *dpack = nullptr, *dw = nullptr, *dcodes = nullptr;
     std::uint16_t* dsc = nullptr;
-    float *dstep = nullptr, *dx = nullptr, *dbase = nullptr, *dy = nullptr;
+    float *dstep = nullptr, *dx = nullptr, *dx2 = nullptr, *dbase = nullptr, *dy = nullptr;
     std::uint32_t* du = nullptr;
     CHECK(hipMalloc(&dpack, pack.size()));
     CHECK(hipMalloc(&dsc, sc.size() * 2U));
     CHECK(hipMalloc(&dw, ad::weight_code_bytes(in, n)));
     CHECK(hipMalloc(&dstep, ad::weight_step_bytes(in, n)));
     CHECK(hipMalloc(&dx, x.size() * 4U));
+    CHECK(hipMalloc(&dx2, std::max<std::size_t>(x2.size(), 1U) * 4U));
     CHECK(hipMalloc(&dcodes, ad::act_code_bytes(rows, in)));
     CHECK(hipMalloc(&du, ad::act_u_bytes(rows, in)));
     CHECK(hipMalloc(&dbase, ad::act_base_bytes(rows)));
@@ -56,11 +64,13 @@ int run_case(unsigned rows, unsigned in, unsigned n, unsigned seed) {
     CHECK(hipMemcpy(dpack, pack.data(), pack.size(), hipMemcpyHostToDevice));
     CHECK(hipMemcpy(dsc, sc.data(), sc.size() * 2U, hipMemcpyHostToDevice));
     CHECK(hipMemcpy(dx, x.data(), x.size() * 4U, hipMemcpyHostToDevice));
+    if (map2) CHECK(hipMemcpy(dx2, x2.data(), x2.size() * 4U, hipMemcpyHostToDevice));
     CHECK(hipMemset(dy, 0xff, std::size_t(rows) * n * 4U));
     const ad::Act act{dcodes, du, dbase, rows, in};
     const ad::Weights wt{dw, dstep, in, n};
     ad::enqueue_requantise(dpack, dsc, in, n, dw, dstep, nullptr);
-    ad::enqueue_quantise(dx, in, act, nullptr);
+    if (map2) ad::enqueue_quantise_map2<Mul>(dx, dx2, in, act, nullptr);
+    else ad::enqueue_quantise(dx, in, act, nullptr);
     ad::enqueue_gemm(wt, act, ad::OutCols{dy, n, n / 16U}, nullptr);
     CHECK(hipGetLastError());
     CHECK(hipDeviceSynchronize());
@@ -73,7 +83,7 @@ int run_case(unsigned rows, unsigned in, unsigned n, unsigned seed) {
     CHECK(hipMemcpy(gu.data(), du, gu.size() * 4U, hipMemcpyDeviceToHost));
     CHECK(hipMemcpy(gbase.data(), dbase, gbase.size() * 4U, hipMemcpyDeviceToHost));
     CHECK(hipMemcpy(gy.data(), dy, gy.size() * 4U, hipMemcpyDeviceToHost));
-    for (void* p : {static_cast<void*>(dpack), static_cast<void*>(dsc), static_cast<void*>(dw), static_cast<void*>(dstep), static_cast<void*>(dx),
+    for (void* p : {static_cast<void*>(dpack), static_cast<void*>(dsc), static_cast<void*>(dw), static_cast<void*>(dstep), static_cast<void*>(dx), static_cast<void*>(dx2),
                     static_cast<void*>(dcodes), static_cast<void*>(du), static_cast<void*>(dbase), static_cast<void*>(dy)})
         CHECK(hipFree(p));
 
@@ -92,7 +102,7 @@ int run_case(unsigned rows, unsigned in, unsigned n, unsigned seed) {
     std::vector<std::uint8_t> hu(std::size_t(mp) * (in / rot::kGroupA), 1);
     std::vector<float> hb(mp, 0.0f), row(in);
     for (unsigned r = 0; r < rows; ++r) {
-        std::copy(x.begin() + std::ptrdiff_t(r) * in, x.begin() + std::ptrdiff_t(r + 1U) * in, row.begin());
+        std::copy(xq.begin() + std::ptrdiff_t(r) * in, xq.begin() + std::ptrdiff_t(r + 1U) * in, row.begin());
         hb[r] = rot::quantise_row(row.data(), in, hc.data() + std::size_t(r) * in, hu.data() + std::size_t(r) * (in / rot::kGroupA));
     }
     for (unsigned r = 0; r < mp; ++r) {
@@ -115,7 +125,7 @@ int run_case(unsigned rows, unsigned in, unsigned n, unsigned seed) {
             nan_y += std::isnan(ref) ? 1U : 0U;
         }
     const bool ok = !(bad_w | bad_s | bad_a | bad_u | bad_b | bad_y);
-    std::printf("%s rows %u in %u n %u: wcodes %u steps %u acodes %u u %u base %u y %u differ (NaN outputs %u)\n", ok ? "PASS" : "FAIL", rows, in, n,
+    std::printf("%s%s rows %u in %u n %u: wcodes %u steps %u acodes %u u %u base %u y %u differ (NaN outputs %u)\n", ok ? "PASS" : "FAIL", map2 ? " map2" : "", rows, in, n,
                 bad_w, bad_s, bad_a, bad_u, bad_b, bad_y, nan_y);
     return ok ? 0 : 1;
 }
@@ -127,6 +137,8 @@ int main() {
     fails += run_case(130, 1280, 272, 2U);  // 2 m CTAs (second partial), 17 W tiles
     fails += run_case(16, 384, 16, 3U);     // odd block count, one tile each way
     fails += run_case(300, 2048, 400, 4U);  // 3 m CTAs, 25 W tiles
+    fails += run_case(40, 17408, 32, 5U, true);  // map2 (gated-unit form), the longest CTA-quantiser row of the bound shapes
+    fails += run_case(20, 24704, 32, 6U);        // past kCtaInputs: the wave-per-row quantiser
     std::printf("%s\n", fails ? "iu4a4_dense tests FAILED" : "iu4a4_dense tests PASS");
     return fails ? 1 : 0;
 }

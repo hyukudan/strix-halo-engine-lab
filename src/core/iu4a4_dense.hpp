@@ -73,6 +73,9 @@ using I2 = int __attribute__((ext_vector_type(2)));
 using I8 = int __attribute__((ext_vector_type(8)));
 using F4 = float __attribute__((ext_vector_type(4)));
 __device__ __forceinline__ float fmax_(float a, float o) { return o > a ? o : a; }
+typedef const __attribute__((address_space(1))) I2 GI2;
+typedef const __attribute__((address_space(1))) F4 GF4;
+typedef const __attribute__((address_space(1))) std::uint32_t GU32;
 
 // One wave per row (blockDim 256 = 8 rows). Lanes 0-15 take block 2 s, lanes 16-31 block 2 s + 1 of step s; lane
 // holds inputs 8 (lane % 16) .. + 7 of its block (the a4_tiles::Emu lane form, bitwise = fwht128).
@@ -156,6 +159,110 @@ __global__ __launch_bounds__(256) void quantise_kernel(const float* __restrict__
     }
 }
 
+// CTA form of the quantiser (one 8-wave CTA per row, one read of x): wave w takes steps w, w + 8, ... (a step = 2
+// blocks, as quantise_kernel) and keeps its rotated values in registers; the row maximum and the first non-finite
+// value meet in LDS. Same operations, same bits as quantise_kernel. F::apply(a, b) maps two inputs to the value that
+// is quantised (an engine's gated unit, e.g. SiLU(g) * u, so the FP32 product is never stored); Ident takes a.
+// Rows up to kCtaInputs inputs; quantise_kernel takes longer rows.
+inline constexpr unsigned kCtaSteps = 12U, kCtaInputs = 8U * kCtaSteps * 2U * 128U;  // 24,576
+struct Ident {
+    __device__ __forceinline__ static float apply(float a, float) { return a; }
+};
+template <class F>
+__global__ __launch_bounds__(256) void quantise_cta_kernel(const float* __restrict__ x0, const float* __restrict__ x1, unsigned x_stride, Act a) {
+#pragma clang fp contract(off)
+    __shared__ float s_amax[8], s_bad[8];
+    __shared__ unsigned s_badk[8];
+    const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x >> 5U, row = blockIdx.x;
+    const unsigned mp = padded_rows(a.rows), in = a.in, blocks = in / rot::kBlock, steps = (blocks + 1U) / 2U;
+    const unsigned half = lane >> 4U, sub = lane & 15U;
+    const bool live_row = row < a.rows;
+    const std::size_t ro = std::size_t(live_row ? row : 0U) * x_stride;
+    float v[kCtaSteps][8];
+    float amax_m = 0.0f, bad = 0.0f;
+    unsigned bad_k = 0xffffffffU;
+#pragma unroll
+    for (unsigned q = 0; q < kCtaSteps; ++q) {
+        const unsigned blk = 2U * (wave + 8U * q) + half;
+        if (live_row && blk < blocks) {
+            const std::size_t at = ro + blk * rot::kBlock + sub * 8U;
+            const F4 lo = *reinterpret_cast<const F4*>(x0 + at), hi = *reinterpret_cast<const F4*>(x0 + at + 4U);
+            F4 lo1 = lo, hi1 = hi;
+            if (x1) lo1 = *reinterpret_cast<const F4*>(x1 + at), hi1 = *reinterpret_cast<const F4*>(x1 + at + 4U);
+#pragma unroll
+            for (unsigned j = 0; j < 4U; ++j) {
+                float t0 = F::apply(lo[j], lo1[j]), t1 = F::apply(hi[j], hi1[j]);
+                asm volatile("" : "+v"(t0), "+v"(t1));  // the value rounded once, as a stored FP32 input
+                v[q][j] = t0, v[q][4U + j] = t1;
+            }
+        } else {
+#pragma unroll
+            for (unsigned j = 0; j < 8U; ++j) v[q][j] = 0.0f;
+        }
+        if (wave + 8U * q < steps) {  // wave-uniform: every lane of the wave takes part in the shuffles
+            a4_tiles::Emu<32U, true>::fwht(v[q]);
+#pragma unroll
+            for (unsigned j = 0; j < 8U; ++j) {
+                const float m = a4_tiles::fabs_(v[q][j]);
+                if (!(m <= 3.402823466e38f)) {
+                    const unsigned k = blk * rot::kBlock + sub * 8U + j;
+                    if (k < bad_k) bad_k = k, bad = v[q][j];
+                } else {
+                    amax_m = fmax_(amax_m, m);
+                }
+            }
+        }
+    }
+    for (unsigned d = 1; d < 32U; d *= 2U) {
+        amax_m = fmax_(amax_m, __shfl_xor(amax_m, int(d), 32));
+        const unsigned ok = static_cast<unsigned>(__shfl_xor(static_cast<int>(bad_k), int(d), 32));
+        const float ov = __shfl_xor(bad, int(d), 32);
+        if (ok < bad_k) bad_k = ok, bad = ov;
+    }
+    if (lane == 0U) s_amax[wave] = amax_m, s_bad[wave] = bad, s_badk[wave] = bad_k;
+    __syncthreads();
+    for (unsigned o = 0; o < 8U; ++o) {
+        amax_m = fmax_(amax_m, s_amax[o]);
+        if (s_badk[o] < bad_k) bad_k = s_badk[o], bad = s_bad[o];
+    }
+    const bool finite = bad_k == 0xffffffffU;
+    const float base = finite ? amax_m / (7.0f * static_cast<float>(rot::kUMax)) : bad;
+    if (threadIdx.x == 0U) a.base[row] = base;
+    const bool coded = finite && base > 0.0f;
+#pragma unroll
+    for (unsigned q = 0; q < kCtaSteps; ++q) {
+        if (wave + 8U * q >= steps) continue;
+        const unsigned blk = 2U * (wave + 8U * q) + half;
+        float amax = 0.0f;
+#pragma unroll
+        for (unsigned j = 0; j < 8U; ++j) amax = fmax_(amax, a4_tiles::fabs_(v[q][j]));
+        amax = fmax_(amax, __shfl_xor(amax, 1, 32));
+        amax = fmax_(amax, __shfl_xor(amax, 2, 32));
+        int ug = 1;
+        if (coded && amax > 0.0f) {
+            const float qq = amax / (7.0f * base);
+            ug = qq >= static_cast<float>(rot::kUMax) ? rot::kUMax : static_cast<int>(::ceilf(qq));
+            ug = ug < 1 ? 1 : ug;
+        }
+        const float step = base * static_cast<float>(ug);
+        std::uint32_t packed = 0U;
+#pragma unroll
+        for (unsigned j = 0; j < 8U; ++j) {
+            const int code = coded ? integer_math::a4_code_f(v[q][j], step) : 0;
+            packed |= (static_cast<std::uint32_t>(code) & 15U) << (4U * j);
+        }
+        const unsigned hb = lane & 16U;
+        const std::uint32_t uw = static_cast<std::uint32_t>(__shfl(ug, int(hb), 32)) |
+                                 static_cast<std::uint32_t>(__shfl(ug, int(hb + 4U), 32)) << 8U |
+                                 static_cast<std::uint32_t>(__shfl(ug, int(hb + 8U), 32)) << 16U |
+                                 static_cast<std::uint32_t>(__shfl(ug, int(hb + 12U), 32)) << 24U;
+        if (blk < blocks) {
+            *reinterpret_cast<std::uint32_t*>(a.codes + rot::pack_byte(blk * rot::kBlock + sub * 8U, row, mp)) = packed;
+            if (sub == 0U) a.u[std::size_t(blk) * mp + row] = uw;
+        }
+    }
+}
+
 // One thread per (column n, block b); load time.
 __global__ __launch_bounds__(256) void requantise_kernel(const std::uint8_t* __restrict__ pack, const std::uint16_t* __restrict__ scales,
                                                          unsigned in, unsigned n, std::uint8_t* __restrict__ dst, float* __restrict__ step) {
@@ -178,9 +285,12 @@ __global__ __launch_bounds__(256) void gemm_kernel(Weights w, Act a, Cols cols, 
     for (unsigned i = 0; i < kTw; ++i) nt[i] = nt0 + i < ntiles ? nt0 + i : ntiles - 1U;  // dead tiles read a live one
 #pragma unroll
     for (unsigned i = 0; i < kTm; ++i) mt[i] = mt0 + i < mtiles ? mt0 + i : mtiles - 1U;
-    const auto* wp = reinterpret_cast<const detail::I2*>(f16_dense_tall::detail::uniform(w.codes));
-    const auto* xp = reinterpret_cast<const detail::I2*>(f16_dense_tall::detail::uniform(a.codes));
-    const auto* sp = reinterpret_cast<const F4*>(f16_dense_tall::detail::uniform(w.step));
+    // Global (not flat) pointers: a flat load also counts in lgkmcnt, which only drains to 0, so every wait for a
+    // fragment would also wait for the prefetch issued after it.
+    const GI2* wp = (const GI2*)w.codes;
+    const GI2* xp = (const GI2*)a.codes;
+    const GF4* sp = (const GF4*)w.step;
+    const GU32* up = (const GU32*)a.u;
     // Fragment index of (unit ku, tile t): (ku * tiles + t) * 16 + l16; per unit the offsets grow by tiles * 16.
     const std::size_t wstride = std::size_t(ntiles) * 16U, xstride = std::size_t(mtiles) * 16U;
     float acc[kTw][kTm][8];
@@ -191,39 +301,36 @@ __global__ __launch_bounds__(256) void gemm_kernel(Weights w, Act a, Cols cols, 
 #pragma unroll
             for (unsigned e = 0; e < 8U; ++e) acc[i][j][e] = 0.0f;
     const I8 zero = {0, 0, 0, 0, 0, 0, 0, 0};
-    I2 wf[kTw], xf[kTm], wn[kTw], xn[kTm];
+    // Two fragment sets in ping-pong (an A group = 2 units: unit 0 reads set a and fills b, unit 1 reads b and fills a).
+    I2 wa[kTw], xa[kTm], wb[kTw], xb[kTm];
     const auto load = [&](unsigned ku, I2 (&wd)[kTw], I2 (&xd)[kTm]) __attribute__((always_inline)) {
 #pragma unroll
         for (unsigned i = 0; i < kTw; ++i) wd[i] = wp[ku * wstride + nt[i] * 16U + l16];
 #pragma unroll
         for (unsigned j = 0; j < kTm; ++j) xd[j] = xp[ku * xstride + mt[j] * 16U + l16];
     };
+    const auto mma = [&](const I2 (&wd)[kTw], const I2 (&xd)[kTm], I8 (&c)[kTw][kTm], bool first) __attribute__((always_inline)) {
+#pragma unroll
+        for (unsigned i = 0; i < kTw; ++i)
+#pragma unroll
+            for (unsigned j = 0; j < kTm; ++j)
+                c[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, wd[i], true, xd[j], first ? zero : c[i][j], false);
+    };
     const unsigned last_unit = blocks * 8U - 1U;
-    load(0U, wf, xf);
+    load(0U, wa, xa);
     for (unsigned b = 0; b < blocks; ++b) {
         std::uint32_t ub[kTm];
 #pragma unroll
-        for (unsigned j = 0; j < kTm; ++j) ub[j] = a.u[std::size_t(b) * mp + mt[j] * 16U + l16];
+        for (unsigned j = 0; j < kTm; ++j) ub[j] = up[std::size_t(b) * mp + mt[j] * 16U + l16];
         I8 t[kTw][kTm];
 #pragma unroll
         for (unsigned g = 0; g < rot::kGroupsPerBlock; ++g) {
+            const unsigned ku = b * 8U + g * 2U;
             I8 c[kTw][kTm];
-#pragma unroll
-            for (unsigned uu = 0; uu < 2U; ++uu) {
-                const unsigned ku = b * 8U + g * 2U + uu;
-                load(ku < last_unit ? ku + 1U : ku, wn, xn);  // one unit ahead (the last unit reloads itself)
-#pragma unroll
-                for (unsigned i = 0; i < kTw; ++i)
-#pragma unroll
-                    for (unsigned j = 0; j < kTm; ++j) {
-                        if (uu == 0U) c[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, wf[i], true, xf[j], zero, false);
-                        else c[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, wf[i], true, xf[j], c[i][j], false);
-                    }
-#pragma unroll
-                for (unsigned i = 0; i < kTw; ++i) wf[i] = wn[i];
-#pragma unroll
-                for (unsigned j = 0; j < kTm; ++j) xf[j] = xn[j];
-            }
+            load(ku + 1U, wb, xb);
+            mma(wa, xa, c, true);
+            load(ku + 1U < last_unit ? ku + 2U : ku + 1U, wa, xa);  // the last unit reloads itself
+            mma(wb, xb, c, false);
 #pragma unroll
             for (unsigned j = 0; j < kTm; ++j) {
                 const int ug = static_cast<int>((ub[j] >> (8U * g)) & 255U);
@@ -235,7 +342,7 @@ __global__ __launch_bounds__(256) void gemm_kernel(Weights w, Act a, Cols cols, 
         }
 #pragma unroll
         for (unsigned i = 0; i < kTw; ++i) {
-            const F4* s = sp + ((std::size_t(b) * ntiles + nt[i]) * 2U + hi) * 2U;
+            const GF4* s = sp + ((std::size_t(b) * ntiles + nt[i]) * 2U + hi) * 2U;
             const F4 s0 = s[0], s1 = s[1];
 #pragma unroll
             for (unsigned j = 0; j < kTm; ++j)
@@ -270,8 +377,15 @@ __global__ __launch_bounds__(256) void gemm_kernel(Weights w, Act a, Cols cols, 
 }  // namespace detail
 
 // Host side (stream-ordered; callers check supported() and hipGetLastError()).
+// x: rows of a.in values at x_stride floats. quantise_map2: the quantised value is F::apply(a[k], b[k]) (same stride);
+// with a second input it needs map2_supported(in).
+inline bool map2_supported(unsigned in) { return in <= detail::kCtaInputs; }
+template <class F = detail::Ident> inline void enqueue_quantise_map2(const float* x0, const float* x1, unsigned x_stride, const Act& a, hipStream_t s) {
+    if (a.in <= detail::kCtaInputs) hipLaunchKernelGGL((detail::quantise_cta_kernel<F>), dim3(padded_rows(a.rows)), dim3(256), 0, s, x0, x1, x_stride, a);
+    else hipLaunchKernelGGL(detail::quantise_kernel, dim3((padded_rows(a.rows) + 7U) / 8U), dim3(256), 0, s, x0, x_stride, a);
+}
 inline void enqueue_quantise(const float* x, unsigned x_stride, const Act& a, hipStream_t s) {
-    hipLaunchKernelGGL(detail::quantise_kernel, dim3((padded_rows(a.rows) + 7U) / 8U), dim3(256), 0, s, x, x_stride, a);
+    enqueue_quantise_map2<detail::Ident>(x, nullptr, x_stride, a, s);
 }
 inline void enqueue_requantise(const std::uint8_t* pack, const std::uint16_t* scales, unsigned in, unsigned n, std::uint8_t* dst, float* step,
                                hipStream_t s) {

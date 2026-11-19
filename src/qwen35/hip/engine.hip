@@ -467,9 +467,16 @@ void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStrea
 void mlp(const Tensor& g, const Tensor& u, const Tensor& d, const float* x, float* h, float* out, unsigned rows, hipStream_t s,
          const WideScratch& wide, const Iu4Scratch& iu4) {
     static const bool fuse = strix::envcfg::flag("STRIX_DENSE_GLU_X16", true);
-    if (rows > 16U && a4_ok(g, wide) && a4_ok(u, wide) && a4_ok(d, wide)) {  // A4W4: glu then down (h quantised by its own pass)
-        glu(g, u, x, h, rows, s, wide, iu4);
-        linear(d, h, out, rows, s, wide, iu4);
+    if (rows > 16U && a4_ok(g, wide) && a4_ok(u, wide) && a4_ok(d, wide) && g.inputs == u.inputs && g.outputs == u.outputs &&
+        d.inputs == g.outputs && core::iu4a4_dense::map2_supported(d.inputs)) {
+        // A4W4: gate and up share one quantised x; SiLU(g) * u is quantised for down in the same pass (no FP32 h).
+        a4_linear(g, x, wide.g, rows, s, wide);
+        a4_linear(u, x, wide.u, rows, s, wide, false);
+        core::iu4a4_dense::Act act = wide.a4;
+        act.rows = rows;
+        act.in = d.inputs;
+        core::iu4a4_dense::enqueue_quantise_map2<SiluMul>(wide.g, wide.u, d.inputs, act, s);
+        a4_linear(d, nullptr, out, rows, s, wide, false);
         return;
     }
     if (fuse && rows > 16U && !wide_ok(g, wide) && wide_iu4_ok(g, wide, rows) && wide_iu4_ok(u, wide, rows) && wide_iu4_ok(d, wide, rows) &&
