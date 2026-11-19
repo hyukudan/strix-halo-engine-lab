@@ -8,6 +8,7 @@
 #include "strix/pair/tp_inputs.hpp"
 
 #include <cstdint>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -101,6 +102,11 @@ void test_inputs() {
     check(throws([] { (void)tp::rank_rates({}, {243.0, 0.0}, 2U); }), "rates: an undeclared rank refused");
     check(throws([] { (void)tp::rank_rates({195.0}, {243.0, 243.0}, 2U); }), "rates: a flag with the wrong rank count refused");
     check(throws([] { (void)tp::rank_rates({195.0, -1.0}, {}, 2U); }), "rates: a non-positive flag refused");
+    const double inf = std::numeric_limits<double>::infinity();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    check(throws([&] { (void)tp::rank_rates({inf, 180.0}, {}, 2U); }), "rates: infinite override refused at admission");
+    check(throws([&] { (void)tp::rank_rates({}, {243.0, inf}, 2U); }), "rates: infinite topology rate refused");
+    check(throws([&] { (void)tp::rank_rates({nan, 180.0}, {}, 2U); }), "rates: NaN override refused");
 
     strix::dist::LinkCost lc;
     lc.latency_us = 34.0;
@@ -112,6 +118,8 @@ void test_inputs() {
     check(o.latency_ms == 0.012 && o.bytes_per_ms == t.bytes_per_ms, "trip: the override replaces the latency only");
     check(throws([] { (void)tp::trip_cost(strix::dist::LinkCost{}); }), "trip: an invalid measurement refused");
     check(throws([&] { (void)tp::trip_cost(lc, -1.0); }), "trip: a negative override refused");
+    check(throws([&] { (void)tp::trip_cost(lc, inf); }), "trip: infinite latency override refused");
+    check(throws([&] { (void)tp::trip_cost(lc, nan); }), "trip: NaN latency override refused");
 }
 
 }  // namespace
