@@ -1223,6 +1223,7 @@ void Forward::forward_rows(std::span<const std::uint32_t> tokens, bool logits) {
 std::span<const std::uint32_t> Forward::rows_greedy() const noexcept { return impl_->vr.greedy; }
 const std::vector<float>& Forward::rows_logits() const noexcept { return impl_->vr.logits_host; }
 void Forward::commit_rows(std::uint32_t k) { impl_->commit_rows(k); }
+void Forward::set_rows_expert_union(bool on) noexcept { impl_->vr.expert_union = on; }
 const std::vector<float>& Forward::prefill(const std::vector<std::uint32_t>& prompt) { return impl_->prefill(prompt); }
 Forward::~Forward() {
     if (impl_ && impl_->s) {

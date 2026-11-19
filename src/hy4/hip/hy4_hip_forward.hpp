@@ -100,6 +100,7 @@ public:
     [[nodiscard]] std::span<const std::uint32_t> rows_greedy() const noexcept;
     [[nodiscard]] const std::vector<float>& rows_logits() const noexcept;
     void commit_rows(std::uint32_t k);
+    void set_rows_expert_union(bool on) noexcept;  // routed experts of a window read once (bitwise); A/B aid of the bench
 
     void set_timing(bool on) noexcept;  // per-stage device sync for StepTimes (a first-receipt aid, not a tuned path)
     [[nodiscard]] const StepTimes& times() const noexcept;
