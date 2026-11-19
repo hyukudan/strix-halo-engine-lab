@@ -23,6 +23,7 @@
 // Fragments are loaded straight from global memory (both layouts are fragment-ordered: 8 B per lane, 128 B per tile
 // and k unit), one unit ahead.
 // Limits (callers check supported()): in % 128 == 0, in <= iu4a4_rot::kMaxInputs, n % 16 == 0; quantise: x_stride % 4 == 0.
+// The GEMM copies codes, steps and u in 16 B pieces: Act / Weights buffers start 16 B aligned (as hipMalloc returns).
 #include "f16_dense_tall.hpp"
 #include "iu4a4_rot.hpp"
 #include <hip/hip_runtime.h>
@@ -73,7 +74,8 @@ using I2 = int __attribute__((ext_vector_type(2)));
 using I8 = int __attribute__((ext_vector_type(8)));
 using F4 = float __attribute__((ext_vector_type(4)));
 __device__ __forceinline__ float fmax_(float a, float o) { return o > a ? o : a; }
-typedef const __attribute__((address_space(1))) I2 GI2;
+using I4 = int __attribute__((ext_vector_type(4)));
+typedef const __attribute__((address_space(1))) I4 GI4;
 typedef const __attribute__((address_space(1))) F4 GF4;
 typedef const __attribute__((address_space(1))) std::uint32_t GU32;
 
@@ -273,42 +275,62 @@ __global__ __launch_bounds__(256) void requantise_kernel(const std::uint8_t* __r
     step[step_index(b, col, n)] = rot::requantise_codes(pack, scales, in, n, col, b, dst);
 }
 
+// GEMM main loop. The CTA stages each 128-input block of its 8 W tiles and 8 x tiles in LDS (2 KB per K16 unit:
+// W tiles then x tiles, 128 B each = the global fragment layout, so a piece is one 16 B copy), double buffered: the
+// block b + 1 copy is loaded at the start of block b and stored after it, one barrier per block. The block's side data
+// rides in the same copy (side area: the 8 W tiles' steps, 64 B each, then the 8 x tiles' u, 64 B each), so no global
+// latency sits inside the barrier-synchronised block (measured: global side loads there cost ~25 %). Waves read their
+// fragments with ds_load_b64 from two base registers + immediate offsets (no per-fragment address arithmetic), one
+// unit ahead. The arithmetic per group / block is the contract's (iu4a4_rot::dot), unchanged.
+inline constexpr unsigned kUnitBytes = 2048U, kCodeBytes = 8U * kUnitBytes, kSideBytes = 1024U, kBlockBytes = kCodeBytes + kSideBytes;
+static_assert(kCtaTilesN == 8U && kCtaTilesM == 8U, "a staged unit holds 8 W tiles and 8 x tiles (64 x 16 B per side)");
 template <class Cols, class Store>
 __global__ __launch_bounds__(256) void gemm_kernel(Weights w, Act a, Cols cols, Store store) {
-    const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x >> 5U, l16 = lane & 15U, hi = lane >> 4U;
+    __shared__ __attribute__((aligned(16))) std::uint8_t lds[2U * kBlockBytes];
+    const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5U, l16 = lane & 15U, hi = lane >> 4U;
     const unsigned ntiles = f16_dense_tall::detail::uni(w.n) / 16U, mp = padded_rows(f16_dense_tall::detail::uni(a.rows)), mtiles = mp / 16U;
     const unsigned in = f16_dense_tall::detail::uni(w.in), blocks = in / rot::kBlock;
-    const unsigned nt0 = blockIdx.y * kCtaTilesN + (wave % kWavesN) * kTw, mt0 = blockIdx.x * kCtaTilesM + (wave / kWavesN) * kTm;
-    if (mt0 >= mtiles) return;  // no live x tile (no barrier in this kernel)
+    const unsigned wn = wave % kWavesN, wm = wave / kWavesN;
+    const unsigned nt0 = blockIdx.y * kCtaTilesN + wn * kTw, mt0 = blockIdx.x * kCtaTilesM + wm * kTm;
+    const bool live = mt0 < mtiles;  // a wave without a live x tile still copies and meets the barriers
     unsigned nt[kTw], mt[kTm];
 #pragma unroll
     for (unsigned i = 0; i < kTw; ++i) nt[i] = nt0 + i < ntiles ? nt0 + i : ntiles - 1U;  // dead tiles read a live one
 #pragma unroll
     for (unsigned i = 0; i < kTm; ++i) mt[i] = mt0 + i < mtiles ? mt0 + i : mtiles - 1U;
-    // Global (not flat) pointers: a flat load also counts in lgkmcnt, which only drains to 0, so every wait for a
-    // fragment would also wait for the prefetch issued after it.
-    const GI2* wp = (const GI2*)w.codes;
-    const GI2* xp = (const GI2*)a.codes;
-    const GF4* sp = (const GF4*)w.step;
-    const GU32* up = (const GU32*)a.u;
-    // Fragment index of (unit ku, tile t): (ku * tiles + t) * 16 + l16; per unit the offsets grow by tiles * 16.
-    const std::size_t wstride = std::size_t(ntiles) * 16U, xstride = std::size_t(mtiles) * 16U;
+    // Copy role: piece q of a block = unit 2 q + (tid >> 7); waves 0-1 / 4-5 copy W, 2-3 / 6-7 copy x; 16 B at tid % 64.
+    const unsigned side = (tid >> 6U) & 1U, piece = tid & 63U, cu = tid >> 7U;
+    const unsigned stiles = side == 0U ? ntiles : mtiles, cbase = side == 0U ? blockIdx.y * kCtaTilesN : blockIdx.x * kCtaTilesM;
+    const unsigned ctile = cbase + (piece >> 3U) < stiles ? cbase + (piece >> 3U) : stiles - 1U;
+    const std::size_t ustride = std::size_t(stiles) * 8U;  // one K16 unit of this side, in 16 B pieces
+    const GI4* src = (side == 0U ? (const GI4*)w.codes : (const GI4*)a.codes) + std::size_t(cu) * ustride + std::size_t(ctile) * 8U + (piece & 7U);
+    const unsigned dst = cu * kUnitBytes + side * 1024U + piece * 16U;
+    // Side copy (waves 0-1): piece p < 32: steps of W tile p / 4 (16 floats = 4 pieces); p >= 32: u of x tile (p - 32) / 4.
+    const bool scopy = tid < 64U;
+    const unsigned sq = tid & 31U, sstile = (tid < 32U ? blockIdx.y * kCtaTilesN : blockIdx.x * kCtaTilesM) + (sq >> 2U);
+    const unsigned slim = tid < 32U ? ntiles : mtiles, stc = sstile < slim ? sstile : slim - 1U;
+    const std::size_t sstride = tid < 32U ? std::size_t(ntiles) * 4U : std::size_t(mp) / 4U;  // one block, in 16 B
+    const GI4* ssrc = (tid < 32U ? (const GI4*)w.step : (const GI4*)a.u) + std::size_t(stc) * 4U + (sq & 3U);
+    I4 stg[4], sstg = {0, 0, 0, 0};
+    const auto fetch = [&](unsigned b) __attribute__((always_inline)) {
+#pragma unroll
+        for (unsigned q = 0; q < 4U; ++q) stg[q] = src[(std::size_t(b) * 8U + 2U * q) * ustride];
+        if (scopy) sstg = ssrc[std::size_t(b) * sstride];
+    };
+    const auto put = [&](unsigned buf) __attribute__((always_inline)) {
+#pragma unroll
+        for (unsigned q = 0; q < 4U; ++q) *reinterpret_cast<I4*>(lds + buf * kBlockBytes + dst + q * 2U * kUnitBytes) = stg[q];
+        if (scopy) *reinterpret_cast<I4*>(lds + buf * kBlockBytes + kCodeBytes + tid * 16U) = sstg;
+    };
     float acc[kTw][kTm][8];
 #pragma unroll
     for (unsigned i = 0; i < kTw; ++i)
 #pragma unroll
         for (unsigned j = 0; j < kTm; ++j)
 #pragma unroll
-            for (unsigned e = 0; e < 8U; ++e) acc[i][j][e] = 0.0f;
+            for (unsigned e = 0; e < 8U; ++e) acc[i][j][e] = 0.0F;
     const I8 zero = {0, 0, 0, 0, 0, 0, 0, 0};
-    // Two fragment sets in ping-pong (an A group = 2 units: unit 0 reads set a and fills b, unit 1 reads b and fills a).
-    I2 wa[kTw], xa[kTm], wb[kTw], xb[kTm];
-    const auto load = [&](unsigned ku, I2 (&wd)[kTw], I2 (&xd)[kTm]) __attribute__((always_inline)) {
-#pragma unroll
-        for (unsigned i = 0; i < kTw; ++i) wd[i] = wp[ku * wstride + nt[i] * 16U + l16];
-#pragma unroll
-        for (unsigned j = 0; j < kTm; ++j) xd[j] = xp[ku * xstride + mt[j] * 16U + l16];
-    };
+    I2 wa[kTw], xa[kTm], wb[kTw], xb[kTm];  // fragment sets in ping-pong (named: no ring copies)
     const auto mma = [&](const I2 (&wd)[kTw], const I2 (&xd)[kTm], I8 (&c)[kTw][kTm], bool first) __attribute__((always_inline)) {
 #pragma unroll
         for (unsigned i = 0; i < kTw; ++i)
@@ -316,41 +338,58 @@ __global__ __launch_bounds__(256) void gemm_kernel(Weights w, Act a, Cols cols, 
             for (unsigned j = 0; j < kTm; ++j)
                 c[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, wd[i], true, xd[j], first ? zero : c[i][j], false);
     };
-    const unsigned last_unit = blocks * 8U - 1U;
-    load(0U, wa, xa);
+    fetch(0U);
+    put(0U);
+    __syncthreads();
     for (unsigned b = 0; b < blocks; ++b) {
-        std::uint32_t ub[kTm];
+        const bool more = b + 1U < blocks;
+        if (more) fetch(b + 1U);
+        if (live) {
+            const I2* wl = reinterpret_cast<const I2*>(lds + (b & 1U) * kBlockBytes + wn * (kTw * 128U) + l16 * 8U);
+            const I2* xl = reinterpret_cast<const I2*>(lds + (b & 1U) * kBlockBytes + 1024U + wm * (kTm * 128U) + l16 * 8U);
+            const auto load = [&](unsigned k, I2 (&wd)[kTw], I2 (&xd)[kTm]) __attribute__((always_inline)) {
 #pragma unroll
-        for (unsigned j = 0; j < kTm; ++j) ub[j] = up[std::size_t(b) * mp + mt[j] * 16U + l16];
-        I8 t[kTw][kTm];
+                for (unsigned i = 0; i < kTw; ++i) wd[i] = wl[(k * kUnitBytes + i * 128U) / 8U];
 #pragma unroll
-        for (unsigned g = 0; g < rot::kGroupsPerBlock; ++g) {
-            const unsigned ku = b * 8U + g * 2U;
-            I8 c[kTw][kTm];
-            load(ku + 1U, wb, xb);
-            mma(wa, xa, c, true);
-            load(ku + 1U < last_unit ? ku + 2U : ku + 1U, wa, xa);  // the last unit reloads itself
-            mma(wb, xb, c, false);
+                for (unsigned j = 0; j < kTm; ++j) xd[j] = xl[(k * kUnitBytes + j * 128U) / 8U];
+            };
+            const std::uint8_t* sd = lds + (b & 1U) * kBlockBytes + kCodeBytes;
+            std::uint32_t ub[kTm];
 #pragma unroll
-            for (unsigned j = 0; j < kTm; ++j) {
-                const int ug = static_cast<int>((ub[j] >> (8U * g)) & 255U);
+            for (unsigned j = 0; j < kTm; ++j) ub[j] = reinterpret_cast<const std::uint32_t*>(sd + 512U + (wm * kTm + j) * 64U)[l16];
+            I8 t[kTw][kTm];
+            load(0U, wa, xa);
 #pragma unroll
-                for (unsigned i = 0; i < kTw; ++i)
+            for (unsigned g = 0; g < rot::kGroupsPerBlock; ++g) {
+                I8 c[kTw][kTm];
+                load(2U * g + 1U, wb, xb);
+                mma(wa, xa, c, true);
+                if (g + 1U < rot::kGroupsPerBlock) load(2U * g + 2U, wa, xa);
+                mma(wb, xb, c, false);
 #pragma unroll
-                    for (unsigned e = 0; e < 8U; ++e) t[i][j][e] = g == 0U ? __mul24(ug, c[i][j][e]) : __mul24(ug, c[i][j][e]) + t[i][j][e];
+                for (unsigned j = 0; j < kTm; ++j) {
+                    const int ug = static_cast<int>((ub[j] >> (8U * g)) & 255U);
+#pragma unroll
+                    for (unsigned i = 0; i < kTw; ++i)
+#pragma unroll
+                        for (unsigned e = 0; e < 8U; ++e) t[i][j][e] = g == 0U ? __mul24(ug, c[i][j][e]) : __mul24(ug, c[i][j][e]) + t[i][j][e];
+                }
+            }
+#pragma unroll
+            for (unsigned i = 0; i < kTw; ++i) {
+                const F4* sb = reinterpret_cast<const F4*>(sd + (wn * kTw + i) * 64U + hi * 32U);
+                const F4 s0 = sb[0], s1 = sb[1];
+#pragma unroll
+                for (unsigned j = 0; j < kTm; ++j)
+#pragma unroll
+                    for (unsigned e = 0; e < 8U; ++e)
+                        acc[i][j][e] = __builtin_fmaf(static_cast<float>(t[i][j][e]), e < 4U ? s0[e] : s1[e - 4U], acc[i][j][e]);
             }
         }
-#pragma unroll
-        for (unsigned i = 0; i < kTw; ++i) {
-            const GF4* s = sp + ((std::size_t(b) * ntiles + nt[i]) * 2U + hi) * 2U;
-            const F4 s0 = s[0], s1 = s[1];
-#pragma unroll
-            for (unsigned j = 0; j < kTm; ++j)
-#pragma unroll
-                for (unsigned e = 0; e < 8U; ++e)
-                    acc[i][j][e] = __builtin_fmaf(static_cast<float>(t[i][j][e]), e < 4U ? s0[e] : s1[e - 4U], acc[i][j][e]);
-        }
+        if (more) put((b + 1U) & 1U);
+        __syncthreads();
     }
+    if (!live) return;  // after the last barrier
     store.run([&](auto& s) __attribute__((always_inline)) {
 #pragma unroll
         for (unsigned j = 0; j < kTm; ++j) {
