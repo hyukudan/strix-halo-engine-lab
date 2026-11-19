@@ -86,7 +86,18 @@ contract = 'qwen-cuda;prefill=exact'
 if any(forms.values()):
     contract = ('qwen-cuda;prefill=fast;forms=' + (','.join(n for n in names if forms[n]) or 'none')
                 + ';moe_route_bf16=' + str(int(forms['moe_route_bf16'])) + (';ids=' + form_ids if form_ids else ''))
-if expert != 'incumbent':
+regime = c.get('expert_regime')  # per-regime experts (TURBO nested on FAST); absent: one expert arithmetic everywhere
+if regime is not None:
+    # expert_arithmetic on prefill blocks of >= N rows, the narrow arithmetic on every window and smaller block; the
+    # contract carries the rule in brackets (qwen_options.hpp with_expert_arithmetic). Each field must agree with the rule.
+    n = regime.get('prefill_blocks_min_rows') if isinstance(regime, dict) else None
+    narrow = regime.get('windows_and_smaller_blocks') if isinstance(regime, dict) else None
+    if (type(n) is not int or n < 1 or expert == 'incumbent' or regime.get('prefill_blocks') != expert
+            or type(narrow) is not str or not narrow or narrow == expert
+            or regime.get('rule') != f'prefill_rows>={n}:{expert},else:{narrow}'):
+        raise SystemExit('invalid expert_regime')
+    contract += '+experts[' + regime['rule'] + ']'
+elif expert != 'incumbent':
     contract += '+' + expert
 fast = contract != 'qwen-cuda;prefill=exact'
 candidate = sys.argv[2] in ('fast', 'turbo')  # the arm compared against exact
