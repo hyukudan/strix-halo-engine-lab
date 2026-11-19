@@ -5078,6 +5078,23 @@ One word selects every FAST lever qualified for the run's regime (weights source
 - **Measured gain:** none of its own (selection only): the levers' figures apply, e.g. FAST4 + chunk16 at 8K 13,437-13,714 tok/s; split-K FAST on the spec CLI below.
 - **Implementation / evidence:** [profile table](../include/strix/profiles/qwen_dense_cuda.hpp), [toggles](toggles.md#profiles-exact-vs-fast)
 
+<a id="qwen-rtx-commit-async"></a>
+
+### Asynchronous decode commit tail
+
+**Engine:** `qwen-rtx`. **Control:** `STRIX_QRTX_COMMIT_ASYNC`. **Default:** off (`0`) until its timing receipt.
+
+After a verify window the decode commit (recurrent-state replay of the accepted rows, conv rollback, MTP cache rows)
+used to end with a stream synchronisation. With the switch on the commit returns once its work is queued; the draft
+queues behind it, the next verify window synchronises first, and the host does its between-step work meanwhile.
+
+- **Preconditions:** CUDA Qwen MoE decode (`strix-cuda-qwen-serve`).
+- **Automatic selection:** none.
+- **Exactness evidence:** Scheduling only: the same launches in the same order on one stream, host synchronisations removed; the commit tail reads no pinned host input, and every reader that rewrites pinned inputs synchronises first (host test of the shared protocol). Emitted ids, logits and state bits unchanged by construction. A device fault in the tail surfaces at the next synchronisation and fails that step.
+- **Off switch:** `STRIX_QRTX_COMMIT_ASYNC=0` (the default).
+- **Measured gain:** Not yet measured.
+- **Implementation / evidence:** [shared protocol](../include/strix/spec/commit_tail.hpp), [CUDA binding](../src/cuda/models/qwen/qwen_prefill_driver.cu), [backend notes](engine/cuda-backend.md)
+
 <a id="qwen-dense-cuda-splitk-fast"></a>
 
 ### Qwen dense 27B CUDA NVFP4 GEMV split-K FAST (`nvfp4-splitk-fast-v1`)
