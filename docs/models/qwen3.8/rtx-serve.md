@@ -89,6 +89,12 @@ host RAM, LRU-evicted; row segments are shared between checkpoints of the same p
   never fails because of the cache.
 - **Tuning:** `--prefix-cache-block T` (default 256), `--prefix-cache-stride S` (default 16384, 0 = only the last
   block boundary; a multiple of T).
+- **Root mark (opt-in, not yet measured on device):** `--prefix-cache-root on` also checkpoints the last block boundary
+  inside the request's system prompt + tools (the leading system messages and tools rendered alone, when their tokens
+  begin the prompt), so a new conversation with the same system prompt and tools resumes there instead of at the
+  nearest stride multiple (0 below 16,384 tokens). One extra checkpoint per distinct prefix; restored state stays
+  bit-identical (a block-aligned checkpoint like the others). The positions come from the shared mark plan
+  (`include/strix/session/mark_plan.hpp`).
 - **Reporting:** `usage.prompt_tokens_details.cached_tokens` is the number of restored tokens. The `strix.rtx`
   receipt adds `prefix_cached`, `prefix_restore_ms` and `prefix_capture_ms`. `GET /v1/cache/stats` and the
   `prefix_cache` object of `/api/status` report lookups, hits, captures, bytes, evictions, capture time and the
