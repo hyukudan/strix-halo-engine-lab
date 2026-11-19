@@ -3,7 +3,7 @@
 // A declaration is DATA: a table of StageDecl (per layer template, plus the stages before the first and after the last
 // layer), the per-layer trait words, and the pack's format rules. From it the shared planners derive, with no model
 // code: the launch plan (launch_plan.hpp: today's launch list in check mode, the fused plan) and the rows forms
-// (rows_plan.hpp: step, verify(R), window). Nothing here executes; an executor binds Launch entries (later package).
+// (rows_plan.hpp: step, verify(R), window). Nothing here executes; an executor binds Launch entries.
 // Home: shared (host shared / plan). src/model_graph keeps the description role and converts into this
 // (src/model_graph/stage_bridge.hpp to_stage_graph).
 #include <cstdint>
@@ -71,7 +71,7 @@ struct StageDecl {
     std::string_view in[4] = {};
     std::string_view out = {};
     Operand operand{};
-    std::string_view numeric = {};  // numeric contract name (contract types: package W1-2)
+    std::string_view numeric = {};  // numeric contract name
     Rows rows = Rows::per_row;
     Split split = Split::none;
     std::uint8_t leaves = 0;     // 0 or 4 (canonical partial tree)

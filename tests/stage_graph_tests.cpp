@@ -32,7 +32,7 @@ namespace t = strix::graph::trait;
 
 // Qwen 27B dense decode layer (src/qwen35/hip/engine.hip decode loop): GDN layers project xn to {qkv, z} (IU4), beta,
 // alpha (48 outputs: not an IU4 shape); gated attention layers to {q (+gate), k, v}; the MLP to {gate, up}, down.
-// Fixture until the qwen35 owner moves it into the family directory. Only the projection part is declared in full;
+// Test fixture (not the family's declaration). Only the projection part is declared in full;
 // the recurrent / attention bodies are one stage each.
 constexpr StageDecl kQwenLayer[] = {
     {.id = "attn_norm", .op = Op::norm, .entry = "rmsnorm_fused", .site = "attn", .in = {"x"}, .out = "xn", .reduce = true},
@@ -161,6 +161,52 @@ void contracts() {
     check(p.launches.size() == 2U && p.launches[0].stages.size() == 1U && p.launches[1].stages.size() == 2U &&
               p.launches[1].prologue.size() == 1U,
           "fused: no group across a rewritten input; b + c grouped with n2 as prologue");
+    // A stage moved into an earlier launch must not reorder a write of its output name: b (same input as a) would join
+    // a's launch and write t twice there, and the prologue n of c would read b's t.
+    static constexpr StageDecl ww[] = {
+        {.id = "a", .op = Op::linear, .in = {"x"}, .out = "t", .operand = weights("wa", 64, 64)},
+        {.id = "n", .op = Op::norm, .in = {"t"}, .out = "u", .reduce = true},
+        {.id = "c", .op = Op::linear, .in = {"u"}, .out = "y", .operand = weights("wc", 64, 64)},
+        {.id = "b", .op = Op::linear, .in = {"x"}, .out = "t", .operand = weights("wb", 64, 64)},
+    };
+    g.layer = ww;
+    const auto p1 = launch_plan(g, 0U, 1U, {.mode = Fusion::fused});
+    check(p1.launches.size() == 3U && p1.launches[0].stages.size() == 1U && p1.launches[1].prologue.size() == 1U &&
+              p1.launches[2].stages.size() == 1U && p1.instances[p1.launches[2].stages[0]].decl->id == "b",
+          "fused: a second writer of one name opens its own launch");
+    // An epilogue folded into an earlier launch must not overwrite a name a later-placed launch still reads.
+    static constexpr StageDecl war[] = {
+        {.id = "a", .op = Op::linear, .in = {"x"}, .out = "y", .operand = weights("wa", 64, 64)},
+        {.id = "b", .op = Op::linear, .in = {"o"}, .out = "z", .operand = weights("wb", 64, 64)},
+        {.id = "e", .op = Op::elementwise, .in = {"y"}, .out = "o"},
+    };
+    g.layer = war;
+    const auto p2 = launch_plan(g, 0U, 1U, {.mode = Fusion::fused});
+    check(p2.launches.size() == 3U && p2.launches[0].epilogue.empty(), "fused: no epilogue fold over a pending reader of its output");
+    // Adjacent norm chains share a launch only when EVERY input comes from before it (n2 reads p, written by n1's launch).
+    static constexpr StageDecl nn[] = {
+        {.id = "l", .op = Op::linear, .in = {"x"}, .out = "h", .operand = weights("wl", 64, 64)},
+        {.id = "n1", .op = Op::norm, .in = {"h"}, .out = "p", .reduce = true},
+        {.id = "n2", .op = Op::norm, .in = {"z", "p"}, .out = "r", .reduce = true},
+        {.id = "e1", .op = Op::elementwise, .in = {"p"}, .out = "q"},
+        {.id = "e2", .op = Op::elementwise, .in = {"r"}, .out = "s"},
+    };
+    g.layer = nn;
+    const auto p3 = launch_plan(g, 0U, 1U, {.mode = Fusion::fused});
+    check(p3.launches.size() == 3U && p3.launches[1].stages.size() == 1U && p3.launches[2].stages.size() == 1U,
+          "fused: a norm reading the previous norm's output opens its own launch");
+    // A reduction whose input is rewritten before its consumer cannot be deferred into that consumer's prologue.
+    static constexpr StageDecl cl[] = {
+        {.id = "a", .op = Op::linear, .in = {"x"}, .out = "t", .operand = weights("wa", 64, 64)},
+        {.id = "n", .op = Op::norm, .in = {"t"}, .out = "u", .reduce = true},
+        {.id = "b", .op = Op::linear, .in = {"w"}, .out = "t", .operand = weights("wb", 64, 64)},
+        {.id = "c", .op = Op::linear, .in = {"u"}, .out = "y", .operand = weights("wc", 64, 64)},
+    };
+    g.layer = cl;
+    const auto p4 = launch_plan(g, 0U, 1U, {.mode = Fusion::fused});
+    bool no_prologue = true;
+    for (const auto& l : p4.launches) no_prologue = no_prologue && l.prologue.empty();
+    check(p4.launches.size() == 4U && no_prologue, "fused: no prologue across a rewrite of the reduction's input");
 }
 
 void rows() {

@@ -115,15 +115,45 @@ private:
     bool prologue_capable(std::uint32_t i) const {
         const auto b = d(i).out;
         bool any = false;
+        bool clobbered = false;
         for (std::size_t j = i + 1U; j < p_.instances.size(); ++j) {
             const auto& c = *p_.instances[j].decl;
             if (reads(c, b)) {
+                // A prologue re-reads the reduction's inputs at its consumer: refuse when one was rewritten in between.
+                if (clobbered) return false;
                 any = true;
                 if (!(c.op == Op::linear || c.op == Op::head || seam_head(c))) return false;
             }
             if (c.out == b) break;
+            if (reads(d(i), c.out)) clobbered = true;
         }
         return any;
+    }
+    // Value b is readable by a stage placed in launch k: as a main stage (producer strictly earlier) or as an epilogue
+    // (k's own stages may produce it). A pending reduction runs as k's prologue: its inputs must come from before k.
+    bool available(std::string_view b, int k, bool epilogue) const {
+        if (b.empty()) return true;
+        const int p = producer(b);
+        if (p == kPending) {
+            for (const auto x : d(static_cast<std::uint32_t>(writer(b))).in)
+                if (!available(x, k, false)) return false;
+            return true;
+        }
+        return epilogue ? p <= k : p < k;
+    }
+    bool available_all(std::uint32_t i, int k, bool epilogue) const {
+        return std::all_of(std::begin(d(i).in), std::end(d(i).in), [&](std::string_view b) { return available(b, k, epilogue); });
+    }
+    // Placing stage i in launch k moves its write ahead of every stage already placed in k or later (pending reductions
+    // run later, as prologues): refuse when one of them reads or writes the same name.
+    bool out_free(std::uint32_t i, int k) const {
+        const auto b = d(i).out;
+        if (b.empty()) return true;
+        for (std::uint32_t j = 0; j < i; ++j) {
+            const int o = owner_[j];
+            if ((o == kPending || o >= k) && (d(j).out == b || reads(d(j), b))) return false;
+        }
+        return true;
     }
     // Inputs written by two different linear members of one grouped launch: not tile-local.
     bool split_inputs(std::uint32_t i) const {
@@ -152,10 +182,7 @@ private:
                 if (d(h).op != Op::linear || d(h).in[0] != s.in[0] || p_.instances[h].format != in.format ||
                     head_src_[static_cast<std::size_t>(k)] != writer(s.in[0]))
                     continue;  // a different value in the same buffer name is a different input
-                bool ready = true;
-                for (const auto b : s.in)
-                    if (!b.empty() && producer(b) >= k) ready = false;
-                if (!ready) continue;
+                if (!available_all(i, k, false) || !out_free(i, k)) continue;
                 join(i, k, &Launch::stages);
                 return prologues(i);
             }
@@ -170,7 +197,7 @@ private:
             }
             const int k = back();
             if (s.op == Op::norm && k >= 0 && d(p_.launches[static_cast<std::size_t>(k)].stages.front()).op == Op::norm &&
-                p_.launches[static_cast<std::size_t>(k)].layer == in.layer && producer(s.in[0]) < k) {
+                p_.launches[static_cast<std::size_t>(k)].layer == in.layer && available_all(i, k, false) && out_free(i, k)) {
                 join(i, k, &Launch::stages);  // adjacent independent vector chains: one launch
                 return prologues(i);
             }
@@ -181,7 +208,8 @@ private:
             int last = kNone;
             for (const auto b : s.in)
                 if (!b.empty()) last = std::max(last, producer(b));
-            if (last >= 0 && kernel_op(d(p_.launches[static_cast<std::size_t>(last)].stages.front()).op)) {
+            if (last >= 0 && kernel_op(d(p_.launches[static_cast<std::size_t>(last)].stages.front()).op) &&
+                available_all(i, last, true) && out_free(i, last)) {
                 join(i, last, &Launch::epilogue);
                 return prologues(i);
             }
