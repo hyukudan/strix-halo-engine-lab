@@ -102,6 +102,9 @@ struct EngineOptions {
     cuda_core::FlashTail flash_tail = cuda_core::FlashTail::split;
     // attn8: e4m3 flash attention over an e4m3 shadow of the KV cache (bit-changing, own identity suffix "-a8"; FAST gate required).
     bool prefill_attn8 = false;
+    // decode_attn8: decode / verify attention on e4m3 tensor cores over the same e4m3 shadow (cuda_core attention_decode8; FAST class
+    // d8, bit-changing vs BF16 attention_decode, own identity suffix "-d8"; opt-in until its quality gate passes). Main session only.
+    bool decode_attn8 = false;
     // Resident expanded prefill operands (strix/cuda_core/operand_cache_plan.hpp, shared dense_big core): each NVFP4 / q8_0 weight
     // is expanded into its MMA operand once per engine instead of once per chunk, slot and request. Bitwise neutral (same bytes,
     // same kernel). auto = FAST8 e4m3 operands only (the measured per-call cost), on = also the exact f16 / q8 operands; both
@@ -122,10 +125,11 @@ struct EngineOptions {
     static const char* pf_names[] = {"exact", "flash", "fast", "fast2", "fast8", "fast4"};
     const std::string a = names[static_cast<unsigned>(o.dense_arithmetic)];
     // a non-exact prefill policy is a different arithmetic identity (prefix caches never mix them)
-    const std::string pf = o.prefill_arith == PrefillArith::exact
-        ? ""
+    // decode_attn8 changes the decode bits and so every later K/V row: its own suffix (FAST class d8, never an exact identity)
+    const std::string pf = (o.prefill_arith == PrefillArith::exact
+        ? std::string()
         : std::string("-pf-") + pf_names[static_cast<unsigned>(o.prefill_arith)] + (o.prefill_attn8 ? "-a8" : "") +
-              (o.prefill_gdn == PrefillGdn::chunk16 ? "-gdnc16" : "");
+              (o.prefill_gdn == PrefillGdn::chunk16 ? "-gdnc16" : "")) + (o.decode_attn8 ? "-d8" : "");
     if (o.turbo_weights == TurboWeights::off) return "qwen35-cuda-exact-" + a + "-v1" + pf;
     // the FAST split policy changes the NVFP4 GEMV summation order (decode, verify and the exact prefill's split ranges)
     const std::string sk = o.nvfp4_split == split_k::Profile::fast ? "-skf1" : "";
@@ -214,6 +218,15 @@ public:
                         std::uint32_t pos, bool want_top = true);
     void mtp_feed_put(std::uint32_t slot, const std::uint32_t* top_dev);  // slot = *top_dev (async, device to device)
     void mtp_feed_read(std::uint32_t n, std::uint32_t* host) const;       // host[0..n) = slots 0..n-1 (synchronizes)
+    // Verify pre-launch (strix/spec/block_drafter.hpp): mtp_feed_read_async(n) queues the copy of slots 0..n-1 to pinned
+    // host staging (no wait); mtp_feed_wait(n, host) waits for THAT copy only (not for work queued after it).
+    void mtp_feed_read_async(std::uint32_t n);
+    void mtp_feed_wait(std::uint32_t n, std::uint32_t* host);
+    // forward_rows whose first nhost row ids are host values (host_ids) and whose next k rows take their ids on the device
+    // from feed slots slot[j] (or host_vals[j] when slot[j] == strix::spec::DraftFeed::kHost = 0xFFFFFFFF). Same graph,
+    // same operands as forward_rows(tokens) with tokens = host ids + the feed ids; nothing is read or waited for.
+    RowsOut forward_rows_fed(const std::uint32_t* host_ids, std::uint32_t nhost, const std::uint32_t* slot,
+                             const std::uint32_t* host_vals, std::uint32_t k, LogitRows want = LogitRows::all);
     // Draft-only MTP head over a vocabulary subset (strix/spec/draft_rows.hpp, group 16 = one NVFP4 tile of the head):
     // before each head launch the engine copies the rows' new tiles into a compact head (device-to-device, no
     // re-quantisation) and maps the argmax back to token ids on the device, so MtpOut::top stays a token id. MtpOut::logits

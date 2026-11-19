@@ -85,11 +85,26 @@ using HcSub = hcc::SubSum;
 // Only the collapse site and the separate expansion take the terms (enqueue_hc_site routes them there): the other site
 // kernels see constant null terms, so the branch folds away and their code stays the stored-sub form (a runtime branch
 // there raised hc_site_fast_kernel to 175 VGPRs).
+// Canonical-input specialization for the existing non-collapse site kernels. Unlike HcSub's
+// optional terms this form has no per-element pointer branch; dispatch selects it once.
+struct HcCanonicalSub {
+    const float* __restrict__ p;
+    const float* __restrict__ low;
+    const float* __restrict__ high;
+    __device__ __forceinline__ float operator[](std::size_t i) const { return (p[i] + low[i]) + high[i]; }
+    __device__ __forceinline__ explicit operator bool() const { return p != nullptr; }
+};
+// Incumbent stored-input site kernels keep constant-null terms; canonical-input non-collapse
+// sites use a separate compile-time input policy, avoiding a per-element runtime branch.
 __host__ __device__ inline HcSub hc_sub(const HcSiteView& v) { return HcSub{v.sub, v.sub_low, v.sub_high}; }
 __host__ __device__ inline HcSub hc_sub_stored(const HcSiteView& v) { return HcSub{v.sub, nullptr, nullptr}; }
+template <bool Terms> __host__ __device__ inline auto hc_site_sub(const HcSiteView& v) {
+    if constexpr (Terms) return HcCanonicalSub{v.sub, v.sub_low, v.sub_high};
+    else return hc_sub_stored(v);
+}
 
 // All copies of element i of row r: expanded (sub not null) or read from the stored stream.
-__device__ __forceinline__ void site_copies(HcSub sub, const float* __restrict__ residual,
+__device__ __forceinline__ void site_copies(auto sub, const float* __restrict__ residual,
                                             const HcMix* __restrict__ em, const float* __restrict__ stream, unsigned r, unsigned i,
                                             unsigned hidden, float* e) {
     const std::size_t row = static_cast<std::size_t>(r) * hc_copies * hidden;
@@ -277,7 +292,7 @@ __global__ __launch_bounds__(1024) void norm_split_kernel(NormView v) {
 constexpr unsigned site_waves = 8, site_mixes = hc_mix_count / site_waves, site_unroll = 10;
 static_assert(site_waves * site_mixes == hc_mix_count, "three mixes per wave");
 
-__device__ __forceinline__ void site_partial_row(HcSub sub, const float* __restrict__ residual,
+__device__ __forceinline__ void site_partial_row(auto sub, const float* __restrict__ residual,
                                                  const HcMix* __restrict__ em, float* __restrict__ stream,
                                                  const std::uint16_t* __restrict__ fn, float* __restrict__ partial, unsigned hidden,
                                                  unsigned chunks, unsigned c, unsigned r) {
@@ -312,7 +327,7 @@ __device__ __forceinline__ void site_partial_row(HcSub sub, const float* __restr
     }
 }
 
-__device__ __forceinline__ void site_body(const HcSiteView& v, HcSub sub, const float* __restrict__ residual,
+__device__ __forceinline__ void site_body(const HcSiteView& v, auto sub, const float* __restrict__ residual,
                                           const HcMix* __restrict__ em, float* __restrict__ stream, const std::uint16_t* __restrict__ fn,
                                           float* __restrict__ partial, std::uint32_t* __restrict__ counters,
                                           const HcMix* __restrict__ cm, float* __restrict__ out, std::int8_t* __restrict__ codes,
@@ -376,9 +391,10 @@ __device__ __forceinline__ void site_body(const HcSiteView& v, HcSub sub, const 
         }
     }
 }
+template <bool Terms = false>
 __global__ __launch_bounds__(32 * site_waves) void hc_site_kernel(HcSiteView v, unsigned mix_chunks, unsigned partial_blocks,
                                                                   unsigned norm_chunks) {
-    site_body(v, hc_sub_stored(v), v.residual, v.expand_mixes, v.stream, v.fn, v.partial, v.counters, v.collapse_mixes, v.out, v.codes, v.deltas,
+    site_body(v, hc_site_sub<Terms>(v), v.residual, v.expand_mixes, v.stream, v.fn, v.partial, v.counters, v.collapse_mixes, v.out, v.codes, v.deltas,
               v.sums, mix_chunks, partial_blocks, norm_chunks);
 }
 
@@ -521,7 +537,7 @@ __device__ __forceinline__ void mix_final_fast_wave(const float* __restrict__ pa
 
 // Value e (< chunk) of the stream chunk at c0 of row r: expanded (as copy_value) or read from the stored stream.
 template <bool Expand>
-__device__ __forceinline__ float site_stream_value(HcSub sub, const float* __restrict__ residual,
+__device__ __forceinline__ float site_stream_value(auto sub, const float* __restrict__ residual,
                                                    const HcMix* __restrict__ em, const float* __restrict__ srow, unsigned r,
                                                    unsigned kc, unsigned i, unsigned hidden, unsigned e) {
     if constexpr (Expand) return hcc::copy_value<hc_spec>(sub, residual, em, r, kc, i, hidden);
@@ -539,7 +555,7 @@ __device__ __forceinline__ float site_stream_value(HcSub sub, const float* __res
 // (copy_value's expressions, ascending j, so the same bits) into its own LDS slice before the copies' dots; without
 // it each copy's chunk re-reads all the residual copies and sub (4x the loads, the previous form).
 template <bool Expand, bool Mix, unsigned G, bool Collapse = false, bool Once = false>
-__device__ __forceinline__ void site_fast_partial(const HcSiteView& v, HcSub sub, const float* __restrict__ residual,
+__device__ __forceinline__ void site_fast_partial(const HcSiteView& v, auto sub, const float* __restrict__ residual,
                                                   const HcMix* __restrict__ em, float* __restrict__ stream,
                                                   const std::uint16_t* __restrict__ fn, float* __restrict__ partial,
                                                   std::uint32_t* __restrict__ counters, unsigned mix_chunks, float* lds,
@@ -688,7 +704,7 @@ __device__ __forceinline__ void site_fast_partial(const HcSiteView& v, HcSub sub
 // groups over the 8 waves.
 constexpr unsigned site_norm_part_max = 8, site_norm_groups_max = site_norm_part_max * chunk_k / site_waves;
 template <bool Expand>
-__device__ __forceinline__ void site_fast_norm(const HcSiteView& v, HcSub sub, const float* __restrict__ residual,
+__device__ __forceinline__ void site_fast_norm(const HcSiteView& v, auto sub, const float* __restrict__ residual,
                                                const HcMix* __restrict__ em, const float* __restrict__ stream,
                                                const HcMix* __restrict__ cm, float* __restrict__ out, std::int8_t* __restrict__ codes,
                                                float* __restrict__ deltas, std::int32_t* __restrict__ sums_out, unsigned b,
@@ -747,7 +763,7 @@ __device__ __forceinline__ void site_fast_norm(const HcSiteView& v, HcSub sub, c
     }
 }
 
-template <bool Expand, bool Mix, unsigned G>
+template <bool Expand, bool Mix, unsigned G, bool Terms = false>
 __global__ __launch_bounds__(site_threads) void hc_site_fast_kernel(HcSiteView v, unsigned mix_chunks, unsigned partial_blocks,
                                                                     unsigned norm_chunks, unsigned norm_part) {
     // One LDS buffer for either kind of block: a partial block's tile values, a norm block's own chunks.
@@ -756,10 +772,10 @@ __global__ __launch_bounds__(site_threads) void hc_site_fast_kernel(HcSiteView v
     __shared__ float sq[32];
     __shared__ unsigned last;
     if (blockIdx.x < partial_blocks)
-        site_fast_partial<Expand, Mix, G>(v, hc_sub_stored(v), v.residual, v.expand_mixes, v.stream, v.fn, v.partial, v.counters, mix_chunks, lds,
+        site_fast_partial<Expand, Mix, G>(v, hc_site_sub<Terms>(v), v.residual, v.expand_mixes, v.stream, v.fn, v.partial, v.counters, mix_chunks, lds,
                                           last);
     else
-        site_fast_norm<Expand>(v, hc_sub_stored(v), v.residual, v.expand_mixes, v.stream, v.collapse_mixes, v.out, v.codes, v.deltas, v.sums,
+        site_fast_norm<Expand>(v, hc_site_sub<Terms>(v), v.residual, v.expand_mixes, v.stream, v.collapse_mixes, v.out, v.codes, v.deltas, v.sums,
                                blockIdx.x - partial_blocks, norm_chunks, norm_part, lds, sq);
 }
 // Expansion + mixes + the collapse with the expansion's pre (HcSiteView::collapse_out): partial blocks only.
@@ -771,7 +787,10 @@ __global__ __launch_bounds__(site_threads) void hc_site_collapse_kernel(HcSiteVi
                                                  lds, last);
 }
 using SiteFastKernel = void (*)(HcSiteView, unsigned, unsigned, unsigned, unsigned);
-template <unsigned G> SiteFastKernel site_fast_kernel(bool expand, bool mix) {
+template <unsigned G> SiteFastKernel site_fast_kernel(bool expand, bool mix, bool terms) {
+    if constexpr (G <= 4U) {
+        if (terms) return mix ? hc_site_fast_kernel<true, true, G, true> : hc_site_fast_kernel<true, false, G, true>;
+    }
     return expand ? (mix ? hc_site_fast_kernel<true, true, G> : hc_site_fast_kernel<true, false, G>)
                   : (mix ? hc_site_fast_kernel<false, true, G> : hc_site_fast_kernel<false, false, G>);
 }
@@ -2132,7 +2151,6 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
     const bool once = collapse_route.once;
     const bool one = v.launches == 1 ||
                      (v.launches == 0 && v.rows <= (fast ? hc_site_fast_one_launch_rows : hc_site_one_launch_rows));
-    require(!v.sub_low || v.collapse_out || !one, "hc site: the canonical-sum terms need the collapse site or the separate expansion");
     if (!one) {
         if (v.sub) enqueue_hc_expand(v.sub, v.residual, v.expand_mixes, v.rows, H, v.stream, stream, v.sub_low, v.sub_high);
         if (v.fn) {
@@ -2154,11 +2172,14 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
     if (!fast) {
         const unsigned partial_blocks = v.fn || v.sub ? mix_chunks * v.rows : 0U;
         const unsigned norm_blocks = v.norm_weight ? norm_chunks * v.rows : 0U;
-        hipLaunchKernelGGL(hc_site_kernel, dim3(partial_blocks + norm_blocks), dim3(wave * site_waves), 0, as_stream(stream), v, mix_chunks,
+        const auto kernel = v.sub_low ? hc_site_kernel<true> : hc_site_kernel<false>;
+        hipLaunchKernelGGL(kernel, dim3(partial_blocks + norm_blocks), dim3(wave * site_waves), 0, as_stream(stream), v, mix_chunks,
                            partial_blocks, norm_chunks);
     } else {
         // Tiles of g rows per partial block (1, 2, 4 or 8) and norm parts of `part` chunks per block (1-8).
-        const unsigned g = v.tile ? v.tile : v.rows == 1 ? 1U : v.rows == 2 ? 2U : 4U;
+        unsigned g = v.tile ? v.tile : v.rows == 1 ? 1U : v.rows == 2 ? 2U : 4U;
+        // The canonical-input G8 mix variant spills; keep rows independent and use the existing G4 geometry.
+        if (v.sub_low && g > 4U) g = 4U;
         unsigned part = v.norm_part ? v.norm_part : v.rows == 1 ? 1U : v.rows == 2 ? 2U : 4U;  // measured (cold fn, R 1-8)
         part = part < norm_chunks ? part : norm_chunks;
         const unsigned tiles = (v.rows + g - 1U) / g;
@@ -2173,10 +2194,10 @@ void enqueue_hc_site(const HcSiteView& v, void* stream) {
         const unsigned partial_blocks = v.fn || v.sub ? mix_chunks * tiles : 0U;
         const unsigned norm_blocks = v.norm_weight ? (norm_chunks + part - 1U) / part * v.rows : 0U;
         const bool expand = v.sub != nullptr, mix = v.fn != nullptr;
-        const SiteFastKernel kernel = g == 1   ? site_fast_kernel<1>(expand, mix)
-                                      : g == 2 ? site_fast_kernel<2>(expand, mix)
-                                      : g == 4 ? site_fast_kernel<4>(expand, mix)
-                                               : site_fast_kernel<8>(expand, mix);
+        const SiteFastKernel kernel = g == 1   ? site_fast_kernel<1>(expand, mix, v.sub_low != nullptr)
+                                      : g == 2 ? site_fast_kernel<2>(expand, mix, v.sub_low != nullptr)
+                                      : g == 4 ? site_fast_kernel<4>(expand, mix, v.sub_low != nullptr)
+                                               : site_fast_kernel<8>(expand, mix, v.sub_low != nullptr);
         hipLaunchKernelGGL(kernel, dim3(partial_blocks + norm_blocks), dim3(site_threads), 0, as_stream(stream), v, mix_chunks,
                            partial_blocks, norm_chunks, part);
     }

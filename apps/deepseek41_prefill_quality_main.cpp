@@ -170,7 +170,9 @@ int main(int argc,char** argv) try {
     auto transport=strix::dist::usb4_host_auto(u,nullptr);
     strix::dist::Communicator comm(strix::dist::Group{rank,2,1,0x616d647072656669ULL},std::move(transport),std::size_t(32)<<20);
     strix::deepseek41::PrefillOptions o;o.rank=rank;o.world=2;o.communicator=&comm;
-    o.max_positions=8192;o.row_split=false;o.cone=false;o.quality_head_rows=64;
+    // Sized for the longest manifest prompt (a fixed 8192 refused every 32K gate window).
+    {std::ifstream scan(argv[2]);o.max_positions=strix::deepseek41::quality::manifest_max_positions(scan);}
+    o.row_split=false;o.cone=false;o.quality_head_rows=64;
     const strix::LoaderCapture gate_capture(!gate_dir.empty());
     strix::deepseek41::DevicePrefill prefill(argv[1],o);
     const auto gate_files=strix::LoaderCapture::snapshot();

@@ -24,11 +24,13 @@
 #include <vector>
 
 #include "strix/pair/pipe.hpp"
+#include "strix/pair/stage_map.hpp"
 
 namespace strix::pair::layers {
 inline constexpr std::uint64_t seam_magic = 0x31454e4950594c53ULL;   // "SLYPINE1"
 inline constexpr std::uint64_t hidden_magic = 0x31444e4459414c53ULL; // decode hidden row
 inline constexpr std::uint64_t token_magic = 0x314e4b5459414c53ULL;  // decode token relay
+inline constexpr std::uint64_t state_magic = 0x31544154535941ULL;    // end-of-prefill state relay to the decoder
 enum Word : std::size_t { w_magic = 0, w_start = 2, w_rows = 3, w_bytes = 4, w_identity = 5, w_tokens = 6, w_cut = 7 };
 
 inline std::uint64_t fnv(std::uint64_t hash, std::span<const std::uint32_t> values) {
@@ -107,10 +109,18 @@ struct StageOps {
     std::function<void(PipeFrame& frame, bool save, std::size_t bytes)> seam;
     std::function<void()> fence;
     std::size_t row_bytes = 0;
+    // Interleaved stages (prefill over a StageMap, below): run layers [first, last) for one window; first == 0 embeds
+    // `tokens`, a later range finds its rows loaded by `seam`. Not used by the Placement form.
+    std::function<void(std::span<const std::uint32_t> tokens, const Window& window, std::uint32_t first, std::uint32_t last,
+                       bool head)> range;
 };
 struct PrefillStats {
     double wait_ms = 0, seal_ms = 0, total_ms = 0;
     std::vector<double> window_ms;   // forward enqueue + its seam work, per window
+    // Per-window timeline (host clock). wait: acquire of the input frame. sync: the consumer's load + fence (it drains the
+    // previous window's GPU work) or the producer's seal (it drains this window's). enqueue: the forward call.
+    // The GPU work of a rank's windows is hidden in sync (+ enqueue, which overlaps it); wait is the rank idling on its input.
+    std::vector<double> wait_window_ms, sync_window_ms, enqueue_window_ms;
 };
 
 // One prefill on this rank. `in`: consumer pipe from the previous stage (null on the first), `out`: producer pipe to the
@@ -132,9 +142,12 @@ inline PrefillStats prefill(const Placement& p, std::span<const std::uint32_t> p
         const auto tokens = prompt.subspan(win.start, win.rows);
         const auto bytes = std::size_t(win.rows) * ops.row_bytes;
         const auto t0 = Clock::now();
+        double wait = 0, sync = 0;
         if (in) {
             auto& frame = in->acquire(w);
-            stats.wait_ms += ms(Clock::now() - t0);
+            wait = ms(Clock::now() - t0);
+            stats.wait_ms += wait;
+            const auto l0 = Clock::now();
             const auto& h = frame.header;
             if (h[w_start] != win.start || h[w_rows] != win.rows || h[w_tokens] != fnv(14695981039346656037ULL, tokens) ||
                 h[w_cut] != p.first())
@@ -142,8 +155,11 @@ inline PrefillStats prefill(const Placement& p, std::span<const std::uint32_t> p
             ops.seam(frame, false, bytes);
             ops.fence();            // the slot is reused only after its rows are in the engine
             in->release(w);
+            sync += ms(Clock::now() - l0);
         }
+        const auto e0 = Clock::now();
         ops.forward(tokens, win, p.head() && w + 1U == ws.size());
+        stats.enqueue_window_ms.push_back(ms(Clock::now() - e0));
         if (out) {
             const auto s0 = Clock::now();
             auto& frame = out->acquire(w);
@@ -156,8 +172,12 @@ inline PrefillStats prefill(const Placement& p, std::span<const std::uint32_t> p
             ops.seam(frame, true, bytes);
             if (frame.staging) frame.staging->seal(bytes);
             out->release(w);
-            stats.seal_ms += ms(Clock::now() - s0);
+            const auto seal = ms(Clock::now() - s0);
+            stats.seal_ms += seal;
+            sync += seal;
         }
+        stats.wait_window_ms.push_back(wait);
+        stats.sync_window_ms.push_back(sync);
         stats.window_ms.push_back(ms(Clock::now() - t0));
     }
     if (in) in->finish(ws.size());
@@ -189,6 +209,8 @@ struct DecodeOps {
     //   rewrite every device row the guessed forward wrote). A family whose state cannot be undone leaves it empty.
     std::function<bool(std::uint32_t last, std::uint32_t& next)> guess;
     std::function<void()> rewind;
+    // Interleaved stages (decode over a StageMap, below): one row through layers [first, last); first == 0 embeds `token`.
+    std::function<void(std::uint32_t token, std::uint32_t first, std::uint32_t last, bool head)> range;
 };
 struct DecodeStats {
     std::vector<std::uint32_t> ids;
@@ -267,6 +289,223 @@ inline DecodeStats decode(const Placement& p, std::uint32_t first_token, std::ui
             down->send(message);
         }
         token = relay(p.head() ? ops.top() : 0U, step);
+        out.ids.push_back(token);
+    }
+    out.total_ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+    return out;
+}
+
+// End-of-prefill relay of every stage's layer state to ONE decoder stage (the planner's handoff plan: the decoder owns
+// the whole model, decode then runs there alone at single-rank cost instead of crossing every cut per token).
+// Messages travel along the line towards `decoder`: a stage below it forwards what arrives from below plus its own
+// layers downwards (to stage + 1), a stage above it forwards upwards (to stage - 1). One message per layer, so the
+// sender's export of layer l + 1 overlaps the receiver's check and import of layer l. The head stage attaches the
+// prefill's first token. The decoder calls `load` once per layer it does not run and returns the first token.
+struct RelayOps {
+    std::function<std::vector<std::byte>(std::uint32_t layer)> save;          // one layer's state on this stage
+    std::function<void(std::uint32_t layer, std::span<const std::byte>)> load; // decoder only
+    // Checksum of one message's bytes; empty = SeamCrc (bytewise table). A binder with a hardware CRC32C passes it:
+    // the relay moves the whole KV + recurrent state once, a few hundred MB at long contexts.
+    std::function<std::uint32_t(std::span<const std::byte>)> checksum;
+};
+struct RelayStats { std::uint32_t token = 0; std::uint64_t bytes = 0, messages = 0; double ms = 0; };
+inline RelayStats relay_state(const Placement& p, std::uint32_t decoder, std::uint32_t first_token, const Link* up,
+                              const Link* down, const RelayOps& ops) {
+    using Clock = std::chrono::steady_clock;
+    p.check();
+    if (decoder >= p.stages()) throw std::invalid_argument("state relay: decoder stage outside the plan");
+    if ((up != nullptr) == p.embeds() || (down != nullptr) == p.head())
+        throw std::invalid_argument("layer pipeline: links do not match the stage (up: not first, down: not last)");
+    const auto start = Clock::now();
+    const auto check_sum = [&](std::span<const std::byte> b) {
+        if (ops.checksum) return ops.checksum(b);
+        SeamCrc crc; crc.update(b); return crc.value();
+    };
+    RelayStats out;
+    // One message per layer, streamed: {state_magic, layer, bytes, checksum, token + 1 (0: none)} + bytes. A link
+    // carries a count first; a forwarding stage passes each message on as it arrives, then appends its own layers.
+    struct Message { std::uint64_t words[5]{}; std::vector<std::byte> bytes; };
+    const auto get_msg = [&](const Link* from) {
+        Message m;
+        from->receive(std::as_writable_bytes(std::span(m.words)));
+        if (m.words[0] != state_magic) throw std::runtime_error("state relay: bad message header");
+        m.bytes.resize(static_cast<std::size_t>(m.words[2]));
+        from->receive(m.bytes);
+        if (check_sum(m.bytes) != m.words[3]) throw std::runtime_error("state relay: checksum mismatch");
+        return m;
+    };
+    const auto put_msg = [&](const Link* to, const Message& m) { to->send(std::as_bytes(std::span(m.words))); to->send(m.bytes); };
+    const auto own = [&](std::uint32_t layer) {
+        Message m;
+        m.bytes = ops.save(layer);
+        m.words[0] = state_magic; m.words[1] = layer; m.words[2] = m.bytes.size(); m.words[3] = check_sum(m.bytes);
+        m.words[4] = p.head() ? std::uint64_t(first_token) + 1U : 0U;
+        return m;
+    };
+    const auto count_from = [&](const Link* from) {
+        std::uint64_t count = 0;
+        if (from) from->receive(std::as_writable_bytes(std::span(&count, 1)));
+        return count;
+    };
+    const std::uint64_t mine = p.last() - p.first();
+    if (p.stage != decoder) {
+        const bool below = p.stage < decoder;
+        const Link* from = below ? up : down;   // the far side of the line (null at the end)
+        const Link* to = below ? down : up;
+        const auto incoming = count_from(from);
+        const std::uint64_t count = incoming + mine;
+        to->send(std::as_bytes(std::span(&count, 1)));
+        for (std::uint64_t i = 0; i < incoming; ++i) { const auto m = get_msg(from); out.bytes += m.bytes.size(); put_msg(to, m); }
+        for (auto layer = p.first(); layer < p.last(); ++layer) { const auto m = own(layer); out.bytes += m.bytes.size(); put_msg(to, m); }
+        out.messages = count;
+    } else {
+        bool token = p.head();
+        out.token = first_token;
+        std::uint64_t received = 0;
+        for (const Link* from : {p.stage > 0U ? up : nullptr, down}) {
+            const auto count = count_from(from);
+            for (std::uint64_t i = 0; i < count; ++i) {
+                const auto m = get_msg(from);
+                if (m.words[1] >= p.first() && m.words[1] < p.last()) throw std::runtime_error("state relay: a layer of the decoder's own stage");
+                ops.load(static_cast<std::uint32_t>(m.words[1]), m.bytes);
+                out.bytes += m.bytes.size();
+                if (m.words[4]) { out.token = static_cast<std::uint32_t>(m.words[4] - 1U); token = true; }
+                ++received;
+            }
+        }
+        out.messages = received;
+        if (received + mine != p.cuts.back() || !token) throw std::runtime_error("state relay: decoder did not receive every layer");
+    }
+    out.ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+    return out;
+}
+
+// Interleaved virtual stages on two ranks (strix/pair/stage_map.hpp): the 2v stages of a StageMap alternate between the
+// ranks (stage s on rank s % 2) and every layer's sequence state stays with the rank that owns its stage, in prefill AND
+// decode. Each rank runs its (stage, chunk) steps in the shared StagePipes order (groups of chunks, depth-first); every
+// stage still takes the windows in prompt order, so each layer sees the same windows in the same order as the
+// single-rank path: the bits equal the one-node prefill at the same width. Fill + drain cost one stage (P / 2v) instead
+// of one half-pass (P / 2): wall ~ chunks x P / 2 + P / 2v + hops (regime.hpp interleaved_wall_ms).
+// Whole-layer cuts only: a half cut splits a layer inside the engine and is not a layer range.
+inline void check_stage_map(const StageMap& map, unsigned rank, bool range_bound) {
+    map.validate(map.layers());
+    if (rank > 1U) throw std::invalid_argument("layer pipeline: a stage map runs on ranks 0 and 1");
+    if (!range_bound) throw std::invalid_argument("layer pipeline: a stage map needs the engine's range hook");
+    for (const auto& cut : map.cuts)
+        if (cut.half) throw std::invalid_argument("layer pipeline: stage maps run whole-layer cuts (a half cut is not a layer range)");
+}
+
+// Consumer-side header check of a StageMap seam (StagePipes checks [42]-[44] first): the cut word names the boundary's cut.
+inline std::function<std::size_t(const PipeHeader&, std::uint64_t)> stage_validator(
+    std::uint64_t identity, const StageMap& map, std::uint32_t max_rows, std::size_t row_bytes) {
+    return [=](const PipeHeader& h, std::uint64_t sequence) {
+        const std::uint64_t boundary = map.stages() > 2U ? h[43] : 0U;   // wire v3 (v = 1) has the one boundary
+        if (h[w_magic] != seam_magic || h[1] != sequence || boundary + 1U >= map.stages() ||
+            h[w_cut] != map.cuts[static_cast<std::size_t>(boundary) + 1U].wire() || h[w_identity] != identity ||
+            h[w_rows] == 0U || h[w_rows] > max_rows || h[w_bytes] != h[w_rows] * row_bytes)
+            throw std::runtime_error("layer pipeline stage seam header mismatch (model, plan, prompt, cut or window)");
+        return static_cast<std::size_t>(h[w_bytes]);
+    };
+}
+
+// One prefill on this rank over `pipes` (built for the same map with chunks == windows(prompt, width).size() and
+// options.validate = stage_validator). Engine hooks: ops.range (layers of one stage), ops.seam, ops.fence.
+inline PrefillStats prefill(const StageMap& map, unsigned rank, std::span<const std::uint32_t> prompt, std::uint32_t width,
+                            std::uint64_t identity, StagePipes& pipes, const StageOps& ops) {
+    using Clock = std::chrono::steady_clock;
+    const auto ms = [](auto d) { return std::chrono::duration<double, std::milli>(d).count(); };
+    check_stage_map(map, rank, static_cast<bool>(ops.range));
+    const auto ws = windows(prompt.size(), width);
+    if (pipes.chunks() != ws.size() || pipes.map().fnv() != map.fnv())
+        throw std::invalid_argument("layer pipeline: stage pipes were built for another map or window count");
+    const std::uint32_t last_stage = map.stages() - 1U;
+    PrefillStats stats;
+    stats.window_ms.assign(ws.size(), 0.0);
+    const auto begin = Clock::now();
+    for (const auto step : pipes.order()) {
+        const auto& win = ws[static_cast<std::size_t>(step.chunk)];
+        const auto tokens = prompt.subspan(win.start, win.rows);
+        const auto bytes = std::size_t(win.rows) * ops.row_bytes;
+        const auto t0 = Clock::now();
+        if (step.stage > 0U) {
+            const std::uint32_t boundary = step.stage - 1U;
+            auto& frame = pipes.acquire_in(step.chunk, boundary);
+            stats.wait_ms += ms(Clock::now() - t0);
+            const auto& h = frame.header;
+            if (h[w_start] != win.start || h[w_rows] != win.rows || h[w_tokens] != fnv(14695981039346656037ULL, tokens))
+                throw std::runtime_error("layer pipeline stage seam window does not match this stage's window (position, rows, tokens)");
+            ops.seam(frame, false, bytes);
+            ops.fence();            // the slot is reused only after its rows are in the engine
+            pipes.release_in(step.chunk, boundary);
+        }
+        ops.range(tokens, win, map.cuts[step.stage].layer, map.cuts[step.stage + 1U].layer,
+                  step.stage == last_stage && step.chunk + 1U == ws.size());
+        if (step.stage < last_stage) {
+            const auto s0 = Clock::now();
+            auto& frame = pipes.acquire_out(step.chunk, step.stage);   // StagePipes owns [1], [41], [43], [44]
+            auto& h = frame.header;
+            h[w_magic] = seam_magic; h[w_start] = win.start; h[w_rows] = win.rows; h[w_bytes] = bytes; h[w_identity] = identity;
+            h[w_tokens] = fnv(14695981039346656037ULL, tokens); h[w_cut] = map.cuts[step.stage + 1U].wire();
+            frame.resize(bytes);
+            ops.seam(frame, true, bytes);
+            if (frame.staging) frame.staging->seal(bytes);
+            pipes.release_out(step.chunk, step.stage);
+            stats.seal_ms += ms(Clock::now() - s0);
+        }
+        stats.window_ms[static_cast<std::size_t>(step.chunk)] += ms(Clock::now() - t0);
+    }
+    pipes.finish();
+    stats.total_ms = ms(Clock::now() - begin);
+    return stats;
+}
+
+// Greedy decode over the same map: per token the row visits the 2v stages in order (one hop per boundary: 4 header words
+// + one row, CRC), then the head rank (the last stage is odd: rank 1) relays the token to rank 0. `peer`: ordered duplex
+// link to the other rank (after StagePipes::finish()). 2v hops per token instead of 2: the planner charges decode tokens.
+inline DecodeStats decode(const StageMap& map, unsigned rank, std::uint32_t first_token, std::uint32_t count, const Link& peer,
+                          const DecodeOps& ops) {
+    check_stage_map(map, rank, static_cast<bool>(ops.range));
+    const std::uint32_t stages = map.stages();
+    const bool head_rank = map.owner(stages - 1U) == rank;
+    std::vector<std::byte> message(32U + ops.row_bytes);   // 4 header words + one row
+    const auto relay = [&](std::uint32_t token, std::uint64_t step) {
+        std::uint64_t words[4] = {token_magic, step, token, 0};
+        if (head_rank) {
+            peer.send(std::as_bytes(std::span(words)));
+            return token;
+        }
+        peer.receive(std::as_writable_bytes(std::span(words)));
+        if (words[0] != token_magic || words[1] != step || words[3] != 0U) throw std::runtime_error("layer pipeline token relay out of order");
+        return static_cast<std::uint32_t>(words[2]);
+    };
+    using Clock = std::chrono::steady_clock;
+    const auto start = Clock::now();
+    DecodeStats out;
+    if (count == 0U) return out;
+    std::uint32_t token = relay(head_rank ? first_token : 0U, 0U);
+    out.ids.push_back(token);
+    for (std::uint64_t step = 1; step < count; ++step) {
+        for (std::uint32_t s = 0; s < stages; ++s) {
+            if (map.owner(s) != rank) continue;
+            if (s > 0U) {
+                peer.receive(message);
+                std::uint64_t h[4];
+                std::memcpy(h, message.data(), sizeof h);
+                SeamCrc crc; crc.update(std::span(message).subspan(32U));
+                if (h[0] != hidden_magic || h[1] != step * stages + s - 1U || h[2] != ops.row_bytes || h[3] != crc.value())
+                    throw std::runtime_error("layer pipeline decode row mismatch (order, size or CRC)");
+                ops.import_row(std::span<const std::byte>(message).subspan(32U));
+            }
+            ops.range(token, map.cuts[s].layer, map.cuts[s + 1U].layer, s + 1U == stages);
+            if (s + 1U < stages) {
+                ops.export_row(std::span(message).subspan(32U));
+                SeamCrc crc; crc.update(std::span<const std::byte>(message).subspan(32U));
+                const std::uint64_t h[4] = {hidden_magic, step * stages + s, ops.row_bytes, crc.value()};
+                std::memcpy(message.data(), h, sizeof h);
+                peer.send(message);
+            }
+        }
+        token = relay(head_rank ? ops.top() : 0U, step);
         out.ids.push_back(token);
     }
     out.total_ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();

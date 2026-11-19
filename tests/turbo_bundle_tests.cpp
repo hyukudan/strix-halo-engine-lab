@@ -104,15 +104,20 @@ void families() {
     require(strix::minimax::defaults::profile_table.size() == 9, "minimax retains six base rows, the FAST router rows and explicit-only TP2 exchange row");
     for (const char* lever : {"idx_wmma", "idx_wmma_layers", "router_wmma", "router_wmma_layers"}) {
         const auto* e = find(r, lever);
+        // turbo cell empty or the builtin (router_wmma: "0", so turbo does not inherit its fast cell)
         require(e != nullptr && e->status == p::Status::builtin && e->value == e->lever->builtin &&
-                    std::string_view(e->lever->value[3]).empty() && !e->lever->runnable[3],
+                    (std::string_view(e->lever->value[3]).empty() || e->lever->value[3] == e->lever->builtin) &&
+                    !e->lever->runnable[3],
                 "minimax index rows stay explicit-only outside turbo");
     }
     require(find(r, "msa_flash")->status == p::Status::pending && find(r, "msa_flash_layers")->status == p::Status::pending,
             "minimax turbo flash waits for adapter admission/export");
     require(find(r, "moe_invariant")->status == p::Status::pending, "minimax moe invariant pending");
     generic(mm, p::Name::fast, none, r);
-    require(find(r, "msa_flash") == nullptr || find(r, "msa_flash")->status == p::Status::builtin, "minimax fast unchanged");
+    // fast = the qualified bundle mm-fast-pf-v2: its two members' cells (the index rows stay explicit-only, above).
+    require(find(r, "msa_flash")->status == p::Status::set && find(r, "msa_flash")->value == "1" &&
+                find(r, "router_wmma")->status == p::Status::set && find(r, "router_wmma")->value == "1",
+            "minimax fast = bundle members msa_flash + router_wmma");
 
     namespace md = strix::minimax::defaults;
     const std::map<std::string, std::string> mm_env{{md::kProductProfileEnv, "turbo"}};

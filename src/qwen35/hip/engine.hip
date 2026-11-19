@@ -26,10 +26,12 @@
 #include "strix/qwen35/iu4_draft_head.hpp"
 #include "strix/spec/draft_rows.hpp"
 #include "strix/hip_gdn_dims.hpp"
+#include "strix/pair/tp_layout.hpp"
 #include "../../attn_core/dense_decode.hpp"
 #include "../../attn_core/dense_decode_flash.hpp"
 #include "../../core/dense_linear.hpp"
 #include "../../core/dense_linear_iu4.hpp"
+#include "../../core/tp_join.hpp"
 #include "../../core/window_state_buffers.hpp"
 #include "../../core/a4_tiles.hpp"
 #include "../../core/f16_dense_iu4.hpp"
@@ -205,6 +207,10 @@ struct Layer {
     std::uint16_t* conv_state = nullptr;
     std::uint16_t *k_cache = nullptr, *v_cache = nullptr;
     std::uint16_t* v_t = nullptr;  // V^T copy for the wide-window flash attention (prefill_rows > 16 only)
+    // Tensor-parallel rank-local GDN tensors (enable_tp): qkv / z packs of this rank's heads in local order (same tile
+    // and scale bytes as the full packs), conv weights of its channels, dt / a of its value heads.
+    Tensor tqkv, tz;
+    float *tconv = nullptr, *tdt = nullptr, *ta = nullptr;
 };
 
 dl::View view(const Tensor& t) { return {t.data, t.inputs, t.outputs, t.row_bytes}; }
@@ -507,6 +513,14 @@ __global__ void concat2_kernel(const float* a, const float* b, float* out, unsig
     }
 }
 
+// Exact TP joins / split argmax: shared HIP core (src/core/tp_join.hpp).
+using core::tp_join::tp_join_kernel;
+using core::tp_join::tp_join16_kernel;
+using core::tp_join::tp_draft_map_kernel;
+using core::tp_join::tp_select_kernel;
+using core::tp_join::tp_pick_kernel;
+using core::tp_join::tp_pick_join_kernel;
+
 }  // namespace
 
 struct HipEngine::Impl {
@@ -532,6 +546,7 @@ struct HipEngine::Impl {
     int *d_ids = nullptr, *d_arg = nullptr;
     unsigned committed = 0, pending = 0;
     unsigned own_begin = 0, own_end = 0;  // owned layer range (HipEngineOptions::layer_begin / layer_end)
+    unsigned stage_begin = 0, stage_end = 0;  // prefill stage range inside the owned one (set_stage; default = owned)
     unsigned win_vt_from = 0;             // vt_from of the current window (set by its first range)
     // Wide-window attention (rows > 16, FAST): shared flash over the BF16 cache (attn_core/dense_decode_flash.hpp).
     // vt_valid = positions whose V^T copy matches the cache (any other cache write lowers it).
@@ -585,6 +600,9 @@ struct HipEngine::Impl {
         fr(dhead); fr(d_dmap);
         fr(wide.codes); fr(wide.deltas); fr(wide.g); fr(wide.u); fr(wide.xt);
         fr(iu4.xh); fr(iu4.g); fr(iu4.u);
+        for (auto& y : L) { fr(y.tqkv.data); fr(y.tz.data); fr(y.tconv); fr(y.tdt); fr(y.ta); }
+        for (auto* j : {&tp.core, &tp.ctx, &tp.hid, &tp.mlp, &tp.head}) { fr(j->base); fr(j->stride); }
+        fr(tp.sel_vh); fr(tp.slots); fr(tp.picks); fr(tp.bfull); fr(tp.afull); fr(tp.hslots); fr(tp.didx);
         if (stream) (void)hipStreamDestroy(stream);
     }
 
@@ -605,6 +623,7 @@ struct HipEngine::Impl {
         own_begin = opt.layer_begin;
         own_end = opt.layer_end ? opt.layer_end : cfg.layers;
         if (own_begin >= own_end || own_end > cfg.layers) throw std::invalid_argument("owned layer range must be 0 <= begin < end <= layers");
+        stage_begin = own_begin; stage_end = own_end;
         HK(hipStreamCreate(&stream));
         if (own_begin == 0U) embd = loader.load("token_embd");
         if (own_end == cfg.layers) { onorm = loader.load("output_norm"); head = loader.load("output"); }
@@ -741,17 +760,389 @@ struct HipEngine::Impl {
             g.small_type = 0; g.key_heads = cfg.gdn_key_heads; g.value_heads = GH; g.head_dim = cfg.gdn_key_dim;
             g.kernel = cfg.gdn_conv_kernel; g.rows = k; g.qk_epsilon = 1e-6F; g.rms_epsilon = cfg.rms_eps;
             g.norm_kind = HipGdnGatedNorm::swish;
+            if (tp.on) tp_dims(y, g);
             hip_gdn_decode_step_dims(g, stream);
         }
     }
 
+    // ---------------- exact tensor-parallel decode (HipEngine::enable_tp) ----------------
+    // Rank r computes the columns / heads of its shares with the one-rank kernels (core::dense_iu4::run_cols, the GDN
+    // step on compact local heads, dense_decode on its kv heads) and joins the others' after 4 all-gathers per layer:
+    // GDN core / attention ctx (input of out / o), out / o output, silu(gate) * up (input of down), down output. Norms,
+    // residual adds, embedding and beta / alpha stay replicated (same inputs, same kernels, same bits); the MTP drafter
+    // is replicated too, or split the same way (mtp_run_tp, STRIX_TP_SPLIT_DRAFT).
+    // Why not fewer: out / o / down outputs feed the residual + rmsnorm (whole row), and their inputs are split by
+    // head / column; removing the input gather needs a K split whose partials join in the one-rank wave order (next lever).
+    struct TpJoin {
+        int *base = nullptr, *stride = nullptr;
+        unsigned cols = 0, maxw = 0;
+    };
+    struct Tp {
+        bool on = false, full_logits = false, head_split = false;
+        unsigned rank = 0, ranks = 1;
+        HipEngine::TpGather gather{};
+        unsigned kb = 0, nk = 0, hq0 = 0, nq = 0, kv0 = 0, nkv = 0;      // GDN key heads, q heads, kv heads of this rank
+        unsigned gc = 0, gv = 0, gh = 0;                                 // local qkv channels, value width, value heads
+        unsigned oc0 = 0, ocn = 0, gu0 = 0, gun = 0, hd0 = 0, hdn = 0;   // column shares: hidden (out/o/down), mlp, head
+        int* sel_vh = nullptr;                                           // local value head -> global (beta / alpha)
+        TpJoin core, ctx, hid, mlp, head;
+        float* slots = nullptr;  // ranks x slot_floats
+        float* picks = nullptr;  // ranks x pick_floats: split argmax (value, index bits) per row
+        unsigned slot_floats = 0, pick_floats = 2U * kMaxRows;
+        float *bfull = nullptr, *afull = nullptr;  // replicated beta / alpha rows
+        // FP16 gathers (STRIX_TP_F16_GATHER): core / ctx / gu feed only an IU4 GEMV, whose first op is the elementwise
+        // FP16 conversion; each rank converts its share, the join writes the GEMV's activation rows (bitwise the same).
+        bool f16 = false;
+        _Float16* hslots = nullptr;  // ranks x slot_floats halves
+        // Split MTP drafter (STRIX_TP_SPLIT_DRAFT): the MTP layer and the draft head by the trunk's shares + split argmax.
+        bool split_draft = false;
+        int* didx = nullptr;  // kMaxRows: joined subset argmax (compact column) before the id map
+        std::vector<double> rates;
+        std::uint64_t gathers = 0;
+        std::string receipt;
+    } tp;
+
+    void tp_dims(const Layer& y, HipGdnDimsStep& g) const {
+        g.conv = y.tconv; g.dt = y.tdt; g.a = y.ta;
+        g.key_heads = tp.nk; g.value_heads = tp.gh;
+    }
+    float* tp_slot() const { return tp.slots + std::size_t(tp.rank) * tp.slot_floats; }
+    void tp_gather(float* slots, unsigned slot_floats, std::size_t bytes) {
+        tp.gather.fn(tp.gather.ctx, static_cast<void*>(stream), slots, std::size_t(slot_floats) * 4U, bytes);
+        ++tp.gathers;
+    }
+    // All-gather of the slots' first rows x maxw words, then out[rows][cols] = the joined rows.
+    void tp_join(const TpJoin& j, unsigned rows, float* out) {
+        tp_gather(tp.slots, tp.slot_floats, std::size_t(rows) * j.maxw * 4U);
+        const unsigned n = rows * j.cols;
+        tp_join_kernel<<<std::min(1024U, (n + 255U) / 256U), 256, 0, stream>>>(tp.slots, j.base, j.stride, j.cols, rows, out);
+    }
+    // Columns [first, first + count) of IU4 w with the one-rank row sweeps and FP16 conversion (as linear16).
+    void tp_cols(const Tensor& w, const float* xin, unsigned first, unsigned count, float* out, unsigned out_stride, unsigned rows) {
+        core::dense_row_sweeps(rows, [&](unsigned r, unsigned m) {
+            core::dense_iu4::prepare(xin + std::size_t(r) * w.inputs, iu4.xh, w.inputs, m, stream);
+            core::dense_iu4::run_cols(w.data, w.inputs, w.outputs, first, count, iu4.xh, out + std::size_t(r) * out_stride, out_stride,
+                                      m, stream);
+        });
+    }
+    // Join that feeds an IU4 GEMV only. FP16 mode: convert this rank's slot with prepare's elementwise kernel, gather
+    // halves (half the bytes), join into iu4.xh in prepare's placement; returns true (xh holds the rows, `out` untouched).
+    // Otherwise the FP32 join into `out`; returns false.
+    bool tp_join_x(const TpJoin& j, unsigned rows, float* out) {
+        if (!tp.f16) {
+            tp_join(j, rows, out);
+            return false;
+        }
+        const std::size_t words = std::size_t(rows) * j.maxw;
+        core::dense_iu4::to_f16_kernel<0><<<64, 256, 0, stream>>>(tp_slot(), tp.hslots + std::size_t(tp.rank) * tp.slot_floats, words);
+        tp.gather.fn(tp.gather.ctx, static_cast<void*>(stream), tp.hslots, std::size_t(tp.slot_floats) * 2U, words * 2U);
+        ++tp.gathers;
+        const unsigned n = rows * j.cols;
+        tp_join16_kernel<<<std::min(1024U, (n + 255U) / 256U), 256, 0, stream>>>(tp.hslots, j.base, j.stride, j.cols, rows, iu4.xh,
+                                                                                  core::dense_iu4::scalar_x());
+        return true;
+    }
+    // tp_cols, or (xh_ready) the same run_cols sweeps on the joined activation rows (sweep r reads xh + r * K: the
+    // prepare placement permutes inside aligned 8-word groups and K % 8 == 0, so the offset rows are prepare's rows).
+    void tp_cols_x(const Tensor& w, const float* xin, bool xh_ready, unsigned first, unsigned count, float* out, unsigned out_stride,
+                   unsigned rows) {
+        if (!xh_ready) return tp_cols(w, xin, first, count, out, out_stride, rows);
+        core::dense_row_sweeps(rows, [&](unsigned r, unsigned m) {
+            core::dense_iu4::run_cols(w.data, w.inputs, w.outputs, first, count, iu4.xh + std::size_t(r) * w.inputs,
+                                      out + std::size_t(r) * out_stride, out_stride, m, stream);
+        });
+    }
+    // silu(gate) * up of the mlp share into out [rows][gun] (as glu16).
+    void tp_gate_up(const Tensor& g, const Tensor& u, const float* xin, float* out, unsigned rows) {
+        core::dense_row_sweeps(rows, [&](unsigned r, unsigned m) {
+            core::dense_iu4::prepare(xin + std::size_t(r) * H, iu4.xh, H, m, stream);
+            core::dense_iu4::run_cols(g.data, H, I, tp.gu0, tp.gun, iu4.xh, iu4.g, tp.gun, m, stream);
+            core::dense_iu4::run_cols(u.data, H, I, tp.gu0, tp.gun, iu4.xh, iu4.u, tp.gun, m, stream);
+            silu_mul_kernel<<<256, 256, 0, stream>>>(iu4.g, iu4.u, out + std::size_t(r) * tp.gun, std::size_t(m) * tp.gun);
+        });
+    }
+    // Columns [first, first + count) of a row-major weight (q8_0 / bf16: output column n = bytes [n, n + 1) x row_bytes):
+    // the same kernel on a sub-tensor computes each column with the full tensor's arithmetic (grid over outputs).
+    static Tensor tp_sub(const Tensor& w, unsigned first, unsigned count) {
+        if (w.fmt == kIu4Fmt || !w.row_bytes) throw std::logic_error("tp_sub: row-major weights only");
+        Tensor t = w;
+        t.data = w.data + std::size_t(first) * w.row_bytes;
+        t.outputs = count;
+        t.bytes = std::size_t(count) * w.row_bytes;
+        return t;
+    }
+    // A column share of any dense weight into out [rows][count] (IU4: run_cols; row-major: the sub-tensor).
+    void tp_part(const Tensor& w, const float* x, unsigned first, unsigned count, float* out, unsigned rows) {
+        if (w.fmt == kIu4Fmt) tp_cols(w, x, first, count, out, count, rows);
+        else linear(tp_sub(w, first, count), x, out, rows, stream, wide, iu4);
+    }
+    void tp_part_gate_up(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned rows) {
+        if (g.fmt == kIu4Fmt) tp_gate_up(g, u, x, out, rows);
+        else glu(tp_sub(g, tp.gu0, tp.gun), tp_sub(u, tp.gu0, tp.gun), x, out, rows, stream, wide, iu4);
+    }
+    void tp_upload(int** dst, const std::vector<std::int32_t>& v) {
+        alloc0(dst, std::max<std::size_t>(v.size(), 1U) * 4U);
+        HK(hipMemcpy(*dst, v.data(), v.size() * 4U, hipMemcpyHostToDevice));
+    }
+    TpJoin tp_make_join(const std::vector<std::vector<strix::pair::tp::Segment>>& per_rank, unsigned cols) {
+        const auto m = strix::pair::tp::join_map(per_rank, cols, tp.slot_floats);
+        TpJoin j;
+        j.cols = cols;
+        j.maxw = m.max_width;
+        tp_upload(&j.base, m.base);
+        tp_upload(&j.stride, m.stride);
+        return j;
+    }
+    // IU4 pack of the columns `segs` of w in local order: the same 128-byte tiles (16 columns x 16 k, K-major) and scale
+    // rows as the full pack, so every column's arithmetic is the full pack's (the kernel addresses tiles by N).
+    Tensor tp_repack(const Tensor& w, const std::vector<strix::pair::tp::Segment>& segs) {
+        const unsigned K = w.inputs, N = w.outputs, Nl = strix::pair::tp::width(segs);
+        Tensor t;
+        t.inputs = K; t.outputs = Nl; t.fmt = w.fmt;
+        t.bytes = core::dense_iu4::tensor_bytes(Nl, K);
+        alloc0(&t.data, t.bytes);
+        const std::size_t sp = std::size_t(N / 16U) * 128U, dp = std::size_t(Nl / 16U) * 128U, g = K / 64U;
+        const std::uint8_t* ws = w.data + core::dense_iu4::packed_bytes(N, K);
+        std::uint8_t* wd = t.data + core::dense_iu4::packed_bytes(Nl, K);
+        unsigned at = 0;
+        for (const auto& s : segs) {
+            if (s.global % 16U || s.count % 16U) throw std::invalid_argument("tp repack: column runs must be whole 16-column tiles");
+            HK(hipMemcpy2DAsync(t.data + std::size_t(at / 16U) * 128U, dp, w.data + std::size_t(s.global / 16U) * 128U, sp,
+                                std::size_t(s.count / 16U) * 128U, K / 16U, hipMemcpyDeviceToDevice, stream));
+            HK(hipMemcpyAsync(wd + std::size_t(at) * g * 2U, ws + std::size_t(s.global) * g * 2U, std::size_t(s.count) * g * 2U,
+                              hipMemcpyDeviceToDevice, stream));
+            at += s.count;
+        }
+        return t;
+    }
+    // Rows of `row_bytes` of src for the units of segs, in local order, packed at dst.
+    void tp_rows(void* dst, const void* src, const std::vector<strix::pair::tp::Segment>& segs, std::size_t row_bytes) {
+        std::size_t at = 0;
+        for (const auto& s : segs) {
+            HK(hipMemcpyAsync(static_cast<std::uint8_t*>(dst) + at, static_cast<const std::uint8_t*>(src) + s.global * row_bytes,
+                              s.count * row_bytes, hipMemcpyDeviceToDevice, stream));
+            at += s.count * row_bytes;
+        }
+    }
+
+    void enable_tp(unsigned rank, const std::vector<double>& rates, HipEngine::TpGather gather, bool full_logits) {
+        namespace ptp = strix::pair::tp;
+        const unsigned R = unsigned(rates.size());
+        if (tp.on) throw std::logic_error("enable_tp: already on");
+        if (R < 1U || rank >= R || !gather.fn) throw std::invalid_argument("enable_tp: rank must be < ranks and the gather set");
+        if (pending || own_begin != 0U || own_end != cfg.layers) throw std::invalid_argument("enable_tp: whole model on this rank, no pending window");
+        if (core::dense_iu4::reference_flag() || !iu4.xh) throw std::invalid_argument("enable_tp: needs IU4 weights on the exact core");
+        for (const auto& y : L)
+            for (const Tensor* t : {&y.gate, &y.up, &y.down, &y.qkv, &y.z, &y.out, &y.q, &y.k, &y.v, &y.o})
+                if (t->data && t->fmt != kIu4Fmt) throw std::invalid_argument("enable_tp: every trunk projection must be IU4");
+        const unsigned KH = cfg.gdn_key_heads, kd = cfg.gdn_key_dim, vd = GH ? GV / GH : 0U, G = cfg.heads / cfg.kv_heads;
+        if (n_gdn && (GH % KH || GC != 2U * KH * kd + GV)) throw std::runtime_error("enable_tp: GDN channels are not q | k | v by heads");
+        if (cfg.heads % cfg.kv_heads || QW != cfg.heads * D || KW != cfg.kv_heads * D || H % 64U || I % 64U)
+            throw std::runtime_error("enable_tp: attention / trunk shapes outside the split rules");
+        const auto keys = ptp::split_units(KH, rates), kvs = ptp::split_units(cfg.kv_heads, rates);
+        const auto hs = ptp::split_units(H / 64U, rates), ms = ptp::split_units(I / 64U, rates);
+        const auto hc = ptp::head_columns(head.fmt == kIu4Fmt, V, rates);  // replicated: every rank owns [0, V)
+        tp.head_split = hc.split;
+        for (unsigned q = 0; q < R; ++q)
+            if (!keys[q].size() || !kvs[q].size()) throw std::invalid_argument("enable_tp: every rank needs a GDN key head and a kv head");
+        std::vector<std::vector<ptp::Segment>> core_s(R), ctx_s(R), hid_s(R), mlp_s(R);
+        for (unsigned q = 0; q < R; ++q) {
+            core_s[q] = ptp::expand(ptp::mod_value_heads(KH, GH, keys[q]), vd);
+            ctx_s[q] = {{kvs[q].begin * G * D, kvs[q].size() * G * D}};
+            hid_s[q] = {{hs[q].begin * 64U, hs[q].size() * 64U}};
+            mlp_s[q] = {{ms[q].begin * 64U, ms[q].size() * 64U}};
+        }
+        const auto vh = ptp::mod_value_heads(KH, GH, keys[rank]);
+        std::vector<ptp::Segment> qkv_s{{keys[rank].begin * kd, keys[rank].size() * kd}, {KH * kd + keys[rank].begin * kd, keys[rank].size() * kd}};
+        for (const auto& s : ptp::expand(vh, vd, 2U * KH * kd)) qkv_s.push_back(s);
+        const auto z_s = ptp::expand(vh, vd);
+        tp.rank = rank; tp.ranks = R; tp.gather = gather; tp.full_logits = full_logits && tp.head_split;
+        tp.kb = keys[rank].begin; tp.nk = keys[rank].size(); tp.kv0 = kvs[rank].begin; tp.nkv = kvs[rank].size();
+        tp.hq0 = tp.kv0 * G; tp.nq = tp.nkv * G;
+        tp.gc = ptp::width(qkv_s); tp.gv = ptp::width(z_s); tp.gh = ptp::width(vh);
+        tp.oc0 = hid_s[rank][0].global; tp.ocn = hid_s[rank][0].count;
+        tp.gu0 = mlp_s[rank][0].global; tp.gun = mlp_s[rank][0].count;
+        tp.hd0 = hc.cols[rank].global; tp.hdn = hc.cols[rank].count;
+        unsigned maxw = 2U;
+        for (const auto* s : {&core_s, &ctx_s, &hid_s, &mlp_s})
+            for (const auto& v : *s) maxw = std::max(maxw, ptp::width(v));
+        // Both default on (measured bitwise: ids == one node over 1200 tokens, same k histogram; faster on the four spec
+        // contents and plain); =0 restores the FP32 gathers / the replicated drafter.
+        static const bool f16_on = strix::envcfg::flag("STRIX_TP_F16_GATHER", true);
+        static const bool split_draft_on = strix::envcfg::flag("STRIX_TP_SPLIT_DRAFT", true);
+        tp.f16 = f16_on;
+        tp.split_draft = split_draft_on && mtp.ok;
+        if (tp.split_draft && mtp.blk.q.fmt != kIu4Fmt && !mtp.blk.q.row_bytes) throw std::runtime_error("enable_tp: MTP weights not splittable");
+        if (tp.head_split)  // the rank's local logits (trunk head share) live in its slot; a replicated head uses `logits`
+            for (const auto& c : hc.cols) maxw = std::max(maxw, c.count);
+        if (tp.split_draft)  // the draft subset share (64-column blocks of at most V columns): +-1 unit each
+            for (const auto& u : ptp::split_units(V / 64U, rates)) maxw = std::max(maxw, u.size() * 64U + 128U);
+        tp.slot_floats = kMaxRows * maxw;
+        alloc0(&tp.slots, std::size_t(R) * tp.slot_floats * 4U);
+        alloc0(&tp.picks, std::size_t(R) * tp.pick_floats * 4U);
+        if (tp.f16) alloc0(&tp.hslots, std::size_t(R) * tp.slot_floats * 2U);
+        if (tp.split_draft) alloc0(&tp.didx, kMaxRows * 4U);
+        tp.rates = rates;
+        if (n_gdn) tp.core = tp_make_join(core_s, GV);
+        tp.ctx = tp_make_join(ctx_s, QW);
+        tp.hid = tp_make_join(hid_s, H);
+        tp.mlp = tp_make_join(mlp_s, I);
+        if (tp.full_logits) {  // split head only (full_logits requires it): one segment per rank
+            std::vector<std::vector<ptp::Segment>> head_s;
+            for (const auto& c : hc.cols) head_s.push_back({c});
+            tp.head = tp_make_join(head_s, V);
+        }
+        tp_upload(&tp.sel_vh, ptp::select_map(vh));
+        alloc0(&tp.bfull, std::size_t(kMaxRows) * GH * 4U);
+        alloc0(&tp.afull, std::size_t(kMaxRows) * GH * 4U);
+        const std::size_t ck = cfg.gdn_conv_kernel, kvb = std::size_t(committed) * KW * 2U;
+        const std::size_t kvm = tp.split_draft ? std::size_t(opt.max_positions) * KW * 2U : 0U;  // whole MTP cache (its rows)
+        std::uint8_t* tmp = nullptr;
+        alloc0(&tmp, std::max({sb, cb, kvb, kvm, std::size_t(4)}));
+        if (tp.split_draft)  // MTP K / V rows of this rank's kv heads (the split drafter's attention reads only its heads)
+            for (std::uint16_t* c : {mtp.blk.k_cache, mtp.blk.v_cache}) {
+                HK(hipMemcpyAsync(tmp, c, kvm, hipMemcpyDeviceToDevice, stream));
+                HK(hipMemcpy2DAsync(c, std::size_t(tp.nkv) * D * 2U, tmp + std::size_t(tp.kv0) * D * 2U, std::size_t(KW) * 2U,
+                                    std::size_t(tp.nkv) * D * 2U, opt.max_positions, hipMemcpyDeviceToDevice, stream));
+            }
+        for (unsigned l = 0; l < cfg.layers; ++l) {
+            auto& y = L[l];
+            if (gdn_index[l] != ~0U) {  // weights, then the committed matrix / conv history of this rank's heads and channels
+                y.tqkv = tp_repack(y.qkv, qkv_s);
+                y.tz = tp_repack(y.z, z_s);
+                alloc0(&y.tconv, std::size_t(tp.gc) * ck * 4U);
+                tp_rows(y.tconv, y.conv.data, qkv_s, ck * 4U);
+                alloc0(&y.tdt, std::size_t(tp.gh) * 4U);
+                tp_rows(y.tdt, y.dt.data, vh, 4U);
+                alloc0(&y.ta, std::size_t(tp.gh) * 4U);
+                tp_rows(y.ta, y.a.data, vh, 4U);
+                HK(hipMemcpyAsync(tmp, y.gdn_state, sb, hipMemcpyDeviceToDevice, stream));
+                tp_rows(y.gdn_state, tmp, vh, sb / GH);
+                HK(hipMemcpyAsync(tmp, y.conv_state, cb, hipMemcpyDeviceToDevice, stream));
+                tp_rows(y.conv_state, tmp, qkv_s, ck * 2U);
+            } else if (committed) {  // K / V rows of this rank's kv heads, positions < committed
+                for (std::uint16_t* c : {y.k_cache, y.v_cache}) {
+                    HK(hipMemcpyAsync(tmp, c, kvb, hipMemcpyDeviceToDevice, stream));
+                    HK(hipMemcpy2DAsync(c, std::size_t(tp.nkv) * D * 2U, tmp + std::size_t(tp.kv0) * D * 2U, std::size_t(KW) * 2U,
+                                        std::size_t(tp.nkv) * D * 2U, committed, hipMemcpyDeviceToDevice, stream));
+                }
+            }
+        }
+        HK(hipStreamSynchronize(stream));
+        HK(hipFree(tmp));
+        vt_valid = 0;  // the V^T copy (wide windows) no longer matches the local caches
+        tp.on = true;
+        char buf[768];
+        std::snprintf(buf, sizeof buf,
+                      "tp rank %u/%u: gdn key heads [%u,+%u) value heads %u, kv heads [%u,+%u) q heads %u, hidden cols [%u,+%u), "
+                      "mlp cols [%u,+%u), head %s [%u,+%u)%s; gathers/token %u (4/layer + %u), slot %u floats; core/ctx/gu gathers %s; "
+                      "mtp drafter %s",
+                      rank, R, tp.kb, tp.nk, tp.gh, tp.kv0, tp.nkv, tp.nq, tp.oc0, tp.ocn, tp.gu0, tp.gun,
+                      tp.head_split ? "split" : "replicated", tp.hd0, tp.hdn, tp.full_logits ? " full logits" : "",
+                      4U * cfg.layers + (tp.head_split ? 1U : 0U), tp.head_split ? 1U : 0U, tp.slot_floats, tp.f16 ? "fp16" : "fp32",
+                      !mtp.ok ? "none" : tp.split_draft ? "split (6 gathers/call)" : "replicated");
+        tp.receipt = buf;
+    }
+
+    HipRowsOut run_tp(const std::uint32_t* tokens, unsigned n, LogitRows want, bool defer) {
+        if (n < 1U || n > kMaxRows) throw std::invalid_argument("tensor-parallel windows take 1..16 rows");
+        if (pending) { rollback(0U); pending = 0; }  // an uncommitted window is discarded
+        core::require_capacity(committed, n, opt.max_positions);
+        core::validate_token_ids(tokens, n, cfg.vocab);
+        const unsigned pos = committed;
+        if (defer) HK(hipMemcpyAsync(bak_conv, conv_all, cb * n_gdn, hipMemcpyDeviceToDevice, stream));
+        HK(hipMemcpyAsync(d_ids, tokens, n * 4U, hipMemcpyHostToDevice, stream));
+        embed_kernel<<<n, 256, 0, stream>>>(embd.data, embd.fmt, embd.row_bytes, H, d_ids, x);
+        const unsigned nb = (n * H + 255U) / 256U;
+        float* slot = tp_slot();
+        for (unsigned l = 0; l < cfg.layers; ++l) {
+            auto& y = L[l];
+            rmsnorm(x, y.attn_norm, H, cfg.rms_eps, xn, n, stream);
+            if (gdn_index[l] != ~0U) {
+                const std::size_t gi = gdn_index[l];
+                tp_cols(y.tqkv, xn, 0U, tp.gc, qkv, tp.gc, n);
+                tp_cols(y.tz, xn, 0U, tp.gv, z, tp.gv, n);
+                linear(y.beta, xn, tp.bfull, n, stream, wide, iu4);
+                linear(y.alpha, xn, tp.afull, n, stream, wide, iu4);
+                tp_select_kernel<<<1, 256, 0, stream>>>(tp.bfull, tp.sel_vh, GH, tp.gh, n, beta);
+                tp_select_kernel<<<1, 256, 0, stream>>>(tp.afull, tp.sel_vh, GH, tp.gh, n, gate);
+                if (defer)
+                    capture_raw_kernel<<<64, 256, 0, stream>>>(qkv, beta, gate, raw_qkv + gi * kMaxRows * GC, raw_beta + gi * kMaxRows * GH,
+                                                               raw_gate + gi * kMaxRows * GH, n * tp.gc, n * tp.gh);
+                HipGdnDimsStep g{};
+                g.qkv = qkv; g.beta = beta; g.gate = gate; g.core = slot; g.matrix = y.gdn_state; g.z = z;
+                g.conv_state = y.conv_state; g.norm = y.snorm.data;
+                g.small_type = 0; g.head_dim = cfg.gdn_key_dim;
+                g.kernel = cfg.gdn_conv_kernel; g.rows = n; g.qk_epsilon = 1e-6F; g.rms_epsilon = cfg.rms_eps;
+                g.norm_kind = HipGdnGatedNorm::swish;
+                tp_dims(y, g);
+                if (defer) g.matrix_out = gdn_buf.target_at(gi * sb / 4U);
+                hip_gdn_decode_step_dims(g, stream);
+                const bool xh = tp_join_x(tp.core, n, core);
+                tp_cols_x(y.out, core, xh, tp.oc0, tp.ocn, slot, tp.ocn, n);
+            } else {
+                tp_cols(y.q, xn, 2U * D * tp.hq0, 2U * D * tp.nq, q_in, 2U * D * tp.nq, n);
+                tp_cols(y.k, xn, D * tp.kv0, D * tp.nkv, kk, D * tp.nkv, n);
+                tp_cols(y.v, xn, D * tp.kv0, D * tp.nkv, vv, D * tp.nkv, n);
+                attn_core::dense_decode::Params p{n, tp.nq, tp.nkv, 2U * D, cfg.rotary_dim, pos, cfg.rms_eps,
+                                                  1.0F / std::sqrt(float(D)), cfg.rope_theta, true};
+                attn_core::dense_decode::launch<256>(p, q_in, kk, vv, reinterpret_cast<const float*>(y.qnorm.data),
+                                                     reinterpret_cast<const float*>(y.knorm.data), qn, y.k_cache, y.v_cache, slot, stream);
+                const bool xh = tp_join_x(tp.ctx, n, ctx);
+                tp_cols_x(y.o, ctx, xh, tp.oc0, tp.ocn, slot, tp.ocn, n);
+            }
+            tp_join(tp.hid, n, proj);
+            add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H);
+            rmsnorm(x, y.post_norm, H, cfg.rms_eps, xn, n, stream);
+            tp_gate_up(y.gate, y.up, xn, slot, n);
+            const bool xh = tp_join_x(tp.mlp, n, gu);
+            tp_cols_x(y.down, gu, xh, tp.oc0, tp.ocn, slot, tp.ocn, n);
+            tp_join(tp.hid, n, proj);
+            add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H);
+        }
+        HipRowsOut out;
+        if (mtp.ok) {  // trunk hidden of every row for the MTP chain (replicated: x is the one-rank x)
+            rmsnorm(x, onorm, H, cfg.rms_eps, mtp.hpost, n, stream);
+            out.hidden_post = mtp.hpost;
+            out.hidden_pre = x;
+        }
+        if (want != LogitRows::none) {
+            const unsigned first = want == LogitRows::last ? n - 1U : 0U, m = want == LogitRows::last ? 1U : n;
+            rmsnorm(x + std::size_t(first) * H, onorm, H, cfg.rms_eps, xn, m, stream);
+            if (!tp.head_split) {  // the one-rank head on every rank
+                linear(head, xn, logits, m, stream, wide, iu4);
+                argmax_kernel<<<m, 1024, 0, stream>>>(logits, V, d_arg);
+                out.logits = logits;
+            } else {
+                tp_cols(head, xn, tp.hd0, tp.hdn, slot, tp.hdn, m);
+                if (tp.full_logits) {  // gate fixtures: the whole rows, then the one-rank argmax
+                    tp_join(tp.head, m, logits);
+                    argmax_kernel<<<m, 1024, 0, stream>>>(logits, V, d_arg);
+                    out.logits = logits;
+                } else {
+                    float* mine = tp.picks + std::size_t(tp.rank) * tp.pick_floats;
+                    tp_pick_kernel<<<m, 1024, 0, stream>>>(slot, tp.hdn, tp.hdn, int(tp.hd0), mine);
+                    tp_gather(tp.picks, tp.pick_floats, std::size_t(m) * 8U);
+                    tp_pick_join_kernel<<<1, 32, 0, stream>>>(tp.picks, tp.ranks, tp.pick_floats, m, d_arg);
+                }
+            }
+            out.top = reinterpret_cast<const std::uint32_t*>(d_arg);
+        }
+        HK(hipGetLastError());
+        if (defer) pending = n;
+        else committed += n;
+        return out;
+    }
+
     HipRowsOut run(const std::uint32_t* tokens, unsigned n, LogitRows want, bool defer) {
+        if (tp.on) return run_tp(tokens, n, want, defer);
         return run_range(0U, cfg.layers, tokens, n, want, defer);
     }
 
     // Layers [first, last) of one window (run == run_range(0, layers)). first > 0: the input rows are already in x
     // (import_hidden / a stream-ordered copy). Head only at the last layer; the window commits when `last` is the owned end.
     HipRowsOut run_range(unsigned first, unsigned last, const std::uint32_t* tokens, unsigned n, LogitRows want, bool defer) {
+        if (tp.on) throw std::logic_error("tensor-parallel windows run the whole model (forward_rows / forward_commit)");
         if (first >= last || first < own_begin || last > own_end)
             throw std::invalid_argument("layer range must be non-empty and inside the owned range");
         if (defer && (own_begin != 0U || own_end != cfg.layers || first != 0U || last != cfg.layers))
@@ -771,7 +1162,7 @@ struct HipEngine::Impl {
         }
         const unsigned nb = (n * H + 255U) / 256U;
         const bool flash = wide_flash(n);
-        if (first == own_begin) {  // once per window: a later range of the same window (one-process cut) reuses it
+        if (first == stage_begin) {  // once per window: a later range of the same window (one-process cut) reuses it
             win_vt_from = std::min(vt_valid, pos);
             vt_valid = flash ? pos + n : win_vt_from;
         }
@@ -854,7 +1245,7 @@ struct HipEngine::Impl {
         }
         HK(hipGetLastError());
         if (defer) pending = n;
-        else if (last == own_end) committed += n;
+        else if (last == stage_end) committed += n;
         return out;
     }
 
@@ -899,6 +1290,7 @@ struct HipEngine::Impl {
 
     void load_mtp(const std::string& path) {
         if (mtp.ok) throw std::logic_error("load_mtp: already loaded");
+        if (tp.on) throw std::logic_error("load_mtp: load the MTP layer before enable_tp (its cache is sliced there)");
         if (own_begin != 0U || own_end != cfg.layers) throw std::logic_error("load_mtp: needs the whole model on this rank");
         Loader loader(path);
         const std::string b = "blk." + std::to_string(cfg.layers) + ".";
@@ -946,11 +1338,82 @@ struct HipEngine::Impl {
     // Same math as the CUDA MTP layer: cat(enorm(embed(tok)), hnorm(hidden)) -> eh_proj -> one full-attention block (own KV) ->
     // shared_head_norm -> trunk lm_head. Scratch of the trunk window (q_in, kk, vv, qn, ctx, gu, proj) is reused: calls are
     // stream-ordered between passes.
+    // mtp_run split like a trunk attention layer (enable_tp with STRIX_TP_SPLIT_DRAFT): eh / o / down by the hidden
+    // shares, q / k / v by kv heads (the MTP cache holds this rank's heads), gate / up by the mlp share, then the draft
+    // head (subset or full) by column shares and the split argmax. 6 FP32 gathers per call (the q8_0 / bf16 consumers
+    // read F32 rows). Every column / head / candidate is computed by one rank with the one-rank kernel; norms, adds,
+    // embedding and concat are replicated: the drafts are the one-rank drafts.
+    HipMtpOut mtp_run_tp(const std::uint32_t* next_tokens, const float* hidden_dev, unsigned n, unsigned pos0, bool want_top) {
+        auto& y = mtp.blk;
+        float* slot = tp_slot();
+        const unsigned nb = (n * H + 255U) / 256U;
+        HK(hipMemcpyAsync(mtp.ids, next_tokens, n * 4U, hipMemcpyHostToDevice, stream));
+        embed_kernel<<<n, 256, 0, stream>>>(embd.data, embd.fmt, embd.row_bytes, H, mtp.ids, mtp.tA);
+        rmsnorm(mtp.tA, mtp.enorm, H, cfg.rms_eps, mtp.mxn, n, stream);
+        rmsnorm(hidden_dev, mtp.hnorm, H, cfg.rms_eps, mtp.tB, n, stream);
+        concat2_kernel<<<(n * H + 255U) / 256U, 256, 0, stream>>>(mtp.mxn, mtp.tB, mtp.cat, n, H);
+        tp_part(mtp.eh, mtp.cat, tp.oc0, tp.ocn, slot, n);
+        tp_join(tp.hid, n, mtp.mx);
+        rmsnorm(mtp.mx, y.attn_norm, H, cfg.rms_eps, mtp.mxn, n, stream);
+        tp_part(y.q, mtp.mxn, 2U * D * tp.hq0, 2U * D * tp.nq, q_in, n);
+        tp_part(y.k, mtp.mxn, D * tp.kv0, D * tp.nkv, kk, n);
+        tp_part(y.v, mtp.mxn, D * tp.kv0, D * tp.nkv, vv, n);
+        attn_core::dense_decode::Params p{n, tp.nq, tp.nkv, 2U * D, cfg.rotary_dim, pos0, cfg.rms_eps,
+                                          1.0F / std::sqrt(float(D)), cfg.rope_theta, true};
+        attn_core::dense_decode::launch<256>(p, q_in, kk, vv, reinterpret_cast<const float*>(y.qnorm.data),
+                                             reinterpret_cast<const float*>(y.knorm.data), qn, y.k_cache, y.v_cache, slot, stream);
+        tp_join(tp.ctx, n, ctx);
+        tp_part(y.o, ctx, tp.oc0, tp.ocn, slot, n);
+        tp_join(tp.hid, n, proj);
+        add_kernel<<<nb, 256, 0, stream>>>(mtp.mx, proj, n * H);
+        rmsnorm(mtp.mx, y.post_norm, H, cfg.rms_eps, mtp.mxn, n, stream);
+        tp_part_gate_up(y.gate, y.up, mtp.mxn, slot, n);
+        tp_join(tp.mlp, n, gu);
+        tp_part(y.down, gu, tp.oc0, tp.ocn, slot, n);
+        tp_join(tp.hid, n, proj);
+        add_kernel<<<nb, 256, 0, stream>>>(mtp.mx, proj, n * H);
+        rmsnorm(mtp.mx, mtp.shnorm, H, cfg.rms_eps, mtp.mxn, n, stream);
+        HipMtpOut o;
+        if (want_top) {
+            float* mine = tp.picks + std::size_t(tp.rank) * tp.pick_floats;
+            if (drows) {  // subset head: this rank's 64-column blocks of the compact pack, argmax over the live rows only
+                draft_rows_sync();
+                Tensor w = head;
+                w.data = dhead;
+                w.outputs = dcols;
+                w.bytes = iu4_head_bytes(dcols, head.inputs);
+                const auto share = strix::pair::tp::split_units(dcols / 64U, tp.rates)[tp.rank];
+                const unsigned c0 = share.begin * 64U, cn = share.size() * 64U, live = drows->rows();
+                if (std::size_t(n) * cn > tp.slot_floats) throw std::runtime_error("mtp tp: draft share exceeds the slot");
+                tp_cols(w, mtp.mxn, c0, cn, slot, cn, n);
+                tp_pick_kernel<<<n, 1024, 0, stream>>>(slot, live > c0 ? std::min(cn, live - c0) : 0U, cn, int(c0), mine);
+                tp_gather(tp.picks, tp.pick_floats, std::size_t(n) * 8U);
+                tp_pick_join_kernel<<<1, 32, 0, stream>>>(tp.picks, tp.ranks, tp.pick_floats, n, tp.didx);
+                tp_draft_map_kernel<<<1, 32, 0, stream>>>(tp.didx, live, d_dmap, kIu4DraftGroup, n, mtp.top);
+            } else if (!tp.head_split) {  // full head not splittable (non-IU4 or V % 64 != 0): the one-rank head on every
+                // rank, as the target does (a split share would cover one 64-column unit only)
+                linear(head, mtp.mxn, mtp.mlogits, n, stream, wide, iu4);
+                argmax_kernel<<<n, 1024, 0, stream>>>(mtp.mlogits, V, mtp.top);
+            } else {  // full head: the trunk head's vocab shares
+                tp_part(head, mtp.mxn, tp.hd0, tp.hdn, slot, n);
+                tp_pick_kernel<<<n, 1024, 0, stream>>>(slot, tp.hdn, tp.hdn, int(tp.hd0), mine);
+                tp_gather(tp.picks, tp.pick_floats, std::size_t(n) * 8U);
+                tp_pick_join_kernel<<<1, 32, 0, stream>>>(tp.picks, tp.ranks, tp.pick_floats, n, mtp.top);
+            }
+            o.top = reinterpret_cast<const std::uint32_t*>(mtp.top);  // logits stay rank-local shares (not returned)
+        }
+        HK(hipGetLastError());
+        o.hidden_pre = mtp.mx;
+        o.hidden_post = mtp.mxn;
+        return o;
+    }
+
     HipMtpOut mtp_run(const std::uint32_t* next_tokens, const float* hidden_dev, unsigned n, unsigned pos0, bool want_top) {
         if (!mtp.ok) throw std::runtime_error("mtp_forward: no MTP tensors loaded");
         if (n < 1U || n > kMaxRows) throw std::invalid_argument("mtp_forward: rows must be 1..16");
         core::require_capacity(pos0, n, opt.max_positions);
         core::validate_token_ids(next_tokens, n, cfg.vocab);
+        if (tp.on && tp.split_draft) return mtp_run_tp(next_tokens, hidden_dev, n, pos0, want_top);
         auto& y = mtp.blk;
         HK(hipMemcpyAsync(mtp.ids, next_tokens, n * 4U, hipMemcpyHostToDevice, stream));
         embed_kernel<<<n, 256, 0, stream>>>(embd.data, embd.fmt, embd.row_bytes, H, mtp.ids, mtp.tA);
@@ -1057,11 +1520,64 @@ void HipEngine::read_logits(const HipRowsOut& o, std::uint32_t rows, float* host
     HK(hipMemcpyAsync(host, o.logits, std::size_t(rows) * p_->V * 4U, hipMemcpyDeviceToHost, p_->stream));
     HK(hipStreamSynchronize(p_->stream));
 }
+void HipEngine::set_stage(std::uint32_t first, std::uint32_t last) {
+    auto& p = *p_;
+    if (p.tp.on) throw std::logic_error("set_stage: tensor-parallel decode is on (the caches hold this rank's heads only)");
+    if (first >= last || first < p.own_begin || last > p.own_end) throw std::invalid_argument("set_stage: range outside the owned layers");
+    if (p.pending) throw std::logic_error("set_stage: a deferred window is pending");
+    p.stage_begin = first; p.stage_end = last;
+}
+std::size_t HipEngine::state_bytes(std::uint32_t first, std::uint32_t last) const {
+    const auto& p = *p_;
+    if (p.tp.on) throw std::logic_error("state_bytes: tensor-parallel decode is on (the caches hold this rank's heads only)");
+    if (first >= last || first < p.own_begin || last > p.own_end) throw std::invalid_argument("state_bytes: range outside the owned layers");
+    std::size_t total = 0;
+    for (auto l = first; l < last; ++l)
+        total += p.gdn_index[l] != ~0U ? p.sb + p.cb : 2U * std::size_t(p.committed) * p.KW * 2U;
+    return total;
+}
+void HipEngine::export_state(std::uint32_t first, std::uint32_t last, void* host) const {
+    auto& p = *p_;
+    if (p.tp.on) throw std::logic_error("export_state: tensor-parallel decode is on (the caches hold this rank's heads only)");
+    if (p.pending) throw std::logic_error("export_state: a deferred window is pending");
+    auto* out = static_cast<std::byte*>(host);
+    const auto copy = [&](const void* d, std::size_t bytes) {
+        HK(hipMemcpyAsync(out, d, bytes, hipMemcpyDeviceToHost, p.stream)); out += bytes; };
+    (void)state_bytes(first, last);   // range check
+    for (auto l = first; l < last; ++l) {
+        const auto& y = p.L[l];
+        if (p.gdn_index[l] != ~0U) { copy(p.gdn_buf.committed_at(std::size_t(p.gdn_index[l]) * p.sb / 4U), p.sb); copy(y.conv_state, p.cb); }
+        else { const auto kv = std::size_t(p.committed) * p.KW * 2U; copy(y.k_cache, kv); copy(y.v_cache, kv); }
+    }
+    HK(hipStreamSynchronize(p.stream));
+}
+void HipEngine::import_state(std::uint32_t first, std::uint32_t last, std::uint32_t positions, const void* host) {
+    auto& p = *p_;
+    if (p.tp.on) throw std::logic_error("import_state: tensor-parallel decode is on (the caches hold this rank's heads only)");
+    if (p.pending) throw std::logic_error("import_state: a deferred window is pending");
+    if (positions != p.committed) throw std::invalid_argument("import_state: positions differ from this rank's committed count");
+    const auto* in = static_cast<const std::byte*>(host);
+    const auto copy = [&](void* d, std::size_t bytes) {
+        HK(hipMemcpyAsync(d, in, bytes, hipMemcpyHostToDevice, p.stream)); in += bytes; };
+    (void)state_bytes(first, last);   // range check
+    for (auto l = first; l < last; ++l) {
+        auto& y = p.L[l];
+        if (p.gdn_index[l] != ~0U) { copy(p.gdn_buf.committed_at(std::size_t(p.gdn_index[l]) * p.sb / 4U), p.sb); copy(y.conv_state, p.cb); }
+        else { const auto kv = std::size_t(p.committed) * p.KW * 2U; copy(y.k_cache, kv); copy(y.v_cache, kv); }
+    }
+    p.vt_valid = 0;   // imported V rows: the V^T copy is rebuilt from the cache by the next wide window
+    HK(hipStreamSynchronize(p.stream));
+}
 void HipEngine::bench_seek(std::uint32_t pos) {
     if (pos > p_->opt.max_positions) throw std::invalid_argument("bench_seek beyond max_positions");
     p_->committed = pos;
     p_->pending = 0;
 }
+void HipEngine::enable_tp(std::uint32_t rank, const std::vector<double>& rates, TpGather gather, bool full_logits) {
+    p_->enable_tp(rank, rates, gather, full_logits);
+}
+bool HipEngine::tp_on() const { return p_->tp.on; }
+std::string HipEngine::tp_receipt() const { return p_->tp.receipt; }
 void HipEngine::sync() const { HK(hipStreamSynchronize(p_->stream)); }
 
 void HipEngine::load_mtp(const std::string& path) { p_->load_mtp(path); }

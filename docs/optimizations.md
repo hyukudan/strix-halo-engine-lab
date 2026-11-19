@@ -4558,7 +4558,7 @@ their checks.
 
 ### FAST WMMA prefill linear cores (glm-pf-wmma-x)
 
-**Engine:** `glm`. **Control:** `STRIX_GLM_PF_WMMA`. **Default:** off (`strix-glm5-rank --profile fast` enables; opt-in FAST identity).
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_WMMA`. **Default:** off (explicit `STRIX_GLM_PF_WMMA=1` only; unqualified for `--profile fast`, see the quality line; opt-in FAST identity).
 
 The exact prefill's X3 linear calls run on `v_wmma_f32_16x16x16_f16` over the exact cores' FP16 operands: dense calls of
 2048+ rows (X3 route) and the MoE gate/up/down of the V11/V14 route. Per (row, output) each stage of four 16-wide
@@ -4567,9 +4567,9 @@ tiles per wave (remainders on 64-row storage); the H128/svh epilogue, plan, tran
 exact path's. `STRIX_GLM_PF_WMMA_ROWS=64` and `STRIX_GLM_PF_WMMA_CP=1` select other tilings with the same bits.
 
 - **Preconditions:** dense calls of 2048+ rows (`STRIX_GLM_PF_EXACT_X` auto / 4); MoE calls on V11 or V14 (auto from 128 rows). Other calls stay exact.
-- **Automatic selection:** `strix-glm5-rank --profile fast` sets `STRIX_GLM_PF_WMMA=1` before device work; an explicit environment value wins. `default` exports nothing, `quality` uses default with a notice, and baseline vetoes the profile addition. The bare `--profile` keeps its timing meaning.
+- **Automatic selection:** none today: `--profile fast` does not select it (the FAST prefill set fails the 8K quality gate, KL 0.0587 and 0.492 on two windows, no single member carrying it; it returns to the fast column when fixed). An explicit environment value runs it. `default` exports nothing, `quality` uses default with a notice, and baseline vetoes the profile addition. The bare `--profile` keeps its timing meaning.
 - **Fallback notice:** None; each rank prints `prefill identity glm-pf-wmma-x FAST (... wmma calls dense D moe M)` only when WMMA calls ran, else `prefill identity exact` (`prefill identity prefill-wmma route` under `--prefill wmma`). Two ranks: the switch is part of the startup agreement (a mismatch stops both ranks); modes without that handshake refuse `STRIX_GLM_PF_WMMA=1`.
-- **Exactness evidence:** FAST identity (new FP32 summation order). Quality: pre-registered quality-parity check passed at 1K / 8K / 32K. Synthetic: WMMA vs FP64 2.5-2.8e-7 rel-L2 (exact X3 1.9-8.2e-7); every WMMA tiling bitwise equal (hip_glm_pf_wmma_tests). Pair: FAST deterministic; OFF equals the exact 8K logits anchors on both ranks.
+- **Exactness evidence:** FAST identity (new FP32 summation order). Quality: pre-registered quality-parity check passed at 1K / 8K / 32K; the later per-window FAST gate of the whole FAST prefill set fails at 8K (above), so the lever is unqualified for the profile. Synthetic: WMMA vs FP64 2.5-2.8e-7 rel-L2 (exact X3 1.9-8.2e-7); every WMMA tiling bitwise equal (hip_glm_pf_wmma_tests). Pair: FAST deterministic; OFF equals the exact 8K logits anchors on both ranks.
 - **Off switch:** STRIX_GLM_PF_WMMA=0 (also overrides `--profile fast`); without a named fast profile, unset keeps it off
 - **Measured gain:** Pair 8K TTFT 15.45 -> 12.94 s (-16.3 %), 32K 62.3 -> 51.2 s (-17.8 %, mean of both run orders); whole-call MoE -28..-29 %, dense 8192 rows -28..-32 %
 - **Implementation / evidence:** [shared core](../src/moe_core/grouped_f16.hpp), [GLM adapter](../src/glm/prefill/glm_pf_wmma_x.hpp), [MoE](../src/glm/prefill/glm_pf_wmma_moe.inc), [test](../tests/hip_glm_pf_wmma_tests.hip)
@@ -5027,6 +5027,24 @@ values outside the band, so byte comparisons of that buffer need `STRIX_IDX_WMMA
 
 ## Qwen RTX PRO standalone
 
+<a id="qwen-rtx-ple-a8"></a>
+
+### PLE projections on the shared dense A8 projection (FAST form `ple_a8`)
+
+**Engine:** `qwen-rtx`. **Control:** `--ple-a8 on|off`, `STRIX_QRTX_PLE_A8` (lever row `ple_a8`, identity `qwen-cuda-ple-a8-v1`). **Default:** off (opt-in under `--profile fast`; not a FAST bundle member until its gate passes).
+
+In a prefill block the PLE key projection (2560 -> 10240) and value projection (2560 -> 2560) read the same gathered rows.
+Under `ple_a8` they are two segments of one shared dense A8 projection (one activation quantize, one int8 tensor-core
+launch, the `dense-a8-v1` projection contract) instead of two FP32 lane-chain launches. Verify and decode windows keep the
+exact projections.
+
+- **Preconditions:** CUDA Qwen MoE prefill blocks under `--profile fast` with `--ple-a8 on` (the row is runnable under `fast` only).
+- **Automatic selection:** none.
+- **Exactness evidence:** FAST class (changes the PLE keys and values). FAST gate: not run yet. The arithmetic contract and the prefix identity name the form when it is on; off, the same launches run as before.
+- **Off switch:** `--ple-a8 off`; `STRIX_QRTX_PLE_A8=0` (the default).
+- **Measured gain:** Not yet measured.
+- **Implementation / evidence:** [call site](../src/cuda/models/qwen/qwen_prefill_driver.cu), [lever row](../include/strix/profiles/qwen_cuda.hpp), [no-model bench](../tests/cuda/qwen_ple_a8_bench.cu)
+
 <a id="qwen-rtx-prefix-cache"></a>
 
 ### Prompt prefix cache
@@ -5078,6 +5096,29 @@ One word selects every FAST lever qualified for the run's regime (weights source
 - **Measured gain:** none of its own (selection only): the levers' figures apply, e.g. FAST4 + chunk16 at 8K 13,437-13,714 tok/s; split-K FAST on the spec CLI below.
 - **Implementation / evidence:** [profile table](../include/strix/profiles/qwen_dense_cuda.hpp), [toggles](toggles.md#profiles-exact-vs-fast)
 
+<a id="qwen-dense-cuda-decode-attn8"></a>
+
+### Qwen dense 27B CUDA decode attention on an e4m3 K/V shadow (FAST `decode_attn8`, opt-in)
+
+**Engine:** `qwen-rtx` (dense 27B). **Control:** `--decode-attn8 on|off` on `strix-cuda-qwen35-decode` and `strix-cuda-qwen35-spec`. **Default:** off; `--profile fast` does not turn it on until its quality gate passes. **Class:** FAST (bit-changing, quality-gated).
+
+Decode and verify attention read an e4m3 shadow of the K/V cache instead of the BF16 rows: persistent CTAs over (2,048-key
+chunk, kv head, block of 128 (row, q-head) pairs), each K/V tile read once per kv head per step, S and P*V on e4m3 tensor
+cores (`mma m16n8k32`) with FP32 accumulation and FP32 online softmax, then a per-row combine over the chunks. The shadow
+rows of a step are written from device positions (graph-safe); the BF16 cache stays the source of truth. A trait of the
+shared per-layer entry `attention_decode_kv` (null shadow = the exact BF16 row-shared walk) in the CUDA e4m3 attention family
+(`src/cuda_core/attention/attention_flash8.cu`), no separate family. Slot batches and the MTP block keep the BF16 form.
+
+- **Preconditions:** CUDA Qwen dense 27B, main session; on the spec CLI it also covers the prefill windows.
+- **Automatic selection:** none (no `qualified` regime in `include/strix/profiles/qwen_dense_cuda.hpp`).
+- **Exactness evidence:** identity suffix `-d8`. Inside the FAST class a verify of R rows gives the same bits as R one-row
+  decode steps (absolute chunks, per-row skip / scale / combine; device test). Without the lever the engine calls the exact
+  `attention_decode` as before: the exact attention kernels and the e4m3 prefill kernels are machine-code identical to the
+  code without this trait. Quality gate (8K / 28K / 64K): not run yet.
+- **Off switch:** `--decode-attn8 off` (the default), or `--profile exact`.
+- **Measured gain:** not yet measured.
+- **Implementation / evidence:** [e4m3 attention family](../src/cuda_core/attention/attention_flash8.cu), [entry](../include/strix/cuda_core/attention.hpp), [device test](../tests/cuda_core/cuda_core_test.cu), [profile test](../tests/qwen35_dense_profile_host_tests.cpp)
+
 <a id="qwen-dense-cuda-splitk-fast"></a>
 
 ### Qwen dense 27B CUDA NVFP4 GEMV split-K FAST (`nvfp4-splitk-fast-v1`)
@@ -5095,6 +5136,24 @@ A device without a row runs the EXACT targets.
 - **Off switch:** `--split-k exact` (also under `--profile fast`), or `--profile exact`.
 - **Measured gain:** RTX PRO 6000 at 600 W, converted NVFP4 pack, greedy spec decode (sub15d), 1,200 tokens, two strict A/B pairs of 3 runs each: think 262.02 / 261.66 -> 263.83 / 263.90 tok/s (+0.7 / +0.9 %), verify 14.07 / 14.08 -> 13.99 / 13.98 ms per step (-0.5 / -0.7 %); FAST also changes the accepted drafts on think (263 -> 262 steps, E 4.56 -> 4.58), so its tok/s is not a pure per-step figure: per step 17.399 -> 17.346 ms (-0.3 %); code 334.32 / 333.94 -> 335.53 / 336.18 tok/s (+0.4 / +0.7 %, within 3x the run spread), verify 14.94 / 14.94 -> 14.85 / 14.81 ms per step. GPU clocks 2,550-2,750 MHz across the four runs.
 - **Implementation / evidence:** [policy](../include/strix/split_k_policy.hpp), [GEMV](../src/cuda_core/dense/nvfp4.cu), [policy test](../tests/split_k_policy_host_tests.cpp), [profile test](../tests/qwen35_dense_profile_host_tests.cpp)
+
+<a id="qwen-dense-cuda-verify-prelaunch"></a>
+
+### Qwen dense 27B CUDA spec: verify pre-launch behind the device-fed MTP draft
+
+**Engine:** `qwen-rtx` (dense 27B). **Control:** `--prelaunch 0|1` on `strix-cuda-qwen35-spec`. **Default:** off (`0`) until its timing receipt.
+
+The verify of a speculative block reads the drafted ids from the device feed slots instead of from the host: the MTP
+chain queues the copy of its ids to the host, the verify graph is launched behind the draft on the same stream (a
+32-thread gather kernel writes the ids into the verify inputs, then the same trunk graph runs), and only then does the
+host wait for the ids. The host no longer stands between the last draft kernel and the first verify kernel.
+
+- **Preconditions:** CUDA Qwen dense spec CLI with the MTP chain drafter (chain-only and hybrid blocks); other drafters and engines decline the pre-launch and run the serial form.
+- **Automatic selection:** none yet; the CLI prints `prelaunch[TAG]: on|off, pre-launched steps N of M`.
+- **Exactness evidence:** Scheduling only: the verify runs the same graph on the same position and id contents in the same stream order; emitted ids equal the serial greedy ids in every block (host tests: same MTP calls and proposals, feed slots resolve to the drafted ids, identical emitted ids and block traces with the controller on and off).
+- **Off switch:** `--prelaunch 0` (the default).
+- **Measured gain:** Not yet measured.
+- **Implementation / evidence:** [contract](../include/strix/spec/block_drafter.hpp), [MTP chain](../include/strix/spec/mtp_chain.hpp), [CUDA binding](../src/qwen35/cuda/engine.cu)
 
 ## Platform (kernel)
 
@@ -5490,3 +5549,43 @@ another with the single-row instruction sequence.
   187.3 -> 137.5 ms. Speculative decode with the shared copy proposer, 300 ids, code prompt: plain 16.65 -> 20.16 tok/s
   (E 1.37 tokens per pass); prose: no proposals, 17.06 -> 17.06 tok/s.
 - **Implementation / evidence:** [union form](../src/hip_moe_q4k_a8_probe.hip), [plan](../include/strix/moe/expert_union.hpp), [binding](../src/hy4/hip/hy4_hip_rows.inc)
+
+### Qwen 27B exact tensor-parallel decode over two nodes
+
+**Engine:** `qwen35` (HIP, IU4 dense). **Control:** `--tp-rank 0|1` on both ranks (`--tp-transport`, `--tp-rates`,
+`--tp-trip-us`, `--tp-force`); levers `STRIX_TP_F16_GATHER` and `STRIX_TP_SPLIT_DRAFT` (default on). **Default:** off
+(one node) unless `--tp-rank` is given; with it, the shared split planner (`include/strix/pair/split_plan.hpp`) keeps the
+decode on one node when the group does not win (unless `--tp-force`).
+
+Each rank loads the model and prefills alone (replicated, same bits), then decodes its column / head shares
+(`core::dense_iu4::run_cols`, `include/strix/pair/column_split.hpp`, `tp_layout.hpp`) with exact joins: all-gathers and a
+split argmax. FP16 gathers feed the IU4 activation rows, whose first operation is the same FP16 conversion, and the
+MTP drafter is split by the trunk's shares. The verify-window costs are the compiled table on every rank, so both ranks
+choose the same windows (labelled `table (forced: ranks must agree)`); an explicit `--spec-costs calibrated|learned`
+with `--tp-rank` is refused. Per-rank read rates come from the topology declaration (`memory_gbytes_ps` of both nodes,
+`--topology FILE --node ID` or `STRIX_TOPOLOGY`) or `--tp-rates`; there is no compiled default. The trip cost is
+measured at start-up over the gather form the decode runs (`include/strix/dist/link_cost.hpp` measure + agree, both
+ranks hold the same bits; `include/strix/pair/tp_inputs.hpp`); `--tp-trip-us` overrides only its latency. The gather
+binding is shared (`include/strix/pair/gather_link.hpp`, HIP side `src/xport/tp_gather_hip.hpp`), as are the join and
+split-argmax kernels (`src/core/tp_join.hpp`). The run's `tp link:` line splits the pass into `link` (host time in the
+exchange; the staged route does not wait for the stream first, the Communicator orders its copy after the producer)
+and `rest`. A vocabulary head that cannot be split (not IU4, or V not a multiple of 64) runs replicated on every rank,
+in the drafter as in the target (`include/strix/pair/tp_layout.hpp` head_columns).
+- **Off switch:** omit `--tp-rank`; `STRIX_TP_F16_GATHER=0` / `STRIX_TP_SPLIT_DRAFT=0` for the levers.
+- **Exactness evidence:** generated ids equal the one-node plain reference over 1,200 tokens (code prompt) with the
+  levers on and off, and over 200 plain tokens. The one-node dense IU4 kernels compile to the same ISA as before; only
+  the column-share kernel is new.
+- **Measured gain:** two Strix Halo nodes over USB4, EXACT, code prompt, 1,200 tokens with MTP speculation: one node
+  46.76 / 46.68 tok/s, tensor parallel 58.50 tok/s in the same run (+25 %).
+
+### Qwen 27B pair prefill: decode relay to one node
+
+**Engine:** `qwen35` (HIP, pair layer split app `strix-hip-qwen35-pair`). **Control:** `STRIX_PAIR_DECODE_RELAY`.
+**Default:** off (layer-owned decode). With `=1` and every node's memory declared, the shared chain planner may choose
+a decoder that holds the whole model; after the layered prefill each stage's layer state moves to it once and it
+decodes alone (a layer split only serialises one-row decode).
+- **Off switch:** `STRIX_PAIR_DECODE_RELAY=0` or unset.
+- **Exactness evidence:** none on this tree yet. The default stays off until a pair run on this tree records the
+  placement line, the relayed state size and time, decode tok/s and ids equal to the one-node reference, for both
+  settings.
+- **Measured gain:** not measured on this tree.

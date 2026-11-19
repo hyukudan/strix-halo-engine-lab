@@ -7,9 +7,19 @@ NT_AMDGPU_METADATA note (msgpack) of each one and reports per kernel: private se
 (scratch) bytes, VGPR/SGPR spill counts, VGPR/SGPR counts, LDS bytes and dynamic stack.
 
 With --allowance FILE it fails (exit 1) when a kernel exceeds its stored allowance.
-Allowance lines: `<kernel-name-or-fnmatch-pattern> <max_private_bytes> [# reason]`.
+Allowance lines: `<kernel-name-or-fnmatch-pattern> <max_private_bytes> [vgpr=N] [sgpr=N] [lds=N] [# reason]`.
 Kernels without a matching line are allowed 0 bytes, 0 spills and no dynamic stack.
-The first matching line wins.
+The first matching line wins. The optional fields are the kernel's static launch budget (a contract checked
+without a GPU): VGPRs / SGPRs as allocated and static LDS bytes must not exceed them.
+
+With --isa-base BASE (repeatable) it compares the machine code of every kernel in the given files against BASE
+(binaries of the base tree built with the same flags): per (target, kernel) the disassembly with addresses, encodings, symbolic
+targets and comments removed must be identical. It prints IDENTICAL / CHANGED / NEW / GONE per kernel matching
+--isa-kernels (fnmatch, default every kernel) and fails when a matching kernel changed or disappeared: the proof
+that a move into a shared home did not change code. Needs llvm-objdump.
+
+--self-test runs the allowance parser, the budget check and the ISA normalisation on built-in samples with
+planted controls (each must fail as planted); it needs neither a GPU nor a binary.
 
 With --nt it also disassembles each code object (llvm-objdump) and counts global/buffer
 loads carrying the slc or nt cache-policy bit per kernel (__builtin_nontemporal_load).
@@ -159,22 +169,157 @@ def kernel_rows(path):
     return rows
 
 
-def load_allowance(path):
+BUDGET_KEYS = ("vgpr", "sgpr", "lds")
+
+
+def parse_allowance(lines):
+    """(pattern, max_private_bytes, {budget key: max}) per non-comment line."""
     rules = []
-    for line in open(path, encoding="utf-8"):
+    for line in lines:
         line = line.split("#", 1)[0].strip()
         if not line:
             continue
-        pattern, limit = line.split()
-        rules.append((pattern, int(limit)))
+        fields = line.split()
+        if len(fields) < 2 or not fields[1].isdigit():
+            raise SystemExit("allowance line needs a pattern and a byte count: %r" % line)
+        budget = {}
+        for field in fields[2:]:
+            key, sep, value = field.partition("=")
+            if not sep or key not in BUDGET_KEYS or not value.isdigit():
+                raise SystemExit("allowance field %r: expected one of %s=N" % (field, "/".join(BUDGET_KEYS)))
+            budget[key] = int(value)
+        rules.append((fields[0], int(fields[1]), budget))
     return rules
 
 
+def load_allowance(path):
+    with open(path, encoding="utf-8") as f:
+        return parse_allowance(f)
+
+
+def rule_for(rules, name):
+    for rule in rules:
+        if rule[0] == name or fnmatch.fnmatchcase(name, rule[0]):
+            return rule
+    return None
+
+
 def allowed(rules, name):
-    for pattern, limit in rules:
-        if pattern == name or fnmatch.fnmatchcase(name, pattern):
-            return limit
-    return 0
+    rule = rule_for(rules, name)
+    return rule[1] if rule else 0
+
+
+def over_budget(rules, row):
+    """[(key, value, limit)] of the row's launch-budget fields above the first matching line's budget."""
+    rule = rule_for(rules, row["name"])
+    if not rule:
+        return []
+    return [(k, row[k], v) for k, v in sorted(rule[2].items()) if row[k] > v]
+
+
+ADDRESS_RE = re.compile(r"^\s*[0-9a-f]+:\s*")
+SYMBOL_RE = re.compile(r"^[0-9a-f]+ <(.+)>:$")
+
+
+def normalized_functions(text):
+    """{symbol: tuple of instructions} from `llvm-objdump -d --no-show-raw-insn` text: addresses, comments,
+    symbolic targets and spacing removed, so that only the instruction stream is compared."""
+    out, current = {}, None
+    for line in text.splitlines():
+        m = SYMBOL_RE.match(line)
+        if m:
+            current = m.group(1)
+            out[current] = []
+            continue
+        if current is None:
+            continue
+        line = line.split("//", 1)[0]
+        line = ADDRESS_RE.sub("", line)
+        line = re.sub(r"<[^>]*>", "", line)
+        line = " ".join(line.split())
+        if line:
+            out[current].append(line)
+    return {k: tuple(v) for k, v in out.items()}
+
+
+def disassemble(objdump, code):
+    with tempfile.NamedTemporaryFile(suffix=".co", delete=False) as t:
+        t.write(code)
+        tmp = t.name
+    try:
+        return subprocess.run([objdump, "-d", "--no-show-raw-insn", tmp], capture_output=True,
+                              text=True, check=True).stdout
+    finally:
+        os.unlink(tmp)
+
+
+def isa_map(objdump, paths):
+    """{(target triple, symbol): set of normalized instruction streams} over every code object of the files."""
+    out = {}
+    for path in paths:
+        for label, co in code_objects(path):
+            target = label.rsplit(":", 1)[-1] if ":" in label else "elf"
+            for symbol, body in normalized_functions(disassemble(objdump, co)).items():
+                out.setdefault((target, symbol), set()).add(body)
+    return out
+
+
+def isa_compare(base, head, pattern):
+    """[(verdict, target, symbol)] for every function matching pattern: IDENTICAL, CHANGED, NEW or GONE."""
+    rows = []
+    for key in sorted(set(base) | set(head)):
+        if not fnmatch.fnmatchcase(key[1], pattern):
+            continue
+        if key not in head:
+            verdict = "GONE"
+        elif key not in base:
+            verdict = "NEW"
+        else:
+            verdict = "IDENTICAL" if base[key] == head[key] else "CHANGED"
+        rows.append((verdict, key[0], key[1]))
+    return rows
+
+
+def self_test():
+    """Planted controls: every check must accept its good sample and reject its planted fault."""
+    failures = []
+
+    def expect(ok, what):
+        if not ok:
+            failures.append(what)
+
+    rules = parse_allowance(["# comment", "k_spill 64 vgpr=128 lds=32768  # reason", "k_wide* 0 vgpr=192", "k_plain 0"])
+    expect([r[0] for r in rules] == ["k_spill", "k_wide*", "k_plain"], "allowance patterns")
+    expect(rules[0][2] == {"vgpr": 128, "lds": 32768} and rules[2][2] == {}, "budget fields")
+    row = {"name": "k_spill", "vgpr": 128, "sgpr": 90, "lds": 32768}
+    expect(over_budget(rules, row) == [], "a kernel at its budget passes")
+    expect(over_budget(rules, dict(row, vgpr=129)) == [("vgpr", 129, 128)], "planted control: one VGPR over fails")
+    expect(over_budget(rules, dict(row, name="k_wide_x", vgpr=200)) == [("vgpr", 200, 192)], "pattern budget applies")
+    expect(over_budget(rules, dict(row, name="unlisted", vgpr=255)) == [], "unlisted kernels carry no budget")
+    for bad in (["k 1 vgpr=x"], ["k 1 regs=3"], ["k"], ["k vgpr=3"]):
+        try:
+            parse_allowance(bad)
+            failures.append("planted control: malformed line %r accepted" % bad[0])
+        except SystemExit:
+            pass
+    a = ("\n0000000000001900 <kern>:\n    1900: s_load_dwordx4 s[0:3], s[4:5], 0x0 // 000000001900: F4080002\n"
+         "    1908: s_cbranch_scc1 3 // 000000001914 <kern+0x14>\n    190c: v_add_f32_e32 v0, v1, v2\n"
+         "\n0000000000001a00 <other>:\n    1a00: s_endpgm\n")
+    moved = a.replace("1900", "2900").replace("1908", "2908").replace("190c", "290c").replace("1914", "2914")
+    changed = a.replace("v_add_f32_e32 v0, v1, v2", "v_mul_f32_e32 v0, v1, v2")
+    expect(len(normalized_functions(a)["kern"]) == 3, "three instructions parsed")
+    expect(normalized_functions(a)["kern"] == normalized_functions(moved)["kern"], "relocated code is identical")
+    base = {("gfx1151", k): {v} for k, v in normalized_functions(a).items()}
+    head = {("gfx1151", k): {v} for k, v in normalized_functions(changed).items()}
+    expect(isa_compare(base, head, "*") == [("CHANGED", "gfx1151", "kern"), ("IDENTICAL", "gfx1151", "other")],
+           "planted control: one changed instruction is CHANGED")
+    expect(isa_compare(base, {k: v for k, v in base.items() if k[1] != "kern"}, "k*") == [("GONE", "gfx1151", "kern")],
+           "planted control: a vanished kernel is GONE")
+    for f in failures:
+        print("SELF-TEST FAIL: %s" % f, file=sys.stderr)
+    if not failures:
+        print("kernel contract self-test PASS (allowance and budget parser, budget check, ISA normalisation, planted controls)")
+    return 1 if failures else 0
 
 
 LOAD_RE = re.compile(r"^\s*(global_load|buffer_load|global_load_tr|flat_load)\S*\s.*\b(slc|nt)\b")
@@ -189,17 +334,10 @@ def nontemporal_loads(objdump, rows):
         if key in seen:
             continue
         seen[key] = True
-        with tempfile.NamedTemporaryFile(suffix=".co", delete=False) as t:
-            t.write(r["code"])
-            tmp = t.name
-        try:
-            text = subprocess.run([objdump, "-d", "--no-show-raw-insn", tmp], capture_output=True,
-                                  text=True, check=True).stdout
-        finally:
-            os.unlink(tmp)
+        text = disassemble(objdump, r["code"])
         current = None
         for line in text.splitlines():
-            m = re.match(r"^[0-9a-f]+ <(.+)>:$", line)
+            m = SYMBOL_RE.match(line)
             if m:
                 current = m.group(1)
                 continue
@@ -210,7 +348,7 @@ def nontemporal_loads(objdump, rows):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("files", nargs="+")
+    ap.add_argument("files", nargs="*")
     ap.add_argument("--allowance", help="fail if a kernel exceeds this stored allowance")
     ap.add_argument("--csv", help="write every kernel row to this CSV file")
     ap.add_argument("--all", action="store_true", help="print every kernel, not only those with scratch or spills")
@@ -218,7 +356,25 @@ def main():
     ap.add_argument("--objdump", default="llvm-objdump")
     ap.add_argument("--write-allowance", help="write the current per-kernel scratch of every flagged kernel as an allowance file")
     ap.add_argument("--quiet", action="store_true", help="print only the summary and check failures")
+    ap.add_argument("--isa-base", action="append", help="base-tree binary (repeatable): fail when a matching kernel's machine code changed")
+    ap.add_argument("--isa-kernels", default="*", help="fnmatch pattern of the functions --isa-base compares")
+    ap.add_argument("--self-test", action="store_true", help="run the built-in checks with planted controls")
     args = ap.parse_args()
+    if args.self_test:
+        return self_test()
+    if not args.files:
+        ap.error("no files")
+    if args.isa_base:
+        verdicts = isa_compare(isa_map(args.objdump, args.isa_base), isa_map(args.objdump, args.files), args.isa_kernels)
+        count = {}
+        for verdict, target, symbol in verdicts:
+            count[verdict] = count.get(verdict, 0) + 1
+            if verdict != "IDENTICAL" or not args.quiet:
+                print("%-9s %s %s" % (verdict, target, symbol))
+        bad = count.get("CHANGED", 0) + count.get("GONE", 0)
+        print("isa identity %s (%s)" % ("FAIL" if bad or not verdicts else "PASS",
+                                       ", ".join("%d %s" % (n, v) for v, n in sorted(count.items())) or "no matching kernel"))
+        return 1 if bad or not verdicts else 0
 
     rows = []
     for f in args.files:
@@ -263,18 +419,22 @@ def main():
     if args.allowance:
         rules = load_allowance(args.allowance)
         bad = []
+        over = []
         for r in rows:
             limit = allowed(rules, r["name"])
             if r["private"] > limit or r["dynamic_stack"] or (limit == 0 and (r["vgpr_spill"] or r["sgpr_spill"])):
                 bad.append((r, limit))
+            over.extend((r, k, v, m) for k, v, m in over_budget(rules, r))
         for r, limit in bad:
             print("SCRATCH CHECK FAIL: %s private %d B (allowance %d), vgpr_spill %d, sgpr_spill %d%s" % (
                 r["name"], r["private"], limit, r["vgpr_spill"], r["sgpr_spill"],
                 ", dynamic stack" if r["dynamic_stack"] else ""), file=sys.stderr)
-        if bad:
+        for r, key, value, limit in over:
+            print("BUDGET CHECK FAIL: %s %s %d (budget %d)" % (r["name"], key, value, limit), file=sys.stderr)
+        if bad or over:
             return 1
         slack = sum(1 for r in flagged if r["private"] < allowed(rules, r["name"]))
-        unused = sum(1 for pattern, _ in rules if not any(pattern == r["name"] or fnmatch.fnmatchcase(r["name"], pattern) for r in rows))
+        unused = sum(1 for pattern, _, _ in rules if not any(pattern == r["name"] or fnmatch.fnmatchcase(r["name"], pattern) for r in rows))
         print("scratch check PASS (%d kernels; %d below their allowance, %d allowance lines match no kernel)" % (
             len(rows), slack, unused))
     return 0

@@ -82,9 +82,11 @@ __device__ __forceinline__ _Float16 to_f16_value(float v) {
 // of one column block are adjacent in dispatch order, so they read its weight slice while it is L2 / MALL resident instead
 // of re-streaming it from DRAM once per R rows. Stored rows are bitwise those of run() with <= 16 rows (row independence
 // above); xh must hold the rows rounded up to R (pad rows are read, never stored).
-template <unsigned R, unsigned MaxG, unsigned Rc, bool UX, bool Grid2 = false>
+// Share = true (cols_kernel only): store at (out_stride, out_quad) instead of (outputs, quad); false compiles to the
+// full-launch store (the share parameters are dead).
+template <unsigned R, unsigned MaxG, unsigned Rc, bool UX, bool Grid2 = false, bool Share = false>
 __device__ __forceinline__ void block_body(const std::uint8_t* w, unsigned inputs, unsigned outputs, const _Float16* xh, float* out,
-                                           unsigned nrows, unsigned quad) {
+                                           unsigned nrows, unsigned quad, unsigned out_stride, unsigned out_quad) {
     constexpr unsigned S = kWaves, KT = MaxG * 4U;
     __shared__ float part[R * S * 64];
     if constexpr (Grid2) {
@@ -123,14 +125,26 @@ __device__ __forceinline__ void block_body(const std::uint8_t* w, unsigned input
         float sum = part[(r * S) * 64U + c];
 #pragma unroll
         for (unsigned s = 1; s < S; ++s) sum += part[(r * S + s) * 64U + c];
-        out[std::size_t(r) * outputs + quad * 64U + c] = sum;
+        if constexpr (Share) out[std::size_t(r) * out_stride + out_quad * 64U + c] = sum;
+        else out[std::size_t(r) * outputs + quad * 64U + c] = sum;
     }
 }
 
 template <unsigned R, unsigned MaxG, unsigned Rc = R, bool UX = false, bool Grid2 = false>
 __global__ void __launch_bounds__(32 * kWaves) kernel(const std::uint8_t* w, unsigned inputs, unsigned outputs, const _Float16* xh,
                                                       float* out, unsigned nrows) {
-    block_body<R, MaxG, Rc, UX, Grid2>(w, inputs, outputs, xh, out, nrows, Grid2 ? blockIdx.y : blockIdx.x);
+    const unsigned quad = Grid2 ? blockIdx.y : blockIdx.x;
+    block_body<R, MaxG, Rc, UX, Grid2>(w, inputs, outputs, xh, out, nrows, quad, outputs, quad);
+}
+
+// Column share (exact tensor parallelism, rows 1..16): the launch covers column blocks [quad0, quad0 + gridDim.x) of the
+// N = outputs matrix and stores column quad0 * 64 + j into out[r * out_stride + j]. A column's value depends only on the
+// pack, N, K, xh and the column (K split and LDS reduction order are per block, block_body), so a share holds bitwise
+// the columns of kernel's full launch. kernel and group_kernel are unchanged (they store at their own quad, stride N).
+template <unsigned R, unsigned MaxG, unsigned Rc = R, bool UX = false>
+__global__ void __launch_bounds__(32 * kWaves) cols_kernel(const std::uint8_t* w, unsigned inputs, unsigned outputs, const _Float16* xh,
+                                                           float* out, unsigned nrows, unsigned quad0, unsigned out_stride) {
+    block_body<R, MaxG, Rc, UX, false, true>(w, inputs, outputs, xh, out, nrows, quad0 + blockIdx.x, out_stride, blockIdx.x);
 }
 
 // Projection group (decode step plan, strix/decode_projection_group.hpp): projections of the same prepared rows xh
@@ -148,7 +162,7 @@ __global__ void __launch_bounds__(32 * kWaves) group_kernel(Group g, unsigned in
     unsigned m;
     std::uint32_t quad;
     ::strix::decode::locate(g.first, g.count, blockIdx.x, m, quad);  // blockIdx-uniform: scalar
-    block_body<R, MaxG, Rc, UX>(g.w[m], inputs, g.outputs[m], xh, g.out[m], nrows, quad);
+    block_body<R, MaxG, Rc, UX>(g.w[m], inputs, g.outputs[m], xh, g.out[m], nrows, quad, g.outputs[m], quad);
 }
 
 // STRIX_IU4_ROW_REUSE: unset/1 = core calls of up to 8 rows (default), 0 = old 4-row chunks.
@@ -197,6 +211,14 @@ void launch_bucket(const std::uint8_t* w, unsigned inputs, unsigned outputs, con
     const dim3 grid = Grid2 ? dim3(dense_iu4_rows::blocks(rows), outputs / 64U) : dim3(outputs / 64U), block(32U * kWaves);
     dispatch_bucket<R>(inputs, [&]<unsigned G, unsigned Rc, bool UX>() {
         kernel<R, G, Rc, UX, Grid2><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
+    });
+}
+template <unsigned R>
+void launch_cols_bucket(const std::uint8_t* w, unsigned inputs, unsigned outputs, const _Float16* xh, float* out, unsigned rows,
+                        hipStream_t s, unsigned quad0, unsigned quads, unsigned out_stride) {
+    const dim3 grid(quads), block(32U * kWaves);
+    dispatch_bucket<R>(inputs, [&]<unsigned G, unsigned Rc, bool UX>() {
+        cols_kernel<R, G, Rc, UX><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows, quad0, out_stride);
     });
 }
 template <unsigned R>
@@ -258,6 +280,23 @@ inline void run(const std::uint8_t* w, unsigned inputs, unsigned outputs, const 
     else if (rows <= 4U) launch_bucket<4>(w, inputs, outputs, xh, out, rows, s);
     else if (rows <= 8U) launch_bucket<8>(w, inputs, outputs, xh, out, rows, s);
     else launch_bucket<16>(w, inputs, outputs, xh, out, rows, s);
+}
+// Columns [first, first + count) of the N = outputs projection (first, count multiples of 64; rows 1..16): a
+// tensor-parallel share. Reads only those columns' tiles and scales; column first + j goes to out[r * out_stride + j]
+// (rank-local compact share: out_stride = count; in place in a full-width buffer: out + first, out_stride = outputs).
+// Bitwise the same columns as run() (cols_kernel).
+inline void run_cols(const std::uint8_t* w, unsigned inputs, unsigned outputs, unsigned first, unsigned count, const _Float16* xh,
+                     float* out, unsigned out_stride, unsigned rows, hipStream_t s) {
+    if (!supported(outputs, inputs) || rows == 0U || rows > kMaxRows || first % 64U != 0U || count % 64U != 0U ||
+        first > outputs || count > outputs - first || out_stride < count)
+        throw std::runtime_error("iu4 dense projection: unsupported shape, rows or column range");
+    if (count == 0U) return;
+    const unsigned q0 = first / 64U, q = count / 64U;
+    if (rows <= 1U) launch_cols_bucket<1>(w, inputs, outputs, xh, out, rows, s, q0, q, out_stride);
+    else if (rows <= 2U) launch_cols_bucket<2>(w, inputs, outputs, xh, out, rows, s, q0, q, out_stride);
+    else if (rows <= 4U) launch_cols_bucket<4>(w, inputs, outputs, xh, out, rows, s, q0, q, out_stride);
+    else if (rows <= 8U) launch_cols_bucket<8>(w, inputs, outputs, xh, out, rows, s, q0, q, out_stride);
+    else launch_cols_bucket<16>(w, inputs, outputs, xh, out, rows, s, q0, q, out_stride);
 }
 // Projections of the same prepared rows xh (one `inputs`) in ONE launch (decode step plan: projection group); rows 1..16.
 // Every member's output is bitwise run()'s: same block body, operands and order. One member = run().

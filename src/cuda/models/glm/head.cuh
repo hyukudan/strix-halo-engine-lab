@@ -15,7 +15,9 @@ std::size_t head_workspace_bytes(unsigned rows);
 cudaError_t decode_head(Matrix packed,U16* decoded,cudaStream_t);
 // hidden [rows,4096] final-normalized FP32 -> logits [rows,154880] FP32.
 cudaError_t enqueue_head(const HeadWeights&,const float* hidden,float* logits,unsigned rows,void* workspace,std::size_t bytes,cudaStream_t);
-// result[0]=token (0xffffffff if none), result[1]=nonfinite count, result[2]=winning logit bits.
-// Order: logit descending, token ascending; +0==-0; nonfinite never wins.
-cudaError_t enqueue_argmax(const float* logits,unsigned n,U32* result,cudaStream_t);
+// Per row j of rows (logits + j*n): result[4j]=token (0xffffffff if none), result[4j+1]=nonfinite count,
+// result[4j+2]=winning logit bits. Order: logit descending, token ascending; +0==-0; nonfinite never wins (the shared
+// head pick, strix/head_argmax.hpp). workspace: argmax_workspace_bytes(rows) of device memory; rows <= 16.
+std::size_t argmax_workspace_bytes(unsigned rows);
+cudaError_t enqueue_argmax(const float* logits,unsigned n,unsigned rows,U32* result,void* workspace,cudaStream_t);
 }

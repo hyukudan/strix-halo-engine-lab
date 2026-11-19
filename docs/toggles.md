@@ -24,12 +24,13 @@ You only need this page to inspect a path, to debug, or to move the engine to di
 
 | Profile | What it does |
 |---|---|
-| `--profile default` | Current production path; exports no profile overrides. This is the default. |
-| `--profile fast` | Adds only qualified bit-changing options. Rows that are not qualified yet stay off (see `--allow-pending`). |
+| `--profile exact` (alias `default`) | Current production path; exports no profile overrides. This is the default. |
+| `--profile fast` | Adds every qualified bit-changing option, and the rows selected for fast ahead of their receipt (stamped "qualification in progress" in the receipt). Rows that are neither stay off (see `--allow-pending`). MiniMax: the qualified bundle `mm-fast-pf-v2` (the same members and prefill identity as `STRIX_MM_FAST_PREFILL=1`; refused with `--baseline`). GLM pair: nothing (`STRIX_GLM_PF_WMMA` is unqualified for fast: its FAST prefill set fails the 8K quality gate; it runs only when set explicitly). DeepSeek pair: the FAST bundle and its Engram / shared / MoE FP16 levers stay explicit until their quality gate. A set switch, `0` included, wins. |
 | `--profile quality` | A higher-precision pack where one exists (Nemotron EXL3). Otherwise equal to `default`. |
+| `--profile` on `strix-cuda-ds41-prefill-service` | DS41 RTX prefill service: takes the same word (`exact`/`default`, `fast`; `STRIX_DS41_PROFILE`) and `--allow-pending` as the replica, through the same resolver (`strix/profiles/ds41_rtx.hpp`). Today every fast row is pending (listed in `levers`, never used), so `fast` runs as `exact`. |
 
-Named profiles exist for Qwen, the DeepSeek pair, Gemma4/Nemotron and `strix-glm5-rank`.
-MiniMax has no named product profile: `--profile NAME:PROMPT.u32:STEPS` runs a timed session.
+Named profiles exist for Qwen, the DeepSeek pair, Gemma4/Nemotron and `strix-glm5-rank`. Every word parser, Gemma 4 and the GLM RTX producer included, takes `exact` (= `default`) through the shared tier parser; engines without a TURBO column refuse `turbo` with that reason.
+MiniMax takes the same words (`--profile exact|fast|...`); `--profile NAME:PROMPT.u32:STEPS` still runs a timed session.
 The CUDA Qwen dense 27B CLIs (`strix-cuda-qwen35-decode`, `strix-cuda-qwen35-spec`) take the same word, `--profile exact|default|fast|quality`
 (`exact` = `default`; `turbo` is refused: no TURBO bar for this engine yet). One table, `include/strix/profiles/qwen_dense_cuda.hpp`, resolved by
 the shared resolver for both CLIs: `fast` turns on each lever only in the regime where its gate passed; an explicit option wins and
@@ -43,8 +44,9 @@ identity names every applied lever.
 | `--prefill-gdn chunk16` | same regime (gated together with FAST4) | `--prefill-gdn serial` |
 | `--prefill-attn8 on` | same regime, prompt of at least 32,768 tokens (32K gate passed; no 8K gate) | `--prefill-attn8 off` |
 | `--split-k fast` | spec CLI (decode windows), `--turbo-weights onfly\|converted`: FAST `nvfp4-splitk-fast-v1` (gate passed; spec verify 0.6-0.7 % faster). Decode CLI: pending (its `fast` already applies FAST4; that combination has no gate yet) | `--split-k exact` |
+| `--decode-attn8 on` | pending on both CLIs (no qualified regime yet: gate at 8K / 28K / 64K not run). Decode / verify attention on e4m3 tensor cores over the e4m3 K/V shadow, identity `-d8`; verify rows give the same bits as one-row decode; on the spec CLI it also covers the prefill windows. Explicit `--decode-attn8 on` runs it in any regime | `--decode-attn8 off` |
 
-The spec CLI prefills through decode windows, so only `split_k` is offered there.
+The spec CLI prefills through decode windows, so only `split_k` and `decode_attn8` are offered there.
 GLM rank accepts `--profile default|fast|quality` (also `--profile=NAME`); its bare `--profile` still enables kernel timing
 and can be combined with a named profile. GLM `fast` sets only `STRIX_GLM_PF_WMMA=1`; an explicit environment
 value wins, and `--baseline` / `STRIX_GLM_BASELINE=1` vetoes the profile addition. `quality` uses default settings
@@ -123,6 +125,7 @@ The tables below list the curated flags. The full list of environment variables 
 | `--prefill-path device` | deepseek serve | `device` | Prefill on the GPU. | - |
 | `--wide-exact N` | qwen (27B HIP decode app) | off (16-row windows) | EXACT prefill windows of N rows, every row bitwise the 16-row result; only when every large dense projection is IU4 (other formats resolve to 16 rows). `--wide N` (> 16) is the FAST wide class. [Details](optimizations.md#qwen27-hip-decode-step). | 64 measured best on Strix (exact attention costs more per row in wider grids). |
 | `--prefill-rows N`, `--prefill-exact` | qwen (27B HIP spec app) | 64-row EXACT windows (IU4 dense projections; 16 rows otherwise) | `--prefill-rows 16` = 16-row windows; N > 16 = the FAST wide class unless `--prefill-exact` is given. [Details](optimizations.md#qwen27-hip-decode-step). | - |
+| `--profile exact\|fast` | qwen (27B HIP decode and spec apps) | `exact` (= `default`) | Tier word; `exact` changes nothing. `fast` selects 64-row FAST wide prefill windows once its composite gate passes; until then it is pending (reported, not applied) unless `--allow-pending`. `--wide N` / `--prefill-rows N` win over the word. | Pair app: not bound (its `--wide 512` is already the FAST class). |
 | `--vision FILE` | deepseek serve (rank 0) | off | Image input: loads the vision GGUF and accepts `image_url` parts. Needs `--prefill-path device`. [Image input](engine/vision.md). | - |
 | `STRIX_VISION_RESIDENT` | deepseek serve | 1 | `1`: the image tower is uploaded at start; `0`: on the first image. | `0` to keep the memory free until an image arrives. |
 | `STRIX_VISION_CACHE_MIB` | deepseek serve | 256 | Size of the image embed cache in MiB; `0` disables storing. | Larger when the same images repeat. |
@@ -132,6 +135,7 @@ The tables below list the curated flags. The full list of environment variables 
 | Flag | Engine | Default | What it does | When other hardware wants it |
 |---|---|---|---|---|
 | `--mtp-bundle`, `--rope-yarn 2\|4 --context C` | qwen | - | MTP draft bundle; YaRN for long context. | - |
+| `--prelaunch 0\|1` | qwen-rtx (dense 27B spec CLI) | `0` | Launches the verify behind the device-fed MTP draft (same ids). | - |
 | `--mtp 0\|1` | glm | resolved (see `--print-effective-config`) | Turns the MTP draft off or on. | `0` when memory is short. |
 | `--identity r1b\|r1` | glm | `r1b` | Decode identity. | `r1` to compare. |
 | `--dspark`, `--no-dspark`, `--dspark-vocab auto\|full` | deepseek | on when the draft is found | DSpark speculative draft. | `--no-dspark` when memory is short. |
@@ -151,6 +155,9 @@ The tables below list the curated flags. The full list of environment variables 
 | `--engram-direct`, `--engram-mapped` | deepseek | `direct` | Engram table access. | `mapped` when memory is short. |
 | `--decode-xch xfer\|comm`, `STRIX_GLM_DECODE_XCH` | glm | `xfer` (`comm` in baseline) | Decode exchange mode. | Compare both on a different interconnect. |
 | `--wb-defer`, `--wb-stream`, `--ce-pacing` (`--no-*`) | deepseek-rtx | on | Write-back and copy-engine pacing. Also `STRIX_DS41_WB_STREAM`, `STRIX_DS41_CE_PACING`. | Off on links where the copy engine is not the bottleneck. |
+| `--tp-rank 0\|1`, `--tp-transport`, `--tp-rates A,B`, `--tp-trip-us`, `--tp-force` | qwen dense decode (HIP) | off (one node) | Exact tensor-parallel decode over two ranks: column / head shares, exact gathers. `--tp-rates` (GB/s per rank) overrides the topology rates, `--tp-trip-us` the measured trip latency, `--tp-force` keeps the group when the planner says it loses. [Entry](optimizations.md#qwen-27b-exact-tensor-parallel-decode-over-two-nodes). | Per-rank rates come from the topology declaration; a same-box pair measures its own trip at start-up. |
+| `--topology FILE --node ID`, `STRIX_TOPOLOGY` | qwen dense decode (HIP) | none | Topology declaration read for the tensor-parallel rates (`memory_gbytes_ps` of both nodes). | Declare each node's measured memory rate. |
+| `STRIX_PAIR_DECODE_RELAY=1` | qwen pair prefill (HIP) | off | After the layered prefill, moves each stage's layer state once to a node that holds the whole model and decodes there. Not measured on this tree. [Entry](optimizations.md#qwen-27b-pair-prefill-decode-relay-to-one-node). | When one node holds the whole model and the layer split serialises decode. |
 | `STRIX_DS41_OB_SPLIT=K` | deepseek | off | Splits the o_b exchange into K chunks that overlap compute. Exact. Slower on the host path. | Try on a faster interconnect or with GPU-direct. |
 
 Pair setup: [pair-setup.md](pair-setup.md).
@@ -159,7 +166,7 @@ Pair setup: [pair-setup.md](pair-setup.md).
 
 | Flag | Engine | Default | What it does |
 |---|---|---|---|
-| `--profile default\|fast\|quality` | qwen, deepseek pair, gemma4/nemotron, glm rank | `default` | See [Profiles](#profiles-exact-vs-fast). |
+| `--profile exact\|default\|fast\|quality` | qwen, deepseek pair, gemma4/nemotron, glm rank | `exact` (= `default`) | See [Profiles](#profiles-exact-vs-fast). |
 | `--profile` (bare) | glm rank | off | Kernel timing; preserved alongside named profiles. |
 | `--profile NAME:PROMPT.u32:STEPS` | minimax rank | off | Timed session, not a product profile. |
 | `--allow-pending` | pair apps | off | Lets `fast` apply rows that are not qualified yet. |
@@ -242,7 +249,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_HOST_WAIT` | qwen | block | [host-wait-policy](optimizations.md#host-wait-policy) |
 | `STRIX_SESSION_CACHE` | minimax | on (two-node serve route) | [mm-sessions](optimizations.md#mm-sessions) |
 
-### Prefill (97)
+### Prefill (98)
 
 | Toggle | Engine | Default | Details |
 |---|---|---|---|
@@ -366,6 +373,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_SERVE_PREFILL_GROUP` | deepseek (pair) | auto | several short prompts admitted together share one device prefill pass; `0` = one pass per prompt; `STRIX_SERVE_PREFILL_GROUP_MEMBERS` (2..64) caps a group; [DeepSeek page](models/deepseek-v4.1/README.md) |
 | `STRIX_SERVE_T16K` | qwen | ON: T16384 owner when the context admits a 32,768-token request and every resident slot fits; `0` keeps T8192 | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 | `STRIX_SERVE_FP16_MTP` | qwen | ON: explicit-sidecar MTP servers keep the automatic FP16 prefill arithmetic with the unqualified fast options off; `0` declines it | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
+| `STRIX_QRTX_PLE_A8` | qwen-rtx | off (opt-in under `--profile fast`, FAST gate pending) | [qwen-rtx-ple-a8](optimizations.md#qwen-rtx-ple-a8) |
 
 ### Decode, MTP and DSpark (26)
 
