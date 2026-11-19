@@ -9,6 +9,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -32,6 +33,7 @@
 #include "../../core/dense_linear_iu4.hpp"
 #include "../../core/window_state_buffers.hpp"
 #include "../../core/a4_tiles.hpp"
+#include "../../core/iu4a4_dense.hpp"
 #include "../../core/f16_dense_iu4.hpp"
 #include "../../core/f16_dense_q8a8.hpp"
 #include "../../ops/norm/norm_device.hpp"
@@ -146,6 +148,8 @@ struct Tensor {
     std::uint8_t* data = nullptr;
     unsigned inputs = 0, outputs = 0, fmt = 0;  // fmt: ggml type 0 f32, 1 f16, 8 q8_0, 30 bf16, 200 IU4 g64 (shared pack)
     std::size_t bytes = 0, row_bytes = 0;
+    std::uint8_t* a4 = nullptr;  // STRIX_DENSE_A4W4: rotated W4 codes (core/iu4a4_dense.hpp), requantised at load
+    float* a4_step = nullptr;
 };
 constexpr unsigned kMaxRows = HipEngine::max_rows();
 
@@ -232,6 +236,7 @@ void dispatch_rows(unsigned rows, const Tensor& w, const Tensor& up, const float
 // + xt: FP16 x tiles of the x16 form of the IU4 wide GEMM (rows x max inputs, f16_dense_tall::x16_bytes).
 struct WideScratch : core::DenseWideScratch {
     _Float16* xt = nullptr;
+    core::iu4a4_dense::Act a4{};  // STRIX_DENSE_A4W4: activation codes / group scales / row bases of one window
 };
 
 // A8 of 32-value groups, one wave per group (as quantize_a8: amax / 127, rint, clamp +-127; delta 1 for zero or tiny groups).
@@ -389,6 +394,28 @@ int fast4_emu() {
     }();
     return mode;
 }
+// STRIX_DENSE_A4W4 = 0 (default) | 1: the wide IU4 GEMMs of the layers run the shared A4W4 class (core/iu4a4_dense.hpp,
+// FAST, contract dense-iu4a4-rot-v1: Hadamard-128 rotated A4 g32 activations x rotated W4 per-128 weights on iu4 WMMA).
+// Opt-in until the FAST gate passes; never in a profile or the ready set before that.
+bool a4w4_on() {
+    static const bool on = [] {
+        const bool v = strix::envcfg::flag("STRIX_DENSE_A4W4", false);
+        if (v) std::fprintf(stderr, "qwen35-hip: FAST class %s on the wide IU4 layer GEMMs (opt-in, gate pending)
+", core::iu4a4_dense::kIdentity);
+        return v;
+    }();
+    return on;
+}
+bool a4_ok(const Tensor& t, const WideScratch& wide) { return t.a4 && wide.a4.codes; }
+// out = x W^T in the A4W4 class; quantise = false reuses the activation operand of the previous call (same x, same in).
+void a4_linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s, const WideScratch& wide, bool quantise = true) {
+    namespace ad = core::iu4a4_dense;
+    ad::Act act = wide.a4;
+    act.rows = rows;
+    act.in = w.inputs;
+    if (quantise) ad::enqueue_quantise(x, w.inputs, act, s);
+    ad::enqueue_gemm(ad::Weights{w.a4, w.a4_step, w.inputs, w.outputs}, act, ad::OutCols{out, w.outputs, w.outputs / 16U}, s);
+}
 template <class Q> struct WithQ { using type = Q; };
 template <class K> void with_tile_quantiser(K&& k) {
     namespace a4 = core::a4_tiles;
@@ -415,7 +442,9 @@ void wide_iu4(const Tensor& w, const float* x, float* out, unsigned rows, hipStr
     else core::f16_dense_tall::iu4a16::enqueue(wide_iu4_view(w, x, out, rows), s);
 }
 void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s, const WideScratch& wide, const Iu4Scratch& iu4) {
-    if (rows > 16U && wide_ok(w, wide)) {
+    if (rows > 16U && a4_ok(w, wide)) {
+        a4_linear(w, x, out, rows, s, wide);
+    } else if (rows > 16U && wide_ok(w, wide)) {
         wide_quant(x, w.inputs, rows, s, wide);
         wide_dense(w, out, rows, s, wide);
     } else if (rows > 16U && wide_iu4_ok(w, wide, rows)) {
@@ -438,6 +467,11 @@ void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStrea
 void mlp(const Tensor& g, const Tensor& u, const Tensor& d, const float* x, float* h, float* out, unsigned rows, hipStream_t s,
          const WideScratch& wide, const Iu4Scratch& iu4) {
     static const bool fuse = strix::envcfg::flag("STRIX_DENSE_GLU_X16", true);
+    if (rows > 16U && a4_ok(g, wide) && a4_ok(u, wide) && a4_ok(d, wide)) {  // A4W4: glu then down (h quantised by its own pass)
+        glu(g, u, x, h, rows, s, wide, iu4);
+        linear(d, h, out, rows, s, wide, iu4);
+        return;
+    }
     if (fuse && rows > 16U && !wide_ok(g, wide) && wide_iu4_ok(g, wide, rows) && wide_iu4_ok(u, wide, rows) && wide_iu4_ok(d, wide, rows) &&
         g.outputs == u.outputs && d.inputs == g.outputs && wide_iu4_x16(d, wide, rows)) {
         const bool x16 = wide_iu4_x16(g, wide, rows);
@@ -454,7 +488,11 @@ void mlp(const Tensor& g, const Tensor& u, const Tensor& d, const float* x, floa
     linear(d, h, out, rows, s, wide, iu4);
 }
 void glu(const Tensor& g, const Tensor& u, const float* x, float* out, unsigned rows, hipStream_t s, const WideScratch& wide, const Iu4Scratch& iu4) {
-    if (rows > 16U && wide_ok(g, wide) && wide_ok(u, wide) && g.outputs == u.outputs) {
+    if (rows > 16U && a4_ok(g, wide) && a4_ok(u, wide) && g.inputs == u.inputs && g.outputs == u.outputs) {
+        a4_linear(g, x, wide.g, rows, s, wide);
+        a4_linear(u, x, wide.u, rows, s, wide, false);  // gate and up share one quantised x
+        silu_mul_kernel<<<1024, 256, 0, s>>>(wide.g, wide.u, out, std::size_t(rows) * g.outputs);
+    } else if (rows > 16U && wide_ok(g, wide) && wide_ok(u, wide) && g.outputs == u.outputs) {
         wide_quant(x, g.inputs, rows, s, wide);
         wide_dense(g, wide.g, rows, s, wide);
         wide_dense(u, wide.u, rows, s, wide);
@@ -571,7 +609,7 @@ struct HipEngine::Impl {
     ~Impl() {
         if (stream) (void)hipStreamSynchronize(stream);
         auto fr = [](auto* p) { if (p) (void)hipFree(p); };
-        auto fn = [&](Tensor& t) { fr(t.data); };
+        auto fn = [&](Tensor& t) { fr(t.data); fr(t.a4); fr(t.a4_step); };
         fn(embd); fn(onorm); fn(head);
         for (auto& y : L)
             for (Tensor* t : {&y.attn_norm, &y.post_norm, &y.gate, &y.up, &y.down, &y.qkv, &y.z, &y.beta, &y.alpha, &y.conv, &y.dt,
@@ -584,6 +622,7 @@ struct HipEngine::Impl {
         fr(d_ids); fr(d_arg);
         fr(dhead); fr(d_dmap);
         fr(wide.codes); fr(wide.deltas); fr(wide.g); fr(wide.u); fr(wide.xt);
+        fr(wide.a4.codes); fr(wide.a4.u); fr(wide.a4.base);
         fr(iu4.xh); fr(iu4.g); fr(iu4.u);
         if (stream) (void)hipStreamDestroy(stream);
     }
@@ -591,6 +630,32 @@ struct HipEngine::Impl {
     template <class T> static void alloc0(T** p, std::size_t bytes) {
         HK(hipMalloc(p, bytes));
         HK(hipMemset(*p, 0, bytes));
+    }
+
+    // STRIX_DENSE_A4W4: activation operand of one window (rows x maxin) and the rotated copy of every wide-eligible IU4
+    // layer projection (requantised on the device from the resident g64 pack; the pack stays for decode / exact paths).
+    void load_a4(unsigned rows, unsigned maxin) {
+        namespace ad = core::iu4a4_dense;
+        alloc0(&wide.a4.codes, ad::act_code_bytes(rows, maxin));
+        alloc0(&wide.a4.u, ad::act_u_bytes(rows, maxin));
+        alloc0(&wide.a4.base, ad::act_base_bytes(rows));
+        const auto t0 = std::chrono::steady_clock::now();
+        std::size_t bytes = 0;
+        unsigned count = 0;
+        for (unsigned l = own_begin; l < own_end; ++l)
+            for (Tensor* t : {&L[l].gate, &L[l].up, &L[l].down, &L[l].qkv, &L[l].z, &L[l].out, &L[l].q, &L[l].k, &L[l].v, &L[l].o}) {
+                if (!t->data || t->fmt != kIu4Fmt || !ad::supported(t->inputs, t->outputs)) continue;
+                HK(hipMalloc(&t->a4, ad::weight_code_bytes(t->inputs, t->outputs)));
+                HK(hipMalloc(&t->a4_step, ad::weight_step_bytes(t->inputs, t->outputs)));
+                const auto* scale = reinterpret_cast<const std::uint16_t*>(t->data + core::dense_iu4::packed_bytes(t->outputs, t->inputs));
+                ad::enqueue_requantise(t->data, scale, t->inputs, t->outputs, t->a4, t->a4_step, nullptr);
+                HK(hipGetLastError());
+                bytes += ad::weight_code_bytes(t->inputs, t->outputs) + ad::weight_step_bytes(t->inputs, t->outputs);
+                ++count;
+            }
+        HK(hipDeviceSynchronize());
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "qwen35-hip: A4W4 rotated weights: %u tensors, %.2f GiB, %.0f ms\n", count, double(bytes) / double(1ULL << 30), ms);
     }
 
     void load(const std::string& path) {
@@ -691,6 +756,7 @@ struct HipEngine::Impl {
             alloc0(&wide.g, std::size_t(RS) * I * 4U);
             alloc0(&wide.u, std::size_t(RS) * I * 4U);
             alloc0(&wide.xt, core::f16_dense_tall::x16_bytes(RS, unsigned(maxin)));
+            if (a4w4_on()) load_a4(RS, unsigned(maxin));
             // flash attention of the wide windows: geometry the shared adapter is instantiated for (Dim 256, GQA group 6)
             if (D == 256U && cfg.heads == 6U * cfg.kv_heads) {
                 vt_stride = (opt.max_positions + 15U) / 16U * 16U;
