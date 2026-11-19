@@ -28,7 +28,8 @@ inline constexpr strix::fast_profile::Member kFastMembers[] = {
     {"STRIX_MM_PF_MSA_FLASH", "1", "msa-flash-bf16-l40-v1", "1 2 3"},
     {"STRIX_MM_PF_ROUTER_WMMA", "1", "mm-pf-router-wmma-v1"},
 };
-inline constexpr strix::fast_profile::Bundle kFastBundle{"STRIX_MM_FAST_PREFILL", "mm-fast-pf-v2", kFastMembers};
+inline constexpr strix::fast_profile::Bundle kFastBundle{"STRIX_MM_FAST_PREFILL", "mm-fast-pf-v2", kFastMembers,
+                                                         "docs/optimizations.md#fast-key-split-msa-attention-core-mm-pf-msa-flash"};
 inline constexpr const char* kMsaFlashLayers = "40-59";  // passes the FAST gate on EXL3 at 8K and 32K; 30-59 8K only
 // FAST mm-pf-router-wmma-v1 (STRIX_MM_PF_ROUTER_WMMA=1, or the bundle mm-fast-pf-v2; "0" opts out): the prefill
 // router product of the MoE layers in STRIX_MM_PF_ROUTER_WMMA_LAYERS on the shared FP16 WMMA core. The default set is
@@ -72,9 +73,13 @@ static_assert(msa_flash_policy(kMsaFlashLayers) != nullptr &&
 // Bundle selection is requested provenance; only effective members enter agreement.
 inline constexpr std::array<strix::profile::Lever, 9> profile_table{{
     // Prefill only: MSA attention of windows > 8 rows; selection, block lists and K/V caches unchanged.
-    {"msa_flash", "STRIX_MM_PF_MSA_FLASH", "", {"", "", "", "1"}, "0", strix::profile::Kind::bit_changing,
-     {true, false, true, false}, {true, true, true, false}, "", "0",
-     "msa-flash-bf16-l40-v1 (EXL3 gate PASS 8K KL 0.0012, 32K KL 0.0029); 2 = two-term operands; pending turbo adapter admission/export for mode 1 on layers 0-59",
+    // fast: member of the qualified bundle mm-fast-pf-v2 ('--profile fast' expands the bundle, mm_defaults.cpp
+    // prefill_policy: same admission as STRIX_MM_FAST_PREFILL=1). The fast cells of the two members are the bundle's
+    // values; tests/profile_fast_set_tests.cpp fails if one is emptied.
+    {"msa_flash", "STRIX_MM_PF_MSA_FLASH", "", {"", "1", "", "1"}, "0", strix::profile::Kind::bit_changing,
+     {true, true, true, false}, {true, true, true, false}, "", "0",
+     "msa-flash-bf16-l40-v1, bundle mm-fast-pf-v2 (EXL3 gate PASS 8K KL 0.0012, 32K KL 0.0029; docs/optimizations.md#fast-key-split-msa-attention-core-mm-pf-msa-flash); "
+     "2 = two-term operands; pending turbo adapter admission/export for mode 1 on layers 0-59",
      false, {}, true},
     {"msa_flash_layers", "STRIX_MM_PF_MSA_FLASH_LAYERS", "", {"", "", "", "0-59"}, kMsaFlashLayers, strix::profile::Kind::bit_changing,
      {true, false, true, false}, {true, true, true, false}, "", "", "FAST MSA flash layer set (read only while msa_flash is on); pending turbo adapter admission/export for 0-59, then per-prompt qualification with scripts/bench/mmflash",
@@ -95,8 +100,10 @@ inline constexpr std::array<strix::profile::Lever, 9> profile_table{{
     // Explicit only: 32K quality gate failed; no profile selects f16.
     strix::xport::exchange_format_lever(),
     // Prefill only: router product of the listed MoE layers on the FP16 WMMA core; sigmoid, bias and selection unchanged.
-    {"router_wmma", "STRIX_MM_PF_ROUTER_WMMA", "", {"", "", "", ""}, "0", strix::profile::Kind::bit_changing,
-     {true, false, true, false}, {true, true, true, false}, "", "0", "mm-pf-router-wmma-v1 (FAST bundle mm-fast-pf-v2; gate 8K KL 0.0020, 32K pfe2o)", false, {}, true},
+    // fast: member of mm-fast-pf-v2 (see msa_flash). Turbo cell "0" = builtin: turbo keeps its pre-bundle rows.
+    {"router_wmma", "STRIX_MM_PF_ROUTER_WMMA", "", {"", "1", "", "0"}, "0", strix::profile::Kind::bit_changing,
+     {true, true, true, false}, {true, true, true, false}, "", "0",
+     "mm-pf-router-wmma-v1, bundle mm-fast-pf-v2 (gate PASS 8K KL 0.0020 and 32K with the bundle)", false, {}, true},
     {"router_wmma_layers", "STRIX_MM_PF_ROUTER_WMMA_LAYERS", "", {"", "", "", ""}, kRouterWmmaLayers, strix::profile::Kind::bit_changing,
      {true, false, true, false}, {true, true, true, false}, "", "", "FAST router layer set (read only while router_wmma is on)", false, {}, true},
 }};

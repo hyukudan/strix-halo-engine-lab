@@ -29,6 +29,10 @@ struct Bundle {
     const char* env;            // the one switch
     const char* profile;        // named profile id, e.g. "ds41-fast-pf-v1"
     std::span<const Member> members;
+    // Receipt that qualifies the bundle for the product word `--profile fast` (public docs anchor); nullptr: the switch
+    // only. When set, every member must be a qualified fast cell of the engine's profile table with the member's value
+    // (tests/profile_fast_set_tests.cpp), so the word cannot silently stop selecting a gated bundle.
+    const char* profile_receipt = nullptr;
 };
 
 using Getenv = std::function<const char*(const char*)>;
