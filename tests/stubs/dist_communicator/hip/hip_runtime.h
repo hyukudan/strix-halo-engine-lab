@@ -52,7 +52,12 @@ inline hipError_t hipDeviceSynchronize() { return hipSuccess; }
 inline hipError_t hipStreamWaitEvent(hipStream_t, hipEvent_t, unsigned) { return hipSuccess; }
 inline hipError_t hipEventCreateWithFlags(hipEvent_t* e, unsigned) { *e = new StubEvent; return hipSuccess; }
 inline hipError_t hipEventCreate(hipEvent_t* e) { return hipEventCreateWithFlags(e, 0U); }
-inline hipError_t hipEventRecord(hipEvent_t e, hipStream_t = nullptr) { e->recorded = true; return hipSuccess; }
+inline thread_local unsigned stub_event_records = 0;
+inline hipError_t hipEventRecord(hipEvent_t e, hipStream_t = nullptr) {
+    ++stub_event_records;
+    e->recorded = true;
+    return hipSuccess;
+}
 inline hipError_t hipEventQuery(hipEvent_t) { return hipSuccess; }
 inline hipError_t hipEventSynchronize(hipEvent_t) { return hipSuccess; }
 inline hipError_t hipEventDestroy(hipEvent_t e) { delete e; return hipSuccess; }

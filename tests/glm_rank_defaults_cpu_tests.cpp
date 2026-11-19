@@ -115,7 +115,7 @@ void test_plain_equals_receipt() {
 }
 
 void test_apply_env_default() {
-    CHECK(rd::env_items().size() == 42);  // one item per environment selector
+    CHECK(rd::env_items().size() == 43);  // one item per environment selector
     const auto normal = resolve({}, {});
     const auto baseline = resolve({"--baseline"}, {});
     for (const auto& [key, off] : Env{{"STRIX_GLM_PF_SEQPAR", "0"}, {"STRIX_GLM_PF_AUX_COMBINE", "0"},
@@ -222,6 +222,15 @@ void test_item_off_switches() {
         const auto forced = resolve(plain, {{"STRIX_XPORT_SPLIT_ROWS", "1"}});
         CHECK(forced.split_frame.source == "explicit" && forced.split_policy.on(2) && !forced.split_policy.on(1));
         CHECK(resolve(cat(plain, {"--baseline"}), {}).split_policy.mode == strix::xport::SplitFramePolicy::Mode::off);
+        // The engine splits only with the publishing producers on the fused boundary: the receipt follows that gate.
+        for (const char* gate : {"STRIX_GLM_XB_PUBLISH", "STRIX_GLM_BOUNDARY"}) {
+            const auto gated = resolve(plain, {{"STRIX_XPORT_SPLIT_ROWS", "1"}, {gate, "0"}});
+            CHECK(gated.split_policy.mode == strix::xport::SplitFramePolicy::Mode::off && !gated.split_policy.on(2));
+            CHECK(gated.split_frame.source == "needs-boundary-publish");
+        }
+        // Producer publish: engine built-in default (reported, not exported), baseline restores the copy + publish launch.
+        CHECK(sf.env.at("STRIX_GLM_XB_PUBLISH").value == "1" && sf.env.at("STRIX_GLM_XB_PUBLISH").source == "default");
+        CHECK(resolve(cat(plain, {"--baseline"}), {}).env.at("STRIX_GLM_XB_PUBLISH").value == "0");
         bool threw = false;
         try { (void)resolve(plain, {{"STRIX_XPORT_SPLIT_ROWS", "maybe"}}); } catch (const std::invalid_argument&) { threw = true; }
         CHECK(threw);

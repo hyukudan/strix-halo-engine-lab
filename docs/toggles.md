@@ -135,6 +135,7 @@ The tables below list the curated flags. The full list of environment variables 
 | Flag | Engine | Default | What it does | When other hardware wants it |
 |---|---|---|---|---|
 | `--mtp-bundle`, `--rope-yarn 2\|4 --context C` | qwen | - | MTP draft bundle; YaRN for long context. | - |
+| `--prelaunch 0\|1` | qwen-rtx (dense 27B spec CLI) | `0` | Launches the verify behind the device-fed MTP draft (same ids). | - |
 | `--mtp 0\|1` | glm | resolved (see `--print-effective-config`) | Turns the MTP draft off or on. | `0` when memory is short. |
 | `--identity r1b\|r1` | glm | `r1b` | Decode identity. | `r1` to compare. |
 | `--dspark`, `--no-dspark`, `--dspark-vocab auto\|full` | deepseek | on when the draft is found | DSpark speculative draft. | `--no-dspark` when memory is short. |
@@ -245,7 +246,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_HOST_WAIT` | qwen | block | [host-wait-policy](optimizations.md#host-wait-policy) |
 | `STRIX_SESSION_CACHE` | minimax | on (two-node serve route) | [mm-sessions](optimizations.md#mm-sessions) |
 
-### Prefill (97)
+### Prefill (98)
 
 | Toggle | Engine | Default | Details |
 |---|---|---|---|
@@ -369,6 +370,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_SERVE_PREFILL_GROUP` | deepseek (pair) | auto | several short prompts admitted together share one device prefill pass; `0` = one pass per prompt; `STRIX_SERVE_PREFILL_GROUP_MEMBERS` (2..64) caps a group; [DeepSeek page](models/deepseek-v4.1/README.md) |
 | `STRIX_SERVE_T16K` | qwen | ON: T16384 owner when the context admits a 32,768-token request and every resident slot fits; `0` keeps T8192 | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 | `STRIX_SERVE_FP16_MTP` | qwen | ON: explicit-sidecar MTP servers keep the automatic FP16 prefill arithmetic with the unqualified fast options off; `0` declines it | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
+| `STRIX_QRTX_PLE_A8` | qwen-rtx | off (opt-in under `--profile fast`, FAST gate pending) | [qwen-rtx-ple-a8](optimizations.md#qwen-rtx-ple-a8) |
 
 ### Decode, MTP and DSpark (25)
 

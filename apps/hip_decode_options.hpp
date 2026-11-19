@@ -422,6 +422,10 @@ struct Options {
     bool prompt_lookup_snapshot_explicit = false, prompt_lookup_snapshot_bytes_explicit = false;
     bool device_queue_trace = false;
     std::uint32_t known_prefix_prefill_rows = 0;
+    // Qwen pair: the prompt prefix qwen_pp::resolve_pair_route chose (set once by the CLI pair block, with its reason
+    // literal); the MTP hand-off runs this route instead of deciding again.
+    std::uint64_t qwen_pair_prefix = 0;
+    const char* qwen_pair_reason = "single-short";
     // Smaller tiled blocks (descending) for the remainder after the last complete T-row block; by default the
     // sizes of default_known_prefill_tail_rows below T (D-056), none with `--known-prefix-tail-rows none`.
     std::vector<std::uint32_t> known_prefix_tail_rows;

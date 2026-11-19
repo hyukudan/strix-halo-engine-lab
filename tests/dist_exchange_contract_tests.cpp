@@ -258,8 +258,15 @@ void one_way_routes() {
             auto ranks = make_pair({.direct = true, .max_bytes = std::size_t{16} << 20U});
             const std::string route = ranks[0].comm->route_text();
             std::array<bool, 2> moved{};
-            const auto errors = run(ranks, [&](unsigned r, Rank& rank) { moved[r] = one_way(*rank.comm, r, from, n, 5U); });
+            std::array<unsigned, 2> records{};
+            const auto errors = run(ranks, [&](unsigned r, Rank& rank) {
+                const auto before = stub_event_records;
+                moved[r] = one_way(*rank.comm, r, from, n, 5U);
+                records[r] = stub_event_records - before;
+            });
             const std::string label = "one-way " + std::to_string(n) + " B from rank " + std::to_string(from) + " (" + route + ")";
+            if (n == (std::size_t{64} << 10U) && !std::getenv("STRIX_DIST_TRACE"))
+                expect(records[from] == 1U && records[1U - from] == 1U, label + ": one event per active host copy");
             expect(errors[0].empty() && errors[1].empty(), label + ": " + errors[0] + " | " + errors[1]);
             expect(moved[0] && moved[1], label + ": transfer() must move it on both ranks");
             const unsigned to = 1U - from;

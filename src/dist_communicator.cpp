@@ -2698,7 +2698,7 @@ void Communicator::start_host(hipStream_t stream, const void* local, std::size_t
     current_ = History{sequence_, bytes, tag_.kind, tag_.layer, tag_.request, 0, 0, 'H'};
     set_phase(Phase::reuse_wait);
     // The receive buffer is reused only after the CPU has seen the previous copy out of it complete.
-    if (!staged_started_ && receive_pending_) {
+    if (!staged_started_ && direction_ != ExchangeDirection::send && receive_pending_) {
         const auto reuse_begin = std::chrono::steady_clock::now();
         const auto deadline = entry + wait_timeout_;
         for (hipError_t ready; (ready = hipEventQuery(receive_done_)) != hipSuccess;) {
@@ -2710,8 +2710,8 @@ void Communicator::start_host(hipStream_t stream, const void* local, std::size_t
         const auto reuse_end = std::chrono::steady_clock::now();
         stats_.host_reuse_wait += std::chrono::duration<double>(reuse_end - reuse_begin).count();
         slot_wait_.observe(tag_.kind, reuse_begin, reuse_end);
+        receive_pending_ = false;
     }
-    if (!staged_started_) receive_pending_ = false;
     // The copy is ordered after the producer of `local` on the stream; the progress thread waits for it on
     // the CPU before computing the CRC and sending.
     if (trace_) {
@@ -2719,7 +2719,7 @@ void Communicator::start_host(hipStream_t stream, const void* local, std::size_t
         if (!pre_copy_) check(hipEventCreate(&pre_copy_), "trace event");
         check(hipEventRecord(pre_copy_, stream), "trace event");
     }
-    if (!staged_started_) {
+    if (!staged_started_ && direction_ != ExchangeDirection::receive) {
         latency::mark("d2h_enqueue_begin");
         if (local) {
             if (d2h_kernel_bytes_ && bytes <= d2h_kernel_bytes_)
@@ -2738,6 +2738,8 @@ void Communicator::start_host(hipStream_t stream, const void* local, std::size_t
     set_phase(Phase::producer);
     // A one-way transfer() (host route or the head of a mixed one): the sender only sends, the receiver only receives.
     progress_->worker.post([this, direction = direction_] {
+        const bool sends = direction != ExchangeDirection::receive;
+        const bool receives = direction != ExchangeDirection::send;
         // Spin on the copy's event: a blocking synchronize may sleep and add its wake-up to every exchange. Bounded:
         // a producer that never completes stops the communicator (and wakes the peer) instead of hanging both ranks.
         const auto deadline = started_at_ + wait_timeout_;
@@ -2759,15 +2761,14 @@ void Communicator::start_host(hipStream_t stream, const void* local, std::size_t
             latency::mark("producer_flag_wait_begin");
             wait_staged_flag(producer_flag_, staged_token_, deadline);
             latency::mark("producer_flag_ready");
-        } else {
+        } else if (sends) {
             bounded(send_ready_, "the producer's device-to-host copy");
         }
         latency::mark("d2h_observed");
         std::uint64_t cmd = 0;
-        std::memcpy(&cmd, send_host_, std::min<std::size_t>(sizeof(cmd), bytes_));
+        if (sends) std::memcpy(&cmd, send_host_, std::min<std::size_t>(sizeof(cmd), bytes_));
         cmd_out_.store(cmd, std::memory_order_relaxed);
         set_phase(Phase::transfer);
-        const bool sends = direction != ExchangeDirection::receive, receives = direction != ExchangeDirection::send;
         // Deferred: this message's own CRC is computed while it is on the wire and goes in the next trailer (ready views
         // only, never a one-way transfer).
         const bool defer = deferring_;
@@ -2811,9 +2812,12 @@ void Communicator::start_host(hipStream_t stream, const void* local, std::size_t
         latency::mark("transport_end");
         stats_.last_received = std::chrono::steady_clock::now();
         peer_wait_.observe(tag_.kind, stats_.last_staged, stats_.last_received);
-        if (trace_) t_received_ = wall_ns();
+        if (trace_) {
+            t_received_ = wall_ns();
+            if (!receives) peer_staged_ns_ = t_validated_ = 0;
+        }
         std::uint64_t got = 0;
-        std::memcpy(&got, receive_host_, std::min<std::size_t>(sizeof(got), bytes_));
+        if (receives) std::memcpy(&got, receive_host_, std::min<std::size_t>(sizeof(got), bytes_));
         cmd_in_.store(got, std::memory_order_relaxed);
         set_phase(Phase::check);
         // The peer's message is checked here, as soon as it is complete: on a mixed route this overlaps the device
