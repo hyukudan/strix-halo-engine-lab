@@ -281,6 +281,17 @@
   },
   {
     "engine": "qwen",
+    "name": "Registration prefault",
+    "flag_or_env": "STRIX_MODEL_PREFAULT",
+    "default": "ON",
+    "exact": "Page residency only: the populate reads the file and writes nothing; same registered bytes; Qwen MoE greedy ids equal ON vs OFF.",
+    "gain": "One Strix Halo node, Qwen MoE GGUF (82.5 GB registered), same binary ON vs OFF: cold page cache load-only 21.9 vs 36.6 s, engine first token 84.9 vs 98.5 s; warm page cache 1.37 / 1.38 vs 1.99 / 2.00 s (ABAB).",
+    "preconditions": "Linux, --residency register (registered file mapping); applies to every HIP mapped-model registration.",
+    "off_switch": "STRIX_MODEL_PREFAULT=0",
+    "doc_anchor": "docs/optimizations.md#registration-prefault"
+  },
+  {
+    "engine": "qwen",
     "name": "Serving PLE table re-warm",
     "flag_or_env": "STRIX_PLE_REWARM",
     "default": "ON (bounded)",

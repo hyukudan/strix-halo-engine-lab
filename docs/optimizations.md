@@ -305,6 +305,18 @@ Keep registered model pages off the reclaim LRU so host memory pressure cannot e
 - **Measured gain:** One Strix Halo node, HTTP server: cold starts locked 42/42 vs unlocked 5 hangs in 41 (GPU queues evicted, never restored); 8 x 8500-token clients 106.1 vs 106.8 s (1.55 vs 1.5 tok/s, ABBA); 16 clients complete (320/320 tokens, 187-199 s) where the unlocked server stalled during on-demand slot growth in both legs. Automatic slots reflect the real headroom (29 -> 8 on the measured node).
 - **Implementation / evidence:** [Residency](operations/model-weight-residency.md#registered-page-lock)
 
+### Registration prefault
+
+**Engine:** every HIP engine that registers a mapped model file (`qwen` GGUF, dense packs, MTP sidecar). **Control:** `STRIX_MODEL_PREFAULT`. **Default:** ON.
+
+Before the registered ranges of a mapped model are pinned, the same ranges are read into the page cache from up to 16 threads (64 MiB chunks). Without it the driver faults every page in from the registering thread, which on a cold page cache reads the file through one thread.
+
+- **Preconditions:** Linux, `--residency register` (registered file mapping).
+- **Exactness evidence:** Page residency only: the populate reads the file and writes nothing. Same registered bytes and tensor storages; Qwen MoE greedy ids equal ON vs OFF (64-token prompt, 32 tokens, cold cache).
+- **Off switch:** STRIX_MODEL_PREFAULT=0
+- **Measured gain:** One Strix Halo node, Qwen MoE UD-Q4_K_XL GGUF (82.5 GB registered), same binary ON vs OFF: cold page cache, load-only 21.9 vs 36.6 s; engine registration done at 21.4 vs 35.9 s, first token 84.9 vs 98.5 s; warm page cache 1.37 / 1.38 vs 1.99 / 2.00 s (ABAB). Peak RSS and bytes read unchanged.
+- **Implementation / evidence:** `src/hip_model_residency.cpp` (`create_impl`), `MappedModelFile::prefault_parallel`
+
 ### Serving PLE table re-warm
 
 **Engine:** `qwen`. **Control:** `STRIX_PLE_REWARM`. **Default:** ON (bounded).

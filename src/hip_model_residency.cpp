@@ -310,7 +310,7 @@ struct HostRange {
 // STRIX_MODEL_PREFAULT=0: registration faults its own pages (one thread) as before. Page residency only.
 inline constexpr lever::Decl registration_prefault_lever{
     .name = "model_registration_prefault", .env = "STRIX_MODEL_PREFAULT", .exactness = lever::Exactness::bitwise,
-    .default_on = true, .source = "imp_load cold Qwen MoE GGUF load: registration 35.2 s one thread vs populate 4.46 GB/s"};
+    .default_on = true, .source = "docs/optimizations.md#registration-prefault: cold Qwen MoE GGUF load ON vs OFF"};
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> prefault_spans(const std::vector<HostRange>& ranges) {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
