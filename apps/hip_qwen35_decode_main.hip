@@ -175,10 +175,12 @@ int main(int argc, char** argv) try {
     if (!plan.mtp_source.empty()) {
         E->load_mtp(plan.mtp_source);
         chain = std::make_unique<HipMtpChain>(*E, false, HipEngine::mtp_max_rows());
+        chain->set_device_feed(plan.device_feed);  // --chain-feed (shared spec flags)
         if (plan.draft_rows) drows = std::make_unique<strix::spec::DraftRows>(hip_dense_draft_rows_config(V, plan));
     }
-    std::printf("spec: %s (mtp %s%s%s), draft rows %s\n", chain ? "mtp" : "off", plan.mtp_reason.c_str(),
-                plan.mtp_source.empty() ? "" : " ", plan.mtp_source.c_str(), drows ? "subset" : "full");
+    std::printf("spec: %s (mtp %s%s%s), draft rows %s, chain feed %s\n", chain ? "mtp" : "off", plan.mtp_reason.c_str(),
+                plan.mtp_source.empty() ? "" : " ", plan.mtp_source.c_str(), drows ? "subset" : "full",
+                chain && chain->device_feed() ? "device" : "host");
     std::vector<std::uint32_t> uprompt(prompt.begin(), prompt.end());
     std::vector<float> dumped;
     std::uint32_t top[HipEngine::max_rows()];
