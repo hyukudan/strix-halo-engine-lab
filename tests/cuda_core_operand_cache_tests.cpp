@@ -13,7 +13,11 @@
 #include <vector>
 
 namespace oc = strix::weight::operand_cache;
-static_assert(&oc::plan == &strix::cuda_core::operand_cache::plan && &oc::budget == &strix::cuda_core::operand_cache::budget,
+// Same entity: two non-type template arguments naming the same function are the same specialization.
+template <auto A, auto B> struct SameEntity { static constexpr bool value = false; };
+template <auto A> struct SameEntity<A, A> { static constexpr bool value = true; };
+static_assert(SameEntity<&oc::plan, &strix::cuda_core::operand_cache::plan>::value &&
+              SameEntity<&oc::budget, &strix::cuda_core::operand_cache::budget>::value,
               "the forwarding header aliases the shared planner");
 
 static int g_fail = 0;
