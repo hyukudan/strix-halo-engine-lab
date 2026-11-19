@@ -5090,7 +5090,10 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     endif()
     option(STRIX_DS41_PREFILL_FP16_LT "Build optional FP16 dense prefill backend" OFF)
     if(STRIX_DS41_PREFILL_FP16_LT)
-        find_library(STRIX_HIPBLASLT_LIBRARY NAMES hipblaslt PATHS /opt/rocm/lib /opt/rocm/core-10.1/lib REQUIRED)
+        # Same toolkit as the HIP compiler: ROCM_PATH, then the compiler's ROCm root, then the system default.
+        find_library(STRIX_HIPBLASLT_LIBRARY NAMES hipblaslt
+            HINTS "$ENV{ROCM_PATH}" "${CMAKE_HIP_COMPILER_ROCM_ROOT}" PATH_SUFFIXES lib lib64
+            PATHS /opt/rocm REQUIRED)
         target_sources(strix_ds41_layer_hip PRIVATE src/hip_ds41_dense_fp16.hip)
         target_link_libraries(strix_ds41_layer_hip PUBLIC "${STRIX_HIPBLASLT_LIBRARY}")
         get_filename_component(strix_hipblaslt_real "${STRIX_HIPBLASLT_LIBRARY}" REALPATH)
