@@ -37,7 +37,10 @@ struct LinkCost {
     double latency_us = 0.0;   // per exchange (intercept of the p50 fit)
     double us_per_byte = 0.0;  // per byte and direction, both directions moving at once
     double tail_us = 0.0;      // largest p90 - p50 of the samples (for planners that price the tail)
-    [[nodiscard]] bool valid() const { return latency_us > 0.0 && us_per_byte >= 0.0 && tail_us >= 0.0; }
+    [[nodiscard]] bool valid() const {
+        return std::isfinite(latency_us) && latency_us > 0.0 && std::isfinite(us_per_byte) && us_per_byte >= 0.0 &&
+               std::isfinite(tail_us) && tail_us >= 0.0;
+    }
     [[nodiscard]] double exchange_us(std::uint64_t bytes) const { return latency_us + us_per_byte * static_cast<double>(bytes); }
     [[nodiscard]] double latency_ms() const { return latency_us / 1000.0; }
     // 0 = no rate term measured (one size, or a flat fit): planners treat it as latency-only.
@@ -135,7 +138,9 @@ inline constexpr std::array<std::uint64_t, 3> default_link_sizes{4096U, 65536U, 
 // The host-bytes form: symmetric Transport::exchange of `bytes` each way. Both ranks call it with the same arguments.
 inline std::vector<LinkSample> measure_host(Transport& transport, std::span<const std::uint64_t> sizes, unsigned warmup = 5U,
                                             unsigned rounds = 30U, std::chrono::microseconds pause = std::chrono::microseconds{0}) {
+    if (sizes.empty() || rounds == 0U) throw std::invalid_argument("link cost: measure needs sizes and rounds");
     const std::uint64_t most = *std::max_element(sizes.begin(), sizes.end());
+    if (most > std::vector<std::byte>{}.max_size()) throw std::length_error("link cost: probe exceeds host buffer limit");
     std::vector<std::byte> out(static_cast<std::size_t>(most), std::byte{0x5a}), in(static_cast<std::size_t>(most));
     return measure([&](std::uint64_t bytes) {
         const auto n = static_cast<std::size_t>(bytes);
@@ -150,12 +155,13 @@ inline LinkCost combine(const LinkCost& a, const LinkCost& b) {
 
 // One symmetric exchange of the two fits; every rank returns combine(own, peer).
 inline LinkCost agree(Transport& transport, const LinkCost& mine) {
-    if (!mine.valid()) throw std::invalid_argument("link cost: agree() needs a valid local fit");
     std::array<double, 3> local{mine.latency_us, mine.us_per_byte, mine.tail_us}, remote{};
     std::array<std::byte, sizeof(local)> out{}, in{};
     std::memcpy(out.data(), local.data(), sizeof(local));
     transport.exchange(out, in);
     std::memcpy(remote.data(), in.data(), sizeof(remote));
+    // Both ranks complete the exchange even when one fit is invalid.
+    if (!mine.valid()) throw std::invalid_argument("link cost: agree() needs a valid local fit");
     const LinkCost peer{remote[0], remote[1], remote[2]};
     if (!peer.valid()) throw std::runtime_error("link cost: the peer sent an invalid fit");
     return combine(mine, peer);

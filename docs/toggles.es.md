@@ -130,6 +130,7 @@ Las tablas listan los flags seleccionados. La lista completa de variables de ent
 | Flag | Motor | Por defecto | Qué hace | Cuándo lo quiere otro hardware |
 |---|---|---|---|---|
 | `--mtp-bundle`, `--rope-yarn 2\|4 --context C` | qwen | - | Bundle de draft MTP; YaRN para contexto largo. | - |
+| `--prelaunch 0\|1` | qwen-rtx (CLI spec densa 27B) | `0` | Lanza el verify detrás del draft MTP alimentado en el dispositivo (mismos ids). | - |
 | `--mtp 0\|1` | glm | resuelto (ver `--print-effective-config`) | Apaga o enciende el draft MTP. | `0` cuando falta memoria. |
 | `--identity r1b\|r1` | glm | `r1b` | Identidad de decode. | `r1` para comparar. |
 | `--dspark`, `--no-dspark`, `--dspark-vocab auto\|full` | deepseek | on si se encuentra el draft | Draft especulativo DSpark. | `--no-dspark` cuando falta memoria. |

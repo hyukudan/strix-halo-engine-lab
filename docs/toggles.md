@@ -135,6 +135,7 @@ The tables below list the curated flags. The full list of environment variables 
 | Flag | Engine | Default | What it does | When other hardware wants it |
 |---|---|---|---|---|
 | `--mtp-bundle`, `--rope-yarn 2\|4 --context C` | qwen | - | MTP draft bundle; YaRN for long context. | - |
+| `--prelaunch 0\|1` | qwen-rtx (dense 27B spec CLI) | `0` | Launches the verify behind the device-fed MTP draft (same ids). | - |
 | `--mtp 0\|1` | glm | resolved (see `--print-effective-config`) | Turns the MTP draft off or on. | `0` when memory is short. |
 | `--identity r1b\|r1` | glm | `r1b` | Decode identity. | `r1` to compare. |
 | `--dspark`, `--no-dspark`, `--dspark-vocab auto\|full` | deepseek | on when the draft is found | DSpark speculative draft. | `--no-dspark` when memory is short. |

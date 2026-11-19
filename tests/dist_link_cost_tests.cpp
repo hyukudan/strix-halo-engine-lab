@@ -24,7 +24,7 @@ public:
     void send(std::span<const std::byte> message) override { sent.assign(message.begin(), message.end()); }
     void receive(std::span<std::byte> message) override {
         if (message.size() > peer_.size()) throw std::runtime_error("loopback: short peer message");
-        std::memcpy(message.data(), peer_.data(), message.size());
+        for (std::size_t i = 0; i < message.size(); ++i) message[i] = peer_[i];
     }
     void exchange(std::span<const std::byte> out, std::span<std::byte> in) override {
         ++calls;
@@ -112,6 +112,9 @@ int main() try {
     {
         Loopback t(std::vector<std::byte>(4096));
         const std::uint64_t sizes[] = {512, 4096};
+        bool empty_refused = false;
+        try { (void)measure_host(t, {}, 1U, 3U); } catch (const std::invalid_argument&) { empty_refused = true; }
+        require(empty_refused && t.calls == 0U, "empty host probe refused before allocation or transport");
         const auto s = measure_host(t, sizes, 1U, 3U);
         require(s.size() == 2U && t.calls == 8U && t.sent.size() == 4096U, "host form exchanges the requested bytes");
     }
@@ -127,6 +130,11 @@ int main() try {
         bool caught = false;
         try { (void)agree(bad, r0); } catch (const std::runtime_error&) { caught = true; }
         require(caught, "an invalid peer fit is refused");
+        Loopback good(wire(r1));
+        const LinkCost infinite{std::numeric_limits<double>::infinity(), 0.0, 0.0};
+        caught = false;
+        try { (void)agree(good, infinite); } catch (const std::invalid_argument&) { caught = true; }
+        require(caught && good.calls == 1U, "an invalid local fit is sent so the peer can also reject it");
     }
     std::cout << "PASS: dist link cost (fit, anchor within 10 %, measure, rank agreement)\n";
     return 0;

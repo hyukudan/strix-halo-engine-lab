@@ -53,9 +53,9 @@ public:
         const std::size_t slot = std::size_t(sizes.back());
         void* buf = nullptr;
         ::strix::hip_check_message(hipMalloc(&buf, 2U * slot), "tp gather: probe buffer");
-        ::strix::hip_check_message(hipMemsetAsync(buf, 0, 2U * slot, stream), "tp gather: probe buffer");
         dist::LinkCost mine;
         try {
+            ::strix::hip_check_message(hipMemsetAsync(buf, 0, 2U * slot, stream), "tp gather: probe buffer");
             const auto samples = dist::measure([&](std::uint64_t bytes) {
                 link_.gather(stream, buf, slot, std::size_t(bytes));
                 HipOps::sync(stream);

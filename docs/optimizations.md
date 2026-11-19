@@ -5137,6 +5137,24 @@ A device without a row runs the EXACT targets.
 - **Measured gain:** RTX PRO 6000 at 600 W, converted NVFP4 pack, greedy spec decode (sub15d), 1,200 tokens, two strict A/B pairs of 3 runs each: think 262.02 / 261.66 -> 263.83 / 263.90 tok/s (+0.7 / +0.9 %), verify 14.07 / 14.08 -> 13.99 / 13.98 ms per step (-0.5 / -0.7 %); FAST also changes the accepted drafts on think (263 -> 262 steps, E 4.56 -> 4.58), so its tok/s is not a pure per-step figure: per step 17.399 -> 17.346 ms (-0.3 %); code 334.32 / 333.94 -> 335.53 / 336.18 tok/s (+0.4 / +0.7 %, within 3x the run spread), verify 14.94 / 14.94 -> 14.85 / 14.81 ms per step. GPU clocks 2,550-2,750 MHz across the four runs.
 - **Implementation / evidence:** [policy](../include/strix/split_k_policy.hpp), [GEMV](../src/cuda_core/dense/nvfp4.cu), [policy test](../tests/split_k_policy_host_tests.cpp), [profile test](../tests/qwen35_dense_profile_host_tests.cpp)
 
+<a id="qwen-dense-cuda-verify-prelaunch"></a>
+
+### Qwen dense 27B CUDA spec: verify pre-launch behind the device-fed MTP draft
+
+**Engine:** `qwen-rtx` (dense 27B). **Control:** `--prelaunch 0|1` on `strix-cuda-qwen35-spec`. **Default:** off (`0`) until its timing receipt.
+
+The verify of a speculative block reads the drafted ids from the device feed slots instead of from the host: the MTP
+chain queues the copy of its ids to the host, the verify graph is launched behind the draft on the same stream (a
+32-thread gather kernel writes the ids into the verify inputs, then the same trunk graph runs), and only then does the
+host wait for the ids. The host no longer stands between the last draft kernel and the first verify kernel.
+
+- **Preconditions:** CUDA Qwen dense spec CLI with the MTP chain drafter (chain-only and hybrid blocks); other drafters and engines decline the pre-launch and run the serial form.
+- **Automatic selection:** none yet; the CLI prints `prelaunch[TAG]: on|off, pre-launched steps N of M`.
+- **Exactness evidence:** Scheduling only: the verify runs the same graph on the same position and id contents in the same stream order; emitted ids equal the serial greedy ids in every block (host tests: same MTP calls and proposals, feed slots resolve to the drafted ids, identical emitted ids and block traces with the controller on and off).
+- **Off switch:** `--prelaunch 0` (the default).
+- **Measured gain:** Not yet measured.
+- **Implementation / evidence:** [contract](../include/strix/spec/block_drafter.hpp), [MTP chain](../include/strix/spec/mtp_chain.hpp), [CUDA binding](../src/qwen35/cuda/engine.cu)
+
 ## Platform (kernel)
 
 <a id="platform-perfopt"></a>

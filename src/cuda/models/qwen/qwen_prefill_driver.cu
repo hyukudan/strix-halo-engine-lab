@@ -21,6 +21,7 @@
 
 #include "strix/cuda/qwen_dense.hpp"
 #include "strix/cuda/qwen_gdn.hpp"
+#include "../../core/head_argmax.cuh"
 #include "strix/cuda/qwen_hc.hpp"
 #include "strix/cuda/qwen_hc_fp16_range.hpp"
 #include "strix/cuda/amd_math.cuh"
@@ -1011,7 +1012,8 @@ void Prefill::Impl::allocate() {
     }
     if (cfg.decode) {
         head_logits = dev_zero<float>(std::uint64_t{kMaxWindowRows} * hc::kVocab, "head logits");
-        argmax_dev = dev_zero<std::uint32_t>(kMaxWindowRows, "argmax");
+        // [kMaxWindowRows] ids, then the shared head pick's chunk workspace (strix/head_argmax.hpp)
+        argmax_dev = dev_zero<std::uint32_t>(kMaxWindowRows + strix::head_argmax::workspace_bytes(kMaxWindowRows) / 4U, "argmax");
         ck(cudaMallocHost(&ids_pinned, kMaxWindowRows * 4), "pinned ids");
         ck(cudaMallocHost(&argmax_pinned, kMaxWindowRows * 4), "pinned argmax");
         moe_sticky = dev_zero<std::uint32_t>(1 + kMaxWindowRows, "moe sticky");
@@ -2253,7 +2255,16 @@ void Prefill::Impl::step_tail(std::uint32_t rows) {
         for (std::uint32_t r0 = 0; r0 < rows; r0 += 8U)  // the head kernel takes 1..8 rows; same per-row DAG at every count
             hc::lm_head_rows(hidden + std::uint64_t{r0} * kHidden, kHidden, std::min(8U, rows - r0), head, hc::kVocab,
                              head_logits + std::uint64_t{r0} * hc::kVocab, hc::kVocab, stream);
-    hc::first_max_rows(head_logits, hc::kVocab, rows, hc::kVocab, argmax_dev, stream);
+    {  // greedy pick per row (select_greedy_token semantics: a non-finite logit -> 0xffffffff), shared multi-block form
+        namespace hp = strix::cuda::core::head_argmax;
+        hp::View v;
+        v.logits = head_logits;
+        v.stride = hc::kVocab;
+        v.count = hc::kVocab;
+        v.rows = rows;
+        v.partial = reinterpret_cast<strix::head_argmax::Pick*>(argmax_dev + kMaxWindowRows);
+        ck(hp::pick_rows(v, hp::EmitIndexOrNone{argmax_dev}, stream), "head pick");
+    }
     ck(cudaMemcpyAsync(argmax_pinned, argmax_dev, std::uint64_t{rows} * 4, cudaMemcpyDeviceToHost, stream), "argmax d2h");
     if (window) ck(cudaMemcpyAsync(moe_sticky_pinned, moe_sticky, (1 + kMaxWindowRows) * 4, cudaMemcpyDeviceToHost, stream), "moe sticky d2h");
 }
