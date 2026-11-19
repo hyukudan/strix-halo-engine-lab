@@ -14,7 +14,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <initializer_list>
 #include <optional>
 #include <map>
@@ -32,6 +31,7 @@
 #include "../../attn_core/dense_decode.hpp"
 #include "../../attn_core/dense_decode_flash.hpp"
 #include "../../core/dense_linear.hpp"
+#include "../../core/hip_range_weight_loader.hpp"
 #include "../../core/dense_linear_iu4.hpp"
 #include "../../core/tp_join.hpp"
 #include "../../core/window_state_buffers.hpp"
@@ -160,8 +160,9 @@ constexpr unsigned kMaxRows = HipEngine::max_rows();
 
 class Loader {
 public:
-    explicit Loader(const std::string& path) : info_(gguf::read_file(path)), file_(path, std::ios::binary) {
-        if (!file_) throw std::runtime_error("cannot open " + path);
+    // Bytes reach the device through the shared range loader (core::HipRangeWeightLoader): parallel unbuffered reads
+    // into pinned staging overlapped with the uploads. load() only queues; ready() is the one wait, before any use.
+    explicit Loader(const std::string& path) : info_(gguf::read_file(path)), file_(path) {
         for (const auto& t : info_.tensors) by_name_[t.name] = &t;
     }
     const gguf::FileInfo& info() const { return info_; }
@@ -184,23 +185,21 @@ public:
         if (!g) throw std::runtime_error("unsupported ggml type for " + name);
         r.row_bytes = std::size_t(r.inputs / g->block_elements) * g->block_bytes;
         HK(hipMalloc(&r.data, r.bytes));
-        file_.seekg(std::streamoff(t->absolute_offset));
-        std::vector<char> stage(std::min<std::size_t>(r.bytes, 64ULL << 20));
-        for (std::size_t done = 0; done < r.bytes;) {
-            const auto n = std::min(stage.size(), r.bytes - done);
-            file_.read(stage.data(), std::streamsize(n));
-            if (!file_) throw std::runtime_error("short read " + name);
-            HK(hipMemcpy(r.data + done, stage.data(), n, hipMemcpyHostToDevice));
-            done += n;
-        }
+        file_.load(t->absolute_offset, r.bytes, reinterpret_cast<std::uint8_t*>(r.data));
         total_ += r.bytes;
         return r;
+    }
+    // Every tensor queued so far is in device memory (rethrows the first read or upload failure); one receipt line.
+    void ready(bool quiet) {
+        file_.ready();
+        if (!quiet)
+            std::printf("%s\n", core::weight_load_line(file_.stats(), file_.peak_pinned_bytes(), file_.options()).c_str());
     }
     std::size_t total() const { return total_; }
 
 private:
     gguf::FileInfo info_;
-    std::ifstream file_;
+    core::HipRangeWeightLoader file_;
     std::map<std::string, const gguf::TensorInfo*> by_name_;
     std::size_t total_ = 0;
 };
@@ -780,6 +779,7 @@ struct HipEngine::Impl {
                 kv_pos_bytes += 2U * KW * 2U;
             }
         }
+        loader.ready(opt.quiet);
         pass_weight_bytes = loader.total() - embd.bytes;
         if (!opt.quiet)
             std::printf("loaded %.2f GiB (layers %u, hidden %u, vocab %u, GDN layers %u)\n", double(loader.total()) / double(1ULL << 30),
@@ -1426,6 +1426,7 @@ struct HipEngine::Impl {
         mtp.hnorm = loader.load(b + "nextn.hnorm");
         mtp.shnorm = loader.load(b + "nextn.shared_head_norm");
         mtp.eh = loader.load(b + "nextn.eh_proj");
+        loader.ready(opt.quiet);
         mtp_bytes = 0;
         for (const Tensor* t : {&y.attn_norm, &y.post_norm, &y.gate, &y.up, &y.down, &y.q, &y.k, &y.v, &y.o, &y.qnorm, &y.knorm,
                                 &mtp.enorm, &mtp.hnorm, &mtp.shnorm, &mtp.eh})

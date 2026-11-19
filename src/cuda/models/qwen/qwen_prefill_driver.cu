@@ -65,6 +65,8 @@
 #include <thread>
 #include <vector>
 
+#include "strix/startup_markers.hpp"
+
 namespace strix::cuda::qwen_prefill {
 namespace {
 
@@ -582,7 +584,14 @@ void Prefill::Impl::upload_model() {
     int slot = 0;
     void* scratch = nullptr;  // raw bytes of a tensor that is transcoded on the device
     std::uint64_t scratch_bytes = 0;
+    // Load phase split (host wall time; printed with STRIX_STARTUP_MARKERS=1): header/index, device allocation,
+    // file read (fread), waits for a staging slot (upload or transcode behind), final drain. Timing only.
+    double index_s = 0, alloc_s = 0, read_s = 0, wait_s = 0;
+    std::uint64_t read_bytes = 0;
+    const auto since = [](Clock::time_point from) { return std::chrono::duration<double>(Clock::now() - from).count(); };
+    const auto load_begin = Clock::now();
     for (const auto& part : model_parts(cfg.model_gguf)) {
+    auto mark = Clock::now();
     const auto pinfo = gguf::read_file(part);
     std::shared_ptr<const weight::Source> owner;
     auto admission = weight::open_source(part,owner);
@@ -594,6 +603,7 @@ void Prefill::Impl::upload_model() {
     source_weights.insert(source_weights.end(),admitted.begin(),admitted.end());
     std::FILE* f = std::fopen(part.c_str(), "rb");
     if (!f) throw std::runtime_error("cannot open " + part);
+    index_s += since(mark);
     for (auto t : pinfo.tensors) {
         if (t.name.rfind("per_layer_token_embd", 0) == 0) { ple_part = part; info.tensors.push_back(t); continue; }  // PLE (host)
         if (t.name == "output.weight" && !cfg.decode) { info.tensors.push_back(t); continue; }                  // head (node)
@@ -605,6 +615,7 @@ void Prefill::Impl::upload_model() {
         if (target != Target::native && !transcode::supported(t.ggml_type))
             throw std::runtime_error("no decoder for " + t.name + " type " + std::to_string(t.ggml_type));
         void* raw = nullptr;
+        mark = Clock::now();
         if (target == Target::native) raw = dev_alloc<std::uint8_t>(t.byte_size, t.name.c_str());
         else {
             if (scratch_bytes < t.byte_size) {
@@ -617,11 +628,17 @@ void Prefill::Impl::upload_model() {
             }
             raw = scratch;
         }
+        alloc_s += since(mark);
         _fseeki64(f, static_cast<long long>(t.absolute_offset), SEEK_SET);
         for (std::uint64_t off = 0; off < t.byte_size; off += kChunk) {
             const auto n = std::min(kChunk, t.byte_size - off);
+            mark = Clock::now();
             ck(cudaEventSynchronize(done[slot]), "staging reuse");
+            wait_s += since(mark);
+            mark = Clock::now();
             if (std::fread(staging[slot], 1, static_cast<std::size_t>(n), f) != n) throw std::runtime_error("short read " + t.name);
+            read_s += since(mark);
+            read_bytes += n;
             ck(cudaMemcpyAsync(static_cast<std::uint8_t*>(raw) + off, staging[slot], n, cudaMemcpyHostToDevice, stream), "upload");
             ck(cudaEventRecord(done[slot], stream), "event");
             slot ^= 1;
@@ -649,7 +666,13 @@ void Prefill::Impl::upload_model() {
     }
     std::fclose(f);
     }
+    const auto drain_begin = Clock::now();
     ck(cudaStreamSynchronize(stream), "upload sync");
+    if (startup::enabled())
+        std::fprintf(stderr, "strix-load-phases backend=cuda loader=qwen_upload_model wall_s=%.2f read_s=%.2f read_gb=%.2f "
+                     "read_gbps=%.2f wait_s=%.2f alloc_s=%.2f index_s=%.2f drain_s=%.2f\n", since(load_begin), read_s,
+                     static_cast<double>(read_bytes) / 1e9, read_s > 0 ? static_cast<double>(read_bytes) / 1e9 / read_s : 0.0,
+                     wait_s, alloc_s, index_s, since(drain_begin));
     if (scratch) cudaFree(scratch);
     cudaFreeHost(staging[0]);
     cudaFreeHost(staging[1]);
@@ -1360,14 +1383,15 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
         ck(cudaMemcpy(m.rope, cs.data(), cs.size() * sizeof(qsa::RopeTable), cudaMemcpyHostToDevice), "rope upload");
     }
     const auto t0 = Clock::now();
-    m.upload_model();
+    { startup::Phase phase("qwen_upload_model"); m.upload_model(); }
     if (m.native_experts) qwen_route::require_composition(m.route_policy.enabled,
         qwen_route::Composition::other_weight_pack);
-    m.upload_ple();
-    m.upload_mtp();
-    m.allocate();
-    m.upload_draft();
-    m.new_session(config.session_positions ? config.session_positions : config.max_positions);  // session 0: the single-session API
+    { startup::Phase phase("qwen_upload_ple"); m.upload_ple(); }
+    { startup::Phase phase("qwen_upload_mtp"); m.upload_mtp(); }
+    { startup::Phase phase("qwen_allocate"); m.allocate(); }
+    { startup::Phase phase("qwen_upload_draft"); m.upload_draft(); }
+    { startup::Phase phase("qwen_session");
+      m.new_session(config.session_positions ? config.session_positions : config.max_positions); }  // session 0: the single-session API
     if (m.cfg.block_fit) m.allocate_fitted_block();  // last: the block capacity takes what the fixed buffers left
     {
         const char* v = std::getenv("STRIX_QRTX_GRAPHS");

@@ -303,6 +303,17 @@
   },
   {
     "engine": "qwen",
+    "name": "Qwen dense HIP shared weight load",
+    "flag_or_env": "STRIX_LOAD_WORKERS",
+    "default": "ON",
+    "exact": "Same tensor bytes at the same device buffers; 8 greedy ids identical over 6 runs (old and new loader, cold and warm).",
+    "gain": "Qwen3.8-27B IU4 GGUF on one Strix Halo node: cold load 9.4 / 9.3 s \u2192 2.6 / 2.5 s, warm 3.3 \u2192 2.5 s; no page-cache residue (was +14.4 GB)",
+    "preconditions": "Dense 27B HIP engine; O_DIRECT where the file system accepts it.",
+    "off_switch": "none (private loader removed); STRIX_LOAD_WORKERS=1 serialises the reads",
+    "doc_anchor": "docs/optimizations.md#qwen-dense-hip-shared-weight-load"
+  },
+  {
+    "engine": "qwen",
     "name": "Serving PLE table re-warm",
     "flag_or_env": "STRIX_PLE_REWARM",
     "default": "ON (bounded)",

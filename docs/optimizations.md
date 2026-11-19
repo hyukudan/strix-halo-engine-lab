@@ -329,6 +329,18 @@ HIP 7.17 copies pageable host memory to an integrated GPU through a CPU staging 
 - **Measured gain:** One Strix Halo node (gfx1151), page-cache-warm GGUF, 3 GiB regions read for the first time: direct 24-27 GB/s on HIP 7.17 vs registered 50-57 GB/s (both runtimes); HIP 7.16 direct 74-79 GB/s. Whole resident copy of Qwen3-0.6B Q8_0 (0.80 GB): HIP 7.17 46 / 46 ms registered vs 57 / 57 ms direct; HIP 7.16 the rule keeps direct, 36 / 36 ms vs 47-48 ms forced registered (ABAB, same binary per runtime).
 - **Implementation / evidence:** `src/hip_model_residency.cpp` (`copy_through_registered_source`), rule and piece plan `include/strix/residency/copy_source.hpp`, test `tests/model_copy_source_tests.cpp`
 
+### Qwen dense HIP shared weight load
+
+**Engine:** `qwen` (dense 27B HIP engine: `strix-hip-qwen35-decode`, `-spec`, `-pair`). **Control:** `STRIX_LOAD_WORKERS`, `STRIX_LOAD_STAGING_MIB` (the shared loader's knobs). **Default:** ON.
+
+The dense engine's own loader read each tensor with one buffered stream into a 64 MiB pageable buffer and copied it with a synchronous `hipMemcpy`, so reading and copying alternated on one thread and the whole file stayed in the page cache. Its tensors now queue on the shared range loader (`core::HipRangeWeightLoader`, the one DeepSeek, MiniMax and Hy4 use): parallel unbuffered reads into pinned staging, uploads overlapped with the reads, one wait before the first use (trunk and MTP layer).
+
+- **Preconditions:** a file system that accepts O_DIRECT (else buffered reads through the same queue).
+- **Exactness evidence:** Same tensor bytes at the same device buffers; 8 greedy ids identical over 6 runs (old and new loader, cold and warm).
+- **Off switch:** none (the private loader is removed); `STRIX_LOAD_WORKERS=1` serialises the reads.
+- **Measured gain:** One Strix Halo node, Qwen3.8-27B IU4 GGUF (13.96 GiB of weights), page cache dropped: load 9.4 / 9.3 s -> 2.6 / 2.5 s (5.8 GiB/s); page cache warm: 3.3 -> 2.5 s. The file no longer stays in the page cache after the load (+14.4 GB of cache before).
+- **Implementation / evidence:** `src/qwen35/hip/engine.hip` (`Loader`), shared `src/core/hip_range_weight_loader.hpp`
+
 ### Serving PLE table re-warm
 
 **Engine:** `qwen`. **Control:** `STRIX_PLE_REWARM`. **Default:** ON (bounded).

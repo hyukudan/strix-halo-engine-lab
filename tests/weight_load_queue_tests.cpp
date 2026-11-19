@@ -481,6 +481,35 @@ void small_budget_ranges() {
 }
 }  // namespace
 
+// Qwen dense HIP loader (src/qwen35/hip/engine.hip Loader): GGUF tensors back to back at 32-byte aligned offsets,
+// sizes from a 4-byte norm to more than the staging budget, each into its own device buffer, on an O_DIRECT-aligned
+// source: every tensor lands byte-exact, neighbours sharing a page do not overwrite each other, staging stays bounded.
+void gguf_tensor_ranges() {
+    constexpr std::uint64_t mib = std::uint64_t{1} << 20;
+    const std::vector<std::uint64_t> sizes{4, 3 * mib + 17, 64, mib, 5, 2 * mib + 4096, 4, 96, 777};
+    std::uint64_t at = 4096 + 32;  // after a header
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> tensors;
+    for (const auto n : sizes) {
+        tensors.emplace_back(at, n);
+        at = (at + n + 31) / 32 * 32;
+    }
+    const MemorySource s(static_cast<std::size_t>(at), 4096, 29);
+    HostUploader up;
+    std::vector<std::vector<std::uint8_t>> dev;
+    for (const auto& t : tensors) dev.emplace_back(static_cast<std::size_t>(t.second), std::uint8_t{0xA5});
+    {
+        WeightLoadQueue q(up, {4, 2 * mib, nullptr, false});
+        WeightRangeTickets r(q);
+        for (std::size_t i = 0; i < tensors.size(); ++i) r.load(s, tensors[i].first, tensors[i].second, dev[i].data());
+        r.flush();
+        q.publish();
+    }
+    bool same = true;
+    for (std::size_t i = 0; i < tensors.size(); ++i)
+        same = same && std::memcmp(dev[i].data(), s.bytes() + tensors[i].first, static_cast<std::size_t>(tensors[i].second)) == 0;
+    require(same && up.peak_bytes <= 2 * mib && up.clean(), "GGUF tensors back to back land byte-exact in their own buffers");
+}
+
 int main() {
 #ifdef _MSC_VER
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
@@ -501,6 +530,7 @@ int main() {
         failed_upload_wait();
         cancel_in_cleanup();
         small_budget_ranges();
+        gguf_tensor_ranges();
     } catch (const std::exception& e) {
         std::cerr << "weight load queue tests: " << e.what() << "\n";
         return 1;
