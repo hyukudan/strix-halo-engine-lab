@@ -100,3 +100,5 @@ TURBO ablations are provisional experiments, not qualification evidence. `no-gdn
 MiniMax TURBO flash is pending adapter admission/export; its manifest is inspection-only (`bash scripts/bench/turbo/ablate.sh arms minimax --pending`). Qwen single-process power reports lack prefill execution timestamps, so length-matrix receipts remain invalid when no independently timed prefill line is available. Final-report arrival must not anchor prefill telemetry.
 
 For controlled exact/onfly decode diagnosis, see [the TURBO decode measurement kit](../scripts/bench/turbo/README.md) (header layout census, small-row projection benchmark and diagnostic trace adapters).
+
+Launch geometry: `python3 scripts/bench/common/launch_audit.py TRACE --mp N [--step-kernel NAME] [--flagged-only]` lists every kernel of a traced run (Nsight Systems SQLite export or rocprofv3 kernel trace CSV) with blocks, threads, registers, shared memory, time and idle before it, and flags launches with fewer blocks than the device has multiprocessors (`N` read from the device). The CUDA greedy head pick check and timing is `cuda_core_head_argmax_bench [--check-only]`.
