@@ -8,7 +8,7 @@
 //                (dist/link_cost.hpp measure + agree: both ranks hold the same bits), optionally with an explicit
 //                latency override (--tp-trip-us) that replaces only the measured latency.
 // Home: shared (host shared, pair facility). Bound by: qwen35 dense HIP exact TP decode (apps/hip_qwen35_decode_main.hip).
-// Host test: tests/pair_tp_inputs_tests.cpp.
+// Host test: tests/pair_tp_gather_tests.cpp.
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>

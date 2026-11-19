@@ -11,7 +11,7 @@
 // routes: enqueue time only). Pass wall - sync - link = host gaps (launches, joins, bookkeeping).
 // Backend-neutral host code: Ops supplies Stream, stream(void*), sync(Stream) and tag(call); Legacy / Fast supply
 // exchange(Stream, const void* local, void* remote, std::size_t bytes, const Tag&). The HIP binding is
-// src/xport/tp_gather_hip.hpp; host test tests/pair_gather_link_tests.cpp.
+// src/xport/tp_gather_hip.hpp; host test tests/pair_tp_gather_tests.cpp.
 // Home: shared (host shared, pair facility). Bound by: qwen35 dense HIP exact tensor-parallel decode.
 #include <chrono>
 #include <cstddef>
