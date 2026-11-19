@@ -1525,10 +1525,23 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
             ck(cudaMemcpyAsync(ple_ids, ple_ids_host, std::uint64_t{rows} * pm::kPleHeads * 8, cudaMemcpyHostToDevice, stream),
                "ple ids");
             pm::launch_ple_gather_iq4nl(ple_table_dev, ple_table_rows, ple_ids, rows, ple_rows, pm::kPleWidth, ple_status, stream);
-            pm::launch_ple_project(ple_rows, pm::kPleWidth, rows, w.get("blk.1.ple_key.weight"), pm::kPleWidth, pm::kExpanded,
-                                   ple_keys, pm::kExpanded, stream);
-            pm::launch_ple_project(ple_rows, pm::kPleWidth, rows, w.get("blk.1.ple_value.weight"), pm::kPleWidth, pm::kHidden,
-                                   ple_values, pm::kHidden, stream);
+            if (cfg.forms.ple_a8 && !window) {
+                // FAST ple_a8 (qwen-cuda-ple-a8-v1): both projections read the same gathered rows, so they are two
+                // segments of ONE shared dense A8 projection (one quantize, one launch); verify/step windows stay exact.
+                dn::Site ps;
+                ps.store = dn::Store::f32;
+                ps.width = pm::kPleWidth;
+                ps.segments = 2;
+                ps.segment[0] = {w.get("blk.1.ple_key.weight"), pm::kExpanded, ple_keys, pm::kExpanded};
+                ps.segment[1] = {w.get("blk.1.ple_value.weight"), pm::kHidden, ple_values, pm::kHidden};
+                ck(dn::quantize_project(stream, ps, rows, dn::Input::bf16, ple_rows, pm::kPleWidth, codes, deltas, cap), "ple a8");
+                executed_forms.ple_a8 = true;
+            } else {
+                pm::launch_ple_project(ple_rows, pm::kPleWidth, rows, w.get("blk.1.ple_key.weight"), pm::kPleWidth,
+                                       pm::kExpanded, ple_keys, pm::kExpanded, stream);
+                pm::launch_ple_project(ple_rows, pm::kPleWidth, rows, w.get("blk.1.ple_value.weight"), pm::kPleWidth,
+                                       pm::kHidden, ple_values, pm::kHidden, stream);
+            }
             // the tail carries the session's PLE conv history: per session, on its rows
             for (std::uint32_t i = 0; i < count; ++i) {
                 const std::uint64_t off = seg[i].offset;

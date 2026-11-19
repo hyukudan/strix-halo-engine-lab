@@ -102,6 +102,9 @@ target_compile_options(nvfp4_a8_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=f
 add_test(NAME nvfp4_a8 COMMAND nvfp4_a8_test)
 add_executable(nvfp4_a8_bench tests/cuda/nvfp4_a8_bench.cu)
 target_link_libraries(nvfp4_a8_bench PRIVATE strix_qwen_cuda)
+# FAST ple_a8: PLE key/value projections, exact lane chain vs the shared dense A8 site (bound + timing, GPU index 0, no model).
+add_executable(qwen_ple_a8_bench tests/cuda/qwen_ple_a8_bench.cu)
+target_link_libraries(qwen_ple_a8_bench PRIVATE strix_qwen_cuda)
 add_executable(qwen_turbo_resolver_test tests/cuda/qwen_turbo_resolver_test.cu)
 target_link_libraries(qwen_turbo_resolver_test PRIVATE strix_qwen_cuda strix_qwen_prefix)
 add_test(NAME qwen_turbo_resolver COMMAND qwen_turbo_resolver_test)
