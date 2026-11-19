@@ -227,6 +227,7 @@ void carry_interop() {
         {"staged-host-staged-mixed", {staged_step, host, staged_step, device}, {staged_step, device, staged_step, host}},
     };
     for (const auto& k : cases) {
+        std::fprintf(stderr, "[dist-contract] carry_interop case=%s\n", k.name);
         auto ranks = make_pair({});
         const auto errors = run(ranks, [&](unsigned r, Rank& rank) {
             for (const auto& step : r == 0U ? k.rank0 : k.rank1) step(*rank.comm, r);
@@ -236,6 +237,7 @@ void carry_interop() {
     // The ready view's payload is corrupted on rank 1: its deferred CRC is checked by the next exchange_host().
     // (The view is delivered before its CRC is known, so the payload is not compared here.)
     for (const bool host_next : {true, false}) {
+        std::fprintf(stderr, "[dist-contract] carry_interop corrupted host_next=%d\n", host_next ? 1 : 0);
         auto fresh = make_pair({.corrupt_rank1_at = 0});
         const auto errs = run(fresh, [&](unsigned r, Rank& rank) {
             auto& c = *rank.comm;
@@ -255,6 +257,7 @@ void one_way_routes() {
                                  std::size_t{16} << 20U, (std::size_t{5} << 20U) + 192U};
     for (const std::size_t n : sizes) {
         for (const unsigned from : {0U, 1U}) {
+            std::fprintf(stderr, "[dist-contract] one_way_routes bytes=%zu from=%u\n", n, from);
             auto ranks = make_pair({.direct = true, .max_bytes = std::size_t{16} << 20U});
             const std::string route = ranks[0].comm->route_text();
             std::array<bool, 2> moved{};
@@ -284,6 +287,7 @@ void one_way_routes() {
     }
     // An engine without a one-way form: device and mixed routes refuse (nothing sent), the host route still goes one way.
     for (const std::size_t n : {std::size_t{1} << 20U, std::size_t{16} << 20U, std::size_t{64} << 10U}) {
+        std::fprintf(stderr, "[dist-contract] one_way_routes unsupported bytes=%zu\n", n);
         auto ranks = make_pair({.direct = true, .one_way_form = false, .max_bytes = std::size_t{16} << 20U});
         std::array<bool, 2> moved{};
         const auto errors = run(ranks, [&](unsigned r, Rank& rank) { moved[r] = one_way(*rank.comm, r, 0U, n, 6U); });
@@ -297,6 +301,7 @@ void one_way_routes() {
 void one_way_carry() {
     // Deferred CRCs ride one-way messages per direction: rank 0 -> 1, then 1 -> 0, then a control round.
     {
+        std::fputs("[dist-contract] one_way_carry normal\n", stderr);
         auto ranks = make_pair({});
         const auto errors = run(ranks, [&](unsigned r, Rank& rank) {
             staged(*rank.comm, r, 4096U, 1U);
@@ -309,6 +314,7 @@ void one_way_carry() {
     }
     // A corrupted ready view on rank 1 fails at the first message rank 1 receives (rank 0's one-way transfer).
     {
+        std::fputs("[dist-contract] one_way_carry corrupted\n", stderr);
         auto ranks = make_pair({.corrupt_rank1_at = 0});
         const auto errors = run(ranks, [&](unsigned r, Rank& rank) {
             auto& c = *rank.comm;
@@ -324,8 +330,11 @@ void one_way_carry() {
 
 int main() {
     setenv("STRIX_HOST_ANON_PIN", "0", 1);
+    std::fputs("[dist-contract] starting carry_interop\n", stderr);
     carry_interop();
+    std::fputs("[dist-contract] starting one_way_routes\n", stderr);
     one_way_routes();
+    std::fputs("[dist-contract] starting one_way_carry\n", stderr);
     one_way_carry();
     if (failures) {
         std::fprintf(stderr, "dist exchange contract: %d failure(s)\n", failures);
