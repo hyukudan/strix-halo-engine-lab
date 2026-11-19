@@ -30,6 +30,7 @@ struct Options {
     bool prefill_big = true;
     bool prefill_attn8 = false;
     Split nvfp4_split = Split::exact;
+    bool decode_attn8 = false;
     TurboWeights turbo_weights = TurboWeights::off;
     bool operator==(const Options&) const = default;
 };
@@ -207,6 +208,32 @@ int main() {
         run(Name::fast, TurboWeights::onfly, qp::Route::windows, 300, {}, &text);
         check(text.find("; qualified;") != std::string::npos && text.find("nothing applied") == std::string::npos,
               "FAST that applied split_k prints 'qualified'");
+    }
+
+    // 2d. decode_attn8 (FAST e4m3 decode / verify attention): offered on both routes; pending in the shipped registry (fast
+    //     leaves it off everywhere); a qualified row promotes it exactly from its min_prompt_tokens on its own route, and
+    //     the explicit --decode-attn8 off under fast keeps it off.
+    {
+        check(qp::offered("decode_attn8", qp::Route::windows) && qp::offered("decode_attn8", qp::Route::large_prefill),
+              "decode_attn8 must be offered on both routes");
+        for (const auto route : all_r)
+            for (const auto t : all_t) {
+                std::string text;
+                check(!run(Name::fast, TurboWeights::converted, route, t, {}, &text).decode_attn8, "shipped fast turned decode_attn8 on");
+                check(text.find("decode_attn8 = off [pending]") != std::string::npos, "fast text must show decode_attn8 pending");
+            }
+        const qp::Qualified rows[] = {{"decode_attn8", qp::Weights::nvfp4_rtn, qp::Route::windows, 8192, "synthetic test row"}};
+        check(!run(Name::fast, TurboWeights::converted, qp::Route::windows, 4096, {}, nullptr, rows).decode_attn8, "below the row's context");
+        check(run(Name::fast, TurboWeights::converted, qp::Route::windows, 8192, {}, nullptr, rows).decode_attn8, "at the row's context");
+        check(!run(Name::fast, TurboWeights::converted, qp::Route::large_prefill, 131072, {}, nullptr, rows).decode_attn8,
+              "a windows row must not turn the decode CLI on");
+        check(!run(Name::fast, TurboWeights::converted, qp::Route::windows, 131072, {{"decode_attn8", "off"}}, nullptr, rows).decode_attn8,
+              "--decode-attn8 off under fast");
+        check(run(std::nullopt, TurboWeights::off, qp::Route::large_prefill, 0, {{"decode_attn8", "on"}}).decode_attn8,
+              "--decode-attn8 on without a profile word");
+        check(throws([] { (void)run(std::nullopt, TurboWeights::converted, qp::Route::windows, 0, {{"decode_attn8", "auto"}}); },
+                     "--decode-attn8 expects on|off"),
+              "bad --decode-attn8 value must throw with the option's message");
     }
 
     std::printf("%s (%d failures)\n", g_fail ? "FAIL" : "ALL PASS", g_fail);

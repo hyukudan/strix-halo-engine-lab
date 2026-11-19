@@ -191,6 +191,7 @@ int main(int argc, char** argv) {
             else if (a == "--flash-tail") flash_tail = next();         // split|off (bitwise equal; scheduling only; default split)
             else if (a == "--prefill-attn8") lever_cli.emplace_back("prefill_attn8", next());        // on|off: e4m3 flash attention (FAST, identity -a8)
             else if (a == "--split-k") lever_cli.emplace_back("split_k", next());           // exact|fast: NVFP4 split-K policy (fast = FAST, identity -skf1)
+            else if (a == "--decode-attn8") lever_cli.emplace_back("decode_attn8", next());  // on|off: e4m3 decode/verify attention (FAST, identity -d8)
             else if (a == "--prefill-operand-cache") pf_ocache = next();          // auto|on|off: resident expanded weights (bitwise neutral)
             else if (a == "--prefill-operand-cache-cap-mib") pf_ocache_cap = next();  // arena cap in MiB, 0 = budget only
             else if (a == "--prefill-chunk") pf_chunk = strix::core::parse_u32(next());
@@ -232,7 +233,7 @@ int main(int argc, char** argv) {
             } else if (a == "--turbo-save-pack") save_pack = next();  // write the onfly NVFP4 weights of --model (BF16 gguf) as a converted pack, then exit
             else if (a == "--print-effective-config") print_cfg = true;
             else if (a == "--dump-logits") dump = next();
-            else if (a == "--dump-cont") dump_cont = next();  // with --prefill-arith: big prefill, then dump only its last row + decode rows
+            else if (a == "--dump-cont") dump_cont = next();  // last prompt row (big prefill or windows of --rows) + decode rows only
             else if (a == "--force-gen-file") force_file = next();  // teacher forcing: decode feeds these tokens (comma list), not its own argmax
             else if (a == "--dump-mtp") dump_mtp = next();
             else if (a == "--mtp-hidden") mtp_pre = next() == "pre";
@@ -400,7 +401,7 @@ int main(int argc, char** argv) {
         if (!dump.empty() && !df) throw std::runtime_error("cannot open " + dump);
         std::FILE* df_open = nullptr;
         if (!dump_cont.empty()) {  // continuation dump: row 0 = last prefill row, row j = decode step j (same layout as --dump-logits' tail)
-            if (pf_arith.empty() || df) throw std::runtime_error("--dump-cont needs --prefill-arith and no --dump-logits");
+            if (df) throw std::runtime_error("--dump-cont needs no --dump-logits");
             df_open = std::fopen(dump_cont.c_str(), "wb");
             if (!df_open) throw std::runtime_error("cannot open " + dump_cont);
         }
@@ -454,6 +455,10 @@ int main(int argc, char** argv) {
                 next_tok = tp[rows - 1];
             } else if (last) {
                 E->read_top(o, 1, &next_tok);
+                if (df_open) {  // windows route: row 0 of the continuation dump = the last prompt row (as the large prefill's)
+                    E->read_logits(o, 0, host_logits.data());
+                    std::fwrite(host_logits.data(), 4, cfg.vocab, df_open);
+                }
             }
         }
         E->sync();

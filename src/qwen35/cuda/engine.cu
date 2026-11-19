@@ -471,7 +471,7 @@ struct CudaEngine::Impl {
         ao = alloc<float>(static_cast<std::size_t>(RM) * c.heads * c.head_dim);
         hid = alloc<float>(static_cast<std::size_t>(RM) * c.intermediate);
         logits = alloc<float>(static_cast<std::size_t>(RM) * c.vocab);
-        scratch = alloc<float>(cc::attention_scratch_floats(ad, RM));
+        scratch = alloc<float>(std::max(cc::attention_scratch_floats(ad, RM), cc::attention_decode8_scratch_floats(ad, RM)));
         d_ids = alloc<std::uint32_t>(RM);
         d_pos = alloc<std::uint32_t>(1);
         d_top = alloc<std::uint32_t>(RM);
@@ -535,6 +535,7 @@ struct CudaEngine::Impl {
         CK(cudaStreamSynchronize(s));
         committed = 0;
         last_rows = 0;
+        d8_end = 0;
     }
 
     // ---- one attention layer body (shared by the trunk and the MTP block): mixer + MLP on rows of xa (residual stream).
@@ -543,6 +544,7 @@ struct CudaEngine::Impl {
         const std::uint32_t* pos;
         __nv_bfloat16 *kc, *vc;
         cc::RowMap rm{};
+        const cc::KvShadowE4m3* sh8 = nullptr;  // decode_attn8: the layer's e4m3 shadow (FAST8 decode attention), else BF16 attention
     };
 
     // GEMVs that share x: one launch when format and in agree (bitwise equal either way), else separate launches.
@@ -571,7 +573,7 @@ struct CudaEngine::Impl {
         CK(cc::rope_apply(q, qdst, c.rotary_dim, cos_t, sin_t, b.pos, s, b.rm));
         CK(cc::rope_apply(k, kvv, c.rotary_dim, cos_t, sin_t, b.pos, s, b.rm));
         CK(cc::kv_store(ad, k, v, b.kc, b.vc, b.pos, rows, s, b.rm));
-        CK(cc::attention_decode(ad, q, qdst, qg + D, qsrc, b.kc, b.vc, b.pos, rows, ao, scratch, s, b.rm));
+        CK(cc::attention_decode_kv(ad, q, qdst, qg + D, qsrc, b.kc, b.vc, b.sh8, b.pos, rows, ao, scratch, s, b.rm));
         CK(cc::dense_rows(w.o, ao, b.x, rows, b.x, s, opt.dense_arithmetic));
     }
 
@@ -600,7 +602,7 @@ struct CudaEngine::Impl {
                 CK(cc::gdn_window(gd, cl.layer, cl.state, cl.win, z, gout, rows, c.rms_eps, d_parity, s));
                 CK(cc::dense_rows(w.out, gout, x, rows, x, s, opt.dense_arithmetic));
             } else {
-                attn_mixer(w, Bufs{x, xn, d_pos, kc[l], vc[l]}, rows);
+                attn_mixer(w, Bufs{x, xn, d_pos, kc[l], vc[l], {}, decode8_on() ? &pf.sh[l] : nullptr}, rows);
             }
             mlp(w, Bufs{x, xn, d_pos, nullptr, nullptr}, rows);
         }
@@ -618,6 +620,7 @@ struct CudaEngine::Impl {
         if (rows == 0 || rows > RM) throw std::runtime_error("forward_rows: rows must be 1..32");
         core::require_capacity(committed, rows, opt.max_positions);
         core::validate_token_ids(tokens, rows, c.vocab);
+        if (decode8_on()) decode8_catch_up();
         InputPack in{};
         in.pos0 = committed;
         for (std::uint32_t i = 0; i < rows; ++i) in.ids[i] = tokens[i];
@@ -666,6 +669,9 @@ struct CudaEngine::Impl {
         if (kk > 0) {
             CK(cc::gdn_commit(gd, commit_layers.data(), static_cast<std::uint32_t>(commit_layers.size()), last_rows, kk, d_parity, s));
         }
+        // decode_attn8: the window's rows were quantised into the shadow right after kv_store (attn_mixer), so the committed
+        // prefix stays mirrored when the shadow was current at the window start (forward() catches up first).
+        if (decode8_on() && d8_end == committed) d8_end += kk;
         committed += kk;
         last_rows = 0;
     }
@@ -976,6 +982,17 @@ struct CudaEngine::Impl {
         std::uint32_t sh_end = 0, sh_from = 0, start = 0;
     } pf;
     [[nodiscard]] bool attn8_on() const { return opt.prefill_attn8 && opt.prefill_arith != PrefillArith::exact; }
+    // decode_attn8 (FAST8 decode / verify attention over the same e4m3 shadow, identity -d8): positions < d8_end mirror the
+    // BF16 cache for decode. Main-session trunk only: slot batches (rm.slot) and the MTP block keep BF16 attention_decode.
+    std::uint32_t d8_end = 0;
+    [[nodiscard]] bool decode8_on() const { return opt.decode_attn8; }
+    void decode8_catch_up() {
+        pf_shadow_init();
+        if (d8_end >= committed) return;
+        for (std::uint32_t l = 0; l < c.layers; ++l)
+            if (L[l].attn) CK(cc::kv_shadow_e4m3(ad, kc[l], vc[l], pf.sh[l], d8_end, committed - d8_end, s));
+        d8_end = committed;
+    }
     void pf_shadow_init() {
         if (!pf.sh.empty()) return;
         const std::size_t bytes = cc::kv_shadow_e4m3_bytes(ad), p8 = cc::attn8_capacity(ad), kvd = static_cast<std::size_t>(c.kv_heads) * p8 * c.head_dim;
@@ -1768,6 +1785,10 @@ void print_effective_config(const EngineOptions& o, const char* arith, std::FILE
                  o.flash_pipe == cuda_core::FlashPipe::swz3 ? "swz3" : "pad2",
                  o.prefill_arith == PrefillArith::exact ? "n/a (exact prefill keeps attention_decode)"
                  : o.prefill_attn8 ? "on (e4m3 shadow KV + e4m3 flash, bit-changing, identity -a8)" : "off");
+    std::fprintf(f, "  decode-attn8: %s\n",
+                 o.decode_attn8 ? "on (FAST class d8: decode/verify attention on e4m3 tensor cores over the e4m3 shadow, identity -d8; "
+                                  "verify rows == serial rows inside the class; slot batches and the MTP block keep BF16 attention)"
+                                : "off (BF16 attention_decode)");
     const char* oc = o.prefill_operand_cache == cuda_core::operand_cache::Mode::off ? "per-call weight expansion"
                      : o.prefill_operand_cache == cuda_core::operand_cache::Mode::on
                          ? "every expanded class (FAST8 e4m3, exact f16 / q8) resident, expanded once"

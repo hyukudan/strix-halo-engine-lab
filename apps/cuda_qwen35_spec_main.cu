@@ -152,6 +152,7 @@ int main(int argc, char** argv) {
             else if (a == "--pdl") pdl = next() != "0";  // EngineOptions::pdl, as the decode CLI
             else if (a == "--profile") profile = strix::qwen35::profile::parse(next());  // one tier word; exact = default
             else if (a == "--split-k") lever_cli.emplace_back("split_k", next());  // exact|fast: overrides the profile
+            else if (a == "--decode-attn8") lever_cli.emplace_back("decode_attn8", next());  // on|off: e4m3 decode/verify attention (FAST, identity -d8)
             else if (a == "--seed-costs") seed_costs = next() != "0";
             else if (a == "--cost-model") {
                 const std::string v = next();

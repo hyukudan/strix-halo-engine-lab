@@ -102,6 +102,9 @@ struct EngineOptions {
     cuda_core::FlashTail flash_tail = cuda_core::FlashTail::split;
     // attn8: e4m3 flash attention over an e4m3 shadow of the KV cache (bit-changing, own identity suffix "-a8"; FAST gate required).
     bool prefill_attn8 = false;
+    // decode_attn8: decode / verify attention on e4m3 tensor cores over the same e4m3 shadow (cuda_core attention_decode8; FAST class
+    // d8, bit-changing vs BF16 attention_decode, own identity suffix "-d8"; opt-in until its quality gate passes). Main session only.
+    bool decode_attn8 = false;
     // Resident expanded prefill operands (strix/cuda_core/operand_cache_plan.hpp, shared dense_big core): each NVFP4 / q8_0 weight
     // is expanded into its MMA operand once per engine instead of once per chunk, slot and request. Bitwise neutral (same bytes,
     // same kernel). auto = FAST8 e4m3 operands only (the measured per-call cost), on = also the exact f16 / q8 operands; both
@@ -122,10 +125,11 @@ struct EngineOptions {
     static const char* pf_names[] = {"exact", "flash", "fast", "fast2", "fast8", "fast4"};
     const std::string a = names[static_cast<unsigned>(o.dense_arithmetic)];
     // a non-exact prefill policy is a different arithmetic identity (prefix caches never mix them)
-    const std::string pf = o.prefill_arith == PrefillArith::exact
-        ? ""
+    // decode_attn8 changes the decode bits and so every later K/V row: its own suffix (FAST class d8, never an exact identity)
+    const std::string pf = (o.prefill_arith == PrefillArith::exact
+        ? std::string()
         : std::string("-pf-") + pf_names[static_cast<unsigned>(o.prefill_arith)] + (o.prefill_attn8 ? "-a8" : "") +
-              (o.prefill_gdn == PrefillGdn::chunk16 ? "-gdnc16" : "");
+              (o.prefill_gdn == PrefillGdn::chunk16 ? "-gdnc16" : "")) + (o.decode_attn8 ? "-d8" : "");
     if (o.turbo_weights == TurboWeights::off) return "qwen35-cuda-exact-" + a + "-v1" + pf;
     // the FAST split policy changes the NVFP4 GEMV summation order (decode, verify and the exact prefill's split ranges)
     const std::string sk = o.nvfp4_split == split_k::Profile::fast ? "-skf1" : "";
