@@ -170,7 +170,7 @@ int main() {
         check(!c.prefill_big && c.prefill_arith == PrefillArith::exact, "--prefill-arith windows");
         const Options d = run(Name::fast, TurboWeights::converted, qp::Route::large_prefill, 32768, {{"prefill_attn8", "off"}, {"prefill_arith", "exact"}});
         check(d.prefill_arith == PrefillArith::exact && !d.prefill_attn8, "explicit off switches under fast");
-        // every engine spelling passes the resolver (RTX-CHAIN-1119B smoke: chunk16tc was refused by a second list here)
+        // every engine spelling passes the resolver (the CLI path once kept a second spelling list that refused chunk16tc)
         const Options e = run(Name::fast, TurboWeights::converted, qp::Route::large_prefill, 8192, {{"prefill_gdn", "chunk16tc"}});
         check(e.prefill_arith == PrefillArith::fast4 && e.prefill_gdn == PrefillGdn::chunk16tc, "explicit --prefill-gdn chunk16tc under fast");
         const Options f = run(std::nullopt, TurboWeights::converted, qp::Route::large_prefill, 0,

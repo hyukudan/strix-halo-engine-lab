@@ -140,7 +140,7 @@ int main() {
         check(engine_identity(f).find("-h16") == std::string::npos, "prefill-hid ignored outside fast4");
     }
     {  // the CLI path: decode_main -> qp::resolve -> qp::apply on the REAL EngineOptions accepts every engine spelling and maps it
-       // exactly like the engine parser (RTX-CHAIN-1119B smoke: the profile applier kept a second list and refused chunk16tc)
+       // exactly like the engine parser (the profile applier once kept a second spelling list that refused chunk16tc)
         namespace q = strix::qwen35;
         namespace qp = strix::qwen35::profile;
         const auto via_cli = [](std::optional<strix::profile::Name> profile, const strix::profile::Pairs& cli) {
@@ -158,7 +158,7 @@ int main() {
                   "CLI --prefill-hid reaches the options as the engine parser maps it");
         const auto t = via_cli(strix::profile::Name::fast, {{"prefill_gdn", "chunk16tc"}});
         check(t.prefill_arith == q::PrefillArith::fast4 && t.prefill_gdn == q::PrefillGdn::chunk16tc && t.prefill_hid == q::PrefillHid::f32,
-              "--profile fast + --prefill-gdn chunk16tc: kit smoke composition (hid stays f32: no gate receipt)");
+              "--profile fast + --prefill-gdn chunk16tc: explicit lever on top of the profile (hid stays f32: no gate receipt)");
         check(rejects([&] { (void)via_cli(std::nullopt, {{"prefill_gdn", "chunk16t"}}); }), "CLI --prefill-gdn rejects unknown spellings");
     }
     {  // --prefill-norm-fold: strict on|off; bitwise scheduling of bytes -> never part of the engine identity

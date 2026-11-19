@@ -97,7 +97,9 @@ __device__ __forceinline__ void regs_inc() {
 // instantiates exactly the text of the cp.async kernel and its SASS is identical to it (with the stage MMA and the epilogue in
 // __forceinline__ helpers ptxas re-scheduled the lsu kernel: 10,016 -> 11,488 instructions, 2-4.6 % slower on 4 of 5 dense
 // FAST4 shapes). Feed::bulk adds the producer warpgroup below. Same loads and MMA order per accumulator: bitwise equal.
-template <Feed F>
+// H16 (nvfp4-tile-h16-v1, compile-time trait): the GLU epilogue stores BF16 hidden rows (a.y16) instead of FP32 (a.y). The
+// FP32 instantiation (H16 = false) has no H16 code at all, so its machine code is the trait-free kernel's.
+template <Feed F, bool H16>
 __global__ void __launch_bounds__(F == Feed::bulk ? kBulkThreads : kThreads, 1) gemm_kernel(const GemmArgs a) {
     constexpr bool kBulk = F == Feed::bulk;
     extern __shared__ __align__(16) unsigned char smem[];
@@ -271,7 +273,7 @@ __global__ void __launch_bounds__(F == Feed::bulk ? kBulkThreads : kThreads, 1) 
                     const float gate = __fmul_rn(acc[2 * p][nt][z], __fmul_rn(a.gs, rs));
                     const float up = __fmul_rn(acc[2 * p + 1][nt][z], __fmul_rn(a.gs2, rs));
                     const float h = __fmul_rn(strix::cuda_core::cc_silu(gate), up);
-                    if (a.y16 != nullptr) a.y16[yrow + ch] = __bfloat16_as_ushort(__float2bfloat16_rn(h));  // nvfp4-tile-h16-v1
+                    if constexpr (H16) a.y16[yrow + ch] = __bfloat16_as_ushort(__float2bfloat16_rn(h));  // nvfp4-tile-h16-v1
                     else a.y[yrow + ch] = h;
                 }
             } else {

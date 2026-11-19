@@ -456,7 +456,7 @@ void bench_h16(std::uint32_t rows) {
     const double saved = (glu32 - glu16) + (q32 - q16);
     std::printf("H16 BENCH rows=%u glu_f32_ms=%.4f glu_h16_ms=%.4f quant_f32_ms=%.4f quant_h16_ms=%.4f saved_ms=%.4f\n", rows, glu32, glu16,
                 q32, q16, saved);
-    std::printf("H16 OP GATE %s (saved %.4f ms per %u-row FFN; predicted 0.10-0.14, floor 0.05)\n", saved >= 0.05 ? "PASS" : "FAIL", saved,
+    std::printf("H16 OP GATE %s (saved %.4f ms per %u-row FFN; floor 0.05)\n", saved >= 0.05 ? "PASS" : "FAIL", saved,
                 rows);
     for (void* p : {static_cast<void*>(w), static_cast<void*>(w2), static_cast<void*>(xt), static_cast<void*>(rs), static_cast<void*>(x),
                     static_cast<void*>(y), static_cast<void*>(y16), static_cast<void*>(ht), static_cast<void*>(hrs)})
