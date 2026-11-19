@@ -157,6 +157,7 @@ ExpertStreamer::ExpertStreamer(FileReader& file, StreamerPlan plan) : file_(file
         }
     }
     // resident experts: [gate r][up r][down r] in virtual order, read from the file run by run of consecutive ids
+    double load_io_s = 0.0;  // load-time reads: no run's I/O
     for (std::uint32_t l = p_.first; l < p_.end; ++l) {
         const std::uint32_t r = p_.resident[l];
         if (r == 0U) continue;
@@ -168,7 +169,7 @@ ExpertStreamer::ExpertStreamer(FileReader& file, StreamerPlan plan) : file_(file
             for (std::uint32_t v = 0; v < r;) {
                 std::uint32_t n = 1;
                 while (v + n < r && p_.order[l][v + n] == p_.order[l][v] + n) ++n;
-                file_to_device(p_.extents[l].offset[k] + std::uint64_t{p_.order[l][v]} * b, std::uint64_t{n} * b, at);
+                file_to_device(p_.extents[l].offset[k] + std::uint64_t{p_.order[l][v]} * b, std::uint64_t{n} * b, at, load_io_s);
                 at += std::uint64_t{n} * b;
                 v += n;
             }
@@ -299,11 +300,9 @@ void ExpertStreamer::begin_run_uses(std::span<const std::uint32_t> layers) {
     if (streamed_.empty()) return;
     run_ = true;
     ++run_id_;
-    bytes_streamed_ = 0;
-    file_bytes_ = 0;
+    epochs_.open(run_id_);  // a preload still reading publishes into its own counters, never into this run's
     promoted_mark_ = promoted_end_;
     demoted_mark_ = demoted_end_;
-    io_seconds_ = 0.0;
     wait_seconds_ = 0.0;
     wake_.notify_all();
 }
@@ -311,6 +310,7 @@ void ExpertStreamer::end_run() {
     std::lock_guard<std::mutex> lock(mutex_);
     promoted_end_ = promoted_cum_;
     demoted_end_ = demoted_cum_;
+    epochs_.close();  // the run's counters are final: stats() returns them unchanged while the idle preload runs
     run_ = false;
     wake_.notify_all();
 }
@@ -363,8 +363,8 @@ void ExpertStreamer::release(std::uint32_t layer, cudaStream_t stream) {
 ExpertStreamer::Stats ExpertStreamer::stats() const {
     std::lock_guard<std::mutex> lock(mutex_);
     Stats st;
-    st.bytes_streamed = bytes_streamed_;
-    st.io_seconds = io_seconds_;
+    st.bytes_streamed = epochs_.run().bytes;
+    st.io_seconds = epochs_.run().io_seconds;
     st.wait_seconds = wait_seconds_;
     st.copy_end_ms.assign(p_.end, -1.0F);
     st.copy_begin_ms.assign(p_.end, -1.0F);
@@ -387,7 +387,7 @@ ExpertStreamer::Stats ExpertStreamer::stats() const {
     st.demoted_layers = (run_ ? demoted_cum_ : demoted_end_) - demoted_mark_;
     st.promoted_held = promoted_held_;
     st.promoted_bytes = promoted_bytes_;
-    st.file_bytes = file_bytes_;
+    st.file_bytes = epochs_.run().file_bytes;
     return st;
 }
 ExpertStreamer::Promoted ExpertStreamer::promoted() const {
@@ -397,7 +397,7 @@ ExpertStreamer::Promoted ExpertStreamer::promoted() const {
 cudaEvent_t ExpertStreamer::copy_origin() const { return origin_ ? origin_->e : nullptr; }
 
 // file -> pinned staging -> device (copy stream), aligned superset pieces; blocks until enqueued
-void ExpertStreamer::file_to_device(std::uint64_t offset, std::uint64_t bytes, std::uint8_t* dst) {
+void ExpertStreamer::file_to_device(std::uint64_t offset, std::uint64_t bytes, std::uint8_t* dst, double& io_s) {
     const std::uint64_t A = FileReader::alignment;
     std::uint64_t done = 0;
     while (done < bytes) {
@@ -408,7 +408,7 @@ void ExpertStreamer::file_to_device(std::uint64_t offset, std::uint64_t bytes, s
         const std::uint64_t a1 = std::min<std::uint64_t>((at + n + A - 1U) / A * A, file_.size());
         const auto t0 = std::chrono::steady_clock::now();
         file_.read_range(a0, static_cast<std::size_t>(a1 - a0), st.buf->get(), std::size_t{8} << 20);
-        io_seconds_ += seconds_since(t0);
+        io_s += seconds_since(t0);
         STRIX_CUDA_CHECK(cudaMemcpyAsync(dst + done, st.buf->get() + (at - a0), n, cudaMemcpyHostToDevice, copy_));
         STRIX_CUDA_CHECK(cudaEventRecord(st.done->e, copy_));
         st.used = true;
@@ -428,7 +428,7 @@ void ExpertStreamer::file_to_host(std::uint64_t offset, std::uint64_t bytes, std
 }
 // file -> pinned host memory (lazy promotion): straight into dst when it is aligned like the file offset (the
 // reader's aligned path, no bounce), else the aligned superset through the staging ring and a host copy
-void ExpertStreamer::file_to_pinned(std::uint64_t offset, std::uint64_t bytes, std::uint8_t* dst) {
+void ExpertStreamer::file_to_pinned(std::uint64_t offset, std::uint64_t bytes, std::uint8_t* dst, double& io_s) {
     const std::uint64_t A = FileReader::alignment;
     const auto t0 = std::chrono::steady_clock::now();
     if (reinterpret_cast<std::uintptr_t>(dst) % A == offset % A) {
@@ -445,7 +445,7 @@ void ExpertStreamer::file_to_pinned(std::uint64_t offset, std::uint64_t bytes, s
             done += n;
         }
     }
-    io_seconds_ += seconds_since(t0);
+    io_s += seconds_since(t0);
 }
 void ExpertStreamer::copy_piecewise(std::uint8_t* dst, const std::uint8_t* src, std::uint64_t bytes) {
     const std::uint64_t piece = p_.piece_bytes == 0U ? bytes : p_.piece_bytes;
@@ -456,7 +456,7 @@ void ExpertStreamer::copy_piecewise(std::uint8_t* dst, const std::uint8_t* src, 
 // Group g of the layer's streamed experts into the slot: its gate, up and down pieces, then the group's event.
 // fill (a file-tier layer being promoted): the file runs go into the new pinned copy at the host tier's packed layout,
 // and the slot is copied from there (the same bytes as through the staging ring).
-void ExpertStreamer::load_group(Slot& s, std::uint32_t layer, std::uint32_t g, std::uint8_t* fill) {
+void ExpertStreamer::load_group(Slot& s, std::uint32_t layer, std::uint32_t g, std::uint8_t* fill, double& io_s) {
     const std::uint32_t E = p_.experts, r = p_.resident[layer], n_s = E - r;
     const std::uint32_t G = p_.group_experts == 0U ? n_s : p_.group_experts;
     const std::uint32_t j0 = g * G, n = std::min(n_s - j0, G);
@@ -474,7 +474,7 @@ void ExpertStreamer::load_group(Slot& s, std::uint32_t layer, std::uint32_t g, s
             for (std::uint32_t v = r + j0; v < r + j0 + n;) {
                 std::uint32_t m = 1;
                 while (v + m < r + j0 + n && p_.order[layer][v + m] == p_.order[layer][v] + m) ++m;
-                file_to_pinned(p_.extents[layer].offset[k] + std::uint64_t{p_.order[layer][v]} * b, std::uint64_t{m} * b, at);
+                file_to_pinned(p_.extents[layer].offset[k] + std::uint64_t{p_.order[layer][v]} * b, std::uint64_t{m} * b, at, io_s);
                 at += std::uint64_t{m} * b;
                 v += m;
             }
@@ -483,7 +483,7 @@ void ExpertStreamer::load_group(Slot& s, std::uint32_t layer, std::uint32_t g, s
             for (std::uint32_t v = r + j0; v < r + j0 + n;) {
                 std::uint32_t m = 1;
                 while (v + m < r + j0 + n && p_.order[layer][v + m] == p_.order[layer][v] + m) ++m;
-                file_to_device(p_.extents[layer].offset[k] + std::uint64_t{p_.order[layer][v]} * b, std::uint64_t{m} * b, dst);
+                file_to_device(p_.extents[layer].offset[k] + std::uint64_t{p_.order[layer][v]} * b, std::uint64_t{m} * b, dst, io_s);
                 dst += std::uint64_t{m} * b;
                 v += m;
             }
@@ -494,19 +494,15 @@ void ExpertStreamer::load_group(Slot& s, std::uint32_t layer, std::uint32_t g, s
     STRIX_CUDA_CHECK(cudaEventRecord(s.group_ready[g]->e, copy_));
 }
 
-std::uint64_t ExpertStreamer::load_into(Slot& s, std::uint32_t layer) {
+std::uint64_t ExpertStreamer::load_into(Slot& s, std::uint32_t layer, bool timed, bool origin, double& io_s) {
     s.layer = -1;
-    const bool timed = p_.timing && run_;
     if (timed) {
-        if (!origin_recorded_) {
-            STRIX_CUDA_CHECK(cudaEventRecord(origin_->e, copy_));
-            origin_recorded_ = true;
-        }
+        if (origin) STRIX_CUDA_CHECK(cudaEventRecord(origin_->e, copy_));
         STRIX_CUDA_CHECK(cudaEventRecord(copy_begin_[layer]->e, copy_));
     }
     auto fresh = promote_buffer(layer);
     try {
-        for (std::uint32_t g = 0; g < groups(layer); ++g) load_group(s, layer, g, fresh ? fresh->get() : nullptr);
+        for (std::uint32_t g = 0; g < groups(layer); ++g) load_group(s, layer, g, fresh ? fresh->get() : nullptr, io_s);
     } catch (...) {
         if (fresh) cudaStreamSynchronize(copy_);  // no copy may still read the buffer freed below
         throw;
@@ -526,10 +522,7 @@ std::uint64_t ExpertStreamer::load_into(Slot& s, std::uint32_t layer) {
     } else if (promote_lru_.contains(layer)) {
         promote_lru_.touch(layer, ++promote_clock_);
     }
-    if (timed) {
-        STRIX_CUDA_CHECK(cudaEventRecord(copy_end_[layer]->e, copy_));
-        copied_[layer] = true;
-    }
+    if (timed) STRIX_CUDA_CHECK(cudaEventRecord(copy_end_[layer]->e, copy_));  // copied_ / origin_recorded_: loop(), under mutex_
     const std::uint64_t eb = p_.expert_bytes[0] + p_.expert_bytes[1] + p_.expert_bytes[2];
     s.layer = static_cast<std::int32_t>(layer);
     return std::uint64_t{streamed(layer)} * eb;
@@ -596,8 +589,8 @@ void ExpertStreamer::loop() {
             // the preload this run consumes: the one that followed the previous run (this thread finished it before)
             consumed_bytes_ = 0;
             consumed_s_ = consumed_after_begin_s_ = 0.0;
-            if (run_id_ > 0U && preload_after_run_ == run_id_ - 1U && !preload_running_ && preload_bytes_ != 0U) {
-                consumed_bytes_ = preload_bytes_;
+            if (run_id_ > 0U && epochs_.preload_followed(run_id_ - 1U) && !preload_running_ && epochs_.preload().bytes != 0U) {
+                consumed_bytes_ = epochs_.preload().bytes;
                 consumed_s_ = std::chrono::duration<double>(preload_t1_ - preload_t0_).count();
                 const auto from = std::max(preload_t0_, run_begin_t_);
                 consumed_after_begin_s_ = preload_t1_ > from ? std::chrono::duration<double>(preload_t1_ - from).count() : 0.0;
@@ -616,18 +609,22 @@ void ExpertStreamer::loop() {
         }
         if (!run_) {
             idle_prefetch_done = true;
-            preload_after_run_ = run_id_;
-            preload_bytes_ = 0;
+            // the preload's counters are its own (job-local, published below): a run that ends, reports or begins
+            // while it still reads never sees them
+            const ExpertStreamJob job = epochs_.start_preload();  // follows run `job.epoch`; consumed once it is done
             preload_running_ = true;
             preload_t0_ = std::chrono::steady_clock::now();
             lock.unlock();
-            std::uint64_t pre_bytes = 0;
+            ExpertStreamCounters pre{};
             try {
                 STRIX_CUDA_CHECK(cudaDeviceSynchronize());
                 for (std::size_t j = 0; j < slots_.size(); ++j) {
                     auto& s = slots_[j];
                     if (s.layer == static_cast<std::int32_t>(streamed_[j])) continue;
-                    pre_bytes += load_into(s, streamed_[j]);
+                    const bool from_file = p_.stream_tier[streamed_[j]] == ExpertTier::file;
+                    const std::uint64_t b = load_into(s, streamed_[j], false, false, pre.io_seconds);
+                    pre.bytes += b;
+                    if (from_file) pre.file_bytes += b;
                     STRIX_CUDA_CHECK(cudaStreamSynchronize(copy_));
                 }
             } catch (const std::exception& e) {
@@ -637,7 +634,7 @@ void ExpertStreamer::loop() {
             }
             {
                 std::lock_guard<std::mutex> g(mutex_);
-                preload_bytes_ = pre_bytes;
+                epochs_.publish(job, pre);
                 preload_t1_ = std::chrono::steady_clock::now();
                 preload_running_ = false;
             }
@@ -648,16 +645,23 @@ void ExpertStreamer::loop() {
         auto& s = slots_[j % slots_.size()];
         const std::uint32_t layer = uses_[j];
         const bool wait_free = j >= slots_.size();
+        // what this use belongs to, captured under mutex_: its counters are published below for this run only
+        const ExpertStreamJob job = epochs_.run_job();
+        const bool timed = p_.timing, origin = timed && !origin_recorded_;
         try {
             if (wait_free) STRIX_CUDA_CHECK(cudaStreamWaitEvent(copy_, s.free->e, 0));
             if (s.layer != static_cast<std::int32_t>(layer)) {
                 const bool from_file = p_.stream_tier[layer] == ExpertTier::file;
                 lock.unlock();
-                const std::uint64_t b = load_into(s, layer);
+                double io_s = 0.0;
+                const std::uint64_t b = load_into(s, layer, timed, origin, io_s);
                 lock.lock();
-                bytes_streamed_ += b;
-                if (from_file) file_bytes_ += b;
+                epochs_.publish(job, {b, from_file ? b : 0U, io_s});
                 copy_bytes_[layer] = b;
+                if (timed) {
+                    origin_recorded_ = true;
+                    copied_[layer] = true;
+                }
             } else {
                 // preloaded between runs: its group events fired long ago (record them again: same meaning)
                 lock.unlock();
