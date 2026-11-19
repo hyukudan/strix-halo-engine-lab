@@ -12,7 +12,7 @@
 //   - the host gap per join segment (wake-up + relaunch after a host wait: zero only for a route measured at zero);
 //   - a GAIN BAR: a multi-device form is admissible only if ms x (1 + uncertainty) < single x (1 - margin);
 //   - a reason string on every refusal and one receipt line with counts and bytes, so prediction and measurement compare.
-// Prints only: callers still choose their form (an engine binds the chosen form in its own change, with its ticket).
+// Prints only: callers still choose their form (an engine binds the chosen form in its own change, with its measurement).
 // Host test: tests/pair_planner_tests.cpp.
 // Home: shared (host shared). Bound by: none yet (engines describe their pass as split::Stage rows and print the line).
 #include "strix/device/set.hpp"
