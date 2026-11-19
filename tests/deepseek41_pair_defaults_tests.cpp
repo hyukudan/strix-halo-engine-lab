@@ -472,20 +472,24 @@ void test_profile() {
         std::size_t pending = 0;
         for (const auto& e : f.profile->entries) pending += e.status == pr::Status::pending;
         check(pending == 0U, "fast: no pending row once the bundle selects attention bf16flash");
-        const char* stamp = "qualified";
-        check(f.profile->qualification() == stamp, "fast: the gated stack is stamped qualified");
-        for (const char* row : {"fast_prefill", "engram_f16wmma", "shared_f16", "moe_f16wmma"})
-            check(f.profile->find(row)->status == pr::Status::set && f.profile->find(row)->value == "1", "fast: gated row set");
+        // The gated stack is final for prompts <= 8,192 and provisional above: selected ahead of its full receipt.
+        const std::string stamp = f.profile->qualification();
+        check(stamp.rfind("qualification in progress", 0) == 0, "fast: the gated stack is stamped in progress (32K provisional)");
+        for (const char* row : {"fast_prefill", "engram_f16wmma", "shared_f16", "moe_f16wmma"}) {
+            check(f.profile->find(row)->status == pr::Status::provisional && f.profile->find(row)->value == "1",
+                  "fast: gated row selected (provisional)");
+            check(stamp.find(row) != std::string::npos, "fast: provisional row named in the stamp");
+        }
         check(std::count_if(f.notices.begin(), f.notices.end(), [](const std::string& n) {
-                  return n.find("is bit-changing; qualification in progress") != std::string::npos; }) == 0,
-              "fast: no provisional notice");
-        check(f.profile->json().find(std::string("\"qualification\":\"") + stamp + "\"") != std::string::npos &&
-                  f.profile->json().find("\"provisional\":[]") != std::string::npos &&
+                  return n.find("qualification in progress") != std::string::npos; }) > 0,
+              "fast: provisional notice");
+        check(f.profile->json().find("\"provisional\":[\"") != std::string::npos &&
+                  f.profile->json().find("fast_prefill") != std::string::npos &&
                   base.profile->json().find("\"provisional\":[]") != std::string::npos,
-              "receipt: qualified stamp, empty provisional list");
-        check(pd::describe(app, f).find(std::string("profile qualification ") + stamp + "\n") != std::string::npos &&
-                  pd::describe(app, f).find("profile lever fast_prefill 1 (profile, ") != std::string::npos,
-              "effective config: qualified lines");
+              "receipt: provisional list names the gated rows; exact has none");
+        check(pd::describe(app, f).find("profile qualification " + stamp + "\n") != std::string::npos &&
+                  pd::describe(app, f).find("profile lever fast_prefill 1 (") != std::string::npos,
+              "effective config: provisional lines");
         World sw0 = w;
         sw0.env["STRIX_DS41_FAST_PREFILL"] = "0";
         const auto f0 = sw0.run(app, fast_args);
@@ -494,7 +498,7 @@ void test_profile() {
               "fast: an explicit switch 0 wins over the profile");
         World ap = w;
         ap.env["STRIX_DS41_PROFILE_ALLOW_PENDING"] = "1";
-        check(ap.run(app, fast_args).profile->qualification() == stamp, "--allow-pending: nothing pending under fast");
+        check(ap.run(app, fast_args).profile->qualification() == stamp, "--allow-pending: the same set under fast");
 
         auto q_args = plain_args;
         q_args.insert(q_args.end(), {"--profile", "quality"});

@@ -298,7 +298,7 @@ int main() {
         namespace md = strix::minimax::defaults;
         const auto ds41_rows = bundle_rows(dp::profile_table, strix::ds41::fast_profile::kBundle);
         const auto mm_rows = bundle_rows(md::profile_table, md::kFastBundle);
-        check_gates("deepseek41-pair", dp::profile_table, {}, ds41_rows);
+        check_gates("deepseek41-pair", dp::profile_table, dp::fast_gates, ds41_rows);
         check_gates("glm-pair", strix::glm::rank_defaults::product_profile_table, {});
         check_gates("deepseek41-rtx", strix::ds41::rtx::profile::shared_rows(), {});
         check_gates("minimax-pair", md::profile_table, {}, mm_rows);
