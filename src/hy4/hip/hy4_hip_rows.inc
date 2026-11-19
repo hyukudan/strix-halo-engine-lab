@@ -2,7 +2,7 @@
 // the step's private helpers (linear, norm, engram, index_keys, index_select) and caches. Contract and host replay:
 // hy4_hip_rows.hpp. No kernel of its own: every launch is the step's shared entry, with Rows = R where the entry's
 // per-row arithmetic does not depend on the row count:
-//  - Q8_0 Linears: shared q8_rows with a Rows = R Site (Q8RowsN, same coefficient / fma / add as Q8Rows): every (output,
+//  - Q8_0 Linears: shared q8_rows with a Rows = R Site (Q8RowsN, the StockQ8Arithmetic of the step's LinearF32): every (output,
 //    row) accumulator gets the same products in the same column order and the same lane / leaf tree for any Rows
 //    (hip_q8_rows_gemv.hpp reduce: lane bits 16..1, leaf bits 2..0, whatever the pair count);
 //  - absorb heads K_b / V_b: q8_rows launch_heads with a Rows = 2 head Site (launch_heads admits 1..2 rows; Outs 4 both);
@@ -15,7 +15,7 @@
 // (rows::cache_rows -> layer_caches max_rows; rows::check_rewind replays it).
 
 template <unsigned R>
-struct Q8RowsN {  // Q8Rows with R input rows; row r stores at out[r * outputs + o]
+struct Q8RowsN : strix::q8_rows::StockQ8Arithmetic {  // the stock Q8_0 site with R input rows; row r stores at out[r * outputs + o]
     using Input = float;
     static constexpr unsigned rows = R;
     const void* input[R];
@@ -24,15 +24,12 @@ struct Q8RowsN {  // Q8Rows with R input rows; row r stores at out[r * outputs +
     float* out;
     const float* bias = nullptr;
     bool round = false;
-    __device__ static float coefficient(unsigned scale, std::int8_t code) { return Q8Rows::coefficient(scale, code); }
-    __device__ static void fma(float& a, float cf, float x) { Q8Rows::fma(a, cf, x); }
-    __device__ static float add(float lower, float upper) { return Q8Rows::add(lower, upper); }
     __device__ void store(std::uint32_t oi, unsigned r, float value) const {
         out[std::size_t{r} * outputs + oi] = round ? strix::ops::glu::epilogue<strix::ops::glu::Round::bf16>(value, bias, bias ? oi : 0U) : value;
     }
 };
 template <unsigned R>
-struct AbsorbRowsN {  // AbsorbHeads with R (<= 2) input rows; row r stores at out + r * row_stride
+struct AbsorbRowsN : strix::q8_rows::StockQ8Arithmetic {  // the heads site with R (<= 2) input rows; row r stores at out + r * row_stride
     using Input = float;
     static constexpr unsigned rows = R;
     static constexpr bool head_input = true;
@@ -41,9 +38,6 @@ struct AbsorbRowsN {  // AbsorbHeads with R (<= 2) input rows; row r stores at o
     std::uint32_t width, outputs, head_outputs, input_stride, out_stride;
     std::size_t row_stride;
     float* out;
-    __device__ static float coefficient(unsigned scale, std::int8_t code) { return AbsorbHeads::coefficient(scale, code); }
-    __device__ static void fma(float& a, float cf, float x) { AbsorbHeads::fma(a, cf, x); }
-    __device__ static float add(float lower, float upper) { return AbsorbHeads::add(lower, upper); }
     __device__ void store(std::uint32_t oi, unsigned r, float value) const {
         out[r * row_stride + std::size_t{oi / head_outputs} * out_stride + oi % head_outputs] = value;
     }
@@ -207,12 +201,12 @@ void linear_vrows(const std::string& name, const float* x, std::uint32_t width, 
     if (round) glu::launch_epilogue<glu::Round::bf16>(y, bias, outputs, total, y, s);
     check(hipGetLastError(), "linear verify rows launch");
 }
-// absorb_heads() over R rows: pairs of rows per launch (launch_heads admits 1..2 rows), the odd row alone.
+// launch_heads_f32() over R rows: pairs of rows per launch (launch_heads admits 1..2 rows), the odd row alone.
 void absorb_vrows(const std::uint8_t* wt, std::uint32_t heads, std::uint32_t width, std::uint32_t head_outputs, const float* x,
                   std::uint32_t x_stride, std::size_t x_row, float* y, std::uint32_t y_stride, std::size_t y_row, std::uint32_t R) {
     for (std::uint32_t r = 0; r < R; r += 2U) {
         if (R - r < 2U) {
-            absorb_heads(wt, heads, width, head_outputs, x + r * x_row, x_stride, y + r * y_row, y_stride, s);
+            strix::q8_rows::launch_heads_f32(wt, heads, width, head_outputs, x + r * x_row, x_stride, y + r * y_row, y_stride, s);
             break;
         }
         AbsorbRowsN<2U> site{};
@@ -273,7 +267,7 @@ void attention_vrows(std::uint32_t l, std::uint32_t R) {  // vr.xn -> vr.f
         const std::uint32_t p = vr.p0 + r, keys = p + 1U;
         std::uint16_t* const q_r = vr.qt + r * frow;
         float* const o_r = vr.olat + r * lrow;
-        if (idx && gi::dense(gi::kHy4, p)) {  // the causal prefix: list = iota, length iota[keys] = keys
+        if (idx && gi::dense(preset::indexer, p)) {  // the causal prefix: list = iota, length iota[keys] = keys
             DsaPolicy::Args a{latent[l], iota, iota + keys, context, 0U, 0U, 0U, q_r, sinks, o_r};
             strix::attn_core::sparse::launch_flash_rows<DsaPolicy, 32U>(a, DsaSpec::kGroups, s, keys);
         } else if (idx) {
@@ -381,7 +375,7 @@ void ffn_vrows(std::uint32_t l, std::uint32_t R) {  // vr.xn -> vr.f
     } else {
         const std::size_t K = c.top_k, L = c.latent;
         linear_vrows(blk(l, "ffn_gate_inp.weight"), vr.xn, h, c.experts, R, vr.rlog, false);
-        strix::moe_core::enqueue_route_wave<strix::moe::preset::hy4, DeclaredMath>(vr.rlog, t(blk(l, "exp_probs_b.bias")).f(), vr.ids, vr.rw, R, s);
+        strix::moe_core::enqueue_route_wave<preset::route, DeclaredMath>(vr.rlog, t(blk(l, "exp_probs_b.bias")).f(), vr.ids, vr.rw, R, s);
         linear_vrows(blk(l, "ffn_routed_down.weight"), vr.xn, h, c.latent, R, vr.z);
         const bool kquant_down = t(blk(l, "ffn_down_exps.weight")).type == 12U || t(blk(l, "ffn_down_exps.weight")).type == 14U;
         if (vr.expert_union && R > 1U && t(blk(l, "ffn_gate_exps.weight")).type == 12U && kquant_down)
