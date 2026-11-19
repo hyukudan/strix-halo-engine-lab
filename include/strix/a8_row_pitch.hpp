@@ -13,7 +13,7 @@
 
 namespace strix {
 
-inline constexpr std::uint32_t kA8PitchAliasBytes = 8192U;  // row pitches that are multiples of this alias
+inline constexpr std::uint32_t kA8PitchAliasBytes = 4096U;  // row pitches that are multiples of this alias (T2: 4096 pad 1.30x)
 inline constexpr std::uint32_t kA8PitchPadBytes = 128U;     // keeps pitch % 32 == 0 (deltas) and 128-byte alignment
 
 // width: values per row (a multiple of 32). Returns the codes row pitch in bytes (>= width, a multiple of 32).
