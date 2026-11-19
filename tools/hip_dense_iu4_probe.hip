@@ -252,10 +252,11 @@ static int rates() {
 }
 // cmp mode: our production IU4 g64 W4A16 entries at the given shapes, the "ours" column of a GEMM-library comparison.
 //   hip-dense-iu4-probe <rows> cmp in:n [in:n ...]
+//   hip-dense-iu4-probe <rows> tile in:n [in:n ...]   (tall-core forms x CTA waves, ABBA, output bits vs direct 16 waves)
 // rows <= 16: the small-M core (dense_linear_iu4 prepare + run: the decode / verify entry; prepare timed alone, run
 // alone); rows > 16: prod16 / prod8 (iu4a16::enqueue) and x16prod+cvt (enqueue_x16_tiles + enqueue_x16).
 // Weights are random codes with scale 1/16 (timing only). wMB = IU4 codes + FP16 scales read once per call.
-static int cmp(unsigned rows, int argc, char** argv) {
+static int cmp(unsigned rows, int argc, char** argv, bool tile = false) {
     namespace sm = strix::core::dense_iu4;
     std::vector<std::pair<unsigned, unsigned>> shapes;
     unsigned max_in = 0U, max_n = 0U;
@@ -323,12 +324,40 @@ static int cmp(unsigned rows, int argc, char** argv) {
             continue;
         }
         iu::View v{w, scale, x, y, in, n, n, rows, n, 0U, 0U};
-        pr("prod16", time_us([&] { iu::enqueue(v, nullptr, 16U); }));
-        pr("prod8", time_us([&] { iu::enqueue(v, nullptr, 8U); }));
-        pr("x16prod+cvt", time_us([&] {
-            tall::enqueue_x16_tiles(x, xt, rows, in, nullptr);
-            iu::enqueue_x16(v, xt, nullptr);
-        }));
+        if (!tile) {
+            pr("prod16", time_us([&] { iu::enqueue(v, nullptr, 16U); }));
+            pr("prod8", time_us([&] { iu::enqueue(v, nullptr, 8U); }));
+            pr("x16prod+cvt", time_us([&] {
+                tall::enqueue_x16_tiles(x, xt, rows, in, nullptr);
+                iu::enqueue_x16(v, xt, nullptr);
+            }));
+            continue;
+        }
+        // tile mode: the tall core's forms (direct / x16 GEMM, the x16 tile pass timed alone) x CTA waves (16 / 8), in
+        // ABBA order (round 1 reversed), every arm's output bits vs the direct form with 16 waves.
+        const std::size_t ny = std::size_t(rows) * n;
+        std::vector<float> ref(ny), got(ny);
+        iu::enqueue(v, nullptr, 16U);
+        CK(hipDeviceSynchronize());
+        CK(hipMemcpy(ref.data(), y, ny * 4U, hipMemcpyDeviceToHost));
+        tall::enqueue_x16_tiles(x, xt, rows, in, nullptr);
+        const int reps = rows >= 2048U ? 8 : 20;
+        pr("x16cvt", time_us([&] { tall::enqueue_x16_tiles(x, xt, rows, in, nullptr); }, reps));
+        const unsigned arms[4][2] = {{0U, 16U}, {0U, 8U}, {1U, 16U}, {1U, 8U}};
+        for (int round = 0; round < 2; ++round)
+            for (unsigned a = 0; a < 4U; ++a) {
+                const unsigned x16 = arms[round ? 3U - a : a][0], wv = arms[round ? 3U - a : a][1];
+                const double us = time_us([&] {
+                    if (x16) iu::enqueue_x16(v, xt, nullptr, wv);
+                    else iu::enqueue(v, nullptr, wv);
+                }, reps);
+                CK(hipMemcpy(got.data(), y, ny * 4U, hipMemcpyDeviceToHost));
+                const bool same = std::memcmp(got.data(), ref.data(), ny * 4U) == 0;
+                char arm[32];
+                std::snprintf(arm, sizeof arm, "%s-w%u", x16 ? "x16" : "dir", wv);
+                std::printf("tile%d %s ", round, same ? "bits=" : "BITS!");
+                pr(arm, us);
+            }
     }
     CK(hipFree(w)); CK(hipFree(x)); CK(hipFree(y)); CK(hipFree(xt)); CK(hipFree(xh));
     return 0;
@@ -336,6 +365,7 @@ static int cmp(unsigned rows, int argc, char** argv) {
 int main(int argc, char** argv) {
     if (argc > 2 && argv[2][0] == 'r') return rates();
     if (argc > 2 && std::strcmp(argv[2], "cmp") == 0) return cmp(unsigned(std::atoi(argv[1])), argc, argv);
+    if (argc > 2 && std::strcmp(argv[2], "tile") == 0) return cmp(unsigned(std::atoi(argv[1])), argc, argv, true);
     const unsigned rows = argc > 1 ? unsigned(std::atoi(argv[1])) : 512U;
     const unsigned shapes[][2] = {{5120U, 17408U}, {17408U, 5120U}, {5120U, 10240U}};
     Bufs b{};
