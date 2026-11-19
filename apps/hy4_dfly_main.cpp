@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <iomanip>
 #include <map>
@@ -353,6 +354,18 @@ int mtp(int argc, char** argv) {
         std::vector<std::uint64_t> eligible(depth + 1U, 0U), reached(depth + 1U, 0U);
         double ms = 0.0;
         std::uint64_t steps = 0;
+        // a device taps run (strix-hy4-rows --mtp-taps): the device block's teacher ids and its last teacher logits rows
+        std::vector<std::uint32_t> dev_top;
+        std::vector<float> dev_logits;
+        std::uint32_t lfrom = 0, lrows = 0;
+        if (std::filesystem::exists(std::filesystem::path(dir) / "nextn_top.txt")) {
+            dev_top = read_ids((std::filesystem::path(dir) / "nextn_top.txt").string());
+            lfrom = static_cast<std::uint32_t>(std::stoul(m.at("logits_from")));
+            lrows = static_cast<std::uint32_t>(std::stoul(m.at("logits_rows")));
+            dev_logits = read_f32(std::filesystem::path(dir) / "nextn_logits.f32", std::size_t{lrows} * config.vocab);
+        }
+        std::uint64_t compared = 0, agree = 0, lcompared = 0, lagree = 0;
+        double max_diff = 0.0, sum_diff = 0.0;
         const auto timed = [&](std::uint32_t token, const std::vector<float>& h, std::uint32_t pos) {
             const auto t0 = std::chrono::steady_clock::now();
             auto out = ref.nextn_step(token, h, pos);
@@ -364,6 +377,19 @@ int mtp(int argc, char** argv) {
             const std::vector<float> h(hid.begin() + static_cast<std::ptrdiff_t>(std::size_t{p} * config.hidden),
                                        hid.begin() + static_cast<std::ptrdiff_t>(std::size_t{p + 1U} * config.hidden));
             auto cur = timed(ids[p + 1U], h, p);  // teacher step: the block's K/V at p; drafts the id at p + 2
+            if (p < dev_top.size()) {
+                ++compared;
+                agree += cur.argmax == dev_top[p] ? 1U : 0U;
+            }
+            if (!dev_logits.empty() && p >= lfrom && p < lfrom + lrows) {
+                const float* dl = dev_logits.data() + std::size_t{p - lfrom} * config.vocab;
+                double row_max = 0.0;
+                for (std::size_t i = 0; i < config.vocab; ++i) row_max = std::max(row_max, static_cast<double>(std::fabs(cur.logits[i] - dl[i])));
+                max_diff = std::max(max_diff, row_max);
+                sum_diff += row_max;
+                ++lcompared;
+                lagree += static_cast<std::uint32_t>(std::max_element(dl, dl + config.vocab) - dl) == cur.argmax ? 1U : 0U;
+            }
             if (p + 1U < prompt || p + 2U >= ids.size()) continue;  // anchors: the greedy region (ids[p + 2] is the target's)
             for (std::uint32_t k = 1; k <= depth && p + 1U + k < ids.size(); ++k) {
                 ++eligible[k];
@@ -378,6 +404,10 @@ int mtp(int argc, char** argv) {
             ref.nextn_truncate(p + 1U);
         }
         report(dir, eligible, reached, ms, steps);
+        if (compared)
+            std::cout << "DEVICE " << dir << " teacher top-1 agree " << agree << "/" << compared << "; logits rows " << lcompared
+                      << " top-1 agree " << lagree << " max |d| " << max_diff << " mean row max |d| "
+                      << (lcompared ? sum_diff / static_cast<double>(lcompared) : 0.0) << std::endl;
         for (std::uint32_t k = 0; k <= depth; ++k) { eligible_all[k] += eligible[k]; reached_all[k] += reached[k]; }
     }
     if (dirs.size() > 1U) report("pooled", eligible_all, reached_all, 0.0, 0U);
