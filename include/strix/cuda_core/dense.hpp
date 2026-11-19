@@ -1,5 +1,6 @@
 #pragma once
 #include "strix/cuda_core/types.hpp"
+#include "strix/head_argmax.hpp"
 
 namespace strix::cuda_core {
 
@@ -35,8 +36,9 @@ cudaError_t dense_gate_up_silu_rows(const DenseWeight& gate, const DenseWeight& 
 cudaError_t embedding_rows(const DenseWeight& table, const std::uint32_t* ids, float* out, std::uint32_t rows,
                            cudaStream_t stream);
 
-// out[r] = argmax of logits row r (lowest index wins ties). workspace: kArgmaxWorkspaceBytes of device memory.
-constexpr std::size_t kArgmaxWorkspaceBytes = 32 * 128 * 8;
+// out[r] = first maximum of the finite logits of row r (lowest index wins ties; 0xffffffff when the row has no finite
+// logit): the shared head pick (strix/head_argmax.hpp). workspace: kArgmaxWorkspaceBytes of device memory.
+constexpr std::size_t kArgmaxWorkspaceBytes = strix::head_argmax::workspace_bytes(kMaxRows);
 cudaError_t argmax_rows(const float* logits, std::uint32_t vocab, std::uint32_t rows, std::uint32_t* out, void* workspace,
                         cudaStream_t stream);
 

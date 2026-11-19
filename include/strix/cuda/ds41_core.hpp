@@ -250,6 +250,7 @@ struct ArgmaxView {
     std::uint32_t rows = 0, count = 0, stride = 0;  // stride 0 = count
     std::uint32_t first_index = 0;
     void* out = nullptr;                            // ArgmaxCandidate[rows]
+    void* partial = nullptr;  // strix::head_argmax::workspace_bytes(rows) of device memory (chunk picks)
 };
 void enqueue_argmax(const ArgmaxView& view, cudaStream_t stream);
 

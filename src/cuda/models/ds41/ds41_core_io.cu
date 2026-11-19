@@ -2,6 +2,7 @@
 // injection) and the greedy head selection. Bitwise the host reference of ds41_layer.hpp.
 
 #include "ds41_cuda_common.cuh"
+#include "../../core/head_argmax.cuh"
 
 #include "strix/cuda/ds41_core.hpp"
 #include "strix/ds41_scalar_codecs.hpp"
@@ -136,49 +137,13 @@ engram_inject_kernel(float* stream, const float* __restrict__ kv, const float* _
 
 std::size_t align256(std::size_t n) { return (n + 255U) / 256U * 256U; }
 
-// ---- argmax --------------------------------------------------------------------------------------------------------
-constexpr std::uint32_t kArgmaxThreads = 1024;
-
-__device__ __forceinline__ void take_better(float& v, std::uint32_t& i, float ov, std::uint32_t oi) {
-    if (ov > v || (ov == v && oi < i)) { v = ov; i = oi; }
-}
-
-__global__ void __launch_bounds__(kArgmaxThreads)
-argmax_kernel(const float* __restrict__ logits, std::uint32_t count, std::uint32_t stride, std::uint32_t first_index,
-              ArgmaxCandidate* __restrict__ out) {
-    __shared__ float sv[32];
-    __shared__ std::uint32_t si[32], sf[32];
-    const std::uint32_t r = blockIdx.x, lane = threadIdx.x & 31U, warp = threadIdx.x / 32U;
-    const float* l = logits + std::size_t{r} * stride;
-    float v = -INFINITY;
-    std::uint32_t idx = 0xffffffffU, finite = 1;
-    for (std::uint32_t i = threadIdx.x; i < count; i += blockDim.x) {
-        const float x = l[i];
-        if (!isfinite(x)) { finite = 0; continue; }
-        take_better(v, idx, x, first_index + i);
+// ---- argmax: the shared head pick (src/cuda/core/head_argmax.cuh); this adapter writes ArgmaxCandidate words --
+struct EmitCandidate {
+    ArgmaxCandidate* out;
+    __device__ void operator()(std::uint32_t row, const ::strix::head_argmax::Pick& p) const {
+        out[row] = ArgmaxCandidate{p.index == ::strix::head_argmax::kNone ? __int_as_float(static_cast<int>(0xff800000U)) : p.value, p.index, p.nonfinite == 0U ? 1U : 0U};
     }
-    for (unsigned d = 16U; d; d >>= 1U) {
-        const float ov = __shfl_xor_sync(full_mask, v, d);
-        const std::uint32_t oi = __shfl_xor_sync(full_mask, idx, d);
-        take_better(v, idx, ov, oi);
-        finite &= __shfl_xor_sync(full_mask, finite, d);
-    }
-    if (lane == 0) { sv[warp] = v; si[warp] = idx; sf[warp] = finite; }
-    __syncthreads();
-    if (warp == 0) {
-        const std::uint32_t warps = blockDim.x / 32U;
-        v = lane < warps ? sv[lane] : -INFINITY;
-        idx = lane < warps ? si[lane] : 0xffffffffU;
-        finite = lane < warps ? sf[lane] : 1U;
-        for (unsigned d = 16U; d; d >>= 1U) {
-            const float ov = __shfl_xor_sync(full_mask, v, d);
-            const std::uint32_t oi = __shfl_xor_sync(full_mask, idx, d);
-            take_better(v, idx, ov, oi);
-            finite &= __shfl_xor_sync(full_mask, finite, d);
-        }
-        if (lane == 0) out[r] = ArgmaxCandidate{v, idx, finite};
-    }
-}
+};
 
 }  // namespace
 
@@ -246,8 +211,15 @@ void enqueue_engram(const EngramView& v, cudaStream_t stream) {
 
 void enqueue_argmax(const ArgmaxView& v, cudaStream_t stream) {
     require(v.rows > 0 && v.count > 0, "argmax geometry");
-    argmax_kernel<<<v.rows, kArgmaxThreads, 0, stream>>>(v.logits, v.count, v.stride ? v.stride : v.count, v.first_index,
-                                                          static_cast<ArgmaxCandidate*>(v.out));
+    require(v.partial != nullptr, "argmax workspace");
+    ::strix::cuda::core::head_argmax::View h;
+    h.logits = v.logits;
+    h.stride = v.stride ? v.stride : v.count;
+    h.count = v.count;
+    h.rows = v.rows;
+    h.first_index = v.first_index;
+    h.partial = static_cast<::strix::head_argmax::Pick*>(v.partial);
+    STRIX_CUDA_CHECK(::strix::cuda::core::head_argmax::pick_rows(h, EmitCandidate{static_cast<ArgmaxCandidate*>(v.out)}, stream));
     STRIX_CUDA_CHECK(cudaGetLastError());
 }
 

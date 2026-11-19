@@ -82,6 +82,14 @@ if(MSVC)
     target_compile_options(cuda_core_nvfp4_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
 
+# Shared greedy head pick: identity vs the host reference + us per call (--check-only is the ctest form).
+add_executable(cuda_core_head_argmax_bench ${_cc_root}/tests/cuda_core/head_argmax_bench.cu)
+target_include_directories(cuda_core_head_argmax_bench PRIVATE ${_cc_root}/include)
+target_compile_features(cuda_core_head_argmax_bench PRIVATE cxx_std_20)
+if(MSVC)
+    target_compile_options(cuda_core_head_argmax_bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
+
 # Long-context prefill attention bench + pipe identity check (scripts: --check-only is the ctest form).
 add_executable(cuda_core_flash_bench ${_cc_root}/tests/cuda_core/flash_bench.cu)
 target_link_libraries(cuda_core_flash_bench PRIVATE strix_cuda_core_kernels)

@@ -414,6 +414,13 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-exact-reduce-contract-tests)
     add_test(NAME strix-exact-reduce-contract-tests COMMAND strix-exact-reduce-contract-tests)
 
+    add_executable(strix-head-argmax-tests tests/head_argmax_tests.cpp)
+    target_include_directories(strix-head-argmax-tests PRIVATE include)
+    target_compile_features(strix-head-argmax-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-head-argmax-tests)
+    add_test(NAME strix-head-argmax-tests COMMAND strix-head-argmax-tests)
+    set_tests_properties(strix-head-argmax-tests PROPERTIES LABELS "cpu")
+
     add_executable(strix-dist-transport-spec-tests tests/dist_transport_spec_tests.cpp)
     target_include_directories(strix-dist-transport-spec-tests PRIVATE include)
     target_compile_features(strix-dist-transport-spec-tests PRIVATE cxx_std_20)
