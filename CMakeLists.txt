@@ -6357,6 +6357,18 @@ if(BUILD_TESTING)
     target_compile_features(strix-pair-tp-gather-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-pair-tp-gather-tests)
     add_test(NAME strix-pair-tp-gather-tests COMMAND strix-pair-tp-gather-tests)
+    # One resolved device / link view (device::Set): rates, sources, measured trip classes, digest.
+    add_executable(strix-device-set-tests tests/device_set_tests.cpp)
+    target_include_directories(strix-device-set-tests PRIVATE include)
+    target_compile_features(strix-device-set-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-device-set-tests)
+    add_test(NAME strix-device-set-tests COMMAND strix-device-set-tests)
+    # One planner entry (pair::planner::plan): measured-cost rules, gain bar, refusal reasons, receipt line.
+    add_executable(strix-pair-planner-tests tests/pair_planner_tests.cpp)
+    target_include_directories(strix-pair-planner-tests PRIVATE include)
+    target_compile_features(strix-pair-planner-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-pair-planner-tests)
+    add_test(NAME strix-pair-planner-tests COMMAND strix-pair-planner-tests)
     # Interleaved virtual stages of the layer pipeline (StageMap on two ranks): prefill + decode bitwise == one rank.
     add_executable(strix-pair-layer-stages-tests tests/pair_layer_stages_tests.cpp)
     target_include_directories(strix-pair-layer-stages-tests PRIVATE include)
