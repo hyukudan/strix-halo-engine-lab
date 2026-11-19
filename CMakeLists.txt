@@ -496,7 +496,8 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-attention-score-reduce-host-tests)
     target_link_libraries(strix-attention-score-reduce-host-tests PRIVATE Threads::Threads)
     add_test(NAME strix-attention-score-reduce-host-tests COMMAND strix-attention-score-reduce-host-tests)
-    # K/V cache storage classes (strix/kv_storage.hpp): bytes, role / tier policy, quantiser layouts, draft-cache ids == serial.
+    # K/V cache storage classes (strix/kv_storage.hpp, the model contract's AttentionKvStorage): bytes, role / tier policy,
+    # contract binding, quantiser layouts, draft-cache ids == serial.
     add_executable(strix-kv-storage-tests tests/kv_storage_tests.cpp)
     target_include_directories(strix-kv-storage-tests PRIVATE include)
     target_compile_features(strix-kv-storage-tests PRIVATE cxx_std_20)
