@@ -1,6 +1,7 @@
 #pragma once
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/serve/cache_budget_rule.hpp"
+#include "strix/session/mark_plan.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -212,9 +213,17 @@ inline std::uint64_t prefix_capture_cadence(std::uint64_t tile, std::uint64_t re
     if(requested || !tile) return requested;
     return std::max(tile,((4096U+tile-1U)/tile)*tile);
 }
+// requested: a boundary the request asked to keep (its root mark, a waiting joiner), published off cadence.
 inline bool prefix_capture_boundary_selected(std::uint64_t position, std::uint64_t covered,
-    std::uint64_t tile, std::uint64_t cadence) {
-    return tile && cadence && (position%cadence==0 || position>covered || covered-position<tile);
+    std::uint64_t tile, std::uint64_t cadence, bool requested=false) {
+    return tile && cadence && (requested || position%cadence==0 || position>covered || covered-position<tile);
+}
+// The root mark of a tiled prompt (session::root_mark on the T grid): the deepest full-T boundary strictly inside the
+// request's repeated system + tools prefix (GenerationJob::stable_prefix) and at most n - 2, so another conversation
+// with the same prefix restores there. A boundary the certified plan already reaches with full T blocks; only its
+// publication is new (the cadence skips it). 0: none.
+inline std::uint64_t prefix_root_capture(std::uint64_t stable_prefix, std::uint64_t n, std::uint32_t tile) {
+    return session::root_mark(stable_prefix, n, tile, 2);
 }
 // Observer ownership never depends on storage admission, budget or family.
 inline bool cache_observer_required(bool tiled, bool import_export, bool diagnostic) {

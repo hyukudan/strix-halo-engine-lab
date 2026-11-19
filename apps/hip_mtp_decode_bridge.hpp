@@ -88,6 +88,7 @@ struct MtpServeRequest {
     serve::CacheRetention cache_retention = serve::CacheRetention::server_policy;
     std::string session_id, session_operation, session_durability;
     std::span<const std::uint32_t> prompt;
+    std::uint32_t stable_prefix = 0; // GenerationJob::stable_prefix: the prompt's root mark (prefix_root_capture)
     std::uint64_t max_tokens = 0;
     std::span<const std::uint32_t> stop_tokens;
     // Context n-gram draft extension for this request: forced on/off, or unset = the engine's default.
@@ -336,7 +337,8 @@ public:
         MtpDecodeTargetParents::TiledPrompt& tiled,SerialSessionContext& session,HipMtpTargetHidden& target,HipMtpRuntime& runtime,
         const QualifiedMtpDraftPlan& qualified,const ActivatedMtpDraftPlan& activated,const ExecutionRuntimeResources& resources,
         DirectLaunchDispatcher& dispatcher,std::byte* held,std::shared_ptr<TokenSampler> final_sampler={},
-        HipMtpHostRowSelector final_selector={},std::function<void(serve::GenerationProgress)> progress={}, bool session_resume=false, bool tiled_suffix=true, bool batch=false, BatchCertContext batch_cert={}, bool defer_cache_lookup=false)
+        HipMtpHostRowSelector final_selector={},std::function<void(serve::GenerationProgress)> progress={}, bool session_resume=false, bool tiled_suffix=true, bool batch=false, BatchCertContext batch_cert={}, bool defer_cache_lookup=false,
+        std::uint32_t stable_prefix=0)
         :tokens_(tokens.begin(),tokens.end()),tiled_(tiled),session_(session),target_(target),runtime_(runtime),qualified_(qualified),
          activated_(activated),resources_(resources),dispatcher_(dispatcher),held_(held),final_sampler_(std::move(final_sampler)),final_selector_(std::move(final_selector)),progress_(std::move(progress)) {
         producer_rotary_=model.rotary_identity();
@@ -404,11 +406,15 @@ public:
         if(tiled_.cache) tiled_.cache->set_policy_selection(!!final_selector_);
         deferred_lookup_=defer_cache_lookup && tiled_.cache && tiled_.cache->joining_allowed() && !session_resume;
         start_=std::chrono::steady_clock::now();
+        stable_prefix_=stable_prefix;
         if(session_resume) {
             restored_=session_.next_position;
             if(!restored_ || restored_>=n_ || runtime_.next_source_position()+1U!=restored_)
                 throw std::invalid_argument("MTP session suffix frontier differs");
-        } else if(tiled_.cache && !deferred_lookup_) restored_=tiled_.cache->begin_request(session_,tokens_);
+        } else if(tiled_.cache && !deferred_lookup_) {
+            restored_=tiled_.cache->begin_request(session_,tokens_);
+            request_root_capture();
+        }
         pos_=restored_;
         if(restored_ && !session_resume && !tiled_.rtx_import && !legacy_cache()) {
             const auto& cursor=tiled_.cache->continuation();
@@ -450,6 +456,7 @@ public:
             throw std::logic_error("prefix join retry requires an untouched certified prompt");
         deferred_lookup_=false;
         restored_=tiled_.cache->begin_request(session_,tokens_);
+        request_root_capture();
         pos_=restored_;
         if(restored_) {
             const auto& cursor=tiled_.cache->continuation();
@@ -872,9 +879,17 @@ private:
         // any synchronous/default-stream held copy. No dependency is added for capture.
         return {tiled_.block_owner->producer_stream(),snapshot_predictor,mtp};
     }
+    // The root mark (system + tools prefix) is kept as a checkpoint even off the capture cadence, so a sibling
+    // conversation restores there. begin_request clears the request's capture set, so this follows each lookup.
+    void request_root_capture() {
+        if(!tiled_.cache || !certified_request_) return;
+        if(const auto root=prefix_root_capture(stable_prefix_,n_,plan_config_.rows); root>restored_)
+            tiled_.cache->request_capture(root);
+    }
     QwenTiledPlanConfig plan_config_;
     bool certified_request_=false,batch_=false;
     bool deferred_lookup_=false;
+    std::uint32_t stable_prefix_=0;
     BatchCertContext batch_cert_;
     std::vector<QwenUnitExec> trace_;
     std::uint64_t request_order_=0;
@@ -1135,9 +1150,9 @@ inline HipMtpTargetHiddenTicket run_tiled_mtp_prompt(std::span<const std::uint32
     HipMtpTargetHidden& target,HipMtpRuntime& runtime,const QualifiedMtpDraftPlan& qualified,const ActivatedMtpDraftPlan& activated,
     const ExecutionRuntimeResources& resources,DirectLaunchDispatcher& dispatcher,std::byte* held,std::string& receipt,
     std::shared_ptr<TokenSampler> final_sampler={},HipMtpHostRowSelector final_selector={},
-    std::function<void(serve::GenerationProgress)> progress={}) {
+    std::function<void(serve::GenerationProgress)> progress={},std::uint32_t stable_prefix=0) {
     TiledMtpPrompt prompt(tokens,model,compiled,tiled,session,target,runtime,qualified,activated,resources,dispatcher,held,
-        std::move(final_sampler),std::move(final_selector),std::move(progress));
+        std::move(final_sampler),std::move(final_selector),std::move(progress),false,true,false,{},false,stable_prefix);
     while(!prompt.done()) prompt.step();
     return prompt.finish(receipt);
 }
@@ -1156,6 +1171,7 @@ struct MtpBatchRequest {
     std::shared_ptr<MtpConstraintRow> constraint;
     serve::CacheRetention cache_retention = serve::CacheRetention::server_policy;
     std::vector<std::uint32_t> prompt;
+    std::uint32_t stable_prefix = 0; // GenerationJob::stable_prefix: the prompt's root mark (prefix_root_capture)
     std::uint64_t max_tokens = 0;
     std::vector<std::uint32_t> stop_tokens;
     std::shared_ptr<TokenSampler> sampler; // null: first-max selection
@@ -1464,7 +1480,7 @@ private:
             *s.runtime, qualified_, activated_, s.parents->resources, *s.dispatcher, s.held, s.request.sampler,
             s.request.constraint?HipMtpHostRowSelector{[state=s.request.constraint](auto row){return state->select(row);}}:HipMtpHostRowSelector{},
             s.request.on_progress,false,true,true,batch_cert_context(s),
-            options_.prefix_cache_inflight && interleave_ && !service_mode_);
+            options_.prefix_cache_inflight && interleave_ && !service_mode_,s.request.stable_prefix);
         static_cast<void>(m);
         ++stats_.admitted;
         s.order = stats_.admitted;
@@ -2813,7 +2829,8 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         std::string request_receipt;
                         pending=run_tiled_mtp_prompt(q.prompt,model,compiled,parents->tiled,session,*target,*runtime,qualified,activated,
                             r,dispatcher,tiled_held,request_receipt,{},
-                            q.constraint?HipMtpHostRowSelector{[state=q.constraint](auto row){return state->select(row);}}:HipMtpHostRowSelector{},q.on_progress);
+                            q.constraint?HipMtpHostRowSelector{[state=q.constraint](auto row){return state->select(row);}}:HipMtpHostRowSelector{},q.on_progress,
+                            q.stable_prefix);
                         static const bool state_digest=strix::envcfg::flag("STRIX_PREFIX_CACHE_DIGEST", false);
                         if(state_digest && parents->tiled.cache)
                             out.prompt_state_digest=model_content_identity_hex(parents->tiled.cache->state_digest(session.next_position));

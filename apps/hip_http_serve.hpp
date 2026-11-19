@@ -115,6 +115,7 @@ public:
         request.session_id = job.session_id;
         request.cache_retention = job.cache_retention;
         request.prompt = job.prompt;
+        request.stable_prefix = job.stable_prefix;
         request.max_tokens = job.max_tokens;
         request.stop_tokens = job.stop_tokens;
         request.ngram_draft = job.ngram_draft;
@@ -450,6 +451,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
             request.constraint = constraints.make(job.constraint);
             request.cache_retention = job.cache_retention;
             request.prompt = job.prompt;
+            request.stable_prefix = job.stable_prefix;
             request.max_tokens = job.max_tokens;
             request.stop_tokens = job.stop_tokens;
             request.on_tokens = callbacks.tokens;
