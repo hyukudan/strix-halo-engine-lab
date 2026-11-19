@@ -15,8 +15,11 @@
 // longest prefix equal to the target's greedy rows, emits accepted drafts + the target's next token (the bonus or the
 // correction) and commits accepted + 1 rows. Emitted ids equal serial greedy decode for ANY block.
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include "strix/spec/drafting.hpp"
@@ -130,6 +133,44 @@ struct StepRecord {
     double verify_ms = 0.0, draft_ms = 0.0;
 };
 
+// One verify round of BlockSpeculator (the rollout record): what was drafted, the target's greedy id at EVERY verified row
+// (the rejected rows included) and what was emitted (= drafts[0, accepted) + greedy[accepted]). The spans are valid only
+// during RoundSink::round. Recording never changes a decision: the sink sees the round after commit.
+struct RoundRecord {
+    std::uint64_t context = 0;  // StepParams::context of the round (committed positions, cost bin)
+    Source source = Source::serial;
+    std::uint32_t anchor = 0;   // row 0 of the verify
+    std::uint32_t k = 0, rows = 0, accepted = 0, copy = 0, ext = 0;  // rows = k + 1
+    double verify_ms = 0.0, draft_ms = 0.0;
+    std::span<const std::uint32_t> drafts, greedy, emitted;  // k, rows, accepted + 1 ids
+};
+
+class RoundSink {
+public:
+    virtual ~RoundSink() = default;
+    virtual void round(const RoundRecord& record) = 0;  // once per verify, after the target's commit
+};
+
+// Binary trace of rounds (little endian; no host names or paths inside):
+//   file   : "SRT1", u32 version (1), u32 label bytes, label
+//   record : u32 "RREC", u64 context, u32 anchor, k, rows, accepted, copy, ext, u8 source, u8[3] 0, f32 verify_ms,
+//            f32 draft_ms (48 bytes), then k u32 drafts, rows u32 greedy (emitted is derived)
+// Reader: scripts/bench/spec/recycle_score.py.
+class RoundTraceWriter final : public RoundSink {
+public:
+    RoundTraceWriter(const std::string& path, std::string_view label);  // throws std::runtime_error if it cannot open
+    ~RoundTraceWriter() override;
+    RoundTraceWriter(const RoundTraceWriter&) = delete;
+    RoundTraceWriter& operator=(const RoundTraceWriter&) = delete;
+    void round(const RoundRecord& record) override;
+    [[nodiscard]] std::uint64_t records() const { return records_; }
+
+private:
+    std::FILE* file_ = nullptr;
+    std::uint64_t records_ = 0;
+    std::vector<unsigned char> buf_;
+};
+
 class BlockSpeculator {
 public:
     BlockSpeculator(BlockDrafter& drafter, VerifyTarget& target) : drafter_(drafter), target_(target) {}
@@ -138,10 +179,13 @@ public:
     // One step; appends the emitted ids to `out`. Returns the record (emitted == 0: nothing to do).
     StepRecord step(std::vector<std::uint32_t>& out, const StepParams& params);
     [[nodiscard]] std::uint32_t anchor() const { return anchor_; }
+    // Optional round trace (nullptr = off, the default: one null check per step). Not owned.
+    void set_round_sink(RoundSink* sink) { sink_ = sink; }
 
 private:
     BlockDrafter& drafter_;
     VerifyTarget& target_;
+    RoundSink* sink_ = nullptr;
     std::uint32_t anchor_ = 0;
     std::vector<std::uint32_t> rows_, greedy_;
 };

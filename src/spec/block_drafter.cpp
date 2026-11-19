@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 
 namespace strix::spec {
@@ -181,6 +182,48 @@ void BlockDrafter::observe(const Block& b, std::uint32_t accepted, double verify
     if (chain_) chain_->accept(emitted);
 }
 
+namespace {
+void put_u32(std::vector<unsigned char>& b, std::uint32_t v) {
+    for (int i = 0; i < 4; ++i) b.push_back(static_cast<unsigned char>((v >> (8 * i)) & 0xFFU));
+}
+void put_u64(std::vector<unsigned char>& b, std::uint64_t v) {
+    for (int i = 0; i < 8; ++i) b.push_back(static_cast<unsigned char>((v >> (8 * i)) & 0xFFU));
+}
+void put_f32(std::vector<unsigned char>& b, double v) {
+    const auto f = static_cast<float>(v);
+    std::uint32_t u = 0;
+    std::memcpy(&u, &f, sizeof u);
+    put_u32(b, u);
+}
+}  // namespace
+
+RoundTraceWriter::RoundTraceWriter(const std::string& path, std::string_view label) {
+    file_ = std::fopen(path.c_str(), "wb");
+    if (!file_) throw std::runtime_error("round trace: cannot open " + path);
+    buf_ = {'S', 'R', 'T', '1'};
+    put_u32(buf_, 1);
+    put_u32(buf_, std::uint32_t(label.size()));
+    buf_.insert(buf_.end(), label.begin(), label.end());
+    std::fwrite(buf_.data(), 1, buf_.size(), file_);
+}
+
+RoundTraceWriter::~RoundTraceWriter() {
+    if (file_) std::fclose(file_);
+}
+
+void RoundTraceWriter::round(const RoundRecord& r) {
+    buf_ = {'R', 'R', 'E', 'C'};
+    put_u64(buf_, r.context);
+    for (const std::uint32_t v : {r.anchor, r.k, r.rows, r.accepted, r.copy, r.ext}) put_u32(buf_, v);
+    put_u32(buf_, std::uint32_t(r.source));  // u8 source + 3 zero bytes (little endian)
+    put_f32(buf_, r.verify_ms);
+    put_f32(buf_, r.draft_ms);
+    for (const std::uint32_t v : r.drafts) put_u32(buf_, v);
+    for (const std::uint32_t v : r.greedy) put_u32(buf_, v);
+    if (std::fwrite(buf_.data(), 1, buf_.size(), file_) != buf_.size()) throw std::runtime_error("round trace: write failed");
+    ++records_;
+}
+
 StepRecord BlockSpeculator::step(std::vector<std::uint32_t>& out, const StepParams& params) {
     StepRecord r;
     auto block = drafter_.next(params);
@@ -197,6 +240,23 @@ StepRecord BlockSpeculator::step(std::vector<std::uint32_t>& out, const StepPara
     std::vector<std::uint32_t> emitted(block.drafts.begin(), block.drafts.begin() + accepted);
     emitted.push_back(greedy_[accepted]);
     drafter_.observe(block, accepted, verify_ms, emitted, params.context);
+    if (sink_) {
+        RoundRecord rec;
+        rec.context = params.context;
+        rec.source = block.source;
+        rec.anchor = anchor_;
+        rec.k = std::uint32_t(block.drafts.size());
+        rec.rows = block.rows();
+        rec.accepted = accepted;
+        rec.copy = block.copy;
+        rec.ext = block.ext;
+        rec.verify_ms = verify_ms;
+        rec.draft_ms = block.draft_ms;
+        rec.drafts = block.drafts;
+        rec.greedy = greedy_;
+        rec.emitted = emitted;
+        sink_->round(rec);
+    }
     out.insert(out.end(), emitted.begin(), emitted.end());
     anchor_ = emitted.back();
     r.source = block.source;
