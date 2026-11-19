@@ -118,4 +118,18 @@ inline std::string model_witness(const std::filesystem::path& target, const std:
     return model_content_identity_hex(sha256_bytes(std::as_bytes(std::span(content))));
 }
 
+// State size of a quality run: the longest manifest prompt (rows "name tokens path [arms]", '#' comments) + 8, at least
+// 8192 (the earlier fixed size, so manifests of <= 8184-token prompts keep their configuration). Mirrors the timing app.
+inline std::uint32_t manifest_max_positions(std::istream& manifest) {
+    std::uint32_t longest = 8192;
+    for (std::string line; std::getline(manifest, line);) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream fields(line);
+        std::string row_name;
+        std::uint32_t row_tokens = 0;
+        if (fields >> row_name >> row_tokens && row_tokens + 8U > longest) longest = row_tokens + 8U;
+    }
+    return longest;
+}
+
 }  // namespace strix::deepseek41::quality

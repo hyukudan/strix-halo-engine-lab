@@ -59,11 +59,17 @@ inline constexpr Lever table[] = {
      .target = "fast (nvfp4-splitk-fast-v1, identity -skf1)", .off = "exact",
      .source = "NVFP4 GEMV split-K FAST targets (strix/split_k_policy.hpp, 188-SM cc 12.0 rows); gate EXACT -> FAST pooled "
                "KL 0.00000 top-1 0.9990 dNLL -0.00000; spec verify -0.08 .. -0.12 ms/step (2 ABAB pairs)"},
+    {.name = "decode_attn8", .env = "", .option = "--decode-attn8", .value = {"", "on", "", ""}, .builtin = "off",
+     .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
+     .target = "on (e4m3 decode / verify attention over the e4m3 K/V shadow, tensor-core S and PV, identity -d8)", .off = "off",
+     .source = "cuda_core attention_decode8 (attention_flash8.cu): split-key items (2048-key chunk, kv head, 128 row x head "
+               "pairs) read each K/V tile once per kv head; verify rows == one-row calls bitwise; gate 8K / 28K / 64K pending"},
 };
 
 // Levers that act on the windowed forward_rows path (the spec CLI prefills through it: cuda_spec.hpp prefill). The
 // prefill_* rows act only on the large-M prefill and are not offered there.
-inline constexpr std::string_view kWindowsLevers[] = {"split_k"};
+// decode_attn8 acts on every forward_rows call (decode, verify and the spec CLI's prefill windows): offered on both routes.
+inline constexpr std::string_view kWindowsLevers[] = {"split_k", "decode_attn8"};
 
 // Where a FAST cell is qualified: one row per (lever, weights, route, minimum prompt tokens) with its receipt.
 struct Qualified {
@@ -178,6 +184,7 @@ void apply(Options& o, const Resolved& r) {
     std::optional<bool> big, attn8;
     std::optional<G> gdn;
     std::optional<S> split;
+    std::optional<bool> dec8;
     if (const auto* v = take("prefill_arith")) {
         if (*v == "windows") big = false;  // reference: forward_rows windows of 32 + commit, arithmetic exact
         else if (*v == "exact") arith = A::exact;
@@ -200,11 +207,16 @@ void apply(Options& o, const Resolved& r) {
         if (*v != "exact" && *v != "fast") throw std::runtime_error("--split-k expects exact|fast");
         split = *v == "fast" ? S::fast : S::exact;
     }
+    if (const auto* v = take("decode_attn8")) {
+        if (*v != "on" && *v != "off") throw std::runtime_error("--decode-attn8 expects on|off");
+        dec8 = *v == "on";
+    }
     if (arith) o.prefill_arith = *arith;
     if (big) o.prefill_big = *big;
     if (gdn) o.prefill_gdn = *gdn;
     if (attn8) o.prefill_attn8 = *attn8;
     if (split) o.nvfp4_split = *split;
+    if (dec8) o.decode_attn8 = *dec8;
 }
 
 // The resolved lever set for the effective config. Empty under the default (exact) profile: its effective config stays

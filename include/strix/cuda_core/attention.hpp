@@ -88,6 +88,35 @@ cudaError_t kv_shadow_e4m3(const AttentionDims& d, const __nv_bfloat16* k_cache,
 // and O += P'' V8 on e4m3 tensor cores (FP32 accumulate), online softmax FP32. Keys 0 .. pos0 + rows - 1 must be in the shadow.
 cudaError_t attention_prefill_flash8(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate, const GroupedView& gv,
                                      const KvShadowE4m3& sh, std::uint32_t pos0, std::uint32_t rows, float* out, cudaStream_t stream);
+// FAST8 DECODE / VERIFY attention (bit-changing vs attention_decode; class "d8", own identity and quality gate; never under an exact
+// profile). Same contract as attention_decode (rows at device positions *pos0_dev + r or rm.pos[r], ascending; row r attends keys
+// 0 .. its position; gated output [rows][heads][head_dim]) over the e4m3 shadow, with the flash8 arithmetic (Q8 per (row, head),
+// S and P''V on e4m3 mma, FP32 online softmax). Work item = (kAttn8Chunk-key chunk, kv head, 128 (row, q head) pairs): the q heads
+// of a kv head and all rows share each K/V tile read. Per (row, head) the bits depend only on that row's q and the shadow keys
+// 0 .. its position (absolute chunks, per-row tile skip and per-row P'' scale), so verify of R rows == R one-row calls and the
+// launch shape never matters. Keys 0 .. last row's position must be in the shadow (kv_shadow_e4m3 / kv_shadow_e4m3_rows).
+// rm.slot is not supported (the shadow has no slot dimension): returns cudaErrorNotSupported. Scratch: attention_decode8_scratch_floats.
+constexpr std::uint32_t kAttn8Chunk = 2048;
+[[nodiscard]] inline std::size_t attn8_max_chunks(const AttentionDims& d) { return (static_cast<std::size_t>(d.max_positions) + kAttn8Chunk - 1) / kAttn8Chunk; }
+[[nodiscard]] std::size_t attention_decode8_scratch_floats(const AttentionDims& d, std::uint32_t rows);
+// Quantises the shadow at the positions of `rows` decode rows (same bytes as kv_shadow_e4m3 for those positions); call after kv_store.
+cudaError_t kv_shadow_e4m3_rows(const AttentionDims& d, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache, const KvShadowE4m3& sh,
+                                const std::uint32_t* pos0_dev, std::uint32_t rows, cudaStream_t stream, const RowMap& rm = {});
+cudaError_t attention_decode8(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate, const GroupedView& gv,
+                              const KvShadowE4m3& sh, const std::uint32_t* pos0_dev, std::uint32_t rows, float* out, float* scratch,
+                              cudaStream_t stream, const RowMap& rm = {});
+// Decode / verify attention of one layer with its K/V READ FORM as a trait: kv8 == nullptr -> the exact BF16 walk
+// (attention_decode, row-shared plan); kv8 != nullptr -> the FAST e4m3 form (the step rows are quantised into the shadow,
+// then attention_decode8). The BF16 cache stays the source of truth in both forms (kv_store before this call). Scratch:
+// max(attention_scratch_floats, attention_decode8_scratch_floats). Engines bind this one entry, never the two bodies.
+inline cudaError_t attention_decode_kv(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate,
+                                       const GroupedView& gv, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+                                       const KvShadowE4m3* kv8, const std::uint32_t* pos0_dev, std::uint32_t rows, float* out,
+                                       float* scratch, cudaStream_t stream, const RowMap& rm = {}) {
+    if (kv8 == nullptr) return attention_decode(d, q, qv, gate, gv, k_cache, v_cache, pos0_dev, rows, out, scratch, stream, rm);
+    if (const cudaError_t e = kv_shadow_e4m3_rows(d, k_cache, v_cache, *kv8, pos0_dev, rows, stream, rm); e != cudaSuccess) return e;
+    return attention_decode8(d, q, qv, gate, gv, *kv8, pos0_dev, rows, out, scratch, stream, rm);
+}
 // p[i] = base + step * i for i < n (small device helper used to address attention windows).
 cudaError_t iota_u32(std::uint32_t* p, std::uint32_t n, std::uint32_t base, std::uint32_t step, cudaStream_t stream);
 

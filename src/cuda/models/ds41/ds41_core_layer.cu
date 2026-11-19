@@ -1,6 +1,7 @@
 // deepseek41 CUDA layer core: device weights of a layer range and the core part of every plan op (cuda_ds41_layer_core.hpp).
 
 #include "strix/cuda/ds41_layer_core.hpp"
+#include "strix/head_argmax.hpp"
 
 #include "ds41_cuda_common.cuh"
 
@@ -126,7 +127,8 @@ LayerCore::LayerCore(TensorFile& f, std::uint32_t first, std::uint32_t end, bool
                                   engram_workspace_bytes(max_rows, g_.engram_cols, g_.hidden)}));
     if (head) {
         b_.logits.resize(R * g_.vocab);
-        b_.candidates.resize(R);
+        // [R] candidates, then the shared head pick's chunk workspace (12-byte words, the same size as a candidate)
+        b_.candidates.resize(R + strix::head_argmax::workspace_bytes(static_cast<std::uint32_t>(R)) / sizeof(ArgmaxCandidate));
     }
 }
 
@@ -368,7 +370,7 @@ void LayerCore::head(cudaStream_t s) {
     v.out = b_.logits.get();
     enqueue_q8_0_a8(v, s);
     tap(label("head", 0xffffffffU, "", "logits"), b_.logits.get(), g_.vocab);
-    enqueue_argmax({b_.logits.get(), rows_, g_.vocab, 0, 0, b_.candidates.get()}, s);
+    enqueue_argmax({b_.logits.get(), rows_, g_.vocab, 0, 0, b_.candidates.get(), b_.candidates.get() + max_rows_}, s);
     tap(label("argmax", 0xffffffffU, "", "token"), reinterpret_cast<const float*>(b_.candidates.get()), 3U);
 }
 

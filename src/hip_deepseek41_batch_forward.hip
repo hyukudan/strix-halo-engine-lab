@@ -1988,8 +1988,27 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
     // hold one view per request of the configured step limit (8, or 16 with STRIX_DS41_BATCH_ROWS16=1); the device side
     // flushes a launch every attn::hip::kMaxSegments views, so 16 requests are two launches per kernel instead of 16.
     static const bool batch_segments = strix::envcfg::flag("STRIX_DS41_BATCH_SEGMENTS", true);
-    struct PendingPost { bool on = false; const float* sub = nullptr; const float* residual = nullptr; const ds41::HcMix* mixes = nullptr; };
+    // sub_low/sub_high (both or neither): the sublayer input is the canonical rank sum (sub + sub_low) + sub_high, read in
+    // place by the expansion (HcSiteView::sub_low); the three buffers stay unwritten until the expansion is enqueued.
+    struct PendingPost {
+        bool on = false;
+        const float* sub = nullptr;
+        const float* sub_low = nullptr;
+        const float* sub_high = nullptr;
+        const float* residual = nullptr;
+        const ds41::HcMix* mixes = nullptr;
+    };
     PendingPost post;  // an expansion not yet enqueued; stream_now() is already its output
+    // The FFN combine's canonical sum y = (shared + rank0 low) + rank1 high, not stored when this layer's hc_post(ffn)
+    // is the next step: it hands the three terms to its expansion (fused: the next site's), read where y was read; same
+    // expression, order and bits, one launch and the y write/read less. Any other step first stores y (settle_sum).
+    struct PendingSum { std::int64_t layer = -1; const float* shared = nullptr; const float* low = nullptr; const float* high = nullptr; };
+    PendingSum pending_sum;
+    const auto settle_sum = [&] {
+        if (pending_sum.layer >= 0)
+            ds41::enqueue_canonical_sum(pending_sum.shared, pending_sum.low, pending_sum.high, std::size_t{R} * H, m.y.p, st);
+        pending_sum = PendingSum{};
+    };
     // capture_main_hidden (as DeviceForward): the input of layers [layers - 3, layers) once the expansion is stored
     const std::uint32_t capture_first = m.options.layers >= 3U ? m.options.layers - 3U : 0U;
     std::int64_t capture_at = -1;  // the layer whose input is captured once the pending expansion is stored
@@ -2053,7 +2072,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
     bool o_a_trellis = false;  // an o_a ran from the trellis pack (no A8 of o_low for a Q8 o_b)
     const auto flush_post = [&] {
         if (!post.on) return;
-        ds41::enqueue_hc_expand(post.sub, post.residual, post.mixes, R, H, stream_now(), st);
+        ds41::enqueue_hc_expand(post.sub, post.residual, post.mixes, R, H, stream_now(), st, post.sub_low, post.sub_high);
         stored_post();
     };
     const auto enqueue_site = [&](const Step* mix, ds41::HcMix* mixes_out, const ds41::HcMix* collapse_mixes, const float* norm_weight,
@@ -2063,6 +2082,8 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
         v.hidden = H;
         if (post.on) {
             v.sub = post.sub;
+            v.sub_low = post.sub_low;
+            v.sub_high = post.sub_high;
             v.residual = post.residual;
             v.expand_mixes = post.mixes;
         }
@@ -2178,6 +2199,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
             ++first_step;
     for (std::size_t step_index = first_step; step_index < m.plan.steps.size(); ++step_index) {
         const auto& s = m.plan.steps[step_index];
+        if (pending_sum.layer >= 0 && !(s.op == Op::hc_post && s.site == "ffn" && s.layer == pending_sum.layer)) settle_sum();
         if (front_cut != 0U && step_index != 0U && (s.layer < 0 || static_cast<std::uint32_t>(s.layer) >= front_cut)) break;
         const double trace_comm = tr ? m.comm_seconds() : 0.0;
         const auto layer = static_cast<std::uint32_t>(std::max(s.layer, 0));
@@ -2849,9 +2871,17 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
             if (s.site == "attn") enqueue_late_mix();  // if the o_b path did not
             const int next = 1 - m.cur;
             x_a8 = false;
+            // this layer's FFN combine left its canonical terms (the loop head stored y for any other step)
+            const bool terms = pending_sum.layer >= 0;
+            const float* sub = terms ? pending_sum.shared : m.y.p;
+            const float* sub_low = terms ? pending_sum.low : nullptr;
+            const float* sub_high = terms ? pending_sum.high : nullptr;
+            pending_sum = PendingSum{};
             if (fuse_hc) {  // stored by the next site (or before the Engram injection, or by the head)
                 post.on = true;
-                post.sub = m.y.p;
+                post.sub = sub;
+                post.sub_low = sub_low;
+                post.sub_high = sub_high;
                 post.residual = stream_now();
                 post.mixes = s.site == "attn" ? m.mix_attn.p : m.mix_ffn.p;
                 m.cur = next;
@@ -2861,7 +2891,8 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 }
                 break;
             }
-            ds41::enqueue_hc_expand(m.y.p, stream_now(), s.site == "attn" ? m.mix_attn.p : m.mix_ffn.p, R, H, m.streams[next].p, st);
+            ds41::enqueue_hc_expand(sub, stream_now(), s.site == "attn" ? m.mix_attn.p : m.mix_ffn.p, R, H, m.streams[next].p, st,
+                                    sub_low, sub_high);
             m.cur = next;
             if (s.site == "ffn") {
                 m.identity_pre = false;
@@ -3111,7 +3142,9 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                     });
                 const float* low = m.options.rank == 0U ? m.half_own.p : m.half_other.p;
                 const float* high = m.options.rank == 0U ? m.half_other.p : m.half_own.p;
-                ds41::enqueue_canonical_sum(m.shared.p, low, high, std::size_t{R} * H, m.y.p, st);
+                // the received half is in m.half_other on st (a model buffer, no transport lease); next written by the
+                // next layer's exchanges, after its Engram flush or attention site has stored this expansion
+                pending_sum = PendingSum{static_cast<std::int64_t>(layer), m.shared.p, low, high};
                 break;
             }
             for (std::uint32_t half = 0; half < 2U; ++half) {
@@ -3133,7 +3166,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
                 ds41::enqueue_add_f32(m.low.p, m.high.p, std::size_t{R} * H, m.y.p, st);
                 break;
             }
-            ds41::enqueue_canonical_sum(m.shared.p, m.low.p, m.high.p, std::size_t{R} * H, m.y.p, st);
+            pending_sum = PendingSum{static_cast<std::int64_t>(layer), m.shared.p, m.low.p, m.high.p};
             break;
         }
         case Op::head: {
@@ -3239,6 +3272,7 @@ const std::vector<std::uint32_t>& BatchForward::run_step(std::span<const BatchRo
             tr->op(to_string(s.op), s.layer, s.site, m.comm_seconds() - trace_comm, static_cast<int>(trace_op));
         }
     }
+    settle_sum();  // a plan that ends at a combine: y stored, as before
     if (tr) tr->last_event(st);
     if (front_cut != 0U) {  // a FRONT step: the cut after layer front_cut - 1 of every segment, as a TAIL step_boundary reads it
         namespace pipe = ds41::pipe;

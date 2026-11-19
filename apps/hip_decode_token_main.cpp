@@ -3541,6 +3541,8 @@ static int run_decode_entry(
         const auto& choice = pair_route.chunk;
         options.known_prefix_prefill_rows = pair_route.tile_rows;
         pair_prompt_route = pair_route.route;
+        options.qwen_pair_prefix = pair_prompt_route.prefix;
+        options.qwen_pair_reason = pair_prompt_route.reason;
         std::fprintf(stderr, "qwen-pair regime policy=%s mode=%s chunk=%u chunks=%llu model-pipeline-ms=%.0f "
             "model-single-ms=%.0f tile-rows=%u\n", pair_route.policy, pair_prompt_route.prefix ? "pipeline" : "single",
             choice.rows, static_cast<unsigned long long>(pair_route.chunks), pair_route.model.pipeline_ms,

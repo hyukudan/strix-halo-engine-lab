@@ -918,7 +918,7 @@ int main(int argc, char** argv) {
         auto entry = [](std::uint64_t id, std::vector<std::uint32_t> ids, bool mtp = false, std::uint64_t identity = 7) {
             gs::PrefixCache::Entry e;
             e.id = id; e.ids = std::move(ids);
-            e.mtp = mtp; e.identity = identity; e.frontier = e.ids.size() - (mtp ? 1U : 0U);
+            e.mtp = mtp; e.identity = identity; e.frontier = e.ids.size();
             e.state.assign(16, 42);
             return e;
         };
@@ -932,7 +932,11 @@ int main(int argc, char** argv) {
         CHECK(!c.find(std::span(p).first(2), false, 7));
         CHECK(!c.find(p, true, 7) && !c.find(p, false, 8));
         CHECK(c.prepare(entry(3, {1, 2, 3}, true))); c.commit(true);
-        CHECK(c.find(p, true, 7)->frontier == 2);  // A + y0 key; restore at |A|
+        CHECK(c.prepare(entry(4, {1, 2}, true))); c.commit(true);
+        CHECK(c.find(p, true, 7)->id == 3 && c.find(p, true, 7)->frontier == 3);  // MTP key = the prompt; restore at |A|
+        // a follow-up whose token after the prompt is not the first generated one (template turn) still restores
+        CHECK(c.find(std::vector<std::uint32_t>{1, 2, 9, 4}, true, 7)->id == 4);
+        CHECK(c.find(std::span(p).first(3), true, 7)->id == 4);  // exact MTP key forbidden: one token must remain
         CHECK(c.state(3) && c.state(3)->size() == 16 && !c.state(99));
         // a weak hash makes every key collide: only the full token compare decides
         gs::PrefixCache weak(4096, [](std::uint64_t, std::span<const std::uint32_t>) -> std::uint64_t { return 5; });
@@ -1335,7 +1339,8 @@ int main(int argc, char** argv) {
             auto blk = gs::encode(old_peer);
             const std::uint32_t v5 = 5;
             std::memcpy(blk.data() + offsetof(gs::Control, version), &v5, sizeof v5);
-            CHECK(throws_with([&] { (void)gs::decode(blk); }, "protocol version 5 from the peer, expected 8"));
+            CHECK(throws_with([&] { (void)gs::decode(blk); },
+                              "protocol version 5 from the peer, expected " + std::to_string(gs::kControlVersion)));
             CHECK(gs::decode(gs::encode(old_peer)).version == gs::kControlVersion);
             std::printf("v5-layout peer block: refused at the version check\n");
         }

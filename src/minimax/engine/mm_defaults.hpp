@@ -76,6 +76,8 @@ struct PrefillPolicy {
     std::string router_wmma_layers;                // its layer set (builtin kRouterWmmaLayers), canonical ranges
     std::string policies;                          // named FAST policies that run, '+'-joined; empty: none
     std::string note;                              // why a bundle member does not run; empty: none
+    bool bundle_column = false;                    // the product profile's column applies the bundle members
+    bool bundle_from_profile = false;              // ... and the switch is unset: the word selected the bundle
     // STRIX_TP2_EXCHANGE_FMT (shared trait, xport/exchange_format.hpp): an explicit f16 = named FAST policy
     // tp2-xchg-f16-v0 (throws under STRIX_MM_BASELINE=1); default f32 in every profile (the FAST bundle does not select it).
     strix::xport::ExchangeFormat exchange_fmt = strix::xport::ExchangeFormat::f32;
@@ -97,6 +99,14 @@ profile::Resolution profile_resolution(const Lookup& env);
 // resolves, so both apps feed profile_resolution() the same values. The per-phase timing session is
 // '--timing-profile NAME:PROMPT.u32:STEPS'; the old '--profile NAME:PROMPT.u32:STEPS' stays accepted with one notice.
 inline constexpr const char* kProductProfileEnv = "STRIX_MM_PRODUCT_PROFILE";
+// The product profile's column (shared resolver, profile_table, no environment) applies every member of the FAST bundle
+// mm-fast-pf-v2 with its bundle value: today 'fast' (qualified cells, gate PASS 8K + 32K); default / quality never,
+// turbo not while its cells are pending.
+bool profile_column_selects_bundle(const Lookup& env);
+// ... and the bundle switch (STRIX_MM_FAST_PREFILL) is unset: prefill_policy() then expands the bundle from the word
+// (fast_profile::profile_switch), the same members, admission and prefill identity as the switch; nothing is exported.
+// A set switch, "0" included, wins. With STRIX_MM_BASELINE=1 prefill_policy() refuses the word (exact baseline).
+bool fast_profile_selects_bundle(const Lookup& env);
 // The apps' own option loops call this: true when `a` is one of the options above (its value skipped). `timing`
 // (rank only; nullptr in serve) receives a timing session spec ('--timing-profile', or the old '--profile' spelling).
 bool product_option(const std::string& a, const std::function<std::string()>& next, std::string* timing);

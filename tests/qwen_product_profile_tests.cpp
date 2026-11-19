@@ -48,7 +48,7 @@ void product() {
     pr::Inputs inputs{{}, lookup(empty), false};
     check(pr::parse("default") == pr::Name::standard && pr::parse("fast") == pr::Name::fast &&
         pr::parse("quality") == pr::Name::quality, "three profile names");
-    refuses([] { (void)pr::parse("turbbo"); }, "default, fast, quality or turbo");
+    refuses([] { (void)pr::parse("turbbo"); }, "exact (default), fast, quality or turbo");
     for (const auto profile : {pr::Name::standard, pr::Name::fast, pr::Name::quality}) {
         for (const bool allow : {false, true}) {
             inputs.allow_pending = allow;
@@ -237,7 +237,7 @@ void cli_and_receipts() {
     }
     check(parse({"decoder","model.gguf","1","--profile=fast"}).product_profile.profile == pr::Name::fast, "equals syntax");
     refuses([] { (void)parse({"decoder","model.gguf","1","--profile"}); }, "requires a value");
-    refuses([] { (void)parse({"decoder","model.gguf","1","--profile","turbbo"}); }, "default, fast, quality or turbo");
+    refuses([] { (void)parse({"decoder","model.gguf","1","--profile","turbbo"}); }, "exact (default), fast, quality or turbo");
     refuses([] { (void)parse({"decoder","model.gguf","1","--profile","fast","--profile=default"}); }, "duplicate");
     check(parse({"decoder","model.gguf","1","--qsa-budget","1536"}).product_profile.find("qsa_budget")->value == "1536",
         "implemented QSA budget CLI accepted");
