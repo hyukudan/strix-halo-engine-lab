@@ -242,7 +242,7 @@ int run_mtp_ref(q::HipEngine& E, const std::string& model, const std::string& mt
 
 int main(int argc, char** argv) try {
     strix::qwen35::hip_profile::take(strix::qwen35::hip_profile::App::spec, argc, argv);  // --profile exact|fast
-    std::string model, ids_file, label = "run", sources, mtp_file, chain_hidden = "post", dump_ref, dump_out;
+    std::string model, ids_file, label = "run", sources, mtp_file, chain_hidden = "post", chain_feed = "device", dump_ref, dump_out;
     std::uint32_t n_gen = 256, max_block = 0, max_pos = 0, pf_bench = 0, trace_n = 0, prefill_rows = 0, chain_k = 0, ref_n = 0;
     bool prefill_exact = false;  // prefill_rows 0 = the engine default (64-row EXACT windows)
     q::HipDenseSpecArgs spec_args;  // the family's shared speculation flags: the same parser and resolver as strix-hip-qwen35-decode
@@ -272,6 +272,7 @@ int main(int argc, char** argv) try {
         else if (a == "--label") label = next();
         else if (q::parse_hip_dense_spec_arg(a, next, spec_args)) {}  // --mtp, --draft-rows, --draft-pack, --spec-costs
         else if (a == "--chain-hidden") chain_hidden = next();      // post | pre (hidden fed to the MTP layer)
+        else if (a == "--chain-feed") chain_feed = next();          // device (default) | host: one synchronizing read per position
         else if (a == "--chain-k") chain_k = strix::core::parse_u32(next());  // override (default: the resolver's cap)
         else if (a == "--copy-arm") copy_arm = strix::core::parse_u32(next());  // also run the copy-only baseline for N tokens
         else if (a == "--mtp-ref") mtp_ref = true;                  // mtp_forward vs host reference
@@ -286,9 +287,10 @@ int main(int argc, char** argv) try {
                 plan.draft_rows ? "subset" : "full", q::hip_dense_cost_mode_name(plan.costs), sources.empty() ? "" : " sources",
                 chain_k ? " chain-k" : "", max_block ? " max-block" : "", sources.empty() && !chain_k && !max_block ? " none" : "");
     if (chain_hidden != "post" && chain_hidden != "pre") throw std::invalid_argument("--chain-hidden post|pre");
+    if (chain_feed != "device" && chain_feed != "host") throw std::invalid_argument("--chain-feed device|host");
     if (model.empty() || (ids_file.empty() && !cost_table && !pf_bench))
         throw std::invalid_argument("usage: --model F.gguf (--prompt-file ids | --cost-table | --prefill-bench N [--pf-sample]) [--n-gen N] "
-                                    "[--sources copy,chain,hybrid|none] [--mtp F.gguf] [--chain-hidden post|pre] [--chain-k N] [--mtp-ref] [--dump-ref F] [--dump-out F] "
+                                    "[--sources copy,chain,hybrid|none] [--mtp F.gguf] [--chain-hidden post|pre] [--chain-feed device|host] [--chain-k N] [--mtp-ref] [--dump-ref F] [--dump-out F] "
                                     "[--max-block 1..16] [--check 0|1] [--max-pos N] [--label S]");
     std::vector<std::uint32_t> prompt;
     if (!ids_file.empty()) {
@@ -313,7 +315,10 @@ int main(int argc, char** argv) try {
     std::unique_ptr<HipMtpChain> chain_glue;
     std::unique_ptr<sp::DraftRows> drows;
     std::optional<q::HipDenseCosts> costs;  // measured once per process (first spec run, after its prompt)
-    if (E->has_mtp()) chain_glue = std::make_unique<HipMtpChain>(*E, chain_hidden == "pre", q::HipEngine::mtp_max_rows());
+    if (E->has_mtp()) {
+        chain_glue = std::make_unique<HipMtpChain>(*E, chain_hidden == "pre", q::HipEngine::mtp_max_rows());
+        chain_glue->set_device_feed(chain_feed == "device");
+    }
     std::printf("loaded: weights %.2f GB/pass, state %.0f MB/pass, max_positions %u\n", double(E->weight_bytes()) / 1e9,
                 double(E->state_bytes_per_pass()) / 1e6, opt.max_positions);
 
@@ -549,6 +554,9 @@ int main(int argc, char** argv) try {
                     1000.0 * double(out.size() - 1) / wall, wall / double(std::max<std::size_t>(per_step.size(), 1)), best, prompt.size(), prefill_ms);
         for (unsigned r = 1; r <= 16U; ++r)
             if (windows[r]) std::printf("verify-window %u: %llu calls\n", r, (unsigned long long)windows[r]);
+        if (use_chain && chain_glue)
+            std::printf("mtp-feed[%s]: %s, chain host reads %llu over %llu drafts\n", label.c_str(), chain_glue->device_feed() ? "device" : "host",
+                        (unsigned long long)chain_glue->host_reads(), (unsigned long long)chain_glue->drafts());
         if (use_chain && chain_glue)
             std::printf("mtp[%s]: hidden %s chain_k override %u, mtp_forward calls %llu rows %llu, draft() %llu calls %.1f ms total = %.2f ms/draft, %.2f ms/mtp_forward call; "
                         "chain-source passes %llu (%.1f %%), hybrid blocks %llu (ext proposed %llu accepted %llu)\n",
