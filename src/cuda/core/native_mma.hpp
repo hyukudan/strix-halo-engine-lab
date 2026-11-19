@@ -93,9 +93,10 @@ static_assert(kWideThreads / 32U == 8U * warp_parts(kTileMBlocks), "16 warps: 8 
 // Launch rule (backend-neutral): the wide form when the launch routes at least min_avg rows per expert on average
 // (min_avg = 0: off). min_avg is a planner parameter: the lever value `--expert-wide-tile N` (N rows per expert), taken
 // from the no-model tile bench of the device (its TILEWIDE line: the smallest rows-per-expert case from which the wide
-// form is faster at every larger case). kWideMinAvgRows is only the value of a bare `on`: PROVISIONAL, set above the
-// 80..120 rows-per-expert band where a 128-row tile was measured 3-7 % slower than 64-row tiles on this card class.
-inline constexpr unsigned kWideMinAvgRows = 128U;
+// form is faster at every larger case). kWideMinAvgRows is only the value of a bare `on`: the TILEWIDE of the RTX PRO 6000
+// Blackwell (sm_120, 188 SMs; tile bench 11-19, 11/11 cases bits EQUAL): wide / tile time 0.79-0.96 at every case from 80
+// to 320 rows per expert, 1.05-1.07 at 48-64. Another device takes its own TILEWIDE as `--expert-wide-tile N`.
+inline constexpr unsigned kWideMinAvgRows = 80U;
 STRIX_NATIVE_MMA_HD bool wide_form(std::uint64_t assignments, unsigned experts, unsigned min_avg) {
     return min_avg != 0U && assignments >= std::uint64_t{min_avg} * experts;
 }

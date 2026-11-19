@@ -117,7 +117,7 @@ inline constexpr Lever table[] = {
      .target = "", .off = "0",
      .source = "decode tile form of the tensor-core GSQ experts: exact (bitwise the tile form; greedy ids equal on prose/edit/json)"},
     // Exact schedule trait of the tensor-core GSQ experts: launches averaging >= N rows per expert (the row's value; `on` =
-    // native_mma::kWideMinAvgRows, PROVISIONAL; N from the device's no-model tile bench) run 128-row CSR tiles in
+    // native_mma::kWideMinAvgRows = the RTX PRO TILEWIDE; N from the device's no-model tile bench) run 128-row CSR tiles in
     // 512-thread blocks (one weight row per lane), so a 128-row run of an expert decodes its codes once instead of twice;
     // bitwise the tile form (same MMA and scale-FMA order per output, same m16 position per row). Opt-in until its timing
     // receipt: `--expert-wide-tile on|N` / STRIX_QRTX_EXPERT_WIDE_TILE=1|N.

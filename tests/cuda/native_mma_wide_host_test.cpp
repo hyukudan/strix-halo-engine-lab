@@ -101,6 +101,7 @@ int main() {
     check(nm::wide_form(std::uint64_t{nm::kWideMinAvgRows} * 512U, 512U, nm::kWideMinAvgRows), "wide at the threshold", 0, 0);
     check(!nm::wide_form(std::uint64_t{nm::kWideMinAvgRows} * 512U - 1U, 512U, nm::kWideMinAvgRows), "tile form below the threshold", 0, 0);
     check(nm::wide_form(96ULL * 512U, 512U, 96U) && !nm::wide_form(96ULL * 512U - 1U, 512U, 96U), "planner parameter 96 rows", 0, 0);
+    check(nm::kWideMinAvgRows == 80U, "bare on = the measured TILEWIDE of the RTX PRO (80 rows per expert)", 0, 0);
     check(!nm::wide_form(1ULL << 30, 512U, 0U), "off: never wide", 0, 0);
     check(nm::wide_form(16U * 10U, 512U, 1U) == false && nm::wide_form(512U, 512U, 1U), "forced threshold 1", 0, 0);
     // Output ownership: wide and tile forms own the same outputs, each once.
