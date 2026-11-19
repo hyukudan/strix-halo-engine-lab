@@ -348,6 +348,12 @@ int main() {
         // an engine without the hook ignores the switch
         const auto nohook = feed<PosEngine>(P, 0, true);
         MC_CHECK(nohook.writes == a.writes && nohook.full_calls == a.full_calls && nohook.kv_calls == 0, "kv switch without hook");
+        // default: K/V-only catch-up ON where the engine has the hook (device gate passed), the incumbent calls without it
+        PosKvEngine ek;
+        PosEngine ep;
+        const sp::MtpChain<PosKvEngine, PosDev> dk(ek, false, 3, 8);
+        const sp::MtpChain<PosEngine, PosDev> dp(ep, false, 3, 8);
+        MC_CHECK(dk.kv_catchup() && !dp.kv_catchup(), "default kv catch-up: hook %d no-hook %d", int(dk.kv_catchup()), int(dp.kv_catchup()));
     }
     std::puts("spec_mtp_chain_tests: PASS");
     return 0;

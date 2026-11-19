@@ -126,7 +126,9 @@ int main(int argc, char** argv) {
         std::unique_ptr<sp::DraftRows> draft_rows;
         std::uint32_t idle_ms = 0;  // host sleep (GPU idle) before every spec run: thermal gaps inside one ticket
         bool cost_table = false, check = true, graphs = true, seed_costs = true, turbo_lm_head = true, pdl = false;
-        bool pf_large = false, kv_catchup = false;  // --prefill-route large, --mtp-catchup kv (both off until measured)
+        // --prefill-route large (off until measured); --mtp-catchup kv = default (device gate passed: identical ids / steps /
+        // E / k histogram to full at 28,187 tokens, MTP feed 1.960 -> 0.091 s), full = the off switch.
+        bool pf_large = false, kv_catchup = true;
         std::uint32_t pf_chunk = 0;                 // --prefill-chunk N (large route; 0 = EngineOptions default)
         q::TurboWeights turbo = q::TurboWeights::off;
         for (int i = 1; i < argc; ++i) {
