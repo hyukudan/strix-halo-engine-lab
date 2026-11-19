@@ -124,4 +124,35 @@ struct StepEstimate {
     return f;
 }
 
+// Which ranks decode, for unequal nodes. With shares in proportion to the rates, a group's compute is the split bytes
+// over the sum of its rates plus the replicated bytes over its slowest rate (+ fixed), and the trips do not depend on
+// who is in the group; so for every group size k the k fastest ranks are the best group. The plan tries k = 1..N
+// (k <= units) and keeps the fastest step; a tie keeps the smaller group. `ranks` lists the chosen ranks fastest first
+// (stable for equal rates); `est` is that group's estimate with split_units shares over `units`.
+struct GroupPlan {
+    std::vector<std::uint32_t> ranks;
+    StepEstimate est;
+};
+[[nodiscard]] inline GroupPlan choose_ranks(const StepModel& m, std::span<const double> rates, std::uint32_t units,
+                                            const TripCost& link) {
+    if (rates.empty() || units == 0U) throw std::invalid_argument("tp choose_ranks: no ranks or no units");
+    std::vector<std::uint32_t> order(rates.size());
+    for (std::size_t i = 0; i < order.size(); ++i) order[i] = static_cast<std::uint32_t>(i);
+    std::stable_sort(order.begin(), order.end(), [&](std::uint32_t a, std::uint32_t b) { return rates[a] > rates[b]; });
+    GroupPlan best;
+    double best_ms = std::numeric_limits<double>::infinity();
+    for (std::size_t k = 1; k <= order.size() && k <= units; ++k) {
+        std::vector<double> r(k);
+        for (std::size_t i = 0; i < k; ++i) r[i] = rates[order[i]];
+        const auto shares = split_units(units, r);
+        const auto e = estimate(m, r, fractions(shares), link);
+        if (e.group_ms < best_ms) {
+            best_ms = e.group_ms;
+            best.ranks.assign(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(k));
+            best.est = e;
+        }
+    }
+    return best;
+}
+
 }  // namespace strix::pair::tp
