@@ -875,6 +875,17 @@
   },
   {
     "engine": "qwen",
+    "name": "Qwen 27B HIP decode attention row share (one K/V walk per kv head for several rows)",
+    "flag_or_env": "STRIX_DECODE_ATTN_ROW_SHARE",
+    "default": "1",
+    "exact": "Bitwise: one no-contraction arithmetic form, device test vs main's engine-built kernel under both flag sets (111 cases x 6 forms); decode ids identical on / off / main, plain and speculative, 8K and 32K.",
+    "gain": "Qwen 27B IU4, one node, 3 pairs: 8K plain 78.2 -> 76.3 ms/token; 32K plain 101.7 -> 93.6; 32K speculative code 62.2 -> 56.0, think 49.3 -> 40.35.",
+    "preconditions": "Qwen 27B dense HIP engine (24 q / 4 kv, Dim 256) on a device with a measured table (gfx1151, 20 multiprocessors); otherwise the main schedule.",
+    "off_switch": "STRIX_DECODE_ATTN_ROW_SHARE=0",
+    "doc_anchor": "docs/optimizations.md#qwen27-hip-decode-attn-row-share"
+  },
+  {
+    "engine": "qwen",
     "name": "Qwen 27B HIP EXACT 64-row prefill windows",
     "flag_or_env": "--wide-exact N (decode app), --prefill-rows N --prefill-exact (spec app)",
     "default": "spec app: 64-row EXACT windows when every large dense projection is IU4 (16 rows otherwise); decode app: 16-row windows; pair app: --wide N FAST class",

@@ -445,6 +445,17 @@ if(BUILD_TESTING)
     target_compile_features(strix-wave-fit-host-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-wave-fit-host-tests)
     add_test(NAME strix-wave-fit-host-tests COMMAND strix-wave-fit-host-tests)
+    add_executable(strix-attn-row-share-tests tests/attn_row_share_tests.cpp)
+    target_include_directories(strix-attn-row-share-tests PRIVATE include)
+    target_compile_features(strix-attn-row-share-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-attn-row-share-tests)
+    add_test(NAME strix-attn-row-share-tests COMMAND strix-attn-row-share-tests)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        # Source form of the shared EXACT dense decode attention (fp contraction pinned, one arithmetic copy).
+        add_test(NAME strix-dense-decode-exact-form-tests
+            COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_SOURCE_DIR}/tests/dense_decode_exact_form_tests.py)
+    endif()
     add_executable(strix-a4-tiles-host-tests tests/a4_tiles_host_tests.cpp)
     target_include_directories(strix-a4-tiles-host-tests PRIVATE src)
     target_compile_features(strix-a4-tiles-host-tests PRIVATE cxx_std_20)
@@ -3144,7 +3155,10 @@ int main() { return 0; }"
         # HipEngine (window engine: forward_rows + commit(k)) over the shared HIP cores; both apps bind it.
         add_library(strix_qwen35_hip_engine STATIC src/qwen35/hip/engine.hip src/qwen35/config.cpp src/qwen35/family.cpp)
         set_target_properties(strix_qwen35_hip_engine PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-        set_source_files_properties(src/qwen35/hip/engine.hip PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+        # Floating-point options of the EXACT HIP translation units (no contraction). The engine and the frozen v0 of the
+        # decode attention tests use this one variable, so a test compares against the bits the engine build computes.
+        set(STRIX_HIP_EXACT_FP_OPTIONS "-ffp-contract=off")
+        set_source_files_properties(src/qwen35/hip/engine.hip PROPERTIES COMPILE_OPTIONS "${STRIX_HIP_EXACT_FP_OPTIONS}")
         target_link_libraries(strix_qwen35_hip_engine PUBLIC strix_hip_runtime strix_core)
         target_include_directories(strix_qwen35_hip_engine PRIVATE src)  # attn_core headers include "attn_core/..."
         add_executable(strix-hip-qwen35-decode apps/hip_qwen35_decode_main.hip)
@@ -3169,8 +3183,19 @@ int main() { return 0; }"
             # Shared FAST wide-window attention (flash over the dense_decode BF16 cache) vs the decode form
             add_executable(strix-hip-dense-decode-flash-tests tests/hip_dense_decode_flash_tests.hip)
             set_target_properties(strix-hip-dense-decode-flash-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-            target_include_directories(strix-hip-dense-decode-flash-tests PRIVATE src)
+            target_include_directories(strix-hip-dense-decode-flash-tests PRIVATE src include)
+            target_compile_options(strix-hip-dense-decode-flash-tests PRIVATE ${STRIX_HIP_EXACT_FP_OPTIONS})
             add_test(NAME strix-hip-dense-decode-flash-tests COMMAND strix-hip-dense-decode-flash-tests)
+            # Shared exact decode attention: every attend form == main's kernel as the engine builds it, bit for bit. The
+            # frozen v0 TU always takes the engine's options; the forms are built with them and with the HIP default.
+            set_source_files_properties(tests/hip_dense_decode_rows_v0.hip PROPERTIES COMPILE_OPTIONS "${STRIX_HIP_EXACT_FP_OPTIONS}")
+            foreach(rows_test strix-hip-dense-decode-rows-tests strix-hip-dense-decode-rows-default-tests)
+                add_executable(${rows_test} tests/hip_dense_decode_rows_tests.hip tests/hip_dense_decode_rows_v0.hip)
+                set_target_properties(${rows_test} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+                target_include_directories(${rows_test} PRIVATE src include)
+                add_test(NAME ${rows_test} COMMAND ${rows_test})
+            endforeach()
+            target_compile_options(strix-hip-dense-decode-rows-tests PRIVATE ${STRIX_HIP_EXACT_FP_OPTIONS})
         endif()
         if(STRIX_CHECK_KERNEL_SCRATCH)
             strix_check_kernel_scratch(strix-hip-qwen35-decode)

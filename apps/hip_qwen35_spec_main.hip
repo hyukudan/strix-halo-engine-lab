@@ -397,9 +397,12 @@ int main(int argc, char** argv) try {
 
     if (cost_table) {
         std::uint32_t anchor = 0;
-        std::vector<std::uint32_t> ids(256);
+        std::vector<std::uint32_t> ids(256);  // context: 256 synthetic ids, or the prompt when one is given (8K / 32K walls)
         for (std::size_t i = 0; i < ids.size(); ++i) ids[i] = std::uint32_t(mix(5 + i) % vocab);
+        if (!prompt.empty()) ids = prompt;
+        const double pf0 = now_ms();
         prefill_ids(ids, anchor);
+        std::printf("cost table context: %zu tokens prefilled in %.1f ms\n", ids.size(), now_ms() - pf0);
         warm();
         std::vector<std::uint32_t> t(q::HipEngine::max_rows(), anchor);
         std::printf("cost table (%s, ctx %zu+)\nrows verify_ms(commit full) verify_ms(commit half) tok_per_s_if_all_accepted\n", label.c_str(), ids.size());

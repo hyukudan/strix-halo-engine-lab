@@ -1116,6 +1116,39 @@ the decode app keeps 16-row windows unless `--wide-exact N`, the pair app keeps 
 - **Implementation / evidence:** [engine](../src/qwen35/hip/engine.hip), [IU4 dense core](../src/core/dense_linear_iu4.hpp),
   [row-block grid](../src/core/dense_iu4_rows.hpp), [options](../include/strix/qwen35/hip_engine.hpp)
 
+<a id="qwen27-hip-decode-attn-row-share"></a>
+
+### Qwen 27B HIP: decode attention walks the K/V cache once per kv head for several rows
+
+**Engine:** `qwen` (27B dense, HIP). **Control:** `STRIX_DECODE_ATTN_ROW_SHARE` (default 1). **Home:** shared
+(`src/attn_core/dense_decode.hpp` kernels, `include/strix/attn_row_share.hpp` plan and measured tables).
+
+- One block walks the K/V prefix of a kv head once for P (row, q head) pairs and applies U positions per step; per pair
+  the arithmetic is main's, in main's order. A measured table picks (P, U) by walk length band and row count.
+- The table is keyed by device (architecture without feature suffix, the multiprocessor count the runtime reports) and
+  head shape (group, kv heads, head dim). Only gfx1151 with 20 multiprocessors (40 CUs), group 6 x 4 kv heads, Dim 256
+  has a table today; any other device or shape, rows past 16, and the off switch run the main schedule.
+- `--baseline` does not turn it off, and the Qwen HIP apps have no `--print-effective-config`; the switch is recorded
+  in the environment registry at its first read, like `STRIX_DECODE_FUSE`.
+
+- **Preconditions:** Qwen 27B dense on the HIP engine (24 q / 4 kv heads, Dim 256) on a device with a table.
+- **Fallback:** the main schedule (main's kernel, same instructions), silently: the plan is a pure schedule choice.
+- **Exactness evidence:** EXACT, bitwise. The per-position update is one copy with no contraction under
+  `#pragma clang fp contract(off)`, so the engine flag (`-ffp-contract=off`) and the HIP default compile every form to
+  the same instructions, and main's kernel to main's instructions. Device test against main's kernel as the engine
+  builds it, compiled with both flag sets: 111 cases (rows 1-17, 64; lengths 1 to 131072; two more head shapes;
+  ungated) x 6 forms, every one bitwise, one output digest for both builds. Qwen 27B IU4: decode ids identical with the
+  switch on, off and on main, plain and speculative, 8K and 32K contexts (3 pairs each).
+- **Off switch:** STRIX_DECODE_ATTN_ROW_SHARE=0.
+- **Measured gain:** One Strix Halo node, Qwen 27B IU4, EXACT decode, synthetic-filled contexts, one model load per
+  arm, 3 pairs (on / off ms per token): 8K plain 76.3 / 78.2; 8K speculative code 32.4 / 34.1, think 26.75 / 27.37;
+  32K plain 93.6 / 101.7; 32K speculative code 56.0 / 62.2, think 40.35 / 49.3 (the controller takes larger verify
+  windows when they are cheaper: E 3.00 -> 3.50 code, 4.20 -> 4.85 think). Kernel-only (cache flushed), 16-row
+  window at 32K: 21.7 -> 7.6 ms per layer.
+- **Implementation / evidence:** [kernels](../src/attn_core/dense_decode.hpp),
+  [plan and tables](../include/strix/attn_row_share.hpp), [device test](../tests/hip_dense_decode_rows_tests.hip),
+  [source-form test](../tests/dense_decode_exact_form_tests.py)
+
 <a id="qwen-decode-fuse"></a>
 
 ### Qwen R1 GDN preparation fusion / Fusión de preparación GDN R1
