@@ -8,7 +8,12 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 #include <vector>
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -150,6 +155,25 @@ int main() {
                first_data[17] ==
                    bytes[first.absolute_offset + 17],
            "mapped tensor address reads original file bytes");
+
+    // Registration prefault (src/hip_model_residency.cpp create_impl): the parallel populate only reads; empty and
+    // out-of-file spans are skipped, a span past the end is clipped, every byte stays the file's, pages end resident.
+    {
+        (void)mapped.drop_page_cache(0, mapped.bytes());
+        const std::vector<std::pair<std::uint64_t, std::uint64_t>> spans{
+            {0, mapped.bytes()}, {mapped.bytes(), 4096}, {128, 0}, {mapped.bytes() - 100, std::uint64_t{1} << 30}};
+        expect(mapped.prefault_parallel(spans) == 2, "prefault populates the in-file spans only (clipped at the end)");
+        const auto* all = reinterpret_cast<const std::uint8_t*>(mapped.base_address());
+        bool same = true;
+        for (std::size_t index = 0; index < bytes.size(); ++index) same = same && all[index] == bytes[index];
+        expect(same, "prefault leaves every mapped byte equal to the file");
+        const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+        std::vector<unsigned char> resident((bytes.size() + page - 1) / page);
+        const bool queried = ::mincore(const_cast<std::uint8_t*>(all), bytes.size(), resident.data()) == 0;
+        bool every = queried;
+        for (const auto flag : resident) every = every && (flag & 1U) != 0;
+        expect(every, "prefault leaves every page of the spans resident");
+    }
 
     auto invalid_manifest = manifest;
     invalid_manifest.tensors[1].absolute_offset =
