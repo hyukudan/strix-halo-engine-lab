@@ -56,9 +56,12 @@ public:
     // A run job counts only for its own epoch while that epoch is open; a preload job only for the latest preload.
     // Anything else is a late publication (a run ended early, e.g. on an error path, or a superseded preload) and is
     // dropped: it must not enter another job's receipt.
-    void publish(const ExpertStreamJob& job, const ExpertStreamCounters& c) noexcept {
-        if (job.run ? (open_ && job.epoch == epoch_) : (preload_valid_ && job.epoch == preload_epoch_)) (job.run ? run_ : preload_) += c;
+    // Returns whether other job-local receipt fields may be published under this same lock.
+    bool publish(const ExpertStreamJob& job, const ExpertStreamCounters& c) noexcept {
+        const bool current = job.run ? (open_ && job.epoch == epoch_) : (preload_valid_ && job.epoch == preload_epoch_);
+        if (current) (job.run ? run_ : preload_) += c;
         else ++dropped_;
+        return current;
     }
 
     // The open epoch's counters so far, or the last closed epoch's final counters.

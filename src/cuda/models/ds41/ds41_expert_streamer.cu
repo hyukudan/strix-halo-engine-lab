@@ -656,11 +656,12 @@ void ExpertStreamer::loop() {
                 double io_s = 0.0;
                 const std::uint64_t b = load_into(s, layer, timed, origin, io_s);
                 lock.lock();
-                epochs_.publish(job, {b, from_file ? b : 0U, io_s});
-                copy_bytes_[layer] = b;
-                if (timed) {
-                    origin_recorded_ = true;
-                    copied_[layer] = true;
+                if (epochs_.publish(job, {b, from_file ? b : 0U, io_s})) {
+                    copy_bytes_[layer] = b;
+                    if (timed) {
+                        origin_recorded_ = true;
+                        copied_[layer] = true;
+                    }
                 }
             } else {
                 // preloaded between runs: its group events fired long ago (record them again: same meaning)

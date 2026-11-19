@@ -33,12 +33,12 @@ void unit() {
     check(!e.is_open() && e.run().bytes == 0U && !e.preload_followed(0), "fresh state");
     e.open(1);
     const auto r1 = e.run_job();
-    e.publish(r1, {100, 100, 0.5});
+    check(e.publish(r1, {100, 100, 0.5}), "current run may publish per-layer timing and byte metadata");
     e.publish(r1, {50, 0, 0.0});
     check(e.run().bytes == 150U && e.run().file_bytes == 100U && e.run().io_seconds == 0.5, "run accumulates its own jobs");
     e.close();
     const ExpertStreamCounters closed = e.run();
-    e.publish(r1, {7, 7, 1.0});  // a run job that finishes after end_run (a run ended early)
+    check(!e.publish(r1, {7, 7, 1.0}), "an ended run cannot publish per-layer metadata");
     check(same(e.run(), closed) && e.dropped() == 1U, "closed run is frozen, late run job dropped");
     const auto p1 = e.start_preload();
     e.publish(p1, {200, 200, 2.0});
@@ -46,7 +46,7 @@ void unit() {
     check(e.preload().bytes == 200U && e.preload_followed(1) && !e.preload_followed(0), "preload counters tagged with the run it followed");
     e.open(2);
     check(e.run().bytes == 0U && e.preload().bytes == 200U, "open zeroes the run, keeps the preload");
-    e.publish(r1, {9, 9, 9.0});  // run 1's job published during run 2
+    check(!e.publish(r1, {9, 9, 9.0}), "an old job cannot mark the new run's timing origin");
     check(e.run().bytes == 0U && e.dropped() == 2U, "another run's job is dropped");
     e.publish(e.run_job(), {30, 0, 0.0});
     e.close();
