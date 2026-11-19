@@ -5078,6 +5078,29 @@ One word selects every FAST lever qualified for the run's regime (weights source
 - **Measured gain:** none of its own (selection only): the levers' figures apply, e.g. FAST4 + chunk16 at 8K 13,437-13,714 tok/s; split-K FAST on the spec CLI below.
 - **Implementation / evidence:** [profile table](../include/strix/profiles/qwen_dense_cuda.hpp), [toggles](toggles.md#profiles-exact-vs-fast)
 
+<a id="qwen-dense-cuda-decode-attn8"></a>
+
+### Qwen dense 27B CUDA decode attention on an e4m3 K/V shadow (FAST `decode_attn8`, opt-in)
+
+**Engine:** `qwen-rtx` (dense 27B). **Control:** `--decode-attn8 on|off` on `strix-cuda-qwen35-decode` and `strix-cuda-qwen35-spec`. **Default:** off; `--profile fast` does not turn it on until its quality gate passes. **Class:** FAST (bit-changing, quality-gated).
+
+Decode and verify attention read an e4m3 shadow of the K/V cache instead of the BF16 rows: persistent CTAs over (2,048-key
+chunk, kv head, block of 128 (row, q-head) pairs), each K/V tile read once per kv head per step, S and P*V on e4m3 tensor
+cores (`mma m16n8k32`) with FP32 accumulation and FP32 online softmax, then a per-row combine over the chunks. The shadow
+rows of a step are written from device positions (graph-safe); the BF16 cache stays the source of truth. A trait of the
+shared per-layer entry `attention_decode_kv` (null shadow = the exact BF16 row-shared walk) in the CUDA e4m3 attention family
+(`src/cuda_core/attention/attention_flash8.cu`), no separate family. Slot batches and the MTP block keep the BF16 form.
+
+- **Preconditions:** CUDA Qwen dense 27B, main session; on the spec CLI it also covers the prefill windows.
+- **Automatic selection:** none (no `qualified` regime in `include/strix/profiles/qwen_dense_cuda.hpp`).
+- **Exactness evidence:** identity suffix `-d8`. Inside the FAST class a verify of R rows gives the same bits as R one-row
+  decode steps (absolute chunks, per-row skip / scale / combine; device test). Without the lever the engine calls the exact
+  `attention_decode` as before: the exact attention kernels and the e4m3 prefill kernels are machine-code identical to the
+  code without this trait. Quality gate (8K / 28K / 64K): not run yet.
+- **Off switch:** `--decode-attn8 off` (the default), or `--profile exact`.
+- **Measured gain:** not yet measured.
+- **Implementation / evidence:** [e4m3 attention family](../src/cuda_core/attention/attention_flash8.cu), [entry](../include/strix/cuda_core/attention.hpp), [device test](../tests/cuda_core/cuda_core_test.cu), [profile test](../tests/qwen35_dense_profile_host_tests.cpp)
+
 <a id="qwen-dense-cuda-splitk-fast"></a>
 
 ### Qwen dense 27B CUDA NVFP4 GEMV split-K FAST (`nvfp4-splitk-fast-v1`)
