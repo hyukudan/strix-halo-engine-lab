@@ -42,6 +42,17 @@ std::vector<E> down(const E* d, std::size_t n) {
 }
 int g_fail = 0;
 
+// Feed::bulk must reproduce the lsu output `y` bit for bit (same stage bytes, same MMA order per accumulator). `reset`: the
+// residual form's starting y (it runs in place); otherwise y is poisoned with NaN first so an unwritten element cannot match.
+bool bulk_bitwise(T::GemmArgs g, const float* reset, const std::vector<float>& y) {
+    if (reset) CU(cudaMemcpy(g.y, reset, y.size() * 4, cudaMemcpyDeviceToDevice));
+    else CU(cudaMemset(g.y, 0xff, y.size() * 4));
+    g.feed = T::Feed::bulk;
+    CU(T::gemm_enqueue(g, nullptr));
+    const auto b = down(g.y, y.size());
+    return std::memcmp(b.data(), y.data(), y.size() * 4) == 0;
+}
+
 // one plain GEMM case: epi store / residual / silu_mul; returns max |err| / bound
 void check_gemm(const char* name, std::uint32_t out, std::uint32_t in, std::uint32_t rows, T::Epi epi, std::uint32_t seed) {
     const Weight w = random_weight(out, in, seed);
@@ -81,6 +92,7 @@ void check_gemm(const char* name, std::uint32_t out, std::uint32_t in, std::uint
     }
     CU(T::gemm_enqueue(g, nullptr));
     const auto y = down(dy, aux.size());
+    const bool bsame = bulk_bitwise(g, epi == T::Epi::residual ? daux : nullptr, y);
     double worst = 0;
     for (std::uint32_t r = 0; r < rows; ++r)
         for (std::uint32_t o = 0; o < out; ++o) {
@@ -104,9 +116,9 @@ void check_gemm(const char* name, std::uint32_t out, std::uint32_t in, std::uint
         CU(T::gemm_enqueue(g, nullptr));
         det = down(dy, aux.size()) == y;
     }
-    const bool ok = qsame && det && worst <= 1.0;
-    std::printf("TILE CHECK %-10s out=%u in=%u rows=%u quant-bitwise=%d deterministic=%d err/bound=%.3f %s\n", name, out, in, rows,
-                qsame ? 1 : 0, det ? 1 : 0, worst, ok ? "PASS" : "FAIL");
+    const bool ok = qsame && det && bsame && worst <= 1.0;
+    std::printf("TILE CHECK %-10s out=%u in=%u rows=%u quant-bitwise=%d deterministic=%d bulk-bitwise=%d err/bound=%.3f %s\n", name,
+                out, in, rows, qsame ? 1 : 0, det ? 1 : 0, bsame ? 1 : 0, worst, ok ? "PASS" : "FAIL");
     g_fail += ok ? 0 : 1;
     for (void* p : {static_cast<void*>(drec), static_cast<void*>(dx), static_cast<void*>(daux), static_cast<void*>(dw),
                     static_cast<void*>(dxt), static_cast<void*>(drs), static_cast<void*>(dy)})
@@ -142,6 +154,7 @@ void check_glu(std::uint32_t ch, std::uint32_t in, std::uint32_t rows, std::uint
     g.epi = T::Epi::glu;
     CU(T::gemm_enqueue(g, nullptr));
     const auto y = down(dy, static_cast<std::size_t>(rows) * ch);
+    const bool bsame = bulk_bitwise(g, nullptr, y);
     double worst = 0;
     for (std::uint32_t r = 0; r < rows; ++r)
         for (std::uint32_t c = 0; c < ch; ++c) {
@@ -155,8 +168,9 @@ void check_glu(std::uint32_t ch, std::uint32_t in, std::uint32_t rows, std::uint
             const double bound = (gm * sg * 3e-5 * 1.2 * std::fabs(ur * su) + std::fabs(silu(gr * sg)) * um * su * 3e-5) + 1e-30;
             worst = std::max(worst, std::fabs(y[static_cast<std::size_t>(r) * ch + c] - ref) / bound);
         }
-    const bool ok = worst <= 1.0;
-    std::printf("TILE CHECK %-10s ch=%u in=%u rows=%u err/bound=%.3f %s\n", "glu", ch, in, rows, worst, ok ? "PASS" : "FAIL");
+    const bool ok = bsame && worst <= 1.0;
+    std::printf("TILE CHECK %-10s ch=%u in=%u rows=%u bulk-bitwise=%d err/bound=%.3f %s\n", "glu", ch, in, rows, bsame ? 1 : 0, worst,
+                ok ? "PASS" : "FAIL");
     g_fail += ok ? 0 : 1;
     for (void* p : {static_cast<void*>(dg), static_cast<void*>(du), static_cast<void*>(tg), static_cast<void*>(tu),
                     static_cast<void*>(dxt), static_cast<void*>(dx), static_cast<void*>(drs), static_cast<void*>(dy)})
@@ -342,16 +356,25 @@ void bench(const char* name, std::uint32_t out, std::uint32_t in, std::uint32_t 
     cudaEvent_t a, b;
     CU(cudaEventCreate(&a));
     CU(cudaEventCreate(&b));
-    for (int i = 0; i < 3; ++i) CU(T::gemm_enqueue(g, nullptr));
-    std::vector<float> ms;
-    for (int i = 0; i < 20; ++i) {
-        CU(cudaEventRecord(a));
+    T::GemmArgs gb = g;  // Feed::bulk arm, timed launch by launch alternating with the lsu arm (strict ABAB in one process)
+    gb.feed = T::Feed::bulk;
+    for (int i = 0; i < 3; ++i) {
         CU(T::gemm_enqueue(g, nullptr));
+        CU(T::gemm_enqueue(gb, nullptr));
+    }
+    std::vector<float> ms, msb;
+    const auto timed = [&](const T::GemmArgs& ga, std::vector<float>& out_ms) {
+        CU(cudaEventRecord(a));
+        CU(T::gemm_enqueue(ga, nullptr));
         CU(cudaEventRecord(b));
         CU(cudaEventSynchronize(b));
         float t = 0;
         CU(cudaEventElapsedTime(&t, a, b));
-        ms.push_back(t);
+        out_ms.push_back(t);
+    };
+    for (int i = 0; i < 20; ++i) {
+        timed(g, ms);
+        timed(gb, msb);
     }
     float qms = 0;
     CU(cudaEventRecord(a));
@@ -363,6 +386,10 @@ void bench(const char* name, std::uint32_t out, std::uint32_t in, std::uint32_t 
     const double med = ms[ms.size() / 2], macs = static_cast<double>(out) * (glu ? 2 : 1) * in * rows;
     std::printf("TILE BENCH %-6s out=%u in=%u rows=%u ms=%.4f TFLOPS=%.1f quant_ms=%.4f\n", name, out * (glu ? 2 : 1), in, rows, med,
                 2.0 * macs / (med * 1e-3) / 1e12, qms);
+    std::sort(msb.begin(), msb.end());
+    const double medb = msb[msb.size() / 2];
+    std::printf("TILE BENCH %-6s feed=bulk out=%u in=%u rows=%u ms=%.4f TFLOPS=%.1f bulk/lsu=%.4f\n", name, out * (glu ? 2 : 1), in,
+                rows, medb, 2.0 * macs / (medb * 1e-3) / 1e12, medb / med);
     for (void* p : {static_cast<void*>(w), static_cast<void*>(w2), static_cast<void*>(xt), static_cast<void*>(rs), static_cast<void*>(x),
                     static_cast<void*>(y)})
         CU(cudaFree(p));
@@ -395,6 +422,8 @@ int main(int argc, char** argv) {
     check_gemm("store", 1024, 5120, 24, T::Epi::store, 61);  // model K
     check_glu(80, 128, 20, 31);
     check_glu(192, 1024, 300, 71);
+    check_gemm("residual", 400, 768, 520, T::Epi::residual, 81);  // bulk feed: partial weight tile (!ok records), 3 x 2 tiles, KS 6
+    check_glu(1040, 640, 300, 91);                                // bulk feed: 17 x 64-channel tiles, last partial (!ok w2 slots)
     check_norm_quant(300, 5120, true, 81);   // model width, padding rows 300..511
     check_norm_quant(257, 384, false, 91);   // null gain, NREG 2 -> bucket 8
     check_norm_quant(64, 8192, true, 101);   // widest fused row (NREG 32)
