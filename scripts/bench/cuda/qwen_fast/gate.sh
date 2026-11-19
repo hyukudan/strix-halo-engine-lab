@@ -109,6 +109,13 @@ bundle = c.get('fast_bundle', {}).get('id', 'none')  # the FAST bundle id when t
 tbundle = c.get('turbo_bundle', {}).get('id', 'none')  # likewise the TURBO bundle id (printed under --profile turbo)
 if sys.argv[2] == 'turbo' and c.get('profile') != 'turbo':
     raise SystemExit('turbo arm did not resolve --profile turbo')
+# The arm label names the arithmetic: the turbo arm must have resolved the int8 experts (the expert_turbo target of
+# include/strix/profiles/qwen_cuda.hpp), every other arm must not have them anywhere (prefill blocks or windows).
+int8 = 'gsq-iq-i8mma-turbo-cuda-v1'
+if sys.argv[2] == 'turbo' and expert != int8:
+    raise SystemExit(f'turbo arm did not resolve the int8 experts ({int8}): expert_arithmetic {expert}')
+if sys.argv[2] != 'turbo' and int8 in (expert, regime.get('windows_and_smaller_blocks') if isinstance(regime, dict) else None):
+    raise SystemExit(f'{sys.argv[2]} arm resolved the int8 experts ({int8}): TURBO arithmetic is gated under the turbo arm only')
 sys.stderr.write(f"arm {sys.argv[2]}: contract {contract} | fast_bundle {bundle} | turbo_bundle {tbundle}\n")
 executions = c.get('executions')
 if not isinstance(executions, list) or not executions:

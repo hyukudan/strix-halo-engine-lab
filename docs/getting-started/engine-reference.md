@@ -126,11 +126,12 @@ MTP draft keep the pack. `--print-effective-config` adds a `turbo_weights` objec
 arithmetic) beside the resolution's weights; 3-bit or `converted` requests refuse the start.
 On the Qwen MoE GSQ pack, `--profile turbo` runs every lever of `--profile fast` (BF16 tensor-core experts, HC and QSA
 tensor-core forms, deferred prompt MTP rows) plus the int8 tensor-core experts (`gsq-iq-i8mma-turbo-cuda-v1`) in their
-regime only: prefill blocks of at least `--expert-turbo-rows N` rows (`STRIX_QRTX_EXPERT_TURBO_ROWS`, provisional 512;
+regime only: prefill blocks of at least `--expert-turbo-rows N` rows (`STRIX_QRTX_EXPERT_TURBO_ROWS`, default 512;
 `off` = int8 in every MoE call); decode and verify windows and smaller blocks keep the FAST experts, so TURBO decode is
 FAST decode. The rule is in the arithmetic contract (`+experts[prefill_rows>=N:...,else:...]`) and in the effective
-config (`expert_regime`); `--expert-turbo off` gives FAST. Lower precision than FAST (32K logit gate, 4 prompts x 128
-rows: KL 0.00948, top-1 0.9785, dNLL +0.00543); explicit only, never a default.
+config (`expert_regime`); `--expert-turbo off` gives FAST. Lower precision than FAST. 32K logit gate, 4 prompts x 128
+rows: the regime (`--profile turbo`, default rows) KL 0.00906, top-1 0.9844, dNLL +0.00102; int8 in every MoE call
+(`--expert-turbo-rows off`) KL 0.00948, top-1 0.9785, dNLL +0.00543. Explicit only, never a default.
 
 Qwen accepts `--profile default|fast|quality|turbo` for CLI decode, `--http-serve`,
 MTP and the MTP qualification runner. Omission means `default`: it exports no

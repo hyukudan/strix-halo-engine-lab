@@ -84,17 +84,22 @@ inline constexpr Lever table[] = {
      .kind = Kind::bit_changing, .ready = {true, true, true, false}, .runnable = {false, false, false, true},
      .target = "gsq-iq-i8mma-turbo-cuda-v1", .off = "0",
      .source = "routed GSQ experts: A8 int8 activations x integer codes on int8 IMMA, one FP32 FMA per group; 32K logit gate "
-               "(4 prompts x 128 rows) PASS KL 0.00948 top-1 0.9785 dNLL +0.00543; speed regime per expert_turbo_rows; changes logits",
+               "(4 prompts x 128 rows) PASS: regime (default rows) KL 0.00906 top-1 0.9844 dNLL +0.00102, int8 in every call "
+               "KL 0.00948 top-1 0.9785 dNLL +0.00543; speed regime per expert_turbo_rows; changes logits",
      .provisional = {false, false, false, true}},
     // Regime of expert_turbo (read only when it is on): prefill blocks of at least N rows run the int8 experts, every other
-    // MoE call the run's other expert arithmetic; `off` = int8 in every MoE call (decode windows included). N comes from
-    // the no-model expert bench (int8 vs BF16 by rows); 512 is PROVISIONAL until that receipt: every scheduled prefill
-    // block (1024/2048/4096/8192, qwen_prefill.hpp block_schedule) is above it, so the gated 32K arithmetic is unchanged.
+    // MoE call the run's other expert arithmetic; `off` = int8 in every MoE call (decode windows included). Measured: the
+    // no-model expert bench (one routed-expert call, IQ3_S gate/up + IQ4_NL down) has int8 / BF16 time 0.954 / 0.967 /
+    // 0.953 / 0.957 / 0.898 / 0.915 at 1 / 16 / 128 / 512 / 2048 / 8192 rows, yet int8 in every decode window cost 9-15 %
+    // per step in situ (mtp_mma on); the bench does not reproduce that loss, so windows stay FAST. 512 stays because every
+    // scheduled prefill block (1024/2048/4096/8192, qwen_prefill.hpp block_schedule) is above it: the gated 32K
+    // arithmetic is the int8 one, and no window or tail below 512 rows changes arithmetic without a measurement.
     {.name = "expert_turbo_rows", .env = "STRIX_QRTX_EXPERT_TURBO_ROWS", .option = "--expert-turbo-rows",
      .value = {"", "", "", "512"}, .builtin = "512",
      .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, true},
      .target = "", .off = "off",
-     .source = "int8 experts on prefill blocks of >= N rows only (decode windows: the FAST experts); N provisional, expert bench pending",
+     .source = "int8 experts on prefill blocks of >= N rows only (decode windows: the FAST experts); expert bench int8/BF16 "
+               "0.95-0.97 at 1-512 rows, 0.90-0.92 at 2048-8192, in-situ decode windows +9-15 % per step with int8: N = 512",
      .provisional = {false, false, false, true}},
     // FAST (and TURBO outside expert_turbo's regime): routed GSQ experts on BF16 tensor cores (gsq-iq-bf16mma-cuda-v1), the
     // expert member of the FAST bundle; its empty turbo cell is the fast cell.

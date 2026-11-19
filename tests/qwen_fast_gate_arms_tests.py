@@ -115,6 +115,14 @@ def main():
              cfg=turbo(lambda c: c["expert_regime"].update(windows_and_smaller_blocks=I8, rule=f"prefill_rows>=512:{I8},else:{I8}"))),
         case("regime with incumbent experts refused", t, 2, ["turbo"], "invalid expert_regime",
              cfg=turbo(lambda c: c.update(expert_arithmetic="incumbent"))),
+        # arm label = arithmetic: --profile turbo with --expert-turbo off resolves the FAST experts (refused under turbo);
+        # a fast arm that resolved the int8 experts (e.g. --expert-turbo on) is refused under fast
+        case("turbo arm with FAST experts refused", t, 2, ["turbo"], "turbo arm did not resolve the int8 experts",
+             cfg=turbo(lambda c: (c.pop("expert_regime"), c.update(expert_arithmetic=BF16, arithmetic_contract=FORMS + "+" + BF16)))),
+        case("fast arm with FAST experts accepted", ["--arms", "fast"], 0, ["fast"], "+" + BF16 + " |",
+             cfg=turbo(lambda c: (c.pop("expert_regime"), c.update(profile="fast", expert_arithmetic=BF16, arithmetic_contract=FORMS + "+" + BF16)))),
+        case("fast arm with int8 experts refused", ["--arms", "fast"], 2, ["fast"], "fast arm resolved the int8 experts",
+             cfg=turbo(lambda c: (flat(c), c.update(profile="fast")))),
     ]
     print(f"qwen_fast_gate_arms: {sum(results)}/{len(results)} PASS")
     return 0 if all(results) else 1
