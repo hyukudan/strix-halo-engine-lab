@@ -12,6 +12,7 @@
 #include "strix/dist/gpu_direct.hpp"
 #include "strix/dist/host_copy.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -326,6 +327,40 @@ void one_way_carry() {
         expect(errors[0].empty(), "corrupted ready view then one-way 0->1: rank 0 passes, got '" + errors[0] + "'");
     }
 }
+
+// Host-resident control (DS41 forwards' exchange_host): host_routed() gives the per-size path, the same on both ranks;
+// a rank that sends host-routed chunks with exchange_host() works with a peer on the device round trip (exchange()),
+// between ready-view exchanges, and the bytes arrive.
+void host_control_routing() {
+    {
+        auto ranks = make_pair({.direct = true, .max_bytes = std::size_t{16} << 20U});
+        const auto& c = *ranks[0].comm;
+        expect(c.host_routed(512U) && c.host_routed(std::size_t{64} << 10U), "host_routed: control sizes take the host route");
+        expect(!c.host_routed((std::size_t{64} << 10U) + 64U) && !c.host_routed(std::size_t{1} << 20U),
+               "host_routed: device-routed sizes");
+        auto plain = make_pair({});
+        expect(plain[0].comm->host_routed(std::size_t{1} << 20U), "host_routed: no device exchange");
+    }
+    auto ranks = make_pair({});
+    const auto errors = run(ranks, [&](unsigned r, Rank& rank) {
+        auto& c = *rank.comm;
+        const std::size_t total = (std::size_t{128} << 10U) + 4096U, chunk = std::size_t{64} << 10U;
+        std::vector<std::byte> out(total), in(total);
+        for (std::size_t i = 0; i < total; ++i) out[i] = pattern(r, i, 11U);
+        staged(c, r, 4096U, 1U);
+        for (std::size_t at = 0; at < total; at += chunk) {
+            const std::size_t n = std::min(chunk, total - at);
+            const Tag tag{static_cast<std::uint32_t>(TagKind::control), 0xC1U, at};
+            if (r == 0U && c.host_routed(n)) c.exchange_host(std::span(out).subspan(at, n), std::span(in).subspan(at, n), tag);
+            else c.exchange(nullptr, out.data() + at, in.data() + at, n, tag);
+        }
+        staged(c, r, 4096U, 12U);
+        device_control(c, r, 13U);
+        for (std::size_t i = 0; i < total; ++i)
+            if (in[i] != pattern(1U - r, i, 11U)) throw std::runtime_error("chunked control payload differs");
+    });
+    expect(errors[0].empty() && errors[1].empty(), "chunked host control vs device round trip: " + errors[0] + " | " + errors[1]);
+}
 } // namespace
 
 int main() {
@@ -347,6 +382,7 @@ int main() {
     one_way_routes();
     std::fputs("[dist-contract] starting one_way_carry\n", stderr);
     one_way_carry();
+    host_control_routing();
     if (failures) {
         std::fprintf(stderr, "dist exchange contract: %d failure(s)\n", failures);
         return 1;
