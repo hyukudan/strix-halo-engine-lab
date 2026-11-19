@@ -193,6 +193,7 @@ struct Forward::Impl {
     std::map<std::string, Tensor> w;
     std::map<std::uint32_t, float*> engram_w1;  // [copy scale 4 x hidden | pre gamma hidden] per Engram layer
     bool store_epilogue = true;  // STRIX_HY4_Q8_STORE_EPILOGUE
+    bool pf_store_epilogue = true;  // STRIX_HY4_PF_STORE_EPILOGUE: prompt windows' bf16 epilogues in the producer's store (EXACT)
     // Pinned host staging of the decode step (host-to-device copies never wait for the stream; each slot is written once
     // per step and the step ends with a stream sync, so no slot is rewritten while its copy is pending).
     struct Staging {
@@ -368,6 +369,7 @@ struct Forward::Impl {
         engram_stage = static_cast<std::uint8_t*>(es);
         dstatus_all = alloc<std::uint32_t>(8U * c.layers);
         store_epilogue = strix::envcfg::flag("STRIX_HY4_Q8_STORE_EPILOGUE", true);
+        pf_store_epilogue = strix::envcfg::flag("STRIX_HY4_PF_STORE_EPILOGUE", true);
         const std::uint32_t launch_rows = rows::cache_rows(rmax, vr.max);  // rows a launch / verify pass may write (ring sizes)
         std::vector<std::uint32_t> seq(context + 1U);
         std::iota(seq.begin(), seq.end(), 0U);
@@ -739,7 +741,7 @@ struct Forward::Impl {
     // per head (grid z) at x + z * batch_in, weights + z * batch_weight_bytes, y + z * batch_out.
     void q8a8_rows(const std::uint8_t* weights, std::uint32_t width, std::uint32_t outputs, std::uint32_t R, const float* x,
                    std::uint32_t x_stride, float* y, std::uint32_t y_stride, std::uint32_t batch = 1U, std::uint32_t batch_in = 0U,
-                   std::uint32_t batch_out = 0U) {
+                   std::uint32_t batch_out = 0U, bool round = false, const float* bias = nullptr) {
         namespace q8 = strix::core::f16_dense_tall::q8a8;
         strix::ds41::enqueue_quantize_a8(x, x_stride, R, pr.codes, pr.deltas, pr.sums, s);
         q8::View v{};
@@ -757,6 +759,8 @@ struct Forward::Impl {
         v.batch_in = batch_in;
         v.batch_out = batch_out;
         v.batch_weight_bytes = std::uint64_t{outputs} * v.row_bytes;
+        v.round_bf16 = round ? 1U : 0U;  // the Linear's bf16 epilogue (+ bias) in the GEMM's store: y = R(sum + bias)
+        v.bias = round ? bias : nullptr;
         if (!q8::supported(v)) throw std::runtime_error("hy4 hip forward: A8 rows GEMM refuses width " + std::to_string(width));
         q8::enqueue(v, s);
         check(hipGetLastError(), "q8a8 rows launch");
@@ -768,7 +772,13 @@ struct Forward::Impl {
         if (tw.dims.at(0) != width || tw.bytes != row_bytes(tw.type, width) * outputs)
             throw std::runtime_error("hy4 hip forward: shape of " + name);
         if (tw.type == 8U) {
-            q8a8_rows(tw.p, width, outputs, R, x, width, y, outputs);
+            // pf_store_epilogue: the epilogue below runs in the GEMM's store instead (same function, same FP32 sum: same bits)
+            const bool fused = round && pf_store_epilogue;
+            q8a8_rows(tw.p, width, outputs, R, x, width, y, outputs, 1U, 0U, 0U, fused, bias);
+            if (fused) {
+                check(hipGetLastError(), "linear rows epilogue launch");
+                return;
+            }
         } else {
             HipDenseRowsView v;
             v.x = x;
@@ -958,6 +968,7 @@ struct Forward::Impl {
         v.down_deltas = {pr.ddeltas, K * I / 32U * 4U};
         v.down_sums = {pr.dsums, K * I / 32U * 4U};
         v.rawdots = {pr.rawdots, K * L * 4U};
+        v.rawdots_bf16 = pf_store_epilogue;  // each expert's Linear output rounded in the down kernel's store (ffn_rows skips its pass)
         const auto lay = strix::q51_known_rows::scratch_layout(R, c.experts, c.top_k, true);
         const auto ptr = [&](std::uint64_t at) { return reinterpret_cast<unsigned*>(pr.csr + at); };
         v.csr = {ptr(lay.header), ptr(lay.offsets), ptr(lay.touched), ptr(lay.rows), ptr(lay.slots), ptr(lay.batch_experts), ptr(lay.batch_begins)};
@@ -987,7 +998,8 @@ struct Forward::Impl {
             linear_rows(blk(l, "ffn_routed_down.weight"), pr.xn, h, c.latent, R, pr.z);
             check(dcr::store_rows({pr.z, L, nullptr, 0U, R, {c.latent, 0U}, pr.zb, flag}, s), "expert input rows (bf16)");
             experts_rows(l, R);
-            glu::launch_epilogue<glu::Round::bf16>(pr.rawdots, nullptr, L, R * K * L, pr.rawdots, s);  // each expert's Linear output
+            if (!pf_store_epilogue)  // else the down kernel stored the rounded dots (rawdots_bf16)
+                glu::launch_epilogue<glu::Round::bf16>(pr.rawdots, nullptr, L, R * K * L, pr.rawdots, s);  // each expert's Linear output
             strix::moe_core::enqueue_combine<strix::moe::CombineForm::bf16_steps, 16U, 1536U>(pr.rw, pr.rawdots, nullptr, pr.acc, R, s);
             linear_rows(blk(l, "ffn_routed_up.weight"), pr.acc, c.latent, h, R, pr.routed);
             linear_rows(blk(l, "ffn_gate_shexp.weight"), pr.xn, h, c.shared_ff, R, pr.g);

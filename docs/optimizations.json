@@ -3409,5 +3409,6 @@
     "preconditions": "Hy4-flash verify rows (R <= 8, top-16 of 512) on the Q4_K x A8 C1 family with K-quant down.",
     "off_switch": "STRIX_HY4_ROWS_EXPERT_UNION=0",
     "doc_anchor": "docs/optimizations.md#hy4-rows-expert-union"
-  }
+  },
+  {"engine": "hy4", "name": "Prompt windows: bf16 epilogue in the producers' store", "flag_or_env": "STRIX_HY4_PF_STORE_EPILOGUE", "default": "ON", "exact": "Bitwise: same function on the same FP32 value; bf16 epilogue idempotent over all 2^32 patterns; 4096-token logits digest a0db1a8a45606112 equal on, off and parent.", "gain": "One node, 4096-token bench prompt, 2048-row windows, A-B/B-A: warm -4.3 %, cold -4.2 %.", "preconditions": "Hy4-flash --prompt-rows; q8a8 dense batch <= 1 outside the operand-image form; K-quant known-rows down. Other forms refuse it.", "off_switch": "STRIX_HY4_PF_STORE_EPILOGUE=0", "doc_anchor": "docs/optimizations.md#hy4-pf-store-epilogue"}
 ]

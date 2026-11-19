@@ -5616,3 +5616,26 @@ another with the single-row instruction sequence.
   187.3 -> 137.5 ms. Speculative decode with the shared copy proposer, 300 ids, code prompt: plain 16.65 -> 20.16 tok/s
   (E 1.37 tokens per pass); prose: no proposals, 17.06 -> 17.06 tok/s.
 - **Implementation / evidence:** [union form](../src/hip_moe_q4k_a8_probe.hip), [plan](../include/strix/moe/expert_union.hpp), [binding](../src/hy4/hip/hy4_hip_rows.inc)
+
+<a id="hy4-pf-store-epilogue"></a>
+
+## Hy4-flash prompt windows: bf16 epilogue in the producers' store
+
+**Engine:** `hy4`. **Control:** `STRIX_HY4_PF_STORE_EPILOGUE`. **Default:** on.
+
+The windowed prompt (`--prompt-rows`) ran a separate `glu::launch_epilogue<Round::bf16>` pass over every Q8_0 Linear
+output and over the routed experts' FP32 raw slot dots. The shared producers now apply the same function to the same
+FP32 value in their store: the q8a8 dense core (`View::round_bf16` / `View::bias` select the `kernel_linear` entry; the
+plain kernel is unchanged; with K parts the epilogue runs on the last part only, on the full sum) and the K-quant
+envelope of the known-rows MoE down (`PrefillRows::rawdots_bf16`).
+
+- **Preconditions:** Hy4-flash windowed prompt; q8a8 dense calls with batch <= 1 outside the operand-image form; the
+  K-quant envelope of the known-rows down. Other forms refuse the flag (and keep the separate pass).
+- **Exactness evidence:** Same bits by construction (same function on the same register value); the unbiased bf16
+  epilogue is idempotent over all 2^32 FP32 patterns (host test `tests/ops_rope_glu_host_tests.cpp`); one node, 4096
+  tokens: last-position logits digest a0db1a8a45606112 and last generated position digest equal with the lever on,
+  off and on the parent commit.
+- **Off switch:** `STRIX_HY4_PF_STORE_EPILOGUE=0` keeps the separate epilogue passes.
+- **Measured gain:** One node, 4096-token bench prompt (a ~66-token sequence repeated), 2048-row windows, alternated
+  A-B / B-A: warm prompt 7,680 / 7,694 ms -> 7,307 / 7,409 ms (-4.3 %), cold 7,879 / 7,942 -> 7,593 / 7,557 ms (-4.2 %).
+- **Implementation / evidence:** [dense core](../src/core/f16_dense_q8a8.hpp), [known-rows down](../src/hip_moe_q4k_a8_known_rows.hip), [binding](../src/hy4/hip/hy4_hip_forward.hip)
