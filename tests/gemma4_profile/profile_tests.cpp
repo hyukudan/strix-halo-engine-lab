@@ -406,7 +406,8 @@ void no_pending_executes() {
 void parsing_and_apply() {
     check(pr::parse("default") == pr::Name::standard && pr::parse("fast") == pr::Name::fast &&
           pr::parse("quality") == pr::Name::quality, "parse names");
-    refuses([] { (void)pr::parse("turbo"); }, "default, fast or quality", "unknown profile");
+    refuses([] { (void)pr::parse("turbo"); }, "exact (default), fast or quality", "unknown profile");
+    check(pr::parse("exact") == pr::Name::standard, "exact is the default column (shared tier word)");
     // An empty table proves admission is checked before indexing, without triggering UB on an unfixed build.
     for (const auto app : {pr::App::engine, pr::App::decode_bench, pr::App::prefill_bench})
         refuses([&] { (void)pr::resolve(pr::Name::turbo, app, in(), {}); }, "turbo", "direct TURBO resolution");
@@ -420,6 +421,10 @@ void parsing_and_apply() {
     check(!pr::take_option(3, bare, i, out) && !out && i == 1, "bare --profile left to the app");
     i = 1;
     check(!pr::take_option(2, with_value, i, out), "--profile at the end is bare");
+    char a4[] = "exact";
+    char* with_exact[] = {a0, a1, a4};
+    i = 1; out.reset();
+    check(pr::take_option(3, with_exact, i, out) && out == pr::Name::standard && i == 2, "--profile exact consumed");
 
     // apply exports only profile-set plain switches, never over an existing value, never asset/off levers.
     constexpr pr::Lever exported[] = {

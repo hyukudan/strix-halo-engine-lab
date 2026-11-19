@@ -880,7 +880,7 @@ int main(int argc, char** argv) {
             else if (a == "--profile" || a.rfind("--profile=", 0) == 0) {
                 const std::string name = a == "--profile" ? next() : a.substr(10);
                 if (!strix::profile::is_name(name))
-                    throw std::invalid_argument("--profile must be default, fast, quality or turbo (got '" + name + "')");
+                    throw std::invalid_argument("--profile must be exact (default), fast, quality or turbo (got '" + name + "')");
                 rank_args.push_back("--profile");
                 rank_args.push_back(name);
             }

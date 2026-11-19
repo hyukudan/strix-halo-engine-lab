@@ -177,7 +177,7 @@ Name parse(std::string_view value) {
     // 'turbo' is a shared name, but gemma4 has no versioned TURBO name and its rows have three columns
     // (strix/profiles/gemma4.hpp Lever::value): refused here, before any column index.
     if (!strix::profile::is_name(value) || value == "turbo")
-        throw std::invalid_argument("profile must be default, fast or quality");
+        throw std::invalid_argument("profile must be exact (default), fast or quality");
     return strix::profile::parse(value);
 }
 strix::profile::ExecutionReceipt host_receipt(strix::profile::NumericalIdentity known) {
@@ -396,7 +396,7 @@ void apply(const Resolution& resolution) {
 bool take_option(int argc, char** argv, int& i, std::optional<Name>& out) {
     if (std::string_view(argv[i]) != "--profile" || i + 1 >= argc) return false;
     const std::string_view next = argv[i + 1];
-    if (next != "default" && next != "fast" && next != "quality") return false;
+    if (!strix::profile::is_name(next)) return false;  // shared tier words; parse() refuses turbo with its reason
     out = parse(next);
     ++i;
     return true;

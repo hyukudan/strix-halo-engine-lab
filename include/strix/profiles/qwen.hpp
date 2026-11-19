@@ -25,10 +25,7 @@ using ::strix::profile::kind_name;
 using ::strix::profile::status_name;
 #include "strix/qwen_profile_table.hpp"
 inline std::span<const Lever> levers() { return table; }
-inline Name parse(std::string_view value) {
-    if (value == "exact") return Name::standard;
-    return ::strix::profile::parse(value);
-}  // default|fast|quality|turbo
+using ::strix::profile::parse;  // shared tier words: exact (= default)|fast|quality|turbo
 inline constexpr std::string_view kTurboVersion = "qwen-turbo-v1";
 // Weight sources this build loads under turbo (onfly / converted flip to runnable with their loaders).
 inline constexpr ::strix::profile::turbo::WeightCaps kWeightCaps{

@@ -1,5 +1,7 @@
 #include "profile.hpp"
 
+#include "strix/engine_profile.hpp"
+
 #include <cstdlib>
 #include <optional>
 #include <stdexcept>
@@ -156,11 +158,15 @@ const char* status_name(Status status) {
 }
 const char* kind_name(Kind kind) { return kind == Kind::exact ? "exact" : "bit-changing"; }
 
+// The tier word goes through the shared parser (exact = default, fast, quality, turbo). This producer's rows have
+// three columns and no versioned TURBO name, so turbo is refused here, before any column index.
+static_assert(unsigned(Name::standard) == unsigned(::strix::profile::Name::standard) &&
+              unsigned(Name::fast) == unsigned(::strix::profile::Name::fast) &&
+              unsigned(Name::quality) == unsigned(::strix::profile::Name::quality));
 Name parse(std::string_view value) {
-    if (value == "default") return Name::standard;
-    if (value == "fast") return Name::fast;
-    if (value == "quality") return Name::quality;
-    throw std::invalid_argument("--profile must be default, fast or quality (got '" + std::string(value) + "')");
+    if (!::strix::profile::is_name(value) || value == "turbo")
+        throw std::invalid_argument("--profile must be exact (default), fast or quality (got '" + std::string(value) + "')");
+    return static_cast<Name>(static_cast<unsigned>(::strix::profile::parse(value)));
 }
 const char* name(Name profile) {
     switch (profile) {
