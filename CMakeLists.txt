@@ -3077,18 +3077,19 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     # CMake's HIP language drives device compilation directly. ROCm 7.x
     # development images do not necessarily ship the legacy hipConfig.cmake /
     # hip::host package target, so locate the runtime header/library from the
-    # toolkit instead of requiring that package surface.
+    # toolkit instead of requiring that package surface. The compiler's own ROCm root comes before
+    # /opt/rocm so a toolkit selected only by CMAKE_HIP_COMPILER gets its own headers and runtime.
     find_path(
         STRIX_HIP_INCLUDE_DIR
         NAMES hip/hip_runtime.h
-        HINTS "$ENV{ROCM_PATH}" /opt/rocm
+        HINTS "$ENV{ROCM_PATH}" "${CMAKE_HIP_COMPILER_ROCM_ROOT}" /opt/rocm
         PATH_SUFFIXES include
         REQUIRED
     )
     find_library(
         STRIX_HIP_RUNTIME_LIBRARY
         NAMES amdhip64
-        HINTS "$ENV{ROCM_PATH}" /opt/rocm
+        HINTS "$ENV{ROCM_PATH}" "${CMAKE_HIP_COMPILER_ROCM_ROOT}" /opt/rocm
         PATH_SUFFIXES lib lib64
         REQUIRED
     )
