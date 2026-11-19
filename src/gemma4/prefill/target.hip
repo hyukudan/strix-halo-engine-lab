@@ -787,7 +787,7 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
             x_ready = h[PairWord::x_ready] != 0;
         }
         // LAST_KV: the pass's last row (row n - 1 of the last segment) moves to row 0 of the buffers the remaining work
-        // reads (residual, the layer input x, q when already projected, its PLE rows); its K/V reads stay at n - 1.
+        // reads (residual, the layer input x, q when already projected, its PLE rows, its position); its K/V reads stay at n - 1.
         const auto narrow = [&](std::size_t q_width) {
             // The PLE rows are moved: their stage must have finished on this queue.
             if (ple_pending) { checked(hipStreamWaitEvent(b.queue, b.ple_done, 0)); ple_pending = false; }
@@ -799,6 +799,9 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
                 };
                 move(b.residual, c.hidden); move(b.x, c.hidden); move(b.ple, std::size_t(c.layers) * c.ple_dim);
                 if (q_width) move(b.q, q_width);
+                // The q rotation of the remaining layers reads the row's position.
+                checked(hipMemcpyAsync(b.positions.as<std::uint64_t>(), b.positions.as<std::uint64_t>() + row, sizeof(std::uint64_t),
+                                       hipMemcpyDeviceToDevice, b.queue));
             }
             live = 1; read_base = n - 1;
             tail_part = {parts.back().tx, 0, 1, parts.back().stride};

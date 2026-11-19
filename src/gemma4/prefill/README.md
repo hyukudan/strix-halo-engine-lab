@@ -101,6 +101,16 @@ attention retain `g4-v1` semantics. Bulk norms use the target library's public p
 elementwise PLE and RoPE stages preserve its operation boundaries. All
 producer rows of the prompt chunk stay in the unpublished overlay.
 
+Row liveness (`LAST_KV`, `include/strix/prefill_row_liveness.hpp`): layers 24..41
+own no K/V, so a pass's rows run only up to the last layer that owns K/V or that a
+consumer taps; above it only a read last row continues (logits now or kept for
+`last_logits()`), and only on the exact route (decode-target linears and canonical
+attention give a row the same bytes whatever rows share the call). The engine calls
+`keep_last_row(false)`: its chunks end after layer 23's K/V writes (layer 35 with
+block-drafter taps; no cut when every row's final output is read). Committed KV,
+last logits and taps are unchanged (`strix-gemma4-prefill-check --last-kv-ab`).
+`STRIX_G4_PREFILL_LAST_KV=0` runs every layer for every row.
+
 Canonical attention evaluates the whole chunk with the kernels in
 `canonical.hip`, byte-identical to the target's `gpu::attention` called row by
 row (`STRIX_G4_PREFILL_CANON_KERNEL=0` restores the per-eight-row loop over that
