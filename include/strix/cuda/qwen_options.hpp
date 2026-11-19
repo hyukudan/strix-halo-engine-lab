@@ -128,7 +128,7 @@ inline bool take(int argc, char** argv, int& i, Request& r) {
 
 // Maps a lever Resolution onto the engine Config: the only place that does.
 inline void apply(const cp::Choice& choice, qp::Config& config) {
-    config.forms = {choice.hc_mma, choice.mtp_mma, choice.qsa_mma, choice.moe_mma};
+    config.forms = {choice.hc_mma, choice.mtp_mma, choice.qsa_mma, choice.moe_mma, choice.ple_a8};
     config.moe_route_bf16 = choice.moe_route_bf16;  // explicit: the resolver already read the environment
     // Config::defer_prompt_mtp (exact): the lever row `mtp_defer_prompt` (--mtp-defer-prompt on|off, env, fast profile).
     config.defer_prompt_mtp = config.defer_prompt_mtp || choice.mtp_defer_prompt;
@@ -250,6 +250,7 @@ inline ::strix::serve::Json forms_json(const qwen_prefill::Config::Forms& f, boo
     forms.set("mtp_mma", J(f.mtp_mma));
     forms.set("qsa_mma", J(f.qsa_mma));
     forms.set("moe_mma", J(f.moe_mma));
+    forms.set("ple_a8", J(f.ple_a8));
     forms.set("moe_route_bf16", J(moe_route_bf16));
     return forms;
 }
@@ -334,7 +335,9 @@ inline constexpr std::uint64_t fnv64(std::string_view s) {
     return h;
 }
 inline cp::Choice choice_of(const qp::Config& c) {
-    return {c.moe_route_bf16.value_or(false), c.forms.hc_mma, c.forms.mtp_mma, c.forms.qsa_mma, c.forms.moe_mma};
+    cp::Choice choice{c.moe_route_bf16.value_or(false), c.forms.hc_mma, c.forms.mtp_mma, c.forms.qsa_mma, c.forms.moe_mma};
+    choice.ple_a8 = c.forms.ple_a8;
+    return choice;
 }
 // Resolved::contract recomputed from a resolved Config (a running service holds only the Config).
 inline std::string config_arithmetic_contract(const qp::Config& c) {

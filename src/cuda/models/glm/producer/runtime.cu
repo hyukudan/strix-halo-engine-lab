@@ -1004,7 +1004,7 @@ struct Runtime::Impl {
         kda_s.allocate(kda_layer_count*kda_state_bytes);kda_c.allocate(kda_layer_count*kda_conv_bytes);ck_s.allocate(kda_layer_count*kda_state_bytes);ck_c.allocate(kda_layer_count*kda_conv_bytes);tail.allocate(kda_layer_count*kda_block*kda_row_bytes);
         dlat.allocate(dsa_layer_count*c*1024);dkey.allocate(dsa_layer_count*c*256);dgate.allocate(dsa_layer_count*c*256);dpool.allocate(dsa_layer_count*(c/4)*512);
         const std::size_t sr=dopt.mtp_spec?spec_drafts+1:1; // rows of a decode step (up to spec_drafts+1: the verify)
-        rx.allocate(65536*sr);rx2.allocate(65536*sr);hrow.allocate(16384*sr);emb.allocate(16384*sr);mtp_out.allocate(16384*sr);route.allocate(256);route_sg.allocate(4*288*4);route_keys.allocate(4*288*4);argres.allocate(256);host_small.allocate(65536,true); // router scratch: up to 4 rows (verify)
+        rx.allocate(65536*sr);rx2.allocate(65536*sr);hrow.allocate(16384*sr);emb.allocate(16384*sr);mtp_out.allocate(16384*sr);route.allocate(256);route_sg.allocate(4*288*4);route_keys.allocate(4*288*4);argres.allocate(256+argmax_workspace_bytes(16)); /* 64 result words, then the head pick workspace */host_small.allocate(65536,true); // router scratch: up to 4 rows (verify)
         // Head: stream head.bin to the device once, decode K6 -> FP16, keep scales, free the compressed blob.
         auto& hb=*blobs.at("head.bin");{Charge h(head_blob_part);load_blob_device(hb,staging);}
         auto hm=matrix("lm_head",head_hidden,head_vocab);need(hm.bits==6,"lm_head must be K6");
@@ -1454,7 +1454,7 @@ struct Runtime::Impl {
         }
         hc_final_kernel<<<dim3(16,rows),256,0,compute.s>>>(rx.as<float>(),part.as<float>());norm<<<rows,256,0,compute.s>>>(part.as<float>(),u16("model.language_model.norm.weight"),hrow.as<float>(),rows);
         ck(enqueue_head(head(),hrow.as<float>(),logits.as<float>(),rows,head_ws.p,head_ws.bytes,compute.s));
-        for(unsigned j=0;j<rows;++j)ck(enqueue_argmax(logits.as<float>()+std::size_t(j)*vocab_size,vocab_size,argres.as<U32>()+4*j,compute.s));
+        ck(enqueue_argmax(logits.as<float>(),vocab_size,rows,argres.as<U32>(),argres.as<U32>()+64,compute.s));
     }
     void promote_kda(unsigned l){ck(cudaMemcpyAsync(cks(l),kst2(l),kda_state_bytes,cudaMemcpyDeviceToDevice,compute.s));ck(cudaMemcpyAsync(ckc(l),kcv2(l),kda_conv_bytes,cudaMemcpyDeviceToDevice,compute.s));}
     // One generation step. Same layer helpers, kernels and order as prefill:
@@ -1503,7 +1503,7 @@ struct Runtime::Impl {
     // stays on the device (argres + 16) and is read back with the cycle's last synchronization.
     void enqueue_draft(unsigned row,U32* host){
         ck(enqueue_head(head(),mtp_out.as<float>()+std::size_t(row)*4096,dlogits.as<float>(),1,head_ws.p,head_ws.bytes,compute.s));
-        ck(enqueue_argmax(dlogits.as<float>(),vocab_size,argres.as<U32>()+16,compute.s));ck(cudaMemcpyAsync(host,argres.as<U32>()+16,12,cudaMemcpyDeviceToHost,compute.s));
+        ck(enqueue_argmax(dlogits.as<float>(),vocab_size,1,argres.as<U32>()+16,argres.as<U32>()+64,compute.s));ck(cudaMemcpyAsync(host,argres.as<U32>()+16,12,cudaMemcpyDeviceToHost,compute.s));
     }
     void take_draft(const U32* h){have_draft=h[0]<vocab_size&&h[1]==0;draft_host=h[0];}
     // One cycle: verify [pending, d1..dK] at P..P+K with the plain step's per-row ops (trunk rows = K+1 <= 4),

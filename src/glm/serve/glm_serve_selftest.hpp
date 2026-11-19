@@ -140,8 +140,10 @@ inline bool run_prefix_selftest(strix::serve::GenerationQueue& queue,
         for (const auto& p : prompts) {
             if (!batched) clear();
             first.push_back(run(p));
+            // Every second follow-up drops the reply, as a chat client whose template re-renders the turn (its token
+            // after the prompt is not the first generated one); a prompt-end entry must still serve it.
             auto q = p;
-            q.insert(q.end(), first.back().tokens.begin(), first.back().tokens.end());
+            if (expect_reply || idx.size() % 2 == 0) q.insert(q.end(), first.back().tokens.begin(), first.back().tokens.end());
             q.insert(q.end(), followup.begin(), followup.end());
             next.push_back(std::move(q));
             idx.push_back(idx.size());

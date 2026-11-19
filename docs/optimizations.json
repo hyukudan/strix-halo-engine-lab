@@ -3020,6 +3020,17 @@
   },
   {
     "engine": "qwen-rtx",
+    "name": "PLE projections on the shared dense A8 projection (FAST form ple_a8)",
+    "flag_or_env": "--ple-a8 on|off; STRIX_QRTX_PLE_A8 (lever row ple_a8, identity qwen-cuda-ple-a8-v1)",
+    "default": "off (opt-in under --profile fast; not a FAST bundle member until its gate passes)",
+    "exact": "FAST class: changes the PLE keys and values in prefill blocks; verify / decode windows keep the exact projections. FAST gate not run yet. Off: the same launches as before.",
+    "gain": "Not yet measured.",
+    "preconditions": "CUDA Qwen MoE prefill blocks under --profile fast with --ple-a8 on (the row is runnable under fast only).",
+    "off_switch": "--ple-a8 off; STRIX_QRTX_PLE_A8=0",
+    "doc_anchor": "docs/optimizations.md#qwen-rtx-ple-a8"
+  },
+  {
+    "engine": "qwen-rtx",
     "name": "Prompt prefix cache",
     "flag_or_env": "--prefix-cache; STRIX_QRTX_PREFIX_CACHE; --prefix-cache-host-mb; --prefix-cache-vram-mb; --prefix-cache-block; --prefix-cache-stride",
     "default": "ON",
@@ -3352,5 +3363,16 @@
     "preconditions": "CUDA decode attention through cuda_core::attention_decode with more than one row (Qwen 27B dense verify / draft / plain) on a measured device and head shape (shared table: sm_120 with 188 SMs, 24 q / 4 kv, Dim 256); others keep the one-row grid (same bits).",
     "off_switch": "STRIX_DECODE_ATTN_ROW_SHARE=0",
     "doc_anchor": "docs/optimizations.md#qwen27-cuda-decode-attn-row-share"
+  },
+  {
+    "engine": "qwen-rtx",
+    "name": "Qwen dense 27B CUDA spec: verify pre-launch behind the device-fed MTP draft",
+    "flag_or_env": "--prelaunch 0|1 (strix-cuda-qwen35-spec)",
+    "default": "off (0) until its timing receipt",
+    "exact": "Scheduling only: same verify graph on the same position / id contents in the same stream order; emitted ids equal the serial greedy ids in every block (host tests).",
+    "gain": "Not yet measured.",
+    "preconditions": "CUDA Qwen dense spec CLI with the MTP chain drafter (chain-only and hybrid blocks); other drafters and engines run the serial form.",
+    "off_switch": "--prelaunch 0",
+    "doc_anchor": "docs/optimizations.md#qwen-dense-cuda-verify-prelaunch"
   }
 ]

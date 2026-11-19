@@ -414,6 +414,13 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-exact-reduce-contract-tests)
     add_test(NAME strix-exact-reduce-contract-tests COMMAND strix-exact-reduce-contract-tests)
 
+    add_executable(strix-head-argmax-tests tests/head_argmax_tests.cpp)
+    target_include_directories(strix-head-argmax-tests PRIVATE include)
+    target_compile_features(strix-head-argmax-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-head-argmax-tests)
+    add_test(NAME strix-head-argmax-tests COMMAND strix-head-argmax-tests)
+    set_tests_properties(strix-head-argmax-tests PROPERTIES LABELS "cpu")
+
     add_executable(strix-dist-transport-spec-tests tests/dist_transport_spec_tests.cpp)
     target_include_directories(strix-dist-transport-spec-tests PRIVATE include)
     target_compile_features(strix-dist-transport-spec-tests PRIVATE cxx_std_20)
@@ -476,6 +483,13 @@ if(BUILD_TESTING)
     target_compile_features(strix-attention-row-walk-host-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-attention-row-walk-host-tests)
     add_test(NAME strix-attention-row-walk-host-tests COMMAND strix-attention-row-walk-host-tests)
+    # K/V cache storage classes (strix/kv_storage.hpp): bytes, role / tier policy, quantiser layouts, draft-cache ids == serial.
+    add_executable(strix-kv-storage-tests tests/kv_storage_tests.cpp)
+    target_include_directories(strix-kv-storage-tests PRIVATE include)
+    target_compile_features(strix-kv-storage-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-kv-storage-tests)
+    add_test(NAME strix-kv-storage-tests COMMAND strix-kv-storage-tests)
+
     # Streamed-expert run epochs (both CUDA DS41 expert providers): run counters frozen at end_run, idle preload apart.
     add_executable(strix-expert-stream-epoch-tests tests/expert_stream_epoch_tests.cpp)
     target_include_directories(strix-expert-stream-epoch-tests PRIVATE include)
