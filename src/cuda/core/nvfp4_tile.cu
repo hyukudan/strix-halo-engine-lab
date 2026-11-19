@@ -68,7 +68,7 @@ cudaError_t gemm_enqueue(const GemmArgs& a, cudaStream_t stream) {
     if (auto e = capability(); e != cudaSuccess) return e;
     // Feed trait: same tiles, same stage bytes, same MMA order (bitwise); only the stage copy and its synchronisation differ.
     const bool bulk = a.feed == Feed::bulk;
-    const auto kernel = bulk ? sm120::gemm_bulk_kernel : sm120::gemm_kernel;
+    const auto kernel = bulk ? sm120::gemm_kernel<Feed::bulk> : sm120::gemm_kernel<Feed::lsu>;
     const unsigned threads = bulk ? sm120::kBulkThreads : sm120::kThreads;
     // CUDA applies the attribute to the current device; idempotent, no process-global flag.
     if (auto e = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(sm120::kSmem)); e != cudaSuccess)

@@ -2,7 +2,7 @@
 // sm_120 kernels of the NVFP4 tile GEMM (contract, layouts and identity: strix/cuda/core/nvfp4_tile.hpp).
 //
 // Tile: CTA = 128 weight rows (A, mma m) x 256 activation rows (B, mma n), K 128 per stage, 3-stage ring fed by cp.async
-// (Feed::lsu, gemm_kernel) or by bulk copies from a producer warpgroup (Feed::bulk, gemm_bulk_kernel), 8 MMA warps as
+// (gemm_kernel<Feed::lsu>) or by bulk copies from a producer warpgroup (gemm_kernel<Feed::bulk>), 8 MMA warps as
 // 2 (weight) x 4 (rows), warp tile 64 x 64 = 4 x 8 m16n8k64 MMAs per 64-input block, 128 FP32 accumulators per thread.
 // Work per MAC: smem->register 0.021 B (LDS.128 A fragment + LDS.64 B fragment + one u32 scale each), L2->smem 0.0066 B
 // ((1/128 + 1/256) x 0.5625 B), so the kernel stays under both data pipes at the FP4 tensor rate (2,048 MAC/clk/SM).
@@ -43,42 +43,69 @@ __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_grou
 template <int N>
 __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N)); }
 
-// One landed 128-K stage through this warp's 64 x 64 tile: 2 x 64-K blocks of 4 A + 8 B fragments and 32 MMAs. Both feeds run
-// exactly this (same loads, same MMA order per accumulator), so the feed trait cannot change a bit of the result.
-__device__ __forceinline__ void stage_mma(float (&acc)[4][8][4], const unsigned char* sA, std::uint32_t wm, std::uint32_t wn,
-                                          std::uint32_t lane) {
-    const unsigned char* sB = sA + kAStage;
-#pragma unroll
-    for (std::uint32_t kb = 0; kb < 2; ++kb) {
-        uint4 af[4];
-        std::uint32_t sa[4];
-#pragma unroll
-        for (std::uint32_t mt = 0; mt < 4; ++mt) {
-            const unsigned char* rec = sA + (wm * 4 + mt) * kWRec;
-            af[mt] = *reinterpret_cast<const uint4*>(rec + a_frag(kb, lane));
-            sa[mt] = *reinterpret_cast<const std::uint32_t*>(rec + a_scale(kb, lane));
-        }
-#pragma unroll
-        for (std::uint32_t nt = 0; nt < 8; ++nt) {
-            const unsigned char* rec = sB + (wn * 8 + nt) * kXRec;
-            const uint2 bf = *reinterpret_cast<const uint2*>(rec + b_frag(kb, lane));
-            const std::uint32_t sb = *reinterpret_cast<const std::uint32_t*>(rec + b_scale(kb, lane));
-#pragma unroll
-            for (std::uint32_t mt = 0; mt < 4; ++mt) mma(acc[mt][nt], af[mt], bf, sa[mt], sb);
-        }
-    }
+// ---- Feed::bulk (strix/cuda/core/nvfp4_tile.hpp). Warp kMmaWarps is the producer: it copies each record of a stage with ONE 1-D
+// bulk copy (TMA engine, async proxy) into a full / empty mbarrier ring, so no copy instruction enters the MMA warps' MIO queue
+// (a profile of the dense FAST4 prefill: 7 LDGSTS per thread per stage queued ahead of the kb0 fragments; moving them into
+// the MMA window lost 4-7 %).
+// The eight MMA warps wait for a stage and release it per warp: no CTA-wide barrier per stage. The records already sit in MMA
+// fragment order, so there is no tensor map, swizzle or ldmatrix. Same stage bytes at the same shared offsets (stage_record ==
+// the chunks of stage_chunk, tile_host), the same stage MMA and epilogue text: bitwise equal to Feed::lsu.
+// Registers are split per SM sub-partition (warp w runs on SMSP w % 4, 16 K registers each). One extra warp would put three warps
+// on SMSP 0 and cap EVERY thread at 168 registers (the MMA warps then spill around the epilogue's calls: SASS of the 9-warp form).
+// So the producer is a whole warpgroup (warps 8-11, one per SMSP) that gives its registers back (setmaxnreg 40) to the MMA
+// warpgroups (232): per SMSP 2 x 232 + 40 = 504 x 32 <= 16,384. Only warp 8 copies; warps 9-11 leave after the hand-over.
+constexpr std::uint32_t kMmaWarps = kThreads / 32, kBulkThreads = kThreads + 128, kProducerRegs = 40, kMmaRegs = 232;
+static_assert(2 * kMmaRegs + kProducerRegs <= 16384 / 32, "per-SMSP register file");
+__device__ __forceinline__ void mbar_init(std::uint32_t bar, std::uint32_t count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(bar), "r"(count) : "memory");
 }
-__device__ __forceinline__ void epilogue(const GemmArgs& a, const float (&acc)[4][8][4], std::uint32_t tm, std::uint32_t tn,
-                                         std::uint32_t wm, std::uint32_t wn, std::uint32_t lane);
+__device__ __forceinline__ void mbar_wait(std::uint32_t bar, std::uint32_t parity) {
+    asm volatile(
+        "{\n"
+        ".reg .pred p;\n"
+        "WAIT:\n"
+        "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
+        "@!p bra WAIT;\n"
+        "}" ::"r"(bar),
+        "r"(parity)
+        : "memory");
+}
+__device__ __forceinline__ void mbar_arrive(std::uint32_t bar) {
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(bar) : "memory");
+}
+__device__ __forceinline__ void mbar_expect_tx(std::uint32_t bar, std::uint32_t bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(bar), "r"(bytes) : "memory");
+}
+__device__ __forceinline__ void bulk_copy(std::uint32_t dst, const void* src, std::uint32_t bytes, std::uint32_t bar) {
+    // .shared::cta destination: the ::cluster form made ptxas test the CTA rank of every destination (and keep a call) per copy
+    asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(dst), "l"(src),
+                 "r"(bytes), "r"(bar)
+                 : "memory");
+}
+template <std::uint32_t N>
+__device__ __forceinline__ void regs_dec() {
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" ::"n"(N));
+}
+template <std::uint32_t N>
+__device__ __forceinline__ void regs_inc() {
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" ::"n"(N));
+}
 
-__global__ void __launch_bounds__(kThreads, 1) gemm_kernel(const GemmArgs a) {
+// Feed trait (strix/cuda/core/nvfp4_tile.hpp): ONE kernel, the feed a compile-time parameter. The stage MMA and the epilogue are
+// written once, inline in this body; only the stage copy and its synchronisation sit under `if constexpr`. Feed::lsu therefore
+// instantiates exactly the text of the cp.async kernel and its SASS is identical to it (with the stage MMA and the epilogue in
+// __forceinline__ helpers ptxas re-scheduled the lsu kernel: 10,016 -> 11,488 instructions, 2-4.6 % slower on 4 of 5 dense
+// FAST4 shapes). Feed::bulk adds the producer warpgroup below. Same loads and MMA order per accumulator: bitwise equal.
+template <Feed F>
+__global__ void __launch_bounds__(F == Feed::bulk ? kBulkThreads : kThreads, 1) gemm_kernel(const GemmArgs a) {
+    constexpr bool kBulk = F == Feed::bulk;
     extern __shared__ __align__(16) unsigned char smem[];
     const std::uint32_t KS = a.in / kK, tiles_n = a.rows_pad / kCtaRows, wtiles = a.out / 16, ntiles = a.rows_pad / 8;
     const std::uint32_t tm = blockIdx.x / tiles_n, tn = blockIdx.x % tiles_n;
     const bool glu = a.epi == Epi::glu;
     const std::uint32_t tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, wm = warp & 1, wn = warp >> 1;
     const std::uint32_t sbase = static_cast<std::uint32_t>(__cvta_generic_to_shared(smem));
-    // one stage = the 8 weight records and the 32 activation records of input block ks, copied verbatim. Thread tid copies the
+    // Feed::lsu: one stage = the 8 weight records and the 32 activation records of input block ks, copied verbatim. Thread tid copies the
     // 16-byte chunks c = tid + i * kThreads (i < kPer, c < kChunks). Which record / tile / source a chunk reads does not depend on ks,
     // so its source base, ks stride, shared offset and predicates are computed ONCE here; a stage then costs kPer cp.async plus one
     // multiply-add each. (Recomputing them per stage in a rolled, divergent loop was ~1,860 clk per 128-K stage serialised after the
@@ -104,6 +131,54 @@ __global__ void __launch_bounds__(kThreads, 1) gemm_kernel(const GemmArgs a) {
         for (std::uint32_t i = 0; i < kPer; ++i)
             if (live[i]) cp16(st + dst[i], src[i] + static_cast<std::size_t>(ks) * step[i], okc[i]);
     };
+    std::uint32_t full0 = 0, empty0 = 0;  // Feed::bulk: full[0 .. kStages), empty[0 .. kStages) mbarriers
+    if constexpr (kBulk) {
+        __shared__ __align__(8) std::uint64_t bars[2 * kStages];
+        full0 = static_cast<std::uint32_t>(__cvta_generic_to_shared(bars));
+        empty0 = full0 + kStages * 8;
+    if (tid == 0) {
+#pragma unroll
+        for (std::uint32_t s = 0; s < kStages; ++s) {
+            mbar_init(full0 + 8 * s, 1);
+            mbar_init(empty0 + 8 * s, kMmaWarps);
+        }
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    }
+    __syncthreads();
+        // each role's code is reached only through its own setmaxnreg (ptxas allocates it under that budget)
+        if (warp >= kMmaWarps) {  // producer warpgroup; warp 8 lane l owns records l and l + 32 of every stage, resolved once
+            regs_dec<kProducerRegs>();
+            if (warp != kMmaWarps) return;
+            const std::uint32_t tx = stage_bytes(tm, tn, glu, KS, wtiles, ntiles);
+            StageRecord r[2];
+            const std::uint8_t* rsrc[2];
+            bool mine[2];
+#pragma unroll
+            for (std::uint32_t j = 0; j < 2; ++j) {
+                const std::uint32_t i = lane + 32 * j;
+                mine[j] = i < kStageRecs;
+                r[j] = stage_record(mine[j] ? i : 0, tm, tn, glu, KS, wtiles, ntiles);
+                rsrc[j] = (r[j].which == 2 ? a.x : r[j].which == 1 ? a.w2 : a.w) + r[j].base;
+                if (mine[j] && !r[j].ok)  // never copied: zero the slot of every stage once (published by the first full arrive)
+                    for (std::uint32_t s = 0; s < kStages; ++s)
+                        for (std::uint32_t o = 0; o < r[j].bytes; o += 16)
+                            *reinterpret_cast<uint4*>(smem + s * kStage + r[j].dst + o) = make_uint4(0, 0, 0, 0);
+            }
+            __syncwarp();
+            for (std::uint32_t ks = 0; ks < KS; ++ks) {
+                const std::uint32_t s = ks % kStages, full = full0 + 8 * s;
+                if (ks >= kStages) mbar_wait(empty0 + 8 * s, (ks / kStages - 1) & 1U);
+                if (lane == 0) mbar_expect_tx(full, tx);
+                __syncwarp();
+#pragma unroll
+                for (std::uint32_t j = 0; j < 2; ++j)
+                    if (mine[j] && r[j].ok)
+                        bulk_copy(sbase + s * kStage + r[j].dst, rsrc[j] + static_cast<std::size_t>(ks) * r[j].bytes, r[j].bytes, full);
+            }
+            return;
+        }
+        regs_inc<kMmaRegs>();
+    }
     float acc[4][8][4];
 #pragma unroll
     for (int i = 0; i < 4; ++i)
@@ -111,25 +186,50 @@ __global__ void __launch_bounds__(kThreads, 1) gemm_kernel(const GemmArgs a) {
         for (int j = 0; j < 8; ++j)
 #pragma unroll
             for (int z = 0; z < 4; ++z) acc[i][j][z] = 0.f;
+    if constexpr (!kBulk) {
 #pragma unroll
-    for (std::uint32_t s = 0; s + 1 < kStages; ++s) {
-        if (s < KS) load(s, s);
-        cp_commit();
+        for (std::uint32_t s = 0; s + 1 < kStages; ++s) {
+            if (s < KS) load(s, s);
+            cp_commit();
+        }
     }
     for (std::uint32_t ks = 0; ks < KS; ++ks) {
-        cp_wait<kStages - 2>();
-        __syncthreads();  // stage ks landed for every thread; stage (ks - 1) % kStages is free
-        if (ks + kStages - 1 < KS) load((ks + kStages - 1) % kStages, ks + kStages - 1);
-        cp_commit();
-        stage_mma(acc, smem + (ks % kStages) * kStage, wm, wn, lane);
+        if constexpr (kBulk) {
+            mbar_wait(full0 + 8 * (ks % kStages), (ks / kStages) & 1U);
+        } else {
+            cp_wait<kStages - 2>();
+            __syncthreads();  // stage ks landed for every thread; stage (ks - 1) % kStages is free
+            if (ks + kStages - 1 < KS) load((ks + kStages - 1) % kStages, ks + kStages - 1);
+            cp_commit();
+        }
+        const unsigned char* sA = smem + (ks % kStages) * kStage;
+        const unsigned char* sB = sA + kAStage;
+#pragma unroll
+        for (std::uint32_t kb = 0; kb < 2; ++kb) {
+            uint4 af[4];
+            std::uint32_t sa[4];
+#pragma unroll
+            for (std::uint32_t mt = 0; mt < 4; ++mt) {
+                const unsigned char* rec = sA + (wm * 4 + mt) * kWRec;
+                af[mt] = *reinterpret_cast<const uint4*>(rec + a_frag(kb, lane));
+                sa[mt] = *reinterpret_cast<const std::uint32_t*>(rec + a_scale(kb, lane));
+            }
+#pragma unroll
+            for (std::uint32_t nt = 0; nt < 8; ++nt) {
+                const unsigned char* rec = sB + (wn * 8 + nt) * kXRec;
+                const uint2 bf = *reinterpret_cast<const uint2*>(rec + b_frag(kb, lane));
+                const std::uint32_t sb = *reinterpret_cast<const std::uint32_t*>(rec + b_scale(kb, lane));
+#pragma unroll
+                for (std::uint32_t mt = 0; mt < 4; ++mt) mma(acc[mt][nt], af[mt], bf, sa[mt], sb);
+            }
+        }
+        if constexpr (kBulk) {
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");  // this warp's reads of slot ks % kStages before its refill
+            __syncwarp();
+            if (lane == 0) mbar_arrive(empty0 + 8 * (ks % kStages));
+        }
     }
-    cp_wait<0>();
-    epilogue(a, acc, tm, tn, wm, wn, lane);
-}
-
-__device__ __forceinline__ void epilogue(const GemmArgs& a, const float (&acc)[4][8][4], std::uint32_t tm, std::uint32_t tn,
-                                         std::uint32_t wm, std::uint32_t wn, std::uint32_t lane) {
-    const bool glu = a.epi == Epi::glu;
+    if constexpr (!kBulk) cp_wait<0>();
     // Epilogue loads first, stores after. y may alias aux (the residual GEMMs run in place) and, as plain pointers, rs too, so the
     // compiler may not move a load above an earlier store: written per element, the residual path was 128 LDG -> FADD -> STG chains
     // per thread and rs was re-read after every store, each paying a full memory latency while the CTA held its SM (+0.19-0.20 ms
@@ -184,124 +284,6 @@ __device__ __forceinline__ void epilogue(const GemmArgs& a, const float (&acc)[4
             }
         }
     }
-}
-
-// ---- Feed::bulk (strix/cuda/core/nvfp4_tile.hpp). Warp kMmaWarps is the producer: it copies each record of a stage with ONE 1-D
-// bulk copy (TMA engine, async proxy) into a full / empty mbarrier ring, so no copy instruction enters the MMA warps' MIO queue
-// (a profile of the dense FAST4 prefill: 7 LDGSTS per thread per stage queued ahead of the kb0 fragments; moving them into
-// the MMA window lost 4-7 %).
-// The eight MMA warps wait for a stage and release it per warp: no CTA-wide barrier per stage. The records already sit in MMA
-// fragment order, so there is no tensor map, swizzle or ldmatrix. Same stage bytes at the same shared offsets (stage_record ==
-// the chunks of stage_chunk, tile_host), stage_mma and epilogue unchanged: bitwise equal to Feed::lsu.
-// Registers are split per SM sub-partition (warp w runs on SMSP w % 4, 16 K registers each). One extra warp would put three warps
-// on SMSP 0 and cap EVERY thread at 168 registers (the MMA warps then spill around the epilogue's calls: SASS of the 9-warp form).
-// So the producer is a whole warpgroup (warps 8-11, one per SMSP) that gives its registers back (setmaxnreg 40) to the MMA
-// warpgroups (232): per SMSP 2 x 232 + 40 = 504 x 32 <= 16,384. Only warp 8 copies; warps 9-11 leave after the hand-over.
-constexpr std::uint32_t kMmaWarps = kThreads / 32, kBulkThreads = kThreads + 128, kProducerRegs = 40, kMmaRegs = 232;
-static_assert(2 * kMmaRegs + kProducerRegs <= 16384 / 32, "per-SMSP register file");
-__device__ __forceinline__ void mbar_init(std::uint32_t bar, std::uint32_t count) {
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(bar), "r"(count) : "memory");
-}
-__device__ __forceinline__ void mbar_wait(std::uint32_t bar, std::uint32_t parity) {
-    asm volatile(
-        "{\n"
-        ".reg .pred p;\n"
-        "WAIT:\n"
-        "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
-        "@!p bra WAIT;\n"
-        "}" ::"r"(bar),
-        "r"(parity)
-        : "memory");
-}
-__device__ __forceinline__ void mbar_arrive(std::uint32_t bar) {
-    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(bar) : "memory");
-}
-__device__ __forceinline__ void mbar_expect_tx(std::uint32_t bar, std::uint32_t bytes) {
-    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(bar), "r"(bytes) : "memory");
-}
-__device__ __forceinline__ void bulk_copy(std::uint32_t dst, const void* src, std::uint32_t bytes, std::uint32_t bar) {
-    // .shared::cta destination: the ::cluster form made ptxas test the CTA rank of every destination (and keep a call) per copy
-    asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(dst), "l"(src),
-                 "r"(bytes), "r"(bar)
-                 : "memory");
-}
-template <std::uint32_t N>
-__device__ __forceinline__ void regs_dec() {
-    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" ::"n"(N));
-}
-template <std::uint32_t N>
-__device__ __forceinline__ void regs_inc() {
-    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" ::"n"(N));
-}
-
-__global__ void __launch_bounds__(kBulkThreads, 1) gemm_bulk_kernel(const GemmArgs a) {
-    extern __shared__ __align__(16) unsigned char smem[];
-    __shared__ __align__(8) std::uint64_t bars[2 * kStages];  // full[0 .. kStages), empty[0 .. kStages)
-    const std::uint32_t KS = a.in / kK, tiles_n = a.rows_pad / kCtaRows, wtiles = a.out / 16, ntiles = a.rows_pad / 8;
-    const std::uint32_t tm = blockIdx.x / tiles_n, tn = blockIdx.x % tiles_n;
-    const std::uint32_t tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const std::uint32_t sbase = static_cast<std::uint32_t>(__cvta_generic_to_shared(smem));
-    const std::uint32_t full0 = static_cast<std::uint32_t>(__cvta_generic_to_shared(bars)), empty0 = full0 + kStages * 8;
-    if (tid == 0) {
-#pragma unroll
-        for (std::uint32_t s = 0; s < kStages; ++s) {
-            mbar_init(full0 + 8 * s, 1);
-            mbar_init(empty0 + 8 * s, kMmaWarps);
-        }
-        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-    }
-    __syncthreads();
-    // each role's code is reached only through its own setmaxnreg (ptxas allocates it under that budget)
-    if (warp >= kMmaWarps) {  // producer warpgroup; warp 8 lane l owns records l and l + 32 of every stage, resolved once
-        regs_dec<kProducerRegs>();
-        if (warp != kMmaWarps) return;
-        const bool glu = a.epi == Epi::glu;
-        const std::uint32_t tx = stage_bytes(tm, tn, glu, KS, wtiles, ntiles);
-        StageRecord r[2];
-        const std::uint8_t* src[2];
-        bool mine[2];
-#pragma unroll
-        for (std::uint32_t j = 0; j < 2; ++j) {
-            const std::uint32_t i = lane + 32 * j;
-            mine[j] = i < kStageRecs;
-            r[j] = stage_record(mine[j] ? i : 0, tm, tn, glu, KS, wtiles, ntiles);
-            src[j] = (r[j].which == 2 ? a.x : r[j].which == 1 ? a.w2 : a.w) + r[j].base;
-            if (mine[j] && !r[j].ok)  // never copied: zero the slot of every stage once (published by the first full arrive)
-                for (std::uint32_t s = 0; s < kStages; ++s)
-                    for (std::uint32_t o = 0; o < r[j].bytes; o += 16)
-                        *reinterpret_cast<uint4*>(smem + s * kStage + r[j].dst + o) = make_uint4(0, 0, 0, 0);
-        }
-        __syncwarp();
-        for (std::uint32_t ks = 0; ks < KS; ++ks) {
-            const std::uint32_t s = ks % kStages, full = full0 + 8 * s;
-            if (ks >= kStages) mbar_wait(empty0 + 8 * s, (ks / kStages - 1) & 1U);
-            if (lane == 0) mbar_expect_tx(full, tx);
-            __syncwarp();
-#pragma unroll
-            for (std::uint32_t j = 0; j < 2; ++j)
-                if (mine[j] && r[j].ok)
-                    bulk_copy(sbase + s * kStage + r[j].dst, src[j] + static_cast<std::size_t>(ks) * r[j].bytes, r[j].bytes, full);
-        }
-        return;
-    }
-    regs_inc<kMmaRegs>();
-    const std::uint32_t wm = warp & 1, wn = warp >> 1;
-    float acc[4][8][4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-#pragma unroll
-        for (int j = 0; j < 8; ++j)
-#pragma unroll
-            for (int z = 0; z < 4; ++z) acc[i][j][z] = 0.f;
-    for (std::uint32_t ks = 0; ks < KS; ++ks) {
-        const std::uint32_t s = ks % kStages;
-        mbar_wait(full0 + 8 * s, (ks / kStages) & 1U);
-        stage_mma(acc, smem + s * kStage, wm, wn, lane);
-        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");  // this warp's reads of slot s before its next bulk refill
-        __syncwarp();
-        if (lane == 0) mbar_arrive(empty0 + 8 * s);
-    }
-    epilogue(a, acc, tm, tn, wm, wn, lane);
 }
 
 // Padding row r (rows..rows_pad-1): zero codes / scales / rs.
