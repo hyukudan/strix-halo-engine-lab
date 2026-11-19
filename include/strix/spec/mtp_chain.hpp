@@ -38,6 +38,13 @@ concept MtpFeedEngine = requires(E& e, const std::uint32_t* t, std::uint32_t* h,
     e.mtp_feed_read(u, h);
 };
 
+// K/V-ONLY CATCH-UP (optional backend hook, detected by MtpKvEngine): Engine::mtp_kv(next_tokens, hidden_dev, rows, pos0)
+// writes exactly the MTP K/V that mtp_forward of the same rows writes and nothing else. A single-layer MTP's K/V at a
+// position depend only on that row's layer input, so catch-up chunks whose block output and draft are never read skip the
+// attention, o_proj, MLP and head (a long prompt: every chunk but the last).
+template <class E>
+concept MtpKvEngine = requires(E& e, const std::uint32_t* t, const float* x, std::uint32_t u) { e.mtp_kv(t, x, u, u); };
+
 template <class Engine, class Dev>
 class MtpChain final : public ChainDrafter {
 public:
@@ -116,6 +123,11 @@ public:
     void set_device_feed(bool on) { feed_ = on; }
     [[nodiscard]] bool device_feed() const { return MtpFeedEngine<Engine> && feed_; }
     [[nodiscard]] std::uint64_t host_reads() const { return reads_; }  // synchronizing id reads issued by the chain
+    // K/V-only catch-up (engines with MtpKvEngine): off = the incumbent calls (rollback); on = catch-up chunks whose outputs
+    // nobody reads only write the MTP K/V (same K/V bits, so the same drafts). Off until its device gate passes.
+    void set_kv_catchup(bool on) { kv_catchup_ = on; }
+    [[nodiscard]] bool kv_catchup() const { return MtpKvEngine<Engine> && kv_catchup_; }
+    [[nodiscard]] std::uint64_t kv_calls() const { return kv_calls_; }  // K/V-only catch-up calls (not in calls())
 
 private:
     // draft() over the device feed: the same mtp calls in the same order, ids read once at the end (DEVICE FEED above).
@@ -156,7 +168,7 @@ private:
         const float* src = pre_ ? o.hidden_pre : o.hidden_post;
         std::uint32_t done = 0;
         while (done < rows) {
-            if (next_.size() == ring_n_) flush();
+            if (next_.size() == ring_n_) flush(false, false);  // forced: its last-row outputs are overwritten by a later flush
             const std::uint32_t n = std::min<std::uint32_t>(rows - done, ring_n_ - static_cast<std::uint32_t>(next_.size()));
             Dev::copy(e_, ring_ + next_.size() * hid_, src + std::size_t(done) * hid_, std::size_t(n) * hid_);
             next_.insert(next_.end(), next_tokens + done, next_tokens + done + n);
@@ -165,12 +177,24 @@ private:
     }
     // Write the ring into the MTP KV (rows_max_ per call, causal inside each call). Leaves the last row's top / hidden in
     // d1_ / carry_ (fed: d1 goes to feed slot 0 without a host read; draft_fed() reads it with the drafts).
-    void flush(bool fed = false) {
+    // outputs = false: nobody reads this flush's last-row outputs (a ring-full flush inside push_hidden; d1_ / carry_ are
+    // rewritten by the flush draft() runs first). With K/V-only catch-up (MtpKvEngine) every chunk whose outputs have no
+    // reader writes only the MTP K/V (same K/V bits); without it the calls are exactly the incumbent ones.
+    void flush(bool fed = false, bool outputs = true) {
         std::uint32_t off = 0;
         const auto total = static_cast<std::uint32_t>(next_.size());
+        const bool kv = kv_catchup();
         while (off < total) {
             const std::uint32_t n = std::min<std::uint32_t>(rows_max_, total - off);
             const bool final_chunk = off + n == total;  // only the last row's draft is needed: earlier chunks skip lm_head
+            if (kv && !(final_chunk && outputs)) {
+                if constexpr (MtpKvEngine<Engine>) e_.mtp_kv(next_.data() + off, ring_ + std::size_t(off) * hid_, n, mtp_pos_);
+                ++kv_calls_;
+                rows_ += n;
+                mtp_pos_ += n;
+                off += n;
+                continue;
+            }
             const auto m = e_.mtp_forward(next_.data() + off, ring_ + std::size_t(off) * hid_, n, mtp_pos_, final_chunk);
             ++calls_;
             rows_ += n;
@@ -217,8 +241,9 @@ private:
     std::vector<std::uint32_t> next_, succ_;
     std::uint32_t mtp_pos_ = 0, d1_ = 0;
     std::uint32_t top_tmp_[32]{};
-    std::uint64_t calls_ = 0, rows_ = 0, drafts_ = 0, reads_ = 0;
+    std::uint64_t calls_ = 0, rows_ = 0, drafts_ = 0, reads_ = 0, kv_calls_ = 0;
     bool feed_ = true;
+    bool kv_catchup_ = false;
     double draft_wall_ms_ = 0.0;
 };
 
