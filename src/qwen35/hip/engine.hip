@@ -27,6 +27,7 @@
 #include "strix/spec/draft_rows.hpp"
 #include "strix/hip_argmax_core.hpp"
 #include "strix/hip_gdn_dims.hpp"
+#include "strix/owned_layer_ordinals.hpp"
 #include "strix/pair/tp_layout.hpp"
 #include "../../attn_core/dense_decode.hpp"
 #include "../../attn_core/dense_decode_flash.hpp"
@@ -516,8 +517,8 @@ struct HipEngine::Impl {
     unsigned H = 0, V = 0, D = 0, QW = 0, KW = 0, I = 0, GV = 0, GC = 0, GH = 0;
     Tensor embd, onorm, head;
     std::vector<Layer> L;
-    std::vector<unsigned> gdn_index;  // layer -> index among GDN layers (or ~0u)
-    unsigned n_gdn = 0;
+    std::vector<unsigned> gdn_index;  // layer -> index among the OWNED GDN layers (or ~0u: attention / another rank's layer)
+    unsigned n_gdn = 0;               // owned GDN layers: state, backup, conv and raw slices are sized by it
     std::size_t sb = 0, cb = 0;       // GDN matrix bytes / conv bytes per layer
     std::size_t pass_weight_bytes = 0, kv_pos_bytes = 0, mtp_bytes = 0;
     float *gdn_all = nullptr, *bak_state = nullptr;  // allocations; roles (committed / window target) live in gdn_buf
@@ -612,6 +613,7 @@ struct HipEngine::Impl {
     }
 
     template <class T> static void alloc0(T** p, std::size_t bytes) {
+        if (bytes == 0) { *p = nullptr; return; }  // e.g. no GDN layer in this rank's range
         HK(hipMalloc(p, bytes));
         HK(hipMemset(*p, 0, bytes));
     }
@@ -633,9 +635,12 @@ struct HipEngine::Impl {
         if (own_begin == 0U) embd = loader.load("token_embd");
         if (own_end == cfg.layers) { onorm = loader.load("output_norm"); head = loader.load("output"); }
         L.assign(cfg.layers, Layer{});
-        gdn_index.assign(cfg.layers, ~0U);
-        for (unsigned l = 0; l < cfg.layers; ++l)
-            if (cfg.kind(l) == LayerKind::gated_delta_net) gdn_index[l] = n_gdn++;
+        {  // GDN state only for this rank's layers (strix/owned_layer_ordinals.hpp)
+            auto gdn = owned_layer_ordinals(cfg.layers, own_begin, own_end,
+                                            [&](std::uint32_t l) { return cfg.kind(l) == LayerKind::gated_delta_net; });
+            gdn_index = std::move(gdn.ordinal);
+            n_gdn = gdn.count;
+        }
         sb = std::size_t(GH) * cfg.gdn_key_dim * cfg.gdn_value_dim * 4U;
         cb = std::size_t(GC) * cfg.gdn_conv_kernel * 2U;
         alloc0(&gdn_all, sb * n_gdn);
