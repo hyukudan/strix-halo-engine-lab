@@ -5534,7 +5534,7 @@ the stream wait before a staged exchange), `link` (host time in the exchange) an
   levers on and off, and over 200 plain tokens. The one-node dense IU4 kernels compile to the same ISA as before; only
   the column-share kernel is new.
 - **Measured gain:** two Strix Halo nodes over USB4, EXACT, code prompt, 1,200 tokens with MTP speculation: one node
-  46.76 / 46.68 tok/s, tensor parallel 58.50 tok/s in the same ticket (+25 %).
+  46.76 / 46.68 tok/s, tensor parallel 58.50 tok/s in the same run (+25 %).
 
 ### Qwen 27B pair prefill: decode relay to one node
 
