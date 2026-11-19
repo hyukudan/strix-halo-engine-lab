@@ -15,6 +15,7 @@
 #include "strix/cuda_core/attention.hpp"
 #include "strix/cuda_core/dense.hpp"
 #include "strix/cuda_core/gdn.hpp"
+#include "strix/cuda_core/gdn_chunk.hpp"
 #include "strix/cuda_core/nvfp4.hpp"
 #include "strix/cuda_core/norms.hpp"
 #include "strix/cuda_core/dense_big.hpp"
@@ -1103,9 +1104,11 @@ struct CudaEngine::Impl {
         sl.qkvc = sl.alloc<float>(static_cast<std::size_t>(C) * gd.conv_channels());
         sl.ar = sl.alloc<float>(static_cast<std::size_t>(C) * gd.value_heads);
         sl.br = sl.alloc<float>(static_cast<std::size_t>(C) * gd.value_heads);
-        if (opt.prefill_gdn == PrefillGdn::chunk16 && opt.prefill_arith != PrefillArith::exact) {  // 215 MB per slot at C = 4096
+        if (opt.prefill_gdn != PrefillGdn::serial && opt.prefill_arith != PrefillArith::exact) {  // 215 MB per slot at C = 4096
             sl.gdn_ws.floats = cc::gdn_chunk_workspace_floats(gd, C);
             sl.gdn_ws.ws = sl.alloc<float>(sl.gdn_ws.floats);
+            sl.gdn_ws.scan = static_cast<std::uint8_t>(opt.prefill_gdn == PrefillGdn::chunk16tc ? cc::gdn_chunk::Scan::tf32
+                                                                                                 : cc::gdn_chunk::Scan::f32);
         }
         sl.qg = sl.alloc<float>(static_cast<std::size_t>(C) * c.q_gate_width());
         sl.q = sl.alloc<float>(static_cast<std::size_t>(C) * c.heads * c.head_dim);
@@ -1833,7 +1836,9 @@ void print_effective_config(const EngineOptions& o, const char* arith, std::FILE
     std::fprintf(f, "  prefill-gdn: %s\n",
                  o.prefill_arith == PrefillArith::exact ? "serial (exact prefill keeps the decode windows)"
                  : o.prefill_gdn == PrefillGdn::chunk16 ? "chunk16 (FAST gdn-chunk16-f32-v1, identity -gdnc16)"
-                                                        : "serial (decode recurrence, bitwise)");
+                 : o.prefill_gdn == PrefillGdn::chunk16tc
+                     ? "chunk16tc (FAST gdn-chunk16-tf32-v1: chunk scan on TF32 tensor cores, FP32 state in registers, identity -gdnc16t)"
+                     : "serial (decode recurrence, bitwise)");
     std::fprintf(f, "  prefill-norm-fold: %s\n",
                  o.prefill_arith != PrefillArith::fast4 ? "n/a (FAST4 only)"
                  : o.prefill_norm_fold ? "on (hidden RMSNorm + chunked-GDN gated RMSNorm folded into the FAST4 quantiser, bitwise)"
