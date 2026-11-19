@@ -13,6 +13,7 @@
 //   make_chain()    -> native MTP drafter (strix::spec::ChainDrafter = shared MtpChain)
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
@@ -77,6 +78,24 @@ public:
         e_.commit(k);
         e_.sync();
     }
+    // Token tree (strix/spec/tree_window.hpp): sibling rows verified in the same window, EXACT (each row = the linear window of
+    // its path). Opt-in until measured on the device (set_tree); off = tree_rows() 0, every block linear (bitwise as before).
+    void set_tree(bool on) { tree_ = on; }
+    // decode_attn8 (FAST e4m3 shadow) has no leaf K/V index (CudaEngine::forward_tree refuses it): linear windows only.
+    [[nodiscard]] std::uint32_t tree_rows() const override {
+        return tree_ && !e_.options().decode_attn8 ? strix::cuda_core::kMaxRows : 0U;
+    }
+    void verify_tree(const strix::spec::TreeRows& rows, std::vector<std::uint32_t>& greedy) override {
+        tw_ = strix::spec::tree_window(rows);
+        const auto o = e_.forward_tree(rows.tokens.data(), tw_, LogitRows::all);
+        greedy.resize(tw_.rows);
+        e_.read_top(o, tw_.rows, greedy.data());  // synchronizes
+        if (chain_) chain_->observe_verify(o, tw_.rows);
+    }
+    void commit_path(std::span<const std::uint32_t> path) override {
+        e_.commit_path(strix::spec::path_commit(tw_, path));
+        e_.sync();
+    }
     // Prefill chunk (not a drafting step): rows at positions committed().. ; next_first = the token after the chunk when
     // it is not the last one. The last chunk returns the greedy token after the prompt (the anchor) in *top_out.
     // Feeds the MTP ring (row i's successor = tokens[i+1], the last row's = next_first / the anchor).
@@ -100,6 +119,8 @@ private:
     std::unique_ptr<Chain> chain_;
     RowsOut pending_{};              // pre-launched verify (verify_launch_fed) until verify_collect
     std::uint32_t pending_rows_ = 0;
+    bool tree_ = false;
+    strix::spec::TreeWindow tw_{};
 };
 
 }  // namespace strix::qwen35

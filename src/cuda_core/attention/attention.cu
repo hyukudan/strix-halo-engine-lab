@@ -30,6 +30,7 @@ constexpr int kValueBatch = 16;
 template <int GT>
 constexpr std::uint32_t kValueWalk = value_walk_rows(static_cast<std::uint32_t>(GT));
 
+template <bool SELF>
 __global__ void kv_store_kernel(AttentionDims d, const float* k, const float* v, __nv_bfloat16* kc, __nv_bfloat16* vc,
                                 const std::uint32_t* pos0p, RowMap rm) {
     pdl_trigger();
@@ -38,7 +39,8 @@ __global__ void kv_store_kernel(AttentionDims d, const float* k, const float* v,
     const std::uint32_t pos = rm.pos ? rm.pos[r] : *pos0p + r;
     const std::size_t so = rm.slot ? rm.slot[r] * rm.slot_stride : 0;
     const std::size_t src = (static_cast<std::size_t>(r) * d.kv_heads + h) * d.head_dim;
-    const std::size_t dst = so + (static_cast<std::size_t>(h) * d.max_positions + pos) * d.head_dim;
+    const std::uint32_t at = SELF ? rm.self[r] : pos;  // token tree: a leaf row's K/V index (strix/spec/tree_window.hpp)
+    const std::size_t dst = so + (static_cast<std::size_t>(h) * d.max_positions + at) * d.head_dim;
     for (std::uint32_t i = threadIdx.x; i < d.head_dim; i += blockDim.x) {
         kc[dst + i] = __float2bfloat16_rn(k[src + i]);
         vc[dst + i] = __float2bfloat16_rn(v[src + i]);
@@ -65,9 +67,22 @@ __host__ __device__ inline Scratch carve(float* base, const AttentionDims& d, st
 // Rows of the launch, read once per block. s_len[r] = positions attended by row r. A walk = rows r0 .. r0 + n - 1 of one
 // cache slot (rows_per_walk of the active chunk count, never across a slot: attention_row_walk.hpp); s_walk[k] = first
 // row of walk k in ascending order, s_walk[nwalks] = rows. Block-synchronised.
+// SELF (token tree, RowMap::self): a leaf row (own K/V index off its position) starts a walk and the row after it starts
+// the next one, so a leaf always walks alone (n == 1) and a shared walk never holds a leaf: the K/V row a walk loads at a
+// position is then the right key for every row of the walk, and the kernels read a lone leaf's own key from rm.self.
+template <bool SELF>
+__device__ __forceinline__ std::uint32_t leaf_walk_starts(const RowMap& rm, std::uint32_t lane, std::uint32_t rows, std::uint32_t len) {
+    if constexpr (SELF) {
+        const std::uint32_t lv = __ballot_sync(0xffffffffu, lane < rows && rm.self[lane] != len - 1);
+        return lv | (lv << 1);
+    } else {
+        return 0u;
+    }
+}
 struct RowSet {
     std::uint32_t nwalks = 0, active = 0;  // active = chunks of the longest row
 };
+template <bool SELF = false>
 __device__ __forceinline__ RowSet row_set(const std::uint32_t* pos0p, std::uint32_t rows, const RowMap& rm, const RowWalk& rw,
                                           std::uint32_t* s_len, std::uint32_t* s_walk) {
     const std::uint32_t lane = threadIdx.x & 31;
@@ -80,7 +95,8 @@ __device__ __forceinline__ RowSet row_set(const std::uint32_t* pos0p, std::uint3
     const std::uint32_t active = (longest + CH - 1) / CH;
     const std::uint32_t per = rows_per_walk(rw, active);
     const std::uint32_t prev = __shfl_up_sync(0xffffffffu, slot, 1);
-    const std::uint32_t starts = __ballot_sync(0xffffffffu, lane == 0 || slot != prev);  // first row of each cache slot
+    const std::uint32_t starts = __ballot_sync(0xffffffffu, lane == 0 || slot != prev)  // first row of each cache slot
+                                 | leaf_walk_starts<SELF>(rm, lane, rows, len);
     const std::uint32_t slot_start = 31u - static_cast<std::uint32_t>(__clz(static_cast<int>(starts & ((2u << lane) - 1u))));
     const std::uint32_t leads = __ballot_sync(0xffffffffu, lane < rows && walk_start(lane, slot_start, per));
     const std::uint32_t nwalks = static_cast<std::uint32_t>(__popc(static_cast<int>(leads)));
@@ -148,7 +164,7 @@ __device__ __forceinline__ void fold_heads(float (&mx)[GT], const float (&smx)[S
 }
 __device__ __forceinline__ float score_xor(float x, std::uint32_t off) { return __shfl_xor_sync(0xffffffffu, x, static_cast<int>(off)); }
 __device__ __forceinline__ float score_add(float a, float b) { return __fadd_rn(a, b); }
-template <int GT>
+template <int GT, bool SELF = false>
 __global__ void __launch_bounds__(256, 2) attn_scores_kernel(AttentionDims d, const float* q, GroupedView qv, const __nv_bfloat16* kc,
                                                           const std::uint32_t* pos0p, std::uint32_t rows, Scratch sc, RowMap rm,
                                                           RowWalk rw, std::uint32_t qvec) {
@@ -160,7 +176,7 @@ __global__ void __launch_bounds__(256, 2) attn_scores_kernel(AttentionDims d, co
     // is computed, so a warp waits for memory about once per batch. The batch is staged in shared memory (each lane reads
     // back only its own slots) so the position loop stays rolled.
     __shared__ uint4 kst[kScoreBatch][8][32];
-    const RowSet rs = row_set(pos0p, rows, rm, rw, s_len, s_walk);
+    const RowSet rs = row_set<SELF>(pos0p, rows, rm, rw, s_len, s_walk);
     const std::uint32_t G = d.heads / d.kv_heads, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
     const std::uint32_t mc = attn_max_chunks(d), items = item_count(rw, rs, d.kv_heads);
     const float scale = d.scale;
@@ -179,6 +195,10 @@ __global__ void __launch_bounds__(256, 2) attn_scores_kernel(AttentionDims d, co
         const std::uint32_t base = wk.chunk * CH, kvh = wk.kvh, chunk = wk.chunk;
         if (base >= wk.lmax) continue;  // block-uniform
         const __nv_bfloat16* kb = kc + (rm.slot ? rm.slot[wk.r0] * rm.slot_stride : 0) + static_cast<std::size_t>(kvh) * mp * D + lane * 8;
+        // SELF: a one-row walk reads its own key (position len - 1) at rm.self[r0] (a token-tree leaf's K/V index; a chain
+        // row's index is its position); kp() is the identity otherwise.
+        const std::uint32_t own_p = SELF && wk.n == 1u ? s_len[wk.r0] - 1u : 0xffffffffu, own = SELF ? rm.self[wk.r0] : 0u;
+        const auto kp = [&](std::uint32_t p) { return SELF && p == own_p ? own : p; };
         for (std::uint32_t i = lane; i < wk.n * GT; i += 32u) wm[i / GT][w][i % GT] = __int_as_float(0xff800000);
         __syncwarp();
         float qr[GT][8], mx[GT];
@@ -189,7 +209,7 @@ __global__ void __launch_bounds__(256, 2) attn_scores_kernel(AttentionDims d, co
 #pragma unroll
         for (int b = 0; b < kScoreBatch; ++b) {
             const std::uint32_t p = base + w + 8u * static_cast<std::uint32_t>(b);
-            u[b] = p < endw ? __ldg(reinterpret_cast<const uint4*>(kb + static_cast<std::size_t>(p) * D)) : make_uint4(0, 0, 0, 0);
+            u[b] = p < endw ? __ldg(reinterpret_cast<const uint4*>(kb + static_cast<std::size_t>(kp(p)) * D)) : make_uint4(0, 0, 0, 0);
         }
         for (std::uint32_t p0 = base + w; p0 < endw; p0 += 8u * kScoreBatch) {
 #pragma unroll
@@ -198,7 +218,7 @@ __global__ void __launch_bounds__(256, 2) attn_scores_kernel(AttentionDims d, co
 #pragma unroll
             for (int b = 0; b < kScoreBatch; ++b) {
                 const std::uint32_t p = p1 + 8u * static_cast<std::uint32_t>(b);
-                u[b] = p < endw ? __ldg(reinterpret_cast<const uint4*>(kb + static_cast<std::size_t>(p) * D)) : make_uint4(0, 0, 0, 0);
+                u[b] = p < endw ? __ldg(reinterpret_cast<const uint4*>(kb + static_cast<std::size_t>(kp(p)) * D)) : make_uint4(0, 0, 0, 0);
             }
 #pragma unroll 1
             for (std::uint32_t j = 0; j < wk.n; ++j) {
@@ -298,10 +318,14 @@ __global__ void __launch_bounds__(256, 2) attn_scores_kernel(AttentionDims d, co
 // thread reads back only its own column). Each V element is loaded once for the whole walk. Rows of a walk differ only in
 // the causal tail of the last chunk: batches below every row's count skip the per-row check. Rows j >= n (a shorter walk
 // on a wider instantiation) run on stale weights and are never stored.
-template <int GT, int NR>
+// SELF (one-row walks only, NR == 1): chunk offset own_i (the row's own position) is read from vown (rm.self).
+template <int GT, int NR, bool SELF = false>
 __device__ __forceinline__ void values_accumulate(const AttentionDims& d, const __nv_bfloat16* vp, const float (*es)[kValuePairs],
                                                   const std::uint32_t* lim, std::uint32_t n, std::uint32_t G, std::uint32_t r0,
-                                                  std::uint32_t kvh, std::uint32_t chunk, const Scratch& sc, __nv_bfloat16 (*vst)[CH]) {
+                                                  std::uint32_t kvh, std::uint32_t chunk, const Scratch& sc, __nv_bfloat16 (*vst)[CH],
+                                                  std::uint32_t own_i = 0xffffffffu, const __nv_bfloat16* vown = nullptr) {
+    static_assert(!SELF || NR == 1, "a token-tree leaf walks alone");
+    const auto vat = [&](std::uint32_t i) { return SELF && i == own_i ? *vown : vp[static_cast<std::size_t>(i) * D]; };
     constexpr int M = GT * NR, MV = (M + 3) / 4;
     static_assert(MV * 4 <= static_cast<int>(kValuePairs), "walk weights exceed the shared row");
     const std::uint32_t t = threadIdx.x, mc = attn_max_chunks(d);
@@ -320,7 +344,7 @@ __device__ __forceinline__ void values_accumulate(const AttentionDims& d, const 
     const __nv_bfloat16 vzero = __ushort_as_bfloat16(static_cast<unsigned short>(0));
     __nv_bfloat16 u[kValueBatch];
 #pragma unroll
-    for (int b = 0; b < kValueBatch; ++b) u[b] = static_cast<std::uint32_t>(b) < n_hi ? vp[static_cast<std::size_t>(b) * D] : vzero;
+    for (int b = 0; b < kValueBatch; ++b) u[b] = static_cast<std::uint32_t>(b) < n_hi ? vat(static_cast<std::uint32_t>(b)) : vzero;
     for (std::uint32_t i0 = 0; i0 < n_hi; i0 += kValueBatch) {
 #pragma unroll
         for (int b = 0; b < kValueBatch; ++b) vst[b][t] = u[b];
@@ -328,7 +352,7 @@ __device__ __forceinline__ void values_accumulate(const AttentionDims& d, const 
 #pragma unroll
         for (int b = 0; b < kValueBatch; ++b) {
             const std::uint32_t i = i1 + static_cast<std::uint32_t>(b);
-            u[b] = i < n_hi ? vp[static_cast<std::size_t>(i) * D] : vzero;
+            u[b] = i < n_hi ? vat(i) : vzero;
         }
         const std::uint32_t nb = min(n_hi - i0, static_cast<std::uint32_t>(kValueBatch));
         if (i0 + nb <= n_lo) {
@@ -375,7 +399,7 @@ __device__ __forceinline__ void values_accumulate(const AttentionDims& d, const 
 // block tree of block_sum256 (warp xor butterfly, then the 8 warp sums added in order 0..7; thread t holds position
 // base + t), here run for every pair of the walk with one barrier; chunk value partial = sum over the chunk positions
 // ascending of e_p * v[p][t] (separate rounded mul, add).
-template <int GT>
+template <int GT, bool SELF = false>
 __global__ void __launch_bounds__(256, 2) attn_values_kernel(AttentionDims d, const __nv_bfloat16* vc, const std::uint32_t* pos0p,
                                                           std::uint32_t rows, Scratch sc, RowMap rm, RowWalk rw) {
     pdl_trigger();
@@ -387,7 +411,7 @@ __global__ void __launch_bounds__(256, 2) attn_values_kernel(AttentionDims d, co
     __shared__ std::uint32_t lim[WR];
     __shared__ __align__(16) float es[CH][kValuePairs];
     __shared__ __nv_bfloat16 vst[kValueBatch][CH];
-    const RowSet rs = row_set(pos0p, rows, rm, rw, s_len, s_walk);
+    const RowSet rs = row_set<SELF>(pos0p, rows, rm, rw, s_len, s_walk);
     const std::uint32_t G = d.heads / d.kv_heads, t = threadIdx.x, lane = t & 31, w = t >> 5;
     const std::uint32_t mc = attn_max_chunks(d), items = item_count(rw, rs, d.kv_heads);
     for (std::uint32_t it = rw.adjacent ? blockIdx.x : 0u; it < items; it += rw.adjacent ? gridDim.x : 1u) {
@@ -460,6 +484,15 @@ __global__ void __launch_bounds__(256, 2) attn_values_kernel(AttentionDims d, co
             }
         }
         const __nv_bfloat16* vp = vcs + (static_cast<std::size_t>(kvh) * d.max_positions + base) * D + t;
+        if constexpr (SELF) {
+            if (n <= 1) {  // token tree: the row's own value (chunk offset len - 1 - base) at rm.self[r0]
+                const std::uint32_t own_p = s_len[wk.r0] - 1u;
+                const __nv_bfloat16* vown = vcs + (static_cast<std::size_t>(kvh) * d.max_positions + rm.self[wk.r0]) * D + t;
+                values_accumulate<GT, 1, true>(d, vp, es, lim, n, G, wk.r0, kvh, chunk, sc, vst, own_p - base, vown);
+                __syncthreads();  // es / red / lim / vst of the next item
+                continue;
+            }
+        }
         if (n <= 1) values_accumulate<GT, 1>(d, vp, es, lim, n, G, wk.r0, kvh, chunk, sc, vst);
         else if (n <= 2) values_accumulate<GT, 2>(d, vp, es, lim, n, G, wk.r0, kvh, chunk, sc, vst);
         else if (n <= 3 || WR < 6) values_accumulate<GT, 3>(d, vp, es, lim, n, G, wk.r0, kvh, chunk, sc, vst);
@@ -490,7 +523,7 @@ __global__ void __launch_bounds__(256) attn_combine_kernel(AttentionDims d, cons
 // Occupancy floor of the shared plan and size of the shared-walk grid: two waves of resident blocks of `kernel` on the
 // current device (SM count and the kernel's real occupancy, read once per device and kernel). 0 = unknown: the caller keeps
 // one row per block.
-constexpr int kWaveKernels = 6;  // scores / values x group widths 4 / 6 / 8
+constexpr int kWaveKernels = 12;  // scores / values x group widths 4 / 6 / 8 x SELF (token tree)
 std::uint32_t two_waves(const void* kernel, int which) {
     constexpr int kDevices = 64;
     static std::atomic<std::uint32_t> cache[kDevices][kWaveKernels];
@@ -542,7 +575,7 @@ const attn_row_share::DeviceTable* row_share_table(const AttentionDims& d) {
 constexpr std::uint8_t kRowShareUnset = 0xffu;  // not set yet: the first decode_row_share() reads the switch
 std::atomic<std::uint8_t> g_row_share{kRowShareUnset};
 
-template <int GT>
+template <int GT, bool SELF>
 cudaError_t decode_attention(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate, const GroupedView& gv,
                              const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache, const std::uint32_t* pos0, std::uint32_t rows,
                              float* out, const Scratch& sc, cudaStream_t stream, const RowMap& rm, int which) {
@@ -558,8 +591,9 @@ cudaError_t decode_attention(const AttentionDims& d, const float* q, const Group
     const attn_row_share::DeviceTable* table = mode == DecodeRowShare::automatic ? row_share_table(d) : nullptr;
     const std::uint32_t cs = walk_cap(mode, table, rows, kScoreWalkRows), cv = walk_cap(mode, table, rows, value_walk_rows(GT));
     if (cs > 1 && cv > 1) {
-        const std::uint32_t fs = two_waves(reinterpret_cast<const void*>(attn_scores_kernel<GT>), which);
-        const std::uint32_t fv = two_waves(reinterpret_cast<const void*>(attn_values_kernel<GT>), which + 3);
+        const int ws = which + (SELF ? 6 : 0);  // the SELF instantiations have their own occupancy
+        const std::uint32_t fs = two_waves(reinterpret_cast<const void*>(attn_scores_kernel<GT, SELF>), ws);
+        const std::uint32_t fv = two_waves(reinterpret_cast<const void*>(attn_values_kernel<GT, SELF>), ws + 3);
         if (fs != 0 && fv != 0) {
             rs = row_walk(mode, rows, d.kv_heads, mc, cs, fs);
             rv = row_walk(mode, rows, d.kv_heads, mc, cv, fv);
@@ -568,9 +602,9 @@ cudaError_t decode_attention(const AttentionDims& d, const float* q, const Group
             if (rv.adjacent) gvd = dim3(min(cap, fv));
         }
     }
-    if (auto e = launch_pdl(attn_scores_kernel<GT>, gs, dim3(256), stream, d, q, qv, k_cache, pos0, rows, sc, rm, rs, qvec); e != cudaSuccess)
+    if (auto e = launch_pdl(attn_scores_kernel<GT, SELF>, gs, dim3(256), stream, d, q, qv, k_cache, pos0, rows, sc, rm, rs, qvec); e != cudaSuccess)
         return e;
-    if (auto e = launch_pdl(attn_values_kernel<GT>, gvd, dim3(256), stream, d, v_cache, pos0, rows, sc, rm, rv); e != cudaSuccess)
+    if (auto e = launch_pdl(attn_values_kernel<GT, SELF>, gvd, dim3(256), stream, d, v_cache, pos0, rows, sc, rm, rv); e != cudaSuccess)
         return e;
     return launch_pdl(attn_combine_kernel, dim3(d.heads, rows), dim3(256), stream, d, gate, gv, pos0, out, sc, rm);
 }
@@ -591,7 +625,7 @@ DecodeRowShare decode_row_share() {
 cudaError_t kv_store(const AttentionDims& d, const float* k, const float* v, __nv_bfloat16* k_cache, __nv_bfloat16* v_cache,
                      const std::uint32_t* pos0, std::uint32_t rows, cudaStream_t stream, const RowMap& rm) {
     if (rows == 0) return cudaErrorInvalidValue;
-    return launch_pdl(kv_store_kernel, dim3(d.kv_heads, rows), dim3(256), stream, d, k, v, k_cache, v_cache, pos0, rm);
+    return launch_pdl(rm.self ? kv_store_kernel<true> : kv_store_kernel<false>, dim3(d.kv_heads, rows), dim3(256), stream, d, k, v, k_cache, v_cache, pos0, rm);
 }
 
 cudaError_t attention_decode(const AttentionDims& d, const float* q, const GroupedView& qv, const float* gate,
@@ -600,11 +634,38 @@ cudaError_t attention_decode(const AttentionDims& d, const float* q, const Group
     if (d.head_dim != 256 || rows == 0 || rows > kMaxRows || d.kv_heads == 0 || d.heads % d.kv_heads != 0 || d.heads / d.kv_heads > 8)
         return cudaErrorInvalidValue;
     const Scratch sc = carve(scratch, d, rows);
-    switch (attn_group_width(d.heads / d.kv_heads)) {
-        case 4: return decode_attention<4>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 0);
-        case 6: return decode_attention<6>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 1);
-        default: return decode_attention<8>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 2);
+    if (rm.self != nullptr) {  // token tree (RowMap::self): leaf rows walk alone and read their own K/V there
+        switch (attn_group_width(d.heads / d.kv_heads)) {
+            case 4: return decode_attention<4, true>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 0);
+            case 6: return decode_attention<6, true>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 1);
+            default: return decode_attention<8, true>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 2);
+        }
     }
+    switch (attn_group_width(d.heads / d.kv_heads)) {
+        case 4: return decode_attention<4, false>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 0);
+        case 6: return decode_attention<6, false>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 1);
+        default: return decode_attention<8, false>(d, q, qv, gate, gv, k_cache, v_cache, pos0, rows, out, sc, stream, rm, 2);
+    }
+}
+
+namespace {
+__global__ void kv_move_row_kernel(AttentionDims d, KvLayerCaches c, std::uint32_t from, std::uint32_t to) {
+    const std::uint32_t h = blockIdx.x, l = blockIdx.y;
+    const std::size_t src = (static_cast<std::size_t>(h) * d.max_positions + from) * d.head_dim;
+    const std::size_t dst = (static_cast<std::size_t>(h) * d.max_positions + to) * d.head_dim;
+    for (std::uint32_t i = threadIdx.x; i < d.head_dim; i += blockDim.x) {
+        c.k[l][dst + i] = c.k[l][src + i];
+        c.v[l][dst + i] = c.v[l][src + i];
+    }
+}
+}  // namespace
+
+cudaError_t kv_move_row(const AttentionDims& d, const KvLayerCaches& caches, std::uint32_t layers, std::uint32_t from, std::uint32_t to,
+                        cudaStream_t stream) {
+    if (layers > kMaxKvMoveLayers || from >= d.max_positions || to >= d.max_positions) return cudaErrorInvalidValue;
+    if (layers == 0 || from == to) return cudaSuccess;
+    kv_move_row_kernel<<<dim3(d.kv_heads, layers), dim3(256), 0, stream>>>(d, caches, from, to);
+    return cudaGetLastError();
 }
 
 }  // namespace strix::cuda_core

@@ -24,6 +24,7 @@
 #include "strix/qwen35/config.hpp"
 #include "strix/split_k_policy.hpp"
 #include "strix/qwen35/engine_types.hpp"
+#include "strix/spec/tree_window.hpp"
 
 namespace strix::spec { class DraftRows; }
 
@@ -196,6 +197,10 @@ public:
     [[nodiscard]] bool prefill_is_big() const;  // whether prefill() takes the large-M path for this engine
     // Accepts the first k rows of the last forward_rows window (0 <= k <= rows). Async on stream().
     void commit(std::uint32_t k);
+    // Token tree (strix/spec/tree_window.hpp): the rows of `tree` (tokens[tree.rows]) in one window; each row gets the bits a
+    // linear window of its own path gives (EXACT). Accept with commit_path (commit(k) refuses a tree window). Async on stream().
+    RowsOut forward_tree(const std::uint32_t* tokens, const strix::spec::TreeWindow& tree, LogitRows want = LogitRows::all);
+    void commit_path(const strix::spec::PathCommit& pc);
 
     // MTP layer (single full-attention block with its own KV; positions are explicit, no hidden state to commit).
     // Row r runs at position pos0 + r with input token next_tokens[r] (the token FOLLOWING the hidden's position) and

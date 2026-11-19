@@ -26,10 +26,13 @@ __device__ __forceinline__ float block_sum128(float v, float* smem) {
 // issue order changes: every row's raw value is loaded before the first use (one round trip instead of n dependent ones) and
 // the n head sums share one barrier pair (instead of n). s0..s2 carry the taps to the next batch.
 constexpr int kConvBatch = 16;  // decode window rows per batch (prefill blocks use 8: no spill at its address terms)
-template <int B>
+// TREE (token-tree window, strix/spec/tree_window.hpp): a row whose bit is set in `leaf` (window rows < 32) computes its output
+// from the current taps and does not shift them (the next row's parent is the last non-leaf row).
+template <int B, bool TREE = false>
 __device__ __forceinline__ void conv_rows(float w0, float w1, float w2, float w3, float& s0, float& s1, float& s2,
                                           const float* __restrict__ raw, float* qc, std::uint32_t channels, std::uint32_t c,
-                                          std::uint32_t r, std::uint32_t n, bool qk, float scale, float (*red)[4]) {
+                                          std::uint32_t r, std::uint32_t n, bool qk, float scale, float (*red)[4],
+                                          std::uint32_t leaf = 0) {
     float xv[B], yv[B];
 #pragma unroll
     for (int i = 0; i < B; ++i)
@@ -48,7 +51,8 @@ __device__ __forceinline__ void conv_rows(float w0, float w1, float w2, float w3
             sum = __fadd_rn(sum, __fmul_rn(w2, s2));
             sum = __fadd_rn(sum, __fmul_rn(w3, xv[i]));
             yv[i] = cc_silu(sum);
-            const bool on = static_cast<std::uint32_t>(i) < n;
+            bool on = static_cast<std::uint32_t>(i) < n;
+            if constexpr (TREE) on = on && ((leaf >> (r + static_cast<std::uint32_t>(i))) & 1u) == 0u;
             s0 = on ? s1 : s0;
             s1 = on ? s2 : s1;
             s2 = on ? xv[i] : s2;
@@ -85,10 +89,11 @@ __device__ __forceinline__ void conv_rows(float w0, float w1, float w2, float w3
 
 // Block = 128 channels. Blocks [0, qk_blocks) are q/k heads (conv + silu + l2norm); the rest are v channels (conv + silu).
 // tap order oldest first: ((0 + w0 s0) + w1 s1) + w2 s2) + w3 x. The conv state is read-only here.
+template <bool TREE>
 __global__ void __launch_bounds__(128) conv_pre_kernel(const float* __restrict__ w, const float* __restrict__ conv_state,
                                                        const float* __restrict__ raw, float* qc, std::uint32_t channels,
                                                        std::uint32_t rows, std::uint32_t q_blocks, std::uint32_t qk_blocks,
-                                                       float qscale, GdnSlotTable st) {
+                                                       float qscale, GdnSlotTable st, const std::uint32_t* leafp) {
     __shared__ float red[kConvBatch][4];
     if (st.row0) {  // multi-session: this block's group (blockIdx.y)
         pdl_wait();
@@ -103,11 +108,13 @@ __global__ void __launch_bounds__(128) conv_pre_kernel(const float* __restrict__
     float s0 = conv_state[c * 3], s1 = conv_state[c * 3 + 1], s2 = conv_state[c * 3 + 2];  // committed state: written only outside the graph
     pdl_wait();
     pdl_trigger();  // after the wait: at most one dependent grid waits ahead of the running one
+    std::uint32_t leaf = 0;
+    if constexpr (TREE) leaf = *leafp;  // written by the window's input kernel (complete after the wait)
     const bool qk = blockIdx.x < qk_blocks;
     const float scale = blockIdx.x < q_blocks ? qscale : 1.0f;
     constexpr std::uint32_t kB = kConvBatch;
     for (std::uint32_t r = 0; r < rows; r += kB)
-        conv_rows<kConvBatch>(w0, w1, w2, w3, s0, s1, s2, raw, qc, channels, c, r, min(kB, rows - r), qk, scale, red);
+        conv_rows<kConvBatch, TREE>(w0, w1, w2, w3, s0, s1, s2, raw, qc, channels, c, r, min(kB, rows - r), qk, scale, red, leaf);
 }
 
 // Row-parallel form of conv_pre_kernel for prefill chunks (the same conv_rows body): block (128 channels, kConvRows rows).
@@ -151,9 +158,13 @@ struct CommitBatch {
     DeltaArgs a[kMaxGdnLayers];
 };
 
-template <bool OUT>
+// TREE (token-tree window / path replay, strix/spec/tree_window.hpp): a row whose bit is set in `leaf` does not change S. With OUT
+// it runs the same row code (the bits a linear window gives that row) between a backup of S to `bk` (shared memory) and its
+// restore; without OUT (commit replay) the row is skipped.
+template <bool OUT, bool TREE = false>
 __device__ __forceinline__ void delta_body(const DeltaArgs& a, const GdnDims& d, std::uint32_t rows, std::uint32_t parity,
-                                           std::uint32_t h, float eps) {
+                                           std::uint32_t h, float eps, std::uint32_t leaf = 0,
+                                           const std::uint32_t* leafp = nullptr, float* bk = nullptr) {
     constexpr int K = 128;
     __shared__ float ks[K], qs[K];
     __shared__ float red[4];
@@ -168,6 +179,9 @@ __device__ __forceinline__ void delta_body(const DeltaArgs& a, const GdnDims& d,
 #pragma unroll
     for (int k = 0; k < K; ++k) S[k] = sp[static_cast<std::size_t>(k) * d.value_dim];
     pdl_wait();
+    if constexpr (TREE) {
+        if (leafp) leaf = *leafp;  // device mask written by the window's input kernel (complete after the wait)
+    }
     const float dtb = a.dt_bias[h], sa = a.ssm_a[h];
     // row inputs are prefetched one row ahead (loads only: the arithmetic and its order are unchanged)
     float c_ks = 0.f, c_qs = 0.f, c_v = 0.f, c_b = 0.f, c_a = 0.f, c_z = 0.f;
@@ -194,6 +208,22 @@ __device__ __forceinline__ void delta_body(const DeltaArgs& a, const GdnDims& d,
         const float decay = cc_expf(g);
         __syncthreads();
         if (r + 1 < rows) fetch(r + 1);
+        bool leaf_row = false;
+        if constexpr (TREE) {
+            leaf_row = ((leaf >> r) & 1u) != 0u;  // block-uniform
+            if (leaf_row) {
+                if constexpr (!OUT) {  // path replay: a skipped leaf
+                    __syncthreads();
+                    continue;
+                } else {
+                    // The leaf runs the row code below unchanged (same instructions, same bits) and S is restored after it.
+                    // Keeping S intact instead (S*decay as new values) needs > 255 registers and spilled; the backup is
+                    // 128 x 128 floats of dynamic shared memory (the window has one block per value head, <= 1 per SM).
+#pragma unroll
+                    for (int k = 0; k < K; ++k) bk[k * 128 + t] = S[k];
+                }
+            }
+        }
         float kv = 0.0f;
 #pragma unroll
         for (int k = 0; k < K; ++k) {
@@ -218,6 +248,12 @@ __device__ __forceinline__ void delta_body(const DeltaArgs& a, const GdnDims& d,
             v = __fmul_rn(v, a.gain[t]);
             v = __fmul_rn(v, cc_silu(zv));
             a.out[static_cast<std::size_t>(r) * d.v_width() + h * d.value_dim + t] = v;
+            if constexpr (TREE) {
+                if (leaf_row) {
+#pragma unroll
+                    for (int k = 0; k < K; ++k) S[k] = bk[k * 128 + t];
+                }
+            }
         } else {
 #pragma unroll
             for (int k = 0; k < K; ++k) S[k] = __fadd_rn(S[k], __fmul_rn(ks[k], dl));
@@ -253,6 +289,12 @@ __global__ void __launch_bounds__(128) delta_window_kernel(DeltaArgs a, GdnDims 
         return;
     }
     delta_body<true>(a, d, rows, *parity, blockIdx.x, eps);
+}
+
+__global__ void __launch_bounds__(128) delta_window_tree_kernel(DeltaArgs a, GdnDims d, std::uint32_t rows,
+                                                                const std::uint32_t* parity, float eps, const std::uint32_t* leafp) {
+    extern __shared__ float leaf_backup[];  // [128 k][128 t]: S of a leaf row's parent (delta_body TREE)
+    delta_body<true, true>(a, d, rows, *parity, blockIdx.x, eps, 0u, leafp, leaf_backup);
 }
 
 // Partial accept for multi-session: re-apply the first accept[g] rows (0 < accept < nrows) of group g for layer blockIdx.y.
@@ -297,14 +339,24 @@ __global__ void __launch_bounds__(128) delta_apply_kernel(CommitBatch b, GdnDims
     delta_body<false>(b.a[blockIdx.y], d, rows, *parity, blockIdx.x, 0.0f);
 }
 
-// conv state after accepting the first k raw rows: the last three of (s0, s1, s2, raw_0 .. raw_{k-1}).
-__global__ void __launch_bounds__(128) conv_commit_kernel(CommitBatch b, std::uint32_t channels, std::uint32_t k) {
+// Token-tree path replay: rows [0, rows) except the `skip` rows (leaves not on the accepted path).
+__global__ void __launch_bounds__(128) delta_apply_tree_kernel(CommitBatch b, GdnDims d, std::uint32_t rows,
+                                                               const std::uint32_t* parity, std::uint32_t skip) {
+    delta_body<false, true>(b.a[blockIdx.y], d, rows, *parity, blockIdx.x, 0.0f, skip);
+}
+
+// conv state after accepting raw rows: the last three of (s0, s1, s2, accepted raw rows). src[i] = raw row index of the new tap
+// i, or -3..-1 = old state tap src[i] + 3 (linear accept of k rows: src = k-3, k-2, k-1).
+struct ConvSrc {
+    int i[3];
+};
+__global__ void __launch_bounds__(128) conv_commit_kernel(CommitBatch b, std::uint32_t channels, ConvSrc src) {
     const DeltaArgs& a = b.a[blockIdx.y];
     const std::uint32_t c = blockIdx.x * 128 + threadIdx.x;
     const float s[3] = {a.conv[c * 3], a.conv[c * 3 + 1], a.conv[c * 3 + 2]};
     float n[3];
     for (int i = 0; i < 3; ++i) {
-        const int idx = static_cast<int>(k) - 3 + i;  // index into raw rows; negative = old state
+        const int idx = src.i[i];  // index into raw rows; negative = old state
         n[i] = idx >= 0 ? a.raw[static_cast<std::size_t>(idx) * channels + c] : s[idx + 3];
     }
     a.conv[c * 3] = n[0];
@@ -317,16 +369,28 @@ __global__ void flip_kernel(std::uint32_t* p) { *p ^= 1u; }
 }  // namespace
 
 cudaError_t gdn_window(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
-                       float* out, std::uint32_t rows, float eps, const std::uint32_t* parity_dev, cudaStream_t stream) {
+                       float* out, std::uint32_t rows, float eps, const std::uint32_t* parity_dev, cudaStream_t stream,
+                       const std::uint32_t* leaf_dev) {
     if (d.key_dim != 128 || d.value_dim != 128 || d.conv_kernel != 4 || rows == 0 || rows > kMaxRows) return cudaErrorInvalidValue;
     const std::uint32_t C = d.conv_channels();
     const float qscale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d.key_dim)));
-    if (auto e = launch_pdl(conv_pre_kernel, dim3(C / 128), dim3(128), stream, layer.conv_w, state.conv, win.raw, win.qkv_c, C, rows,
-                            d.key_heads, 2 * d.key_heads, qscale, GdnSlotTable{});
+    if (auto e = leaf_dev ? launch_pdl(conv_pre_kernel<true>, dim3(C / 128), dim3(128), stream, layer.conv_w, state.conv, win.raw,
+                                       win.qkv_c, C, rows, d.key_heads, 2 * d.key_heads, qscale, GdnSlotTable{}, leaf_dev)
+                          : launch_pdl(conv_pre_kernel<false>, dim3(C / 128), dim3(128), stream, layer.conv_w, state.conv, win.raw,
+                                       win.qkv_c, C, rows, d.key_heads, 2 * d.key_heads, qscale, GdnSlotTable{},
+                                       static_cast<const std::uint32_t*>(nullptr));
         e != cudaSuccess)
         return e;
     DeltaArgs a{state.delta_base, win.qkv_c, win.a_raw, win.b_raw, layer.ssm_a, layer.dt_bias, layer.norm_gain, z, out,
                 nullptr, nullptr};
+    if (leaf_dev) {
+        constexpr std::size_t kBackup = 128u * 128u * sizeof(float);  // 64 KiB > the 48 KiB default: opt in once
+        static const cudaError_t attr = cudaFuncSetAttribute(delta_window_tree_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                             static_cast<int>(kBackup));
+        if (attr != cudaSuccess) return attr;
+        return launch_pdl_smem(delta_window_tree_kernel, dim3(d.value_heads), dim3(128), kBackup, stream, a, d, rows, parity_dev, eps,
+                               leaf_dev);
+    }
     return launch_pdl(delta_window_kernel, dim3(d.value_heads), dim3(128), stream, a, d, rows, parity_dev, eps, GdnSlotTable{});
 }
 
@@ -335,8 +399,8 @@ cudaError_t gdn_window_slots(const GdnDims& d, const GdnLayer& layer, const GdnS
     if (d.key_dim != 128 || d.value_dim != 128 || d.conv_kernel != 4 || groups == 0 || groups > kMaxRows || !t.row0) return cudaErrorInvalidValue;
     const std::uint32_t C = d.conv_channels();
     const float qscale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d.key_dim)));
-    if (auto e = launch_pdl(conv_pre_kernel, dim3(C / 128, groups), dim3(128), stream, layer.conv_w, state.conv, win.raw, win.qkv_c, C,
-                            0u, d.key_heads, 2 * d.key_heads, qscale, t);
+    if (auto e = launch_pdl(conv_pre_kernel<false>, dim3(C / 128, groups), dim3(128), stream, layer.conv_w, state.conv, win.raw, win.qkv_c, C,
+                            0u, d.key_heads, 2 * d.key_heads, qscale, t, static_cast<const std::uint32_t*>(nullptr));
         e != cudaSuccess)
         return e;
     DeltaArgs a{state.delta_base, win.qkv_c, win.a_raw, win.b_raw, layer.ssm_a, layer.dt_bias, layer.norm_gain, z, out,
@@ -364,10 +428,12 @@ cudaError_t gdn_commit_slots(const GdnDims& d, const GdnCommitLayer* layers, std
     return cudaGetLastError();
 }
 
-cudaError_t gdn_commit(const GdnDims& d, const GdnCommitLayer* layers, std::uint32_t n, std::uint32_t window_rows,
-                       std::uint32_t k, std::uint32_t* parity_dev, cudaStream_t stream) {
-    if (n == 0 || n > kMaxGdnLayers || k > window_rows) return cudaErrorInvalidValue;
-    if (k == 0) return cudaSuccess;
+cudaError_t gdn_commit_path(const GdnDims& d, const GdnCommitLayer* layers, std::uint32_t n, std::uint32_t window_rows,
+                            std::uint32_t end, std::uint32_t skip, bool replay, std::uint32_t* parity_dev, cudaStream_t stream) {
+    if (n == 0 || n > kMaxGdnLayers || end > window_rows || window_rows > kMaxRows) return cudaErrorInvalidValue;
+    if (end > 0 && (skip >> (end - 1) & 1u)) return cudaErrorInvalidValue;  // the path's last row is never skipped
+    if (end == 0) return cudaSuccess;
+    if (end < 32) skip &= (1u << end) - 1u;
     CommitBatch b{};
     for (std::uint32_t i = 0; i < n; ++i) {
         const auto& L = layers[i];
@@ -375,14 +441,30 @@ cudaError_t gdn_commit(const GdnDims& d, const GdnCommitLayer* layers, std::uint
                            nullptr, nullptr, nullptr, L.state.conv, L.win.raw};
     }
     const std::uint32_t C = d.conv_channels();
-    if (k < window_rows) {
-        delta_apply_kernel<<<dim3(d.value_heads, n), 128, 0, stream>>>(b, d, k, parity_dev);
+    if (replay) {
+        if (skip) delta_apply_tree_kernel<<<dim3(d.value_heads, n), 128, 0, stream>>>(b, d, end, parity_dev, skip);
+        else delta_apply_kernel<<<dim3(d.value_heads, n), 128, 0, stream>>>(b, d, end, parity_dev);
         if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
     }
-    conv_commit_kernel<<<dim3(C / 128, n), 128, 0, stream>>>(b, C, k);
+    // new taps = the last three of (old taps -3..-1, accepted rows of [0, end) in order)
+    ConvSrc src{{-3, -2, -1}};
+    for (std::uint32_t r = 0; r < end; ++r) {
+        if (skip >> r & 1u) continue;
+        src.i[0] = src.i[1];
+        src.i[1] = src.i[2];
+        src.i[2] = static_cast<int>(r);
+    }
+    conv_commit_kernel<<<dim3(C / 128, n), 128, 0, stream>>>(b, C, src);
     if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
     flip_kernel<<<1, 1, 0, stream>>>(parity_dev);
     return cudaGetLastError();
+}
+
+cudaError_t gdn_commit(const GdnDims& d, const GdnCommitLayer* layers, std::uint32_t n, std::uint32_t window_rows,
+                       std::uint32_t k, std::uint32_t* parity_dev, cudaStream_t stream) {
+    if (n == 0 || n > kMaxGdnLayers || k > window_rows) return cudaErrorInvalidValue;
+    if (k == 0) return cudaSuccess;
+    return gdn_commit_path(d, layers, n, window_rows, k, 0u, k < window_rows, parity_dev, stream);
 }
 
 cudaError_t gdn_prefill_layer(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
@@ -410,7 +492,8 @@ cudaError_t gdn_prefill_layer(const GdnDims& d, const GdnLayer& layer, const Gdn
     }
     CommitBatch b{};
     b.a[0] = DeltaArgs{state.delta_base, win.qkv_c, win.a_raw, win.b_raw, layer.ssm_a, layer.dt_bias, nullptr, nullptr, nullptr, state.conv, win.raw};
-    conv_commit_kernel<<<dim3(C / 128, 1), 128, 0, stream>>>(b, C, rows);
+    const int ir = static_cast<int>(rows);  // chunk end: the last three raw rows (negative = old taps)
+    conv_commit_kernel<<<dim3(C / 128, 1), 128, 0, stream>>>(b, C, ConvSrc{{ir - 3, ir - 2, ir - 1}});
     return cudaGetLastError();
 }
 

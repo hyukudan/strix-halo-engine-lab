@@ -74,7 +74,7 @@ double quantile(std::vector<double> v, double p) {
 }
 // One spec arm: controller form, draft head, chain cap (see --arms).
 struct ArmSpec { std::string tag; std::uint32_t frontier = 8; bool continuation = true; double loss = 0.05; bool subset = false; std::uint32_t cap = 7;
-                 bool fixed = false; };
+                 bool fixed = false; bool tree = false; };
 ArmSpec parse_arm(const std::string& name, std::uint32_t chain_k) {
     ArmSpec a;
     a.cap = chain_k;
@@ -86,10 +86,11 @@ ArmSpec parse_arm(const std::string& name, std::uint32_t chain_k) {
         return a;
     }
     std::string base = name;
+    if (base.size() > 1 && base.back() == 't') { a.tree = true; base.pop_back(); }  // token-tree verify (sibling rows)
     if (base.size() > 1 && base.back() == 'd') { a.fixed = true; base.pop_back(); }  // fixed cost model (--cost-model)
     if (base.size() > 2 && base.compare(base.size() - 2, 2, "15") == 0) { a.cap = 15; base.resize(base.size() - 2); }
     if (base == "sub") a.subset = true;
-    else if (base != "new") throw std::runtime_error("--arms: N, new, sub, new15 or sub15, each optionally + d (got " + name + ")");
+    else if (base != "new") throw std::runtime_error("--arms: N, new, sub, new15 or sub15, each optionally + d, then + t (got " + name + ")");
     a.frontier = sp::ArbiterConfig{}.frontier_every;
     a.loss = sp::ArbiterConfig{}.frontier_loss;
     a.tag = name;
@@ -119,6 +120,9 @@ int main(int argc, char** argv) {
         //   --cost-kv online|off|KV = the context cost of those arms (spec::set_context_cost, shared with every binder):
         //   online (default) fits it from this device's verify walls (ArbiterConfig::cost_fit), off = context-blind seeds
         //   (the previous form), KV = fixed ms per verify row per 1,024 context positions (deterministic A/B).
+        //   A final "t" (subt, sub15dt, ...) = token-tree verify: the engine verifies sibling rows (strix/spec/tree_window.hpp,
+        //   EXACT) and the controller places the MTP runner-up beside a chain node where its cost rule pays; without "t" every
+        //   block is linear (the runner-up probe still records q per depth).
         double cm_v1 = 13.30, cm_vrow = 0.113, cm_da = 0.370, cm_db = 0.454;
         std::string cost_kv = "online";
         std::vector<std::string> arms{"new"};
@@ -382,6 +386,7 @@ int main(int argc, char** argv) {
                 prefill(anchor);
                 warm();
                 sp::BlockConfig bc;
+                S.set_tree(arm.tree);
                 bc.arbiter.frontier_every = arm.frontier;
                 bc.arbiter.model_continuation = arm.continuation;
                 bc.arbiter.frontier_loss = arm.loss;

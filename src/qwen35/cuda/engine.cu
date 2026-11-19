@@ -283,9 +283,24 @@ struct InputPack {
     std::uint32_t pos0;
     std::uint32_t ids[cc::kMaxRows];
 };
-__global__ void set_inputs_kernel(InputPack in, std::uint32_t* pos, std::uint32_t* ids) {
+// Token-tree window descriptor (strix/spec/tree_window.hpp), absolute: tree[0] = leaf mask, tree[1 + r] = position of row r,
+// tree[1 + 32 + r] = K/V index of row r. Written by the same input launch (tree == nullptr: linear window, nothing written).
+struct TreePack {
+    std::uint32_t leaf;
+    std::uint32_t pos[cc::kMaxRows];
+    std::uint32_t idx[cc::kMaxRows];
+};
+constexpr std::uint32_t kTreeWords = 1 + 2 * cc::kMaxRows;
+__global__ void set_inputs_kernel(InputPack in, std::uint32_t* pos, std::uint32_t* ids, TreePack tp, std::uint32_t* tree) {
     if (threadIdx.x == 0) *pos = in.pos0;
     if (threadIdx.x < cc::kMaxRows) ids[threadIdx.x] = in.ids[threadIdx.x];
+    if (tree) {
+        if (threadIdx.x == 0) tree[0] = tp.leaf;
+        if (threadIdx.x < cc::kMaxRows) {
+            tree[1 + threadIdx.x] = tp.pos[threadIdx.x];
+            tree[1 + cc::kMaxRows + threadIdx.x] = tp.idx[threadIdx.x];
+        }
+    }
 }
 __global__ void zero_u32_kernel(std::uint32_t* p) { *p = 0; }
 // Draft head output. Subset head (group_of set): compact row -> token id (slot group_of[row / group], row % group), in place
@@ -381,6 +396,11 @@ struct CudaEngine::Impl {
           *ao = nullptr, *hid = nullptr, *logits = nullptr, *scratch = nullptr, *cos_t = nullptr, *sin_t = nullptr;
     float *mx = nullptr, *mxn = nullptr, *mcat = nullptr, *mtmp = nullptr, *mlogits = nullptr;
     std::uint32_t *d_ids = nullptr, *d_pos = nullptr, *d_top = nullptr, *d_parity = nullptr;
+    std::uint32_t* d_tree = nullptr;  // token-tree window descriptor (TreePack, absolute positions / K/V indices)
+    bool tree_mode = false;           // the trunk being run / captured verifies a token tree
+    bool last_tree = false;           // the last window was a tree (commit_path accepts it; commit(k) refuses)
+    cc::KvLayerCaches kv_layers{};    // attention-layer caches for the tree commit's K/V row move
+    std::uint32_t kv_layer_n = 0;
     void* d_argws = nullptr;
     std::uint32_t *d_mids = nullptr, *d_mpos = nullptr, *d_mtop = nullptr, *d_mtop2 = nullptr;  // d_mtop2: draft runner-ups
     // device-fed MTP chain: drafted ids, CudaEngine::kMtpFeedSlots entries, then the same slots' runner-ups
@@ -503,6 +523,7 @@ struct CudaEngine::Impl {
         scratch = alloc<float>(std::max(cc::attention_scratch_floats(ad, RM), cc::attention_decode8_scratch_floats(ad, RM)));
         d_ids = alloc<std::uint32_t>(RM);
         d_pos = alloc<std::uint32_t>(1);
+        d_tree = alloc<std::uint32_t>(kTreeWords, true);
         d_top = alloc<std::uint32_t>(RM);
         d_parity = alloc<std::uint32_t>(1, true);
         d_argws = alloc<unsigned char>(cc::kArgmaxWorkspaceBytes);
@@ -536,6 +557,11 @@ struct CudaEngine::Impl {
             if (L[l].attn) {
                 kc.push_back(alloc<__nv_bfloat16>(kvn, true));
                 vc.push_back(alloc<__nv_bfloat16>(kvn, true));
+                if (kv_layer_n < cc::kMaxKvMoveLayers) {
+                    kv_layers.k[kv_layer_n] = kc.back();
+                    kv_layers.v[kv_layer_n] = vc.back();
+                }
+                ++kv_layer_n;
                 conv.push_back(nullptr);
                 delta.push_back(nullptr);
                 raw.push_back(nullptr);
@@ -632,10 +658,12 @@ struct CudaEngine::Impl {
                     multi(ws, ys, 4, xn, rows);
                 }
                 const auto& cl = commit_layers[gi++];
-                CK(cc::gdn_window(gd, cl.layer, cl.state, cl.win, z, gout, rows, c.rms_eps, d_parity, s));
+                CK(cc::gdn_window(gd, cl.layer, cl.state, cl.win, z, gout, rows, c.rms_eps, d_parity, s, tree_mode ? d_tree : nullptr));
                 CK(cc::dense_rows(w.out, gout, x, rows, x, s, opt.dense_arithmetic));
             } else {
-                attn_mixer(w, Bufs{x, xn, d_pos, kc[l], vc[l], {}, decode8_on() ? &pf.sh[l] : nullptr}, rows);
+                Bufs ab{x, xn, d_pos, kc[l], vc[l], {}, decode8_on() ? &pf.sh[l] : nullptr};
+                if (tree_mode) ab.rm = cc::RowMap{d_tree + 1, nullptr, 0, d_tree + 1 + cc::kMaxRows};
+                attn_mixer(w, ab, rows);
             }
             mlp(w, Bufs{x, xn, d_pos, nullptr, nullptr}, rows);
         }
@@ -658,15 +686,29 @@ struct CudaEngine::Impl {
         if (decode8_on()) decode8_catch_up();
     }
 
-    RowsOut forward(const std::uint32_t* tokens, std::uint32_t rows, LogitRows want) {
+    RowsOut forward(const std::uint32_t* tokens, std::uint32_t rows, LogitRows want, const strix::spec::TreeWindow* tree = nullptr) {
         if (rows == 0 || rows > RM) throw std::runtime_error("forward_rows: rows must be 1..32");
+        if (tree && tree->rows != rows) throw std::runtime_error("forward_tree: descriptor rows != rows");
+        // decode_attn8 reads keys from the e4m3 shadow by position (attention.hpp attention_decode8: no own-K/V index), so a
+        // leaf row could not read its own key there: tree windows run on the exact BF16 attention only.
+        if (tree && decode8_on()) throw std::runtime_error("forward_tree: not with decode_attn8 (the e4m3 shadow has no leaf K/V index)");
         core::validate_token_ids(tokens, rows, c.vocab);
         window_prologue(rows);
         InputPack in{};
         in.pos0 = committed;
         for (std::uint32_t i = 0; i < rows; ++i) in.ids[i] = tokens[i];
-        set_inputs_kernel<<<1, 32, 0, s>>>(in, d_pos, d_ids);
+        TreePack tp{};
+        if (tree) {
+            tp.leaf = tree->leaf;
+            for (std::uint32_t i = 0; i < rows; ++i) {
+                tp.pos[i] = committed + tree->pos[i];
+                tp.idx[i] = committed + tree->index[i];
+            }
+        }
+        set_inputs_kernel<<<1, 32, 0, s>>>(in, d_pos, d_ids, tp, tree ? d_tree : nullptr);
         CK(cudaGetLastError());
+        tree_mode = tree != nullptr;
+        last_tree = tree_mode;
         return run_rows(rows, want);
     }
 
@@ -694,6 +736,8 @@ struct CudaEngine::Impl {
         window_prologue(rows);
         fed_rows_kernel<<<1, 32, 0, s>>>(in, d_feed, d_pos, d_ids);
         CK(cudaGetLastError());
+        tree_mode = false;  // a fed verify is a linear window
+        last_tree = false;
         return run_rows(rows, want);
     }
     void mtp_feed_read_async(std::uint32_t n) {
@@ -710,7 +754,7 @@ struct CudaEngine::Impl {
     // The window after its inputs are on the device (d_pos, d_ids): replay (or capture) the trunk graph of (rows, want).
     RowsOut run_rows(std::uint32_t rows, LogitRows want) {
         if (decode8_on() && d8_end != committed) throw std::logic_error("forward_rows: decode_attn8 shadow behind the committed prefix (window_prologue not run)");
-        const std::uint32_t key = rows * 4 + static_cast<std::uint32_t>(want);
+        const std::uint32_t key = rows * 4 + static_cast<std::uint32_t>(want) + (tree_mode ? 1u << 16 : 0u);  // tree graphs keyed apart
         if (graphs_on) {
             auto it = graphs.find(key);
             if (it == graphs.end()) {
@@ -750,6 +794,7 @@ struct CudaEngine::Impl {
 
     void commit_rows(std::uint32_t kk) {
         if (kk > last_rows) throw std::runtime_error("commit: k exceeds the last window");
+        if (last_tree && kk > 0) throw std::runtime_error("commit: the last window was a token tree (use commit_path)");
         if (kk > 0) {
             CK(cc::gdn_commit(gd, commit_layers.data(), static_cast<std::uint32_t>(commit_layers.size()), last_rows, kk, d_parity, s));
         }
@@ -758,6 +803,23 @@ struct CudaEngine::Impl {
         if (decode8_on() && d8_end == committed) d8_end += kk;
         committed += kk;
         last_rows = 0;
+    }
+
+    // Token tree (strix/spec/tree_window.hpp): accept the root path described by pc of the last forward_tree window. GDN: replay
+    // the path rows (or keep the window state when the path is every chain row), conv taps over the path; attention: a final
+    // leaf's K/V moves from its index to its position (chain rows are already at their positions; rejected leaves stay past
+    // the committed length, never read).
+    void commit_path(const strix::spec::PathCommit& pc) {
+        if (!last_tree) throw std::runtime_error("commit_path: the last window was not a token tree");
+        if (pc.end == 0 || pc.end > last_rows || pc.accepted == 0 || pc.accepted > pc.end)
+            throw std::runtime_error("commit_path: path outside the last window");
+        if (kv_layer_n > cc::kMaxKvMoveLayers) throw std::runtime_error("commit_path: more attention layers than the K/V move table");
+        CK(cc::gdn_commit_path(gd, commit_layers.data(), static_cast<std::uint32_t>(commit_layers.size()), last_rows, pc.end, pc.skip,
+                               pc.replay, d_parity, s));
+        if (pc.move) CK(cc::kv_move_row(ad, kv_layers, kv_layer_n, committed + pc.from, committed + pc.to, s));
+        committed += pc.accepted;
+        last_rows = 0;
+        last_tree = false;
     }
 
     // ================= multi-session (slots)
@@ -1496,7 +1558,7 @@ struct CudaEngine::Impl {
         InputPack in{};
         in.pos0 = pos0;
         for (std::uint32_t i = 0; i < rows; ++i) in.ids[i] = next_tokens[i];
-        set_inputs_kernel<<<1, 32, 0, s>>>(in, d_mpos, d_mids);
+        set_inputs_kernel<<<1, 32, 0, s>>>(in, d_mpos, d_mids, TreePack{}, nullptr);
         CK(cudaGetLastError());
         mtp_body_launch(hidden_dev, rows);
         CudaEngine::MtpOut o;
@@ -1517,7 +1579,7 @@ struct CudaEngine::Impl {
             InputPack in{};
             in.pos0 = pos;
             in.ids[0] = *in_host;
-            set_inputs_kernel<<<1, 32, 0, s>>>(in, d_mpos, d_mids);
+            set_inputs_kernel<<<1, 32, 0, s>>>(in, d_mpos, d_mids, TreePack{}, nullptr);
         } else {  // the slot holds an argmax id of an earlier step (< vocab by construction)
             fed_inputs_kernel<<<1, 32, 0, s>>>(d_feed, in_slot, pos, d_mpos, d_mids);
         }
@@ -1924,6 +1986,10 @@ RowsOut CudaEngine::forward_rows(const std::uint32_t* tokens, std::uint32_t rows
     return p_->forward(tokens, rows, want);
 }
 void CudaEngine::commit(std::uint32_t k) { p_->commit_rows(k); }
+RowsOut CudaEngine::forward_tree(const std::uint32_t* tokens, const strix::spec::TreeWindow& tree, LogitRows want) {
+    return p_->forward(tokens, tree.rows, want, &tree);
+}
+void CudaEngine::commit_path(const strix::spec::PathCommit& pc) { p_->commit_path(pc); }
 RowsOut CudaEngine::prefill(const std::uint32_t* tokens, std::uint32_t n, LogitRows want) { return p_->prefill(tokens, n, want); }
 bool CudaEngine::prefill_is_big() const { return p_->big_supported(); }
 const char* prefill_arith_name(PrefillArith a) {
