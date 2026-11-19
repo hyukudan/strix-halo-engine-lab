@@ -3403,7 +3403,12 @@ int main() { return 0; }"
         target_include_directories(strix_qwen35_hip_engine PRIVATE src)  # attn_core headers include "attn_core/..."
         add_executable(strix-hip-qwen35-decode apps/hip_qwen35_decode_main.hip)
         set_target_properties(strix-hip-qwen35-decode PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-        target_link_libraries(strix-hip-qwen35-decode PRIVATE strix_qwen35_hip_engine strix_spec strix_dist strix_device)  # --tp-rank: pair link, topology rates
+        # Shared Channel instantiation of the TP slot gathers (src/xport/tp_gather*.hpp): the pair gather link's channel route.
+        add_library(strix_tp_xport STATIC src/xport/tp_gather.hip)
+        set_target_properties(strix_tp_xport PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_link_libraries(strix_tp_xport PUBLIC strix_dist)
+        target_include_directories(strix_tp_xport PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
+        target_link_libraries(strix-hip-qwen35-decode PRIVATE strix_qwen35_hip_engine strix_spec strix_dist strix_device strix_tp_xport)  # --tp-rank: pair link, topology rates
         # N-rank layer split over the topology declaration + shared planner + shared layer pipeline (one rank = the
         # decode app's path); --self-cut runs the one-process cut test of the engine's range hooks.
         add_executable(strix-hip-qwen35-pair apps/hip_qwen35_pair_main.hip)

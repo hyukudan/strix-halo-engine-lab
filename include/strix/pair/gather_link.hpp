@@ -29,9 +29,16 @@ enum class GatherRoute : std::uint8_t { staged = 0, device_direct = 1, channel =
                                            : "channel (device-waited, no host wait)";
 }
 
+// Route policy (backend-neutral; bindings receive the route, they do not read switches): the device-waited channel when
+// requested, else the device-direct exchange when the transport offers it, else the host-staged exchange.
+[[nodiscard]] constexpr GatherRoute select_route(bool direct_available, bool channel_requested) noexcept {
+    return channel_requested ? GatherRoute::channel : direct_available ? GatherRoute::device_direct : GatherRoute::staged;
+}
+
 // Stand-in for a route a binding does not offer (the constructor refuses that route, so it is never called).
 struct NoExchange {
     template<class... A> void exchange(A&&...) { throw std::logic_error("gather link: route not bound"); }
+    void drain() { throw std::logic_error("gather link: route not bound"); }
 };
 
 template<class Ops, class Legacy, class Fast>
@@ -62,6 +69,13 @@ public:
     // Engine binding (a plain function pointer + context, e.g. qwen35 HipEngine::TpGather).
     static void fn(void* ctx, void* stream, void* slots, std::size_t slot_bytes, std::size_t bytes) {
         static_cast<GatherLink*>(ctx)->gather(Ops::stream(stream), slots, slot_bytes, bytes);
+    }
+    // End of a run, before its results are reported: the channel route checks the integrity of its last messages
+    // (deferred CRC: the check of message s travels with s + 1, the last one with the drain's seal), so a corrupt final
+    // gather fails here instead of in a destructor that cannot report it. Both ranks call it (the seal is symmetric).
+    // The staged and device-direct routes check every exchange inline: nothing to finish.
+    void finish() {
+        if (route_ == GatherRoute::channel) fast_->drain();
     }
     // Restart the time counters (e.g. after the start-up link measurement); the call sequence (wire tags) continues.
     void reset_counters() noexcept { link_ms_ = 0.0; counted_from_ = calls_; }

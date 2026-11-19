@@ -31,6 +31,7 @@
 #include "../src/core/dense_linear.hpp"
 #include "../src/core/dense_linear_iu4.hpp"
 #include "../src/xport/tp_gather_hip.hpp"
+#include "strix/env_flags.hpp"
 
 namespace {
 std::string sysfs_clock() {
@@ -165,7 +166,9 @@ int main(int argc, char** argv) try {
         if (!opened.receipt.empty()) std::printf("tp transport: %s\n", opened.receipt.c_str());
         // largest gather: 16 rows x the widest share (mlp ~I/2), or whole logits rows for --dump-logits
         const std::size_t cap = dump.empty() ? (2U << 20) : (16U << 20);
-        tpg = std::make_unique<strix::xport::tp_gather::HipPairGather>(std::move(opened), std::uint32_t(tp_rank), cap);
+        tpg = std::make_unique<strix::xport::tp_gather::HipPairGather>(std::move(opened), std::uint32_t(tp_rank), cap,
+                                                                       static_cast<hipStream_t>(E->stream_handle()),
+                                                                       strix::envcfg::flag("STRIX_TP_CHANNEL", false));
     }
     const unsigned V = E->vocab();
     // Speculation: one shared resolver (hip_spec_defaults.hpp). --dump-logits needs every position's logits: one row per step.
@@ -264,7 +267,7 @@ int main(int argc, char** argv) try {
         const double gather_row = (8.0 * cf.hidden + 2.0 * (double(cf.heads) * cf.head_dim + cf.intermediate)) / 4.0;
         const auto stages = psp::uniform_layers(layers, pass_bytes / double(layers), 1024U, 4U, gather_row, 1U);
         // Trip cost measured now over the gather form the decode runs, agreed by both ranks (identical bits).
-        const auto lc = tpg->measure_link(static_cast<hipStream_t>(E->stream_handle()));
+        const auto lc = tpg->measure_link();
         const auto trip = strix::pair::tp::trip_cost(lc, tp_trip_us);
         std::printf("tp link cost: %s; trip %.1f us%s, %s\n", lc.describe().c_str(), trip.latency_ms * 1000.0,
                     tp_trip_us > 0.0 ? " (--tp-trip-us)" : " (measured)", strix::pair::gather_route_name(tpg->link().route()));
@@ -349,6 +352,7 @@ int main(int argc, char** argv) try {
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     run = false;
     sampler.join();
+    if (tpg) tpg->finish();  // the channel's last gathers are checked before any result is printed
     std::printf("generated:");
     for (int t : generated) std::printf(" %d", t);
     std::printf("\n");
