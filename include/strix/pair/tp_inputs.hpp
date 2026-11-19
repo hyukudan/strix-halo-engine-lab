@@ -9,6 +9,7 @@
 //                latency override (--tp-trip-us) that replaces only the measured latency.
 // Home: shared (host shared, pair facility). Bound by: qwen35 dense HIP exact TP decode (apps/hip_qwen35_decode_main.hip).
 // Host test: tests/pair_tp_gather_tests.cpp.
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -31,7 +32,7 @@ struct RankRates {
                                           std::uint32_t ranks) {
     const auto valid = [&](const std::vector<double>& v) {
         if (v.size() != ranks) return false;
-        for (const double g : v) if (!(g > 0.0)) return false;
+        for (const double g : v) if (!std::isfinite(g) || !(g > 0.0)) return false;
         return true;
     };
     if (!override_gbps.empty()) {
@@ -46,7 +47,8 @@ struct RankRates {
 // Trip cost of one gather from the agreed link measurement. override_us > 0 replaces the measured latency only.
 [[nodiscard]] inline TripCost trip_cost(const dist::LinkCost& measured, double override_us = 0.0) {
     if (!measured.valid()) throw std::invalid_argument("tp trip cost: the link measurement is not valid");
-    if (override_us < 0.0) throw std::invalid_argument("tp trip cost: negative --tp-trip-us");
+    if (!std::isfinite(override_us) || override_us < 0.0)
+        throw std::invalid_argument("tp trip cost: --tp-trip-us must be finite and non-negative");
     return TripCost{(override_us > 0.0 ? override_us : measured.latency_us) / 1000.0, measured.bytes_per_ms()};
 }
 
