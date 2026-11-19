@@ -84,8 +84,8 @@ struct Weights {
     const std::uint8_t* down = nullptr;        // [experts][hidden][ffn/32 blocks]
     ExpertArithmetic arithmetic=ExpertArithmetic::incumbent;
     bool decode_tile = true;   // gsq_bf16_mma: steps of <= 16 rows bind the decode tile form (bitwise the tile form)
-    // gsq_bf16_mma: with wide_tile, launches routing at least native_mma::kWideMinAvgRows rows per expert on average
-    // (wide_min_avg, when not 0, replaces that threshold: benches) bind the wide 128-row tile form, bitwise the tile form.
+    // gsq_bf16_mma: with wide_tile, launches routing at least wide_min_avg rows per expert on average (0 =
+    // native_mma::kWideMinAvgRows) bind the wide 128-row tile form, bitwise the tile form.
     bool wide_tile = false;
     std::uint32_t wide_min_avg = 0;
 };

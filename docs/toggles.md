@@ -445,7 +445,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_QSA_DECODE_POOL_BF16` | qwen | 1 (plain append-only serial decode un... | [qwen-qsa-decode-pool](optimizations.md#qwen-qsa-decode-pool) |
 | `STRIX_QWEN_ROUTER_BF16` | qwen | OFF (opt-in: STRIX_QWEN_ROUTER_BF16=1) | [qwen-exact-bf16-router-weights](optimizations.md#qwen-exact-bf16-router-weights) |
 
-### Kernel paths (122)
+### Kernel paths (123)
 
 | Toggle | Engine | Default | Details |
 |---|---|---|---|
@@ -572,6 +572,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_ROUTER_STAGE_ACT` | qwen | ON | [qwen-router](optimizations.md#qwen-router) |
 | `STRIX_SERVE_HEALTH_RECORD` | qwen | ON | [operations/service-health.md](operations/service-health.md) |
 | `STRIX_SERVE_OBSERVE_EXPIRY_S` | deepseek | 60 seconds | [ds-observation](optimizations.md#ds-observation) |
+| `STRIX_QRTX_EXPERT_WIDE_TILE` | qwen-rtx | off (`1` = on with the builtin threshold, `N` = on from N rows per expert) | [qwen-rtx-expert-wide-tile](optimizations.md#qwen-rtx-expert-wide-tile) |
 
 ### Debug only (3)
 

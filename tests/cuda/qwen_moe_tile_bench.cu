@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <utility>
 #include <vector>
 
 #include "strix/cuda/amd_math_tables.hpp"
@@ -113,6 +114,7 @@ int main(int argc, char** argv) {
         return h;
     };
     std::vector<double> T, M, Y;
+    std::vector<std::pair<u32, double>> wide_ratio;   // (rows per expert, wide / tile time)
     int bad = 0;
     for (const u32 c : kCases) {
         const u32 rows = kUsed / kTop * c;
@@ -159,6 +161,18 @@ int main(int argc, char** argv) {
         bad += equal ? 0 : 1;
         std::printf("TILECMP c=%u tile_ms=%.3f wide_ms=%.3f wide_over_tile=%.3f rawdots_hash=%016llx intermediates_hash=%016llx bits %s\n",
                     c, form_ms[0], form_ms[1], form_ms[1] / form_ms[0], form_hash[1][0], form_hash[1][1], equal ? "EQUAL" : "DIFFER");
+        wide_ratio.emplace_back(c, form_ms[1] / form_ms[0]);
+    }
+    // The planner parameter of the wide form on this device (`--expert-wide-tile N`): the smallest rows-per-expert case
+    // from which the wide form is faster than the 64-row tile form at that case and every larger one (none: keep it off).
+    {
+        u32 from = 0U;
+        for (std::size_t i = wide_ratio.size(); i-- > 0;) {
+            if (wide_ratio[i].second >= 1.0) break;
+            from = wide_ratio[i].first;
+        }
+        if (from != 0U) std::printf("TILEWIDE min_rows=%u (use --expert-wide-tile %u on this device)\n", from, from);
+        else std::printf("TILEWIDE min_rows=none (the wide form is not faster at the largest case: keep it off)\n");
     }
     // Least squares y = a + D T + M m (normal equations, Cramer's rule).
     double ne[3][3] = {}, b[3] = {};

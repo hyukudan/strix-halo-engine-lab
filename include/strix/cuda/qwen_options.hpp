@@ -136,6 +136,7 @@ inline void apply(const cp::Choice& choice, qp::Config& config) {
     config.expert_decode_tile = config.expert_decode_tile && choice.expert_decode_tile;
     // Config::expert_wide_tile (exact schedule trait): the lever row `expert_wide_tile` (opt-in).
     config.expert_wide_tile = config.expert_wide_tile || choice.expert_wide_tile;
+    if (config.expert_wide_min_rows == 0U) config.expert_wide_min_rows = choice.expert_wide_min_rows;
     // TURBO / FAST expert rows: an explicit --expert-arithmetic other than incumbent keeps its own contract.
     if (choice.expert_turbo && choice.expert_fast)
         throw std::invalid_argument("--expert-turbo and --expert-fast select different expert arithmetics; set one");

@@ -91,9 +91,11 @@ static_assert(kWideMBlocks * warp_parts(kWideMBlocks) == kTileMBlocks * warp_par
               "the wide form keeps the tile form's 32 accumulators per thread");
 static_assert(kWideThreads / 32U == 8U * warp_parts(kTileMBlocks), "16 warps: 8 column blocks x the 2 parts of a tile-form warp");
 // Launch rule (backend-neutral): the wide form when the launch routes at least min_avg rows per expert on average
-// (min_avg = 0: off). kWideMinAvgRows is PROVISIONAL: from 64 rows an expert on, the average expert has more than one
-// 64-row tile to merge; the no-model tile bench (64 vs wide at 16..320 rows an expert) sets the measured crossover.
-inline constexpr unsigned kWideMinAvgRows = 64U;
+// (min_avg = 0: off). min_avg is a planner parameter: the lever value `--expert-wide-tile N` (N rows per expert), taken
+// from the no-model tile bench of the device (its TILEWIDE line: the smallest rows-per-expert case from which the wide
+// form is faster at every larger case). kWideMinAvgRows is only the value of a bare `on`: PROVISIONAL, set above the
+// 80..120 rows-per-expert band where a 128-row tile was measured 3-7 % slower than 64-row tiles on this card class.
+inline constexpr unsigned kWideMinAvgRows = 128U;
 STRIX_NATIVE_MMA_HD bool wide_form(std::uint64_t assignments, unsigned experts, unsigned min_avg) {
     return min_avg != 0U && assignments >= std::uint64_t{min_avg} * experts;
 }

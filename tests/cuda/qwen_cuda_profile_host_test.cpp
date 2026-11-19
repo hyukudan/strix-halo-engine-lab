@@ -78,6 +78,8 @@ std::set<std::string> diff(const qp::Config& a, const qp::Config& b) {
     ne("forms.mtp_mma", a.forms.mtp_mma != b.forms.mtp_mma);
     ne("forms.qsa_mma", a.forms.qsa_mma != b.forms.qsa_mma);
     ne("forms.moe_mma", a.forms.moe_mma != b.forms.moe_mma);
+    ne("expert_wide_tile", a.expert_wide_tile != b.expert_wide_tile);
+    ne("expert_wide_min_rows", a.expert_wide_min_rows != b.expert_wide_min_rows);
     return d;
 }
 // serve vs cli: the same request. Fails on a Resolution, contract or Config difference that is not named.
@@ -216,6 +218,25 @@ void profiles() {
                              one({"--profile", "fast"}, qo::Entry::serve, Env{{"STRIX_QRTX_EXPERT_WIDE_TILE", "1"}})}) {
         check(wide.config.expert_wide_tile, "wide tile on by option / env: " + status(wide, "expert_wide_tile"));
         check(wide.contract == fast.contract && bundle_id(wide) == bundle_id(fast), "wide tile on: same contract and bundle id");
+        check(wide.config.expert_wide_min_rows == 0U, "wide tile on: the builtin threshold (0 = native_mma::kWideMinAvgRows)");
+    }
+    // Its planner parameter: N rows per expert from the device's tile bench, by option or env; serve == CLI; exact row.
+    same_request("wide tile rows", {"--profile", "fast", "--expert-wide-tile", "96"});
+    for (const auto& wide : {one({"--profile", "fast", "--expert-wide-tile", "96"}, qo::Entry::serve),
+                             one({"--profile", "fast"}, qo::Entry::cli, Env{{"STRIX_QRTX_EXPERT_WIDE_TILE", "96"}})}) {
+        check(wide.config.expert_wide_tile && wide.config.expert_wide_min_rows == 96U,
+              "wide tile N: on with threshold 96: " + status(wide, "expert_wide_tile"));
+        check(wide.contract == fast.contract && bundle_id(wide) == bundle_id(fast), "wide tile N: same contract and bundle id");
+    }
+    {
+        const auto off = one({"--profile", "fast", "--expert-wide-tile", "off"}, qo::Entry::serve);
+        check(!off.config.expert_wide_tile && off.config.expert_wide_min_rows == 0U, "wide tile off: no threshold");
+        bool refused = false;
+        try { (void)one({"--profile", "fast", "--expert-wide-tile", "70000"}, qo::Entry::serve); } catch (const std::exception&) { refused = true; }
+        check(refused, "wide tile rows above 65535 refused");
+        refused = false;
+        try { (void)one({"--profile", "fast", "--expert-wide-tile", "wide"}, qo::Entry::serve); } catch (const std::exception&) { refused = true; }
+        check(refused, "wide tile malformed value refused");
     }
     check(cp::form_identities(fast.choice) == "qwen-cuda-hc-f16mma-v2,qwen-cuda-qsa-bf16mma-v2", "fast identities: " + cp::form_identities(fast.choice));
     fast_bundle();
