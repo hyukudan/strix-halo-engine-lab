@@ -1,4 +1,5 @@
 #include "strix/moe_q4k_a8_contract.hpp"
+#include "strix/moe/expert_union.hpp"
 #if defined(__FAST_MATH__) || (defined(__FINITE_MATH_ONLY__) && __FINITE_MATH_ONLY__)
 #error "Q4K A8G32 requires nonfinite checks and strict floating-point semantics"
 #endif
@@ -368,5 +369,36 @@ void validate(const Request& request, const Bindings& b) {
                     views[j].address+views[j].bytes <= views[i].address,
                     "Q4K A8 mutable views and separate gate/up must not overlap");
     }
+}
+void validate_union(const Request& request, const Bindings& b, DeviceBytes plan) {
+    namespace eu = strix::moe::expert_union;
+    const auto s = request.shape;
+    check(eu::admits(s.logical_rows, s.top_k) && request.gate_type == 12U && s.hidden <= c1_max_rows,
+        "Q4K A8 union rows admit R <= 8, K <= 16, Q4_K gate/up and hidden <= 1536 only");
+    const std::uint64_t rows = s.logical_rows;
+    const std::array<DeviceBytes, 6> per_row{b.input, b.routes, b.codes, b.deltas, b.sums, b.output};
+    for (const auto& v : per_row) check(v.bytes % rows == 0U, "Q4K A8 union per-row views must hold R equal extents");
+    const auto slice = [rows](DeviceBytes v, std::uint64_t r) {
+        const std::uint64_t each = v.bytes / rows;
+        return DeviceBytes{v.address + static_cast<std::uintptr_t>(each * r), each};
+    };
+    Request one = request;
+    one.shape.logical_rows = 1U;
+    for (std::uint64_t r = 0; r < rows; ++r) {
+        Bindings row = b;
+        row.input = slice(b.input, r); row.routes = slice(b.routes, r); row.codes = slice(b.codes, r);
+        row.deltas = slice(b.deltas, r); row.sums = slice(b.sums, r); row.output = slice(b.output, r);
+        validate(one, row);
+    }
+    check(plan.address != 0 && plan.address % 16U == 0 && plan.bytes == eu::plan_bytes &&
+        plan.bytes <= std::numeric_limits<std::uintptr_t>::max() - plan.address, "Q4K A8 union plan view invalid");
+    // Whole extents: every pair with a mutable member (codes, deltas, sums, status, output, plan) is disjoint, as validate().
+    const std::array<DeviceBytes, 10> views{b.input, b.gate, b.up, b.routes, b.codes, b.deltas, b.sums, b.status, b.output, plan};
+    for (std::size_t i = 0; i < views.size(); ++i)
+        for (std::size_t j = 0; j < i; ++j)
+            if (i >= 4 || (i == 2 && j == 1))
+                check(views[i].address + views[i].bytes <= views[j].address ||
+                    views[j].address + views[j].bytes <= views[i].address,
+                    "Q4K A8 union mutable views and the plan must not overlap");
 }
 }  // namespace strix::moe_q4k_a8

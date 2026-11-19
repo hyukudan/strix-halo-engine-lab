@@ -1,4 +1,5 @@
 #include "strix/moe_a8_down_contract.hpp"
+#include "strix/moe/expert_union.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -77,6 +78,37 @@ void validate_down(const DownRequest& r,const DownBindings& b) {
         for(std::size_t j=0;j<i;++j)
             need(views[i].address+views[i].bytes<=views[j].address ||
                 views[j].address+views[j].bytes<=views[i].address,"A8 down views must be disjoint");
+    }
+}
+void validate_down_union(const DownRequest& r,const DownBindings& b,std::uint32_t rows,DeviceBytes plan) {
+    namespace eu=strix::moe::expert_union;
+    need(eu::admits(rows,r.shape.top_k) && kquant(r.weight_type),
+        "A8 down union rows admit R <= 8, K <= 16 and the K-quant class (Q4_K / Q6_K) only");
+    const std::uint64_t n=rows;
+    const std::array<DeviceBytes,6> per_row{b.intermediates,b.routes,b.codes,b.deltas,b.sums,b.rawdots};
+    for(const auto& v:per_row) need(v.bytes%n==0U,"A8 down union per-row views must hold R equal extents");
+    const auto slice=[n](DeviceBytes v,std::uint64_t k) {
+        const std::uint64_t each=v.bytes/n;
+        return DeviceBytes{v.address+static_cast<std::uintptr_t>(each*k),each};
+    };
+    for(std::uint64_t k=0;k<n;++k) {
+        DownBindings row=b;
+        row.intermediates=slice(b.intermediates,k);row.routes=slice(b.routes,k);row.codes=slice(b.codes,k);
+        row.deltas=slice(b.deltas,k);row.sums=slice(b.sums,k);row.rawdots=slice(b.rawdots,k);
+        validate_down(r,row);
+    }
+    need(plan.address!=0 && plan.address%16U==0 && plan.bytes==eu::plan_bytes &&
+        plan.bytes<=std::numeric_limits<std::uintptr_t>::max()-plan.address,"A8 down union plan view invalid");
+    // Whole extents pairwise disjoint (validate_down's rule), the plan included.
+    const std::array<DeviceBytes,10> views{b.intermediates,b.weights,b.routes,b.codes,b.deltas,b.sums,b.rawdots,b.status,
+        b.aggregate_status,plan};
+    for(std::size_t i=0;i<views.size();++i) {
+        if(i==8 && views[i].address==0 && views[i].bytes==0) continue;
+        for(std::size_t j=0;j<i;++j) {
+            if(j==8 && views[j].address==0 && views[j].bytes==0) continue;
+            need(views[i].address+views[i].bytes<=views[j].address ||
+                views[j].address+views[j].bytes<=views[i].address,"A8 down union views and the plan must be disjoint");
+        }
     }
 }
 std::array<std::uint8_t,32> decode_down_q51_codes(std::span<const std::byte> b) {
