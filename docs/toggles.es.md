@@ -237,7 +237,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_HOST_WAIT` | qwen | block | [host-wait-policy](optimizations.md#host-wait-policy) |
 | `STRIX_SESSION_CACHE` | minimax | on (two-node serve route) | [mm-sessions](optimizations.md#mm-sessions) |
 
-### Prefill (97)
+### Prefill (98)
 
 | Toggle | Motor | Por defecto | Detalles |
 |---|---|---|---|
@@ -360,6 +360,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_SERVE_PREFILL_GROUP` | deepseek (par) | auto | varios prompts cortos admitidos a la vez comparten una pasada de prefill en el dispositivo; `0` = una pasada por prompt; `STRIX_SERVE_PREFILL_GROUP_MEMBERS` (2..64) limita un grupo; [página de DeepSeek](models/deepseek-v4.1/README.es.md) |
 | `STRIX_SERVE_T16K` | qwen | ON: T16384 owner when the context admits a 32,768-token request and every resident slot fits; `0` keeps T8192 | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 | `STRIX_SERVE_FP16_MTP` | qwen | ON: explicit-sidecar MTP servers keep the automatic FP16 prefill arithmetic with the unqualified fast options off; `0` declines it | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
+| `STRIX_QRTX_PLE_A8` | qwen-rtx | off (opt-in con `--profile fast`, gate FAST pendiente) | [qwen-rtx-ple-a8](optimizations.md#qwen-rtx-ple-a8) |
 
 ### Decode, MTP y DSpark (25)
 

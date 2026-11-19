@@ -5015,6 +5015,24 @@ values outside the band, so byte comparisons of that buffer need `STRIX_IDX_WMMA
 
 ## Qwen RTX PRO standalone
 
+<a id="qwen-rtx-ple-a8"></a>
+
+### PLE projections on the shared dense A8 projection (FAST form `ple_a8`)
+
+**Engine:** `qwen-rtx`. **Control:** `--ple-a8 on|off`, `STRIX_QRTX_PLE_A8` (lever row `ple_a8`, identity `qwen-cuda-ple-a8-v1`). **Default:** off (opt-in under `--profile fast`; not a FAST bundle member until its gate passes).
+
+In a prefill block the PLE key projection (2560 -> 10240) and value projection (2560 -> 2560) read the same gathered rows.
+Under `ple_a8` they are two segments of one shared dense A8 projection (one activation quantize, one int8 tensor-core
+launch, the `dense-a8-v1` projection contract) instead of two FP32 lane-chain launches. Verify and decode windows keep the
+exact projections.
+
+- **Preconditions:** CUDA Qwen MoE prefill blocks under `--profile fast` with `--ple-a8 on` (the row is runnable under `fast` only).
+- **Automatic selection:** none.
+- **Exactness evidence:** FAST class (changes the PLE keys and values). FAST gate: not run yet. The arithmetic contract and the prefix identity name the form when it is on; off, the same launches run as before.
+- **Off switch:** `--ple-a8 off`; `STRIX_QRTX_PLE_A8=0` (the default).
+- **Measured gain:** Not yet measured.
+- **Implementation / evidence:** [call site](../src/cuda/models/qwen/qwen_prefill_driver.cu), [lever row](../include/strix/profiles/qwen_cuda.hpp), [no-model bench](../tests/cuda/qwen_ple_a8_bench.cu)
+
 <a id="qwen-rtx-prefix-cache"></a>
 
 ### Prompt prefix cache
