@@ -126,6 +126,7 @@ int main(int argc, char** argv) {
         std::unique_ptr<sp::DraftRows> draft_rows;
         std::uint32_t idle_ms = 0;  // host sleep (GPU idle) before every spec run: thermal gaps inside one ticket
         bool cost_table = false, check = true, graphs = true, seed_costs = true, turbo_lm_head = true, pdl = false;
+        bool pf_large = false, kv_catchup = false;  // --prefill-route large, --mtp-catchup kv (both off until measured)
         q::TurboWeights turbo = q::TurboWeights::off;
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
@@ -165,6 +166,24 @@ int main(int argc, char** argv) {
             }
             else if (a == "--chain-hidden") chain_hidden = next();
             else if (a == "--max-pos") max_pos = strix::core::parse_u32(next());
+            // Prompt fill: windows (forward_rows of 32 + MTP feed, the incumbent) | large (CudaEngine::prefill large-M route,
+            // every row's hidden fed to the MTP chain: SpecEngine::prefill_big; the resolver then offers the decode CLI's
+            // large-prefill levers: --profile fast = FAST4 + chunk16 prompt, decode stays exact).
+            else if (a == "--prefill-route") {
+                const auto v = next();
+                if (v != "windows" && v != "large") throw std::invalid_argument("--prefill-route expects windows|large");
+                pf_large = v == "large";
+            }
+            else if (a == "--prefill-arith") lever_cli.emplace_back("prefill_arith", next());  // large route only (resolver)
+            else if (a == "--prefill-gdn") lever_cli.emplace_back("prefill_gdn", next());
+            else if (a == "--prefill-attn8") lever_cli.emplace_back("prefill_attn8", next());
+            // MTP catch-up of rows nobody reads the output of: full (incumbent calls) | kv (K/V-only rows, same K/V bits;
+            // strix/spec/mtp_chain.hpp MtpKvEngine)
+            else if (a == "--mtp-catchup") {
+                const auto v = next();
+                if (v != "full" && v != "kv") throw std::invalid_argument("--mtp-catchup expects full|kv");
+                kv_catchup = v == "kv";
+            }
             else if (a == "--label") label = next();
             else if (a == "--frontier") arms = {std::to_string(strix::core::parse_u32(next()))};
             else if (a == "--arms") {
@@ -203,7 +222,8 @@ int main(int argc, char** argv) {
         if (model.empty() == synth.empty())
             throw std::runtime_error("usage: (--model F.gguf | --synthetic-full bf16|q8_0 [--layers N]) [--prompt-ids a,b | --prompt-file F | --prompt-len N] "
                                      "[--n-gen N] [--sources copy,chain,hybrid|none] [--oracle ACC] [--cost-table] [--check 0|1] [--max-block 1..32] "
-                                     "[--frontier N | --arms 0,8,new,sub,new15,sub15 --pairs P] [--draft-core G] [--draft-fallback G] [--draft-pack F1,F2] [--idle-ms MS] [--ids-out DIR]  (--prompt-file accepts F1,F2,...: one engine load)");
+                                     "[--frontier N | --arms 0,8,new,sub,new15,sub15 --pairs P] [--draft-core G] [--draft-fallback G] [--draft-pack F1,F2] [--idle-ms MS] [--ids-out DIR] "
+                                     "[--prefill-route windows|large [--prefill-arith A] [--prefill-gdn G] [--prefill-attn8 on|off]] [--mtp-catchup full|kv]  (--prompt-file accepts F1,F2,...: one engine load)");
         // (label, ids) per prompt; --prompt-file takes a comma list (label = file stem), each prompt runs serial + spec arms.
         std::vector<std::pair<std::string, std::vector<std::uint32_t>>> prompts;
         if (!ids_arg.empty()) prompts.emplace_back(label, parse_ids(ids_arg));
@@ -233,7 +253,9 @@ int main(int argc, char** argv) {
         namespace qp = strix::qwen35::profile;
         std::size_t prompt_tokens = prompt_len;
         for (const auto& entry : prompts) prompt_tokens = std::max(prompt_tokens, entry.second.size());
-        const auto resolved = qp::resolve(profile, qp::regime_of(opt, qp::Route::windows, prompt_tokens), lever_cli);
+        // --prefill-route large: the prompt goes through CudaEngine::prefill, so the decode CLI's large-prefill route applies.
+        const auto route = pf_large ? qp::Route::large_prefill : qp::Route::windows;
+        const auto resolved = qp::resolve(profile, qp::regime_of(opt, route, prompt_tokens), lever_cli);
         qp::apply(opt, *resolved);
         std::fputs(qp::describe(*resolved).c_str(), stderr);
         opt.max_positions = std::max<std::uint32_t>(max_pos, std::uint32_t(std::max<std::size_t>(longest, prompt_len) + n_gen + 128 +
@@ -260,17 +282,36 @@ int main(int argc, char** argv) {
             prompts.assign(1, {label, prompt});
         }
         q::SpecEngine S(*E, chain_hidden == "pre");
+        if (S.has_chain()) S.make_chain().set_kv_catchup(kv_catchup);
+        std::printf("prompt fill: route %s (engine prefill %s), mtp catch-up %s\n", pf_large ? "large" : "windows",
+                    pf_large ? (E->prefill_is_big() ? "large-M" : "windows fallback") : "-", kv_catchup ? "kv" : "full");
         const auto hid = cfg.hidden;
         (void)hid;
 
         auto prefill = [&](std::uint32_t& anchor) {
             E->reset();
             S.reset();
-            for (std::size_t p = 0; p < prompt.size(); p += 32) {
-                const auto rows = std::uint32_t(std::min<std::size_t>(32, prompt.size() - p));
-                const bool last = p + rows == prompt.size();
-                S.prefill(prompt.data() + p, rows, last ? 0 : prompt[p + rows], last, &anchor);
+            const auto t0 = std::chrono::steady_clock::now();
+            double trunk_ms = -1.0;
+            if (pf_large) {
+                trunk_ms = S.prefill_big(prompt.data(), static_cast<std::uint32_t>(prompt.size()), &anchor);
+            } else {
+                for (std::size_t p = 0; p < prompt.size(); p += 32) {
+                    const auto rows = std::uint32_t(std::min<std::size_t>(32, prompt.size() - p));
+                    const bool last = p + rows == prompt.size();
+                    S.prefill(prompt.data() + p, rows, last ? 0 : prompt[p + rows], last, &anchor);
+                }
             }
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            // TTFT stage split: trunk (large route) and the MTP feed done inside the fill (the last ring rows are written
+            // lazily by the first draft); windows = one wall (trunk + feed interleaved)
+            if (trunk_ms >= 0.0)
+                std::printf("prefill[%s]: route large, %zu tokens in %.3f s = %.1f tok/s (trunk %.3f s = %.1f tok/s, mtp feed %.3f s, catch-up %s)\n",
+                            label.c_str(), prompt.size(), ms / 1000.0, 1000.0 * double(prompt.size()) / ms, trunk_ms / 1000.0,
+                            1000.0 * double(prompt.size()) / trunk_ms, (ms - trunk_ms) / 1000.0, kv_catchup ? "kv" : "full");
+            else
+                std::printf("prefill[%s]: route windows, %zu tokens in %.3f s = %.1f tok/s (catch-up %s)\n", label.c_str(), prompt.size(),
+                            ms / 1000.0, 1000.0 * double(prompt.size()) / ms, kv_catchup ? "kv" : "full");
         };
         // Warm every row graph (commit 0 discards: no state change) so capture cost is not in any wall.
         auto warm = [&]() {
