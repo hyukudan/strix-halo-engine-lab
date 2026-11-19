@@ -38,7 +38,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         src/gemma4/kernels/a8.hip src/gemma4/kernels/attention_fast_decode.hip
         src/gemma4/kv/transactions.hip src/gemma4/kv/fp16_mirror.hip)
     target_link_libraries(strix_gemma4_device_primitives PUBLIC strix_gemma4_b_contracts "${STRIX_HIP_RUNTIME_LIBRARY}")
-    target_include_directories(strix_gemma4_device_primitives PUBLIC "${STRIX_HIP_INCLUDE_DIR}")
+    target_include_directories(strix_gemma4_device_primitives SYSTEM PUBLIC "${STRIX_HIP_INCLUDE_DIR}")
     set(gemma4_b_hip_targets strix_gemma4_device_primitives)
     if(TARGET strix_gemma4_ref)
         add_library(strix_gemma4_device STATIC src/gemma4/kernels/target.hip)

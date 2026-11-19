@@ -187,8 +187,9 @@ int main(int argc, char** argv) {
         const auto args = arguments(argc, argv);
         // Product profile: resolved and exported before any switch is read.
         namespace pr = strix::gemma4::profile;
-        const auto product = pr::resolve(args.product.value_or(pr::Name::standard), pr::App::decode_bench,
-                                    {.allow_pending = args.allow_pending});
+        pr::Inputs inputs;
+        inputs.allow_pending = args.allow_pending;
+        const auto product = pr::resolve(args.product.value_or(pr::Name::standard), pr::App::decode_bench, inputs);
         pr::apply(product);
         std::cout << "{\"profile\":" << product.json() << "}\n";
         const auto [kernel, perfopt] = host_kernel();

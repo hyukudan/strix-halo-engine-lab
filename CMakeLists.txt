@@ -3093,7 +3093,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         REQUIRED
     )
     add_library(strix_tiled_core STATIC src/core/wmma_tiled.hip)
-    target_include_directories(strix_tiled_core PUBLIC src PRIVATE "${STRIX_HIP_INCLUDE_DIR}")
+    target_include_directories(strix_tiled_core PUBLIC src include PRIVATE "${STRIX_HIP_INCLUDE_DIR}")
     target_compile_options(strix_tiled_core PRIVATE -O3 -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
         -fhip-fp32-correctly-rounded-divide-sqrt)
     set_target_properties(strix_tiled_core PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
@@ -3555,9 +3555,10 @@ int main() { return 0; }"
         target_compile_definitions(strix-hip-mtp-model-qualification PRIVATE
             STRIX_DECODE_ENTRY=strix_hip_decode_token_entry STRIX_MTP_MODEL_QUALIFICATION_RUNNER=1)
         target_include_directories(strix-hip-mtp-model-qualification PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+        # Same link closure as strix-hip-decode-token: the runner compiles the same main.
         target_link_libraries(strix-hip-mtp-model-qualification PRIVATE
-            strix_hip_runtime strix_mtp_projection_component_fixtures strix_serve strix_assets strix_qwen_model_description
-            strix_device_profile)
+            strix_hip_runtime strix_mtp_projection_component_fixtures strix_serve strix_serve_json strix_assets
+            strix_qwen_model_description strix_device_profile strix_qwen_http_session_owner)
         # Large state snapshots are diagnostic-only. Prefer the system SHA-256
         # provider when available; the portable digest remains the fallback.
         find_package(OpenSSL QUIET COMPONENTS Crypto)
