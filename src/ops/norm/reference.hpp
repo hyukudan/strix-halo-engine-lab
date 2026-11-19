@@ -36,8 +36,13 @@ void reference(const typename Traits::Input* x, const typename Traits::Scale* w,
             for (unsigned lane = 0; lane < h; ++lane)
                 partial[lane] = partial[lane] + partial[lane + h];
         const float r = Traits::inv_sqrt(partial[0] / static_cast<float>(n) + eps);
-        for (unsigned i = 0; i < n; ++i)
-            yr[i] = w ? (xr[i] * r) * Traits::load(w, wt, i) : xr[i] * r;
+        constexpr OutputForm form = output_form_of<Traits>();
+        for (unsigned i = 0; i < n; ++i) {
+            if constexpr (form == OutputForm::plain)
+                yr[i] = w ? (xr[i] * r) * Traits::load(w, wt, i) : xr[i] * r;
+            else
+                yr[i] = finish<form>(xr[i] * r, w ? Traits::load(w, wt, i) : 1.0F, w != nullptr);
+        }
     }
 }
 

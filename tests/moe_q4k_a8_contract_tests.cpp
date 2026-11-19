@@ -1,4 +1,5 @@
 #include "strix/moe_q4k_a8_contract.hpp"
+#include "strix/q51_known_rows.hpp"
 #include "strix/low_precision.hpp"
 #include "q4k_a8_oracle.hpp"
 #include <algorithm>
@@ -200,11 +201,11 @@ void tests(bool exhaustive) {
         if (change == 10) q.shape.hidden=2816;
         if (change == 11) q.shape.rows=0;
         if (change == 12) q.shape.rows=31;
-        if (change == 13) q.shape.rows=672;
+        if (change == 13) q.shape.rows=c1_max_rows+32U;  // C1 envelope (model-B preset I = 1536)
         if (change == 14) q.shape.experts=0;
         if (change == 15) q.shape.experts=513;
         if (change == 16) q.shape.top_k=0;
-        if (change == 17) q.shape.top_k=11;
+        if (change == 17) q.shape.top_k=c1_max_top_k+1U;  // C1 envelope (model-B preset top-16)
         if (change == 18) q.input=static_cast<InputKind>(99);
         if (change == 19) ++v.gate.bytes;
         if (change == 20) --v.routes.bytes;
@@ -218,6 +219,19 @@ void tests(bool exhaustive) {
                 "invalid dimensions must reject at dimension gate before incidental byte mismatch");
         }
         expect(rejected,"invalid probe admission fails before enqueue");
+    }
+    // f16x K-quant prefill envelope (model-B top-16): the prefill CSR layout admits top_k <= 16 and stays linear in rows x top_k;
+    // decode windows keep top_k <= 10; the SwiGLU clamp defaults to none.
+    {
+        namespace kr51=strix::q51_known_rows;
+        expect(kr51::prefill_max_top_k==c1_max_top_k,"prefill CSR top_k bound = the C1 envelope");
+        const auto l16=kr51::scratch_layout(4096U,512U,16U,true),l10=kr51::scratch_layout(4096U,512U,10U,true);
+        expect(l16.slots-l16.rows>=4ULL*4096U*16U&&l16.bytes>l10.bytes,"prefill CSR layout holds rows x 16 assignments");
+        bool refused17=false,refused_window=false;
+        try { (void)kr51::scratch_layout(4096U,512U,17U,true); } catch (const std::invalid_argument&) { refused17=true; }
+        try { (void)kr51::scratch_layout(8U,512U,11U,false); } catch (const std::invalid_argument&) { refused_window=true; }
+        expect(refused17&&refused_window,"prefill CSR refuses top_k 17 and the window CSR keeps top_k <= 10");
+        expect(std::isinf(Request{}.swiglu_limit)&&Request{}.swiglu_limit>0.0F,"Request clamp defaults to none (+inf)");
     }
 }
 }

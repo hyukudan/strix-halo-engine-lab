@@ -8,7 +8,8 @@
 #endif
 #include "glm/engine/glm_kvshard_math.hpp"
 #include "glm/attn/glm_dsa_policy.hpp"
-#include "glm/common/glm_dsa_pool.hpp"
+#include "glm/common/glm_math.hpp"
+#include "strix/attn/group_pool.hpp"
 #include "glm/engine/glm_kvshard_dump.hpp"
 #include "glm/engine/glm_kvshard_layout.hpp"
 #include "xport/kvshard_oracle.hpp"

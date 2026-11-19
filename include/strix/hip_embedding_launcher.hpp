@@ -72,6 +72,22 @@ void launch_hip_mtp_embedding_device(const MtpNativeContext&,const std::uint32_t
 void launch_hip_mtp_embedding_rows(std::span<const MtpNativeContext> contexts,std::span<const std::uint32_t* const> tokens,
     std::span<const std::uint32_t> values,void* stream);
 
+// Framework-free row gather over the same kernels (for an engine adapter that owns its pointers): one GGML table on
+// the device (F32 / F16 / BF16 / Q8_0 / IQ4_XS / K / GSQ kinds, row_width values per row, vocabulary_size rows).
+struct HipEmbeddingTable {
+    const void* weights = nullptr;
+    std::uint32_t ggml_type = 0, row_width = 0, vocabulary_size = 0;
+};
+// Output row t (pitch elements after row t-1) = the decoded table row of host id ids[t]; any count (launches of up
+// to 256 rows). An id >= vocabulary_size throws before anything is enqueued. FP32 stores the decoded value, BF16
+// rounds it to nearest even, exactly as launch_hip_graph_embedding stores it.
+void launch_hip_embedding_rows(const HipEmbeddingTable& table, HipActivationStorage output,
+    std::span<const std::uint32_t> ids, void* out, std::uint64_t pitch, void* stream);
+// One row for a token word on the device (sync-free decode chain); an out-of-vocabulary word reads row 0 (the
+// device-token rule of launch_hip_mtp_embedding_device: its producer rejects it).
+void launch_hip_embedding_device_row(const HipEmbeddingTable& table, HipActivationStorage output,
+    const std::uint32_t* device_id, void* out, void* stream);
+
 // Tiled prompt priming: row t loads host token tokens[t] into outputs[t] (BF16 [hidden]) with
 // launch_hip_mtp_embedding's row load/store; one owner, at most 8 rows.
 void launch_hip_mtp_embedding_rows_to(const MtpNativeContext&,std::span<const std::uint32_t> tokens,

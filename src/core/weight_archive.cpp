@@ -152,8 +152,14 @@ Archive load_safetensors(const std::filesystem::path& path) {
     return out;
 }
 std::vector<float> decode_row(const Tensor& t, std::uint64_t row) {
-    if (t.shape.empty() || t.shape.size() > 2) throw std::runtime_error("weight row needs rank 1 or 2");
-    const auto columns = t.shape.back(), rows = t.shape.size() == 1 ? 1 : t.shape.front();
+    if (t.shape.empty()) throw std::runtime_error("weight row needs rank >= 1");
+    // Rank >= 3 (stacked experts [E][rows][cols]): row indexes the flattened leading extents.
+    const auto columns = t.shape.back();
+    std::uint64_t rows = 1;
+    for (std::size_t d = 0; d + 1U < t.shape.size(); ++d) {
+        if (t.shape[d] && rows > UINT64_MAX / t.shape[d]) throw std::runtime_error("weight row count overflows");
+        rows *= t.shape[d];
+    }
     if (!columns || row >= rows || columns > SIZE_MAX / sizeof(float)) throw std::out_of_range("weight row out of range");
     std::vector<float> out(static_cast<std::size_t>(columns));
     const auto data = t.bytes();

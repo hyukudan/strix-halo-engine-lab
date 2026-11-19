@@ -12,6 +12,9 @@
 #include <cstdlib>
 #include <vector>
 using namespace strix::moe_q4k_a8;
+// Latent MoE geometry at the C1 envelope edge (1536 in and out, top-16 of 512).
+constexpr Geometry kLatent{1536, 1536, 512, 16};
+static_assert(fits_c1(kLatent));
 namespace {
 void expect(bool ok,const char* why){if(!ok) throw std::runtime_error(why);}
 void check(hipError_t e){if(e!=hipSuccess) throw std::runtime_error(hipGetErrorString(e));}
@@ -143,6 +146,68 @@ void finite_case(unsigned type,unsigned hidden,unsigned width,unsigned slots,
     for(auto* view:{&intermediates,&reference,&w,&r,&codes,&deltas,&sums,&raw,&status,&aggregate})view->guards();
     expect(w.read<std::byte>()==weights,"weights remain read-only after failures/capture");
 }
+// K-quant down trait (Q4_K 12 / Q6_K 14) at the model-B preset (H = I = 1536, top-16) with the clamp trait (L = 10):
+// (1) the clamped producer on raw projections == the unclamped producer on host-clamped projections (h, codes, deltas, sums,
+// rawdots bitwise); (2) codes / deltas / sums == the CPU quantizer of the produced h; (3) every rawdot == the CPU oracle
+// (evaluate_down_row, declared order) in FP32 bits. Synthetic weights; no model qualification.
+void kquant_case(unsigned type,unsigned slots,const strix::HipSetupQuiescenceGuard& guard,hipStream_t stream) {
+    constexpr unsigned experts=3,hidden=kLatent.hidden,width=kLatent.intermediate;
+    constexpr float limit=10.0F;
+    const auto row_bytes=static_cast<std::size_t>(down_row_bytes(type,width));
+    const std::size_t block_bytes=type==12U?144U:210U;
+    std::vector<std::byte> weights(static_cast<std::size_t>(experts)*hidden*row_bytes);
+    for(std::size_t i=0;i<weights.size();++i) weights[i]=std::byte(((i*2654435761ULL)>>13U)&255U);
+    for(std::size_t b=0;b<weights.size()/block_bytes;++b) {  // finite FP16 headers of both signs
+        put16(weights,b*block_bytes+(type==12U?0U:208U),(b%3U==0?0x9c00U:0x1c00U)|static_cast<unsigned>((b*37U)&0x3ffU));
+        if(type==12U) put16(weights,b*block_bytes+2U,0x1800U|static_cast<unsigned>((b*53U)&0x3ffU));
+    }
+    std::vector<float> raw_in(static_cast<std::size_t>(slots)*2U*width),clamped_in(raw_in.size());
+    for(unsigned slot=0;slot<slots;++slot) for(unsigned j=0;j<width;++j) {
+        const auto at=static_cast<std::size_t>(slot)*2U*width+j;
+        raw_in[at]=static_cast<float>(static_cast<int>((j*7U+slot*11U)%61U)-30)/2.0F;        // gate in [-15, 15]
+        raw_in[at+width]=static_cast<float>(static_cast<int>((j*13U+slot*5U)%53U)-26)/2.0F;  // up in [-13, 13]
+        const auto c=strix::moe::swiglu_clamp(raw_in[at],raw_in[at+width],limit);
+        clamped_in[at]=c.gate;clamped_in[at+width]=c.up;
+    }
+    std::vector<unsigned> routes(slots);for(unsigned slot=0;slot<slots;++slot)routes[slot]=(slot*2U+1U)%experts;
+    struct Run { std::vector<float> h; std::vector<std::int8_t> codes; std::vector<float> deltas; std::vector<std::int32_t> sums; std::vector<float> raw; };
+    Buffer w(weights.size(),guard),r(slots*4U,guard);w.upload(weights.data());r.upload(routes.data());
+    const auto run=[&](const std::vector<float>& input,float swiglu_limit) {
+        Buffer intermediates(input.size()*4U,guard),codes(slots*width,guard),deltas(slots*(width/32U)*4U,guard),
+            sums(slots*(width/32U)*4U,guard),raw(slots*hidden*4U,guard),status(4,guard),aggregate(4,guard);
+        const unsigned zero=0;intermediates.upload(input.data());status.upload(&zero);aggregate.upload(&zero);
+        DownRequest req;req.enabled=true;req.approved_numerical_identity=down_numerical_identity(type);
+        req.shape={hidden,width,experts,slots};req.weight_type=type;req.swiglu_limit=swiglu_limit;
+        DownBindings b{intermediates.view(),w.view(),r.view(),codes.view(),deltas.view(),sums.view(),raw.view(),status.view(),aggregate.view()};
+        guard.run([&]{enqueue_down_activation_quantize(req,b,stream);enqueue_down_rawdots(req,b,stream);check(hipStreamSynchronize(stream));});
+        expect(status.read<unsigned>()[0]==0 && aggregate.read<unsigned>()[0]==0,"K-quant finite producer status");
+        for(auto* view:{&intermediates,&codes,&deltas,&sums,&raw,&status,&aggregate})view->guards();
+        return Run{intermediates.read<float>(),codes.read<std::int8_t>(),deltas.read<float>(),sums.read<std::int32_t>(),raw.read<float>()};
+    };
+    const auto clamped=run(raw_in,limit),reference=run(clamped_in,strix::moe::kSwigluNoClamp);
+    for(unsigned slot=0;slot<slots;++slot) expect(std::memcmp(clamped.h.data()+slot*2U*width,reference.h.data()+slot*2U*width,width*4U)==0,
+        "clamp trait == unclamped producer on clamped projections (h bits)");
+    expect(clamped.codes==reference.codes && clamped.sums==reference.sums &&
+        std::memcmp(clamped.deltas.data(),reference.deltas.data(),clamped.deltas.size()*4U)==0 &&
+        std::memcmp(clamped.raw.data(),reference.raw.data(),clamped.raw.size()*4U)==0,"clamp trait == pre-clamped producer (codes, rawdots)");
+    bool clamp_power=false;
+    for(unsigned slot=0;slot<slots;++slot) {
+        const auto h=std::span<const float>(clamped.h).subspan(static_cast<std::size_t>(slot)*2U*width,width);
+        for(unsigned j=0;j<width;++j) {const auto at=static_cast<std::size_t>(slot)*2U*width+j;clamp_power|=raw_in[at]!=clamped_in[at]||raw_in[at+width]!=clamped_in[at+width];}
+        const auto q=quantize_down_values(h);
+        expect(std::equal(q.codes.begin(),q.codes.end(),clamped.codes.begin()+slot*width),"K-quant codes vs CPU quantizer");
+        for(unsigned g=0;g<width/32U;++g) expect(clamped.sums[slot*(width/32U)+g]==q.sums[g] &&
+            std::bit_cast<unsigned>(clamped.deltas[slot*(width/32U)+g])==std::bit_cast<unsigned>(q.deltas[g]),"K-quant delta/C vs CPU quantizer");
+        for(unsigned row=0;row<hidden;++row) {
+            const auto at=(static_cast<std::size_t>(routes[slot])*hidden+row)*row_bytes;
+            const auto expected=evaluate_down_row(std::span<const std::byte>(weights).subspan(at,row_bytes),q,type);
+            expect(std::bit_cast<unsigned>(expected)==std::bit_cast<unsigned>(clamped.raw[slot*hidden+row]),
+                "K-quant rawdot FP32 bits vs original-byte CPU oracle");
+        }
+    }
+    expect(clamp_power,"fixture exercises the clamp");
+    expect(w.read<std::byte>()==weights,"K-quant weights read-only");
+}
 }
 int main() try {
     strix::HipSetupQuiescenceGuard guard;expect(guard.architecture().starts_with("gfx1151"),"actual gfx1151 required");
@@ -151,5 +216,7 @@ int main() try {
     setenv("STRIX_GSQ_Q20_A8","1",1);
     for(unsigned type:{7U,8U,42U,20U}) for(unsigned width:{128U,640U}) for(unsigned slots:{1U,10U})
         finite_case(type,width==128U?64U:2560U,width,slots,guard,stream.value);
+    for(unsigned type:{12U,14U}) for(unsigned slots:{1U,16U}) kquant_case(type,slots,guard,stream.value);
+    std::cout<<"A8 down K-quant (model-B preset H=I=1536 top-16 clamp 10) Q4_K/Q6_K PASS\n";
     std::cout<<"A8 down component fixtures PASS; no model quality/performance qualification\n";
 } catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

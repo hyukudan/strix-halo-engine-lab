@@ -97,6 +97,35 @@ void numeric_case(unsigned n, Format format, bool weighted, float eps) {
     Norm::run(x.data(), w, format, n, eps, x.data(), rows, &checks);
     for (std::size_t i = 0; i < count; ++i) require(bits_equal(x[i], expected[i]), "in-place bits");
 }
+struct Bf16DoubleTraits : HostTraits {
+    static constexpr auto output_form = strix::ops::norm::OutputForm::bf16_double;
+};
+
+// Independent BF16 round-to-nearest-even of a finite float (fixture values are finite).
+float rne(float x) {
+    std::uint32_t u;
+    std::memcpy(&u, &x, sizeof(u));
+    u = (u + 0x7FFFU + ((u >> 16U) & 1U)) & 0xFFFF0000U;
+    float r;
+    std::memcpy(&r, &u, sizeof(r));
+    return r;
+}
+
+// bf16_double: y = R(w * R(x*r)) and unit scale y = R(x*r), with x*r the plain unit-scale output (same reduction).
+void bf16_double_case(unsigned n, bool weighted) {
+    std::vector<float> x(n), w(n), plain(n), y(n);
+    for (unsigned i = 0; i < n; ++i) {
+        x[i] = std::sin(0.37F * static_cast<float>(i) + 0.1F) * 3.0F;
+        w[i] = 1.0F + 0.01F * static_cast<float>(i % 17U);
+    }
+    strix::ops::norm::reference<HostTraits>(x.data(), nullptr, Format::f32, n, 1e-5F, plain.data(), 1);
+    strix::ops::norm::reference<Bf16DoubleTraits>(x.data(), weighted ? w.data() : nullptr, Format::f32, n, 1e-5F, y.data(), 1);
+    for (unsigned i = 0; i < n; ++i) {
+        const float want = weighted ? rne(w[i] * rne(plain[i])) : rne(plain[i]);
+        require(bits_equal(y[i], want), "bf16_double form");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -111,6 +140,9 @@ int main() {
                         numeric_case(n, format, weighted, eps);
                         ++cases;
                     }
+        static_assert(strix::ops::norm::output_form_of<HostTraits>() == strix::ops::norm::OutputForm::plain);
+        for (unsigned n : {1U, 96U, 512U, 1536U, 3072U})
+            for (bool weighted : {false, true}) bf16_double_case(n, weighted);
         float zero[4] = {}, y[4] = {1, 1, 1, 1};
         strix::ops::norm::reference<HostTraits>(zero, nullptr, Format::f32, 4, Norm::epsilon, y, 1);
         for (float value : y) require(value == 0.0F, "zero row");

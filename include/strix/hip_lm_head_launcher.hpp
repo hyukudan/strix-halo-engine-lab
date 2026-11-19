@@ -25,6 +25,24 @@ struct HipLmHeadLauncherConfig {
     std::uint32_t rows_lean = 0;
 };
 
+// Dense rows GEMV through the head family's weight traits, raw device pointers (no execution contract):
+//   out[r * out_stride + o] = sum_k W[o][k] * x[r * x_stride + k], FP32 out, o < outputs, r < rows.
+// W is [outputs][width] in GGUF type ggml_type: F32 (0), F16 (1), Q8_0 (8, width % 32 == 0) or BF16 (30). x is FP32 or BF16
+// bits (input). Arithmetic = the generic head kernel (lm_head_kernel): 256 lanes stride the width, FP32 products and
+// sums, LDS halving tree. rows == 1: one launch of `outputs` blocks. rows > 1: ONE launch of the rows tile
+// (strix/dense_rows_tile.hpp), every (row, output) bitwise equal to its single-row launch. Users: model heads, routers,
+// small F32/BF16 projections.
+struct HipDenseRowsView {
+    const void* x = nullptr;
+    HipActivationStorage input = HipActivationStorage::bf16;
+    const void* weights = nullptr;
+    std::uint32_t ggml_type = 30;
+    std::uint32_t width = 0, outputs = 0, rows = 1;
+    std::uint32_t x_stride = 0, out_stride = 0;  // elements; 0 = width / outputs
+    float* out = nullptr;
+    bool row_loop = false;  // true: one single-row launch per row (off switch of the rows tile; identity reference)
+};
+void launch_hip_dense_rows(const HipDenseRowsView& view, void* stream);
 void register_hip_lm_head_kernel_variant(
     const ModelContract& model,
     const ExecutionBindingRequest& request,

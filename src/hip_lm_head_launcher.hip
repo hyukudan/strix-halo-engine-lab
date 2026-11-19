@@ -15,6 +15,7 @@
 #include "strix/q8_projection_organization.hpp"
 
 #include "strix/dispatch_resources.hpp"
+#include "strix/dense_rows_tile.hpp"
 #include "strix/q6p_registry.hpp"
 #include "hip_q6p_weights.hpp"
 
@@ -466,6 +467,61 @@ __global__ void lm_head_kernel(
     if (threadIdx.x == 0) {
         logits[vocab_row] =
             scratch[0];
+    }
+}
+
+// Rows form of lm_head_kernel (strix/dense_rows_tile.hpp): block (bx, by) computes kOut outputs x kRows rows. Lane t keeps
+// one chain per value over the features t + kThreads * k in k order (the same `sum += activation * weight` expression),
+// then each value runs the single-row LDS tree (distances 128 .. 1). One weight load feeds kRows chains and one
+// activation load feeds kOut chains; the bits of every (row, output) equal its single-row launch.
+template <typename Input, WeightKind Kind>
+__global__ __launch_bounds__(kThreads) void dense_rows_tile_kernel(
+    const Input* x, std::uint32_t x_stride, const void* weights, std::uint32_t width, std::uint32_t outputs,
+    std::uint32_t rows, float* out, std::uint32_t out_stride) {
+    namespace drt = strix::dense_rows_tile;
+    static_assert(drt::kLanes == kThreads, "the rows tile keeps the single-row lane count");
+    __shared__ float scratch[drt::kTreeValues * drt::kLanes];
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x);
+    const auto bx = static_cast<std::uint32_t>(blockIdx.x), by = static_cast<std::uint32_t>(blockIdx.y);
+    std::uint32_t wrow[drt::kOut];
+    const Input* xrow[drt::kRows];
+#pragma unroll
+    for (std::uint32_t o = 0; o < drt::kOut; ++o) wrow[o] = drt::clamp_index(bx * drt::kOut + o, outputs);
+#pragma unroll
+    for (std::uint32_t r = 0; r < drt::kRows; ++r)
+        xrow[r] = x + static_cast<std::size_t>(drt::clamp_index(by * drt::kRows + r, rows)) * x_stride;
+    float acc[drt::kValues];
+#pragma unroll
+    for (std::uint32_t v = 0; v < drt::kValues; ++v) acc[v] = 0.0F;
+    for (std::uint32_t feature = lane; feature < width; feature += kThreads) {
+        float a[drt::kRows];
+#pragma unroll
+        for (std::uint32_t r = 0; r < drt::kRows; ++r) a[r] = load_activation(&xrow[r][feature]);
+#pragma unroll
+        for (std::uint32_t o = 0; o < drt::kOut; ++o) {
+            const float w = load_weight<Kind>(weights, width, wrow[o], feature);
+#pragma unroll
+            for (std::uint32_t r = 0; r < drt::kRows; ++r) acc[o * drt::kRows + r] += a[r] * w;
+        }
+    }
+#pragma unroll
+    for (std::uint32_t base = 0; base < drt::kValues; base += drt::kTreeValues) {
+#pragma unroll
+        for (std::uint32_t v = 0; v < drt::kTreeValues; ++v) scratch[v * drt::kLanes + lane] = acc[base + v];
+        __syncthreads();
+        for (std::uint32_t shift = drt::kLaneShift - 1U;; --shift) {
+            for (std::uint32_t item = lane; item < drt::tree_items(shift); item += kThreads) {
+                const auto t = drt::tree_item(item, shift);
+                scratch[t.dst] += scratch[t.src];
+            }
+            __syncthreads();
+            if (shift == 0U) break;
+        }
+        if (lane < drt::kTreeValues) {
+            const auto o = drt::value_output(bx, base + lane), r = drt::value_row(by, base + lane);
+            if (o < outputs && r < rows) out[static_cast<std::size_t>(r) * out_stride + o] = scratch[lane * drt::kLanes];
+        }
+        __syncthreads();
     }
 }
 
@@ -1312,8 +1368,52 @@ std::uint64_t implementation_identity(
     if (config.wave8_q8_wave) hash_u64(hash, 0x4c4d513857415638ULL);
     return hash;
 }
+template <typename Input, WeightKind Kind>
+void launch_dense_rows_typed(const HipDenseRowsView& v, hipStream_t stream) {
+    const auto x_stride = v.x_stride ? v.x_stride : v.width;
+    const auto out_stride = v.out_stride ? v.out_stride : v.outputs;
+    if (v.rows > 1 && !v.row_loop) {
+        const auto g = strix::dense_rows_tile::grid(v.rows, v.outputs);
+        if (g.y > 65535U) throw std::invalid_argument("HIP dense rows: too many rows for one rows-tile launch");
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(dense_rows_tile_kernel<Input, Kind>), dim3(g.x, g.y), dim3(kThreads), 0, stream,
+            static_cast<const Input*>(v.x), x_stride, v.weights, v.width, v.outputs, v.rows, v.out, out_stride);
+        check_hip(hipGetLastError(), "HIP dense rows tile launch");
+        return;
+    }
+    for (std::uint32_t r = 0; r < v.rows; ++r) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(lm_head_kernel<Input, Kind>), dim3(v.outputs), dim3(kThreads), 0, stream,
+            static_cast<const Input*>(v.x) + static_cast<std::size_t>(r) * x_stride, v.weights, v.width, v.outputs,
+            v.out + static_cast<std::size_t>(r) * out_stride);
+    }
+    check_hip(hipGetLastError(), "HIP dense rows launch");
+}
+template <typename Input>
+void launch_dense_rows_input(const HipDenseRowsView& v, hipStream_t stream) {
+    switch (weight_kind(v.ggml_type)) {
+    case WeightKind::f32: launch_dense_rows_typed<Input, WeightKind::f32>(v, stream); return;
+    case WeightKind::f16: launch_dense_rows_typed<Input, WeightKind::f16>(v, stream); return;
+    case WeightKind::bf16: launch_dense_rows_typed<Input, WeightKind::bf16>(v, stream); return;
+    case WeightKind::q8_0:
+        if (v.width % 32U != 0) throw std::invalid_argument("HIP dense rows: Q8_0 width must be a multiple of 32");
+        launch_dense_rows_typed<Input, WeightKind::q8_0>(v, stream);
+        return;
+    default: throw std::invalid_argument("HIP dense rows supports F32, F16, BF16 and Q8_0 weights");
+    }
+}
 
 }  // namespace
+void launch_hip_dense_rows(const HipDenseRowsView& v, void* stream) {
+    if (!v.x || !v.weights || !v.out || v.width == 0 || v.outputs == 0 || v.rows == 0)
+        throw std::invalid_argument("HIP dense rows: null pointer or empty geometry");
+    if ((v.x_stride != 0 && v.x_stride < v.width) || (v.out_stride != 0 && v.out_stride < v.outputs))
+        throw std::invalid_argument("HIP dense rows: stride below the row width");
+    const auto s = static_cast<hipStream_t>(stream);
+    switch (v.input) {
+    case HipActivationStorage::bf16: launch_dense_rows_input<std::uint16_t>(v, s); return;
+    case HipActivationStorage::fp32: launch_dense_rows_input<float>(v, s); return;
+    }
+    throw std::invalid_argument("HIP dense rows: unknown input storage");
+}
 
 void register_hip_lm_head_kernel_variant(
     const ModelContract& model,

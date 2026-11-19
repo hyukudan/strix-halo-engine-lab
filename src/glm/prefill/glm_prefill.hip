@@ -4,6 +4,7 @@
 // -fno-gpu-flush-denormals-to-zero.
 #include "glm/prefill/glm_prefill.hpp"
 #include "attn_core/select.hpp"
+#include "strix/attn/group_pool.hpp"
 #include "glm/prefill/glm_pf_variants.hpp"
 #include "glm/prefill/glm_pf_workspace.hpp"
 #include "glm/prefill/glm_pf_aux.hpp"
@@ -378,17 +379,12 @@ __global__ __launch_bounds__(128) void dsa_pool_kernel(DsaSlot sl, unsigned p0, 
     const unsigned global = p0 + blockIdx.x;
     if (kv_shard && global % 2 != rank) return;
     const unsigned p = kv_shard ? global / 2 : global, i = threadIdx.x, t0 = p * kKpool;
-    float l4[kKpool], kv[kKpool], e[kKpool], pr[kKpool];
+    float l4[kKpool], kv[kKpool];
     for (unsigned j = 0; j < kKpool; ++j) {
         l4[j] = bf16_to_float(sl.igate[static_cast<std::size_t>(t0 + j) * kIdxDim + i]) + w.ape[j * kIdxDim + i];
         kv[j] = bf16_to_float(sl.ikey[static_cast<std::size_t>(t0 + j) * kIdxDim + i]);
     }
-    float m = l4[0];
-    for (unsigned j = 1; j < kKpool; ++j) m = l4[j] > m ? l4[j] : m;
-    for (unsigned j = 0; j < kKpool; ++j) e[j] = declared_exp(l4[j] - m);
-    const float sum = ((e[0] + e[1]) + e[2]) + e[3];
-    for (unsigned j = 0; j < kKpool; ++j) pr[j] = e[j] / sum;
-    const float K = ((pr[0] * kv[0] + pr[1] * kv[1]) + pr[2] * kv[2]) + pr[3] * kv[3];
+    const float K = strix::attn::group_indexer::gated_pool_channel<kKpool>(l4, kv, strix::attn::group_pool::Fn<declared_exp>{});
     if (!is_finite(K)) atomicOr(flag, 1U);
     sl.pooled[static_cast<std::size_t>(p) * kIdxDim + i] = K;
 }

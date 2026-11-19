@@ -22,7 +22,7 @@ struct EncodeMark {
 // `token_type`, `merges`, `pre`). Encoding splits the text on control and user-defined tokens
 // (when special parsing is on), pre-tokenizes every other piece with the model's pattern, maps its
 // bytes to the byte-level alphabet and applies the merges by rank. Decoding inverts the byte map.
-// The `qwen35`, the DeepSeek V3/V4 (`joyai-llm`, `deepseek-v3`) and the GLM-4/5 (`glm4`) pre-tokenizers are
+// The `qwen35`, the DeepSeek V3/V4 (`joyai-llm`, `deepseek-v3`, `hy_v4`) and the GLM-4/5 (`glm4`) pre-tokenizers are
 // implemented; other tokenizers are rejected at load.
 class BpeTokenizer {
 public:

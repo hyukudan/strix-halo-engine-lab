@@ -12,6 +12,7 @@
 
 #include "strix/ds41_formats.hpp"
 #include "strix/ds41_msvc_builtins.hpp"
+#include "strix/moe/activation_policy.hpp"
 
 #include <cstdint>
 #include <span>
@@ -51,12 +52,11 @@ STRIX_DS41_HD inline float declared_exp(float x) {
     const int k = static_cast<int>(n), k1 = k / 2, k2 = k - k1;
     return (p * detail::pow2(k1)) * detail::pow2(k2);
 }
-// SwiGLU with the model's clamps: gate clamped from above, up on both sides, then
+// SwiGLU with the model's clamps (the shared moe clamp trait: gate clamped from above, up on both sides), then
 // silu(g) * u with silu(g) = g / (1 + exp(-g)). NaN inputs propagate.
 STRIX_DS41_HD inline float swiglu_clamped(float gate, float up, float limit) {
-    const float g = gate > limit ? limit : gate;
-    const float u = up < -limit ? -limit : (up > limit ? limit : up);
-    return (g / (1.0F + declared_exp(-g))) * u;
+    const auto c = strix::moe::swiglu_clamp(gate, up, limit);
+    return (c.gate / (1.0F + declared_exp(-c.gate))) * c.up;
 }
 
 // Natural logarithm of a positive normal float from basic IEEE operations: y = m * 2^k with m in

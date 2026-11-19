@@ -1,4 +1,5 @@
 #include "strix/minimax_moe.hpp"
+#include "strix/moe/route_policy.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -21,7 +22,7 @@ void post_exchange_row(float* h, const float* part0, const float* part1, const f
 }
 
 RouteRow route_row(const float* y, const float* router_w, const float* bias) {
-    float s[kExperts], c[kExperts];
+    float s[kExperts];
     for (unsigned e = 0; e < kExperts; ++e) {
         const float* w = router_w + static_cast<std::size_t>(e) * kHidden;
         float lanes[kRouterLanes];
@@ -32,19 +33,13 @@ RouteRow route_row(const float* y, const float* router_w, const float* bias) {
         }
         msa::butterfly(lanes);
         s[e] = 1.0F / (1.0F + msa::exp_f(-lanes[0]));
-        c[e] = s[e] + bias[e];
     }
-    std::uint32_t order[kExperts];
-    std::iota(order, order + kExperts, 0U);
-    std::partial_sort(order, order + kTopE, order + kExperts,
-                      [&](std::uint32_t a, std::uint32_t b) { return c[a] != c[b] ? c[a] > c[b] : a < b; });
+    // Selection and weights: the shared router policy (preset minimax_m3 = the device route_topk serial scan; the former
+    // partial_sort gave the same picks for finite choices and was not a strict weak order for NaN).
+    static_assert(strix::moe::preset::minimax_m3.experts == kExperts && strix::moe::preset::minimax_m3.top_k == kTopE &&
+                  strix::moe::preset::minimax_m3.scale == kRouteScale && strix::moe::preset::minimax_m3.renorm_eps == kSumEps);
     RouteRow out{};
-    float sum = 0.0F;
-    for (unsigned k = 0; k < kTopE; ++k) sum = sum + s[order[k]];
-    for (unsigned k = 0; k < kTopE; ++k) {
-        out.ids[k] = order[k];
-        out.weights[k] = (s[order[k]] / (sum + kSumEps)) * kRouteScale;
-    }
+    strix::moe::route_select_ref(strix::moe::preset::minimax_m3, s, std::span<const float>(bias, kExperts), out.ids, out.weights);
     return out;
 }
 

@@ -44,6 +44,10 @@ def main():
     original_signature = re.search(r"__global__ void rmsnorm_kernel[^{}]+(?=\{)", before)[0]
     assert canon(signature) == canon(original_signature), "kernel signature/attributes"
     normalized = body(shared, "rmsnorm_kernel")
+    # The output-form trait (norm.hpp OutputForm): GLM binds the plain form; compare only that branch.
+    head, rest = normalized.split("constexpr OutputForm form = output_form_of<Traits>();", 1)
+    branch = rest.split("if constexpr (form == OutputForm::plain) {", 1)[1].split("} else {", 1)[0]
+    normalized = head + branch + "}"
     # Remove only these compile-time type/order checks, then undo the three
     # adapter qualifications. Every arithmetic token must match the baseline.
     for check in (

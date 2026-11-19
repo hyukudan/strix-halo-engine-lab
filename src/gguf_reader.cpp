@@ -72,6 +72,7 @@ public:
                 fail("GGUF padding must contain zero bytes");
             }
         }
+        info.strix_nvfp4_tile_pack = tensor_names_.count(kNvfp4TilePackMarker) != 0;
         for (auto& tensor : info.tensors) {
             if (tensor.relative_offset % info.alignment != 0) {
                 fail("tensor offset is not aligned");
@@ -80,7 +81,7 @@ public:
             if (tensor.absolute_offset > file_size_) {
                 fail("tensor offset exceeds file size");
             }
-            tensor.byte_size = tensor_size(tensor);
+            tensor.byte_size = tensor_size(tensor, info.is_f8_e4m3(tensor));
             tensor.absolute_end = checked_add(tensor.absolute_offset, tensor.byte_size);
             if (tensor.absolute_end > file_size_) {
                 fail("tensor data range exceeds file size");
@@ -337,8 +338,10 @@ private:
         }
     }
 
-    static std::uint64_t tensor_size(const TensorInfo& tensor) {
-        const auto geometry = tensor_type_geometry(tensor.ggml_type);
+    static std::uint64_t tensor_size(const TensorInfo& tensor, bool f8_e4m3) {
+        // Upstream F8_E4M3 (id 43 outside a Strix tile pack, see gguf_reader.hpp): one byte per element.
+        const auto geometry = f8_e4m3 ? std::optional<TensorTypeGeometry>{TensorTypeGeometry{1, 1}}
+                                      : tensor_type_geometry(tensor.ggml_type);
         if (!geometry.has_value()) {
             fail("GGML tensor type has no pinned storage geometry");
         }

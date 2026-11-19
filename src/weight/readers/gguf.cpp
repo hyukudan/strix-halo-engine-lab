@@ -10,6 +10,8 @@ Status index_gguf(const gguf::FileInfo& parsed,std::shared_ptr<const Source> sou
         for(const auto& t:parsed.tensors) {
             if(t.dimensions.empty() || t.dimensions.size()>4)return {Error::unsupported_shape,"GGUF logical rank outside 1..4"};
             RawTensor raw;raw.id=tensor_id(*source,t.name,result.header_identity);raw.name=t.name;raw.wire_type=t.ggml_type;
+            // Wire id 43 outside a Strix tile pack is upstream F8_E4M3 (gguf_reader.hpp): admitted as the typed e4m3 scalar.
+            if(parsed.is_f8_e4m3(t))raw.wire_dtype="F8_E4M3";
             raw.shape.rank=std::uint8_t(t.dimensions.size());raw.extents.assign(t.dimensions.rbegin(),t.dimensions.rend());
             // The public shape is row-major logical [N,K]; GGUF stores contiguous K first.
             std::reverse_copy(t.dimensions.begin(),t.dimensions.end(),raw.shape.dims.begin());

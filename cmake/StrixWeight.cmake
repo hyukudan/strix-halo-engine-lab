@@ -15,6 +15,7 @@ add_library(strix-weight STATIC
     ${STRIX_WEIGHT_ROOT}/src/weight/adapters/gemma4.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/adapters/h3.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/adapters/vision.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/tensor_map.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/resolve.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/cache.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/image_identity.cpp

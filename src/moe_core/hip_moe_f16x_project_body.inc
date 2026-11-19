@@ -176,7 +176,14 @@ if constexpr(BWords>=4U)
         const unsigned r=row_of(live?a:0U),slot=slot_of(live?a:0U);
         const float unscale=ldexpf(1.0F,-exp_of(live?a:0U));
         const float g=acc[mi][0][e]*unscale,u=acc[mi][1][e]*unscale;
+#ifdef STRIX_F16X_SWIGLU_LIMIT
+        // Clamp trait (project_prefill_f16x_clamped, strix::moe::swiglu_clamp): the product of the clamped projections; `bad`
+        // below stays on the raw g / u (fail closed, as the C1 trait).
+        const auto clamped=strix::moe::swiglu_clamp(g,u,STRIX_F16X_SWIGLU_LIMIT);
+        const float hv=(clamped.gate/(1.0F+expf(-clamped.gate)))*clamped.up;
+#else
         const float hv=(g/(1.0F+expf(-g)))*u;
+#endif
         const bool bad=!isfinite(g)||!isfinite(u)||!isfinite(hv);
         if(live) {
             if constexpr((Core&4U)!=0U)f16_store_global(at(view.output,r)+slot*2U*outputs+out,hv);

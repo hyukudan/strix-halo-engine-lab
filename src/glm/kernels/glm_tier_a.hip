@@ -4,7 +4,7 @@
 #include "glm_norm.hpp"
 #include "strix/hip_argmax_core.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
-#include "moe_core/route.hpp"
+#include "moe_core/route_wave_kernel.hpp"  // shared router + combine kernels
 #include "../../ops/norm/norm_device.hpp"
 #include "../../core/ordered_reduce.hpp"
 
@@ -213,68 +213,14 @@ __global__ __launch_bounds__(128) void kda_out_kernel(KdaDev k, const float* o, 
 }
 
 // ---------------------------------------------------------------- router, combine, swiglu, argmax
-// One wave per row (P3): each lane owns experts lane + 32 i (288 = 9 x 32). The sigmoid and the biased key are the same
-// expressions per expert as the former lane-0 loop; the k-pass selection is the shared moe_core::route_wave_topk XOR tree on
-// the 32-bit ordered keys (carried as float bits; the exchanges move bits only), largest key first, ties -> lower index, so
-// the 8 picks equal the serial scan's. Sorting, the ascending denominator sum and the weights stay on lane 0, unchanged.
-struct GlmRouteWavePolicy {
-    static constexpr std::uint32_t candidates = kExperts / 32, wave = 32;
-    static_assert(kExperts % 32 == 0 && candidates <= 32, "route_kernel: experts must fill the wave candidate mask");
-    std::uint32_t lane;
-    std::uint32_t* pick;
-    template <class T>
-    __device__ static T xor32(T value, int mask) { return strix::qwen_dpp::xor32(value, static_cast<unsigned>(mask)); }
-    __device__ static bool better(float a, std::uint32_t ai, float b, std::uint32_t bi) {
-        const std::uint32_t ka = __builtin_bit_cast(std::uint32_t, a), kb = __builtin_bit_cast(std::uint32_t, b);
-        return ka > kb || (ka == kb && ai < bi);
-    }
-    __device__ void record(std::uint32_t slot, bool, float, std::uint32_t index) const {
-        if (lane == 0) pick[slot] = index;  // every slot has a candidate: 288 experts, 8 passes
-    }
+// Router and combine: the shared moe_core family (src/moe_core/route_wave_kernel.hpp, lifted from here unchanged) on
+// preset::glm5 (sigmoid + bias, ordered keys, ascending ids, x 2.5) and CombineForm::fma_f32 (fma chain + shared).
+struct GlmRouteMath {
+    STRIX_GLM_HD static float exp(float x) { return declared_exp(x); }
 };
-
-__global__ void route_kernel(const float* logits, const float* bias, std::uint32_t* ids, float* w) {
-    __shared__ float sg[kExperts];
-    __shared__ std::uint32_t pick_s[kTopE];
-    const unsigned r = blockIdx.x, lane = threadIdx.x;
-    const float* lg = logits + static_cast<std::size_t>(r) * kExperts;
-    float key[GlmRouteWavePolicy::candidates];
-#pragma unroll
-    for (unsigned i = 0; i < GlmRouteWavePolicy::candidates; ++i) {
-        const unsigned e = lane + 32 * i;
-        const float v = sigmoid(lg[e]);
-        sg[e] = v;
-        key[i] = __builtin_bit_cast(float, ordered_key(v + bias[e]));
-    }
-    strix::moe_core::route_wave_topk(key, (1U << GlmRouteWavePolicy::candidates) - 1U, kExperts, kTopE, lane,
-                                     GlmRouteWavePolicy{lane, pick_s});
-    __syncthreads();
-    if (lane != 0) return;
-    std::uint32_t pick[kTopE];
-    for (unsigned k = 0; k < kTopE; ++k) pick[k] = pick_s[k];
-    for (unsigned a = 1; a < kTopE; ++a)  // ascending id
-        for (unsigned b = a; b > 0 && pick[b - 1] > pick[b]; --b) {
-            const std::uint32_t t = pick[b];
-            pick[b] = pick[b - 1];
-            pick[b - 1] = t;
-        }
-    float den = 0.0F;
-    for (unsigned k = 0; k < kTopE; ++k) den = den + sg[pick[k]];
-    den = den + kRouteDenEps;
-    for (unsigned k = 0; k < kTopE; ++k) {
-        ids[static_cast<std::size_t>(r) * kTopE + k] = pick[k];
-        w[static_cast<std::size_t>(r) * kTopE + k] = (sg[pick[k]] / den) * kRouteScale;
-    }
-}
-
-__global__ void moe_combine_kernel(const float* w, const float* eo, const float* shared, float* y) {
-    const unsigned r = blockIdx.y, d = blockIdx.x * 256 + threadIdx.x;
-    if (d >= kHidden) return;
-    float acc = 0.0F;
-    for (unsigned k = 0; k < kTopE; ++k)
-        acc = __builtin_fmaf(w[static_cast<std::size_t>(r) * kTopE + k], eo[(static_cast<std::size_t>(r) * kTopE + k) * kHidden + d], acc);
-    y[static_cast<std::size_t>(r) * kHidden + d] = acc + shared[static_cast<std::size_t>(r) * kHidden + d];
-}
+static_assert(strix::moe::preset::glm5.experts == kExperts && strix::moe::preset::glm5.top_k == kTopE &&
+                  strix::moe::preset::glm5.scale == kRouteScale && strix::moe::preset::glm5.renorm_eps == kRouteDenEps,
+              "GLM route constants = preset::glm5");
 
 __global__ void swiglu_kernel(const float* g, const float* u, float* a, std::size_t n) {
     const std::size_t i = blockIdx.x * std::size_t{256} + threadIdx.x;
@@ -351,11 +297,12 @@ void kda_step(const KdaDev& k, const float* qkv, const float* f, const float* ga
     ok(hipGetLastError(), "glm kda_out");
 }
 void route(const float* logits, const float* bias, std::uint32_t* ids, float* w, unsigned rows, hipStream_t s) {
-    route_kernel<<<rows, 32, 0, s>>>(logits, bias, ids, w);
+    strix::moe_core::enqueue_route_wave<strix::moe::preset::glm5, GlmRouteMath>(logits, bias, ids, w, rows, s);
     ok(hipGetLastError(), "glm route");
 }
 void moe_combine(const float* w, const float* eo, const float* shared, float* y, unsigned rows, hipStream_t s) {
-    moe_combine_kernel<<<dim3(kHidden / 256, rows), 256, 0, s>>>(w, eo, shared, y);
+    static_assert(kHidden % 256 == 0, "combine grid");
+    strix::moe_core::enqueue_combine<strix::moe::CombineForm::fma_f32, kTopE, kHidden>(w, eo, shared, y, rows, s);
     ok(hipGetLastError(), "glm moe_combine");
 }
 void swiglu(const float* g, const float* u, float* a, std::size_t n, hipStream_t s) {

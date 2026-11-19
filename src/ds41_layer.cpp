@@ -1,4 +1,5 @@
 #include "strix/ds41_layer.hpp"
+#include "strix/engram/inject.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -263,31 +264,21 @@ std::array<float, hc_copies> engram_gates(std::span<const float> stream, std::sp
     const std::size_t hidden = stream.size() / hc_copies;
     require(stream.size() == hidden * hc_copies && kv.size() == hidden * (hc_copies + 1) && qn.size() == stream.size() &&
                 kn.size() == stream.size(), "Engram gate geometry");
-    const float inv_sqrt_hidden = static_cast<float>(1.0 / std::sqrt(static_cast<double>(hidden)));
+    std::vector<float> scratch(stream.begin(), stream.end());  // the shared reference updates in place; gates only here
     std::array<float, hc_copies> gates{};
-    for (std::uint32_t c = 0; c < hc_copies; ++c) {
-        const float* h = stream.data() + c * hidden;
-        const float* key = kv.data() + c * hidden;
-        const float* q = qn.data() + c * hidden;
-        const float* k = kn.data() + c * hidden;
-        const float rh = declared_rsqrt(chunked_dot(h, nullptr, hidden) / static_cast<float>(hidden) + eps);
-        const float rk = declared_rsqrt(chunked_dot(key, nullptr, hidden) / static_cast<float>(hidden) + eps);
-        const float dot_sum = chunked_dot_of([&](std::size_t i) { return h[i] * (q[i] * k[i]); },
-                                          [&](std::size_t i) { return key[i]; }, hidden);
-        const float dot = (dot_sum * (rh * rk)) * inv_sqrt_hidden;
-        gates[c] = engram_gate_of(dot);
-    }
+    engram::inject_row_reference(engram::InjectForm::folded, hc_copies, static_cast<std::uint32_t>(hidden), eps, scratch.data(),
+                                 kv.data(), qn.data(), kn.data(), false, gates.data());
     return gates;
 }
 
+// Shared Engram injection contract (include/strix/engram/inject.hpp), folded form.
 void engram_inject(std::span<float> stream, std::span<const float> kv, std::span<const float> qn, std::span<const float> kn,
                    float eps, bool gate_off) {
-    auto gates = engram_gates(stream, kv, qn, kn, eps);
-    if (gate_off) gates.fill(0.0F);
     const std::size_t hidden = stream.size() / hc_copies;
-    const float* value = kv.data() + hc_copies * hidden;
-    for (std::uint32_t c = 0; c < hc_copies; ++c)
-        for (std::size_t i = 0; i < hidden; ++i) stream[c * hidden + i] = stream[c * hidden + i] + gates[c] * value[i];
+    require(stream.size() == hidden * hc_copies && kv.size() == hidden * (hc_copies + 1) && qn.size() == stream.size() &&
+                kn.size() == stream.size(), "Engram gate geometry");
+    engram::inject_row_reference(engram::InjectForm::folded, hc_copies, static_cast<std::uint32_t>(hidden), eps, stream.data(),
+                                 kv.data(), qn.data(), kn.data(), gate_off);
 }
 
 } // namespace strix::ds41

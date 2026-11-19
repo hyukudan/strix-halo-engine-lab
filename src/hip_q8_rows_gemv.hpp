@@ -57,6 +57,7 @@
 #include "hip_q6p_weights.hpp"
 #include "hip/weight/ggml_sources.hpp"
 #include "strix/q6p_registry.hpp"
+#include "strix/decode_head_rows.hpp"
 #include "strix/hip_gsq_a8_groups.hpp"
 #include "moe_core/dense_a8_small_layout.hpp"
 #include "strix/known_window_cohort.hpp"
@@ -334,10 +335,23 @@ template <> struct RowsFormat<true> : ::strix::weight::hip::Q6RowsSource {
     }
 };
 
+// Head input (strix/decode_head_rows.hpp): a Site with head_input reads, for the output group that starts at
+// first_out, the input row of its head; every other Site reads site.input[r] (the same load as before).
+template <class Site> constexpr bool head_input_of() { return requires { Site::head_input; }; }
+template <class Site>
+__device__ __forceinline__ const typename Site::Input* direct_input(const Site& site, unsigned r, std::uint32_t first_out) {
+    using Input = typename Site::Input;
+    if constexpr (head_input_of<Site>())
+        return static_cast<const Input*>(site.input[r]) +
+               ::strix::decode::head_input_offset(first_out, site.head_outputs, site.input_stride);
+    else return static_cast<const Input*>(site.input[r]);
+}
+
 // Staged: every block copies all rows to LDS once, then loops over output groups.
 // Direct: one output group per wave.
 template <class Site, unsigned Outs, bool Staged, bool Q6 = false>
 __global__ __launch_bounds__(kThreads) void project_rows_kernel(Site site) {
+    static_assert(!head_input_of<Site>() || (!Staged && !Q6), "head input: direct non-Q6 form only");
     using Input = typename Site::Input;
     using Format = RowsFormat<Q6>;
     constexpr unsigned Rows = Site::rows, Pairs = Outs * Rows, N = pow2u(Pairs) * 8U, Depth = prefetch_of<Site, Staged>();
@@ -373,7 +387,7 @@ __global__ __launch_bounds__(kThreads) void project_rows_kernel(Site site) {
             for (unsigned r = 0; r < Rows; ++r) {
                 float x[8];
                 if constexpr (Staged) load8(reinterpret_cast<const Input*>(q8_rows_lds) + r * width + base, x);
-                else load8(static_cast<const Input*>(site.input[r]) + base, x);
+                else load8(direct_input(site, r, g * Outs) + base, x);
 #pragma unroll
                 for (unsigned o = 0; o < Outs; ++o)
 #pragma unroll
@@ -2118,6 +2132,7 @@ template <class Site> void launch_lane(const Site& site, hipStream_t stream) {
 // the previously queued kernel touches, so it may start while that kernel still runs.
 // a8 selects the dense A8 profile arithmetic (launch_dense_a8).
 template <class Site> void launch(const Site& site, bool a8, hipStream_t stream, bool any_order = false) {
+    static_assert(!head_input_of<Site>(), "q8_rows: head-input Sites launch through launch_heads");
 #if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
     if constexpr (Site::rows <= 8U && requires { Site::dense_trellis_inputs; }) {
         if (hip_dense_trellis_active() && hip_dense_trellis_permitted()) {
@@ -2253,6 +2268,22 @@ template <class Site> void launch(const Site& site, bool a8, hipStream_t stream,
             if (!stepped) start(project_rows_kernel<Site, Outs, false>, groups_for(Outs, kWaves), kThreads, 0U, site);
         }
     }
+}
+
+// Head rows (strix/decode_head_rows.hpp): the H GEMVs of a head-input Site in ONE launch of the direct kernel, the
+// form launch() takes for the same Site launched per head (rows <= 2 and no Q6P32 copy / A8 / IU4 / staging), so every
+// output has the same loads, products and tree as the per-head launches (bitwise). Site: head_input, head_outputs,
+// input_stride (elements between two heads' input rows), one segment of heads * head_outputs rows.
+template <class Site> void launch_heads(const Site& site, hipStream_t stream) {
+    static_assert(head_input_of<Site>() && Site::rows <= 2U, "q8_rows heads: 1..2 rows, head-input Site");
+    constexpr unsigned Outs = outs_of<Site, false>();
+    const ::strix::decode::HeadRows plan{site.outputs / (site.head_outputs ? site.head_outputs : 1U), site.head_outputs,
+                                         site.input_stride};
+    if (const char* refusal = ::strix::decode::head_rows_refusal(plan, site.width, Outs)) throw std::invalid_argument(refusal);
+    if (plan.heads * site.head_outputs != site.outputs || site.width % 32U != 0U)
+        throw std::invalid_argument("q8_rows heads: outputs must be heads x head_outputs, width a multiple of 32");
+    const unsigned blocks = ((site.outputs + Outs - 1U) / Outs + kWaves - 1U) / kWaves;
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(project_rows_kernel<Site, Outs, false>), dim3(blocks), dim3(kThreads), 0, stream, site);
 }
 
 #include "hip_dense_a8g64.hpp"

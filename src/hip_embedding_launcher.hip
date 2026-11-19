@@ -1191,4 +1191,63 @@ void launch_hip_mtp_embedding_device(const MtpNativeContext& c,const std::uint32
     check_hip(hipGetLastError(),"MTP device-token embedding launch");
 }
 
+namespace {
+// The kind switch of the raw entries: f.template operator()<Output, Kind>() for the table's kind and the output storage.
+template <class F>
+void with_table_kind(std::uint32_t ggml_type, HipActivationStorage output, F&& f) {
+    const auto by_output = [&]<EmbeddingWeightKind Kind>() {
+        if (output == HipActivationStorage::fp32) f.template operator()<float, Kind>();
+        else if (output == HipActivationStorage::bf16) f.template operator()<std::uint16_t, Kind>();
+        else throw std::invalid_argument("HIP embedding output storage is unsupported");
+    };
+    switch (weight_kind(ggml_type)) {
+    case EmbeddingWeightKind::f32: by_output.template operator()<EmbeddingWeightKind::f32>(); return;
+    case EmbeddingWeightKind::f16: by_output.template operator()<EmbeddingWeightKind::f16>(); return;
+    case EmbeddingWeightKind::bf16: by_output.template operator()<EmbeddingWeightKind::bf16>(); return;
+    case EmbeddingWeightKind::q8_0: by_output.template operator()<EmbeddingWeightKind::q8_0>(); return;
+    case EmbeddingWeightKind::iq4_xs: by_output.template operator()<EmbeddingWeightKind::iq4_xs>(); return;
+#define STRIX_GGML_KIND_CASE(KIND, type) case EmbeddingWeightKind::KIND: by_output.template operator()<EmbeddingWeightKind::KIND>(); return;
+    STRIX_GGML_KINDS_K(STRIX_GGML_KIND_CASE) STRIX_GGML_KINDS_GSQ(STRIX_GGML_KIND_CASE) STRIX_GGML_KIND_CASE(iq4_nl, 20)
+#undef STRIX_GGML_KIND_CASE
+    }
+    throw std::logic_error("unreachable embedding weight kind");
+}
+void check_table(const HipEmbeddingTable& table, const void* out) {
+    if (!table.weights || !out || table.row_width == 0U || table.vocabulary_size == 0U)
+        throw std::invalid_argument("HIP embedding rows: null table / output or empty geometry");
+}
+}  // namespace
+
+void launch_hip_embedding_rows(const HipEmbeddingTable& table, HipActivationStorage output,
+    std::span<const std::uint32_t> ids, void* out, std::uint64_t pitch, void* stream) {
+    check_table(table, out);
+    if (pitch < table.row_width) throw std::invalid_argument("HIP embedding rows: pitch below the row width");
+    for (const auto id : ids)
+        if (id >= table.vocabulary_size) throw std::out_of_range("HIP embedding rows: token outside the vocabulary");
+    const auto blocks = std::min<std::uint32_t>(32U, (table.row_width - 1U) / kThreads + 1U);
+    with_table_kind(table.ggml_type, output, [&]<typename Output, EmbeddingWeightKind Kind>() {
+        for (std::size_t first = 0; first < ids.size(); first += kEmbeddingRowsMax) {
+            const auto count = static_cast<std::uint32_t>(std::min<std::size_t>(kEmbeddingRowsMax, ids.size() - first));
+            EmbeddingRowsTokens tokens{};
+            for (std::uint32_t r = 0; r < count; ++r) tokens.id[r] = ids[first + r];
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(embedding_rows_kernel<Output, Kind>), dim3(blocks, count), dim3(kThreads), 0,
+                reinterpret_cast<hipStream_t>(stream), table.weights, table.row_width, tokens,
+                static_cast<Output*>(out) + first * pitch, pitch);
+            check_hip(hipGetLastError(), "HIP embedding rows launch");
+        }
+    });
+}
+
+void launch_hip_embedding_device_row(const HipEmbeddingTable& table, HipActivationStorage output,
+    const std::uint32_t* device_id, void* out, void* stream) {
+    check_table(table, out);
+    if (!device_id) throw std::invalid_argument("HIP embedding device row requires a token word");
+    with_table_kind(table.ggml_type, output, [&]<typename Output, EmbeddingWeightKind Kind>() {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(device_token_embedding_kernel<Output, Kind>),
+            dim3((table.row_width + kThreads - 1U) / kThreads), dim3(kThreads), 0, reinterpret_cast<hipStream_t>(stream),
+            table.weights, table.row_width, table.vocabulary_size, device_id, static_cast<Output*>(out));
+        check_hip(hipGetLastError(), "HIP embedding device row launch");
+    });
+}
+
 }  // namespace strix

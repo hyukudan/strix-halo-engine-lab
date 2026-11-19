@@ -25,7 +25,11 @@
 // LDS: D x (2T + 16) B (V^T, odd 16-B pitch: 16 consecutive rows hit distinct bank groups) + 4 x H x T x 4 B
 // (partials) + H x (2T + 16) B (P) + H x 4 B (alpha). GLM (H 32, D 512): 60,032 B at T 32, 34,432 B at T 16 (200 /
 // 255 VGPR, 0 scratch, 4 / 5 waves per SIMD, gfx1151). MSA shape (H 16, D 128, T 32): 4 waves, 19,776 B.
-// Not built yet: D_qk != D_v (DS41 MLA rope part: key width 576, value width 512) - add a K-only k-step tail.
+// Key-only tail (optional kRope, MLA with a RoPE part: key / query width D + kRope, value width D; contract
+// include/strix/attn/mla_contract.hpp): quarter q also runs kRope / 64 k steps over the tail dims D + q kRope / 4 ..,
+// accumulated after its D / 4 dims in the same score tile; +8 VGPR per k step (query fragment), no LDS, the gather
+// still reads D value dims. Learned sink (optional sink()): the normalisation is 1 / (l + 2^(z log2(e) - m)).
+// A policy without kRope / sink() compiles to the code without them (same ISA).
 //
 // Policy P:
 //   using Args;                                            kernel argument (trivially copyable)
@@ -55,6 +59,10 @@
 //                                 replace out(): the raw online state (m in log2 units of the scaled score, l, and
 //                                 the accumulator relative to m) for an engine epilogue (sink term, inverse RoPE);
 //                                 a row without keys then writes nothing
+//   static constexpr unsigned kRope;               key-only tail width (% 64 == 0): key_row and the query rows are
+//                                 [D + kRope] (row stride D + kRope), value_row stays [D] (MLA: the key row's first D)
+//   static __device__ float sink(const Args&, unsigned row, unsigned head)
+//                                 learned sink logit (natural units, unscaled) in the denominator; out() / out_op() only
 // Launch: flash_rows_kernel<P, T><<<rows, Geometry<P::kHeads, P::kDim, T>::kThreads, 0, stream>>>(args).
 #include "attn_core/flash_tile.hpp"
 #include "strix/env_arms.hpp"
@@ -96,6 +104,14 @@ template <class P>
 concept PolicyOutOp = requires(const typename P::Args& a, std::uint16_t*& p) { p = P::out_op(a, 0U); P::kOutOp; };
 template <class P>
 concept PolicyRawState = requires(const typename P::Args& a) { P::emit_state(a, 0U, 0U, 0.0F, 0.0F); P::emit(a, 0U, 0U, 0U, 0.0F); };
+template <class P>
+concept PolicyKeyTail = requires { P::kRope; };
+template <class P>
+concept PolicySink = requires(const typename P::Args& a, float& z) { z = P::sink(a, 0U, 0U); };
+template <class P> constexpr unsigned key_tail() {
+    if constexpr (PolicyKeyTail<P>) return P::kRope;
+    else return 0U;
+}
 
 template <class P, unsigned T, bool Pf = true>
 __global__ __launch_bounds__((Geometry<P::kHeads, P::kDim, T>::kThreads)) void flash_rows_kernel(typename P::Args a) {
@@ -105,6 +121,9 @@ __global__ __launch_bounds__((Geometry<P::kHeads, P::kDim, T>::kThreads)) void f
     using tile::U2;
     using tile::U4;
     constexpr unsigned H = P::kHeads, D = P::kDim;
+    constexpr unsigned R = key_tail<P>(), Dk = D + R, Kt = R / 64U, Rq = R / 4U;  // key tail: Kt k steps per quarter
+    static_assert(R % 64U == 0U, "key-only tail: whole 16-wide k steps per dim quarter");
+    static_assert(!(PolicySink<P> && PolicyRawState<P>), "raw-state epilogues own the sink term");
     constexpr tile::Operand O = P::kOp;
     __shared__ __attribute__((aligned(16))) unsigned char lds[G::kBytes];
     const unsigned r = blockIdx.x, tid = threadIdx.x, w = tid >> 5U, lane = tid & 31U, ln = lane & 15U, hf = lane >> 4U;
@@ -127,11 +146,16 @@ __global__ __launch_bounds__((Geometry<P::kHeads, P::kDim, T>::kThreads)) void f
             return;
         }
     }
-    Frag qf[G::kKs];
+    Frag qf[G::kKs + Kt];
     if constexpr (PolicyQueryOp<P>) {
-        const std::uint16_t* qr = P::query_op(a, r) + static_cast<std::size_t>(mt * 16U + ln) * D + qd * G::kQd;
+        const std::uint16_t* qr = P::query_op(a, r) + static_cast<std::size_t>(mt * 16U + ln) * Dk + qd * G::kQd;
 #pragma unroll
         for (unsigned k = 0; k < G::kKs; ++k) qf[k] = tile::frag32(qr + 16U * k);
+        if constexpr (Kt != 0U) {
+            const std::uint16_t* qt = P::query_op(a, r) + static_cast<std::size_t>(mt * 16U + ln) * Dk + D + qd * Rq;
+#pragma unroll
+            for (unsigned k = 0; k < Kt; ++k) qf[G::kKs + k] = tile::frag32(qt + 16U * k);
+        }
     } else if constexpr (PolicyQuery16<P>) {
 #pragma unroll
         for (unsigned k = 0; k < G::kKs; ++k) {
@@ -139,10 +163,21 @@ __global__ __launch_bounds__((Geometry<P::kHeads, P::kDim, T>::kThreads)) void f
             P::query16(a, r, mt * 16U + ln, (qd * G::kQd) / 16U + k, x);
             qf[k] = tile::frag_from_f32<O>(x);
         }
+#pragma unroll
+        for (unsigned k = 0; k < Kt; ++k) {
+            float x[16];
+            P::query16(a, r, mt * 16U + ln, (D + qd * Rq) / 16U + k, x);
+            qf[G::kKs + k] = tile::frag_from_f32<O>(x);
+        }
     } else {
-        const float* qr = P::query(a, r) + static_cast<std::size_t>(mt * 16U + ln) * D + qd * G::kQd;
+        const float* qr = P::query(a, r) + static_cast<std::size_t>(mt * 16U + ln) * Dk + qd * G::kQd;
 #pragma unroll
         for (unsigned k = 0; k < G::kKs; ++k) qf[k] = tile::frag_from_f32<O>(qr + 16U * k);
+        if constexpr (Kt != 0U) {
+            const float* qt = P::query(a, r) + static_cast<std::size_t>(mt * 16U + ln) * Dk + D + qd * Rq;
+#pragma unroll
+            for (unsigned k = 0; k < Kt; ++k) qf[G::kKs + k] = tile::frag_from_f32<O>(qt + 16U * k);
+        }
     }
     Acc o[G::kDt];
 #pragma unroll
@@ -191,6 +226,11 @@ __global__ __launch_bounds__((Geometry<P::kHeads, P::kDim, T>::kThreads)) void f
             Acc s = tile::acc_zero();
 #pragma unroll
             for (unsigned k = 0; k < G::kKs; ++k) s = tile::mma<O>(qf[k], tile::frag32(kr + 16U * k), s);
+            if constexpr (Kt != 0U) {  // key-only tail of this quarter, same score tile
+                const std::uint16_t* kt = P::key_row(a, r, pos) + D + qd * Rq;
+#pragma unroll
+                for (unsigned k = 0; k < Kt; ++k) s = tile::mma<O>(qf[G::kKs + k], tile::frag32(kt + 16U * k), s);
+            }
             float* spw = sp + (static_cast<std::size_t>(qd) * H + mt * 16U + hf) * T + 16U * tt + ln;
 #pragma unroll
             for (unsigned e = 0; e < 8; ++e) spw[2U * e * T] = s[e];
@@ -256,7 +296,11 @@ __global__ __launch_bounds__((Geometry<P::kHeads, P::kDim, T>::kThreads)) void f
             for (unsigned e = 0; e < 8; ++e) P::emit(a, r, mt * 16U + 2U * e + hf, qd * G::kQd + 16U * c + ln, o[c][e]);
         return;
     }
-    if (sg == 0) al[tile::row_slot(sh)] = tile::finalize_scale(st);
+    if constexpr (PolicySink<P>) {  // 1 / (l + 2^(z log2(e) - m)): the sink column of the softmax, no value
+        if (sg == 0) al[tile::row_slot(sh)] = 1.0F / (st.l + __builtin_amdgcn_exp2f(P::sink(a, r, sh) * 1.4426950408889634F - st.m));
+    } else {
+        if (sg == 0) al[tile::row_slot(sh)] = tile::finalize_scale(st);
+    }
     __syncthreads();
     float iv[8];
     tile::row_scalars(al, mt, lane, iv);

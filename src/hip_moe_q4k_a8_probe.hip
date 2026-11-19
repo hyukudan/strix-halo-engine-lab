@@ -14,6 +14,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #pragma clang fp contract(off)
 #include "strix/hip_gsq_a8_groups.hpp"
 #if defined(__HIP_DEVICE_COMPILE__)
@@ -195,6 +196,24 @@ __global__ void serial_prologue(const void* input, const unsigned* routes, const
     const unsigned bad=quantize_row<Bf16>(input,hidden,codes,deltas,sums,route_bits);
     if(threadIdx.x==0) *status=route_bits|bad;
 }
+// Q4_K term of one 256-block for lane pair p (g32 groups 2p, 2p+1), half h = lane&1: a0/a1 are the lane's 16 codes of each
+// group, deltas/sums the row's g32 headers. Shared by `project` (gate/up) and the Q4_K down trait (down_rawdots_kq<12>).
+__device__ __forceinline__ float q4k_pair_term(uint4 hd,uint4 q,int4 a0,int4 a1,unsigned p,unsigned block,
+    const float* local_deltas,const int* local_sums) {
+    constexpr unsigned mask=0x0f0f0f0fU;
+    int r0=dot(a0.x,q.x&mask,0);r0=dot(a0.y,q.y&mask,r0);r0=dot(a0.z,q.z&mask,r0);r0=dot(a0.w,q.w&mask,r0);
+    int r1=dot(a1.x,(q.x>>4U)&mask,0);r1=dot(a1.y,(q.y>>4U)&mask,r1);r1=dot(a1.z,(q.z>>4U)&mask,r1);r1=dot(a1.w,(q.w>>4U)&mask,r1);
+    r0+=strix::qwen_dpp::xor32(r0, 1);r1+=strix::qwen_dpp::xor32(r1, 1);
+    const unsigned g0=2U*p,g1=g0+1U;
+    const int i0=static_cast<int>(factor(hd,g0,false))*r0,i1=static_cast<int>(factor(hd,g1,false))*r1;
+    const int j0=static_cast<int>(factor(hd,g0,true))*local_sums[block*8U+g0];
+    const int j1=static_cast<int>(factor(hd,g1,true))*local_sums[block*8U+g1];
+    const float d=half_float(hd.x&65535U),dm=half_float(hd.x>>16U);
+    const float u0=d*static_cast<float>(i0),v0=dm*static_cast<float>(j0),t0=u0-v0;
+    const float u1=d*static_cast<float>(i1),v1=dm*static_cast<float>(j1),t1=u1-v1;
+    const float c0=local_deltas[block*8U+g0]*t0,c1=local_deltas[block*8U+g1]*t1;
+    return c0+c1;
+}
 __global__ void project(const unsigned char* gate,const unsigned char* up,const unsigned* routes,
     const signed char* codes,const float* deltas,const int* sums,const unsigned* status,
     float* output,unsigned hidden,unsigned rows) {
@@ -219,19 +238,7 @@ __global__ void project(const unsigned char* gate,const unsigned char* up,const 
         const uint4 q=*reinterpret_cast<const uint4*>(packed+16U+c*16U);
         const int4 a0=*reinterpret_cast<const int4*>(local_codes+block*256U+p*64U+h*16U);
         const int4 a1=*reinterpret_cast<const int4*>(local_codes+block*256U+p*64U+32U+h*16U);
-        constexpr unsigned mask=0x0f0f0f0fU;
-        int r0=dot(a0.x,q.x&mask,0);r0=dot(a0.y,q.y&mask,r0);r0=dot(a0.z,q.z&mask,r0);r0=dot(a0.w,q.w&mask,r0);
-        int r1=dot(a1.x,(q.x>>4U)&mask,0);r1=dot(a1.y,(q.y>>4U)&mask,r1);r1=dot(a1.z,(q.z>>4U)&mask,r1);r1=dot(a1.w,(q.w>>4U)&mask,r1);
-        r0+=strix::qwen_dpp::xor32(r0, 1);r1+=strix::qwen_dpp::xor32(r1, 1);
-        const unsigned g0=2U*p,g1=g0+1U;
-        const int i0=static_cast<int>(factor(hd,g0,false))*r0,i1=static_cast<int>(factor(hd,g1,false))*r1;
-        const int j0=static_cast<int>(factor(hd,g0,true))*local_sums[block*8U+g0];
-        const int j1=static_cast<int>(factor(hd,g1,true))*local_sums[block*8U+g1];
-        const float d=half_float(hd.x&65535U),dm=half_float(hd.x>>16U);
-        const float u0=d*static_cast<float>(i0),v0=dm*static_cast<float>(j0),t0=u0-v0;
-        const float u1=d*static_cast<float>(i1),v1=dm*static_cast<float>(j1),t1=u1-v1;
-        const float c0=local_deltas[block*8U+g0]*t0,c1=local_deltas[block*8U+g1]*t1;
-        const float paired=c0+c1;
+        const float paired=q4k_pair_term(hd,q,a0,a1,p,block,local_deltas,local_sums);
         acc=acc+paired;
     }
     // Only c0 is observable. c0 receives exactly ((p0+p1)+(p2+p3)).
@@ -580,9 +587,12 @@ __device__ void down_error(unsigned* status,unsigned* aggregate,unsigned bits) {
     atomicOr(status,bits);
     if(aggregate) atomicOr(aggregate,down_aggregate_error);
 }
-__global__ void down_activation_quantize(float* intermediates,const unsigned* routes,
+// Producer body. Clamp = the shared activation trait (strix::moe::swiglu_clamp) on the projections before silu(g) * u; the
+// fail-closed check stays on the raw projections, so a nonfinite projection is never hidden by the clamp.
+template<bool Clamp>
+__device__ __forceinline__ void down_activation_body(float* intermediates,const unsigned* routes,
     signed char* codes,float* deltas,int* sums,unsigned* status,unsigned* aggregate,
-    unsigned width,unsigned experts) {
+    unsigned width,unsigned experts,float limit) {
     if(*status!=0) return;
     const unsigned lane=threadIdx.x&31U,wave=threadIdx.x/32U;
     const unsigned group=blockIdx.x*8U+wave,slot=blockIdx.y;
@@ -590,7 +600,10 @@ __global__ void down_activation_quantize(float* intermediates,const unsigned* ro
     if(routes[slot]>=experts) {if(lane==0) down_error(status,aggregate,down_invalid_route);return;}
     const unsigned at=slot*2U*width+group*32U+lane;
     const float g=intermediates[at],u=intermediates[at+width];
-    const float h=(g/(1.0F+expf(-g)))*u;
+    float gc=g,uc=u;
+    if constexpr(Clamp) {const auto clamped=strix::moe::swiglu_clamp(g,u,limit);gc=clamped.gate;uc=clamped.up;}
+    else static_cast<void>(limit);
+    const float h=(gc/(1.0F+expf(-gc)))*uc;
     const unsigned bad=static_cast<unsigned>(__ballot(!isfinite(g)||!isfinite(u)||!isfinite(h)));
     if(bad!=0) {if(lane==0) down_error(status,aggregate,down_nonfinite_activation);return;}
     float a=fabsf(h);
@@ -604,6 +617,99 @@ __global__ void down_activation_quantize(float* intermediates,const unsigned* ro
     intermediates[at]=h;
     codes[slot*width+group*32U+lane]=static_cast<signed char>(code);
     if(lane==0) {deltas[slot*(width/32U)+group]=delta;sums[slot*(width/32U)+group]=sum;}
+}
+__global__ void down_activation_quantize(float* intermediates,const unsigned* routes,
+    signed char* codes,float* deltas,int* sums,unsigned* status,unsigned* aggregate,
+    unsigned width,unsigned experts) {
+    down_activation_body<false>(intermediates,routes,codes,deltas,sums,status,aggregate,width,experts,0.0F);
+}
+__global__ void down_activation_quantize_clamped(float* intermediates,const unsigned* routes,
+    signed char* codes,float* deltas,int* sums,unsigned* status,unsigned* aggregate,
+    unsigned width,unsigned experts,float limit) {
+    down_activation_body<true>(intermediates,routes,codes,deltas,sums,status,aggregate,width,experts,limit);
+}
+// Q6_K term of one 256-block for lane pair p, half h (`project`'s lane layout): groups g0 = 2p, g1 = 2p+1 of half n = p/2
+// are quarters 2(p&1) and 2(p&1)+1; the lane holds elements 16h..16h+15 of each, i.e. exactly the 16-element sub-block of
+// scale 2g+h. part = s * sum (q-32)*a per lane, J = part + xor1(part) = s0*I0 + s1*I1 (exact int32), c_g = delta*(d*J).
+struct Q4kLane { uint4 hd,q; };
+struct Q6kLane { uint4 low0,low1,high; int s0,s1; unsigned d; };
+__device__ __forceinline__ Q6kLane q6k_lane_load(const unsigned char* block,unsigned p,unsigned h) {
+    const unsigned n=p/2U;
+    Q6kLane x;  // 210-byte blocks: byte-aligned vectors (2-byte row alignment only)
+    __builtin_memcpy(&x.low0,block+n*64U+h*16U,16U);
+    __builtin_memcpy(&x.low1,block+n*64U+32U+h*16U,16U);
+    __builtin_memcpy(&x.high,block+128U+n*32U+h*16U,16U);
+    x.s0=static_cast<int>(static_cast<signed char>(block[192U+4U*p+h]));       // scale 2*g0+h, g0 = 2p
+    x.s1=static_cast<int>(static_cast<signed char>(block[192U+4U*p+2U+h]));    // scale 2*g1+h, g1 = 2p+1
+    x.d=static_cast<unsigned>(block[208])|(static_cast<unsigned>(block[209])<<8U);
+    return x;
+}
+__device__ __forceinline__ int q6k_words_dot(uint4 low,uint4 high,unsigned ls,unsigned hs,int4 a) {
+    const unsigned lw[4]={low.x,low.y,low.z,low.w},hw[4]={high.x,high.y,high.z,high.w};
+    const int aw[4]={a.x,a.y,a.z,a.w};
+    int integer=0;
+#pragma unroll
+    for(unsigned k=0;k<4U;++k) {
+        const unsigned q=((lw[k]>>ls)&0x0f0f0f0fU)|(((hw[k]>>hs)&0x03030303U)<<4U);
+        const int w=static_cast<int>(((q|0x80808080U)-0x20202020U)^0x80808080U);  // bytewise q - 32, no borrow
+        integer=__builtin_amdgcn_sudot4(true,aw[k],true,w,integer,false);
+    }
+    return integer;
+}
+__device__ __forceinline__ float q6k_pair_term(const Q6kLane& x,int4 a0,int4 a1,unsigned p,unsigned block,
+    const float* local_deltas) {
+    const unsigned ls=4U*(p&1U),g0=2U*p,g1=g0+1U;
+    int j0=x.s0*q6k_words_dot(x.low0,x.high,ls,ls,a0),j1=x.s1*q6k_words_dot(x.low1,x.high,ls,ls+2U,a1);
+    j0+=strix::qwen_dpp::xor32(j0, 1);j1+=strix::qwen_dpp::xor32(j1, 1);
+    const float d=half_float(x.d);
+    const float c0=local_deltas[block*8U+g0]*(d*static_cast<float>(j0));
+    const float c1=local_deltas[block*8U+g1]*(d*static_cast<float>(j1));
+    return c0+c1;
+}
+// K-quant down trait (Q4_K 12, Q6_K 14) of the C1 core: `project`'s grid and lanes over one slot's A8 activation, staged
+// once per CTA in LDS (hip_moe_rca: an LDS-routed operand is free; a global A stream is the bound), every weight byte read
+// by one lane, and all of a lane's blocks requested before the first product (one block in flight per wave otherwise).
+template<std::uint32_t T>
+__global__ __launch_bounds__(256) void down_rawdots_kq(const unsigned char* weights,const unsigned* routes,
+    const signed char* codes,const float* deltas,const int* sums,float* rawdots,
+    unsigned* status,unsigned* aggregate,unsigned hidden,unsigned width,unsigned experts) {
+    static_assert(T==12U || T==14U);
+    __shared__ __align__(16) signed char local_codes[c1_max_rows];
+    __shared__ __align__(16) float local_deltas[c1_max_rows/32U];
+    __shared__ __align__(16) int local_sums[c1_max_rows/32U];
+    if(*status!=0) return;
+    const unsigned slot=blockIdx.y,expert=routes[slot];
+    if(expert>=experts) {if(threadIdx.x==0) down_error(status,aggregate,down_invalid_route);return;}
+    for(unsigned i=16U*threadIdx.x;i<width;i+=4096U)
+        *reinterpret_cast<int4*>(local_codes+i)=*reinterpret_cast<const int4*>(codes+slot*width+i);
+    for(unsigned i=threadIdx.x;i<width/32U;i+=256U) {local_deltas[i]=deltas[slot*(width/32U)+i];local_sums[i]=sums[slot*(width/32U)+i];}
+    __syncthreads();
+    const unsigned lane=threadIdx.x&31U,c=lane&7U,p=c/2U,h=c&1U;
+    const unsigned row=blockIdx.x*32U+(threadIdx.x/32U)*4U+lane/8U,blocks=width/256U;
+    constexpr unsigned block_bytes=T==12U?144U:210U,max_blocks=c1_max_rows/256U;
+    const auto* row_weights=weights+(static_cast<unsigned long long>(expert)*hidden+row)*blocks*block_bytes;
+    // Unconditional loads (a block past the row re-reads the last one and is never used), as project_window.
+    using Lane=std::conditional_t<T==12U,Q4kLane,Q6kLane>;
+    Lane staged[max_blocks];
+#pragma unroll
+    for(unsigned i=0;i<max_blocks;++i) {
+        const auto* packed=row_weights+min(i,blocks-1U)*block_bytes;
+        if constexpr(T==12U) {staged[i].hd=*reinterpret_cast<const uint4*>(packed);staged[i].q=*reinterpret_cast<const uint4*>(packed+16U+c*16U);}
+        else staged[i]=q6k_lane_load(packed,p,h);
+    }
+    float acc=0.0F;
+#pragma unroll
+    for(unsigned block=0;block<max_blocks;++block) if(block<blocks) {
+        const int4 a0=*reinterpret_cast<const int4*>(local_codes+block*256U+p*64U+h*16U);
+        const int4 a1=*reinterpret_cast<const int4*>(local_codes+block*256U+p*64U+32U+h*16U);
+        float paired;
+        if constexpr(T==12U) paired=q4k_pair_term(staged[block].hd,staged[block].q,a0,a1,p,block,local_deltas,local_sums);
+        else paired=q6k_pair_term(staged[block],a0,a1,p,block,local_deltas);
+        acc=acc+paired;
+    }
+    acc=acc+strix::qwen_dpp::xor32(acc, 2);
+    acc=acc+strix::qwen_dpp::xor32(acc, 4);
+    if(c==0) rawdots[slot*hidden+row]=acc;
 }
 __device__ unsigned down_u16(const unsigned char* p) {
     return static_cast<unsigned>(p[0])|(static_cast<unsigned>(p[1])<<8U);
@@ -823,11 +929,19 @@ void down_admit(const DownRequest& request,const DownBindings& b,hipStream_t str
 }
 void enqueue_down_activation_quantize(const DownRequest& r,const DownBindings& b,hipStream_t stream) {
     down_admit(r,b,stream);
-    down_activation_quantize<<<dim3((r.shape.intermediate/32U+7U)/8U,r.shape.top_k),256,0,stream>>>(
-        reinterpret_cast<float*>(b.intermediates.address),reinterpret_cast<const unsigned*>(b.routes.address),
-        reinterpret_cast<signed char*>(b.codes.address),reinterpret_cast<float*>(b.deltas.address),
-        reinterpret_cast<int*>(b.sums.address),reinterpret_cast<unsigned*>(b.status.address),
-        reinterpret_cast<unsigned*>(b.aggregate_status.address),r.shape.intermediate,r.shape.experts);
+    const dim3 grid((r.shape.intermediate/32U+7U)/8U,r.shape.top_k);
+    if(r.swiglu_limit!=moe::kSwigluNoClamp)
+        down_activation_quantize_clamped<<<grid,256,0,stream>>>(
+            reinterpret_cast<float*>(b.intermediates.address),reinterpret_cast<const unsigned*>(b.routes.address),
+            reinterpret_cast<signed char*>(b.codes.address),reinterpret_cast<float*>(b.deltas.address),
+            reinterpret_cast<int*>(b.sums.address),reinterpret_cast<unsigned*>(b.status.address),
+            reinterpret_cast<unsigned*>(b.aggregate_status.address),r.shape.intermediate,r.shape.experts,r.swiglu_limit);
+    else
+        down_activation_quantize<<<grid,256,0,stream>>>(
+            reinterpret_cast<float*>(b.intermediates.address),reinterpret_cast<const unsigned*>(b.routes.address),
+            reinterpret_cast<signed char*>(b.codes.address),reinterpret_cast<float*>(b.deltas.address),
+            reinterpret_cast<int*>(b.sums.address),reinterpret_cast<unsigned*>(b.status.address),
+            reinterpret_cast<unsigned*>(b.aggregate_status.address),r.shape.intermediate,r.shape.experts);
     hip_check(hipGetLastError(),"A8 down activation/quantization enqueue");
 }
 void enqueue_down_rawdots(const DownRequest& r,const DownBindings& b,const SlotMergeTail& tail,hipStream_t stream) {
@@ -835,7 +949,18 @@ void enqueue_down_rawdots(const DownRequest& r,const DownBindings& b,const SlotM
     if(tail.tickets && (!tail.route_weights || !tail.accumulation || !tail.output || !tail.record ||
         r.shape.hidden%strix::moe_slot_merge::tile_rows!=0U || r.shape.top_k>strix::moe_slot_merge::max_slots))
         throw std::invalid_argument("A8 down slot-merge tail requires weights, accumulation, output, record, H % 64 == 0, K <= 16");
-    if(r.weight_type==gsq_a8::type_iq4_nl) {
+    if(r.weight_type==12 || r.weight_type==14) {
+        if(tail.tickets) throw std::invalid_argument("A8 down slot-merge tail is not bound for the K-quant (Q4_K / Q6_K) rawdots");
+        const auto kq=[&]<std::uint32_t T>() {
+            down_rawdots_kq<T><<<dim3(r.shape.hidden/32U,r.shape.top_k),256,0,stream>>>(
+                reinterpret_cast<const unsigned char*>(b.weights.address),reinterpret_cast<const unsigned*>(b.routes.address),
+                reinterpret_cast<const signed char*>(b.codes.address),reinterpret_cast<const float*>(b.deltas.address),
+                reinterpret_cast<const int*>(b.sums.address),reinterpret_cast<float*>(b.rawdots.address),
+                reinterpret_cast<unsigned*>(b.status.address),reinterpret_cast<unsigned*>(b.aggregate_status.address),
+                r.shape.hidden,r.shape.intermediate,r.shape.experts);
+        };
+        if(r.weight_type==12) kq.template operator()<12U>(); else kq.template operator()<14U>();
+    } else if(r.weight_type==gsq_a8::type_iq4_nl) {
         down_rawdots_iq<gsq_a8::type_iq4_nl><<<dim3(r.shape.hidden/64U,r.shape.top_k),256,0,stream>>>(
             reinterpret_cast<const unsigned char*>(b.weights.address),reinterpret_cast<const unsigned*>(b.routes.address),
             reinterpret_cast<const signed char*>(b.codes.address),reinterpret_cast<const float*>(b.deltas.address),

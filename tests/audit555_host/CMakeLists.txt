@@ -5,9 +5,12 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 get_filename_component(STRIX_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract.py"
     "${STRIX_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}" COMMAND_ERROR_IS_FATAL ANY)
-add_executable(audit555-host regression.cpp)
+find_package(Threads REQUIRED)
+add_executable(audit555-host regression.cpp "${STRIX_ROOT}/src/ds41_engram.cpp" "${STRIX_ROOT}/src/engram/spec.cpp"
+    "${STRIX_ROOT}/src/engram/hasher.cpp" "${STRIX_ROOT}/src/engram/row_reader.cpp")
 target_compile_features(audit555-host PRIVATE cxx_std_20)
-target_include_directories(audit555-host PRIVATE "${STRIX_ROOT}/include" "${CMAKE_CURRENT_BINARY_DIR}")
+target_include_directories(audit555-host PRIVATE "${STRIX_ROOT}/include" "${STRIX_ROOT}/src" "${CMAKE_CURRENT_BINARY_DIR}")
+target_link_libraries(audit555-host PRIVATE Threads::Threads)
 add_executable(session-embed-splice "${STRIX_ROOT}/tests/session_embed_splice_tests.cpp"
     "${STRIX_ROOT}/src/session/embed_rows.cpp")
 target_compile_features(session-embed-splice PRIVATE cxx_std_20)

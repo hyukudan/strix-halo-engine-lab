@@ -4,6 +4,7 @@
 // Layouts: activations FP32 row-major; plain weights in their file layout [out][in] (F16 / BF16 as uint16, F32 as
 // float); the residual stream of one row is 4 copies x 4096, copy-major.
 #include "glm/common/glm_math.hpp"
+#include "strix/moe/activation_policy.hpp"
 
 #include <array>
 #include <cstdint>
@@ -119,10 +120,9 @@ Route route(std::span<const float> x, const Mat& router, const float* bias, Iden
 // R1b router logits (identity experiment): y[o] = r1b_dot over the 4096 inputs.
 void dense_r1b(std::span<const float> x, const Mat& w, std::span<float> y);
 std::vector<std::uint32_t> topk_ordered(std::span<const float> score, unsigned k);  // R5: indices by key, then sorted
-inline float swiglu(float g, float u) {
-    const float gg = g > kClamp ? kClamp : g;
-    const float uu = u > kClamp ? kClamp : (u < -kClamp ? -kClamp : u);
-    return silu(gg) * uu;
+inline float swiglu(float g, float u) {  // the shared moe clamp trait, then GLM's silu
+    const auto c = strix::moe::swiglu_clamp(g, u, kClamp);
+    return silu(c.gate) * c.up;
 }
 void moe_combine(const Route& r, std::span<const float> expert_out /*[8][4096] in route order*/,
                  std::span<const float> shared, std::span<float> y);

@@ -1,4 +1,5 @@
 #include "strix/ds41_moe.hpp"
+#include "strix/moe/route_policy.hpp"
 
 #include <algorithm>
 #include <array>
@@ -83,28 +84,14 @@ RouterOutput reference_router(std::span<const float> x, std::uint32_t rows, std:
         }
     out.ids.resize(static_cast<std::size_t>(rows) * top_k);
     out.weights.resize(static_cast<std::size_t>(rows) * top_k);
+    // Selection and weights: the shared router policy (include/strix/moe/route_policy.hpp, preset ds41).
+    const strix::moe::RoutePolicy policy = strix::moe::preset::ds41(experts, top_k, route_scale);
+    const std::span<const float> scores(out.scores);
     for (std::uint32_t r = 0; r < rows; ++r) {
-        const auto* scores = out.scores.data() + static_cast<std::size_t>(r) * experts;
-        const auto& b = !image_rows.empty() && image_rows[r] ? bias_image : bias;
-        std::vector<bool> taken(experts, false);
-        for (std::uint32_t k = 0; k < top_k; ++k) {
-            std::uint32_t best = experts;
-            float best_value = 0.0F;
-            for (std::uint32_t e = 0; e < experts; ++e) {
-                if (taken[e]) continue;
-                const float v = scores[e] + b[e];
-                if (best == experts || v > best_value) { best = e; best_value = v; }
-            }
-            taken[best] = true;
-            out.ids[static_cast<std::size_t>(r) * top_k + k] = best;
-        }
-        float sum = 0.0F;
-        for (std::uint32_t k = 0; k < top_k; ++k) sum = sum + scores[out.ids[static_cast<std::size_t>(r) * top_k + k]];
-        const float denominator = sum + 1e-20F;
-        for (std::uint32_t k = 0; k < top_k; ++k) {
-            const float s = scores[out.ids[static_cast<std::size_t>(r) * top_k + k]];
-            out.weights[static_cast<std::size_t>(r) * top_k + k] = (top_k > 1U ? s / denominator : s) * route_scale;
-        }
+        const auto at = static_cast<std::size_t>(r) * top_k;
+        strix::moe::route_select_ref(policy, scores.subspan(static_cast<std::size_t>(r) * experts, experts),
+                              !image_rows.empty() && image_rows[r] ? bias_image : bias,
+                              std::span<std::uint32_t>(out.ids).subspan(at, top_k), std::span<float>(out.weights).subspan(at, top_k));
     }
     return out;
 }

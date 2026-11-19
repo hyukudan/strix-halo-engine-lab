@@ -67,6 +67,26 @@ inline std::vector<Window> windows(std::size_t prompt, std::uint32_t width) {
     return out;
 }
 
+// Window width of a two-stage pipe from a calibration of the half-window time per width (stage time of one window).
+// The width changes no bit when the binding is window-invariant; only the flow shop changes: wall = (windows + 1) x
+// half-window time, so a narrower window that costs a little more per row can win by filling the pipe sooner. Costs are
+// an input measured on the deployment, never compiled in; no usable cost -> 0 (the caller keeps its width). Ties keep
+// the first entry.
+struct WindowCost {
+    std::uint32_t rows = 0;
+    double half_ms = 0;
+};
+[[nodiscard]] inline std::uint32_t two_stage_window_rows(std::size_t prompt, std::span<const WindowCost> costs) {
+    std::uint32_t best = 0;
+    double best_ms = 0;
+    for (const auto& w : costs) {
+        if (w.rows == 0U || !(w.half_ms > 0)) continue;
+        const double ms = static_cast<double>((prompt + w.rows - 1U) / w.rows + 1U) * w.half_ms;
+        if (best_ms == 0 || ms < best_ms) best = w.rows, best_ms = ms;
+    }
+    return best;
+}
+
 // Consumer-side header check (PipeOptions::validate) of one link: returns the payload bytes.
 inline std::function<std::size_t(const PipeHeader&, std::uint64_t)> validator(
     std::uint64_t identity, std::uint64_t count, std::uint32_t cut, std::uint32_t max_rows, std::size_t row_bytes) {
@@ -159,8 +179,22 @@ struct DecodeOps {
     std::function<void(std::span<std::byte>)> export_row;        // synchronizes
     std::function<void(std::span<const std::byte>)> import_row;  // host bytes stay valid until the next forward returns
     std::size_t row_bytes = 0;
+    // Pipelined speculation (optional, first stage of two or more; both set = on). The first stage is idle while the
+    // later stages finish row n, so it runs row n+1 on a GUESSED token and sends it only when the relayed token equals
+    // the guess; on a miss it undoes the guessed row and runs the true one. The wire carries the same messages as
+    // without guessing and every row is the one-row forward of the true token at its position: bitwise the plain loop.
+    // guess(last, next): `last` = the confirmed token this stage just ran (each confirmed id is passed once, in order);
+    //   return true with a proposal in `next`, false = no guess this step.
+    // rewind(): undo the last forward completely (position and host state back; the redo at the same position must
+    //   rewrite every device row the guessed forward wrote). A family whose state cannot be undone leaves it empty.
+    std::function<bool(std::uint32_t last, std::uint32_t& next)> guess;
+    std::function<void()> rewind;
 };
-struct DecodeStats { std::vector<std::uint32_t> ids; double total_ms = 0; };
+struct DecodeStats {
+    std::vector<std::uint32_t> ids;
+    double total_ms = 0;
+    std::uint64_t guesses = 0, hits = 0;  // first stage with guess/rewind: guessed rows run / rows sent without a redo
+};
 
 // Greedy decode of `count` ids, the first one being `first_token` (known on the last stage only: the head of the
 // prefill). `up` / `down`: links to the previous / next stage (null at the ends). Returns the same ids on every stage.
@@ -186,6 +220,34 @@ inline DecodeStats decode(const Placement& p, std::uint32_t first_token, std::ui
     if (count == 0U) return out;
     std::uint32_t token = relay(p.head() ? first_token : 0U, 0U);
     out.ids.push_back(token);
+    if (!up && down && ops.guess && ops.rewind) {  // first stage, pipelined speculation (see DecodeOps::guess)
+        std::vector<std::byte> spare(message.size());
+        bool ready = false;  // `message` already holds the row of this step (a guess that hit)
+        for (std::uint64_t step = 1; step < count; ++step) {
+            if (!ready) {
+                ops.forward(token, false);
+                ops.export_row(std::span(message).subspan(32U));
+            }
+            SeamCrc crc; crc.update(std::span<const std::byte>(message).subspan(32U));
+            const std::uint64_t h[4] = {hidden_magic, step, ops.row_bytes, crc.value()};
+            std::memcpy(message.data(), h, sizeof h);
+            down->send(message);
+            std::uint32_t g = 0;
+            const bool guessed = step + 1U < count && ops.guess(token, g);
+            if (guessed) {
+                ops.forward(g, false);
+                ops.export_row(std::span(spare).subspan(32U));
+                ++out.guesses;
+            }
+            token = relay(0U, step);
+            out.ids.push_back(token);
+            ready = guessed && g == token;
+            if (ready) { message.swap(spare); ++out.hits; }
+            else if (guessed) ops.rewind();
+        }
+        out.total_ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+        return out;
+    }
     for (std::uint64_t step = 1; step < count; ++step) {
         if (up) {
             up->receive(message);

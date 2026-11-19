@@ -57,8 +57,12 @@ struct MetadataEntry {
 };
 
 // Strix NVFP4 tile pack (converted weights, see strix::cuda_core nvfp4): dimensions [in, out], data is out/16 x in/128 records of
-// 1152 bytes (the cuda_core tile layout). Not the upstream GGML NVFP4 layout; the id is outside the upstream range.
+// 1152 bytes (the cuda_core tile layout). Not the upstream GGML NVFP4 layout. The wire id collides with upstream GGML F8_E4M3
+// (also 43: one byte per element, no block scale), so the id is read by file: a file is a Strix tile pack only when it carries
+// the F32 global-scale table kNvfp4TilePackMarker (every converted pack writes it); in any other file 43 is upstream F8_E4M3.
 inline constexpr std::uint32_t kNvfp4TilePack = 43;
+inline constexpr std::uint32_t kGgmlF8E4M3 = 43;
+inline constexpr const char* kNvfp4TilePackMarker = "strix.nvfp4.gscale";
 // Private (non-ggml) tensor type: shared IU4 g64 dense projection, N outputs x K inputs (core/iu4.hpp): tiles
 // [K/16][N/16][column within tile][K within tile / 2] signed nibbles, then FP16 scales [N][K/64]. Geometry per row of K:
 // K/64 blocks of 64 elements, 34 bytes (32 nibble bytes + 2 scale bytes), N % 64 == 0.
@@ -91,8 +95,13 @@ struct FileInfo {
     std::uint64_t metadata_end = 0;    // file offset just after the last key/value entry (they start at byte 24)
     std::vector<MetadataEntry> metadata;
     std::vector<TensorInfo> tensors;
+    // True when the file carries kNvfp4TilePackMarker: wire type 43 is then the Strix NVFP4 tile pack, otherwise upstream F8_E4M3.
+    bool strix_nvfp4_tile_pack = false;
 
     [[nodiscard]] const MetadataEntry* find_metadata(const std::string& key) const;
+    [[nodiscard]] bool is_f8_e4m3(const TensorInfo& tensor) const noexcept {
+        return tensor.ggml_type == kGgmlF8E4M3 && !strix_nvfp4_tile_pack;
+    }
 };
 
 [[nodiscard]] FileInfo read(std::istream& input,

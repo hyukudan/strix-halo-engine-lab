@@ -6,6 +6,7 @@
 //   above 88 and +0 below -103; sqrt correctly rounded, through double on the device).
 //   Reductions: R1 = ascending fmaf chain; R2 = lane-strided fmaf partials over L lanes + pairwise halving tree.
 #include "../rtxpf/import/glm_dims.hpp"  // the model dimensions (shared with the RTX import state layout)
+#include "../../../include/strix/attn/cache_rows.hpp"  // relative: GLM host targets build with only src/ on the path
 #include <cstddef>
 #include <cstdint>
 
@@ -74,13 +75,11 @@ STRIX_GLM_HD inline float f16_to_float(std::uint16_t h) {  // exact (DS ds41_lay
     return __builtin_bit_cast(float, sign | ((exponent + 112U) << 23U) | (mantissa << 13U));
 }
 STRIX_GLM_HD inline float bf16_to_float(std::uint16_t b) { return __builtin_bit_cast(float, static_cast<std::uint32_t>(b) << 16U); }
-// RNE to bfloat16 of a finite float (the cache write site C3 checks the result for +-inf afterwards).
-STRIX_GLM_HD inline std::uint16_t float_to_bf16(float x) {
-    const auto u = __builtin_bit_cast(std::uint32_t, x);
-    return static_cast<std::uint16_t>((u + 0x7fffU + ((u >> 16U) & 1U)) >> 16U);
-}
-STRIX_GLM_HD inline bool is_finite(float x) { return (__builtin_bit_cast(std::uint32_t, x) & 0x7f800000U) != 0x7f800000U; }
-STRIX_GLM_HD inline bool bf16_is_finite(std::uint16_t b) { return (b & 0x7f80U) != 0x7f80U; }
+// RNE to bfloat16 of a finite float (the cache write site C3 checks the result for +-inf afterwards): the shared
+// cache-row encoding (strix/attn/cache_rows.hpp).
+STRIX_GLM_HD inline std::uint16_t float_to_bf16(float x) { return strix::attn::cache_rows::encode(x); }
+STRIX_GLM_HD inline bool is_finite(float x) { return strix::attn::cache_rows::finite(x); }
+STRIX_GLM_HD inline bool bf16_is_finite(std::uint16_t b) { return strix::attn::cache_rows::finite(b); }
 
 // R5 ordered key of a finite score: larger score -> larger key; -0 maps to +0.
 STRIX_GLM_HD inline std::uint32_t ordered_key(float s) {

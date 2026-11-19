@@ -117,6 +117,9 @@ struct ApiConfig {
     std::uint32_t default_max_tokens = 4096;
     std::uint32_t http_slots = 0; // resolved capacity; zero leaves engine-specific headers unset
     bool default_thinking = true;            // the template's default (enable_thinking unset)
+    // reasoning_effort values the family template renders with the reasoning block already closed (e.g. "no_think"):
+    // like "none", they turn thinking off for the output parse; the effort itself still reaches the renderer.
+    std::vector<std::string> thinking_off_efforts;
     std::string api_key;                     // empty: no authentication
     // Requests with temperature > 0 on an engine without sampling: "greedy" runs them greedy and
     // says so in the response, "reject" answers 400.

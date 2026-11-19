@@ -1,4 +1,5 @@
 #include "strix/serve/glm_chat.hpp"
+#include "strix/serve/chat_template_kit.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -14,30 +15,16 @@ const std::string kThinkStart = "<think>", kThinkEnd = "</think>";
 const std::string kCallStart = "<tool_call>", kCallEnd = "</tool_call>";
 const std::string kKeyStart = "<arg_key>", kKeyEnd = "</arg_key>", kValueStart = "<arg_value>", kValueEnd = "</arg_value>";
 
-[[noreturn]] void raise(const std::string& message) { throw ChatTemplateError(message); }
+using chat_kit::call_arguments;
+using chat_kit::py_str;
+using chat_kit::raise;
+using chat_kit::tool_spec;
+using chat_kit::tool_to_json;
+using chat_kit::truthy;
 
 bool is_type(const Json* item, std::string_view type) {
     const auto* t = item ? item->find("type") : nullptr;
     return t && t->is_string() && t->as_string() == type;
-}
-// Python truthiness of a value (absent = Jinja undefined = false).
-bool truthy(const Json* v) {
-    if (!v || v->is_null()) return false;
-    if (v->is_bool()) return v->as_bool();
-    if (v->is_number()) return v->as_double() != 0.0;
-    if (v->is_string()) return !v->as_string().empty();
-    return v->size() > 0U;
-}
-// {{ value }}: Python str() of a scalar; undefined prints nothing.
-std::string py_str(const Json* v, const char* what) {
-    if (!v) return {};
-    switch (v->kind()) {
-    case Json::Kind::null: return "None";
-    case Json::Kind::boolean: return v->as_bool() ? "True" : "False";
-    case Json::Kind::number: return v->number_source();
-    case Json::Kind::string: return v->as_string();
-    default: raise(std::string("Unexpected ") + what + " type (an object or array printed as text).");
-    }
 }
 // A non-empty array whose first element is an object (content.0 in the template).
 const Json* first_item(const Json* v) {
@@ -69,28 +56,6 @@ std::string visible_text(const Json* content) {
 std::string role_of(const Json& message) {
     const auto* role = message.find("role");
     return role && role->is_string() ? role->as_string() : std::string{};
-}
-
-// A tool as the template sees it: its `function` member when it has one.
-const Json& tool_spec(const Json& tool) {
-    const auto* function = tool.find("function");
-    if (!function) return tool;
-    if (!function->is_object()) raise("A tool's function must be an object.");
-    return *function;
-}
-
-// tool_to_json: the tool's members in order, without defer_loading and strict.
-std::string tool_to_json(const Json& tool) {
-    if (!tool.is_object()) raise("Every tool must be an object.");
-    std::string out = "{";
-    bool first = true;
-    for (const auto& [key, value] : tool.as_object()) {
-        if (key == "defer_loading" || key == "strict") continue;
-        if (!first) out += ", ";
-        first = false;
-        out += "\"" + key + "\": " + value.dump_spaced();
-    }
-    return out + "}";
 }
 
 std::string tool_response(const std::string& text) { return "<tool_response>" + text + "</tool_response>"; }
@@ -181,20 +146,6 @@ std::string observation_block(const Json::Array& messages, std::size_t begin, st
 }
 
 // The arguments mapping of a tool call: an object as given, or a JSON string parsed into one.
-Json call_arguments(const Json& call, const std::string& name) {
-    const auto* arguments = call.find("arguments");
-    if (arguments && arguments->is_object()) return *arguments;
-    if (arguments && arguments->is_string()) {
-        if (strip(arguments->as_string()).empty()) return Json::object();
-        Json parsed;
-        try { parsed = parse_request_json(arguments->as_string()); }
-        catch (const JsonError&) { raise("Tool call arguments for function \"" + name + "\" are not valid JSON."); }
-        if (!parsed.is_object()) raise("Tool call arguments for function \"" + name + "\" must be a JSON object.");
-        return parsed;
-    }
-    raise("Tool call arguments for function \"" + name + "\" must be an object/mapping or a JSON string.");
-}
-
 std::string render_assistant(const Json& message, bool keep_reasoning) {
     std::string out = "<|assistant|>";
     auto content = visible_text(message.find("content"));
@@ -272,70 +223,11 @@ std::string render_glm_chat(const ChatTemplateInput& input) {
     return out;
 }
 
-namespace {
-// As parse_assistant_output: the schema of one parameter of a request tool.
-const Json* parameter_schema(const Json& tools, const std::string& function, const std::string& parameter) {
-    if (!tools.is_array()) return nullptr;
-    for (const auto& tool : tools.as_array()) {
-        const auto* spec = tool.find("function");
-        if (!spec) spec = &tool;
-        const auto* name = spec->find("name");
-        if (!name || !name->is_string() || name->as_string() != function) continue;
-        const auto* parameters = spec->find("parameters");
-        if (!parameters) parameters = spec->find("input_schema");
-        const auto* properties = parameters ? parameters->find("properties") : nullptr;
-        return properties ? properties->find(parameter) : nullptr;
-    }
-    return nullptr;
-}
-// Strings (or no schema) stay text; other types are parsed as JSON when they parse, else kept as text.
-Json typed_value(const std::string& text, const Json* schema) {
-    const auto* type = schema ? schema->find("type") : nullptr;
-    const bool string_type = !type || (type->is_string() && type->as_string() == "string");
-    if (string_type) return Json(text);
-    try { return parse_json(text); } catch (const JsonError&) { return Json(text); }
-}
-}  // namespace
-
 AssistantOutput parse_glm_output(const std::string& text, bool thinking, const Json& tools) {
     (void)thinking;  // the generation prompt always opens the reasoning block
-    AssistantOutput out;
-    out.tool_calls = Json::array();  // also when the reply ends inside the thinking block
-    const auto end = text.find(kThinkEnd);
-    if (end == std::string::npos) { out.reasoning = strip(text); return out; }
-    out.reasoning = strip(text.substr(0, end));
-    out.reasoning_complete = true;
-    const auto rest = text.substr(end + kThinkEnd.size());
-    const auto first_call = rest.find(kCallStart);
-    out.content = strip(first_call == std::string::npos ? rest : rest.substr(0, first_call));
-    for (auto at = first_call; at != std::string::npos; at = rest.find(kCallStart, at)) {
-        const auto begin = at + kCallStart.size();
-        const auto close = rest.find(kCallEnd, begin);
-        const auto block = rest.substr(begin, close == std::string::npos ? std::string::npos : close - begin);
-        at = close == std::string::npos ? rest.size() : close + kCallEnd.size();
-        if (close == std::string::npos) out.unfinished_call = true;
-        const auto name = strip(block.substr(0, block.find(kKeyStart)));
-        if (name.empty()) continue;
-        Json arguments = Json::object();
-        for (auto p = block.find(kKeyStart); p != std::string::npos; p = block.find(kKeyStart, p)) {
-            const auto key_end = block.find(kKeyEnd, p);
-            if (key_end == std::string::npos) break;
-            const auto key = strip(block.substr(p + kKeyStart.size(), key_end - p - kKeyStart.size()));
-            const auto value_at = block.find(kValueStart, key_end);
-            if (value_at == std::string::npos || !strip(block.substr(key_end + kKeyEnd.size(), value_at - key_end - kKeyEnd.size())).empty()) break;
-            const auto value_begin = value_at + kValueStart.size();
-            const auto value_end = block.find(kValueEnd, value_begin);
-            const auto value = block.substr(value_begin, value_end == std::string::npos ? std::string::npos : value_end - value_begin);
-            arguments.set(key, typed_value(value, parameter_schema(tools, name, key)));
-            p = value_end == std::string::npos ? block.size() : value_end + kValueEnd.size();
-        }
-        Json call = Json::object();
-        call.set("name", Json(name));
-        call.set("arguments", std::move(arguments));
-        out.tool_calls.push(std::move(call));
-        out.call_complete.push_back(close != std::string::npos);
-    }
-    return out;
+    static constexpr chat_kit::KvToolGrammar grammar{"</think>", "", "<tool_call>", "</tool_call>", "<arg_key>", "</arg_key>",
+                                                     "<arg_value>", "</arg_value>"};
+    return chat_kit::parse_kv_tool_output(text, true, grammar, tools);
 }
 
 }  // namespace strix::serve

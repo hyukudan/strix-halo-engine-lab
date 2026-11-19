@@ -344,8 +344,8 @@ void validate(const Request& request, const Bindings& b) {
         "Q4K A8 probe requires explicit matching numerical identity approval");
     const auto s = request.shape;
     check(s.hidden >= 256 && s.hidden <= max_hidden && s.hidden%256U == 0 && s.rows > 0 &&
-        s.rows <= max_rows && s.rows%32U == 0 && s.experts > 0 && s.experts <= max_experts &&
-        s.top_k > 0 && s.top_k <= max_top_k && s.logical_rows == 1, "Q4K A8 probe admits bounded C1 dimensions only");
+        s.rows <= c1_max_rows && s.rows%32U == 0 && s.experts > 0 && s.experts <= max_experts &&
+        s.top_k > 0 && s.top_k <= c1_max_top_k && s.logical_rows == 1, "Q4K A8 probe admits bounded C1 dimensions only");
     check(request.input == InputKind::bf16 || request.input == InputKind::fp32, "Q4K A8 input storage unsupported");
     check(request.gate_type == request.up_type && !request.fused_gate_up,
         "A8 prototype requires separate matching type12 or type13 gate/up tensors");

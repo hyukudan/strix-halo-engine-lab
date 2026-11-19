@@ -3,6 +3,7 @@
 // Build with -ffp-contract=off -fno-fast-math -fno-gpu-flush-denormals-to-zero.
 #include "glm/spec/glm_spec_dev.hpp"
 #include "glm/kernels/glm_tree.hpp"
+#include "strix/attn/group_pool.hpp"
 
 #include <cstdlib>
 #include <stdexcept>
@@ -194,17 +195,12 @@ __global__ __launch_bounds__(128) void dsa_rows_pool_kernel(DsaSlot sl, unsigned
     const unsigned r = blockIdx.x, i = threadIdx.x, t = t0 + r;
     if ((t + 1) % kKpool != 0) return;
     const unsigned tp = t + 1 - kKpool;
-    float l4[kKpool], kv[kKpool], e[kKpool], p[kKpool];
+    float l4[kKpool], kv[kKpool];
     for (unsigned j = 0; j < kKpool; ++j) {
         l4[j] = bf16_to_float(sl.igate[static_cast<std::size_t>(tp + j) * kIdxDim + i]) + w.ape[j * kIdxDim + i];
         kv[j] = bf16_to_float(sl.ikey[static_cast<std::size_t>(tp + j) * kIdxDim + i]);
     }
-    float m = l4[0];
-    for (unsigned j = 1; j < kKpool; ++j) m = l4[j] > m ? l4[j] : m;
-    for (unsigned j = 0; j < kKpool; ++j) e[j] = declared_exp(l4[j] - m);
-    const float sum = ((e[0] + e[1]) + e[2]) + e[3];
-    for (unsigned j = 0; j < kKpool; ++j) p[j] = e[j] / sum;
-    const float K = ((p[0] * kv[0] + p[1] * kv[1]) + p[2] * kv[2]) + p[3] * kv[3];
+    const float K = strix::attn::group_indexer::gated_pool_channel<kKpool>(l4, kv, strix::attn::group_pool::Fn<declared_exp>{});
     if (GLMSPEC_MUTANT != 3 && !is_finite(K)) atomicOr(row_flag + r, 1U);
     sl.pooled[static_cast<std::size_t>(t / kKpool) * kIdxDim + i] = K;
 }

@@ -19,7 +19,9 @@ add_test(NAME entry-failure-ownership COMMAND direct-row-fetch-tests entry)
 add_test(NAME ring-recycling-and-read-failure COMMAND direct-row-fetch-tests lifecycle)
 set_tests_properties(throwing-sink-drain-reuse entry-failure-ownership ring-recycling-and-read-failure PROPERTIES TIMEOUT 20)
 
-add_executable(engram-policy-tests engram_policy_tests.cpp "${STRIX_ROOT}/src/ds41_engram.cpp")
+# The DS41 Engram adapter binds the shared Engram component.
+set(STRIX_ENGRAM_SOURCES "${STRIX_ROOT}/src/engram/spec.cpp" "${STRIX_ROOT}/src/engram/hasher.cpp" "${STRIX_ROOT}/src/engram/row_reader.cpp")
+add_executable(engram-policy-tests engram_policy_tests.cpp "${STRIX_ROOT}/src/ds41_engram.cpp" ${STRIX_ENGRAM_SOURCES})
 target_include_directories(engram-policy-tests PRIVATE "${STRIX_ROOT}/include" "${STRIX_ROOT}/src")
 target_link_libraries(engram-policy-tests PRIVATE Threads::Threads)
 if(MSVC)
@@ -32,7 +34,7 @@ add_test(NAME engram-policy-and-fallback COMMAND engram-policy-tests)
 set_tests_properties(engram-policy-and-fallback PROPERTIES TIMEOUT 20)
 
 add_executable(engram-cache-tests "${STRIX_ROOT}/tests/ds41_engram_cache_tests.cpp"
-    "${STRIX_ROOT}/src/ds41_engram.cpp")
+    "${STRIX_ROOT}/src/ds41_engram.cpp" ${STRIX_ENGRAM_SOURCES})
 target_include_directories(engram-cache-tests PRIVATE "${STRIX_ROOT}/include" "${STRIX_ROOT}/src")
 target_link_libraries(engram-cache-tests PRIVATE Threads::Threads)
 if(MSVC)
