@@ -4,9 +4,12 @@
 // - MODEL_B: hash ids from the pack's 12 multipliers and 64 moduli equal vectors computed on the host CPU by the reference
 //   formula (modeling_hy_v4_flash hash_ngrams: lookup, int64 products, XOR fold, % head vocab size); padding at the
 //   document start; ids at or past the reference table size read the pad; e4m3 decode of all 256 codes; 96-byte rows.
+// - Read-ahead: blocks read on the worker equal RowReader::read of the same requests byte for byte (direct and plain),
+//   in any wait order; a failed block rethrows on wait and does not stop the blocks after it; release frees.
 #include "strix/ds41_engram.hpp"
 #include "strix/ds41_formats.hpp"
 #include "strix/engram/hasher.hpp"
+#include "strix/engram/read_ahead.hpp"
 #include "strix/engram/row_reader.hpp"
 #include "strix/engram/spec.hpp"
 #if defined(STRIX_ENGRAM_HY4)
@@ -383,6 +386,59 @@ void test_reader_96() {
     std::filesystem::remove(path);
 }
 
+void test_read_ahead() {
+    std::vector<std::uint8_t> bytes(4096U * 40U + 7U);
+    Lcg g{47};
+    for (auto& b : bytes) b = static_cast<std::uint8_t>(g.next());
+    const auto path = write_file("strix_engram_core_read_ahead.bin", bytes);
+    const std::vector<strix::engram::Table> tables{{64U, 900U}, {64U + 900U * 96U, 700U}};
+    for (int mode = 0; mode < 2; ++mode) {
+        strix::engram::ReaderOptions o;
+        o.row_bytes = 96;
+        o.threads = 2;
+        o.direct_io = mode == 0;
+        strix::engram::RowReader reader(path, tables, o);
+        std::vector<std::vector<strix::engram::RowRequest>> blocks(6);
+        for (std::size_t k = 0; k < blocks.size(); ++k) {
+            blocks[k].resize(k == 3U ? 0U : 64U + 37U * k);  // block 3 empty
+            for (auto& r : blocks[k]) {
+                r.table = static_cast<std::uint32_t>(g.next() % 2U);
+                r.row = g.next() % (r.table == 0U ? 900U : 700U);
+            }
+            if (blocks[k].size() > 5U) blocks[k][5] = blocks[k][1];  // a duplicate inside the block
+        }
+        blocks[4].push_back({1U, 700U});  // out of range: block 4 fails, block 5 is still read
+        std::vector<std::vector<std::uint8_t>> direct(blocks.size());
+        for (std::size_t k = 0; k < blocks.size(); ++k)
+            if (k != 4U) {
+                direct[k].resize(blocks[k].size() * 96U);
+                reader.read(blocks[k], direct[k]);
+            }
+        strix::engram::ReadAhead ahead(reader);
+        std::vector<std::uint64_t> tickets;
+        for (const auto& b : blocks) tickets.push_back(ahead.submit(b));
+        expect(tickets.front() == 0U && tickets.back() == blocks.size() - 1U, "read-ahead tickets in submission order");
+        bool same = true;
+        for (const std::size_t k : {std::size_t{5}, std::size_t{0}, std::size_t{2}, std::size_t{1}, std::size_t{3}}) {
+            const auto got = ahead.wait(tickets[k]);
+            same = same && got.size() == direct[k].size() &&
+                   (got.empty() || std::memcmp(got.data(), direct[k].data(), got.size()) == 0);
+        }
+        expect(same, mode == 0 ? "read-ahead bytes equal RowReader::read (direct)" : "read-ahead bytes equal RowReader::read (plain)");
+        expect(throws([&] { (void)ahead.wait(tickets[4]); }), "read-ahead rethrows the failed block");
+        expect(ahead.held() == blocks.size(), "read-ahead holds every unreleased block");
+        for (const auto t : tickets) ahead.release(t);
+        expect(ahead.held() == 0U, "read-ahead release frees");
+        expect(throws([&] { (void)ahead.wait(tickets[0]); }), "read-ahead rejects a released ticket");
+        const auto st = ahead.stats();
+        expect(st.blocks == blocks.size() - 1U, "read-ahead counts the read blocks (empty block not queued)");
+        // destruction with blocks still queued: finishes them, then joins
+        strix::engram::ReadAhead drain(reader);
+        for (std::size_t k = 0; k < 3U; ++k) (void)drain.submit(blocks[k]);
+    }
+    std::filesystem::remove(path);
+}
+
 } // namespace
 
 int main() {
@@ -392,6 +448,7 @@ int main() {
 #endif
     test_decode();
     test_reader_96();
+    test_read_ahead();
     if (failures == 0) std::printf("engram core tests: PASS\n");
     return failures == 0 ? 0 : 1;
 }
