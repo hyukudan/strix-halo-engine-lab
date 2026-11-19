@@ -209,11 +209,6 @@ try {
             "join accepts a cache grid dividing T, including the HTTP 1024-row checkpoint default");
         require(!qwen_prefix_join_grid(0,8192) && !qwen_prefix_join_grid(3072,8192) && !qwen_prefix_join_grid(1024,0),
             "join refuses a missing or non-dividing cache grid");
-        QwenPrefixJoinWait wait{42,9216};
-        require(wait.pending(42,true,true,1024) && wait.pending(42,true,true,9216),"wait keeps incomplete producer");
-        require(!wait.pending(43,true,true,0),"ABA slot generation releases waiter");
-        require(!wait.pending(42,false,true,1024) && !wait.pending(42,true,false,1024),"producer cancellation/completion releases waiter");
-        require(!wait.pending(42,true,true,10240),"passed boundary releases waiter");
     }
     std::cout<<"planner passed: "<<shapes<<" shapes, "<<units<<" units; certificates and capture eligibility passed\n";
     return 0;

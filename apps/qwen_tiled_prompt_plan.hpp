@@ -289,13 +289,6 @@ inline bool qwen_suffix_solo_class(const QwenTiledPlanConfig& config,std::uint64
 inline bool qwen_prefix_join_grid(std::uint64_t cache_rows,std::uint64_t t_rows) {
     return cache_rows && t_rows && t_rows%cache_rows==0;
 }
-// A wait is tied to an admission generation, never just a reusable slot address.
-struct QwenPrefixJoinWait {
-    std::uint64_t generation=0,boundary=0;
-    bool pending(std::uint64_t current,bool active,bool prefilling,std::uint64_t position) const {
-        return boundary && current==generation && active && prefilling && position<=boundary;
-    }
-};
 inline std::uint64_t qwen_prefix_join_boundary(const QwenTiledPlanConfig& producer,std::uint64_t pn,
     const QwenTiledPlanConfig& consumer,std::uint64_t cn,std::uint64_t common,std::uint64_t from,
     const QwenBatchConfig& batch,bool nesting_possible) {
