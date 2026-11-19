@@ -298,6 +298,21 @@ void route_checks() {
     require(r.route.prefix == 0U && r.chunk.rows == 4096U && r.tile_rows == 8192U && std::string_view(r.policy) == "fixed");
     r = resolve_pair_route(8192, 8192, nullptr, nullptr, prediction, false, false);
     require(r.route.prefix == 0U && r.tile_rows == 4096U);
+    // The MTP hand-off runs the resolver's route, cut back to the rows its tiled plan carries. At 8K the length
+    // policy pipelines (4 x 2,048) where the old fixed rule the hand-off used to apply declined (< 28,672 rows).
+    r = length(8192, 8192);
+    const auto handed = handoff_route(r.route, 8192U, r.tile_rows);
+    require(handed.prefix == 8192U && std::string_view(handed.reason) == "pipeline-length-model");
+    require(choose_prompt_route(8192, r.tile_rows, nullptr, prediction).prefix == 0U);
+    require(handoff_route(r.route, 6144U, r.tile_rows).prefix == 6144U);  // serial / window tail stays with rank 0
+    require(handoff_route(r.route, 2048U, r.tile_rows).prefix == 0U);     // one tile or less: one node
+    r = length(16384, 16384);
+    require(r.route.prefix != 0U && handoff_route(r.route, 16384U, r.tile_rows).prefix == r.route.prefix);
+    r = resolve_pair_route(8192, 8192, nullptr, nullptr, prediction, false, true);  // fixed policy: single stays single
+    require(handoff_route(r.route, 8192U, r.tile_rows).prefix == 0U);
+    r = length(32768, 16384);  // from 28,672 rows both rules agree
+    require(handoff_route(r.route, 32768U, r.tile_rows).prefix ==
+            choose_prompt_route(32768, r.tile_rows, nullptr, prediction).prefix);
     r = resolve_pair_route(32768, 16384, nullptr, nullptr, prediction, false, true);
     require(r.route.prefix == 32768U && r.chunk.rows == 4096U && r.tile_rows == 4096U);
     // A transfer-bearing cost file keeps the cost-model route under either policy.

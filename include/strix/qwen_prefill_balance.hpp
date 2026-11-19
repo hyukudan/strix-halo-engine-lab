@@ -388,4 +388,11 @@ inline PairRoute resolve_pair_route(std::uint64_t prompt, std::uint32_t legacy, 
         out.chunks = (out.route.prefix + out.tile_rows - 1U) / out.tile_rows;
     return out;
 }
+// The MTP pair hand-off runs the route resolve_pair_route chose (no second threshold), cut back to the rows the MTP
+// owner's tiled plan carries before its serial / window tail; a prefix of at most one tile runs on one node.
+inline PromptRoute handoff_route(PromptRoute resolved, std::uint64_t tiled_end, std::uint32_t tile_rows) {
+    resolved.prefix = std::min(resolved.prefix, tiled_end);
+    if (resolved.prefix <= tile_rows) resolved.prefix = 0U;
+    return resolved;
+}
 } // namespace strix::qwen_pp
