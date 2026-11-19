@@ -5468,3 +5468,25 @@ Several short waiting prompts run as one device prefill pass under the FAST leve
 - **Off switch:** `STRIX_SERVE_PREFILL_GROUP=0`
 - **Exactness evidence:** pair runs, same eight prompts solo (one at a time) and grouped in one server: every member's logits and exported-state hashes equal its solo run on both ranks, under exact (solo hashes equal to the previous main), the FAST profile, FAST_DENSE, FAST_MOE, FAST_ATTN=2, and the FAST profile with `STRIX_DS41_FAST_DENSE_MIN_ROWS=64` (groups of 125 rows across the threshold).
 - **Measured gain:** FAST profile, eight requests x 256 tokens: whole run 99.9 -> 102.7 tok/s (+2.8 %), admission 1,428 -> 865 ms; four requests about +1 % (noisy).
+
+<a id="hy4-rows-expert-union"></a>
+
+## Hy4-flash verify rows: routed experts of the window read once
+
+**Engine:** `hy4`. **Control:** `STRIX_HY4_ROWS_EXPERT_UNION`. **Default:** on.
+
+A speculative verify window of R rows (R <= 8) runs the step's stages over all rows in one pass; its routed experts
+read each row's 16 experts separately, so the per-row cost of a window was one more row of expert weights (~14 ms per
+row on one node). The window's experts now go through the union rows form of the shared Q4_K x A8 MoE family: the
+distinct experts of the window are listed once, each is read once, and the rows that chose it are computed one after
+another with the single-row instruction sequence.
+
+- **Preconditions:** Hy4-flash verify rows (`strix-hy4-rows`, the speculative decode path), top-16 of 512 experts, Q4_K
+  gate / up with a K-quant down (the C1 envelope of the family).
+- **Exactness evidence:** Bitwise by construction; on device, rows logits equal the step's logits for 30 / 30 rows
+  (R = 1 / 2 / 4 / 8, per-row and union arms), and speculative decode ids equal plain greedy ids (300 ids, code and prose).
+- **Off switch:** `STRIX_HY4_ROWS_EXPERT_UNION=0` keeps the per-row expert loop.
+- **Measured gain:** One node, verify window, 10-rep alternated medians: R2 73.7 -> 68.7 ms, R4 111.1 -> 91.6 ms, R8
+  187.3 -> 137.5 ms. Speculative decode with the shared copy proposer, 300 ids, code prompt: plain 16.65 -> 20.16 tok/s
+  (E 1.37 tokens per pass); prose: no proposals, 17.06 -> 17.06 tok/s.
+- **Implementation / evidence:** [union form](../src/hip_moe_q4k_a8_probe.hip), [plan](../include/strix/moe/expert_union.hpp), [binding](../src/hy4/hip/hy4_hip_rows.inc)

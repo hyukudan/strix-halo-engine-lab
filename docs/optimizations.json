@@ -3351,5 +3351,16 @@
     "preconditions": "CUDA decode attention through cuda_core::attention_decode with more than one row (Qwen 27B dense verify / draft / plain) on a measured device and head shape (shared table: sm_120 with 188 SMs, 24 q / 4 kv, Dim 256); others keep the one-row grid (same bits).",
     "off_switch": "STRIX_DECODE_ATTN_ROW_SHARE=0",
     "doc_anchor": "docs/optimizations.md#qwen27-cuda-decode-attn-row-share"
+  },
+  {
+    "engine": "hy4",
+    "name": "Verify rows: routed experts of the window read once (expert union)",
+    "flag_or_env": "STRIX_HY4_ROWS_EXPERT_UNION",
+    "default": "ON",
+    "exact": "Bitwise: every (row, slot, output) runs the single-row instruction sequence; rows == step logits 30/30 (R 1/2/4/8, per-row and union arms) on device.",
+    "gain": "One node, verify window, 10-rep A-B medians: R4 111.1 -> 91.6 ms, R8 187.3 -> 137.5 ms; code decode with the copy proposer 16.65 -> 20.16 tok/s (ids equal).",
+    "preconditions": "Hy4-flash verify rows (R <= 8, top-16 of 512) on the Q4_K x A8 C1 family with K-quant down.",
+    "off_switch": "STRIX_HY4_ROWS_EXPERT_UNION=0",
+    "doc_anchor": "docs/optimizations.md#hy4-rows-expert-union"
   }
 ]

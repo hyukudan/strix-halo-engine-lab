@@ -361,7 +361,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_SERVE_T16K` | qwen | ON: T16384 owner when the context admits a 32,768-token request and every resident slot fits; `0` keeps T8192 | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 | `STRIX_SERVE_FP16_MTP` | qwen | ON: explicit-sidecar MTP servers keep the automatic FP16 prefill arithmetic with the unqualified fast options off; `0` declines it | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 
-### Decode, MTP y DSpark (25)
+### Decode, MTP y DSpark (26)
 
 | Toggle | Motor | Por defecto | Detalles |
 |---|---|---|---|
@@ -376,6 +376,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_GLM_R1B_DENSE` | glm | 7 | [glm-r1b-dense-auto](optimizations.md#glm-r1b-dense-auto) |
 | `STRIX_GLM_R1B_HC` | glm | 4 | [glm-r1b-hc-v4](optimizations.md#glm-r1b-hc-v4) |
 | `STRIX_GLM_SPEC_KDA_TREE` | glm | on (Xfer verify exchange, KDA tree 2,... | [glm-mtp-spec](optimizations.md#glm-mtp-spec) |
+| `STRIX_HY4_ROWS_EXPERT_UNION` | hy4 | on | [hy4-rows-expert-union](optimizations.md#hy4-rows-expert-union) |
 | `STRIX_MM_ATTEND4_DECODE` | minimax | 1 | [mm-attend4-decode](optimizations.md#mm-attend4-decode) |
 | `STRIX_MM_DRAFT_LIN` | minimax | opt | [mm-draft-lin](optimizations.md#mm-draft-lin) |
 | `STRIX_MM_DSPARK_ATTN` | minimax | 2 | [mm-dspark-attn](optimizations.md#mm-dspark-attn) |
