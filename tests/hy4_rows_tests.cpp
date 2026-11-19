@@ -7,10 +7,14 @@
 //     speculation engages (accepted drafts > 0) and a commit that keeps rejected rows is detected (ids differ).
 #include "hy4/hip/hy4_hip_rows.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -114,6 +118,180 @@ void check_spec() {
     CHECK(wrong.ids != plain);  // negative control: rejected rows left in the history change the ids
     std::printf("spec negative control (commit keeps rejected rows): ids differ = %d\n", wrong.ids != plain ? 1 : 0);
 }
+
+// The chain arm (MtpSource = the shared MtpChain over the forward's next-token block). Target: next = (5 last + 3 n) % 97
+// (n = history length: hardly copyable). Its "next-token block" knows the stream only through what the chain feeds it:
+// block position p gets the token at target position p + 1, so with every position fed once, in order, with the right
+// successor, it predicts the target exactly; it errs on purpose at every p % 5 == 3. Hidden rows carry their source: the
+// target's (verify / prompt rows) hold +p, the block's own output at p holds -(p + 1).
+struct FakeMtpForward {
+    struct Cfg { std::uint32_t hidden = 4; } cfg;
+    static constexpr std::uint32_t kNextnRows = 32;
+    std::vector<std::uint32_t> hist, greedy, mtp_tok;
+    std::vector<float> rows_h, pre, post;
+    std::array<std::uint32_t, kNextnRows> top{};
+    std::uint32_t p0 = 0, rows = 0;
+    std::uint64_t bad_hidden = 0, bad_position = 0, teacher_rows = 0, chain_rows = 0, wrong_on_purpose = 0;
+    std::function<void(const float*, std::uint32_t, std::uint32_t)> sink;
+    static std::uint32_t next(std::uint32_t last, std::size_t n) { return static_cast<std::uint32_t>((5U * last + 3U * n) % 97U); }
+    [[nodiscard]] const Cfg& config() const { return cfg; }
+    [[nodiscard]] std::uint32_t position() const { return static_cast<std::uint32_t>(hist.size()); }
+    void forward_rows(std::span<const std::uint32_t> toks, bool) {
+        if (rows != 0U) throw std::logic_error("fake: pass before commit");
+        p0 = position();
+        rows = static_cast<std::uint32_t>(toks.size());
+        greedy.clear();
+        rows_h.assign(std::size_t{rows} * 4U, 0.0F);
+        for (std::uint32_t r = 0; r < rows; ++r) {
+            hist.push_back(toks[r]);
+            greedy.push_back(next(toks[r], hist.size()));
+            rows_h[std::size_t{r} * 4U] = static_cast<float>(p0 + r);
+        }
+    }
+    [[nodiscard]] std::span<const std::uint32_t> rows_greedy() const { return greedy; }
+    void commit_rows(std::uint32_t k) {
+        hist.resize(p0 + k);
+        rows = 0;
+    }
+    [[nodiscard]] const float* rows_hidden() const { return rows_h.data(); }
+    // prompt windows of 16 rows: the sink sees the target hidden of every prompt row; returns the anchor
+    std::uint32_t prefill(const std::vector<std::uint32_t>& prompt) {
+        std::vector<float> win;
+        for (std::size_t i = 0; i < prompt.size(); i += 16U) {
+            const auto n = static_cast<std::uint32_t>(std::min<std::size_t>(16U, prompt.size() - i));
+            win.assign(std::size_t{n} * 4U, 0.0F);
+            for (std::uint32_t r = 0; r < n; ++r) {
+                hist.push_back(prompt[i + r]);
+                win[std::size_t{r} * 4U] = static_cast<float>(hist.size() - 1U);
+            }
+            if (sink) sink(win.data(), static_cast<std::uint32_t>(i), n);
+        }
+        return next(hist.back(), hist.size());
+    }
+    void set_prompt_hidden(std::function<void(const float*, std::uint32_t, std::uint32_t)> s) { sink = std::move(s); }
+    float* alloc_f32(std::size_t n) { return new float[std::max<std::size_t>(n, 1U)](); }
+    void free_f32(float* p) noexcept { delete[] p; }
+    void copy_f32_async(float* d, const float* s, std::size_t n) { std::copy(s, s + n, d); }
+    void read_ids(const std::uint32_t* src, std::uint32_t n, std::uint32_t* host) { std::copy(src, src + n, host); }
+    struct Out {
+        const std::uint32_t* top;
+        const float* hidden_pre;
+        const float* hidden_post;
+    };
+    Out nextn_rows(const std::uint32_t* toks, const float* hidden, std::uint32_t R, std::uint32_t pos0, bool want_top) {
+        if (R == 0U || R > kNextnRows || pos0 > mtp_tok.size()) {
+            ++bad_position;
+            throw std::logic_error("fake: next-token rows / position");
+        }
+        mtp_tok.resize(pos0);  // a redo at the same positions replaces a rejected chain
+        pre.assign(std::size_t{R} * 4U, 0.0F);
+        post.assign(std::size_t{R} * 4U, 0.0F);
+        for (std::uint32_t r = 0; r < R; ++r) {
+            const std::uint32_t p = pos0 + r;
+            const float h0 = hidden[std::size_t{r} * 4U];
+            if (h0 == static_cast<float>(p)) ++teacher_rows;
+            else if (h0 == -static_cast<float>(p)) ++chain_rows;  // the block's own output at p - 1
+            else ++bad_hidden;
+            mtp_tok.push_back(toks[r]);
+            post[std::size_t{r} * 4U] = -static_cast<float>(p + 1U);
+            top[r] = 0U;
+        }
+        if (want_top) {
+            const std::uint32_t p = pos0 + R - 1U;  // block position p holds target token p + 1; predicts target token p + 2
+            std::uint32_t pred = next(mtp_tok[p], std::size_t{p} + 2U);
+            if (p % 5U == 3U) {
+                pred = (pred + 1U) % 97U;
+                ++wrong_on_purpose;
+            }
+            top[R - 1U] = pred;
+        }
+        return {top.data(), pre.data(), post.data()};
+    }
+};
+
+void check_spec_mtp() {
+    std::vector<std::uint32_t> prompt;
+    for (std::uint32_t i = 0; i < 37; ++i) prompt.push_back((i * 13U + 5U) % 97U);
+    const std::uint32_t n = 300;
+    std::vector<std::uint32_t> plain;
+    {
+        auto h = prompt;
+        plain.push_back(FakeMtpForward::next(h.back(), h.size()));
+        while (plain.size() < n) {
+            h.push_back(plain.back());
+            plain.push_back(FakeMtpForward::next(h.back(), h.size()));
+        }
+    }
+    hb::rows::SpecOptions o;
+    o.max_rows = hb::rows::kMaxVerifyRows;
+    for (std::uint32_t r = 1; r <= o.max_rows; ++r) o.verify_ms.push_back(57.7 + 11.6 * (r - 1U));
+    o.chain_survival = {0.714, 0.633, 0.436, 0.675, 0.256, 0.5};
+    FakeMtpForward c;  // copy only (the incumbent) on the same target
+    const std::uint32_t anchor_c = c.prefill(prompt);
+    const auto copy_only = hb::rows::spec_decode(c, prompt, anchor_c, n, o);
+    CHECK(copy_only.ids == plain);
+    for (const bool with_copy : {true, false}) {
+        FakeMtpForward f;
+        hb::rows::MtpSource<FakeMtpForward> source(f);
+        source.install(prompt);
+        const std::uint32_t anchor = f.prefill(prompt);
+        source.finish_prompt(anchor);
+        CHECK(anchor == plain[0]);
+        auto oo = o;
+        oo.copy = with_copy;
+        const auto res = hb::rows::spec_decode(f, prompt, anchor, n, oo, &source);
+        CHECK(res.ids == plain);                            // the chain changes which rows are verified, never an id
+        CHECK(f.bad_hidden == 0U && f.bad_position == 0U);  // teacher rows = target hidden at p, chain rows = own output
+        CHECK(f.teacher_rows >= prompt.size());             // every prompt position fed to the block
+        CHECK(res.chain_drafts > 0U && f.chain_rows > 0U && f.wrong_on_purpose > 0U);
+        CHECK(res.accepted > 2U * copy_only.accepted);      // a predictive block beats the copy source on a non-copy stream
+        CHECK(res.steps.size() < copy_only.steps.size());
+        std::printf("spec mtp (%s): ids == plain over %u ids, %zu passes (copy only %zu), accepted %llu (copy only %llu), "
+                    "block calls %llu rows %llu (teacher %llu chain %llu)\n",
+                    with_copy ? "chain+copy+hybrid" : "chain only", n, res.steps.size(), copy_only.steps.size(),
+                    static_cast<unsigned long long>(res.accepted), static_cast<unsigned long long>(copy_only.accepted),
+                    static_cast<unsigned long long>(res.chain_calls), static_cast<unsigned long long>(res.chain_rows),
+                    static_cast<unsigned long long>(f.teacher_rows), static_cast<unsigned long long>(f.chain_rows));
+    }
+}
+
+// The stated confidence (BlockDrafter::seed_chain_survival -> Arbiter::seed_model_survival) raises the chain arm's
+// expected tokens of the first decision; with no seed the flat prior prices it.
+struct NullChain final : strix::spec::ChainDrafter {
+    void draft(std::span<const std::uint32_t>, std::uint32_t k, std::vector<std::uint32_t>& out) override { out.assign(k, 0U); }
+    void accept(std::span<const std::uint32_t>) override {}
+};
+void check_survival_seed() {
+    strix::spec::BlockConfig bc;
+    bc.max_block = 8;
+    bc.arbiter.windows = {1, 2, 3, 4, 5, 6, 7, 8};
+    bc.copy = false;
+    bc.hybrid = false;
+    bc.chain_max_k = 7;
+    bc.fixed_costs = true;
+    bc.chain_seed_step_ms = 6.1;
+    bc.chain_seed_flush_ms = 9.6;
+    NullChain a, b;
+    strix::spec::BlockDrafter flat(bc, &a), seeded(bc, &b);
+    for (std::uint32_t r = 1; r <= 8; ++r) {
+        flat.seed_verify_ms(r, 57.7 + 11.6 * (r - 1U));
+        seeded.seed_verify_ms(r, 57.7 + 11.6 * (r - 1U));
+    }
+    const std::vector<double> high(7, 0.95);
+    seeded.seed_chain_survival(high, 64.0);
+    const std::vector<std::uint32_t> stream{1, 2, 3};
+    flat.commit(stream);
+    seeded.commit(stream);
+    strix::spec::StepParams p;
+    p.max_rows = 8;
+    p.context = 3;
+    const auto bf = flat.next(p);
+    const auto bs = seeded.next(p);
+    CHECK(bs.decision.expected_tokens > bf.decision.expected_tokens);
+    CHECK(bs.decision.k >= bf.decision.k && bs.decision.k > 1U);
+    std::printf("chain survival seed: first decision k %u -> %u, expected tokens %.2f -> %.2f\n", bf.decision.k, bs.decision.k,
+                bf.decision.expected_tokens, bs.decision.expected_tokens);
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -126,6 +304,8 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::filesystem::exists(argv[1])) check_rings(strix::hy4::Config::from_gguf(argv[1]), "pack");
         check_words();
         check_spec();
+        check_spec_mtp();
+        check_survival_seed();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "exception: %s\n", e.what());
         return 1;

@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <chrono>
 #include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -220,6 +221,15 @@ private:
     std::uint64_t calls_ = 0, rows_ = 0, drafts_ = 0, reads_ = 0;
     bool feed_ = true;
     double draft_wall_ms_ = 0.0;
+};
+
+// Dev glue for an engine that owns its device memory and stream through three members:
+//   float* alloc_f32(std::size_t floats), void free_f32(float*), void copy_f32_async(float* dst, const float* src, std::size_t floats)
+// (async device -> device on the engine's stream). Any backend whose engine has them binds MtpChain<Engine, EngineChainDev>.
+struct EngineChainDev {
+    template <class E> static float* alloc(E& e, std::size_t n) { return e.alloc_f32(n); }
+    template <class E> static void release(E& e, float* p) { e.free_f32(p); }
+    template <class E> static void copy(E& e, float* d, const float* s, std::size_t n) { e.copy_f32_async(d, s, n); }
 };
 
 }  // namespace strix::spec
