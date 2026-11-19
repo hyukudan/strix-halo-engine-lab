@@ -492,10 +492,11 @@ int main(int argc, char** argv) try {
         if (!use_chain) bc.copy = true;
         sp::BlockDrafter drafter(bc, use_chain ? chain_glue.get() : nullptr);
         q::hip_dense_seed_verify(drafter, bc.max_block, bc.fixed_costs, *costs);
-        std::printf("spec config: costs %s (%s), verify ms r1 %.1f r16 %.1f, draft flush %.2f step %.2f ms, chain cap %u, max block %u\n",
+        std::printf("spec config: costs %s (%s), verify ms r1 %.1f r16 %.1f, draft flush %.2f step %.2f ms, chain cap %u, max block %u, "
+                    "context cost %s\n",
                     q::hip_dense_cost_mode_name(plan.costs), costs->source == q::HipDenseCostSource::calibrated ? "calibrated" : "table",
                     q::hip_dense_verify_ms(*costs, 1), q::hip_dense_verify_ms(*costs, 16), bc.chain_seed_flush_ms, bc.chain_seed_step_ms,
-                    bc.chain_max_k, bc.max_block);
+                    bc.chain_max_k, bc.max_block, sp::context_cost_name(drafter.arbiter().config()).c_str());
         drafter.commit(prompt);
         drafter.commit(std::span<const std::uint32_t>(out.data(), 1));
         E->set_draft_rows(drows_on ? drows.get() : nullptr);

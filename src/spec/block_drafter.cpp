@@ -175,6 +175,8 @@ void BlockDrafter::observe(const Block& b, std::uint32_t accepted, double verify
     }
     stats_.record(o, std::uint32_t(emitted.size()));
     arbiter_.observe(o, emitted);
+    stats_.cost_fit = arbiter_.cost_fit();  // printed in strix-spec-stats (context cost mode and coefficients)
+    stats_.has_cost_fit = true;
     proposer_.commit(emitted);
     if (chain_) chain_->accept(emitted);
 }

@@ -115,7 +115,11 @@ int main(int argc, char** argv) {
         //   A trailing "d" (newd, subd, new15d, sub15d) = deterministic controller: BlockConfig::fixed_costs with the work
         //   model --cost-model V1,VROW,DA,DB: verify V(r) = V1 + VROW (r - 1) ms, draft DA + DB f ms per position with
         //   f = draft head rows / vocab (1 = full head). Defaults = PRO 6000 receipts of this identity (cc_decode3-STATE.md).
+        //   --cost-kv online|off|KV = the context cost of those arms (spec::set_context_cost, shared with every binder):
+        //   online (default) fits it from this device's verify walls (ArbiterConfig::cost_fit), off = context-blind seeds
+        //   (the previous form), KV = fixed ms per verify row per 1,024 context positions (deterministic A/B).
         double cm_v1 = 13.30, cm_vrow = 0.113, cm_da = 0.370, cm_db = 0.454;
+        std::string cost_kv = "online";
         std::vector<std::string> arms{"new"};
         std::uint32_t draft_core = sp::DraftRowsConfig{}.core_groups, draft_fallback = sp::DraftRowsConfig{}.fallback_groups;
         std::string draft_pack;
@@ -153,6 +157,11 @@ int main(int argc, char** argv) {
                 if (std::sscanf(v.c_str(), "%lf,%lf,%lf,%lf", &cm_v1, &cm_vrow, &cm_da, &cm_db) != 4 || !(cm_v1 > 0.0) ||
                     !(cm_vrow >= 0.0) || !(cm_da > 0.0) || !(cm_db >= 0.0))
                     throw std::runtime_error("--cost-model V1,VROW,DA,DB (ms; V1 > 0, DA > 0)");
+            }
+            else if (a == "--cost-kv") {
+                cost_kv = next();
+                sp::ArbiterConfig probe;
+                sp::set_context_cost(probe, cost_kv);  // validates now: online|off|KV
             }
             else if (a == "--chain-hidden") chain_hidden = next();
             else if (a == "--max-pos") max_pos = strix::core::parse_u32(next());
@@ -406,12 +415,16 @@ int main(int argc, char** argv) {
                     fixed_draft_ms = cm_da + cm_db * f;
                     bc.fixed_costs = true;
                     bc.chain_seed_flush_ms = bc.chain_seed_step_ms = fixed_draft_ms;
+                    sp::set_context_cost(bc.arbiter, cost_kv);  // seeded model only (fixed_costs -> learn_costs = false)
                 }
                 sp::BlockDrafter drafter(bc, chain);
                 if (arm.fixed) {
                     for (std::uint32_t r = 1; r <= bc.max_block; ++r) drafter.seed_verify_ms(r, cm_v1 + cm_vrow * double(r - 1));
-                    std::printf("costs[%s]: fixed model V(r) = %.3f + %.4f (r-1) ms, draft %.3f ms per position\n", tag.c_str(),
+                    std::printf("costs[%s]: fixed model V(r) = %.3f + %.4f (r-1) ms, draft %.3f ms per position", tag.c_str(),
                                 cm_v1, cm_vrow, fixed_draft_ms);
+                    const auto& ac = drafter.arbiter().config();
+                    if (ac.row_kv_ms_per_kpos > 0.0) std::printf(", + %.4f r ms per 1K context positions", ac.row_kv_ms_per_kpos);
+                    std::printf(", context cost %s\n", sp::context_cost_name(ac).c_str());
                 } else if (seed_costs) {  // engine's measured verify wall per window shape (commit full), 3 reps each
                     std::vector<std::uint32_t> t(32, anchor);
                     for (const std::uint32_t r : {1U, 2U, 4U, 8U, 16U, 32U}) {

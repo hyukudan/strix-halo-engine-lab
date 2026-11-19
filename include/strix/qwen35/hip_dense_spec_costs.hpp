@@ -92,7 +92,8 @@ struct HipDenseCosts {
 }
 
 // ONE set of speculation flags for every entry point of the family (strix-hip-qwen35-decode, strix-hip-qwen35-spec):
-//   --mtp auto|off|none|FILE, --draft-rows on|off, --draft-pack F1,F2, --spec-costs calibrated|table|learned
+//   --mtp auto|off|none|FILE, --draft-rows on|off, --draft-pack F1,F2, --spec-costs calibrated|table|learned,
+//   --cost-kv auto|online|off|KV (context cost of the calibrated / table model, hip_dense_cost_kv)
 //   (fixed = table, the previous name). learned = the previous learned form (cap 7), kept as the rollback.
 enum class HipDenseCostMode { calibrated, table, learned };
 struct HipDenseSpecArgs {
@@ -100,6 +101,7 @@ struct HipDenseSpecArgs {
     bool draft_rows = true;
     std::string draft_packs;
     HipDenseCostMode costs = HipDenseCostMode::calibrated;
+    std::string cost_kv = "auto";  // --cost-kv auto|online|off|KV: context cost of the table / calibrated model (hip_dense_cost_kv)
 };
 [[nodiscard]] inline const char* hip_dense_cost_mode_name(HipDenseCostMode m) {
     return m == HipDenseCostMode::calibrated ? "calibrated" : m == HipDenseCostMode::table ? "table" : "learned";
@@ -121,6 +123,10 @@ bool parse_hip_dense_spec_arg(const std::string& flag, Next&& next, HipDenseSpec
         else if (v == "table" || v == "fixed") a.costs = HipDenseCostMode::table;
         else if (v == "learned") a.costs = HipDenseCostMode::learned;
         else throw std::invalid_argument("--spec-costs calibrated|table|learned");
+    } else if (flag == "--cost-kv") {
+        a.cost_kv = next();
+        spec::ArbiterConfig probe;
+        if (a.cost_kv != "auto") spec::set_context_cost(probe, a.cost_kv);  // validates now: auto|online|off|KV
     } else {
         return false;
     }

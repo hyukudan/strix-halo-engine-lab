@@ -10,7 +10,8 @@
 //               the prompt holds >= pack_min_hits of their ids outside the core (the CUDA dense app's flag and rule).
 //               Without one, a non-Latin request drafts only the core + prompt + emitted ids of its script.
 //   costs       --spec-costs calibrated (default: this device's walls, hip_dense_measure_costs) | table (compiled
-//               fallback) | learned (previous form). Flags parse through parse_hip_dense_spec_arg (hip_dense_spec_costs.hpp):
+//               fallback) | learned (previous form). --cost-kv online (default: the shared context cost fit from this
+//               device's verify walls, spec::ArbiterConfig::cost_fit) | off | KV (fixed). Flags parse through parse_hip_dense_spec_arg (hip_dense_spec_costs.hpp):
 //               both apps accept the same flags with the same meaning and end with the same plan, block config and costs.
 // Speculation is exact: verify windows are bitwise equal to row-by-row decode (hip_engine.hpp), and drafts (MTP layer
 // precision, head subset) only steer how many tokens a window accepts, never which tokens are emitted.
@@ -36,6 +37,7 @@ struct HipDenseSpecPlan {
     bool draft_rows = false;
     std::vector<std::string> draft_packs;  // pack id files (comma list of --draft-pack)
     HipDenseCostMode costs = HipDenseCostMode::calibrated;
+    std::string cost_kv = "auto";  // context cost of the calibrated / table model (hip_dense_cost_kv)
 };
 
 // `mtp`: "auto" / "" / "off" / "none" / path; `draft_rows`: false = full head (off switch). `has_layer` answers whether
@@ -45,6 +47,7 @@ template <class HasLayer>
 HipDenseSpecPlan resolve_hip_dense_spec(const std::string& model, const HipDenseSpecArgs& args, bool plain, HasLayer&& has_layer) {
     HipDenseSpecPlan p;
     p.costs = args.costs;
+    p.cost_kv = args.cost_kv;
     const std::string mtp = plain ? std::string("off") : args.mtp;
     const bool draft_rows = args.draft_rows;
     const std::string& draft_packs = args.draft_packs;
@@ -86,9 +89,20 @@ inline spec::DraftRowsConfig hip_dense_draft_rows_config(std::uint32_t vocab, co
 // Drafting block of the qwen35 HIP family: windows up to 16 rows (the engine's max), lookup + MTP chain + hybrid, priced
 // by the node work model (hip_dense_spec_costs.hpp: fixed costs, chain cap 15, the CUDA sub15d arm's mechanism) unless
 // `fixed` is false (the previous learned form, cap 7). head_fraction = draft head rows / vocab (1 = full head).
+// The calibrated / table model also carries the shared context cost (--cost-kv, default auto = hip_dense_cost_kv).
+// auto, measured on one Strix Halo node (Qwen 27B dense IU4, ids equal in every arm): calibrated seeds are
+// the walls at the prompt's own context, so the online fit has nothing to price: 0.0 % at 8K code, 32K code / think and
+// short code / think -> off. The ctx-256 table fallback
+// misprices a long context (r8 82.6 ms priced, ~150 ms at 29.7K): online +10.4 % at 32K code (18.22 -> 20.12 tok/s) -> online.
+[[nodiscard]] inline std::string hip_dense_cost_kv(const std::string& requested, HipDenseCostSource source) {
+    if (requested != "auto") return requested;
+    return source == HipDenseCostSource::calibrated ? "off" : "online";
+}
 inline spec::BlockConfig hip_dense_block_config(const HipDenseSpecPlan& plan, double head_fraction, const HipDenseCosts& costs) {
-    return hip_dense_spec_block_config(HipEngine::max_rows(), !plan.mtp_source.empty(), plan.costs != HipDenseCostMode::learned,
-                                       head_fraction, costs);
+    auto bc = hip_dense_spec_block_config(HipEngine::max_rows(), !plan.mtp_source.empty(), plan.costs != HipDenseCostMode::learned,
+                                          head_fraction, costs);
+    if (bc.fixed_costs) spec::set_context_cost(bc.arbiter, hip_dense_cost_kv(plan.cost_kv, costs.source));
+    return bc;
 }
 // The plan's costs for this engine (F7: nothing lab-specific by default). calibrated: after the prompt (real context),
 // one warm-up and one timed verify window per row bucket (1 / 2 / 4 / 8 / 16 rows), each discarded (commit(0): the

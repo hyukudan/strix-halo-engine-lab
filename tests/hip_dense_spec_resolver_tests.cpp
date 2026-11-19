@@ -87,7 +87,11 @@ int main() {
     RC_CHECK(rest == std::vector<std::string>({"--model", "m.gguf", "--chain-k", "5"}), "app flags left to the app");
     RC_CHECK(parse({"--spec-costs", "fixed"}).costs == q::HipDenseCostMode::table, "fixed = table (previous name)");
     RC_CHECK(parse({"--spec-costs", "learned"}).costs == q::HipDenseCostMode::learned, "learned");
-    for (const auto& bad : std::vector<std::vector<std::string>>{{"--draft-rows", "yes"}, {"--spec-costs", "auto"}, {"--mtp"}}) {
+    // --cost-kv: the shared context cost switch (spec::set_context_cost), default online.
+    RC_CHECK(d.cost_kv == "auto" && parse({"--cost-kv", "online"}).cost_kv == "online" && parse({"--cost-kv", "off"}).cost_kv == "off" && parse({"--cost-kv", "0.3"}).cost_kv == "0.3",
+             "--cost-kv parsed");
+    for (const auto& bad : std::vector<std::vector<std::string>>{{"--draft-rows", "yes"}, {"--spec-costs", "auto"}, {"--mtp"},
+                                                                 {"--cost-kv", "maybe"}, {"--cost-kv", "-1"}}) {
         bool threw = false;
         try { (void)parse(bad); } catch (const std::invalid_argument&) { threw = true; }
         RC_CHECK(threw, "%s %s must be refused", bad[0].c_str(), bad.size() > 1 ? bad[1].c_str() : "");
@@ -105,6 +109,24 @@ int main() {
     fa.draft_packs = "x.ids,,y.ids";
     const auto pf = q::resolve_hip_dense_spec("plain.gguf", fa, false, has);
     RC_CHECK(pf.mtp_reason == "file" && pf.draft_packs == std::vector<std::string>({"x.ids", "y.ids"}), "file + packs");
+    {  // the plan carries --cost-kv into the block config of both apps (fixed / calibrated model; learned walls ignore it)
+        const auto costs = q::hip_dense_table_costs(true);
+        const auto bd = q::hip_dense_block_config(pm, 1.0, costs);
+        const auto bo = q::hip_dense_block_config(q::resolve_hip_dense_spec("with-mtp.gguf", parse({"--cost-kv", "off"}), false, has), 1.0, costs);
+        const auto bk = q::hip_dense_block_config(q::resolve_hip_dense_spec("with-mtp.gguf", parse({"--cost-kv", "0.3"}), false, has), 1.0, costs);
+        RC_CHECK(pm.cost_kv == "auto" && bd.fixed_costs && bd.arbiter.cost_fit && bd.arbiter.row_kv_ms_per_kpos == 0.0,
+                 "default auto: table fallback -> online");
+        const double cw[5] = {77.0, 80.0, 83.0, 95.0, 141.0};
+        const auto cal = q::hip_dense_calibrated_costs(cw, 14'000'000'000ULL, 450'000'000ULL, 700'000'000ULL, true);
+        RC_CHECK(cal.source == q::HipDenseCostSource::calibrated, "calibrated walls");
+        const auto bc_auto = q::hip_dense_block_config(pm, 1.0, cal);
+        const auto bc_on = q::hip_dense_block_config(q::resolve_hip_dense_spec("with-mtp.gguf", parse({"--cost-kv", "online"}), false, has), 1.0, cal);
+        RC_CHECK(bc_auto.fixed_costs && !bc_auto.arbiter.cost_fit && bc_auto.arbiter.row_kv_ms_per_kpos == 0.0,
+                 "default auto: calibrated seeds -> off");
+        RC_CHECK(bc_on.arbiter.cost_fit, "explicit online kept with calibrated seeds");
+        RC_CHECK(!bo.arbiter.cost_fit && bo.arbiter.row_kv_ms_per_kpos == 0.0, "off");
+        RC_CHECK(!bk.arbiter.cost_fit && bk.arbiter.row_kv_ms_per_kpos == 0.3, "fixed");
+    }
 
     // 3. Costs: calibrated from walls, table only as the fallback.
     const auto table = q::hip_dense_table_costs(true);

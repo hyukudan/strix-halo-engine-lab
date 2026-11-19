@@ -26,6 +26,7 @@ double g_chain_step = 1.5;  // virtual ms per chain step
 double g_jitter = 0.0, g_spike = 0.0;
 std::uint64_t g_jitter_seed = 0;
 bool g_fixed = false;
+std::string g_cost_kv = "online";  // context cost of the fixed model (spec::set_context_cost)
 double noise(std::uint64_t k) { return g_jitter * double(mix(k * 0x9e3779b9ULL + g_jitter_seed) % 1000) / 1000.0; }
 
 // The "model": response[i] is the greedy token at response position i (a pure function of the position: a valid
@@ -119,6 +120,7 @@ Run run(const World& w, std::uint32_t n_tokens, double accuracy, bool copy, bool
     if (g_fixed) {  // the fake's true costs as the fixed model: chain g_chain_step per position, verify 10 + 0.15 r + commit 0.2
         cfg.fixed_costs = true;
         cfg.chain_seed_flush_ms = cfg.chain_seed_step_ms = g_chain_step;
+        sp::set_context_cost(cfg.arbiter, g_cost_kv);
     }
     FakeChain fc(w, accuracy);
     sp::BlockDrafter drafter(cfg, chain || hybrid ? &fc : nullptr);
@@ -261,17 +263,21 @@ int main() {
             std::printf("frontier %u: %llu steps for %u tokens, %.1f virtual ms\n", every, (unsigned long long)r.steps, n, g_clock);
         }
     }
-    {  // Deterministic controller (BlockConfig::fixed_costs): one prompt under three wall clocks (exact; jitter < 3 ms per
-       // call; jitter + a 12 ms spike on the first draft call) takes the SAME decision at every step and emits the serial
-       // truth. The learned form is printed beside it: there the decisions follow the clock.
+    {  // Fixed-cost controller (BlockConfig::fixed_costs): one prompt under three wall clocks (exact; jitter < 3 ms per
+       // call; jitter + a 12 ms spike on the first draft call). With the context cost off (or fixed) it takes the SAME
+       // decision at every step; with the default online fit (a clipped 3-term fit of the verify walls, not per-window walls)
+       // the decisions may follow the clock but the spike / jitter must not pin k (the learned form's failure); all emit
+       // the serial truth. The learned form is printed beside them.
         const auto w = make_world("prose", 40, n, 21);
         g_chain_step = 0.64;  // per drafted position vs a ~10.5 ms verify: the CUDA dense CJK subset head ratio
         std::vector<std::uint32_t> ref;
-        std::uint32_t learned_differs = 0;
-        std::vector<std::uint32_t> learned_ref;
+        std::uint32_t learned_differs = 0, online_differs = 0;
+        std::vector<std::uint32_t> learned_ref, online_ref;
         for (int variant = 0; variant < 3; ++variant)
-            for (const bool fixed : {true, false}) {
+            for (const int arm : {0, 1, 2}) {  // 0 = fixed, context cost off; 1 = fixed, online (default); 2 = learned
+                const bool fixed = arm != 2;
                 g_fixed = fixed;
+                g_cost_kv = arm == 0 ? "off" : "online";
                 g_jitter = variant ? 3.0 : 0.0;
                 g_spike = variant == 2 ? 12.0 : 0.0;
                 g_jitter_seed = std::uint64_t(variant) * 1000003ULL;
@@ -287,8 +293,14 @@ int main() {
                 std::uint32_t mode_k = 0;
                 for (std::uint32_t k = 1; k <= 32; ++k) if (hist[k] > hist[mode_k]) mode_k = k;
                 std::printf("determinism variant %d %s: %zu steps, serial %u, model k mode %u (%u passes), %.1f virtual ms\n", variant,
-                            fixed ? "fixed  " : "learned", r.trace.size(), serial, mode_k, hist[mode_k], g_clock);
-                if (fixed) {
+                            arm == 0 ? "fixed off   " : arm == 1 ? "fixed online" : "learned     ", r.trace.size(), serial, mode_k,
+                            hist[mode_k], g_clock);
+                if (arm == 1) {
+                    if (variant == 0) online_ref = r.trace;
+                    else online_differs += r.trace != online_ref;
+                    BD_CHECK(mode_k >= 2 && mode_k <= 5, "fixed online: model k mode %u, want 2..5 (variant %d)", mode_k, variant);
+                    BD_CHECK(serial * 10 < r.trace.size(), "fixed online: %u serial of %zu steps", serial, r.trace.size());
+                } else if (fixed) {
                     if (variant == 0) ref = r.trace;
                     std::size_t at = 0;
                     while (at < ref.size() && at < r.trace.size() && ref[at] == r.trace[at]) ++at;
@@ -302,8 +314,10 @@ int main() {
                     else learned_differs += r.trace != learned_ref;
                 }
             }
-        std::printf("determinism: fixed costs identical in 3 of 3 clocks; learned costs differ in %u of 2\n", learned_differs);
+        std::printf("determinism: fixed costs (context cost off) identical in 3 of 3 clocks; online fit differs in %u of 2 (k mode "
+                    "kept); learned costs differ in %u of 2\n", online_differs, learned_differs);
         g_fixed = false;
+        g_cost_kv = "online";
         g_jitter = g_spike = 0.0;
         g_chain_step = 1.5;
     }
