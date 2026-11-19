@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # No-model ticket: per-tile vs per-m16-block cost of the CUDA tensor-core expert route (qwen_moe_tile_bench).
-# Loads no model; synthetic weights for 512 experts (~1.2 GB on the card). Expected wall ~25 s, inner timeout 100 s.
+# Loads no model; synthetic weights for 512 experts (~1.2 GB on the card). Two forms per load (64-row tile, wide 128-row)
+# with a device bitwise comparison of their outputs. Expected wall ~35 s, inner timeout 100 s.
 #   usage: tile_bench_ticket.sh <qwen_moe_tile_bench executable> [reps (default 9)]
 # Device: CUDA_DEVICE_ORDER=PCI_BUS_ID and BENCH_CVD (default 0) select the card; the run refuses any device whose
-# name does not contain BENCH_DEVICE_MATCH (default "PRO"). Abort rules: rc != 0, a BAD line, or wall > 100 s.
+# name does not contain BENCH_DEVICE_MATCH (default "PRO"). Abort rules: rc != 0, a BAD or DIFFER line, or wall > 100 s.
 set -euo pipefail
 if [[ $# -lt 1 || $# -gt 2 ]]; then
     echo "usage: $0 <qwen_moe_tile_bench executable> [reps]" >&2

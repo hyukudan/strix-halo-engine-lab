@@ -1697,6 +1697,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         moe::Weights ew;
         ew.arithmetic=cfg.expert_arithmetic;
         ew.decode_tile = cfg.expert_decode_tile;
+        ew.wide_tile = cfg.expert_wide_tile;
         ew.gate_type = lw[l].gate_type;
         ew.down_type = lw[l].down_type;
         ew.gate = static_cast<const std::uint8_t*>(lw[l].p[k_ffn_gate_exps_weight]);

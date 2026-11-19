@@ -106,6 +106,15 @@ inline constexpr Lever table[] = {
      .kind = Kind::exact, .ready = {true, true, true, true}, .runnable = {true, true, true, true},
      .target = "", .off = "0",
      .source = "decode tile form of the tensor-core GSQ experts: exact (bitwise the tile form; greedy ids equal on prose/edit/json)"},
+    // Exact schedule trait of the tensor-core GSQ experts: launches averaging >= 64 rows per expert run 128-row CSR tiles in
+    // 512-thread blocks (one weight row per lane), so a 128-row run of an expert decodes its codes once instead of twice;
+    // bitwise the tile form (same MMA and scale-FMA order per output, same m16 position per row). Opt-in until its timing
+    // receipt: `--expert-wide-tile on` / STRIX_QRTX_EXPERT_WIDE_TILE=1.
+    {.name = "expert_wide_tile", .env = "STRIX_QRTX_EXPERT_WIDE_TILE", .option = "--expert-wide-tile",
+     .value = {"", "", "", ""}, .builtin = "0",
+     .kind = Kind::exact, .ready = {true, true, true, true}, .runnable = {true, true, true, true},
+     .target = "", .off = "0",
+     .source = "wide 128-row tile form of the tensor-core GSQ experts: exact by construction (bitwise the tile form); timing pending"},
 };
 inline std::span<const Lever> levers() { return table; }
 
@@ -129,6 +138,7 @@ struct Choice {
     bool expert_fast = false;   // likewise (gsq-iq-bf16mma-cuda-v1)
     bool mtp_defer_prompt = false;  // exact: Config::defer_prompt_mtp
     bool expert_decode_tile = true; // exact: Config::expert_decode_tile (absent row = on)
+    bool expert_wide_tile = false;  // exact: Config::expert_wide_tile (opt-in)
     bool fast() const { return moe_route_bf16 || hc_mma || mtp_mma || qsa_mma || moe_mma; }
     bool operator==(const Choice&) const = default;
 };
@@ -155,6 +165,7 @@ inline Choice choose(const pr::Resolution& r) {
     c.expert_fast = lever_on(r, "expert_fast");
     c.mtp_defer_prompt = lever_on(r, "mtp_defer_prompt");
     c.expert_decode_tile = r.find("expert_decode_tile") == nullptr || lever_on(r, "expert_decode_tile");
+    c.expert_wide_tile = lever_on(r, "expert_wide_tile");
     return c;
 }
 // Flip together with the members' fast-column `ready` cells when the whole-bundle gate receipt passes.

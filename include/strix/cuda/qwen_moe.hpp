@@ -84,13 +84,17 @@ struct Weights {
     const std::uint8_t* down = nullptr;        // [experts][hidden][ffn/32 blocks]
     ExpertArithmetic arithmetic=ExpertArithmetic::incumbent;
     bool decode_tile = true;   // gsq_bf16_mma: steps of <= 16 rows bind the decode tile form (bitwise the tile form)
+    // gsq_bf16_mma: with wide_tile, launches routing at least native_mma::kWideMinAvgRows rows per expert on average
+    // (wide_min_avg, when not 0, replaces that threshold: benches) bind the wide 128-row tile form, bitwise the tile form.
+    bool wide_tile = false;
+    std::uint32_t wide_min_avg = 0;
 };
 
 // The single steps (tests) and the whole routed MoE of one layer. Any rows >= 1 is accepted (the HIP entry requires
 // 16 <= rows <= prefill_max_rows, rows % 8 == 0; the bits of a row never depend on rows). record: optional device
 // DeferredMoeFirstError {domain, bits} (include/strix/deferred_moe_status.hpp).
 void enqueue_prologue(const Rows&, std::uint32_t rows, std::uint32_t clear_words, cudaStream_t);
-void enqueue_csr(const Rows&, std::uint32_t rows, cudaStream_t);
+void enqueue_csr(const Rows&, std::uint32_t rows, cudaStream_t, std::uint32_t rows_per_tile = 64);  // 64, or 128 (wide tensor-core form)
 // moe_mma: FAST form (Config::forms.moe_mma): single-FP32-chain IMMA project/down on the A8 types, bit-changing.
 void enqueue_project(const Rows&, std::uint32_t rows, const Weights&, const amdmath::Tables&, cudaStream_t, bool moe_mma = false);
 void enqueue_down(const Rows&, std::uint32_t rows, const Weights&, cudaStream_t, bool moe_mma = false);

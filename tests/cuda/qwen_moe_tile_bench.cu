@@ -4,6 +4,9 @@
 // (rows = 50 c, the ten experts of a row are distinct). Each config prints the median ms of the routed experts
 // (enqueue_routed minus enqueue_csr), the tile count read back from the device and the m16-block count; a least-squares
 // fit t = a + tiles D + mblocks M over all configs then prints D, M and the share of the 8K expert time that is per-tile.
+// Each config also runs the wide 128-row form (Weights::wide_tile, forced at every load) and prints its time, its tile
+// count and whether its rawdots / intermediates hash equals the 64-row form's bit for bit (both buffers NaN-filled before
+// each checked run, so a skipped output cannot match).
 //   usage: qwen_moe_tile_bench [reps]      (needs the card; never loads a model)
 #include <cuda_runtime.h>
 
@@ -44,6 +47,16 @@ template <class T> T* dev(std::size_t n) { T* p = nullptr; CK(cudaMalloc(&p, std
 template <class T> T* upload(const std::vector<T>& v) { T* p = dev<T>(v.size()); CK(cudaMemcpy(p, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice)); return p; }
 float median(std::vector<float> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; }
 u32 ceil_div(u32 a, u32 b) { return (a + b - 1U) / b; }
+// Order-independent 64-bit hash of n words (bitwise equality check of two runs' outputs).
+__global__ void hash_kernel(const u32* w, std::size_t n, unsigned long long* out) {
+    unsigned long long h = 0ULL;
+    for (std::size_t i = blockIdx.x * std::size_t{blockDim.x} + threadIdx.x; i < n; i += std::size_t{gridDim.x} * blockDim.x) {
+        unsigned long long x = (static_cast<unsigned long long>(i) << 32U) ^ w[i];
+        x *= 0x9E3779B97F4A7C15ULL; x ^= x >> 29U; x *= 0xBF58476D1CE4E5B9ULL; x ^= x >> 32U;
+        h += x;
+    }
+    atomicAdd(out, h);
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -89,6 +102,16 @@ int main(int argc, char** argv) {
     cudaEvent_t e0, e1;
     CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
 
+    unsigned long long* hash_dev = dev<unsigned long long>(1);
+    const auto hash = [&](const void* p, std::size_t bytes) {
+        CK(cudaMemsetAsync(hash_dev, 0, 8, s));
+        hash_kernel<<<1024, 256, 0, s>>>(static_cast<const u32*>(p), bytes / 4U, hash_dev);
+        CK(cudaGetLastError());
+        unsigned long long h = 0ULL;
+        CK(cudaMemcpyAsync(&h, hash_dev, 8, cudaMemcpyDeviceToHost, s));
+        CK(cudaStreamSynchronize(s));
+        return h;
+    };
     std::vector<double> T, M, Y;
     int bad = 0;
     for (const u32 c : kCases) {
@@ -97,30 +120,45 @@ int main(int argc, char** argv) {
         for (u32 i = 0; i < rows; ++i)
             for (u32 j = 0; j < kTop; ++j) r[std::size_t{i} * kTop + j] = j * (kUsed / kTop) + i / c;   // slot-major: expert gets [e c, (e+1) c)
         CK(cudaMemcpy(routes, r.data(), r.size() * 4, cudaMemcpyHostToDevice));
-        auto timed = [&](bool whole) {
-            mo::enqueue_prologue(v, rows, kHidden, s);
-            CK(cudaEventRecord(e0, s));
-            if (whole) (void)mo::enqueue_routed(v, rows, w, tables, s); else mo::enqueue_csr(v, rows, s);
-            CK(cudaEventRecord(e1, s));
-            CK(cudaEventSynchronize(e1));
-            float ms = 0.0F;
-            CK(cudaEventElapsedTime(&ms, e0, e1));
-            return ms;
-        };
-        timed(true); timed(true);
-        std::vector<float> routed, csr;
-        for (int k = 0; k < reps; ++k) { routed.push_back(timed(true)); csr.push_back(timed(false)); }
-        (void)timed(true);
-        u32 summary = 0, tiles = 0;
-        CK(cudaMemcpy(&summary, v.csr.summary, 4, cudaMemcpyDeviceToHost));
-        CK(cudaMemcpy(&tiles, v.csr.tile_count, 4, cudaMemcpyDeviceToHost));
-        const u32 want_tiles = kUsed * ceil_div(c, 64), mblocks = kUsed * ceil_div(c, 16);
-        const double expert_ms = double(median(routed)) - double(median(csr));
-        const bool ok = summary == 0U && tiles == want_tiles;
-        bad += ok ? 0 : 1;
-        std::printf("TILEBENCH c=%u rows=%u tiles=%u mblocks=%u routed_ms=%.3f csr_ms=%.3f expert_ms=%.3f us_per_tile=%.3f summary=%u %s\n",
-                    c, rows, tiles, mblocks, median(routed), median(csr), expert_ms, 1000.0 * expert_ms / tiles, summary, ok ? "OK" : "BAD");
-        T.push_back(want_tiles); M.push_back(mblocks); Y.push_back(expert_ms);
+        const std::size_t raw_bytes = std::size_t{rows} * kTop * kHidden * 4U, mid_bytes = std::size_t{rows} * kTop * 2U * kFfn * 4U;
+        double form_ms[2] = {};
+        unsigned long long form_hash[2][2] = {};
+        for (u32 form = 0; form < 2U; ++form) {   // 0: 64-row tile form, 1: wide 128-row form (forced at every load)
+            w.wide_tile = form == 1U; w.wide_min_avg = 1U;
+            const u32 tile_rows = form ? 128U : 64U;
+            auto timed = [&](bool whole) {
+                mo::enqueue_prologue(v, rows, kHidden, s);
+                CK(cudaEventRecord(e0, s));
+                if (whole) (void)mo::enqueue_routed(v, rows, w, tables, s); else mo::enqueue_csr(v, rows, s, tile_rows);
+                CK(cudaEventRecord(e1, s));
+                CK(cudaEventSynchronize(e1));
+                float ms = 0.0F;
+                CK(cudaEventElapsedTime(&ms, e0, e1));
+                return ms;
+            };
+            timed(true); timed(true);
+            std::vector<float> routed, csr;
+            for (int k = 0; k < reps; ++k) { routed.push_back(timed(true)); csr.push_back(timed(false)); }
+            CK(cudaMemset(v.rawdots.base, 0xFF, raw_bytes)); CK(cudaMemset(v.intermediates.base, 0xFF, mid_bytes));
+            (void)timed(true);
+            form_hash[form][0] = hash(v.rawdots.base, raw_bytes); form_hash[form][1] = hash(v.intermediates.base, mid_bytes);
+            u32 summary = 0, tiles = 0;
+            CK(cudaMemcpy(&summary, v.csr.summary, 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(&tiles, v.csr.tile_count, 4, cudaMemcpyDeviceToHost));
+            const u32 want_tiles = kUsed * ceil_div(c, tile_rows), mblocks = kUsed * ceil_div(c, 16);
+            const double expert_ms = double(median(routed)) - double(median(csr));
+            const bool ok = summary == 0U && tiles == want_tiles;
+            bad += ok ? 0 : 1;
+            form_ms[form] = expert_ms;
+            std::printf("TILEBENCH%s c=%u rows=%u tiles=%u mblocks=%u routed_ms=%.3f csr_ms=%.3f expert_ms=%.3f us_per_tile=%.3f summary=%u %s\n",
+                        form ? "W" : "", c, rows, tiles, mblocks, median(routed), median(csr), expert_ms, 1000.0 * expert_ms / tiles, summary,
+                        ok ? "OK" : "BAD");
+            if (form == 0U) { T.push_back(want_tiles); M.push_back(mblocks); Y.push_back(expert_ms); }
+        }
+        const bool equal = form_hash[0][0] == form_hash[1][0] && form_hash[0][1] == form_hash[1][1];
+        bad += equal ? 0 : 1;
+        std::printf("TILECMP c=%u tile_ms=%.3f wide_ms=%.3f wide_over_tile=%.3f rawdots_hash=%016llx intermediates_hash=%016llx bits %s\n",
+                    c, form_ms[0], form_ms[1], form_ms[1] / form_ms[0], form_hash[1][0], form_hash[1][1], equal ? "EQUAL" : "DIFFER");
     }
     // Least squares y = a + D T + M m (normal equations, Cramer's rule).
     double ne[3][3] = {}, b[3] = {};

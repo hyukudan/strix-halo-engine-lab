@@ -208,6 +208,15 @@ void profiles() {
         check(!tile.config.expert_decode_tile && status(tile, "expert_decode_tile") == "off", "decode tile off by option / env: " + status(tile, "expert_decode_tile"));
         check(tile.contract == fast.contract && bundle_id(tile) == bundle_id(fast), "decode tile off: same contract and bundle id");
     }
+    // expert_wide_tile: exact schedule trait (128-row tiles), opt-in in every profile until its timing receipt; on by option
+    // or env, serve == CLI; contract and bundle id unchanged (bitwise the tile form).
+    check(!fast.config.expert_wide_tile, "fast: wide tile form off (opt-in)");
+    same_request("wide tile on", {"--profile", "fast", "--expert-wide-tile", "on"});
+    for (const auto& wide : {one({"--profile", "fast", "--expert-wide-tile", "on"}, qo::Entry::serve),
+                             one({"--profile", "fast"}, qo::Entry::serve, Env{{"STRIX_QRTX_EXPERT_WIDE_TILE", "1"}})}) {
+        check(wide.config.expert_wide_tile, "wide tile on by option / env: " + status(wide, "expert_wide_tile"));
+        check(wide.contract == fast.contract && bundle_id(wide) == bundle_id(fast), "wide tile on: same contract and bundle id");
+    }
     check(cp::form_identities(fast.choice) == "qwen-cuda-hc-f16mma-v2,qwen-cuda-qsa-bf16mma-v2", "fast identities: " + cp::form_identities(fast.choice));
     fast_bundle();
     for (const char* f : {"moe_route_bf16", "qsa_budget", "gdn_fp16_chunk", "output_head"})

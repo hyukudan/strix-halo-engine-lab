@@ -150,6 +150,8 @@ add_test(NAME qwen_cohort_plan COMMAND qwen_cohort_plan_test)
 add_executable(native_reuse_host_test tests/cuda/native_reuse_host_test.cpp)
 target_include_directories(native_reuse_host_test PRIVATE include)
 add_test(NAME native_reuse_host COMMAND native_reuse_host_test)
+add_executable(native_mma_wide_host_test tests/cuda/native_mma_wide_host_test.cpp)
+add_test(NAME native_mma_wide_host COMMAND native_mma_wide_host_test)
 # TURBO integer expert contract (gsq-iq-i8mma-turbo-cuda-v1): CPU oracle of placement, exact group dots and order.
 add_executable(turbo_i8_host_test tests/cuda/turbo_i8_host_test.cpp)
 target_include_directories(turbo_i8_host_test PRIVATE include)
