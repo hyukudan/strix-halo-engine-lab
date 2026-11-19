@@ -101,9 +101,10 @@ __global__ __launch_bounds__(256) void prologue_kernel(Rows v, std::uint32_t cle
 // ---------------------------------------------------------------------------------------------------------------------
 // csr: build_prefill_csr_waves (known_rows.hip:460-532) with cap 16, transcribed (32 waves of 32 lanes; the AMD
 // ballot/shfl peer loop becomes __match_any_sync, and a __syncwarp separates the position reads from the leader updates,
-// which the AMD wave executes in lockstep). Also emits this port's tiles (runs of <= tcap assignments of one expert: 64, or
-// 128 for the wide tensor-core form; cut at multiples of tcap of the expert's run).
-__global__ __launch_bounds__(1024) void csr_kernel(Rows v, std::uint32_t rows, std::uint32_t tcap) {
+// which the AMD wave executes in lockstep). Also emits this port's tiles (runs of <= tcap assignments of one expert, cut at
+// multiples of tcap of the expert's run). tcap is a compile-time trait: tile_rows (64) for every route, kWideRows (128) for
+// the wide tensor-core form, so the tile arithmetic stays folded constants.
+template <unsigned tcap> __global__ __launch_bounds__(1024) void csr_kernel(Rows v, std::uint32_t rows) {
     constexpr unsigned Waves = 32U, cap = hip_batch;
     const Csr& csr = v.csr;
     const unsigned t = threadIdx.x, lane = t & 31U, wave = t / 32U, count = rows * top_k, span = (count + Waves - 1U) / Waves;
@@ -352,8 +353,10 @@ void enqueue_prologue(const Rows& v, std::uint32_t rows, std::uint32_t clear_wor
 }
 void enqueue_csr(const Rows& v, std::uint32_t rows, cudaStream_t s, std::uint32_t rows_per_tile) {
     if (rows * top_k > 65535U * 32U) throw std::invalid_argument("MoE CSR rows");
-    if (rows_per_tile != tile_rows && rows_per_tile != ::strix::cuda::core::native_mma::kWideRows) throw std::invalid_argument("MoE CSR tile rows");
-    csr_kernel<<<1, 1024, 0, s>>>(v, rows, rows_per_tile);
+    if (rows_per_tile == tile_rows) csr_kernel<tile_rows><<<1, 1024, 0, s>>>(v, rows);
+    else if (rows_per_tile == ::strix::cuda::core::native_mma::kWideRows)
+        csr_kernel<::strix::cuda::core::native_mma::kWideRows><<<1, 1024, 0, s>>>(v, rows);
+    else throw std::invalid_argument("MoE CSR tile rows");
     check(cudaGetLastError(), "MoE CSR");
 }
 void enqueue_project(const Rows& v, std::uint32_t rows, const Weights& w, const amdmath::Tables& tables, cudaStream_t s, bool moe_mma) {
