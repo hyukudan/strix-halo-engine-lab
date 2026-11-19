@@ -42,7 +42,7 @@ identity names every applied lever.
 |---|---|---|
 | `--prefill-arith fast4` | decode CLI large prefill, `--turbo-weights onfly\|converted` (W4A4 gate 8K/32K passed) | `--prefill-arith exact` |
 | `--prefill-gdn chunk16` | same regime (gated together with FAST4) | `--prefill-gdn serial` |
-| `--prefill-attn8 on` | same regime, prompt of at least 32,768 tokens (32K gate passed; no 8K gate) | `--prefill-attn8 off` |
+| `--prefill-attn8 on` | same regime, prompt of at least 8,192 tokens (8K and 32K gates passed) | `--prefill-attn8 off` |
 | `--split-k fast` | spec CLI (decode windows), `--turbo-weights onfly\|converted`: FAST `nvfp4-splitk-fast-v1` (gate passed; spec verify 0.6-0.7 % faster). Decode CLI: pending (its `fast` already applies FAST4; that combination has no gate yet) | `--split-k exact` |
 | `--decode-attn8 on` | pending on both CLIs (no qualified regime yet: gate at 8K / 28K / 64K not run). Decode / verify attention on e4m3 tensor cores over the e4m3 K/V shadow, identity `-d8`; verify rows give the same bits as one-row decode; on the spec CLI it also covers the prefill windows. Explicit `--decode-attn8 on` runs it in any regime | `--decode-attn8 off` |
 

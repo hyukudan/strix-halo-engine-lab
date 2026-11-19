@@ -74,16 +74,17 @@ int main() {
                     check(text.empty(), "EXACT printed profile text (effective config not byte-identical)");
                 }
 
-    // 2. FAST, decode CLI (large prefill), NVFP4 onfly/converted: fast4 + chunk16; attn8 only from 32K; split_k pending
+    // 2. FAST, decode CLI (large prefill), NVFP4 onfly/converted: fast4 + chunk16 + attn8 from 8K; split_k pending
     //    there (qualified on the spec windows route only: no composition receipt with fast4 + chunk16).
     for (const auto w : {TurboWeights::onfly, TurboWeights::converted}) {
         std::string text;
         const Options o8 = run(Name::fast, w, qp::Route::large_prefill, 8192, {}, &text);
         check(o8.prefill_arith == PrefillArith::fast4 && o8.prefill_gdn == PrefillGdn::chunk16, "FAST 8K bundle");
-        check(!o8.prefill_attn8 && o8.nvfp4_split == Split::exact && o8.prefill_big, "FAST 8K: attn8 / split_k must stay off");
+        check(o8.prefill_attn8 && o8.nvfp4_split == Split::exact && o8.prefill_big, "FAST 8K: attn8 on, split_k off");
+        const Options o4 = run(Name::fast, w, qp::Route::large_prefill, 4096);
+        check(!o4.prefill_attn8 && o4.prefill_arith == PrefillArith::fast4, "FAST below 8K: attn8 stays off");
         check(text.find("prefill_arith = fast4 [profile]") != std::string::npos, "FAST text lists prefill_arith");
-        check(text.find("prefill_attn8 = off [pending]") != std::string::npos && text.find("prompt >= 32768") != std::string::npos,
-              "FAST text explains attn8 regime");
+        check(text.find("prefill_attn8 = on [profile]") != std::string::npos, "FAST 8K text lists prefill_attn8");
         check(text.find("split_k = exact [pending]") != std::string::npos &&
                   text.find("qualified only for nvfp4-rtn (onfly/converted) / windows (spec CLI)") != std::string::npos,
               "FAST text explains split_k");
