@@ -80,7 +80,6 @@ int main(int argc, char** argv) try {
     std::string tp_spec = "usb4auto";
     std::vector<double> tp_rates;  // --tp-rates override, GB/s per rank; default: the topology declaration (shares follow the ratio)
     double tp_trip_us = 0.0;       // --tp-trip-us override of the measured trip latency; 0 = measured at start-up
-    bool costs_flag = false;       // --spec-costs given explicitly
     bool tp_force = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -101,7 +100,7 @@ int main(int argc, char** argv) try {
         else if (a == "--max-pos") maxpos = strix::core::parse_u32(next());
         else if (a == "--repeat") repeat = std::max(1U, strix::core::parse_u32(next()));  // prefills per process (reset between): first = cold, last = warm
         else if (a == "--no-mtp") spec_args.mtp = "off";
-        else if (parse_hip_dense_spec_arg(a, next, spec_args)) costs_flag = costs_flag || a == "--spec-costs";  // --mtp, --draft-rows, --draft-pack, --spec-costs
+        else if (parse_hip_dense_spec_arg(a, next, spec_args)) {}  // --mtp, --draft-rows, --draft-pack, --spec-costs
         // Exact tensor-parallel decode over 2 ranks (HipEngine::enable_tp): each rank loads the model and prefills alone
         // (replicated, same bits), then decodes its column / head shares; ids == the one-rank ids. Rates = measured
         // per-rank read speed (column shares); spec needs fixed costs (both ranks must choose the same windows).
@@ -123,7 +122,7 @@ int main(int argc, char** argv) try {
     // Tensor-parallel decode: every rank must pick the same verify windows, so the speculation costs are the compiled
     // table (identical bits on every rank; calibrated or learned walls are per rank and could differ). An explicit
     // calibrated / learned request contradicts that and is refused; the default resolves to the table and says so.
-    if (tp_rank >= 0 && costs_flag && spec_args.costs != HipDenseCostMode::table)
+    if (tp_rank >= 0 && spec_args.costs_explicit && spec_args.costs != HipDenseCostMode::table)
         throw std::invalid_argument("--spec-costs calibrated|learned with --tp-rank: the ranks must agree on windows (use --spec-costs table)");
     if (tp_rank >= 0) {
         spec_args.costs = HipDenseCostMode::table;
