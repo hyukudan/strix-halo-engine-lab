@@ -6588,6 +6588,12 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-hy4-placement-tests)
     add_test(NAME strix-hy4-placement-tests COMMAND strix-hy4-placement-tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/hy4/q4km-component-bytes.tsv)
+    # Hy4-flash exact tensor-parallel layout (strix/hy4/tp_layout.hpp): shares tile, MoE join, planner joins = step gathers.
+    add_executable(strix-hy4-tp-layout-tests tests/hy4_tp_layout_tests.cpp)
+    target_include_directories(strix-hy4-tp-layout-tests PRIVATE include)
+    target_compile_features(strix-hy4-tp-layout-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-hy4-tp-layout-tests)
+    add_test(NAME strix-hy4-tp-layout-tests COMMAND strix-hy4-tp-layout-tests)
     # Shared prompt windows (strix/session/prompt_windows.hpp) and the two-stage window picker.
     add_executable(strix-prompt-windows-tests tests/prompt_windows_tests.cpp)
     target_include_directories(strix-prompt-windows-tests PRIVATE include)

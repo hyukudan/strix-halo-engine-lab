@@ -7,6 +7,7 @@
 #include "hy4/hip/hy4_hip_forward.hpp"
 #include "hy4/hip/hy4_hip_plan.hpp"
 #include "hy4/hip/hy4_hip_rows.hpp"
+#include "strix/hy4/tp_layout.hpp"
 
 #include "attn_core/cache_rows.hpp"
 #include "attn_core/group_pool.hpp"
@@ -61,6 +62,7 @@ namespace hcs = strix::hc;
 namespace glu = strix::ops::glu;
 namespace mla = strix::attn_core::sparse::mla;
 namespace a8 = strix::moe_q4k_a8;
+namespace htp = strix::hy4::tp;
 
 void check(hipError_t e, const char* what) { strix::hip_check_prefixed("hy4 hip forward: ", e, what); }
 
@@ -84,7 +86,14 @@ struct SwaSpec {
     static constexpr strix::attn::mla::Select kSelect = strix::attn::mla::Select::Window;
     static constexpr bool kSink = true;
 };
+// Tensor-parallel share of an indexed layer (Forward::enable_tp): 16 of the 32 heads per rank, one M tile of the same
+// kernel (H = 16 is a declared tile, sparse_flash_wmma.hpp Geometry). A sliding layer's share is one of SwaSpec's two
+// groups: SwaPolicy itself over one row (grid 1) with the group's qt / sinks / out offsets.
+struct DsaHalfSpec : DsaSpec {
+    static constexpr unsigned kHeads = 16U;
+};
 using DsaPolicy = mla::LatentPolicy<DsaSpec>;
+using DsaHalfPolicy = mla::LatentPolicy<DsaHalfSpec>;
 using SwaPolicy = mla::LatentPolicy<SwaSpec>;
 static_assert(DsaSpec::kHeads * DsaSpec::kGroups == preset::dsa().g.heads);
 static_assert(SwaSpec::kHeads * SwaSpec::kGroups == preset::swa().g.heads);
@@ -237,6 +246,14 @@ struct Forward::Impl {
     std::uint64_t greedy_bytes = 0;
     strix::HipGreedyRowsReply* greedy_reply = nullptr;
     std::uint32_t greedy_token = 0;
+
+    // exact tensor parallelism (Forward::enable_tp; strix/hy4/tp_layout.hpp): world 1 = the one-node step, unchanged
+    struct Tp {
+        std::uint32_t rank = 0, world = 1;
+        Forward::TpGather gather;
+        float* moe = nullptr;  // [2][slot] MoE gather buffer (tp::moe layout)
+        std::uint64_t calls = 0;
+    } tp;
 
     // batched prompt (prompt_rows > 0): [rows][...] workspaces of one window; attn_k_b re-laid 256 wide per layer
     std::uint32_t rmax = 0;
@@ -511,6 +528,27 @@ struct Forward::Impl {
         linear(tw.p, tw.type, x, width, outputs, y, round, bias);
     }
 
+    // ---- exact tensor parallelism (Forward::enable_tp; strix/hy4/tp_layout.hpp) ----
+    // Rows [r.first, r.first + r.count) of the Linear `name` (outputs rows) into y + r.first: the same launch as linear()
+    // over fewer rows. Every output row is its own dot product, so the rows a rank computes carry the one-node bits; the
+    // whole range is the one-node call itself.
+    void linear_rows(const std::string& name, const float* x, std::uint32_t width, std::uint32_t outputs, htp::Range r, float* y,
+                     bool round = true) {
+        const auto& tw = t(name);
+        if (tw.dims.at(0) != width || tw.bytes != row_bytes(tw.type, width) * outputs || r.first + r.count > outputs)
+            throw std::runtime_error("hy4 hip forward: shape of " + name);
+        linear(tw.p + row_bytes(tw.type, width) * r.first, tw.type, x, width, static_cast<std::uint32_t>(r.count), y + r.first, round);
+    }
+    [[nodiscard]] htp::Range share(std::size_t n) const { return tp.world == 1U ? htp::Range{0U, n} : htp::half(n, tp.rank); }
+    // The symmetric swap of the two halves of `buffer` (slot = one half), stream-ordered after its producers.
+    void tp_gather(void* buffer, std::size_t slot_bytes) {
+        tp.gather.fn(tp.gather.ctx, s, buffer, slot_bytes, slot_bytes);
+        ++tp.calls;
+    }
+    void allocate_tp() {
+        if (tp.moe == nullptr) tp.moe = alloc<float>(2U * htp::moe(0U, c.top_k, c.latent, c.shared_ff).slot);
+    }
+
     void sync_time(double& slot, std::chrono::steady_clock::time_point& mark) {
         if (!timing) return;
         check(hipStreamSynchronize(s), "timing sync");
@@ -605,18 +643,22 @@ struct Forward::Impl {
         check(hipGetLastError(), "group select launch");
     }
 
-    void attention(std::uint32_t l) {  // xn -> f
+    void attention(std::uint32_t l) {  // xn -> f (with enable_tp: this rank's heads, o and o_proj rows joined)
         const std::uint32_t H = c.heads[l], qk = c.qk_head(), kl = c.kv_lora, rope = c.qk_rope, vd = c.v_head;
         const bool idx = c.indexed[l] != 0U;
         if (idx ? H != 32U : H != 64U) throw std::runtime_error("hy4 hip forward: head count outside the flash presets");
         const std::uint32_t row = kl + rope;
-        linear(blk(l, "attn_gate.weight"), xn, c.hidden, H * vd, gate);
+        const bool par = tp.world == 2U;
+        const auto hs = share(H);  // this rank's heads [h0, h0 + Hs)
+        const auto h0 = static_cast<std::uint32_t>(hs.first), Hs = static_cast<std::uint32_t>(hs.count);
+        linear_rows(blk(l, "attn_gate.weight"), xn, c.hidden, H * vd, {std::size_t{h0} * vd, std::size_t{Hs} * vd}, gate);
         linear(blk(l, "attn_q_a.weight"), xn, c.hidden, c.q_lora, qa);
         norm(qa, t(blk(l, "attn_q_a_norm.weight")).f(), c.q_lora, c.rms_eps, qa);
-        linear(blk(l, "attn_q_b.weight"), qa, c.q_lora, H * qk, qv);
+        linear_rows(blk(l, "attn_q_b.weight"), qa, c.q_lora, H * qk, {std::size_t{h0} * qk, std::size_t{Hs} * qk}, qv);
         const float* cs = idx ? cos_idx : cos_swa;
         const float* sn = idx ? sin_idx : sin_swa;
-        strix::ops::rope::launch<strix::ops::rope::Round::bf16>({qv, 1U, H, H * qk, qk, c.qk_nope, rope / 2U, cs, sn, dpos, false}, s);
+        strix::ops::rope::launch<strix::ops::rope::Round::bf16>(
+            {qv + std::size_t{h0} * qk, 1U, Hs, H * qk, qk, c.qk_nope, rope / 2U, cs, sn, dpos, false}, s);
         linear(blk(l, "attn_kv_a_mqa.weight"), xn, c.hidden, row, ckv);
         norm(ckv, t(blk(l, "attn_kv_a_norm.weight")).f(), kl, c.rms_eps, ckv);
         strix::ops::rope::launch<strix::ops::rope::Round::bf16>({ckv, 1U, 1U, row, row, kl, rope / 2U, cs, sn, dpos, false}, s);
@@ -626,49 +668,70 @@ struct Forward::Impl {
         // absorbed query: q_lat[h] = K_b[h] q_nope[h] (rows of qk_nope), then the rope tail, as the bf16 operand image
         const auto& kb = t(blk(l, "attn_k_b.weight"));
         const auto kb_head = row_bytes(kb.type, c.qk_nope) * kl;
-        if (kb.type == 8U) strix::q8_rows::launch_heads_f32(kb.p, H, c.qk_nope, kl, qv, qk, qfull, row, s);  // Q8_0: one launch
+        const std::size_t q0 = std::size_t{h0} * qk, r0 = std::size_t{h0} * row, l0 = std::size_t{h0} * kl, v0 = std::size_t{h0} * vd;
+        if (kb.type == 8U)  // Q8_0: one launch
+            strix::q8_rows::launch_heads_f32(kb.p + h0 * kb_head, Hs, c.qk_nope, kl, qv + q0, qk, qfull + r0, row, s);
         else
-            for (std::uint32_t h = 0; h < H; ++h)
+            for (std::uint32_t h = h0; h < h0 + Hs; ++h)
                 linear(kb.p + h * kb_head, kb.type, qv + std::size_t{h} * qk, c.qk_nope, kl, qfull + std::size_t{h} * row, false);
-        check(hipMemcpy2DAsync(qfull + kl, row * 4U, qv + c.qk_nope, qk * 4U, rope * 4U, H, hipMemcpyDeviceToDevice, s), "q rope copy");
-        check(dcr::store_rows({qfull, row, nullptr, 0U, H, {row, 0U}, qt, flag}, s), "query operand image");
-        const float* sinks = t(blk(l, "attn_sinks.weight")).f();
+        check(hipMemcpy2DAsync(qfull + r0 + kl, row * 4U, qv + q0 + c.qk_nope, qk * 4U, rope * 4U, Hs, hipMemcpyDeviceToDevice, s),
+              "q rope copy");
+        check(dcr::store_rows({qfull + r0, row, nullptr, h0, Hs, {row, 0U}, qt, flag}, s), "query operand image");
+        const float* sinks = t(blk(l, "attn_sinks.weight")).f() + h0;
+        const std::uint16_t* qs = qt + r0;  // this rank's heads of the operand image (one group: row 0 of the launch)
+        float* const os = olat + l0;
         const std::uint32_t keys = pos + 1U;
+        // the flash over this rank's heads: one node = every group; a share = one 16-head tile (indexed) or one of the
+        // two 32-head groups (sliding) as row 0 of the same kernels
+        const auto dsa = [&](const std::uint32_t* lists, const std::uint32_t* counts, unsigned stride, unsigned max_keys) {
+            if (par) {
+                DsaHalfPolicy::Args a{latent[l], lists, counts, stride, 0U, 0U, 0U, qs, sinks, os};
+                strix::attn_core::sparse::launch_flash_rows<DsaHalfPolicy, 32U>(a, 1U, s, max_keys);
+            } else {
+                DsaPolicy::Args a{latent[l], lists, counts, stride, 0U, 0U, 0U, qs, sinks, os};
+                strix::attn_core::sparse::launch_flash_rows<DsaPolicy, 32U>(a, DsaSpec::kGroups, s, max_keys);
+            }
+        };
         if (idx && gi::dense(preset::indexer, pos)) {  // every closed group selected: the causal prefix
             stage->list_n[l] = keys;  // pinned slot per layer (async copy, no wait)
             check(hipMemcpyAsync(list_n, &stage->list_n[l], 4, hipMemcpyHostToDevice, s), "list length");
-            DsaPolicy::Args a{latent[l], iota, list_n, context, 0U, 0U, 0U, qt, sinks, olat};
-            strix::attn_core::sparse::launch_flash_rows<DsaPolicy, 32U>(a, DsaSpec::kGroups, s, keys);
+            dsa(iota, list_n, context, keys);
         } else if (idx) {
             index_select(l);
-            DsaPolicy::Args a{latent[l], ilist, list_n, kIndexListStride, 0U, 0U, 0U, qt, sinks, olat};
-            strix::attn_core::sparse::launch_flash_rows<DsaPolicy, 32U>(a, DsaSpec::kGroups, s, index_list_tokens(pos));
+            dsa(ilist, list_n, kIndexListStride, index_list_tokens(pos));
         } else {
             const auto ring = latent_rows[l].ring;
-            SwaPolicy::Args a{latent[l], nullptr, nullptr, 0U, pos, c.window, ring - 1U, qt, sinks, olat};
-            strix::attn_core::sparse::launch_flash_rows<SwaPolicy, 32U>(a, SwaSpec::kGroups, s, std::min(keys, c.window));
+            SwaPolicy::Args a{latent[l], nullptr, nullptr, 0U, pos, c.window, ring - 1U, qs, sinks, os};
+            strix::attn_core::sparse::launch_flash_rows<SwaPolicy, 32U>(a, par ? 1U : SwaSpec::kGroups, s, std::min(keys, c.window));
         }
         check(hipGetLastError(), "flash launch");
         const auto& vb = t(blk(l, "attn_v_b.weight"));
         const auto vb_head = row_bytes(vb.type, kl) * vd;
-        if (vb.type == 8U) strix::q8_rows::launch_heads_f32(vb.p, H, kl, vd, olat, kl, o, vd, s);  // Q8_0: one launch
+        if (vb.type == 8U) strix::q8_rows::launch_heads_f32(vb.p + h0 * vb_head, Hs, kl, vd, olat + l0, kl, o + v0, vd, s);  // Q8_0: one launch
         else
-            for (std::uint32_t h = 0; h < H; ++h)
+            for (std::uint32_t h = h0; h < h0 + Hs; ++h)
                 linear(vb.p + h * vb_head, vb.type, olat + std::size_t{h} * kl, kl, vd, o + std::size_t{h} * vd, false);
-        glu::launch_epilogue<glu::Round::bf16>(o, nullptr, H * vd, std::size_t{H} * vd, o, s);
-        glu::launch_sigmoid_gate<glu::DeclaredExp, glu::Round::bf16>(o, gate, std::size_t{H} * vd, o, s);
-        linear(blk(l, "attn_output.weight"), o, H * vd, c.hidden, f);
+        glu::launch_epilogue<glu::Round::bf16>(o + v0, nullptr, Hs * vd, std::size_t{Hs} * vd, o + v0, s);
+        glu::launch_sigmoid_gate<glu::DeclaredExp, glu::Round::bf16>(o + v0, gate + v0, std::size_t{Hs} * vd, o + v0, s);
+        if (par) tp_gather(o, std::size_t{Hs} * vd * 4U);  // o = [rank 0 heads | rank 1 heads]: the one-node o
+        const auto fr = share(c.hidden);
+        linear_rows(blk(l, "attn_output.weight"), o, H * vd, c.hidden, fr, f);
+        if (par) tp_gather(f, fr.count * 4U);
         norm(f, t(blk(l, "post_attention_norm.weight")).f(), c.hidden, c.rms_eps, f);
         check(hipGetLastError(), "attention launch");
     }
 
-    void ffn(std::uint32_t l) {  // xn -> f
+    void ffn(std::uint32_t l) {  // xn -> f (with enable_tp: this rank's rows / slots, joined with the peer's)
         const std::uint32_t h = c.hidden;
+        const bool par = tp.world == 2U;
         if (c.dense[l]) {
-            linear(blk(l, "ffn_gate.weight"), xn, h, c.dense_ff, g);
-            linear(blk(l, "ffn_up.weight"), xn, h, c.dense_ff, up);
-            glu::launch_swiglu<glu::DeclaredExp, glu::Round::bf16>(g, up, c.dense_ff, glu::no_clamp, act, s);
-            linear(blk(l, "ffn_down.weight"), act, c.dense_ff, h, f);
+            const auto fr = share(c.dense_ff), hr = share(h);
+            linear_rows(blk(l, "ffn_gate.weight"), xn, h, c.dense_ff, fr, g);
+            linear_rows(blk(l, "ffn_up.weight"), xn, h, c.dense_ff, fr, up);
+            glu::launch_swiglu<glu::DeclaredExp, glu::Round::bf16>(g + fr.first, up + fr.first, fr.count, glu::no_clamp, act + fr.first, s);
+            if (par) tp_gather(act, fr.count * 4U);
+            linear_rows(blk(l, "ffn_down.weight"), act, c.dense_ff, h, hr, f);
+            if (par) tp_gather(f, hr.count * 4U);
         } else {
             linear(blk(l, "ffn_gate_inp.weight"), xn, h, c.experts, rlog, false);
             strix::moe_core::enqueue_route_wave<preset::route, glu::DeclaredExp>(rlog, t(blk(l, "exp_probs_b.bias")).f(), ids, rw, 1U, s);
@@ -680,34 +743,55 @@ struct Forward::Impl {
             std::uint32_t* const ps = dstatus_all + 8U * std::size_t{l};
             std::uint32_t* const ds = ps + 4;
             const auto dev =[](const void* p, std::uint64_t bytes) { return a8::DeviceBytes{reinterpret_cast<std::uintptr_t>(p), bytes}; };
-            const std::uint64_t K = c.top_k, I = c.expert_ff, L = c.latent;
+            // routed slots of this rank (one node: all top_k into rawdots; a share: top_k / 2 at ids + first slot, written
+            // into its tp::moe slot) and its shared-expert rows; one join leaves the 16 slot rows contiguous
+            htp::MoeLayout m;
+            m.slots = c.top_k;
+            if (par) m = htp::moe(tp.rank, c.top_k, c.latent, c.shared_ff);
+            float* const raw = par ? tp.moe + m.raw_mine : rawdots;
+            const std::uint32_t* const sid = ids + m.slot_first;
+            const std::uint64_t K = m.slots, I = c.expert_ff, L = c.latent;
             a8::Request rq;
             rq.enabled = true;
             rq.approved_numerical_identity = a8::numerical_identity_for_gate_type(wg.type);
             rq.input = a8::InputKind::fp32;
-            rq.shape = {c.latent, c.expert_ff, c.experts, c.top_k, 1U};
+            rq.shape = {c.latent, c.expert_ff, c.experts, static_cast<std::uint32_t>(K), 1U};
             rq.gate_type = wg.type;
             rq.up_type = wu.type;
-            a8::Bindings b{dev(z, L * 4U), dev(wg.p, wg.bytes), dev(wu.p, wu.bytes), dev(ids, K * 4U), dev(pcodes, L),
+            a8::Bindings b{dev(z, L * 4U), dev(wg.p, wg.bytes), dev(wu.p, wu.bytes), dev(sid, K * 4U), dev(pcodes, L),
                            dev(pdeltas, L / 32U * 4U), dev(psums, L / 32U * 4U), dev(ps, 4U), dev(pout, K * 2U * I * 4U)};
             a8::enqueue_probe(rq, b, s);
             a8::DownRequest dq;
             dq.enabled = true;
             dq.approved_numerical_identity = a8::down_numerical_identity(wd.type);
-            dq.shape = {c.latent, c.expert_ff, c.experts, c.top_k};
+            dq.shape = {c.latent, c.expert_ff, c.experts, static_cast<std::uint32_t>(K)};
             dq.weight_type = wd.type;
             dq.swiglu_limit = c.swiglu_limit;
-            a8::DownBindings db{dev(pout, K * 2U * I * 4U), dev(wd.p, wd.bytes), dev(ids, K * 4U), dev(dcodes, K * I),
-                                dev(ddeltas, K * I / 32U * 4U), dev(dsums, K * I / 32U * 4U), dev(rawdots, K * L * 4U),
+            a8::DownBindings db{dev(pout, K * 2U * I * 4U), dev(wd.p, wd.bytes), dev(sid, K * 4U), dev(dcodes, K * I),
+                                dev(ddeltas, K * I / 32U * 4U), dev(dsums, K * I / 32U * 4U), dev(raw, K * L * 4U),
                                 dev(ds, 4U), {0U, 0U}};
             a8::enqueue_down_activation_quantize(dq, db, s);
             a8::enqueue_down_rawdots(dq, db, s);
-            glu::launch_epilogue<glu::Round::bf16>(rawdots, nullptr, L, K * L, rawdots, s);  // each expert's down Linear output
-            strix::moe_core::enqueue_combine<strix::moe::CombineForm::bf16_steps, 16U, 1536U>(rw, rawdots, nullptr, acc, 1U, s);
+            glu::launch_epilogue<glu::Round::bf16>(raw, nullptr, L, K * L, raw, s);  // each expert's down Linear output
+            if (par) {  // shared gate/up rows of this rank into its slot, one join, the activation halves into act
+                const auto sr = share(c.shared_ff);
+                linear_rows(blk(l, "ffn_gate_shexp.weight"), xn, h, c.shared_ff, sr, g);
+                linear_rows(blk(l, "ffn_up_shexp.weight"), xn, h, c.shared_ff, sr, up);
+                glu::launch_swiglu<glu::DeclaredExp, glu::Round::bf16>(g + sr.first, up + sr.first, sr.count, glu::no_clamp,
+                                                                      tp.moe + m.act_mine, s);
+                tp_gather(tp.moe, m.slot * 4U);
+                check(hipMemcpy2DAsync(act, sr.count * 4U, tp.moe + m.act_first, m.act_pitch * 4U, sr.count * 4U, 2U,
+                                       hipMemcpyDeviceToDevice, s),
+                      "shared activation join");
+            }
+            strix::moe_core::enqueue_combine<strix::moe::CombineForm::bf16_steps, 16U, 1536U>(
+                rw, par ? tp.moe + m.raw_all : rawdots, nullptr, acc, 1U, s);
             linear(blk(l, "ffn_routed_up.weight"), acc, c.latent, h, routed);
-            linear(blk(l, "ffn_gate_shexp.weight"), xn, h, c.shared_ff, g);
-            linear(blk(l, "ffn_up_shexp.weight"), xn, h, c.shared_ff, up);
-            glu::launch_swiglu<glu::DeclaredExp, glu::Round::bf16>(g, up, c.shared_ff, glu::no_clamp, act, s);
+            if (!par) {
+                linear(blk(l, "ffn_gate_shexp.weight"), xn, h, c.shared_ff, g);
+                linear(blk(l, "ffn_up_shexp.weight"), xn, h, c.shared_ff, up);
+                glu::launch_swiglu<glu::DeclaredExp, glu::Round::bf16>(g, up, c.shared_ff, glu::no_clamp, act, s);
+            }
             linear(blk(l, "ffn_down_shexp.weight"), act, c.shared_ff, h, shared);
             strix::moe_core::enqueue_combine<strix::moe::CombineForm::bf16_steps, 1U, 3072U>(nullptr, routed, shared, f, 1U, s);
         }
@@ -1167,7 +1251,9 @@ struct Forward::Impl {
                   "head mixes");
             check(hcc::enqueue_collapse<kHead>(x0, mixh, 1U, c.hidden, u, s), "head collapse");
             norm(u, t("output_norm.weight").f(), c.hidden, c.rms_eps, xn);
-            linear("output.weight", xn, c.hidden, c.vocab, logits_d, false);
+            const auto vr = share(c.vocab);  // enable_tp: this rank's vocabulary rows, then the logits joined
+            linear_rows("output.weight", xn, c.hidden, c.vocab, vr, logits_d, false);
+            if (tp.world == 2U) tp_gather(logits_d, vr.count * 4U);
             if (greedy) {  // the shared device greedy row: first max, lowest token on ties (no logits copy)
                 const strix::ExecutionBufferAddress lg{{}, reinterpret_cast<std::uintptr_t>(logits_d), std::uint64_t{c.vocab} * 4U, 0U};
                 const strix::ExecutionBufferAddress pa{{}, reinterpret_cast<std::uintptr_t>(greedy_partials), greedy_bytes, 0U};
@@ -1224,6 +1310,39 @@ std::span<const std::uint32_t> Forward::rows_greedy() const noexcept { return im
 const std::vector<float>& Forward::rows_logits() const noexcept { return impl_->vr.logits_host; }
 void Forward::commit_rows(std::uint32_t k) { impl_->commit_rows(k); }
 void Forward::set_rows_expert_union(bool on) noexcept { impl_->vr.expert_union = on; }
+std::uint64_t Forward::tensor_bytes(const std::string& name) const noexcept {
+    const auto it = impl_->w.find(name);
+    return it == impl_->w.end() ? 0U : it->second.bytes;
+}
+void Forward::enable_tp(std::uint32_t rank, TpGather gather) {
+    auto& im = *impl_;
+    const Config& c = im.c;
+    if (rank > 1U || gather.fn == nullptr) throw std::invalid_argument("hy4 hip forward: tensor parallelism needs rank 0|1 and a gather");
+    if (im.first != 0U || im.last != c.layers) throw std::logic_error("hy4 hip forward: tensor parallelism needs a whole-model rank");
+    // the joins assume the flash presets (32 indexed / 64 sliding heads), the combine's 16 x 1536 slot rows and even
+    // split dimensions (tp::half refuses odd ones)
+    for (std::uint32_t l = 0; l < c.layers; ++l)
+        if (c.heads[l] != (c.indexed[l] != 0U ? 32U : 64U)) throw std::invalid_argument("hy4 hip forward: tp head layout");
+    if (c.top_k != 16U || c.latent != 1536U || c.hidden != 3072U) throw std::invalid_argument("hy4 hip forward: tp slot layout");
+    (void)htp::half(c.vocab, rank);
+    (void)htp::half(c.dense_ff, rank);
+    (void)htp::moe(rank, c.top_k, c.latent, c.shared_ff);
+    im.allocate_tp();
+    im.tp.rank = rank;
+    im.tp.world = 2U;
+    im.tp.gather = gather;
+    im.tp.calls = 0;
+}
+std::uint32_t Forward::tp_gathers_per_step() const noexcept {
+    return impl_->tp.world == 2U ? htp::step_count(htp::dims_of(impl_->c)).gathers : 0U;
+}
+std::string Forward::tp_receipt() const {
+    if (impl_->tp.world != 2U) return "hy4 tp: off (one node)";
+    const auto n = htp::step_count(htp::dims_of(impl_->c));
+    return "hy4 tp: rank " + std::to_string(impl_->tp.rank) + " of 2 (heads, o_proj / FFN / shared rows, routed slots 8 + 8, vocab halves); " +
+           std::to_string(n.gathers) + " gathers per step, " + std::to_string(n.bytes / 1024U) + " KiB sent per rank per step; " +
+           std::to_string(impl_->tp.calls) + " gathers so far";
+}
 const std::vector<float>& Forward::prefill(const std::vector<std::uint32_t>& prompt) { return impl_->prefill(prompt); }
 Forward::~Forward() {
     if (impl_ && impl_->s) {
