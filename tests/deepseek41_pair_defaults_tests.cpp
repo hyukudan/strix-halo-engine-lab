@@ -483,8 +483,7 @@ void test_profile() {
                   f.profile->json().find("\"provisional\":[]") != std::string::npos &&
                   base.profile->json().find("\"provisional\":[]") != std::string::npos,
               "receipt: qualified stamp, empty provisional list");
-        check(pd::describe(app, f).find(std::string("profile qualification ") + stamp + "
-") != std::string::npos &&
+        check(pd::describe(app, f).find(std::string("profile qualification ") + stamp + "\n") != std::string::npos &&
                   pd::describe(app, f).find("profile lever fast_prefill 1 (profile, ") != std::string::npos,
               "effective config: qualified lines");
         World sw0 = w;
