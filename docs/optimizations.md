@@ -5509,3 +5509,22 @@ Several short waiting prompts run as one device prefill pass under the FAST leve
 - **Off switch:** `STRIX_SERVE_PREFILL_GROUP=0`
 - **Exactness evidence:** pair runs, same eight prompts solo (one at a time) and grouped in one server: every member's logits and exported-state hashes equal its solo run on both ranks, under exact (solo hashes equal to the previous main), the FAST profile, FAST_DENSE, FAST_MOE, FAST_ATTN=2, and the FAST profile with `STRIX_DS41_FAST_DENSE_MIN_ROWS=64` (groups of 125 rows across the threshold).
 - **Measured gain:** FAST profile, eight requests x 256 tokens: whole run 99.9 -> 102.7 tok/s (+2.8 %), admission 1,428 -> 865 ms; four requests about +1 % (noisy).
+
+### Qwen 27B exact tensor-parallel decode over two nodes
+
+**Engine:** `qwen35` (HIP, IU4 dense). **Control:** `--tp-rank 0|1` on both ranks (`--tp-transport`, `--tp-rates`,
+`--tp-trip-us`, `--tp-force`); levers `STRIX_TP_F16_GATHER` and `STRIX_TP_SPLIT_DRAFT` (default on). **Default:** off
+(one node) unless `--tp-rank` is given; with it, the shared split planner (`include/strix/pair/split_plan.hpp`) keeps the
+decode on one node when the group does not win (unless `--tp-force`).
+
+Each rank loads the model and prefills alone (replicated, same bits), then decodes its column / head shares
+(`core::dense_iu4::run_cols`, `include/strix/pair/column_split.hpp`, `tp_layout.hpp`) with exact joins: all-gathers and a
+split argmax. FP16 gathers feed the IU4 activation rows, whose first operation is the same FP16 conversion, and the
+MTP drafter is split by the trunk's shares. The verify-window costs are the compiled table on every rank, so both ranks
+choose the same windows; learned costs are refused.
+- **Off switch:** omit `--tp-rank`; `STRIX_TP_F16_GATHER=0` / `STRIX_TP_SPLIT_DRAFT=0` for the levers.
+- **Exactness evidence:** generated ids equal the one-node plain reference over 1,200 tokens (code prompt) with the
+  levers on and off, and over 200 plain tokens. The one-node dense IU4 kernels compile to the same ISA as before; only
+  the column-share kernel is new.
+- **Measured gain:** two Strix Halo nodes over USB4, EXACT, code prompt, 1,200 tokens with MTP speculation: one node
+  46.76 / 46.68 tok/s, tensor parallel 58.50 tok/s in the same ticket (+25 %).
