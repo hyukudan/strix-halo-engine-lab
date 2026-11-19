@@ -148,6 +148,21 @@ struct Run {
     std::uint32_t max_rows = 0;
     std::vector<std::uint32_t> trace;  // per step: source * 100 + drafts verified
     std::uint64_t prelaunched = 0, launched = 0;
+    std::vector<double> rounds;  // every RoundSink record, flattened (fields, ms and the three id lists)
+};
+
+// Round trace capture: the pre-launched verify must feed the sink the same record as the read-then-verify order.
+struct RoundCapture final : sp::RoundSink {
+    std::vector<double>* out = nullptr;
+    void round(const sp::RoundRecord& r) override {
+        for (const double v : {double(r.context), double(int(r.source)), double(r.anchor), double(r.k), double(r.rows),
+                               double(r.accepted), double(r.copy), double(r.ext), r.verify_ms, r.draft_ms})
+            out->push_back(v);
+        for (const auto ids : {r.drafts, r.greedy, r.emitted}) {
+            out->push_back(double(ids.size()));
+            for (const std::uint32_t id : ids) out->push_back(double(id));
+        }
+    }
 };
 
 // legal_rows / capacity: the caller binds StepParams::max_rows = min(backend rows, context room), as the engine apps do.
@@ -180,6 +195,9 @@ Run run(const World& w, std::uint32_t n_tokens, double accuracy, bool copy, bool
     fc.stream_len = 1;
     sp::BlockSpeculator spec(drafter, target);
     spec.set_prelaunch(g_prelaunch);
+    RoundCapture capture;
+    capture.out = &r.rounds;
+    spec.set_round_sink(&capture);
     spec.start(r.out[0]);
     target.committed_rows = 0;
     while (r.out.size() < n_tokens) {
@@ -382,13 +400,15 @@ int main() {
                 const auto on = run(w, 600U, 0.55, copy, true, hybrid, true);
                 g_prelaunch = false;
                 BD_CHECK(on.out == off.out && on.trace == off.trace, "pre-launch %s mode %d: emitted ids or blocks differ", cls.c_str(), mode);
+                BD_CHECK(!on.rounds.empty() && on.rounds == off.rounds,
+                         "pre-launch %s mode %d: round records differ from the read-then-verify order", cls.c_str(), mode);
                 BD_CHECK(off.prelaunched == 0 && off.launched == 0, "pre-launch off: nothing pre-launched");
                 BD_CHECK(on.prelaunched == on.launched && on.prelaunched == on.chain_blocks + on.hybrid && on.prelaunched > 0,
                          "pre-launch %s mode %d: %llu pre-launched, %llu chain + %llu hybrid blocks", cls.c_str(), mode,
                          (unsigned long long)on.prelaunched, (unsigned long long)on.chain_blocks, (unsigned long long)on.hybrid);
                 pre_steps += on.prelaunched;
             }
-        std::printf("verify pre-launch: same ids and blocks as read-then-verify in 4 of 4 runs, %llu pre-launched steps\n",
+        std::printf("verify pre-launch: same ids, blocks and round records as read-then-verify in 4 of 4 runs, %llu pre-launched steps\n",
                     (unsigned long long)pre_steps);
     }
     std::printf("block drafter tests ok: %d cases, copy blocks %llu, chain blocks %llu, hybrid blocks %llu; edit %.2f vs serial %.2f ms/token\n",
