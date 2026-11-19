@@ -139,6 +139,7 @@ bool throws(F f) {
 
 int main() {
     std::mt19937 rng(20261119U);
+    auto draw = [&rng](std::uint32_t m) { return static_cast<std::uint32_t>(rng() % m); };  // 32-bit draw (GCC -Wconversion)
     std::uint64_t cases = 0, rows_total = 0, sib_rows = 0, sib_taken = 0, replays = 0, moves = 0;
     for (int seq = 0; seq < 60; ++seq) {
         // serial reference of the whole stream
@@ -154,19 +155,19 @@ int main() {
         while (out.size() < n_tok) {
             const std::size_t at = out.size();  // ids[at] = target's next token after the anchor out.back()
             sp::Block b;
-            const std::uint32_t n = 1U + rng() % 15U;
+            const std::uint32_t n = 1U + draw(15U);
             bool on_path = true;
             for (std::uint32_t j = 0; j < n; ++j) {
                 const std::uint32_t truth = ids[at + j];
                 const bool hit = on_path && std::bernoulli_distribution(p_ok)(rng);
-                const std::uint32_t d = hit ? truth : (truth + 1U + rng() % (kVocab - 1U)) % kVocab;
-                std::uint32_t alt = (d + 1U + rng() % (kVocab - 1U)) % kVocab;
+                const std::uint32_t d = hit ? truth : (truth + 1U + draw(kVocab - 1U)) % kVocab;
+                std::uint32_t alt = (d + 1U + draw(kVocab - 1U)) % kVocab;
                 if (!hit && on_path && std::bernoulli_distribution(q_alt)(rng)) alt = truth;
                 if (alt == d) alt = (d + 1U) % kVocab;
                 on_path = on_path && hit;
                 b.drafts.push_back(d);
                 b.alts.push_back(alt);
-                const bool s = (n + 1U + b.siblings) < sp::kTreeWindowMaxRows && (rng() % 2U) == 0U;
+                const bool s = (n + 1U + b.siblings) < sp::kTreeWindowMaxRows && draw(2U) == 0U;
                 b.sib.push_back(s ? 1U : 0U);
                 b.siblings += s ? 1U : 0U;
             }
