@@ -71,10 +71,19 @@ static void model_content() {
     require(missing_rejected, "missing effective overlay must not attest a witness");
 }
 
+static void manifest_positions() {
+    std::istringstream short_rows("# name tokens path arms\ns8k-a 8128 a.ids exact\nt0k-a 256 b.ids exact\n");
+    require(quality::manifest_max_positions(short_rows) == 8192, "<= 8184-token manifests keep the 8192 state");
+    std::istringstream long_rows("s8k-a 8128 a.ids exact\n\nd32-a 32768 c.ids exact,m16_sh_eng_fast3\n");
+    require(quality::manifest_max_positions(long_rows) == 32776, "a 32K window sizes the state to 32768 + 8");
+    std::istringstream bad_rows("only-a-name\n");
+    require(quality::manifest_max_positions(bad_rows) == 8192, "rows without a token count keep the floor");
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc != 2) throw std::runtime_error("expected replay or model");
-        if (std::string_view(argv[1]) == "replay") replay_reference();
+        if (std::string_view(argv[1]) == "replay") { replay_reference(); manifest_positions(); }
         else if (std::string_view(argv[1]) == "model") model_content();
         else throw std::runtime_error("unknown test");
         return 0;
