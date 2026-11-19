@@ -3008,6 +3008,17 @@
     "doc_anchor": "docs/optimizations.md#qwen-rtx-prefix-cache"
   },
   {
+    "engine": "qwen-rtx",
+    "name": "Tensor-core expert decode tile form",
+    "flag_or_env": "--expert-decode-tile; STRIX_QRTX_EXPERT_DECODE_TILE (lever row expert_decode_tile)",
+    "default": "ON in every profile; acts only where the tensor-core GSQ experts run (gsq_bf16_mma: the FAST expert arithmetic)",
+    "exact": "Bitwise the tile form: same MMAs and scale FMAs in the same order per output. The tile form compiles to the previous instructions for every type except IQ2_S project (schedule only, same floating-point opcode multiset). Greedy ids equal on prose / edit / json; the arithmetic contract and the bundle id do not change.",
+    "gain": "RTX PRO 6000, FAST served decode e2e: prose 127.22 -> 137.6 / 138.98, edit 342.37 -> 380.98 / 378.97, json 287.14 -> 316.32 / 317.26 tok/s (two runs).",
+    "preconditions": "CUDA Qwen MoE (strix-cuda-qwen-serve, qwen_tf_logits) with gsq_bf16_mma experts; steps of at most 16 rows (decode, MTP verify windows). Prefill blocks keep the tile form.",
+    "off_switch": "--expert-decode-tile off; STRIX_QRTX_EXPERT_DECODE_TILE=0",
+    "doc_anchor": "docs/optimizations.md#qwen-rtx-expert-decode-tile"
+  },
+  {
     "engine": "qwen",
     "name": "Exact BF16 router weights",
     "flag_or_env": "STRIX_QWEN_ROUTER_BF16",
