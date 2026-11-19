@@ -1,4 +1,5 @@
 #include "../src/model_graph/deepseek41_adapter.hpp"
+#include "strix/prefill_row_liveness.hpp"
 #include "strix/deepseek41_model_description.hpp"
 #include "strix/model_description.hpp"
 #include "strix/serve/json.hpp"
@@ -55,6 +56,9 @@ int main() try {
     const auto graph = ds::graph_from_model_description(description, model.config);
     check(mg::canonical(graph) == mg::canonical(ds::model_graph_from_config(model.config)), "description/config graph mismatch");
     check(graph.layers.size() == model.layers.size(), "ordered trunk size");
+    // Row liveness (strix/prefill_row_liveness.hpp): every trunk layer declares state, so prompt rows stop nowhere early.
+    { const auto lp = strix::prefill_liveness::plan_graph(graph, {.taps = {}, .every_row = false, .head_row = false, .tail_row_invariant = false});
+      check(!lp.cut() && lp.cache_only_last && strix::prefill_liveness::skipped_row_layers(lp, 512) == 0, "row liveness: no layer above the last state owner"); }
     check(!graph.attachments.empty() && graph.attachments.front().kind == mg::AttachmentKind::mtp, "MTP attachment");
     check(graph.attachments.front().layers.size() == model.config.num_nextn_predict_layers, "MTP stages");
     bool compressed = false, window_only = false;

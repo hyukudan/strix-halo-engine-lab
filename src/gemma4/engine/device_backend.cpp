@@ -131,9 +131,13 @@ public:
             target_ = std::make_unique<gpu::DeviceTarget>(bind_host_weights(model),tables,options);
             if (a8_route && target_->stats().identity != a8::arithmetic_id)
                 throw std::logic_error("a8 prefill requires g4-a8-v1 decode");
-            if (many_row)
+            if (many_row) {
                 prefill_ = std::make_unique<prefill::DevicePrefill>(target_->borrow_device_weights(),tables,
                     prefill::Residency::device,false,attention,linears);
+                // The decode tail evaluates the prompt's last rows (prefill_rows never asks for a head): a pass's rows
+                // stop at the last K/V-owning or tapped layer (LAST_KV, off: STRIX_G4_PREFILL_LAST_KV=0).
+                prefill_->keep_last_row(false);
+            }
             // v1: no policy (every WMMA linear on FP16 operands), also over a STRIX_G4_PREFILL_LINEAR_POLICY.
             if (wmma_route) prefill_->set_linear_policy(v2 ? prefill::LinearPolicy::parse(prefill::v2_policy) : prefill::LinearPolicy{});
         }

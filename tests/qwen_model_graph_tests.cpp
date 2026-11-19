@@ -1,4 +1,5 @@
 #include "../src/model_graph/qwen_adapter.hpp"
+#include "strix/prefill_row_liveness.hpp"
 
 #include <algorithm>
 #include <iostream>
@@ -30,6 +31,9 @@ int main(int argc, char** argv) {
         expect(mg::canonical(graph) == mg::canonical(qd::model_graph_from_contract(model)), "file/contract graph differs");
         expect(mg::identity(graph) == mg::identity(qd::model_graph_from_description(file)), "unstable graph identity");
         expect(graph.layers.size() == 48, "trunk layer count");
+        // Row liveness (strix/prefill_row_liveness.hpp): every trunk layer declares state, so prompt rows stop nowhere early.
+        { const auto lp = strix::prefill_liveness::plan_graph(graph, {.taps = {}, .every_row = false, .head_row = false, .tail_row_invariant = false});
+          expect(!lp.cut() && lp.cache_only_last && strix::prefill_liveness::skipped_row_layers(lp, 512) == 0, "row liveness: no layer above the last state owner"); }
         expect(graph.attachments.size() == 2, "PLE/MTP attachment count");
         expect(graph.attachments[0].kind == mg::AttachmentKind::ple &&
             graph.attachments[0].target == "layer.1.before-attention", "PLE insertion");

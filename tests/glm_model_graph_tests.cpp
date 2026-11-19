@@ -1,5 +1,6 @@
 // Host-only description/identity/inventory fixtures. No model payload or device.
 #include "../src/glm/load/glm_model_description.hpp"
+#include "strix/prefill_row_liveness.hpp"
 #include "../src/glm/load/glm_rank_plan_graph.hpp"
 #include "strix/serve/json.hpp"
 
@@ -41,6 +42,9 @@ std::vector<std::string> inventory() {
 }
 void layer_contract(const mg::ModelGraph& graph) {
     CHECK(graph.layers.size() == 45);
+    // Row liveness (strix/prefill_row_liveness.hpp): every trunk layer declares state, so prompt rows stop nowhere early.
+    { const auto lp = strix::prefill_liveness::plan_graph(graph, {.taps = {}, .every_row = false, .head_row = false, .tail_row_invariant = false});
+      CHECK(!lp.cut() && lp.cache_only_last && strix::prefill_liveness::skipped_row_layers(lp, 512) == 0); }
     unsigned kda = 0, indexed = 0;
     for (std::size_t id = 0; id < graph.layers.size(); ++id) {
         const auto& layer = graph.layers[id];

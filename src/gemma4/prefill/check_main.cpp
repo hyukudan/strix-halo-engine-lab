@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -90,6 +91,7 @@ struct Args {
     unsigned repetitions = 1, warmup = 0, split = 0, continuation = 0;
     bool same_weight = false, check_split = false, profile = false, c4 = false, canonical_reference = false;
     bool after_benchmark_checks = false, profile_comparison = false, canonical_ab = false;
+    bool last_kv_ab = false;                 // --last-kv-ab: LAST_KV off/on, prompt form and engine form, bitwise
     pf::Linears linears = pf::Linears::wmma; // --linears exact|wmma
     bool exact_ab = false;                   // --exact-ab: exact prefill versus eight-row decode passes
     bool a8_gate = false;                    // --a8-gate: every row's logits + KV digest, a8 prefill vs a8 decode
@@ -109,6 +111,7 @@ Args arguments(int argc, char** argv) {
         if (g4::profile::take_option(argc, argv, i, a.product)) continue;
         if (key == "--profile" || key == "--kernel-profile") { a.profile = true; continue; }
         if (key == "--canonical-kernel-ab") { a.canonical_ab = true; continue; }
+        if (key == "--last-kv-ab") { a.last_kv_ab = true; continue; }
         if (key == "--exact-ab") { a.exact_ab = true; continue; }
         if (key == "--a8-gate") { a.a8_gate = true; continue; }
         if (key == "--check-c4") { a.c4 = true; continue; }
@@ -150,6 +153,8 @@ Args arguments(int argc, char** argv) {
         throw std::invalid_argument("attention profile comparison requires STRIX_G4_PREFILL_ATTN=wmma");
     if (a.canonical_ab && (a.lengths.empty() || a.profile || a.profile_comparison || pf::attention_mode() != pf::AttentionMode::canonical))
         throw std::invalid_argument("--canonical-kernel-ab needs explicit lengths, canonical attention and no other profile mode");
+    if (a.last_kv_ab && (a.lengths.empty() || a.profile || a.profile_comparison || a.canonical_ab))
+        throw std::invalid_argument("--last-kv-ab needs explicit lengths and no other profile mode");
     if (a.exact_ab && (a.lengths.empty() || a.linears == pf::Linears::wmma || a.canonical_ab || a.profile_comparison))
         throw std::invalid_argument("--exact-ab needs explicit lengths and --linears exact");
     if (a.a8_gate && (a.lengths.empty() || a.linears != pf::Linears::a8 || !a.gate_chunk || a.gate_chunk > pf::max_chunk_rows || a.ref_rows > 8))
@@ -263,6 +268,50 @@ void profile_attention(pf::DevicePrefill& target, const g4::ModelConfig& config,
                   << ",\"tflops\":" << flops / (ms * 1e9) << ",\"matrix_tflops\":" << flops / (matrix_ms * 1e9)
                   << ",\"minimum_gb_s\":" << (total.bytes - previous.bytes) / (ms * 1e6) << "}\n";
     }
+}
+// LAST_KV (strix/prefill_row_liveness.hpp) off versus on, interleaved on one prefill object, in two forms:
+// "prompt" = run() (taps of every row, deferred / final head: the last row runs the tail alone where the route allows),
+// "engine" = the engine's prefill_rows passes (no logits, no taps, keep_last_row(false): rows stop at the last K/V owner).
+// Every run must reproduce the first off run's committed KV digest; prompt runs also its last logits and taps.
+void last_kv_ab(pf::DevicePrefill& prefill, const g4::ModelConfig& config, std::span<const unsigned> tokens, unsigned repetitions) {
+    std::string digest;
+    std::vector<float> logits, taps;
+    const auto once = [&](bool on, bool engine, unsigned iteration) {
+        if (setenv("STRIX_G4_PREFILL_LAST_KV", on ? "1" : "0", 1) != 0) throw std::runtime_error("setenv STRIX_G4_PREFILL_LAST_KV");
+        prefill.keep_last_row(!engine);
+        gpu::DeviceStream stream(config, unsigned(tokens.size()));
+        unsigned levers = 0;
+        const auto start = Clock::now();
+        pf::Result result;
+        if (engine) {
+            const auto count = unsigned(tokens.size());
+            for (unsigned first = 0; first < count;) {
+                const auto rows = std::min(pf::chunk_rows, count - first);
+                auto tx = stream.begin();
+                const auto chunk = prefill.forward(*tx, tokens.subspan(first, rows), false, false, false, false, true);
+                tx->commit(rows); levers |= chunk.levers; first += rows;
+            }
+        } else result = prefill.run(stream, tokens);
+        const auto seconds = std::chrono::duration<double>(Clock::now() - start).count();
+        const auto state = stream.digest();
+        if (digest.empty()) {
+            if (on || engine) throw std::logic_error("last-kv A/B starts with the off prompt run");
+            digest = state; logits = result.last_logits; taps = result.tail_taps;
+        } else {
+            if (state != digest) throw std::runtime_error("LAST_KV A/B committed KV digest mismatch");
+            if (!engine) { equal(result.last_logits, logits); equal(result.tail_taps, taps); }
+        }
+        std::cout << "{\"last_kv_ab\":\"" << (on ? "on" : "off") << "\",\"form\":\"" << (engine ? "engine" : "prompt")
+                  << "\",\"rows\":" << tokens.size() << ",\"iteration\":" << iteration << ",\"seconds\":" << seconds
+                  << ",\"tokens_per_s\":" << static_cast<double>(tokens.size()) / seconds;
+        if (engine) std::cout << ",\"narrowed\":" << ((levers & pf::lever_last_kv) ? "true" : "false");
+        std::cout << "}\n";
+    };
+    for (unsigned r = 0; r < repetitions; ++r) { once(false, false, r); once(true, false, r); once(false, true, r); once(true, true, r); }
+    (void)unsetenv("STRIX_G4_PREFILL_LAST_KV");
+    prefill.keep_last_row(true);
+    std::cout << "{\"gate\":\"last-kv-off-vs-on\",\"rows\":" << tokens.size() << ",\"runs\":" << 4 * repetitions
+              << ",\"kv_digest\":\"" << digest << "\",\"verdict\":\"EXACT\"}\n";
 }
 // Old per-8-row canonical attention versus the whole-chunk kernels on one
 // prefill object: interleaved timings, then one profiled run each. Every run
@@ -485,6 +534,7 @@ int main(int argc, char** argv) try {
                 tokens[i] = unsigned(ids[i % ids.size()]);
             }
             if (args.canonical_ab) { canonical_ab(prefill, model.config, tokens, args.repetitions); continue; }
+            if (args.last_kv_ab) { last_kv_ab(prefill, model.config, tokens, args.repetitions); continue; }
             if (args.exact_ab) { exact_ab(prefill, *decoder, model.config, tokens, args.repetitions); continue; }
             if (args.a8_gate) { a8_gate(prefill, *decoder, model.config, tokens, args.gate_chunk, args.ref_rows); continue; }
             pf::Result result;
