@@ -23,7 +23,8 @@ I8 = "gsq-iq-i8mma-turbo-cuda-v1"
 BF16 = "gsq-iq-bf16mma-cuda-v1"
 FORMS = "qwen-cuda;prefill=fast;forms=hc_mma,qsa_mma;moe_route_bf16=0;ids=qwen-cuda-hc-f16mma-v2,qwen-cuda-qsa-bf16mma-v2"
 RULE = f"prefill_rows>=512:{I8},else:{BF16}"
-# The effective config the TURBO arm printed on the RTX chain 11-19 (g32t), reduced to the fields gate.sh reads.
+# The effective config a nested TURBO arm prints (--profile turbo, default expert_turbo_rows), reduced to the fields
+# gate.sh reads.
 TURBO = {
     "entry": "serve", "profile": "turbo",
     "arithmetic_contract": FORMS + "+experts[" + RULE + "]",
@@ -95,7 +96,7 @@ def main():
         case("compare without sealed arms refused", ["--arms", "compare"], 2, [], "is missing"),
         case("compare with only exact sealed refused", ["--arms", "compare"], 2, [], "out/fast is missing",
              prep=lambda t: (t / "out" / "exact").mkdir(parents=True)),
-        # resolved-contract check (11-19 g32t/g32x ended rc 2 on the nested TURBO contract)
+        # resolved-contract check: the nested TURBO contract (+experts[rule]) is accepted, mismatches are refused
         case("nested turbo contract accepted", t, 0, ["turbo"], "+experts[" + RULE + "]", cfg=TURBO),
         case("flat turbo contract (rows off) accepted", t, 0, ["turbo"], "+" + I8 + " |", cfg=turbo(flat)),
         case("regime rows differ from contract refused", t, 2, ["turbo"], "does not match resolved arithmetic contract",
