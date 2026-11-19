@@ -5549,19 +5549,22 @@ split-argmax kernels (`src/core/tp_join.hpp`). The run's `tp link:` line splits 
 exchange; the staged route does not wait for the stream first, the Communicator orders its copy after the producer)
 and `rest`. A vocabulary head that cannot be split (not IU4, or V not a multiple of 64) runs replicated on every rank,
 in the drafter as in the target (`include/strix/pair/tp_layout.hpp` head_columns).
-`STRIX_TP_CHANNEL=1` (default off, not yet measured) carries the in-token gathers on the shared device-waited channel
+`STRIX_TP_CHANNEL` (default on; `=0` restores the staged route) carries the in-token gathers on the shared device-waited channel
 (`src/xport/channel_communicator.hpp` over `xport::Channel<tp_gather::Traits>`, `src/xport/tp_gather_traits.hpp`,
 HIP operations `src/xport/hip_channel_runtime.hpp`): a copy kernel publishes this rank's share, the progress thread
 runs the wire, the stream waits on the receive flag, and the host never waits per gather. Same bytes, same slots, same
-stream order and join kernels, so the ids are expected to equal the staged route; `STRIX_TP_XPORT_*` tunes the channel
+stream order and join kernels; `STRIX_TP_XPORT_*` tunes the channel
 (depth, progress CPU, timeout). The run ends by draining the channel, which checks the last messages (deferred
 integrity check): a failure ends the run with an error before any result is printed.
-- **Off switch:** omit `--tp-rank`; `STRIX_TP_F16_GATHER=0` / `STRIX_TP_SPLIT_DRAFT=0` for the levers.
+- **Off switch:** omit `--tp-rank`; `STRIX_TP_F16_GATHER=0` / `STRIX_TP_SPLIT_DRAFT=0` for the levers;
+  `STRIX_TP_CHANNEL=0` for the staged route.
 - **Exactness evidence:** generated ids equal the one-node plain reference over 1,200 tokens (code prompt) with the
   levers on and off, and over 200 plain tokens. The one-node dense IU4 kernels compile to the same ISA as before; only
   the column-share kernel is new.
 - **Measured gain:** two Strix Halo nodes over USB4, EXACT, code prompt, 1,200 tokens with MTP speculation: one node
-  46.76 / 46.68 tok/s, tensor parallel 58.50 tok/s in the same run (+25 %).
+  46.76 / 46.68 tok/s, tensor parallel 58.50 tok/s in the same run (+25 %). Channel route, same prompt and length,
+  ABA in one run each: one node 46.77 / 46.69 tok/s vs channel 65.38 tok/s (x1.40); staged 58.26 / 58.25 tok/s vs
+  channel 65.28 tok/s (+12.1 %); generated ids equal the one-node reference on all six arms.
 
 ### Qwen 27B pair prefill: decode relay to one node
 

@@ -168,7 +168,7 @@ int main(int argc, char** argv) try {
         const std::size_t cap = dump.empty() ? (2U << 20) : (16U << 20);
         tpg = std::make_unique<strix::xport::tp_gather::HipPairGather>(std::move(opened), std::uint32_t(tp_rank), cap,
                                                                        static_cast<hipStream_t>(E->stream_handle()),
-                                                                       strix::envcfg::flag("STRIX_TP_CHANNEL", false));
+                                                                       strix::envcfg::flag("STRIX_TP_CHANNEL", true));
     }
     const unsigned V = E->vocab();
     // Speculation: one shared resolver (hip_spec_defaults.hpp). --dump-logits needs every position's logits: one row per step.
