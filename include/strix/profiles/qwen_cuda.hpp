@@ -97,6 +97,15 @@ inline constexpr Lever table[] = {
      .kind = Kind::exact, .ready = {true, true, true, true}, .runnable = {true, true, true, true},
      .target = "", .off = "0",
      .source = "deferred prompt MTP rows: exact (the identical MTP call after the first token; MTP fixture byte-equal)"},
+    // Exact schedule trait of the tensor-core GSQ experts (FAST / expert_fast arithmetic only): steps of <= 16 rows (decode
+    // and MTP verify windows) run the decode tile form (one m16 block, three-group weight-field ring), bitwise the tile
+    // form (same field values, same MMA and scale-FMA order per output). On in every profile (an absent row = on: the
+    // empty cells add no entry); `--expert-decode-tile off` / STRIX_QRTX_EXPERT_DECODE_TILE=0 runs the tile form.
+    {.name = "expert_decode_tile", .env = "STRIX_QRTX_EXPERT_DECODE_TILE", .option = "--expert-decode-tile",
+     .value = {"", "", "", ""}, .builtin = "1",
+     .kind = Kind::exact, .ready = {true, true, true, true}, .runnable = {true, true, true, true},
+     .target = "", .off = "0",
+     .source = "decode tile form of the tensor-core GSQ experts: exact (bitwise the tile form; greedy ids equal on prose/edit/json)"},
 };
 inline std::span<const Lever> levers() { return table; }
 
@@ -119,6 +128,7 @@ struct Choice {
     bool expert_turbo = false;  // maps to Config::expert_arithmetic (its identity is the arithmetic name, not a form)
     bool expert_fast = false;   // likewise (gsq-iq-bf16mma-cuda-v1)
     bool mtp_defer_prompt = false;  // exact: Config::defer_prompt_mtp
+    bool expert_decode_tile = true; // exact: Config::expert_decode_tile (absent row = on)
     bool fast() const { return moe_route_bf16 || hc_mma || mtp_mma || qsa_mma || moe_mma; }
     bool operator==(const Choice&) const = default;
 };
@@ -144,6 +154,7 @@ inline Choice choose(const pr::Resolution& r) {
     c.expert_turbo = lever_on(r, "expert_turbo");
     c.expert_fast = lever_on(r, "expert_fast");
     c.mtp_defer_prompt = lever_on(r, "mtp_defer_prompt");
+    c.expert_decode_tile = r.find("expert_decode_tile") == nullptr || lever_on(r, "expert_decode_tile");
     return c;
 }
 // Flip together with the members' fast-column `ready` cells when the whole-bundle gate receipt passes.

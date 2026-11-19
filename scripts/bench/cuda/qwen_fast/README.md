@@ -47,6 +47,13 @@ Exit codes of gate.sh: 0 pass, 1 fail, 2 identity or input error.
 then `--arms fast,compare` with the same `--out`. A compare refuses (rc 2) if a sealed arm dir is missing.
 CPU test: `python tests/qwen_fast_gate_arms_tests.py`.
 
+Decode gate (FAST vs exact on the reference's OWN continuation, decode windows): the exact arm generates and dumps in one
+load, `qwen_tf_logits --profile exact --generate 128 --rows 129 --window 4` (greedy 1-row `step()`s; writes
+`q-NAME-gen.u32` and the teacher-forced token file `q-NAME-tf.u32` = prompt + the first 128 generated ids, then dumps 129
+rows: the last prompt position and every generated id, in `step()` windows of 4 rows); every other arm runs plain
+teacher-forced mode over `--prompt NAME=q-NAME-tf.u32 --rows 129 --window 4` and is compared with `fast_logit_gate.py
+compare` (pooled and per prompt). `--generate G --rows 0` only generates (free-running agreement between arms).
+
 This target-logit gate does not qualify MTP draft/cache fidelity or speculative acceptance. MTP forms remain
 provisional until a separate draft/cache check and a complete speculative-workload gate pass on native hardware.
 

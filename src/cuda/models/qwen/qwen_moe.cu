@@ -503,7 +503,7 @@ template <unsigned T> void launch_mma_down(const Rows& v, const Weights& w, unsi
     else native_mma_down_kernel<T, MoeBinding><<<grid, kMmaThreads, 0, s>>>(w.down, v);
 }
 void enqueue_mma_experts(const Rows& v, std::uint32_t rows, const Weights& w, unsigned tiles, cudaStream_t s) {
-    const bool decode = native_mma::decode_form(rows);
+    const bool decode = w.decode_tile && native_mma::decode_form(rows);
     switch (w.gate_type) {
     case 18: launch_mma_project<18>(v, w, tiles, decode, s); break;
     case 21: launch_mma_project<21>(v, w, tiles, decode, s); break;

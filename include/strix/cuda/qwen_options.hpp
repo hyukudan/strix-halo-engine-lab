@@ -132,6 +132,8 @@ inline void apply(const cp::Choice& choice, qp::Config& config) {
     config.moe_route_bf16 = choice.moe_route_bf16;  // explicit: the resolver already read the environment
     // Config::defer_prompt_mtp (exact): the lever row `mtp_defer_prompt` (--mtp-defer-prompt on|off, env, fast profile).
     config.defer_prompt_mtp = config.defer_prompt_mtp || choice.mtp_defer_prompt;
+    // Config::expert_decode_tile (exact schedule trait): the lever row `expert_decode_tile` (on unless switched off).
+    config.expert_decode_tile = config.expert_decode_tile && choice.expert_decode_tile;
     // TURBO / FAST expert rows: an explicit --expert-arithmetic other than incumbent keeps its own contract.
     if (choice.expert_turbo && choice.expert_fast)
         throw std::invalid_argument("--expert-turbo and --expert-fast select different expert arithmetics; set one");

@@ -198,6 +198,16 @@ void profiles() {
     for (const char* f : {"hc_mma", "qsa_mma", "expert_fast"}) check(status(fast, f) == "provisional", std::string("fast: ") + f + " provisional");
     check(status(fast, "mtp_defer_prompt") == "profile", "fast: exact deferral applied by the profile (qualified exact row): " + status(fast, "mtp_defer_prompt"));
     for (const char* f : {"mtp_mma", "moe_mma", "expert_turbo"}) check(status(fast, f) == "absent", std::string("fast: ") + f + " not selected");
+    // expert_decode_tile: exact schedule trait of the tensor-core experts, on in every profile (absent row), off by option or
+    // env, serve == CLI; the arithmetic contract and the bundle id do not change (bitwise the tile form).
+    check(fast.config.expert_decode_tile && status(fast, "expert_decode_tile") == "absent", "fast: decode tile form on (absent row)");
+    check(one({"--profile", "exact"}, qo::Entry::serve).config.expert_decode_tile, "exact: decode tile on (no tensor-core experts run)");
+    same_request("decode tile off", {"--profile", "fast", "--expert-decode-tile", "off"});
+    for (const auto& tile : {one({"--profile", "fast", "--expert-decode-tile", "off"}, qo::Entry::serve),
+                             one({"--profile", "fast"}, qo::Entry::serve, Env{{"STRIX_QRTX_EXPERT_DECODE_TILE", "0"}})}) {
+        check(!tile.config.expert_decode_tile && status(tile, "expert_decode_tile") == "off", "decode tile off by option / env: " + status(tile, "expert_decode_tile"));
+        check(tile.contract == fast.contract && bundle_id(tile) == bundle_id(fast), "decode tile off: same contract and bundle id");
+    }
     check(cp::form_identities(fast.choice) == "qwen-cuda-hc-f16mma-v2,qwen-cuda-qsa-bf16mma-v2", "fast identities: " + cp::form_identities(fast.choice));
     fast_bundle();
     for (const char* f : {"moe_route_bf16", "qsa_budget", "gdn_fp16_chunk", "output_head"})

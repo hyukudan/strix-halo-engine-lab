@@ -45,7 +45,7 @@ want exact || want fast || want compare || { echo "--arms: no step selected" >&2
 mkdir -p "$out"
 # Profile arms must not inherit numerical overrides or profile-export provenance.
 for key in STRIX_QRTX_HC_MMA STRIX_QRTX_MTP_MMA STRIX_QRTX_QSA_MMA STRIX_QRTX_MOE_MMA \
-           STRIX_QRTX_EXPERT_FAST STRIX_QRTX_EXPERT_TURBO STRIX_QRTX_MTP_DEFER_PROMPT STRIX_QRTX_QSA_FUSED \
+           STRIX_QRTX_EXPERT_FAST STRIX_QRTX_EXPERT_TURBO STRIX_QRTX_EXPERT_DECODE_TILE STRIX_QRTX_MTP_DEFER_PROMPT STRIX_QRTX_QSA_FUSED \
            STRIX_QPF2K_MOE_ROUTE_BF16 STRIX_QPF2K_QSA_BUDGET STRIX_QPF2K_GDN_FP16_CHUNK \
            STRIX_QWEN_PROFILE_ALLOW_PENDING ${!STRIX_QWEN_PROFILE_OWNED_@}; do
     unset "$key"
