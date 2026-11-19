@@ -1062,6 +1062,90 @@ void frontier_tests() {
         a.observe({d.source, 0, d.k, 1, d.rows, 20.0, 0.0}, std::vector<std::uint32_t>(2, 1U));
     }
 }
+// Exploration probe charge (ArbiterConfig::charge_probe). CUDA dense 27B sub15d shape: seeds 13.30 + 0.113 (r - 1) ms,
+// K/V 0.0699 ms per verify row per 1,024 positions (28K receipt), draft 0.824 ms per position, windows up to 16 rows (k 15).
+// The device is the priced model itself (fixed K/V term) and acceptance is a deterministic draw at survival p per depth.
+struct ProbeRun {
+    std::vector<std::uint32_t> ks;  // k of every pass (0 = serial)
+    double tokens = 0.0, ms = 0.0, serial_ms = 0.0, budget = 0.0, max_excess = -1e300;
+    std::uint32_t probes = 0, max_probe_k = 0, min_probe_k = ~0U;
+};
+ProbeRun probe_run(bool charge, std::uint64_t ctx, double p, int passes) {
+    sp::ArbiterConfig config;
+    config.windows = {1, 2, 3, 4, 6, 8, 12, 16};
+    config.learn_costs = false;
+    config.row_kv_ms_per_kpos = 0.0699;
+    config.charge_probe = charge;
+    sp::Arbiter a(config);
+    for (std::uint32_t r = 1; r <= 16; ++r) a.seed_cost(r, 13.30 + 0.113 * double(r - 1));
+    const std::vector<double> survival(15, p);
+    a.seed_model_survival(survival);
+    sp::StepInput in;
+    in.model_max_k = 15;
+    std::vector<double> draft_ms;
+    for (std::uint32_t i = 1; i <= 15; ++i) draft_ms.push_back(0.824 * double(i));
+    in.model_draft_ms = draft_ms;
+    in.context = ctx;
+    ProbeRun run;
+    run.serial_ms = a.verify_ms(1, ctx);
+    run.budget = config.frontier_loss * double(config.probe_every) * run.serial_ms;
+    std::uint64_t s = 0x9E3779B97F4A7C15ULL;
+    const auto draw = [&s] {
+        s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+        return double(s >> 11) * 0x1.0p-53;
+    };
+    for (int i = 0; i < passes; ++i) {
+        const auto d = a.decide(in);
+        run.ks.push_back(d.source == sp::Source::serial ? 0U : d.k);
+        if (d.source == sp::Source::serial) {
+            run.tokens += 1.0;
+            run.ms += run.serial_ms;
+            a.observe({sp::Source::serial, 0, 0, 0, 1, run.serial_ms, 0.0, ctx}, {});
+            continue;
+        }
+        std::uint32_t acc = 0;
+        while (acc < d.k && draw() < p) ++acc;
+        const double v = a.verify_ms(d.rows, ctx), dr = 0.824 * double(d.k);
+        run.tokens += double(acc + 1U);
+        run.ms += v + dr;
+        if (d.probe) {
+            ++run.probes;
+            run.max_probe_k = std::max(run.max_probe_k, d.k);
+            run.min_probe_k = std::min(run.min_probe_k, d.k);
+            if (d.k > 1) run.max_excess = std::max(run.max_excess, d.expected_ms - d.expected_tokens * run.serial_ms);
+        }
+        a.observe({sp::Source::model, 0, d.k, acc, d.rows, v, dr, ctx}, {});
+    }
+    return run;
+}
+
+void probe_charge_tests() {
+    // Short context (2K, serial wins at p 0.05): the deepest probe prices below its budget, so the charged arbiter makes
+    // the previous decisions pass for pass.
+    {
+        const auto on = probe_run(true, 2048, 0.05, 320), off = probe_run(false, 2048, 0.05, 320);
+        SP_CHECK(on.ks == off.ks, "short context: the charged probe changed a decision");
+        SP_CHECK(off.probes >= 8 && off.max_probe_k == 15 && on.max_probe_k == 15, "short context: deep probes (%u, k %u)",
+                 off.probes, off.max_probe_k);
+    }
+    // 128K (serial wins at p 0.4: 22.2 ms vs k 1 at 32.1 ms for 1.4 tokens): the previous probe runs k 15 (~170 ms); the
+    // charged one stays within its budget (frontier_loss x probe_every serial passes) and keeps >= 95 % of serial's rate.
+    {
+        const auto on = probe_run(true, 131072, 0.4, 640), off = probe_run(false, 131072, 0.4, 640);
+        const double serial_rate = 1.0 / on.serial_ms, rate_on = on.tokens / on.ms, rate_off = off.tokens / off.ms;
+        SP_CHECK(off.max_probe_k == 15, "128K: the previous probe runs the deepest k (%u)", off.max_probe_k);
+        SP_CHECK(on.probes >= 16 && on.max_probe_k < 15 && on.min_probe_k >= 1, "128K: charged probes %u, k %u..%u", on.probes,
+                 on.min_probe_k, on.max_probe_k);
+        SP_CHECK(on.max_excess <= on.budget + 1e-9, "128K: priced probe excess %.3f ms > budget %.3f ms", on.max_excess, on.budget);
+        SP_CHECK(rate_on > rate_off && rate_on >= 0.95 * serial_rate,
+                 "128K: charged %.2f tok/s, previous %.2f tok/s, serial %.2f tok/s", 1000.0 * rate_on, 1000.0 * rate_off,
+                 1000.0 * serial_rate);
+        std::printf("probe charge 128K p 0.4: serial %.2f tok/s, previous probe %.2f (k %u), charged %.2f (k %u..%u), %u probes\n",
+                    1000.0 * serial_rate, 1000.0 * rate_off, off.max_probe_k, 1000.0 * rate_on, on.min_probe_k, on.max_probe_k,
+                    on.probes);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1075,6 +1159,7 @@ int main() {
     context_pricing_tests();
     cost_fit_tests();
     context_gate_tests();
+    probe_charge_tests();
     std::printf("PASS strix-spec-drafting-tests\n");
     return 0;
 }
