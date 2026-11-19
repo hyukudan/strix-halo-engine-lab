@@ -1,6 +1,7 @@
 // Host tests of the shared tensor-parallel gather link (strix/pair/gather_link.hpp) and the placement inputs
 // (strix/pair/tp_inputs.hpp). Invariants: the slot swap addresses (local = slot[rank], remote = slot[1 - rank]); the
-// staged route waits for the stream once per gather BEFORE its exchange, device routes never wait on the host; the wire
+// staged route calls its exchange directly (the Communicator orders its copy after the producer on the stream), no
+// route waits for the stream on the host; the wire
 // tag sequence is the call count and survives a counter restart; rates and trip costs come only from a flag, the
 // declaration or the measurement (no compiled default).
 #include "strix/pair/gather_link.hpp"
@@ -52,29 +53,28 @@ void test_routes() {
     int stream_object = 0;
     std::vector<std::uint8_t> slots(2U * 64U);
     for (const std::uint32_t rank : {0U, 1U}) {
-        // staged: wait, then the exchange, every call
+        // staged: the exchange only, every call (no host stream wait before it)
         events.clear();
         Link st(rank, GatherRoute::staged, &legacy, nullptr);
         st.gather(&stream_object, slots.data(), 64U, 40U);
         Link::fn(&st, &stream_object, slots.data(), 64U, 64U);
-        check(events.size() == 4U && events[0].what == 's' && events[1].what == 'l' && events[2].what == 's' && events[3].what == 'l',
-              "staged: one host stream wait before each exchange");
-        check(events[1].local == slots.data() + rank * 64U && events[1].remote == slots.data() + (1U - rank) * 64U,
+        check(events.size() == 2U && events[0].what == 'l' && events[1].what == 'l', "staged: one exchange per gather, no host wait");
+        check(events[0].local == slots.data() + rank * 64U && events[0].remote == slots.data() + (1U - rank) * 64U,
               "staged: local = slot[rank], remote = slot[1 - rank]");
-        check(events[1].bytes == 40U && events[1].tag == 0U && events[3].tag == 1U, "staged: bytes and tag sequence");
-        check(st.calls() == 2U && st.sync_ms() >= 0.0 && st.link_ms() >= 0.0, "staged: counters");
+        check(events[0].bytes == 40U && events[0].tag == 0U && events[1].tag == 1U, "staged: bytes and tag sequence");
+        check(st.calls() == 2U && st.link_ms() >= 0.0, "staged: counters");
         // device direct: legacy exchange, no host wait
         events.clear();
         Link dd(rank, GatherRoute::device_direct, &legacy, nullptr);
         dd.gather(&stream_object, slots.data(), 64U, 8U);
-        check(events.size() == 1U && events[0].what == 'l' && dd.sync_ms() == 0.0, "device direct: no host wait");
+        check(events.size() == 1U && events[0].what == 'l', "device direct: no host wait");
         // channel: fast exchange only, no host wait
         events.clear();
         Link ch(rank, GatherRoute::channel, &legacy, &fast);
         for (int i = 0; i < 3; ++i) ch.gather(&stream_object, slots.data(), 64U, 16U);
         bool fast_only = events.size() == 3U;
         for (const auto& e : events) fast_only = fast_only && e.what == 'f';
-        check(fast_only && ch.sync_ms() == 0.0, "channel: no host wait, never the legacy exchange");
+        check(fast_only, "channel: no host wait, never the legacy exchange");
         check(events.size() == 3U && events[2].tag == 2U && events[2].local == slots.data() + rank * 64U, "channel: tags and slots");
         // counter restart keeps the wire tag sequence
         ch.reset_counters();

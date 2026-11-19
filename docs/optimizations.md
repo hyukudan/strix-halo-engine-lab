@@ -5527,8 +5527,10 @@ with `--tp-rank` is refused. Per-rank read rates come from the topology declarat
 measured at start-up over the gather form the decode runs (`include/strix/dist/link_cost.hpp` measure + agree, both
 ranks hold the same bits; `include/strix/pair/tp_inputs.hpp`); `--tp-trip-us` overrides only its latency. The gather
 binding is shared (`include/strix/pair/gather_link.hpp`, HIP side `src/xport/tp_gather_hip.hpp`), as are the join and
-split-argmax kernels (`src/core/tp_join.hpp`). The run's `tp link:` line splits the pass into `sync` (host blocked in
-the stream wait before a staged exchange), `link` (host time in the exchange) and `rest`.
+split-argmax kernels (`src/core/tp_join.hpp`). The run's `tp link:` line splits the pass into `link` (host time in the
+exchange; the staged route does not wait for the stream first, the Communicator orders its copy after the producer)
+and `rest`. A vocabulary head that cannot be split (not IU4, or V not a multiple of 64) runs replicated on every rank,
+in the drafter as in the target (`include/strix/pair/tp_layout.hpp` head_columns).
 - **Off switch:** omit `--tp-rank`; `STRIX_TP_F16_GATHER=0` / `STRIX_TP_SPLIT_DRAFT=0` for the levers.
 - **Exactness evidence:** generated ids equal the one-node plain reference over 1,200 tokens (code prompt) with the
   levers on and off, and over 200 plain tokens. The one-node dense IU4 kernels compile to the same ISA as before; only

@@ -367,14 +367,13 @@ int main(int argc, char** argv) try {
                     clk_n ? busy_sum / clk_n : 0L);
         if (tp_rank >= 0) {
             const double passes = steps ? double(steps) : double(generated.size() - 1U);
-            // sync = host blocked in the stream wait before a staged exchange (GPU work in flight + drain); link = host
-            // time in the exchange call (device routes: enqueue only); rest = everything else of the pass wall.
+            // link = host time in the exchange call (staged: producer tail + copy + wire; device routes: enqueue only);
+            // rest = everything else of the pass wall.
             const auto& tl = tpg->link();
             const double n = double(tl.calls());
-            std::printf("tp link: %llu gathers, %.1f per pass, route %s, sync %.2f ms/pass, link %.2f ms/pass (%.1f us/gather), "
-                        "rest %.2f ms/pass\n",
-                        (unsigned long long)tl.calls(), n / passes, strix::pair::gather_route_name(tl.route()), tl.sync_ms() / passes,
-                        tl.link_ms() / passes, n > 0.0 ? tl.link_ms() * 1000.0 / n : 0.0, (ms - tl.sync_ms() - tl.link_ms()) / passes);
+            std::printf("tp link: %llu gathers, %.1f per pass, route %s, link %.2f ms/pass (%.1f us/gather), rest %.2f ms/pass\n",
+                        (unsigned long long)tl.calls(), n / passes, strix::pair::gather_route_name(tl.route()),
+                        tl.link_ms() / passes, n > 0.0 ? tl.link_ms() * 1000.0 / n : 0.0, (ms - tl.link_ms()) / passes);
         }
     }
     if (!dump.empty()) {

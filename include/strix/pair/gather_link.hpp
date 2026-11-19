@@ -2,14 +2,15 @@
 // One all-gather of an exact tensor-parallel pass over two ranks: a symmetric swap of the slots. slot[rank] holds this
 // rank's share, produced by work already enqueued on the stream; slot[1 - rank] receives the peer's share and is valid
 // for work enqueued on the same stream after the call. Routes (one per run, both ranks the same):
-//   staged        - the host waits for the stream, then a host-staged exchange (dist::Communicator::exchange);
+//   staged        - a host-staged exchange (dist::Communicator::exchange): the Communicator enqueues its device-to-host
+//                   copy on the stream after the producer and its progress thread waits for that copy's event, so the
+//                   caller does not wait for the stream first (no host stream wait before the exchange);
 //   device_direct - the Communicator's device exchange (stream-ordered, no host wait);
 //   channel       - the shared device-waited channel (xport::ChannelCommunicator): a copy kernel publishes the share,
 //                   the progress thread runs the wire, the stream waits on the RX flag; no host wait per gather.
-// Counters: calls; sync_ms = host time blocked in the stream wait before the exchange (staged route only: GPU work
-// still in flight plus the drain); link_ms = host time inside the exchange call (staged: the whole wire; device
-// routes: enqueue time only). Pass wall - sync - link = host gaps (launches, joins, bookkeeping).
-// Backend-neutral host code: Ops supplies Stream, stream(void*), sync(Stream) and tag(call); Legacy / Fast supply
+// Counters: calls; link_ms = host time inside the exchange call (staged: the producer's tail still in flight, the copy
+// and the whole wire; device routes: enqueue time only). Pass wall - link = host gaps (launches, joins, bookkeeping).
+// Backend-neutral host code: Ops supplies Stream, stream(void*) and tag(call); Legacy / Fast supply
 // exchange(Stream, const void* local, void* remote, std::size_t bytes, const Tag&). The HIP binding is
 // src/xport/tp_gather_hip.hpp; host test tests/pair_tp_gather_tests.cpp.
 // Home: shared (host shared, pair facility). Bound by: qwen35 dense HIP exact tensor-parallel decode.
@@ -23,7 +24,7 @@ namespace strix::pair {
 enum class GatherRoute : std::uint8_t { staged = 0, device_direct = 1, channel = 2 };
 
 [[nodiscard]] constexpr const char* gather_route_name(GatherRoute r) noexcept {
-    return r == GatherRoute::staged ? "staged (host wait + host-staged exchange)"
+    return r == GatherRoute::staged ? "staged (host-staged exchange)"
          : r == GatherRoute::device_direct ? "device direct (stream-ordered)"
                                            : "channel (device-waited, no host wait)";
 }
@@ -52,13 +53,7 @@ public:
         const void* mine = b + std::size_t(rank_) * slot_bytes;
         void* peer = b + std::size_t(1U - rank_) * slot_bytes;
         const auto tag = Ops::tag(calls_);
-        auto t = Clock::now();
-        if (route_ == GatherRoute::staged) {
-            Ops::sync(stream);
-            const auto s = Clock::now();
-            sync_ms_ += ms(t, s);
-            t = s;
-        }
+        const auto t = Clock::now();
         if (route_ == GatherRoute::channel) fast_->exchange(stream, mine, peer, bytes, tag);
         else legacy_->exchange(stream, mine, peer, bytes, tag);
         link_ms_ += ms(t, Clock::now());
@@ -69,12 +64,11 @@ public:
         static_cast<GatherLink*>(ctx)->gather(Ops::stream(stream), slots, slot_bytes, bytes);
     }
     // Restart the time counters (e.g. after the start-up link measurement); the call sequence (wire tags) continues.
-    void reset_counters() noexcept { sync_ms_ = 0.0; link_ms_ = 0.0; counted_from_ = calls_; }
+    void reset_counters() noexcept { link_ms_ = 0.0; counted_from_ = calls_; }
 
     [[nodiscard]] std::uint32_t rank() const noexcept { return rank_; }
     [[nodiscard]] GatherRoute route() const noexcept { return route_; }
     [[nodiscard]] std::uint64_t calls() const noexcept { return calls_ - counted_from_; }
-    [[nodiscard]] double sync_ms() const noexcept { return sync_ms_; }
     [[nodiscard]] double link_ms() const noexcept { return link_ms_; }
 
 private:
@@ -85,7 +79,7 @@ private:
     Legacy* legacy_ = nullptr;
     Fast* fast_ = nullptr;
     std::uint64_t calls_ = 0, counted_from_ = 0;
-    double sync_ms_ = 0.0, link_ms_ = 0.0;
+    double link_ms_ = 0.0;
 };
 
 }  // namespace strix::pair
