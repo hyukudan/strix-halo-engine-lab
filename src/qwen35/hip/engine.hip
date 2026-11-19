@@ -941,17 +941,16 @@ struct HipEngine::Impl {
             throw std::runtime_error("enable_tp: attention / trunk shapes outside the split rules");
         const auto keys = ptp::split_units(KH, rates), kvs = ptp::split_units(cfg.kv_heads, rates);
         const auto hs = ptp::split_units(H / 64U, rates), ms = ptp::split_units(I / 64U, rates);
-        tp.head_split = head.fmt == kIu4Fmt && V % 64U == 0U;
-        const auto vs = ptp::split_units(tp.head_split ? V / 64U : 1U, rates);
+        const auto hc = ptp::head_columns(head.fmt == kIu4Fmt, V, rates);  // replicated: every rank owns [0, V)
+        tp.head_split = hc.split;
         for (unsigned q = 0; q < R; ++q)
             if (!keys[q].size() || !kvs[q].size()) throw std::invalid_argument("enable_tp: every rank needs a GDN key head and a kv head");
-        std::vector<std::vector<ptp::Segment>> core_s(R), ctx_s(R), hid_s(R), mlp_s(R), head_s(R);
+        std::vector<std::vector<ptp::Segment>> core_s(R), ctx_s(R), hid_s(R), mlp_s(R);
         for (unsigned q = 0; q < R; ++q) {
             core_s[q] = ptp::expand(ptp::mod_value_heads(KH, GH, keys[q]), vd);
             ctx_s[q] = {{kvs[q].begin * G * D, kvs[q].size() * G * D}};
             hid_s[q] = {{hs[q].begin * 64U, hs[q].size() * 64U}};
             mlp_s[q] = {{ms[q].begin * 64U, ms[q].size() * 64U}};
-            head_s[q] = {{vs[q].begin * 64U, vs[q].size() * 64U}};
         }
         const auto vh = ptp::mod_value_heads(KH, GH, keys[rank]);
         std::vector<ptp::Segment> qkv_s{{keys[rank].begin * kd, keys[rank].size() * kd}, {KH * kd + keys[rank].begin * kd, keys[rank].size() * kd}};
@@ -963,7 +962,7 @@ struct HipEngine::Impl {
         tp.gc = ptp::width(qkv_s); tp.gv = ptp::width(z_s); tp.gh = ptp::width(vh);
         tp.oc0 = hid_s[rank][0].global; tp.ocn = hid_s[rank][0].count;
         tp.gu0 = mlp_s[rank][0].global; tp.gun = mlp_s[rank][0].count;
-        tp.hd0 = head_s[rank][0].global; tp.hdn = head_s[rank][0].count;
+        tp.hd0 = hc.cols[rank].global; tp.hdn = hc.cols[rank].count;
         unsigned maxw = 2U;
         for (const auto* s : {&core_s, &ctx_s, &hid_s, &mlp_s})
             for (const auto& v : *s) maxw = std::max(maxw, ptp::width(v));
@@ -974,8 +973,10 @@ struct HipEngine::Impl {
         tp.f16 = f16_on;
         tp.split_draft = split_draft_on && mtp.ok;
         if (tp.split_draft && mtp.blk.q.fmt != kIu4Fmt && !mtp.blk.q.row_bytes) throw std::runtime_error("enable_tp: MTP weights not splittable");
-        if (tp.head_split || tp.split_draft)  // the rank's local logits (trunk head / draft subset share) live in its slot
-            for (const auto& v : head_s) maxw = std::max(maxw, ptp::width(v) + (tp.split_draft ? 128U : 0U));  // subset: +-1 unit each
+        if (tp.head_split)  // the rank's local logits (trunk head share) live in its slot; a replicated head uses `logits`
+            for (const auto& c : hc.cols) maxw = std::max(maxw, c.count);
+        if (tp.split_draft)  // the draft subset share (64-column blocks of at most V columns): +-1 unit each
+            for (const auto& u : ptp::split_units(V / 64U, rates)) maxw = std::max(maxw, u.size() * 64U + 128U);
         tp.slot_floats = kMaxRows * maxw;
         alloc0(&tp.slots, std::size_t(R) * tp.slot_floats * 4U);
         alloc0(&tp.picks, std::size_t(R) * tp.pick_floats * 4U);
@@ -986,7 +987,11 @@ struct HipEngine::Impl {
         tp.ctx = tp_make_join(ctx_s, QW);
         tp.hid = tp_make_join(hid_s, H);
         tp.mlp = tp_make_join(mlp_s, I);
-        if (tp.full_logits) tp.head = tp_make_join(head_s, V);
+        if (tp.full_logits) {  // split head only (full_logits requires it): one segment per rank
+            std::vector<std::vector<ptp::Segment>> head_s;
+            for (const auto& c : hc.cols) head_s.push_back({c});
+            tp.head = tp_make_join(head_s, V);
+        }
         tp_upload(&tp.sel_vh, ptp::select_map(vh));
         alloc0(&tp.bfull, std::size_t(kMaxRows) * GH * 4U);
         alloc0(&tp.afull, std::size_t(kMaxRows) * GH * 4U);
@@ -1385,6 +1390,10 @@ struct HipEngine::Impl {
                 tp_gather(tp.picks, tp.pick_floats, std::size_t(n) * 8U);
                 tp_pick_join_kernel<<<1, 32, 0, stream>>>(tp.picks, tp.ranks, tp.pick_floats, n, tp.didx);
                 tp_draft_map_kernel<<<1, 32, 0, stream>>>(tp.didx, live, d_dmap, kIu4DraftGroup, n, mtp.top);
+            } else if (!tp.head_split) {  // full head not splittable (non-IU4 or V % 64 != 0): the one-rank head on every
+                // rank, as the target does (a split share would cover one 64-column unit only)
+                linear(head, mtp.mxn, mtp.mlogits, n, stream, wide, iu4);
+                argmax_kernel<<<n, 1024, 0, stream>>>(mtp.mlogits, V, mtp.top);
             } else {  // full head: the trunk head's vocab shares
                 tp_part(head, mtp.mxn, tp.hd0, tp.hdn, slot, n);
                 tp_pick_kernel<<<n, 1024, 0, stream>>>(slot, tp.hdn, tp.hdn, int(tp.hd0), mine);

@@ -51,6 +51,27 @@ struct Segment {
     return out;
 }
 
+// Vocabulary head columns per rank. The head is split in `unit`-column blocks only when its format allows a column
+// share (`splittable`) and V is a whole number of blocks; otherwise it is replicated and every rank owns [0, V) (each
+// rank runs the whole head and its own argmax). Either way the union of what the ranks compute covers every column:
+// split shares tile [0, V) exactly once, replicated ranks each cover it.
+struct HeadColumns {
+    bool split = false;
+    std::vector<Segment> cols;  // per rank: [global, global + count) columns
+};
+[[nodiscard]] inline HeadColumns head_columns(bool splittable, std::uint32_t vocab, std::span<const double> rates,
+                                              std::uint32_t unit = 64U) {
+    if (vocab == 0U || unit == 0U || rates.empty()) throw std::invalid_argument("tp: head needs a vocabulary, a unit and ranks");
+    HeadColumns h;
+    h.split = splittable && vocab % unit == 0U;
+    if (!h.split) {
+        h.cols.assign(rates.size(), Segment{0U, vocab});
+        return h;
+    }
+    for (const auto& s : split_units(vocab / unit, rates)) h.cols.push_back({s.begin * unit, s.size() * unit});
+    return h;
+}
+
 // local position -> global element (gather of a replicated full row into the compact local order).
 [[nodiscard]] inline std::vector<std::int32_t> select_map(std::span<const Segment> s) {
     std::vector<std::int32_t> out;

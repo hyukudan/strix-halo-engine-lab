@@ -7,6 +7,7 @@
 //     of per-part picks with `beats` for random partitions, rows with ties, -inf and NaN, and the empty-row sentinel.
 //   - FP16 gathers: per-rank conversion + join into the prepare placement == prepare of the joined row; sweep offsets;
 //   - split draft head: per-share picks over the live subset columns fold to the one-rank subset pick.
+//   - head columns: split / replicated vocabulary head coverage of [0, V) for every format, V and rates.
 #include "strix/pair/tp_layout.hpp"
 
 #include "core/iu4_x_pairs.hpp"
@@ -18,6 +19,7 @@
 #include <cstring>
 #include <limits>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -241,9 +243,42 @@ void test_draft_split() {
     }
 }
 
+// The vocabulary head: whatever the format / V / rates, the columns the ranks compute cover [0, V): split shares tile it
+// exactly once in 64-column blocks, a head that cannot split (non-IU4, V % 64 != 0) is replicated with [0, V) per rank.
+// (Regression: a non-splittable head used to get a one-unit split = 64 columns on rank 0 and none on rank 1.)
+void test_head_columns() {
+    const std::vector<std::vector<double>> rate_sets{{200.0, 200.0}, {300.0, 100.0}, {1.0, 2.0, 3.0}, {5.0}};
+    const std::uint32_t vocabs[] = {248320U, 248321U, 248383U, 64U, 128U, 151936U};
+    for (const auto& rates : rate_sets)
+        for (const std::uint32_t V : vocabs)
+            for (const bool splittable : {true, false}) {
+                const auto h = tp::head_columns(splittable, V, rates);
+                check(h.split == (splittable && V % 64U == 0U), "split exactly when the format allows it and V % 64 == 0");
+                check(h.cols.size() == rates.size(), "one column range per rank");
+                std::vector<unsigned> cover(V, 0U);
+                for (const auto& c : h.cols) {
+                    check(std::uint64_t(c.global) + c.count <= V, "range inside the vocabulary");
+                    if (h.split) check(c.global % 64U == 0U && c.count % 64U == 0U, "split ranges are whole 64-column blocks");
+                    for (std::uint32_t i = 0; i < c.count && c.global + i < V; ++i) ++cover[c.global + i];
+                }
+                const unsigned want = h.split ? 1U : unsigned(rates.size());
+                bool all = true;
+                for (const unsigned k : cover) all = all && k == want;
+                check(all, h.split ? "split head: every column on exactly one rank" : "replicated head: every column on every rank");
+            }
+    bool threw = false;
+    try {
+        (void)tp::head_columns(true, 0U, rate_sets[0]);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    check(threw, "empty vocabulary refused");
+}
+
 }  // namespace
 
 int main() {
+    test_head_columns();
     test_mod_heads();
     test_join();
     test_sweep_offsets();
