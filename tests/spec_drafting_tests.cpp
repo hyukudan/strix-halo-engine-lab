@@ -996,7 +996,8 @@ void context_gate_tests() {
     //    positions. A 4-5K run (prompt about 3.5-3.65K + 1,200 tokens, where the limit 2 lost on code) decides exactly as
     //    off on every pass; the 6.6K and 28K runs decide exactly as under the limit 2 (their receipts stand).
     {
-        const double def = sp::ArbiterConfig{}.cost_fit_condition;
+        sp::ArbiterConfig defaults;  // not const: the check reads the shipped default at run time
+        const double def = defaults.cost_fit_condition;
         SP_CHECK(def == 1.5, "default cost_fit_condition %.2f, want 1.5", def);
         auto a = seeded_arbiter("online", def);
         for (const std::uint64_t l : {4096ULL, 4847ULL, 6143ULL}) SP_CHECK(!a.kv_identified(l), "limit 1.5: identified at %llu", (unsigned long long)l);
