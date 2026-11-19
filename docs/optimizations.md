@@ -5032,23 +5032,6 @@ the longest cached prefix of its token ids and prefills only the rest.
 - **Measured gain:** No throughput figure published yet. Follow-up agent turns report 48,128-49,664 restored tokens in `cached_tokens`.
 - **Implementation / evidence:** [Qwen RTX serve guide](models/qwen3.8/rtx-serve.md#prompt-prefix-cache), [cache](../apps/cuda_qwen_prefix_cache.hpp)
 
-<a id="qwen-rtx-expert-decode-tile"></a>
-
-### Tensor-core expert decode tile form
-
-**Engine:** `qwen-rtx`. **Control:** `--expert-decode-tile`, `STRIX_QRTX_EXPERT_DECODE_TILE` (lever row `expert_decode_tile`). **Default:** ON.
-
-A row routes to an expert at most once, so a step of at most 16 rows gives every expert tile at most one m16 block.
-Those launches of the tensor-core GSQ expert kernels bind one accumulator block instead of four. The freed registers
-hold a three-group ring of weight fields in flight, where the tile form keeps a one-group lookahead.
-
-- **Preconditions:** CUDA Qwen MoE with `gsq_bf16_mma` experts (the FAST expert arithmetic); steps of at most 16 rows (decode, MTP verify windows, and a prefill block of at most 16 rows: a short prompt or a tail block). Prefill blocks of more than 16 rows keep the tile form; the exact profile runs no tensor-core experts.
-- **Automatic selection:** On in every profile (an absent lever row = on); the launch picks the form from the step's row count. A wider tile under the decode form fails closed.
-- **Exactness evidence:** Same MMAs and scale FMAs in the same order for every output (bitwise the tile form). The tile form compiles to the previous instructions for every type except the IQ2_S project kernel (schedule only, same floating-point opcode multiset). Greedy ids equal on prose, edit and json; teacher-forced FAST logits of the decode form identical to the tile form (`--expert-decode-tile off`) on 645 rows of five contents (prose, edit, json, code, an 8K prompt). Contract and bundle id unchanged; `qwen_cuda_profile_host_test` checks the switch, serve == CLI and the unchanged id.
-- **Off switch:** `--expert-decode-tile off`; `STRIX_QRTX_EXPERT_DECODE_TILE=0`
-- **Measured gain:** RTX PRO 6000 600 W, FAST served decode e2e: prose 127.22 -> 137.6 / 138.98, edit 342.37 -> 380.98 / 378.97, json 287.14 -> 316.32 / 317.26 tok/s (one run before, two runs after).
-- **Implementation / evidence:** [kernels](../src/cuda/core/moe_a8_mma.cuh), [form constants](../src/cuda/core/native_mma.hpp), [lever row](../include/strix/profiles/qwen_cuda.hpp)
-
 <a id="qwen-rtx-expert-wide-tile"></a>
 
 ### Tensor-core expert wide tile form (128 rows)
@@ -5067,6 +5050,23 @@ bytes per row and warps per SM do not change. N is a planner parameter per devic
 - **Off switch:** `--expert-wide-tile off`; `STRIX_QRTX_EXPERT_WIDE_TILE=0` (the default).
 - **Measured gain:** Not yet measured.
 - **Implementation / evidence:** [kernels](../src/cuda/core/moe_a8_mma.cuh), [form contract and launch rule](../src/cuda/core/native_mma.hpp), [lever row](../include/strix/profiles/qwen_cuda.hpp), [bench](../tests/cuda/qwen_moe_tile_bench.cu)
+
+<a id="qwen-rtx-expert-decode-tile"></a>
+
+### Tensor-core expert decode tile form
+
+**Engine:** `qwen-rtx`. **Control:** `--expert-decode-tile`, `STRIX_QRTX_EXPERT_DECODE_TILE` (lever row `expert_decode_tile`). **Default:** ON.
+
+A row routes to an expert at most once, so a step of at most 16 rows gives every expert tile at most one m16 block.
+Those launches of the tensor-core GSQ expert kernels bind one accumulator block instead of four. The freed registers
+hold a three-group ring of weight fields in flight, where the tile form keeps a one-group lookahead.
+
+- **Preconditions:** CUDA Qwen MoE with `gsq_bf16_mma` experts (the FAST expert arithmetic); steps of at most 16 rows (decode, MTP verify windows, and a prefill block of at most 16 rows: a short prompt or a tail block). Prefill blocks of more than 16 rows keep the tile form; the exact profile runs no tensor-core experts.
+- **Automatic selection:** On in every profile (an absent lever row = on); the launch picks the form from the step's row count. A wider tile under the decode form fails closed.
+- **Exactness evidence:** Same MMAs and scale FMAs in the same order for every output (bitwise the tile form). The tile form compiles to the previous instructions for every type except the IQ2_S project kernel (schedule only, same floating-point opcode multiset). Greedy ids equal on prose, edit and json; teacher-forced FAST logits of the decode form identical to the tile form (`--expert-decode-tile off`) on 645 rows of five contents (prose, edit, json, code, an 8K prompt). Contract and bundle id unchanged; `qwen_cuda_profile_host_test` checks the switch, serve == CLI and the unchanged id.
+- **Off switch:** `--expert-decode-tile off`; `STRIX_QRTX_EXPERT_DECODE_TILE=0`
+- **Measured gain:** RTX PRO 6000 600 W, FAST served decode e2e: prose 127.22 -> 137.6 / 138.98, edit 342.37 -> 380.98 / 378.97, json 287.14 -> 316.32 / 317.26 tok/s (one run before, two runs after).
+- **Implementation / evidence:** [kernels](../src/cuda/core/moe_a8_mma.cuh), [form constants](../src/cuda/core/native_mma.hpp), [lever row](../include/strix/profiles/qwen_cuda.hpp)
 
 <a id="qwen-dense-cuda-profile"></a>
 

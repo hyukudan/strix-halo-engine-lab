@@ -3020,6 +3020,16 @@
   },
   {
     "engine": "qwen-rtx",
+    "name": "Tensor-core expert wide tile form (128 rows)",
+    "flag_or_env": "--expert-wide-tile on|off|N; STRIX_QRTX_EXPERT_WIDE_TILE (lever row expert_wide_tile)",
+    "default": "off (opt-in until its timing receipt); N = minimum average rows per expert of a launch (planner parameter from the device's no-model tile bench, TILEWIDE line); on = builtin 128 (provisional)",
+    "exact": "Exact schedule trait: a wide tile is two consecutive 64-row tiles, same m16 position per row, same MMA and scale-FMA sequence per output: bitwise the tile form (host test; device hash comparison in the bench). Contract and bundle id unchanged.",
+    "gain": "Not yet measured.",
+    "preconditions": "CUDA Qwen MoE with gsq_bf16_mma experts; prefill launches above 16 rows.",
+    "off_switch": "--expert-wide-tile off; STRIX_QRTX_EXPERT_WIDE_TILE=0",
+    "doc_anchor": "docs/optimizations.md#qwen-rtx-expert-wide-tile"
+  },  {
+    "engine": "qwen-rtx",
     "name": "Tensor-core expert decode tile form",
     "flag_or_env": "--expert-decode-tile; STRIX_QRTX_EXPERT_DECODE_TILE (lever row expert_decode_tile)",
     "default": "ON in every profile; acts only where the tensor-core GSQ experts run (gsq_bf16_mma: the FAST expert arithmetic)",
@@ -3029,17 +3039,7 @@
     "off_switch": "--expert-decode-tile off; STRIX_QRTX_EXPERT_DECODE_TILE=0",
     "doc_anchor": "docs/optimizations.md#qwen-rtx-expert-decode-tile"
   },
-  {
-    "engine": "qwen-rtx",
-    "name": "Tensor-core expert wide tile form (128 rows)",
-    "flag_or_env": "--expert-wide-tile on|off|N; STRIX_QRTX_EXPERT_WIDE_TILE (lever row expert_wide_tile)",
-    "default": "off (opt-in until its timing receipt); N = minimum average rows per expert of a launch (planner parameter from the device's no-model tile bench, TILEWIDE line); on = builtin 128 (provisional)",
-    "exact": "Exact schedule trait: a wide tile is two consecutive 64-row tiles, same m16 position per row, same MMA and scale-FMA sequence per output: bitwise the tile form (host test; device hash comparison in the bench). Contract and bundle id unchanged.",
-    "gain": "Not yet measured.",
-    "preconditions": "CUDA Qwen MoE with gsq_bf16_mma experts; prefill launches above 16 rows.",
-    "off_switch": "--expert-wide-tile off; STRIX_QRTX_EXPERT_WIDE_TILE=0",
-    "doc_anchor": "docs/optimizations.md#qwen-rtx-expert-wide-tile"
-  },
+
   {
     "engine": "qwen",
     "name": "Exact BF16 router weights",
