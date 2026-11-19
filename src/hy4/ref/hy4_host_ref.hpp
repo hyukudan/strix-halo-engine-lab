@@ -45,6 +45,11 @@ struct Config {
     std::vector<std::uint64_t> head_sizes;     // [engram layer][head] prime moduli
     std::vector<std::int32_t> token_map;
     std::uint32_t pad_token = 120002;
+    // Next-token (MTP) block after the text layers (GGUF nextn_predict_layers; block id `layers`): 0 = none. Its
+    // attention form: `nextn_heads` heads, indexed (DSA) when the block carries the indexer tensors (the pack's
+    // attention.indexer.types array covers the text layers only).
+    std::uint32_t nextn = 0, nextn_heads = 0;
+    std::uint8_t nextn_indexed = 1;
 
     [[nodiscard]] std::uint32_t engram_heads() const { return (ngram - 1U) * heads_per_ngram; }
     [[nodiscard]] std::uint32_t qk_head() const { return qk_nope + qk_rope; }
@@ -111,6 +116,25 @@ public:
     [[nodiscard]] const std::vector<float>& latent_row(std::uint32_t layer, std::uint32_t position) const;
     // The last step's hc_head output (the one stream before output_norm) or, when `normed`, the output_norm output.
     [[nodiscard]] const std::vector<float>& last_hidden(bool normed) const;
+
+    // Next-token (MTP) block (Config::nextn == 1, GGUF block `layers`), the drafter the pack ships:
+    //   x = eh_proj(cat(enorm(e(token)), hnorm(h)))           (e = token_embd row, BF16 values)
+    //   x = x + attn(attn_norm(x)); x = x + ffn(ffn_norm(x))   (one residual stream: the block has no hc_* tensors;
+    //                                                           the same attention / MoE arithmetic as a text layer)
+    //   logits = output(shared_head_norm(x))                   (the shared output head)
+    // at `position` with its own K/V (positions 0 .. position-1 must be cached: by earlier steps of this block).
+    // `h` is the hidden the caller chooses (the target's last_hidden at position, or this block's previous `hidden`
+    // when chaining drafts). The step never touches the text layers' state.
+    struct NextnStep {
+        std::vector<float> logits;
+        std::vector<float> hidden;  // x before shared_head_norm
+        std::vector<float> normed;  // shared_head_norm(x): the head's input
+        std::uint32_t argmax = 0;   // lower index on ties
+    };
+    [[nodiscard]] NextnStep nextn_step(std::uint32_t token, const std::vector<float>& h, std::uint32_t position);
+    // Drops the block's cached positions >= `positions` (rollback of rejected drafts).
+    void nextn_truncate(std::uint32_t positions);
+    [[nodiscard]] std::uint32_t nextn_positions() const noexcept;
 
 private:
     struct State;
