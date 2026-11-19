@@ -109,6 +109,8 @@ public:
     Chain& make_chain() { return *chain_; }
     [[nodiscard]] std::uint64_t chain_calls() const { return chain_ ? chain_->calls() : 0; }
     [[nodiscard]] std::uint64_t chain_rows() const { return chain_ ? chain_->rows() : 0; }
+    // K/V-only catch-up chunks (MtpChain::kv_calls, not in chain_calls): full catch-up calls == chain_calls + chain_kv_calls
+    [[nodiscard]] std::uint64_t chain_kv_calls() const { return chain_ ? chain_->kv_calls() : 0; }
     // New sequence: the engine is reset by the caller; forget the MTP positions.
     void reset() {
         if (chain_) chain_->reset();

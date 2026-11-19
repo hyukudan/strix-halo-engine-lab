@@ -516,7 +516,7 @@ int main(int argc, char** argv) {
                 // lookup, bookkeeping, launch gaps between them). Model passes by drafted depth k.
                 double sum_verify = 0, sum_draft = 0;
                 std::vector<std::uint64_t> k_hist(33, 0);
-                const auto calls0 = S.chain_calls(), rows0 = S.chain_rows();
+                const auto calls0 = S.chain_calls(), rows0 = S.chain_rows(), kv0 = S.chain_kv_calls();
                 const double t0 = now_ms();
                 while (out.size() < n_gen) {
                     sp::StepParams p;
@@ -559,13 +559,13 @@ int main(int argc, char** argv) {
                 const double mean_e = per_step.empty() ? 0.0 : double(out.size() - 1) / double(per_step.size());
                 const auto& st = drafter.stats();
                 std::printf("spec[%s]: %zu tokens, %zu steps (serial %llu copy %llu chain %llu), E mean %.2f p50 %.0f p90 %.0f, avg %.2f tok/s (%.3f ms/step), "
-                            "best-1s %.2f tok/s, hybrid blocks %llu (ext %llu/%llu), mtp calls %llu rows %llu\n",
+                            "best-1s %.2f tok/s, hybrid blocks %llu (ext %llu/%llu), mtp calls %llu rows %llu kv-only calls %llu\n",
                             tag.c_str(), out.size(), per_step.size(), (unsigned long long)by_source[0], (unsigned long long)by_source[1],
                             (unsigned long long)by_source[2], mean_e, quantile(per_step, 0.5), quantile(per_step, 0.9),
                             1000.0 * double(out.size() - 1) / wall, wall / double(std::max<std::size_t>(per_step.size(), 1)), best,
                             (unsigned long long)drafter.hybrid_blocks, (unsigned long long)drafter.hybrid_ext_accepted,
                             (unsigned long long)drafter.hybrid_ext_proposed, (unsigned long long)(S.chain_calls() - calls0),
-                            (unsigned long long)(S.chain_rows() - rows0));
+                            (unsigned long long)(S.chain_rows() - rows0), (unsigned long long)(S.chain_kv_calls() - kv0));
                 const double steps_n = double(std::max<std::size_t>(per_step.size(), 1));
                 std::string hist;
                 for (std::size_t k = 1; k < k_hist.size(); ++k)

@@ -175,7 +175,8 @@ struct FeedResult {
     std::vector<KvWrite> writes;
     std::vector<std::pair<unsigned, unsigned>> full_calls;
     std::vector<std::uint32_t> drafts;
-    std::uint64_t rows = 0, kv_calls = 0;
+    std::uint64_t rows = 0, kv_calls = 0, calls = 0;
+    std::uint64_t calls0 = 0, kv0 = 0, rows0 = 0;  // after the prompt, before the first draft (the exe's spec[] snapshot)
 };
 // P prompt rows fed as windows of `win` rows (win = 0: one observe_prefill of all rows = prefill_big), then a draft of 4,
 // one accept of 3 rows and a second draft (decode catch-up after the prompt).
@@ -204,6 +205,9 @@ FeedResult feed(unsigned P, unsigned win, bool kv) {
         }
     }
     FeedResult res;
+    res.calls0 = chain.calls();
+    res.kv0 = chain.kv_calls();
+    res.rows0 = chain.rows();
     std::vector<std::uint32_t> out;
     chain.draft({}, 4, out);
     res.drafts = out;
@@ -219,6 +223,7 @@ FeedResult feed(unsigned P, unsigned win, bool kv) {
     res.full_calls = e.full_calls;
     res.rows = chain.rows();
     res.kv_calls = chain.kv_calls();
+    res.calls = chain.calls();
     return res;
 }
 // The K/V each position ends with = its LAST write (chain steps write speculative rows that a later flush overwrites).
@@ -334,6 +339,16 @@ int main() {
         MC_CHECK(final_kv(kw.writes) == kvw && kw.drafts == a.drafts, "kv catch-up (windows) changed the K/V or the drafts");
         MC_CHECK(k.rows == a.rows && k.kv_calls > 0, "kv catch-up rows %llu vs %llu, kv calls %llu", (unsigned long long)k.rows,
                  (unsigned long long)a.rows, (unsigned long long)k.kv_calls);
+        // counter split (kitfix 11-19, device d0): calls() counts full mtp_forward calls only; a K/V-only chunk counts in
+        // kv_calls(). Full catch-up calls == kv run calls + kv-only calls, in total and in the decode window after the prompt
+        // (the first draft flushes the residual ring: its non-final chunks are K/V-only), with the same rows.
+        MC_CHECK(a.kv_calls == 0 && k.calls + k.kv_calls == a.calls && kw.calls + kw.kv_calls == a.calls,
+                 "counter split: full %llu vs kv %llu + kv-only %llu", (unsigned long long)a.calls, (unsigned long long)k.calls,
+                 (unsigned long long)k.kv_calls);
+        MC_CHECK((k.calls - k.calls0) + (k.kv_calls - k.kv0) == a.calls - a.calls0 && k.rows - k.rows0 == a.rows - a.rows0 &&
+                     k.kv_calls - k.kv0 > 0,
+                 "decode window: full %llu vs kv %llu + kv-only %llu", (unsigned long long)(a.calls - a.calls0),
+                 (unsigned long long)(k.calls - k.calls0), (unsigned long long)(k.kv_calls - k.kv0));
         unsigned prompt_full = 0;  // full calls that cover prompt rows: only the final chunk of the first draft's flush
         for (const auto& fc : k.full_calls) prompt_full += fc.first < P ? 1U : 0U;
         MC_CHECK(prompt_full == 1, "kv catch-up: %u full calls over the prompt (want 1)", prompt_full);
