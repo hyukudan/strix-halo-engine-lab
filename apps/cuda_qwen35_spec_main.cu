@@ -127,6 +127,7 @@ int main(int argc, char** argv) {
         std::uint32_t idle_ms = 0;  // host sleep (GPU idle) before every spec run: thermal gaps inside one ticket
         bool cost_table = false, check = true, graphs = true, seed_costs = true, turbo_lm_head = true, pdl = false;
         bool pf_large = false, kv_catchup = false;  // --prefill-route large, --mtp-catchup kv (both off until measured)
+        std::uint32_t pf_chunk = 0;                 // --prefill-chunk N (large route; 0 = EngineOptions default)
         q::TurboWeights turbo = q::TurboWeights::off;
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
@@ -177,6 +178,7 @@ int main(int argc, char** argv) {
             else if (a == "--prefill-arith") lever_cli.emplace_back("prefill_arith", next());  // large route only (resolver)
             else if (a == "--prefill-gdn") lever_cli.emplace_back("prefill_gdn", next());
             else if (a == "--prefill-attn8") lever_cli.emplace_back("prefill_attn8", next());
+            else if (a == "--prefill-chunk") pf_chunk = strix::core::parse_u32(next());  // as the decode CLI (rows per chunk)
             // MTP catch-up of rows nobody reads the output of: full (incumbent calls) | kv (K/V-only rows, same K/V bits;
             // strix/spec/mtp_chain.hpp MtpKvEngine)
             else if (a == "--mtp-catchup") {
@@ -248,6 +250,10 @@ int main(int argc, char** argv) {
         opt.turbo_weights = turbo;
         opt.turbo_lm_head = turbo_lm_head;
         opt.pdl = pdl;
+        if (pf_chunk != 0) {
+            if (!pf_large) throw std::invalid_argument("--prefill-chunk needs --prefill-route large");
+            opt.prefill_chunk = pf_chunk;
+        }
         // The decode CLI's resolver on the windows route: SpecEngine prefills through forward_rows windows (cuda_spec.hpp
         // prefill), so only the levers of that path are offered (split_k); prefill_arith stays exact. EXACT touches nothing.
         namespace qp = strix::qwen35::profile;
