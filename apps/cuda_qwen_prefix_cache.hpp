@@ -17,6 +17,9 @@ struct Settings {
     bool enabled = true;
     std::uint32_t block = 256;
     std::uint64_t stride = 16384;
+    // Root mark: also checkpoint at the last block boundary inside the request's system + tools prefix
+    // (GenerationJob::stable_prefix), so other conversations with that prefix resume there. Off until measured.
+    bool root = false;
     std::uint64_t host_bytes = default_host_budget(), vram_bytes = 0;
 };
 
@@ -66,13 +69,16 @@ public:
         }
         std::cerr << "strix-cuda-qwen-serve: prefix cache " << (settings_.enabled ? "on" : "off")
                   << ", host " << settings_.host_bytes / 1048576 << " MiB, VRAM " << settings_.vram_bytes / 1048576
-                  << " MiB, block " << settings_.block << ", stride " << settings_.stride << std::endl;
+                  << " MiB, block " << settings_.block << ", stride " << settings_.stride
+                  << ", root " << (settings_.root ? "on" : "off") << std::endl;
     }
 
     bool enabled() const { return bool(store_); }
 
-    std::vector<std::uint64_t> plan(std::uint64_t n, std::uint64_t restored) const {
-        return enabled() ? capture_points(n, settings_.block, restored, settings_.stride) : std::vector<std::uint64_t>{};
+    // stable_prefix: the request's system + tools prefix in tokens (0: none); used only with the root mark on.
+    std::vector<std::uint64_t> plan(std::uint64_t n, std::uint64_t restored, std::uint64_t stable_prefix = 0) const {
+        return enabled() ? capture_points(n, settings_.block, restored, settings_.stride, settings_.root ? stable_prefix : 0)
+                         : std::vector<std::uint64_t>{};
     }
 
     std::uint64_t restore(qwen_prefill::Prefill& engine, qwen_prefill::SessionId session,

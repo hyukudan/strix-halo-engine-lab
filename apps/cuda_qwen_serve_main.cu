@@ -10,7 +10,7 @@
 //       [--mtp-depth 7] [--min-p 0.7] [--max-queue 64] [--http-slots 4] [--prefill-chunk 1024|auto] [--prefill-overlap-rows 1024]
 //       [--admit-grace-ms 2] [--cohort-depth fair|max] [--slot-margin-mib 2048] [--block-rows N] [--mtp-defer-prompt on|off]
 //       [--expert-residency auto|full|tiered] [--vram-budget-gib N] [--print-effective-config]
-//       [--prefix-cache on|off] [--prefix-cache-block 256] [--prefix-cache-stride 16384]
+//       [--prefix-cache on|off] [--prefix-cache-block 256] [--prefix-cache-stride 16384] [--prefix-cache-root on|off]
 //       [--prefix-cache-host-mb N] [--prefix-cache-vram-mb 0]
 // Context cap: --max-positions P is the largest session (KV/index/pooled + MTP cache, 31,616 B per position + 233 MB).
 // Each request reserves its own session: prompt + max_tokens + 16 positions, rounded to --session-granule (256), capped
@@ -147,6 +147,11 @@ Options parse(int argc, char** argv) {
         }
         else if (a == "--prefix-cache-block") o.prefix.block = cache_count();
         else if (a == "--prefix-cache-stride") o.prefix.stride = cache_count();
+        else if (a == "--prefix-cache-root") {
+            const auto value = next();
+            if (value != "on" && value != "off") throw std::invalid_argument("--prefix-cache-root is on or off");
+            o.prefix.root = value == "on";
+        }
         else if (a == "--prefix-cache-host-mb") o.prefix.host_bytes = mib();
         else if (a == "--prefix-cache-vram-mb") o.prefix.vram_bytes = mib();
         else if (a == "--bind") o.bind = next();
@@ -250,7 +255,7 @@ public:
         else {
             auto prefilled = cache_.restore(e_, 0, job.prompt, prefix_restore_ms);
             st.cached_tokens = prefilled;
-            const auto points = cache_.plan(n, prefilled);
+            const auto points = cache_.plan(n, prefilled, job.stable_prefix);
             while (prefilled < n - 1) {
                 const auto rows = px::clip_chunk(prefilled, UINT32_MAX, points);
                 prefilled = e_.prefill_chunk(0, job.prompt, n - 1, prefilled, rows);
@@ -657,7 +662,7 @@ private:
         }
         s.prefilled = cache_.restore(e_, s.session, job.prompt, s.prefix_restore_ms);
         s.st.cached_tokens = s.prefilled;
-        s.capture_points = cache_.plan(s.n, s.prefilled);
+        s.capture_points = cache_.plan(s.n, s.prefilled, job.stable_prefix);
         if (job.on_progress) job.on_progress({serve::GenerationPhase::prefill, s.prefilled, 0, s.n});
     }
 
