@@ -3224,7 +3224,7 @@ int main() { return 0; }"
         target_include_directories(strix_qwen35_hip_engine PRIVATE src)  # attn_core headers include "attn_core/..."
         add_executable(strix-hip-qwen35-decode apps/hip_qwen35_decode_main.hip)
         set_target_properties(strix-hip-qwen35-decode PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-        target_link_libraries(strix-hip-qwen35-decode PRIVATE strix_qwen35_hip_engine strix_spec)
+        target_link_libraries(strix-hip-qwen35-decode PRIVATE strix_qwen35_hip_engine strix_spec strix_dist)  # strix_dist: --tp-rank
         # N-rank layer split over the topology declaration + shared planner + shared layer pipeline (one rank = the
         # decode app's path); --self-cut runs the one-process cut test of the engine's range hooks.
         add_executable(strix-hip-qwen35-pair apps/hip_qwen35_pair_main.hip)
@@ -6314,6 +6314,19 @@ if(BUILD_TESTING)
     target_compile_features(strix-pair-column-split-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-pair-column-split-tests)
     add_test(NAME strix-pair-column-split-tests COMMAND strix-pair-column-split-tests)
+    # One stage description, per-regime split plan (strix/pair/split_plan.hpp): dense binding == its hand model,
+    # slot joins bitwise == one rank, regime -> form, bit-changing joins refused.
+    add_executable(strix-pair-split-plan-tests tests/pair_split_plan_tests.cpp)
+    target_include_directories(strix-pair-split-plan-tests PRIVATE include)
+    target_compile_features(strix-pair-split-plan-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-pair-split-plan-tests)
+    add_test(NAME strix-pair-split-plan-tests COMMAND strix-pair-split-plan-tests)
+    # Rank-local head layouts + all-gather join + split argmax (strix/pair/tp_layout.hpp): joined == one rank.
+    add_executable(strix-pair-tp-layout-tests tests/pair_tp_layout_tests.cpp)
+    target_include_directories(strix-pair-tp-layout-tests PRIVATE include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_features(strix-pair-tp-layout-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-pair-tp-layout-tests)
+    add_test(NAME strix-pair-tp-layout-tests COMMAND strix-pair-tp-layout-tests)
     add_executable(strix-qwen-chain-plan apps/qwen_chain_plan_main.cpp)
     target_include_directories(strix-qwen-chain-plan PRIVATE include)
     target_compile_features(strix-qwen-chain-plan PRIVATE cxx_std_20)

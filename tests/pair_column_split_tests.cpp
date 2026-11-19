@@ -7,6 +7,7 @@
 //   - estimate: one rank alone == group of one; the group wins only when the link term is below the saved compute.
 #include "strix/pair/column_split.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -120,12 +121,63 @@ void test_estimate() {
     std::printf("estimate: one %.1f ms, two ranks %.1f ms (compute %.1f + link %.1f) at 31 us/trip, %.1f ms at 200 us/trip\n",
                 fast.one_rank_ms, fast.group_ms, fast.compute_ms, fast.link_ms, slow.group_ms);
 }
+
+// 3 and 4 synthetic ranks of unequal speed (host only: two nodes exist and they measure the same rate).
+// Shares follow the rates (each within one unit of its exact quota), so the rank times are balanced to within one unit
+// of the slowest rank and never worse than an equal split; choose_ranks keeps the fastest ranks and drops a rank whose
+// replicated work costs more than its share saves.
+void test_unequal_ranks() {
+    const std::vector<std::vector<double>> sets{{1.0, 0.6, 1.4}, {1.0, 0.5, 1.2, 0.8}, {0.7, 0.7, 1.3}};
+    for (const auto& rel : sets) {
+        std::vector<double> rates;
+        double sum = 0.0, slowest = 1e30;
+        for (const double x : rel) {
+            rates.push_back(190e6 * x);
+            sum += 190e6 * x;
+            slowest = std::min(slowest, 190e6 * x);
+        }
+        for (const std::uint32_t units : {80U, 272U, 3880U}) {
+            const auto s = tp::split_units(units, rates);
+            check(s.size() == rates.size() && s.front().begin == 0U && s.back().end == units, "N-rank shares cover the units");
+            double tmax = 0.0, tmin = 1e30, emax = 0.0;
+            for (std::size_t r = 0; r < s.size(); ++r) {
+                const double quota = units * rates[r] / sum;
+                check(std::fabs(double(s[r].size()) - quota) <= 1.0, "N-rank share within one unit of its quota");
+                const double t = s[r].size() / rates[r];
+                tmax = std::max(tmax, t);
+                tmin = std::min(tmin, t);
+                emax = std::max(emax, (double(units) / double(rates.size())) / rates[r]);
+            }
+            check(tmax - tmin <= 2.0 / slowest + 1e-12, "N-rank times balanced within one unit of the slowest rank");
+            check(tmax <= emax + 1e-12, "rate shares never slower than an equal split");
+        }
+    }
+    tp::StepModel m;
+    m.split_bytes = 13.9e9;
+    m.replicated_bytes = 0.05e9;
+    m.fixed_ms = 1.3;
+    for (int l = 0; l < 64; ++l)
+        for (const double b : {12288.0, 10240.0, 34816.0, 10240.0}) m.trips.push_back({b});
+    const tp::TripCost link{0.039, 2.7e6};
+    const double even3[3] = {181e6, 190e6, 200e6};
+    const auto a = tp::choose_ranks(m, even3, 3880U, link);
+    check(a.ranks.size() == 3U && a.ranks[0] == 2U && a.ranks[2] == 0U, "3 similar ranks: all decode, fastest first");
+    check(a.est.group_wins, "3 similar ranks: the group beats the fastest alone");
+    const double one_slow[4] = {190e6, 190e6, 190e6, 3e6};  // a rank 60x slower: its replicated reads cost ~17 ms
+    const auto b = tp::choose_ranks(m, one_slow, 3880U, link);
+    check(b.ranks.size() == 3U && std::find(b.ranks.begin(), b.ranks.end(), 3U) == b.ranks.end(), "4 ranks, one very slow: it is dropped");
+    const auto c = tp::choose_ranks(m, one_slow, 3880U, tp::TripCost{0.4, 2.7e6});
+    check(c.ranks.size() == 1U && c.ranks[0] == 0U, "slow link: the fastest rank decodes alone (first of equal rates)");
+    std::printf("choose_ranks: 3 similar -> %zu ranks %.1f ms (one %.1f); 4 with a slow one -> %zu ranks %.1f ms; slow link -> %zu\n",
+                a.ranks.size(), a.est.group_ms, a.est.one_rank_ms, b.ranks.size(), b.est.group_ms, c.ranks.size());
+}
 }  // namespace
 
 int main() {
     test_split();
     test_join_bitwise();
     test_estimate();
+    test_unequal_ranks();
     std::printf("pair column split tests: %s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

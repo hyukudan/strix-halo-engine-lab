@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "strix/qwen35/config.hpp"
 #include "strix/qwen35/engine_types.hpp"
@@ -159,6 +160,22 @@ public:
     // Timing only: set the committed length to `pos` WITHOUT computing (KV / state keep their contents; positions below pos are
     // whatever the cache holds). Used to sample window cost at long context without running the whole prefill.
     void bench_seek(std::uint32_t pos);
+
+    // Exact tensor-parallel decode over N processes (one per device), each holding the whole model and the same
+    // committed state (a replicated one-rank prefill). From this call on, every window (rows <= max_rows, whole model)
+    // computes only this rank's columns / heads (shares by `rates`, strix/pair/column_split.hpp) and joins the others'
+    // through `gather`: fn(ctx, stream, slots, slot_bytes, bytes), ordered on `stream` after the producers of this
+    // rank's slot (slots + rank * slot_bytes, first `bytes`), must fill the first `bytes` of every other slot with that
+    // rank's and order later work on `stream` after it; every rank makes the same calls in the same order. Ids are the
+    // one-rank ids bit for bit; logits rows are gathered (and bitwise) only with `full_logits`, otherwise logits stay
+    // null and read_top carries the split argmax. The committed state is sliced to this rank's heads (one way).
+    struct TpGather {
+        void* ctx = nullptr;
+        void (*fn)(void* ctx, void* stream, void* slots, std::size_t slot_bytes, std::size_t bytes) = nullptr;
+    };
+    void enable_tp(std::uint32_t rank, const std::vector<double>& rates, TpGather gather, bool full_logits = false);
+    [[nodiscard]] bool tp_on() const;
+    [[nodiscard]] std::string tp_receipt() const;  // shares per tensor class, gathers per token
 
 private:
     HipEngine();
