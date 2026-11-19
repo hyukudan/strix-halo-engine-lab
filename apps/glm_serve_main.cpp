@@ -242,6 +242,11 @@ struct EngineOps {
         spec.at(slot) = {};
     }
     static std::uint64_t prefix_state_bound(std::uint64_t p) { return gs::prefix_snapshot_bound(p); }
+    // Store rule of this rank: MemAvailable covers the snapshot bound and leaves the load admission's RAM margin.
+    std::uint64_t ram_margin = ge::mem::Margins::from_env().ram;
+    bool prefix_store_allowed(std::uint64_t bound) const {
+        return gs::prefix_store_fits(gs::prefix_memory_bytes(), bound, ram_margin);
+    }
     std::vector<std::uint8_t> state_bytes_upto(std::uint32_t slot, std::uint64_t p) {
         return eng.state_bytes_upto(slot, p);
     }
@@ -1260,6 +1265,8 @@ int main(int argc, char** argv) {
         lc.batch = !serial;
         lc.short_first = short_first;
         lc.prefix_cache_bytes = prefix_cache_bytes;
+        lc.host_available = [] { return gs::prefix_memory_bytes(); };  // pressure rule: the store rule's margin
+        lc.host_floor = ops.ram_margin;
         // Reply-end snapshots (opt-in, exactly "1"; plain decode only: refused under MTP). Rank 1 follows the lead.
         lc.prefix_reply_store = strix::envcfg::flag("STRIX_GLM_SERVE_REPLY_KEEP", false, strix::EnvFlagMatch::exact);
         lc.prefix_identity = gs::fnv1a64(&hello.model_hash, sizeof(hello.model_hash), hello.identity_hash);

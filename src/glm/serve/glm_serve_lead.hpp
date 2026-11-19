@@ -91,8 +91,9 @@ struct LeadConfig {
     // prefill-produced one, so with this off every wire byte and every decision is the prompt-end behaviour.
     bool prefix_reply_store = false;
     // MemAvailable probe for the pressure rule (kept entries go before a request is starved); empty: /proc/meminfo.
+    // host_floor: the RAM margin of the store rule (the serve sets the margin it resolved from the environment).
     std::function<std::optional<std::uint64_t>()> host_available;
-    std::uint64_t host_floor = kPrefixMemoryFloor;
+    std::uint64_t host_floor = kPrefixMemoryMargin;
     bool batch = true;               // false: serial admission (one request at a time)
     bool short_first = true;         // admit the shortest waiting prompt first (bounded overtakes); false: FIFO
     double heartbeat_seconds = 1.0;  // idle: one heartbeat round per interval keeps rank 1 and the link alive
@@ -691,18 +692,17 @@ private:
         (void)control_round(ev);
     }
 
-    // Live requests win over kept prefixes: when this rank's MemAvailable is below the floor the store rule needs,
-    // kept entries go (LRU, never a leased one) instead of the request or its snapshot being refused.
+    // Live requests win over kept prefixes: when this rank's MemAvailable is below the RAM margin (the margin the store
+    // rule leaves, prefix_pressure_shortfall), kept entries go (LRU, never a leased one) instead of the request starving.
     void relieve_pressure() {
         if (!prefix_cache_ || prefix_cache_->size() == 0) return;
         std::uint64_t shortfall = 0;
         if (cfg_.host_available) {
-            const auto avail = cfg_.host_available();
-            if (avail && *avail < cfg_.host_floor) shortfall = cfg_.host_floor - *avail;
-        } else if constexpr (requires { eng_.prefix_store_allowed(); }) {
-            if (!eng_.prefix_store_allowed()) shortfall = 1;
-        } else if (const auto avail = prefix_memory_bytes(); avail && *avail < cfg_.host_floor) {
-            shortfall = cfg_.host_floor - *avail;
+            shortfall = prefix_pressure_shortfall(cfg_.host_available(), cfg_.host_floor);
+        } else if constexpr (requires { eng_.prefix_store_allowed(std::uint64_t{0}); }) {
+            if (!eng_.prefix_store_allowed(std::uint64_t{0})) shortfall = 1;
+        } else {
+            shortfall = prefix_pressure_shortfall(prefix_memory_bytes(), cfg_.host_floor);
         }
         if (!shortfall) return;
         for (const auto id : prefix_cache_->reclaim_plan(shortfall)) evict_kept(id, true);

@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "glm/engine/glm_mem.hpp"
 #include "strix/serve/conversation_keep.hpp"
 
 namespace strix::glm::serve {
@@ -27,7 +28,20 @@ inline std::uint64_t prefix_budget_bytes(const std::string& v) {
     if (g > 0 && bytes == 0) throw std::invalid_argument("--prefix-cache-gib: budget below one byte");
     return bytes;
 }
-inline constexpr std::uint64_t kPrefixMemoryFloor = 16ULL * 1024 * 1024 * 1024;  // MemAvailable a snapshot store needs
+// RAM a rank keeps free beside its kept snapshots: the GLM memory model's RAM margin (engine/glm_mem.hpp
+// Margins::ram, the RAM the load admission leaves to the OS, sshd, the peer link and other tenants;
+// STRIX_GLM_MEM_MARGIN_GIB). The serve passes the value it resolved from the environment; this is its default.
+inline constexpr std::uint64_t kPrefixMemoryMargin = strix::glm::engine::mem::Margins{}.ram;
+// Store rule (per rank, before the paired vote): this rank's MemAvailable covers the snapshot bound and still leaves
+// the margin. No reading refuses.
+inline bool prefix_store_fits(std::optional<std::uint64_t> available, std::uint64_t snapshot_bound, std::uint64_t margin) {
+    return available && *available >= snapshot_bound && *available - snapshot_bound >= margin;
+}
+// Pressure rule (lead): the bytes kept entries must release for MemAvailable to be back at the margin (0: none or no
+// reading). A store admitted by prefix_store_fits never puts its rank under pressure by itself.
+inline std::uint64_t prefix_pressure_shortfall(std::optional<std::uint64_t> available, std::uint64_t margin) {
+    return available && *available < margin ? margin - *available : 0;
+}
 // MemAvailable in bytes; nullopt when the line is missing or malformed.
 inline std::optional<std::uint64_t> prefix_memory_bytes(std::istream& f) {
     std::string line;
@@ -41,14 +55,6 @@ inline std::optional<std::uint64_t> prefix_memory_bytes(std::istream& f) {
         catch (...) { return std::nullopt; }
     }
     return std::nullopt;
-}
-inline bool prefix_memory_available(std::istream& f) {
-    const auto b = prefix_memory_bytes(f);
-    return b && *b >= kPrefixMemoryFloor;
-}
-inline bool prefix_memory_available() {
-    std::ifstream f("/proc/meminfo");
-    return prefix_memory_available(f);
 }
 inline std::optional<std::uint64_t> prefix_memory_bytes() {
     std::ifstream f("/proc/meminfo");

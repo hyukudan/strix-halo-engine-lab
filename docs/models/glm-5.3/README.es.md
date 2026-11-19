@@ -120,7 +120,8 @@ y cada uno por separado e informa EXACT/FAIL con tok/s por nivel de concurrencia
 
 `--prefix-cache-gib G` fija la LRU de snapshots de prompts en RAM en G GiB por rango
 (4 por defecto; `--prefix-cache-gib 0` la desactiva; ambos rangos deben usar el mismo presupuesto). Solo se guarda si ambos rangos
-confirman su snapshot y cada uno tiene al menos 16 GiB de MemAvailable; sin lectura de memoria o si
+confirman su snapshot y cada uno tiene MemAvailable para el snapshot más el margen de RAM de la admisión de carga
+(8 GiB, `STRIX_GLM_MEM_MARGIN_GIB`); sin lectura de memoria o si
 el snapshot supera el presupuesto, se rechaza el guardado. Un acierto restaura la clave de prefijo
 estricto más larga y procesa el sufijo con el planificador de chunks habitual. Con MTP, la clave
 incluye el primer token greedy de salida y se restaura en la frontera del prompt original.

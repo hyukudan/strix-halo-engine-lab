@@ -4875,7 +4875,7 @@ token. A request whose prompt extends a stored key restores the longest one and 
 through the usual chunk scheduler. `strix.prefix_cache` reports `hit_tokens`, `prefill_tokens` and `restore_ms`.
 
 - **Preconditions:** `strix-glm5-serve`; the same budget on both ranks (unequal budgets are refused at the handshake).
-- **Automatic selection:** A store commits only when both ranks snapshot the same bytes and each rank has at least 16 GiB MemAvailable; a miss or a refused store prefills the whole prompt.
+- **Automatic selection:** A store commits only when both ranks snapshot the same bytes and each rank's MemAvailable covers the snapshot plus the load admission's RAM margin (8 GiB, STRIX_GLM_MEM_MARGIN_GIB); a miss or a refused store prefills the whole prompt.
 - **Fallback notice:** None.
 - **Exactness evidence:** Turn-2 tokens equal the same request replayed after clearing the cache (8/8 long, 16/16 short prompts), alone and batched, on both ranks; MTP prefix restore equals a cold run (`--selftest N --selftest-prefix`).
 - **Off switch:** --prefix-cache-gib 0

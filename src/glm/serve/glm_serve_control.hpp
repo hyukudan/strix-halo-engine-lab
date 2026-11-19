@@ -405,15 +405,15 @@ std::vector<std::uint32_t> replay(Eng& eng, Channel& ch, const Control& c, std::
             bool keep_counted = false;
             try {
                 if constexpr (requires { eng.state_bytes_upto(c.pslot, c.ppos); eng.prefix_state_bound(c.ppos); }) {
-                    bool available = false;
-                    if constexpr (requires { eng.prefix_store_allowed(); }) available = eng.prefix_store_allowed();
-                    else available = prefix_memory_available();
                     cache->commit(false);
                     const std::uint64_t bound = eng.prefix_state_bound(c.ppos);
+                    bool available = false;  // prefix_store_fits: MemAvailable >= bound + this rank's RAM margin
+                    if constexpr (requires { eng.prefix_store_allowed(bound); }) available = eng.prefix_store_allowed(bound);
+                    else available = prefix_store_fits(prefix_memory_bytes(), bound, kPrefixMemoryMargin);
                     if (!available) {
                         const auto avail = prefix_memory_bytes();
-                        why = "host memory below the store floor (MemAvailable " +
-                              (avail ? std::to_string(*avail >> 20) + " MiB" : std::string("unknown")) + ")";
+                        why = "host memory (MemAvailable " + (avail ? std::to_string(*avail >> 20) + " MiB" : std::string("unknown")) +
+                              " below the snapshot bound " + std::to_string(bound >> 20) + " MiB + the RAM margin)";
                     } else if (!cache->can_stage(bound, prompt.size())) {
                         why = "budget (bound " + std::to_string(bound) + " B, held " + std::to_string(cache->bytes()) + " of " +
                               std::to_string(cache->budget()) + " B)";
