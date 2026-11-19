@@ -2376,16 +2376,17 @@ void Communicator::direct_hint(std::size_t bytes, unsigned rings) {
 
 bool Communicator::transfer(hipStream_t stream, bool sending, void* device, std::size_t bytes, const Tag& tag) {
     if (!device || bytes == 0U) throw std::invalid_argument("dist transfer size or buffer");
-    if (!direct_) return false;
-    const Route& r = route(bytes);
-    if (!r.direct || r.host_percent) return false;
-    // Ask once whether the engine has a one-way form; the probe leaves the next start() symmetric.
-    if (!one_way_probed_) {
-        one_way_ = direct_->use_direction(ExchangeDirection::send);
-        if (one_way_) static_cast<void>(direct_->use_direction(ExchangeDirection::both));
-        one_way_probed_ = true;
+    // Host route: one way on the host transport. Pure device and mixed routes need the engine's one-way form (the mixed
+    // route's head goes one way on the host transport at the same time as its device tail).
+    if (direct_ && route(bytes).direct) {
+        // Ask once whether the engine has a one-way form; the probe leaves the next start() symmetric.
+        if (!one_way_probed_) {
+            one_way_ = direct_->use_direction(ExchangeDirection::send);
+            if (one_way_) static_cast<void>(direct_->use_direction(ExchangeDirection::both));
+            one_way_probed_ = true;
+        }
+        if (!one_way_) return false;
     }
-    if (!one_way_) return false;
     struct Scope {
         ExchangeDirection& value;
         ~Scope() { value = ExchangeDirection::both; }
@@ -2431,9 +2432,12 @@ void Communicator::start(hipStream_t stream, const void* local, std::size_t byte
         direct_started_ = true;
         return;
     }
-    if (bytes == 0U || bytes > max_bytes_ || !local) throw std::invalid_argument("dist exchange size or buffers");
+    if (bytes == 0U || bytes > max_bytes_ || (!local && direction_ != ExchangeDirection::receive))
+        throw std::invalid_argument("dist exchange size or buffers");
     tag_ = tag;
-    if (pipeline_ && bytes > pipeline_->chunk && bytes <= pipeline_->capacity) start_pipeline(stream, local, bytes);
+    // The chunked pipeline is symmetric: a one-way transfer() takes the plain host path.
+    if (direction_ == ExchangeDirection::both && pipeline_ && bytes > pipeline_->chunk && bytes <= pipeline_->capacity)
+        start_pipeline(stream, local, bytes);
     else start_host(stream, local, bytes);
 }
 
@@ -2732,7 +2736,8 @@ void Communicator::start_host(hipStream_t stream, const void* local, std::size_t
     started_ = true;
     started_at_ = entry;
     set_phase(Phase::producer);
-    progress_->worker.post([this] {
+    // A one-way transfer() (host route or the head of a mixed one): the sender only sends, the receiver only receives.
+    progress_->worker.post([this, direction = direction_] {
         // Spin on the copy's event: a blocking synchronize may sleep and add its wake-up to every exchange. Bounded:
         // a producer that never completes stops the communicator (and wakes the peer) instead of hanging both ranks.
         const auto deadline = started_at_ + wait_timeout_;
@@ -2762,15 +2767,14 @@ void Communicator::start_host(hipStream_t stream, const void* local, std::size_t
         std::memcpy(&cmd, send_host_, std::min<std::size_t>(sizeof(cmd), bytes_));
         cmd_out_.store(cmd, std::memory_order_relaxed);
         set_phase(Phase::transfer);
-        Trailer trailer;
-        trailer.epoch = group_.epoch; trailer.plan = group_.plan; trailer.sequence = sequence_; trailer.request = tag_.request;
-        trailer.bytes = bytes_; trailer.rank = group_.rank; trailer.tag = tag_.kind; trailer.layer = tag_.layer;
-        // Every message carries the CRC of this rank's previous deferred one (if any), checked by the peer.
-        trailer.carried_sequence = tx_carry_sequence_;
-        trailer.carried_crc32c = tx_carry_crc_;
-        tx_carry_sequence_ = 0;
-        // Deferred: this message's own CRC is computed while it is on the wire and goes in the next trailer.
+        const bool sends = direction != ExchangeDirection::receive, receives = direction != ExchangeDirection::send;
+        // Deferred: this message's own CRC is computed while it is on the wire and goes in the next trailer (ready views
+        // only, never a one-way transfer).
         const bool defer = deferring_;
+        // Every message carries the CRC of this rank's previous deferred one (if any), checked by the peer. A rank that
+        // only receives sends no trailer and keeps its carry for its next message.
+        Trailer trailer;
+        if (sends) trailer = make_trailer(bytes_, tag_, defer ? trailer_crc_deferred : 0U);
         const std::uint64_t sequence = sequence_;
         const std::span<const std::byte> payload(send_host_, bytes_);
         const std::span<const std::byte> received(receive_host_, bytes_);
@@ -2778,18 +2782,20 @@ void Communicator::start_host(hipStream_t stream, const void* local, std::size_t
             std::span<const std::byte> payload;
             std::uint32_t crc;
         } on_wire{payload, 0U};
-        if (defer) {
-            trailer.flags = trailer_crc_deferred;
-        } else {
+        if (sends && !defer) {
             latency::mark("crc_tx_begin");
             trailer.crc32c = crc32c(payload);
             latency::mark("crc_tx_end");
         }
         if (trace_) trailer.staged_ns = t_staged_ = wall_ns();
-        std::memcpy(send_host_ + bytes_, &trailer, sizeof(trailer));
+        if (sends) std::memcpy(send_host_ + bytes_, &trailer, sizeof(trailer));
         stats_.last_staged = std::chrono::steady_clock::now();
         latency::mark("transport_begin");
-        if (defer)
+        if (!receives)
+            transport_->send(std::span<const std::byte>(send_host_, bytes_ + sizeof(Trailer)));
+        else if (!sends)
+            transport_->receive(std::span<std::byte>(receive_host_, bytes_ + sizeof(Trailer)));
+        else if (defer)
             transport_->exchange_overlapped(std::span<const std::byte>(send_host_, bytes_ + sizeof(Trailer)),
                                             std::span<std::byte>(receive_host_, bytes_ + sizeof(Trailer)),
                                             [](void* context) {
@@ -2813,7 +2819,8 @@ void Communicator::start_host(hipStream_t stream, const void* local, std::size_t
         // The peer's message is checked here, as soon as it is complete: on a mixed route this overlaps the device
         // exchange's part instead of following it in finish(). A mismatch is rethrown by finish().
         // STRIX_DIST_CHECK_ON_CALLER=1: checked by finish() on the caller's thread instead (the earlier placement).
-        if (!check_on_caller()) {
+        // A rank that only sent has no message to check; its pending deferred CRC waits for the next one it receives.
+        if (receives && !check_on_caller()) {
             latency::mark("crc_rx_begin");
             validate_peer(defer);
             latency::mark("crc_rx_end");
@@ -2886,7 +2893,7 @@ void Communicator::finish(hipStream_t stream, void* remote) {
         return;
     }
     if (!started_) throw std::logic_error("dist exchange: finish() without start()");
-    if (!remote) throw std::invalid_argument("dist exchange receive buffer");
+    if (!remote && direction_ != ExchangeDirection::send) throw std::invalid_argument("dist exchange receive buffer");
     finish_host(stream, remote);
 }
 
@@ -2939,23 +2946,44 @@ bool Communicator::check_on_caller() {
 void Communicator::validate_peer(bool deferred) {
     Trailer peer;
     std::memcpy(&peer, receive_host_ + bytes_, sizeof(peer));
+    check_peer_trailer(peer, bytes_, tag_, deferred);
+    if (!deferred && peer.crc32c != crc32c(std::span<const std::byte>(receive_host_, bytes_)))
+        throw std::runtime_error("dist exchange: payload CRC mismatch");
+    peer_staged_ns_ = peer.staged_ns;
+    if (trace_) t_validated_ = wall_ns();
+}
+
+Trailer Communicator::make_trailer(std::size_t bytes, const Tag& tag, std::uint32_t flags) {
+    Trailer trailer;
+    trailer.epoch = group_.epoch; trailer.plan = group_.plan; trailer.sequence = sequence_; trailer.request = tag.request;
+    trailer.bytes = bytes; trailer.rank = group_.rank; trailer.tag = tag.kind; trailer.layer = tag.layer;
+    trailer.carried_sequence = tx_carry_sequence_;
+    trailer.carried_crc32c = tx_carry_crc_;
+    tx_carry_sequence_ = 0;
+    trailer.flags = flags;
+    return trailer;
+}
+
+void Communicator::check_peer_trailer(const Trailer& peer, std::size_t bytes, const Tag& tag, bool deferred) {
     if (peer.magic != trailer_magic || peer.epoch != group_.epoch || peer.plan != group_.plan || peer.sequence != sequence_ ||
-        peer.request != tag_.request || peer.bytes != bytes_ || peer.rank != 1U - group_.rank || peer.tag != tag_.kind ||
-        peer.layer != tag_.layer)
+        peer.request != tag.request || peer.bytes != bytes || peer.rank != 1U - group_.rank || peer.tag != tag.kind ||
+        peer.layer != tag.layer)
         throw std::runtime_error("dist exchange: the peer's trailer does not match this collective");
     // The previous deferred message's CRC (computed here after it was delivered) against the one the peer carries now.
-    if (peer.carried_sequence != rx_pending_sequence_)
+    if (peer.carried_sequence != rx_pending_sequence_) {
+        // A host-control message (exchange_host) carries like any other since the shared trailer: a mismatch there is a
+        // disagreement on the order of collectives, not on STRIX_DIST_CRC_DEFER.
+        const char* const why = (peer.flags & trailer_host_control) != 0U
+            ? "the peer's exchange_host() message; the ranks disagree on the order of collectives"
+            : "STRIX_DIST_CRC_DEFER must match on both ranks, and both ranks need a build whose exchange_host() carries";
         throw std::runtime_error("dist exchange: deferred CRC carry mismatch (peer carries " + std::to_string(peer.carried_sequence) +
-                                 ", expected " + std::to_string(rx_pending_sequence_) + "; STRIX_DIST_CRC_DEFER must match on both ranks)");
+                                 ", expected " + std::to_string(rx_pending_sequence_) + "; " + why + ")");
+    }
     if (rx_pending_sequence_ && peer.carried_crc32c != rx_pending_crc_)
         throw std::runtime_error("dist exchange: payload CRC mismatch (deferred, exchange " + std::to_string(rx_pending_sequence_ - 1U) + ")");
     rx_pending_sequence_ = 0;
     if (((peer.flags & trailer_crc_deferred) != 0U) != deferred)
         throw std::runtime_error("dist exchange: the peer's CRC deferral differs from this rank's (STRIX_DIST_CRC_DEFER must match)");
-    if (!deferred && peer.crc32c != crc32c(std::span<const std::byte>(receive_host_, bytes_)))
-        throw std::runtime_error("dist exchange: payload CRC mismatch");
-    peer_staged_ns_ = peer.staged_ns;
-    if (trace_) t_validated_ = wall_ns();
 }
 
 void Communicator::finish_host(hipStream_t stream, void* remote) {
@@ -2992,9 +3020,9 @@ void Communicator::finish_host(hipStream_t stream, void* remote) {
     set_phase(Phase::idle);
     latency::mark("finish_wait_end");
     const auto received = std::chrono::steady_clock::now();
-    if (check_on_caller()) validate_peer();
+    if (check_on_caller() && direction_ != ExchangeDirection::send) validate_peer();
     const auto bytes = bytes_; // the peer's message was checked (trailer and CRC)
-    if (!staged_started_ && remote) {
+    if (!staged_started_ && remote && direction_ != ExchangeDirection::send) {
         latency::mark("h2d_enqueue_begin");
         check(hipMemcpyAsync(remote, receive_host_, bytes, hipMemcpyHostToDevice, stream), "host to device");
         if (!receive_done_) check(hipEventCreateWithFlags(&receive_done_, hipEventDisableTiming), "receive event");
@@ -3006,13 +3034,13 @@ void Communicator::finish_host(hipStream_t stream, void* remote) {
         if (!h2d_done_) check(hipEventCreate(&h2d_done_), "trace event");
         check(hipEventRecord(h2d_done_, stream), "trace event");
     }
-    if (!staged_started_ && remote) receive_pending_ = true;
+    if (!staged_started_ && remote && direction_ != ExchangeDirection::send) receive_pending_ = true;
     current_.cmd_out = cmd_out_.load(std::memory_order_relaxed);
     current_.cmd_in = cmd_in_.load(std::memory_order_relaxed);
     history_[history_next_++ % history_.size()] = current_;
     ++sequence_;
     ++stats_.exchanges;
-    stats_.bytes_sent += bytes;
+    if (direction_ != ExchangeDirection::receive) stats_.bytes_sent += bytes;
     const auto end = std::chrono::steady_clock::now();
     stats_.stage += std::chrono::duration<double>(stats_.last_staged - started_at_).count();
     stats_.wire += std::chrono::duration<double>(stats_.last_received - stats_.last_staged).count();
@@ -3049,6 +3077,9 @@ void Communicator::exchange_host(std::span<const std::byte> local, std::span<std
         throw std::invalid_argument("dist exchange_host size or buffers");
     const auto entry = std::chrono::steady_clock::now();
     stats_.last_entry = entry;
+    // The previous ready-view exchange's job may still compute its deferred CRCs: the carry state is read below only
+    // after it returned (its staged buffers are not this call's).
+    drain_tail();
     // The receive buffer is reused only after the CPU has seen the previous copy out of it (exchange()'s) complete.
     if (receive_pending_)
         for (hipError_t ready; (ready = hipEventQuery(receive_done_)) != hipSuccess;) {
@@ -3057,9 +3088,8 @@ void Communicator::exchange_host(std::span<const std::byte> local, std::span<std
         }
     receive_pending_ = false;
     std::memcpy(send_host_, local.data(), bytes);
-    Trailer trailer;
-    trailer.epoch = group_.epoch; trailer.plan = group_.plan; trailer.sequence = sequence_; trailer.request = tag.request;
-    trailer.bytes = bytes; trailer.rank = group_.rank; trailer.tag = tag.kind; trailer.layer = tag.layer;
+    // The same trailer as exchange()'s: it carries this rank's pending deferred CRC, and the peer's carry is checked.
+    Trailer trailer = make_trailer(bytes, tag, trailer_host_control);
     trailer.crc32c = crc32c(std::span<const std::byte>(send_host_, bytes));
     std::memcpy(send_host_ + bytes, &trailer, sizeof(trailer));
     // A failed control exchange poisons the communicator (later calls throw "stopped earlier") and wakes the peer.
@@ -3071,9 +3101,7 @@ void Communicator::exchange_host(std::span<const std::byte> local, std::span<std
         stats_.last_received = received;
         Trailer peer;
         std::memcpy(&peer, receive_host_ + bytes, sizeof(peer));
-        if (peer.magic != trailer_magic || peer.epoch != group_.epoch || peer.plan != group_.plan || peer.sequence != sequence_ ||
-            peer.request != tag.request || peer.bytes != bytes || peer.rank != 1U - group_.rank || peer.tag != tag.kind || peer.layer != tag.layer)
-            throw std::runtime_error("dist exchange: the peer's trailer does not match this collective");
+        check_peer_trailer(peer, bytes, tag, false);
         if (peer.crc32c != crc32c(std::span<const std::byte>(receive_host_, bytes)))
             throw std::runtime_error("dist exchange: payload CRC mismatch");
     } catch (const std::exception& e) {

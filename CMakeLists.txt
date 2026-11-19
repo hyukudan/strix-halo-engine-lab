@@ -1525,6 +1525,18 @@ if(BUILD_TESTING)
     target_compile_features(strix-hip-prefill-pool-host-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-hip-prefill-pool-host-tests)
     add_test(NAME strix-hip-prefill-pool-host-tests COMMAND strix-hip-prefill-pool-host-tests)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # dist::Communicator exchange contract on the host (CPU HIP stub, in-process pair): exchange_host/exchange
+        # interchangeable with deferred CRCs, one-way transfer() on every route.
+        add_executable(strix-dist-exchange-contract-tests tests/dist_exchange_contract_tests.cpp src/dist_communicator.cpp
+            src/serve/json.cpp)
+        target_include_directories(strix-dist-exchange-contract-tests PRIVATE tests/stubs/dist_communicator include src)
+        target_link_libraries(strix-dist-exchange-contract-tests PRIVATE Threads::Threads)
+        target_compile_features(strix-dist-exchange-contract-tests PRIVATE cxx_std_20)
+        strix_target_warnings(strix-dist-exchange-contract-tests)
+        add_test(NAME strix-dist-exchange-contract-tests COMMAND strix-dist-exchange-contract-tests)
+        set_tests_properties(strix-dist-exchange-contract-tests PROPERTIES TIMEOUT 120)
+    endif()
     add_executable(strix-hip-prefill-call-shapes-host-tests tests/hip_prefill_call_shapes_host_tests.cpp)
     target_include_directories(strix-hip-prefill-call-shapes-host-tests PRIVATE tests/stubs/hip_prefill_pool src apps)
     target_link_libraries(strix-hip-prefill-call-shapes-host-tests PRIVATE strix_core)
