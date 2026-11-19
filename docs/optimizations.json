@@ -3030,6 +3030,17 @@
     "doc_anchor": "docs/optimizations.md#qwen-rtx-expert-decode-tile"
   },
   {
+    "engine": "qwen-rtx",
+    "name": "TURBO: int8 tensor-core experts on large prefill blocks",
+    "flag_or_env": "--profile turbo; --expert-turbo-rows N; STRIX_QRTX_EXPERT_TURBO_ROWS (lever rows expert_turbo, expert_turbo_rows)",
+    "default": "off (explicit --profile turbo only); N = 512 under turbo",
+    "exact": "TURBO class (bit-changing). 32K logit gate vs the exact reference, 4 prompts x 128 rows: KL 0.00906, top-1 0.9844, dNLL +0.00102 (bar KL <= 0.02, top-1 >= 0.93, dNLL <= 0.01); int8 in every MoE call: KL 0.00948, top-1 0.9785, dNLL +0.00543. Bundle not marked qualified.",
+    "gain": "RTX PRO 6000 600 W, TURBO vs FAST: 8,076-token TTFT -7.2 % cold / -6.7 % warm; 32,652-token prefill -6.4 % cold / -6.6 % warm; decode equal within noise.",
+    "preconditions": "CUDA Qwen MoE (strix-cuda-qwen-serve, qwen_tf_logits); GSQ packs admitted for both arithmetics; prefill blocks of >= N rows run int8, decode / verify windows and smaller blocks the FAST BF16 experts.",
+    "off_switch": "omit --profile turbo; --expert-turbo-rows off = int8 in every MoE call",
+    "doc_anchor": "docs/optimizations.md#qwen-rtx-turbo-experts"
+  },
+  {
     "engine": "qwen",
     "name": "Exact BF16 router weights",
     "flag_or_env": "STRIX_QWEN_ROUTER_BF16",

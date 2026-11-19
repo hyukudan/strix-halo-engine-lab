@@ -423,7 +423,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_MTP_PRIME_ROWS` | qwen | ON (STRIX_MTP_PRIME_ROWS=0: desactivar) | [qwen-mtp-prime-rows](optimizations.md#qwen-mtp-prime-rows) |
 | `STRIX_QSA_MTP_POOL` | qwen | 1 (eligible native MTP CLI, the singl... | [qwen-qsa-mtp-pool](optimizations.md#qwen-qsa-mtp-pool) |
 
-### Exacto frente a FAST (9)
+### Exacto frente a FAST (10)
 
 | Toggle | Motor | Por defecto | Detalles |
 |---|---|---|---|
@@ -434,6 +434,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_GLM_PF_EXACTMOE_V` | glm | auto | [glm-pf-exact-moe-auto](optimizations.md#glm-pf-exact-moe-auto) |
 | `STRIX_GLM_PF_EXACT_X` | glm | auto | [glm-pf-exact-x](optimizations.md#glm-pf-exact-x) |
 | `STRIX_QPF2K_MOE_ROUTE_BF16` | qwen | OFF | [qwen-moe-route-bf16](optimizations.md#qwen-moe-route-bf16) |
+| `STRIX_QRTX_EXPERT_TURBO_ROWS` | qwen-rtx | 512 solo con `--profile turbo` (`off` = int8 en cada llamada MoE) | [qwen-rtx-turbo-experts](optimizations.md#qwen-rtx-turbo-experts) |
 | `STRIX_QSA_DECODE_POOL_BF16` | qwen | 1 (plain append-only serial decode un... | [qwen-qsa-decode-pool](optimizations.md#qwen-qsa-decode-pool) |
 | `STRIX_QWEN_ROUTER_BF16` | qwen | OFF (opt-in: STRIX_QWEN_ROUTER_BF16=1) | [qwen-exact-bf16-router-weights](optimizations.md#qwen-exact-bf16-router-weights) |
 

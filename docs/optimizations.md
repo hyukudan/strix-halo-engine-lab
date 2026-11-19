@@ -5049,6 +5049,23 @@ hold a three-group ring of weight fields in flight, where the tile form keeps a 
 - **Measured gain:** RTX PRO 6000 600 W, FAST served decode e2e: prose 127.22 -> 137.6 / 138.98, edit 342.37 -> 380.98 / 378.97, json 287.14 -> 316.32 / 317.26 tok/s (one run before, two runs after).
 - **Implementation / evidence:** [kernels](../src/cuda/core/moe_a8_mma.cuh), [form constants](../src/cuda/core/native_mma.hpp), [lever row](../include/strix/profiles/qwen_cuda.hpp)
 
+<a id="qwen-rtx-turbo-experts"></a>
+
+### TURBO: int8 tensor-core experts on large prefill blocks
+
+**Engine:** `qwen-rtx`. **Control:** `--profile turbo`; regime `--expert-turbo-rows N`, `STRIX_QRTX_EXPERT_TURBO_ROWS` (lever rows `expert_turbo`, `expert_turbo_rows`). **Default:** off (TURBO is explicit only; `exact`, no profile word and `fast` do not change).
+
+`--profile turbo` runs every FAST lever and adds the int8 tensor-core experts (`gsq-iq-i8mma-turbo-cuda-v1`: A8 int8
+activations x integer codes on int8 IMMA, one FP32 FMA per group) on prefill blocks of at least N rows (N = 512). Decode
+and MTP verify windows and smaller blocks run the FAST BF16 experts, so TURBO decode is FAST decode.
+
+- **Preconditions:** CUDA Qwen MoE (`strix-cuda-qwen-serve`, `qwen_tf_logits`) with GSQ expert packs admitted for both arithmetics; `--profile turbo` given explicitly. The bundle is not marked qualified (`qwen-cuda-turbo-bundle-v2`; it runs FAST's arithmetic in decode, whose decode-class gate is still open).
+- **Automatic selection:** none; the rule is part of the arithmetic contract (`+experts[prefill_rows>=512:...]`), the identities and the bundle id; `--print-effective-config` prints `expert_regime`.
+- **Exactness evidence:** TURBO class (bit-changing, lower precision than FAST). 32K logit gate against the exact reference, 4 prompts x 128 teacher-forced rows: KL 0.00906, top-1 0.9844, dNLL +0.00102 (bar KL <= 0.02, top-1 >= 0.93, dNLL <= 0.01); int8 in every MoE call: KL 0.00948, top-1 0.9785, dNLL +0.00543. Two loads wrote bitwise-identical TURBO logits.
+- **Off switch:** omit `--profile turbo`; `--expert-turbo-rows off` = int8 in every MoE call (decode windows included).
+- **Measured gain:** RTX PRO 6000 600 W, TURBO vs FAST, two runs each: 8,076-token TTFT -7.2 % cold / -6.7 % warm; 32,652-token prefill -6.4 % cold / -6.6 % warm; decode e2e equal within noise (same arithmetic in every window).
+- **Implementation / evidence:** [int8 expert kernels](../src/cuda/core/moe_turbo_i8.cuh), [profile column](../include/strix/profiles/qwen_cuda.hpp), [regime rule](../include/strix/cuda/qwen_options.hpp), [gate](../scripts/bench/cuda/qwen_fast/gate.sh)
+
 <a id="qwen-dense-cuda-profile"></a>
 
 ### Qwen dense 27B CUDA product profile
