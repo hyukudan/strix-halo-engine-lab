@@ -400,8 +400,8 @@ int fast4_emu() {
 bool a4w4_on() {
     static const bool on = [] {
         const bool v = strix::envcfg::flag("STRIX_DENSE_A4W4", false);
-        if (v) std::fprintf(stderr, "qwen35-hip: FAST class %s on the wide IU4 layer GEMMs (opt-in, gate pending)
-", core::iu4a4_dense::kIdentity);
+        if (v) std::fprintf(stderr, "qwen35-hip: FAST class %s on the wide IU4 layer GEMMs (opt-in, gate pending)\n",
+                            core::iu4a4_dense::kIdentity);
         return v;
     }();
     return on;

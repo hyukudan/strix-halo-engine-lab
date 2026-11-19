@@ -38,7 +38,7 @@ inline constexpr unsigned kCtaTilesN = kTw * kWavesN, kCtaTilesM = kTm * kWavesM
 static_assert(rot::kBlock == 128U && rot::kGroupA == 32U, "the kernels walk 8 k units per block, 2 per A group");
 
 inline bool supported(unsigned in, unsigned n) { return in > 0U && in % rot::kBlock == 0U && in <= rot::kMaxInputs && n > 0U && n % 16U == 0U; }
-inline unsigned padded_rows(unsigned rows) { return (rows + 15U) & ~15U; }
+__host__ __device__ inline unsigned padded_rows(unsigned rows) { return (rows + 15U) & ~15U; }
 // Activation operand of `rows` rows (rows padded to 16; pad rows: codes 0, u 1, base 0).
 inline std::size_t act_code_bytes(unsigned rows, unsigned in) { return std::size_t(padded_rows(rows)) * in / 2U; }
 inline std::size_t act_u_bytes(unsigned rows, unsigned in) { return std::size_t(padded_rows(rows)) * (in / rot::kBlock) * 4U; }
