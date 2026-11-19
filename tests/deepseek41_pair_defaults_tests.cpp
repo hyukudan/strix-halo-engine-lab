@@ -450,32 +450,52 @@ void test_profile() {
         fast_args.insert(fast_args.end(), {"--profile", "fast"});
         const auto f = w.run(app, fast_args);
         auto fast_env = base.set_env;
-        fast_env.emplace_back("STRIX_DS41_FAST_MOE", "1");
+        const std::vector<std::pair<std::string, std::string>> fast_set{
+            {"STRIX_DS41_FAST_PREFILL", "1"}, {"STRIX_DS41_FAST_ATTN", "2"}, {"STRIX_DS41_FAST_MOE", "1"},
+            {"STRIX_DS41_FAST_DENSE", "1"}, {"STRIX_DS41_FAST_DENSE_MIN_ROWS", "128"}, {"STRIX_DS41_FAST_ENGRAM", "1"},
+            {"STRIX_DS41_FAST_SHARED", "1"}, {"STRIX_DS41_FAST_MOE_F16", "1"}};
+        fast_env.insert(fast_env.end(), fast_set.begin(), fast_set.end());
         check(f.args == base.args && std::is_permutation(f.set_env.begin(), f.set_env.end(), fast_env.begin(), fast_env.end()),
-              "fast: applies moe_relaxed only; the pending attention row is never applied");
-        check(f.profile->find("moe_relaxed")->status == pr::Status::provisional && f.profile->find("moe_relaxed")->value == "1",
-              "fast: moe_relaxed provisional");
-        check(std::count(f.set_env.begin(), f.set_env.end(), std::pair<std::string, std::string>{"STRIX_DS41_FAST_MOE", "1"}) == 1,
-              "fast: provisional moe_relaxed still runs");
+              "fast: bundle ds41-fast-pf-v1 expanded as the switch, plus Engram, shared and MoE FP16 levers");
+        const auto value_of = [](const std::vector<std::pair<std::string, std::string>>& set, const char* key) {
+            for (const auto& [k, v] : set) if (k == key) return v;
+            return std::string();
+        };
+        World sw = w;
+        sw.env["STRIX_DS41_FAST_PREFILL"] = "1";
+        const auto switch_run = sw.run(app, plain_args);
+        for (const char* key : {"STRIX_DS41_FAST_ATTN", "STRIX_DS41_FAST_MOE", "STRIX_DS41_FAST_DENSE", "STRIX_DS41_FAST_DENSE_MIN_ROWS"})
+            check(!value_of(f.set_env, key).empty() && value_of(f.set_env, key) == value_of(switch_run.set_env, key),
+                  "fast: bundle members equal the switch's");
+        check(f.profile->find("moe_relaxed")->value == "1" && f.profile->find("attention_f16wmma")->value == "2",
+              "fast: bundle members in the receipt");
         std::size_t pending = 0;
         for (const auto& e : f.profile->entries) pending += e.status == pr::Status::pending;
-        check(pending == 1U && f.profile->find("attention_f16wmma")->status == pr::Status::pending && f.notices.size() == base.notices.size() + pending + 1U,
-              "fast: one notice per pending row and one for the provisional row");
-        check(std::count(f.notices.begin(), f.notices.end(),
-                         "deepseek41-pair profile fast: moe_relaxed=1 is bit-changing; qualification in progress") == 1,
-              "fast: provisional notice");
-        check(f.profile->qualification() == "qualification in progress: moe_relaxed", "fast: qualification in progress, never qualified");
-        check(f.profile->json().find("\"qualification\":\"qualification in progress: moe_relaxed\"") != std::string::npos &&
-                  f.profile->json().find("\"provisional\":[\"moe_relaxed\"]") != std::string::npos &&
+        check(pending == 0U, "fast: no pending row once the bundle selects attention bf16flash");
+        const char* stamp = "qualified";
+        check(f.profile->qualification() == stamp, "fast: the gated stack is stamped qualified");
+        for (const char* row : {"fast_prefill", "engram_f16wmma", "shared_f16", "moe_f16wmma"})
+            check(f.profile->find(row)->status == pr::Status::set && f.profile->find(row)->value == "1", "fast: gated row set");
+        check(std::count_if(f.notices.begin(), f.notices.end(), [](const std::string& n) {
+                  return n.find("is bit-changing; qualification in progress") != std::string::npos; }) == 0,
+              "fast: no provisional notice");
+        check(f.profile->json().find(std::string("\"qualification\":\"") + stamp + "\"") != std::string::npos &&
+                  f.profile->json().find("\"provisional\":[]") != std::string::npos &&
                   base.profile->json().find("\"provisional\":[]") != std::string::npos,
-              "receipt: provisional stamp and list");
-        check(pd::describe(app, f).find("profile qualification qualification in progress: moe_relaxed\n") != std::string::npos &&
-                  pd::describe(app, f).find("profile lever moe_relaxed 1 (provisional, ") != std::string::npos,
-              "effective config: provisional lines");
+              "receipt: qualified stamp, empty provisional list");
+        check(pd::describe(app, f).find(std::string("profile qualification ") + stamp + "
+") != std::string::npos &&
+                  pd::describe(app, f).find("profile lever fast_prefill 1 (profile, ") != std::string::npos,
+              "effective config: qualified lines");
+        World sw0 = w;
+        sw0.env["STRIX_DS41_FAST_PREFILL"] = "0";
+        const auto f0 = sw0.run(app, fast_args);
+        check(value_of(f0.set_env, "STRIX_DS41_FAST_ATTN").empty() && value_of(f0.set_env, "STRIX_DS41_FAST_DENSE").empty() &&
+                  value_of(f0.set_env, "STRIX_DS41_FAST_PREFILL") == "0",
+              "fast: an explicit switch 0 wins over the profile");
         World ap = w;
         ap.env["STRIX_DS41_PROFILE_ALLOW_PENDING"] = "1";
-        check(ap.run(app, fast_args).profile->qualification() == "qualification in progress: moe_relaxed; unqualified: attention_f16wmma",
-              "--allow-pending: both stamps");
+        check(ap.run(app, fast_args).profile->qualification() == stamp, "--allow-pending: nothing pending under fast");
 
         auto q_args = plain_args;
         q_args.insert(q_args.end(), {"--profile", "quality"});
