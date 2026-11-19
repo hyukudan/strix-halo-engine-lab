@@ -15,6 +15,9 @@
 // x16prod+cvt: the production x16 entry (enqueue_x16_tiles + iu4a16::enqueue_x16).
 // Rates: 4 independent accumulator chains per wave, 16 waves per WGP, f16 / iu8 / iu4 16x16x16 (ops = 2 * 16^3 each).
 // Usage: hip-dense-iu4-probe [rows=512]   prints one line per (shape, arm): us/call and TFLOPS at the timed clock.
+//        hip-dense-iu4-probe 512 ldsfloor [micro|core] [rand]   operand-path ceilings of the tall core (see ldsfloor).
+// Data class matters on gfx1151: WMMA power depends on the operand bits, and with full-mantissa FP16 data the clock
+// settles ~15-20 % below its constant-data level (sampled 2.85 -> 2.3-2.4 GHz). Compare rates on the same data class.
 #include "core/f16_dense_iu4.hpp"
 #include "attn_core/dense_decode.hpp"
 #include "core/dense_linear_iu4.hpp"
@@ -24,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -250,6 +254,229 @@ static int rates() {
     std::printf("rate a4g32-cvt %.1f TOPS\n", ops16 / time_us([&] { hipLaunchKernelGGL(rescale_rate<5>, dim3(640), dim3(256), 0, nullptr, iters, o); }, 5) / 1e6);
     return 0;
 }
+// ldsfloor mode (diagnostic, values meaningless): the tall core's WMMA loop with its operands read from a FIXED LDS
+// tile (no global loads, no decode), so each arm's rate is the ceiling of one fragment structure on this chip.
+// W waves per CTA arranged WR (row groups) x W / WR (column groups); a wave owns R row tiles x C column tiles. Per
+// k unit it reads C B fragments (2 x ds_load_b128 each, ring 2 ahead, like core<>) and, with ALds, R A fragments
+// (loaded one unit ahead); else A is a register constant. Stage 1 = the incumbent stage (every 4 units: barrier, 256
+// stagers store 8 x b128, barrier); Stage 2 = one barrier + stores (double-buffer form). Unique: lanes 16-31 read
+// other rows than lanes 0-15 (does the LDS merge the repeated half-wave addresses?).
+namespace ldsfloor {
+constexpr unsigned kPitch = 20;  // dwords per LDS row: 2 k units (32 halves) + 4 pad, conflict-free b128 like 36
+// Compile-time loop: every index is a constant when the fragments are named, so no register array is promoted to one
+// wide vector (a Half16 b[3] ring indexed in a #pragma unroll loop became <48 x half> + 15 re-pack VALU per WMMA).
+template <unsigned I, unsigned N, class F> __device__ __forceinline__ void static_for(F&& f) {
+    if constexpr (I < N) {
+        f(std::integral_constant<unsigned, I>{});
+        static_for<I + 1U, N>(f);
+    }
+}
+template <unsigned W, unsigned R, unsigned C, unsigned WR, bool ALds, int Stage, bool Unique>
+__global__ __launch_bounds__(32 * W) void kern(unsigned units, float* out, unsigned rnd) {
+    constexpr unsigned Rows = 16U * R * WR, Cols = 16U * C * (W / WR);
+    __shared__ alignas(16) std::uint32_t la[Rows][kPitch];
+    __shared__ alignas(16) std::uint32_t lb[Cols][kPitch];
+    const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5U, c = lane & 15U;
+    // rnd: FP16 values uniform in [-1, 1] (full mantissa toggling, like real activations / weights); else constants.
+    const auto rh = [](unsigned i) __attribute__((always_inline)) {
+        unsigned z = i * 2654435761U + 0x9E3779B9U;
+        z ^= z >> 15U, z *= 2246822519U, z ^= z >> 13U;
+        return static_cast<std::uint32_t>(__builtin_bit_cast(std::uint16_t, static_cast<_Float16>(float(int(z % 2001U) - 1000) / 1000.0F)));
+    };
+    const auto rw = [&](unsigned i) __attribute__((always_inline)) { return rh(2U * i) | (rh(2U * i + 1U) << 16U); };
+    for (unsigned i = tid; i < Rows * kPitch; i += 32U * W) (&la[0][0])[i] = rnd ? rw(i) : 0x1C001C00U ^ (i & 0x00030003U);
+    for (unsigned i = tid; i < Cols * kPitch; i += 32U * W) (&lb[0][0])[i] = rnd ? rw(i + 77777U) : 0x1C001C00U ^ (i & 0x00050005U);
+    __syncthreads();
+    const unsigned rb = (wave % WR) * 16U * R, cb = (wave / WR) * 16U * C;
+    const unsigned bl = Unique ? lane : c;
+    const auto frag = [](const std::uint32_t* p) __attribute__((always_inline)) { return tall::detail::staged_fragment(p); };
+    tall::Half16 a[R], an[R];
+    tall::Float8 acc[R][C] = {};
+    static_for<0U, R>([&](auto r) __attribute__((always_inline)) {
+        if constexpr (ALds) a[r] = frag(&la[rb + 16U * r + c][0]);
+        else for (unsigned i = 0; i < 16U; ++i) a[r][i] = rnd ? __builtin_bit_cast(_Float16, static_cast<std::uint16_t>(rh(tid * 64U + 16U * r + i)))
+                                                           : static_cast<_Float16>(float((tid + i + r) & 3U));
+    });
+    tall::U4 keep[8];
+    for (unsigned i = 0; i < 8U; ++i) keep[i] = *reinterpret_cast<const tall::U4*>(&lb[tid % Cols][4U * (i % 5U)]);
+    for (unsigned u = 0; u < units; ++u) {
+        const unsigned kk = u & 1U;
+        if constexpr (Stage != 0) {
+            if (u % 4U == 0U) {
+                __syncthreads();
+                if (tid < Cols) {
+#pragma unroll
+                    for (unsigned i = 0; i < 8U; ++i) *reinterpret_cast<tall::U4*>(&lb[tid][4U * (i & 3U)]) = keep[i];
+                }
+                if constexpr (Stage == 1) __syncthreads();
+            }
+        }
+        asm volatile("" ::: "memory");
+        if constexpr (ALds) static_for<0U, R>([&](auto r) __attribute__((always_inline)) { an[r] = frag(&la[rb + 16U * r + c][8U * (kk ^ 1U)]); });
+        tall::detail::sched_fence();
+        tall::Half16 r0, r1, r2;  // B ring, two fragments ahead
+        const auto slot = [&](auto k) __attribute__((always_inline)) -> tall::Half16& {
+            if constexpr (k % 3U == 0U) return r0;
+            else if constexpr (k % 3U == 1U) return r1;
+            else return r2;
+        };
+        const auto bfrag = [&](unsigned t) __attribute__((always_inline)) { return frag(&lb[(cb + 16U * t + bl) % Cols][8U * kk]); };
+        r0 = bfrag(0U);
+        if constexpr (C > 1U) r1 = bfrag(1U);
+        tall::detail::sched_fence();
+        static_for<0U, C>([&](auto t) __attribute__((always_inline)) {
+            if constexpr (t + 2U < C) slot(std::integral_constant<unsigned, t + 2U>{}) = bfrag(t + 2U);
+            static_for<0U, R>([&](auto r) __attribute__((always_inline)) {
+                acc[r][t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[r], slot(t), acc[r][t]);
+            });
+            tall::detail::sched_fence();
+        });
+        if constexpr (ALds) static_for<0U, R>([&](auto r) __attribute__((always_inline)) { a[r] = an[r]; });
+    }
+    float s = 0.0F;
+    static_for<0U, R>([&](auto r) __attribute__((always_inline)) {
+        static_for<0U, C>([&](auto t) __attribute__((always_inline)) { s += acc[r][t][(r + t) & 7U]; });
+    });
+    if (s == 1234.5F) out[tid] = s;
+}
+// The production core with its DRAM / decode paths removed: stage_load returns register values (no global loads),
+// decode is a copy, A fragments read one 256-row x 64-k chunk of x16 tiles (L2-resident). Barriers, stores, the B ring
+// and the A loads keep the production instruction stream: the incumbent structure's ceiling at a real shape.
+template <unsigned W> struct FloorCols : iu::Cols<W> {
+    using Raw = typename iu::Cols<W>::Raw;
+    __device__ __forceinline__ Raw stage_load(unsigned t, unsigned c, unsigned u) const {
+        Raw r;
+#pragma unroll
+        for (unsigned q = 0; q < 8U; ++q) r.w[q] = 0x1C001C00U ^ ((t * 16U + c) & 3U) ^ (u & 1U) ^ q;
+        r.s = u;
+        return r;
+    }
+    __device__ __forceinline__ void stage_decode(const Raw& raw, tall::U4* nb) const {
+        Raw r = raw;
+#pragma unroll
+        for (unsigned q = 0; q < 8U; ++q) asm volatile("" : "+v"(r.w[q]));
+#pragma unroll
+        for (unsigned q = 0; q < 8U; ++q) nb[q] = tall::U4{r.w[q], r.w[q] ^ r.s, r.w[q], r.w[q]};
+    }
+};
+template <class Base> struct SmallA : Base {
+    __device__ __forceinline__ tall::Half16 fragment(unsigned row, unsigned unit) const { return Base::fragment(row & 255U, unit & 3U); }
+};
+// Epilogue removed: the sums are only compared (keeps every WMMA live), no output bytes are written.
+struct NullStore {
+    struct Tile {
+        float* y;
+        unsigned c;
+    };
+    __device__ __forceinline__ Tile open(unsigned, const tall::ColumnTile& ct, unsigned c) const { return {ct.y, c}; }
+    __device__ __forceinline__ void put(const Tile& t, unsigned, float v) const {
+        if (v == 1234.5F) t.y[t.c] = v;
+    }
+    __device__ __forceinline__ void close() const {}
+    template <class F> __device__ __forceinline__ void run(F&& f) { f(*this); }
+};
+template <class C> __global__ __launch_bounds__(512) void pkn(C c, const float* x, unsigned in, unsigned rows) {
+    __shared__ tall::Storage<16> lds;
+    tall::core<16>(x, in, rows, c, lds, NullStore{});
+}
+template <class C> static double run_nostore(const C& c, const iu::View& v) {
+    const dim3 g(v.count / 256U, (v.rows + 255U) / 256U);  // column-fast (x16 policies)
+    return time_us([&] { hipLaunchKernelGGL((pkn<C>), g, dim3(512), 0, nullptr, c, v.x, v.in, v.rows); });
+}
+template <unsigned W, unsigned R, unsigned C, unsigned WR, bool ALds, int Stage, bool Unique>
+void arm(const char* name, float* o, unsigned rnd) {
+    constexpr unsigned units = 256U, waves = 20U * 16U * 4U;  // 4 rounds of 16 waves on each of the 20 WGPs
+    const unsigned grid = waves / W;
+    const double ops = double(grid) * W * R * C * units * 8192.0;
+    const auto go = [&] { hipLaunchKernelGGL((kern<W, R, C, WR, ALds, Stage, Unique>), dim3(grid), dim3(32 * W), 0, nullptr, units, o, rnd); };
+    for (int i = 0; i < 100; ++i) go();  // ~80 ms: the clock settles at its power-limited level before timing
+    const double us = time_us(go, 150);
+    std::printf("ldsfloor %s %-28s W%-2u %ux%-2u A%s stage%d %8.1f us %6.2f TFLOPS  lds/WMMA %.3f KB\n", rnd ? "rand " : "const", name, W, R, C,
+                ALds ? "lds" : "reg", Stage, us, ops / us / 1e6, (double(C) + (ALds ? double(R) : 0.0)) / double(R * C));
+}
+// argv[3] "core": only the real-shape decomposition; argv[3] or argv[4] "rand": random weights / x tiles (else
+// constant memset data: the WMMA power and therefore the sustained clock depend on the data).
+static void fill_rand(void* p, std::size_t bytes, std::uint32_t seed, bool half_pm1) {
+    std::vector<std::uint16_t> h(bytes / 2U);
+    std::uint32_t z = seed;
+    for (auto& e : h) {
+        z = z * 1664525U + 1013904223U;
+        e = half_pm1 ? __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(float(int(z >> 9) % 2001 - 1000) / 1000.0F))
+                     : static_cast<std::uint16_t>(z >> 16);
+    }
+    CK(hipMemcpy(p, h.data(), bytes, hipMemcpyHostToDevice));
+}
+static int run(int argc, char** argv) {
+    bool core_only = false, rnd = false, micro = false;
+    for (int i = 3; i < argc; ++i)
+        core_only |= std::strcmp(argv[i], "core") == 0, rnd |= std::strcmp(argv[i], "rand") == 0, micro |= std::strcmp(argv[i], "micro") == 0;
+    float* o = nullptr;
+    CK(hipMalloc(&o, 4096));
+    for (int round = 0; round < (core_only ? 0 : 2); ++round) {
+        arm<16, 1, 16, 16, false, 0, false>("incumbent-1x16", o, rnd ? 1U : 0U);
+        arm<16, 1, 16, 16, false, 1, false>("incumbent-1x16+stage2bar", o, rnd ? 1U : 0U);
+        arm<16, 1, 16, 16, false, 2, false>("incumbent-1x16+stage1bar", o, rnd ? 1U : 0U);
+        arm<16, 1, 16, 16, false, 0, true>("incumbent-1x16-unique", o, rnd ? 1U : 0U);
+        arm<8, 1, 16, 8, false, 0, false>("incumbent-1x16-w8", o, rnd ? 1U : 0U);
+        arm<16, 1, 16, 16, true, 0, false>("A-lds-1x16", o, rnd ? 1U : 0U);
+        arm<16, 2, 8, 8, true, 0, false>("A-lds-2x8-w16", o, rnd ? 1U : 0U);
+        arm<8, 2, 8, 4, true, 0, false>("A-lds-2x8-w8", o, rnd ? 1U : 0U);
+        arm<4, 2, 8, 2, true, 0, false>("A-lds-2x8-w4", o, rnd ? 1U : 0U);
+        arm<8, 4, 4, 2, true, 0, false>("A-lds-4x4-w8", o, rnd ? 1U : 0U);
+        arm<8, 2, 8, 4, true, 2, false>("A-lds-2x8-w8+stage1bar", o, rnd ? 1U : 0U);
+        arm<8, 4, 4, 2, true, 2, false>("A-lds-4x4-w8+stage1bar", o, rnd ? 1U : 0U);
+    }
+    // Real-shape decomposition (GEMM only, x16 form, 16 waves): floor (no DRAM, no decode, A one hot chunk), + real A
+    // tiles, + real weight loads (copy, no decode), + decode (= production x16 GEMM). Two rounds, reversed order in round 1.
+    const unsigned shapes[][2] = {{5120U, 17408U}, {17408U, 5120U}, {5120U, 10240U}};
+    for (const unsigned rows : {512U, 4096U}) {
+        if (micro) break;
+        for (const auto& sh : shapes) {
+            iu::View v{};
+            v.in = sh[0], v.n = sh[1], v.count = sh[1], v.rows = rows, v.out_stride = sh[1];
+            std::uint8_t* w = nullptr;
+            std::uint16_t* sc = nullptr;
+            _Float16* xt = nullptr;
+            CK(hipMalloc(&v.out, std::size_t(rows) * sh[1] * 4U));
+            CK(hipMalloc(&w, std::size_t(sh[0]) * sh[1] / 2U));
+            CK(hipMalloc(&sc, std::size_t(sh[0]) / 64U * sh[1] * 2U));
+            CK(hipMalloc(&xt, std::size_t(rows) * sh[0] * 2U));
+            if (rnd) {
+                fill_rand(w, std::size_t(sh[0]) * sh[1] / 2U, 7U, false);
+                const std::vector<std::uint16_t> hs(std::size_t(sh[0]) / 64U * sh[1], std::uint16_t(0x2c00));  // 1/16
+                CK(hipMemcpy(sc, hs.data(), hs.size() * 2U, hipMemcpyHostToDevice));
+                fill_rand(xt, std::size_t(rows) * sh[0] * 2U, 11U, true);
+            } else {
+                CK(hipMemset(w, 0x5A, std::size_t(sh[0]) * sh[1] / 2U));
+                CK(hipMemset(sc, 0x20, std::size_t(sh[0]) / 64U * sh[1] * 2U));
+                CK(hipMemset(xt, 0x21, std::size_t(rows) * sh[0] * 2U));
+            }
+            v.weight = w, v.scale = sc;
+            const double gf = 2.0 * rows * v.in * v.n;
+            double t[4] = {};
+            for (int round = 0; round < 2; ++round) {
+                for (int k = 0; k < 4; ++k) {
+                    const int arm_k = round ? 3 - k : k;
+                    double us = 0.0;
+                    if (arm_k == 0) us = run_arm(SmallA<tall::X16Cols<FloorCols<16>>>{{{{v}}, xt, rows}}, v);
+                    if (arm_k == 1) us = run_nostore(SmallA<tall::X16Cols<FloorCols<16>>>{{{{v}}, xt, rows}}, v);
+                    if (arm_k == 2) us = run_nostore(tall::X16Cols<PCols<16, false, false>>{{{v}}, xt, rows}, v);
+                    if (arm_k == 3) us = run_arm(tall::X16Cols<PCols<16, false, false>>{{{v}}, xt, rows}, v);
+                    t[arm_k] += us / 2.0;
+                }
+            }
+            const char* names[4] = {"floor", "floor-nostore", "prod-nostore", "prod"};
+            for (int k = 0; k < 4; ++k)
+                std::printf("ldsfloor core %s in %5u n %5u rows %5u %-14s %8.1f us %6.2f TFLOPS\n", rnd ? "rand " : "const", v.in, v.n, rows, names[k], t[k], gf / t[k] / 1e6);
+            CK(hipFree(v.out));
+            CK(hipFree(w));
+            CK(hipFree(sc));
+            CK(hipFree(xt));
+        }
+    }
+    return 0;
+}
+}  // namespace ldsfloor
 // cmp mode: our production IU4 g64 W4A16 entries at the given shapes, the "ours" column of a GEMM-library comparison.
 //   hip-dense-iu4-probe <rows> cmp in:n [in:n ...]
 //   hip-dense-iu4-probe <rows> tile in:n [in:n ...]   (tall-core forms x CTA waves, ABBA, output bits vs direct 16 waves)
@@ -364,6 +591,7 @@ static int cmp(unsigned rows, int argc, char** argv, bool tile = false) {
 }
 int main(int argc, char** argv) {
     if (argc > 2 && argv[2][0] == 'r') return rates();
+    if (argc > 2 && std::strcmp(argv[2], "ldsfloor") == 0) return ldsfloor::run(argc, argv);
     if (argc > 2 && std::strcmp(argv[2], "cmp") == 0) return cmp(unsigned(std::atoi(argv[1])), argc, argv);
     if (argc > 2 && std::strcmp(argv[2], "tile") == 0) return cmp(unsigned(std::atoi(argv[1])), argc, argv, true);
     const unsigned rows = argc > 1 ? unsigned(std::atoi(argv[1])) : 512U;
