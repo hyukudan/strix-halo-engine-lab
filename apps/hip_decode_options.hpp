@@ -422,6 +422,10 @@ struct Options {
     bool prompt_lookup_snapshot_explicit = false, prompt_lookup_snapshot_bytes_explicit = false;
     bool device_queue_trace = false;
     std::uint32_t known_prefix_prefill_rows = 0;
+    // Qwen pair: the prompt prefix qwen_pp::resolve_pair_route chose (set once by the CLI pair block, with its reason
+    // literal); the MTP hand-off runs this route instead of deciding again.
+    std::uint64_t qwen_pair_prefix = 0;
+    const char* qwen_pair_reason = "single-short";
     // Smaller tiled blocks (descending) for the remainder after the last complete T-row block; by default the
     // sizes of default_known_prefill_tail_rows below T (D-056), none with `--known-prefix-tail-rows none`.
     std::vector<std::uint32_t> known_prefix_tail_rows;
@@ -1718,15 +1722,51 @@ inline void validate_mtp_cli(const Options& o,bool resolved=false) {
 inline void validate_onfly_i4_routes(const Options& o) {
     onfly_i4::require_serial(o.turbo.active(), !o.mtp.cohort.empty() || (o.http_serve && o.http_batch));
 }
+// A run builds its MTP target windows only outside a golden dump and outside a fixed single-request session
+// (apps/hip_mtp_decode_bridge.hpp allocate_window, apps/hip_decode_token_main.cpp window_factory_for).
+inline bool mtp_builds_target_windows(const Options& o) {
+    return o.mtp.enabled && o.mtp.window_rows && o.mtp.golden_dump.empty() && (!o.session_mtp_fixed || o.http_serve);
+}
 inline void validate_resolved_mtp_cli(const Options& o) {
     validate_onfly_i4_routes(o);
     validate_mtp_cli(o,true);
-    if(o.mtp.enabled && o.mtp.window_rows && (!o.deferred_moe_status || !o.virtual_q8_gdn_input || !o.prefetch_q8_gdn_input ||
-       !o.virtual_q8_gdn_output || !o.wave8_q8_gdn_input || !o.wave8_q8_gdn_output))
-        throw std::invalid_argument("MTP target windows require resolved D1 and explicit paired wave8 GDN configuration");
-    if(o.mtp.enabled && o.mtp.window_expert_union && (!o.q4k_a8g32_gate_up || !o.grouped_exact_q51_down ||
-       !o.q51_slot_parallel_down || !o.deferred_moe_status))
-        throw std::invalid_argument("MTP window expert union requires resolved A8, grouped Q5_1, slot-parallel down and D1");
+    // Each refusal names the flags whose resolved option is still off (issue 758: the user adds exactly those).
+    const auto missing=[](std::initializer_list<std::pair<bool,const char*>> terms) {
+        std::string names;
+        for(const auto& [present,flag]:terms) if(!present) names+=std::string(names.empty()?"":" ")+flag;
+        return names;
+    };
+    if(o.mtp.enabled && o.mtp.window_rows) {
+        const auto absent=missing({{o.deferred_moe_status,"--deferred-moe-status"},{o.virtual_q8_gdn_input,"--virtual-q8-gdn-input"},
+            {o.prefetch_q8_gdn_input,"--prefetch-q8-gdn-input"},{o.virtual_q8_gdn_output,"--virtual-q8-gdn-output"},
+            {o.wave8_q8_gdn_input,"--wave8-q8-gdn-input"},{o.wave8_q8_gdn_output,"--wave8-q8-gdn-output"}});
+        if(!absent.empty())
+            throw std::invalid_argument("MTP target windows require resolved D1 and explicit paired wave8 GDN configuration; missing "+absent);
+    }
+    if(o.mtp.enabled && o.mtp.window_expert_union) {
+        const auto absent=missing({{o.q4k_a8g32_gate_up,"--q4k-a8g32-gate-up"},{o.grouped_exact_q51_down,"--grouped-exact-q51-down"},
+            {o.q51_slot_parallel_down,"--q51-slot-parallel-down"},{o.deferred_moe_status,"--deferred-moe-status"}});
+        if(!absent.empty())
+            throw std::invalid_argument("MTP window expert union requires resolved A8, grouped Q5_1, slot-parallel down and D1; missing "+absent);
+    }
+    // The window's hyper-mix rows exist only on the parallel/staged/fused typed-Q8 HC kernel with row and output
+    // prefetch (known_hyper_rows_id); without it the window refused only after the model load (issue 758).
+    // Runs that build no window (golden dump, fixed single-request session) keep their earlier admission.
+    const bool builds_windows=mtp_builds_target_windows(o);
+    if(builds_windows && o.mtp.window_hyper_mix && (!o.parallel_hyper_mix || !o.staged_hyper_projections ||
+       !o.fused_staged_hyper_mix || !o.typed_hyper_projection || !o.prefetch_typed_hyper_rows || !o.prefetch_q8_hyper_output))
+        throw std::invalid_argument("MTP window hyper-mix requires resolved --parallel-hyper-mix --staged-hyper-projections "
+            "--fused-staged-hyper-mix --typed-fused-hyper-projections --prefetch-typed-hyper-rows --prefetch-q8-hyper-output");
+    // Every window verifies its rows with the greedy multi-row head (hip_mtp_window_verifier.hip), which exists only on
+    // the virtual Q8 LM head with row prefetch (known_head_id: prefetch8 load or wave8 marker). The server builds its
+    // windows at startup and refused only after the model load ("known-window greedy rows require ..."); its automatic
+    // owner receives the prefetch from the shared prompt organization, an explicit T must name it. The single-request
+    // command keeps its existing rule here. STRIX_MTP_GREEDY_ROWS=0 keeps per-row selectors.
+    const char* greedy_rows=strix::envcfg::text("STRIX_MTP_GREEDY_ROWS");
+    if(builds_windows && !(greedy_rows && std::string_view(greedy_rows)=="0") &&
+       (!o.virtual_q8_lm_head || (o.http_serve && !o.prefetch_q8_lm_head)))
+        throw std::invalid_argument(std::string("MTP target windows require resolved --virtual-q8-lm-head")+
+            (o.http_serve?" --prefetch-q8-lm-head":"")+" (greedy window rows; STRIX_MTP_GREEDY_ROWS=0 keeps per-row selectors)");
 }
 
 inline std::string yarn_route_refusal(const Options& o) {

@@ -24,6 +24,7 @@
 // Switches (shared resolver, recorded for --print-effective-config; CLI = serve):
 //   STRIX_HANDOFF_SHARED_ONCE  shared pieces once + relay       (default per family: see each adapter's decl)
 //   STRIX_HANDOFF_PREFIX_FIRST ask the ranks first, ship suffix  (default off: needs the family's invariance receipt)
+#include "strix/device/link_class.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <span>
@@ -94,8 +95,11 @@ struct Holding {
 };
 
 struct Links {
-    double host_bytes_per_s = 125e6;    // prefill host egress, shared by every destination (1 GbE payload ~117.6e6)
-    double relay_bytes_per_s = 4.4e9;   // pair interconnect (USB4 host path, 35 Gb/s at >= 16 MB pieces)
+    // Rates from the one link table (device/link_class.hpp calibration rows): 125e6 and 4.4e9 for the lab.
+    double host_bytes_per_s =           // prefill host egress, shared by every destination (1 GbE payload ~117.6e6)
+        ::strix::device::link_rate_mbytes_ps(::strix::device::LinkUse::host_egress, ::strix::device::legacy_host_link_class) * 1e6;
+    double relay_bytes_per_s =          // pair interconnect (USB4 host path, 35 Gb/s at >= 16 MB pieces)
+        ::strix::device::link_rate_mbytes_ps(::strix::device::LinkUse::relay_host_path, ::strix::device::legacy_pair_link_class) * 1e6;
     double recompute_rows_per_s = -1;   // ranks' suffix prefill rate; < 0 = unmeasured, never chosen
 };
 

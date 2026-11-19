@@ -42,6 +42,35 @@ int main() try {
     a.mma = false; a.rows = 1;
     require(!hc::hc_compact_workspace(a, 15U, true, true));
     require(hc::hc_compact_workspace(a, 15U, true, false));
+    // Rows-form cap: an exact automatic call the rows forms can take (rows <= cap) is never compact; above the cap the old rule
+    // holds unless exact_full; exact_full never changes the FAST (mma) admission or an explicit layout.
+    for (unsigned rows : {9U, 12U, 16U}) {
+        a.rows = rows;
+        require(hc::hc_compact_workspace(a, 15U, true, true));                // defaults = the admission before the cap
+        require(!hc::hc_compact_workspace(a, 15U, true, true, 16U));
+        require(hc::hc_compact_workspace(a, 15U, true, false, 16U));          // decode forms off: no rows form to protect
+        a.mma = true;
+        require(hc::hc_compact_workspace(a, 15U, true, true, 16U, true));
+        a.mma = false;
+    }
+    for (unsigned rows : {17U, 2019U, 8076U}) {
+        a.rows = rows;
+        require(hc::hc_compact_workspace(a, 15U, true, true, 16U, false));
+        require(!hc::hc_compact_workspace(a, 15U, true, true, 16U, true));
+        require(!hc::hc_compact_workspace(a, 15U, true, false, 16U, true));
+        require(!hc::hc_compact_workspace(a, 15U, false, true, 16U, false));  // compact lever off: full, as before
+        a.mma = true;
+        require(hc::hc_compact_workspace(a, 15U, true, true, 16U, true));
+        require(!hc::hc_compact_workspace(a, 15U, false, true, 16U, true));
+        a.mma = false;
+        a.workspace_layout = hc::HcWorkspaceLayout::full;
+        require(!hc::hc_compact_workspace(a, 15U, true, true, 16U, false));
+        a.workspace_layout = hc::HcWorkspaceLayout::compact;
+        require(hc::hc_compact_workspace(a, 4U, true, true, 16U, true));     // explicit staged format wins over exact_full
+        a.workspace_layout = hc::HcWorkspaceLayout::automatic;
+        rejects([&] { (void)hc::hc_compact_workspace(a, 4U, true, true, 16U, true); });
+    }
+    a.rows = 1;
     a.workspace_layout = hc::HcWorkspaceLayout::compact;
     for (unsigned stage : {1U, 2U, 4U, 15U})
         require(hc::hc_compact_workspace(a, stage, false, true));
@@ -51,7 +80,17 @@ int main() try {
     rejects([&] { (void)hc::hc_compact_workspace(a, 2U, true, true); });
     a.input = input; a.norm = nullptr;
     rejects([&] { (void)hc::hc_compact_workspace(a, 4U, true, true); });
-    std::puts("HC full/staged/compact/alignment admission passed");
+    // Exact fused output epilogue form: default (-1) follows the lever; an explicit per-call choice wins over it.
+    {
+        hc::HcMixArgs e;
+        require(e.output_batched == -1);
+        require(hc::hc_output_batched(e, true) && !hc::hc_output_batched(e, false));
+        e.output_batched = 0;
+        require(!hc::hc_output_batched(e, true) && !hc::hc_output_batched(e, false));
+        e.output_batched = 1;
+        require(hc::hc_output_batched(e, true) && hc::hc_output_batched(e, false));
+    }
+    std::puts("HC full/staged/compact/alignment admission + output epilogue form passed");
     return 0;
 } catch (const std::exception& error) {
     std::fprintf(stderr, "%s\n", error.what());

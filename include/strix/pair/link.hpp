@@ -1,9 +1,9 @@
 #pragma once
-// Pair-route command line and link setup shared by every engine's two-node route (Qwen, Gemma 4):
-// --rank 0|1, --peer HOST and --transport usb4auto|tcp are removed from argv and exported as
-// <PREFIX>_RANK, <PREFIX>_PEER and <PREFIX>_TRANSPORT, so an engine's option parser never sees them and
-// a re-exec'd child inherits them. open_link() opens the ordered byte transport the pair pipe runs on.
+// Pair-route link setup shared by every engine's two-node route (Qwen, Gemma 4). The command line (strip_flags:
+// --rank/--peer/--transport, or a node topology) is in pair/link_flags.hpp; open_link() opens the ordered byte
+// transport the pair pipe runs on from the exported <PREFIX>_RANK / _PEER / _TRANSPORT.
 #include "strix/dist/open_transport.hpp"
+#include "strix/pair/link_flags.hpp"
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -14,47 +14,6 @@
 #include <vector>
 
 namespace strix::pair {
-inline void set_env(const std::string& key, const char* value) {
-#ifdef _WIN32
-    if (_putenv_s(key.c_str(), value) != 0) throw std::runtime_error("pair prefill environment update failed");
-#else
-    if (setenv(key.c_str(), value, 1) != 0) throw std::runtime_error("pair prefill environment update failed");
-#endif
-}
-// Returns the remaining arguments (argv[0] first, nullptr-terminated); argc/argv then point into it.
-inline std::vector<char*> strip_flags(int& argc, char**& argv, std::string_view prefix) {
-    std::vector<char*> kept{argv[0]};
-    const std::string base(prefix);
-    bool rank_seen = false;
-    for (int index = 1; index < argc; ++index) {
-        const std::string_view argument(argv[index]);
-        if (argument == "--rank" || argument == "--peer" || argument == "--transport") {
-            if (++index == argc) throw std::invalid_argument("pair prefill pair flag requires a value");
-            const char* value = argv[index];
-            if (argument == "--rank") {
-                if (rank_seen || (std::string_view(value) != "0" && std::string_view(value) != "1"))
-                    throw std::invalid_argument("pair prefill requires one --rank 0|1");
-                rank_seen = true;
-                set_env(base + "_RANK", value);
-            } else set_env(base + (argument == "--peer" ? "_PEER" : "_TRANSPORT"), value);
-        } else kept.push_back(argv[index]);
-    }
-    if (!rank_seen) {
-        const char* inherited = std::getenv((base + "_RANK").c_str());
-        if (!inherited || (std::string_view(inherited) != "0" && std::string_view(inherited) != "1"))
-            throw std::invalid_argument("pair prefill requires --rank 0|1");
-    }
-    argc = static_cast<int>(kept.size());
-    kept.push_back(nullptr);
-    argv = kept.data();
-    return kept;
-}
-inline unsigned env_rank(std::string_view prefix) {
-    const char* value = std::getenv((std::string(prefix) + "_RANK").c_str());
-    if (!value || (std::string_view(value) != "0" && std::string_view(value) != "1"))
-        throw std::invalid_argument("pair prefill requires --rank 0|1");
-    return value[0] == '0' ? 0U : 1U;
-}
 // transport: usb4auto (default; the striped USB4 host path), usb4gpu (the same control path plus the
 // device exchange, for a link that moves seam pieces device to device: xport/pair_device_link.hpp) or
 // tcp (rank 0 listens on port, rank 1 connects to peer), opened by the single shared opener

@@ -8,10 +8,17 @@
 //     address: broadcast, L1 resident).
 //   - One block = 8 waves = 64 output columns; the 8 waves split K in contiguous ranges of K / 8 (G / 8 = MaxG K64
 //     groups each), reduce their partial sums in LDS in a fixed ascending order (deterministic, no atomics).
-//   - Rows are padded to the bucket R (1/2/4/8/16); rows past nrows are neither computed nor stored. Default: core
-//     calls of up to 8 rows (R <= 8: one call, every weight word read once; R = 16: two 8-row calls), bitwise equal
-//     to the chunked form (per-row op order is identical). One call over 16 rows was measured slower (rows 16
-//     verify 272.8 vs 220.7 ms, Strix 27B IU4) and spills (private segment 144 B): not offered.
+//   - Rows are padded to the bucket R (1/2/4/8/16); a core call that holds any real row computes all of its Rc rows
+//     (rows past nrows read stale scratch rows: the caller's xh must hold R rows) and only rows < nrows are stored.
+//     Each row's dot products are independent of the other rows (same operands, same order), so stored rows are
+//     bitwise those of a call with fewer rows. Passing the real count instead took `r >= nrows` exits inside the
+//     unrolled row loops of every k-tile: measured on Strix 27B IU4 verify windows rows 3 / 6 / 12 = 127.1 / 130.6 /
+//     140.7 ms vs rows 4 / 8 / 16 = 76.5 / 82.6 / 126.8 ms (hip_dense_dec3-STATE.md). Default: core
+//     rows per weight sweep from strix/decode_weight_sweep.hpp (every weight word read once per sweep). Scalar
+//     activations (default): one sweep of up to 16 rows, the activation words loaded in 8-row chunks (SGPR budget);
+//     the 16-row bucket used to run two 8-row sweeps and stream the weights twice. Vector activations: 8 rows per
+//     sweep (one 16-row sweep in that form measured slower, 272.8 vs 220.7 ms, and spilled 144 B). Bitwise equal to
+//     the chunked form either way (per-row op order is identical).
 //     STRIX_IU4_ROW_REUSE=0 selects the old 4-row chunk calls (weights re-streamed per chunk).
 // Home: shared (backend core, HIP): no model names; any dense projection can bind it (qwen35 now).
 #if defined(__HIPCC__)
@@ -19,15 +26,22 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <initializer_list>
 #include <stdexcept>
 
+#include "strix/decode_projection_group.hpp"
+#include "strix/decode_weight_sweep.hpp"
 #include "strix/env_flags.hpp"
+#include "dense_iu4_rows.hpp"
+#include "iu4_x_pairs.hpp"
 #include "w4a16.hpp"
 
 namespace strix::core::dense_iu4 {
 
 inline constexpr unsigned kWaves = 8U;
-inline constexpr unsigned kMaxRows = 16U;
+inline constexpr unsigned kMaxRows = dense_iu4_rows::kMaxRows;
+inline constexpr unsigned kWideRows = dense_iu4_rows::kWideRows;
+inline constexpr std::size_t wide_xh_rows(std::size_t rows) { return dense_iu4_rows::xh_rows(rows); }
 
 inline constexpr std::size_t packed_bytes(unsigned outputs, unsigned inputs) { return std::size_t(outputs) * inputs / 2U; }
 inline constexpr std::size_t tensor_bytes(unsigned outputs, unsigned inputs) {
@@ -47,13 +61,42 @@ __global__ void to_f16_kernel(const float* x, _Float16* h, std::size_t count) {
         h[i] = static_cast<_Float16>(v != v ? v : fminf(65504.0F, fmaxf(-65504.0F, v)));
     }
 }
+// Same conversion, stored in the pre-paired layout of the scalar-activation core (permutation inside 8-k blocks; rows
+// start on block boundaries because inputs % 64 == 0).
+template <int = 0>
+__global__ void to_f16_paired_kernel(const float* x, _Float16* h, std::size_t count) {
+    for (std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += std::size_t(gridDim.x) * blockDim.x) {
+        const float v = x[i];
+        h[iu4_pairs::paired_index(i)] = static_cast<_Float16>(v != v ? v : fminf(65504.0F, fmaxf(-65504.0F, v)));
+    }
+}
+// The same conversion (expression of the two kernels above) for producer epilogues.
+__device__ __forceinline__ _Float16 to_f16_value(float v) {
+    return static_cast<_Float16>(v != v ? v : fminf(65504.0F, fmaxf(-65504.0F, v)));
+}
 
-template <unsigned R, unsigned MaxG, unsigned Rc = R>
-__global__ void __launch_bounds__(32 * kWaves) kernel(const std::uint8_t* w, unsigned inputs, unsigned outputs, const _Float16* xh,
-                                                      float* out, unsigned nrows) {
+// One block's 64 output columns (quad) of one tensor; kernel and group_kernel below differ only in how they pick
+// (tensor, quad) from blockIdx.
+// Grid2 (exact wide windows, rows > 16; kernel only): block (x, y) = rows [x R, x R + R) of the 64-column block y. Same
+// instruction stream per block as the 1-D form (only the row / column offsets come from the block index); the R-row blocks
+// of one column block are adjacent in dispatch order, so they read its weight slice while it is L2 / MALL resident instead
+// of re-streaming it from DRAM once per R rows. Stored rows are bitwise those of run() with <= 16 rows (row independence
+// above); xh must hold the rows rounded up to R (pad rows are read, never stored).
+template <unsigned R, unsigned MaxG, unsigned Rc, bool UX, bool Grid2 = false>
+__device__ __forceinline__ void block_body(const std::uint8_t* w, unsigned inputs, unsigned outputs, const _Float16* xh, float* out,
+                                           unsigned nrows, unsigned quad) {
     constexpr unsigned S = kWaves, KT = MaxG * 4U;
     __shared__ float part[R * S * 64];
-    const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x / 32U, quad = blockIdx.x;
+    if constexpr (Grid2) {
+        static_assert(R == dense_iu4_rows::kWideRows, "the wide grid plan owns the row block size");
+        const auto b = dense_iu4_rows::block(blockIdx.x, nrows);
+        xh += std::size_t(b.row0) * inputs;
+        out += std::size_t(b.row0) * outputs;
+        nrows = b.rows;
+    }
+    // UX: wave index made wave-uniform (SGPR) so the activation reads of w4a16::wave_rows<..., UniformX> are scalar loads.
+    const unsigned lane = threadIdx.x & 31U;
+    const unsigned wave = UX ? __builtin_amdgcn_readfirstlane(threadIdx.x / 32U) : threadIdx.x / 32U;
     const auto* ws = reinterpret_cast<const std::uint16_t*>(w + packed_bytes(outputs, inputs));
     const unsigned k0 = wave * KT;
     float res[R][2];
@@ -62,9 +105,9 @@ __global__ void __launch_bounds__(32 * kWaves) kernel(const std::uint8_t* w, uns
 #pragma unroll
     for (unsigned h = 0; h * Rc < R; ++h) {
         if (h * Rc >= nrows) break;
-        const unsigned n = nrows - h * Rc;
-        w4a16::wave_rows<Rc, KT, MaxG>(w, ws, outputs, inputs, k0, k0 + KT, quad * 4U, xh + std::size_t(h * Rc) * inputs + k0 * 16U,
-                                       inputs, lane, n < Rc ? n : Rc,
+        // all Rc rows of a call that holds a real row (the full-bucket instruction stream); the store keeps r < nrows
+        w4a16::wave_rows<Rc, KT, MaxG, false, false, UX>(w, ws, outputs, inputs, k0, k0 + KT, quad * 4U, xh + std::size_t(h * Rc) * inputs + k0 * 16U,
+                                       inputs, lane, Rc,
                                        [&](unsigned, unsigned r, unsigned column, float value) { res[h * Rc + r][column & 1U] += value; });
     }
     const unsigned rel = (lane >> 3U) * 16U + 2U * (lane & 7U);
@@ -84,31 +127,84 @@ __global__ void __launch_bounds__(32 * kWaves) kernel(const std::uint8_t* w, uns
     }
 }
 
+template <unsigned R, unsigned MaxG, unsigned Rc = R, bool UX = false, bool Grid2 = false>
+__global__ void __launch_bounds__(32 * kWaves) kernel(const std::uint8_t* w, unsigned inputs, unsigned outputs, const _Float16* xh,
+                                                      float* out, unsigned nrows) {
+    block_body<R, MaxG, Rc, UX, Grid2>(w, inputs, outputs, xh, out, nrows, Grid2 ? blockIdx.y : blockIdx.x);
+}
+
+// Projection group (decode step plan, strix/decode_projection_group.hpp): projections of the same prepared rows xh
+// (same inputs) in one launch; block b -> member m, quad b - first[m] (first[] in 64-column blocks). Same block body.
+inline constexpr unsigned kGroupMax = 4U;
+struct Group {
+    const std::uint8_t* w[kGroupMax];
+    float* out[kGroupMax];
+    unsigned outputs[kGroupMax];
+    std::uint32_t first[kGroupMax + 1U];
+    unsigned count;
+};
+template <unsigned R, unsigned MaxG, unsigned Rc = R, bool UX = false>
+__global__ void __launch_bounds__(32 * kWaves) group_kernel(Group g, unsigned inputs, const _Float16* xh, unsigned nrows) {
+    unsigned m;
+    std::uint32_t quad;
+    ::strix::decode::locate(g.first, g.count, blockIdx.x, m, quad);  // blockIdx-uniform: scalar
+    block_body<R, MaxG, Rc, UX>(g.w[m], inputs, g.outputs[m], xh, g.out[m], nrows, quad);
+}
+
 // STRIX_IU4_ROW_REUSE: unset/1 = core calls of up to 8 rows (default), 0 = old 4-row chunks.
 inline bool row_reuse() {
     static const bool on = envcfg::flag("STRIX_IU4_ROW_REUSE", true);  // recorded in the effective config
     return on;
 }
+// STRIX_IU4_SCALAR_X: 1 = pre-paired activations read through scalar loads (w4a16 UniformX: same dot2 operands and
+// order, bitwise equal; default since its node A/B: plain 75.73 -> 72.27 ms/token, verify rows 8 118.9 -> 82.6 ms,
+// logits bitwise, HDD2-T1), 0 = natural layout through vector broadcast loads (the previous form). One switch for
+// prepare() and run() (layout and kernel must agree); off under STRIX_IU4_ROW_REUSE=0.
+inline bool scalar_x() {
+    static const bool on = envcfg::flag("STRIX_IU4_SCALAR_X", true) && row_reuse();  // recorded in the effective config
+    return on;
+}
+// STRIX_IU4_ONE_SWEEP: 1 (default) = scalar-activation windows of 9..16 rows read the weights once (one 16-row sweep,
+// strix/decode_weight_sweep.hpp), 0 = the previous two 8-row sweeps. Same rows bitwise either way; rows <= 8 unaffected.
+inline bool one_sweep() {
+    static const bool on = envcfg::flag("STRIX_IU4_ONE_SWEEP", true);  // recorded in the effective config
+    return on;
+}
 
-template <unsigned R>
-void launch_bucket(const std::uint8_t* w, unsigned inputs, unsigned outputs, const _Float16* xh, float* out, unsigned rows, hipStream_t s) {
-    const dim3 grid(outputs / 64U), block(32U * kWaves);
-    constexpr unsigned C = R >= 8U ? 4U : R, M = R > 8U ? 8U : R;
-    const bool mid = R <= 4U || row_reuse();
+// The template instance of rows bucket R for `inputs`: f.template operator()<MaxG, Rc, UX>() launches it.
+template <unsigned R, class F>
+void dispatch_bucket(unsigned inputs, F&& f) {
+    // Rows per weight sweep (strix/decode_weight_sweep.hpp): scalar activations 16 (one stream for any window), vector 8.
+    constexpr unsigned C = R >= 8U ? 4U : R, M = ::strix::decode::sweep_rows(R, ::strix::decode::kHipIu4VectorX),
+                       MX = ::strix::decode::sweep_rows(R, ::strix::decode::kHipIu4ScalarX);
+    const bool mid = R <= 4U || row_reuse(), sx = scalar_x(), one = MX == M || one_sweep();
+    const auto pick = [&]<unsigned G>() {
+        if (sx && one) f.template operator()<G, MX, true>();
+        else if (sx) f.template operator()<G, M, true>();
+        else if (mid) f.template operator()<G, M, false>();
+        else f.template operator()<G, C, false>();
+    };
     switch (inputs / 512U) {
-    case 10U:
-        if (mid) kernel<R, 10U, M><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
-        else kernel<R, 10U, C><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
-        break;
-    case 12U:
-        if (mid) kernel<R, 12U, M><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
-        else kernel<R, 12U, C><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
-        break;
-    default:
-        if (mid) kernel<R, 34U, M><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
-        else kernel<R, 34U, C><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
-        break;
+    case 10U: pick.template operator()<10U>(); break;
+    case 12U: pick.template operator()<12U>(); break;
+    default: pick.template operator()<34U>(); break;
     }
+}
+// Grid2 = false: one launch of the R bucket over all rows (rows <= 16). Grid2 = true (R = kWideRows): ceil(rows / R)
+// row chunks per column block (block_body above).
+template <unsigned R, bool Grid2 = false>
+void launch_bucket(const std::uint8_t* w, unsigned inputs, unsigned outputs, const _Float16* xh, float* out, unsigned rows, hipStream_t s) {
+    const dim3 grid = Grid2 ? dim3(dense_iu4_rows::blocks(rows), outputs / 64U) : dim3(outputs / 64U), block(32U * kWaves);
+    dispatch_bucket<R>(inputs, [&]<unsigned G, unsigned Rc, bool UX>() {
+        kernel<R, G, Rc, UX, Grid2><<<grid, block, 0, s>>>(w, inputs, outputs, xh, out, rows);
+    });
+}
+template <unsigned R>
+void launch_group_bucket(const Group& g, unsigned inputs, const _Float16* xh, unsigned rows, hipStream_t s) {
+    const dim3 grid(g.first[g.count]), block(32U * kWaves);
+    dispatch_bucket<R>(inputs, [&]<unsigned G, unsigned Rc, bool UX>() {
+        group_kernel<R, G, Rc, UX><<<grid, block, 0, s>>>(g, inputs, xh, rows);
+    });
 }
 
 // Reference form for the exactness gate: dequantises the same pack (w = q * s exact in F32) and sums in double over
@@ -137,18 +233,63 @@ inline void reference(const std::uint8_t* w, unsigned inputs, unsigned outputs, 
     reference_kernel<0><<<(outputs + 127U) / 128U, 128, 0, s>>>(w, inputs, outputs, x, out, rows);
 }
 
+// prepare() as a producer epilogue (decode launch fusion): a kernel that computes x (a norm, a SiLU product) calls
+// store(i, x[i]) with the F32 value it stores, i = row * inputs + k; same conversion and layout as prepare(), so run()
+// reads the same bytes and the prepare launch is gone. One sweep of rows <= kMaxRows (xh holds those rows).
+struct PreparedStore {
+    _Float16* h;
+    bool paired;
+    __device__ void operator()(std::size_t i, float v) const { h[paired ? iu4_pairs::paired_index(i) : i] = to_f16_value(v); }
+};
+inline PreparedStore prepared_store(_Float16* xh) { return {xh, scalar_x()}; }
 // Converts the F32 activations once; several projections of the same x (q/k/v, gate/up) share the prepared rows.
 inline void prepare(const float* x, _Float16* xh, unsigned inputs, unsigned rows, hipStream_t s) {
-    to_f16_kernel<0><<<64, 256, 0, s>>>(x, xh, std::size_t(rows) * inputs);
+    if (scalar_x()) to_f16_paired_kernel<0><<<64, 256, 0, s>>>(x, xh, std::size_t(rows) * inputs);
+    else to_f16_kernel<0><<<64, 256, 0, s>>>(x, xh, std::size_t(rows) * inputs);
 }
-// xh: FP16 rows from prepare(); out: F32 [rows][outputs]; rows 1..16.
+// xh: FP16 rows from prepare(); out: F32 [rows][outputs]. rows 1..16: the decode / verify buckets (unchanged). rows > 16
+// (exact wide prefill windows): one Grid2 launch of kWideRows-row blocks (dense_iu4_rows.hpp); xh must hold
+// wide_xh_rows(rows) rows.
 inline void run(const std::uint8_t* w, unsigned inputs, unsigned outputs, const _Float16* xh, float* out, unsigned rows, hipStream_t s) {
-    if (!supported(outputs, inputs) || rows == 0U || rows > kMaxRows) throw std::runtime_error("iu4 dense projection: unsupported shape or rows");
-    if (rows <= 1U) launch_bucket<1>(w, inputs, outputs, xh, out, rows, s);
+    if (!supported(outputs, inputs) || rows == 0U) throw std::runtime_error("iu4 dense projection: unsupported shape or rows");
+    if (rows > kMaxRows) launch_bucket<kWideRows, true>(w, inputs, outputs, xh, out, rows, s);
+    else if (rows <= 1U) launch_bucket<1>(w, inputs, outputs, xh, out, rows, s);
     else if (rows <= 2U) launch_bucket<2>(w, inputs, outputs, xh, out, rows, s);
     else if (rows <= 4U) launch_bucket<4>(w, inputs, outputs, xh, out, rows, s);
     else if (rows <= 8U) launch_bucket<8>(w, inputs, outputs, xh, out, rows, s);
     else launch_bucket<16>(w, inputs, outputs, xh, out, rows, s);
+}
+// Projections of the same prepared rows xh (one `inputs`) in ONE launch (decode step plan: projection group); rows 1..16.
+// Every member's output is bitwise run()'s: same block body, operands and order. One member = run().
+struct Member {
+    const std::uint8_t* w;
+    unsigned outputs;
+    float* out;
+};
+inline void run_group(const Member* members, unsigned count, unsigned inputs, const _Float16* xh, unsigned rows, hipStream_t s) {
+    if (rows == 0U || rows > kMaxRows) throw std::runtime_error("iu4 projection group: rows must be 1..16");
+    Group g{};
+    ::strix::decode::GroupIndex<kGroupMax> index;
+    for (unsigned i = 0; i < count; ++i) {
+        const Member& m = members[i];
+        if (!supported(m.outputs, inputs)) throw std::runtime_error("iu4 projection group: unsupported member shape");
+        g.w[index.count] = m.w;
+        g.out[index.count] = m.out;
+        g.outputs[index.count] = m.outputs;
+        index.add(m.outputs / 64U);
+    }
+    if (index.count == 0U) throw std::runtime_error("iu4 projection group: no member");
+    if (index.count == 1U) return run(g.w[0], inputs, g.outputs[0], xh, g.out[0], rows, s);
+    for (unsigned i = 0; i <= index.count; ++i) g.first[i] = index.first[i];
+    g.count = index.count;
+    if (rows <= 1U) launch_group_bucket<1>(g, inputs, xh, rows, s);
+    else if (rows <= 2U) launch_group_bucket<2>(g, inputs, xh, rows, s);
+    else if (rows <= 4U) launch_group_bucket<4>(g, inputs, xh, rows, s);
+    else if (rows <= 8U) launch_group_bucket<8>(g, inputs, xh, rows, s);
+    else launch_group_bucket<16>(g, inputs, xh, rows, s);
+}
+inline void run_group(std::initializer_list<Member> members, unsigned inputs, const _Float16* xh, unsigned rows, hipStream_t s) {
+    run_group(members.begin(), static_cast<unsigned>(members.size()), inputs, xh, rows, s);
 }
 inline void linear(const std::uint8_t* w, unsigned inputs, unsigned outputs, const float* x, _Float16* xh, float* out, unsigned rows,
                    hipStream_t s) {

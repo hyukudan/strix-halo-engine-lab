@@ -102,6 +102,9 @@ target_compile_options(nvfp4_a8_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=f
 add_test(NAME nvfp4_a8 COMMAND nvfp4_a8_test)
 add_executable(nvfp4_a8_bench tests/cuda/nvfp4_a8_bench.cu)
 target_link_libraries(nvfp4_a8_bench PRIVATE strix_qwen_cuda)
+# FAST ple_a8: PLE key/value projections, exact lane chain vs the shared dense A8 site (bound + timing, GPU index 0, no model).
+add_executable(qwen_ple_a8_bench tests/cuda/qwen_ple_a8_bench.cu)
+target_link_libraries(qwen_ple_a8_bench PRIVATE strix_qwen_cuda)
 add_executable(qwen_turbo_resolver_test tests/cuda/qwen_turbo_resolver_test.cu)
 target_link_libraries(qwen_turbo_resolver_test PRIVATE strix_qwen_cuda strix_qwen_prefix)
 add_test(NAME qwen_turbo_resolver COMMAND qwen_turbo_resolver_test)
@@ -134,10 +137,30 @@ target_include_directories(qwen_quant_host_test PRIVATE include)
 add_executable(qwen_quant_device_test tests/cuda/qwen_quant_device_test.cu src/ggml_dequant.cpp src/iq4_nl.cpp)
 target_link_libraries(qwen_quant_device_test PRIVATE strix_qwen_cuda)
 target_compile_options(qwen_quant_device_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+# Native expert source binding: typed / runtime-fallback dispatch properties (host only, no GPU, header-only).
+add_executable(native_source_binding_test tests/cuda/native_source_binding_test.cu)
+target_include_directories(native_source_binding_test PRIVATE include src)
+target_compile_options(native_source_binding_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+if(MSVC)
+    target_compile_options(native_source_binding_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
+add_test(NAME native_source_binding COMMAND native_source_binding_test)
 # Multi-session decode: cohort window packing (host test) and the cohort gate/bench (GPU).
 add_executable(qwen_cohort_plan_test tests/cuda/qwen_cohort_plan_test.cpp)
 target_include_directories(qwen_cohort_plan_test PRIVATE include)
 add_test(NAME qwen_cohort_plan COMMAND qwen_cohort_plan_test)
+# Native SIMT expert contract (cuda-native-iq-fp32@1): CPU oracle of decoded-weight reuse, register fold and code view.
+add_executable(native_reuse_host_test tests/cuda/native_reuse_host_test.cpp)
+target_include_directories(native_reuse_host_test PRIVATE include)
+add_test(NAME native_reuse_host COMMAND native_reuse_host_test)
+# TURBO integer expert contract (gsq-iq-i8mma-turbo-cuda-v1): CPU oracle of placement, exact group dots and order.
+add_executable(turbo_i8_host_test tests/cuda/turbo_i8_host_test.cpp)
+target_include_directories(turbo_i8_host_test PRIVATE include)
+add_test(NAME turbo_i8_host COMMAND turbo_i8_host_test)
+# Shared GSQ weight decode (FAST / TURBO / exact native): word-level branch-free decode == reference code(), all types.
+add_executable(gsq_decode_host_test tests/cuda/gsq_decode_host_test.cpp)
+target_include_directories(gsq_decode_host_test PRIVATE include)
+add_test(NAME gsq_decode_host COMMAND gsq_decode_host_test)
 # per-request session reservation + the serve's ONE RESOLVER check (host only)
 add_executable(qwen_session_reservation_test tests/session_reservation_tests.cpp)
 target_include_directories(qwen_session_reservation_test PRIVATE include)
@@ -152,6 +175,22 @@ target_compile_options(qwen_qsa_multi_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--
 add_executable(qwen_qsa_mma_test tests/cuda/qwen_qsa_mma_test.cu)
 target_link_libraries(qwen_qsa_mma_test PRIVATE strix_qwen_cuda)
 target_compile_options(qwen_qsa_mma_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+# QSA exact fused attention == three-kernel exact attention byte for byte + ABAB timing (device, no model):
+# qwen_qsa_fused_test <tables dir> [--no-timing]; its softmax-order / index invariants on the host (no GPU).
+add_executable(qwen_qsa_fused_test tests/cuda/qwen_qsa_fused_test.cu)
+target_link_libraries(qwen_qsa_fused_test PRIVATE strix_qwen_cuda)
+target_compile_options(qwen_qsa_fused_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+add_executable(qwen_qsa_fused_order_test tests/cuda/qwen_qsa_fused_order_test.cpp)
+target_include_directories(qwen_qsa_fused_order_test PRIVATE src/cuda/models/qwen)
+add_test(NAME qwen_qsa_fused_order COMMAND qwen_qsa_fused_order_test)
+# Shared row-group attention core: union-list invariant on the host (no GPU) and the device fixture
+# qwen_qsa_rowgroup_test <tables dir> [--no-timing] (FAST qsa_mma v2 vs the exact path, union byte-compare, timing).
+add_executable(rowgroup_union_host_test tests/cuda/rowgroup_union_host_test.cpp)
+target_include_directories(rowgroup_union_host_test PRIVATE include)
+add_test(NAME rowgroup_union_host COMMAND rowgroup_union_host_test)
+add_executable(qwen_qsa_rowgroup_test tests/cuda/qwen_qsa_rowgroup_test.cu)
+target_link_libraries(qwen_qsa_rowgroup_test PRIVATE strix_qwen_cuda)
+target_compile_options(qwen_qsa_rowgroup_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
 # QSA index scores: shared-tree form == warp-shuffle form byte for byte (device, no model) + --bench timing
 add_executable(qwen_qsa_score_tree_test tests/cuda/qwen_qsa_score_tree_test.cu)
 target_link_libraries(qwen_qsa_score_tree_test PRIVATE strix_qwen_cuda)
@@ -233,6 +272,10 @@ set_tests_properties(qwen_gdn_state16 PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVIC
 add_executable(qwen_cuda_profile_host_test tests/cuda/qwen_cuda_profile_host_test.cpp)
 target_link_libraries(qwen_cuda_profile_host_test PRIVATE strix_qwen_prefix)
 add_test(NAME qwen_cuda_profile_host COMMAND qwen_cuda_profile_host_test)
+# FAST hc_mma model admission: the FP16 range bound on HC norm / inject weights (host-only).
+add_executable(qwen_hc_fp16_range_host_test tests/cuda/qwen_hc_fp16_range_host_test.cpp)
+target_include_directories(qwen_hc_fp16_range_host_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME qwen_hc_fp16_range_host COMMAND qwen_hc_fp16_range_host_test)
 # Gate kit: teacher-forced logit dump (layout of tools/strix-gate/fast_logit_gate.py); see scripts/bench/cuda/qwen_fast/README.md.
 add_executable(qwen_tf_logits tests/cuda/qwen_tf_logits.cu)
 target_link_libraries(qwen_tf_logits PRIVATE strix_qwen_cuda strix_qwen_handoff)

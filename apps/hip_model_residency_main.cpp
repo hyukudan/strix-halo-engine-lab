@@ -38,7 +38,9 @@ int main(int argc, char** argv) try {
     // Start gate: resolves the declared device (--devices FILE, --device-id ID, STRIX_DEVICES, STRIX_DEVICE), refuses an
     // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
     // GPU of a node keeps working (declared=implicit).
-    strix::device::bind_hip_main(argc, argv);
+    // Registers the model file mapping (register mode): driver pages declined, STRIX_HOST_DRIVER_PAGES=1 refused.
+    strix::device::bind_hip_main(argc, argv, stderr, strix::device::CodeLoad::shared,
+                                 strix::device::HostRegistration::model_file);
     if (argc < 3) {
         throw std::invalid_argument(
             "usage: strix-hip-model-residency MODEL.gguf register|copy "

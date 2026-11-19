@@ -3,6 +3,7 @@
 #include "strix/startup_markers.hpp"
 #pragma once
 #include "qwen_pair_transport.hpp"
+#include "strix/pair/chain_topology.hpp"
 #include "rtx_state_import_routes.hpp"
 #include "qwen_yarn_memory.hpp"
 #include "mtp_asset_verification.hpp"
@@ -3339,7 +3340,8 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                 return;
             }
             if(qwen_pp::pipe_enabled()) {
-                pending=run_pair_tiled_mtp_prompt(options.tokens,model,compiled,parents->tiled,session,*target,*runtime,
+                pending=run_pair_tiled_mtp_prompt(options.tokens,{options.qwen_pair_prefix,options.qwen_pair_reason},
+                    model,compiled,parents->tiled,session,*target,*runtime,
                     qualified,activated,r,dispatcher,tiled_held,tiled_receipt);
                 if(std::getenv("STRIX_QWEN_PF_PIPE_RANK")[0]=='1') return;
             } else

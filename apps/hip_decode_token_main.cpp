@@ -1,3 +1,6 @@
+#include "strix/pair/link_flags.hpp"
+#include "strix/pair/chain_topology.hpp"
+#include "strix/device/process_topology.hpp"
 #include "strix/weight/admission.hpp"
 #include "strix/device/hip_gate.hpp"
 #include "strix/env_flags.hpp"
@@ -1212,7 +1215,8 @@ static int run_decode_entry(
     // excluded or undeclared one and prints the "device:" receipt line. Without a declaration the single integrated
     // GPU of a node keeps working (declared=implicit). A retry re-enters here with the flags already removed.
     // Eager code loading is resolved below by this engine's own policy (--no-eager-code-load, baseline, defaults off).
-    strix::device::bind_hip_main(argc, argv, stderr, strix::device::CodeLoad::engine);
+    strix::device::bind_hip_main(argc, argv, stderr, strix::device::CodeLoad::engine,
+                                 strix::device::HostRegistration::model_file);
     // Host wait policy of this engine (shared home: strix/device/hip_gate.hpp; STRIX_HOST_WAIT overrides): blocking.
     // The runtime's own schedule busy-waits (one host core at 100 % for the whole prefill) for no measured speed.
     try {
@@ -1305,36 +1309,9 @@ static int run_decode_entry(
         return std::string_view(a) == "--deploy" || std::string_view(a) == "--deploy-check";
     });
     if (strix::qwen_pp::pipe_enabled() || deploy_requested) {
-        pair_arguments.push_back(argv[0]);
-        bool pair_rank_seen = false;
-        const auto pair_setenv = [](const char* key, const char* value) {
-#ifdef _WIN32
-            if (_putenv_s(key, value) != 0) throw std::runtime_error("pair prefill environment update failed");
-#else
-            if (setenv(key, value, 1) != 0) throw std::runtime_error("pair prefill environment update failed");
-#endif
-        };
-        for (int pair_index = 1; pair_index < argc; ++pair_index) {
-            const std::string_view pair_argument(argv[pair_index]);
-            if (pair_argument == "--rank" || pair_argument == "--peer" || pair_argument == "--transport") {
-                if (++pair_index == argc) throw std::invalid_argument("pair prefill pair flag requires a value");
-                const char* pair_value = argv[pair_index];
-                if (pair_argument == "--rank") {
-                    if (pair_rank_seen || (std::string_view(pair_value) != "0" && std::string_view(pair_value) != "1"))
-                        throw std::invalid_argument("pair prefill requires one --rank 0|1");
-                    pair_rank_seen = true;
-                    pair_setenv("STRIX_QWEN_PF_PIPE_RANK", pair_value);
-                } else pair_setenv(pair_argument == "--peer" ? "STRIX_QWEN_PF_PIPE_PEER" : "STRIX_QWEN_PF_PIPE_TRANSPORT", pair_value);
-            } else pair_arguments.push_back(argv[pair_index]);
-        }
-        if (!pair_rank_seen && strix::qwen_pp::pipe_enabled()) {
-            const char* pair_inherited_rank = std::getenv("STRIX_QWEN_PF_PIPE_RANK");
-            if (!pair_inherited_rank || (std::string_view(pair_inherited_rank) != "0" && std::string_view(pair_inherited_rank) != "1"))
-                throw std::invalid_argument("pair prefill requires --rank 0|1");
-        }
-        argc = static_cast<int>(pair_arguments.size());
-        pair_arguments.push_back(nullptr);
-        argv = pair_arguments.data();
+        // The shared pair flag strip (pair/link_flags.hpp): legacy --rank/--peer/--transport or a node topology;
+        // the rank is required only when the pair pipe runs.
+        pair_arguments = strix::pair::strip_flags(argc, argv, "STRIX_QWEN_PF_PIPE", strix::qwen_pp::pipe_enabled());
     }
     auto options =
         parse_options(
@@ -1836,7 +1813,7 @@ static int run_decode_entry(
         strix::decode_cli::validate_effective_startup(effective);
     strix::decode_cli::validate_http_serving_memory(options,prompt_memory);
     if (options.print_effective_config) {
-        const auto config = strix::decode_cli::effective_config_json(effective);
+        const auto config = strix::device::with_topology_field(strix::decode_cli::effective_config_json(effective));
         std::cout << (pair_policy ? strix::qwen_pp::inspect_pair_policy(config, *pair_policy) : config);
         return 0;
     }
@@ -3550,7 +3527,7 @@ static int run_decode_entry(
             pair_cost_bucket = pair_costs;
             pair_prediction = pair_cut_env ? strix::qwen_pp::predict_cut(pair_costs,
                 strix::qwen_pp::parse_stage_cut(pair_cut_env, pair_legal, pair_legal_half)) :
-                strix::qwen_pp::choose_cut(pair_costs, pair_legal, pair_legal_half);
+                strix::qwen_pp::choose_cut(pair_costs, pair_legal, pair_legal_half, strix::pair::chain::process_stage_cost_scale());
         } else {
             const auto pair_cut = strix::qwen_pp::resolve_stage_cut(pair_cut_env, pair_legal, pair_legal_half,
                 pair_policy->half_cut.on);
@@ -3564,6 +3541,8 @@ static int run_decode_entry(
         const auto& choice = pair_route.chunk;
         options.known_prefix_prefill_rows = pair_route.tile_rows;
         pair_prompt_route = pair_route.route;
+        options.qwen_pair_prefix = pair_prompt_route.prefix;
+        options.qwen_pair_reason = pair_prompt_route.reason;
         std::fprintf(stderr, "qwen-pair regime policy=%s mode=%s chunk=%u chunks=%llu model-pipeline-ms=%.0f "
             "model-single-ms=%.0f tile-rows=%u\n", pair_route.policy, pair_prompt_route.prefix ? "pipeline" : "single",
             choice.rows, static_cast<unsigned long long>(pair_route.chunks), pair_route.model.pipeline_ms,

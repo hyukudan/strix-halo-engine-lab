@@ -41,6 +41,7 @@ environment variable, the shipped value, the value that restores the previous pa
 | glm-pair | step-flag-deferred | `STRIX_GLM_STEP_FLAG` | 1 | 0 | Measurement: plain decode checks the layers' checkpoints with the head's (one host sync less per step), same bits (G-02) |
 | glm-pair | spec-kda-tree-2 | `STRIX_GLM_SPEC_KDA_TREE` | 2 | 1 | Measurement: two-barrier KDA verify tree, bitwise == 9-barrier tree, token vectors match --mtp 0, +2.8 % |
 | glm-pair | xfer-boundary-fused | `STRIX_GLM_BOUNDARY` | 1 | 0 | Measurement: Xfer reduce +1.41 -> fused boundary ~+1.10 ms/token over local, bitwise |
+| glm-pair | xfer-producer-publish | `STRIX_GLM_XB_PUBLISH` | 1 | 0 | Measurement: decode producers publish the exchanged partial (no copy + publish launch), tokens/logits/state identical; needs the fused boundary |
 | glm-pair | moe-fast | `STRIX_GLM_MOE` | fast | ref | Measurement: FastMoe matches DefaultMoe bitwise (real TP2 slices); raw-only experts (fits GTT) |
 | glm-pair | pf-exact-moe-auto | `STRIX_GLM_PF_EXACTMOE_V` | auto | 1 | Measurement: exact MoE auto (v14 through the X3 core with row-bucketed tiles and folded remainders for calls >= 128 rows, v3 with row buckets below), outputs bitwise; 8K TTFT -19.5 % and 1K -15 % vs the X2 core; MoE call -3..-6 % vs v11 |
 | glm-pair | pf-exact-moe-plan | `STRIX_GLM_PF_EXACTMOE_PLAN` | device | host | Measurement: exact MoE device plan (pairs/tiles/groups built on the GPU, byte-equal to the host plan; no route download or host sync per MoE call) |

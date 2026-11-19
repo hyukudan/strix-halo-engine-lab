@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace strix::spec {
@@ -38,6 +39,21 @@ std::size_t lookup_class(std::uint32_t bucket, std::uint32_t depth) { return poo
 std::size_t context_bin(std::uint64_t positions) {
     return positions < 2048 ? 0 : positions < 8192 ? 1 : positions < 32768 ? 2 : positions < 131072 ? 3 : 4;
 }
+
+namespace {
+// Lower edge of context bin b (positions; context_bin's thresholds), ~0 past the last bin.
+std::uint64_t bin_edge(std::size_t b) {
+    constexpr std::uint64_t edges[context_bins + 1] = {0, 2048, 8192, 32768, 131072, ~0ULL};
+    return edges[std::min<std::size_t>(b, context_bins)];
+}
+// Identification of the K/V term against a seed table given for contexts [lo, hi): kappa in [s / (l - lo), s / (l - hi)],
+// condition (l - lo) / (l - hi) <= cond (ArbiterConfig::cost_fit_condition; 0 = no test).
+bool kv_condition(double l, std::uint64_t lo, std::uint64_t hi, double cond) {
+    if (!(cond > 0.0)) return true;
+    if (hi == ~0ULL || !(l > double(hi))) return false;
+    return l - double(lo) <= cond * (l - double(hi));
+}
+}  // namespace
 
 // ------------------------------------------------------------------------------------------------ ContextProposer
 ContextProposer::ContextProposer(const ProposerConfig& config)
@@ -116,8 +132,13 @@ Arbiter::Arbiter(ArbiterConfig config) : config_(std::move(config)) {
         std::adjacent_find(w.begin(), w.end()) != w.end() || w.back() > max_proposal + 1)
         throw std::invalid_argument("arbiter windows must be ascending, unique, start at 1 and be <= 65 rows");
     if (!(config_.switch_in >= 1.0) || !(config_.half_life_tokens > 0.0) || !(config_.cost_weight_cap >= 1.0) ||
-        !(config_.cost_aging > 0.0 && config_.cost_aging <= 1.0))
-        throw std::invalid_argument("arbiter: switch_in >= 1, half_life_tokens > 0, cost_weight_cap >= 1, aging in (0, 1]");
+        !(config_.cost_aging > 0.0 && config_.cost_aging <= 1.0) || !(config_.frontier_loss >= 0.0) ||
+        !(config_.retreat_horizon >= 0.0) || !(config_.cost_fit_half_life > 0.0) || !(config_.cost_fit_ridge > 0.0) ||
+        !(config_.row_kv_ms_per_kpos >= 0.0 && config_.row_kv_ms_per_kpos <= 10.0) ||
+        !(config_.cost_fit_condition == 0.0 || (config_.cost_fit_condition >= 1.0 && std::isfinite(config_.cost_fit_condition))))
+        throw std::invalid_argument("arbiter: switch_in >= 1, half_life_tokens > 0, cost_weight_cap >= 1, aging in (0, 1], "
+                                    "frontier_loss >= 0, retreat_horizon >= 0, cost_fit_half_life > 0, cost_fit_ridge > 0, "
+                                    "row_kv_ms_per_kpos in [0, 10], cost_fit_condition 0 or >= 1");
     for (auto& c : cost_) { c.ms.assign(w.back() + 1, 0.0); c.weight.assign(w.back() + 1, 0.0); c.seed.assign(w.back() + 1, 0.0); }
 }
 
@@ -132,6 +153,10 @@ void Arbiter::seed_cost(std::uint32_t rows, double ms, std::uint64_t context) {
     for (std::size_t b = 0; b < context_bins; ++b) {
         if (context != ~0ULL && b != context_bin(context)) continue;
         cost_[b].seed[rows] = ms;
+        // The context the seeds stand for (ArbiterConfig::cost_fit_condition): seeded everywhere = a context-blind table,
+        // the shortest bin's price; seeded for one bin = that bin's range.
+        cost_[b].seed_lo = context == ~0ULL ? 0 : bin_edge(b);
+        cost_[b].seed_hi = context == ~0ULL ? bin_edge(1) : bin_edge(b + 1);
     }
 }
 
@@ -160,7 +185,186 @@ void Arbiter::seed_model_survival(std::span<const double> conditional, double we
     }
 }
 
+// Seeded cost model at the live context (ArbiterConfig::cost_fit): the seeds were tabled at one context (or are a work
+// model), and the decode attention re-reads the K/V once per verify row. Learned walls already include their context
+// bin, so the context cost prices seeds only. Monotone in rows: the table is, and the added per-row slope is >= 0.
 double Arbiter::verify_ms(std::uint32_t rows, std::uint64_t context) const {
+    const double v = table_ms(rows, context);
+    if (config_.learn_costs || !(v > 0.0) || !kv_identified(context)) return v;
+    if (config_.row_kv_ms_per_kpos > 0.0) return v + config_.row_kv_ms_per_kpos * double(rows) * (double(context) / 1024.0);
+    if (!fitting() || !(fit_w_ > 0.0)) return v;
+    // The fit's own walls must identify it too (a short request's walls never price a long one's K/V).
+    const auto& c = cost_[context_bin(context)];
+    if (!kv_condition(fit_wl_ / fit_w_, c.seed_lo, c.seed_hi, config_.cost_fit_condition)) return v;
+    return std::max(v + fit_correction(rows, context), 0.25 * v);
+}
+
+bool Arbiter::kv_identified(std::uint64_t context) const {
+    const auto& c = cost_[context_bin(context)];
+    return kv_condition(double(context), c.seed_lo, c.seed_hi, config_.cost_fit_condition);
+}
+
+namespace {
+constexpr std::size_t fit_terms = 3;
+std::array<double, fit_terms> fit_features(std::uint32_t rows, std::uint64_t context) {
+    return {1.0, double(rows - 1U), double(rows) * (double(context) / 1024.0)};
+}
+}  // namespace
+
+// c + beta (r - 1) + kappa r L = (c + kappa L) + (beta + kappa L) (r - 1), L in units of 1,024 positions: the per-row part
+// is kept >= 0, so a larger window never prices below a smaller one.
+double Arbiter::fit_correction(std::uint32_t rows, std::uint64_t context) const {
+    const double kl = fit_coef_[2] * (double(context) / 1024.0);
+    return fit_coef_[0] + kl + std::max(fit_coef_[1] + kl, 0.0) * double(rows - 1U);
+}
+
+// The fit's prediction of one pass's verify wall (the seed table plus the current correction, floored at 1/4 of the
+// seed); base = the seed table's wall.
+double Arbiter::fit_predict(const FitPass& pass, double& base) const {
+    base = table_ms(pass.rows, pass.context);
+    return fit_w_ > 0.0 ? std::max(base + fit_correction(pass.rows, pass.context), 0.25 * base) : base;
+}
+
+// One pass of the context cost fit (gated by fit_cost): the wall's residual over the seed, clipped against the current
+// prediction (+-1x while the fit holds < 4 passes, +-0.5x after: a one-off stall moves it by at most half a pass's
+// prediction / its weight), then a decayed ridge least squares over the three features, solved in closed form (3 x 3,
+// partial pivoting).
+void Arbiter::fit_fold(const FitPass& pass) {
+    double base = 0.0;
+    const double pred = fit_predict(pass, base);
+    if (!(base > 0.0)) return;
+    const double lim = (fit_w_ < 4.0 ? 1.0 : 0.5) * pred;
+    const double y = std::clamp(pass.verify_ms, pred - lim, pred + lim) - base;
+    const auto x = fit_features(pass.rows, pass.context);
+    const double keep = std::exp2(-1.0 / config_.cost_fit_half_life);
+    for (auto& v : fit_xx_) v *= keep;
+    for (auto& v : fit_xy_) v *= keep;
+    fit_w_ = fit_w_ * keep + 1.0;
+    fit_wl_ = fit_wl_ * keep + double(pass.context);
+    for (std::size_t i = 0; i < fit_terms; ++i) {
+        fit_xy_[i] += x[i] * y;
+        for (std::size_t j = 0; j < fit_terms; ++j) fit_xx_[i * fit_terms + j] += x[i] * x[j];
+    }
+    // Ridge: beta is the seed table's shape error (the seeds were tabled on this kind of device), so it weighs 100x: at one
+    // context the slope goes to kappa (the K/V walk) and extrapolates with the context; a context range separates them.
+    // kappa < 0 is not physical (a step in the row tiles at one context can push it there): refit with kappa = 0.
+    std::array<double, fit_terms> coef{};
+    const auto solve = [&](std::size_t n) {
+        double m[fit_terms][fit_terms + 1];
+        for (std::size_t i = 0; i < n; ++i) {
+            for (std::size_t j = 0; j < n; ++j)
+                m[i][j] = fit_xx_[i * fit_terms + j] + (i == j ? config_.cost_fit_ridge * (i == 1 ? 100.0 : 1.0) : 0.0);
+            m[i][n] = fit_xy_[i];
+        }
+        for (std::size_t col = 0; col < n; ++col) {
+            std::size_t piv = col;
+            for (std::size_t r = col + 1; r < n; ++r)
+                if (std::fabs(m[r][col]) > std::fabs(m[piv][col])) piv = r;
+            if (!(std::fabs(m[piv][col]) > 0.0)) return false;  // cannot happen with ridge > 0
+            if (piv != col)
+                for (std::size_t j = 0; j <= n; ++j) std::swap(m[col][j], m[piv][j]);
+            for (std::size_t r = col + 1; r < n; ++r) {
+                const double f = m[r][col] / m[col][col];
+                for (std::size_t j = col; j <= n; ++j) m[r][j] -= f * m[col][j];
+            }
+        }
+        coef = {};
+        for (std::size_t i = n; i-- > 0;) {
+            double s = m[i][n];
+            for (std::size_t j = i + 1; j < n; ++j) s -= m[i][j] * coef[j];
+            coef[i] = s / m[i][i];
+        }
+        for (const double v : coef)
+            if (!std::isfinite(v)) return false;
+        return true;
+    };
+    if (!solve(fit_terms)) return;  // keep the previous coefficients
+    if (coef[2] < 0.0 && !solve(fit_terms - 1)) return;
+    fit_coef_ = coef;
+}
+
+
+// The stall test in front of the fit. A pass off the prediction by more than half of it (by more than all of it before
+// the first fold: only the seeds stand behind that prediction) is held, not folded. What the next pass shows decides:
+// - back within the band: the held pass was a stall and is dropped (the fit is exactly the one without it);
+// - off in the same direction during the warm-up (< 4 passes held by the fit): it was a level, not a stall (a long
+//   context above the context-blind seeds looks like this), so the held pass is folded, then this one;
+// - off after the warm-up, or off in the other direction: this pass is folded (clipped), the held one dropped.
+// So one stall in the warm-up cannot set the K/V slope at full weight, and a persisting level is learnt at full speed.
+void Arbiter::fit_cost(const Outcome& o) {
+    if (!config_.learn_costs) fit_last_context_ = o.context;  // stats: the context the term was last priced at
+    if (!fitting() || o.rows == 0 || o.rows >= cost_[0].ms.size() || !(o.verify_ms > 0.0) || !std::isfinite(o.verify_ms)) return;
+    const FitPass now{o.rows, o.context, o.verify_ms};
+    double base = 0.0;
+    const double pred = fit_predict(now, base);
+    if (!(base > 0.0)) return;
+    const bool out = std::fabs(o.verify_ms - pred) > (fit_w_ > 0.0 ? 0.5 : 1.0) * pred;
+    if (out && !fit_last_skipped_) {
+        fit_last_skipped_ = true;
+        fit_held_ = now;
+        ++fit_skipped_;
+        return;
+    }
+    if (out && fit_held_.rows != 0 && fit_w_ < 4.0) {
+        double held_base = 0.0;
+        const double held_pred = fit_predict(fit_held_, held_base);  // the fit has not moved since the hold
+        if ((fit_held_.verify_ms > held_pred) == (o.verify_ms > pred)) {
+            --fit_skipped_;
+            fit_fold(fit_held_);
+        }
+    }
+    fit_held_ = FitPass{};
+    fit_last_skipped_ = false;
+    fit_fold(now);
+}
+
+Arbiter::CostFit Arbiter::cost_fit() const {
+    CostFit f;
+    if (config_.learn_costs) { f.mode = "learned"; return f; }
+    if (config_.row_kv_ms_per_kpos > 0.0) {
+        f.mode = "fixed";
+        f.kappa = config_.row_kv_ms_per_kpos;
+        f.context = double(fit_last_context_);
+        f.kv_open = kv_identified(fit_last_context_);
+        return f;
+    }
+    if (!config_.cost_fit) return f;
+    f.mode = "online";
+    f.c = fit_coef_[0];
+    f.beta = fit_coef_[1];
+    f.kappa = fit_coef_[2];
+    f.weight = fit_w_;
+    f.skipped = fit_skipped_;
+    if (fit_w_ > 0.0) {
+        f.context = fit_wl_ / fit_w_;
+        const auto& c = cost_[context_bin(fit_last_context_)];
+        f.kv_open = kv_identified(fit_last_context_) && kv_condition(f.context, c.seed_lo, c.seed_hi, config_.cost_fit_condition);
+    }
+    return f;
+}
+
+void set_context_cost(ArbiterConfig& config, const std::string& value) {
+    if (value == "online") { config.cost_fit = true; config.row_kv_ms_per_kpos = 0.0; return; }
+    if (value == "off" || value == "0") { config.cost_fit = false; config.row_kv_ms_per_kpos = 0.0; return; }
+    char* end = nullptr;
+    const double kv = value.empty() ? 0.0 : std::strtod(value.c_str(), &end);
+    if (value.empty() || end != value.c_str() + value.size() || !(kv > 0.0) || kv > 10.0)
+        throw std::invalid_argument("--cost-kv online|off|KV (KV = ms per verify row per 1,024 context positions, 0 < KV <= 10)");
+    config.cost_fit = false;
+    config.row_kv_ms_per_kpos = kv;
+}
+
+std::string context_cost_name(const ArbiterConfig& config) {
+    if (config.learn_costs) return "learned";
+    if (config.row_kv_ms_per_kpos > 0.0) {
+        char b[48];
+        std::snprintf(b, sizeof b, "fixed %.6g", config.row_kv_ms_per_kpos);
+        return b;
+    }
+    return config.cost_fit ? "online" : "off";
+}
+
+double Arbiter::table_ms(std::uint32_t rows, std::uint64_t context) const {
     const auto& c = cost_[context_bin(context)];
     if (rows == 0 || rows >= c.ms.size()) return 0.0;
     double floor = 0.0;  // monotone: never below a known smaller window
@@ -195,14 +399,21 @@ double Arbiter::expected(Source source, std::uint32_t bucket, std::uint32_t k) c
     const auto& table = source == Source::lookup ? lookup_[std::min(bucket, lookup_buckets - 1)] : model_;
     const auto& prior = source == Source::lookup ? config_.lookup_prior : config_.model_prior;
     const double z = source == Source::lookup ? config_.lookup_sd : config_.model_sd;
-    double e = 1.0, alive = 1.0, bound = 1.0;
+    // Continuation (ArbiterConfig::model_continuation): the prior mean of S_j follows the shallower bounds geometrically.
+    const bool continuation = source == Source::model && config_.model_continuation;
+    const double w = prior[0] + prior[1];
+    double e = 1.0, alive = 1.0, bound = 1.0, before = 1.0;  // bound = B_{j-1}, before = B_{j-2}
     for (std::uint32_t j = 1; j <= k; ++j) {
         const auto& beta = table[source == Source::lookup ? lookup_class(bucket, j) : depth_class(j)];
         const double n = beta.a + beta.b;
-        if (!(n > 0.0)) break;
-        alive *= beta.a / n;
-        const double q = (alive * n + prior[0]) / (n + prior[0] + prior[1]);
-        bound = std::min(bound, std::max(0.0, q - z * std::sqrt(q * (1.0 - q) / (n + prior[0] + prior[1] + 1.0))));
+        if (!(n > 0.0) && !continuation) break;
+        // Prior mass m_j * w; the flat form keeps prior[0] itself (bit-identical to the previous expression).
+        const bool flat = !continuation || j == 1;
+        const double m = flat ? prior[0] / w : before > 0.0 ? bound * bound / before : 0.0;
+        alive = n > 0.0 ? alive * beta.a / n : m;  // no evidence at depth j: the continuation stands in for S_j
+        const double q = std::min(1.0, (alive * n + (flat ? prior[0] : m * w)) / (n + w));
+        before = bound;
+        bound = std::min(bound, std::max(0.0, q - z * std::sqrt(q * (1.0 - q) / (n + w + 1.0))));
         e += bound;
     }
     return e;
@@ -278,6 +489,22 @@ Decision Arbiter::decide(const StepInput& input) {
         pick = current;
     if (pick == std::size_t(Source::model) && passes_ < model_barred_until_) pick = 0;
     Decision d = best[pick].d;
+    // Frontier probe: the winning per-depth drafter offers one depth more than its evidence covers, at a bounded rate
+    // (ArbiterConfig::frontier_every); otherwise a first-row miss on the first probe pins it at k = 1 (see the config).
+    if (d.source == Source::model && !black_box && config_.frontier_every > 0 && d.k < model_n &&
+        passes_ >= last_frontier_ + config_.frontier_every) {
+        const auto& next = model_[depth_class(d.k + 1)];
+        const auto k = d.k + 1;
+        const auto rows = physical(k + 1);
+        if (next.a + next.b < config_.frontier_evidence && rows != 0 && rows <= input.max_rows) {
+            // Charged: the probe runs only while its own priced score stays within frontier_loss of the pick.
+            const double tokens = expected(Source::model, 0, k), ms = verify_ms(rows, ctx) + draft_ms(k);
+            if (tokens / std::max(ms, 1e-9) >= best[pick].score * (1.0 - config_.frontier_loss)) {
+                d = Decision{Source::model, k, rows, rows > k + 1, tokens, ms, true};
+                last_frontier_ = passes_;
+            }
+        }
+    }
     // Exploration of the learned drafter at its deepest legal k: first measurements, then re-probes.
     const bool explore = model_passes_ < config_.min_model_passes || passes_ >= last_model_ + config_.probe_every;
     if (model_n > 0 && d.source != Source::model && explore && black_box) {
@@ -327,8 +554,12 @@ void Arbiter::observe(const Outcome& o, std::span<const std::uint32_t> emitted) 
         // A streak of first-row misses bars the drafter only when it is improbable under the learned first-row rate
         // (a streak of m has probability (1 - r1)^m): at ~66 % acceptance two misses in a row are routine and must not
         // idle the drafter for probe_every passes (measured: 58-71 % serial passes on prose at 64-69 % acceptance).
-        const double r1 = std::min(survival(Source::model, 0, 1), 0.999);
-        const auto streak = std::uint32_t(std::min(16.0, std::ceil(std::log(config_.retreat_confidence) / std::log(1.0 - r1))));
+        // Over the evidence horizon H (ArbiterConfig::retreat_horizon) a streak of m starts by chance about H r1 (1 - r1)^m
+        // times, so m is the shortest streak with H r1 (1 - r1)^m <= retreat_confidence (H = 0: per pass, (1 - r1)^m).
+        const double r1 = std::clamp(survival(Source::model, 0, 1), 1e-3, 0.999);
+        const double chance = config_.retreat_horizon > 0.0
+            ? std::min(1.0, config_.retreat_confidence / (config_.retreat_horizon * r1)) : config_.retreat_confidence;
+        const auto streak = std::uint32_t(std::min(16.0, std::ceil(std::log(chance) / std::log(1.0 - r1))));
         if (model_misses_ >= std::max(config_.retreat_misses, streak)) { model_barred_until_ = passes_ + config_.probe_every; model_misses_ = 0; }
     }
     if (o.source == Source::lookup) {
@@ -336,12 +567,13 @@ void Arbiter::observe(const Outcome& o, std::span<const std::uint32_t> emitted) 
         if (lookup_misses_ >= config_.retreat_misses) { lookup_barred_ = true; lookup_misses_ = 0; }
     }
     auto& c = cost_[context_bin(o.context)];
-    for (auto& w : c.weight) w *= config_.cost_aging;
-    if (o.rows > 0 && o.rows < c.ms.size() && o.verify_ms > 0.0) {
+    if (config_.learn_costs) for (auto& w : c.weight) w *= config_.cost_aging;
+    if (config_.learn_costs && o.rows > 0 && o.rows < c.ms.size() && o.verify_ms > 0.0) {
         auto& w = c.weight[o.rows];
         c.ms[o.rows] = (c.ms[o.rows] * w + o.verify_ms) / (w + 1.0);
         w = std::min(w + 1.0, config_.cost_weight_cap);
     }
+    fit_cost(o);  // seeded model only (ArbiterConfig::cost_fit)
     // Resolve pending lookup proposals: each one predicted the tokens emitted after the step it was made at.
     std::size_t keep = 0;
     for (std::size_t i = 0; i < pending_.size(); ++i) {
@@ -435,7 +667,13 @@ std::string SpecStats::json() const {
     for (const auto n : lookup_us_hist) lookups += n;
     j += "},\"draft_ms\":" + num(draft_ms) + ",\"lookup_us\":{\"count\":" + std::to_string(lookups) +
          ",\"p50\":" + num(lookup_us_quantile(0.5)) + ",\"p99\":" + num(lookup_us_quantile(0.99)) +
-         ",\"max\":" + num(lookup_us_max) + "},\"index_bytes\":" + std::to_string(index_bytes) + "}";
+         ",\"max\":" + num(lookup_us_max) + "},\"index_bytes\":" + std::to_string(index_bytes);
+    if (has_cost_fit)
+        j += ",\"cost_fit\":{\"mode\":\"" + std::string(cost_fit.mode) + "\",\"c\":" + num(cost_fit.c) + ",\"beta\":" +
+             num(cost_fit.beta) + ",\"kappa\":" + num(cost_fit.kappa) + ",\"weight\":" + num(cost_fit.weight) + ",\"kv\":\"" +
+             (cost_fit.kv_open ? "open" : "closed") + "\",\"ctx\":" + num(cost_fit.context) +
+             ",\"skipped\":" + std::to_string(cost_fit.skipped) + "}";
+    j += "}";
     return j;
 }
 

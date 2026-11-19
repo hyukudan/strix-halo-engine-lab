@@ -4,6 +4,7 @@
 //   strix-qwen-chain-plan --rows 32768 --card-rate 4320 --node-rate 1600 --link-mbps 118 [--pair-mbps 4580]
 //       [--blocks 2048,4096,8192] [--decoder card|node-a|node-b|any] [--costs node-costs.json] [--latency-ms 0.3]
 //       [--card-fixed-ms 0] [--node-fixed-ms 0] [--split auto|device-only|handoff-full|layer-cut] [--cuts 24,0]
+#include "strix/device/link_class.hpp"
 #include "strix/qwen_prefill_balance.hpp"
 #include "strix/qwen_prefill_chain.hpp"
 #include <cstdio>
@@ -60,7 +61,7 @@ void print(const char* label, const std::vector<strix::pair::chain::Device>& dev
 
 int main(int argc, char** argv) try {
     std::uint64_t rows = 32768U;
-    double card_rate = 0.0, node_rate = 0.0, link_mbps = 0.0, pair_mbps = 4580.0, latency = 0.3, card_fixed = 0.0, node_fixed = 0.0;
+    double card_rate = 0.0, node_rate = 0.0, link_mbps = 0.0, pair_mbps = strix::device::find_link_class(strix::device::legacy_pair_link_class)->gbytes_ps * 1000.0, latency = 0.3, card_fixed = 0.0, node_fixed = 0.0;
     std::string block_text = "2048,4096,8192", decoder = "any", split_text = "auto", cut_text;
     const char* costs = nullptr;
     for (int i = 1; i + 1 < argc; i += 2) {

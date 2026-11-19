@@ -409,6 +409,7 @@ int main(int argc, char** argv) {
     };
     // Given flags / env win over the bound device's declared budget (profile / memory_gib; strix/device/budget.hpp).
     std::optional<double> vram_given, ram_given;
+    bool vram_card_cap = false;  // caps.vram_total_gib came from the bound entry (profile / memory_gib): a whole-card cap
     if (const char* v = std::getenv("STRIX_DS41_VRAM_TOTAL_GIB"); v && *v) vram_given = caps.vram_total_gib = total_gib_value("STRIX_DS41_VRAM_TOTAL_GIB", v);
     if (const char* v = std::getenv("STRIX_DS41_RAM_TOTAL_GIB"); v && *v) ram_given = caps.ram_total_gib = total_gib_value("STRIX_DS41_RAM_TOTAL_GIB", v);
     std::string receipt, cache_kind = "tierstream";
@@ -800,6 +801,7 @@ int main(int argc, char** argv) {
         const auto budget = strix::device::route_budget(strix::device::bind_cuda(), given);
         caps.vram_total_gib = budget.device_gib();
         caps.ram_total_gib = budget.host_gib();
+        vram_card_cap = !vram_given && budget.device_capped();  // the entry's whole-card cap, not this process's allowance
         if (budget.device_capped() || budget.host_capped())
             std::fprintf(stderr, "ds41-replica: memory budget %s\n", budget.json().c_str());
     }
@@ -1337,6 +1339,13 @@ int main(int argc, char** argv) {
         if (caps.measuring()) {
             meter = std::make_unique<replica_budget::Meter>(budget_sample_ms);
             meter->begin(o.device);
+            if (vram_card_cap && meter->before()) {  // whole-card cap -> this process's allowance (ds41_rtx_budget.hpp)
+                const double card_gib = caps.vram_total_gib;
+                caps.vram_total_gib = strix::ds41::rtx::card_cap_allowance_gib(card_gib, meter->before());
+                vram_card_cap = false;
+                std::fprintf(stderr, "ds41-replica: device cap %.3f GiB is the whole card; %.3f GiB already in use (%s) -> allowance %.3f GiB\n",
+                             card_gib, static_cast<double>(meter->before()) / 1073741824.0, meter->baseline(), caps.vram_total_gib);
+            }
         }
         CudaPrefill p(model, o);
         const double dense_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load).count();

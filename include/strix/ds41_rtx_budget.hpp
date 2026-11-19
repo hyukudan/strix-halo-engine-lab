@@ -38,6 +38,21 @@ inline std::uint64_t budget_bytes(double gib) {
     return gib > 0.0 ? static_cast<std::uint64_t>(std::llround(gib * kBudgetGiB)) : 0U;
 }
 
+// A device cap declared by the bound entry (--device-profile / memory_gib, strix/device/budget.hpp) is the whole card's
+// memory, as every other route reads it (Qwen: residency budget_cap / live_budget_view; GLM: the device-wide ledger):
+// what the card already held before this process is not this process's to plan. The replica's meter charges only its
+// own use above that baseline (Meter::before), so the replica's allowance is the card cap minus the baseline. An
+// explicit --vram-total-gib / STRIX_DS41_VRAM_TOTAL_GIB keeps its meaning (this process's allowance) and does not come
+// here. Baseline 0 (no NVML: the meter charges the whole device use) leaves the cap as is.
+inline double card_cap_allowance_gib(double card_cap_gib, std::uint64_t before_bytes) {
+    const auto cap = budget_bytes(card_cap_gib);
+    if (cap == 0 || before_bytes == 0) return card_cap_gib;
+    if (before_bytes >= cap)
+        throw std::runtime_error("budget: the device cap (" + std::to_string(card_cap_gib) + " GiB, whole card) is already held by "
+                                 "the device's other users (" + std::to_string(static_cast<double>(before_bytes) / kBudgetGiB) + " GiB)");
+    return static_cast<double>(cap - before_bytes) / kBudgetGiB;
+}
+
 struct BudgetCaps {
     double vram_total_gib = -1.0;  // --vram-total-gib / STRIX_DS41_VRAM_TOTAL_GIB (< 0: no cap)
     double ram_total_gib = -1.0;   // --ram-total-gib / STRIX_DS41_RAM_TOTAL_GIB (< 0: no cap; process commit, pinned incl.)

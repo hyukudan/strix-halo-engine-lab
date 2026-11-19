@@ -5,26 +5,30 @@
 #include <stdexcept>
 #include <vector>
 
+#include "strix/session/mark_plan.hpp"
+
 namespace strix::cuda::qwen_prefix {
 
 inline void validate_block(std::uint32_t block) {
     if (!block || block % 4) throw std::invalid_argument("--prefix-cache-block must be a positive multiple of 4");
 }
 
-inline std::uint64_t lookup_limit(std::uint64_t tokens) { return tokens >= 2 ? tokens - 2 : 0; }
+inline std::uint64_t lookup_limit(std::uint64_t tokens) { return session::mark_limit(tokens, 2); }
 
+// The shared mark plan (strix::session::plan_marks): the stride grid, the root mark (the repeated system + tools prefix,
+// 0: none) and the last block boundary a restore of this prompt may use.
 inline std::vector<std::uint64_t> capture_points(std::uint64_t tokens, std::uint32_t block,
-                                                std::uint64_t restored, std::uint64_t stride) {
+                                                std::uint64_t restored, std::uint64_t stride, std::uint64_t root = 0) {
     validate_block(block);
     if (stride && stride % block) throw std::invalid_argument("--prefix-cache-stride must be 0 or a multiple of --prefix-cache-block");
-    const auto last = lookup_limit(tokens) / block * block;
-    std::vector<std::uint64_t> points;
-    if (last <= restored) return points;
-    if (stride) {
-        for (auto p = (restored / stride + 1) * stride; p < last; p += stride) points.push_back(p);
-    }
-    points.push_back(last);
-    return points;
+    session::MarkPlanRequest request;
+    request.tokens = tokens;
+    request.restored = restored;
+    request.block = block;
+    request.stride = stride;
+    request.root = root;
+    request.tail = 2;
+    return session::plan_marks(request);
 }
 
 inline std::uint32_t clip_chunk(std::uint64_t prefilled, std::uint32_t rows,

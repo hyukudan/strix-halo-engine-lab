@@ -179,7 +179,7 @@ inline Environment requested_prefill_environment(Get get) {
             "STRIX_QSA_UNION_MERGE", "STRIX_QSA_SCORE_ROWS64", "STRIX_QSA_SCORE_SPLIT_LOADS", "STRIX_QSA_INDEX_BAND", "STRIX_QSA_POOL_PACKED", "STRIX_QSA_DECODE_POOL",
             "STRIX_QSA_DECODE_SELECT", "STRIX_QSA_DECODE_POOL_BF16", "STRIX_QSA_DECODE_POOL_CHECK", "STRIX_PREFILL_MOE_MERGE_VEC", "STRIX_QSA_CACHE_ONLY", "STRIX_PREFILL_FINAL_CONE", "STRIX_HOST_WAIT", "STRIX_QWEN_ROUTER_BF16", "STRIX_Q6P",
             "STRIX_QPF2K_GDN_CHUNK16", "STRIX_QPF2K_GDN_CHUNK16_MAX_ROWS", "STRIX_QPF2K_GDN_COOP_LAUNCH",
-            "STRIX_QSA_DECODE_FUSED_MAXIMA", "STRIX_QSA_DECODE_ATTN_V2", "STRIX_QSA_DECODE_VALUE_V2", "STRIX_MOE_R1_GLUE_FUSE", "STRIX_QWEN_DECODE_FUSE",
+            "STRIX_QSA_DECODE_FUSED_MAXIMA", "STRIX_QSA_DECODE_ATTN_V2", "STRIX_QSA_DECODE_VALUE_V2", "STRIX_MOE_R1_GLUE_FUSE", "STRIX_MOE_R1_TAIL_FOLD", "STRIX_QWEN_DECODE_FUSE",
             "STRIX_QPF2K_COMPACT_IMAGES", "STRIX_QPF2K_INDEX_BATCH", "STRIX_EAGER_CODE_LOAD", "HIP_ENABLE_DEFERRED_LOADING", "STRIX_QPF2K_EARLY_SETUP", "STRIX_CTX_EXACT_MEMORY", "STRIX_QSA_SCORE_RING", "STRIX_QSA_SCORE_RING_ROWS", "STRIX_TERMINAL_LOGITS_ARENA",
             "STRIX_SESSION_CACHE", "STRIX_SESSION_DISK", "XDG_CACHE_HOME", "HOME",
             "STRIX_PREFIX_BATCH_CERT", "STRIX_BATCH_CACHE_SOLO", "STRIX_QWEN_YARN_MTP", "STRIX_QWEN_YARN_HOST_RESERVE", "STRIX_PLE_ROLLING_CAP_BYTES", "STRIX_PLE_ROLLING", "STRIX_PLE_ROLLING_POSITIONS", "STRIX_PREFIX_CACHE", "STRIX_PREFIX_CACHE_RETENTION",
@@ -203,13 +203,20 @@ inline Environment requested_prefill_environment(Get get) {
 inline Environment requested_prefill_environment() {
     return requested_prefill_environment([](const char* name) { return ::strix::envcfg::text(name); });
 }
+// Launch/copy organizations only, never arithmetic. The LM-head pair schedules the virtual Q8 LM head, which is a
+// numerical choice of the resolved base (the automatic decode profile sets it). A base without it (for example a
+// server whose explicit MTP-window organization keeps its own decode profile) keeps its LM head, instead of
+// failing "prefetch Q8 LM head requires resolved virtual Q8 LM head" at every tile (issue 758). Every base that
+// carries the virtual Q8 LM head gets the same items as before.
 inline void apply_measured_prompt_organization(Options& o) {
     o.q51_slot_parallel_down = true;
     o.batched_moe_activation = true;
     o.wave8_q8_gdn_input = true;
     o.wave8_q8_gdn_output = true;
-    o.prefetch_q8_lm_head = true;
-    o.wave8_q8_lm_head = true;
+    if (o.virtual_q8_lm_head) {
+        o.prefetch_q8_lm_head = true;
+        o.wave8_q8_lm_head = true;
+    }
     o.wave8_q8_qsa_output = true;
 }
 inline constexpr DecodeNumericalProfile dense_a8_profile =
@@ -1222,6 +1229,9 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
         return notice("memory observation unavailable; explicit tiled configuration required");
     constexpr std::uint64_t gib = UINT64_C(1) << 30U;
     std::string attempts;
+    // Why the single-request decode profile was not adopted (last tile tried); named in a declined notice so
+    // the user is not sent to low-level organization flags when one switch would do (issue 758).
+    std::string adoption_declined;
     // The shared route rule, asked for the largest request this context admits. Serving adds its own
     // constraints: the resolved decode arithmetic stays, every resident slot must still fit beside a
     // T16384 owner, and STRIX_SERVE_T16K=0 / STRIX_SERVE_ROUTE=0 keep the earlier owner / arithmetic.
@@ -1296,7 +1306,13 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
                     candidate = std::move(adopted);
                     adopted_organization = std::move(organization);
                     decode_adopted = true;
-                } catch (const std::exception& error) { decode_declined = error.what(); governed_mtp_exclusion = false; }
+                } catch (const std::exception& error) {
+                    decode_declined = error.what(); governed_mtp_exclusion = false;
+                    if (decode_declined.find("context-not-qualified") != std::string::npos)
+                        decode_declined += " (context " + std::to_string(candidate.context_tokens) +
+                            " needs --unqualified-context)";
+                    adoption_declined = decode_declined;
+                }
             }
             fp16_declined = resolve_prompt_route(candidate,requested,capabilities,shape).arithmetic_fallback;
             if (!decode_declined.empty() && !fp16_declined.empty()) fp16_declined += " (" + decode_declined + ")";
@@ -1476,7 +1492,8 @@ inline void resolve_serve_prefill(EffectiveConfig& result, const ModelContract& 
             attempts += "T" + std::to_string(rows) + ":" + error.what() + "; ";
         }
     }
-    notice(attempts + "explicit tiled configuration required");
+    notice(attempts + (adoption_declined.empty() ? std::string() :
+        "decode profile not adopted: " + adoption_declined + "; ") + "explicit tiled configuration required");
 }
 // Stage A is pure: no host budget estimate, device work or directory probes.
 inline std::string cache_defaults_suppression(const Options& o, const Environment& env) {

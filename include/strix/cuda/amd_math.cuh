@@ -186,6 +186,86 @@ __device__ __forceinline__ float amd_expf(const Tables& t, float x) {
     return y;
 }
 
+// amd_expf for N independent inputs: y[i] has the bits of amd_expf(t, x[i]) (the same IEEE operations; amd_v_exp's branches
+// only choose among values both forms compute). The difference is the memory schedule: amd_v_exp consumes its exp2_tab
+// gather and its exp_bits gather (a random word of a ~52 MB bit table, an L2 round trip) through branches before the next
+// call starts, so a loop of N calls pays 2N dependent round trips; here all N exp2_tab gathers, then all N exp_bits
+// gathers, are issued before the first is consumed (2 round trips per batch). Out-of-domain lanes (|a| >= 1, NaN, tiny)
+// gather a fixed in-bounds word and ignore it. The rare slow cases call amd_v_exp_slow exactly as amd_v_exp does.
+template <unsigned N>
+__device__ __forceinline__ void amd_expf_batch(const Tables& t, const float (&x)[N], float (&y)[N]) {
+    if (!t.exp2_tab) {
+#pragma unroll
+        for (unsigned i = 0; i < N; ++i) y[i] = amd_expf(t, x[i]);
+        return;
+    }
+    const float kLog2e = __uint_as_float(0x3fb8aa3bU), kLog2eLo = __uint_as_float(0x32a5705fU);
+    float a[N], ex[N], n[N];
+    float2 tab[N];
+#pragma unroll
+    for (unsigned i = 0; i < N; ++i) {  // amd_expf's reduction, then amd_v_exp's table index; gathers 1 (exp2_tab)
+        const float ph = __fmul_rn(x[i], kLog2e);
+        ex[i] = rintf(ph);
+        float pl = __fmaf_rn(x[i], kLog2e, -ph);
+        pl = __fmaf_rn(x[i], kLog2eLo, pl);
+        a[i] = __fadd_rn(__fsub_rn(ph, ex[i]), pl);
+        n[i] = fabsf(a[i]) < 1.0F ? rintf(__fmul_rn(a[i], 64.0F)) : 0.0F;
+        tab[i] = __ldg(t.exp2_tab + static_cast<int>(n[i]) + 64);
+    }
+    float f[N], err[N], bound[N];
+    bool edge[N], tiny[N];
+    std::uint32_t word[N], index[N];
+#pragma unroll
+    for (unsigned i = 0; i < N; ++i) {  // amd_v_exp's fast-path arithmetic (same operations, same order); gathers 2 (exp_bits)
+        const std::uint32_t b = __float_as_uint(a[i]), mag = b & 0x7fffffffU;
+        const float r = __fsub_rn(a[i], __fmul_rn(n[i], 0.015625F));
+        const float lh = __uint_as_float(0x3f317218U), ll = __uint_as_float(0xb102e308U);
+        const float qh = __fmul_rn(r, lh);
+        float ql = __fmaf_rn(r, lh, -qh);
+        ql = __fmaf_rn(r, ll, ql);
+        float p = __fmaf_rn(qh, 1.0F / 120.0F, 1.0F / 24.0F);
+        p = __fmaf_rn(qh, p, 1.0F / 6.0F);
+        p = __fmaf_rn(qh, p, 0.5F);
+        const float tail = __fmul_rn(__fmul_rn(qh, qh), p);
+        const float sh = __fadd_rn(1.0F, qh);
+        float sl = __fsub_rn(qh, __fsub_rn(sh, 1.0F));
+        sl = __fadd_rn(sl, __fadd_rn(ql, tail));
+        const float s1 = __fadd_rn(sh, sl);
+        const float s2 = __fsub_rn(sl, __fsub_rn(s1, sh));
+        const float ph = __fmul_rn(tab[i].x, s1);
+        float pl = __fmaf_rn(tab[i].x, s1, -ph);
+        pl = __fmaf_rn(tab[i].x, s2, pl);
+        pl = __fmaf_rn(tab[i].y, s1, pl);
+        f[i] = __fadd_rn(ph, pl);
+        err[i] = __fsub_rn(pl, __fsub_rn(f[i], ph));
+        const std::uint32_t fb = __float_as_uint(f[i]);
+        const float half_up = __uint_as_float(((fb >> 23) - 24U) << 23);
+        const float half = (err[i] < 0.0F && (fb & 0x007fffffU) == 0U) ? __fmul_rn(half_up, 0.5F) : half_up;
+        bound[i] = __uint_as_float(((fb >> 23) - 35U) << 23);
+        edge[i] = __fsub_rn(half, fabsf(err[i])) <= bound[i];
+        tiny[i] = mag < (102U << 23);
+        index[i] = (tiny[i] || !(fabsf(a[i]) < 1.0F)) ? 0U : (b >> 31) * (25U << 23) + (mag - (102U << 23));
+        word[i] = __ldg(t.exp_bits + (index[i] >> 5));
+    }
+#pragma unroll
+    for (unsigned i = 0; i < N; ++i) {  // amd_v_exp's decisions (same order), then amd_expf's scaling and range selects
+        float v;
+        if (fabsf(a[i]) < 1.0F) {
+            const bool bit = (word[i] >> (index[i] & 31U)) & 1U;
+            v = f[i];
+            if (edge[i] || (!tiny[i] && bit && fabsf(err[i]) <= bound[i])) v = amd_v_exp_slow(t, a[i]);
+            else if (!tiny[i] && bit) {
+                const std::uint32_t fb = __float_as_uint(f[i]);
+                v = __uint_as_float(((err[i] > 0.0F) == ((fb >> 31) == 0U)) ? fb + 1U : fb - 1U);
+            }
+            v = amd_ldexp(v, static_cast<int>(ex[i]));
+        } else v = a[i] != a[i] ? a[i] : 0.0F;
+        if (__uint_as_float(0xc2ce8ed0U) > x[i]) v = 0.0F;
+        if (__uint_as_float(0x42b17218U) < x[i]) v = __uint_as_float(0x7f800000U);
+        y[i] = v;
+    }
+}
+
 // rsqrtf: subnormal inputs scaled by 2^24 before v_rsq_f32 and the result by 2^12.
 __device__ __forceinline__ float amd_rsqrtf(const Tables& t, float x) {
     const bool small = __uint_as_float(0x00800000U) > x;  // v_cmp_gt_f32 vcc, 0x800000, x

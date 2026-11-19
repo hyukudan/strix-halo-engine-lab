@@ -4,6 +4,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace strix::cuda_core {
@@ -12,8 +13,43 @@ namespace strix::cuda_core {
 // finished (once every predecessor block has called pdl_trigger or exited); it MUST call pdl_wait() before reading anything the
 // predecessor wrote or writing anything the predecessor reads. Work before pdl_wait may only touch constant data (weights, committed
 // state that nothing in the same graph writes). pdl_wait returns after the predecessor grid completed and its writes are visible.
+// Why that is enough at any chain depth (transitivity): if every PDL kernel reaches pdl_wait in at least one block of every
+// launch (an early `return` before it is allowed only for blocks that cannot be all of the grid), then "K_n completed" implies
+// "K_n-1 completed", so when K_n passes its wait every earlier kernel has completed and is visible. Only pre-wait code ever
+// overlaps earlier kernels, and it touches constants only. The two conditions per kernel are the whole correctness contract;
+// pdl_trigger placement does not affect correctness. Trigger placement is a resource choice: after the wait, at most one
+// kernel sits in its pre-wait region (bounds the weight prefetch held in L2: fp4_gemv); at entry, a chain of small grids can
+// all sit pre-wait at once. The chain-level form of this rule (which pairs overlap, demotion of a violating launch) is the
+// backend-neutral include/strix/launch_overlap.hpp; the probe harness tests/cuda_core/pdl_harness.cuh measures each fact on
+// the device (seeded hazards caught whenever the successor really started early, %globaltimer witness).
+// Enforced by type where bound: a kernel takes its non-constant buffers as After<T>; their pointer is only reachable with the
+// PdlWaited token that pdl_wait() returns, so no access to them can be written before the wait (bound: fp4_gemv,
+// fp4_reduce, norm_kernel). Constant data (weights, gains, committed state) stays a plain pointer.
 __device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
-__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+class PdlWaited;
+__device__ __forceinline__ PdlWaited pdl_wait();
+class PdlWaited {
+    __device__ PdlWaited() {}
+    friend __device__ PdlWaited pdl_wait();
+};
+__device__ __forceinline__ PdlWaited pdl_wait() {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    return PdlWaited();
+}
+template <class T>
+class After {
+  public:
+    After() = default;
+    __host__ __device__ After(T* p) : p_(p) {}  // NOLINT(google-explicit-constructor): host fills jobs / launch args
+    __device__ __forceinline__ T* operator()(const PdlWaited&) const { return p_; }
+
+  private:
+    T* p_ = nullptr;
+};
+
+// L2 prefetch of one 128-byte line (no register, no ordering against pdl_wait): the way a kernel streams its constant
+// weights before pdl_wait.
+__device__ __forceinline__ void prefetch_l2(const void* p) { asm volatile("prefetch.global.L2 [%0];" ::"l"(p)); }
 
 inline bool& pdl_enabled() {
     static bool on = true;
@@ -21,11 +57,12 @@ inline bool& pdl_enabled() {
 }
 
 template <class... KArgs, class... Args>
-cudaError_t launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, cudaStream_t stream, Args... args) {
+cudaError_t launch_pdl_smem(void (*kernel)(KArgs...), dim3 grid, dim3 block, std::size_t smem, cudaStream_t stream,
+                            Args... args) {
     cudaLaunchConfig_t cfg{};
     cfg.gridDim = grid;
     cfg.blockDim = block;
-    cfg.dynamicSmemBytes = 0;
+    cfg.dynamicSmemBytes = smem;
     cfg.stream = stream;
     cudaLaunchAttribute at[1];
     at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -33,6 +70,11 @@ cudaError_t launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, cudaStre
     cfg.attrs = at;
     cfg.numAttrs = pdl_enabled() ? 1 : 0;
     return cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
+}
+
+template <class... KArgs, class... Args>
+cudaError_t launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, cudaStream_t stream, Args... args) {
+    return launch_pdl_smem(kernel, grid, block, 0, stream, args...);
 }
 
 // Single points for transcendentals (a HIP twin swaps these for its own bit-matched versions).

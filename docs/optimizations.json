@@ -281,6 +281,17 @@
   },
   {
     "engine": "qwen",
+    "name": "Registration prefault",
+    "flag_or_env": "STRIX_MODEL_PREFAULT",
+    "default": "ON",
+    "exact": "Page residency only: the populate reads the file and writes nothing; same registered bytes; Qwen MoE greedy ids equal ON vs OFF.",
+    "gain": "One Strix Halo node, Qwen MoE GGUF (82.5 GB registered), same binary ON vs OFF: cold page cache load-only 21.9 vs 36.6 s, engine first token 84.9 vs 98.5 s; warm page cache 1.37 / 1.38 vs 1.99 / 2.00 s (ABAB).",
+    "preconditions": "Linux, --residency register (registered file mapping); applies to every HIP mapped-model registration.",
+    "off_switch": "STRIX_MODEL_PREFAULT=0",
+    "doc_anchor": "docs/optimizations.md#registration-prefault"
+  },
+  {
+    "engine": "qwen",
     "name": "Serving PLE table re-warm",
     "flag_or_env": "STRIX_PLE_REWARM",
     "default": "ON (bounded)",
@@ -839,6 +850,61 @@
     "preconditions": "Eager plain one-row decode on the CLI serial route; see the doc section for per-item shape and route conditions.",
     "off_switch": "STRIX_MOE_R1_GLUE_FUSE=0",
     "doc_anchor": "docs/optimizations.md#qwen-plain-decode-step"
+  },
+  {
+    "engine": "qwen",
+    "name": "Plain decode MoE slot merge in the A8 down launch",
+    "flag_or_env": "STRIX_MOE_R1_TAIL_FOLD",
+    "default": "1 (eager plain one-row decode, with STRIX_MOE_R1_GLUE_FUSE)",
+    "exact": "Byte-identical: device fixture strix-hip-moe-kquant-tests r1-slot-merge-tail (four down kernels, sticky status, non-finite and BF16-overflowing weights, invalid route, preset record, K 1/7/10) vs the down launch plus the incumbent tail; Qwen MoE 8K logits + 64 decode ids equal to main.",
+    "gain": "48 fewer launches per Qwen MoE token; 8K + 64 decode tokens 45.00 / 44.84 vs 44.47 / 44.68 ms/step (one pair per ticket, not a speed claim).",
+    "preconditions": "Eager deferred-status q4k-a8 runtime with A8 down, top_k <= 16, hidden % 64 == 0.",
+    "off_switch": "STRIX_MOE_R1_TAIL_FOLD=0",
+    "doc_anchor": "docs/optimizations.md#qwen-plain-decode-step"
+  },
+  {
+    "engine": "qwen",
+    "name": "Qwen 27B HIP decode launch fusion",
+    "flag_or_env": "STRIX_DECODE_FUSE",
+    "default": "1",
+    "exact": "Same arithmetic, same bits: plain decode ids equal to main over 128 tokens, speculative ids equal to plain over 1,200 tokens (Qwen 27B IU4).",
+    "gain": "plain decode 128 tokens 71.47 vs 70.26 ms/token (one pair per ticket, not a speed claim).",
+    "preconditions": "Qwen 27B dense HIP engine; prepared rows for IU4 projections of windows <= 16 rows.",
+    "off_switch": "STRIX_DECODE_FUSE=0",
+    "doc_anchor": "docs/optimizations.md#qwen27-hip-decode-step"
+  },
+  {
+    "engine": "qwen",
+    "name": "Qwen 27B HIP one IU4 weight sweep for 9..16-row windows",
+    "flag_or_env": "STRIX_IU4_ONE_SWEEP",
+    "default": "1",
+    "exact": "Same rows bitwise (host test decode-weight-sweep; decode and speculative ids above).",
+    "gain": "One weight stream instead of two for 9..16-row decode / verify windows; no separate timing.",
+    "preconditions": "Scalar-activation IU4 windows of 9..16 rows.",
+    "off_switch": "STRIX_IU4_ONE_SWEEP=0",
+    "doc_anchor": "docs/optimizations.md#qwen27-hip-decode-step"
+  },
+  {
+    "engine": "qwen",
+    "name": "Qwen 27B HIP decode attention row share (one K/V walk per kv head for several rows)",
+    "flag_or_env": "STRIX_DECODE_ATTN_ROW_SHARE",
+    "default": "1",
+    "exact": "Bitwise: one no-contraction arithmetic form, device test vs main's engine-built kernel under both flag sets (111 cases x 6 forms); decode ids identical on / off / main, plain and speculative, 8K and 32K.",
+    "gain": "Qwen 27B IU4, one node, 3 pairs: 8K plain 78.2 -> 76.3 ms/token; 32K plain 101.7 -> 93.6; 32K speculative code 62.2 -> 56.0, think 49.3 -> 40.35.",
+    "preconditions": "Qwen 27B dense HIP engine (24 q / 4 kv, Dim 256) on a device with a measured table (gfx1151, 20 multiprocessors); otherwise the main schedule.",
+    "off_switch": "STRIX_DECODE_ATTN_ROW_SHARE=0",
+    "doc_anchor": "docs/optimizations.md#qwen27-hip-decode-attn-row-share"
+  },
+  {
+    "engine": "qwen",
+    "name": "Qwen 27B HIP EXACT 64-row prefill windows",
+    "flag_or_env": "--wide-exact N (decode app), --prefill-rows N --prefill-exact (spec app)",
+    "default": "spec app: 64-row EXACT windows when every large dense projection is IU4 (16 rows otherwise); decode app: 16-row windows; pair app: --wide N FAST class",
+    "exact": "Every row bitwise the 16-row result: 2,048-token last-row logits bitwise and 4 ids equal (Qwen 27B IU4).",
+    "gain": "prefill 2,048 tokens --wide 16 132.5 / 132.5 vs --wide-exact 64 189.6 / 188.7 tok/s cold / warm (one ticket, not a speed claim).",
+    "preconditions": "IU4 large dense projections (qwen35::resolve_prefill_rows).",
+    "off_switch": "--prefill-rows 16 (spec app); omit --wide-exact (decode app)",
+    "doc_anchor": "docs/optimizations.md#qwen27-hip-decode-step"
   },
   {
     "engine": "qwen",
@@ -2954,6 +3020,17 @@
   },
   {
     "engine": "qwen-rtx",
+    "name": "PLE projections on the shared dense A8 projection (FAST form ple_a8)",
+    "flag_or_env": "--ple-a8 on|off; STRIX_QRTX_PLE_A8 (lever row ple_a8, identity qwen-cuda-ple-a8-v1)",
+    "default": "off (opt-in under --profile fast; not a FAST bundle member until its gate passes)",
+    "exact": "FAST class: changes the PLE keys and values in prefill blocks; verify / decode windows keep the exact projections. FAST gate not run yet. Off: the same launches as before.",
+    "gain": "Not yet measured.",
+    "preconditions": "CUDA Qwen MoE prefill blocks under --profile fast with --ple-a8 on (the row is runnable under fast only).",
+    "off_switch": "--ple-a8 off; STRIX_QRTX_PLE_A8=0",
+    "doc_anchor": "docs/optimizations.md#qwen-rtx-ple-a8"
+  },
+  {
+    "engine": "qwen-rtx",
     "name": "Prompt prefix cache",
     "flag_or_env": "--prefix-cache; STRIX_QRTX_PREFIX_CACHE; --prefix-cache-host-mb; --prefix-cache-vram-mb; --prefix-cache-block; --prefix-cache-stride",
     "default": "ON",
@@ -2962,6 +3039,17 @@
     "preconditions": "strix-cuda-qwen-serve; token ids sharing at least one 256-token block with an earlier prompt in the same process and compatibility key.",
     "off_switch": "--prefix-cache off; STRIX_QRTX_PREFIX_CACHE=0",
     "doc_anchor": "docs/optimizations.md#qwen-rtx-prefix-cache"
+  },
+  {
+    "engine": "qwen-rtx",
+    "name": "Tensor-core expert decode tile form",
+    "flag_or_env": "--expert-decode-tile; STRIX_QRTX_EXPERT_DECODE_TILE (lever row expert_decode_tile)",
+    "default": "ON in every profile; acts only where the tensor-core GSQ experts run (gsq_bf16_mma: the FAST expert arithmetic)",
+    "exact": "Bitwise the tile form: same MMAs and scale FMAs in the same order per output. The tile form compiles to the previous instructions for every type except IQ2_S project (schedule only, same floating-point opcode multiset). Greedy ids equal on prose / edit / json; teacher-forced FAST logits identical to the tile form on 645 rows of five contents; the arithmetic contract and the bundle id do not change.",
+    "gain": "RTX PRO 6000 600 W, FAST served decode e2e: prose 127.22 -> 137.6 / 138.98, edit 342.37 -> 380.98 / 378.97, json 287.14 -> 316.32 / 317.26 tok/s (one run before, two runs after).",
+    "preconditions": "CUDA Qwen MoE (strix-cuda-qwen-serve, qwen_tf_logits) with gsq_bf16_mma experts; steps of at most 16 rows (decode, MTP verify windows, and a prefill block of at most 16 rows: a short prompt or a tail block). Prefill blocks of more than 16 rows keep the tile form.",
+    "off_switch": "--expert-decode-tile off; STRIX_QRTX_EXPERT_DECODE_TILE=0",
+    "doc_anchor": "docs/optimizations.md#qwen-rtx-expert-decode-tile"
   },
   {
     "engine": "qwen",
@@ -3261,5 +3349,30 @@
     "preconditions": "Each lever keeps its own admission (route, shape, model assets, MTP/HTTP exclusions) and declines by itself with its own notice; an explicit per-lever value wins; STRIX_BASELINE=1 vetoes the profile.",
     "off_switch": "unset STRIX_QWEN_ALLON (or 0)",
     "doc_anchor": "docs/optimizations.md#qwen-all-on-composition-profile"
+  },
+  {"engine":"qwen-rtx","name":"Qwen dense 27B CUDA product profile","flag_or_env":"--profile exact|default|fast|quality (strix-cuda-qwen35-decode, strix-cuda-qwen35-spec)","default":"exact (no option changed)","exact":"exact leaves every option and the effective config unchanged (strix-qwen35-dense-profile-host-tests); FAST levers keep their own identities and gates (FAST4 + chunk16 8K/32K passed; attn8 32K passed; split-K FAST passed)","gain":"none of its own (selection only); FAST4 + chunk16 8K 13,437-13,714 tok/s","preconditions":"fast: --prefill-arith fast4 + --prefill-gdn chunk16 on the decode CLI large prefill with --turbo-weights onfly|converted; --prefill-attn8 on from 32,768 prompt tokens; --split-k fast on the spec CLI (decode windows) with --turbo-weights onfly|converted; split-k pending on the decode CLI (no gate with FAST4); turbo refused","off_switch":"--profile exact or the lever's own option","doc_anchor":"docs/optimizations.md#qwen-dense-cuda-profile"},
+  {"engine":"qwen-rtx","name":"Qwen dense 27B CUDA decode attention on an e4m3 K/V shadow (decode_attn8)","flag_or_env":"--decode-attn8 on|off (strix-cuda-qwen35-decode, strix-cuda-qwen35-spec)","default":"off; --profile fast does not apply it (quality gate pending)","exact":"FAST class (bit-changing, identity -d8); verify of R rows == R one-row decode steps inside the class; off = exact attention_decode, exact and e4m3 prefill kernels machine-code identical; gate 8K/28K/64K not run","gain":"not yet measured","preconditions":"CUDA Qwen dense 27B main session; spec CLI also covers its prefill windows; slot batches and the MTP block keep BF16","off_switch":"--decode-attn8 off (default) or --profile exact","doc_anchor":"docs/optimizations.md#qwen-dense-cuda-decode-attn8"},
+  {"engine":"qwen-rtx","name":"Qwen dense 27B CUDA NVFP4 GEMV split-K FAST (nvfp4-splitk-fast-v1)","flag_or_env":"--split-k exact|fast (strix-cuda-qwen35-decode, strix-cuda-qwen35-spec); --profile fast on the spec CLI","default":"exact (nvfp4-splitk-exact-v1, target 1000 blocks per call)","exact":"FAST class (bit-changing, identity -skf1): gate EXACT -> FAST 4 x 512 rows pooled KL 0.00000 (q99 9.5e-06), top-1 0.9990, dNLL -0.00000; spec ids == FAST serial x1200 (code, think, en, ja); --split-k exact ids == EXACT serial","gain":"RTX PRO 6000 600 W, converted NVFP4, spec decode sub15d x1200, 2 A/B pairs: think 262.02/261.66 -> 263.83/263.90 tok/s (verify 14.07/14.08 -> 13.99/13.98 ms/step); code 334.32/333.94 -> 335.53/336.18 tok/s (within 3x spread)","preconditions":"NVFP4 weights (onfly|converted); split_k_policy rows for 188 SMs cc 12.0, other devices run EXACT targets; --profile fast applies it on the spec CLI only (decode CLI pending: no gate with FAST4)","off_switch":"--split-k exact (also under --profile fast) or --profile exact","doc_anchor":"docs/optimizations.md#qwen-dense-cuda-splitk-fast"},
+  {
+    "engine": "qwen",
+    "name": "Qwen 27B CUDA decode attention row share",
+    "flag_or_env": "STRIX_DECODE_ATTN_ROW_SHARE",
+    "default": "ON (1): shared plan picks the walk per active chunk count; one row or a short prefix runs the one-row grid",
+    "exact": "Bitwise: device test vs the frozen one-row kernels (rows 1/2/3/4/5/7/12/13/16 at ~1K/33K/131K x modes off/automatic/all; short cases at group widths 4/6/8), scratch and output equal.",
+    "gain": "Kernel bench (one call, 24 q / 4 kv, Dim 256, RTX PRO 6000; automatic / off ms, same binary): 32K rows 12 0.528 / 0.699; 131K rows 12 2.15 / 4.31. Model 28K code x 400 (one run per arm, switch only): off 173.09 -> automatic 176.96 tok/s. Against the previous kernels: bench rows 2-16 at 1K-131K <= 0.442 of their time; model 28K x 400 (one run per arm, ids equal) code 121.54 -> 176.56, reasoning 130.54 -> 194.64, prose 101.29 -> 135.84 tok/s.",
+    "preconditions": "CUDA decode attention through cuda_core::attention_decode with more than one row (Qwen 27B dense verify / draft / plain) on a measured device and head shape (shared table: sm_120 with 188 SMs, 24 q / 4 kv, Dim 256); others keep the one-row grid (same bits).",
+    "off_switch": "STRIX_DECODE_ATTN_ROW_SHARE=0",
+    "doc_anchor": "docs/optimizations.md#qwen27-cuda-decode-attn-row-share"
+  },
+  {
+    "engine": "qwen-rtx",
+    "name": "Qwen dense 27B CUDA spec: verify pre-launch behind the device-fed MTP draft",
+    "flag_or_env": "--prelaunch 0|1 (strix-cuda-qwen35-spec)",
+    "default": "off (0) until its timing receipt",
+    "exact": "Scheduling only: same verify graph on the same position / id contents in the same stream order; emitted ids equal the serial greedy ids in every block (host tests).",
+    "gain": "Not yet measured.",
+    "preconditions": "CUDA Qwen dense spec CLI with the MTP chain drafter (chain-only and hybrid blocks); other drafters and engines run the serial form.",
+    "off_switch": "--prelaunch 0",
+    "doc_anchor": "docs/optimizations.md#qwen-dense-cuda-verify-prelaunch"
   }
 ]

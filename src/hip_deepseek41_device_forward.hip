@@ -1847,8 +1847,21 @@ const std::vector<std::uint32_t>& DeviceForward::run_step(std::span<const std::u
     static const bool attn_a8 = strix::envcfg::flag("STRIX_DS41_ATTN_A8", false);
     const bool fuse_hc = hc_site_flag && !hashing && !m.options.layer_timing;
     const bool fuse_qa_kv = qa_kv_flag && !hashing;
-    struct PendingPost { bool on = false; const float* sub = nullptr; const float* residual = nullptr; const ds41::HcMix* mixes = nullptr; };
+    // sub_low / sub_high (both or neither): the expansion reads (sub + sub_low) + sub_high, the canonical rank sum, where it
+    // reads sub (HcSiteView::sub_low); the three buffers stay unwritten until the expansion is enqueued (stored_post).
+    struct PendingPost {
+        bool on = false;
+        const float* sub = nullptr;
+        const float* residual = nullptr;
+        const ds41::HcMix* mixes = nullptr;
+        const float* sub_low = nullptr;
+        const float* sub_high = nullptr;
+    };
     PendingPost post;              // an expansion not yet enqueued; stream_now() is already its output
+    // The routed halves of a combine whose canonical sum (shared + low) + high was not stored in y: the hc_post(ffn) right
+    // after it takes them as its expansion's sub terms (low is rank 0's half on both ranks).
+    struct SumTerms { const float* low = nullptr; const float* high = nullptr; };
+    SumTerms sum_terms;
     std::int64_t capture_at = -1;  // the layer whose input is captured once the pending expansion is stored
     const Step* site_mix = nullptr;
     // STRIX_DS41_LATE_HC_LAYERS (P17.5, default all; none = off; measured R1 -0.2, R6 -0.35, batch N=2..8 -0.6..-1.5 ms): on those layers, with HC_SITE and tensor-parallel attention, the attention site
@@ -1909,7 +1922,7 @@ const std::vector<std::uint32_t>& DeviceForward::run_step(std::span<const std::u
     };
     const auto flush_post = [&] {
         if (!post.on) return;
-        ds41::enqueue_hc_expand(post.sub, post.residual, post.mixes, R, H, stream_now(), st);
+        ds41::enqueue_hc_expand(post.sub, post.residual, post.mixes, R, H, stream_now(), st, post.sub_low, post.sub_high);
         stored_post();
     };
     // One hc site: the pending expansion (if any), the mixes of `mix` (if any) into mixes_out, then the collapse by
@@ -1923,6 +1936,8 @@ const std::vector<std::uint32_t>& DeviceForward::run_step(std::span<const std::u
             v.sub = post.sub;
             v.residual = post.residual;
             v.expand_mixes = post.mixes;
+            v.sub_low = post.sub_low;
+            v.sub_high = post.sub_high;
         }
         v.stream = stream_now();
         if (mix) {
@@ -2025,6 +2040,18 @@ const std::vector<std::uint32_t>& DeviceForward::run_step(std::span<const std::u
     using SplitRawExchange = xport::Ds41RawSlotsExchange<
         std::remove_reference_t<decltype(*m.options.communicator)>, hipStream_t, dist::Tag>;
     std::optional<SplitRawExchange> split_raw_exchange;
+    // A combine's y = (shared + low) + high. When the next plan step is this layer's fused hc_post(ffn), the only reader
+    // of y, the sum is not stored: that expansion reads the three buffers (same expression and order), which nothing
+    // writes before the next site, the Engram flush, the head or the stage-end flush enqueues it. Otherwise y is stored.
+    const auto canonical_sum_or_terms = [&](const Step* at, const float* low, const float* high) {
+        const Step* end = m.plan.steps.data() + m.plan.steps.size();
+        const Step* next = at + 1;
+        if (fuse_hc && next != end && next->op == Op::hc_post && next->site == "ffn" && next->layer == at->layer) {
+            sum_terms = {low, high};
+            return;
+        }
+        ds41::enqueue_canonical_sum(m.shared.p, low, high, std::size_t{R} * H, m.y.p, st);
+    };
     for (const auto& s : m.plan.steps) {
         const double comm_before = step_events || tr ? m.comm_seconds() : 0.0;
         const auto layer = static_cast<std::uint32_t>(std::max(s.layer, 0));
@@ -2583,6 +2610,14 @@ const std::vector<std::uint32_t>& DeviceForward::run_step(std::span<const std::u
                 post.sub = m.y.p;
                 post.residual = stream_now();
                 post.mixes = s.site == "attn" ? m.mix_attn.p : m.mix_ffn.p;
+                post.sub_low = nullptr;
+                post.sub_high = nullptr;
+                if (sum_terms.low) {  // the combine just before (ffn only) left y unstored: the site sums its terms
+                    post.sub = m.shared.p;
+                    post.sub_low = sum_terms.low;
+                    post.sub_high = sum_terms.high;
+                    sum_terms = {};
+                }
                 m.cur = next;
                 if (s.site == "ffn") {
                     m.identity_pre = false;
@@ -2918,7 +2953,7 @@ const std::vector<std::uint32_t>& DeviceForward::run_step(std::span<const std::u
                     });
                 const float* low = m.options.rank == 0U ? m.half_own.p : m.half_other.p;
                 const float* high = m.options.rank == 0U ? m.half_other.p : m.half_own.p;
-                ds41::enqueue_canonical_sum(m.shared.p, low, high, std::size_t{R} * H, m.y.p, st);
+                canonical_sum_or_terms(&s, low, high);
                 break;
             }
             // two ranks emulated on one node: each rank's weighted half sum, then (shared + low) + high
@@ -2941,7 +2976,7 @@ const std::vector<std::uint32_t>& DeviceForward::run_step(std::span<const std::u
                 ds41::enqueue_add_f32(m.low.p, m.high.p, std::size_t{R} * H, m.y.p, st);
                 break;
             }
-            ds41::enqueue_canonical_sum(m.shared.p, m.low.p, m.high.p, std::size_t{R} * H, m.y.p, st);
+            canonical_sum_or_terms(&s, m.low.p, m.high.p);
             break;
         }
         case Op::head: {

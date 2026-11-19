@@ -15,6 +15,13 @@ in [docs/engine/serving/serving.md](engine/serving/serving.md).
 | GLM-5.3 Flash pair | `strix-glm5-serve` (one per rank) | chat and completions routes with SSE; continuous batching of up to eight requests, every request's tokens equal the same request served alone; exact MTP at one request, batched MTP verify from two (`STRIX_GLM_SERVE_G2=0` off); decode-first chunked prefill (`--prefill-chunk`, 0 off); exact prompt-prefix cache, 4 GiB per rank by default (`--prefix-cache-gib 0` off) (measured rows: prefix cache off; 8 built-in short chat prompts in the GLM chat template, 22–59 prompt tokens (mean ~33), up to 128 greedy tokens each, barrier start) | [GLM page](models/glm-5.3/README.md#glm-serve) |
 | Nemotron 3.5 Bolt E4B | `strix-gemma4-serve` | continuous batching of up to eight chat requests (`STRIX_G4_SERVE_SLOTS`), every request's tokens equal the same request served alone; MTP drafter and prompt lookup at one request; `--profile default\|fast\|quality` | [Nemotron page](models/nemotron-3.5-bolt-e4b/README.md#how-fast) |
 
+Qwen on one node with an explicit MTP sidecar recipe (for example
+`recipes/qwen-distill-g-yarn.mtp-bundle.json`): the recipe's target windows need a fixed target
+organization (17 flags, including `--virtual-q8-lm-head --prefetch-q8-lm-head`) and a calibration
+golden dumped with the tiled command. The server names any missing flag before loading the model.
+The two commands, verified on a 124 GiB Strix Halo node with the 111.3 GB UD-Q4_K_XL target, are in
+[engine/serving/serving.md](engine/serving/serving.md#one-node-explicit-sidecar-mtp-recipe).
+
 ## Exposing the servers
 
 Qwen and DeepSeek publish executed features at `GET /v1/capabilities`; each response's `strix` object

@@ -140,3 +140,7 @@ Served prefill by length for any OpenAI-compatible server: `scripts/bench/common
 `serve-decode.sh --client-cmd` client; finite positive client TTFT and measured positive usage.prompt_tokens are
 required). Rows preserve input order without cold/warm labels or length grouping. `tools/serve_bench.py` reports
 `peak_1s_tok_s` only with measured per-chunk token counts; ordinary SSE text plus final usage leaves it null.
+Multi-turn sessions for any OpenAI-compatible server: `scripts/bench/common/session_turns.py` (also a
+`--client-cmd` client): one conversation over T turns, N sibling conversations with the same system prompt and tools,
+and the history with user turn 2 edited; per request it prints wall time (max_tokens small), prompt tokens,
+`cached_tokens` and a hash of the answer (equal hashes across arms = same greedy answer).

@@ -21,9 +21,12 @@
 
 #include "strix/cuda/qwen_dense.hpp"
 #include "strix/cuda/qwen_gdn.hpp"
+#include "../../core/head_argmax.cuh"
 #include "strix/cuda/qwen_hc.hpp"
+#include "strix/cuda/qwen_hc_fp16_range.hpp"
 #include "strix/cuda/amd_math.cuh"
 #include "strix/cuda/qwen_moe.hpp"
+#include "strix/cuda/qwen_mtp_defer.hpp"
 #include "strix/cuda/qwen_mtp_draft.hpp"
 #include "strix/cuda/qwen_plemtp.hpp"
 #include "strix/cuda/qwen_qsa.hpp"
@@ -71,6 +74,7 @@ namespace qsa = strix::cuda::qwen_qsa;
 namespace moe = strix::cuda::qwen_moe;
 namespace pm = strix::cuda::qwen_plemtp;
 namespace md = strix::cuda::qwen_mtp_draft;
+namespace qmd = strix::cuda::qwen_mtp_defer;
 
 using Clock = std::chrono::steady_clock;
 
@@ -220,6 +224,7 @@ bool nvtx_on() {
     static const bool on = strix::envcfg::flag("STRIX_QRTX_NVTX", false);
     return on;
 }
+
 inline void nvtx_push(const char* name) { if (nvtx_on()) nvtxRangePushA(name); }
 inline void nvtx_pop() { if (nvtx_on()) nvtxRangePop(); }
 // Ranges of one run_block: whatever is still open when it unwinds (an exception mid-enqueue) is popped.
@@ -284,6 +289,10 @@ struct BlockFields {
     float* moe_inter = nullptr;                // native path: FP32 h per (row, slot)
     moe::Csr csr{};
     std::uint16_t* tap = nullptr;              // wide rows after layer 47 (MTP)
+    // A prefill block keeps its layer-47 rows after the first kMaxWindowRows rows, where the decode windows put theirs
+    // (run_block, window ? tap : block_tap()): no window overwrites a block's rows, so a deferred MTP call
+    // (Config::defer_prompt_mtp) still reads them after the first verify windows.
+    std::uint16_t* block_tap() const { return tap + qmd::block_tap_first_row(kMaxWindowRows) * kWide; }
     // PLE rows
     std::uint64_t* ple_ids_host = nullptr;     // pinned [cap][16] (host hashing; graph memcpy source in decode)
     std::uint64_t* ple_ids = nullptr;
@@ -339,6 +348,7 @@ struct Prefill::Impl : BlockFields {
     // open cohort window (session i at its window_offset) until commit_cohort.
     bool window = false;                       // run_block in window mode (GDN rows kept per layer, split state)
     Config::Forms executed_forms;
+    int hc_inject_exp = 0;                     // hc_mma FP16 inject operand exponent (upload_model admission; qwen_hc_fp16_range.hpp)
     bool executed_moe_route_bf16 = false;
     bool cohort_open = false;
     std::vector<SessionState*> cohort;         // the sessions of the open window, in cohort order
@@ -367,6 +377,8 @@ struct Prefill::Impl : BlockFields {
     ~Impl() { if (trace_file) std::fclose(trace_file); if (trace_host) cudaFreeHost(trace_host); }
     std::size_t graph_cap = 512;                   // layouts up to 16 rows (C8 with 1-draft windows: 256)
     std::uint64_t graph_clock = 0, graph_captures = 0, graph_replays = 0, graph_evictions = 0, eager_windows = 0;
+    // Routed-MoE window rows receipt (moe_rows_policy): 9..15-row windows counted at verify_cohort.
+    std::uint64_t moe_real_row_windows = 0, moe_padding_rows_skipped = 0, moe_padded_windows = 0;
     void drop_graph(std::map<GraphKey, StepGraph>::iterator it);
     std::uint32_t* ids_pinned = nullptr;           // [8] window tokens (graph memcpy source)
     std::uint32_t* argmax_pinned = nullptr;        // [8]
@@ -494,6 +506,7 @@ struct Prefill::Impl : BlockFields {
             throw std::logic_error("state copy with an open window or chunk in flight");
         if (!state_copy.stream)
             ck(cudaStreamCreateWithFlags(&state_copy.stream, cudaStreamNonBlocking), "state copy stream");
+        mtp_on(qmd::Use::read_rows, s);  // the rows a copy reads are complete (an import drops them first)
         ck(cudaStreamSynchronize(stream), "state copy producer");
         return state_copy.stream;
     }
@@ -515,7 +528,29 @@ struct Prefill::Impl : BlockFields {
     SessionState* pre_session = nullptr;       // the session whose chunk is in flight (prefill_wait)
     std::uint64_t pre_length = 0;
     std::uint32_t prefill_enqueue(SessionState& S, const std::vector<std::uint32_t>& tokens, std::uint64_t position,
-                                  std::uint64_t from, std::uint32_t max_rows);
+                                  std::uint64_t from, std::uint32_t max_rows, bool defer_mtp = false);
+    // Config::defer_prompt_mtp: the MTP rows of the engine set's last prompt block, not yet launched. The call reads the
+    // engine set's block_tap() rows [0, count) and mtp_next [0, count); both stay intact until the next prefill block on
+    // the engine set, which settles first. One record: the block buffers hold one block.
+    struct DeferredMtp {
+        SessionState* session = nullptr;
+        std::uint64_t first = 0;   // position of the first pair
+        std::uint32_t count = 0;   // pairs
+        bool mma = false;          // Config::forms.mtp_mma at the block
+    };
+    DeferredMtp mtp_defer{};
+    bool mtp_inflight = false;     // a settled call may still run on `stream` (verify_cohort waits for it)
+    // Launches the deferred call on `stream`, the identical call the block would have made. Never while a prefill set is
+    // swapped in (the record names the engine set's buffers).
+    void mtp_settle();
+    // The policy of include/strix/cuda/qwen_mtp_defer.hpp for a use of session `target`.
+    void mtp_on(qmd::Use use, const SessionState& target, bool fresh = false) {
+        switch (qmd::on_use(mtp_defer.session != nullptr, mtp_defer.session == &target, use, fresh)) {
+        case qmd::Action::settle: mtp_settle(); break;
+        case qmd::Action::drop: mtp_defer = {}; break;
+        case qmd::Action::none: break;
+        }
+    }
     // The block's segments (one per session, rows concatenated). pad: rows of the row-independent steps (>= total rows).
     void run_block(const Segment* seg, std::uint32_t count, std::uint32_t pad);
 };
@@ -523,8 +558,8 @@ struct Prefill::Impl : BlockFields {
 void Prefill::Impl::upload_model() {
     // Retain admission of the original merged headers. `info` below describes device storage after transcode.
     admission = qwen_packs::admit_model(cfg.model_gguf,qwen_packs::expert_arithmetic_name(cfg.expert_arithmetic));
-    if(cfg.expert_arithmetic==qwen_packs::ExpertArithmetic::gsq_a8_dot4 && cfg.forms.moe_mma)
-        throw std::invalid_argument("GSQ A8: single-chain moe_mma composition unqualified");
+    if(cfg.expert_arithmetic!=qwen_packs::ExpertArithmetic::incumbent && cfg.forms.moe_mma)
+        throw std::invalid_argument("explicit GSQ expert arithmetic: single-chain moe_mma composition unqualified");
     if (!admission.pack) throw std::runtime_error("Qwen weight pack not admitted: " + admission.reason);
     constexpr std::uint64_t kChunk = std::uint64_t{256} << 20;
     std::uint8_t* staging[2] = {nullptr, nullptr};
@@ -661,7 +696,26 @@ void Prefill::Impl::upload_model() {
         probe.down_type = lw[l].down_type;
         native_experts = native_experts || moe::native_types(probe);
     }
-    if(cfg.expert_arithmetic==qwen_packs::ExpertArithmetic::gsq_a8_dot4 && route_policy.enabled)
+    if (cfg.forms.hc_mma) {  // FAST hc_mma: its FP16 range argument is checked on this model's weights (qwen_hc_fp16_range.hpp)
+        namespace hr = strix::cuda::qwen_hc::fp16_range;
+        hr::Scan scan;
+        std::vector<float> host(4U * kWide);
+        for (std::uint32_t l = 0; l < kLayers; ++l)
+            for (const auto& [norm, inject] : {std::pair{k_hc_attn_norm, k_hc_attn_inject}, std::pair{k_hc_ffn_norm, k_hc_ffn_inject}}) {
+                if (!lw[l].p[norm] || !lw[l].p[inject]) throw std::runtime_error("hc_mma admission: HC norm/inject missing in layer " + std::to_string(l));
+                ck(cudaMemcpy(host.data(), lw[l].p[norm], kWide * sizeof(float), cudaMemcpyDeviceToHost), "hc_mma admission norm");
+                hr::scan_norm(scan, host.data(), kWide);
+                ck(cudaMemcpy(host.data(), lw[l].p[inject], 4U * kWide * sizeof(float), cudaMemcpyDeviceToHost), "hc_mma admission inject");
+                hr::scan_inject(scan, host.data(), 4U * kWide);
+            }
+        if (const auto why = hr::refusal(scan); !why.empty())
+            throw std::runtime_error("hc_mma (qwen-cuda-hc-f16mma-v2) refused for this model: " + why);
+        hc_inject_exp = hr::inject_exp(scan);  // every non-zero inject weight survives FP16 (no silent drop)
+        std::fprintf(stderr, "hc_mma admission: inject |w| %.4g .. %.4g, operand shift 2^%d (%zu weights would round to FP16 zero "
+                     "and %zu to subnormals unshifted)\n", static_cast<double>(scan.inject_min_nonzero_abs),
+                     static_cast<double>(scan.inject_max_abs), hc_inject_exp, scan.inject_underflow, scan.inject_subnormal);
+    }
+    if(cfg.expert_arithmetic!=qwen_packs::ExpertArithmetic::incumbent && route_policy.enabled)
         qwen_route::require_composition(true,qwen_route::Composition::other_weight_pack);
     // Validate the route against source admission. FAST dense transcodes may still have A8 experts.
     if (admission.pack->arithmetic == "exact" && native_experts)
@@ -833,7 +887,7 @@ void Prefill::Impl::allocate_block(std::uint32_t rows, std::uint32_t qsa_chunk, 
     emb = dev_zero<std::uint16_t>(R * kHidden, "emb");
     wide_a = dev_zero<std::uint16_t>(R * kWide, "wide a");
     wide_b = dev_zero<std::uint16_t>(R * kWide, "wide b");
-    tap = dev_zero<std::uint16_t>(R * kWide, "tap");
+    tap = dev_zero<std::uint16_t>(qmd::tap_rows(kMaxWindowRows, cap) * kWide, "tap");  // window rows, then the block's (block_tap)
     hidden = dev_zero<std::uint16_t>(R * kHidden, "hidden");
     step_out = dev_zero<std::uint16_t>(R * kHidden, "step out");
     injection = dev_zero<float>(R * 4, "injection");
@@ -958,7 +1012,8 @@ void Prefill::Impl::allocate() {
     }
     if (cfg.decode) {
         head_logits = dev_zero<float>(std::uint64_t{kMaxWindowRows} * hc::kVocab, "head logits");
-        argmax_dev = dev_zero<std::uint32_t>(kMaxWindowRows, "argmax");
+        // [kMaxWindowRows] ids, then the shared head pick's chunk workspace (strix/head_argmax.hpp)
+        argmax_dev = dev_zero<std::uint32_t>(kMaxWindowRows + strix::head_argmax::workspace_bytes(kMaxWindowRows) / 4U, "argmax");
         ck(cudaMallocHost(&ids_pinned, kMaxWindowRows * 4), "pinned ids");
         ck(cudaMallocHost(&argmax_pinned, kMaxWindowRows * 4), "pinned argmax");
         moe_sticky = dev_zero<std::uint32_t>(1 + kMaxWindowRows, "moe sticky");
@@ -1384,6 +1439,17 @@ std::string Prefill::residency_receipt_json() const {
     if (!impl_->tier) return "{\"expert_residency\":\"full\"}";
     return impl_->tier->receipt_json();
 }
+MoeRowsPolicy Prefill::moe_rows() const { return moe_rows_policy(impl_->cfg.moe_real_rows, impl_->tier != nullptr); }
+std::string_view Prefill::weight_pack_id() const { return impl_->admission.pack->id; }
+bool Prefill::native_experts() const { return impl_->native_experts; }
+std::string Prefill::moe_rows_receipt_json() const {
+    const auto& m = *impl_;
+    const auto p = moe_rows_policy(m.cfg.moe_real_rows, m.tier != nullptr);
+    const auto b = [](bool v) { return v ? std::string("true") : std::string("false"); };
+    return "{\"requested\":" + b(p.requested) + ",\"effective\":" + b(p.effective) + ",\"reason\":\"" + p.reason +
+           "\",\"real_row_windows\":" + std::to_string(m.moe_real_row_windows) + ",\"padding_rows_skipped\":" +
+           std::to_string(m.moe_padding_rows_skipped) + ",\"padded_windows\":" + std::to_string(m.moe_padded_windows) + "}";
+}
 std::uint64_t Prefill::card_budget_bytes() const {
     // a cap the plan used (flag, environment or device profile) or the tiered route: the engine was sized to it
     return impl_->plan.decision.cap_source != "card" || impl_->tier ? impl_->plan.decision.budget : 0ULL;
@@ -1417,6 +1483,13 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         trace_cap = rows;
     }
     if (pad > rows) ck(cudaMemsetAsync(ids, 0, std::uint64_t{pad} * 4, stream), "ids clear");
+    // Routed rows of a decode window: its real rows. The padding rows of a 9..15-row window (token 0 over stale
+    // attention-core rows, never read back) would otherwise route top-k on row-varying garbage and stream those experts'
+    // bytes (a 9-row window then pays about the 16-row MoE), and a non-finite padding row would set the window-wide CSR
+    // failure word. Each row's routed chain does not depend on the other rows (windows are batch-invariant; 1..8-row
+    // windows already route exactly their rows), so the real rows' bits are unchanged. Prefill blocks and the tiered
+    // path keep `pad`.
+    const std::uint32_t moe_rows = moe_block_rows(moe_rows_policy(cfg.moe_real_rows, tier != nullptr), window, rows, pad);
     for (std::uint32_t i = 0; i < count; ++i)
         ck(cudaMemcpyAsync(ids + seg[i].offset, seg[i].tokens, std::uint64_t{seg[i].rows} * 4, cudaMemcpyHostToDevice, stream), "ids");
     nv.push("embed");
@@ -1436,6 +1509,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         a.injection = injection;
         a.output = hidden;
         a.mma = cfg.forms.hc_mma && !window;  // FAST form on run()'s prefill blocks only; verify/step windows stay exact
+        a.inject_exp = hc_inject_exp;
         a.workspace_layout = hc::HcWorkspaceLayout::automatic;
         hc::hc_mix(a, tables, stream);
         executed_forms.hc_mma |= a.mma;
@@ -1453,10 +1527,23 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
             ck(cudaMemcpyAsync(ple_ids, ple_ids_host, std::uint64_t{rows} * pm::kPleHeads * 8, cudaMemcpyHostToDevice, stream),
                "ple ids");
             pm::launch_ple_gather_iq4nl(ple_table_dev, ple_table_rows, ple_ids, rows, ple_rows, pm::kPleWidth, ple_status, stream);
-            pm::launch_ple_project(ple_rows, pm::kPleWidth, rows, w.get("blk.1.ple_key.weight"), pm::kPleWidth, pm::kExpanded,
-                                   ple_keys, pm::kExpanded, stream);
-            pm::launch_ple_project(ple_rows, pm::kPleWidth, rows, w.get("blk.1.ple_value.weight"), pm::kPleWidth, pm::kHidden,
-                                   ple_values, pm::kHidden, stream);
+            if (cfg.forms.ple_a8 && !window) {
+                // FAST ple_a8 (qwen-cuda-ple-a8-v1): both projections read the same gathered rows, so they are two
+                // segments of ONE shared dense A8 projection (one quantize, one launch); verify/step windows stay exact.
+                dn::Site ps;
+                ps.store = dn::Store::f32;
+                ps.width = pm::kPleWidth;
+                ps.segments = 2;
+                ps.segment[0] = {w.get("blk.1.ple_key.weight"), pm::kExpanded, ple_keys, pm::kExpanded};
+                ps.segment[1] = {w.get("blk.1.ple_value.weight"), pm::kHidden, ple_values, pm::kHidden};
+                ck(dn::quantize_project(stream, ps, rows, dn::Input::bf16, ple_rows, pm::kPleWidth, codes, deltas, cap), "ple a8");
+                executed_forms.ple_a8 = true;
+            } else {
+                pm::launch_ple_project(ple_rows, pm::kPleWidth, rows, w.get("blk.1.ple_key.weight"), pm::kPleWidth,
+                                       pm::kExpanded, ple_keys, pm::kExpanded, stream);
+                pm::launch_ple_project(ple_rows, pm::kPleWidth, rows, w.get("blk.1.ple_value.weight"), pm::kPleWidth,
+                                       pm::kHidden, ple_values, pm::kHidden, stream);
+            }
             // the tail carries the session's PLE conv history: per session, on its rows
             for (std::uint32_t i = 0; i < count; ++i) {
                 const std::uint64_t off = seg[i].offset;
@@ -1582,8 +1669,8 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         mix(lw[l].p[k_hc_ffn_norm], lw[l].p[k_hc_ffn_inject], hc_ffn[l]);
         nv.pop();
         nv.push("moe_route");
-        hc::route_logits(hidden, static_cast<const float*>(lw[l].p[k_ffn_gate_inp_weight]), pad, logits, stream);
-        hc::route_select(logits, pad, kTopK, true, tables, routes, route_w, stream);
+        hc::route_logits(hidden, static_cast<const float*>(lw[l].p[k_ffn_gate_inp_weight]), moe_rows, logits, stream);
+        hc::route_select(logits, moe_rows, kTopK, true, tables, routes, route_w, stream);
         nv.pop();
         if (trace_file) ck(cudaMemcpyAsync(trace_host + std::uint64_t{l} * rows * kTopK, routes, std::uint64_t{rows} * kTopK * 4,
                                            cudaMemcpyDeviceToHost, stream), "expert trace");
@@ -1624,6 +1711,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         mr.csr = csr;
         moe::Weights ew;
         ew.arithmetic=cfg.expert_arithmetic;
+        ew.decode_tile = cfg.expert_decode_tile;
         ew.gate_type = lw[l].gate_type;
         ew.down_type = lw[l].down_type;
         ew.gate = static_cast<const std::uint8_t*>(lw[l].p[k_ffn_gate_exps_weight]);
@@ -1632,7 +1720,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         nv.push("moe_routed");
         if (!tier) {
             // FAST form: prefill blocks only; the receipt records what was dispatched (native experts fall back).
-            executed_forms.moe_mma |= moe::enqueue(mr, pad, kHidden, ew, tables, nullptr, stream, cfg.forms.moe_mma && !window);
+            executed_forms.moe_mma |= moe::enqueue(mr, moe_rows, kHidden, ew, tables, nullptr, stream, cfg.forms.moe_mma && !window);
         } else {
             // Tiered: the prologue reads the real ids; publish maps them to slots (misses -> the zero slot) and hands the
             // misses to the host; the routed kernels run on the slot routes; gather brings the host raw dots back.
@@ -1661,7 +1749,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         executed_moe_route_bf16 |= mr.route_bf16;
         nv.pop();
         if (window) {
-            moe_sticky_kernel<<<1, 32, 0, stream>>>(csr.summary, moe_status, 4, pad, moe_sticky);
+            moe_sticky_kernel<<<1, 32, 0, stream>>>(csr.summary, moe_status, 4, moe_rows, moe_sticky);
             ck(cudaGetLastError(), "moe sticky");
         }
         if (side) ck(cudaStreamWaitEvent(stream, side_join, 0), "side join wait");
@@ -1669,7 +1757,8 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         hc::combine(shared_out, routed_out, pad, combined, stream);
         inject(combined);
         nv.pop();
-        if (l == kLayers - 1U) ck(cudaMemcpyAsync(tap, wide, std::uint64_t{pad} * kWide * 2, cudaMemcpyDeviceToDevice, stream), "tap");
+        if (l == kLayers - 1U)
+            ck(cudaMemcpyAsync(window ? tap : block_tap(), wide, std::uint64_t{pad} * kWide * 2, cudaMemcpyDeviceToDevice, stream), "tap");
         if (after_layer) after_layer(l);
     }
     final_wide = wide;
@@ -1787,6 +1876,8 @@ Timing Prefill::run(SessionId session, const std::vector<std::uint32_t>& tokens,
         copy.trace_id = static_cast<std::uint64_t>(p.data-m.host)+1;
         sink(copy);
     };
+    // the block buffers are rewritten: a deferred MTP call of another session runs first; this session's is discarded
+    m.mtp_on(qmd::Use::engine_block, S, true);
     const auto t0 = Clock::now();
     Timing timing;
     m.executed_forms = {};
@@ -1817,7 +1908,7 @@ Timing Prefill::run(SessionId session, const std::vector<std::uint32_t>& tokens,
             const Segment seg{&S, tokens.data() + p0, p0, rows, 0};
             m.run_block(&seg, 1, std::max<std::uint32_t>(16U, round_up(rows, 8U)));
             if (S.held && p0 + rows == position)  // decode: h_{position-1} seeds the first draft chain
-                ck(cudaMemcpyAsync(S.held, m.tap + std::uint64_t{rows - 1} * kWide, kWide * 2, cudaMemcpyDeviceToDevice, m.stream), "held");
+                ck(cudaMemcpyAsync(S.held, m.block_tap() + std::uint64_t{rows - 1} * kWide, kWide * 2, cudaMemcpyDeviceToDevice, m.stream), "held");
             mark_stream(m.stream, "compute_end", k, {}, p0, rows, 0);
             if (m.mtp && p0+rows == position) {
                 const auto pairs = position-1-p0;
@@ -1931,7 +2022,7 @@ Timing Prefill::run(SessionId session, const std::vector<std::uint32_t>& tokens,
                 ck(cudaMemcpyAsync(m.mtp_next, m.next_host.data(), std::uint64_t{n} * 4, cudaMemcpyHostToDevice, m.stream), "mtp next");
                 const auto mwts = m.mtp_weights();
                 mark_stream(m.stream, "mtp_compute_start", k, {}, p0, n, 0);
-                pm::launch_mtp_cache_rows(mwts, pm::MtpRounding{.mma = m.cfg.forms.mtp_mma}, m.tap, m.mtp_next, n, p0, S.mtp_kv, S.mtp_index, m.mtp_ws,
+                pm::launch_mtp_cache_rows(mwts, pm::MtpRounding{.mma = m.cfg.forms.mtp_mma}, m.block_tap(), m.mtp_next, n, p0, S.mtp_kv, S.mtp_index, m.mtp_ws,
                                           m.mtp_status, m.tables, m.stream);
                 m.executed_forms.mtp_mma |= m.cfg.forms.mtp_mma;
                 mark_stream(m.stream, "mtp_compute_end", k, {}, p0, n, 0);
@@ -1950,7 +2041,7 @@ Timing Prefill::run(SessionId session, const std::vector<std::uint32_t>& tokens,
                 }
             }
             if (p0 + rows == position && m.cfg.export_state) {  // held row h_{p-1}: the tap of the last row
-                ck(cudaMemcpyAsync(out, m.tap + std::uint64_t{rows - 1} * kWide, kWide * 2, cudaMemcpyDeviceToHost, m.stream), "held");
+                ck(cudaMemcpyAsync(out, m.block_tap() + std::uint64_t{rows - 1} * kWide, kWide * 2, cudaMemcpyDeviceToHost, m.stream), "held");
                 mark_stream(m.stream, "d2h_done", static_cast<std::uint64_t>(out-m.host)+1, {}, 0, 0, 0);
                 held = out;
                 out += kWide * 2;
@@ -2164,7 +2255,16 @@ void Prefill::Impl::step_tail(std::uint32_t rows) {
         for (std::uint32_t r0 = 0; r0 < rows; r0 += 8U)  // the head kernel takes 1..8 rows; same per-row DAG at every count
             hc::lm_head_rows(hidden + std::uint64_t{r0} * kHidden, kHidden, std::min(8U, rows - r0), head, hc::kVocab,
                              head_logits + std::uint64_t{r0} * hc::kVocab, hc::kVocab, stream);
-    hc::first_max_rows(head_logits, hc::kVocab, rows, hc::kVocab, argmax_dev, stream);
+    {  // greedy pick per row (select_greedy_token semantics: a non-finite logit -> 0xffffffff), shared multi-block form
+        namespace hp = strix::cuda::core::head_argmax;
+        hp::View v;
+        v.logits = head_logits;
+        v.stride = hc::kVocab;
+        v.count = hc::kVocab;
+        v.rows = rows;
+        v.partial = reinterpret_cast<strix::head_argmax::Pick*>(argmax_dev + kMaxWindowRows);
+        ck(hp::pick_rows(v, hp::EmitIndexOrNone{argmax_dev}, stream), "head pick");
+    }
     ck(cudaMemcpyAsync(argmax_pinned, argmax_dev, std::uint64_t{rows} * 4, cudaMemcpyDeviceToHost, stream), "argmax d2h");
     if (window) ck(cudaMemcpyAsync(moe_sticky_pinned, moe_sticky, (1 + kMaxWindowRows) * 4, cudaMemcpyDeviceToHost, stream), "moe sticky d2h");
 }
@@ -2218,10 +2318,22 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
     // and never read back)
     const std::uint32_t pad = total <= 8U ? total : 16U;
     if (pad > m.cap) throw std::invalid_argument("step rows out of range");
+    if (total < pad) {  // receipt: what run_block's routed MoE does with this window's padding rows
+        if (moe_rows_policy(m.cfg.moe_real_rows, m.tier != nullptr).effective) {
+            ++m.moe_real_row_windows;
+            m.moe_padding_rows_skipped += pad - total;
+        } else {
+            ++m.moe_padded_windows;
+        }
+    }
     // The pinned window inputs (ids_pinned, ple_ids_host, seg_table_pinned) are rewritten below and read by the copies of
     // this window only when it executes: every earlier window synchronized the decode stream before returning, so no
     // reader is in flight. Enforced here (one query), so a later change that returns before the sync fails loudly
     // instead of cross-wiring sessions.
+    if (m.mtp_inflight) {  // a settled deferred MTP call reads no window input; the window starts after it anyway
+        m.mtp_inflight = false;
+        ck(cudaStreamSynchronize(m.stream), "deferred MTP rows");
+    }
     if (cudaStreamQuery(m.stream) != cudaSuccess)
         throw std::logic_error("verify_cohort(): the decode stream is still busy (pinned window inputs would race)");
     std::vector<Segment> segs;
@@ -2426,6 +2538,7 @@ void Prefill::reserve_session(SessionId session, std::uint64_t positions) {
     auto& s = m.session(session);
     if (s.window_open || s.prefilling || m.cohort_open) throw std::logic_error("reserve_session() with an open window or a chunk in flight");
     if (positions == 0 || positions > m.cfg.max_positions) throw std::invalid_argument("reserve_session(): positions 1..max_positions");
+    m.mtp_on(qmd::Use::replace_rows, s);  // the state is discarded
     if (positions == s.capacity) { s.length = 0; return; }
     ck(cudaStreamSynchronize(m.stream), "session resize");
     m.drop_session_graphs(session);
@@ -2452,6 +2565,7 @@ void Prefill::destroy_session(SessionId session) {
     if (session == 0) throw std::invalid_argument("session 0 belongs to the engine");
     auto& s = m.session(session);
     if (s.window_open || s.prefilling) throw std::logic_error("destroy_session() with an open window or a chunk in flight");
+    m.mtp_on(qmd::Use::replace_rows, s);  // never launched into freed rows
     ck(cudaStreamSynchronize(m.stream), "session drop");
     m.drop_session_graphs(session);
     for (void* p : s.row_allocations) cudaFree(p);
@@ -2527,6 +2641,7 @@ void Prefill::import_state(SessionId session, std::uint64_t length, const std::v
     auto& s = m.session(session);
     qwen_route::require_composition(m.route_policy.enabled, qwen_route::Composition::untagged_state_import);
     if (!fixed || length == 0 || length >= s.capacity) throw std::invalid_argument("prefix import length/fixed");
+    m.mtp_on(qmd::Use::replace_rows, s);  // the import replaces the rows
     std::uint64_t end = 0;
     for (const auto& seg : segments) {
         if (!seg.data || seg.first != end || seg.count == 0 || seg.count > length - end)
@@ -2598,6 +2713,7 @@ void Prefill::restore_canonical(const CanonicalState& state, SessionId session) 
     if (const auto refusal = recurrent_state_route_refusal(m.state_type, false, "canonical snapshot (untagged f32 matrix)"); !refusal.empty())
         throw std::invalid_argument(refusal);
     auto& s = m.session(session);
+    m.mtp_on(qmd::Use::replace_rows, s);  // the snapshot replaces the rows
     if (m.mtp && !m.cfg.diagnostic_bf16_mtp) throw std::invalid_argument("canonical snapshot MTP-sidecar layout is unqualified");
     if (!state.length || state.length >= s.capacity) throw std::invalid_argument("canonical snapshot length");
     if (m.cfg.diagnostic_bf16_mtp) {
@@ -2693,7 +2809,7 @@ std::string Prefill::graph_stats() const {
 // Host inputs go through this set's pinned staging (no pageable copy, so the enqueue never waits for the stream).
 // Returns the rows of the block.
 std::uint32_t Prefill::Impl::prefill_enqueue(SessionState& S, const std::vector<std::uint32_t>& tokens, std::uint64_t position,
-                                             std::uint64_t from, std::uint32_t max_rows) {
+                                             std::uint64_t from, std::uint32_t max_rows, bool defer_mtp) {
     if (from == 0) {  // fresh state, as run()
         for (std::uint32_t o = 0; o < 12; ++o) {
             ck(cudaMemsetAsync(S.kv[o], 0, position * 2048, stream), "kv clear");
@@ -2714,18 +2830,38 @@ std::uint32_t Prefill::Impl::prefill_enqueue(SessionState& S, const std::vector<
     const Segment seg{&S, tok_pinned, p0, rows, 0};
     run_block(&seg, 1, std::max<std::uint32_t>(16U, round_up(rows, 8U)));
     if (S.held && p0 + rows == position)
-        ck(cudaMemcpyAsync(S.held, tap + std::uint64_t{rows - 1} * kWide, kWide * 2, cudaMemcpyDeviceToDevice, stream), "held");
+        ck(cudaMemcpyAsync(S.held, block_tap() + std::uint64_t{rows - 1} * kWide, kWide * 2, cudaMemcpyDeviceToDevice, stream), "held");
     if (mtp) {
         const std::uint64_t last = std::min<std::uint64_t>(p0 + rows, position - 1);  // pairs i in [p0, last)
         if (last > p0) {
             const auto cnt = static_cast<std::uint32_t>(last - p0);
             for (std::uint32_t r = 0; r < cnt; ++r) next_pinned[r] = tokens[p0 + r + 1];
             ck(cudaMemcpyAsync(mtp_next, next_pinned, std::uint64_t{cnt} * 4, cudaMemcpyHostToDevice, stream), "mtp next");
-            pm::launch_mtp_cache_rows(mtp_weights(), pm::MtpRounding{.mma = cfg.forms.mtp_mma}, tap, mtp_next, cnt, p0, S.mtp_kv, S.mtp_index, mtp_ws,
-                                      mtp_status, tables, stream);
+            // the prompt's last block: these rows only feed draft chains, so the first verify window need not wait for them
+            if (qmd::defer_block(defer_mtp, p0, rows, position)) mtp_defer = {&S, p0, cnt, cfg.forms.mtp_mma};
+            else pm::launch_mtp_cache_rows(mtp_weights(), pm::MtpRounding{.mma = cfg.forms.mtp_mma}, block_tap(), mtp_next, cnt, p0, S.mtp_kv,
+                                           S.mtp_index, mtp_ws, mtp_status, tables, stream);
         }
     }
     return rows;
+}
+
+void Prefill::Impl::mtp_settle() {
+    if (!mtp_defer.session) return;
+    const auto d = mtp_defer;
+    mtp_defer = {};
+    pm::launch_mtp_cache_rows(mtp_weights(), pm::MtpRounding{.mma = d.mma}, block_tap(), mtp_next, d.count, d.first, d.session->mtp_kv,
+                              d.session->mtp_index, mtp_ws, mtp_status, tables, stream);
+    mtp_inflight = true;
+}
+
+bool Prefill::mtp_deferred(SessionId session) const {
+    return impl_->mtp_defer.session == &impl_->session(session);
+}
+
+void Prefill::mtp_settle(SessionId session) {
+    auto& m = *impl_;
+    m.mtp_on(qmd::Use::read_rows, m.session(session));
 }
 
 std::uint64_t Prefill::prefill_chunk(SessionId session, const std::vector<std::uint32_t>& tokens, std::uint64_t position,
@@ -2739,7 +2875,9 @@ std::uint64_t Prefill::prefill_chunk(SessionId session, const std::vector<std::u
     if (position > tokens.size() || position == 0 || from >= position) throw std::invalid_argument("prefill chunk out of range");
     if (position > S.capacity) throw std::invalid_argument("prompt longer than the session's capacity");
     if (from != 0 && from != S.length) throw std::invalid_argument("prefill chunk does not continue the session");
-    const auto rows = m.prefill_enqueue(S, tokens, position, from, max_rows);
+    // the block buffers are rewritten: a deferred MTP call runs first, unless it is this session's and the state restarts
+    m.mtp_on(qmd::Use::engine_block, S, from == 0);
+    const auto rows = m.prefill_enqueue(S, tokens, position, from, max_rows, m.cfg.defer_prompt_mtp);
     ck(cudaStreamSynchronize(m.stream), "prefill chunk");
     if (m.tier) m.tier_step_end(from + rows);
     S.length = from + rows;
@@ -2815,6 +2953,9 @@ void Prefill::prefill_chunk_async(SessionId session, const std::vector<std::uint
     if (position > tokens.size() || position == 0 || from >= position) throw std::invalid_argument("prefill chunk out of range");
     if (position > S.capacity) throw std::invalid_argument("prompt longer than the session's capacity");
     if (from != 0 && from != S.length) throw std::invalid_argument("prefill chunk does not continue the session");
+    // this session's deferred MTP rows: discarded by a fresh state, else launched on the engine stream (other rows than
+    // the chunk's; the prefill set's buffers are its own)
+    m.mtp_on(qmd::Use::async_block, S, from == 0);
     // enqueue with the prefill set swapped in: every launch reads the prefill stream and buffers; nothing is shared with
     // the decode windows (the session is in no window until prefill_wait()).
     std::swap(static_cast<BlockFields&>(m), *m.pre);
@@ -2872,6 +3013,7 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
         qwen_route::require_composition(impl_->route_policy.enabled, qwen_route::Composition::mtp_sidecar);
     auto& m = *impl_;
     auto& S = m.session(session);
+    m.mtp_on(qmd::Use::read_rows, S);  // the chain reads the prompt's MTP rows (stream order)
     if (m.cfg.diagnostic_bf16_mtp && (pending >= hc::kVocab || !std::isfinite(min_probability) || min_probability < 0 || min_probability > 1))
         throw std::invalid_argument("MTP diagnostic pending/probability");
     if (S.prefilling) throw std::logic_error("draft() on a session with a prefill chunk in flight");
@@ -3064,6 +3206,7 @@ std::vector<Draft> Prefill::draft_cohort(const std::vector<DraftRequest>& reques
     qwen_route::require_composition(impl_->route_policy.enabled, qwen_route::Composition::mtp_sidecar);
     auto& m = *impl_;
     if (m.cohort_open) throw std::logic_error("draft() with an open window");
+    for (const auto& r : requests) m.mtp_on(qmd::Use::read_rows, m.session(r.session));  // the chains read the prompts' MTP rows
     std::vector<Draft> out(requests.size());
     // chains by descending depth: the chains still running at step k are a prefix (rows 0 .. active(k) - 1)
     std::vector<std::uint32_t> order, depth(requests.size(), 0);

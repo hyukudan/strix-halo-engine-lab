@@ -367,7 +367,7 @@ template <class T> static std::vector<T> f32_vector(const std::vector<std::uint8
 // HC mix runner.
 struct HcRun { std::vector<float> normalized, injection; std::vector<std::uint16_t> output; double ms = 0; };
 static HcRun run_hc(const HcWeights& w, const std::vector<std::uint16_t>& input, unsigned rows, float eps, const am::Tables& t, int reps = 1,
-    bool split = false) {
+    bool split = false, bool compact = false) {
     Dev<std::uint8_t> down(w.down), up(w.up);
     Dev<float> norm(w.norm), inj(w.inject.empty() ? std::vector<float>{} : w.inject);
     Dev<std::uint16_t> in(input);
@@ -380,6 +380,7 @@ static HcRun run_hc(const HcWeights& w, const std::vector<std::uint16_t>& input,
     a.input = in.p; a.norm = norm.p; a.inject = w.inject.empty() ? nullptr : inj.p; a.packed = hc::hc_packed_view(packed.p);
     a.epsilon = eps; a.rows = rows; a.normalized = normalized.p; a.injection = injection.p; a.output = out.p;
     if (split) a.gates = gates.p;
+    if (compact) a.workspace_layout = hc::HcWorkspaceLayout::compact;  // the production prefill layout (inverse + lows only)
     cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
     hc::hc_pack(down.p, up.p, a.packed, nullptr);
     hc::hc_mix(a, t, nullptr);
@@ -477,6 +478,18 @@ static void test_hc_perf(const strix::qwen_gguf::Model* m, const am::Tables& t) 
     const HcRun split = run_hc(w, input, rows, 1e-6F, t, 5, true);
     std::printf("perf: hc mix split epilogue, 8192 rows: %.3f ms per call\n", split.ms);
     same("hc 8192 rows split-epilogue output == fused output", got.output, split.output, false, H);
+    const HcRun cmp = run_hc(w, input, rows, 1e-6F, t, 5, false, true);
+    std::printf("perf: hc mix fused compact workspace, 8192 rows: %.3f ms per call\n", cmp.ms);
+    same("hc 8192 rows compact-workspace output == full-workspace output", got.output, cmp.output, false, H);
+    same("hc 8192 rows compact-workspace injection == full-workspace injection", got.injection, cmp.injection, false, S);
+    {
+        std::vector<float> lf, lc;  // low values sit at [row][kWide..] in both layouts
+        for (unsigned r = 0; r < rows; ++r) {
+            lf.insert(lf.end(), got.normalized.begin() + static_cast<std::ptrdiff_t>(r) * P + W, got.normalized.begin() + static_cast<std::ptrdiff_t>(r + 1) * P);
+            lc.insert(lc.end(), cmp.normalized.begin() + static_cast<std::ptrdiff_t>(r) * P + W, cmp.normalized.begin() + static_cast<std::ptrdiff_t>(r + 1) * P);
+        }
+        same("hc 8192 rows compact-workspace low == full-workspace low", lf, lc, false, P - W);
+    }
     std::vector<unsigned> rs;
     for (unsigned r = 0; r < 16; ++r) rs.push_back(r);
     for (unsigned r = 4000; r < 4040; ++r) rs.push_back(r);

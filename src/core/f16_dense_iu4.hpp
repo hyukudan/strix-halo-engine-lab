@@ -57,25 +57,43 @@ template <unsigned Waves> struct Cols {
     }
     // 64 weights of the stager's column = four 8-byte rows of four K16 tiles (one K64 scale group); columns past count
     // read the last one (never stored). unit % 4 == 0 (the core stages four k units at a time from 0).
-    __device__ __forceinline__ void stage(unsigned tile, unsigned col, unsigned unit, U4* nb) const {
+    // Split for the core's schedule (f16_dense_tall.hpp ColsStageSplit): stage_load issues the loads, stage_decode does
+    // the arithmetic; stage() is their composition (same bits wherever the decode runs).
+    struct Raw {
+        std::uint32_t w[8];
+        std::uint32_t s;
+    };
+    __device__ __forceinline__ Raw stage_load(unsigned tile, unsigned col, unsigned unit) const {
         const unsigned o0 = 16U * (v.tile0 + tile) + col, o = o0 < v.count ? o0 : v.count - 1U;
         const std::size_t col_bytes = (std::size_t(o / 16U) * 16U + o % 16U) * 8U, kt_bytes = std::size_t(v.n) * 8U;
-        std::uint32_t w[8];
+        Raw r;
 #pragma unroll
         for (unsigned j = 0; j < 4U; ++j) {
             const auto t = *(detail::GlobalU2*)(v.weight + std::size_t(unit + j) * kt_bytes + col_bytes);
-            w[2U * j] = t[0], w[2U * j + 1U] = t[1];
+            r.w[2U * j] = t[0], r.w[2U * j + 1U] = t[1];
         }
-        const std::uint32_t s = v.scale[std::size_t(o) * (v.in / 64U) + unit / 4U];
-        const detail::Half2 scale2 = __builtin_bit_cast(detail::Half2, s | (s << 16U));
+        r.s = v.scale[std::size_t(o) * (v.in / 64U) + unit / 4U];
+        return r;
+    }
+    __device__ __forceinline__ void stage_decode(const Raw& raw, U4* nb) const {
+        // The empty asm keeps every decode instruction here (measured: the compiler otherwise hoists the XOR and the
+        // scale pack next to the loads, and the stager waits for DRAM before the stage's WMMAs).
+        Raw r = raw;
+#pragma unroll
+        for (unsigned q = 0; q < 8U; ++q) asm volatile("" : "+v"(r.w[q]));
+        asm volatile("" : "+v"(r.s));
+        const detail::Half2 scale2 = __builtin_bit_cast(detail::Half2, r.s | (r.s << 16U));
 #pragma unroll
         for (unsigned q = 0; q < 8U; ++q) {  // nb[q] = k 8q .. 8q + 7 of the group = word q (8 nibbles)
-            const std::uint32_t b = w[q] ^ 0x88888888U;
+            const std::uint32_t b = r.w[q] ^ 0x88888888U;
             U4 h;
 #pragma unroll
             for (unsigned p = 0; p < 4U; ++p) h[p] = detail::w16_pair(b, p, scale2);
             nb[q] = h;
         }
+    }
+    __device__ __forceinline__ void stage(unsigned tile, unsigned col, unsigned unit, U4* nb) const {
+        stage_decode(stage_load(tile, col, unit), nb);
     }
 };
 
@@ -84,6 +102,13 @@ using Store = q8a8::Store;
 template <unsigned TC, unsigned Waves> __global__ __launch_bounds__(32 * Waves) void kernel(View v) {
     __shared__ Storage<TC> lds;
     core<TC>(v.x, v.in, v.rows, Cols<Waves>{v}, lds, Store{v.count, v.tile0, v.accumulate});
+}
+// x16 form: A fragments from the FP16 x tiles of f16_dense_tall (enqueue_x16_tiles: the core's own RNE cast done once per
+// input), CTAs column-fast (X16Cols): same bits as kernel (the core's x16 contract). Pays when the FP32 x re-read per
+// column block misses the caches (see x16_pays).
+template <unsigned TC, unsigned Waves> __global__ __launch_bounds__(32 * Waves) void kernel_x16(View v, const _Float16* xt) {
+    __shared__ Storage<TC> lds;
+    core<TC>(v.x, v.in, v.rows, X16Cols<Cols<Waves>>{{v}, xt, v.rows}, lds, Store{v.count, v.tile0, v.accumulate});
 }
 
 inline bool supported(const View& v) {
@@ -99,20 +124,46 @@ inline unsigned waves_for(unsigned rows, unsigned in, unsigned waves = 0U) {
     return waves == 8U || waves == 16U ? waves : rows >= 512U && (in >= 8192U || rows < 1024U) ? 16U : 8U;
 }
 
-template <unsigned Waves> inline void launch(View v, hipStream_t stream) {
+// The plan's launches (full 16-tile CTAs, then the remainder width): k(width constant, grid, view with tile0 set).
+// ColumnFast: grid (column blocks, row blocks), the order of the x16 form.
+template <unsigned Waves, bool ColumnFast = false, class K> inline void launch_plan(View v, K&& k) {
     const unsigned tiles = (v.count + 15U) / 16U, gx = (v.rows + 16U * Waves - 1U) / (16U * Waves);
     const Plan pl = plan(tiles, v.rows, true);
+    const auto grid = [&](unsigned cols) { return ColumnFast ? dim3(cols, gx) : dim3(gx, cols); };
     v.tile0 = 0U;
-    if (pl.full) hipLaunchKernelGGL((kernel<16, Waves>), dim3(gx, pl.full), dim3(32U * Waves), 0, stream, v);
+    if (pl.full) k(std::integral_constant<unsigned, 16U>{}, grid(pl.full), v);
     v.tile0 = 16U * pl.full;
-    if (pl.tc == 1U) hipLaunchKernelGGL((kernel<1, Waves>), dim3(gx, pl.gy), dim3(32U * Waves), 0, stream, v);
-    if (pl.tc == 2U) hipLaunchKernelGGL((kernel<2, Waves>), dim3(gx, pl.gy), dim3(32U * Waves), 0, stream, v);
-    if (pl.tc == 4U) hipLaunchKernelGGL((kernel<4, Waves>), dim3(gx, pl.gy), dim3(32U * Waves), 0, stream, v);
+    if (pl.tc == 1U) k(std::integral_constant<unsigned, 1U>{}, grid(pl.gy), v);
+    if (pl.tc == 2U) k(std::integral_constant<unsigned, 2U>{}, grid(pl.gy), v);
+    if (pl.tc == 4U) k(std::integral_constant<unsigned, 4U>{}, grid(pl.gy), v);
+}
+template <unsigned Waves> inline void launch(View v, hipStream_t stream) {
+    launch_plan<Waves>(v, [&](auto tc, dim3 grid, const View& w) {
+        hipLaunchKernelGGL((kernel<decltype(tc)::value, Waves>), grid, dim3(32U * Waves), 0, stream, w);
+    });
 }
 
 // Caller checks supported(v) and the launch error (hipGetLastError).
 inline void enqueue(const View& v, hipStream_t stream, unsigned waves = 0U) {
     if (waves_for(v.rows, v.in, waves) == 16U) launch<16>(v, stream);
     else launch<8>(v, stream);
+}
+// x16 form of enqueue: xt = enqueue_x16_tiles(v.x, xt, v.rows, v.in) of the same x (x16_bytes(rows, in)); same bits.
+inline void enqueue_x16(const View& v, const _Float16* xt, hipStream_t stream, unsigned waves = 0U) {
+    const auto go = [&](auto wv) {
+        constexpr unsigned W = decltype(wv)::value;
+        launch_plan<W, true>(v, [&](auto tc, dim3 grid, const View& w) {
+            hipLaunchKernelGGL((kernel_x16<decltype(tc)::value, W>), grid, dim3(32U * W), 0, stream, w, xt);
+        });
+    };
+    if (waves_for(v.rows, v.in, waves) == 16U) go(std::integral_constant<unsigned, 16U>{});
+    else go(std::integral_constant<unsigned, 8U>{});
+}
+// Where the x16 form was measured faster on gfx1151 (hd4 probe, 512 rows, tile pass included): FP32 x above 16 MiB
+// (17408 -> 5120: 3163 -> 2266 us; x = 35.6 MB is re-read from DRAM by each of the 20 column blocks, the FP16 tiles fit
+// the 32 MB MALL) and n >= 10240 (5120 -> 17408: 2202 -> 2121 us, 5120 -> 10240: 1305 -> 1246 us). Narrower shapes keep
+// the direct form until measured; so do windows below the measured 512 rows.
+inline bool x16_pays(unsigned rows, unsigned in, unsigned n) {
+    return rows >= 512U && (n >= 10240U || std::uint64_t(rows) * in * 4U > (std::uint64_t(16) << 20U));
 }
 }  // namespace strix::core::f16_dense_tall::iu4a16

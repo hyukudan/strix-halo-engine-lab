@@ -36,6 +36,8 @@ struct RuntimeWorkspace {
     std::uint64_t gate_up_offset = 0, gate_up_bytes = 0;
     std::uint64_t accumulation_offset = 0, accumulation_bytes = 0;
     std::uint64_t status_offset = 0;
+    // A8 down only: the slot-merge ticket words (strix/moe_slot_merge.hpp), directly after status, inside its pad.
+    std::uint64_t ticket_offset = 0, ticket_bytes = 0;
     std::uint64_t codes_offset = 0, codes_bytes = 0;
     std::uint64_t deltas_offset = 0, deltas_bytes = 0;
     std::uint64_t sums_offset = 0, sums_bytes = 0;

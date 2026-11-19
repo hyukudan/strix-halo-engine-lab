@@ -18,6 +18,7 @@
 #include <cstdint>
 
 #include "dense_decode.hpp"
+#include "strix/env_flags.hpp"
 #include "dense_flash_prefill.hpp"
 
 namespace strix::attn_core::dense_decode_flash {
@@ -99,8 +100,18 @@ inline void launch(const dense_decode::Params& p, const float* q_in, const float
                    const float* k_gain, float* q_scratch, std::uint16_t* k_cache, std::uint16_t* v_cache, std::uint16_t* vt,
                    unsigned vstride, unsigned vt_from, unsigned* failure, float* ws, std::size_t ws_floats, float* ctx,
                    hipStream_t stream) {
-    dense_decode::prep_kernel<Dim><<<dim3(p.rows, p.heads + 2U * p.kv_heads), Dim, 0, stream>>>(p, q_in, k_in, v_in, q_gain, k_gain,
-                                                                                              q_scratch, k_cache, v_cache);
+    // RoPE table of the window in ws (stream order: prep reads it before dense::launch writes ws). Same bits as the inline
+    // form; STRIX_ATTN_ROPE_TABLE=0 or a missing / small ws keeps the inline form.
+    static const bool table_on = envcfg::flag("STRIX_ATTN_ROPE_TABLE", true);
+    const unsigned half = p.rot_dim / 2U;
+    const dim3 pg(p.rows, p.heads + 2U * p.kv_heads);
+    if (table_on && ws && half && std::size_t(p.rows) * half * 2U <= ws_floats) {
+        dense_decode::rope_table_kernel<<<(p.rows * half + 255U) / 256U, 256, 0, stream>>>(p, ws);
+        dense_decode::prep_kernel<Dim, true><<<pg, Dim, 0, stream>>>(p, q_in, k_in, v_in, q_gain, k_gain, q_scratch, k_cache,
+                                                                     v_cache, ws);
+    } else {
+        dense_decode::prep_kernel<Dim><<<pg, Dim, 0, stream>>>(p, q_in, k_in, v_in, q_gain, k_gain, q_scratch, k_cache, v_cache);
+    }
     const unsigned to = p.pos0 + p.rows, width = p.kv_heads * Dim;
     vt_kernel<<<dim3((to - vt_from + 31U) / 32U, width / 32U), 256, 0, stream>>>(v_cache, vt, width, vt_from, to, vstride);
     const Args a{q_scratch, ctx, failure, k_cache, vt, p.rows, p.heads, p.kv_heads, p.pos0, vstride};

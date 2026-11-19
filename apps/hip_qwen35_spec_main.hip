@@ -16,10 +16,14 @@
 #include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "strix/qwen35/hip_engine.hpp"
+#include "strix/profiles/qwen_dense_hip.hpp"
+#include "strix/qwen35/hip_spec_defaults.hpp"
+#include "../src/core/dense_linear_iu4.hpp"  // dense_iu4::scalar_x (the costs' bucket form)
 #include "strix/spec/block_drafter.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/spec/engine_target.hpp"
@@ -28,12 +32,7 @@
 
 namespace sp = strix::spec;
 namespace q = strix::qwen35;
-struct HipChainDev {
-    static float* alloc(q::HipEngine& e, std::size_t n) { return e.alloc_f32(n); }
-    static void release(q::HipEngine& e, float* p) { e.free_f32(p); }
-    static void copy(q::HipEngine& e, float* d, const float* s, std::size_t n) { e.copy_f32_async(d, s, n); }
-};
-using HipMtpChain = sp::MtpChain<q::HipEngine, HipChainDev>;
+using HipMtpChain = q::HipMtpChain;  // shared glue + resolver: strix/qwen35/hip_spec_defaults.hpp
 using Clock = std::chrono::steady_clock;
 
 namespace {
@@ -242,9 +241,12 @@ int run_mtp_ref(q::HipEngine& E, const std::string& model, const std::string& mt
 }  // namespace
 
 int main(int argc, char** argv) try {
+    strix::qwen35::hip_profile::take(strix::qwen35::hip_profile::App::spec, argc, argv);  // --profile exact|fast
     std::string model, ids_file, label = "run", sources, mtp_file, chain_hidden = "post", dump_ref, dump_out;
-    std::uint32_t n_gen = 256, max_block = 16, max_pos = 0, pf_bench = 0, trace_n = 0, prefill_rows = 16, chain_k = 7, ref_n = 0;
-    bool check = true, cost_table = false, pf_sample = false, seed_costs = false, pf_twice = false, mtp_ref = false;
+    std::uint32_t n_gen = 256, max_block = 0, max_pos = 0, pf_bench = 0, trace_n = 0, prefill_rows = 0, chain_k = 0, ref_n = 0;
+    bool prefill_exact = false;  // prefill_rows 0 = the engine default (64-row EXACT windows)
+    q::HipDenseSpecArgs spec_args;  // the family's shared speculation flags: the same parser and resolver as strix-hip-qwen35-decode
+    bool check = true, cost_table = false, pf_sample = false, pf_twice = false, mtp_ref = false;
     std::uint32_t copy_arm = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -256,20 +258,21 @@ int main(int argc, char** argv) try {
         else if (a == "--prompt-file") ids_file = next();
         else if (a == "--n-gen") n_gen = strix::core::parse_u32(next());
         else if (a == "--sources") sources = next();
-        else if (a == "--max-block") max_block = strix::core::parse_u32(next());
+        else if (a == "--max-block") max_block = strix::core::parse_u32(next());  // override (default: the resolver's, 16)
         else if (a == "--max-pos") max_pos = strix::core::parse_u32(next());
         else if (a == "--check") check = next() != "0";
         else if (a == "--cost-table") cost_table = true;
         else if (a == "--prefill-bench") pf_bench = strix::core::parse_u32(next());
         else if (a == "--pf-sample") pf_sample = true;
         else if (a == "--pf-twice") pf_twice = true;  // two full prefills: cold first, warm last
-        else if (a == "--prefill-rows") prefill_rows = strix::core::parse_u32(next());  // >16 = FAST wide windows (dense-q8a8-f16-v1)
-        else if (a == "--seed-costs") seed_costs = next() != "0";
+        else if (a == "--prefill-rows") prefill_rows = strix::core::parse_u32(next());  // 16 = 16-row exact; >16 = FAST wide windows (dense-q8a8-f16-v1)
+        else if (a == "--prefill-exact") prefill_exact = true;  // with --prefill-rows > 16: EXACT wide windows (bitwise to 16)
+        else if (a == "--seed-costs") spec_args.costs = next() != "0" ? q::HipDenseCostMode::calibrated : q::HipDenseCostMode::learned;  // previous name
         else if (a == "--trace") trace_n = strix::core::parse_u32(next());
         else if (a == "--label") label = next();
-        else if (a == "--mtp") mtp_file = next();                  // side GGUF with blk.<layers>.* (MTP head)
+        else if (q::parse_hip_dense_spec_arg(a, next, spec_args)) {}  // --mtp, --draft-rows, --draft-pack, --spec-costs
         else if (a == "--chain-hidden") chain_hidden = next();      // post | pre (hidden fed to the MTP layer)
-        else if (a == "--chain-k") chain_k = strix::core::parse_u32(next());
+        else if (a == "--chain-k") chain_k = strix::core::parse_u32(next());  // override (default: the resolver's cap)
         else if (a == "--copy-arm") copy_arm = strix::core::parse_u32(next());  // also run the copy-only baseline for N tokens
         else if (a == "--mtp-ref") mtp_ref = true;                  // mtp_forward vs host reference
         else if (a == "--ref-n") ref_n = strix::core::parse_u32(next());  // serial reference length (default n-gen): the first ref-n ids are compared
@@ -277,7 +280,11 @@ int main(int argc, char** argv) try {
         else if (a == "--dump-out") dump_out = next();              // speculative emitted ids -> file
         else throw std::invalid_argument("unknown argument " + a);
     }
-    if (sources.empty()) sources = mtp_file.empty() ? "copy" : "copy,chain,hybrid";
+    const auto plan = q::resolve_hip_dense_spec(model, spec_args);  // ONE resolver (hip_spec_defaults.hpp)
+    mtp_file = plan.mtp_source;
+    std::printf("spec plan: mtp %s %s, draft rows %s, costs %s; overrides:%s%s%s%s\n", plan.mtp_reason.c_str(), mtp_file.c_str(),
+                plan.draft_rows ? "subset" : "full", q::hip_dense_cost_mode_name(plan.costs), sources.empty() ? "" : " sources",
+                chain_k ? " chain-k" : "", max_block ? " max-block" : "", sources.empty() && !chain_k && !max_block ? " none" : "");
     if (chain_hidden != "post" && chain_hidden != "pre") throw std::invalid_argument("--chain-hidden post|pre");
     if (model.empty() || (ids_file.empty() && !cost_table && !pf_bench))
         throw std::invalid_argument("usage: --model F.gguf (--prompt-file ids | --cost-table | --prefill-bench N [--pf-sample]) [--n-gen N] "
@@ -294,11 +301,18 @@ int main(int argc, char** argv) try {
     opt.max_positions = std::max<std::uint32_t>(max_pos, std::uint32_t(prompt.size()) + n_gen + 128U + (cost_table ? 512U : 0U));
     if (pf_bench) opt.max_positions = std::max(opt.max_positions, pf_bench + 64U);
     opt.quiet = true;
-    opt.prefill_rows = prefill_rows;
+    if (prefill_rows) {  // explicit window: 16-row exact, or FAST wide unless --prefill-exact
+        opt.prefill_rows = prefill_rows;
+        opt.wide_exact = prefill_exact;
+    }
     auto E = q::HipEngine::from_gguf(model, opt);
+    std::printf("prefill windows: %u rows, %s\n", E->prefill_rows(),
+                E->prefill_rows() <= 16U ? "exact (16-row)" : opt.wide_exact ? "exact (wide, bitwise to 16-row)" : "FAST (dense wide class)");
     if (!mtp_file.empty()) E->load_mtp(mtp_file);
     const auto vocab = E->config().vocab;
     std::unique_ptr<HipMtpChain> chain_glue;
+    std::unique_ptr<sp::DraftRows> drows;
+    std::optional<q::HipDenseCosts> costs;  // measured once per process (first spec run, after its prompt)
     if (E->has_mtp()) chain_glue = std::make_unique<HipMtpChain>(*E, chain_hidden == "pre", q::HipEngine::mtp_max_rows());
     std::printf("loaded: weights %.2f GB/pass, state %.0f MB/pass, max_positions %u\n", double(E->weight_bytes()) / 1e9,
                 double(E->state_bytes_per_pass()) / 1e6, opt.max_positions);
@@ -385,9 +399,12 @@ int main(int argc, char** argv) try {
 
     if (cost_table) {
         std::uint32_t anchor = 0;
-        std::vector<std::uint32_t> ids(256);
+        std::vector<std::uint32_t> ids(256);  // context: 256 synthetic ids, or the prompt when one is given (8K / 32K walls)
         for (std::size_t i = 0; i < ids.size(); ++i) ids[i] = std::uint32_t(mix(5 + i) % vocab);
+        if (!prompt.empty()) ids = prompt;
+        const double pf0 = now_ms();
         prefill_ids(ids, anchor);
+        std::printf("cost table context: %zu tokens prefilled in %.1f ms\n", ids.size(), now_ms() - pf0);
         warm();
         std::vector<std::uint32_t> t(q::HipEngine::max_rows(), anchor);
         std::printf("cost table (%s, ctx %zu+)\nrows verify_ms(commit full) verify_ms(commit half) tok_per_s_if_all_accepted\n", label.c_str(), ids.size());
@@ -452,31 +469,39 @@ int main(int argc, char** argv) try {
         prefill_ids(prompt, anchor, use_chain);
         const double prefill_ms = now_ms() - tp0;
         warm();
-        sp::BlockConfig bc;
-        bc.max_block = max_block;
-        bc.copy = sources.find("copy") != std::string::npos || !use_chain;
-        bc.chain = use_chain && chain_glue && sources.find("chain") != std::string::npos;
-        bc.hybrid = use_chain && chain_glue && sources.find("hybrid") != std::string::npos;
-        bc.chain_max_k = chain_k;
-        if (sources == "none" && use_chain) bc.copy = bc.chain = bc.hybrid = false;
-        sp::BlockDrafter drafter(bc, use_chain ? chain_glue.get() : nullptr);
-        if (seed_costs) {
-            std::vector<std::uint32_t> t(q::HipEngine::max_rows(), anchor);
-            for (const std::uint32_t r : {1U, 2U, 4U, 8U, 16U}) {
-                double sum = 0;
-                for (int rep = 0; rep < 3; ++rep) {
-                    const double t0 = now_ms();
-                    E->forward_rows(t.data(), r, q::LogitRows::all);
-                    E->commit(0);
-                    E->sync();
-                    sum += now_ms() - t0;
-                }
-                drafter.seed_verify_ms(r, sum / 3);
-            }
-        }
-        drafter.commit(prompt);
         out.assign(1, anchor);
+        const bool drows_on = use_chain && chain_glue && plan.draft_rows;
+        if (drows_on) {  // the subset first: its share of the head is the draft price (as in strix-hip-qwen35-decode)
+            if (!drows) drows = std::make_unique<sp::DraftRows>(q::hip_dense_draft_rows_config(vocab, plan));
+            drows->begin(prompt);
+            drows->admit(std::span<const std::uint32_t>(out.data(), 1));
+        }
+        // The shared resolver's block config and costs (measured once per process after the first prompt), then this
+        // research app's named overrides, only when given on the command line.
+        if (!costs) costs = q::hip_dense_measure_costs(*E, plan.costs, strix::core::dense_iu4::scalar_x(), anchor);
+        const double head_fraction = drows_on ? double(drows->rows()) / double(vocab) : 1.0;
+        sp::BlockConfig bc = q::hip_dense_block_config(plan, head_fraction, *costs);
+        if (max_block) bc.max_block = std::min(max_block, bc.max_block);
+        if (chain_k) bc.chain_max_k = chain_k;
+        bc.chain_max_k = std::min(bc.chain_max_k, bc.max_block > 1U ? bc.max_block - 1U : 1U);
+        if (!sources.empty()) {
+            bc.copy = sources.find("copy") != std::string::npos;
+            bc.chain = sources.find("chain") != std::string::npos;
+            bc.hybrid = sources.find("hybrid") != std::string::npos;
+        }
+        bc.chain = bc.chain && use_chain && chain_glue;
+        bc.hybrid = bc.hybrid && use_chain && chain_glue;
+        if (!use_chain) bc.copy = true;
+        sp::BlockDrafter drafter(bc, use_chain ? chain_glue.get() : nullptr);
+        q::hip_dense_seed_verify(drafter, bc.max_block, bc.fixed_costs, *costs);
+        std::printf("spec config: costs %s (%s), verify ms r1 %.1f r16 %.1f, draft flush %.2f step %.2f ms, chain cap %u, max block %u, "
+                    "context cost %s\n",
+                    q::hip_dense_cost_mode_name(plan.costs), costs->source == q::HipDenseCostSource::calibrated ? "calibrated" : "table",
+                    q::hip_dense_verify_ms(*costs, 1), q::hip_dense_verify_ms(*costs, 16), bc.chain_seed_flush_ms, bc.chain_seed_step_ms,
+                    bc.chain_max_k, bc.max_block, sp::context_cost_name(drafter.arbiter().config()).c_str());
+        drafter.commit(prompt);
         drafter.commit(std::span<const std::uint32_t>(out.data(), 1));
+        E->set_draft_rows(drows_on ? drows.get() : nullptr);
         sp::EngineVerifyTarget<q::HipEngine> target(*E);
         if (use_chain && chain_glue) target.set_observer([&](const q::HipRowsOut& o, std::uint32_t rows) { chain_glue->observe_verify(o, rows); });
         sp::BlockSpeculator spec(drafter, target);
@@ -489,7 +514,7 @@ int main(int argc, char** argv) try {
         while (out.size() < n_run) {
             sp::StepParams p;
             p.remaining = n_run - std::uint32_t(out.size());
-            p.max_rows = std::min<std::uint32_t>(16U, max_block);
+            p.max_rows = std::min<std::uint32_t>(16U, bc.max_block);
             p.context = E->committed();
             const auto r = spec.step(out, p);
             if (r.emitted == 0) break;
@@ -501,8 +526,11 @@ int main(int argc, char** argv) try {
             per_step.push_back(double(r.emitted));
             tick_ms.push_back(now_ms() - t0);
             cum.push_back(std::uint32_t(out.size()));
+            if (drows_on) drows->admit(std::span<const std::uint32_t>(out.data() + out.size() - r.emitted, r.emitted));
         }
         const double wall = now_ms() - t0;
+        E->set_draft_rows(nullptr);
+        if (drows_on) std::printf("draft rows: %s\n", drows->describe().c_str());
         std::size_t bad = (out.size() != n_run || (!ref.empty() && n_run == n_gen && ref.size() != n_gen)) ? 1U : 0U;
         for (std::size_t i = 0; i < out.size() && i < ref.size(); ++i)
             if (out[i] != ref[i]) { ++bad; if (bad == 1) std::fprintf(stderr, "MISMATCH at token %zu: spec %u serial %u\n", i, out[i], ref[i]); }
@@ -522,7 +550,7 @@ int main(int argc, char** argv) try {
         for (unsigned r = 1; r <= 16U; ++r)
             if (windows[r]) std::printf("verify-window %u: %llu calls\n", r, (unsigned long long)windows[r]);
         if (use_chain && chain_glue)
-            std::printf("mtp[%s]: hidden %s chain_k %u, mtp_forward calls %llu rows %llu, draft() %llu calls %.1f ms total = %.2f ms/draft, %.2f ms/mtp_forward call; "
+            std::printf("mtp[%s]: hidden %s chain_k override %u, mtp_forward calls %llu rows %llu, draft() %llu calls %.1f ms total = %.2f ms/draft, %.2f ms/mtp_forward call; "
                         "chain-source passes %llu (%.1f %%), hybrid blocks %llu (ext proposed %llu accepted %llu)\n",
                         label.c_str(), chain_hidden.c_str(), chain_k, (unsigned long long)chain_glue->calls(), (unsigned long long)chain_glue->rows(),
                         (unsigned long long)chain_glue->drafts(), chain_glue->draft_wall_ms(),

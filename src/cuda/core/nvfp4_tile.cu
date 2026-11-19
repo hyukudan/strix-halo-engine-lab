@@ -1,0 +1,79 @@
+// Enqueue side of the NVFP4 tile GEMM (contract: strix/cuda/core/nvfp4_tile.hpp; kernels: arch/sm120/nvfp4_tile.cuh).
+// Built for sm_120a only (block-scaled FP4 mma, cvt e2m1x2); another device gets cudaErrorNotSupported, never a trap.
+#include "strix/cuda/core/nvfp4_tile_cuda.hpp"
+
+#include "arch/sm120/nvfp4_tile.cuh"
+
+namespace strix::cuda::core::nvfp4::tile {
+namespace {
+cudaError_t capability() {
+    int device = 0, major = 0, minor = 0;
+    if (auto e = cudaGetDevice(&device); e != cudaSuccess) return e;
+    if (auto e = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device); e != cudaSuccess) return e;
+    if (auto e = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device); e != cudaSuccess) return e;
+    return major == 12 && minor == 0 ? cudaSuccess : cudaErrorNotSupported;
+}
+}  // namespace
+
+bool supported() { return capability() == cudaSuccess; }
+
+cudaError_t repack_enqueue(const std::uint8_t* records, std::uint32_t out, std::uint32_t in, std::uint8_t* tile, cudaStream_t stream) {
+    if (!records || !tile || out == 0 || out % 16 || in == 0 || in % kK) return cudaErrorInvalidValue;
+    if (auto e = capability(); e != cudaSuccess) return e;
+    const std::size_t bytes = w_tile_bytes(out, in);
+    sm120::repack_kernel<<<static_cast<unsigned>((bytes + 255) / 256), 256, 0, stream>>>(records, bytes, in, tile);
+    return cudaGetLastError();
+}
+
+cudaError_t quantize_enqueue(const float* x, std::uint32_t rows, std::uint32_t in, std::uint8_t* x_tile, float* rs, cudaStream_t stream) {
+    if (!x || !x_tile || !rs || rows == 0 || in == 0 || in % kK || reinterpret_cast<std::uintptr_t>(x) % 16) return cudaErrorInvalidValue;
+    if (auto e = capability(); e != cudaSuccess) return e;
+    sm120::quantize_kernel<<<rows_padded(rows), 256, 0, stream>>>(x, rows, in, x_tile, rs);
+    return cudaGetLastError();
+}
+
+namespace {
+// One launch of the folded quantiser with row normaliser nm; NREG bucket = the smallest of 8/16/24/32 holding in / 256 elements per
+// thread (padding entries are 0 and add +0 / sit outside every head: any bucket >= the need gives the same bits).
+template <class Norm>
+cudaError_t norm_quantize_launch(const float* x, const Norm& nm, std::uint32_t rows, std::uint32_t in, std::uint8_t* x_tile, float* rs,
+                                 cudaStream_t stream) {
+    if (!norm_quantize_fits(in)) return cudaErrorInvalidValue;
+    if (!x || !x_tile || !rs || rows == 0 || reinterpret_cast<std::uintptr_t>(x) % 16) return cudaErrorInvalidValue;
+    if (auto e = capability(); e != cudaSuccess) return e;
+    const unsigned grid = rows_padded(rows);
+    const std::size_t smem = static_cast<std::size_t>(in) * sizeof(float);
+    const std::uint32_t nreg = (in + 255) / 256;
+    if (nreg <= 8) sm120::norm_quantize_kernel<8, Norm><<<grid, 256, smem, stream>>>(x, nm, rows, in, x_tile, rs);
+    else if (nreg <= 16) sm120::norm_quantize_kernel<16, Norm><<<grid, 256, smem, stream>>>(x, nm, rows, in, x_tile, rs);
+    else if (nreg <= 24) sm120::norm_quantize_kernel<24, Norm><<<grid, 256, smem, stream>>>(x, nm, rows, in, x_tile, rs);
+    else sm120::norm_quantize_kernel<32, Norm><<<grid, 256, smem, stream>>>(x, nm, rows, in, x_tile, rs);
+    return cudaGetLastError();
+}
+}  // namespace
+
+cudaError_t norm_quantize_enqueue(const float* x, const float* gain, float eps, std::uint32_t rows, std::uint32_t in, std::uint8_t* x_tile,
+                                  float* rs, cudaStream_t stream) {
+    return norm_quantize_launch(x, sm120::RmsRowNorm{gain, eps}, rows, in, x_tile, rs, stream);
+}
+
+cudaError_t gated_norm_quantize_enqueue(const float* x, const float* z, const float* gain, float eps, std::uint32_t rows,
+                                        std::uint32_t in, std::uint8_t* x_tile, float* rs, cudaStream_t stream) {
+    if (!z || !gain || in % kGatedNormHead) return cudaErrorInvalidValue;
+    return norm_quantize_launch(x, sm120::GatedHeadNorm{z, gain, eps}, rows, in, x_tile, rs, stream);
+}
+
+cudaError_t gemm_enqueue(const GemmArgs& a, cudaStream_t stream) {
+    if (!valid(a)) return cudaErrorInvalidValue;
+    if (auto e = capability(); e != cudaSuccess) return e;
+    // CUDA applies the attribute to the current device; idempotent, no process-global flag.
+    if (auto e = cudaFuncSetAttribute(sm120::gemm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(sm120::kSmem));
+        e != cudaSuccess)
+        return e;
+    const std::uint32_t per_cta = a.epi == Epi::glu ? kCtaOut / 2 : kCtaOut;  // GLU: 64 channels = 128 gate/up rows
+    const std::uint64_t tiles = static_cast<std::uint64_t>((a.out + per_cta - 1) / per_cta) * (a.rows_pad / kCtaRows);
+    if (tiles > 0x7fffffffULL) return cudaErrorInvalidValue;
+    sm120::gemm_kernel<<<static_cast<unsigned>(tiles), sm120::kThreads, sm120::kSmem, stream>>>(a);
+    return cudaGetLastError();
+}
+}  // namespace strix::cuda::core::nvfp4::tile

@@ -12,6 +12,7 @@
 #include <mutex>
 
 #include "../common.cuh"
+#include "strix/split_k_policy.hpp"
 
 namespace strix::cuda_core {
 namespace {
@@ -64,7 +65,10 @@ __device__ __forceinline__ void mma16816(float (&c)[4], std::uint32_t a0, std::u
 
 // ---------------------------------------------------------------------------------------------------------------- GEMV
 constexpr int kWarpsPerBlock = 4;
-std::uint32_t g_target_warps = 1000;  // split-K target (depends on the shape only, never on rows)
+// split-K policy (strix/split_k_policy.hpp): depends on the shape and the process-wide profile, never on rows
+std::uint32_t g_target_warps = split_k::kExactTarget;  // EXACT target (test hook: nvfp4_set_split_target)
+split_k::Profile g_split_profile = split_k::Profile::exact;
+split_k::Device g_split_device{};
 
 struct LoadRegs {
     uint4 d0, d1, sc;
@@ -140,9 +144,9 @@ __device__ __forceinline__ void compute_chunk(const LoadRegs (&L)[MT], const boo
 // (ks == 1, single weight) the epilogue y = acc * gscale (+ resid) is written straight to y.
 struct Job {
     const unsigned char* w[2];  // [1] != null: fused gate/up (silu(w0 x) * (w1 x))
-    float* part;                // split-K partials [z][ks][rows][out]
-    float* y;
-    const float* resid;
+    After<float> part;          // split-K partials [z][ks][rows][out]
+    After<float> y;
+    After<const float> resid;   // non-constant buffers: reachable only after pdl_wait (common.cuh)
     float gs[2];
     std::uint32_t out, ks, g0;  // g0 = first grid.x block of this job
 };
@@ -152,8 +156,11 @@ struct Jobs {
 };
 
 template <int RB, int MT>
-__global__ void __launch_bounds__(kWarpsPerBlock * 32) fp4_gemv(const Jobs jobs, const float* x, std::uint32_t in, std::uint32_t rows) {
+__global__ void __launch_bounds__(kWarpsPerBlock * 32) fp4_gemv(const Jobs jobs, const After<const float> xa, std::uint32_t in, std::uint32_t rows) {
     extern __shared__ uint2 xs_dyn[];
+    // PDL (scheduling only): this block's first weight records (constant data) are requested BEFORE pdl_wait, so the
+    // weight stream overlaps the predecessor's tail. x, part and y are touched only after pdl_wait, and the dependent
+    // kernel is released (pdl_trigger) only after it too (L2 footprint, common.cuh); After<> enforces the wait. The arithmetic below is unchanged.
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     int ji = 0;
 #pragma unroll
@@ -163,9 +170,6 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) fp4_gemv(const Jobs jobs,
     const std::uint32_t ks = J.ks, out = J.out;
     if (blockIdx.y >= ks || (blockIdx.z == 1 && J.w[1] == nullptr)) return;  // block-uniform
     const std::uint32_t bx = blockIdx.x - J.g0;
-    float* const part = J.part;
-    float* const y = J.y;
-    const float* const resid = J.resid;
     const float gs0 = J.gs[0];
     const std::uint32_t kidx = blockIdx.y;
     const unsigned char* w = J.w[blockIdx.z];
@@ -186,10 +190,30 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) fp4_gemv(const Jobs jobs,
 #pragma unroll
         for (int rb = 0; rb < RB; ++rb) acc[mt][rb][0] = acc[mt][rb][1] = acc[mt][rb][2] = acc[mt][rb][3] = 0.f;
 
+    // Before pdl_wait (constant data only): record c0 of each tile goes to registers (`cur`) and record c0 + 1, when this
+    // block has one, is requested into L2 (lanes 0..8 = its 9 lines; no register). A full resident wave then holds at most
+    // 2 records per tile in flight (<= ~21 MB of L2 even for ks == 1 shapes).
+    {
+        constexpr std::uint32_t kLines = kNvfp4RecordBytes / 128;
+        static_assert(kNvfp4RecordBytes % 128 == 0, "records are whole 128-byte lines");
+        if (c0 + 1 < c1 && static_cast<std::uint32_t>(lane) < kLines) {
+#pragma unroll
+            for (int mt = 0; mt < MT; ++mt)
+                if (on[mt])
+                    prefetch_l2(base[mt] + static_cast<std::size_t>(c0 + 1) * kNvfp4RecordBytes +
+                                static_cast<std::size_t>(lane) * 128);
+        }
+    }
     LoadRegs cur[MT], nxt[MT];
 #pragma unroll
     for (int mt = 0; mt < MT; ++mt)
         if (on[mt] && c0 < c1) cur[mt] = load_record(base[mt] + static_cast<std::size_t>(c0) * kNvfp4RecordBytes, lane);
+    const PdlWaited waited = pdl_wait();
+    pdl_trigger();
+    const float* const x = xa(waited);
+    float* const part = J.part(waited);
+    float* const y = J.y(waited);
+    const float* const resid = J.resid(waited);
     for (std::uint32_t c = c0; c < c1; ++c) {
         const std::uint32_t cs = (c - c0) % kSlab;
         if (cs == 0) {
@@ -244,12 +268,15 @@ __global__ void __launch_bounds__(kWarpsPerBlock * 32) fp4_gemv(const Jobs jobs,
 
 // grid (blocks over the largest job, njobs): finalises split-K and fused jobs.
 __global__ void fp4_reduce(const Jobs jobs, std::uint32_t rows) {
+    const PdlWaited waited = pdl_wait();
+    pdl_trigger();  // after the wait: L2 footprint (common.cuh)
     const Job& J = jobs.j[blockIdx.y];
     if (J.ks <= 1 && J.w[1] == nullptr) return;
     const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= static_cast<std::size_t>(J.out) * rows) return;
     const std::size_t stride = static_cast<std::size_t>(J.out) * rows;
-    const float* part = J.part;
+    const float* part = J.part(waited);
+    const float* const resid = J.resid(waited);
     float s = part[idx];
     for (std::uint32_t k = 1; k < J.ks; ++k) s = __fadd_rn(s, part[k * stride + idx]);
     float v = __fmul_rn(s, J.gs[0]);
@@ -258,10 +285,10 @@ __global__ void fp4_reduce(const Jobs jobs, std::uint32_t rows) {
         float u = part[off + idx];
         for (std::uint32_t k = 1; k < J.ks; ++k) u = __fadd_rn(u, part[off + k * stride + idx]);
         v = __fmul_rn(cc_silu(v), __fmul_rn(u, J.gs[1]));
-    } else if (J.resid != nullptr) {
-        v = __fadd_rn(J.resid[idx], v);
+    } else if (resid != nullptr) {
+        v = __fadd_rn(resid[idx], v);
     }
-    J.y[idx] = v;
+    J.y(waited)[idx] = v;
 }
 
 using WorkspaceKey = std::pair<int, cudaStream_t>;
@@ -280,12 +307,14 @@ cudaError_t launch_gemv(Jobs& jobs, const float* x, std::uint32_t in, std::uint3
         fused = fused || jobs.j[q].w[1] != nullptr;
         any_split = any_split || jobs.j[q].ks > 1;
     }
-    fp4_gemv<RB, MT><<<dim3(gx, maxks, fused ? 2 : 1), kWarpsPerBlock * 32, kSlab * RB * 2048, s>>>(jobs, x, in, rows);
-    cudaError_t e = cudaGetLastError();
+    // Both launches carry the programmatic-serialization attribute (off switch: set_programmatic_launch(false) gives the
+    // previous fully serialised form; same kernels, same bits).
+    cudaError_t e = launch_pdl_smem(fp4_gemv<RB, MT>, dim3(gx, maxks, fused ? 2 : 1), dim3(kWarpsPerBlock * 32),
+                                    static_cast<std::size_t>(kSlab) * RB * 2048, s, jobs, x, in, rows);
     if (e != cudaSuccess || (!any_split && !fused)) return e;
     const std::size_t n = static_cast<std::size_t>(maxout) * rows;
-    fp4_reduce<<<dim3(static_cast<unsigned>((n + 255) / 256), static_cast<unsigned>(jobs.n)), 256, 0, s>>>(jobs, rows);
-    return cudaGetLastError();
+    return launch_pdl(fp4_reduce, dim3(static_cast<unsigned>((n + 255) / 256), static_cast<unsigned>(jobs.n)), dim3(256), s,
+                      jobs, rows);
 }
 
 cudaError_t launch_by_rows(Jobs& jobs, const float* x, std::uint32_t in, std::uint32_t rows, cudaStream_t s) {
@@ -413,11 +442,34 @@ cudaError_t quantize(const void* src, std::uint32_t out, std::uint32_t in, void*
 
 }  // namespace
 
-void nvfp4_set_split_target(std::uint32_t warps) { g_target_warps = warps ? warps : 1000; }
+void nvfp4_set_split_target(std::uint32_t warps) { g_target_warps = warps ? warps : split_k::kExactTarget; }
+
+cudaError_t nvfp4_device_key(split_k::Device* key) {
+    int dev = 0, sms = 0, major = 0, minor = 0;
+    cudaError_t e = cudaGetDevice(&dev);
+    if (e == cudaSuccess) e = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    if (e == cudaSuccess) e = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+    if (e == cudaSuccess) e = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+    if (e != cudaSuccess) return e;
+    *key = {static_cast<std::uint32_t>(sms), static_cast<std::uint32_t>(10 * major + minor)};
+    return cudaSuccess;
+}
+
+cudaError_t nvfp4_set_split_profile(bool fast) {
+    // the key is recorded under EXACT too (reporting only: target() ignores the device under EXACT)
+    split_k::Device d{};
+    if (const cudaError_t e = nvfp4_device_key(&d); e != cudaSuccess) return e;
+    g_split_device = d;
+    g_split_profile = fast ? split_k::Profile::fast : split_k::Profile::exact;
+    return cudaSuccess;
+}
+
+const char* nvfp4_split_identity() { return split_k::identity(g_split_profile, g_split_device).data(); }
+
+split_k::Device nvfp4_split_device() { return g_split_device; }
 
 std::uint32_t nvfp4_split_k(std::uint32_t out, std::uint32_t in) {
-    const std::uint32_t nch = in >> 7, groups = std::max<std::uint32_t>(1, (out / 16 + 15) / 16);
-    return std::clamp<std::uint32_t>((g_target_warps + groups / 2) / groups, 1, nch);
+    return split_k::factor(split_k::target(g_split_profile, g_split_device, out, in, g_target_warps), out, in);
 }
 
 cudaError_t nvfp4_quantize_bf16(const void* bf16, std::uint32_t out, std::uint32_t in, void* dst, float* gscale,

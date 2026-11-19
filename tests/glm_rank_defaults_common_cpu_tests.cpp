@@ -29,7 +29,7 @@ void test_common_default_rows() {
     static_assert(std::is_same_v<rd::EnvItem, profile::DefaultItem>);
     const Env absent;
     const auto empty = lookup(absent);
-    CHECK(rd::env_items().size() == 42);
+    CHECK(rd::env_items().size() == 43);
     const auto normal = rd::resolve(rd::scan({}), empty);
     const auto baseline_config = rd::resolve(rd::scan({"--baseline"}), empty);
     CHECK(rd::print(normal).find("effective pf-seqpar=on") != std::string::npos);
@@ -135,14 +135,13 @@ void test_glm_product_profiles() {
         CHECK(rd::print(e) == rd::print(plain) + e.product->describe());
         CHECK(e.product->quality_fallback() == (std::string(name) == "quality"));
     }
+    // pf_wmma is UNQUALIFIED for fast (8K quality gate failed): the word selects nothing; explicit STRIX_GLM_PF_WMMA=1 only.
     auto fast = rd::resolve(rd::scan({"--profile", "fast", "--decode", "64"}), empty);
-    CHECK(fast.product && fast.product->find("pf_wmma")->status == profile::Status::set);
-    CHECK(fast.product->find("pf_wmma")->value == "1");
-    auto wanted = normal_exports;
-    wanted["STRIX_GLM_PF_WMMA"] = "1";
-    CHECK(exports(fast) == wanted); // FAST adds exactly one switch.
+    CHECK(fast.product && fast.product->find("pf_wmma")->status == profile::Status::builtin);
+    CHECK(fast.product->find("pf_wmma")->value == "0");
+    CHECK(exports(fast) == normal_exports); // FAST exports nothing until the gate passes.
     CHECK(fast.product->qualification() == "qualified");
-    CHECK(rd::print(fast).find("profile lever pf_wmma 1 (profile, bit-changing, STRIX_GLM_PF_WMMA)") != std::string::npos);
+    CHECK(rd::print(fast).find("profile lever pf_wmma 1") == std::string::npos);
     CHECK(rd::print(fast) == rd::print(plain) + fast.product->describe());
     for (const char* value : {"0", "1", "", "1tail"}) {
         const Env env{{"STRIX_GLM_PF_WMMA", value}};

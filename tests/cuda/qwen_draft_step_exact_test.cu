@@ -1,4 +1,5 @@
-// Byte-identity + timing test: MTP draft/commit step decode kernels, old vs new (rows 1..8).
+// Byte-identity + timing test: MTP draft/commit step kernels, old vs new (decode rows 1..8; prefill rows 9..2019 for the fused
+// projection and hyper output, which launch_mtp_cache_rows routes to the v2 forms at every row count).
 //   qwen_draft_step_exact_test --tables DIR
 // Includes the two .cu files directly to reach their anonymous-namespace kernels. Build: tests/cuda/build_qwen_test.bat
 // (sources: this file + src/cuda/core/amd_math_tables.cu; gguf_reader not needed).
@@ -85,7 +86,8 @@ static void test_step(const am::Tables& tb) {
     auto* d_en = dalloc(enorm); auto* d_hn = dalloc(hnorm);
     for (unsigned variant = 0; variant < 2; ++variant) {
         MtpRounding rd; if (variant) { rd.normalized_bf16 = false; rd.projection_bf16 = false; rd.gemma_offset = true; }
-        for (unsigned rows = 1; rows <= 8; ++rows) {
+        for (unsigned rows : {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U, 13U, 67U, 2019U}) {
+            const bool prefill = rows > 8U;   // only the fused projection and the hyper output have prefill v2 forms
             const std::string tag = "rows " + std::to_string(rows) + " variant " + std::to_string(variant);
             std::vector<std::uint16_t> emb(rows * kHidden), hid(static_cast<std::size_t>(rows) * kExpanded);
             for (auto& x : emb) x = bf(nrm(1.5F));
@@ -103,8 +105,7 @@ static void test_step(const am::Tables& tb) {
             auto* f_old = dzero<std::uint16_t>(static_cast<std::size_t>(rows) * kExpanded);
             auto* f_new = dzero<std::uint16_t>(static_cast<std::size_t>(rows) * kExpanded);
             mtp_fused_projection_kernel<<<dim3(kHidden / 8U, (rows + kFuseRows - 1U) / kFuseRows), 256>>>(n_old, d_eh, rows, f_old, rd);
-            if (rows == 1) mtp_fused_projection_v2_kernel<1><<<dim3(kHidden / 8U, 1), 256>>>(n_old, d_eh, rows, f_new, rd);
-            else mtp_fused_projection_v2_kernel<4><<<dim3(kHidden / 8U, (rows + 3U) / 4U), 256>>>(n_old, d_eh, rows, f_new, rd);
+            mtp_fused_projection_v2(n_old, d_eh, rows, f_new, rd, nullptr);
             CK(cudaDeviceSynchronize());
             const auto fo = fetch(f_old, static_cast<std::size_t>(rows) * kExpanded), fn = fetch(f_new, fo.size());
             report(same(fo, fn), "fused_projection " + tag);
@@ -116,7 +117,7 @@ static void test_step(const am::Tables& tb) {
             auto* h_old = dzero<std::uint16_t>(static_cast<std::size_t>(rows) * kHidden);
             auto* h_new = dzero<std::uint16_t>(static_cast<std::size_t>(rows) * kHidden);
             mtp_hyper_output_kernel<<<dim3(kHidden / 32U, rows), 128>>>(d_hcn, d_low, d_up, h_old, tb);
-            mtp_hyper_output_v2_kernel<<<dim3(kHidden / 32U, rows), 128>>>(d_hcn, d_low, d_up, h_new, tb);
+            mtp_hyper_output_v2(d_hcn, d_low, d_up, h_new, tb, rows, nullptr);
             CK(cudaDeviceSynchronize());
             const auto ho = fetch(h_old, static_cast<std::size_t>(rows) * kHidden), hn = fetch(h_new, ho.size());
             report(same(ho, hn), "hyper_output " + tag);
@@ -126,17 +127,22 @@ static void test_step(const am::Tables& tb) {
             auto* vo = dzero<float>(kv); auto* vn = dzero<float>(kv);
             const dim3 g(kMtpIndexDim + 2U * kMtpKvWidth, (rows + kLinRows - 1U) / kLinRows);
             mtp_cache_projection_kernel<<<g, 256>>>(h_old, rows, d_ik, d_kq, d_vq, io, kk, vo);
-            mtp_cache_projection_v2_kernel<<<g, 256>>>(h_old, rows, d_ik, d_kq, d_vq, ino, kn, vn);
+            if (!prefill) mtp_cache_projection_v2_kernel<<<g, 256>>>(h_old, rows, d_ik, d_kq, d_vq, ino, kn, vn);
             CK(cudaDeviceSynchronize());
-            report(same(fetch(io, ko), fetch(ino, ko)) && same(fetch(kk, kv), fetch(kn, kv)) && same(fetch(vo, kv), fetch(vn, kv)), "cache_projection " + tag);
+            if (!prefill) report(same(fetch(io, ko), fetch(ino, ko)) && same(fetch(kk, kv), fetch(kn, kv)) && same(fetch(vo, kv), fetch(vn, kv)), "cache_projection " + tag);
+            if (variant == 0 && prefill && rows == 2019U) {
+                timing("fused_projection", rows, [&] { mtp_fused_projection_kernel<<<dim3(kHidden / 8U, (rows + kFuseRows - 1U) / kFuseRows), 256>>>(n_old, d_eh, rows, f_old, rd); },
+                    [&] { mtp_fused_projection_v2(n_old, d_eh, rows, f_new, rd, nullptr); });
+                timing("hyper_output", rows, [&] { mtp_hyper_output_kernel<<<dim3(kHidden / 32U, rows), 128>>>(d_hcn, d_low, d_up, h_old, tb); },
+                    [&] { mtp_hyper_output_v2(d_hcn, d_low, d_up, h_new, tb, rows, nullptr); });
+            }
             if (variant == 0 && (rows == 1 || rows == 4 || rows == 8)) {
                 timing("input_norms", rows, [&] { mtp_input_norms_kernel<<<dim3(2, rows), 256>>>(d_emb, d_hid, d_en, d_hn, n_old, rd); },
                     [&] { mtp_input_norms_v2_kernel<<<dim3(2, rows), 256>>>(d_emb, d_hid, d_en, d_hn, n_new, rd); });
                 timing("fused_projection", rows, [&] { mtp_fused_projection_kernel<<<dim3(kHidden / 8U, (rows + kFuseRows - 1U) / kFuseRows), 256>>>(n_old, d_eh, rows, f_old, rd); },
-                    [&] { if (rows == 1) mtp_fused_projection_v2_kernel<1><<<dim3(kHidden / 8U, 1), 256>>>(n_old, d_eh, rows, f_new, rd);
-                          else mtp_fused_projection_v2_kernel<4><<<dim3(kHidden / 8U, (rows + 3U) / 4U), 256>>>(n_old, d_eh, rows, f_new, rd); });
+                    [&] { mtp_fused_projection_v2(n_old, d_eh, rows, f_new, rd, nullptr); });
                 timing("hyper_output", rows, [&] { mtp_hyper_output_kernel<<<dim3(kHidden / 32U, rows), 128>>>(d_hcn, d_low, d_up, h_old, tb); },
-                    [&] { mtp_hyper_output_v2_kernel<<<dim3(kHidden / 32U, rows), 128>>>(d_hcn, d_low, d_up, h_new, tb); });
+                    [&] { mtp_hyper_output_v2(d_hcn, d_low, d_up, h_new, tb, rows, nullptr); });
                 timing("cache_projection", rows, [&] { mtp_cache_projection_kernel<<<g, 256>>>(h_old, rows, d_ik, d_kq, d_vq, io, kk, vo); },
                     [&] { mtp_cache_projection_v2_kernel<<<g, 256>>>(h_old, rows, d_ik, d_kq, d_vq, ino, kn, vn); });
             }

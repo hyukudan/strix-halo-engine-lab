@@ -22,6 +22,7 @@
 #include "strix/cuda_core/submit_window.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/gguf_writer.hpp"
+#include "strix/spec/draft_rows.hpp"
 #include "strix/wave_fit.hpp"
 #include "../../core/dense_linear.hpp"
 
@@ -287,6 +288,42 @@ __global__ void set_inputs_kernel(InputPack in, std::uint32_t* pos, std::uint32_
     if (threadIdx.x < cc::kMaxRows) ids[threadIdx.x] = in.ids[threadIdx.x];
 }
 __global__ void zero_u32_kernel(std::uint32_t* p) { *p = 0; }
+// Draft head output. Subset head (group_of set): compact row -> token id (slot group_of[row / group], row % group), in place
+// on the argmax output. Device-fed MTP chain (feed_out set): the last row's token id is also stored in the chain's feed slot.
+__global__ void draft_map_kernel(std::uint32_t* top, const std::uint32_t* group_of, std::uint32_t rows, std::uint32_t group,
+                                 std::uint32_t* feed_out) {
+    if (threadIdx.x < rows) {
+        std::uint32_t t = top[threadIdx.x];
+        if (group_of) {
+            t = group_of[t / group] * group + t % group;
+            top[threadIdx.x] = t;
+        }
+        if (feed_out && threadIdx.x + 1 == rows) *feed_out = t;
+    }
+}
+// Device-fed MTP chain step: the input id is the previous step's draft, read from the feed on the device (no host round trip).
+__global__ void fed_inputs_kernel(const std::uint32_t* feed, std::uint32_t slot, std::uint32_t pos0, std::uint32_t* pos,
+                                  std::uint32_t* ids) {
+    if (threadIdx.x == 0) {
+        *pos = pos0;
+        ids[0] = feed[slot];
+    }
+}
+// Verify pre-launch: the verify rows' ids, host values or drafted ids still in the chain's feed slots (gathered on the
+// device). Rows past the window get id 0, as set_inputs_kernel leaves them, so d_ids is the same array either way.
+constexpr std::uint32_t kFeedHostRow = 0xFFFFFFFFU;  // = strix::spec::DraftFeed::kHost
+struct FedPack {
+    std::uint32_t pos0;
+    std::uint32_t ids[cc::kMaxRows];
+    std::uint32_t slot[cc::kMaxRows];
+};
+__global__ void fed_rows_kernel(FedPack in, const std::uint32_t* feed, std::uint32_t* pos, std::uint32_t* ids) {
+    if (threadIdx.x == 0) *pos = in.pos0;
+    if (threadIdx.x < cc::kMaxRows) {
+        const std::uint32_t sl = in.slot[threadIdx.x];
+        ids[threadIdx.x] = sl == kFeedHostRow ? in.ids[threadIdx.x] : feed[sl];
+    }
+}
 
 // Multi-session batch tables (one small by-value pack, scattered to device arrays by one kernel before the graph).
 struct SlotPack {
@@ -337,6 +374,16 @@ struct CudaEngine::Impl {
     std::uint32_t *d_ids = nullptr, *d_pos = nullptr, *d_top = nullptr, *d_parity = nullptr;
     void* d_argws = nullptr;
     std::uint32_t *d_mids = nullptr, *d_mpos = nullptr, *d_mtop = nullptr;
+    std::uint32_t* d_feed = nullptr;  // device-fed MTP chain: drafted ids, CudaEngine::kMtpFeedSlots entries
+    // Verify pre-launch: pinned staging of the feed ids + the event that marks their copy (mtp_feed_read_async / _wait).
+    cc::UniqueHandle<void*, cudaFreeHost> h_feed_owner;
+    std::uint32_t* h_feed = nullptr;
+    cc::UniqueHandle<cudaEvent_t, cudaEventDestroy> feed_ev;
+    // Draft-only subset head (set_draft_rows): compact NVFP4 tiles of `head` + slot -> source tile table.
+    strix::spec::DraftRows* drows = nullptr;
+    unsigned char* dhead = nullptr;
+    std::uint32_t* d_dmap = nullptr;
+    std::uint32_t dhead_slots = 0;
     // per-layer state / window buffers
     std::vector<float*> conv, delta, raw, qkvc, ar, br;
     std::vector<__nv_bfloat16*> kc, vc;
@@ -353,6 +400,9 @@ struct CudaEngine::Impl {
     };
     std::unordered_map<std::uint32_t, Graph> graphs;
     std::uint64_t last_nodes = 0;
+    // One-row MTP body graphs keyed by the hidden input pointer (the chain's carry buffer); pointers seen once ran eagerly.
+    std::vector<std::pair<const float*, Graph>> mtp_graphs;
+    std::vector<const float*> mtp_eager;
 
     template <class T>
     T* alloc(std::size_t n, bool zero = false) {
@@ -396,6 +446,8 @@ struct CudaEngine::Impl {
 
     void init() {
         cc::set_programmatic_launch(opt.pdl);
+        // split-K policy before the workspace bound below, graphs and prefill tables (all follow nvfp4_split_k)
+        CK(cc::nvfp4_set_split_profile(opt.nvfp4_split == split_k::Profile::fast));
         gd = {c.gdn_key_heads, c.gdn_key_dim, c.gdn_value_heads, c.gdn_value_dim, c.gdn_conv_kernel};
         ad.heads = c.heads;
         ad.kv_heads = c.kv_heads;
@@ -438,7 +490,7 @@ struct CudaEngine::Impl {
         ao = alloc<float>(static_cast<std::size_t>(RM) * c.heads * c.head_dim);
         hid = alloc<float>(static_cast<std::size_t>(RM) * c.intermediate);
         logits = alloc<float>(static_cast<std::size_t>(RM) * c.vocab);
-        scratch = alloc<float>(cc::attention_scratch_floats(ad, RM));
+        scratch = alloc<float>(std::max(cc::attention_scratch_floats(ad, RM), cc::attention_decode8_scratch_floats(ad, RM)));
         d_ids = alloc<std::uint32_t>(RM);
         d_pos = alloc<std::uint32_t>(1);
         d_top = alloc<std::uint32_t>(RM);
@@ -453,6 +505,10 @@ struct CudaEngine::Impl {
             d_mids = alloc<std::uint32_t>(RM);
             d_mpos = alloc<std::uint32_t>(1);
             d_mtop = alloc<std::uint32_t>(RM);
+            d_feed = alloc<std::uint32_t>(CudaEngine::kMtpFeedSlots, true);
+            CK(cudaMallocHost(h_feed_owner.put(), CudaEngine::kMtpFeedSlots * sizeof(std::uint32_t)));
+            h_feed = static_cast<std::uint32_t*>(h_feed_owner.get());
+            CK(cudaEventCreateWithFlags(feed_ev.put(), cudaEventDisableTiming));
             const std::size_t n = static_cast<std::size_t>(c.kv_heads) * opt.max_positions * c.head_dim;
             mkc = alloc<__nv_bfloat16>(n, true);
             mvc = alloc<__nv_bfloat16>(n, true);
@@ -501,6 +557,7 @@ struct CudaEngine::Impl {
         CK(cudaStreamSynchronize(s));
         committed = 0;
         last_rows = 0;
+        d8_end = 0;
     }
 
     // ---- one attention layer body (shared by the trunk and the MTP block): mixer + MLP on rows of xa (residual stream).
@@ -509,6 +566,7 @@ struct CudaEngine::Impl {
         const std::uint32_t* pos;
         __nv_bfloat16 *kc, *vc;
         cc::RowMap rm{};
+        const cc::KvShadowE4m3* sh8 = nullptr;  // decode_attn8: the layer's e4m3 shadow (FAST8 decode attention), else BF16 attention
     };
 
     // GEMVs that share x: one launch when format and in agree (bitwise equal either way), else separate launches.
@@ -537,7 +595,7 @@ struct CudaEngine::Impl {
         CK(cc::rope_apply(q, qdst, c.rotary_dim, cos_t, sin_t, b.pos, s, b.rm));
         CK(cc::rope_apply(k, kvv, c.rotary_dim, cos_t, sin_t, b.pos, s, b.rm));
         CK(cc::kv_store(ad, k, v, b.kc, b.vc, b.pos, rows, s, b.rm));
-        CK(cc::attention_decode(ad, q, qdst, qg + D, qsrc, b.kc, b.vc, b.pos, rows, ao, scratch, s, b.rm));
+        CK(cc::attention_decode_kv(ad, q, qdst, qg + D, qsrc, b.kc, b.vc, b.sh8, b.pos, rows, ao, scratch, s, b.rm));
         CK(cc::dense_rows(w.o, ao, b.x, rows, b.x, s, opt.dense_arithmetic));
     }
 
@@ -566,7 +624,7 @@ struct CudaEngine::Impl {
                 CK(cc::gdn_window(gd, cl.layer, cl.state, cl.win, z, gout, rows, c.rms_eps, d_parity, s));
                 CK(cc::dense_rows(w.out, gout, x, rows, x, s, opt.dense_arithmetic));
             } else {
-                attn_mixer(w, Bufs{x, xn, d_pos, kc[l], vc[l]}, rows);
+                attn_mixer(w, Bufs{x, xn, d_pos, kc[l], vc[l], {}, decode8_on() ? &pf.sh[l] : nullptr}, rows);
             }
             mlp(w, Bufs{x, xn, d_pos, nullptr, nullptr}, rows);
         }
@@ -584,11 +642,54 @@ struct CudaEngine::Impl {
         if (rows == 0 || rows > RM) throw std::runtime_error("forward_rows: rows must be 1..32");
         core::require_capacity(committed, rows, opt.max_positions);
         core::validate_token_ids(tokens, rows, c.vocab);
+        if (decode8_on()) decode8_catch_up();
         InputPack in{};
         in.pos0 = committed;
         for (std::uint32_t i = 0; i < rows; ++i) in.ids[i] = tokens[i];
         set_inputs_kernel<<<1, 32, 0, s>>>(in, d_pos, d_ids);
         CK(cudaGetLastError());
+        return run_rows(rows, want);
+    }
+
+    // Verify pre-launch: forward() whose rows nhost.. take their ids from the chain's feed slots on the device (gathered by
+    // one kernel in place of set_inputs_kernel; the slots hold argmax ids < vocab by construction). Then the same graph.
+    RowsOut forward_fed(const std::uint32_t* host_ids, std::uint32_t nhost, const std::uint32_t* slot, const std::uint32_t* host_vals,
+                        std::uint32_t k, LogitRows want) {
+        const std::uint32_t rows = nhost + k;
+        if (!mtp_ok) throw std::runtime_error("forward_rows_fed: no MTP feed (no MTP tensors loaded)");
+        if (rows == 0 || rows > RM || nhost > rows) throw std::runtime_error("forward_rows_fed: rows must be 1..32");
+        core::require_capacity(committed, rows, opt.max_positions);
+        core::validate_token_ids(host_ids, nhost, c.vocab);
+        FedPack in{};
+        in.pos0 = committed;
+        for (std::uint32_t i = 0; i < cc::kMaxRows; ++i) in.slot[i] = kFeedHostRow;  // rows past the window: id 0
+        for (std::uint32_t i = 0; i < nhost; ++i) in.ids[i] = host_ids[i];
+        for (std::uint32_t j = 0; j < k; ++j) {
+            if (slot[j] == kFeedHostRow) {
+                core::validate_token_ids(&host_vals[j], 1, c.vocab);
+                in.ids[nhost + j] = host_vals[j];
+            } else {
+                if (slot[j] >= CudaEngine::kMtpFeedSlots) throw std::runtime_error("forward_rows_fed: feed slot out of range");
+                in.slot[nhost + j] = slot[j];
+            }
+        }
+        fed_rows_kernel<<<1, 32, 0, s>>>(in, d_feed, d_pos, d_ids);
+        CK(cudaGetLastError());
+        return run_rows(rows, want);
+    }
+    void mtp_feed_read_async(std::uint32_t n) {
+        if (!mtp_ok || n > CudaEngine::kMtpFeedSlots) throw std::runtime_error("mtp_feed_read_async: no MTP tensors or bad count");
+        CK(cudaMemcpyAsync(h_feed, d_feed, static_cast<std::size_t>(n) * 4, cudaMemcpyDeviceToHost, s));
+        CK(cudaEventRecord(feed_ev.get(), s));
+    }
+    void mtp_feed_wait(std::uint32_t n, std::uint32_t* host) {
+        if (!mtp_ok || n > CudaEngine::kMtpFeedSlots) throw std::runtime_error("mtp_feed_wait: no MTP tensors or bad count");
+        CK(cudaEventSynchronize(feed_ev.get()));
+        std::copy(h_feed, h_feed + n, host);
+    }
+
+    // The window after its inputs are on the device (d_pos, d_ids): replay (or capture) the trunk graph of (rows, want).
+    RowsOut run_rows(std::uint32_t rows, LogitRows want) {
         const std::uint32_t key = rows * 4 + static_cast<std::uint32_t>(want);
         if (graphs_on) {
             auto it = graphs.find(key);
@@ -632,6 +733,9 @@ struct CudaEngine::Impl {
         if (kk > 0) {
             CK(cc::gdn_commit(gd, commit_layers.data(), static_cast<std::uint32_t>(commit_layers.size()), last_rows, kk, d_parity, s));
         }
+        // decode_attn8: the window's rows were quantised into the shadow right after kv_store (attn_mixer), so the committed
+        // prefix stays mirrored when the shadow was current at the window start (forward() catches up first).
+        if (decode8_on() && d8_end == committed) d8_end += kk;
         committed += kk;
         last_rows = 0;
     }
@@ -658,7 +762,10 @@ struct CudaEngine::Impl {
         (void)cudaSetDevice(device);
         if (s) (void)cudaStreamSynchronize(s);
         graphs.clear();
+        mtp_graphs.clear();
         ss.graphs.clear();
+        feed_ev.reset();
+        h_feed_owner.reset();
         if (s) cc::nvfp4_release_workspace(s);
         pf.sl.clear();  // drain slot streams before freeing shared model/state buffers
         allocations.clear();
@@ -908,6 +1015,7 @@ struct CudaEngine::Impl {
             allocations.push_back(std::move(owner));
             return p;
         }
+        cc::GdnChunkWork gdn_ws;  // FAST gdn-chunk16 workspace (prefill_gdn chunk16 only; ws null = serial delta rule)
         float *x = nullptr, *xn = nullptr, *z = nullptr, *gout = nullptr, *raw = nullptr, *qkvc = nullptr, *ar = nullptr, *br = nullptr,
               *qg = nullptr, *q = nullptr, *k = nullptr, *v = nullptr, *ao = nullptr, *hid = nullptr, *scr = nullptr;
         std::uint32_t *ids = nullptr, *wpos = nullptr, *pos = nullptr, *cpar = nullptr;
@@ -916,9 +1024,23 @@ struct CudaEngine::Impl {
         std::uint32_t act_in = 0, act_rows = 0;
         cc::BigAct act[2];
         bool have[2] = {false, false};
+        // FAST4 norm fold: xn = rmsnorm(x, norm_gain) is PENDING (never written) while norm_gain != nullptr; pf_act quantises it
+        // straight from x or materialises the f32 rows. A GEMM writing x drops a pending xn (xn_dead: reading it would be an error).
+        const float* norm_gain = nullptr;
+        bool xn_dead = false;
+        // The same for the chunked GDN output: gout holds the raw delta-rule rows and its gated RMSNorm (gain gout_gain, gate z) is
+        // PENDING while gout_gain != nullptr (gdn_prefill_layer ran with defer_norm); pf_act folds it into the ssm_out quantiser.
+        const float* gout_gain = nullptr;
+    };
+    struct CacheDel {
+        void operator()(cc::BigOperandCache* p) const { cc::dense_big_cache_destroy(p); }
     };
     struct Pf {
         std::uint32_t C = 0;
+        // resident expanded operands shared by every slot context; declared before sl so it is destroyed after the slots have
+        // drained their streams
+        std::unique_ptr<cc::BigOperandCache, CacheDel> cache;
+        bool cache_tried = false;
         std::vector<std::unique_ptr<Slot>> sl;
         int terms = 3;
         // e4m3 KV shadow (opt.prefill_attn8): per attention layer, allocated on first use; positions < sh_end mirror the BF16 cache.
@@ -926,6 +1048,17 @@ struct CudaEngine::Impl {
         std::uint32_t sh_end = 0, sh_from = 0, start = 0;
     } pf;
     [[nodiscard]] bool attn8_on() const { return opt.prefill_attn8 && opt.prefill_arith != PrefillArith::exact; }
+    // decode_attn8 (FAST8 decode / verify attention over the same e4m3 shadow, identity -d8): positions < d8_end mirror the
+    // BF16 cache for decode. Main-session trunk only: slot batches (rm.slot) and the MTP block keep BF16 attention_decode.
+    std::uint32_t d8_end = 0;
+    [[nodiscard]] bool decode8_on() const { return opt.decode_attn8; }
+    void decode8_catch_up() {
+        pf_shadow_init();
+        if (d8_end >= committed) return;
+        for (std::uint32_t l = 0; l < c.layers; ++l)
+            if (L[l].attn) CK(cc::kv_shadow_e4m3(ad, kc[l], vc[l], pf.sh[l], d8_end, committed - d8_end, s));
+        d8_end = committed;
+    }
     void pf_shadow_init() {
         if (!pf.sh.empty()) return;
         const std::size_t bytes = cc::kv_shadow_e4m3_bytes(ad), p8 = cc::attn8_capacity(ad), kvd = static_cast<std::size_t>(c.kv_heads) * p8 * c.head_dim;
@@ -969,6 +1102,10 @@ struct CudaEngine::Impl {
         sl.qkvc = sl.alloc<float>(static_cast<std::size_t>(C) * gd.conv_channels());
         sl.ar = sl.alloc<float>(static_cast<std::size_t>(C) * gd.value_heads);
         sl.br = sl.alloc<float>(static_cast<std::size_t>(C) * gd.value_heads);
+        if (opt.prefill_gdn == PrefillGdn::chunk16 && opt.prefill_arith != PrefillArith::exact) {  // 215 MB per slot at C = 4096
+            sl.gdn_ws.floats = cc::gdn_chunk_workspace_floats(gd, C);
+            sl.gdn_ws.ws = sl.alloc<float>(sl.gdn_ws.floats);
+        }
         sl.qg = sl.alloc<float>(static_cast<std::size_t>(C) * c.q_gate_width());
         sl.q = sl.alloc<float>(static_cast<std::size_t>(C) * c.heads * c.head_dim);
         sl.k = sl.alloc<float>(static_cast<std::size_t>(C) * c.kv_width());
@@ -1009,10 +1146,41 @@ struct CudaEngine::Impl {
             pf_make_slot(*slot, pf.C);
             pf.sl.push_back(std::move(slot));
         }
+        pf_cache_init();
+        for (const auto& slot : pf.sl) cc::dense_big_ctx_attach_cache(slot->bc, pf.cache.get());
     }
 
+    // Resident expanded operands (cuda_engine.hpp prefill_operand_cache): planned once, after the slot scratch exists, over every
+    // projection in use order; filled lazily by the first GEMM of each weight. Bitwise neutral; admission is reported once.
+    void pf_cache_init() {
+        if (pf.cache_tried) return;
+        pf.cache_tried = true;
+        if (opt.prefill_operand_cache == cc::operand_cache::Mode::off) return;
+        if (opt.prefill_operand_cache == cc::operand_cache::Mode::automatic && opt.prefill_arith != PrefillArith::fast8 &&
+            opt.prefill_arith != PrefillArith::fast4)
+            return;
+        std::vector<cc::DenseWeight> ws;
+        for (const LayerW& w : L)
+            for (const cc::DenseWeight* d : {&w.qkv, &w.gate, &w.beta, &w.alpha, &w.out, &w.q, &w.k, &w.v, &w.o, &w.ffn_gate, &w.ffn_up, &w.ffn_down})
+                if (d->data != nullptr) ws.push_back(*d);
+        pf.cache.reset(cc::dense_big_cache_create());
+        cc::BigCacheReport r;
+        CK(cc::dense_big_cache_reserve(pf.cache.get(), ws.data(), ws.size(), pf_class(), opt.prefill_operand_cache,
+                                       static_cast<std::uint64_t>(opt.prefill_operand_cache_cap_mib) << 20, &r));
+        if (!opt.quiet)
+            std::fprintf(stderr, "prefill operand cache: %s; class %s; %u resident, %u not admitted; %.2f of %.2f GiB wanted (budget %.2f GiB); bitwise neutral\n",
+                         cc::operand_cache::mode_name(opt.prefill_operand_cache), r.f4 ? "e2m1 tile (FAST4)" : r.f8 ? "e4m3 (FAST8)" : "exact (f16/q8)", r.admitted, r.rejected,
+                         r.arena_bytes / 1073741824.0, r.wanted_bytes / 1073741824.0, r.budget_bytes / 1073741824.0);
+    }
+
+    [[nodiscard]] cc::BigClass pf_class() const {
+        return opt.prefill_arith == PrefillArith::fast4   ? cc::BigClass::fast4
+               : opt.prefill_arith == PrefillArith::fast8 ? cc::BigClass::fast8
+                                                          : cc::BigClass::exact;
+    }
     [[nodiscard]] int pf_terms() const {
-        if (opt.prefill_arith == PrefillArith::fast || opt.prefill_arith == PrefillArith::fast8) return 1;
+        if (opt.prefill_arith == PrefillArith::fast || opt.prefill_arith == PrefillArith::fast8 || opt.prefill_arith == PrefillArith::fast4)
+            return 1;
         if (opt.prefill_arith == PrefillArith::fast2) return 2;
         const auto a = opt.dense_arithmetic;
         return a == cc::DenseArith::mma3 ? 3 : a == cc::DenseArith::mma2 ? 2 : 1;
@@ -1027,7 +1195,28 @@ struct CudaEngine::Impl {
             sl.act_rows = rows;
         }
         const int cls = w.format == cc::WeightFormat::nvfp4 ? 1 : 0;
-        if (!sl.have[cls]) {
+        if (x == sl.xn && sl.xn_dead) throw std::logic_error("prefill: normalised rows read after their residual source was overwritten");
+        if (x == sl.gout && sl.gout_gain != nullptr && !sl.have[cls]) {
+            if (cls == 1 && opt.prefill_arith == PrefillArith::fast4 && w.in == gd.v_width()) {
+                CK(cc::dense_big_gated_norm_split4(sl.gout, sl.z, sl.gout_gain, c.rms_eps, rows, w.in, &sl.act[1], sl.st, sl.bc));
+                sl.have[1] = true;
+            } else {  // any other consumer: apply the norm in place first (the unfolded chunked path)
+                CK(cc::gdn_chunk_norm(gd, sl.gout_gain, sl.z, sl.gout, rows, c.rms_eps, sl.st));
+                sl.gout_gain = nullptr;
+            }
+        }
+        if (x == sl.xn && sl.norm_gain != nullptr && !sl.have[cls]) {
+            if (cls == 1 && opt.prefill_arith == PrefillArith::fast4 && w.in == c.hidden) {
+                CK(cc::dense_big_norm_split4(sl.x, sl.norm_gain, c.rms_eps, rows, w.in, &sl.act[1], sl.st, sl.bc));
+                sl.have[1] = true;
+            } else {
+                pf_norm_materialise(sl, rows);
+            }
+        }
+        if (!sl.have[cls] && cls == 1 && opt.prefill_arith == PrefillArith::fast4) {
+            CK(cc::dense_big_split4(x, rows, w.in, &sl.act[cls], sl.st, sl.bc));
+            sl.have[cls] = true;
+        } else if (!sl.have[cls]) {
             CK(cc::dense_big_split(x, rows, w.in, w.format, pf.terms, &sl.act[cls], sl.st, sl.bc, opt.prefill_arith == PrefillArith::fast8));
             sl.have[cls] = true;
         }
@@ -1038,17 +1227,44 @@ struct CudaEngine::Impl {
         sl.have[0] = sl.have[1] = false;
     }
 
+    // xn = rmsnorm(x, gain) ahead of its GEMM consumers. FAST4 + prefill_norm_fold: left pending, so each consumer's A operand is
+    // quantised straight from x (cuda_core dense_big_norm_split4, bitwise equal to rmsnorm + dense_big_split4) and the f32 rows are
+    // neither written nor re-read; any other consumer gets them materialised first (pf_act).
+    void pf_norm(Slot& sl, const float* gain, std::uint32_t rows) {
+        pf_dirty(sl);
+        sl.xn_dead = false;
+        if (opt.prefill_norm_fold && opt.prefill_arith == PrefillArith::fast4 && cc::dense_big_norm_split4_fits(c.hidden)) {
+            sl.norm_gain = gain;
+            return;
+        }
+        sl.norm_gain = nullptr;
+        const cc::GroupedView hv{rows, 1, c.hidden, c.hidden, c.hidden};
+        CK(cc::rmsnorm(sl.x, hv, gain, sl.xn, hv, c.rms_eps, sl.st));
+    }
+    void pf_norm_materialise(Slot& sl, std::uint32_t rows) {
+        const cc::GroupedView hv{rows, 1, c.hidden, c.hidden, c.hidden};
+        CK(cc::rmsnorm(sl.x, hv, sl.norm_gain, sl.xn, hv, c.rms_eps, sl.st));
+        sl.norm_gain = nullptr;
+    }
+
     void pf_gemm(Slot& sl, const cc::DenseWeight& w, const float* x, std::uint32_t rows, float* y, const float* aux, cc::BigEpi epi) {
         const cc::BigAct& a = pf_act(sl, x, rows, w);
+        if (y == sl.x && sl.norm_gain != nullptr) {  // x is overwritten: a still pending xn can no longer be produced
+            sl.norm_gain = nullptr;
+            sl.xn_dead = true;
+        }
         CK(cc::dense_big_gemm(w, a, y, aux, epi, sl.st, sl.bc));
     }
 
     void pf_mlp(Slot& sl, const LayerW& w, std::uint32_t rows) {
-        const cc::GroupedView hv{rows, 1, c.hidden, c.hidden, c.hidden};
-        CK(cc::rmsnorm(sl.x, hv, w.post_norm, sl.xn, hv, c.rms_eps, sl.st));
-        pf_dirty(sl);
-        pf_gemm(sl, w.ffn_gate, sl.xn, rows, sl.hid, nullptr, cc::BigEpi::none);
-        pf_gemm(sl, w.ffn_up, sl.xn, rows, sl.hid, sl.hid, cc::BigEpi::silu_mul);  // y = silu(gate) * up, in place
+        pf_norm(sl, w.post_norm, rows);
+        if (opt.prefill_arith == PrefillArith::fast4 && w.ffn_gate.format == cc::WeightFormat::nvfp4 && w.ffn_up.format == cc::WeightFormat::nvfp4) {
+            // FAST4: gate and up in ONE GEMM, SwiGLU in registers (no f32 gate round trip through hid)
+            CK(cc::dense_big_glu4(w.ffn_gate, w.ffn_up, pf_act(sl, sl.xn, rows, w.ffn_gate), sl.hid, sl.st, sl.bc));
+        } else {
+            pf_gemm(sl, w.ffn_gate, sl.xn, rows, sl.hid, nullptr, cc::BigEpi::none);
+            pf_gemm(sl, w.ffn_up, sl.xn, rows, sl.hid, sl.hid, cc::BigEpi::silu_mul);  // y = silu(gate) * up, in place
+        }
         pf_dirty(sl);
         pf_gemm(sl, w.ffn_down, sl.hid, rows, sl.x, sl.x, cc::BigEpi::residual);
         pf_dirty(sl);
@@ -1093,8 +1309,6 @@ struct CudaEngine::Impl {
     // layer l (null for the first chunk); mine[l] is recorded after this chunk's layer l.
     void pf_chunk(Slot& sl, const std::uint32_t* tokens, std::uint32_t rows, std::uint32_t pos0, std::uint32_t read_side,
                   const cudaEvent_t* prev, cudaEvent_t* mine) {
-        const std::uint32_t H = c.hidden;
-        const cc::GroupedView hv{rows, 1, H, H, H};
         CK(cudaMemcpyAsync(sl.ids, tokens, static_cast<std::size_t>(rows) * 4, cudaMemcpyHostToDevice, sl.st));
         CK(cudaMemcpyAsync(sl.pos, &pos0, 4, cudaMemcpyHostToDevice, sl.st));
         CK(cudaMemcpyAsync(sl.cpar, &read_side, 4, cudaMemcpyHostToDevice, sl.st));
@@ -1104,16 +1318,20 @@ struct CudaEngine::Impl {
         for (std::uint32_t l = 0; l < c.layers; ++l) {
             const LayerW& w = L[l];
             if (prev != nullptr) CK(cudaStreamWaitEvent(sl.st, prev[l], 0));
-            CK(cc::rmsnorm(sl.x, hv, w.attn_norm, sl.xn, hv, c.rms_eps, sl.st));
-            pf_dirty(sl);
+            pf_norm(sl, w.attn_norm, rows);
             if (!w.attn) {
                 pf_gemm(sl, w.qkv, sl.xn, rows, sl.raw, nullptr, cc::BigEpi::none);
                 pf_gemm(sl, w.gate, sl.xn, rows, sl.z, nullptr, cc::BigEpi::none);
                 pf_gemm(sl, w.beta, sl.xn, rows, sl.br, nullptr, cc::BigEpi::none);
                 pf_gemm(sl, w.alpha, sl.xn, rows, sl.ar, nullptr, cc::BigEpi::none);
                 const auto& cl = commit_layers[gi++];
+                // FAST4 norm fold on the chunked path: the gated RMSNorm is left pending and folded into the ssm_out A operand (bitwise)
+                cc::GdnChunkWork gw = sl.gdn_ws;
+                gw.defer_norm = opt.prefill_norm_fold && opt.prefill_arith == PrefillArith::fast4 && gw.ws != nullptr &&
+                                w.out.format == cc::WeightFormat::nvfp4 && cc::dense_big_norm_split4_fits(gd.v_width());
                 CK(cc::gdn_prefill_layer(gd, cl.layer, cl.state, cc::GdnWindow{sl.raw, sl.qkvc, sl.ar, sl.br}, sl.z, sl.gout, rows, c.rms_eps,
-                                         sl.cpar, sl.st));
+                                         sl.cpar, gw, sl.st));
+                sl.gout_gain = gw.defer_norm ? cl.layer.norm_gain : nullptr;
                 pf_gemm(sl, w.out, sl.gout, rows, sl.x, sl.x, cc::BigEpi::residual);
                 pf_dirty(sl);
             } else {
@@ -1130,6 +1348,8 @@ struct CudaEngine::Impl {
         core::validate_token_ids(tokens, n, c.vocab);
         if (opt.prefill_arith == PrefillArith::fast8 && !cc::dense_big_fast8_supported())
             throw std::invalid_argument("prefill: FAST8 implementation unavailable for this build/device");
+        if (opt.prefill_arith == PrefillArith::fast4 && !cc::dense_big_fast4_supported())
+            throw std::invalid_argument("prefill: FAST4 implementation unavailable for this build/device");
         const char* fallback = big_fallback();
         if (!opt.quiet) std::fprintf(stderr, "prefill route: %s; reason: %s; chunk: %u; requested slots: %u\n",
                                     fallback ? "windows" : "large", fallback ? fallback : "admitted", opt.prefill_chunk, opt.prefill_slots);
@@ -1216,17 +1436,91 @@ struct CudaEngine::Impl {
         return o;
     }
 
+    void set_draft_rows(strix::spec::DraftRows* r) {
+        if (r) {
+            if (!mtp_ok) throw std::runtime_error("set_draft_rows: no MTP tensors loaded");
+            if (head.format != cc::WeightFormat::nvfp4 || r->group() != 16 || head.out != c.vocab || r->vocab() != c.vocab ||
+                r->rows() == 0)
+                throw std::runtime_error("set_draft_rows: needs an NVFP4 lm_head and 16-row groups over the model vocabulary");
+            if (r != drows && r->capacity() <= dhead_slots) r->invalidate();  // another subset may have filled the buffer
+            if (r->capacity() > dhead_slots) {  // grow-only; the old buffers stay owned by `allocations`
+                dhead = alloc<unsigned char>(static_cast<std::size_t>(r->capacity()) * cc::nvfp4_bytes(16, head.in));
+                d_dmap = alloc<std::uint32_t>(r->capacity());
+                dhead_slots = r->capacity();
+                r->invalidate();  // a new buffer holds nothing yet
+            }
+        }
+        drows = r;
+    }
+    // Copies the subset's new tiles (runs of consecutive source tiles in one copy) and their table entries, in stream order.
+    void draft_rows_sync() {
+        const auto& g = drows->groups();
+        const std::uint32_t from = drows->materialised(), to = drows->slots();
+        if (from >= to) return;
+        const std::size_t tile = cc::nvfp4_bytes(16, head.in);
+        const auto* src = static_cast<const unsigned char*>(head.data);
+        for (std::uint32_t a = from; a < to;) {
+            std::uint32_t b = a + 1;
+            while (b < to && g[b] == g[b - 1] + 1) ++b;
+            CK(cudaMemcpyAsync(dhead + a * tile, src + static_cast<std::size_t>(g[a]) * tile, (b - a) * tile, cudaMemcpyDeviceToDevice, s));
+            a = b;
+        }
+        CK(cudaMemcpyAsync(d_dmap + from, g.data() + from, (to - from) * sizeof(std::uint32_t), cudaMemcpyHostToDevice, s));
+        drows->mark_materialised();
+    }
     CudaEngine::MtpOut mtp(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0, bool want_top) {
         if (!mtp_ok) throw std::runtime_error("mtp_forward: no MTP tensors loaded");
         if (rows == 0 || rows > RM) throw std::runtime_error("mtp_forward: bad rows/pos0");
         core::require_capacity(pos0, rows, opt.max_positions);
         core::validate_token_ids(next_tokens, rows, c.vocab);
-        const std::uint32_t H = c.hidden;
         InputPack in{};
         in.pos0 = pos0;
         for (std::uint32_t i = 0; i < rows; ++i) in.ids[i] = next_tokens[i];
         set_inputs_kernel<<<1, 32, 0, s>>>(in, d_mpos, d_mids);
         CK(cudaGetLastError());
+        mtp_body_launch(hidden_dev, rows);
+        CudaEngine::MtpOut o;
+        if (want_top) mtp_head(rows, nullptr, o);
+        o.hidden_pre = mx;
+        o.hidden_post = mxn;
+        return o;
+    }
+    // Device-fed chain step (one row): input id by value (in_host) or from feed slot in_slot; the draft goes to slot out_slot.
+    CudaEngine::MtpOut mtp_fed(const std::uint32_t* in_host, std::uint32_t in_slot, std::uint32_t out_slot, const float* hidden_dev,
+                               std::uint32_t pos, bool want_top) {
+        if (!mtp_ok) throw std::runtime_error("mtp_step_fed: no MTP tensors loaded");
+        if (in_slot >= CudaEngine::kMtpFeedSlots || out_slot >= CudaEngine::kMtpFeedSlots)
+            throw std::runtime_error("mtp_step_fed: feed slot out of range");
+        core::require_capacity(pos, 1, opt.max_positions);
+        if (in_host) {
+            core::validate_token_ids(in_host, 1, c.vocab);
+            InputPack in{};
+            in.pos0 = pos;
+            in.ids[0] = *in_host;
+            set_inputs_kernel<<<1, 32, 0, s>>>(in, d_mpos, d_mids);
+        } else {  // the slot holds an argmax id of an earlier step (< vocab by construction)
+            fed_inputs_kernel<<<1, 32, 0, s>>>(d_feed, in_slot, pos, d_mpos, d_mids);
+        }
+        CK(cudaGetLastError());
+        mtp_body_launch(hidden_dev, 1);
+        CudaEngine::MtpOut o;
+        if (want_top) mtp_head(1, d_feed + out_slot, o);
+        o.hidden_pre = mx;
+        o.hidden_post = mxn;
+        return o;
+    }
+    void mtp_feed_put(std::uint32_t slot, const std::uint32_t* top_dev) {
+        if (!mtp_ok || slot >= CudaEngine::kMtpFeedSlots) throw std::runtime_error("mtp_feed_put: no MTP tensors or bad slot");
+        CK(cudaMemcpyAsync(d_feed + slot, top_dev, 4, cudaMemcpyDeviceToDevice, s));
+    }
+    void mtp_feed_read(std::uint32_t n, std::uint32_t* host) {
+        if (!mtp_ok || n > CudaEngine::kMtpFeedSlots) throw std::runtime_error("mtp_feed_read: no MTP tensors or bad count");
+        CK(cudaMemcpyAsync(host, d_feed, static_cast<std::size_t>(n) * 4, cudaMemcpyDeviceToHost, s));
+        CK(cudaStreamSynchronize(s));
+    }
+    // MTP block body on rows whose ids / positions are in d_mids / d_mpos: mx = block output, mxn = shared-head norm of mx.
+    void mtp_body(const float* hidden_dev, std::uint32_t rows) {
+        const std::uint32_t H = c.hidden;
         const cc::GroupedView src{rows, 1, H, H, H}, dst{rows, 1, H, 2 * H, H};
         CK(cc::embedding_rows(embd, d_mids, mtmp, rows, s));
         CK(cc::rmsnorm(mtmp, src, m_enorm, mcat, dst, c.rms_eps, s));
@@ -1239,16 +1533,67 @@ struct CudaEngine::Impl {
         mlp(M, b, rows);
         // mx holds the block output (pre mtp.norm); the hidden export needs it intact, so normalise into mxn.
         CK(cc::rmsnorm(mx, hv, m_shnorm, mxn, hv, c.rms_eps, s));
-        CudaEngine::MtpOut o;
-        if (want_top) {
+    }
+    // A chain step (rows 1, stable hidden pointer = the chain's carry) replays one captured graph of the body: ids and position
+    // are device-side, as in the verify graph, so the same operands run without ~24 stream-ordered launch gaps. The first call
+    // per pointer runs eagerly (any lazy workspace growth happens outside a capture); flush chunks (rows > 1) stay eager.
+    void mtp_body_launch(const float* hidden_dev, std::uint32_t rows) {
+        if (!graphs_on || rows != 1) {
+            mtp_body(hidden_dev, rows);
+            return;
+        }
+        for (auto& [p, g] : mtp_graphs)
+            if (p == hidden_dev) {
+                CK(cudaGraphLaunch(g.exec.get(), s));
+                return;
+            }
+        if (std::find(mtp_eager.begin(), mtp_eager.end(), hidden_dev) == mtp_eager.end()) {
+            if (mtp_eager.size() >= 8) mtp_eager.erase(mtp_eager.begin());
+            mtp_eager.push_back(hidden_dev);
+            mtp_body(hidden_dev, rows);
+            return;
+        }
+        cc::UniqueHandle<cudaGraph_t, cudaGraphDestroy> g;
+        CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+        try {
+            mtp_body(hidden_dev, rows);
+        } catch (...) {
+            cudaGraph_t dummy = nullptr;
+            cudaStreamEndCapture(s, &dummy);
+            if (dummy) cudaGraphDestroy(dummy);
+            throw;
+        }
+        CK(cudaStreamEndCapture(s, g.put()));
+        Graph gr;
+        CK(cudaGraphInstantiate(gr.exec.put(), g.get(), 0));
+        std::size_t n = 0;
+        CK(cudaGraphGetNodes(g.get(), nullptr, &n));
+        gr.nodes = n;
+        if (mtp_graphs.size() >= 4) mtp_graphs.erase(mtp_graphs.begin());
+        mtp_graphs.emplace_back(hidden_dev, std::move(gr));
+        CK(cudaGraphLaunch(mtp_graphs.back().second.exec.get(), s));
+    }
+    // Draft head on mxn rows -> o.logits / o.top (token ids); feed_out (device-fed chain) also receives the last row's id.
+    void mtp_head(std::uint32_t rows, std::uint32_t* feed_out, CudaEngine::MtpOut& o) {
+        if (drows) {  // draft-only subset head: same tiles, compact out; ids mapped back on the device
+            draft_rows_sync();
+            cc::DenseWeight w = head;
+            w.data = dhead;
+            w.out = drows->rows();
+            CK(cc::dense_rows(w, mxn, mlogits, rows, nullptr, s, opt.dense_arithmetic));
+            CK(cc::argmax_rows(mlogits, w.out, rows, d_mtop, d_argws, s));
+            draft_map_kernel<<<1, 32, 0, s>>>(d_mtop, d_dmap, rows, 16U, feed_out);
+            CK(cudaGetLastError());
+        } else {
             CK(cc::dense_rows(head, mxn, mlogits, rows, nullptr, s, opt.dense_arithmetic));
             CK(cc::argmax_rows(mlogits, c.vocab, rows, d_mtop, d_argws, s));
-            o.logits = mlogits;
-            o.top = d_mtop;
+            if (feed_out) {
+                draft_map_kernel<<<1, 32, 0, s>>>(d_mtop, nullptr, rows, 16U, feed_out);
+                CK(cudaGetLastError());
+            }
         }
-        o.hidden_pre = mx;
-        o.hidden_post = mxn;
-        return o;
+        o.logits = mlogits;
+        o.top = d_mtop;
     }
 };
 
@@ -1456,6 +1801,24 @@ std::unique_ptr<CudaEngine> CudaEngine::synthetic(const Config& cfg, PackFormat 
     return e;
 }
 
+void print_split_policy(const EngineOptions& o, std::FILE* f) {
+    // The device key of the process policy once an engine init() set it, else of the current device (the key init()
+    // records). The effective identity is split_k::identity(option, key) == nvfp4_split_identity() after init(o).
+    split_k::Device d = cc::nvfp4_split_device();
+    const bool set = d.units != 0;
+    const bool known = set || cc::nvfp4_device_key(&d) == cudaSuccess;
+    if (!known) d = {};
+    char key[64] = "";
+    if (known) std::snprintf(key, sizeof key, "%u SMs cc %u.%u", d.units, d.arch / 10, d.arch % 10);
+    std::string line = "  split-k: " + split_k::effective_text(o.nvfp4_split, d, key);
+    if (o.nvfp4_split == split_k::Profile::fast)
+        line += split_k::fast_applies(d) ? "; identity -skf1; --split-k exact = off"
+                                         : "; identity -skf1 names the request: ids and caches must not cross devices";
+    if (set && split_k::identity(o.nvfp4_split, d) != std::string_view(cc::nvfp4_split_identity()))
+        line += std::string("; process policy ") + cc::nvfp4_split_identity() + " (another engine's init(); last init() wins)";
+    std::fprintf(f, "%s\n", line.c_str());
+}
+
 void print_effective_config(const EngineOptions& o, const char* arith, std::FILE* f) {
     static const char* names[] = {"fp32", "mma3", "mma2", "mma1"};
     arith = names[static_cast<unsigned>(o.dense_arithmetic)];
@@ -1466,10 +1829,19 @@ void print_effective_config(const EngineOptions& o, const char* arith, std::FILE
                  o.turbo_bits, o.turbo_weights >= TurboWeights::onfly ? (o.turbo_lm_head ? "nvfp4" : "bf16") : "n/a", o.multi_gemv ? "on" : "off");
     std::fprintf(f, "  prefill-arith: %s\n  prefill-big: %s\n  prefill-chunk: %u\n  prefill-slots: %u\n  prefill-admission: pending model/device; execution reports route/reason\n",
                  prefill_arith_name(o.prefill_arith), o.prefill_big ? "on" : "off", o.prefill_chunk, o.prefill_slots);
+    std::fprintf(f, "  prefill-gdn: %s\n",
+                 o.prefill_arith == PrefillArith::exact ? "serial (exact prefill keeps the decode windows)"
+                 : o.prefill_gdn == PrefillGdn::chunk16 ? "chunk16 (FAST gdn-chunk16-f32-v1, identity -gdnc16)"
+                                                        : "serial (decode recurrence, bitwise)");
+    std::fprintf(f, "  prefill-norm-fold: %s\n",
+                 o.prefill_arith != PrefillArith::fast4 ? "n/a (FAST4 only)"
+                 : o.prefill_norm_fold ? "on (hidden RMSNorm + chunked-GDN gated RMSNorm folded into the FAST4 quantiser, bitwise)"
+                                       : "off (rmsnorm + quantise)");
     std::fprintf(f, "  prefill-inflight: %u%s (bounded submission, scheduling only, bitwise)\n  prefill-ramp: %u%s\n", o.prefill_inflight,
                  o.prefill_inflight ? " chunks" : " = unbounded", o.prefill_ramp, o.prefill_ramp ? " rows first chunk, doubling to prefill-chunk" : " (off)");
     if (o.turbo_weights >= TurboWeights::onfly)
         std::fprintf(f, "  format: NVFP4 e2m1 + e4m3/16 + FP32 global; RTN; GEMV f16 mma, FP32 accumulate, activations RN f16, rows 1..32 bitwise row-invariant\n");
+    if (o.turbo_weights != TurboWeights::off) print_split_policy(o, f);
     std::fprintf(f, "  prefill-flash-tail: %s (scheduling only, bitwise equal; split = partial last wave as fewer-warp jobs)\n",
                  o.flash_tail == cuda_core::FlashTail::split ? "split" : "off");
     if (o.prefill_wave_min_tokens == 0) std::fprintf(f, "  prefill-wave-steps: off (steps of prefill_chunk; --prefill-wave-min N turns it on)\n");
@@ -1479,6 +1851,19 @@ void print_effective_config(const EngineOptions& o, const char* arith, std::FILE
                  o.flash_pipe == cuda_core::FlashPipe::swz3 ? "swz3" : "pad2",
                  o.prefill_arith == PrefillArith::exact ? "n/a (exact prefill keeps attention_decode)"
                  : o.prefill_attn8 ? "on (e4m3 shadow KV + e4m3 flash, bit-changing, identity -a8)" : "off");
+    std::fprintf(f, "  decode-attn8: %s\n",
+                 o.decode_attn8 ? "on (FAST class d8: decode/verify attention on e4m3 tensor cores over the e4m3 shadow, identity -d8; "
+                                  "verify rows == serial rows inside the class; slot batches and the MTP block keep BF16 attention)"
+                                : "off (BF16 attention_decode)");
+    const char* oc = o.prefill_operand_cache == cuda_core::operand_cache::Mode::off ? "per-call weight expansion"
+                     : o.prefill_operand_cache == cuda_core::operand_cache::Mode::on
+                         ? "every expanded class (FAST8 e4m3, exact f16 / q8) resident, expanded once"
+                         : o.prefill_arith == PrefillArith::fast8 ? "FAST8 e4m3 operands resident, expanded once"
+                         : o.prefill_arith == PrefillArith::fast4 ? "FAST4 e2m1 tile operands resident, repacked once (byte permutation)"
+                                                                  : "inactive (auto admits FAST8 e4m3 / FAST4 e2m1 tiles only; exact classes need on)";
+    std::fprintf(f, "  prefill-operand-cache: %s: %s; budget free VRAM - max(4 GiB, 10 %% total)%s; bitwise neutral (same operand bytes, same kernel)\n",
+                 cuda_core::operand_cache::mode_name(o.prefill_operand_cache), oc,
+                 o.prefill_operand_cache_cap_mib ? ", capped by --prefill-operand-cache-cap-mib" : "");
 }
 
 const Config& CudaEngine::config() const { return p_->c; }
@@ -1506,12 +1891,26 @@ void CudaEngine::commit(std::uint32_t k) { p_->commit_rows(k); }
 RowsOut CudaEngine::prefill(const std::uint32_t* tokens, std::uint32_t n, LogitRows want) { return p_->prefill(tokens, n, want); }
 bool CudaEngine::prefill_is_big() const { return p_->big_supported(); }
 const char* prefill_arith_name(PrefillArith a) {
-    static const char* n[] = {"exact", "flash", "fast", "fast2", "fast8"};
+    static const char* n[] = {"exact", "flash", "fast", "fast2", "fast8", "fast4"};
     return n[static_cast<int>(a)];
 }
+void CudaEngine::set_draft_rows(strix::spec::DraftRows* rows) { p_->set_draft_rows(rows); }
+
 CudaEngine::MtpOut CudaEngine::mtp_forward(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows,
                                            std::uint32_t pos0, bool want_top) {
     return p_->mtp(next_tokens, hidden_dev, rows, pos0, want_top);
+}
+CudaEngine::MtpOut CudaEngine::mtp_step_fed(const std::uint32_t* in_host, std::uint32_t in_slot, std::uint32_t out_slot,
+                                            const float* hidden_dev, std::uint32_t pos, bool want_top) {
+    return p_->mtp_fed(in_host, in_slot, out_slot, hidden_dev, pos, want_top);
+}
+void CudaEngine::mtp_feed_put(std::uint32_t slot, const std::uint32_t* top_dev) { p_->mtp_feed_put(slot, top_dev); }
+void CudaEngine::mtp_feed_read(std::uint32_t n, std::uint32_t* host) const { p_->mtp_feed_read(n, host); }
+void CudaEngine::mtp_feed_read_async(std::uint32_t n) { p_->mtp_feed_read_async(n); }
+void CudaEngine::mtp_feed_wait(std::uint32_t n, std::uint32_t* host) { p_->mtp_feed_wait(n, host); }
+RowsOut CudaEngine::forward_rows_fed(const std::uint32_t* host_ids, std::uint32_t nhost, const std::uint32_t* slot,
+                                     const std::uint32_t* host_vals, std::uint32_t k, LogitRows want) {
+    return p_->forward_fed(host_ids, nhost, slot, host_vals, k, want);
 }
 void CudaEngine::read_logits(const RowsOut& o, std::uint32_t row, float* host) const {
     CK(cudaMemcpyAsync(host, o.logits + static_cast<std::size_t>(row) * p_->c.vocab, static_cast<std::size_t>(p_->c.vocab) * 4,

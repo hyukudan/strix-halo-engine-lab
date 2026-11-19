@@ -5,6 +5,8 @@
 #include "strix/hip_moe_a8_down.hpp"
 #include "strix/hip_moe_q4k_a8_known_rows.hpp"
 #include "strix/hip_launch_context.hpp"
+#include "strix/deferred_moe_status.hpp"
+#include "strix/moe_slot_merge.hpp"
 #if defined(__FAST_MATH__) || (defined(__FINITE_MATH_ONLY__) && __FINITE_MATH_ONLY__)
 #error "Q4K A8G32 requires nonfinite checks and strict floating-point semantics"
 #endif
@@ -624,7 +626,7 @@ __device__ unsigned down_q51_word(const unsigned char* block,unsigned first) {
     return result;
 }
 template<bool Q51>
-__global__ void down_rawdots(const unsigned char* weights,const unsigned* routes,
+__device__ __forceinline__ void down_rawdots_rows(const unsigned char* weights,const unsigned* routes,
     const signed char* codes,const float* deltas,const int* sums,float* rawdots,
     unsigned* status,unsigned* aggregate,unsigned hidden,unsigned width,unsigned experts) {
     if(*status!=0) return;
@@ -663,7 +665,7 @@ __global__ void down_rawdots(const unsigned char* weights,const unsigned* routes
 }
 // Q2_0 down (q20_a8_down_numerical_identity): down_rawdots lanes and tree, group g = half g%2 of block
 // g/2; contribution delta * (d * float(I - S)).
-__global__ void down_rawdots_q20(const unsigned char* weights,const unsigned* routes,
+__device__ __forceinline__ void down_rawdots_q20_rows(const unsigned char* weights,const unsigned* routes,
     const signed char* codes,const float* deltas,const int* sums,float* rawdots,
     unsigned* status,unsigned* aggregate,unsigned hidden,unsigned width,unsigned experts) {
     if(*status!=0) return;
@@ -685,7 +687,7 @@ __global__ void down_rawdots_q20(const unsigned char* weights,const unsigned* ro
 }
 // GSQ IQ4_NL down: down_rawdots lanes and tree, contribution delta * (d * float(I)).
 template<std::uint32_t T>
-__global__ void down_rawdots_iq(const unsigned char* weights,const unsigned* routes,
+__device__ __forceinline__ void down_rawdots_iq_rows(const unsigned char* weights,const unsigned* routes,
     const signed char* codes,const float* deltas,float* rawdots,
     unsigned* status,unsigned* aggregate,unsigned hidden,unsigned width,unsigned experts) {
     if(*status!=0) return;
@@ -705,6 +707,105 @@ __global__ void down_rawdots_iq(const unsigned char* weights,const unsigned* rou
     acc=acc+strix::qwen_dpp::xor32(acc, 1);
     acc=acc+strix::qwen_dpp::xor32(acc, 2);
     if(owner==0) rawdots[slot*hidden+row]=acc;
+}
+// Slot-merge epilogue trait of the down launches (strix/moe_slot_merge.hpp): off when tail.tickets is null.
+// Every thread of every block reaches it (the row bodies above have no barrier). Per output the merge is the
+// incumbent q4k_a8_serial_tail_kernel's: +0 seed, slots 0..top_k-1 in index order, v_fmac with the route weight
+// as src0, the same finite threshold, accumulation written only where the incumbent writes it, the commit only
+// from a clean final status, status |= 8 and the first-error record from the final status. The status the tile
+// sees equals the status the incumbent tail read: bits set inside this launch come from invalid routes, which
+// every tile's own block of that slot sets before its ticket.
+__device__ void slot_merge_epilogue(const SlotMergeTail& t,const float* rawdots,const unsigned* routes,
+    unsigned* status,unsigned hidden,unsigned experts) {
+    namespace sm=strix::moe_slot_merge;
+    if(t.tickets==nullptr) return;
+    __shared__ unsigned last,initial,flagged,first_invalid;
+    __shared__ float slot_weight[sm::max_slots];
+    __threadfence(); // every writing lane releases its partials device-wide
+    __syncthreads();
+    if(threadIdx.x==0) {
+        __threadfence(); // and orders them before this block's ticket
+        last=sm::last_arrival(atomicAdd(&t.tickets[blockIdx.x],1U),gridDim.y)?1U:0U;
+        first_invalid=gridDim.y;
+    }
+    __syncthreads();
+    if(last==0U) return;
+    __threadfence(); // acquire: every slot partial of this row tile is visible
+    if(threadIdx.x==0) initial=*static_cast<volatile unsigned*>(status);
+    // One parallel load of the route weights and the first invalid route (the kernel wrote global memory, so these
+    // are vector loads: staged once instead of one dependent round trip per slot).
+    if(threadIdx.x<gridDim.y) {
+        slot_weight[threadIdx.x]=t.route_weights[threadIdx.x];
+        if(routes[threadIdx.x]>=experts) atomicMin(&first_invalid,threadIdx.x);
+    }
+    __syncthreads();
+    if(initial==0U && threadIdx.x<sm::tile_rows) {
+        const unsigned out=blockIdx.x*sm::tile_rows+threadIdx.x;
+        // The incumbent loop stops at the first invalid route and then writes nothing: the same outcome.
+        const bool written=first_invalid==gridDim.y;
+        float current=0.0F;
+        if(written) {
+            float dots[sm::max_slots];
+#pragma unroll
+            for(unsigned slot=0;slot<sm::max_slots;++slot)
+                if(slot<gridDim.y) dots[slot]=rawdots[static_cast<std::uint64_t>(slot)*hidden+out];
+#pragma unroll
+            for(unsigned slot=0;slot<sm::max_slots;++slot)
+                if(slot<gridDim.y) // incumbent roles: weight src0, partial src1, accumulator +0-seeded
+                    asm volatile("v_fmac_f32 %0, %1, %2" : "+v"(current) : "v"(slot_weight[slot]), "v"(dots[slot]));
+        }
+        if(written) t.accumulation[out]=current;
+        const float value=written?current:t.accumulation[out];
+        if(sm::fails_commit(__float_as_uint(value),t.bf16_commit)) atomicOr(&t.tickets[sm::nonfinite_word(hidden)],1U);
+    }
+    __threadfence(); // the merging lanes release the accumulation and the flag
+    __syncthreads();
+    if(threadIdx.x==0) {
+        t.tickets[blockIdx.x]=0U; // every arrival of this tile is in
+        __threadfence(); // release the accumulation and the nonfinite flag
+        last=sm::last_arrival(atomicAdd(&t.tickets[sm::tile_done_word(hidden)],1U),gridDim.x)?1U:0U;
+    }
+    __syncthreads();
+    if(last==0U) return;
+    __threadfence(); // acquire: every tile's accumulation is visible
+    if(threadIdx.x==0) {
+        flagged=*static_cast<volatile unsigned*>(&t.tickets[sm::nonfinite_word(hidden)]);
+        initial=*static_cast<volatile unsigned*>(status)|(flagged!=0U?sm::nonfinite_status:0U);
+    }
+    __syncthreads();
+    if(initial==0U)
+        for(unsigned out=threadIdx.x;out<hidden;out+=blockDim.x) {
+            const float v=t.accumulation[out];
+            if(t.output_bf16) static_cast<std::uint16_t*>(t.output)[out]=sm::bf16_rne(__float_as_uint(v));
+            else static_cast<float*>(t.output)[out]=v;
+        }
+    if(threadIdx.x==0) {
+        if(flagged!=0U) atomicOr(status,sm::nonfinite_status);
+        merge_deferred_moe_first_error(*static_cast<DeferredMoeFirstError*>(t.record),initial,
+            static_cast<DeferredMoeDomain>(t.domain));
+        t.tickets[sm::tile_done_word(hidden)]=0U;
+        t.tickets[sm::nonfinite_word(hidden)]=0U;
+    }
+}
+template<bool Q51>
+__global__ void down_rawdots(const unsigned char* weights,const unsigned* routes,
+    const signed char* codes,const float* deltas,const int* sums,float* rawdots,
+    unsigned* status,unsigned* aggregate,unsigned hidden,unsigned width,unsigned experts,SlotMergeTail tail) {
+    down_rawdots_rows<Q51>(weights,routes,codes,deltas,sums,rawdots,status,aggregate,hidden,width,experts);
+    slot_merge_epilogue(tail,rawdots,routes,status,hidden,experts);
+}
+__global__ void down_rawdots_q20(const unsigned char* weights,const unsigned* routes,
+    const signed char* codes,const float* deltas,const int* sums,float* rawdots,
+    unsigned* status,unsigned* aggregate,unsigned hidden,unsigned width,unsigned experts,SlotMergeTail tail) {
+    down_rawdots_q20_rows(weights,routes,codes,deltas,sums,rawdots,status,aggregate,hidden,width,experts);
+    slot_merge_epilogue(tail,rawdots,routes,status,hidden,experts);
+}
+template<std::uint32_t T>
+__global__ void down_rawdots_iq(const unsigned char* weights,const unsigned* routes,
+    const signed char* codes,const float* deltas,float* rawdots,
+    unsigned* status,unsigned* aggregate,unsigned hidden,unsigned width,unsigned experts,SlotMergeTail tail) {
+    down_rawdots_iq_rows<T>(weights,routes,codes,deltas,rawdots,status,aggregate,hidden,width,experts);
+    slot_merge_epilogue(tail,rawdots,routes,status,hidden,experts);
 }
 void down_admit(const DownRequest& request,const DownBindings& b,hipStream_t stream) {
     validate_down(request,b);
@@ -729,38 +830,44 @@ void enqueue_down_activation_quantize(const DownRequest& r,const DownBindings& b
         reinterpret_cast<unsigned*>(b.aggregate_status.address),r.shape.intermediate,r.shape.experts);
     hip_check(hipGetLastError(),"A8 down activation/quantization enqueue");
 }
-void enqueue_down_rawdots(const DownRequest& r,const DownBindings& b,hipStream_t stream) {
+void enqueue_down_rawdots(const DownRequest& r,const DownBindings& b,const SlotMergeTail& tail,hipStream_t stream) {
     down_admit(r,b,stream);
+    if(tail.tickets && (!tail.route_weights || !tail.accumulation || !tail.output || !tail.record ||
+        r.shape.hidden%strix::moe_slot_merge::tile_rows!=0U || r.shape.top_k>strix::moe_slot_merge::max_slots))
+        throw std::invalid_argument("A8 down slot-merge tail requires weights, accumulation, output, record, H % 64 == 0, K <= 16");
     if(r.weight_type==gsq_a8::type_iq4_nl) {
         down_rawdots_iq<gsq_a8::type_iq4_nl><<<dim3(r.shape.hidden/64U,r.shape.top_k),256,0,stream>>>(
             reinterpret_cast<const unsigned char*>(b.weights.address),reinterpret_cast<const unsigned*>(b.routes.address),
             reinterpret_cast<const signed char*>(b.codes.address),reinterpret_cast<const float*>(b.deltas.address),
             reinterpret_cast<float*>(b.rawdots.address),
             reinterpret_cast<unsigned*>(b.status.address),reinterpret_cast<unsigned*>(b.aggregate_status.address),
-            r.shape.hidden,r.shape.intermediate,r.shape.experts);
+            r.shape.hidden,r.shape.intermediate,r.shape.experts,tail);
     } else if(r.weight_type==42) {
         down_rawdots_q20<<<dim3(r.shape.hidden/64U,r.shape.top_k),256,0,stream>>>(
             reinterpret_cast<const unsigned char*>(b.weights.address),reinterpret_cast<const unsigned*>(b.routes.address),
             reinterpret_cast<const signed char*>(b.codes.address),reinterpret_cast<const float*>(b.deltas.address),
             reinterpret_cast<const int*>(b.sums.address),reinterpret_cast<float*>(b.rawdots.address),
             reinterpret_cast<unsigned*>(b.status.address),reinterpret_cast<unsigned*>(b.aggregate_status.address),
-            r.shape.hidden,r.shape.intermediate,r.shape.experts);
+            r.shape.hidden,r.shape.intermediate,r.shape.experts,tail);
     } else if(r.weight_type==7) {
         down_rawdots<true><<<dim3(r.shape.hidden/64U,r.shape.top_k),256,0,stream>>>(
             reinterpret_cast<const unsigned char*>(b.weights.address),reinterpret_cast<const unsigned*>(b.routes.address),
             reinterpret_cast<const signed char*>(b.codes.address),reinterpret_cast<const float*>(b.deltas.address),
             reinterpret_cast<const int*>(b.sums.address),reinterpret_cast<float*>(b.rawdots.address),
             reinterpret_cast<unsigned*>(b.status.address),reinterpret_cast<unsigned*>(b.aggregate_status.address),
-            r.shape.hidden,r.shape.intermediate,r.shape.experts);
+            r.shape.hidden,r.shape.intermediate,r.shape.experts,tail);
     } else {
         down_rawdots<false><<<dim3(r.shape.hidden/64U,r.shape.top_k),256,0,stream>>>(
             reinterpret_cast<const unsigned char*>(b.weights.address),reinterpret_cast<const unsigned*>(b.routes.address),
             reinterpret_cast<const signed char*>(b.codes.address),reinterpret_cast<const float*>(b.deltas.address),
             reinterpret_cast<const int*>(b.sums.address),reinterpret_cast<float*>(b.rawdots.address),
             reinterpret_cast<unsigned*>(b.status.address),reinterpret_cast<unsigned*>(b.aggregate_status.address),
-            r.shape.hidden,r.shape.intermediate,r.shape.experts);
+            r.shape.hidden,r.shape.intermediate,r.shape.experts,tail);
     }
     hip_check(hipGetLastError(),"A8 down integer rawdot enqueue");
+}
+void enqueue_down_rawdots(const DownRequest& r,const DownBindings& b,hipStream_t stream) {
+    enqueue_down_rawdots(r,b,SlotMergeTail{},stream);
 }
 
 }

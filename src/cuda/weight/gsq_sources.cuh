@@ -2,6 +2,7 @@
 #include "source.cuh"
 #include "strix/cuda/qwen_quant.cuh"
 #include "strix/weight/formats/ggml.hpp"
+#include "gsq_decode.cuh"
 
 namespace strix::cuda::weight {
 
@@ -158,69 +159,7 @@ template<class Arch> struct OperandSource<GgmlTag<13>,SignedA8Tag,Arch,CudaFourC
 template<class Arch> struct OperandSource<GgmlTag<7>,SignedA8Tag,Arch,CudaFourChainImma>:LegacyDownSource<7,Arch> {};
 template<class Arch> struct OperandSource<GgmlTag<8>,SignedA8Tag,Arch,CudaFourChainImma>:LegacyDownSource<8,Arch> {};
 
-// Scalar extraction is shared by the MMA and dp4a operand protocols. Grid
-// placement is supplied by the canonical CUDA decoder, with its original notices.
-template<unsigned T> struct GsqDecode {
-    static_assert(T==18 || T==20 || T==21 || T==22 || T==23 || T==42);
-    static constexpr unsigned be=::strix::weight::formats::gsq_block_elements(T);
-    static constexpr unsigned bb=::strix::weight::formats::gsq_block_bytes(T);
-    static constexpr bool halves=T==22;
-    __host__ __device__ static const std::uint8_t* block(const std::uint8_t* row,unsigned group,unsigned& sub) {
-        sub=group%(be/32); return row+std::uint64_t(group/(be/32))*bb;
-    }
-    __host__ __device__ static void scales(const std::uint8_t* row,unsigned group,float& a,float& b) {
-        unsigned s; const auto* x=block(row,group,s);
-        const float d=quant::detail::fp16(std::uint16_t(x[0])|(std::uint16_t(x[1])<<8));
-        b=0.0F;
-        if constexpr(T==20 || T==42) a=d;
-        if constexpr(T==21) a=d*float(1+2*int((x[::strix::weight::formats::Iq3S::scales+s/2]>>(4*(s%2)))&15));
-        if constexpr(T==18) {
-            const unsigned off=66+4*s;
-            const unsigned aux=unsigned(x[off])|(unsigned(x[off+1])<<8)|(unsigned(x[off+2])<<16)|(unsigned(x[off+3])<<24);
-            a=(d*(0.5F+float(aux>>28)))*0.5F;
-        }
-        if constexpr(T==22) { a=(d*(0.5F+float(x[74+s]&15)))*0.25F; b=(d*(0.5F+float(x[74+s]>>4)))*0.25F; }
-        if constexpr(T==23) {
-            const unsigned high=unsigned(x[2])|(unsigned(x[3])<<8);
-            const unsigned ls=((x[4+s/2]>>(4*(s%2)))&15)|(((high>>(2*s))&3)<<4);
-            a=d*float(int(ls)-32);
-        }
-    }
-    __host__ __device__ static int code(const std::uint8_t* row,unsigned group,unsigned k) {
-        unsigned s; const auto* x=block(row,group,s);
-        if constexpr(T==42) { const unsigned e=32*s+k; return int((x[2+e/4]>>(2*(e%4)))&3)-1; }
-        if constexpr(T==20 || T==23) {
-            const auto* qs=T==20?x+2:x+8+16*s;
-            return int(quant::detail::kvalue((qs[k%16]>>(4*(k/16)))&15));
-        }
-        if constexpr(T==21) {
-            using Iq=::strix::weight::formats::Iq3S;
-            const unsigned l=k/8,j=k%8,qh=x[Iq::qh+s];
-            const unsigned idx=x[Iq::qs+8*s+2*l+j/4]|((qh<<(8-2*l-j/4))&256);
-            const unsigned grid=quant::detail::iq3s_grid(idx);
-            return int((grid>>(8*(j%4)))&255)*((x[Iq::signs+4*s+l]>>j)&1?-1:1);
-        }
-        if constexpr(T==18) {
-            const unsigned off=66+4*s;
-            const unsigned aux=unsigned(x[off])|(unsigned(x[off+1])<<8)|(unsigned(x[off+2])<<16)|(unsigned(x[off+3])<<24);
-            const unsigned l=k/8,j=k%8,sign=quant::detail::ksigns((aux>>(7*l))&127);
-            const unsigned grid=quant::detail::iq3xxs_grid(x[2+8*s+2*l+j/4]);
-            return int((grid>>(8*(j%4)))&255)*((sign>>j)&1?-1:1);
-        }
-        if constexpr(T==22) {
-            const unsigned l=k/8,j=k%8,qh=x[66+s];
-            const auto grid=quant::detail::iq2s_grid(x[2+4*s+l]|((qh<<(8-2*l))&0x300));
-            return int((grid>>(8*j))&255)*((x[34+4*s+l]>>j)&1?-1:1);
-        }
-        return 0;
-    }
-    __host__ __device__ static unsigned word(const std::uint8_t* row,unsigned group,unsigned index) {
-        unsigned r=0;
-        #pragma unroll
-        for(unsigned j=0;j<4;++j) r|=(unsigned(code(row,group,4*index+j))&255)<<(8*j);
-        return r;
-    }
-};
+// GsqDecode<T> (word-level, branch-free decode + the reference code()) lives in gsq_decode.cuh, shared with the host tests.
 
 template<unsigned T,class Arch>
 struct OperandSource<GgmlTag<T>,SignedA8Tag,Arch,GsqIq3SA8Dot4Cuda> {
@@ -352,5 +291,38 @@ struct OperandSource<RuntimeGgmlTag,NativeScalarTag,Arch,CudaNativeFp32> {
         quant::decode_row_group(type,row,group,out);
     }
 };
+
+// The same source with the storage type fixed at compile time. decode_row_group(Type, ...) is one case of the
+// runtime switch above (same expressions, same flags), so the 32 values are bitwise the runtime-type values. The
+// switch, the geometry lookup and the runtime-divisor group split fold away, and the decoded group no longer has to
+// be merged from every case through a stack array (the runtime form keeps it in local memory: STL per case, LDL
+// per use). The runtime `type` argument is kept for interface parity; the dispatcher binds it equal to Type.
+template<std::uint32_t Type> struct TypedGgmlTag {};
+template<std::uint32_t Type,class Arch>
+struct OperandSource<TypedGgmlTag<Type>,NativeScalarTag,Arch,CudaNativeFp32> {
+    static constexpr std::uint32_t storage_type=Type;
+    __host__ __device__ static std::uint64_t row_bytes(unsigned,unsigned width) {
+        const auto geometry=quant::geometry(Type);
+        return std::uint64_t(width)/geometry.block_elements*geometry.block_bytes;
+    }
+    __device__ static void decode(unsigned,const std::uint8_t* row,unsigned group,float* out) {
+        quant::decode_row_group(Type,row,group,out);
+    }
+};
+
+// Calls f.template operator()<Source>() with the typed source for the storage types the native expert route meets
+// in the shipped packs (GSQ-RCO gate/up IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS, down IQ4_NL / Q2_0) and with the
+// runtime-type source for every other decodable type. Values are identical either way; only the decode code differs.
+template<class Arch,class F> void with_native_source(std::uint32_t type,F&& f) {
+    switch(type) {
+    case quant::t_iq3_xxs: f.template operator()<OperandSource<TypedGgmlTag<quant::t_iq3_xxs>,NativeScalarTag,Arch,CudaNativeFp32>>(); return;
+    case quant::t_iq4_nl:  f.template operator()<OperandSource<TypedGgmlTag<quant::t_iq4_nl>,NativeScalarTag,Arch,CudaNativeFp32>>(); return;
+    case quant::t_iq3_s:   f.template operator()<OperandSource<TypedGgmlTag<quant::t_iq3_s>,NativeScalarTag,Arch,CudaNativeFp32>>(); return;
+    case quant::t_iq2_s:   f.template operator()<OperandSource<TypedGgmlTag<quant::t_iq2_s>,NativeScalarTag,Arch,CudaNativeFp32>>(); return;
+    case quant::t_iq4_xs:  f.template operator()<OperandSource<TypedGgmlTag<quant::t_iq4_xs>,NativeScalarTag,Arch,CudaNativeFp32>>(); return;
+    case quant::t_q2_0:    f.template operator()<OperandSource<TypedGgmlTag<quant::t_q2_0>,NativeScalarTag,Arch,CudaNativeFp32>>(); return;
+    default:               f.template operator()<OperandSource<RuntimeGgmlTag,NativeScalarTag,Arch,CudaNativeFp32>>(); return;
+    }
+}
 
 } // namespace strix::cuda::weight

@@ -18,11 +18,13 @@
 #include "strix/cuda/qwen_route_bf16.hpp"
 #include "strix/cuda/qwen_mtp_diagnostic.hpp"
 #include "strix/qwen_weight_packs.hpp"
+#include "strix/lever.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string_view>
 #include <optional>
 #include <string>
 #include <vector>
@@ -47,6 +49,11 @@ struct Config {
     // maximum before the decode buffers and refuse when anything later does not fit (the pre-fit behaviour).
     bool block_fit = false;
     std::uint32_t block_fit_reserve_mib = 512;
+    // Routed-MoE rows of a 9..15-row decode window (lever qwen_cuda_moe_real_rows, resolved by qwen_options): true = route
+    // and run the routed experts on the window's real rows only; false = the padded 16-row block (the old form). Read once
+    // when the engine is built (a change needs a new engine / process). Prefill blocks and tiered engines keep the padded
+    // rows either way (moe_rows_policy below); the engine reports what it applied in moe_rows_receipt_json().
+    bool moe_real_rows = true;
     int device = 0;
     bool ple_host_pinned = true;       // per_layer_token_embd (28.8 GB) in pinned host memory, gathered on the host
     // Release per layer: every block's KV/index rows of layer l, and in the last block each GDN layer's recurrent/conv
@@ -69,6 +76,13 @@ struct Config {
     strix::residency::Options residency;
     // false: run() keeps the state on the device only (no D2H staging, no pieces): a decode session that never hands off.
     bool export_state = true;
+    // prefill_chunk (decode sessions): the MTP predictor rows of the block that completes the prompt are not computed
+    // before the chunk returns but later, as the identical single call on the engine stream (see mtp_deferred()), so
+    // the first verify window does not wait for draft-only work. Same bits in every row; off = computed in the chunk.
+    bool defer_prompt_mtp = false;
+    // Tensor-core GSQ experts (gsq_bf16_mma) in steps of <= 16 rows run the decode tile form (bitwise the tile form);
+    // false = the tile form at every row count (lever row expert_decode_tile).
+    bool expert_decode_tile = true;
     // Explicit unqualified CUDA A8 route-storage candidate. Omitted: environment;
     // false: individual OFF. Baseline/defaults/exact masters always suppress it.
     std::optional<bool> moe_route_bf16;
@@ -89,6 +103,7 @@ struct Config {
         bool mtp_mma = false;  // MTP fused projection on FP16 tensor cores, FP32 accumulation
         bool qsa_mma = false;  // QSA prefill attention (scores and output) on FP16 tensor cores, FP32 accumulation
         bool moe_mma = false;  // routed-MoE prefill project/down: int8 IMMA block dots, ONE FP32 FMA chain per output (not the HIP four)
+        bool ple_a8 = false;   // PLE key/value projections on the shared dense A8 projection (qwen_dense, int8 tensor cores)
     } forms;
     qwen_packs::ExpertArithmetic expert_arithmetic=qwen_packs::ExpertArithmetic::incumbent;
 };
@@ -156,6 +171,34 @@ struct GraphCounters {
     std::size_t cached = 0, cap = 0;
     std::uint64_t captures = 0, replays = 0, evictions = 0, eager_windows = 0;
 };
+
+// Routed-MoE rows of a 9..15-row decode window (moe_rows_policy below). ON: the window routes and runs the routed experts on
+// its real rows instead of the padded 16-row block, so the padding rows (token 0 over stale core rows, never read back) no
+// longer stream their experts' bytes nor raise the window-wide CSR failure word. Organizational: real-row bits unchanged
+// (native window gate T=2..16 + partial-accept rollback, bit-identical), so no new numerical identity. Every entry
+// (CLI = serve); only decode windows change; prefill blocks and tiered engines keep the padded rows. ON by default; STRIX_QRTX_MOE_REAL_ROWS=0 restores the padded form.
+// Read once when the engine is built: an A/B needs two processes.
+inline constexpr ::strix::lever::Decl moe_real_rows_lever{
+    .name = "qwen_cuda_moe_real_rows", .env = "STRIX_QRTX_MOE_REAL_ROWS", .exactness = ::strix::lever::Exactness::bitwise,
+    .default_on = true, .source = "native window/rollback and poisoned-padding gates; paired T9/T12 window timing with T8/T16 controls"};
+
+// Routed-MoE rows of a decode window: requested (Config::moe_real_rows) -> effective for this engine, with the reason.
+// One rule for the engine and the host tests. Organizational only: each row's routed chain does not depend on the other
+// rows, so real-row bits and the numerical identity are unchanged; only the expert bytes streamed for padding rows change.
+struct MoeRowsPolicy {
+    bool requested = false;
+    bool effective = false;
+    const char* reason = "";
+};
+[[nodiscard]] inline MoeRowsPolicy moe_rows_policy(bool requested, bool tiered) {
+    if (!requested) return {false, false, "padded: 9..15-row windows route all 16 block rows (explicit off)"};
+    if (tiered) return {true, false, "padded: tiered expert residency keeps the 16-row block (slot publish/gather unchanged)"};
+    return {true, true, "real rows: 9..15-row windows route their real rows; prefill blocks stay padded"};
+}
+// Rows that reach route_logits/route_select, the routed experts and the sticky status scan of one run_block.
+[[nodiscard]] inline std::uint32_t moe_block_rows(const MoeRowsPolicy& p, bool window, std::uint32_t rows, std::uint32_t pad) {
+    return window && p.effective ? rows : pad;
+}
 
 // Multi-session decode. A session is the per-request state: QSA KV / raw index / pooled keys per layer, the GDN recurrent
 // double buffer and conv histories, PLE conv + n-gram word, the MTP predictor cache and held row, the length and the
@@ -298,6 +341,13 @@ public:
     // draft attention (each session's MTP KV/index/pooled cache and position), routed Q8 experts and the selection run per
     // session. Every chain equals draft(session, ...) bit for bit (tokens and probabilities). Results in request order.
     std::vector<Draft> draft_cohort(const std::vector<DraftRequest>& requests);
+    // Config::defer_prompt_mtp: true while the session's prompt MTP rows are still to be computed. They only feed draft
+    // chains, so a caller may verify the pending token alone (no draft) first. Every reader of those rows (draft,
+    // draft_cohort, row export, snapshots) and every prefill that reuses the block buffers computes them first;
+    // a fresh prefill, an import, a resize or a destroy of the session discards them.
+    bool mtp_deferred(SessionId session) const;
+    // Enqueues the session's deferred MTP rows on the engine stream (no host wait); no-op when none are deferred.
+    void mtp_settle(SessionId session);
     // CUDA graphs of the verify windows (default: on unless STRIX_QRTX_GRAPHS=0). Graphs are keyed by the cohort layout
     // (session, rows, GDN buffer parity per entry), one eager warm-up per key first, LRU-capped (STRIX_QRTX_GRAPH_CACHE).
     void set_graphs(bool on);
@@ -320,6 +370,14 @@ public:
     [[nodiscard]] bool tiered() const;
     [[nodiscard]] std::string residency_json() const;
     [[nodiscard]] std::string residency_receipt_json() const;
+    // Routed-MoE window rows: {"requested","effective","reason","real_row_windows","padding_rows_skipped",
+    // "padded_windows"} - windows counted at verify_cohort (eager and graph replays alike), 9..15-row windows only.
+    [[nodiscard]] std::string moe_rows_receipt_json() const;
+    // What the cohort's window cost model keys on (qwen_cohort_plan.hpp WideProfile): the routed-MoE window rows applied,
+    // the declared weight pack id and whether some layer's routed experts run the native MoE path.
+    [[nodiscard]] MoeRowsPolicy moe_rows() const;
+    [[nodiscard]] std::string_view weight_pack_id() const;
+    [[nodiscard]] bool native_experts() const;
     // Resolved card budget (tiered or an explicit cap, including full mode; 0 = full mode without an explicit cap) and the
     // device bytes it holds once loaded (measured): a server admits sessions against budget - engine bytes.
     [[nodiscard]] std::uint64_t card_budget_bytes() const;

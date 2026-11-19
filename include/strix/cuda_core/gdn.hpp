@@ -81,5 +81,28 @@ cudaError_t gdn_commit_slots(const GdnDims& d, const GdnCommitLayer* layers, std
 cudaError_t gdn_prefill_layer(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
                               float* out, std::uint32_t rows, float eps, const std::uint32_t* parity_dev, cudaStream_t stream);
 cudaError_t gdn_prefill_flip(std::uint32_t* parity_dev, cudaStream_t stream);
+// FAST chunked delta rule for the PREFILL chunk (gdn_chunk.hpp, identity gdn-chunk16-f32-v1): same conv, conv-state and shadow-side
+// contract as gdn_prefill_layer, delta rule evaluated per 16-row chunk (parallel chunk precompute + 192-block chunk scan + gated
+// norm). Outputs and the new state differ from the serial recurrence in the last bits (reassociation, triangular solve): callers
+// carry the identity suffix. ws = device workspace of >= gdn_chunk_workspace_floats(d, rows) floats; ws == nullptr = serial kernel.
+// defer_norm (chunked path only): the gated RMSNorm (third kernel) is NOT applied; `out` keeps the raw delta-rule output and the caller
+// owns the norm: gdn_chunk_norm, or a consumer that folds the same arithmetic (FAST4 gated_norm_quantize_enqueue, bitwise equal).
+struct GdnChunkWork {
+    float* ws = nullptr;
+    std::size_t floats = 0;
+    bool defer_norm = false;
+};
+[[nodiscard]] std::size_t gdn_chunk_workspace_floats(const GdnDims& d, std::uint32_t rows);
+cudaError_t gdn_prefill_layer(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
+                              float* out, std::uint32_t rows, float eps, const std::uint32_t* parity_dev, const GdnChunkWork& chunk,
+                              cudaStream_t stream);
+// The gated RMSNorm of the chunked path, in place on out (rows x v_width): y = out * inv_head * norm_gain[pos] * silu(z) per value head
+// (arithmetic: src/cuda_core/gdn/gated_norm.cuh). What gdn_chunk_delta runs last unless defer_norm.
+cudaError_t gdn_chunk_norm(const GdnDims& d, const float* norm_gain, const float* z, float* out, std::uint32_t rows, float eps,
+                           cudaStream_t stream);
+// Delta part only (win.qkv_c already holds the conv output); used by gdn_prefill_layer and the device fixture.
+cudaError_t gdn_chunk_delta(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
+                            float* out, std::uint32_t rows, float eps, const std::uint32_t* parity_dev, const GdnChunkWork& w,
+                            cudaStream_t stream);
 
 }  // namespace strix::cuda_core

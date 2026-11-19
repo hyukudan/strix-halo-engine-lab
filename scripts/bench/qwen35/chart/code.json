@@ -1,0 +1,10 @@
+{
+ "class": "code",
+ "thinking": false,
+ "messages": [
+  {
+   "role": "user",
+   "content": "Write a complete Python module that implements a thread-safe LRU cache with per-entry time-to-live expiry, a decorator for caching function results, hit/miss statistics, and a full unittest test suite. Use type hints and docstrings."
+  }
+ ]
+}

@@ -5,6 +5,8 @@
 #include "strix/hip_gdn_decode_fuse.hpp"
 #include "strix/hip_gdn_dims.hpp"
 #include "strix/gdn_recurrent_layout_diagnostic.hpp"
+#include "strix/gdn_recurrent_lds_index.hpp"
+#include "strix/gdn_recurrence_rows.hpp"
 #include "strix/hip_ggml_weight_formats.hpp"
 #ifdef STRIX_BUILD_GDN_LM_WAVE8_DIAGNOSTIC
 #include "strix/hip_gdn_lm_wave8_diagnostic.hpp"
@@ -1693,9 +1695,14 @@ void recurrent_step_kernel(
 // reads and writes it through memory every row). Row r runs exactly the operations of recurrent_step_kernel on the
 // qkv / beta / gate / core of row r (strides below), in the same order, so the bits equal `rows` separate launches;
 // the stored state of row r is the retained value the next row loads (a float round trip is exact).
+// `state` is loaded once before any store and the final tile goes to `state_out` (== state for in place): out of place
+// leaves `state` untouched with bitwise the same stored result (verify windows keep it as the checkpoint).
+// The reduction buffer's physical index is the form F (gdn_recurrent_lds_index.hpp): column_major (default) is
+// conflict-free; lane_major is the original placement (STRIX_GDN_ROWS_LDS_LANE_MAJOR=1). Same elements, pairs, order.
+template <gdn_recurrent_lds::Form F>
 __global__ __launch_bounds__(kRecurrentThreads)
 void recurrent_rows_kernel(
-    const float* qkv, const float* beta, const float* gate, float* state, float* core,
+    const float* qkv, const float* beta, const float* gate, const float* state, float* state_out, float* core,
     std::uint32_t key_heads, std::uint32_t value_heads, std::uint32_t head_dim, std::uint32_t rows,
     std::uint64_t qkv_stride, std::uint64_t core_stride) {
     const auto tile_count = head_dim / kValueTile;
@@ -1708,7 +1715,7 @@ void recurrent_rows_kernel(
     const auto q_base = static_cast<std::uint64_t>(key_head) * head_dim;
     const auto k_base = static_cast<std::uint64_t>(key_heads) * head_dim + q_base;
     const auto v_base = static_cast<std::uint64_t>(key_heads) * head_dim * 2ULL + static_cast<std::uint64_t>(value_head) * head_dim;
-    __shared__ float reduction[kRecurrentThreads * kValueTile];
+    __shared__ float reduction[gdn_recurrent_lds::extent(F)];
     __shared__ float deltas[kValueTile];
     float retained[kValueTile];
 #pragma unroll
@@ -1723,49 +1730,49 @@ void recurrent_rows_kernel(
 #pragma unroll
         for (std::uint32_t column = 0; column < kValueTile; ++column) {
             retained[column] = retained[column] * decay;
-            reduction[static_cast<std::size_t>(lane) * kValueTile + column] = retained[column] * q[k_base + lane];
+            reduction[gdn_recurrent_lds::index(F, lane, column)] = retained[column] * q[k_base + lane];
         }
         __syncthreads();
         for (std::uint32_t stride = kRecurrentThreads / 2U; stride > 0; stride >>= 1U) {
             if (lane < stride) {
 #pragma unroll
                 for (std::uint32_t column = 0; column < kValueTile; ++column)
-                    reduction[static_cast<std::size_t>(lane) * kValueTile + column] +=
-                        reduction[static_cast<std::size_t>(lane + stride) * kValueTile + column];
+                    reduction[gdn_recurrent_lds::index(F, lane, column)] +=
+                        reduction[gdn_recurrent_lds::index(F, lane + stride, column)];
             }
             __syncthreads();
         }
         if (lane == 0) {
 #pragma unroll
             for (std::uint32_t column = 0; column < kValueTile; ++column)
-                deltas[column] = (q[v_base + value_base + column] - reduction[column]) * b[value_head];
+                deltas[column] = (q[v_base + value_base + column] - reduction[gdn_recurrent_lds::index(F, 0U, column)]) * b[value_head];
         }
         __syncthreads();
 #pragma unroll
         for (std::uint32_t column = 0; column < kValueTile; ++column) {
             retained[column] += q[k_base + lane] * deltas[column];
-            reduction[static_cast<std::size_t>(lane) * kValueTile + column] = retained[column] * q[q_base + lane];
+            reduction[gdn_recurrent_lds::index(F, lane, column)] = retained[column] * q[q_base + lane];
         }
         __syncthreads();
         for (std::uint32_t stride = kRecurrentThreads / 2U; stride > 0; stride >>= 1U) {
             if (lane < stride) {
 #pragma unroll
                 for (std::uint32_t column = 0; column < kValueTile; ++column)
-                    reduction[static_cast<std::size_t>(lane) * kValueTile + column] +=
-                        reduction[static_cast<std::size_t>(lane + stride) * kValueTile + column];
+                    reduction[gdn_recurrent_lds::index(F, lane, column)] +=
+                        reduction[gdn_recurrent_lds::index(F, lane + stride, column)];
             }
             __syncthreads();
         }
         if (lane == 0) {
 #pragma unroll
             for (std::uint32_t column = 0; column < kValueTile; ++column)
-                out[static_cast<std::uint64_t>(value_head) * head_dim + value_base + column] = reduction[column];
+                out[static_cast<std::uint64_t>(value_head) * head_dim + value_base + column] = reduction[gdn_recurrent_lds::index(F, 0U, column)];
         }
         __syncthreads();  // the next row rewrites reduction[] and deltas[]
     }
 #pragma unroll
     for (std::uint32_t column = 0; column < kValueTile; ++column)
-        state[(static_cast<std::uint64_t>(value_head) * head_dim + lane) * head_dim + value_base + column] = retained[column];
+        state_out[(static_cast<std::uint64_t>(value_head) * head_dim + lane) * head_dim + value_base + column] = retained[column];
 }
 #ifdef STRIX_BUILD_KNOWN_WINDOW_DIAGNOSTIC
 template <unsigned Rows> struct GdnRecurrentWindowPointers {
@@ -1859,14 +1866,14 @@ void recurrent_retained_window_kernel(GdnRecurrentWindowPointers<Rows> rows, flo
 // Only physical LDS addresses differ from the incumbent recurrence. Logical
 // columns, arithmetic expressions, barriers and separate delta lifetime remain.
 // These same instantiations serve explicit eager choices and diagnostic probes.
-template <gdn_recurrent_layout_diagnostic::Layout Layout>
+template <gdn_recurrent_layout_diagnostic::Layout L>
 __device__ __forceinline__ constexpr std::size_t recurrent_layout_index(
     std::uint32_t lane, std::uint32_t column) {
-    if constexpr (Layout == gdn_recurrent_layout_diagnostic::Layout::transposed)
-        return static_cast<std::size_t>(column) * kRecurrentThreads + lane;
-    else
-        return static_cast<std::size_t>(lane) *
-            (Layout == gdn_recurrent_layout_diagnostic::Layout::stride33 ? 33U : kValueTile) + column;
+    using gdn_recurrent_layout_diagnostic::Layout;
+    return gdn_recurrent_lds::index(L == Layout::transposed ? gdn_recurrent_lds::Form::column_major
+                                        : L == Layout::stride33 ? gdn_recurrent_lds::Form::lane_major_pad
+                                                                : gdn_recurrent_lds::Form::lane_major,
+        lane, column);
 }
 
 template <gdn_recurrent_layout_diagnostic::Layout Layout>
@@ -5883,12 +5890,15 @@ void enqueue_gdn_prefill_core_rows(const std::vector<std::array<GdnKnownWindowRo
     }
     // qpf2k recurrence: QColsG lanes per column group, QColsC columns per group, QColsW waves per block (4 lanes x 32
     // keys, 2 columns per lane, 4 waves = 64 columns per block, 96 blocks; SGPR decay/beta).
-    constexpr unsigned QColsG = 4U, QColsC = 2U, QColsW = 4U, QColsChunk = 8U, QColsOpt = 2U;
+    using QColsDefault = qpf2k_gdn::ColsDefault;
+    constexpr unsigned QColsG = QColsDefault::G, QColsC = QColsDefault::C, QColsW = QColsDefault::W, QColsChunk = QColsDefault::Chunk,
+                       QColsOpt = QColsDefault::Opt;
     using QCols = qpf2k_gdn::ColsShape<QColsG, QColsC, QColsW>;
     if ((qpf2k & 1U) && count % QColsChunk == 0U) {
         const auto cols = [&]<GdnRecurrentStorage S>() {
             hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_qpf2k_cols_kernel<S, QColsG, QColsC, QColsW, QColsChunk, QColsOpt>),
-                dim3(first.value_heads * (128U / QCols::columns)), dim3(QColsW * 32U), 0, stream, strided, count, matrix, first.key_heads,
+                dim3(first.value_heads * (128U / QCols::columns)), dim3(QColsW * 32U), 0, stream,
+                gdn_recurrence::uniform(strided.qkv, strided.beta, strided.gate, strided.core, strided.stride), count, matrix, first.key_heads,
                 static_cast<const unsigned*>(nullptr));   // Nan 3 (pinned): the flag is not read
         };
         if (config.recurrent_storage == GdnRecurrentStorage::value_key) cols.template operator()<GdnRecurrentStorage::value_key>();
@@ -8134,6 +8144,44 @@ __global__ void conv_update_rows_kernel(float* qkv, std::uint16_t* conv_state, c
     for (std::uint32_t r = 0; r < rows; ++r)
         conv_update_body(qkv + static_cast<std::uint64_t>(r) * channels, conv_state, conv_weights, kind, kernel_size, channel);
 }
+// Register-ring form of conv_update_rows_kernel (Taps = the conv kernel size): row r runs conv_update_body's operations
+// on the same values in the same order (shift the history, BF16 of the new input, sum over taps 0..Taps-1 from +0, SiLU,
+// BF16 rounding); the history and the taps live in registers instead of the per-row global store / load round trip of
+// conv_state, and the inputs of Ahead rows are loaded together. The history is written back after the last row. Same bits.
+template <unsigned Taps, unsigned Ahead = 8U>
+__global__ void conv_update_rows_ring_kernel(float* qkv, std::uint16_t* conv_state, const void* conv_weights, SmallWeightKind kind,
+                                             std::uint32_t channels, std::uint32_t rows) {
+    const auto channel = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (channel >= channels) return;
+    std::uint16_t* state = conv_state + static_cast<std::uint64_t>(channel) * Taps;
+    std::uint16_t ring[Taps];
+    float weight[Taps];
+#pragma unroll
+    for (unsigned i = 0; i < Taps; ++i) {
+        ring[i] = state[i];
+        weight[i] = load_small(conv_weights, kind, static_cast<std::uint64_t>(channel) * Taps + i);
+    }
+    for (std::uint32_t r0 = 0; r0 < rows; r0 += Ahead) {
+        float in[Ahead];
+#pragma unroll
+        for (unsigned j = 0; j < Ahead; ++j)
+            if (r0 + j < rows) in[j] = qkv[static_cast<std::uint64_t>(r0 + j) * channels + channel];
+#pragma unroll
+        for (unsigned j = 0; j < Ahead; ++j) {
+            if (r0 + j >= rows) break;
+#pragma unroll
+            for (unsigned i = 0; i + 1U < Taps; ++i) ring[i] = ring[i + 1U];
+            ring[Taps - 1U] = float_to_bf16(in[j]);
+            float sum = 0.0F;
+#pragma unroll
+            for (unsigned i = 0; i < Taps; ++i) sum += bf16_to_float(ring[i]) * weight[i];
+            const float silu = sum / (1.0F + expf(-sum));
+            qkv[static_cast<std::uint64_t>(r0 + j) * channels + channel] = round_bf16(silu);
+        }
+    }
+#pragma unroll
+    for (unsigned i = 0; i < Taps; ++i) state[i] = ring[i];
+}
 __global__ void transform_beta_gate_rows_kernel(float* beta, float* gate, const void* dt, SmallWeightKind dt_kind, const void* a,
                                                 SmallWeightKind a_kind, std::uint32_t heads) {
     const auto head = static_cast<std::uint32_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -8146,6 +8194,21 @@ __global__ void normalize_qk_rows_kernel(float* qkv, std::uint32_t key_heads, st
     __shared__ float scratch[kRecurrentThreads];
     normalize_qk_body(qkv + static_cast<std::uint64_t>(blockIdx.y) * channels, key_heads, head_dim, epsilon,
                       static_cast<std::uint32_t*>(nullptr), blockIdx.x, scratch);
+}
+// Off switch of the conflict-free recurrence LDS form (bits are the same either way; for A/B timing and rollback).
+static bool gdn_rows_lds_lane_major() {
+    static const bool on = strix::envcfg::flag("STRIX_GDN_ROWS_LDS_LANE_MAJOR", false);
+    return on;
+}
+// Off switch of the shared chunked recurrence core in the window path (bits are the same either way: A/B timing, rollback).
+// Off switch of the register-ring window conv (bits are the same either way: A/B timing, rollback).
+static bool gdn_dims_conv_ring() {
+    static const bool on = strix::envcfg::flag("STRIX_GDN_DIMS_CONV_RING", true);
+    return on;
+}
+static bool gdn_dims_cols() {
+    static const bool on = strix::envcfg::flag("STRIX_GDN_DIMS_COLS", true);
+    return on;
 }
 static bool gdn_dims_row_launch() {
     static const bool on = strix::envcfg::flag("STRIX_GDN_DIMS_ROW_LAUNCH", false);
@@ -8162,9 +8225,13 @@ void hip_gdn_decode_step_dims(const HipGdnDimsStep& v, void* stream_ptr) {
     // Rows run one after the other (R1 per row): row r is bit-identical alone or in any window. The conv / transform / norm
     // steps are per row (the conv history is sequential); the recurrence of all rows is ONE launch (state in registers).
     const bool window = v.rows > 1U && !gdn_dims_row_launch();
-    if (window) {
+    if (window && v.kernel == kGdnWindowKernel && gdn_dims_conv_ring())
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(conv_update_rows_ring_kernel<kGdnWindowKernel>), dim3((channels + kProjectionThreads - 1U) / kProjectionThreads),
+            dim3(kProjectionThreads), 0, stream, v.qkv, v.conv_state, v.conv, kind, channels, v.rows);
+    else if (window)
         hipLaunchKernelGGL(conv_update_rows_kernel, dim3((channels + kProjectionThreads - 1U) / kProjectionThreads),
             dim3(kProjectionThreads), 0, stream, v.qkv, v.conv_state, v.conv, kind, channels, v.kernel, v.rows);
+    if (window) {
         hipLaunchKernelGGL(transform_beta_gate_rows_kernel, dim3((v.value_heads + kProjectionThreads - 1U) / kProjectionThreads, v.rows),
             dim3(kProjectionThreads), 0, stream, v.beta, v.gate, v.dt, kind, v.a, kind, v.value_heads);
         hipLaunchKernelGGL(normalize_qk_rows_kernel, dim3(v.key_heads * 2U, v.rows), dim3(d), 0, stream,
@@ -8182,9 +8249,28 @@ void hip_gdn_decode_step_dims(const HipGdnDimsStep& v, void* stream_ptr) {
         hipLaunchKernelGGL(normalize_qk_kernel, dim3(v.key_heads * 2U), dim3(d), 0, stream,
             qkv, v.key_heads, d, v.qk_epsilon, static_cast<std::uint32_t*>(nullptr));
     }
-    hipLaunchKernelGGL(recurrent_rows_kernel, dim3(v.value_heads * (d / kValueTile)), dim3(d), 0, stream,
-        v.qkv, v.beta, v.gate, v.matrix, v.core, v.key_heads, v.value_heads, d, v.rows,
-        static_cast<std::uint64_t>(channels), static_cast<std::uint64_t>(v.value_heads) * d);
+    const auto rows_kernel = gdn_rows_lds_lane_major() ? recurrent_rows_kernel<gdn_recurrent_lds::Form::lane_major>
+                                                       : recurrent_rows_kernel<gdn_recurrent_lds::Form::column_major>;
+    // The shared chunked core (qpf2k_gdn::gdn_qpf2k_cols_kernel: no barrier inside a row, in-lane + DPP tree; 0.79 us per
+    // row-layer on the 48 x 128 x 128 shape vs ~8.7 us for rows_kernel) runs the first multiple of its chunk; rows_kernel
+    // continues from the state it stored. Same operations, operand pairs and order as rows_kernel: the same bits
+    // (include/strix/gdn_recurrence_rows.hpp). STRIX_GDN_DIMS_COLS=0: rows_kernel for every row.
+    // A deferred verify window writes its state to v.matrix_out and keeps v.matrix as the checkpoint; the chunked core
+    // updates its state in place, so such a window runs rows_kernel for every row (in -> out, the measured decode form).
+    using QCols = qpf2k_gdn::ColsDefault;
+    const bool in_place = v.matrix_out == nullptr || v.matrix_out == v.matrix;
+    const auto part = gdn_recurrence::split(window && in_place && gdn_dims_cols() ? v.rows : 0U, QCols::Chunk);
+    const gdn_recurrence::Rows all{v.qkv, v.beta, v.gate, v.core, channels, v.value_heads, static_cast<std::uint64_t>(v.value_heads) * d};
+    if (part.bulk)
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(qpf2k_gdn::gdn_qpf2k_cols_kernel<GdnRecurrentStorage::key_value, QCols::G, QCols::C, QCols::W,
+                               QCols::Chunk, QCols::Opt>),
+            dim3(v.value_heads * (d / qpf2k_gdn::ColsShape<QCols::G, QCols::C, QCols::W>::columns)), dim3(QCols::W * 32U), 0, stream,
+            all, part.bulk, v.matrix, v.key_heads, static_cast<const unsigned*>(nullptr));   // Nan 3 (pinned): the flag is not read
+    if (const auto tail = gdn_recurrence::advance(all, part.bulk); part.bulk < v.rows)
+        hipLaunchKernelGGL(rows_kernel, dim3(v.value_heads * (d / kValueTile)), dim3(d), 0, stream,
+            tail.qkv, tail.beta, tail.gate, v.matrix, v.matrix_out ? v.matrix_out : v.matrix, tail.core,
+            v.key_heads, v.value_heads, d, v.rows - part.bulk,
+            static_cast<std::uint64_t>(channels), static_cast<std::uint64_t>(v.value_heads) * d);
     if (window && v.norm_kind == HipGdnGatedNorm::swish)
         hipLaunchKernelGGL(gated_rms_norm_swish_kernel, dim3(v.value_heads, v.rows), dim3(d), 0, stream,
             v.core, v.z, v.norm, kind, v.value_heads, d, v.rms_epsilon);

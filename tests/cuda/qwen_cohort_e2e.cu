@@ -116,6 +116,7 @@ int main(int argc, char** argv) {
     }
     const std::string mode = argc > 7 ? argv[7] : "gate";
     qp::Config c;
+    c.moe_real_rows = strix::lever::select(qp::moe_real_rows_lever, {}).on;  // STRIX_QRTX_MOE_REAL_ROWS (process arms)
     c.model_gguf = std::getenv("STRIX_QWEN_GGUF") ? std::getenv("STRIX_QWEN_GGUF") : "Qwen3.8-Flash-Next-UD-Q4_K_XL-merged.gguf";
     if (const char* s = std::getenv("STRIX_QWEN_MTP")) c.mtp_sidecar_gguf = s;
     if (const char* v = std::getenv("STRIX_QWEN_DRAFT_VOCAB")) c.draft_vocab = v;
@@ -255,6 +256,7 @@ int main(int argc, char** argv) {
             }
         }
         std::printf("graph %s\n", p.graph_stats().c_str());
+    std::printf("moe_rows %s\n", p.moe_rows_receipt_json().c_str());
         return 0;
     }
 
@@ -805,6 +807,7 @@ int main(int argc, char** argv) {
     };
     if (max_sessions >= 8) admit_mtp("admit-overlap mtp(chunk 48)", {{sid[0], 0, 0}, {sid[2], 2, 0}}, Member{sid[3], 3, 48}, sid[7]);
     std::printf("graph %s\n", p.graph_stats().c_str());
+    std::printf("moe_rows %s\n", p.moe_rows_receipt_json().c_str());
     std::printf("%s\n", bad == 0 ? "COHORT GATE PASS" : "COHORT GATE FAIL");
     return bad == 0 ? 0 : 3;
 }

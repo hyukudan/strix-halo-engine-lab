@@ -20,14 +20,76 @@ __device__ __forceinline__ float block_sum128(float v, float* smem) {
     return s;
 }
 
+// Rows [r, r + n) of channel c, n <= B (block-uniform; red holds >= B rows), shared by the decode window and prefill kernels.
+// Per row the operations and their order are the serial loop's: tap order oldest first ((0 + w0 s0) + w1 s1) + w2 s2) + w3 x,
+// silu, and for q/k heads block_sum128's tree (butterfly, then warps 0..3 in order) of y*y, inv, (y * inv) * scale. Only the
+// issue order changes: every row's raw value is loaded before the first use (one round trip instead of n dependent ones) and
+// the n head sums share one barrier pair (instead of n). s0..s2 carry the taps to the next batch.
+constexpr int kConvBatch = 16;  // decode window rows per batch (prefill blocks use 8: no spill at its address terms)
+template <int B>
+__device__ __forceinline__ void conv_rows(float w0, float w1, float w2, float w3, float& s0, float& s1, float& s2,
+                                          const float* __restrict__ raw, float* qc, std::uint32_t channels, std::uint32_t c,
+                                          std::uint32_t r, std::uint32_t n, bool qk, float scale, float (*red)[4]) {
+    float xv[B], yv[B];
+#pragma unroll
+    for (int i = 0; i < B; ++i)
+        xv[i] = static_cast<std::uint32_t>(i) < n ? raw[static_cast<std::size_t>(r + static_cast<std::uint32_t>(i)) * channels + c] : 0.0f;
+    // Rows go in groups of G with no branch inside a group, so the independent per-row chains (silu, the 5-step butterfly,
+    // sqrt/div) interleave; rows i >= n of the last group compute on xv = 0, never shift the taps and are never stored.
+    constexpr int G = 4;
+    static_assert(B % G == 0, "row batch is whole groups");
+#pragma unroll
+    for (int g0 = 0; g0 < B; g0 += G) {
+        if (static_cast<std::uint32_t>(g0) >= n) break;
+#pragma unroll
+        for (int i = g0; i < g0 + G; ++i) {
+            float sum = __fmul_rn(w0, s0);
+            sum = __fadd_rn(sum, __fmul_rn(w1, s1));
+            sum = __fadd_rn(sum, __fmul_rn(w2, s2));
+            sum = __fadd_rn(sum, __fmul_rn(w3, xv[i]));
+            yv[i] = cc_silu(sum);
+            const bool on = static_cast<std::uint32_t>(i) < n;
+            s0 = on ? s1 : s0;
+            s1 = on ? s2 : s1;
+            s2 = on ? xv[i] : s2;
+        }
+    }
+    if (qk) {  // block-uniform: every thread reaches both barriers
+        const int w = static_cast<int>(threadIdx.x >> 5);
+#pragma unroll
+        for (int g0 = 0; g0 < B; g0 += G) {
+            if (static_cast<std::uint32_t>(g0) >= n) break;
+#pragma unroll
+            for (int i = g0; i < g0 + G; ++i) {
+                const float v = warp_sum_xor(__fmul_rn(yv[i], yv[i]));  // p = 0 + y*y is exact
+                if ((threadIdx.x & 31) == 0) red[i][w] = v;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int g0 = 0; g0 < B; g0 += G) {
+            if (static_cast<std::uint32_t>(g0) >= n) break;
+#pragma unroll
+            for (int i = g0; i < g0 + G; ++i) {
+                const float ss = __fadd_rn(__fadd_rn(__fadd_rn(red[i][0], red[i][1]), red[i][2]), red[i][3]);
+                const float inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(ss, 1e-6f)));
+                yv[i] = __fmul_rn(__fmul_rn(yv[i], inv), scale);
+            }
+        }
+        __syncthreads();  // red is reused by the next batch
+    }
+#pragma unroll
+    for (int i = 0; i < B; ++i)
+        if (static_cast<std::uint32_t>(i) < n) qc[static_cast<std::size_t>(r + static_cast<std::uint32_t>(i)) * channels + c] = yv[i];
+}
+
 // Block = 128 channels. Blocks [0, qk_blocks) are q/k heads (conv + silu + l2norm); the rest are v channels (conv + silu).
 // tap order oldest first: ((0 + w0 s0) + w1 s1) + w2 s2) + w3 x. The conv state is read-only here.
 __global__ void __launch_bounds__(128) conv_pre_kernel(const float* __restrict__ w, const float* __restrict__ conv_state,
                                                        const float* __restrict__ raw, float* qc, std::uint32_t channels,
                                                        std::uint32_t rows, std::uint32_t q_blocks, std::uint32_t qk_blocks,
                                                        float qscale, GdnSlotTable st) {
-    __shared__ float red[4];
-    pdl_trigger();
+    __shared__ float red[kConvBatch][4];
     if (st.row0) {  // multi-session: this block's group (blockIdx.y)
         pdl_wait();
         const std::uint32_t g = blockIdx.y;
@@ -40,36 +102,22 @@ __global__ void __launch_bounds__(128) conv_pre_kernel(const float* __restrict__
     const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
     float s0 = conv_state[c * 3], s1 = conv_state[c * 3 + 1], s2 = conv_state[c * 3 + 2];  // committed state: written only outside the graph
     pdl_wait();
+    pdl_trigger();  // after the wait: at most one dependent grid waits ahead of the running one
     const bool qk = blockIdx.x < qk_blocks;
     const float scale = blockIdx.x < q_blocks ? qscale : 1.0f;
-    for (std::uint32_t r = 0; r < rows; ++r) {
-        const float x = raw[static_cast<std::size_t>(r) * channels + c];
-        float sum = __fmul_rn(w0, s0);
-        sum = __fadd_rn(sum, __fmul_rn(w1, s1));
-        sum = __fadd_rn(sum, __fmul_rn(w2, s2));
-        sum = __fadd_rn(sum, __fmul_rn(w3, x));
-        float y = cc_silu(sum);
-        s0 = s1;
-        s1 = s2;
-        s2 = x;
-        if (qk) {
-            const float ss = block_sum128(__fmul_rn(y, y), red);  // p = 0 + y*y is exact
-            const float inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(ss, 1e-6f)));
-            y = __fmul_rn(__fmul_rn(y, inv), scale);
-        }
-        qc[static_cast<std::size_t>(r) * channels + c] = y;
-    }
+    constexpr std::uint32_t kB = kConvBatch;
+    for (std::uint32_t r = 0; r < rows; r += kB)
+        conv_rows<kConvBatch>(w0, w1, w2, w3, s0, s1, s2, raw, qc, channels, c, r, min(kB, rows - r), qk, scale, red);
 }
 
-
-// Row-parallel twin of conv_pre_kernel for prefill chunks (BITWISE the same per-row arithmetic): block (128 channels, RB rows).
+// Row-parallel form of conv_pre_kernel for prefill chunks (the same conv_rows body): block (128 channels, kConvRows rows).
 // The conv taps of row r are raw rows r-3..r-1 (negative = committed conv state).
 constexpr std::uint32_t kConvRows = 32;
 __global__ void __launch_bounds__(128) conv_prefill_kernel(const float* __restrict__ w, const float* __restrict__ conv_state,
                                                            const float* __restrict__ raw, float* qc, std::uint32_t channels,
                                                            std::uint32_t rows, std::uint32_t q_blocks, std::uint32_t qk_blocks,
                                                            float qscale) {
-    __shared__ float red[4];
+    __shared__ float red[kConvBatch][4];
     const std::uint32_t c = blockIdx.x * 128 + threadIdx.x;
     const std::uint32_t r0 = blockIdx.y * kConvRows, r1 = min(rows, r0 + kConvRows);
     const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
@@ -82,23 +130,8 @@ __global__ void __launch_bounds__(128) conv_prefill_kernel(const float* __restri
     float s0 = s[0], s1 = s[1], s2 = s[2];
     const bool qk = blockIdx.x < qk_blocks;
     const float scale = blockIdx.x < q_blocks ? qscale : 1.0f;
-    for (std::uint32_t r = r0; r < r1; ++r) {
-        const float x = raw[static_cast<std::size_t>(r) * channels + c];
-        float sum = __fmul_rn(w0, s0);
-        sum = __fadd_rn(sum, __fmul_rn(w1, s1));
-        sum = __fadd_rn(sum, __fmul_rn(w2, s2));
-        sum = __fadd_rn(sum, __fmul_rn(w3, x));
-        float y = cc_silu(sum);
-        s0 = s1;
-        s1 = s2;
-        s2 = x;
-        if (qk) {
-            const float ss = block_sum128(__fmul_rn(y, y), red);
-            const float inv = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(ss, 1e-6f)));
-            y = __fmul_rn(__fmul_rn(y, inv), scale);
-        }
-        qc[static_cast<std::size_t>(r) * channels + c] = y;
-    }
+    for (std::uint32_t r = r0; r < r1; r += 8)
+        conv_rows<8>(w0, w1, w2, w3, s0, s1, s2, raw, qc, channels, c, r, min(8u, r1 - r), qk, scale, red);
 }
 
 struct DeltaArgs {
@@ -354,16 +387,27 @@ cudaError_t gdn_commit(const GdnDims& d, const GdnCommitLayer* layers, std::uint
 
 cudaError_t gdn_prefill_layer(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
                               float* out, std::uint32_t rows, float eps, const std::uint32_t* parity_dev, cudaStream_t stream) {
+    return gdn_prefill_layer(d, layer, state, win, z, out, rows, eps, parity_dev, GdnChunkWork{}, stream);
+}
+
+cudaError_t gdn_prefill_layer(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
+                              float* out, std::uint32_t rows, float eps, const std::uint32_t* parity_dev, const GdnChunkWork& chunk,
+                              cudaStream_t stream) {
     if (d.key_dim != 128 || d.value_dim != 128 || d.conv_kernel != 4 || rows == 0) return cudaErrorInvalidValue;
+    if (chunk.defer_norm && chunk.ws == nullptr) return cudaErrorInvalidValue;  // the serial kernel always applies the norm itself
     const std::uint32_t C = d.conv_channels();
     const float qscale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d.key_dim)));
     conv_prefill_kernel<<<dim3(C / 128, (rows + kConvRows - 1) / kConvRows), 128, 0, stream>>>(
         layer.conv_w, state.conv, win.raw, win.qkv_c, C, rows, d.key_heads, 2 * d.key_heads, qscale);
     if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
-    DeltaArgs a{state.delta_base, win.qkv_c, win.a_raw, win.b_raw, layer.ssm_a, layer.dt_bias, layer.norm_gain, z, out,
-                nullptr, nullptr};
-    delta_window_kernel<<<dim3(d.value_heads), 128, 0, stream>>>(a, d, rows, parity_dev, eps, GdnSlotTable{});
-    if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
+    if (chunk.ws != nullptr) {  // FAST gdn-chunk16-f32-v1 (gdn_chunk.cu)
+        if (auto e = gdn_chunk_delta(d, layer, state, win, z, out, rows, eps, parity_dev, chunk, stream); e != cudaSuccess) return e;
+    } else {
+        DeltaArgs a{state.delta_base, win.qkv_c, win.a_raw, win.b_raw, layer.ssm_a, layer.dt_bias, layer.norm_gain, z, out,
+                    nullptr, nullptr};
+        delta_window_kernel<<<dim3(d.value_heads), 128, 0, stream>>>(a, d, rows, parity_dev, eps, GdnSlotTable{});
+        if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
+    }
     CommitBatch b{};
     b.a[0] = DeltaArgs{state.delta_base, win.qkv_c, win.a_raw, win.b_raw, layer.ssm_a, layer.dt_bias, nullptr, nullptr, nullptr, state.conv, win.raw};
     conv_commit_kernel<<<dim3(C / 128, 1), 128, 0, stream>>>(b, C, rows);

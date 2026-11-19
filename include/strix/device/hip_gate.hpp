@@ -2,6 +2,7 @@
 
 #include "strix/device/eager_code_load.hpp"
 #include "strix/device/gate.hpp"
+#include "strix/device/runtime_host_memory.hpp"
 
 #include <cstdio>
 #include <initializer_list>
@@ -29,8 +30,11 @@ const Bound& bind_hip(Request request = {}, const std::string& devices_path = {}
 // Engine flags (including --deploy-check) cannot bypass admission before the engine parser validates their meaning.
 // First of all it applies eager code-object loading (strix/device/eager_code_load.hpp: restarts the image once with
 // HIP_ENABLE_DEFERRED_LOADING=0 unless STRIX_EAGER_CODE_LOAD=0 or the HIP value is set); CodeLoad::engine leaves that
-// to a binary that resolves its own policy later.
-void bind_hip_main(int& argc, char** argv, std::FILE* receipt = stderr, CodeLoad code_load = CodeLoad::shared);
+// to a binary that resolves its own policy later. `registration` declares what the binary registers with the runtime as
+// host memory (runtime_host_memory.hpp): HostRegistration::model_file (the model file mapping, HipModelResidency)
+// declines the driver-pages default and refuses STRIX_HOST_DRIVER_PAGES=1 with a one-line reason (status 2).
+void bind_hip_main(int& argc, char** argv, std::FILE* receipt = stderr, CodeLoad code_load = CodeLoad::shared,
+                   HostRegistration registration = HostRegistration::engine_pages);
 
 // The binding made by this process, or null before the first bind (and always null without the HIP runtime).
 [[nodiscard]] const Bound* hip_bound() noexcept;

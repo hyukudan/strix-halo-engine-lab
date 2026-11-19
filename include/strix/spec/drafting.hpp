@@ -82,10 +82,67 @@ struct ArbiterConfig {
     std::uint32_t retreat_misses = 2;   // consecutive first-row misses that bar a source (lookup: until new evidence;
                                         // never a black-box drafter: its measured rate already prices its misses)
     double retreat_confidence = 0.01;   // learned drafter: bar only a miss streak at most this probable under its rate
+    // ... over this many passes (the evidence horizon), not per pass: per pass, a 0.64 first-row rate barred after 5 misses,
+    // which happens by chance ~2.3 times per 580 passes (measured on CUDA dense 27B Japanese prose: 33-566 serial passes per
+    // 1,200 tokens, ~4.7 % at 32 serial passes per bar), while a miss pass costs only its drafts. 0 = the per-pass form.
+    double retreat_horizon = 256.0;
     double min_lookup_evidence = 4.0;   // observations a lookup bucket needs before lookup may run (fresh buckets:
                                         // depth 1; resumed copy buckets: one hazard per emitted position)
     std::uint32_t min_model_passes = 3; // the learned drafter runs this often before it is compared
-    double cost_weight_cap = 8.0;       // verify-cost EWMA: a new wall weighs >= 1/(cap+1)
+    // Frontier probe (per-depth learned drafter only): expected() credits nothing to a depth no proposal has reached, and a
+    // drafter that wins at k only learns depths <= k + 1 of what it offers, so after a first-row miss on the first probe it
+    // stayed at k = 1 for good (measured: 290 of 291 MTP passes at depth 1, E 1.76, where depth 2 was worth ~0.5 token).
+    // While the model arm wins at k and depth k + 1 has decayed evidence below frontier_evidence, it offers k + 1 once every
+    // frontier_every passes. 0 = off (the previous form). Drafts never change emitted tokens; this only prices depth.
+    std::uint32_t frontier_every = 8;
+    double frontier_evidence = 0.5;
+    // The probe is charged its cost: it fires only when its priced score (expected tokens / (verify + draft ms)) is within
+    // frontier_loss of the pick, so it can cost at most frontier_loss / frontier_every of the throughput per pass.
+    double frontier_loss = 0.05;
+    // Per-depth learned drafter: the cumulative survival S_j is shrunk toward the geometric continuation of the shallower
+    // depths (m_j = B_{j-1}^2 / B_{j-2}, m_1 = the prior mean) instead of the flat prior mean, and a depth without evidence is
+    // priced at m_j. The flat mean (false, the previous form) pulls deep, little-evidenced S_j up toward 0.5: measured on the
+    // CUDA dense 27B Japanese prose, S_4 0.048 was priced 0.12 and the arm ran k = 4-5 instead of the k = 3 optimum (-3.8 %).
+    // Lookup sources keep the flat prior (their depth is bounded by the proposal). Only k changes; tokens never do.
+    bool model_continuation = true;
+    // false: measured walls never enter a decision; the seeded cost model (seed_cost) prices every window, so decide() is a
+    // pure function of the seeds and the acceptance history (deterministic for a fixed prompt). Walls are still reported by
+    // the caller's stats. true (the previous form): every pass's wall is folded into the window's cost.
+    bool learn_costs = true;
+    // Context cost of the seeded model (learn_costs = false only; learned walls already carry their context bin). The
+    // decode attention re-reads the K/V once per verify row, so a row's cost grows with the context: measured on CUDA
+    // dense 27B at 28K a row cost ~2.0 ms where the short-context seed priced 0.113, and the Arbiter drafted k ~7-8 where
+    // k ~4 is the optimum. The device's own verify walls price it (cost_fit, default):
+    //   V(r, L) = seed(r) + c + beta (r - 1) + kappa r L / 1,024
+    // a weighted ridge least squares over every pass's (rows, context, wall) with forgetting, the residual clipped against
+    // the current prediction (one stall cannot move it) and the per-row slope kept >= 0 (monotone in rows). It follows a
+    // kernel whose rows share one K/V walk by itself (smaller kappa) and corrects the seed's shape on this device. At one
+    // context the three terms are collinear: the minimum-norm split gives a long-context residual to kappa and a short one
+    // to c / beta, and the prediction at the live context is right either way. No pass seen = the seeds (previous form).
+    // A pass whose wall is off the prediction by more than half of it (an isolated stall) is not folded at all, from the
+    // first folded pass on (the first pass: by more than the warm-up clip); a second one in a row is (clipped), so a real
+    // level change is folded on every other pass while it stays off.
+    // Only k changes; tokens never do. Switch for every binder: set_context_cost ("online" | "off" | KV).
+    bool cost_fit = true;
+    double cost_fit_half_life = 64.0;  // passes: older walls weigh half after this many
+    double cost_fit_ridge = 1.0;       // pass-equivalents pulling (c, beta, kappa) toward 0 (= the seeds)
+    // Identification of the K/V term. At one context the row slope of the walls over the seeds is s = beta + kappa L and
+    // only the context distance between the walls and the seed table separates the two: the seeds' context is known to
+    // their context bin [lo, hi) (bin 0 for a table seeded at every context: a context-blind table prices the shortest
+    // bin), so kappa lies in [s / (L - lo), s / (L - hi)]. Its condition q = (L - lo) / (L - hi) is infinite while L <= hi
+    // (r (L - L_seed) can vanish: collinear with rows; the slope a short run sees is row tiles and drift) and tends to 1
+    // with L. The context term (fit or fixed) prices a decision only while q <= cost_fit_condition at the live context
+    // and, for the fit, at its weighted mean context; otherwise the price is the seed table, bit for bit (= "off").
+    // Bin-0 seeds at 1.5: from 6,144 positions. Regime rule (RTX PRO 6000, Qwen 27B dense, one run per arm, online vs off):
+    // at q 1.78 (4.7K) kappa is identified only within a factor 1.8 and the term lost on one content (code -0.75 %, mixed
+    // +0.8 / +4.4 % on the others), at q 1.45 (6.6K) +2.5 %, at q 1.08 (28K) +6.0 %; 1.5 holds the off plan on the whole
+    // 4-5K regime and keeps both winning regimes open. 0 = no identification test (every context, the previous form).
+    double cost_fit_condition = 1.5;
+    // > 0: fixed context term instead of the fit (deterministic decisions for A/B runs): every verify row pays this many
+    // ms per 1,024 context positions on top of the seed table, at the contexts that identify it (cost_fit_condition).
+    // 0 = the fit (cost_fit) or nothing.
+    double row_kv_ms_per_kpos = 0.0;
+    double cost_weight_cap = 8.0;      // verify-cost EWMA: a new wall weighs >= 1/(cap+1)
     double cost_aging = 0.995;          // per pass, every window's weight decays (stale windows re-learn fast)
     double lookup_overhead_ms = 0.0;    // extra cost of a lookup pass (the proposal itself is computed every step: sunk)
     std::array<double, 2> lookup_prior{1.0, 2.0};  // Beta prior (accept, reject) per depth for lookup
@@ -141,8 +198,21 @@ public:
     void observe(const Outcome& outcome, std::span<const std::uint32_t> emitted);
     // The stream restarted elsewhere (new request / non-contiguous position): drop unresolved proposals.
     void reset_pending() { pending_.clear(); }
-    // Current estimate: interpolated between measured windows, never below a smaller measured window.
+    // Current estimate: interpolated between measured windows, never below a smaller measured window; with seeded costs
+    // (learn_costs = false) plus the context cost (fitted, or rows x row_kv_ms_per_kpos x context / 1,024).
     [[nodiscard]] double verify_ms(std::uint32_t rows, std::uint64_t context = 0) const;
+    // The context cost (ArbiterConfig::cost_fit): coefficients of V(r, L) - seed(r) and the decayed pass weight.
+    // kv_open: the term prices decisions at the last pass's context (ArbiterConfig::cost_fit_condition); context: the
+    // fit's weighted mean context (positions); skipped: isolated outliers not folded.
+    struct CostFit {
+        const char* mode = "off";  // "online" | "fixed" | "off" | "learned" (walls priced per window)
+        double c = 0.0, beta = 0.0, kappa = 0.0, weight = 0.0, context = 0.0;
+        bool kv_open = false;
+        std::uint64_t skipped = 0;
+    };
+    [[nodiscard]] CostFit cost_fit() const;
+    // ArbiterConfig::cost_fit_condition at `context` against the seed table priced there (true: the K/V term is identified).
+    [[nodiscard]] bool kv_identified(std::uint64_t context) const;
     // Posterior mean of the conditional survival at `depth` (decisions bound the cumulative survival, see .cpp).
     [[nodiscard]] double survival(Source source, std::uint32_t bucket, std::uint32_t depth) const;
     [[nodiscard]] const ArbiterConfig& config() const { return config_; }
@@ -151,8 +221,20 @@ private:
     struct Beta { double a = 0, b = 0; };
     using Table = std::array<Beta, depth_classes>;
     struct Pending { std::vector<std::uint32_t> tokens; std::uint32_t bucket = 0, matched = 0; std::uint64_t run = 0; };
-    struct Costs { std::vector<double> ms, weight, seed; };  // [rows]
+    // [rows]; seed_lo / seed_hi: the context range the seed table was given for (positions; bin 0 when seeded everywhere)
+    struct Costs { std::vector<double> ms, weight, seed; std::uint64_t seed_lo = 0, seed_hi = 2048; };
     [[nodiscard]] double known_ms(const Costs& c, std::uint32_t rows) const;  // measured, scaled seed, or -1
+    [[nodiscard]] double table_ms(std::uint32_t rows, std::uint64_t context) const;  // verify_ms without the context term
+    [[nodiscard]] bool fitting() const { return !config_.learn_costs && config_.cost_fit && !(config_.row_kv_ms_per_kpos > 0.0); }
+    [[nodiscard]] double fit_correction(std::uint32_t rows, std::uint64_t context) const;
+    struct FitPass {
+        std::uint32_t rows = 0;  // 0 = none
+        std::uint64_t context = 0;
+        double verify_ms = 0.0;
+    };
+    [[nodiscard]] double fit_predict(const FitPass& pass, double& base) const;
+    void fit_fold(const FitPass& pass);
+    void fit_cost(const Outcome& outcome);
     void decay(double tokens);
     void learn(Table& table, std::uint32_t proposed, std::uint32_t accepted, double weight);
     [[nodiscard]] double expected(Source source, std::uint32_t bucket, std::uint32_t k) const;
@@ -163,8 +245,14 @@ private:
     Table model_{};
     std::vector<Pending> pending_;  // unresolved lookup proposals, oldest first (at most max_proposal)
     std::array<Costs, context_bins> cost_{};
+    std::array<double, 9> fit_xx_{};  // decayed sum of w x x^T over the features (1, rows - 1, rows x context / 1,024)
+    std::array<double, 3> fit_xy_{}, fit_coef_{};
+    double fit_w_ = 0.0, fit_wl_ = 0.0;  // decayed pass weight and weight x context (positions)
+    std::uint64_t fit_last_context_ = 0, fit_skipped_ = 0;
+    bool fit_last_skipped_ = false;
+    FitPass fit_held_{};  // the pass the stall test held back (rows 0 = none)
     Source last_ = Source::serial;
-    std::uint64_t passes_ = 0, last_model_ = 0, model_passes_ = 0, model_barred_until_ = 0;
+    std::uint64_t passes_ = 0, last_model_ = 0, model_passes_ = 0, model_barred_until_ = 0, last_frontier_ = 0;
     std::uint32_t model_misses_ = 0, lookup_misses_ = 0;
     bool last_black_box_ = false;  // the last model decision used the drafter's measured rate (no retreat for it)
     bool lookup_barred_ = false;
@@ -178,8 +266,11 @@ public:
 
 // One counters object per stream (or summed over a run) and THE line every engine prints at the end of a run:
 //   strix-spec-stats {"passes":..,"emitted":..,"tokens_per_pass":..,"sources":{..},"depth_offered":[..],
-//                     "depth_accepted":[..],"rows":{..},"draft_ms":..,"lookup_us":{..},"index_bytes":..}
+//                     "depth_accepted":[..],"rows":{..},"draft_ms":..,"lookup_us":{..},"index_bytes":..
+//                     [,"cost_fit":{"mode":..,"c":..,"beta":..,"kappa":..,"weight":..,"kv":"open"|"closed","ctx":..,"skipped":..}]}  (cost_fit: set by the drafter)
 struct SpecStats {
+    Arbiter::CostFit cost_fit{};  // the Arbiter's context cost after the last pass; mode "off" with no pass: not printed
+    bool has_cost_fit = false;
     std::uint64_t passes = 0, emitted = 0;
     std::array<std::uint64_t, source_count> source_passes{}, source_proposed{}, source_accepted{};
     std::array<std::uint64_t, max_proposal> depth_offered{}, depth_accepted{};  // [d-1]
@@ -195,5 +286,11 @@ struct SpecStats {
     [[nodiscard]] std::string json() const;
     [[nodiscard]] std::string line() const { return "strix-spec-stats " + json(); }
 };
+
+// The context cost switch of every binder (CLI = serve: one parser, one printed name). "online" = the fit (default),
+// "off" = the seeds only (the previous form), a number KV > 0 (<= 10) = fixed row_kv_ms_per_kpos (deterministic).
+// Throws std::invalid_argument on anything else.
+void set_context_cost(ArbiterConfig& config, const std::string& value);
+[[nodiscard]] std::string context_cost_name(const ArbiterConfig& config);  // "online" | "off" | "fixed 0.0699" | "learned"
 
 } // namespace strix::spec

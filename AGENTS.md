@@ -38,6 +38,98 @@ each engine only adapts it. This is the default for new work, not a later refact
   states what moves to shared code and which engines adopt it next.
 - Reviews reject new engine-local copies of logic that already exists, or obviously belongs, in a
   shared home.
+- One kernel family per operation class and backend: tall / dense GEMM, MoE grouped GEMM, attention,
+  recurrence (GDN), hyper-connection, engram lookup, weight decoders, LM head. An engine that needs
+  different operands or an epilogue adds a trait to that family. A second family in a model directory
+  is a defect: the change that finds it binds the engine to the shared family and deletes the private
+  one in the same change set, with the bitwise (EXACT) or gated (FAST) proof.
+- Backend split: tile and window planning, operand scheduling policy, quantisation contracts and
+  identities, decoder tables, gates, cost models, placement and the option resolver are
+  backend-neutral shared code that CUDA and HIP both bind. Only kernel bodies are per backend, and
+  they live in that backend's shared home (`src/cuda/core`, `src/core`), never in a model directory.
+  Work done for one device that another engine or backend can reuse lands in the shared home first.
+- Operand classes are chosen from the measured peak of the device for each class (for example the
+  integer 4-bit by 4-bit tensor rate against the FP16 rate), not from habit; a FAST class uses the
+  narrowest class that passes its gate, as a trait of the shared kernel under a versioned identity.
+- No device, node count, memory size, link or measured cost of one laboratory is compiled in:
+  such values come from the device and topology declarations or from a calibration at load.
+
+## Adding a model
+
+Support for a new model is a binding, not a new engine:
+
+1. Write the forward pass down stage by stage and map every stage to the shared component that
+   already implements that mechanism on each backend. The closest existing family is extended, not
+   copied.
+2. The model directory holds only what no other model can use: the tensor naming map (as data the
+   shared loader consumes), numerics the model requires, its family adapter and `models/<model>.toml`.
+   Tokenizer, chat template, quant decoders, loaders, caches, speculation, serving, placement and
+   every kernel come from shared code.
+3. A stage with no shared implementation is built in the shared home as a trait or policy of an
+   existing core, so the next model gets it; a piece that today is private to another engine is
+   moved to the shared home and that engine is re-bound to it (byte-compared) in the same work.
+4. The pull request carries the table `stage | shared component | model-specific code` and lists
+   every new file under the model directory with the reason it cannot be shared.
+
+# Performance tiers, quality gate and the route to main
+
+## Tiers (one mechanism: the shared `strix::profile` resolver, word `--profile exact|fast|turbo`)
+
+- **EXACT**: bitwise the reference path of the engine. No tolerance. An optimisation that keeps
+  every bit is an EXACT schedule change and needs an identity proof (ids, logits or state digest,
+  and identical machine code for untouched kernels). An engine whose device path has no bitwise
+  host reference names its reference class BASE and says so next to every number.
+- **FAST**: may change bits. A FAST lever needs (1) the quality gate below against the exact path
+  of the same engine and (2) a measured gain in the regime where it is enabled. There is no
+  minimum gain. Once both exist the lever is a registry row and is **on by default under
+  `--profile fast`** in that regime. Changing bits is not a defect in FAST; "gate not run" and
+  "gate failed" are the only reportable states.
+- **TURBO**: FAST plus levers that trade more quality for speed. Tiers are nested: the resolved
+  turbo set contains the fast set, each turbo lever is enabled only in regimes where a receipt
+  shows it faster than FAST, so TURBO is never slower than FAST. Explicit opt-in, never a default.
+  A lever that passes the FAST gate belongs in FAST.
+- Levers are data (name, versioned identity, receipts, regime, default per tier, off switch). The
+  server and the CLI resolve through the same code; a parity test covers it. A lever that wins in
+  some regimes ships with per-regime selection, not a global switch.
+
+## Quality gate for FAST levers
+
+- Limits, pooled over the gate set: KL <= 0.02, top-1 agreement >= 0.93, dNLL <= 0.01.
+- Per window the limit is `max(limit, 1.5 x the null of that same window)`, where the null is the
+  distance between two exact runs that differ only in evaluation order (one-ulp class). The
+  pooled limits stay absolute.
+- MoE engines: the lever arm replays the expert routes of the reference arm, so the gate measures
+  arithmetic and not route flips; the route flip rate of the free-running arm is reported.
+- dNLL is scored on token ids that neither arm generated, on at least 800 rows, with its standard
+  error printed. A verdict on fewer rows is provisional.
+- One gate tool for every engine; an engine only binds its route output and input.
+
+## Measuring
+
+- State class (EXACT / BASE / FAST / TURBO), hardware and power state with every number. Label
+  predictions as predictions. Do not benchmark while a key optimisation of the path is missing.
+- Multi-device: always report the one-device number, the multi-device number and their ratio, for
+  decode and for prefill. A plan that loses to one device is refused by the planner.
+- A negative result needs a device receipt (a bench), not only reasoning. A technique that is
+  known to work elsewhere and loses here is treated as an implementation defect until measured.
+- Kernel work requires reading the generated code (registers, spills, occupancy) and a no-model
+  bench before any model run.
+
+## Using several devices together
+
+Splitting a model across devices is a common facility, not an engine feature: the device and link
+description with measured costs, the capability table, the split planner with its cost model, the
+exchange contract and the channel interface are backend-neutral; a transport and a backend
+contribute only the channel body and the device-waited primitives; a model contributes only its
+stage declaration. See "Shared code first".
+
+## Route to main
+
+A change merges only with: an independent review that says GO, identity proof for every engine
+whose shared code changed, a clean build under the public CI warning set
+(`-Wall -Wextra -Wpedantic -Wconversion -Wshadow -Werror`), and green CI. Pull request text
+carries `Docs:` and `Home:` lines, numbers only from receipts on the tree being merged, and no
+laboratory paths.
 
 # Production defaults for humans and coding agents
 

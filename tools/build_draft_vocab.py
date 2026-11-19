@@ -13,6 +13,9 @@ Only the GGUF metadata header is read; tensor data is never touched.
 
 usage: build_draft_vocab.py MODEL.gguf OUT.u32 [--size N] [--spanish N]
            [--corpus-ids FILE ...] [--corpus-text FILE ... --tokenizer-json PATH]
+       build_draft_vocab.py MODEL.gguf OUT.u32 --script cjk
+           a script pack instead: every normal token whose text holds kana or CJK ideographs (CJK symbols and
+           full-width forms included), lowest ids first; a draft head adds it when the prompt holds its ids.
 """
 import argparse
 import collections
@@ -111,12 +114,22 @@ def main():
     ap.add_argument('--corpus-ids', nargs='*', default=[])
     ap.add_argument('--corpus-text', nargs='*', default=[])
     ap.add_argument('--tokenizer-json')
+    ap.add_argument('--script', choices=['cjk'], help='write a script pack (see usage) instead of a core vocabulary')
     a = ap.parse_args()
 
     meta = read_metadata(a.gguf)
     tokens = meta['tokenizer.ggml.tokens']
     types = meta.get('tokenizer.ggml.token_type') or [1] * len(tokens)
     vocab = len(tokens)
+    if a.script:
+        decoder = byte_decoder()
+        def cjk(text):
+            return any(0x3000 <= ord(ch) <= 0x30ff or 0x4e00 <= ord(ch) <= 0x9fff or 0xff00 <= ord(ch) <= 0xffef for ch in text)
+        pack = [i for i, t in enumerate(tokens) if types[i] == 1 and cjk(token_text(t, decoder))]
+        with open(a.out, 'wb') as f:
+            f.write(struct.pack(f'<{len(pack)}I', *pack))
+        print(f'{a.out}: {len(pack)} {a.script} script ids of {vocab}')
+        return
     chosen, seen = [], set()
 
     def add(ids, limit=None):

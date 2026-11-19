@@ -167,9 +167,27 @@ inline CutPrediction predict_cut(const LayerCosts& costs, pair::StageCut cut) {
     const auto split = pair::predict_split(costs.layers, attention_costs(costs), costs.lm_head, cut.layer, cut.half);
     return {split.cut, split.a, split.b, split.half};
 }
-// Half-layer cuts compete only when the costs carry the attention sub-block times.
-inline CutPrediction choose_cut(const LayerCosts& costs, const LegalCuts& legal, const LegalCuts& legal_half = {}) {
+// Half-layer cuts compete only when the costs carry the attention sub-block times. `rank_scale` (pair route: two
+// entries, pair/chain_topology.hpp stage_cost_scale of the declared topology) multiplies the costs of the rank running
+// each stage; empty or all 1.0 (equal or undeclared nodes) is the equal-rank balance, bit for bit.
+inline CutPrediction choose_cut(const LayerCosts& costs, const LegalCuts& legal, const LegalCuts& legal_half = {},
+                                std::span<const double> rank_scale = {}) {
+    const bool scaled = std::any_of(rank_scale.begin(), rank_scale.end(), [](double v) { return v != 1.0; });
+    if (scaled && rank_scale.size() != 2U) throw std::invalid_argument("pair prefill cut needs one cost scale per rank (2)");
     try {
+        if (scaled) {
+            const auto front = attention_costs(costs);
+            std::array<std::array<double, 48>, 2> layer{}, attention{};
+            for (std::size_t r = 0; r < 2U; ++r)
+                for (std::size_t l = 0; l < 48U; ++l) { layer[r][l] = costs.layers[l] * rank_scale[r]; attention[r][l] = front[l] * rank_scale[r]; }
+            const std::span<const double> stage[2] = {layer[0], layer[1]};
+            const std::span<const double> fronts[2] = {attention[0], attention[1]};
+            const auto chain = pair::balance_chain(std::span<const std::span<const double>>(stage),
+                std::span<const std::span<const double>>(fronts), costs.lm_head * rank_scale[1],
+                [&](std::uint32_t cut) { return legal[cut]; },
+                [&](std::uint32_t cut) { return costs.has_attention && legal_half[cut]; });
+            return {chain.cuts.at(0), chain.work.at(0), chain.work.at(1), chain.half.at(0)};
+        }
         const auto split = pair::balance_split(costs.layers, attention_costs(costs), costs.lm_head,
             [&](std::uint32_t cut) { return legal[cut]; },
             [&](std::uint32_t cut) { return costs.has_attention && legal_half[cut]; });
@@ -369,5 +387,12 @@ inline PairRoute resolve_pair_route(std::uint64_t prompt, std::uint32_t legacy, 
     if (out.route.prefix && out.tile_rows)
         out.chunks = (out.route.prefix + out.tile_rows - 1U) / out.tile_rows;
     return out;
+}
+// The MTP pair hand-off runs the route resolve_pair_route chose (no second threshold), cut back to the rows the MTP
+// owner's tiled plan carries before its serial / window tail; a prefix of at most one tile runs on one node.
+inline PromptRoute handoff_route(PromptRoute resolved, std::uint64_t tiled_end, std::uint32_t tile_rows) {
+    resolved.prefix = std::min(resolved.prefix, tiled_end);
+    if (resolved.prefix <= tile_rows) resolved.prefix = 0U;
+    return resolved;
 }
 } // namespace strix::qwen_pp

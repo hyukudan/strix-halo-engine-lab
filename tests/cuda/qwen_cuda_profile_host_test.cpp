@@ -64,18 +64,21 @@ std::set<std::string> diff(const qp::Config& a, const qp::Config& b) {
     ne("final_block_rows", a.final_block_rows != b.final_block_rows);
     ne("block_fit", a.block_fit != b.block_fit);
     ne("block_fit_reserve_mib", a.block_fit_reserve_mib != b.block_fit_reserve_mib);
+    ne("moe_real_rows", a.moe_real_rows != b.moe_real_rows);
     ne("device", a.device != b.device);
     ne("ple_host_pinned", a.ple_host_pinned != b.ple_host_pinned);
     ne("release_by_layer", a.release_by_layer != b.release_by_layer);
     ne("decode", a.decode != b.decode);
     ne("draft_vocab", a.draft_vocab != b.draft_vocab);
     ne("export_state", a.export_state != b.export_state);
+    ne("defer_prompt_mtp", a.defer_prompt_mtp != b.defer_prompt_mtp);
     ne("moe_route_bf16", a.moe_route_bf16 != b.moe_route_bf16);
     ne("diagnostic_bf16_mtp", a.diagnostic_bf16_mtp != b.diagnostic_bf16_mtp);
     ne("forms.hc_mma", a.forms.hc_mma != b.forms.hc_mma);
     ne("forms.mtp_mma", a.forms.mtp_mma != b.forms.mtp_mma);
     ne("forms.qsa_mma", a.forms.qsa_mma != b.forms.qsa_mma);
     ne("forms.moe_mma", a.forms.moe_mma != b.forms.moe_mma);
+    ne("forms.ple_a8", a.forms.ple_a8 != b.forms.ple_a8);
     return d;
 }
 // serve vs cli: the same request. Fails on a Resolution, contract or Config difference that is not named.
@@ -111,6 +114,72 @@ std::string status(const qo::Resolved& r, const char* lever) {
     return e ? std::string(pr::status_name(e->status)) : "absent";
 }
 
+// The RTX Qwen FAST bundle (cp::kFastBundle) through the one resolver: the fast column selects exactly its members, serve ==
+// CLI == prefill service, the id is decided on effective values, any differing member leaves the bundle with a reason, the
+// exact deferral row is an ordinary lever (option, env, off), and the expert rows of FAST and TURBO are exclusive.
+std::string bundle_id(const qo::Resolved& r) {
+    return cp::fast_bundle_status(r.choice, r.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::gsq_bf16_mma).id;
+}
+std::string bundle_detail(const qo::Resolved& r) {
+    return cp::fast_bundle_status(r.choice, r.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::gsq_bf16_mma).detail;
+}
+void fast_bundle() {
+    const std::string id(cp::kFastBundle);
+    for (const auto e : {qo::Entry::serve, qo::Entry::cli, qo::Entry::prefill_service}) {
+        const auto r = one({"--profile", "fast"}, e);
+        check(bundle_id(r) == id, "fast is the bundle in every entry: " + bundle_detail(r));
+        const auto json = qo::effective_config_json(r);
+        check(json.find("\"fast_bundle\"") != std::string::npos && json.find("\"" + id + "\"") != std::string::npos,
+              "effective config prints the bundle id");
+        check(bundle_detail(r).find("expert_fast,qsa_mma,hc_mma,mtp_defer_prompt") != std::string::npos &&
+                  bundle_detail(r).find("provisional") != std::string::npos, "bundle detail: members, provisional: " + bundle_detail(r));
+    }
+    const auto plain = one({}, qo::Entry::serve);
+    check(bundle_id(plain).empty() && qo::effective_config_json(plain).find("fast_bundle") == std::string::npos,
+          "default: no bundle, no field (effective config bytes kept)");
+    check(qo::numerical_identity(one({"--profile", "fast"}, qo::Entry::serve).config).hash != qo::numerical_identity(plain.config).hash,
+          "the bundle has its own numerical identity");
+    // Each member overridden leaves the bundle, with the member named; the other members stay.
+    const std::pair<Args, const char*> outside[] = {
+        {{"--profile", "fast", "--qsa-mma", "off"}, "qsa_mma off"},
+        {{"--profile", "fast", "--hc-mma", "off"}, "hc_mma off"},
+        {{"--profile", "fast", "--expert-fast", "off"}, "experts are not"},
+        {{"--profile", "fast", "--mtp-defer-prompt", "off"}, "mtp_defer_prompt off"},
+        {{"--profile", "fast", "--mtp-mma", "on"}, "mtp_mma on"},
+        {{"--profile", "fast", "--expert-fast", "off", "--moe-mma", "on"}, "moe_mma on"},
+        {{"--profile", "fast", "--ple-a8", "on"}, "ple_a8 on"},
+    };
+    for (const auto& [args, why] : outside) {
+        same_request(std::string("fast-outside-") + why, args);
+        const auto r = one(args, qo::Entry::serve);
+        check(bundle_id(r).empty() && bundle_detail(r).find(why) != std::string::npos, std::string("outside: ") + bundle_detail(r));
+        const auto json = qo::effective_config_json(r);
+        check(json.find("\"fast_bundle\"") != std::string::npos && json.find("\"none\"") != std::string::npos,
+              std::string("fast profile prints id none when outside: ") + why);
+    }
+    auto r = one({"--profile", "fast", "--expert-fast", "off"}, qo::Entry::cli);
+    check(r.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::incumbent && r.config.forms.hc_mma && status(r, "expert_fast") == "off",
+          "--expert-fast off keeps the pack's experts, other members stay");
+    r = one({"--profile", "fast"}, qo::Entry::serve, Env{{"STRIX_QRTX_EXPERT_FAST", "0"}});
+    check(r.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::incumbent, "STRIX_QRTX_EXPERT_FAST=0 reaches through the lookup");
+    check(refuses({"--profile", "fast", "--moe-mma", "on"}), "bf16mma experts + single-chain moe_mma: refused (unqualified composition)");
+    // Same values set one by one under the default profile ARE the bundle (decided on effective values).
+    const Args explicit_members{"--expert-fast", "on", "--qsa-mma", "on", "--hc-mma", "on", "--mtp-defer-prompt", "on"};
+    r = one(explicit_members, qo::Entry::serve);
+    check(bundle_id(r) == id && qo::effective_config_json(r).find("\"fast_bundle\"") != std::string::npos, "explicit members: " + bundle_detail(r));
+    r = one({"--expert-arithmetic", "gsq-iq-bf16mma-cuda-v1", "--profile", "fast", "--expert-fast", "off"}, qo::Entry::serve);
+    check(bundle_id(r) == id, "explicit --expert-arithmetic bf16mma keeps the bundle arithmetic: " + bundle_detail(r));
+    // The exact deferral row: option, env, off; never a bit-changing contract.
+    r = one({"--mtp-defer-prompt", "on"}, qo::Entry::cli);
+    check(r.config.defer_prompt_mtp && r.contract == "qwen-cuda;prefill=exact" && status(r, "mtp_defer_prompt") == "explicit-cli",
+          "--mtp-defer-prompt on: exact contract, explicit");
+    r = one({}, qo::Entry::serve, Env{{"STRIX_QRTX_MTP_DEFER_PROMPT", "1"}});
+    check(r.config.defer_prompt_mtp && r.contract == "qwen-cuda;prefill=exact", "STRIX_QRTX_MTP_DEFER_PROMPT=1 through the lookup");
+    check(!one({}, qo::Entry::cli).config.defer_prompt_mtp, "default: prompt MTP not deferred");
+    check(refuses({"--mtp-defer-prompt", "maybe"}), "--mtp-defer-prompt is on or off");
+    check(refuses({"--profile", "turbo", "--expert-fast", "on"}, {}, qo::Entry::serve), "FAST and TURBO expert rows are exclusive");
+}
+
 void profiles() {
     for (const auto& a : {Args{}, Args{"--profile", "default"}, Args{"--profile", "exact"}}) {
         same_request("exact", a);
@@ -122,9 +191,34 @@ void profiles() {
     check(one({"--profile", "exact"}, qo::Entry::cli).resolution.json() == one({"--profile", "default"}, qo::Entry::cli).resolution.json(), "exact is an alias of default");
     same_request("fast", {"--profile", "fast"});
     const auto fast = one({"--profile", "fast"}, qo::Entry::serve);
-    check(fast.config.forms.hc_mma && fast.config.forms.mtp_mma && fast.config.forms.qsa_mma && fast.config.forms.moe_mma, "fast: the four forms on");
-    check(fast.contract == "qwen-cuda;prefill=fast;forms=hc_mma,mtp_mma,qsa_mma,moe_mma;moe_route_bf16=0", "fast contract: " + fast.contract);
-    for (const char* f : {"hc_mma", "mtp_mma", "qsa_mma", "moe_mma"}) check(status(fast, f) == "provisional", std::string("fast: ") + f + " provisional");
+    // fast = the FAST bundle: bf16mma experts + row-group QSA + HC MMA + deferred prompt MTP; moe_mma / mtp_mma not members.
+    check(fast.config.forms.hc_mma && fast.config.forms.qsa_mma && !fast.config.forms.mtp_mma && !fast.config.forms.moe_mma,
+          "fast: the bundle's two forms on, mtp_mma / moe_mma off");
+    check(fast.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::gsq_bf16_mma && fast.config.defer_prompt_mtp,
+          "fast: bf16mma experts and deferred prompt MTP");
+    check(fast.contract == "qwen-cuda;prefill=fast;forms=hc_mma,qsa_mma;moe_route_bf16=0;ids=qwen-cuda-hc-f16mma-v2,qwen-cuda-qsa-bf16mma-v2+gsq-iq-bf16mma-cuda-v1", "fast contract: " + fast.contract);
+    for (const char* f : {"hc_mma", "qsa_mma", "expert_fast"}) check(status(fast, f) == "provisional", std::string("fast: ") + f + " provisional");
+    check(status(fast, "mtp_defer_prompt") == "profile", "fast: exact deferral applied by the profile (qualified exact row): " + status(fast, "mtp_defer_prompt"));
+    for (const char* f : {"mtp_mma", "moe_mma", "expert_turbo", "ple_a8"}) check(status(fast, f) == "absent", std::string("fast: ") + f + " not selected");
+    // expert_decode_tile: exact schedule trait of the tensor-core experts, on in every profile (absent row), off by option or
+    // env, serve == CLI; the arithmetic contract and the bundle id do not change (bitwise the tile form).
+    check(fast.config.expert_decode_tile && status(fast, "expert_decode_tile") == "absent", "fast: decode tile form on (absent row)");
+    check(one({"--profile", "exact"}, qo::Entry::serve).config.expert_decode_tile, "exact: decode tile on (no tensor-core experts run)");
+    same_request("decode tile off", {"--profile", "fast", "--expert-decode-tile", "off"});
+    for (const auto& tile : {one({"--profile", "fast", "--expert-decode-tile", "off"}, qo::Entry::serve),
+                             one({"--profile", "fast"}, qo::Entry::serve, Env{{"STRIX_QRTX_EXPERT_DECODE_TILE", "0"}})}) {
+        check(!tile.config.expert_decode_tile && status(tile, "expert_decode_tile") == "off", "decode tile off by option / env: " + status(tile, "expert_decode_tile"));
+        check(tile.contract == fast.contract && bundle_id(tile) == bundle_id(fast), "decode tile off: same contract and bundle id");
+    }
+    // ple_a8: opt-in under fast; the form, its identity and the prefix contract follow the option, CLI = serve.
+    same_request("fast+ple_a8", {"--profile", "fast", "--ple-a8", "on"});
+    const auto ple = one({"--profile", "fast", "--ple-a8", "on"}, qo::Entry::serve);
+    check(ple.config.forms.ple_a8 && !fast.config.forms.ple_a8, "ple_a8: on only when asked");
+    check(ple.contract == "qwen-cuda;prefill=fast;forms=hc_mma,qsa_mma,ple_a8;moe_route_bf16=0;ids=qwen-cuda-hc-f16mma-v2,"
+                          "qwen-cuda-qsa-bf16mma-v2,qwen-cuda-ple-a8-v1+gsq-iq-bf16mma-cuda-v1", "ple_a8 contract: " + ple.contract);
+    check(status(ple, "ple_a8").rfind("explicit", 0) == 0, "ple_a8: explicit under fast: " + status(ple, "ple_a8"));
+    check(cp::form_identities(fast.choice) == "qwen-cuda-hc-f16mma-v2,qwen-cuda-qsa-bf16mma-v2", "fast identities: " + cp::form_identities(fast.choice));
+    fast_bundle();
     for (const char* f : {"moe_route_bf16", "qsa_budget", "gdn_fp16_chunk", "output_head"})
         check(status(fast, f) == "pending", std::string("fast: ") + f + " pending (listed, not used)");
     check(fast.config.moe_route_bf16 == false, "fast: pending route storage is not applied");
@@ -139,21 +233,21 @@ void profiles() {
 void overrides() {
     same_request("fast-hc-off", {"--profile", "fast", "--hc-mma", "off"});
     auto r = one({"--profile", "fast", "--hc-mma", "off"}, qo::Entry::cli);
-    check(!r.config.forms.hc_mma && r.config.forms.mtp_mma && r.config.forms.qsa_mma && r.config.forms.moe_mma, "--hc-mma off wins over the profile");
+    check(!r.config.forms.hc_mma && !r.config.forms.mtp_mma && r.config.forms.qsa_mma && !r.config.forms.moe_mma, "--hc-mma off wins over the profile");
     check(status(r, "hc_mma") == "off", "hc_mma status off");
-    check(r.contract == "qwen-cuda;prefill=fast;forms=mtp_mma,qsa_mma,moe_mma;moe_route_bf16=0", r.contract);
+    check(r.contract == "qwen-cuda;prefill=fast;forms=qsa_mma;moe_route_bf16=0;ids=qwen-cuda-qsa-bf16mma-v2+gsq-iq-bf16mma-cuda-v1", r.contract);
     // moe_mma: option and env of the table row, CLI beats env, off wins over the fast profile.
     same_request("fast-moe-off", {"--profile", "fast", "--moe-mma", "off"});
     r = one({"--profile", "fast", "--moe-mma", "off"}, qo::Entry::cli);
     check(!r.config.forms.moe_mma && r.config.forms.hc_mma && status(r, "moe_mma") == "off", "--moe-mma off wins over the profile");
-    check(r.contract == "qwen-cuda;prefill=fast;forms=hc_mma,mtp_mma,qsa_mma;moe_route_bf16=0", r.contract);
+    check(r.contract == "qwen-cuda;prefill=fast;forms=hc_mma,qsa_mma;moe_route_bf16=0;ids=qwen-cuda-hc-f16mma-v2,qwen-cuda-qsa-bf16mma-v2+gsq-iq-bf16mma-cuda-v1", r.contract);
     Env moe_env{{"STRIX_QRTX_MOE_MMA", "0"}};
     same_request("fast-env-moe-off", {"--profile", "fast"}, moe_env);
     r = one({"--profile", "fast"}, qo::Entry::serve, moe_env);
     check(!r.config.forms.moe_mma && status(r, "moe_mma") == "off", "STRIX_QRTX_MOE_MMA=0 reaches only through the lookup");
     moe_env = {{"STRIX_QRTX_MOE_MMA", "1"}};
     r = one({}, qo::Entry::prefill_service, moe_env);
-    check(r.config.forms.moe_mma && !r.config.forms.hc_mma && status(r, "moe_mma") == "explicit-env" && r.contract == "qwen-cuda;prefill=fast;forms=moe_mma;moe_route_bf16=0",
+    check(r.config.forms.moe_mma && !r.config.forms.hc_mma && status(r, "moe_mma") == "explicit-env" && r.contract == "qwen-cuda;prefill=fast;forms=moe_mma;moe_route_bf16=0;ids=qwen-cuda-moe-i8fma-v1",
           "env turns the MoE form on in the default profile: " + r.contract);
     r = one({"--moe-mma", "off"}, qo::Entry::cli, moe_env);
     check(!r.config.forms.moe_mma, "CLI beats env (moe_mma)");
@@ -165,7 +259,7 @@ void overrides() {
     check(!r.config.forms.qsa_mma && status(r, "qsa_mma") == "off", "STRIX_QRTX_QSA_MMA=0 reaches only through the lookup");
     env = {{"STRIX_QRTX_MTP_MMA", "1"}};
     r = one({}, qo::Entry::prefill_service, env);
-    check(r.config.forms.mtp_mma && status(r, "mtp_mma") == "explicit-env" && r.contract == "qwen-cuda;prefill=fast;forms=mtp_mma;moe_route_bf16=0",
+    check(r.config.forms.mtp_mma && status(r, "mtp_mma") == "explicit-env" && r.contract == "qwen-cuda;prefill=fast;forms=mtp_mma;moe_route_bf16=0;ids=qwen-cuda-mtp-f16mma-v1",
           "env turns one form on in the default profile: " + r.contract);
     r = one({"--mtp-mma", "off"}, qo::Entry::cli, env);
     check(!r.config.forms.mtp_mma, "CLI beats env");
@@ -175,7 +269,9 @@ void overrides() {
     // The route storage: explicit option, env, or --allow-pending (unqualified).
     r = one({"--prefill-moe-route-bf16", "on"}, qo::Entry::cli);
     check(r.config.moe_route_bf16 == true && r.contract == "qwen-cuda;prefill=fast;forms=none;moe_route_bf16=1", "route storage on: " + r.contract);
-    r = one({"--profile", "fast", "--allow-pending"}, qo::Entry::cli);
+    // The bundle's bf16mma experts refuse the route storage (qwen_options.hpp resolve: unqualified composition).
+    check(refuses({"--profile", "fast", "--allow-pending"}), "fast bundle + pending route storage: refused, never silent");
+    r = one({"--profile", "fast", "--expert-fast", "off", "--allow-pending"}, qo::Entry::cli);
     check(r.config.moe_route_bf16 == true && status(r, "moe_route_bf16") == "unqualified", "--allow-pending runs the route storage as unqualified");
     check(status(r, "qsa_budget") == "pending", "not-runnable rows stay pending under --allow-pending");
     env = {{"STRIX_QPF2K_MOE_ROUTE_BF16", "1"}};
@@ -253,7 +349,7 @@ void identities() {
     std::uint64_t legacy = 14695981039346656037ULL;
     for (const char ch : std::string(base)) { legacy ^= static_cast<unsigned char>(ch); legacy *= 1099511628211ULL; }
     check(qo::handoff_numerical_id(base, {}) == legacy, "exact hand-off id keeps its historical value");
-    check(cp::form_identities({false, true, true, true}) == "qwen-cuda-hc-f16mma-v1,qwen-cuda-mtp-f16mma-v1,qwen-cuda-qsa-f16mma-v1", "form identities");
+    check(cp::form_identities({false, true, true, true}) == "qwen-cuda-hc-f16mma-v2,qwen-cuda-mtp-f16mma-v1,qwen-cuda-qsa-bf16mma-v2", "form identities");
     // Prefix-cache identity: forms enter only when on.
     const auto dir = fs::temp_directory_path() / "strix_qwen_cuda_profile_host_test";
     fs::create_directories(dir / "tables");
@@ -279,7 +375,7 @@ void identities() {
     fs::remove_all(dir);
     // Receipt.
     const auto receipt = cp::receipt({false, true, false, true}).json();
-    check(receipt.find("qwen-cuda;prefill=fast;forms=hc_mma,qsa_mma;moe_route_bf16=0") != std::string::npos, "receipt carries the contract: " + receipt);
+    check(receipt.find("qwen-cuda;prefill=fast;forms=hc_mma,qsa_mma;moe_route_bf16=0;ids=qwen-cuda-hc-f16mma-v2,qwen-cuda-qsa-bf16mma-v2") != std::string::npos, "receipt carries the contract: " + receipt);
 }
 
 void effective_config() {
@@ -351,30 +447,51 @@ void snapshot_forms() {
 }
 }  // namespace
 
-// TURBO (qwen-turbo-v1) through the one resolver: serve == CLI == strix/cuda/qwen_turbo.hpp, weight toggle only (the
-// exact CUDA prefill forms), lever options refused, and no turbo field outside turbo.
+// TURBO (qwen-turbo-v1) through the one resolver: serve == CLI == strix/cuda/qwen_turbo.hpp for the weight toggle, the
+// CUDA table read through its turbo cells (FAST forms + the TURBO-only integer expert row), lever options honoured, and
+// no turbo field outside turbo.
 void turbo_binding() {
     const Env none;
     const auto request = parse(with_paths({"--profile", "turbo", "--turbo-weights", "onfly", "--blocks", "1024,2048"}), none);
     const auto serve = qo::resolve(request, qo::Entry::serve), cli = qo::resolve(request, qo::Entry::cli);
-    const auto direct = strix::cuda::qwen_turbo::resolve({request.profile, request.inputs, false});
+    const auto direct = strix::cuda::qwen_turbo::resolve({request.profile, request.inputs, false}, strix::qwen::cuda_profile::levers());
     const auto plain = one({}, qo::Entry::serve);
     check(serve.resolution.is_turbo() && serve.config.turbo_onfly_nvfp4 && cli.config.turbo_onfly_nvfp4 && direct.onfly_nvfp4,
           "turbo: onfly effective in both entries");
     check(!serve.config.turbo_namespace.empty() && serve.config.turbo_namespace == cli.config.turbo_namespace &&
               serve.config.turbo_namespace == direct.cache_namespace, "turbo: namespace of the qwen_turbo resolver");
-    check(!serve.choice.fast() && !cli.choice.fast() && serve.contract == plain.contract, "turbo: exact CUDA prefill forms");
+    check(serve.choice == cli.choice && serve.choice.hc_mma && serve.choice.mtp_mma && serve.choice.qsa_mma &&
+              !serve.choice.moe_mma && serve.choice.expert_turbo && serve.contract != plain.contract,
+          "turbo: FAST forms inherited, moe_mma off, integer experts on");
+    check(serve.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::gsq_i8_turbo &&
+              cli.config.expert_arithmetic == serve.config.expert_arithmetic &&
+              serve.contract.find("gsq-iq-i8mma-turbo-cuda-v1") != std::string::npos,
+          "turbo: TURBO expert arithmetic in both entries");
+    check(qo::numerical_identity(serve.config).hash != qo::numerical_identity(plain.config).hash, "turbo: own numerical identity");
     check(diff(serve.config, cli.config) == std::set<std::string>({"decode", "export_state", "release_by_layer"}),
           "turbo: same values in both entries");
     check(!plain.config.turbo_onfly_nvfp4 && plain.config.turbo_namespace.empty() &&
               qo::effective_config_json(plain).find("turbo_weights") == std::string::npos &&
               qo::effective_config_json(serve).find("\"turbo_weights\"") != std::string::npos,
           "turbo: effective config field only under turbo");
+    const auto off = qo::resolve(parse(with_paths({"--profile", "turbo", "--expert-turbo", "off"}), none), qo::Entry::serve);
+    check(off.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::incumbent && !off.choice.expert_turbo &&
+              off.choice.hc_mma, "turbo: --expert-turbo off keeps the pack's experts, other rows stay");
+    const auto bf = qo::resolve(parse(with_paths({"--profile", "turbo", "--expert-arithmetic", "gsq-iq-bf16mma-cuda-v1"}), none),
+                                qo::Entry::serve);
+    check(bf.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::gsq_bf16_mma,
+          "turbo: an explicit expert arithmetic wins over the row");
+    const auto fast = qo::resolve(parse(with_paths({"--profile", "fast"}), none), qo::Entry::serve);
+    check(fast.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::gsq_bf16_mma && !fast.choice.expert_turbo &&
+              fast.choice.expert_fast && plain.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::incumbent,
+          "turbo row selects nothing outside turbo (fast selects the FAST expert row instead)");
+    check(!serve.choice.expert_fast && serve.choice.mtp_mma && serve.choice.mtp_defer_prompt,
+          "turbo: FAST expert row kept out (turbo cell off); mtp_mma and the exact deferral stay in TURBO");
     bool threw = false;
     try {
         (void)qo::resolve(parse(with_paths({"--profile", "turbo", "--prefill-moe-route-bf16", "1"}), none), qo::Entry::serve);
     } catch (const std::invalid_argument&) { threw = true; }
-    check(threw, "turbo: CUDA lever option refused");
+    check(threw, "turbo: RouteBF16 with the TURBO expert arithmetic refused");
 }
 
 // Block fit: shared rows_fit planner (fake allocator) and the resolver binding (every entry, typed schedule strict).
@@ -407,6 +524,51 @@ void block_fit() {
     check(refuses({}, bad, qo::Entry::serve), "STRIX_QRTX_BLOCK_FIT accepts 0 or 1 only");
 }
 
+// Routed-MoE window rows (qwen_cuda_moe_real_rows): qualified real-row form by default; requested/effective/reason;
+// tiered and prefill keep the padded rows; no numerical identity change.
+void moe_window_rows() {
+    namespace qp = strix::cuda::qwen_prefill;
+    check(qp::moe_real_rows_lever.default_on && qp::moe_real_rows_lever.exactness == strix::lever::Exactness::bitwise,
+          "moe_real_rows: bitwise organization, qualified default on; explicit off restores padded form");
+    const Env on{{"STRIX_QRTX_MOE_REAL_ROWS", "1"}}, off{{"STRIX_QRTX_MOE_REAL_ROWS", "0"}}, bad{{"STRIX_QRTX_MOE_REAL_ROWS", "yes"}};
+    for (const auto e : {qo::Entry::serve, qo::Entry::cli, qo::Entry::prefill_service}) {
+        const auto d = one({}, e), y = one({}, e, on), n = one({}, e, off);
+        check(d.config.moe_real_rows && d.moe_real_rows_origin == "default", "default: real rows, origin default");
+        check(y.config.moe_real_rows && y.moe_real_rows_origin == "explicit", "STRIX_QRTX_MOE_REAL_ROWS=1 requests real rows");
+        check(!n.config.moe_real_rows && n.moe_real_rows_origin == "explicit", "STRIX_QRTX_MOE_REAL_ROWS=0 is explicit off");
+        check(qo::numerical_identity(y.config).hash == qo::numerical_identity(n.config).hash &&
+                  qo::handoff_numerical_id_config("x", y.config) == qo::handoff_numerical_id_config("x", n.config) &&
+                  y.contract == n.contract,
+              "real rows: same numerical identity, hand-off id and arithmetic contract");
+        const auto row_of = [](const qo::Resolved& r) {
+            const auto json = strix::serve::parse_json(qo::effective_config_json(r));
+            return *json.find("engine")->find("moe_window_rows");
+        };
+        const auto row = row_of(y);
+        check(row.find("requested")->as_bool() && row.find("source")->as_string() == "explicit" &&
+                  row.find("qualified_default")->as_bool() && row.find("lever")->as_string() == "qwen_cuda_moe_real_rows" &&
+                  row.find("tiered")->as_string().find("padded") != std::string::npos &&
+                  row.find("restart")->as_string().find("separate processes") != std::string::npos,
+              "effective config names requested/source/qualification/tiered fallback/restart semantics");
+        check(row_of(d).find("requested")->as_bool(), "default effective config: requested");
+    }
+    same_request("real rows requested", {}, on);
+    check(refuses({}, bad, qo::Entry::serve), "STRIX_QRTX_MOE_REAL_ROWS accepts 0 or 1 only");
+    // policy: requested -> effective only on a fully resident engine; decode windows only.
+    const auto d = qp::moe_rows_policy(false, false), y = qp::moe_rows_policy(true, false), t = qp::moe_rows_policy(true, true);
+    check(!d.requested && !d.effective && y.requested && y.effective && t.requested && !t.effective,
+          "policy: off / on / tiered fallback");
+    check(std::string(t.reason).find("tiered") != std::string::npos && std::string(d.reason).find("padded") != std::string::npos,
+          "policy reasons name the fallback");
+    for (std::uint32_t rows = 1; rows <= 16; ++rows) {
+        const std::uint32_t pad = rows <= 8 ? rows : 16;
+        check(qp::moe_block_rows(y, true, rows, pad) == rows, "window, real rows: the window's rows");
+        check(qp::moe_block_rows(d, true, rows, pad) == pad && qp::moe_block_rows(t, true, rows, pad) == pad,
+              "window, default or tiered: the padded block");
+        check(qp::moe_block_rows(y, false, rows, 16) == 16, "prefill blocks keep the padded rows");
+    }
+}
+
 int main() {
     try {
         const Args expert={"--expert-arithmetic","gsq-iq3s-a8-dot4-cuda-v1"};
@@ -417,17 +579,74 @@ int main() {
         check(gsq.config.expert_arithmetic==strix::qwen_packs::ExpertArithmetic::gsq_a8_dot4,"explicit GSQ parsed once");
         check(gsq.contract.find("gsq-iq3s-a8-dot4-cuda-v1")!=std::string::npos,"GSQ contract named");
         check(qo::effective_config_json(gsq).find("gsq-iq3s-a8-dot4-cuda-v1")!=std::string::npos,"GSQ effective config names arithmetic");
+        for(const auto* r:{&native,&gsq}) check(qo::config_arithmetic_contract(r->config)==r->contract,"service /health contract = effective config contract: "+r->contract);
+        for(const auto& a:{Args{"--profile","fast"},Args{"--profile","turbo","--turbo-weights","onfly"}}) {
+            const auto s=one(a,qo::Entry::prefill_service);
+            check(qo::config_arithmetic_contract(s.config)==s.contract,"service /health contract = effective config contract: "+s.contract);
+        }
+        {   // loaded-dispatch receipt: load-time presence/possible classes + declared form, never an exclusive executed class
+            namespace qpk=strix::qwen_packs;
+            using V=std::vector<std::string_view>;
+            const auto mma=one({"--moe-mma","on"},qo::Entry::cli);
+            const auto real=strix::cuda::qwen_prefill::moe_rows_policy(true,false);
+            // requested MMA is not an execution fact: decode windows (moe_mma && !window) and the decode-row fallback keep four-chain possible
+            check(qo::expert_possible_classes(qpk::ExpertArithmetic::incumbent,true,false)==V{"cuda-moe-mma@1","cuda-four-chain-imma@1"},"A8 + requested moe_mma keeps decode fallback class");
+            check(qo::expert_possible_classes(qpk::ExpertArithmetic::incumbent,false,false)==V{"cuda-four-chain-imma@1"},"A8 exact: one class");
+            // native_experts = ANY native layer: native present, A8 layers not excluded (mixed or unknown)
+            check(qo::expert_possible_classes(qpk::ExpertArithmetic::incumbent,true,true)==V{"cuda-native-iq-fp32@1","cuda-moe-mma@1","cuda-four-chain-imma@1"},"native presence + mixed A8 with moe_mma");
+            check(qo::expert_possible_classes(qpk::ExpertArithmetic::incumbent,false,true)==V{"cuda-native-iq-fp32@1","cuda-four-chain-imma@1"},"native presence + mixed A8");
+            check(qo::expert_possible_classes(qpk::ExpertArithmetic::gsq_a8_dot4,false,false)==V{qpk::gsq_a8_contract},"GSQ A8 contract, no native layer");
+            check(qo::expert_possible_classes(qpk::ExpertArithmetic::gsq_a8_dot4,false,true)==V{"cuda-native-iq-fp32@1",qpk::gsq_a8_contract},"GSQ A8 + native presence");
+            const auto nat=qo::expert_dispatch_json(mma.config,"gsq-pack",true,real).dump();
+            check(nat.find("\"arithmetic\"")==std::string::npos && nat.find("\"executed_class\":\"not-observed\"")!=std::string::npos
+                  && nat.find("\"scope\":\"loaded-presence\"")!=std::string::npos,"no exclusive actual class claimed: "+nat);
+            check(nat.find("\"possible_classes\":[\"cuda-native-iq-fp32@1\",\"cuda-moe-mma@1\",\"cuda-four-chain-imma@1\"]")!=std::string::npos
+                  && nat.find("\"native_class\":\"present\"")!=std::string::npos && nat.find("\"layer_mix\":\"unknown\"")!=std::string::npos,"native presence, mixed/unknown scope: "+nat);
+            check(nat.find("\"declared_expert_arithmetic\":\"incumbent\"")!=std::string::npos && nat.find("\"declared_moe_mma\":true")!=std::string::npos,"declared form kept separate: "+nat);
+            check(nat.find("\"weight_pack\":\"gsq-pack\"")!=std::string::npos && nat.find("\"native_experts\":true")!=std::string::npos
+                  && nat.find("\"moe_window_rows_effective\":true")!=std::string::npos,"loaded source facts: "+nat);
+            check(nat.find("\"declared_contract\":\""+mma.contract+"\"")!=std::string::npos,"declared contract = effective config contract: "+nat);
+            const auto a8=qo::expert_dispatch_json(mma.config,"a8-pack",false,real).dump();
+            check(a8.find("\"possible_classes\":[\"cuda-moe-mma@1\",\"cuda-four-chain-imma@1\"]")!=std::string::npos
+                  && a8.find("\"native_class\":\"absent\"")!=std::string::npos && a8.find("\"layer_mix\":\"a8-route-only\"")!=std::string::npos
+                  && a8.find("decode-row fallback")!=std::string::npos,"requested MMA with decode fallback: "+a8);
+            const auto g=qo::expert_dispatch_json(gsq.config,"gsq-pack",false,real).dump();
+            check(g.find("\"possible_classes\":[\"gsq-iq3s-a8-dot4-cuda-v1\"]")!=std::string::npos,"GSQ A8 receipt: "+g);
+        }
         check(qo::numerical_identity(gsq.config).hash!=qo::numerical_identity(native.config).hash,"GSQ snapshots have independent numerical identity");
         check(qo::handoff_numerical_id_config("old",gsq.config)!=qo::handoff_numerical_id_config("old",native.config),"GSQ handoffs cannot masquerade as native");
         check(qo::handoff_numerical_id_config("old",native.config)==qo::handoff_numerical_id("old",qo::choice_of(native.config)),"incumbent handoff bytes preserved");
         check(refuses({"--expert-arithmetic","unknown"}),"unknown expert arithmetic rejected");
         check(refuses({"--expert-arithmetic","gsq-iq3s-a8-dot4-cuda-v1","--moe-mma","on"}),"GSQ single-chain composition rejects explicitly");
+        {
+            const Args mma={"--expert-arithmetic","gsq-iq-bf16mma-cuda-v1"};
+            same_request("explicit GSQ BF16 MMA arithmetic",mma);
+            const auto bf=one(mma,qo::Entry::cli);
+            check(bf.config.expert_arithmetic==strix::qwen_packs::ExpertArithmetic::gsq_bf16_mma,"explicit BF16 MMA parsed");
+            check(bf.contract.find("gsq-iq-bf16mma-cuda-v1")!=std::string::npos,"BF16 MMA contract named");
+            check(qo::numerical_identity(bf.config).hash!=qo::numerical_identity(gsq.config).hash &&
+                  qo::numerical_identity(bf.config).hash!=qo::numerical_identity(native.config).hash,"BF16 MMA has its own numerical identity");
+            check(qo::handoff_numerical_id_config("old",bf.config)!=qo::handoff_numerical_id_config("old",gsq.config),"BF16 MMA handoff differs from A8");
+            check(refuses({"--expert-arithmetic","gsq-iq-bf16mma-cuda-v1","--moe-mma","on"}),"BF16 MMA single-chain composition rejects explicitly");
+            const Args ti={"--expert-arithmetic","gsq-iq-i8mma-turbo-cuda-v1"};
+            same_request("explicit GSQ TURBO int8 arithmetic",ti);
+            const auto tu=one(ti,qo::Entry::cli);
+            check(tu.config.expert_arithmetic==strix::qwen_packs::ExpertArithmetic::gsq_i8_turbo,"explicit TURBO int8 parsed");
+            check(tu.contract.find("gsq-iq-i8mma-turbo-cuda-v1")!=std::string::npos,"TURBO int8 contract named");
+            check(qo::numerical_identity(tu.config).hash!=qo::numerical_identity(gsq.config).hash &&
+                  qo::numerical_identity(tu.config).hash!=qo::numerical_identity(bf.config).hash &&
+                  qo::numerical_identity(tu.config).hash!=qo::numerical_identity(native.config).hash,"TURBO int8 has its own numerical identity");
+            check(qo::handoff_numerical_id_config("old",tu.config)!=qo::handoff_numerical_id_config("old",gsq.config) &&
+                  qo::handoff_numerical_id_config("old",tu.config)!=qo::handoff_numerical_id_config("old",bf.config),"TURBO int8 handoff differs");
+            check(refuses({"--expert-arithmetic","gsq-iq-i8mma-turbo-cuda-v1","--moe-mma","on"}),"TURBO int8 single-chain composition rejects explicitly");
+        }
         profiles();
         overrides();
         common_options();
         turbo_binding();
         flat_blocks();
         block_fit();
+        moe_window_rows();
         identities();
         effective_config();
         route_governors();

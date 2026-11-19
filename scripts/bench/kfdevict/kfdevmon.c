@@ -3,7 +3,8 @@
 //   through ROCr's /dev/kfd fd;
 // - logs every userptr / GTT / VRAM KFD allocation and free (ioctl interposition) with a backtrace
 //   for userptr ones and the /proc/self/maps line that owns the user address.
-// Env: KFDEVMON_OUT=<prefix> (log = <prefix>.<pid>), KFDEVMON_BT=0 disables backtraces.
+// Env: KFDEVMON_OUT=<prefix> (log = <prefix>.<pid>), KFDEVMON_BT=0 disables backtraces, KFDEVMON_BT=2 logs EVERY
+//      allocation (not only userptr / >= 64 MiB) and every SVM range ioctl with a backtrace (lazy-allocation hunts).
 // Build: gcc -O2 -shared -fPIC -o kfdevmon.so kfdevmon.c -ldl -lpthread
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -51,13 +52,13 @@ static void log_alloc(struct kfd_ioctl_alloc_memory_of_gpu_args* a, int rc) {
     if (nbo < MAXBO) { bos[nbo].handle = a->handle; bos[nbo].size = a->size; bos[nbo].uaddr = up ? a->mmap_offset : 0; bos[nbo].flags = a->flags; nbo++; }
     if (up) { up_alive_n++; up_alive_bytes += a->size; up_total_n++; }
     else if (a->flags & KFD_IOC_ALLOC_MEM_FLAGS_GTT) gtt_alive_bytes += a->size;
-    if (up || a->size >= (64u << 20)) {
+    if (up || want_bt >= 2 || a->size >= (64u << 20)) {
         char ml[400] = ""; if (up) maps_line(a->mmap_offset, ml, sizeof ml);
         fprintf(out, "%.6f ALLOC %s size=%llu flags=%x uaddr=%llx handle=%llx alive_up=%llu/%lluMB | %s\n", now_boot(),
                 up ? "USERPTR" : (a->flags & KFD_IOC_ALLOC_MEM_FLAGS_VRAM) ? "VRAM" : (a->flags & KFD_IOC_ALLOC_MEM_FLAGS_GTT) ? "GTT" : "OTHER",
                 (unsigned long long)a->size, a->flags, (unsigned long long)(up ? a->mmap_offset : 0), (unsigned long long)a->handle,
                 (unsigned long long)up_alive_n, (unsigned long long)(up_alive_bytes >> 20), ml);
-        if (up && want_bt) {
+        if ((up && want_bt) || want_bt >= 2) {
             void* f[24]; int k = backtrace(f, 24); char** s = backtrace_symbols(f, k);
             for (int i = 2; s && i < k; ++i) fprintf(out, "    bt %s\n", s[i]);
             free(s);
@@ -83,6 +84,23 @@ static void log_free(uint64_t handle) {
     pthread_mutex_unlock(&mu);
 }
 
+#ifdef AMDKFD_IOC_SVM
+// KFDEVMON_BT=2: every SVM range operation (hipHostRegister and friends) with its owner frames.
+static void log_svm(const struct kfd_ioctl_svm_args* a, int rc) {
+    pthread_mutex_lock(&mu);
+    char ml[400] = ""; maps_line(a->start_addr, ml, sizeof ml);
+    fprintf(out, "%.6f SVM op=%u start=%llx size=%llu rc=%d attrs", now_boot(), a->op, (unsigned long long)a->start_addr,
+            (unsigned long long)a->size, rc);
+    for (unsigned i = 0; i < a->nattr && i < 8; ++i) fprintf(out, " %u=%x", a->attrs[i].type, a->attrs[i].value);
+    fprintf(out, " | %s\n", ml);
+    void* f[24]; int k = backtrace(f, 24); char** s = backtrace_symbols(f, k);
+    for (int i = 2; s && i < k; ++i) fprintf(out, "    bt %s\n", s[i]);
+    free(s);
+    fflush(out);
+    pthread_mutex_unlock(&mu);
+}
+#endif
+
 int ioctl(int fd, unsigned long req, ...) {
     va_list ap; va_start(ap, req); void* arg = va_arg(ap, void*); va_end(ap);
     if (!real_ioctl) real_ioctl = (int (*)(int, unsigned long, ...))dlsym(RTLD_NEXT, "ioctl");
@@ -91,6 +109,12 @@ int ioctl(int fd, unsigned long req, ...) {
     const int rc = real_ioctl(fd, req, arg);
     if (out && req == AMDKFD_IOC_ALLOC_MEMORY_OF_GPU) log_alloc((struct kfd_ioctl_alloc_memory_of_gpu_args*)arg, rc);
     if (out && free_handle && rc == 0) log_free(free_handle);
+#ifdef AMDKFD_IOC_SVM
+    // The runtime adds the attribute bytes to the size field of the request number: match type and number only.
+    if (out && want_bt >= 2 && _IOC_TYPE(req) == _IOC_TYPE(AMDKFD_IOC_SVM) && _IOC_NR(req) == _IOC_NR(AMDKFD_IOC_SVM) &&
+        ((const struct kfd_ioctl_svm_args*)arg)->op == KFD_IOCTL_SVM_OP_SET_ATTR)
+        log_svm((const struct kfd_ioctl_svm_args*)arg, rc);
+#endif
     return rc;
 }
 
@@ -141,7 +165,7 @@ static void* smi_thread(void* unused) {
 
 __attribute__((constructor)) static void init(void) {
     const char* o = getenv("KFDEVMON_OUT"); if (!o || !*o) return;
-    const char* bt = getenv("KFDEVMON_BT"); want_bt = !(bt && bt[0] == '0');
+    const char* bt = getenv("KFDEVMON_BT"); want_bt = bt && bt[0] == '2' ? 2 : !(bt && bt[0] == '0');
     char p[512]; snprintf(p, sizeof p, "%s.%d", o, (int)getpid()); out = fopen(p, "w"); if (!out) return;
     struct timespec r; clock_gettime(CLOCK_REALTIME, &r);
     fprintf(out, "# kfdevmon pid=%d boot=%.6f real=%ld.%09ld\n", (int)getpid(), now_boot(), (long)r.tv_sec, r.tv_nsec); fflush(out);

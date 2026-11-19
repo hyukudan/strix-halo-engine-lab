@@ -111,10 +111,18 @@ void select_rows(float* block_scores, std::uint32_t max_blocks, std::uint32_t ro
 void attention(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
     const std::uint16_t* kv, float* scores, float* attention_output, const amdmath::Tables& tables, cudaStream_t stream,
     bool mma = false);
-// FAST form (Config::forms.qsa_mma): scores + softmax + values + gate in one flash kernel on BF16 tensor cores, FP32 accumulation.
-// Same selected[] / kv / q_gate inputs; no scores workspace. Numerically close to attention(), not bit-identical.
+// FAST form (Config::forms.qsa_mma, qwen-cuda-qsa-bf16mma-v2): scores + softmax + values + gate on BF16 tensor cores, FP32
+// accumulation, through the shared row-group core (4 rows walk the union of their selections; core/attention_rowgroup.cuh).
+// Same selected[] / kv / q_gate inputs; workspace >= attention_mma_workspace_bytes(rows) (attention() passes its scores
+// buffer). Numerically close to attention(), not bit-identical.
+[[nodiscard]] std::size_t attention_mma_workspace_bytes(std::uint32_t rows);
 void attention_mma(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
-    const std::uint16_t* kv, float* attention_output, cudaStream_t stream);
+    const std::uint16_t* kv, void* workspace, float* attention_output, cudaStream_t stream);
+// Exact fused form: scores + softmax + values + gate of one (KV head, row) in one block, bit-identical to attention()'s
+// three kernels. No scores workspace. attention() and layer_core_multi take it for prefill-shaped rows when
+// STRIX_QRTX_QSA_FUSED=1.
+void attention_fused(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,
+    const std::uint16_t* kv, float* attention_output, const amdmath::Tables& tables, cudaStream_t stream);
 
 // The three kernels of attention() separately (same arguments).
 void attention_scores(const float* q_gate, std::uint32_t rows, std::uint64_t first_position, const std::uint32_t* selected,

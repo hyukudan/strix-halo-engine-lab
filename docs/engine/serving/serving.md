@@ -201,6 +201,68 @@ win, including with that environment switch set. `--baseline` / `STRIX_BASELINE=
 the automatic T and the 1024-row checkpoint default. Inspect `--print-effective-config` for T,
 `serve_automatic_prefill` and `prefix_cache_block_rows`.
 
+An explicit tiled server owner keeps the uniform row layout: every one of its T rows holds its own
+logits and QSA block scores. The bounded QSA score ring and the terminal logits stripe belong to
+the single-request command (`compact_prompt_memory`) and are not command-line options. The server's
+workspace is therefore T times the per-row arena, independent of the context: on Qwen3.8 Flash
+the CPU plan test measures 998,400 bytes per row, i.e. 8,178,892,800 bytes at T = 8192 and
+1,022,361,600 bytes at T = 1024, so `--known-prefix-workspace-budget-bytes 4294967296` refuses
+T8192 and `8589934592` admits it. A refusal prints T, the bytes needed and per row, the budget,
+the layout and the largest row buffers. Prefer the automatic owner: omit the tiled flags and
+budgets, keep the MTP calibration, golden, sidecar, pins and window budgets, and read the
+`Qwen serve-prefill:` line printed at load for the reason whenever it declines. A server with
+low-level organization flags keeps their organization instead of the single-request decode
+profile; without them it takes that profile, which is qualified at context 8192, so a longer
+explicit `--context` also needs `--unqualified-context` (the single-request rule).
+
+### One node: explicit-sidecar MTP recipe
+
+The MTP target windows of a sidecar recipe (for example
+`recipes/qwen-distill-g-yarn.mtp-bundle.json`, passed as `--mtp` plus its pins) run on a fixed
+target organization, and the server checks it before loading the model, naming the missing
+flags: the D1/paired wave8 GDN and A8/grouped Q5_1/slot-parallel-down flags, the six hyper-mix
+flags (window hyper-mix), and `--virtual-q8-lm-head --prefetch-q8-lm-head` (the greedy window
+rows run on that LM head; the automatic owner adds the prefetch itself unless `STRIX_SERVE_ROUTE=0`,
+an explicit T needs it). Runs that build no window (`--mtp-golden-dump`, a fixed single-request
+session) are not held to the hyper-mix and LM-head checks.
+The calibration golden is dumped once with the tiled single-request command, so that its
+calibration rows are those the server replays (a golden from a non-tiled command is refused with
+`calibration row geometry differs`):
+
+```bash
+ORG=(--deferred-moe-status --virtual-q8-gdn-input --prefetch-q8-gdn-input
+  --virtual-q8-gdn-output --wave8-q8-gdn-input --wave8-q8-gdn-output
+  --q4k-a8g32-gate-up --grouped-exact-q51-down --q51-slot-parallel-down
+  --parallel-hyper-mix --staged-hyper-projections --fused-staged-hyper-mix
+  --typed-fused-hyper-projections --prefetch-typed-hyper-rows --prefetch-q8-hyper-output
+  --virtual-q8-lm-head --prefetch-q8-lm-head)
+# MTP=(--mtp ...the recipe's pins as flags...); IDS = the calibration token ids
+strix-hip-decode-token MODEL.gguf "${IDS[@]}" --generate 64 --context 33280 "${MTP[@]}" "${ORG[@]}" \
+  --known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows 8192 \
+  --known-prefix-workspace-budget-bytes 8589934592 \
+  --known-prefix-host-metadata-budget-bytes 2147483648 \
+  --known-prefix-uma-budget-bytes 128849018880 \
+  --known-prefix-host-headroom-bytes 4294967296 \
+  --mtp-golden-dump GOLDEN            # prints mtp_golden_sha256
+STRIX_SERVE_T16K=0 strix-hip-decode-token MODEL.gguf "${IDS[@]}" --generate 64 \
+  --context 33280 --http-batch 4 "${MTP[@]}" "${ORG[@]}" \
+  --mtp-golden GOLDEN --mtp-golden-sha256 SHA \
+  --http-serve --http-bind 127.0.0.1 --http-port 8082
+```
+
+On one 124 GiB Strix Halo node with the 111.3 GB UD-Q4_K_XL target and the distill-G sidecar,
+the server line reads `Qwen serve-prefill: automatic T8192`, four slots are built and
+`strix serve: listening` follows after 37 s (first chat request answered; 34-94 s across the seven
+verified automatic and explicit-T starts). For an explicit T add
+`--known-prefix-window --known-prefix-full-rows --known-prefix-prefill-rows T` with all four
+budgets: workspace at least T x 998,400 bytes (8,178,892,800 at T8192, so 4 GiB is refused
+with the message above and 8 GiB admits it), metadata
+2 GiB, UMA as above or the node's explicit value, host headroom 4 GiB. The headroom must cover the
+native prefill pools, about 2.5 GB at T16 and 3.6 GB at T8192; 1 GiB is refused with
+`known prefill native pools exceed --known-prefix-host-headroom-bytes; required N`.
+Explicit rows started this way: context 33,280 and 8,192 at T8192, 16,384 at T1024 and T16,
+8,192 at T16.
+
 GPU service, nesting and slots gates reported EXACT against sequential explicit T2048: complete
 IDs and committed target state matched; service/nesting also checked prompt state, and slots
 covered 1/2/4/8 clients. Every default startup selected automatic T8192. These gates do not

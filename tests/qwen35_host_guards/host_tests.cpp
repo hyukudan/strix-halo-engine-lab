@@ -1,5 +1,6 @@
 #include "strix/qwen35/cuda_engine.hpp"
 #include "strix/cuda_core/nvfp4.hpp"
+#include "strix/profiles/qwen_dense_cuda.hpp"
 #include "../../src/core/dense_linear.hpp"
 #include "../../src/cuda_core/dense/dense_mma.hpp"
 #include <algorithm>
@@ -109,6 +110,85 @@ int main() {
     auto identity = engine_identity(a);
     cc::set_dense_arith(cc::DenseArith::fp32);
     check(engine_identity(a) == identity, "identity immutable under global selector");
+    {  // --prefill-gdn: strict spelling; chunk16 is a FAST identity on non-exact prefill policies only
+        namespace q = strix::qwen35;
+        check(q::parse_prefill_gdn("serial") == q::PrefillGdn::serial, "prefill-gdn serial");
+        check(q::parse_prefill_gdn("chunk16") == q::PrefillGdn::chunk16, "prefill-gdn chunk16");
+        for (const char* bad : {"", "chunk", "Chunk16", "chunk16 ", "auto"})
+            check(rejects([&] { (void)q::parse_prefill_gdn(bad); }), "prefill-gdn rejects other spellings");
+        q::EngineOptions f = a;
+        f.prefill_arith = q::PrefillArith::fast4;
+        const std::string serial_id = engine_identity(f);
+        f.prefill_gdn = q::PrefillGdn::chunk16;
+        const std::string chunk_id = engine_identity(f);
+        check(serial_id.ends_with("-pf-fast4") && chunk_id == serial_id + "-gdnc16", "chunk16 FAST identity suffix");
+        f.prefill_arith = q::PrefillArith::exact;
+        check(engine_identity(f).find("gdnc16") == std::string::npos, "chunk16 ignored under the exact prefill policy");
+    }
+    {  // --prefill-norm-fold: strict on|off; bitwise scheduling of bytes -> never part of the engine identity
+        namespace q = strix::qwen35;
+        check(q::parse_prefill_norm_fold("on") && !q::parse_prefill_norm_fold("off"), "prefill-norm-fold on|off");
+        for (const char* bad : {"", "1", "ON", "auto", "on "})
+            check(rejects([&] { (void)q::parse_prefill_norm_fold(bad); }), "prefill-norm-fold rejects other spellings");
+        q::EngineOptions f = a;
+        f.prefill_arith = q::PrefillArith::fast4;
+        check(f.prefill_norm_fold, "prefill-norm-fold default on (bitwise, measured)");
+        const std::string off_id = engine_identity(f);
+        f.prefill_norm_fold = false;
+        check(engine_identity(f) == off_id, "prefill-norm-fold keeps the FAST4 identity (bitwise)");
+    }
+    {  // NVFP4 split-K policy -> identity on the real EngineOptions (review condition 2): EXACT has no "-skf1"; FAST ends in
+       // "-skf1" for every NVFP4 source; without NVFP4 weights FAST and EXACT are one identity; qp::apply sets the option.
+        namespace q = strix::qwen35;
+        namespace qp = strix::qwen35::profile;
+        for (const q::TurboWeights w : {q::TurboWeights::native, q::TurboWeights::onfly, q::TurboWeights::converted}) {
+            q::EngineOptions f;
+            f.turbo_weights = w;
+            const std::string exact_id = engine_identity(f);
+            check(exact_id.find("skf1") == std::string::npos, "default identity carries no -skf1");
+            f.nvfp4_split = strix::split_k::Profile::fast;
+            check(engine_identity(f) == exact_id + "-skf1", "FAST split identity = EXACT identity + -skf1");
+        }
+        q::EngineOptions off;
+        off.turbo_weights = q::TurboWeights::off;
+        const std::string off_id = engine_identity(off);
+        off.nvfp4_split = strix::split_k::Profile::fast;
+        check(engine_identity(off) == off_id, "turbo off: split policy is not part of the identity (no NVFP4 tensor)");
+        for (const char* word : {"fast", "default"}) {
+            q::EngineOptions o;
+            o.turbo_weights = q::TurboWeights::converted;
+            const auto r = qp::resolve(strix::profile::parse(word), qp::regime_of(o, qp::Route::windows, 300), {});
+            qp::apply(o, *r);
+            const bool fast = std::string_view(word) == "fast";
+            check((o.nvfp4_split == strix::split_k::Profile::fast) == fast, "qp::apply on EngineOptions sets nvfp4_split");
+            check(engine_identity(o).ends_with("-skf1") == fast, "resolved tier -> identity suffix");
+        }
+    }
+    {  // FAST decode attention (decode_attn8): own identity suffix "-d8" on every weight source; the registry row is pending
+       // (no qualified regime yet), so `fast` alone leaves it off and only the explicit --decode-attn8 on sets it.
+        namespace q = strix::qwen35;
+        namespace qp = strix::qwen35::profile;
+        for (const q::TurboWeights w : {q::TurboWeights::off, q::TurboWeights::native, q::TurboWeights::converted}) {
+            q::EngineOptions o;
+            o.turbo_weights = w;
+            const std::string id = engine_identity(o);
+            check(id.find("-d8") == std::string::npos, "default identity carries no -d8");
+            o.decode_attn8 = true;
+            check(engine_identity(o).find("-d8") != std::string::npos && engine_identity(o) != id, "decode_attn8 -> -d8 identity");
+        }
+        for (const auto route : {qp::Route::large_prefill, qp::Route::windows}) {
+            q::EngineOptions o;
+            o.turbo_weights = q::TurboWeights::converted;
+            const auto r = qp::resolve(strix::profile::parse("fast"), qp::regime_of(o, route, 65536), {});
+            qp::apply(o, *r);
+            check(!o.decode_attn8, "fast without a qualified decode_attn8 row leaves it off");
+            q::EngineOptions e;
+            e.turbo_weights = q::TurboWeights::converted;
+            const auto re = qp::resolve(std::nullopt, qp::regime_of(e, route, 65536), {{"decode_attn8", "on"}});
+            qp::apply(e, *re);
+            check(e.decode_attn8 && engine_identity(e).find("-d8") != std::string::npos, "--decode-attn8 on sets the option");
+        }
+    }
     check(portable_sampler() == 0, "POSIX clock sampler compiles and closes");
     check(std::isinf(maxrel({NAN}, {0.0})) && std::isinf(maxrel({0.0F}, {INFINITY})), "nonfinite qualification rejection");
     return failures ? 1 : 0;

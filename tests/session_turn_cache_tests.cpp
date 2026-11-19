@@ -570,6 +570,27 @@ void runtime_restore_faults() {
             if (mode == 2) { auto k = e.store.acquire(); CHECK(k.slot != 0); e.fail_release = false; e.store.release(k); }
         }
     }
+    // Ordinary prompt-restart cache (no completed turns): a declined restore is a
+    // miss and a throwing restore is restore_failed, never a hit.
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        TurnEngine e; e.limits.prefix_cache = true; sv::GenerationQueue q; auto h = turn_hooks(e);
+        h.prompt_restart_cache = true;
+        h.prompt_checkpoint = [&e](const sv::SessionView& v, sv::SessionCheckpoint b) {
+            if (b != sv::SessionCheckpoint::terminal) return false;
+            auto k = v.state; e.commit_pending(k); return true;
+        };
+        auto p = turn_policy(); p.completed_turns = false;
+        sv::SessionRuntime r(q,e,e.store,p,h);
+        CHECK(execute(r,q,request()).error.empty() && r.cache_entries() == 1 && r.cache_stats().misses == 1);
+        auto ids = e.sealed_tokens; ids.push_back(77);
+        e.decline_restore = mode == 0; e.fail_restore = mode == 1;
+        const auto out = execute(r,q,request(ids));
+        const auto s = r.cache_stats();
+        CHECK(e.restores == 1);
+        if (mode == 0) CHECK(out.error.empty() && out.stats.cached_tokens == 0 && s.hits == 0 && s.misses == 2 && !s.restore_failed);
+        if (mode == 1) CHECK(!out.error.empty() && s.hits == 0 && s.misses == 1 && s.restore_failed == 1);
+        if (mode == 2) CHECK(out.error.empty() && out.stats.cached_tokens == ids.size() - 1 && s.hits == 1 && s.misses == 1);
+    }
     // Capture failure after an earlier admission cannot evict that checkpoint.
     {
         TurnEngine e; sv::GenerationQueue q; sv::SessionRuntime r(q,e,e.store,turn_policy(),turn_hooks(e));

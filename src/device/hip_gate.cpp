@@ -1,10 +1,14 @@
 #include "strix/device/hip_gate.hpp"
 
 #include "strix/device/hip_enumerator.hpp"
+#include "strix/device/process_topology.hpp"
+#include "strix/device/runtime_host_memory.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/power/sampler.hpp"
 #include "strix/route_receipt.hpp"
 
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <mutex>
 #include <optional>
@@ -46,15 +50,50 @@ const Bound& bind_hip(Request request, const std::string& devices_path, std::FIL
     return *state.bound;
 }
 
-void bind_hip_main(int& argc, char** argv, std::FILE* receipt, CodeLoad code_load) {
+void bind_hip_main(int& argc, char** argv, std::FILE* receipt, CodeLoad code_load, HostRegistration registration) {
+    // Runtime host memory mode first (runtime_host_memory.hpp): the eager-code restart then carries every value in one
+    // exec. Still here afterwards with values this image inserted: restart for them, or roll them back.
+    // The default applies where the device memory is host memory, to binaries that register only their own pinned pages.
+    // Binaries that register the model FILE mapping (HostRegistration::model_file: apps/hip_decode_token_main.cpp,
+    // apps/hip_model_residency_main.cpp; src/hip_model_residency.cpp create_impl) decline it and refuse "1": with
+    // HSA_USE_SVM=0 that registration is refused ("hipHostRegister(model range): invalid argument", measured 8K one node,
+    // 2 of 2 runs). Their GPU-visible file pages are kept from evicting by registered_backing_lifetime.hpp's lock order.
+    // Independent of the code-load policy (CodeLoad only decides who applies eager code loading).
+    const bool host_pages_default = runtime_host_pages_default(registration, kfd_gpus_share_host_memory());
+    unsigned host_pages_inserted = 0;
+    try {
+        host_pages_inserted = apply_runtime_host_driver_pages(
+            [](const char* name) { return strix::envcfg::text(name); },
+            [](const char* name, const char* value) { return ::setenv(name, value, 0) == 0; }, host_pages_default, registration);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "%s\n", e.what());
+        std::fflush(stderr);
+        std::exit(2);
+    }
     eager_code_load_or_restart(argv, code_load);  // before anything touches the device: the restart repeats the process
+    if (const int error = finish_runtime_host_driver_pages(host_pages_inserted,
+            [](const char* name) { return ::unsetenv(name) == 0; }, [&] { return restart_own_image(argv); }))
+        std::fprintf(stderr, "runtime host memory: restart failed (%s); continuing with user pages\n", std::strerror(error));
+    {  // effective config: the lever with the mode this image really runs in (the same line for every entry point)
+        const char* policy = strix::envcfg::text("STRIX_HOST_DRIVER_PAGES");  // recorded again below with the effective mode
+        strix::envcfg::record("STRIX_HOST_DRIVER_PAGES", policy != nullptr && *policy != '\0' ? policy : nullptr,
+                              runtime_host_memory_is_driver_pages(std::getenv(kRuntimePagedMemory)) ? "1" : "0");
+    }
     if (receipt && code_load == CodeLoad::shared) std::fprintf(receipt, "%s\n", code_load_receipt(code_load).c_str());
+    if (receipt) {
+        const std::string line = runtime_host_memory_receipt([](const char* name) { return strix::envcfg::text(name); },
+                                                             runtime_host_memory_restart_error(), host_pages_default);
+        if (!line.empty()) std::fprintf(receipt, "%s\n", line.c_str());
+    }
     try {
         const auto cli = take_command_line(argc, argv);
         Request request;
         request.select = cli.select;
         request.profile = cli.profile;
         (void)bind_hip(std::move(request), cli.devices_path, receipt);
+        // Node topology (strix-topology-v1): keep --topology/--node for the family; `topology:` beside `device:`.
+        keep_topology_command_line(take_topology_command_line(argc, argv));
+        if (const auto line = gate_topology_line(argc, argv); receipt && !line.empty()) std::fprintf(receipt, "%s\n", line.c_str());
     } catch (const std::exception& e) {
         std::fprintf(stderr, "%s\n", e.what());
         std::fflush(stderr);

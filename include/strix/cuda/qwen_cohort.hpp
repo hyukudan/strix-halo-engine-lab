@@ -261,6 +261,9 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
     const bool batch = o.draft_batch < 0 ? draft_batch_default() : o.draft_batch != 0;
     std::vector<qp::DraftRequest> requests(n);
     std::uint32_t chains = 0;
+    // Config::defer_prompt_mtp: a session whose prompt MTP rows are still deferred verifies its pending token alone
+    // (the first token never depends on drafts); its rows are enqueued after this step's tokens, for the next drafts.
+    std::vector<char> deferred(n, 0);
     for (std::uint32_t i = 0; i < n; ++i) {
         auto& s = streams[i];
         rows[i].push_back(s.pending);
@@ -268,6 +271,10 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
         out[i].window_sessions = m;
         std::uint32_t depth = o.mtp ? draft_depth_cap(m, o.depth, o.policy, o.budget) : 0U;
         if (s.depth_max) depth = std::min(depth, s.depth_max);
+        if (o.mtp && p.mtp_deferred(s.session)) {
+            depth = 0;
+            deferred[i] = 1;
+        }
         requests[i] = {s.session, s.pending, depth, o.min_p};
     }
     // copy-first: a gated context span replaces this stream's MTP chain (no predictor forward)
@@ -442,6 +449,8 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
         }
         else if (room[i] > 0) c->mtp_expected = c->mtp_expected < 0.0 ? static_cast<double>(out[i].mtp_accepted) : 0.75 * c->mtp_expected + 0.25 * static_cast<double>(out[i].mtp_accepted);
     }
+    for (std::uint32_t i = 0; i < n; ++i)
+        if (deferred[i] && !out[i].failed) p.mtp_settle(streams[i].session);  // no host wait
     if (timing) {
         timing->draft_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
         timing->verify_ms += std::chrono::duration<double, std::milli>(Clock::now() - t1).count();

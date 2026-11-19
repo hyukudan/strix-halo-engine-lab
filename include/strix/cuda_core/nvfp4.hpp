@@ -23,6 +23,7 @@
 // warp partials in ascending order (the split count depends only on (out, in), never on rows), then * gscale, then the
 // optional residual add: rows 1..32 are bitwise identical to rows 1. Activations must satisfy |x| < 65504.
 #include "strix/cuda_core/types.hpp"
+#include "strix/split_k_policy.hpp"
 #include <vector>
 
 namespace strix::cuda_core {
@@ -81,6 +82,16 @@ cudaError_t nvfp4_reserve_workspace(std::size_t bytes, cudaStream_t stream = nul
 void nvfp4_release_workspace(cudaStream_t stream);
 // Tuning/test hook: target number of blocks used to pick the split-K factor (default 1000; 0 = default).
 void nvfp4_set_split_target(std::uint32_t warps);
+// Split-K policy of the process (strix/split_k_policy.hpp): false = EXACT (target 1000 for every shape, today's bits),
+// true = FAST nvfp4-splitk-fast-v1 (per-shape targets keyed by the current device's SM count + compute capability; shapes
+// or devices without a row keep 1000). Process-wide like the target; set before workspaces, graphs and prefill tables.
+cudaError_t nvfp4_set_split_profile(bool fast);
+// Identity of the effective policy on the device last set (nvfp4-splitk-exact-v1 | nvfp4-splitk-fast-v1).
+const char* nvfp4_split_identity();
+// Device key of the last nvfp4_set_split_profile (units = SM count, arch = 10 * major + minor); {0, 0} before any set.
+split_k::Device nvfp4_split_device();
+// Device key of the current device (what nvfp4_set_split_profile would record).
+cudaError_t nvfp4_device_key(split_k::Device* key);
 // Split-K factor used for (out, in) (diagnostics / tests).
 std::uint32_t nvfp4_split_k(std::uint32_t out, std::uint32_t in);
 

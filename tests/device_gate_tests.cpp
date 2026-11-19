@@ -434,6 +434,39 @@ void code_load() {
     require(split_process_arguments(std::string_view("a\0\0b\0", 5)) == std::vector<std::string>{"a", "", "b"} &&
                 split_process_arguments("cut").empty(), "code load: restart arguments");
 }
+void cuda_code_load() {
+    // CUDA start gate policy (bind_cuda): EAGER unless STRIX_EAGER_CODE_LOAD=0 or CUDA_MODULE_LOADING is already set.
+    std::vector<std::string> puts;
+    auto put = [&](const char* name, const char* value) { puts.push_back(std::string(name) + "=" + value); return true; };
+    auto env = [](const char* strix, const char* cuda) {
+        return [=](const char* name) -> const char* {
+            return std::string(name) == "STRIX_EAGER_CODE_LOAD" ? strix : std::string(name) == "CUDA_MODULE_LOADING" ? cuda : nullptr;
+        };
+    };
+    require(apply_eager_cuda_module_loading(env(nullptr, nullptr), put) && puts == std::vector<std::string>{"CUDA_MODULE_LOADING=EAGER"},
+        "cuda code load: default sets CUDA_MODULE_LOADING=EAGER");
+    require(apply_eager_cuda_module_loading(env("1", nullptr), put) && puts.size() == 2U, "cuda code load: STRIX_EAGER_CODE_LOAD=1 is eager");
+    require(!apply_eager_cuda_module_loading(env("0", nullptr), put), "cuda code load: STRIX_EAGER_CODE_LOAD=0 declines");
+    require(!apply_eager_cuda_module_loading(env(nullptr, "LAZY"), put), "cuda code load: an explicit LAZY wins");
+    require(!apply_eager_cuda_module_loading(env("1", ""), put), "cuda code load: an explicit (empty) value is never overwritten");
+    require(puts.size() == 2U, "cuda code load: declined calls set nothing");
+    rejects([&] { (void)apply_eager_cuda_module_loading(env(nullptr, nullptr), [](const char*, const char*) { return false; }); },
+        "cannot configure", "cuda code load: a refused setenv is an error");
+    require(cuda_code_load_receipt(env(nullptr, "EAGER"), true) == "code load: eager (CUDA_MODULE_LOADING=EAGER, start gate)",
+        "cuda code load: gate receipt");
+    require(cuda_code_load_receipt(env(nullptr, "LAZY"), false) == "code load: CUDA_MODULE_LOADING=LAZY (environment)",
+        "cuda code load: environment receipt");
+    require(cuda_code_load_receipt(env("0", nullptr), false) == "code load: lazy (STRIX_EAGER_CODE_LOAD=0)", "cuda code load: declined receipt");
+    require(cuda_code_load_receipt(env(nullptr, nullptr), false) == "code load: lazy (driver default)", "cuda code load: default receipt");
+    // The real process environment: the gate's put (set_process_environment) makes the value visible to the driver's getenv.
+    set_env("CUDA_MODULE_LOADING", "");
+    set_env("STRIX_EAGER_CODE_LOAD", "");
+    const auto real = [](const char* name) -> const char* { const char* v = strix::envcfg::text(name); return v && *v ? v : nullptr; };
+    require(apply_eager_cuda_module_loading(real, [](const char* name, const char* value) { set_process_environment(name, value); return true; }) &&
+                real("CUDA_MODULE_LOADING") && std::string(real("CUDA_MODULE_LOADING")) == "EAGER", "cuda code load: process environment holds EAGER");
+    require(!apply_eager_cuda_module_loading(real, put), "cuda code load: second call keeps the value");
+    set_env("CUDA_MODULE_LOADING", "");
+}
 } // namespace
 
 int main() {
@@ -451,6 +484,7 @@ int main() {
         units();
         host_wait();
         code_load();
+        cuda_code_load();
     } catch (const std::exception& e) {
         std::cerr << "device gate tests: " << e.what() << '\n';
         return 1;

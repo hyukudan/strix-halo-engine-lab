@@ -1,4 +1,5 @@
 #include "../src/minimax/model_graph.hpp"
+#include "strix/prefill_row_liveness.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -50,6 +51,9 @@ int main(int argc, char** argv) {
         const auto g = mm::build_model_graph(d);
         const auto original = mg::canonical(g);
         check(g.layers.size() == 60 && g.attachments.empty(), "trunk/attachment inventory");
+        // Row liveness (strix/prefill_row_liveness.hpp): every trunk layer declares state, so prompt rows stop nowhere early.
+        { const auto lp = strix::prefill_liveness::plan_graph(g, {.taps = {}, .every_row = false, .head_row = false, .tail_row_invariant = false});
+          check(!lp.cut() && lp.cache_only_last && strix::prefill_liveness::skipped_row_layers(lp, 512) == 0, "row liveness: no layer above the last state owner"); }
         check(g.dimensions.at("dims.hidden") == 6144 && !g.dimensions.contains("dims.vocab_rank_pad"), "model vs physical dimensions");
         check(original == mg::canonical(mm::build_model_graph(d)) && mg::identity(g).size() == 16, "stable canonical identity");
         for (const auto& l : g.layers) {

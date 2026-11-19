@@ -24,12 +24,29 @@ Solo necesitas esta página para inspeccionar una ruta, depurar o llevar el moto
 
 | Perfil | Qué hace |
 |---|---|
-| `--profile default` | Ruta de producción actual; no exporta cambios de perfil. Es el valor por defecto. |
-| `--profile fast` | Añade solo opciones cualificadas que cambian bits. Las filas aún no cualificadas siguen apagadas (ver `--allow-pending`). |
+| `--profile exact` (alias `default`) | Ruta de producción actual; no exporta cambios de perfil. Es el valor por defecto. |
+| `--profile fast` | Añade todas las opciones cualificadas que cambian bits y las filas elegidas para fast antes de su recibo (marcadas "qualification in progress" en el recibo). Las demás siguen apagadas (ver `--allow-pending`). MiniMax: el paquete cualificado `mm-fast-pf-v2` (los mismos miembros e identidad de prefill que `STRIX_MM_FAST_PREFILL=1`; rechazado con `--baseline`). Par GLM: nada (`STRIX_GLM_PF_WMMA` no está cualificado para fast: su conjunto FAST de prefill falla la puerta de calidad a 8K; solo corre si se pone explícitamente). Par DeepSeek: el paquete FAST y sus palancas Engram / experto compartido / MoE FP16 siguen explícitos hasta su puerta de calidad. Un interruptor puesto, `0` incluido, manda. |
 | `--profile quality` | Un pack de mayor precisión donde existe (Nemotron EXL3). Si no, igual que `default`. |
+| `--profile` en `strix-cuda-ds41-prefill-service` | Servicio de prefill DS41 RTX: acepta la misma palabra (`exact`/`default`, `fast`; `STRIX_DS41_PROFILE`) y `--allow-pending` que la réplica, con el mismo resolutor (`strix/profiles/ds41_rtx.hpp`). Hoy todas las filas fast están pendientes (listadas en `levers`, nunca usadas), así que `fast` se ejecuta como `exact`. |
 
-Existen perfiles con nombre para Qwen, el par DeepSeek, Gemma4/Nemotron y `strix-glm5-rank`.
-MiniMax no tiene perfiles de producto con nombre: `--profile NAME:PROMPT.u32:STEPS` ejecuta una sesión con tiempos.
+Existen perfiles con nombre para Qwen, el par DeepSeek, Gemma4/Nemotron y `strix-glm5-rank`. Todos los analizadores de la palabra, Gemma 4 y el productor GLM RTX incluidos, aceptan `exact` (= `default`) con el analizador compartido; los motores sin columna TURBO rechazan `turbo` con ese motivo.
+MiniMax acepta las mismas palabras (`--profile exact|fast|...`); `--profile NAME:PROMPT.u32:STEPS` sigue ejecutando una sesión con tiempos.
+Las CLI CUDA de Qwen denso 27B (`strix-cuda-qwen35-decode`, `strix-cuda-qwen35-spec`) aceptan la misma palabra, `--profile exact|default|fast|quality`
+(`exact` = `default`; `turbo` se rechaza: este motor aún no tiene barra TURBO). Una sola tabla, `include/strix/profiles/qwen_dense_cuda.hpp`, resuelta por
+el resolvedor compartido para ambas CLI: `fast` enciende cada palanca solo en el régimen donde pasó su gate; una opción explícita gana y
+`exact` no cambia nada (mismas opciones, mismos bytes de `--print-effective-config`). Con `fast` la configuración efectiva añade un bloque
+`profile:` (cada palanca, su estado, la identidad que enciende una fila `profile` y por qué una fila pendiente sigue apagada) y un
+`profile-fingerprint`. La identidad del motor nombra cada palanca aplicada.
+
+| Palanca (opción) | `fast` la enciende cuando | Interruptor de apagado |
+|---|---|---|
+| `--prefill-arith fast4` | prefill grande de la CLI de decode, `--turbo-weights onfly\|converted` (gate W4A4 8K/32K superado) | `--prefill-arith exact` |
+| `--prefill-gdn chunk16` | mismo régimen (cualificado junto con FAST4) | `--prefill-gdn serial` |
+| `--prefill-attn8 on` | mismo régimen, prompt de al menos 32.768 tokens (gate 32K superado; sin gate 8K) | `--prefill-attn8 off` |
+| `--split-k fast` | CLI spec (ventanas de decode), `--turbo-weights onfly\|converted`: FAST `nvfp4-splitk-fast-v1` (gate superado; verify de spec 0,6-0,7 % más rápido). CLI de decode: pendiente (su `fast` ya aplica FAST4; esa combinación aún no tiene gate) | `--split-k exact` |
+| `--decode-attn8 on` | pendiente en ambas CLI (sin régimen cualificado: gate a 8K / 28K / 64K sin ejecutar). Atención de decode / verify en tensor cores e4m3 sobre la sombra e4m3 del K/V, identidad `-d8`; las filas de verify dan los mismos bits que el decode de una fila; en la CLI spec cubre también las ventanas de prefill. `--decode-attn8 on` explícito lo ejecuta en cualquier régimen | `--decode-attn8 off` |
+
+La CLI spec hace el prefill con ventanas de decode, así que allí solo se ofrecen `split_k` y `decode_attn8`.
 GLM rank acepta `--profile default|fast|quality` (también `--profile=NAME`); `--profile` sin valor sigue activando
 los tiempos de kernels y se puede combinar con un perfil con nombre. En GLM, `fast` solo activa `STRIX_GLM_PF_WMMA=1`;
 un valor explícito del entorno prevalece y `--baseline` / `STRIX_GLM_BASELINE=1` veta la adición del perfil.
@@ -101,6 +118,9 @@ Las tablas listan los flags seleccionados. La lista completa de variables de ent
 | `--prefill auto` | glm | `auto` | Elige la ruta de prefill. | - |
 | `--prefill-chunk N` | glm | 512 | Tamaño de chunk de prefill en filas. | Mayor con más cómputo; menor con menos memoria. |
 | `--prefill-path device` | deepseek serve | `device` | Prefill en la GPU. | - |
+| `--wide-exact N` | qwen (app decode HIP 27B) | off (ventanas de 16 filas) | Ventanas de prefill EXACT de N filas, cada fila bit a bit igual al resultado de 16 filas; solo si todas las proyecciones densas grandes son IU4 (otros formatos resuelven a 16 filas). `--wide N` (> 16) es la clase FAST ancha. [Detalles](optimizations.md#qwen27-hip-decode-step). | 64 es el mejor medido en Strix (la atención exacta cuesta más por fila en rejillas más anchas). |
+| `--prefill-rows N`, `--prefill-exact` | qwen (app spec HIP 27B) | ventanas EXACT de 64 filas (proyecciones densas IU4; 16 filas en otro caso) | `--prefill-rows 16` = ventanas de 16 filas; N > 16 = la clase FAST ancha salvo con `--prefill-exact`. [Detalles](optimizations.md#qwen27-hip-decode-step). | - |
+| `--profile exact\|fast` | qwen (apps decode y spec HIP 27B) | `exact` (= `default`) | Palabra de nivel; `exact` no cambia nada. `fast` elige ventanas de prefill FAST anchas de 64 filas cuando pase su gate compuesto; hasta entonces queda pendiente (se informa, no se aplica) salvo `--allow-pending`. `--wide N` / `--prefill-rows N` mandan sobre la palabra. | App pair: sin enlazar (su `--wide 512` ya es la clase FAST). |
 | `--vision FILE` | deepseek serve (rank 0) | desactivado | Entrada de imágenes: carga el GGUF de visión y acepta partes `image_url`. Requiere `--prefill-path device`. [Entrada de imágenes](engine/vision.es.md). | - |
 | `STRIX_VISION_RESIDENT` | deepseek serve | 1 | `1`: la torre de imagen se sube al arrancar; `0`: con la primera imagen. | `0` para dejar la memoria libre hasta que llegue una imagen. |
 | `STRIX_VISION_CACHE_MIB` | deepseek serve | 256 | Tamaño en MiB de la caché de embeddings de imagen; `0` desactiva el almacenamiento. | Mayor si las mismas imágenes se repiten. |
@@ -110,6 +130,7 @@ Las tablas listan los flags seleccionados. La lista completa de variables de ent
 | Flag | Motor | Por defecto | Qué hace | Cuándo lo quiere otro hardware |
 |---|---|---|---|---|
 | `--mtp-bundle`, `--rope-yarn 2\|4 --context C` | qwen | - | Bundle de draft MTP; YaRN para contexto largo. | - |
+| `--prelaunch 0\|1` | qwen-rtx (CLI spec densa 27B) | `0` | Lanza el verify detrás del draft MTP alimentado en el dispositivo (mismos ids). | - |
 | `--mtp 0\|1` | glm | resuelto (ver `--print-effective-config`) | Apaga o enciende el draft MTP. | `0` cuando falta memoria. |
 | `--identity r1b\|r1` | glm | `r1b` | Identidad de decode. | `r1` para comparar. |
 | `--dspark`, `--no-dspark`, `--dspark-vocab auto\|full` | deepseek | on si se encuentra el draft | Draft especulativo DSpark. | `--no-dspark` cuando falta memoria. |
@@ -220,7 +241,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_HOST_WAIT` | qwen | block | [host-wait-policy](optimizations.md#host-wait-policy) |
 | `STRIX_SESSION_CACHE` | minimax | on (two-node serve route) | [mm-sessions](optimizations.md#mm-sessions) |
 
-### Prefill (97)
+### Prefill (98)
 
 | Toggle | Motor | Por defecto | Detalles |
 |---|---|---|---|
@@ -343,12 +364,16 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_SERVE_PREFILL_GROUP` | deepseek (par) | auto | varios prompts cortos admitidos a la vez comparten una pasada de prefill en el dispositivo; `0` = una pasada por prompt; `STRIX_SERVE_PREFILL_GROUP_MEMBERS` (2..64) limita un grupo; [página de DeepSeek](models/deepseek-v4.1/README.es.md) |
 | `STRIX_SERVE_T16K` | qwen | ON: T16384 owner when the context admits a 32,768-token request and every resident slot fits; `0` keeps T8192 | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 | `STRIX_SERVE_FP16_MTP` | qwen | ON: explicit-sidecar MTP servers keep the automatic FP16 prefill arithmetic with the unqualified fast options off; `0` declines it | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
+| `STRIX_QRTX_PLE_A8` | qwen-rtx | off (opt-in con `--profile fast`, gate FAST pendiente) | [qwen-rtx-ple-a8](optimizations.md#qwen-rtx-ple-a8) |
 
-### Decode, MTP y DSpark (22)
+### Decode, MTP y DSpark (25)
 
 | Toggle | Motor | Por defecto | Detalles |
 |---|---|---|---|
 | `STRIX_BATCH_TOOL_DRAFT` | qwen | ON (batched decoding) | [qwen-tool-draft](optimizations.md#qwen-tool-draft) |
+| `STRIX_DECODE_ATTN_ROW_SHARE` | qwen (27B HIP) | 1 | [qwen27-hip-decode-attn-row-share](optimizations.md#qwen27-hip-decode-attn-row-share) |
+| `STRIX_DECODE_ATTN_ROW_SHARE` | qwen (27B CUDA) | 1 | [qwen27-cuda-decode-attn-row-share](optimizations.md#qwen27-cuda-decode-attn-row-share) |
+| `STRIX_DECODE_FUSE` | qwen (27B HIP) | 1 | [qwen27-hip-decode-step](optimizations.md#qwen27-hip-decode-step) |
 | `STRIX_DS41_DECODE_PREFETCH` | deepseek | auto | [ds-prefetch](optimizations.md#ds-prefetch) |
 | `STRIX_DS41_DEFER_DECODER` | deepseek | on | [ds-defer-decoder](optimizations.md#ds-defer-decoder) |
 | `STRIX_DS41_DSPARK_CALIB` | deepseek | auto | [ds-warm](optimizations.md#ds-warm) |
@@ -362,6 +387,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_MM_SERVE_DSPARK` | minimax | auto | [mm-serve-dspark](optimizations.md#mm-serve-dspark) |
 | `STRIX_MM_SERVE_DSPARK_STAGE` | minimax | 1 | [mm-serve-dspark-stage](optimizations.md#mm-serve-dspark-stage) |
 | `STRIX_MOE_R1_GLUE_FUSE` | qwen | 1 (eager plain one-row decode) | [qwen-plain-decode-step](optimizations.md#qwen-plain-decode-step) |
+| `STRIX_MOE_R1_TAIL_FOLD` | qwen | 1 (eager plain one-row decode, con `STRIX_MOE_R1_GLUE_FUSE`) | [qwen-plain-decode-step](optimizations.md#qwen-plain-decode-step) |
 | `STRIX_QSA_DECODE_ATTN_V2` | qwen | 1 (eager plain one-row decode) | [qwen-plain-decode-step](optimizations.md#qwen-plain-decode-step) |
 | `STRIX_QSA_DECODE_FUSED_MAXIMA` | qwen | 1 (eager plain one-row decode) | [qwen-plain-decode-step](optimizations.md#qwen-plain-decode-step) |
 | `STRIX_QSA_DECODE_POOL` | qwen | 1 (plain append-only serial decode) | [qwen-qsa-decode-pool](optimizations.md#qwen-qsa-decode-pool) |
@@ -416,7 +442,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_QSA_DECODE_POOL_BF16` | qwen | 1 (plain append-only serial decode un... | [qwen-qsa-decode-pool](optimizations.md#qwen-qsa-decode-pool) |
 | `STRIX_QWEN_ROUTER_BF16` | qwen | OFF (opt-in: STRIX_QWEN_ROUTER_BF16=1) | [qwen-exact-bf16-router-weights](optimizations.md#qwen-exact-bf16-router-weights) |
 
-### Rutas de kernel (121)
+### Rutas de kernel (122)
 
 | Toggle | Motor | Por defecto | Detalles |
 |---|---|---|---|
@@ -487,6 +513,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_GLM_SERVE_PREFILL_UNITS` | glm | 1 | un prompt largo admitido bajo carga se corta en unidades de capa, no en chunks de tokens; `0` = chunks de tokens; [página de GLM](models/glm-5.3/README.es.md) |
 | `STRIX_GLM_STEP_FLAG` | glm | 1 (engine default) | [glm-step-flag](optimizations.md#glm-step-flag) |
 | `STRIX_GLM_TIERB` | glm | fused | [glm-attn-tierb-fused](optimizations.md#glm-attn-tierb-fused) |
+| `STRIX_IU4_ONE_SWEEP` | qwen (27B HIP) | 1 | [qwen27-hip-decode-step](optimizations.md#qwen27-hip-decode-step) |
 | `STRIX_LM_HEAD_COHORT_LEAN` | qwen | 1 | [qwen-lm-head-cohort-lean](optimizations.md#qwen-lm-head-cohort-lean) |
 | `STRIX_LM_HEAD_ROWS_LEAN` | qwen | 2 | [qwen-lm-head-rows-lean](optimizations.md#qwen-lm-head-rows-lean) |
 | `STRIX_MINIMAX_GU4_SCALAR` | minimax | ON (build time) | [mm-gu4](optimizations.md#mm-gu4) |
@@ -518,6 +545,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_MM_XB_WAIT` | minimax | 1 | [mm-xb-wait](optimizations.md#mm-xb-wait) |
 | `STRIX_MM_XB_WARM` | minimax | 8 | [mm-xb-warm](optimizations.md#mm-xb-warm) |
 | `STRIX_MM_XB_WARM_O` | minimax | 8 | [mm-xb-warm-o](optimizations.md#mm-xb-warm-o) |
+| `STRIX_MODEL_PREFAULT` | qwen | ON | [registration-prefault](optimizations.md#registration-prefault) |
 | `STRIX_MODEL_REGISTER_MLOCK` | qwen | ON when RLIMIT_MEMLOCK covers the reg... | [registered-page-lock](optimizations.md#registered-page-lock) |
 | `STRIX_PLE_PREISSUE` | qwen | ON | [qwen-ple-preissue](optimizations.md#qwen-ple-preissue) |
 | `STRIX_PLE_RECLAIMABLE` | qwen | auto | [qwen-l1](optimizations.md#qwen-l1) |

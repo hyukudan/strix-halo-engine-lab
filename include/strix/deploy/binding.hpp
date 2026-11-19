@@ -4,6 +4,7 @@
 // device-fact exchange and canonical plan-hash agreement. Host transport only;
 // every call here runs before any device owner is constructed.
 #include "strix/deploy/plan.hpp"
+#include "strix/dist/mesh.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -56,29 +57,53 @@ using Exchange = std::function<void(std::span<const std::byte> out, std::span<st
 
 // Fresh rank-ordered observations. Wire fields deliberately exclude private
 // observation paths (drm_device) and optional GTT/VRAM detail.
-inline std::vector<DeviceFacts> exchange_pair_facts(unsigned rank, const DeviceFacts& local, const Exchange& exchange) {
-    if (rank > 1) throw std::invalid_argument("deployment: pair rank must be 0 or 1");
-    struct Wire {
-        std::uint64_t magic, rank, version, cu, total, free, unified;
-        std::array<char, 64> gfx, source;
-    } mine{}, peer{};
-    mine.magic = 0x53544445504c3034ULL; mine.rank = rank;
+namespace detail {
+struct FactsWire {
+    std::uint64_t magic, rank, version, cu, total, free, unified;
+    std::array<char, 64> gfx, source;
+};
+inline constexpr std::uint64_t facts_magic = 0x53544445504c3034ULL;
+inline FactsWire encode_facts(unsigned rank, const DeviceFacts& local) {
+    FactsWire mine{};
+    mine.magic = facts_magic; mine.rank = rank;
     mine.version = local.gfx_target_version; mine.cu = local.cu_count;
     mine.total = local.mem_total_bytes; mine.free = local.mem_free_bytes; mine.unified = local.unified;
     if (local.gfx_target.size() >= mine.gfx.size() || local.source.size() >= mine.source.size())
         throw std::invalid_argument("deployment: observation string exceeds wire limit");
     std::copy(local.gfx_target.begin(), local.gfx_target.end(), mine.gfx.begin());
     std::copy(local.source.begin(), local.source.end(), mine.source.begin());
-    exchange(std::as_bytes(std::span(&mine, 1)), std::as_writable_bytes(std::span(&peer, 1)));
-    if (peer.magic != mine.magic || peer.rank != 1U - rank || peer.cu > UINT32_MAX || peer.unified > 1 ||
+    return mine;
+}
+inline DeviceFacts decode_facts(const FactsWire& peer, unsigned expected_rank) {
+    if (peer.magic != facts_magic || peer.rank != expected_rank || peer.cu > UINT32_MAX || peer.unified > 1 ||
         peer.gfx.back() || peer.source.back()) throw std::runtime_error("deployment: incompatible peer facts");
     DeviceFacts remote;
     remote.gfx_target = peer.gfx.data(); remote.source = peer.source.data();
     remote.gfx_target_version = peer.version; remote.cu_count = static_cast<std::uint32_t>(peer.cu);
     remote.mem_total_bytes = peer.total; remote.mem_free_bytes = peer.free; remote.unified = peer.unified != 0;
-    std::vector<DeviceFacts> devices(2);
-    devices[rank] = local; devices[1U - rank] = remote;
+    return remote;
+}
+} // namespace detail
+
+// N ranks: every rank sends its record to every peer (dist/mesh.hpp schedule: peers in ascending rank order, deadlock
+// free) and ends with the same rank-ordered facts. `exchange(peer, out, in)` swaps one record with rank `peer`.
+inline std::vector<DeviceFacts> exchange_facts(unsigned rank, unsigned world, const DeviceFacts& local,
+                                               const dist::PeerExchange& exchange) {
+    if (world == 0U || rank >= world) throw std::invalid_argument("deployment: rank outside the declared world");
+    const auto mine = detail::encode_facts(rank, local);
+    std::vector<detail::FactsWire> all(world);
+    dist::all_gather(rank, world, std::as_bytes(std::span(&mine, 1)), std::as_writable_bytes(std::span(all)), exchange);
+    std::vector<DeviceFacts> devices(world);
+    for (unsigned r = 0; r < world; ++r) devices[r] = r == rank ? local : detail::decode_facts(all[r], r);
     return devices;
+}
+
+// Two ranks over the pair's symmetric Exchange: the N = 2 form of exchange_facts (one exchange of one record).
+inline std::vector<DeviceFacts> exchange_pair_facts(unsigned rank, const DeviceFacts& local, const Exchange& exchange) {
+    if (rank > 1) throw std::invalid_argument("deployment: pair rank must be 0 or 1");
+    return exchange_facts(rank, 2U, local, [&](std::uint32_t, std::span<const std::byte> out, std::span<std::byte> in) {
+        exchange(out, in);
+    });
 }
 
 // Both ranks must have resolved the same canonical plan. Refusal is left to require_plan.
