@@ -367,11 +367,12 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_SERVE_T16K` | qwen | ON: T16384 owner when the context admits a 32,768-token request and every resident slot fits; `0` keeps T8192 | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 | `STRIX_SERVE_FP16_MTP` | qwen | ON: explicit-sidecar MTP servers keep the automatic FP16 prefill arithmetic with the unqualified fast options off; `0` declines it | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 
-### Decode, MTP and DSpark (24)
+### Decode, MTP and DSpark (25)
 
 | Toggle | Engine | Default | Details |
 |---|---|---|---|
 | `STRIX_BATCH_TOOL_DRAFT` | qwen | ON (batched decoding) | [qwen-tool-draft](optimizations.md#qwen-tool-draft) |
+| `STRIX_DECODE_ATTN_ROW_SHARE` | qwen (27B HIP) | 1 | [qwen27-hip-decode-attn-row-share](optimizations.md#qwen27-hip-decode-attn-row-share) |
 | `STRIX_DECODE_FUSE` | qwen (27B HIP) | 1 | [qwen27-hip-decode-step](optimizations.md#qwen27-hip-decode-step) |
 | `STRIX_DS41_DECODE_PREFETCH` | deepseek | auto | [ds-prefetch](optimizations.md#ds-prefetch) |
 | `STRIX_DS41_DEFER_DECODER` | deepseek | on | [ds-defer-decoder](optimizations.md#ds-defer-decoder) |
