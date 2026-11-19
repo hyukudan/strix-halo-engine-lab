@@ -430,6 +430,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_DS41_WB_STREAM` | deepseek-rtx | ON | [rtx-wb-stream](optimizations.md#rtx-wb-stream) |
 | `STRIX_GLM_MTP_SPEC` | glm | on (Xfer verify exchange, KDA tree 2,... | [glm-mtp-spec](optimizations.md#glm-mtp-spec) |
 | `STRIX_GLM_SPEC_XCH` | glm | on (Xfer verify exchange, KDA tree 2,... | [glm-mtp-spec](optimizations.md#glm-mtp-spec) |
+| `STRIX_SPEC_ARBITER` | glm | off (opt-in: shared Arbiter chooses plain / MTP chain / prompt lookup per cycle; tokens unchanged, speed unmeasured) | [glm-mtp-spec](optimizations.md#glm-mtp-spec) |
 | `STRIX_HTTP_EAGER_SLOTS` | qwen | AUTO capacity; at most 4 eager slots;... | [batched-decoding](engine/serving/serving.md#batched-decoding) |
 | `STRIX_MMX_LINEAR_V11` | minimax | 1 | [mm-linear-v11](optimizations.md#mm-linear-v11) |
 | `STRIX_MMX_PREFILL_PIPE_PAIR` | minimax | auto | [mm-pf-pipe-pair](optimizations.md#mm-pf-pipe-pair) |

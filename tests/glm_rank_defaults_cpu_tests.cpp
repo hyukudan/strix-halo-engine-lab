@@ -67,6 +67,7 @@ bool same_values(const rd::Effective& a, const rd::Effective& b, std::string* wh
     d = diff("xch", a.xch, b.xch) || d;
     d = diff("max-rows", a.max_rows.value, b.max_rows.value) || d;
     d = diff("split-frame", a.split_frame.value, b.split_frame.value) || d;
+    d = diff("spec-arbiter", a.spec_arbiter ? "1" : "0", b.spec_arbiter ? "1" : "0") || d;
     for (const auto& it : rd::env_items()) d = diff(it.env, a.env.at(it.env).value, b.env.at(it.env).value) || d;
     return !d;
 }
@@ -169,6 +170,17 @@ void test_apply_env_default() {
     CHECK(resolve(cat(kDeploy, kDecodeWork), {}).env.at("STRIX_GLM_SPEC_XCH").value == "xfer");
     CHECK(resolve({"--baseline"}, {}).env.at("STRIX_GLM_SPEC_XCH").value == "comm");
     CHECK(resolve({}, {{"STRIX_GLM_SPEC_XCH", "comm"}}).env.at("STRIX_GLM_SPEC_XCH").source == "explicit");
+    // shared Arbiter binding (opt-in): default off, baseline off, explicit 1 on, anything else refused at startup
+    CHECK(!resolve(cat(kDeploy, kDecodeWork), {}).spec_arbiter);
+    CHECK(!resolve({"--baseline"}, {}).spec_arbiter);
+    CHECK(resolve(cat(kDeploy, kDecodeWork), {{"STRIX_SPEC_ARBITER", "1"}}).spec_arbiter);
+    CHECK(resolve({"--baseline"}, {{"STRIX_SPEC_ARBITER", "1"}}).spec_arbiter);
+    CHECK(rd::print(resolve({}, {{"STRIX_SPEC_ARBITER", "1"}})).find("STRIX_SPEC_ARBITER=1") != std::string::npos);
+    {
+        bool threw = false;
+        try { (void)resolve({}, {{"STRIX_SPEC_ARBITER", "2"}}); } catch (const std::invalid_argument&) { threw = true; }
+        CHECK(threw);
+    }
     const auto plain = resolve(cat(kDeploy, kDecodeWork), {});
     Env set;
     rd::apply_env(plain, [&](const char* k, const char* v) { set[k] = v; });
