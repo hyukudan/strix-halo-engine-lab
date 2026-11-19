@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "strix/qwen35/hip_engine.hpp"
+#include "strix/profiles/qwen_dense_hip.hpp"
 #include "strix/qwen35/hip_spec_defaults.hpp"
 #include "../src/core/dense_linear_iu4.hpp"  // dense_iu4::scalar_x (the costs' bucket form)
 #include "strix/spec/block_drafter.hpp"
@@ -240,6 +241,7 @@ int run_mtp_ref(q::HipEngine& E, const std::string& model, const std::string& mt
 }  // namespace
 
 int main(int argc, char** argv) try {
+    strix::qwen35::hip_profile::take(strix::qwen35::hip_profile::App::spec, argc, argv);  // --profile exact|fast
     std::string model, ids_file, label = "run", sources, mtp_file, chain_hidden = "post", dump_ref, dump_out;
     std::uint32_t n_gen = 256, max_block = 0, max_pos = 0, pf_bench = 0, trace_n = 0, prefill_rows = 0, chain_k = 0, ref_n = 0;
     bool prefill_exact = false;  // prefill_rows 0 = the engine default (64-row EXACT windows)

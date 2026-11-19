@@ -19,6 +19,7 @@
 #include "strix/profiles/qwen.hpp"
 #include "strix/profiles/qwen_cuda.hpp"
 #include "strix/profiles/qwen_dense_cuda.hpp"
+#include "strix/profiles/qwen_dense_hip.hpp"
 #include "minimax/engine/mm_defaults.hpp"
 #include "minimax/engine/mm_profile_table.hpp"
 
@@ -249,6 +250,7 @@ int main() {
     check_bundle("minimax-pair", strix::minimax::defaults::profile_table, strix::minimax::defaults::kFastBundle);
     check_table("qwen-hip", strix::qwen::profile::table);
     check_table("qwen-cuda", strix::qwen::cuda_profile::table);
+    check_table("qwen35-hip-dense", strix::qwen35::hip_profile::table);
     qwen_dense_regimes();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
