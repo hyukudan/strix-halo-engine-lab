@@ -257,7 +257,7 @@ Selection select(const Inputs& inputs) {
     for (std::size_t i = 0; i < inputs.args.size(); ++i) {
         const auto& a = inputs.args[i];
         if (a == "--profile") {
-            if (i + 1 >= inputs.args.size()) throw std::invalid_argument("missing value of --profile (default, fast or quality)");
+            if (i + 1 >= inputs.args.size()) throw std::invalid_argument("missing value of --profile (exact (default), fast or quality)");
             cli = parse(inputs.args[++i]);
         } else if (a == "--allow-pending") {
             s.allow_pending = true;
