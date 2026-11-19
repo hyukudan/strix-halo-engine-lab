@@ -42,6 +42,12 @@ template<char C> struct FakeExchange {
     void exchange(int*, const void* local, void* remote, std::size_t bytes, std::uint64_t tag) {
         events.push_back({C, local, remote, bytes, tag});
     }
+    int drains = 0;
+    bool corrupt = false;  // the seal of the last message fails its integrity check
+    void drain() {
+        ++drains;
+        if (corrupt) throw std::runtime_error("seal: deferred check of the last message failed");
+    }
 };
 using Legacy = FakeExchange<'l'>;
 using Fast = FakeExchange<'f'>;
@@ -92,6 +98,29 @@ void test_routes() {
     check(throws([&] { (void)Bare(0U, GatherRoute::channel, &legacy, nullptr); }), "unbound channel route refused");
 }
 
+// L1: the channel's last message is checked by the drain's seal; finish() must surface that failure (both ranks call it)
+// and the inline-checked routes have nothing to finish. Route policy: one backend-neutral function.
+void test_finish_and_route() {
+    using strix::pair::GatherRoute;
+    Legacy legacy;
+    Fast fast;
+    int stream_object = 0;
+    std::vector<std::uint8_t> slots(2U * 64U);
+    Link ch(0U, GatherRoute::channel, &legacy, &fast);
+    ch.gather(&stream_object, slots.data(), 64U, 64U);
+    ch.finish();
+    check(fast.drains == 1, "finish: the channel route drains (seal of the last message)");
+    fast.corrupt = true;
+    check(throws([&] { ch.finish(); }), "finish: a failed check of the last gather is reported, not swallowed");
+    Link st(1U, GatherRoute::staged, &legacy, nullptr);
+    st.finish();
+    check(legacy.drains == 0, "finish: staged route checks inline, no drain");
+    check(strix::pair::select_route(false, false) == GatherRoute::staged, "route: staged when nothing else");
+    check(strix::pair::select_route(true, false) == GatherRoute::device_direct, "route: device direct when offered");
+    check(strix::pair::select_route(true, true) == GatherRoute::channel && strix::pair::select_route(false, true) == GatherRoute::channel,
+          "route: the channel when requested");
+}
+
 void test_inputs() {
     namespace tp = strix::pair::tp;
     const auto f = tp::rank_rates({200.0, 180.0}, {243.0, 243.0}, 2U);
@@ -126,6 +155,7 @@ void test_inputs() {
 
 int main() {
     test_routes();
+    test_finish_and_route();
     test_inputs();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
