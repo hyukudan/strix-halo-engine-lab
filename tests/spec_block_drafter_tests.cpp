@@ -32,6 +32,12 @@ bool g_fixed = false;
 bool g_prelaunch = false;
 std::uint32_t g_dev[64]{};
 std::string g_cost_kv = "online";  // context cost of the fixed model (spec::set_context_cost)
+// Tree-arbiter cost model of TreeTarget (rv_tree3): a tree window costs the linear window of the same rows + g_tree_extra
+// (the measured per-window surcharge), and a window wider than g_step_rows rows pays g_step_ms more (dense row tile). The
+// fixed seeds stay linear (10.2 + row_ms r), as on the device. g_gap_mode: RunnerChain margins, 0 none, 1 informative
+// (a runner-up that is the target's token has gap 0.3, any other 4.0), 2 uninformative (hash in [0, 6)).
+double g_tree_extra = 0.0, g_step_ms = 0.0;
+std::uint32_t g_step_rows = 32, g_gap_mode = 0;
 double noise(std::uint64_t k) { return g_jitter * double(mix(k * 0x9e3779b9ULL + g_jitter_seed) % 1000) / 1000.0; }
 
 // The "model": response[i] is the greedy token at response position i (a pure function of the position: a valid
@@ -249,7 +255,7 @@ struct TreeTarget final : sp::VerifyTarget {
         greedy.clear();
         for (std::size_t i = 0; i < tokens.size(); ++i) greedy.push_back(truth(committed_rows + i + 1));
         last_linear.assign(tokens.begin(), tokens.end());
-        g_clock += 10.0 + row_ms * double(tokens.size());
+        g_clock += 10.0 + row_ms * double(tokens.size()) + (tokens.size() > g_step_rows ? g_step_ms : 0.0);
     }
     void commit(std::uint32_t k) override {
         BD_CHECK(k >= 1 && k <= last_linear.size(), "linear commit %u of %zu", k, last_linear.size());
@@ -282,7 +288,7 @@ struct TreeTarget final : sp::VerifyTarget {
             greedy[r] = right[r] ? truth(committed_rows + t.depth[r] + 1) : std::uint32_t(h % 900) + 10;
         }
         last_tree = t;
-        g_clock += 10.0 + row_ms * double(n);
+        g_clock += 10.0 + row_ms * double(n) + (n > g_step_rows ? g_step_ms : 0.0) + g_tree_extra;
     }
     void commit_path(std::span<const std::uint32_t> path) override {
         BD_CHECK(!path.empty() && path[0] == 0, "path starts at the anchor");
@@ -302,11 +308,13 @@ struct RunnerChain final : sp::ChainDrafter {
     bool report = true;
     std::uint32_t stream_len = 0;
     std::vector<std::uint32_t> ru;
+    std::vector<float> gp;
     std::uint64_t paths = 0;
     RunnerChain(const World& world, double acc, double q) : w(world), accuracy(acc), q_true(q) {}
     void draft(std::span<const std::uint32_t> prefix, std::uint32_t k, std::vector<std::uint32_t>& out) override {
         out.clear();
         ru.clear();
+        gp.clear();
         for (std::uint32_t j = 0; j < k; ++j) {
             const std::uint64_t pos = std::uint64_t(stream_len) + prefix.size() + j;
             const bool right = double(mix(pos * 977 + 5) % 1000) / 1000.0 < accuracy;
@@ -314,6 +322,8 @@ struct RunnerChain final : sp::ChainDrafter {
             const std::uint32_t t = pos < w.response.size() ? w.response[pos] : 7;
             out.push_back(right ? t : 5);
             ru.push_back(!right && alt ? t : 6);
+            if (g_gap_mode == 1) gp.push_back(!right && alt ? 0.3f : 4.0f);
+            else if (g_gap_mode == 2) gp.push_back(float(mix(pos * 131 + 3) % 600) / 100.0f);
         }
         g_clock += 0.5 * double(prefix.size() + k);
     }
@@ -325,6 +335,9 @@ struct RunnerChain final : sp::ChainDrafter {
     }
     [[nodiscard]] std::span<const std::uint32_t> runner_ups() const override {
         return report ? std::span<const std::uint32_t>(ru) : std::span<const std::uint32_t>();
+    }
+    [[nodiscard]] std::span<const float> runner_up_gaps() const override {
+        return report ? std::span<const float>(gp) : std::span<const float>();
     }
 };
 
@@ -455,6 +468,76 @@ int tree_tests() {
                 }
     std::printf("tree tests ok: %d cases, sibling rows %llu, taken %llu\n", cases, (unsigned long long)placed,
                 (unsigned long long)taken);
+    return cases;
+}
+
+// rv_tree3: sibling placement priced by measured walls. The device showed a per-window tree surcharge (+0.5..0.7 ms at
+// equal rows) and a step-shaped row cost (8 -> 9 rows +1.2 ms) that the linear seeds do not see; the seeds here stay
+// linear too. Invariants: ids == serial; the tree run is never slower than the linear run (1 %: exploration of a shape
+// before its wall is known + path dependence, see below); a surcharge no sibling set pays stops placement; the learned
+// surcharge equals the modelled one; informative drafter gaps raise the taken / placed ratio and never cost time.
+int tree_arbiter_tests() {
+    const std::uint32_t n = 1200;
+    int cases = 0;
+    double worst = 0.0;
+    for (const std::string cls : {"prose", "edit", "loop"})
+        for (const double acc : {0.3, 0.63, 0.85})
+            for (const double q : {0.1, 0.35, 0.8})
+                for (const double extra : {0.0, 0.7, 3.0})
+                    for (const bool step : {false, true}) {
+                        const auto w = make_world(cls, 40, n, 11 + std::uint64_t(acc * 100));
+                        g_tree_extra = extra;
+                        g_step_rows = step ? 8 : 32;
+                        g_step_ms = step ? 1.2 : 0.0;
+                        const auto tr = run_tree(w, n, acc, q, 32, true, 0.113, false);
+                        const auto lin = run_tree(w, n, acc, q, 0, true, 0.113, false);
+                        for (std::uint32_t i = 0; i < n; ++i)
+                            BD_CHECK(tr.out[i] == w.response[i] && lin.out[i] == w.response[i], "arbiter run differs at %u", i);
+                        worst = std::max(worst, tr.ms / lin.ms);
+                        // 1 %: once one tree window changes the acceptance history, the two runs make different chain
+                        // decisions; that path dependence alone moves the total by up to ~0.9 % here (cases with <= 10 tree
+                        // windows, whose own cost is < 0.1 %). The device gate (on >= off - 0.5 %) is the kit's.
+                        BD_CHECK(tr.ms <= lin.ms * 1.01,
+                                 "%s acc %.2f q %.2f extra %.1f step %d: tree %.0f vs linear %.0f ms (rows %llu taken %llu windows %llu)",
+                                 cls.c_str(), acc, q, extra, int(step), tr.ms, lin.ms, (unsigned long long)tr.sib_rows,
+                                 (unsigned long long)tr.taken, (unsigned long long)tr.stats.tree_windows);
+                        if (!step && extra > 0.0 && tr.stats.tree_windows > 0 && tr.stats.tree_surcharge_ms != 0.0)
+                            BD_CHECK(std::abs(tr.stats.tree_surcharge_ms - extra) < 0.05, "learned surcharge %.3f vs %.1f",
+                                     tr.stats.tree_surcharge_ms, extra);
+                        if (extra == 3.0 && q <= 0.35)  // a surcharge no sibling set pays: placement stops after exploration
+                            BD_CHECK(tr.stats.tree_windows * 20 <= tr.steps, "%s acc %.2f q %.2f: %llu tree windows in %llu steps",
+                                     cls.c_str(), acc, q, (unsigned long long)tr.stats.tree_windows, (unsigned long long)tr.steps);
+                        ++cases;
+                    }
+    // Drafter gaps: informative margins (hit 0.3, miss 4.0) vs uninformative ones at the device's en-prose surcharge.
+    std::uint64_t rows_i = 0, taken_i = 0, rows_u = 0, taken_u = 0;
+    for (const double acc : {0.3, 0.63})
+        for (const double q : {0.1, 0.35}) {
+            const auto w = make_world("prose", 40, n, 17 + std::uint64_t(acc * 100));
+            g_tree_extra = 0.7;
+            g_step_rows = 32;
+            g_step_ms = 0.0;
+            g_gap_mode = 1;
+            const auto inf = run_tree(w, n, acc, q, 32, true, 0.113, false);
+            g_gap_mode = 2;
+            const auto uni = run_tree(w, n, acc, q, 32, true, 0.113, false);
+            BD_CHECK(inf.ms <= uni.ms * 1.005, "acc %.2f q %.2f: informative gaps %.0f vs %.0f ms", acc, q, inf.ms, uni.ms);
+            for (std::uint32_t i = 0; i < n; ++i) BD_CHECK(inf.out[i] == w.response[i], "gap run differs at %u", i);
+            rows_i += inf.sib_rows;
+            taken_i += inf.taken;
+            rows_u += uni.sib_rows;
+            taken_u += uni.taken;
+            ++cases;
+        }
+    BD_CHECK(rows_i > 0 && rows_u > 0 && double(taken_i) / double(rows_i) > 1.5 * double(taken_u) / double(rows_u),
+             "gap selector: taken/placed %llu/%llu vs uninformative %llu/%llu", (unsigned long long)taken_i,
+             (unsigned long long)rows_i, (unsigned long long)taken_u, (unsigned long long)rows_u);
+    g_tree_extra = g_step_ms = 0.0;
+    g_step_rows = 32;
+    g_gap_mode = 0;
+    std::printf("tree arbiter tests ok: %d cases, worst tree/linear %.4f, gap selector taken/placed %llu/%llu vs %llu/%llu\n",
+                cases, worst, (unsigned long long)taken_i, (unsigned long long)rows_i, (unsigned long long)taken_u,
+                (unsigned long long)rows_u);
     return cases;
 }
 }  // namespace
@@ -640,6 +723,7 @@ int main() {
                     (unsigned long long)pre_steps);
     }
     tree_tests();
+    tree_arbiter_tests();
     std::printf("block drafter tests ok: %d cases, copy blocks %llu, chain blocks %llu, hybrid blocks %llu; edit %.2f vs serial %.2f ms/token\n",
                 cases, (unsigned long long)copies, (unsigned long long)chains, (unsigned long long)hybrids, tok_ms_all_loop, tok_ms_serial);
     return 0;

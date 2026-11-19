@@ -79,8 +79,12 @@ public:
         e_.sync();
     }
     // Token tree (strix/spec/tree_window.hpp): sibling rows verified in the same window, EXACT (each row = the linear window of
-    // its path). Opt-in until measured on the device (set_tree); off = tree_rows() 0, every block linear (bitwise as before).
-    void set_tree(bool on) { tree_ = on; }
+    // its path). Opt-in until measured on the device (set_tree); off = tree_rows() 0, every block linear (bitwise as before)
+    // and the draft head computes no runner-ups (plain argmax launches, the pre-tree draft path).
+    void set_tree(bool on) {
+        tree_ = on;
+        e_.set_runner_ups(on);
+    }
     // decode_attn8 (FAST e4m3 shadow) has no leaf K/V index (CudaEngine::forward_tree refuses it): linear windows only.
     [[nodiscard]] std::uint32_t tree_rows() const override {
         return tree_ && !e_.options().decode_attn8 ? strix::cuda_core::kMaxRows : 0U;

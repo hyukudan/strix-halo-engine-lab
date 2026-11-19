@@ -285,6 +285,11 @@ struct SpecStats {
     // placed, so a linear run measures q_d; rows = sibling rows verified, taken = siblings accepted (+1 token each).
     std::array<std::uint64_t, 16> sibling_trials{}, sibling_hits{};
     std::uint64_t sibling_rows = 0, sibling_taken = 0;
+    // The same probe per drafter logit-gap bucket (block_drafter.hpp kSiblingGapEdges); tree windows verified and the
+    // learned tree surcharge (ms over a linear window of the same rows) used to price siblings.
+    std::array<std::uint64_t, 6> sibling_gap_trials{}, sibling_gap_hits{};
+    std::uint64_t tree_windows = 0;
+    double tree_surcharge_ms = 0.0;
     void record(const Outcome& outcome, std::uint32_t emitted_this_pass);
     void lookup_time(double us);
     [[nodiscard]] double lookup_us_quantile(double q) const;  // upper bucket edge

@@ -680,7 +680,12 @@ std::string SpecStats::json() const {
         for (std::size_t d = 0; d < sdepth; ++d) j += (d ? "," : "") + std::to_string(sibling_trials[d]);
         j += "],\"hits\":[";
         for (std::size_t d = 0; d < sdepth; ++d) j += (d ? "," : "") + std::to_string(sibling_hits[d]);
-        j += "],\"rows\":" + std::to_string(sibling_rows) + ",\"taken\":" + std::to_string(sibling_taken) + "}";
+        j += "],\"gap_trials\":[";
+        for (std::size_t g = 0; g < sibling_gap_trials.size(); ++g) j += (g ? "," : "") + std::to_string(sibling_gap_trials[g]);
+        j += "],\"gap_hits\":[";
+        for (std::size_t g = 0; g < sibling_gap_hits.size(); ++g) j += (g ? "," : "") + std::to_string(sibling_gap_hits[g]);
+        j += "],\"rows\":" + std::to_string(sibling_rows) + ",\"taken\":" + std::to_string(sibling_taken) +
+             ",\"tree_windows\":" + std::to_string(tree_windows) + ",\"surcharge_ms\":" + num(tree_surcharge_ms) + "}";
     }
     j += "}";
     return j;

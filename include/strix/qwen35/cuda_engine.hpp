@@ -232,8 +232,12 @@ public:
     // same operands as forward_rows(tokens) with tokens = host ids + the feed ids; nothing is read or waited for.
     RowsOut forward_rows_fed(const std::uint32_t* host_ids, std::uint32_t nhost, const std::uint32_t* slot,
                              const std::uint32_t* host_vals, std::uint32_t k, LogitRows want = LogitRows::all);
-    // + host2[0..n) = each slot's runner-up (0xFFFFFFFF: none); one synchronization (token-tree siblings / probe).
-    void mtp_feed_read2(std::uint32_t n, std::uint32_t* host, std::uint32_t* host2) const;
+    // + host2[0..n) = each slot's runner-up (0xFFFFFFFF: none) and gaps[0..n) = its draft-head logit gap top-1 minus
+    // runner-up (NaN: none; nullptr: not read); one synchronization (token-tree siblings / probe).
+    void mtp_feed_read2(std::uint32_t n, std::uint32_t* host, std::uint32_t* host2, float* gaps = nullptr) const;
+    // Draft runner-ups (argmax2 + gap) on / off (default off: the draft head runs the plain argmax launches and
+    // mtp_feed_read2 reports none). A token-tree verify target turns them on (Qwen35SpecTarget::set_tree).
+    void set_runner_ups(bool on);
     // Draft-only MTP head over a vocabulary subset (strix/spec/draft_rows.hpp, group 16 = one NVFP4 tile of the head):
     // before each head launch the engine copies the rows' new tiles into a compact head (device-to-device, no
     // re-quantisation) and maps the argmax back to token ids on the device, so MtpOut::top stays a token id. MtpOut::logits
