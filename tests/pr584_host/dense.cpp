@@ -25,6 +25,8 @@ struct View {
     unsigned row_bytes{}, k_bytes{}, in{}, count{}, rows{}, x_stride{}, out_stride{}, accumulate{};
     std::uint32_t batch{}, batch_in{}, batch_out{};
     std::uint64_t batch_weight_bytes{};
+    const float* bias{};
+    std::uint32_t round_bf16{};
 };
 std::vector<View> calls;
 #include "dense_supported.inc"
@@ -143,6 +145,22 @@ int main(int argc, char** argv) {
                 "independent chain or output order lost");
         require(first.k_bytes == 136 && second.k_bytes == 272 && first.row_bytes == 544 && second.row_bytes == 544 &&
                 second.codes == codes.data() + 128 && second.deltas == deltas.data() + 4, "part offsets/strides wrong");
+        require(first.round_bf16 == 0U && second.round_bf16 == 0U && first.bias == nullptr && second.bias == nullptr,
+                "store epilogue set without being asked");
+        {  // the Linear store epilogue (bf16 round + bias) runs on the last K part only, on the full sum
+            q::calls.clear();
+            const float bias = 0.5F;
+            q::View pv{};
+            pv.codes = codes.data(); pv.deltas = deltas.data(); pv.out = &out; pv.in = 64; pv.count = 1;  // 3 x 64 codes, 6 deltas
+            pv.round_bf16 = 1U; pv.bias = &bias;
+            q::enqueue_parts(pv, 3U, nullptr);
+            require(q::calls.size() == 3, "parts count");
+            for (std::size_t p = 0; p < 3; ++p) {
+                const bool last = p == 2;
+                require(q::calls[p].round_bf16 == (last ? 1U : 0U) && q::calls[p].bias == (last ? &bias : nullptr),
+                        "store epilogue not on the last part only");
+            }
+        }
         q::calls.clear(); out = -9.0F;
         v.k_parts = 1;
         require(enqueue_fast_dense(v, nullptr), "first unfused call rejected");

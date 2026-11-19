@@ -3351,5 +3351,6 @@
     "preconditions": "CUDA decode attention through cuda_core::attention_decode with more than one row (Qwen 27B dense verify / draft / plain) on a measured device and head shape (shared table: sm_120 with 188 SMs, 24 q / 4 kv, Dim 256); others keep the one-row grid (same bits).",
     "off_switch": "STRIX_DECODE_ATTN_ROW_SHARE=0",
     "doc_anchor": "docs/optimizations.md#qwen27-cuda-decode-attn-row-share"
-  }
+  },
+  {"engine": "hy4", "name": "Prompt windows: bf16 epilogue in the producers' store", "flag_or_env": "STRIX_HY4_PF_STORE_EPILOGUE", "default": "ON", "exact": "Bitwise: same function on the same FP32 value; bf16 epilogue idempotent over all 2^32 patterns; 4096-token logits digest a0db1a8a45606112 equal on, off and parent.", "gain": "One node, 4096-token bench prompt, 2048-row windows, A-B/B-A: warm -4.3 %, cold -4.2 %.", "preconditions": "Hy4-flash --prompt-rows; q8a8 dense batch <= 1 outside the operand-image form; K-quant known-rows down. Other forms refuse it.", "off_switch": "STRIX_HY4_PF_STORE_EPILOGUE=0", "doc_anchor": "docs/optimizations.md#hy4-pf-store-epilogue"}
 ]

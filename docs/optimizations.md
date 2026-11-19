@@ -5468,3 +5468,26 @@ Several short waiting prompts run as one device prefill pass under the FAST leve
 - **Off switch:** `STRIX_SERVE_PREFILL_GROUP=0`
 - **Exactness evidence:** pair runs, same eight prompts solo (one at a time) and grouped in one server: every member's logits and exported-state hashes equal its solo run on both ranks, under exact (solo hashes equal to the previous main), the FAST profile, FAST_DENSE, FAST_MOE, FAST_ATTN=2, and the FAST profile with `STRIX_DS41_FAST_DENSE_MIN_ROWS=64` (groups of 125 rows across the threshold).
 - **Measured gain:** FAST profile, eight requests x 256 tokens: whole run 99.9 -> 102.7 tok/s (+2.8 %), admission 1,428 -> 865 ms; four requests about +1 % (noisy).
+
+<a id="hy4-pf-store-epilogue"></a>
+
+## Hy4-flash prompt windows: bf16 epilogue in the producers' store
+
+**Engine:** `hy4`. **Control:** `STRIX_HY4_PF_STORE_EPILOGUE`. **Default:** on.
+
+The windowed prompt (`--prompt-rows`) ran a separate `glu::launch_epilogue<Round::bf16>` pass over every Q8_0 Linear
+output and over the routed experts' FP32 raw slot dots. The shared producers now apply the same function to the same
+FP32 value in their store: the q8a8 dense core (`View::round_bf16` / `View::bias` select the `kernel_linear` entry; the
+plain kernel is unchanged; with K parts the epilogue runs on the last part only, on the full sum) and the K-quant
+envelope of the known-rows MoE down (`PrefillRows::rawdots_bf16`).
+
+- **Preconditions:** Hy4-flash windowed prompt; q8a8 dense calls with batch <= 1 outside the operand-image form; the
+  K-quant envelope of the known-rows down. Other forms refuse the flag (and keep the separate pass).
+- **Exactness evidence:** Same bits by construction (same function on the same register value); the unbiased bf16
+  epilogue is idempotent over all 2^32 FP32 patterns (host test `tests/ops_rope_glu_host_tests.cpp`); one node, 4096
+  tokens: last-position logits digest a0db1a8a45606112 and last generated position digest equal with the lever on,
+  off and on the parent commit.
+- **Off switch:** `STRIX_HY4_PF_STORE_EPILOGUE=0` keeps the separate epilogue passes.
+- **Measured gain:** One node, 4096-token bench prompt (a ~66-token sequence repeated), 2048-row windows, alternated
+  A-B / B-A: warm prompt 7,680 / 7,694 ms -> 7,307 / 7,409 ms (-4.3 %), cold 7,879 / 7,942 -> 7,593 / 7,557 ms (-4.2 %).
+- **Implementation / evidence:** [dense core](../src/core/f16_dense_q8a8.hpp), [known-rows down](../src/hip_moe_q4k_a8_known_rows.hip), [binding](../src/hy4/hip/hy4_hip_forward.hip)

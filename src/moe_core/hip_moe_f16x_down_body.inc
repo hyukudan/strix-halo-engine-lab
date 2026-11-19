@@ -155,6 +155,12 @@
             if(__float_as_uint(acc[mi][0][e])==0x7fc12345U)out[0]=acc[mi][0][e]*unscale;
             if(__float_as_uint(acc[mi][1][e])==0x7fc12345U)out[16]=acc[mi][1][e]*unscale;
         } else if constexpr((Core&4U)!=0U){f16_store_global(out,acc[mi][0][e]*unscale);f16_store_global(out+16,acc[mi][1][e]*unscale);}
+#ifdef STRIX_F16X_DOWN_ROUND
+        else if constexpr(STRIX_F16X_DOWN_ROUND) { // the BF16 Linear store (PrefillRows::rawdots_bf16): one rounding of the same value
+            out[0]=::strix::ops::glu::epilogue<::strix::ops::glu::Round::bf16>(acc[mi][0][e]*unscale,nullptr,0U);
+            out[16]=::strix::ops::glu::epilogue<::strix::ops::glu::Round::bf16>(acc[mi][1][e]*unscale,nullptr,0U);
+        }
+#endif
         else {out[0]=acc[mi][0][e]*unscale;out[16]=acc[mi][1][e]*unscale;}
     }
     if constexpr((Core&512U)!=0U)fuse_merge_tail<Batch,Columns,T::Threads>(fuse,view,count,tile,hidden,row_of);

@@ -18,6 +18,7 @@
 #endif
 #include <hip/hip_fp16.h>
 #include "moe_core/grouped_f16.hpp"
+#include "ops/glu/glu.hpp"  // epilogue<Round::bf16>: the K-quant down's rounded raw-dot store (PrefillRows::rawdots_bf16)
 #include <algorithm>
 #include <cmath>
 #include <array>
@@ -1672,7 +1673,8 @@ __global__ __launch_bounds__(F16Tile<Tune>::Threads,prefill_core2_min_waves(Tune
 }
 #include "moe_core/hip_moe_f16x_kquant_down.inc"
 // K-quant down trait entry of the same body (Type 12 = Q4_K, 14 = Q6_K; plain schedule, Core 0, no fused merge).
-template<unsigned Type,unsigned Tune>
+// RoundDots (PrefillRows::rawdots_bf16): each raw slot dot is stored as ops::glu::epilogue<Round::bf16> of the same value.
+template<unsigned Type,unsigned Tune,bool RoundDots>
 __global__ __launch_bounds__(F16Tile<Tune>::Threads,prefill_core2_min_waves(Tune,0U)) void down_prefill_f16x_kq(const unsigned char* weights,
     PrefillRows view,unsigned hidden,unsigned width) {
     constexpr unsigned Core=0U;
@@ -1682,7 +1684,9 @@ __global__ __launch_bounds__(F16Tile<Tune>::Threads,prefill_core2_min_waves(Tune
 #define STRIX_F16X_LDS(S,R) __shared__ __align__(16) S sb[1]; __shared__ R rows;
 #define STRIX_F16X_DOWN_GUARD if(csr.summary[0]||batch>=csr.summary[2])return;
 #define STRIX_F16X_DOWN_KQ 1
+#define STRIX_F16X_DOWN_ROUND RoundDots
 #include "moe_core/hip_moe_f16x_down_body.inc"
+#undef STRIX_F16X_DOWN_ROUND
 #undef STRIX_F16X_DOWN_KQ
 #undef STRIX_F16X_BATCH_TILE
 #undef STRIX_F16X_LDS
@@ -2118,14 +2122,18 @@ static void enqueue_prefill_kquant(const Request& request,const PrefillRows& row
         }
         hip_check(hipGetLastError(),"FP16 prefill WMMA gate/up projection (K-quant envelope)");
         prefill_stage_reached(2U,stream);
+        // rows.rawdots_bf16: the same kernel stores each raw slot dot once-rounded to BF16 (the caller's epilogue pass goes).
+        const auto down=[&]<unsigned Type,bool Round>(const char* name) {
+            prefill_resources<down_prefill_f16x_kq<Type,Tune,Round>,Threads>(name,Tune);
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_kq<Type,Tune,Round>),down_grid,dim3(Threads),0,stream,
+                down_weights,rows,shape.hidden,shape.rows);
+        };
         if(down_type==14U) {
-            prefill_resources<down_prefill_f16x_kq<14U,Tune>,Threads>("down_q6k",Tune);
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_kq<14U,Tune>),down_grid,dim3(Threads),0,stream,
-                down_weights,rows,shape.hidden,shape.rows);
+            if(rows.rawdots_bf16)down.template operator()<14U,true>("down_q6k_bf16");
+            else down.template operator()<14U,false>("down_q6k");
         } else {
-            prefill_resources<down_prefill_f16x_kq<12U,Tune>,Threads>("down_q4k",Tune);
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_kq<12U,Tune>),down_grid,dim3(Threads),0,stream,
-                down_weights,rows,shape.hidden,shape.rows);
+            if(rows.rawdots_bf16)down.template operator()<12U,true>("down_q4k_bf16");
+            else down.template operator()<12U,false>("down_q4k");
         }
         hip_check(hipGetLastError(),"FP16 prefill WMMA down (K-quant envelope)");
     };
@@ -2143,6 +2151,8 @@ void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned cou
         enqueue_prefill_kquant(request,rows,count,clear_words,gate,up,down_type,down_weights,stream,form);
         return;
     }
+    if(rows.rawdots_bf16)
+        throw std::invalid_argument("A8 prefill: BF16-rounded raw slot dots (rawdots_bf16) run in the K-quant envelope only");
     if((down_type!=7U&&down_type!=8U&&!gsq_a8::down_type(down_type))||(request.gate_type!=12U&&!q5k&&!q20)||
        (gsq_a8::down_type(down_type)&&!q20)||
        !gate||!up||!down_weights||
