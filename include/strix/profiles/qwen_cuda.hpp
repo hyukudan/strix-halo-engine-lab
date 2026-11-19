@@ -65,6 +65,15 @@ inline constexpr Lever table[] = {
      .source = "QSA prefill attention on the shared row-group core (core/attention_rowgroup.cuh: union of 4 rows' keys, BF16 "
                "tensor cores, FP32 accumulation); union byte-equal in its fixture; logit gate pending; changes logits",
      .provisional = {false, true, false}},
+    // Opt-in under fast (not a FAST bundle member until its gate receipt): the PLE key/value projections (Q8_0 weights) on
+    // the shared dense A8 projection (qwen_dense::quantize_project, int8 tensor cores, one FP32 FMA chain per output, the
+    // dense-a8-v1 projection contract of the GDN/QSA projections) instead of the FP32 lane chain of ple_project_kernel.
+    {.name = "ple_a8", .env = "STRIX_QRTX_PLE_A8", .option = "--ple-a8",
+     .value = {"", "", ""}, .builtin = "0",
+     .kind = Kind::bit_changing, .ready = {true, false, true}, .runnable = {false, true, false},
+     .target = "qwen-cuda-ple-a8-v1", .off = "0",
+     .source = "PLE key/value projections on the shared dense A8 projection (int8 tensor cores); FAST gate v2 pending; changes logits",
+     .provisional = {false, true, false}},
     // fast cell empty and turbo cell "0" (builtin): FAST experts are the expert_fast row, TURBO experts the integer
     // expert_turbo row; the single-chain moe_mma form refuses a non-incumbent expert arithmetic (qwen_options.hpp resolve),
     // and `--moe-mma on` (with `--expert-fast off` under fast) stays available explicitly, e.g. for a non-GSQ pack.
@@ -143,10 +152,12 @@ inline constexpr std::string_view kHcIdentity = "qwen-cuda-hc-f16mma-v2";
 inline constexpr std::string_view kMtpIdentity = "qwen-cuda-mtp-f16mma-v1";
 inline constexpr std::string_view kQsaIdentity = "qwen-cuda-qsa-bf16mma-v2";
 inline constexpr std::string_view kMoeIdentity = "qwen-cuda-moe-i8fma-v1";
+inline constexpr std::string_view kPleIdentity = "qwen-cuda-ple-a8-v1";
 
 // The runnable levers a resolution selects. Pending, off and builtin-off rows select nothing.
 struct Choice {
     bool moe_route_bf16 = false, hc_mma = false, mtp_mma = false, qsa_mma = false, moe_mma = false;
+    bool ple_a8 = false;  // after the five above, so their positional initialisers keep their meaning
     bool expert_turbo = false;  // maps to Config::expert_arithmetic (its identity is the arithmetic name, not a form)
     bool expert_fast = false;   // likewise (gsq-iq-bf16mma-cuda-v1)
     // Regime of expert_turbo (row expert_turbo_rows): int8 experts on prefill blocks of at least this many rows; nullopt:
@@ -154,7 +165,7 @@ struct Choice {
     std::optional<std::uint32_t> expert_turbo_rows{512};
     bool mtp_defer_prompt = false;  // exact: Config::defer_prompt_mtp
     bool expert_decode_tile = true; // exact: Config::expert_decode_tile (absent row = on)
-    bool fast() const { return moe_route_bf16 || hc_mma || mtp_mma || qsa_mma || moe_mma; }
+    bool fast() const { return moe_route_bf16 || hc_mma || mtp_mma || qsa_mma || moe_mma || ple_a8; }
     bool operator==(const Choice&) const = default;
 };
 
@@ -193,6 +204,7 @@ inline Choice choose(const pr::Resolution& r) {
     c.mtp_mma = lever_on(r, "mtp_mma");
     c.qsa_mma = lever_on(r, "qsa_mma");
     c.moe_mma = lever_on(r, "moe_mma");
+    c.ple_a8 = lever_on(r, "ple_a8");
     c.expert_turbo = lever_on(r, "expert_turbo");
     c.expert_fast = lever_on(r, "expert_fast");
     c.expert_turbo_rows = turbo_rows(r);
@@ -232,6 +244,7 @@ inline BundleStatus fast_bundle_status(const Choice& c, bool expert_bf16mma) {
     m.need(!c.moe_mma, "moe_mma on (not a member)");
     m.need(!c.mtp_mma, "mtp_mma on (not a member)");
     m.need(!c.moe_route_bf16, "moe_route_bf16 on (not a member)");
+    m.need(!c.ple_a8, "ple_a8 on (not a member)");
     return bundle_detail::status(kFastBundle, kFastBundleMembers, m, kFastBundleQualified);
 }
 
@@ -260,11 +273,13 @@ inline BundleStatus turbo_bundle_status(const Choice& c, bool expert_i8turbo_v1,
     m.need(!c.mtp_mma, "mtp_mma on (not a member)");
     m.need(!c.moe_mma, "moe_mma on (not a member)");
     m.need(!c.moe_route_bf16, "moe_route_bf16 on (not a member)");
+    m.need(!c.ple_a8, "ple_a8 on (not a member)");
     return bundle_detail::status(kTurboBundle, kTurboBundleMembers, m, kTurboBundleQualified);
 }
 inline std::string forms_list(const Choice& c) {
     std::string out;
-    for (const auto& [on, name] : {std::pair{c.hc_mma, "hc_mma"}, std::pair{c.mtp_mma, "mtp_mma"}, std::pair{c.qsa_mma, "qsa_mma"}, std::pair{c.moe_mma, "moe_mma"}})
+    for (const auto& [on, name] : {std::pair{c.hc_mma, "hc_mma"}, std::pair{c.mtp_mma, "mtp_mma"}, std::pair{c.qsa_mma, "qsa_mma"}, std::pair{c.moe_mma, "moe_mma"},
+                                  std::pair{c.ple_a8, "ple_a8"}})
         if (on) out += (out.empty() ? "" : ",") + std::string(name);
     return out;
 }
@@ -276,6 +291,7 @@ inline std::string form_identities(const Choice& c) {
     add(c.mtp_mma, kMtpIdentity);
     add(c.qsa_mma, kQsaIdentity);
     add(c.moe_mma, kMoeIdentity);
+    add(c.ple_a8, kPleIdentity);
     return out;
 }
 // The CUDA arithmetic of the prefill, as a stable string (receipt, hand-off producer id, prefix identity). A FAST run with

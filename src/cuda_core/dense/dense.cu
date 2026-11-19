@@ -1,4 +1,5 @@
 // Dense rows 1..16: BF16 / Q8_0 / F32 weights, FP32 accumulation in the fixed order documented in dense.hpp.
+#include "../../cuda/core/head_argmax.cuh"
 #include "strix/cuda_core/dense.hpp"
 #include "strix/cuda_core/nvfp4.hpp"
 
@@ -278,61 +279,6 @@ __global__ void embedding_kernel(const unsigned char* table, WeightFormat fmt, s
     }
 }
 
-// Two-stage argmax, lowest index wins ties. Stage 1: block (c, r) scans a contiguous chunk of row r; stage 2: one block per row.
-constexpr std::uint32_t kArgmaxChunks = 128;
-__device__ __forceinline__ bool better(float v, std::uint32_t i, float bv, std::uint32_t bi) {
-    return bi == 0xFFFFFFFFu || v > bv || (v == bv && i < bi);
-}
-__global__ void argmax_stage1(const float* logits, std::uint32_t vocab, float* pv, std::uint32_t* pi) {
-    pdl_trigger();
-    pdl_wait();
-    const float* l = logits + static_cast<std::size_t>(blockIdx.y) * vocab;
-    const std::uint32_t per = (vocab + kArgmaxChunks - 1) / kArgmaxChunks;
-    const std::uint32_t lo = blockIdx.x * per, hi = min(vocab, lo + per);
-    float best = 0.0f;
-    std::uint32_t bi = 0xFFFFFFFFu;
-    for (std::uint32_t i = lo + threadIdx.x; i < hi; i += blockDim.x) {
-        const float v = l[i];
-        if (better(v, i, best, bi)) {
-            best = v;
-            bi = i;
-        }
-    }
-    __shared__ float sv[256];
-    __shared__ std::uint32_t si[256];
-    sv[threadIdx.x] = best;
-    si[threadIdx.x] = bi;
-    __syncthreads();
-    for (unsigned s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s && si[threadIdx.x + s] != 0xFFFFFFFFu && better(sv[threadIdx.x + s], si[threadIdx.x + s], sv[threadIdx.x], si[threadIdx.x])) {
-            sv[threadIdx.x] = sv[threadIdx.x + s];
-            si[threadIdx.x] = si[threadIdx.x + s];
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        pv[blockIdx.y * kArgmaxChunks + blockIdx.x] = sv[0];
-        pi[blockIdx.y * kArgmaxChunks + blockIdx.x] = si[0];
-    }
-}
-__global__ void argmax_stage2(const float* pv, const std::uint32_t* pi, std::uint32_t* out) {
-    pdl_wait();
-    const std::size_t base = static_cast<std::size_t>(blockIdx.x) * kArgmaxChunks;
-    __shared__ float sv[kArgmaxChunks];
-    __shared__ std::uint32_t si[kArgmaxChunks];
-    sv[threadIdx.x] = pv[base + threadIdx.x];
-    si[threadIdx.x] = pi[base + threadIdx.x];
-    __syncthreads();
-    for (unsigned s = kArgmaxChunks / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s && si[threadIdx.x + s] != 0xFFFFFFFFu && better(sv[threadIdx.x + s], si[threadIdx.x + s], sv[threadIdx.x], si[threadIdx.x])) {
-            sv[threadIdx.x] = sv[threadIdx.x + s];
-            si[threadIdx.x] = si[threadIdx.x + s];
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) out[blockIdx.x] = si[0];
-}
-
 }  // namespace
 
 void set_programmatic_launch(bool on) { pdl_enabled() = on; }
@@ -434,10 +380,13 @@ cudaError_t embedding_rows(const DenseWeight& table, const std::uint32_t* ids, f
 cudaError_t argmax_rows(const float* logits, std::uint32_t vocab, std::uint32_t rows, std::uint32_t* out, void* workspace,
                         cudaStream_t stream) {
     if (workspace == nullptr || rows == 0 || rows > kMaxRows) return cudaErrorInvalidValue;
-    float* pv = static_cast<float*>(workspace);
-    std::uint32_t* pi = reinterpret_cast<std::uint32_t*>(pv + static_cast<std::size_t>(kMaxRows) * kArgmaxChunks);
-    if (auto e = launch_pdl(argmax_stage1, dim3(kArgmaxChunks, rows), dim3(256), stream, logits, vocab, pv, pi); e != cudaSuccess) return e;
-    return launch_pdl(argmax_stage2, dim3(rows), dim3(kArgmaxChunks), stream, static_cast<const float*>(pv), static_cast<const std::uint32_t*>(pi), out);
+    namespace hp = strix::cuda::core::head_argmax;  // the shared head pick (strix/head_argmax.hpp)
+    hp::View v;
+    v.logits = logits;
+    v.count = vocab;
+    v.rows = rows;
+    v.partial = static_cast<strix::head_argmax::Pick*>(workspace);
+    return hp::pick_rows<hp::Launch::pdl>(v, hp::EmitIndex{out}, stream);  // main's launch form for this core (PDL)
 }
 
 }  // namespace strix::cuda_core

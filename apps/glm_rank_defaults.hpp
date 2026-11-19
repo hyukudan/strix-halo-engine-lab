@@ -90,6 +90,9 @@ inline const std::vector<EnvItem>& env_items() {
          "Measurement: two-barrier KDA verify tree, bitwise == 9-barrier tree, token vectors match --mtp 0, +2.8 %", true, true},
         {"xfer-boundary-fused", "STRIX_GLM_BOUNDARY", "1", "0",
          "Measurement: Xfer reduce +1.41 -> fused boundary ~+1.10 ms/token over local, bitwise", false, true},
+        {"xfer-producer-publish", "STRIX_GLM_XB_PUBLISH", "1", "0",
+         "Measurement: decode producers publish the exchanged partial (no copy + publish launch), tokens/logits/state identical; "
+         "needs the fused boundary", false, true},
         {"moe-fast", "STRIX_GLM_MOE", "fast", "ref",
          "Measurement: FastMoe matches DefaultMoe bitwise (real TP2 slices); raw-only experts (fits GTT)", false, false},
         // =7 restores the previous large-call core (X2), =3 v3 for every call; the baseline restores v1.
@@ -346,6 +349,13 @@ inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& 
         // Prefill variant selectors: an unknown value fails here, at startup, instead of
         // silently selecting the default inside the engine.
         if (const auto* p = strix::glm::pf::pf_variant_find(it.env)) (void)strix::glm::pf::pf_variant_parse(*p, v.value.c_str());
+    }
+    // Split frames are cut by the publishing producers on the fused boundary (engine split_on gate): with either one
+    // resolved off the engine never splits, so the effective policy is off and the receipt says so.
+    if (e.split_policy.mode != strix::xport::SplitFramePolicy::Mode::off &&
+        (e.env.at("STRIX_GLM_BOUNDARY").value == "0" || e.env.at("STRIX_GLM_XB_PUBLISH").value == "0")) {
+        e.split_policy.mode = strix::xport::SplitFramePolicy::Mode::off;
+        e.split_frame = {e.split_policy.describe(), "needs-boundary-publish"};
     }
     const std::string shard_policy = env("STRIX_GLM_KV_SHARD") ? env("STRIX_GLM_KV_SHARD") : "0";
     if (shard_policy != "0" && shard_policy != "1" && shard_policy != "auto")

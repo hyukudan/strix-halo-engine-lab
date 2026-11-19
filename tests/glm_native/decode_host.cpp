@@ -1074,6 +1074,8 @@ void profile_tests(){
     // environment selection, refusal of bad names, --allow-pending
     check(run({},{{"STRIX_GLM_RTX_PROFILE","fast"}}).name==rp::Name::fast&&run({"--profile","quality"},{{"STRIX_GLM_RTX_PROFILE","fast"}}).name==rp::Name::quality,
           "STRIX_GLM_RTX_PROFILE selects; --profile wins");
+    check(run({"--profile","exact"}).name==rp::Name::standard&&rp::parse("default")==rp::Name::standard,
+          "--profile exact is the default column (shared tier parser)");
     for(auto args:{std::vector<std::string>{"--profile","turbo"},std::vector<std::string>{"--profile"}}){
         bool refused=false;try{(void)run(args);}catch(const std::invalid_argument&){refused=true;}check(refused,"bad or missing --profile refused");}
     {bool refused=false;try{(void)run({},{{"STRIX_GLM_RTX_PROFILE","x"}});}catch(const std::invalid_argument&){refused=true;}check(refused,"bad STRIX_GLM_RTX_PROFILE refused");}

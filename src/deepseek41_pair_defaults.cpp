@@ -262,10 +262,27 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
     // Resolve the bundle before admission, reporting and rank agreement. An explicit
     // component OFF wins. Canonical strings are also exported for execution/cache readers.
     // Shared bundle rules (strix/fast_profile.hpp); the dense row threshold is DS41's own auxiliary row.
+    // The bundle expands from its switch as the product profile selects it (fast_profile::profile_switch): a first
+    // resolution on the raw environment says whether the profile column applies the switch row; a set switch wins.
     namespace fp = strix::fast_profile;
-    auto fast_env = fp::expand(strix::ds41::fast_profile::kBundle, raw_env);
+    const auto& bundle = strix::ds41::fast_profile::kBundle;
+    strix::profile::take_options(profile_engine(), user, profile_inputs);
+    std::string selected;
+    {
+        const fp::Overrides none;
+        auto raw_inputs = profile_inputs;
+        raw_inputs.env = fp::lookup(none, raw_env);
+        const auto first = strix::profile::resolve(profile_engine(), raw_inputs);
+        for (const auto& e : first.entries)
+            if (e.lever->env == bundle.env && strix::profile::applied(e.status)) selected = e.value;
+    }
+    const fp::Getenv bundle_env = fp::profile_switch(bundle, selected, raw_env);
+    auto fast_env = fp::expand(bundle, bundle_env);
+    // Selected by the profile (switch unset): the switch row keeps the profile's status (set / provisional) in the
+    // receipt and the export; the expanded members are canonical overrides as with the switch.
+    if (!fp::set(raw_env(bundle.env))) fast_env.erase(bundle.env);
     if (const char* value = raw_env("STRIX_DS41_FAST_DENSE_MIN_ROWS");
-        fp::set(value) || fp::switch_on(raw_env("STRIX_DS41_FAST_PREFILL")) || fp::switch_on(raw_env("STRIX_DS41_FAST_DENSE")))
+        fp::set(value) || fp::switch_on(bundle_env(bundle.env)) || fp::switch_on(raw_env("STRIX_DS41_FAST_DENSE")))
         fast_env.emplace("STRIX_DS41_FAST_DENSE_MIN_ROWS", std::to_string(
             strix::ds41::fast_profile::dense_min_rows_value(value)));
     // The explicit Engram lever (not a bundle member): canonical value exported when set, like the members.
@@ -273,7 +290,6 @@ Resolved resolve(App app, const std::vector<std::string>& in, const Getenv& raw_
     if (const auto& e = strix::ds41::fast_profile::kShared; fp::set(raw_env(e.env))) fast_env.emplace(e.env, fp::canonical(e, raw_env(e.env)));
     if (const auto& e = strix::ds41::fast_profile::kMoeF16; fp::set(raw_env(e.env))) fast_env.emplace(e.env, fp::canonical(e, raw_env(e.env)));
     profile_inputs.env = fp::lookup(fast_env, raw_env);
-    strix::profile::take_options(profile_engine(), user, profile_inputs);
     r.profile = strix::profile::resolve(profile_engine(), profile_inputs);
     const auto profile_env = strix::profile::exports(*r.profile, fast_env);
     r.set_env = profile_env;

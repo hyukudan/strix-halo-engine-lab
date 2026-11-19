@@ -380,6 +380,7 @@ void synthetic(std::mt19937& rng) {
         for (std::size_t i = 5; i < lo.size(); i += 1009) lo[i] = specials[(i / 1009) % 7];
         for (std::size_t i = 7; i < hi.size(); i += 1013) hi[i] = specials[(i / 1013) % 7];
         Device<float> dsh(sb), dlo(lo), dhi(hi), sterm(std::size_t{sr} * n), xterm(std::size_t{sr} * hidden);
+        Device<float> dnorm(std::vector<float>(hidden, 1.0F));
         stored_sum_kernel<<<static_cast<unsigned>((sb.size() + 255U) / 256U), 256>>>(dsh.p, dlo.p, dhi.p, sb.size(), dsb.p);
         check(hipGetLastError(), "stored sum launch");
         // the separate kernels (STRIX_DS41_PREFILL_HC_FUSE=0): expansion, mixes, collapse
@@ -431,6 +432,33 @@ void synthetic(std::mt19937& rng) {
             expect(same_bits(sterm.down(), stream_ref) && same_mix(mixes.down(), mix_ref) && same_bits(xterm.down(), x_ref) &&
                        counters.down() == std::vector<std::uint32_t>(hc_site_counter_count(sr), 0U),
                    "site launch with the canonical sum in place bitwise, rows=" + std::to_string(sr) + " pass " + std::to_string(pass));
+            // Decode/batch use the non-collapse mix site, with the same input policy.
+            for (const std::uint32_t form : {1U, 2U}) {
+                t.collapse_out = nullptr;
+                t.form = form;
+                sterm.up(std::vector<float>(std::size_t{sr} * n, -1.0F));
+                enqueue_hc_site(t, nullptr);
+                expect(same_bits(sterm.down(), stream_ref) && same_mix(mixes.down(), mix_ref),
+                       "non-collapse canonical input bitwise, form=" + std::to_string(form) + " pass=" + std::to_string(pass));
+                // The production decode/batch consumer also collapses and normalizes in the same site.
+                t.norm_weight = dnorm.p;
+                t.norm_eps = 1e-20F;
+                t.collapse_mixes = dem.p;
+                t.out = xterm.p;
+                t.out_stride = hidden;
+                auto stored = t;
+                stored.sub = dsb.p;
+                stored.sub_low = stored.sub_high = nullptr;
+                stored.stream = sref.p;
+                stored.out = xref.p;
+                enqueue_hc_site(stored, nullptr);
+                enqueue_hc_site(t, nullptr);
+                expect(same_bits(xterm.down(), xref.down()),
+                       "non-collapse canonical input norm bitwise, form=" + std::to_string(form) + " pass=" + std::to_string(pass));
+                t.norm_weight = nullptr;
+                t.out = nullptr;
+
+            }
         }
     }
     {

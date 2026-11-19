@@ -309,6 +309,21 @@ __global__ void fed_inputs_kernel(const std::uint32_t* feed, std::uint32_t slot,
         ids[0] = feed[slot];
     }
 }
+// Verify pre-launch: the verify rows' ids, host values or drafted ids still in the chain's feed slots (gathered on the
+// device). Rows past the window get id 0, as set_inputs_kernel leaves them, so d_ids is the same array either way.
+constexpr std::uint32_t kFeedHostRow = 0xFFFFFFFFU;  // = strix::spec::DraftFeed::kHost
+struct FedPack {
+    std::uint32_t pos0;
+    std::uint32_t ids[cc::kMaxRows];
+    std::uint32_t slot[cc::kMaxRows];
+};
+__global__ void fed_rows_kernel(FedPack in, const std::uint32_t* feed, std::uint32_t* pos, std::uint32_t* ids) {
+    if (threadIdx.x == 0) *pos = in.pos0;
+    if (threadIdx.x < cc::kMaxRows) {
+        const std::uint32_t sl = in.slot[threadIdx.x];
+        ids[threadIdx.x] = sl == kFeedHostRow ? in.ids[threadIdx.x] : feed[sl];
+    }
+}
 
 // Multi-session batch tables (one small by-value pack, scattered to device arrays by one kernel before the graph).
 struct SlotPack {
@@ -360,6 +375,10 @@ struct CudaEngine::Impl {
     void* d_argws = nullptr;
     std::uint32_t *d_mids = nullptr, *d_mpos = nullptr, *d_mtop = nullptr;
     std::uint32_t* d_feed = nullptr;  // device-fed MTP chain: drafted ids, CudaEngine::kMtpFeedSlots entries
+    // Verify pre-launch: pinned staging of the feed ids + the event that marks their copy (mtp_feed_read_async / _wait).
+    cc::UniqueHandle<void*, cudaFreeHost> h_feed_owner;
+    std::uint32_t* h_feed = nullptr;
+    cc::UniqueHandle<cudaEvent_t, cudaEventDestroy> feed_ev;
     // Draft-only subset head (set_draft_rows): compact NVFP4 tiles of `head` + slot -> source tile table.
     strix::spec::DraftRows* drows = nullptr;
     unsigned char* dhead = nullptr;
@@ -471,7 +490,7 @@ struct CudaEngine::Impl {
         ao = alloc<float>(static_cast<std::size_t>(RM) * c.heads * c.head_dim);
         hid = alloc<float>(static_cast<std::size_t>(RM) * c.intermediate);
         logits = alloc<float>(static_cast<std::size_t>(RM) * c.vocab);
-        scratch = alloc<float>(cc::attention_scratch_floats(ad, RM));
+        scratch = alloc<float>(std::max(cc::attention_scratch_floats(ad, RM), cc::attention_decode8_scratch_floats(ad, RM)));
         d_ids = alloc<std::uint32_t>(RM);
         d_pos = alloc<std::uint32_t>(1);
         d_top = alloc<std::uint32_t>(RM);
@@ -487,6 +506,9 @@ struct CudaEngine::Impl {
             d_mpos = alloc<std::uint32_t>(1);
             d_mtop = alloc<std::uint32_t>(RM);
             d_feed = alloc<std::uint32_t>(CudaEngine::kMtpFeedSlots, true);
+            CK(cudaMallocHost(h_feed_owner.put(), CudaEngine::kMtpFeedSlots * sizeof(std::uint32_t)));
+            h_feed = static_cast<std::uint32_t*>(h_feed_owner.get());
+            CK(cudaEventCreateWithFlags(feed_ev.put(), cudaEventDisableTiming));
             const std::size_t n = static_cast<std::size_t>(c.kv_heads) * opt.max_positions * c.head_dim;
             mkc = alloc<__nv_bfloat16>(n, true);
             mvc = alloc<__nv_bfloat16>(n, true);
@@ -535,6 +557,7 @@ struct CudaEngine::Impl {
         CK(cudaStreamSynchronize(s));
         committed = 0;
         last_rows = 0;
+        d8_end = 0;
     }
 
     // ---- one attention layer body (shared by the trunk and the MTP block): mixer + MLP on rows of xa (residual stream).
@@ -543,6 +566,7 @@ struct CudaEngine::Impl {
         const std::uint32_t* pos;
         __nv_bfloat16 *kc, *vc;
         cc::RowMap rm{};
+        const cc::KvShadowE4m3* sh8 = nullptr;  // decode_attn8: the layer's e4m3 shadow (FAST8 decode attention), else BF16 attention
     };
 
     // GEMVs that share x: one launch when format and in agree (bitwise equal either way), else separate launches.
@@ -571,7 +595,7 @@ struct CudaEngine::Impl {
         CK(cc::rope_apply(q, qdst, c.rotary_dim, cos_t, sin_t, b.pos, s, b.rm));
         CK(cc::rope_apply(k, kvv, c.rotary_dim, cos_t, sin_t, b.pos, s, b.rm));
         CK(cc::kv_store(ad, k, v, b.kc, b.vc, b.pos, rows, s, b.rm));
-        CK(cc::attention_decode(ad, q, qdst, qg + D, qsrc, b.kc, b.vc, b.pos, rows, ao, scratch, s, b.rm));
+        CK(cc::attention_decode_kv(ad, q, qdst, qg + D, qsrc, b.kc, b.vc, b.sh8, b.pos, rows, ao, scratch, s, b.rm));
         CK(cc::dense_rows(w.o, ao, b.x, rows, b.x, s, opt.dense_arithmetic));
     }
 
@@ -600,7 +624,7 @@ struct CudaEngine::Impl {
                 CK(cc::gdn_window(gd, cl.layer, cl.state, cl.win, z, gout, rows, c.rms_eps, d_parity, s));
                 CK(cc::dense_rows(w.out, gout, x, rows, x, s, opt.dense_arithmetic));
             } else {
-                attn_mixer(w, Bufs{x, xn, d_pos, kc[l], vc[l]}, rows);
+                attn_mixer(w, Bufs{x, xn, d_pos, kc[l], vc[l], {}, decode8_on() ? &pf.sh[l] : nullptr}, rows);
             }
             mlp(w, Bufs{x, xn, d_pos, nullptr, nullptr}, rows);
         }
@@ -618,11 +642,54 @@ struct CudaEngine::Impl {
         if (rows == 0 || rows > RM) throw std::runtime_error("forward_rows: rows must be 1..32");
         core::require_capacity(committed, rows, opt.max_positions);
         core::validate_token_ids(tokens, rows, c.vocab);
+        if (decode8_on()) decode8_catch_up();
         InputPack in{};
         in.pos0 = committed;
         for (std::uint32_t i = 0; i < rows; ++i) in.ids[i] = tokens[i];
         set_inputs_kernel<<<1, 32, 0, s>>>(in, d_pos, d_ids);
         CK(cudaGetLastError());
+        return run_rows(rows, want);
+    }
+
+    // Verify pre-launch: forward() whose rows nhost.. take their ids from the chain's feed slots on the device (gathered by
+    // one kernel in place of set_inputs_kernel; the slots hold argmax ids < vocab by construction). Then the same graph.
+    RowsOut forward_fed(const std::uint32_t* host_ids, std::uint32_t nhost, const std::uint32_t* slot, const std::uint32_t* host_vals,
+                        std::uint32_t k, LogitRows want) {
+        const std::uint32_t rows = nhost + k;
+        if (!mtp_ok) throw std::runtime_error("forward_rows_fed: no MTP feed (no MTP tensors loaded)");
+        if (rows == 0 || rows > RM || nhost > rows) throw std::runtime_error("forward_rows_fed: rows must be 1..32");
+        core::require_capacity(committed, rows, opt.max_positions);
+        core::validate_token_ids(host_ids, nhost, c.vocab);
+        FedPack in{};
+        in.pos0 = committed;
+        for (std::uint32_t i = 0; i < cc::kMaxRows; ++i) in.slot[i] = kFeedHostRow;  // rows past the window: id 0
+        for (std::uint32_t i = 0; i < nhost; ++i) in.ids[i] = host_ids[i];
+        for (std::uint32_t j = 0; j < k; ++j) {
+            if (slot[j] == kFeedHostRow) {
+                core::validate_token_ids(&host_vals[j], 1, c.vocab);
+                in.ids[nhost + j] = host_vals[j];
+            } else {
+                if (slot[j] >= CudaEngine::kMtpFeedSlots) throw std::runtime_error("forward_rows_fed: feed slot out of range");
+                in.slot[nhost + j] = slot[j];
+            }
+        }
+        fed_rows_kernel<<<1, 32, 0, s>>>(in, d_feed, d_pos, d_ids);
+        CK(cudaGetLastError());
+        return run_rows(rows, want);
+    }
+    void mtp_feed_read_async(std::uint32_t n) {
+        if (!mtp_ok || n > CudaEngine::kMtpFeedSlots) throw std::runtime_error("mtp_feed_read_async: no MTP tensors or bad count");
+        CK(cudaMemcpyAsync(h_feed, d_feed, static_cast<std::size_t>(n) * 4, cudaMemcpyDeviceToHost, s));
+        CK(cudaEventRecord(feed_ev.get(), s));
+    }
+    void mtp_feed_wait(std::uint32_t n, std::uint32_t* host) {
+        if (!mtp_ok || n > CudaEngine::kMtpFeedSlots) throw std::runtime_error("mtp_feed_wait: no MTP tensors or bad count");
+        CK(cudaEventSynchronize(feed_ev.get()));
+        std::copy(h_feed, h_feed + n, host);
+    }
+
+    // The window after its inputs are on the device (d_pos, d_ids): replay (or capture) the trunk graph of (rows, want).
+    RowsOut run_rows(std::uint32_t rows, LogitRows want) {
         const std::uint32_t key = rows * 4 + static_cast<std::uint32_t>(want);
         if (graphs_on) {
             auto it = graphs.find(key);
@@ -666,6 +733,9 @@ struct CudaEngine::Impl {
         if (kk > 0) {
             CK(cc::gdn_commit(gd, commit_layers.data(), static_cast<std::uint32_t>(commit_layers.size()), last_rows, kk, d_parity, s));
         }
+        // decode_attn8: the window's rows were quantised into the shadow right after kv_store (attn_mixer), so the committed
+        // prefix stays mirrored when the shadow was current at the window start (forward() catches up first).
+        if (decode8_on() && d8_end == committed) d8_end += kk;
         committed += kk;
         last_rows = 0;
     }
@@ -694,6 +764,8 @@ struct CudaEngine::Impl {
         graphs.clear();
         mtp_graphs.clear();
         ss.graphs.clear();
+        feed_ev.reset();
+        h_feed_owner.reset();
         if (s) cc::nvfp4_release_workspace(s);
         pf.sl.clear();  // drain slot streams before freeing shared model/state buffers
         allocations.clear();
@@ -976,6 +1048,17 @@ struct CudaEngine::Impl {
         std::uint32_t sh_end = 0, sh_from = 0, start = 0;
     } pf;
     [[nodiscard]] bool attn8_on() const { return opt.prefill_attn8 && opt.prefill_arith != PrefillArith::exact; }
+    // decode_attn8 (FAST8 decode / verify attention over the same e4m3 shadow, identity -d8): positions < d8_end mirror the
+    // BF16 cache for decode. Main-session trunk only: slot batches (rm.slot) and the MTP block keep BF16 attention_decode.
+    std::uint32_t d8_end = 0;
+    [[nodiscard]] bool decode8_on() const { return opt.decode_attn8; }
+    void decode8_catch_up() {
+        pf_shadow_init();
+        if (d8_end >= committed) return;
+        for (std::uint32_t l = 0; l < c.layers; ++l)
+            if (L[l].attn) CK(cc::kv_shadow_e4m3(ad, kc[l], vc[l], pf.sh[l], d8_end, committed - d8_end, s));
+        d8_end = committed;
+    }
     void pf_shadow_init() {
         if (!pf.sh.empty()) return;
         const std::size_t bytes = cc::kv_shadow_e4m3_bytes(ad), p8 = cc::attn8_capacity(ad), kvd = static_cast<std::size_t>(c.kv_heads) * p8 * c.head_dim;
@@ -1768,6 +1851,10 @@ void print_effective_config(const EngineOptions& o, const char* arith, std::FILE
                  o.flash_pipe == cuda_core::FlashPipe::swz3 ? "swz3" : "pad2",
                  o.prefill_arith == PrefillArith::exact ? "n/a (exact prefill keeps attention_decode)"
                  : o.prefill_attn8 ? "on (e4m3 shadow KV + e4m3 flash, bit-changing, identity -a8)" : "off");
+    std::fprintf(f, "  decode-attn8: %s\n",
+                 o.decode_attn8 ? "on (FAST class d8: decode/verify attention on e4m3 tensor cores over the e4m3 shadow, identity -d8; "
+                                  "verify rows == serial rows inside the class; slot batches and the MTP block keep BF16 attention)"
+                                : "off (BF16 attention_decode)");
     const char* oc = o.prefill_operand_cache == cuda_core::operand_cache::Mode::off ? "per-call weight expansion"
                      : o.prefill_operand_cache == cuda_core::operand_cache::Mode::on
                          ? "every expanded class (FAST8 e4m3, exact f16 / q8) resident, expanded once"
@@ -1819,6 +1906,12 @@ CudaEngine::MtpOut CudaEngine::mtp_step_fed(const std::uint32_t* in_host, std::u
 }
 void CudaEngine::mtp_feed_put(std::uint32_t slot, const std::uint32_t* top_dev) { p_->mtp_feed_put(slot, top_dev); }
 void CudaEngine::mtp_feed_read(std::uint32_t n, std::uint32_t* host) const { p_->mtp_feed_read(n, host); }
+void CudaEngine::mtp_feed_read_async(std::uint32_t n) { p_->mtp_feed_read_async(n); }
+void CudaEngine::mtp_feed_wait(std::uint32_t n, std::uint32_t* host) { p_->mtp_feed_wait(n, host); }
+RowsOut CudaEngine::forward_rows_fed(const std::uint32_t* host_ids, std::uint32_t nhost, const std::uint32_t* slot,
+                                     const std::uint32_t* host_vals, std::uint32_t k, LogitRows want) {
+    return p_->forward_fed(host_ids, nhost, slot, host_vals, k, want);
+}
 void CudaEngine::read_logits(const RowsOut& o, std::uint32_t row, float* host) const {
     CK(cudaMemcpyAsync(host, o.logits + static_cast<std::size_t>(row) * p_->c.vocab, static_cast<std::size_t>(p_->c.vocab) * 4,
                        cudaMemcpyDeviceToHost, p_->s));

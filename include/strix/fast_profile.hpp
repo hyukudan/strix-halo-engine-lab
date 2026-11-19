@@ -29,6 +29,10 @@ struct Bundle {
     const char* env;            // the one switch
     const char* profile;        // named profile id, e.g. "ds41-fast-pf-v1"
     std::span<const Member> members;
+    // Receipt that qualifies the bundle for the product word `--profile fast` (public docs anchor); nullptr: the switch
+    // only. When set, every member must be a qualified fast cell of the engine's profile table with the member's value
+    // (tests/profile_fast_set_tests.cpp), so the word cannot silently stop selecting a gated bundle.
+    const char* profile_receipt = nullptr;
 };
 
 using Getenv = std::function<const char*(const char*)>;
@@ -83,6 +87,18 @@ inline Overrides expand(const Bundle& b, const Getenv& raw, const Admit& admit =
         else if (on && (!admit || admit(m))) out.emplace(m.env, m.value);
     }
     return out;
+}
+
+// The environment a bundle expands from once the product profile is known: when the bundle switch is unset and
+// `selected` (the value the resolved profile column applies to the switch row; empty: none) is not empty, the switch
+// reads `selected`; an explicitly set switch ("0" included) and every other variable read `raw`. A product profile
+// that selects the bundle therefore runs the same members and canonical values as setting the switch.
+inline Getenv profile_switch(const Bundle& b, std::string selected, Getenv raw) {
+    return [key = std::string(b.env), selected = std::move(selected), raw = std::move(raw)](const char* name) -> const char* {
+        const char* v = raw(name);
+        if (!set(v) && !selected.empty() && key == name) return selected.c_str();
+        return v;
+    };
 }
 
 // The lookup the profile resolution reads: overrides first, then the raw environment (empty = unset).
