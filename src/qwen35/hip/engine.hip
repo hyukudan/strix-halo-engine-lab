@@ -31,6 +31,7 @@
 #include "../../attn_core/dense_decode_flash.hpp"
 #include "../../core/dense_linear.hpp"
 #include "../../core/dense_linear_iu4.hpp"
+#include "../../core/tp_join.hpp"
 #include "../../core/window_state_buffers.hpp"
 #include "../../core/a4_tiles.hpp"
 #include "../../core/f16_dense_iu4.hpp"
@@ -512,70 +513,13 @@ __global__ void concat2_kernel(const float* a, const float* b, float* out, unsig
     }
 }
 
-// Tensor parallel (enable_tp). Join of an all-gather (strix/pair/tp_layout.hpp): out[r][c] = slots[base[c] + r * stride[c]].
-__global__ void tp_join_kernel(const float* slots, const int* base, const int* stride, unsigned cols, unsigned rows, float* out) {
-    for (std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < std::size_t(rows) * cols; i += std::size_t(gridDim.x) * blockDim.x) {
-        const unsigned r = unsigned(i / cols), c = unsigned(i % cols);
-        out[i] = slots[std::size_t(base[c]) + std::size_t(r) * unsigned(stride[c])];
-    }
-}
-// The same join of FP16 slots straight into the IU4 activation rows: xh[pos(r * cols + c)], pos = the placement of
-// dense_iu4::prepare (iu4_pairs::paired_index under scalar_x, identity otherwise). Each rank converted its own share
-// with prepare's elementwise kernel (to_f16_kernel) before the gather, so xh is bitwise prepare(joined FP32 rows).
-__global__ void tp_join16_kernel(const _Float16* slots, const int* base, const int* stride, unsigned cols, unsigned rows,
-                                 _Float16* xh, bool paired) {
-    for (std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < std::size_t(rows) * cols; i += std::size_t(gridDim.x) * blockDim.x) {
-        const unsigned r = unsigned(i / cols), c = unsigned(i % cols);
-        xh[paired ? core::iu4_pairs::paired_index(i) : i] = slots[std::size_t(base[c]) + std::size_t(r) * unsigned(stride[c])];
-    }
-}
-// Subset argmax index (compact column, as draft_argmax_map_kernel) -> vocab id through the draft-row group map.
-__global__ void tp_draft_map_kernel(const int* idx, unsigned count, const std::uint32_t* map, unsigned group, unsigned rows, int* out) {
-    const unsigned r = threadIdx.x;
-    if (r >= rows) return;
-    const unsigned c = unsigned(idx[r]);
-    out[r] = c < count ? int(map[c / group] * group + c % group) : idx[r];
-}
-// out[r][j] = src[r * src_stride + map[j]]: a replicated full row -> this rank's local order.
-__global__ void tp_select_kernel(const float* src, const int* map, unsigned src_stride, unsigned cols, unsigned rows, float* out) {
-    for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < rows * cols; i += gridDim.x * blockDim.x)
-        out[i] = src[std::size_t(i / cols) * src_stride + unsigned(map[i % cols])];
-}
-// argmax_kernel over this rank's vocab share (row stride `stride`), reporting (value, global index) per row.
-__global__ void tp_pick_kernel(const float* logits, unsigned count, unsigned stride, int index0, float* pick) {
-    __shared__ float bv[1024];
-    __shared__ int bi[1024];
-    const float* row = logits + std::size_t(blockIdx.x) * stride;
-    float best = -INFINITY;
-    int bidx = 0x7fffffff;
-    for (unsigned i = threadIdx.x; i < count; i += 1024U)
-        if (row[i] > best) { best = row[i]; bidx = int(i) + index0; }
-    bv[threadIdx.x] = best;
-    bi[threadIdx.x] = bidx;
-    __syncthreads();
-    for (unsigned s = 512U; s > 0U; s >>= 1U) {
-        if (threadIdx.x < s) {
-            const float v = bv[threadIdx.x + s];
-            const int i = bi[threadIdx.x + s];
-            if (v > bv[threadIdx.x] || (v == bv[threadIdx.x] && i < bi[threadIdx.x])) { bv[threadIdx.x] = v; bi[threadIdx.x] = i; }
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) { pick[2U * blockIdx.x] = bv[0]; pick[2U * blockIdx.x + 1U] = __int_as_float(bi[0]); }
-}
-// Fold of the ranks' picks in rank order with the same rule (pair::tp::beats): the one-rank argmax index.
-__global__ void tp_pick_join_kernel(const float* picks, unsigned ranks, unsigned stride, unsigned rows, int* out) {
-    const unsigned r = threadIdx.x;
-    if (r >= rows) return;
-    float bv = -INFINITY;
-    int bi = 0x7fffffff;
-    for (unsigned q = 0; q < ranks; ++q) {
-        const float v = picks[std::size_t(q) * stride + 2U * r];
-        const int i = __float_as_int(picks[std::size_t(q) * stride + 2U * r + 1U]);
-        if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
-    }
-    out[r] = bi;
-}
+// Exact TP joins / split argmax: shared HIP core (src/core/tp_join.hpp).
+using core::tp_join::tp_join_kernel;
+using core::tp_join::tp_join16_kernel;
+using core::tp_join::tp_draft_map_kernel;
+using core::tp_join::tp_select_kernel;
+using core::tp_join::tp_pick_kernel;
+using core::tp_join::tp_pick_join_kernel;
 
 }  // namespace
 
@@ -1569,12 +1513,14 @@ void HipEngine::read_logits(const HipRowsOut& o, std::uint32_t rows, float* host
 }
 void HipEngine::set_stage(std::uint32_t first, std::uint32_t last) {
     auto& p = *p_;
+    if (p.tp.on) throw std::logic_error("set_stage: tensor-parallel decode is on (the caches hold this rank's heads only)");
     if (first >= last || first < p.own_begin || last > p.own_end) throw std::invalid_argument("set_stage: range outside the owned layers");
     if (p.pending) throw std::logic_error("set_stage: a deferred window is pending");
     p.stage_begin = first; p.stage_end = last;
 }
 std::size_t HipEngine::state_bytes(std::uint32_t first, std::uint32_t last) const {
     const auto& p = *p_;
+    if (p.tp.on) throw std::logic_error("state_bytes: tensor-parallel decode is on (the caches hold this rank's heads only)");
     if (first >= last || first < p.own_begin || last > p.own_end) throw std::invalid_argument("state_bytes: range outside the owned layers");
     std::size_t total = 0;
     for (auto l = first; l < last; ++l)
@@ -1583,6 +1529,7 @@ std::size_t HipEngine::state_bytes(std::uint32_t first, std::uint32_t last) cons
 }
 void HipEngine::export_state(std::uint32_t first, std::uint32_t last, void* host) const {
     auto& p = *p_;
+    if (p.tp.on) throw std::logic_error("export_state: tensor-parallel decode is on (the caches hold this rank's heads only)");
     if (p.pending) throw std::logic_error("export_state: a deferred window is pending");
     auto* out = static_cast<std::byte*>(host);
     const auto copy = [&](const void* d, std::size_t bytes) {
@@ -1597,6 +1544,7 @@ void HipEngine::export_state(std::uint32_t first, std::uint32_t last, void* host
 }
 void HipEngine::import_state(std::uint32_t first, std::uint32_t last, std::uint32_t positions, const void* host) {
     auto& p = *p_;
+    if (p.tp.on) throw std::logic_error("import_state: tensor-parallel decode is on (the caches hold this rank's heads only)");
     if (p.pending) throw std::logic_error("import_state: a deferred window is pending");
     if (positions != p.committed) throw std::invalid_argument("import_state: positions differ from this rank's committed count");
     const auto* in = static_cast<const std::byte*>(host);

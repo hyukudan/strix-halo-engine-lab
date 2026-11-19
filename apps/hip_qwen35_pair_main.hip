@@ -249,9 +249,10 @@ int main(int argc, char** argv) try {
     // Decode placement from the declaration through the ONE planner: with every node's memory declared, the handoff
     // admission runs first (a decoder that holds the whole model + state receives every stage's layer state once after the
     // prefill and decodes alone: a layer split only serialises the decode). Undeclared memory, no fitting decoder, or a
-    // decoder outside the stage chain keep the layer-owned decode. STRIX_PAIR_DECODE_RELAY=0: layer-owned (rollback).
-    const bool relay_allowed = strix::envcfg::flag("STRIX_PAIR_DECODE_RELAY", true);
-    std::string decode_reason = !relay_allowed ? "STRIX_PAIR_DECODE_RELAY=0" : !chain::memory_declared(topo) ? "node memory not declared" : "";
+    // decoder outside the stage chain keep the layer-owned decode. The relay is OFF by default until its pair receipt
+    // (decode tok/s and ids against the one-node reference) exists for this tree: STRIX_PAIR_DECODE_RELAY=1 enables it.
+    const bool relay_allowed = strix::envcfg::flag("STRIX_PAIR_DECODE_RELAY", false);
+    std::string decode_reason = !relay_allowed ? "STRIX_PAIR_DECODE_RELAY off (default; =1 enables the relay)" : !chain::memory_declared(topo) ? "node memory not declared" : "";
     chain::Plan plan;
     if (decode_reason.empty()) {
         request.layer_owned_state = false;

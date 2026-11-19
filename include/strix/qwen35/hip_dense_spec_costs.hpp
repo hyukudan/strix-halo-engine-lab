@@ -15,6 +15,9 @@
 // draft prices follow from the model's MTP-layer and head bytes at the stream rate V(1) implies (one row streams every
 // weight once). "table" = the compiled cluster1 receipt below, a FALLBACK only (calibration off or invalid), reported as
 // such on the run's spec config line. The same flags and resolver serve every entry point (HipDenseSpecArgs).
+// Exact tensor-parallel decode (--tp-rank) is the one forced use of the table: every rank must choose the same verify
+// windows, so it runs the table, labelled "table (forced: ranks must agree)"; an explicit calibrated / learned request
+// with --tp-rank is refused (a TP-calibrated table agreed by both ranks is the follow-up).
 // Home: qwen35 HIP binding (shared resolver of the family); the controller itself is shared (src/spec).
 #include <cmath>
 #include <cstdint>
@@ -25,7 +28,7 @@
 
 namespace strix::qwen35 {
 
-// FALLBACK table (not a policy): verify wall per full row bucket, ms (HDD2-T1 cost table, cluster1, commit full, ctx 256+).
+// FALLBACK table (not a policy; forced only under exact TP decode, see above): verify wall per full row bucket, ms (HDD2-T1 cost table, cluster1, commit full, ctx 256+).
 inline constexpr std::uint32_t kHipDenseBucketRows[] = {1U, 2U, 4U, 8U, 16U};
 inline constexpr double kHipDenseBucketMsScalar[] = {73.141, 73.747, 76.526, 82.637, 126.841};  // STRIX_IU4_SCALAR_X on (default)
 inline constexpr double kHipDenseBucketMsVector[] = {76.646, 76.934, 89.104, 118.866, 214.443};  // STRIX_IU4_SCALAR_X=0
