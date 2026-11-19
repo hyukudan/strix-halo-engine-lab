@@ -4594,7 +4594,7 @@ if(BUILD_TESTING)
 endif()
 # Shared Engram component (hashed n-gram memory, any family): Spec, hash, row reader, row decode. Host, vendor-free.
 find_package(Threads REQUIRED)
-add_library(strix_engram STATIC src/engram/spec.cpp src/engram/hasher.cpp src/engram/row_reader.cpp)
+add_library(strix_engram STATIC src/engram/spec.cpp src/engram/hasher.cpp src/engram/row_reader.cpp src/engram/read_ahead.cpp)
 target_include_directories(strix_engram PUBLIC include PRIVATE src)
 target_compile_features(strix_engram PUBLIC cxx_std_20)
 target_link_libraries(strix_engram PUBLIC Threads::Threads)
