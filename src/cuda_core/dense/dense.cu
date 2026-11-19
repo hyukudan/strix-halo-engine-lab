@@ -386,7 +386,7 @@ cudaError_t argmax_rows(const float* logits, std::uint32_t vocab, std::uint32_t 
     v.count = vocab;
     v.rows = rows;
     v.partial = static_cast<strix::head_argmax::Pick*>(workspace);
-    return hp::pick_rows(v, hp::EmitIndex{out}, stream);
+    return hp::pick_rows<hp::Launch::pdl>(v, hp::EmitIndex{out}, stream);  // main's launch form for this core (PDL)
 }
 
 }  // namespace strix::cuda_core
