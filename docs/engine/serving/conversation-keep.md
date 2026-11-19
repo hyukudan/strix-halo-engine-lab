@@ -28,11 +28,11 @@ would exceed it, without evicting existing entries. Preparation allocates all no
 commit transfers their ownership without allocation, and abort destroys the pending payload. When the lead observes host memory pressure at admission, kept entries are evicted before a
 request or its snapshot is refused.
 
-A follow-up turn hits only if its prompt extends the kept key. With MTP the key is the prompt plus the first
-generated token, and the chat template opens the reasoning block in the generation prompt, so:
-
-- a client that returns the reasoning of earlier turns (`reasoning_content`, with `preserve_thinking: true`) hits;
-- a client that drops it renders `<think></think>` in the history and misses under MTP (it hits with `--mtp-spec 0`).
+A follow-up turn hits only if its prompt extends the kept key. The prompt-end key is the prompt itself, with or
+without MTP, so a client that drops the reasoning of earlier turns (the history renders `<think></think>`) hits as
+well as one that returns it (`reasoning_content`, with `preserve_thinking: true`). Under MTP the snapshot's last MTP
+row was paired with the first generated token rather than the follow-up's next token; that only changes drafts,
+which are always verified, the same as at every chunk boundary of a chunked MTP prefill.
 
 `STRIX_GLM_SERVE_REPLY_KEEP=1` (opt-in, plain decode only) also snapshots the end of a reply. Its follow-up is
 not always token-identical to a cold prefill, so it stays off.

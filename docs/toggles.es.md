@@ -131,6 +131,7 @@ Las tablas listan los flags seleccionados. La lista completa de variables de ent
 | Flag | Motor | Por defecto | Qué hace | Cuándo lo quiere otro hardware |
 |---|---|---|---|---|
 | `--mtp-bundle`, `--rope-yarn 2\|4 --context C` | qwen | - | Bundle de draft MTP; YaRN para contexto largo. | - |
+| `--prelaunch 0\|1` | qwen-rtx (CLI spec densa 27B) | `0` | Lanza el verify detrás del draft MTP alimentado en el dispositivo (mismos ids). | - |
 | `--mtp-catchup kv\|full` | qwen-rtx (CLI spec 27B) | `kv` | Catch-up MTP solo K/V: los chunks de catch-up cuyas salidas nadie lee escriben solo la K/V del MTP (misma K/V, mismos drafts). `full` = la pasada MTP completa (interruptor de apagado). [Detalles](optimizations.md#qwen27-cuda-mtp-kv-catchup) | - |
 | `--mtp 0\|1` | glm | resuelto (ver `--print-effective-config`) | Apaga o enciende el draft MTP. | `0` cuando falta memoria. |
 | `--identity r1b\|r1` | glm | `r1b` | Identidad de decode. | `r1` para comparar. |
@@ -242,7 +243,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_HOST_WAIT` | qwen | block | [host-wait-policy](optimizations.md#host-wait-policy) |
 | `STRIX_SESSION_CACHE` | minimax | on (two-node serve route) | [mm-sessions](optimizations.md#mm-sessions) |
 
-### Prefill (97)
+### Prefill (98)
 
 | Toggle | Motor | Por defecto | Detalles |
 |---|---|---|---|
@@ -365,6 +366,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_SERVE_PREFILL_GROUP` | deepseek (par) | auto | varios prompts cortos admitidos a la vez comparten una pasada de prefill en el dispositivo; `0` = una pasada por prompt; `STRIX_SERVE_PREFILL_GROUP_MEMBERS` (2..64) limita un grupo; [página de DeepSeek](models/deepseek-v4.1/README.es.md) |
 | `STRIX_SERVE_T16K` | qwen | ON: T16384 owner when the context admits a 32,768-token request and every resident slot fits; `0` keeps T8192 | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 | `STRIX_SERVE_FP16_MTP` | qwen | ON: explicit-sidecar MTP servers keep the automatic FP16 prefill arithmetic with the unqualified fast options off; `0` declines it | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
+| `STRIX_QRTX_PLE_A8` | qwen-rtx | off (opt-in con `--profile fast`, gate FAST pendiente) | [qwen-rtx-ple-a8](optimizations.md#qwen-rtx-ple-a8) |
 
 ### Decode, MTP y DSpark (25)
 

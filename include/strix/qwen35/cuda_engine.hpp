@@ -230,6 +230,15 @@ public:
                         std::uint32_t pos, bool want_top = true);
     void mtp_feed_put(std::uint32_t slot, const std::uint32_t* top_dev);  // slot = *top_dev (async, device to device)
     void mtp_feed_read(std::uint32_t n, std::uint32_t* host) const;       // host[0..n) = slots 0..n-1 (synchronizes)
+    // Verify pre-launch (strix/spec/block_drafter.hpp): mtp_feed_read_async(n) queues the copy of slots 0..n-1 to pinned
+    // host staging (no wait); mtp_feed_wait(n, host) waits for THAT copy only (not for work queued after it).
+    void mtp_feed_read_async(std::uint32_t n);
+    void mtp_feed_wait(std::uint32_t n, std::uint32_t* host);
+    // forward_rows whose first nhost row ids are host values (host_ids) and whose next k rows take their ids on the device
+    // from feed slots slot[j] (or host_vals[j] when slot[j] == strix::spec::DraftFeed::kHost = 0xFFFFFFFF). Same graph,
+    // same operands as forward_rows(tokens) with tokens = host ids + the feed ids; nothing is read or waited for.
+    RowsOut forward_rows_fed(const std::uint32_t* host_ids, std::uint32_t nhost, const std::uint32_t* slot,
+                             const std::uint32_t* host_vals, std::uint32_t k, LogitRows want = LogitRows::all);
     // Draft-only MTP head over a vocabulary subset (strix/spec/draft_rows.hpp, group 16 = one NVFP4 tile of the head):
     // before each head launch the engine copies the rows' new tiles into a compact head (device-to-device, no
     // re-quantisation) and maps the argmax back to token ids on the device, so MtpOut::top stays a token id. MtpOut::logits

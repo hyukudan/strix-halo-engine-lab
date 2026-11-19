@@ -5045,6 +5045,24 @@ values outside the band, so byte comparisons of that buffer need `STRIX_IDX_WMMA
 
 ## Qwen RTX PRO standalone
 
+<a id="qwen-rtx-ple-a8"></a>
+
+### PLE projections on the shared dense A8 projection (FAST form `ple_a8`)
+
+**Engine:** `qwen-rtx`. **Control:** `--ple-a8 on|off`, `STRIX_QRTX_PLE_A8` (lever row `ple_a8`, identity `qwen-cuda-ple-a8-v1`). **Default:** off (opt-in under `--profile fast`; not a FAST bundle member until its gate passes).
+
+In a prefill block the PLE key projection (2560 -> 10240) and value projection (2560 -> 2560) read the same gathered rows.
+Under `ple_a8` they are two segments of one shared dense A8 projection (one activation quantize, one int8 tensor-core
+launch, the `dense-a8-v1` projection contract) instead of two FP32 lane-chain launches. Verify and decode windows keep the
+exact projections.
+
+- **Preconditions:** CUDA Qwen MoE prefill blocks under `--profile fast` with `--ple-a8 on` (the row is runnable under `fast` only).
+- **Automatic selection:** none.
+- **Exactness evidence:** FAST class (changes the PLE keys and values). FAST gate: not run yet. The arithmetic contract and the prefix identity name the form when it is on; off, the same launches run as before.
+- **Off switch:** `--ple-a8 off`; `STRIX_QRTX_PLE_A8=0` (the default).
+- **Measured gain:** Not yet measured.
+- **Implementation / evidence:** [call site](../src/cuda/models/qwen/qwen_prefill_driver.cu), [lever row](../include/strix/profiles/qwen_cuda.hpp), [no-model bench](../tests/cuda/qwen_ple_a8_bench.cu)
+
 <a id="qwen-rtx-prefix-cache"></a>
 
 ### Prompt prefix cache
@@ -5136,6 +5154,24 @@ A device without a row runs the EXACT targets.
 - **Off switch:** `--split-k exact` (also under `--profile fast`), or `--profile exact`.
 - **Measured gain:** RTX PRO 6000 at 600 W, converted NVFP4 pack, greedy spec decode (sub15d), 1,200 tokens, two strict A/B pairs of 3 runs each: think 262.02 / 261.66 -> 263.83 / 263.90 tok/s (+0.7 / +0.9 %), verify 14.07 / 14.08 -> 13.99 / 13.98 ms per step (-0.5 / -0.7 %); FAST also changes the accepted drafts on think (263 -> 262 steps, E 4.56 -> 4.58), so its tok/s is not a pure per-step figure: per step 17.399 -> 17.346 ms (-0.3 %); code 334.32 / 333.94 -> 335.53 / 336.18 tok/s (+0.4 / +0.7 %, within 3x the run spread), verify 14.94 / 14.94 -> 14.85 / 14.81 ms per step. GPU clocks 2,550-2,750 MHz across the four runs.
 - **Implementation / evidence:** [policy](../include/strix/split_k_policy.hpp), [GEMV](../src/cuda_core/dense/nvfp4.cu), [policy test](../tests/split_k_policy_host_tests.cpp), [profile test](../tests/qwen35_dense_profile_host_tests.cpp)
+
+<a id="qwen-dense-cuda-verify-prelaunch"></a>
+
+### Qwen dense 27B CUDA spec: verify pre-launch behind the device-fed MTP draft
+
+**Engine:** `qwen-rtx` (dense 27B). **Control:** `--prelaunch 0|1` on `strix-cuda-qwen35-spec`. **Default:** off (`0`) until its timing receipt.
+
+The verify of a speculative block reads the drafted ids from the device feed slots instead of from the host: the MTP
+chain queues the copy of its ids to the host, the verify graph is launched behind the draft on the same stream (a
+32-thread gather kernel writes the ids into the verify inputs, then the same trunk graph runs), and only then does the
+host wait for the ids. The host no longer stands between the last draft kernel and the first verify kernel.
+
+- **Preconditions:** CUDA Qwen dense spec CLI with the MTP chain drafter (chain-only and hybrid blocks); other drafters and engines decline the pre-launch and run the serial form.
+- **Automatic selection:** none yet; the CLI prints `prelaunch[TAG]: on|off, pre-launched steps N of M`.
+- **Exactness evidence:** Scheduling only: the verify runs the same graph on the same position and id contents in the same stream order; emitted ids equal the serial greedy ids in every block (host tests: same MTP calls and proposals, feed slots resolve to the drafted ids, identical emitted ids and block traces with the controller on and off).
+- **Off switch:** `--prelaunch 0` (the default).
+- **Measured gain:** Not yet measured.
+- **Implementation / evidence:** [contract](../include/strix/spec/block_drafter.hpp), [MTP chain](../include/strix/spec/mtp_chain.hpp), [CUDA binding](../src/qwen35/cuda/engine.cu)
 
 ## Platform (kernel)
 

@@ -19,6 +19,9 @@
 // read per position. Same calls in the same order with the same operands: the drafted ids are bitwise those of the
 // host-fed chain (tests/spec_mtp_chain_tests.cpp). Feed slot layout per draft: 0 = the flushed prediction (d1),
 // 1 = the last prefix step's prediction, 1 + j = chain step j's draft.
+// VERIFY PRE-LAUNCH (optional, detected by MtpPrelaunchEngine: mtp_feed_read_async(n) + mtp_feed_wait(n, host)):
+// draft_prelaunch() enqueues the same draft, queues the ids' copy to host staging, hands the slot map to the caller's
+// launch (which enqueues the verify behind the draft), and only then waits for the copy.
 #include <algorithm>
 #include <chrono>
 #include <concepts>
@@ -36,6 +39,13 @@ concept MtpFeedEngine = requires(E& e, const std::uint32_t* t, std::uint32_t* h,
     e.mtp_step_fed(t, u, u, x, u, true);
     e.mtp_feed_put(u, t);
     e.mtp_feed_read(u, h);
+};
+// VERIFY PRE-LAUNCH hooks (strix/spec/block_drafter.hpp): mtp_feed_read_async(n) enqueues the copy of slots 0..n-1 to host
+// staging (no wait); mtp_feed_wait(n, host) waits for that copy only (not for work enqueued after it) and fills host[0..n).
+template <class E>
+concept MtpPrelaunchEngine = MtpFeedEngine<E> && requires(E& e, std::uint32_t* h, std::uint32_t u) {
+    e.mtp_feed_read_async(u);
+    e.mtp_feed_wait(u, h);
 };
 
 // K/V-ONLY CATCH-UP (optional backend hook, detected by MtpKvEngine): Engine::mtp_kv(next_tokens, hidden_dev, rows, pos0)
@@ -123,6 +133,28 @@ public:
     void set_device_feed(bool on) { feed_ = on; }
     [[nodiscard]] bool device_feed() const { return MtpFeedEngine<Engine> && feed_; }
     [[nodiscard]] std::uint64_t host_reads() const { return reads_; }  // synchronizing id reads issued by the chain
+    // Verify pre-launch: draft_fed() (same calls, same ids), with launch(prefix, feed) called after the draft is enqueued
+    // and the ids' copy to host staging is queued, before waiting for that copy.
+    bool draft_prelaunch(std::span<const std::uint32_t> prefix, std::uint32_t k, std::vector<std::uint32_t>& out,
+                         const PrelaunchFn& launch) override {
+        if constexpr (MtpPrelaunchEngine<Engine>) {
+            if (!feed_ || k == 0 || std::size_t(k) + 1 > Engine::kMtpFeedSlots || k > DraftFeed::kMax) return false;
+            const auto t0 = std::chrono::steady_clock::now();
+            out.clear();
+            draft_fed(prefix, k, out, &launch);
+            draft_wall_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            ++drafts_;
+            ++prelaunched_;
+            return true;
+        } else {
+            (void)prefix;
+            (void)k;
+            (void)out;
+            (void)launch;
+            return false;
+        }
+    }
+    [[nodiscard]] std::uint64_t prelaunched() const { return prelaunched_; }  // draft_prelaunch() drafts
     // K/V-only catch-up (engines with MtpKvEngine): off = the incumbent calls (rollback); on = catch-up chunks whose outputs
     // nobody reads only write the MTP K/V (same K/V bits, so the same drafts). On by default where the engine has the hook;
     // its device gate compares the MTP K/V bytes of the prompt rows, ids, steps and the k histogram with the full catch-up
@@ -134,7 +166,9 @@ public:
 
 private:
     // draft() over the device feed: the same mtp calls in the same order, ids read once at the end (DEVICE FEED above).
-    void draft_fed(std::span<const std::uint32_t> prefix, std::uint32_t k, std::vector<std::uint32_t>& out) {
+    // launch (pre-launch only): called once after the copy of the ids to host staging is queued, before the wait.
+    void draft_fed(std::span<const std::uint32_t> prefix, std::uint32_t k, std::vector<std::uint32_t>& out,
+                   const PrelaunchFn* launch = nullptr) {
         const bool flushed = !next_.empty();
         if (flushed) flush(true);  // d1 -> feed slot 0
         std::uint32_t pos = mtp_pos_;
@@ -151,7 +185,24 @@ private:
         for (std::uint32_t j = 1; j < k; ++j)
             fed_step(j == 1 && !first_dev ? &d1_ : nullptr, j == 1 ? first_slot : j, 1 + j, pos++, true);
         std::uint32_t ids[Engine::kMtpFeedSlots]{};
-        if (first_dev || k > 1) {
+        const bool read = first_dev || k > 1;
+        if constexpr (MtpPrelaunchEngine<Engine>) {
+            if (launch) {
+                // Draft j: slot first_slot (j == 0 on the device) or host d1_ (j == 0 not on the device); slot 1 + j after.
+                DraftFeed f;
+                f.k = k;
+                f.slot[0] = first_dev ? first_slot : DraftFeed::kHost;
+                f.host_id[0] = first_dev ? 0U : d1_;
+                for (std::uint32_t j = 1; j < k; ++j) f.slot[j] = 1 + j;
+                if (read) e_.mtp_feed_read_async(k + 1);
+                (*launch)(prefix, f);
+                if (read) {
+                    e_.mtp_feed_wait(k + 1, ids);
+                    ++reads_;
+                }
+            }
+        }
+        if (read && launch == nullptr) {
             e_.mtp_feed_read(k + 1, ids);
             ++reads_;
         }
@@ -244,7 +295,7 @@ private:
     std::vector<std::uint32_t> next_, succ_;
     std::uint32_t mtp_pos_ = 0, d1_ = 0;
     std::uint32_t top_tmp_[32]{};
-    std::uint64_t calls_ = 0, rows_ = 0, drafts_ = 0, reads_ = 0, kv_calls_ = 0;
+    std::uint64_t calls_ = 0, rows_ = 0, drafts_ = 0, reads_ = 0, kv_calls_ = 0, prelaunched_ = 0;
     bool feed_ = true;
     bool kv_catchup_ = true;
     double draft_wall_ms_ = 0.0;

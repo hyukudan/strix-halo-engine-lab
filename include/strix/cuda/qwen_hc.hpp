@@ -119,10 +119,6 @@ void lm_head(const std::uint16_t* hidden, const void* output_q8, std::uint32_t v
 // r at logits + r * logits_stride).
 void lm_head_rows(const std::uint16_t* hidden, std::uint64_t hidden_stride, std::uint32_t rows, const void* output_q8,
     std::uint32_t vocab, float* logits, std::uint64_t logits_stride, cudaStream_t stream);
-// Device first_max_token per row: out[r] = token, or 0xffffffff when a logit is non-finite.
-void first_max_rows(const float* logits, std::uint64_t stride, std::uint32_t rows, std::uint32_t count, std::uint32_t* out,
-    cudaStream_t stream);
-// Host first maximum (strict >, lowest index wins); throws std::invalid_argument on a non-finite logit or empty input.
 [[nodiscard]] std::uint32_t first_max_token(const float* logits, std::size_t count);
 
 }  // namespace strix::cuda::qwen_hc

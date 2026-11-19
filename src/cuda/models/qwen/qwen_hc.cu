@@ -1611,42 +1611,6 @@ __global__ __launch_bounds__(256) void lm_head_rows_kernel(const std::uint16_t* 
     }
 }
 
-// Greedy selection on the device (select_greedy_token semantics): first maximum, lowest index on ties (+0 == -0);
-// a non-finite logit sets out[row] = 0xffffffff.
-__global__ __launch_bounds__(1024) void first_max_kernel(const float* __restrict__ logits, std::uint64_t stride, std::uint32_t count,
-    std::uint32_t* __restrict__ out) {
-    const float* x = logits + static_cast<std::size_t>(blockIdx.x) * stride;
-    float best = 0.0F;
-    unsigned index = 0xffffffffU;
-    bool bad = false;
-    for (unsigned i = threadIdx.x; i < count; i += blockDim.x) {
-        const float v = x[i];
-        if (!isfinite(v)) bad = true;
-        else if (index == 0xffffffffU || v > best) { best = v; index = i; }
-    }
-    __shared__ float bv[1024];
-    __shared__ unsigned bi[1024];
-    __shared__ int any_bad;
-    if (threadIdx.x == 0) any_bad = 0;
-    __syncthreads();
-    if (bad) any_bad = 1;
-    bv[threadIdx.x] = best;
-    bi[threadIdx.x] = index;
-    __syncthreads();
-    for (unsigned d = blockDim.x / 2U; d > 0U; d /= 2U) {
-        if (threadIdx.x < d) {
-            const float v = bv[threadIdx.x + d];
-            const unsigned j = bi[threadIdx.x + d];
-            if (j != 0xffffffffU && (bi[threadIdx.x] == 0xffffffffU || v > bv[threadIdx.x] || (v == bv[threadIdx.x] && j < bi[threadIdx.x]))) {
-                bv[threadIdx.x] = v;
-                bi[threadIdx.x] = j;
-            }
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) out[blockIdx.x] = any_bad || bi[0] == 0xffffffffU ? 0xffffffffU : bi[0];
-}
-
 unsigned blocks_for(std::size_t total, unsigned threads) { return static_cast<unsigned>((total + threads - 1U) / threads); }
 
 }  // namespace
@@ -1902,12 +1866,6 @@ void lm_head_rows(const std::uint16_t* hidden, std::uint64_t hidden_stride, std:
     default: throw std::invalid_argument("qwen_hc lm_head_rows: rows must be 1..8");
     }
     check(cudaGetLastError(), "lm head rows launch");
-}
-void first_max_rows(const float* logits, std::uint64_t stride, std::uint32_t rows, std::uint32_t count, std::uint32_t* out,
-    cudaStream_t stream) {
-    if (!rows) return;
-    first_max_kernel<<<rows, 1024U, 0, stream>>>(logits, stride, count, out);
-    check(cudaGetLastError(), "first max launch");
 }
 std::uint32_t first_max_token(const float* logits, std::size_t count) {  // select_greedy_token, src/serial_request.cpp:12-55
     if (count == 0U || count > 0x100000000ULL) throw std::invalid_argument("greedy selection vocabulary size is invalid");

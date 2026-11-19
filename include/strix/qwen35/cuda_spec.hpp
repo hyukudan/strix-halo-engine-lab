@@ -7,6 +7,8 @@
 //
 // SpecEngine owns the glue state of one stream:
 //   verify(tokens)  -> forward_rows(R, all logits) + host argmax of every row           (strix::spec::VerifyTarget)
+//   verify_launch_fed(host rows, feed) / verify_collect(tokens)  -> verify pre-launch: forward_rows_fed behind the draft
+//                      (drafted ids gathered from the chain's feed slots on the device), then the same read as verify()
 //   commit(k)       -> engine commit(k) (+ host sync so the step wall is complete)
 //   make_chain()    -> native MTP drafter (strix::spec::ChainDrafter = shared MtpChain)
 #include <chrono>
@@ -57,6 +59,23 @@ public:
         greedy.resize(rows);
         e_.read_top(o, rows, greedy.data());  // synchronizes
         if (chain_) chain_->observe_verify(o, rows);
+    }
+    // Verify pre-launch (strix/spec/block_drafter.hpp): the verify graph is enqueued behind the draft with the drafts'
+    // ids gathered from the chain's feed slots on the device; verify_collect() reads the result like verify().
+    bool verify_launch_fed(std::span<const std::uint32_t> host_rows, const strix::spec::DraftFeed& feed) override {
+        if (!chain_) return false;
+        pending_ = e_.forward_rows_fed(host_rows.data(), static_cast<std::uint32_t>(host_rows.size()), feed.slot.data(),
+                                       feed.host_id.data(), feed.k, LogitRows::all);
+        pending_rows_ = static_cast<std::uint32_t>(host_rows.size()) + feed.k;
+        return true;
+    }
+    void verify_collect(std::span<const std::uint32_t> tokens, std::vector<std::uint32_t>& greedy) override {
+        const auto rows = static_cast<std::uint32_t>(tokens.size());
+        if (pending_rows_ == 0 || rows != pending_rows_) throw std::runtime_error("spec: verify_collect does not match the pre-launched verify");
+        pending_rows_ = 0;
+        greedy.resize(rows);
+        e_.read_top(pending_, rows, greedy.data());  // synchronizes
+        if (chain_) chain_->observe_verify(pending_, rows);
     }
     void commit(std::uint32_t k) override {
         e_.commit(k);
@@ -120,6 +139,8 @@ private:
     CudaEngine& e_;
     bool pre_ = false;  // chain hidden convention (pre = residual, post = final-norm output)
     std::unique_ptr<Chain> chain_;
+    RowsOut pending_{};              // pre-launched verify (verify_launch_fed) until verify_collect
+    std::uint32_t pending_rows_ = 0;
     float* rows_dev_ = nullptr;  // prefill_big hidden rows [rows_cap_ floats]
     std::size_t rows_cap_ = 0;
 };

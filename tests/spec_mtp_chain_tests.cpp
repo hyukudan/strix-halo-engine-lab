@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace sp = strix::spec;
@@ -83,17 +84,66 @@ struct FakeFedEngine : FakeEngine {
 };
 static_assert(!sp::MtpFeedEngine<FakeEngine> && sp::MtpFeedEngine<FakeFedEngine>, "feed hook detection");
 
+// The fed fake with the verify pre-launch hooks: the async read snapshots the slots into staging (what the device copy
+// sees in stream order); the wait returns that snapshot. `order` records a (async read), l (launch), w (wait).
+struct FakePreEngine : FakeFedEngine {
+    std::uint32_t staging[kMtpFeedSlots]{};
+    std::string order;
+    void mtp_feed_read_async(std::uint32_t n) {
+        std::memcpy(staging, feed, n * 4U);
+        order += 'a';
+    }
+    void mtp_feed_wait(std::uint32_t n, std::uint32_t* host) {
+        ++feed_reads;
+        std::memcpy(host, staging, n * 4U);
+        order += 'w';
+    }
+};
+static_assert(sp::MtpPrelaunchEngine<FakePreEngine> && !sp::MtpPrelaunchEngine<FakeFedEngine>, "pre-launch hook detection");
+
+// Pre-launch bookkeeping of one scenario run: launches, drafts whose launched ids differ from the returned ones, falls back.
+struct PreLog {
+    unsigned launches = 0, mismatches = 0, fallbacks = 0, prefix_mismatches = 0;
+};
+
 // One scripted sequence (flush chunks, chain steps, catch-up, copy prefixes, drafts without a flush, a k past the feed);
-// returns every proposed id in order and the chain's synchronizing reads per draft (max).
+// returns every proposed id in order and the chain's synchronizing reads per draft (max). pre: every draft goes through
+// draft_prelaunch with a launch that resolves the feed the way the verify's device gather does (slots read in stream
+// order behind the draft), then overwrites those slots (later device work) before the chain waits for its ids.
 template <class Eng>
-std::vector<std::uint32_t> scenario(Eng& e, std::uint64_t& max_reads_per_draft, bool& fed) {
+std::vector<std::uint32_t> scenario(Eng& e, std::uint64_t& max_reads_per_draft, bool& fed, PreLog* pre = nullptr) {
     sp::MtpChain<Eng, HostDev> chain(e, false, 3, 8);
     fed = chain.device_feed();
     std::vector<std::uint32_t> all, out;
     max_reads_per_draft = 0;
     auto draft = [&](std::vector<std::uint32_t> prefix, std::uint32_t k) {
         const auto r0 = chain.host_reads();
-        chain.draft(prefix, k, out);
+        if (pre) {
+            std::vector<std::uint32_t> launched;
+            unsigned calls = 0;
+            const sp::PrelaunchFn launch = [&](std::span<const std::uint32_t> pfx, const sp::DraftFeed& f) {
+                ++calls;
+                if constexpr (requires { e.order; }) e.order += 'l';
+                if (!std::equal(pfx.begin(), pfx.end(), prefix.begin(), prefix.end())) ++pre->prefix_mismatches;
+                launched.clear();
+                for (std::uint32_t j = 0; j < f.k; ++j) {
+                    if constexpr (requires { e.feed[0]; }) {
+                        launched.push_back(f.slot[j] == sp::DraftFeed::kHost ? f.host_id[j] : e.feed[f.slot[j]]);
+                        if (f.slot[j] != sp::DraftFeed::kHost) e.feed[f.slot[j]] = 0xDEADU;
+                    }
+                }
+            };
+            if (chain.draft_prelaunch(prefix, k, out, launch)) {
+                pre->launches += calls;
+                if (calls != 1 || launched != out) ++pre->mismatches;
+            } else {
+                if (calls != 0) ++pre->mismatches;
+                ++pre->fallbacks;
+                chain.draft(prefix, k, out);
+            }
+        } else {
+            chain.draft(prefix, k, out);
+        }
         max_reads_per_draft = std::max<std::uint64_t>(max_reads_per_draft, chain.host_reads() - r0);
         all.insert(all.end(), out.begin(), out.end());
         all.push_back(0xFFFFFFFFu);
@@ -369,6 +419,46 @@ int main() {
         const sp::MtpChain<PosKvEngine, PosDev> dk(ek, false, 3, 8);
         const sp::MtpChain<PosEngine, PosDev> dp(ep, false, 3, 8);
         MC_CHECK(dk.kv_catchup() && !dp.kv_catchup(), "default kv catch-up: hook %d no-hook %d", int(dk.kv_catchup()), int(dp.kv_catchup()));
+    }
+    // verify pre-launch == device feed: same mtp calls, same proposals; the launched verify's ids (feed slots resolved at
+    // launch) are exactly the drafted ids, the ids are read from the copy queued BEFORE the launch, one launch per draft.
+    {
+        FakePreEngine pe;
+        PreLog log;
+        std::uint64_t pre_reads = 0;
+        bool pre_fed = false;
+        const auto pp = scenario(pe, pre_reads, pre_fed, &log);
+        MC_CHECK(pre_fed && pp == fp, "pre-launch proposals differ from device-fed (%zu vs %zu ids)", pp.size(), fp.size());
+        MC_CHECK(pe.calls.size() == fe.calls.size(), "pre-launch call count %zu vs %zu", pe.calls.size(), fe.calls.size());
+        for (std::size_t i = 0; i < fe.calls.size() && i < pe.calls.size(); ++i)
+            MC_CHECK(fe.calls[i].tokens == pe.calls[i].tokens && fe.calls[i].hidden0 == pe.calls[i].hidden0 &&
+                         fe.calls[i].pos0 == pe.calls[i].pos0 && fe.calls[i].want_top == pe.calls[i].want_top,
+                     "pre-launch call %zu differs", i);
+        MC_CHECK(log.mismatches == 0 && log.prefix_mismatches == 0, "launched ids differ from the drafts (%u, prefix %u)",
+                 log.mismatches, log.prefix_mismatches);
+        MC_CHECK(log.launches == 5 && log.fallbacks == 1, "5 pre-launched drafts + the k = 70 fallback (%u, %u)", log.launches,
+                 log.fallbacks);
+        // drafts 1-3 read (a l w), draft 4 (k = 2, no flush) reads (a l w), draft 5 (one prefix step) reads (a l w)
+        MC_CHECK(pe.order == "alwalwalwalwalw", "async read before launch before wait (%s)", pe.order.c_str());
+        // k = 1 without a flush or a prefix: draft 0 is the host d1, nothing to read; the launch gets it as a host row
+        FakePreEngine p3;
+        sp::MtpChain<FakePreEngine, HostDev> c3(p3, false, 3, 8);
+        FakeRows p3r;
+        p3r.hidden_post = p3r.hidden_pre = hid.data();
+        c3.observe_prefill(p3r, 5, prompt, 99);
+        c3.draft({}, 1, out);  // flush
+        const auto d1 = out[0];
+        sp::DraftFeed seen;
+        const sp::PrelaunchFn grab = [&](std::span<const std::uint32_t>, const sp::DraftFeed& f) { seen = f; };
+        p3.order.clear();
+        MC_CHECK(c3.draft_prelaunch({}, 1, out, grab) && out.size() == 1 && out[0] == d1, "k = 1 pre-launch draft");
+        MC_CHECK(seen.k == 1 && seen.slot[0] == sp::DraftFeed::kHost && seen.host_id[0] == d1 && p3.order.empty(),
+                 "k = 1 host row, no read (%s)", p3.order.c_str());
+        c3.set_device_feed(false);
+        MC_CHECK(!c3.draft_prelaunch({}, 2, out, grab), "no device feed: pre-launch declined");
+        FakeFedEngine f4;
+        sp::MtpChain<FakeFedEngine, HostDev> c4(f4, false, 3, 8);
+        MC_CHECK(!c4.draft_prelaunch({}, 2, out, grab), "engine without the pre-launch hooks: declined");
     }
     std::puts("spec_mtp_chain_tests: PASS");
     return 0;

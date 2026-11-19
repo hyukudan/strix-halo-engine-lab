@@ -309,6 +309,21 @@ __global__ void fed_inputs_kernel(const std::uint32_t* feed, std::uint32_t slot,
         ids[0] = feed[slot];
     }
 }
+// Verify pre-launch: the verify rows' ids, host values or drafted ids still in the chain's feed slots (gathered on the
+// device). Rows past the window get id 0, as set_inputs_kernel leaves them, so d_ids is the same array either way.
+constexpr std::uint32_t kFeedHostRow = 0xFFFFFFFFU;  // = strix::spec::DraftFeed::kHost
+struct FedPack {
+    std::uint32_t pos0;
+    std::uint32_t ids[cc::kMaxRows];
+    std::uint32_t slot[cc::kMaxRows];
+};
+__global__ void fed_rows_kernel(FedPack in, const std::uint32_t* feed, std::uint32_t* pos, std::uint32_t* ids) {
+    if (threadIdx.x == 0) *pos = in.pos0;
+    if (threadIdx.x < cc::kMaxRows) {
+        const std::uint32_t sl = in.slot[threadIdx.x];
+        ids[threadIdx.x] = sl == kFeedHostRow ? in.ids[threadIdx.x] : feed[sl];
+    }
+}
 
 // Multi-session batch tables (one small by-value pack, scattered to device arrays by one kernel before the graph).
 struct SlotPack {
@@ -360,6 +375,10 @@ struct CudaEngine::Impl {
     void* d_argws = nullptr;
     std::uint32_t *d_mids = nullptr, *d_mpos = nullptr, *d_mtop = nullptr;
     std::uint32_t* d_feed = nullptr;  // device-fed MTP chain: drafted ids, CudaEngine::kMtpFeedSlots entries
+    // Verify pre-launch: pinned staging of the feed ids + the event that marks their copy (mtp_feed_read_async / _wait).
+    cc::UniqueHandle<void*, cudaFreeHost> h_feed_owner;
+    std::uint32_t* h_feed = nullptr;
+    cc::UniqueHandle<cudaEvent_t, cudaEventDestroy> feed_ev;
     // Draft-only subset head (set_draft_rows): compact NVFP4 tiles of `head` + slot -> source tile table.
     strix::spec::DraftRows* drows = nullptr;
     unsigned char* dhead = nullptr;
@@ -487,6 +506,9 @@ struct CudaEngine::Impl {
             d_mpos = alloc<std::uint32_t>(1);
             d_mtop = alloc<std::uint32_t>(RM);
             d_feed = alloc<std::uint32_t>(CudaEngine::kMtpFeedSlots, true);
+            CK(cudaMallocHost(h_feed_owner.put(), CudaEngine::kMtpFeedSlots * sizeof(std::uint32_t)));
+            h_feed = static_cast<std::uint32_t*>(h_feed_owner.get());
+            CK(cudaEventCreateWithFlags(feed_ev.put(), cudaEventDisableTiming));
             const std::size_t n = static_cast<std::size_t>(c.kv_heads) * opt.max_positions * c.head_dim;
             mkc = alloc<__nv_bfloat16>(n, true);
             mvc = alloc<__nv_bfloat16>(n, true);
@@ -639,6 +661,48 @@ struct CudaEngine::Impl {
         for (std::uint32_t i = 0; i < rows; ++i) in.ids[i] = tokens[i];
         set_inputs_kernel<<<1, 32, 0, s>>>(in, d_pos, d_ids);
         CK(cudaGetLastError());
+        return run_rows(rows, want);
+    }
+
+    // Verify pre-launch: forward() whose rows nhost.. take their ids from the chain's feed slots on the device (gathered by
+    // one kernel in place of set_inputs_kernel; the slots hold argmax ids < vocab by construction). Then the same graph.
+    RowsOut forward_fed(const std::uint32_t* host_ids, std::uint32_t nhost, const std::uint32_t* slot, const std::uint32_t* host_vals,
+                        std::uint32_t k, LogitRows want) {
+        const std::uint32_t rows = nhost + k;
+        if (!mtp_ok) throw std::runtime_error("forward_rows_fed: no MTP feed (no MTP tensors loaded)");
+        if (rows == 0 || rows > RM || nhost > rows) throw std::runtime_error("forward_rows_fed: rows must be 1..32");
+        core::require_capacity(committed, rows, opt.max_positions);
+        core::validate_token_ids(host_ids, nhost, c.vocab);
+        FedPack in{};
+        in.pos0 = committed;
+        for (std::uint32_t i = 0; i < cc::kMaxRows; ++i) in.slot[i] = kFeedHostRow;  // rows past the window: id 0
+        for (std::uint32_t i = 0; i < nhost; ++i) in.ids[i] = host_ids[i];
+        for (std::uint32_t j = 0; j < k; ++j) {
+            if (slot[j] == kFeedHostRow) {
+                core::validate_token_ids(&host_vals[j], 1, c.vocab);
+                in.ids[nhost + j] = host_vals[j];
+            } else {
+                if (slot[j] >= CudaEngine::kMtpFeedSlots) throw std::runtime_error("forward_rows_fed: feed slot out of range");
+                in.slot[nhost + j] = slot[j];
+            }
+        }
+        fed_rows_kernel<<<1, 32, 0, s>>>(in, d_feed, d_pos, d_ids);
+        CK(cudaGetLastError());
+        return run_rows(rows, want);
+    }
+    void mtp_feed_read_async(std::uint32_t n) {
+        if (!mtp_ok || n > CudaEngine::kMtpFeedSlots) throw std::runtime_error("mtp_feed_read_async: no MTP tensors or bad count");
+        CK(cudaMemcpyAsync(h_feed, d_feed, static_cast<std::size_t>(n) * 4, cudaMemcpyDeviceToHost, s));
+        CK(cudaEventRecord(feed_ev.get(), s));
+    }
+    void mtp_feed_wait(std::uint32_t n, std::uint32_t* host) {
+        if (!mtp_ok || n > CudaEngine::kMtpFeedSlots) throw std::runtime_error("mtp_feed_wait: no MTP tensors or bad count");
+        CK(cudaEventSynchronize(feed_ev.get()));
+        std::copy(h_feed, h_feed + n, host);
+    }
+
+    // The window after its inputs are on the device (d_pos, d_ids): replay (or capture) the trunk graph of (rows, want).
+    RowsOut run_rows(std::uint32_t rows, LogitRows want) {
         const std::uint32_t key = rows * 4 + static_cast<std::uint32_t>(want);
         if (graphs_on) {
             auto it = graphs.find(key);
@@ -713,6 +777,8 @@ struct CudaEngine::Impl {
         graphs.clear();
         mtp_graphs.clear();
         ss.graphs.clear();
+        feed_ev.reset();
+        h_feed_owner.reset();
         if (s) cc::nvfp4_release_workspace(s);
         pf.sl.clear();  // drain slot streams before freeing shared model/state buffers
         allocations.clear();
@@ -1898,6 +1964,12 @@ CudaEngine::MtpOut CudaEngine::mtp_step_fed(const std::uint32_t* in_host, std::u
 }
 void CudaEngine::mtp_feed_put(std::uint32_t slot, const std::uint32_t* top_dev) { p_->mtp_feed_put(slot, top_dev); }
 void CudaEngine::mtp_feed_read(std::uint32_t n, std::uint32_t* host) const { p_->mtp_feed_read(n, host); }
+void CudaEngine::mtp_feed_read_async(std::uint32_t n) { p_->mtp_feed_read_async(n); }
+void CudaEngine::mtp_feed_wait(std::uint32_t n, std::uint32_t* host) { p_->mtp_feed_wait(n, host); }
+RowsOut CudaEngine::forward_rows_fed(const std::uint32_t* host_ids, std::uint32_t nhost, const std::uint32_t* slot,
+                                     const std::uint32_t* host_vals, std::uint32_t k, LogitRows want) {
+    return p_->forward_fed(host_ids, nhost, slot, host_vals, k, want);
+}
 void CudaEngine::read_logits(const RowsOut& o, std::uint32_t row, float* host) const {
     CK(cudaMemcpyAsync(host, o.logits + static_cast<std::size_t>(row) * p_->c.vocab, static_cast<std::size_t>(p_->c.vocab) * 4,
                        cudaMemcpyDeviceToHost, p_->s));
