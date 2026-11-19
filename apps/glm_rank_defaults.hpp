@@ -92,7 +92,7 @@ inline const std::vector<EnvItem>& env_items() {
          "Measurement: Xfer reduce +1.41 -> fused boundary ~+1.10 ms/token over local, bitwise", false, true},
         {"xfer-producer-publish", "STRIX_GLM_XB_PUBLISH", "1", "0",
          "Measurement: decode producers publish the exchanged partial (no copy + publish launch), tokens/logits/state identical; "
-         "8K plain -1.4 %, MTP -1.9 % (#520); needs the fused boundary", false, true},
+         "needs the fused boundary", false, true},
         {"moe-fast", "STRIX_GLM_MOE", "fast", "ref",
          "Measurement: FastMoe matches DefaultMoe bitwise (real TP2 slices); raw-only experts (fits GTT)", false, false},
         // =7 restores the previous large-call core (X2), =3 v3 for every call; the baseline restores v1.
