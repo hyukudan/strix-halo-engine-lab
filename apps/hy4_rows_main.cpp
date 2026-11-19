@@ -349,7 +349,8 @@ int main(int argc, char** argv) {
                 so.chain_survival = survival.empty() ? std::vector<double>{0.714, 0.633, 0.436, 0.675, 0.256, 0.5} : survival;
             }
             if (prime(f, ids, batched, source.get()) != first_id) throw std::runtime_error("repeat prompt anchor differs (" + label + ")");
-            const auto res = hb::rows::spec_decode(f, ids, first_id, spec_n, so, source.get());
+            const auto res = source ? hb::rows::spec_decode(f, ids, first_id, spec_n, so, *source)
+                                    : hb::rows::spec_decode(f, ids, first_id, spec_n, so);
             std::size_t first_bad = std::min(res.ids.size(), plain.size());
             for (std::size_t i = 0; i < first_bad; ++i)
                 if (res.ids[i] != plain[i]) {

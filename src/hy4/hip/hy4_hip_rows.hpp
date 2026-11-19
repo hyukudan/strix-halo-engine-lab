@@ -19,7 +19,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -240,39 +239,30 @@ struct SpecResult {
     double chain_ms = 0;
 };
 
-// Speculative greedy decode of n ids after a prompt already in `f` (position == prompt.size()); anchor = the greedy
-// id after the prompt (ids[0]). Sources: the copy proposer and, with `mtp` (installed before the prefill and finished
-// with the anchor), the next-token block chain; the Arbiter decides the source and the rows of every pass.
-// Output ids are those of plain greedy decode when forward_rows rows == step (the shared controller emits only the
-// target's own greedy ids: accepted drafts equal them, the first mismatch is replaced by the target's id). The chain
-// changes which rows are verified, never an id.
+namespace detail {
+// One speculative decode over `target` (the rows contract, with the chain's view when `chain` is set).
 template <class Fwd>
-SpecResult spec_decode(Fwd& f, std::span<const std::uint32_t> prompt, std::uint32_t anchor, std::uint32_t n, const SpecOptions& o,
-                       MtpSource<Fwd>* mtp = nullptr) {
+SpecResult spec_run(Fwd& f, std::span<const std::uint32_t> prompt, std::uint32_t anchor, std::uint32_t n, const SpecOptions& o,
+                    spec::ChainDrafter* chain, std::span<const double> survival, spec::VerifyTarget& target) {
     if (o.max_rows < 1U || o.max_rows > kMaxVerifyRows) throw std::invalid_argument("hy4 rows: spec max rows outside 1..8");
     spec::BlockConfig bc;
     bc.max_block = o.max_rows;
     bc.arbiter.windows.clear();
     for (std::uint32_t w = 1; w <= o.max_rows; ++w) bc.arbiter.windows.push_back(w);
-    bc.copy = o.copy;
-    bc.chain = mtp != nullptr;
-    bc.hybrid = mtp != nullptr && o.copy;
+    bc.copy = o.copy || chain == nullptr;
+    bc.chain = chain != nullptr;
+    bc.hybrid = chain != nullptr && o.copy;
     bc.chain_max_k = o.max_rows > 1U ? o.max_rows - 1U : 1U;
     bc.chain_seed_step_ms = o.chain_step_ms;
     bc.chain_seed_flush_ms = o.chain_flush_ms;
     bc.fixed_costs = !o.verify_ms.empty();
-    spec::BlockDrafter drafter(bc, mtp ? &mtp->chain() : nullptr);
+    spec::BlockDrafter drafter(bc, chain);
     for (std::uint32_t r = 1; r <= o.max_rows && r <= o.verify_ms.size(); ++r) drafter.seed_verify_ms(r, o.verify_ms[r - 1U]);
-    if (mtp && !o.chain_survival.empty()) drafter.seed_chain_survival(o.chain_survival, o.survival_weight);
+    if (chain && !survival.empty()) drafter.seed_chain_survival(survival, o.survival_weight);
     drafter.commit(prompt);
     SpecResult res;
     res.ids.push_back(anchor);
     drafter.commit(std::span<const std::uint32_t>(res.ids.data(), 1));
-    VerifyEngine<Fwd> engine(f);
-    spec::EngineVerifyTarget<VerifyEngine<Fwd>> copy_target(engine);
-    std::unique_ptr<ChainVerifyTarget<Fwd>> chain_target;
-    if (mtp) chain_target = std::make_unique<ChainVerifyTarget<Fwd>>(f, mtp->chain());
-    spec::VerifyTarget& target = chain_target ? static_cast<spec::VerifyTarget&>(*chain_target) : copy_target;
     spec::BlockSpeculator sp(drafter, target);
     sp.start(anchor);
     const auto t0 = std::chrono::steady_clock::now();
@@ -290,14 +280,33 @@ SpecResult spec_decode(Fwd& f, std::span<const std::uint32_t> prompt, std::uint3
     }
     res.wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (res.ids.size() > n) res.ids.resize(n);
-    if (mtp) {
-        auto& ch = mtp->chain();
-        res.chain_calls = ch.calls();
-        res.chain_rows = ch.rows();
-        res.chain_drafts = ch.drafts();
-        res.chain_reads = ch.host_reads();
-        res.chain_ms = ch.draft_wall_ms();
-    }
+    return res;
+}
+}  // namespace detail
+
+// Speculative greedy decode of n ids after a prompt already in `f` (position == prompt.size()); anchor = the greedy
+// id after the prompt (ids[0]). Copy proposer; the Arbiter decides the rows of every pass.
+// Output ids are those of plain greedy decode when forward_rows rows == step (the shared controller emits only the
+// target's own greedy ids: accepted drafts equal them, the first mismatch is replaced by the target's id).
+template <class Fwd>
+SpecResult spec_decode(Fwd& f, std::span<const std::uint32_t> prompt, std::uint32_t anchor, std::uint32_t n, const SpecOptions& o) {
+    VerifyEngine<Fwd> engine(f);
+    spec::EngineVerifyTarget<VerifyEngine<Fwd>> target(engine);
+    return detail::spec_run(f, prompt, anchor, n, o, nullptr, {}, target);
+}
+// The same with the next-token block chain (`mtp` installed before the prefill and finished with the anchor): the copy,
+// chain and hybrid arms (copy and hybrid unless o.copy is false). The chain changes which rows are verified, never an id.
+template <class Fwd>
+SpecResult spec_decode(Fwd& f, std::span<const std::uint32_t> prompt, std::uint32_t anchor, std::uint32_t n, const SpecOptions& o,
+                       MtpSource<Fwd>& mtp) {
+    auto& ch = mtp.chain();
+    ChainVerifyTarget<Fwd> target(f, ch);
+    auto res = detail::spec_run(f, prompt, anchor, n, o, &ch, o.chain_survival, target);
+    res.chain_calls = ch.calls();
+    res.chain_rows = ch.rows();
+    res.chain_drafts = ch.drafts();
+    res.chain_reads = ch.host_reads();
+    res.chain_ms = ch.draft_wall_ms();
     return res;
 }
 

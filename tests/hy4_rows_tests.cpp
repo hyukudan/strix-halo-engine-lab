@@ -239,7 +239,7 @@ void check_spec_mtp() {
         CHECK(anchor == plain[0]);
         auto oo = o;
         oo.copy = with_copy;
-        const auto res = hb::rows::spec_decode(f, prompt, anchor, n, oo, &source);
+        const auto res = hb::rows::spec_decode(f, prompt, anchor, n, oo, source);
         CHECK(res.ids == plain);                            // the chain changes which rows are verified, never an id
         CHECK(f.bad_hidden == 0U && f.bad_position == 0U);  // teacher rows = target hidden at p, chain rows = own output
         CHECK(f.teacher_rows >= prompt.size());             // every prompt position fed to the block
