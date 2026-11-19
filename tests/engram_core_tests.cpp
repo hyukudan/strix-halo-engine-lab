@@ -167,24 +167,24 @@ void test_ds41_rebind() {
     {
         // Stateless rows_at equals the stateful push at every position and layer (dead positions included) and
         // leaves the Hasher's history untouched.
-        strix::ds41::EngramHasher s(ds41_contract());
+        strix::ds41::EngramHasher sh(ds41_contract());
         Lcg r{777};
         std::vector<std::uint32_t> tokens(300);
         for (auto& t : tokens) {
             t = static_cast<std::uint32_t>(r.next() % 1000U);
             if (r.next() % 11U == 0U) t = strix::ds41::engram_dead_token(t);
         }
-        const auto all = s.hash_sequence(tokens);
-        const std::size_t per = static_cast<std::size_t>(s.layers()) * s.columns();
-        std::vector<std::uint64_t> one(s.columns());
-        bool same = true;
+        const auto all = sh.hash_sequence(tokens);
+        const std::size_t per = static_cast<std::size_t>(sh.layers()) * sh.columns();
+        std::vector<std::uint64_t> one(sh.columns());
+        bool equal_rows = true;
         for (std::size_t t = 0; t < tokens.size(); ++t)
-            for (std::uint32_t e = 0; e < s.layers(); ++e) {
-                s.rows_at(tokens, t, e, one);
-                same = same && std::equal(one.begin(), one.end(), all.begin() + static_cast<std::ptrdiff_t>(t * per + e * s.columns()));
+            for (std::uint32_t e = 0; e < sh.layers(); ++e) {
+                sh.rows_at(tokens, t, e, one);
+                equal_rows = equal_rows && std::equal(one.begin(), one.end(), all.begin() + static_cast<std::ptrdiff_t>(t * per + e * sh.columns()));
             }
-        expect(same, "DS41 rows_at equals push (every position, every layer, dead positions)");
-        expect(s.positions() == tokens.size(), "rows_at does not touch the history");
+        expect(equal_rows, "DS41 rows_at equals push (every position, every layer, dead positions)");
+        expect(sh.positions() == tokens.size(), "rows_at does not touch the history");
     }
     c.rows[1] += 1U;
     expect(throws([&] { strix::ds41::EngramHasher bad(c); }), "DS41 primes must sum to the table rows");
