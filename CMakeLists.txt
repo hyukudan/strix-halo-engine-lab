@@ -1646,7 +1646,7 @@ if(BUILD_TESTING)
     set_tests_properties(strix-turbo-bundle-tests PROPERTIES LABELS "cpu;profile" TIMEOUT 60)
     # One shared check of the tier word over every engine table: a qualified (or provisional) FAST row is in the
     # resolved fast set, fast != exact when one exists, exact enables no bit-changing row.
-    add_executable(strix-profile-fast-set-tests tests/profile_fast_set_tests.cpp src/minimax/engine/mm_defaults.cpp)
+    add_executable(strix-profile-fast-set-tests tests/profile_fast_set_tests.cpp src/minimax/engine/mm_defaults.cpp src/ds41_rtx_profile.cpp)
     target_link_libraries(strix-profile-fast-set-tests PRIVATE strix_core strix_serve_json)
     target_include_directories(strix-profile-fast-set-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     strix_target_warnings(strix-profile-fast-set-tests)

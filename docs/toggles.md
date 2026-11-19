@@ -27,6 +27,7 @@ You only need this page to inspect a path, to debug, or to move the engine to di
 | `--profile exact` (alias `default`) | Current production path; exports no profile overrides. This is the default. |
 | `--profile fast` | Adds every qualified bit-changing option, and the rows selected for fast ahead of their receipt (stamped "qualification in progress" in the receipt). Rows that are neither stay off (see `--allow-pending`). MiniMax: the qualified bundle `mm-fast-pf-v2` (the same members and prefill identity as `STRIX_MM_FAST_PREFILL=1`; refused with `--baseline`). GLM pair: nothing (`STRIX_GLM_PF_WMMA` is unqualified for fast: its FAST prefill set fails the 8K quality gate; it runs only when set explicitly). DeepSeek pair: the FAST bundle and its Engram / shared / MoE FP16 levers stay explicit until their quality gate. A set switch, `0` included, wins. |
 | `--profile quality` | A higher-precision pack where one exists (Nemotron EXL3). Otherwise equal to `default`. |
+| `--profile` on `strix-cuda-ds41-prefill-service` | DS41 RTX prefill service: takes the same word (`exact`/`default`, `fast`; `STRIX_DS41_PROFILE`) and `--allow-pending` as the replica, through the same resolver (`strix/profiles/ds41_rtx.hpp`). Today every fast row is pending (listed in `levers`, never used), so `fast` runs as `exact`. |
 
 Named profiles exist for Qwen, the DeepSeek pair, Gemma4/Nemotron and `strix-glm5-rank`.
 MiniMax takes the same words (`--profile exact|fast|...`); `--profile NAME:PROMPT.u32:STEPS` still runs a timed session.

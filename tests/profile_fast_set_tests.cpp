@@ -16,6 +16,7 @@
 #include "strix/fast_profile.hpp"
 #include "strix/engine_profile.hpp"
 #include "strix/glm_pair_profile_table.hpp"
+#include "strix/profiles/ds41_rtx.hpp"
 #include "strix/profiles/qwen.hpp"
 #include "strix/profiles/qwen_cuda.hpp"
 #include "strix/profiles/qwen_dense_cuda.hpp"
@@ -245,6 +246,7 @@ int main() {
     check_table("deepseek41-pair", strix::deepseek41::pair_defaults::profile_table);
     check_bundle("deepseek41-pair", strix::deepseek41::pair_defaults::profile_table, strix::ds41::fast_profile::kBundle);
     check_table("glm-pair", strix::glm::rank_defaults::product_profile_table);
+    check_table("deepseek41-rtx", strix::ds41::rtx::profile::shared_rows());
     minimax_bundle();
     check_table("minimax-pair", strix::minimax::defaults::profile_table);
     check_bundle("minimax-pair", strix::minimax::defaults::profile_table, strix::minimax::defaults::kFastBundle);

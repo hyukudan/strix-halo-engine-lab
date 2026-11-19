@@ -1514,7 +1514,8 @@ int main(int argc, char** argv) {
         }
         else if (a == "--host-commit-floor-gib") { o.host_commit_floor_gib = std::stod(next()); host_floor_given = true; }
         else if (a == "--host-pin-wait-s") { o.host_pin_wait_s = std::stod(next()); host_wait_given = true; }
-        else if (a == "--host-promote" || a == "--no-host-promote" || a == "--baseline") {}  // resolved below
+        else if (a == "--host-promote" || a == "--no-host-promote" || a == "--baseline" || a == "--allow-pending") {}  // resolved below
+        else if (a == "--profile") next();  // exact|default|fast|quality: resolved below (same word and resolver as the replica)
         else if (a == "--host-promote-max-gib") o.host_promote_max_gib = std::stod(next());
         else if (a == "--tiers") tiers = next();
         else if (a == "--slots") o.slots = static_cast<std::uint32_t>(std::stoul(next()));
@@ -1586,13 +1587,22 @@ int main(int argc, char** argv) {
         usage("host floor/wait must be finite and nonnegative");
     if (!(o.host_promote_max_gib >= 0.0 && o.host_promote_max_gib <= 1024.0)) usage("--host-promote-max-gib must be within 0..1024");
     {
-        // the default-ON service levers: the last of a lever's own options and --baseline, else STRIX_DS41_RTX_BASELINE=1,
-        // else the lever's variable, else on (the service does not take --profile yet: the default column)
+        // --profile WORD (STRIX_DS41_PROFILE) and the service levers through the replica's resolver: the last of a lever's own
+        // options and --baseline, else STRIX_DS41_RTX_BASELINE=1, else the lever's variable, else the profile column. No word =
+        // exact = the default column (host_promote on); the fast-only rows are pending: listed, never used.
         namespace pf = strix::ds41::rtx::profile;
-        const auto levers = pf::resolve(pf::Name::standard, false, pf::App::prefill_service,
-                                        pf::Inputs{std::vector<std::string>(argv + 2, argv + argc), {}});
-        const auto* hp = levers.find("host_promote");
-        o.host_promote = hp != nullptr && hp->value == "on";
+        pf::Resolution levers;
+        try { levers = pf::resolve(pf::App::prefill_service, pf::Inputs{std::vector<std::string>(argv + 2, argv + argc), {}}); }
+        catch (const std::exception& e) { usage(e.what()); }
+        for (const auto& e : levers.entries) {
+            if (e.status == pf::Status::pending)
+                std::fprintf(stderr, "profile %s: %s pending, not used (%s)\n", pf::name(levers.name),
+                             std::string(e.lever->name).c_str(), std::string(e.lever->source).c_str());
+            else if (e.status == pf::Status::unqualified)  // --allow-pending on a row this service does not bind yet
+                usage(("--profile " + std::string(pf::name(levers.name)) + ": lever " + std::string(e.lever->name) +
+                       " has no binding in the prefill service (--allow-pending)").c_str());
+        }
+        o.host_promote = levers.on("host_promote");
         c.levers_json = levers.json();
     }
     if (!tiers.empty()) {

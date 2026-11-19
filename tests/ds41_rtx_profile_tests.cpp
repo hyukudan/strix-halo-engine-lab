@@ -1,11 +1,13 @@
 // CPU tests of the DS RTX --profile resolver (strix/profiles/ds41_rtx.hpp): the table, precedence (CLI > environment >
 // profile > builtin, --baseline in order), pending refusal and listing, --allow-pending stamping, the selection.
+#include "strix/fnv.hpp"
 #include "strix/profiles/ds41_rtx.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <memory>
+#include <utility>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -14,6 +16,10 @@ namespace pf = strix::ds41::rtx::profile;
 
 namespace {
 int failures = 0;
+struct Case {
+    std::vector<std::string> args;
+    std::map<std::string, std::string> env;
+};
 #define CHECK(cond)                                                              \
     do {                                                                         \
         if (!(cond)) {                                                           \
@@ -248,6 +254,47 @@ int main() {
         const auto expected = ready ? pf::Status::profile : allow && runnable ? pf::Status::unqualified : pf::Status::pending;
         CHECK(r.find("same_builtin")->status == expected && r.find("same_builtin")->value == "off");
         CHECK(r.find("same_builtin")->wanted == (ready ? "" : "off"));
+    }
+
+    // Identity pins, captured from the resolver before it was shared with the service: no word, `--profile exact`,
+    // `--profile default` and STRIX_DS41_PROFILE=exact all give today's receipt JSON byte for byte, for both apps.
+    {
+        const std::string service_json =
+            R"J({"profile":"default","app":"prefill-service","qualification":"qualified","allow_pending":false,"levers":{"host_promote":{"value":"on","status":"profile","switch":"--host-promote --no-host-promote STRIX_DS41_HOST_PROMOTE","kind":"exact","source":"lazy host promotion of streamed file-tier expert layers (exact: the same file bytes; above the host floor)"}},"pending":[],"unqualified":[]})J";
+        const std::vector<Case> words = {
+            Case{{}, {}}, Case{{"--profile", "exact"}, {}}, Case{{"--profile", "default"}, {}}, Case{{}, {{"STRIX_DS41_PROFILE", "exact"}}}};
+        for (const auto& [args, env] : words) {
+            const auto rep = pf::resolve(pf::App::replica, in(args, env));
+            CHECK(rep.json().size() == 3501U && strix::host_fnv::text(rep.json()) == 0x31f78efb211de9a0ULL);
+            CHECK(pf::resolve(pf::App::prefill_service, in(args, env)).json() == service_json);
+            CHECK(rep.qualification() == "qualified" && rep.pending().empty() == false);  // prompt_layer_major pending, as today
+        }
+        // fast: the replica's receipt is today's; the service lists its fast rows as pending and applies nothing new
+        CHECK(strix::host_fnv::text(run({"--profile", "fast"}).json()) == 0xfc25babb029d49fdULL);
+        const auto sf = run({"--profile", "fast"}, {}, pf::App::prefill_service);
+        CHECK(sf.on("host_promote") && !sf.on("batch_long") && !sf.on("fp16_dense_prefill"));
+        CHECK(status(sf, "batch_long") == "pending" && status(sf, "fp16_dense_prefill") == "pending");
+        CHECK(sf.qualification() == "qualified");
+    }
+    // Replica and service resolve the same word through the same function: same name / allow-pending, the same
+    // --baseline and STRIX_DS41_RTX_BASELINE=1 reading, turbo refused by both.
+    {
+        const std::vector<Case> cases = {
+            Case{{"--profile", "fast"}, {}}, Case{{"--profile", "exact", "--allow-pending"}, {}}, Case{{}, {{"STRIX_DS41_PROFILE", "fast"}}},
+            Case{{"--profile", "quality"}, {{"STRIX_DS41_PROFILE_ALLOW_PENDING", "1"}}}, Case{{"--profile", "fast", "--baseline"}, {}}};
+        for (const auto& [args, env] : cases) {
+            const auto r = pf::resolve(pf::App::replica, in(args, env));
+            const auto sv = pf::resolve(pf::App::prefill_service, in(args, env));
+            const auto sel = pf::select(in(args, env));
+            CHECK(r.name == sv.name && r.name == sel.name && r.allow_pending == sv.allow_pending && r.allow_pending == sel.allow_pending);
+        }
+        CHECK(!run({"--baseline"}, {}, pf::App::prefill_service).on("host_promote") && !run({"--baseline"}).on("lean_state"));
+        CHECK(!run({}, {{"STRIX_DS41_RTX_BASELINE", "1"}}, pf::App::prefill_service).on("host_promote"));
+        CHECK(!run({}, {{"STRIX_DS41_RTX_BASELINE", "1"}}).on("lean_state"));
+        CHECK(run({"--baseline", "--host-promote"}, {}, pf::App::prefill_service).on("host_promote"));
+        CHECK(throws({"--profile", "turbo"}) && throws({"--profile", "bogus"}) && throws({"--profile"}));
+        CHECK(pf::parse("exact") == pf::Name::standard && pf::parse("default") == pf::Name::standard);
+        CHECK(pf::shared_rows().size() == pf::levers().size());
     }
 
     if (failures) {

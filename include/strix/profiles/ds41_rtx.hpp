@@ -18,7 +18,8 @@
 //   fast     default + every further exact lever and every bit-changing lever that has passed its quality qualification. Today none has:
 //            the fast-only rows are pending (listed in the receipt and --print-config, never silently used).
 //   quality  = default for DS on the RTX (no higher-precision expert pack exists for the replica).
-// The prefill service rows (App::prefill_service; the service resolves the default column, no --profile yet): host_promote
+// The prefill service rows (App::prefill_service; the service takes --profile / --allow-pending through the same resolve()
+// as the replica, one word for both apps): host_promote
 // (lazy host promotion of file-tier expert layers, exact) on, --baseline / STRIX_DS41_RTX_BASELINE=1 turn it off.
 // One table row per lever (ds41_rtx_profile.cpp): a value per profile, ready (qualified and present) and runnable (the
 // implementation is in this build) per profile, kind exact | bit-changing, the CLI options and the environment switch
@@ -58,6 +59,9 @@ struct Lever {
     std::string_view source;                // owner commit / branch; for a pending column, what it waits for
 };
 [[nodiscard]] std::span<const Lever> levers();
+// The same rows as strix::profile::Lever (first option as the CLI switch, a three-column value padded with an empty turbo
+// cell: turbo is refused by this adapter): lets the shared fast-set / table checks read this table. Built once.
+[[nodiscard]] std::span<const strix::profile::Lever> shared_rows();
 
 enum class Status { profile, explicit_cli, explicit_env, baseline_cli, baseline_env, pending, unqualified };
 [[nodiscard]] const char* status_name(Status status);
@@ -75,6 +79,8 @@ struct Resolution {
     bool allow_pending = false;
     std::vector<Entry> entries;
     [[nodiscard]] const Entry* find(std::string_view lever) const;
+    // true when the resolved value of `lever` is "on" (absent lever: false)
+    [[nodiscard]] bool on(std::string_view lever) const;
     // "qualified", or "unqualified: <rows>" when --allow-pending ran pending columns
     [[nodiscard]] std::string qualification() const;
     [[nodiscard]] std::vector<std::string> pending() const;

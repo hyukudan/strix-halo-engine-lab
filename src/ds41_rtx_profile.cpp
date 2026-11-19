@@ -78,7 +78,7 @@ constexpr Lever kTable[] = {
      .source = "pending: decision on the first member's TTFT (prefill-service closed batches, --batch-max)"},
     {.name = "fp16_dense_prefill", .value = {"", "on", ""}, .builtin = "off", .ready = none, .runnable = none,
      .kind = Kind::bit_changing, .apps = service, .baseline = false,
-     .source = "pending: quality qualification (DS FP16 dense prefill bands); the service does not take --profile yet"},
+     .source = "pending: quality qualification (DS FP16 dense prefill bands)"},
 };
 
 using strix::profile::environment;
@@ -115,6 +115,35 @@ std::string switches(const Lever& l) {
 }  // namespace
 
 std::span<const Lever> levers() { return kTable; }
+
+std::span<const strix::profile::Lever> shared_rows() {
+    static const std::vector<strix::profile::Lever> rows = [] {
+        std::vector<strix::profile::Lever> out;
+        for (const auto& l : kTable) {
+            strix::profile::Lever row{};
+            row.name = l.name;
+            row.env = l.env;
+            row.option = l.options[0].flag;
+            for (std::size_t c = 0; c < l.value.size(); ++c) {
+                row.value[c] = l.value[c];
+                row.ready[c] = l.ready[c];
+                row.runnable[c] = l.runnable[c];
+            }
+            row.builtin = l.builtin;
+            row.kind = l.kind;
+            row.off = "off";
+            row.source = l.source;
+            out.push_back(row);
+        }
+        return out;
+    }();
+    return rows;
+}
+
+bool Resolution::on(std::string_view lever) const {
+    const auto* e = find(lever);
+    return e != nullptr && e->value == "on";
+}
 
 const char* status_name(Status status) {
     switch (status) {
@@ -207,7 +236,7 @@ Selection select(const Inputs& inputs) {
     for (std::size_t i = 0; i < inputs.args.size(); ++i) {
         const auto& a = inputs.args[i];
         if (a == "--profile") {
-            if (i + 1 >= inputs.args.size()) throw std::invalid_argument("missing value of --profile (default, fast or quality)");
+            if (i + 1 >= inputs.args.size()) throw std::invalid_argument("missing value of --profile (exact, fast or quality)");
             cli = parse(inputs.args[++i]);
         } else if (a == "--allow-pending") {
             s.allow_pending = true;
