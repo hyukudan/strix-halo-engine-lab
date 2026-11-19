@@ -323,6 +323,13 @@ target_compile_options(qwen_tiered_moe_tests PRIVATE
 if(MSVC)
     target_compile_options(qwen_tiered_moe_tests PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
+# No-model bench of the tensor-core expert route: per-tile vs per-m16-block cost of the expert tiles
+# (scripts/bench/qwen_moe/tile_bench_ticket.sh). Not a test: needs the card, prints timings only.
+add_executable(qwen_moe_tile_bench tests/cuda/qwen_moe_tile_bench.cu)
+target_link_libraries(qwen_moe_tile_bench PRIVATE strix_qwen_cuda)
+if(MSVC)
+    target_compile_options(qwen_moe_tile_bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
 
 # serve == bench residency command line (host only, no CUDA)
 add_executable(strix-expert-residency-parity-tests tests/expert_residency_parity_tests.cpp)
