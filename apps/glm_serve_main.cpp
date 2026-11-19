@@ -230,7 +230,7 @@ struct EngineOps {
     std::vector<unsigned> hp_row;
     std::uint32_t prefix_restored = 0, prefix_bootstrap_pending = 0;
     // per slot: the prompt tokens (both ranks see the same chunks), the shared arbiter's lookup context
-    std::vector<std::vector<std::uint32_t>> context;
+    std::vector<std::vector<std::uint32_t>> context{};
     void remember(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0) {
         if (!policy.spec_arbiter) return;
         auto& c = context.at(slot);
@@ -1164,7 +1164,7 @@ int main(int argc, char** argv) {
             std::printf("rank %u: batched self-speculation off (the attention seam verifies one slot per call)\n", opt.rank);
         hello.g2 = g2_on ? 1U : 0U;
         EngineOps ops{eng, {eff.kmax, eff.adaptive, eff.kmax, opt.capacity},
-                      prefill_mode == "gemv" ? sp::BootstrapPolicy::Chunked : sp::BootstrapPolicy::Reference, {}, {}, 0, {}, 0, {}, {}, {}};
+                      prefill_mode == "gemv" ? sp::BootstrapPolicy::Chunked : sp::BootstrapPolicy::Reference, {}, {}, 0, {}, 0, {}, {}};
         ops.control.rank = opt.rank;
         ops.spec.assign(opt.slots, {});
         ops.hp_row.assign(opt.slots, 0);
