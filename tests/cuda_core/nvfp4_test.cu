@@ -604,6 +604,12 @@ static void test_readahead(std::uint32_t rows, unsigned long long win_ns, int re
             CK(cc::nvfp4_dense_rows(t.d, t.hid, t.y, rows, t.h, s));
         }
     };
+    // One eager pass before any capture, as the engine does (it reserves its split-K workspace first): the first GEMV on a
+    // stream allocates that stream's workspace, which a capturing stream refuses ("operation not permitted when stream is
+    // capturing"). The eager pass captures nothing, so it leaves no read-ahead site behind.
+    cc::nvfp4_set_readahead(0);
+    chain();
+    CK(cudaStreamSynchronize(s));
     struct Arm {
         std::size_t nodes = 0;
         std::uint64_t bytes = 0;
