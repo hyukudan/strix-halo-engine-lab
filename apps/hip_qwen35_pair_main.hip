@@ -26,6 +26,7 @@
 #include <hip/hip_runtime.h>
 
 #include "strix/device/topology.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/dist/open_transport.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/pair/layer_pipeline.hpp"
@@ -249,8 +250,7 @@ int main(int argc, char** argv) try {
     // admission runs first (a decoder that holds the whole model + state receives every stage's layer state once after the
     // prefill and decodes alone: a layer split only serialises the decode). Undeclared memory, no fitting decoder, or a
     // decoder outside the stage chain keep the layer-owned decode. STRIX_PAIR_DECODE_RELAY=0: layer-owned (rollback).
-    const char* relay_env = std::getenv("STRIX_PAIR_DECODE_RELAY");
-    const bool relay_allowed = !(relay_env && std::string(relay_env) == "0");
+    const bool relay_allowed = strix::envcfg::flag("STRIX_PAIR_DECODE_RELAY", true);
     std::string decode_reason = !relay_allowed ? "STRIX_PAIR_DECODE_RELAY=0" : !chain::memory_declared(topo) ? "node memory not declared" : "";
     chain::Plan plan;
     if (decode_reason.empty()) {
