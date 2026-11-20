@@ -16,6 +16,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -214,6 +216,10 @@ public:
                 greedy.abandon_wide_cycle(emitted);
                 host_phase_mark("w5 abandon bookkeeping");
                 ++size_stats.abandoned;size_stats.abandoned_rows_wasted+=wide_rows;size_stats.abandon_rows.push_back(n-1U);
+                // STRIX_CYCLE_LOG: the served route has no bridge JSON, so each abandon names its rejected row here.
+                static const bool log_cycles=std::getenv("STRIX_CYCLE_LOG")!=nullptr;
+                if(log_cycles) std::fprintf(stderr,"wide abandon at=%llu rows=%u accepted=%u\n",
+                    static_cast<unsigned long long>(base.next_position),wide_rows,n-1U);
                 size_stats.ms_abandoned+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
                 return std::nullopt;
             }
