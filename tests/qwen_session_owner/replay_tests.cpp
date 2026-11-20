@@ -47,6 +47,7 @@ struct MtpBatchRequest {
     std::shared_ptr<MtpConstraintRow> constraint;
     serve::CacheRetention cache_retention=serve::CacheRetention::server_policy;
     std::vector<std::uint32_t> prompt, stop_tokens;
+    std::uint32_t stable_prefix=0;
     std::uint64_t max_tokens=0;
     std::shared_ptr<TokenSampler> sampler;
     std::optional<bool> ngram_draft,tool_draft,ngram_peers;
