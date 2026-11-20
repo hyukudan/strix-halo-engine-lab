@@ -142,6 +142,8 @@ def rows_of(path, positions=None):
     if positions is not None and pos is None:
         pos = np.asarray(positions, np.int64)
     n = pos.size
+    if n == 0:
+        return pos, data.reshape(0, 0)
     if data.size % n:
         raise SystemExit(f"{path}: {data.size} floats is not {n} rows")
     return pos, data.reshape(n, data.size // n)
