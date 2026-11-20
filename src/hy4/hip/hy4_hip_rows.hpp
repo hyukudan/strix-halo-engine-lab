@@ -37,6 +37,12 @@ inline constexpr bool kExpertUnionDefault = true;  // measured bitwise (ROWS 30/
 [[nodiscard]] constexpr std::array<std::uint32_t, 4> position_words(std::uint32_t p, std::uint32_t ratio) {
     return {p, p / ratio * ratio, p / ratio, 0U};
 }
+// Rows form of a next-token block call (Forward::nextn_rows): the call's rows run in chunks through the verify rows form;
+// the chunk starting at row `off` of an R-row call holds min(R - off, verify_rows) rows (verify_rows < 2: one row per
+// chunk = the per-row loop). Every row r of the call keeps its own pinned position slot r (no host sync inside a call).
+[[nodiscard]] constexpr std::uint32_t nextn_chunk(std::uint32_t off, std::uint32_t R, std::uint32_t verify_rows) {
+    return off >= R ? 0U : std::min(R - off, std::max(1U, verify_rows));
+}
 // Rows one launch / one pass may write ahead of the oldest live key: the caches are sized for the larger of the batched
 // prompt window and the verify rows.
 [[nodiscard]] constexpr std::uint32_t cache_rows(std::uint32_t prompt_rows, std::uint32_t verify_rows) {

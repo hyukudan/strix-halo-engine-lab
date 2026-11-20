@@ -224,11 +224,12 @@ void absorb_vrows(const std::uint8_t* wt, std::uint32_t heads, std::uint32_t wid
     }
 }
 
+// Text layers and the next-token block (l = c.layers, the rows form of nextn_rows): heads_of / indexed_of read its form.
 void attention_vrows(std::uint32_t l, std::uint32_t R) {  // vr.xn -> vr.f
     namespace rp = strix::ops::rope;
     namespace dcr = strix::attn_core::cache_rows;
-    const std::uint32_t H = c.heads[l], qk = c.qk_head(), kl = c.kv_lora, rope = c.qk_rope, vd = c.v_head, h = c.hidden;
-    const bool idx = c.indexed[l] != 0U;
+    const std::uint32_t H = heads_of(l), qk = c.qk_head(), kl = c.kv_lora, rope = c.qk_rope, vd = c.v_head, h = c.hidden;
+    const bool idx = indexed_of(l);
     if (idx ? H != 32U : H != 64U) throw std::runtime_error("hy4 hip forward: head count outside the flash presets");
     const std::uint32_t row = kl + rope;
     const std::size_t qrow = std::size_t{H} * qk, orow = std::size_t{H} * vd, frow = std::size_t{H} * row, lrow = std::size_t{H} * kl;
@@ -252,12 +253,10 @@ void attention_vrows(std::uint32_t l, std::uint32_t R) {  // vr.xn -> vr.f
         }
     const auto& kb = t(blk(l, "attn_k_b.weight"));
     if (kb.type == 8U) absorb_vrows(kb.p, H, c.qk_nope, kl, vr.qv, qk, qrow, vr.qfull, row, frow, R);
-    else {
+    else {  // one grouped launch per row over the H head slices (the step's form; bitwise == one linear() per head)
         const auto kb_head = row_bytes(kb.type, c.qk_nope) * kl;
         for (std::uint32_t r = 0; r < R; ++r)
-            for (std::uint32_t hh = 0; hh < H; ++hh)
-                linear(kb.p + hh * kb_head, kb.type, vr.qv + r * qrow + std::size_t{hh} * qk, c.qk_nope, kl,
-                       vr.qfull + r * frow + std::size_t{hh} * row, false);
+            linear_groups(kb.p, kb.type, kb_head, H, nullptr, H, vr.qv + r * qrow, qk, c.qk_nope, kl, vr.qfull + r * frow, row);
     }
     check(hipMemcpy2DAsync(vr.qfull + kl, row * 4U, vr.qv + c.qk_nope, qk * 4U, rope * 4U, std::size_t{H} * R, hipMemcpyDeviceToDevice, s),
           "q rope copy rows");
@@ -285,12 +284,10 @@ void attention_vrows(std::uint32_t l, std::uint32_t R) {  // vr.xn -> vr.f
     }
     const auto& vb = t(blk(l, "attn_v_b.weight"));
     if (vb.type == 8U) absorb_vrows(vb.p, H, kl, vd, vr.olat, kl, lrow, vr.o, vd, orow, R);
-    else {
+    else {  // one grouped launch per row (the step's form)
         const auto vb_head = row_bytes(vb.type, kl) * vd;
         for (std::uint32_t r = 0; r < R; ++r)
-            for (std::uint32_t hh = 0; hh < H; ++hh)
-                linear(vb.p + hh * vb_head, vb.type, vr.olat + r * lrow + std::size_t{hh} * kl, kl, vd, vr.o + r * orow + std::size_t{hh} * vd,
-                       false);
+            linear_groups(vb.p, vb.type, vb_head, H, nullptr, H, vr.olat + r * lrow, kl, kl, vd, vr.o + r * orow, vd);
     }
     glu::launch_epilogue<glu::Round::bf16>(vr.o, nullptr, H * vd, R * orow, vr.o, s);
     glu::launch_sigmoid_gate<glu::DeclaredExp, glu::Round::bf16>(vr.o, vr.gate, R * orow, vr.o, s);
@@ -367,7 +364,7 @@ void expert_rows_union(std::uint32_t l, std::uint32_t R) {
 
 void ffn_vrows(std::uint32_t l, std::uint32_t R) {  // vr.xn -> vr.f
     const std::uint32_t h = c.hidden;
-    if (c.dense[l]) {
+    if (dense_of(l)) {
         linear_vrows(blk(l, "ffn_gate.weight"), vr.xn, h, c.dense_ff, R, vr.g);
         linear_vrows(blk(l, "ffn_up.weight"), vr.xn, h, c.dense_ff, R, vr.up);
         glu::launch_swiglu<glu::DeclaredExp, glu::Round::bf16>(vr.g, vr.up, std::size_t{R} * c.dense_ff, glu::no_clamp, vr.act, s);
@@ -378,7 +375,12 @@ void ffn_vrows(std::uint32_t l, std::uint32_t R) {  // vr.xn -> vr.f
         strix::moe_core::enqueue_route_wave<preset::route, glu::DeclaredExp>(vr.rlog, t(blk(l, "exp_probs_b.bias")).f(), vr.ids, vr.rw, R, s);
         linear_vrows(blk(l, "ffn_routed_down.weight"), vr.xn, h, c.latent, R, vr.z);
         const bool kquant_down = t(blk(l, "ffn_down_exps.weight")).type == 12U || t(blk(l, "ffn_down_exps.weight")).type == 14U;
-        if (vr.expert_union && R > 1U && t(blk(l, "ffn_gate_exps.weight")).type == 12U && kquant_down)
+        const auto& wg = t(blk(l, "ffn_gate_exps.weight"));
+        if (wg.type == kTypeBf16)  // the next-token block: each row's BF16 slices by the grouped dense rows (the step's form)
+            for (std::uint32_t r = 0; r < R; ++r)
+                experts_dense(wg, t(blk(l, "ffn_up_exps.weight")), t(blk(l, "ffn_down_exps.weight")), vr.z + r * L, vr.ids + r * K,
+                              vr.rawdots + r * K * L);
+        else if (vr.expert_union && R > 1U && wg.type == 12U && kquant_down)
             expert_rows_union(l, R);
         else
             for (std::uint32_t r = 0; r < R; ++r) expert_row(l, vr.z + r * L, vr.ids + r * K, vr.rawdots + r * K * L);

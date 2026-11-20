@@ -136,6 +136,33 @@ int mtp_taps(hb::Forward& f, const std::vector<std::uint32_t>& prompt, const std
         std::ofstream b(std::filesystem::path(dir) / "hidden_post.f32", std::ios::binary);
         b.write(reinterpret_cast<const char*>(host.data()), static_cast<std::streamsize>(host.size() * sizeof(float)));
     }
+    {  // rows form vs the per-row loop of the next-token block (Forward::nextn_rows) over the first fed positions: the
+       // teacher's calls, bitwise (hidden_pre, hidden_post, the last row's greedy id); walls of the second run of each form.
+       // The teacher loop below rewrites every block cache row from position 0.
+        const std::uint32_t n = std::min<std::uint32_t>(hb::Forward::kNextnRows, P - 1U);
+        std::vector<float> pre[2], post[2];
+        std::uint32_t top[2]{};
+        double wall[2]{};
+        for (int form = 0; form < 2; ++form) {
+            f.set_nextn_row_loop(form == 0);
+            for (int rep = 0; rep < 2; ++rep) {
+                const double t0 = now_ms();
+                const auto o = f.nextn_rows(ids.data() + 1, hid, n, 0U, true);
+                f.read_ids(o.top + (n - 1U), 1U, &top[form]);
+                wall[form] = now_ms() - t0;
+                pre[form].resize(std::size_t{n} * h);
+                post[form].resize(std::size_t{n} * h);
+                f.read_f32(o.hidden_pre, pre[form].size(), pre[form].data());
+                f.read_f32(o.hidden_post, post[form].size(), post[form].data());
+            }
+        }
+        f.set_nextn_row_loop(false);
+        const auto same = [](const std::vector<float>& a, const std::vector<float>& b) {
+            return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+        };
+        std::printf("MTPROWS rows %u pre_equal %d post_equal %d top %u %u | row loop %.2f ms rows form %.2f ms (%.3f vs %.3f ms/row)\n", n,
+                    same(pre[0], pre[1]) ? 1 : 0, same(post[0], post[1]) ? 1 : 0, top[0], top[1], wall[0], wall[1], wall[0] / n, wall[1] / n);
+    }
     constexpr std::uint32_t kLogitRows = 8;
     const std::uint32_t logits_from = P > kLogitRows ? P - kLogitRows : 0U;
     std::vector<std::uint32_t> teacher(P, 0U);
