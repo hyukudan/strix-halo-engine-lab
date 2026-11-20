@@ -910,7 +910,9 @@ private:
             session.health!=SerialSessionHealth::ready || !target_valid ||
             !certified_metadata(session.state,session.arithmetic_lineage,p) ||
             !qwen_full_t_continuation(plan_,plan_n_,p)) return {};
-        const bool selected=requested_captures_.contains(p) || p%every_==0 || p+block_rows_>std::min<std::uint64_t>(covered,prompt.size());
+        // The last full-T boundary before the prompt end stays selected when the cache unit is below T.
+        const bool selected=requested_captures_.contains(p) || p%every_==0 ||
+            p+std::max<std::uint64_t>(block_rows_,plan_.rows)>std::min<std::uint64_t>(covered,prompt.size());
         // Unselected boundaries may prefetch rows privately. They never publish checkpoints.
         // This lets a one-block staging cap feed a checkpoint cadence larger than T.
         if(!retain_) {store_->record_no_store_skip();return {};}

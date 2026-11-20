@@ -1131,10 +1131,17 @@ void write_logit_hashes(std::span<const std::string> hashes) {
     std::cout << ']';
 }
 
-// The prefix cache's segment / checkpoint unit: --prefix-cache-block-rows, else T.
+// The prefix cache's segment / checkpoint unit: --prefix-cache-block-rows, else T. The single tiled-MTP HTTP route
+// also keeps the row-class checkpoint at a prompt's class end (qwen_row_class_point), so its default unit is the
+// 128-row class grid (every full-T boundary stays on it); STRIX_PREFIX_CACHE_ROW_CLASS=0 keeps T.
 template <class O>
 std::uint32_t prefix_cache_unit(const O& options) {
-    return static_cast<std::uint32_t>(options.prefix_cache_block_rows ? options.prefix_cache_block_rows : options.known_prefix_prefill_rows);
+    if (options.prefix_cache_block_rows) return static_cast<std::uint32_t>(options.prefix_cache_block_rows);
+    static const bool row_class = strix::envcfg::flag("STRIX_PREFIX_CACHE_ROW_CLASS", true);
+    const std::uint64_t grid = strix::decode_cli::qwen_row_class_grid, t = options.known_prefix_prefill_rows;
+    if (row_class && options.http_serve && !options.http_batch && options.mtp.enabled && t > grid && t % grid == 0U)
+        return static_cast<std::uint32_t>(grid);
+    return static_cast<std::uint32_t>(t);
 }
 
 }  // namespace
