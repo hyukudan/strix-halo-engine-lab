@@ -13,6 +13,9 @@
 // m <= 2 this is the single split a + P(kept > a) * (depth - a + host_turn). STRIX_MTP_DRAFT_SPLIT (or the backend's own
 // variable): unset / "auto" = that choice, 0 = one segment (whole chain), N = fixed first segment N (then the rest).
 // The segment cap (max_segments, 0 = depth) is the backend's STRIX_*_DRAFT_SEGMENTS: 2 = the single split.
+// Context: two histograms, chosen by the caller per chain (the backends pass "the previous chain of this session kept its
+// whole depth"): long-draft streams (JSON, copies) and short-draft streams (prose) then get their own ends from one
+// process-wide chooser instead of the mix of both.
 #pragma once
 
 #include <array>
@@ -49,20 +52,21 @@ public:
     }
 
     // Segment ends for a chain of `depth` steps: ascending, last == depth (one entry: no split).
-    std::vector<std::uint32_t> segment_ends(std::uint32_t depth) const {
+    std::vector<std::uint32_t> segment_ends(std::uint32_t depth, std::uint32_t context = 0) const {
+        const auto& h = kept_[context & 1U];
         if (mode_ == 0 || depth < 2) return {depth};
         const std::uint32_t cap = max_segments_ == 0 || max_segments_ > depth ? depth : max_segments_;
-        const std::uint32_t a = first_segment(depth);
-        if (mode_ > 0 || cap <= 2 || a == depth || samples(depth) < min_samples_) {
+        const std::uint32_t a = first_segment(depth, context);
+        if (mode_ > 0 || cap <= 2 || a == depth || samples(depth, context) < min_samples_) {
             if (a == depth) return {depth};
             return {a, depth};
         }
         // g[c][s]: least expected steps from boundary s to the end with at most c segments (the chain alive at s)
-        const double total = static_cast<double>(samples(depth));
+        const double total = static_cast<double>(samples(depth, context));
         std::vector<double> alive(depth + 1U, 0.0);  // P(kept > s)
         for (std::uint32_t s = 0; s <= depth; ++s) {
             std::uint64_t more = 0;
-            for (std::uint32_t n = s + 1; n <= depth && n < kBins; ++n) more += kept_[n];
+            for (std::uint32_t n = s + 1; n <= depth && n < kBins; ++n) more += h[n];
             alive[s] = s == 0 ? 1.0 : static_cast<double>(more) / total;
         }
         const double inf = 1e300;
@@ -91,17 +95,18 @@ public:
     }
 
     // First segment length for a chain of `depth` steps (== depth: no split).
-    std::uint32_t first_segment(std::uint32_t depth) const {
+    std::uint32_t first_segment(std::uint32_t depth, std::uint32_t context = 0) const {
+        const auto& h = kept_[context & 1U];
         if (mode_ == 0 || depth < 2) return depth;
         if (mode_ > 0) return static_cast<std::uint32_t>(mode_) < depth ? static_cast<std::uint32_t>(mode_) : depth;
         std::uint64_t total = 0;
-        for (std::uint32_t n = 0; n <= depth && n < kBins; ++n) total += kept_[n];
+        for (std::uint32_t n = 0; n <= depth && n < kBins; ++n) total += h[n];
         if (total < min_samples_) return depth < 2U ? depth : 2U;
         std::uint32_t best = depth;
         double best_cost = depth;
         for (std::uint32_t a = 1; a < depth; ++a) {
             std::uint64_t more = 0;
-            for (std::uint32_t n = a + 1; n <= depth && n < kBins; ++n) more += kept_[n];
+            for (std::uint32_t n = a + 1; n <= depth && n < kBins; ++n) more += h[n];
             const double cost = a + static_cast<double>(more) / static_cast<double>(total) * (depth - a + host_turn_);
             if (cost < best_cost) best_cost = cost, best = a;
         }
@@ -109,15 +114,15 @@ public:
     }
 
     // Record one finished chain that kept `kept` drafts (the stop rule keeps the low draft itself).
-    void note(std::uint32_t kept) { ++kept_[kept < kBins ? kept : kBins - 1]; }
+    void note(std::uint32_t kept, std::uint32_t context = 0) { ++kept_[context & 1U][kept < kBins ? kept : kBins - 1]; }
 
     // Receipt tally of finished chains: steps launched (all segments that ran), steps kept, segments after the first
     // (= host turns). launched - kept is the step work the verify discards.
     struct Tally {
         std::uint64_t chains = 0, launched = 0, kept = 0, turns = 0;
     };
-    void note(std::uint32_t kept, std::uint32_t launched, std::uint32_t turns) {
-        note(kept);
+    void note(std::uint32_t kept, std::uint32_t launched, std::uint32_t turns, std::uint32_t context = 0) {
+        note(kept, context);
         ++tally_.chains;
         tally_.launched += launched;
         tally_.kept += kept;
@@ -126,12 +131,13 @@ public:
     const Tally& tally() const { return tally_; }
 
     int mode() const { return mode_; }
-    std::uint64_t kept(std::uint32_t n) const { return n < kBins ? kept_[n] : 0; }
+    std::uint64_t kept(std::uint32_t n) const { return n < kBins ? kept_[0][n] + kept_[1][n] : 0; }
+    std::uint64_t kept(std::uint32_t n, std::uint32_t context) const { return n < kBins ? kept_[context & 1U][n] : 0; }
 
 private:
-    std::uint64_t samples(std::uint32_t depth) const {
+    std::uint64_t samples(std::uint32_t depth, std::uint32_t context) const {
         std::uint64_t total = 0;
-        for (std::uint32_t n = 0; n <= depth && n < kBins; ++n) total += kept_[n];
+        for (std::uint32_t n = 0; n <= depth && n < kBins; ++n) total += kept_[context & 1U][n];
         return total;
     }
 
@@ -139,7 +145,7 @@ private:
     double host_turn_;
     std::uint64_t min_samples_;
     std::uint32_t max_segments_;
-    std::array<std::uint64_t, kBins> kept_{};
+    std::array<std::array<std::uint64_t, kBins>, 2> kept_{};
     Tally tally_{};
 };
 

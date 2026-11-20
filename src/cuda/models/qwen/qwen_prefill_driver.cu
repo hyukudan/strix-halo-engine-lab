@@ -183,6 +183,7 @@ struct SessionState {
     std::uint16_t *mtp_kv = nullptr, *mtp_index = nullptr;  // MTP predictor cache rows
     float* mtp_pooled = nullptr;                // the draft attention's pooled keys over the MTP cache
     std::uint32_t mtp_pooled_valid = 0;
+    std::uint32_t draft_full = 0;  // the previous draft() chain kept its whole depth (DraftSplit context)
     float* gdn_state = nullptr;                 // [36][48*128*128] (current; decode windows swap it with gdn_other)
     float* gdn_other = nullptr;                 // decode: the window's output state (S0 stays in gdn_state)
     float* gdn_base = nullptr;                  // the first GDN state buffer (graph key parity)
@@ -3173,7 +3174,7 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
     // from device memory (the eager chain runs once per key first; any position, pooled state or token replays it).
     qsa::MultiShape dshape{};
     const std::uint32_t one_row = 1;
-    const std::vector<std::uint32_t> ends = per_step_sync ? std::vector<std::uint32_t>{depth} : m.draft_split.segment_ends(depth);
+    const std::vector<std::uint32_t> ends = per_step_sync ? std::vector<std::uint32_t>{depth} : m.draft_split.segment_ends(depth, S.draft_full);
     if (ends.size() > 1) ++m.draft_split_runs;
     bool stopped = false;
     std::uint32_t launched = 0, turns = 0;  // steps launched / segments after the first that ran (receipt tally)
@@ -3332,7 +3333,8 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
         }
     }
     }  // segments
-    if (!per_step_sync) m.draft_split.note(static_cast<std::uint32_t>(out.tokens.size()), launched, turns);
+    if (!per_step_sync) m.draft_split.note(static_cast<std::uint32_t>(out.tokens.size()), launched, turns, S.draft_full);
+    S.draft_full = out.tokens.size() == depth ? 1U : 0U;
     m.draft_ns += static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_chain).count());
     return out;

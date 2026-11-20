@@ -134,6 +134,14 @@ int main() {
         DraftSplit full;
         for (int c = 0; c < 50; ++c) full.note(7);
         check(full.segment_ends(7) == std::vector<std::uint32_t>{7}, "full-depth chains: one segment");
+        // contexts: prose-like chains in context 0, full chains in context 1 -> each keeps its own ends
+        DraftSplit mixed;
+        for (std::uint32_t n = 1; n <= 7; ++n)
+            for (std::uint32_t c = 0; c < h[n]; ++c) mixed.note(n, 7, 0, 0);
+        for (int c = 0; c < 50; ++c) mixed.note(7, 7, 0, 1);
+        check(mixed.segment_ends(7, 0) == ep, "context 0 = the prose ends");
+        check(mixed.segment_ends(7, 1) == std::vector<std::uint32_t>{7}, "context 1 = one segment");
+        check(mixed.kept(7) == 53 && mixed.kept(7, 1) == 50, "receipt histogram sums the contexts");
     }
     std::printf("%s mtp_draft_split_tests\n", failures ? "FAIL" : "PASS");
     return failures ? EXIT_FAILURE : EXIT_SUCCESS;
