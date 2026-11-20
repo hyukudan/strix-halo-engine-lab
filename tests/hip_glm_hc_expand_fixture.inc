@@ -93,6 +93,18 @@ void test_hc_expand(std::mt19937& g, bool timing) {
                     reset();
                     check(run_bw() && same(), base + " bw strict payload/guards/flag");
                     check(!P::hc_expand_bw_rows(X, mix, Y, nullptr, X, rr + guard, flag, R, nullptr), base + " bw refuses Xo aliasing X");
+                    // Admission must be fail-closed: optional pair input may be null, not the
+                    // nonempty kernel's required buffers. None of these attempts may launch.
+                    check(!P::hc_expand_bw_rows(nullptr, mix, Y, nullptr, out + guard, rr + guard, flag, R, nullptr),
+                          base + " bw refuses missing X");
+                    check(!P::hc_expand_bw_rows(X, nullptr, Y, nullptr, out + guard, rr + guard, flag, R, nullptr),
+                          base + " bw refuses missing mix");
+                    check(!P::hc_expand_bw_rows(X, mix, nullptr, nullptr, out + guard, rr + guard, flag, R, nullptr),
+                          base + " bw refuses missing y");
+                    check(!P::hc_expand_bw_rows(X, mix, Y, nullptr, nullptr, rr + guard, flag, R, nullptr),
+                          base + " bw refuses missing Xo");
+                    check(!P::hc_expand_bw_rows(X, mix, Y, nullptr, out + guard, nullptr, flag, R, nullptr),
+                          base + " bw refuses missing norm output");
                     if (timing && stress == 0 && failures == 0) {
                         // ABBA: one-row kernel at the production hoist vs the shared row expansion, same inputs.
                         const unsigned h = P::hc_expand_hoist();
