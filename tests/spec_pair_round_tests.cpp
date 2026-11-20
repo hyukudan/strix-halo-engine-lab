@@ -207,8 +207,7 @@ void test_chain_replay() {
     pr::FollowResult fr;
     const auto err = run_chain(0U, true, &a, &b, &fr);
     expect(err.empty(), "chain replay ran without error");
-    if (!err.empty()) std::fprintf(stderr, "  chain replay: %s
-", err.c_str());
+    if (!err.empty()) std::fprintf(stderr, "  chain replay: %s\n", err.c_str());
     expect(a == b && a.size() == 4U * 5U - 1U, "follower target + chain call log == leader's (commit before accept)");
     expect(fr.drafts == 4U && fr.passes == 5U && fr.rounds == 4U + 5U + 1U, "chain follow counts");
     const auto div = run_chain(1U, true, nullptr, nullptr, nullptr);  // the follower's drafts differ: fail closed
