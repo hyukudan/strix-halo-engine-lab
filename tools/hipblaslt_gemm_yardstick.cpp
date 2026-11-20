@@ -10,6 +10,10 @@
 // Env: HB_ARMS=<bit mask of the arms, default 31>, HB_NAMES=1 prints the winning kernel name.
 // HB_BATCH=E (default 1): E independent GEMMs of the same shape in one strided-batched call, each with its own weights,
 // rows and outputs (the vendor form of a grouped MoE expert call with E experts of <rows> rows each); TFLOPS count all E.
+// HB_RAND=<class> (default 0: constant bytes 0x11 / 0x22). The sustained clock under WMMA depends on the operand bits on
+// gfx1151, so compare only with our probe on the same data class: 1 = W code / 16 (code -8..7, the IU4 probe class),
+// x uniform -1..1; 2 = W and x full-mantissa uniform -1..1 (the class of dequantised K-quant weights); 3 = uniform random
+// bytes for W and x (int8 arm only: FP16 arms would read NaN / Inf). Fixed seeds.
 #include <hip/hip_runtime.h>
 #include <hipblaslt/hipblaslt.h>
 #include <hipblaslt/hipblaslt-version.h>
@@ -51,6 +55,24 @@ int main(int argc, char** argv) {
     const std::size_t ws_bytes = std::size_t(64) << 20;
     CK(hipMalloc(&w, max_w)); CK(hipMalloc(&x, max_x)); CK(hipMalloc(&d, max_d)); CK(hipMalloc(&ws, ws_bytes));
     CK(hipMemset(w, 0x11, max_w)); CK(hipMemset(x, 0x22, max_x));  // small finite FP16 / BF16 values
+    const unsigned data_class = std::getenv("HB_RAND") ? unsigned(std::atoi(std::getenv("HB_RAND"))) : 0U;
+    if (data_class > 3U) { std::printf("HB_RAND must be 0..3\n"); return 2; }
+    if (data_class != 0U) {
+        auto fill = [](void* p, std::size_t bytes, std::uint32_t z, unsigned cls) {
+            std::vector<std::uint16_t> h(bytes / 2U);
+            for (auto& e : h) {
+                z = z * 1664525U + 1013904223U;
+                if (cls == 3U) { e = static_cast<std::uint16_t>(z >> 16); continue; }
+                const float v = cls == 1U ? float(int((z >> 16) & 15U) - 8) / 16.0F : float(int(z >> 9) % 2001 - 1000) / 1000.0F;
+                const _Float16 f = static_cast<_Float16>(v);
+                std::memcpy(&e, &f, sizeof(e));
+            }
+            CK(hipMemcpy(p, h.data(), h.size() * 2U, hipMemcpyHostToDevice));
+        };
+        fill(w, max_w, 7U, data_class);                          // weights: the class
+        fill(x, max_x, 11U, data_class == 3U ? 3U : 2U);         // activations: full-mantissa (or random bytes)
+    }
+    std::printf("data class %u\n", data_class);
     hipEvent_t ea, eb;
     CK(hipEventCreate(&ea)); CK(hipEventCreate(&eb));
     const Arm arms[] = {{"f16-d32", HIP_R_16F, HIP_R_16F, HIP_R_32F}, {"f16-d16", HIP_R_16F, HIP_R_16F, HIP_R_16F},
