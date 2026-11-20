@@ -463,9 +463,11 @@ struct Prefill::Impl : BlockFields {
     std::uint64_t* draft_pos = nullptr;         // device [8]
     std::uint64_t* draft_pos_pinned = nullptr;  // [8] + the pending token word after them
     std::uint64_t draft_captures = 0, draft_replays = 0;
-    // Draft chain in two graph segments [0, a) and [a, depth) (rtxmax3, shared chooser strix/mtp_draft_split.hpp): the second
-    // runs only when no draft of the first fell below min_p. STRIX_QRTX_DRAFT_SPLIT: unset/auto, 0 = one segment, N = fixed a.
-    strix::mtp::DraftSplit draft_split{strix::mtp::DraftSplit::mode_from_env("STRIX_QRTX_DRAFT_SPLIT")};
+    // Draft chain in graph segments [0, b1) [b1, b2) ... (rtxmax3; shared chooser strix/mtp_draft_split.hpp): a segment runs
+    // only when no draft before it fell below min_p. STRIX_QRTX_DRAFT_SPLIT: unset/auto, 0 = one segment, N = fixed first
+    // segment; STRIX_QRTX_DRAFT_SEGMENTS: segment cap (unset = depth, 2 = the single split).
+    strix::mtp::DraftSplit draft_split{strix::mtp::DraftSplit::mode_from_env("STRIX_QRTX_DRAFT_SPLIT"), 0.25, 8,
+                                       strix::mtp::DraftSplit::segments_from_env("STRIX_QRTX_DRAFT_SEGMENTS")};
     std::uint64_t draft_split_runs = 0, draft_second_runs = 0, draft_ns = 0;  // draft_ns: host wall of draft() chains
     // batched draft chains (draft_cohort): row j = the j-th chain by descending depth
     std::uint16_t* bd_wide = nullptr;          // [3][8][10240] attention / mlp / source wide rows
@@ -2856,7 +2858,7 @@ std::string Prefill::draft_stats() const {
     const auto& m = *impl_;
     const auto& t = m.draft_split.tally();
     std::string s = "{\"chains\":" + std::to_string(t.chains) + ",\"launched\":" + std::to_string(t.launched) + ",\"kept\":" +
-        std::to_string(t.kept) + ",\"second\":" + std::to_string(t.second) + ",\"split\":" + std::to_string(m.draft_split_runs) +
+        std::to_string(t.kept) + ",\"second\":" + std::to_string(t.turns) + ",\"split\":" + std::to_string(m.draft_split_runs) +
         ",\"ms\":" + std::to_string(static_cast<double>(m.draft_ns) * 1e-6) + ",\"captures\":" + std::to_string(m.draft_captures) +
         ",\"replays\":" + std::to_string(m.draft_replays) + ",\"hist\":[";
     for (std::uint32_t n = 0; n < strix::mtp::DraftSplit::kBins; ++n) s += (n ? "," : "") + std::to_string(m.draft_split.kept(n));
@@ -3171,12 +3173,13 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
     // from device memory (the eager chain runs once per key first; any position, pooled state or token replays it).
     qsa::MultiShape dshape{};
     const std::uint32_t one_row = 1;
-    const std::uint32_t first_segment = per_step_sync ? depth : m.draft_split.first_segment(depth);
-    if (first_segment < depth) ++m.draft_split_runs;
+    const std::vector<std::uint32_t> ends = per_step_sync ? std::vector<std::uint32_t>{depth} : m.draft_split.segment_ends(depth);
+    if (ends.size() > 1) ++m.draft_split_runs;
     bool stopped = false;
-    std::uint32_t launched = 0;  // steps launched by the segments that ran (receipt tally)
-    for (std::uint32_t k0 = 0, k1 = first_segment; k0 < depth && !stopped; k0 = k1, k1 = depth) {
-    if (k0 > 0) ++m.draft_second_runs;
+    std::uint32_t launched = 0, turns = 0;  // steps launched / segments after the first that ran (receipt tally)
+    for (std::size_t seg = 0; seg < ends.size() && !stopped; ++seg) {
+    const std::uint32_t k0 = seg ? ends[seg - 1] : 0U, k1 = ends[seg];
+    if (k0 > 0) ++m.draft_second_runs, ++turns;
     launched += k1 - k0;
     source = k0 ? wide_src : S.held;  // segment 2 continues from the chain's wide state and m.draft_token on the device
     const Impl::DraftKey dkey{reinterpret_cast<std::uintptr_t>(S.held), reinterpret_cast<std::uintptr_t>(S.mtp_kv),
@@ -3329,7 +3332,7 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
         }
     }
     }  // segments
-    if (!per_step_sync) m.draft_split.note(static_cast<std::uint32_t>(out.tokens.size()), launched, first_segment < depth && launched > first_segment);
+    if (!per_step_sync) m.draft_split.note(static_cast<std::uint32_t>(out.tokens.size()), launched, turns);
     m.draft_ns += static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_chain).count());
     return out;
