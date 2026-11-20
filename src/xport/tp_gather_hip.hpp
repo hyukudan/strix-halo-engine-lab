@@ -125,6 +125,13 @@ public:
         if (fast_) fast_->drain();
         return dist::agree_max(comm_->transport(), mine);
     }
+    // The pair transport for a host phase between gathers (a layer-stage prompt pass and its state re-layout,
+    // strix/pair/relayout.hpp): the channel drained first, as agree_max. Both ranks enter and leave the phase at the same
+    // point and no gather is enqueued while the caller uses it; the phase leaves the byte stream aligned.
+    [[nodiscard]] dist::Transport& host_transport() {
+        if (fast_) fast_->drain();
+        return comm_->transport();
+    }
     // After the last gather of a run, before its results are printed (both ranks): surfaces a failed integrity check of
     // the channel's last messages (pair::GatherLink::finish).
     void finish() { link_.finish(); }
