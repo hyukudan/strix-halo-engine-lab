@@ -719,6 +719,12 @@ The tiled MTP prompt primes the predictor cache for each finished block in batch
 - **Off switch:** STRIX_MTP_PRIME_ROWS=0 (restart the process)
 - **Measured gain (original eight-row route only; no wider-batch timing claim):** MTP-route prompt at 262,144 tokens (YaRN f2, T8192, one node): 210.9–213.2 → 202.8–203.8 s, −8.1 to −10.0 s in three pairs; decode unchanged.
 
+**Four output rows per wave in the priming input projection.** `STRIX_MTP_PRIME_PROJ_ROWS` (default `4`; `1` restores one output row per wave; cached, restart). The fused input projection of a priming batch (embedding plus the four hyper streams, Q4 copy) was bound by L1 input loads: with one wave per output row every row reloads the token inputs of each column group, one load per FMA (about 39 µs of the ~55 µs per primed row). With four rows per wave the inputs of a two-token group are loaded once per column group and each row runs its unchanged FMA chain, reduction tree and rounding, so the outputs are bitwise those of one row per wave. The draft (decode) path is unchanged.
+
+- **Exactness evidence:** device test `strix-hip-mtp-draft-batch-tests` compares the prime-rows fusion with the one-token fusion bit for bit (2 to 64 rows, both roundings, run with `4` and with `1`); same binary, T2048, 4,096-token prompt: end-of-prompt state digest, terminal logits digest, lineage digest and tokens equal with `4` and `1`.
+- **Measured gain:** same binary, one node, 32,768-token MTP prompt (T16384), ABBA: final-block priming 618–667 ms vs 934–947 ms with `1`, prompt 20.87–21.08 s vs 21.60–21.91 s (mean −0.78 s, about −3.6 %, two pairs); 16,384 tokens: final-block priming 313–321 ms vs 455 ms (prompt difference within noise). Tokens identical; decode unchanged.
+- **Off switch:** `STRIX_MTP_PRIME_PROJ_ROWS=1` (restart)
+
 <a id="spec-context-cost"></a>
 
 ### Context-aware verify pricing (speculative drafting)
@@ -5118,6 +5124,23 @@ shared per-layer entry `attention_decode_kv` (null shadow = the exact BF16 row-s
 - **Off switch:** `--decode-attn8 off` (the default), or `--profile exact`.
 - **Measured gain:** not yet measured.
 - **Implementation / evidence:** [e4m3 attention family](../src/cuda_core/attention/attention_flash8.cu), [entry](../include/strix/cuda_core/attention.hpp), [device test](../tests/cuda_core/cuda_core_test.cu), [profile test](../tests/qwen35_dense_profile_host_tests.cpp)
+
+<a id="qwen-rtx-commit-async"></a>
+
+### Asynchronous decode commit tail
+
+**Engine:** `qwen-rtx`. **Control:** `STRIX_QRTX_COMMIT_ASYNC`. **Default:** off (`0`) until its timing receipt.
+
+After a verify window the decode commit (recurrent-state replay of the accepted rows, conv rollback, MTP cache rows)
+used to end with a stream synchronisation. With the switch on the commit returns once its work is queued; the draft
+queues behind it, the next verify window synchronises first, and the host does its between-step work meanwhile.
+
+- **Preconditions:** CUDA Qwen MoE decode (`strix-cuda-qwen-serve`).
+- **Automatic selection:** none.
+- **Exactness evidence:** Scheduling only: the same launches in the same order on one stream, host synchronisations removed; the commit tail reads no pinned host input, and every reader that rewrites pinned inputs synchronises first (host test of the shared protocol). Emitted ids, logits and state bits unchanged by construction. A device fault in the tail surfaces at the next synchronisation and fails that step.
+- **Off switch:** `STRIX_QRTX_COMMIT_ASYNC=0` (the default).
+- **Measured gain:** Not yet measured.
+- **Implementation / evidence:** [shared protocol](../include/strix/spec/commit_tail.hpp), [CUDA binding](../src/cuda/models/qwen/qwen_prefill_driver.cu), [backend notes](engine/cuda-backend.md)
 
 <a id="qwen-dense-cuda-splitk-fast"></a>
 

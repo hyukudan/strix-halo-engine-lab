@@ -389,20 +389,23 @@ public:
     std::size_t prefill_chunk_rows() const override { return chunk; }
     bool prefill_matches_decode() const override { return matches; }
     bool prefill_batch_supported() const override { return supported; }
-    e::PrefillRows prefill_rows(g4::KvTxn& tx, std::span<const std::uint32_t> tokens, bool hidden, bool taps) override {
+    e::PrefillRows prefill_rows(g4::KvTxn& tx, std::span<const std::uint32_t> tokens, g4::HiddenDemand demand, bool taps) override {
+        const bool hidden = demand != g4::HiddenDemand::none;
         requested.push_back(taps);
         std::vector<g4::RowPlan> rows;
         for (std::size_t i = 0; i < tokens.size(); ++i) rows.push_back({0,0,tx.frontier()+i,tokens[i],&tx,i,true,hidden});
         auto pass = host.forward_rows(rows);
         e::PrefillRows out; out.tap_width = pass.tap_width;
         if (hidden) out.hidden = std::move(pass.hidden);
+        // last_committed: the last row alone, as the device prefill exports it.
+        if (demand == g4::HiddenDemand::last_committed) out.hidden.erase(out.hidden.begin(), out.hidden.end()-std::ptrdiff_t(out.hidden.size()/tokens.size()));
         if (!g4::prefill::lever_enabled(g4::prefill::lever_pinned_taps)) { out.taps = std::move(pass.taps); return out; }
         out.levers = g4::prefill::lever_pinned_taps;
         if (taps) { held = std::move(pass.taps); out.tap_view = held; }
         return out;
     }
     // Batched calls as the device backend makes them: one result per stream, views valid until the next call.
-    std::vector<e::PrefillRows> prefill_rows_batch(std::span<const e::PrefillItem> items, bool hidden, bool taps) override {
+    std::vector<e::PrefillRows> prefill_rows_batch(std::span<const e::PrefillItem> items, g4::HiddenDemand hidden, bool taps) override {
         ++batch_calls; batch_width = std::max(batch_width,items.size());
         std::size_t total = 0;
         for (const auto& item : items) total += item.tokens.size();
@@ -425,12 +428,14 @@ public:
 struct StageLog { std::vector<float> taps, hidden; std::vector<std::uint64_t> positions; std::size_t empty_taps = 0; };
 // Session shapes of the three drafter families: DFlash consumes taps through
 // stage(); EAGLE consumes taps and final hidden rows through stage_rows(); MTP
-// keeps only final hidden rows and declares wants_taps() false.
+// keeps only the last committed final hidden row (HiddenDemand::last_committed) and declares wants_taps() false.
 class ShapeDraft final : public e::DraftSession {
 public:
     ShapeDraft(int family, std::vector<std::uint32_t> gold, std::size_t base, std::shared_ptr<StageLog> log)
         : family_(family), gold_(std::move(gold)), base_(base), log_(std::move(log)) {}
-    bool wants_hidden() const override { return family_ != 0; }
+    g4::HiddenDemand hidden_demand() const override {
+        return family_ == 0 ? g4::HiddenDemand::none : family_ == 1 ? g4::HiddenDemand::all_rows : g4::HiddenDemand::last_committed;
+    }
     bool wants_taps() const override { return family_ != 2; }
     void append(std::span<const float> taps, std::span<const std::uint64_t> positions) override {
         log_->taps.insert(log_->taps.end(),taps.begin(),taps.end());
@@ -439,7 +444,8 @@ public:
     void stage_rows(std::span<const float> taps, std::span<const float> hidden, std::span<const std::uint32_t> next,
                     std::span<const std::uint64_t> positions) override {
         if (family_ == 0) { e::DraftSession::stage_rows(taps,hidden,next,positions); return; }
-        CHECK(hidden.size() == positions.size()*16);
+        if (family_ == 1) CHECK(hidden.size() == positions.size()*16);
+        else CHECK(hidden.empty() || hidden.size() == 16 || hidden.size() == positions.size()*16); // last row / decode rows
         if (family_ == 2 && taps.empty()) ++log_->empty_taps;
         else CHECK(taps.size() == positions.size()*80);
         log_->hidden.insert(log_->hidden.end(),hidden.begin(),hidden.end());

@@ -37,11 +37,11 @@ public:
     LinearView resident_head(LinearView source) const override { return backend_->resident_head(source); }
     std::size_t prefill_chunk_rows() const override { return backend_->prefill_chunk_rows(); }
     bool prefill_matches_decode() const override { return backend_->prefill_matches_decode(); }
-    PrefillRows prefill_rows(KvTxn& transaction, std::span<const std::uint32_t> tokens, bool hidden, bool taps) override {
+    PrefillRows prefill_rows(KvTxn& transaction, std::span<const std::uint32_t> tokens, HiddenDemand hidden, bool taps) override {
         return backend_->prefill_rows(transaction,tokens,hidden,taps);
     }
     bool prefill_batch_supported() const override { return backend_->prefill_batch_supported(); }
-    std::vector<PrefillRows> prefill_rows_batch(std::span<const PrefillItem> items, bool hidden, bool taps) override {
+    std::vector<PrefillRows> prefill_rows_batch(std::span<const PrefillItem> items, HiddenDemand hidden, bool taps) override {
         return backend_->prefill_rows_batch(items,hidden,taps);
     }
     bool head_logits(std::span<const float> hidden, std::vector<float>& logits) override {

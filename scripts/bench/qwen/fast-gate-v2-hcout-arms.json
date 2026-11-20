@@ -1,0 +1,7 @@
+{"arms": {
+ "REF": {"argv": ["--prefill-exact-fp16"], "env": {}, "routes": {"out": true}},
+ "NULL": {"argv": ["--prefill-exact-fp16"], "env": {"STRIX_MOE_ROUTE_NULL": "0:1"}, "routes": {"in": "REF"}},
+ "NULLF": {"argv": ["--prefill-exact-fp16"], "env": {"STRIX_MOE_ROUTE_NULL": "0:1"}, "routes": {"out": true}},
+ "HC": {"argv": [], "env": {}, "routes": {"in": "REF"}},
+ "HCF": {"argv": [], "env": {}, "routes": {"out": true}}
+}}

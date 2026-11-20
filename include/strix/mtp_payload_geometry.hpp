@@ -4,6 +4,7 @@
 #include "strix/indexed_attention_workspace.hpp"
 #include "strix/mtp_forward_payload.hpp"
 #include "strix/mtp_target_window_payload.hpp"
+#include <algorithm>
 #include <array>
 #include <stdexcept>
 
@@ -83,5 +84,19 @@ inline std::uint64_t golden_host(std::uint64_t rows,std::uint64_t width,std::uin
 inline std::uint64_t replay_host(std::uint64_t rows,std::uint64_t width,std::uint64_t vocabulary) {
     const auto row=add(mul(width,4U),mul(vocabulary,4U));
     return add(add(row,mul(rows,add(sizeof(HipMtpForwardReplayRowReceipt)+2U*sizeof(std::uint32_t),row))),mul(add(rows,1U),192U));
+}
+// Largest golden file header of any version (v1 168, v2 184, v3 288 bytes).
+inline constexpr std::uint64_t golden_header_bound=288U;
+// A golden holds exactly its calibration rows (the tiled prompt's calibration rows, or every predictor pair of a
+// serial prompt): its file and the independent replay are bounded by that row count. The configured byte budgets
+// stay hard caps. Admission charges this payload, never the caps alone; the golden read uses golden_file as limit.
+struct CalibrationCharge { std::uint64_t golden_file=0, golden=0, replay=0; };
+inline CalibrationCharge calibration_charge(std::uint64_t rows,std::uint64_t width,std::uint64_t vocabulary,
+    std::uint64_t golden_cap,std::uint64_t replay_cap) {
+    if(!rows || !width || !vocabulary) throw std::invalid_argument("MTP calibration payload geometry is zero");
+    const auto file=std::min(golden_cap,golden_file(rows,width,vocabulary,golden_header_bound));
+    // The encoded file and the decoded rows coexist while the golden is read.
+    return {file,std::min(golden_cap,add(file,golden_host(rows,width,vocabulary))),
+        std::min(replay_cap,replay_host(rows,width,vocabulary))};
 }
 } // namespace strix::mtp_payload

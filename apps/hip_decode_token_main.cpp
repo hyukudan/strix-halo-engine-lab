@@ -3826,9 +3826,19 @@ static int run_decode_entry(
             strix::decode_cli::PrefillReservationGrowth mtp_growth;
             if (ple_turn) {
                 const auto& m = options.mtp;
+                // One known request: its golden holds exactly the calibration rows the bridge checks, so charge
+                // that payload (Flash-Next 16 rows ~51 MB) instead of the 2 x 6 GiB bundle caps, which declined MTP
+                // on the default >= 32K route. Cohorts and serving keep the caps.
+                const bool tiled = strix::decode_cli::mtp_tiled_prompt(options);
+                const auto calibration = !options.http_serve && m.cohort.empty() && (tiled || options.tokens.size() > 1U)
+                    ? (tiled ? std::uint64_t{strix::decode_cli::mtp_calibration_rows(options)} : options.tokens.size() - 1U) : 0U;
+                const auto payload = calibration
+                    ? strix::mtp_payload::calibration_charge(calibration, strix::mtp_payload::mul(model.hidden_size, model.hc_count),
+                        model.vocab_size, m.golden_max_bytes, m.replay_host_bytes)
+                    : strix::mtp_payload::CalibrationCharge{m.golden_max_bytes, m.golden_max_bytes, m.replay_host_bytes};
                 mtp_growth = strix::decode_cli::mtp_prefill_reservation({m.sidecar_retained_bytes,
                     strix::mtp_payload::runtime_budget(model, options.context_tokens, m.runtime_bytes, m.runtime_automatic),
-                    m.target_capture_bytes, m.replay_host_bytes, m.golden_max_bytes, m.window_arena_bytes,
+                    m.target_capture_bytes, payload.replay, payload.golden, m.window_arena_bytes,
                     m.window_capture_bytes, m.window_checkpoint_bytes, m.window_total_bytes,
                     m.window_rows ? static_cast<std::uint32_t>(m.window_rows_set.empty() ? 1U : m.window_rows_set.size()) : 0U,
                     m.window_prefix});

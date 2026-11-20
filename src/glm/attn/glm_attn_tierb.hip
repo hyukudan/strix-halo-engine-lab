@@ -552,13 +552,16 @@ void dsa_b(const Mat& q_b, const Mat& wq_b, const float* qr, unsigned qr_stride,
     if (!supported(Group::DsaB, m, 2)) throw std::invalid_argument("glm attn tierb: dsa_b shapes");
     check_rows(rows, qr, qr_stride, GQb::In, ws);
     check_out(q, q_stride, GQb::Out, rows);
-    check_out(qI, qI_stride, GWqb::Out, rows);
+    if (qI != nullptr) check_out(qI, qI_stride, GWqb::Out, rows);
     Args a{};
     a.m0 = margs(q_b, qr, qr_stride, q, q_stride, ws, 0);
-    a.m1 = margs(wq_b, qr, qr_stride, qI, qI_stride, ws, 1);
+    a.m1 = qI != nullptr ? margs(wq_b, qr, qr_stride, qI, qI_stride, ws, 1) : a.m0;
     a.m2 = a.m1;
     a.rows = rows;
-    launch<GQb, 1, GWqb, 1>(a, resolve(k, Group::DsaB, rows), s);
+    // Same knobs (the DsaB row of the table) either way: the q_b member runs the same member_cta chains, so q is
+    // bit-identical whether the wq_b member is launched beside it or not.
+    if (qI != nullptr) launch<GQb, 1, GWqb, 1>(a, resolve(k, Group::DsaB, rows), s);
+    else launch<GQb, 1, GWqb, 0>(a, resolve(k, Group::DsaB, rows), s);
 }
 void dsa_o(const Mat& m, const float* x, unsigned x_stride, unsigned rows, float* y, unsigned y_stride, void* ws, hipStream_t s, Knobs k,
            const strix::pair::ProducerPublish* pub) {

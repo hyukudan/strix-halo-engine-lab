@@ -1,0 +1,13 @@
+{"arms": {
+ "REF": {"argv": [], "env": {}, "routes": {"out": true}},
+ "NULL": {"argv": [], "env": {"STRIX_MOE_ROUTE_NULL": "0:1"}, "routes": {"in": "REF"}},
+ "FAST": {"argv": ["--profile", "fast", "--allow-pending"], "env": {}, "routes": {"in": "REF"}},
+ "FASTF": {"argv": ["--profile", "fast", "--allow-pending"], "env": {}, "routes": {"out": true}},
+ "NULLF": {"argv": [], "env": {"STRIX_MOE_ROUTE_NULL": "0:1"}, "routes": {"out": true}},
+ "Q": {"argv": [], "env": {"STRIX_QPF2K_QSA_BUDGET": "1536"}, "routes": {"in": "REF"}},
+ "G": {"argv": [], "env": {"STRIX_QPF2K_GDN_FP16_CHUNK": "1"}, "routes": {"in": "REF"}},
+ "R": {"argv": [], "env": {"STRIX_QPF2K_MOE_ROUTE_BF16": "1"}, "routes": {"in": "REF"}},
+ "QF": {"argv": [], "env": {"STRIX_QPF2K_QSA_BUDGET": "1536"}, "routes": {"out": true}},
+ "GF": {"argv": [], "env": {"STRIX_QPF2K_GDN_FP16_CHUNK": "1"}, "routes": {"out": true}},
+ "RF": {"argv": [], "env": {"STRIX_QPF2K_MOE_ROUTE_BF16": "1"}, "routes": {"out": true}}
+}}

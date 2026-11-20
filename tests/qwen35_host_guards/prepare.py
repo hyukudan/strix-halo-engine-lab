@@ -100,3 +100,18 @@ text = (root / "apps/hip_qwen35_spec_main.hip").read_text()
 a = text.index("    std::size_t bad =")
 b = text.index(";", a) + 1
 (out / "audit_lengths.inc").write_text("std::size_t incomplete(const std::vector<unsigned>& out, const std::vector<unsigned>& ref, unsigned n_gen) { const unsigned n_run = n_gen;" + text[a:b] + "return bad; }")
+
+# Window entries of the CUDA Qwen main session (forward, forward_fed) verbatim with their shared input prologue, run_rows,
+# commit and reset; the two 1x32 input kernels become host calls of the same name (window_tests.cpp records them).
+text = (root / eng).read_text()
+a = text.index("constexpr std::uint32_t kFeedHostRow")
+(out / "window_types.inc").write_text("\n".join([body(eng, "struct InputPack {") + ";", body(eng, "struct FedPack {") + ";",
+                                                 text[a:text.index("\n", a)]]))
+parts = [body(eng, "void reset() {"), body(eng, "void window_prologue("), body(eng, "RowsOut forward("),
+         body(eng, "RowsOut forward_fed("), body(eng, "RowsOut run_rows("), body(eng, "void commit_rows("),
+         body(eng, "[[nodiscard]] bool decode8_on()"), body(eng, "void decode8_catch_up()")]
+code = "\n".join(parts)
+for kernel in ("set_inputs_kernel<<<1, 32, 0, s>>>", "fed_rows_kernel<<<1, 32, 0, s>>>"):
+    assert code.count(kernel) == 1, kernel
+    code = code.replace(kernel, kernel[:kernel.index("<<<")])
+(out / "window.inc").write_text(code)

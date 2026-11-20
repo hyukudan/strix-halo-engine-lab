@@ -40,7 +40,8 @@ Status normalise(const Registry& registry,const TensorIndex& index,const RawTens
     if(raw.shape.rank>raw.shape.dims.size())return {Error::unsupported_shape,"storage rank exceeds four"};
     if(binding.logical_shape.rank>binding.logical_shape.dims.size())return {Error::unsupported_shape,"binding rank exceeds four"};
     WeightView w{};w.tensor=raw.id;w.shape=raw.shape;w.payload=raw.payload;w.parameters=params;
-    w.storage=index.container==Container::gguf?gguf_format(raw.wire_type):safetensors_format(raw.wire_dtype);
+    // A GGUF tensor names its storage by wire id, except a typed scalar the reader resolved by file (upstream F8_E4M3 = 43).
+    w.storage=index.container==Container::gguf && raw.wire_dtype.empty()?gguf_format(raw.wire_type):safetensors_format(raw.wire_dtype);
     // A caller must explicitly select this semantic schema, then all companion dtype/shape rules are verified.
     if(params.transform=="strix.nvfp4.safetensors@1") {
         if(index.container!=Container::safetensors || index.schema!=params.transform || !raw.name.ends_with(".codes") ||

@@ -2445,8 +2445,9 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     const auto golden_prefill_identity=tiled_prompt ? decode_profile_identity : prefill_profile_identity;
     const auto golden_prefill_profile=tiled_prompt ? pair.decode : pair.prefill;
     if(!m.metadata_only && !dump){
-    const auto golden_limit=options.rotary.mode()==RotaryMode::yarn?
-        std::min(m.golden_max_bytes,mtp_payload::golden_file(calibration_rows,width,model.vocab_size,288U)):m.golden_max_bytes;
+    // The golden holds exactly calibration_rows rows (checked below): read at most that file, the size admission charged.
+    const auto golden_limit=
+        std::min(m.golden_max_bytes,mtp_payload::golden_file(calibration_rows,width,model.vocab_size,mtp_payload::golden_header_bound));
     golden=read_mtp_forward_golden_file(m.golden,mtp_cli_digest(m.golden_sha256),golden_limit);
     validate_mtp_forward_golden_rotary(golden,model.rotary_identity(),options.context_tokens,
         prefill_profile_identity,golden_prefill_identity,decode_profile_identity);
