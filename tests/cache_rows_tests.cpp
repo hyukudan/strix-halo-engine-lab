@@ -133,12 +133,82 @@ void store_reference() {
     CHECK(!cr::store_rows_ref(src.data(), 4U, pos, 0U, 1U, f, full.data()));
 }
 
+// The producer-store form (src/attn_core/cache_rows.hpp ImageEpilogue on the q8a8 StoreImage path) rounds with the
+// attention operand function tile::to_bf16 (attn_core/wmma_types.hpp), restated here: RNE, a NaN stays a quiet NaN.
+std::uint16_t operand_bf16(float x) {
+    std::uint32_t u = 0U;
+    std::memcpy(&u, &x, sizeof u);
+    if ((u & 0x7fffffffU) > 0x7f800000U) return static_cast<std::uint16_t>((u >> 16U) | 0x40U);
+    return static_cast<std::uint16_t>((u + 0x7fffU + ((u >> 16U) & 1U)) >> 16U);
+}
+
+void store_epilogue_image() {
+    // (1) operand rounding == encode on every non-NaN input; a NaN input raises the flag on both paths
+    bool same = true, nan_flags = true;
+    for (std::uint64_t u = 0; u <= 0xffffffffULL; u += 65521U) {
+        const float x = as_float(static_cast<std::uint32_t>(u));
+        if (std::isnan(x)) nan_flags = nan_flags && !cr::encodes_finite(x);
+        else same = same && operand_bf16(x) == cr::encode(x) && cr::encodes_finite(x) == (cr::finite(x) && cr::finite(cr::encode(x)));
+    }
+    for (const std::uint32_t u : {0x7f7fffffU, 0x7f7f8000U, 0x7f7f7fffU, 0x7f800000U, 0xff800000U, 0x00000001U, 0x80000000U, 0x3f808000U})
+        same = same && operand_bf16(as_float(u)) == cr::encode(as_float(u));
+    CHECK(same);
+    CHECK(nan_flags);
+    CHECK(!cr::encodes_finite(as_float(0x7f7fffffU)) && cr::encodes_finite(as_float(0x7f7f7fffU)));
+    // (2) subrow: the rope tail [512, 576) of a 576-wide query row k is row 9k + 8 of the buffer read as 64-wide rows
+    CHECK(cr::subrow_ok(576U, 64U, 512U) && !cr::subrow_ok(576U, 64U, 500U) && !cr::subrow_ok(576U, 100U, 0U) &&
+          !cr::subrow_ok(576U, 64U, 576U) && !cr::subrow_ok(576U, 0U, 0U));
+    for (std::uint32_t k = 0; k < 300U; ++k)
+        CHECK(cr::row_offset(cr::Rows{64U, 0U}, cr::subrow(k, 576U, 64U, 512U)) == std::size_t{k} * 576U + 512U);
+    // (3) Hy4 query image, old vs new path (both through the reference writer, bits == the device writers):
+    //     old: FP32 qfull = [K_b sums (512) | rope tail of qv (64)] -> store_rows rows of 576;
+    //     new: the GEMM store writes operand_bf16(sum) at column o of row k (product h of query row r: k = r * H + h) and
+    //          the tail goes through store_rows from qv (stride 256, columns 192..255) as 64-wide rows at subrow(k).
+    constexpr unsigned kl = 512U, rope = 64U, row = kl + rope, qk = 256U, nope = 192U, H = 5U, R = 7U, N = R * H;
+    Rng g{29};
+    std::vector<float> sums(std::size_t{N} * kl), qv(std::size_t{N} * qk);
+    for (auto& v : sums) v = g.uniform() * 300.0F;
+    for (auto& v : qv) v = cr::decode(cr::encode(g.uniform() * 8.0F));  // the roped q row: bf16 values in FP32
+    for (const bool poison : {false, true}) {
+        if (poison) sums[3U * kl + 17U] = std::numeric_limits<float>::infinity();
+        std::vector<float> qfull(std::size_t{N} * row);
+        for (unsigned k = 0; k < N; ++k) {
+            for (unsigned o = 0; o < kl; ++o) qfull[std::size_t{k} * row + o] = sums[std::size_t{k} * kl + o];
+            for (unsigned i = 0; i < rope; ++i) qfull[std::size_t{k} * row + kl + i] = qv[std::size_t{k} * qk + nope + i];
+        }
+        std::vector<std::uint16_t> before(qfull.size(), 0x1234U), after(qfull.size(), 0x5678U);
+        const bool ok_before = cr::store_rows_ref(qfull.data(), row, nullptr, 0U, N, cr::Rows{row, 0U}, before.data());
+        bool ok_after = true;
+        std::vector<unsigned> hits(after.size(), 0U);
+        for (unsigned k = 0; k < N; ++k)
+            for (unsigned o = 0; o < kl; o += 2U) {  // StoreImage::put: the pair (o, o + 1), flag rule of ImageEpilogue
+                const float x0 = sums[std::size_t{k} * kl + o], x1 = sums[std::size_t{k} * kl + o + 1U];
+                ok_after = ok_after && cr::encodes_finite(x0) && cr::encodes_finite(x1);
+                after[std::size_t{k} * row + o] = operand_bf16(x0);
+                after[std::size_t{k} * row + o + 1U] = operand_bf16(x1);
+                ++hits[std::size_t{k} * row + o];
+                ++hits[std::size_t{k} * row + o + 1U];
+            }
+        std::vector<std::uint32_t> pos(N);
+        for (unsigned k = 0; k < N; ++k) pos[k] = cr::subrow(k, row, rope, kl);
+        ok_after = cr::store_rows_ref(qv.data() + nope, qk, pos.data(), 0U, N, cr::Rows{rope, 0U}, after.data()) && ok_after;
+        for (unsigned k = 0; k < N; ++k)
+            for (unsigned i = 0; i < rope; ++i) ++hits[std::size_t{k} * row + kl + i];
+        bool once = true;
+        for (const unsigned h : hits) once = once && h == 1U;
+        CHECK(once);
+        CHECK(before == after);
+        CHECK(ok_before == ok_after && ok_before == !poison);
+    }
+}
+
 }  // namespace
 
 int main() {
     encoding();
     slots_and_rings();
     store_reference();
+    store_epilogue_image();
     if (failures != 0) {
         std::fprintf(stderr, "cache_rows: %d failures\n", failures);
         return 1;
