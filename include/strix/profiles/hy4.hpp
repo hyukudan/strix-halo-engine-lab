@@ -23,9 +23,9 @@ namespace strix::hy4::profile {
 namespace sp = ::strix::profile;
 
 inline constexpr sp::Lever table[] = {
-    {.name = "prompt_rows", .env = "", .option = "--prompt-rows", .value = {"", "2048", "", ""}, .builtin = "0",
+    {.name = "prompt_rows", .env = "", .option = "--prompt-rows", .value = {"", "4096", "", ""}, .builtin = "0",
      .kind = sp::Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
-     .target = "2048 (A8 rows prefill windows)", .off = "0",
+     .target = "4096 (A8 rows prefill windows)", .off = "0",
      .source = "batched prompt: 1K next-32 ids == position by position, window size bitwise (512 = 1024, 2048 = 4096); "
                "FAST gate v2 per regime: see `qualified`",
      .provisional = {false, false, false, false}},
@@ -70,6 +70,11 @@ inline constexpr Qualified qualified[] = {
      "gate v2 (route replay, one-ulp null): 2,000 held-out rows after prompts of 2,048..32,568 tokens, code 6 windows "
      "(py) + prose 4 windows (licence texts), KL 0.00106, top-1 0.993, dNLL -0.00065 +- 0.00130, all windows PASS or "
      "UNRESOLVED (prose-4096 dNLL), every class final"},
+    // 4096-row windows compute the same bits as 2048-row windows (each row's attention and MoE work does not depend on the
+    // window it rides in): the 2048 gate receipts carry over; 4096 is the FAST value (fewer launches per prompt).
+    {"prompt_rows", "4096", Device::gfx1151, Topology::one_node, 32568,
+     "bitwise == prompt_rows 2048 (dumped logits cmp, code 8,192 and 32,568 tokens, build 8ecdaeabfcab) -> the 2048 gate "
+     "receipts above; prefill 8K 631.3 -> 650.7 tok/s, 32K 615.1 -> 629.8 tok/s"},
     // The head copy changes only the decode head's weights (no prompt dependence: no bound); the layer split changes no
     // bit, so the pair's head stage computes the same logits as one node.
     {"head_q8", "1", Device::gfx1151, Topology::one_node, kNoPromptBound,
