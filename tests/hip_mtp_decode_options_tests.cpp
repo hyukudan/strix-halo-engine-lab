@@ -417,7 +417,57 @@ void campaign_defaults_contract(){
             require(served.http_batch==2U && mtp_wide_copy_rows_effective(served)==cli_rows,"--http-batch parses with the wide flags");
         }
         auto plain_serve=parse(wide);plain_serve.http_serve=true;
-        require(mtp_wide_copy_rows_effective(plain_serve).empty(),"without the flags the serve route stays off");
+        require(mtp_wide_copy_rows_effective(plain_serve).empty(),"an explicit =copy without wide sizes stays off on the serve route");
+        {   // The served default: --http-serve with neither --mtp-ngram-draft nor --mtp-copy-wide-rows takes the auto sizes
+            // with the observing copy drafter of =wide; the extension keeps its own default (ngram_draft false).
+            auto served=wide;served.erase(std::find(served.begin(),served.end(),std::string("--mtp-ngram-draft=copy")));
+            const auto cli_default=served;
+            served.insert(served.end(),{"--mtp-target-window-rows-set","2,4,8","--http-serve","--http-batch","2"});
+            const auto def=parse(served);
+            require(def.mtp.copy_wide_default && def.mtp.copy_wide_auto && def.mtp.copy_wide_rows==std::vector<std::uint32_t>{32U} &&
+                def.mtp.ngram_context && def.mtp.ngram_copy_edit && def.mtp.ngram_wide_only && !def.mtp.ngram_draft &&
+                !def.mtp.ngram_off,"the served default: the auto size, the observing copy drafter, the extension at its default");
+            require(mtp_wide_copy_rows_effective(def)==def.mtp.copy_wide_rows && mtp_wide_copy_rows_effective(def,false).empty(),
+                "the served default goes through the one resolver (STRIX_MTP_SERVE_WIDE=0 turns it off)");
+            require(std::find(def.known_prefix_tail_rows.begin(),def.known_prefix_tail_rows.end(),32U)!=def.known_prefix_tail_rows.end() &&
+                def.known_prefix_wide_only_tail_rows==std::vector<std::uint32_t>{32U},"the served default adds its wide-only tail block");
+            require(!mtp_batch_lookup(def.mtp,nullptr).on,"the batch route's lookup default stays off under the served default");
+            const auto cli=parse(cli_default);
+            require(!cli.mtp.copy_wide_default && cli.mtp.copy_wide_rows.empty() && !cli.mtp.ngram_context,"the CLI has no wide default");
+            auto zero=served;zero.insert(zero.end(),{"--mtp-copy-wide-rows","0"});
+            const auto off=parse(zero);
+            require(!off.mtp.copy_wide_default && off.mtp.copy_wide_rows.empty() && !off.mtp.ngram_context &&
+                off.known_prefix_wide_only_tail_rows.empty(),"--mtp-copy-wide-rows 0 keeps the served route off");
+            for(const char* mode:{"--mtp-ngram-draft=on","--mtp-ngram-draft=off","--mtp-ngram-draft=auto","--mtp-ngram-draft=ctx"}) {
+                auto explicit_mode=served;explicit_mode.push_back(mode);
+                const auto x=parse(explicit_mode);
+                require(!x.mtp.copy_wide_default && x.mtp.copy_wide_rows.empty() && !x.mtp.ngram_wide_only,
+                    "an explicit n-gram mode keeps the served default out");
+            }
+            auto chosen=served;chosen.insert(chosen.end(),{"--mtp-ngram-draft=wide","--mtp-copy-wide-rows","auto"});
+            const auto opt=parse(chosen);
+            require(!opt.mtp.copy_wide_default && opt.mtp.copy_wide_rows==def.mtp.copy_wide_rows && opt.mtp.ngram_draft,
+                "the explicit =wide auto line keeps its own meaning (forced extension)");
+            // The resolved route withdraws the default (never an error): explicit tails without the wide size.
+            auto tails=served;tails.insert(tails.end(),{"--known-prefix-tail-rows","64,16"});
+            const auto withdrawn=parse(tails);
+            require(!withdrawn.mtp.copy_wide_default && withdrawn.mtp.copy_wide_rows.empty() && !withdrawn.mtp.ngram_context &&
+                !withdrawn.mtp.ngram_copy_edit && !withdrawn.mtp.ngram_wide_only && !withdrawn.mtp.copy_wide_auto &&
+                withdrawn.known_prefix_tail_rows==std::vector<std::uint32_t>{64U,16U} &&
+                withdrawn.mtp.copy_wide_reason.find("withdrawn")!=std::string::npos,"tails without the wide size withdraw the default");
+            auto baseline=def;baseline.baseline=true;settle_mtp_copy_wide_default(baseline);
+            require(!baseline.mtp.copy_wide_default && baseline.mtp.copy_wide_rows.empty(),"the baseline withdraws the default");
+            auto pending=def;pending.known_prefix_prefill_rows=0U;pending.known_prefix_prefill_explicit=false;
+            pending.known_prefix_rows_explicit=false;settle_mtp_copy_wide_default(pending);
+            require(pending.mtp.copy_wide_default,"a pending HTTP prefill does not decide the default yet");
+            auto switched=def;
+            switched.mtp.copy_wide_default=switched.mtp.copy_wide_auto=false;switched.mtp.copy_wide_rows.clear();
+            switched.mtp.ngram_context=switched.mtp.ngram_copy_edit=switched.mtp.ngram_wide_only=false;
+            apply_mtp_copy_wide_default(switched,false);
+            require(!switched.mtp.copy_wide_default && switched.mtp.copy_wide_rows.empty(),"STRIX_MTP_SERVE_WIDE=0: no served default");
+            apply_mtp_copy_wide_default(switched,true);
+            require(switched.mtp.copy_wide_default && switched.mtp.copy_wide_rows==def.mtp.copy_wide_rows,"the switch on: the same default");
+        }
     }
 }
 

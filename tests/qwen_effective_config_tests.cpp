@@ -6058,6 +6058,12 @@ int main(int argc, char** arguments) {
         {auto o=candidate();o.mtp.target_capture_bytes=o.mtp.target_capture_bytes+1;reject_mtp(o);}
         {auto o=candidate();o.mtp.window_rows_set={2,4};reject_mtp(o);}
         {auto o=candidate();o.mtp.copy_wide_rows={16};reject_mtp(o);}
+        {   // the served wide copy default is part of the bound command; the same fields typed explicitly are not
+            auto o=candidate();o.mtp.copy_wide_rows={32};o.mtp.ngram_context=o.mtp.ngram_copy_edit=o.mtp.ngram_wide_only=true;
+            o.mtp.copy_wide_auto=true;reject_mtp(o);
+            o.mtp.copy_wide_default=true;
+            expect(cache_mtp_contract_qualified(o),"the served wide copy default keeps the bound production MTP contract");
+            o.mtp.ngram_draft=true;reject_mtp(o);}
         {auto o=candidate();o.mtp.draft_vocab="other.bin";reject_mtp(o);}
         {auto o=candidate();o.mtp.draft_profile="base";reject_mtp(o);}
         {auto o=candidate();o.mtp.cohort_mode="sequential";reject_mtp(o);}
