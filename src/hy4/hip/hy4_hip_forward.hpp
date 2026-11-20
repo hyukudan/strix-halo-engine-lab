@@ -129,7 +129,12 @@ public:
     static constexpr std::uint32_t kNextnRows = 32;  // widest nextn_rows call
     [[nodiscard]] bool has_nextn() const noexcept;
     void set_nextn_row_loop(bool on) noexcept;
-    NextnOut nextn_rows(const std::uint32_t* tokens, const float* hidden, std::uint32_t rows, std::uint32_t pos0, bool want_top);
+    // outputs = trailing rows whose top / hidden the caller reads (default all). Rows [0, rows - outputs) only write the
+    // block's caches (bitwise the full form's: the latent row and the indexer keys depend only on the row's input); their
+    // pre / post rows are unspecified and their top is 0. want_top needs outputs >= 1. The row loop computes every row.
+    static constexpr std::uint32_t kAllRows = ~0U;
+    NextnOut nextn_rows(const std::uint32_t* tokens, const float* hidden, std::uint32_t rows, std::uint32_t pos0, bool want_top,
+                        std::uint32_t outputs = kAllRows);
     // Logits of the last nextn_rows row (host copy; want_top must have been set): the device-vs-oracle check.
     [[nodiscard]] const std::vector<float>& nextn_logits();
     // prefill() reports every prompt row's output_norm(hidden) (device rows, valid during the call) with its first position:

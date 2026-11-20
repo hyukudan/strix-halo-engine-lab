@@ -49,6 +49,16 @@ concept MtpPrelaunchEngine = MtpFeedEngine<E> && requires(E& e, std::uint32_t* h
     e.mtp_feed_wait(u, h);
 };
 
+// KV-ONLY ROWS (optional backend hook, detected by MtpKvRowsEngine): Engine::mtp_forward(next_tokens, hidden_dev, rows, pos0,
+// want_top, outputs) where only the trailing `outputs` rows' top / hidden are read. A catch-up flush reads nothing but the
+// last row of its final chunk (d1 + carry), so every other row only has to write the MTP layer's KV: a one-layer block's
+// cache row depends on the row's input alone, so a backend can skip the query side and the FFN of those rows and keep
+// its caches bitwise the full form's (the drafts and every proposal unchanged). Engines without the hook run every row.
+template <class E>
+concept MtpKvRowsEngine = requires(E& e, const std::uint32_t* t, const float* x, std::uint32_t u) {
+    e.mtp_forward(t, x, u, u, true, u);
+};
+
 template <class Engine, class Dev>
 class MtpChain final : public ChainDrafter {
 public:
@@ -223,7 +233,7 @@ private:
         while (off < total) {
             const std::uint32_t n = std::min<std::uint32_t>(rows_max_, total - off);
             const bool final_chunk = off + n == total;  // only the last row's draft is needed: earlier chunks skip lm_head
-            const auto m = e_.mtp_forward(next_.data() + off, ring_ + std::size_t(off) * hid_, n, mtp_pos_, final_chunk);
+            const auto m = forward_rows(next_.data() + off, ring_ + std::size_t(off) * hid_, n, mtp_pos_, final_chunk);
             ++calls_;
             rows_ += n;
             mtp_pos_ += n;
@@ -243,6 +253,11 @@ private:
             }
         }
         next_.clear();
+    }
+    // A flush chunk: the final chunk's last row is the only output read (outputs 1), earlier chunks read none (outputs 0).
+    MtpOut forward_rows(const std::uint32_t* next, const float* hidden, std::uint32_t n, std::uint32_t pos0, bool final_chunk) {
+        if constexpr (MtpKvRowsEngine<Engine>) return e_.mtp_forward(next, hidden, n, pos0, final_chunk, final_chunk ? 1U : 0U);
+        else return e_.mtp_forward(next, hidden, n, pos0, final_chunk);
     }
     std::uint32_t step(std::uint32_t input_token, std::uint32_t pos, bool want_top) {
         const auto m = e_.mtp_forward(&input_token, carry_, 1, pos, want_top);

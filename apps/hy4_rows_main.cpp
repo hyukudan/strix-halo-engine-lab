@@ -163,6 +163,42 @@ int mtp_taps(hb::Forward& f, const std::vector<std::uint32_t>& prompt, const std
         std::printf("MTPROWS rows %u pre_equal %d post_equal %d top %u %u | row loop %.2f ms rows form %.2f ms (%.3f vs %.3f ms/row)\n", n,
                     same(pre[0], pre[1]) ? 1 : 0, same(post[0], post[1]) ? 1 : 0, top[0], top[1], wall[0], wall[1], wall[0] / n, wall[1] / n);
     }
+    if (P >= 3U) {  // KV-only rows (outputs = 1, the flush's form) vs the per-row loop computing every row: the last row's
+                    // pre / post / greedy id, then one chained step at position n over the n cache rows (its pre / post / id);
+                    // walls of the second run of each form (the n-row call alone)
+        const std::uint32_t n = std::min<std::uint32_t>(hb::Forward::kNextnRows, P - 2U);
+        std::vector<float> pre[2], post[2], spre[2], spost[2];
+        std::uint32_t top[2]{}, stop[2]{};
+        double wall[2]{};
+        for (int form = 0; form < 2; ++form) {
+            f.set_nextn_row_loop(form == 0);
+            for (int rep = 0; rep < 2; ++rep) {
+                const double t0 = now_ms();
+                const auto o = f.nextn_rows(ids.data() + 1, hid, n, 0U, true, 1U);
+                f.read_ids(o.top + (n - 1U), 1U, &top[form]);
+                wall[form] = now_ms() - t0;
+                pre[form].resize(h);
+                post[form].resize(h);
+                f.read_f32(o.hidden_pre + std::size_t{n - 1U} * h, h, pre[form].data());
+                f.read_f32(o.hidden_post + std::size_t{n - 1U} * h, h, post[form].data());
+                f.copy_f32_async(carry, o.hidden_post + std::size_t{n - 1U} * h, h);
+                const auto so = f.nextn_rows(&ids[n + 1U], carry, 1U, n, true);
+                f.read_ids(so.top, 1U, &stop[form]);
+                spre[form].resize(h);
+                spost[form].resize(h);
+                f.read_f32(so.hidden_pre, h, spre[form].data());
+                f.read_f32(so.hidden_post, h, spost[form].data());
+            }
+        }
+        f.set_nextn_row_loop(false);
+        const auto same = [](const std::vector<float>& a, const std::vector<float>& b) {
+            return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+        };
+        std::printf("MTPKV rows %u last pre_equal %d post_equal %d top %u %u | step pre_equal %d post_equal %d top %u %u | "
+                    "row loop %.2f ms kv-only %.2f ms\n",
+                    n, same(pre[0], pre[1]) ? 1 : 0, same(post[0], post[1]) ? 1 : 0, top[0], top[1], same(spre[0], spre[1]) ? 1 : 0,
+                    same(spost[0], spost[1]) ? 1 : 0, stop[0], stop[1], wall[0], wall[1]);
+    }
     constexpr std::uint32_t kLogitRows = 8;
     const std::uint32_t logits_from = P > kLogitRows ? P - kLogitRows : 0U;
     std::vector<std::uint32_t> teacher(P, 0U);

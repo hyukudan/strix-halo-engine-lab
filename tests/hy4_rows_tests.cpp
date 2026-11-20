@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -161,7 +162,7 @@ struct FakeMtpForward {
     std::vector<float> rows_h, pre, post;
     std::array<std::uint32_t, kNextnRows> top{};
     std::uint32_t p0 = 0, rows = 0;
-    std::uint64_t bad_hidden = 0, bad_position = 0, teacher_rows = 0, chain_rows = 0, wrong_on_purpose = 0;
+    std::uint64_t bad_hidden = 0, bad_position = 0, teacher_rows = 0, chain_rows = 0, wrong_on_purpose = 0, kv_only_rows = 0;
     std::function<void(const float*, std::uint32_t, std::uint32_t)> sink;
     static std::uint32_t next(std::uint32_t last, std::size_t n) { return static_cast<std::uint32_t>((5U * last + 3U * n) % 97U); }
     [[nodiscard]] const Cfg& config() const { return cfg; }
@@ -208,7 +209,10 @@ struct FakeMtpForward {
         const float* hidden_pre;
         const float* hidden_post;
     };
-    Out nextn_rows(const std::uint32_t* toks, const float* hidden, std::uint32_t R, std::uint32_t pos0, bool want_top) {
+    // outputs: the forward's KV-only contract: rows before the trailing `outputs` get poisoned outputs (NaN hidden): a chain
+    // that read one would feed it back (bad_hidden) or draft from it.
+    Out nextn_rows(const std::uint32_t* toks, const float* hidden, std::uint32_t R, std::uint32_t pos0, bool want_top,
+                   std::uint32_t outputs = ~0U) {
         if (R == 0U || R > kNextnRows || pos0 > mtp_tok.size()) {
             ++bad_position;
             throw std::logic_error("fake: next-token rows / position");
@@ -223,7 +227,9 @@ struct FakeMtpForward {
             else if (h0 == -static_cast<float>(p)) ++chain_rows;  // the block's own output at p - 1
             else ++bad_hidden;
             mtp_tok.push_back(toks[r]);
-            post[std::size_t{r} * 4U] = -static_cast<float>(p + 1U);
+            const bool kv_only = r + std::min(outputs, R) < R;
+            post[std::size_t{r} * 4U] = kv_only ? std::numeric_limits<float>::quiet_NaN() : -static_cast<float>(p + 1U);
+            kv_only_rows += kv_only ? 1U : 0U;
             top[r] = 0U;
         }
         if (want_top) {
@@ -273,6 +279,7 @@ void check_spec_mtp() {
         CHECK(res.ids == plain);                            // the chain changes which rows are verified, never an id
         CHECK(f.bad_hidden == 0U && f.bad_position == 0U);  // teacher rows = target hidden at p, chain rows = own output
         CHECK(f.teacher_rows >= prompt.size());             // every prompt position fed to the block
+        CHECK(f.kv_only_rows > 0U);                         // the chain used the KV-only rows (never read their outputs)
         CHECK(res.chain_drafts > 0U && f.chain_rows > 0U && f.wrong_on_purpose > 0U);
         CHECK(res.accepted > 2U * copy_only.accepted);      // a predictive block beats the copy source on a non-copy stream
         CHECK(res.steps.size() < copy_only.steps.size());
