@@ -1547,6 +1547,13 @@ if(BUILD_TESTING)
         target_link_libraries(strix-dist-exchange-contract-tests PRIVATE Threads::Threads)
         target_compile_features(strix-dist-exchange-contract-tests PRIVATE cxx_std_20)
         strix_target_warnings(strix-dist-exchange-contract-tests)
+        # Keep this host-only transport contract under ASan/UBSan in Linux CI: the stub pair must never
+        # hide a bad buffer lifetime, data race-induced use-after-free, or out-of-bounds trailer.
+        # These flags apply to this test executable only, never to the engine or kernel targets.
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(strix-dist-exchange-contract-tests PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+            target_link_options(strix-dist-exchange-contract-tests PRIVATE -fsanitize=address,undefined)
+        endif()
         add_test(NAME strix-dist-exchange-contract-tests COMMAND strix-dist-exchange-contract-tests)
         set_tests_properties(strix-dist-exchange-contract-tests PROPERTIES TIMEOUT 120)
     endif()
