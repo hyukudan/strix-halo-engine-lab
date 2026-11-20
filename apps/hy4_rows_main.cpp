@@ -7,12 +7,14 @@
 //   --mtp (with --prompt-rows): the pack's next-token block is loaded and drafts as the shared MtpChain (chain + hybrid
 //     arms of the Arbiter, the copy source kept unless --mtp-copy 0); --chain-ms STEP,FLUSH seeds its walls, --survival
 //     c1,c2,... its stated confidence (default: the host oracle's prose conditionals). MTP line: block calls / rows / wall.
+//   --mtp-head full|q8|q4: the drafts' head (default full = the BF16 head; q8 / q4 = the shared MTP draft head over a Q8_0 /
+//     Q4_0 copy of output.weight). The taps run prints MTPHEAD: the three forms on the same block rows (agreement, ms).
 //   --mtp-taps DIR (with --mtp, first content): prompt + --taps-gen N greedy ids through verify rows of 1 (bitwise the
 //     step), the target hidden (output_norm) of every fed position written as a taps run of strix-hy4-dfly mtp; then the
 //     oracle's acceptance protocol on the device block (teacher at every position, chains of --depth D at every greedy
 //     anchor): MTPACC P(run >= k) / E(d), and nextn_top.txt / nextn_logits.f32 for strix-hy4-dfly mtp's device check.
 // strix-hy4-rows PART.gguf... --ids-file F [--context N] [--prompt-rows N] [--reps K] [--spec N] [--max-rows R]
-//   [--verify-ms a,b,...] [--gbps G] [--mtp [--mtp-copy 0|1] [--chain-ms S,F] [--survival c,...] [--mtp-taps DIR
+//   [--verify-ms a,b,...] [--gbps G] [--mtp [--mtp-head full|q8|q4] [--mtp-copy 0|1] [--chain-ms S,F] [--survival c,...] [--mtp-taps DIR
 //   [--taps-gen N] [--depth D]]]; --content LABEL=PATH (repeatable) instead of --ids-file: one spec run per content
 #include "hy4/hip/hy4_hip_forward.hpp"
 #include "hy4/hip/hy4_hip_rows.hpp"
@@ -106,7 +108,10 @@ std::uint32_t prime(hb::Forward& f, const std::vector<std::uint32_t>& prompt, bo
 // device next-token block (apps/hy4_dfly_main.cpp mtp: teacher step at every fed position p = token ids[p + 1] with the
 // target hidden at p; at every greedy anchor a chain of up to `depth` drafts fed with its own argmax and its own
 // shared_head_norm output, compared with the target's greedy ids; rejected positions are rewritten by the next teacher).
-int mtp_taps(hb::Forward& f, const std::vector<std::uint32_t>& prompt, const std::string& dir, std::uint32_t gen, std::uint32_t depth) {
+const char* head_name(hb::NextnHead head) { return head == hb::NextnHead::q8 ? "q8" : head == hb::NextnHead::q4 ? "q4" : "full"; }
+
+int mtp_taps(hb::Forward& f, const std::vector<std::uint32_t>& prompt, const std::string& dir, std::uint32_t gen, std::uint32_t depth,
+             hb::NextnHead head) {
     const std::size_t h = f.config().hidden;
     const auto P0 = static_cast<std::uint32_t>(prompt.size());
     const std::uint32_t P = P0 + gen;  // fed positions
@@ -198,6 +203,35 @@ int mtp_taps(hb::Forward& f, const std::vector<std::uint32_t>& prompt, const std
                     "row loop %.2f ms kv-only %.2f ms\n",
                     n, same(pre[0], pre[1]) ? 1 : 0, same(post[0], post[1]) ? 1 : 0, top[0], top[1], same(spre[0], spre[1]) ? 1 : 0,
                     same(spost[0], spost[1]) ? 1 : 0, stop[0], stop[1], wall[0], wall[1]);
+    }
+    if (P >= 3U) {  // the drafts' head forms on the same block rows (one-row teacher calls at positions 0 .. m-1, input token ids[r + 1],
+       // hidden row r; top predicts ids[r + 2]): top agreement with the full BF16 head, correct tops, and ms per call (the
+       // second pass of each form; the first builds the q8 / q4 copy). Every form rewrites the same cache rows in order.
+        const std::uint32_t m = P - 2U;
+        constexpr hb::NextnHead forms[3]{hb::NextnHead::full, hb::NextnHead::q8, hb::NextnHead::q4};
+        std::vector<std::uint32_t> tops[3];
+        double ms[3]{};
+        for (int k = 0; k < 3; ++k) {
+            f.set_nextn_head(forms[k]);
+            tops[k].assign(m, 0U);
+            for (int rep = 0; rep < 2; ++rep) {
+                const double t0 = now_ms();
+                for (std::uint32_t r = 0; r < m; ++r) {
+                    const auto o = f.nextn_rows(&ids[r + 1U], hid + std::size_t{r} * h, 1U, r, true);
+                    f.read_ids(o.top, 1U, &tops[k][r]);
+                }
+                ms[k] = (now_ms() - t0) / m;
+            }
+        }
+        f.set_nextn_head(head);
+        std::uint32_t agree[3]{}, correct[3]{};
+        for (int k = 0; k < 3; ++k)
+            for (std::uint32_t r = 0; r < m; ++r) {
+                agree[k] += tops[k][r] == tops[0][r] ? 1U : 0U;
+                correct[k] += tops[k][r] == ids[r + 2U] ? 1U : 0U;
+            }
+        std::printf("MTPHEAD rows %u agree q8 %u q4 %u | correct full %u q8 %u q4 %u | ms/call full %.3f q8 %.3f q4 %.3f (head saves q8 %.3f q4 %.3f)\n",
+                    m, agree[1], agree[2], correct[0], correct[1], correct[2], ms[0], ms[1], ms[2], ms[0] - ms[1], ms[0] - ms[2]);
     }
     constexpr std::uint32_t kLogitRows = 8;
     const std::uint32_t logits_from = P > kLogitRows ? P - kLogitRows : 0U;
@@ -294,6 +328,13 @@ int main(int argc, char** argv) {
             else if (a == "--gbps" && more) gbps = std::stod(argv[++i]);
             else if (a == "--union-ab") union_ab = true;
             else if (a == "--mtp") mtp = true;
+            else if (a == "--mtp-head" && more) {
+                const std::string v = argv[++i];
+                if (v == "full") o.nextn_head = hb::NextnHead::full;
+                else if (v == "q8") o.nextn_head = hb::NextnHead::q8;
+                else if (v == "q4") o.nextn_head = hb::NextnHead::q4;
+                else throw std::invalid_argument("--mtp-head full|q8|q4");
+            }
             else if (a == "--mtp-copy" && more) mtp_copy = std::stoul(argv[++i]) != 0UL;
             else if (a == "--chain-ms" && more) chain_ms = read_list(argv[++i]);
             else if (a == "--survival" && more) survival = read_list(argv[++i]);
@@ -312,11 +353,11 @@ int main(int argc, char** argv) {
         o.nextn = mtp;
         const double t_load = now_ms();
         hb::Forward f(o);
-        std::printf("load %.1f s, %u verify rows, prompt %zu ids (%s), context %u\n", (now_ms() - t_load) / 1000.0, o.verify_rows,
-                    prompt.size(), o.prompt_rows ? "batched" : "position by position", o.context);
+        std::printf("load %.1f s, %u verify rows, prompt %zu ids (%s), context %u, draft head %s\n", (now_ms() - t_load) / 1000.0,
+                    o.verify_rows, prompt.size(), o.prompt_rows ? "batched" : "position by position", o.context, head_name(o.nextn_head));
         const auto vocab = static_cast<std::size_t>(f.config().vocab);
         const bool batched = o.prompt_rows != 0U;
-        if (!taps_dir.empty()) return mtp_taps(f, prompt, taps_dir, taps_gen, depth);
+        if (!taps_dir.empty()) return mtp_taps(f, prompt, taps_dir, taps_gen, depth, o.nextn_head);
         const std::uint32_t anchor = prime(f, prompt, batched);
         if (spec_n == 0U) {
             // ---- bench: plain digests at G positions, rows of the same tokens
