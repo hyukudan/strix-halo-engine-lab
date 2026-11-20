@@ -4011,6 +4011,17 @@ int main() { return 0; }"
         target_link_libraries(strix-hip-q8-rows-heads-tests PRIVATE strix_hip_runtime strix_core)
         strix_target_warnings(strix-hip-q8-rows-heads-tests)
         add_test(NAME strix-hip-q8-rows-heads-tests COMMAND strix-hip-q8-rows-heads-tests)
+        # Decode FFN fusions: GLU projection group (q8_rows paired store) and combine with rounded expert outputs ==
+        # the separate launches, bitwise, at the Hy4 shapes; --bench times them.
+        add_executable(strix-hip-glu-pair-combine-tests tests/hip_glu_pair_combine_tests.hip)
+        set_target_properties(strix-hip-glu-pair-combine-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_include_directories(strix-hip-glu-pair-combine-tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+        target_compile_options(strix-hip-glu-pair-combine-tests PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+            -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+        target_link_libraries(strix-hip-glu-pair-combine-tests PRIVATE strix_hip_runtime strix_core)
+        strix_target_warnings(strix-hip-glu-pair-combine-tests)
+        add_test(NAME strix-hip-glu-pair-combine-tests COMMAND strix-hip-glu-pair-combine-tests)
         add_executable(strix-hip-gsq-dense-a8-tests tests/hip_gsq_dense_a8_tests.hip)
         set_target_properties(strix-hip-gsq-dense-a8-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
@@ -6723,6 +6734,14 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-pair-layer-stages-tests)
     add_test(NAME strix-pair-layer-stages-tests COMMAND strix-pair-layer-stages-tests)
     set_tests_properties(strix-pair-layer-stages-tests PROPERTIES TIMEOUT 60)
+    # Ordered logical channels over one pair transport (both stage-pipe directions on one link).
+    add_executable(strix-pair-link-mux-tests tests/pair_link_mux_tests.cpp)
+    target_include_directories(strix-pair-link-mux-tests PRIVATE include)
+    target_compile_features(strix-pair-link-mux-tests PRIVATE cxx_std_20)
+    target_link_libraries(strix-pair-link-mux-tests PRIVATE Threads::Threads)
+    strix_target_warnings(strix-pair-link-mux-tests)
+    add_test(NAME strix-pair-link-mux-tests COMMAND strix-pair-link-mux-tests)
+    set_tests_properties(strix-pair-link-mux-tests PROPERTIES TIMEOUT 60)
     add_executable(strix-qwen-chain-plan apps/qwen_chain_plan_main.cpp)
     target_include_directories(strix-qwen-chain-plan PRIVATE include)
     target_compile_features(strix-qwen-chain-plan PRIVATE cxx_std_20)
