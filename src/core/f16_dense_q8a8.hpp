@@ -14,6 +14,7 @@
 #include "f16_dense_tall.hpp"
 #include "../attn_core/wmma_types.hpp"  // the operand-image epilogue rounds with the attention cores' to_operand
 #include "../hip/weight/ggml_sources.hpp"
+#include "../ops/glu/glu.hpp"  // epilogue<Round::bf16>: the Linear store epilogue (View::round_bf16, StoreRounded)
 
 namespace strix::core::f16_dense_tall::q8a8 {
 inline constexpr char kPolicyName[] = "dense-q8a8-f16-v1";
@@ -35,6 +36,13 @@ struct View {
     // supported() checks shape admission only; it does not check output overlap or allocation extents.
     std::uint32_t batch = 0U, batch_in = 0U, batch_out = 0U;
     std::uint64_t batch_weight_bytes = 0U;
+    // Linear epilogue in the store (round_bf16 != 0): out[r][o] = ops::glu::epilogue<Round::bf16>(total, bias, o), total =
+    // the value Store writes today (sum, or out + sum when accumulating), bias == nullptr = no bias. Same bits as the plain
+    // store followed by a separate glu::launch_epilogue<Round::bf16>(out, bias, count, rows * count, out) when out_stride
+    // == count; enqueue_parts applies it on the last K part only. Not with the operand-image form. Batched form (batch > 1):
+    // product z rounds its own columns out + z * batch_out (same function per element); a bias is refused there.
+    const float* bias = nullptr;
+    std::uint32_t round_bf16 = 0U;
 };
 
 // Forms (bits of the kernel template; every form gives the contract's bits):
@@ -54,15 +62,34 @@ template <unsigned Waves, unsigned Form = 0U> struct Cols {
         return {nullptr, v.out + o, v.out_stride, o < v.count};
     }
     // 64 weights = two Q8_0 blocks (68 bytes) of the stager's column; columns past count read the last one (never stored)
-    __device__ __forceinline__ void stage(unsigned tile, unsigned col, unsigned unit, U4* nb) const {
+    __device__ __forceinline__ const std::uint8_t* stage_at(unsigned tile, unsigned col, unsigned unit) const {
         const unsigned o0 = 16U * (v.tile0 + tile) + col, o = o0 < v.count ? o0 : v.count - 1U;
-        const auto* p = v.weight + static_cast<std::size_t>(o) * v.row_bytes + v.k_bytes + (unit / 2U) * 34U;
-        WeightSource::template stage<Form>(p,nb);
+        return v.weight + static_cast<std::size_t>(o) * v.row_bytes + v.k_bytes + (unit / 2U) * 34U;
     }
-    __device__ __forceinline__ Half16 fragment(unsigned row, unsigned unit) const {
-        return WeightSource::activation_fragment(v.codes,v.deltas,v.x_stride,row,unit);
+    // Split schedule of the core (ColsStageSplit / ColsFragmentSplit): the loads are issued one stage / one k unit
+    // ahead and decoded after the WMMAs in between, so neither the stagers' weight loads nor the A8 loads are waited
+    // for right next to their issue. stage() and fragment() stay the compositions (same bits).
+    __device__ __forceinline__ WeightSource::StageRaw stage_load(unsigned tile, unsigned col, unsigned unit) const {
+        return WeightSource::stage_load(stage_at(tile, col, unit));
     }
+    __device__ __forceinline__ void stage_decode(const WeightSource::StageRaw& raw, U4* nb) const {
+        WeightSource::template stage_decode<Form>(raw, nb);
+    }
+    __device__ __forceinline__ void stage(unsigned tile, unsigned col, unsigned unit, U4* nb) const {
+        stage_decode(stage_load(tile, col, unit), nb);
+    }
+    __device__ __forceinline__ WeightSource::ActivationRaw fragment_load(unsigned row, unsigned unit) const {
+        return WeightSource::activation_load(v.codes,v.deltas,v.x_stride,row,unit);
+    }
+    __device__ __forceinline__ Half16 fragment_half(const WeightSource::ActivationRaw& raw) const {
+        return WeightSource::activation_half(raw);
+    }
+    __device__ __forceinline__ Half16 fragment(unsigned row, unsigned unit) const { return fragment_half(fragment_load(row, unit)); }
 };
+// Without the split the core waits for every weight and A8 load right after issuing it (ISA: 24 of 24 global loads per
+// 128-WMMA loop body at 0 WMMAs from their wait; with it 16 sit 16 WMMAs ahead): keep both hooks on every form.
+static_assert(ColsStageSplit<Cols<8U, 0U>> && ColsStageSplit<Cols<16U, kWPacked>> && ColsFragmentSplit<Cols<8U, 0U>> &&
+              ColsFragmentSplit<Cols<16U, kWPacked>>);
 
 // Stores only outputs below count (the last column tile may be partial); accumulate adds to what is there.
 struct Store {
@@ -79,6 +106,29 @@ struct Store {
         if (!t.live) return;
         float* dst = t.y + static_cast<std::size_t>(r) * t.stride + t.c;
         *dst = accumulate ? *dst + value : value;
+    }
+    __device__ __forceinline__ void close() const {}
+    template <class F> __device__ __forceinline__ void run(F&& f) { f(*this); }
+};
+// Store plus the View's Linear epilogue (round_bf16 != 0, kernel_linear): the value Store would write goes through
+// ops::glu::epilogue<Round::bf16>(total, bias, o), the function of the separate epilogue pass, on the same register.
+struct StoreRounded {
+    std::uint32_t count, tile0, accumulate;
+    const float* bias;
+    struct Tile {
+        float* y;
+        unsigned stride, c, o;
+        bool live;
+    };
+    __device__ __forceinline__ Tile open(unsigned i, const ColumnTile& ct, unsigned c) const {
+        const unsigned o = 16U * (tile0 + i) + c;
+        return {f16_dense_tall::detail::uniform(ct.y), f16_dense_tall::detail::uni(ct.stride), c, o, o < count};
+    }
+    __device__ __forceinline__ void put(const Tile& t, unsigned r, float value) const {
+        if (!t.live) return;
+        float* dst = t.y + static_cast<std::size_t>(r) * t.stride + t.c;
+        const float total = accumulate ? *dst + value : value;
+        *dst = ::strix::ops::glu::epilogue<::strix::ops::glu::Round::bf16>(total, bias, t.o);
     }
     __device__ __forceinline__ void close() const {}
     template <class F> __device__ __forceinline__ void run(F&& f) { f(*this); }
@@ -118,16 +168,26 @@ template <class E> struct StoreImage {
     template <class F> __device__ __forceinline__ void run(F&& f) { f(*this); }
 };
 
-template <unsigned TC, unsigned Waves, unsigned Form> __global__ __launch_bounds__(32 * Waves) void kernel(View v) {
-    __shared__ Storage<TC> lds;
-    if (v.batch > 1U) {  // product blockIdx.z of a batched launch (CTA-uniform)
+// Product blockIdx.z of a batched launch (CTA-uniform): its weight, A8 rows and output columns.
+__device__ __forceinline__ void select_product(View& v) {
+    if (v.batch > 1U) {
         const unsigned z = blockIdx.z;
         v.weight += static_cast<std::size_t>(z) * v.batch_weight_bytes;
         v.codes += static_cast<std::size_t>(z) * v.batch_in;
         v.deltas += static_cast<std::size_t>(z) * (v.batch_in / 32U);
         v.out += static_cast<std::size_t>(z) * v.batch_out;
     }
+}
+template <unsigned TC, unsigned Waves, unsigned Form> __global__ __launch_bounds__(32 * Waves) void kernel(View v) {
+    __shared__ Storage<TC> lds;
+    select_product(v);
     core<TC>(nullptr, v.in, v.rows, Cols<Waves, Form>{v}, lds, Store{v.count, v.tile0, v.accumulate});
+}
+// The same chains with the View's Linear epilogue in the store (round_bf16 != 0; batched form without a bias).
+template <unsigned TC, unsigned Waves, unsigned Form> __global__ __launch_bounds__(32 * Waves) void kernel_linear(View v) {
+    __shared__ Storage<TC> lds;
+    select_product(v);
+    core<TC>(nullptr, v.in, v.rows, Cols<Waves, Form>{v}, lds, StoreRounded{v.count, v.tile0, v.accumulate, v.bias});
 }
 template <unsigned TC, unsigned Waves, class E>
 __global__ __launch_bounds__(32 * Waves) void kernel_image(View v, std::uint16_t* image, typename E::Args e) {
@@ -137,7 +197,8 @@ __global__ __launch_bounds__(32 * Waves) void kernel_image(View v, std::uint16_t
 
 inline bool supported(const View& v) {
     return ::strix::weight::hip::Q8F16Source::supported(v) &&
-           (v.batch <= 1U || (v.batch <= 65535U && v.batch_in % 32U == 0U));
+           (v.batch <= 1U || (v.batch <= 65535U && v.batch_in % 32U == 0U)) &&
+           (v.round_bf16 == 0U ? v.bias == nullptr : v.batch <= 1U || v.bias == nullptr);  // bias: store epilogue, one product
 }
 
 // Rows per weight read = 16 * waves (the same bits either way). waves 0 = the rule: STRIX_F16_Q8A8_WAVES (8 or 16) when
@@ -163,6 +224,14 @@ template <unsigned Waves, unsigned Form> inline void launch(View v, hipStream_t 
     const Plan pl = plan(tiles, v.rows, true);
     const unsigned gz = v.batch > 1U ? v.batch : 1U;  // batched form: one product per grid z
     v.tile0 = 0U;
+    if (v.round_bf16 != 0U) {  // the store-epilogue entry: same grid and chains (batched: no bias, supported())
+        if (pl.full) hipLaunchKernelGGL((kernel_linear<16, Waves, Form>), dim3(gx, pl.full, gz), dim3(32U * Waves), 0, stream, v);
+        v.tile0 = 16U * pl.full;
+        if (pl.tc == 1U) hipLaunchKernelGGL((kernel_linear<1, Waves, Form>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v);
+        if (pl.tc == 2U) hipLaunchKernelGGL((kernel_linear<2, Waves, Form>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v);
+        if (pl.tc == 4U) hipLaunchKernelGGL((kernel_linear<4, Waves, Form>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v);
+        return;
+    }
     if (pl.full) hipLaunchKernelGGL((kernel<16, Waves, Form>), dim3(gx, pl.full, gz), dim3(32U * Waves), 0, stream, v);
     v.tile0 = 16U * pl.full;
     if (pl.tc == 1U) hipLaunchKernelGGL((kernel<1, Waves, Form>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v);
@@ -183,8 +252,8 @@ inline void enqueue(const View& v, hipStream_t stream, unsigned waves = 0U, unsi
 
 // The operand-image form (StoreImage): same grid, same chains, same CTA rule as enqueue.
 inline bool supported_image(const View& v, const std::uint16_t* image) {
-    return supported(v) && image != nullptr && v.accumulate == 0U && v.count % 2U == 0U && v.out_stride % 2U == 0U &&
-           reinterpret_cast<std::uintptr_t>(image) % 4U == 0U;
+    return supported(v) && image != nullptr && v.accumulate == 0U && v.round_bf16 == 0U && v.count % 2U == 0U &&
+           v.out_stride % 2U == 0U && reinterpret_cast<std::uintptr_t>(image) % 4U == 0U;
 }
 template <unsigned Waves, class E> inline void launch_image(View v, std::uint16_t* image, typename E::Args e, hipStream_t stream) {
     const unsigned tiles = (v.count + 15U) / 16U, gx = (v.rows + 16U * Waves - 1U) / (16U * Waves);
@@ -202,11 +271,17 @@ template <class E> inline void enqueue_image(const View& v, std::uint16_t* image
     else launch_image<8, E>(v, image, e, stream);
 }
 // Independent FP32 chains per K part, added in unfused order by Store.
-// Caller validates each equal-width part; the stream orders the output additions.
+// Caller validates each equal-width part; the stream orders the output additions. The store epilogue (round_bf16, bias)
+// runs on the last part only, on the full sum: the bits of the unfused parts followed by one epilogue pass.
 inline void enqueue_parts(View v, unsigned parts, hipStream_t stream, unsigned form = kFormRule) {
+    const std::uint32_t round = v.round_bf16;
+    const float* bias = v.bias;
     for (unsigned part = 0; part < parts; ++part) {
+        const bool last = part + 1U == parts;
+        v.round_bf16 = last ? round : 0U;
+        v.bias = last ? bias : nullptr;
         enqueue(v, stream, 0U, form);
-        if (part + 1U == parts) break;
+        if (last) break;
         v.k_bytes += v.in / 32U * 34U;
         v.codes += v.in;
         v.deltas += v.in / 32U;
