@@ -89,7 +89,7 @@ jobs:
       CCACHE_DIR: /home/runner/.ccache-host
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_COMPRESS: 'true'
-      CCACHE_MAXSIZE: 3G
+      CCACHE_MAXSIZE: 1G
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
     steps:
@@ -263,7 +263,7 @@ jobs:
             docker run --rm \
               -v "$PWD:/work" \
               -v "$HOME/.ccache-hip:/ccache" \
-              -e CCACHE_DIR=/ccache -e CCACHE_BASEDIR=/work -e CCACHE_COMPRESS=true -e CCACHE_MAXSIZE=2G \
+              -e CCACHE_DIR=/ccache -e CCACHE_BASEDIR=/work -e CCACHE_COMPRESS=true -e CCACHE_MAXSIZE=500M \
               -e CMAKE_C_COMPILER_LAUNCHER=ccache -e CMAKE_CXX_COMPILER_LAUNCHER=ccache -e CMAKE_HIP_COMPILER_LAUNCHER=ccache \
               -w /work \
               "$image" \
