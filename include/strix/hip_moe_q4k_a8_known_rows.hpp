@@ -83,6 +83,10 @@ struct PrefillRows {
     bool route_bf16 = false; // Candidate: DA16 certificate writer and matching ordered merge only.
     unsigned* unsafe = nullptr; // Private admission sidecar, stream-owned; null selects base producers.
     bool route_i8 = false; // Env-only draft, requires route_bf16 and its reserved FP32 row.
+    // K-quant envelope only (other forms refuse it): each raw slot dot is stored once-rounded to BF16
+    // (ops::glu::epilogue<Round::bf16>, the stored output of a BF16 Linear) by the down kernel itself. Same bits as the
+    // FP32 store followed by a separate bf16 epilogue pass over rawdots (the rounding is idempotent); saves that pass.
+    bool rawdots_bf16 = false;
 };
 // T CTAs: each row's clear, route checks and quantizer exactly as the window prologue.
 void enqueue_prefill_prologue(const Request&, const PrefillRows&, unsigned rows, unsigned clear_words, hipStream_t);

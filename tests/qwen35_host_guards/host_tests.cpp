@@ -137,6 +137,22 @@ int main() {
         f.prefill_norm_fold = false;
         check(engine_identity(f) == off_id, "prefill-norm-fold keeps the FAST4 identity (bitwise)");
     }
+    {  // --prefill-tile-feed: strict bulk|lsu; incumbent default lsu, bulk opt-in; scheduling only -> never part of the engine identity
+        namespace q = strix::qwen35;
+        namespace ft = strix::cuda::core::nvfp4::tile;
+        check(q::parse_prefill_tile_feed("bulk") == ft::Feed::bulk && q::parse_prefill_tile_feed("lsu") == ft::Feed::lsu,
+              "prefill-tile-feed bulk|lsu");
+        for (const char* bad : {"", "BULK", "lsu ", "tma", "on", "off", "1"})
+            check(rejects([&] { (void)q::parse_prefill_tile_feed(bad); }), "prefill-tile-feed rejects other spellings");
+        q::EngineOptions f = a;
+        f.prefill_arith = q::PrefillArith::fast4;
+        check(q::EngineOptions{}.prefill_tile_feed == ft::Feed::lsu && ft::kDefaultFeed == ft::Feed::lsu,
+              "prefill-tile-feed default lsu (incumbent path retained)");
+        f.prefill_tile_feed = ft::Feed::bulk;
+        const std::string bulk_id = engine_identity(f);
+        f.prefill_tile_feed = ft::Feed::lsu;
+        check(engine_identity(f) == bulk_id, "prefill-tile-feed keeps the FAST4 identity (bitwise)");
+    }
     {  // NVFP4 split-K policy -> identity on the real EngineOptions (review condition 2): EXACT has no "-skf1"; FAST ends in
        // "-skf1" for every NVFP4 source; without NVFP4 weights FAST and EXACT are one identity; qp::apply sets the option.
         namespace q = strix::qwen35;

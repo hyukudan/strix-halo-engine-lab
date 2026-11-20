@@ -57,6 +57,17 @@ STRIX_CR_HD inline std::uint16_t encode(float x) {
 STRIX_CR_HD inline bool finite(std::uint16_t b) { return (b & 0x7f80U) != 0x7f80U; }
 STRIX_CR_HD inline bool finite(float x) { return (__builtin_bit_cast(std::uint32_t, x) & 0x7f800000U) != 0x7f800000U; }
 STRIX_CR_HD inline float decode(std::uint16_t b) { return __builtin_bit_cast(float, static_cast<std::uint32_t>(b) << 16U); }
+// The writer's flag rule for one value (store_rows_ref and every device writer): the input and its encoding are finite.
+STRIX_CR_HD inline bool encodes_finite(float x) { return finite(x) && finite(encode(x)); }
+// A span of a wide row as a row of a narrow view of the same buffer: columns [first, first + width) of row k of rows
+// `wide` elements wide are row subrow(k, ...) of the buffer read as rows `width` wide (subrow_ok: width divides wide
+// and first). A writer stores such spans with Rows{width, 0} at those positions (Hy4: the rope tail of a query image).
+constexpr bool subrow_ok(unsigned wide, unsigned width, unsigned first) {
+    return width != 0U && wide % width == 0U && first % width == 0U && first + width <= wide;
+}
+constexpr std::uint32_t subrow(std::uint32_t k, unsigned wide, unsigned width, unsigned first) {
+    return k * (wide / width) + first / width;
+}
 
 // Host reference of the writer: rows r = 0..n-1 of src (stride src_stride floats) go to the row of position
 // positions[r] (positions == nullptr: first_position + r). Returns false if any input or encoded value is not finite

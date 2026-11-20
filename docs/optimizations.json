@@ -932,10 +932,10 @@
     "engine": "qwen",
     "name": "QSA MTP committed BF16 key service",
     "flag_or_env": "STRIX_QSA_MTP_POOL",
-    "default": "1 (eligible native MTP CLI, the single-request HTTP runner, and YaRN f2 MTP CLI through 524288 and f4 through 1048576 positions; see the route table)",
-    "exact": "Bitwise. Single HTTP runner, same binary, default vs STRIX_QSA_MTP_POOL=0: token IDs, prompt state digest, every committed target state component and the full-vocabulary logits of every committed step identical per request (explicit --http-batch 0, auto-resolved single, in-memory prefix cache, constrained JSON, request n-grams, cancel-then-next, 2048-2052 token boundary, 12K-22K prompts); STRIX_QSA_MTP_POOL_CHECK=1 compared all 13 roles with 0 differences; device fixtures pass natively and with YaRN factors 2 and 4. The timing-based window controller can choose a different R2/R4/R8 owner when the cycle is faster, which changes speculative rows and predictor KV, never a committed token or the target state. YaRN 1M f4 prose matched all 256 tokens, every committed full-vocabulary logit digest, prompt/final target state and predictor state against serial YaRN and pool-off MTP.",
-    "gain": "Single HTTP runner, 127.6K-token conversation (131K context, T8192 dense-A8, R2/R4/R8 prefix windows, in-memory prefix cache), one Strix Halo node, ABBA same binary: decode 39.5 -> 52.0 tok/s cold (+32 %), 41.6 -> 55.8 tok/s on restored follow-up turns (+34 %); prefill unchanged; identical tokens.",
-    "preconditions": "One thirteen-entry owner per session, shared by target R2/R4/R8 windows, serial fallback and predictor. Automatic scope is eligible native MTP CLI, the single-request HTTP runner (--http-batch 0 or a configuration the batch runner cannot take, including the in-memory prefix cache) and explicit YaRN f2 MTP CLI through 524288 and f4 through 1048576 positions. AUTO/capped batch sizes slots without the pool; a one-slot fallback to the single runner keeps it only if that slot still fits with it charged. HTTP batch slots, nested scheduling, sessions, disk prefix restore, state import and serving prefixes require STRIX_QSA_MTP_POOL=1. Product profiles carry no pool lever. Separate checked key/scratch/metadata reservation per HTTP slot. Baseline, GSQ, defaults-off, BF16=0, graph, hierarchical, wide and explicit cohort routes retain historical paths. Explicit YaRN CLI requires the shared retained table; YaRN HTTP remains closed.",
+    "default": "1 (eligible native MTP CLI, HTTP serving (single-request runner and batch slots), and YaRN f2 MTP CLI through 524288 and f4 through 1048576 positions; see the route table)",
+    "exact": "Bitwise. Single HTTP runner, same binary, default vs STRIX_QSA_MTP_POOL=0: token IDs, prompt state digest, every committed target state component and the full-vocabulary logits of every committed step identical per request (explicit --http-batch 0, auto-resolved single, in-memory prefix cache, constrained JSON, request n-grams, cancel-then-next, 2048-2052 token boundary, 12K-22K prompts); STRIX_QSA_MTP_POOL_CHECK=1 compared all 13 roles with 0 differences; device fixtures pass natively and with YaRN factors 2 and 4. The timing-based window controller can choose a different R2/R4/R8 owner when the cycle is faster, which changes speculative rows and predictor KV, never a committed token or the target state. YaRN 1M f4 prose matched all 256 tokens, every committed full-vocabulary logit digest, prompt/final target state and predictor state against serial YaRN and pool-off MTP. HTTP batch slots, same binary, default vs STRIX_QSA_MTP_POOL=0: token IDs identical per request (8.5K sequential, two concurrent 8.5K/9.4K requests with 53 two-member cohort cycles, 40K, 80K); STRIX_QSA_MTP_POOL_CHECK=1 22,220 checks, 119.8 M scores, 0 differences.",
+    "gain": "Single HTTP runner, 127.6K-token conversation (131K context, T8192 dense-A8, R2/R4/R8 prefix windows, in-memory prefix cache), one Strix Halo node, ABBA same binary: decode 39.5 -> 52.0 tok/s cold (+32 %), 41.6 -> 55.8 tok/s on restored follow-up turns (+34 %); prefill unchanged; identical tokens. AUTO batch slots at 98,304 context, one request at a time, one A/B pair per length, same binary: 8.5K 81.0 -> 82.9, 40K 62.4 -> 80.6, 80K 65.0 -> 80.0 tok/s (+23 %, 8-row round 96.1 -> 78.0 ms).",
+    "preconditions": "One thirteen-entry owner per session, shared by target R2/R4/R8 windows, serial fallback and predictor. Automatic scope is eligible native MTP CLI, HTTP serving (the single-request runner and every batch slot, including the in-memory prefix cache) and explicit YaRN f2 MTP CLI through 524288 and f4 through 1048576 positions. Each HTTP slot owns one pool, charged per slot in the capacity fit. Nested scheduling, sessions, disk prefix restore, state import and serving prefixes require STRIX_QSA_MTP_POOL=1. Product profiles carry no pool lever. Separate checked key/scratch/metadata reservation per HTTP slot. Baseline, GSQ, defaults-off, BF16=0, graph, hierarchical, wide and explicit cohort routes retain historical paths. Explicit YaRN CLI requires the shared retained table; YaRN HTTP remains closed.",
     "off_switch": "STRIX_QSA_MTP_POOL=0 (historical MTP key paths, bytes and inspection)",
     "doc_anchor": "docs/optimizations.md#qwen-qsa-mtp-pool"
   },
@@ -3053,6 +3053,16 @@
   },
   {
     "engine": "qwen-rtx",
+    "name": "Tensor-core expert wide tile form (128 rows)",
+    "flag_or_env": "--expert-wide-tile on|off|N; STRIX_QRTX_EXPERT_WIDE_TILE (lever row expert_wide_tile)",
+    "default": "off (opt-in until its timing receipt); N = minimum average rows per expert of a launch (planner parameter from the device's no-model tile bench, TILEWIDE line); on = builtin 128 (provisional)",
+    "exact": "Exact schedule trait: a wide tile is two consecutive 64-row tiles, same m16 position per row, same MMA and scale-FMA sequence per output: bitwise the tile form (host test; device hash comparison in the bench). Contract and bundle id unchanged.",
+    "gain": "Not yet measured.",
+    "preconditions": "CUDA Qwen MoE with gsq_bf16_mma experts; prefill launches above 16 rows.",
+    "off_switch": "--expert-wide-tile off; STRIX_QRTX_EXPERT_WIDE_TILE=0",
+    "doc_anchor": "docs/optimizations.md#qwen-rtx-expert-wide-tile"
+  },  {
+    "engine": "qwen-rtx",
     "name": "Tensor-core expert decode tile form",
     "flag_or_env": "--expert-decode-tile; STRIX_QRTX_EXPERT_DECODE_TILE (lever row expert_decode_tile)",
     "default": "ON in every profile; acts only where the tensor-core GSQ experts run (gsq_bf16_mma: the FAST expert arithmetic)",
@@ -3062,6 +3072,7 @@
     "off_switch": "--expert-decode-tile off; STRIX_QRTX_EXPERT_DECODE_TILE=0",
     "doc_anchor": "docs/optimizations.md#qwen-rtx-expert-decode-tile"
   },
+
   {
     "engine": "qwen-rtx",
     "name": "TURBO: int8 tensor-core experts on large prefill blocks",
@@ -3410,6 +3421,14 @@
   },
   {
     "engine": "qwen-rtx",
+    "name": "Qwen dense 27B CUDA FAST4 tile GEMM: bulk stage feed",
+    "flag_or_env": "--prefill-tile-feed bulk|lsu (strix-cuda-qwen35-decode)",
+    "default": "lsu (incumbent FAST4 tile GEMM feed; bulk is explicit opt-in)",
+    "exact": "Scheduling only, no identity suffix: device fixture bulk == lsu bit for bit in 9 checks; host oracle checks the bulk records write exactly the lsu chunk bytes; host tests pin the default and the unchanged engine identity.",
+    "gain": "Operator bench (RTX PRO 6000, 4,096 rows, no model, strict ABAB): bulk / lsu = 0.934 GLU, 0.921 down, 0.929 down residual, 0.850 o, 0.858 o residual, 0.846 k/v, 0.977 q/k/v. End-to-end prefill not yet measured.",
+    "preconditions": "--prefill-arith fast4 (sm_120, NVFP4 weights); other prefill classes print prefill-tile-feed: n/a.",
+    "off_switch": "--prefill-tile-feed lsu",
+    "doc_anchor": "docs/optimizations.md#qwen-dense-cuda-fast4-tile-bulk-feed",
     "name": "Qwen 27B CUDA spec: K/V-only MTP catch-up",
     "flag_or_env": "--mtp-catchup kv|full",
     "default": "kv",
@@ -3431,5 +3450,6 @@
     "preconditions": "Hy4-flash verify rows (R <= 8, top-16 of 512) on the Q4_K x A8 C1 family with K-quant down.",
     "off_switch": "STRIX_HY4_ROWS_EXPERT_UNION=0",
     "doc_anchor": "docs/optimizations.md#hy4-rows-expert-union"
-  }
+  },
+  {"engine": "hy4", "name": "Prompt windows: bf16 epilogue in the producers' store", "flag_or_env": "STRIX_HY4_PF_STORE_EPILOGUE", "default": "ON", "exact": "Bitwise: same function on the same FP32 value; bf16 epilogue idempotent over all 2^32 patterns; 4096-token logits digest a0db1a8a45606112 equal on, off and parent.", "gain": "One node, 4096-token bench prompt, 2048-row windows, A-B/B-A: warm -4.3 %, cold -4.2 %.", "preconditions": "Hy4-flash --prompt-rows; q8a8 dense batch <= 1 outside the operand-image form; K-quant known-rows down. Other forms refuse it.", "off_switch": "STRIX_HY4_PF_STORE_EPILOGUE=0", "doc_anchor": "docs/optimizations.md#hy4-pf-store-epilogue"}
 ]

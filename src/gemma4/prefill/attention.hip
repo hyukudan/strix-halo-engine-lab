@@ -482,6 +482,9 @@ struct FlashPolicy {
     using Shape = attn_core::dense::Shape<D, group, D / 128U>;
     static constexpr float kScaleLog2 = attention_scale * 1.44269504088896341F;
     static constexpr attn_core::tile::Operand kOp = attn_core::tile::Operand::f16; // pack_split<false> FP16 K/V
+    // The core's 8-wave cap is kept (dense_flash_budget.hpp would pick 6 for D 256): E4B 8K FAST prefill measured
+    // 0.6 % slower at 6 (split-K launch; same bits either way). D 512 (16 waves) gets 8 from the rule anyway.
+    static constexpr unsigned kWavesPerEu = 8U;
     __device__ static bool valid(const Args& a) {
         const auto& r = a.reads[0];
         return r.position < max_positions && a.rows <= max_positions - r.position && r.width == a.width &&

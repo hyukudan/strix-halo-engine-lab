@@ -4678,20 +4678,8 @@ static int run_decode_entry(
             batch_slots = !single_route && (capacity.slots > 1U ||
                 ((options.http_batch_explicit || deployment.plan) && options.http_batch_cap == 1U))
                 ? capacity.slots : 0U;
-            const bool pool_fallback = !single_route && !batch_slots &&
-                qsa_mtp_pool_single_fallback_pending(options, strix::qpf2k::has_gsq_gate(manifest));
+            // The QSA MTP pool is charged per slot in `serving` on every HTTP route, so a one-slot fallback already fits it.
             resolve_batch_cache_scheduler(options, requested_environment, static_cast<std::uint32_t>(batch_slots));
-            if (pool_fallback) {
-                // Batch sizing excluded the pool; the single runner keeps it only if its one slot still fits with it.
-                auto single_serving = prompt_memory.serving(options);
-                single_serving.slot_host = add(single_serving.slot_host, wide_bytes);
-                single_serving.slot_device = add(single_serving.slot_device, wide_bytes);
-                const auto single = resolve_http_bridge_capacity(retained, single_serving,
-                    fit_host, fit_device, headroom, headroom, 1U);
-                options.qsa_mtp_pool_fallback_unfit = !single.slots;
-                std::cerr << "qsa-mtp-pool single-fallback enabled=" << (single.slots ? 1 : 0) << " reserved_bytes="
-                          << strix::mtp_qsa_pool_plan(options.context_tokens).reserved_bytes << " (" << single.limiting << ")\n";
-            }
             if (!batch_slots && options.http_sampling == "sample")
                 throw std::runtime_error("HTTP sampling requires memory for the batched route");
         }
