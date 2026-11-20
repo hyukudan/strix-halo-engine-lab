@@ -88,6 +88,12 @@ inline constexpr Qualified qualified[] = {
     {"head_q8", "1", Device::gfx1151, Topology::one_node, kNoPromptBound,
      "gate v2: 5 windows, 1,000 held-out rows, KL 0.00002, top-1 0.999, dNLL +0.00032; decode 57.13 -> 55.79 ms/token"},
     {"head_q8", "1", Device::gfx1151, Topology::pair, kNoPromptBound, "same head numerics as one node (the layer split changes no bit)"},
+    // The expanded-MHA prompt attention, gated as the whole FAST composition (prompt_rows 4096 + head_q8 + pf_mha) against
+    // the same BASE references and one-ulp nulls as the long prompt_rows gate. The pair is not gated (pending).
+    {"pf_mha", "1", Device::gfx1151, Topology::one_node, 32568,
+     "gate v2 (route replay, one-ulp null): 2,000 held-out rows after prompts of 2,048..32,568 tokens, code 6 windows "
+     "(py) + prose 4 windows (licence texts), all 10 windows PASS, KL 0.00101, top-1 0.995, dNLL -0.00140 +- 0.00140; "
+     "prefill 8K 669.7 -> 693.1 tok/s (rows 2048)"},
 };
 
 [[nodiscard]] inline const Qualified* qualification(std::string_view lever, std::string_view value, const Regime& regime,
