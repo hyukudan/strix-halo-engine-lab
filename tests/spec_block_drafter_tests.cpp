@@ -309,8 +309,14 @@ struct RunnerChain final : sp::ChainDrafter {
     std::uint32_t stream_len = 0;
     std::vector<std::uint32_t> ru;
     std::vector<float> gp;
-    std::uint64_t paths = 0;
+    std::uint64_t paths = 0, prelaunch_offers = 0;
     RunnerChain(const World& world, double acc, double q) : w(world), accuracy(acc), q_true(q) {}
+    // Counts the verify pre-launch offers (BlockSpeculator passes a launch only to a linear target) and declines them, so
+    // the step falls back to draft(): the run's ids and blocks must not depend on the offer.
+    bool draft_prelaunch(std::span<const std::uint32_t>, std::uint32_t, std::vector<std::uint32_t>&, const sp::PrelaunchFn&) override {
+        ++prelaunch_offers;
+        return false;
+    }
     void draft(std::span<const std::uint32_t> prefix, std::uint32_t k, std::vector<std::uint32_t>& out) override {
         out.clear();
         ru.clear();
@@ -344,7 +350,7 @@ struct RunnerChain final : sp::ChainDrafter {
 struct TreeRun {
     std::vector<std::uint32_t> out, trace;
     sp::SpecStats stats;
-    std::uint64_t steps = 0, sib_rows = 0, taken = 0;
+    std::uint64_t steps = 0, sib_rows = 0, taken = 0, prelaunch_offers = 0;
     double ms = 0.0;
 };
 
@@ -370,6 +376,7 @@ TreeRun run_tree(const World& w, std::uint32_t n_tokens, double acc, double q, s
     drafter.commit(std::span<const std::uint32_t>(&r.out[0], 1));
     ch.stream_len = 1;
     sp::BlockSpeculator spec(drafter, target);
+    spec.set_prelaunch(g_prelaunch);
     spec.start(r.out[0]);
     while (r.out.size() < n_tokens) {
         sp::StepParams p;
@@ -388,6 +395,7 @@ TreeRun run_tree(const World& w, std::uint32_t n_tokens, double acc, double q, s
     }
     r.stats = drafter.stats();
     r.ms = g_clock;
+    r.prelaunch_offers = ch.prelaunch_offers;
     return r;
 }
 
@@ -421,6 +429,26 @@ void tree_unit_tests() {
 
 int tree_tests() {
     tree_unit_tests();
+    {  // verify pre-launch + token tree: a tree target is never offered a pre-launch (its siblings are placed after the
+       // chain ids are read); a linear target is. Either way the ids and blocks equal the run without pre-launch.
+        const auto w = make_world("prose", 40, 600, 71);
+        g_prelaunch = true;
+        const auto tree_pre = run_tree(w, 600, 0.63, 0.35, 32, true, 0.113, false);
+        const auto lin_pre = run_tree(w, 600, 0.63, 0.35, 0, true, 0.113, false);
+        g_prelaunch = false;
+        const auto tree_off = run_tree(w, 600, 0.63, 0.35, 32, true, 0.113, false);
+        const auto lin_off = run_tree(w, 600, 0.63, 0.35, 0, true, 0.113, false);
+        BD_CHECK(tree_pre.prelaunch_offers == 0 && tree_pre.sib_rows > 0, "tree target offered %llu pre-launches (siblings %llu)",
+                 (unsigned long long)tree_pre.prelaunch_offers, (unsigned long long)tree_pre.sib_rows);
+        BD_CHECK(lin_pre.prelaunch_offers > 0 && lin_off.prelaunch_offers == 0, "linear target: pre-launch offers %llu / %llu",
+                 (unsigned long long)lin_pre.prelaunch_offers, (unsigned long long)lin_off.prelaunch_offers);
+        BD_CHECK(tree_pre.out == tree_off.out && tree_pre.trace == tree_off.trace && lin_pre.out == lin_off.out &&
+                     lin_pre.trace == lin_off.trace,
+                 "pre-launch flag changed a tree or linear run");
+        std::printf("tree + pre-launch: tree target 0 offers (%llu sibling rows), linear target %llu offers, ids unchanged
+",
+                    (unsigned long long)tree_pre.sib_rows, (unsigned long long)lin_pre.prelaunch_offers);
+    }
     int cases = 0;
     const std::uint32_t n = 1200;
     std::uint64_t placed = 0, taken = 0;
