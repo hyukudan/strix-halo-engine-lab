@@ -14,6 +14,9 @@
 // strix-hy4-rows PART.gguf... --ids-file F [--context N] [--prompt-rows N] [--reps K] [--spec N] [--max-rows R]
 //   [--verify-ms a,b,...] [--gbps G] [--mtp [--mtp-copy 0|1] [--chain-ms S,F] [--survival c,...] [--mtp-taps DIR
 //   [--taps-gen N] [--depth D]]]; --content LABEL=PATH (repeatable) instead of --ids-file: one spec run per content
+//   [--tp-rank 0|1 [--tp-transport usb4auto|tcp-listen:PORT|tcp-connect:HOST:PORT]]: the same run on a tensor-parallel
+//     pair (each rank loads the whole pack): bench rows / plain steps on both ranks with their shares; --spec: rank 0
+//     drafts and decides, rank 1 replays its verify passes (FOLLOW line), ids compared with plain greedy on rank 0.
 #include "hy4/hip/hy4_hip_forward.hpp"
 #include "hy4/hip/hy4_hip_rows.hpp"
 #include "strix/spec/block_parallel.hpp"
