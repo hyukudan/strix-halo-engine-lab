@@ -326,8 +326,7 @@ int main() {
     expect(threw, "non-increasing cuts refused");
     if (failures) { std::fprintf(stderr, "%d failure(s)\n", failures); return 1; }
     std::printf("PASS: layer pipeline over N ranks (%u plans, N=1..4, ids and logits bytes equal to one rank; "
-                "%u pipelined-speculation runs equal, negative control detected; %u relayed decodes equal)
-", checked, spec_checked,
+                "%u pipelined-speculation runs equal, negative control detected; %u relayed decodes equal)\n", checked, spec_checked,
                 relayed);
     return 0;
 }
