@@ -577,7 +577,6 @@ void ffn_vrows_tp(std::uint32_t l, std::uint32_t R) {  // vr.xn -> vr.f, this ra
         linear_vrows(blk(l, "ffn_routed_down.weight"), vr.xn, h, c.latent, R, vr.z);
         const auto& wg = t(blk(l, "ffn_gate_exps.weight"));
         const auto& wdt = t(blk(l, "ffn_down_exps.weight"));
-        if (wg.type == kTypeBf16) throw std::logic_error("hy4 hip forward: BF16 experts (next-token block) under tensor parallelism");
         const bool kquant_down = wdt.type == 12U || wdt.type == 14U;
         // this rank's slots (htp::moe: top_k / 2 from slot_first) and shared-expert activations, one join per layer:
         // slot = [R][Ks][L] routed slot rows | [R][shared_ff / 2] activations
@@ -587,7 +586,10 @@ void ffn_vrows_tp(std::uint32_t l, std::uint32_t R) {  // vr.xn -> vr.f, this ra
         const std::size_t raw_n = std::size_t{R} * Ks * L, sa = raw_n + std::size_t{R} * sr.count;
         float* const mine = tp_rows_mine(sa);
         check(hipMemcpy2DAsync(tp.tids, Ks * 4U, vr.ids + m.slot_first, K * 4U, Ks * 4U, R, hipMemcpyDeviceToDevice, s), "tp slot ids");
-        if (vr.expert_union && R > 1U && wg.type == 12U && kquant_down)
+        if (wg.type == kTypeBf16)  // the next-token block (drafter under TP): each row's 8 BF16 slots, the step's form
+            for (std::uint32_t r = 0; r < R; ++r)
+                experts_dense(wg, t(blk(l, "ffn_up_exps.weight")), wdt, vr.z + r * L, tp.tids + r * Ks, mine + std::size_t{r} * Ks * L, Ks);
+        else if (vr.expert_union && R > 1U && wg.type == 12U && kquant_down)
             expert_rows_union(l, R, tp.tids, Ks, mine);
         else
             for (std::uint32_t r = 0; r < R; ++r) expert_row(l, vr.z + r * L, tp.tids + r * Ks, mine + std::size_t{r} * Ks * L, Ks);

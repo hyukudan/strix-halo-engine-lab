@@ -487,16 +487,22 @@ int main(int argc, char** argv) {
             std::unique_ptr<hb::rows::MtpSource<hb::Forward>> source;
             std::uint64_t plain_fnv = 1469598103934665603ULL;  // the plain ids (compared across one node / pair runs)
             for (const auto id : plain) plain_fnv = (plain_fnv ^ id) * 1099511628211ULL;
-            if (follower) {  // rank 1: the same prompt pass, then rank 0's verify passes
+            // tensor-parallel drafter (both ranks; STRIX_HY4_TP_DRAFT=0: rank 0 alone, one-node block): both ranks must agree
+            so.draft_tp = tp_rank >= 0 && mtp && strix::envcfg::flag("STRIX_HY4_TP_DRAFT", true);
+            if (follower) {  // rank 1: the same prompt pass (with the block when the drafter runs on both), then rank 0's rounds
+                std::unique_ptr<hb::rows::MtpSource<hb::Forward>> fsrc;
+                if (so.draft_tp) fsrc = std::make_unique<hb::rows::MtpSource<hb::Forward>>(f);
                 const double prime_t1 = now_ms();
-                if (prime(f, ids, batched) != first_id) throw std::runtime_error("repeat prompt anchor differs (" + label + ")");
-                std::printf("PRIME %s prompt %zu ids %.1f ms (tp rank 1)\n", label.c_str(), ids.size(), now_ms() - prime_t1);
+                if (prime(f, ids, batched, fsrc.get()) != first_id) throw std::runtime_error("repeat prompt anchor differs (" + label + ")");
+                std::printf("PRIME %s prompt %zu ids %.1f ms (tp rank 1%s)\n", label.c_str(), ids.size(), now_ms() - prime_t1,
+                            fsrc ? ", with the block" : "");
                 const double t1 = now_ms();
-                const auto fr = hb::rows::spec_follow(f, pair_ex);
+                const auto fr = fsrc ? hb::rows::spec_follow(f, pair_ex, *fsrc) : hb::rows::spec_follow(f, pair_ex);
                 const double wall = now_ms() - t1;
-                std::printf("FOLLOW %s rounds %llu passes %llu rows %llu committed %llu wall %.1f ms (position checked)\n", label.c_str(),
-                            static_cast<unsigned long long>(fr.rounds), static_cast<unsigned long long>(fr.passes),
-                            static_cast<unsigned long long>(fr.rows), static_cast<unsigned long long>(fr.committed), wall);
+                std::printf("FOLLOW %s rounds %llu passes %llu rows %llu committed %llu drafts %llu wall %.1f ms (position checked%s)\n",
+                            label.c_str(), static_cast<unsigned long long>(fr.rounds), static_cast<unsigned long long>(fr.passes),
+                            static_cast<unsigned long long>(fr.rows), static_cast<unsigned long long>(fr.committed),
+                            static_cast<unsigned long long>(fr.drafts), wall, fsrc ? ", draft ids cross-checked" : "");
                 std::printf("PLAIN %s tp rank 1 %.2f tok/s (%.2f ms/token) ids_fnv %016llx\n", label.c_str(), 1000.0 / step_ms, step_ms,
                             static_cast<unsigned long long>(plain_fnv));
                 std::fflush(stdout);
@@ -537,11 +543,11 @@ int main(int argc, char** argv) {
                         res.steps.empty() ? 0.0 : gen / static_cast<double>(res.steps.size()), static_cast<unsigned long long>(res.proposed),
                         static_cast<unsigned long long>(res.accepted));
             if (mtp)
-                std::printf("MTP %s block calls %llu rows %llu drafts %llu id reads %llu draft wall %.1f ms (%.2f ms/draft) chain %s seeds step %.1f flush %.1f\n",
+                std::printf("MTP %s block calls %llu rows %llu drafts %llu id reads %llu draft wall %.1f ms (%.2f ms/draft) chain %s seeds step %.1f flush %.1f%s\n",
                             label.c_str(), static_cast<unsigned long long>(res.chain_calls), static_cast<unsigned long long>(res.chain_rows),
                             static_cast<unsigned long long>(res.chain_drafts), static_cast<unsigned long long>(res.chain_reads), res.chain_ms,
                             res.chain_drafts ? res.chain_ms / static_cast<double>(res.chain_drafts) : 0.0, so.copy ? "+copy+hybrid" : "only",
-                            so.chain_step_ms, so.chain_flush_ms);
+                            so.chain_step_ms, so.chain_flush_ms, so.draft_tp ? " block tp" : (tp_rank == 0 ? " block rank 0" : ""));
             if (mtp)  // where a pass's wall goes: verify passes, drafter (flush + chain), the rest (round message, host)
                 std::printf("WALL %s total %.1f ms verify %.1f draft %.1f other %.1f (per pass %.2f / %.2f / %.2f)\n", label.c_str(), res.wall_ms,
                             res.verify_ms, res.chain_ms, res.wall_ms - res.verify_ms - res.chain_ms,

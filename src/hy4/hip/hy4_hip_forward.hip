@@ -361,6 +361,7 @@ struct Forward::Impl {
         bool logits_full = false;                  // logits_d holds the last want_top row's full-head logits
         const float* last_post = nullptr;          // device row of the last want_top call (nextn_logits recompute)
         NextnHead head = NextnHead::full;
+        bool tp = false;  // set_nextn_tp: the block runs tensor-parallel (both ranks call every nextn_rows)
         std::unique_ptr<strix::HipMtpDraftHead> q8, q4;  // shared draft heads (built at first use)
         float* ph = nullptr;                       // [rmax][hidden] prompt rows: output_norm(hc_head collapse)
         float* pu = nullptr;                       // [rmax][hidden] collapse
@@ -895,8 +896,12 @@ struct Forward::Impl {
     // A routed id outside the experts writes NaN (caught by the non-finite checks downstream).
     // One row's experts: zr = its routed_down output [latent], idr = its device top-k ids, raw = its [K][latent] down outputs
     // (the decode step: z / ids / rawdots; the rows form: row r of vr.z / vr.ids / vr.rawdots).
-    void experts_dense(const Tensor& wg, const Tensor& wu, const Tensor& wd, const float* zr, const std::uint32_t* idr, float* raw) {
-        const std::uint32_t K = c.top_k, I = c.expert_ff, L = c.latent;
+    // kslots: the slots this call runs (0 = all top_k; a TP rank: its top_k / 2 slots, idr = its first slot's id): each slot's
+    // slices are independent groups of the same launches, so a slot row is bitwise the one-node row.
+    void experts_dense(const Tensor& wg, const Tensor& wu, const Tensor& wd, const float* zr, const std::uint32_t* idr, float* raw,
+                       std::uint32_t kslots = 0U) {
+        const std::uint32_t K = kslots ? kslots : c.top_k, I = c.expert_ff, L = c.latent;
+        if (K > c.top_k) throw std::logic_error("hy4 hip forward: BF16 expert slots above top_k");
         if (!nx.act) throw std::logic_error("hy4 hip forward: BF16 experts without the next-token workspace");
         if (wu.type != wg.type || wd.type != wg.type) throw std::runtime_error("hy4 hip forward: mixed BF16 expert types");
         const std::uint64_t gate_slice = row_bytes(wg.type, L) * I, down_slice = row_bytes(wd.type, I) * L;
@@ -943,8 +948,7 @@ struct Forward::Impl {
             const std::uint32_t* const sid = ids + m.slot_first;
             const std::uint64_t K = m.slots, L = c.latent;
             if (wg.type == kTypeBf16) {  // the next-token block: BF16 slices by the shared dense rows (the A8 form has no BF16)
-                if (par) throw std::logic_error("hy4 hip forward: BF16 experts (next-token block) under tensor parallelism");
-                experts_dense(wg, wu, wd, z, ids, rawdots);
+                experts_dense(wg, wu, wd, z, sid, raw, static_cast<std::uint32_t>(K));  // a TP rank: its 8 slots into its tp::moe slot
             } else {
                 const std::uint64_t I = c.expert_ff;
                 a8::Request rq;
@@ -1671,10 +1675,13 @@ struct Forward::Impl {
             std::fill(nx.top + off, nx.top + off + rows_n, 0U);
             return;
         }
-        attention_vrows(L, rows_n);                                                 // vr.xn -> vr.f (post_attention_norm)
+        // the drafter under TP (Forward::set_nextn_tp, both ranks in the draft rounds): this rank's heads / slots, joined
+        if (tp.world == 2U) attention_vrows_tp(L, rows_n);
+        else attention_vrows(L, rows_n);                                            // vr.xn -> vr.f (post_attention_norm)
         glu::launch_epilogue<glu::Round::bf16>(nx.xr, vr.f, nh, nh, nx.xr, s);    // x = bf(x + attn)
         norm_rows(nx.xr, t(blk(L, "ffn_norm.weight")).f(), c.hidden, rows_n, vr.xn);
-        ffn_vrows(L, rows_n);                                                       // vr.xn -> vr.f (post_ffw_norm)
+        if (tp.world == 2U) ffn_vrows_tp(L, rows_n);
+        else ffn_vrows(L, rows_n);                                                  // vr.xn -> vr.f (post_ffw_norm)
         glu::launch_epilogue<glu::Round::bf16>(nx.xr, vr.f, nh, nh, nx.xr, s);    // x = bf(x + ffn)
         check(hipMemcpyAsync(nx.pre + off * h, nx.xr, nh * 4U, hipMemcpyDeviceToDevice, s), "next-token hidden rows copy");
         norm_rows(nx.xr, t(blk(L, "nextn.shared_head_norm.weight")).f(), c.hidden, rows_n, nx.post + off * h);
@@ -1911,9 +1918,15 @@ const float* Forward::rows_hidden() const noexcept { return impl_->vr.xn; }
 bool Forward::has_nextn() const noexcept { return impl_->nx.on; }
 void Forward::set_nextn_row_loop(bool on) noexcept { impl_->nx.row_loop = on; }
 void Forward::set_nextn_head(NextnHead head) { impl_->nx.head = head; }
+void Forward::set_nextn_tp(bool on) {
+    if (on && impl_->tp.world != 2U) throw std::logic_error("hy4 hip forward: set_nextn_tp needs enable_tp");
+    impl_->nx.tp = on;
+}
 Forward::NextnOut Forward::nextn_rows(const std::uint32_t* tokens, const float* hidden, std::uint32_t rows, std::uint32_t pos0, bool want_top,
                                       std::uint32_t outputs) {
-    const Impl::TpOneNode one(impl_->tp);  // the drafter: one-node form on the rank that runs it
+    // the drafter: one-node form on the rank that runs it, or (set_nextn_tp, both ranks call it) tensor-parallel
+    if (impl_->nx.tp) return impl_->nextn_rows(tokens, hidden, rows, pos0, want_top, outputs);
+    const Impl::TpOneNode one(impl_->tp);
     return impl_->nextn_rows(tokens, hidden, rows, pos0, want_top, outputs);
 }
 const std::vector<float>& Forward::nextn_logits() {

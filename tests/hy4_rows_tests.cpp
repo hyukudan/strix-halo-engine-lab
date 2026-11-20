@@ -200,6 +200,7 @@ struct FakeMtpForward {
         return next(hist.back(), hist.size());
     }
     void set_prompt_hidden(std::function<void(const float*, std::uint32_t, std::uint32_t)> s) { sink = std::move(s); }
+    void set_nextn_tp(bool) {}  // the pair form (spec_decode / spec_follow with a pair exchange); one node here
     float* alloc_f32(std::size_t n) { return new float[std::max<std::size_t>(n, 1U)](); }
     void free_f32(float* p) noexcept { delete[] p; }
     void copy_f32_async(float* d, const float* s, std::size_t n) { std::copy(s, s + n, d); }

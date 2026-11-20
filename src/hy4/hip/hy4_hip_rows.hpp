@@ -209,6 +209,24 @@ private:
     float* last_ = nullptr;
 };
 
+// The next-token block tensor-parallel for one decode (Forward::set_nextn_tp), the one-node form again after it.
+template <class Fwd>
+class NextnTp {
+public:
+    NextnTp(Fwd& f, bool on) : f_(f), on_(on) {
+        if (on_) f_.set_nextn_tp(true);
+    }
+    ~NextnTp() {
+        if (on_) f_.set_nextn_tp(false);
+    }
+    NextnTp(const NextnTp&) = delete;
+    NextnTp& operator=(const NextnTp&) = delete;
+
+private:
+    Fwd& f_;
+    bool on_;
+};
+
 // Verify target of the chain arm: the rows contract plus the chain's view of each pass (the committed rows' hidden).
 template <class Fwd>
 class ChainVerifyTarget final : public spec::VerifyTarget {
@@ -244,6 +262,9 @@ struct SpecOptions {
     std::vector<double> chain_survival;
     double survival_weight = 8.0;
     bool copy = true;  // the copy source (and the hybrid copy + chain block); false = chain only
+    // tensor-parallel pair: the next-token block runs on both ranks with their shares (Forward::set_nextn_tp; rank 1 replays
+    // the draft rounds on its own chain); false = the one-node block on rank 0 while rank 1 waits. Both ranks must agree.
+    bool draft_tp = true;
 };
 struct SpecResult {
     std::vector<std::uint32_t> ids;                   // emitted ids, ids[0] = the anchor
@@ -326,9 +347,11 @@ SpecResult spec_decode(Fwd& f, std::span<const std::uint32_t> prompt, std::uint3
     ChainVerifyTarget<Fwd> target(f, ch);
     SpecResult res;
     if (pair == nullptr) res = detail::spec_run(f, prompt, anchor, n, o, &ch, o.chain_survival, target);
-    else {  // tensor-parallel pair, rank 0: the drafter here, every verify also on rank 1 (spec_follow)
+    else {  // tensor-parallel pair, rank 0: the drafter here, every verify also on rank 1 (spec_follow); with draft_tp every
+            // chain draft too (rank 1 runs the same draft calls on its own chain: draft rounds)
         spec::pair_round::PairVerifyLeader lead(target, *pair, [&f] { return std::uint64_t{f.position()}; });
-        res = detail::spec_run(f, prompt, anchor, n, o, &ch, o.chain_survival, lead);
+        const NextnTp tp(f, o.draft_tp);
+        res = detail::spec_run(f, prompt, anchor, n, o, o.draft_tp ? &lead.chain(ch) : &ch, o.chain_survival, lead);
         lead.finish();
     }
     res.chain_calls = ch.calls();
@@ -347,6 +370,15 @@ spec::pair_round::FollowResult spec_follow(Fwd& f, const spec::pair_round::Excha
     VerifyEngine<Fwd> engine(f);
     spec::EngineVerifyTarget<VerifyEngine<Fwd>> target(engine);
     return spec::pair_round::pair_follow(target, pair, [&f] { return std::uint64_t{f.position()}; });
+}
+// The same with rank 0's drafter on both ranks (SpecOptions::draft_tp on both): `mtp` installed before this rank's prefill
+// of the same prompt and finished with the same anchor; its chain replays rank 0's draft rounds (draft ids cross-checked).
+template <class Fwd>
+spec::pair_round::FollowResult spec_follow(Fwd& f, const spec::pair_round::Exchange& pair, MtpSource<Fwd>& mtp) {
+    auto& ch = mtp.chain();
+    ChainVerifyTarget<Fwd> target(f, ch);
+    const NextnTp tp(f, true);
+    return spec::pair_round::pair_follow(target, pair, [&f] { return std::uint64_t{f.position()}; }, &ch);
 }
 
 }  // namespace strix::hy4::hipbind::rows

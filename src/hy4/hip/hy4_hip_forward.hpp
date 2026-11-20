@@ -140,6 +140,10 @@ public:
     void set_nextn_row_loop(bool on) noexcept;
     // The drafts' head from the next nextn_rows call on (the device check compares the forms on the same rows).
     void set_nextn_head(NextnHead head);
+    // After enable_tp: nextn_rows runs tensor-parallel (this rank's heads, BF16 expert slots 8 + 8 and shared rows, joined;
+    // the drafts' head on both ranks) instead of the one-node form. Both ranks must then make every nextn_rows call in the
+    // same order (strix/spec/pair_round.hpp draft rounds). Bitwise the one-node block: the same joins as the trunk's.
+    void set_nextn_tp(bool on);
     // outputs = trailing rows whose top / hidden the caller reads (default all). Rows [0, rows - outputs) only write the
     // block's caches (bitwise the full form's: the latent row and the indexer keys depend only on the row's input); their
     // pre / post rows are unspecified and their top is 0. want_top needs outputs >= 1. The row loop computes every row.
@@ -174,7 +178,7 @@ public:
     // rows) splits the same way over its R rows (heads, o_proj / FFN / shared rows, routed slots 8 + 8 per row; the head
     // stays replicated): bitwise the one-node pass; both ranks run the same passes (strix/spec/pair_round.hpp). prefill()
     // and the next-token block (nextn_rows / nextn_logits, the drafter) run the one-node form on each rank that calls them
-    // (no gather). Whole-model rank only.
+    // (no gather), unless set_nextn_tp(true) (nextn_rows then splits like a step on both ranks). Whole-model rank only.
     struct TpGather {
         void* ctx = nullptr;
         void (*fn)(void* ctx, void* stream, void* slots, std::size_t slot_bytes, std::size_t bytes) = nullptr;
