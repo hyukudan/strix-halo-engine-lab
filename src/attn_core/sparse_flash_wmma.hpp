@@ -64,6 +64,7 @@
 //   static __device__ float sink(const Args&, unsigned row, unsigned head)
 //                                 learned sink logit (natural units, unscaled) in the denominator; out() / out_op() only
 // Launch: flash_rows_kernel<P, T><<<rows, Geometry<P::kHeads, P::kDim, T>::kThreads, 0, stream>>>(args).
+#include "attn_core/flash_pf_policy.hpp"
 #include "attn_core/flash_tile.hpp"
 #include "strix/env_arms.hpp"
 #include "strix/env_flags.hpp"
@@ -315,12 +316,8 @@ __global__ __launch_bounds__((Geometry<P::kHeads, P::kDim, T>::kThreads)) void f
 }
 
 // Pipelined loads (Pf, bitwise: same operands, same order), shared by every engine that binds this core.
-// Auto by the launch's longest key list (host bound, max_keys): Pf hides latency only when there are blocks to overlap,
-// and its extra VGPRs (gfx1151 VGPR Pf on / off: T 16 210 / 253, T 32 238 / 199) cost occupancy on short lists. Measured receipts
-// (fp32glm3r, ABAB, bitwise in every case): GLM T 16 lists <= 2,051 flash ~-19 %; DS41 T 32 lists 640 -4.3..-4.7 %,
-// 228 +3.3 %, <= 128 +12..15 % -> on from kPfMinKeys. STRIX_ATTN_FLASH_PF=1 / 0 forces it; resolved once per in-process
-// arm (env_arms).
-inline constexpr unsigned kPfMinKeys = 320;
+// Auto by the launch's key block T and longest key list (host bound, max_keys); the rule and its receipts (fp32glm3r)
+// live in flash_pf_policy.hpp. STRIX_ATTN_FLASH_PF=1 / 0 forces it; resolved once per in-process arm (env_arms).
 inline int flash_pf_mode() {  // -1 auto, 0 off, 1 on
     static strix::env_arms::Resolved<int> mode;
     return mode.get([] {
@@ -329,21 +326,16 @@ inline int flash_pf_mode() {  // -1 auto, 0 off, 1 on
         return strix::envcfg::flag("STRIX_ATTN_FLASH_PF", true) ? 1 : 0;
     });
 }
-inline bool flash_pf_enabled(unsigned max_keys = ~0U) {
-    const int m = flash_pf_mode();
-    return m < 0 ? max_keys >= kPfMinKeys : m == 1;
-}
-inline const char* flash_pf_reason(unsigned max_keys = ~0U) {
-    const int m = flash_pf_mode();
-    if (m >= 0) return m == 1 ? "on (STRIX_ATTN_FLASH_PF=1)" : "off (STRIX_ATTN_FLASH_PF=0)";
-    return max_keys >= kPfMinKeys ? "on (auto: key lists >= 320)" : "off (auto: key lists < 320, nothing to overlap)";
+inline bool flash_pf_enabled(unsigned max_keys = ~0U, unsigned T = 32U) { return flash_pf_decide(flash_pf_mode(), T, max_keys); }
+inline const char* flash_pf_reason(unsigned max_keys = ~0U, unsigned T = 32U) {
+    return flash_pf_reason_text(flash_pf_mode(), T, max_keys);
 }
 template <class P, unsigned T> inline void launch_flash_rows(const typename P::Args& a, unsigned grid, hipStream_t s, unsigned max_keys = ~0U) {
     constexpr unsigned threads = Geometry<P::kHeads, P::kDim, T>::kThreads;
     static std::atomic<int> shown{-1};  // print the decision (and its reason) whenever it changes
-    const bool pf = flash_pf_enabled(max_keys);
+    const bool pf = flash_pf_enabled(max_keys, T);
     if (shown.exchange(pf ? 1 : 0, std::memory_order_relaxed) != (pf ? 1 : 0))
-        std::fprintf(stderr, "attn_core flash T %u: pipelined loads %s\n", T, flash_pf_reason(max_keys));
+        std::fprintf(stderr, "attn_core flash T %u: pipelined loads %s\n", T, flash_pf_reason(max_keys, T));
     if (pf) flash_rows_kernel<P, T, true><<<grid, threads, 0, s>>>(a);
     else flash_rows_kernel<P, T, false><<<grid, threads, 0, s>>>(a);
 }

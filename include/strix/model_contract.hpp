@@ -1,6 +1,7 @@
 #pragma once
 
 #include "strix/hip_qwen_rotary_table.hpp"
+#include "strix/kv_storage.hpp"
 #include "strix/recurrent_state_type.hpp"
 #include <cstdint>
 #include <string>
@@ -10,13 +11,16 @@ namespace strix {
 class HipQwenRotaryTable;
 
 // Storage of the target model's QSA attention KV cache (the MTP head keeps its
-// own BF16 cache). bf16 is the canonical model dtype. int8_token is the opt-in
-// kv-int8-tok-v1 identity: per token, per KV head and per K/V half, symmetric
-// int8 codes of the BF16-rounded values with one FP32 scale (absmax / 127).
-enum class AttentionKvStorage : std::uint32_t { bf16 = 0, int8_token = 1 };
+// own BF16 cache). The forms, their identity words and the role / tier rule
+// have one table: strix/kv_storage.hpp. bf16 is the canonical model dtype.
+// int8_token is the opt-in kv-int8-tok-v1 identity: per token, per KV head and
+// per K/V half, symmetric int8 codes of the BF16-rounded values with one FP32
+// scale (absmax / 127). This contract admits only those two forms
+// (ModelContract::validate); e4m3_token has no HIP reader.
+using AttentionKvStorage = kv::Form;
 
 [[nodiscard]] constexpr const char* attention_kv_storage_name(AttentionKvStorage storage) noexcept {
-    return storage == AttentionKvStorage::int8_token ? "kv-int8-tok-v1" : "bf16";
+    return kv::name(storage).data();  // every name is a string literal: NUL-terminated
 }
 
 // Captured from the official Qwen config pinned in artifacts/. These values

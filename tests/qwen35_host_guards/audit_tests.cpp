@@ -73,8 +73,15 @@ struct Engine {
 // engine.hip WideScratch: the dense scratch plus the x16 tile buffer of the IU4 wide windows (_Float16 there; the audit
 // never stores a tile, so a 16-bit stand-in keeps this host test free of _Float16).
 using Half = std::uint16_t;
-struct WideScratch : core::DenseWideScratch { Half* xt = nullptr; };
 using hipStream_t = void*;
+// engine.hip A4W4 class (core/iu4a4_dense.hpp): the activation codes of one window. The audited tensors carry no A4
+// codes (a4_ok below is false), so its producers are unreachable here.
+namespace strix::core::iu4a4_dense {
+struct Act { std::uint8_t* codes = nullptr; float* u = nullptr; float* base = nullptr; unsigned rows = 0, in = 0; };
+inline bool map2_supported(unsigned) { return false; }
+template <class F> void enqueue_quantise_map2(const float*, const float*, unsigned, const Act&, hipStream_t) { runtime_require(false); }
+}
+struct WideScratch : core::DenseWideScratch { Half* xt = nullptr; core::iu4a4_dense::Act a4{}; };
 struct Tensor { unsigned fmt = 30, inputs = 1, outputs = 1; };
 unsigned limit = 0;
 float* base_out = nullptr;
@@ -103,6 +110,8 @@ void wide_iu4(const Tensor&, const float*, float*, unsigned, hipStream_t, const 
 // x16 tile form of the IU4 wide windows (core/f16_dense_tall.hpp producers); unreachable here (no type-200 weights).
 bool wide_iu4_x16(const Tensor&, const WideScratch&, unsigned) { return false; }
 struct SiluMul {};
+bool a4_ok(const Tensor&, const WideScratch&) { return false; }
+void a4_linear(const Tensor&, const float*, float*, unsigned, hipStream_t, const WideScratch&, bool = true) { runtime_require(false); }
 namespace strix::core::f16_dense_tall {
 struct TileRne {};
 void enqueue_x16_tiles(const float*, Half*, unsigned, unsigned, hipStream_t) { runtime_require(false); }

@@ -365,11 +365,34 @@ It changes what they are measured on:
 | rule | what is measured |
 |---|---|
 | R1 route replay (MoE engines) | The lever arm replays the reference's expert ids and weights at every router call, so KL, top-1 and dNLL measure arithmetic, not route flips. Separately, the route flip rate of the lever running free (its own routes) is divided by the flip rate of the null arm running free. That ratio must be <= 1.5. |
-| R2 null-relative window KL | For each window, the KL limit is max(0.02, 1.5 x the null arm's KL on that same window). The null is a one-ulp perturbation, measured under the same replay as the lever. The pooled KL limit stays an absolute 0.02. Top-1 and dNLL limits stay absolute per window. |
+| R2 null-relative window KL | For each window, the KL limit is max(0.02, 1.5 x the null arm's KL on that same window). The null is a one-ulp perturbation, measured under the same replay as the lever. The pooled limits follow the null floor below. Top-1 and dNLL limits stay absolute per window. |
 | R3 held-out dNLL | dNLL is scored on token ids that neither arm generated: the recorded continuation of the text. The gate refuses labels that all equal an arm's own top-1. At least 800 scored rows are needed pooled, and the standard error is printed. |
 
 | R2b three states per window | Top-1 and dNLL pass at the limit (disagreement <= L = max(0.07, 1.5 x the null's disagreement); dNLL <= 0.01), fail above the limit plus 2 standard errors of the window's rows (dNLL se at most 1.5 x the null's se on that window) and are UNRESOLVED in between. An unresolved window is cleared only by its content class (`--classes C.json`, declared before scoring; default the prompt-length band with a manifest, else one class): the class rows are pooled and judged by the same rule, final on >= 800 rows. |
 | R4 reference check | A window where the lever beats the exact reference by more than 3 se, while the paired lever-minus-null difference is also below -3 se, is "reference suspect". A window whose reference NLL is above max(3 x median, median + 2 nats) of the set (>= 3 windows) is "off-distribution": control or chat-template ids, or a timing prompt used as a gate window. Either holds the verdict. |
+
+### Null floor for the pooled bars
+
+On some engines the exact null itself fails a pooled bar: on GLM-5.3 (4 windows x 255 rows) the one-ulp null scores
+pooled KL 0.141 and dNLL +0.052 against the exact reference, and top-1 0.9304 (se 0.008), so no arm, the exact null
+included, could pass KL <= 0.02. **By default, these calculations are advisory only:** the gate still judges
+PASS/FAIL with the original absolute pooled bars. `qual --allow-null-floor` explicitly opts into using the relaxed
+null-relative bars to decide PASS/FAIL; the JSON records `pooled.null_floor.enabled`. Without the opt-in, a candidate
+failing any absolute pooled bar remains FAIL, regardless of the advisory null-floor result.
+When explicitly enabled, a pooled bar is judged against the pooled null of the same windows:
+
+| bar | engaged when the pooled null ... | limit when engaged (relax-only) |
+|---|---|---|
+| KL | + 2 se > 0.02 | max(0.02, null + 0.02) |
+| top-1 | - 2 se < 0.93 | min(0.93, null - 0.01) |
+| dNLL | + 2 se > 0.01 | max(0.01, null + 0.01) |
+
+The pooled null is the row-weighted mean of the null arms over the same windows; se is the row standard error of the
+first null (top-1: binomial). A bar without the null's evidence (no null top-1 or null NLL rows; KL without per-row
+null KL has se 0) stays absolute. The margins are the FAST allowance on top of the floor: one paired standard error of
+lever-minus-null at ~1,000 rows on GLM (KL 0.019-0.023, top-1 0.007-0.010). The floor never relaxes a window, a class
+or the route flip ratio, and it is never applied silently: the `NULL-FLOOR` line prints every pooled bar with its null,
+se, limit and result, and names the bars that pass only under the floor (JSON `pooled.null_floor`).
 
 Exit 0 = PASS, 1 = FAIL, 3 = UNRESOLVED (provisional: the lever stays opt-in for the unresolved classes), 4 = HOLD
 (reference check: examine the exact path on those windows, then re-run), 2 = no verdict. No verdict is given in these cases:

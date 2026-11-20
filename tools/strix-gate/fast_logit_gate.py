@@ -44,6 +44,9 @@ import time
 
 import numpy as np
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import tail_rule  # noqa: E402
+
 SCHEMA = "strix-fast-dump/v1"
 SEL_MAGIC = 0x444C4553
 
@@ -706,7 +709,7 @@ def compare_logits(da, a, db, b, name, tokens, chunk=16):
     total = len(tokens)
     if rows > total:
         raise GateError(f"{name}: {rows} rows scored but the prompt has {total} tokens")
-    kl, agree, nla, nlb, hia, hib = np.empty(rows), np.empty(rows, bool), [], [], [], []
+    kl, agree, margin, nla, nlb, hia, hib = np.empty(rows), np.empty(rows, bool), np.empty(rows), [], [], [], []
     identical = True
     for i in range(0, rows, chunk):
         za = np.concatenate([s[i:i + chunk] for s in sa], axis=1).astype(np.float64)
@@ -718,6 +721,7 @@ def compare_logits(da, a, db, b, name, tokens, chunk=16):
         kl[i:i + chunk] = (np.exp(la) * (la - lb)).sum(axis=1)
         ta, tb = za.argmax(axis=1), zb.argmax(axis=1)
         agree[i:i + chunk] = ta == tb
+        margin[i:i + chunk] = tail_rule.ref_margin(la)
         for j in range(za.shape[0]):
             pos = total - rows + i + j  # the row at prompt position pos predicts token pos + 1
             if pos + 1 < total:
@@ -725,7 +729,7 @@ def compare_logits(da, a, db, b, name, tokens, chunk=16):
                 nlb.append(-lb[j, tokens[pos + 1]])
                 hia.append(ta[j] == tokens[pos + 1])
                 hib.append(tb[j] == tokens[pos + 1])
-    return {"rows": rows, "kl": kl, "agree": agree, "nll_ref": np.array(nla), "nll_cand": np.array(nlb),
+    return {"rows": rows, "kl": kl, "agree": agree, "margin_ref": margin, "nll_ref": np.array(nla), "nll_cand": np.array(nlb),
             "hit_ref": np.array(hia, dtype=bool), "hit_cand": np.array(hib, dtype=bool), "identical": identical}
 
 
@@ -792,7 +796,8 @@ def compare_v2(a, names, results, null_prompt_kl, report, null_prompt=None):
             nu = (null_prompt or {}).get(name) or {}
             w = gate_v2.window_stats(name, r["kl"], r["agree"], r["nll_ref"], r["nll_cand"], null_prompt_kl[name],
                                      r["hit_ref"], r["hit_cand"], null_top1s=nu.get("top1") or None,
-                                     null_nlls=nu.get("nll") or None)
+                                     null_nlls=nu.get("nll") or None,
+                                     null_kl_rows=nu["kl"][0] if nu.get("kl") else None)
             windows.append(w)
             print(gate_v2.window_line(w, flips_of.get(name)))
         p = gate_v2.verdict(windows, [flips_of[n] for n in names] if flips_of else None)
@@ -894,13 +899,16 @@ def compare(a):
           f"q99 {stats['kl_q']['q99']:.2e}; true token worse {stats['worse']} better {stats['better']}; copy rows "
           f"{stats['copy_rows']} misses ref {stats['copy_miss_ref']} cand {stats['copy_miss']} (copy dNLL {stats['copy_dnll']:+.5f})")
     null_rows, null_stats, null_prompt_kl = [], [], {name: [] for name in names}
-    null_prompt = {name: {"nll": [], "top1": []} for name in names}   # per-row NLL and top-1 of each null (v2)
+    null_results = []
+    null_prompt = {name: {"nll": [], "top1": [], "kl": []} for name in names}   # per-row NLL / KL, top-1 of each null (v2)
     for dn, mn in nulls:  # pooled exactly like the candidate: same reference, same prompts, same labels
         rs = [compare_logits(da, ma, dn, mn, name, tok_of[name]) for name in names]
+        null_results.append(rs)
         for name, r in zip(names, rs):
             null_prompt_kl[name].append(float(r["kl"].mean()))
             null_prompt[name]["nll"].append(r["nll_cand"])
             null_prompt[name]["top1"].append(float(r["agree"].mean()))
+            null_prompt[name]["kl"].append(r["kl"])
         st = arm_stats(rs, copy_masks)
         null_stats.append(st)
         null_rows.append({"dir": str(dn), "run_id": mn[0]["run_id"], "arm": mn[0]["arm"], "env": mn[0]["env"],
@@ -951,6 +959,10 @@ def compare(a):
     sel = f"; selection {sel_slot_diff}/{sel_slots} slots differ, {sel_id_diff} ids" if sel_seen else ""
     print(f"POOLED rows {report['pooled']['rows']}: KL {kl:.5f}, top-1 {top1:.4f}, dNLL {dnll:+.5f}, logits identical {identical}{sel} "
           f"[{rule}] -> {'PASS' if ok else 'FAIL'}")
+    if not a.expect_identical:
+        # Reported beside the verdict, not part of it: it classifies a failing window by its confident rows.
+        report["tail"] = tail_rule.tail_verdict(results, null_results, binom_sf=binom_sf)
+        print(f"TAIL (reported, not in the exit code) {tail_rule.describe(report['tail'], names)}")
     if a.json:
         pathlib.Path(a.json).write_text(json.dumps(report, indent=1, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
     return 0 if ok else 1

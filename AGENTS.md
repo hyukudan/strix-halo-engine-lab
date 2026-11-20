@@ -95,7 +95,12 @@ Support for a new model is a binding, not a new engine:
 ## Quality gate for FAST levers
 
 - Limits, pooled over the gate set: KL <= 0.02, top-1 agreement >= 0.93, dNLL <= 0.01. The pooled
-  limits are absolute.
+  limits remain absolute for the default quality verdict. The null floor is advisory by default; only an
+  explicit `qual --allow-null-floor` may use its relaxed pooled bars to decide PASS/FAIL. When enabled,
+  a pooled bar whose pooled null fails it or is within 2 null row standard errors of failing is relaxed to
+  `KL <= null + 0.02`, `top-1 >= null - 0.01` or `dNLL <= null + 0.01` (never stricter than the
+  absolute bar). The gate always prints the NULL-FLOOR diagnostic, including whether the policy was
+  enabled; it never relaxes a window, content class or route flip ratio.
 - The null of a window is the distance between two exact runs that differ only in evaluation order
   (one-ulp class), measured on that same window. A re-run that reproduces the same bits is not a
   null; an engine without a null arm gets no verdict (the tool refuses it) until it binds a null hook.

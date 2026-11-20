@@ -30,7 +30,7 @@ def rows_with_mean(n, mean, scale, rng):
 
 
 def window(name, n, kl, top1, dnll, null_kl, rng, hit=0.5, scale=0.05, null_top1=None, null_dnll=None, null_scale=None,
-           ref_nll=1.0, cls=None):
+           ref_nll=1.0, cls=None, null_kl_rows=None):
     agree = np.arange(n) < round(top1 * n)
     d = rows_with_mean(n, dnll, scale, rng)
     nll_ref = np.full(n, ref_nll)
@@ -39,7 +39,8 @@ def window(name, n, kl, top1, dnll, null_kl, rng, hit=0.5, scale=0.05, null_top1
     if null_dnll is not None:
         null_nlls = [nll_ref + rows_with_mean(n, null_dnll, null_scale or scale, rng)]
     return v2.window_stats(name, np.full(n, kl), agree, nll_ref, nll_ref + d, [null_kl], hits, hits,
-                           null_top1s=None if null_top1 is None else [null_top1], null_nlls=null_nlls, cls=cls)
+                           null_top1s=None if null_top1 is None else [null_top1], null_nlls=null_nlls, cls=cls,
+                           null_kl_rows=null_kl_rows)
 
 
 class Statistics(unittest.TestCase):
@@ -123,12 +124,113 @@ class Statistics(unittest.TestCase):
         self.assertAlmostEqual(p["dnll_se"], d.std(ddof=1) / np.sqrt(d.size))
         self.assertAlmostEqual(p["dnll"], 0.002)
         self.assertTrue(p["pass"])
-        # A window passing under its own null limit still counts in the pooled KL, whose limit stays 0.02.
-        ws = [window(f"w{i}", 256, 0.03, 0.97, 0.0, 0.03, self.rng) for i in range(4)]
+        # A window passing under its own null limit still counts in the pooled KL, whose limit stays 0.02 while the
+        # pooled null is measurably inside the bar (null KL 0.015 on every row: se 0).
+        ws = [window(f"w{i}", 256, 0.021, 0.97, 0.0, 0.015, self.rng, null_kl_rows=np.full(256, 0.015)) for i in range(4)]
         p = v2.verdict(ws)
         self.assertTrue(p["checks"]["windows"])
         self.assertFalse(p["checks"]["kl"])
+        self.assertFalse(p["null_floor"]["kl"]["engaged"])
         self.assertFalse(p["pass"])
+
+    def test_null_floor_relaxes_only_bars_the_null_itself_fails(self):
+        # GLM i4gate shape: 4 windows x 255 rows, pooled null top-1 0.9304 (binomial se 0.008: within 2 se of 0.93),
+        # null KL 0.141 and null dNLL +0.052 above their bars. Limits: KL 0.161, top-1 0.9204, dNLL 0.062.
+        def gate(top1, kl=0.13, dnll=0.005):
+            ws = [window(f"w{i}", 255, kl, top1, dnll, 0.141, self.rng, null_top1=0.9304, null_dnll=0.052,
+                         null_kl_rows=np.full(255, 0.141), scale=0.01) for i in range(4)]
+            return v2.verdict(ws, allow_null_floor=True)
+        p = gate(0.926)
+        f = p["null_floor"]
+        self.assertEqual(f["applied"], ["kl", "top1", "dnll"])
+        self.assertAlmostEqual(f["kl"]["limit"], f["kl"]["null"] + 0.02)
+        self.assertAlmostEqual(f["top1"]["limit"], f["top1"]["null"] - 0.01)
+        self.assertAlmostEqual(f["dnll"]["limit"], f["dnll"]["null"] + 0.01)
+        self.assertTrue(f["top1"]["null"] >= 0.93)          # the null passes the absolute top-1 bar by a hair ...
+        self.assertTrue(f["top1"]["engaged"])               # ... but not by 2 se: the floor engages
+        self.assertTrue(all(p["checks"][b] for b in ("kl", "top1", "dnll")))
+        self.assertEqual(f["decisive"], ["kl", "top1"])     # dNLL 0.005 passes the absolute bar as well
+        self.assertEqual(p["state"], "PASS")
+        line = v2.pooled_line(p)
+        self.assertIn("NULL-FLOOR", line)
+        self.assertIn("pass ONLY under the floor: kl,top1", line)
+        # a lever 0.032 below the null's top-1 (27-layer arm) fails the floor bar; one above null + 0.02 KL fails too
+        self.assertFalse(gate(0.898)["checks"]["top1"])
+        self.assertFalse(gate(0.926, kl=0.165)["checks"]["kl"])
+        self.assertFalse(gate(0.926, dnll=0.07)["checks"]["dnll"])
+
+    def test_null_floor_is_advisory_by_default(self):
+        ws = [window(f"w{i}", 255, 0.13, 0.926, 0.005, 0.141, self.rng,
+                     null_top1=0.9304, null_dnll=0.052, null_kl_rows=np.full(255, 0.141),
+                     scale=0.01) for i in range(4)]
+        strict = v2.verdict(ws)
+        self.assertEqual(strict["state"], "FAIL")
+        self.assertFalse(strict["null_floor"]["enabled"])
+        self.assertFalse(strict["checks"]["kl"])
+        self.assertFalse(strict["checks"]["top1"])
+        self.assertTrue(strict["null_floor"]["kl"]["pass"])
+        self.assertIn("ADVISORY ONLY", v2.pooled_line(strict))
+        self.assertIn("<= 0.02", v2.pooled_line(strict))
+        allowed = v2.verdict(ws, allow_null_floor=True)
+        self.assertTrue(allowed["null_floor"]["enabled"])
+        self.assertEqual(allowed["state"], "PASS")
+        self.assertTrue(allowed["checks"]["kl"])
+        self.assertTrue(allowed["checks"]["top1"])
+        self.assertIn("enabled by explicit opt-in", v2.pooled_line(allowed))
+
+    def test_null_floor_is_relax_only_and_off_for_a_clean_null(self):
+        # engaged (null 0.9405 within 2 se of 0.93) but null - 0.01 = 0.9305 is above the bar: the bar stays 0.93
+        ws = [window(f"w{i}", 255, 0.005, 0.931, 0.0, 0.004, self.rng, null_top1=0.9405, null_dnll=0.0)
+              for i in range(4)]
+        f = v2.verdict(ws)["null_floor"]
+        self.assertTrue(f["top1"]["engaged"])
+        self.assertFalse(f["top1"]["relaxed"])
+        self.assertEqual(f["top1"]["limit"], 0.93)
+        # a clean engine: every pooled null inside its bar, the floor is not applied and says so
+        ws = [window(f"w{i}", 255, 0.025, 0.97, 0.0, 0.004, self.rng, null_top1=0.99, null_dnll=0.0,
+                     null_kl_rows=np.full(255, 0.004)) for i in range(4)]
+        p = v2.verdict(ws)
+        self.assertEqual(p["null_floor"]["applied"], [])
+        self.assertFalse(p["checks"]["kl"])                 # 0.025 > 0.02, the absolute bar
+        self.assertIn("not applied", v2.pooled_line(p))
+        # without the null's per-row KL the KL band is 0; without null NLL / top-1 those bars stay absolute
+        ws = [window(f"w{i}", 255, 0.025, 0.97, 0.0, 0.019, self.rng) for i in range(4)]
+        f = v2.verdict(ws)["null_floor"]
+        self.assertFalse(f["kl"]["engaged"])
+        self.assertIsNone(f["top1"]["null"])
+        self.assertIsNone(f["dnll"]["null"])
+        # a wide per-row null KL (mean 0.019, se ~0.008) is not measurably inside 0.02: engaged, limit 0.039
+        rows = np.where(np.arange(255) % 10 == 0, 0.181, 0.001)
+        ws = [window(f"w{i}", 255, 0.025, 0.97, 0.0, float(rows.mean()), self.rng, null_kl_rows=rows) for i in range(4)]
+        f = v2.verdict(ws)["null_floor"]
+        self.assertTrue(f["kl"]["engaged"])
+        self.assertAlmostEqual(f["kl"]["limit"], float(rows.mean()) + 0.02)
+
+    def test_null_floor_pools_the_mean_of_several_nulls(self):
+        rng = self.rng
+        ws = []
+        for i in range(4):
+            nll_ref = np.full(255, 1.0)
+            ws.append(v2.window_stats(f"w{i}", np.full(255, 0.01), np.ones(255, bool), nll_ref, nll_ref + 0.012,
+                                      [0.009, 0.011], null_top1s=[0.97, 0.98],
+                                      null_nlls=[nll_ref + rows_with_mean(255, 0.014, 0.05, rng),
+                                                 nll_ref + rows_with_mean(255, 0.010, 0.05, rng)]))
+        f = v2.verdict(ws)["null_floor"]
+        self.assertAlmostEqual(f["kl"]["null"], 0.010)
+        self.assertAlmostEqual(f["top1"]["null"], 0.975)
+        self.assertAlmostEqual(f["dnll"]["null"], 0.012)       # mean of both nulls, not the first one
+        self.assertAlmostEqual(f["dnll"]["limit"], 0.022)
+        self.assertEqual(f["applied"], ["dnll"])
+
+    def test_null_floor_never_clears_a_failed_window(self):
+        ws = [window(f"w{i}", 255, 0.12, 0.93, 0.0, 0.141, self.rng, null_top1=0.9304, null_dnll=0.05,
+                     null_kl_rows=np.full(255, 0.141)) for i in range(3)]
+        ws.append(window("bad", 255, 0.25, 0.93, 0.0, 0.141, self.rng, null_top1=0.9304, null_dnll=0.05,
+                         null_kl_rows=np.full(255, 0.141)))   # 0.25 > 1.5 x 0.141 on its own window
+        p = v2.verdict(ws, allow_null_floor=True)
+        self.assertTrue(p["checks"]["kl"])                  # pooled 0.1525 <= 0.161 under the floor ...
+        self.assertFalse(p["checks"]["windows"])            # ... the window still fails
+        self.assertEqual(p["state"], "FAIL")
 
     def test_three_states_and_class_pooling(self):
         # review_rule A.3: a real loss on one content class (dNLL 0.03 = 3 x limit, 63-row windows, se ~0.02) is

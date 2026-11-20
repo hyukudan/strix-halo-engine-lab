@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <stdexcept>
 
 namespace {
 
@@ -91,6 +92,23 @@ int main() {
     // Non-finite values pass through.
     check(strix::core::fp16_ulp_up_bits(0x7f800000U) == 0x7f800000U, "inf unchanged", 0.0f);
     check(strix::core::fp16_ulp_up_bits(0x7fc00000U) == 0x7fc00000U, "nan unchanged", 0.0f);
+    // Gate null site parser (STRIX_DENSE_NULL): fields, bounds, rejection.
+    {
+        const auto ns = strix::core::parse_null_site("0:17:5119", 64U, 5120U, "N");
+        check(ns.layer == 0U && ns.pos == 17U && ns.elem == 5119U, "null site 0:17:5119", 0.0f);
+        const auto big = strix::core::parse_null_site("63:4294967295:0", 64U, 5120U, "N");
+        check(big.layer == 63U && big.pos == 4294967295ULL && big.elem == 0U, "null site bounds", 0.0f);
+        int rejected = 0;
+        for (const char* t : {"", "0", "0:1", "0:1:2:3", "64:0:0", "0:0:5120", "a:0:0", "0:-1:0", "0::0", ":0:0", "0:4294967296:0",
+                              "0:0:1 ", "00000000000:0:0"}) {
+            try {
+                (void)strix::core::parse_null_site(t, 64U, 5120U, "N");
+            } catch (const std::invalid_argument&) {
+                ++rejected;
+            }
+        }
+        check(rejected == 13, "null site rejects malformed or out-of-range text (13 cases)", static_cast<float>(rejected));
+    }
     std::printf("null_perturb tests: %s (absorbed f32 one-ulp nulls %d / 1000)\n", failures == 0 ? "PASS" : "FAIL", absorbed);
     return failures == 0 ? 0 : 1;
 }

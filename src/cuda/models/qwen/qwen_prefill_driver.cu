@@ -566,6 +566,10 @@ void Prefill::Impl::upload_model() {
     if(cfg.expert_arithmetic!=qwen_packs::ExpertArithmetic::incumbent && cfg.forms.moe_mma)
         throw std::invalid_argument("explicit GSQ expert arithmetic: single-chain moe_mma composition unqualified");
     if (!admission.pack) throw std::runtime_error("Qwen weight pack not admitted: " + admission.reason);
+    if (cfg.expert_narrow) {  // per-regime experts: the arithmetic outside the regime must be admitted for this pack too
+        const auto narrow = qwen_packs::admit_model(cfg.model_gguf, qwen_packs::expert_arithmetic_name(*cfg.expert_narrow));
+        if (!narrow.pack) throw std::runtime_error("Qwen weight pack not admitted outside the expert_turbo regime: " + narrow.reason);
+    }
     constexpr std::uint64_t kChunk = std::uint64_t{256} << 20;
     std::uint8_t* staging[2] = {nullptr, nullptr};
     ck(cudaMallocHost(&staging[0], kChunk), "pinned staging");
@@ -1720,7 +1724,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         mr.output = {routed_out, kHidden * 2};
         mr.csr = csr;
         moe::Weights ew;
-        ew.arithmetic=cfg.expert_arithmetic;
+        ew.arithmetic = expert_arithmetic_for(cfg, window, moe_rows);  // per regime (TURBO: int8 on large prefill blocks)
         ew.decode_tile = cfg.expert_decode_tile;
         ew.gate_type = lw[l].gate_type;
         ew.down_type = lw[l].down_type;
