@@ -19,6 +19,9 @@
 // (scale, bias, residual, a sum with an earlier pass) in the same store, so no second kernel re-reads the raw sums.
 //   open(i, ct, c) -> per-lane state for live column tile i of the launch (c = lane's column inside the tile)
 //   put(state, r, v): row r < rows, v = the WMMA chain's sum;  close(): once per thread after its last put.
+//   Pair mode (the store has Tile and put_pair(state, r, first, second)): the CTA's TC tiles are TC / 2 output tiles,
+//   tile t paired with tile t + TC / 2 (two products of the same outputs, e.g. gate and up); open() is called for
+//   tile t only and put_pair gets both chains' sums, so a combining epilogue (act(gate) * up) needs no second pass.
 //   run(f): calls f(s) with the object that has open/put/close. A policy with several modes switches on its
 //   (wave-uniform) mode here and passes a store whose mode is a compile-time constant: no per-element mode branches.
 // Row waves with no live row (the CTA past the last row) keep their staging and barrier duties and skip their row
@@ -152,6 +155,9 @@ template <class C> inline constexpr unsigned kCtaWaves = 8U;
 template <class C> requires requires { C::kWaves; } inline constexpr unsigned kCtaWaves<C> = C::kWaves;
 template <class C> inline constexpr bool kColumnFast = false;
 template <class C> requires requires { C::kColumnFast; } inline constexpr bool kColumnFast<C> = C::kColumnFast;
+
+// A store mode with the pair epilogue (see the Store policy notes at the top).
+template <class S> concept PairStoreMode = requires(S& s, const typename S::Tile& t) { s.put_pair(t, 0U, 0.0F, 0.0F); };
 
 // Pitch 36 dwords per column: b128 accesses stay aligned and columns rotate banks. 2,304 bytes per column tile.
 template <unsigned TC> struct alignas(16) Storage {
@@ -299,15 +305,32 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
     // acc[t][j] -> row row0 + 2 j + lane / 16, column 16 t + lane % 16. The policy's run() instantiates this loop once
     // per store mode it has, so a mode is chosen once per wave and never per element.
     store.run([&](auto& s) __attribute__((always_inline)) {
+        // Pair store (the mode has put_pair): tile t and tile t + TC / 2 hold two products of the same outputs (for
+        // example gate and up); open() sees tile t, put_pair gets both sums of the same lane slot. Same WMMA chains.
+        if constexpr (PairStoreMode<std::remove_cvref_t<decltype(s)>>) {
+            static_assert(TC % 2U == 0U, "a pair store needs an even tile count");
 #pragma unroll
-        for (unsigned t = 0; t < TC; ++t) {
-            const ColumnTile ct = cols.tile(cblock * TC + t);
-            if (!detail::uni(ct.live ? 1U : 0U)) continue;
-            const auto st = s.open(cblock * TC + t, ct, c);
+            for (unsigned t = 0; t < TC / 2U; ++t) {
+                const ColumnTile ct = cols.tile(cblock * TC + t);
+                if (!detail::uni(ct.live ? 1U : 0U)) continue;
+                const auto st = s.open(cblock * TC + t, ct, c);
 #pragma unroll
-            for (unsigned j = 0; j < 8U; ++j) {
-                const unsigned r = row0 + 2U * j + (lane >> 4U);
-                if (r < nr) s.put(st, r, acc[t][j]);
+                for (unsigned j = 0; j < 8U; ++j) {
+                    const unsigned r = row0 + 2U * j + (lane >> 4U);
+                    if (r < nr) s.put_pair(st, r, acc[t][j], acc[t + TC / 2U][j]);
+                }
+            }
+        } else {
+#pragma unroll
+            for (unsigned t = 0; t < TC; ++t) {
+                const ColumnTile ct = cols.tile(cblock * TC + t);
+                if (!detail::uni(ct.live ? 1U : 0U)) continue;
+                const auto st = s.open(cblock * TC + t, ct, c);
+#pragma unroll
+                for (unsigned j = 0; j < 8U; ++j) {
+                    const unsigned r = row0 + 2U * j + (lane >> 4U);
+                    if (r < nr) s.put(st, r, acc[t][j]);
+                }
             }
         }
         s.close();

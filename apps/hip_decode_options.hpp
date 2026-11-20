@@ -302,8 +302,6 @@ struct Options {
     bool yarn_mtp_draft_top2=false,yarn_mtp_q4_all=true,yarn_mtp_greedy_rows=true,yarn_mtp_pipeline=true;
     bool yarn_mtp_pool_off = false;
     bool ple_rolling_explicit_opt_in = false, qsa_mtp_pool_explicit_opt_in = false;
-    // Startup only: AUTO/capped HTTP batch fell back to the single runner and that slot does not fit with the pool.
-    bool qsa_mtp_pool_fallback_unfit = false;
     bool mtp_cli_phase_retirement = true;
     bool prefill_profile_automatic = false;
     bool prefill_profile_deferred = false;
@@ -1137,30 +1135,35 @@ inline void validate_resolved_teacher_forced_score(const Options& options, std::
     if (!o.mtp.enabled) return "not-mtp";
     if (o.yarn_mtp_pool_off) return "disabled";
     if (!qpf2k::long_context_item_enabled("STRIX_QSA_MTP_POOL",gsq) || o.baseline) return "disabled";
+    const bool qualified_rotary=o.rotary.mode()!=RotaryMode::yarn ||
+        (o.rotary.factor()==2U && o.context_tokens<=524288U) || (o.rotary.factor()==4U && o.context_tokens<=1048576U);
     const bool qualified_cli=!o.http_serve && o.session_load.empty() && o.session_save.empty() &&
         !o.session_live_control && o.session_then_prompt.empty() && !o.session_mtp_fixed &&
         !o.session_management_requested && !o.prefix_cache_host_bytes && o.prefix_cache_dir.empty() &&
         o.prefix_cache_then_prompts.empty() && o.serving_prefix_files.empty() && !o.rtx_state_import && !o.prefix_cache_roundtrip &&
-        o.mtp.sample_repeats==1U &&
-        (o.rotary.mode()!=RotaryMode::yarn ||
-         (o.rotary.factor()==2U && o.context_tokens<=524288U) ||
-         (o.rotary.factor()==4U && o.context_tokens<=1048576U));
-    // The single-request HTTP runner owns one service: every ordinary request starts a fresh epoch and the
-    // in-memory prefix-cache restore hook invalidates both domains. Batch slots, sessions, disk prefix restore,
-    // state import and YaRN HTTP keep the explicit opt-in. A resolved AUTO/capped batch that falls back to one
-    // slot is admitted only when startup charged the pool to that slot (qsa_mtp_pool_fallback_unfit).
-    const bool qualified_http_single=o.http_serve && !o.http_batch && !o.session_live_control &&
+        o.mtp.sample_repeats==1U && qualified_rotary;
+    // HTTP serving, the single runner and every batch slot alike: each request owner holds its own service (one
+    // per slot, charged per slot in the capacity fit), every admitted request starts a fresh epoch (batch
+    // admission and cancellation included), the in-memory prefix-cache restore hook invalidates both domains and
+    // the cohort cycle of concurrent slots scores each member from its own owner. Sessions, nested scheduling,
+    // disk prefix restore and state import keep the explicit opt-in. YaRN HTTP (single route only) takes the
+    // CLI's factor band, so the same request resolves the same pool route on both; YaRN batch slots keep the opt-in.
+    const bool qualified_http=o.http_serve && !o.session_live_control &&
         o.session_load.empty() && o.session_save.empty() && o.session_then_prompt.empty() && !o.session_mtp_fixed &&
         !o.session_management_requested && o.prefix_cache_dir.empty() && o.prefix_cache_then_prompts.empty() &&
         o.serving_prefix_files.empty() && !o.rtx_state_import && !o.prefix_cache_roundtrip &&
-        o.mtp.sample_repeats==1U && o.rotary.mode()!=RotaryMode::yarn && !o.qsa_mtp_pool_fallback_unfit;
+        o.mtp.sample_repeats==1U && (o.http_batch ? o.rotary.mode()!=RotaryMode::yarn : qualified_rotary);
     const char* explicit_on=std::getenv("STRIX_QSA_MTP_POOL");
-    if (!qualified_cli && !qualified_http_single && !o.qsa_mtp_pool_explicit_opt_in &&
+    if (!qualified_cli && !qualified_http && !o.qsa_mtp_pool_explicit_opt_in &&
         !(explicit_on && std::string_view(explicit_on)=="1"))
-        return o.qsa_mtp_pool_fallback_unfit ? "single-fallback-does-not-fit" : "unqualified-route-requires-STRIX_QSA_MTP_POOL=1";
+        return "unqualified-route-requires-STRIX_QSA_MTP_POOL=1";
     if (!qpf2k::long_context_item_enabled("STRIX_QSA_DECODE_POOL_BF16",gsq)) return "bf16-disabled";
     if (o.execution.mode==DecodeExecutionMode::graph || o.qsa_hierarchical_selection) return "unsupported-control";
-    if (!o.mtp.cohort.empty() || !o.mtp.copy_wide_rows.empty()) return "unconverted-writer-span";
+    // Wide copy cycles compose: their tiled owner never leases the pool (committed_pool is bound only on non-prefill
+    // owners), the next verify window leases certified at the new frontier and the lazy build refills the gap from
+    // the tiled rows' raw bytes; an abandoned cycle leaves only non-committed blocks behind. The CLI cohort keeps the
+    // decline (its planner charges one pool for every member).
+    if (!o.mtp.cohort.empty()) return "unconverted-writer-span";
     if (o.rotary.mode()==RotaryMode::yarn &&
         (!o.context_tokens || o.context_tokens>o.rotary.effective_max() ||
          o.rotary.factor()!=(o.context_tokens<=524288U?2U:4U))) return "unqualified-rotary";
@@ -1175,14 +1178,6 @@ inline void validate_resolved_teacher_forced_score(const Options& options, std::
     if (!qsa_mtp_pool_route(o,gsq) || model.full_attention_layers!=12 || model.indexer_head_dim!=128 ||
         model.indexer_n_heads!=4 || model.indexer_compress_ratio!=4) return 0;
     return mtp_qsa_pool_plan(o.context_tokens).reserved_bytes;
-}
-// AUTO or capped HTTP batch serving falls back to the single runner when startup capacity is one slot. Batch
-// sizing excludes the pool; startup charges it to that slot again before the single route keeps it.
-[[nodiscard]] inline bool qsa_mtp_pool_single_fallback_pending(const Options& o,bool gsq=false) {
-    if (!o.http_serve || o.session_live_control || !o.http_batch || (o.http_batch_explicit && o.http_batch_cap==1U) ||
-        qsa_mtp_pool_route(o,gsq)) return false;
-    auto single=o;single.http_batch=0;
-    return qsa_mtp_pool_route(single,gsq);
 }
 
 // The prefix state cache restores and captures whole tiled blocks: it runs only on the tiled
@@ -1800,10 +1795,35 @@ inline void validate_resolved_mtp_cli(const Options& o) {
             (o.http_serve?" --prefetch-q8-lm-head":"")+" (greedy window rows; STRIX_MTP_GREEDY_ROWS=0 keeps per-row selectors)");
 }
 
+// YaRN serving above the native extent (opt-in: explicit --rope-yarn). The position descriptor is already data in
+// every cache identity (prefix entry namespace and session numerical config: session_numerical_config; cache family
+// numerical contract), so a YaRN entry never meets a native one. Admitted: the single greedy HTTP MTP route and an
+// explicit prefix state cache budget (the automatic budget declines "rotary-cache-unqualified" until a receipt row
+// exists). Batch/cohort serving, sampling and session save/restore keep their named refusals.
+inline bool yarn_http_single_route(const Options& o) noexcept {
+    return o.http_serve && o.http_batch_explicit && !o.http_batch_cap && !o.http_batch && !o.session_live_control;
+}
+inline bool yarn_admitted_serving_flag(std::string_view flag) noexcept {
+    for (const std::string_view admitted : {"--http-serve","--http-batch","--http-bind","--http-port","--http-model-id",
+            "--http-api-key-file","--http-max-connections","--http-max-queue","--http-default-max-tokens",
+            "--http-sse-keepalive","--http-sse-progress-interval","--http-stream-receipts","--http-capabilities",
+            "--http-responses","--http-thinking-budget","--http-anthropic-thinking-budget",
+            "--prefix-cache","--prefix-cache-host-bytes","--prefix-cache-dir","--prefix-cache-disk","--prefix-cache-disk-bytes",
+            "--prefix-cache-every","--prefix-cache-block-rows","--prefix-cache-retention","--prefix-cache-staging-bytes",
+            "--prefix-cache-inflight","--prefix-cache-durable"})
+        if (flag == admitted) return true;
+    return false;
+}
 inline std::string yarn_route_refusal(const Options& o) {
     if (o.session_options_requested || !o.session_save.empty() || !o.session_load.empty())
         return "YaRN with session save/restore not yet qualified";
-    if (prefix_state_cache_requested(o)) return "YaRN with prefix state cache not yet qualified";
+    if (prefix_state_cache_requested(o) && !o.prefix_cache_host_bytes)
+        return "YaRN prefix state cache requires an explicit --prefix-cache-host-bytes";
+    if (!o.prefix_cache_then_prompts.empty()) return "YaRN prefix state cache follow-up prompts not yet qualified";
+    if (o.http_serve && !o.mtp.enabled) return "YaRN HTTP serving requires the MTP route";
+    if (o.http_batch || (o.http_serve && !yarn_http_single_route(o)))
+        return "YaRN HTTP serving requires the single route --http-batch 0 (batch/cohort rotary sites not audited)";
+    if (o.http_serve && o.http_sampling == "sample") return "YaRN HTTP sampling not supported (greedy only)";
     if (o.mtp.enabled) {
         if(o.rotary.factor()!=(o.context_tokens<=524288U?2U:4U))
             return "YaRN MTP requires f2 at C<=524288 and f4 at C<=1048576";
@@ -1822,6 +1842,7 @@ inline std::string yarn_route_refusal(const Options& o) {
                flag=="--known-prefill-uma-budget" || flag=="--known-prefill-host-headroom" ||
                flag=="--known-prefix-workspace-budget-bytes" || flag=="--known-prefix-host-metadata-budget-bytes" ||
                flag=="--known-prefix-uma-budget-bytes" || flag=="--known-prefix-host-headroom-bytes") continue;
+            if(yarn_admitted_serving_flag(flag)) continue;
             const std::array canonical_flags{
                 "--parallel-hyper-mix","--staged-hyper-projections","--fused-staged-hyper-mix",
                 "--typed-fused-hyper-projections","--prefetch-typed-hyper-rows","--prefetch-q8-hyper-output",
@@ -1835,7 +1856,6 @@ inline std::string yarn_route_refusal(const Options& o) {
             return "YaRN MTP explicit target override not supported: "+flag;
         }
     } else if(o.mtp.supplied) return "YaRN MTP parameters require --mtp";
-    if (o.http_serve || o.http_batch) return "YaRN on HTTP serving not supported";
     if (o.teacher_forced_score) return "YaRN with teacher scoring not yet qualified";
     if (o.execution.mode != DecodeExecutionMode::eager || o.gdn_islands || o.prepared_eager)
         return "YaRN graph capture path not yet qualified";

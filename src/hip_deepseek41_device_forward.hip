@@ -1339,26 +1339,25 @@ void DeviceForward::exchange_host(std::span<const std::byte> out, std::span<std:
     auto& m = *impl_;
     if (!m.distributed()) throw std::logic_error("deepseek41 device forward: exchange_host needs world 2");
     if (!in.empty() && out.size() != in.size()) throw std::invalid_argument("deepseek41 device forward: exchange_host sizes differ");
-    // STRIX_DS41_HOST_EXCHANGE=1: host to host through the communicator's pinned buffers (no device round trip; the same
-    // messages on the wire, so the peer may use either path). Default: through the device control buffer.
-    static const bool host_only = [] {
-        const char* v = std::getenv("STRIX_DS41_HOST_EXCHANGE");
-        return v != nullptr && std::string_view(v) == "1";
-    }();
-    if (host_only) {
-        for (std::size_t at = 0; at < out.size(); at += Impl::control_chunk) {
-            const std::size_t n = std::min(Impl::control_chunk, out.size() - at);
-            m.options.communicator->exchange_host(out.subspan(at, n), in.empty() ? std::span<std::byte>{} : in.subspan(at, n),
-                                                  dist::Tag{static_cast<std::uint32_t>(dist::TagKind::control), 0xC1U, at});
-        }
-        return;
-    }
-    if (m.control.p == nullptr) m.control = Dev<std::uint8_t>(2U * Impl::control_chunk);
+    // Host-routed chunks (every chunk up to the host route's limit, 64 KiB on the default table): host to host through
+    // the communicator's pinned buffers, the same messages on the wire (trailer, sequence, CRC), so the peer may use
+    // either path. The caller's buffers may be written or read by work queued on the model stream, so the stream is
+    // drained once first, as the device round trip ends drained. Device-routed chunks (a GPU-direct route) and
+    // STRIX_DS41_HOST_EXCHANGE=0: through the device control buffer.
+    static const bool host_control = strix::envcfg::flag("STRIX_DS41_HOST_EXCHANGE", true);
+    bool drained = false;
     for (std::size_t at = 0; at < out.size(); at += Impl::control_chunk) {
         const std::size_t n = std::min(Impl::control_chunk, out.size() - at);
+        const dist::Tag tag{static_cast<std::uint32_t>(dist::TagKind::control), 0xC1U, at};
+        if (host_control && m.options.communicator->host_routed(n)) {
+            if (!drained) check(hipStreamSynchronize(m.stream), "control");
+            drained = true;
+            m.options.communicator->exchange_host(out.subspan(at, n), in.empty() ? std::span<std::byte>{} : in.subspan(at, n), tag);
+            continue;
+        }
+        if (m.control.p == nullptr) m.control = Dev<std::uint8_t>(2U * Impl::control_chunk);
         check(hipMemcpyAsync(m.control.p, out.data() + at, n, hipMemcpyHostToDevice, m.stream), "control upload");
-        m.options.communicator->exchange(m.stream, m.control.p, m.control.p + Impl::control_chunk, n,
-                                         dist::Tag{static_cast<std::uint32_t>(dist::TagKind::control), 0xC1U, at});
+        m.options.communicator->exchange(m.stream, m.control.p, m.control.p + Impl::control_chunk, n, tag);
         if (!in.empty())  // an empty `in`: the peer's bytes are not wanted
             check(hipMemcpyAsync(in.data() + at, m.control.p + Impl::control_chunk, n, hipMemcpyDeviceToHost, m.stream), "control download");
         check(hipStreamSynchronize(m.stream), "control");
@@ -2753,14 +2752,16 @@ const std::vector<std::uint32_t>& DeviceForward::run_step(std::span<const std::u
                         std::copy(u.begin(), u.end(), out + gs);
                         std::copy(d.begin(), d.end(), out + 2U * gs);
                     }));
-                for (auto& f : copies) f.get();
-                m.stream_seconds += seconds_since(t0);
+                // Each expert's upload is queued as soon as its own read is in staging, not after every read: the copy
+                // engine moves expert j while later reads still run. Same bytes, slots and kernels as before.
                 for (std::size_t j = 0; j < experts.size(); ++j) {
+                    copies[j].get();
                     const std::uint8_t* in = m.slot_pinned + j * (2U * gs + ds);
                     check(hipMemcpyAsync(m.slot_gate.p + j * gs, in, gs, hipMemcpyHostToDevice, st), "expert gate");
                     check(hipMemcpyAsync(m.slot_up.p + j * gs, in + gs, gs, hipMemcpyHostToDevice, st), "expert up");
                     check(hipMemcpyAsync(m.slot_down.p + j * ds, in + 2U * gs, ds, hipMemcpyHostToDevice, st), "expert down");
                 }
+                m.stream_seconds += seconds_since(t0);  // reads + upload enqueue (the reads dominate)
                 const std::vector<std::uint32_t> counts{static_cast<std::uint32_t>(routes.experts.size()), routes.max_rows};
                 m.built.experts.upload(routes.experts, st);
                 m.built.begins.upload(routes.begins, st);

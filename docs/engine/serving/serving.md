@@ -1184,8 +1184,10 @@ encode|plain|decode FILE` exposes the tokenizer on the command line; MODEL may a
 - Batched: prompt blocks of several requests may form a segmented group; one native prompt unit owns the shared
   prefill arena at a time. With more than four decoding requests a cycle forms several 8-row cohort windows (two
   rows per request); joint planning (`STRIX_MTP_BATCH_JOINT=1`) runs in groups of at most eight requests.
-- YaRN mode (`--rope-yarn`) is CLI-only: the HTTP server refuses it (MTP is available on the explicit CLI route), and a request cannot
-  change the rotary mode.
+- YaRN mode (`--rope-yarn F --context C`, opt-in, above 262,144) serves only on the single greedy MTP route
+  (`--http-batch 0`); batch slots, sampling and sessions refuse by name. The prefix state cache needs an explicit
+  `--prefix-cache-host-bytes` (charged in the YaRN memory admission; the automatic budget stays off). Cache and
+  session keys bind the rotary descriptor, so YaRN and native entries never mix. A request cannot change the rotary mode.
 - Every built slot holds a full context of state memory and its own window owners; memory grows with the built
   slots. A nested prompt pauses the long prompt for its own prefill; boundary cancellation is not on the
   one-at-a-time route.

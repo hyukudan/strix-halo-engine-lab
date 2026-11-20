@@ -118,6 +118,8 @@ inline const std::vector<EnvItem>& env_items() {
          "Measurement: prefill dense rows v4 runs the exact projections on the shared FMA-rows core, same ascending fmaf chain, bitwise == v3; exact two-node prefill 12.68 / 12.69 s vs 12.81 s at 8,192 tokens, logits / state / token hashes equal (=3 restores v3). Dense rows v3 groups the projections of one input (KDA f_a / g_a / b, DSA wk / gate / weights_proj) in one 128 x 64 launch, same ascending fmaf chain, bitwise == v2; grouped calls 6.77 vs 9.33 ms (KDA) and 6.62 vs 8.98 ms (DSA) at 8192 rows; TTFT 14.34 -> 14.29 s at 8,192 tokens (=2 restores v2, =1 v1)", false, true},
         {"pf-dense-form-auto", "STRIX_GLM_PF_DENSE_FORM", "0", "0",
          "Guard: physical form of dense rows v4 (shared FMA-rows core), read only with STRIX_GLM_PF_DENSE_ROWS=4: 0 selects the form per shape, 1..7 force one form where the shape admits it (diagnostic; every form gives the same bytes)", false, true},
+        {"spec-arbiter", "STRIX_SPEC_ARBITER", "1", "0",
+         "Measurement: each MTP cycle chooses plain / MTP chain / prompt lookup (<= 7 drafts) with the shared strix::spec Arbiter, priced from the replicated cost table (both ranks decide the same); tokens stay the greedy tokens (verify, fnv equal), pair ABBA 256 tokens 20.4 -> 15.1 ms/token at 1K, 21.1 -> 15.0 at 6K, 19.7 -> 13.7 on a copy prompt (=0 restores the MTP chain alone)", false, true},
         {"max-rows-auto", "STRIX_GLM_MAX_ROWS_AUTO", "1", "0",
          "Measurement: exact 8192 vs 4096 rows, 8K TTFT -4 %, 32K 116.3 -> 109.9 s (-5.5 %); +7.3 GiB per rank", false, true},
         {"pf-staged", "STRIX_GLM_PF_STAGED", "1", "0",
@@ -250,6 +252,7 @@ struct Effective {
     bool mtp_spec_candidate = false;
     unsigned kmax = 3;
     bool adaptive = true;
+    bool spec_arbiter = false;  // STRIX_SPEC_ARBITER (env_items row; MTP decode only)
     std::string prefill;  // resolved: gemv | ref | wmma
     std::string xch;
     std::map<std::string, Value> env;  // env name -> effective value
@@ -373,6 +376,9 @@ inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& 
         throw std::invalid_argument("STRIX_GLM_PF_SEQPAR must be 0, 1 or auto");
     (void)strix::glm::pf::parse_scratch_policy(e.env.at("STRIX_GLM_PF_SCRATCH").value.c_str());
     (void)strix::glm::pf::parse_query_window_policy(e.env.at("STRIX_GLM_PF_ATTN_QWIN").value.c_str());
+    const auto& arbiter = e.env.at("STRIX_SPEC_ARBITER").value;
+    if (arbiter != "0" && arbiter != "1") throw std::invalid_argument("STRIX_SPEC_ARBITER must be 0 or 1");
+    e.spec_arbiter = arbiter == "1";
     e.world = r.world;
     return e;
 }

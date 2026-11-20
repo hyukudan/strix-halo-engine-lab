@@ -503,6 +503,23 @@ template <class Site> __device__ __forceinline__ const typename Site::Input* row
     if constexpr (requires { site.row_input(r); }) return site.row_input(r);
     else return static_cast<const typename Site::Input*>(site.input[r]);
 }
+// A Site window of Site::rows rows run by a kernel of P > Site::rows rows: rows Site::rows..P - 1 read the last row again
+// and are never stored, so every stored row keeps its own FMA chains and trees (the per-row contract: the bits of R1).
+template <class Site, unsigned P> struct PaddedRows : Site {
+    static_assert(P > Site::rows);
+    static constexpr unsigned rows = P;
+    __device__ const typename Site::Input* row_input(unsigned r) const {
+        return ::strix::q8_rows::row_input(static_cast<const Site&>(*this), r < Site::rows ? r : Site::rows - 1U);
+    }
+    __device__ void store(std::uint32_t o, unsigned r, float value) const {
+        if (r < Site::rows) Site::store(o, r, value);
+    }
+};
+// Narrowest FP32 input whose 6- and 7-row windows take the padded 8-row VOPD kernel. Measured (gfx1151, cold weights,
+// median of 24, projection shapes 1536..8192 wide): project_rows_kernel R6 / R7 cost 1.1x..1.7x the padded R8 VOPD
+// call (8192 -> 3072: R6 254 / R7 259 us vs 151 us), the stepped kernel at 6144 -> 2560 R6 176 / R7 217 us vs 93 us;
+// 1024-wide inputs lose (1024 -> 8192: R6 63 vs 77 us).
+constexpr std::uint32_t kPaddedMinWidth = 1536U;
 template <class Site, unsigned Outs, unsigned Sub>
 __global__ __launch_bounds__(kThreads) void project_wide_rows_kernel(Site site) {
     using Input = typename Site::Input;
@@ -2166,7 +2183,7 @@ template <class Site> void launch(const Site& site, bool a8, hipStream_t stream,
     if constexpr (Site::rows <= 8U && iu4_group_of<Site>() != 0U)
         if (launch_iu4_rows(site, stream, any_order, nullptr)) return;
     if (a8) { launch_dense_a8(site, stream, any_order); return; }
-    const auto start = [&](auto kernel, unsigned blocks, unsigned threads, std::uint32_t bytes, const Site& args) {
+    const auto start = [&](auto kernel, unsigned blocks, unsigned threads, std::uint32_t bytes, const auto& args) {
         if (any_order)
             hipExtLaunchKernelGGL(kernel, dim3(blocks), dim3(threads), bytes, stream, nullptr, nullptr, hipExtAnyOrderLaunch, args);
         else hipLaunchKernelGGL(kernel, dim3(blocks), dim3(threads), bytes, stream, args);
@@ -2196,6 +2213,17 @@ template <class Site> void launch(const Site& site, bool a8, hipStream_t stream,
                 start(kernel, blocks, 32U * waves, 0U, site);
                 return;
             }
+        }
+    }
+    // Verify windows of 6 and 7 rows, FP32 inputs from kPaddedMinWidth up: the 8-row VOPD kernel over PaddedRows (the
+    // last row read again for the missing rows, never stored); it also replaces the stepped kernel there.
+    // STRIX_Q8_ROWS_VOPD=0 disables this with the 4/8-row path.
+    if constexpr (fused_fma_of<Site>() && sizeof(typename Site::Input) == 4U && (Site::rows == 6U || Site::rows == 7U)) {
+        if (!a8 && narrow_vopd() != 0U && site.width >= std::max(kPaddedMinWidth, narrow_fp32_min_width())) {
+            PaddedRows<Site, 8U> padded{};
+            static_cast<Site&>(padded) = site;
+            start(project_wide_rows_coef_kernel<PaddedRows<Site, 8U>, 4U, 4U, 4U, true>, (site.outputs + 3U) / 4U, 64U, 0U, padded);
+            return;
         }
     }
     if constexpr (Site::rows > 8U) {

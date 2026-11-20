@@ -526,7 +526,13 @@ inline void select_mtp_bundle_golden(Options& options, const ModelContract& mode
     const auto identity=mtp_bundle_golden_identity(options,model);
     const auto shipped=std::filesystem::path(options.mtp_bundle_path).parent_path()/"goldens"/(identity+".golden");
     const auto cached=std::filesystem::is_regular_file(shipped)?shipped:mtp_golden_cache_dir()/(identity+".golden");
-    options.mtp.golden=std::filesystem::is_regular_file(cached)?cached.string():std::string{};
+    // Path and pin travel together (as main pins the ensured golden): the serving pre-load check verifies the digest.
+    if (std::filesystem::is_regular_file(cached)) {
+        options.mtp.golden=cached.string();
+        options.mtp.golden_sha256=model_content_identity_hex(sha256_file_content(cached,FileHashPolicy::cached));
+    } else {
+        options.mtp.golden.clear();options.mtp.golden_sha256.clear();
+    }
 }
 inline EffectiveConfig initialize_prefill_config(const RequestedOptions& request) {
     EffectiveConfig result;
@@ -2223,11 +2229,10 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
         << (config.environment.contains("STRIX_BITCALC_LOGITS_OUT") ? "true" : "false")
         << ",\"forced_tokens\":"
         << (config.environment.contains("STRIX_BITCALC_FORCE_TOKENS") ? "true" : "false") << "},";
-    // AUTO/capped HTTP batch owns no pool; a one-slot fallback re-admits it at startup (stderr qsa-mtp-pool line).
-    if(const bool pooled=qsa_mtp_pool_route(o,config.gsq_owner); pooled || qsa_mtp_pool_single_fallback_pending(o,config.gsq_owner)) {
+    // HTTP batch slots own one pool each (charged per slot); startup admission still decides (stderr qsa-mtp-pool line).
+    if(qsa_mtp_pool_route(o,config.gsq_owner)) {
         const auto plan=mtp_qsa_pool_plan(o.context_tokens);
-        out << "\"qsa_mtp_pool\":{\"requested\":true,\"effective\":\""
-            << (pooled?"runtime-admission-required":"single-fallback-only") << "\",\"route\":\""
+        out << "\"qsa_mtp_pool\":{\"requested\":true,\"effective\":\"runtime-admission-required\",\"route\":\""
             << (!o.http_serve?"cli":o.http_batch?"http-batch":"http-single") << "\",\"source\":\""
             << (o.qsa_mtp_pool_explicit_opt_in?"STRIX_QSA_MTP_POOL=1":"default")
             << "\",\"format\":\"bf16\",\"entries\":13,\"key_bytes\":"

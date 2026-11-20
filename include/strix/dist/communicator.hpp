@@ -60,6 +60,7 @@ struct Trailer {
 };
 static_assert(sizeof(Trailer) == 128);
 inline constexpr std::uint32_t trailer_crc_deferred = 1U; // this message's CRC travels in the next trailer
+inline constexpr std::uint32_t trailer_host_control = 2U; // sent by exchange_host() (carries and checks like exchange())
 
 // CRC-32C (Castagnoli) of the payload; SSE4.2 when available. STRIX_DIST_CRC_PARALLEL=1
 // selects vector folding when supported, otherwise three independent chains on
@@ -236,12 +237,15 @@ public:
     // STRIX_DIST_HOST_CRC_OVERLAP=1 additionally prepares TX CRCs and validates RX
     // chunks on persistent workers while the progress thread moves other chunks.
     void exchange(hipStream_t stream, const void* local, void* remote, std::size_t bytes, const Tag& tag);
-    // One-way device transfer of `bytes` (GPU-direct routes only): the sending rank passes sending = true and its
-    // device buffer, the receiving rank sending = false and the buffer to fill; both at the same point with the same
-    // size and tag. Nothing travels in the unused direction and no early receive is posted. The receiver's GPU checks
-    // the in-band identity and checksum as for exchange(); check_exchanges() reports a refusal. Returns false, with
-    // nothing sent, when this size has no pure device route (host or mixed route, or an engine without a one-way
-    // form): the caller then uses its host path. Both ranks get the same answer (same route table).
+    // One-way transfer of `bytes` of a device buffer: the sending rank passes sending = true and its device buffer, the
+    // receiving rank sending = false and the buffer to fill; both at the same point with the same size and tag. Nothing
+    // travels in the unused direction and no early receive is posted, on every route: host (the sender copies to the
+    // pinned buffer and sends payload + trailer, the receiver receives, checks trailer and CRC, copies to the device),
+    // pure device (the receiver's GPU checks the in-band identity and checksum; check_exchanges() reports a refusal) and
+    // mixed (the host head and the device tail, each one way, at the same time). Deferred CRCs ride with the messages a
+    // rank sends: the sender carries its pending one, the receiver checks the one the sender carries. Returns false, with
+    // nothing sent, only when the route uses a device engine without a one-way form (the caller then uses exchange()).
+    // Both ranks get the same answer (same route table and engine).
     [[nodiscard]] bool transfer(hipStream_t stream, bool sending, void* device, std::size_t bytes, const Tag& tag);
     // The same exchange in two halves, so that work enqueued in between overlaps the transfer. start()
     // enqueues the copy of `local` on `stream` and returns; the progress thread waits on the CPU for that
@@ -252,8 +256,9 @@ public:
     // Host-resident payloads (control frames, forwarded messages): `local` goes straight into the pinned send buffer and
     // the peer's message is copied out of the pinned receive buffer into `remote` (empty: not wanted), with no device
     // buffer and no device copy on either side of the wire. The message on the wire (payload, trailer, sequence) is the
-    // same as exchange()'s, so a peer may use either call for the same collective. The calling thread does the transfer;
-    // not between start() and finish().
+    // same as exchange()'s (identity, sequence, CRC, and the deferred-CRC carry in both directions), so a peer may use
+    // either call for the same collective, also right after ready-view (deferred CRC) exchanges. The calling thread does
+    // the transfer; not between start() and finish().
     void exchange_host(std::span<const std::byte> local, std::span<std::byte> remote, const Tag& tag);
     // Agree before an optional collective changes the pair's protocol. Both ranks
     // call this even when locally disabled; either refusal selects the old path.
@@ -341,6 +346,9 @@ public:
     // nothing in flight here: e.g. an in-process A/B of XferExchange against CommExchange).
     [[nodiscard]] Transport& transport() noexcept { return *transport_; }
     [[nodiscard]] const DeviceExchange* device_exchange() const noexcept { return direct_.get(); }
+    // Whether exchange() of `bytes` takes the host path (no device exchange, or the route table puts this size on the
+    // host transport): then exchange_host() moves the same message with no device copy. Both ranks the same answer.
+    [[nodiscard]] bool host_routed(std::size_t bytes) const { return !direct_ || !route(bytes).direct; }
     // The size router (with a device exchange): STRIX_DIST_ROUTE=table (default: the measured table; with host
     // streams, small messages on the host path, two rings up to 1 MB, mixed 35 % host above; without, one ring up to
     // 32 KB, two up to 256 KB, every ring above),
@@ -412,6 +420,11 @@ private:
     bool trace_pending_ = false;
     void flush_trace();
     void validate_peer(bool deferred = false); // the peer's trailer and CRC of the received message (deferred: identity only)
+    // The one trailer builder and peer check of every host message (start_host's job, exchange_host): identity, the
+    // carried deferred CRC (taken: tx_carry_ is reset) and, for the peer, the carry against rx_pending_ (cleared).
+    // Carry state belongs to the progress thread: callers on the caller thread drain_tail() first.
+    [[nodiscard]] Trailer make_trailer(std::size_t bytes, const Tag& tag, std::uint32_t flags);
+    void check_peer_trailer(const Trailer& peer, std::size_t bytes, const Tag& tag, bool deferred);
     // Bounded waits (STRIX_DIST_WAIT_TIMEOUT_MS, default 120000): the producer's copy, the reuse of the receive buffer,
     // and the progress job. On expiry (or any failed host exchange) the communicator stops for good, prints its state
     // (the collective in flight and its phase, the last collectives, the streams' progress) to stderr and closes the

@@ -20,6 +20,7 @@
 //          v_add eps (:156647); v_rsq_f32 (:156656); inv*v (:156667), *w (:156670), gate*(.) (:156674) with
 //          gate = 1/(1+expf(-z)).
 #include "strix/cuda/qwen_gdn.hpp"
+#include "strix/cuda/qwen_gdn_prepass.hpp"
 #include "../../../attn_core/recurrent_state.hpp"
 #include "../../../cuda_core/gdn/gdn_lanes.cuh"
 
@@ -139,29 +140,37 @@ __global__ __launch_bounds__(256) void gates_kernel(const std::uint16_t* __restr
 // The HIP kernel walks all rows of a head in one block with an LDS ring. Rows are independent given their 3 predecessors'
 // raw BF16 inputs, so here a block owns (head, 32-row chunk); a prepass saves each chunk's 3 preceding raw rows (from the
 // workspace or the old history) and writes the new history, before any row is overwritten in place.
+// The body saves the taps of chunks [first, last); `history` = this call owns the old history (reads it, then writes the new
+// one). Split rule (include/strix/cuda/qwen_gdn_prepass.hpp): only chunk 0's taps and a history of count < 4 rows read the
+// old history, so the caller that covers chunk 0 owns it and every other caller reads workspace rows only.
+static_assert(qwen_gdn::prepass::kChunk == kConvChunk && qwen_gdn::prepass::kHistory == kConvKernel && qwen_gdn::prepass::kTaps == 3U,
+    "conv prepass split rule matches the conv shape");
 __device__ __forceinline__ void conv_prepass_body(const Rows& rows, std::uint32_t count, std::uint16_t* conv_state,
-    std::uint16_t* __restrict__ boundary) {
+    std::uint16_t* __restrict__ boundary, unsigned first, unsigned last, bool history) {
     const unsigned ch = blockIdx.x * 256U + threadIdx.x;
     if (ch >= kConvWidth) return;
-    std::uint16_t old[kConvKernel];
+    std::uint16_t old[kConvKernel] = {};
+    if (history)
 #pragma unroll
-    for (unsigned i = 0; i < kConvKernel; ++i) old[i] = conv_state[static_cast<std::uint64_t>(ch) * kConvKernel + i];
-    const auto raw = [&](int row) -> std::uint16_t {  // row >= -3; rows -3..-1 are taps 1..3 (:2823-2824)
+        for (unsigned i = 0; i < kConvKernel; ++i) old[i] = conv_state[static_cast<std::uint64_t>(ch) * kConvKernel + i];
+    const auto raw = [&](std::int64_t row) -> std::uint16_t {  // row >= -3; rows -3..-1 are taps 1..3 (:2823-2824)
         return row >= 0 ? float_to_bf16(rows.qkv[static_cast<std::uint64_t>(row) * rows.stride + ch]) : old[row + 4];
     };
-    const unsigned chunks = (count + kConvChunk - 1U) / kConvChunk;
-    for (unsigned c = 0; c < chunks; ++c)
+    for (unsigned c = first; c < last; ++c)
 #pragma unroll
         for (unsigned j = 0; j < 3U; ++j)
-            boundary[(static_cast<std::uint64_t>(c) * 3U + j) * kConvWidth + ch] = raw(static_cast<int>(c * kConvChunk + j) - 3);
+            boundary[(static_cast<std::uint64_t>(c) * 3U + j) * kConvWidth + ch] = raw(qwen_gdn::prepass::tap_row(c, j));
+    if (!history) return;
     // history = raw inputs of rows count-4 .. count-1 (:2858-2859; ring slot of row -k is tap 4-k)
 #pragma unroll
     for (unsigned i = 0; i < kConvKernel; ++i)
-        conv_state[static_cast<std::uint64_t>(ch) * kConvKernel + i] = raw(static_cast<int>(count) - 4 + static_cast<int>(i));
+        conv_state[static_cast<std::uint64_t>(ch) * kConvKernel + i] = raw(qwen_gdn::prepass::history_row(count, i));
 }
+// grid (channel blocks, chunks): block y saves chunk y's taps (one DRAM round trip per thread instead of one per chunk);
+// the block of chunk 0 owns the history.
 __global__ __launch_bounds__(256) void conv_prepass_kernel(Rows rows, std::uint32_t count, DevRef<std::uint16_t> conv_ref,
     std::uint16_t* __restrict__ boundary) {
-    conv_prepass_body(rows, count, conv_ref.get(), boundary);
+    conv_prepass_body(rows, count, conv_ref.get(), boundary, blockIdx.y, blockIdx.y + 1U, blockIdx.y == qwen_gdn::prepass::kHistoryChunk);
 }
 // Segment views: the rows of segment `seg` start at its row (every field shifts by the same stride).
 __device__ __forceinline__ Rows segment_rows(const Rows& rows, std::uint32_t row) {
@@ -171,7 +180,8 @@ __device__ __forceinline__ Rows segment_rows(const Rows& rows, std::uint32_t row
 // one grid slice (blockIdx.y) per segment; boundary of segment i at boundary + i * 3 * kConvWidth (one chunk: count <= 32)
 __global__ __launch_bounds__(256) void conv_prepass_multi_kernel(Rows rows, Segments segs, std::uint16_t* __restrict__ boundary) {
     const Segment& s = segs.s[blockIdx.y];
-    conv_prepass_body(segment_rows(rows, s.row), s.count, s.conv.get(), boundary + static_cast<std::uint64_t>(blockIdx.y) * 3U * kConvWidth);
+    conv_prepass_body(segment_rows(rows, s.row), s.count, s.conv.get(), boundary + static_cast<std::uint64_t>(blockIdx.y) * 3U * kConvWidth,
+        0U, qwen_gdn::prepass::chunks(s.count), true);
 }
 
 // Conv history after the first `keep` rows of a window: the prepass rule (raw inputs of rows keep-4 .. keep-1, older taps
@@ -556,7 +566,8 @@ void launch_conv_ref(const Rows& rows, std::uint32_t count, DevRef<std::uint16_t
     if (rows.stride % 4U || reinterpret_cast<std::uintptr_t>(rows.qkv) % 16U)
         throw std::invalid_argument("qwen_gdn: qkv rows must be 16-byte aligned");
     auto* boundary = static_cast<std::uint16_t*>(scratch);
-    conv_prepass_kernel<<<(kConvWidth + 255U) / 256U, 256, 0, stream>>>(rows, count, conv_state, boundary);
+    conv_prepass_kernel<<<dim3((kConvWidth + 255U) / 256U, prepass::chunks(count)), 256, 0, stream>>>(rows, count, conv_state,
+        boundary);
     check(cudaGetLastError(), "conv prepass launch");
     conv_kernel<<<dim3(kKeyHeads * 2U + kValueHeads, (count + kConvChunk - 1U) / kConvChunk), 256, 0, stream>>>(rows, count,
         boundary, w.conv, w.qk_l2_epsilon, t);

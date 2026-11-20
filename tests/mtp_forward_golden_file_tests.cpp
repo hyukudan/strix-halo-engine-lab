@@ -1,4 +1,5 @@
 #include "strix/mtp_forward_golden_file.hpp"
+#include "strix/mtp_forward_payload.hpp"
 #include "strix/model_content_hash.hpp"
 #include "strix/mtp_payload_geometry.hpp"
 #include <array>
@@ -174,6 +175,8 @@ int main() {
             v3.prompt_prefill_profile_identity=15;
             const auto bytes3=encode_mtp_forward_golden_file(v3,4096);
             expect(bytes3.size()==manual.size()+120U,"v3 exact header extent");
+            expect(mtp_forward_golden_v3_file_bytes(v3.rows.size(),v3.rows.front().target_hidden_bf16.size(),
+                v3.rows.front().full_logits.size())==bytes3.size(),"pending golden charge equals the encoded v3 extent");
             file.write(bytes3);
             require_mtp_forward_golden_geometry(file.path,v3.rows.size(),v3.rows.front().target_hidden_bf16.size(),
                 v3.rows.front().full_logits.size(),v3.context_capacity);

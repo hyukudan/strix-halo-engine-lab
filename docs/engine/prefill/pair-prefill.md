@@ -48,11 +48,14 @@ host CRC-32C of the same bytes, bit for bit; the control stream (piece CRC, whol
 consumption ACK) is unchanged; native logit equality remains pending. Pieces of 64 KiB or less and the
 host-only transport keep the host path.
 
-Host or mixed communicator routes decline `transfer()` and use the symmetric fallback,
-including reverse scratch traffic. With host streams available, the default route table
-selects a mixed route above 1 MiB: a full 16 MiB seam piece uses that fallback, with host
-staging for the mixed share. Selecting `usb4gpu` alone does not establish a copy-free or
-one-way transfer; inspect the route table and actual one-way/byte counters.
+`transfer()` is one way on every communicator route: on a host route the sender sends and
+the receiver receives and checks the trailer; on a mixed route (the default table's choice
+above 1 MiB, so every full 16 MiB seam piece) the host head and the device tail each go one
+way at the same time. No scratch payload travels in the unused direction and no early
+receive is posted. Only a device engine without a one-way form declines, and the piece then
+takes the symmetric fallback. Selecting `usb4gpu` alone does not establish a copy-free
+transfer (the mixed share is staged on the host); inspect the route table and actual
+one-way/byte counters.
 
 `STRIX_PAIR_LINK_ONE_WAY=0` restores the symmetric exchange (a full-size scratch payload in
 the unused direction); both ranks must set it the same way. `STRIX_PAIR_LINK_DEVICE_CRC=0`
