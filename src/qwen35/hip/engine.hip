@@ -521,8 +521,8 @@ void mlp(const Tensor& g, const Tensor& u, const Tensor& d, const float* x, floa
                           wide_iu4_ok(d, wide, rows) && g.outputs == u.outputs && g.inputs == u.inputs && d.inputs == g.outputs;
     if (fuse && pair && wide_glu && fast4_emu() == 0 && wide_iu4_x16(g, wide, rows) && wide_iu4_x16(d, wide, rows)) {
         namespace iu = core::f16_dense_tall::iu4a16;
-        iu::GluView gv{wide_iu4_view(g, x, nullptr, rows), static_cast<const std::uint8_t*>(u.data), nullptr,
-                       reinterpret_cast<_Float16*>(wide.g)};
+        iu::GluView gv{wide_iu4_view(g, x, nullptr, rows), static_cast<const std::uint8_t*>(u.data), nullptr, nullptr};
+        gv.h = reinterpret_cast<decltype(gv.h)>(wide.g);
         gv.second_scale = reinterpret_cast<const std::uint16_t*>(gv.second_weight + core::dense_iu4::packed_bytes(u.outputs, u.inputs));
         if (iu::glu_pair_supported(gv)) {
             x16_tiles(x, wide.xt, rows, g.inputs, s);

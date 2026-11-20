@@ -82,7 +82,7 @@ inline bool map2_supported(unsigned) { return false; }
 template <class F> void enqueue_quantise_map2(const float*, const float*, unsigned, const Act&, hipStream_t) { runtime_require(false); }
 }
 struct WideScratch : core::DenseWideScratch { Half* xt = nullptr; core::iu4a4_dense::Act a4{}; };
-struct Tensor { unsigned fmt = 30, inputs = 1, outputs = 1; };
+struct Tensor { unsigned fmt = 30, inputs = 1, outputs = 1; const void* data = nullptr; };
 unsigned limit = 0;
 float* base_out = nullptr;
 std::vector<unsigned> seen;
@@ -122,6 +122,19 @@ template <class Q> struct WithQ { using type = Q; };
 template <class K> void with_tile_quantiser(K&& k) { k(WithQ<core::f16_dense_tall::TileRne>{}); }
 void x16_tiles(const float*, Half*, unsigned, unsigned, hipStream_t) { runtime_require(false); }
 void silu_mul_host(const float*, const float*, float*, std::size_t) {}
+// engine.hip GLU pair sweep of the IU4 wide windows (core/f16_dense_iu4.hpp iu4a16::GluView, enqueue_glu_x16): taken
+// only with type-200 weights and x16 support (wide_iu4_x16 above is false), so unreachable here.
+int fast4_emu() { return 0; }
+namespace strix::core::dense_iu4 {
+inline std::size_t packed_bytes(unsigned, unsigned) { return 0; }
+}
+namespace strix::core::f16_dense_tall::iu4a16 {
+struct View {};
+struct GluView { View first; const std::uint8_t* second_weight; const std::uint16_t* second_scale; Half* h; };
+inline bool glu_pair_supported(const GluView&) { return false; }
+template <class F> void enqueue_glu_x16(const GluView&, const Half*, hipStream_t) { runtime_require(false); }
+}
+core::f16_dense_tall::iu4a16::View wide_iu4_view(const Tensor&, const float*, float*, unsigned) { return {}; }
 #include "audit_hip.inc"
 #include "audit_cli.inc"
 #include "audit_lengths.inc"
