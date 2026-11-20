@@ -426,6 +426,11 @@ if(BUILD_TESTING)
     target_compile_features(strix-dist-transport-spec-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-dist-transport-spec-tests)
     add_test(NAME strix-dist-transport-spec-tests COMMAND strix-dist-transport-spec-tests)
+    add_executable(strix-dist-link-cost-tests tests/dist_link_cost_tests.cpp)
+    target_include_directories(strix-dist-link-cost-tests PRIVATE include)
+    target_compile_features(strix-dist-link-cost-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-dist-link-cost-tests)
+    add_test(NAME strix-dist-link-cost-tests COMMAND strix-dist-link-cost-tests)
 
     add_executable(strix-device-profile-host-tests tests/device_profile_host_tests.cpp src/device_profile.cpp)
     target_include_directories(strix-device-profile-host-tests PRIVATE include)
@@ -3427,6 +3432,12 @@ int main() { return 0; }"
     if(STRIX_CHECK_KERNEL_SCRATCH)
         strix_check_kernel_scratch(strix-hip-decode-token)
     endif()
+    # Shared Channel instantiation of the TP slot gathers (src/xport/tp_gather*.hpp): the pair gather link's channel route,
+    # bound by every family's exact TP decode (qwen35 dense, hy4).
+    add_library(strix_tp_xport STATIC src/xport/tp_gather.hip)
+    set_target_properties(strix_tp_xport PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+    target_link_libraries(strix_tp_xport PUBLIC strix_dist)
+    target_include_directories(strix_tp_xport PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
     if(STRIX_FAMILY_QWEN35_HIP)
         # HipEngine (window engine: forward_rows + commit(k)) over the shared HIP cores; both apps bind it.
         add_library(strix_qwen35_hip_engine STATIC src/qwen35/hip/engine.hip src/qwen35/config.cpp src/qwen35/family.cpp)
@@ -3439,7 +3450,7 @@ int main() { return 0; }"
         target_include_directories(strix_qwen35_hip_engine PRIVATE src)  # attn_core headers include "attn_core/..."
         add_executable(strix-hip-qwen35-decode apps/hip_qwen35_decode_main.hip)
         set_target_properties(strix-hip-qwen35-decode PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-        target_link_libraries(strix-hip-qwen35-decode PRIVATE strix_qwen35_hip_engine strix_spec)
+        target_link_libraries(strix-hip-qwen35-decode PRIVATE strix_qwen35_hip_engine strix_spec strix_dist strix_device strix_tp_xport)  # --tp-rank: pair link, topology rates
         # N-rank layer split over the topology declaration + shared planner + shared layer pipeline (one rank = the
         # decode app's path); --self-cut runs the one-process cut test of the engine's range hooks.
         add_executable(strix-hip-qwen35-pair apps/hip_qwen35_pair_main.hip)
@@ -3449,6 +3460,11 @@ int main() { return 0; }"
         add_executable(strix-hip-qwen35-spec apps/hip_qwen35_spec_main.hip)
         set_target_properties(strix-hip-qwen35-spec PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
         target_link_libraries(strix-hip-qwen35-spec PRIVATE strix_qwen35_hip_engine strix_spec)
+        # Measurement probe: IU4 decode projection split by output columns (run_cols) - bits vs the full launch, us per share.
+        add_executable(strix-hip-dense-iu4-cols-probe tools/hip_dense_iu4_cols_probe.hip)
+        set_target_properties(strix-hip-dense-iu4-cols-probe PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_include_directories(strix-hip-dense-iu4-cols-probe PRIVATE src include)
+        target_link_libraries(strix-hip-dense-iu4-cols-probe PRIVATE strix_hip_runtime strix_core)
         if(BUILD_TESTING)
             # Shared FAST policy dense-iu4a16-f16-v1 (IU4 wide prefill windows): decode bits + GEMM error
             add_executable(strix-hip-f16-dense-iu4-tests tests/hip_f16_dense_iu4_tests.hip)
@@ -6628,6 +6644,12 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-hy4-placement-tests)
     add_test(NAME strix-hy4-placement-tests COMMAND strix-hy4-placement-tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/hy4/q4km-component-bytes.tsv)
+    # Hy4-flash exact tensor-parallel layout (strix/hy4/tp_layout.hpp): shares tile, MoE join, planner joins = step gathers.
+    add_executable(strix-hy4-tp-layout-tests tests/hy4_tp_layout_tests.cpp)
+    target_include_directories(strix-hy4-tp-layout-tests PRIVATE include)
+    target_compile_features(strix-hy4-tp-layout-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-hy4-tp-layout-tests)
+    add_test(NAME strix-hy4-tp-layout-tests COMMAND strix-hy4-tp-layout-tests)
     # Shared prompt windows (strix/session/prompt_windows.hpp) and the two-stage window picker.
     add_executable(strix-prompt-windows-tests tests/prompt_windows_tests.cpp)
     target_include_directories(strix-prompt-windows-tests PRIVATE include)
@@ -6642,6 +6664,39 @@ if(BUILD_TESTING)
     target_link_libraries(strix-pair-layer-pipeline-tests PRIVATE Threads::Threads)
     strix_target_warnings(strix-pair-layer-pipeline-tests)
     add_test(NAME strix-pair-layer-pipeline-tests COMMAND strix-pair-layer-pipeline-tests)
+    # Exact tensor-parallel decode shares (strix/pair/column_split.hpp): units by rate, joined shares == one rank.
+    add_executable(strix-pair-column-split-tests tests/pair_column_split_tests.cpp)
+    target_include_directories(strix-pair-column-split-tests PRIVATE include)
+    target_compile_features(strix-pair-column-split-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-pair-column-split-tests)
+    add_test(NAME strix-pair-column-split-tests COMMAND strix-pair-column-split-tests)
+    # One stage description, per-regime split plan (strix/pair/split_plan.hpp): dense binding == its hand model,
+    # slot joins bitwise == one rank, regime -> form, bit-changing joins refused.
+    add_executable(strix-pair-split-plan-tests tests/pair_split_plan_tests.cpp)
+    target_include_directories(strix-pair-split-plan-tests PRIVATE include)
+    target_compile_features(strix-pair-split-plan-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-pair-split-plan-tests)
+    add_test(NAME strix-pair-split-plan-tests COMMAND strix-pair-split-plan-tests)
+    # Rank-local head layouts + all-gather join + split argmax (strix/pair/tp_layout.hpp): joined == one rank.
+    add_executable(strix-pair-tp-layout-tests tests/pair_tp_layout_tests.cpp)
+    target_include_directories(strix-pair-tp-layout-tests PRIVATE include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_features(strix-pair-tp-layout-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-pair-tp-layout-tests)
+    add_test(NAME strix-pair-tp-layout-tests COMMAND strix-pair-tp-layout-tests)
+    # Shared TP gather link (routes, slot swap, host waits, tag sequence) + placement inputs (rates, measured trip cost).
+    add_executable(strix-pair-tp-gather-tests tests/pair_tp_gather_tests.cpp)
+    target_include_directories(strix-pair-tp-gather-tests PRIVATE include)
+    target_compile_features(strix-pair-tp-gather-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-pair-tp-gather-tests)
+    add_test(NAME strix-pair-tp-gather-tests COMMAND strix-pair-tp-gather-tests)
+    # Interleaved virtual stages of the layer pipeline (StageMap on two ranks): prefill + decode bitwise == one rank.
+    add_executable(strix-pair-layer-stages-tests tests/pair_layer_stages_tests.cpp)
+    target_include_directories(strix-pair-layer-stages-tests PRIVATE include)
+    target_compile_features(strix-pair-layer-stages-tests PRIVATE cxx_std_20)
+    target_link_libraries(strix-pair-layer-stages-tests PRIVATE Threads::Threads)
+    strix_target_warnings(strix-pair-layer-stages-tests)
+    add_test(NAME strix-pair-layer-stages-tests COMMAND strix-pair-layer-stages-tests)
+    set_tests_properties(strix-pair-layer-stages-tests PROPERTIES TIMEOUT 60)
     add_executable(strix-qwen-chain-plan apps/qwen_chain_plan_main.cpp)
     target_include_directories(strix-qwen-chain-plan PRIVATE include)
     target_compile_features(strix-qwen-chain-plan PRIVATE cxx_std_20)
@@ -6790,7 +6845,7 @@ if(STRIX_FAMILY_HY4)
     target_link_libraries(strix_hy4_hip PUBLIC strix_hy4_ref strix_hip_runtime strix_q4k_a8_hip_probe strix_engram strix_ds41_hip)
     strix_target_warnings(strix_hy4_hip)
     add_executable(strix-hy4-rank apps/hy4_rank_main.cpp)
-    target_link_libraries(strix-hy4-rank PRIVATE strix_hy4_hip strix_dist strix_device strix_spec)  # pair: shared layer pipeline + link; copy proposer
+    target_link_libraries(strix-hy4-rank PRIVATE strix_hy4_hip strix_dist strix_device strix_spec strix_tp_xport)  # pair: shared layer pipeline + link (gather channel); copy proposer
     strix_target_warnings(strix-hy4-rank)
     add_executable(strix-hy4-rows apps/hy4_rows_main.cpp)  # verify rows bench + speculative decode (hy4_hip_rows)
     target_link_libraries(strix-hy4-rows PRIVATE strix_hy4_hip strix_spec)

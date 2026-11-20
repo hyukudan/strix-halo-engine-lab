@@ -103,6 +103,20 @@ node B: strix-hy4-rank PART1.gguf PART2.gguf --rank 1 --peer NODE_A --ids-file p
 window width: `--prompt-rows R`, or a calibration `--window-costs ROWS:MS,...` (half-window milliseconds per width,
 measured on the deployment) from which it picks the width with the shortest pipeline wall.
 
+Exact tensor-parallel decode (both nodes hold the whole pack and prefill the prompt alone; every decode step is split):
+
+```
+node A: strix-hy4-rank PART1.gguf PART2.gguf --tp-rank 0 --tp-rates 217,217 --ids-file prompt.ids --gen 128 --context 4160 --prompt-rows 1024 --top 0
+node B: strix-hy4-rank PART1.gguf PART2.gguf --tp-rank 1 --tp-rates 217,217 --ids-file prompt.ids --gen 128 --context 4160 --prompt-rows 1024 --top 0
+```
+
+Attention is split by heads, o_proj, the layer-0 FFN, the shared expert and the head by rows, the routed experts by
+slot (8 + 8 of the 16); 128 all-gathers per token on the shared pair gather link (`--tp-transport`, default
+`usb4auto`) join the shares. Every split output is a whole result of the same kernel and the joins are
+concatenations, so the ids equal one node. At start-up both ranks measure the link and the shared split planner prints
+`tp placement:`; it refuses the pair when the pair is predicted slower (`--tp-force` runs it anyway, `--tp-trip-us`
+replaces the measured trip).
+
 ## Measured
 
 Class (see [Arithmetic class](#arithmetic-class)): the default-path line is BASE; the table rows use the FAST lever
@@ -127,8 +141,13 @@ Engram rows the prompt reads are almost all repeats and a real-text prompt is sl
 
 At 4096 tokens the pair reproduced the one-node greedy ids and last-position logits digest.
 
-The pair does not speed up decode: for one token the two halves run one after the other, and the hop adds to it.
-Decode reads about 9.7 GiB of weights per token, so one node is close to its memory-bandwidth floor.
+The layer split does not speed up decode: for one token the two halves run one after the other, and the hop adds to
+it. Decode reads about 9.7 GiB of weights per token, so one node is close to its memory-bandwidth floor.
+
+Exact tensor-parallel decode (1024-token prompt, 128 greedy ids, device greedy pick, host-staged gather route), one
+node | pair | one node in one sequence: 16.52 | 19.92 | 16.51 tok/s (step median 60.5 | 49.9 | 60.5 ms); the pair's
+ids equal one node's on both ranks (and 300 of 300 in a longer run). Each rank reads about 56 % of the one-node
+bytes per token; the rest of the step is the 128 gathers.
 
 ## Tests
 

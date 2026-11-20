@@ -12,7 +12,11 @@
 //   token with the token relayed back: the same work as one node, so the ids and logits equal the one-node run.
 #include "hy4/hip/hy4_hip_forward.hpp"
 #include "hy4/hip/hy4_hip_plan.hpp"
+#include "strix/hy4/tp_layout.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/pair/layer_pipeline.hpp"
+#include "strix/pair/tp_inputs.hpp"
+#include "xport/tp_gather_hip.hpp"
 #include "strix/pair/link.hpp"
 #include "strix/pair/link_flags.hpp"
 #include "strix/profiles/hy4.hpp"
@@ -28,6 +32,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
@@ -274,6 +279,15 @@ int run(int argc, char** argv) {
     std::uint32_t gen = 0, top = 5, cut = 0, repeat = 1;
     std::uint16_t port = 29755;
     bool timing = false, rows_explicit = false, pipe_guess = false;
+    // Exact tensor-parallel decode over 2 whole-model ranks (Forward::enable_tp; the shared gather link and planner, as the
+    // Qwen dense TP binding): --tp-rank 0|1 [--tp-transport usb4auto|tcp-listen:PORT|tcp-connect:HOST:PORT]
+    // --tp-rates GB/s,GB/s [--tp-trip-us U] [--tp-force]. Each rank loads the whole pack and prefills alone; the decode
+    // steps run on both ranks with this rank's shares; the plan refuses the pair when it does not win (unless forced).
+    int tp_rank = -1;
+    std::string tp_spec = "usb4auto";
+    std::vector<double> tp_rates;
+    double tp_trip_us = 0.0;
+    bool tp_force = false;
     std::string dump_path;  // --dump-logits F: every host logits row (FP32, vocab floats per step) appended to F
     std::vector<strix::hy4::hipbind::PairWindowCost> window_costs;  // --window-costs ROWS:MS,... (pair calibration)
     // The tier word (--profile default|fast|quality, --allow-pending) through the shared resolver; the lever options
@@ -300,6 +314,14 @@ int run(int argc, char** argv) {
         else if (a == "--cut" && more) cut = static_cast<std::uint32_t>(std::stoul(args[++i]));
         else if (a == "--repeat" && more) repeat = static_cast<std::uint32_t>(std::stoul(args[++i]));
         else if (a == "--port" && more) port = static_cast<std::uint16_t>(std::stoul(args[++i]));
+        else if (a == "--tp-rank" && more) tp_rank = static_cast<int>(std::stoul(args[++i]));
+        else if (a == "--tp-transport" && more) tp_spec = args[++i];
+        else if (a == "--tp-trip-us" && more) tp_trip_us = std::stod(args[++i]);
+        else if (a == "--tp-force") tp_force = true;
+        else if (a == "--tp-rates" && more) {
+            std::stringstream ss(args[++i]);
+            for (std::string v; std::getline(ss, v, ',');) tp_rates.push_back(std::stod(v));
+        }
         else if (a == "--pipe-guess" && more) {
             const std::string v = args[++i];
             if (v != "copy" && v != "off") throw std::invalid_argument("--pipe-guess copy|off");
@@ -334,6 +356,18 @@ int run(int argc, char** argv) {
               << static_cast<double>(lr.bytes) / 1073741824.0 << " s=" << std::setprecision(2) << lr.seconds << " GiB/s="
               << (lr.seconds > 0 ? static_cast<double>(lr.bytes) / 1073741824.0 / lr.seconds : 0.0) << "\n"
               << lr.queue_line << std::flush;
+    std::unique_ptr<strix::xport::tp_gather::HipPairGather> tpg;
+    if (tp_rank >= 0) {  // after the load: the peer may load slower; open_pair waits up to its timeout
+        if (tp_rank > 1 || o.prompt_rows == 0U || tp_rates.size() != 2U)
+            throw std::invalid_argument("--tp-rank 0|1 needs --prompt-rows (each rank prefills alone) and --tp-rates A,B (GB/s)");
+        auto opened = strix::dist::open_pair(tp_spec, static_cast<std::uint32_t>(tp_rank));
+        if (!opened.receipt.empty()) std::cout << "tp transport: " << opened.receipt << "\n";
+        // largest gather: half the logits row (vocab / 2 FP32); the link probe sizes fit in 1 MiB
+        // route: the shared policy (pair::select_route); the device-waited channel unless STRIX_TP_CHANNEL=0 (staged)
+        tpg = std::make_unique<strix::xport::tp_gather::HipPairGather>(std::move(opened), static_cast<std::uint32_t>(tp_rank), 1U << 20,
+                                                                       static_cast<hipStream_t>(fwd.stream_handle()),
+                                                                       strix::envcfg::flag("STRIX_TP_CHANNEL", true));
+    }
     std::ofstream dump;
     if (!dump_path.empty()) {
         dump.open(dump_path, std::ios::binary | std::ios::trunc);
@@ -369,8 +403,50 @@ int run(int argc, char** argv) {
                   << t.total << "]\n";
         p0 = prompt.size() - 1U;
     }
+    // tp placement, decided once from measurements: both ranks first run kTpCalib decode-form steps one node (each holds
+    // the whole pack, so the ids are the split form's ids), the smaller of the last two is this rank's one-node pass,
+    // agreed max over the ranks; the planner prices the stage model's residual as fixed work on every rank
+    // (split::with_measured_single), the trip comes from the start-up probe of the route the decode runs. One node wins ->
+    // both ranks keep decoding one node (the same ids); --tp-force runs the split anyway.
+    constexpr std::size_t kTpCalib = 3U;
+    std::vector<double> tp_calib_ms;
+    bool tp_placed = !tpg, tp_on = false;
+    double tp_ms = 0.0;
+    std::size_t tp_steps = 0;
+    const auto tp_place = [&] {
+        namespace psp = strix::pair::split;
+        auto stages = strix::hy4::tp::decode_stages(c, [&](const std::string& n) { return fwd.tensor_bytes(n); });
+        std::vector<double> bpms;
+        for (const double g : tp_rates) bpms.push_back(g * 1e6);  // GB/s -> bytes/ms
+        const auto n = tp_calib_ms.size();
+        const double one_ms = tpg->agree_max(std::min(tp_calib_ms[n - 1U], tp_calib_ms[n - 2U]));
+        const auto cal = psp::with_measured_single(stages, psp::Pass{}, *std::min_element(bpms.begin(), bpms.end()), one_ms);
+        // trip cost measured now over the gather form the decode runs, agreed by both ranks (identical bits)
+        const auto lc = tpg->measure_link();
+        const auto trip = strix::pair::tp::trip_cost(lc, tp_trip_us);
+        const auto plan = psp::plan(stages, psp::Pass{}, psp::Costs{bpms, trip, 0.0, false});
+        const bool wins = plan.tensor.admissible && plan.tensor.ms < plan.single.ms;
+        std::cout << "tp calibration: one node pass " << std::setprecision(1) << one_ms << " ms measured (" << kTpCalib
+                  << " one-node steps, agreed max), stage model " << cal.model_ms << " ms, fixed residual " << cal.fixed_ms << " ms\n"
+                  << "tp link cost: " << lc.describe() << "; trip " << trip.latency_ms * 1000.0 << " us"
+                  << (tp_trip_us > 0.0 ? " (--tp-trip-us)" : " (measured)") << ", " << strix::pair::gather_route_name(tpg->link().route())
+                  << "\ntp placement: one rank " << plan.single.ms << " ms/pass, 2 ranks " << plan.tensor.ms << " ms/pass (compute "
+                  << plan.tensor.compute_ms << " + " << plan.tensor.trips << " trips " << plan.tensor.link_ms << ") -> "
+                  << (wins ? "decode on all ranks" : tp_force ? "group loses, forced" : "decode stays on one node (both ranks)") << "\n";
+        if (!wins && !tp_force) return;
+        fwd.enable_tp(static_cast<std::uint32_t>(tp_rank), {&tpg->link(), &strix::xport::tp_gather::HipPairGather::Link::fn});
+        if (plan.tensor.trips != fwd.tp_gathers_per_step())
+            throw std::logic_error("tp: planner trips differ from the step's gathers");
+        tpg->link().reset_counters();
+        tp_on = true;
+        std::cout << fwd.tp_receipt() << "\n" << std::flush;
+    };
     for (std::size_t p = p0; p < steps; ++p) {
         if (p < prompt.size()) token = prompt[p];
+        if (!tp_placed && tp_calib_ms.size() >= kTpCalib) {
+            tp_place();
+            tp_placed = true;
+        }
         const auto s0 = clock::now();
         const bool batched = o.prompt_rows != 0U && p + 1U == prompt.size();
         const bool device = top == 0U && !batched;  // --top 0: the shared device greedy row, no logits on the host
@@ -380,6 +456,11 @@ int run(int argc, char** argv) {
         if (dump && !logits.empty())
             dump.write(reinterpret_cast<const char*>(logits.data()), static_cast<std::streamsize>(logits.size() * sizeof(float)));
         (p < prompt.size() ? prompt_ms : gen_ms) += step_ms;
+        if (!tp_placed && !batched) tp_calib_ms.push_back(step_ms);
+        if (tp_on && !batched) {
+            tp_ms += step_ms;
+            ++tp_steps;
+        }
         std::vector<std::uint32_t> order(logits.size());
         std::iota(order.begin(), order.end(), 0U);
         const auto k = std::min<std::size_t>(std::max<std::size_t>(top, 1U), order.size());
@@ -405,12 +486,19 @@ int run(int argc, char** argv) {
             token = g < teacher.size() ? teacher[g] : next;
         }
     }
+    if (tpg) tpg->finish();  // the channel's last gathers are checked before any result is printed
     std::cout << "ids";
     for (const auto id : generated) std::cout << ' ' << id;
     const auto gen_steps = gen > 1U ? gen - 1U : 0U;
     std::cout << "\n" << std::setprecision(1) << "time prompt_ms=" << prompt_ms << " gen_ms=" << gen_ms
               << " total_ms=" << std::chrono::duration<double, std::milli>(clock::now() - t0).count() << " decode_tok_s="
               << std::setprecision(2) << (gen_ms > 0 ? 1000.0 * gen_steps / gen_ms : 0.0) << "\n";
+    if (tpg)
+        std::cout << fwd.tp_receipt() << "\ntp link: " << tpg->link().calls() << " gathers, host time in the exchange "
+                  << std::setprecision(1) << tpg->link().link_ms() << " ms (" << std::setprecision(3)
+                  << (tp_steps > 0 ? tpg->link().link_ms() / static_cast<double>(tp_steps) : 0.0) << " ms/step); split steps "
+                  << tp_steps << " decode_tok_s=" << std::setprecision(2)
+                  << (tp_ms > 0 ? 1000.0 * static_cast<double>(tp_steps) / tp_ms : 0.0) << "\n";
     return 0;
 }
 

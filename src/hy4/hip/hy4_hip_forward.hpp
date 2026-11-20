@@ -150,6 +150,25 @@ public:
     void set_timing(bool on) noexcept;  // per-stage device sync for StepTimes (a first-receipt aid, not a tuned path)
     [[nodiscard]] const StepTimes& times() const noexcept;
 
+    // ---- exact tensor parallelism over two whole-model ranks (decode steps; strix/pair/gather_link.hpp) ----
+    // After enable_tp every step() computes this rank's share and joins it with the peer's through `gather` (the shared
+    // GatherLink::fn binding): attention by heads (gate, q_b, rope, K_b, query image, flash, V_b, gate) then o joined,
+    // o_proj by output rows then joined; layer-0 FFN gate/up by rows (act joined), down by rows (joined); MoE routed
+    // slots 8 + 8 (A8 probe / down at ids + 8 rank) and shared gate/up by rows, one join of [slot rows | shared act];
+    // head by vocabulary rows (logits joined). Router, latent down/up, shared down, HC sites, norms, Engram, indexer
+    // and the greedy pick stay replicated. Every split output is a whole per-head / per-row / per-slot result of the
+    // same kernel and the joins are concatenations (the combine runs over all 16 slot rows in slot order): bitwise the
+    // one-node step. Both ranks must run the same step sequence (each gather is a symmetric swap). Prefill, prefill
+    // windows and verify rows stay per rank (each rank runs the whole prompt). Whole-model rank only.
+    struct TpGather {
+        void* ctx = nullptr;
+        void (*fn)(void* ctx, void* stream, void* slots, std::size_t slot_bytes, std::size_t bytes) = nullptr;
+    };
+    void enable_tp(std::uint32_t rank, TpGather gather);
+    [[nodiscard]] std::uint32_t tp_gathers_per_step() const noexcept;  // 0 before enable_tp
+    [[nodiscard]] std::string tp_receipt() const;                      // one line: rank, shares, gathers and bytes per step
+    [[nodiscard]] std::uint64_t tensor_bytes(const std::string& name) const noexcept;  // loaded tensor bytes (0: absent)
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

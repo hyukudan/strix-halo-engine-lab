@@ -5589,3 +5589,77 @@ envelope of the known-rows MoE down (`PrefillRows::rawdots_bf16`).
 - **Measured gain:** One node, 4096-token bench prompt (a ~66-token sequence repeated), 2048-row windows, alternated
   A-B / B-A: warm prompt 7,680 / 7,694 ms -> 7,307 / 7,409 ms (-4.3 %), cold 7,879 / 7,942 -> 7,593 / 7,557 ms (-4.2 %).
 - **Implementation / evidence:** [dense core](../src/core/f16_dense_q8a8.hpp), [known-rows down](../src/hip_moe_q4k_a8_known_rows.hip), [binding](../src/hy4/hip/hy4_hip_forward.hip)
+
+### Qwen 27B exact tensor-parallel decode over two nodes
+
+**Engine:** `qwen35` (HIP, IU4 dense). **Control:** `--tp-rank 0|1` on both ranks (`--tp-transport`, `--tp-rates`,
+`--tp-trip-us`, `--tp-force`); levers `STRIX_TP_F16_GATHER` and `STRIX_TP_SPLIT_DRAFT` (default on). **Default:** off
+(one node) unless `--tp-rank` is given; with it, the shared split planner (`include/strix/pair/split_plan.hpp`) keeps the
+decode on one node when the group does not win (unless `--tp-force`).
+
+Each rank loads the model and prefills alone (replicated, same bits), then decodes its column / head shares
+(`core::dense_iu4::run_cols`, `include/strix/pair/column_split.hpp`, `tp_layout.hpp`) with exact joins: all-gathers and a
+split argmax. FP16 gathers feed the IU4 activation rows, whose first operation is the same FP16 conversion, and the
+MTP drafter is split by the trunk's shares. The verify-window costs are the compiled table on every rank, so both ranks
+choose the same windows (labelled `table (forced: ranks must agree)`); an explicit `--spec-costs calibrated|learned`
+with `--tp-rank` is refused. Per-rank read rates come from the topology declaration (`memory_gbytes_ps` of both nodes,
+`--topology FILE --node ID` or `STRIX_TOPOLOGY`) or `--tp-rates`; there is no compiled default. The trip cost is
+measured at start-up over the gather form the decode runs (`include/strix/dist/link_cost.hpp` measure + agree, both
+ranks hold the same bits; `include/strix/pair/tp_inputs.hpp`); `--tp-trip-us` overrides only its latency. The gather
+binding is shared (`include/strix/pair/gather_link.hpp`, HIP side `src/xport/tp_gather_hip.hpp`), as are the join and
+split-argmax kernels (`src/core/tp_join.hpp`). The run's `tp link:` line splits the pass into `link` (host time in the
+exchange; the staged route does not wait for the stream first, the Communicator orders its copy after the producer)
+and `rest`. A vocabulary head that cannot be split (not IU4, or V not a multiple of 64) runs replicated on every rank,
+in the drafter as in the target (`include/strix/pair/tp_layout.hpp` head_columns).
+`STRIX_TP_CHANNEL` (default on; `=0` restores the staged route) carries the in-token gathers on the shared device-waited channel
+(`src/xport/channel_communicator.hpp` over `xport::Channel<tp_gather::Traits>`, `src/xport/tp_gather_traits.hpp`,
+HIP operations `src/xport/hip_channel_runtime.hpp`): a copy kernel publishes this rank's share, the progress thread
+runs the wire, the stream waits on the receive flag, and the host never waits per gather. Same bytes, same slots, same
+stream order and join kernels; `STRIX_TP_XPORT_*` tunes the channel
+(depth, progress CPU, timeout). The run ends by draining the channel, which checks the last messages (deferred
+integrity check): a failure ends the run with an error before any result is printed.
+- **Off switch:** omit `--tp-rank`; `STRIX_TP_F16_GATHER=0` / `STRIX_TP_SPLIT_DRAFT=0` for the levers;
+  `STRIX_TP_CHANNEL=0` for the staged route.
+- **Exactness evidence:** generated ids equal the one-node plain reference over 1,200 tokens (code prompt) with the
+  levers on and off, and over 200 plain tokens. The one-node dense IU4 kernels compile to the same ISA as before; only
+  the column-share kernel is new.
+- **Measured gain:** two Strix Halo nodes over USB4, EXACT, code prompt, 1,200 tokens with MTP speculation: one node
+  46.76 / 46.68 tok/s, tensor parallel 58.50 tok/s in the same run (+25 %). Channel route, same prompt and length,
+  ABA in one run each: one node 46.77 / 46.69 tok/s vs channel 65.38 tok/s (x1.40); staged 58.26 / 58.25 tok/s vs
+  channel 65.28 tok/s (+12.1 %); generated ids equal the one-node reference on all six arms.
+
+### Qwen 27B pair prefill: decode relay to one node
+
+**Engine:** `qwen35` (HIP, pair layer split app `strix-hip-qwen35-pair`). **Control:** `STRIX_PAIR_DECODE_RELAY`.
+**Default:** off (layer-owned decode). With `=1` and every node's memory declared, the shared chain planner may choose
+a decoder that holds the whole model; after the layered prefill each stage's layer state moves to it once and it
+decodes alone (a layer split only serialises one-row decode).
+- **Off switch:** `STRIX_PAIR_DECODE_RELAY=0` or unset.
+- **Exactness evidence:** none on this tree yet. The default stays off until a pair run on this tree records the
+  placement line, the relayed state size and time, decode tok/s and ids equal to the one-node reference, for both
+  settings.
+- **Measured gain:** not measured on this tree.
+
+### Hy4-flash exact tensor-parallel decode over two nodes
+
+**Engine:** `hy4` (HIP). **Control:** `--tp-rank 0|1` on both ranks of `strix-hy4-rank` (`--tp-rates A,B` required,
+`--tp-transport`, `--tp-trip-us`, `--tp-force`; needs `--prompt-rows`). **Default:** off (one node) unless `--tp-rank`
+is given; with it, the shared split planner (`include/strix/pair/split_plan.hpp`, the decode pass described as stages
+by `include/strix/hy4/tp_layout.hpp` decode_stages) keeps the decode on one node when the group does not win (unless
+`--tp-force`).
+
+Each rank loads the whole pack and prefills alone (replicated, same bits). From the first decode step
+(`Forward::enable_tp`), each rank computes its share and the shared pair gather (`include/strix/pair/gather_link.hpp`,
+HIP side `src/xport/tp_gather_hip.hpp`) swaps the halves: attention by heads (gate, q_b, rope, K_b, the query image, the
+sparse flash as one 16-head tile per rank on indexed layers or one of the two 32-head groups on sliding layers, V_b,
+the gate; then o joined), o_proj by output rows, the layer-0 FFN by rows, the routed experts by slot (A8 probe / down
+over 8 of the 16 slots at the rank's ids) with the shared expert's gate/up rows in the same join, the head by
+vocabulary rows. Router, latent down / up, the shared down projection, hyper-connection sites, norms, Engram, the
+indexer and the greedy pick stay replicated. The shares are written where `tp_layout.hpp` places them, so the gathered
+buffer is the one-node buffer (no join pass): 128 gathers per token. Every split output is a whole per-head / per-row /
+per-slot result of the same kernel and the combine runs over all 16 slot rows in slot order.
+- **Off switch:** omit `--tp-rank`.
+- **Exactness evidence:** generated ids equal the one-node run on both ranks (300 of 300 and 128 of 128, 1024-token
+  prompt); host test `tests/hy4_tp_layout_tests.cpp` (shares tile, the MoE join leaves the slot rows contiguous, the
+  planner's joins equal the step's gathers).
+- **Measured:** one node | pair | one node: 16.52 | 19.92 | 16.51 tok/s (host-staged gather route, +21 %).
