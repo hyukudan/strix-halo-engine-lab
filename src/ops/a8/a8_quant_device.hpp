@@ -8,7 +8,7 @@
 //    lanes of a wave hold one group per iteration); the norm's FP32 output row is still written;
 //  - quantize_rows_kernel<Pre>: the quantiser of an elementwise pre-op (the shared glu functions sigmoid_gate / swiglu) of
 //    two FP32 rows; same launch shape as quantize_a8_kernel (one wave per (group, row)).
-#include "ops/glu/glu.hpp"
+#include "../glu/glu.hpp"  // relative: binders of this header need not have src/ on their include path
 
 #include <hip/hip_runtime.h>
 

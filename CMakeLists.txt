@@ -3778,16 +3778,6 @@ int main() { return 0; }"
         strix_target_warnings(strix-hip-dense-rows-tile-tests)
         add_test(NAME strix-hip-dense-rows-tile-tests COMMAND strix-hip-dense-rows-tile-tests)
         set_tests_properties(strix-hip-dense-rows-tile-tests PROPERTIES SKIP_RETURN_CODE 77)
-        # A8 rows stored by their producer (src/ops/a8: norm store, sigmoid gate / SwiGLU quantiser) and the strided rmsnorm ==
-        # the separate passes they replace (bitwise).
-        add_executable(strix-hip-a8-producer-tests tests/hip_a8_producer_tests.hip)
-        set_target_properties(strix-hip-a8-producer-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-        target_include_directories(strix-hip-a8-producer-tests PRIVATE include src)
-        target_link_libraries(strix-hip-a8-producer-tests PRIVATE strix_hip_runtime)
-        strix_target_warnings(strix-hip-a8-producer-tests)
-        add_test(NAME strix-hip-a8-producer-tests COMMAND strix-hip-a8-producer-tests)
-        set_tests_properties(strix-hip-a8-producer-tests PROPERTIES SKIP_RETURN_CODE 77)
         # Shared cache-row writer (attn_core/cache_rows.hpp) vs the host reference, test geometries.
         add_executable(strix-hip-cache-rows-tests tests/hip_cache_rows_tests.hip)
         set_target_properties(strix-hip-cache-rows-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
@@ -5172,7 +5162,14 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(strix-hip-ds41-formats-tests tests/hip_ds41_formats_tests.hip)
         target_link_libraries(strix-hip-ds41-formats-tests PRIVATE strix_ds41_hip strix_dist strix_core)
         add_test(NAME strix-hip-ds41-formats-tests COMMAND strix-hip-ds41-formats-tests)
-        set(strix_ds41_hip_targets strix_ds41_hip strix-hip-ds41-formats-tests)
+        # A8 rows stored by their producer (src/ops/a8: norm store, sigmoid gate / SwiGLU quantiser) and the strided rmsnorm ==
+        # the separate passes they replace (bitwise).
+        add_executable(strix-hip-a8-producer-tests tests/hip_a8_producer_tests.hip)
+        target_include_directories(strix-hip-a8-producer-tests PRIVATE src)
+        target_link_libraries(strix-hip-a8-producer-tests PRIVATE strix_ds41_hip strix_dist strix_core)
+        add_test(NAME strix-hip-a8-producer-tests COMMAND strix-hip-a8-producer-tests)
+        set_tests_properties(strix-hip-a8-producer-tests PROPERTIES SKIP_RETURN_CODE 77)
+        set(strix_ds41_hip_targets strix_ds41_hip strix-hip-ds41-formats-tests strix-hip-a8-producer-tests)
     else()
         set(strix_ds41_hip_targets strix_ds41_hip)
     endif()
