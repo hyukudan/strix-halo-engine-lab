@@ -38,6 +38,7 @@ struct ForwardOptions {
     std::uint32_t first = 0, last = 0;         // trunk layers of this rank; last 0 = depth
     std::uint32_t context = 4096;              // positions this forward may hold
     std::uint32_t prompt_rows = 0;             // batched prompt window (rows per launch, multiple of 8, >= 16); 0 = none
+    bool head_q8 = false;                      // FAST hy4-head-bf16-q8_0-v1: Q8_0 copy of the BF16 head for the decode head
     std::uint32_t verify_rows = 0;             // rows of a verify pass (forward_rows, 1..8); rings sized for them; 0 = none
     bool nextn = false;                        // also load the pack's next-token (MTP) block: nextn_rows() (whole-model rank)
     NextnHead nextn_head = NextnHead::q4;      // the drafts' head (want_top of nextn_rows)

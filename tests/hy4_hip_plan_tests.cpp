@@ -181,7 +181,8 @@ void check_profile() {
     CHECK(rows({}, &st) == "0" && st == is(sp::Status::builtin, "qualified"));
     CHECK(rows({"--profile", "default"}, &st) == "0" && st == is(sp::Status::builtin, "qualified"));
     CHECK(rows({"--profile", "fast"}, &st) == "0" && st == is(sp::Status::pending, "qualified"));
-    CHECK(rows({"--profile", "fast", "--allow-pending"}, &st) == "2048" && st == is(sp::Status::unqualified, "unqualified: prompt_rows"));
+    CHECK(rows({"--profile", "fast", "--allow-pending"}, &st) == "2048" &&
+          st.rfind(is(sp::Status::unqualified, "unqualified: prompt_rows"), 0) == 0);
     CHECK(rows({"--profile", "fast", "--prompt-rows", "512"}, &st) == "512" &&
           st == is(sp::Status::explicit_cli, "unqualified: prompt_rows"));
     CHECK(rows({"--prompt-rows", "2048"}, &st) == "2048" && st == is(sp::Status::explicit_cli, "unqualified: prompt_rows"));
@@ -233,6 +234,23 @@ void check_profile_regime() {
     CHECK(run(g, one, gated + 1U, {"--prompt-rows", "2048"}, &st) == "2048" && st == "explicit-cli / unqualified: prompt_rows");
     CHECK(run(g, one, 17, {"--prompt-rows", "512"}, &st) == "512" && st == "explicit-cli / unqualified: prompt_rows");
     CHECK(hp::device_of("gfx1151:sramecc+:xnack-") == g && hp::device_of("gfx1100") == hp::Device::unknown);
+    // head_q8: no prompt bound, one node and pair; unknown device pending
+    const auto head = [](hp::Device d, hp::Topology t, std::uint64_t tokens) {
+        sp::Inputs in;
+        in.env = [](const char*) -> const char* { return nullptr; };
+        std::vector<std::string> args{"--profile", "fast"};
+        sp::take_options(hp::engine(), args, in);
+        hp::Regime r;
+        r.device = d;
+        r.topology = t;
+        r.prompt_tokens = tokens;
+        const auto res = hp::resolve(r, in);
+        const auto* e = res->find("head_q8");
+        return e == nullptr ? std::string("missing") : e->value + "/" + sp::status_name(e->status);
+    };
+    CHECK(head(g, one, 1U << 20) == "1/profile");
+    CHECK(head(g, hp::Topology::pair, 32768) == "1/profile");
+    CHECK(head(hp::Device::unknown, one, 17) == "0/pending");
 }
 
 void check_indexer_binding() {

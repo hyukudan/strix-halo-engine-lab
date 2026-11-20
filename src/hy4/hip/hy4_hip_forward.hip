@@ -15,6 +15,7 @@
 #include "attn_core/sparse_flash_mla.hpp"
 #include "core/f16_dense_q8a8.hpp"
 #include "core/hc_core.hpp"
+#include "core/wmma_tiled.hpp"
 #include "core/hip_range_weight_loader.hpp"
 #include "engram/hip/inject_kernel.hpp"
 #include "engram/hip/row_kernel.hpp"
@@ -275,6 +276,8 @@ struct Forward::Impl {
 
     // batched prompt (prompt_rows > 0): [rows][...] workspaces of one window; attn_k_b re-laid 256 wide per layer
     std::uint32_t rmax = 0;
+    bool head_q8_on = false;                // options.head_q8 (FAST row head_q8 of strix/profiles/hy4.hpp)
+    const std::uint8_t* head_q8 = nullptr;  // Q8_0 copy of output.weight read by linear("output.weight") (decode / drafter)
     float* seam = nullptr;  // [rmax][4][hidden] X rows of a layer-pipeline window (stage of a layer split only)
     struct PromptRows {
         float *x0 = nullptr, *x1 = nullptr, *u = nullptr, *xn = nullptr, *f = nullptr, *partial = nullptr;
@@ -593,9 +596,30 @@ struct Forward::Impl {
         if (round) glu::launch_epilogue<glu::Round::bf16>(y, bias, outputs, outputs, y, s);
         check(hipGetLastError(), "linear epilogue launch");
     }
+    // FAST hy4-head-bf16-q8_0-v1: the BF16 output head gets a Q8_0 copy at load (shared transcode core::convert_bf16_q8_0,
+    // ggml quantize_row_q8_0_ref rule, host reference core/iu4_onfly.hpp) that linear("output.weight") reads through the
+    // q8 rows form: the decode head and the drafter head. The prompt windows and the verify rows keep the BF16 bytes.
+    void build_head_q8() {
+        if (!head_q8_on || w.find("output.weight") == w.end()) return;
+        const auto& tw = t("output.weight");
+        if (tw.type != 30U || tw.dims.size() != 2U || tw.dims[0] % 32U) throw std::runtime_error("hy4 head q8: BF16 [K % 32] head");
+        const auto K = static_cast<std::uint32_t>(tw.dims[0]), N = static_cast<std::uint32_t>(tw.dims[1]);
+        const std::size_t bytes = row_bytes(8U, K) * N;
+        auto* d = alloc<std::uint8_t>(bytes);
+        check(strix::core::convert_bf16_q8_0(reinterpret_cast<const std::uint16_t*>(tw.p), static_cast<int>(K), static_cast<int>(N), d, s),
+              "head q8 convert");
+        check(hipStreamSynchronize(s), "head q8 convert sync");
+        head_q8 = d;
+        report.queue_line += "decode head hy4-head-bf16-q8_0-v1 source_GiB=" + std::to_string(static_cast<double>(tw.bytes) / 1073741824.0) +
+                             " copy_GiB=" + std::to_string(static_cast<double>(bytes) / 1073741824.0) + "\n";
+    }
     void linear(const std::string& name, const float* x, std::uint32_t width, std::uint32_t outputs, float* y, bool round = true,
                 const float* bias = nullptr) {
         const auto& tw = t(name);
+        if (head_q8 != nullptr && name == "output.weight") {
+            if (tw.dims.at(0) != width) throw std::runtime_error("hy4 hip forward: shape of " + name);
+            return linear(head_q8, 8U, x, width, outputs, y, round, bias);
+        }
         if (tw.dims.at(0) != width || tw.bytes != row_bytes(tw.type, width) * outputs)
             throw std::runtime_error("hy4 hip forward: shape of " + name);
         linear(tw.p, tw.type, x, width, outputs, y, round, bias);
@@ -1705,6 +1729,7 @@ Forward::Forward(const ForwardOptions& o) : impl_(std::make_unique<Impl>()) {
         throw std::invalid_argument("hy4 hip forward: prompt rows must be a multiple of 8, at least 16");
     if (o.verify_rows > rows::kMaxVerifyRows) throw std::invalid_argument("hy4 hip forward: verify rows outside 0..8");
     impl_->vr.max = o.verify_rows;
+    impl_->head_q8_on = o.head_q8;
     impl_->nx.on = o.nextn;  // before load(): wanted() admits the next-token block
     impl_->nx.head = o.nextn_head;
     if (o.nextn && (impl_->first != 0U || impl_->last != impl_->c.layers || impl_->c.nextn != 1U))
@@ -1712,6 +1737,7 @@ Forward::Forward(const ForwardOptions& o) : impl_(std::make_unique<Impl>()) {
     check(hipStreamCreateWithFlags(&impl_->s, hipStreamNonBlocking), "stream");
     impl_->load(o.parts);
     impl_->allocate();
+    impl_->build_head_q8();
     if (impl_->rmax) impl_->allocate_prompt();
     if (impl_->vr.max) impl_->allocate_verify();
     if (impl_->nx.on) impl_->allocate_nextn();

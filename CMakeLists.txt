@@ -6977,7 +6977,7 @@ if(STRIX_FAMILY_HY4)
     target_compile_options(strix_hy4_hip PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
         -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
     target_link_libraries(strix_hy4_hip PUBLIC strix_hy4_ref strix_hip_runtime strix_q4k_a8_hip_probe strix_engram strix_ds41_hip)
-    target_link_libraries(strix_hy4_hip PRIVATE strix_state_cache)  # state image files (session/checkpoint_io)
+    target_link_libraries(strix_hy4_hip PRIVATE strix_state_cache strix_tiled_core)  # state image files; head Q8_0 transcode
     strix_target_warnings(strix_hy4_hip)
     add_executable(strix-hy4-rank apps/hy4_rank_main.cpp)
     target_link_libraries(strix-hy4-rank PRIVATE strix_hy4_hip strix_dist strix_device strix_spec)  # pair: shared layer pipeline + link; copy proposer

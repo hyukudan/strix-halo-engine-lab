@@ -381,6 +381,7 @@ int run(int argc, char** argv) {
     std::uint16_t port = 29755;
     bool timing = false, rows_explicit = false, pipe_guess = false;
     GateRef gref;           // --gate-ref (long BASE reference in pieces)
+    bool head_explicit = false;
     std::string dump_path;  // --dump-logits F: every host logits row (FP32, vocab floats per step) appended to F
     std::vector<strix::hy4::hipbind::PairWindowCost> window_costs;  // --window-costs ROWS:MS,... (pair calibration)
     // The tier word (--profile default|fast|quality, --allow-pending) through the shared resolver; the lever options
@@ -400,6 +401,7 @@ int run(int argc, char** argv) {
         else if (a == "--prompt-rows" && more) o.prompt_rows = static_cast<std::uint32_t>(std::stoul(args[++i])), rows_explicit = true;
         else if (a == "--timing") timing = true;
         else if (a == "--gate-ref") gref.on = true;
+        else if (a == "--head-q8" && more) o.head_q8 = args[++i] == "1", head_explicit = true;
         else if (a == "--verify-rows" && more) o.verify_rows = static_cast<std::uint32_t>(std::stoul(args[++i]));
         else if (a == "--state-in" && more) gref.state_in = args[++i];
         else if (a == "--state-out" && more) gref.state_out = args[++i];
@@ -444,6 +446,7 @@ int run(int argc, char** argv) {
     const auto& profile = resolved->resolution;
     if (const auto* e = resolved->find("prompt_rows"); e != nullptr && !rows_explicit && strix::profile::applied(e->status))
         o.prompt_rows = static_cast<std::uint32_t>(std::stoul(e->value));
+    if (const auto* e = resolved->find("head_q8"); e != nullptr && !head_explicit && strix::profile::applied(e->status)) o.head_q8 = e->value == "1";
     std::cout << profile.describe() << "regime " << hp::device_name(regime.device) << " / " << hp::topology_name(regime.topology)
               << " / prompt " << regime.prompt_tokens << "\n" << std::flush;
     for (const auto& n : profile.notices()) std::cerr << n << '\n';

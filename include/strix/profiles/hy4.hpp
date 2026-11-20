@@ -29,6 +29,11 @@ inline constexpr sp::Lever table[] = {
      .source = "batched prompt: 1K next-32 ids == position by position, window size bitwise (512 = 1024, 2048 = 4096); "
                "FAST gate v2 per regime: see `qualified`",
      .provisional = {false, false, false, false}},
+    {.name = "head_q8", .env = "", .option = "--head-q8", .value = {"", "1", "", ""}, .builtin = "0",
+     .kind = sp::Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
+     .target = "1 (Q8_0 copy of the BF16 head for the decode head, hy4-head-bf16-q8_0-v1)", .off = "0",
+     .source = "shared core::convert_bf16_q8_0 (ggml q8_0 rule) at load; FAST gate v2 per regime: see `qualified`",
+     .provisional = {false, false, false, false}},
 };
 
 // Regime of a run, known before the forward loads. An unknown device resolves every FAST cell to pending.
@@ -54,10 +59,16 @@ struct Qualified {
     std::uint64_t max_prompt_tokens;
     std::string_view receipt;
 };
+inline constexpr std::uint64_t kNoPromptBound = ~std::uint64_t{0};
 inline constexpr Qualified qualified[] = {
     {"prompt_rows", "2048", Device::gfx1151, Topology::one_node, 4096,
      "gate v2 (route replay, one-ulp null): 1,000 held-out rows over en/zh/es/py/rs, KL 0.00189, top-1 0.982, "
      "dNLL -0.00174 +- 0.00304; long4k KL 0.00082"},
+    // The head copy changes only the decode head's weights (no prompt dependence: no bound); the layer split changes no
+    // bit, so the pair's head stage computes the same logits as one node.
+    {"head_q8", "1", Device::gfx1151, Topology::one_node, kNoPromptBound,
+     "gate v2: 5 windows, 1,000 held-out rows, KL 0.00002, top-1 0.999, dNLL +0.00032; decode 57.13 -> 55.79 ms/token"},
+    {"head_q8", "1", Device::gfx1151, Topology::pair, kNoPromptBound, "same head numerics as one node (the layer split changes no bit)"},
 };
 
 [[nodiscard]] inline const Qualified* qualification(std::string_view lever, std::string_view value, const Regime& regime,
@@ -108,7 +119,7 @@ struct Resolved {
         for (const auto& q : rows)
             if (q.lever == entry.lever->name)
                 where += std::string(where.empty() ? "" : "; ") + device_name(q.device) + " / " + topology_name(q.topology) +
-                         " / prompt <= " + std::to_string(q.max_prompt_tokens);
+                         (q.max_prompt_tokens == kNoPromptBound ? std::string() : " / prompt <= " + std::to_string(q.max_prompt_tokens));
         entry.reason = "not qualified for " + std::string(device_name(regime.device)) + " / " + topology_name(regime.topology) +
                        " / prompt " + std::to_string(regime.prompt_tokens) +
                        (where.empty() ? std::string(": no gate receipt yet") : "; qualified only for " + where);
