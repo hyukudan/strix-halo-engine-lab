@@ -16,6 +16,7 @@
 #include "strix/deepseek41_model.hpp"
 #include "strix/deepseek41_plan.hpp"
 #include "strix/ds41_layer.hpp"
+#include "strix/head_argmax.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -466,6 +467,7 @@ int main(int argc, char** argv) try {
                 float* logits = ws.take<float>(V);
                 c::A8Rows a{ws.take<std::int8_t>(H), ws.take<float>(H / 32U), ws.take<std::int32_t>(H / 32U), 1, H, H};
                 auto* cand = ws.take<d::ArgmaxCandidate>(1);
+                void* argmax_partial = ws.take_bytes(strix::head_argmax::workspace_bytes(1));
                 c::NormView v;
                 v.hc_stream = stream;
                 v.pre = pre;
@@ -477,7 +479,7 @@ int main(int argc, char** argv) try {
                 timer.start(s);
                 c::enqueue_norm(v, s);
                 q8("output.weight", V, H, a, logits);
-                c::enqueue_argmax({logits, 1, V, 0, 0, cand}, s);
+                c::enqueue_argmax({logits, 1, V, 0, 0, cand, argmax_partial}, s);
                 ms = timer.stop(s);
                 const auto l = down(logits, V);
                 logits_hash = c::fnv1a(l.data(), l.size());
