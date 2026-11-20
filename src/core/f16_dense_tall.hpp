@@ -132,6 +132,9 @@ __device__ __forceinline__ Frag staged_fragment(const std::uint32_t* p) {
 //     [unit, unit + 4) into nb[8], instead of raw FP16 loads from tile(i).w: weights of another stored form are decoded
 //     once per (CTA, stage) and every row wave reads the decoded FP16 from LDS.
 //   fragment(row, unit) -> Half16: the lane's A fragment of `row` at k unit `unit`, instead of 16 FP32 loads of x.
+//   fragment_load(row, unit) -> raw, fragment_half(raw) -> Half16 (optional, with fragment() = their composition):
+//     fragment() split in its loads and its arithmetic, like the core's own FP32 x path: the loads of unit u + 1 are
+//     issued before the WMMAs of unit u and decoded after them (without the split the decode waits for its loads).
 //   kWaves: row waves per CTA (default 8 = 128 rows per weight read); launch with 32 * kWaves threads and
 //     grid.x = ceil(rows / (16 * kWaves)). Stagers stay the first 16 * TC threads.
 //   kColumnFast = true: grid.x = column block, grid.y = row block (launch dim3(column blocks, row blocks)), so the
@@ -140,6 +143,8 @@ __device__ __forceinline__ Frag staged_fragment(const std::uint32_t* p) {
 //     (measured on the MiniMax index projection, 6 column blocks, 4096 rows: x re-streamed per block at rows-fast).
 template <class C> concept ColsStage = requires(const C& c, U4* nb) { c.stage(0U, 0U, 0U, nb); };
 template <class C> concept ColsFragment = requires(const C& c) { { c.fragment(0U, 0U) } -> std::same_as<Half16>; };
+template <class C> concept ColsFragmentSplit =
+    ColsFragment<C> && requires(const C& c) { { c.fragment_half(c.fragment_load(0U, 0U)) } -> std::same_as<Half16>; };
 //   stage_load(tile, col, unit) -> raw, stage_decode(raw, nb) (optional, both or neither): stage() split in its
 //     global loads and its arithmetic. The core issues the loads after the stage's second barrier and decodes after
 //     the stage's WMMAs, so the load latency hides behind them (stage() must equal stage_decode(stage_load())).
@@ -213,15 +218,17 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
     const auto* xb = reinterpret_cast<const unsigned char*>(detail::uniform(x));
     // Rows past nr read row 0 (their sums are never stored).
     const std::uint32_t xr = row0 + c < nr ? row0 + c : 0U, xo = xr * in * 4U;
-    // A fragment in two steps: frag_load issues the loads (the policy's fragment, or the 16 FP32 x values), frag_half
-    // gives the WMMA operand (identity, or the core's RNE cast). The loads of unit u + 1 are issued before the WMMAs of
-    // unit u and converted after them.
+    // A fragment in two steps: frag_load issues the loads (the policy's split load, its fragment, or the 16 FP32 x
+    // values), frag_half gives the WMMA operand (the policy's decode, identity, or the core's RNE cast). The loads of
+    // unit u + 1 are issued before the WMMAs of unit u and converted after them.
     const auto frag_load = [&](unsigned unit) __attribute__((always_inline)) {
-        if constexpr (ColsFragment<Cols>) return cols.fragment(xr, unit);
+        if constexpr (ColsFragmentSplit<Cols>) return cols.fragment_load(xr, unit);
+        else if constexpr (ColsFragment<Cols>) return cols.fragment(xr, unit);
         else return detail::row_raw(xb, xo + unit * 64U);
     };
-    const auto frag_half = [](const auto& raw) __attribute__((always_inline)) {
-        if constexpr (ColsFragment<Cols>) return raw;
+    const auto frag_half = [&](const auto& raw) __attribute__((always_inline)) {
+        if constexpr (ColsFragmentSplit<Cols>) return cols.fragment_half(raw);
+        else if constexpr (ColsFragment<Cols>) return raw;
         else return detail::row_half(raw);
     };
     // Stager role: thread tid owns column tid of the CTA's column block.

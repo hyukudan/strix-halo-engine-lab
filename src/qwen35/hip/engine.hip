@@ -27,7 +27,9 @@
 #include "strix/gguf_reader.hpp"
 #include "strix/qwen35/iu4_draft_head.hpp"
 #include "strix/spec/draft_rows.hpp"
+#include "strix/hip_argmax_core.hpp"
 #include "strix/hip_gdn_dims.hpp"
+#include "strix/owned_layer_ordinals.hpp"
 #include "strix/pair/tp_layout.hpp"
 #include "../../attn_core/dense_decode.hpp"
 #include "../../attn_core/dense_decode_flash.hpp"
@@ -95,57 +97,41 @@ __global__ void embed_kernel(const std::uint8_t* table, unsigned fmt, std::size_
         out[std::size_t(r) * hidden + i] = v;
     }
 }
+__global__ void put_id_kernel(int* dst, int id) { *dst = id; }  // device-fed MTP chain: a host id by value
 __global__ void add_kernel(float* x, const float* y, unsigned n) {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] = x[i] + y[i];
 }
-// Lowest index wins ties; fixed tree.
-__global__ void argmax_kernel(const float* logits, unsigned vocab, int* out) {
-    __shared__ float bv[1024];
-    __shared__ int bi[1024];
-    const float* row = logits + std::size_t(blockIdx.x) * vocab;
-    float best = -INFINITY;
-    int bidx = 0x7fffffff;
-    for (unsigned i = threadIdx.x; i < vocab; i += 1024U)
-        if (row[i] > best) { best = row[i]; bidx = int(i); }
-    bv[threadIdx.x] = best;
-    bi[threadIdx.x] = bidx;
-    __syncthreads();
-    for (unsigned s = 512U; s > 0U; s >>= 1U) {
-        if (threadIdx.x < s) {
-            const float v = bv[threadIdx.x + s];
-            const int i = bi[threadIdx.x + s];
-            if (v > bv[threadIdx.x] || (v == bv[threadIdx.x] && i < bi[threadIdx.x])) { bv[threadIdx.x] = v; bi[threadIdx.x] = i; }
-        }
-        __syncthreads();
+// Head pick on the shared first-max core (include/strix/hip_argmax_core.hpp): integer key = the CPU finite comparison,
+// lowest index on ties, fixed tree. A non-finite logit never wins; a row that saw one (or has no finite value) writes id 0
+// (a valid id: a feed slot may embed it) and stores its status in *status (host-mapped, written by failing rows only), which
+// read_top / mtp_feed_read report as an error. Finite rows: the same ids as the float first-max.
+__device__ __forceinline__ void pick_store(const argmax::Partial& best, int id, int* out, unsigned* status) {
+    const unsigned st = argmax::status(best);
+    out[blockIdx.x] = st ? 0 : id;
+    if (st) {
+        *status = st;
+        __threadfence_system();
     }
-    if (threadIdx.x == 0) out[blockIdx.x] = bi[0];
 }
-// Draft-only subset head: argmax over the first `count` compact rows (row stride `stride`, same first-max rule as
-// argmax_kernel), then compact row -> token id through the slot table (slot -> source group of `group` ids).
+__device__ __forceinline__ argmax::Partial pick_row(const float* row, unsigned count) {
+    __shared__ argmax::Partial lanes[1024];
+    auto best = argmax::empty();
+    for (unsigned i = threadIdx.x; i < count; i += 1024U) best = argmax::choose(best, argmax::load(row[i], i));
+    return argmax::block_argmax<1024>(lanes, threadIdx.x, best);
+}
+__global__ void argmax_kernel(const float* logits, unsigned vocab, int* out, unsigned* status) {
+    const auto best = pick_row(logits + std::size_t(blockIdx.x) * vocab, vocab);
+    if (threadIdx.x == 0) pick_store(best, int(best.token), out, status);
+}
+// Draft-only subset head: the same pick over the first `count` compact rows (row stride `stride`), then compact row -> token
+// id through the slot table (slot -> source group of `group` ids).
 __global__ void draft_argmax_map_kernel(const float* logits, unsigned count, unsigned stride, const std::uint32_t* map,
-                                        unsigned group, int* out) {
-    __shared__ float bv[1024];
-    __shared__ int bi[1024];
-    const float* row = logits + std::size_t(blockIdx.x) * stride;
-    float best = -INFINITY;
-    int bidx = 0x7fffffff;
-    for (unsigned i = threadIdx.x; i < count; i += 1024U)
-        if (row[i] > best) { best = row[i]; bidx = int(i); }
-    bv[threadIdx.x] = best;
-    bi[threadIdx.x] = bidx;
-    __syncthreads();
-    for (unsigned s = 512U; s > 0U; s >>= 1U) {
-        if (threadIdx.x < s) {
-            const float v = bv[threadIdx.x + s];
-            const int i = bi[threadIdx.x + s];
-            if (v > bv[threadIdx.x] || (v == bv[threadIdx.x] && i < bi[threadIdx.x])) { bv[threadIdx.x] = v; bi[threadIdx.x] = i; }
-        }
-        __syncthreads();
-    }
+                                        unsigned group, int* out, unsigned* status) {
+    const auto best = pick_row(logits + std::size_t(blockIdx.x) * stride, count);
     if (threadIdx.x == 0) {
-        const unsigned r = unsigned(bi[0]);
-        out[blockIdx.x] = r < count ? int(map[r / group] * group + r % group) : bi[0];  // no finite row: as argmax_kernel
+        const unsigned r = best.token;
+        pick_store(best, best.valid ? int(map[r / group] * group + r % group) : 0, out, status);
     }
 }
 
@@ -623,8 +609,8 @@ struct HipEngine::Impl {
     unsigned H = 0, V = 0, D = 0, QW = 0, KW = 0, I = 0, GV = 0, GC = 0, GH = 0;
     Tensor embd, onorm, head;
     std::vector<Layer> L;
-    std::vector<unsigned> gdn_index;  // layer -> index among GDN layers (or ~0u)
-    unsigned n_gdn = 0;
+    std::vector<unsigned> gdn_index;  // layer -> index among the OWNED GDN layers (or ~0u: attention / another rank's layer)
+    unsigned n_gdn = 0;               // owned GDN layers: state, backup, conv and raw slices are sized by it
     std::size_t sb = 0, cb = 0;       // GDN matrix bytes / conv bytes per layer
     std::size_t pass_weight_bytes = 0, kv_pos_bytes = 0, mtp_bytes = 0;
     float *gdn_all = nullptr, *bak_state = nullptr;  // allocations; roles (committed / window target) live in gdn_buf
@@ -635,6 +621,27 @@ struct HipEngine::Impl {
           *q_in = nullptr, *kk = nullptr, *vv = nullptr, *qn = nullptr, *ctx = nullptr, *gu = nullptr, *logits = nullptr,
           *wide_logits = nullptr;  // all rows of a wide window (quality-gate dumps only; allocated on first use)
     int *d_ids = nullptr, *d_arg = nullptr;
+    // Head-pick status (argmax_kernel / draft_argmax_map_kernel): host-mapped word, nonzero after a row saw a non-finite logit.
+    struct PickStatus {
+        unsigned *host = nullptr, *dev = nullptr;
+        void init() {
+            HK(hipHostMalloc(reinterpret_cast<void**>(&host), sizeof(unsigned), hipHostMallocMapped | hipHostMallocCoherent));
+            *host = 0U;
+            HK(hipHostGetDevicePointer(reinterpret_cast<void**>(&dev), host, 0));
+        }
+        // After a stream sync: throws (and clears) when a pick since the last check saw a non-finite logit.
+        void check(const char* what) const {
+            const unsigned st = *static_cast<volatile unsigned*>(host);
+            if (st == 0U) return;
+            *static_cast<volatile unsigned*>(host) = 0U;
+            throw std::runtime_error(std::string(what) + ": non-finite logits in a picked row (status " + std::to_string(st) +
+                                     (st & 2U ? ", no finite value)" : ")"));
+        }
+        PickStatus() = default;
+        PickStatus(const PickStatus&) = delete;
+        PickStatus& operator=(const PickStatus&) = delete;
+        ~PickStatus() { if (host) (void)hipHostFree(host); }
+    } pick;
     unsigned committed = 0, pending = 0;
     unsigned own_begin = 0, own_end = 0;  // owned layer range (HipEngineOptions::layer_begin / layer_end)
     unsigned stage_begin = 0, stage_end = 0;  // prefill stage range inside the owned one (set_stage; default = owned)
@@ -657,13 +664,16 @@ struct HipEngine::Impl {
         Tensor enorm, hnorm, shnorm, eh;
         float *tA = nullptr, *tB = nullptr, *cat = nullptr, *mx = nullptr, *mxn = nullptr, *hpost = nullptr, *mlogits = nullptr;
         int *ids = nullptr, *top = nullptr;
+        int* feed = nullptr;                 // device-fed chain: HipEngine::kMtpFeedSlots picked ids
+        std::uint32_t* feed_host = nullptr;  // pinned staging of mtp_feed_read
         ~MtpData() {
             auto fr = [](auto* p) { if (p) (void)hipFree(p); };
             for (Tensor* t : {&blk.attn_norm, &blk.post_norm, &blk.gate, &blk.up, &blk.down, &blk.q, &blk.k, &blk.v, &blk.o, &blk.qnorm,
                               &blk.knorm, &enorm, &hnorm, &shnorm, &eh}) fr(t->data);
             fr(blk.k_cache); fr(blk.v_cache);
             for (auto* p : {tA, tB, cat, mx, mxn, hpost, mlogits}) fr(p);
-            fr(ids); fr(top);
+            fr(ids); fr(top); fr(feed);
+            if (feed_host) (void)hipHostFree(feed_host);
         }
     } mtp;
     // Draft-only subset head (set_draft_rows): compact IU4 columns of `head` (dcols columns, tile stride dcols / 16) and the
@@ -699,6 +709,7 @@ struct HipEngine::Impl {
     }
 
     template <class T> static void alloc0(T** p, std::size_t bytes) {
+        if (bytes == 0) { *p = nullptr; return; }  // e.g. no GDN layer in this rank's range
         HK(hipMalloc(p, bytes));
         HK(hipMemset(*p, 0, bytes));
     }
@@ -750,9 +761,12 @@ struct HipEngine::Impl {
         if (own_begin == 0U) embd = loader.load("token_embd");
         if (own_end == cfg.layers) { onorm = loader.load("output_norm"); head = loader.load("output"); }
         L.assign(cfg.layers, Layer{});
-        gdn_index.assign(cfg.layers, ~0U);
-        for (unsigned l = 0; l < cfg.layers; ++l)
-            if (cfg.kind(l) == LayerKind::gated_delta_net) gdn_index[l] = n_gdn++;
+        {  // GDN state only for this rank's layers (strix/owned_layer_ordinals.hpp)
+            auto gdn = owned_layer_ordinals(cfg.layers, own_begin, own_end,
+                                            [&](std::uint32_t l) { return cfg.kind(l) == LayerKind::gated_delta_net; });
+            gdn_index = std::move(gdn.ordinal);
+            n_gdn = gdn.count;
+        }
         sb = std::size_t(GH) * cfg.gdn_key_dim * cfg.gdn_value_dim * 4U;
         cb = std::size_t(GC) * cfg.gdn_conv_kernel * 2U;
         alloc0(&gdn_all, sb * n_gdn);
@@ -852,6 +866,7 @@ struct HipEngine::Impl {
             alloc0(&iu4.u, IR * I * 4U);
         }
         alloc0(&d_arg, kMaxRows * 4U);
+        pick.init();
     }
 
     void reset_state() {
@@ -1234,13 +1249,13 @@ struct HipEngine::Impl {
             rmsnorm(x + std::size_t(first) * H, onorm, H, cfg.rms_eps, xn, m, stream);
             if (!tp.head_split) {  // the one-rank head on every rank
                 linear(head, xn, logits, m, stream, wide, iu4);
-                argmax_kernel<<<m, 1024, 0, stream>>>(logits, V, d_arg);
+                argmax_kernel<<<m, 1024, 0, stream>>>(logits, V, d_arg, pick.dev);
                 out.logits = logits;
             } else {
                 tp_cols(head, xn, tp.hd0, tp.hdn, slot, tp.hdn, m);
                 if (tp.full_logits) {  // gate fixtures: the whole rows, then the one-rank argmax
                     tp_join(tp.head, m, logits);
-                    argmax_kernel<<<m, 1024, 0, stream>>>(logits, V, d_arg);
+                    argmax_kernel<<<m, 1024, 0, stream>>>(logits, V, d_arg, pick.dev);
                     out.logits = logits;
                 } else {
                     float* mine = tp.picks + std::size_t(tp.rank) * tp.pick_floats;
@@ -1373,8 +1388,8 @@ struct HipEngine::Impl {
             rmsnorm(x + std::size_t(first) * H, onorm, H, cfg.rms_eps, xn, m, stream);
             for (unsigned r = 0; r < m; r += kMaxRows)
                 linear(head, xn + std::size_t(r) * H, lg + std::size_t(r) * V, std::min(kMaxRows, m - r), stream, wide, iu4);
-            if (m > kMaxRows) argmax_kernel<<<1, 1024, 0, stream>>>(lg + std::size_t(m - 1U) * V, V, d_arg);
-            else argmax_kernel<<<m, 1024, 0, stream>>>(lg, V, d_arg);
+            if (m > kMaxRows) argmax_kernel<<<1, 1024, 0, stream>>>(lg + std::size_t(m - 1U) * V, V, d_arg, pick.dev);
+            else argmax_kernel<<<m, 1024, 0, stream>>>(lg, V, d_arg, pick.dev);
             out.logits = lg;
             out.top = reinterpret_cast<const std::uint32_t*>(d_arg);
         }
@@ -1466,6 +1481,8 @@ struct HipEngine::Impl {
         alloc0(&mtp.mlogits, std::size_t(kMaxRows) * V * 4U);
         alloc0(&mtp.ids, kMaxRows * 4U);
         alloc0(&mtp.top, kMaxRows * 4U);
+        alloc0(&mtp.feed, HipEngine::kMtpFeedSlots * 4U);
+        HK(hipHostMalloc(reinterpret_cast<void**>(&mtp.feed_host), HipEngine::kMtpFeedSlots * 4U, hipHostMallocDefault));
         mtp.ok = true;
         if (!opt.quiet) std::printf("mtp loaded %.2f GiB (blk.%u)\n", double(loader.total()) / double(1ULL << 30), cfg.layers);
     }
@@ -1478,12 +1495,11 @@ struct HipEngine::Impl {
     // head (subset or full) by column shares and the split argmax. 6 FP32 gathers per call (the q8_0 / bf16 consumers
     // read F32 rows). Every column / head / candidate is computed by one rank with the one-rank kernel; norms, adds,
     // embedding and concat are replicated: the drafts are the one-rank drafts.
-    HipMtpOut mtp_run_tp(const std::uint32_t* next_tokens, const float* hidden_dev, unsigned n, unsigned pos0, bool want_top) {
+    HipMtpOut mtp_run_tp(const int* ids, const float* hidden_dev, unsigned n, unsigned pos0, bool want_top, int* top) {
         auto& y = mtp.blk;
         float* slot = tp_slot();
         const unsigned nb = (n * H + 255U) / 256U;
-        HK(hipMemcpyAsync(mtp.ids, next_tokens, n * 4U, hipMemcpyHostToDevice, stream));
-        embed_kernel<<<n, 256, 0, stream>>>(embd.data, embd.fmt, embd.row_bytes, H, mtp.ids, mtp.tA);
+        embed_kernel<<<n, 256, 0, stream>>>(embd.data, embd.fmt, embd.row_bytes, H, ids, mtp.tA);
         rmsnorm(mtp.tA, mtp.enorm, H, cfg.rms_eps, mtp.mxn, n, stream);
         rmsnorm(hidden_dev, mtp.hnorm, H, cfg.rms_eps, mtp.tB, n, stream);
         concat2_kernel<<<(n * H + 255U) / 256U, 256, 0, stream>>>(mtp.mxn, mtp.tB, mtp.cat, n, H);
@@ -1524,18 +1540,18 @@ struct HipEngine::Impl {
                 tp_pick_kernel<<<n, 1024, 0, stream>>>(slot, live > c0 ? std::min(cn, live - c0) : 0U, cn, int(c0), mine);
                 tp_gather(tp.picks, tp.pick_floats, std::size_t(n) * 8U);
                 tp_pick_join_kernel<<<1, 32, 0, stream>>>(tp.picks, tp.ranks, tp.pick_floats, n, tp.didx);
-                tp_draft_map_kernel<<<1, 32, 0, stream>>>(tp.didx, live, d_dmap, kIu4DraftGroup, n, mtp.top);
+                tp_draft_map_kernel<<<1, 32, 0, stream>>>(tp.didx, live, d_dmap, kIu4DraftGroup, n, top);
             } else if (!tp.head_split) {  // full head not splittable (non-IU4 or V % 64 != 0): the one-rank head on every
                 // rank, as the target does (a split share would cover one 64-column unit only)
                 linear(head, mtp.mxn, mtp.mlogits, n, stream, wide, iu4);
-                argmax_kernel<<<n, 1024, 0, stream>>>(mtp.mlogits, V, mtp.top);
+                argmax_kernel<<<n, 1024, 0, stream>>>(mtp.mlogits, V, top, pick.dev);
             } else {  // full head: the trunk head's vocab shares
                 tp_part(head, mtp.mxn, tp.hd0, tp.hdn, slot, n);
                 tp_pick_kernel<<<n, 1024, 0, stream>>>(slot, tp.hdn, tp.hdn, int(tp.hd0), mine);
                 tp_gather(tp.picks, tp.pick_floats, std::size_t(n) * 8U);
-                tp_pick_join_kernel<<<1, 32, 0, stream>>>(tp.picks, tp.ranks, tp.pick_floats, n, mtp.top);
+                tp_pick_join_kernel<<<1, 32, 0, stream>>>(tp.picks, tp.ranks, tp.pick_floats, n, top);
             }
-            o.top = reinterpret_cast<const std::uint32_t*>(mtp.top);  // logits stay rank-local shares (not returned)
+            o.top = reinterpret_cast<const std::uint32_t*>(top);  // logits stay rank-local shares (not returned)
         }
         HK(hipGetLastError());
         o.hidden_pre = mtp.mx;
@@ -1548,10 +1564,42 @@ struct HipEngine::Impl {
         if (n < 1U || n > kMaxRows) throw std::invalid_argument("mtp_forward: rows must be 1..16");
         core::require_capacity(pos0, n, opt.max_positions);
         core::validate_token_ids(next_tokens, n, cfg.vocab);
-        if (tp.on && tp.split_draft) return mtp_run_tp(next_tokens, hidden_dev, n, pos0, want_top);
-        auto& y = mtp.blk;
         HK(hipMemcpyAsync(mtp.ids, next_tokens, n * 4U, hipMemcpyHostToDevice, stream));
-        embed_kernel<<<n, 256, 0, stream>>>(embd.data, embd.fmt, embd.row_bytes, H, mtp.ids, mtp.tA);
+        return mtp_layer(mtp.ids, hidden_dev, n, pos0, want_top, mtp.top);
+    }
+    // Device-fed chain step (one row, strix/spec/mtp_chain.hpp MtpFeedEngine): input id by value (in_host, passed as a kernel
+    // argument: no host copy) or from feed slot in_slot (an earlier step's pick: < vocab, a failed pick wrote 0); the pick
+    // goes to feed slot out_slot. Same layer launches and operands as mtp_run on that id.
+    HipMtpOut mtp_fed(const std::uint32_t* in_host, unsigned in_slot, unsigned out_slot, const float* hidden_dev, unsigned pos,
+                      bool want_top) {
+        if (!mtp.ok) throw std::runtime_error("mtp_step_fed: no MTP tensors loaded");
+        if (in_slot >= HipEngine::kMtpFeedSlots || out_slot >= HipEngine::kMtpFeedSlots)
+            throw std::invalid_argument("mtp_step_fed: feed slot out of range");
+        core::require_capacity(pos, 1U, opt.max_positions);
+        const int* ids = mtp.feed + in_slot;
+        if (in_host) {
+            core::validate_token_ids(in_host, 1U, cfg.vocab);
+            put_id_kernel<<<1, 1, 0, stream>>>(mtp.ids, int(*in_host));
+            ids = mtp.ids;
+        }
+        return mtp_layer(ids, hidden_dev, 1U, pos, want_top, mtp.feed + out_slot);
+    }
+    void mtp_feed_put(unsigned slot, const std::uint32_t* top_dev) {
+        if (!mtp.ok || slot >= HipEngine::kMtpFeedSlots) throw std::invalid_argument("mtp_feed_put: no MTP tensors or bad slot");
+        HK(hipMemcpyAsync(mtp.feed + slot, top_dev, 4U, hipMemcpyDeviceToDevice, stream));
+    }
+    void mtp_feed_read(unsigned n, std::uint32_t* host) {
+        if (!mtp.ok || n > HipEngine::kMtpFeedSlots) throw std::invalid_argument("mtp_feed_read: no MTP tensors or bad count");
+        HK(hipMemcpyAsync(mtp.feed_host, mtp.feed, std::size_t(n) * 4U, hipMemcpyDeviceToHost, stream));
+        HK(hipStreamSynchronize(stream));
+        pick.check("mtp_feed_read");
+        std::memcpy(host, mtp.feed_host, std::size_t(n) * 4U);
+    }
+    // The MTP layer on n rows whose input ids are on the device (ids[n]); the pick of each row goes to top[n].
+    HipMtpOut mtp_layer(const int* ids, const float* hidden_dev, unsigned n, unsigned pos0, bool want_top, int* top) {
+        if (tp.on && tp.split_draft) return mtp_run_tp(ids, hidden_dev, n, pos0, want_top, top);
+        auto& y = mtp.blk;
+        embed_kernel<<<n, 256, 0, stream>>>(embd.data, embd.fmt, embd.row_bytes, H, ids, mtp.tA);
         rmsnorm(mtp.tA, mtp.enorm, H, cfg.rms_eps, mtp.mxn, n, stream);
         rmsnorm(hidden_dev, mtp.hnorm, H, cfg.rms_eps, mtp.tB, n, stream);
         concat2_kernel<<<(n * H + 255U) / 256U, 256, 0, stream>>>(mtp.mxn, mtp.tB, mtp.cat, n, H);
@@ -1579,14 +1627,14 @@ struct HipEngine::Impl {
             w.outputs = dcols;
             w.bytes = iu4_head_bytes(dcols, head.inputs);
             linear(w, mtp.mxn, mtp.mlogits, n, stream, wide, iu4);
-            draft_argmax_map_kernel<<<n, 1024, 0, stream>>>(mtp.mlogits, drows->rows(), dcols, d_dmap, kIu4DraftGroup, mtp.top);
+            draft_argmax_map_kernel<<<n, 1024, 0, stream>>>(mtp.mlogits, drows->rows(), dcols, d_dmap, kIu4DraftGroup, top, pick.dev);
             o.logits = mtp.mlogits;
-            o.top = reinterpret_cast<const std::uint32_t*>(mtp.top);
+            o.top = reinterpret_cast<const std::uint32_t*>(top);
         } else if (want_top) {
             linear(head, mtp.mxn, mtp.mlogits, n, stream, wide, iu4);
-            argmax_kernel<<<n, 1024, 0, stream>>>(mtp.mlogits, V, mtp.top);
+            argmax_kernel<<<n, 1024, 0, stream>>>(mtp.mlogits, V, top, pick.dev);
             o.logits = mtp.mlogits;
-            o.top = reinterpret_cast<const std::uint32_t*>(mtp.top);
+            o.top = reinterpret_cast<const std::uint32_t*>(top);
         }
         HK(hipGetLastError());
         o.hidden_pre = mtp.mx;
@@ -1650,6 +1698,7 @@ void HipEngine::commit(std::uint32_t k) {
 void HipEngine::read_top(const HipRowsOut& o, std::uint32_t rows, std::uint32_t* host) const {
     HK(hipMemcpyAsync(host, o.top, rows * 4U, hipMemcpyDeviceToHost, p_->stream));
     HK(hipStreamSynchronize(p_->stream));
+    p_->pick.check("read_top");
 }
 void HipEngine::read_logits(const HipRowsOut& o, std::uint32_t rows, float* host) const {
     HK(hipMemcpyAsync(host, o.logits, std::size_t(rows) * p_->V * 4U, hipMemcpyDeviceToHost, p_->stream));
@@ -1732,6 +1781,12 @@ bool HipEngine::has_mtp_layer(const std::string& path) {
 HipMtpOut HipEngine::mtp_forward(const std::uint32_t* t, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0, bool want_top) {
     return p_->mtp_run(t, hidden_dev, rows, pos0, want_top);
 }
+HipMtpOut HipEngine::mtp_step_fed(const std::uint32_t* in_host, std::uint32_t in_slot, std::uint32_t out_slot, const float* hidden_dev,
+                                  std::uint32_t pos, bool want_top) {
+    return p_->mtp_fed(in_host, in_slot, out_slot, hidden_dev, pos, want_top);
+}
+void HipEngine::mtp_feed_put(std::uint32_t slot, const std::uint32_t* top_dev) { p_->mtp_feed_put(slot, top_dev); }
+void HipEngine::mtp_feed_read(std::uint32_t n, std::uint32_t* host) const { p_->mtp_feed_read(n, host); }
 float* HipEngine::alloc_f32(std::size_t n) const {
     float* q = nullptr;
     HK(hipMalloc(&q, n * sizeof(float)));

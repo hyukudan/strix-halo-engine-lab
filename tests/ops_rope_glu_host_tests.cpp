@@ -7,6 +7,8 @@
 #include "ops/glu/glu.hpp"
 #include "ops/rope/rope.hpp"
 
+#include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -82,6 +84,67 @@ void epilogue_tests() {
     check(ok, "linear epilogue");
     // one rounding, not two: a value whose separate roundings differ from the joint one
     check(same_bits(strix::ops::glu::epilogue<Round::bf16>(1.0F + 0x1.0p-9F, bias, 0), bf(1.0F + 0x1.0p-9F + 0.25F)), "single rounding");
+}
+
+// Store epilogue (q8a8 View::round_bf16 / StoreRounded, known_rows PrefillRows::rawdots_bf16): the producer stores
+// epilogue<bf16>(total, bias, o) instead of total, and the separate pass y = epilogue<bf16>(y, bias, o) is dropped.
+// (1) Every FP32 pattern: the unbiased bf16 epilogue is idempotent, so a configuration that still runs the pass over
+//     stored rounded values (a diagnostic path, a mixed binder) gives the same bits as either form alone.
+// (2) K parts: the parts are added by the store in the same order, and the epilogue sees the same full total.
+void store_epilogue_tests() {
+    using strix::ops::glu::Round;
+    std::uint64_t bad = 0;
+    for (std::uint64_t u = 0; u <= 0xffffffffULL; ++u) {
+        const float x = std::bit_cast<float>(static_cast<std::uint32_t>(u));
+        const float once = strix::ops::glu::epilogue<Round::bf16>(x, nullptr, 0U);
+        const float twice = strix::ops::glu::epilogue<Round::bf16>(once, nullptr, 0U);
+        if (std::bit_cast<std::uint32_t>(once) != std::bit_cast<std::uint32_t>(twice)) ++bad;
+    }
+    check(bad == 0U, "bf16 epilogue idempotent over all 2^32 FP32 patterns");
+    const float bias[4] = {0.25F, -1.5F, 3.0e-3F, 0.0F};
+    bool ok = true;
+    for (int i = 0; i < 20000; ++i) {
+        const float s0 = next_value(40.0F), s1 = next_value(40.0F), s2 = next_value(40.0F);
+        const auto o = static_cast<std::size_t>(i % 4);
+        const float* b = (i & 4) != 0 ? bias : nullptr;
+        // unfused: Store writes s0, adds s1, adds s2; then the epilogue pass
+        float y = s0;
+        y = y + s1;
+        y = y + s2;
+        const float unfused = strix::ops::glu::epilogue<Round::bf16>(y, b, o);
+        // fused (enqueue_parts): plain Store for parts 0..1, StoreRounded on the last part: epilogue(*dst + value)
+        float z = s0;
+        z = z + s1;
+        const float fused = strix::ops::glu::epilogue<Round::bf16>(z + s2, b, o);
+        ok = ok && same_bits(unfused, fused);
+        // one part: StoreRounded writes epilogue(sum); a later (kept) pass changes nothing when unbiased
+        const float one = strix::ops::glu::epilogue<Round::bf16>(s0, b, o);
+        if (b == nullptr) ok = ok && same_bits(strix::ops::glu::epilogue<Round::bf16>(one, nullptr, o), one);
+    }
+    check(ok, "store epilogue == plain store + epilogue pass (parts, bias, no bias)");
+    // (3) Batched form (q8a8 kernel_linear, batch > 1, no bias; Hy4 attn_v_b: H products of vd columns, out_stride H * vd,
+    //     batch_out vd): product z stores row r column o at r * stride + z * batch_out + o. These indices cover
+    //     [0, rows * stride) exactly once, so the per-product store epilogue = the separate pass over the whole buffer.
+    for (const auto& shape : {std::array<std::size_t, 3>{7U, 64U, 256U}, std::array<std::size_t, 3>{16U, 3U, 48U}}) {
+        const std::size_t rows = shape[0], heads = shape[1], cols = shape[2], stride = heads * cols, n = rows * stride;
+        std::vector<float> sums(n), pass(n), fused(n, 0.0F);
+        std::vector<unsigned> hits(n, 0U);
+        for (std::size_t i = 0; i < n; ++i) sums[i] = next_value(40.0F);
+        for (std::size_t i = 0; i < n; ++i) pass[i] = strix::ops::glu::epilogue<Round::bf16>(sums[i], nullptr, 0U);  // separate pass
+        for (std::size_t z = 0; z < heads; ++z)
+            for (std::size_t r = 0; r < rows; ++r)
+                for (std::size_t o = 0; o < cols; ++o) {
+                    const std::size_t at = r * stride + z * cols + o;  // StoreRounded::put of product z (out + z * batch_out)
+                    ++hits[at];
+                    fused[at] = strix::ops::glu::epilogue<Round::bf16>(sums[at], nullptr, o);
+                }
+        bool cover = true, same = true;
+        for (std::size_t i = 0; i < n; ++i) {
+            cover = cover && hits[i] == 1U;
+            same = same && same_bits(pass[i], fused[i]);
+        }
+        check(cover && same, "batched store epilogue covers every element once and equals the separate pass");
+    }
 }
 
 // The MODEL_B reference rotation, written independently of the op (modelb-host-ref-v1).
@@ -160,6 +223,7 @@ void rope_tests() {
 int main() {
     glu_tests();
     epilogue_tests();
+    store_epilogue_tests();
     rope_tests();
     if (failures) return 1;
     std::printf("PASS ops rope/glu host contract\n");
