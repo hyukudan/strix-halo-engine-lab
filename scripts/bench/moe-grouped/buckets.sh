@@ -25,6 +25,8 @@ kernels() {  # top MoE kernels of one trace: name, calls, mean us
   python3 - "$st" <<'PY'
 import csv, sys
 rows = [r for r in csv.DictReader(open(sys.argv[1])) if 'prefill_f16x' in r['Name']]
+if not rows:
+    raise SystemExit('No prefill_f16x kernel rows in profiler report')
 for r in sorted(rows, key=lambda r: -float(r['TotalDurationNs']))[:2]:
     n = r['Name'].replace('(anonymous namespace)::', '').split('(')[0].split('::')[-1]
     print('  kernel %-40s calls %4s mean %9.1f us' % (n, r['Calls'], float(r['AverageNs']) / 1e3))
