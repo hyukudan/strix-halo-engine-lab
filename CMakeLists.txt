@@ -1543,6 +1543,12 @@ if(BUILD_TESTING)
     # Its worker/selector gates are bounded; this bounds a wait inside the selection itself.
     set_tests_properties(strix-mtp-selection-transaction-tests PROPERTIES TIMEOUT 900)
 
+    # Thinking budgets on device-greedy windows (argmax replies only): select_greedy_window + ArgmaxConstraintRequests.
+    add_executable(strix-greedy-window-selection-tests tests/greedy_window_selection_tests.cpp)
+    target_link_libraries(strix-greedy-window-selection-tests PRIVATE strix_serve)
+    strix_target_warnings(strix-greedy-window-selection-tests)
+    add_test(NAME strix-greedy-window-selection-tests COMMAND strix-greedy-window-selection-tests)
+
     add_executable(strix-serve-json-constraint-tests tests/serve_json_constraint_tests.cpp)
     target_link_libraries(strix-serve-json-constraint-tests PRIVATE strix_serve)
     strix_target_warnings(strix-serve-json-constraint-tests)

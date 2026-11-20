@@ -72,13 +72,7 @@ public:
         ranked_=policy.ranked;
         std::fprintf(stderr,"constraint mask ahead: %s, ranked membership: %u\n",ahead_?"on":"off",argmax_first_?ranked_:0U);
     }
-    bool available(std::span<const std::uint32_t> stops) const {
-        const auto id=tokenizer_->find("</think>");
-        return id!=UINT32_MAX && tokenizer_->token_bytes(id)=="</think>" &&
-            (tokenizer_->type(id)==serve::BpeTokenizer::TokenType::control ||
-             tokenizer_->type(id)==serve::BpeTokenizer::TokenType::user_defined) &&
-            std::find(stops.begin(),stops.end(),id)==stops.end();
-    }
+    bool available(std::span<const std::uint32_t> stops) const {return serve::thinking_closure_usable(*tokenizer_,stops);}
     std::shared_ptr<MtpConstraintRow> make(const std::shared_ptr<const serve::ConstraintSpec>& spec) {
         if(!spec) return {};
         if(!trie_) trie_=std::make_shared<serve::TokenByteTrie>(*tokenizer_,spec->eos_ids);

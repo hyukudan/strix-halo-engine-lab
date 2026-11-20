@@ -29,4 +29,22 @@ MtpSelectionPrefix walk_mtp_selection(std::span<const std::uint32_t> proposals,
     return plan;
 }
 
+GreedyWindowSelection select_greedy_window(MtpSelectionTransaction& transaction,
+    std::span<const std::uint32_t> drafts, std::span<const std::uint32_t> argmax) {
+    if (argmax.empty() || drafts.size() + 1 != argmax.size())
+        throw std::invalid_argument("greedy window: one argmax reply per input row (the pending token and every draft)");
+    transaction.reset();
+    transaction.expect(drafts);
+    auto plan = walk_mtp_selection(drafts, argmax.size(), argmax.size(), {}, [&](std::size_t row) {
+        if (const auto known = transaction.select_known(argmax[row], 0)) return *known;
+        throw MtpSelectionError("greedy window: row " + std::to_string(row) +
+                                " needs host logits; this engine replies with each row's argmax only");
+    });
+    if (plan.selection_failure) {
+        transaction.discard();
+        throw MtpSelectionError(*plan.selection_failure);
+    }
+    return {std::move(plan.selected_ids), transaction.seal()};
+}
+
 }  // namespace strix
