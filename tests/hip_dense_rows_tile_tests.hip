@@ -3,7 +3,8 @@
 //     F32 512 x 3072 fp32 input rows 2048 (model-B router), F32 16 x 3072 fp32 rows 37 (indexer proj, ragged rows),
 //     BF16 1003 x 3000 bf16 input rows 13 with strides (ragged outputs, width not a multiple of 256),
 //     Q8_0 300 x 2048 bf16 rows 9, F16 64 x 768 fp32 rows 2; outputs outside the stored range stay untouched.
-//  2. timing (printed, not asserted): router geometry, rows 2048: per-row loop vs rows tile, median of 5.
+//  2. timing (printed, not asserted): router geometry, rows 2048, and the next-token block's BF16 rows (2 / 4 / 8 rows):
+//     per-row loop vs rows tile, median of 5.
 //  3. grouped rows (HipDenseRowsView::groups) == one plain launch per group, BITWISE, wave and block form and group_loop:
 //     BF16 expert slices 1536 x 1536 with device ids (shared / per-group input), BF16 absorb heads (strided in / out),
 //     Q8_0 block form; a slice id outside the weights leaves NaN in that group only. Timing printed (expert gate, K_b).
@@ -152,7 +153,7 @@ void identity(const Case& c, bool time_it) {
             }
         std::sort(ms[0], ms[0] + 5);
         std::sort(ms[1], ms[1] + 5);
-        std::printf("TIMING router F32 %u x %u rows %u: per-row loop %.3f ms, rows tile %.3f ms (median of 5)\n",
+        std::printf("TIMING type %u %u x %u rows %u: per-row loop %.3f ms, rows tile %.3f ms (median of 5)\n", c.ggml_type,
                     c.outputs, c.width, c.rows, static_cast<double>(ms[0][2]), static_cast<double>(ms[1][2]));
         hip(hipEventDestroy(e0), "event");
         hip(hipEventDestroy(e1), "event");
@@ -294,6 +295,15 @@ int main() {
                   "rows tile == per-row, bitwise: Q8_0 300 x 2048 bf16 rows 9"}, false);
         identity({1U, 64U, 768U, 2U, 768U, 64U, false,
                   "rows tile == per-row, bitwise: F16 64 x 768 fp32 rows 2"}, false);
+        // the next-token block's BF16 rows in the rows form of nextn_rows (fp32 activations): per-row wave launches vs the tile
+        identity({30U, 8192U, 3072U, 4U, 3072U, 8192U, false,
+                  "rows tile == per-row, bitwise: BF16 8192 x 3072 fp32 rows 4 (attn_gate)"}, true);
+        identity({30U, 3072U, 8192U, 4U, 8192U, 3072U, false,
+                  "rows tile == per-row, bitwise: BF16 3072 x 8192 fp32 rows 4 (attn_output)"}, true);
+        identity({30U, 3072U, 8192U, 8U, 8192U, 3072U, false,
+                  "rows tile == per-row, bitwise: BF16 3072 x 8192 fp32 rows 8 (attn_output)"}, true);
+        identity({30U, 3072U, 6144U, 2U, 6144U, 3072U, false,
+                  "rows tile == per-row, bitwise: BF16 3072 x 6144 fp32 rows 2 (eh_proj)"}, true);
         grouped({30U, 1536U, 1536U, 64U, 16U, 0U, 1536U, true, false, false,
                  "grouped == per-group, bitwise: BF16 16 of 64 slices 1536 x 1536, device ids, shared fp32 input (expert gate)"}, true);
         grouped({30U, 1536U, 1536U, 64U, 16U, 1536U, 1536U, true, false, false,

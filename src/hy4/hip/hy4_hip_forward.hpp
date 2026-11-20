@@ -105,7 +105,7 @@ public:
     void commit_rows(std::uint32_t k);
     void set_rows_expert_union(bool on) noexcept;  // routed experts of a window read once (bitwise); A/B aid of the bench
     // Device [R][hidden] rows of output_norm(hidden) (the head's input) of the last forward_rows pass; valid until the next
-    // pass. The MTP teacher input of the committed rows.
+    // pass or the next nextn_rows call (its rows form uses the verify workspace). The MTP teacher input of the committed rows.
     [[nodiscard]] const float* rows_hidden() const noexcept;
 
     // ---- next-token (MTP) block (options.nextn, whole-model rank; GGUF block config().layers), host oracle
@@ -118,6 +118,9 @@ public:
     // max, lowest id on ties) at top[R - 1]; the other entries are 0. The block's numerics are those of the pack (BF16
     // weights as stored, routed experts by per-expert dense rows): class FAST, a drafter only (the verify decides every id;
     // never touches the target's caches, position or token history). Synchronises.
+    // Rows form (options.verify_rows >= 2): the call's rows run in chunks of up to verify_rows through the verify rows form
+    // (every non-expert weight read once per chunk; experts per row), each row bitwise equal to the per-row loop;
+    // set_nextn_row_loop(true) runs one row at a time (the identity reference of the device check).
     struct NextnOut {
         const std::uint32_t* top = nullptr;   // device [R]
         const float* hidden_pre = nullptr;    // device [R][hidden]: x before shared_head_norm
@@ -125,6 +128,7 @@ public:
     };
     static constexpr std::uint32_t kNextnRows = 32;  // widest nextn_rows call
     [[nodiscard]] bool has_nextn() const noexcept;
+    void set_nextn_row_loop(bool on) noexcept;
     NextnOut nextn_rows(const std::uint32_t* tokens, const float* hidden, std::uint32_t rows, std::uint32_t pos0, bool want_top);
     // Logits of the last nextn_rows row (host copy; want_top must have been set): the device-vs-oracle check.
     [[nodiscard]] const std::vector<float>& nextn_logits();

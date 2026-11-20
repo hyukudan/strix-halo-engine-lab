@@ -46,6 +46,36 @@ void check_rings(const strix::hy4::Config& c, const char* name) {
     std::printf("%s: rewind replay R 1..8 PASS on %u layers, one-row rings clobbered on %u\n", name, c.layers, clobbered);
 }
 
+// The next-token block in the rows form (Forward::nextn_rows): chunks cover the call's rows once, in order, each within
+// the verify rows (its workspace), and the block's caches (the layout allocate_nextn appends at block id c.layers, rings
+// sized cache_rows(prompt, verify)) survive a chunk written ahead of its reads then redone (the flush after a rejection).
+void check_nextn_rows(const strix::hy4::Config& c, const char* name) {
+    for (const std::uint32_t vmax : {0U, 1U, 2U, 5U, hb::rows::kMaxVerifyRows})
+        for (std::uint32_t R = 1; R <= 32U; ++R) {
+            std::uint32_t off = 0, chunks = 0;
+            while (const std::uint32_t n = hb::rows::nextn_chunk(off, R, vmax)) {
+                CHECK(n <= std::max(1U, vmax));
+                off += n;
+                ++chunks;
+            }
+            CHECK(off == R);
+            CHECK(chunks == (R + std::max(1U, vmax) - 1U) / std::max(1U, vmax));
+        }
+    for (const std::uint8_t indexed : {std::uint8_t{0}, std::uint8_t{1}}) {
+        auto cx = c;  // allocate_nextn's form: the block's heads / indexed / dense appended at id c.layers
+        cx.heads.push_back(indexed != 0U ? 32U : 64U);
+        cx.indexed.push_back(indexed);
+        cx.dense.push_back(0U);
+        for (const std::uint32_t prompt_rows : {0U, 16U}) {
+            const auto e = hb::rows::check_rewind(cx, c.layers, 8192U, hb::rows::cache_rows(prompt_rows, hb::rows::kMaxVerifyRows),
+                                                  hb::rows::kMaxVerifyRows);
+            if (!e.empty()) std::fprintf(stderr, "%s nextn: %s\n", name, e.c_str());
+            CHECK(e.empty());
+        }
+    }
+    std::printf("%s: next-token rows chunks 1..32 x verify 0..8 PASS, block rings (indexed / sliding) PASS\n", name);
+}
+
 void check_words() {
     for (std::uint32_t p = 0; p < 100; ++p) {
         const auto w = hb::rows::position_words(p, 4U);
@@ -303,6 +333,7 @@ int main(int argc, char** argv) {
         check_rings(wide, "window 512");
         if (argc > 1 && std::filesystem::exists(argv[1])) check_rings(strix::hy4::Config::from_gguf(argv[1]), "pack");
         check_words();
+        check_nextn_rows(wide, "window 512");
         check_spec();
         check_spec_mtp();
         check_survival_seed();

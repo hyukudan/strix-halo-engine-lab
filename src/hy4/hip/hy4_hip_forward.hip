@@ -301,6 +301,9 @@ struct Forward::Impl {
         std::uint32_t* top = nullptr;              // pinned host [kNextnRows]: the greedy id of a want_top row
         float *pre = nullptr, *post = nullptr;     // device [kNextnRows][hidden]
         float *x = nullptr, *cat = nullptr, *act = nullptr;  // [hidden] residual, [2 hidden] eh_proj input, [top_k][expert_ff]
+        bool row_loop = false;                     // one row at a time (the rows form's identity reference)
+        float *xr = nullptr, *catr = nullptr;      // rows form: [vr.max][hidden] residual rows, [vr.max][2 hidden] eh_proj input
+        std::uint32_t* words = nullptr;            // rows form: pinned [kNextnRows][4] position words, one slot per row of a call
         Staging* stages = nullptr;  // pinned, one per row of a call: rows run with no host sync between them, so each row's
                                     // async uploads (position, dense list length) read their own slot
         std::vector<float> logits;                 // host copy of the last want_top row (nextn_logits)
@@ -765,7 +768,9 @@ struct Forward::Impl {
     // top_k slices (one launch each, BF16 outputs), act = swiglu(g, u, swiglu_limit), rawdots[k] = W_d[ids[k]] act[k]
     // (one launch; rounded by the caller's epilogue). 3 launches; every output bitwise equal to its per-expert linear().
     // A routed id outside the experts writes NaN (caught by the non-finite checks downstream).
-    void experts_dense(const Tensor& wg, const Tensor& wu, const Tensor& wd) {
+    // One row's experts: zr = its routed_down output [latent], idr = its device top-k ids, raw = its [K][latent] down outputs
+    // (the decode step: z / ids / rawdots; the rows form: row r of vr.z / vr.ids / vr.rawdots).
+    void experts_dense(const Tensor& wg, const Tensor& wu, const Tensor& wd, const float* zr, const std::uint32_t* idr, float* raw) {
         const std::uint32_t K = c.top_k, I = c.expert_ff, L = c.latent;
         if (!nx.act) throw std::logic_error("hy4 hip forward: BF16 experts without the next-token workspace");
         if (wu.type != wg.type || wd.type != wg.type) throw std::runtime_error("hy4 hip forward: mixed BF16 expert types");
@@ -774,11 +779,11 @@ struct Forward::Impl {
             throw std::runtime_error("hy4 hip forward: BF16 expert shapes");
         float* const gk = pout;                        // [K][I]
         float* const uk = pout + std::size_t{K} * I;   // [K][I]
-        linear_groups(wg.p, wg.type, gate_slice, c.experts, ids, K, z, 0U, L, I, gk, I);
-        linear_groups(wu.p, wu.type, gate_slice, c.experts, ids, K, z, 0U, L, I, uk, I);
+        linear_groups(wg.p, wg.type, gate_slice, c.experts, idr, K, zr, 0U, L, I, gk, I);
+        linear_groups(wu.p, wu.type, gate_slice, c.experts, idr, K, zr, 0U, L, I, uk, I);
         glu::launch_epilogue<glu::Round::bf16>(pout, nullptr, 2U * std::size_t{K} * I, 2U * std::size_t{K} * I, pout, s);  // BF16 Linear outputs
         glu::launch_swiglu<glu::DeclaredExp, glu::Round::bf16>(gk, uk, std::size_t{K} * I, c.swiglu_limit, nx.act, s);
-        linear_groups(wd.p, wd.type, down_slice, c.experts, ids, K, nx.act, I, I, L, rawdots, L);
+        linear_groups(wd.p, wd.type, down_slice, c.experts, idr, K, nx.act, I, I, L, raw, L);
         check(hipGetLastError(), "BF16 experts launch");
     }
 
@@ -797,7 +802,7 @@ struct Forward::Impl {
             const auto& wu = t(blk(l, "ffn_up_exps.weight"));
             const auto& wd = t(blk(l, "ffn_down_exps.weight"));
             if (wg.type == kTypeBf16) {  // the next-token block: BF16 slices by the shared dense rows (the A8 form has no BF16)
-                experts_dense(wg, wu, wd);
+                experts_dense(wg, wu, wd, z, ids, rawdots);
             } else {
                 // this layer's two status words (zeroed once per step, read once at the step end: no per-layer host sync)
                 std::uint32_t* const ps = dstatus_all + 8U * std::size_t{l};
@@ -1462,12 +1467,55 @@ struct Forward::Impl {
         check(hipHostMalloc(&tp, kNextnRows * sizeof(std::uint32_t), hipHostMallocDefault), "next-token ids");
         nx.top = static_cast<std::uint32_t*>(tp);
         std::fill(nx.top, nx.top + kNextnRows, 0U);
+        if (vr.max >= 2U) {  // the rows form runs through the verify workspace (allocate_verify before this)
+            nx.xr = alloc<float>(std::size_t{vr.max} * h);
+            nx.catr = alloc<float>(std::size_t{vr.max} * 2U * h);
+            void* wp = nullptr;
+            check(hipHostMalloc(&wp, kNextnRows * 4U * sizeof(std::uint32_t), hipHostMallocDefault), "next-token position words");
+            nx.words = static_cast<std::uint32_t*>(wp);
+        }
         if (rmax) {
             nx.ph = alloc<float>(std::size_t{rmax} * h);
             nx.pu = alloc<float>(std::size_t{rmax} * h);
             nx.mixh = alloc<hcc::MixRow<kHead>>(rmax);
             nx.partial = alloc<float>(hcc::mix_partial_floats<kHead>(rmax, c.hidden));
         }
+    }
+
+    // Rows form of nextn_rows: rows off .. off + rows_n - 1 of the call (rows_n <= vr.max) through the verify rows form at
+    // block L (attention_vrows / ffn_vrows: every non-expert weight read once for the chunk; BF16 experts and absorb heads
+    // per row by the grouped dense rows). Per-row arithmetic = the per-row loop's (rows tile == single-row dense rows,
+    // bitwise; the norms / rope / epilogues / flash / route are the same kernels over more rows).
+    void nextn_chunk_rows(const std::uint32_t* toks, const float* hid, std::uint32_t off, std::uint32_t rows_n, std::uint32_t p0) {
+        const std::uint32_t L = c.layers;
+        const std::size_t h = c.hidden, nh = std::size_t{rows_n} * h;
+        vr.p0 = p0 + off;
+        std::uint32_t* const words = nx.words + 4U * std::size_t{off};  // the rows' own pinned slots: no sync inside a call
+        for (std::uint32_t r = 0; r < rows_n; ++r) {
+            const auto pw = rows::position_words(vr.p0 + r, kIdxRatio);
+            std::copy(pw.begin(), pw.end(), words + 4U * r);
+        }
+        check(hipMemcpyAsync(vr.dpos, words, 16U * std::size_t{rows_n}, hipMemcpyHostToDevice, s), "next-token position words upload");
+        const auto& te = t("token_embd.weight");
+        launch_hip_embedding_rows({te.p, te.type, c.hidden, c.vocab}, HipActivationStorage::fp32,
+                                  std::span<const std::uint32_t>(toks + off, rows_n), nx.xr, c.hidden, s);
+        glu::launch_epilogue<glu::Round::bf16>(nx.xr, nullptr, nh, nh, nx.xr, s);  // e: BF16 values
+        const float* const en = t(blk(L, "nextn.enorm.weight")).f();
+        const float* const hn = t(blk(L, "nextn.hnorm.weight")).f();
+        for (std::uint32_t r = 0; r < rows_n; ++r) {
+            norm(nx.xr + r * h, en, c.hidden, c.rms_eps, nx.catr + 2U * r * h);
+            norm(hid + (off + r) * h, hn, c.hidden, c.rms_eps, nx.catr + 2U * r * h + h);
+        }
+        linear_vrows(blk(L, "nextn.eh_proj.weight"), nx.catr, 2U * c.hidden, c.hidden, rows_n, nx.xr);
+        norm_rows(nx.xr, t(blk(L, "attn_norm.weight")).f(), c.hidden, rows_n, vr.xn);
+        attention_vrows(L, rows_n);                                                 // vr.xn -> vr.f (post_attention_norm)
+        glu::launch_epilogue<glu::Round::bf16>(nx.xr, vr.f, nh, nh, nx.xr, s);    // x = bf(x + attn)
+        norm_rows(nx.xr, t(blk(L, "ffn_norm.weight")).f(), c.hidden, rows_n, vr.xn);
+        ffn_vrows(L, rows_n);                                                       // vr.xn -> vr.f (post_ffw_norm)
+        glu::launch_epilogue<glu::Round::bf16>(nx.xr, vr.f, nh, nh, nx.xr, s);    // x = bf(x + ffn)
+        check(hipMemcpyAsync(nx.pre + off * h, nx.xr, nh * 4U, hipMemcpyDeviceToDevice, s), "next-token hidden rows copy");
+        norm_rows(nx.xr, t(blk(L, "nextn.shared_head_norm.weight")).f(), c.hidden, rows_n, nx.post + off * h);
+        std::fill(nx.top + off, nx.top + off + rows_n, 0U);
     }
 
     Forward::NextnOut nextn_rows(const std::uint32_t* toks, const float* hid, std::uint32_t R, std::uint32_t p0, bool want_top) {
@@ -1481,10 +1529,15 @@ struct Forward::Impl {
         const auto& te = t("token_embd.weight");
         const std::uint32_t saved = pos;  // attention / indexer read the query position from pos (the oracle's form)
         Staging* const saved_stage = stage;
+        const std::uint32_t saved_p0 = vr.p0;  // the rows form binds the verify workspace (committed: vr.rows == 0)
+        const bool rows_form = !nx.row_loop && nx.words != nullptr && vr.rows == 0U && R >= 2U;
         nx.logits_ready = false;
         std::uint32_t bad = 0;
         try {
-            for (std::uint32_t r = 0; r < R; ++r) {
+            if (rows_form)
+                for (std::uint32_t off = 0, rows_n = 0; (rows_n = rows::nextn_chunk(off, R, vr.max)) != 0U; off += rows_n)
+                    nextn_chunk_rows(toks, hid, off, rows_n, p0);
+            for (std::uint32_t r = 0; !rows_form && r < R; ++r) {
                 const std::uint32_t p = p0 + r;
                 pos = p;
                 hpos = {p, p / kIdxRatio * kIdxRatio, p / kIdxRatio, 0U};
@@ -1520,10 +1573,12 @@ struct Forward::Impl {
         } catch (...) {
             pos = saved;
             stage = saved_stage;
+            vr.p0 = saved_p0;
             throw;
         }
         pos = saved;
         stage = saved_stage;
+        vr.p0 = saved_p0;
         if (bad) throw std::runtime_error("hy4 hip forward: non-finite value in a cache / operand row (next-token block)");
         if (want_top) {
             if (greedy_reply->status != 0U) throw std::runtime_error("hy4 hip forward: non-finite logit (next-token greedy status)");
@@ -1599,9 +1654,11 @@ Forward::~Forward() {
     if (impl_ && impl_->engram_stage) (void)hipHostFree(impl_->engram_stage);
     if (impl_ && impl_->nx.top) (void)hipHostFree(impl_->nx.top);
     if (impl_ && impl_->nx.stages) (void)hipHostFree(impl_->nx.stages);
+    if (impl_ && impl_->nx.words) (void)hipHostFree(impl_->nx.words);
 }
 const float* Forward::rows_hidden() const noexcept { return impl_->vr.xn; }
 bool Forward::has_nextn() const noexcept { return impl_->nx.on; }
+void Forward::set_nextn_row_loop(bool on) noexcept { impl_->nx.row_loop = on; }
 Forward::NextnOut Forward::nextn_rows(const std::uint32_t* tokens, const float* hidden, std::uint32_t rows, std::uint32_t pos0, bool want_top) {
     return impl_->nextn_rows(tokens, hidden, rows, pos0, want_top);
 }
