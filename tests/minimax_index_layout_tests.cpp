@@ -61,6 +61,10 @@ int main() {
             const auto kernel = r::index_route(rows, ring, split, lds);
             check(kernel.tiled == (rows > 8));
             check(r::index_projection_route({}, rows) == r::IndexLayout::packed);
+            // Key-only short-context form: ring 48 where measured faster (1 / 2 rows), an explicit ring still wins.
+            const auto key = r::index_route(rows, ring, split, lds, true);
+            check(key.ring == (ring != 0 ? ring : rows <= 2 ? 48U : kernel.ring) && key.tiled == kernel.tiled &&
+                  key.lds == kernel.lds && key.rows_per_wave == kernel.rows_per_wave);
         }
     std::cout << "MiniMax index layouts: routes, bytes, admission and refusal gates passed\n";
 }

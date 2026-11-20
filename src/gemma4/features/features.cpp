@@ -148,7 +148,7 @@ Result Exporter::export_features(const Request& r) {
             if (many && r.prefix->size()-p > 8) {
                 const auto n = std::min<std::size_t>(r.prefix->size()-p,many-p%many);
                 auto tx = temporary.state->begin();
-                (void)backend_.prefill_rows(*tx,{r.prefix->data()+p,n},false,false);
+                (void)backend_.prefill_rows(*tx,{r.prefix->data()+p,n},HiddenDemand::none,false);
                 tx->commit(n); p += n;
                 continue;
             }
@@ -203,7 +203,7 @@ Result Exporter::export_features(const Request& r, engine::StreamState& prefix) 
         const auto many = r.chunk_rows == 8 ? backend_.prefill_chunk_rows() : 0;
         if (many && b.tokens.size() > 8 && b.tokens.size() <= many) {
             tx.reset(); tx = prefix.begin();
-            const auto rows = backend_.prefill_rows(*tx,b.tokens,true,false);
+            const auto rows = backend_.prefill_rows(*tx,b.tokens,HiddenDemand::all_rows,false);
             const auto hidden_rows = rows.hidden_rows();
             if (hidden_rows.size() != b.tokens.size()*c.hidden) throw std::runtime_error("backend returned incomplete feature rows");
             const auto row = [&](std::size_t position) {

@@ -330,6 +330,20 @@ class ArmsFileTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_arms(path, ["X"])
 
+    def test_route_record_and_replay_arms(self):
+        """FAST gate v2: routes {"out": bool, "in": "OTHER"}; the route files themselves are runner-owned hooks."""
+        from tools.qualification.option_qual.run import load_arms
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "arms.json"
+            arms = {"REF": {"routes": {"out": True}}, "X": {"routes": {"in": "REF"}, "env": {"STRIX_MOE_ROUTE_NULL": "0:1"}}}
+            path.write_text(json.dumps({"arms": arms}))
+            self.assertEqual(load_arms(path, ["REF", "X"])["X"]["routes"], {"in": "REF"})
+            for bad in ({"routes": {"in": "X"}}, {"routes": {"out": "yes"}}, {"routes": {"both": True}}, {"routes": []},
+                        {"env": {"STRIX_MOE_ROUTES_IN": "f.rte"}}, {"env": {"STRIX_MOE_ROUTES_OUT": "f.rte"}}):
+                path.write_text(json.dumps({"arms": {"X": bad}}))
+                with self.assertRaises(ValueError):
+                    load_arms(path, ["X"])
+
     def test_option_switches_allowed_hook_variables_refused(self):
         from tools.qualification.option_qual.run import load_arms
         with tempfile.TemporaryDirectory() as d:

@@ -1,7 +1,7 @@
 #pragma once
 
 // engine::DraftSession adapter for the MTP assistant drafter.
-// Needs from the target per cycle: the post-final-norm hidden of the last committed row (A1: wants_hidden +
+// Needs from the target per cycle: the post-final-norm hidden of the last committed row (A1: hidden_demand +
 // stage_rows) and read-only committed KV views of target layers 22 (sliding) and 23 (full) (A6: attach + kv_view).
 // The admitted k is passed through A1's propose_window. No drafter state besides that one hidden row.
 #include "mtp.hpp"
@@ -49,7 +49,8 @@ public:
     void publish() override;
     void discard() noexcept override;
     std::array<std::uint32_t, 7> propose_window(std::uint32_t anchor, std::uint64_t position, std::uint32_t k) STRIX_G4_MTP_ROWS;
-    [[nodiscard]] bool wants_hidden() const STRIX_G4_MTP_ROWS { return true; }
+    // The last committed row's hidden only: prefill keeps no other row alive for it (HiddenDemand contract).
+    [[nodiscard]] HiddenDemand hidden_demand() const STRIX_G4_MTP_ROWS { return HiddenDemand::last_committed; }
     // stage_rows keeps only the last final hidden row; target taps are never read.
     [[nodiscard]] bool wants_taps() const STRIX_G4_MTP_ROWS { return false; }
     // Cost grows per depth from a small base (~0.56 ms/depth on E4B): eligible for multi-stream auto,

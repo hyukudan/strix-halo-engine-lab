@@ -1,6 +1,6 @@
 """Streaming readers for full-vocabulary logit records.
 
-Two little-endian formats, FP32 logits in ascending vocabulary order:
+Three little-endian formats, FP32 logits in ascending vocabulary order:
 
 * step stream (``STRIX_BITCALC_LOGITS_OUT``): per token selection a header of six uint32
   ``magic, step, position, argmax, emitted, vocab`` followed by ``vocab`` floats. With forced
@@ -8,10 +8,13 @@ Two little-endian formats, FP32 logits in ascending vocabulary order:
 * teacher spool (``--teacher-logits-file``): ``TMLLOG01``, u64 vocab, u64 rows, u64 input count,
   u32 input IDs; per row u32 input, u64 position, ``vocab`` floats; footer ``TMLEOF01``, u64 rows.
   Row ``r`` is scored against input ``r + 1``.
+* head dump (a prefill quality tool's teacher head): ``rows`` x vocab floats, no header; the prompt IDs come from the
+  caller (``read_head(path, ids=..., rows=...)``). Row ``j`` is scored against prompt ID ``n - rows + j + 1``.
 
 Readers never load a whole file and reject truncated or incomplete files.
 """
 from dataclasses import dataclass
+import os
 import struct
 
 import numpy as np
@@ -90,7 +93,33 @@ def read_spool(path, hasher=None):
             raise ValueError("trailing bytes after spool footer")
 
 
-READERS = {"steps": read_steps, "spool": read_spool}
+def read_head(path, hasher=None, *, ids, rows):
+    """Head dump: ``rows`` x vocab FP32 rows and nothing else, the logits of the last ``rows`` positions of a prompt
+    ``ids`` (a prefill quality tool's teacher head). Row ``j`` is position ``n - rows + j`` and is scored against the
+    prompt ID ``ids[n - rows + j + 1]`` (held-out text: neither arm generated it); the last row has no label in the
+    prompt, so it is read (and hashed) but not yielded."""
+    ids = np.asarray(ids, dtype=np.int64).reshape(-1)
+    n = int(ids.size)
+    if rows < 2 or rows > n:
+        raise ValueError(f"head rows {rows} outside [2, prompt length {n}]")
+    size = os.path.getsize(path)
+    if size == 0 or size % (4 * rows):
+        raise ValueError(f"head dump of {size} bytes is not {rows} x vocabulary FP32 rows")
+    vocab = size // (4 * rows)
+    if int(ids.min()) < 0 or int(ids.max()) >= vocab:
+        raise ValueError("prompt ID outside the head dump's vocabulary")
+    first = n - rows
+    with open(path, "rb") as raw:
+        f = _Hashing(raw, hasher) if hasher is not None else raw
+        for j in range(rows - 1):
+            logits = np.frombuffer(_exact(f, 4 * vocab, "head logits"), dtype="<f4")
+            yield Row(j, first + j, -1, int(ids[first + j + 1]), logits)
+        _exact(f, 4 * vocab, "head last row")
+        if f.read(1):
+            raise ValueError("trailing bytes after the head rows")
+
+
+READERS = {"steps": read_steps, "spool": read_spool, "head": read_head}
 
 
 def reader(fmt):

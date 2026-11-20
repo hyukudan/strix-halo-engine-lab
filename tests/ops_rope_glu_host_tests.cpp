@@ -1,0 +1,167 @@
+// Host contract of the shared RoPE and gated elementwise ops (src/ops/rope, src/ops/glu):
+//  - glu Round::none + DeclaredExp == ds41_moe.hpp swiglu_clamped (the lifted DS41 form) bit for bit;
+//  - glu Round::bf16 == the MODEL_B reference expressions (modelb-host-ref-v1: bf(bf(silu(g)) * u), bf(bf(x) * bf(sigmoid(g))));
+//  - native table + reference_apply Round::bf16 == the MODEL_B reference rotation (interleaved pairs, theta^(-2i/64) in FP32,
+//    cos / sin from double rounded to BF16, BF16 outputs) on the trailing 64 of a 256-wide head;
+//  - positions index table rows; inverse undoes the rotation (Round::none, within rounding).
+#include "ops/glu/glu.hpp"
+#include "ops/rope/rope.hpp"
+
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+#include <vector>
+
+namespace {
+
+int failures = 0;
+void check(bool ok, const char* what) {
+    if (!ok) {
+        std::fprintf(stderr, "FAIL %s\n", what);
+        ++failures;
+    }
+}
+bool same_bits(float a, float b) { return std::memcmp(&a, &b, sizeof a) == 0; }
+float bf(float x) { return strix::ds41::round_to_bf16(x); }
+
+std::uint32_t lcg = 12345U;
+float next_value(float scale) {
+    lcg = lcg * 1664525U + 1013904223U;
+    return (static_cast<float>(lcg >> 8U) / 16777216.0F - 0.5F) * 2.0F * scale;
+}
+
+void glu_tests() {
+    using strix::ops::glu::DeclaredExp;
+    using strix::ops::glu::Round;
+    const float limits[] = {10.0F, 7.0F, strix::ops::glu::no_clamp};
+    bool none_ok = true, bf_ok = true, gate_ok = true, gate_none_ok = true;
+    for (int i = 0; i < 20000; ++i) {
+        const float g = bf(next_value(24.0F)), u = bf(next_value(24.0F)), x = next_value(3.0F);
+        for (const float limit : limits) {
+            none_ok = none_ok && same_bits(strix::ops::glu::swiglu<DeclaredExp, Round::none>(g, u, limit),
+                                           strix::ds41::swiglu_clamped(g, u, limit));
+            const float gc = g > limit ? limit : g, uc = u < -limit ? -limit : (u > limit ? limit : u);
+            const float silu = gc / (1.0F + strix::ds41::declared_exp(-gc));
+            bf_ok = bf_ok && same_bits(strix::ops::glu::swiglu<DeclaredExp, Round::bf16>(g, u, limit), bf(bf(silu) * uc));
+        }
+        gate_ok = gate_ok && same_bits(strix::ops::glu::sigmoid_gate<DeclaredExp, Round::bf16>(x, g),
+                                       bf(bf(x) * bf(strix::ds41::declared_sigmoid(g))));
+        gate_none_ok = gate_none_ok && same_bits(strix::ops::glu::sigmoid_gate<DeclaredExp, Round::none>(x, g),
+                                                 x * strix::ds41::declared_sigmoid(g));
+    }
+    check(none_ok, "swiglu none == ds41 swiglu_clamped");
+    check(bf_ok, "swiglu bf16 == modelb reference expression");
+    check(gate_ok, "sigmoid gate bf16 == modelb reference expression");
+    check(gate_none_ok, "sigmoid gate none");
+    // Clamp edges: gate clamped from above only, up on both sides, NaN passes through, +inf limit = none.
+    check(strix::ops::glu::swiglu<DeclaredExp, Round::none>(50.0F, 1.0F, 10.0F) ==
+              strix::ops::glu::swiglu<DeclaredExp, Round::none>(10.0F, 1.0F, 10.0F), "gate clamp");
+    check(strix::ops::glu::swiglu<DeclaredExp, Round::none>(1.0F, -50.0F, 10.0F) ==
+              strix::ops::glu::swiglu<DeclaredExp, Round::none>(1.0F, -10.0F, 10.0F), "up clamp");
+    check(strix::ops::glu::swiglu<DeclaredExp, Round::none>(-50.0F, 1.0F, 10.0F) ==
+              strix::ops::glu::swiglu<DeclaredExp, Round::none>(-50.0F, 1.0F, strix::ops::glu::no_clamp), "gate has no lower bound");
+    check(std::isnan(strix::ops::glu::swiglu<DeclaredExp, Round::bf16>(std::numeric_limits<float>::quiet_NaN(), 1.0F, 10.0F)),
+          "NaN passes");
+}
+
+// Linear epilogue: bf16 = one rounding of (x + bias) (the oracle's bf(dot + bias)), unit bias = bf(x); none = x + bias.
+void epilogue_tests() {
+    using strix::ops::glu::Round;
+    bool ok = true;
+    const float bias[3] = {0.25F, -1.5F, 3.0e-3F};
+    for (int i = 0; i < 4000; ++i) {
+        const float x = next_value(40.0F);
+        const auto c = static_cast<std::size_t>(i % 3);
+        ok = ok && same_bits(strix::ops::glu::epilogue<Round::bf16>(x, bias, c), bf(x + bias[c]));
+        ok = ok && same_bits(strix::ops::glu::epilogue<Round::bf16>(x, nullptr, c), bf(x));
+        ok = ok && same_bits(strix::ops::glu::epilogue<Round::none>(x, bias, c), x + bias[c]);
+        ok = ok && same_bits(strix::ops::glu::epilogue<Round::none>(x, nullptr, c), x);
+    }
+    check(ok, "linear epilogue");
+    // one rounding, not two: a value whose separate roundings differ from the joint one
+    check(same_bits(strix::ops::glu::epilogue<Round::bf16>(1.0F + 0x1.0p-9F, bias, 0), bf(1.0F + 0x1.0p-9F + 0.25F)), "single rounding");
+}
+
+// The MODEL_B reference rotation, written independently of the op (modelb-host-ref-v1).
+void modelb_rope(float* x, std::size_t dims, std::uint32_t pos, float theta) {
+    for (std::size_t i = 0; i < dims / 2U; ++i) {
+        const float inv = 1.0F / std::pow(theta, static_cast<float>(2U * i) / static_cast<float>(dims));
+        const float angle = static_cast<float>(pos) * inv;
+        const float c = bf(static_cast<float>(std::cos(static_cast<double>(angle))));
+        const float s = bf(static_cast<float>(std::sin(static_cast<double>(angle))));
+        const float a = x[2U * i], b = x[2U * i + 1U];
+        x[2U * i] = bf(a * c - b * s);
+        x[2U * i + 1U] = bf(b * c + a * s);
+    }
+}
+
+void rope_tests() {
+    using strix::ops::rope::Round;
+    using strix::ops::rope::View;
+    constexpr std::uint32_t heads = 4, head = 256, pairs = 32, nope = 192, rows = 3;
+    const std::uint32_t positions[rows] = {0U, 511U, 70000U};
+    for (const float theta : {1.0e7F, 1.0e4F}) {
+        // Table rows 0 .. 70000 would be large: build one table row per used position (positions index rows 0..2).
+        std::vector<float> ct(rows * pairs), st(rows * pairs);
+        for (std::uint32_t r = 0; r < rows; ++r)
+            strix::ops::rope::build_native_table(theta, pairs, positions[r], 1U, Round::bf16, ct.data() + r * pairs,
+                                                 st.data() + r * pairs);
+        std::vector<float> x(std::size_t{rows} * heads * head);
+        for (auto& v : x) v = bf(next_value(4.0F));
+        auto want = x;
+        for (std::uint32_t r = 0; r < rows; ++r)
+            for (std::uint32_t h = 0; h < heads; ++h) modelb_rope(want.data() + (r * heads + h) * head + nope, 2U * pairs, positions[r], theta);
+        const std::uint32_t slots[rows] = {0U, 1U, 2U};
+        View v;
+        v.x = x.data();
+        v.rows = rows;
+        v.vectors = heads;
+        v.row_stride = heads * head;
+        v.vector_stride = head;
+        v.offset = nope;
+        v.pairs = pairs;
+        v.cos = ct.data();
+        v.sin = st.data();
+        v.positions = slots;
+        strix::ops::rope::reference_apply(v, Round::bf16);
+        check(std::memcmp(x.data(), want.data(), x.size() * sizeof(float)) == 0, "rope bf16 == modelb reference rotation");
+        // Inverse with FP32 tables (BF16 cos / sin are not orthonormal) restores the input within FP32 rounding.
+        for (std::uint32_t r = 0; r < rows; ++r)
+            strix::ops::rope::build_native_table(theta, pairs, positions[r], 1U, Round::none, ct.data() + r * pairs,
+                                                 st.data() + r * pairs);
+        auto y = x;
+        v.x = y.data();
+        strix::ops::rope::reference_apply(v, Round::none);
+        v.inverse = true;
+        strix::ops::rope::reference_apply(v, Round::none);
+        float worst = 0.0F;
+        for (std::size_t i = 0; i < y.size(); ++i) worst = std::fmax(worst, std::fabs(y[i] - x[i]));
+        check(worst < 1e-5F, "rope inverse round trip");
+    }
+    // Table rows are positions: one table of 4 rows from position 5 equals four one-row tables.
+    std::vector<float> c4(4U * pairs), s4(4U * pairs), c1(pairs), s1(pairs);
+    strix::ops::rope::build_native_table(1.0e4F, pairs, 5U, 4U, Round::bf16, c4.data(), s4.data());
+    strix::ops::rope::build_native_table(1.0e4F, pairs, 7U, 1U, Round::bf16, c1.data(), s1.data());
+    check(std::memcmp(c4.data() + 2U * pairs, c1.data(), pairs * sizeof(float)) == 0 &&
+              std::memcmp(s4.data() + 2U * pairs, s1.data(), pairs * sizeof(float)) == 0, "table row = position");
+    bool threw = false;
+    try {
+        strix::ops::rope::reference_apply(View{}, Round::bf16);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    check(threw, "empty view rejected");
+}
+
+}  // namespace
+
+int main() {
+    glu_tests();
+    epilogue_tests();
+    rope_tests();
+    if (failures) return 1;
+    std::printf("PASS ops rope/glu host contract\n");
+    return 0;
+}

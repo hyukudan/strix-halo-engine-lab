@@ -271,26 +271,37 @@ void profile_attention(pf::DevicePrefill& target, const g4::ModelConfig& config,
 }
 // LAST_KV (strix/prefill_row_liveness.hpp) off versus on, interleaved on one prefill object, in two forms:
 // "prompt" = run() (taps of every row, deferred / final head: the last row runs the tail alone where the route allows),
-// "engine" = the engine's prefill_rows passes (no logits, no taps, keep_last_row(false): rows stop at the last K/V owner).
-// Every run must reproduce the first off run's committed KV digest; prompt runs also its last logits and taps.
+// "engine" = the engine's prefill_rows passes (no logits, no taps, keep_last_row(false): rows stop at the last K/V owner),
+// "mtp" = the engine passes with the MTP drafter attached (HiddenDemand: off = all_rows, the every-row export; on =
+// last_committed, each chunk's last row alone, the other rows stop at the last K/V owner).
+// Every run must reproduce the first off run's committed KV digest; prompt runs also its last logits and taps; mtp runs
+// its last logits (last_logits() of the kept row) and every chunk's exported last hidden row (on vs the off export).
 void last_kv_ab(pf::DevicePrefill& prefill, const g4::ModelConfig& config, std::span<const unsigned> tokens, unsigned repetitions) {
     std::string digest;
-    std::vector<float> logits, taps;
-    const auto once = [&](bool on, bool engine, unsigned iteration) {
+    std::vector<float> logits, taps, chunk_hidden;
+    const auto once = [&](bool on, bool engine, unsigned iteration, bool mtp = false) {
         if (setenv("STRIX_G4_PREFILL_LAST_KV", on ? "1" : "0", 1) != 0) throw std::runtime_error("setenv STRIX_G4_PREFILL_LAST_KV");
         prefill.keep_last_row(!engine);
         gpu::DeviceStream stream(config, unsigned(tokens.size()));
         unsigned levers = 0;
         const auto start = Clock::now();
         pf::Result result;
+        std::vector<float> hidden;
+        const auto demand = !mtp ? g4::HiddenDemand::none : on ? g4::HiddenDemand::last_committed : g4::HiddenDemand::all_rows;
         if (engine) {
             const auto count = unsigned(tokens.size());
             for (unsigned first = 0; first < count;) {
                 const auto rows = std::min(pf::chunk_rows, count - first);
                 auto tx = stream.begin();
-                const auto chunk = prefill.forward(*tx, tokens.subspan(first, rows), false, false, false, false, true);
+                const auto chunk = prefill.forward(*tx, tokens.subspan(first, rows), false, false, demand, false, true);
+                if (mtp) {
+                    const auto h = chunk.hidden_rows(), last = h.last(config.hidden);
+                    if (h.size() != (on ? 1U : rows) * std::size_t(config.hidden)) throw std::runtime_error("mtp form exported hidden rows");
+                    hidden.insert(hidden.end(), last.begin(), last.end());
+                }
                 tx->commit(rows); levers |= chunk.levers; first += rows;
             }
+            if (mtp) result.last_logits = prefill.last_logits();
         } else result = prefill.run(stream, tokens);
         const auto seconds = std::chrono::duration<double>(Clock::now() - start).count();
         const auto state = stream.digest();
@@ -300,17 +311,25 @@ void last_kv_ab(pf::DevicePrefill& prefill, const g4::ModelConfig& config, std::
         } else {
             if (state != digest) throw std::runtime_error("LAST_KV A/B committed KV digest mismatch");
             if (!engine) { equal(result.last_logits, logits); equal(result.tail_taps, taps); }
+            if (mtp) {
+                equal(result.last_logits, logits);
+                if (chunk_hidden.empty()) chunk_hidden = hidden;
+                else equal(hidden, chunk_hidden);
+            }
         }
-        std::cout << "{\"last_kv_ab\":\"" << (on ? "on" : "off") << "\",\"form\":\"" << (engine ? "engine" : "prompt")
+        std::cout << "{\"last_kv_ab\":\"" << (on ? "on" : "off") << "\",\"form\":\"" << (mtp ? "mtp" : engine ? "engine" : "prompt")
                   << "\",\"rows\":" << tokens.size() << ",\"iteration\":" << iteration << ",\"seconds\":" << seconds
                   << ",\"tokens_per_s\":" << static_cast<double>(tokens.size()) / seconds;
         if (engine) std::cout << ",\"narrowed\":" << ((levers & pf::lever_last_kv) ? "true" : "false");
         std::cout << "}\n";
     };
-    for (unsigned r = 0; r < repetitions; ++r) { once(false, false, r); once(true, false, r); once(false, true, r); once(true, true, r); }
+    for (unsigned r = 0; r < repetitions; ++r) {
+        once(false, false, r); once(true, false, r); once(false, true, r); once(true, true, r);
+        once(false, true, r, true); once(true, true, r, true);
+    }
     (void)unsetenv("STRIX_G4_PREFILL_LAST_KV");
     prefill.keep_last_row(true);
-    std::cout << "{\"gate\":\"last-kv-off-vs-on\",\"rows\":" << tokens.size() << ",\"runs\":" << 4 * repetitions
+    std::cout << "{\"gate\":\"last-kv-off-vs-on\",\"rows\":" << tokens.size() << ",\"runs\":" << 6 * repetitions
               << ",\"kv_digest\":\"" << digest << "\",\"verdict\":\"EXACT\"}\n";
 }
 // Old per-8-row canonical attention versus the whole-chunk kernels on one

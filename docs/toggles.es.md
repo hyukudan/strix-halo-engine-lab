@@ -177,8 +177,8 @@ llegar el núcleo en mosaico compartido (`src/core`), con los mismos bits.
 |---|---|---|---|
 | `STRIX_DS41_PF_CORE=0\|moe\|dense\|1` | deepseek | por forma | Qué productos del prefill corren en el núcleo compartido en lugar de los kernels de DeepSeek: `moe` = gate/up y down de expertos, `dense` = los productos densos Q8_0 x A8, `1` = ambos, `0` = ninguno. Mismos bits en todos los casos. Sin definir: el núcleo compartido donde el fixture de rango lo mide más rápido, el gate/up (-0,6..-2,2 %) y el down (-6,0..-7,2 %) Q8_0 del experto compartido (-2,8..-3,9 % en conjunto), y solo en lotes de 16 filas con `STRIX_DS41_FAST_MOE` desactivado y `STRIX_DS41_PREFILL_STAGE` distinto de `1`, y el gate/up IQ2_XXS (-7,1..-8,2 % con 2048 / 4096 / 8192 filas) y el down Q2_K (-2,4..-3,4 %) enrutados, que corren ahí sin el tile de pesos en LDS para que dos workgroups compartan un WGP; los productos densos siguen en los kernels de DeepSeek. Se resuelve una vez por ejecución; cualquier otro valor, incluido el vacío, se rechaza. |
 | `STRIX_DS41_FAST_I4=1` | deepseek | off | Prefill borrador con pérdida: los pesos GGUF de los expertos se decodifican a INT4 en el kernel y la entrada A8 se recuantiza a A4. Corre en el núcleo compartido. `STRIX_DS41_FAST_I4_SCOPE=all\|gu` elige gate/up/down (por defecto) o solo gate/up. Sin cualificar en calidad. |
-| `STRIX_GLM_MODEL_FORMAT=fast_i4` | glm | `exl3` | Formato con pérdida: los expertos enrutados gate/up de las capas MoE tardías se guardan en INT4 (prefill W4A4, decode W4A16) y se libera su copia EXL3. Rechaza las identidades exactas. Frente a FAST en el par: KL de los logits de prefill 0,0145, top-1 95,4 %, NLL -0,002 (umbral 0,02 / 93 % / +0,01); tokens de decode con teacher forcing KL 0,0098, top-1 94,8 %; prefill 8K -2,0 %, 32K -3,2 %; velocidad de decode normal y MTP sin cambios. |
-| `STRIX_GLM_FAST_I4_EXL3_LAYERS=<lista>` | glm | `0-14` | Con `fast_i4`: capas MoE (ordinales, rangos `a-b` o `none`) que conservan los expertos enrutados EXL3. Una capa INT4 temprana cuesta un escalón de calidad que satura, las tardías son baratas; INT4 en todas las capas no pasa el umbral de calidad. |
+| `STRIX_GLM_MODEL_FORMAT=fast_i4` | glm | `exl3` | Formato con pérdida: los expertos enrutados gate/up de las capas MoE tardías se guardan en INT4 (prefill W4A4, decode W4A16) y se libera su copia EXL3. Rechaza las identidades exactas y solo funciona sobre la prefill FAST (`STRIX_GLM_PF_WMMA=1`). No es una palanca FAST cualificada: el gate FAST v2 frente a la referencia exacta (4 ventanas x 255 filas de prompts de 2K tokens, null de un ulp FP16) no cumple los umbrales agregados con ningún brazo, ni siquiera con el null exacto (KL del null 0,141), así que ninguna palanca de prefill de GLM puede pasarlo tal como está escrito. Con el conjunto anterior de 27 capas (ordinales 15-41) fallan dos ventanas por encima de 1,5 x el null y el top-1 agregado baja a 0,898; con el conjunto por defecto de 17 capas (ordinales 25-41) pasan todas las ventanas que pasa FAST solo (KL agregada 0,132, top-1 0,926; FAST solo 0,130 / 0,931). Recibo v1 anterior del conjunto de 27 capas frente a FAST: KL de los logits de prefill 0,0145, top-1 95,4 %, NLL -0,002; tokens de decode con teacher forcing KL 0,0098, top-1 94,8 %; prefill 8K -2,0 %, 32K -3,2 %; velocidad de decode normal y MTP sin cambios. La velocidad de prefill del conjunto de 17 capas no está medida. |
+| `STRIX_GLM_FAST_I4_EXL3_LAYERS=<lista>` | glm | `0-24` | Con `fast_i4`: capas MoE (ordinales, rangos `a-b` o `none`) que conservan los expertos enrutados EXL3. Una capa INT4 temprana cuesta un escalón de calidad que satura, las tardías son baratas. `0-24` (INT4 en los ordinales 25-41) pasa todas las ventanas del gate FAST v2; `0-14` falla dos ventanas; INT4 en todas las capas falla. |
 | `STRIX_GLM_FAST_I4_SCOPE=gate_up\|all` | glm | `gate_up` | Con `fast_i4`: qué matrices enrutadas van en INT4. `all` añade la proyección down (prefill 8K en caliente -3,6 % frente a FAST; menos margen de calidad). |
 | `STRIX_GLM_FAST_I4_SCALE=fast_full\|legacy` | glm | `fast_full` | Con `fast_i4`: regla de escala de los pesos en la conversión de carga. `fast_full` usa todo el rango del nibble [-8, 7] a 0,9 de la escala sin recorte (error de pesos 0,0095 frente a 0,0115 con `legacy`, mismo tiempo de conversión). |
 | `STRIX_GLM_FAST_I4_PAIRED=0` | glm | activado | Con `fast_i4` y ámbito `gate_up`: desactiva el kernel emparejado gate/up (un kernel lee los pesos INT4 de gate y up y su epílogo SwiGLU escribe la entrada de down) y ejecuta las llamadas separadas de gate, up y activación. Mismos bits de salida en ambos casos. |
@@ -369,7 +369,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_SERVE_FP16_MTP` | qwen | ON: explicit-sidecar MTP servers keep the automatic FP16 prefill arithmetic with the unqualified fast options off; `0` declines it | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 | `STRIX_QRTX_PLE_A8` | qwen-rtx | off (opt-in con `--profile fast`, gate FAST pendiente) | [qwen-rtx-ple-a8](optimizations.md#qwen-rtx-ple-a8) |
 
-### Decode, MTP y DSpark (25)
+### Decode, MTP y DSpark (26)
 
 | Toggle | Motor | Por defecto | Detalles |
 |---|---|---|---|
@@ -399,6 +399,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_QWEN_DECODE_FUSE` | qwen | ON (por defecto; STRIX_QWEN_DECODE_FUSE=0 restaura la secuencia de tres lanzamientos) | [qwen-decode-fuse](optimizations.md#qwen-decode-fuse) |
 | `STRIX_QWEN_YARN_MTP` | qwen | table-backed QSA MTP pool and rolling... | [qwen-yarn-mtp](optimizations.md#qwen-yarn-mtp) |
 | `STRIX_TOOL_DRAFT_PREFIX_GATE` | qwen | ON (batched decoding) | [qwen-tool-draft](optimizations.md#qwen-tool-draft) |
+| `STRIX_QRTX_COMMIT_ASYNC` | qwen-rtx | off | [qwen-rtx-commit-async](optimizations.md#qwen-rtx-commit-async) |
 
 ### Transporte del par (25)
 
@@ -428,6 +429,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_MTP_JOINT_PLAN` | qwen | calibrated-c3 when STRIX_MTP_BATCH_JO... | [joint-plan-rule](engine/scheduling/joint-serving-windows.md#joint-plan-rule) |
 | `STRIX_MTP_JOINT_RULE_FILE` | qwen | calibrated-c3 when STRIX_MTP_BATCH_JO... | [joint-plan-rule](engine/scheduling/joint-serving-windows.md#joint-plan-rule) |
 | `STRIX_MTP_PRIME_BATCH` | qwen | 64 filas (limitado a 8..128; 8 restaura los lotes originales) | [qwen-mtp-prime-rows](optimizations.md#qwen-mtp-prime-rows) |
+| `STRIX_MTP_PRIME_PROJ_ROWS` | qwen | 4 filas de salida por wave (1: una fila por wave) | [qwen-mtp-prime-rows](optimizations.md#qwen-mtp-prime-rows) |
 | `STRIX_MTP_PRIME_ROWS` | qwen | ON (STRIX_MTP_PRIME_ROWS=0: desactivar) | [qwen-mtp-prime-rows](optimizations.md#qwen-mtp-prime-rows) |
 | `STRIX_QSA_MTP_POOL` | qwen | 1 (eligible native MTP CLI, the singl... | [qwen-qsa-mtp-pool](optimizations.md#qwen-qsa-mtp-pool) |
 
@@ -574,9 +576,12 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_SERVE_HEALTH_RECORD` | qwen | ON | [operations/service-health.md](operations/service-health.md) |
 | `STRIX_SERVE_OBSERVE_EXPIRY_S` | deepseek | 60 seconds | [ds-observation](optimizations.md#ds-observation) |
 
-### Solo depuración (2)
+### Solo depuración (5)
 
 | Toggle | Motor | Por defecto | Detalles |
 |---|---|---|---|
 | `STRIX_DS41_OB_READY_EPILOGUE` | deepseek | auto | [ds-ready](optimizations.md#ds-ready) |
 | `STRIX_SERVE_BACKEND_PROBE` | qwen | ON | [operations/service-health.md](operations/service-health.md) |
+| `STRIX_MOE_ROUTES_OUT` | qwen-rtx (tap de rutas MoE compartido) | off | Gate FAST: graba los ids y pesos de expertos de cada llamada al router en FILE; [tap de rutas](../include/strix/moe/route_file.hpp) |
+| `STRIX_MOE_ROUTES_IN` | qwen-rtx (tap de rutas MoE compartido) | off | Gate FAST: reproduce los ids y pesos grabados llamada a llamada (capa, filas y top-k deben coincidir); [tap de rutas](../include/strix/moe/route_file.hpp) |
+| `STRIX_MOE_ROUTE_NULL` | qwen-rtx (tap de rutas MoE compartido) | off | Control nulo del gate FAST `CAPA[:SEMILLA]`: los pesos seleccionados de la capa se mueven un ulp FP32; [tap de rutas](../include/strix/moe/route_file.hpp) |

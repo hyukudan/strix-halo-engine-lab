@@ -25,8 +25,10 @@
 // Epilogue (once per work-group): the four (m, l, O) states are merged in wave order through LDS (fixed order,
 // deterministic), then written as FP32 [H][D].
 // LDS: 4 x D x 48 B (V^T, 16-B pad per row) + 512 B (m, l) = 25,088 B at D 128; the query staging (H x D x 2 B) and
-// the merge buffer (H x D x 4 B) reuse the V^T area before / after the key loop. Split adds H x D x 2 B (the query
-// lo terms stay in LDS and are read per tile; the hi terms stay in registers).
+// the merge buffer (H x D x 4 B) reuse the V^T area before / after the key loop. Split adds H x (2 D + 16) B (the query
+// lo rows stay in LDS with a 16-B pad and are read per tile: a 16-row fragment read is conflict-free, 256-B rows were
+// 8-way; the hi terms stay in registers). The V^T gathers (rows d, d + 8, d + 16, d + 24 on the same 8 banks) stay
+// 4-way: a skewed pitch removes the conflicts but measured +10 % kernel time (more VGPRs and LDS per work-group).
 //
 // Policy P:
 //   using Args;                                   kernel argument (trivially copyable)
@@ -70,8 +72,9 @@ template <unsigned H, unsigned D> struct KeySplit {
     static constexpr unsigned kPitch = 2 * kT + 16;         // V^T row: 16 keys + 16-B pad
     static constexpr unsigned kVtWave = D * kPitch;         // one wave's V^T tile
     static constexpr unsigned kMl = kWaves * kVtWave;       // (m, l) x 16 heads x 4 waves
-    static constexpr unsigned kQlo = kMl + kWaves * H * 2 * 4;  // Split: query lo terms [H][D]
-    static constexpr unsigned bytes(bool split) { return kQlo + (split ? H * D * 2 : 0U); }
+    static constexpr unsigned kQlo = kMl + kWaves * H * 2 * 4;  // Split: query lo terms [H][kQloPitch]
+    static constexpr unsigned kQloPitch = 2 * D + 16;       // query lo row + 16-B pad: 8 rows cover 32 banks
+    static constexpr unsigned bytes(bool split) { return kQlo + (split ? H * kQloPitch : 0U); }
     static_assert(H * D * 2 <= kMl && H * D * 4 <= kMl, "query staging and merge buffer fit the V^T area");
     // Merge buffer slot (FP32 index) of output (head, dim): lane (hf = dim & 1, ln = head) owns 8 x kKs floats.
     static constexpr unsigned merge_slot(unsigned head, unsigned dim) {
@@ -124,7 +127,7 @@ __global__ __launch_bounds__((KeySplit<P::kHeads, P::kDim>::kThreads)) void flas
 #pragma unroll
             for (unsigned i = 0; i < H / G::kWaves; ++i) {
                 const unsigned head = i * G::kWaves + w;
-                *reinterpret_cast<U2*>(lds + G::kQlo + (head * D + lane * 4U) * 2U) = *reinterpret_cast<const U2*>(lo + head * D + lane * 4U);
+                *reinterpret_cast<U2*>(lds + G::kQlo + head * G::kQloPitch + lane * 8U) = *reinterpret_cast<const U2*>(lo + head * D + lane * 4U);
             }
         }
         const std::uint16_t* qo = P::query_op(a, row);
@@ -140,7 +143,7 @@ __global__ __launch_bounds__((KeySplit<P::kHeads, P::kDim>::kThreads)) void flas
             P::query(a, row, head, lane, x);
             *reinterpret_cast<U2*>(lds + (head * D + lane * 4U) * 2U) = U2{tile::pack2<O>(x[0], x[1]), tile::pack2<O>(x[2], x[3])};
             if constexpr (Split) {
-                *reinterpret_cast<U2*>(lds + G::kQlo + (head * D + lane * 4U) * 2U) =
+                *reinterpret_cast<U2*>(lds + G::kQlo + head * G::kQloPitch + lane * 8U) =
                     U2{tile::pack2_lo<O>(x[0], x[1]), tile::pack2_lo<O>(x[2], x[3])};
             }
         }
@@ -192,7 +195,7 @@ __global__ __launch_bounds__((KeySplit<P::kHeads, P::kDim>::kThreads)) void flas
 #pragma unroll
         for (unsigned x = 0; x < G::kKs; ++x) {
             if constexpr (!kKeysEarly) kf[x] = tile::frag32(kr + 16U * x);
-            if constexpr (Split) s = tile::mma<O>(kf[x], tile::frag32(lds + G::kQlo + (ln * D + 16U * x) * 2U), s);
+            if constexpr (Split) s = tile::mma<O>(kf[x], tile::frag32(lds + G::kQlo + ln * G::kQloPitch + 32U * x), s);
             s = tile::mma<O>(kf[x], qf[x], s);
         }
         // 3. V^T tile of this wave

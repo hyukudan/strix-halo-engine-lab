@@ -43,7 +43,8 @@ struct DecodeCache {
             for (unsigned i = 0; i < G::kIdxDim; ++i)
                 pooled.at(static_cast<std::size_t>(address / 4) * G::kIdxDim + i) =
                     original ? original_pool_channel(key.data() + start, gate.data() + start, ape.data(), i) :
-                    G::dsa_pool_channel(key.data() + start, gate.data() + start, ape.data(), i);
+                    strix::attn::group_pool::gated_bf16_channel<4>(key.data() + start, gate.data() + start, ape.data(), i,
+                                                                    G::kIdxDim, G::declared_exp);
         }
     }
 };

@@ -163,7 +163,10 @@ void taps_tests() {
     };
     LK_CHECK(!mtp()->wants_taps(), "MTP session reads no taps");
     LK_CHECK(!lk::hybrid_factory(mtp, cfg)()->wants_taps(), "lookup + MTP reads no taps (prefill tap copy stays skipped)");
-    LK_CHECK(lk::hybrid_factory(mtp, cfg)()->wants_hidden(), "lookup + MTP keeps the MTP hidden rows");
+    LK_CHECK(mtp()->hidden_demand() == strix::gemma4::HiddenDemand::last_committed, "MTP reads the last committed hidden row only");
+    LK_CHECK(lk::hybrid_factory(mtp, cfg)()->hidden_demand() == strix::gemma4::HiddenDemand::last_committed,
+             "lookup + MTP keeps the MTP demand (last committed row)");
+    LK_CHECK(lk::hybrid_factory({}, cfg)()->hidden_demand() == strix::gemma4::HiddenDemand::none, "lookup alone reads no hidden");
     const en::DraftFactory taps = [] { return std::make_unique<TapsInner>(); };
     LK_CHECK(lk::hybrid_factory(taps, cfg)()->wants_taps(), "a wrapped taps consumer keeps its taps");
     // Runtime admission: no drafter / MTP wrapped; DFlash and e4b-eagle never wrapped (their sessions, wants_taps
@@ -305,12 +308,178 @@ void coordinator_tests() {
                     (unsigned long long)s.cycles, (unsigned long long)s.accepted, (unsigned long long)s.proposed);
     }
 }
+
+// HiddenDemand (SH-01): MTP declares last_committed, so prompt prefill exports one hidden row per chunk instead of every
+// row (the device plan then stops the other rows at the last K/V owner). These checks pin that nothing the drafter
+// reads changes: (1) the real MTP session ends in the same state whether a chunk's rows are staged with every hidden
+// row (the incumbent) or with the last row alone; (2) the coordinator passes the demand to the backend and gives the
+// session the same rows whether the backend returns one row or every row.
+namespace g4 = strix::gemma4;
+namespace mtp = strix::gemma4::eagle::mtp;
+// Records what the session hands its drafter (the only reader of the staged state).
+struct SeenDraft final : mtp::Drafter {
+    mtp::Config c;
+    mtp::Timings t;
+    std::vector<float> hidden;
+    std::uint64_t position = 0;
+    std::uint32_t anchor = 0, calls = 0;
+    SeenDraft() { c.backbone = 64; }
+    const mtp::Config& config() const override { return c; }
+    const mtp::Timings& timings() const override { return t; }
+    mtp::Draft draft(const mtp::Inputs& in, std::uint32_t) override {
+        hidden.assign(in.hidden.begin(), in.hidden.end());
+        position = in.position;
+        anchor = in.anchor;
+        ++calls;
+        return {};
+    }
+};
+float hidden_value(std::uint64_t position, std::size_t i) { return float(position % 1009) * 0.125F + float(i) * 0.001F; }
+// The audit's session check: 512 rows staged in 64 groups of 8 with every hidden row, versus the same groups with only
+// the last row's hidden (what the coordinator now passes), versus one call with every row.
+void session_last_row_tests() {
+    constexpr std::size_t rows = 512, group = 8, B = 64;
+    constexpr std::uint64_t start = 1000;
+    std::vector<std::uint32_t> next(rows);
+    std::vector<std::uint64_t> positions(rows);
+    std::vector<float> hidden(rows * B);
+    for (std::size_t r = 0; r < rows; ++r) {
+        positions[r] = start + r;
+        next[r] = std::uint32_t(7 + (r * 31) % 250);
+        for (std::size_t i = 0; i < B; ++i) hidden[r * B + i] = hidden_value(start + r, i);
+    }
+    State state;
+    const auto run = [&](int mode) {
+        auto owned = std::make_unique<SeenDraft>();
+        auto* seen = owned.get();
+        mtp::Session session(std::move(owned), {22, 23});
+        session.attach(state);
+        if (mode == 2) {
+            session.stage_rows({}, hidden, next, positions);
+            session.publish();
+        } else {
+            for (std::size_t first = 0; first < rows; first += group) {
+                const auto count = std::min(group, rows - first);
+                const auto all = std::span<const float>(hidden);
+                const auto h = mode == 0 ? all.subspan(first * B, count * B) : first + count == rows ? all.last(B) : std::span<const float>{};
+                session.stage_rows({}, h, std::span<const std::uint32_t>(next).subspan(first, count),
+                                   std::span<const std::uint64_t>(positions).subspan(first, count));
+                session.publish();
+            }
+        }
+        (void)session.propose_window(next.back(), positions.back() + 1, 3);
+        LK_CHECK(seen->calls == 1 && seen->position == positions.back() + 1 && seen->anchor == next.back(),
+                 "MTP drafts from the last committed row (mode %d)", mode);
+        (void)session.propose_window(next.back() + 1, positions.back() + 1, 3);
+        LK_CHECK(seen->calls == 1, "a wrong anchor drafts nothing (mode %d)", mode);
+        return seen->hidden;
+    };
+    const auto every = run(0), last = run(1), whole = run(2);
+    LK_CHECK(every.size() == B && std::equal(every.begin(), every.end(), hidden.end() - std::ptrdiff_t(B)), "incumbent keeps the last row");
+    LK_CHECK(last == every && whole == every, "last-row-only staging leaves the MTP state bitwise identical");
+}
+// A drafter session that logs every stage_rows call; its demand is set by the test.
+struct StageLog {
+    std::vector<std::vector<std::uint64_t>> positions;
+    std::vector<std::vector<std::uint32_t>> next;
+    std::vector<std::vector<float>> hidden;
+};
+struct LoggingDraft final : en::DraftSession {
+    g4::HiddenDemand demand;
+    std::shared_ptr<StageLog> log;
+    LoggingDraft(g4::HiddenDemand d, std::shared_ptr<StageLog> l) : demand(d), log(std::move(l)) {}
+    std::array<std::uint32_t, 7> propose(std::uint32_t, std::uint64_t) override { return {}; }
+    void append(std::span<const float>, std::span<const std::uint64_t>) override {}
+    void stage_rows(std::span<const float>, std::span<const float> h, std::span<const std::uint32_t> n,
+                    std::span<const std::uint64_t> p) override {
+        log->positions.emplace_back(p.begin(), p.end());
+        log->next.emplace_back(n.begin(), n.end());
+        log->hidden.emplace_back(h.begin(), h.end());
+    }
+    void publish() override {}
+    void discard() noexcept override {}
+    [[nodiscard]] g4::HiddenDemand hidden_demand() const override { return demand; }
+    [[nodiscard]] bool wants_taps() const override { return false; }
+};
+// Many-row prefill over LocalTarget; hidden row = hidden_value(position). narrow: last_committed returns one row.
+struct PrefillBackend final : en::Backend {
+    LocalTarget target;
+    ModelConfig c;
+    bool narrow = true;
+    std::vector<g4::HiddenDemand> demands;
+    PrefillBackend() { c.hidden = target.hidden; c.vocab = target.vocab; }
+    std::unique_ptr<en::StreamState> create_stream() override { return std::make_unique<State>(); }
+    ForwardResult forward_rows(std::span<const RowPlan> rows) override { return target.forward_rows(rows); }
+    const ModelConfig& config() const override { return c; }
+    strix::serve::Json identity() const override { return strix::serve::Json::object(); }
+    std::size_t prefill_chunk_rows() const override { return 16; }
+    en::PrefillRows prefill_rows(KvTxn& tx, std::span<const std::uint32_t> tokens, g4::HiddenDemand hidden, bool) override {
+        demands.push_back(hidden);
+        const auto start = tx.frontier();
+        std::vector<RowPlan> plans;
+        for (std::size_t i = 0; i < tokens.size(); ++i) plans.push_back({0, 0, start + i, tokens[i], &tx, i, true, false});
+        const auto pass = target.forward_rows(plans);
+        en::PrefillRows out;
+        out.tap_width = pass.tap_width;
+        const std::size_t first = hidden == g4::HiddenDemand::none ? tokens.size()
+            : hidden == g4::HiddenDemand::last_committed && narrow ? tokens.size() - 1 : 0;
+        for (std::size_t r = first; r < tokens.size(); ++r)
+            for (std::size_t i = 0; i < c.hidden; ++i) out.hidden.push_back(hidden_value(start + r, i));
+        return out;
+    }
+};
+void coordinator_demand_tests() {
+    std::vector<std::uint32_t> prompt;
+    for (std::uint32_t i = 0; i < 45; ++i) prompt.push_back(2 + (i * 37) % 290);
+    const auto run = [&](g4::HiddenDemand demand, bool narrow, std::vector<g4::HiddenDemand>& seen) {
+        PrefillBackend b;
+        b.narrow = narrow;
+        auto log = std::make_shared<StageLog>();
+        en::Coordinator coordinator(b, [=] { return std::make_unique<LoggingDraft>(demand, log); });
+        en::Request req;
+        req.prompt = prompt;
+        req.max_tokens = 4;
+        req.dflash = en::DraftMode::on;
+        req.stop_ids.clear();
+        const auto slot = coordinator.submit(req);
+        coordinator.run();
+        (void)coordinator.result(slot);
+        seen = b.demands;
+        return log;
+    };
+    std::vector<g4::HiddenDemand> seen_every, seen_last, seen_wide;
+    const auto every = run(g4::HiddenDemand::all_rows, true, seen_every);
+    const auto last = run(g4::HiddenDemand::last_committed, true, seen_last);
+    const auto wide = run(g4::HiddenDemand::last_committed, false, seen_wide);
+    const auto only = [](const std::vector<g4::HiddenDemand>& v, g4::HiddenDemand d) {
+        return !v.empty() && std::all_of(v.begin(), v.end(), [d](g4::HiddenDemand x) { return x == d; });
+    };
+    LK_CHECK(only(seen_last, g4::HiddenDemand::last_committed), "the coordinator passes the MTP demand to prefill_rows");
+    LK_CHECK(only(seen_every, g4::HiddenDemand::all_rows), "all_rows passed through");
+    LK_CHECK(every->positions == last->positions && every->next == last->next, "every row is still staged (lookup index feed)");
+    LK_CHECK(last->hidden == wide->hidden && last->positions == wide->positions, "one returned row == every returned row (last read)");
+    const std::size_t width = PrefillBackend{}.c.hidden;
+    std::size_t carried = 0, empty = 0;
+    for (std::size_t g = 0; g < last->positions.size(); ++g) {
+        const auto& h = last->hidden[g];
+        if (h.empty()) { ++empty; continue; }
+        ++carried;
+        // A prefill group carries its last row alone; decode groups carry one row per position, as before.
+        LK_CHECK(h.size() == width || h.size() == last->positions[g].size() * width, "group hidden layout");
+        const auto& ref = every->hidden[g];
+        LK_CHECK(ref.size() >= width && std::equal(h.end() - std::ptrdiff_t(width), h.end(), ref.end() - std::ptrdiff_t(width)),
+                 "carried row == the all_rows group's last row");
+    }
+    LK_CHECK(carried > 0 && empty > 0, "last_committed: prefill groups without the last row carry no hidden");
+}
 } // namespace
 
 int main() {
     try {
         index_tests();
         taps_tests();
+        session_last_row_tests();
+        coordinator_demand_tests();
         coordinator_tests();
         std::printf("lookup tests OK\n");
         return 0;
