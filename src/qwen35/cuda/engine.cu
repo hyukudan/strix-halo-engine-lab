@@ -292,15 +292,18 @@ struct TreePack {
     std::uint32_t idx[cc::kMaxRows];
 };
 constexpr std::uint32_t kTreeWords = 1 + 2 * cc::kMaxRows;
-__global__ void set_inputs_kernel(InputPack in, std::uint32_t* pos, std::uint32_t* ids, TreePack tp, std::uint32_t* tree) {
+__global__ void set_inputs_kernel(InputPack in, std::uint32_t* pos, std::uint32_t* ids) {
     if (threadIdx.x == 0) *pos = in.pos0;
     if (threadIdx.x < cc::kMaxRows) ids[threadIdx.x] = in.ids[threadIdx.x];
-    if (tree) {
-        if (threadIdx.x == 0) tree[0] = tp.leaf;
-        if (threadIdx.x < cc::kMaxRows) {
-            tree[1 + threadIdx.x] = tp.pos[threadIdx.x];
-            tree[1 + cc::kMaxRows + threadIdx.x] = tp.idx[threadIdx.x];
-        }
+}
+// Token-tree window: the same inputs + the tree descriptor (leaf mask, row positions, K/V indices) in one launch.
+__global__ void set_inputs_tree_kernel(InputPack in, std::uint32_t* pos, std::uint32_t* ids, TreePack tp, std::uint32_t* tree) {
+    if (threadIdx.x == 0) *pos = in.pos0;
+    if (threadIdx.x < cc::kMaxRows) ids[threadIdx.x] = in.ids[threadIdx.x];
+    if (threadIdx.x == 0) tree[0] = tp.leaf;
+    if (threadIdx.x < cc::kMaxRows) {
+        tree[1 + threadIdx.x] = tp.pos[threadIdx.x];
+        tree[1 + cc::kMaxRows + threadIdx.x] = tp.idx[threadIdx.x];
     }
 }
 __global__ void zero_u32_kernel(std::uint32_t* p) { *p = 0; }
@@ -718,7 +721,8 @@ struct CudaEngine::Impl {
                 tp.idx[i] = committed + tree->index[i];
             }
         }
-        set_inputs_kernel<<<1, 32, 0, s>>>(in, d_pos, d_ids, tp, tree ? d_tree : nullptr);
+        if (tree) set_inputs_tree_kernel<<<1, 32, 0, s>>>(in, d_pos, d_ids, tp, d_tree);
+        else set_inputs_kernel<<<1, 32, 0, s>>>(in, d_pos, d_ids);
         CK(cudaGetLastError());
         tree_mode = tree != nullptr;
         last_tree = tree_mode;
@@ -1571,7 +1575,7 @@ struct CudaEngine::Impl {
         InputPack in{};
         in.pos0 = pos0;
         for (std::uint32_t i = 0; i < rows; ++i) in.ids[i] = next_tokens[i];
-        set_inputs_kernel<<<1, 32, 0, s>>>(in, d_mpos, d_mids, TreePack{}, nullptr);
+        set_inputs_kernel<<<1, 32, 0, s>>>(in, d_mpos, d_mids);
         CK(cudaGetLastError());
         mtp_body_launch(hidden_dev, rows);
         CudaEngine::MtpOut o;
@@ -1592,7 +1596,7 @@ struct CudaEngine::Impl {
             InputPack in{};
             in.pos0 = pos;
             in.ids[0] = *in_host;
-            set_inputs_kernel<<<1, 32, 0, s>>>(in, d_mpos, d_mids, TreePack{}, nullptr);
+            set_inputs_kernel<<<1, 32, 0, s>>>(in, d_mpos, d_mids);
         } else {  // the slot holds an argmax id of an earlier step (< vocab by construction)
             fed_inputs_kernel<<<1, 32, 0, s>>>(d_feed, in_slot, pos, d_mpos, d_mids);
         }
