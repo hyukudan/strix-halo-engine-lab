@@ -1269,6 +1269,8 @@ int main(int argc, char** argv) {
         lc.host_floor = ops.ram_margin;
         // Reply-end snapshots (opt-in, exactly "1"; plain decode only: refused under MTP). Rank 1 follows the lead.
         lc.prefix_reply_store = strix::envcfg::flag("STRIX_GLM_SERVE_REPLY_KEEP", false, strix::EnvFlagMatch::exact);
+        // Root store at the system prompt (default on; "0" off). Rank 1 follows the lead.
+        lc.prefix_root = strix::envcfg::flag("STRIX_GLM_SERVE_PREFIX_ROOT", true, strix::EnvFlagMatch::exact);
         lc.prefix_identity = gs::fnv1a64(&hello.model_hash, sizeof(hello.model_hash), hello.identity_hash);
         lc.prefill_chunk = prefill_chunk;
         lc.interleave = serve_prefill_interleave(prefill_mode, opt.max_rows, eng.prefill_pipeline());
@@ -1670,6 +1672,10 @@ int main(int argc, char** argv) {
                 counter("strix_glm_serve_prefix_misses_total", "Prefix cache misses.", st.prefix_misses);
                 counter("strix_glm_serve_prefix_stores_total", "Paired prefix stores.", st.prefix_stores);
                 counter("strix_glm_serve_prefix_refused_total", "Paired prefix stores refused (reason on stderr).", st.prefix_refused);
+                counter("strix_glm_serve_prefix_root_stores_total", "Paired root stores at the system prompt (in prefix_stores).",
+                        st.prefix_root_stores);
+                counter("strix_glm_serve_prefix_root_refused_total", "Paired root stores refused (in prefix_refused).",
+                        st.prefix_root_refused);
                 counter("strix_glm_serve_prefix_evictions_total", "Prefix LRU evictions.", st.prefix_evictions);
                 m << "# TYPE strix_glm_serve_prefix_bytes gauge\nstrix_glm_serve_prefix_bytes " << st.prefix_bytes << '\n';
             }

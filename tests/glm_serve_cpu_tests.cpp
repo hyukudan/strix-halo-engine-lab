@@ -884,7 +884,109 @@ void import_route_receipts() {
     }
 }
 
+// Root store (LeadConfig::prefix_root): a producer whose leading system prompt (stable_prefix) repeats keeps its state at
+// root_mark(stable, n, 1024, 2) on its way through the prefill (the fake snapshot throws unless the slot is exactly at
+// that frontier); a sibling (same system prompt, other user turn) restores there and its tokens equal its cold run;
+// the producer's tokens equal its run without a root; a restore that reached the root stores none.
+void prefix_root_sibling() {
+    CHECK(gs::prefix_root_row(2100, 2300) == 2048);
+    CHECK(gs::prefix_root_row(1024, 5000) == 0);     // strictly inside the system prompt
+    CHECK(gs::prefix_root_row(1025, 5000) == 1024);
+    CHECK(gs::prefix_root_row(5000, 4097) == 3072);  // at least 2 rows before the end
+    CHECK(gs::prefix_root_row(0, 5000) == 0);
+    std::vector<std::uint32_t> system, a, b;
+    for (std::uint32_t k = 0; k < 2100; ++k) system.push_back(3000U + k % 977U);
+    a = system;
+    b = system;
+    for (std::uint32_t k = 0; k < 150; ++k) {
+        a.push_back(7000U + k);
+        b.push_back(9000U + 3U * k);
+    }
+    const std::uint32_t slots = 2;
+    Loopback lb;
+    FakeEng e0(slots), e1(slots);
+    Pipe pipe;
+    e0.pipe = e1.pipe = &pipe;
+    e1.rank = 1;
+    gs::Channel c0(lb.side(0), 0), c1(lb.side(1), 1);
+    gs::Hello h0 = hello_for(slots, 4096, 2), h1 = hello_for(slots, 4096, 2);
+    h0.prefix_cache_bytes = h1.prefix_cache_bytes = 1U << 20;
+    std::string follow_error, lead_error, driver_error;
+    std::thread follower([&] {
+        try { gs::follow(e1, c1, h1, slots, 4096); } catch (const std::exception& e) { follow_error = e.what(); }
+    });
+    std::atomic<bool> stop{false};
+    sv::GenerationQueue queue(16);
+    gs::LeadConfig lc;
+    lc.prefix_cache_bytes = h0.prefix_cache_bytes;
+    lc.slots = slots;
+    lc.capacity = 4096;
+    lc.heartbeat_seconds = 0.01;
+    lc.interleave.select = sv::PrefillInterleave::Select::off;
+    try {
+        c0.hello(h0);
+        gs::Lead<FakeEng> lead(e0, c0, queue, lc, stop);
+        std::thread driver([&] {
+            try {
+                const auto run = [&](const std::vector<std::uint32_t>& prompt, std::uint32_t stable) {
+                    sv::GenerationJob job;
+                    job.prompt = prompt;
+                    job.stable_prefix = stable;
+                    job.max_tokens = 12;
+                    job.stop_tokens = gs::default_stop_ids();
+                    auto t = queue.submit(std::move(job));
+                    if (!t) throw std::runtime_error("root: queue refused a job");
+                    std::vector<std::uint32_t> out;
+                    for (bool done = false; !done;) {
+                        const auto got = t->wait(std::chrono::milliseconds(200), done);
+                        out.insert(out.end(), got.begin(), got.end());
+                    }
+                    return out;
+                };
+                const auto producer = run(a, 2100);
+                auto s = lead.stats();
+                CHECK(s.prefix_root_stores == 1 && s.prefix_root_refused == 0 && s.prefix_stores == 2 && s.prefix_hits == 0);
+                const auto sibling = run(b, 2100);
+                s = lead.stats();
+                CHECK(s.prefix_hits == 1 && s.prefix_hit_tokens_prompt == 2048);  // restored at the root
+                CHECK(s.prefix_root_stores == 1 && s.prefix_stores == 3);         // reached the root: no second root
+                lead.clear_prefix_cache();
+                const auto sibling_cold = run(b, 0);  // no stable prefix: no root, cold prefill
+                const auto producer_cold = run(a, 0);
+                s = lead.stats();
+                CHECK(s.prefix_root_stores == 1 && s.prefix_hits == 1);
+                CHECK(!sibling.empty() && sibling == sibling_cold);
+                CHECK(!producer.empty() && producer == producer_cold);
+            } catch (const std::exception& e) {
+                driver_error = e.what();
+            }
+            stop.store(true);
+        });
+        try {
+            lead.loop();
+        } catch (const std::exception& e) {
+            lead_error = e.what();
+            queue.shutdown();
+        }
+        driver.join();
+    } catch (const std::exception& e) {
+        lead_error = e.what();
+    }
+    follower.join();
+    CHECK(lead_error.empty() && follow_error.empty() && driver_error.empty());
+    if (!lead_error.empty() || !follow_error.empty() || !driver_error.empty())
+        std::printf("root: lead '%s' follow '%s' driver '%s'\n", lead_error.c_str(), follow_error.c_str(), driver_error.c_str());
+    bool restored_at_root = false;
+    for (const auto& l : e0.log) restored_at_root = restored_at_root || l.find("@2048") != std::string::npos;
+    CHECK(restored_at_root);
+    std::printf("prefix root sibling: %s\n", failures == 0 ? "PASS" : "FAIL");
+}
+
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--prefix-root") {
+        prefix_root_sibling();
+        return failures == 0 ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--audit656-import") {
         import_route_receipts();
         return failures == 0 ? 0 : 1;
@@ -898,6 +1000,7 @@ int main(int argc, char** argv) {
         return failures == 0 ? 0 : 1;
     }
     const bool prefix_only = argc == 2 && std::string(argv[1]) == "--prefix-only";
+    prefix_root_sibling();
     // ---- admission order: LeadConfig::short_first feeds SessionRuntime::reserve_fifo(wait, short_first), which takes
     // from the shared queue with this selection; off keeps FIFO
     {
