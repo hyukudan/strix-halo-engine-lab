@@ -45,6 +45,8 @@
 #include "strix/serve/bpe_tokenizer.hpp"
 #include "strix/serve/engine.hpp"
 #include "strix/serve/http_server.hpp"
+#include "strix/serve/prefix_join.hpp"
+#include "strix/serve/short_first.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -97,7 +99,14 @@ struct Options {
     std::uint32_t mtp_depth = 7, max_queue = 64;
     float min_p = 0.7F;
     std::uint32_t http_slots = 16, admit_grace_ms = 2;
-    std::uint32_t prefill_chunk = 1024;         // rows per prefill chunk while others decode; 0 = auto (fitted, see chunk_done)
+    // --prefix-cache-inflight on|off: a prompt sharing a prefix with a prompt still prefilling waits for the producer's
+    // checkpoint at the shared block boundary and restores it (shared strix::serve prefix join; needs the prefix cache).
+    // --prefill-short-first on|off: at each chunk boundary the prefilling request with the fewest remaining rows runs
+    // the next chunk (shared select_waiting, at most kMaxQueueOvertakes overtaking chunks per request); off = oldest.
+    // Both change only which rows run when: every request's tokens are unchanged (restore and chunking contracts).
+    // Preserve the legacy scheduling path unless explicitly enabled and qualified on CUDA hardware.
+    bool prefix_inflight = false, prefill_short_first = false;
+    std::uint32_t prefill_chunk = 1024;        // rows per prefill chunk while others decode; 0 = auto (fitted, see chunk_done)
     std::uint32_t prefill_overlap_rows = 1024;  // largest chunk on the prefill stream (overlap); its scratch is sized to it
     bool prefill_overlap = false;               // STRIX_QRTX_PREFILL_OVERLAP=1: chunks on a second stream beside the steps
     bool prefill_poll = false;                  // STRIX_QRTX_PREFILL_POLL=1 (overlap): decode steps keep running until the chunk
@@ -151,6 +160,11 @@ Options parse(int argc, char** argv) {
             const auto value = next();
             if (value != "on" && value != "off") throw std::invalid_argument("--prefix-cache-root is on or off");
             o.prefix.root = value == "on";
+        }
+        else if (a == "--prefix-cache-inflight" || a == "--prefill-short-first") {
+            const auto value = next();
+            if (value != "on" && value != "off") throw std::invalid_argument(a + " is on or off");
+            (a == "--prefix-cache-inflight" ? o.prefix_inflight : o.prefill_short_first) = value == "on";
         }
         else if (a == "--prefix-cache-host-mb") o.prefix.host_bytes = mib();
         else if (a == "--prefix-cache-vram-mb") o.prefix.vram_bytes = mib();
@@ -409,12 +423,13 @@ public:
             // mode: decode steps keep running and the chunk is polled after each; it joins at the next step boundary once
             // complete; the loop blocks on it only when no session can decode.
             if (!inflight_ && e_.prefill_overlap() && decoding()) {
-                Slot* slot = oldest_prefill();
+                Slot* slot = next_prefill();
                 if (slot && slot->job->ticket->cancelled()) { finish(*slot, {}, "cancelled"); slot = nullptr; }
                 if (slot) {
                     try {
                         const auto rows = px::clip_chunk(slot->prefilled, next_chunk_rows(true), slot->capture_points);
                         e_.prefill_chunk_async(slot->session, slot->job->job.prompt, slot->n - 1, slot->prefilled, rows);
+                        slot->launched = slot->prefilled + rows;
                         inflight_ = slot;
                         inflight_steps_ = 0;
                     } catch (const std::exception& ex) {
@@ -478,6 +493,13 @@ private:
         std::vector<std::uint32_t> emitted;
         std::uint64_t rows = 0, window_sessions = 0, max_window_sessions = 0, window_rows = 0;
         bool first = true;
+        // In-flight prefix join (shared strix::serve directory): prefix_entry while this prompt may serve joins; while
+        // it waits, the producer's entry (a lease), lane and wait record; join_boundary stays for the receipt.
+        std::uint64_t prefix_entry = 0, join_entry = 0, join_boundary = 0;
+        std::uint32_t join_lane = 0;
+        serve::PrefixJoinWait join;
+        std::uint64_t launched = 0;   // overlap: prefilled + the rows of this slot's chunk on the prefill stream
+        std::uint32_t overtakes = 0;  // chunks of other requests chosen before this one (short first)
     };
 
     // Free/total VRAM. Tiered residency: the engine was sized to a budget, so the server never fills the card beyond it:
@@ -663,6 +685,7 @@ private:
         s.prefilled = cache_.restore(e_, s.session, job.prompt, s.prefix_restore_ms);
         s.st.cached_tokens = s.prefilled;
         s.capture_points = cache_.plan(s.n, s.prefilled, job.stable_prefix);
+        join_or_announce(s);
         if (job.on_progress) job.on_progress({serve::GenerationPhase::prefill, s.prefilled, 0, s.n});
     }
 
@@ -670,11 +693,74 @@ private:
         for (const auto& s : slots_) if (s.job && s.phase == Phase::decode) return true;
         return false;
     }
-    Slot* oldest_prefill() {
-        Slot* pick = nullptr;
+    std::uint32_t lane_of(const Slot& s) const { return static_cast<std::uint32_t>(&s - slots_.data()); }
+    // In-flight prefix join (shared strix::serve::choose_prefix_join, block-grid boundary trait): a prompt sharing a
+    // prefix with a prompt still prefilling asks that producer for a checkpoint at the deepest shared block boundary it
+    // has not run yet and waits for it; otherwise it serves joins itself. Restore = bit-identical checkpoint.
+    void join_or_announce(Slot& s) {
+        if (!o_.prefix_inflight || !cache_.enabled()) return;
+        const auto& prompt = s.job->job.prompt;
+        const auto choice = serve::choose_prefix_join(inflight_dir_, {}, prompt, s.prefilled,
+            [&](const serve::PrefixMatch& m, std::uint32_t lane) -> std::uint64_t {
+                if (lane >= slots_.size()) return 0;
+                const Slot& p = slots_[lane];
+                if (&p == &s || !p.job || p.phase != Phase::prefill || p.prefix_entry != m.entry) return 0;
+                const std::uint64_t frontier = inflight_ == &p ? p.launched : p.prefilled;
+                return serve::prefix_join_block_boundary(m.tokens, s.n, p.n, frontier, o_.prefix.block);
+            });
+        if (choice && inflight_dir_.acquire(choice.entry)) {
+            Slot& p = slots_[choice.lane];
+            const auto at = std::lower_bound(p.capture_points.begin(), p.capture_points.end(), choice.boundary);
+            if (at == p.capture_points.end() || *at != choice.boundary) p.capture_points.insert(at, choice.boundary);
+            s.join_entry = choice.entry;
+            s.join_lane = choice.lane;
+            s.join = {choice.entry, choice.boundary};
+            s.join_boundary = choice.boundary;
+            return;
+        }
+        s.prefix_entry = inflight_dir_.announce({}, prompt, lane_of(s));
+    }
+    // True while s waits for its producer's checkpoint (the capture is synchronous: it exists once the producer has
+    // prefilled to the boundary). On release (checkpoint taken, or the producer ended, was cancelled or failed) the
+    // prompt restores the longest checkpoint again and serves joins itself.
+    bool join_waiting(Slot& s) {
+        if (!s.join_entry) return false;
+        const Slot& p = slots_[s.join_lane];
+        const bool cancelled = s.job->ticket->cancelled();  // released at once: the pick finishes it
+        if (!cancelled &&
+            s.join.pending(p.prefix_entry, p.job.has_value(), p.phase == Phase::prefill, p.prefilled >= s.join.boundary))
+            return true;
+        inflight_dir_.release(s.join_entry);
+        s.join_entry = 0;
+        s.join = {};
+        if (cancelled) return false;
+        auto& job = s.job->job;
+        double ms = 0;
+        s.prefilled = cache_.restore(e_, s.session, job.prompt, ms);  // the session holds exactly the restored rows
+        s.prefix_restore_ms += ms;
+        s.st.cached_tokens = s.prefilled;
+        s.capture_points = cache_.plan(s.n, s.prefilled, job.stable_prefix);
+        s.prefix_entry = inflight_dir_.announce({}, job.prompt, lane_of(s));
+        if (job.on_progress) job.on_progress({serve::GenerationPhase::prefill, s.prefilled, 0, s.n});
+        return false;
+    }
+    void end_prefix_entries(Slot& s) noexcept {
+        if (s.prefix_entry) { inflight_dir_.withdraw(s.prefix_entry); s.prefix_entry = 0; }
+        if (s.join_entry) { inflight_dir_.release(s.join_entry); s.join_entry = 0; }
+    }
+    // Owner of the next prefill chunk, at a chunk boundary. Waiting joiners are left out. Short first: the fewest
+    // remaining rows, admission order on ties, a request overtaken kMaxQueueOvertakes times goes next (shared
+    // select_waiting); off: the oldest. Only the order of whole chunks changes, each request's chunks stay its own.
+    Slot* next_prefill() {
+        std::vector<Slot*> lanes;
         for (auto& s : slots_)
-            if (s.job && s.phase == Phase::prefill && (!pick || s.job->started < pick->job->started)) pick = &s;
-        return pick;
+            if (s.job && s.phase == Phase::prefill && !join_waiting(s)) lanes.push_back(&s);
+        std::stable_sort(lanes.begin(), lanes.end(),
+                         [](const Slot* a, const Slot* b) { return a->job->started < b->job->started; });
+        const auto pick = serve::select_waiting(lanes, o_.prefill_short_first,
+            [](const Slot* s) { return s->n - 1 - s->prefilled; },
+            [](Slot* s) -> std::uint32_t& { return s->overtakes; });
+        return pick < lanes.size() ? lanes[pick] : nullptr;
     }
     // Rows of the next chunk while others decode: --prefill-chunk N, or auto. Auto fits chunk_ms = a + b * rows (the fixed
     // per-chunk cost a matters: a per-row rate measured on small chunks would shrink the chunks without end) by least squares
@@ -727,16 +813,17 @@ private:
         s.st.prefill_ms = std::chrono::duration<double, std::milli>(s.t_decode - s.t0).count();
         if (job.on_progress) job.on_progress({serve::GenerationPhase::decode, s.n, 0, s.n});
         s.phase = Phase::decode;
+        end_prefix_entries(s);  // prompt done: it serves no further join (its end checkpoint is in the cache)
         s.ctx = s.ctx_build.valid() ? s.ctx_build.get() : nullptr;  // built in start() (same mode, same prompt)
         s.stream = qc::Stream{s.session, job.prompt[s.n - 1], s.n - 1, job.draft_depth_max, s.ctx.get(), job.copy_rows, job.window_rows};
         s.st.finish = "length";
         if (job.max_tokens == 0) finish(s, {}, "length");
     }
 
-    // One chunk of the oldest prefilling request after the decode step: next_chunk_rows() while others decode, else
-    // whole blocks.
+    // One chunk of the next prefilling request (next_prefill) after the decode step: next_chunk_rows() while others
+    // decode, else whole blocks up to the next checkpoint.
     void prefill_step() {
-        Slot* pick = oldest_prefill();
+        Slot* pick = next_prefill();
         if (!pick) return;
         Slot& s = *pick;
         if (s.job->ticket->cancelled()) { finish(s, {}, "cancelled"); return; }
@@ -851,8 +938,10 @@ private:
             ",\"copy_wide_steps\":" + std::to_string(s.ctx->wide_steps) + ",\"copy_wide_rows\":" + std::to_string(s.ctx->wide_rows) +
             ",\"copy_wide_accepted\":" + std::to_string(s.ctx->wide_accepted);
         extra += ",\"prefix_cached\":" + std::to_string(st.cached_tokens) + ",\"prefix_restore_ms\":" + std::to_string(s.prefix_restore_ms)
-            + ",\"prefix_capture_ms\":" + std::to_string(s.prefix_capture_ms) + "}";
+            + ",\"prefix_capture_ms\":" + std::to_string(s.prefix_capture_ms) + ",\"prefix_join\":" + std::to_string(s.join_boundary)
+            + ",\"prefill_overtakes\":" + std::to_string(s.overtakes) + "}";
         st.engine_extra.emplace_back("rtx", extra);
+        end_prefix_entries(s);
         queue_.finish(*s.job, std::move(st), error);
         s.job.reset();
         s.phase = Phase::prefill;
@@ -868,6 +957,8 @@ private:
     std::unique_ptr<strix::MtpDepthHost> dh_;  // measured-cost lone-stream depth (STRIX_MTP_CONTROLLER=depth)
     std::uint32_t max_chunk_ = 1024, auto_rows_ = 256, first_rows_ = 0, fit_n_ = 0, inflight_steps_ = 0;
     Slot* inflight_ = nullptr;  // overlap: the slot whose chunk is on the prefill stream
+    // Prompts still prefilling that may serve a join (lane = slot index); joins need >= 256 shared tokens.
+    serve::PrefixDirectory inflight_dir_{64, 256};
     double step_ms_ = 0, fit_[5] = {0, 0, 0, 0, 0}, fit_a_ = 0, fit_b_ = 0;
 };
 

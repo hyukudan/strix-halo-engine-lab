@@ -2320,6 +2320,24 @@ change acceptance, not committed target-greedy tokens. Compare within one load w
   28K x 400 tokens, one run per arm, token ids equal: code 121.54 -> 176.56 tok/s (verify 28.84 -> 19.30 ms per step),
   reasoning 130.54 -> 194.64, prose 101.29 -> 135.84.
 
+<a id="qwen27-cuda-mtp-kv-catchup"></a>
+
+### Qwen 27B CUDA spec: K/V-only MTP catch-up
+
+**Engine:** `qwen-rtx` (27B dense, CUDA: `strix-cuda-qwen35-spec`). **Control:** `--mtp-catchup kv|full`. **Default:**
+`kv` where the engine has the hook. **Home:** shared (host spec layer `include/strix/spec/mtp_chain.hpp`: the
+`MtpKvEngine` concept and the catch-up policy); the CUDA Qwen adapter supplies `mtp_kv` (`src/qwen35/cuda/engine.cu`).
+
+- The MTP chain catches up on committed positions lazily. A catch-up chunk whose block output and draft are never read
+  needs only the MTP layer's K/V; with the hook it issues the same K and V projections, in the same order and with the
+  same operands, and skips q, attention, o_proj, MLP, the MTP norm and the head. K/V bits and drafts are unchanged.
+- Engines without `mtp_kv` are unchanged (concept + `if constexpr`). HIP runs the same shared chain and adopts the
+  form by adding `mtp_kv` to its adapter.
+- Measured (EXACT, RTX PRO 6000 Blackwell, 28,187-token prompt, `--prefill-route large`, one pair): ids, steps and the
+  k histogram equal to `full`; MTP feed 1.960 s -> 0.091 s; decode unchanged (121.78 vs 121.39 tok/s).
+  Not yet measured: the default `windows` prompt route.
+- **Off switch:** `--mtp-catchup full`.
+
 <a id="rtx-kernels"></a>
 
 ### Decode kernel bundle
@@ -5082,12 +5100,29 @@ A row routes to an expert at most once, so a step of at most 16 rows gives every
 Those launches of the tensor-core GSQ expert kernels bind one accumulator block instead of four. The freed registers
 hold a three-group ring of weight fields in flight, where the tile form keeps a one-group lookahead.
 
-- **Preconditions:** CUDA Qwen MoE with `gsq_bf16_mma` experts (the FAST expert arithmetic); steps of at most 16 rows (decode, MTP verify windows, and a prefill block of at most 16 rows: a short prompt or a tail block). Prefill blocks of more than 16 rows keep the tile form; the exact profile runs no tensor-core experts.
+- **Preconditions:** CUDA Qwen MoE with `gsq_bf16_mma` experts (the FAST expert arithmetic) or `gsq_i8_turbo` experts (the TURBO int8 arithmetic, same trait and ring; measured on the device without a model, see Measured gain; the nested TURBO profile runs FAST's experts in decode windows, so this form runs under `--profile turbo --expert-turbo-rows off` only); steps of at most 16 rows (decode, MTP verify windows, and a prefill block of at most 16 rows: a short prompt or a tail block). Prefill blocks of more than 16 rows keep the tile form; the exact profile runs no tensor-core experts.
 - **Automatic selection:** On in every profile (an absent lever row = on); the launch picks the form from the step's row count. A wider tile under the decode form fails closed.
 - **Exactness evidence:** Same MMAs and scale FMAs in the same order for every output (bitwise the tile form). The tile form compiles to the previous instructions for every type except the IQ2_S project kernel (schedule only, same floating-point opcode multiset). Greedy ids equal on prose, edit and json; teacher-forced FAST logits of the decode form identical to the tile form (`--expert-decode-tile off`) on 645 rows of five contents (prose, edit, json, code, an 8K prompt). Contract and bundle id unchanged; `qwen_cuda_profile_host_test` checks the switch, serve == CLI and the unchanged id.
 - **Off switch:** `--expert-decode-tile off`; `STRIX_QRTX_EXPERT_DECODE_TILE=0`
-- **Measured gain:** RTX PRO 6000 600 W, FAST served decode e2e: prose 127.22 -> 137.6 / 138.98, edit 342.37 -> 380.98 / 378.97, json 287.14 -> 316.32 / 317.26 tok/s (one run before, two runs after).
+- **Measured gain:** RTX PRO 6000 600 W, FAST served decode e2e: prose 127.22 -> 137.6 / 138.98, edit 342.37 -> 380.98 / 378.97, json 287.14 -> 316.32 / 317.26 tok/s (one run before, two runs after). int8 form (`gsq_i8_turbo`, no model: routed-expert calls per storage-type pair, weighted by the model's layer mix to a 48-layer step, same card): int8 decode form vs FAST BF16 decode form -0.05 / -0.32 / -1.26 ms per step at 1 / 4 / 16 rows, vs the int8 tile form -0.52 / -1.49 / -6.87 ms; every decode form bitwise its tile form on the device. Not yet measured: end-to-end decode with int8 windows.
 - **Implementation / evidence:** [kernels](../src/cuda/core/moe_a8_mma.cuh), [form constants](../src/cuda/core/native_mma.hpp), [lever row](../include/strix/profiles/qwen_cuda.hpp)
+
+<a id="qwen-rtx-turbo-experts"></a>
+
+### TURBO: int8 tensor-core experts on large prefill blocks
+
+**Engine:** `qwen-rtx`. **Control:** `--profile turbo`; regime `--expert-turbo-rows N`, `STRIX_QRTX_EXPERT_TURBO_ROWS` (lever rows `expert_turbo`, `expert_turbo_rows`). **Default:** off (TURBO is explicit only; `exact`, no profile word and `fast` do not change).
+
+`--profile turbo` runs every FAST lever and adds the int8 tensor-core experts (`gsq-iq-i8mma-turbo-cuda-v1`: A8 int8
+activations x integer codes on int8 IMMA, one FP32 FMA per group) on prefill blocks of at least N rows (N = 512). Decode
+and MTP verify windows and smaller blocks run the FAST BF16 experts, so TURBO decode is FAST decode.
+
+- **Preconditions:** CUDA Qwen MoE (`strix-cuda-qwen-serve`, `qwen_tf_logits`) with GSQ expert packs admitted for both arithmetics; `--profile turbo` given explicitly. The bundle is not marked qualified (`qwen-cuda-turbo-bundle-v2`; it runs FAST's arithmetic in decode, whose decode-class gate is still open).
+- **Automatic selection:** none; the rule is part of the arithmetic contract (`+experts[prefill_rows>=512:...]`), the identities and the bundle id; `--print-effective-config` prints `expert_regime`.
+- **Exactness evidence:** TURBO class (bit-changing, lower precision than FAST). 32K logit gate against the exact reference, 4 prompts x 128 teacher-forced rows: KL 0.00906, top-1 0.9844, dNLL +0.00102 (bar KL <= 0.02, top-1 >= 0.93, dNLL <= 0.01); int8 in every MoE call: KL 0.00948, top-1 0.9785, dNLL +0.00543. Two loads wrote bitwise-identical TURBO logits.
+- **Off switch:** omit `--profile turbo`; `--expert-turbo-rows off` = int8 in every MoE call (decode windows included).
+- **Measured gain:** RTX PRO 6000 600 W, TURBO vs FAST, two runs each: 8,076-token TTFT -7.2 % cold / -6.7 % warm; 32,652-token prefill -6.4 % cold / -6.6 % warm; decode e2e equal within noise (same arithmetic in every window).
+- **Implementation / evidence:** [int8 expert kernels](../src/cuda/core/moe_turbo_i8.cuh), [profile column](../include/strix/profiles/qwen_cuda.hpp), [regime rule](../include/strix/cuda/qwen_options.hpp), [gate](../scripts/bench/cuda/qwen_fast/gate.sh)
 
 <a id="qwen-dense-cuda-profile"></a>
 
