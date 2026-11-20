@@ -7,6 +7,7 @@
 // wanted (its pending token, then its first drafts), so shrinking only shortens a draft chain.
 #pragma once
 
+#include "strix/spec/wide_window.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <string>
@@ -147,10 +148,11 @@ inline CopyWideModel copy_wide_measured(unsigned decode_rows_cap) {
     m.wide_ms = decode_rows_cap >= 16U ? 29.2 : 62.5;
     return m;
 }
+// The shared wide-window rule (strix/spec/wide_window.hpp): a fully accepted wide window must commit more tokens per
+// ms than a fully accepted narrow one. The CUDA window keeps the accepted prefix row by row (rollback rows), so a miss
+// costs no discarded pass.
 inline bool copy_wide_pays(std::uint32_t rows, const CopyWideModel& m = {}) {
-    if (rows <= kWindowRows || !(m.wide_ms > 0.0)) return false;
-    const double narrow = static_cast<double>(kWindowRows) / (m.narrow_a_ms + m.narrow_b_ms * kWindowRows);
-    return static_cast<double>(rows) / m.wide_ms > narrow;
+    return strix::spec::wide_window_full_pays(rows, m.wide_ms, kWindowRows, m.narrow_a_ms + m.narrow_b_ms * kWindowRows);
 }
 
 }  // namespace strix::cuda::qwen_cohort

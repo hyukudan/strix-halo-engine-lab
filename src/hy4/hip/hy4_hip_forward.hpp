@@ -28,6 +28,7 @@ struct ForwardOptions {
     std::uint32_t first = 0, last = 0;         // trunk layers of this rank; last 0 = depth
     std::uint32_t context = 4096;              // positions this forward may hold
     std::uint32_t prompt_rows = 0;             // batched prompt window (rows per launch, multiple of 8, >= 16); 0 = none
+    std::uint32_t verify_rows = 0;             // rows of a verify pass (forward_rows, 1..8); rings sized for them; 0 = none
 };
 
 struct LoadReport {
@@ -90,6 +91,16 @@ public:
     // group key the position closes), so the redo at the same position rewrites all of them before any read; a sliding
     // ring slot reused by position p held p - ring (ring >= window), outside p's window. step() synchronizes at its end.
     void rewind();
+
+    // ---- verify rows (hy4_hip_rows.hpp / .inc), whole-model rank, options.verify_rows > 0 ----
+    // R = tokens.size() rows at positions position() .. + R - 1 in one pass, each row bitwise what step() gives at that
+    // position (class BASE). Greedy id per row in rows_greedy(); the logits rows [R][vocab] in rows_logits() when asked.
+    // Synchronises; commit_rows(k) (0 <= k <= R) keeps the first k rows before the next pass or step.
+    void forward_rows(std::span<const std::uint32_t> tokens, bool logits);
+    [[nodiscard]] std::span<const std::uint32_t> rows_greedy() const noexcept;
+    [[nodiscard]] const std::vector<float>& rows_logits() const noexcept;
+    void commit_rows(std::uint32_t k);
+    void set_rows_expert_union(bool on) noexcept;  // routed experts of a window read once (bitwise); A/B aid of the bench
 
     void set_timing(bool on) noexcept;  // per-stage device sync for StepTimes (a first-receipt aid, not a tuned path)
     [[nodiscard]] const StepTimes& times() const noexcept;

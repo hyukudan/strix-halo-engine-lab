@@ -16,18 +16,20 @@
 # serve_bench.py burst set (aggregate tok/s from the server's cycle receipts when the log carries them, per-request
 # and end-to-end tok/s, TTFT, token ids), stops the server and writes one receipt per (class, round) with
 # metrics agg_C<n> / e2e_C<n>. Class prompts: scripts/bench/prompts/classes/<class>.txt (or --prompt-dir).
+# A class <base>ctx without its own file is generated from <base>.txt behind a long unrelated log of --ctx-chars
+# characters (default 30000, ~18K tokens; scripts/bench/prompts/longctx.py), e.g. editctx = the edit task at long context.
 # The decode class matters: drafting (MTP / n-gram) acceptance differs by an order of magnitude between them.
 set -u
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/bench/common/runlib.sh
 source "$here/runlib.sh"
-tag='' port='' classes=prose,edit,json conc=1,4,8 maxt=128 rounds=1 ready=/v1/models ready_log='' peer_cmd='' client_cmd='' round_base=0 ready_s=240 chat=() extra='{}' arm=''
+ctx_chars=30000 tag='' port='' classes=prose,edit,json conc=1,4,8 maxt=128 rounds=1 ready=/v1/models ready_log='' peer_cmd='' client_cmd='' round_base=0 ready_s=240 chat=() extra='{}' arm=''
 prompt_dir=$here/../prompts/classes
 while (($#)); do
     case $1 in
         --tag) tag=$2 ;; --port) port=$2 ;; --classes) classes=$2 ;; --concurrency) conc=$2 ;; --max-tokens) maxt=$2 ;;
         --rounds) rounds=$2 ;; --ready-path) ready=$2 ;; --ready-log) ready_log=$2 ;; --peer-cmd) peer_cmd=$2 ;; --client-cmd) client_cmd=$2 ;; --round) round_base=$2 ;; --ready-s) ready_s=$2 ;; --body-extra) extra=$2 ;;
-        --prompt-dir) prompt_dir=$2 ;; --arm) arm=$2 ;;
+        --prompt-dir) prompt_dir=$2 ;; --arm) arm=$2 ;; --ctx-chars) ctx_chars=$2 ;;
         --chat) chat=(--chat); shift; continue ;;
         --) shift; break ;;
         *) kit_die "unknown argument $1" ;;
@@ -37,6 +39,15 @@ done
 [[ -n $tag && -n $port && $# -gt 0 ]] || kit_die 'need --tag, --port and -- SERVER_CMD'
 out=${KIT_OUT:-bench-out}; d=$out/$tag; sdir=$d/server
 rm -rf -- "$d"; mkdir -p -- "$sdir"
+# Generated long-context classes: <base>ctx from <base>.txt (the run's own prompt directory, recorded with it).
+IFS=, read -ra C <<<"$classes"
+for c in "${C[@]}"; do
+    [[ $c == *ctx && ! -s $prompt_dir/$c.txt && -s $prompt_dir/${c%ctx}.txt ]] || continue
+    if [[ $prompt_dir != "$d/prompts" ]]; then
+        mkdir -p -- "$d/prompts"; cp -- "$prompt_dir"/*.txt "$d/prompts/"; prompt_dir=$d/prompts
+    fi
+    "$KIT_PY" -I "$KIT_ROOT/scripts/bench/prompts/longctx.py" "$prompt_dir/${c%ctx}.txt" "$prompt_dir/$c.txt"         --chars "$ctx_chars" || kit_die "cannot generate class $c"
+done
 kit_clean_env
 printf '%q ' "$@" >"$sdir/cmd.txt"; echo >>"$sdir/cmd.txt"
 # One absolute deadline, including startup, all clients and bounded teardown.
