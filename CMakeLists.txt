@@ -3391,6 +3391,12 @@ int main() { return 0; }"
     if(STRIX_CHECK_KERNEL_SCRATCH)
         strix_check_kernel_scratch(strix-hip-decode-token)
     endif()
+    # Shared Channel instantiation of the TP slot gathers (src/xport/tp_gather*.hpp): the pair gather link's channel route,
+    # bound by every family's exact TP decode (qwen35 dense, hy4).
+    add_library(strix_tp_xport STATIC src/xport/tp_gather.hip)
+    set_target_properties(strix_tp_xport PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+    target_link_libraries(strix_tp_xport PUBLIC strix_dist)
+    target_include_directories(strix_tp_xport PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
     if(STRIX_FAMILY_QWEN35_HIP)
         # HipEngine (window engine: forward_rows + commit(k)) over the shared HIP cores; both apps bind it.
         add_library(strix_qwen35_hip_engine STATIC src/qwen35/hip/engine.hip src/qwen35/config.cpp src/qwen35/family.cpp)
@@ -3403,11 +3409,6 @@ int main() { return 0; }"
         target_include_directories(strix_qwen35_hip_engine PRIVATE src)  # attn_core headers include "attn_core/..."
         add_executable(strix-hip-qwen35-decode apps/hip_qwen35_decode_main.hip)
         set_target_properties(strix-hip-qwen35-decode PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-        # Shared Channel instantiation of the TP slot gathers (src/xport/tp_gather*.hpp): the pair gather link's channel route.
-        add_library(strix_tp_xport STATIC src/xport/tp_gather.hip)
-        set_target_properties(strix_tp_xport PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-        target_link_libraries(strix_tp_xport PUBLIC strix_dist)
-        target_include_directories(strix_tp_xport PUBLIC include "${STRIX_HIP_INCLUDE_DIR}")
         target_link_libraries(strix-hip-qwen35-decode PRIVATE strix_qwen35_hip_engine strix_spec strix_dist strix_device strix_tp_xport)  # --tp-rank: pair link, topology rates
         # N-rank layer split over the topology declaration + shared planner + shared layer pipeline (one rank = the
         # decode app's path); --self-cut runs the one-process cut test of the engine's range hooks.
@@ -6794,7 +6795,7 @@ if(STRIX_FAMILY_HY4)
     target_link_libraries(strix_hy4_hip PUBLIC strix_hy4_ref strix_hip_runtime strix_q4k_a8_hip_probe strix_engram strix_ds41_hip)
     strix_target_warnings(strix_hy4_hip)
     add_executable(strix-hy4-rank apps/hy4_rank_main.cpp)
-    target_link_libraries(strix-hy4-rank PRIVATE strix_hy4_hip strix_dist strix_device strix_spec)  # pair: shared layer pipeline + link; copy proposer
+    target_link_libraries(strix-hy4-rank PRIVATE strix_hy4_hip strix_dist strix_device strix_spec strix_tp_xport)  # pair: shared layer pipeline + link (gather channel); copy proposer
     strix_target_warnings(strix-hy4-rank)
     add_executable(strix-hy4-rows apps/hy4_rows_main.cpp)  # verify rows bench + speculative decode (hy4_hip_rows)
     target_link_libraries(strix-hy4-rows PRIVATE strix_hy4_hip strix_spec)
