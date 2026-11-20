@@ -5094,7 +5094,7 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         # Same toolkit as the HIP compiler: ROCM_PATH, then the compiler's ROCm root, then the system default.
         find_library(STRIX_HIPBLASLT_LIBRARY NAMES hipblaslt
             HINTS "$ENV{ROCM_PATH}" "${CMAKE_HIP_COMPILER_ROCM_ROOT}" PATH_SUFFIXES lib lib64
-            PATHS /opt/rocm REQUIRED)
+            PATHS /opt/rocm /opt/rocm/core-10.1 REQUIRED)
         target_sources(strix_ds41_layer_hip PRIVATE src/hip_ds41_dense_fp16.hip)
         target_link_libraries(strix_ds41_layer_hip PUBLIC "${STRIX_HIPBLASLT_LIBRARY}")
         get_filename_component(strix_hipblaslt_real "${STRIX_HIPBLASLT_LIBRARY}" REALPATH)
