@@ -432,14 +432,14 @@ void campaign_defaults_contract(){
             require(std::find(def.known_prefix_tail_rows.begin(),def.known_prefix_tail_rows.end(),32U)!=def.known_prefix_tail_rows.end() &&
                 def.known_prefix_wide_only_tail_rows==std::vector<std::uint32_t>{32U},"the served default adds its wide-only tail block");
             require(!mtp_batch_lookup(def.mtp,nullptr).on,"the batch route's lookup default stays off under the served default");
-            const auto cli=parse(cli_default);
-            require(!cli.mtp.copy_wide_default && cli.mtp.copy_wide_rows.empty() && !cli.mtp.ngram_context,"the CLI has no wide default");
+            const auto cli_parsed=parse(cli_default);
+            require(!cli_parsed.mtp.copy_wide_default && cli_parsed.mtp.copy_wide_rows.empty() && !cli_parsed.mtp.ngram_context,"the CLI has no wide default");
             auto zero=served;zero.insert(zero.end(),{"--mtp-copy-wide-rows","0"});
-            const auto off=parse(zero);
-            require(!off.mtp.copy_wide_default && off.mtp.copy_wide_rows.empty() && !off.mtp.ngram_context &&
-                off.known_prefix_wide_only_tail_rows.empty(),"--mtp-copy-wide-rows 0 keeps the served route off");
-            for(const char* mode:{"--mtp-ngram-draft=on","--mtp-ngram-draft=off","--mtp-ngram-draft=auto","--mtp-ngram-draft=ctx"}) {
-                auto explicit_mode=served;explicit_mode.push_back(mode);
+            const auto zero_off=parse(zero);
+            require(!zero_off.mtp.copy_wide_default && zero_off.mtp.copy_wide_rows.empty() && !zero_off.mtp.ngram_context &&
+                zero_off.known_prefix_wide_only_tail_rows.empty(),"--mtp-copy-wide-rows 0 keeps the served route off");
+            for(const char* flag:{"--mtp-ngram-draft=on","--mtp-ngram-draft=off","--mtp-ngram-draft=auto","--mtp-ngram-draft=ctx"}) {
+                auto explicit_mode=served;explicit_mode.push_back(flag);
                 const auto x=parse(explicit_mode);
                 require(!x.mtp.copy_wide_default && x.mtp.copy_wide_rows.empty() && !x.mtp.ngram_wide_only,
                     "an explicit n-gram mode keeps the served default out");
