@@ -5,6 +5,7 @@
 #include "strix/hip_ds41_routes_fast.hpp"
 #include "hip_ds41_routes_fast_body.hpp"
 #include "engram/hip/row_kernel.hpp"  // shared Engram row kernel (decode form)
+#include "ops/a8/a8_quant_device.hpp"  // shared A8 group (quantize_a8_kernel)
 #include "strix/ds41_scalar_codecs.hpp"
 
 #include <hip/hip_fp16.h>
@@ -363,19 +364,11 @@ __global__ __launch_bounds__(32) void quantize_a8_kernel(const float* __restrict
     const unsigned lane = threadIdx.x, group = blockIdx.x, row = blockIdx.y, groups = pitch / 32U;
     const unsigned long long in = static_cast<unsigned long long>(row) * width + 32U * group + lane;
     const unsigned long long at = static_cast<unsigned long long>(row) * pitch + 32U * group + lane;
-    const float x = values[in];
-    float amax = fabsf(x);
-    for (int stride = 16; stride; stride /= 2) amax = fmaxf(amax, __shfl_xor(amax, stride, 32));
-    const bool tiny = amax > 0.0F && amax < 0x1p-119F;
-    const float delta = amax == 0.0F || tiny ? 1.0F : amax / 127.0F;
-    const float rounded = tiny ? 0.0F : rintf(x / delta);
-    const int code = static_cast<int>(fminf(127.0F, fmaxf(-127.0F, rounded)));
-    int sum = code;
-    for (int stride = 16; stride; stride /= 2) sum += __shfl_xor(sum, stride, 32);
-    codes[at] = static_cast<signed char>(code);
+    const auto q = strix::ops::a8::quantize_group(values[in]);  // the shared group (ops/a8/a8_quant_device.hpp)
+    codes[at] = static_cast<signed char>(q.code);
     if (lane == 0U) {
-        deltas[static_cast<unsigned long long>(row) * groups + group] = delta;
-        sums[static_cast<unsigned long long>(row) * groups + group] = sum;
+        deltas[static_cast<unsigned long long>(row) * groups + group] = q.delta;
+        sums[static_cast<unsigned long long>(row) * groups + group] = q.sum;
     }
 }
 

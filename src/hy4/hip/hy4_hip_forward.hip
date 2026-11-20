@@ -23,6 +23,7 @@
 #include "engram/hip/row_kernel.hpp"
 #include "moe_core/route_wave_kernel.hpp"
 #include "moe_core/route_tap_hip.hpp"
+#include "ops/a8/a8_quant_device.hpp"
 #include "ops/glu/glu_device.hpp"
 #include "ops/glu/q8_rows_glu_pair.hpp"
 #include "ops/norm/norm_presets.hpp"
@@ -271,6 +272,10 @@ struct Forward::Impl {
     std::vector<float*> mha_halo;
     float* mha_x = nullptr;
     std::uint16_t *mha_k = nullptr, *mha_v = nullptr;
+    // STRIX_HY4_PF_A8_PRODUCER (EXACT, same bits): prompt windows' A8 operand rows stored by their producer (the site / q_a
+    // norms, the sigmoid gate and SwiGLU in one quantiser pass) and reused by every Q8_0 consumer; kv latent norm on the
+    // strided rows. Off = one quantiser pass per consumer, separate gate / SwiGLU passes, gather + norm + scatter.
+    bool pf_a8_producer = true;
     // Pinned host staging of the decode step (host-to-device copies never wait for the stream; each slot is written once
     // per step and the step ends with a stream sync, so no slot is rewritten while its copy is pending).
     struct Staging {
@@ -345,12 +350,24 @@ struct Forward::Impl {
         float *mdeltas = nullptr, *ddeltas = nullptr, *hout = nullptr, *clear = nullptr, *rawdots = nullptr;
         std::int32_t *msums = nullptr, *dsums = nullptr;
         std::uint8_t* csr = nullptr;
+        std::int8_t *xcodes = nullptr, *qcodes = nullptr;  // pf_a8_producer: A8 rows of xn / qa (the norms' stores)
+        float *xdeltas = nullptr, *qdeltas = nullptr;
+        std::int32_t *xsums = nullptr, *qsums = nullptr;
         float *ik = nullptr, *pooled = nullptr, *iq = nullptr, *hwraw = nullptr;
         std::uint32_t *skeys = nullptr, *hist0 = nullptr, *ilist = nullptr, *list_n = nullptr, *iota4 = nullptr;
         std::uint32_t* qtail = nullptr;  // q_image: [k] = row of query row k's rope tail in pr.qt read as rope-wide rows
         std::uint8_t *erows = nullptr, *gate_off = nullptr;
         float *e = nullptr, *kvout = nullptr;
     } pr;
+    // pf_a8_producer: A8 rows already stored for the FP32 rows [rows][width] at x (by the norm that wrote x, or by a pre-op
+    // quantiser for rows never written as FP32). q8a8_rows takes a row range of a live slot instead of quantising; a slot is
+    // dropped when a GEMM or a plain norm writes its rows.
+    struct A8Slot {
+        const float* x = nullptr;
+        std::uint32_t rows = 0, width = 0;
+        strix::ops::a8::Rows a8{};
+    };
+    A8Slot a8_xn, a8_qa, a8_pre;
     std::vector<const std::uint8_t*> kb_pad;
     // Prompt-window Engram read-ahead (engram_submit): tickets per Engram ordinal of the window starting at the key.
     struct EngramWindow {
@@ -496,6 +513,7 @@ struct Forward::Impl {
         store_epilogue = strix::envcfg::flag("STRIX_HY4_Q8_STORE_EPILOGUE", true);
         pf_store_epilogue = strix::envcfg::flag("STRIX_HY4_PF_STORE_EPILOGUE", true);
         pf_mha = strix::envcfg::flag("STRIX_HY4_PF_MHA", false);
+        pf_a8_producer = strix::envcfg::flag("STRIX_HY4_PF_A8_PRODUCER", true);
         const std::uint32_t launch_rows = rows::cache_rows(rmax, vr.max);  // rows a launch / verify pass may write (ring sizes)
         state_launch_rows = launch_rows;
         std::vector<std::uint32_t> seq(context + 1U);
@@ -588,6 +606,15 @@ struct Forward::Impl {
         pr.rawdots = alloc<float>(R * K * L);
         pr.csr = alloc<std::uint8_t>(strix::q51_known_rows::scratch_layout(rmax, c.experts, c.top_k, true).bytes);
         pr.acc = alloc<float>(R * L); pr.routed = alloc<float>(R * h); pr.shared = alloc<float>(R * h);
+        if (pf_a8_producer) {
+            const auto slot_rows = [&](std::uint32_t width, std::int8_t*& codes, float*& deltas, std::int32_t*& sums) {
+                const std::uint32_t pitch = strix::a8_row_pitch(width);
+                codes = alloc<std::int8_t>(R * pitch); deltas = alloc<float>(R * pitch / 32U); sums = alloc<std::int32_t>(R * pitch / 32U);
+                return strix::ops::a8::Rows{codes, deltas, sums, pitch};
+            };
+            a8_xn.a8 = slot_rows(c.hidden, pr.xcodes, pr.xdeltas, pr.xsums);
+            a8_qa.a8 = slot_rows(c.q_lora, pr.qcodes, pr.qdeltas, pr.qsums);
+        }
         pr.ik = alloc<float>(R * kIdxDim); pr.pooled = alloc<float>(R / kIdxRatio * kIdxDim);
         pr.iq = alloc<float>(R * kIdxHeads * kIdxDim); pr.hwraw = alloc<float>(R * kIdxHeads);
         pr.skeys = alloc<std::uint32_t>(R * group_cap); pr.hist0 = alloc<std::uint32_t>(R * 256U);
@@ -1020,10 +1047,45 @@ struct Forward::Impl {
     }
 
     // ---- batched prompt: the same stages over a window of R rows (row r = position p0 + r) -----------------------
-    void norm_rows(const float* x, const float* weight, unsigned n, unsigned R, float* y) {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(strix::ops::norm::rmsnorm_kernel<NormTraits, 256>), dim3(R), dim3(256), 0, s, x, weight, 0, n,
-                           c.rms_eps, y);
+    // emit (pf_a8_producer): the norm's store also writes the A8 rows of y into the slot (ops/a8 NormStore: the quantiser's
+    // group on the same FP32 y), and the slot is registered for y; without it, any slot over y is dropped.
+    void norm_rows(const float* x, const float* weight, unsigned n, unsigned R, float* y, A8Slot* emit = nullptr) {
+        namespace nm = strix::ops::norm;
+        a8_drop(y);
+        if (emit != nullptr && pf_a8_producer && n % 32U == 0U && n <= emit->a8.pitch && R <= rmax) {
+            const strix::ops::a8::NormStore st{emit->a8, n};
+            // rmsnorm_fused_kernel writes x only for Residual (false here): x is read-only
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(nm::rmsnorm_fused_kernel<NormTraits, 256, false, strix::ops::a8::NormStore>), dim3(R), dim3(256),
+                               0, s, const_cast<float*>(x), nullptr, weight, 0, n, c.rms_eps, y, st);
+            check(hipGetLastError(), "rmsnorm A8 rows launch");
+            emit->x = y;
+            emit->rows = R;
+            emit->width = n;
+            return;
+        }
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(nm::rmsnorm_kernel<NormTraits, 256>), dim3(R), dim3(256), 0, s, x, weight, 0, n, c.rms_eps, y);
         check(hipGetLastError(), "rmsnorm rows launch");
+    }
+    // The norm of the first n values of R rows at row stride `stride`, in place (the kv latent of the 576-wide rows).
+    void norm_rows_strided(float* x, std::uint32_t stride, const float* weight, unsigned n, unsigned R) {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(strix::ops::norm::rmsnorm_strided_kernel<NormTraits, 256>), dim3(R), dim3(256), 0, s, x,
+                           std::size_t{stride}, weight, 0, n, c.rms_eps, x, std::size_t{stride});
+        check(hipGetLastError(), "rmsnorm strided rows launch");
+    }
+    void a8_drop(const float* y) noexcept {
+        for (A8Slot* a : {&a8_xn, &a8_qa, &a8_pre})
+            if (y != nullptr && a->x == y) a->x = nullptr;
+    }
+    // The A8 rows of x [R][x_stride] when x is a whole-row range of a live slot of width x_stride (else a8.codes == nullptr).
+    strix::ops::a8::Rows a8_of(const float* x, std::uint32_t R, std::uint32_t x_stride) const noexcept {
+        for (const A8Slot* a : {&a8_xn, &a8_qa, &a8_pre}) {
+            if (a->x == nullptr || x < a->x || a->width != x_stride) continue;
+            const std::size_t off = static_cast<std::size_t>(x - a->x);
+            if (off % x_stride != 0U || off / x_stride + R > a->rows) continue;
+            const std::size_t r0 = off / x_stride, groups = a->a8.pitch / 32U;
+            return {a->a8.codes + r0 * a->a8.pitch, a->a8.deltas + r0 * groups, a->a8.sums + r0 * groups, a->a8.pitch};
+        }
+        return {};
     }
     // One A8 rows GEMM (shared core::f16_dense_tall::q8a8) over activation rows x [R][x_stride]; `batch` > 1 runs one product
     // per head (grid z) at x + z * batch_in, weights + z * batch_weight_bytes, y + z * batch_out.
@@ -1033,12 +1095,15 @@ struct Forward::Impl {
         namespace q8 = strix::core::f16_dense_tall::q8a8;
         // A8 rows at the shared operand pitch: a pitch that is a multiple of 8 KiB (K_b 16384, V_b 32768, o_proj 16384)
         // aliases the 128 rows a CTA stage reads (strix/a8_row_pitch.hpp); same values, same bits.
-        const std::uint32_t pitch = strix::a8_row_pitch(x_stride);
-        strix::ds41::enqueue_quantize_a8(x, x_stride, R, pitch, pr.codes, pr.deltas, pr.sums, s);
+        // pf_a8_producer: rows whose producer already stored their A8 rows (a8_of) skip the quantiser; same codes, same bits.
+        const auto pre = a8_of(x, R, x_stride);
+        const std::uint32_t pitch = pre.codes != nullptr ? pre.pitch : strix::a8_row_pitch(x_stride);
+        if (pre.codes == nullptr) strix::ds41::enqueue_quantize_a8(x, x_stride, R, pitch, pr.codes, pr.deltas, pr.sums, s);
+        a8_drop(y);
         q8::View v{};
         v.weight = weights;
-        v.codes = pr.codes;
-        v.deltas = pr.deltas;
+        v.codes = pre.codes != nullptr ? pre.codes : pr.codes;
+        v.deltas = pre.codes != nullptr ? pre.deltas : pr.deltas;
         v.out = y != nullptr ? y : reinterpret_cast<float*>(image);  // the image form never writes out (supported() wants one)
         v.row_bytes = static_cast<std::uint32_t>(row_bytes(8U, width));
         v.in = width;
@@ -1068,6 +1133,7 @@ struct Forward::Impl {
         const auto& tw = t(name);
         if (tw.dims.at(0) != width || tw.bytes != row_bytes(tw.type, width) * outputs)
             throw std::runtime_error("hy4 hip forward: shape of " + name);
+        a8_drop(y);
         if (tw.type == 8U) {
             // pf_store_epilogue: the epilogue below runs in the GEMM's store instead (same function, same FP32 sum: same bits)
             const bool fused = round && pf_store_epilogue;
@@ -1090,6 +1156,27 @@ struct Forward::Impl {
         }
         if (round) glu::launch_epilogue<glu::Round::bf16>(y, bias, outputs, std::size_t{R} * outputs, y, s);
         check(hipGetLastError(), "linear rows epilogue launch");
+    }
+    // y[r] = W op(r) with op an elementwise pre-op of FP32 rows (ops/a8 SigmoidGate / Swiglu: the shared glu functions) whose
+    // result rows would be x [R][width]. pf_a8_producer + Q8_0 W: one quantiser pass stores the A8 rows of op (x is never
+    // written; the slot stands for it during this Linear). Else: separate() writes x, then the plain linear_rows.
+    template <class Pre, class Separate>
+    void linear_rows_pre(const std::string& name, const Pre& op, Separate&& separate, float* x, std::uint32_t width, std::uint32_t outputs,
+                         std::uint32_t R, float* y) {
+        const std::uint32_t pitch = strix::a8_row_pitch(width);
+        if (!pf_a8_producer || t(name).type != 8U || width % 32U != 0U || R > rmax) {
+            separate();
+            linear_rows(name, x, width, outputs, R, y);
+            return;
+        }
+        a8_pre.a8 = strix::ops::a8::Rows{pr.codes, pr.deltas, pr.sums, pitch};  // pr.codes holds R x (wide + pad) >= R x pitch
+        strix::ops::a8::launch_quantize_rows(op, width, R, a8_pre.a8, s);
+        check(hipGetLastError(), "pre-op A8 rows launch");
+        a8_pre.x = x;
+        a8_pre.rows = R;
+        a8_pre.width = width;
+        linear_rows(name, x, width, outputs, R, y);
+        a8_pre.x = nullptr;
     }
 
     // Engram row requests of window [p0, p0 + R) for one Engram ordinal; tok(q) is the token at position q.
@@ -1257,16 +1344,20 @@ struct Forward::Impl {
         const std::uint32_t* pp = iota + p0;
         linear_rows(blk(l, "attn_gate.weight"), pr.xn, c.hidden, H * vd, R, pr.gate);
         linear_rows(blk(l, "attn_q_a.weight"), pr.xn, c.hidden, c.q_lora, R, pr.qa);
-        norm_rows(pr.qa, t(blk(l, "attn_q_a_norm.weight")).f(), c.q_lora, R, pr.qa);
+        norm_rows(pr.qa, t(blk(l, "attn_q_a_norm.weight")).f(), c.q_lora, R, pr.qa, &a8_qa);
         linear_rows(blk(l, "attn_q_b.weight"), pr.qa, c.q_lora, H * qk, R, pr.qv);
         const float* cs = idx ? cos_idx : cos_swa;
         const float* sn = idx ? sin_idx : sin_swa;
         rp::launch<rp::Round::bf16>({pr.qv, R, H, H * qk, qk, c.qk_nope, rope / 2U, cs, sn, pp, false}, s);
         linear_rows(blk(l, "attn_kv_a_mqa.weight"), pr.xn, c.hidden, row, R, pr.ckv);
         // the latent 512 of each 576-wide row normalised (the norm reads rows of n): gather, norm, scatter back
-        check(hipMemcpy2DAsync(pr.ckn, kl * 4U, pr.ckv, row * 4U, kl * 4U, R, hipMemcpyDeviceToDevice, s), "latent gather");
-        norm_rows(pr.ckn, t(blk(l, "attn_kv_a_norm.weight")).f(), kl, R, pr.ckn);
-        check(hipMemcpy2DAsync(pr.ckv, row * 4U, pr.ckn, kl * 4U, kl * 4U, R, hipMemcpyDeviceToDevice, s), "latent scatter");
+        if (pf_a8_producer) {
+            norm_rows_strided(pr.ckv, row, t(blk(l, "attn_kv_a_norm.weight")).f(), kl, R);
+        } else {
+            check(hipMemcpy2DAsync(pr.ckn, kl * 4U, pr.ckv, row * 4U, kl * 4U, R, hipMemcpyDeviceToDevice, s), "latent gather");
+            norm_rows(pr.ckn, t(blk(l, "attn_kv_a_norm.weight")).f(), kl, R, pr.ckn);
+            check(hipMemcpy2DAsync(pr.ckv, row * 4U, pr.ckn, kl * 4U, kl * 4U, R, hipMemcpyDeviceToDevice, s), "latent scatter");
+        }
         rp::launch<rp::Round::bf16>({pr.ckv, R, 1U, row, row, kl, rope / 2U, cs, sn, pp, false}, s);
         check(dcr::store_rows({pr.ckv, row, pp, 0U, R, latent_rows[l], latent[l], flag}, s), "latent rows store");
         if (idx) index_keys_rows(l, p0, R);
@@ -1312,8 +1403,9 @@ struct Forward::Impl {
             q8a8_rows(vb.p, kl, vd, R, pr.olat, H * kl, pr.o, H * vd, H, kl, vd, pf_store_epilogue);
             if (!pf_store_epilogue) glu::launch_epilogue<glu::Round::bf16>(pr.o, nullptr, n, n, pr.o, s);
         }
-        glu::launch_sigmoid_gate<glu::DeclaredExp, glu::Round::bf16>(pr.o, pr.gate, n, pr.o, s);
-        linear_rows(blk(l, "attn_output.weight"), pr.o, H * vd, c.hidden, R, pr.f);
+        linear_rows_pre(
+            blk(l, "attn_output.weight"), strix::ops::a8::SigmoidGate<glu::DeclaredExp, glu::Round::bf16>{pr.o, pr.gate},
+            [&] { glu::launch_sigmoid_gate<glu::DeclaredExp, glu::Round::bf16>(pr.o, pr.gate, n, pr.o, s); }, pr.o, H * vd, c.hidden, R, pr.f);
         norm_rows(pr.f, t(blk(l, "post_attention_norm.weight")).f(), c.hidden, R, pr.f);
         check(hipGetLastError(), "attention rows launch");
     }
@@ -1368,8 +1460,10 @@ struct Forward::Impl {
         if (c.dense[l]) {
             linear_rows(blk(l, "ffn_gate.weight"), pr.xn, h, c.dense_ff, R, pr.g);
             linear_rows(blk(l, "ffn_up.weight"), pr.xn, h, c.dense_ff, R, pr.up);
-            glu::launch_swiglu<glu::DeclaredExp, glu::Round::bf16>(pr.g, pr.up, std::size_t{R} * c.dense_ff, glu::no_clamp, pr.act, s);
-            linear_rows(blk(l, "ffn_down.weight"), pr.act, c.dense_ff, h, R, pr.f);
+            linear_rows_pre(
+                blk(l, "ffn_down.weight"), strix::ops::a8::Swiglu<glu::DeclaredExp, glu::Round::bf16>{pr.g, pr.up, glu::no_clamp},
+                [&] { glu::launch_swiglu<glu::DeclaredExp, glu::Round::bf16>(pr.g, pr.up, std::size_t{R} * c.dense_ff, glu::no_clamp, pr.act, s); },
+                pr.act, c.dense_ff, h, R, pr.f);
         } else {
             const std::uint64_t K = c.top_k, L = c.latent;
             linear_rows(blk(l, "ffn_gate_inp.weight"), pr.xn, h, c.experts, R, pr.rlog, false);
@@ -1384,8 +1478,10 @@ struct Forward::Impl {
             linear_rows(blk(l, "ffn_routed_up.weight"), pr.acc, c.latent, h, R, pr.routed);
             linear_rows(blk(l, "ffn_gate_shexp.weight"), pr.xn, h, c.shared_ff, R, pr.g);
             linear_rows(blk(l, "ffn_up_shexp.weight"), pr.xn, h, c.shared_ff, R, pr.up);
-            glu::launch_swiglu<glu::DeclaredExp, glu::Round::bf16>(pr.g, pr.up, std::size_t{R} * c.shared_ff, glu::no_clamp, pr.act, s);
-            linear_rows(blk(l, "ffn_down_shexp.weight"), pr.act, c.shared_ff, h, R, pr.shared);
+            linear_rows_pre(
+                blk(l, "ffn_down_shexp.weight"), strix::ops::a8::Swiglu<glu::DeclaredExp, glu::Round::bf16>{pr.g, pr.up, glu::no_clamp},
+                [&] { glu::launch_swiglu<glu::DeclaredExp, glu::Round::bf16>(pr.g, pr.up, std::size_t{R} * c.shared_ff, glu::no_clamp, pr.act, s); },
+                pr.act, c.shared_ff, h, R, pr.shared);
             strix::moe_core::enqueue_combine<strix::moe::CombineForm::bf16_steps, 1U, 3072U>(nullptr, pr.routed, pr.shared, pr.f, R, s);
         }
         norm_rows(pr.f, t(blk(l, "post_ffw_norm.weight")).f(), h, R, pr.f);
@@ -1399,7 +1495,7 @@ struct Forward::Impl {
                                        t(blk(l, (p + "_scale.weight").c_str())).f(), R, c.hidden, 1U, c.hc_eps, c.rms_eps, pr.mix, pr.partial, s),
               "hc mixes rows");
         check(hcc::enqueue_collapse<kSub>(pr.x0, pr.mix, R, c.hidden, pr.u, s), "hc collapse rows");
-        norm_rows(pr.u, t(blk(l, norm_name)).f(), c.hidden, R, pr.xn);
+        norm_rows(pr.u, t(blk(l, norm_name)).f(), c.hidden, R, pr.xn, &a8_xn);
         sub();
         check(hcc::enqueue_expand<kSub>(hcc::SubSum{pr.f, nullptr, nullptr}, pr.x0, pr.mix, R, c.hidden, pr.x1, s), "hc expand rows");
         std::swap(pr.x0, pr.x1);

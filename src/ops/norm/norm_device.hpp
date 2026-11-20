@@ -62,6 +62,19 @@ __global__ void rmsnorm_kernel(const typename Traits::Input* x, const typename T
     rmsnorm_row<Traits, L, false>(s, x + base, nullptr, nullptr, w, wt, n, eps, y + base, base, NoStore{});
 }
 
+// The norm of the first n values of rows at a row stride (x row r at x + r * x_stride, y row r at y + r * y_stride; y may
+// be x): the plain kernel's row function on the same values, without gathering the rows to a tight buffer. One block per row.
+template <class Traits, unsigned L>
+__global__ void rmsnorm_strided_kernel(const typename Traits::Input* x, std::size_t x_stride, const typename Traits::Scale* w,
+                                       typename Traits::ScaleFormat wt, unsigned n, float eps, typename Traits::Output* y,
+                                       std::size_t y_stride) {
+    static_assert(std::is_same_v<typename Traits::Input, float>);
+    static_assert(std::is_same_v<typename Traits::Output, float>);
+    __shared__ float s[L];
+    const std::size_t row = blockIdx.x;
+    rmsnorm_row<Traits, L, false>(s, x + row * x_stride, nullptr, nullptr, w, wt, n, eps, y + row * y_stride, row * n, NoStore{});
+}
+
 // x += r (Residual), then the norm of x into y and store(row * n + i, y) per element. One block per row.
 template <class Traits, unsigned L, bool Residual, class Store>
 __global__ void rmsnorm_fused_kernel(float* x, const float* r, const typename Traits::Scale* w,
