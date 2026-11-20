@@ -113,9 +113,14 @@ constexpr bool b_ring_ok(unsigned tc, unsigned ahead) {
     return true;
 }
 static_assert(b_ring_ok(1, 1) && b_ring_ok(2, 2) && b_ring_ok(4, 2) && b_ring_ok(16, 2) && b_ring_ok(16, 3));
-__device__ __forceinline__ Half16 staged_fragment(const std::uint32_t* p) {
+// B fragment as 8 dwords (two 16-byte LDS loads), bit-cast to 16 halves only as the WMMA operand: a <16 x half> value
+// held across the ring makes gfx11 true16 codegen split and re-pack every dword (v_lshrrev_b32 16 + v_mov_b16 .h per
+// dword: 16 no-op VALU per WMMA, measured 1,026 of 1,458 VALU per 64 WMMA in the q8a8 loop). Bits identical either way
+// (the same fix as tiled_core.hpp / f16_tile_gemm.hpp / hip_moe_prefill_core2.inc).
+typedef std::uint32_t Frag __attribute__((ext_vector_type(8), aligned(16)));
+__device__ __forceinline__ Frag staged_fragment(const std::uint32_t* p) {
     struct { U4 l, h; } v{*reinterpret_cast<const U4*>(p), *reinterpret_cast<const U4*>(p + 4)};
-    return __builtin_bit_cast(Half16, v);
+    return __builtin_bit_cast(Frag, v);
 }
 }  // namespace detail
 
@@ -124,6 +129,9 @@ __device__ __forceinline__ Half16 staged_fragment(const std::uint32_t* p) {
 //     [unit, unit + 4) into nb[8], instead of raw FP16 loads from tile(i).w: weights of another stored form are decoded
 //     once per (CTA, stage) and every row wave reads the decoded FP16 from LDS.
 //   fragment(row, unit) -> Half16: the lane's A fragment of `row` at k unit `unit`, instead of 16 FP32 loads of x.
+//   fragment_load(row, unit) -> raw, fragment_half(raw) -> Half16 (optional, with fragment() = their composition):
+//     fragment() split in its loads and its arithmetic, like the core's own FP32 x path: the loads of unit u + 1 are
+//     issued before the WMMAs of unit u and decoded after them (without the split the decode waits for its loads).
 //   kWaves: row waves per CTA (default 8 = 128 rows per weight read); launch with 32 * kWaves threads and
 //     grid.x = ceil(rows / (16 * kWaves)). Stagers stay the first 16 * TC threads.
 //   kColumnFast = true: grid.x = column block, grid.y = row block (launch dim3(column blocks, row blocks)), so the
@@ -132,6 +140,8 @@ __device__ __forceinline__ Half16 staged_fragment(const std::uint32_t* p) {
 //     (measured on the MiniMax index projection, 6 column blocks, 4096 rows: x re-streamed per block at rows-fast).
 template <class C> concept ColsStage = requires(const C& c, U4* nb) { c.stage(0U, 0U, 0U, nb); };
 template <class C> concept ColsFragment = requires(const C& c) { { c.fragment(0U, 0U) } -> std::same_as<Half16>; };
+template <class C> concept ColsFragmentSplit =
+    ColsFragment<C> && requires(const C& c) { { c.fragment_half(c.fragment_load(0U, 0U)) } -> std::same_as<Half16>; };
 //   stage_load(tile, col, unit) -> raw, stage_decode(raw, nb) (optional, both or neither): stage() split in its
 //     global loads and its arithmetic. The core issues the loads after the stage's second barrier and decodes after
 //     the stage's WMMAs, so the load latency hides behind them (stage() must equal stage_decode(stage_load())).
@@ -202,15 +212,17 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
     const auto* xb = reinterpret_cast<const unsigned char*>(detail::uniform(x));
     // Rows past nr read row 0 (their sums are never stored).
     const std::uint32_t xr = row0 + c < nr ? row0 + c : 0U, xo = xr * in * 4U;
-    // A fragment in two steps: frag_load issues the loads (the policy's fragment, or the 16 FP32 x values), frag_half
-    // gives the WMMA operand (identity, or the core's RNE cast). The loads of unit u + 1 are issued before the WMMAs of
-    // unit u and converted after them.
+    // A fragment in two steps: frag_load issues the loads (the policy's split load, its fragment, or the 16 FP32 x
+    // values), frag_half gives the WMMA operand (the policy's decode, identity, or the core's RNE cast). The loads of
+    // unit u + 1 are issued before the WMMAs of unit u and converted after them.
     const auto frag_load = [&](unsigned unit) __attribute__((always_inline)) {
-        if constexpr (ColsFragment<Cols>) return cols.fragment(xr, unit);
+        if constexpr (ColsFragmentSplit<Cols>) return cols.fragment_load(xr, unit);
+        else if constexpr (ColsFragment<Cols>) return cols.fragment(xr, unit);
         else return detail::row_raw(xb, xo + unit * 64U);
     };
-    const auto frag_half = [](const auto& raw) __attribute__((always_inline)) {
-        if constexpr (ColsFragment<Cols>) return raw;
+    const auto frag_half = [&](const auto& raw) __attribute__((always_inline)) {
+        if constexpr (ColsFragmentSplit<Cols>) return cols.fragment_half(raw);
+        else if constexpr (ColsFragment<Cols>) return raw;
         else return detail::row_half(raw);
     };
     // Stager role: thread tid owns column tid of the CTA's column block.
@@ -264,14 +276,14 @@ __device__ __forceinline__ void core(const float* x, unsigned in, unsigned nr, C
                     const Half16 a = frag_half(ar);
                     if (kk + 1U < 4U || more) ar = frag_load(u0 + kk + 1U);
                     detail::sched_fence();
-                    Half16 b[kAhead + 1U];
+                    detail::Frag b[kAhead + 1U];  // 8 dwords each; Half16 only at the WMMA (see staged_fragment)
 #pragma unroll
                     for (unsigned t = 0; t < kAhead; ++t) b[t] = detail::staged_fragment(&lds.w[16U * t + c][kk * 8U]);
                     detail::sched_fence();
 #pragma unroll
                     for (unsigned t = 0; t < TC; ++t) {
                         if (t + kAhead < TC) b[(t + kAhead) % (kAhead + 1U)] = detail::staged_fragment(&lds.w[16U * (t + kAhead) + c][kk * 8U]);
-                        acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b[t % (kAhead + 1U)], acc[t]);
+                        acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, __builtin_bit_cast(Half16, b[t % (kAhead + 1U)]), acc[t]);
 #if defined(STRIX_WFMT_CAPTURE) && STRIX_WFMT_CAPTURE
                         if constexpr (requires { cols.capture_partial(acc[t]); }) cols.capture_partial(acc[t]);
 #endif

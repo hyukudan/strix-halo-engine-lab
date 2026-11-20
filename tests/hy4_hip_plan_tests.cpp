@@ -97,6 +97,24 @@ void check_prompt_plan() {
     CHECK(hb::index_dense_rows(0U, 2048U) == 2048U && hb::index_dense_rows(2040U, 16U) == 8U && hb::index_dense_rows(2048U, 16U) == 0U);
     for (std::uint32_t t = 2040U; t < 2056U; ++t)
         CHECK((t < 2040U + hb::index_dense_rows(2040U, 16U)) == strix::attn::group_indexer::dense(strix::hy4::preset::indexer, t));
+    // Verify rows flash split: window layers batch every row; indexed layers batch the causal-prefix rows, which come first
+    // (dense is a prefix property), and row r of the batch attends iota[p0 + 1 + r] = p0 + r + 1 keys = its own launch's
+    // index_list_tokens(p0 + r); the selecting rows follow one launch each.
+    for (const std::uint32_t p0 : {0U, 100U, 2040U, 2044U, 2047U, 2048U, 3000U})
+        for (std::uint32_t rows = 1U; rows <= 8U; ++rows) {
+            const auto w = hb::vrows_flash_split(false, p0, rows);
+            CHECK(w.batched == rows && w.per_row == 0U);
+            const auto d = hb::vrows_flash_split(true, p0, rows);
+            CHECK(d.batched + d.per_row == rows);
+            for (std::uint32_t r = 0; r < rows; ++r) {
+                const bool dense = strix::attn::group_indexer::dense(strix::hy4::preset::indexer, p0 + r);
+                CHECK(dense == (r < d.batched));
+                if (dense) {
+                    CHECK(p0 + 1U + r == hb::index_list_tokens(p0 + r));
+                }
+            }
+        }
+    CHECK(hb::vrows_flash_split(true, 2044U, 8U).batched == 4U && hb::vrows_flash_split(true, 2044U, 8U).per_row == 4U);
     static_assert(hb::kKbPadInput % 128U == 0U && hb::kKbPadInput >= 192U);
 }
 

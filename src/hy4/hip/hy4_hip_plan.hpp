@@ -108,6 +108,18 @@ using PairWindowCost = strix::pair::layers::WindowCost;
     while (n < rows && gi::dense(preset::indexer, p0 + n)) ++n;
     return n;
 }
+// Flash launches of one layer for a verify window [p0, p0 + rows): the first `batched` rows in ONE launch (a window
+// layer: every row; an indexed layer: its causal-prefix rows), then the rest (indexed rows that select) one launch per
+// row after their own index_select (the selection list is one shared buffer). Row r of the batched launch attends the
+// keys its own launch would: a window row min(p0 + r + 1, window) by its position, an indexed row iota[p0 + 1 + r] =
+// p0 + r + 1 = index_list_tokens(p0 + r).
+struct VrowsFlashSplit {
+    std::uint32_t batched = 0, per_row = 0;
+};
+[[nodiscard]] constexpr VrowsFlashSplit vrows_flash_split(bool indexed, std::uint32_t p0, std::uint32_t rows) {
+    const std::uint32_t b = indexed ? index_dense_rows(p0, rows) : rows;
+    return {b, rows - b};
+}
 // attn_k_b (Q8_0, input 192) re-laid at load as 256-wide rows for the A8 rows GEMM (input % 128): two zero-scale Q8_0
 // blocks per row, so the padded columns (the q rope tail of each head row) add exact zero terms.
 inline constexpr std::uint32_t kKbPadInput = 256U;
