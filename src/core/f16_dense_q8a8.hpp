@@ -86,6 +86,10 @@ template <unsigned Waves, unsigned Form = 0U> struct Cols {
     }
     __device__ __forceinline__ Half16 fragment(unsigned row, unsigned unit) const { return fragment_half(fragment_load(row, unit)); }
 };
+// Without the split the core waits for every weight and A8 load right after issuing it (ISA: 24 of 24 global loads per
+// 128-WMMA loop body at 0 WMMAs from their wait; with it 16 sit 16 WMMAs ahead): keep both hooks on every form.
+static_assert(ColsStageSplit<Cols<8U, 0U>> && ColsStageSplit<Cols<16U, kWPacked>> && ColsFragmentSplit<Cols<8U, 0U>> &&
+              ColsFragmentSplit<Cols<16U, kWPacked>>);
 
 // Stores only outputs below count (the last column tile may be partial); accumulate adds to what is there.
 struct Store {
