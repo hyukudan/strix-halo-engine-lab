@@ -254,6 +254,35 @@ void campaign_defaults_contract(){
     n.ngram_off=false;n.sample_options=true;require(!mtp_ngram_draft_requested(n),"auto stays off when sampling");
     n.sample_options=false;n.cohort.push_back({});require(!mtp_ngram_draft_requested(n),"auto stays off with cohort requests");
     n.cohort.clear();n.golden_dump="g";require(!mtp_ngram_draft_requested(n),"auto stays off when dumping a golden");
+    n.golden_dump.clear();
+    // Previously STRIX_BATCH_NGRAM was the only engine-level batch switch (off by default). The fix must honor
+    // explicit --mtp-ngram-draft modes without silently enabling the single-request auto policy for HTTP batches.
+    require(!mtp_batch_lookup(n,nullptr).on && !mtp_batch_lookup(n,"").on && !mtp_batch_lookup(n,nullptr).default_context,
+        "batch route: auto preserves the historical off-by-default policy");
+    n.ngram_draft=true;
+    require(mtp_batch_lookup(n,nullptr).on,"batch route: explicit --mtp-ngram-draft enables prompt lookup");
+    n.ngram_draft=false;
+    require(!mtp_batch_lookup(n,"0").on && !mtp_batch_lookup(n,"off").on,"batch route: STRIX_BATCH_NGRAM=0 is the off switch");
+    n.ngram_off=true;require(!mtp_batch_lookup(n,nullptr).on,"batch route: =off disables it");
+    require(mtp_batch_lookup(n,"1").on,"batch route: STRIX_BATCH_NGRAM=1 forces it");
+    n.ngram_off=false;n.draft_chain=false;
+    require(!mtp_batch_lookup(n,nullptr).on,"batch route: auto stays off where not admissible");
+    n.ngram_draft=n.ngram_context=n.ngram_copy_edit=true;
+    require(mtp_batch_lookup(n,nullptr).on && !mtp_batch_lookup(n,nullptr).default_context,
+        "batch route: an explicit =copy runs the engine's context drafter");
+    require(!mtp_batch_lookup(n,"ctx").default_context,"batch route: =ctx override keeps the engine's context configuration");
+    n.ngram_draft=n.ngram_context=n.ngram_copy_edit=false;n.draft_chain=true;
+    require(mtp_batch_lookup(n,"ctx").on && mtp_batch_lookup(n,"ctx").default_context,
+        "batch route: STRIX_BATCH_NGRAM=ctx builds the default context drafter over the extension mode");
+    for(const auto& [flag,ctx]:{std::pair<const char*,bool>{"--mtp-ngram-draft=copy",true},{"--mtp-ngram-draft=ctx",true},
+                                {"--mtp-ngram-draft=on",false}}) {
+        auto served=request();served.insert(served.end(),{"--mtp-draft-chain","--mtp-target-window-rows","8","--mtp-window-prefix",
+            "--mtp-window-capture-bytes","8192","--mtp-window-checkpoint-bytes","8192",
+            "--mtp-window-total-bytes","32768","--mtp-window-arena-bytes","8192","--mtp-window-history-intervals","32",flag});
+        set(served,"--mtp-candidate-depth","7");
+        const auto lookup=mtp_batch_lookup(parse(served).mtp,nullptr);
+        require(lookup.on && !lookup.default_context && parse(served).mtp.ngram_context==ctx,"batch route honours the parsed mode");
+    }
     auto mode=request();mode.push_back("--mtp-ngram-draft=off");
     require(parse(mode).mtp.ngram_off && !parse(mode).mtp.ngram_draft,"=off parses");
     mode=request();mode.push_back("--mtp-ngram-draft=auto");

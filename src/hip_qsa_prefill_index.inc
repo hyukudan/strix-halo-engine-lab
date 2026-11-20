@@ -101,12 +101,19 @@ __global__ __launch_bounds__(W * 32U) void rows_kernel(QsaRowsInputViews<Rows> v
 }
 // rows_body: a verbatim copy of rows_kernel's body (r0 = the workgroup's first row of views) for rows_batch_kernel;
 // rows_kernel itself is left untouched (instruction-identical).
+// RB = 8 (STRIX_QPF2K_QSA_INDEX_SHAPE=4): the same chains, tree and FMA order for 8 rows per workgroup, so each weight
+// read serves 8 rows instead of 4 (half of the 2,048 reads of the whole matrix per 8K call) and each LDS read feeds
+// both outputs of the wave for 8 rows (1 B of LDS per FMA instead of 2). The rows are staged as their raw BF16 bits,
+// act16[feature * 8 + row] (8 x width x 2 B: the same 40 KiB as RB = 4 in FP32), and widened at the read with the
+// word << 16 / word & 0xffff0000 that the FP32 staging applies, so every FMA operand is bit-identical. RB = 4 unchanged.
 template <unsigned Rows, unsigned RB, unsigned OW, unsigned W>
 __device__ __forceinline__ void rows_body(const QsaRowsInputViews<Rows>& views, std::uint32_t width, unsigned r0) {
     static_assert(Rows % RB == 0U && (RB == 4U || RB == 8U));
     extern __shared__ __align__(16) float act[];
+    [[maybe_unused]] std::uint16_t* const act16 = reinterpret_cast<std::uint16_t*>(act);
     const unsigned tid = threadIdx.x, lane = tid % 32U, wave = tid / 32U;
     const unsigned outputs = views.first[views.count];
+    if constexpr (RB == 4U) {
     // Stage the block's rows: unit u = (row u % RB, features 8 (u / RB) .. + 7).
     const unsigned units = RB * width / 8U;
     for (unsigned u = tid; u < units; u += W * 32U) {
@@ -117,6 +124,23 @@ __device__ __forceinline__ void rows_body(const QsaRowsInputViews<Rows>& views, 
         for (unsigned j = 0; j < 4U; ++j) {
             act[(f + 2U * j) * RB + r] = __uint_as_float(words[j] << 16U);
             act[(f + 2U * j + 1U) * RB + r] = __uint_as_float(words[j] & 0xffff0000U);
+        }
+    }
+    } else {
+        // Unit u = features 2u and 2u + 1 of the 8 rows: one 4-byte load per row (lanes read consecutive words of a
+        // row), repacked so word i of a feature holds rows 2i (low half) and 2i + 1 (high half); two 16-byte LDS stores
+        // (lane stride 32 B: no bank conflict). Needs 4-byte aligned rows (the batch path requires 16).
+        for (unsigned u = tid; u < width / 2U; u += W * 32U) {
+            unsigned even[4], odd[4];
+#pragma unroll
+            for (unsigned i = 0; i < 4U; ++i) {
+                const unsigned a = *reinterpret_cast<const unsigned*>(views.input[r0 + 2U * i] + 2U * u);
+                const unsigned b = *reinterpret_cast<const unsigned*>(views.input[r0 + 2U * i + 1U] + 2U * u);
+                even[i] = (a & 0xffffU) | (b << 16U);
+                odd[i] = (a >> 16U) | (b & 0xffff0000U);
+            }
+            *reinterpret_cast<uint4*>(act16 + 2U * u * 8U) = make_uint4(even[0], even[1], even[2], even[3]);
+            *reinterpret_cast<uint4*>(act16 + (2U * u + 1U) * 8U) = make_uint4(odd[0], odd[1], odd[2], odd[3]);
         }
     }
     const std::uint16_t* weight[OW];
@@ -145,10 +169,20 @@ __device__ __forceinline__ void rows_body(const QsaRowsInputViews<Rows>& views, 
 #pragma unroll
             for (unsigned o = 0; o < OW; ++o) w[o] = bf16_to_float(weight[o][k * 256U + 32U * j]);
             float a[RB];
+            if constexpr (RB == 4U) {
 #pragma unroll
             for (unsigned q = 0; q < RB / 4U; ++q) {
                 const float4 x = *reinterpret_cast<const float4*>(&act[f * RB + 4U * q]);
                 a[4U * q] = x.x; a[4U * q + 1U] = x.y; a[4U * q + 2U] = x.z; a[4U * q + 3U] = x.w;
+            }
+            } else {
+                const uint4 x = *reinterpret_cast<const uint4*>(act16 + f * 8U);
+                const unsigned words[4] = {x.x, x.y, x.z, x.w};
+#pragma unroll
+                for (unsigned i = 0; i < 4U; ++i) {
+                    a[2U * i] = __uint_as_float(words[i] << 16U);
+                    a[2U * i + 1U] = __uint_as_float(words[i] & 0xffff0000U);
+                }
             }
 #pragma unroll
             for (unsigned o = 0; o < OW; ++o)

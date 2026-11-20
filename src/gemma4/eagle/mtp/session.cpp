@@ -76,8 +76,11 @@ void Session::stage_rows(std::span<const float>, std::span<const float> hidden, 
     require(!staged_, "previous stage not published/discarded");
     if (positions.empty()) return;
     const auto B = drafter_->config().backbone;
-    require(hidden.size() == positions.size() * B && next_tokens.size() == positions.size(),
-            "final hidden rows required (RowPlan::export_hidden) with one next token per row");
+    require(next_tokens.size() == positions.size(), "one next token per staged row");
+    // HiddenDemand::last_committed: a group without the last committed row carries no hidden and stages nothing here.
+    if (hidden.empty()) return;
+    require(hidden.size() == B || hidden.size() == positions.size() * B,
+            "final hidden of positions.back() (one row, or one row per position) required (RowPlan::export_hidden)");
     pending_hidden_.assign(hidden.end() - std::ptrdiff_t(B), hidden.end());
     pending_position_ = positions.back();
     pending_next_ = next_tokens.back();

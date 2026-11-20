@@ -4,6 +4,7 @@
 #include "strix/ds41_exact_flags.hpp"
 
 #include "strix/ds41_moe.hpp"
+#include "ops/glu/glu_device.hpp"  // shared SwiGLU op (enqueue_swiglu_f32 binds Round::none)
 
 #include <hip/hip_runtime.h>
 
@@ -36,14 +37,9 @@ void check(hipError_t e, const char* what) {
     ::strix::hip_check_prefixed("ds41 trellis: ", e, what);
 }
 hipStream_t as_stream(void* s) { return static_cast<hipStream_t>(s); }
-unsigned blocks_for(std::size_t n, unsigned block) { return static_cast<unsigned>((n + block - 1U) / block); }
 
-__global__ void swiglu_f32_kernel(const float* __restrict__ gate, const float* __restrict__ up, std::size_t n, float limit,
-                                  float* __restrict__ act) {
-    const std::size_t i = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
-    if (i < n) act[i] = swiglu_clamped(gate[i], up[i], limit);
-}
 #if defined(STRIX_DS41_TRELLIS_LIB)
+unsigned blocks_for(std::size_t n, unsigned block) { return static_cast<unsigned>((n + block - 1U) / block); }
 // y[r][i] = y[r][i] + t[r][i] (t contiguous rows of n values)
 __global__ void accumulate_rows_kernel(float* __restrict__ y, std::size_t y_stride, const float* __restrict__ t, std::uint32_t n,
                                        std::uint32_t rows) {
@@ -58,9 +54,10 @@ __global__ void accumulate_rows_kernel(float* __restrict__ y, std::size_t y_stri
 
 void enqueue_swiglu_f32(const float* gate, const float* up, std::uint32_t rows, std::uint32_t width, float limit, float* act,
                         void* stream) {
+    // The shared SwiGLU op (src/ops/glu): declared exp, no rounding = ds41_moe.hpp swiglu_clamped.
     const std::size_t n = std::size_t{rows} * width;
     if (n == 0U) return;
-    hipLaunchKernelGGL(swiglu_f32_kernel, dim3(blocks_for(n, 256)), dim3(256), 0, as_stream(stream), gate, up, n, limit, act);
+    ops::glu::launch_swiglu<ops::glu::DeclaredExp, ops::glu::Round::none>(gate, up, n, limit, act, as_stream(stream));
     check(hipGetLastError(), "swiglu f32");
 }
 

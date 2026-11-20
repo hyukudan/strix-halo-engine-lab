@@ -770,6 +770,44 @@ def compare_selection(da, a, db, b, name):
     return layers
 
 
+def compare_v2(a, names, results, null_prompt_kl, report, null_prompt=None):
+    """FAST gate v2 verdict over the per-prompt rows (statistics in gate_v2.py, shared with the option_qual adapter)."""
+    import gate_v2
+    flips_of = {}
+    for item in a.route_flips or []:
+        name, _, files = item.partition("=")
+        parts = files.split(",")
+        if name not in names or len(parts) != 3:
+            raise GateError(f"--route-flips {item!r}: want PROMPT=REF,CAND_FREE,NULL_FREE for a compared prompt")
+        try:
+            flips_of[name] = {"cand": gate_v2.route_flips(parts[0], parts[1]), "null": gate_v2.route_flips(parts[0], parts[2])}
+        except gate_v2.GateError as e:
+            raise GateError(str(e)) from e
+    if flips_of and sorted(flips_of) != names:
+        raise GateError("--route-flips must name every compared prompt (or none: dense engines)")
+    windows = []
+    try:
+        for name, r in zip(names, results):
+            gate_v2.null_moved(name, null_prompt_kl[name])
+            nu = (null_prompt or {}).get(name) or {}
+            w = gate_v2.window_stats(name, r["kl"], r["agree"], r["nll_ref"], r["nll_cand"], null_prompt_kl[name],
+                                     r["hit_ref"], r["hit_cand"], null_top1s=nu.get("top1") or None,
+                                     null_nlls=nu.get("nll") or None,
+                                     null_kl_rows=nu["kl"][0] if nu.get("kl") else None)
+            windows.append(w)
+            print(gate_v2.window_line(w, flips_of.get(name)))
+        p = gate_v2.verdict(windows, [flips_of[n] for n in names] if flips_of else None)
+    except gate_v2.GateError as e:
+        raise GateError(str(e)) from e
+    print(gate_v2.pooled_line(p))
+    report["pooled"] = dict(p, rule="v2")
+    report["windows"] = [{k: v for k, v in w.items() if k != "_rows"} for w in windows]
+    if a.json:
+        pathlib.Path(a.json).write_text(json.dumps(report, indent=1, sort_keys=True, default=str) + "\n", encoding="utf-8",
+                                        newline="\n")
+    return gate_v2.EXIT[p["state"]]
+
+
 def compare(a):
     if a.mode == "turbo":
         return compare_turbo(a)
@@ -777,7 +815,12 @@ def compare(a):
     null_dirs = a.null_arm or []
     if a.expect_identical and (a.dnll_rule != "abs" or null_dirs):
         raise GateError("--expect-identical has no dNLL limit: drop --dnll-rule / --null-arm")
-    check_dnll_policy(a.dnll_rule, a.engine, a.profile, len(null_dirs))
+    v2 = getattr(a, "rule", "v1") == "v2"
+    if v2 and (a.expect_identical or a.dnll_rule != "abs" or not null_dirs):
+        raise GateError("--rule v2 needs at least one --null-arm and the plain dNLL rule (no --dnll-rule floor / --expect-identical)")
+    if not v2 and getattr(a, "route_flips", None):
+        raise GateError("--route-flips is a --rule v2 input")
+    check_dnll_policy(a.dnll_rule, a.engine, a.profile, 0 if v2 else len(null_dirs))
     da, ma = load_arm(a.ref, ranks)
     db, mb = load_arm(a.cand, ranks)
     if ma[0]["run_id"] == mb[0]["run_id"]:
@@ -851,18 +894,26 @@ def compare(a):
     print(f"rows {stats['rows']}: KL q50 {stats['kl_q']['q50']:.2e} q90 {stats['kl_q']['q90']:.2e} "
           f"q99 {stats['kl_q']['q99']:.2e}; true token worse {stats['worse']} better {stats['better']}; copy rows "
           f"{stats['copy_rows']} misses ref {stats['copy_miss_ref']} cand {stats['copy_miss']} (copy dNLL {stats['copy_dnll']:+.5f})")
-    null_rows, null_stats = [], []
+    null_rows, null_stats, null_prompt_kl = [], [], {name: [] for name in names}
+    null_prompt = {name: {"nll": [], "top1": [], "kl": []} for name in names}   # per-row NLL / KL, top-1 of each null (v2)
     for dn, mn in nulls:  # pooled exactly like the candidate: same reference, same prompts, same labels
         rs = [compare_logits(da, ma, dn, mn, name, tok_of[name]) for name in names]
+        for name, r in zip(names, rs):
+            null_prompt_kl[name].append(float(r["kl"].mean()))
+            null_prompt[name]["nll"].append(r["nll_cand"])
+            null_prompt[name]["top1"].append(float(r["agree"].mean()))
+            null_prompt[name]["kl"].append(r["kl"])
         st = arm_stats(rs, copy_masks)
         null_stats.append(st)
         null_rows.append({"dir": str(dn), "run_id": mn[0]["run_id"], "arm": mn[0]["arm"], "env": mn[0]["env"],
-                          "execution": mn[0]["execution"], "rows": st["rows"], "kl": st["kl"], "top1": st["top1"],
+                          "execution": mn[0].get("execution"), "rows": st["rows"], "kl": st["kl"], "top1": st["top1"],
                           "dnll": st["dnll"], "stats": st})
         print(f"null {mn[0]['arm']} run {mn[0]['run_id']} env {mn[0]['env']}: KL {st['kl']:.5f}, top-1 {st['top1']:.4f}, "
               f"dNLL {st['dnll']:+.5f}; KL q50/q90/q99 {st['kl_q']['q50']:.2e}/{st['kl_q']['q90']:.2e}/{st['kl_q']['q99']:.2e}; "
               f"worse {st['worse']} better {st['better']}; copy misses {st['copy_miss']} (ref {st['copy_miss_ref']})")
     dv = None
+    if v2:
+        return compare_v2(a, names, results, null_prompt_kl, report, null_prompt)
     if a.expect_identical:
         ok = identical and sel_slot_diff == 0
         rule = "identical logits and selections"
@@ -1213,6 +1264,11 @@ def main(argv=None):
     c.add_argument("--engine", help="engine of the candidate (floor rule policy check), e.g. ds41")
     c.add_argument("--profile", help="profile of the candidate (floor rule policy check), e.g. fast-prefill")
     c.add_argument("--expect-identical", action="store_true", help="repeat of one identity: any difference fails")
+    c.add_argument("--rule", choices=("v1", "v2"), default="v1",
+                   help="v2: FAST gate v2 (gate_v2.py): per prompt KL <= max(0.02, 1.5 x --null-arm KL), top-1 and dNLL "
+                        "per prompt and pooled, >= 800 rows, dNLL se; needs >= 1 --null-arm")
+    c.add_argument("--route-flips", action="append", metavar="PROMPT=REF,CAND_FREE,NULL_FREE",
+                   help="v2, MoE engines: strix-route-file/v1 records of one prompt (R1 flip ratio <= 1.5); one per prompt")
     c.add_argument("--json")
     c.add_argument("--mode", choices=("fast", "turbo"), default="fast",
                    help="fast (default): absolute bar; turbo: T's loss vs E must not exceed the reference pack R's")

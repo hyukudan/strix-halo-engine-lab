@@ -14,6 +14,7 @@
 #include "strix/cuda/ds41_prefill.hpp"
 #include "strix/ds41_file_reader.hpp"
 #include "strix/ds41_host_promote.hpp"
+#include "strix/expert_stream_epoch.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -158,14 +159,16 @@ private:
     [[nodiscard]] std::uint32_t streamed(std::uint32_t l) const { return p_.experts - p_.resident[l]; }
     [[nodiscard]] std::uint32_t groups(std::uint32_t l) const;
     [[nodiscard]] std::size_t use_of(std::uint32_t layer) const;
-    void file_to_device(std::uint64_t offset, std::uint64_t bytes, std::uint8_t* dst);
+    // io_s: the caller's job-local file-read time (published under mutex_ when the job is done; never a shared counter)
+    void file_to_device(std::uint64_t offset, std::uint64_t bytes, std::uint8_t* dst, double& io_s);
     void file_to_host(std::uint64_t offset, std::uint64_t bytes, std::uint8_t* dst, PinnedBytes& page);
-    void file_to_pinned(std::uint64_t offset, std::uint64_t bytes, std::uint8_t* dst);
+    void file_to_pinned(std::uint64_t offset, std::uint64_t bytes, std::uint8_t* dst, double& io_s);
     void copy_piecewise(std::uint8_t* dst, const std::uint8_t* src, std::uint64_t bytes);
-    void load_group(Slot& s, std::uint32_t layer, std::uint32_t g, std::uint8_t* fill);
+    void load_group(Slot& s, std::uint32_t layer, std::uint32_t g, std::uint8_t* fill, double& io_s);
     std::unique_ptr<PinnedBytes> promote_buffer(std::uint32_t layer);  // nullptr: no promotion of this load
     void demote_under_pressure();
-    std::uint64_t load_into(Slot& s, std::uint32_t layer);  // returns the bytes enqueued
+    // timed / origin: captured under mutex_ by the loader for a run use (the copy events; origin: the run's first copy)
+    std::uint64_t load_into(Slot& s, std::uint32_t layer, bool timed, bool origin, double& io_s);  // returns the bytes enqueued
     void loop();
 
     FileReader& file_;
@@ -190,8 +193,8 @@ private:
     bool stop_ = false, run_ = false;
     std::uint64_t run_id_ = 0;
     std::string error_;
-    std::uint64_t bytes_streamed_ = 0;
-    double io_seconds_ = 0.0, wait_seconds_ = 0.0;
+    ExpertStreamEpochs epochs_;  // bytes / file bytes / I/O time of the run and of the idle preload, kept apart
+    double wait_seconds_ = 0.0;
     std::size_t device_bytes_ = 0;
     std::atomic<std::size_t> pinned_bytes_{0};  // grows / shrinks with the promoted layers (loader thread)
     HostPinStats host_pin_stats_;
@@ -204,9 +207,7 @@ private:
     std::vector<std::unique_ptr<Event>> copy_begin_, copy_end_;  // [layer]
     std::vector<bool> copied_;                                   // [layer] copied during this run
     std::vector<std::uint64_t> copy_bytes_;                      // [layer] bytes copied during this run
-    // between-runs preload accounting (host clock)
-    std::uint64_t preload_after_run_ = 0;   // run id the last preload followed (it serves run id + 1)
-    std::uint64_t preload_bytes_ = 0;
+    // between-runs preload accounting (host clock; its bytes and the run it followed are in epochs_)
     std::chrono::steady_clock::time_point preload_t0_{}, preload_t1_{}, run_begin_t_{};
     bool preload_running_ = false;
     // the preload the current run consumed (set when the loader starts the run: the preload, if any, finished before)
@@ -220,7 +221,7 @@ private:
     bool promote_blocked_ = false;  // a run that gave layers back promotes none
     std::uint32_t promoted_cum_ = 0, demoted_cum_ = 0, promoted_end_ = 0, demoted_end_ = 0, promoted_mark_ = 0, demoted_mark_ = 0;
     std::uint32_t promoted_held_ = 0;
-    std::uint64_t promoted_bytes_ = 0, file_bytes_ = 0;
+    std::uint64_t promoted_bytes_ = 0;
 };
 
 }  // namespace strix::ds41::cuda::detail

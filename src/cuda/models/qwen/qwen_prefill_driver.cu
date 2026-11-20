@@ -31,7 +31,9 @@
 #include "strix/cuda/qwen_plemtp.hpp"
 #include "strix/cuda/qwen_qsa.hpp"
 #include "strix/mtp_draft_split.hpp"
+#include "strix/spec/commit_tail.hpp"
 #include "strix/cuda/qwen_transcode.hpp"
+#include "strix/cuda/core/moe_route_tap.hpp"
 #include "strix/cuda/core/nvfp4_a8_cuda.hpp"
 #include "strix/gguf_reader.hpp"
 #include "qwen_tier_adapter.hpp"
@@ -439,6 +441,9 @@ struct Prefill::Impl : BlockFields {
     std::map<DraftKey, DraftGraph> draft_graphs;
     std::map<DraftKey, std::uint32_t> draft_warmed;
     bool draft_graph = true;
+    // Config::decode, STRIX_QRTX_COMMIT_ASYNC=1: commit_cohort returns without synchronising; the host's between-step
+    // work overlaps the commit's device tail (shared protocol strix/spec/commit_tail.hpp; launches and order unchanged)
+    strix::spec::CommitTail commit_tail;
     std::uint64_t* draft_pos = nullptr;         // device [8]
     std::uint64_t* draft_pos_pinned = nullptr;  // [8] + the pending token word after them
     std::uint64_t draft_captures = 0, draft_replays = 0;
@@ -1328,6 +1333,7 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
         }
     }
     if (config.decode) {
+        m.commit_tail.enabled = strix::envcfg::flag("STRIX_QRTX_COMMIT_ASYNC", false);
         const char* v = std::getenv("STRIX_QRTX_SIDE_SHARED");
         if (!(v && v[0] == '0')) {
             ck(cudaStreamCreateWithPriority(&m.side_stream, cudaStreamNonBlocking, m.stream_priority_high), "side stream");
@@ -1381,6 +1387,9 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
         std::fwrite(head, 4, 6, m.trace_file);
         m.use_graphs = false;  // the per-layer copies below are eager-only
     }
+    // FAST gate v2 route tap (STRIX_MOE_ROUTES_OUT / _IN, STRIX_MOE_ROUTE_NULL): the tap syncs and copies per router
+    // call, so decode windows run eager (a set_graphs(true) later makes the tap refuse the capture).
+    if (strix::cuda::core::route_tap_active()) m.use_graphs = false;
     {
         std::size_t free_now = 0, total_now = 0;
         if (cudaMemGetInfo(&free_now, &total_now) == cudaSuccess && m.plan.card.free > free_now) m.engine_bytes = m.plan.card.free - free_now;
@@ -1675,6 +1684,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         nv.push("moe_route");
         hc::route_logits(hidden, static_cast<const float*>(lw[l].p[k_ffn_gate_inp_weight]), moe_rows, logits, stream);
         hc::route_select(logits, moe_rows, kTopK, true, tables, routes, route_w, stream);
+        strix::cuda::core::route_tap(l, moe_rows, kTopK, kExperts, routes, route_w, stream);  // inactive: one cached test
         nv.pop();
         if (trace_file) ck(cudaMemcpyAsync(trace_host + std::uint64_t{l} * rows * kTopK, routes, std::uint64_t{rows} * kTopK * 4,
                                            cudaMemcpyDeviceToHost, stream), "expert trace");
@@ -2197,7 +2207,11 @@ void Prefill::commit_cohort(const std::vector<std::uint32_t>& keep) {
             if (keep[done] == 0) m.undo_one(*members[done]);
             else m.commit_one(*members[done], keep[done]);
         }
-        ck(cudaStreamSynchronize(m.stream), "commit");
+        // Async tail (opt-in): no host reads the commit and it reads no pinned input, so the call returns here; the next
+        // draft queues behind it on this stream and the next window synchronises first (verify_cohort). A device fault
+        // in the tail surfaces at that next synchronisation.
+        if (m.commit_tail.after_commit()) ck(cudaStreamSynchronize(m.stream), "commit");
+        else ck(cudaGetLastError(), "commit enqueue");
     } catch (...) {
         cudaStreamSynchronize(m.stream);
         for (std::size_t i = done; i < members.size(); ++i) m.poison(*members[i]);
@@ -2334,6 +2348,10 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
     // this window only when it executes: every earlier window synchronized the decode stream before returning, so no
     // reader is in flight. Enforced here (one query), so a later change that returns before the sync fails loudly
     // instead of cross-wiring sessions.
+    if (m.commit_tail.verify_needs_sync()) {  // an async commit tail (no draft synchronised after it): retire it first
+        m.commit_tail.synced();
+        ck(cudaStreamSynchronize(m.stream), "commit tail");
+    }
     if (m.mtp_inflight) {  // a settled deferred MTP call reads no window input; the window starts after it anyway
         m.mtp_inflight = false;
         ck(cudaStreamSynchronize(m.stream), "deferred MTP rows");
@@ -3062,7 +3080,10 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
                               depth | k0 << 8U | k1 << 16U};
     cudaGraphExec_t dexec = nullptr;
     bool capture = false;
-    if (m.use_graphs && m.qsa_graph && m.draft_graph && !per_step_sync && S.mtp_pooled && cudaStreamQuery(m.stream) == cudaSuccess &&
+    // stream idle, or only an async commit tail in flight (it reads none of the pinned inputs written below; every earlier
+    // chain synchronised before returning), and no deferred MTP rows (strix/spec/commit_tail.hpp)
+    if (m.use_graphs && m.qsa_graph && m.draft_graph && !per_step_sync && S.mtp_pooled &&
+        m.commit_tail.draft_replay_ok(cudaStreamQuery(m.stream) == cudaSuccess, m.mtp_inflight) &&
         qsa::graph_shape(&one_row, 1, m.qws, dshape)) {
         const auto it = m.draft_graphs.find(dkey);
         if (it != m.draft_graphs.end()) {
@@ -3149,6 +3170,7 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
         if (!per_step_sync) continue;
         ck(cudaMemcpyAsync(sel, m.draft_sel + 2 * k, 8, cudaMemcpyDeviceToHost, m.stream), "draft read");
         ck(cudaStreamSynchronize(m.stream), "draft step");
+        m.commit_tail.synced();
         float probability;
         std::memcpy(&probability, &sel[1], 4);
         out.tokens.push_back(sel[0]);
@@ -3193,6 +3215,7 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
         std::uint32_t all[2 * kMaxStepRows];
         ck(cudaMemcpyAsync(all, m.draft_sel + 2 * k0, std::uint64_t{k1 - k0} * 8, cudaMemcpyDeviceToHost, m.stream), "draft read");
         ck(cudaStreamSynchronize(m.stream), "draft chain");
+        m.commit_tail.synced();
         for (std::uint32_t k = k0; k < k1; ++k) {
             float probability;
             std::memcpy(&probability, &all[2 * (k - k0) + 1], 4);
@@ -3318,6 +3341,7 @@ std::vector<Draft> Prefill::draft_cohort(const std::vector<DraftRequest>& reques
     std::vector<std::uint32_t> all(2ULL * kMaxStepRows * chains);
     ck(cudaMemcpyAsync(all.data(), m.bd_sel, all.size() * 4, cudaMemcpyDeviceToHost, m.stream), "draft read");
     ck(cudaStreamSynchronize(m.stream), "draft chains");
+    m.commit_tail.synced();
     for (std::uint32_t j = 0; j < chains; ++j) {
         const auto i = order[j];
         for (std::uint32_t k = 0; k < depth[i]; ++k) {

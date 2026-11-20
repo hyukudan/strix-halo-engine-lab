@@ -186,13 +186,27 @@ struct Resolution {
                 return true;
         return false;
     }
+    // An explicit setting (CLI or environment) of a bit-changing lever keeps the run qualified only when its value is
+    // the builtin, the lever's off value, or the value of a column the table marks ready and not provisional: the
+    // table's qualification data, one rule for every engine.
+    [[nodiscard]] static bool explicit_value_qualified(const Entry& entry) {
+        const Lever& lever = *entry.lever;
+        if (lever.kind != Kind::bit_changing) return true;
+        if (entry.value == lever.builtin || (!lever.off.empty() && entry.value == lever.off)) return true;
+        for (std::size_t c = 0; c < kProfileColumns; ++c)
+            if (lever.ready[c] && !lever.provisional[c] && !lever.value[c].empty() && entry.value == lever.value[c]) return true;
+        return false;
+    }
     // "qualified"; else "qualification in progress: <rows>" for provisional columns and/or "unqualified: <rows>"
-    // when --allow-pending ran pending columns, separated by "; ".
+    // when --allow-pending ran pending columns or an explicit setting chose a bit-changing value no qualified column
+    // has, separated by "; ".
     [[nodiscard]] std::string qualification() const {
         std::string provisional, unqualified;
         for (const auto& entry : entries) {
+            const bool explicit_unqualified = (entry.status == Status::explicit_cli || entry.status == Status::explicit_env) &&
+                                              !explicit_value_qualified(entry);
             auto* rows = entry.status == Status::provisional ? &provisional :
-                entry.status == Status::unqualified ? &unqualified : nullptr;
+                entry.status == Status::unqualified || explicit_unqualified ? &unqualified : nullptr;
             if (rows != nullptr) *rows += (rows->empty() ? "" : ",") + std::string(entry.lever->name);
         }
         std::string out;

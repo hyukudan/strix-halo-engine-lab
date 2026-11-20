@@ -3,9 +3,10 @@
 // host loop it reproduces and how the lanes map onto the declared reduction (R1 chains, R2 halving trees).
 // Build with -ffp-contract=off -fno-fast-math -fno-gpu-flush-denormals-to-zero.
 #include "glm/attn/glm_attn_fast.hpp"
-#include "attn_core/select.hpp"
+#include "attn_core/group_select_kernel.hpp"  // shared group select kernel (R5)
 #include "glm/attn/glm_dsa_policy.hpp"
-#include "glm/common/glm_dsa_pool.hpp"
+#include "attn_core/group_score_scan.hpp"
+#include "strix/attn/group_pool.hpp"
 #include "glm/kernels/glm_tree.hpp"
 
 #include <algorithm>
@@ -761,7 +762,8 @@ __global__ __launch_bounds__(128) void dsa_pool_kernel(DsaRows d, dev::IndexerDe
     if ((t + 1) % kKpool == 0) {
         const unsigned t0 = t + 1 - kKpool;
         const auto offset = static_cast<std::size_t>(t0) * kIdxDim;
-        const float K = dsa_pool_channel(sl.ikey + offset, sl.igate + offset, w.ape, i);
+        const float K = strix::attn::group_pool::gated_bf16_channel<kKpool>(sl.ikey + offset, sl.igate + offset, w.ape, i, kIdxDim,
+                                                                           strix::attn::group_pool::Fn<declared_exp>{});
         if (!is_finite(K)) atomicOr(flag, 1U);
         sl.pooled[static_cast<std::size_t>(t / kKpool) * kIdxDim + i] = K;
     }
@@ -770,278 +772,35 @@ __global__ __launch_bounds__(128) void dsa_pool_kernel(DsaRows d, dev::IndexerDe
 // ---------------------------------------------------------------- indexer scores (R11) + top-byte histogram
 // Host: for pool p: acc = +0; for h ascending: dot = chain_i fmaf(qI[h][i], K[i]); acc = fmaf(w_h, relu(dot * c), acc).
 // One lane per pool; the 32 head chains run side by side (each i-ascending), qI / w_h from LDS.
-constexpr unsigned kScoreThreads = 64;
-__global__ __launch_bounds__(kScoreThreads) void idx_score_kernel(DsaRows d, const float* qI, const float* wraw,
-                                                                  std::uint32_t* keys, unsigned key_stride,
-                                                                  std::uint32_t* hist0) {
-    __shared__ float4 qs[kIdxHeads * kIdxDim / 4];
-    __shared__ float wh[kIdxHeads];
-    __shared__ unsigned lh[256];
-    const unsigned r = blockIdx.y, l = threadIdx.x;
-    const unsigned P = (d.tpos[r] + 1) / kKpool, p0 = blockIdx.x * kScoreThreads;
-    if (p0 >= P) return;
-    const float4* q4 = reinterpret_cast<const float4*>(qI + static_cast<std::size_t>(r) * kIdxHeads * kIdxDim);
-    for (unsigned e = l; e < kIdxHeads * kIdxDim / 4; e += kScoreThreads) qs[e] = q4[e];
-    if (l < kIdxHeads) wh[l] = wraw[static_cast<std::size_t>(r) * kIdxHeads + l] * kInvSqrt32;
-    for (unsigned e = l; e < 256; e += kScoreThreads) lh[e] = 0;
-    __syncthreads();
-    const unsigned p = p0 + l;
-    if (p < P) {
-        const float4* K = reinterpret_cast<const float4*>(d.slots[r].pooled + static_cast<std::size_t>(p) * kIdxDim);
-        float dot[kIdxHeads];
-#pragma unroll
-        for (unsigned h = 0; h < kIdxHeads; ++h) dot[h] = 0.0F;
-        for (unsigned i4 = 0; i4 < kIdxDim / 4; ++i4) {
-            const float4 kv = K[i4];
-#pragma unroll
-            for (unsigned h = 0; h < kIdxHeads; ++h) {
-                const float4 q = qs[h * (kIdxDim / 4) + i4];
-                dot[h] = __builtin_fmaf(q.x, kv.x, dot[h]);
-                dot[h] = __builtin_fmaf(q.y, kv.y, dot[h]);
-                dot[h] = __builtin_fmaf(q.z, kv.z, dot[h]);
-                dot[h] = __builtin_fmaf(q.w, kv.w, dot[h]);
-            }
-        }
-        float acc = 0.0F;
-#pragma unroll
-        for (unsigned h = 0; h < kIdxHeads; ++h) {
-            const float sc = dot[h] * kInvSqrt128;
-            acc = __builtin_fmaf(wh[h], sc > 0.0F ? sc : 0.0F, acc);
-        }
-        const std::uint32_t key = ordered_key(acc);
-        keys[static_cast<std::size_t>(r) * key_stride + p] = key;
-        atomicAdd(&lh[key >> 24U], 1U);
-    }
-    __syncthreads();
-    for (unsigned e = l; e < 256; e += kScoreThreads)
-        if (lh[e]) atomicAdd(&hist0[r * 256 + e], lh[e]);
-}
-
-// RG=2 uses 35,072 bytes of LDS; RG=4 would exceed 64 KiB.
-template <unsigned RG>
-__global__ __launch_bounds__(kScoreThreads) void idx_score_rg_kernel(DsaRows d, const float* qI, const float* wraw,
-                                                                     std::uint32_t* keys, unsigned key_stride,
-                                                                     std::uint32_t* hist0) {
-    static_assert(RG == 2, "indexer row grouping must fit in 64 KiB LDS");
-    __shared__ float4 qs[RG][kIdxHeads * kIdxDim / 4];
-    __shared__ float wh[RG][kIdxHeads];
-    __shared__ unsigned lh[RG][256];
-    static_assert(sizeof(qs) + sizeof(wh) + sizeof(lh) <= 65536, "indexer LDS budget");
-    const unsigned g0 = blockIdx.y * RG, l = threadIdx.x;
-    const unsigned p = blockIdx.x * kScoreThreads + l;
-    const float* pooled[RG];
-    unsigned pools[RG];
-#pragma unroll
-    for (unsigned u = 0; u < RG; ++u) {
-        const unsigned r = g0 + u;
-        pooled[u] = r < d.rows ? d.slots[r].pooled : nullptr;
-        pools[u] = r < d.rows ? (d.tpos[r] + 1) / kKpool : 0U;
-        if (r < d.rows) {
-            const float4* q4 = reinterpret_cast<const float4*>(qI + static_cast<std::size_t>(r) * kIdxHeads * kIdxDim);
-            for (unsigned e = l; e < kIdxHeads * kIdxDim / 4; e += kScoreThreads) qs[u][e] = q4[e];
-            if (l < kIdxHeads) wh[u][l] = wraw[static_cast<std::size_t>(r) * kIdxHeads + l] * kInvSqrt32;
-        }
-        for (unsigned e = l; e < 256; e += kScoreThreads) lh[u][e] = 0;
-    }
-    __syncthreads();
-    // Pass 0 shares the first slot's keys. Other slots retain their own key loads.
-#pragma unroll
-    for (unsigned pass = 0; pass < RG; ++pass) {
-        bool active[RG];
-        bool any = false;
-#pragma unroll
-        for (unsigned u = 0; u < RG; ++u) {
-            active[u] = p < pools[u] &&
-                        (pass == 0 ? pooled[u] == pooled[0] : u == pass && pooled[u] != pooled[0]);
-            any = any || active[u];
-        }
-        if (any) {
-            const float4* K = reinterpret_cast<const float4*>(pooled[pass] + static_cast<std::size_t>(p) * kIdxDim);
-            float dot[RG][kIdxHeads];
-#pragma unroll
-            for (unsigned u = 0; u < RG; ++u)
-#pragma unroll
-                for (unsigned h = 0; h < kIdxHeads; ++h) dot[u][h] = 0.0F;
-            for (unsigned i4 = 0; i4 < kIdxDim / 4; ++i4) {
-                const float4 kv = K[i4];
-#pragma unroll
-                for (unsigned u = 0; u < RG; ++u) {
-                    if (active[u]) {
-#pragma unroll
-                        for (unsigned h = 0; h < kIdxHeads; ++h) {
-                            const float4 q = qs[u][h * (kIdxDim / 4) + i4];
-                            dot[u][h] = __builtin_fmaf(q.x, kv.x, dot[u][h]);
-                            dot[u][h] = __builtin_fmaf(q.y, kv.y, dot[u][h]);
-                            dot[u][h] = __builtin_fmaf(q.z, kv.z, dot[u][h]);
-                            dot[u][h] = __builtin_fmaf(q.w, kv.w, dot[u][h]);
-                        }
-                    }
-                }
-            }
-#pragma unroll
-            for (unsigned u = 0; u < RG; ++u) {
-                if (active[u]) {
-                    float acc = 0.0F;
-#pragma unroll
-                    for (unsigned h = 0; h < kIdxHeads; ++h) {
-                        const float sc = dot[u][h] * kInvSqrt128;
-                        acc = __builtin_fmaf(wh[u][h], sc > 0.0F ? sc : 0.0F, acc);
-                    }
-                    const std::uint32_t key = ordered_key(acc);
-                    keys[static_cast<std::size_t>(g0 + u) * key_stride + p] = key;
-                    atomicAdd(&lh[u][key >> 24U], 1U);
-                }
-            }
-        }
-    }
-    __syncthreads();
-#pragma unroll
-    for (unsigned u = 0; u < RG; ++u)
-        if (g0 + u < d.rows)
-            for (unsigned e = l; e < 256; e += kScoreThreads)
-                if (lh[u][e]) atomicAdd(&hist0[(g0 + u) * 256 + e], lh[u][e]);
-}
-
-// Register-blocked score variants: RK_ROWS=2 (selector 3), RK_ROWS=1 (selector 5).
-// 64 lanes cover 128 pools: lane l owns p0+l and p0+l+64. Only row histograms use LDS.
-// The two-row form has 128 dot accumulators/lane (one-row: 64). Review generated ISA
-// for scalar query loads, VGPR allocation and spills; selector 5 is the lower-register option.
-template <unsigned RK_ROWS>
-__global__ __launch_bounds__(kScoreThreads) void idx_score_rk_kernel(DsaRows d, const float* qI, const float* wraw,
-                                                                     std::uint32_t* keys, unsigned key_stride,
-                                                                     std::uint32_t* hist0) {
-    static_assert(RK_ROWS == 1 || RK_ROWS == 2, "indexer register-blocked rows");
-    __shared__ unsigned lh[RK_ROWS][256];
-    const unsigned g0 = blockIdx.y * RK_ROWS, l = threadIdx.x;
-    const unsigned p0 = blockIdx.x * (2 * kScoreThreads);
-    const float* pooled[RK_ROWS];
-    unsigned pools[RK_ROWS];
-    unsigned max_pools = 0;
-#pragma unroll
-    for (unsigned u = 0; u < RK_ROWS; ++u) {
-        const unsigned r = g0 + u;
-        pooled[u] = r < d.rows ? d.slots[r].pooled : nullptr;
-        pools[u] = r < d.rows ? (d.tpos[r] + 1) / kKpool : 0U;
-        max_pools = pools[u] > max_pools ? pools[u] : max_pools;
-    }
-    if (p0 >= max_pools) return;  // CTA-uniform, including zero-pool rows
-#pragma unroll
-    for (unsigned u = 0; u < RK_ROWS; ++u)
-        for (unsigned e = l; e < 256; e += kScoreThreads) lh[u][e] = 0;
-    __syncthreads();
-    float dot[RK_ROWS][2][kIdxHeads];
-#pragma unroll
-    for (unsigned u = 0; u < RK_ROWS; ++u)
-#pragma unroll
-        for (unsigned j = 0; j < 2; ++j)
-#pragma unroll
-            for (unsigned h = 0; h < kIdxHeads; ++h) dot[u][j][h] = 0.0F;
-    // For a shared slot, the first row's key loads cover the union of both P bounds.
-    unsigned first_pools = pools[0];
-    if constexpr (RK_ROWS == 2)
-        if (pooled[1] == pooled[0]) first_pools = max_pools;
-    for (unsigned i4 = 0; i4 < kIdxDim / 4; ++i4) {
-        float4 kv[2];
-#pragma unroll
-        for (unsigned j = 0; j < 2; ++j) {
-            const unsigned p = p0 + l + j * kScoreThreads;
-            kv[j] = float4{};
-            if (p < first_pools)
-                kv[j] = reinterpret_cast<const float4*>(pooled[0] + static_cast<std::size_t>(p) * kIdxDim)[i4];
-        }
-#pragma unroll
-        for (unsigned u = 0; u < RK_ROWS; ++u) {
-            if (p0 < pools[u]) {  // uniform: never predicate query loads on a lane's key validity
-                float4 row_kv[2];
-#pragma unroll
-                for (unsigned j = 0; j < 2; ++j) {
-                    row_kv[j] = kv[j];
-                    if (pooled[u] != pooled[0]) {
-                        const unsigned p = p0 + l + j * kScoreThreads;
-                        row_kv[j] = float4{};
-                        if (p < pools[u])
-                            row_kv[j] = reinterpret_cast<const float4*>(pooled[u] + static_cast<std::size_t>(p) * kIdxDim)[i4];
-                    }
-                }
-                // Uniform addresses permit s_load: no lane index or lane-dependent branch.
-                // Two-head microtiles, double-buffered: prefetch the next pair before using
-                // the current pair, then rotate. Each query float4 serves both keys.
-                const float4* q4 = reinterpret_cast<const float4*>(
-                    qI + static_cast<std::size_t>(g0 + u) * kIdxHeads * kIdxDim);
-                float4 qa = q4[i4], qb = q4[kIdxDim / 4 + i4];
-#pragma unroll
-                for (unsigned h = 0; h < kIdxHeads; h += 2) {
-                    float4 next_a{}, next_b{};
-                    if (h + 2 < kIdxHeads) {
-                        next_a = q4[(h + 2) * (kIdxDim / 4) + i4];
-                        next_b = q4[(h + 3) * (kIdxDim / 4) + i4];
-                    }
-#pragma unroll
-                    for (unsigned j = 0; j < 2; ++j) {
-                        dot[u][j][h] = __builtin_fmaf(qa.x, row_kv[j].x, dot[u][j][h]);
-                        dot[u][j][h] = __builtin_fmaf(qa.y, row_kv[j].y, dot[u][j][h]);
-                        dot[u][j][h] = __builtin_fmaf(qa.z, row_kv[j].z, dot[u][j][h]);
-                        dot[u][j][h] = __builtin_fmaf(qa.w, row_kv[j].w, dot[u][j][h]);
-                        dot[u][j][h + 1] = __builtin_fmaf(qb.x, row_kv[j].x, dot[u][j][h + 1]);
-                        dot[u][j][h + 1] = __builtin_fmaf(qb.y, row_kv[j].y, dot[u][j][h + 1]);
-                        dot[u][j][h + 1] = __builtin_fmaf(qb.z, row_kv[j].z, dot[u][j][h + 1]);
-                        dot[u][j][h + 1] = __builtin_fmaf(qb.w, row_kv[j].w, dot[u][j][h + 1]);
-                    }
-                    qa = next_a;
-                    qb = next_b;
-                }
-            }
-        }
-    }
-#pragma unroll
-    for (unsigned u = 0; u < RK_ROWS; ++u) {
-        if (p0 < pools[u]) {
-            float acc[2] = {0.0F, 0.0F};
-#pragma unroll
-            for (unsigned h = 0; h < kIdxHeads; ++h) {
-                const float wh = wraw[static_cast<std::size_t>(g0 + u) * kIdxHeads + h] * kInvSqrt32;
-#pragma unroll
-                for (unsigned j = 0; j < 2; ++j) {
-                    const float sc = dot[u][j][h] * kInvSqrt128;
-                    acc[j] = __builtin_fmaf(wh, sc > 0.0F ? sc : 0.0F, acc[j]);
-                }
-            }
-#pragma unroll
-            for (unsigned j = 0; j < 2; ++j) {
-                const unsigned p = p0 + l + j * kScoreThreads;
-                if (p < pools[u]) {
-                    const std::uint32_t key = ordered_key(acc[j]);
-                    keys[static_cast<std::size_t>(g0 + u) * key_stride + p] = key;
-                    atomicAdd(&lh[u][key >> 24U], 1U);
-                }
-            }
-        }
-    }
-    __syncthreads();
-#pragma unroll
-    for (unsigned u = 0; u < RK_ROWS; ++u)
-        if (g0 + u < d.rows)
-            for (unsigned e = l; e < 256; e += kScoreThreads)
-                if (lh[u][e]) atomicAdd(&hist0[(g0 + u) * 256 + e], lh[u][e]);
-}
+constexpr unsigned kScoreThreads = strix::attn_core::group_scan::kThreads;
+// The exact scan is the shared family (src/attn_core/group_score_scan.hpp) over GLM's slots: fp32 pooled keys, 32 heads,
+// 128^-1/2 inside the relu (InsideRelu), head weights x 32^-1/2.
+struct GlmScan {
+    using Rows = DsaRows;
+    using Key = float;
+    static constexpr unsigned kHeads = kIdxHeads, kDim = kIdxDim;
+    __device__ __forceinline__ static unsigned rows(DsaRows d) { return d.rows; }
+    __device__ __forceinline__ static const float* keys(DsaRows d, unsigned r) { return d.slots[r].pooled; }
+    __device__ __forceinline__ static unsigned pools(DsaRows d, unsigned r) { return (d.tpos[r] + 1) / kKpool; }
+    __device__ __forceinline__ static float weight(float raw) { return raw * kInvSqrt32; }
+    __device__ __forceinline__ static float scaled(float dot) { return dot * kInvSqrt128; }
+    __device__ __forceinline__ static std::uint32_t key_of(float s) { return ordered_key(s); }
+};
+namespace gscan = strix::attn_core::group_scan;
 
 // ---------------------------------------------------------------- R5 exact top-k + canonical token list
-// Radix select of the k-th largest key K* (top byte from hist0, then 3 byte passes); selected = key > K* plus the
-// lowest-index pools with key == K* (the host stable order's first k). Ordered compaction: thread l owns the contiguous
-// pool segment [l * seg, (l + 1) * seg); exclusive block scans give each segment's equal-rank base and output base.
-__global__ __launch_bounds__(1024) void idx_select_kernel(DsaRows d, const std::uint32_t* keys, unsigned key_stride,
-                                                          const std::uint32_t* hist0, std::uint32_t* tokens,
-                                                          std::uint32_t* n_out) {
-    __shared__ unsigned hist[256], wsum[32];
-    __shared__ unsigned sh_prefix, sh_rem;
-    const unsigned r = blockIdx.x, l = threadIdx.x;
-    const unsigned t = d.tpos[r], P = (t + 1) / kKpool, k = P < kIdxPools ? P : kIdxPools;
-    const std::uint32_t* kr = keys + static_cast<std::size_t>(r) * key_stride;
-    std::uint32_t* tok = tokens + static_cast<std::size_t>(r) * kTokStride;
-    strix::attn_core::select::select_row<strix::attn_core::select::SegmentPolicy<kKpool>>(
-        kr, P, t, k, l, tok, n_out + r,
-        strix::attn_core::select::SegmentStorage{hist, wsum, sh_prefix, sh_rem}, hist0, r);
-}
+// The shared group select kernel (src/attn_core/group_select_kernel.hpp, lifted from here unchanged) on the GLM DSA
+// shape (CompleteOnly: P = (t + 1) / 4, top 512): radix select of the k-th largest key (top byte from hist0, then 3 byte
+// passes), selected = key > K* plus the lowest-index pools with key == K*, ordered compaction.
+struct GlmSelectView {
+    using Rows = DsaRows;
+    static constexpr strix::attn::group_indexer::Shape kShape = strix::attn::group_indexer::kGlmDsa;
+    static constexpr unsigned kTokStride = strix::glm::fast::kTokStride;
+    __device__ static unsigned tpos(const DsaRows& d, unsigned r) { return d.tpos[r]; }
+};
+static_assert(GlmSelectView::kShape.ratio == kKpool && strix::attn::group_indexer::pick_count(GlmSelectView::kShape) == kIdxPools &&
+                  GlmSelectView::kShape.own == strix::attn::group_indexer::OwnGroup::CompleteOnly,
+              "GLM select = group_indexer::kGlmDsa");
 
 // ---------------------------------------------------------------- MLA (R13)
 // absorb: host qt[l] = chain over d = 0..255 of fmaf(q[h][d], kv_b[h*512 + d][l]). Lane = 2 latent dims (one 32-bit
@@ -1718,19 +1477,19 @@ void indexer_score(const DsaRows& d, const float* qI, const float* wraw, std::ui
     if (rg == 6) rg = (same_slot && d.rows >= 2) ? (p_bound <= 2048U ? 5U : (p_bound >= 8192U && d.rows <= 4 ? 3U : 1U)) : 1U;
     const unsigned rk_tiles = (p_bound + 2 * kScoreThreads - 1) / (2 * kScoreThreads);
     if (rg == 3)
-        idx_score_rk_kernel<2><<<dim3(rk_tiles, (d.rows + 1) / 2), kScoreThreads, 0, s>>>(d, qI, wraw, keys, key_stride, hist0);
+        gscan::score_rk_kernel<GlmScan, 2><<<dim3(rk_tiles, (d.rows + 1) / 2), kScoreThreads, 0, s>>>(d, qI, wraw, keys, key_stride, hist0);
     else if (rg == 5)
-        idx_score_rk_kernel<1><<<dim3(rk_tiles, d.rows), kScoreThreads, 0, s>>>(d, qI, wraw, keys, key_stride, hist0);
+        gscan::score_rk_kernel<GlmScan, 1><<<dim3(rk_tiles, d.rows), kScoreThreads, 0, s>>>(d, qI, wraw, keys, key_stride, hist0);
     else if (rg == 1)
-        idx_score_kernel<<<dim3(tiles, d.rows), kScoreThreads, 0, s>>>(d, qI, wraw, keys, key_stride, hist0);
+        gscan::score_kernel<GlmScan><<<dim3(tiles, d.rows), kScoreThreads, 0, s>>>(d, qI, wraw, keys, key_stride, hist0);
     else  // RG=4 requests use RG=2 to stay within the LDS budget.
-        idx_score_rg_kernel<2><<<dim3(tiles, (d.rows + 1) / 2), kScoreThreads, 0, s>>>(d, qI, wraw, keys, key_stride, hist0);
+        gscan::score_rg_kernel<GlmScan, 2><<<dim3(tiles, (d.rows + 1) / 2), kScoreThreads, 0, s>>>(d, qI, wraw, keys, key_stride, hist0);
     ok(hipGetLastError(), "glm fast indexer_score");
 }
 void indexer_select(const DsaRows& d, const std::uint32_t* keys, unsigned key_stride, const std::uint32_t* hist0,
                     std::uint32_t* tokens, std::uint32_t* n, hipStream_t s) {
     check_rows(d.rows);
-    idx_select_kernel<<<d.rows, 1024, 0, s>>>(d, keys, key_stride, hist0, tokens, n);
+    strix::attn_core::group_select::enqueue_select<GlmSelectView>(d, d.rows, keys, key_stride, hist0, tokens, n, s);
     ok(hipGetLastError(), "glm fast indexer_select");
 }
 

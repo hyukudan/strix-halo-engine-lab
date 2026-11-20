@@ -10,6 +10,7 @@
 #include "strix/qwen_onfly_i4.hpp"
 #include "strix/qwen_allon.hpp"
 #include "hip_decode_options.hpp"
+#include "qwen_tiled_prompt_plan.hpp"
 #include "known_prefill_reservation.hpp"
 #include "strix/model_mapping_accounting.hpp"
 #include "qwen_moe_route_bf16.hpp"
@@ -1898,7 +1899,12 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
     if (o.http_serve && !o.baseline && o.prefix_cache && o.prefix_cache_host_bytes &&
         !o.prefix_cache_block_rows_explicit && o.known_prefix_prefill_rows >= 1024 &&
         o.known_prefix_prefill_rows % 1024 == 0) {
-        o.prefix_cache_block_rows = 1024;
+        // The single tiled-MTP route also keeps the row-class checkpoint at a prompt's class end
+        // (qwen_row_class_point), which must sit on the cache grid: its unit is the 128-row class grid
+        // (every 1024 and full-T boundary stays on it). STRIX_PREFIX_CACHE_ROW_CLASS=0 keeps 1024.
+        const bool row_class = !o.http_batch && o.mtp.enabled &&
+            !env_is(result.environment, "STRIX_PREFIX_CACHE_ROW_CLASS", "0");
+        o.prefix_cache_block_rows = row_class ? qwen_row_class_grid : 1024U;
         result.sources["--prefix-cache-block-rows"] = OptionSource::automatic;
     }
     return result;
