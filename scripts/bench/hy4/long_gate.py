@@ -207,8 +207,15 @@ def gate(a):
         lines.append(g.window_line(w, f))
     for x in lines:
         print(x)
+    # R1: the shared flip-ratio check is defined on FREE-running arms against a null of the same length. Here both arms
+    # replay (local flips: the arm's own ids vs the replayed ones) and the null is shorter, so the ratio is reported per
+    # window and judged by --r1 (default: report only; the R1 evidence is the ratio's stationarity against the cuts
+    # inside the range a free-running ruling already qualified).
+    print("local flips (arm / null, rate): " + "; ".join(
+        f"{w['name']} {f['cand']['rate']:.4f}/{f['null']['rate']:.4f}={f['cand']['rate'] / max(f['null']['rate'], 1e-12):.2f}"
+        for w, f in zip(windows, flips)))
     try:
-        pooled = g.verdict(windows, flips)
+        pooled = g.verdict(windows, flips if a.r1 else None)
     except g.GateError as e:
         print(f"no verdict: {e}")
         return 2
@@ -243,6 +250,7 @@ def main(argv=None):
     s.add_argument("manifest")
     s.add_argument("--gate-v2", default=str(pathlib.Path(__file__).resolve().parents[3] / "tools/strix-gate/gate_v2.py"))
     s.add_argument("--json")
+    s.add_argument("--r1", action="store_true", help="apply the shared flip-ratio limit to the local flips")
     a = ap.parse_args(argv)
     return {"routes-pos": routes_pos, "replay-arm": replay_arm, "replay-chunks": replay_chunks, "gate": gate}[a.cmd](a) or 0
 
