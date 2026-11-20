@@ -62,14 +62,29 @@ template <unsigned Waves, unsigned Form = 0U> struct Cols {
         return {nullptr, v.out + o, v.out_stride, o < v.count};
     }
     // 64 weights = two Q8_0 blocks (68 bytes) of the stager's column; columns past count read the last one (never stored)
-    __device__ __forceinline__ void stage(unsigned tile, unsigned col, unsigned unit, U4* nb) const {
+    __device__ __forceinline__ const std::uint8_t* stage_at(unsigned tile, unsigned col, unsigned unit) const {
         const unsigned o0 = 16U * (v.tile0 + tile) + col, o = o0 < v.count ? o0 : v.count - 1U;
-        const auto* p = v.weight + static_cast<std::size_t>(o) * v.row_bytes + v.k_bytes + (unit / 2U) * 34U;
-        WeightSource::template stage<Form>(p,nb);
+        return v.weight + static_cast<std::size_t>(o) * v.row_bytes + v.k_bytes + (unit / 2U) * 34U;
     }
-    __device__ __forceinline__ Half16 fragment(unsigned row, unsigned unit) const {
-        return WeightSource::activation_fragment(v.codes,v.deltas,v.x_stride,row,unit);
+    // Split schedule of the core (ColsStageSplit / ColsFragmentSplit): the loads are issued one stage / one k unit
+    // ahead and decoded after the WMMAs in between, so neither the stagers' weight loads nor the A8 loads are waited
+    // for right next to their issue. stage() and fragment() stay the compositions (same bits).
+    __device__ __forceinline__ WeightSource::StageRaw stage_load(unsigned tile, unsigned col, unsigned unit) const {
+        return WeightSource::stage_load(stage_at(tile, col, unit));
     }
+    __device__ __forceinline__ void stage_decode(const WeightSource::StageRaw& raw, U4* nb) const {
+        WeightSource::template stage_decode<Form>(raw, nb);
+    }
+    __device__ __forceinline__ void stage(unsigned tile, unsigned col, unsigned unit, U4* nb) const {
+        stage_decode(stage_load(tile, col, unit), nb);
+    }
+    __device__ __forceinline__ WeightSource::ActivationRaw fragment_load(unsigned row, unsigned unit) const {
+        return WeightSource::activation_load(v.codes,v.deltas,v.x_stride,row,unit);
+    }
+    __device__ __forceinline__ Half16 fragment_half(const WeightSource::ActivationRaw& raw) const {
+        return WeightSource::activation_half(raw);
+    }
+    __device__ __forceinline__ Half16 fragment(unsigned row, unsigned unit) const { return fragment_half(fragment_load(row, unit)); }
 };
 
 // Stores only outputs below count (the last column tile may be partial); accumulate adds to what is there.
