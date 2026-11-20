@@ -13,6 +13,7 @@ using hipStream_t = void*;
 inline const hipStream_t hipStreamPerThread = reinterpret_cast<void*>(std::uintptr_t{2});
 inline const hipStream_t hipStreamLegacy = reinterpret_cast<void*>(std::uintptr_t{1});
 enum hipStreamCaptureStatus { hipStreamCaptureStatusNone };
+enum hipDeviceAttribute_t { hipDeviceAttributeIntegrated };
 struct hipUUID { unsigned char bytes[16]; };
 struct hipDeviceProp_t { char gcnArchName[256]; };
 
@@ -23,6 +24,7 @@ inline void record(char value) { if (event) event(value); }
 }
 
 inline const char* hipGetErrorString(hipError_t) { return "mock runtime error"; }
+inline hipError_t hipGetLastError() { return hipSuccess; }
 inline hipError_t hipGetDevice(int* device) { *device = 0; return hipSuccess; }
 inline hipError_t hipSetDevice(int) { return hipSuccess; }
 inline hipError_t hipRuntimeGetVersion(int* version) { *version = 1; return hipSuccess; }
@@ -54,5 +56,6 @@ inline hipError_t hipMalloc(void**, std::size_t) { std::abort(); }
 inline hipError_t hipExtMallocWithFlags(void**, std::size_t, unsigned) { std::abort(); }
 inline hipError_t hipHostMalloc(void**, std::size_t, unsigned) { std::abort(); }
 inline hipError_t hipMemcpy(void*, const void*, std::size_t, int) { std::abort(); }
+inline hipError_t hipDeviceGetAttribute(int*, hipDeviceAttribute_t, int) { std::abort(); }
 inline hipError_t hipFree(void*) { std::abort(); }
 inline hipError_t hipHostFree(void*) { std::abort(); }

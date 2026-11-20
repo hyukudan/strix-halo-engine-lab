@@ -7,6 +7,7 @@
 #include "strix/hip_model_residency_diagnostic.hpp"
 #endif
 #include "strix/lever.hpp"
+#include "strix/residency/copy_source.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -319,6 +320,18 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> prefault_spans(const std::v
     return spans;
 }
 
+// STRIX_MODEL_REGISTER_CHUNK_BYTES=N (default 268435456 = 256 MiB; 0 = one registration per merged range): register
+// each merged range as page-aligned pieces of at most N bytes. An invalidated page of a userptr registration makes the
+// driver revalidate the whole registration while every queue of the process is evicted; smaller pieces bound that
+// stall. The temporary source registrations of a resident copy use the same pieces.
+std::uint64_t registration_piece_bytes() {
+    static const std::uint64_t chunk = [] {
+        const char* v = std::getenv("STRIX_MODEL_REGISTER_CHUNK_BYTES");
+        return v ? std::strtoull(v, nullptr, 10) : 268435456ULL;
+    }();
+    return chunk;
+}
+
 std::vector<HostRange> build_registration_ranges(
     const MappedModelFile& mapped,
     const ModelManifest& manifest,
@@ -328,14 +341,8 @@ std::vector<HostRange> build_registration_ranges(
     std::vector<HostRange> merged;
     for (const auto range : build_registered_residency_ranges(manifest,policy,mapped.bytes(),page))
         merged.push_back({range.begin,range.end});
-    // STRIX_MODEL_REGISTER_CHUNK_BYTES=N (default 268435456 = 256 MiB; 0 = one registration per merged range): register each merged range as page-aligned
-    // pieces of at most N bytes. An invalidated page of a userptr registration makes the driver revalidate the
-    // whole registration while every queue of the process is evicted; smaller pieces bound that stall. A tensor
-    // may then span pieces: binding requires their device aliases to be contiguous (checked after registering).
-    static const std::uint64_t chunk = [] {
-        const char* v = std::getenv("STRIX_MODEL_REGISTER_CHUNK_BYTES");
-        return v ? std::strtoull(v, nullptr, 10) : 268435456ULL;
-    }();
+    // A tensor may span pieces: binding requires their device aliases to be contiguous (checked after registering).
+    const std::uint64_t chunk = registration_piece_bytes();
     if (chunk == 0U) return merged;
     const auto piece = std::max<std::uint64_t>(align_down(chunk, page), page);
     std::vector<HostRange> pieces;
@@ -380,6 +387,42 @@ std::vector<HostRange> build_copy_ranges(
         ranges.push_back({range.begin,range.end});
     }
     return ranges;
+}
+
+// STRIX_MODEL_COPY_REGISTERED: unset = the measured rule of strix/residency/copy_source.hpp (register the copy
+// source on HIP >= 7.17 integrated GPUs), 1 = always register it, 0 = always copy straight from the mapping.
+inline constexpr lever::Decl copy_registered_source_lever{
+    .name = "model_copy_registered_source", .env = "STRIX_MODEL_COPY_REGISTERED", .exactness = lever::Exactness::bitwise,
+    .default_on = true, .source = "docs/optimizations.md#resident-copy-registered-source: 3 GiB fresh GGUF regions, HIP 7.16 vs 7.17"};
+
+bool copy_registers_source() {
+    const auto choice = lever::select(copy_registered_source_lever, {});
+    if (!choice.on || choice.origin == lever::Origin::explicit_switch) return choice.on;
+    int runtime = 0, device = 0, integrated = 0;
+    if (hipRuntimeGetVersion(&runtime) != hipSuccess || hipGetDevice(&device) != hipSuccess ||
+        hipDeviceGetAttribute(&integrated, hipDeviceAttributeIntegrated, device) != hipSuccess) {
+        (void)hipGetLastError();
+        return false;  // unknown runtime or device: the incumbent direct copy
+    }
+    return model_copy::register_source(runtime, integrated != 0);
+}
+
+// Copies the mapping range [range.begin, range.end) to `device`, each piece through a temporary registration of its
+// pages (released right after its copy). A piece the runtime refuses to register is copied straight from the mapping.
+void copy_through_registered_source(void* device, const MappedModelFile& mapped, HostRange range) {
+    for (const auto& piece : model_copy::source_pieces(range.begin, range.end, registration_piece_bytes(), page_size(),
+             mapped.bytes())) {
+        auto* pages = reinterpret_cast<void*>(mapped.base_address() + static_cast<std::uintptr_t>(piece.register_begin));
+        const auto page_bytes = static_cast<std::size_t>(piece.register_end - piece.register_begin);
+        const bool registered = hipHostRegister(pages, page_bytes, hipHostRegisterMapped) == hipSuccess;
+        if (!registered) (void)hipGetLastError();
+        const auto copied = hipMemcpy(static_cast<unsigned char*>(device) + (piece.begin - range.begin),
+            reinterpret_cast<const void*>(mapped.base_address() + static_cast<std::uintptr_t>(piece.begin)),
+            static_cast<std::size_t>(piece.end - piece.begin), hipMemcpyHostToDevice);
+        const auto released = registered ? hipHostUnregister(pages) : hipSuccess;
+        check_hip(copied, "hipMemcpy(model range copy, registered source)");
+        check_hip(released, "hipHostUnregister(model range copy source)");
+    }
 }
 
 }  // namespace
@@ -982,8 +1025,10 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
                 policy);
 
         const HipSetupQuiescenceGuard setup_guard;
+        const bool register_source = copy_registers_source();
 
         try {
+            startup::Phase copy_marker(register_source ? "resident_copy_registered" : "resident_copy_direct");
             result.copied_ranges_.reserve(
                 ranges.size());
 
@@ -1000,6 +1045,10 @@ HipModelResidency HipModelResidency::create_impl(const MappedModelFile& mapped,
                     "hipMalloc(model range copy)");
                 try {
                     setup_guard.run([&] {
+                        if (register_source) {
+                            copy_through_registered_source(device, mapped, range);
+                            return;
+                        }
                         check_hip(
                             hipMemcpy(
                                 device,

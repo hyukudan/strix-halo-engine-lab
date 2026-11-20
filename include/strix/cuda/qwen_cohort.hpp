@@ -10,6 +10,7 @@
 #include "strix/cuda/qwen_cohort_plan.hpp"
 #include "strix/cuda/qwen_prefill.hpp"
 #include "strix/mtp_context_draft.hpp"
+#include "strix/mtp_selection_transaction.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -84,6 +85,9 @@ struct Stream {
     std::uint32_t copy_rows = 0;      // per-request wide copy window rows (0: the step's; request field "copy_rows")
     std::uint32_t window_rows = 0;    // per-request window budget (0: the step's; request field "window_rows"; the
                                       // step takes the widest one of its streams, packing only)
+    // borrowed; null = plain greedy. The request's selection policy (a thinking budget), applied to the verified rows
+    // by strix::select_greedy_window; its receipt is published after commit_cohort.
+    strix::MtpSelectionTransaction* selection = nullptr;
 };
 
 inline std::uint32_t window_rows_default() {
@@ -399,24 +403,45 @@ inline std::vector<StreamStep> step(qp::Prefill& p, std::vector<Stream>& streams
             return false;
         }
         std::vector<std::uint32_t> keep(entries.size());
+        std::vector<std::unique_ptr<strix::MtpSelectionReceipt>> receipts(entries.size());
         for (std::size_t j = 0; j < entries.size(); ++j) {
             const auto& e = entries[j];
             const auto& row = rows[e.index];
-            std::uint32_t k = 1;
-            while (k < e.rows && row[k] == r[j].argmax[k - 1]) ++k;
-            keep[j] = k;
             auto& st = out[e.index];
+            std::uint32_t k = 1;
+            if (auto* selection = streams[e.index].selection) {
+                // Request policy (thinking budget): the shared walk over the argmax replies; equals the greedy rule
+                // below unless the policy forces a token. A policy refusal fails this request only (keep 0, undone).
+                try {
+                    auto g = strix::select_greedy_window(*selection,
+                        std::span<const std::uint32_t>(row).subspan(1, e.rows - 1U),
+                        std::span<const std::uint32_t>(r[j].argmax.data(), e.rows));
+                    k = static_cast<std::uint32_t>(g.ids.size());
+                    st.tokens = std::move(g.ids);
+                    receipts[j] = std::move(g.receipt);
+                } catch (const strix::MtpSelectionError& ex) {
+                    keep[j] = 0;
+                    st.failed = true;
+                    st.error = std::string("constraint selection: ") + ex.what();
+                    continue;
+                }
+            } else {
+                while (k < e.rows && row[k] == r[j].argmax[k - 1]) ++k;
+                st.tokens.assign(r[j].argmax.begin(), r[j].argmax.begin() + k);
+            }
+            keep[j] = k;
             st.rows = e.rows;
             st.mtp_proposed = std::min(mtp_prefix[e.index], e.rows - 1U);
             st.context_proposed = e.rows - 1U - st.mtp_proposed;
             st.mtp_accepted = std::min(st.mtp_proposed, k - 1U);
             st.context_accepted = k - 1U - st.mtp_accepted;
             st.window_rows = total;
-            st.tokens.assign(r[j].argmax.begin(), r[j].argmax.begin() + k);
             if (o.want_logits) st.logits.assign(r[j].logits.begin(), r[j].logits.begin() + static_cast<std::ptrdiff_t>(r[j].logits.size() / e.rows * k));
         }
         p.commit_cohort(keep);
         for (std::size_t j = 0; j < entries.size(); ++j) {
+            if (receipts[j]) receipts[j]->publish();
+            if (keep[j] == 0) continue;
             auto& s = streams[entries[j].index];
             s.position += keep[j];
             s.pending = out[entries[j].index].tokens.back();

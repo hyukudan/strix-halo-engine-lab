@@ -106,6 +106,15 @@ void launch_norm(const Rows& rows, std::uint32_t count, const Weights& w, const 
 void launch_core(const std::uint16_t* input, std::uint64_t input_stride, const Rows& rows, std::uint32_t count,
     std::uint16_t* conv_state, float* state, void* scratch, const Weights& w, const amdmath::Tables& t, cudaStream_t stream,
     const A8Out* a8 = nullptr, Tuning tuning = {});
+// launch_core cut by strix/gdn_prefill_overlap.hpp: K5 of segment i on `stream` beside K6 of segment i-1 and K3+K4 of
+// segment i+1 on an auxiliary stream of the calling thread, event-ordered; `stream` waits for the auxiliary work before
+// anything enqueued after the call. Same kernels, same per-row arithmetic, conv history and FP32 state carried segment to
+// segment as block to block: bitwise equal to the serial call. Serial (K3..K6 above) when overlap is false, the state is
+// 16-bit, the stream is capturing or the plan has one segment. launch_core = launch_core_overlap with
+// overlap = STRIX_QRTX_GDN_OVERLAP (default on; 0 = serial).
+void launch_core_overlap(const std::uint16_t* input, std::uint64_t input_stride, const Rows& rows, std::uint32_t count,
+    std::uint16_t* conv_state, float* state, void* scratch, const Weights& w, const amdmath::Tables& t, cudaStream_t stream,
+    const A8Out* a8, Tuning tuning, bool overlap);
 
 // launch_core with the split recurrence; raw_qkv (optional, [count][10240] FP32) receives the conv inputs (the rows'
 // qkv before K4 rewrites them in place) for a later conv-state rollback.

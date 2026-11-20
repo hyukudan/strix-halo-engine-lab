@@ -317,6 +317,18 @@ Before the registered ranges of a mapped model are pinned, the same ranges are r
 - **Measured gain:** One Strix Halo node, Qwen MoE UD-Q4_K_XL GGUF (82.5 GB registered), same binary ON vs OFF: cold page cache, load-only 21.9 vs 36.6 s; engine registration done at 21.4 vs 35.9 s, first token 84.9 vs 98.5 s; warm page cache 1.37 / 1.38 vs 1.99 / 2.00 s (ABAB). Peak RSS and bytes read unchanged.
 - **Implementation / evidence:** `src/hip_model_residency.cpp` (`create_impl`), `MappedModelFile::prefault_parallel`
 
+### Resident copy registered source
+
+**Engine:** every HIP engine that copies a mapped model into device memory (`--residency copy`, `--mtp-sidecar-residency copy`). **Control:** `STRIX_MODEL_COPY_REGISTERED`. **Default:** automatic (ON on HIP runtimes from 7.17 on integrated GPUs, OFF elsewhere).
+
+HIP 7.17 copies pageable host memory to an integrated GPU through a CPU staging buffer, so a resident copy straight from the read-only model mapping fell to 24-27 GB/s (74-79 GB/s on HIP 7.16). On those runtimes the copy now registers each 256 MiB piece of its range (the piece rule of the registered path, `STRIX_MODEL_REGISTER_CHUNK_BYTES`), copies it and releases the registration at once; nothing of the model stays registered after setup. On HIP 7.16 and on discrete GPUs the direct copy stays (on 7.16 it is the faster form).
+
+- **Preconditions:** `--residency copy` or a copied MTP sidecar; the rule reads the HIP runtime version and the device's integrated attribute.
+- **Exactness evidence:** Same bytes at the same device addresses (byte comparison of every arm in the transfer bench; same `copied_bytes`). A piece the runtime refuses to register is copied directly.
+- **Off switch:** STRIX_MODEL_COPY_REGISTERED=0 (1 forces it everywhere)
+- **Measured gain:** One Strix Halo node (gfx1151), page-cache-warm GGUF, 3 GiB regions read for the first time: direct 24-27 GB/s on HIP 7.17 vs registered 50-57 GB/s (both runtimes); HIP 7.16 direct 74-79 GB/s. Whole resident copy of Qwen3-0.6B Q8_0 (0.80 GB): HIP 7.17 46 / 46 ms registered vs 57 / 57 ms direct; HIP 7.16 the rule keeps direct, 36 / 36 ms vs 47-48 ms forced registered (ABAB, same binary per runtime).
+- **Implementation / evidence:** `src/hip_model_residency.cpp` (`copy_through_registered_source`), rule and piece plan `include/strix/residency/copy_source.hpp`, test `tests/model_copy_source_tests.cpp`
+
 ### Serving PLE table re-warm
 
 **Engine:** `qwen`. **Control:** `STRIX_PLE_REWARM`. **Default:** ON (bounded).

@@ -346,6 +346,9 @@ public:
     // nothing in flight here: e.g. an in-process A/B of XferExchange against CommExchange).
     [[nodiscard]] Transport& transport() noexcept { return *transport_; }
     [[nodiscard]] const DeviceExchange* device_exchange() const noexcept { return direct_.get(); }
+    // Whether exchange() of `bytes` takes the host path (no device exchange, or the route table puts this size on the
+    // host transport): then exchange_host() moves the same message with no device copy. Both ranks the same answer.
+    [[nodiscard]] bool host_routed(std::size_t bytes) const { return !direct_ || !route(bytes).direct; }
     // The size router (with a device exchange): STRIX_DIST_ROUTE=table (default: the measured table; with host
     // streams, small messages on the host path, two rings up to 1 MB, mixed 35 % host above; without, one ring up to
     // 32 KB, two up to 256 KB, every ring above),

@@ -135,6 +135,25 @@ std::vector<LinkSample> measure(Exchange&& exchange, std::span<const std::uint64
 // Start-up sizes: one latency-bound, one mid, one rate-bound message (~10 ms of link time at 35 rounds).
 inline constexpr std::array<std::uint64_t, 3> default_link_sizes{4096U, 65536U, 1048576U};
 
+// Probe sizes of ONE cost regime (lo, hi] that fit `capacity`: the default sizes inside it, plus the regime's ends
+// (2 x lo or 4096, and min(hi, capacity)) when fewer than two defaults fall inside, so a fit never spans two exchange
+// paths (e.g. a size table that keeps small messages on the host path and sends large ones to the device rings).
+// Ascending, no duplicates; empty when the regime holds no size <= capacity. (0, max] = the default sizes that fit.
+inline std::vector<std::uint64_t> regime_sizes(std::uint64_t lo, std::uint64_t hi, std::uint64_t capacity) {
+    const std::uint64_t top = std::min(hi, capacity);
+    std::vector<std::uint64_t> out;
+    if (top <= lo) return out;
+    for (const auto b : default_link_sizes)
+        if (b > lo && b <= top) out.push_back(b);
+    if (out.size() < 2U) {
+        const std::uint64_t first = lo == 0U ? std::uint64_t{4096} : (lo > top / 2U ? top : 2U * lo);
+        for (const auto b : {std::min(first, top), top})
+            if (b > lo && std::find(out.begin(), out.end(), b) == out.end()) out.push_back(b);
+        std::sort(out.begin(), out.end());
+    }
+    return out;
+}
+
 // The host-bytes form: symmetric Transport::exchange of `bytes` each way. Both ranks call it with the same arguments.
 inline std::vector<LinkSample> measure_host(Transport& transport, std::span<const std::uint64_t> sizes, unsigned warmup = 5U,
                                             unsigned rounds = 30U, std::chrono::microseconds pause = std::chrono::microseconds{0}) {

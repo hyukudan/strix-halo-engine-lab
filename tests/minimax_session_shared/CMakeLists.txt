@@ -117,9 +117,11 @@ set_tests_properties(minimax-session-replay PROPERTIES TIMEOUT 120 LABELS "cpu;s
 
 if(NOT MINIMAX_SESSION_BASELINE)
     include("${REPO_ROOT}/cmake/StrixStateCache.cmake")
-    target_link_libraries(minimax_replay_family PUBLIC strix_state_cache strix_session_owner)
+    include("${REPO_ROOT}/cmake/StrixPower.cmake")
+    target_link_libraries(minimax_replay_family PUBLIC strix_state_cache strix_session_owner strix_power)
     target_sources(minimax_replay_family PRIVATE
         "${REPO_ROOT}/src/serve/api.cpp"
+        "${REPO_ROOT}/src/serve/token_memo.cpp"
         "${REPO_ROOT}/src/serve/ollama.cpp"
         "${REPO_ROOT}/src/serve/media.cpp"
         "${REPO_ROOT}/src/serve/constraint_selection.cpp"

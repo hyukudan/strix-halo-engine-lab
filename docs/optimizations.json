@@ -292,6 +292,17 @@
   },
   {
     "engine": "qwen",
+    "name": "Resident copy registered source",
+    "flag_or_env": "STRIX_MODEL_COPY_REGISTERED",
+    "default": "AUTO (ON on HIP >= 7.17 integrated GPUs)",
+    "exact": "Same bytes at the same device addresses; a piece the runtime refuses to register is copied directly.",
+    "gain": "One Strix Halo node, warm GGUF, 3 GiB fresh regions: HIP 7.17 direct 24-27 GB/s vs registered 50-57 GB/s; Qwen3-0.6B resident copy on HIP 7.17 46 vs 57 ms; HIP 7.16 keeps direct (36 vs 47-48 ms forced registered).",
+    "preconditions": "--residency copy or a copied MTP sidecar; HIP runtime >= 7.17 on an integrated GPU (automatic rule).",
+    "off_switch": "STRIX_MODEL_COPY_REGISTERED=0",
+    "doc_anchor": "docs/optimizations.md#resident-copy-registered-source"
+  },
+  {
+    "engine": "qwen",
     "name": "Serving PLE table re-warm",
     "flag_or_env": "STRIX_PLE_REWARM",
     "default": "ON (bounded)",

@@ -441,4 +441,24 @@ ConstraintVerdict ConstraintSelection::verdict(std::string finish, std::string e
     return v;
 }
 
+std::shared_ptr<ConstraintSelection> ArgmaxConstraintRequests::make(const std::shared_ptr<const ConstraintSpec>& spec) {
+    if (!spec) return {};
+    if (!admits(*spec))
+        throw std::invalid_argument("this engine selects from each row's argmax only: response_format, logprobs and logit "
+                                    "transforms are not executed");
+    std::shared_ptr<const TokenByteTrie> trie;
+    {
+        const std::lock_guard lock(mutex_);
+        // The trie excludes the request's EOS ids; they are the server's stop set, so one trie serves every request.
+        if (!trie_ || trie_eos_ != spec->eos_ids) {
+            trie_ = std::make_shared<TokenByteTrie>(*tokenizer_, spec->eos_ids);
+            trie_eos_ = spec->eos_ids;
+        }
+        trie = trie_;
+    }
+    auto selection = std::make_shared<ConstraintSelection>(spec, std::move(trie), tokenizer_);
+    selection->set_argmax_first(true);
+    return selection;
+}
+
 }  // namespace strix::serve

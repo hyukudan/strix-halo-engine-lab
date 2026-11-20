@@ -146,7 +146,8 @@ struct ApiConfig {
     bool engine_constraints = false;
     bool engine_thinking_budget = false;
     // Anthropic thinking.budget_tokens: false (default) = accepted and stated as not enforced (the request keeps speculative
-    // decoding); true = enforced as thinking-budget-v1 (the request decodes on the serial host route).
+    // decoding); true = enforced as thinking-budget-v1 on the resolved selection route (resolve_mtp_selection_route:
+    // "mtp-host" keeps MTP windows and caps each window's commit at the forced closure; "serial-host" only as fallback).
     bool enforce_anthropic_thinking_budget = false;
     // From GenerationEngine::constraint_execution_routes(); the first route handles new requests.
     std::vector<std::string> constraint_execution_routes;

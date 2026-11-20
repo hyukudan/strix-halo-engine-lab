@@ -127,6 +127,44 @@ int main() {
             }
         check(ok, "chunk_range partition");
     }
+    {  // Split-vocabulary pair words (MiniMax host head_argmax; device mirror in xport argmax_exchange).
+        const std::uint32_t half = 1000;
+        // The rule the MiniMax host scan used before binding: first max per half (`l[i] > l[best]`), then
+        // `v1 > v0 ? id1 : id0` across ranks. Finite rows only (it threw on the rank that saw a non-finite logit).
+        const auto legacy = [](const std::vector<float>& l0, const std::vector<float>& l1, std::uint32_t id0_1) {
+            std::uint32_t b0 = 0, b1 = 0;
+            for (std::uint32_t i = 0; i < l0.size(); ++i) if (l0[i] > l0[b0]) b0 = i;
+            for (std::uint32_t i = 0; i < l1.size(); ++i) if (l1[i] > l1[b1]) b1 = i;
+            return l1[b1] > l0[b0] ? id0_1 + b1 : b0;
+        };
+        const auto pair = [&](const std::vector<float>& l0, const std::vector<float>& l1) {
+            // Both ranks call pair_pick(rank 0's word, rank 1's word), so they agree by construction.
+            return ha::pair_pick(ha::pair_word(ha::reference(l0, 0)), ha::pair_word(ha::reference(l1, half)));
+        };
+        std::uniform_int_distribution<int> small(-4, 4);
+        bool same = true;
+        for (int t = 0; t < 2000; ++t) {
+            const auto ut = static_cast<std::size_t>(t);
+            const std::size_t n0 = 1 + ut % 37, n1 = 1 + ut % 23;
+            std::vector<float> l0(n0), l1(n1);
+            for (auto& v : l0) v = static_cast<float>(small(rng)) * 0.5F;  // many planted ties within and across halves
+            for (auto& v : l1) v = static_cast<float>(small(rng)) * 0.5F;
+            if (ut % 5 == 0) l0[ut % n0] = -0.0F;
+            if (ut % 7 == 0) l1[ut % n1] = 0.0F;
+            same &= pair(l0, l1) == legacy(l0, l1, half);
+        }
+        check(same, "pair pick == legacy MiniMax host rule on finite rows (ties, +0/-0)");
+        check(pair({1.0F, 2.0F}, {2.0F, 1.0F}) == 1U, "pair tie across halves -> rank 0");
+        check(pair({-0.0F}, {0.0F}) == 0U, "pair +0 == -0 -> rank 0");
+        check(pair({1.0F, 2.0F}, {2.5F, 2.5F}) == half, "pair rank 1 larger -> its first max");
+        check(pair({1.0F, nan}, {2.0F}) == ha::kNone, "pair NaN on rank 0 fails both");
+        check(pair({1.0F}, {inf, 0.0F}) == ha::kNone, "pair +inf on rank 1 fails both");
+        check(pair({-inf}, {1.0F}) == ha::kNone, "pair -inf fails both");
+        const auto w = ha::pair_word(ha::reference(std::vector<float>{3.5F, 7.25F, 7.25F}, 40));
+        float v = 0.0F;
+        std::memcpy(&v, &w.value_bits, 4);
+        check(w.index == 41U && v == 7.25F, "pair word carries value bits + global index");
+    }
     std::printf("%s head_argmax: %d failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }
