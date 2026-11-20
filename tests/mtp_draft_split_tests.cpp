@@ -47,6 +47,23 @@ int main() {
         s.note(1000);
         check(s.kept(DraftSplit::kBins - 1) == 1, "overflow bin");
     }
+    {
+        // receipt tally: the three-argument note feeds the same histogram (same split choice) and counts the step work
+        DraftSplit a, b;
+        const std::uint32_t kept[6] = {1, 2, 7, 3, 1, 7};
+        for (int r = 0; r < 4; ++r)
+            for (const auto k : kept) {
+                const std::uint32_t first = b.first_segment(7);
+                check(a.first_segment(7) == first, "tally note keeps the split choice");
+                const bool second = first < 7 && k > first;
+                a.note(k);
+                b.note(k, second ? 7U : first, second);
+            }
+        const auto& t = b.tally();
+        check(t.chains == 24 && t.kept == 4 * (1 + 2 + 7 + 3 + 1 + 7), "tally chains / kept");
+        check(t.launched >= t.kept && t.second <= t.chains, "tally launched >= kept");
+        for (std::uint32_t n = 0; n < DraftSplit::kBins; ++n) check(a.kept(n) == b.kept(n), "tally histogram equal");
+    }
     std::printf("%s mtp_draft_split_tests\n", failures ? "FAIL" : "PASS");
     return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }

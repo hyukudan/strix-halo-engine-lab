@@ -400,7 +400,7 @@ public:
         std::string extra = head;
         for (std::size_t i = 0; i < emitted.size() && i < 4096; ++i) extra += (i ? "," : "") + std::to_string(emitted[i]);
         extra += "],\"prefix_cached\":" + std::to_string(st.cached_tokens) + ",\"prefix_restore_ms\":" + std::to_string(prefix_restore_ms)
-            + ",\"prefix_capture_ms\":" + std::to_string(prefix_capture_ms) + "}";
+            + ",\"prefix_capture_ms\":" + std::to_string(prefix_capture_ms) + ",\"draft_chain\":" + e_.draft_stats() + "}";
         st.engine_extra.emplace_back("rtx", extra);
         if (selection) st.constraint = selection->verdict(st.finish, mtp ? "mtp-host" : "serial-host");
         return st;
@@ -1000,7 +1000,7 @@ private:
             ",\"copy_wide_accepted\":" + std::to_string(s.ctx->wide_accepted);
         extra += ",\"prefix_cached\":" + std::to_string(st.cached_tokens) + ",\"prefix_restore_ms\":" + std::to_string(s.prefix_restore_ms)
             + ",\"prefix_capture_ms\":" + std::to_string(s.prefix_capture_ms) + ",\"prefix_join\":" + std::to_string(s.join_boundary)
-            + ",\"prefill_overtakes\":" + std::to_string(s.overtakes) + "}";
+            + ",\"prefill_overtakes\":" + std::to_string(s.overtakes) + ",\"draft_chain\":" + e_.draft_stats() + "}";
         st.engine_extra.emplace_back("rtx", extra);
         end_prefix_entries(s);
         queue_.finish(*s.job, std::move(st), error);

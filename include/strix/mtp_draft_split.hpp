@@ -57,6 +57,20 @@ public:
     // Record one finished chain that kept `kept` drafts (the stop rule keeps the low draft itself).
     void note(std::uint32_t kept) { ++kept_[kept < kBins ? kept : kBins - 1]; }
 
+    // Receipt tally of finished chains: steps launched (both segments), steps kept, chains that ran the second segment
+    // (= host turns). launched - kept is the step work the verify discards; a device-side stop would run kept steps.
+    struct Tally {
+        std::uint64_t chains = 0, launched = 0, kept = 0, second = 0;
+    };
+    void note(std::uint32_t kept, std::uint32_t launched, bool second) {
+        note(kept);
+        ++tally_.chains;
+        tally_.launched += launched;
+        tally_.kept += kept;
+        tally_.second += second ? 1U : 0U;
+    }
+    const Tally& tally() const { return tally_; }
+
     int mode() const { return mode_; }
     std::uint64_t kept(std::uint32_t n) const { return n < kBins ? kept_[n] : 0; }
 
@@ -65,6 +79,7 @@ private:
     double host_turn_;
     std::uint64_t min_samples_;
     std::array<std::uint64_t, kBins> kept_{};
+    Tally tally_{};
 };
 
 }  // namespace strix::mtp

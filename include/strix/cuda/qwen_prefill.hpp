@@ -379,6 +379,9 @@ public:
     void set_multiseg(bool on);
     void set_graph_cap(std::size_t cap);            // LRU cap (>= 1); evicts down to it now
     [[nodiscard]] std::string graph_stats() const;
+    // Single-session draft() chains since load (JSON): chains, steps launched / kept, second-segment runs, split chains,
+    // host wall ms, graph captures / replays, histogram of kept drafts (strix/mtp_draft_split.hpp). Receipt counters only.
+    [[nodiscard]] std::string draft_stats() const;
     [[nodiscard]] GraphCounters graph_counters() const;
     [[nodiscard]] std::uint32_t max_positions() const;
 
