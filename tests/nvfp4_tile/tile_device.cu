@@ -1,7 +1,8 @@
 // Device fixture + operator bench of the NVFP4 tile GEMM (sm_120; run only through an operator ticket on device 0).
 //   tile_device            : quantiser bytes == host reference (bitwise), GEMM store / residual / silu_mul / glu within the FP32
 //                            accumulation bound of the double reference, repeated launches bitwise identical.
-//   tile_device --bench R  : model shapes of the 27B dense layer at R activation rows, median of 20 timed launches per shape.
+//   tile_device --bench R  : model shapes of the 27B dense layer at R activation rows, median of 20 timed launches per shape
+//                            (lsu and bulk alternating launch by launch); --bench R lsu: lsu alone, main's timing loop.
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -323,6 +324,11 @@ void bench_norm_quant(std::uint32_t rows, std::uint32_t in, std::uint32_t gdn_in
     CU(cudaEventDestroy(b));
 }
 
+// --bench R lsu: time Feed::lsu alone with main's loop (3 warm-ups, 20 timed launches, each one preceded by the same kernel).
+// The default --bench alternates lsu and bulk launch by launch (fair bulk/lsu ratio), so there every timed lsu launch follows
+// a bulk launch; that sequence is not main's, and the lsu-vs-main comparison must use this mode in both binaries' order.
+bool lsu_only = false;
+
 // timing of one shape with random tiles (no reference): median of 20 launches after 3 warm-ups
 void bench(const char* name, std::uint32_t out, std::uint32_t in, std::uint32_t rows, bool glu, bool residual = false) {
     const std::uint32_t rp = T::rows_padded(rows);
@@ -360,7 +366,7 @@ void bench(const char* name, std::uint32_t out, std::uint32_t in, std::uint32_t 
     gb.feed = T::Feed::bulk;
     for (int i = 0; i < 3; ++i) {
         CU(T::gemm_enqueue(g, nullptr));
-        CU(T::gemm_enqueue(gb, nullptr));
+        if (!lsu_only) CU(T::gemm_enqueue(gb, nullptr));
     }
     std::vector<float> ms, msb;
     const auto timed = [&](const T::GemmArgs& ga, std::vector<float>& out_ms) {
@@ -374,7 +380,7 @@ void bench(const char* name, std::uint32_t out, std::uint32_t in, std::uint32_t 
     };
     for (int i = 0; i < 20; ++i) {
         timed(g, ms);
-        timed(gb, msb);
+        if (!lsu_only) timed(gb, msb);
     }
     float qms = 0;
     CU(cudaEventRecord(a));
@@ -387,8 +393,8 @@ void bench(const char* name, std::uint32_t out, std::uint32_t in, std::uint32_t 
     std::printf("TILE BENCH %-6s out=%u in=%u rows=%u ms=%.4f TFLOPS=%.1f quant_ms=%.4f\n", name, out * (glu ? 2 : 1), in, rows, med,
                 2.0 * macs / (med * 1e-3) / 1e12, qms);
     std::sort(msb.begin(), msb.end());
-    const double medb = msb[msb.size() / 2];
-    std::printf("TILE BENCH %-6s feed=bulk out=%u in=%u rows=%u ms=%.4f TFLOPS=%.1f bulk/lsu=%.4f\n", name, out * (glu ? 2 : 1), in,
+    const double medb = lsu_only ? 0.0 : msb[msb.size() / 2];
+    if (!lsu_only) std::printf("TILE BENCH %-6s feed=bulk out=%u in=%u rows=%u ms=%.4f TFLOPS=%.1f bulk/lsu=%.4f\n", name, out * (glu ? 2 : 1), in,
                 rows, medb, 2.0 * macs / (medb * 1e-3) / 1e12, medb / med);
     for (void* p : {static_cast<void*>(w), static_cast<void*>(w2), static_cast<void*>(xt), static_cast<void*>(rs), static_cast<void*>(x),
                     static_cast<void*>(y)})
@@ -405,6 +411,7 @@ int main(int argc, char** argv) {
     }
     if (argc >= 3 && std::string(argv[1]) == "--bench") {
         const auto rows = static_cast<std::uint32_t>(std::strtoul(argv[2], nullptr, 10));
+        lsu_only = argc >= 4 && std::string(argv[3]) == "lsu";
         bench("glu", 17408, 5120, rows, true);   // FFN gate+up fused
         bench("down", 5120, 17408, rows, false);  // FFN down
         bench("qkv", 10240, 5120, rows, false);   // GDN qkv
