@@ -525,7 +525,13 @@ inline void select_mtp_bundle_golden(Options& options, const ModelContract& mode
     const auto identity=mtp_bundle_golden_identity(options,model);
     const auto shipped=std::filesystem::path(options.mtp_bundle_path).parent_path()/"goldens"/(identity+".golden");
     const auto cached=std::filesystem::is_regular_file(shipped)?shipped:mtp_golden_cache_dir()/(identity+".golden");
-    options.mtp.golden=std::filesystem::is_regular_file(cached)?cached.string():std::string{};
+    // Path and pin travel together (as main pins the ensured golden): the serving pre-load check verifies the digest.
+    if (std::filesystem::is_regular_file(cached)) {
+        options.mtp.golden=cached.string();
+        options.mtp.golden_sha256=model_content_identity_hex(sha256_file_content(cached,FileHashPolicy::cached));
+    } else {
+        options.mtp.golden.clear();options.mtp.golden_sha256.clear();
+    }
 }
 inline EffectiveConfig initialize_prefill_config(const RequestedOptions& request) {
     EffectiveConfig result;

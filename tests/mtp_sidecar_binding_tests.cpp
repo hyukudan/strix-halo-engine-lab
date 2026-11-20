@@ -3,6 +3,7 @@
 #include "strix/mtp_output_contract.hpp"
 #include "strix/compiled_mtp_draft_plan.hpp"
 #include <iostream>
+#include <sstream>
 #include <memory>
 #include <stdexcept>
 #include <utility>
@@ -191,6 +192,24 @@ int main() {
         (void)strix::build_mtp_sidecar_manifest(model,info,fixture.evidence);
         info.metadata.back().signed_array[2]--;
         rejects([&]{(void)strix::build_mtp_sidecar_manifest(model,info,fixture.evidence);},"YaRN sidecar signed section mismatch");
+    }
+    {
+        // Every MTP sidecar header read (runtime loader and serving pre-load check) uses the shared limits, which retain
+        // the INT32 rope sections the YaRN contract compares; the default limits keep array summaries only.
+        std::string bytes="GGUF";
+        const auto le=[&](std::uint64_t value,unsigned width){for(unsigned i=0;i<width;++i)bytes.push_back(static_cast<char>((value>>(i*8U))&0xffU));};
+        const std::string key="qwen4exp.rope.dimension_sections";
+        le(3,4);le(0,8);le(1,8);le(key.size(),8);bytes+=key;le(9,4);le(5,4);le(4,8);
+        for(const std::uint64_t v:{11U,11U,10U,0U})le(v,4);
+        while(bytes.size()%32U!=0U)bytes.push_back(static_cast<char>(0));
+        const auto parse=[&](const strix::gguf::Limits& limits){std::istringstream input(bytes);
+            return strix::gguf::read(input,bytes.size(),limits);};
+        const auto shared_read=parse(strix::mtp_sidecar_header_limits(1U<<20U));
+        const auto* entry=shared_read.find_metadata(key);
+        expect(entry && entry->signed_array==std::vector<std::int64_t>{11,11,10,0},"shared sidecar header limits retain rope sections");
+        const auto summary=parse(strix::gguf::Limits{});
+        const auto* bare=summary.find_metadata(key);
+        expect(bare && bare->signed_array.empty() && bare->unsigned_array.empty(),"default limits keep summaries only");
     }
     return failures?1:0;
 }
