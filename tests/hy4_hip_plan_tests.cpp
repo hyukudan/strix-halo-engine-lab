@@ -206,7 +206,7 @@ void check_profile_regime() {
     for (const auto& q : hp::qualified)
         if (q.lever == "prompt_rows" && q.device == hp::Device::gfx1151 && q.topology == hp::Topology::one_node)
             gated = std::max(gated, q.max_prompt_tokens);
-    CHECK(gated >= 4096U);
+    CHECK(gated >= 32568U);  // the long-prompt gate (hy4_fast2): the 2K..32K scoreboard prompts are in the qualified range
     const auto run = [](hp::Device d, hp::Topology t, std::uint64_t tokens, std::vector<std::string> args, std::string* status) {
         sp::Inputs in;
         in.env = [](const char*) -> const char* { return nullptr; };
@@ -226,6 +226,7 @@ void check_profile_regime() {
     std::string st;
     CHECK(run(g, one, 17, {"--profile", "fast"}, &st) == "2048" && st == "profile / qualified");
     CHECK(run(g, one, gated, {"--profile", "fast"}, &st) == "2048" && st == "profile / qualified");
+    CHECK(run(g, one, 16384, {"--profile", "fast"}, &st) == "2048" && st == "profile / qualified");
     CHECK(run(g, one, gated + 1U, {"--profile", "fast"}, &st) == "0" && st == "pending / qualified +reason");
     CHECK(run(hp::Device::unknown, one, 17, {"--profile", "fast"}, &st) == "0" && st == "pending / qualified +reason");
     CHECK(run(g, hp::Topology::pair, 17, {"--profile", "fast"}, &st) == "0" && st == "pending / qualified +reason");

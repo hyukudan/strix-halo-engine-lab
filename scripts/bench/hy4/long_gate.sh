@@ -8,7 +8,7 @@
 #   long_gate.sh pos DOC                   (CPU) reference route pieces -> pos-DOC.npz
 set -u
 MODE=$1; DOC=$2; : "${BIN:?}" "${PARTS:?}" "${DIR:?}" "${GATE:?}"
-S=$DIR/sum.txt; TO=${TO:-140}; BUDGET=${BUDGET:-95}
+S=$DIR/sum.txt; TO=${TO:-140}; BUDGET=${BUDGET:-115}
 cd "$DIR" || exit 1
 tail_err() { grep -a -E 'error|what\(\)|terminate|exception' "$1" | head -3 | cut -c1-240 >> $S; }
 case $MODE in

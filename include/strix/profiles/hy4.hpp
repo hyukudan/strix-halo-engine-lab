@@ -64,6 +64,12 @@ inline constexpr Qualified qualified[] = {
     {"prompt_rows", "2048", Device::gfx1151, Topology::one_node, 4096,
      "gate v2 (route replay, one-ulp null): 1,000 held-out rows over en/zh/es/py/rs, KL 0.00189, top-1 0.982, "
      "dNLL -0.00174 +- 0.00304; long4k KL 0.00082"},
+    // Long prompts: BASE reference by verify rows R=8 (bitwise step()) carried across tickets by state images, arms with the
+    // reference routes replayed, a one-ulp null per cut from the reference image at N-1024 (hy4_fast2, build 8ecdaeabfcab).
+    {"prompt_rows", "2048", Device::gfx1151, Topology::one_node, 32568,
+     "gate v2 (route replay, one-ulp null): 2,000 held-out rows after prompts of 2,048..32,568 tokens, code 6 windows "
+     "(py) + prose 4 windows (licence texts), KL 0.00106, top-1 0.993, dNLL -0.00065 +- 0.00130, all windows PASS or "
+     "UNRESOLVED (prose-4096 dNLL), every class final"},
     // The head copy changes only the decode head's weights (no prompt dependence: no bound); the layer split changes no
     // bit, so the pair's head stage computes the same logits as one node.
     {"head_q8", "1", Device::gfx1151, Topology::one_node, kNoPromptBound,
