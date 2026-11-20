@@ -114,7 +114,7 @@ struct Publication {
 // How a commit copies overlay rows into the caches: `ordered` = one block per producer walking the rows in position
 // order; `grid` = one block per (row, producer). Both leave the same bytes and tags (tests/gemma4_gpu/publish_grid.hip).
 enum class PublishOrder : std::uint8_t { ordered, grid };
-[[nodiscard]] PublishOrder publish_order(); // default grid; STRIX_G4_KV_PUBLISH_GRID=0 selects ordered
+[[nodiscard]] PublishOrder publish_order(); // default ordered; STRIX_G4_KV_PUBLISH_GRID=1 selects grid
 // `descriptors` is device memory; launches on `queue` (nullptr = null stream) without synchronizing.
 void launch_publication(const Publication* descriptors, unsigned producers, std::uint64_t start, unsigned rows,
                         PublishOrder order, void* queue);
