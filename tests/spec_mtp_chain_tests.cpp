@@ -3,6 +3,7 @@
 // chain steps, accept() after a partial verify) without any GPU, and that the device-fed chain (engine feed hooks) issues the
 // same calls and proposes the same ids as the host-fed chain with at most one synchronizing read per draft.
 #include "strix/spec/mtp_chain.hpp"
+#include "strix/qwen35/hip_engine.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -119,6 +120,10 @@ struct FakePreEngine : FakeFedEngine {
     }
 };
 static_assert(sp::MtpPrelaunchEngine<FakePreEngine> && !sp::MtpPrelaunchEngine<FakeFedEngine>, "pre-launch hook detection");
+// The HIP Qwen 3.5 engine binds the device feed (declarations only: checkable without a HIP toolchain); its chain then reads
+// the ids once per draft (the FakeFedEngine read counts below are the contract it implements). No pre-launch hooks yet.
+static_assert(sp::MtpFeedEngine<strix::qwen35::HipEngine> && !sp::MtpPrelaunchEngine<strix::qwen35::HipEngine>,
+              "HIP engine device-feed hooks");
 
 // Pre-launch bookkeeping of one scenario run: launches, drafts whose launched ids differ from the returned ones, falls back.
 struct PreLog {

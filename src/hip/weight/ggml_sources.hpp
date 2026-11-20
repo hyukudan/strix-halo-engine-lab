@@ -28,14 +28,28 @@ template<> struct OperandSource<Q8_0Tag,F16TileTag,Gfx1151,DenseQ8A8F16V1> {
         const auto* p=v.blocks+static_cast<std::size_t>(c.row)*v.row_stride_bytes+c.k_bytes+(c.unit/2U)*34U;
         stage<Core::form>(p,fragment);
     }
+    // stage() in two steps for the tall core's split schedule (f16_dense_tall.hpp ColsStageSplit): stage_load issues the
+    // 68-byte loads of two Q8_0 blocks, stage_decode is the decode on those words. stage() is their composition (same
+    // bits). Named vector members, not an array, so the words stay in registers while the core's WMMAs run.
+    struct StageRaw {
+        U4 q0, q1, q2, q3;
+        std::uint32_t q4;
+    };
+    __device__ __forceinline__ static StageRaw stage_load(const std::uint8_t* p) {
+        return {*(gfx1151::GlobalBytes16*)(p), *(gfx1151::GlobalBytes16*)(p + 16U), *(gfx1151::GlobalBytes16*)(p + 32U),
+                *(gfx1151::GlobalBytes16*)(p + 48U), *(gfx1151::GlobalBytes4*)(p + 64U)};
+    }
     template<unsigned Form> __device__ __forceinline__ static void stage(const std::uint8_t* p,U4* nb) {
+        stage_decode<Form>(stage_load(p), nb);
+    }
+    template<unsigned Form> __device__ __forceinline__ static void stage_decode(const StageRaw& r,U4* nb) {
         std::uint32_t d[17];
 #pragma unroll
         for (unsigned i = 0; i < 4U; ++i) {
-            const U4 t = *(gfx1151::GlobalBytes16*)(p + 16U * i);
+            const U4 t = i == 0U ? r.q0 : i == 1U ? r.q1 : i == 2U ? r.q2 : r.q3;
             d[4U * i] = t[0], d[4U * i + 1U] = t[1], d[4U * i + 2U] = t[2], d[4U * i + 3U] = t[3];
         }
-        d[16] = *(gfx1151::GlobalBytes4*)(p + 64U);
+        d[16] = r.q4;
         if constexpr ((Form & 1U) != 0U) {
             std::uint32_t x[17];
 #pragma unroll
@@ -75,15 +89,27 @@ template<> struct OperandSource<Q8_0Tag,F16TileTag,Gfx1151,DenseQ8A8F16V1> {
             }
         }
     }
-    __device__ __forceinline__ static Fragment activation_fragment(const std::int8_t* codes,const float* deltas,
-                                                                   unsigned stride,unsigned row,unsigned unit) {
+    // A fragment in two steps for the core's A schedule (f16_dense_tall.hpp ColsFragmentSplit): activation_load issues
+    // the 16 code bytes and the block delta, activation_half decodes them. activation_fragment is their composition.
+    struct ActivationRaw {
+        U4 codes;
+        float delta;
+    };
+    __device__ __forceinline__ static ActivationRaw activation_load(const std::int8_t* codes,const float* deltas,
+                                                                    unsigned stride,unsigned row,unsigned unit) {
         const std::size_t at = static_cast<std::size_t>(row) * stride + 16U * unit;
-        const float delta = deltas[static_cast<std::size_t>(row) * (stride / 32U) + unit / 2U];
-        const U4 t = *(gfx1151::GlobalBytes16*)(reinterpret_cast<const std::uint8_t*>(codes) + at);
+        return {*(gfx1151::GlobalBytes16*)(reinterpret_cast<const std::uint8_t*>(codes) + at),
+                deltas[static_cast<std::size_t>(row) * (stride / 32U) + unit / 2U]};
+    }
+    __device__ __forceinline__ static Fragment activation_half(const ActivationRaw& r) {
         Fragment h;
 #pragma unroll
-        for (unsigned i = 0; i < 16U; ++i) h[i] = gfx1151::a16_value(t[i / 4U], i % 4U, delta);
+        for (unsigned i = 0; i < 16U; ++i) h[i] = gfx1151::a16_value(r.codes[i / 4U], i % 4U, r.delta);
         return h;
+    }
+    __device__ __forceinline__ static Fragment activation_fragment(const std::int8_t* codes,const float* deltas,
+                                                                   unsigned stride,unsigned row,unsigned unit) {
+        return activation_half(activation_load(codes, deltas, stride, row, unit));
     }
 };
 template <unsigned Outs> struct Q8Fetch {

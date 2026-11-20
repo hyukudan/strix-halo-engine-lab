@@ -22,7 +22,9 @@
 #include "ops/glu/glu_device.hpp"
 #include "ops/norm/norm_presets.hpp"
 #include "ops/rope/rope_device.hpp"
+#include "strix/a8_row_pitch.hpp"
 #include "strix/ds41_moe.hpp"
+#include "strix/engram/read_ahead.hpp"
 #include "strix/engram/row_reader.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/hc/hc_contract.hpp"
@@ -193,6 +195,8 @@ struct Forward::Impl {
     std::map<std::string, Tensor> w;
     std::map<std::uint32_t, float*> engram_w1;  // [copy scale 4 x hidden | pre gamma hidden] per Engram layer
     bool store_epilogue = true;  // STRIX_HY4_Q8_STORE_EPILOGUE
+    bool pf_store_epilogue = true;  // STRIX_HY4_PF_STORE_EPILOGUE: prompt windows' bf16 epilogues in the producer's store (EXACT)
+    bool q_image = false;           // pf_store_epilogue: K_b stores the bf16 query operand image in the GEMM (allocate_prompt)
     // Pinned host staging of the decode step (host-to-device copies never wait for the stream; each slot is written once
     // per step and the step ends with a stream sync, so no slot is rewritten while its copy is pending).
     struct Staging {
@@ -258,11 +262,19 @@ struct Forward::Impl {
         std::uint8_t* csr = nullptr;
         float *ik = nullptr, *pooled = nullptr, *iq = nullptr, *hwraw = nullptr;
         std::uint32_t *skeys = nullptr, *hist0 = nullptr, *ilist = nullptr, *list_n = nullptr, *iota4 = nullptr;
+        std::uint32_t* qtail = nullptr;  // q_image: [k] = row of query row k's rope tail in pr.qt read as rope-wide rows
         std::uint8_t *erows = nullptr, *gate_off = nullptr;
         float *e = nullptr, *kvout = nullptr;
     } pr;
     std::vector<const std::uint8_t*> kb_pad;
-    std::vector<std::uint8_t> engram_host;
+    // Prompt-window Engram read-ahead (engram_submit): tickets per Engram ordinal of the window starting at the key.
+    struct EngramWindow {
+        std::uint32_t rows = 0;
+        std::vector<std::uint64_t> tickets;
+    };
+    static constexpr std::uint64_t kNoEngramTicket = ~std::uint64_t{0};
+    std::map<std::uint32_t, EngramWindow> engram_windows;
+    std::unique_ptr<strix::engram::ReadAhead> engram_ahead;  // after engram_reader: destroyed (joined) before it
     std::vector<std::uint32_t> status_host;
 
     template <class T> T* alloc(std::size_t count) {
@@ -368,6 +380,7 @@ struct Forward::Impl {
         engram_stage = static_cast<std::uint8_t*>(es);
         dstatus_all = alloc<std::uint32_t>(8U * c.layers);
         store_epilogue = strix::envcfg::flag("STRIX_HY4_Q8_STORE_EPILOGUE", true);
+        pf_store_epilogue = strix::envcfg::flag("STRIX_HY4_PF_STORE_EPILOGUE", true);
         const std::uint32_t launch_rows = rows::cache_rows(rmax, vr.max);  // rows a launch / verify pass may write (ring sizes)
         std::vector<std::uint32_t> seq(context + 1U);
         std::iota(seq.begin(), seq.end(), 0U);
@@ -427,10 +440,23 @@ struct Forward::Impl {
         pr.u = alloc<float>(R * h); pr.xn = alloc<float>(R * h); pr.f = alloc<float>(R * h);
         pr.partial = alloc<float>(std::max(hcc::mix_partial_floats<kSub>(rmax, c.hidden), hcc::mix_partial_floats<kHead>(1, c.hidden)));
         pr.mix = alloc<hcc::MixRow<kSub>>(R);
-        pr.codes = alloc<std::int8_t>(R * wide); pr.deltas = alloc<float>(R * wide / 32U); pr.sums = alloc<std::int32_t>(R * wide / 32U);
+        const std::size_t a8w = wide + strix::kA8PitchPadBytes;  // any strix::a8_row_pitch(x_stride <= wide) fits
+        pr.codes = alloc<std::int8_t>(R * a8w); pr.deltas = alloc<float>(R * a8w / 32U); pr.sums = alloc<std::int32_t>(R * a8w / 32U);
         pr.gate = alloc<float>(R * H * c.v_head); pr.qa = alloc<float>(R * c.q_lora); pr.qv = alloc<float>(R * H * c.qk_head());
         pr.ckv = alloc<float>(R * row); pr.ckn = alloc<float>(R * c.kv_lora);
-        pr.qfull = alloc<float>(R * H * row); pr.qt = alloc<std::uint16_t>(R * H * row);
+        // pf_store_epilogue: K_b stores the query operand image in its GEMM (no FP32 qfull); the rope tail of query row k
+        // is row subrow(k) of pr.qt read as rope-wide rows (cache_rows contract), written by the shared row writer.
+        namespace acr = strix::attn::cache_rows;
+        q_image = pf_store_epilogue && acr::subrow_ok(c.kv_lora + c.qk_rope, c.qk_rope, c.kv_lora);
+        if (!q_image) pr.qfull = alloc<float>(R * H * row);
+        pr.qt = alloc<std::uint16_t>(R * H * row);
+        if (q_image) {
+            std::vector<std::uint32_t> tail(R * H);
+            for (std::size_t k = 0; k < tail.size(); ++k)
+                tail[k] = acr::subrow(static_cast<std::uint32_t>(k), c.kv_lora + c.qk_rope, c.qk_rope, c.kv_lora);
+            pr.qtail = alloc<std::uint32_t>(tail.size());
+            check(hipMemcpy(pr.qtail, tail.data(), tail.size() * 4U, hipMemcpyHostToDevice), "query tail rows upload");
+        }
         pr.olat = alloc<float>(R * H * c.kv_lora); pr.o = alloc<float>(R * H * c.v_head);
         const std::size_t ff = std::max<std::size_t>(c.dense_ff, c.shared_ff);
         pr.g = alloc<float>(R * ff); pr.up = alloc<float>(R * ff); pr.act = alloc<float>(R * ff);
@@ -739,24 +765,35 @@ struct Forward::Impl {
     // per head (grid z) at x + z * batch_in, weights + z * batch_weight_bytes, y + z * batch_out.
     void q8a8_rows(const std::uint8_t* weights, std::uint32_t width, std::uint32_t outputs, std::uint32_t R, const float* x,
                    std::uint32_t x_stride, float* y, std::uint32_t y_stride, std::uint32_t batch = 1U, std::uint32_t batch_in = 0U,
-                   std::uint32_t batch_out = 0U) {
+                   std::uint32_t batch_out = 0U, bool round = false, const float* bias = nullptr, std::uint16_t* image = nullptr) {
         namespace q8 = strix::core::f16_dense_tall::q8a8;
-        strix::ds41::enqueue_quantize_a8(x, x_stride, R, pr.codes, pr.deltas, pr.sums, s);
+        // A8 rows at the shared operand pitch: a pitch that is a multiple of 8 KiB (K_b 16384, V_b 32768, o_proj 16384)
+        // aliases the 128 rows a CTA stage reads (strix/a8_row_pitch.hpp); same values, same bits.
+        const std::uint32_t pitch = strix::a8_row_pitch(x_stride);
+        strix::ds41::enqueue_quantize_a8(x, x_stride, R, pitch, pr.codes, pr.deltas, pr.sums, s);
         q8::View v{};
         v.weight = weights;
         v.codes = pr.codes;
         v.deltas = pr.deltas;
-        v.out = y;
+        v.out = y != nullptr ? y : reinterpret_cast<float*>(image);  // the image form never writes out (supported() wants one)
         v.row_bytes = static_cast<std::uint32_t>(row_bytes(8U, width));
         v.in = width;
         v.count = outputs;
         v.rows = R;
-        v.x_stride = x_stride;
+        v.x_stride = pitch;
         v.out_stride = y_stride;
         v.batch = batch;
         v.batch_in = batch_in;
         v.batch_out = batch_out;
         v.batch_weight_bytes = std::uint64_t{outputs} * v.row_bytes;
+        v.round_bf16 = round ? 1U : 0U;  // the Linear's bf16 epilogue (+ bias) in the GEMM's store: y = R(sum + bias)
+        v.bias = round ? bias : nullptr;
+        if (image != nullptr) {  // the bf16 cache-row image of the outputs (y unused): store_rows' bits and flag rule
+            if (!q8::supported_image(v, image)) throw std::runtime_error("hy4 hip forward: A8 rows image GEMM refuses width " + std::to_string(width));
+            q8::enqueue_image<strix::attn_core::cache_rows::ImageEpilogue>(v, image, flag, s);
+            check(hipGetLastError(), "q8a8 rows image launch");
+            return;
+        }
         if (!q8::supported(v)) throw std::runtime_error("hy4 hip forward: A8 rows GEMM refuses width " + std::to_string(width));
         q8::enqueue(v, s);
         check(hipGetLastError(), "q8a8 rows launch");
@@ -768,7 +805,13 @@ struct Forward::Impl {
         if (tw.dims.at(0) != width || tw.bytes != row_bytes(tw.type, width) * outputs)
             throw std::runtime_error("hy4 hip forward: shape of " + name);
         if (tw.type == 8U) {
-            q8a8_rows(tw.p, width, outputs, R, x, width, y, outputs);
+            // pf_store_epilogue: the epilogue below runs in the GEMM's store instead (same function, same FP32 sum: same bits)
+            const bool fused = round && pf_store_epilogue;
+            q8a8_rows(tw.p, width, outputs, R, x, width, y, outputs, 1U, 0U, 0U, fused, bias);
+            if (fused) {
+                check(hipGetLastError(), "linear rows epilogue launch");
+                return;
+            }
         } else {
             HipDenseRowsView v;
             v.x = x;
@@ -785,29 +828,74 @@ struct Forward::Impl {
         check(hipGetLastError(), "linear rows epilogue launch");
     }
 
-    void engram_rows_stage(std::uint32_t l, std::uint32_t ordinal, std::uint32_t p0, std::uint32_t R) {
+    // Engram row requests of window [p0, p0 + R) for one Engram ordinal; tok(q) is the token at position q.
+    template <class Tok> std::vector<strix::engram::RowRequest> engram_window_requests(std::uint32_t ordinal, std::uint32_t p0, std::uint32_t R,
+                                                                                    Tok&& tok) const {
         const std::uint32_t heads = c.engram_heads();
         std::vector<strix::engram::RowRequest> req;
         req.reserve(std::size_t{R} * heads);
-        std::vector<std::uint8_t> off(R, 0U);
-        bool any_off = false;
         std::vector<std::uint32_t> window(c.ngram);
         for (std::uint32_t r = 0; r < R; ++r) {
             const auto q = p0 + r;
-            if (tokens[q] == c.pad_token) { off[r] = 1U; any_off = true; }  // masked position: no Engram output
-            for (std::uint32_t k = 0; k < c.ngram; ++k) window[k] = q >= k ? tokens[q - k] : c.pad_token;
+            for (std::uint32_t k = 0; k < c.ngram; ++k) window[k] = q >= k ? tok(q - k) : c.pad_token;
             const auto rows = strix::hy4::engram_rows(c, ordinal, window);
             if (rows.size() != heads) throw std::runtime_error("hy4 hip forward: Engram rows per position");
             for (const auto x : rows) req.push_back({0U, x});
         }
-        engram_host.resize(req.size() * c.engram_dim);
-        engram_reader->read(req, engram_host);
-        check(hipMemcpyAsync(pr.erows, engram_host.data(), engram_host.size(), hipMemcpyHostToDevice, s), "engram rows upload");
+        return req;
+    }
+
+    // Read-ahead of a prompt window's Engram rows (the ids are known before the layers run): one block per Engram layer
+    // of this stage, in layer order, on the shared engram::ReadAhead worker. The bytes are RowReader::read's for the
+    // same requests (the incumbent synchronous read at the layer), so no bit changes; the read overlaps the GPU's
+    // layers instead of running after the MoE status sync of the layer before. A window already queued is kept.
+    template <class Tok> void engram_submit(std::uint32_t p0, std::uint32_t R, Tok&& tok) {
+        if (!engram_reader || engram_windows.count(p0) != 0U) return;
+        if (!engram_ahead) engram_ahead = std::make_unique<strix::engram::ReadAhead>(*engram_reader);
+        EngramWindow queued{R, std::vector<std::uint64_t>(c.engram_layers.size(), kNoEngramTicket)};
+        bool here = false;
+        for (std::uint32_t ord = 0; ord < c.engram_layers.size(); ++ord)
+            if (c.engram_layers[ord] >= first && c.engram_layers[ord] < last) {
+                queued.tickets[ord] = engram_ahead->submit(engram_window_requests(ord, p0, R, tok));
+                here = true;
+            }
+        if (here) engram_windows.emplace(p0, std::move(queued));
+    }
+
+    // Frees a window's read-ahead buffers (after the window sync: the uploads have consumed them).
+    void engram_release(std::uint32_t p0) noexcept {
+        const auto it = engram_windows.find(p0);
+        if (it == engram_windows.end()) return;
+        try {
+            for (const auto ticket : it->second.tickets)
+                if (ticket != kNoEngramTicket) engram_ahead->release(ticket);
+        } catch (...) {  // release only waits on the worker; nothing to recover
+        }
+        engram_windows.erase(it);
+    }
+    void engram_release_all() noexcept {
+        while (!engram_windows.empty()) engram_release(engram_windows.begin()->first);
+    }
+
+    void engram_rows_stage(std::uint32_t l, std::uint32_t ordinal, std::uint32_t p0, std::uint32_t R) {
+        const std::uint32_t heads = c.engram_heads();
+        std::vector<std::uint8_t> off(R, 0U);
+        bool any_off = false;
+        for (std::uint32_t r = 0; r < R; ++r)
+            if (tokens[p0 + r] == c.pad_token) { off[r] = 1U; any_off = true; }  // masked position: no Engram output
+        const auto win = engram_windows.find(p0);
+        if (win == engram_windows.end() || win->second.rows != R || win->second.tickets.at(ordinal) == kNoEngramTicket)
+            throw std::logic_error("hy4 hip forward: Engram rows of the window were not queued");
+        const auto host = engram_ahead->wait(win->second.tickets[ordinal]);
+        const std::size_t row_count = std::size_t{R} * heads;
+        if (host.size() != row_count * c.engram_dim) throw std::logic_error("hy4 hip forward: Engram read-ahead block size");
+        // the block stays allocated until engram_release after the window sync
+        check(hipMemcpyAsync(pr.erows, host.data(), host.size(), hipMemcpyHostToDevice, s), "engram rows upload");
         strix::engram::RowPrepView pv;
         pv.form = strix::engram::RowPrepForm::head_rms_bf16;
         pv.fmt = strix::engram::RowFormat{96U, strix::engram::RowScale::none};
         pv.rows = pr.erows;
-        pv.row_count = req.size();
+        pv.row_count = row_count;
         pv.out = pr.e;
         pv.norm_weight = t(blk(l, "engram_lookup_norm.weight")).f();
         pv.heads = heads;
@@ -896,10 +984,18 @@ struct Forward::Impl {
         check(dcr::store_rows({pr.ckv, row, pp, 0U, R, latent_rows[l], latent[l], flag}, s), "latent rows store");
         if (idx) index_keys_rows(l, p0, R);
         // absorbed query per head: K_b image (256 wide; the rope tail meets zero weights) x the q head row, batched over heads
-        q8a8_rows(kb_pad[l], kKbPadInput, kl, R, pr.qv, H * qk, pr.qfull, H * row, H, qk, row);
-        check(hipMemcpy2DAsync(pr.qfull + kl, row * 4U, pr.qv + c.qk_nope, qk * 4U, rope * 4U, std::size_t{R} * H, hipMemcpyDeviceToDevice, s),
-              "q rope rows copy");
-        check(dcr::store_rows({pr.qfull, row, nullptr, 0U, R * H, {row, 0U}, pr.qt, flag}, s), "query operand rows image");
+        if (q_image) {
+            // pf_store_epilogue: the GEMM stores encode(sum) into pr.qt's first kl columns with the writer's flag rule
+            // (dcr::ImageEpilogue) and the roped tail (already bf16 values in qv) goes through the same writer as rope-wide
+            // rows at positions subrow(k): every element of pr.qt once, the bits of the FP32 qfull + store_rows path.
+            q8a8_rows(kb_pad[l], kKbPadInput, kl, R, pr.qv, H * qk, nullptr, H * row, H, qk, row, false, nullptr, pr.qt);
+            check(dcr::store_rows({pr.qv + c.qk_nope, qk, pr.qtail, 0U, R * H, {rope, 0U}, pr.qt, flag}, s), "query tail rows image");
+        } else {
+            q8a8_rows(kb_pad[l], kKbPadInput, kl, R, pr.qv, H * qk, pr.qfull, H * row, H, qk, row);
+            check(hipMemcpy2DAsync(pr.qfull + kl, row * 4U, pr.qv + c.qk_nope, qk * 4U, rope * 4U, std::size_t{R} * H, hipMemcpyDeviceToDevice, s),
+                  "q rope rows copy");
+            check(dcr::store_rows({pr.qfull, row, nullptr, 0U, R * H, {row, 0U}, pr.qt, flag}, s), "query operand rows image");
+        }
         const float* sinks = t(blk(l, "attn_sinks.weight")).f();
         if (idx) {
             const std::uint32_t nd = index_dense_rows(p0, R);
@@ -920,9 +1016,11 @@ struct Forward::Impl {
         check(hipGetLastError(), "flash rows launch");
         const auto& vb = t(blk(l, "attn_v_b.weight"));
         if (vb.type != 8U || vb.bytes != row_bytes(8U, kl) * vd * H) throw std::runtime_error("hy4 hip forward: attn_v_b is not Q8_0");
-        q8a8_rows(vb.p, kl, vd, R, pr.olat, H * kl, pr.o, H * vd, H, kl, vd);
+        // pf_store_epilogue: each head's product rounds its vd columns in the GEMM's store (batched form, no bias); the H
+        // products cover the R x H*vd rows once, so this is the separate pass's function on the same FP32 sums: same bits.
+        q8a8_rows(vb.p, kl, vd, R, pr.olat, H * kl, pr.o, H * vd, H, kl, vd, pf_store_epilogue);
         const std::size_t n = std::size_t{R} * H * vd;
-        glu::launch_epilogue<glu::Round::bf16>(pr.o, nullptr, n, n, pr.o, s);
+        if (!pf_store_epilogue) glu::launch_epilogue<glu::Round::bf16>(pr.o, nullptr, n, n, pr.o, s);
         glu::launch_sigmoid_gate<glu::DeclaredExp, glu::Round::bf16>(pr.o, pr.gate, n, pr.o, s);
         linear_rows(blk(l, "attn_output.weight"), pr.o, H * vd, c.hidden, R, pr.f);
         norm_rows(pr.f, t(blk(l, "post_attention_norm.weight")).f(), c.hidden, R, pr.f);
@@ -958,6 +1056,7 @@ struct Forward::Impl {
         v.down_deltas = {pr.ddeltas, K * I / 32U * 4U};
         v.down_sums = {pr.dsums, K * I / 32U * 4U};
         v.rawdots = {pr.rawdots, K * L * 4U};
+        v.rawdots_bf16 = pf_store_epilogue;  // each expert's Linear output rounded in the down kernel's store (ffn_rows skips its pass)
         const auto lay = strix::q51_known_rows::scratch_layout(R, c.experts, c.top_k, true);
         const auto ptr = [&](std::uint64_t at) { return reinterpret_cast<unsigned*>(pr.csr + at); };
         v.csr = {ptr(lay.header), ptr(lay.offsets), ptr(lay.touched), ptr(lay.rows), ptr(lay.slots), ptr(lay.batch_experts), ptr(lay.batch_begins)};
@@ -987,7 +1086,8 @@ struct Forward::Impl {
             linear_rows(blk(l, "ffn_routed_down.weight"), pr.xn, h, c.latent, R, pr.z);
             check(dcr::store_rows({pr.z, L, nullptr, 0U, R, {c.latent, 0U}, pr.zb, flag}, s), "expert input rows (bf16)");
             experts_rows(l, R);
-            glu::launch_epilogue<glu::Round::bf16>(pr.rawdots, nullptr, L, R * K * L, pr.rawdots, s);  // each expert's Linear output
+            if (!pf_store_epilogue)  // else the down kernel stored the rounded dots (rawdots_bf16)
+                glu::launch_epilogue<glu::Round::bf16>(pr.rawdots, nullptr, L, R * K * L, pr.rawdots, s);  // each expert's Linear output
             strix::moe_core::enqueue_combine<strix::moe::CombineForm::bf16_steps, 16U, 1536U>(pr.rw, pr.rawdots, nullptr, pr.acc, R, s);
             linear_rows(blk(l, "ffn_routed_up.weight"), pr.acc, c.latent, h, R, pr.routed);
             linear_rows(blk(l, "ffn_gate_shexp.weight"), pr.xn, h, c.shared_ff, R, pr.g);
@@ -1015,6 +1115,12 @@ struct Forward::Impl {
 
     // One window [p0, p0 + R) whose tokens are already in `tokens`; head = the last row's logits.
     void prefill_window(std::uint32_t p0, std::uint32_t R, bool head) {
+        engram_submit(p0, R, [this](std::uint32_t q) { return tokens[q]; });  // no-op when prefill() queued it ahead
+        struct EngramRelease {  // after the window sync below (or on a throw): the uploads have consumed the rows
+            Impl& m;
+            std::uint32_t at;
+            ~EngramRelease() { m.engram_release(at); }
+        } engram_release_guard{*this, p0};
         auto mark = std::chrono::steady_clock::now();
         const std::size_t n = 4U * std::size_t{c.hidden};
         if (first == 0U) {
@@ -1068,12 +1174,30 @@ struct Forward::Impl {
         for (std::uint32_t k = 0; k < plan.lead; ++k) out = &step(prompt[i++], state);
         const auto start = std::chrono::steady_clock::now();
         StepTimes sum{};
+        struct EngramReleaseAll {  // a failed window leaves no queued rows behind (the next prompt may reuse a position)
+            Impl& m;
+            ~EngramReleaseAll() { m.engram_release_all(); }
+        } engram_release_guard{*this};
         for (std::size_t wi = 0; wi < plan.windows.size(); ++wi) {
             const auto win = plan.windows[wi];
             if (win.p0 != pos) throw std::logic_error("hy4 hip forward: prompt plan position");
             for (std::uint32_t r = 0; r < win.rows; ++r) {
                 if (prompt[i] >= c.vocab) throw std::invalid_argument("hy4 hip forward: token outside the vocabulary");
                 tokens.push_back(prompt[i++]);
+            }
+            if (tokens.size() != std::size_t{win.p0} + win.rows) throw std::logic_error("hy4 hip forward: prompt history position");
+            // Engram read-ahead: this window's rows first, then the next window's (its ids are in the prompt), so the
+            // next window's reads run while this window computes.
+            engram_submit(win.p0, win.rows, [this](std::uint32_t q) { return tokens[q]; });
+            if (wi + 1U < plan.windows.size()) {
+                const auto nx = plan.windows[wi + 1U];
+                const std::size_t have = tokens.size();
+                bool ids_ok = nx.p0 == win.p0 + win.rows && i + nx.rows <= prompt.size();
+                for (std::uint32_t r = 0; ids_ok && r < nx.rows; ++r) ids_ok = prompt[i + r] < c.vocab;
+                if (ids_ok)  // else the window's own checks throw when it is reached
+                    engram_submit(nx.p0, nx.rows, [this, &prompt, have, i](std::uint32_t q) {
+                        return q < have ? tokens[q] : prompt[i + (q - have)];
+                    });
             }
             times = {};
             const bool head = wi + 1U == plan.windows.size() && plan.tail == 0U;

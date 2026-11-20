@@ -192,7 +192,7 @@ model-kernel src/moe_core/hip_ds41_prefill_grouped.inc 4
 model-kernel src/moe_core/hip_ds41_prefill_variants.inc 5
 model-kernel src/moe_core/qwen_grouped_tiles.inc 2
 model-kernel src/qwen35/cuda/engine.cu 10
-model-kernel src/qwen35/hip/engine.hip 9
+model-kernel src/qwen35/hip/engine.hip 10
 raw-getenv include/strix/cohort_step_plan.hpp 2
 raw-getenv include/strix/compact_stage_images.hpp 4
 raw-getenv include/strix/ctx_exact_memory.hpp 4
@@ -452,3 +452,4 @@ tu-include src/cuda/models/minimax/mm_fp32_identity_tests.cu 1
 tu-include src/glm/xfer/glm_xfer.hip 1
 tu-include src/hip_deepseek41_prefill_xport.hip 1
 tu-include src/minimax/xfer/minimax_xfer.hip 1
+tu-include src/xport/tp_gather.hip 1
