@@ -1,6 +1,7 @@
 // Tests of the CUDA GDN prefill core (src/cuda/models/qwen/qwen_gdn.cu) against literal host references of the HIP kernels
 // (src/hip_gdn_launcher.hip :2750 gates, :2807 conv, :2896 lanes, :3000 norm) and, when present, the HIP step dump.
-//   qwen_gdn_tests [--tables DIR] [--no-real] [--replay-only] [--bench ROWS] [--fixture DIR]
+//   qwen_gdn_tests [--tables DIR] [--no-real] [--replay-only] [--bench ROWS] [--bench-overlap ROWS]
+//                  [--bench-core-overlap ROWS] [--fixture DIR]
 // Host references follow the HIP lane structure literally (256-lane chains + LDS/shuffle trees, permlanex16/DPP key sums,
 // the G=4 lanes recurrence with DPP row_xmask). Transcendentals come from a device oracle running the same
 // amd_math.cuh emulation (verified separately by qwen_amd_math_tests), so these tests check the arithmetic structure.
@@ -18,6 +19,7 @@
 #include <vector>
 
 #include "strix/cuda/qwen_gdn.hpp"
+#include "strix/gdn_prefill_overlap.hpp"
 #include "strix/cuda/amd_math_tables.hpp"
 #include "qwen_fixture.hpp"
 #include "qwen_gguf_host.hpp"
@@ -517,6 +519,47 @@ static void test_core(const HostWeights& hw, const char* tag, u32 count) {
     }
 }
 
+// Two-stream overlap (launch_core_overlap, strix/gdn_prefill_overlap.hpp) against the serial call: every row output, the
+// state, the conv history and the A8 codes / deltas, bitwise. Non-zero state and history; counts with a short last segment.
+struct OverlapRun { CoreOut c; std::vector<std::int8_t> codes; std::vector<float> deltas; };
+static OverlapRun run_core_mode(const HostWeights& hw, u32 count, bool overlap, bool a8) {
+    const auto hidden = make_hidden(count, 91);
+    const auto qkv = make_bf16_values(static_cast<size_t>(count) * CW, 92, 2.0F, CW);
+    const auto z = make_bf16_values(static_cast<size_t>(count) * VW, 93, 3.0F, VW);
+    const auto state0 = make_bf16_values(g::kMatrixFloats, 94, 0.5F, 128);
+    DevWeights dw(hw); Workspace ws(count);
+    ws.put(0, CW, qkv); ws.put(kOffZ, VW, z);
+    u16* dh = dev_upload(hidden); u16* dhist = dev_upload(make_history(95)); float* ds = dev_upload(state0);
+    void* scratch = nullptr; CK(cudaMalloc(&scratch, g::core_scratch_bytes(count)));
+    const size_t ncodes = static_cast<size_t>(count) * VW, ndeltas = static_cast<size_t>((count + 255U) / 256U) * (VW / 32U) * 256U;
+    std::int8_t* dcodes = nullptr; float* ddeltas = nullptr;
+    CK(cudaMalloc(&dcodes, ncodes)); CK(cudaMemset(dcodes, 0, ncodes));
+    CK(cudaMalloc(&ddeltas, ndeltas * 4)); CK(cudaMemset(ddeltas, 0, ndeltas * 4));
+    const g::A8Out out{dcodes, ddeltas};
+    g::launch_core_overlap(dh, H, ws.rows(), count, dhist, ds, scratch, dw.w(), g_tables, nullptr, a8 ? &out : nullptr, g::Tuning{},
+        overlap);
+    CK(cudaDeviceSynchronize());
+    OverlapRun r{CoreOut{ws.get(0, CW), ws.get(kOffBeta, VH), ws.get(kOffGate, VH), ws.get(kOffCore, VW), dev_download(ds, g::kMatrixFloats),
+        dev_download(dhist, CW * 4)}, dev_download(dcodes, ncodes), dev_download(ddeltas, ndeltas)};
+    CK(cudaFree(dh)); CK(cudaFree(dhist)); CK(cudaFree(ds)); CK(cudaFree(scratch)); CK(cudaFree(dcodes)); CK(cudaFree(ddeltas));
+    return r;
+}
+template <class T> static bool bits_equal(const std::vector<T>& x, const std::vector<T>& y) {
+    return x.size() == y.size() && !std::memcmp(x.data(), y.data(), x.size() * sizeof(T));
+}
+static bool test_core_overlap(const HostWeights& hw, u32 count, bool a8) {
+    const auto serial = run_core_mode(hw, count, false, a8);
+    const auto ovl = run_core_mode(hw, count, true, a8);
+    const bool bits = bits_equal(serial.c.core, ovl.c.core) && bits_equal(serial.c.state, ovl.c.state) &&
+        bits_equal(serial.c.hist, ovl.c.hist) && bits_equal(serial.c.qkv, ovl.c.qkv) && bits_equal(serial.c.beta, ovl.c.beta) &&
+        bits_equal(serial.c.gate, ovl.c.gate) && bits_equal(serial.codes, ovl.codes) && bits_equal(serial.deltas, ovl.deltas);
+    const auto p = strix::gdn_overlap::plan(count, true);
+    std::printf("%s core overlap T=%u%s segments %u x %u rows == serial\n", bits ? "ok  " : "FAIL", count, a8 ? " A8" : "", p.n,
+        p.segment);
+    ++(bits ? g_pass : g_fail);
+    return bits;
+}
+
 // ------------------------------------------------------------------------------------------------ fixture replay
 // Dense A8 projection (H1.1 of notes/qwen-prefill-map-a8.md): per 32-feature block quantize (dense_a8_quantize8), then per
 // (row, out) acc = fma(dw * delta, (float)dot, acc) over blocks ascending, canonical NaN. Test-only, simple kernels.
@@ -725,9 +768,44 @@ static void bench_overlap(u32 count) {
     cudaStreamDestroy(s1); cudaStreamDestroy(s2);
 }
 
+// The production schedule: launch_core_overlap serial vs two-stream on one call of `count` rows (synthetic weights), after
+// the bitwise check of both forms (with and without A8). Medians of 5 after a warm-up.
+static void bench_core_overlap(u32 count) {
+    const auto hw = synthetic_weights(5);
+    const bool bits = test_core_overlap(hw, count, false) && test_core_overlap(hw, count, true);
+    DevWeights dw(hw); Workspace ws(count);
+    ws.put(0, CW, make_bf16_values(static_cast<size_t>(count) * CW, 81, 2.0F, CW));
+    ws.put(kOffZ, VW, make_bf16_values(static_cast<size_t>(count) * VW, 82, 3.0F, VW));
+    u16* dh = dev_upload(make_hidden(count, 83)); u16* dhist = nullptr; float* ds = nullptr; void* scratch = nullptr;
+    CK(cudaMalloc(&dhist, CW * 8)); CK(cudaMalloc(&ds, g::kMatrixFloats * 4));
+    CK(cudaMalloc(&scratch, g::core_scratch_bytes(count)));
+    cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+    auto run = [&](bool overlap) {
+        CK(cudaMemset(dhist, 0, CW * 8)); CK(cudaMemset(ds, 0, g::kMatrixFloats * 4));
+        CK(cudaEventRecord(e0));
+        g::launch_core_overlap(dh, H, ws.rows(), count, dhist, ds, scratch, dw.w(), g_tables, nullptr, nullptr, g::Tuning{}, overlap);
+        CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1));
+        float ms = 0.0F; CK(cudaEventElapsedTime(&ms, e0, e1));
+        return ms;
+    };
+    (void)run(false); (void)run(true);
+    float t[2][5];
+    for (int rep = 0; rep < 5; ++rep) { t[0][rep] = run(false); t[1][rep] = run(true); }
+    auto med = [](const float* v) { std::vector<float> x(v, v + 5); std::sort(x.begin(), x.end()); return x[2]; };
+    const float ser = med(t[0]), ovl = med(t[1]);
+    const auto p = strix::gdn_overlap::plan(count, true);
+    std::printf("core-overlap T=%u segments %u x %u: serial %.3f ms overlap %.3f ms saved %.3f ms (%.1f %%) bits %s\n", count, p.n,
+        p.segment, ser, ovl, ser - ovl, 100.0 * (ser - ovl) / ser, bits ? "EQUAL" : "DIFFERENT");
+    for (int m = 0; m < 2; ++m)
+        std::printf("core-overlap T=%u %s reps %.3f %.3f %.3f %.3f %.3f\n", count, m ? "overlap" : "serial", t[m][0], t[m][1], t[m][2],
+            t[m][3], t[m][4]);
+    CK(cudaFree(dh)); CK(cudaFree(dhist)); CK(cudaFree(ds)); CK(cudaFree(scratch));
+    cudaEventDestroy(e0); cudaEventDestroy(e1);
+}
+
 int main(int argc, char** argv) {
     std::string tables = "qrtx-build\\tables", fixture = "qrtx-build\\fx";
-    bool real = true, replay_only = false; u32 bench_rows = 0, overlap_rows = 0;
+    bool real = true, replay_only = false; u32 bench_rows = 0, overlap_rows = 0, core_overlap_rows = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--tables" && i + 1 < argc) tables = argv[++i];
@@ -736,10 +814,16 @@ int main(int argc, char** argv) {
         else if (a == "--replay-only") replay_only = true;
         else if (a == "--bench" && i + 1 < argc) bench_rows = static_cast<u32>(std::atoi(argv[++i]));
         else if (a == "--bench-overlap" && i + 1 < argc) overlap_rows = static_cast<u32>(std::atoi(argv[++i]));
+        else if (a == "--bench-core-overlap" && i + 1 < argc) core_overlap_rows = static_cast<u32>(std::atoi(argv[++i]));
     }
     g_tables = am::load_tables(tables);
     if (bench_rows) { bench(bench_rows); am::free_tables(g_tables); return 0; }
     if (overlap_rows) { bench_overlap(overlap_rows); am::free_tables(g_tables); return 0; }
+    if (core_overlap_rows) {
+        bench_core_overlap(core_overlap_rows);
+        am::free_tables(g_tables);
+        return g_fail ? 1 : 0;
+    }
     if (replay_only) {
         strix::qwen_gguf::Model model;
         replay_fixture(model, fixture);
@@ -757,6 +841,9 @@ int main(int argc, char** argv) {
     test_norm(syn, 37, false);
     test_norm(syn, 300, true);
     test_core(syn, "synthetic", 150);
+    test_core_overlap(syn, 1024, false);
+    test_core_overlap(syn, 1500, true);
+    test_core_overlap(syn, 4173, true);
     if (real) {
         strix::qwen_gguf::Model model;
         const auto w0 = real_weights(model, 0);
