@@ -1373,6 +1373,13 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-host-free-memory-tests)
     add_test(NAME strix-host-free-memory-tests COMMAND strix-host-free-memory-tests)
     set_tests_properties(strix-host-free-memory-tests PROPERTIES LABELS "cpu" TIMEOUT 120)
+    # Shared host memory readings, floor admission, recovery wait and pressure governor (strix/host_memory.hpp).
+    add_executable(strix-host-memory-tests tests/host_memory_tests.cpp)
+    target_include_directories(strix-host-memory-tests PRIVATE include)
+    target_compile_features(strix-host-memory-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-host-memory-tests)
+    add_test(NAME strix-host-memory-tests COMMAND strix-host-memory-tests)
+    set_tests_properties(strix-host-memory-tests PROPERTIES LABELS "cpu" TIMEOUT 60)
     # Shared weight-load queue: overlapped reads, per-ticket staging inside a resident budget, one publication wait.
     add_executable(strix-weight-load-queue-tests tests/weight_load_queue_tests.cpp)
     target_include_directories(strix-weight-load-queue-tests PRIVATE src include)
