@@ -16,6 +16,7 @@
 #include <cstring>
 #include <fstream>
 #include <initializer_list>
+#include <optional>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -34,6 +35,8 @@
 #include "../../core/window_state_buffers.hpp"
 #include "../../core/a4_tiles.hpp"
 #include "../../core/iu4a4_dense.hpp"
+#include "../../core/layer_set.hpp"
+#include "../../core/null_perturb.hpp"
 #include "../../core/f16_dense_iu4.hpp"
 #include "../../core/f16_dense_q8a8.hpp"
 #include "../../ops/norm/norm_device.hpp"
@@ -406,6 +409,26 @@ bool a4w4_on() {
     }();
     return on;
 }
+// STRIX_DENSE_A4W4_LAYERS (with STRIX_DENSE_A4W4=1): the layers whose wide GEMMs take the A4W4 class (core/layer_set.hpp
+// grammar, absolute layer numbers; unset = every layer). The other layers keep no rotated copy and run the EXACT path.
+core::LayerSet a4w4_layers(unsigned layers) {
+    const char* v = strix::envcfg::text("STRIX_DENSE_A4W4_LAYERS");
+    return core::parse_layer_set(v == nullptr || *v == 0 ? "!" : v, 0U, layers, "STRIX_DENSE_A4W4_LAYERS");
+}
+// STRIX_DENSE_NULL=LAYER:POS:ELEM (gate v2 null control, test hook; core/null_perturb.hpp): one FP16 ulp on residual element
+// ELEM of the row at absolute position POS before layer LAYER's input norm (layer 0: the embedding row; later layers: the
+// residual the fused norm adds the previous MLP output to). Unset = no control (nullptr).
+const core::NullSite* dense_null_site(unsigned layers, unsigned width) {
+    static const std::optional<core::NullSite> site = [&]() -> std::optional<core::NullSite> {
+        const char* v = strix::envcfg::text("STRIX_DENSE_NULL");
+        if (v == nullptr || *v == 0) return std::nullopt;
+        const auto n = core::parse_null_site(v, layers, width, "STRIX_DENSE_NULL");
+        std::fprintf(stderr, "qwen35-hip: gate null control: one FP16 ulp at layer %u pos %llu elem %u (STRIX_DENSE_NULL)\n", n.layer,
+                     static_cast<unsigned long long>(n.pos), n.elem);
+        return n;
+    }();
+    return site ? &*site : nullptr;
+}
 bool a4_ok(const Tensor& t, const WideScratch& wide) { return t.a4 && wide.a4.codes; }
 // out = x W^T in the A4W4 class; quantise = false reuses the activation operand of the previous call (same x, same in).
 void a4_linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStream_t s, const WideScratch& wide, bool quantise = true) {
@@ -649,7 +672,9 @@ struct HipEngine::Impl {
         const auto t0 = std::chrono::steady_clock::now();
         std::size_t bytes = 0;
         unsigned count = 0;
-        for (unsigned l = own_begin; l < own_end; ++l)
+        const core::LayerSet on = a4w4_layers(cfg.layers);
+        for (unsigned l = own_begin; l < own_end; ++l) {
+            if (!on.test(l)) continue;
             for (Tensor* t : {&L[l].gate, &L[l].up, &L[l].down, &L[l].qkv, &L[l].z, &L[l].out, &L[l].q, &L[l].k, &L[l].v, &L[l].o}) {
                 if (!t->data || t->fmt != kIu4Fmt || !ad::supported(t->inputs, t->outputs)) continue;
                 HK(hipMalloc(&t->a4, ad::weight_code_bytes(t->inputs, t->outputs)));
@@ -660,9 +685,11 @@ struct HipEngine::Impl {
                 bytes += ad::weight_code_bytes(t->inputs, t->outputs) + ad::weight_step_bytes(t->inputs, t->outputs);
                 ++count;
             }
+        }
         HK(hipDeviceSynchronize());
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        std::fprintf(stderr, "qwen35-hip: A4W4 rotated weights: %u tensors, %.2f GiB, %.0f ms\n", count, double(bytes) / double(1ULL << 30), ms);
+        std::fprintf(stderr, "qwen35-hip: A4W4 rotated weights: %u tensors in %u layers, %.2f GiB, %.0f ms\n", count, on.count(),
+                     double(bytes) / double(1ULL << 30), ms);
     }
 
     void load(const std::string& path) {
@@ -824,6 +851,15 @@ struct HipEngine::Impl {
 
     // Layers [first, last) of one window (run == run_range(0, layers)). first > 0: the input rows are already in x
     // (import_hidden / a stream-ordered copy). Head only at the last layer; the window commits when `last` is the owned end.
+    // Gate null control (STRIX_DENSE_NULL): one FP16 ulp up on one residual element (eager windows only: host round trip).
+    void null_flip(float* at) {
+        std::uint32_t bits = 0;
+        HK(hipMemcpyAsync(&bits, at, 4, hipMemcpyDeviceToHost, stream));
+        HK(hipStreamSynchronize(stream));
+        bits = core::fp16_ulp_up_bits(bits);
+        HK(hipMemcpyAsync(at, &bits, 4, hipMemcpyHostToDevice, stream));
+        HK(hipStreamSynchronize(stream));
+    }
     HipRowsOut run_range(unsigned first, unsigned last, const std::uint32_t* tokens, unsigned n, LogitRows want, bool defer) {
         if (first >= last || first < own_begin || last > own_end)
             throw std::invalid_argument("layer range must be non-empty and inside the owned range");
@@ -856,8 +892,11 @@ struct HipEngine::Impl {
         const bool pre = fuse && n <= kMaxRows && iu4.xh && !core::dense_iu4::reference_flag();
         _Float16* const xh_pre = pre ? iu4.xh : nullptr;
         const float* carry = nullptr;  // the previous MLP output, not yet added to x
+        const core::NullSite* null_site = dense_null_site(cfg.layers, H);
         for (unsigned l = first; l < last; ++l) {
             auto& y = L[l];
+            if (null_site != nullptr && null_site->layer == l && null_site->pos >= pos && null_site->pos < std::uint64_t(pos) + n)
+                null_flip(x + std::size_t(null_site->pos - pos) * H + null_site->elem);
             rmsnorm_fused(x, carry, y.attn_norm, H, cfg.rms_eps, xn, n, xh_pre, stream);
             carry = nullptr;
             if (gdn_index[l] != ~0U) {
