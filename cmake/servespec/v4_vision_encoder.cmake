@@ -86,5 +86,14 @@ if(STRIX_ENABLE_HIP_RUNTIME AND TARGET strix_hip_runtime)
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee -Wall -Wextra)
         target_include_directories(strix-dense-flash-bench PRIVATE "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/include")
         target_link_libraries(strix-dense-flash-bench PRIVATE strix_hip_runtime)
+        # Device self-test of the dense flash core's MLA traits (row-major V, shared rope key, sink): traits == classic
+        # bitwise, sink vs FP64. Run strix-dense-flash-mla-hip-tests explicitly; host CTest does not run it.
+        add_executable(strix-dense-flash-mla-hip-tests "${CMAKE_SOURCE_DIR}/tests/hip_dense_flash_mla_tests.hip")
+        set_target_properties(strix-dense-flash-mla-hip-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_compile_options(strix-dense-flash-mla-hip-tests PRIVATE
+            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee -Wall -Wextra)
+        target_include_directories(strix-dense-flash-mla-hip-tests PRIVATE "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/include")
+        target_link_libraries(strix-dense-flash-mla-hip-tests PRIVATE strix_hip_runtime)
     endif()
 endif()

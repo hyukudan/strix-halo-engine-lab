@@ -9,6 +9,7 @@
 #include "hy4/hip/hy4_hip_rows.hpp"
 
 #include "attn_core/cache_rows.hpp"
+#include "attn_core/dense_flash_prefill.hpp"
 #include "attn_core/group_pool.hpp"
 #include "attn_core/group_score_scan.hpp"
 #include "attn_core/group_select_kernel.hpp"
@@ -17,6 +18,7 @@
 #include "core/hc_core.hpp"
 #include "core/wmma_tiled.hpp"
 #include "core/hip_range_weight_loader.hpp"
+#include "core/q8_0_transpose.hpp"
 #include "engram/hip/inject_kernel.hpp"
 #include "engram/hip/row_kernel.hpp"
 #include "moe_core/route_wave_kernel.hpp"
@@ -101,6 +103,38 @@ using DsaPolicy = mla::LatentPolicy<DsaSpec>;
 using SwaPolicy = mla::LatentPolicy<SwaSpec>;
 static_assert(DsaSpec::kHeads * DsaSpec::kGroups == preset::dsa().g.heads);
 static_assert(SwaSpec::kHeads * SwaSpec::kGroups == preset::swa().g.heads);
+// Expanded-MHA prompt form of a sliding layer (pf_mha, FAST): per head K = [k_nope 192 | the shared rope key 64] and V 256,
+// expanded per window from the latent by one K = 512 GEMM each, on the shared dense flash core (sink, row-major V and
+// MLA rope-key traits). 512 MAC per key per head instead of the absorbed 576 + 512. D = qk 256 = v_head 256.
+struct SwaMhaPolicy {
+    struct Args {
+        const float* q;               // [rows][heads][256] FP32: q_nope | roped q tail
+        const std::uint16_t* k;       // [pos - k0][heads][192] bf16 (expanded k_nope)
+        const std::uint16_t* v;       // [pos - k0][heads][256] bf16 (expanded v)
+        const std::uint16_t* latent;  // the layer's latent ring [ring][576] bf16: rope key = row (pos & mask) + 512
+        const float* sinks;           // [heads]
+        float* out;                   // [rows][heads][256]
+        unsigned* failure;
+        unsigned rows, p0, k0, window, mask;
+    };
+    static constexpr unsigned kHeads = SwaSpec::kHeads * SwaSpec::kGroups, kNope = 192U, kRope = SwaSpec::kRope, kLat = SwaSpec::kLat;
+    static constexpr unsigned kDim = kNope + kRope;
+    using Shape = strix::attn_core::dense::Shape<kDim, 1U, 2U, 64U>;  // MHA: one head x 64 positions per work-group
+    static constexpr float kScaleLog2 = SwaSpec::kScale * 1.4426950408889634F;
+    static constexpr strix::attn_core::tile::Operand kOp = strix::attn_core::tile::Operand::bf16;
+    static constexpr bool kValueRows = true;
+    __device__ static bool valid(const Args& a) { return a.q && a.k && a.v && a.latent && a.sinks && a.out && a.window && a.p0 >= a.k0; }
+    __host__ __device__ static unsigned rows(const Args& a) { return a.rows; }
+    __device__ static unsigned position(const Args& a) { return a.p0; }
+    __device__ static unsigned window(const Args& a) { return a.window; }
+    __device__ static const float* query(const Args& a, unsigned row, unsigned h) { return a.q + (std::size_t{row} * kHeads + h) * kDim; }
+    __device__ static float* out(const Args& a, unsigned row, unsigned h) { return a.out + (std::size_t{row} * kHeads + h) * kDim; }
+    __device__ static const std::uint16_t* key(const Args& a, unsigned p, unsigned h) { return a.k + (std::size_t{p - a.k0} * kHeads + h) * kNope; }
+    __device__ static const std::uint16_t* rope_key(const Args& a, unsigned p) { return a.latent + std::size_t{p & a.mask} * (kLat + kRope) + kLat; }
+    __device__ static const std::uint16_t* value(const Args& a, unsigned p, unsigned h) { return a.v + (std::size_t{p - a.k0} * kHeads + h) * kDim; }
+    __device__ static float sink(const Args& a, unsigned, unsigned h) { return a.sinks[h]; }
+    __device__ static unsigned* failure(const Args& a) { return a.failure; }
+};
 
 // ---- indexer views (data over the shared pool / score scan / select cores) -------------------------------------
 namespace gpl = strix::attn::group_pool;  // gi = strix::attn::group_indexer (hy4_hip_plan.hpp)
@@ -229,6 +263,14 @@ struct Forward::Impl {
     bool store_epilogue = true;  // STRIX_HY4_Q8_STORE_EPILOGUE
     bool pf_store_epilogue = true;  // STRIX_HY4_PF_STORE_EPILOGUE: prompt windows' bf16 epilogues in the producer's store (EXACT)
     bool q_image = false;           // pf_store_epilogue: K_b stores the bf16 query operand image in the GEMM (allocate_prompt)
+    // STRIX_HY4_PF_MHA (FAST, default off until gate v2): the sliding layers' prompt attention in the expanded-MHA form
+    // (attention_mha_rows). Buffers (allocate_prompt): attn_k_b^T Q8_0 [heads][192][512] and the FP32 latent rows of the
+    // positions before the window, per sliding layer; the expansion input rows and the bf16 K_nope / V images of a window.
+    bool pf_mha = false;
+    std::vector<const std::uint8_t*> kb_t;
+    std::vector<float*> mha_halo;
+    float* mha_x = nullptr;
+    std::uint16_t *mha_k = nullptr, *mha_v = nullptr;
     // Pinned host staging of the decode step (host-to-device copies never wait for the stream; each slot is written once
     // per step and the step ends with a stream sync, so no slot is rewritten while its copy is pending).
     struct Staging {
@@ -453,6 +495,7 @@ struct Forward::Impl {
         dstatus_all = alloc<std::uint32_t>(8U * c.layers);
         store_epilogue = strix::envcfg::flag("STRIX_HY4_Q8_STORE_EPILOGUE", true);
         pf_store_epilogue = strix::envcfg::flag("STRIX_HY4_PF_STORE_EPILOGUE", true);
+        pf_mha = strix::envcfg::flag("STRIX_HY4_PF_MHA", false);
         const std::uint32_t launch_rows = rows::cache_rows(rmax, vr.max);  // rows a launch / verify pass may write (ring sizes)
         state_launch_rows = launch_rows;
         std::vector<std::uint32_t> seq(context + 1U);
@@ -567,8 +610,40 @@ struct Forward::Impl {
             check(hipMemcpy2D(p, dst, kb.p, src, src, rows, hipMemcpyDeviceToDevice), "k_b image");
             kb_pad[l] = p;
         }
+        if (pf_mha) allocate_mha();
         strix::moe_q4k_a8::known_rows::reserve_prefill_pools(((rmax * c.top_k + 9U) / 10U + 7U) / 8U * 8U,  // CSR pool: rows x 10
                                                              c.expert_ff);  // DA16 h image of the K-quant envelope
+    }
+    // pf_mha buffers. The transposed K_b image is the shared host transform core::q8_0::transpose (one re-quantisation, FAST).
+    // Halo: window + 16 rows (the flash reads keys from the 16-aligned first key of the window's first row).
+    void allocate_mha() {
+        using MP = SwaMhaPolicy;
+        if (c.qk_nope != MP::kNope || c.qk_rope != MP::kRope || c.kv_lora != MP::kLat || c.v_head != MP::kDim || c.window == 0U)
+            throw std::runtime_error("hy4 hip forward: STRIX_HY4_PF_MHA outside the expanded-MHA geometry");
+        const std::size_t hmax = c.window + 16U, kl = c.kv_lora, H = MP::kHeads, rows = hmax + rmax + 16U;
+        mha_x = alloc<float>((hmax + rmax) * kl);
+        mha_k = alloc<std::uint16_t>(rows * H * MP::kNope);
+        mha_v = alloc<std::uint16_t>(rows * H * MP::kDim);
+        check(hipMemset(mha_k, 0, rows * H * MP::kNope * 2U), "mha k image clear");
+        check(hipMemset(mha_v, 0, rows * H * MP::kDim * 2U), "mha v image clear");  // keys past a window's last row read as zero
+        kb_t.assign(c.layers, nullptr);
+        mha_halo.assign(c.layers, nullptr);
+        std::vector<std::uint8_t> host;
+        for (std::uint32_t l = first; l < last; ++l) {
+            if (c.indexed[l] != 0U) continue;
+            if (c.heads[l] != H || latent_rows[l].width != MP::kLat + MP::kRope || latent_rows[l].ring == 0U)
+                throw std::runtime_error("hy4 hip forward: STRIX_HY4_PF_MHA sliding layer outside the policy");
+            const auto& kb = t(blk(l, "attn_k_b.weight"));
+            const auto& vb = t(blk(l, "attn_v_b.weight"));
+            if (vb.type != 8U || vb.bytes != row_bytes(8U, kl) * MP::kDim * H) throw std::runtime_error("hy4 hip forward: attn_v_b is not Q8_0");
+            host.resize(kb.bytes);
+            check(hipMemcpy(host.data(), kb.p, kb.bytes, hipMemcpyDeviceToHost), "k_b download");
+            const auto img = strix::core::q8_0::transpose(host.data(), H, kl, MP::kNope);
+            auto* p = alloc<std::uint8_t>(img.size());
+            check(hipMemcpy(p, img.data(), img.size(), hipMemcpyHostToDevice), "k_b^T image");
+            kb_t[l] = p;
+            mha_halo[l] = alloc<float>(hmax * kl);
+        }
     }
 
     // ---- stages (each one shared entry) ----------------------------------------------------------------------
@@ -1149,6 +1224,29 @@ struct Forward::Impl {
         check(hipGetLastError(), "group select rows launch");
     }
 
+    // Expanded-MHA prompt attention of sliding layer l (pf_mha, FAST): the FP32 latent rows of positions k0 .. p0 + R - 1
+    // (the halo kept from the previous window + this window's normalised latent) -> K_nope = A8(x) . K_b^T and V = A8(x) .
+    // V_b (shared q8a8 rows GEMM, bf16 image store) -> shared dense flash core (sink, row-major V, MLA rope key from the
+    // latent ring) -> pr.o [R][64][256] FP32. Every key's expansion reads the same FP32 row whatever the window cut.
+    void attention_mha_rows(std::uint32_t l, std::uint32_t p0, std::uint32_t R) {
+        using MP = SwaMhaPolicy;
+        const std::uint32_t kl = c.kv_lora, H = MP::kHeads, hmax = c.window + 16U;
+        const std::uint32_t k0 = (p0 >= c.window ? p0 - c.window + 1U : 0U) & ~15U, h = p0 - k0;  // the flash's first key tile
+        float* xw = mha_x + std::size_t{hmax} * kl;  // row of position p0
+        if (h) check(hipMemcpyAsync(xw - std::size_t{h} * kl, mha_halo[l] + std::size_t{hmax - h} * kl, std::size_t{h} * kl * 4U,
+                                    hipMemcpyDeviceToDevice, s), "mha halo rows");
+        check(hipMemcpy2DAsync(xw, kl * 4U, pr.ckv, (kl + c.qk_rope) * 4U, kl * 4U, R, hipMemcpyDeviceToDevice, s), "mha latent rows");
+        // the next window's halo: positions p0 + R - hmax .. p0 + R - 1 (rows below k0 are never read)
+        check(hipMemcpyAsync(mha_halo[l], mha_x + std::size_t{R} * kl, std::size_t{hmax} * kl * 4U, hipMemcpyDeviceToDevice, s),
+              "mha halo save");
+        const float* xk = xw - std::size_t{h} * kl;
+        q8a8_rows(kb_t[l], kl, H * MP::kNope, h + R, xk, kl, nullptr, H * MP::kNope, 1U, 0U, 0U, false, nullptr, mha_k);
+        q8a8_rows(t(blk(l, "attn_v_b.weight")).p, kl, H * MP::kDim, h + R, xk, kl, nullptr, H * MP::kDim, 1U, 0U, 0U, false, nullptr, mha_v);
+        const MP::Args a{pr.qv, mha_k, mha_v, latent[l], t(blk(l, "attn_sinks.weight")).f(), pr.o, flag, R, p0, k0, c.window,
+                         latent_rows[l].ring - 1U};
+        strix::attn_core::dense::launch<MP>(a, H, s);
+        check(hipGetLastError(), "mha flash rows launch");
+    }
     void attention_rows(std::uint32_t l, std::uint32_t p0, std::uint32_t R) {  // pr.xn -> pr.f
         namespace dcr = strix::attn_core::cache_rows;
         namespace rp = strix::ops::rope;
@@ -1172,44 +1270,48 @@ struct Forward::Impl {
         rp::launch<rp::Round::bf16>({pr.ckv, R, 1U, row, row, kl, rope / 2U, cs, sn, pp, false}, s);
         check(dcr::store_rows({pr.ckv, row, pp, 0U, R, latent_rows[l], latent[l], flag}, s), "latent rows store");
         if (idx) index_keys_rows(l, p0, R);
-        // absorbed query per head: K_b image (256 wide; the rope tail meets zero weights) x the q head row, batched over heads
-        if (q_image) {
-            // pf_store_epilogue: the GEMM stores encode(sum) into pr.qt's first kl columns with the writer's flag rule
-            // (dcr::ImageEpilogue) and the roped tail (already bf16 values in qv) goes through the same writer as rope-wide
-            // rows at positions subrow(k): every element of pr.qt once, the bits of the FP32 qfull + store_rows path.
-            q8a8_rows(kb_pad[l], kKbPadInput, kl, R, pr.qv, H * qk, nullptr, H * row, H, qk, row, false, nullptr, pr.qt);
-            check(dcr::store_rows({pr.qv + c.qk_nope, qk, pr.qtail, 0U, R * H, {rope, 0U}, pr.qt, flag}, s), "query tail rows image");
-        } else {
-            q8a8_rows(kb_pad[l], kKbPadInput, kl, R, pr.qv, H * qk, pr.qfull, H * row, H, qk, row);
-            check(hipMemcpy2DAsync(pr.qfull + kl, row * 4U, pr.qv + c.qk_nope, qk * 4U, rope * 4U, std::size_t{R} * H, hipMemcpyDeviceToDevice, s),
-                  "q rope rows copy");
-            check(dcr::store_rows({pr.qfull, row, nullptr, 0U, R * H, {row, 0U}, pr.qt, flag}, s), "query operand rows image");
-        }
-        const float* sinks = t(blk(l, "attn_sinks.weight")).f();
-        if (idx) {
-            const std::uint32_t nd = index_dense_rows(p0, R);
-            if (nd) {  // causal prefix: list = iota (stride 0), length t + 1 = iota[p0 + 1 + r]
-                DsaPolicy::Args a{latent[l], iota, iota + p0 + 1U, 0U, 0U, 0U, 0U, pr.qt, sinks, pr.olat};
-                strix::attn_core::sparse::launch_flash_rows<DsaPolicy, 32U>(a, nd * DsaSpec::kGroups, s, p0 + nd);
-            }
-            if (nd < R) {
-                index_select_rows(l, p0 + nd, R - nd, nd);
-                DsaPolicy::Args a{latent[l], pr.ilist, pr.list_n, kIndexListStride, 0U, 0U, 0U, pr.qt + std::size_t{nd} * H * row, sinks,
-                                  pr.olat + std::size_t{nd} * H * kl};
-                strix::attn_core::sparse::launch_flash_rows<DsaPolicy, 32U>(a, (R - nd) * DsaSpec::kGroups, s, kIndexListStride);
-            }
-        } else {
-            SwaPolicy::Args a{latent[l], nullptr, nullptr, 0U, p0, c.window, latent_rows[l].ring - 1U, pr.qt, sinks, pr.olat};
-            strix::attn_core::sparse::launch_flash_rows<SwaPolicy, 32U>(a, R * SwaSpec::kGroups, s, std::min(p0 + R, c.window));
-        }
-        check(hipGetLastError(), "flash rows launch");
-        const auto& vb = t(blk(l, "attn_v_b.weight"));
-        if (vb.type != 8U || vb.bytes != row_bytes(8U, kl) * vd * H) throw std::runtime_error("hy4 hip forward: attn_v_b is not Q8_0");
-        // pf_store_epilogue: each head's product rounds its vd columns in the GEMM's store (batched form, no bias); the H
-        // products cover the R x H*vd rows once, so this is the separate pass's function on the same FP32 sums: same bits.
-        q8a8_rows(vb.p, kl, vd, R, pr.olat, H * kl, pr.o, H * vd, H, kl, vd, pf_store_epilogue);
         const std::size_t n = std::size_t{R} * H * vd;
-        if (!pf_store_epilogue) glu::launch_epilogue<glu::Round::bf16>(pr.o, nullptr, n, n, pr.o, s);
+        if (pf_mha && !idx) {  // expanded-MHA form (FAST lever): pr.qv + the latent rows -> pr.o FP32
+            attention_mha_rows(l, p0, R);
+        } else {
+            // absorbed query per head: K_b image (256 wide; the rope tail meets zero weights) x the q head row, batched over heads
+            if (q_image) {
+                // pf_store_epilogue: the GEMM stores encode(sum) into pr.qt's first kl columns with the writer's flag rule
+                // (dcr::ImageEpilogue) and the roped tail (already bf16 values in qv) goes through the same writer as rope-wide
+                // rows at positions subrow(k): every element of pr.qt once, the bits of the FP32 qfull + store_rows path.
+                q8a8_rows(kb_pad[l], kKbPadInput, kl, R, pr.qv, H * qk, nullptr, H * row, H, qk, row, false, nullptr, pr.qt);
+                check(dcr::store_rows({pr.qv + c.qk_nope, qk, pr.qtail, 0U, R * H, {rope, 0U}, pr.qt, flag}, s), "query tail rows image");
+            } else {
+                q8a8_rows(kb_pad[l], kKbPadInput, kl, R, pr.qv, H * qk, pr.qfull, H * row, H, qk, row);
+                check(hipMemcpy2DAsync(pr.qfull + kl, row * 4U, pr.qv + c.qk_nope, qk * 4U, rope * 4U, std::size_t{R} * H, hipMemcpyDeviceToDevice, s),
+                      "q rope rows copy");
+                check(dcr::store_rows({pr.qfull, row, nullptr, 0U, R * H, {row, 0U}, pr.qt, flag}, s), "query operand rows image");
+            }
+            const float* sinks = t(blk(l, "attn_sinks.weight")).f();
+            if (idx) {
+                const std::uint32_t nd = index_dense_rows(p0, R);
+                if (nd) {  // causal prefix: list = iota (stride 0), length t + 1 = iota[p0 + 1 + r]
+                    DsaPolicy::Args a{latent[l], iota, iota + p0 + 1U, 0U, 0U, 0U, 0U, pr.qt, sinks, pr.olat};
+                    strix::attn_core::sparse::launch_flash_rows<DsaPolicy, 32U>(a, nd * DsaSpec::kGroups, s, p0 + nd);
+                }
+                if (nd < R) {
+                    index_select_rows(l, p0 + nd, R - nd, nd);
+                    DsaPolicy::Args a{latent[l], pr.ilist, pr.list_n, kIndexListStride, 0U, 0U, 0U, pr.qt + std::size_t{nd} * H * row, sinks,
+                                      pr.olat + std::size_t{nd} * H * kl};
+                    strix::attn_core::sparse::launch_flash_rows<DsaPolicy, 32U>(a, (R - nd) * DsaSpec::kGroups, s, kIndexListStride);
+                }
+            } else {
+                SwaPolicy::Args a{latent[l], nullptr, nullptr, 0U, p0, c.window, latent_rows[l].ring - 1U, pr.qt, sinks, pr.olat};
+                strix::attn_core::sparse::launch_flash_rows<SwaPolicy, 32U>(a, R * SwaSpec::kGroups, s, std::min(p0 + R, c.window));
+            }
+            check(hipGetLastError(), "flash rows launch");
+            const auto& vb = t(blk(l, "attn_v_b.weight"));
+            if (vb.type != 8U || vb.bytes != row_bytes(8U, kl) * vd * H) throw std::runtime_error("hy4 hip forward: attn_v_b is not Q8_0");
+            // pf_store_epilogue: each head's product rounds its vd columns in the GEMM's store (batched form, no bias); the H
+            // products cover the R x H*vd rows once, so this is the separate pass's function on the same FP32 sums: same bits.
+            q8a8_rows(vb.p, kl, vd, R, pr.olat, H * kl, pr.o, H * vd, H, kl, vd, pf_store_epilogue);
+            if (!pf_store_epilogue) glu::launch_epilogue<glu::Round::bf16>(pr.o, nullptr, n, n, pr.o, s);
+        }
         glu::launch_sigmoid_gate<glu::DeclaredExp, glu::Round::bf16>(pr.o, pr.gate, n, pr.o, s);
         linear_rows(blk(l, "attn_output.weight"), pr.o, H * vd, c.hidden, R, pr.f);
         norm_rows(pr.f, t(blk(l, "post_attention_norm.weight")).f(), c.hidden, R, pr.f);
