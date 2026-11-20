@@ -103,10 +103,10 @@ int main() {
         const Lever width{.name = "rows", .env = "", .option = "--rows", .value = {"", "4096", "", ""}, .builtin = "0",
             .kind = Kind::bit_changing, .ready = {false, true, false, false}, .runnable = {true, true, false, false},
             .target = "", .off = "0", .source = "gate receipt; 1024 / 2048 / 4096 bitwise", .same_bits = "1024,2048,4096"};
-        const Lever pending{.name = "window", .env = "", .option = "--window", .value = {"", "4096", "", ""}, .builtin = "0",
+        const Lever unready{.name = "window", .env = "", .option = "--window", .value = {"", "4096", "", ""}, .builtin = "0",
             .kind = Kind::bit_changing, .ready = {}, .runnable = {true, true, false, false}, .target = "", .off = "0",
             .source = "pending", .same_bits = "2048,4096"};
-        const std::array rows{width, pending};
+        const std::array rows{width, unready};
         const Engine e{"same_bits", "ALLOW", rows};
         const Lookup none = [](const char*) -> const char* { return nullptr; };
         const auto stamp = [&](Pairs cli) {
