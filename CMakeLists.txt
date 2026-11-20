@@ -1655,6 +1655,12 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-serve-startup-phases-tests)
     add_test(NAME strix-serve-startup-phases-tests COMMAND strix-serve-startup-phases-tests)
     set_tests_properties(strix-serve-startup-phases-tests PROPERTIES LABELS "cpu" TIMEOUT 120)
+    # Server start warm-up: plan, synthetic ids and run wrapper (strix/serve/startup_warmup.hpp).
+    add_executable(strix-serve-startup-warmup-tests tests/serve_startup_warmup_tests.cpp)
+    target_link_libraries(strix-serve-startup-warmup-tests PRIVATE strix_core)
+    strix_target_warnings(strix-serve-startup-warmup-tests)
+    add_test(NAME strix-serve-startup-warmup-tests COMMAND strix-serve-startup-warmup-tests)
+    set_tests_properties(strix-serve-startup-warmup-tests PROPERTIES LABELS "cpu" TIMEOUT 120)
     add_test(NAME strix-prefill-option-cache-write COMMAND strix-prefix-state-cache-tests
         --write-option-checkpoint "${CMAKE_CURRENT_BINARY_DIR}/prefill-option-cache")
     add_test(NAME strix-prefill-option-cache-read COMMAND strix-prefix-state-cache-tests
