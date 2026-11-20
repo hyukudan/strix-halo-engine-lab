@@ -223,6 +223,7 @@ struct Forward::Impl {
     std::map<std::uint32_t, float*> engram_w1;  // [copy scale 4 x hidden | pre gamma hidden] per Engram layer
     bool store_epilogue = true;  // STRIX_HY4_Q8_STORE_EPILOGUE
     bool pf_store_epilogue = true;  // STRIX_HY4_PF_STORE_EPILOGUE: prompt windows' bf16 epilogues in the producer's store (EXACT)
+    bool q_image = false;           // pf_store_epilogue: K_b stores the bf16 query operand image in the GEMM (allocate_prompt)
     // Pinned host staging of the decode step (host-to-device copies never wait for the stream; each slot is written once
     // per step and the step ends with a stream sync, so no slot is rewritten while its copy is pending).
     struct Staging {
@@ -296,6 +297,7 @@ struct Forward::Impl {
         std::uint8_t* csr = nullptr;
         float *ik = nullptr, *pooled = nullptr, *iq = nullptr, *hwraw = nullptr;
         std::uint32_t *skeys = nullptr, *hist0 = nullptr, *ilist = nullptr, *list_n = nullptr, *iota4 = nullptr;
+        std::uint32_t* qtail = nullptr;  // q_image: [k] = row of query row k's rope tail in pr.qt read as rope-wide rows
         std::uint8_t *erows = nullptr, *gate_off = nullptr;
         float *e = nullptr, *kvout = nullptr;
     } pr;
@@ -502,7 +504,19 @@ struct Forward::Impl {
         pr.codes = alloc<std::int8_t>(R * a8w); pr.deltas = alloc<float>(R * a8w / 32U); pr.sums = alloc<std::int32_t>(R * a8w / 32U);
         pr.gate = alloc<float>(R * H * c.v_head); pr.qa = alloc<float>(R * c.q_lora); pr.qv = alloc<float>(R * H * c.qk_head());
         pr.ckv = alloc<float>(R * row); pr.ckn = alloc<float>(R * c.kv_lora);
-        pr.qfull = alloc<float>(R * H * row); pr.qt = alloc<std::uint16_t>(R * H * row);
+        // pf_store_epilogue: K_b stores the query operand image in its GEMM (no FP32 qfull); the rope tail of query row k
+        // is row subrow(k) of pr.qt read as rope-wide rows (cache_rows contract), written by the shared row writer.
+        namespace acr = strix::attn::cache_rows;
+        q_image = pf_store_epilogue && acr::subrow_ok(c.kv_lora + c.qk_rope, c.qk_rope, c.kv_lora);
+        if (!q_image) pr.qfull = alloc<float>(R * H * row);
+        pr.qt = alloc<std::uint16_t>(R * H * row);
+        if (q_image) {
+            std::vector<std::uint32_t> tail(R * H);
+            for (std::size_t k = 0; k < tail.size(); ++k)
+                tail[k] = acr::subrow(static_cast<std::uint32_t>(k), c.kv_lora + c.qk_rope, c.qk_rope, c.kv_lora);
+            pr.qtail = alloc<std::uint32_t>(tail.size());
+            check(hipMemcpy(pr.qtail, tail.data(), tail.size() * 4U, hipMemcpyHostToDevice), "query tail rows upload");
+        }
         pr.olat = alloc<float>(R * H * c.kv_lora); pr.o = alloc<float>(R * H * c.v_head);
         const std::size_t ff = std::max<std::size_t>(c.dense_ff, c.shared_ff);
         pr.g = alloc<float>(R * ff); pr.up = alloc<float>(R * ff); pr.act = alloc<float>(R * ff);
@@ -942,7 +956,7 @@ struct Forward::Impl {
     // per head (grid z) at x + z * batch_in, weights + z * batch_weight_bytes, y + z * batch_out.
     void q8a8_rows(const std::uint8_t* weights, std::uint32_t width, std::uint32_t outputs, std::uint32_t R, const float* x,
                    std::uint32_t x_stride, float* y, std::uint32_t y_stride, std::uint32_t batch = 1U, std::uint32_t batch_in = 0U,
-                   std::uint32_t batch_out = 0U, bool round = false, const float* bias = nullptr) {
+                   std::uint32_t batch_out = 0U, bool round = false, const float* bias = nullptr, std::uint16_t* image = nullptr) {
         namespace q8 = strix::core::f16_dense_tall::q8a8;
         // A8 rows at the shared operand pitch: a pitch that is a multiple of 8 KiB (K_b 16384, V_b 32768, o_proj 16384)
         // aliases the 128 rows a CTA stage reads (strix/a8_row_pitch.hpp); same values, same bits.
@@ -952,7 +966,7 @@ struct Forward::Impl {
         v.weight = weights;
         v.codes = pr.codes;
         v.deltas = pr.deltas;
-        v.out = y;
+        v.out = y != nullptr ? y : reinterpret_cast<float*>(image);  // the image form never writes out (supported() wants one)
         v.row_bytes = static_cast<std::uint32_t>(row_bytes(8U, width));
         v.in = width;
         v.count = outputs;
@@ -965,6 +979,12 @@ struct Forward::Impl {
         v.batch_weight_bytes = std::uint64_t{outputs} * v.row_bytes;
         v.round_bf16 = round ? 1U : 0U;  // the Linear's bf16 epilogue (+ bias) in the GEMM's store: y = R(sum + bias)
         v.bias = round ? bias : nullptr;
+        if (image != nullptr) {  // the bf16 cache-row image of the outputs (y unused): store_rows' bits and flag rule
+            if (!q8::supported_image(v, image)) throw std::runtime_error("hy4 hip forward: A8 rows image GEMM refuses width " + std::to_string(width));
+            q8::enqueue_image<strix::attn_core::cache_rows::ImageEpilogue>(v, image, flag, s);
+            check(hipGetLastError(), "q8a8 rows image launch");
+            return;
+        }
         if (!q8::supported(v)) throw std::runtime_error("hy4 hip forward: A8 rows GEMM refuses width " + std::to_string(width));
         q8::enqueue(v, s);
         check(hipGetLastError(), "q8a8 rows launch");
@@ -1155,10 +1175,18 @@ struct Forward::Impl {
         check(dcr::store_rows({pr.ckv, row, pp, 0U, R, latent_rows[l], latent[l], flag}, s), "latent rows store");
         if (idx) index_keys_rows(l, p0, R);
         // absorbed query per head: K_b image (256 wide; the rope tail meets zero weights) x the q head row, batched over heads
-        q8a8_rows(kb_pad[l], kKbPadInput, kl, R, pr.qv, H * qk, pr.qfull, H * row, H, qk, row);
-        check(hipMemcpy2DAsync(pr.qfull + kl, row * 4U, pr.qv + c.qk_nope, qk * 4U, rope * 4U, std::size_t{R} * H, hipMemcpyDeviceToDevice, s),
-              "q rope rows copy");
-        check(dcr::store_rows({pr.qfull, row, nullptr, 0U, R * H, {row, 0U}, pr.qt, flag}, s), "query operand rows image");
+        if (q_image) {
+            // pf_store_epilogue: the GEMM stores encode(sum) into pr.qt's first kl columns with the writer's flag rule
+            // (dcr::ImageEpilogue) and the roped tail (already bf16 values in qv) goes through the same writer as rope-wide
+            // rows at positions subrow(k): every element of pr.qt once, the bits of the FP32 qfull + store_rows path.
+            q8a8_rows(kb_pad[l], kKbPadInput, kl, R, pr.qv, H * qk, nullptr, H * row, H, qk, row, false, nullptr, pr.qt);
+            check(dcr::store_rows({pr.qv + c.qk_nope, qk, pr.qtail, 0U, R * H, {rope, 0U}, pr.qt, flag}, s), "query tail rows image");
+        } else {
+            q8a8_rows(kb_pad[l], kKbPadInput, kl, R, pr.qv, H * qk, pr.qfull, H * row, H, qk, row);
+            check(hipMemcpy2DAsync(pr.qfull + kl, row * 4U, pr.qv + c.qk_nope, qk * 4U, rope * 4U, std::size_t{R} * H, hipMemcpyDeviceToDevice, s),
+                  "q rope rows copy");
+            check(dcr::store_rows({pr.qfull, row, nullptr, 0U, R * H, {row, 0U}, pr.qt, flag}, s), "query operand rows image");
+        }
         const float* sinks = t(blk(l, "attn_sinks.weight")).f();
         if (idx) {
             const std::uint32_t nd = index_dense_rows(p0, R);
