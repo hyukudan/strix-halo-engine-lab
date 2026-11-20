@@ -707,7 +707,15 @@ public:
         }
         // Row-class checkpoint (the next turn resumes here, off the T grid): after this unit's predictor rows and
         // held row, before the final row's adoption.
-        if(row_class_end && complete) tiled_.cache->capture_row_class(session_,tokens_);
+        if(row_class_end) {
+            // Synchronous capture: finish this unit's deferred owner checks and predictor rows first (no arithmetic change).
+            if(!complete && block.owner->completion_pending()) block.owner->finish_pending_completion();
+            if(!complete && runtime_.prime_hidden_rows_pending()) runtime_.prime_hidden_rows_complete();
+            const bool ready=!block.owner->completion_pending() && !runtime_.prime_hidden_rows_pending() &&
+                runtime_.next_source_position()+1U==pos_;
+            row_class_note_=ready?tiled_.cache->capture_row_class(session_,tokens_):
+                block.owner->completion_pending()?"owner-pending":runtime_.prime_hidden_rows_pending()?"priming-pending":"predictor-frontier";
+        }
         if(tiled_.cache) tiled_.cache->after_unit(session_,tokens_,pos_);
         if(block.capture)++blocks_;else ++tail_blocks_;
         if(grouped)++grouped_blocks_;
@@ -769,6 +777,7 @@ public:
         out<<"\"rows\":"<<tiled_.rows<<",\"tail_rows\":[";
         for(std::size_t t=0;t<tiled_.tails.size();++t)out<<(t?",":"")<<tiled_.tails[t].rows;
         out<<"],\"restored_position\":"<<restored_
+           <<",\"row_class_point\":"<<(tiled_.cache?tiled_.cache->row_class_point():0U)<<",\"row_class\":\""<<row_class_note_<<'"'
            <<",\"blocks\":"<<blocks_<<",\"tail_blocks\":"<<tail_blocks_<<",\"serial_rows\":"<<serial_rows_<<",\"tiled_start\":"<<(adopted_?"true":"false")
            <<",\"prompt_ms\":"<<prompt_ms<<",\"grouped_blocks\":"<<grouped_blocks_
            <<",\"block_ms\":"<<block_ms_<<",\"tail_ms\":"<<tail_ms_<<",\"serial_ms\":"<<serial_ms_;
@@ -1069,6 +1078,7 @@ private:
     std::byte* hidden_allocation_=nullptr;
     Phase phase_=Phase::blocks;
     bool adopted_=false,window_refused_=false,priming_=false;
+    const char* row_class_note_="";   // the row-class capture at this prompt's class point: "captured" or why not
     int balanced_=-1;
     HipPrefixStateCacheSession::Capture capture_;
     std::future<bool> submitter_;

@@ -648,17 +648,22 @@ public:
     // Synchronous capture at row_class_point(): the bridge calls it right after the unit ending there (for the
     // prompt's last unit: before its last row is adopted). Same payload as after_block (target rows, fixed state,
     // MTP rows and held row). A class point that is also a full-T boundary stays with the T-grid capture.
-    void capture_row_class(const SerialSessionContext& session, std::span<const std::uint32_t> prompt) {
+    // Returns "captured" (or a store-side skip inside capture_sync) or the reason no capture was attempted.
+    const char* capture_row_class(const SerialSessionContext& session, std::span<const std::uint32_t> prompt) {
         const auto p=session.next_position;
         if(!row_class_ || !row_class_point_ || p!=row_class_point_ || policy_selection_ || !store_ ||
-            store_->policy().legacy || imported_ || !certified_path_ || !plan_enabled_ || serial_path_ ||
-            p%block_rows_ || p>prompt.size() || session.committed_tokens!=p ||
-            session.health!=SerialSessionHealth::ready || session.arithmetic_lineage.tainted ||
-            qwen_full_t_continuation(plan_,plan_n_,p) || !row_class_metadata(session.state,session.arithmetic_lineage,p)) return;
-        if(!retain_) {store_->record_no_store_skip();return;}
+            store_->policy().legacy || imported_ || !certified_path_ || !plan_enabled_ || serial_path_) return "route";
+        if(p%block_rows_ || p>prompt.size()) return "cache-unit";
+        if(session.committed_tokens!=p || session.health!=SerialSessionHealth::ready || session.arithmetic_lineage.tainted)
+            return "session";
+        if(qwen_full_t_continuation(plan_,plan_n_,p)) return "full-t-boundary";
+        if(!row_class_metadata(session.state,session.arithmetic_lineage,p)) return "lineage";
+        if(!retain_) {store_->record_no_store_skip();return "no-store";}
         PrefixAsyncCapture::reap();
         auto proof=row_class_certificate(p);
-        if(!proof.empty()) capture_sync(session,prompt,p,std::move(proof));
+        if(proof.empty()) return "certificate";
+        capture_sync(session,prompt,p,std::move(proof));
+        return "captured";
     }
     void set_plan(const QwenTiledPlanConfig& config, std::uint64_t n, bool enabled,
         std::uint64_t route=1,QwenBatchConfig batch={},bool allow_restore=true,bool nesting_possible=false) {
