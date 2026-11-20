@@ -492,27 +492,28 @@ void attention_vrows_tp(std::uint32_t l, std::uint32_t R) {  // vr.xn -> vr.f, t
           "q rope copy rows (tp)");
     check(dcr::store_rows({vr.qfull, row, nullptr, 0U, Hs * R, {row, 0U}, vr.qt, flag}, s), "query operand images (tp)");
     const float* sinks = t(blk(l, "attn_sinks.weight")).f() + h0;
-    // the flash per row over this rank's head group (the step's share launch: one 16-head tile indexed / one of the two
-    // 32-head groups sliding, as row 0); a work-group's bits do not depend on the grid
+    // this rank's head group (one 16-head tile indexed / one of the two 32-head groups sliding): ONE launch over the rows
+    // that need no per-row selection (attention_vrows' split; row = token of the tight [R][Hs][row] image), then the
+    // selecting rows one launch each after their index_select. A work-group reads only its own row's query, list and
+    // count, so a row's bits do not depend on the grid (the per-row launches it replaces: R x layers -> layers).
     const VrowsFlashSplit split = vrows_flash_split(idx, vr.p0, R);
-    for (std::uint32_t r = 0; r < R; ++r) {
-        const std::uint16_t* qrow = vr.qt + r * fs;
-        float* const orow = vr.olat + r * ls;
-        const std::uint32_t at_pos = vr.p0 + r;
-        if (!idx) {
-            SwaPolicy::Args a{latent[l], nullptr, nullptr, 0U, at_pos, c.window, latent_rows[l].ring - 1U, qrow, sinks, orow};
-            strix::attn_core::sparse::launch_flash_rows<SwaPolicy, 32U>(a, 1U, s, std::min(at_pos + 1U, c.window));
-        } else if (r < split.batched) {  // the causal prefix: list = iota, length p + 1
-            DsaHalfPolicy::Args a{latent[l], iota, iota + at_pos + 1U, 0U, 0U, 0U, 0U, qrow, sinks, orow};
-            strix::attn_core::sparse::launch_flash_rows<DsaHalfPolicy, 32U>(a, 1U, s, at_pos + 1U);
-        } else {
-            {
-                const RowBind bind(*this, r);
-                index_select(l);
-            }
-            DsaHalfPolicy::Args a{latent[l], ilist, list_n, kIndexListStride, 0U, 0U, 0U, qrow, sinks, orow};
-            strix::attn_core::sparse::launch_flash_rows<DsaHalfPolicy, 32U>(a, 1U, s, index_list_tokens(at_pos));
+    if (split.batched != 0U) {
+        if (idx) {  // the causal prefix: list = iota (stride 0), length of row r = iota[p0 + 1 + r] = p0 + r + 1
+            DsaHalfPolicy::Args a{latent[l], iota, iota + vr.p0 + 1U, 0U, 0U, 0U, 0U, vr.qt, sinks, vr.olat};
+            strix::attn_core::sparse::launch_flash_rows<DsaHalfPolicy, 32U>(a, split.batched, s, vr.p0 + split.batched);
+        } else {  // window rows: row r at position p0 + r
+            SwaHalfPolicy::Args a{latent[l], nullptr, nullptr, 0U, vr.p0, c.window, latent_rows[l].ring - 1U, vr.qt, sinks, vr.olat};
+            strix::attn_core::sparse::launch_flash_rows<SwaHalfPolicy, 32U>(a, split.batched, s, std::min(vr.p0 + split.batched, c.window));
         }
+        check(hipGetLastError(), "flash verify rows launch (tp)");
+    }
+    for (std::uint32_t r = split.batched; r < R; ++r) {  // indexed rows that select: the one shared list per row
+        {
+            const RowBind bind(*this, r);
+            index_select(l);
+        }
+        DsaHalfPolicy::Args a{latent[l], ilist, list_n, kIndexListStride, 0U, 0U, 0U, vr.qt + r * fs, sinks, vr.olat + r * ls};
+        strix::attn_core::sparse::launch_flash_rows<DsaHalfPolicy, 32U>(a, 1U, s, index_list_tokens(vr.p0 + r));
         check(hipGetLastError(), "flash verify row launch (tp)");
     }
     const auto& vb = t(blk(l, "attn_v_b.weight"));

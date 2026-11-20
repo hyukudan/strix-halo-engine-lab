@@ -91,13 +91,19 @@ struct SwaSpec {
 };
 // Tensor-parallel share of an indexed layer (Forward::enable_tp): 16 of the 32 heads per rank, one M tile of the same
 // kernel (H = 16 is a declared tile, sparse_flash_wmma.hpp Geometry). A sliding layer's share is one of SwaSpec's two
-// groups: SwaPolicy itself over one row (grid 1) with the group's qt / sinks / out offsets.
+// groups: SwaPolicy itself over one row (grid 1) with the group's qt / sinks / out offsets. Verify rows under TP hold a
+// rank's share tight per row ([R][16 or 32 heads][row]): DsaHalfSpec / SwaHalfSpec (one group per token) run the rows
+// of a layer in ONE launch, row = token (sparse_flash_mla.hpp LatentPolicy), the same work-group per row.
 struct DsaHalfSpec : DsaSpec {
     static constexpr unsigned kHeads = 16U;
+};
+struct SwaHalfSpec : SwaSpec {
+    static constexpr unsigned kGroups = 1U;
 };
 using DsaPolicy = mla::LatentPolicy<DsaSpec>;
 using DsaHalfPolicy = mla::LatentPolicy<DsaHalfSpec>;
 using SwaPolicy = mla::LatentPolicy<SwaSpec>;
+using SwaHalfPolicy = mla::LatentPolicy<SwaHalfSpec>;
 static_assert(DsaSpec::kHeads * DsaSpec::kGroups == preset::dsa().g.heads);
 static_assert(SwaSpec::kHeads * SwaSpec::kGroups == preset::swa().g.heads);
 
