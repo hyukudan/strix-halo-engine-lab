@@ -116,7 +116,7 @@ old `--profile NAME:PROMPT.u32:STEPS` still works, with a notice). Quality bar:
 
 Qwen on CUDA (sm_120, `strix-cuda-qwen-serve` and the other entries through the shared option resolver
 [cuda/qwen_options.hpp](../../include/strix/cuda/qwen_options.hpp), which binds
-[cuda/qwen_turbo.hpp](../../include/strix/cuda/qwen_turbo.hpp); no lever rows under turbo): `--profile turbo
+[cuda/qwen_turbo.hpp](../../include/strix/cuda/qwen_turbo.hpp); the turbo column of the CUDA lever table): `--profile turbo
 --turbo-weights onfly` converts the dense Q8_0 projections (GDN in/out, QSA q/k/v/o,
 shared expert) once at load to NVFP4 (identity `onfly-nvfp4-rtn-g16`, about +1.6 GB
 beside the pack) and decode windows read them through the shared
@@ -124,6 +124,14 @@ beside the pack) and decode windows read them through the shared
 activations as the exact route; prefill blocks, routed experts, the LM head and the
 MTP draft keep the pack. `--print-effective-config` adds a `turbo_weights` object (onfly, namespace, decode
 arithmetic) beside the resolution's weights; 3-bit or `converted` requests refuse the start.
+On the Qwen MoE GSQ pack, `--profile turbo` runs every lever of `--profile fast` (BF16 tensor-core experts, HC and QSA
+tensor-core forms, deferred prompt MTP rows) plus the int8 tensor-core experts (`gsq-iq-i8mma-turbo-cuda-v1`) in their
+regime only: prefill blocks of at least `--expert-turbo-rows N` rows (`STRIX_QRTX_EXPERT_TURBO_ROWS`, default 512;
+`off` = int8 in every MoE call); decode and verify windows and smaller blocks keep the FAST experts, so TURBO decode is
+FAST decode. The rule is in the arithmetic contract (`+experts[prefill_rows>=N:...,else:...]`) and in the effective
+config (`expert_regime`); `--expert-turbo off` gives FAST. Lower precision than FAST. 32K logit gate, 4 prompts x 128
+rows: the regime (`--profile turbo`, default rows) KL 0.00906, top-1 0.9844, dNLL +0.00102; int8 in every MoE call
+(`--expert-turbo-rows off`) KL 0.00948, top-1 0.9785, dNLL +0.00543. Explicit only, never a default.
 
 Qwen accepts `--profile default|fast|quality|turbo` for CLI decode, `--http-serve`,
 MTP and the MTP qualification runner. Omission means `default`: it exports no

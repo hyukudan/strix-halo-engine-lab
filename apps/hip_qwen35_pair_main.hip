@@ -26,6 +26,7 @@
 #include <hip/hip_runtime.h>
 
 #include "strix/device/topology.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/dist/open_transport.hpp"
 #include "strix/gguf_reader.hpp"
 #include "strix/pair/layer_pipeline.hpp"
@@ -245,11 +246,30 @@ int main(int argc, char** argv) try {
     if (!chain::memory_declared(topo)) shape.weight_bytes.clear();
     const auto devices = pp::devices(cfg, ranks);
     auto request = pp::request(prompt.size(), a.wide, N, a.maxpos, double(a.gen), a.placement);
-    request.layer_owned_state = true;
-    const auto choice = chain::choose(devices, chain::links(hops), shape, request);
-    const auto& plan = choice.best;
+    // Decode placement from the declaration through the ONE planner: with every node's memory declared, the handoff
+    // admission runs first (a decoder that holds the whole model + state receives every stage's layer state once after the
+    // prefill and decodes alone: a layer split only serialises the decode). Undeclared memory, no fitting decoder, or a
+    // decoder outside the stage chain keep the layer-owned decode. The relay is OFF by default until its pair receipt
+    // (decode tok/s and ids against the one-node reference) exists for this tree: STRIX_PAIR_DECODE_RELAY=1 enables it.
+    const bool relay_allowed = strix::envcfg::flag("STRIX_PAIR_DECODE_RELAY", false);
+    std::string decode_reason = !relay_allowed ? "STRIX_PAIR_DECODE_RELAY off (default; =1 enables the relay)" : !chain::memory_declared(topo) ? "node memory not declared" : "";
+    chain::Plan plan;
+    if (decode_reason.empty()) {
+        request.layer_owned_state = false;
+        plan = chain::choose(devices, chain::links(hops), shape, request).best;
+        if (!plan.valid) decode_reason = "no decoder holds the whole model: " + plan.reason;
+        else if (plan.decoder < plan.first || plan.decoder > plan.last) decode_reason = "decoder outside the stage chain";
+    }
+    const bool relay = decode_reason.empty() && plan.stages() > 1U;
+    if (!decode_reason.empty()) {
+        request.layer_owned_state = true;
+        plan = chain::choose(devices, chain::links(hops), shape, request).best;
+    }
     std::printf("%s\n", pp::describe(plan, devices, prompt.size()).c_str());
     if (!plan.valid) return 2;
+    const std::string placement_text = relay ? "relay to " + devices[plan.decoder].name + " (whole model there, state moved once)"
+                                     : plan.stages() == 1U ? std::string("single stage") : "layer-owned (" + decode_reason + ")";
+    std::printf("decode placement: %s\n", placement_text.c_str());
     const auto me = topo.local_rank;
     if (me < plan.first || me >= plan.first + plan.stages()) { std::printf("rank %s runs no layers in this plan\n", topo.local().id.c_str()); return 0; }
     layers::Placement place{plan.cuts, me - plan.first};
@@ -262,12 +282,15 @@ int main(int argc, char** argv) try {
     opt.max_positions = a.maxpos;
     opt.prefill_rows = a.wide;
     opt.wide_exact = false;  // --wide N > 16 stays the FAST wide class here (the engine default is now EXACT wide windows)
-    opt.layer_begin = place.first();
-    opt.layer_end = place.last();
+    const std::uint32_t decoder_stage = plan.decoder - plan.first;
+    const bool decodes_here = !relay || place.stage == decoder_stage;
+    opt.layer_begin = relay && decodes_here ? 0U : place.first();   // the relay decoder loads the whole model
+    opt.layer_end = relay && decodes_here ? L : place.last();
     const auto t_load = Clock::now();
     auto E = HipEngine::from_gguf(a.model, opt);
     std::printf("load time %.1f s\n", ms_since(t_load) / 1000.0);
-    if (E->layer_begin() != place.first() || E->layer_end() != place.last()) throw std::logic_error("engine range differs from the stage");
+    if (E->layer_begin() != opt.layer_begin || E->layer_end() != opt.layer_end) throw std::logic_error("engine range differs from the stage");
+    E->set_stage(place.first(), place.last());   // prefill windows run and commit on the stage range
 
     // Links on the line (stage s <-> s+1 is topology link (first+s, first+s+1)); upstream first: no open deadlock.
     if (a.transport == "usb4auto" && !place.embeds() && !place.head())
@@ -324,6 +347,12 @@ int main(int argc, char** argv) try {
         std::printf("prefill %u/%u (%s) stage %u: %zu tokens %.1f ms = %.1f tok/s; seam wait %.1f ms, seal %.1f ms, sclk avg %ld MHz\n",
                     pass + 1U, a.repeat, pass == 0U ? "cold" : pass + 1U == a.repeat ? "warm" : "mid", place.stage, prompt.size(), wall,
                     double(prompt.size()) * 1000.0 / wall, st.wait_ms, st.seal_ms, mhz);
+        if (place.stages() > 1U) {   // per-window timeline: wait on input / enqueue / sync (GPU drain) in ms
+            std::printf("timeline stage %u (wait/enqueue/sync ms):", place.stage);
+            for (std::size_t w = 0; w < st.window_ms.size(); ++w)
+                std::printf(" %.0f/%.0f/%.0f", st.wait_window_ms[w], st.enqueue_window_ms[w], st.sync_window_ms[w]);
+            std::printf("\n");
+        }
     }
     if (place.head() && !a.dump.empty()) { dumped.resize(E->vocab()); E->read_logits(o, 1, dumped.data()); }
     {   // Link counter for the decode receipt: round trips of one decode message (header + one row) down and a token back.
@@ -339,11 +368,38 @@ int main(int argc, char** argv) try {
                         place.stage, place.stage + 1U, big.size(), rtt[rtt.size() / 2U], rtt.front(), rtt.back(), rtt.size());
         }
     }
+    // Relayed decode: every stage's layer state to the decoder once, then the decoder runs the single-rank decode alone.
+    layers::Placement dplace = place;
+    if (relay) {
+        layers::Link ru, rd;
+        if (up) { ru.send = [&](std::span<const std::byte> b) { up->send(b); }; ru.receive = [&](std::span<std::byte> b) { up->receive(b); }; }
+        if (down) { rd.send = [&](std::span<const std::byte> b) { down->send(b); }; rd.receive = [&](std::span<std::byte> b) { down->receive(b); }; }
+        layers::RelayOps rops;
+        rops.save = [&](std::uint32_t layer) {
+            std::vector<std::byte> img(E->state_bytes(layer, layer + 1U));
+            E->export_state(layer, layer + 1U, img.data());
+            return img;
+        };
+        rops.load = [&](std::uint32_t layer, std::span<const std::byte> img) {
+            if (img.size() != E->state_bytes(layer, layer + 1U)) throw std::runtime_error("state relay: byte count differs from this engine's layer");
+            E->import_state(layer, layer + 1U, E->committed(), img.data());
+        };
+        rops.checksum = [](std::span<const std::byte> img) { return strix::dist::crc32c(img); };   // hardware CRC32C
+        barrier();
+        const auto rs = layers::relay_state(place, decoder_stage, first_token, up ? &ru : nullptr, down ? &rd : nullptr, rops);
+        std::printf("state relay stage %u -> decoder stage %u: %.1f MB in %llu layer messages, %.1f ms\n", place.stage, decoder_stage,
+                    double(rs.bytes) / 1e6, static_cast<unsigned long long>(rs.messages), rs.ms);
+        if (!decodes_here) return 0;
+        first_token = rs.token;
+        E->set_stage(0U, L);
+        dplace = layers::Placement{{0U, L}, 0U};
+        up.reset(); down.reset();
+    }
     // Layer-owned decode: one hidden row per cut per token, the token relayed back.
     std::vector<float> row(row_bytes / 4U);
     layers::DecodeOps d;
     d.row_bytes = row_bytes;
-    d.forward = [&](std::uint32_t tok, bool head) { o = E->forward_range(place.first(), place.last(), &tok, 1U, head ? LogitRows::last : LogitRows::none); };
+    d.forward = [&](std::uint32_t tok, bool head) { o = E->forward_range(dplace.first(), dplace.last(), &tok, 1U, head ? LogitRows::last : LogitRows::none); };
     d.top = [&] {
         std::uint32_t t = 0;
         E->read_top(o, 1, &t);
@@ -355,17 +411,17 @@ int main(int argc, char** argv) try {
     layers::Link lu, ld;
     if (up) { lu.send = [&](std::span<const std::byte> b) { up->send(b); }; lu.receive = [&](std::span<std::byte> b) { up->receive(b); }; }
     if (down) { ld.send = [&](std::span<const std::byte> b) { down->send(b); }; ld.receive = [&](std::span<std::byte> b) { down->receive(b); }; }
-    barrier();
+    if (!relay) barrier();
     ClockSampler clk;
-    const auto dec = layers::decode(place, first_token, a.gen, up ? &lu : nullptr, down ? &ld : nullptr, d);
+    const auto dec = layers::decode(dplace, first_token, a.gen, up ? &lu : nullptr, down ? &ld : nullptr, d);
     const long mhz = clk.stop();
     std::printf("generated:");
     for (auto t : dec.ids) std::printf(" %u", t);
     std::printf("\n");
     if (a.gen > 1U)
         std::printf("decode: %.2f ms/token, %.2f tok/s (stage %u, %u stages, sclk avg %ld MHz)\n", dec.total_ms / double(a.gen - 1U),
-                    1000.0 * double(a.gen - 1U) / dec.total_ms, place.stage, place.stages(), mhz);
-    if (place.head() && !a.dump.empty()) {
+                    1000.0 * double(a.gen - 1U) / dec.total_ms, place.stage, dplace.stages(), mhz);
+    if (dplace.head() && !a.dump.empty()) {
         std::ofstream f(a.dump, std::ios::binary);
         f.write(reinterpret_cast<const char*>(dumped.data()), std::streamsize(dumped.size() * 4U));
         std::printf("dumped %zu positions x %u to %s\n", dumped.size() / E->vocab(), E->vocab(), a.dump.c_str());

@@ -17,6 +17,7 @@
 #include "strix/serve/engine.hpp"
 #include "strix/serve/prefill_interleave.hpp"
 #include "strix/session/prefill_session.hpp"
+#include "strix/session/mark_plan.hpp"
 #include "glm/serve/glm_session_owner.hpp"
 #include "strix/serve/glm_chat.hpp"
 
@@ -82,6 +83,13 @@ private:
     std::vector<bool> used_;
 };
 
+// Root row of a prompt of n tokens whose first `stable` tokens are the leading system messages: a multiple of
+// kPrefixRootBlock strictly inside them and at least 2 rows before the end (session::root_mark); 0: no root.
+inline constexpr std::uint32_t kPrefixRootBlock = 1024;
+[[nodiscard]] inline std::uint64_t prefix_root_row(std::uint64_t stable, std::uint64_t n) {
+    return strix::session::root_mark(stable, n, kPrefixRootBlock, 2);
+}
+
 struct LeadConfig {
     std::uint32_t slots = 8;
     std::uint64_t capacity = 8192;
@@ -90,9 +98,17 @@ struct LeadConfig {
     // frontier so the next conversation turn restores there. A decode-produced state is not proven bitwise equal to a
     // prefill-produced one, so with this off every wire byte and every decision is the prompt-end behaviour.
     bool prefix_reply_store = false;
+    // Root store (default on, STRIX_GLM_SERVE_PREFIX_ROOT=0 off): a prompt whose leading system messages
+    // (GenerationJob::stable_prefix) repeat in other conversations also keeps its state at the root row
+    // session::root_mark(stable_prefix, n, kPrefixRootBlock, 2) on its way through the prefill, so a sibling chat (same
+    // system prompt, another user turn) restores there. The KDA state can not be cut from a longer entry, so the
+    // prefill call ends at the root row and the entry is a prompt-prefill state at a prompt row frontier (the
+    // prompt-end class). The rows every call computes are unchanged.
+    bool prefix_root = true;
     // MemAvailable probe for the pressure rule (kept entries go before a request is starved); empty: /proc/meminfo.
+    // host_floor: the RAM margin of the store rule (the serve sets the margin it resolved from the environment).
     std::function<std::optional<std::uint64_t>()> host_available;
-    std::uint64_t host_floor = kPrefixMemoryFloor;
+    std::uint64_t host_floor = kPrefixMemoryMargin;
     bool batch = true;               // false: serial admission (one request at a time)
     bool short_first = true;         // admit the shortest waiting prompt first (bounded overtakes); false: FIFO
     double heartbeat_seconds = 1.0;  // idle: one heartbeat round per interval keeps rank 1 and the link alive
@@ -169,6 +185,7 @@ struct LeadStats {
     std::uint64_t prefix_hits = 0, prefix_misses = 0, prefix_stores = 0, prefix_evictions = 0, prefix_bytes = 0;
     std::uint64_t prefix_pressure_evictions = 0, prefix_refused = 0, prefix_hit_tokens_prompt = 0, prefix_hit_tokens_reply = 0;
     std::uint64_t prefix_hits_reply = 0, prefix_stores_reply = 0, prefix_reply_skipped = 0;
+    std::uint64_t prefix_root_stores = 0, prefix_root_refused = 0;  // LeadConfig::prefix_root stores (in prefix_stores too)
     std::uint64_t finished = 0, active = 0;
     std::uint64_t rows_hist[kMaxRows + 1]{};  // steps by row count
     double step_seconds = 0, prefill_seconds = 0;
@@ -310,6 +327,7 @@ private:
         std::uint32_t slot = 0;
         std::size_t done = 0;
         unsigned chunk = 0;  // fixed at admission
+        std::uint64_t root = 0;  // root row still to store (LeadConfig::prefix_root); 0: none
         Active a;
         // RTX route: the import this prompt waits for (0: none, or fallen back to the chunked prefill)
         std::uint32_t import_id = 0;
@@ -466,6 +484,8 @@ private:
         runtime().publish_progress(p.a.state, {strix::serve::GenerationPhase::prefill, 0, 0, n});
         // Preserve the optional FAST import route's identity selection; native snapshots never replace an eligible import.
         const bool import_route = cfg_.rtx_prefill && route_on_.load() && !imp_ && n >= 2 && n >= cfg_.import_min_tokens;
+        // A restore that reaches the root leaves nothing to store (prefill_chunk compares it with `done`).
+        p.root = cfg_.prefix_cache_bytes && cfg_.prefix_root && !import_route ? prefix_root_row(request(p.a).stable_prefix, n) : 0;
         if (cfg_.prefix_cache_bytes) {
             const auto* e = import_route ? nullptr : prefix_cache_->lookup(request(p.a).prompt, p.a.mtp_ok, cfg_.prefix_identity);
             const std::uint64_t held = e ? e->id : 0;
@@ -566,7 +586,8 @@ private:
         // Each call runs the base chunk's work in layer units of the current piece (LayerUnits::base_units) through
         // the same pacer; grouping is capped at one base-equivalent: a layer unit has no per-call pass to amortize.
         // A prompt that fits one base chunk keeps the token call (one call either way).
-        if (p.units || (cfg_.prefill_units_rows != 0 && p.a.mtp_ok && p.chunk != 0 && lanes != 0 && n - p.done > p.chunk &&
+        // A root still to store keeps the token calls up to it (a units session runs to the end of the prompt).
+        if (p.units || (p.root <= p.done && cfg_.prefill_units_rows != 0 && p.a.mtp_ok && p.chunk != 0 && lanes != 0 && n - p.done > p.chunk &&
                         cfg_.prefill_units_admit && cfg_.prefill_units_admit(n - p.done))) {
             const bool start = !p.units;
             if (start) {
@@ -588,7 +609,8 @@ private:
             c.pflags = kPrefillMtp | kPrefillUnits | (start ? kPrefillStart : 0U) | (last ? kPrefillLast : 0U);
             if (start) chunk.assign(prompt.begin() + static_cast<std::ptrdiff_t>(p.done), prompt.end());
         } else {
-            const auto plan = cfg_.interleave.plan(p.chunk, n - p.done, lanes, cfg_.prefill_chunk_cap, p.ms_per_token);
+            auto plan = cfg_.interleave.plan(p.chunk, n - p.done, lanes, cfg_.prefill_chunk_cap, p.ms_per_token);
+            if (p.root > p.done) plan.tokens = std::min<std::size_t>(plan.tokens, static_cast<std::size_t>(p.root - p.done));
             m = plan.tokens;
             decode_debt_.charge(plan);
             last = p.done + m == n;
@@ -649,6 +671,7 @@ private:
             }
         }
         if (!last) {
+            if (p.root != 0 && p.done == p.root) store_root(p);
             runtime().publish_progress(p.a.state, {strix::serve::GenerationPhase::prefill, p.done, 0, n});
             return;
         }
@@ -691,18 +714,17 @@ private:
         (void)control_round(ev);
     }
 
-    // Live requests win over kept prefixes: when this rank's MemAvailable is below the floor the store rule needs,
-    // kept entries go (LRU, never a leased one) instead of the request or its snapshot being refused.
+    // Live requests win over kept prefixes: when this rank's MemAvailable is below the RAM margin (the margin the store
+    // rule leaves, prefix_pressure_shortfall), kept entries go (LRU, never a leased one) instead of the request starving.
     void relieve_pressure() {
         if (!prefix_cache_ || prefix_cache_->size() == 0) return;
         std::uint64_t shortfall = 0;
         if (cfg_.host_available) {
-            const auto avail = cfg_.host_available();
-            if (avail && *avail < cfg_.host_floor) shortfall = cfg_.host_floor - *avail;
-        } else if constexpr (requires { eng_.prefix_store_allowed(); }) {
-            if (!eng_.prefix_store_allowed()) shortfall = 1;
-        } else if (const auto avail = prefix_memory_bytes(); avail && *avail < cfg_.host_floor) {
-            shortfall = cfg_.host_floor - *avail;
+            shortfall = prefix_pressure_shortfall(cfg_.host_available(), cfg_.host_floor);
+        } else if constexpr (requires { eng_.prefix_store_allowed(std::uint64_t{0}); }) {
+            if (!eng_.prefix_store_allowed(std::uint64_t{0})) shortfall = 1;
+        } else {
+            shortfall = prefix_pressure_shortfall(prefix_memory_bytes(), cfg_.host_floor);
         }
         if (!shortfall) return;
         for (const auto id : prefix_cache_->reclaim_plan(shortfall)) evict_kept(id, true);
@@ -743,6 +765,18 @@ private:
     void store_prefix(Prefilling& p) {
         auto key = request(p.a).prompt;
         (void)store_snapshot(p.slot, p.a.mtp_ok, key.size(), false, key);
+    }
+
+    // Root store (LeadConfig::prefix_root): the prefill call just ended at the root row, so the slot holds exactly the
+    // prompt rows [0, root) (the chunk boundary every chunked prefill has; with MTP the drafter row root - 1 is the
+    // chunk-boundary case of store_prefix). Key = those ids. Refusal is counted, never an error.
+    void store_root(Prefilling& p) {
+        const auto& prompt = request(p.a).prompt;
+        std::vector<std::uint32_t> key(prompt.begin(), prompt.begin() + static_cast<std::ptrdiff_t>(p.root));
+        const bool ok = store_snapshot(p.slot, p.a.mtp_ok, p.root, false, key);
+        p.root = 0;
+        std::lock_guard<std::mutex> l(m_);
+        ++(ok ? stats_.prefix_root_stores : stats_.prefix_root_refused);
     }
 
     // Reply-end store (opt-in). The slot holds rows [0, pos): the prompt, then every emitted token except the last

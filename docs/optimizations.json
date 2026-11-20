@@ -2657,14 +2657,14 @@
   },
   {
     "engine": "glm",
-    "name": "Prefill KDA scan v5",
+    "name": "Prefill KDA scan v6",
     "flag_or_env": "STRIX_GLM_PF_KDA_SCAN",
-    "default": "5",
-    "exact": "Raw scan outputs, outputs and states bitwise equal to v3, v1 and the decode kernel on the prefill gate.",
-    "gain": "v5 1.18-1.20 vs v3 1.23-1.25 us/row per KDA layer (-3.7 %), 8K pair TTFT neutral (16.60 vs 16.60 s, 8 arms); v3: 1.84-1.93 -> 1.23-1.28 us/row per KDA layer at chunk positions 0..28672 (-33 %); 8K pair TTFT 16.63 -> 16.34 s (-1.7 %); with MLA scores v6, 32K 68.76 -> 67.72 s (-1.5 %, mean of both run orders)",
+    "default": "6",
+    "exact": "Raw scan outputs, outputs and states bitwise equal to v5, v3, v1 and the decode kernel on the prefill gate.",
+    "gain": "v6 (prep fused into the scan) prep + conv + scan 2.02 -> 1.82 us/row per KDA layer at C=4096 (2.00 -> 1.82 at C=2048) vs v5; v5 1.18-1.20 vs v3 1.23-1.25 us/row per KDA layer (-3.7 %), 8K pair TTFT neutral (16.60 vs 16.60 s, 8 arms); v3: 1.84-1.93 -> 1.23-1.28 us/row per KDA layer at chunk positions 0..28672 (-33 %); 8K pair TTFT 16.63 -> 16.34 s (-1.7 %); with MLA scores v6, 32K 68.76 -> 67.72 s (-1.5 %, mean of both run orders)",
     "preconditions": "Exact chunked prefill.",
-    "off_switch": "STRIX_GLM_PF_KDA_SCAN=3 (or 1)",
-    "doc_anchor": "docs/optimizations.md#glm-pf-kda-scan-v5"
+    "off_switch": "STRIX_GLM_PF_KDA_SCAN=5 (or 3, 1)",
+    "doc_anchor": "docs/optimizations.md#glm-pf-kda-scan-v6"
   },
   {
     "engine": "glm",
@@ -2937,7 +2937,7 @@
     "default": "4 (GiB per rank)",
     "exact": "Turn-2 tokens equal the same request replayed after clearing the cache, alone and batched, on both ranks; MTP prefix restore equals a cold run.",
     "gain": "Two-turn conversations, first turn ~4,100 tokens, turn 2 adds 53 (4,120-token prompt, 4,067 restored): turn-2 admit-to-ready 8.57-8.98 -> 0.82-0.89 s (459-481 -> 4,629-5,024 tok/s, ~10x); restore 9-11 ms",
-    "preconditions": "strix-glm5-serve; the same budget on both ranks; stores need 16 GiB MemAvailable per rank.",
+    "preconditions": "strix-glm5-serve; the same budget on both ranks; stores need MemAvailable >= snapshot + the load admission's RAM margin (8 GiB, STRIX_GLM_MEM_MARGIN_GIB) per rank.",
     "off_switch": "--prefix-cache-gib 0",
     "doc_anchor": "docs/optimizations.md#glm-serve-prefix-cache"
   },
@@ -3057,10 +3057,21 @@
     "flag_or_env": "--expert-decode-tile; STRIX_QRTX_EXPERT_DECODE_TILE (lever row expert_decode_tile)",
     "default": "ON in every profile; acts only where the tensor-core GSQ experts run (gsq_bf16_mma: the FAST expert arithmetic)",
     "exact": "Bitwise the tile form: same MMAs and scale FMAs in the same order per output. The tile form compiles to the previous instructions for every type except IQ2_S project (schedule only, same floating-point opcode multiset). Greedy ids equal on prose / edit / json; teacher-forced FAST logits identical to the tile form on 645 rows of five contents; the arithmetic contract and the bundle id do not change.",
-    "gain": "RTX PRO 6000 600 W, FAST served decode e2e: prose 127.22 -> 137.6 / 138.98, edit 342.37 -> 380.98 / 378.97, json 287.14 -> 316.32 / 317.26 tok/s (one run before, two runs after).",
-    "preconditions": "CUDA Qwen MoE (strix-cuda-qwen-serve, qwen_tf_logits) with gsq_bf16_mma experts; steps of at most 16 rows (decode, MTP verify windows, and a prefill block of at most 16 rows: a short prompt or a tail block). Prefill blocks of more than 16 rows keep the tile form.",
+    "gain": "RTX PRO 6000 600 W, FAST served decode e2e: prose 127.22 -> 137.6 / 138.98, edit 342.37 -> 380.98 / 378.97, json 287.14 -> 316.32 / 317.26 tok/s (one run before, two runs after). int8 form (no model, routed-expert calls per storage-type pair, weighted by the model's layer mix to a 48-layer step, RTX PRO 6000 600 W): int8 decode form vs FAST BF16 decode form -0.05 / -0.32 / -1.26 ms per step at 1 / 4 / 16 rows, vs the int8 tile form -0.52 / -1.49 / -6.87 ms; every decode form bitwise its tile form on the device. Not yet measured: end-to-end decode with int8 windows.",
+    "preconditions": "CUDA Qwen MoE (strix-cuda-qwen-serve, qwen_tf_logits) with gsq_bf16_mma experts or gsq_i8_turbo experts (same trait and ring; nested TURBO runs FAST's experts in decode windows, so the int8 form runs under --profile turbo --expert-turbo-rows off only); steps of at most 16 rows (decode, MTP verify windows, and a prefill block of at most 16 rows: a short prompt or a tail block). Prefill blocks of more than 16 rows keep the tile form.",
     "off_switch": "--expert-decode-tile off; STRIX_QRTX_EXPERT_DECODE_TILE=0",
     "doc_anchor": "docs/optimizations.md#qwen-rtx-expert-decode-tile"
+  },
+  {
+    "engine": "qwen-rtx",
+    "name": "TURBO: int8 tensor-core experts on large prefill blocks",
+    "flag_or_env": "--profile turbo; --expert-turbo-rows N; STRIX_QRTX_EXPERT_TURBO_ROWS (lever rows expert_turbo, expert_turbo_rows)",
+    "default": "off (explicit --profile turbo only); N = 512 under turbo",
+    "exact": "TURBO class (bit-changing). 32K logit gate vs the exact reference, 4 prompts x 128 rows: KL 0.00906, top-1 0.9844, dNLL +0.00102 (bar KL <= 0.02, top-1 >= 0.93, dNLL <= 0.01); int8 in every MoE call: KL 0.00948, top-1 0.9785, dNLL +0.00543. Bundle not marked qualified.",
+    "gain": "RTX PRO 6000 600 W, TURBO vs FAST: 8,076-token TTFT -7.2 % cold / -6.7 % warm; 32,652-token prefill -6.4 % cold / -6.6 % warm; decode equal within noise.",
+    "preconditions": "CUDA Qwen MoE (strix-cuda-qwen-serve, qwen_tf_logits); GSQ packs admitted for both arithmetics; prefill blocks of >= N rows run int8, decode / verify windows and smaller blocks the FAST BF16 experts.",
+    "off_switch": "omit --profile turbo; --expert-turbo-rows off = int8 in every MoE call",
+    "doc_anchor": "docs/optimizations.md#qwen-rtx-turbo-experts"
   },
   {
     "engine": "qwen",
@@ -3396,5 +3407,18 @@
     "preconditions": "CUDA Qwen dense spec CLI with the MTP chain drafter (chain-only and hybrid blocks); other drafters and engines run the serial form.",
     "off_switch": "--prelaunch 0",
     "doc_anchor": "docs/optimizations.md#qwen-dense-cuda-verify-prelaunch"
-  }
+  },
+  {
+    "engine": "qwen-rtx",
+    "name": "Qwen 27B CUDA spec: K/V-only MTP catch-up",
+    "flag_or_env": "--mtp-catchup kv|full",
+    "default": "kv",
+    "exact": "EXACT: catch-up chunks nobody reads issue the same K/V projections in the same order; ids, steps and k histogram equal to full (one pair, large prompt route).",
+    "gain": "RTX PRO 6000 Blackwell, 28,187-token prompt, large prompt route, one pair: MTP feed 1.960 -> 0.091 s; decode unchanged. Not yet measured: the default windows route.",
+    "preconditions": "Engines with the mtp_kv hook (CUDA Qwen 27B dense spec CLI); others unchanged.",
+    "off_switch": "--mtp-catchup full",
+    "doc_anchor": "docs/optimizations.md#qwen27-cuda-mtp-kv-catchup"
+  },
+  {"engine":"qwen","name":"Qwen 27B exact tensor-parallel decode over two nodes","flag_or_env":"--tp-rank 0|1; --tp-transport; --tp-rates A,B; --tp-trip-us; --tp-force; --topology FILE --node ID; STRIX_TOPOLOGY; STRIX_TP_F16_GATHER; STRIX_TP_SPLIT_DRAFT","default":"off (one node) unless --tp-rank is given; the shared split planner keeps one node when the group does not win","exact":"Generated ids equal the one-node plain reference over 1,200 tokens (code prompt) with the levers on and off, and over 200 plain tokens.","gain":"Two nodes over USB4, EXACT, code prompt, 1,200 tokens with MTP speculation: one node 46.76 / 46.68 tok/s, tensor parallel 58.50 tok/s (+25 %).","preconditions":"Both ranks hold the model; per-rank read rates from --tp-rates or the topology declaration (no compiled default); the trip cost is measured at start-up and agreed by both ranks.","off_switch":"omit --tp-rank; STRIX_TP_F16_GATHER=0 / STRIX_TP_SPLIT_DRAFT=0 for the levers","doc_anchor":"docs/optimizations.md#qwen-27b-exact-tensor-parallel-decode-over-two-nodes"},
+  {"engine":"qwen","name":"Qwen 27B pair prefill: decode relay to one node","flag_or_env":"STRIX_PAIR_DECODE_RELAY","default":"off (layer-owned decode)","exact":"None on this tree yet.","gain":"Not measured on this tree.","preconditions":"Every node's memory declared; the chain planner chooses a decoder that holds the whole model.","off_switch":"STRIX_PAIR_DECODE_RELAY=0 or unset","doc_anchor":"docs/optimizations.md#qwen-27b-pair-prefill-decode-relay-to-one-node"}
 ]

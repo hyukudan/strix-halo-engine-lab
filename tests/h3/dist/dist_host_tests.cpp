@@ -7,6 +7,7 @@
 // Exit status: 0 PASSED, 1 FAILED, 77 SKIPPED (a requested fixture mode had no assets; never reported as PASSED).
 // Gate (G3 on the host): 1 node (block_forward_host with the canonical 2-block split) == world 1 == world 2
 // (rank 0 | rank 1 concatenated) == world 2 with swapped ranks, bitwise, per block (FNV-1a of each key block's rows).
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -377,9 +378,41 @@ void admission_tests() {
     check(n_rej == 8, "--forms rejected: empty, w2, w2,w1, w1,w1, w1,w2,w2, w1,w3, w1,<empty>, W1 (" + std::to_string(n_rej) + "/8)");
 }
 
+// ForwardTables::update keeps the rope (and its id) while (position ids, inv_freq) are unchanged and leaves the same
+// bytes as a fresh build for every plan; a new layout or new inv_freq recomputes it under a new id.
+void forward_tables_tests() {
+    block::GlobalWeights g;
+    for (unsigned i = 0; i < 16; ++i) g.inv_freq.push_back(std::pow(10000.0F, -static_cast<float>(i) / 16.0F));
+    const block::PackedLayout L = block::PackedLayout::build(8, 1, 4, 6, 0), L2 = block::PackedLayout::build(8, 1, 6, 4, 0);
+    const block::ForwardPlan p1 = block::ForwardPlan::build(L, 0.9F, {}), p2 = block::ForwardPlan::build(L, 0.4F, {}),
+                             q = block::ForwardPlan::build(L2, 0.4F, {});
+    for (const auto* p : {&p1, &p2, &q})  // one-hot timestep schedule: t_emb without curve weights
+        for (const float tv : p->t_vals)
+            if (std::find(g.discrete_times.begin(), g.discrete_times.end(), tv) == g.discrete_times.end()) g.discrete_times.push_back(tv);
+    g.basis = static_cast<std::uint32_t>(g.discrete_times.size());
+    auto same = [](const ForwardTables& a, const ForwardTables& b) {
+        return a.t_emb == b.t_emb && a.n_t == b.n_t && a.rope.seq == b.rope.seq && a.rope.c == b.rope.c && a.rope.s == b.rope.s &&
+               a.mod_row == b.mod_row;
+    };
+    ForwardTables t;
+    t.update(g, L, p1);
+    const std::uint64_t id1 = t.rope_id;
+    check(id1 != 0 && same(t, ForwardTables::build(g, L, p1)), "forward tables: first update == build");
+    t.update(g, L, p2);
+    check(t.rope_id == id1 && same(t, ForwardTables::build(g, L, p2)), "forward tables: new sigma keeps the rope, == build");
+    t.update(g, L2, q);
+    check(L2.position_ids != L.position_ids && t.rope_id != id1 && same(t, ForwardTables::build(g, L2, q)),
+          "forward tables: new layout recomputes the rope, == build");
+    const std::uint64_t id2 = t.rope_id;
+    g.inv_freq[3] *= 2.0F;
+    t.update(g, L2, q);
+    check(t.rope_id != id2 && same(t, ForwardTables::build(g, L2, q)), "forward tables: new inv_freq recomputes the rope");
+}
+
 void unit_tests() {
     std::printf("[unit]\n");
     admission_tests();
+    forward_tables_tests();
     check(crc32c_sw("123456789", 9) == 0xE3069283U, "crc32c check value");
     {
         const Split a = Split::of(400), b = Split::of(37910);

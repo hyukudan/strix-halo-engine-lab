@@ -159,6 +159,54 @@ template <int Kind> __global__ __launch_bounds__(256) void rescale_rate(int iter
     if (s == 1234.5F) out[t] = s;
 }
 
+// sd_i4 arms (contract dense-iu4a4-rot-v1, core/iu4a4_rot.hpp; measurement only): 8 column tiles per wave (the
+// register budget of the planned trait), per 128-K block 4 A groups of 32 (Kind 6) or 2 of 64 (Kind 7). C is cumulative
+// (never reset); t = lead * C + sum_g e_g * C with 24-bit multiplies (Abel form: no convert per A group), then
+// acc = fma(float(t), wstep, acc) once per block. e / lead (8 rows per lane) and wstep (one per tile) are loaded from a
+// cache-resident table per group / block, as the production loop would. Values are not meaningful (timing only).
+template <int Kind> __global__ __launch_bounds__(256) void rot_rate(int iters, const int* __restrict__ coef, const float* __restrict__ ws, float* out) {
+    using I8 = int __attribute__((ext_vector_type(8)));
+    using I2 = int __attribute__((ext_vector_type(2)));
+    using F8 = float __attribute__((ext_vector_type(8)));
+    constexpr unsigned kT = 8U, kG = Kind == 6 ? 4U : 2U, kU = 8U / kG;  // tiles, A groups per block, K16 units per group
+    const unsigned t = threadIdx.x, lane = t & 31U;
+    const I2 a = {int(t), int(t * 3U)}, b = {int(t ^ 1U), int(t ^ 2U)};
+    I8 c[kT], s[kT];
+    F8 acc[kT];
+    for (unsigned q = 0; q < kT; ++q)
+        for (unsigned e = 0; e < 8U; ++e) c[q][e] = 0, s[q][e] = 0, acc[q][e] = 0.0F;
+    for (int i = 0; i < iters; ++i) {
+        const I8* cf = reinterpret_cast<const I8*>(coef) + (unsigned(i) & 63U) * (kG + 1U) * 32U + lane;
+        const I8 lead = cf[kG * 32U];
+#pragma unroll
+        for (unsigned q = 0; q < kT; ++q)
+#pragma unroll
+            for (unsigned e = 0; e < 8U; ++e) s[q][e] = __mul24(lead[e], c[q][e]);
+#pragma unroll
+        for (unsigned g = 0; g < kG; ++g) {
+            const I8 eg = cf[g * 32U];
+#pragma unroll
+            for (unsigned k = 0; k < kU; ++k)
+#pragma unroll
+                for (unsigned q = 0; q < kT; ++q) c[q] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, a, true, b, c[q], false);
+#pragma unroll
+            for (unsigned q = 0; q < kT; ++q)
+#pragma unroll
+                for (unsigned e = 0; e < 8U; ++e) s[q][e] += __mul24(eg[e], c[q][e]);
+        }
+        const float* w = ws + (unsigned(i) & 63U) * kT * 32U + lane;
+#pragma unroll
+        for (unsigned q = 0; q < kT; ++q) {
+            const float sw = w[q * 32U];
+#pragma unroll
+            for (unsigned e = 0; e < 8U; ++e) acc[q][e] = __builtin_fmaf(float(s[q][e]), sw, acc[q][e]);
+        }
+    }
+    float r = 0.0F;
+    for (unsigned q = 0; q < kT; ++q) r += acc[q][q];
+    if (r == 1234.5F) out[t] = r;
+}
+
 template <class F> static double time_us(F&& launch, int reps = 20);
 __device__ __forceinline__ float act_silu(float g) { return g / (1.0F + expf(-g)); }
 struct ActSilu {
@@ -252,6 +300,15 @@ static int rates() {
     std::printf("rate a4g64-magic %.1f TOPS\n", ops16 / time_us([&] { hipLaunchKernelGGL(rescale_rate<3>, dim3(640), dim3(256), 0, nullptr, iters, o); }, 5) / 1e6);
     std::printf("rate a4g32-magic %.1f TOPS\n", ops16 / time_us([&] { hipLaunchKernelGGL(rescale_rate<4>, dim3(640), dim3(256), 0, nullptr, iters, o); }, 5) / 1e6);
     std::printf("rate a4g32-cvt %.1f TOPS\n", ops16 / time_us([&] { hipLaunchKernelGGL(rescale_rate<5>, dim3(640), dim3(256), 0, nullptr, iters, o); }, 5) / 1e6);
+    // sd_i4: 64 WMMAs per iteration at iters / 4 = the same work as ops16.
+    int* coef = nullptr;
+    float* wsb = nullptr;
+    CK(hipMalloc(&coef, 64U * 5U * 32U * 8U * sizeof(int)));
+    CK(hipMalloc(&wsb, 64U * 8U * 32U * sizeof(float)));
+    CK(hipMemset(coef, 0, 64U * 5U * 32U * 8U * sizeof(int)));
+    CK(hipMemset(wsb, 0, 64U * 8U * 32U * sizeof(float)));
+    std::printf("rate a4i-g32-w128-abel %.1f TOPS\n", ops16 / time_us([&] { hipLaunchKernelGGL(rot_rate<6>, dim3(640), dim3(256), 0, nullptr, iters / 4, coef, wsb, o); }, 5) / 1e6);
+    std::printf("rate a4i-g64-w128-abel %.1f TOPS\n", ops16 / time_us([&] { hipLaunchKernelGGL(rot_rate<7>, dim3(640), dim3(256), 0, nullptr, iters / 4, coef, wsb, o); }, 5) / 1e6);
     return 0;
 }
 // ldsfloor mode (diagnostic, values meaningless): the tall core's WMMA loop with its operands read from a FIXED LDS

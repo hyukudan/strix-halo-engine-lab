@@ -7,6 +7,9 @@
 // and the null-relative gate limit falls to its floor. fp16_ulp_up_bits returns the next FP16 value above round-to-FP16
 // of x (as f32 bits): the smallest move of x whose FP16 rounding always differs from x's. Non-finite x is unchanged.
 #include <cstdint>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
 #define STRIX_NULL_PERTURB_HD __host__ __device__
@@ -35,6 +38,36 @@ STRIX_NULL_PERTURB_HD inline std::uint32_t fp16_ulp_up_bits(std::uint32_t bits) 
     if (((bits >> 23) & 0xffU) == 0xffU) return bits;
     const float r = round_fp16_value(__builtin_bit_cast(float, bits));
     return __builtin_bit_cast(std::uint32_t, r + fp16_spacing(r < 0.0f ? -r : r));
+}
+
+// Gate null site of the dense engines (test hook, host-only): "LAYER:POS:ELEM" = one FP16 ulp (fp16_ulp_up_bits) on
+// residual element ELEM of the row at absolute position POS at the input of layer LAYER. Fields are decimal;
+// LAYER < layers, ELEM < width, POS < 2^32. Anything else throws std::invalid_argument naming the variable.
+struct NullSite {
+    unsigned layer = 0;
+    std::uint64_t pos = 0;
+    unsigned elem = 0;
+};
+
+inline NullSite parse_null_site(std::string_view text, unsigned layers, unsigned width, const char* name) {
+    const auto bad = [&] {
+        return std::invalid_argument(std::string(name) + " must be LAYER:POS:ELEM (decimal, LAYER < " + std::to_string(layers) +
+                                     ", ELEM < " + std::to_string(width) + "), got '" + std::string(text) + "'");
+    };
+    std::uint64_t v[3] = {};
+    for (unsigned i = 0; i < 3U; ++i) {
+        const auto colon = text.find(':');
+        if ((colon == std::string_view::npos) != (i == 2U)) throw bad();
+        const std::string_view t = text.substr(0, colon);
+        if (t.empty() || t.size() > 10U) throw bad();
+        for (const char c : t) {
+            if (c < '0' || c > '9') throw bad();
+            v[i] = v[i] * 10U + static_cast<std::uint64_t>(c - '0');
+        }
+        if (i < 2U) text.remove_prefix(colon + 1);
+    }
+    if (v[0] >= layers || v[2] >= width || v[1] > 0xffffffffULL) throw bad();
+    return NullSite{static_cast<unsigned>(v[0]), v[1], static_cast<unsigned>(v[2])};
 }
 
 }  // namespace strix::core
