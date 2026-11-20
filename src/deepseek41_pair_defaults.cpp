@@ -5,6 +5,7 @@
 #include "strix/deepseek41_pair_defaults.hpp"
 #include "strix/deepseek41_pair_profile_table.hpp"
 #include "strix/deepseek41_serve_cache_policy.hpp"
+#include "strix/host_memory.hpp"
 #include "strix/session/speculation_default.hpp"
 
 #include <algorithm>
@@ -90,7 +91,12 @@ void resolve_sessions(App app, Resolved& r, const Getenv& env, const Probe& prob
         try { return probe.available_memory ? probe.available_memory() : 0; }
         catch (const std::exception&) { return 0; }
     }();
-    const auto default_ram = std::min<std::uint64_t>(8ULL << 30U, available / 10U);
+    // The pool never takes the shared host floor (unchanged while MemAvailable >= 10/9 of the floor).
+    const auto usable = [&]() -> std::uint64_t {
+        try { return probe.usable_memory ? probe.usable_memory() : UINT64_MAX; }
+        catch (const std::exception&) { return 0; }
+    }();
+    const auto default_ram = std::min<std::uint64_t>({8ULL << 30U, available / 10U, usable});
     c.ram_bytes = number(value("--session-ram-bytes", "STRIX_SESSION_RAM_BYTES",
         std::to_string(default_ram)), default_ram);
     const auto legacy_mb = last_value(r.args, "--session-cache-mb");
@@ -482,15 +488,12 @@ Effective::Effective(App app, int& argc, char**& argv, const Build& build) {
         status.dwLength = sizeof(status);
         return GlobalMemoryStatusEx(&status) ? status.ullAvailPhys : 0;
 #else
-        std::ifstream meminfo("/proc/meminfo");
-        for (std::string key, unit; meminfo >> key;) {
-            std::uint64_t kb = 0;
-            meminfo >> kb; std::getline(meminfo, unit);
-            if (key == "MemAvailable:") return kb * 1024U;
-        }
-        return 0;
+        return ::strix::host_memory::read_meminfo().available;
 #endif
     };
+#ifndef _WIN32
+    probe.usable_memory = [] { return ::strix::host_memory::usable_above_floor(::strix::host_memory::read_meminfo()); };
+#endif
     probe.writable_space = [](const std::string& p) -> std::uint64_t {
         std::error_code ec;
         std::filesystem::create_directories(p, ec);

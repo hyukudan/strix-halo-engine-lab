@@ -181,6 +181,17 @@ void PrefixCache::invalidate_resident(KvHandle h) noexcept {
 void PrefixCache::invalidate_residents() noexcept {
   owner_->remove(scope_, [](const auto& c) { return bool(c.resident); });
 }
+std::size_t PrefixCache::purge_prefixes(std::span<const std::uint32_t> prompt, const Identity& identity) noexcept {
+  std::size_t removed = 0;
+  owner_->remove(scope_, [&](const PrefixCacheCheckpoint& c) {
+    if (!c.snapshot || c.snapshot->identity != identity) return false;
+    const auto& tokens = c.snapshot->state.tokens;
+    const bool hit = tokens.size() <= prompt.size() && prefix_length(tokens, prompt) == tokens.size();
+    removed += hit ? 1U : 0U;
+    return hit;
+  });
+  return removed;
+}
 bool PrefixCache::unpin(const std::string& keep) { return owner_->unpin(scope_, keep); }
 
 std::shared_ptr<const PrefixSnapshot> PrefixCache::lookup(

@@ -5,6 +5,7 @@
 // effective configuration (see mm_defaults.hpp).
 #include "minimax/engine/mm_defaults.hpp"
 #include "strix/env_flags.hpp"
+#include "strix/host_memory.hpp"
 #include "minimax/engine/mm_profile_table.hpp"
 #include "minimax/engine/route_identity.hpp"
 #include "core/layer_set.hpp"
@@ -602,21 +603,22 @@ SessionConfig session_config(const Cli& cli, const Lookup& env, std::uint64_t av
                              bool explicit_cli, const std::string& explicit_directory) {
     auto c = session_policy(cli, env, explicit_cli);
     auto value = [&](const char* key, const char* fallback) { const char* v = env(key); return std::string(v ? v : fallback); };
+    std::uint64_t total = 0;  // unknown when the caller passes MemAvailable: the floor keeps its 4 GiB minimum
     if (available == UINT64_MAX) {
         available = 0;
 #ifdef _WIN32
         MEMORYSTATUSEX m{}; m.dwLength = sizeof(m);
-        if (GlobalMemoryStatusEx(&m)) available = m.ullAvailPhys;
+        if (GlobalMemoryStatusEx(&m)) { available = m.ullAvailPhys; total = m.ullTotalPhys; }
 #else
-        std::ifstream mem("/proc/meminfo"); std::string line;
-        while (std::getline(mem, line)) if (line.starts_with("MemAvailable:")) {
-            std::istringstream in(line.substr(13)); in >> available; available *= 1024; break;
-        }
+        const auto reading = ::strix::host_memory::read_meminfo();
+        available = reading.available; total = reading.total;
 #endif
     }
     // MemAvailable is read after the model load, so it is what remains for the host; a quarter admits the six-peak
     // capture guard at the default 8256-token context on the two-node serve route (~31 GB available -> ~7.7 GB).
-    c.ram_bytes = std::min<std::uint64_t>(8ULL << 30, available / 4);
+    // The pool never takes the shared host floor (unchanged while MemAvailable >= 4/3 of the floor).
+    const auto host_floor = ::strix::host_memory::floor_bytes(total);
+    c.ram_bytes = std::min<std::uint64_t>({8ULL << 30, available / 4, available > host_floor ? available - host_floor : 0});
     if (env("STRIX_SESSION_RAM_BYTES")) c.ram_bytes = std::stoull(value("STRIX_SESSION_RAM_BYTES", "0"));
     auto xdg = value("XDG_CACHE_HOME", "");
     auto home = value("HOME", "");

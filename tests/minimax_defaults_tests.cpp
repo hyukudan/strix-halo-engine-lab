@@ -403,6 +403,15 @@ void test_session_defaults() {
     check(c.enabled && c.reason.empty() && c.route == "serve/usb4-auto/fixed-width-one-session-v1" &&
           c.ram_bytes == (8ULL << 30) && c.max_parked == 8 && !c.disk, "qualified serve route admits by default");
     {
+        // Shared host floor (4 GiB minimum): a quarter of 31 GB is unchanged; a short node is clamped to
+        // MemAvailable - floor, and the capture-peak check then declines the pool instead of eating the floor.
+        check(md::session_config(cli, lookup(env), 31ULL << 30).ram_bytes == (31ULL << 30) / 4, "floor leaves 31 GiB unchanged");
+        const auto short_node = md::session_config(cli, lookup(env), 5ULL << 30);
+        check(short_node.ram_bytes == (1ULL << 30) && !short_node.enabled &&
+              short_node.reason == "budget/MemAvailable below one session capture peak", "short node clamped to the floor");
+        check(md::session_config(cli, lookup(env), 3ULL << 30).ram_bytes == 0, "below the floor: no pool");
+    }
+    {
         md::Cli tcp = cli; tcp.transport = "tcp-listen:9000";
         const auto other = md::session_config(tcp, lookup(env), 100ULL << 30);
         check(!other.enabled && other.reason == "route not yet GPU-qualified: serve/tcp-listen:9000/fixed-width-one-session-v1",

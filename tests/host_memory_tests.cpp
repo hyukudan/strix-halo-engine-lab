@@ -116,6 +116,40 @@ void test_wait() {
     }
 }
 
+void test_floor() {
+    require(hm::floor_bytes(0) == 4 * hm::kGiB, "unknown total keeps 4 GiB");
+    require(hm::floor_bytes(128 * hm::kGiB) == 4 * hm::kGiB, "128 GiB node: 4 GiB");
+    require(hm::floor_bytes(512 * hm::kGiB) == 16 * hm::kGiB, "512 GiB node: total / 32");
+    hm::Reading r;
+    r.total = 128 * hm::kGiB; r.available = 20 * hm::kGiB; r.free = r.available; r.ok = true;
+    require(hm::usable_above_floor(r) == 16 * hm::kGiB, "usable = available - floor");
+    require(hm::admit(16 * hm::kGiB, r).admitted, "need == usable fits");
+    const auto short_by_one = hm::admit(16 * hm::kGiB + 1, r);
+    require(!short_by_one.admitted && short_by_one.reason.find("short: need") == 0, "one byte over is short");
+    require(!hm::admit(UINT64_MAX, r).admitted, "oversized need cannot wrap into a fit");
+    r.available = 3 * hm::kGiB;
+    require(hm::usable_above_floor(r) == 0 && !hm::admit(1, r).admitted, "below the floor admits nothing");
+    r.ok = false; r.available = 100 * hm::kGiB;
+    require(hm::usable_above_floor(r) == 0 && !hm::admit(0, r).admitted, "unreadable admits nothing");
+}
+
+void test_governor() {
+    const auto psi = [](double some10, double full10) {
+        hm::Psi p; p.some10 = some10; p.full10 = full10; p.ok = true; return p;
+    };
+    hm::PressureGovernor g;
+    require(g.update(psi(0, 0), 0) == hm::Pressure::none, "calm node: none");
+    require(g.update(psi(12, 0), 1) == hm::Pressure::warning, "some10 >= 10: warning at once");
+    require(g.update(psi(30, 26), 2) == hm::Pressure::critical, "full10 >= 25: critical at once");
+    require(g.update(psi(0, 0), 3) == hm::Pressure::critical, "a fall waits for calm");
+    require(g.update(psi(11, 0), 20) == hm::Pressure::critical, "still inside the calm spell");
+    require(g.update(psi(0, 0), 33) == hm::Pressure::warning, "after 30 s: highest level seen while calm");
+    require(g.update(psi(0, 0), 34) == hm::Pressure::warning, "the next spell starts again");
+    require(g.update(psi(0, 0), 64) == hm::Pressure::none, "back to none after another calm spell");
+    require(g.update(hm::Psi{}, 65) == hm::Pressure::none, "no PSI file: none");
+    require(std::string(hm::pressure_name(hm::Pressure::critical)) == "critical", "name");
+}
+
 void test_live() {
 #if defined(__linux__)
     const auto r = hm::read_meminfo();
@@ -137,6 +171,8 @@ int main() {
 #endif
     test_parse();
     test_wait();
+    test_floor();
+    test_governor();
     test_live();
     if (failures) { std::cerr << failures << " failure(s)\n"; return 1; }
     std::cout << "host_memory tests: PASS\n";

@@ -209,6 +209,9 @@ struct AdvanceResult {
     // Authoritative work for this entire advance (input AND output). output.rows
     // remains unset in advance results: never count the same work twice.
     EffectiveRows rows{};
+    // With an error only: the lane's logits were not finite. The runtime then purges every cached
+    // state on the lane's prompt path (serve::SessionRuntime::purge_nonfinite), not only the slot.
+    bool nonfinite = false;
 };
 
 // Lower-level model/session contract, independently adaptable to the existing

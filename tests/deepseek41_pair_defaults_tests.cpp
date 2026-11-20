@@ -110,10 +110,12 @@ struct World {
     std::set<std::string> dirs = {MD, PACKS, PACKS + "/ours-K4", PACKS + "/ours-K5", PACKS + "/vocab"};
     pd::Build build{true};
     std::uint64_t memory = 64ULL << 30U, free_disk = 512ULL << 30U;
+    std::uint64_t usable = UINT64_MAX;  // MemAvailable - host floor; UINT64_MAX leaves the probe unset
 
     pd::Resolved run(pd::App app, const std::vector<std::string>& args) const {
         pd::Probe p;
         p.available_memory = [this] { return memory; };
+        if (usable != UINT64_MAX) p.usable_memory = [this] { return usable; };
         p.writable_space = [this](const std::string&) { return free_disk; };
         p.file = [this](const std::string& f) { return files.count(f) != 0; };
         p.dir = [this](const std::string& d) { return dirs.count(d) != 0; };
@@ -303,6 +305,16 @@ void test_session_defaults() {
     auto r = w.run(pd::App::serve, args);
     check(!r.session.enabled && !r.session.disk, "unqualified target serving defaults OFF");
     check(r.session.ram_bytes == w.memory / 10 && r.session.max_parked == 8, "RAM defaults");
+    {
+        // Shared host floor (4 GiB on a 128 GiB node): no change while MemAvailable/10 <= MemAvailable - floor ...
+        World f = w; f.usable = f.memory - (4ULL << 30U);
+        check(f.run(pd::App::serve, args).session.ram_bytes == f.memory / 10, "floor leaves a roomy node unchanged");
+        // ... and the pool never takes the floor when memory is short (MemAvailable 4.2 GiB -> 0.2 GiB usable).
+        f.memory = (42ULL << 30U) / 10U; f.usable = f.memory - (4ULL << 30U);
+        check(f.run(pd::App::serve, args).session.ram_bytes == f.usable, "short node: pool clamped to MemAvailable - floor");
+        f.usable = 0;
+        check(f.run(pd::App::serve, args).session.ram_bytes == 0, "below the floor: no automatic pool");
+    }
     check(r.session.disk_bytes == 0 && r.session.directory == "cache-home/.cache/strix-engine/sessions", "disk defaults");
     const std::string session_lines = "session cache off\nsession ram_bytes 6871947673\nsession max_parked 8\n"
         "session disk off\nsession disk_bytes 0\nsession directory cache-home/.cache/strix-engine/sessions\n"

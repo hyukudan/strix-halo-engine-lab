@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strix/host_memory.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/session/engine.hpp"
 #include "strix/session/kv.hpp"
@@ -55,6 +56,9 @@ struct SessionCacheStats {
     // count records certified at completion, claim_refused the reply claims the runtime declined to certify.
     std::uint64_t resident_hits = 0, resident_misses = 0, resident_hit_rows = 0, resident_reply_hits = 0;
     std::uint64_t resident_kept = 0, resident_reply_kept = 0, resident_claim_refused = 0;
+    // Retentions declined at critical host memory pressure; lanes reported with non-finite logits and the cached
+    // snapshots purged for them.
+    std::uint64_t pressure_refused = 0, nonfinite_lanes = 0, nonfinite_purged = 0;
 };
 // A family's explicit claim that a lane ended on a committed frontier whose first `rows` rows are canonical model
 // state for tokens prompt + reply: rows == prompt.size() + reply_tokens == the store's consumed frontier. Only the
@@ -158,6 +162,10 @@ struct SessionHooks {
     // before capture_prompt. False refuses caching; throw fails caching only.
     // Absent preserves producers that prepare their candidate during commit.
     std::function<bool(const SessionView&)> turn_snapshot;
+    // Host memory pressure, read right before each NEW prefix / turn retention. Absent: the shared governor
+    // (strix/host_memory.hpp PressureGovernor) on /proc/pressure/memory. At critical no new state is retained; the
+    // reply itself is unaffected. Resident records are not gated (they keep only the free slot's own KV).
+    std::function<host_memory::Pressure()> memory_pressure;
 };
 
 // Fixture policy: whole-suffix prefill, then ordered native decode batches.
@@ -238,6 +246,11 @@ public:
     // Native protocol already formed its complete terminal receipt. Replace,
     // never merge/add its output accounting; completion still owns the lease.
     void complete_native(session::KvHandle, GenerationStats, std::string error = {});
+    // Owner-thread native callback, before complete(): the lane's logits were not finite. Every cached snapshot of
+    // this identity whose tokens are a prefix of the lane's prompt (the state it restored from and any checkpoint it
+    // stored on the way) and its resident record are purged; nothing more is retained for the lane. Generic engines
+    // report the same through AdvanceResult::nonfinite.
+    void purge_nonfinite(session::KvHandle);
     void wait_for(std::chrono::milliseconds, bool generation_ready = false);
     bool stopping() const;
 private:

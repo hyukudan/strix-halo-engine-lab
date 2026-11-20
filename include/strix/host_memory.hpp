@@ -1,7 +1,9 @@
 #pragma once
-// Host memory readings and the recovery wait: one home for every engine (host only, no device headers, no engine
-// dependency).
+// Host memory readings, the admission floor, the recovery wait and the pressure level: one home for every engine (host
+// only, no device headers, no engine dependency).
 //
+//   floor      every load or pool admission leaves max(4 GiB, MemTotal / 32) of MemAvailable untouched.
+//   pressure   PressureGovernor turns PSI averages into none / warning / critical (rise at once, fall after calm).
 //   readings   one parser for the kernel's "Key:   N kB" counter files (/proc/meminfo, /proc/self/status) and one for
 //              the memory pressure file (/proc/pressure/memory). Engines read through these instead of private parsers.
 //   recovery   a process that is still exiting (the previous run of a back-to-back sequence) gives its memory back over
@@ -139,6 +141,40 @@ inline std::string gib_str(std::uint64_t bytes) {
     return b;
 }
 
+// ---- Floor and admission -------------------------------------------------------------------------------------------
+// Floor kept free under every load or pool admission. On a unified-memory node (the GPU allocates host RAM) a process
+// that drives MemAvailable to zero stalls the whole node in reclaim; the floor is max(4 GiB, MemTotal / 32), i.e.
+// 4 GiB on a 128 GiB node. An unknown MemTotal (0) still keeps 4 GiB.
+inline constexpr std::uint64_t floor_bytes(std::uint64_t mem_total) {
+    return std::max<std::uint64_t>(4U * kGiB, mem_total / 32U);
+}
+// Bytes a new consumer may take: MemAvailable - floor, saturating at 0 (an unreadable reading gives 0).
+inline std::uint64_t usable_above_floor(const Reading& r) {
+    const std::uint64_t f = floor_bytes(r.total);
+    return r.ok && r.available > f ? r.available - f : 0;
+}
+
+struct Admission {
+    bool admitted = false;
+    std::uint64_t need = 0, available = 0, floor = 0;
+    std::string reason;
+};
+
+// need <= MemAvailable - floor, by subtraction (an oversized need cannot wrap into a fit). An unreadable meminfo admits
+// nothing: the caller decides whether that is fatal.
+inline Admission admit(std::uint64_t need, const Reading& r) {
+    Admission a;
+    a.need = need;
+    a.available = r.available;
+    a.floor = floor_bytes(r.total);
+    if (!r.ok) { a.reason = "host memory unreadable (/proc/meminfo)"; return a; }
+    a.admitted = need <= usable_above_floor(r);
+    a.reason = std::string(a.admitted ? "fits: need " : "short: need ") + gib_str(need) + " GiB " +
+               (a.admitted ? "<=" : ">") + " MemAvailable " + gib_str(r.available) + " GiB - floor " + gib_str(a.floor) +
+               " GiB";
+    return a;
+}
+
 // ---- Recovery wait -------------------------------------------------------------------------------------------------
 struct WaitPolicy {
     double max_wait_s = 30;          // STRIX_HOST_MEMORY_WAIT_S (0 = never wait)
@@ -193,5 +229,57 @@ inline std::string describe(const WaitResult& w) {
            std::to_string(static_cast<long>(w.waited_s * 1000.0)) + " ms, MemAvailable " + gib_str(w.first_available) +
            " -> " + gib_str(w.last_available) + " GiB";
 }
+
+// ---- Pressure governor ---------------------------------------------------------------------------------------------
+// PSI averages -> none / warning / critical. A rise is taken at once; a fall only after calm_s of readings below the
+// current level (then straight to the highest level seen during the calm spell). Pool owners stop growing at critical.
+enum class Pressure { none, warning, critical };
+inline const char* pressure_name(Pressure p) {
+    return p == Pressure::critical ? "critical" : p == Pressure::warning ? "warning" : "none";
+}
+
+struct PressureThresholds {
+    double warn_some10 = 10;  // some task stalled on memory 10 % of the last 10 s: reclaim is visible
+    double warn_full10 = 2;   // every task stalled 2 % of the time: the node is reclaiming hard
+    double crit_full10 = 25;  // thrash: the level the GLM load watchdog aborts at
+    double calm_s = 30;
+};
+
+inline Pressure classify(const Psi& p, const PressureThresholds& t) {
+    if (!p.ok) return Pressure::none;
+    if (t.crit_full10 > 0 && p.full10 >= t.crit_full10) return Pressure::critical;
+    if ((t.warn_full10 > 0 && p.full10 >= t.warn_full10) || (t.warn_some10 > 0 && p.some10 >= t.warn_some10))
+        return Pressure::warning;
+    return Pressure::none;
+}
+
+class PressureGovernor {
+public:
+    explicit PressureGovernor(PressureThresholds t = {}) : t_(t) {}
+    Pressure update(const Psi& p, double now_s) {
+        const Pressure seen = classify(p, t_);
+        if (seen >= level_) {
+            level_ = seen;
+            calm_since_ = -1;
+            calm_max_ = Pressure::none;
+            return level_;
+        }
+        if (calm_since_ < 0) { calm_since_ = now_s; calm_max_ = seen; }
+        calm_max_ = std::max(calm_max_, seen);
+        if (now_s - calm_since_ >= t_.calm_s) {
+            level_ = calm_max_;
+            calm_since_ = -1;
+            calm_max_ = Pressure::none;
+        }
+        return level_;
+    }
+    [[nodiscard]] Pressure level() const { return level_; }
+
+private:
+    PressureThresholds t_;
+    Pressure level_ = Pressure::none;
+    double calm_since_ = -1;
+    Pressure calm_max_ = Pressure::none;
+};
 
 }  // namespace strix::host_memory

@@ -108,6 +108,10 @@ public:
       const Identity&, std::uint64_t alignment) const;
   void invalidate_resident(KvHandle) noexcept;
   void invalidate_residents() noexcept;
+  // Removes every snapshot of `identity` (prompt and completed-turn entries, kept or not) whose tokens are a prefix
+  // of `prompt`, including an entry equal to it. Used when a request on that path produced non-finite logits: any
+  // of those states may be the poisoned one. Returns the number removed. Leases already taken stay valid.
+  std::size_t purge_prefixes(std::span<const std::uint32_t> prompt, const Identity& identity) noexcept;
   [[nodiscard]] std::shared_ptr<const PrefixSnapshot> lookup(
       std::span<const std::uint32_t>, const Identity&) const;
   [[nodiscard]] std::shared_ptr<const PrefixSnapshot> lookup_turn(

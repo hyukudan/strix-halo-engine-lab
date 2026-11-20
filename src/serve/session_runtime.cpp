@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <map>
 #include <optional>
@@ -104,6 +105,7 @@ struct SessionRuntime::Impl {
         std::uint32_t phase_remaining = 0;
         std::stop_source cancel;
         bool done = false, receipt_done = false, cache_cleanup = false;
+        bool nonfinite = false;  // logits were not finite: nothing more is retained for this lane
         std::string publication_error;
         session::Identity resident_identity;
         bool resident_reply_hit = false;  // the resident hit reused consumed reply rows
@@ -133,6 +135,30 @@ struct SessionRuntime::Impl {
     std::uint64_t resident_kept = 0, resident_reply_kept = 0, resident_claim_refused = 0;
     bool stop_notified = false;
     std::uint64_t turn_admitted = 0, turn_refused = 0, turn_failed = 0, restore_failed = 0;
+    std::uint64_t pressure_refused = 0, nonfinite_lanes = 0, nonfinite_purged = 0;
+    host_memory::PressureGovernor governor;
+    // Right before a NEW retention: true (and counted) at critical host memory pressure.
+    bool pressure_refuses() noexcept {
+        host_memory::Pressure p = host_memory::Pressure::none;
+        try {
+            if (hooks.memory_pressure) p = hooks.memory_pressure();
+            else {
+                const auto now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                p = governor.update(host_memory::read_psi(), now);
+            }
+        } catch (...) { p = host_memory::Pressure::none; }  // an unreadable signal never blocks retention
+        if (p != host_memory::Pressure::critical) return false;
+        ++pressure_refused;
+        return true;
+    }
+    // Non-finite logits on this lane: drop every cached state on its prompt path and its resident record.
+    void purge_nonfinite(Lane& l) noexcept {
+        if (!l.nonfinite) ++nonfinite_lanes;
+        l.nonfinite = true;
+        if (!cache) return;
+        cache->invalidate_resident(l.handle);
+        nonfinite_purged += cache->purge_prefixes(l.taken.job.prompt, hooks.identity);
+    }
     void close() {
         if (closed) return;
         closed = true;
@@ -199,7 +225,7 @@ struct SessionRuntime::Impl {
     void completed_turn(Lane& l, FinishReason reason) noexcept {
         if (!turn_caching()) return;
         try {
-            if (reason == FinishReason::none || reason == FinishReason::cancelled || cancelled(l) ||
+            if (reason == FinishReason::none || reason == FinishReason::cancelled || cancelled(l) || l.nonfinite ||
                 !l.publication_error.empty() || !l.turn || !policy.store ||
                 l.taken.job.cache_retention == CacheRetention::no_store || !hooks.identity.known() ||
                 hooks.identity.ranks != store.ranks() || !l.turn->metadata.known() ||
@@ -208,7 +234,7 @@ struct SessionRuntime::Impl {
                 !hooks.turn_checkpoint || !hooks.turn_checkpoint(l.view(), reason)) {
                 ++turn_refused; return;
             }
-            if (cancelled(l)) { ++turn_refused; return; }
+            if (cancelled(l) || pressure_refuses()) { ++turn_refused; return; }
             auto credit = cache->reserve_turn(hooks.identity, l.turn->metadata, logical(frontier(l)), l.turn->max_state_bytes);
             if (!credit) { ++turn_refused; return; }
             const auto before = frontier(l);
@@ -257,7 +283,7 @@ struct SessionRuntime::Impl {
                     reply_rows = resident_rows ? claim->reply_tokens : 0;
                     if (!resident_rows) ++resident_claim_refused;
                 }
-                const bool retain = resident_rows && error.empty() && policy.store && hooks.identity.known() &&
+                const bool retain = resident_rows && error.empty() && !l.nonfinite && policy.store && hooks.identity.known() &&
                     l.taken.job.cache_retention != CacheRetention::no_store;
                 if (cache) cache->invalidate_resident(l.handle);
                 if (!retain) store.release(l.handle);
@@ -396,8 +422,8 @@ struct SessionRuntime::Impl {
     void prompt_checkpoint(Lane& l, SessionCheckpoint boundary) {
         if (!caching() || !hooks.prompt_restart_cache || !policy.store || !policy.max_entries ||
             (!policy.max_bytes && !policy.retain_one_oversize) ||
-            l.taken.job.cache_retention == CacheRetention::no_store || !hooks.prompt_checkpoint ||
-            !hooks.prompt_checkpoint(l.view(), boundary)) return;
+            l.taken.job.cache_retention == CacheRetention::no_store || l.nonfinite || !hooks.prompt_checkpoint ||
+            !hooks.prompt_checkpoint(l.view(), boundary) || pressure_refuses()) return;
         auto snap = std::make_shared<session::PrefixSnapshot>();
         snap->identity = hooks.identity;
         snap->state = store.capture_prompt(l.handle);
@@ -411,9 +437,10 @@ struct SessionRuntime::Impl {
     }
     void checkpoint(Lane& l) {
         if (!caching() || !policy.store || !policy.max_entries || !policy.max_bytes ||
-            l.taken.job.cache_retention == CacheRetention::no_store || !hooks.checkpoint ||
+            l.taken.job.cache_retention == CacheRetention::no_store || l.nonfinite || !hooks.checkpoint ||
             l.stats.generated_tokens != 0 ||
-            store.pending(l.handle) || !store.consumed(l.handle) || !hooks.checkpoint(l.view())) return;
+            store.pending(l.handle) || !store.consumed(l.handle) || !hooks.checkpoint(l.view()) ||
+            pressure_refuses()) return;
         auto snap = std::make_shared<session::PrefixSnapshot>();
         snap->identity = hooks.identity;
         snap->state = store.capture(l.handle);
@@ -596,7 +623,7 @@ struct SessionRuntime::Impl {
                 // already published by the family before another lane failed.
                 const bool keep=o.tokens.empty() || !l.taken.job.on_tokens || l.taken.job.on_tokens(o.tokens);
                 progress(l);
-                if(!r.error.empty()) {store.invalidate(l.handle);fail(l,r.error);continue;}
+                if(!r.error.empty()) {if(r.nonfinite) purge_nonfinite(l);store.invalidate(l.handle);fail(l,r.error);continue;}
                 prompt_checkpoint(l,SessionCheckpoint::progress);
                 if(!keep) {l.cancel.request_stop();terminal(l,FinishReason::cancelled);}
                 else if(o.finish!=FinishReason::none) terminal(l,o.finish);
@@ -959,6 +986,10 @@ void SessionRuntime::complete_native(session::KvHandle h, GenerationStats stats,
     }
     throw std::invalid_argument("stale native completion");
 }
+void SessionRuntime::purge_nonfinite(session::KvHandle h) {
+    for (auto& l : impl_->lanes) if (!l->done && l->handle == h) { impl_->purge_nonfinite(*l); return; }
+    throw std::invalid_argument("stale non-finite purge");
+}
 void SessionRuntime::wait_for(std::chrono::milliseconds duration, bool generation_ready) {
     if (impl_->hooks.wait) impl_->hooks.wait(duration);
     else impl_->queue.wait_for_work_until(std::chrono::steady_clock::now() + duration, generation_ready);
@@ -968,7 +999,8 @@ std::size_t SessionRuntime::cache_entries() const noexcept { return impl_->cache
 SessionCacheStats SessionRuntime::cache_stats() const noexcept { return {impl_->cache ? impl_->cache->size() : 0,impl_->cache ? impl_->cache->bytes() : 0,impl_->hits,impl_->misses,
     impl_->turn_admitted,impl_->turn_refused,impl_->turn_failed,impl_->restore_failed,
     impl_->resident_hits,impl_->resident_misses,impl_->resident_hit_rows,impl_->resident_reply_hits,
-    impl_->resident_kept,impl_->resident_reply_kept,impl_->resident_claim_refused}; }
+    impl_->resident_kept,impl_->resident_reply_kept,impl_->resident_claim_refused,
+    impl_->pressure_refused,impl_->nonfinite_lanes,impl_->nonfinite_purged}; }
 bool SessionRuntime::unpin_turn_cache(const std::string& keep) { return impl_->cache && impl_->cache->unpin(keep); }
 session::Capabilities SessionRuntime::capabilities() const { return impl_->caps; }
 void SessionRuntime::configure_api(ApiConfig& c) const {

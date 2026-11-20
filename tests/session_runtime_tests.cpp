@@ -9,7 +9,7 @@ namespace {
 // supply native planners; this fixture deliberately reuses the scripted state.
 struct MixedFixture final : ss::Engine {
     FakeEngine model;
-    bool lane_error = false;
+    bool lane_error = false, nonfinite = false;
     std::function<void()> after_first;
     void prefill(std::span<const std::uint32_t> t,ss::KvHandle& h) override {model.prefill(t,h);}
     ss::StepResult decode(ss::KvHandle& h,const ss::SamplerState& s) override {return model.decode(h,s);}
@@ -23,7 +23,7 @@ struct MixedFixture final : ss::Engine {
             else {
                 const auto before=r.output.before;model.prefill(item.prompt,item.state);r.input_tokens=item.prompt.size();
                 r.output=model.decode(item.state,item.sampler);r.output.before=before;
-                if(lane_error && i==0)r.error="injected lane failure after commit";
+                if(lane_error && i==0){r.error="injected lane failure after commit";r.nonfinite=nonfinite;}
             }
             results.push_back(std::move(r));if(i==0 && after_first)after_first();
         }return results;
@@ -383,6 +383,14 @@ int main() {
             CHECK(failed.error.find("injected lane failure")!=std::string::npos &&
                 failed.ids==std::vector<std::uint32_t>({65,66,0}) && failed.stats.generated_tokens==3);
             CHECK(peer.error.empty() && peer.ids==failed.ids && e.model.releases==2);
+            CHECK(runtime.cache_stats().nonfinite_lanes==0);
+        }
+        {
+            MixedFixture e;e.lane_error=true;e.nonfinite=true;sv::GenerationQueue q;ss::Policy p;p.enabled=false;
+            sv::SessionRuntime runtime(q,e,e.model.store,p,mixed_hooks());
+            auto a=q.submit(job()),b=q.submit(job());runtime.step();
+            CHECK(!drain(a).error.empty() && drain(b).error.empty());
+            CHECK(runtime.cache_stats().nonfinite_lanes==1);  // the generic result reaches the shared purge
         }
         {
             MixedFixture e;sv::GenerationQueue q;ss::Policy p;p.enabled=false;
@@ -390,6 +398,44 @@ int main() {
             auto a=q.submit(job()),b=q.submit(job());e.after_first=[&]{b->cancel();};runtime.step();
             CHECK(drain(a).error.empty());const auto cancelled=drain(b);
             CHECK(cancelled.ids.empty() && cancelled.stats.finish=="cancelled" && e.model.suffixes.size()==1);
+        }
+        {
+            // Critical host memory pressure declines NEW retention only; the reply is unchanged and retention resumes
+            // when the pressure falls.
+            FakeEngine e; sv::GenerationQueue q;
+            auto level = strix::host_memory::Pressure::critical;
+            auto h = runtime_hooks(e); h.memory_pressure = [&level] { return level; };
+            sv::SessionRuntime r(q, e, e.store, {}, h);
+            const auto hot = execute(r, q, job());
+            CHECK(hot.error.empty() && hot.ids == std::vector<std::uint32_t>({65, 66, 0}));
+            CHECK(r.cache_entries() == 0 && e.captures == 0 && r.cache_stats().pressure_refused == 1);
+            level = strix::host_memory::Pressure::warning;
+            CHECK(execute(r, q, job()).ids == hot.ids && r.cache_entries() == 1 && r.cache_stats().pressure_refused == 1);
+        }
+        {
+            // Non-finite logits on a lane purge every cached state on its prompt path (the entry it restored from and
+            // the checkpoint it stored on the way), keep unrelated entries, and retain nothing more for the lane.
+            FakeEngine e; sv::GenerationQueue q;
+            bool poison = false; sv::SessionRuntime* owner = nullptr;
+            auto h = runtime_hooks(e);
+            const auto receipt = h.receipt;
+            h.receipt = [&, receipt](const sv::SessionView& v, sv::GenerationStats& s) {
+                if (poison) owner->purge_nonfinite(v.state);
+                receipt(v, s);
+            };
+            sv::SessionRuntime r(q, e, e.store, {}, h); owner = &r;
+            CHECK(execute(r, q, job({20, 21})).error.empty() && execute(r, q, job()).error.empty() && r.cache_entries() == 2);
+            poison = true;
+            const auto bad = execute(r, q, job({10, 11, 12, 13}));
+            CHECK(bad.stats.cached_tokens == 3);  // it restored from the {10,11,12} entry
+            const auto stats = r.cache_stats();
+            CHECK(stats.nonfinite_lanes == 1 && stats.nonfinite_purged >= 1 && r.cache_entries() == 1);
+            poison = false;
+            CHECK(execute(r, q, job({20, 21, 22})).stats.cached_tokens == 2);  // the unrelated entry survived
+            CHECK(execute(r, q, job({10, 11, 12, 14})).stats.cached_tokens == 0);  // the poisoned path is gone
+            bool stale = false;
+            try { r.purge_nonfinite(ss::KvHandle{}); } catch (const std::invalid_argument&) { stale = true; }
+            CHECK(stale);
         }
         {
             // Named sessions require explicit family validation, for both forms.

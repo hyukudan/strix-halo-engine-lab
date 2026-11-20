@@ -14,6 +14,7 @@
 
 #include "resident_tp2.hpp"
 #include "strix/deepseek41_prefill_levers.hpp"
+#include "strix/host_memory.hpp"
 #include "strix/serve/resident_session.hpp"
 
 #include <chrono>
@@ -71,16 +72,11 @@ struct Telemetry {
     int busy_pct = -1;
 };
 
-[[nodiscard]] inline long long meminfo_field_kb(const char* key) {
-    std::ifstream in("/proc/meminfo");
-    for (std::string line; std::getline(in, line);)
-        if (line.rfind(key, 0) == 0) return std::atoll(line.c_str() + std::char_traits<char>::length(key));
-    return -1;
-}
-
 [[nodiscard]] inline Telemetry read_telemetry() {
     Telemetry t;
-    if (const long long kb = meminfo_field_kb("MemAvailable:"); kb >= 0) t.mem_available_gib = static_cast<double>(kb) / 1048576.0;
+    const auto meminfo = ::strix::host_memory::read_kb_fields("/proc/meminfo");  // the shared counter parser
+    if (const auto it = meminfo.find("MemAvailable"); it != meminfo.end())
+        t.mem_available_gib = static_cast<double>(it->second) / static_cast<double>(::strix::host_memory::kGiB);
     for (int card = 0; card < 4 && t.sclk_mhz < 0; ++card) {
         const std::string dev = "/sys/class/drm/card" + std::to_string(card) + "/device/";
         std::ifstream s(dev + "pp_dpm_sclk");

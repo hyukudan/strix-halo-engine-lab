@@ -74,6 +74,8 @@ inline Build this_build() {
 struct Probe {
     std::function<bool(const std::string&)> file, dir;
     std::function<std::uint64_t()> available_memory;
+    // MemAvailable less the shared host floor (strix/host_memory.hpp floor_bytes); unset = no floor (fakes, Windows).
+    std::function<std::uint64_t()> usable_memory;
     // Creates/probes a private cache directory; zero means unavailable.
     std::function<std::uint64_t(const std::string&)> writable_space;
     std::function<std::vector<std::string>(const std::string&)> list;  // file names in a directory
