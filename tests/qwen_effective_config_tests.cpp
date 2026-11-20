@@ -537,6 +537,9 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
             const auto slot=o.known_prefix_prefill_rows==8192?919596612U:751824452U;
             return HttpServingMemory{2819704288ULL,2775625728ULL,slot,slot};
         };
+        // The served wide copy default adds its 32-row tiled tail owner: +33,873,416 bytes of committed host peak;
+        // T8192 is still admitted at every availability below.
+        constexpr std::uint64_t wide_default_peak=103224760751ULL+33873416ULL;
         for (bool inspect:{false,true}) for (auto available:{130374098944ULL,131955068928ULL,132000509952ULL}) {
             production.options.print_effective_config=inspect;
             observed.available=available;
@@ -544,7 +547,7 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
             validate_effective_startup(admitted);
             expect(admitted.options.known_prefix_prefill_rows==8192 &&
                 admitted.host_compilation.at("target_registered_backing_bytes")==registered &&
-                admitted.host_compilation.at("serve_committed_host_peak_bytes")==103224760751ULL,
+                admitted.host_compilation.at("serve_committed_host_peak_bytes")==wide_default_peak,
                 "native serving committed target backing admits T8192 in startup and inspection");
             const auto& o=admitted.options;
             const auto r=observed.estimate(o); const auto m=observed.serving(o);
@@ -558,10 +561,10 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
             reserved.options.known_prefill_uma_explicit=true;reserved.options.known_prefill_uma_budget=200000000000ULL;
             const auto warm=resolve(reserved,roomy);
             expect(warm.options.known_prefix_prefill_rows==8192 &&
-                warm.host_compilation.at("serve_committed_host_peak_bytes")==103224760751ULL+table,
+                warm.host_compilation.at("serve_committed_host_peak_bytes")==wide_default_peak+table,
                 "HTTP automatic prefill reserves warmed PLE backing exactly once");
             reserved.environment["STRIX_PLE_WARM"]="0";
-            expect(resolve(reserved,roomy).host_compilation.at("serve_committed_host_peak_bytes")==103224760751ULL,
+            expect(resolve(reserved,roomy).host_compilation.at("serve_committed_host_peak_bytes")==wide_default_peak,
                 "PLE warm OFF restores automatic prefill backing total");
             const auto primary=r.model_backing+r.state_d1+r.serial_scratch+r.workspace+r.tails+
                 r.metadata+r.runtime_payload+r.external_host;
@@ -652,7 +655,8 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
     validate_effective_startup(startup);
     expect(startup.options.known_prefix_window && startup.options.known_prefix_full_rows &&
         startup.options.known_prefix_expert_union && startup.options.known_window_router_rows &&
-        startup.options.known_prefix_tail_rows==std::vector<std::uint32_t>({1024,256,64,16}) &&
+        startup.options.known_prefix_tail_rows==std::vector<std::uint32_t>({1024,256,64,32,16}) &&
+        startup.options.mtp.copy_wide_default && startup.options.known_prefix_wide_only_tail_rows==std::vector<std::uint32_t>({32}) &&
         startup.options.prefix_cache_block_rows==0 &&
         numerical_profile_pair(startup.options).decode==dense_a8_profile,
         "serve_prefill_production_mtp_ceilings: preserve explicit route organizations, tails, cache and decode arithmetic");
@@ -880,8 +884,9 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
         explicit_config.options.known_prefill_metadata_budget==startup.options.known_prefill_metadata_budget &&
         explicit_config.options.known_prefill_uma_budget==startup.options.known_prefill_uma_budget &&
         explicit_config.options.known_prefill_host_headroom==startup.options.known_prefill_host_headroom &&
-        explicit_config.options.known_prefix_tail_rows==startup.options.known_prefix_tail_rows,
-        "serve_prefill_production_guards: explicit T/budgets win");
+        explicit_config.options.known_prefix_tail_rows==std::vector<std::uint32_t>({1024,256,64,16}) &&
+        !explicit_config.options.mtp.copy_wide_default && explicit_config.options.mtp.copy_wide_rows.empty(),
+        "serve_prefill_production_guards: explicit T/budgets win (explicit tails without 32 withdraw the wide default)");
     expect(numerical_profile_pair(explicit_config.options).decode==numerical_profile_pair(startup.options).decode &&
         numerical_profile_pair(explicit_config.options).prefill==dense_a8_profile && !explicit_config.options.prefill_profile_automatic,
         "serve_prefill_production_guards: an explicit tiled configuration keeps its resolved arithmetic");
