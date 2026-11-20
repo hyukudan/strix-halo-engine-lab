@@ -1362,7 +1362,11 @@ struct Forward::Impl {
     // block L (attention_vrows / ffn_vrows: every non-expert weight read once for the chunk; BF16 experts and absorb heads
     // per row by the grouped dense rows). Per-row arithmetic = the per-row loop's (rows tile == single-row dense rows,
     // bitwise; the norms / rope / epilogues / flash / route are the same kernels over more rows).
-    void nextn_chunk_rows(const std::uint32_t* toks, const float* hid, std::uint32_t off, std::uint32_t rows_n, std::uint32_t p0) {
+    // kv_only: rows whose outputs the caller never reads stop after the block's caches (cache_vrows: the latent row and the
+    // indexer keys depend only on the row's attn_norm input, so they are bitwise the full form's); their pre / post rows
+    // are left as they were and their top is 0.
+    void nextn_chunk_rows(const std::uint32_t* toks, const float* hid, std::uint32_t off, std::uint32_t rows_n, std::uint32_t p0,
+                          bool kv_only) {
         const std::uint32_t L = c.layers;
         const std::size_t h = c.hidden, nh = std::size_t{rows_n} * h;
         vr.p0 = p0 + off;
@@ -1384,6 +1388,11 @@ struct Forward::Impl {
         }
         linear_vrows(blk(L, "nextn.eh_proj.weight"), nx.catr, 2U * c.hidden, c.hidden, rows_n, nx.xr);
         norm_rows(nx.xr, t(blk(L, "attn_norm.weight")).f(), c.hidden, rows_n, vr.xn);
+        if (kv_only) {
+            cache_vrows(L, rows_n);
+            std::fill(nx.top + off, nx.top + off + rows_n, 0U);
+            return;
+        }
         attention_vrows(L, rows_n);                                                 // vr.xn -> vr.f (post_attention_norm)
         glu::launch_epilogue<glu::Round::bf16>(nx.xr, vr.f, nh, nh, nx.xr, s);    // x = bf(x + attn)
         norm_rows(nx.xr, t(blk(L, "ffn_norm.weight")).f(), c.hidden, rows_n, vr.xn);
@@ -1394,9 +1403,12 @@ struct Forward::Impl {
         std::fill(nx.top + off, nx.top + off + rows_n, 0U);
     }
 
-    Forward::NextnOut nextn_rows(const std::uint32_t* toks, const float* hid, std::uint32_t R, std::uint32_t p0, bool want_top) {
+    Forward::NextnOut nextn_rows(const std::uint32_t* toks, const float* hid, std::uint32_t R, std::uint32_t p0, bool want_top,
+                                 std::uint32_t outputs) {
         if (!nx.on) throw std::logic_error("hy4 hip forward: nextn_rows needs ForwardOptions::nextn");
         if (R == 0U || R > kNextnRows) throw std::invalid_argument("hy4 hip forward: next-token rows outside 1 .. 32");
+        outputs = std::min(outputs, R);
+        if (want_top && outputs == 0U) throw std::invalid_argument("hy4 hip forward: want_top reads the last row's output");
         if (std::uint64_t{p0} + R > context) throw std::runtime_error("hy4 hip forward: next-token context full");
         for (std::uint32_t r = 0; r < R; ++r)
             if (toks[r] >= c.vocab) throw std::invalid_argument("hy4 hip forward: token outside the vocabulary");
@@ -1410,9 +1422,13 @@ struct Forward::Impl {
         nx.logits_ready = false;
         std::uint32_t bad = 0;
         try {
-            if (rows_form)
-                for (std::uint32_t off = 0, rows_n = 0; (rows_n = rows::nextn_chunk(off, R, vr.max)) != 0U; off += rows_n)
-                    nextn_chunk_rows(toks, hid, off, rows_n, p0);
+            if (rows_form) {  // KV-only rows [0, R - outputs), then the output rows: each range in chunks of vr.max
+                const std::uint32_t kv_end = R - outputs;
+                for (std::uint32_t off = 0, rows_n = 0; (rows_n = rows::nextn_chunk(off, kv_end, vr.max)) != 0U; off += rows_n)
+                    nextn_chunk_rows(toks, hid, off, rows_n, p0, true);
+                for (std::uint32_t off = kv_end, rows_n = 0; (rows_n = rows::nextn_chunk(off, R, vr.max)) != 0U; off += rows_n)
+                    nextn_chunk_rows(toks, hid, off, rows_n, p0, false);
+            }
             for (std::uint32_t r = 0; !rows_form && r < R; ++r) {
                 const std::uint32_t p = p0 + r;
                 pos = p;
@@ -1535,8 +1551,9 @@ Forward::~Forward() {
 const float* Forward::rows_hidden() const noexcept { return impl_->vr.xn; }
 bool Forward::has_nextn() const noexcept { return impl_->nx.on; }
 void Forward::set_nextn_row_loop(bool on) noexcept { impl_->nx.row_loop = on; }
-Forward::NextnOut Forward::nextn_rows(const std::uint32_t* tokens, const float* hidden, std::uint32_t rows, std::uint32_t pos0, bool want_top) {
-    return impl_->nextn_rows(tokens, hidden, rows, pos0, want_top);
+Forward::NextnOut Forward::nextn_rows(const std::uint32_t* tokens, const float* hidden, std::uint32_t rows, std::uint32_t pos0, bool want_top,
+                                      std::uint32_t outputs) {
+    return impl_->nextn_rows(tokens, hidden, rows, pos0, want_top, outputs);
 }
 const std::vector<float>& Forward::nextn_logits() { return impl_->nextn_logits(); }
 void Forward::set_prompt_hidden(std::function<void(const float*, std::uint32_t, std::uint32_t)> sink) {

@@ -119,7 +119,7 @@ private:
 };
 
 // ---- native MTP drafter: the shared MtpChain (strix/spec/mtp_chain.hpp) over a forward with the next-token block ----
-// Fwd additionally: config().hidden, kNextnRows, nextn_rows(tokens, hidden, rows, pos0, want_top) -> {top, hidden_pre,
+// Fwd additionally: config().hidden, kNextnRows, nextn_rows(tokens, hidden, rows, pos0, want_top, outputs) -> {top, hidden_pre,
 // hidden_post}, read_ids(top, n, host) (synchronises), rows_hidden() (device rows of the last forward_rows pass: the
 // target's output_norm hidden = the teacher input), set_prompt_hidden(sink), alloc_f32 / free_f32 / copy_f32_async.
 template <class Fwd>
@@ -137,6 +137,12 @@ public:
     void read_top(const Rows& r, std::uint32_t n, std::uint32_t* host) { f_.read_ids(r.top, n, host); }
     MtpOut mtp_forward(const std::uint32_t* next, const float* hidden, std::uint32_t rows, std::uint32_t pos0, bool want_top) {
         const auto o = f_.nextn_rows(next, hidden, rows, pos0, want_top);
+        return {o.top, o.hidden_pre, o.hidden_post};
+    }
+    // MtpKvRowsEngine (strix/spec/mtp_chain.hpp): only the trailing `outputs` rows' top / hidden are read.
+    MtpOut mtp_forward(const std::uint32_t* next, const float* hidden, std::uint32_t rows, std::uint32_t pos0, bool want_top,
+                       std::uint32_t outputs) {
+        const auto o = f_.nextn_rows(next, hidden, rows, pos0, want_top, outputs);
         return {o.top, o.hidden_pre, o.hidden_post};
     }
     float* alloc_f32(std::size_t n) { return f_.alloc_f32(n); }

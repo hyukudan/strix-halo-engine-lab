@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <algorithm>
 #include <cstring>
+#include <limits>
+#include <utility>
 #include <vector>
 
 namespace sp = strix::spec;
@@ -82,6 +84,24 @@ struct FakeFedEngine : FakeEngine {
     }
 };
 static_assert(!sp::MtpFeedEngine<FakeEngine> && sp::MtpFeedEngine<FakeFedEngine>, "feed hook detection");
+// The same fake with the KV-only rows hook: rows outside the trailing `outputs` get poisoned outputs (NaN hidden, a top id
+// no other row produces), so any read of them changes a later call's hidden operand or a proposal.
+struct FakeKvEngine : FakeEngine {
+    using FakeEngine::mtp_forward;
+    std::vector<std::pair<unsigned, bool>> kv_calls;  // (outputs, want_top) of every 6-argument call
+    unsigned kv_only_rows = 0;
+    FakeMtpOut mtp_forward(const std::uint32_t* t, const float* hidden, unsigned rows, unsigned pos0, bool want_top, unsigned outputs) {
+        const FakeMtpOut o = mtp_forward(t, hidden, rows, pos0, want_top);
+        kv_calls.emplace_back(outputs, want_top);
+        for (unsigned r = 0; r + std::min(outputs, rows) < rows; ++r) {
+            out_h[r * kH] = std::numeric_limits<float>::quiet_NaN();
+            out_top[r] = 0xBADu;
+            ++kv_only_rows;
+        }
+        return o;
+    }
+};
+static_assert(!sp::MtpKvRowsEngine<FakeEngine> && sp::MtpKvRowsEngine<FakeKvEngine>, "KV-only rows hook detection");
 
 // One scripted sequence (flush chunks, chain steps, catch-up, copy prefixes, drafts without a flush, a k past the feed);
 // returns every proposed id in order and the chain's synchronizing reads per draft (max).
@@ -196,6 +216,28 @@ int main() {
                  "call %zu differs", i);
     MC_CHECK(fed_reads == 70, "the k = 70 draft falls back to one read per position (max %llu)", (unsigned long long)fed_reads);
     MC_CHECK(host_reads == 70, "host path reads once per position (max %llu)", (unsigned long long)host_reads);
+    // KV-only rows == every row computed: same calls, same proposals; flush chunks pass outputs 0, the final chunk 1
+    {
+        FakeEngine pe;
+        FakeKvEngine ke;
+        std::uint64_t pr = 0, kr = 0;
+        bool pfed = false, kfed = false;
+        const auto pp = scenario(pe, pr, pfed);
+        const auto kp = scenario(ke, kr, kfed);
+        MC_CHECK(pp == kp, "KV-only proposals differ (%zu vs %zu ids)", pp.size(), kp.size());
+        MC_CHECK(pe.calls.size() == ke.calls.size(), "KV-only call count %zu vs %zu", pe.calls.size(), ke.calls.size());
+        for (std::size_t i = 0; i < pe.calls.size(); ++i)
+            MC_CHECK(pe.calls[i].tokens == ke.calls[i].tokens && pe.calls[i].hidden0 == ke.calls[i].hidden0 &&
+                         pe.calls[i].pos0 == ke.calls[i].pos0 && pe.calls[i].want_top == ke.calls[i].want_top,
+                     "KV-only call %zu differs (a poisoned row was read)", i);
+        bool saw_none = false;
+        for (const auto& [outputs, want_top] : ke.kv_calls) {
+            MC_CHECK(outputs == (want_top ? 1U : 0U), "flush chunk outputs %u with want_top %d", outputs, int(want_top));
+            saw_none = saw_none || outputs == 0U;
+        }
+        MC_CHECK(!ke.kv_calls.empty() && saw_none && ke.kv_only_rows > 0U, "KV-only hook engaged (%zu calls, %u rows)",
+                 ke.kv_calls.size(), ke.kv_only_rows);
+    }
     std::uint64_t fed_small = 0;
     {
         FakeFedEngine f2;

@@ -224,6 +224,27 @@ void absorb_vrows(const std::uint8_t* wt, std::uint32_t heads, std::uint32_t wid
     }
 }
 
+// The cache side of attention_vrows: rows vr.p0 .. vr.p0 + R - 1 of layer l's latent (kv_a -> kv norm -> rope -> store) and,
+// indexed, its token / group keys, from vr.xn alone (never from the rows' attention or FFN output). attention_vrows calls
+// it at this point of its launch order; nextn_rows calls it alone for the rows whose outputs the caller never reads.
+void cache_vrows(std::uint32_t l, std::uint32_t R) {  // vr.xn -> latent[l] (+ tkeys[l] / gkeys[l])
+    namespace rp = strix::ops::rope;
+    namespace dcr = strix::attn_core::cache_rows;
+    const std::uint32_t kl = c.kv_lora, rope = c.qk_rope, row = kl + rope;
+    const bool idx = indexed_of(l);
+    const std::uint32_t* positions = iota + vr.p0;
+    linear_vrows(blk(l, "attn_kv_a_mqa.weight"), vr.xn, c.hidden, row, R, vr.ckv);
+    const float* kvn = t(blk(l, "attn_kv_a_norm.weight")).f();
+    for (std::uint32_t r = 0; r < R; ++r) norm(vr.ckv + std::size_t{r} * row, kvn, kl, c.rms_eps, vr.ckv + std::size_t{r} * row);
+    rp::launch<rp::Round::bf16>({vr.ckv, R, 1U, row, row, kl, rope / 2U, idx ? cos_idx : cos_swa, idx ? sin_idx : sin_swa, positions, false}, s);
+    check(dcr::store_rows({vr.ckv, row, positions, 0U, R, latent_rows[l], latent[l], flag}, s), "latent verify rows store");
+    if (idx)
+        for (std::uint32_t r = 0; r < R; ++r) {
+            const RowBind bind(*this, r);
+            index_keys(l);
+        }
+}
+
 // Text layers and the next-token block (l = c.layers, the rows form of nextn_rows): heads_of / indexed_of read its form.
 void attention_vrows(std::uint32_t l, std::uint32_t R) {  // vr.xn -> vr.f
     namespace rp = strix::ops::rope;
@@ -241,16 +262,7 @@ void attention_vrows(std::uint32_t l, std::uint32_t R) {  // vr.xn -> vr.f
     const float* cs = idx ? cos_idx : cos_swa;
     const float* sn = idx ? sin_idx : sin_swa;
     rp::launch<rp::Round::bf16>({vr.qv, R, H, H * qk, qk, c.qk_nope, rope / 2U, cs, sn, positions, false}, s);
-    linear_vrows(blk(l, "attn_kv_a_mqa.weight"), vr.xn, h, row, R, vr.ckv);
-    const float* kvn = t(blk(l, "attn_kv_a_norm.weight")).f();
-    for (std::uint32_t r = 0; r < R; ++r) norm(vr.ckv + std::size_t{r} * row, kvn, kl, c.rms_eps, vr.ckv + std::size_t{r} * row);
-    rp::launch<rp::Round::bf16>({vr.ckv, R, 1U, row, row, kl, rope / 2U, cs, sn, positions, false}, s);
-    check(dcr::store_rows({vr.ckv, row, positions, 0U, R, latent_rows[l], latent[l], flag}, s), "latent verify rows store");
-    if (idx)
-        for (std::uint32_t r = 0; r < R; ++r) {
-            const RowBind bind(*this, r);
-            index_keys(l);
-        }
+    cache_vrows(l, R);
     const auto& kb = t(blk(l, "attn_k_b.weight"));
     if (kb.type == 8U) absorb_vrows(kb.p, H, c.qk_nope, kl, vr.qv, qk, qrow, vr.qfull, row, frow, R);
     else {  // one grouped launch per row over the H head slices (the step's form; bitwise == one linear() per head)
