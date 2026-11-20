@@ -244,8 +244,8 @@ void check_profile_regime() {
     CHECK(run(g, one, 17, {}, &st) == "0" && st == "builtin / qualified");
     CHECK(run(g, one, 17, {"--prompt-rows", "4096"}, &st) == "4096" && st == "explicit-cli / qualified");
     CHECK(run(g, one, 32568, {"--prompt-rows", "4096"}, &st) == "4096" && st == "explicit-cli / qualified");
-    // the shared resolver qualifies only the table value: 2048 (same bits) runs stamped unqualified
-    CHECK(run(g, one, 17, {"--prompt-rows", "2048"}, &st) == "2048" && st == "explicit-cli / unqualified: prompt_rows");
+    // 2048 is in the table value's same_bits class: qualified wherever 4096 is, unqualified past the gated range
+    CHECK(run(g, one, 17, {"--prompt-rows", "2048"}, &st) == "2048" && st == "explicit-cli / qualified");
     CHECK(run(g, one, gated + 1U, {"--prompt-rows", "2048"}, &st) == "2048" && st == "explicit-cli / unqualified: prompt_rows");
     CHECK(run(g, one, 17, {"--prompt-rows", "512"}, &st) == "512" && st == "explicit-cli / unqualified: prompt_rows");
     CHECK(hp::device_of("gfx1151:sramecc+:xnack-") == g && hp::device_of("gfx1100") == hp::Device::unknown);
