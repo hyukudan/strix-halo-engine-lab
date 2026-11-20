@@ -411,7 +411,9 @@ int main(int argc, char** argv) {
                 // the host oracle's prose conditionals (hy4_recipe: P(run>=k) .714 .452 .197 .133 .034 .017)
                 so.chain_survival = survival.empty() ? std::vector<double>{0.714, 0.633, 0.436, 0.675, 0.256, 0.5} : survival;
             }
+            const double prime_t0 = now_ms();  // the spec path's prompt pass (with the block: its teacher flushes when the ring fills)
             if (prime(f, ids, batched, source.get()) != first_id) throw std::runtime_error("repeat prompt anchor differs (" + label + ")");
+            std::printf("PRIME %s prompt %zu ids %.1f ms%s\n", label.c_str(), ids.size(), now_ms() - prime_t0, source ? " (with the block)" : "");
             const auto res = source ? hb::rows::spec_decode(f, ids, first_id, spec_n, so, *source)
                                     : hb::rows::spec_decode(f, ids, first_id, spec_n, so);
             std::size_t first_bad = std::min(res.ids.size(), plain.size());
