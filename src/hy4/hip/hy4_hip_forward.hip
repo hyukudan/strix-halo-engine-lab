@@ -6,6 +6,7 @@
 #include <hip/hip_runtime.h>
 #include "hy4/hip/hy4_hip_forward.hpp"
 #include "hy4/hip/hy4_hip_plan.hpp"
+#include "hy4/hip/hy4_hip_rows.hpp"
 
 #include "attn_core/cache_rows.hpp"
 #include "attn_core/group_pool.hpp"
@@ -367,7 +368,7 @@ struct Forward::Impl {
         engram_stage = static_cast<std::uint8_t*>(es);
         dstatus_all = alloc<std::uint32_t>(8U * c.layers);
         store_epilogue = strix::envcfg::flag("STRIX_HY4_Q8_STORE_EPILOGUE", true);
-        const std::uint32_t launch_rows = std::max(1U, rmax);  // rows one cache store may write (ring sizes)
+        const std::uint32_t launch_rows = rows::cache_rows(rmax, vr.max);  // rows a launch / verify pass may write (ring sizes)
         std::vector<std::uint32_t> seq(context + 1U);
         std::iota(seq.begin(), seq.end(), 0U);
         check(hipMemcpy(iota, seq.data(), seq.size() * 4U, hipMemcpyHostToDevice), "iota upload");
@@ -1194,6 +1195,8 @@ struct Forward::Impl {
         }
         return last == c.layers ? logits : empty;
     }
+
+#include "hy4/hip/hy4_hip_rows.inc"  // verify rows (hy4_rows): forward_rows / commit_rows over the step's helpers
 };
 
 Forward::Forward(const ForwardOptions& o) : impl_(std::make_unique<Impl>()) {
@@ -1208,11 +1211,19 @@ Forward::Forward(const ForwardOptions& o) : impl_(std::make_unique<Impl>()) {
         throw std::invalid_argument("hy4 hip forward: layer range / context");
     if (o.prompt_rows != 0U && !prompt_window_ok(o.prompt_rows))
         throw std::invalid_argument("hy4 hip forward: prompt rows must be a multiple of 8, at least 16");
+    if (o.verify_rows > rows::kMaxVerifyRows) throw std::invalid_argument("hy4 hip forward: verify rows outside 0..8");
+    impl_->vr.max = o.verify_rows;
     check(hipStreamCreateWithFlags(&impl_->s, hipStreamNonBlocking), "stream");
     impl_->load(o.parts);
     impl_->allocate();
     if (impl_->rmax) impl_->allocate_prompt();
+    if (impl_->vr.max) impl_->allocate_verify();
 }
+void Forward::forward_rows(std::span<const std::uint32_t> tokens, bool logits) { impl_->forward_rows(tokens, logits); }
+std::span<const std::uint32_t> Forward::rows_greedy() const noexcept { return impl_->vr.greedy; }
+const std::vector<float>& Forward::rows_logits() const noexcept { return impl_->vr.logits_host; }
+void Forward::commit_rows(std::uint32_t k) { impl_->commit_rows(k); }
+void Forward::set_rows_expert_union(bool on) noexcept { impl_->vr.expert_union = on; }
 const std::vector<float>& Forward::prefill(const std::vector<std::uint32_t>& prompt) { return impl_->prefill(prompt); }
 Forward::~Forward() {
     if (impl_ && impl_->s) {

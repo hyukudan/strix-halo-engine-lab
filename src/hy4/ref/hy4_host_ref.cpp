@@ -141,6 +141,7 @@ void Config::validate() const {
     const auto bad = [](const char* what) { throw std::invalid_argument(std::string("hy4 config: ") + what); };
     if (indexed.size() != layers || heads.size() != layers || dense.size() != layers) bad("per-layer arrays");
     if (qk_rope % 2U || index_dim % 4U || hidden == 0U || top_k > experts) bad("dimensions");
+    if (nextn > 1U || (nextn == 1U && nextn_heads == 0U)) bad("next-token block (one block with heads > 0)");
     const auto eh = engram_heads();
     if (engram_mult.size() != engram_layers.size() * ngram || head_offsets.size() != engram_layers.size() * eh ||
         head_sizes.size() != engram_layers.size() * eh || token_map.empty())
@@ -172,6 +173,7 @@ Config Config::truncated(std::uint32_t n) const {
     if (n == 0U || n > layers) throw std::invalid_argument("hy4 config: truncated depth outside 1..layers");
     Config c = *this;
     c.layers = n;
+    c.nextn = 0;  // the next-token block follows the full trunk only
     c.indexed.resize(n);
     c.heads.resize(n);
     c.dense.resize(n);
@@ -253,6 +255,11 @@ Config Config::from_gguf(const std::filesystem::path& first_part) {
         c.heads.push_back(static_cast<std::uint32_t>(heads.at(l)));
         c.dense.push_back(l < leading_dense ? 1U : 0U);
     }
+    c.nextn = nextn;
+    if (nextn == 1U) {
+        c.nextn_heads = static_cast<std::uint32_t>(heads.at(c.layers));
+        c.nextn_indexed = c.layers < types.size() ? (types[c.layers] ? 1U : 0U) : 1U;  // the block carries the indexer
+    }
     for (const auto l : uarr("ple.layers")) c.engram_layers.push_back(static_cast<std::uint32_t>(l));
     c.ngram = u32("ple.ngram_size");
     c.heads_per_ngram = u32("ple.heads_per_ngram");
@@ -274,8 +281,9 @@ public:
     SyntheticWeights(const Config& c, std::uint64_t seed, std::string filter) : seed_(seed), filter_(std::move(filter)) {
         const std::uint64_t h = c.hidden, ql = c.q_lora, kl = c.kv_lora;
         add("token_embd.weight", {h, c.vocab}, 1.0F);
-        for (std::uint32_t l = 0; l < c.layers; ++l) {
-            const std::uint64_t H = c.heads[l];
+        for (std::uint32_t l = 0; l < c.layers + c.nextn; ++l) {
+            const bool text = l < c.layers;  // else the next-token block
+            const std::uint64_t H = text ? c.heads[l] : c.nextn_heads;
             for (const char* norm : {"attn_norm.weight", "attn_q_a_norm.weight", "post_attention_norm.weight", "ffn_norm.weight",
                                      "post_ffw_norm.weight"})
                 add(blk(l, norm), {std::string(norm) == "attn_q_a_norm.weight" ? ql : h}, -1.0F);
@@ -289,11 +297,16 @@ public:
             add(blk(l, "attn_gate.weight"), {h, H * c.v_head}, 0.15F);
             add(blk(l, "attn_output.weight"), {H * c.v_head, h}, 0.12F);
             for (const char* site : {"hc_attn", "hc_ffn"}) {
+                if (!text) break;
                 add(blk(l, (std::string(site) + "_fn.weight").c_str()), {4U * h, 8}, 0.05F);
                 add(blk(l, (std::string(site) + "_base.weight").c_str()), {8}, 0.5F);
                 add(blk(l, (std::string(site) + "_scale.weight").c_str()), {2}, 0.5F);
             }
-            if (c.indexed[l]) {
+            if (!text) {
+                add(blk(l, "nextn.eh_proj.weight"), {2U * h, h}, 0.1F);
+                for (const char* norm : {"nextn.enorm.weight", "nextn.hnorm.weight", "nextn.shared_head_norm.weight"}) add(blk(l, norm), {h}, -1.0F);
+            }
+            if (text ? c.indexed[l] != 0U : c.nextn_indexed != 0U) {
                 add(blk(l, "indexer.attn_k.weight"), {h, c.index_dim}, 0.15F);
                 add(blk(l, "indexer.k_norm.weight"), {c.index_dim}, -1.0F);
                 add(blk(l, "indexer.attn_q_b.weight"), {ql, c.index_heads * c.index_dim}, 0.2F);
@@ -303,7 +316,7 @@ public:
                 add(blk(l, "indexer_compressor_ape.weight"), {c.index_dim, c.index_ratio}, 0.3F);
                 add(blk(l, "indexer_compressor_norm.weight"), {c.index_dim}, -1.0F);
             }
-            if (c.dense[l]) {
+            if (text && c.dense[l]) {
                 add(blk(l, "ffn_gate.weight"), {h, c.dense_ff}, 0.15F);
                 add(blk(l, "ffn_up.weight"), {h, c.dense_ff}, 0.15F);
                 add(blk(l, "ffn_down.weight"), {c.dense_ff, h}, 0.1F);
@@ -475,16 +488,26 @@ struct HostRef::State {
     // per layer: per position, the expanded keys [heads][qk_head] and values [heads][v_head]
     std::vector<std::vector<Vec>> keys, values;
     std::vector<std::vector<Vec>> token_keys, group_keys;  // indexed layers
+    // taps (read only, no bit change): per layer per position the latent row [kv_lora normed | qk_rope roped], and
+    // the last step's hc_head output before / after output_norm
+    std::vector<std::vector<Vec>> latents;
+    Vec head_in, head_out;
     Vec logits;
     std::uint32_t next = 0;
 
     State(Config config, Weights& weights) : c(std::move(config)), w(weights) {
         c.validate();
-        keys.resize(c.layers);
-        values.resize(c.layers);
-        token_keys.resize(c.layers);
-        group_keys.resize(c.layers);
+        const std::size_t blocks = std::size_t{c.layers} + c.nextn;  // text layers + the next-token block
+        keys.resize(blocks);
+        values.resize(blocks);
+        token_keys.resize(blocks);
+        group_keys.resize(blocks);
+        latents.resize(blocks);
     }
+    // per-block attention / FFN form: the text layers' arrays, else the next-token block's
+    std::uint32_t heads_of(std::uint32_t l) const { return l < c.layers ? c.heads[l] : c.nextn_heads; }
+    bool indexed_of(std::uint32_t l) const { return l < c.layers ? c.indexed[l] != 0U : c.nextn_indexed != 0U; }
+    bool dense_of(std::uint32_t l) const { return l < c.layers && c.dense[l] != 0U; }
     const Vec& t(const std::string& name) const { return w.tensor(name); }
 
     void engram(std::uint32_t layer, std::uint32_t ordinal, Vec& x) {
@@ -536,9 +559,9 @@ struct HostRef::State {
     }
 
     Vec attention(std::uint32_t l, const Vec& xn) {
-        const auto H = c.heads[l], qk = c.qk_head(), nope = c.qk_nope, kl = c.kv_lora, vd = c.v_head;
+        const auto H = heads_of(l), qk = c.qk_head(), nope = c.qk_nope, kl = c.kv_lora, vd = c.v_head;
         const std::uint32_t q = pos;
-        const bool idx = c.indexed[l] != 0U;
+        const bool idx = indexed_of(l);
         const float theta = idx ? c.rope_theta_indexed : c.rope_theta_sliding;
         const auto gate = linear(t(blk(l, "attn_gate.weight")), xn, std::size_t{H} * vd);
         const auto qr = rms_norm(linear(t(blk(l, "attn_q_a.weight")), xn, c.q_lora), &t(blk(l, "attn_q_a_norm.weight")), c.rms_eps);
@@ -547,6 +570,9 @@ struct HostRef::State {
         auto ckv = linear(t(blk(l, "attn_kv_a_mqa.weight")), xn, std::size_t{kl} + c.qk_rope);
         const auto lat = rms_norm(ckv.data(), kl, t(blk(l, "attn_kv_a_norm.weight")).data(), c.rms_eps);
         rope(ckv.data() + kl, c.qk_rope, q, theta);
+        Vec tap(lat);
+        tap.insert(tap.end(), ckv.begin() + kl, ckv.end());
+        latents[l].push_back(std::move(tap));
         // expanded per-head keys and values (attn_k_b: per head kv_lora rows of qk_nope; attn_v_b: v_head rows of kv_lora)
         const auto& kb = t(blk(l, "attn_k_b.weight"));
         const auto& vb = t(blk(l, "attn_v_b.weight"));
@@ -653,7 +679,7 @@ struct HostRef::State {
             for (std::size_t i = 0; i < g.size(); ++i) a[i] = ops::glu::swiglu<ops::glu::DeclaredExp, ops::glu::Round::bf16>(g[i], u[i], limit);
             return a;
         };
-        if (c.dense[l]) {
+        if (dense_of(l)) {
             const auto a = swiglu(linear(t(blk(l, "ffn_gate.weight")), xf, c.dense_ff), linear(t(blk(l, "ffn_up.weight")), xf, c.dense_ff),
                                    ops::glu::no_clamp);
             return rms_norm(linear(t(blk(l, "ffn_down.weight")), a, c.hidden), &closing, c.rms_eps);
@@ -704,11 +730,59 @@ struct HostRef::State {
             hc_update(x, fm, ffn(l, xf));
         }
         const auto hm = hc_mix(x, t("output_hc_fn.weight"), t("output_hc_base.weight"), t("output_hc_scale.weight"), 4U, c.rms_eps, c.hc_eps);
-        const auto y = rms_norm(hc_collapse(x, hm, h), &t("output_norm.weight"), c.rms_eps);
-        logits = linear(t("output.weight"), y, c.vocab, false);
+        head_in = hc_collapse(x, hm, h);
+        head_out = rms_norm(head_in, &t("output_norm.weight"), c.rms_eps);
+        logits = linear(t("output.weight"), head_out, c.vocab, false);
         next = static_cast<std::uint32_t>(std::max_element(logits.begin(), logits.end()) - logits.begin());
         ++pos;
         return logits;
+    }
+
+    // ---- the next-token (MTP) block: block id c.layers, its own K/V; `pos` is borrowed for the step only ----
+    std::uint32_t nextn_positions() const { return c.nextn ? static_cast<std::uint32_t>(keys[c.layers].size()) : 0U; }
+
+    NextnStep nextn_step(std::uint32_t token, const Vec& hid, std::uint32_t position) {
+        if (c.nextn != 1U) throw std::invalid_argument("hy4 ref: the configuration has no next-token block");
+        if (token >= c.vocab) throw std::invalid_argument("hy4 ref: token outside the vocabulary");
+        const auto h = c.hidden, L = c.layers;
+        if (hid.size() != h) throw std::invalid_argument("hy4 ref: next-token hidden width");
+        if (position != nextn_positions()) throw std::invalid_argument("hy4 ref: next-token position != cached positions");
+        const auto er = w.row("token_embd.weight", token);
+        Vec e(h);
+        for (std::size_t i = 0; i < h; ++i) e[i] = bf(er[i]);
+        Vec cat = rms_norm(e, &t(blk(L, "nextn.enorm.weight")), c.rms_eps);
+        const auto hn = rms_norm(hid, &t(blk(L, "nextn.hnorm.weight")), c.rms_eps);
+        cat.insert(cat.end(), hn.begin(), hn.end());
+        Vec x = linear(t(blk(L, "nextn.eh_proj.weight")), cat, h);
+        const std::uint32_t saved = pos;
+        pos = position;  // attention / indexer read the query position from pos
+        try {
+            const auto a = attention(L, rms_norm(x, &t(blk(L, "attn_norm.weight")), c.rms_eps));
+            for (std::size_t i = 0; i < h; ++i) x[i] = bf(x[i] + a[i]);
+            const auto f = ffn(L, rms_norm(x, &t(blk(L, "ffn_norm.weight")), c.rms_eps));
+            for (std::size_t i = 0; i < h; ++i) x[i] = bf(x[i] + f[i]);
+        } catch (...) {
+            pos = saved;
+            throw;
+        }
+        pos = saved;
+        NextnStep out;
+        out.normed = rms_norm(x, &t(blk(L, "nextn.shared_head_norm.weight")), c.rms_eps);
+        out.logits = linear(t("output.weight"), out.normed, c.vocab, false);
+        out.argmax = static_cast<std::uint32_t>(std::max_element(out.logits.begin(), out.logits.end()) - out.logits.begin());
+        out.hidden = std::move(x);
+        return out;
+    }
+
+    void nextn_truncate(std::uint32_t n) {
+        if (c.nextn != 1U || n >= nextn_positions()) return;
+        const auto L = c.layers;
+        keys[L].resize(n);
+        values[L].resize(n);
+        latents[L].resize(n);
+        if (token_keys[L].size() > n) token_keys[L].resize(n);
+        const std::size_t groups = n / c.index_ratio;  // group g is pooled once position (g + 1) * ratio - 1 is cached
+        if (group_keys[L].size() > groups) group_keys[L].resize(groups);
     }
 };
 
@@ -718,5 +792,19 @@ const std::vector<float>& HostRef::step(std::uint32_t token) { return state_->st
 std::uint32_t HostRef::position() const noexcept { return state_->pos; }
 std::uint32_t HostRef::next_token() const noexcept { return state_->next; }
 const Config& HostRef::config() const noexcept { return state_->c; }
+const std::vector<float>& HostRef::latent_row(std::uint32_t layer, std::uint32_t position) const {
+    if (layer >= state_->latents.size() || position >= state_->latents[layer].size())
+        throw std::out_of_range("hy4 ref: latent_row outside the fed positions");
+    return state_->latents[layer][position];
+}
+HostRef::NextnStep HostRef::nextn_step(std::uint32_t token, const std::vector<float>& h, std::uint32_t position) {
+    return state_->nextn_step(token, h, position);
+}
+void HostRef::nextn_truncate(std::uint32_t positions) { state_->nextn_truncate(positions); }
+std::uint32_t HostRef::nextn_positions() const noexcept { return state_->nextn_positions(); }
+const std::vector<float>& HostRef::last_hidden(bool normed) const {
+    if (state_->pos == 0U) throw std::out_of_range("hy4 ref: last_hidden before the first step");
+    return normed ? state_->head_out : state_->head_in;
+}
 
 }  // namespace strix::hy4

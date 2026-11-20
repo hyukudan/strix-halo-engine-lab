@@ -381,6 +381,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_GLM_R1B_DENSE` | glm | 7 | [glm-r1b-dense-auto](optimizations.md#glm-r1b-dense-auto) |
 | `STRIX_GLM_R1B_HC` | glm | 4 | [glm-r1b-hc-v4](optimizations.md#glm-r1b-hc-v4) |
 | `STRIX_GLM_SPEC_KDA_TREE` | glm | on (Xfer verify exchange, KDA tree 2,... | [glm-mtp-spec](optimizations.md#glm-mtp-spec) |
+| `STRIX_HY4_ROWS_EXPERT_UNION` | hy4 | on | [hy4-rows-expert-union](optimizations.md#hy4-rows-expert-union) |
 | `STRIX_MM_ATTEND4_DECODE` | minimax | 1 | [mm-attend4-decode](optimizations.md#mm-attend4-decode) |
 | `STRIX_MM_DRAFT_LIN` | minimax | opt | [mm-draft-lin](optimizations.md#mm-draft-lin) |
 | `STRIX_MM_DSPARK_ATTN` | minimax | 2 | [mm-dspark-attn](optimizations.md#mm-dspark-attn) |
