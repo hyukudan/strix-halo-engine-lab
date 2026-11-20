@@ -1128,6 +1128,8 @@ the decode app keeps 16-row windows unless `--wide-exact N`, the pair app keeps 
 - `STRIX_DECODE_FUSE`: each residual add folds into the next RMS norm, and for windows of <= 16 rows the norms and the
   SiLU pass store the prepared FP16 rows of the next IU4 projections (one prepare per input instead of one per
   projection); projections of the same prepared rows run as one launch (`include/strix/decode_projection_group.hpp`).
+  The two-device tensor-parallel pass uses the same switch: the residual adds fold into the norms and the norms store
+  the prepared rows its IU4 column shares read.
 - `STRIX_IU4_ONE_SWEEP`: scalar-activation windows of 9..16 rows read the IU4 weights once (one 16-row sweep,
   `include/strix/decode_weight_sweep.hpp`) instead of two 8-row sweeps; rows <= 8 are unaffected.
 - EXACT wide prefill windows: the 16-row arithmetic over 64-row windows; the IU4 dense projections take one row-block

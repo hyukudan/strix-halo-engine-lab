@@ -956,12 +956,15 @@ struct HipEngine::Impl {
                                       out + std::size_t(r) * out_stride, out_stride, m, stream);
         });
     }
-    // silu(gate) * up of the mlp share into out [rows][gun] (as glu16).
-    void tp_gate_up(const Tensor& g, const Tensor& u, const float* xin, float* out, unsigned rows) {
+    // silu(gate) * up of the mlp share into out [rows][gun] (as glu16). xh_ready: xin's rows are already prepared in
+    // iu4.xh (the norm's epilogue, prepare's placement: sweep r reads xh + r * H), so no prepare runs.
+    void tp_gate_up(const Tensor& g, const Tensor& u, const float* xin, float* out, unsigned rows, bool xh_ready = false) {
         core::dense_row_sweeps(rows, [&](unsigned r, unsigned m) {
-            core::dense_iu4::prepare(xin + std::size_t(r) * H, iu4.xh, H, m, stream);
-            core::dense_iu4::run_cols(g.data, H, I, tp.gu0, tp.gun, iu4.xh, iu4.g, tp.gun, m, stream);
-            core::dense_iu4::run_cols(u.data, H, I, tp.gu0, tp.gun, iu4.xh, iu4.u, tp.gun, m, stream);
+            const _Float16* xh = iu4.xh;
+            if (xh_ready) xh += std::size_t(r) * H;
+            else core::dense_iu4::prepare(xin + std::size_t(r) * H, iu4.xh, H, m, stream);
+            core::dense_iu4::run_cols(g.data, H, I, tp.gu0, tp.gun, xh, iu4.g, tp.gun, m, stream);
+            core::dense_iu4::run_cols(u.data, H, I, tp.gu0, tp.gun, xh, iu4.u, tp.gun, m, stream);
             silu_mul_kernel<<<256, 256, 0, stream>>>(iu4.g, iu4.u, out + std::size_t(r) * tp.gun, std::size_t(m) * tp.gun);
         });
     }
@@ -1159,13 +1162,22 @@ struct HipEngine::Impl {
         embed_kernel<<<n, 256, 0, stream>>>(embd.data, embd.fmt, embd.row_bytes, H, d_ids, x);
         const unsigned nb = (n * H + 255U) / 256U;
         float* slot = tp_slot();
+        // Decode launch fusion, as the one-rank pass (STRIX_DECODE_FUSE, default on; 0 = the separate launches): each
+        // residual add folds into the next norm (src/ops/norm/norm_device.hpp: the same FP32 add, the same reduction) and
+        // for rows <= 16 the norms store the prepared FP16 rows that the column shares of the IU4 projections read (one
+        // prepare per input instead of one per projection). Same operands, same bits.
+        const bool fuse = decode_fuse();
+        const bool pre = fuse && n <= kMaxRows && iu4.xh && !core::dense_iu4::reference_flag();
+        _Float16* const xh_pre = pre ? iu4.xh : nullptr;
+        const float* carry = nullptr;  // the previous layer's joined MLP output, not yet added to x
         for (unsigned l = 0; l < cfg.layers; ++l) {
             auto& y = L[l];
-            rmsnorm(x, y.attn_norm, H, cfg.rms_eps, xn, n, stream);
+            rmsnorm_fused(x, carry, y.attn_norm, H, cfg.rms_eps, xn, n, xh_pre, stream);
+            carry = nullptr;
             if (gdn_index[l] != ~0U) {
                 const std::size_t gi = gdn_index[l];
-                tp_cols(y.tqkv, xn, 0U, tp.gc, qkv, tp.gc, n);
-                tp_cols(y.tz, xn, 0U, tp.gv, z, tp.gv, n);
+                tp_cols_x(y.tqkv, xn, pre, 0U, tp.gc, qkv, tp.gc, n);
+                tp_cols_x(y.tz, xn, pre, 0U, tp.gv, z, tp.gv, n);
                 linear(y.beta, xn, tp.bfull, n, stream, wide, iu4);
                 linear(y.alpha, xn, tp.afull, n, stream, wide, iu4);
                 tp_select_kernel<<<1, 256, 0, stream>>>(tp.bfull, tp.sel_vh, GH, tp.gh, n, beta);
@@ -1185,9 +1197,9 @@ struct HipEngine::Impl {
                 const bool xh = tp_join_x(tp.core, n, core);
                 tp_cols_x(y.out, core, xh, tp.oc0, tp.ocn, slot, tp.ocn, n);
             } else {
-                tp_cols(y.q, xn, 2U * D * tp.hq0, 2U * D * tp.nq, q_in, 2U * D * tp.nq, n);
-                tp_cols(y.k, xn, D * tp.kv0, D * tp.nkv, kk, D * tp.nkv, n);
-                tp_cols(y.v, xn, D * tp.kv0, D * tp.nkv, vv, D * tp.nkv, n);
+                tp_cols_x(y.q, xn, pre, 2U * D * tp.hq0, 2U * D * tp.nq, q_in, 2U * D * tp.nq, n);
+                tp_cols_x(y.k, xn, pre, D * tp.kv0, D * tp.nkv, kk, D * tp.nkv, n);
+                tp_cols_x(y.v, xn, pre, D * tp.kv0, D * tp.nkv, vv, D * tp.nkv, n);
                 attn_core::dense_decode::Params p{n, tp.nq, tp.nkv, 2U * D, cfg.rotary_dim, pos, cfg.rms_eps,
                                                   1.0F / std::sqrt(float(D)), cfg.rope_theta, true};
                 attn_core::dense_decode::launch<256>(p, q_in, kk, vv, reinterpret_cast<const float*>(y.qnorm.data),
@@ -1196,13 +1208,18 @@ struct HipEngine::Impl {
                 tp_cols_x(y.o, ctx, xh, tp.oc0, tp.ocn, slot, tp.ocn, n);
             }
             tp_join(tp.hid, n, proj);
-            add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H);
-            rmsnorm(x, y.post_norm, H, cfg.rms_eps, xn, n, stream);
-            tp_gate_up(y.gate, y.up, xn, slot, n);
+            if (fuse) {
+                rmsnorm_fused(x, proj, y.post_norm, H, cfg.rms_eps, xn, n, xh_pre, stream);
+            } else {
+                add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H);
+                rmsnorm(x, y.post_norm, H, cfg.rms_eps, xn, n, stream);
+            }
+            tp_gate_up(y.gate, y.up, xn, slot, n, pre);
             const bool xh = tp_join_x(tp.mlp, n, gu);
             tp_cols_x(y.down, gu, xh, tp.oc0, tp.ocn, slot, tp.ocn, n);
             tp_join(tp.hid, n, proj);
-            add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H);
+            if (fuse && l + 1U < cfg.layers) carry = proj;  // added by the next layer's input norm
+            else add_kernel<<<nb, 256, 0, stream>>>(x, proj, n * H);
         }
         HipRowsOut out;
         if (mtp.ok) {  // trunk hidden of every row for the MTP chain (replicated: x is the one-rank x)
