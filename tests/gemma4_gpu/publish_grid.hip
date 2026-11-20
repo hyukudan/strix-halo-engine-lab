@@ -7,6 +7,7 @@
 #include "gemma4/kv/storage.hpp"
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <random>
@@ -167,6 +168,9 @@ void bench() {
 } // namespace
 int main(int argc, char** argv) try {
     require_device();
+    // The grid policy must not silently change existing Gemma4 serving.
+    if (std::getenv("STRIX_G4_KV_PUBLISH_GRID") == nullptr)
+        CHECK(g4kv::publish_order() == g4kv::PublishOrder::ordered);
     unsigned cases = 0;
     for (const auto& [start, rows] : std::vector<std::pair<std::uint64_t, unsigned>>{
              {0, 1}, {3, 8}, {100, 64}, {0, 512}, {300, 512}, {508, 8}, {511, 1}, {1000, 600}, {77, 1100}}) {
