@@ -62,27 +62,35 @@ __device__ __forceinline__ void mma_scale_acc(float (&acc)[4], const float (&p)[
     for (unsigned i = 0; i < 4U; ++i) acc[i] = __fmaf_rn(p[i], scale[i & 1U], acc[i]);
 }
 
+// Field loader of the BF16 tensor-core kernels (lane words native_mma::word_index). The TURBO int8 kernels pass their own
+// loader (moe_turbo_i8.cuh TurboRaw: the int8 fragment's words) to the same ring.
+template <class Decode> struct MmaRaw {
+    static __device__ __forceinline__ typename Decode::Raw get(const std::uint8_t* row, unsigned group, unsigned lane) {
+        return mma_raw<Decode>(row, group, lane);
+    }
+};
 // Weight-field ring of depth D (native_mma::ring_group): slot 0 is the group consumed next. Loads only, issued D groups
-// ahead; D = 1 is the one-group lookahead of the tile form.
-template <class Decode, unsigned D>
+// ahead; D = 1 is the one-group lookahead of the tile form. One ring for every tensor-core expert kernel of the backend
+// (BF16 and TURBO int8): Load supplies the lane's field bytes of one row and group.
+template <class Decode, unsigned D, class Load = MmaRaw<Decode>>
 __device__ __forceinline__ void ring_fill(typename Decode::Raw (&ring)[D][2], const std::uint8_t* row0, const std::uint8_t* row1,
                                           unsigned groups, unsigned lane) {
 #pragma unroll
     for (unsigned i = 0; i < D; ++i) {
         const unsigned group = native_mma::ring_group(0U, i, groups);
-        ring[i][0] = mma_raw<Decode>(row0, group, lane);
-        ring[i][1] = mma_raw<Decode>(row1, group, lane);
+        ring[i][0] = Load::get(row0, group, lane);
+        ring[i][1] = Load::get(row1, group, lane);
     }
 }
 // After the caller copied slot 0 (group `group`): shift the ring and load group ring_group(group, D) into the last slot.
-template <class Decode, unsigned D>
+template <class Decode, unsigned D, class Load = MmaRaw<Decode>>
 __device__ __forceinline__ void ring_advance(typename Decode::Raw (&ring)[D][2], const std::uint8_t* row0, const std::uint8_t* row1,
                                              unsigned group, unsigned groups, unsigned lane) {
     const unsigned next = native_mma::ring_group(group, D, groups);
 #pragma unroll
     for (unsigned i = 0; i + 1U < D; ++i) { ring[i][0] = ring[i + 1U][0]; ring[i][1] = ring[i + 1U][1]; }
-    ring[D - 1U][0] = mma_raw<Decode>(row0, next, lane);
-    ring[D - 1U][1] = mma_raw<Decode>(row1, next, lane);
+    ring[D - 1U][0] = Load::get(row0, next, lane);
+    ring[D - 1U][1] = Load::get(row1, next, lane);
 }
 // Activation stage storage: static shared memory for the tile forms; the wide form's stages (twice the rows: 72 KB project,
 // 80 KB down, over the 48 KB static limit) live in the launch's dynamic shared memory, slot i at byte i * sizeof(A)

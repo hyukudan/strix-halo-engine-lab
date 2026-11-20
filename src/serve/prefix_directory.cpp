@@ -104,6 +104,32 @@ PrefixMatch PrefixDirectory::lookup(const PrefixKey& key, std::span<const std::u
     return best;
 }
 
+std::vector<PrefixMatch> PrefixDirectory::inflight_matches(const PrefixKey& key,
+                                                           std::span<const std::uint32_t> tokens) const {
+    std::vector<PrefixMatch> out;
+    if (tokens.size() < 2 || entries_.empty()) return out;
+    const std::uint64_t limit = tokens.size() - 1; // one suffix token stays with the caller
+    if (limit < min_tokens_) return out;
+    // An entry sharing >= min_tokens tokens shares the first min_tokens / block_tokens full blocks, so it is indexed
+    // under that one chain value (depth 0 = the identity seed); the token compare below decides.
+    const std::size_t depth = static_cast<std::size_t>(min_tokens_ / block_tokens_);
+    std::vector<std::uint64_t> chain;
+    chain_of(key, tokens.first(depth * block_tokens_), chain);
+    const auto range = index_.equal_range(chain[depth]);
+    for (auto it = range.first; it != range.second; ++it) {
+        const std::uint64_t id = it->second;
+        if (std::any_of(out.begin(), out.end(), [id](const PrefixMatch& m) { return m.entry == id; })) continue;
+        const auto found = entries_.find(id);
+        if (found == entries_.end()) continue;
+        const Entry& entry = found->second;
+        if (entry.state != PrefixState::inflight || !(entry.key == key)) continue;
+        const std::uint64_t usable = std::min(common_length(entry.tokens, tokens), limit);
+        if (usable >= min_tokens_) out.push_back(PrefixMatch{id, usable, true});
+    }
+    std::sort(out.begin(), out.end(), [](const PrefixMatch& a, const PrefixMatch& b) { return a.entry < b.entry; });
+    return out;
+}
+
 std::uint64_t PrefixDirectory::announce(const PrefixKey& key, std::span<const std::uint32_t> tokens,
                                         std::uint32_t lane) {
     if (tokens.size() < min_tokens_) return 0;

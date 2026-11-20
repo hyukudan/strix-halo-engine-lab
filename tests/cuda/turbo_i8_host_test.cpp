@@ -107,25 +107,35 @@ static float reference(const Problem& p, unsigned row, unsigned out) {
 // The kernel's order: per group, per m16 block of the tile (rows >= count hold garbage), per n8 block of outputs; operands
 // loaded exactly as turbo_group / turbo_weights do; scale from the owner lane (shuffle). permuted=false: sensitivity arm
 // (identity words q, q + 4 against the permuted 8-byte A loads).
-static std::vector<float> emulate(const Problem& p, unsigned count, bool permuted, std::mt19937& rng) {
+// depth: the weight ring of the kernels (moe_a8::ring_fill / ring_advance over native_mma::ring_group): 1 = the tile form's
+// one-group lookahead, kDecodeAhead = the decode form. The ring hands group `wg` to the IMMAs of group g; wg != g would
+// mix one group's codes and scales with another group's activations.
+static std::vector<float> emulate(const Problem& p, unsigned count, bool permuted, std::mt19937& rng, unsigned depth = 1U) {
+    namespace nm = strix::cuda::core::native_mma;
     const unsigned mblocks = ti::m_blocks(count), groups = p.K / 32U;
+    std::vector<unsigned> ring(depth);
+    for (unsigned i = 0; i < depth; ++i) ring[i] = nm::ring_group(0U, i, groups);
     std::vector<std::int8_t> staged(std::size_t(16U * mblocks) * p.K);
     std::uniform_int_distribution<int> junk(-128, 127);
     for (unsigned r = 0; r < 16U * mblocks; ++r)
         for (unsigned k = 0; k < p.K; ++k) staged[std::size_t(r) * p.K + k] = r < count ? p.x[r * p.K + k] : static_cast<std::int8_t>(junk(rng));
     std::vector<float> out(std::size_t(count) * p.outs, 0.0F), acc(std::size_t(16U * mblocks) * p.outs, 0.0F);
-    for (unsigned g = 0; g < groups; ++g)
+    for (unsigned g = 0; g < groups; ++g) {
+        const unsigned wg = ring[0];  // fields loaded `depth` groups ahead, handed over now
+        for (unsigned i = 0; i + 1U < depth; ++i) ring[i] = ring[i + 1U];
+        ring[depth - 1U] = nm::ring_group(g, depth, groups);
+        if (ring[depth - 1U] >= groups) { check(false, "ring loads past the last group"); return {}; }
         for (unsigned nb = 0; nb < p.outs / 8U; ++nb) {
             // turbo_weights: lane reads words of weight row nb*8 + b_col(lane); scale of its own row, then the owner lanes'.
             float own[32][2];
             std::uint32_t words[32][2];
             for (unsigned lane = 0; lane < 32U; ++lane) {
                 const unsigned o = 8U * nb + ti::b_col(lane);
-                const std::int8_t* code = &p.w[std::size_t(o) * p.K + 32U * g];
+                const std::int8_t* code = &p.w[std::size_t(o) * p.K + 32U * wg];
                 for (unsigned r = 0; r < 2U; ++r)
                     words[lane][r] = pack(code + 4U * (p.halves ? ti::k16_word(lane, r) : (permuted ? ti::k32_word(lane, r) : lane % 4U + 4U * r)));
-                own[lane][0] = p.sw[(o * groups + g) * 2U];
-                own[lane][1] = p.sw[(o * groups + g) * 2U + (p.halves ? 1U : 0U)];
+                own[lane][0] = p.sw[(o * groups + wg) * 2U];
+                own[lane][1] = p.sw[(o * groups + wg) * 2U + (p.halves ? 1U : 0U)];
             }
             for (unsigned m = 0; m < mblocks; ++m) {
                 std::uint32_t d[2][32][4];
@@ -164,6 +174,7 @@ static std::vector<float> emulate(const Problem& p, unsigned count, bool permute
                     }
             }
         }
+    }
     for (unsigned r = 0; r < count; ++r)
         for (unsigned o = 0; o < p.outs; ++o) out[std::size_t(r) * p.outs + o] = acc[std::size_t(r) * p.outs + o];
     return out;
@@ -221,6 +232,31 @@ int main() {
         for (unsigned r = 0; r < 16U; ++r)
             for (unsigned o = 0; o < 16U; ++o) differs |= bad[std::size_t(r) * 16U + o] != reference(p, r, o);
         check(differs, "sensitivity: unpermuted words with 8-byte loads give wrong dots");
+    }
+    // 6. Decode form of the TURBO kernels (native_mma::decode_form: <= 16 rows, kDecodeMBlocks m16 block, the shared
+    //    kDecodeAhead-deep weight ring) equals the contract bitwise, i.e. the int8 tile form, for the K of the down (640) and
+    //    project (2560) loops; groups < depth included (K = 64).
+    {
+        namespace nm = strix::cuda::core::native_mma;
+        bool same = true, fits = true;
+        for (bool halves : {false, true})
+            for (unsigned K : {64U, 640U, 2560U})
+                for (unsigned count : {1U, 2U, 7U, 16U}) {
+                    fits &= nm::decode_form(count) && ti::m_blocks(count) <= nm::kDecodeMBlocks;
+                    const Problem p = make(rng, count, K, 16U, halves);
+                    const auto got = emulate(p, count, true, rng, nm::kDecodeAhead);
+                    if (got.size() != std::size_t(count) * p.outs) { same = false; continue; }
+                    for (unsigned r = 0; r < count; ++r)
+                        for (unsigned o = 0; o < p.outs; ++o) {
+                            const float want = reference(p, r, o), have = got[std::size_t(r) * p.outs + o];
+                            same &= std::memcmp(&want, &have, 4) == 0;
+                            ++compared;
+                        }
+                    ++cases;
+                }
+        check(fits, "a decode-form step (<= 16 rows) fits the decode form's m16 blocks");
+        check(same, "decode form (deep ring, one m16 block) equals the contract bitwise");
+        check(nm::kDecodeAhead > nm::kTileAhead && !nm::decode_form(17U), "decode form: deeper ring, at most 16 rows");
     }
     // The step is one product rounding and one FMA rounding (not a fused triple, not two-rounded fma).
     {

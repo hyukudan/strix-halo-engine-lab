@@ -117,6 +117,7 @@ Las tablas listan los flags seleccionados. La lista completa de variables de ent
 | `--block-schedule default\|tail-large` | qwen-rtx | `tail-large` | Orden de bloques en los kernels grandes. | `default` en GPUs con otro número de CUs. |
 | `--prefill auto` | glm | `auto` | Elige la ruta de prefill. | - |
 | `--prefill-chunk N` | glm | 512 | Tamaño de chunk de prefill en filas. | Mayor con más cómputo; menor con menos memoria. |
+| `--prefill-route windows\|large`, `--prefill-chunk N` | qwen-rtx (CLI spec 27B) | `windows` | `large`: el prompt pasa por el prefill grande del CLI de decode (`--prefill-chunk N` filas por chunk; 0 = valor del motor) y sus filas alimentan la cadena MTP. Opcional, aún sin medir frente a `windows`. | - |
 | `--prefill-path device` | deepseek serve | `device` | Prefill en la GPU. | - |
 | `--wide-exact N` | qwen (app decode HIP 27B) | off (ventanas de 16 filas) | Ventanas de prefill EXACT de N filas, cada fila bit a bit igual al resultado de 16 filas; solo si todas las proyecciones densas grandes son IU4 (otros formatos resuelven a 16 filas). `--wide N` (> 16) es la clase FAST ancha. [Detalles](optimizations.md#qwen27-hip-decode-step). | 64 es el mejor medido en Strix (la atención exacta cuesta más por fila en rejillas más anchas). |
 | `--prefill-rows N`, `--prefill-exact` | qwen (app spec HIP 27B) | ventanas EXACT de 64 filas (proyecciones densas IU4; 16 filas en otro caso) | `--prefill-rows 16` = ventanas de 16 filas; N > 16 = la clase FAST ancha salvo con `--prefill-exact`. [Detalles](optimizations.md#qwen27-hip-decode-step). | - |
@@ -131,6 +132,7 @@ Las tablas listan los flags seleccionados. La lista completa de variables de ent
 |---|---|---|---|---|
 | `--mtp-bundle`, `--rope-yarn 2\|4 --context C` | qwen | - | Bundle de draft MTP; YaRN para contexto largo. | - |
 | `--prelaunch 0\|1` | qwen-rtx (CLI spec densa 27B) | `0` | Lanza el verify detrás del draft MTP alimentado en el dispositivo (mismos ids). | - |
+| `--mtp-catchup kv\|full` | qwen-rtx (CLI spec 27B) | `kv` | Catch-up MTP solo K/V: los chunks de catch-up cuyas salidas nadie lee escriben solo la K/V del MTP (misma K/V, mismos drafts). `full` = la pasada MTP completa (interruptor de apagado). [Detalles](optimizations.md#qwen27-cuda-mtp-kv-catchup) | - |
 | `--mtp 0\|1` | glm | resuelto (ver `--print-effective-config`) | Apaga o enciende el draft MTP. | `0` cuando falta memoria. |
 | `--identity r1b\|r1` | glm | `r1b` | Identidad de decode. | `r1` para comparar. |
 | `--dspark`, `--no-dspark`, `--dspark-vocab auto\|full` | deepseek | on si se encuentra el draft | Draft especulativo DSpark. | `--no-dspark` cuando falta memoria. |

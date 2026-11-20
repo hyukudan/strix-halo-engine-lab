@@ -13,6 +13,7 @@
 #include "strix/dist/communicator.hpp"
 #include "qwen_tiled_prompt_plan.hpp"
 #include "strix/serve/engine.hpp"
+#include "strix/serve/prefix_join.hpp"
 #include "strix/qpf2k_defaults.hpp"
 #include "strix/hip_indexed_attention_launcher.hpp"
 #include "strix/serve/health.hpp"
@@ -1208,7 +1209,10 @@ public:
         bool prefilling = false; // its prompt is still running (interleaved admission)
         std::unique_ptr<TiledMtpPrompt> prefill;
         Slot* waits_for=nullptr;
-        QwenPrefixJoinWait join_wait;
+        serve::PrefixJoinWait join_wait;
+        // Shared in-flight prefix directory: this slot's entry while its prompt may serve joins, and the producer
+        // entry it holds a lease on while it waits.
+        std::uint64_t prefix_entry=0, join_entry=0;
         std::uint64_t order = 0; // admission order: prompts advance oldest first
         std::chrono::steady_clock::time_point prompt_start;
         MtpBatchRequest request;
@@ -1458,6 +1462,7 @@ private:
         // Predictor priming and cache checkpoints use the configured draft identity for every prompt.
         enable_draft_(*s.runtime, s.request.prompt, s.request.sampler);
         s.prompt_start = start;
+        end_prefix_entries(s);
         s.waits_for=nullptr;s.join_wait={};
         if (s.parents->tiled.cache) s.parents->tiled.cache->set_retention(s.request.cache_retention != serve::CacheRetention::no_store);
         s.prefill = std::make_unique<TiledMtpPrompt>(s.request.prompt, model_, compiled_, s.parents->tiled, *s.session, *s.target,
@@ -1471,9 +1476,9 @@ private:
         s.prefill->set_request_order(s.order);
         s.active = true;
         s.prefilling = true;
-        if(options_.prefix_cache_inflight && interleave_ && !service_mode_ && !s.request.constraint &&
-            s.prefill->lookup_deferred()) wait_for_shared_prefix(s);
+        if(prefix_join_on() && !s.request.constraint && s.prefill->lookup_deferred()) wait_for_shared_prefix(s);
         if(!s.waits_for && s.prefill->lookup_deferred()) s.prefill->retry_join_lookup();
+        if(!s.waits_for) announce_prefix(s);
         stats_.max_active = std::max<std::uint64_t>(stats_.max_active, active());
         if(worker_) s.prefill->execute_native=[this,&s](HipKnownPrefixWindow& owner,const std::function<void()>& job){
             if(service_mode_) {
@@ -1508,11 +1513,14 @@ public:
             if(!s.prefilling || !s.waits_for) continue;
             if(cancel_requested(s)) {cancel_prefill(s,false);continue;}
             const auto& producer=*s.waits_for;
+            // Asynchronous capture: the boundary state exists once the producer's position has passed it.
             if(s.join_wait.pending(producer.order,producer.active,producer.prefilling,
-                producer.prefill?producer.prefill->position():0)) continue;
+                (producer.prefill?producer.prefill->position():0)>s.join_wait.boundary)) continue;
             s.waits_for=nullptr;s.join_wait={};
             PrefixAsyncCapture::reap();
             s.prefill->retry_join_lookup();
+            if(s.join_entry) {prefix_inflight_.release(s.join_entry);s.join_entry=0;}
+            announce_prefix(s);
             stats_.inflight_restored_tokens+=s.prefill->restored();
         }
         // STRIX_BATCH_SHORT_FIRST_ROWS (default 2048; 0 = oldest prompt first): a prompt with at most that many rows left runs
@@ -1739,6 +1747,7 @@ public:
             const bool was_active=s->active;
             s->active = false;
             s->prefilling = false;
+            end_prefix_entries(*s);
             s->waits_for=nullptr;s->join_wait={};
             s->prefill.reset();
             s->greedy.reset();
@@ -1749,25 +1758,37 @@ public:
     }
 
 private:
+    bool prefix_join_on() const noexcept {return options_.prefix_cache_inflight && interleave_ && !service_mode_;}
+    // A prefilling unconstrained prompt may serve joins from now on (shared directory; lane = slot index).
+    void announce_prefix(Slot& s) {
+        if(!prefix_join_on() || s.prefix_entry || s.request.constraint) return;
+        for(std::size_t i=0;i<slots_.size();++i)
+            if(slots_[i].get()==&s) {s.prefix_entry=prefix_inflight_.announce({},s.request.prompt,static_cast<std::uint32_t>(i));return;}
+    }
+    // The prompt stops serving joins (prefill complete, cancel, finish, reuse) and drops any lease it holds.
+    void end_prefix_entries(Slot& s) noexcept {
+        if(s.prefix_entry) {prefix_inflight_.withdraw(s.prefix_entry);s.prefix_entry=0;}
+        if(s.join_entry) {prefix_inflight_.release(s.join_entry);s.join_entry=0;}
+    }
+    // Shared in-flight join (strix::serve::choose_prefix_join); the plan-certified boundary is this family's trait.
     void wait_for_shared_prefix(Slot& s) {
         auto* cache=s.parents->tiled.cache;
         if(!cache || !cache->joining_allowed()) return;
-        Slot* best=nullptr;std::uint64_t boundary=0;
-        for(auto& owner:slots_) {
-            auto& other=*owner;
-            auto* source=other.parents->tiled.cache;
-            if(&other==&s || !other.prefilling || other.waits_for || !other.prefill || !source ||
-                other.prefill->restored() || other.request.constraint) continue;
-            std::uint64_t common=0;
-            const auto count=std::min(s.request.prompt.size(),other.request.prompt.size());
-            while(common<count && s.request.prompt[common]==other.request.prompt[common]) ++common;
-            const auto p=cache->join_boundary(*source,common,other.prefill->position());
-            if(p>boundary) {best=&other;boundary=p;}
-        }
-        if(!best || boundary<=cache->cached_boundary(s.request.prompt)) return;
-        best->parents->tiled.cache->request_capture(boundary);
-        s.waits_for=best;s.join_wait={best->order,boundary};
-        ++stats_.inflight_waits;stats_.inflight_wait_tokens+=boundary;
+        const auto choice=serve::choose_prefix_join(prefix_inflight_,{},s.request.prompt,cache->cached_boundary(s.request.prompt),
+            [&](const serve::PrefixMatch& m,std::uint32_t lane)->std::uint64_t {
+                if(lane>=slots_.size()) return 0;
+                auto& other=*slots_[lane];
+                auto* source=other.parents->tiled.cache;
+                if(&other==&s || other.prefix_entry!=m.entry || !other.prefilling || other.waits_for || !other.prefill ||
+                    !source || other.prefill->restored() || other.request.constraint) return 0;
+                return cache->join_boundary(*source,m.tokens,other.prefill->position());
+            });
+        if(!choice) return;
+        auto& best=*slots_[choice.lane];
+        best.parents->tiled.cache->request_capture(choice.boundary);
+        if(prefix_inflight_.acquire(choice.entry)) s.join_entry=choice.entry;
+        s.waits_for=&best;s.join_wait={best.order,choice.boundary};
+        ++stats_.inflight_waits;stats_.inflight_wait_tokens+=choice.boundary;
     }
     static void check_service(hipError_t e,const char* what) {
         if(e!=hipSuccess) throw std::runtime_error(std::string(what)+": "+hipGetErrorString(e));
@@ -1795,6 +1816,7 @@ private:
         if(s.window) s.window->begin_session();
         s.runtime=std::make_shared<HipMtpRuntime>(s.native);
         s.prefilling=false;s.active=false;s.result.finish="cancelled";
+        end_prefix_entries(s);
         s.result.prompt_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-s.prompt_start).count();
         ++stats_.finished;
         if(s.request.constraint) s.result.constraint=s.request.constraint->verdict(s.result.finish);
@@ -2137,6 +2159,7 @@ private:
         if(s.parents->tiled.cache) s.result.cache_refusal=s.parents->tiled.cache->request().refusal;
         s.prefill.reset();
         s.prefilling = false;
+        end_prefix_entries(s);
         s.decode_start = std::chrono::steady_clock::now();
         s.result.prompt_ms = std::chrono::duration<double, std::milli>(s.decode_start - s.prompt_start).count();
         const auto route=resolve_mtp_selection_route(options_.http_selection_mtp,!!s.window,s.window && s.window->policy_selection_admitted());
@@ -2276,6 +2299,7 @@ private:
         finish(s);
     }
     void finish(Slot& s) {
+        end_prefix_entries(s);
         s.waits_for=nullptr;s.join_wait={};
         if(s.request.constraint) s.result.constraint=s.request.constraint->verdict(s.result.finish);
         s.prefill.reset();s.prefilling=false;
@@ -2298,6 +2322,9 @@ private:
     const ActivatedMtpDraftPlan& activated_;
     EnableDraft enable_draft_;
     std::vector<std::unique_ptr<Slot>> slots_;
+    // In-flight prompts that may serve a join (lane = index in slots_). 64-token blocks, min 64: a plan-certified
+    // boundary is a multiple of T >= 64, so no join below 64 shared tokens exists.
+    serve::PrefixDirectory prefix_inflight_{64, 64};
     bool interleave_ = false;
     std::uint32_t serial_rows_per_step_ = 16;
     // Interleaved admission: decode time owed to the requests past their prompt for the prompt units run.
