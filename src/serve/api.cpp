@@ -1,6 +1,7 @@
 #include "strix/serve/api.hpp"
 
 #include "strix/serve/chat_template.hpp"
+#include "strix/serve/constraint_selection.hpp"
 #include "strix/serve/cycle_receipt.hpp"
 #include "strix/power/sampler.hpp"
 #include "strix/route_receipt.hpp"
@@ -1056,7 +1057,11 @@ struct ApiService::Impl {
             auto effort = v->as_string();
             if (effort == "minimal") effort = "low";
             if (effort == "none") input.enable_thinking = false;
-            else input.reasoning_effort = effort;
+            else {
+                const auto& off = config.thinking_off_efforts;
+                if (std::find(off.begin(), off.end(), effort) != off.end()) input.enable_thinking = false;
+                input.reasoning_effort = effort;
+            }
         }
         std::string text;
         try { text = config.chat_renderer ? config.chat_renderer(input) : render_chat_template(input); }
@@ -1269,11 +1274,8 @@ struct ApiService::Impl {
         spec->eos_ids = config.stop_tokens;
         const auto eos = tokenizer->eos_token();
         if (eos < tokenizer->vocab_size() && std::find(spec->eos_ids.begin(), spec->eos_ids.end(), eos) == spec->eos_ids.end()) spec->eos_ids.push_back(eos);
+        if (!thinking_closure_usable(*tokenizer, spec->eos_ids)) bad("thinking_policy", "missing usable end-thinking control token");
         const auto end = tokenizer->find("</think>");
-        if (end >= tokenizer->vocab_size() || tokenizer->token_bytes(end) != "</think>" ||
-            (tokenizer->type(end) != BpeTokenizer::TokenType::control && tokenizer->type(end) != BpeTokenizer::TokenType::user_defined) ||
-            std::find(spec->eos_ids.begin(), spec->eos_ids.end(), end) != spec->eos_ids.end())
-            bad("thinking_policy", "missing usable end-thinking control token");
         spec->end_thinking_id = end;
         thinking.closure_ids.push_back(end);
         const auto suffix = tokenizer->encode(thinking_answer_separator, false);

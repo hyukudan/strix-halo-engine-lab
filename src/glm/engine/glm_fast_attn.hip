@@ -14,6 +14,7 @@
 #include "glm/attn/glm_attn_tierb.hpp"
 #include "glm/engine/glm_lib.hpp"
 #include "glm/spec/glm_spec_dev.hpp"
+#include "strix/sparse_select_policy.hpp"
 
 #include <algorithm>
 #include <stdexcept>
@@ -60,6 +61,7 @@ public:
     FastAttn(unsigned kda_heads, unsigned mla_heads, std::uint64_t cap)
         : Hk_(kda_heads), Hm_(mla_heads), C_(kda_heads * kKdaDim), cap_(cap), kstride_(static_cast<unsigned>(cap / kKpool)) {
         if (const char* directory = std::getenv("STRIX_GLM_KVSHARD_DUMP")) dump_directory_ = directory;
+        skip_query_ = strix::sparse_select::query_skip_enabled();
         constexpr std::size_t R = F::kMaxRows;
         qkv3_ = dalloc<float>(3 * R * C_);
         qkv_ = dalloc<float>(R * 3 * C_);
@@ -206,29 +208,38 @@ private:
             const float* xr = x + r0 * kHidden;
             unsigned p_bound = 1;
             std::uint64_t t_vis = 0;  // max visible tokens over the rows (scores schedule hint)
+            bool identity = true;     // every row selects all its pools (shared short-context rule)
             for (unsigned r = 0; r < n; ++r) {
                 const std::uint64_t t = c.rows[r0 + r].pos;
                 if (t >= st.cap) throw std::out_of_range("DSA position beyond the slot capacity");
                 p_bound = std::max(p_bound, static_cast<unsigned>((t + 1) / kKpool));
                 t_vis = std::max<std::uint64_t>(t_vis, t + 1);
+                identity = identity && strix::sparse_select::selection_is_identity(kDsaSelect, t);
             }
+            // At most kIdxPools completed pools in every row: indexer_select takes them all and never reads the keys or the
+            // histogram, so the scores are skipped (no cache writes happen there), and (STRIX_SELECT_SHORT_SKIP, default on)
+            // so are the query projections only the scores read (wq_b -> qI_, weights_proj -> wraw_). A dump keeps them.
+            const bool score = !identity || dumping;
+            const bool query = score || !skip_query_;
             if (raw(w.q_a)) {  // [q_a + kv_a], both norms, [q_b + wq_b]: the same ops on the same inputs, fused launches
                 TB::dsa_a(mat(w.q_a), mat(w.kv_a), xr, kHidden, n, qa_, kQLora, kva_, kKvLora, tb_ws_, c.stream);
                 D::rmsnorm(qa_, w.q_a_norm, D::WType::BF16, kQLora, kEps, qr_, n, c.stream);
                 D::rmsnorm(kva_, w.kv_a_norm, D::WType::BF16, kKvLora, kEps, lat_, n, c.stream);
-                TB::dsa_b(mat(w.q_b), mat(w.wq_b), qr_, kQLora, n, q_, Hm_ * kMlaDim, qI_, kIdxHeads * kIdxDim, tb_ws_, c.stream);
+                TB::dsa_b(mat(w.q_b), mat(w.wq_b), qr_, kQLora, n, q_, Hm_ * kMlaDim, query ? qI_ : nullptr, kIdxHeads * kIdxDim, tb_ws_,
+                          c.stream);
             } else {
                 c.lin->run(w.q_a, xr, qa_, n, c.stream);
                 D::rmsnorm(qa_, w.q_a_norm, D::WType::BF16, kQLora, kEps, qr_, n, c.stream);
                 c.lin->run(w.q_b, qr_, q_, n, c.stream);
                 c.lin->run(w.kv_a, xr, kva_, n, c.stream);
                 D::rmsnorm(kva_, w.kv_a_norm, D::WType::BF16, kKvLora, kEps, lat_, n, c.stream);
-                c.lin->run(w.wq_b, qr_, qI_, n, c.stream);
+                if (query) c.lin->run(w.wq_b, qr_, qI_, n, c.stream);
             }
+            // Each job is its own chain, so dropping the last job leaves the key / gate bits unchanged.
             const F::DenseJob j3[3] = {{w.wk, xr, key_, kIdxDim, kHidden, kHidden, kIdxDim},
                                        {w.gate, xr, gt_, kIdxDim, kHidden, kHidden, kIdxDim},
                                        {w.weights_proj, xr, wraw_, kIdxHeads, kHidden, kHidden, kIdxHeads}};
-            F::dense_f16(j3, 3, n, c.stream);
+            F::dense_f16(j3, query ? 3U : 2U, n, c.stream);
             dsa_rows_kernel<<<1, F::kMaxRows, 0, c.stream>>>(c.slot_d + r0, c.pos_d + r0, st.latent, st.ikey, st.igate, st.pooled,
                                                               static_cast<unsigned>(st.shard ? kvshard::storage_tokens(st.cap) : st.cap), slots_, tpos_, n);
             hip_ok(hipGetLastError(), "dsa rows");
@@ -236,10 +247,8 @@ private:
             if (st.shard) st.shard->append(st, c, d, lat_, key_, gt_, iw, hist_);
             else if (c.spec) F::dsa_store(d, lat_, key_, gt_, iw, hist_, c.spec->row_flag + r0, c.stream, 1);  // C3/C4 per row
             else F::dsa_store(d, lat_, key_, gt_, iw, hist_, c.flag, c.stream);
-            // At most kIdxPools visible pools in every row: indexer_select takes them all and never reads the keys or the
-            // histogram, so their computation is skipped (no cache writes happen there).
-            if (st.shard) st.shard->prepare(st, c, d, qI_, wraw_, keys_, kstride_, hist_, q_, w.kv_b, mw_, p_bound > kIdxPools || dumping);
-            else if (p_bound > kIdxPools || dumping) {
+            if (st.shard) st.shard->prepare(st, c, d, qI_, wraw_, keys_, kstride_, hist_, q_, w.kv_b, mw_, score);
+            else if (score) {
                 F::indexer_score(d, qI_, wraw_, keys_, kstride_, hist_, p_bound, c.stream, c.spec != nullptr);
             }
             F::indexer_select(d, keys_, kstride_, hist_, tok_, ntok_, c.stream);
@@ -363,7 +372,10 @@ private:
         else c.lin->run(w.o, ky_, y, n, c.stream);
     }
 
+    // DSA selection geometry: pools of kKpool tokens, kIdxPools kept, only completed pools ranked (the tail always attends).
+    static constexpr strix::sparse_select::Geometry kDsaSelect{kKpool, kIdxPools, false};
     std::string dump_directory_;
+    bool skip_query_ = true;  // STRIX_SELECT_SHORT_SKIP (read once)
     unsigned Hk_, Hm_, C_;
     std::uint64_t cap_;
     unsigned kstride_;

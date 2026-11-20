@@ -1957,7 +1957,7 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
             expect(resolve(forbidden,memory).error=="YaRN MTP cohort/wide/sampling/metadata routes are not supported",
                 "cert control preserves the bounded explicit MTP route refusal");
             forbidden=cli; forbidden.options.http_serve=true;
-            expect(resolve(forbidden,memory).error=="YaRN on HTTP serving not supported","cert control preserves named HTTP refusal");
+            expect(resolve(forbidden,memory).error=="YaRN HTTP serving requires the MTP route","cert control preserves named HTTP refusal");
             forbidden=cli; forbidden.options.prefix_cache_roundtrip=true;
             expect(resolve(forbidden,memory).error=="YaRN requires plain serial CLI without cache, replay or recording","cert control preserves named cache refusal");
         }
@@ -2248,12 +2248,44 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
         auto bad = request;
         const char* reason = nullptr;
         if (route == 0) { bad.options.mtp.enabled = true; bad.options.mtp.sample_options=true; reason = "YaRN MTP cohort/wide/sampling/metadata routes are not supported"; }
-        if (route == 1) { bad.options.http_serve = true; reason = "YaRN on HTTP serving not supported"; }
+        if (route == 1) { bad.options.http_serve = true; reason = "YaRN HTTP serving requires the MTP route"; }
         if (route == 2) { bad.options.teacher_forced_score = true; reason = "YaRN with teacher scoring not yet qualified"; }
         if (route == 3) { bad.options.gdn_islands = true; reason = "YaRN graph capture path not yet qualified"; }
         if (route == 4) { bad.options.session_save = "checkpoint"; reason = "YaRN with session save/restore not yet qualified"; }
-        if (route == 5) { bad.options.prefix_cache_host_bytes = 4096; reason = "YaRN with prefix state cache not yet qualified"; }
+        if (route == 5) { bad.options.prefix_cache_dir = "cache"; reason = "YaRN prefix state cache requires an explicit --prefix-cache-host-bytes"; }
         expect(resolve(bad,memory).error == reason,"YaRN named route refusal");
+    }
+    {
+        // QFN-3: YaRN serving opt-in. The single greedy HTTP MTP route with an explicit prefix budget is admitted by
+        // the shared refusal; batch/cohort, sampling and unaudited HTTP controls keep named refusals. The rotary
+        // descriptor itself is bound by the cache identities (prefix_dma_tests, session_state_cache_tests).
+        Options serve;
+        serve.rotary = RotaryDescriptor::yarn(2); serve.context_tokens = 524288U; serve.context_explicit = true;
+        serve.mtp.enabled = true; serve.http_serve = true; serve.http_batch_explicit = true;
+        serve.prefix_cache_host_bytes = UINT64_C(8) << 30U;
+        serve.supplied_options = {"--rope-yarn","--context","--http-serve","--http-batch","--http-port","--prefix-cache-host-bytes"};
+        expect(yarn_route_refusal(serve).empty(), "YaRN single HTTP MTP route with explicit prefix budget is admitted");
+        auto batch = serve; batch.http_batch_explicit = false;
+        expect(yarn_route_refusal(batch).find("--http-batch 0") != std::string::npos, "YaRN HTTP needs the explicit single route");
+        auto capped = serve; capped.http_batch = capped.http_batch_cap = 2U;
+        expect(yarn_route_refusal(capped).find("--http-batch 0") != std::string::npos, "YaRN HTTP batch slots refuse");
+        auto sampled = serve; sampled.http_sampling = "sample";
+        expect(yarn_route_refusal(sampled) == "YaRN HTTP sampling not supported (greedy only)", "YaRN HTTP sampling refuses");
+        auto fast = serve; fast.supplied_options.insert("--http-selection-fast");
+        expect(yarn_route_refusal(fast) == "YaRN MTP explicit target override not supported: --http-selection-fast",
+            "unaudited HTTP selection control refuses by name");
+        auto implicit = serve; implicit.prefix_cache_host_bytes = 0; implicit.prefix_cache_dir = "cache";
+        expect(yarn_route_refusal(implicit) == "YaRN prefix state cache requires an explicit --prefix-cache-host-bytes",
+            "YaRN cache budget is explicit only");
+        auto band = serve; band.context_tokens = 600000U;
+        expect(yarn_route_refusal(band) == "YaRN MTP requires f2 at C<=524288 and f4 at C<=1048576", "factor band unchanged");
+        // One resolver: the same request on the CLI and on the single HTTP route takes the same QSA MTP pool decision.
+        auto cli = serve; cli.http_serve = false; cli.http_batch_explicit = false; cli.prefix_cache_host_bytes = 0;
+        auto http = serve; http.prefix_cache_host_bytes = 0;
+        const char* cli_pool = qsa_mtp_pool_decline(cli);
+        const char* http_pool = qsa_mtp_pool_decline(http);
+        expect((cli_pool == nullptr) == (http_pool == nullptr) &&
+            (!cli_pool || std::string_view(cli_pool) == std::string_view(http_pool)), "YaRN CLI and HTTP single resolve the same pool route");
     }
     {
         auto unknown = request; unknown.environment["STRIX_QPF2K_SHADOW_MAX_TOKENS"] = "300000";
@@ -4145,8 +4177,14 @@ int main(int argc, char** arguments) {
         explicit_t.options.known_prefix_tail_rows.clear();
         explicit_t.options.prefix_cache_host_bytes=gib_bytes;
         const auto cached=resolve(explicit_t,memory);
-        expect(cached.options.known_prefix_prefill_rows==2048 && cached.options.prefix_cache_block_rows==1024,
-            "explicit T wins and configured cache defaults to 1024 checkpoints");
+        // The single MTP route keeps row-class checkpoints on the 128-row class grid; other routes keep 1024.
+        const bool row_class=!cached.options.http_batch && cached.options.mtp.enabled;
+        expect(cached.options.known_prefix_prefill_rows==2048 &&
+            cached.options.prefix_cache_block_rows==(row_class?qwen_row_class_grid:std::uint64_t{1024}),
+            "explicit T wins and configured cache defaults to class-grid (single MTP route) or 1024 checkpoints");
+        auto no_class=explicit_t;no_class.environment["STRIX_PREFIX_CACHE_ROW_CLASS"]="0";
+        expect(resolve(no_class,memory).options.prefix_cache_block_rows==1024,
+            "STRIX_PREFIX_CACHE_ROW_CLASS=0 keeps the 1024-row checkpoint default");
         explicit_t.options.prefix_cache_block_rows_explicit=true;
         explicit_t.options.prefix_cache_block_rows=0;
         expect(resolve(explicit_t,memory).options.prefix_cache_block_rows==0,"explicit zero restores T checkpoints");
@@ -5028,7 +5066,7 @@ int main(int argc, char** arguments) {
         expect(requested_prefill_environment()==prior_image,"MTP OFF preserves historical printed environment bytes");
         expect(qsa_mtp_pool_bytes(mtp_pool,ModelContract::qwen38_flash_next())==0,"MTP OFF has no extra admission bytes");
         ::unsetenv("STRIX_QSA_MTP_POOL");
-        for(unsigned route=0;route<15U;++route) {
+        for(unsigned route=0;route<18U;++route) {
             auto draft=mtp_pool;
             if(route==0) draft.http_serve=true;
             if(route==1) { draft.http_serve=true;draft.http_batch=8; }
@@ -5044,10 +5082,13 @@ int main(int argc, char** arguments) {
             if(route==11) { draft.http_serve=true;draft.session_mtp_fixed=true; }
             if(route==12) { draft.http_serve=true;draft.session_management_requested=true; }
             if(route==13) { draft.http_serve=true;draft.rtx_state_import=true; }
-            if(route==14) { draft.http_serve=true;draft.qsa_mtp_pool_fallback_unfit=true; }
-            expect(qsa_mtp_pool_route(draft)==(route==0 || route==7 || route==9),
-                "single HTTP (with RAM prefix cache) and YaRN f4 CLI default on; slots, sessions, disk restore and import stay opt-in");
-            expect(qsa_mtp_pool_single_fallback_pending(draft)==(route==1),"only AUTO/capped batch has a pending single fallback");
+            if(route==14) { draft.http_serve=true;draft.http_batch=4;draft.session_live_control=true; }
+            if(route==15) { draft.http_serve=true;draft.http_batch=3;draft.prefix_cache_host_bytes=1; }
+            if(route==16) { draft.http_serve=true;draft.http_batch=1;draft.http_batch_explicit=true;draft.http_batch_cap=1; }
+            if(route==17) { draft.http_serve=true;draft.http_batch=3;draft.prefix_cache_dir="DIR"; }
+            expect(qsa_mtp_pool_route(draft)==(route==0 || route==1 || route==7 || route==9 || route==15 || route==16),
+                "HTTP single and batch slots (with RAM prefix cache) and YaRN f4 CLI default on; nested scheduling, sessions, "
+                "disk restore and import stay opt-in");
             ::setenv("STRIX_QSA_MTP_POOL","1",1);
             expect(qsa_mtp_pool_route(draft),"explicit env enables unqualified M1 route when supported");
             ::setenv("STRIX_QPF2K_DEFAULTS","0",1);
@@ -5065,40 +5106,45 @@ int main(int argc, char** arguments) {
         ::unsetenv("STRIX_PLE_ROLLING");
         {
             auto single=mtp_pool;single.http_serve=true;
-            auto fallback=single;fallback.http_batch=1;
-            auto unfit=single;unfit.qsa_mtp_pool_fallback_unfit=true;
+            auto batch=single;batch.http_batch=3;
             expect(qsa_mtp_pool_bytes(single,ModelContract::qwen38_flash_next())==218644480 &&
-                qsa_mtp_pool_bytes(fallback,ModelContract::qwen38_flash_next())==0 &&
-                qsa_mtp_pool_bytes(unfit,ModelContract::qwen38_flash_next())==0,
-                "batch sizing excludes the pool; an unfit one-slot fallback keeps it out of admission");
-            expect(std::string_view(qsa_mtp_pool_decline(unfit))=="single-fallback-does-not-fit","unfit fallback names its decline");
-            auto cap_one=fallback;cap_one.http_batch_explicit=true;cap_one.http_batch_cap=1;
-            expect(!qsa_mtp_pool_single_fallback_pending(cap_one),"explicit cap 1 keeps the batch runner");
+                qsa_mtp_pool_bytes(batch,ModelContract::qwen38_flash_next())==218644480,
+                "every HTTP slot (single runner or batch) is charged one pool in the capacity fit");
             auto yarn_http=single;yarn_http.rotary=RotaryDescriptor::yarn(2);yarn_http.context_tokens=262144;
-            expect(!qsa_mtp_pool_route(yarn_http),"YaRN HTTP stays closed by default");
+            // QFN-3: the single YaRN HTTP route takes the CLI factor band (one resolver); outside it, closed.
+            auto yarn_cli=yarn_http;yarn_cli.http_serve=false;
+            expect(qsa_mtp_pool_route(yarn_http)==qsa_mtp_pool_route(yarn_cli) && qsa_mtp_pool_route(yarn_http),
+                "YaRN single HTTP route resolves the CLI pool decision");
+            auto yarn_out=yarn_http;yarn_out.context_tokens=600000;
+            expect(!qsa_mtp_pool_route(yarn_out),"YaRN HTTP outside the factor band stays closed");
+            auto yarn_batch=batch;yarn_batch.rotary=yarn_http.rotary;yarn_batch.context_tokens=262144;
+            expect(!qsa_mtp_pool_route(yarn_batch),"YaRN HTTP batch slots stay closed by default");
             for(const auto name:{qwen::profile::Name::standard,qwen::profile::Name::fast,qwen::profile::Name::quality}) {
                 auto profiled=single;profiled.product_profile=qwen::profile::resolve(name,{});
-                auto profiled_fallback=fallback;profiled_fallback.product_profile=profiled.product_profile;
-                expect(qsa_mtp_pool_route(profiled) && qsa_mtp_pool_single_fallback_pending(profiled_fallback),
-                    "product profiles carry no pool lever: the single HTTP decision is profile independent");
+                auto profiled_batch=batch;profiled_batch.product_profile=profiled.product_profile;
+                expect(qsa_mtp_pool_route(profiled) && qsa_mtp_pool_route(profiled_batch),
+                    "product profiles carry no pool lever: the HTTP decision is profile independent");
             }
             const auto pool_json=[](const Options& o) { EffectiveConfig c;c.options=o;return effective_config_json(c); };
             expect(pool_json(single).find("\"qsa_mtp_pool\":{\"requested\":true,\"effective\":\"runtime-admission-required\",\"route\":\"http-single\",\"source\":\"default\"")!=std::string::npos,
                 "inspection reports the default single HTTP pool");
-            expect(pool_json(fallback).find("\"effective\":\"single-fallback-only\",\"route\":\"http-batch\"")!=std::string::npos &&
-                pool_json(fallback).find("\"reserved_bytes\":218644480")!=std::string::npos,
-                "inspection reports the pool the one-slot fallback may admit");
+            expect(pool_json(batch).find("\"qsa_mtp_pool\":{\"requested\":true,\"effective\":\"runtime-admission-required\",\"route\":\"http-batch\",\"source\":\"default\"")!=std::string::npos &&
+                pool_json(batch).find("\"reserved_bytes\":218644480")!=std::string::npos,
+                "inspection reports the default per-slot batch pool");
             for(const char* name:{"STRIX_QSA_MTP_POOL","STRIX_QPF2K_DEFAULTS"}) {
                 ::setenv(name,"0",1);
-                expect(!qsa_mtp_pool_route(single) && !qsa_mtp_pool_single_fallback_pending(fallback) &&
-                    pool_json(single).find("qsa_mtp_pool")==std::string::npos && pool_json(fallback).find("qsa_mtp_pool")==std::string::npos,
-                    "off switches remove the single HTTP pool, its fallback and its inspection object");
+                expect(!qsa_mtp_pool_route(single) && !qsa_mtp_pool_route(batch) &&
+                    pool_json(single).find("qsa_mtp_pool")==std::string::npos && pool_json(batch).find("qsa_mtp_pool")==std::string::npos,
+                    "off switches remove the HTTP pool and its inspection object");
                 ::unsetenv(name);
             }
         }
         mtp_pool.http_serve=true;mtp_pool.qsa_mtp_pool_explicit_opt_in=true;
-        mtp_pool.mtp.copy_wide_rows={32};expect(!qsa_mtp_pool_route(mtp_pool),"wide writers decline before allocation");
-        mtp_pool.mtp.copy_wide_rows.clear();mtp_pool.baseline=true;expect(!qsa_mtp_pool_route(mtp_pool),"baseline retains historical MTP");
+        mtp_pool.mtp.copy_wide_rows={32,16};
+        expect(qsa_mtp_pool_route(mtp_pool) && qsa_mtp_pool_decline(mtp_pool)==nullptr,"wide copy rows keep the pool");
+        mtp_pool.mtp.cohort.resize(1);
+        expect(std::string_view(qsa_mtp_pool_decline(mtp_pool))=="unconverted-writer-span","the CLI cohort still declines");
+        mtp_pool.mtp.cohort.clear();mtp_pool.mtp.copy_wide_rows.clear();mtp_pool.baseline=true;expect(!qsa_mtp_pool_route(mtp_pool),"baseline retains historical MTP");
         // Serial decode pool route: plain append-only CLI only; every multi-request or rewriting route is excluded.
         const auto route = [&](std::vector<std::string> extra) {
             std::vector<std::string> args{"decoder","target.gguf","1","2","3","--generate","4"};
@@ -6052,11 +6098,10 @@ int main(int argc, char** arguments) {
         {
             auto o=candidate();o.tokens={1};
             auto batch=candidate(8);batch.tokens={1};
-            expect(qsa_mtp_pool_decline(o)==nullptr &&
-                std::string_view(qsa_mtp_pool_decline(batch))=="unqualified-route-requires-STRIX_QSA_MTP_POOL=1" &&
+            expect(qsa_mtp_pool_decline(o)==nullptr && qsa_mtp_pool_decline(batch)==nullptr &&
                 ple_reclaim_inactive_reason(o,HipModelResidencyPolicy{},false)=="http-serving" &&
                 !mtp_prompt_phase_separation(o),
-                "QSA pool defaults on for single HTTP only; rolling PLE and phase retirement exclude default HTTP");
+                "QSA pool defaults on for single and batch HTTP; rolling PLE and phase retirement exclude default HTTP");
         }
         for(const bool bundle_selected:{false,true}) {
             auto o=candidate();o.rotary=validate_qwen_rotary_request(2,true,524288,false);

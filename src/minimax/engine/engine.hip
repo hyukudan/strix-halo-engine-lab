@@ -28,6 +28,7 @@
 #include "prefill_timeline.hpp"
 #include "minimax/xfer/minimax_xfer.hpp"
 #include "minimax/pfx/pf_exchange.hpp"
+#include "strix/sparse_select_policy.hpp"
 #include "xport/exchange_format.hpp"
 #include "minimax/pfx/pf_route.hpp"
 #include "minimax/moe/mmx_moe.hpp"
@@ -654,6 +655,9 @@ struct Engine::Impl {
     bool attend4_decode = false;  // STRIX_MM_ATTEND4_DECODE (default ON via mm_defaults): v4, one head per wave, on the same grids
     std::uint64_t select_once_calls = 0;  // decode attention calls that took the selection-once route (diagnostic)
     bool select_once = false;  // STRIX_MM_SELECT_ONCE (default ON via mm_defaults): one selection launch per (row, KV head) on route::select_once calls
+    bool select_short_skip = true;  // STRIX_SELECT_SHORT_SKIP (default on): dense decode steps skip the iq projection (no reader)
+    // MSA selection geometry: blocks of kBlock positions, kTopK kept, the newest unfinished block is ranked too.
+    static constexpr strix::sparse_select::Geometry kMsaSelect{msa::kBlock, msa::kTopK, true};
     // decode fused exchange boundary (decode, module path; qualification notes), same bits:
     bool xb_wait = false;     // STRIX_MM_XB_WAIT=1: post_exchange waits for the peer's partial in-kernel (recv_view) instead of a stream wait packet
     bool xb_inplace = false;  // STRIX_MM_XB_INPLACE=1: o_proj / FFN producers write the module's TX slot, a publish kernel replaces the copy
@@ -926,6 +930,7 @@ struct Engine::Impl {
         attend_diet = env_flag("STRIX_MM_ATTEND_DIET", true);  // ON on the N2/W1 sparse >= 8K grids only (t9: exact, 8K 83.9 -> 76.2 us); =0
         attend4_decode = env_flag("STRIX_MM_ATTEND4_DECODE", true);  // ON on the same grids (t12: exact, 8K 78.6 -> 75.2 us); =0
         select_once = env_flag("STRIX_MM_SELECT_ONCE", true);  // ON on sparse calls of >= route::kSelectOnceRows rows (exact, same IDs); =0
+        select_short_skip = strix::sparse_select::query_skip_enabled();
         xb_wait = env_flag("STRIX_MM_XB_WAIT", true);         // ON (exchange boundary 0f1d0818: exact, 1K 48.56 -> 44.40 ms/token with the set); =0 disables
         xb_inplace = env_flag("STRIX_MM_XB_INPLACE", true);   // ON (exchange boundary 0f1d0818: exact, 1K 48.56 -> 44.40 ms/token with the set); =0 disables
         xb_prep = env_flag("STRIX_MM_XB_PREP", false);        // OFF (decode: not part of the measured default set)
@@ -2188,7 +2193,12 @@ struct Engine::Impl {
             route::require_index_layouts(index_layouts_loaded, route::index_layout_bit(index_route));
             const bool lin_opt = gemv && linears_opt;  // decode linears on enqueue_linears (strix_gemv bits)
             const bool conc = index_route == route::IndexLayout::packed && (gemv ? index_conc && !f32 : pf_idx_conc != 0);
-            const strix::minimax::attn::IndexProjView ipv{hn, y.wip, iq, ik, static_cast<std::uint32_t>(n)};
+            // A fused decode step whose rows all select every block (shared short-context rule) takes the dense attend
+            // launch, which reads ik only: the packed decode projection then skips the iq outputs (same ik bits).
+            const bool dense_step = !rows.empty() && attn_fused && step_seqs != 0 &&
+                                    strix::sparse_select::step_selection_is_identity(kMsaSelect, rows, [](const Row& step_row) { return step_row.pos; });
+            strix::minimax::attn::IndexProjView ipv{hn, y.wip, iq, ik, static_cast<std::uint32_t>(n)};
+            if (dense_step && select_short_skip && gemv && index_route == route::IndexLayout::packed) ipv.first_out = strix::minimax::attn::kProjQ;
             const std::size_t ie = pf_idx_member * kLayers + L;
             // FAST index projections (STRIX_MM_PF_IDX_WMMA): prefill rows > 8 of the selected layers, exact prefill base.
             const bool idx_fast = pf_idx_wmma && !gemv && !f32 && n > 8 && index_route == route::IndexLayout::packed &&
@@ -2368,7 +2378,7 @@ struct Engine::Impl {
                 }
             } else if (attn_fused && step_seqs != 0) {  // all rows in two launches (one dense launch below 2048 positions)
                 std::uint16_t* const* tab = cache_tab_d + std::size_t{L} * 3 * kMaxStepRows;
-                const bool dense = route::step_dense(rows, msa::kTopK * msa::kBlock);
+                const bool dense = dense_step;  // every row's pos < kTopK * kBlock
                 mfused::DecodeView dv{};
                 dv.seqs = step_seqs;
                 dv.rows_per_seq = step_rows_per_seq;

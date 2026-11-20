@@ -230,8 +230,8 @@ int main(int argc, char** argv) {
             else if (a == "--pf-ttft-arms") pf_ttft_arms = next();  // "B:-/C:K=V+K=V": per rep every arm runs every prompt, one load
             else if (a == "--pf-ttft-reps") pf_ttft_reps = std::stoi(next());  // arm cycles (strict ABAB order), default 1
             else if (a == "--pf-ttft-mode") pf_ttft_mode = next();  // gemv (default, exact identity) | wmma | wmma,gemv (each prompt in both, one load)
-            else if (a == "--pf-null-study") pf_null_study = next();  // prompt file: exact (gemv) vs wmma vs 1-ulp nulls
-            else if (a == "--pf-null") pf_nulls = next();  // comma-separated LAYER:POS:ELEM 1-ulp residual flips (test hook)
+            else if (a == "--pf-null-study") pf_null_study = next();  // prompt file: exact (gemv) vs wmma vs FP16-ulp nulls
+            else if (a == "--pf-null") pf_nulls = next();  // comma-separated LAYER:POS:ELEM FP16-ulp residual flips (test hook)
             else if (a == "--max-rows") opt.max_rows = static_cast<unsigned>(std::stoul(next()));  // chunk rows of --prefill gemv|wmma
             else if (a == "--mtp") opt.mtp = std::stoul(next()) != 0;
             else if (a == "--raw-linears") opt.raw_linears = std::stoul(next()) != 0;
@@ -1159,7 +1159,10 @@ int main(int argc, char** argv) {
                             opt.rank * eng.vocab_slice(), eng.vocab_slice());
                 std::fflush(stdout);
             } else if (mtp_spec_on) {
-                result = sp::decode_greedy(eng, 0, seed, {eff.kmax, eff.adaptive, eff.kmax, opt.capacity}, decode_n, control);
+                sp::DecodePolicy policy{eff.kmax, eff.adaptive, eff.kmax, opt.capacity};
+                policy.spec_arbiter = eff.spec_arbiter;
+                policy.context = &toks;
+                result = sp::decode_greedy(eng, 0, seed, policy, decode_n, control);
                 out = result.tokens;
             } else for (unsigned i = 1; i < decode_n; ++i) {
                 const ge::Row r{0, next, pos++};
@@ -1192,6 +1195,7 @@ int main(int argc, char** argv) {
                             result.depths[3].accepted, result.depths[3].offered,
                             result.histogram[1], result.histogram[2], result.histogram[3],
                             result.cycles ? double(decode_n - 1) / result.cycles : 0.0);
+                if (!result.spec_stats.empty()) std::printf("rank %u strix-spec-stats %s\n", opt.rank, result.spec_stats.c_str());
             }
             std::printf("rank %u tokens:", opt.rank);
             for (auto t : out) std::printf(" %u", t);
@@ -1877,7 +1881,7 @@ int main(int argc, char** argv) {
             }
             if (!pf_null_study.empty()) {
                 // D10 noise reference (measurement test 1 shape, informational): the exact path (gemv-chunked, == the
-                // reference prefill bitwise) vs the wmma candidate and vs exact runs with one 1-ulp residual flip.
+                // reference prefill bitwise) vs the wmma candidate and vs exact runs with one FP16-ulp residual flip.
                 const auto toks = read_u32(pf_null_study);
                 if (toks.size() + 1 > opt.capacity) throw std::invalid_argument("--pf-null-study prompt longer than --capacity");
                 auto dev = [&](const char* what, const Run& x, const Run& ex) {
@@ -1897,9 +1901,15 @@ int main(int argc, char** argv) {
                 guarded_install("gemv");
                 const Run ex = guarded_run(toks, true, "null study exact");
                 digest("exact", ex, toks.size());
-                guarded_install("wmma");
-                const Run cand = guarded_run(toks, true, "null study wmma");
-                dev("wmma", cand, ex);
+                // The wmma candidate is informational: when its route cannot run here (library without the pinned GEMM,
+                // or its install fails on both ranks alike) the study reports it and still measures the nulls.
+                try {
+                    guarded_install("wmma");
+                    const Run cand = guarded_run(toks, true, "null study wmma");
+                    dev("wmma", cand, ex);
+                } catch (const std::exception& e) {
+                    std::printf("rank %u DEV wmma: not measured (%s)\n", opt.rank, e.what());
+                }
                 guarded_install("gemv");
                 std::size_t a = 0;
                 while (!pf_nulls.empty() && a <= pf_nulls.size()) {
@@ -1914,7 +1924,12 @@ int main(int argc, char** argv) {
                     eng.set_null_flip(layer, pos, elem);
                     const Run nr = guarded_run(toks, true, "null study null");
                     eng.set_null_flip(-1, 0, 0);
-                    dev(("null L" + std::to_string(layer) + " pos " + std::to_string(pos) + " elem " + std::to_string(elem)).c_str(), nr, ex);
+                    const std::string null_name = "null L" + std::to_string(layer) + " pos " + std::to_string(pos) + " elem " + std::to_string(elem);
+                    dev(null_name.c_str(), nr, ex);
+                    // A null equal to the reference bitwise measured nothing (its perturbation was absorbed): refuse it,
+                    // a gate would otherwise read null KL 0 and floor its null-relative limit.
+                    if (nr.logits == ex.logits && nr.state == ex.state)
+                        throw std::runtime_error("null study: " + null_name + " equals the exact run bitwise (perturbation absorbed): not a null");
                     a = b + 1;
                 }
             }

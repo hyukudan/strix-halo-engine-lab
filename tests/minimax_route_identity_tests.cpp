@@ -3,6 +3,7 @@
 // source fingerprints, which force a re-audit after any MiniMax source edit, even
 // for new selectors that do not use the shared pure policy header.
 #include "minimax/engine/route_identity.hpp"
+#include "strix/sparse_select_policy.hpp"
 #include "minimax/engine/mm_defaults.hpp"
 #include "minimax/rtxpf/fp32_identity.hpp"
 #include "strix/session/prefill_session.hpp"
@@ -212,8 +213,11 @@ void decode_and_verify() {
     gated_difference("decode-layout", "MSA fused attend -> per-row K1-K4 (mixed slots)");
     const std::array<Row, 1> alone{{{0, 2047}}};
     const std::array<Row, 2> companions{{{0, 2047}, {1, 2048}}};
-    require(route::step_dense(std::span<const Row>(alone), 2048) &&
-            !route::step_dense(std::span<const Row>(companions), 2048), "dense/sparse companion boundary");
+    constexpr strix::sparse_select::Geometry mm_sparse{128, 16, true};
+    const auto pos_of = [](const Row& row) { return row.pos; };
+    require(strix::sparse_select::step_selection_is_identity(mm_sparse, std::span<const Row>(alone), pos_of) &&
+            !strix::sparse_select::step_selection_is_identity(mm_sparse, std::span<const Row>(companions), pos_of),
+            "dense/sparse companion boundary");
     gated_difference("msa-dense", "MSA dense -> sparse entry (row at 2047; companion at 2048)");
     gated_difference("index-proj", "index proj ring32 -> ring16, row-pair scheduling");
     gated_difference("decode-wide", "router_shared/gate_up wide columns at N2..4");

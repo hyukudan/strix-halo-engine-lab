@@ -1,5 +1,7 @@
 #include "strix/mtp_forward_golden_file.hpp"
+#include "strix/mtp_forward_payload.hpp"
 #include "strix/model_content_hash.hpp"
+#include "strix/mtp_payload_geometry.hpp"
 #include <array>
 #include <bit>
 #include <string>
@@ -173,6 +175,8 @@ int main() {
             v3.prompt_prefill_profile_identity=15;
             const auto bytes3=encode_mtp_forward_golden_file(v3,4096);
             expect(bytes3.size()==manual.size()+120U,"v3 exact header extent");
+            expect(mtp_forward_golden_v3_file_bytes(v3.rows.size(),v3.rows.front().target_hidden_bf16.size(),
+                v3.rows.front().full_logits.size())==bytes3.size(),"pending golden charge equals the encoded v3 extent");
             file.write(bytes3);
             require_mtp_forward_golden_geometry(file.path,v3.rows.size(),v3.rows.front().target_hidden_bf16.size(),
                 v3.rows.front().full_logits.size(),v3.context_capacity);
@@ -187,6 +191,16 @@ int main() {
             file.write(bytes3);
             const auto back3=read_mtp_forward_golden_file(file.path,sha256_bytes(bytes3),4096);
             expect(encode_mtp_forward_golden_file(back3,4096)==bytes3,"v3 bitwise roundtrip");
+            // Admission charges calibration_charge, and the bridge reads with its golden_file limit: the largest
+            // header version of exactly `rows` rows must fit that limit with no slack, under any larger cap.
+            const auto width=v3.rows.front().target_hidden_bf16.size(),vocabulary=v3.rows.front().full_logits.size();
+            const auto charge=mtp_payload::calibration_charge(v3.rows.size(),width,vocabulary,UINT64_C(6)<<30U,UINT64_C(6)<<30U);
+            expect(charge.golden_file==bytes3.size(),"calibration charge bounds the largest golden header version exactly");
+            expect(charge.golden>=charge.golden_file+mtp_payload::golden_host(v3.rows.size(),width,vocabulary) &&
+                charge.replay==mtp_payload::replay_host(v3.rows.size(),width,vocabulary),"charge covers decoded rows and replay");
+            (void)read_mtp_forward_golden_file(file.path,sha256_bytes(bytes3),charge.golden_file);
+            rejects([&]{(void)read_mtp_forward_golden_file(file.path,sha256_bytes(bytes3),charge.golden_file-1U);},
+                "a golden above its calibration rows' bound is refused before decoding");
             const RotaryIdentity rotary(descriptor,table);
             validate_mtp_forward_golden_rotary(back3,rotary,v3.context_capacity,15,7,9);
             rejects([&]{validate_mtp_forward_golden_rotary(golden,rotary,v3.context_capacity);},"legacy golden is not YaRN evidence");
@@ -202,6 +216,16 @@ int main() {
             invalid=v3;invalid.rotary_descriptor_sha256.bytes[0]^=1;
             rejects([&]{(void)encode_mtp_forward_golden_file(invalid,4096);},"descriptor pinned");
             expect(back3.independent_source_content==mtp_self_generated_golden_source(),"v3 capture remains self-generated");
+        }
+        {
+            // Qwen Flash-Next default bundle route: 16 calibration rows, width 2560 x 4, vocabulary 248320, caps 6 GiB.
+            constexpr std::uint64_t cap=UINT64_C(6)<<30U;
+            const auto charge=mtp_payload::calibration_charge(16U,2560U*4U,248320U,cap,cap);
+            expect(charge.golden_file==288U+16U*(24U+4U*(10240U+248320U)),"16-row golden file bound");
+            expect(charge.golden+charge.replay<(UINT64_C(64)<<20U),"16-row golden + replay charge stays below 64 MiB");
+            const auto capped=mtp_payload::calibration_charge(16U,10240U,248320U,1000U,2000U);
+            expect(capped.golden_file==1000U && capped.golden==1000U && capped.replay==2000U,"explicit caps stay hard caps");
+            rejects([]{(void)mtp_payload::calibration_charge(0U,10240U,248320U,cap,cap);},"zero calibration rows refused");
         }
         return failures?1:0;
     } catch(const std::exception& error) { std::cerr<<error.what()<<'\n'; return 1; }

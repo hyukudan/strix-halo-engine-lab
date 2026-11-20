@@ -8,6 +8,7 @@
 
 #include "../common.cuh"
 #include "strix/cuda_core/attention_row_walk.hpp"
+#include "strix/cuda_core/attention_score_reduce.hpp"
 
 namespace strix::cuda_core {
 namespace {
@@ -130,7 +131,23 @@ __device__ __forceinline__ Walk item_walk(std::uint32_t item, const RowWalk& rw,
 // (sequential), xor butterfly 16..1; score = fl(dot) * scale. The GT heads run as independent chains (same per-head
 // operations and order). Per (row, head) a warp takes its positions in the same ascending order with the same running max
 // as the one-row form; between load batches the running max of (row, warp) waits in shared memory and q of the next row is
-// re-read (L1). Lane b keeps the scores of position p0 + 8 b: one store per head per 8 positions.
+// re-read (L1). The butterfly runs as the transposed halving over P positions (attention_score_reduce.hpp, same bits);
+// the lane that ends with a dot stores it (one store per (head, position)).
+template <int GT>
+using ScorePair = score_reduce::ScoreMap<GT, score_reduce::score_positions(GT)>;
+// mx[g] = fmaxf(mx[g], max of head g's slot over the step positions), read from the slot's fold lane (compile-time lane / slot).
+template <int GT, int G0 = 0>
+__device__ __forceinline__ void fold_heads(float (&mx)[GT], const float (&smx)[ScorePair<GT>::C]) {
+    if constexpr (G0 < GT) {
+        constexpr int slot = ScorePair<GT>::fold_slot(G0);
+        constexpr std::uint32_t src = ScorePair<GT>::fold_lane(G0);
+        static_assert(slot >= 0 && src < 32u, "every head has a fold source");
+        mx[G0] = fmaxf(mx[G0], __shfl_sync(0xffffffffu, smx[slot], static_cast<int>(src)));
+        fold_heads<GT, G0 + 1>(mx, smx);
+    }
+}
+__device__ __forceinline__ float score_xor(float x, std::uint32_t off) { return __shfl_xor_sync(0xffffffffu, x, static_cast<int>(off)); }
+__device__ __forceinline__ float score_add(float a, float b) { return __fadd_rn(a, b); }
 template <int GT>
 __global__ void __launch_bounds__(256, 2) attn_scores_kernel(AttentionDims d, const float* q, GroupedView qv, const __nv_bfloat16* kc,
                                                           const std::uint32_t* pos0p, std::uint32_t rows, Scratch sc, RowMap rm,
@@ -148,6 +165,15 @@ __global__ void __launch_bounds__(256, 2) attn_scores_kernel(AttentionDims d, co
     const std::uint32_t mc = attn_max_chunks(d), items = item_count(rw, rs, d.kv_heads);
     const float scale = d.scale;
     const std::size_t qrs = qv.rs(), qgs = qv.gs(), mp = d.max_positions;
+    using PM = ScorePair<GT>;
+    constexpr int P = score_reduce::score_positions(GT);  // positions per reduction step
+    static_assert(kScoreBatch % P == 0, "a batch holds whole steps");
+    // this lane's dots after the halving: position pq of the pair, head hs[i] of slot i; store_lane = replica representative
+    const std::uint32_t pq = PM::position(lane);
+    const bool store_lane = (lane & score_reduce::replica_mask(PM::N)) == 0u;
+    std::uint32_t hs[PM::C];
+#pragma unroll
+    for (int i = 0; i < PM::C; ++i) hs[i] = PM::head(lane, i);
     for (std::uint32_t it = rw.adjacent ? blockIdx.x : 0u; it < items; it += rw.adjacent ? gridDim.x : 1u) {
         const Walk wk = item_walk(it, rw, rs, d.kv_heads, s_len, s_walk);
         const std::uint32_t base = wk.chunk * CH, kvh = wk.kvh, chunk = wk.chunk;
@@ -155,9 +181,7 @@ __global__ void __launch_bounds__(256, 2) attn_scores_kernel(AttentionDims d, co
         const __nv_bfloat16* kb = kc + (rm.slot ? rm.slot[wk.r0] * rm.slot_stride : 0) + static_cast<std::size_t>(kvh) * mp * D + lane * 8;
         for (std::uint32_t i = lane; i < wk.n * GT; i += 32u) wm[i / GT][w][i % GT] = __int_as_float(0xff800000);
         __syncwarp();
-        float qr[GT][8], mx[GT], keep[GT];
-#pragma unroll
-        for (int g = 0; g < GT; ++g) keep[g] = 0.0f;
+        float qr[GT][8], mx[GT];
         std::uint32_t cur = wk.n;  // row of the walk whose q and running max are in registers (none yet)
         float* srow = nullptr;     // scores of row cur, head kvh * G
         const std::uint32_t endw = min(wk.lmax, base + CH);
@@ -208,36 +232,47 @@ __global__ void __launch_bounds__(256, 2) attn_scores_kernel(AttentionDims d, co
                     cur = j;
                     srow = sc.scores + (static_cast<std::size_t>(r) * d.heads + static_cast<std::size_t>(kvh) * G) * mp;
                 }
+                // P positions per step (score_positions: 2 for GT <= 6, 1 for GT 8): the P GT dots (position q, head g;
+                // index q * GT + g) go through the transposed butterfly halving (attention_score_reduce.hpp): each dot keeps
+                // the contract's butterfly tree, so the same bits, with 1.1-1.5 shuffles per dot instead of 5. A lane then holds
+                // PM::C complete dots (position pq, heads hs[i]); one lane per replica group stores them and keeps a running
+                // max per slot, folded into the per-head max once per row and batch (fmaxf over the same scores).
+                float smx[PM::C];
+#pragma unroll
+                for (int i = 0; i < PM::C; ++i) smx[i] = __int_as_float(0xff800000);
 #pragma unroll 1
-                for (std::uint32_t b = 0; b < static_cast<std::uint32_t>(kScoreBatch); ++b) {
+                for (std::uint32_t b = 0; b < static_cast<std::uint32_t>(kScoreBatch); b += static_cast<std::uint32_t>(P)) {
                     if (p0 + 8u * b >= end) break;  // warp-uniform
-                    const uint4 k4 = kst[b][w][lane];
-                    const float kf[8] = {bf16_lo(k4.x), bf16_hi(k4.x), bf16_lo(k4.y), bf16_hi(k4.y),
-                                         bf16_lo(k4.z), bf16_hi(k4.z), bf16_lo(k4.w), bf16_hi(k4.w)};
-                    float dot[GT];
+                    float dot[PM::N];
 #pragma unroll
-                    for (int g = 0; g < GT; ++g) dot[g] = 0.0f;
+                    for (int q2 = 0; q2 < P; ++q2) {
+                        const uint4 k4 = kst[b + static_cast<std::uint32_t>(q2)][w][lane];
+                        const float kf[8] = {bf16_lo(k4.x), bf16_hi(k4.x), bf16_lo(k4.y), bf16_hi(k4.y),
+                                             bf16_lo(k4.z), bf16_hi(k4.z), bf16_lo(k4.w), bf16_hi(k4.w)};
 #pragma unroll
-                    for (int k = 0; k < 8; ++k)
+                        for (int g = 0; g < GT; ++g) dot[q2 * GT + g] = 0.0f;
 #pragma unroll
-                        for (int g = 0; g < GT; ++g) dot[g] = __fadd_rn(dot[g], __fmul_rn(qr[g][k], kf[k]));
+                        for (int k = 0; k < 8; ++k)
 #pragma unroll
-                    for (int off = 16; off > 0; off >>= 1)
+                            for (int g = 0; g < GT; ++g)
+                                dot[q2 * GT + g] = __fadd_rn(dot[q2 * GT + g], __fmul_rn(qr[g][k], kf[k]));
+                    }
+                    score_reduce::reduce<PM::N>(dot, lane, score_xor, score_add);
+                    const std::uint32_t p = p0 + 8u * (b + pq);
 #pragma unroll
-                        for (int g = 0; g < GT; ++g) dot[g] = __fadd_rn(dot[g], __shfl_xor_sync(0xffffffffu, dot[g], off));
-#pragma unroll
-                    for (int g = 0; g < GT; ++g) {
-                        const float s = __fmul_rn(dot[g], scale);
-                        mx[g] = fmaxf(mx[g], s);
-                        keep[g] = lane == b ? s : keep[g];
+                    for (int i = 0; i < PM::C; ++i) {
+                        const float s = __fmul_rn(dot[i], scale);
+                        if (p < end && hs[i] < G) {
+                            smx[i] = fmaxf(smx[i], s);
+                            if (store_lane) srow[static_cast<std::size_t>(hs[i]) * mp + p] = s;
+                        }
                     }
                 }
-                const std::uint32_t p = p0 + 8u * lane;
-                if (lane < static_cast<std::uint32_t>(kScoreBatch) && p < end) {
+                if constexpr (P == 2) {  // the two positions of a slot sit in lanes l and l ^ 16
 #pragma unroll
-                    for (int g = 0; g < GT; ++g)
-                        if (static_cast<std::uint32_t>(g) < G) srow[static_cast<std::size_t>(g) * mp + p] = keep[g];
+                    for (int i = 0; i < PM::C; ++i) smx[i] = fmaxf(smx[i], __shfl_xor_sync(0xffffffffu, smx[i], 16));
                 }
+                fold_heads<GT>(mx, smx);
             }
         }
         if (cur < wk.n) {

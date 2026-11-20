@@ -1,7 +1,8 @@
 """Compile production host regions without HIP or the full engine build.
 
-The device and model are test doubles. Gate decisions, options, flag replacement,
-and Engram hashing are copied verbatim at configure time, never reimplemented.
+The device and model are test doubles. Gate decisions, options and flag replacement
+are copied verbatim at configure time, never reimplemented; the Engram
+hash is compiled from its sources.
 """
 from pathlib import Path
 import sys
@@ -25,8 +26,10 @@ flags = between(hip, "    if (!embeds.empty() || m.image_rows_set) {", "        
 # Exclude the device-only probe; include the entire replacement and clean/dirty transition.
 flags = flags.split("        if (m.options.verify_embed_extras")[0]
 out.joinpath("flags.inc").write_text(flags + "        (void)embed_width;\n    }\n", encoding="utf-8")
-out.joinpath("engram.inc").write_text(
-    between(engram, "EngramHasher::EngramHasher(", "EngramRowReader::EngramRowReader("), encoding="utf-8")
+# Engram hashing is the shared component (src/engram) bound by the DS41 adapter (src/ds41_engram.cpp): both are
+# compiled into the harness as they are, so engram.inc only checks the adapter is still there.
+assert "engram::Spec engram_spec(" in engram
+out.joinpath("engram.inc").write_text("// compiled: src/ds41_engram.cpp + src/engram/*.cpp" + chr(10), encoding="utf-8")
 # Ensure validation is wired before file reads and world/timing dispatch, not merely defined.
 main = app[app.index("int main("):]
 assert main.index("validate_embed_identity_args(a);") < main.index("read_prompt(a.prompt_path, a.rows)")

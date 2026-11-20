@@ -43,7 +43,10 @@ cmake --build build-rtx --target strix-cuda-qwen-serve
 | `--admit-grace-ms N` | 2 | Wait for a burst of requests before the next step (`0` = off). |
 | `--max-queue N` | 64 | Requests waiting for a slot; beyond it the server answers busy. |
 | `--prefill-chunk N\|auto` | 1024 | Prefill rows of a new request per chunk, run between the decode steps of the other sessions. `auto` fits the chunk to the decode step time. |
+| `--prefill-short-first on\|off` | off | At each chunk boundary the prefilling request with the fewest remaining prompt rows runs the next chunk (admission order on ties; a request overtaken 8 times runs next); `off` = the oldest first. Order only: tokens unchanged. |
+| `--prefix-cache-inflight on\|off` | off | A request sharing at least 256 prompt tokens with a request still prefilling waits for that request's checkpoint at the deepest shared 256-token block it has not passed yet, then restores it instead of prefilling the same rows (needs the prefix cache; receipt `prefix_join`). Restored state is bit-identical. |
 | `--cohort-depth fair\|max` | `fair` | How MTP depth is shared when several sessions decode in one step. |
+| `--http-anthropic-thinking-budget enforce\|note` | `note` | Anthropic `thinking.budget_tokens` becomes the request's thinking budget (`enforce`) or is noted as not enforced. `strix.thinking_policy` (`thinking-budget-v1`) is always enforced: the closure is forced on the verified rows, as on the HIP server. |
 | `--block-rows N` | flat 8192 | Prefill block rows (multiple of 16, at least 1024). Untyped: one repeating block of 8192 rows (lever `qwen_cuda_flat_blocks`, bitwise; `STRIX_QRTX_FLAT_BLOCKS=0` or `--blocks 1024,2048,4096,8192` restores the ramp). See [prefill scheduling](../../engine/serving/qwen-cuda-prefill.md#flat-blocks-on-the-serve-entry). |
 
 Every response carries the `strix.rtx` receipt: emitted ids, prefill and decode timings and slot occupancy.

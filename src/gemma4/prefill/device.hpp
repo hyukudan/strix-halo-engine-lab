@@ -178,21 +178,23 @@ class DevicePrefill {
     // logits=false skips the head for a chunk that may not end the prompt; the
     // last row's final-norm output is kept so last_logits() can produce the
     // same logits later if that chunk turns out to be the last one.
-    // hidden=true also returns every row's final-norm output (the decode
-    // target's RowPlan::export_hidden row).
+    // hidden = HiddenDemand::all_rows also returns every row's final-norm output (the decode target's
+    // RowPlan::export_hidden row); last_committed returns the pass's last row alone (one row: rows below it
+    // then stop at the last K/V owner, LAST_KV).
     // views=true admits PINNED_TAPS: taps (only when taps=true) and hidden rows
     // arrive as ChunkResult views of pinned host memory, copied asynchronously
     // (taps overlap the layers after the last tap layer). With the lever off,
     // or views=false, taps and hidden are vectors as before.
     ChunkResult forward(KvTxn& transaction, std::span<const std::uint32_t> tokens, bool all_logits = false, bool logits = true,
-                        bool hidden = false, bool taps = true, bool views = false);
+                        HiddenDemand hidden = HiddenDemand::none, bool taps = true, bool views = false);
     // Several fresh transactions in one pass without logits, at most chunk_rows rows in total: the linears and
     // epilogues run once over the segments' concatenated rows, while KV reads/writes and attention stay per segment.
     // A many-row linear's output row reads only its own input row, so each segment's KV, taps and hidden rows equal
     // forward() on that segment alone (the WMMA route also needs the same kernel choice: every segment > 8 rows).
     // One result per segment, in order; views point into this object's pinned rows until the next pass. A failure
-    // fails every transaction of the pass.
-    std::vector<ChunkResult> forward_batch(std::span<const PrefillSegment> segments, bool hidden = false, bool taps = true,
+    // fails every transaction of the pass. hidden = last_committed returns each segment's last row: with several
+    // segments the pass keeps every row (the plan keeps only the pass's last row) and exports those rows alone.
+    std::vector<ChunkResult> forward_batch(std::span<const PrefillSegment> segments, HiddenDemand hidden = HiddenDemand::none, bool taps = true,
                                            bool views = false);
     [[nodiscard]] std::vector<float> last_logits();
     // Development only: per-op precision of the WMMA linears (see LinearPolicy).
@@ -218,7 +220,7 @@ class DevicePrefill {
   private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
-    std::vector<ChunkResult> pass(std::span<const PrefillSegment> segments, bool all_logits, bool logits, bool hidden, bool taps,
+    std::vector<ChunkResult> pass(std::span<const PrefillSegment> segments, bool all_logits, bool logits, HiddenDemand hidden, bool taps,
                                   bool views);
 };
 

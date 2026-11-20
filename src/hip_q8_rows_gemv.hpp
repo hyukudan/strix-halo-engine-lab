@@ -57,6 +57,7 @@
 #include "hip_q6p_weights.hpp"
 #include "hip/weight/ggml_sources.hpp"
 #include "strix/q6p_registry.hpp"
+#include "strix/decode_head_rows.hpp"
 #include "strix/hip_gsq_a8_groups.hpp"
 #include "moe_core/dense_a8_small_layout.hpp"
 #include "strix/known_window_cohort.hpp"
@@ -334,10 +335,23 @@ template <> struct RowsFormat<true> : ::strix::weight::hip::Q6RowsSource {
     }
 };
 
+// Head input (strix/decode_head_rows.hpp): a Site with head_input reads, for the output group that starts at
+// first_out, the input row of its head; every other Site reads site.input[r] (the same load as before).
+template <class Site> constexpr bool head_input_of() { return requires { Site::head_input; }; }
+template <class Site>
+__device__ __forceinline__ const typename Site::Input* direct_input(const Site& site, unsigned r, std::uint32_t first_out) {
+    using Input = typename Site::Input;
+    if constexpr (head_input_of<Site>())
+        return static_cast<const Input*>(site.input[r]) +
+               ::strix::decode::head_input_offset(first_out, site.head_outputs, site.input_stride);
+    else return static_cast<const Input*>(site.input[r]);
+}
+
 // Staged: every block copies all rows to LDS once, then loops over output groups.
 // Direct: one output group per wave.
 template <class Site, unsigned Outs, bool Staged, bool Q6 = false>
 __global__ __launch_bounds__(kThreads) void project_rows_kernel(Site site) {
+    static_assert(!head_input_of<Site>() || (!Staged && !Q6), "head input: direct non-Q6 form only");
     using Input = typename Site::Input;
     using Format = RowsFormat<Q6>;
     constexpr unsigned Rows = Site::rows, Pairs = Outs * Rows, N = pow2u(Pairs) * 8U, Depth = prefetch_of<Site, Staged>();
@@ -373,7 +387,7 @@ __global__ __launch_bounds__(kThreads) void project_rows_kernel(Site site) {
             for (unsigned r = 0; r < Rows; ++r) {
                 float x[8];
                 if constexpr (Staged) load8(reinterpret_cast<const Input*>(q8_rows_lds) + r * width + base, x);
-                else load8(static_cast<const Input*>(site.input[r]) + base, x);
+                else load8(direct_input(site, r, g * Outs) + base, x);
 #pragma unroll
                 for (unsigned o = 0; o < Outs; ++o)
 #pragma unroll
@@ -489,6 +503,23 @@ template <class Site> __device__ __forceinline__ const typename Site::Input* row
     if constexpr (requires { site.row_input(r); }) return site.row_input(r);
     else return static_cast<const typename Site::Input*>(site.input[r]);
 }
+// A Site window of Site::rows rows run by a kernel of P > Site::rows rows: rows Site::rows..P - 1 read the last row again
+// and are never stored, so every stored row keeps its own FMA chains and trees (the per-row contract: the bits of R1).
+template <class Site, unsigned P> struct PaddedRows : Site {
+    static_assert(P > Site::rows);
+    static constexpr unsigned rows = P;
+    __device__ const typename Site::Input* row_input(unsigned r) const {
+        return ::strix::q8_rows::row_input(static_cast<const Site&>(*this), r < Site::rows ? r : Site::rows - 1U);
+    }
+    __device__ void store(std::uint32_t o, unsigned r, float value) const {
+        if (r < Site::rows) Site::store(o, r, value);
+    }
+};
+// Narrowest FP32 input whose 6- and 7-row windows take the padded 8-row VOPD kernel. Measured (gfx1151, cold weights,
+// median of 24, projection shapes 1536..8192 wide): project_rows_kernel R6 / R7 cost 1.1x..1.7x the padded R8 VOPD
+// call (8192 -> 3072: R6 254 / R7 259 us vs 151 us), the stepped kernel at 6144 -> 2560 R6 176 / R7 217 us vs 93 us;
+// 1024-wide inputs lose (1024 -> 8192: R6 63 vs 77 us).
+constexpr std::uint32_t kPaddedMinWidth = 1536U;
 template <class Site, unsigned Outs, unsigned Sub>
 __global__ __launch_bounds__(kThreads) void project_wide_rows_kernel(Site site) {
     using Input = typename Site::Input;
@@ -2118,6 +2149,7 @@ template <class Site> void launch_lane(const Site& site, hipStream_t stream) {
 // the previously queued kernel touches, so it may start while that kernel still runs.
 // a8 selects the dense A8 profile arithmetic (launch_dense_a8).
 template <class Site> void launch(const Site& site, bool a8, hipStream_t stream, bool any_order = false) {
+    static_assert(!head_input_of<Site>(), "q8_rows: head-input Sites launch through launch_heads");
 #if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)
     if constexpr (Site::rows <= 8U && requires { Site::dense_trellis_inputs; }) {
         if (hip_dense_trellis_active() && hip_dense_trellis_permitted()) {
@@ -2151,7 +2183,7 @@ template <class Site> void launch(const Site& site, bool a8, hipStream_t stream,
     if constexpr (Site::rows <= 8U && iu4_group_of<Site>() != 0U)
         if (launch_iu4_rows(site, stream, any_order, nullptr)) return;
     if (a8) { launch_dense_a8(site, stream, any_order); return; }
-    const auto start = [&](auto kernel, unsigned blocks, unsigned threads, std::uint32_t bytes, const Site& args) {
+    const auto start = [&](auto kernel, unsigned blocks, unsigned threads, std::uint32_t bytes, const auto& args) {
         if (any_order)
             hipExtLaunchKernelGGL(kernel, dim3(blocks), dim3(threads), bytes, stream, nullptr, nullptr, hipExtAnyOrderLaunch, args);
         else hipLaunchKernelGGL(kernel, dim3(blocks), dim3(threads), bytes, stream, args);
@@ -2181,6 +2213,17 @@ template <class Site> void launch(const Site& site, bool a8, hipStream_t stream,
                 start(kernel, blocks, 32U * waves, 0U, site);
                 return;
             }
+        }
+    }
+    // Verify windows of 6 and 7 rows, FP32 inputs from kPaddedMinWidth up: the 8-row VOPD kernel over PaddedRows (the
+    // last row read again for the missing rows, never stored); it also replaces the stepped kernel there.
+    // STRIX_Q8_ROWS_VOPD=0 disables this with the 4/8-row path.
+    if constexpr (fused_fma_of<Site>() && sizeof(typename Site::Input) == 4U && (Site::rows == 6U || Site::rows == 7U)) {
+        if (!a8 && narrow_vopd() != 0U && site.width >= std::max(kPaddedMinWidth, narrow_fp32_min_width())) {
+            PaddedRows<Site, 8U> padded{};
+            static_cast<Site&>(padded) = site;
+            start(project_wide_rows_coef_kernel<PaddedRows<Site, 8U>, 4U, 4U, 4U, true>, (site.outputs + 3U) / 4U, 64U, 0U, padded);
+            return;
         }
     }
     if constexpr (Site::rows > 8U) {
@@ -2253,6 +2296,22 @@ template <class Site> void launch(const Site& site, bool a8, hipStream_t stream,
             if (!stepped) start(project_rows_kernel<Site, Outs, false>, groups_for(Outs, kWaves), kThreads, 0U, site);
         }
     }
+}
+
+// Head rows (strix/decode_head_rows.hpp): the H GEMVs of a head-input Site in ONE launch of the direct kernel, the
+// form launch() takes for the same Site launched per head (rows <= 2 and no Q6P32 copy / A8 / IU4 / staging), so every
+// output has the same loads, products and tree as the per-head launches (bitwise). Site: head_input, head_outputs,
+// input_stride (elements between two heads' input rows), one segment of heads * head_outputs rows.
+template <class Site> void launch_heads(const Site& site, hipStream_t stream) {
+    static_assert(head_input_of<Site>() && Site::rows <= 2U, "q8_rows heads: 1..2 rows, head-input Site");
+    constexpr unsigned Outs = outs_of<Site, false>();
+    const ::strix::decode::HeadRows plan{site.outputs / (site.head_outputs ? site.head_outputs : 1U), site.head_outputs,
+                                         site.input_stride};
+    if (const char* refusal = ::strix::decode::head_rows_refusal(plan, site.width, Outs)) throw std::invalid_argument(refusal);
+    if (plan.heads * site.head_outputs != site.outputs || site.width % 32U != 0U)
+        throw std::invalid_argument("q8_rows heads: outputs must be heads x head_outputs, width a multiple of 32");
+    const unsigned blocks = ((site.outputs + Outs - 1U) / Outs + kWaves - 1U) / kWaves;
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(project_rows_kernel<Site, Outs, false>), dim3(blocks), dim3(kThreads), 0, stream, site);
 }
 
 #include "hip_dense_a8g64.hpp"

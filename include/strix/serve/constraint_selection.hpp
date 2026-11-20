@@ -1,7 +1,10 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <functional>
+#include <mutex>
+#include <span>
 #include <stdexcept>
 #include <unordered_map>
 #include "strix/mtp_selection_transaction.hpp"
@@ -171,6 +174,35 @@ private:
     // Heap-held: GCC 13 -O2 flags an optional<Staged> member as maybe-uninitialized.
     std::unique_ptr<ConstraintSelection::Staged> staged_;
     std::shared_ptr<ConstraintMaskAhead> ahead_;
+};
+
+// The end-thinking token a thinking budget forces: "</think>" as one control (or user-defined) token that is not a
+// stop token. One predicate for the API's policy check and for every engine that advertises thinking budgets
+// (`Tokenizer`: BpeTokenizer or the API's tokenizer view: find / vocab_size / token_bytes / type).
+template <class Tokenizer>
+[[nodiscard]] bool thinking_closure_usable(const Tokenizer& tokenizer, std::span<const std::uint32_t> stops) {
+    const auto id = tokenizer.find("</think>");
+    return id < tokenizer.vocab_size() && tokenizer.token_bytes(id) == "</think>" &&
+        (tokenizer.type(id) == BpeTokenizer::TokenType::control || tokenizer.type(id) == BpeTokenizer::TokenType::user_defined) &&
+        std::find(stops.begin(), stops.end(), id) == stops.end();
+}
+
+// Requests of a device-greedy engine (the host gets each verified row's argmax only; select_greedy_window in
+// strix/mtp_selection_transaction.hpp): argmax-first selections over one tokenizer-wide trie, built on first use.
+// Only specs every row of which select_known() decides are admitted: no response_format program, no scores and no
+// logit transforms (a thinking-only policy); make() refuses the others with std::invalid_argument. Thread-safe.
+class ArgmaxConstraintRequests {
+public:
+    explicit ArgmaxConstraintRequests(std::shared_ptr<const BpeTokenizer> tokenizer) : tokenizer_(std::move(tokenizer)) {}
+    [[nodiscard]] static bool admits(const ConstraintSpec& spec) noexcept {
+        return !spec.program && !spec.logprobs && spec.top_logprobs == 0 && !spec.transform.active();
+    }
+    [[nodiscard]] std::shared_ptr<ConstraintSelection> make(const std::shared_ptr<const ConstraintSpec>& spec);
+private:
+    std::shared_ptr<const BpeTokenizer> tokenizer_;
+    std::mutex mutex_;
+    std::shared_ptr<const TokenByteTrie> trie_;
+    std::vector<std::uint32_t> trie_eos_;
 };
 
 }  // namespace strix::serve

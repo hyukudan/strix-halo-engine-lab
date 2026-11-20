@@ -15,15 +15,16 @@
 // NP > 1: one work group runs up to NP projections that share the activation tile (count <= NP).
 #include <hip/hip_runtime.h>
 
-#include "strix/hip/arch.hpp"
+#include "strix/fma_rows_policy.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <string_view>
 
 namespace strix::core::fma_rows {
 
 enum class Weight : unsigned { F16 = 0, BF16 = 1, F32 = 2 };
-inline constexpr unsigned kGroupMax = 3;
 
 struct Group {
     const void* w[kGroupMax];
@@ -347,12 +348,30 @@ inline void launch(const float* x, Weight wt, unsigned in, unsigned rows, Group 
 //     256 rows (fewer work groups than compute units): 64-row tile 0.40 (128-row 0.55, three-in-one 1.78);
 //   long chains, one projection: 1024 / 2048 rows 128-row tile 0.79 / 0.88 (64-row 1.03 / 1.26); 4096 / 8192 rows 64-row
 //     tile 0.91 / 0.72.
-enum class Form : unsigned { Auto = 0, Pipe128 = 1, Pipe64 = 2, PipeNp3 = 3, Xres16 = 4, Xres8 = 5, Xres4 = 6, Pipe128K16 = 7 };
-inline constexpr unsigned kFormCount = 8;
-inline constexpr unsigned kXresIn = 128, kLongRows = 4096, kFillGroups = 80;
-// CU count of the tuning target (gfx1151: 40); the selection below was measured there.
-inline constexpr unsigned kComputeUnits = strix::hip::arch::Tuning::value.compute_units;
-static_assert(kComputeUnits == 40U, "fma_rows selection is tuned for 40 CUs");
+// Form, the measured thresholds and the CU-scaled rule: strix/fma_rows_policy.hpp (select_form).
+
+// CUs of the current device (first call per device ordinal: hipGetDeviceProperties, then cached). A device the policy
+// cannot map keeps the measured part's count.
+inline unsigned device_compute_units() {
+    constexpr int kSlots = 16;
+    static std::atomic<unsigned> cached[kSlots] = {};
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0) return kMeasuredComputeUnits;
+    if (dev < kSlots) {
+        const unsigned known = cached[dev].load(std::memory_order_relaxed);
+        if (known != 0U) return known;
+    }
+    unsigned cu = 0U;
+    hipDeviceProp_t prop{};
+    if (hipGetDeviceProperties(&prop, dev) == hipSuccess && prop.multiProcessorCount > 0) {
+        std::string_view arch(prop.gcnArchName);
+        arch = arch.substr(0, arch.find(':'));
+        cu = compute_units_from(arch, static_cast<unsigned>(prop.multiProcessorCount));
+    }
+    if (cu == 0U) cu = kMeasuredComputeUnits;
+    if (dev < kSlots) cached[dev].store(cu, std::memory_order_relaxed);
+    return cu;
+}
 
 constexpr bool form_admits(Form f, unsigned in, unsigned rows, unsigned count) {
     if (!admits(in, rows, 32) || count == 0 || count > kGroupMax) return false;
@@ -360,19 +379,13 @@ constexpr bool form_admits(Form f, unsigned in, unsigned rows, unsigned count) {
            (f >= Form::Xres16 && f <= Form::Xres4 && in <= kXresIn);
 }
 
-constexpr Form select(unsigned in, unsigned rows, const Group& g) {
+constexpr Form select(unsigned in, unsigned rows, const Group& g, unsigned cu) {
     unsigned blocks = 0;
     for (unsigned p = 0; p < g.count; ++p) blocks += (g.n[p] + 63U) / 64U;
-    if (in <= kXresIn) {
-        if (rows < kLongRows) return Form::Pipe128K16;
-        const unsigned tiles = (rows + 63U) / 64U;
-        if (tiles * ((blocks + 15U) / 16U) >= kFillGroups) return Form::Xres16;
-        if (tiles * ((blocks + 7U) / 8U) >= kFillGroups) return Form::Xres8;
-        return Form::Xres4;
-    }
-    if (rows >= kLongRows) return g.count > 1 ? Form::PipeNp3 : Form::Pipe64;
-    return ((rows + 127U) / 128U) * blocks < kComputeUnits ? Form::Pipe64 : Form::Pipe128;
+    return select_form(in, rows, blocks, g.count, cu);
 }
+// The form on the current device.
+inline Form select(unsigned in, unsigned rows, const Group& g) { return select(in, rows, g, device_compute_units()); }
 
 // Enqueues the group in the selected form (Auto, or a form the shape does not admit, = select()). Requires
 // admits(in, rows, 32). Returns the form that runs.

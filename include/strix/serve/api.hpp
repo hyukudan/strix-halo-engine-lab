@@ -117,6 +117,9 @@ struct ApiConfig {
     std::uint32_t default_max_tokens = 4096;
     std::uint32_t http_slots = 0; // resolved capacity; zero leaves engine-specific headers unset
     bool default_thinking = true;            // the template's default (enable_thinking unset)
+    // reasoning_effort values the family template renders with the reasoning block already closed (e.g. "no_think"):
+    // like "none", they turn thinking off for the output parse; the effort itself still reaches the renderer.
+    std::vector<std::string> thinking_off_efforts;
     std::string api_key;                     // empty: no authentication
     // Requests with temperature > 0 on an engine without sampling: "greedy" runs them greedy and
     // says so in the response, "reject" answers 400.
@@ -143,7 +146,8 @@ struct ApiConfig {
     bool engine_constraints = false;
     bool engine_thinking_budget = false;
     // Anthropic thinking.budget_tokens: false (default) = accepted and stated as not enforced (the request keeps speculative
-    // decoding); true = enforced as thinking-budget-v1 (the request decodes on the serial host route).
+    // decoding); true = enforced as thinking-budget-v1 on the resolved selection route (resolve_mtp_selection_route:
+    // "mtp-host" keeps MTP windows and caps each window's commit at the forced closure; "serial-host" only as fallback).
     bool enforce_anthropic_thinking_budget = false;
     // From GenerationEngine::constraint_execution_routes(); the first route handles new requests.
     std::vector<std::string> constraint_execution_routes;

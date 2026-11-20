@@ -1,8 +1,39 @@
 #pragma once
 
+#include "strix/ds41_layer.hpp"  // round_to_bf16: the declared BF16 RNE shared by the declared-arithmetic models
+
+#if defined(__HIPCC__) || defined(__CUDACC__)
+#define STRIX_OPS_NORM_HD __host__ __device__
+#else
+#define STRIX_OPS_NORM_HD
+#endif
+
 namespace strix::ops::norm {
 
 enum class ReductionOrder { lane_strided_fma_lds_halving };
+
+// Output form, an optional trait (`static constexpr OutputForm output_form`; absent = plain):
+//   plain:       y = (x*r)*scale, unit scale y = x*r (the existing binders: bits unchanged);
+//   bf16_double: y = R(scale * R(x*r)), unit scale y = R(x*r), R = BF16 RNE: the BF16 reference module's norm
+//                (normalise in BF16, then the BF16 weight product). Binders: models whose reference norm rounds through BF16.
+enum class OutputForm { plain, bf16_double };
+
+template <class Traits>
+constexpr OutputForm output_form_of() {
+    if constexpr (requires { Traits::output_form; }) return Traits::output_form;
+    else return OutputForm::plain;
+}
+
+// One output element: xr = x * r; scale = the decoded weight (has_scale false: unit scale).
+template <OutputForm F>
+STRIX_OPS_NORM_HD inline float finish(float xr, float scale, bool has_scale) {
+    if constexpr (F == OutputForm::plain) {
+        return has_scale ? xr * scale : xr;
+    } else {
+        const float n = ds41::round_to_bf16(xr);
+        return has_scale ? ds41::round_to_bf16(scale * n) : n;
+    }
+}
 
 // Contiguous [rows][n] RMSNorm, shared scale[n] (or null for unit scale),
 // no persistent state. Input/output may alias. The engine owns launch/error

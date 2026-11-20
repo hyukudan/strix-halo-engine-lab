@@ -254,6 +254,35 @@ void campaign_defaults_contract(){
     n.ngram_off=false;n.sample_options=true;require(!mtp_ngram_draft_requested(n),"auto stays off when sampling");
     n.sample_options=false;n.cohort.push_back({});require(!mtp_ngram_draft_requested(n),"auto stays off with cohort requests");
     n.cohort.clear();n.golden_dump="g";require(!mtp_ngram_draft_requested(n),"auto stays off when dumping a golden");
+    n.golden_dump.clear();
+    // Previously STRIX_BATCH_NGRAM was the only engine-level batch switch (off by default). The fix must honor
+    // explicit --mtp-ngram-draft modes without silently enabling the single-request auto policy for HTTP batches.
+    require(!mtp_batch_lookup(n,nullptr).on && !mtp_batch_lookup(n,"").on && !mtp_batch_lookup(n,nullptr).default_context,
+        "batch route: auto preserves the historical off-by-default policy");
+    n.ngram_draft=true;
+    require(mtp_batch_lookup(n,nullptr).on,"batch route: explicit --mtp-ngram-draft enables prompt lookup");
+    n.ngram_draft=false;
+    require(!mtp_batch_lookup(n,"0").on && !mtp_batch_lookup(n,"off").on,"batch route: STRIX_BATCH_NGRAM=0 is the off switch");
+    n.ngram_off=true;require(!mtp_batch_lookup(n,nullptr).on,"batch route: =off disables it");
+    require(mtp_batch_lookup(n,"1").on,"batch route: STRIX_BATCH_NGRAM=1 forces it");
+    n.ngram_off=false;n.draft_chain=false;
+    require(!mtp_batch_lookup(n,nullptr).on,"batch route: auto stays off where not admissible");
+    n.ngram_draft=n.ngram_context=n.ngram_copy_edit=true;
+    require(mtp_batch_lookup(n,nullptr).on && !mtp_batch_lookup(n,nullptr).default_context,
+        "batch route: an explicit =copy runs the engine's context drafter");
+    require(!mtp_batch_lookup(n,"ctx").default_context,"batch route: =ctx override keeps the engine's context configuration");
+    n.ngram_draft=n.ngram_context=n.ngram_copy_edit=false;n.draft_chain=true;
+    require(mtp_batch_lookup(n,"ctx").on && mtp_batch_lookup(n,"ctx").default_context,
+        "batch route: STRIX_BATCH_NGRAM=ctx builds the default context drafter over the extension mode");
+    for(const auto& [flag,ctx]:{std::pair<const char*,bool>{"--mtp-ngram-draft=copy",true},{"--mtp-ngram-draft=ctx",true},
+                                {"--mtp-ngram-draft=on",false}}) {
+        auto served=request();served.insert(served.end(),{"--mtp-draft-chain","--mtp-target-window-rows","8","--mtp-window-prefix",
+            "--mtp-window-capture-bytes","8192","--mtp-window-checkpoint-bytes","8192",
+            "--mtp-window-total-bytes","32768","--mtp-window-arena-bytes","8192","--mtp-window-history-intervals","32",flag});
+        set(served,"--mtp-candidate-depth","7");
+        const auto lookup=mtp_batch_lookup(parse(served).mtp,nullptr);
+        require(lookup.on && !lookup.default_context && parse(served).mtp.ngram_context==ctx,"batch route honours the parsed mode");
+    }
     auto mode=request();mode.push_back("--mtp-ngram-draft=off");
     require(parse(mode).mtp.ngram_off && !parse(mode).mtp.ngram_draft,"=off parses");
     mode=request();mode.push_back("--mtp-ngram-draft=auto");
@@ -366,6 +395,22 @@ void campaign_defaults_contract(){
             if(std::find(cli.known_prefix_wide_only_tail_rows.begin(),cli.known_prefix_wide_only_tail_rows.end(),rows)==
                cli.known_prefix_wide_only_tail_rows.end())
                 require(known_prefix_tail_tiles_prompts(cli,rows,true),"a requested tail size still tiles prompts");
+        {   // --mtp-copy-wide-rows auto: the shared rule over the measured table admits 32 and refuses 16 (all-or-nothing
+            // abandon: 16 rows break even only at 0.91 span acceptance); the CLI and the serve route resolve the same.
+            auto auto_args=cli_args;
+            for(std::size_t a=0;a+1U<auto_args.size();++a) if(auto_args[a]=="--mtp-copy-wide-rows") auto_args[a+1U]="auto";
+            const auto auto_cli=parse(auto_args);
+            require(auto_cli.mtp.copy_wide_auto && auto_cli.mtp.copy_wide_rows==std::vector<std::uint32_t>{32U} &&
+                mtp_wide_copy_rows_effective(auto_cli)==auto_cli.mtp.copy_wide_rows,"auto resolves the 32-row size only");
+            require(auto_cli.mtp.copy_wide_reason.find("32 rows 166.7 ms")!=std::string::npos &&
+                auto_cli.mtp.copy_wide_reason.find("16 rows 142.0 ms")!=std::string::npos &&
+                auto_cli.mtp.copy_wide_reason.find("-> on")!=std::string::npos,"auto states the rule's line per size");
+            auto auto_serve=auto_cli;auto_serve.http_serve=true;auto_serve.http_batch_explicit=true;auto_serve.http_batch_cap=4U;
+            auto_serve.mtp.window_prefix=true;auto_serve.mtp.draft_chain=true;auto_serve.mtp.window_rows_set={2U,4U,8U};
+            resolve_http_route(auto_serve);
+            require(mtp_wide_copy_rows_effective(auto_serve)==auto_cli.mtp.copy_wide_rows &&
+                mtp_wide_copy_rows_effective(auto_serve,false).empty(),"auto: the serve route resolves the CLI's sizes");
+        }
         {   // the real command line: --http-serve --http-batch with the wide flags parses (tails resolved with the prefill)
             auto line=cli_args;line.insert(line.end(),{"--mtp-target-window-rows-set","2,4,8","--http-serve","--http-batch","2"});
             const auto served=parse(line);

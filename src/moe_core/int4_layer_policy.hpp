@@ -5,7 +5,8 @@
 // A lossy INT4 pack is not equally cheap at every depth. Measured on GLM-5.3 (pooled KL against the FAST
 // identity, three text domains): any single early MoE layer costs the same saturating step (about 0.007),
 // late layers add about 0.0003 each. INT4 on the MoE ordinals >= B: B = 0: 0.0245, 10: 0.0184, 15: 0.0138,
-// 20: 0.0088. The routed down projection is the largest single error source, so the default scope keeps it
+// 20: 0.0088. FAST gate v2 against the exact reference (null-relative windows) fails B = 15 and passes
+// B = 25 on every window. The routed down projection is the largest single error source, so the default scope keeps it
 // in the source format. Engines keep only the adapter: the environment names, the default spec and the load.
 //
 // Layer spec: "none" (no layer excluded) or a comma list of MoE ordinals and ranges a-b, 0 = the first MoE

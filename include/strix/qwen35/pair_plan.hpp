@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "strix/pair/chain_topology.hpp"
+#include "strix/pair/placement_inputs.hpp"
 #include "strix/qwen35/config.hpp"
 
 namespace strix::qwen35::pair_plan {
@@ -34,13 +35,8 @@ template<class Tensors> LayerTable layer_table(const Tensors& tensors, std::uint
     for (const auto& tensor : tensors) {
         const std::string_view name = tensor.name;
         const auto bytes = static_cast<double>(tensor.byte_size);
-        if (name.starts_with("blk.")) {
-            std::uint32_t layer = 0;
-            std::size_t i = 4;
-            bool digits = false;
-            for (; i < name.size() && name[i] >= '0' && name[i] <= '9'; ++i) { layer = layer * 10U + static_cast<std::uint32_t>(name[i] - '0'); digits = true; }
-            if (!digits || i >= name.size() || name[i] != '.') throw std::invalid_argument("malformed block tensor name");
-            if (layer < layers) t.weight_bytes[layer] += bytes;
+        if (const auto layer = strix::pair::place::block_of(name); layer >= 0) {   // shared GGUF owner rule
+            if (layer < static_cast<std::int64_t>(layers)) t.weight_bytes[static_cast<std::size_t>(layer)] += bytes;
         } else if (name.starts_with("token_embd")) {
             t.embed_bytes += bytes;
         } else if (name.starts_with("output")) {

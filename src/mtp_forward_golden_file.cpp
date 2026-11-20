@@ -183,6 +183,9 @@ std::vector<std::byte> encode_mtp_forward_golden_file(const HipMtpForwardGolden&
     }
     return result;
 }
+std::uint64_t mtp_forward_golden_v3_file_bytes(std::uint64_t rows,std::uint64_t width,std::uint64_t vocabulary) {
+    return geometry(header_bytes_v3,rows,width,vocabulary);
+}
 void require_mtp_forward_golden_geometry(const std::filesystem::path& path,std::uint64_t rows,
     std::uint64_t width,std::uint64_t vocabulary,std::uint64_t capacity) {
     std::ifstream file(path,std::ios::binary|std::ios::ate);

@@ -12,7 +12,8 @@
 // w / Split, head-dim slice w % Split): the slice's FP16 queries stay in registers as A fragments for the whole
 // row tile, the wave computes the slice's partial scores Q[16][D/Split] . K[16][D/Split]^T and owns the output
 // accumulators O[16][D/Split]. Per key tile:
-//   1. stage: the prefetched K rows ([key][D], padded pitch) and V^T rows ([d][16 keys]) go to LDS;   barrier
+//   1. stage: the prefetched K rows ([key][D], padded pitch) and V^T rows ([d][16 keys], the slot32 rows of
+//      core/lds_rows.hpp: conflict-free PV fragment reads, plain [d][16] rows read 2-way) go to LDS;    barrier
 //      the next tile's global loads are issued right away and land during the math;
 //   2. QK on WMMA, the Split partials go to LDS as FP32;                                             barrier
 //   3. every wave of the row tile sums the partials (fixed order), scales by scale*log2(e), applies the causal and
@@ -48,6 +49,8 @@
 // chain adds about 2^-24 x sum |a_i b_i| per WMMA step, so cancellation is not covered. Bounds and a host model of
 // these products in this order: two_term_model.hpp.
 // The denominator sums hi + lo of p. LDS adds 16 x (D + 8) x 2 + D x 32 B; Q lo stays in registers.
+// Optional occupancy override: static constexpr unsigned kWavesPerEu (waves per SIMD of flash_prefill<P>; absent = the
+// VGPR budget rule of dense_flash_budget.hpp). For a policy whose launch measured slower at the rule's target.
 // rows() is __host__ __device__. Launch: launch<P>(args, heads, stream, workspace, splits) - grid (row blocks, heads / Group, splits), longest
 // blocks first; workspace_floats(rows, heads, D, splits) FP32 when splits > 1.
 #include <hip/hip_runtime.h>
@@ -55,6 +58,7 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "dense_flash_budget.hpp"
 #include "flash_core.hpp"
 
 namespace strix::attn_core::dense {
@@ -163,10 +167,10 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
                 const unsigned key = idx / (D / 8U), c = idx % (D / 8U);
                 *reinterpret_cast<U4*>(&ks[key * KP + 8U * c]) = kreg[i];
                 const unsigned d = idx >> 1, h = idx & 1U;
-                *reinterpret_cast<U4*>(&vs[d * 16U + 8U * h]) = vreg[i];
+                *reinterpret_cast<U4*>(&vs[8U * ::strix::core::lds_rows::slot32(d, h)]) = vreg[i];
                 if constexpr (Two) {
                     *reinterpret_cast<U4*>(&ks_lo[key * KP + 8U * c]) = klreg[i];
-                    *reinterpret_cast<U4*>(&vs_lo[d * 16U + 8U * h]) = vlreg[i];
+                    *reinterpret_cast<U4*>(&vs_lo[8U * ::strix::core::lds_rows::slot32(d, h)]) = vlreg[i];
                 }
             }
         }
@@ -276,13 +280,13 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
 #pragma unroll
                 for (unsigned e = 0; e < 8; ++e) c[e] *= scale[e];
                 if constexpr (Two) {
-                    const unsigned at = (d0 + 16U * f + rr) * 16U;
-                    const Frag vh = tile::frag32(&vs[at]);
-                    c = tile::mma<O>(pa, tile::frag32(&vs_lo[at]), c);
+                    const unsigned at = d0 + 16U * f + rr;
+                    const Frag vh = tile::frag_slot32(vs, at);
+                    c = tile::mma<O>(pa, tile::frag_slot32(vs_lo, at), c);
                     c = tile::mma<O>(pl, vh, c);
                     acc[f] = tile::mma<O>(pa, vh, c);
                 } else {
-                    acc[f] = tile::mma<O>(pa, tile::frag32(&vs[(d0 + 16U * f + rr) * 16U]), c);
+                    acc[f] = tile::mma<O>(pa, tile::frag_slot32(vs, d0 + 16U * f + rr), c);
                 }
             }
         }
@@ -327,10 +331,14 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
     if (bad_value) atomicOr(P::failure(a), 1U);
     if (bad_half) atomicOr(P::failure(a), 4U);
 }
-// Register cap for 8 waves per SIMD (192 VGPRs on gfx1151, 44 B/lane scratch): two 16-wave work-groups per WGP;
-// 1.3x the uncapped 238-VGPR kernel (one work-group per WGP) at 32K.
+// Occupancy target (waves per SIMD): the highest whose VGPR budget holds the key loop without spills
+// (dense_flash_budget.hpp; placement only, same bits).
+template <class P> constexpr unsigned waves_per_eu() {
+    if constexpr (requires { P::kWavesPerEu; }) return P::kWavesPerEu;
+    else return occupancy_target(P::Shape::frags, P::Shape::per_thread, terms_of<P>::value, P::Shape::waves);
+}
 template <class P>
-__global__ __launch_bounds__(P::Shape::threads) __attribute__((amdgpu_waves_per_eu(8))) void flash_prefill(
+__global__ __launch_bounds__(P::Shape::threads) __attribute__((amdgpu_waves_per_eu(waves_per_eu<P>()))) void flash_prefill(
     typename P::Args a, float* ws, unsigned splits, unsigned seg_tiles) {
     flash_body<P>(a, ws, splits, seg_tiles);
 }

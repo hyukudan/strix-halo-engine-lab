@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <chrono>
 #include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -47,6 +48,23 @@ concept MtpPrelaunchEngine = MtpFeedEngine<E> && requires(E& e, std::uint32_t* h
     e.mtp_feed_read_async(u);
     e.mtp_feed_wait(u, h);
 };
+
+// KV-ONLY ROWS (optional backend hook, detected by MtpKvRowsEngine): Engine::mtp_forward(next_tokens, hidden_dev, rows, pos0,
+// want_top, outputs) where only the trailing `outputs` rows' top / hidden are read. A catch-up flush reads nothing but the
+// last row of its final chunk (d1 + carry), so every other row only has to write the MTP layer's KV: a one-layer block's
+// cache row depends on the row's input alone, so a backend can skip the query side and the FFN of those rows and keep
+// its caches bitwise the full form's (the drafts and every proposal unchanged). Engines without the hook run every row.
+template <class E>
+concept MtpKvRowsEngine = requires(E& e, const std::uint32_t* t, const float* x, std::uint32_t u) {
+    e.mtp_forward(t, x, u, u, true, u);
+};
+
+// K/V-ONLY CATCH-UP (optional backend hook, detected by MtpKvEngine): Engine::mtp_kv(next_tokens, hidden_dev, rows, pos0)
+// writes exactly the MTP K/V that mtp_forward of the same rows writes and nothing else. A single-layer MTP's K/V at a
+// position depend only on that row's layer input, so catch-up chunks whose block output and draft are never read skip the
+// attention, o_proj, MLP and head (a long prompt: every chunk but the last).
+template <class E>
+concept MtpKvEngine = requires(E& e, const std::uint32_t* t, const float* x, std::uint32_t u) { e.mtp_kv(t, x, u, u); };
 
 template <class Engine, class Dev>
 class MtpChain final : public ChainDrafter {
@@ -148,6 +166,14 @@ public:
         }
     }
     [[nodiscard]] std::uint64_t prelaunched() const { return prelaunched_; }  // draft_prelaunch() drafts
+    // K/V-only catch-up (engines with MtpKvEngine): off = the incumbent calls (rollback); on = catch-up chunks whose outputs
+    // nobody reads only write the MTP K/V (same K/V bits, so the same drafts). On by default where the engine has the hook;
+    // its device gate compares the MTP K/V bytes of the prompt rows, ids, steps and the k histogram with the full catch-up
+    // under a wall-independent controller (CUDA sub15d --cost-kv off: an online context cost prices k from the run's own
+    // verify walls, so k may differ between any two runs; the K/V and the drafts do not).
+    void set_kv_catchup(bool on) { kv_catchup_ = on; }
+    [[nodiscard]] bool kv_catchup() const { return MtpKvEngine<Engine> && kv_catchup_; }
+    [[nodiscard]] std::uint64_t kv_calls() const { return kv_calls_; }  // K/V-only catch-up calls (not in calls())
 
 private:
     // draft() over the device feed: the same mtp calls in the same order, ids read once at the end (DEVICE FEED above).
@@ -207,7 +233,7 @@ private:
         const float* src = pre_ ? o.hidden_pre : o.hidden_post;
         std::uint32_t done = 0;
         while (done < rows) {
-            if (next_.size() == ring_n_) flush();
+            if (next_.size() == ring_n_) flush(false, false);  // forced: its last-row outputs are overwritten by a later flush
             const std::uint32_t n = std::min<std::uint32_t>(rows - done, ring_n_ - static_cast<std::uint32_t>(next_.size()));
             Dev::copy(e_, ring_ + next_.size() * hid_, src + std::size_t(done) * hid_, std::size_t(n) * hid_);
             next_.insert(next_.end(), next_tokens + done, next_tokens + done + n);
@@ -216,13 +242,25 @@ private:
     }
     // Write the ring into the MTP KV (rows_max_ per call, causal inside each call). Leaves the last row's top / hidden in
     // d1_ / carry_ (fed: d1 goes to feed slot 0 without a host read; draft_fed() reads it with the drafts).
-    void flush(bool fed = false) {
+    // outputs = false: nobody reads this flush's last-row outputs (a ring-full flush inside push_hidden; d1_ / carry_ are
+    // rewritten by the flush draft() runs first). With K/V-only catch-up (MtpKvEngine) every chunk whose outputs have no
+    // reader writes only the MTP K/V (same K/V bits); without it the calls are exactly the incumbent ones.
+    void flush(bool fed = false, bool outputs = true) {
         std::uint32_t off = 0;
         const auto total = static_cast<std::uint32_t>(next_.size());
+        const bool kv = kv_catchup();
         while (off < total) {
             const std::uint32_t n = std::min<std::uint32_t>(rows_max_, total - off);
             const bool final_chunk = off + n == total;  // only the last row's draft is needed: earlier chunks skip lm_head
-            const auto m = e_.mtp_forward(next_.data() + off, ring_ + std::size_t(off) * hid_, n, mtp_pos_, final_chunk);
+            if (kv && !(final_chunk && outputs)) {
+                if constexpr (MtpKvEngine<Engine>) e_.mtp_kv(next_.data() + off, ring_ + std::size_t(off) * hid_, n, mtp_pos_);
+                ++kv_calls_;
+                rows_ += n;
+                mtp_pos_ += n;
+                off += n;
+                continue;
+            }
+            const auto m = forward_rows(next_.data() + off, ring_ + std::size_t(off) * hid_, n, mtp_pos_, final_chunk);
             ++calls_;
             rows_ += n;
             mtp_pos_ += n;
@@ -242,6 +280,11 @@ private:
             }
         }
         next_.clear();
+    }
+    // A flush chunk: the final chunk's last row is the only output read (outputs 1), earlier chunks read none (outputs 0).
+    MtpOut forward_rows(const std::uint32_t* next, const float* hidden, std::uint32_t n, std::uint32_t pos0, bool final_chunk) {
+        if constexpr (MtpKvRowsEngine<Engine>) return e_.mtp_forward(next, hidden, n, pos0, final_chunk, final_chunk ? 1U : 0U);
+        else return e_.mtp_forward(next, hidden, n, pos0, final_chunk);
     }
     std::uint32_t step(std::uint32_t input_token, std::uint32_t pos, bool want_top) {
         const auto m = e_.mtp_forward(&input_token, carry_, 1, pos, want_top);
@@ -268,9 +311,19 @@ private:
     std::vector<std::uint32_t> next_, succ_;
     std::uint32_t mtp_pos_ = 0, d1_ = 0;
     std::uint32_t top_tmp_[32]{};
-    std::uint64_t calls_ = 0, rows_ = 0, drafts_ = 0, reads_ = 0, prelaunched_ = 0;
+    std::uint64_t calls_ = 0, rows_ = 0, drafts_ = 0, reads_ = 0, kv_calls_ = 0, prelaunched_ = 0;
     bool feed_ = true;
+    bool kv_catchup_ = true;
     double draft_wall_ms_ = 0.0;
+};
+
+// Dev glue for an engine that owns its device memory and stream through three members:
+//   float* alloc_f32(std::size_t floats), void free_f32(float*), void copy_f32_async(float* dst, const float* src, std::size_t floats)
+// (async device -> device on the engine's stream). Any backend whose engine has them binds MtpChain<Engine, EngineChainDev>.
+struct EngineChainDev {
+    template <class E> static float* alloc(E& e, std::size_t n) { return e.alloc_f32(n); }
+    template <class E> static void release(E& e, float* p) { e.free_f32(p); }
+    template <class E> static void copy(E& e, float* d, const float* s, std::size_t n) { e.copy_f32_async(d, s, n); }
 };
 
 }  // namespace strix::spec

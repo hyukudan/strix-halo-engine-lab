@@ -298,13 +298,13 @@ int main() {
         namespace md = strix::minimax::defaults;
         const auto ds41_rows = bundle_rows(dp::profile_table, strix::ds41::fast_profile::kBundle);
         const auto mm_rows = bundle_rows(md::profile_table, md::kFastBundle);
-        check_gates("deepseek41-pair", dp::profile_table, {}, ds41_rows);
+        check_gates("deepseek41-pair", dp::profile_table, dp::fast_gates, ds41_rows);
         check_gates("glm-pair", strix::glm::rank_defaults::product_profile_table, {});
         check_gates("deepseek41-rtx", strix::ds41::rtx::profile::shared_rows(), {});
         check_gates("minimax-pair", md::profile_table, {}, mm_rows);
         check_gates("qwen-hip", strix::qwen::profile::table, {});
         check_gates("qwen-cuda", strix::qwen::cuda_profile::table, {});
-        check_gates("qwen35-hip-dense", strix::qwen35::hip_profile::table, {});
+        check_gates("qwen35-hip-dense", strix::qwen35::hip_profile::table, strix::qwen35::hip_profile::kFastGates);
     }
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);

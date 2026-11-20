@@ -7,6 +7,7 @@
 #include "moe_core/grouped_policy.hpp"
 #include "moe_core/device_plan.hpp"
 #include "moe_core/route_prune.hpp"
+#include "moe_core/kquant_block_reads.hpp"
 #include "strix/moe_route_bf16.hpp"
 #include "strix/hip_moe_q4k_a8_known_rows.hpp"
 #include "strix/moe_a8_down_contract.hpp"
@@ -17,7 +18,9 @@
 #endif
 #include <hip/hip_fp16.h>
 #include "moe_core/grouped_f16.hpp"
+#include "ops/glu/glu.hpp"  // epilogue<Round::bf16>: the K-quant down's rounded raw-dot store (PrefillRows::rawdots_bf16)
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <utility>
 #include <cstdio>
@@ -1589,6 +1592,20 @@ __global__ __launch_bounds__((F16TileX<Tune,Core>::Threads),prefill_core2_min_wa
 #undef STRIX_F16X_BATCH_TILE
 #undef STRIX_F16X_LDS
 }
+// Clamp trait entry of the same body (clamped routed experts, e.g. limit 10): h = silu(min(g, L)) * clamp(u, -L, L), the
+// non-finite check on the raw g / u. Only the K-quant envelope of enqueue_prefill launches it; the entry above is unchanged.
+template<bool Q5K,unsigned Tune>
+__global__ __launch_bounds__((F16TileX<Tune,0U>::Threads),prefill_core2_min_waves(Tune,0U)) void project_prefill_f16x_clamped(
+    const unsigned char* gate,const unsigned char* up,PrefillRows view,unsigned hidden,unsigned outputs,const uint4* a16,float swiglu_limit) {
+    constexpr unsigned Core=0U;
+#define STRIX_F16X_BATCH_TILE const unsigned batch=blockIdx.y,tile=blockIdx.x;
+#define STRIX_F16X_LDS(S,R) __shared__ __align__(16) S sb[1]; __shared__ R rows;
+#define STRIX_F16X_SWIGLU_LIMIT swiglu_limit
+#include "moe_core/hip_moe_f16x_project_body.inc"
+#undef STRIX_F16X_SWIGLU_LIMIT
+#undef STRIX_F16X_BATCH_TILE
+#undef STRIX_F16X_LDS
+}
 inline int& direct_b_override(){static int v=-1;return v;}
 inline bool direct_b_requested(){
     static const bool env=strix::envcfg::flag("STRIX_QPF2K_MOE_DIRECT_B", false, strix::EnvFlagMatch::exact);
@@ -1650,6 +1667,27 @@ __global__ __launch_bounds__(F16Tile<Tune>::Threads,prefill_core2_min_waves(Tune
 #define STRIX_F16X_LDS(S,R) __shared__ __align__(16) S sb[1]; __shared__ R rows;
 #define STRIX_F16X_DOWN_GUARD if(csr.summary[0]||batch>=csr.summary[2])return;
 #include "moe_core/hip_moe_f16x_down_body.inc"
+#undef STRIX_F16X_BATCH_TILE
+#undef STRIX_F16X_LDS
+#undef STRIX_F16X_DOWN_GUARD
+}
+#include "moe_core/hip_moe_f16x_kquant_down.inc"
+// K-quant down trait entry of the same body (Type 12 = Q4_K, 14 = Q6_K; plain schedule, Core 0, no fused merge).
+// RoundDots (PrefillRows::rawdots_bf16): each raw slot dot is stored as ops::glu::epilogue<Round::bf16> of the same value.
+template<unsigned Type,unsigned Tune,bool RoundDots>
+__global__ __launch_bounds__(F16Tile<Tune>::Threads,prefill_core2_min_waves(Tune,0U)) void down_prefill_f16x_kq(const unsigned char* weights,
+    PrefillRows view,unsigned hidden,unsigned width) {
+    constexpr unsigned Core=0U;
+    using KQ=F16xKQuantDown<Type>;
+    const FuseArgT<0U> fuse{};
+#define STRIX_F16X_BATCH_TILE const unsigned batch=blockIdx.y,tile=blockIdx.x;
+#define STRIX_F16X_LDS(S,R) __shared__ __align__(16) S sb[1]; __shared__ R rows;
+#define STRIX_F16X_DOWN_GUARD if(csr.summary[0]||batch>=csr.summary[2])return;
+#define STRIX_F16X_DOWN_KQ 1
+#define STRIX_F16X_DOWN_ROUND RoundDots
+#include "moe_core/hip_moe_f16x_down_body.inc"
+#undef STRIX_F16X_DOWN_ROUND
+#undef STRIX_F16X_DOWN_KQ
 #undef STRIX_F16X_BATCH_TILE
 #undef STRIX_F16X_LDS
 #undef STRIX_F16X_DOWN_GUARD
@@ -1786,6 +1824,10 @@ struct Prepared {DeviceRows rows;DeviceCsr csr;};
 Prepared prepare(const Request& request,std::span<const Bindings> rows,const q51_known_rows::Workspace& workspace,hipStream_t stream) {
     if(rows.size()!=2U&&rows.size()!=4U&&rows.size()!=8U&&(rows.size()<9U||rows.size()>max_union_rows))
         throw std::invalid_argument("A8 CSR gate/up requires R2/R4/R8 (or a cohort union of 9..32 rows)");
+    // validate() admits the C1 envelope (I <= 1536, K <= 16); the multi-row forms keep the Qwen bounds: LDS [Rows][max_rows]
+    // and admit_csr's 8 x max_top_k assignment table. Widening them is the window/prefill geometry lift, not this guard.
+    if(request.shape.rows>max_rows||request.shape.top_k>max_top_k)
+        throw std::invalid_argument("A8 multi-row forms admit I <= 640 and K <= 10 only");
     // The bound of the all-rows staging form (project_csr); cohort unions run the window kernels only.
     if(rows.size()<=8U&&staged_activation_bytes(static_cast<unsigned>(rows.size()))>65536U)
         throw std::invalid_argument("A8 CSR gate/up staging exceeds bounded LDS budget");
@@ -2023,12 +2065,94 @@ unsigned prefill_effective_tune(const Request& request,unsigned count,unsigned d
     }
     return tune;
 }
+// K-quant envelope of the f16x grouped prefill (Q4_K gate/up, Q4_K / Q6_K down, top-16 of 512,
+// I 1536, SwiGLU clamp). Envelope = the C1 one (moe_q4k_a8_contract.hpp: rows <= c1_max_rows, top_k <= c1_max_top_k). It runs
+// the plain f16x schedule (prologue with the FP16 A image, shared CSR, gate/up, K-quant down; tune 82, or 80 below 96
+// assignments per expert, the rule of prefill_effective_tune). The qpf2k schedule levers (ROUTE, DA16, certificate, core2,
+// SMALL, DIRECT_B, tiers, TILE64, P1) size LDS, images or tables by max_rows / max_top_k (:2644, :1984, :2238) or are qualified
+// on the Qwen geometry only: they are not applied here (witness line); bit-changing view levers (route BF16 / I8, route
+// prune) are refused. The caller merges the raw slot dots (rawdots[r][slot*hidden + o]) as for every other form. CSR capacity
+// is reserve_prefill_pools(rows) x 10 assignments: a top-16 caller reserves ceil(rows * 16 / 10).
+static void enqueue_prefill_kquant(const Request& request,const PrefillRows& rows,unsigned count,unsigned clear_words,
+    const unsigned char* gate,const unsigned char* up,unsigned down_type,const unsigned char* down_weights,hipStream_t stream,int form) {
+    const auto& shape=request.shape;
+    const bool clamp=std::isfinite(request.swiglu_limit);
+    if(request.gate_type!=12U||request.up_type!=12U||(down_type!=12U&&down_type!=14U))
+        throw std::invalid_argument("A8 prefill K-quant envelope: Q4_K gate/up with Q4_K / Q6_K down only");
+    if(!gate||!up||!down_weights||count<16U||count%8U||count>q51_known_rows::prefill_max_rows||
+       shape.top_k==0U||shape.top_k>c1_max_top_k||shape.experts==0U||shape.experts>max_experts||shape.top_k>shape.experts||
+       shape.hidden==0U||shape.hidden>max_hidden||shape.hidden%256U||shape.rows==0U||shape.rows>c1_max_rows||shape.rows%256U||
+       std::isnan(request.swiglu_limit)||(clamp&&!(request.swiglu_limit>0.0F))||clear_words>shape.hidden)
+        throw std::invalid_argument("A8 prefill K-quant envelope geometry is invalid");
+    if(request.input!=InputKind::bf16)throw std::invalid_argument("A8 prefill K-quant envelope requires BF16 input rows");
+    if(form!=3)throw std::invalid_argument("A8 prefill K-quant envelope runs the FP16 profile form only (form 3)");
+    if(rows.route_bf16||rows.route_i8||prefill_route_prune_state().active())
+        throw std::invalid_argument("A8 prefill K-quant envelope: route BF16 / I8 and route prune are not qualified here");
+    if(prefill_route()!=0U||prefill_da16()||prefill_core2()!=0U||prefill_small()!=0U||direct_b_requested()||prefill_tiers()!=0) {
+        static const bool witness=[]{std::fprintf(stderr,"qpf2k MoE K-quant envelope: plain f16x schedule (ROUTE / DA16 / core2 / "
+            "SMALL / DIRECT_B / tiers not applied: sized by max_rows / max_top_k)\n");return true;}();
+        (void)witness;
+    }
+    direct_b_reason()=direct_b_requested()?"format":"off";
+    (void)prefill_pool_owner().rows(count);
+    hip_check(hipPeekAtLastError(),"FP16 prefill prologue stale error");
+    const auto run=[&]<unsigned Tune>() {
+        using Tile=F16Tile<Tune>;
+        constexpr unsigned Threads=Tile::Threads,Outs=Tile::Columns/2U,cap=Tile::Batch;
+        prefill_last_tune_value()=Tune;
+        uint4* a16=f16_prefill_a16();
+        hipLaunchKernelGGL(f16_prefill_prologue,dim3(count),dim3(256),0,stream,rows,shape.hidden,shape.top_k,shape.experts,clear_words,a16);
+        hip_check(hipGetLastError(),"FP16 prefill prologue (K-quant envelope)");
+        const unsigned blocks=PrefillCsrPlan::blocks_for(count,shape.top_k);
+        if(blocks==0U||blocks>csr_mw_blocks_max())
+            throw std::invalid_argument("qpf2k CSR multi-CTA block count out of range (K-quant envelope: reserve ceil(rows * top_k / 10) pool rows)");
+        hip_check(PrefillCsrPlan::enqueue(rows,count,shape.experts,shape.top_k,cap,csr_mw_scratch(),stream,false,false),
+            "A8 prefill CSR (K-quant envelope)");
+        prefill_stage_reached(1U,stream);
+        const unsigned assignments=count*shape.top_k,batches=std::min(assignments,shape.experts+(assignments+cap-1U)/cap);
+        const dim3 project_grid(shape.rows/Outs,batches),down_grid(shape.hidden/Tile::Columns,batches);
+        if(clamp) {
+            prefill_resources<project_prefill_f16x_clamped<false,Tune>,Threads>("gate_up_q4k_clamped",Tune);
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_clamped<false,Tune>),project_grid,dim3(Threads),0,stream,
+                gate,up,rows,shape.hidden,shape.rows,a16,request.swiglu_limit);
+        } else {
+            prefill_resources<project_prefill_f16x<false,Tune>,Threads>("gate_up_q4k",Tune);
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x<false,Tune>),project_grid,dim3(Threads),0,stream,
+                gate,up,rows,shape.hidden,shape.rows,a16);
+        }
+        hip_check(hipGetLastError(),"FP16 prefill WMMA gate/up projection (K-quant envelope)");
+        prefill_stage_reached(2U,stream);
+        // rows.rawdots_bf16: the same kernel stores each raw slot dot once-rounded to BF16 (the caller's epilogue pass goes).
+        const auto down=[&]<unsigned Type,bool Round>(const char* name) {
+            prefill_resources<down_prefill_f16x_kq<Type,Tune,Round>,Threads>(name,Tune);
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_kq<Type,Tune,Round>),down_grid,dim3(Threads),0,stream,
+                down_weights,rows,shape.hidden,shape.rows);
+        };
+        if(down_type==14U) {
+            if(rows.rawdots_bf16)down.template operator()<14U,true>("down_q6k_bf16");
+            else down.template operator()<14U,false>("down_q6k");
+        } else {
+            if(rows.rawdots_bf16)down.template operator()<12U,true>("down_q4k_bf16");
+            else down.template operator()<12U,false>("down_q4k");
+        }
+        hip_check(hipGetLastError(),"FP16 prefill WMMA down (K-quant envelope)");
+    };
+    if(static_cast<unsigned long long>(count)*shape.top_k>=96ULL*shape.experts)run.template operator()<82U>();
+    else run.template operator()<80U>();
+}
 void enqueue_prefill(const Request& request,const PrefillRows& rows,unsigned count,unsigned clear_words,
     const unsigned char* gate,const unsigned char* up,unsigned down_type,const unsigned char* down_weights,hipStream_t stream,int form,DirectBOperands direct_assets) {
     const bool q5k=request.gate_type==13U,q20=gsq_a8::gate_type(request.gate_type);  // every GSQ gate type: dot4 form
     direct_b_ran()=false;direct_b_reason()=direct_b_requested()?"not-selected":"off";
     prefill_certificate_flag()=false;prefill_tiers_flag()=0;prefill_down_lds_flag()=false;
     prefill_fused_flag()=false;prefill_da16_flag()=false;prefill_tile64_flag()=false;prefill_small_flag()=false;prefill_clear_skipped_flag()=false;
+    // K-quant down, top_k > 10, expert rows > 640 or a SwiGLU clamp: the K-quant envelope (plain f16x schedule).
+    if(down_type==12U||down_type==14U||request.shape.top_k>10U||request.shape.rows>max_rows||std::isfinite(request.swiglu_limit)) {
+        enqueue_prefill_kquant(request,rows,count,clear_words,gate,up,down_type,down_weights,stream,form);
+        return;
+    }
+    if(rows.rawdots_bf16)
+        throw std::invalid_argument("A8 prefill: BF16-rounded raw slot dots (rawdots_bf16) run in the K-quant envelope only");
     if((down_type!=7U&&down_type!=8U&&!gsq_a8::down_type(down_type))||(request.gate_type!=12U&&!q5k&&!q20)||
        (gsq_a8::down_type(down_type)&&!q20)||
        !gate||!up||!down_weights||

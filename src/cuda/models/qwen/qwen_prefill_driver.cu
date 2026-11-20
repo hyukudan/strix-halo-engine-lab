@@ -27,11 +27,14 @@
 #include "strix/cuda/amd_math.cuh"
 #include "strix/cuda/qwen_moe.hpp"
 #include "strix/cuda/qwen_mtp_defer.hpp"
+#include "strix/lever.hpp"
 #include "strix/cuda/qwen_mtp_draft.hpp"
 #include "strix/cuda/qwen_plemtp.hpp"
 #include "strix/cuda/qwen_qsa.hpp"
 #include "strix/mtp_draft_split.hpp"
+#include "strix/spec/commit_tail.hpp"
 #include "strix/cuda/qwen_transcode.hpp"
+#include "strix/cuda/core/moe_route_tap.hpp"
 #include "strix/cuda/core/nvfp4_a8_cuda.hpp"
 #include "strix/gguf_reader.hpp"
 #include "qwen_tier_adapter.hpp"
@@ -92,6 +95,16 @@ constexpr std::uint32_t gdn_ordinal(std::uint32_t layer) { return layer - (layer
 constexpr std::uint32_t qsa_ordinal(std::uint32_t layer) { return layer / 4U; }
 
 std::uint32_t round_up(std::uint32_t v, std::uint32_t m) { return (v + m - 1U) / m * m; }
+
+// Deferred prompt MTP rows of EVERY block, not only the last (qmd::stash_block): the earlier blocks' MTP calls leave the
+// TTFT (3 of 4 blocks at 32K, >= 68 ms each). Bitwise: the same calls with copies of the same inputs, in block order.
+inline constexpr strix::lever::Decl mtp_stash_lever{
+    .name = "qwen_cuda_mtp_stash", .env = "STRIX_QRTX_MTP_STASH", .exactness = strix::lever::Exactness::bitwise,
+    .default_on = true, .source = "tests/qwen_mtp_defer_tests.cpp: stash policy; prefill identity and TTFT ticket pending"};
+bool mtp_stash_enabled() {
+    static const bool on = strix::lever::select(mtp_stash_lever, {}).on;
+    return on;
+}
 
 // The parts of a split GGUF ("...-00001-of-00002.gguf"): every part in order; otherwise the file itself.
 std::vector<std::string> model_parts(const std::string& path) { return weight_pack::gguf_parts(path); }
@@ -374,7 +387,12 @@ struct Prefill::Impl : BlockFields {
     std::FILE* trace_file = nullptr;               // Config::expert_trace (diagnostic)
     std::uint32_t* trace_host = nullptr;          // pinned [layer][rows][top_k]
     std::uint32_t trace_cap = 0, trace_step = 0;
-    ~Impl() { if (trace_file) std::fclose(trace_file); if (trace_host) cudaFreeHost(trace_host); }
+    ~Impl() {
+        if (trace_file) std::fclose(trace_file);
+        if (trace_host) cudaFreeHost(trace_host);
+        if (mtp_stash) cudaFree(mtp_stash);
+        if (mtp_stash_next) cudaFree(mtp_stash_next);
+    }
     std::size_t graph_cap = 512;                   // layouts up to 16 rows (C8 with 1-draft windows: 256)
     std::uint64_t graph_clock = 0, graph_captures = 0, graph_replays = 0, graph_evictions = 0, eager_windows = 0;
     // Routed-MoE window rows receipt (moe_rows_policy): 9..15-row windows counted at verify_cohort.
@@ -439,6 +457,9 @@ struct Prefill::Impl : BlockFields {
     std::map<DraftKey, DraftGraph> draft_graphs;
     std::map<DraftKey, std::uint32_t> draft_warmed;
     bool draft_graph = true;
+    // Config::decode, STRIX_QRTX_COMMIT_ASYNC=1: commit_cohort returns without synchronising; the host's between-step
+    // work overlaps the commit's device tail (shared protocol strix/spec/commit_tail.hpp; launches and order unchanged)
+    strix::spec::CommitTail commit_tail;
     std::uint64_t* draft_pos = nullptr;         // device [8]
     std::uint64_t* draft_pos_pinned = nullptr;  // [8] + the pending token word after them
     std::uint64_t draft_captures = 0, draft_replays = 0;
@@ -532,20 +553,37 @@ struct Prefill::Impl : BlockFields {
     // Config::defer_prompt_mtp: the MTP rows of the engine set's last prompt block, not yet launched. The call reads the
     // engine set's block_tap() rows [0, count) and mtp_next [0, count); both stay intact until the next prefill block on
     // the engine set, which settles first. One record: the block buffers hold one block.
+    // The earlier blocks of the same prompt are deferred too when the stash holds them (qmd::stash_block): `stashed` lists
+    // their calls in block order, inputs in mtp_stash rows [row, row + count) and mtp_stash_next; the next block of the
+    // same prompt keeps them pending (it rewrites the block buffers, not the stash).
+    struct StashedMtp {
+        std::uint64_t first = 0;   // position of the first pair
+        std::uint32_t count = 0;   // pairs
+        std::uint64_t row = 0;     // first stash row
+        bool mma = false;
+    };
     struct DeferredMtp {
         SessionState* session = nullptr;
         std::uint64_t first = 0;   // position of the first pair
         std::uint32_t count = 0;   // pairs
         bool mma = false;          // Config::forms.mtp_mma at the block
+        bool in_block = false;     // the last block's call (reads block_tap() / mtp_next) is recorded
+        std::vector<StashedMtp> stashed;
+        std::uint64_t stashed_rows() const { return stashed.empty() ? 0U : stashed.back().row + stashed.back().count; }
     };
     DeferredMtp mtp_defer{};
+    std::uint16_t* mtp_stash = nullptr;        // [mtp_stash_rows][kWide] tap rows of stashed blocks
+    std::uint32_t* mtp_stash_next = nullptr;   // [mtp_stash_rows] their next tokens
+    std::uint64_t mtp_stash_rows = 0;
     bool mtp_inflight = false;     // a settled call may still run on `stream` (verify_cohort waits for it)
-    // Launches the deferred call on `stream`, the identical call the block would have made. Never while a prefill set is
-    // swapped in (the record names the engine set's buffers).
+    // Launches the deferred calls on `stream`, the identical calls the blocks would have made (stashed ones first, in
+    // block order). Never while a prefill set is swapped in (the record names the engine set's buffers).
     void mtp_settle();
+    // Grows the stash (only with no stashed call pending) to `rows` if the card has room; false: the caller runs inline.
+    bool mtp_stash_reserve(std::uint64_t rows);
     // The policy of include/strix/cuda/qwen_mtp_defer.hpp for a use of session `target`.
     void mtp_on(qmd::Use use, const SessionState& target, bool fresh = false) {
-        switch (qmd::on_use(mtp_defer.session != nullptr, mtp_defer.session == &target, use, fresh)) {
+        switch (qmd::on_use(mtp_defer.session != nullptr, mtp_defer.session == &target, use, fresh, mtp_defer.in_block)) {
         case qmd::Action::settle: mtp_settle(); break;
         case qmd::Action::drop: mtp_defer = {}; break;
         case qmd::Action::none: break;
@@ -561,6 +599,10 @@ void Prefill::Impl::upload_model() {
     if(cfg.expert_arithmetic!=qwen_packs::ExpertArithmetic::incumbent && cfg.forms.moe_mma)
         throw std::invalid_argument("explicit GSQ expert arithmetic: single-chain moe_mma composition unqualified");
     if (!admission.pack) throw std::runtime_error("Qwen weight pack not admitted: " + admission.reason);
+    if (cfg.expert_narrow) {  // per-regime experts: the arithmetic outside the regime must be admitted for this pack too
+        const auto narrow = qwen_packs::admit_model(cfg.model_gguf, qwen_packs::expert_arithmetic_name(*cfg.expert_narrow));
+        if (!narrow.pack) throw std::runtime_error("Qwen weight pack not admitted outside the expert_turbo regime: " + narrow.reason);
+    }
     constexpr std::uint64_t kChunk = std::uint64_t{256} << 20;
     std::uint8_t* staging[2] = {nullptr, nullptr};
     ck(cudaMallocHost(&staging[0], kChunk), "pinned staging");
@@ -1324,6 +1366,7 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
         }
     }
     if (config.decode) {
+        m.commit_tail.enabled = strix::envcfg::flag("STRIX_QRTX_COMMIT_ASYNC", false);
         const char* v = std::getenv("STRIX_QRTX_SIDE_SHARED");
         if (!(v && v[0] == '0')) {
             ck(cudaStreamCreateWithPriority(&m.side_stream, cudaStreamNonBlocking, m.stream_priority_high), "side stream");
@@ -1377,6 +1420,9 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
         std::fwrite(head, 4, 6, m.trace_file);
         m.use_graphs = false;  // the per-layer copies below are eager-only
     }
+    // FAST gate v2 route tap (STRIX_MOE_ROUTES_OUT / _IN, STRIX_MOE_ROUTE_NULL): the tap syncs and copies per router
+    // call, so decode windows run eager (a set_graphs(true) later makes the tap refuse the capture).
+    if (strix::cuda::core::route_tap_active()) m.use_graphs = false;
     {
         std::size_t free_now = 0, total_now = 0;
         if (cudaMemGetInfo(&free_now, &total_now) == cudaSuccess && m.plan.card.free > free_now) m.engine_bytes = m.plan.card.free - free_now;
@@ -1671,6 +1717,7 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         nv.push("moe_route");
         hc::route_logits(hidden, static_cast<const float*>(lw[l].p[k_ffn_gate_inp_weight]), moe_rows, logits, stream);
         hc::route_select(logits, moe_rows, kTopK, true, tables, routes, route_w, stream);
+        strix::cuda::core::route_tap(l, moe_rows, kTopK, kExperts, routes, route_w, stream);  // inactive: one cached test
         nv.pop();
         if (trace_file) ck(cudaMemcpyAsync(trace_host + std::uint64_t{l} * rows * kTopK, routes, std::uint64_t{rows} * kTopK * 4,
                                            cudaMemcpyDeviceToHost, stream), "expert trace");
@@ -1710,8 +1757,10 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         mr.output = {routed_out, kHidden * 2};
         mr.csr = csr;
         moe::Weights ew;
-        ew.arithmetic=cfg.expert_arithmetic;
+        ew.arithmetic = expert_arithmetic_for(cfg, window, moe_rows);  // per regime (TURBO: int8 on large prefill blocks)
         ew.decode_tile = cfg.expert_decode_tile;
+        ew.wide_tile = cfg.expert_wide_tile;
+        ew.wide_min_avg = cfg.expert_wide_min_rows;
         ew.gate_type = lw[l].gate_type;
         ew.down_type = lw[l].down_type;
         ew.gate = static_cast<const std::uint8_t*>(lw[l].p[k_ffn_gate_exps_weight]);
@@ -2193,7 +2242,11 @@ void Prefill::commit_cohort(const std::vector<std::uint32_t>& keep) {
             if (keep[done] == 0) m.undo_one(*members[done]);
             else m.commit_one(*members[done], keep[done]);
         }
-        ck(cudaStreamSynchronize(m.stream), "commit");
+        // Async tail (opt-in): no host reads the commit and it reads no pinned input, so the call returns here; the next
+        // draft queues behind it on this stream and the next window synchronises first (verify_cohort). A device fault
+        // in the tail surfaces at that next synchronisation.
+        if (m.commit_tail.after_commit()) ck(cudaStreamSynchronize(m.stream), "commit");
+        else ck(cudaGetLastError(), "commit enqueue");
     } catch (...) {
         cudaStreamSynchronize(m.stream);
         for (std::size_t i = done; i < members.size(); ++i) m.poison(*members[i]);
@@ -2330,6 +2383,10 @@ std::vector<StepResult> Prefill::verify_cohort(const std::vector<CohortRows>& co
     // this window only when it executes: every earlier window synchronized the decode stream before returning, so no
     // reader is in flight. Enforced here (one query), so a later change that returns before the sync fails loudly
     // instead of cross-wiring sessions.
+    if (m.commit_tail.verify_needs_sync()) {  // an async commit tail (no draft synchronised after it): retire it first
+        m.commit_tail.synced();
+        ck(cudaStreamSynchronize(m.stream), "commit tail");
+    }
     if (m.mtp_inflight) {  // a settled deferred MTP call reads no window input; the window starts after it anyway
         m.mtp_inflight = false;
         ck(cudaStreamSynchronize(m.stream), "deferred MTP rows");
@@ -2837,21 +2894,76 @@ std::uint32_t Prefill::Impl::prefill_enqueue(SessionState& S, const std::vector<
             const auto cnt = static_cast<std::uint32_t>(last - p0);
             for (std::uint32_t r = 0; r < cnt; ++r) next_pinned[r] = tokens[p0 + r + 1];
             ck(cudaMemcpyAsync(mtp_next, next_pinned, std::uint64_t{cnt} * 4, cudaMemcpyHostToDevice, stream), "mtp next");
-            // the prompt's last block: these rows only feed draft chains, so the first verify window need not wait for them
-            if (qmd::defer_block(defer_mtp, p0, rows, position)) mtp_defer = {&S, p0, cnt, cfg.forms.mtp_mma};
-            else pm::launch_mtp_cache_rows(mtp_weights(), pm::MtpRounding{.mma = cfg.forms.mtp_mma}, block_tap(), mtp_next, cnt, p0, S.mtp_kv,
-                                           S.mtp_index, mtp_ws, mtp_status, tables, stream);
+            // these rows only feed draft chains, so the first verify window need not wait for them: the prompt's last block
+            // records its call in place; an earlier block copies its inputs to the stash (the next block rewrites the block
+            // buffers) when it fits, else the stash settles first and the block launches inline (call order unchanged)
+            const std::uint64_t stashed = mtp_defer.stashed_rows();
+            const bool stash_ok = defer_mtp && mtp_stash_enabled() && p0 + rows < position &&
+                (qmd::stash_block(true, p0, rows, position, stashed, cnt, mtp_stash_rows) ||
+                 (stashed == 0 && mtp_stash_reserve(qmd::stash_rows_for(p0, position, rows)) &&
+                  qmd::stash_block(true, p0, rows, position, 0, cnt, mtp_stash_rows)));
+            if (qmd::defer_block(defer_mtp, p0, rows, position)) {
+                mtp_defer.session = &S;
+                mtp_defer.first = p0;
+                mtp_defer.count = cnt;
+                mtp_defer.mma = cfg.forms.mtp_mma;
+                mtp_defer.in_block = true;
+            } else if (stash_ok) {
+                ck(cudaMemcpyAsync(mtp_stash + stashed * kWide, block_tap(), std::uint64_t{cnt} * kWide * 2, cudaMemcpyDeviceToDevice,
+                                   stream), "MTP stash rows");
+                ck(cudaMemcpyAsync(mtp_stash_next + stashed, mtp_next, std::uint64_t{cnt} * 4, cudaMemcpyDeviceToDevice, stream),
+                   "MTP stash next");
+                mtp_defer.session = &S;
+                mtp_defer.stashed.push_back({p0, cnt, stashed, cfg.forms.mtp_mma});
+            } else {
+                if (defer_mtp && !mtp_defer.stashed.empty()) mtp_settle();
+                pm::launch_mtp_cache_rows(mtp_weights(), pm::MtpRounding{.mma = cfg.forms.mtp_mma}, block_tap(), mtp_next, cnt, p0, S.mtp_kv,
+                                          S.mtp_index, mtp_ws, mtp_status, tables, stream);
+            }
         }
     }
     return rows;
 }
 
+bool Prefill::Impl::mtp_stash_reserve(std::uint64_t rows) {
+    if (rows <= mtp_stash_rows) return true;
+    if (!mtp_defer.stashed.empty()) return false;  // pending calls read the current stash
+    const auto bytes = qmd::stash_bytes(rows, kWide);
+    try {
+        tiered::require_budget(bytes, "MTP stash");
+        strix::cuda::require_vram(bytes, "MTP stash");
+    } catch (const std::exception&) {
+        return false;  // no room: the blocks launch inline, as without the stash
+    }
+    std::uint16_t* tap_rows = nullptr;
+    std::uint32_t* next = nullptr;
+    if (cudaMalloc(&tap_rows, rows * kWide * 2) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    if (cudaMalloc(&next, rows * 4) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cudaFree(tap_rows);
+        return false;
+    }
+    if (mtp_stash) cudaFree(mtp_stash);  // synchronous: settled calls on the old stash have finished
+    if (mtp_stash_next) cudaFree(mtp_stash_next);
+    mtp_stash = tap_rows;
+    mtp_stash_next = next;
+    mtp_stash_rows = rows;
+    return true;
+}
+
 void Prefill::Impl::mtp_settle() {
     if (!mtp_defer.session) return;
-    const auto d = mtp_defer;
+    const auto d = std::move(mtp_defer);
     mtp_defer = {};
-    pm::launch_mtp_cache_rows(mtp_weights(), pm::MtpRounding{.mma = d.mma}, block_tap(), mtp_next, d.count, d.first, d.session->mtp_kv,
-                              d.session->mtp_index, mtp_ws, mtp_status, tables, stream);
+    for (const auto& s : d.stashed)
+        pm::launch_mtp_cache_rows(mtp_weights(), pm::MtpRounding{.mma = s.mma}, mtp_stash + s.row * kWide, mtp_stash_next + s.row, s.count,
+                                  s.first, d.session->mtp_kv, d.session->mtp_index, mtp_ws, mtp_status, tables, stream);
+    if (d.in_block)
+        pm::launch_mtp_cache_rows(mtp_weights(), pm::MtpRounding{.mma = d.mma}, block_tap(), mtp_next, d.count, d.first, d.session->mtp_kv,
+                                  d.session->mtp_index, mtp_ws, mtp_status, tables, stream);
     mtp_inflight = true;
 }
 
@@ -3058,7 +3170,10 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
                               depth | k0 << 8U | k1 << 16U};
     cudaGraphExec_t dexec = nullptr;
     bool capture = false;
-    if (m.use_graphs && m.qsa_graph && m.draft_graph && !per_step_sync && S.mtp_pooled && cudaStreamQuery(m.stream) == cudaSuccess &&
+    // stream idle, or only an async commit tail in flight (it reads none of the pinned inputs written below; every earlier
+    // chain synchronised before returning), and no deferred MTP rows (strix/spec/commit_tail.hpp)
+    if (m.use_graphs && m.qsa_graph && m.draft_graph && !per_step_sync && S.mtp_pooled &&
+        m.commit_tail.draft_replay_ok(cudaStreamQuery(m.stream) == cudaSuccess, m.mtp_inflight) &&
         qsa::graph_shape(&one_row, 1, m.qws, dshape)) {
         const auto it = m.draft_graphs.find(dkey);
         if (it != m.draft_graphs.end()) {
@@ -3145,6 +3260,7 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
         if (!per_step_sync) continue;
         ck(cudaMemcpyAsync(sel, m.draft_sel + 2 * k, 8, cudaMemcpyDeviceToHost, m.stream), "draft read");
         ck(cudaStreamSynchronize(m.stream), "draft step");
+        m.commit_tail.synced();
         float probability;
         std::memcpy(&probability, &sel[1], 4);
         out.tokens.push_back(sel[0]);
@@ -3189,6 +3305,7 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
         std::uint32_t all[2 * kMaxStepRows];
         ck(cudaMemcpyAsync(all, m.draft_sel + 2 * k0, std::uint64_t{k1 - k0} * 8, cudaMemcpyDeviceToHost, m.stream), "draft read");
         ck(cudaStreamSynchronize(m.stream), "draft chain");
+        m.commit_tail.synced();
         for (std::uint32_t k = k0; k < k1; ++k) {
             float probability;
             std::memcpy(&probability, &all[2 * (k - k0) + 1], 4);
@@ -3314,6 +3431,7 @@ std::vector<Draft> Prefill::draft_cohort(const std::vector<DraftRequest>& reques
     std::vector<std::uint32_t> all(2ULL * kMaxStepRows * chains);
     ck(cudaMemcpyAsync(all.data(), m.bd_sel, all.size() * 4, cudaMemcpyDeviceToHost, m.stream), "draft read");
     ck(cudaStreamSynchronize(m.stream), "draft chains");
+    m.commit_tail.synced();
     for (std::uint32_t j = 0; j < chains; ++j) {
         const auto i = order[j];
         for (std::uint32_t k = 0; k < depth[i]; ++k) {

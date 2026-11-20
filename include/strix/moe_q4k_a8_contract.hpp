@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/moe/activation_policy.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -9,6 +10,17 @@
 
 namespace strix::moe_q4k_a8 {
 inline constexpr std::uint32_t max_hidden = 2560, max_rows = 640, max_experts = 512, max_top_k = 10;
+// max_rows / max_top_k bound the multi-row forms (window, prefill): LDS [Rows][max_rows] and admit_csr's 8 x 10
+// assignment table. The C1 forms (project, down_activation_quantize, down_rawdots*) take their grid from the shape and
+// size LDS by max_hidden (gate/up) or c1_max_rows (K-quant down), so their envelope is the geometry presets below.
+struct Geometry { std::uint32_t hidden, intermediate, experts, top_k; };
+inline constexpr Geometry qwen_geometry{2560, 640, 512, 10};  // Qwen MoE canonical H/I/E/K
+inline constexpr std::uint32_t c1_max_rows = 1536, c1_max_top_k = 16;
+static_assert(qwen_geometry.intermediate <= max_rows && qwen_geometry.top_k <= max_top_k);
+// A geometry fits the C1 envelope when this holds (a model package static-asserts its own geometry with it).
+[[nodiscard]] constexpr bool fits_c1(const Geometry& g) {
+    return g.hidden <= max_hidden && g.intermediate <= c1_max_rows && g.top_k <= c1_max_top_k && g.experts <= max_experts;
+}
 inline constexpr std::string_view numerical_identity =
     "strix-moe-q4k-a8g32-probe-v2:f32-div-rne:g32-sym127-zero1-finite-noflush:"
     "dot-s8xu8-i32:combine-separate-f32:pair-ascending-sb-tree4:writer-c0:wave32:proj-nonfinite=propagate-unqualified";
@@ -97,6 +109,10 @@ struct Request {
     Shape shape;
     std::uint32_t gate_type = 12, up_type = 12;
     bool fused_gate_up = false;
+    // SwiGLU clamp of the routed experts (strix::moe::swiglu_clamp; +inf = none = every incumbent identity). Finite: only the
+    // f16x prefill K-quant envelope (known_rows enqueue_prefill) and the C1 down trait (DownRequest) apply it; every other
+    // form refuses it.
+    float swiglu_limit = moe::kSwigluNoClamp;
 };
 struct DeviceBytes { std::uintptr_t address = 0; std::uint64_t bytes = 0; };
 struct Bindings {
@@ -104,4 +120,14 @@ struct Bindings {
 };
 // Pure host admission; no allocation, HIP call or buffer mutation.
 void validate(const Request& request, const Bindings& bindings);
+// Union rows form (strix/moe/expert_union.hpp) of the C1 probe: shape.logical_rows = R (1..8). input / routes / codes /
+// deltas / sums / output are R contiguous C1 extents (each row slice passes validate() with logical_rows 1); gate / up /
+// status are shared; plan is the expert_union plan (expert_union::plan_bytes, written by the probe). Q4_K gate / up only and
+// hidden <= c1_max_rows (the kernel stages one weight row in registers). Pure host admission, like validate().
+// Why not the family's window form (strix/hip_moe_q4k_a8_known_rows.hpp, CSR of (row, slot) per expert): that form is
+// bounded by max_rows / max_top_k above (LDS staging, top-k <= 10), so a top-16 geometry is admitted only by the C1
+// bounds (c1_max_rows / c1_max_top_k). The union form is a trait of this family for that wide geometry, not a second
+// family. Convergence (open): one plan for both forms, and one window form once a receipt at the top-8 geometry says
+// which is faster.
+void validate_union(const Request& request, const Bindings& bindings, DeviceBytes plan);
 }  // namespace strix::moe_q4k_a8

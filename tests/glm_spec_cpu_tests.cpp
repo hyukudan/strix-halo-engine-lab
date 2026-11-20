@@ -10,6 +10,7 @@
 // usage: glm_spec_cpu_tests [tokens=2300] [seed=7] [mutant=0]   (mutant 1..3 must FAIL: the checks are not vacuous)
 #include "glm/spec/glm_spec_host.hpp"
 #include "glm/spec/glm_spec_merge.hpp"
+#include "strix/spec/drafting.hpp"
 
 #include <bit>
 #include <cmath>
@@ -20,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <span>
 #include <limits>
 #include <string>
 #include <vector>
@@ -734,6 +736,74 @@ void test_adaptive() {
 }
 
 
+// GLM binding of the shared strix::spec Arbiter (glm_spec_run.cpp, resolver row STRIX_SPEC_ARBITER=1): each TP2 rank runs
+// its own Arbiter and both must take the same decision every cycle with no exchange. learn_costs = false plus costs
+// seeded from the replicated CostTable every cycle make decide() a pure function of replicated data, so rank-local walls
+// given to observe() (deliberately different here) never change a decision. Lookup windows stay <= 7 drafts (8 rows:
+// the Engine::mtp catch-up bound), and on a verbatim copy run the byte-priced arbiter does choose lookup.
+void test_arbiter_replica() {
+    namespace ss = strix::spec;
+    std::mt19937_64 rng(11);
+    std::vector<std::uint32_t> truth;  // the target's greedy stream: prompt, then the output
+    for (int i = 0; i < 1500; ++i) truth.push_back(static_cast<std::uint32_t>(rng() % 40U));
+    const std::size_t prompt = truth.size(), copy_end = prompt + 400;
+    for (std::size_t i = 0; i < 400; ++i) truth.push_back(truth[200 + i]);  // verbatim copy of a prompt span
+    for (int i = 0; i < 400; ++i) truth.push_back(static_cast<std::uint32_t>(1000U + rng() % 5000U));  // new text
+    const CostTable table = seeded_cost_table();
+    ss::ArbiterConfig config;
+    config.learn_costs = false;
+    ss::Arbiter rank0(config), rank1(config);
+    ss::ContextProposer prop0, prop1;
+    prop0.commit(std::span<const std::uint32_t>(truth.data(), prompt));
+    prop1.commit(std::span<const std::uint32_t>(truth.data(), prompt));
+    std::mt19937_64 accept_rng(5);
+    std::size_t p = prompt;
+    unsigned cycles = 0, lookup_copy = 0, lookup_new = 0;
+    bool same = true, bounded = true;
+    while (p + 9 < truth.size()) {
+        for (std::uint32_t r = 1; r <= 8; ++r) {
+            rank0.seed_cost(r, static_cast<double>(table.verify_ms[r] + table.catchup_ms));
+            rank1.seed_cost(r, static_cast<double>(table.verify_ms[r] + table.catchup_ms));
+        }
+        const ss::Proposal q0 = prop0.propose({}, 7), q1 = prop1.propose({}, 7);
+        ss::StepInput in0;
+        in0.lookup = &q0;
+        in0.max_rows = 8;
+        in0.context = p;
+        in0.model_max_k = 3;
+        in0.model_pass_tokens = 2.0;
+        in0.model_pass_ms = static_cast<double>(table.verify_ms[3] + table.step_ms + table.catchup_ms);
+        ss::StepInput in1 = in0;
+        in1.lookup = &q1;
+        const ss::Decision d0 = rank0.decide(in0), d1 = rank1.decide(in1);
+        same = same && d0.source == d1.source && d0.k == d1.k && d0.rows == d1.rows;
+        bounded = bounded && d0.k <= 7 && d0.rows <= 8;
+        std::uint32_t m = 0;  // accepted drafts: computed once (both ranks see the same merged argmax)
+        if (d0.source == ss::Source::lookup) {
+            while (m < d0.k && m < q0.tokens.size() && q0.tokens[m] == truth[p + m]) ++m;
+            if (p < copy_end) ++lookup_copy;
+            else ++lookup_new;
+        } else if (d0.source == ss::Source::model) {
+            m = static_cast<std::uint32_t>(accept_rng() % (d0.k + 1U));
+        }
+        const std::span<const std::uint32_t> emitted(truth.data() + p, m + 1U);
+        ss::Outcome o0{d0.source, q0.bucket(), d0.k, m, d0.k + 1U, 40.0 + d0.k, 0.0, p};
+        ss::Outcome o1 = o0;
+        o1.bucket = q1.bucket();
+        o1.verify_ms = 90.0 + 7.0 * d0.k;  // the other rank's local wall differs
+        rank0.observe(o0, emitted);
+        rank1.observe(o1, emitted);
+        prop0.commit(emitted);
+        prop1.commit(emitted);
+        p += m + 1U;
+        ++cycles;
+    }
+    check(same, "arbiter replica: both ranks decide the same in all " + std::to_string(cycles) + " cycles (local walls differ)");
+    check(bounded, "arbiter replica: lookup windows <= 7 drafts / 8 rows");
+    check(lookup_copy > 0, "arbiter replica: lookup chosen on the verbatim copy run (" + std::to_string(lookup_copy) + " cycles)");
+    std::printf("     arbiter replica: lookup cycles on new text %u\n", lookup_new);
+}
+
 // Retained CommExchange inline arithmetic: an independent oracle for the extracted helper.
 void old_inline_merge(std::span<MergeRow> rows, MergeCtl& ctl, std::span<const MergeRow> peer,
                       const MergeCtl& pc, std::uint32_t rank) {
@@ -822,6 +892,7 @@ int main(int argc, char** argv) {
     try {
         test_merge_rank_order();
         test_adaptive();
+        test_arbiter_replica();
         test_accept();
         test_equivalence(total, seed);
         test_mtp(seed + 1);
