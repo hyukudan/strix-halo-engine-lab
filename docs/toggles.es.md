@@ -274,7 +274,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_GLM_PF_MLA_OB16` | glm | activo cuando corre el GEMM out MLA en WMMA (mismos bits); 0 = o-bar FP32 | [glm-pf-mla-wmma](optimizations.md#glm-pf-mla-wmma) |
 | `STRIX_GLM_PF_TOPK_OVERLAP` | glm | apagado; 1 = diagnóstico: en cada llamada flash FAST, tamaños de listas top-k frente a la unión de pares / cuartetos / octetos de filas alineadas (prefijo denso y filas dispersas), sincroniza el stream (no para medir tiempos), mismos bits | [glm-pf-mla-wmma](optimizations.md#glm-pf-mla-wmma) |
 | `STRIX_GLM_PF_MLA_GEMM_HEADS` | glm | activo (exacto y FAST; mismos bits); 0 = orden de CTAs filas-luego-cabeza | [glm-pf-mla-gemm-heads](optimizations.md#glm-pf-mla-gemm-heads) |
-| `STRIX_GLM_PF_KDA_SCAN` | glm | 5 | [glm-pf-kda-scan-v5](optimizations.md#glm-pf-kda-scan-v5) |
+| `STRIX_GLM_PF_KDA_SCAN` | glm | 6 | [glm-pf-kda-scan-v6](optimizations.md#glm-pf-kda-scan-v6) |
 | `STRIX_GLM_PF_MIXNORM` | glm | 1 | [glm-pf-mixnorm](optimizations.md#glm-pf-mixnorm) |
 | `STRIX_GLM_PF_MLA_GEMM` | glm | 3 (v3); 2 selects v2 | [glm-pf-mla-gemm-v2](optimizations.md#glm-pf-mla-gemm-v2) |
 | `STRIX_GLM_PF_OBAR` | glm | 10 | [glm-pf-obar-v5](optimizations.md#glm-pf-obar-v5) |

@@ -73,7 +73,7 @@ que se ejecuta.
 | `STRIX_GLM_PF_OBAR` | 10, 7, 6, 5, 4, 2 |
 | `STRIX_GLM_PF_MLA_GEMM` | 3, 2, 1 |
 | `STRIX_GLM_PF_SCORES` | 7, 6, 5, 4, 3, 2 |
-| `STRIX_GLM_PF_KDA_SCAN` | 5, 3, 1 |
+| `STRIX_GLM_PF_KDA_SCAN` | 6, 5, 3, 1 |
 | `STRIX_GLM_PF_DENSE_ROWS` | 4, 3, 2, 1 |
 | `STRIX_GLM_PF_DENSE_FORM` | 0, 1, 2, 3, 4, 5, 6, 7 (forma física de la versión 4; 0 = automática según la forma de la llamada) |
 

@@ -4321,23 +4321,27 @@ selections overlap and share latent lines in L2, while a row's absorbed query is
 
 <a id="glm-pf-kda-scan-v3"></a>
 <a id="glm-pf-kda-scan-v5"></a>
+<a id="glm-pf-kda-scan-v6"></a>
 
-### Prefill KDA scan v5
+### Prefill KDA scan v6
 
-**Engine:** `glm`. **Control:** `STRIX_GLM_PF_KDA_SCAN`. **Default:** 5.
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_KDA_SCAN`. **Default:** 6.
 
 The token-sequential KDA recurrence of a prefill chunk keeps every lane's chains and the 128-key pairing tree; the two
 tree levels that cross lanes of a quad (q ^ 2, q ^ 1) read the partner's value through quad DPP moves instead of
 `ds_bpermute` shuffles, which takes four LDS round trips off every token's serial path (v3). v5 also takes the batch
 fill off the serial path: the next 8 tokens' q / k / g are loaded into registers while the current tokens run and are
-stored into the other half of a double LDS buffer (24 KB in all), one barrier per batch.
+stored into the other half of a double LDS buffer (24 KB in all), one barrier per batch. v6 removes the separate prep
+launch: each token's raw row is staged in LDS and the conv, SiLU, norms, gate and beta of v5's prep kernel run inside the
+scan's batch fill (32,576 B of LDS, 186 VGPRs, 2 workgroups per CU as v5); the non-finite test is taken once on the final
+state (non-finite values are absorbing).
 
 - **Preconditions:** Exact chunked prefill.
-- **Automatic selection:** Unset resolves to 5; the resolver reports it. Explicit values win.
+- **Automatic selection:** Unset resolves to 6; the resolver reports it. Explicit values win.
 - **Fallback notice:** None.
 - **Exactness evidence:** Raw scan outputs, outputs and states after every chunk bitwise equal to v1 and to the decode kernel on the prefill gate (real and synthetic weights, special rows).
-- **Off switch:** STRIX_GLM_PF_KDA_SCAN=3 (v3) or =1 (v1)
-- **Measured gain:** v5 1.18-1.20 vs v3 1.23-1.25 us/row per KDA layer (-3.7 %); rank 0 of an 8K pair prefill 0.355 -> 0.340 s in the scan, 8K TTFT 16.60 vs 16.60 s (mean of 8 arms, both run orders: neutral); v3 1.84-1.93 -> 1.23-1.28 us/row per KDA layer at chunk positions 0 / 4096 / 28672 (-33 %); rank 0 of an 8K pair prefill 0.534 -> 0.355 s in the scan, of a 32K one 2.15-2.22 -> 1.43-1.44 s; 8K TTFT 16.63 -> 16.34 s (-1.7 %, alone). Together with MLA scores v6: 32K TTFT 68.76 -> 67.72 s (-1.5 %, mean of both run orders), logits bitwise equal on both ranks
+- **Off switch:** STRIX_GLM_PF_KDA_SCAN=5 (v5), =3 (v3) or =1 (v1)
+- **Measured gain:** v6 prep + conv + scan 2.02 -> 1.82 us/row per KDA layer at C=4096 (2.00 -> 1.82 at C=2048; layer bench, v5 and v6 paired per repetition; v6 bitwise == decode on the prefill gate, 52 checks); v5 1.18-1.20 vs v3 1.23-1.25 us/row per KDA layer (-3.7 %); rank 0 of an 8K pair prefill 0.355 -> 0.340 s in the scan, 8K TTFT 16.60 vs 16.60 s (mean of 8 arms, both run orders: neutral); v3 1.84-1.93 -> 1.23-1.28 us/row per KDA layer at chunk positions 0 / 4096 / 28672 (-33 %); rank 0 of an 8K pair prefill 0.534 -> 0.355 s in the scan, of a 32K one 2.15-2.22 -> 1.43-1.44 s; 8K TTFT 16.63 -> 16.34 s (-1.7 %, alone). Together with MLA scores v6: 32K TTFT 68.76 -> 67.72 s (-1.5 %, mean of both run orders), logits bitwise equal on both ranks
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp)
 
 ### Prefill pipeline and async exchange start

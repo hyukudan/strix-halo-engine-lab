@@ -279,7 +279,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_GLM_PF_MLA_OB16` | glm | on when the MLA WMMA out GEMM runs (same bits); 0 = FP32 o-bar | [glm-pf-mla-wmma](optimizations.md#glm-pf-mla-wmma) |
 | `STRIX_GLM_PF_TOPK_OVERLAP` | glm | off; 1 = diagnostic: per FAST flash call, top-k list sizes vs union sizes of aligned row pairs / quads / octets (dense prefix and sparse rows), syncs the stream (not for timing), bits unchanged | [glm-pf-mla-wmma](optimizations.md#glm-pf-mla-wmma) |
 | `STRIX_GLM_PF_MLA_GEMM_HEADS` | glm | on (exact and FAST; same bits); 0 = rows-then-head CTA order | [glm-pf-mla-gemm-heads](optimizations.md#glm-pf-mla-gemm-heads) |
-| `STRIX_GLM_PF_KDA_SCAN` | glm | 5 | [glm-pf-kda-scan-v5](optimizations.md#glm-pf-kda-scan-v5) |
+| `STRIX_GLM_PF_KDA_SCAN` | glm | 6 | [glm-pf-kda-scan-v6](optimizations.md#glm-pf-kda-scan-v6) |
 | `STRIX_GLM_PF_MIXNORM` | glm | 1 | [glm-pf-mixnorm](optimizations.md#glm-pf-mixnorm) |
 | `STRIX_GLM_PF_MLA_GEMM` | glm | 3 (v3); 2 selects v2 | [glm-pf-mla-gemm-v2](optimizations.md#glm-pf-mla-gemm-v2) |
 | `STRIX_GLM_PF_OBAR` | glm | 10 | [glm-pf-obar-v5](optimizations.md#glm-pf-obar-v5) |

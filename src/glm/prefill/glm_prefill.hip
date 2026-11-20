@@ -3033,8 +3033,8 @@ void kda_mark(unsigned i, hipStream_t s) {
 void set_kda_profile(hipEvent_t* ev5) { g_kda_prof = ev5; }
 namespace {
 unsigned g_kda_scan_v = 0;  // explicit selector (gates / bench); 0 = kda_scan_version()
-// default v5 (v3 + fill off the serial path, same bits, -3.7 % vs v3); STRIX_GLM_PF_KDA_SCAN=3 / 1: v3 / v1;
-// =6: v5 with the prep fused into the scan and the non-finite test on the final state (same bits; opt-in until measured)
+// default v6: v5 with the prep fused into the scan and the non-finite test on the final state (same bits; prep + conv +
+// scan 2.02 -> 1.82 us/row at C=4096); STRIX_GLM_PF_KDA_SCAN=5 / 3 / 1: v5 (v3 + fill off the serial path) / v3 / v1;
 unsigned kda_scan_version() {
     static const unsigned v = [] {
         return pf_variant_from_env(*pf_variant_find("STRIX_GLM_PF_KDA_SCAN"));
