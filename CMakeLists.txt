@@ -409,6 +409,11 @@ target_include_directories(strix_ds41_http_session_owner PUBLIC src)
 target_link_libraries(strix_ds41_http_session_owner PUBLIC strix_session_owner)
 strix_target_warnings(strix_ds41_http_session_owner)
 if(BUILD_TESTING)
+    # CPU-only checks against the real HIP find_library command (toolkit priority and legacy fallback).
+    add_test(NAME strix-hip-toolkit-lookup-tests
+        COMMAND "${CMAKE_COMMAND}" "-DSTRIX_REPO_ROOT=${CMAKE_SOURCE_DIR}"
+                -P "${CMAKE_SOURCE_DIR}/tests/cmake/hip_toolkit_paths_tests.cmake")
+    set_tests_properties(strix-hip-toolkit-lookup-tests PROPERTIES LABELS "cpu;build")
     add_executable(strix-exact-reduce-contract-tests tests/exact_reduce_contract_tests.cpp)
     target_compile_features(strix-exact-reduce-contract-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-exact-reduce-contract-tests)
