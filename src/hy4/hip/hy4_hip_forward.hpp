@@ -98,6 +98,15 @@ public:
     // Back to position 0 for a repeat run of the same process: every cache row is written in position order before a
     // read, so a repeat reproduces the bits (the repeat's logits digest is the check).
     void reset() noexcept;
+    // State image (strix/session/state_image.hpp): the target's cross-position caches (latent rings, indexer token rings,
+    // group keys) + position + token history, so a long teacher-forced reference stops at a ticket boundary and goes on
+    // in a new process with the same bits. load_state() needs the same layout (model depth, rank range, context, ring
+    // rows): another layout is refused. The next-token block's caches are not in the image (refused with nextn on).
+    // Synchronises. Diagnostic / gate tool, no product path.
+    [[nodiscard]] std::string state_layout() const;
+    [[nodiscard]] const std::vector<std::uint32_t>& token_history() const noexcept;  // ids at positions 0 .. position() - 1
+    void save_state(const std::filesystem::path& file) const;
+    void load_state(const std::filesystem::path& file);
     // Undo the last step (pipelined speculation, strix/pair/layer_pipeline.hpp DecodeOps::rewind): position and token
     // history go back one. Every device row a step writes is addressed by its position (latent / token-key rings, the
     // group key the position closes), so the redo at the same position rewrites all of them before any read; a sliding

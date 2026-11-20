@@ -2002,6 +2002,12 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-moe-route-file-tests)
     add_test(NAME strix-moe-route-file-tests COMMAND strix-moe-route-file-tests)
     set_tests_properties(strix-moe-route-file-tests PROPERTIES LABELS "cpu;gate" TIMEOUT 60)
+    # Device state image codec (long teacher-forced references carried across processes).
+    add_executable(strix-session-state-image-tests tests/session_state_image_tests.cpp)
+    target_link_libraries(strix-session-state-image-tests PRIVATE strix_core)
+    strix_target_warnings(strix-session-state-image-tests)
+    add_test(NAME strix-session-state-image-tests COMMAND strix-session-state-image-tests)
+    set_tests_properties(strix-session-state-image-tests PROPERTIES LABELS "cpu;gate" TIMEOUT 60)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         add_test(NAME strix-turbo-kit-tests COMMAND ${Python3_EXECUTABLE} -B
@@ -6971,6 +6977,7 @@ if(STRIX_FAMILY_HY4)
     target_compile_options(strix_hy4_hip PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
         -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
     target_link_libraries(strix_hy4_hip PUBLIC strix_hy4_ref strix_hip_runtime strix_q4k_a8_hip_probe strix_engram strix_ds41_hip)
+    target_link_libraries(strix_hy4_hip PRIVATE strix_state_cache)  # state image files (session/checkpoint_io)
     strix_target_warnings(strix_hy4_hip)
     add_executable(strix-hy4-rank apps/hy4_rank_main.cpp)
     target_link_libraries(strix-hy4-rank PRIVATE strix_hy4_hip strix_dist strix_device strix_spec)  # pair: shared layer pipeline + link; copy proposer

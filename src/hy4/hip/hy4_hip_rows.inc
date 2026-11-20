@@ -390,6 +390,7 @@ void ffn_vrows(std::uint32_t l, std::uint32_t R) {  // vr.xn -> vr.f
         const std::size_t K = c.top_k, L = c.latent;
         linear_vrows(blk(l, "ffn_gate_inp.weight"), vr.xn, h, c.experts, R, vr.rlog, false);
         strix::moe_core::enqueue_route_wave<preset::route, glu::DeclaredExp>(vr.rlog, t(blk(l, "exp_probs_b.bias")).f(), vr.ids, vr.rw, R, s);
+        strix::moe_core::route_tap(l, R, c.top_k, c.experts, vr.ids, vr.rw, s);
         linear_vrows(blk(l, "ffn_routed_down.weight"), vr.xn, h, c.latent, R, vr.z);
         const bool kquant_down = t(blk(l, "ffn_down_exps.weight")).type == 12U || t(blk(l, "ffn_down_exps.weight")).type == 14U;
         const auto& wg = t(blk(l, "ffn_gate_exps.weight"));

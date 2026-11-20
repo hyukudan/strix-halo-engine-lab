@@ -19,6 +19,7 @@
 #include "engram/hip/inject_kernel.hpp"
 #include "engram/hip/row_kernel.hpp"
 #include "moe_core/route_wave_kernel.hpp"
+#include "moe_core/route_tap_hip.hpp"
 #include "ops/glu/glu_device.hpp"
 #include "ops/norm/norm_presets.hpp"
 #include "ops/rope/rope_device.hpp"
@@ -37,6 +38,8 @@
 #include "strix/hip_mtp_draft_head.hpp"
 #include "../../hip_q8_rows_sites.hpp"
 #include "strix/env_flags.hpp"
+#include "strix/session/checkpoint_io.hpp"
+#include "strix/session/state_image.hpp"
 #include "strix/hip_moe_a8_down.hpp"
 #include "strix/hip_moe_q4k_a8_known_rows.hpp"
 #include "strix/q51_known_rows.hpp"
@@ -238,6 +241,15 @@ struct Forward::Impl {
     float *ik = nullptr, *pooled = nullptr, *iq = nullptr, *hwraw = nullptr;
     std::uint32_t *skeys = nullptr, *hist0 = nullptr, *ilist = nullptr;
     std::uint32_t group_cap = 0;            // group-key rows per layer (context / 4, rounded up)
+    // Cross-position device state of the target (state image regions, in allocation order): every cache row a step
+    // reads, nothing else carries from one position to the next (rope tables are static, Engram reads `tokens`).
+    struct StateRegion {
+        std::string name;
+        void* p;
+        std::size_t bytes;
+    };
+    std::vector<StateRegion> state_regions;
+    std::uint32_t state_launch_rows = 0;
     std::array<std::uint32_t, 4> hpos{};    // uploaded to dpos: {position, rope slot 4g, closing group g, 0}
 
     // workspace
@@ -430,6 +442,7 @@ struct Forward::Impl {
         store_epilogue = strix::envcfg::flag("STRIX_HY4_Q8_STORE_EPILOGUE", true);
         pf_store_epilogue = strix::envcfg::flag("STRIX_HY4_PF_STORE_EPILOGUE", true);
         const std::uint32_t launch_rows = rows::cache_rows(rmax, vr.max);  // rows a launch / verify pass may write (ring sizes)
+        state_launch_rows = launch_rows;
         std::vector<std::uint32_t> seq(context + 1U);
         std::iota(seq.begin(), seq.end(), 0U);
         check(hipMemcpy(iota, seq.data(), seq.size() * 4U, hipMemcpyHostToDevice), "iota upload");
@@ -441,6 +454,7 @@ struct Forward::Impl {
             const auto k = layer_caches(c, l, context, launch_rows);
             latent_rows[l] = k.latent;
             latent[l] = alloc<std::uint16_t>(k.latent_rows * k.latent.width);
+            state_regions.push_back({"latent." + std::to_string(l), latent[l], std::size_t{k.latent_rows} * k.latent.width * 2U});
         }
         // indexer caches (token ring + group keys) and the shared scratch of the select stages
         tkeys.assign(c.layers, nullptr);
@@ -457,6 +471,8 @@ struct Forward::Impl {
             tk_rows[l] = k.token_keys;
             tkeys[l] = alloc<std::uint16_t>(k.token_rows * k.token_keys.width);
             gkeys[l] = alloc<std::uint16_t>(std::size_t{group_cap} * kIdxDim);
+            state_regions.push_back({"tkeys." + std::to_string(l), tkeys[l], std::size_t{k.token_rows} * k.token_keys.width * 2U});
+            state_regions.push_back({"gkeys." + std::to_string(l), gkeys[l], std::size_t{group_cap} * kIdxDim * 2U});
             any_indexed = true;
         }
         if (any_indexed) {
@@ -802,6 +818,7 @@ struct Forward::Impl {
         } else {
             linear(blk(l, "ffn_gate_inp.weight"), xn, h, c.experts, rlog, false);
             strix::moe_core::enqueue_route_wave<preset::route, glu::DeclaredExp>(rlog, t(blk(l, "exp_probs_b.bias")).f(), ids, rw, 1U, s);
+            strix::moe_core::route_tap(l, 1U, c.top_k, c.experts, ids, rw, s);  // FAST gate v2 tap (inactive: no copy)
             linear(blk(l, "ffn_routed_down.weight"), xn, h, c.latent, z);
             const auto& wg = t(blk(l, "ffn_gate_exps.weight"));
             const auto& wu = t(blk(l, "ffn_up_exps.weight"));
@@ -1192,6 +1209,7 @@ struct Forward::Impl {
             const std::uint64_t K = c.top_k, L = c.latent;
             linear_rows(blk(l, "ffn_gate_inp.weight"), pr.xn, h, c.experts, R, pr.rlog, false);
             strix::moe_core::enqueue_route_wave<preset::route, glu::DeclaredExp>(pr.rlog, t(blk(l, "exp_probs_b.bias")).f(), pr.ids, pr.rw, R, s);
+            strix::moe_core::route_tap(l, R, c.top_k, c.experts, pr.ids, pr.rw, s);
             linear_rows(blk(l, "ffn_routed_down.weight"), pr.xn, h, c.latent, R, pr.z);
             check(dcr::store_rows({pr.z, L, nullptr, 0U, R, {c.latent, 0U}, pr.zb, flag}, s), "expert input rows (bf16)");
             experts_rows(l, R);
@@ -1788,6 +1806,58 @@ void Forward::reset() noexcept {
     impl_->pos = 0;
     impl_->tokens.clear();
     impl_->times = {};
+}
+const std::vector<std::uint32_t>& Forward::token_history() const noexcept { return impl_->tokens; }
+std::string Forward::state_layout() const {
+    const auto& m = *impl_;
+    std::string key = "hy4-hip-state v1 layers=" + std::to_string(m.c.layers) + " first=" + std::to_string(m.first) +
+                      " last=" + std::to_string(m.last) + " context=" + std::to_string(m.context) +
+                      " launch_rows=" + std::to_string(m.state_launch_rows) + " regions=" + std::to_string(m.state_regions.size());
+    for (const auto& r : m.state_regions) key += " " + r.name + ":" + std::to_string(r.bytes);
+    return key;
+}
+void Forward::save_state(const std::filesystem::path& file) const {
+    auto& m = *impl_;
+    if (m.nx.on) throw std::logic_error("hy4 state image: the next-token block's caches are not in the image (nextn off)");
+    if (m.vr.rows != 0U) throw std::logic_error("hy4 state image: save between a verify pass and its commit_rows");
+    namespace si = strix::session::state_image;
+    si::Image im;
+    im.layout = state_layout();
+    im.position = m.pos;
+    im.tokens = m.tokens;
+    check(hipStreamSynchronize(m.s), "state image sync");
+    for (const auto& r : m.state_regions) {
+        si::Region reg{r.name, std::vector<std::byte>(r.bytes)};
+        check(hipMemcpy(reg.bytes.data(), r.p, r.bytes, hipMemcpyDeviceToHost), "state image read");
+        im.regions.push_back(std::move(reg));
+    }
+    const auto bytes = si::encode(im);
+    strix::session::checkpoint_io::atomic_write(file, bytes);
+}
+void Forward::load_state(const std::filesystem::path& file) {
+    auto& m = *impl_;
+    if (m.nx.on) throw std::logic_error("hy4 state image: the next-token block's caches are not in the image (nextn off)");
+    if (m.vr.rows != 0U) throw std::logic_error("hy4 state image: load between a verify pass and its commit_rows");
+    namespace si = strix::session::state_image;
+    std::vector<std::uint8_t> raw;
+    strix::session::checkpoint_io::read(file, raw, strix::session::checkpoint_io::DirectIo::buffered, false);
+    auto im = si::decode(std::as_bytes(std::span<const std::uint8_t>(raw)), state_layout());
+    raw = {};
+    if (im.tokens.size() != im.position || im.position > m.context)
+        throw std::runtime_error("hy4 state image: position " + std::to_string(im.position) + " with " + std::to_string(im.tokens.size()) +
+                                 " tokens (context " + std::to_string(m.context) + ")");
+    if (im.regions.size() != m.state_regions.size()) throw std::runtime_error("hy4 state image: region count");
+    for (std::size_t i = 0; i < im.regions.size(); ++i) {
+        const auto& r = m.state_regions[i];
+        if (im.regions[i].name != r.name || im.regions[i].bytes.size() != r.bytes)
+            throw std::runtime_error("hy4 state image: region " + im.regions[i].name + " is not " + r.name);
+        check(hipMemcpy(r.p, im.regions[i].bytes.data(), r.bytes, hipMemcpyHostToDevice), "state image write");
+    }
+    for (const auto t : im.tokens)
+        if (t >= m.c.vocab) throw std::runtime_error("hy4 state image: token outside the vocabulary");
+    m.pos = static_cast<std::uint32_t>(im.position);
+    m.tokens.assign(im.tokens.begin(), im.tokens.end());
+    m.times = {};
 }
 void Forward::set_timing(bool on) noexcept { impl_->timing = on; }
 const StepTimes& Forward::times() const noexcept { return impl_->times; }
