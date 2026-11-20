@@ -1,4 +1,9 @@
 // Token-tree window contract (strix/spec/tree_window.hpp): random trees from the shared controller's layout
+// The serial and tree *host* arithmetic is a scheduling oracle: compile with strict non-contracted
+// FP expressions (CMakeLists.txt and cmake/Qwen35Spec.cmake). With x86 FMA contraction, the same
+// attend() expression can round one ULP differently after inlining in serial_row vs run_window;
+// greedy_of intentionally hashes the float bits, turning this host artifact into a token mismatch.
+// Device CUDA/HIP bitwise A/B checks remain a separate qualification gate.
 // (Block::tree_rows) and accept walk (accept_tree), run through a host model of the target rules the CUDA core implements
 // (RowMap::self K/V index, gdn_window leaf mask, gdn_commit_path, kv_move_row). Invariant: every row's output and the
 // committed state after each step are bitwise those of SERIAL decoding of the same tokens -> emitted ids == serial.
