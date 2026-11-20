@@ -366,7 +366,9 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
 // grows here and not on the first request. Nothing is kept: no prefix store, no drafting, no peers.
 inline void warm_up_batch_runner(MtpBatchRunner& runner, const Options& options) {
     const auto plan = serve::plan_startup_warmup(serve::startup_warmup_enabled(), runner.tile_rows(), options.context_tokens);
-    const double ms = serve::run_startup_warmup(plan, runner.vocabulary(), [&](std::vector<std::uint32_t> prompt) {
+    // A warm-up request the runner finishes with an error (or never finishes: not admitted) is reported and the server
+    // starts lazily (StartupWarmupFailed, bounded fail-open); an exception out of admit/step still fails the start.
+    const auto warm = serve::run_startup_warmup(plan, runner.vocabulary(), [&](std::vector<std::uint32_t> prompt) {
         MtpBatchRequest request;
         request.cache_retention = serve::CacheRetention::no_store;
         request.prompt = std::move(prompt);
@@ -381,9 +383,9 @@ inline void warm_up_batch_runner(MtpBatchRunner& runner, const Options& options)
         (void)runner.admit(std::move(request));
         while (runner.active()) runner.step();
         if (!finished || !error.empty())
-            throw std::runtime_error("serve warm-up failed: " + (error.empty() ? std::string("no completion") : error));
+            throw serve::StartupWarmupFailed(error.empty() ? std::string("no completion") : error);
     });
-    std::cerr << serve::startup_warmup_line("strix serve", plan, ms) << std::endl;
+    std::cerr << serve::startup_warmup_line("strix serve", plan, warm) << std::endl;
 }
 
 inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::string engine_description,

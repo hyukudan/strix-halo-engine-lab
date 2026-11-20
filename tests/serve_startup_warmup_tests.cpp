@@ -44,22 +44,51 @@ int main() {
     require(hi - lo > 100000U && repeats < 4U, "ids spread over the range");
     for (const auto id : startup_warmup_prompt(64U, 3U)) require(id == 1U, "tiny vocabulary stays valid");
 
-    // The run wrapper hands the planned prompt to the engine, does nothing without a plan and propagates failure.
-    std::size_t seen = 0;
-    (void)run_startup_warmup(ctx, 248320U, [&](std::vector<std::uint32_t> prompt) { seen = prompt.size(); });
-    require(seen == 4094U, "run gets the planned rows");
-    seen = 7U;
-    require(run_startup_warmup(plan_startup_warmup(false, 8192U, 40960U), 248320U,
-                               [&](std::vector<std::uint32_t>) { seen = 0U; }) == 0.0 && seen == 7U,
-            "no run without a plan");
-    bool thrown = false;
+    // Default and disabled modes of the switch: unset = on (the bitwise lever's default), 0 = the lazy start (no plan,
+    // no run, the "none (off)" line), 1 = on, anything else refused.
+    namespace lever = strix::lever;
+    require(lever::select(startup_warmup_lever, {}, nullptr).on && lever::select(startup_warmup_lever, {}, "").on,
+            "unset switch: warm-up on");
+    require(!lever::select(startup_warmup_lever, {}, "0").on && lever::select(startup_warmup_lever, {}, "1").on,
+            "STRIX_SERVE_WARMUP=0 off, =1 on");
+    bool refused = false;
     try {
-        (void)run_startup_warmup(tile, 248320U, [](std::vector<std::uint32_t>) { throw std::runtime_error("x"); });
+        (void)lever::select(startup_warmup_lever, {}, "yes");
+    } catch (const std::invalid_argument&) { refused = true; }
+    require(refused, "switch values other than 0/1 refused");
+    const auto off = plan_startup_warmup(lever::select(startup_warmup_lever, {}, "0").on, 8192U, 40960U);
+    require(off.rows == 0U && off.reason == "off", "disabled: no plan");
+
+    // The run wrapper hands the planned prompt to the engine and does nothing without a plan.
+    std::size_t seen = 0;
+    const auto ran = run_startup_warmup(ctx, 248320U, [&](std::vector<std::uint32_t> prompt) { seen = prompt.size(); });
+    require(seen == 4094U && ran.failure.empty(), "run gets the planned rows");
+    seen = 7U;
+    const auto none = run_startup_warmup(off, 248320U, [&](std::vector<std::uint32_t>) { seen = 0U; });
+    require(none.ms == 0.0 && none.failure.empty() && seen == 7U, "disabled: no run");
+
+    // Failure paths: a failed warm-up REQUEST (StartupWarmupFailed) is reported and the start goes on lazily (bounded
+    // fail-open); any other exception (an engine fault) still fails the start.
+    bool thrown = false;
+    StartupWarmupResult failed;
+    try {
+        failed = run_startup_warmup(tile, 248320U,
+                                    [](std::vector<std::uint32_t>) { throw StartupWarmupFailed("out of memory"); });
+    } catch (...) { thrown = true; }
+    require(!thrown && failed.failure == "out of memory", "a failed warm-up request does not fail the start");
+    thrown = false;
+    try {
+        (void)run_startup_warmup(tile, 248320U, [](std::vector<std::uint32_t>) { throw std::runtime_error("fault"); });
+    } catch (const StartupWarmupFailed&) {
     } catch (const std::runtime_error&) { thrown = true; }
-    require(thrown, "a failed warm-up fails the start");
+    require(thrown, "an engine fault in the warm-up fails the start");
 
     const auto line = startup_warmup_line("strix serve", tile, 7123.4);
     require(line == "strix serve warm-up: 8192 rows + 1 token (tile) 7123 ms before listening", "warm-up line");
+    require(startup_warmup_line("strix serve", tile, StartupWarmupResult{7123.4, {}}) == line, "completed result line");
+    require(startup_warmup_line("strix serve", tile, StartupWarmupResult{12.0, "out of memory"}) ==
+                "strix serve warm-up: 8192 rows + 1 token (tile) FAILED after 12 ms (out of memory): lazy start",
+            "failed warm-up line");
     require(startup_warmup_line("strix serve", plan_startup_warmup(false, 8192U, 40960U), 0.0) ==
                 "strix serve warm-up: none (off)", "off line");
     std::puts("serve startup warm-up tests: PASS");
