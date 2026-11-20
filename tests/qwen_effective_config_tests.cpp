@@ -5105,8 +5105,14 @@ int main(int argc, char** arguments) {
                 qsa_mtp_pool_bytes(batch,ModelContract::qwen38_flash_next())==218644480,
                 "every HTTP slot (single runner or batch) is charged one pool in the capacity fit");
             auto yarn_http=single;yarn_http.rotary=RotaryDescriptor::yarn(2);yarn_http.context_tokens=262144;
+            // QFN-3: the single YaRN HTTP route takes the CLI factor band (one resolver); outside it, closed.
+            auto yarn_cli=yarn_http;yarn_cli.http_serve=false;
+            expect(qsa_mtp_pool_route(yarn_http)==qsa_mtp_pool_route(yarn_cli) && qsa_mtp_pool_route(yarn_http),
+                "YaRN single HTTP route resolves the CLI pool decision");
+            auto yarn_out=yarn_http;yarn_out.context_tokens=600000;
+            expect(!qsa_mtp_pool_route(yarn_out),"YaRN HTTP outside the factor band stays closed");
             auto yarn_batch=batch;yarn_batch.rotary=yarn_http.rotary;yarn_batch.context_tokens=262144;
-            expect(!qsa_mtp_pool_route(yarn_http) && !qsa_mtp_pool_route(yarn_batch),"YaRN HTTP stays closed by default");
+            expect(!qsa_mtp_pool_route(yarn_batch),"YaRN HTTP batch slots stay closed by default");
             for(const auto name:{qwen::profile::Name::standard,qwen::profile::Name::fast,qwen::profile::Name::quality}) {
                 auto profiled=single;profiled.product_profile=qwen::profile::resolve(name,{});
                 auto profiled_batch=batch;profiled_batch.product_profile=profiled.product_profile;
