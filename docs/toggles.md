@@ -122,6 +122,7 @@ The tables below list the curated flags. The full list of environment variables 
 | `--block-schedule default\|tail-large` | qwen-rtx | `tail-large` | Order of blocks in the large kernels. | `default` on GPUs with a different CU count. |
 | `--prefill auto` | glm | `auto` | Picks the prefill path. | - |
 | `--prefill-chunk N` | glm | 512 | Prefill chunk size in rows. | Larger with more compute; smaller with less memory. |
+| `--prefill-route windows\|large`, `--prefill-chunk N` | qwen-rtx (27B spec CLI) | `windows` | `large`: the prompt goes through the decode CLI's large prefill (`--prefill-chunk N` rows per chunk; 0 = engine default) and its rows feed the MTP chain. Opt-in, not yet measured against `windows`. | - |
 | `--prefill-path device` | deepseek serve | `device` | Prefill on the GPU. | - |
 | `--wide-exact N` | qwen (27B HIP decode app) | off (16-row windows) | EXACT prefill windows of N rows, every row bitwise the 16-row result; only when every large dense projection is IU4 (other formats resolve to 16 rows). `--wide N` (> 16) is the FAST wide class. [Details](optimizations.md#qwen27-hip-decode-step). | 64 measured best on Strix (exact attention costs more per row in wider grids). |
 | `--prefill-rows N`, `--prefill-exact` | qwen (27B HIP spec app) | 64-row EXACT windows (IU4 dense projections; 16 rows otherwise) | `--prefill-rows 16` = 16-row windows; N > 16 = the FAST wide class unless `--prefill-exact` is given. [Details](optimizations.md#qwen27-hip-decode-step). | - |
@@ -136,6 +137,7 @@ The tables below list the curated flags. The full list of environment variables 
 |---|---|---|---|---|
 | `--mtp-bundle`, `--rope-yarn 2\|4 --context C` | qwen | - | MTP draft bundle; YaRN for long context. | - |
 | `--prelaunch 0\|1` | qwen-rtx (dense 27B spec CLI) | `0` | Launches the verify behind the device-fed MTP draft (same ids). | - |
+| `--mtp-catchup kv\|full` | qwen-rtx (27B spec CLI) | `kv` | K/V-only MTP catch-up: catch-up chunks whose outputs nobody reads write only the MTP K/V (same K/V, same drafts). `full` = the full MTP pass (off switch). [Details](optimizations.md#qwen27-cuda-mtp-kv-catchup) | - |
 | `--mtp 0\|1` | glm | resolved (see `--print-effective-config`) | Turns the MTP draft off or on. | `0` when memory is short. |
 | `--identity r1b\|r1` | glm | `r1b` | Decode identity. | `r1` to compare. |
 | `--dspark`, `--no-dspark`, `--dspark-vocab auto\|full` | deepseek | on when the draft is found | DSpark speculative draft. | `--no-dspark` when memory is short. |

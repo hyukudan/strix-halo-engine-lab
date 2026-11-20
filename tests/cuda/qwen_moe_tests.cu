@@ -892,6 +892,9 @@ static void fast_bench(const am::Tables& tables) {
 // down IQ4_NL 20; "expert-bench=GATE,DOWN" for others), 512 experts, top-10 uniform routes, synthetic codes (an integer or
 // BF16 MMA does the same work for any values). Per rows: best and median of 9 timed calls after 3 warm-ups (cudaEvent),
 // then the winner. The crossover of the TURBO expert regime (profile row expert_turbo_rows) is read from these lines.
+// Steps of <= 16 rows (decode windows) time four arms, each arithmetic in its tile form and its decode form (Weights::
+// decode_tile), print a B2 line, and check on the device that each decode form's rawdots equal its tile form's bit for bit
+// (B2 ... IDENTITY ok|DIFF); the B0 line of those rows compares the decode forms (what a window runs).
 static int expert_bench(const am::Tables& tables, u32 gt, u32 dt) {
     std::mt19937 rng(11);
     constexpr u32 NE = 512;
@@ -908,17 +911,21 @@ static int expert_bench(const am::Tables& tables, u32 gt, u32 dt) {
     Device d; upload_weights(d, w);
     std::printf("B0 expert-bench gate %u down %u experts %u top_k %u (ms per routed call; best / median of 9)\n", gt, dt, NE, mo::top_k);
     int bad = 0;
-    for (const u32 T : {1U, 16U, 128U, 512U, 2048U, 8192U}) {
+    for (const u32 T : {1U, 4U, 16U, 128U, 512U, 2048U, 8192U}) {
         State s; init_state(s, T); synthetic_inputs(s, NE, 0, rng);
         upload_state(d, s, true);
         auto& rv = d.rows_view;
         mo::enqueue_prologue(rv, T, mo::hidden, nullptr);
         CK(cudaDeviceSynchronize());
         cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
-        float best[2] = {1e9F, 1e9F}, med[2] = {0, 0};
-        const mo::ExpertArithmetic arms[2] = {mo::ExpertArithmetic::gsq_bf16_mma, mo::ExpertArithmetic::gsq_i8_turbo};
-        for (int a = 0; a < 2; ++a) {
-            d.weights.arithmetic = arms[a];
+        // arms: 0 bf16 tile, 1 bf16 decode, 2 int8 tile, 3 int8 decode (rows > 16: the decode flag selects nothing, 1 and 3 run)
+        const bool window = T <= 16U;
+        const size_t raw_bytes = s.view[V_raw].size();
+        std::vector<u8> raw[4];
+        float best[4] = {1e9F, 1e9F, 1e9F, 1e9F}, med[4] = {0, 0, 0, 0};
+        for (int a = window ? 0 : 1; a < 4; a += window ? 1 : 2) {
+            d.weights.arithmetic = a < 2 ? mo::ExpertArithmetic::gsq_bf16_mma : mo::ExpertArithmetic::gsq_i8_turbo;
+            d.weights.decode_tile = (a & 1) != 0;
             std::vector<float> t;
             for (int it = 0; it < 12; ++it) {
                 CK(cudaEventRecord(e0));
@@ -929,10 +936,19 @@ static int expert_bench(const am::Tables& tables, u32 gt, u32 dt) {
             }
             std::sort(t.begin(), t.end());
             best[a] = t.front(); med[a] = t[t.size() / 2];
+            if (window) { raw[a].resize(raw_bytes); CK(cudaMemcpy(raw[a].data(), d.view[V_raw], raw_bytes, cudaMemcpyDeviceToHost)); }
         }
+        d.weights.decode_tile = true;
         u32 summary = 0; CK(cudaMemcpy(&summary, d.summary, 4, cudaMemcpyDeviceToHost)); bad |= summary ? 1 : 0;
-        std::printf("B0 rows %5u bf16 %.4f / %.4f int8 %.4f / %.4f ratio(int8/bf16, median) %.3f -> %s%s\n", T, best[0], med[0], best[1],
-                    med[1], med[1] / med[0], med[1] < med[0] ? "int8" : "bf16", summary ? " STATUS-FLAGS" : "");
+        if (window) {
+            const bool same_bf16 = raw[0] == raw[1], same_i8 = raw[2] == raw[3];
+            bad |= same_bf16 && same_i8 ? 0 : 1;
+            std::printf("B2 rows %5u gate %u down %u bf16 tile/dec %.4f / %.4f int8 tile/dec %.4f / %.4f int8dec/bf16dec %.3f "
+                        "int8dec/int8tile %.3f IDENTITY bf16 %s int8 %s\n", T, gt, dt, med[0], med[1], med[2], med[3], med[3] / med[1],
+                        med[3] / med[2], same_bf16 ? "ok" : "DIFF", same_i8 ? "ok" : "DIFF");
+        }
+        std::printf("B0 rows %5u bf16 %.4f / %.4f int8 %.4f / %.4f ratio(int8/bf16, median) %.3f -> %s%s\n", T, best[1], med[1], best[3],
+                    med[3], med[3] / med[1], med[3] < med[1] ? "int8" : "bf16", summary ? " STATUS-FLAGS" : "");
         std::fflush(stdout);
         CK(cudaEventDestroy(e0)); CK(cudaEventDestroy(e1));
         free_state_buffers(d);

@@ -1,0 +1,8 @@
+rung	fixture	file	producer	format	class	status	sha256
+G2	gate-en prompt ids (31)	gate-en.ids	strix-tokenize PART1 encode (shared BPE, hy_v4 rule)	ids: one decimal id per line	-	committed	bcbc7144a1211ddfa5c6fe23cbb5379538195869de4ebda9c88dcf35b5069fd1
+G2	gate-zh prompt ids (27)	gate-zh.ids	strix-tokenize PART1 encode (shared BPE, hy_v4 rule)	ids: one decimal id per line	-	committed	3e68b6a47a15bad39d5291189b9cdc55d764144c5b360beb3145c09644f577f5
+G0	host test list	g0-tests.tsv	data	tsv name/args/status/contract	-	committed	-
+G1	device op cases	g1-cases.tsv	data	tsv op/case/class/oracle	bitwise|ids-equal|tol	committed	-
+G2	oracle identity lines gate-en + gate-zh	ref/oracle-identity.txt	strix-hy4-ref-run --identity (hy4-host-ref-v1, PC CPU)	hy4 identity line (gates-plan section 3)	exact	pending	-
+G4	oracle teacher-forced logits, kit.json 8 prompts + gate-zh, 64 rows	(outside git) oracle-<prompt>-tf-r0.f32	strix-hy4-ref-run --quality-dump	fast_logit_gate [rows][120832] FP32 + <prompt>.u32	exact	pending	-
+G5	long prefill ids 4K/16K/32K	(outside git) p<N>.ids	common/prompt_ids.py --tokenize-cmd 'strix-tokenize PART1 encode' --format ids	ids	-	pending	-

@@ -633,9 +633,22 @@ struct CudaEngine::Impl {
         }
     }
 
-    void attn_mixer(const LayerW& w, const Bufs& b, std::uint32_t rows) {
+    // kv_only: only the K/V cache write of these rows (k/v GEMVs, k norm, rope, kv_store: the same kernels and operands as the
+    // full mixer, dense_rows_multi of {k, v} = the {q, k, v} launch bit for bit); no q path, attention or o_proj. For rows
+    // whose output nobody reads (MTP catch-up chunks, strix/spec/mtp_chain.hpp MtpKvEngine).
+    void attn_mixer(const LayerW& w, const Bufs& b, std::uint32_t rows, bool kv_only = false) {
         const std::uint32_t D = c.head_dim;
         const std::uint32_t qgw = c.heads * D * 2;
+        if (kv_only) {
+            const cc::DenseWeight ws[2] = {w.k, w.v};
+            float* const ys[2] = {k, v};
+            multi(ws, ys, 2, b.xn, rows);
+            const cc::GroupedView kvv{rows, c.kv_heads, D, c.kv_heads * D, D};
+            CK(cc::rmsnorm(k, kvv, w.kn, k, kvv, c.rms_eps, s));
+            CK(cc::rope_apply(k, kvv, c.rotary_dim, cos_t, sin_t, b.pos, s, b.rm));
+            CK(cc::kv_store(ad, k, v, b.kc, b.vc, b.pos, rows, s, b.rm));
+            return;
+        }
         {
             const cc::DenseWeight ws[3] = {w.q, w.k, w.v};
             float* const ys[3] = {qg, k, v};
@@ -1441,7 +1454,7 @@ struct CudaEngine::Impl {
         }
     }
 
-    RowsOut prefill(const std::uint32_t* tokens, std::uint32_t n, LogitRows want) {
+    RowsOut prefill(const std::uint32_t* tokens, std::uint32_t n, LogitRows want, float* rows_out = nullptr, bool rows_pre = false) {
         if (n == 0) throw std::runtime_error("prefill: n must be >= 1");
         core::require_capacity(committed, n, opt.max_positions);
         core::validate_token_ids(tokens, n, c.vocab);
@@ -1458,8 +1471,12 @@ struct CudaEngine::Impl {
             for (std::uint32_t p = 0; p < n; p += RM) {
                 const std::uint32_t r = std::min<std::uint32_t>(RM, n - p);
                 o = forward(tokens + p, r, p + r == n ? want : LogitRows::none);
+                if (rows_out != nullptr)
+                    CK(cudaMemcpyAsync(rows_out + static_cast<std::size_t>(p) * c.hidden, rows_pre ? o.hidden_pre : o.hidden_post,
+                                       static_cast<std::size_t>(r) * c.hidden * 4, cudaMemcpyDeviceToDevice, s));
                 commit_rows(r);
             }
+            if (rows_out != nullptr) CK(cudaStreamSynchronize(s));
             return o;
         }
         const std::uint32_t C = pf_step_rows(n), H = c.hidden;  // C <= opt.prefill_chunk (buffers)
@@ -1509,6 +1526,12 @@ struct CudaEngine::Impl {
             const std::uint32_t p = plan[ci].pos, r = plan[ci].rows;
             pf_chunk(sl, tokens + p, r, committed + p, (par0 + ci) & 1u, ci ? &ev[static_cast<std::size_t>(ci - 1) * c.layers] : nullptr,
                      &ev[static_cast<std::size_t>(ci) * c.layers]);
+            if (rows_out != nullptr) {  // every row's final residual (pre) or final-norm output (post), in order on the slot
+                float* dst = rows_out + static_cast<std::size_t>(p) * H;  // stream before the slot's next chunk overwrites sl.x;
+                const cc::GroupedView rv{r, 1, H, H, H};                    // the Events destructor drains the slots on return
+                if (rows_pre) CK(cudaMemcpyAsync(dst, sl.x, static_cast<std::size_t>(r) * H * 4, cudaMemcpyDeviceToDevice, sl.st));
+                else CK(cc::rmsnorm(sl.x, rv, out_norm, dst, rv, c.rms_eps, sl.st));
+            }
         }
         Slot& last = *pf.sl[(nchunks - 1) % nslots];
         CK(cudaStreamWaitEvent(s, ev[static_cast<std::size_t>(nchunks) * c.layers - 1], 0));
@@ -1566,6 +1589,32 @@ struct CudaEngine::Impl {
         }
         CK(cudaMemcpyAsync(d_dmap + from, g.data() + from, (to - from) * sizeof(std::uint32_t), cudaMemcpyHostToDevice, s));
         drows->mark_materialised();
+    }
+    // K/V-only MTP rows: the same inputs and kernels as mtp() up to the MTP layer's kv_store; nothing else is computed and no
+    // output is produced (the chain's catch-up chunks whose block output and draft are never read). Eager (no graph).
+    void mtp_kv(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0) {
+        if (!mtp_ok) throw std::runtime_error("mtp_kv: no MTP tensors loaded");
+        if (rows == 0 || rows > RM) throw std::runtime_error("mtp_kv: bad rows/pos0");
+        core::require_capacity(pos0, rows, opt.max_positions);
+        core::validate_token_ids(next_tokens, rows, c.vocab);
+        InputPack in{};
+        in.pos0 = pos0;
+        for (std::uint32_t i = 0; i < rows; ++i) in.ids[i] = next_tokens[i];
+        set_inputs_kernel<<<1, 32, 0, s>>>(in, d_mpos, d_mids);
+        CK(cudaGetLastError());
+        mtp_body(hidden_dev, rows, true);
+    }
+    // MTP K/V rows [pos0, pos0 + rows) to the host, head-major (cache layout [kv_heads][max_positions][head_dim]).
+    void mtp_kv_read(std::uint32_t pos0, std::uint32_t rows, std::uint16_t* k_host, std::uint16_t* v_host) {
+        if (!mtp_ok) throw std::runtime_error("mtp_kv_read: no MTP tensors loaded");
+        if (rows == 0 || pos0 > opt.max_positions || rows > opt.max_positions - pos0)
+            throw std::runtime_error("mtp_kv_read: rows outside the cache");
+        const std::size_t D = c.head_dim, row_bytes = D * sizeof(__nv_bfloat16);
+        const std::size_t width = static_cast<std::size_t>(rows) * row_bytes, pitch = opt.max_positions * row_bytes;
+        CK(cudaStreamSynchronize(s));
+        CK(cudaMemcpy2DAsync(k_host, width, mkc + pos0 * D, pitch, width, c.kv_heads, cudaMemcpyDeviceToHost, s));
+        CK(cudaMemcpy2DAsync(v_host, width, mvc + pos0 * D, pitch, width, c.kv_heads, cudaMemcpyDeviceToHost, s));
+        CK(cudaStreamSynchronize(s));
     }
     CudaEngine::MtpOut mtp(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0, bool want_top) {
         if (!mtp_ok) throw std::runtime_error("mtp_forward: no MTP tensors loaded");
@@ -1647,7 +1696,7 @@ struct CudaEngine::Impl {
         CK(cudaStreamSynchronize(s));
     }
     // MTP block body on rows whose ids / positions are in d_mids / d_mpos: mx = block output, mxn = shared-head norm of mx.
-    void mtp_body(const float* hidden_dev, std::uint32_t rows) {
+    void mtp_body(const float* hidden_dev, std::uint32_t rows, bool kv_only = false) {
         const std::uint32_t H = c.hidden;
         const cc::GroupedView src{rows, 1, H, H, H}, dst{rows, 1, H, 2 * H, H};
         CK(cc::embedding_rows(embd, d_mids, mtmp, rows, s));
@@ -1657,7 +1706,8 @@ struct CudaEngine::Impl {
         const cc::GroupedView hv{rows, 1, H, H, H};
         CK(cc::rmsnorm(mx, hv, M.attn_norm, mxn, hv, c.rms_eps, s));
         const Bufs b{mx, mxn, d_mpos, mkc, mvc};
-        attn_mixer(M, b, rows);
+        attn_mixer(M, b, rows, kv_only);
+        if (kv_only) return;  // K/V written; block output, mtp.norm and the head are not wanted
         mlp(M, b, rows);
         // mx holds the block output (pre mtp.norm); the hidden export needs it intact, so normalise into mxn.
         CK(cc::rmsnorm(mx, hv, m_shnorm, mxn, hv, c.rms_eps, s));
@@ -2034,7 +2084,9 @@ RowsOut CudaEngine::forward_tree(const std::uint32_t* tokens, const strix::spec:
     return p_->forward(tokens, tree.rows, want, &tree);
 }
 void CudaEngine::commit_path(const strix::spec::PathCommit& pc) { p_->commit_path(pc); }
-RowsOut CudaEngine::prefill(const std::uint32_t* tokens, std::uint32_t n, LogitRows want) { return p_->prefill(tokens, n, want); }
+RowsOut CudaEngine::prefill(const std::uint32_t* tokens, std::uint32_t n, LogitRows want, float* rows_out, bool rows_pre) {
+    return p_->prefill(tokens, n, want, rows_out, rows_pre);
+}
 bool CudaEngine::prefill_is_big() const { return p_->big_supported(); }
 const char* prefill_arith_name(PrefillArith a) {
     static const char* n[] = {"exact", "flash", "fast", "fast2", "fast8", "fast4"};
@@ -2045,6 +2097,12 @@ void CudaEngine::set_draft_rows(strix::spec::DraftRows* rows) { p_->set_draft_ro
 CudaEngine::MtpOut CudaEngine::mtp_forward(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows,
                                            std::uint32_t pos0, bool want_top) {
     return p_->mtp(next_tokens, hidden_dev, rows, pos0, want_top);
+}
+void CudaEngine::mtp_kv(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0) {
+    p_->mtp_kv(next_tokens, hidden_dev, rows, pos0);
+}
+void CudaEngine::mtp_kv_read(std::uint32_t pos0, std::uint32_t rows, std::uint16_t* k_host, std::uint16_t* v_host) const {
+    p_->mtp_kv_read(pos0, rows, k_host, v_host);
 }
 CudaEngine::MtpOut CudaEngine::mtp_step_fed(const std::uint32_t* in_host, std::uint32_t in_slot, std::uint32_t out_slot,
                                             const float* hidden_dev, std::uint32_t pos, bool want_top) {

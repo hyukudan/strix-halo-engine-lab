@@ -11,6 +11,7 @@
 //                      (drafted ids gathered from the chain's feed slots on the device), then the same read as verify()
 //   commit(k)       -> engine commit(k) (+ host sync so the step wall is complete)
 //   make_chain()    -> native MTP drafter (strix::spec::ChainDrafter = shared MtpChain)
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -40,8 +41,11 @@ struct CudaChainDev {
 class SpecEngine final : public strix::spec::VerifyTarget {
 public:
     using Chain = strix::spec::MtpChain<CudaEngine, CudaChainDev>;
-    explicit SpecEngine(CudaEngine& e, bool chain_pre_hidden = false) : e_(e) {
+    explicit SpecEngine(CudaEngine& e, bool chain_pre_hidden = false) : e_(e), pre_(chain_pre_hidden) {
         if (e.has_mtp()) chain_ = std::make_unique<Chain>(e, chain_pre_hidden, 32U);
+    }
+    ~SpecEngine() override {
+        if (rows_dev_) cudaFree(rows_dev_);
     }
     SpecEngine(const SpecEngine&) = delete;
     SpecEngine& operator=(const SpecEngine&) = delete;
@@ -110,9 +114,45 @@ public:
         e_.commit(rows);
         e_.sync();
     }
+    // Whole prompt (positions committed().. ) through the engine's large-M prefill (exact or FAST by its options) with every
+    // row's hidden exported (CudaEngine::prefill rows_out) and fed to the MTP chain: the chain sees the same rows, successors
+    // and positions as from prefill() windows of any size (it rings and chunks them itself); under the exact route the
+    // committed trunk state is that of the windows (cuda_engine.hpp prefill contract). *top_out = the anchor. Long prompts
+    // only cost hidden x 4 B per row of device memory (kept for reuse, freed with this object).
+    // Returns the trunk wall (engine prefill + anchor read, ms); the rest of the call is the MTP feed (stage split).
+    double prefill_big(const std::uint32_t* tokens, std::uint32_t n, std::uint32_t* top_out) {
+        if (n == 0) throw std::invalid_argument("prefill_big: empty prompt");
+        const auto t0 = std::chrono::steady_clock::now();
+        float* rows = nullptr;
+        if (chain_) {
+            const std::size_t need = std::size_t(n) * e_.config().hidden;
+            if (need > rows_cap_) {
+                if (rows_dev_) cudaFree(rows_dev_);
+                rows_dev_ = nullptr;
+                rows_cap_ = 0;
+                if (cudaMalloc(reinterpret_cast<void**>(&rows_dev_), need * sizeof(float)) != cudaSuccess)
+                    throw std::runtime_error("prefill_big: cudaMalloc of the hidden rows");
+                rows_cap_ = need;
+            }
+            rows = rows_dev_;
+        }
+        const auto o = e_.prefill(tokens, n, LogitRows::last, rows, pre_);
+        e_.read_top(o, 1, top_out);  // synchronizes
+        const double trunk_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (chain_) {
+            RowsOut h{};
+            h.hidden_post = rows;
+            h.hidden_pre = rows;
+            chain_->observe_prefill(h, n, tokens, *top_out);
+        }
+        e_.sync();
+        return trunk_ms;
+    }
     Chain& make_chain() { return *chain_; }
     [[nodiscard]] std::uint64_t chain_calls() const { return chain_ ? chain_->calls() : 0; }
     [[nodiscard]] std::uint64_t chain_rows() const { return chain_ ? chain_->rows() : 0; }
+    // K/V-only catch-up chunks (MtpChain::kv_calls, not in chain_calls): full catch-up calls == chain_calls + chain_kv_calls
+    [[nodiscard]] std::uint64_t chain_kv_calls() const { return chain_ ? chain_->kv_calls() : 0; }
     // New sequence: the engine is reset by the caller; forget the MTP positions.
     void reset() {
         if (chain_) chain_->reset();
@@ -120,11 +160,14 @@ public:
 
 private:
     CudaEngine& e_;
+    bool pre_ = false;  // chain hidden convention (pre = residual, post = final-norm output)
     std::unique_ptr<Chain> chain_;
     RowsOut pending_{};              // pre-launched verify (verify_launch_fed) until verify_collect
     std::uint32_t pending_rows_ = 0;
     bool tree_ = false;
     strix::spec::TreeWindow tw_{};
+    float* rows_dev_ = nullptr;  // prefill_big hidden rows [rows_cap_ floats]
+    std::size_t rows_cap_ = 0;
 };
 
 }  // namespace strix::qwen35

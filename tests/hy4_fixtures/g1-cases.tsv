@@ -1,0 +1,25 @@
+op	case	class	oracle and shape (HY4 pack shapes; seeded inputs, 3 seeds)
+engram	hash-decode	ids-equal	strix::engram hasher: 1 token, 4 Engram layers x 16 heads (8 bigram + 8 trigram) row ids
+engram	hash-tail	ids-equal	strix::engram hasher: ids 120818..120831 + pad 120002 before the sequence start (token_map tail rule)
+engram	rows-decode	bitwise	strix::engram row reader: 64 rows x 96 F8_E4M3 -> declared decode, per-head RMSNorm input bytes equal
+engram	rows-prefill	bitwise	same, 512-token chunk (32,768 rows)
+hc	pre-decode	tol:hc-v1	strix::hc contract (comb = identity, hc_mult 4): mixes, pre/post coefficients, mixed input; 1 row x 4 x 3072
+hc	post-decode	bitwise	strix::hc post update stream_i = post_i * out + stream_i, FP32 then BF16 store
+hc	pre-prefill	tol:hc-v1	same as pre-decode, 512 rows
+hc	head	tol:hc-v1	hc_head pre-only mix (fn [4, 4*3072]) -> RMSNorm input
+mla-dsa	decode-dense	tol:mla-v1	sparse MLA contract (hy4_attn, pending): 32 heads, D_qk 576 / D_v 512, kv 1024 (<= 2048: dense causal), sink, gate
+mla-dsa	decode-indexed	tol:mla-v1	same, kv 8192: 2048 selected positions from the indexer case select-decode
+mla-dsa	prefill-chunk	tol:mla-v1	same, 512-row chunk at kv 8192
+mla-swa	decode-window	tol:mla-v1	64 heads, window 512 incl. self (keys q-511..q), theta 1e4, kv 4096, sink, gate
+mla-swa	window-edge	tol:mla-v1	queries at q = 510, 511, 512 (window boundary both sides)
+mla-swa	prefill-chunk	tol:mla-v1	512-row chunk at kv 4096
+indexer	pool-groups	tol:group-indexer-v1	strix::attn group indexer HY4 policy: gated softmax + APE pool of 4, RMSNorm, group RoPE
+indexer	select-decode	ids-equal	top 511 complete groups + own group at kv 8192; ties declared lower index
+indexer	select-prefill	ids-equal	same, 512 query rows
+router	ids-weights-decode	ids-equal	strix::moe route_select_ref hy4 preset: sigmoid + bias selection, top-16/512, unbiased renorm x 3.998
+router	weights-decode	bitwise	same case, FP32 weights in ascending expert id
+router	ids-prefill	ids-equal	same, 512 rows
+experts	q4k-gate-up	tol:grouped-moe-v1	grouped experts core: Q4_K gate/up 1536 x 1536, 16 of 512 experts, SwiGLU clamp 10 (gate upper only, up both)
+experts	q6k-down	tol:grouped-moe-v1	grouped experts core: Q6_K down (layers with Q6_K down in the pack) - core gap per hy4_moe-REPORT
+experts	q4k-down	tol:grouped-moe-v1	grouped experts core: Q4_K down
+experts	prefill-rows	tol:grouped-moe-v1	512 rows, real routing histogram from the router case ids-prefill

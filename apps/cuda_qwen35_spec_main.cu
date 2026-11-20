@@ -119,7 +119,9 @@ int main(int argc, char** argv) {
         //   f = draft head rows / vocab (1 = full head). Defaults = PRO 6000 receipts of this identity (cc_decode3-STATE.md).
         //   --cost-kv online|off|KV = the context cost of those arms (spec::set_context_cost, shared with every binder):
         //   online (default) fits it from this device's verify walls (ArbiterConfig::cost_fit), off = context-blind seeds
-        //   (the previous form), KV = fixed ms per verify row per 1,024 context positions (deterministic A/B).
+        //   (the previous form), KV = fixed ms per verify row per 1,024 context positions (deterministic A/B). Only off / KV
+        //   make k a pure function of the seeds and the acceptance history: online prices k from this run's measured walls
+        //   (Arbiter::fit_fold), so two runs of one binary may choose a different k at a marginal step (ids never change).
         //   A final "t" (subt, sub15dt, ...) = token-tree verify: the engine verifies sibling rows (strix/spec/tree_window.hpp,
         //   EXACT) and the controller places the MTP runner-up beside a chain node where its cost rule pays; without "t" every
         //   block is linear (the runner-up probe still records q per depth).
@@ -132,6 +134,12 @@ int main(int argc, char** argv) {
         std::uint32_t idle_ms = 0;  // host sleep (GPU idle) before every spec run: thermal gaps inside one ticket
         bool cost_table = false, check = true, graphs = true, seed_costs = true, turbo_lm_head = true, pdl = false;
         bool prelaunch = false;  // verify pre-launch: bits unchanged; default off until its timing receipt (DEFAULT ON WHEN PROVEN)
+        // --prefill-route large: opt-in. --mtp-catchup kv = default (K/V-only MTP catch-up where the engine has the hook;
+        // its device gate compares ids / steps / k histogram with full under --cost-kv off and the MTP K/V bytes through
+        // --mtp-kv-dump), full = the off switch.
+        bool pf_large = false, kv_catchup = true;
+        std::string mtp_kv_dump;  // --mtp-kv-dump DIR: after each spec run, the MTP K/V of the prompt rows (raw bf16 bits)
+        std::uint32_t pf_chunk = 0;                 // --prefill-chunk N (large route; 0 = EngineOptions default)
         q::TurboWeights turbo = q::TurboWeights::off;
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
@@ -173,6 +181,25 @@ int main(int argc, char** argv) {
             }
             else if (a == "--chain-hidden") chain_hidden = next();
             else if (a == "--max-pos") max_pos = strix::core::parse_u32(next());
+            // Prompt fill: windows (forward_rows of 32 + MTP feed, the incumbent) | large (CudaEngine::prefill large-M route,
+            // every row's hidden fed to the MTP chain: SpecEngine::prefill_big; the resolver then offers the decode CLI's
+            // large-prefill levers: --profile fast = FAST4 + chunk16 prompt, decode stays exact).
+            else if (a == "--prefill-route") {
+                const auto v = next();
+                if (v != "windows" && v != "large") throw std::invalid_argument("--prefill-route expects windows|large");
+                pf_large = v == "large";
+            }
+            else if (a == "--prefill-arith") lever_cli.emplace_back("prefill_arith", next());  // large route only (resolver)
+            else if (a == "--prefill-gdn") lever_cli.emplace_back("prefill_gdn", next());
+            else if (a == "--prefill-attn8") lever_cli.emplace_back("prefill_attn8", next());
+            else if (a == "--prefill-chunk") pf_chunk = strix::core::parse_u32(next());  // as the decode CLI (rows per chunk)
+            // MTP catch-up of rows nobody reads the output of: full (incumbent calls) | kv (K/V-only rows, same K/V bits;
+            // strix/spec/mtp_chain.hpp MtpKvEngine)
+            else if (a == "--mtp-catchup") {
+                const auto v = next();
+                if (v != "full" && v != "kv") throw std::invalid_argument("--mtp-catchup expects full|kv");
+                kv_catchup = v == "kv";
+            }
             else if (a == "--label") label = next();
             else if (a == "--frontier") arms = {std::to_string(strix::core::parse_u32(next()))};
             else if (a == "--arms") {
@@ -193,6 +220,7 @@ int main(int argc, char** argv) {
             else if (a == "--pairs") { pairs = strix::core::parse_u32(next()); if (pairs == 0) throw std::runtime_error("--pairs >= 1"); }
             else if (a == "--ids-out") ids_out = next();
             else if (a == "--spec-trace") spec_trace = next();
+            else if (a == "--mtp-kv-dump") mtp_kv_dump = next();
             else if (a == "--turbo-weights") {
                 const std::string v = next();
                 if (v != "off" && v != "native" && v != "onfly" && v != "converted") throw std::runtime_error("--turbo-weights expects off|native|onfly|converted");
@@ -212,7 +240,8 @@ int main(int argc, char** argv) {
         if (model.empty() == synth.empty())
             throw std::runtime_error("usage: (--model F.gguf | --synthetic-full bf16|q8_0 [--layers N]) [--prompt-ids a,b | --prompt-file F | --prompt-len N] "
                                      "[--n-gen N] [--sources copy,chain,hybrid|none] [--oracle ACC] [--cost-table] [--check 0|1] [--max-block 1..32] "
-                                     "[--frontier N | --arms 0,8,new,sub,new15,sub15 --pairs P] [--draft-core G] [--draft-fallback G] [--draft-pack F1,F2] [--idle-ms MS] [--ids-out DIR] [--spec-trace DIR]  (--prompt-file accepts F1,F2,...: one engine load)");
+                                     "[--frontier N | --arms 0,8,new,sub,new15,sub15 --pairs P] [--draft-core G] [--draft-fallback G] [--draft-pack F1,F2] [--idle-ms MS] [--ids-out DIR] [--spec-trace DIR] "
+                                     "[--prefill-route windows|large [--prefill-chunk N] [--prefill-arith A] [--prefill-gdn G] [--prefill-attn8 on|off]] [--prelaunch 0|1] [--mtp-catchup full|kv] [--mtp-kv-dump DIR]  (--prompt-file accepts F1,F2,...: one engine load)");
         // (label, ids) per prompt; --prompt-file takes a comma list (label = file stem), each prompt runs serial + spec arms.
         std::vector<std::pair<std::string, std::vector<std::uint32_t>>> prompts;
         if (!ids_arg.empty()) prompts.emplace_back(label, parse_ids(ids_arg));
@@ -237,12 +266,18 @@ int main(int argc, char** argv) {
         opt.turbo_weights = turbo;
         opt.turbo_lm_head = turbo_lm_head;
         opt.pdl = pdl;
+        if (pf_chunk != 0) {
+            if (!pf_large) throw std::invalid_argument("--prefill-chunk needs --prefill-route large");
+            opt.prefill_chunk = pf_chunk;
+        }
         // The decode CLI's resolver on the windows route: SpecEngine prefills through forward_rows windows (cuda_spec.hpp
         // prefill), so only the levers of that path are offered (split_k); prefill_arith stays exact. EXACT touches nothing.
         namespace qp = strix::qwen35::profile;
         std::size_t prompt_tokens = prompt_len;
         for (const auto& entry : prompts) prompt_tokens = std::max(prompt_tokens, entry.second.size());
-        const auto resolved = qp::resolve(profile, qp::regime_of(opt, qp::Route::windows, prompt_tokens), lever_cli);
+        // --prefill-route large: the prompt goes through CudaEngine::prefill, so the decode CLI's large-prefill route applies.
+        const auto route = pf_large ? qp::Route::large_prefill : qp::Route::windows;
+        const auto resolved = qp::resolve(profile, qp::regime_of(opt, route, prompt_tokens), lever_cli);
         qp::apply(opt, *resolved);
         std::fputs(qp::describe(*resolved).c_str(), stderr);
         opt.max_positions = std::max<std::uint32_t>(max_pos, std::uint32_t(std::max<std::size_t>(longest, prompt_len) + n_gen + 128 +
@@ -269,17 +304,36 @@ int main(int argc, char** argv) {
             prompts.assign(1, {label, prompt});
         }
         q::SpecEngine S(*E, chain_hidden == "pre");
+        if (S.has_chain()) S.make_chain().set_kv_catchup(kv_catchup);
+        std::printf("prompt fill: route %s (engine prefill %s), mtp catch-up %s\n", pf_large ? "large" : "windows",
+                    pf_large ? (E->prefill_is_big() ? "large-M" : "windows fallback") : "-", kv_catchup ? "kv" : "full");
         const auto hid = cfg.hidden;
         (void)hid;
 
         auto prefill = [&](std::uint32_t& anchor) {
             E->reset();
             S.reset();
-            for (std::size_t p = 0; p < prompt.size(); p += 32) {
-                const auto rows = std::uint32_t(std::min<std::size_t>(32, prompt.size() - p));
-                const bool last = p + rows == prompt.size();
-                S.prefill(prompt.data() + p, rows, last ? 0 : prompt[p + rows], last, &anchor);
+            const auto t0 = std::chrono::steady_clock::now();
+            double trunk_ms = -1.0;
+            if (pf_large) {
+                trunk_ms = S.prefill_big(prompt.data(), static_cast<std::uint32_t>(prompt.size()), &anchor);
+            } else {
+                for (std::size_t p = 0; p < prompt.size(); p += 32) {
+                    const auto rows = std::uint32_t(std::min<std::size_t>(32, prompt.size() - p));
+                    const bool last = p + rows == prompt.size();
+                    S.prefill(prompt.data() + p, rows, last ? 0 : prompt[p + rows], last, &anchor);
+                }
             }
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            // TTFT stage split: trunk (large route) and the MTP feed done inside the fill (the last ring rows are written
+            // lazily by the first draft); windows = one wall (trunk + feed interleaved)
+            if (trunk_ms >= 0.0)
+                std::printf("prefill[%s]: route large, %zu tokens in %.3f s = %.1f tok/s (trunk %.3f s = %.1f tok/s, mtp feed %.3f s, catch-up %s)\n",
+                            label.c_str(), prompt.size(), ms / 1000.0, 1000.0 * double(prompt.size()) / ms, trunk_ms / 1000.0,
+                            1000.0 * double(prompt.size()) / trunk_ms, (ms - trunk_ms) / 1000.0, kv_catchup ? "kv" : "full");
+            else
+                std::printf("prefill[%s]: route windows, %zu tokens in %.3f s = %.1f tok/s (catch-up %s)\n", label.c_str(), prompt.size(),
+                            ms / 1000.0, 1000.0 * double(prompt.size()) / ms, kv_catchup ? "kv" : "full");
         };
         // Warm every row graph (commit 0 discards: no state change) so capture cost is not in any wall.
         auto warm = [&]() {
@@ -470,7 +524,7 @@ int main(int argc, char** argv) {
                 // lookup, bookkeeping, launch gaps between them). Model passes by drafted depth k.
                 double sum_verify = 0, sum_draft = 0;
                 std::vector<std::uint64_t> k_hist(33, 0);
-                const auto calls0 = S.chain_calls(), rows0 = S.chain_rows();
+                const auto calls0 = S.chain_calls(), rows0 = S.chain_rows(), kv0 = S.chain_kv_calls();
                 const double t0 = now_ms();
                 while (out.size() < n_gen) {
                     sp::StepParams p;
@@ -513,13 +567,13 @@ int main(int argc, char** argv) {
                 const double mean_e = per_step.empty() ? 0.0 : double(out.size() - 1) / double(per_step.size());
                 const auto& st = drafter.stats();
                 std::printf("spec[%s]: %zu tokens, %zu steps (serial %llu copy %llu chain %llu), E mean %.2f p50 %.0f p90 %.0f, avg %.2f tok/s (%.3f ms/step), "
-                            "best-1s %.2f tok/s, hybrid blocks %llu (ext %llu/%llu), mtp calls %llu rows %llu\n",
+                            "best-1s %.2f tok/s, hybrid blocks %llu (ext %llu/%llu), mtp calls %llu rows %llu kv-only calls %llu\n",
                             tag.c_str(), out.size(), per_step.size(), (unsigned long long)by_source[0], (unsigned long long)by_source[1],
                             (unsigned long long)by_source[2], mean_e, quantile(per_step, 0.5), quantile(per_step, 0.9),
                             1000.0 * double(out.size() - 1) / wall, wall / double(std::max<std::size_t>(per_step.size(), 1)), best,
                             (unsigned long long)drafter.hybrid_blocks, (unsigned long long)drafter.hybrid_ext_accepted,
                             (unsigned long long)drafter.hybrid_ext_proposed, (unsigned long long)(S.chain_calls() - calls0),
-                            (unsigned long long)(S.chain_rows() - rows0));
+                            (unsigned long long)(S.chain_rows() - rows0), (unsigned long long)(S.chain_kv_calls() - kv0));
                 std::printf("prelaunch[%s]: %s, pre-launched steps %llu of %zu\n", tag.c_str(), prelaunch ? "on" : "off",
                             (unsigned long long)spec.prelaunched_steps(), per_step.size());
                 const double steps_n = double(std::max<std::size_t>(per_step.size(), 1));
@@ -533,6 +587,28 @@ int main(int argc, char** argv) {
                 if (arm.subset) std::printf("draft[%s]: %s\n", tag.c_str(), draft_rows->describe().c_str());
                 E->set_draft_rows(nullptr);
                 if (!ids_out.empty()) write_ids(tag.substr(0, tag.find('/')) + ".spec-" + arm.tag + "-p" + std::to_string(pair) + ".ids", out);
+                if (!mtp_kv_dump.empty() && S.has_chain()) {
+                    // The prompt rows of the MTP K/V (the only rows a K/V-only catch-up chunk writes; decode catch-up ends
+                    // in a full call in both modes): raw bf16 bits K then V, head-major; FNV-1a 64 of each printed.
+                    const auto P = static_cast<std::uint32_t>(prompt.size());
+                    const std::size_t n = std::size_t(E->config().kv_heads) * P * E->config().head_dim;
+                    std::vector<std::uint16_t> kb(n), vb(n);
+                    E->mtp_kv_read(0, P, kb.data(), vb.data());
+                    const auto fnv = [](const std::vector<std::uint16_t>& b) {
+                        std::uint64_t h = 1469598103934665603ull;
+                        for (const std::uint16_t w : b)
+                            for (int i = 0; i < 2; ++i) h = (h ^ ((w >> (8 * i)) & 0xffu)) * 1099511628211ull;
+                        return h;
+                    };
+                    const std::string f = mtp_kv_dump + "/" + tag.substr(0, tag.find('/')) + ".mtpkv-" + arm.tag + "-p" + std::to_string(pair) + ".bin";
+                    std::ofstream o(f, std::ios::binary);
+                    o.write(reinterpret_cast<const char*>(kb.data()), std::streamsize(n * 2));
+                    o.write(reinterpret_cast<const char*>(vb.data()), std::streamsize(n * 2));
+                    if (!o) throw std::runtime_error("cannot write " + f);
+                    std::printf("mtpkv[%s]: rows %u kv_heads %u head_dim %u catch-up %s k %016llx v %016llx\n", tag.c_str(), P,
+                                E->config().kv_heads, E->config().head_dim, kv_catchup ? "kv" : "full",
+                                (unsigned long long)fnv(kb), (unsigned long long)fnv(vb));
+                }
                 if (!ref.empty()) {
                     std::printf("EXACT[%s]: %s (%zu tokens compared, %zu mismatches)\n", tag.c_str(), bad == 0 ? "PASS" : "FAIL",
                                 std::min(out.size(), ref.size()), bad);
