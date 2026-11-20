@@ -4,6 +4,7 @@
 // this drafter replaces its criteria: exact 2..16 token suffix with a majority vote, a cold-start prior,
 // proposals after any confident prefix (including none), and copy-first chains that skip predictor
 // forwards. Every candidate still passes the exact target verifier.
+#include "strix/context_key_index.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -106,16 +107,12 @@ public:
     std::vector<std::uint32_t> lookup(std::span<const std::uint32_t> extra, std::size_t length,
         std::uint32_t& suffix, std::uint32_t& support, std::uint32_t* occurrences = nullptr) const;
 private:
-    struct Key {
-        std::uint64_t hash; std::uint32_t n;
-        bool operator==(const Key& o) const noexcept { return hash == o.hash && n == o.n; }
-    };
-    struct KeyHash { std::size_t operator()(const Key& k) const noexcept { return static_cast<std::size_t>(k.hash ^ (k.n * 0x9e3779b97f4a7c15ULL)); } };
     void push(std::uint32_t token);
     [[nodiscard]] static std::size_t cell(std::uint32_t suffix, bool unanimous, std::size_t row) noexcept;
     MtpContextDraftConfig config_;
     std::vector<std::uint32_t> context_;
-    std::unordered_map<Key, std::vector<std::uint32_t>, KeyHash> index_;
+    // Ends of every min_suffix-token key in context_; longer suffixes are measured on its candidates.
+    ContextKeyIndex index_;
     std::vector<double> right_, tried_;
     bool started_ = false, wide_ = false;
     // copy/edit: context transitions (preceding token, token) the output replaced after a long unanimous anchor (an
