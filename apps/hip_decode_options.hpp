@@ -1138,7 +1138,11 @@ inline void validate_resolved_teacher_forced_score(const Options& options, std::
         return "unqualified-route-requires-STRIX_QSA_MTP_POOL=1";
     if (!qpf2k::long_context_item_enabled("STRIX_QSA_DECODE_POOL_BF16",gsq)) return "bf16-disabled";
     if (o.execution.mode==DecodeExecutionMode::graph || o.qsa_hierarchical_selection) return "unsupported-control";
-    if (!o.mtp.cohort.empty() || !o.mtp.copy_wide_rows.empty()) return "unconverted-writer-span";
+    // Wide copy cycles compose: their tiled owner never leases the pool (committed_pool is bound only on non-prefill
+    // owners), the next verify window leases certified at the new frontier and the lazy build refills the gap from
+    // the tiled rows' raw bytes; an abandoned cycle leaves only non-committed blocks behind. The CLI cohort keeps the
+    // decline (its planner charges one pool for every member).
+    if (!o.mtp.cohort.empty()) return "unconverted-writer-span";
     if (o.rotary.mode()==RotaryMode::yarn &&
         (!o.context_tokens || o.context_tokens>o.rotary.effective_max() ||
          o.rotary.factor()!=(o.context_tokens<=524288U?2U:4U))) return "unqualified-rotary";

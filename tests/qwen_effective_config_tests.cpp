@@ -5096,8 +5096,11 @@ int main(int argc, char** arguments) {
             }
         }
         mtp_pool.http_serve=true;mtp_pool.qsa_mtp_pool_explicit_opt_in=true;
-        mtp_pool.mtp.copy_wide_rows={32};expect(!qsa_mtp_pool_route(mtp_pool),"wide writers decline before allocation");
-        mtp_pool.mtp.copy_wide_rows.clear();mtp_pool.baseline=true;expect(!qsa_mtp_pool_route(mtp_pool),"baseline retains historical MTP");
+        mtp_pool.mtp.copy_wide_rows={32,16};
+        expect(qsa_mtp_pool_route(mtp_pool) && qsa_mtp_pool_decline(mtp_pool)==nullptr,"wide copy rows keep the pool");
+        mtp_pool.mtp.cohort.resize(1);
+        expect(std::string_view(qsa_mtp_pool_decline(mtp_pool))=="unconverted-writer-span","the CLI cohort still declines");
+        mtp_pool.mtp.cohort.clear();mtp_pool.mtp.copy_wide_rows.clear();mtp_pool.baseline=true;expect(!qsa_mtp_pool_route(mtp_pool),"baseline retains historical MTP");
         // Serial decode pool route: plain append-only CLI only; every multi-request or rewriting route is excluded.
         const auto route = [&](std::vector<std::string> extra) {
             std::vector<std::string> args{"decoder","target.gguf","1","2","3","--generate","4"};
