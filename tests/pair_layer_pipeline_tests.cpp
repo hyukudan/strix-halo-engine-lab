@@ -100,7 +100,14 @@ struct Channel {
     void close() { std::lock_guard lock(mu); closed = true; cv.notify_all(); }
 };
 
-struct Result { std::vector<float> logits; std::vector<std::uint32_t> ids; std::string error; };
+struct Result {
+    std::vector<float> logits, dec_logits;  // last prompt row / last decode step (head stage)
+    std::vector<std::uint32_t> ids;
+    std::string error;
+    std::uint64_t guesses = 0, hits = 0;
+};
+// First-stage guess policies for pipelined speculation (DecodeOps::guess / rewind).
+enum class Guess { off, oracle, wrong, alternate, none };
 
 // Plain single-rank loop (not the driver): the reference.
 Result reference(const Weights& m, const std::vector<std::uint32_t>& prompt, unsigned width, unsigned gen) {
@@ -115,11 +122,13 @@ Result reference(const Weights& m, const std::vector<std::uint32_t>& prompt, uns
         t.range(0, m.layers, &tok, 1U, true);
         r.ids.push_back(t.top());
     }
+    r.dec_logits = t.logits;
     return r;
 }
 
 std::vector<Result> run_chain(const Weights& m, const std::vector<std::uint32_t>& prompt, unsigned width, unsigned gen,
-                              const std::vector<std::uint32_t>& cuts, std::uint64_t bad_identity_stage = ~0ULL) {
+                              const std::vector<std::uint32_t>& cuts, std::uint64_t bad_identity_stage = ~0ULL,
+                              Guess guess = Guess::off, const std::vector<std::uint32_t>* truth = nullptr, bool broken_rewind = false) {
     const unsigned stages = unsigned(cuts.size() - 1U);
     std::vector<std::unique_ptr<Channel>> links;
     for (unsigned i = 0; i + 1U < stages; ++i) links.push_back(std::make_unique<Channel>());
@@ -162,7 +171,32 @@ std::vector<Result> run_chain(const Weights& m, const std::vector<std::uint32_t>
                 d.top = [&] { return t.top(); };
                 d.export_row = [&](std::span<std::byte> b) { std::memcpy(b.data(), t.x.data(), row_bytes); };
                 d.import_row = [&](std::span<const std::byte> b) { std::memcpy(t.x.data(), b.data(), row_bytes); };
-                out[s].ids = layers::decode(p, p.head() ? t.top() : 0U, gen, up ? &lu : nullptr, down ? &ld : nullptr, d).ids;
+                // The toy's state is recurrent (not position-indexed), so its rewind restores a snapshot taken before
+                // every forward; broken_rewind keeps the guessed row's state (negative control: must be detected).
+                std::vector<float> snap_rec, snap_hist;
+                unsigned snap_committed = 0, calls = 0;
+                if (s == 0U && guess != Guess::off) {
+                    d.forward = [&](std::uint32_t tok, bool head) {
+                        snap_rec = t.rec; snap_hist = t.hist; snap_committed = t.committed;
+                        t.range(p.first(), p.last(), &tok, 1U, head);
+                    };
+                    d.guess = [&](std::uint32_t, std::uint32_t& next) {
+                        const unsigned c = calls++;   // call c guesses ids[c + 1]
+                        const std::uint32_t right = truth->at(c + 1U);
+                        switch (guess) {
+                        case Guess::oracle: next = right; return true;
+                        case Guess::wrong: next = (right + 1U) % V; return true;
+                        case Guess::alternate: next = c % 2U == 0U ? right : (right + 3U) % V; return true;
+                        default: return false;
+                        }
+                    };
+                    d.rewind = [&] { if (!broken_rewind) { t.rec = snap_rec; t.hist = snap_hist; t.committed = snap_committed; } };
+                }
+                const auto st = layers::decode(p, p.head() ? t.top() : 0U, gen, up ? &lu : nullptr, down ? &ld : nullptr, d);
+                out[s].ids = st.ids;
+                out[s].guesses = st.guesses;
+                out[s].hits = st.hits;
+                if (p.head()) out[s].dec_logits = t.logits;
             } catch (const std::exception& e) {
                 out[s].error = e.what();
                 if (s) links[s - 1U]->close();
@@ -207,6 +241,38 @@ int main() {
                "cuts " + text(cuts) + " last-row logits bytes differ from one rank");
         ++checked;
     }
+    // pipelined speculation on the first stage: every guess policy gives the one-rank ids and decode logits bytes;
+    // the stage-0 counters match the policy; a rewind that keeps the guessed state is detected.
+    const unsigned sgen = 12;
+    const auto sref = reference(m, prompt, width, sgen);
+    std::vector<std::vector<std::uint32_t>> spec_plans;
+    for (std::uint32_t k = 1; k < 7; ++k) spec_plans.push_back({0, k, 7});
+    spec_plans.push_back({0, 2, 5, 7});
+    unsigned spec_checked = 0;
+    for (const auto& cuts : spec_plans)
+        for (const auto g : {Guess::oracle, Guess::wrong, Guess::alternate, Guess::none}) {
+            const auto r = run_chain(m, prompt, width, sgen, cuts, ~0ULL, g, &sref.ids);
+            const std::string tag = "spec cuts " + text(cuts) + " policy " + std::to_string(int(g));
+            for (std::size_t s = 0; s < r.size(); ++s) {
+                expect(r[s].error.empty(), tag + " stage " + std::to_string(s) + " error: " + r[s].error);
+                expect(r[s].ids == sref.ids, tag + " stage " + std::to_string(s) + " ids differ from one rank");
+            }
+            const auto& dl = r.back().dec_logits;
+            expect(dl.size() == sref.dec_logits.size() && std::memcmp(dl.data(), sref.dec_logits.data(), dl.size() * 4U) == 0,
+                   tag + " last decode logits bytes differ from one rank");
+            const std::uint64_t n = sgen - 2U;  // guesses: steps 1 .. sgen-2
+            const std::uint64_t want_g = g == Guess::none ? 0U : n;
+            const std::uint64_t want_h = g == Guess::oracle ? n : g == Guess::alternate ? (n + 1U) / 2U : 0U;
+            expect(r[0].guesses == want_g && r[0].hits == want_h,
+                   tag + " counters guesses " + std::to_string(r[0].guesses) + " hits " + std::to_string(r[0].hits));
+            ++spec_checked;
+        }
+    {
+        const auto r = run_chain(m, prompt, width, sgen, {0, 4, 7}, ~0ULL, Guess::wrong, &sref.ids, true);
+        const bool same = r.back().ids == sref.ids && r.back().dec_logits.size() == sref.dec_logits.size() &&
+                          std::memcmp(r.back().dec_logits.data(), sref.dec_logits.data(), sref.dec_logits.size() * 4U) == 0;
+        expect(!same, "negative control: a rewind that keeps the guessed row's state must change ids or logits");
+    }
     // a stage with another model/plan identity is refused by name (and nothing hangs)
     const auto bad = run_chain(m, prompt, width, gen, {0, 3, 7}, 1U);
     expect(bad[1].error.find("seam header mismatch") != std::string::npos, "identity mismatch refused: got '" + bad[1].error + "'");
@@ -215,6 +281,7 @@ int main() {
     try { layers::Placement{{0, 3, 3, 7}, 0}.check(); } catch (const std::invalid_argument&) { threw = true; }
     expect(threw, "non-increasing cuts refused");
     if (failures) { std::fprintf(stderr, "%d failure(s)\n", failures); return 1; }
-    std::printf("PASS: layer pipeline over N ranks (%u plans, N=1..4, ids and logits bytes equal to one rank)\n", checked);
+    std::printf("PASS: layer pipeline over N ranks (%u plans, N=1..4, ids and logits bytes equal to one rank; "
+                "%u pipelined-speculation runs equal, negative control detected)\n", checked, spec_checked);
     return 0;
 }
