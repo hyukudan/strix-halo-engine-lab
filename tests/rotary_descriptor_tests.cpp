@@ -123,7 +123,7 @@ int main() {
         require(validate_qwen_rotary_request(2,true,c,false)==two,"explicit short/cross-native f2 geometry");
     require(validate_qwen_rotary_request(4,true,1048576,false)==four,"f4 final extent");
     rejects({"decoder","model.gguf","1","--rope-yarn","2","--context","300000","--http-serve"},
-        "YaRN on HTTP serving not supported");
+        "YaRN HTTP serving requires the MTP route");
     rejects({"decoder","model.gguf","1","2","--rope-yarn","2","--context","300000","--teacher-forced-score","--generate","1"},
         "YaRN with teacher scoring not yet qualified");
     require(parse({"decoder","model.gguf","1","--rope-yarn=4","--context","1048576","--print-effective-config"}).print_effective_config,

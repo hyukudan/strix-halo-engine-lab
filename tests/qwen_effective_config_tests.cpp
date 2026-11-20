@@ -1957,7 +1957,7 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
             expect(resolve(forbidden,memory).error=="YaRN MTP cohort/wide/sampling/metadata routes are not supported",
                 "cert control preserves the bounded explicit MTP route refusal");
             forbidden=cli; forbidden.options.http_serve=true;
-            expect(resolve(forbidden,memory).error=="YaRN on HTTP serving not supported","cert control preserves named HTTP refusal");
+            expect(resolve(forbidden,memory).error=="YaRN HTTP serving requires the MTP route","cert control preserves named HTTP refusal");
             forbidden=cli; forbidden.options.prefix_cache_roundtrip=true;
             expect(resolve(forbidden,memory).error=="YaRN requires plain serial CLI without cache, replay or recording","cert control preserves named cache refusal");
         }
@@ -2248,12 +2248,44 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
         auto bad = request;
         const char* reason = nullptr;
         if (route == 0) { bad.options.mtp.enabled = true; bad.options.mtp.sample_options=true; reason = "YaRN MTP cohort/wide/sampling/metadata routes are not supported"; }
-        if (route == 1) { bad.options.http_serve = true; reason = "YaRN on HTTP serving not supported"; }
+        if (route == 1) { bad.options.http_serve = true; reason = "YaRN HTTP serving requires the MTP route"; }
         if (route == 2) { bad.options.teacher_forced_score = true; reason = "YaRN with teacher scoring not yet qualified"; }
         if (route == 3) { bad.options.gdn_islands = true; reason = "YaRN graph capture path not yet qualified"; }
         if (route == 4) { bad.options.session_save = "checkpoint"; reason = "YaRN with session save/restore not yet qualified"; }
-        if (route == 5) { bad.options.prefix_cache_host_bytes = 4096; reason = "YaRN with prefix state cache not yet qualified"; }
+        if (route == 5) { bad.options.prefix_cache_dir = "cache"; reason = "YaRN prefix state cache requires an explicit --prefix-cache-host-bytes"; }
         expect(resolve(bad,memory).error == reason,"YaRN named route refusal");
+    }
+    {
+        // QFN-3: YaRN serving opt-in. The single greedy HTTP MTP route with an explicit prefix budget is admitted by
+        // the shared refusal; batch/cohort, sampling and unaudited HTTP controls keep named refusals. The rotary
+        // descriptor itself is bound by the cache identities (prefix_dma_tests, session_state_cache_tests).
+        Options serve;
+        serve.rotary = RotaryDescriptor::yarn(2); serve.context_tokens = 524288U; serve.context_explicit = true;
+        serve.mtp.enabled = true; serve.http_serve = true; serve.http_batch_explicit = true;
+        serve.prefix_cache_host_bytes = UINT64_C(8) << 30U;
+        serve.supplied_options = {"--rope-yarn","--context","--http-serve","--http-batch","--http-port","--prefix-cache-host-bytes"};
+        expect(yarn_route_refusal(serve).empty(), "YaRN single HTTP MTP route with explicit prefix budget is admitted");
+        auto batch = serve; batch.http_batch_explicit = false;
+        expect(yarn_route_refusal(batch).find("--http-batch 0") != std::string::npos, "YaRN HTTP needs the explicit single route");
+        auto capped = serve; capped.http_batch = capped.http_batch_cap = 2U;
+        expect(yarn_route_refusal(capped).find("--http-batch 0") != std::string::npos, "YaRN HTTP batch slots refuse");
+        auto sampled = serve; sampled.http_sampling = "sample";
+        expect(yarn_route_refusal(sampled) == "YaRN HTTP sampling not supported (greedy only)", "YaRN HTTP sampling refuses");
+        auto fast = serve; fast.supplied_options.insert("--http-selection-fast");
+        expect(yarn_route_refusal(fast) == "YaRN MTP explicit target override not supported: --http-selection-fast",
+            "unaudited HTTP selection control refuses by name");
+        auto implicit = serve; implicit.prefix_cache_host_bytes = 0; implicit.prefix_cache_dir = "cache";
+        expect(yarn_route_refusal(implicit) == "YaRN prefix state cache requires an explicit --prefix-cache-host-bytes",
+            "YaRN cache budget is explicit only");
+        auto band = serve; band.context_tokens = 600000U;
+        expect(yarn_route_refusal(band) == "YaRN MTP requires f2 at C<=524288 and f4 at C<=1048576", "factor band unchanged");
+        // One resolver: the same request on the CLI and on the single HTTP route takes the same QSA MTP pool decision.
+        auto cli = serve; cli.http_serve = false; cli.http_batch_explicit = false; cli.prefix_cache_host_bytes = 0;
+        auto http = serve; http.prefix_cache_host_bytes = 0;
+        const char* cli_pool = qsa_mtp_pool_decline(cli);
+        const char* http_pool = qsa_mtp_pool_decline(http);
+        expect((cli_pool == nullptr) == (http_pool == nullptr) &&
+            (!cli_pool || std::string_view(cli_pool) == std::string_view(http_pool)), "YaRN CLI and HTTP single resolve the same pool route");
     }
     {
         auto unknown = request; unknown.environment["STRIX_QPF2K_SHADOW_MAX_TOKENS"] = "300000";
