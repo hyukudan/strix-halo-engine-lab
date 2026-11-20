@@ -346,12 +346,23 @@ __device__ __forceinline__ const typename Site::Input* direct_input(const Site& 
                ::strix::decode::head_input_offset(first_out, site.head_outputs, site.input_stride);
     else return static_cast<const Input*>(site.input[r]);
 }
+// Paired store (strix/decode_projection_group.hpp pair_unit): a one-row Site with pair_first, pair_half and
+// store_pair(unit, value, next) walks the units from pair_first on interleaved (gate j, up j adjacent), so the
+// store of an even paired unit receives its partner's value (`next`) and can apply a GLU to both: one launch for
+// gate + up + GLU. Every unit keeps its row, operands and tree (the tree adds lane l to lane l ^ D at every level
+// whatever the unit's slot in the wave), so each value is bitwise the one-member launch's. Direct form only;
+// launch() takes no other path for such a Site. Other Sites compile to the same code.
+template <class Site> constexpr bool paired_store_of() {
+    return requires(const Site& s, std::uint32_t u, float v) { s.pair_first; s.pair_half; s.store_pair(u, v, v); };
+}
 
 // Staged: every block copies all rows to LDS once, then loops over output groups.
 // Direct: one output group per wave.
 template <class Site, unsigned Outs, bool Staged, bool Q6 = false>
 __global__ __launch_bounds__(kThreads) void project_rows_kernel(Site site) {
     static_assert(!head_input_of<Site>() || (!Staged && !Q6), "head input: direct non-Q6 form only");
+    static_assert(!paired_store_of<Site>() || (!Staged && !Q6 && Site::rows == 1U && Outs % 2U == 0U),
+                  "paired store: one-row direct Q8_0 form, an even number of outputs per wave");
     using Input = typename Site::Input;
     using Format = RowsFormat<Q6>;
     constexpr unsigned Rows = Site::rows, Pairs = Outs * Rows, N = pow2u(Pairs) * 8U, Depth = prefetch_of<Site, Staged>();
@@ -365,7 +376,14 @@ __global__ __launch_bounds__(kThreads) void project_rows_kernel(Site site) {
     }
     for (std::uint32_t g = blockIdx.x * kWaves + threadIdx.x / 32U; g < groups; g += Staged ? gridDim.x * kWaves : groups) {
         typename Format::Row w[Outs];
-        Format::rows(site.segments, g, site.outputs, width, w);
+        if constexpr (paired_store_of<Site>()) {
+#pragma unroll
+            for (unsigned o = 0; o < Outs; ++o) {
+                unsigned m; std::uint32_t row;
+                w[o] = segment_row(site.segments, ::strix::decode::pair_unit(min(g * Outs + o, site.outputs - 1U), site.pair_first,
+                    site.pair_half), width, m, row);
+            }
+        } else Format::rows(site.segments, g, site.outputs, width, w);
         float v[N]{};
         typename Format::template Fetch<Outs> next[Depth];
 #pragma unroll
@@ -395,9 +413,16 @@ __global__ __launch_bounds__(kThreads) void project_rows_kernel(Site site) {
             }
         }
         reduce<Site, N, 8U>(v, lane);
-        store_pairs<pow2u(Pairs)>(v[0], lane, [&](unsigned pair, float value) {
-            if (pair < Pairs && g * Outs + pair / Rows < site.outputs) site.store(g * Outs + pair / Rows, pair % Rows, value);
-        });
+        if constexpr (paired_store_of<Site>()) {
+            // Pair p's value is on lane p * (32 / P), the next unit's on the next such lane (every lane shuffles).
+            const float partner = __shfl_down(v[0], 32U / pow2u(Pairs));
+            store_pairs<pow2u(Pairs)>(v[0], lane, [&](unsigned pair, float value) {
+                if (pair < Pairs && g * Outs + pair < site.outputs) site.store_pair(g * Outs + pair, value, partner);
+            });
+        } else
+            store_pairs<pow2u(Pairs)>(v[0], lane, [&](unsigned pair, float value) {
+                if (pair < Pairs && g * Outs + pair / Rows < site.outputs) site.store(g * Outs + pair / Rows, pair % Rows, value);
+            });
     }
 }
 
@@ -2131,6 +2156,21 @@ template <class Site> void launch_lane(const Site& site, hipStream_t stream) {
 // packet's barrier bit: the caller guarantees the projection neither reads nor writes what
 // the previously queued kernel touches, so it may start while that kernel still runs.
 // a8 selects the dense A8 profile arithmetic (launch_dense_a8).
+// Paired-store Sites (paired_store_of): the interleaved walk exists in the direct Q8_0 form only, so this overload
+// launches that form and nothing else (no A8 / Q6P32 / staged / VOPD / IU4 path is instantiated for them).
+template <class Site>
+    requires(paired_store_of<Site>())
+void launch(const Site& site, bool a8, hipStream_t stream, bool any_order = false) {
+    constexpr unsigned Outs = outs_of<Site, false>();
+    if (a8) throw std::invalid_argument("q8_rows paired store: no dense A8 form");
+    if (site.pair_first % 2U != 0U || site.pair_first + 2U * site.pair_half != site.outputs)
+        throw std::invalid_argument("q8_rows paired store: pair_first even and pair_first + 2 pair_half == outputs");
+    const unsigned blocks = ((site.outputs + Outs - 1U) / Outs + kWaves - 1U) / kWaves;
+    constexpr auto kernel = project_rows_kernel<Site, Outs, false>;
+    if (any_order)
+        hipExtLaunchKernelGGL(kernel, dim3(blocks), dim3(kThreads), 0U, stream, nullptr, nullptr, hipExtAnyOrderLaunch, site);
+    else hipLaunchKernelGGL(kernel, dim3(blocks), dim3(kThreads), 0U, stream, site);
+}
 template <class Site> void launch(const Site& site, bool a8, hipStream_t stream, bool any_order = false) {
     static_assert(!head_input_of<Site>(), "q8_rows: head-input Sites launch through launch_heads");
 #if defined(STRIX_HAS_EXPERIMENTAL_DENSE_TRELLIS)

@@ -22,6 +22,7 @@
 #include "moe_core/route_wave_kernel.hpp"
 #include "moe_core/route_tap_hip.hpp"
 #include "ops/glu/glu_device.hpp"
+#include "ops/glu/q8_rows_glu_pair.hpp"
 #include "ops/norm/norm_presets.hpp"
 #include "ops/rope/rope_device.hpp"
 #include "strix/a8_row_pitch.hpp"
@@ -77,6 +78,11 @@ constexpr hcs::Spec kHead = preset::hc_spec(hcs::Site::head);
 // RMSNorm of this model: the BF16 module's double rounding (ops/norm OutputForm::bf16_double), F32 weights, the declared
 // square root: the shared preset.
 using NormTraits = strix::ops::norm::DeclaredF32Traits<strix::ops::norm::OutputForm::bf16_double>;
+
+// Decode FFN input group (STRIX_DECODE_FUSE, default on; 0 = the separate launches): the Q8_0 Linears that read xn in ONE
+// q8_rows launch, the shared GLU projection group (ops/glu/q8_rows_glu_pair.hpp): MoE layers latent down -> z plus the
+// shared expert gate / up -> act = swiglu; the dense layer gate / up -> act. Bits unchanged (bf16 Linear store, DeclaredExp,
+// no clamp: the separate stores and swiglu launch it replaces), 3 (dense layer: 2) launches fewer.
 
 // Sparse MLA flash policies (strix/hy4/presets.hpp dsa / swa): 32 heads per group.
 struct DsaSpec {
@@ -213,6 +219,9 @@ struct Forward::Impl {
     LoadReport report;
     StepTimes times;
     bool timing = false;
+    // STRIX_DECODE_FUSE (same switch name and default as the Qwen HIP decode): FFN input group + combine with the rounded
+    // expert outputs (bits unchanged); 0 = the separate launches.
+    bool decode_fuse = strix::envcfg::flag("STRIX_DECODE_FUSE", true);
 
     std::vector<DevMem> mem;  // every allocation (weights, caches, workspace)
     std::map<std::string, Tensor> w;
@@ -832,18 +841,45 @@ struct Forward::Impl {
         check(hipGetLastError(), "BF16 experts launch");
     }
 
+    // FFN input group of layer l (glu::Q8RowsGluPair, see above): [plain member ->] plain_out, gate / up -> act = swiglu (one launch). Falls back to
+    // one linear() per member + the swiglu launch when STRIX_DECODE_FUSE=0 or a member is not a plain Q8_0 Linear (a FAST class
+    // that replaces a member's weights takes this fallback too).
+    void ffn_input_group(std::uint32_t l, const char* plain, std::uint32_t plain_outputs, float* plain_out, const char* gate_name,
+                         const char* up_name, std::uint32_t ff) {
+        const std::uint32_t h = c.hidden;
+        const std::string pn = plain ? blk(l, plain) : std::string(), gn = blk(l, gate_name), un = blk(l, up_name);
+        const auto plain_ok = [&](const std::string& name, std::uint32_t outputs) {
+            const auto& tw = t(name);
+            if (tw.dims.at(0) != h || tw.bytes != row_bytes(tw.type, h) * outputs) throw std::runtime_error("hy4 hip forward: shape of " + name);
+            return tw.type == 8U;
+        };
+        bool grouped = decode_fuse && store_epilogue && h % 32U == 0U && (plain_outputs % 2U) == 0U;
+        if (plain) grouped = plain_ok(pn, plain_outputs) && grouped;
+        grouped = plain_ok(gn, ff) && plain_ok(un, ff) && grouped;
+        if (!grouped) {
+            if (plain) linear(pn, xn, h, plain_outputs, plain_out);
+            linear(gn, xn, h, ff, g);
+            linear(un, xn, h, ff, up);
+            glu::launch_swiglu<glu::DeclaredExp, glu::Round::bf16>(g, up, ff, glu::no_clamp, act, s);
+            return;
+        }
+        const auto site = glu::q8_rows_glu_pair<glu::DeclaredExp, glu::Round::bf16>(xn, h, plain ? t(pn).p : nullptr, plain_outputs, plain_out,
+                                                                              t(gn).p, t(un).p, ff, act, glu::no_clamp);
+        strix::q8_rows::launch(site, false, s);
+        check(hipGetLastError(), "ffn input group launch");
+    }
+
     void ffn(std::uint32_t l) {  // xn -> f
         const std::uint32_t h = c.hidden;
         if (dense_of(l)) {
-            linear(blk(l, "ffn_gate.weight"), xn, h, c.dense_ff, g);
-            linear(blk(l, "ffn_up.weight"), xn, h, c.dense_ff, up);
-            glu::launch_swiglu<glu::DeclaredExp, glu::Round::bf16>(g, up, c.dense_ff, glu::no_clamp, act, s);
+            ffn_input_group(l, nullptr, 0U, nullptr, "ffn_gate.weight", "ffn_up.weight", c.dense_ff);  // one node: gate / up -> act in one launch
             linear(blk(l, "ffn_down.weight"), act, c.dense_ff, h, f);
         } else {
             linear(blk(l, "ffn_gate_inp.weight"), xn, h, c.experts, rlog, false);
             strix::moe_core::enqueue_route_wave<preset::route, glu::DeclaredExp>(rlog, t(blk(l, "exp_probs_b.bias")).f(), ids, rw, 1U, s);
             strix::moe_core::route_tap(l, 1U, c.top_k, c.experts, ids, rw, s);  // FAST gate v2 tap (inactive: no copy)
-            linear(blk(l, "ffn_routed_down.weight"), xn, h, c.latent, z);
+            // latent down -> z and the shared expert's gate / up -> act, one launch (the shared swiglu moves here)
+            ffn_input_group(l, "ffn_routed_down.weight", c.latent, z, "ffn_gate_shexp.weight", "ffn_up_shexp.weight", c.shared_ff);
             const auto& wg = t(blk(l, "ffn_gate_exps.weight"));
             const auto& wu = t(blk(l, "ffn_up_exps.weight"));
             const auto& wd = t(blk(l, "ffn_down_exps.weight"));
@@ -878,12 +914,14 @@ struct Forward::Impl {
                 a8::enqueue_down_rawdots(dq, db, s);
             }
             const std::uint64_t K = c.top_k, L = c.latent;
-            glu::launch_epilogue<glu::Round::bf16>(rawdots, nullptr, L, K * L, rawdots, s);  // each expert's down Linear output
-            strix::moe_core::enqueue_combine<strix::moe::CombineForm::bf16_steps, 16U, 1536U>(rw, rawdots, nullptr, acc, 1U, s);
+            // each expert's down Linear output is its bf16 rounding: read so by the combine (decode_fuse, one launch fewer) or
+            // stored here
+            if (!decode_fuse) glu::launch_epilogue<glu::Round::bf16>(rawdots, nullptr, L, K * L, rawdots, s);
+            if (decode_fuse)
+                strix::moe_core::enqueue_combine_rounded_eo<strix::moe::CombineForm::bf16_steps, 16U, 1536U>(rw, rawdots, nullptr, acc, 1U, s);
+            else
+                strix::moe_core::enqueue_combine<strix::moe::CombineForm::bf16_steps, 16U, 1536U>(rw, rawdots, nullptr, acc, 1U, s);
             linear(blk(l, "ffn_routed_up.weight"), acc, c.latent, h, routed);
-            linear(blk(l, "ffn_gate_shexp.weight"), xn, h, c.shared_ff, g);
-            linear(blk(l, "ffn_up_shexp.weight"), xn, h, c.shared_ff, up);
-            glu::launch_swiglu<glu::DeclaredExp, glu::Round::bf16>(g, up, c.shared_ff, glu::no_clamp, act, s);
             linear(blk(l, "ffn_down_shexp.weight"), act, c.shared_ff, h, shared);
             strix::moe_core::enqueue_combine<strix::moe::CombineForm::bf16_steps, 1U, 3072U>(nullptr, routed, shared, f, 1U, s);
         }
