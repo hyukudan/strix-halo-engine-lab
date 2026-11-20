@@ -181,7 +181,7 @@ void check_profile() {
     CHECK(rows({}, &st) == "0" && st == is(sp::Status::builtin, "qualified"));
     CHECK(rows({"--profile", "default"}, &st) == "0" && st == is(sp::Status::builtin, "qualified"));
     CHECK(rows({"--profile", "fast"}, &st) == "0" && st == is(sp::Status::pending, "qualified"));
-    CHECK(rows({"--profile", "fast", "--allow-pending"}, &st) == "2048" &&
+    CHECK(rows({"--profile", "fast", "--allow-pending"}, &st) == "4096" &&
           st.rfind(is(sp::Status::unqualified, "unqualified: prompt_rows"), 0) == 0);
     CHECK(rows({"--profile", "fast", "--prompt-rows", "512"}, &st) == "512" &&
           st == is(sp::Status::explicit_cli, "unqualified: prompt_rows"));
@@ -231,8 +231,10 @@ void check_profile_regime() {
     CHECK(run(hp::Device::unknown, one, 17, {"--profile", "fast"}, &st) == "0" && st == "pending / qualified +reason");
     CHECK(run(g, hp::Topology::pair, 17, {"--profile", "fast"}, &st) == "0" && st == "pending / qualified +reason");
     CHECK(run(g, one, 17, {}, &st) == "0" && st == "builtin / qualified");
-    CHECK(run(g, one, 17, {"--prompt-rows", "2048"}, &st) == "2048" && st == "explicit-cli / qualified");
-    CHECK(run(g, one, 32568, {"--prompt-rows", "2048"}, &st) == "2048" && st == "explicit-cli / qualified");
+    CHECK(run(g, one, 17, {"--prompt-rows", "4096"}, &st) == "4096" && st == "explicit-cli / qualified");
+    CHECK(run(g, one, 32568, {"--prompt-rows", "4096"}, &st) == "4096" && st == "explicit-cli / qualified");
+    // the shared resolver qualifies only the table value: 2048 (same bits) runs stamped unqualified
+    CHECK(run(g, one, 17, {"--prompt-rows", "2048"}, &st) == "2048" && st == "explicit-cli / unqualified: prompt_rows");
     CHECK(run(g, one, gated + 1U, {"--prompt-rows", "2048"}, &st) == "2048" && st == "explicit-cli / unqualified: prompt_rows");
     CHECK(run(g, one, 17, {"--prompt-rows", "512"}, &st) == "512" && st == "explicit-cli / unqualified: prompt_rows");
     CHECK(hp::device_of("gfx1151:sramecc+:xnack-") == g && hp::device_of("gfx1100") == hp::Device::unknown);
