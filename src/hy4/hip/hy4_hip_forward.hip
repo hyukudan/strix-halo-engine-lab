@@ -36,6 +36,7 @@
 #include "strix/hip_ggml_weight_formats.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
 #include "strix/hip_mtp_draft_head.hpp"
+#include "xport/bf16_wire_hip.hpp"
 #include "../../hip_q8_rows_sites.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/hip_moe_a8_down.hpp"
@@ -66,6 +67,8 @@ namespace glu = strix::ops::glu;
 namespace mla = strix::attn_core::sparse::mla;
 namespace a8 = strix::moe_q4k_a8;
 namespace htp = strix::hy4::tp;
+namespace bf16_wire = strix::pair::bf16_wire;
+namespace xbw = strix::xport::bf16_wire;
 
 void check(hipError_t e, const char* what) { strix::hip_check_prefixed("hy4 hip forward: ", e, what); }
 
@@ -288,6 +291,13 @@ struct Forward::Impl {
         std::size_t rows_slot = 0;
         std::uint32_t flip = 0;
         std::uint32_t* tids = nullptr;
+        // exact bfloat16 wire (strix/pair/bf16_wire.hpp; STRIX_HY4_TP_JOIN_BF16, default on): every join but the logits'
+        // carries BF16-rounded shares, so only their high halves cross; two [2][wire_slot] wire buffers used alternately
+        bool bf16 = true;
+        std::uint16_t* wire = nullptr;
+        std::size_t wire_slot = 0;
+        std::uint32_t wflip = 0;
+        std::uint16_t* rows_wire = nullptr;  // the wire of the last tp_rows_swap (its tp_rows_place reads it)
     } tp;
     // The one-node form inside a TP rank for a scope: prefill (each rank runs the whole prompt) and the next-token block
     // (the drafter, rank 0 only). Both ranks hold the whole pack; no gather runs in the scope.
@@ -665,14 +675,34 @@ struct Forward::Impl {
         tp.gather.fn(tp.gather.ctx, s, buffer, slot_bytes, slot_bytes);
         ++tp.calls;
     }
+    // The next of the two wire buffers, for a join of `slot` values per rank.
+    std::uint16_t* tp_wire(std::size_t per_rank) {
+        if (per_rank > tp.wire_slot) throw std::logic_error("hy4 hip forward: tp join larger than its wire slot");
+        tp.wflip ^= 1U;
+        return tp.wire + std::size_t{tp.wflip} * 2U * tp.wire_slot;
+    }
+    // The join of a step share: `base` = [2][per_rank] FP32 (slot q = rank q's BF16-rounded share). Over the bfloat16 wire:
+    // this rank's slot packed (a word that is not a bfloat16 raises the flag: the pass refuses), the halves swapped, both
+    // slots widened back into `base` = the words of the FP32 gather. tp.bf16 off: the FP32 gather itself.
+    void tp_join(float* base, std::size_t per_rank) {
+        if (!tp.bf16) return tp_gather(base, per_rank * 4U);
+        std::uint16_t* const wbuf = tp_wire(per_rank);
+        check(xbw::enqueue_pack(base + tp.rank * per_rank, wbuf + tp.rank * per_rank, per_rank, flag, s), "tp join pack");
+        tp_gather(wbuf, bf16_wire::wire_bytes(per_rank));
+        check(xbw::enqueue_place({wbuf, per_rank, 0U, per_rank, per_rank, 1U, base, 2U * per_rank}, s), "tp join widen");
+    }
     void allocate_tp() {
-        if (tp.moe == nullptr) tp.moe = alloc<float>(2U * htp::moe(0U, c.top_k, c.latent, c.shared_ff).slot);
+        const std::size_t m = htp::moe(0U, c.top_k, c.latent, c.shared_ff).slot;
+        if (tp.moe == nullptr) tp.moe = alloc<float>(2U * m);
         if (vr.max != 0U && tp.rows == nullptr) {  // the largest join of a verify pass, per rank: o, f, dense act, MoE slot
-            const std::size_t m = htp::moe(0U, c.top_k, c.latent, c.shared_ff).slot;
             tp.rows_slot = std::size_t{vr.max} * std::max({std::size_t{32U} * c.v_head, std::size_t{c.hidden} / 2U,
                                                              std::size_t{c.dense_ff} / 2U, m});
             tp.rows = alloc<float>(4U * tp.rows_slot);
             tp.tids = alloc<std::uint32_t>(std::size_t{vr.max} * c.top_k);
+        }
+        if (tp.wire == nullptr) {  // the largest bf16 join: a verify pass's (rows_slot) or a step's (o, f, dense act, MoE)
+            tp.wire_slot = std::max({tp.rows_slot, std::size_t{32U} * c.v_head, std::size_t{c.hidden} / 2U, std::size_t{c.dense_ff} / 2U, m});
+            tp.wire = alloc<std::uint16_t>(4U * tp.wire_slot);
         }
     }
 
@@ -850,10 +880,10 @@ struct Forward::Impl {
             linear_groups(vb.p + h0 * vb_head, vb.type, vb_head, Hs, nullptr, Hs, olat + l0, kl, kl, vd, o + v0, vd);
         glu::launch_epilogue<glu::Round::bf16>(o + v0, nullptr, Hs * vd, std::size_t{Hs} * vd, o + v0, s);
         glu::launch_sigmoid_gate<glu::DeclaredExp, glu::Round::bf16>(o + v0, gate + v0, std::size_t{Hs} * vd, o + v0, s);
-        if (par) tp_gather(o, std::size_t{Hs} * vd * 4U);  // o = [rank 0 heads | rank 1 heads]: the one-node o
+        if (par) tp_join(o, std::size_t{Hs} * vd);  // o = [rank 0 heads | rank 1 heads]: the one-node o
         const auto fr = share(c.hidden);
         linear_rows(blk(l, "attn_output.weight"), o, H * vd, c.hidden, fr, f);
-        if (par) tp_gather(f, fr.count * 4U);
+        if (par) tp_join(f, fr.count);
         norm(f, t(blk(l, "post_attention_norm.weight")).f(), c.hidden, c.rms_eps, f);
         check(hipGetLastError(), "attention launch");
     }
@@ -890,9 +920,9 @@ struct Forward::Impl {
             linear_rows(blk(l, "ffn_gate.weight"), xn, h, c.dense_ff, fr, g);
             linear_rows(blk(l, "ffn_up.weight"), xn, h, c.dense_ff, fr, up);
             glu::launch_swiglu<glu::DeclaredExp, glu::Round::bf16>(g + fr.first, up + fr.first, fr.count, glu::no_clamp, act + fr.first, s);
-            if (par) tp_gather(act, fr.count * 4U);
+            if (par) tp_join(act, fr.count);
             linear_rows(blk(l, "ffn_down.weight"), act, c.dense_ff, h, hr, f);
-            if (par) tp_gather(f, hr.count * 4U);
+            if (par) tp_join(f, hr.count);
         } else {
             linear(blk(l, "ffn_gate_inp.weight"), xn, h, c.experts, rlog, false);
             strix::moe_core::enqueue_route_wave<preset::route, glu::DeclaredExp>(rlog, t(blk(l, "exp_probs_b.bias")).f(), ids, rw, 1U, s);
@@ -946,7 +976,7 @@ struct Forward::Impl {
                 linear_rows(blk(l, "ffn_up_shexp.weight"), xn, h, c.shared_ff, sr, up);
                 glu::launch_swiglu<glu::DeclaredExp, glu::Round::bf16>(g + sr.first, up + sr.first, sr.count, glu::no_clamp,
                                                                       tp.moe + m.act_mine, s);
-                tp_gather(tp.moe, m.slot * 4U);
+                tp_join(tp.moe, m.slot);
                 check(hipMemcpy2DAsync(act, sr.count * 4U, tp.moe + m.act_first, m.act_pitch * 4U, sr.count * 4U, 2U,
                                        hipMemcpyDeviceToDevice, s),
                       "shared activation join");
@@ -1546,6 +1576,7 @@ struct Forward::Impl {
             if (stage->status[8U * l] != 0U || stage->status[8U * l + 4U] != 0U)
                 throw std::runtime_error("hy4 hip forward: layer " + std::to_string(l) + " expert status probe " +
                                          std::to_string(stage->status[8U * l]) + " down " + std::to_string(stage->status[8U * l + 4U]));
+        if (bad & bf16_wire::kInexactFlag) throw std::runtime_error("hy4 hip forward: a TP join value is not a bfloat16 (exact wire refused)");
         if (bad) throw std::runtime_error("hy4 hip forward: non-finite value in a cache / operand row");
         if (greedy && last == c.layers) {
             if (greedy_reply->status != 0U) throw std::runtime_error("hy4 hip forward: non-finite logit (device greedy status)");
@@ -1843,6 +1874,8 @@ void Forward::enable_tp(std::uint32_t rank, TpGather gather) {
     im.tp.world = 2U;
     im.tp.gather = gather;
     im.tp.calls = 0;
+    // both ranks must agree (the wire halves the message: a disagreement fails at the first gather's size check)
+    im.tp.bf16 = strix::envcfg::flag("STRIX_HY4_TP_JOIN_BF16", true);
 }
 std::uint32_t Forward::tp_gathers_per_step() const noexcept {
     return impl_->tp.world == 2U ? htp::step_count(htp::dims_of(impl_->c)).gathers : 0U;
@@ -1850,9 +1883,11 @@ std::uint32_t Forward::tp_gathers_per_step() const noexcept {
 std::string Forward::tp_receipt() const {
     if (impl_->tp.world != 2U) return "hy4 tp: off (one node)";
     const auto n = htp::step_count(htp::dims_of(impl_->c));
+    const std::uint64_t logits = 4U * std::uint64_t{impl_->c.vocab / 2U};  // the FP32 logits join (not BF16-rounded)
+    const std::uint64_t sent = impl_->tp.bf16 ? (n.bytes - logits) / 2U + logits : n.bytes;
     return "hy4 tp: rank " + std::to_string(impl_->tp.rank) + " of 2 (heads, o_proj / FFN / shared rows, routed slots 8 + 8, vocab halves); " +
-           std::to_string(n.gathers) + " gathers per step, " + std::to_string(n.bytes / 1024U) + " KiB sent per rank per step; " +
-           std::to_string(impl_->tp.calls) + " gathers so far";
+           std::to_string(n.gathers) + " gathers per step, " + std::to_string(sent / 1024U) + " KiB sent per rank per step (joins " +
+           (impl_->tp.bf16 ? "bf16 exact wire" : "f32") + "); " + std::to_string(impl_->tp.calls) + " gathers so far";
 }
 const std::vector<float>& Forward::prefill(const std::vector<std::uint32_t>& prompt) {
     const Impl::TpOneNode one(impl_->tp);  // each TP rank runs the whole prompt

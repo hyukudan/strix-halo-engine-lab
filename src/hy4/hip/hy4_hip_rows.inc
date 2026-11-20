@@ -448,13 +448,25 @@ void ffn_vrows(std::uint32_t l, std::uint32_t R) {  // vr.xn -> vr.f
 float* tp_rows_mine(std::size_t slot_floats) const {
     return tp.rows + std::size_t{tp.flip} * 2U * tp.rows_slot + std::size_t{tp.rank} * slot_floats;
 }
+// The swap of a join. Every verify join carries BF16-rounded shares (rounded Linear rows, the BF16 gate / GLU / expert
+// epilogues), so with tp.bf16 this rank's slot crosses as high halves (tp_join's wire; a word that is not a bfloat16
+// raises the flag and the pass refuses) and the place widens them back: the FP32 words of the FP32 swap.
 void tp_rows_swap(std::size_t slot_floats) {
     if (slot_floats > tp.rows_slot) throw std::logic_error("hy4 hip forward: tp verify rows join larger than its slot");
-    tp_gather(tp.rows + std::size_t{tp.flip} * 2U * tp.rows_slot, slot_floats * 4U);
+    float* const base = tp.rows + std::size_t{tp.flip} * 2U * tp.rows_slot;
+    if (!tp.bf16) return tp_gather(base, slot_floats * 4U);
+    tp.rows_wire = tp_wire(slot_floats);
+    const std::size_t mine = std::size_t{tp.rank} * slot_floats;
+    check(xbw::enqueue_pack(base + mine, tp.rows_wire + mine, slot_floats, flag, s), "tp verify rows join pack");
+    tp_gather(tp.rows_wire, bf16_wire::wire_bytes(slot_floats));
 }
 // slot q's rows [R][count] at element `at` (row pitch `pitch`) of the swapped buffer -> full[R][n] columns q count ..
 void tp_rows_place(float* full, std::size_t cols, std::uint32_t R, std::size_t count, std::size_t slot_floats, std::size_t at,
                    std::size_t pitch) {
+    if (tp.bf16) {
+        check(xbw::enqueue_place({tp.rows_wire, slot_floats, at, pitch, count, R, full, cols}, s), "tp verify rows join widen");
+        return;
+    }
     const float* const base = tp.rows + std::size_t{tp.flip} * 2U * tp.rows_slot + at;
     for (std::size_t q = 0; q < 2U; ++q)
         check(hipMemcpy2DAsync(full + q * count, cols * 4U, base + q * slot_floats, pitch * 4U, count * 4U, R, hipMemcpyDeviceToDevice, s),
@@ -679,6 +691,7 @@ void forward_rows(std::span<const std::uint32_t> toks, bool want_logits) {
         if (stage->status[8U * l] != 0U || stage->status[8U * l + 4U] != 0U)
             throw std::runtime_error("hy4 hip forward: verify rows layer " + std::to_string(l) + " expert status probe " +
                                      std::to_string(stage->status[8U * l]) + " down " + std::to_string(stage->status[8U * l + 4U]));
+    if (bad & bf16_wire::kInexactFlag) throw std::runtime_error("hy4 hip forward: a TP join value is not a bfloat16 (verify rows, exact wire refused)");
     if (bad) throw std::runtime_error("hy4 hip forward: non-finite value in a cache / operand row (verify rows)");
     vr.greedy.resize(R);
     for (std::uint32_t r = 0; r < R; ++r) {
