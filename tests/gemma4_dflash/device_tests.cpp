@@ -128,7 +128,7 @@ struct ScriptTarget final : g4::Target {
     unsigned width;
     explicit ScriptTarget(std::vector<unsigned> ids, unsigned tap_width) : greedy(std::move(ids)), width(tap_width) {}
     g4::ForwardResult forward_rows(std::span<const g4::RowPlan> rows) override {
-        g4::ForwardResult result{rows.size(), 32, width, std::vector<float>(rows.size() * 32, -1.0F), values(rows.size() * width)};
+        g4::ForwardResult result{rows.size(), 32, width, std::vector<float>(rows.size() * 32, -1.0F), values(rows.size() * width), {}, {}, false};
         for (std::size_t r = 0; r < rows.size(); ++r) result.logits[r * 32 + greedy[r]] = 1.0F;
         return result;
     }

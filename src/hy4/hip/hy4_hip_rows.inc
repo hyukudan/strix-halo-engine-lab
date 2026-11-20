@@ -224,11 +224,33 @@ void absorb_vrows(const std::uint8_t* wt, std::uint32_t heads, std::uint32_t wid
     }
 }
 
+// The cache side of attention_vrows: rows vr.p0 .. vr.p0 + R - 1 of layer l's latent (kv_a -> kv norm -> rope -> store) and,
+// indexed, its token / group keys, from vr.xn alone (never from the rows' attention or FFN output). attention_vrows calls
+// it at this point of its launch order; nextn_rows calls it alone for the rows whose outputs the caller never reads.
+void cache_vrows(std::uint32_t l, std::uint32_t R) {  // vr.xn -> latent[l] (+ tkeys[l] / gkeys[l])
+    namespace rp = strix::ops::rope;
+    namespace dcr = strix::attn_core::cache_rows;
+    const std::uint32_t kl = c.kv_lora, rope = c.qk_rope, row = kl + rope;
+    const bool idx = indexed_of(l);
+    const std::uint32_t* positions = iota + vr.p0;
+    linear_vrows(blk(l, "attn_kv_a_mqa.weight"), vr.xn, c.hidden, row, R, vr.ckv);
+    const float* kvn = t(blk(l, "attn_kv_a_norm.weight")).f();
+    for (std::uint32_t r = 0; r < R; ++r) norm(vr.ckv + std::size_t{r} * row, kvn, kl, c.rms_eps, vr.ckv + std::size_t{r} * row);
+    rp::launch<rp::Round::bf16>({vr.ckv, R, 1U, row, row, kl, rope / 2U, idx ? cos_idx : cos_swa, idx ? sin_idx : sin_swa, positions, false}, s);
+    check(dcr::store_rows({vr.ckv, row, positions, 0U, R, latent_rows[l], latent[l], flag}, s), "latent verify rows store");
+    if (idx)
+        for (std::uint32_t r = 0; r < R; ++r) {
+            const RowBind bind(*this, r);
+            index_keys(l);
+        }
+}
+
+// Text layers and the next-token block (l = c.layers, the rows form of nextn_rows): heads_of / indexed_of read its form.
 void attention_vrows(std::uint32_t l, std::uint32_t R) {  // vr.xn -> vr.f
     namespace rp = strix::ops::rope;
     namespace dcr = strix::attn_core::cache_rows;
-    const std::uint32_t H = c.heads[l], qk = c.qk_head(), kl = c.kv_lora, rope = c.qk_rope, vd = c.v_head, h = c.hidden;
-    const bool idx = c.indexed[l] != 0U;
+    const std::uint32_t H = heads_of(l), qk = c.qk_head(), kl = c.kv_lora, rope = c.qk_rope, vd = c.v_head, h = c.hidden;
+    const bool idx = indexed_of(l);
     if (idx ? H != 32U : H != 64U) throw std::runtime_error("hy4 hip forward: head count outside the flash presets");
     const std::uint32_t row = kl + rope;
     const std::size_t qrow = std::size_t{H} * qk, orow = std::size_t{H} * vd, frow = std::size_t{H} * row, lrow = std::size_t{H} * kl;
@@ -240,57 +262,49 @@ void attention_vrows(std::uint32_t l, std::uint32_t R) {  // vr.xn -> vr.f
     const float* cs = idx ? cos_idx : cos_swa;
     const float* sn = idx ? sin_idx : sin_swa;
     rp::launch<rp::Round::bf16>({vr.qv, R, H, H * qk, qk, c.qk_nope, rope / 2U, cs, sn, positions, false}, s);
-    linear_vrows(blk(l, "attn_kv_a_mqa.weight"), vr.xn, h, row, R, vr.ckv);
-    const float* kvn = t(blk(l, "attn_kv_a_norm.weight")).f();
-    for (std::uint32_t r = 0; r < R; ++r) norm(vr.ckv + std::size_t{r} * row, kvn, kl, c.rms_eps, vr.ckv + std::size_t{r} * row);
-    rp::launch<rp::Round::bf16>({vr.ckv, R, 1U, row, row, kl, rope / 2U, cs, sn, positions, false}, s);
-    check(dcr::store_rows({vr.ckv, row, positions, 0U, R, latent_rows[l], latent[l], flag}, s), "latent verify rows store");
-    if (idx)
-        for (std::uint32_t r = 0; r < R; ++r) {
-            const RowBind bind(*this, r);
-            index_keys(l);
-        }
+    cache_vrows(l, R);
     const auto& kb = t(blk(l, "attn_k_b.weight"));
     if (kb.type == 8U) absorb_vrows(kb.p, H, c.qk_nope, kl, vr.qv, qk, qrow, vr.qfull, row, frow, R);
-    else {
+    else {  // one grouped launch per row over the H head slices (the step's form; bitwise == one linear() per head)
         const auto kb_head = row_bytes(kb.type, c.qk_nope) * kl;
         for (std::uint32_t r = 0; r < R; ++r)
-            for (std::uint32_t hh = 0; hh < H; ++hh)
-                linear(kb.p + hh * kb_head, kb.type, vr.qv + r * qrow + std::size_t{hh} * qk, c.qk_nope, kl,
-                       vr.qfull + r * frow + std::size_t{hh} * row, false);
+            linear_groups(kb.p, kb.type, kb_head, H, nullptr, H, vr.qv + r * qrow, qk, c.qk_nope, kl, vr.qfull + r * frow, row);
     }
     check(hipMemcpy2DAsync(vr.qfull + kl, row * 4U, vr.qv + c.qk_nope, qk * 4U, rope * 4U, std::size_t{H} * R, hipMemcpyDeviceToDevice, s),
           "q rope copy rows");
     check(dcr::store_rows({vr.qfull, row, nullptr, 0U, H * R, {row, 0U}, vr.qt, flag}, s), "query operand images");
     const float* sinks = t(blk(l, "attn_sinks.weight")).f();
-    for (std::uint32_t r = 0; r < R; ++r) {
-        const std::uint32_t p = vr.p0 + r, keys = p + 1U;
-        std::uint16_t* const q_r = vr.qt + r * frow;
-        float* const o_r = vr.olat + r * lrow;
-        if (idx && gi::dense(preset::indexer, p)) {  // the causal prefix: list = iota, length iota[keys] = keys
-            DsaPolicy::Args a{latent[l], iota, iota + keys, context, 0U, 0U, 0U, q_r, sinks, o_r};
-            strix::attn_core::sparse::launch_flash_rows<DsaPolicy, 32U>(a, DsaSpec::kGroups, s, keys);
-        } else if (idx) {
-            {
-                const RowBind bind(*this, r);
-                index_select(l);
-            }
-            DsaPolicy::Args a{latent[l], ilist, list_n, kIndexListStride, 0U, 0U, 0U, q_r, sinks, o_r};
-            strix::attn_core::sparse::launch_flash_rows<DsaPolicy, 32U>(a, DsaSpec::kGroups, s, index_list_tokens(p));
-        } else {
-            SwaPolicy::Args a{latent[l], nullptr, nullptr, 0U, p, c.window, latent_rows[l].ring - 1U, q_r, sinks, o_r};
-            strix::attn_core::sparse::launch_flash_rows<SwaPolicy, 32U>(a, SwaSpec::kGroups, s, std::min(keys, c.window));
+    // Flash: one launch over the rows that need no per-row selection (vrows_flash_split), as forward_rows does. The core
+    // runs one work-group per (row, head group) and a work-group reads only its own row's query, list and count, so a
+    // row's output bits do not depend on the grid; the batched launch lets the rows' 1-2 work-groups run side by side
+    // instead of one launch after another (41 R flash launches per pass -> 41 + the selecting rows).
+    const VrowsFlashSplit fs = vrows_flash_split(idx, vr.p0, R);
+    if (fs.batched != 0U) {
+        if (idx) {  // the causal prefix: list = iota (stride 0), length of row r = iota[p0 + 1 + r] = p0 + r + 1
+            DsaPolicy::Args a{latent[l], iota, iota + vr.p0 + 1U, 0U, 0U, 0U, 0U, vr.qt, sinks, vr.olat};
+            strix::attn_core::sparse::launch_flash_rows<DsaPolicy, 32U>(a, fs.batched * DsaSpec::kGroups, s, vr.p0 + fs.batched);
+        } else {  // window rows: row r at position p0 + r
+            SwaPolicy::Args a{latent[l], nullptr, nullptr, 0U, vr.p0, c.window, latent_rows[l].ring - 1U, vr.qt, sinks, vr.olat};
+            strix::attn_core::sparse::launch_flash_rows<SwaPolicy, 32U>(a, fs.batched * SwaSpec::kGroups, s,
+                                                                        std::min(vr.p0 + fs.batched, c.window));
         }
+        check(hipGetLastError(), "flash verify rows launch");
+    }
+    for (std::uint32_t r = fs.batched; r < R; ++r) {  // selecting rows: index_select fills the one shared list per row
+        {
+            const RowBind bind(*this, r);
+            index_select(l);
+        }
+        DsaPolicy::Args a{latent[l], ilist, list_n, kIndexListStride, 0U, 0U, 0U, vr.qt + r * frow, sinks, vr.olat + r * lrow};
+        strix::attn_core::sparse::launch_flash_rows<DsaPolicy, 32U>(a, DsaSpec::kGroups, s, index_list_tokens(vr.p0 + r));
         check(hipGetLastError(), "flash verify row launch");
     }
     const auto& vb = t(blk(l, "attn_v_b.weight"));
     if (vb.type == 8U) absorb_vrows(vb.p, H, kl, vd, vr.olat, kl, lrow, vr.o, vd, orow, R);
-    else {
+    else {  // one grouped launch per row (the step's form)
         const auto vb_head = row_bytes(vb.type, kl) * vd;
         for (std::uint32_t r = 0; r < R; ++r)
-            for (std::uint32_t hh = 0; hh < H; ++hh)
-                linear(vb.p + hh * vb_head, vb.type, vr.olat + r * lrow + std::size_t{hh} * kl, kl, vd, vr.o + r * orow + std::size_t{hh} * vd,
-                       false);
+            linear_groups(vb.p, vb.type, vb_head, H, nullptr, H, vr.olat + r * lrow, kl, kl, vd, vr.o + r * orow, vd);
     }
     glu::launch_epilogue<glu::Round::bf16>(vr.o, nullptr, H * vd, R * orow, vr.o, s);
     glu::launch_sigmoid_gate<glu::DeclaredExp, glu::Round::bf16>(vr.o, vr.gate, R * orow, vr.o, s);
@@ -367,7 +381,7 @@ void expert_rows_union(std::uint32_t l, std::uint32_t R) {
 
 void ffn_vrows(std::uint32_t l, std::uint32_t R) {  // vr.xn -> vr.f
     const std::uint32_t h = c.hidden;
-    if (c.dense[l]) {
+    if (dense_of(l)) {
         linear_vrows(blk(l, "ffn_gate.weight"), vr.xn, h, c.dense_ff, R, vr.g);
         linear_vrows(blk(l, "ffn_up.weight"), vr.xn, h, c.dense_ff, R, vr.up);
         glu::launch_swiglu<glu::DeclaredExp, glu::Round::bf16>(vr.g, vr.up, std::size_t{R} * c.dense_ff, glu::no_clamp, vr.act, s);
@@ -378,7 +392,12 @@ void ffn_vrows(std::uint32_t l, std::uint32_t R) {  // vr.xn -> vr.f
         strix::moe_core::enqueue_route_wave<preset::route, glu::DeclaredExp>(vr.rlog, t(blk(l, "exp_probs_b.bias")).f(), vr.ids, vr.rw, R, s);
         linear_vrows(blk(l, "ffn_routed_down.weight"), vr.xn, h, c.latent, R, vr.z);
         const bool kquant_down = t(blk(l, "ffn_down_exps.weight")).type == 12U || t(blk(l, "ffn_down_exps.weight")).type == 14U;
-        if (vr.expert_union && R > 1U && t(blk(l, "ffn_gate_exps.weight")).type == 12U && kquant_down)
+        const auto& wg = t(blk(l, "ffn_gate_exps.weight"));
+        if (wg.type == kTypeBf16)  // the next-token block: each row's BF16 slices by the grouped dense rows (the step's form)
+            for (std::uint32_t r = 0; r < R; ++r)
+                experts_dense(wg, t(blk(l, "ffn_up_exps.weight")), t(blk(l, "ffn_down_exps.weight")), vr.z + r * L, vr.ids + r * K,
+                              vr.rawdots + r * K * L);
+        else if (vr.expert_union && R > 1U && wg.type == 12U && kquant_down)
             expert_rows_union(l, R);
         else
             for (std::uint32_t r = 0; r < R; ++r) expert_row(l, vr.z + r * L, vr.ids + r * K, vr.rawdots + r * K * L);

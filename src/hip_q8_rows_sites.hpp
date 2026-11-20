@@ -3,6 +3,7 @@
 // FMA accumulation, FP32 input and output. A binding fills a site and launches it; the kernel is the shared one.
 // - LinearF32: one input row; optional stored output (round = true): the shared glu::epilogue<bf16> (one rounding of
 //   dot + bias) applied in the store, the same device function on the same FP32 value as a separate epilogue launch.
+// - LinearRowsF32<R>: the R-row window of LinearF32 (out[r * outputs + o]); R = 4 / 8 run the VOPD coefficient kernels.
 // - HeadsF32: H per-head GEMVs in ONE launch (strix/decode_head_rows.hpp head rows), out[(o / head_outputs) * out_stride
 //   + o % head_outputs]; e.g. MLA absorb of K_b / V_b.
 // Home: shared (HIP kernel sites beside the q8_rows core). Bound by: bindings with stock Q8_0 projections and MLA absorb.
@@ -17,6 +18,10 @@
 namespace strix::q8_rows {
 
 struct StockQ8Arithmetic {
+    // fma is the fused single-rounding v_fmac_f32 of the R1 kernel, so 4- and 8-row windows of FP32 inputs take the
+    // shared 4 x 4 VOPD coefficient kernels (hip_q8_rows_gemv.hpp launch) like every other fused site: same chains and
+    // trees, the bits of LinearF32 on each row.
+    static constexpr bool fused_fma = true;
     __device__ static float coefficient(unsigned scale, std::int8_t code) {
         return static_cast<float>(__builtin_bit_cast(_Float16, static_cast<std::uint16_t>(scale))) * static_cast<float>(code);
     }
@@ -48,6 +53,23 @@ struct LinearF32 : StockQ8Arithmetic {
     bool round = false;
     __device__ void store(std::uint32_t o, unsigned, float value) const {
         out[o] = round ? ops::glu::epilogue<ops::glu::Round::bf16>(value, bias, bias ? o : 0U) : value;
+    }
+};
+
+// LinearF32 over R input rows in one launch (verify windows): row r reads input[r] and stores out[r * outputs + o] with
+// the same optional epilogue; each (output, row) value has the bits of LinearF32 on that row.
+template <unsigned R>
+struct LinearRowsF32 : StockQ8Arithmetic {
+    using Input = float;
+    static constexpr unsigned rows = R;
+    const void* input[R];
+    Segments segments;
+    std::uint32_t width, outputs;
+    float* out;
+    const float* bias = nullptr;
+    bool round = false;
+    __device__ void store(std::uint32_t o, unsigned r, float value) const {
+        out[std::size_t{r} * outputs + o] = round ? ops::glu::epilogue<ops::glu::Round::bf16>(value, bias, bias ? o : 0U) : value;
     }
 };
 

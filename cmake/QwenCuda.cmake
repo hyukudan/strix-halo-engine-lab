@@ -156,6 +156,8 @@ add_test(NAME qwen_cohort_plan COMMAND qwen_cohort_plan_test)
 add_executable(native_reuse_host_test tests/cuda/native_reuse_host_test.cpp)
 target_include_directories(native_reuse_host_test PRIVATE include)
 add_test(NAME native_reuse_host COMMAND native_reuse_host_test)
+add_executable(native_mma_wide_host_test tests/cuda/native_mma_wide_host_test.cpp)
+add_test(NAME native_mma_wide_host COMMAND native_mma_wide_host_test)
 # TURBO integer expert contract (gsq-iq-i8mma-turbo-cuda-v1): CPU oracle of placement, exact group dots and order.
 add_executable(turbo_i8_host_test tests/cuda/turbo_i8_host_test.cpp)
 target_include_directories(turbo_i8_host_test PRIVATE include)
@@ -328,6 +330,13 @@ target_compile_options(qwen_tiered_moe_tests PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
 if(MSVC)
     target_compile_options(qwen_tiered_moe_tests PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
+endif()
+# No-model bench of the tensor-core expert route: per-tile vs per-m16-block cost of the expert tiles
+# (scripts/bench/qwen_moe/tile_bench_ticket.sh). Not a test: needs the card, prints timings only.
+add_executable(qwen_moe_tile_bench tests/cuda/qwen_moe_tile_bench.cu)
+target_link_libraries(qwen_moe_tile_bench PRIVATE strix_qwen_cuda)
+if(MSVC)
+    target_compile_options(qwen_moe_tile_bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)
 endif()
 
 # serve == bench residency command line (host only, no CUDA)

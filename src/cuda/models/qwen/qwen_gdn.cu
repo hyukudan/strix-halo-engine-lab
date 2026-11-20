@@ -20,6 +20,8 @@
 //          v_add eps (:156647); v_rsq_f32 (:156656); inv*v (:156667), *w (:156670), gate*(.) (:156674) with
 //          gate = 1/(1+expf(-z)).
 #include "strix/cuda/qwen_gdn.hpp"
+#include "strix/cuda/qwen_gdn_prepass.hpp"
+#include "strix/gdn_prefill_overlap.hpp"
 #include "../../../attn_core/recurrent_state.hpp"
 #include "../../../cuda_core/gdn/gdn_lanes.cuh"
 
@@ -139,29 +141,37 @@ __global__ __launch_bounds__(256) void gates_kernel(const std::uint16_t* __restr
 // The HIP kernel walks all rows of a head in one block with an LDS ring. Rows are independent given their 3 predecessors'
 // raw BF16 inputs, so here a block owns (head, 32-row chunk); a prepass saves each chunk's 3 preceding raw rows (from the
 // workspace or the old history) and writes the new history, before any row is overwritten in place.
+// The body saves the taps of chunks [first, last); `history` = this call owns the old history (reads it, then writes the new
+// one). Split rule (include/strix/cuda/qwen_gdn_prepass.hpp): only chunk 0's taps and a history of count < 4 rows read the
+// old history, so the caller that covers chunk 0 owns it and every other caller reads workspace rows only.
+static_assert(qwen_gdn::prepass::kChunk == kConvChunk && qwen_gdn::prepass::kHistory == kConvKernel && qwen_gdn::prepass::kTaps == 3U,
+    "conv prepass split rule matches the conv shape");
 __device__ __forceinline__ void conv_prepass_body(const Rows& rows, std::uint32_t count, std::uint16_t* conv_state,
-    std::uint16_t* __restrict__ boundary) {
+    std::uint16_t* __restrict__ boundary, unsigned first, unsigned last, bool history) {
     const unsigned ch = blockIdx.x * 256U + threadIdx.x;
     if (ch >= kConvWidth) return;
-    std::uint16_t old[kConvKernel];
+    std::uint16_t old[kConvKernel] = {};
+    if (history)
 #pragma unroll
-    for (unsigned i = 0; i < kConvKernel; ++i) old[i] = conv_state[static_cast<std::uint64_t>(ch) * kConvKernel + i];
-    const auto raw = [&](int row) -> std::uint16_t {  // row >= -3; rows -3..-1 are taps 1..3 (:2823-2824)
+        for (unsigned i = 0; i < kConvKernel; ++i) old[i] = conv_state[static_cast<std::uint64_t>(ch) * kConvKernel + i];
+    const auto raw = [&](std::int64_t row) -> std::uint16_t {  // row >= -3; rows -3..-1 are taps 1..3 (:2823-2824)
         return row >= 0 ? float_to_bf16(rows.qkv[static_cast<std::uint64_t>(row) * rows.stride + ch]) : old[row + 4];
     };
-    const unsigned chunks = (count + kConvChunk - 1U) / kConvChunk;
-    for (unsigned c = 0; c < chunks; ++c)
+    for (unsigned c = first; c < last; ++c)
 #pragma unroll
         for (unsigned j = 0; j < 3U; ++j)
-            boundary[(static_cast<std::uint64_t>(c) * 3U + j) * kConvWidth + ch] = raw(static_cast<int>(c * kConvChunk + j) - 3);
+            boundary[(static_cast<std::uint64_t>(c) * 3U + j) * kConvWidth + ch] = raw(qwen_gdn::prepass::tap_row(c, j));
+    if (!history) return;
     // history = raw inputs of rows count-4 .. count-1 (:2858-2859; ring slot of row -k is tap 4-k)
 #pragma unroll
     for (unsigned i = 0; i < kConvKernel; ++i)
-        conv_state[static_cast<std::uint64_t>(ch) * kConvKernel + i] = raw(static_cast<int>(count) - 4 + static_cast<int>(i));
+        conv_state[static_cast<std::uint64_t>(ch) * kConvKernel + i] = raw(qwen_gdn::prepass::history_row(count, i));
 }
+// grid (channel blocks, chunks): block y saves chunk y's taps (one DRAM round trip per thread instead of one per chunk);
+// the block of chunk 0 owns the history.
 __global__ __launch_bounds__(256) void conv_prepass_kernel(Rows rows, std::uint32_t count, DevRef<std::uint16_t> conv_ref,
     std::uint16_t* __restrict__ boundary) {
-    conv_prepass_body(rows, count, conv_ref.get(), boundary);
+    conv_prepass_body(rows, count, conv_ref.get(), boundary, blockIdx.y, blockIdx.y + 1U, blockIdx.y == qwen_gdn::prepass::kHistoryChunk);
 }
 // Segment views: the rows of segment `seg` start at its row (every field shifts by the same stride).
 __device__ __forceinline__ Rows segment_rows(const Rows& rows, std::uint32_t row) {
@@ -171,7 +181,8 @@ __device__ __forceinline__ Rows segment_rows(const Rows& rows, std::uint32_t row
 // one grid slice (blockIdx.y) per segment; boundary of segment i at boundary + i * 3 * kConvWidth (one chunk: count <= 32)
 __global__ __launch_bounds__(256) void conv_prepass_multi_kernel(Rows rows, Segments segs, std::uint16_t* __restrict__ boundary) {
     const Segment& s = segs.s[blockIdx.y];
-    conv_prepass_body(segment_rows(rows, s.row), s.count, s.conv.get(), boundary + static_cast<std::uint64_t>(blockIdx.y) * 3U * kConvWidth);
+    conv_prepass_body(segment_rows(rows, s.row), s.count, s.conv.get(), boundary + static_cast<std::uint64_t>(blockIdx.y) * 3U * kConvWidth,
+        0U, qwen_gdn::prepass::chunks(s.count), true);
 }
 
 // Conv history after the first `keep` rows of a window: the prepass rule (raw inputs of rows keep-4 .. keep-1, older taps
@@ -476,6 +487,11 @@ bool decode_fused_enabled() {
     static const bool on = strix::envcfg::flag("STRIX_QRTX_GDN_DECODE", true);
     return on;
 }
+// prefill two-stream overlap (launch_core_overlap); 0 = the serial K3..K6 order
+bool overlap_enabled() {
+    static const bool on = strix::envcfg::flag("STRIX_QRTX_GDN_OVERLAP", true);
+    return on;
+}
 void check_aligned(const Rows& rows) {
     if (rows.stride % 4U || reinterpret_cast<std::uintptr_t>(rows.qkv) % 16U)
         throw std::invalid_argument("qwen_gdn: qkv rows must be 16-byte aligned");
@@ -556,7 +572,8 @@ void launch_conv_ref(const Rows& rows, std::uint32_t count, DevRef<std::uint16_t
     if (rows.stride % 4U || reinterpret_cast<std::uintptr_t>(rows.qkv) % 16U)
         throw std::invalid_argument("qwen_gdn: qkv rows must be 16-byte aligned");
     auto* boundary = static_cast<std::uint16_t*>(scratch);
-    conv_prepass_kernel<<<(kConvWidth + 255U) / 256U, 256, 0, stream>>>(rows, count, conv_state, boundary);
+    conv_prepass_kernel<<<dim3((kConvWidth + 255U) / 256U, prepass::chunks(count)), 256, 0, stream>>>(rows, count, conv_state,
+        boundary);
     check(cudaGetLastError(), "conv prepass launch");
     conv_kernel<<<dim3(kKeyHeads * 2U + kValueHeads, (count + kConvChunk - 1U) / kConvChunk), 256, 0, stream>>>(rows, count,
         boundary, w.conv, w.qk_l2_epsilon, t);
@@ -656,7 +673,103 @@ void launch_norm(const Rows& rows, std::uint32_t count, const Weights& w, const 
 void launch_core(const std::uint16_t* input, std::uint64_t input_stride, const Rows& rows, std::uint32_t count,
     std::uint16_t* conv_state, float* state, void* scratch, const Weights& w, const amdmath::Tables& t, cudaStream_t stream,
     const A8Out* a8, Tuning tuning) {
-    launch_core_split(input, input_stride, rows, count, conv_state, state, state, nullptr, scratch, w, t, stream, a8, tuning);
+    launch_core_overlap(input, input_stride, rows, count, conv_state, state, scratch, w, t, stream, a8, tuning, overlap_enabled());
+}
+
+namespace {
+// The auxiliary stream and events of the calling thread on the current device, created on first use (thread-local: the
+// event records and waits of one call never interleave with another thread's). nullptr = run serially.
+constexpr int kOverlapDevices = 16;
+constexpr unsigned kOverlapEvents = 2U * gdn_overlap::kMaxSegments + 2U;  // fork, ready[], done[], join
+struct OverlapLanes {
+    cudaStream_t aux = nullptr;
+    cudaEvent_t ev[kOverlapEvents] = {};
+    bool tried = false;
+    OverlapLanes() = default;
+    OverlapLanes(const OverlapLanes&) = delete;
+    OverlapLanes& operator=(const OverlapLanes&) = delete;
+    ~OverlapLanes() { release(); }
+    void release() {
+        for (cudaEvent_t& e : ev) {
+            if (e) (void)cudaEventDestroy(e);
+            e = nullptr;
+        }
+        if (aux) (void)cudaStreamDestroy(aux);
+        aux = nullptr;
+    }
+};
+OverlapLanes* overlap_lanes(cudaStream_t stream) {
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return nullptr;
+    }
+    int device = 0;
+    if (capture != cudaStreamCaptureStatusNone || cudaGetDevice(&device) != cudaSuccess || device < 0 || device >= kOverlapDevices)
+        return nullptr;
+    thread_local OverlapLanes lanes[kOverlapDevices];
+    OverlapLanes& l = lanes[device];
+    if (!l.tried) {
+        l.tried = true;
+        bool ok = cudaStreamCreateWithFlags(&l.aux, cudaStreamNonBlocking) == cudaSuccess;
+        for (unsigned i = 0; ok && i < kOverlapEvents; ++i)
+            ok = cudaEventCreateWithFlags(&l.ev[i], cudaEventDisableTiming) == cudaSuccess;
+        if (!ok) {
+            (void)cudaGetLastError();
+            l.release();
+        }
+    }
+    return l.aux ? &l : nullptr;
+}
+}  // namespace
+
+void launch_core_overlap(const std::uint16_t* input, std::uint64_t input_stride, const Rows& rows, std::uint32_t count,
+    std::uint16_t* conv_state, float* state, void* scratch, const Weights& w, const amdmath::Tables& t, cudaStream_t stream,
+    const A8Out* a8, Tuning tuning, bool overlap) {
+    const auto plan = gdn_overlap::plan(count, overlap && tuning.state_type == RecurrentStateType::f32);
+    OverlapLanes* lanes = plan.n > 1U ? overlap_lanes(stream) : nullptr;
+    if (!lanes) {
+        launch_core_split(input, input_stride, rows, count, conv_state, state, state, nullptr, scratch, w, t, stream, a8, tuning);
+        return;
+    }
+    check_rows(rows);
+    // the whole call's scratch layout: conv boundaries of chunk c at c * 3 rows, decays of row r at r * kValueHeads; a
+    // segment starting at a multiple of gdn_overlap::kAlign uses exactly its part of both
+    auto* bytes = static_cast<unsigned char*>(scratch);
+    auto* decay = reinterpret_cast<float*>(bytes + (conv_scratch_bytes(count) + 255U) / 256U * 256U);
+    cudaStream_t aux = lanes->aux;
+    cudaEvent_t* ready = lanes->ev + 1;
+    cudaEvent_t* done = lanes->ev + 1 + gdn_overlap::kMaxSegments;
+    const auto part = [&](std::uint32_t first) {
+        const std::uint64_t o = std::uint64_t{first} * rows.stride;
+        return Rows{rows.qkv + o, rows.z + o, rows.beta + o, rows.gate + o, rows.core + o, rows.stride};
+    };
+    const auto front = [&](std::uint32_t i) {  // K3 + K4 of segment i on the auxiliary stream
+        const std::uint32_t first = gdn_overlap::first_row(plan, i), n = gdn_overlap::segment_rows(plan, count, i);
+        const Rows r = part(first);
+        launch_gates(input + std::uint64_t{first} * input_stride, input_stride, r, n, w, t, aux);
+        launch_conv(r, n, conv_state, bytes + conv_scratch_bytes(first), w, t, aux);
+        check(cudaEventRecord(ready[i], aux), "overlap ready");
+    };
+    check(cudaEventRecord(lanes->ev[0], stream), "overlap fork");
+    check(cudaStreamWaitEvent(aux, lanes->ev[0], 0), "overlap fork wait");
+    front(0);
+    for (std::uint32_t i = 0; i < plan.n; ++i) {
+        const std::uint32_t first = gdn_overlap::first_row(plan, i), n = gdn_overlap::segment_rows(plan, count, i);
+        const Rows r = part(first);
+        check(cudaStreamWaitEvent(stream, ready[i], 0), "overlap ready wait");
+        launch_recurrence_split(r, n, state, state, decay + std::uint64_t{first} * kValueHeads, t, stream, tuning);
+        check(cudaEventRecord(done[i], stream), "overlap done");
+        if (i + 1U < plan.n) front(i + 1U);
+        check(cudaStreamWaitEvent(aux, done[i], 0), "overlap done wait");
+        A8Out part_a8{};
+        if (a8)
+            part_a8 = A8Out{a8->codes + std::uint64_t{first} * kValueWidth,
+                            a8->deltas + std::uint64_t{first / kA8Pitch} * (kValueWidth / 32U * kA8Pitch)};
+        launch_norm(r, n, w, t, aux, a8 ? &part_a8 : nullptr);
+    }
+    check(cudaEventRecord(lanes->ev[kOverlapEvents - 1U], aux), "overlap join");
+    check(cudaStreamWaitEvent(stream, lanes->ev[kOverlapEvents - 1U], 0), "overlap join wait");
 }
 
 void launch_core_split(const std::uint16_t* input, std::uint64_t input_stride, const Rows& rows, std::uint32_t count,

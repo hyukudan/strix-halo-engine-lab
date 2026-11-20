@@ -12,6 +12,7 @@
 // Opt-in. Nothing is done when MemFree already covers the request (the common case), and the step never takes more than
 // MemAvailable minus a reserve: it cannot swap or OOM the node. It changes no system setting and needs no privilege.
 #include "strix/env_flags.hpp"
+#include "strix/host_memory.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -40,20 +41,13 @@ struct HostMemory {
     bool ok = false;
 };
 
-inline HostMemory read_host_memory() {
+inline HostMemory read_host_memory() {  // the shared reading (strix/host_memory.hpp)
     HostMemory m;
 #if defined(__linux__)
-    std::ifstream in("/proc/meminfo");
-    std::string key, unit;
-    std::uint64_t kb = 0;
-    bool f = false, a = false;
-    while (in >> key >> kb) {
-        std::getline(in, unit);
-        if (key == "MemFree:") { m.free = kb * 1024U; f = true; }
-        else if (key == "MemAvailable:") { m.available = kb * 1024U; a = true; }
-        if (f && a) break;
-    }
-    m.ok = f && a;
+    const auto r = host_memory::read_meminfo();
+    m.free = r.free;
+    m.available = r.available;
+    m.ok = r.ok;
 #endif
     return m;
 }

@@ -133,6 +133,12 @@ std::uint64_t shared_id(const MtpSharedTargetBinding& b,bool physical) {
 }
 } // namespace
 
+gguf::Limits mtp_sidecar_header_limits(std::uint64_t metadata_read_budget_bytes) {
+    gguf::Limits limits;limits.max_metadata_entries=256;limits.max_tensors=64;
+    limits.max_string_bytes=metadata_read_budget_bytes;limits.max_total_array_elements=1000000;limits.max_array_depth=2;
+    limits.max_retained_array_elements=4;
+    return limits;
+}
 ModelManifest build_mtp_sidecar_manifest(const ModelContract& m,const gguf::FileInfo& info,const MtpSidecarAssetEvidence& asset) {
     model_scope(m);asset_valid(asset,false);
     require(info.version==3 && info.file_size==asset.declared_file_bytes && info.data_offset<=info.file_size && info.alignment>=16 &&

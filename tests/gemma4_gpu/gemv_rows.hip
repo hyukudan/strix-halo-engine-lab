@@ -94,19 +94,19 @@ int main(int argc, char** argv) try {
         synchronize();
         // Three timed windows; the median is reported with the spread.
         double ms[3];
-        for (auto& window : ms) {
+        for (auto& timed : ms) {
             const auto begin = std::chrono::steady_clock::now();
             for (unsigned i = 0; i < iters; ++i)
                 call();
             synchronize();
-            window = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count() / iters;
+            timed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count() / iters;
         }
         std::sort(ms, ms + 3);
         std::vector<float> got(std::size_t(rows) * outputs);
         out.download(got.data(), got.size() * sizeof(float));
         unsigned flag = 1;
         failure.download(&flag, sizeof(flag));
-        const double weight_bytes = double(outputs) * row_bytes * (gate ? 2.0 : 1.0);
+        const double weight_bytes = double(outputs) * double(row_bytes) * (gate ? 2.0 : 1.0);
         std::cout << "{\"format\":\"" << format << "\",\"gate\":" << gate << ",\"inputs\":" << inputs << ",\"outputs\":" << outputs
                   << ",\"route\":\"" << route << "\",\"rows\":" << rows << ",\"hash\":\"" << std::hex << fnv(got) << std::dec
                   << "\",\"failure\":" << flag << std::fixed << std::setprecision(4) << ",\"ms\":" << ms[1]

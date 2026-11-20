@@ -13,12 +13,20 @@ inline ModelContentIdentity mtp_cli_digest(std::string_view text) {
     return out;
 }
 // Accepted hexadecimal pins denote binary SHA-256 digests in either case.
+// The sidecar and the golden are verified separately: a bundle golden can still be pending self-generation.
+inline void verify_mtp_serving_sidecar(const MtpCliOptions& m,const ModelContentIdentity& sidecar,std::uint64_t sidecar_bytes) {
+    if(sidecar_bytes!=m.sidecar_bytes || sidecar!=mtp_cli_digest(m.sidecar_sha256))
+        throw std::invalid_argument("one-slot:asset size or digest differs");
+}
+inline void verify_mtp_serving_golden(const MtpCliOptions& m,const ModelContentIdentity& golden,std::uint64_t golden_bytes) {
+    if(golden!=mtp_cli_digest(m.golden_sha256) || golden_bytes>m.golden_max_bytes)
+        throw std::invalid_argument("one-slot:asset size or digest differs");
+}
 inline void verify_mtp_serving_assets(const MtpCliOptions& m,
     const ModelContentIdentity& sidecar, std::uint64_t sidecar_bytes,
     const ModelContentIdentity& golden, std::uint64_t golden_bytes) {
-    if(sidecar_bytes!=m.sidecar_bytes || sidecar!=mtp_cli_digest(m.sidecar_sha256) ||
-        golden!=mtp_cli_digest(m.golden_sha256) || golden_bytes>m.golden_max_bytes)
-        throw std::invalid_argument("one-slot:asset size or digest differs");
+    verify_mtp_serving_sidecar(m,sidecar,sidecar_bytes);
+    verify_mtp_serving_golden(m,golden,golden_bytes);
 }
 inline std::shared_ptr<const HipMtpAssets> load_mtp_cli_assets(const MtpCliOptions& m, const ModelContract& model,
     std::shared_ptr<const MappedModelFile> mapped, const ModelManifest& manifest,

@@ -24,6 +24,7 @@
 #include "glm/engine/glm_fast_i4_defaults.hpp"
 #include "glm/engine/glm_fast_i4_pack.hpp"
 #include "core/host_free_memory.hpp"
+#include "strix/host_memory.hpp"
 #include "core/iu4.hpp"
 #include "core/null_perturb.hpp"
 #include "moe_core/int4_layer_policy.hpp"
@@ -1533,13 +1534,24 @@ struct Engine::Impl {
         const std::uint64_t stage = mem::round_up(std::max<std::uint64_t>(plan.stage_max, 1), 2 * mem::kMiB);
         lib.set_stage_bytes(stage);
         const std::uint64_t phys = plan.physical(amodel);
-        const mem::Snapshot s0 = probe.read();
+        mem::Snapshot s0 = probe.read();
         std::fprintf(stderr, "mem: rank %u %s\nmem: node %s\n", opt.rank, plan.summary(amodel).c_str(), mem::describe(s0).c_str());
         if (const char* e = std::getenv("STRIX_GLM_MEM_ADMIT"); e != nullptr && std::string(e) == "0") {
             std::fprintf(stderr, "mem: WARNING admission check disabled (STRIX_GLM_MEM_ADMIT=0); the watchdog stays on\n");
         } else {
+            // A node that is short may still be getting memory back from a process that is exiting (the previous run):
+            // the shared recovery wait re-reads while the load does not fit and MemAvailable keeps rising (bounded,
+            // STRIX_HOST_MEMORY_WAIT_S), then the admission below decides on the last reading.
+            const auto terms = load_terms();
+            const auto waited = strix::host_memory::await_memory(
+                strix::host_memory::WaitPolicy::from_env(), [&] { return probe.read(); },
+                [](const mem::Snapshot& s) { return s.mem_available; },
+                [&](const mem::Snapshot& s) { return mem::fits(terms, s, margins); },
+                [](double sec) { std::this_thread::sleep_for(std::chrono::duration<double>(sec)); }, s0);
+            if (waited.reads > 1)
+                std::fprintf(stderr, "mem: rank %u %s\n", opt.rank, strix::host_memory::describe(waited).c_str());
             mem::admit("rank " + std::to_string(opt.rank) + " load (" + std::to_string(opt.layers) + " layers)",
-                       load_terms(),
+                       terms,
                        s0, margins);
         }
         if (const char* e = std::getenv("STRIX_GLM_MEM_PLAN_ONLY"); e != nullptr && std::string(e) == "1") {  // --mem-plan
