@@ -102,9 +102,10 @@ void launch_publication(const Publication* descriptors, unsigned producers, std:
     launch_checked();
 }
 PublishOrder publish_order() {
-    // Off switch (=0) restores the ordered one-block-per-producer loop; the committed bytes and tags are the same.
+    // Opt-in (=1) enables the grid after end-to-end qualification; keep the historical ordered publish by default.
+    // The byte-equivalent per-(row,producer) implementation remains available for explicit measurement.
     static const PublishOrder order =
-        envcfg::flag("STRIX_G4_KV_PUBLISH_GRID", true, EnvFlagMatch::exact) ? PublishOrder::grid : PublishOrder::ordered;
+        envcfg::flag("STRIX_G4_KV_PUBLISH_GRID", false, EnvFlagMatch::exact) ? PublishOrder::grid : PublishOrder::ordered;
     return order;
 }
 } // namespace detail
