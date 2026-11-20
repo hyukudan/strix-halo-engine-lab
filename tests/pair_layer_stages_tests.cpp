@@ -236,6 +236,12 @@ int main() {
         const auto got = run_pair(m, prompt, 8, gen, map, 1U);
         expect(!got[0].error.empty() && !got[1].error.empty(), "identity mismatch stops both ranks");
     }
+    {   // the shared default map: v = 3 on uniform layers, v = 1 for one window, v lowered for few layers
+        expect(strix::pair::default_stage_map(42U, 4U).text() == "0,7,14,21,28,35,42", "default 42 layers 4 windows = v3 uniform");
+        expect(strix::pair::default_stage_map(42U, 1U).text() == "0,21,42", "default one window = two-stage cut");
+        expect(strix::pair::default_stage_map(12U, 9U).virtual_stages() == 1U, "12 layers: stages of >= 4 layers -> v = 1");
+        expect(strix::pair::default_stage_map(16U, 9U).virtual_stages() == 2U, "16 layers -> v = 2");
+    }
     {   // refusals: half cut, missing range hook
         StageMap half;
         half.cuts = {StageCut(0U), StageCut(5U, true), StageCut(12U)};

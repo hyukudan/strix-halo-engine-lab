@@ -104,6 +104,20 @@ inline StageMap balance_map(std::span<const double> layer_ms, double tail_ms, st
     return map;
 }
 
+// Default stage map of a two-rank layer pipeline when the deployment names none: v stages per rank, whole-layer cuts from
+// balance_map over uniform layer costs (an engine with a measured per-layer cost calls balance_map itself). Fill and drain
+// cost one stage (P / 2v) instead of a half pass, for 2v - 2 more seam hops per window. Measured (Hy4 42 layers, 2048-row
+// windows, bitwise equal to v = 1): v = 3 beats v = 1 by 13-17 % at 4 windows (8K) and 4 % at 16 (32K). One window has
+// nothing to overlap: v = 1. v is lowered until every stage holds at least `min_layers` layers.
+[[nodiscard]] inline StageMap default_stage_map(std::uint32_t layers, std::uint64_t windows, std::uint32_t v = 3U,
+                                                std::uint32_t min_layers = 4U) {
+    if (layers < 2U) throw std::invalid_argument("pair stage map: a layer pipeline needs two layers");
+    if (windows < 2U) v = 1U;
+    while (v > 1U && 2U * v * std::max(min_layers, 1U) > layers) --v;
+    const std::vector<double> uniform(layers, 1.0);
+    return balance_map(uniform, 0.0, std::max(v, 1U), [](std::uint32_t) { return true; });
+}
+
 // One direction of the pair link: ordered send/receive of that direction's frames and their ACKs.
 struct PipeLink {
     Pipe::Send send;

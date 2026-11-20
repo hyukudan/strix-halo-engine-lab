@@ -660,7 +660,16 @@ int run(int argc, char** argv) {
     if (o.parts.empty() || prompt.empty())
         throw std::invalid_argument("usage: strix-hy4-rank PART1.gguf [PART2.gguf] --ids-file F [--gen N] [--teacher F] [--layers D] "
                                     "[--context C] [--top K] [--timing] [--prompt-rows R] [--dump-logits F] [--profile default|fast] "
-                                    "[--rank 0|1 --cut K | --stage-map C0,C1,..,L --repeat K --port P --pipe-guess copy|off --window-costs ROWS:MS,...]");
+                                    "[--rank 0|1 --cut K | --stage-map C0,C1,..,L|off --repeat K --port P --pipe-guess copy|off --window-costs ROWS:MS,...]");
+    // Pair default: the shared interleaved stage map (strix/pair/stage_map.hpp default_stage_map, measured bitwise equal and
+    // faster than the two-stage cut); --stage-map off, --cut, --pipe-guess or --window-costs keep the two-stage route.
+    if (std::getenv("HY4_RANK") != nullptr && stage_map.empty() && cut == 0U && !pipe_guess && window_costs.empty() &&
+        o.prompt_rows != 0U) {
+        const std::uint32_t depth = o.depth != 0U ? o.depth : strix::hy4::Config::from_gguf(o.parts.front()).layers;
+        const auto map = strix::pair::default_stage_map(depth, strix::pair::layers::windows(prompt.size(), o.prompt_rows).size());
+        if (map.virtual_stages() > 1U) stage_map = map.text();
+    }
+    if (stage_map == "off") stage_map.clear();
     if (std::getenv("HY4_RANK") != nullptr && !stage_map.empty()) {
         if (cut != 0U || pipe_guess || !window_costs.empty())
             throw std::invalid_argument("--stage-map replaces --cut; --pipe-guess and --window-costs are two-stage options");
