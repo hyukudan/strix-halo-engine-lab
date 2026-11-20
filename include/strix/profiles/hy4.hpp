@@ -27,9 +27,11 @@ inline constexpr sp::Lever table[] = {
     {.name = "prompt_rows", .env = "", .option = "--prompt-rows", .value = {"", "4096", "", ""}, .builtin = "0",
      .kind = sp::Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
      .target = "4096 (A8 rows prefill windows)", .off = "0",
-     .source = "batched prompt: 1K next-32 ids == position by position, window size bitwise (512 = 1024, 2048 = 4096); "
-               "FAST gate v2 per regime: see `qualified`",
-     .provisional = {false, false, false, false}},
+     .source = "batched prompt: 1K next-32 ids == position by position, window size bitwise (512 = 1024, 2048 = 4096; "
+               "1024 = 2048 at 4,096 and 8,192 tokens); FAST gate v2 per regime: see `qualified`",
+     .provisional = {false, false, false, false},
+     // the width is scheduling inside this class (the pair's flow-shop picker chooses it): same bits, same qualification
+     .same_bits = "1024,2048,4096"},
     {.name = "head_q8", .env = "", .option = "--head-q8", .value = {"", "1", "", ""}, .builtin = "0",
      .kind = sp::Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
      .target = "1 (Q8_0 copy of the BF16 head for the decode head, hy4-head-bf16-q8_0-v1)", .off = "0",
@@ -84,21 +86,12 @@ inline constexpr Qualified qualified[] = {
     {"prompt_rows", "4096", Device::gfx1151, Topology::one_node, 32568,
      "bitwise == prompt_rows 2048 (dumped logits cmp, code 8,192 and 32,568 tokens, build 8ecdaeabfcab) -> the 2048 gate "
      "receipts above; prefill 8K 631.3 -> 650.7 tok/s, 32K 615.1 -> 629.8 tok/s"},
-    {"prompt_rows", "1024", Device::gfx1151, Topology::one_node, 32568,
-     "bitwise == prompt_rows 2048 (logits_fnv64 3998f68136de649a at 4,096 tokens, aa0554f4a6790a56 at 8,192) -> the 2048 "
-     "gate receipts above; one node 1024 rows cost +7.4 % per row at 8K (13,503 vs 12,573 ms)"},
     // The layer split computes the one-node bits at the same window width (shared stage-plan invariant, hy4_hip_plan
-    // stage_window_plan), so the pair inherits the one-node gate of each width by identity, not by a second gate run:
-    // pair logits_fnv64 == one node at 4,096 tokens rows 1024, 8,192 rows 2048 and 32,768 rows 2048. The width itself is a
-    // flow-shop choice (two_stage_window_rows: wall = (windows + 1) x half-window); every qualified width has the same bits.
-    {"prompt_rows", "1024", Device::gfx1151, Topology::pair, 32568,
-     "pair == one node (logits_fnv64 3998f68136de649a, 4,096 tokens rows 1024) -> the one-node 1024 row"},
-    {"prompt_rows", "2048", Device::gfx1151, Topology::pair, 32568,
-     "pair == one node (logits_fnv64 aa0554f4a6790a56 at 8,192 tokens, 62b91f1ca6ed8e8e at 32,768, rows 2048) -> the "
-     "one-node 2048 gate receipts"},
+    // stage_window_plan), so the pair inherits the one-node gate by identity, not by a second gate run. The width is a
+    // flow-shop choice (two_stage_window_rows: wall = (windows + 1) x half-window) inside the lever's same_bits class.
     {"prompt_rows", "4096", Device::gfx1151, Topology::pair, 32568,
-     "pair == one node at the same width (rows 1024 / 2048 receipts) and one node 4096 == 2048 -> the one-node 2048 gate "
-     "receipts"},
+     "pair logits_fnv64 == one node at the same width (3998f68136de649a at 4,096 tokens rows 1024; aa0554f4a6790a56 at "
+     "8,192 and 62b91f1ca6ed8e8e at 32,768 rows 2048); one node 1024 == 2048 == 4096 -> the one-node 2048 gate receipts"},
     // The head copy changes only the decode head's weights (no prompt dependence: no bound); the layer split changes no
     // bit, so the pair's head stage computes the same logits as one node.
     {"head_q8", "1", Device::gfx1151, Topology::one_node, kNoPromptBound,

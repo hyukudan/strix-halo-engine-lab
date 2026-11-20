@@ -56,7 +56,22 @@ struct Lever {
     bool native_option = false;            // an adapter's native CLI parser owns validation/export
     std::array<bool, kProfileColumns> provisional{};  // selected ahead of qualification; still requires `runnable`; wins over `ready` until the row is flipped
     bool omit_builtin_fingerprint = false;  // additive governed rows preserve the legacy identity at builtin
+    // Comma list of values measured to compute the same bits as each other (receipt in `source`), e.g. window widths of
+    // a window-invariant prefill: choosing among them is scheduling, so an explicit member shares the qualification of a
+    // ready column whose value is in the list. Empty: every value is its own class. Not part of the fingerprint.
+    std::string_view same_bits;
 };
+
+// True when `value` is one whole item of the comma list `list`.
+[[nodiscard]] inline bool bit_class_member(std::string_view list, std::string_view value) {
+    while (!value.empty() && !list.empty()) {
+        const auto comma = list.find(',');
+        if (list.substr(0, comma) == value) return true;
+        if (comma == std::string_view::npos) break;
+        list.remove_prefix(comma + 1U);
+    }
+    return false;
+}
 
 // Column of `lever` that `profile` reads: an empty turbo cell takes the fast cell (TURBO includes every FAST lever
 // unless its turbo cell says otherwise). Shared by every adapter whose rows carry `value` per profile.
@@ -187,14 +202,17 @@ struct Resolution {
         return false;
     }
     // An explicit setting (CLI or environment) of a bit-changing lever keeps the run qualified only when its value is
-    // the builtin, the lever's off value, or the value of a column the table marks ready and not provisional: the
-    // table's qualification data, one rule for every engine.
+    // the builtin, the lever's off value, or the value of a column the table marks ready and not provisional (or a
+    // member of that value's same_bits class): the table's qualification data, one rule for every engine.
     [[nodiscard]] static bool explicit_value_qualified(const Entry& entry) {
         const Lever& lever = *entry.lever;
         if (lever.kind != Kind::bit_changing) return true;
         if (entry.value == lever.builtin || (!lever.off.empty() && entry.value == lever.off)) return true;
+        const bool in_class = bit_class_member(lever.same_bits, entry.value);
         for (std::size_t c = 0; c < kProfileColumns; ++c)
-            if (lever.ready[c] && !lever.provisional[c] && !lever.value[c].empty() && entry.value == lever.value[c]) return true;
+            if (lever.ready[c] && !lever.provisional[c] && !lever.value[c].empty() &&
+                (entry.value == lever.value[c] || (in_class && bit_class_member(lever.same_bits, lever.value[c]))))
+                return true;
         return false;
     }
     // "qualified"; else "qualification in progress: <rows>" for provisional columns and/or "unqualified: <rows>"
