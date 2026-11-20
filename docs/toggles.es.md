@@ -117,6 +117,7 @@ Las tablas listan los flags seleccionados. La lista completa de variables de ent
 | `--block-schedule default\|tail-large` | qwen-rtx | `tail-large` | Orden de bloques en los kernels grandes. | `default` en GPUs con otro número de CUs. |
 | `--prefill auto` | glm | `auto` | Elige la ruta de prefill. | - |
 | `--prefill-chunk N` | glm | 512 | Tamaño de chunk de prefill en filas. | Mayor con más cómputo; menor con menos memoria. |
+| `--prefill-route windows\|large`, `--prefill-chunk N` | qwen-rtx (CLI spec 27B) | `windows` | `large`: el prompt pasa por el prefill grande del CLI de decode (`--prefill-chunk N` filas por chunk; 0 = valor del motor) y sus filas alimentan la cadena MTP. Opcional, aún sin medir frente a `windows`. | - |
 | `--prefill-path device` | deepseek serve | `device` | Prefill en la GPU. | - |
 | `--wide-exact N` | qwen (app decode HIP 27B) | off (ventanas de 16 filas) | Ventanas de prefill EXACT de N filas, cada fila bit a bit igual al resultado de 16 filas; solo si todas las proyecciones densas grandes son IU4 (otros formatos resuelven a 16 filas). `--wide N` (> 16) es la clase FAST ancha. [Detalles](optimizations.md#qwen27-hip-decode-step). | 64 es el mejor medido en Strix (la atención exacta cuesta más por fila en rejillas más anchas). |
 | `--prefill-rows N`, `--prefill-exact` | qwen (app spec HIP 27B) | ventanas EXACT de 64 filas (proyecciones densas IU4; 16 filas en otro caso) | `--prefill-rows 16` = ventanas de 16 filas; N > 16 = la clase FAST ancha salvo con `--prefill-exact`. [Detalles](optimizations.md#qwen27-hip-decode-step). | - |
@@ -131,6 +132,7 @@ Las tablas listan los flags seleccionados. La lista completa de variables de ent
 |---|---|---|---|---|
 | `--mtp-bundle`, `--rope-yarn 2\|4 --context C` | qwen | - | Bundle de draft MTP; YaRN para contexto largo. | - |
 | `--prelaunch 0\|1` | qwen-rtx (CLI spec densa 27B) | `0` | Lanza el verify detrás del draft MTP alimentado en el dispositivo (mismos ids). | - |
+| `--mtp-catchup kv\|full` | qwen-rtx (CLI spec 27B) | `kv` | Catch-up MTP solo K/V: los chunks de catch-up cuyas salidas nadie lee escriben solo la K/V del MTP (misma K/V, mismos drafts). `full` = la pasada MTP completa (interruptor de apagado). [Detalles](optimizations.md#qwen27-cuda-mtp-kv-catchup) | - |
 | `--mtp 0\|1` | glm | resuelto (ver `--print-effective-config`) | Apaga o enciende el draft MTP. | `0` cuando falta memoria. |
 | `--identity r1b\|r1` | glm | `r1b` | Identidad de decode. | `r1` para comparar. |
 | `--dspark`, `--no-dspark`, `--dspark-vocab auto\|full` | deepseek | on si se encuentra el draft | Draft especulativo DSpark. | `--no-dspark` cuando falta memoria. |
@@ -434,7 +436,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_MTP_PRIME_ROWS` | qwen | ON (STRIX_MTP_PRIME_ROWS=0: desactivar) | [qwen-mtp-prime-rows](optimizations.md#qwen-mtp-prime-rows) |
 | `STRIX_QSA_MTP_POOL` | qwen | 1 (eligible native MTP CLI, the singl... | [qwen-qsa-mtp-pool](optimizations.md#qwen-qsa-mtp-pool) |
 
-### Exacto frente a FAST (9)
+### Exacto frente a FAST (10)
 
 | Toggle | Motor | Por defecto | Detalles |
 |---|---|---|---|
@@ -445,6 +447,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_GLM_PF_EXACTMOE_V` | glm | auto | [glm-pf-exact-moe-auto](optimizations.md#glm-pf-exact-moe-auto) |
 | `STRIX_GLM_PF_EXACT_X` | glm | auto | [glm-pf-exact-x](optimizations.md#glm-pf-exact-x) |
 | `STRIX_QPF2K_MOE_ROUTE_BF16` | qwen | OFF | [qwen-moe-route-bf16](optimizations.md#qwen-moe-route-bf16) |
+| `STRIX_QRTX_EXPERT_TURBO_ROWS` | qwen-rtx | 512 solo con `--profile turbo` (`off` = int8 en cada llamada MoE) | [qwen-rtx-turbo-experts](optimizations.md#qwen-rtx-turbo-experts) |
 | `STRIX_QSA_DECODE_POOL_BF16` | qwen | 1 (plain append-only serial decode un... | [qwen-qsa-decode-pool](optimizations.md#qwen-qsa-decode-pool) |
 | `STRIX_QWEN_ROUTER_BF16` | qwen | OFF (opt-in: STRIX_QWEN_ROUTER_BF16=1) | [qwen-exact-bf16-router-weights](optimizations.md#qwen-exact-bf16-router-weights) |
 

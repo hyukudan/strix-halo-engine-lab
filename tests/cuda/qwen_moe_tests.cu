@@ -4,7 +4,7 @@
 // gate_up_chains (:791-909), down_prefill_wmma with down_chains (:957-1032), known_moe_prefill_merge/commit_kernel
 // (src/hip_moe_experts_launcher.hip:2660-2708). Every buffer the pipeline may write is pre-filled with the same sentinel on
 // both sides and compared byte for byte in full (so stray writes are detected too).
-//   qwen_moe_tests <tables dir> [bench|fastmma|fastmma-check|fastmma-bench]
+//   qwen_moe_tests <tables dir> [bench|fastmma|fastmma-check|fastmma-bench|expert-bench[=GATE,DOWN]]
 // Optional: STRIX_QWEN_GGUF (real expert weights, default path of qwen_gguf_host.hpp), qrtx-build\fx\d64.dump.
 #include <cuda_runtime.h>
 
@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "strix/cuda/qwen_moe.hpp"
+#include "strix/cuda/qwen_quant.cuh"
 #include "strix/cuda/qwen_route_bf16.hpp"
 #include "strix/cuda/amd_math_tables.hpp"
 #include "qwen_fixture.hpp"
@@ -886,6 +887,78 @@ static void fast_bench(const am::Tables& tables) {
     }
 }
 
+// expert-bench: the routed-expert call (CSR + gate/up + down, qwen_moe::enqueue_routed) by rows, FAST BF16 experts
+// (gsq-iq-bf16mma-cuda-v1) vs TURBO int8 experts (gsq-iq-i8mma-turbo-cuda-v1), on native GSQ storage (default gate IQ3_S 21,
+// down IQ4_NL 20; "expert-bench=GATE,DOWN" for others), 512 experts, top-10 uniform routes, synthetic codes (an integer or
+// BF16 MMA does the same work for any values). Per rows: best and median of 9 timed calls after 3 warm-ups (cudaEvent),
+// then the winner. The crossover of the TURBO expert regime (profile row expert_turbo_rows) is read from these lines.
+// Steps of <= 16 rows (decode windows) time four arms, each arithmetic in its tile form and its decode form (Weights::
+// decode_tile), print a B2 line, and check on the device that each decode form's rawdots equal its tile form's bit for bit
+// (B2 ... IDENTITY ok|DIFF); the B0 line of those rows compares the decode forms (what a window runs).
+static int expert_bench(const am::Tables& tables, u32 gt, u32 dt) {
+    std::mt19937 rng(11);
+    constexpr u32 NE = 512;
+    HostWeights w{gt, dt, NE, {}, {}, {}};
+    const auto fill = [&](std::vector<u8>& bytes, u32 type, u32 n, u32 k) {
+        const auto geo = strix::cuda::quant::geometry(type);
+        if (!geo.block_elements || k % geo.block_elements) throw std::invalid_argument("expert-bench: storage type");
+        bytes.resize(size_t(NE) * n * (k / geo.block_elements) * geo.block_bytes);
+        for (size_t i = 0; i + 4 <= bytes.size(); i += 4) { const u32 r = static_cast<u32>(rng()); std::memcpy(bytes.data() + i, &r, 4); }
+        const u16 d = half_of(0x1p-10F);  // small finite scales keep the arithmetic in range
+        for (size_t off = 0; off < bytes.size(); off += geo.block_bytes) std::memcpy(bytes.data() + off, &d, 2);
+    };
+    fill(w.gate, gt, mo::ffn, mo::hidden); fill(w.up, gt, mo::ffn, mo::hidden); fill(w.down, dt, mo::hidden, mo::ffn);
+    Device d; upload_weights(d, w);
+    std::printf("B0 expert-bench gate %u down %u experts %u top_k %u (ms per routed call; best / median of 9)\n", gt, dt, NE, mo::top_k);
+    int bad = 0;
+    for (const u32 T : {1U, 4U, 16U, 128U, 512U, 2048U, 8192U}) {
+        State s; init_state(s, T); synthetic_inputs(s, NE, 0, rng);
+        upload_state(d, s, true);
+        auto& rv = d.rows_view;
+        mo::enqueue_prologue(rv, T, mo::hidden, nullptr);
+        CK(cudaDeviceSynchronize());
+        cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+        // arms: 0 bf16 tile, 1 bf16 decode, 2 int8 tile, 3 int8 decode (rows > 16: the decode flag selects nothing, 1 and 3 run)
+        const bool window = T <= 16U;
+        const size_t raw_bytes = s.view[V_raw].size();
+        std::vector<u8> raw[4];
+        float best[4] = {1e9F, 1e9F, 1e9F, 1e9F}, med[4] = {0, 0, 0, 0};
+        for (int a = window ? 0 : 1; a < 4; a += window ? 1 : 2) {
+            d.weights.arithmetic = a < 2 ? mo::ExpertArithmetic::gsq_bf16_mma : mo::ExpertArithmetic::gsq_i8_turbo;
+            d.weights.decode_tile = (a & 1) != 0;
+            std::vector<float> t;
+            for (int it = 0; it < 12; ++it) {
+                CK(cudaEventRecord(e0));
+                (void)mo::enqueue_routed(rv, T, d.weights, tables, nullptr, false);
+                CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1));
+                float ms = 0; CK(cudaEventElapsedTime(&ms, e0, e1));
+                if (it >= 3) t.push_back(ms);
+            }
+            std::sort(t.begin(), t.end());
+            best[a] = t.front(); med[a] = t[t.size() / 2];
+            if (window) { raw[a].resize(raw_bytes); CK(cudaMemcpy(raw[a].data(), d.view[V_raw], raw_bytes, cudaMemcpyDeviceToHost)); }
+        }
+        d.weights.decode_tile = true;
+        u32 summary = 0; CK(cudaMemcpy(&summary, d.summary, 4, cudaMemcpyDeviceToHost)); bad |= summary ? 1 : 0;
+        if (window) {
+            const bool same_bf16 = raw[0] == raw[1], same_i8 = raw[2] == raw[3];
+            bad |= same_bf16 && same_i8 ? 0 : 1;
+            std::printf("B2 rows %5u gate %u down %u bf16 tile/dec %.4f / %.4f int8 tile/dec %.4f / %.4f int8dec/bf16dec %.3f "
+                        "int8dec/int8tile %.3f IDENTITY bf16 %s int8 %s\n", T, gt, dt, med[0], med[1], med[2], med[3], med[3] / med[1],
+                        med[3] / med[2], same_bf16 ? "ok" : "DIFF", same_i8 ? "ok" : "DIFF");
+        }
+        std::printf("B0 rows %5u bf16 %.4f / %.4f int8 %.4f / %.4f ratio(int8/bf16, median) %.3f -> %s%s\n", T, best[1], med[1], best[3],
+                    med[3], med[3] / med[1], med[3] < med[1] ? "int8" : "bf16", summary ? " STATUS-FLAGS" : "");
+        std::fflush(stdout);
+        CK(cudaEventDestroy(e0)); CK(cudaEventDestroy(e1));
+        free_state_buffers(d);
+    }
+    (void)std::system("nvidia-smi --query-gpu=name,clocks.sm,clocks.max.sm,power.draw --format=csv,noheader");
+    free_device(d);
+    std::printf("B0 done%s\n", bad ? " STATUS-FLAGS" : "");
+    return bad;
+}
+
 // Dump of the FAST project + down outputs (all state views) for byte comparison between tile-variant builds.
 static void fast_dump_case(FILE* out, u32 T, unsigned kind, const HostWeights& w, u32 NE, std::mt19937& rng, const am::Tables& tables) {
     State s; init_state(s, T); synthetic_inputs(s, NE, kind, rng);
@@ -943,6 +1016,7 @@ int main(int argc, char** argv) {
     am::Tables tables = am::load_tables(argv[1]);
 #ifdef STRIX_WFMT_CAPTURE
     if (mode.rfind("wfmt-capture=", 0) == 0) { wfmt_capture(tables,mode.c_str()+13); am::free_tables(tables); return 0; }
+    if (mode == "turbo-probe") { const int rc = turbo_probe(tables); am::free_tables(tables); return rc; }
 #endif
     if (mode == "fixture") { fixture_replay(tables); std::printf("%s: %d failures, %llu bytes compared\n", g_fail ? "FAIL" : "PASS", g_fail, g_checked); return g_fail ? 1 : 0; }
     if (mode == "fastmma" || mode == "fastmma-check") {
@@ -952,6 +1026,13 @@ int main(int argc, char** argv) {
         return g_fail ? 1 : 0;
     }
     if (mode == "fastmma-bench") { fast_bench(tables); return 0; }
+    if (mode.rfind("expert-bench", 0) == 0) {
+        u32 gt = 21, dt = 20;
+        if (mode.size() > 13 && mode[12] == '=' && std::sscanf(mode.c_str() + 13, "%u,%u", &gt, &dt) != 2) return 2;
+        const int rc = expert_bench(tables, gt, dt);
+        am::free_tables(tables);
+        return rc;
+    }
     if (mode.rfind("fastdump=", 0) == 0) { fast_dump(tables, mode.c_str() + 9); return 0; }
     if (mode == "bench") {
         // T = 8192, 128 synthetic experts (VRAM < 2 GB), uniform routes, intermediates off.
