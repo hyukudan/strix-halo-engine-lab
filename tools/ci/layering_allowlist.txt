@@ -341,7 +341,7 @@ raw-getenv src/h3/te/te_gpu.hip 2
 raw-getenv src/h3/te/te_pack_reader.cpp 1
 raw-getenv src/hip_deepseek41_batch_dspark.hip 6
 raw-getenv src/hip_deepseek41_batch_forward.hip 17
-raw-getenv src/hip_deepseek41_device_forward.hip 11
+raw-getenv src/hip_deepseek41_device_forward.hip 10
 raw-getenv src/hip_deepseek41_prefill.hip 30
 raw-getenv src/hip_dense_f16_tiled.hpp 4
 raw-getenv src/hip_ds41_attention.hip 4
