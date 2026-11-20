@@ -179,8 +179,10 @@ Problem make(unsigned rows, unsigned width, std::vector<unsigned> first, std::ui
 }
 
 // nan_class: the host compiler may commute the operands of an add, which picks the other NaN payload; against the
-// separately compiled contract reference a NaN therefore only has to be a NaN. The two kernel forms share the tree code
-// and are compared bit for bit.
+// separately compiled contract reference a NaN therefore only has to be a NaN. The same holds between the two host
+// models: they are separate instantiations and the compiler may commute an add in one and not the other (GCC 15 -O2
+// does), so RB8 vs RB4 is bit for bit on every non-NaN output and NaN class on NaN outputs. The device forms are
+// compared bit for bit by the HIP batch test.
 unsigned compare(const char* name, const std::vector<u32>& got, const std::vector<u32>& want, bool nan_class) {
     require(got.size() == want.size(), std::string(name) + ": size");
     const auto nan = [](u32 b) { return (b & 0x7f800000U) == 0x7f800000U && (b & 0x007fffffU) != 0U; };
@@ -197,10 +199,10 @@ unsigned run_case(const char* label, const Problem& p) {
     const auto rb8 = kernel_model<8U, 2U, 16U>(p, &lds8);
     unsigned bad = compare((std::string(label) + " RB4 vs contract").c_str(), old, ref, true) +
         compare((std::string(label) + " RB8 vs contract").c_str(), rb8, ref, true) +
-        compare((std::string(label) + " RB8 vs RB4").c_str(), rb8, old, false);
+        compare((std::string(label) + " RB8 vs RB4").c_str(), rb8, old, true);
     unsigned nans = 0;
     for (const u32 b : rb8) nans += (b & 0x7f800000U) == 0x7f800000U && (b & 0x007fffffU) != 0U;
-    if (nans) std::printf("note %s: %u NaN outputs (bitwise between forms, class-only vs contract)\n", label, nans);
+    if (nans) std::printf("note %s: %u NaN outputs (NaN class only: host models may commute adds)\n", label, nans);
     if (lds4 != lds8 || lds8 != std::size_t(p.width) * 16U) { std::printf("FAIL %s: LDS %zu / %zu\n", label, lds4, lds8); ++bad; }
     std::printf("%s %s rows=%u width=%u outputs=%u lds=%zu B\n", bad ? "FAIL" : "PASS", label, p.rows, p.width, p.outputs(), lds8);
     return bad;
