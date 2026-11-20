@@ -17,6 +17,10 @@
 #include "hy4/hip/hy4_hip_forward.hpp"
 #include "hy4/hip/hy4_hip_rows.hpp"
 #include "strix/spec/block_parallel.hpp"
+#include "strix/dist/open_transport.hpp"
+#include "strix/env_flags.hpp"
+#include "strix/spec/pair_round.hpp"
+#include "xport/tp_gather_hip.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -275,6 +279,10 @@ int main(int argc, char** argv) {
         std::vector<double> chain_ms, survival;
         std::string taps_dir;
         std::uint32_t taps_gen = 128, depth = 6;
+        // tensor-parallel pair (Forward::enable_tp on both ranks, each holding the whole pack): rank 0 drafts and decides,
+        // both ranks run every verify pass with their shares (strix/spec/pair_round.hpp); bench mode runs on both ranks
+        int tp_rank = -1;
+        std::string tp_spec = "usb4auto";
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
             const bool more = i + 1 < argc;
@@ -294,6 +302,8 @@ int main(int argc, char** argv) {
             else if (a == "--gbps" && more) gbps = std::stod(argv[++i]);
             else if (a == "--union-ab") union_ab = true;
             else if (a == "--mtp") mtp = true;
+            else if (a == "--tp-rank" && more) tp_rank = static_cast<int>(std::stoul(argv[++i]));
+            else if (a == "--tp-transport" && more) tp_spec = argv[++i];
             else if (a == "--mtp-copy" && more) mtp_copy = std::stoul(argv[++i]) != 0UL;
             else if (a == "--chain-ms" && more) chain_ms = read_list(argv[++i]);
             else if (a == "--survival" && more) survival = read_list(argv[++i]);
@@ -315,6 +325,36 @@ int main(int argc, char** argv) {
         std::printf("load %.1f s, %u verify rows, prompt %zu ids (%s), context %u\n", (now_ms() - t_load) / 1000.0, o.verify_rows,
                     prompt.size(), o.prompt_rows ? "batched" : "position by position", o.context);
         const auto vocab = static_cast<std::size_t>(f.config().vocab);
+        std::unique_ptr<strix::xport::tp_gather::HipPairGather> tpg;
+        strix::spec::pair_round::Exchange pair_ex;
+        if (tp_rank >= 0) {
+            if (tp_rank > 1 || !taps_dir.empty()) throw std::invalid_argument("--tp-rank 0|1 (bench or --spec; not with --mtp-taps)");
+            const auto rank = static_cast<std::uint32_t>(tp_rank);
+            auto opened = strix::dist::open_pair(tp_spec, rank);
+            if (!opened.receipt.empty()) std::printf("tp transport: %s\n", opened.receipt.c_str());
+            // largest gather: a verify pass's MoE join at 8 rows (8 x (8 slot rows x 1536 + shared / 2) FP32) < 2 MiB
+            const auto stream = static_cast<hipStream_t>(f.stream_handle());
+            tpg = std::make_unique<strix::xport::tp_gather::HipPairGather>(std::move(opened), rank, std::size_t{2} << 20, stream,
+                                                                           strix::envcfg::flag("STRIX_TP_CHANNEL", true));
+            f.enable_tp(rank, {&tpg->link(), &strix::xport::tp_gather::HipPairGather::Link::fn});
+            std::printf("%s\n", f.tp_receipt().c_str());
+            // the round message rides the same gather: [2][kSlot] bytes on the device, stream-ordered after the last pass
+            constexpr std::size_t kSlot = 128;
+            static_assert(strix::spec::pair_round::kMessageBytes <= kSlot);
+            auto* slots = reinterpret_cast<std::uint8_t*>(f.alloc_f32(2U * kSlot / 4U));
+            auto* glink = &tpg->link();
+            pair_ex = [stream, slots, glink, rank](const std::uint8_t* mine, std::uint8_t* peer) {
+                constexpr std::size_t B = strix::spec::pair_round::kMessageBytes;
+                const auto ok = [](hipError_t e, const char* what) {
+                    if (e != hipSuccess) throw std::runtime_error(std::string("spec pair round: ") + what + ": " + hipGetErrorString(e));
+                };
+                ok(hipMemcpyAsync(slots + std::size_t{rank} * kSlot, mine, B, hipMemcpyHostToDevice, stream), "message upload");
+                strix::xport::tp_gather::HipPairGather::Link::fn(glink, stream, slots, kSlot, kSlot);
+                ok(hipMemcpyAsync(peer, slots + std::size_t{1U - rank} * kSlot, B, hipMemcpyDeviceToHost, stream), "message read");
+                ok(hipStreamSynchronize(stream), "message sync");
+            };
+        }
+        const bool follower = tp_rank == 1;
         const bool batched = o.prompt_rows != 0U;
         if (!taps_dir.empty()) return mtp_taps(f, prompt, taps_dir, taps_gen, depth);
         const std::uint32_t anchor = prime(f, prompt, batched);
@@ -401,6 +441,23 @@ int main(int argc, char** argv) {
             so.max_rows = max_rows;
             so.verify_ms = verify_ms.empty() ? strix::spec::moe_verify_seed_ms(strix::spec::hy4_verify_bytes(), step_ms, gbps, max_rows) : verify_ms;
             std::unique_ptr<hb::rows::MtpSource<hb::Forward>> source;
+            std::uint64_t plain_fnv = 1469598103934665603ULL;  // the plain ids (compared across one node / pair runs)
+            for (const auto id : plain) plain_fnv = (plain_fnv ^ id) * 1099511628211ULL;
+            if (follower) {  // rank 1: the same prompt pass, then rank 0's verify passes
+                const double prime_t1 = now_ms();
+                if (prime(f, ids, batched) != first_id) throw std::runtime_error("repeat prompt anchor differs (" + label + ")");
+                std::printf("PRIME %s prompt %zu ids %.1f ms (tp rank 1)\n", label.c_str(), ids.size(), now_ms() - prime_t1);
+                const double t1 = now_ms();
+                const auto fr = hb::rows::spec_follow(f, pair_ex);
+                const double wall = now_ms() - t1;
+                std::printf("FOLLOW %s rounds %llu passes %llu rows %llu committed %llu wall %.1f ms (position checked)\n", label.c_str(),
+                            static_cast<unsigned long long>(fr.rounds), static_cast<unsigned long long>(fr.passes),
+                            static_cast<unsigned long long>(fr.rows), static_cast<unsigned long long>(fr.committed), wall);
+                std::printf("PLAIN %s tp rank 1 %.2f tok/s (%.2f ms/token) ids_fnv %016llx\n", label.c_str(), 1000.0 / step_ms, step_ms,
+                            static_cast<unsigned long long>(plain_fnv));
+                std::fflush(stdout);
+                continue;
+            }
             if (mtp) {
                 source = std::make_unique<hb::rows::MtpSource<hb::Forward>>(f);
                 so.copy = mtp_copy;
@@ -414,8 +471,11 @@ int main(int argc, char** argv) {
             const double prime_t0 = now_ms();  // the spec path's prompt pass (with the block: its teacher flushes when the ring fills)
             if (prime(f, ids, batched, source.get()) != first_id) throw std::runtime_error("repeat prompt anchor differs (" + label + ")");
             std::printf("PRIME %s prompt %zu ids %.1f ms%s\n", label.c_str(), ids.size(), now_ms() - prime_t0, source ? " (with the block)" : "");
-            const auto res = source ? hb::rows::spec_decode(f, ids, first_id, spec_n, so, *source)
-                                    : hb::rows::spec_decode(f, ids, first_id, spec_n, so);
+            const auto* pex = tp_rank == 0 ? &pair_ex : nullptr;
+            const auto res = source ? hb::rows::spec_decode(f, ids, first_id, spec_n, so, *source, pex)
+                                    : hb::rows::spec_decode(f, ids, first_id, spec_n, so, pex);
+            std::printf("PLAIN %s %s %.2f tok/s (%.2f ms/token) ids_fnv %016llx\n", label.c_str(), tp_rank == 0 ? "tp rank 0" : "one node",
+                        1000.0 / step_ms, step_ms, static_cast<unsigned long long>(plain_fnv));
             std::size_t first_bad = std::min(res.ids.size(), plain.size());
             for (std::size_t i = 0; i < first_bad; ++i)
                 if (res.ids[i] != plain[i]) {

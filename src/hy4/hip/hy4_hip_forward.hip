@@ -274,7 +274,23 @@ struct Forward::Impl {
         Forward::TpGather gather;
         float* moe = nullptr;  // [2][slot] MoE gather buffer (tp::moe layout)
         std::uint64_t calls = 0;
+        // verify rows under TP (hy4_hip_rows.inc *_vrows_tp): two [2][rows_slot] swap buffers used alternately (a join's
+        // slots are placed before the buffer is swapped again), this rank's routed slot ids of every row [verify_rows][top_k / 2]
+        float* rows = nullptr;
+        std::size_t rows_slot = 0;
+        std::uint32_t flip = 0;
+        std::uint32_t* tids = nullptr;
     } tp;
+    // The one-node form inside a TP rank for a scope: prefill (each rank runs the whole prompt) and the next-token block
+    // (the drafter, rank 0 only). Both ranks hold the whole pack; no gather runs in the scope.
+    struct TpOneNode {
+        Tp& t;
+        std::uint32_t world;
+        explicit TpOneNode(Tp& state) : t(state), world(state.world) { t.world = 1U; }
+        ~TpOneNode() { t.world = world; }
+        TpOneNode(const TpOneNode&) = delete;
+        TpOneNode& operator=(const TpOneNode&) = delete;
+    };
 
     // batched prompt (prompt_rows > 0): [rows][...] workspaces of one window; attn_k_b re-laid 256 wide per layer
     std::uint32_t rmax = 0;
@@ -626,6 +642,13 @@ struct Forward::Impl {
     }
     void allocate_tp() {
         if (tp.moe == nullptr) tp.moe = alloc<float>(2U * htp::moe(0U, c.top_k, c.latent, c.shared_ff).slot);
+        if (vr.max != 0U && tp.rows == nullptr) {  // the largest join of a verify pass, per rank: o, f, dense act, MoE slot
+            const std::size_t m = htp::moe(0U, c.top_k, c.latent, c.shared_ff).slot;
+            tp.rows_slot = std::size_t{vr.max} * std::max({std::size_t{32U} * c.v_head, std::size_t{c.hidden} / 2U,
+                                                             std::size_t{c.dense_ff} / 2U, m});
+            tp.rows = alloc<float>(4U * tp.rows_slot);
+            tp.tids = alloc<std::uint32_t>(std::size_t{vr.max} * c.top_k);
+        }
     }
 
     void sync_time(double& slot, std::chrono::steady_clock::time_point& mark) {
@@ -1753,7 +1776,10 @@ std::string Forward::tp_receipt() const {
            std::to_string(n.gathers) + " gathers per step, " + std::to_string(n.bytes / 1024U) + " KiB sent per rank per step; " +
            std::to_string(impl_->tp.calls) + " gathers so far";
 }
-const std::vector<float>& Forward::prefill(const std::vector<std::uint32_t>& prompt) { return impl_->prefill(prompt); }
+const std::vector<float>& Forward::prefill(const std::vector<std::uint32_t>& prompt) {
+    const Impl::TpOneNode one(impl_->tp);  // each TP rank runs the whole prompt
+    return impl_->prefill(prompt);
+}
 Forward::~Forward() {
     if (impl_ && impl_->s) {
         (void)hipStreamSynchronize(impl_->s);
@@ -1771,9 +1797,13 @@ bool Forward::has_nextn() const noexcept { return impl_->nx.on; }
 void Forward::set_nextn_row_loop(bool on) noexcept { impl_->nx.row_loop = on; }
 Forward::NextnOut Forward::nextn_rows(const std::uint32_t* tokens, const float* hidden, std::uint32_t rows, std::uint32_t pos0, bool want_top,
                                       std::uint32_t outputs) {
+    const Impl::TpOneNode one(impl_->tp);  // the drafter: one-node form on the rank that runs it
     return impl_->nextn_rows(tokens, hidden, rows, pos0, want_top, outputs);
 }
-const std::vector<float>& Forward::nextn_logits() { return impl_->nextn_logits(); }
+const std::vector<float>& Forward::nextn_logits() {
+    const Impl::TpOneNode one(impl_->tp);
+    return impl_->nextn_logits();
+}
 void Forward::set_prompt_hidden(std::function<void(const float*, std::uint32_t, std::uint32_t)> sink) {
     if (sink && impl_->rmax && !impl_->nx.ph) throw std::logic_error("hy4 hip forward: prompt hidden rows need ForwardOptions::nextn");
     impl_->nx.sink = std::move(sink);

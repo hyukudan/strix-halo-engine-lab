@@ -158,8 +158,11 @@ public:
     // head by vocabulary rows (logits joined). Router, latent down/up, shared down, HC sites, norms, Engram, indexer
     // and the greedy pick stay replicated. Every split output is a whole per-head / per-row / per-slot result of the
     // same kernel and the joins are concatenations (the combine runs over all 16 slot rows in slot order): bitwise the
-    // one-node step. Both ranks must run the same step sequence (each gather is a symmetric swap). Prefill, prefill
-    // windows and verify rows stay per rank (each rank runs the whole prompt). Whole-model rank only.
+    // one-node step. Both ranks must run the same step sequence (each gather is a symmetric swap). forward_rows (verify
+    // rows) splits the same way over its R rows (heads, o_proj / FFN / shared rows, routed slots 8 + 8 per row; the head
+    // stays replicated): bitwise the one-node pass; both ranks run the same passes (strix/spec/pair_round.hpp). prefill()
+    // and the next-token block (nextn_rows / nextn_logits, the drafter) run the one-node form on each rank that calls them
+    // (no gather). Whole-model rank only.
     struct TpGather {
         void* ctx = nullptr;
         void (*fn)(void* ctx, void* stream, void* slots, std::size_t slot_bytes, std::size_t bytes) = nullptr;
