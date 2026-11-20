@@ -15,6 +15,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Benchmark completion-marker regression (CPU-only)
+        shell: bash
+        run: python3 scripts/bench/moe-grouped/test_buckets.py
+
       - name: Reject raw NUL bytes in sources
         shell: bash
         run: python3 tools/ci/check_source_bytes.py
