@@ -375,6 +375,14 @@ The next selected checkpoint reuses these charged row leases. This preserves bot
 the checkpoint cadence and the one-block staging default. A delayed/busy descriptor
 can prevent that preparation; missing slices exceeding the cap still skip.
 
+The HIP Qwen route also publishes the request's root mark off cadence: the deepest
+full-T boundary strictly inside its repeated system + tools prefix
+(`GenerationJob::stable_prefix`, `session::root_mark` on the T grid, at most n - 2).
+That boundary is already a certified full-T continuation, so no plan, certificate or
+row changes; another conversation with the same prefix restores there instead of
+at the cadence boundary below it. Both capture paths read the requested set through
+`prefix_capture_boundary_selected` (`apps/qwen_cache_admission.hpp`).
+
 Certified checkpoints use the existing v1 store with a tagged certificate envelope
 in its opaque metadata section when a disk directory is explicitly configured.
 Existing segment files and baseline capture/priming behavior remain unchanged.
