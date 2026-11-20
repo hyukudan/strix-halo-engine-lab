@@ -1,4 +1,4 @@
-// Host oracle of the FAST chunked GDN (strix/cuda_core/gdn_chunk.hpp, gdn-chunk16-f32-v1). Invariants:
+// Host oracle of the FAST chunked GDN (strix/gdn_chunk.hpp, gdn-chunk16-f32-v1). Invariants:
 //  1. the chunk algebra equals the serial recurrence: chunk(float) vs serial(double) relative RMS of o and of the final state is
 //     within the bound and of the same order as the incumbent serial(float) error (rows 1..300, partial chunks, decays from
 //     ~0.05 to ~0.999, betas 0..1);
@@ -19,8 +19,10 @@
 #include <random>
 
 #include "gdn_ref.hpp"
+#include "strix/cuda_core/gdn_chunk.hpp"  // forwarding header
 
-namespace gc = strix::cuda_core::gdn_chunk;
+namespace gc = strix::gdn_chunk;
+static_assert(strix::cuda_core::gdn_chunk::kChunk == gc::kChunk, "the forwarding header aliases the shared contract");
 using gdnref::D;
 
 static int fails = 0;

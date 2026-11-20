@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 project(strix_gdn_chunk LANGUAGES CXX)
 get_filename_component(STRIX_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../.. ABSOLUTE)
-# Host oracle of the FAST chunked GDN prefill (strix/cuda_core/gdn_chunk.hpp); -DSTRIX_GDN_CHUNK_CUDA=ON adds the sm_120 device
+# Host oracle of the FAST chunked GDN prefill (strix/gdn_chunk.hpp); -DSTRIX_GDN_CHUNK_CUDA=ON adds the sm_120 device
 # fixture/bench (chunk kernels vs the serial gdn_prefill_layer, GPU ticket only).
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
