@@ -199,7 +199,7 @@ void engram_hash() {
     const std::int64_t q0 = std::int64_t{c.token_map[5]} * c.engram_mult[3], q1 = std::int64_t{c.token_map[6]} * c.engram_mult[4],
                        q2 = std::int64_t{c.token_map[7]} * c.engram_mult[5];
     check(r1[2] == c.head_offsets[6] + static_cast<std::uint64_t>((q0 ^ q1 ^ q2) % 37), "layer 1 order-3 head by hand");
-    // b5_checks F2: ids at or past the reference table size read the pad's compressed id at every n-gram slot
+    // Reference parity: ids at or past the reference table size read the pad's compressed id at every n-gram slot
     // (the pack: 120,818..120,831 of the 120,832 map); ids below it are unchanged.
     c.engram_table_size = 290;
     const EngramRows cut(c);
@@ -215,7 +215,7 @@ void engram_hash() {
         check(rows_of(cut, {id, 6, 5}, 1) == rows_of(h, {id, 6, 5}, 1), "ids below the table size unchanged");
 }
 
-// b5_checks F1: the Engram RMSNorm eps is torch nn.RMSNorm(eps=None) = FLT_EPSILON (2^-23), not finfo(bf16).eps.
+// Reference parity: the Engram RMSNorm eps is torch nn.RMSNorm(eps=None) = FLT_EPSILON (2^-23), not finfo(bf16).eps.
 void engram_norm_eps() {
     const Config c;
     check(c.engram_norm_eps == std::numeric_limits<float>::epsilon(), "engram_norm_eps == 2^-23");
