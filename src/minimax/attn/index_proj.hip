@@ -76,7 +76,7 @@ __device__ __forceinline__ void load_x(const float* __restrict__ x, unsigned rs,
 // XOR into the outputs).
 template <unsigned R, unsigned D, int MODE = 0> __global__ __launch_bounds__(32) void proj_decode_kernel(IndexProjView v) {
     constexpr unsigned PX = R == 1 ? 8U : R == 2 ? 4U : R <= 4 ? 2U : 1U;
-    const unsigned o = blockIdx.x * 32 + threadIdx.x;
+    const unsigned o = v.first_out + blockIdx.x * 32 + threadIdx.x;  // first_out: 0, or kProjQ (index key only)
     const unsigned row0 = blockIdx.y * R, here = v.rows - row0 < R ? v.rows - row0 : R;
     const float* __restrict__ x = v.x + static_cast<std::size_t>(row0) * kProjIn;
     const unsigned xs = here == R ? kProjIn : 0U;  // row stride; a short group (R = 2, one row) reads its row twice
@@ -337,11 +337,12 @@ __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(8, 8))) voi
 using strix::hip_check;
 
 template <unsigned D> void launch_decode(const IndexProjView& v, unsigned rpw, hipStream_t stream) {
+    const unsigned blocks = (kProjOut - v.first_out) / 32;  // first_out = kProjQ: the 4 index-key blocks only
     if (rpw == 2 && v.rows > 2) {  // row split: pairs of rows per wave
-        hipLaunchKernelGGL((proj_decode_kernel<2, D>), dim3(kProjOut / 32, (v.rows + 1) / 2), dim3(32), 0, stream, v);
+        hipLaunchKernelGGL((proj_decode_kernel<2, D>), dim3(blocks, (v.rows + 1) / 2), dim3(32), 0, stream, v);
         return;
     }
-    const dim3 grid(kProjOut / 32);
+    const dim3 grid(blocks);
     switch (v.rows) {
     case 1: hipLaunchKernelGGL((proj_decode_kernel<1, D>), grid, dim3(32), 0, stream, v); break;
     case 2: hipLaunchKernelGGL((proj_decode_kernel<2, D>), grid, dim3(32), 0, stream, v); break;
@@ -403,6 +404,7 @@ std::vector<_Float16> pack_index_proj(const float* wq_rows, const float* wk_rows
 void enqueue_index_proj_decode(const IndexProjView& v, unsigned ring, hipStream_t stream, unsigned rows_per_wave) {
     if (rows_per_wave != 0 && rows_per_wave != 2) throw std::invalid_argument("index_proj decode: rows_per_wave must be 0 or 2");
     if (v.rows == 0 || v.rows > 8) throw std::invalid_argument("index_proj decode: rows must be 1..8");
+    if (v.first_out != 0 && v.first_out != kProjQ) throw std::invalid_argument("index_proj decode: first_out must be 0 or kProjQ");
     switch (ring) {
     case 8: launch_decode<8>(v, rows_per_wave, stream); break;
     case 16: launch_decode<16>(v, rows_per_wave, stream); break;
@@ -414,6 +416,7 @@ void enqueue_index_proj_decode(const IndexProjView& v, unsigned ring, hipStream_
 }
 
 void enqueue_index_proj_diag(const IndexProjView& v, int mode, hipStream_t stream) {
+    if (v.first_out != 0) throw std::invalid_argument("index_proj diag: every output (first_out 0)");
     const dim3 g1(kProjOut / 32), g2(kProjOut / 32, (v.rows + 1) / 2);
     if (v.rows == 1) {
         switch (mode) {
@@ -502,7 +505,7 @@ void enqueue_index_proj(const IndexProjView& v, hipStream_t stream) {
     const unsigned ring = ring_override();
     const unsigned lds = v.rows >= 2 && v.rows <= 8 ? lds_default() : 0U;
     const unsigned split = v.rows <= 8 && v.rows > 2 && lds == 0 ? split_default() : 0U;
-    const auto choice = route::index_route(v.rows, ring, split, lds);
+    const auto choice = route::index_route(v.rows, ring, split, lds, v.first_out != 0);
     if (choice.lds) enqueue_index_proj_decode_lds(v, stream);
     else if (!choice.tiled) enqueue_index_proj_decode(v, choice.ring, stream, choice.rows_per_wave);
     else enqueue_index_proj_slab(v, stream);  // same bits as enqueue_index_proj_tiled

@@ -6,7 +6,8 @@
 // as a model-local copy.
 //   bf16        canonical BF16 rows (every backend).
 //   int8_token  kv-int8-tok-v1: per (token, kv head, K/V half) int8 codes rint(x / s), s = absmax / 127, one FP32 scale
-//               (HIP sparse QSA walk; strix/model_contract.hpp AttentionKvStorage::int8_token).
+//               (HIP sparse QSA walk; strix/model_contract.hpp: AttentionKvStorage is this Form, the Qwen contract
+//               admits bf16 and int8_token).
 //   e4m3_token  per (token, kv head) e4m3 codes of x / s, s = absmax / 448, one FP32 scale for K and one for V (CUDA
 //               cuda_core::KvShadowE4m3: attn8 prefill, attention_decode8 through attention_decode_kv).
 //

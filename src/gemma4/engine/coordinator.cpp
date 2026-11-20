@@ -19,6 +19,8 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using Json = strix::serve::Json;
 double elapsed(Clock::time_point start) { return std::chrono::duration<double, std::milli>(Clock::now()-start).count(); }
+// The hidden rows a stream's drafter reads from the target (none without a drafter).
+template <class S> HiddenDemand demand(const S& s) { return s.draft ? s.draft->hidden_demand() : HiddenDemand::none; }
 // PREFILL_BATCH (STRIX_G4_PREFILL_BATCH=0 off): streams with prompt chunks pending share one prefill call per step.
 bool prefill_batch_enabled() { static const bool on = strix::env_flag_default_on("STRIX_G4_PREFILL_BATCH"); return on; }
 void require(bool ok, const char* message) { if (!ok) throw std::invalid_argument(message); }
@@ -341,7 +343,7 @@ std::size_t Coordinator::submit_at(std::size_t slot, Request r, std::shared_ptr<
     if (prefix) {
         const auto F = prefix->tokens.size();
         // The drafter must hold exactly the context of the restored rows; one that cannot be seeded gets a fresh stream.
-        if (s->draft && (s->draft->wants_hidden() != !prefix->hidden.empty() ||
+        if (s->draft && ((s->draft->hidden_demand() != HiddenDemand::none) != !prefix->hidden.empty() ||
                 !s->draft->seed({prompt.data(),F+1},prefix->hidden))) {
             s->draft.reset();
             s->state = backend_.create_stream(admitted);
@@ -570,7 +572,7 @@ std::shared_ptr<PrefixSnapshot> Coordinator::snapshot(std::size_t slot) const {
     for (std::size_t i = 0; out->tokens.size() < F; ++i) out->tokens.push_back(s.out.ids.at(i));
     out->state = std::move(state);
     out->prefill_written = s.out.prefill_frontier == F;
-    if (s.draft && s.draft->wants_hidden()) out->hidden = s.last_hidden;
+    if (s.draft && s.draft->hidden_demand() != HiddenDemand::none) out->hidden = s.last_hidden;
     return out;
 }
 std::shared_ptr<PrefixSnapshot> Coordinator::turn_snapshot(std::size_t slot) const {
@@ -723,10 +725,13 @@ bool Coordinator::advance(std::span<const LaneAdvance> lanes, bool subset) {
                 if(call.empty()) continue;
                 const auto begin = Clock::now();
                 std::vector<PrefillRows> results;
-                bool any_hidden = false, any_taps = false;
+                // One pass serves every segment: the merged demand (all_rows > last_committed > none). A backend whose
+                // plan keeps only the pass's last row keeps every row for a multi-segment last_committed pass itself.
+                HiddenDemand any_hidden = HiddenDemand::none;
+                bool any_taps = false;
                 for (const auto& c : call) {
                     const auto& s = *slots_[c.slot];
-                    any_hidden |= s.draft && s.draft->wants_hidden(); any_taps |= s.draft && s.draft->wants_taps();
+                    any_hidden = merge(any_hidden,demand(s)); any_taps |= s.draft && s.draft->wants_taps();
                 }
                 const auto call_start = Clock::now();
                 if (call.size() > 1) {
@@ -740,13 +745,13 @@ bool Coordinator::advance(std::span<const LaneAdvance> lanes, bool subset) {
                         for (const auto& c : call) {
                             const auto& s = *slots_[c.slot];
                             results.push_back(backend_.prefill_rows(*c.tx,{s.request.prompt.data()+s.prompt_processed,c.rows},
-                                s.draft && s.draft->wants_hidden(),s.draft && s.draft->wants_taps()));
+                                demand(s),s.draft && s.draft->wants_taps()));
                         }
                     require(results.size() == call.size(), "backend batched prefill returned another segment count");
                 } else {
                     const auto& s = *slots_[call.front().slot];
                     results.push_back(backend_.prefill_rows(*call.front().tx,{s.request.prompt.data()+s.prompt_processed,call.front().rows},
-                        s.draft && s.draft->wants_hidden(),s.draft && s.draft->wants_taps()));
+                        demand(s),s.draft && s.draft->wants_taps()));
                 }
                 const auto call_ms = elapsed(call_start);
                 for (std::size_t k = 0; k < call.size(); ++k) {
@@ -756,14 +761,19 @@ bool Coordinator::advance(std::span<const LaneAdvance> lanes, bool subset) {
                 auto tx = std::move(c.tx);
                 const auto position = c.position;
                 const auto n = c.rows;
-                const bool hidden = s.draft && s.draft->wants_hidden(), taps = s.draft && s.draft->wants_taps();
+                const auto wanted = demand(s);
+                const bool hidden = wanted != HiddenDemand::none, taps = s.draft && s.draft->wants_taps();
                 const auto& rows = results[k];
                 const auto width = std::size_t(backend_.config().hidden);
-                const auto tap_rows = rows.tap_rows(), hidden_rows = rows.hidden_rows();
+                const auto tap_rows = rows.tap_rows();
+                // last_committed: the backend returns the last row alone, or every row (a pass it did not narrow).
+                const auto returned = rows.hidden_rows();
+                const auto hidden_rows = wanted == HiddenDemand::last_committed && returned.size() == n*width ? returned.last(width) : returned;
                 // Taps nobody consumes may be omitted. Returned taps are scanned
                 // here unless the backend checked them on the device before its failure fence.
                 require(rows.tap_width == 5*width && (tap_rows.size() == n*rows.tap_width || (!taps && tap_rows.empty())) &&
-                    (!hidden || hidden_rows.size() == n*width), "invalid backend prefill layout");
+                    (!hidden || hidden_rows.size() == (wanted == HiddenDemand::last_committed ? width : n*width)),
+                    "invalid backend prefill layout");
                 if (!(rows.levers & prefill::lever_device_finite))
                     for (const auto x : tap_rows) require(std::isfinite(x), "nonfinite backend taps");
                 for (const auto& lever : prefill::lever_names) if (rows.levers & lever.bit) ++s.out.prefill_levers[lever.name];
@@ -778,9 +788,12 @@ bool Coordinator::advance(std::span<const LaneAdvance> lanes, bool subset) {
                         positions.push_back(position+r);
                         next.push_back(s.request.prompt[s.prompt_processed+r+1]);
                     }
+                    // last_committed: only the group holding the last row carries hidden (that row alone).
+                    const auto group_hidden = !hidden ? std::span<const float>{} :
+                        wanted == HiddenDemand::all_rows ? hidden_rows.subspan(first*width,count*width) :
+                        first+count == n ? hidden_rows : std::span<const float>{};
                     s.draft->stage_rows(tap_rows.empty() ? std::span<const float>{} : tap_rows.subspan(first*rows.tap_width,count*rows.tap_width),
-                        hidden ? hidden_rows.subspan(first*width,count*width) : std::span<const float>{},
-                        next,positions);
+                        group_hidden,next,positions);
                     staged += count;
                 };
                 double context_ms = 0;
@@ -887,7 +900,7 @@ bool Coordinator::advance(std::span<const LaneAdvance> lanes, bool subset) {
                     for (const auto id : w.proposals) require(id < backend_.config().vocab, "draft token outside vocabulary");
                 }
             }
-            const bool hidden = s.input_mode || (s.draft && s.draft->wants_hidden());
+            const bool hidden = s.input_mode || demand(s) != HiddenDemand::none;
             // Logits leave the device only for sampled decode rows (greedy rows use
             // the backend's device winners), taps only for a drafter that reads them.
             const bool logits = s.input_mode || (!w.prefill && (s.request.sampling.temperature != 0 || logits_digest_enabled())),
@@ -960,7 +973,7 @@ bool Coordinator::advance(std::span<const LaneAdvance> lanes, bool subset) {
                 }
                 else next.assign(verdict.emitted.begin(),verdict.emitted.begin()+std::ptrdiff_t(processed));
                 const auto width = std::size_t(backend_.config().hidden);
-                const std::span<const float> hidden = s.draft->wants_hidden() ?
+                const std::span<const float> hidden = demand(s) != HiddenDemand::none ?
                     std::span<const float>(out.hidden.data()+w.start*width,processed*width) : std::span<const float>{};
                 s.draft->stage_rows(out.taps.empty() ? std::span<const float>{} :
                     std::span<const float>(out.taps.data()+w.start*out.tap_width,processed*out.tap_width),hidden,next,positions);

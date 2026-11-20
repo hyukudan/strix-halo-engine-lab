@@ -225,7 +225,11 @@ public:
     // windows + commit(rows) under PrefillArith::exact). Returns the logits / argmax / hidden of the LAST token (want = last; none
     // skips the lm_head). Runs the large-M tensor-core path in chunks of options().prefill_chunk rows; falls back to windows when
     // prefill_big is off, dense arith is fp32 or a weight shape is unsupported. Synchronises the host at the end (own streams); no CUDA graphs.
-    RowsOut prefill(const std::uint32_t* tokens, std::uint32_t n, LogitRows want = LogitRows::last);
+    // rows_out (device, [n][hidden] floats, optional): receives EVERY row's hidden in prompt order, the final-norm output
+    // (RowsOut::hidden_post convention) or with rows_pre the final residual (hidden_pre): what an MTP chain needs to fill its
+    // K/V over a long prompt (strix/qwen35/cuda_spec.hpp SpecEngine::prefill_big). Complete when prefill() returns.
+    RowsOut prefill(const std::uint32_t* tokens, std::uint32_t n, LogitRows want = LogitRows::last, float* rows_out = nullptr,
+                    bool rows_pre = false);
     [[nodiscard]] bool prefill_is_big() const;  // whether prefill() takes the large-M path for this engine
     // Accepts the first k rows of the last forward_rows window (0 <= k <= rows). Async on stream().
     void commit(std::uint32_t k);
@@ -242,6 +246,14 @@ public:
     };
     MtpOut mtp_forward(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0,
                     bool want_top = true);  // want_top=false: skip lm_head + argmax (logits/top null): KV/hidden only
+    // K/V-only MTP rows: writes exactly the MTP K/V that mtp_forward(next_tokens, hidden_dev, rows, pos0, *) writes (same
+    // kernels and operands up to kv_store) and computes nothing else; no output. For catch-up rows whose block output and
+    // draft nobody reads (strix/spec/mtp_chain.hpp MtpKvEngine).
+    void mtp_kv(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0);
+    // Witness of the MTP K/V (exactness gates: K/V-only vs full catch-up): copies cache rows [pos0, pos0 + rows) of every
+    // K/V head to the host as bf16 bit patterns, head-major [kv_heads][rows][head_dim] (k_host, v_host: kv_heads * rows *
+    // head_dim each). Synchronizes the stream; not for the decode path.
+    void mtp_kv_read(std::uint32_t pos0, std::uint32_t rows, std::uint16_t* k_host, std::uint16_t* v_host) const;
     // Device-fed MTP chain (strix/spec/mtp_chain.hpp): one row at `pos` whose input id is *in_host (by value) or, with
     // in_host null, the id in feed slot in_slot on the device; want_top also stores the row's draft id in slot out_slot.
     // The chain enqueues a whole draft without host round trips and reads the ids once (mtp_feed_read). Same kernels and

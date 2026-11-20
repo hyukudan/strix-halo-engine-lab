@@ -102,14 +102,14 @@ struct Backend final : e::Backend {
     }
     std::size_t prefill_chunk_rows() const override { return 16; }
     bool prefill_matches_decode() const override { return same; }
-    e::PrefillRows prefill_rows(g::KvTxn& transaction, std::span<const std::uint32_t> tokens, bool hidden,
+    e::PrefillRows prefill_rows(g::KvTxn& transaction, std::span<const std::uint32_t> tokens, g::HiddenDemand hidden,
                                 bool taps) override {
         auto& tx = static_cast<Txn&>(transaction);
         for (std::size_t i = 0; i < tokens.size(); ++i) (void)row_hash(tx, tx.start + tx.tokens.size(), tokens[i] ^ salt);
         e::PrefillRows rows;
         rows.tap_width = 5 * c.hidden;
         if (taps) rows.taps.assign(tokens.size() * rows.tap_width, 0.5F);
-        if (hidden) rows.hidden.assign(tokens.size() * c.hidden, 0.0F);
+        if (hidden != g::HiddenDemand::none) rows.hidden.assign(tokens.size() * c.hidden, 0.0F);
         return rows;
     }
     const g::ModelConfig& config() const override { return c; }

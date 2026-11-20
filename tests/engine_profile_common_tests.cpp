@@ -66,6 +66,36 @@ int main() {
     inputs.profile = Name::standard;
     require(resolve(engine, inputs).entries[0].value == "0", "DEFAULT unchanged");
 
+    // Explicit settings of a bit-changing lever: qualified only at the builtin, the off value or a ready, not provisional
+    // column value (table data); a provisional or pending column value set by hand stamps the run unqualified.
+    {
+        const Lever ready_fast{.name = "rows", .env = "", .option = "--rows", .value = {"", "64", "", ""}, .builtin = "0",
+            .kind = Kind::bit_changing, .ready = {false, true, false, false}, .runnable = {true, true, false, false},
+            .target = "", .off = "0", .source = "gate receipt"};
+        const Lever provisional_fast{.name = "window", .env = "", .option = "--window", .value = {"", "2048", "", ""},
+            .builtin = "0", .kind = Kind::bit_changing, .ready = {}, .runnable = {true, true, false, false}, .target = "",
+            .off = "0", .source = "gate failed", .provisional = {false, true, false, false}};
+        const Lever exact{.name = "order", .env = "", .option = "--order", .value = {"", "1", "", ""}, .builtin = "0",
+            .kind = Kind::exact, .ready = {true, true, false, false}, .runnable = {true, true, false, false}, .target = "",
+            .off = "0", .source = "bitwise"};
+        const std::array rows{ready_fast, provisional_fast, exact};
+        const Engine e{"explicit", "ALLOW", rows};
+        const Lookup none = [](const char*) -> const char* { return nullptr; };
+        const auto stamp = [&](Pairs cli) {
+            Inputs in;
+            in.env = none;
+            in.cli = std::move(cli);
+            return resolve(e, in).qualification();
+        };
+        require(stamp({}) == "qualified", "builtin run qualified");
+        require(stamp({{"rows", "64"}}) == "qualified", "explicit ready column value qualified");
+        require(stamp({{"rows", "0"}, {"window", "0"}}) == "qualified", "explicit builtin / off qualified");
+        require(stamp({{"order", "7"}}) == "qualified", "explicit exact lever qualified");
+        require(stamp({{"rows", "32"}}) == "unqualified: rows", "explicit unlisted value unqualified");
+        require(stamp({{"window", "2048"}}) == "unqualified: window", "explicit provisional column value unqualified");
+        require(stamp({{"rows", "32"}, {"window", "1024"}}) == "unqualified: rows,window", "explicit rows listed in order");
+    }
+
     // Historical fingerprint must keep its nonstandard seed and FF separators.
     const auto legacy = resolve(engine, inputs);
     std::uint64_t hash = 1469598103934665603ULL;

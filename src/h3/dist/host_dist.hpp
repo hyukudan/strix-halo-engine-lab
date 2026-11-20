@@ -21,7 +21,15 @@ struct ForwardTables {
     std::uint32_t n_t = 0;
     block::RopeTable rope;              // [S][48]
     std::vector<std::uint32_t> mod_row; // [S]
+    // Identity of the rope content: a process-unique id assigned when the table is computed (0 = not tracked, e.g.
+    // a hand-built table). Device drivers keep their uploaded copy while the id is unchanged.
+    std::uint64_t rope_id = 0;
+    std::vector<double> rope_pos;       // key of `rope`: the layout's position ids and the model's inv_freq
+    std::vector<float> rope_freq;
     static ForwardTables build(const block::GlobalWeights& g, const block::PackedLayout& L, const block::ForwardPlan& p);
+    // Tables for a new plan (one per sigma). The rope depends only on (position ids, inv_freq), so it is recomputed
+    // only when that key changes; t_emb, n_t and mod_row are rebuilt. Same bytes as build(g, L, p).
+    void update(const block::GlobalWeights& g, const block::PackedLayout& L, const block::ForwardPlan& p);
 };
 
 // Per DiT block: FNV-1a of the residual rows of each key block after the block (0 where the rank does not own it).

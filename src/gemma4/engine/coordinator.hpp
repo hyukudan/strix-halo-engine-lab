@@ -50,7 +50,9 @@ public:
     [[nodiscard]] virtual std::optional<memory::Payload> native_payload() const { return {}; }
 };
 // Rows of one exact many-row prefill call (no logits): taps per row and, when
-// requested, the final-norm hidden rows that RowPlan::export_hidden returns.
+// requested, the final-norm hidden rows that RowPlan::export_hidden returns: every row for HiddenDemand::all_rows;
+// for last_committed at least the call's (each item's) last row: one row, or every row from a backend that
+// does not narrow (the consumer reads the last).
 // A backend may return either as a view of its own memory instead (valid until
 // its next prefill_rows call), and may omit taps nobody asked for.
 struct PrefillRows {
@@ -80,7 +82,7 @@ public:
     // for a prefill whose arithmetic differs from decode (an int8-activation decode beside an FP32 prefill, a WMMA
     // prefill identity): the coordinator keeps prompt chunk boundaries independent of scheduling.
     [[nodiscard]] virtual bool prefill_matches_decode() const { return false; }
-    virtual PrefillRows prefill_rows(KvTxn& transaction, std::span<const std::uint32_t> tokens, bool hidden, bool taps) {
+    virtual PrefillRows prefill_rows(KvTxn& transaction, std::span<const std::uint32_t> tokens, HiddenDemand hidden, bool taps) {
         (void)transaction; (void)tokens; (void)hidden; (void)taps;
         throw std::logic_error("backend has no many-row prefill");
     }
@@ -88,7 +90,7 @@ public:
     virtual bool prefill_batch_supported() const { return false; }
     // Several streams' fresh transactions in one many-row pass, at most prefill_chunk_rows() rows in total: one
     // PrefillRows per item, each equal to prefill_rows on that item alone. Empty = unsupported (one call per stream).
-    virtual std::vector<PrefillRows> prefill_rows_batch(std::span<const PrefillItem> items, bool hidden, bool taps) {
+    virtual std::vector<PrefillRows> prefill_rows_batch(std::span<const PrefillItem> items, HiddenDemand hidden, bool taps) {
         (void)items; (void)hidden; (void)taps;
         return {};
     }
@@ -133,8 +135,11 @@ public:
     }
     // Called once after creation with the request's own stream (drafters that read committed target KV).
     virtual void attach(StreamState& state) { (void)state; }
-    // Request RowPlan::export_hidden on this stream's rows (post-final-norm tap, zero cost when false).
-    [[nodiscard]] virtual bool wants_hidden() const { return false; }
+    // Final-norm hidden rows this session reads from the target (RowPlan::export_hidden; none = zero cost).
+    // last_committed: stage_rows reads only the hidden of positions.back(); the caller then passes that one row with
+    // the group holding the last committed row (hidden may also hold every row of the group: the last is read) and
+    // empty hidden with the other groups, so prefill keeps no other row alive. all_rows: one row per position.
+    [[nodiscard]] virtual HiddenDemand hidden_demand() const { return HiddenDemand::none; }
     // false: stage_rows ignores its taps, so prompt prefill may skip copying them.
     [[nodiscard]] virtual bool wants_taps() const { return true; }
     // true: a drafter whose cost grows per depth from a small base (MTP). Only such sessions are planned, probed
@@ -143,7 +148,7 @@ public:
     [[nodiscard]] virtual bool multi_stream_candidate() const { return false; }
     // Optional: start from a committed prefix restored without staging its rows. tokens = the committed tokens
     // [0, F) followed by the token after them; hidden = the final hidden row of position F-1 (empty when
-    // wants_hidden() is false). Must leave the session as staging and publishing those rows would. false = unsupported.
+    // hidden_demand() is none). Must leave the session as staging and publishing those rows would. false = unsupported.
     virtual bool seed(std::span<const std::uint32_t> tokens, std::span<const float> hidden) {
         (void)tokens; (void)hidden; return false;
     }

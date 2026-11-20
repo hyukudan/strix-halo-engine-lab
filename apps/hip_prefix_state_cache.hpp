@@ -635,13 +635,35 @@ public:
         auto proof=serial_path_?qwen_serial_certificate(plan_,serial_cold_,plan_n_,position):
             (plan_route_==2?qwen_full_t_certificate_v2(plan_,plan_n_,position):qwen_full_t_certificate(plan_,plan_n_,position));
         if(proof.empty()) return {};
-        const auto& binding=plan_route_==2?plan_identity_:identity_;
-        for(unsigned i=0;i<binding.bytes.size();i+=8) {
-            std::uint64_t word=0;
-            for(unsigned j=0;j<8;++j) word|=std::uint64_t(binding.bytes[i+j])<<(8*j);
-            proof.push_back(word);
-        }
+        bind_certificate(proof,plan_route_==2?plan_identity_:identity_);
         return proof;
+    }
+    // A row-class checkpoint's proof: the owner set and identities, not the producer's partition (single route only).
+    std::vector<std::uint64_t> row_class_certificate(std::uint64_t position) const {
+        auto proof=qwen_row_class_certificate(plan_,position);
+        if(!proof.empty()) bind_certificate(proof,identity_);
+        return proof;
+    }
+    [[nodiscard]] std::uint64_t row_class_point() const {return row_class_point_;}
+    // Synchronous capture at row_class_point(): the bridge calls it right after the unit ending there (for the
+    // prompt's last unit: before its last row is adopted). Same payload as after_block (target rows, fixed state,
+    // MTP rows and held row). A class point that is also a full-T boundary stays with the T-grid capture.
+    // Returns "captured" (or a store-side skip inside capture_sync) or the reason no capture was attempted.
+    const char* capture_row_class(const SerialSessionContext& session, std::span<const std::uint32_t> prompt) {
+        const auto p=session.next_position;
+        if(!row_class_ || !row_class_point_ || p!=row_class_point_ || policy_selection_ || !store_ ||
+            store_->policy().legacy || imported_ || !certified_path_ || !plan_enabled_ || serial_path_) return "route";
+        if(p%block_rows_ || p>prompt.size()) return "cache-unit";
+        if(session.committed_tokens!=p || session.health!=SerialSessionHealth::ready || session.arithmetic_lineage.tainted)
+            return "session";
+        if(qwen_full_t_continuation(plan_,plan_n_,p)) return "full-t-boundary";
+        if(!row_class_metadata(session.state,session.arithmetic_lineage,p)) return "lineage";
+        if(!retain_) {store_->record_no_store_skip();return "no-store";}
+        PrefixAsyncCapture::reap();
+        auto proof=row_class_certificate(p);
+        if(proof.empty()) return "certificate";
+        capture_sync(session,prompt,p,std::move(proof));
+        return "captured";
     }
     void set_plan(const QwenTiledPlanConfig& config, std::uint64_t n, bool enabled,
         std::uint64_t route=1,QwenBatchConfig batch={},bool allow_restore=true,bool nesting_possible=false) {
@@ -668,10 +690,15 @@ public:
             put(config.schedule&2U);
         }
         plan_identity_=sha256_bytes(frame);
+        // STRIX_PREFIX_CACHE_ROW_CLASS=0: T-grid checkpoints only (no row-class checkpoint at the prompt's class end).
+        static const bool row_class=strix::envcfg::flag("STRIX_PREFIX_CACHE_ROW_CLASS", true);
+        row_class_=route==1 && row_class;
+        row_class_point_=row_class_ && enabled?qwen_row_class_point(config,n):0;
     }
     void set_serial_plan(const QwenTiledPlanConfig& config,std::uint64_t n,
         std::vector<KnownPromptChunkUnit> trace,std::function<bool(std::uint64_t)> can_resume,bool enabled) {
         set_plan(config,n,enabled);
+        row_class_=false;row_class_point_=0;
         serial_path_=true;serial_cold_=std::move(trace);serial_executed_.clear();
         serial_can_resume_=std::move(can_resume);
         std::vector<std::byte> frame;
@@ -752,6 +779,21 @@ public:
                 c.producer_certificate.empty()) {
                 certificate_decline(serial_path_?PrefixCertificateDecline::serial_certificate_missing_or_incompatible:PrefixCertificateDecline::prefix_certificate_missing_or_incompatible);
                 return false;
+            }
+            if(qwen_row_class_proof(c.producer_certificate)) {
+                // Row-class checkpoint: the same owner set, then this prompt's own continuation from p proven
+                // row by row against its cold plan (qwen_row_class_continuation).
+                const auto proof=row_class_certificate(c.position);
+                if(!row_class_ || serial_path_ || proof.empty() || proof!=c.producer_certificate) {
+                    certificate_decline(PrefixCertificateDecline::prefix_producer_plan_mismatch);return false;
+                }
+                try { (void)preflight_checkpoint(session,c); }
+                catch(const std::runtime_error&) {
+                    certificate_decline(PrefixCertificateDecline::prefix_checkpoint_preflight);return false;
+                }
+                continuation_=qwen_row_class_continuation(plan_,plan_n_,c.position);
+                if(!continuation_) certificate_decline(PrefixCertificateDecline::prefix_continuation_unsupported);
+                return continuation_.has_value();
             }
             const auto proof=execution_certificate(c.position);
             if(proof.empty() || proof!=c.producer_certificate) {
@@ -873,7 +915,9 @@ private:
             session.health!=SerialSessionHealth::ready || !target_valid ||
             !certified_metadata(session.state,session.arithmetic_lineage,p) ||
             !qwen_full_t_continuation(plan_,plan_n_,p)) return {};
-        const bool selected=requested_captures_.contains(p) || p%every_==0 || p+block_rows_>std::min<std::uint64_t>(covered,prompt.size());
+        // The last full-T boundary before the prompt end stays selected when the cache unit is below T.
+        const bool selected=requested_captures_.contains(p) || p%every_==0 ||
+            p+std::max<std::uint64_t>(block_rows_,plan_.rows)>std::min<std::uint64_t>(covered,prompt.size());
         // Unselected boundaries may prefetch rows privately. They never publish checkpoints.
         // This lets a one-block staging cap feed a checkpoint cadence larger than T.
         if(!retain_) {store_->record_no_store_skip();return {};}
@@ -1013,6 +1057,11 @@ public:
         }
         if (!prefix_capture_boundary_selected(position,covered,block_rows_,every_)) return;
         if (!retain_) { store_->record_no_store_skip(); return; }
+        capture_sync(session, prompt, position, certified_path_ ? execution_certificate(position) : std::vector<std::uint64_t>{});
+    }
+    // The synchronous capture after a completed unit: device fence, the new row segments and the fixed state.
+    void capture_sync(const SerialSessionContext& session, std::span<const std::uint32_t> prompt,
+        std::uint64_t position, std::vector<std::uint64_t> certificate) {
         if(prefix_batch_certification_enabled()) store_->record_snapshot_preparation();
         const auto blocks = position / block_rows_;
         const auto start = std::chrono::steady_clock::now();
@@ -1036,7 +1085,7 @@ public:
             checkpoint = std::make_shared<PrefixCacheCheckpoint>();
             checkpoint->conversation = conversation_;
             checkpoint->identity = active_identity();
-            if(certified_path_) checkpoint->producer_certificate=execution_certificate(position);
+            checkpoint->producer_certificate=std::move(certificate);
             checkpoint->digest = digests.back();
             checkpoint->position = position;
             checkpoint->block_rows = block_rows_;
@@ -1395,23 +1444,55 @@ private:
     bool certified_metadata(const PersistentStateGenerations& state,const ArithmeticLineage& lineage,
         std::uint64_t position) const {
         if(!plan_.rows || !arithmetic_lineage_valid(lineage,position) ||
-            static_cast<std::uint32_t>(state.valid)!=plan_.valid_state || lineage.intervals.size()!=position/plan_.rows) return false;
+            static_cast<std::uint32_t>(state.valid)!=plan_.valid_state || lineage.intervals.size()!=position/plan_.rows ||
+            !generations_at(state,position)) return false;
+        for(std::size_t k=0;k<lineage.intervals.size();++k) {
+            const auto& i=lineage.intervals[k];
+            if(i.producer!=ArithmeticProducer::prefill_chunk || i.begin!=k*plan_.rows || i.end!=(k+1U)*plan_.rows ||
+                !owner_interval(i,plan_.block)) return false;
+        }
+        return true;
+    }
+    bool generations_at(const PersistentStateGenerations& state,std::uint64_t position) const {
         for(std::size_t f=0;f<state.generations.size();++f) {
             if(plan_.generations_per_row[f] && position>(UINT64_MAX-plan_.initial_generations[f])/plan_.generations_per_row[f]) return false;
             if(state.generations[f]!=plan_.initial_generations[f]+position*plan_.generations_per_row[f]) return false;
         }
-        for(std::size_t k=0;k<lineage.intervals.size();++k) {
-            const auto& i=lineage.intervals[k];
-            if(i.producer!=ArithmeticProducer::prefill_chunk || i.begin!=k*plan_.rows || i.end!=(k+1U)*plan_.rows ||
-                i.numerical_plan_identity!=plan_.block.execution || i.reduction_plan_identity!=plan_.block.kernel ||
-                i.state_update_identity!=plan_.block.execution) return false;
-        }
         return true;
+    }
+    static bool owner_interval(const ArithmeticRowInterval& i,const QwenPlanOwner& o) {
+        return i.numerical_plan_identity==o.execution && i.reduction_plan_identity==o.kernel && i.state_update_identity==o.execution;
+    }
+    // A row-class state: contiguous prefill chunks from 0 to `position`, each on the class grid and produced by
+    // an owner of this plan (T or tail): any partition of class units, never a serial row or a sub-grid unit.
+    bool row_class_metadata(const PersistentStateGenerations& state,const ArithmeticLineage& lineage,
+        std::uint64_t position) const {
+        if(!plan_.rows || !position || position%qwen_row_class_grid || !arithmetic_lineage_valid(lineage,position) ||
+            static_cast<std::uint32_t>(state.valid)!=plan_.valid_state || lineage.intervals.empty() ||
+            !generations_at(state,position)) return false;
+        std::uint64_t at=0;
+        for(const auto& i:lineage.intervals) {
+            bool owned=owner_interval(i,plan_.block);
+            for(const auto& t:plan_.tails) owned=owned || owner_interval(i,t);
+            if(!owned || i.producer!=ArithmeticProducer::prefill_chunk || i.begin!=at || i.end<=i.begin ||
+                i.begin%qwen_row_class_grid || i.end%qwen_row_class_grid) return false;
+            at=i.end;
+        }
+        return at==position;
+    }
+    static void bind_certificate(std::vector<std::uint64_t>& proof,const ModelContentIdentity& binding) {
+        for(unsigned i=0;i<binding.bytes.size();i+=8) {
+            std::uint64_t word=0;
+            for(unsigned j=0;j<8;++j) word|=std::uint64_t(binding.bytes[i+j])<<(8*j);
+            proof.push_back(word);
+        }
     }
 
     Metadata preflight_checkpoint(const SerialSessionContext& session,const PrefixCacheCheckpoint& c) const {
         const auto m=decode_metadata(c.metadata);
-        if(c.position>layout_.context_tokens || m.position!=c.position || m.committed_tokens!=c.position || !certified_metadata(m.state,m.lineage,c.position) || m.lineage.tainted ||
+        const bool row_class=qwen_row_class_proof(c.producer_certificate);
+        if(c.position>layout_.context_tokens || m.position!=c.position || m.committed_tokens!=c.position ||
+            !(row_class?row_class_metadata(m.state,m.lineage,c.position):certified_metadata(m.state,m.lineage,c.position)) || m.lineage.tainted ||
             !arithmetic_lineage_valid(m.lineage,c.position) || m.layout_identity!=layout_.layout_identity ||
             m.row_bytes!=row_bytes_ || m.fixed_bytes!=fixed_bytes_ || c.fixed.bytes!=fixed_bytes_ ||
             (c.fixed.bytes && !c.fixed.data) || m.execution_identity!=session.execution_identity ||
@@ -1494,6 +1575,8 @@ private:
     std::uint64_t plan_n_=0;
     const void* capture_tag_=nullptr;
     std::uint64_t plan_route_=1;
+    std::uint64_t row_class_point_=0;
+    bool row_class_=false;
     QwenBatchConfig batch_config_;
     bool allow_restore_=true,nesting_possible_=false;
     bool certified_path_=false,plan_enabled_=false,serial_path_=false;

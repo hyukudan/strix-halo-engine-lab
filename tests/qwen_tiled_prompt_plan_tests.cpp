@@ -209,12 +209,80 @@ try {
             "join accepts a cache grid dividing T, including the HTTP 1024-row checkpoint default");
         require(!qwen_prefix_join_grid(0,8192) && !qwen_prefix_join_grid(3072,8192) && !qwen_prefix_join_grid(1024,0),
             "join refuses a missing or non-dividing cache grid");
-        QwenPrefixJoinWait wait{42,9216};
-        require(wait.pending(42,true,true,1024) && wait.pending(42,true,true,9216),"wait keeps incomplete producer");
-        require(!wait.pending(43,true,true,0),"ABA slot generation releases waiter");
-        require(!wait.pending(42,false,true,1024) && !wait.pending(42,true,false,1024),"producer cancellation/completion releases waiter");
-        require(!wait.pending(42,true,true,10240),"passed boundary releases waiter");
     }
+    std::uint64_t class_pairs=0;
+    {
+        // Row-class checkpoints. Independent row-segment formulation: every row below at_p lies in a class unit of the
+        // cold plan; from at_p each row lies in a class unit on both sides or in the identical unit; same tiled end.
+        const auto independent=[](const QwenTiledPlanConfig& rc,std::uint64_t len,std::uint64_t at_p) {
+            if(!at_p || at_p>=len || at_p%128U) return false;
+            const auto cold=qwen_row_class_trace(rc,len,0),resumed=qwen_row_class_trace(rc,len,at_p);
+            if(!cold || !resumed || cold->end!=resumed->end || cold->end<at_p) return false;
+            const auto at=[](const std::vector<QwenPlanUnit>& units,std::uint64_t row)->const QwenPlanUnit* {
+                for(const auto& u:units) if(u.begin<=row && row<u.end) return &u;
+                return nullptr;
+            };
+            std::set<std::uint64_t> cuts{0,at_p};
+            for(const auto& u:cold->units) {cuts.insert(u.begin);cuts.insert(u.end);}
+            for(const auto& u:resumed->units) {cuts.insert(u.begin);cuts.insert(u.end);}
+            for(const auto row:cuts) {
+                if(row>=cold->end) break;
+                const auto* a=at(cold->units,row);
+                if(!a) return false;
+                if(row<at_p) {if(!qwen_row_class_unit(*a)) return false;continue;}
+                const auto* b=at(resumed->units,row);
+                if(!b) return false;
+                const bool ca=qwen_row_class_unit(*a),cb=qwen_row_class_unit(*b);
+                if(ca!=cb || (!ca && !qwen_row_class_same_unit(*a,*b))) return false;
+            }
+            return true;
+        };
+        for(const std::uint32_t t:{2048U,4096U})
+        for(const std::uint32_t sched:{0U,12U,16U})
+        for(const bool full:{true,false}) {
+            QwenTiledPlanConfig rc;rc.rows=t;rc.block={t,QwenPlanOutput::terminal};rc.schedule=sched;
+            rc.ladder=full?std::vector<std::uint32_t>{2048,1024,512,256,128,64,32,16}:std::vector<std::uint32_t>{1024,256,64,16};
+            for(const auto r:rc.ladder) rc.tails.push_back({r,QwenPlanOutput::terminal});
+            rc.generations_per_row={1,0,0,0,0,0};
+            std::set<std::uint64_t> lengths;
+            for(std::uint64_t len=2;len<=2U*t+700U;len+=37U) lengths.insert(len);
+            for(const std::uint64_t edge:{std::uint64_t{t},2U*std::uint64_t{t},2U*std::uint64_t{t}+128U})
+                for(std::uint64_t len=edge-17U;len<=edge+17U;++len) lengths.insert(len);
+            for(const auto len:lengths) {
+                const auto point=qwen_row_class_point(rc,len);
+                require(point%128U==0 && point<=len,"class point on the grid, within the prompt");
+                if(full && len>=128U) require(point+128U>len,"full ladder: the class point is the prompt's last 128-row grid point");
+                for(std::uint64_t at_p=128;at_p<len;at_p+=128) {
+                    ++class_pairs;
+                    require(qwen_row_class_continuation(rc,len,at_p).has_value()==independent(rc,len,at_p),
+                        "row-class continuation equals the independent row-segment check");
+                }
+                // A follow-up that extends this prompt resumes at its class point (full ladder).
+                if(full && point) for(const std::uint64_t extra:{1U,8U,72U,128U,300U,1000U})
+                    require(qwen_row_class_continuation(rc,len+extra,point).has_value(),"follow-up resumes at the producer's class point");
+            }
+        }
+        QwenTiledPlanConfig rc;rc.rows=4096;rc.block={4096,QwenPlanOutput::terminal};rc.schedule=12;
+        rc.ladder={2048,1024,512,256,128,64,32,16};for(const auto r:rc.ladder)rc.tails.push_back({r,QwenPlanOutput::terminal});
+        rc.generations_per_row={1,0,0,0,0,0};
+        // The receipt corner: an 8,192 prompt's deepest full-T checkpoint is 4,096 (its last T unit is final).
+        require(qwen_full_t_certificate(rc,8192,4096).size() && qwen_full_t_certificate(rc,8192,8192).empty(),"T-grid corner");
+        require(qwen_row_class_point(rc,8192)==8192 && qwen_row_class_point(rc,8184)==8064 && qwen_row_class_point(rc,8264)==8192,
+            "class points of the receipt prompts");
+        require(qwen_row_class_continuation(rc,8264,8192) && qwen_row_class_continuation(rc,8264,8064),"8,264 resumes at 8,192 or 8,064");
+        require(!qwen_row_class_continuation(rc,8264,8100) && !qwen_row_class_continuation(rc,8192,8192) &&
+            !qwen_row_class_continuation(rc,8264,0),"off-grid, prompt-end or empty restore refused");
+        const auto class_proof=qwen_row_class_certificate(rc,8192);
+        require(qwen_row_class_proof(class_proof) && !qwen_row_class_proof(qwen_full_t_certificate(rc,8264,4096)),"class proof tagged");
+        require(class_proof!=qwen_row_class_certificate(rc,8064),"generations bind the position");
+        auto other=rc;other.tails[3].execution=7;
+        require(class_proof!=qwen_row_class_certificate(other,8192),"owner set binds the class_proof");
+        // A sparse ladder (no 128-row owner) leaves sub-grid units below at_p: refused.
+        auto sparse=rc;sparse.rows=2048;sparse.block={2048,QwenPlanOutput::terminal};sparse.ladder={1024,256,64,16};
+        sparse.tails.clear();for(const auto r:sparse.ladder)sparse.tails.push_back({r,QwenPlanOutput::terminal});
+        require(!qwen_row_class_continuation(sparse,2500,2432),"sub-grid units below at_p refused");
+    }
+    std::cout<<"row-class: "<<class_pairs<<" (n, p) pairs passed\n";
     std::cout<<"planner passed: "<<shapes<<" shapes, "<<units<<" units; certificates and capture eligibility passed\n";
     return 0;
 } catch(const std::exception& e) {std::cerr<<e.what()<<'\n';return 1;}

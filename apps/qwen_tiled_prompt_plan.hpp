@@ -199,6 +199,81 @@ inline bool qwen_capture_boundary(std::uint64_t p,std::uint64_t n,std::uint32_t 
     return p && p<n && grid && p%grid==0 && complete && !pending && certified;
 }
 
+// Row-class checkpoints: a prompt-end state the next turn of a conversation can resume, off the T grid.
+// Every known-prefill owner (T and tails) runs the same step-major tile8 plan scaled to its rows, so a row computed
+// by a tiled unit whose begin and end both lie on the 128-row class grid has the same bits whatever the unit's size
+// or owner (the T block run as tail units relies on it; the ladder's row classes sit on this grid). Any other unit
+// (sub-128 tail owners, serial suffix, windows) is interchangeable only with an identical unit. The certificate
+// therefore binds the owner set, not the partition; the consumer proves its own continuation from p row by row.
+inline constexpr std::uint64_t qwen_row_class_grid=128;
+inline constexpr std::uint64_t qwen_row_class_magic=0x51524f57434c5331ULL; // QROWCLS1
+inline bool qwen_row_class_unit(const QwenPlanUnit& u) {
+    return u.end>u.begin && u.begin%qwen_row_class_grid==0 && u.end%qwen_row_class_grid==0;
+}
+inline bool qwen_row_class_same_unit(const QwenPlanUnit& a,const QwenPlanUnit& b) {
+    return a.begin==b.begin && a.end==b.end && a.owner_rows==b.owner_rows && a.kind==b.kind && a.owner==b.owner &&
+        a.heads==b.heads && a.final==b.final && a.priming==b.priming && a.async_priming==b.async_priming;
+}
+// The tiled units a fresh cursor runs from `from` to the end of the tiled phases (the serial suffix follows `end`).
+struct QwenRowClassTrace {std::vector<QwenPlanUnit> units;std::uint64_t end=0;};
+inline std::optional<QwenRowClassTrace> qwen_row_class_trace(const QwenTiledPlanConfig& config,
+    std::uint64_t n,std::uint64_t from) {
+    if(!config.rows || from>=n) return std::nullopt;
+    QwenRowClassTrace trace;QwenPlanCursor cursor;trace.end=from;
+    try {
+        while(const auto u=qwen_tiled_next(config,cursor,trace.end,n)) {trace.units.push_back(*u);trace.end=u->end;}
+    } catch(const std::logic_error&) {return std::nullopt;}
+    return trace;
+}
+// Producer: the deepest position p such that every unit of the cold plan below p is a class unit and p ends a unit
+// (p == n when the prompt's last unit is a class unit computing the heads). 0: none.
+inline std::uint64_t qwen_row_class_point(const QwenTiledPlanConfig& config,std::uint64_t n) {
+    const auto trace=qwen_row_class_trace(config,n,0);
+    std::uint64_t p=0;
+    if(trace) for(const auto& u:trace->units) {if(!qwen_row_class_unit(u)) break;p=u.end;}
+    return p;
+}
+// Consumer: the cursor that resumes this prompt at a restored class position p, if every row from p computes in the
+// same class as the cold plan (rows below p: class units of the cold plan; rows from p: class units on both sides
+// or the identical unit; the same tiled end, hence the same serial suffix).
+inline std::optional<QwenPlanCursor> qwen_row_class_continuation(const QwenTiledPlanConfig& config,
+    std::uint64_t n,std::uint64_t p) {
+    if(!p || p>=n || p%qwen_row_class_grid) return std::nullopt;
+    const auto cold=qwen_row_class_trace(config,n,0),resumed=qwen_row_class_trace(config,n,p);
+    if(!cold || !resumed || cold->end!=resumed->end || cold->end<p) return std::nullopt;
+    const auto matched=[](const QwenPlanUnit& u,const std::vector<QwenPlanUnit>& other) {
+        for(const auto& v:other) if(qwen_row_class_same_unit(u,v)) return true;
+        return false;
+    };
+    for(const auto& u:cold->units)
+        if(u.begin<p ? !qwen_row_class_unit(u) : !qwen_row_class_unit(u) && !matched(u,resumed->units))
+            return std::nullopt;
+    for(const auto& v:resumed->units) if(!qwen_row_class_unit(v) && !matched(v,cold->units)) return std::nullopt;
+    return QwenPlanCursor{};
+}
+// Partition-free proof: the owner set and identities that produce class rows, and the persistent generations at p.
+inline std::vector<std::uint64_t> qwen_row_class_certificate(const QwenTiledPlanConfig& config,std::uint64_t p) {
+    if(!p || p%qwen_row_class_grid || !config.rows) return {};
+    std::vector<std::uint64_t> proof{qwen_row_class_magic,qwen_row_class_grid,config.rows,config.schedule,config.priming,
+        config.tiled_start,config.suppressed,config.force_sync_priming};
+    const auto owner=[&](const QwenPlanOwner& o) {
+        proof.insert(proof.end(),{o.rows,static_cast<std::uint64_t>(o.policy),o.execution,o.kernel});
+    };
+    owner(config.block);proof.push_back(config.tails.size());
+    for(const auto& t:config.tails) owner(t);
+    proof.push_back(config.ladder.size());proof.insert(proof.end(),config.ladder.begin(),config.ladder.end());
+    proof.insert(proof.end(),{config.decode_execution,config.decode_kernel,config.prefill_execution,
+        config.prefill_kernel,config.prefill_profile,config.decode_profile,config.profile_pair,config.valid_state});
+    for(std::size_t f=0;f<config.initial_generations.size();++f) {
+        if(config.generations_per_row[f] && p>(UINT64_MAX-config.initial_generations[f])/config.generations_per_row[f]) return {};
+        proof.push_back(config.initial_generations[f]+p*config.generations_per_row[f]);
+    }
+    return proof;
+}
+inline bool qwen_row_class_proof(const std::vector<std::uint64_t>& proof) {
+    return proof.size()>1U && proof[0]==qwen_row_class_magic;
+}
+
 // Batch certificates describe executed units; a replay alone never authorizes capture.
 inline bool qwen_batch_nest_possible(bool worker,std::uint64_t limit,std::uint32_t t,std::uint64_t remaining) {
     return worker && limit && t==8192 && remaining && remaining<t && remaining<=limit;
@@ -289,13 +364,6 @@ inline bool qwen_suffix_solo_class(const QwenTiledPlanConfig& config,std::uint64
 inline bool qwen_prefix_join_grid(std::uint64_t cache_rows,std::uint64_t t_rows) {
     return cache_rows && t_rows && t_rows%cache_rows==0;
 }
-// A wait is tied to an admission generation, never just a reusable slot address.
-struct QwenPrefixJoinWait {
-    std::uint64_t generation=0,boundary=0;
-    bool pending(std::uint64_t current,bool active,bool prefilling,std::uint64_t position) const {
-        return boundary && current==generation && active && prefilling && position<=boundary;
-    }
-};
 inline std::uint64_t qwen_prefix_join_boundary(const QwenTiledPlanConfig& producer,std::uint64_t pn,
     const QwenTiledPlanConfig& consumer,std::uint64_t cn,std::uint64_t common,std::uint64_t from,
     const QwenBatchConfig& batch,bool nesting_possible) {

@@ -1,5 +1,6 @@
 #include "strix/hip_check.hpp"
 #include "core/f16_dense_q8a8.hpp"  // FAST lever ds41-dense-f16-v1 (shared policy dense-q8a8-f16-v1)
+#include "core/hc_core.hpp"         // shared HIP hyper-connection core (bound below at hc_spec)
 #include "ds41_dense_adapter.hpp"  // shared tiled core route (STRIX_DS41_PF_CORE=1)
 #include "strix/env_flags.hpp"
 #include "strix/hip_argmax_core.hpp"
@@ -17,6 +18,8 @@
 
 #include "strix/ds41_attention.hpp"  // q_b's RoPE image (enqueue_q_b_rope_image): RopeRow, rope_pair
 #include "strix/hip_ds41_formats.hpp"
+#include "engram/hip/inject_kernel.hpp"  // shared Engram injection kernel (folded form)
+#include "ops/rope/rope_device.hpp"      // shared RoPE op (enqueue_rope binds Round::none)
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -63,34 +66,23 @@ __device__ inline float butterfly(float v) {
     return v;
 }
 
-// ---- hyper-connections ---------------------------------------------------------------------------
+// ---- hyper-connections: the shared HIP core (src/core/hc_core.hpp) at this model's Spec --------------------------
+namespace hcc = strix::core::hc;
+// mHC of this model: 4 copies, Sinkhorn comb, F16 fn, FP32 streams, post = 2 * sigmoid (no post eps). hidden, the
+// Sinkhorn iterations and the eps values are runtime arguments (HcMixView / HcSiteView).
+constexpr strix::hc::Spec hc_spec{.streams = hc_copies, .hidden = 0, .site = strix::hc::Site::sublayer,
+                                  .comb = strix::hc::Comb::sinkhorn, .sinkhorn_iters = 0, .fn = strix::hc::FnType::f16,
+                                  .store = strix::hc::Store::f32, .post_magnitude = 2.0F};
+static_assert(hc_spec.mix_rows() == hc_mix_count && sizeof(HcMix) == sizeof(hcc::MixRow<hc_spec>) && hc_spec.post_eps == 0.0F);
 constexpr unsigned chunk = dot_chunk;    // elements per wave chunk of the long dots
 constexpr unsigned chunk_k = chunk / 32; // values per lane in a chunk
-constexpr unsigned hc_tile = 8;          // rows per mix-partial block
 constexpr unsigned mix_waves = hc_mix_count + 1;
+static_assert(chunk == hcc::chunk && mix_waves == hcc::mix_waves<hc_spec> && wave == hcc::wave);
 
-// The sublayer input an expansion reads: p[i], or, with the rank partials (HcSiteView::sub_low / sub_high), the canonical
-// rank sum (p[i] + low[i]) + high[i] read in place: the expression and order of canonical_sum_kernel, FP32 adds only (no
-// product, so contraction cannot differ), the same value the materialised sum stored. low and high are both set or both null.
-struct HcSub {
-    const float* __restrict__ p;
-    const float* __restrict__ low;
-    const float* __restrict__ high;
-    __device__ __forceinline__ float operator[](std::size_t i) const {
-        const float s = p[i];
-        return low ? (s + low[i]) + high[i] : s;
-    }
-    __device__ __forceinline__ explicit operator bool() const { return p != nullptr; }
-};
-// Canonical-input specialization for the existing non-collapse site kernels. Unlike HcSub's
-// optional terms this form has no per-element pointer branch; dispatch selects it once.
-struct HcCanonicalSub {
-    const float* __restrict__ p;
-    const float* __restrict__ low;
-    const float* __restrict__ high;
-    __device__ __forceinline__ float operator[](std::size_t i) const { return (p[i] + low[i]) + high[i]; }
-    __device__ __forceinline__ explicit operator bool() const { return p != nullptr; }
-};
+// The sublayer input an expansion reads (HcSiteView::sub_low / sub_high): hcc::SubSum, the canonical rank sum
+// (p[i] + low[i]) + high[i] read in place, the expression and order of canonical_sum_kernel.
+using HcSub = hcc::SubSum;
+using HcCanonicalSub = hcc::CanonicalSubSum;
 // Incumbent stored-input site kernels keep constant-null terms; canonical-input non-collapse
 // sites use a separate compile-time input policy, avoiding a per-element runtime branch.
 __host__ __device__ inline HcSub hc_sub(const HcSiteView& v) { return HcSub{v.sub, v.sub_low, v.sub_high}; }
@@ -100,17 +92,6 @@ template <bool Terms> __host__ __device__ inline auto hc_site_sub(const HcSiteVi
     else return hc_sub_stored(v);
 }
 
-// Copy k of element i of row r after the expansion of the previous sublayer (as hc_expand):
-// post[k] * sub[i] + sum_j comb[j][k] * residual[j][i], the sum from 0 in ascending j.
-__device__ __forceinline__ float copy_value(auto sub, const float* __restrict__ residual,
-                                            const HcMix* __restrict__ em, unsigned r, unsigned k, unsigned i, unsigned hidden) {
-    const float* res = residual + static_cast<std::size_t>(r) * hc_copies * hidden;
-    const HcMix& m = em[r];
-    float s = 0.0F;
-#pragma unroll
-    for (unsigned j = 0; j < hc_copies; ++j) s = s + m.comb[j * hc_copies + k] * res[j * hidden + i];
-    return m.post[k] * sub[static_cast<std::size_t>(r) * hidden + i] + s;
-}
 // All copies of element i of row r: expanded (sub not null) or read from the stored stream.
 __device__ __forceinline__ void site_copies(auto sub, const float* __restrict__ residual,
                                             const HcMix* __restrict__ em, const float* __restrict__ stream, unsigned r, unsigned i,
@@ -122,85 +103,7 @@ __device__ __forceinline__ void site_copies(auto sub, const float* __restrict__ 
         return;
     }
 #pragma unroll
-    for (unsigned k = 0; k < hc_copies; ++k) e[k] = copy_value(sub, residual, em, r, k, i, hidden);
-}
-
-// Mix partials of chunk c for the rows of a tile: wave m < 24 the chunk's lane dot of fn row m with the
-// stream, wave 24 the chunk's sum of squares; the wave's fn values stay in registers over the tile (many
-// rows). partial[(r * 25 + m) * chunks + c].
-__device__ __forceinline__ void mix_partial_block(const float* __restrict__ stream, const std::uint16_t* __restrict__ fn,
-                                                  float* __restrict__ partial, unsigned hidden, unsigned rows, unsigned chunks,
-                                                  unsigned c, unsigned r0) {
-    const unsigned m = threadIdx.x / wave, l = threadIdx.x % wave, n = hc_copies * hidden;
-    const unsigned c0 = c * chunk, len = c0 + chunk < n ? chunk : n - c0, k_count = len / wave;
-    const bool squares = m == hc_mix_count;
-    float f[chunk_k];
-#pragma unroll
-    for (unsigned k = 0; k < chunk_k; ++k)
-        f[k] = !squares && k < k_count ? f16_to_float(fn[static_cast<std::size_t>(m) * n + c0 + k * wave + l]) : 0.0F;
-    for (unsigned r = r0; r < r0 + hc_tile && r < rows; ++r) {
-        const float* x = stream + static_cast<std::size_t>(r) * n + c0 + l;
-        float xv[chunk_k];
-#pragma unroll
-        for (unsigned k = 0; k < chunk_k; ++k) xv[k] = k < k_count ? x[k * wave] : 0.0F;
-        float acc = 0.0F;
-#pragma unroll
-        for (unsigned k = 0; k < chunk_k; ++k)
-            if (k < k_count) acc = acc + (squares ? xv[k] : f[k]) * xv[k];
-        acc = butterfly(acc);
-        if (l == 0) partial[(static_cast<std::size_t>(r) * mix_waves + m) * chunks + c] = acc;
-    }
-}
-
-__global__ __launch_bounds__(32 * mix_waves) void hc_mix_partial_kernel(const float* __restrict__ stream,
-                                                                        const std::uint16_t* __restrict__ fn, unsigned hidden,
-                                                                        unsigned rows, unsigned chunks, float* __restrict__ partial) {
-    mix_partial_block(stream, fn, partial, hidden, rows, chunks, blockIdx.x, blockIdx.y * hc_tile);
-}
-
-// One wave per row: the ascending chunk sums (lane t <= 24 holds dot t), the RMS factor, the split and
-// Sinkhorn (hc_split_sinkhorn). Lane t (and t + 16) holds comb entry (j, k) = (t / 4, t % 4); every row or
-// column sum is gathered from its four lanes and added in ascending order from 0, as on the host.
-__device__ __forceinline__ void mix_final_wave(const float* __restrict__ partial, const float* __restrict__ base,
-                                               const float* __restrict__ scale, unsigned n, unsigned chunks, unsigned iters,
-                                               float hc_eps, float norm_eps, HcMix* __restrict__ out, unsigned r) {
-    const unsigned t = threadIdx.x % wave;
-    float d = 0.0F;
-    if (t < mix_waves) {
-        const float* p = partial + (static_cast<std::size_t>(r) * mix_waves + t) * chunks;
-        for (unsigned c = 0; c < chunks; ++c) d = d + p[c];
-    }
-    constexpr unsigned h = hc_copies;
-    const float rr = declared_rsqrt(__shfl(d, static_cast<int>(hc_mix_count), wave) / static_cast<float>(n) + norm_eps);
-    const unsigned e = t & 15U, j = e / h, k = e % h;
-    HcMix& o = out[r];
-    if (t < h) o.pre[t] = declared_sigmoid((d * rr) * scale[0] + base[t]) + hc_eps;
-    else if (t < 2 * h) o.post[t - h] = 2.0F * declared_sigmoid((d * rr) * scale[1] + base[t]);
-    float v = (__shfl(d, static_cast<int>(2 * h + e), wave) * rr) * scale[2] + base[2 * h + e];
-    auto at = [&](float x, unsigned jj, unsigned kk) { return __shfl(x, static_cast<int>(jj * h + kk), wave); };
-    float mx = at(v, j, 0);
-    for (unsigned kk = 1; kk < h; ++kk) { const float y = at(v, j, kk); mx = y > mx ? y : mx; }
-    v = declared_exp(v - mx);
-    float sum = 0.0F;
-    for (unsigned kk = 0; kk < h; ++kk) sum = sum + at(v, j, kk);
-    v = v / sum + hc_eps;
-    for (unsigned it = 0; it < iters; ++it) {
-        if (it) {
-            float rs = 0.0F;
-            for (unsigned kk = 0; kk < h; ++kk) rs = rs + at(v, j, kk);
-            v = v / (rs + hc_eps);
-        }
-        float cs = 0.0F;
-        for (unsigned jj = 0; jj < h; ++jj) cs = cs + at(v, jj, k);
-        v = v / (cs + hc_eps);
-    }
-    if (t < 16) o.comb[t] = v;
-}
-
-__global__ __launch_bounds__(32) void hc_mix_final_kernel(const float* __restrict__ partial, const float* __restrict__ base,
-                                                          const float* __restrict__ scale, unsigned n, unsigned chunks, unsigned iters,
-                                                          float hc_eps, float norm_eps, HcMix* __restrict__ out) {
-    mix_final_wave(partial, base, scale, n, chunks, iters, hc_eps, norm_eps, out, blockIdx.x);
+    for (unsigned k = 0; k < hc_copies; ++k) e[k] = hcc::copy_value<hc_spec>(sub, residual, em, r, k, i, hidden);
 }
 
 // A8 of one 32-value group held one value per lane (quantize_a8 bitwise): the order-free maximum of
@@ -219,30 +122,6 @@ __device__ inline void a8_group(float y, unsigned l, std::int8_t* code, float* d
     for (int d = 16; d; d >>= 1) s = s + __shfl_xor(s, d, wave);
     *code = static_cast<std::int8_t>(c);
     if (l == 0) { *delta = dl; *sum = s; }
-}
-
-__global__ __launch_bounds__(256) void hc_collapse_kernel(const float* __restrict__ stream, const HcMix* __restrict__ mixes,
-                                                          unsigned hidden, unsigned long long total, float* __restrict__ out) {
-    const auto index = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index >= total) return;
-    const auto r = index / hidden, i = index % hidden;
-    const float* x = stream + r * hc_copies * hidden;
-    float y = 0.0F;
-    for (unsigned c = 0; c < hc_copies; ++c) {
-        const float p = mixes ? mixes[r].pre[c] : (c == 0 ? 1.0F : 0.0F);
-        y = y + p * x[c * hidden + i];
-    }
-    out[index] = y;
-}
-
-__global__ __launch_bounds__(256) void hc_expand_kernel(HcSub sub, const float* __restrict__ residual,
-                                                        const HcMix* __restrict__ mixes, unsigned hidden, unsigned long long total,
-                                                        float* __restrict__ out) {
-    const auto index = static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index >= total) return;  // total = rows * hc * hidden
-    const auto per_row = static_cast<unsigned long long>(hc_copies) * hidden;
-    const auto r = static_cast<unsigned>(index / per_row), rest = static_cast<unsigned>(index % per_row);
-    out[index] = copy_value(sub, residual, mixes, r, rest / hidden, rest % hidden, hidden);
 }
 
 // ---- RMSNorm ----------------------------------------------------------------------------------------
@@ -415,7 +294,7 @@ __device__ __forceinline__ void site_partial_row(auto sub, const float* __restri
     float sq = 0.0F;
 #pragma unroll site_unroll
     for (unsigned k = 0; k < chunk_k; ++k) {
-        const float x = sub ? copy_value(sub, residual, em, r, kc, i0 + k * wave + l, hidden) : srow[k * wave];
+        const float x = sub ? hcc::copy_value<hc_spec>(sub, residual, em, r, kc, i0 + k * wave + l, hidden) : srow[k * wave];
         if (w == 0) {
             if (sub) srow[k * wave] = x;
             sq = sq + x * x;
@@ -458,7 +337,7 @@ __device__ __forceinline__ void site_body(const HcSiteView& v, auto sub, const f
         // by their fences before their counter increments, are then read with ordinary (batched) loads.
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
         if (w == 0) {
-            mix_final_wave(partial, v.base, v.scale, n, mix_chunks, v.iters, v.hc_eps, v.mix_norm_eps, v.mixes_out, r);
+            hcc::mix_final_wave<hc_spec>(partial, v.base, v.scale, n, mix_chunks, v.iters, v.hc_eps, v.mix_norm_eps, v.mixes_out, r);
             if (l == 0) __hip_atomic_store(counters + r, 0U, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
         }
         return;
@@ -650,7 +529,7 @@ template <bool Expand>
 __device__ __forceinline__ float site_stream_value(auto sub, const float* __restrict__ residual,
                                                    const HcMix* __restrict__ em, const float* __restrict__ srow, unsigned r,
                                                    unsigned kc, unsigned i, unsigned hidden, unsigned e) {
-    if constexpr (Expand) return copy_value(sub, residual, em, r, kc, i, hidden);
+    if constexpr (Expand) return hcc::copy_value<hc_spec>(sub, residual, em, r, kc, i, hidden);
     else return srow[e];
 }
 
@@ -928,20 +807,7 @@ __global__ __launch_bounds__(256) void inverse_rope_a8_kernel(InverseRopeA8View 
     inverse_rope_a8_body(v, v.o, v.codes, v.deltas, v.sums);
 }
 
-// ---- RoPE (in place through one pointer) ---------------------------------------------------------
-__global__ __launch_bounds__(256) void rope_kernel(RopeView v) {
-    const unsigned index = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
-    if (index >= v.vectors * v.pairs) return;
-    const unsigned p = index % v.pairs, vec = index / v.pairs;
-    float* x = v.x + static_cast<std::size_t>(r) * v.row_stride + static_cast<std::size_t>(vec) * v.vector_stride + v.offset;
-    const std::size_t t = static_cast<std::size_t>(v.positions[r]) * v.pairs + p;
-    const float c = v.cos[t], s = v.inverse ? -v.sin[t] : v.sin[t];
-    const float2 ab = *reinterpret_cast<const float2*>(x + 2 * p);
-    float2 y;
-    y.x = ab.x * c - ab.y * s;
-    y.y = ab.x * s + ab.y * c;
-    *reinterpret_cast<float2*>(x + 2 * p) = y;
-}
+// ---- RoPE (in place through one pointer): the shared op src/ops/rope (Round::none), see enqueue_rope ----------
 
 // ---- Q8_0 x A8 sites ------------------------------------------------------------------------------
 // One wave per W consecutive output rows (one group of the grouped site), lane l takes the 32-weight
@@ -2199,47 +2065,7 @@ __global__ __launch_bounds__(256) void round_bf16_kernel(float* __restrict__ val
 // the copy's totals are the ascending chunk sums; then every thread applies the gates (in place through
 // hc_stream only). gate_off (may be null): a row whose flag is nonzero gets gate 0 on every copy, so the add is h + 0 * value,
 // as the upstream model's gate.masked_fill(~token_mask, 0) at image positions.
-__global__ __launch_bounds__(1024) void engram_inject_kernel(float* __restrict__ hc_stream, const float* __restrict__ kv,
-                                                             const float* __restrict__ qn, const float* __restrict__ kn, unsigned hidden,
-                                                             float eps, float inv_sqrt_hidden,
-                                                             const std::uint8_t* __restrict__ gate_off) {
-    __shared__ float part[3][hc_copies][32];
-    __shared__ float gates[hc_copies];
-    const unsigned chunks = (hidden + chunk - 1U) / chunk;
-    const unsigned w = threadIdx.x / wave, l = threadIdx.x % wave, cc = w / chunks, c = w % chunks;
-    float* h = hc_stream + static_cast<std::size_t>(blockIdx.x) * hc_copies * hidden;
-    const float* row_kv = kv + static_cast<std::size_t>(blockIdx.x) * (hc_copies + 1U) * hidden;
-    if (cc < hc_copies) {
-        const float* hcp = h + cc * hidden;
-        const float* key = row_kv + cc * hidden;
-        const float* q = qn + cc * hidden;
-        const float* k = kn + cc * hidden;
-        const unsigned c0 = c * chunk, end = c0 + chunk < hidden ? c0 + chunk : hidden;
-        float hh = 0.0F, kk = 0.0F, dk = 0.0F;
-        for (unsigned i = c0 + l; i < end; i += wave) {
-            hh = hh + hcp[i] * hcp[i];
-            kk = kk + key[i] * key[i];
-            dk = dk + (hcp[i] * (q[i] * k[i])) * key[i];
-        }
-        hh = butterfly(hh);
-        kk = butterfly(kk);
-        dk = butterfly(dk);
-        if (l == 0) { part[0][cc][c] = hh; part[1][cc][c] = kk; part[2][cc][c] = dk; }
-    }
-    __syncthreads();
-    if (threadIdx.x < hc_copies) {
-        const unsigned cp = threadIdx.x;
-        float hh = 0.0F, kk = 0.0F, dk = 0.0F;
-        for (unsigned j = 0; j < chunks; ++j) { hh = hh + part[0][cp][j]; kk = kk + part[1][cp][j]; dk = dk + part[2][cp][j]; }
-        const float rh = declared_rsqrt(hh / static_cast<float>(hidden) + eps);
-        const float rk = declared_rsqrt(kk / static_cast<float>(hidden) + eps);
-        const float gate = engram_gate_of((dk * (rh * rk)) * inv_sqrt_hidden);
-        gates[cp] = gate_off != nullptr && gate_off[blockIdx.x] != 0U ? 0.0F : gate;
-    }
-    __syncthreads();
-    const float* value = row_kv + hc_copies * hidden;
-    for (unsigned i = threadIdx.x; i < hc_copies * hidden; i += blockDim.x) h[i] = h[i] + gates[i / hidden] * value[i % hidden];
-}
+// Engram injection kernel: shared home src/engram/hip/inject_kernel.hpp (InjectForm::folded = this model).
 
 unsigned blocks_for(unsigned long long total, unsigned threads) {
     return static_cast<unsigned>((total + threads - 1) / threads);
@@ -2249,26 +2075,19 @@ std::uint64_t q8_bytes(std::uint64_t rows, std::uint64_t width) { return rows * 
 } // namespace
 
 std::size_t hc_mix_partial_floats(std::uint32_t rows, std::uint32_t hidden) {
-    const std::size_t chunks = (std::size_t{hidden} * hc_copies + chunk - 1) / chunk;
-    return std::size_t{rows} * (hc_mix_count + 1) * chunks;
+    return hcc::mix_partial_floats<hc_spec>(rows, hidden);
 }
 
 void enqueue_hc_mixes(const HcMixView& v, void* stream) {
     require(v.stream && v.fn && v.base && v.scale && v.out && v.partial && v.rows && v.hidden && v.iters >= 1, "hc mixes view");
-    const unsigned n = v.hidden * hc_copies, chunks = (n + chunk - 1U) / chunk;
-    hipLaunchKernelGGL(hc_mix_partial_kernel, dim3(chunks, (v.rows + hc_tile - 1U) / hc_tile), dim3(wave * mix_waves), 0,
-                       as_stream(stream), v.stream, v.fn, v.hidden, v.rows, chunks, v.partial);
-    hipLaunchKernelGGL(hc_mix_final_kernel, dim3(v.rows), dim3(wave), 0, as_stream(stream), v.partial, v.base, v.scale, n, chunks,
-                       v.iters, v.hc_eps, v.norm_eps, v.out);
-    hip_check(hipGetLastError(), "hc mixes launch");
+    hip_check(hcc::enqueue_mixes<hc_spec>(v.stream, v.fn, v.base, v.scale, v.rows, v.hidden, v.iters, v.hc_eps, v.norm_eps, v.out,
+                                          v.partial, as_stream(stream)),
+              "hc mixes launch");
 }
 
 void enqueue_hc_collapse(const float* hc_stream, const HcMix* mixes, std::uint32_t rows, std::uint32_t hidden, float* out,
                          void* stream) {
-    const auto total = static_cast<unsigned long long>(rows) * hidden;
-    hipLaunchKernelGGL(hc_collapse_kernel, dim3(blocks_for(total, 256)), dim3(256), 0, as_stream(stream), hc_stream, mixes,
-                       hidden, total, out);
-    hip_check(hipGetLastError(), "hc collapse launch");
+    hip_check(hcc::enqueue_collapse<hc_spec>(hc_stream, mixes, rows, hidden, out, as_stream(stream)), "hc collapse launch");
 }
 
 // The canonical-sum terms of a sub (HcSub): both or neither, only with sub, none of the three inside [out, out + out_bytes).
@@ -2283,10 +2102,8 @@ void enqueue_hc_expand(const float* sub, const float* residual, const HcMix* mix
     const std::size_t n = std::size_t{rows} * hc_copies * hidden * 4;
     require(!overlap(out, n, residual, n) && sub && sub_terms_clear(sub, sub_low, sub_high, n / hc_copies, out, n),
             "hc expand output must not alias its inputs");
-    const auto total = static_cast<unsigned long long>(rows) * hc_copies * hidden;
-    hipLaunchKernelGGL(hc_expand_kernel, dim3(blocks_for(total, 256)), dim3(256), 0, as_stream(stream), HcSub{sub, sub_low, sub_high},
-                       residual, mixes, hidden, total, out);
-    hip_check(hipGetLastError(), "hc expand launch");
+    hip_check(hcc::enqueue_expand<hc_spec>(HcSub{sub, sub_low, sub_high}, residual, mixes, rows, hidden, out, as_stream(stream)),
+              "hc expand launch");
 }
 
 std::size_t hc_site_counter_count(std::uint32_t rows) { return rows; }
@@ -2417,7 +2234,9 @@ void enqueue_inverse_rope_a8(const InverseRopeA8View& v, void* stream) {
 void enqueue_rope(const RopeView& v, void* stream) {
     require(v.x && v.cos && v.sin && v.positions && v.rows && v.vectors && v.pairs, "RoPE view");
     require(v.offset % 2U == 0 && v.row_stride % 2U == 0 && v.vector_stride % 2U == 0, "RoPE view alignment");
-    hipLaunchKernelGGL(rope_kernel, dim3((v.vectors * v.pairs + 255U) / 256U, v.rows), dim3(256), 0, as_stream(stream), v);
+    ops::rope::launch<ops::rope::Round::none>({v.x, v.rows, v.vectors, v.row_stride, v.vector_stride, v.offset, v.pairs, v.cos,
+                                               v.sin, v.positions, v.inverse},
+                                              as_stream(stream));
     hip_check(hipGetLastError(), "RoPE launch");
 }
 
@@ -3683,11 +3502,19 @@ bool enqueue_q8_0_a8_dense_prefill(const Q8A8DensePrefillView& v, void* stream) 
 void enqueue_engram_inject(float* hc_stream, const float* kv, const float* q_norm, const float* k_norm, std::uint32_t rows,
                            std::uint32_t hidden, float eps, void* stream, const std::uint8_t* gate_off) {
     require(hc_stream && kv && q_norm && k_norm && rows && hidden, "Engram injection view");
-    const float inv = static_cast<float>(1.0 / __builtin_sqrt(static_cast<double>(hidden)));
-    const unsigned chunks = (hidden + chunk - 1U) / chunk;
-    require(chunks * hc_copies <= 32U, "Engram injection hidden size");
-    hipLaunchKernelGGL(engram_inject_kernel, dim3(rows), dim3(wave * hc_copies * chunks), 0, as_stream(stream), hc_stream, kv, q_norm,
-                       k_norm, hidden, eps, inv, gate_off);
+    engram::InjectView v;
+    v.form = engram::InjectForm::folded;
+    v.stream = hc_stream;
+    v.kv = kv;
+    v.w0 = q_norm;
+    v.w1 = k_norm;
+    v.gate_off = gate_off;
+    v.rows = rows;
+    v.hidden = hidden;
+    v.copies = hc_copies;
+    v.eps = eps;
+    require(engram::inject_supported(v), "Engram injection hidden size");
+    engram::hip::enqueue_inject<engram::InjectForm::folded>(v, as_stream(stream));
     hip_check(hipGetLastError(), "Engram injection launch");
 }
 

@@ -32,7 +32,9 @@ qwen_command() {
     fi
     command=(env "${rank_env[@]}" "$(binary strix-hip-decode-token)" "$model_dir/${assets[0]}" "${ids[@]}"
         --context "$context" --execution-mode eager --residency register --generate "$generate"
-        --optimization-profile auto --numerical-profile "$identity" --gpu-greedy-token)
+        --optimization-profile auto --numerical-profile "$identity")
+    # Default (host) greedy selection: --gpu-greedy-token is refused with a numerical profile and a known-prefix
+    # window (apps/hip_decode_options.hpp), and MTP owns selection itself.
     [[ $context == 8192 ]] || command+=(--unqualified-context)
     [[ $profile != baseline ]] || command+=(--baseline)
 }
@@ -57,11 +59,6 @@ qwen_mtp() {
     local content=$1 tile=${2:-8192} depth=7 window=8 windows=2,4,8
     [[ $profile != mtp-k* ]] || depth=${profile#mtp-k}
     if ((depth < 3)); then window=2; windows=2; elif ((depth < 7)); then window=4; windows=2,4; fi
-    local arg
-    local filtered=()
-    # MTP owns selection; validate_mtp_cli explicitly rejects --gpu-greedy-token.
-    for arg in "${command[@]}"; do [[ $arg == --gpu-greedy-token ]] || filtered+=("$arg"); done
-    command=("${filtered[@]}")
     command+=(--mtp --mtp-draft-profile distill-g --mtp-sidecar "$model_dir/${assets[1]}"
         --mtp-target-sha256 "$target_sha" --mtp-target-content "$content"
         --mtp-conversion effective-norm-embedding-first-v1 --mtp-normalized-rounding bf16-rne

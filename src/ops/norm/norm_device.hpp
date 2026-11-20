@@ -36,9 +36,12 @@ __device__ __forceinline__ void rmsnorm_row(float* s, const float* xr, float* xw
     }
     const float ss = Traits::template reduce<L>(s, a);
     const float r = Traits::inv_sqrt(ss / static_cast<float>(n) + eps);
+    constexpr OutputForm form = output_form_of<Traits>();  // the Traits' output rounding (norm.hpp OutputForm)
     for (unsigned i = threadIdx.x; i < n; i += L) {
         const float v = Residual ? xw[i] : xr[i];  // this thread's own store of the first loop
-        float y = w ? (v * r) * Traits::load(w, wt, i) : v * r;
+        float y = 0.0F;
+        if constexpr (form == OutputForm::plain) y = w ? (v * r) * Traits::load(w, wt, i) : v * r;
+        else y = finish<form>(v * r, w ? Traits::load(w, wt, i) : 1.0F, w != nullptr);
         yr[i] = y;
         if constexpr (!std::is_same_v<Store, NoStore>) {
             asm volatile("" : "+v"(y));  // y rounded to FP32 before the consumer's conversion (no mixed-precision fold)
