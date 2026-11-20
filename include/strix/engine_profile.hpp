@@ -59,7 +59,7 @@ struct Lever {
     // Comma list of values measured to compute the same bits as each other (receipt in `source`), e.g. window widths of
     // a window-invariant prefill: choosing among them is scheduling, so an explicit member shares the qualification of a
     // ready column whose value is in the list. Empty: every value is its own class. Not part of the fingerprint.
-    std::string_view same_bits;
+    std::string_view same_bits{};
 };
 
 // True when `value` is one whole item of the comma list `list`.
