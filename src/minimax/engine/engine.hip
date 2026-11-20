@@ -15,6 +15,7 @@
 #include "strix/prefill_headless.hpp"
 #include "strix/minimax/engine.hpp"
 #include "strix/dist/communicator.hpp"
+#include "strix/head_argmax.hpp"
 #include "strix/pair/prefill_group.hpp"
 
 #include "mm_kernels.hpp"
@@ -629,6 +630,16 @@ struct Engine::Impl {
     bool attn_fused = true;  // STRIX_MM_ATTN (runtime, default fused; =off: per-row K1-K4): decode MSA in fused launches
     std::uint16_t** cache_tab_h = nullptr;  // per step: [layer][3][row] cache pointers (k, v, index key)
     std::uint16_t** cache_tab_d = nullptr;
+    // cache_tab_d holds the table of (tab_seqs, tab_slots) while tab_valid: a step with the same slot set skips the
+    // rebuild and the H2D. tab_free: the H2D that read cache_tab_h has retired, so the pinned table may be rewritten
+    // (checked before every rewrite, so an exception between enqueue and the step's final sync is safe; no fence).
+    bool tab_valid = false;
+    std::size_t tab_seqs = 0;
+    std::array<std::uint32_t, kMaxStepRows> tab_slots{};
+    hipEvent_t tab_free = nullptr;
+    // embed_rows' pinned token staging (async H2D on the null stream); tok_free guards its rewrite like tab_free.
+    std::uint32_t* tok_h = nullptr;
+    hipEvent_t tok_free = nullptr;
     std::uint32_t* ticket = nullptr;
     msa::RopeRow* step_rope = nullptr;  // per step: the rows' RoPE rows and positions (contiguous)
     std::uint64_t* step_pos = nullptr;
@@ -826,6 +837,7 @@ struct Engine::Impl {
             for (hipEvent_t ev : *events)
                 if (ev != nullptr) (void)hipEventDestroy(ev);
         if (routes_ready != nullptr) (void)hipEventDestroy(routes_ready);
+        for (hipEvent_t ev : {tab_free, tok_free}) if (ev != nullptr) (void)hipEventDestroy(ev);
         if (idx_side != nullptr) (void)hipStreamDestroy(idx_side);
         if (route_stream != nullptr) (void)hipStreamDestroy(route_stream);
         if (xb_warm_stream != nullptr) (void)hipStreamDestroy(xb_warm_stream);  // decode: warm side stream and its sink
@@ -1528,6 +1540,8 @@ struct Engine::Impl {
             pf_idx_xt = dalloc<_Float16>(pf_idx_xt_rows * kHidden);
         }
         hip_ok(hipEventCreateWithFlags(&routes_ready, hipEventDisableTiming), "route event");
+        hip_ok(hipEventCreateWithFlags(&tab_free, hipEventDisableTiming), "cache table event");
+        hip_ok(hipEventCreateWithFlags(&tok_free, hipEventDisableTiming), "token staging event");
         if (fp32_prefill) {  // FP32 identity workspaces: expert pairs (T x 4 rows) at the widest site
             const std::size_t pairs = T * kTopE;
             f32_xt = dalloc<float>(pairs * kHidden);
@@ -1635,6 +1649,7 @@ struct Engine::Impl {
         logits = dalloc<float>(std::max<std::size_t>(kGatherRows, kMaxStepRows) * kVocabPad);
         rows_d = dalloc<std::uint32_t>(T);
         tok_d = dalloc<std::uint32_t>(T);
+        hip_ok(hipHostMalloc(reinterpret_cast<void**>(&tok_h), T * sizeof(std::uint32_t), hipHostMallocDefault), "token staging");
         am_local = dalloc<std::uint32_t>(2 * kMaxStepRows);
         am_remote = dalloc<std::uint32_t>(2 * kMaxStepRows);
         ctl_local = dalloc<std::uint8_t>(kControlBytes);
@@ -2680,49 +2695,64 @@ struct Engine::Impl {
 
     void embed_rows(const std::uint32_t* toks, std::size_t n) {
         mark();
-        hip_ok(hipMemcpy(tok_d, toks, n * 4, hipMemcpyHostToDevice), "tokens");
+        // Pinned staging + async copy, in order on the null stream: the host goes on to enqueue the layers instead of
+        // waiting for the copy (and for the step tables queued before it). The previous copy from tok_h has retired
+        // before the rewrite (tok_free; immediate on the success path, which ends in a device sync).
+        hip_ok(hipEventSynchronize(tok_free), "token staging free");
+        std::memcpy(tok_h, toks, n * sizeof(std::uint32_t));
+        hip_ok(hipMemcpyAsync(tok_d, tok_h, n * sizeof(std::uint32_t), hipMemcpyHostToDevice, nullptr), "tokens");
+        hip_ok(hipEventRecord(tok_free, nullptr), "token staging event");
         hipLaunchKernelGGL(embed_kernel, dim3(static_cast<unsigned>(n)), dim3(256), 0, nullptr, embed, tok_d, h, kHidden);
         lap(prof.embed);
     }
 
-    // Head on `n` rows of hn starting at `first` (vocabulary half), then the global argmax of each row: one exchange of
-    // (max, id) per row; ties go to the lower id (rank 0's half).
+    // Head on `n` rows of hn (this rank's vocabulary half), then the global argmax of each row through the shared
+    // split-vocabulary pair contract (strix/head_argmax.hpp: first max, rank 0 wins ties): one exchange of one PairWord
+    // per row. A non-finite logit on either rank fails the row on BOTH ranks after the exchange (the rank that saw it no
+    // longer throws first and leaves the peer waiting in the exchange).
     std::vector<std::uint32_t> head_argmax(const float* rows_in, std::size_t n) {
+        namespace ha = strix::head_argmax;
         mark();
         lib.mm(head, rows_in, logits, n, true);
         std::vector<float> lg(n * vn);
         hip_ok(hipMemcpy(lg.data(), logits, lg.size() * 4, hipMemcpyDeviceToHost), "logits");
-        std::vector<std::uint32_t> mine(2 * n), theirs(2 * n);
-        for (std::size_t r = 0; r < n; ++r) {
-            const float* l = lg.data() + r * vn;
-            std::uint32_t best = 0;
-            bool finite = true;
-            for (std::uint32_t i = 0; i < vn; ++i) {
-                finite &= std::isfinite(l[i]);
-                if (l[i] > l[best]) best = i;
-            }
-            if (!finite) throw std::runtime_error("non-finite logits");
-            std::memcpy(&mine[2 * r], &l[best], 4);
-            mine[2 * r + 1] = best + (opt.rank == 0 ? 0U : static_cast<std::uint32_t>(kVocabPad));
-        }
-        hip_ok(hipMemcpy(am_local, mine.data(), n * 8, hipMemcpyHostToDevice), "am");
+        std::vector<ha::PairWord> mine(n), theirs(n);
+        const std::uint32_t id0 = opt.rank == 0 ? 0U : static_cast<std::uint32_t>(kVocabPad);
+        for (std::size_t r = 0; r < n; ++r)
+            mine[r] = ha::pair_word(ha::reference(std::span<const float>(lg.data() + r * vn, vn), id0));
+        hip_ok(hipMemcpy(am_local, mine.data(), n * sizeof(ha::PairWord), hipMemcpyHostToDevice), "am");
         dist::Tag tag;
         tag.kind = static_cast<std::uint32_t>(dist::TagKind::argmax);
         tag.layer = kLayers;
         tag.request = calls;
-        comm.exchange(nullptr, am_local, am_remote, n * 8, tag);
-        hip_ok(hipMemcpy(theirs.data(), am_remote, n * 8, hipMemcpyDeviceToHost), "am r");
+        comm.exchange(nullptr, am_local, am_remote, n * sizeof(ha::PairWord), tag);
+        hip_ok(hipMemcpy(theirs.data(), am_remote, n * sizeof(ha::PairWord), hipMemcpyDeviceToHost), "am r");
         std::vector<std::uint32_t> out(n);
         for (std::size_t r = 0; r < n; ++r) {
-            const std::uint32_t* r0 = opt.rank == 0 ? &mine[2 * r] : &theirs[2 * r];
-            const std::uint32_t* r1 = opt.rank == 0 ? &theirs[2 * r] : &mine[2 * r];
-            float v0, v1;
-            std::memcpy(&v0, &r0[0], 4);
-            std::memcpy(&v1, &r1[0], 4);
-            out[r] = v1 > v0 ? r1[1] : r0[1];
+            out[r] = opt.rank == 0 ? ha::pair_pick(mine[r], theirs[r]) : ha::pair_pick(theirs[r], mine[r]);
+            if (out[r] == ha::kNone) throw std::runtime_error("non-finite logits");
         }
         lap(prof.head);
         return out;
+    }
+
+    // The greedy pick of the prompt's last row (prefill tail): with the transfer module the same device argmax and
+    // exchange as a decode step (shared strix::xport::argmax_exchange: no full-logits download, no CPU scan), else
+    // head_argmax. Same rule on both paths (first max, rank 0 wins ties, non-finite fails both ranks). The prefill
+    // module has been drained by the caller; the routed communicator gives the transport back as before a decode step.
+    std::uint32_t head_pick_last(const float* row) {
+        if (xf == nullptr || !xfer_on) return head_argmax(row, 1)[0];
+        if (comm.device_exchange()) comm.release_transport(nullptr);
+        mark();
+        lib.mm(head, row, logits, 1, true);
+        mx::argmax_exchange(*xf, logits, 1U, static_cast<unsigned>(vn), static_cast<unsigned>(vn),
+                            opt.rank == 0 ? 0U : static_cast<std::uint32_t>(kVocabPad), calls, out_ids_d);
+        std::uint32_t id = 0;
+        hip_ok(hipMemcpy(&id, out_ids_d, sizeof(id), hipMemcpyDeviceToHost), "id");
+        xf->drain();
+        if (id == mx::kNonFinite) throw std::runtime_error("non-finite logits");
+        lap(prof.head);
+        return id;
     }
 
     // Resumable prefill (serve scheduler, qualification notes): prefill()'s walk over the chunks / groups as a
@@ -2880,7 +2910,7 @@ struct Engine::Impl {
                         if (pf_active) pf->drain();
                         const std::size_t n_last = rows - (m - 1) * opt.max_rows;
                         last_out = {last_hn, n_last};
-                        task.next = head_argmax(last_hn + (n_last - 1) * kHidden, 1)[0];
+                        task.next = head_pick_last(last_hn + (n_last - 1) * kHidden);
                     }
                     ++calls;
                     task.c += m;
@@ -2897,7 +2927,7 @@ struct Engine::Impl {
                     if (last) {
                         if (pf_active) pf->drain();
                         last_out = {hn, rows};
-                        task.next = head_argmax(hn + (rows - 1) * kHidden, 1)[0];
+                        task.next = head_pick_last(hn + (rows - 1) * kHidden);
                     }
                     ++calls;
                     ++task.c;
@@ -3436,20 +3466,32 @@ struct Engine::Impl {
         step_seqs = layout.seqs;
         step_rows_per_seq = layout.rows_per_seq;
         if (attn_fused && step_seqs != 0) {  // per-step tables of the fused MSA view: cache pointers, RoPE rows, positions
-            for (unsigned L = 0; L < kLayers; ++L)
-                for (std::size_t r = 0; r < step_seqs; ++r) {
-                    std::uint16_t** t = cache_tab_h + std::size_t{L} * 3 * kMaxStepRows;
-                    t[r] = kc + cache_off(rows[r].slot, L, kKVLocal);
-                    t[kMaxStepRows + r] = vc + cache_off(rows[r].slot, L, kKVLocal);
-                    t[2 * kMaxStepRows + r] = ikc + cache_off(rows[r].slot, L, 128);
-                }
-            hip_ok(hipMemcpyAsync(cache_tab_d, cache_tab_h, std::size_t{kLayers} * 3 * kMaxStepRows * sizeof(void*),
-                                  hipMemcpyHostToDevice, nullptr), "cache table");
+            // The cache table depends only on the rows' slots (fixed cache bases): rebuilt and copied only when the slot
+            // set changes (decode keeps it across steps). No fence: the pinned table is rewritten only after the copy
+            // that read it retired (tab_free), and the null stream orders the copies before the layers.
+            bool same = tab_valid && tab_seqs == step_seqs;
+            for (std::size_t r = 0; same && r < step_seqs; ++r) same = tab_slots[r] == rows[r].slot;
+            if (!same) {
+                tab_valid = false;
+                hip_ok(hipEventSynchronize(tab_free), "cache table free");
+                for (unsigned L = 0; L < kLayers; ++L)
+                    for (std::size_t r = 0; r < step_seqs; ++r) {
+                        std::uint16_t** t = cache_tab_h + std::size_t{L} * 3 * kMaxStepRows;
+                        t[r] = kc + cache_off(rows[r].slot, L, kKVLocal);
+                        t[kMaxStepRows + r] = vc + cache_off(rows[r].slot, L, kKVLocal);
+                        t[2 * kMaxStepRows + r] = ikc + cache_off(rows[r].slot, L, 128);
+                    }
+                hip_ok(hipMemcpyAsync(cache_tab_d, cache_tab_h, std::size_t{kLayers} * 3 * kMaxStepRows * sizeof(void*),
+                                      hipMemcpyHostToDevice, nullptr), "cache table");
+                hip_ok(hipEventRecord(tab_free, nullptr), "cache table event");
+                for (std::size_t r = 0; r < step_seqs; ++r) tab_slots[r] = rows[r].slot;
+                tab_seqs = step_seqs;
+                tab_valid = true;
+            }
             for (std::size_t r = 0; r < n; ++r) {
                 hip_ok(hipMemcpyAsync(step_rope + r, d_rope + rows[r].pos, sizeof(msa::RopeRow), hipMemcpyDeviceToDevice, nullptr), "rope");
                 hip_ok(hipMemcpyAsync(step_pos + r, d_pos + rows[r].pos, 8, hipMemcpyDeviceToDevice, nullptr), "pos");
             }
-            hip_ok(hipStreamSynchronize(nullptr), "step tables");  // the host table is rewritten by the next step
         }
         embed_rows(toks.data(), n);
         layers_forward(n, rows, 0, 0, kLayers);

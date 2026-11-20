@@ -409,6 +409,11 @@ target_include_directories(strix_ds41_http_session_owner PUBLIC src)
 target_link_libraries(strix_ds41_http_session_owner PUBLIC strix_session_owner)
 strix_target_warnings(strix_ds41_http_session_owner)
 if(BUILD_TESTING)
+    # CPU-only checks against the real HIP find_library command (toolkit priority and legacy fallback).
+    add_test(NAME strix-hip-toolkit-lookup-tests
+        COMMAND "${CMAKE_COMMAND}" "-DSTRIX_REPO_ROOT=${CMAKE_SOURCE_DIR}"
+                -P "${CMAKE_SOURCE_DIR}/tests/cmake/hip_toolkit_paths_tests.cmake")
+    set_tests_properties(strix-hip-toolkit-lookup-tests PROPERTIES LABELS "cpu;build")
     add_executable(strix-exact-reduce-contract-tests tests/exact_reduce_contract_tests.cpp)
     target_compile_features(strix-exact-reduce-contract-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-exact-reduce-contract-tests)
@@ -433,6 +438,13 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-qwen-gdn-prepass-tests)
     add_test(NAME strix-qwen-gdn-prepass-tests COMMAND strix-qwen-gdn-prepass-tests)
     set_tests_properties(strix-qwen-gdn-prepass-tests PROPERTIES LABELS "cpu")
+
+    add_executable(strix-gdn-prefill-overlap-tests tests/gdn_prefill_overlap_tests.cpp)
+    target_include_directories(strix-gdn-prefill-overlap-tests PRIVATE include)
+    target_compile_features(strix-gdn-prefill-overlap-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-gdn-prefill-overlap-tests)
+    add_test(NAME strix-gdn-prefill-overlap-tests COMMAND strix-gdn-prefill-overlap-tests)
+    set_tests_properties(strix-gdn-prefill-overlap-tests PROPERTIES LABELS "cpu")
     add_executable(strix-qsa-index-rb8-host-tests tests/qsa_index_rb8_host_tests.cpp)
     target_compile_features(strix-qsa-index-rb8-host-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-qsa-index-rb8-host-tests)
@@ -490,6 +502,11 @@ if(BUILD_TESTING)
     target_compile_features(strix-attn-row-share-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-attn-row-share-tests)
     add_test(NAME strix-attn-row-share-tests COMMAND strix-attn-row-share-tests)
+    add_executable(strix-fma-rows-policy-tests tests/fma_rows_policy_tests.cpp)
+    target_include_directories(strix-fma-rows-policy-tests PRIVATE include)
+    target_compile_features(strix-fma-rows-policy-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-fma-rows-policy-tests)
+    add_test(NAME strix-fma-rows-policy-tests COMMAND strix-fma-rows-policy-tests)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
         # Source form of the shared EXACT dense decode attention (fp contraction pinned, one arithmetic copy).
@@ -1550,6 +1567,12 @@ if(BUILD_TESTING)
     # Its worker/selector gates are bounded; this bounds a wait inside the selection itself.
     set_tests_properties(strix-mtp-selection-transaction-tests PROPERTIES TIMEOUT 900)
 
+    # Thinking budgets on device-greedy windows (argmax replies only): select_greedy_window + ArgmaxConstraintRequests.
+    add_executable(strix-greedy-window-selection-tests tests/greedy_window_selection_tests.cpp)
+    target_link_libraries(strix-greedy-window-selection-tests PRIVATE strix_serve)
+    strix_target_warnings(strix-greedy-window-selection-tests)
+    add_test(NAME strix-greedy-window-selection-tests COMMAND strix-greedy-window-selection-tests)
+
     add_executable(strix-serve-json-constraint-tests tests/serve_json_constraint_tests.cpp)
     target_link_libraries(strix-serve-json-constraint-tests PRIVATE strix_serve)
     strix_target_warnings(strix-serve-json-constraint-tests)
@@ -1700,6 +1723,12 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-serve-startup-phases-tests)
     add_test(NAME strix-serve-startup-phases-tests COMMAND strix-serve-startup-phases-tests)
     set_tests_properties(strix-serve-startup-phases-tests PROPERTIES LABELS "cpu" TIMEOUT 120)
+    # Server start warm-up: plan, synthetic ids and run wrapper (strix/serve/startup_warmup.hpp).
+    add_executable(strix-serve-startup-warmup-tests tests/serve_startup_warmup_tests.cpp)
+    target_link_libraries(strix-serve-startup-warmup-tests PRIVATE strix_core)
+    strix_target_warnings(strix-serve-startup-warmup-tests)
+    add_test(NAME strix-serve-startup-warmup-tests COMMAND strix-serve-startup-warmup-tests)
+    set_tests_properties(strix-serve-startup-warmup-tests PROPERTIES LABELS "cpu" TIMEOUT 120)
     add_test(NAME strix-prefill-option-cache-write COMMAND strix-prefix-state-cache-tests
         --write-option-checkpoint "${CMAKE_CURRENT_BINARY_DIR}/prefill-option-cache")
     add_test(NAME strix-prefill-option-cache-read COMMAND strix-prefix-state-cache-tests
@@ -2090,6 +2119,10 @@ if(BUILD_TESTING)
     target_link_libraries(strix-lane-chain-hyper-output-tests PRIVATE strix_core)
     strix_target_warnings(strix-lane-chain-hyper-output-tests)
     add_test(NAME strix-lane-chain-hyper-output-tests COMMAND strix-lane-chain-hyper-output-tests)
+    add_executable(strix-model-copy-source-tests tests/model_copy_source_tests.cpp)
+    target_include_directories(strix-model-copy-source-tests PRIVATE include)
+    strix_target_warnings(strix-model-copy-source-tests)
+    add_test(NAME strix-model-copy-source-tests COMMAND strix-model-copy-source-tests)
     add_executable(strix-model-selective-copy-layout-tests tests/model_selective_copy_layout_tests.cpp)
     target_link_libraries(strix-model-selective-copy-layout-tests PRIVATE strix_core)
     strix_target_warnings(strix-model-selective-copy-layout-tests)
@@ -3153,23 +3186,24 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     # CMake's HIP language drives device compilation directly. ROCm 7.x
     # development images do not necessarily ship the legacy hipConfig.cmake /
     # hip::host package target, so locate the runtime header/library from the
-    # toolkit instead of requiring that package surface.
+    # toolkit instead of requiring that package surface. The compiler's own ROCm root comes before
+    # /opt/rocm so a toolkit selected only by CMAKE_HIP_COMPILER gets its own headers and runtime.
     find_path(
         STRIX_HIP_INCLUDE_DIR
         NAMES hip/hip_runtime.h
-        HINTS "$ENV{ROCM_PATH}" /opt/rocm
+        HINTS "$ENV{ROCM_PATH}" "${CMAKE_HIP_COMPILER_ROCM_ROOT}" /opt/rocm
         PATH_SUFFIXES include
         REQUIRED
     )
     find_library(
         STRIX_HIP_RUNTIME_LIBRARY
         NAMES amdhip64
-        HINTS "$ENV{ROCM_PATH}" /opt/rocm
+        HINTS "$ENV{ROCM_PATH}" "${CMAKE_HIP_COMPILER_ROCM_ROOT}" /opt/rocm
         PATH_SUFFIXES lib lib64
         REQUIRED
     )
     add_library(strix_tiled_core STATIC src/core/wmma_tiled.hip)
-    target_include_directories(strix_tiled_core PUBLIC src PRIVATE "${STRIX_HIP_INCLUDE_DIR}")
+    target_include_directories(strix_tiled_core PUBLIC src include PRIVATE "${STRIX_HIP_INCLUDE_DIR}")
     target_compile_options(strix_tiled_core PRIVATE -O3 -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
         -fhip-fp32-correctly-rounded-divide-sqrt)
     set_target_properties(strix_tiled_core PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
@@ -3637,9 +3671,10 @@ int main() { return 0; }"
         target_compile_definitions(strix-hip-mtp-model-qualification PRIVATE
             STRIX_DECODE_ENTRY=strix_hip_decode_token_entry STRIX_MTP_MODEL_QUALIFICATION_RUNNER=1)
         target_include_directories(strix-hip-mtp-model-qualification PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+        # Same link closure as strix-hip-decode-token: the runner compiles the same main.
         target_link_libraries(strix-hip-mtp-model-qualification PRIVATE
-            strix_hip_runtime strix_mtp_projection_component_fixtures strix_serve strix_assets strix_qwen_model_description
-            strix_device_profile)
+            strix_hip_runtime strix_mtp_projection_component_fixtures strix_serve strix_serve_json strix_assets
+            strix_qwen_model_description strix_device_profile strix_qwen_http_session_owner)
         # Large state snapshots are diagnostic-only. Prefer the system SHA-256
         # provider when available; the portable digest remains the fallback.
         find_package(OpenSSL QUIET COMPONENTS Crypto)
@@ -4100,6 +4135,19 @@ int main() { return 0; }"
         # The same byte gate with the stepped LDS windows forced for every window they can hold.
         add_test(NAME strix-hip-q8-rows-projection-stepped-tests COMMAND strix-hip-q8-rows-projection-tests)
         set_tests_properties(strix-hip-q8-rows-projection-stepped-tests PROPERTIES ENVIRONMENT "STRIX_Q8_ROWS_STEPPED=1")
+
+        # Stock Q8_0 sites: LinearRowsF32<2..8> against LinearF32 per row, default kernels and project_rows_kernel only.
+        add_executable(strix-hip-q8-rows-stock-tests tests/hip_q8_rows_stock_tests.hip)
+        set_target_properties(strix-hip-q8-rows-stock-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_link_libraries(strix-hip-q8-rows-stock-tests PRIVATE strix_hip_runtime)
+        target_include_directories(strix-hip-q8-rows-stock-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_compile_options(strix-hip-q8-rows-stock-tests PRIVATE
+            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
+        strix_target_warnings(strix-hip-q8-rows-stock-tests)
+        add_test(NAME strix-hip-q8-rows-stock-tests COMMAND strix-hip-q8-rows-stock-tests)
+        add_test(NAME strix-hip-q8-rows-stock-direct-tests COMMAND strix-hip-q8-rows-stock-tests)
+        set_tests_properties(strix-hip-q8-rows-stock-direct-tests PROPERTIES ENVIRONMENT "STRIX_Q8_ROWS_VOPD=0")
 
         # External fixtures pin compressed bits and identify the materialized
         # reference separately. Never register a GPU invocation with CTest.
@@ -4722,6 +4770,10 @@ if(STRIX_ENABLE_HIP_RUNTIME)
         add_executable(strix-hip-xport-split-frame-bench tests/hip_xport_split_frame_bench.hip)
         target_link_libraries(strix-hip-xport-split-frame-bench PRIVATE strix_dist strix_xport)
         target_include_directories(strix-hip-xport-split-frame-bench PRIVATE src include)
+        # Bounded device wait of the channel consumer (wait_view budget + sticky abort word): one GPU, no transport
+        add_executable(strix-hip-xport-bounded-wait-tests tests/hip_xport_bounded_wait_tests.hip)
+        target_link_libraries(strix-hip-xport-bounded-wait-tests PRIVATE strix_dist strix_xport)
+        target_include_directories(strix-hip-xport-bounded-wait-tests PRIVATE src include)
         add_executable(strix-hip-dist-hostpath-tests tests/hip_dist_hostpath_tests.cpp)
         target_link_libraries(strix-hip-dist-hostpath-tests PRIVATE strix_dist)
         strix_target_warnings(strix-hip-dist-hostpath-tests)
@@ -5190,7 +5242,10 @@ if(STRIX_ENABLE_HIP_RUNTIME)
     endif()
     option(STRIX_DS41_PREFILL_FP16_LT "Build optional FP16 dense prefill backend" OFF)
     if(STRIX_DS41_PREFILL_FP16_LT)
-        find_library(STRIX_HIPBLASLT_LIBRARY NAMES hipblaslt PATHS /opt/rocm/lib /opt/rocm/core-10.1/lib REQUIRED)
+        # Same toolkit as the HIP compiler: ROCM_PATH, then the compiler's ROCm root, then the system default.
+        find_library(STRIX_HIPBLASLT_LIBRARY NAMES hipblaslt
+            HINTS "$ENV{ROCM_PATH}" "${CMAKE_HIP_COMPILER_ROCM_ROOT}" PATH_SUFFIXES lib lib64
+            PATHS /opt/rocm /opt/rocm/core-10.1 REQUIRED)
         target_sources(strix_ds41_layer_hip PRIVATE src/hip_ds41_dense_fp16.hip)
         target_link_libraries(strix_ds41_layer_hip PUBLIC "${STRIX_HIPBLASLT_LIBRARY}")
         get_filename_component(strix_hipblaslt_real "${STRIX_HIPBLASLT_LIBRARY}" REALPATH)

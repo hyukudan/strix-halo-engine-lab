@@ -138,6 +138,7 @@ macro(find_program)
 endmacro()
 set(STRIX_PACKAGE_BACKEND hip)
 set(STRIX_DPKG_DEB present)
+set(_strix_pkg_generators TGZ DEB)
 '''
     result = cmake(header + 'set(STRIX_DPKG_SHLIBDEPS present)\n' + block + '''
 if(NOT CPACK_DEBIAN_HIP_PACKAGE_SHLIBDEPS)
@@ -148,8 +149,15 @@ if(CPACK_DEBIAN_HIP_PACKAGE_DEPENDS MATCHES "libc6|libstdc|libgcc-s1")
 endif()
 ''')
     ok(result)
-    missing = cmake(header + 'set(STRIX_DPKG_SHLIBDEPS FALSE)\n' + block)
+    missing = cmake(header + 'set(STRIX_PACKAGING ON)\nset(STRIX_DPKG_SHLIBDEPS FALSE)\n' + block)
     assert missing.returncode != 0 and 'HIP DEBs require' in missing.stdout
+    # A development configure without the shlibs scan drops the HIP DEB generator instead of failing.
+    development = cmake(header + 'set(STRIX_DPKG_SHLIBDEPS FALSE)\n' + block + '''
+if("DEB" IN_LIST _strix_pkg_generators OR NOT "TGZ" IN_LIST _strix_pkg_generators)
+    message(FATAL_ERROR "development configure kept the HIP DEB generator")
+endif()
+''')
+    ok(development)
 
 
 def metadata(ds=True):

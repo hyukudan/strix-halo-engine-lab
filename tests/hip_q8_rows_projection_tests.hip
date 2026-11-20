@@ -31,6 +31,9 @@
 namespace {
 using namespace strix;
 void require(bool value, const std::string& message) { if (!value) throw std::runtime_error(message); }
+// The fixture's packed Buffer owns the copy and outlives its registration (the stream is synchronised and the
+// tensor unregistered before the Buffer leaves scope), so the registry's lease does not own it.
+std::shared_ptr<const void> non_owning_lease(const void* base) { return {base, [](const void*) {}}; }
 void check(hipError_t error, const char* operation) {
     if (error != hipSuccess) throw std::runtime_error(std::string(operation) + ": " + hipGetErrorString(error));
 }
@@ -366,7 +369,7 @@ void onfly_row_invariance(hipStream_t stream) {
             stream, core::iu4_scale_rule_fast_full), "row-invariance conversion");
         check(hipStreamSynchronize(stream), "row-invariance conversion complete");
         const auto* original = reinterpret_cast<const void*>(f.weights.address);
-        q6p::iu4::register_tensor(original, {base, outputs, width});
+        q6p::iu4::register_tensor(original, {base, outputs, width, non_owning_lease(base)});
         for (const auto mode : {Mode::rows, Mode::rows_a8}) {
             std::vector<std::uint8_t> native_reference, halves_reference, single_reference;
             for (const unsigned rows : {1U, 2U, 4U, 7U, 8U}) {
@@ -445,7 +448,7 @@ void onfly_decode_bench(hipStream_t stream) {
                 stream, core::iu4_scale_rule_fast_full), "onfly fixture convert");
             check(hipStreamSynchronize(stream), "onfly fixture convert complete");
             const auto* original = reinterpret_cast<const void*>(f.weights.address);
-            q6p::iu4::register_tensor(original, {base, outputs, width});
+            q6p::iu4::register_tensor(original, {base, outputs, width, non_owning_lease(base)});
             {
                 const q6p::iu4::SuspendScope native;
                 require(f.run(Mode::rows, stream) == exact, "onfly benchmark native arm changed bits");

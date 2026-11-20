@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <span>
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
@@ -68,6 +69,32 @@ STRIX_HEAD_ARGMAX_HD inline void chunk_range(std::uint32_t count, std::uint32_t 
     const std::uint64_t l = std::uint64_t{c} * per, h = l + per;
     lo = static_cast<std::uint32_t>(l < count ? l : count);
     hi = static_cast<std::uint32_t>(h < count ? h : count);
+}
+
+// Split-vocabulary pair (rank 0 owns the lower ids; MiniMax / GLM transfer form): per row each rank sends one PairWord,
+// its Pick's value bits and global index, or index kNone when its half saw a non-finite logit (or no finite one). Both
+// ranks then compute the same pair_pick: kNone (the row fails on BOTH ranks, after the exchange) when either word is
+// kNone, else merge() of the two, so rank 0 wins ties. Host form of the device candidate / pick kernels of
+// src/xport/channel_impl.hip (argmax_candidate_kernel, argmax_pick_kernel), which implement the same rule.
+struct PairWord {
+    std::uint32_t value_bits = 0;
+    std::uint32_t index = kNone;
+};
+static_assert(sizeof(PairWord) == 8, "PairWord is the 8-byte wire word of one row");
+inline PairWord pair_word(const Pick& p) {
+    PairWord w;
+    std::memcpy(&w.value_bits, &p.value, sizeof(float));
+    w.index = p.nonfinite != 0U ? kNone : p.index;
+    return w;
+}
+inline std::uint32_t pair_pick(const PairWord& c0, const PairWord& c1) {
+    if (c0.index == kNone || c1.index == kNone) return kNone;
+    Pick p0, p1;
+    std::memcpy(&p0.value, &c0.value_bits, sizeof(float));
+    std::memcpy(&p1.value, &c1.value_bits, sizeof(float));
+    p0.index = c0.index;
+    p1.index = c1.index;
+    return merge(p0, p1).index;
 }
 
 }  // namespace strix::head_argmax

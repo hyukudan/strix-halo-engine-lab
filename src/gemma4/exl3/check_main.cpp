@@ -308,7 +308,8 @@ void quality(const g4::HostWeights& w, g4::RopeTables rope, const Args& args, bo
                 } } catch (...) { std::lock_guard lock(mutex); if (!error) error = std::current_exception(); }
             };
             std::vector<std::thread> workers; for (unsigned i = 0; i < 16; ++i) workers.emplace_back(work);
-            for (auto& worker : workers) worker.join(); if (error) std::rethrow_exception(error);
+            for (auto& worker : workers) worker.join();
+            if (error) std::rethrow_exception(error);
         }
         auto values = Json::array(); for (double value : kl) values.push(value);
         print(Json::Object{{"metric", "quality"}, {"parent", id}, {"language", require(record, "lang")}, {"teacher_sha256", hash},
@@ -379,7 +380,8 @@ void parity(const g4::HostWeights& w, g4::RopeTables rope, const Args& args) {
                 } } catch (...) { std::lock_guard lock(mutex); if (!error) error = std::current_exception(); }
             };
             std::vector<std::thread> workers; for (unsigned i = 0; i < 16; ++i) workers.emplace_back(work);
-            for (auto& worker : workers) worker.join(); if (error) std::rethrow_exception(error);
+            for (auto& worker : workers) worker.join();
+            if (error) std::rethrow_exception(error);
         }
         auto values = Json::array(); for (double value : kl) values.push(value);
         print(Json::Object{{"metric", "parity"}, {"parent", id}, {"language", require(record, "lang")}, {"teacher_sha256", hash},
