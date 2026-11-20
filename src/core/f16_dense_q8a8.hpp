@@ -140,7 +140,8 @@ struct StoreRounded {
 // written). A consumer that applied the same transform and rounding to the FP32 outputs gets the same bits: the sum
 // is the same register value either way and to_operand is the consumer's rounding function. Halves the output bytes.
 // Policy E: using Args; static constexpr tile::Operand kOp; static __device__ void pair(const Args&, unsigned r,
-// unsigned o, float& x0, float& x1). Limits (supported_image()): one K part, no accumulate, count even.
+// unsigned o, float& x0, float& x1). Limits (supported_image()): one K part, no accumulate, count even. Batched form:
+// product z writes image + z * batch_out (batch_out even), r and o are the product's own row and column.
 template <class E> struct StoreImage {
     std::uint32_t count, tile0;
     std::uint16_t* image;
@@ -189,10 +190,13 @@ template <unsigned TC, unsigned Waves, unsigned Form> __global__ __launch_bounds
     select_product(v);
     core<TC>(nullptr, v.in, v.rows, Cols<Waves, Form>{v}, lds, StoreRounded{v.count, v.tile0, v.accumulate, v.bias});
 }
-template <unsigned TC, unsigned Waves, class E>
+// The operand-image form; batched (batch > 1): product z stores its columns at image + z * batch_out.
+template <unsigned TC, unsigned Waves, unsigned Form, class E>
 __global__ __launch_bounds__(32 * Waves) void kernel_image(View v, std::uint16_t* image, typename E::Args e) {
     __shared__ Storage<TC> lds;
-    core<TC>(nullptr, v.in, v.rows, Cols<Waves>{v}, lds, StoreImage<E>{v.count, v.tile0, image, e});
+    if (v.batch > 1U) image += static_cast<std::size_t>(blockIdx.z) * v.batch_out;
+    select_product(v);
+    core<TC>(nullptr, v.in, v.rows, Cols<Waves, Form>{v}, lds, StoreImage<E>{v.count, v.tile0, image, e});
 }
 
 inline bool supported(const View& v) {
@@ -253,22 +257,33 @@ inline void enqueue(const View& v, hipStream_t stream, unsigned waves = 0U, unsi
 // The operand-image form (StoreImage): same grid, same chains, same CTA rule as enqueue.
 inline bool supported_image(const View& v, const std::uint16_t* image) {
     return supported(v) && image != nullptr && v.accumulate == 0U && v.round_bf16 == 0U && v.count % 2U == 0U &&
-           v.out_stride % 2U == 0U && reinterpret_cast<std::uintptr_t>(image) % 4U == 0U;
+           v.out_stride % 2U == 0U && reinterpret_cast<std::uintptr_t>(image) % 4U == 0U &&
+           (v.batch <= 1U || v.batch_out % 2U == 0U);  // batched: every product's image columns start 4-byte aligned
 }
-template <unsigned Waves, class E> inline void launch_image(View v, std::uint16_t* image, typename E::Args e, hipStream_t stream) {
+template <unsigned Waves, unsigned Form, class E>
+inline void launch_image(View v, std::uint16_t* image, typename E::Args e, hipStream_t stream) {
     const unsigned tiles = (v.count + 15U) / 16U, gx = (v.rows + 16U * Waves - 1U) / (16U * Waves);
     const Plan pl = plan(tiles, v.rows, true);
+    const unsigned gz = v.batch > 1U ? v.batch : 1U;  // batched form: one product per grid z
     v.tile0 = 0U;
-    if (pl.full) hipLaunchKernelGGL((kernel_image<16, Waves, E>), dim3(gx, pl.full), dim3(32U * Waves), 0, stream, v, image, e);
+    if (pl.full) hipLaunchKernelGGL((kernel_image<16, Waves, Form, E>), dim3(gx, pl.full, gz), dim3(32U * Waves), 0, stream, v, image, e);
     v.tile0 = 16U * pl.full;
-    if (pl.tc == 1U) hipLaunchKernelGGL((kernel_image<1, Waves, E>), dim3(gx, pl.gy), dim3(32U * Waves), 0, stream, v, image, e);
-    if (pl.tc == 2U) hipLaunchKernelGGL((kernel_image<2, Waves, E>), dim3(gx, pl.gy), dim3(32U * Waves), 0, stream, v, image, e);
-    if (pl.tc == 4U) hipLaunchKernelGGL((kernel_image<4, Waves, E>), dim3(gx, pl.gy), dim3(32U * Waves), 0, stream, v, image, e);
+    if (pl.tc == 1U) hipLaunchKernelGGL((kernel_image<1, Waves, Form, E>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v, image, e);
+    if (pl.tc == 2U) hipLaunchKernelGGL((kernel_image<2, Waves, Form, E>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v, image, e);
+    if (pl.tc == 4U) hipLaunchKernelGGL((kernel_image<4, Waves, Form, E>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v, image, e);
 }
-// Caller checks supported_image(v, image) and the launch error.
-template <class E> inline void enqueue_image(const View& v, std::uint16_t* image, typename E::Args e, hipStream_t stream, unsigned waves = 0U) {
-    if (waves_for(v.rows, v.in, waves) == 16U) launch_image<16, E>(v, image, e, stream);
-    else launch_image<8, E>(v, image, e, stream);
+template <unsigned Waves, class E>
+inline void launch_image_form(const View& v, std::uint16_t* image, typename E::Args e, unsigned form, hipStream_t stream) {
+    if (form == kWPacked) launch_image<Waves, kWPacked, E>(v, image, e, stream);
+    else launch_image<Waves, 0U, E>(v, image, e, stream);
+}
+// Caller checks supported_image(v, image) and the launch error. waves / form: the rules of enqueue (same bits either way).
+template <class E>
+inline void enqueue_image(const View& v, std::uint16_t* image, typename E::Args e, hipStream_t stream, unsigned waves = 0U,
+                          unsigned form = kFormRule) {
+    const unsigned f = form_for(form);
+    if (waves_for(v.rows, v.in, waves) == 16U) launch_image_form<16, E>(v, image, e, f, stream);
+    else launch_image_form<8, E>(v, image, e, f, stream);
 }
 // Independent FP32 chains per K part, added in unfused order by Store.
 // Caller validates each equal-width part; the stream orders the output additions. The store epilogue (round_bf16, bias)

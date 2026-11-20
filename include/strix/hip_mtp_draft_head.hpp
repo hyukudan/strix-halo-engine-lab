@@ -13,9 +13,13 @@ namespace strix {
 // the full head (same row kernel), and argmax maps back to real token ids with
 // the full selector's finite first-max order (ties pick the lowest token id).
 // Full mode keeps the original head and identity ids (acceptance A/B baseline).
+// Source formats: the model's head as Q8_0 rows (gathered as stored), or as BF16 rows (gathered through the ggml
+// Q8_0 rule, strix/q8_0_rule.hpp: a draft-only Q8_0 copy of a BF16 head; base_tokens = every id gives the whole head).
+enum class HipMtpDraftHeadSource : std::uint8_t {q8_0,bf16};
 struct HipMtpDraftHeadConfig {
     std::uint32_t hidden_size=0,vocab_size=0,max_depth=0;
     bool full=true;
+    HipMtpDraftHeadSource source=HipMtpDraftHeadSource::q8_0; // full mode needs q8_0 (it reads the head itself)
     std::vector<std::uint32_t> base_tokens;
     std::uint32_t context_capacity=0;
     // Subset rows requantized Q8_0 -> Q4_0 at gather (about half the head bytes);
@@ -32,7 +36,8 @@ struct HipMtpDraftHeadStats {
 // read() is valid only after the caller has completed the stream.
 class HipMtpDraftHead final {
 public:
-    HipMtpDraftHead(const void* q8_head,HipMtpDraftHeadConfig,void* stream);
+    // head: [vocab][hidden] rows in config.source's format.
+    HipMtpDraftHead(const void* head,HipMtpDraftHeadConfig,void* stream);
     ~HipMtpDraftHead();
     HipMtpDraftHead(const HipMtpDraftHead&)=delete;
     HipMtpDraftHead& operator=(const HipMtpDraftHead&)=delete;
@@ -43,6 +48,8 @@ public:
     // Head over the active rows for hidden BF16[hidden], then argmax into the
     // device token slot(step) and mapped token[step].
     void launch(const std::uint16_t* hidden,std::uint32_t step,void* stream);
+    // Same for an FP32 hidden: rounded to BF16 (nearest even) into the head's own buffer first.
+    void launch(const float* hidden,std::uint32_t step,void* stream);
     // Multi-session draft batch. shared_rows: the number of leading compact rows holding the same ids in every
     // head (same Q8 head, Q4 subset heads with the same hidden size and runner-up setting, no runner-up
     // diagnostic), UINT32_MAX when the heads cannot be batched. launch_rows: launch() of every head at `step`
