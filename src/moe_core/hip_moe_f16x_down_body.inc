@@ -20,8 +20,14 @@
     const auto slot_of=[&](unsigned a)->unsigned{if constexpr(T::Table)return rows.slot[a];else return a<count?csr.slots[begin+a]:0U;};
     const auto exp_of=[&](unsigned a)->int{if constexpr(T::Table)return rows.exponent[a];else return a<count?f16_exponent(__uint_as_float(static_cast<unsigned>(at(view.down_sums,row_of(a))[slot_of(a)]))):0;};
     __syncthreads();
+#ifdef STRIX_F16X_DOWN_KQ
+    // K-quant down trait (down_prefill_f16x_kq, `KQ` = F16xKQuantDown<Type>): rows of width/256 superblocks; the B lines below
+    // are the trait's, everything else is this body.
+    const unsigned steps=width/64U;
+#else
     constexpr unsigned block_bytes=Q51?24U:34U;
     const unsigned groups=width/32U,steps=width/64U;
+#endif
     // A: part c = t + Threads*j is row c/4, K values 16*(c%4).. of the step (FP32 h, scaled and rounded here).
     const float* a_src[AParts];float a_scale[AParts];bool a_live[AParts];unsigned a_row[AParts],a_part[AParts];
 #pragma unroll
@@ -37,8 +43,13 @@
     const unsigned b_col=t%Columns,b_part=t/Columns;
     constexpr unsigned BBlocks=2U/TPC;
     const unsigned b_expert=(Tune&16384U)?0U:expert; // probe 16384 (hot B): expert 0's weights
+#ifdef STRIX_F16X_DOWN_KQ
+    const auto* b_src=weights+(static_cast<unsigned long long>(b_expert)*hidden+tile*Columns+b_col)*(width/256U)*KQ::block_bytes;
+    struct Regs { uint4 a[AParts][4]{}; typename KQ::Raw b[BBlocks]; };
+#else
     const auto* b_src=weights+(static_cast<unsigned long long>(b_expert)*hidden+tile*Columns+b_col)*groups*block_bytes;
     struct Regs { uint4 a[AParts][4]{}; DownBlock<Q51> b[BBlocks]; };
+#endif
     struct Cvt { uint4 a[AParts][2],b[BBlocks][4]; };
     const auto fetch=[&](unsigned step,Regs& r) {
         if constexpr((Tune&1024U)!=0U)return;
@@ -52,9 +63,15 @@
 #pragma unroll
             for(unsigned q=0;q<4U;++q)r.a[j][q]=f16_load(a_src[j]+64U*step+4U*q);
         }
+#ifdef STRIX_F16X_DOWN_KQ
+        if constexpr((Tune&4096U)==0U)
+#pragma unroll
+        for(unsigned k=0;k<BBlocks;++k)r.b[k]=KQ::load(b_src,step,BBlocks*b_part+k);
+#else
         if constexpr((Tune&4096U)==0U)
 #pragma unroll
         for(unsigned k=0;k<BBlocks;++k)r.b[k]=down_block<Q51>(b_src,2U*step+BBlocks*b_part+k);
+#endif
     };
     const auto convert=[&](unsigned step,const Regs& r,Cvt& cv) {
 #pragma unroll
@@ -66,6 +83,9 @@
 #pragma unroll
         for(unsigned k=0;k<BBlocks;++k) {
             const unsigned half=BBlocks*b_part+k;
+#ifdef STRIX_F16X_DOWN_KQ
+            KQ::template decode<Tune>(r.b[k],step,half,cv.b[k]);
+#else
             if constexpr(Q51) {
                 wmma_v4i b0,b1;float d,m;
                 down_operands<true>(r.b[k],2U*step+half,b0,b1,d,m);
@@ -86,6 +106,7 @@
                     }
                 }
             } else f16_q80_block(r.b[k],2U*step+half,cv.b[k]);
+#endif
         }
     };
     const auto store=[&](const Cvt& cv,Stage& st) {
@@ -134,6 +155,12 @@
             if(__float_as_uint(acc[mi][0][e])==0x7fc12345U)out[0]=acc[mi][0][e]*unscale;
             if(__float_as_uint(acc[mi][1][e])==0x7fc12345U)out[16]=acc[mi][1][e]*unscale;
         } else if constexpr((Core&4U)!=0U){f16_store_global(out,acc[mi][0][e]*unscale);f16_store_global(out+16,acc[mi][1][e]*unscale);}
+#ifdef STRIX_F16X_DOWN_ROUND
+        else if constexpr(STRIX_F16X_DOWN_ROUND) { // the BF16 Linear store (PrefillRows::rawdots_bf16): one rounding of the same value
+            out[0]=::strix::ops::glu::epilogue<::strix::ops::glu::Round::bf16>(acc[mi][0][e]*unscale,nullptr,0U);
+            out[16]=::strix::ops::glu::epilogue<::strix::ops::glu::Round::bf16>(acc[mi][1][e]*unscale,nullptr,0U);
+        }
+#endif
         else {out[0]=acc[mi][0][e]*unscale;out[16]=acc[mi][1][e]*unscale;}
     }
     if constexpr((Core&512U)!=0U)fuse_merge_tail<Batch,Columns,T::Threads>(fuse,view,count,tile,hidden,row_of);

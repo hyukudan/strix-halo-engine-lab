@@ -36,7 +36,8 @@ public:
     void discard() noexcept override;
     // A1 hooks.
     std::array<std::uint32_t, 7> propose_window(std::uint32_t anchor, std::uint64_t position, std::uint32_t k) STRIX_G4_EAGLE_HOOK;
-    [[nodiscard]] bool wants_hidden() const STRIX_G4_EAGLE_HOOK;
+    // all_rows when the drafter reads the final hidden (needs_final): it stages one hidden row per position.
+    [[nodiscard]] HiddenDemand hidden_demand() const STRIX_G4_EAGLE_HOOK;
     void stage_rows(std::span<const float> taps, std::span<const float> hidden, std::span<const std::uint32_t> next_tokens,
                     std::span<const std::uint64_t> positions) STRIX_G4_EAGLE_HOOK;
     // Diagnostics for policy/calibration: last proposals with per-depth drafter top-1 probability.

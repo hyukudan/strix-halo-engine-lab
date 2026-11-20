@@ -4,6 +4,7 @@
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_mtp_draft_head.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
+#include "strix/q8_0_rule.hpp"
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <algorithm>
@@ -58,13 +59,34 @@ __global__ __launch_bounds__(threads) void draft_gather_rows(const std::uint8_t*
     auto* target=compact+static_cast<std::uint64_t>(row)*row_bytes;
     for(std::uint32_t i=threadIdx.x;i<row_bytes;i+=threads) target[i]=source[i];
 }
+// BF16 block -> Q8_0 block (strix::q8_0 rule).
+__device__ __forceinline__ void bf16_block_q8(const std::uint16_t* source,std::uint8_t* target) {
+    float v[32];
+    for(unsigned i=0;i<32;++i) v[i]=strix::q8_0::bf16_value(source[i]);
+    const auto g=strix::q8_0::quantize_group(v);
+    *reinterpret_cast<__half*>(target)=__float2half_rn(g.d);
+    for(unsigned i=0;i<32;++i) target[2+i]=static_cast<std::uint8_t>(g.q[i]);
+}
+// BF16 row -> Q8_0 row, one thread per 32-block.
+__global__ __launch_bounds__(threads) void draft_gather_rows_bf16(const std::uint16_t* head,const std::uint32_t* ids,
+    std::uint32_t first,std::uint32_t count,std::uint32_t blocks,std::uint8_t* compact) {
+    const auto row=first+blockIdx.x;if(blockIdx.x>=count) return;
+    for(std::uint32_t b=threadIdx.x;b<blocks;b+=threads)
+        bf16_block_q8(head+(static_cast<std::uint64_t>(ids[row])*blocks+b)*32U,compact+(static_cast<std::uint64_t>(row)*blocks+b)*34U);
+}
 // Q8_0 row -> Q4_0 row, one thread per 32-block: d=signed max/-8, q=clamp(v/d+8.5),
-// low nibbles hold elements 0..15 and high nibbles 16..31.
+// low nibbles hold elements 0..15 and high nibbles 16..31. A BF16 source passes through its Q8_0 block first
+// (the values a Q8_0 copy of it holds).
+template<HipMtpDraftHeadSource Source>
 __global__ __launch_bounds__(threads) void draft_gather_rows_q4(const std::uint8_t* head,const std::uint32_t* ids,
     std::uint32_t first,std::uint32_t count,std::uint32_t blocks,std::uint8_t* compact) {
     const auto row=first+blockIdx.x;if(blockIdx.x>=count) return;
     for(std::uint32_t b=threadIdx.x;b<blocks;b+=threads) {
-        const auto* source=head+(static_cast<std::uint64_t>(ids[row])*blocks+b)*34U;
+        const std::uint8_t* source=nullptr;std::uint8_t q8[34];
+        if constexpr(Source==HipMtpDraftHeadSource::bf16) {
+            bf16_block_q8(reinterpret_cast<const std::uint16_t*>(head)+(static_cast<std::uint64_t>(ids[row])*blocks+b)*32U,q8);
+            source=q8;
+        } else source=head+(static_cast<std::uint64_t>(ids[row])*blocks+b)*34U;
         auto* target=compact+(static_cast<std::uint64_t>(row)*blocks+b)*18U;
         const float scale=__half2float(*reinterpret_cast<const __half*>(source));
         float values[32],max=0.0F,amax=0.0F;
@@ -79,6 +101,13 @@ __global__ __launch_bounds__(threads) void draft_gather_rows_q4(const std::uint8
             const auto hi=static_cast<unsigned>(fminf(15.0F,values[j+16]*inverse+8.5F));
             target[2+j]=static_cast<std::uint8_t>(lo|(hi<<4U));
         }
+    }
+}
+// FP32 hidden -> BF16 (round to nearest even; finite inputs), the head kernels' input format.
+__global__ __launch_bounds__(threads) void draft_hidden_bf16(const float* hidden,std::uint32_t n,std::uint16_t* out) {
+    for(std::uint32_t i=blockIdx.x*threads+threadIdx.x;i<n;i+=gridDim.x*threads) {
+        const unsigned u=__float_as_uint(hidden[i]);
+        out[i]=static_cast<std::uint16_t>((u+0x7FFFU+((u>>16U)&1U))>>16U);
     }
 }
 // Wave per row over Q4_0 rows; lanes own whole 32-blocks, then a wave tree.
@@ -250,6 +279,7 @@ struct HipMtpDraftHead::Impl {
     std::uint8_t* compact=nullptr;
     std::uint32_t* ids=nullptr;
     std::uint32_t* host_ids=nullptr;
+    std::uint16_t* hidden16=nullptr; // [hidden] BF16 copy of an FP32 hidden (launch(const float*))
     float* logits=nullptr;
     Partial* partials=nullptr;
     std::uint32_t* done=nullptr; // argmax ticket: the last block to finish folds the partials
@@ -261,7 +291,7 @@ struct HipMtpDraftHead::Impl {
     hipStream_t stream=nullptr;
     ~Impl() {
         if(stream) (void)hipStreamSynchronize(stream);
-        for(void* p:{static_cast<void*>(compact),static_cast<void*>(ids),static_cast<void*>(logits),
+        for(void* p:{static_cast<void*>(compact),static_cast<void*>(ids),static_cast<void*>(hidden16),static_cast<void*>(logits),
                      static_cast<void*>(partials),static_cast<void*>(done),static_cast<void*>(slots)}) if(p) (void)hipFree(p);
         if(host_ids) (void)hipHostFree(host_ids);
         if(reply) (void)hipHostFree(reply);
@@ -280,21 +310,27 @@ struct HipMtpDraftHead::Impl {
         }
         if(rows==first) return 0;
         hip_check(hipMemcpyAsync(ids+first,host_ids+first,(rows-first)*sizeof(std::uint32_t),hipMemcpyHostToDevice,stream),"MTP draft ids upload");
-        if(config.q4) hipLaunchKernelGGL(draft_gather_rows_q4,dim3(rows-first),dim3(threads),0,stream,head,ids,first,rows-first,
-            config.hidden_size/32U,compact);
+        const bool bf16=config.source==HipMtpDraftHeadSource::bf16;
+        if(config.q4 && bf16) hipLaunchKernelGGL(HIP_KERNEL_NAME(draft_gather_rows_q4<HipMtpDraftHeadSource::bf16>),dim3(rows-first),dim3(threads),0,
+            stream,head,ids,first,rows-first,config.hidden_size/32U,compact);
+        else if(config.q4) hipLaunchKernelGGL(HIP_KERNEL_NAME(draft_gather_rows_q4<HipMtpDraftHeadSource::q8_0>),dim3(rows-first),dim3(threads),0,
+            stream,head,ids,first,rows-first,config.hidden_size/32U,compact);
+        else if(bf16) hipLaunchKernelGGL(draft_gather_rows_bf16,dim3(rows-first),dim3(threads),0,stream,reinterpret_cast<const std::uint16_t*>(head),
+            ids,first,rows-first,config.hidden_size/32U,compact);
         else hipLaunchKernelGGL(draft_gather_rows,dim3(rows-first),dim3(threads),0,stream,head,ids,first,rows-first,row_bytes,compact);
         hip_check(hipGetLastError(),"MTP draft row gather");
         return added;
     }
 };
-HipMtpDraftHead::HipMtpDraftHead(const void* q8_head,HipMtpDraftHeadConfig config,void* stream):impl_(std::make_unique<Impl>()) {
+HipMtpDraftHead::HipMtpDraftHead(const void* head,HipMtpDraftHeadConfig config,void* stream):impl_(std::make_unique<Impl>()) {
     auto& p=*impl_;
-    require(q8_head && stream && config.hidden_size && config.hidden_size%32U==0U && config.hidden_size<=10240U &&
+    require(head && stream && config.hidden_size && config.hidden_size%32U==0U && config.hidden_size<=10240U &&
         config.vocab_size && config.max_depth && config.max_depth<=max_slots,"MTP draft head geometry is invalid");
-    p.head=static_cast<const std::uint8_t*>(q8_head);p.stream=static_cast<hipStream_t>(stream);
+    p.head=static_cast<const std::uint8_t*>(head);p.stream=static_cast<hipStream_t>(stream);
     p.row_bytes=config.hidden_size/32U*34U;
     if(config.full) {
         require(config.base_tokens.empty() && !config.context_capacity && !config.q4,"MTP full draft head takes no vocabulary subset or Q4 copy");
+        require(config.source==HipMtpDraftHeadSource::q8_0,"MTP full draft head reads a Q8_0 head (gather a BF16 head: base_tokens = every id)");
         p.capacity=p.rows=config.vocab_size;
     } else {
         const auto capacity=static_cast<std::uint64_t>(config.base_tokens.size())+config.context_capacity;
@@ -307,6 +343,7 @@ HipMtpDraftHead::HipMtpDraftHead(const void* q8_head,HipMtpDraftHeadConfig confi
         p.partials=p.device<Partial>((p.capacity-1U)/threads+1U);
         p.done=p.device<std::uint32_t>(1);
         hip_check(hipMemsetAsync(p.done,0,sizeof(std::uint32_t),p.stream),"MTP draft argmax ticket init");
+        p.hidden16=p.device<std::uint16_t>(p.config.hidden_size);
         p.slots=p.device<std::uint32_t>(max_slots);
         hip_check(hipMemsetAsync(p.slots,0,max_slots*sizeof(std::uint32_t),p.stream),"MTP draft slot init");
         hip_check(hipHostMalloc(reinterpret_cast<void**>(&p.reply),sizeof(Reply),hipHostMallocMapped|hipHostMallocCoherent),"MTP draft mapped reply");
@@ -353,13 +390,21 @@ void HipMtpDraftHead::launch(const std::uint16_t* hidden,std::uint32_t step,void
         hipLaunchKernelGGL(draft_argmax<false>,dim3(blocks),dim3(threads),0,p.stream,p.logits,p.ids,p.rows,p.partials,p.done,step,p.slots,p.device_reply);
     hip_check(hipGetLastError(),"MTP draft argmax");
 }
+void HipMtpDraftHead::launch(const float* hidden,std::uint32_t step,void* stream) {
+    auto& p=*impl_;
+    require(hidden && stream==p.stream,"MTP draft head FP32 hidden/stream is invalid");
+    hipLaunchKernelGGL(draft_hidden_bf16,dim3((p.config.hidden_size+threads-1U)/threads),dim3(threads),0,p.stream,hidden,p.config.hidden_size,
+        p.hidden16);
+    hip_check(hipGetLastError(),"MTP draft hidden BF16");
+    launch(p.hidden16,step,stream);
+}
 std::uint32_t HipMtpDraftHead::shared_rows(std::span<HipMtpDraftHead* const> heads) {
     require(!heads.empty() && heads.size()<=max_batch,"MTP draft head batch size is invalid");
     const auto& a=*heads.front()->impl_;
     std::uint32_t shared=a.rows;
     for(auto* head:heads) {
         const auto& b=*head->impl_;
-        if(b.config.full || !b.config.q4 || b.head!=a.head || b.config.hidden_size!=a.config.hidden_size ||
+        if(b.config.full || !b.config.q4 || b.head!=a.head || b.config.source!=a.config.source || b.config.hidden_size!=a.config.hidden_size ||
            b.config.runner_up!=a.config.runner_up || b.runner_logits || !b.rows) return UINT32_MAX;
         std::uint32_t n=0;const auto limit=std::min(shared,b.rows);
         while(n<limit && a.host_ids[n]==b.host_ids[n]) ++n;

@@ -63,6 +63,34 @@ summed in ascending warp order. q8_0: int8 values are exact in bf16; each 32-blo
 - FAST policies: `mma2` (hi + mid), `mma1` (hi only; max |dlogit| 8x larger, see RESULT). Not the default.
 - Shapes not covered (in % 32, out % 16, f32 weights) fall back to fp32 kernels.
 
+## A4W4 layer table (HIP, FAST)
+`--profile fast` (decode and spec apps) exports `STRIX_DENSE_A4W4_LAYERS=48-63`: on wide prefill windows (rows > 16, not
+`--wide-exact` / `--prefill-exact`) the IU4 GEMMs of layers 48-63 run the shared A4W4 class `dense-iu4a4-rot-v1`
+(`src/core/iu4a4_dense.hpp`: Hadamard-128 rotated A4 g32 activations x rotated W4 per-128 weights on iu4 WMMA); the other
+layers keep the wide IU4 path (`dense-iu4a16-f16-v1`). The fast wide-window cell is still pending, so the table acts
+only with an explicit `--wide N` / `--prefill-rows N` above 16. `STRIX_DENSE_A4W4_LAYERS=none` turns it off;
+`STRIX_DENSE_A4W4=1` alone (every layer) fails the gate and is in no profile.
+
+FAST gate v2 (`tools/strix-gate`): 8,192-token prompts, 256 teacher-forced rows per window, 4 windows (1,024 rows), null
+arm `STRIX_DENSE_NULL=0:100:1234` (one FP16 ulp of one residual element before layer 0; per-window null KL 2-3e-5).
+Set A = 2 texts x 2 cut points (used to choose the layers); set B = 4 slices of a third text (held out).
+
+| A4W4 layers | reference | windows | KL | top-1 | dNLL | verdict |
+|---|---|---|---|---|---|---|
+| 0-63 | wide IU4 | A | 0.0763 | 0.906 | +0.0090 | FAIL |
+| 48-63 | wide IU4 | A | 0.0053 | 0.976 | +0.0026 | PASS |
+| 8-15, 48-63 | wide IU4 | A | 0.0095 | 0.960 | +0.0073 | FAIL (one window dNLL) |
+| 48-63 | EXACT (`--wide-exact 512`) | B | 0.0069 | 0.971 | -0.0104 | PASS |
+| none (wide IU4 alone) | EXACT (`--wide-exact 512`) | B | 0.00003 | 0.999 | -0.0003 | PASS |
+
+Choice: one arm per group of 8 layers (set A, reference wide IU4). Pooled KL by group 0-7 .0233, 8-15 .0047,
+16-23 .0082, 24-31 .0101, 32-39 .0166, 40-47 .0116, 48-55 .0034, 56-63 .0018; the sum (.0797) matches the all-layer
+KL (.0763). Adding any further group to 48-63 breaks one window's KL or dNLL limit.
+
+Speed (one gfx1151 node, `--wide 512`, strict ABAB, 3 pairs, same binary): 8K warm 15,945 -> 15,199 ms (-4.7 %,
+514 -> 539 tok/s); 8K cold 15,705 -> 14,937 ms (-4.9 %); 32K (one prefill per process) 81,504 -> 78,045 ms (-4.2 %,
+402 -> 420 tok/s). The rotated copy of the 16 layers costs 3.0 GiB of device memory and 0.5 s at load.
+
 ## Multi-session batched decode (CUDA, exact class, default path for slots)
 
 `CudaEngine::configure_slots(n)` gives n sessions (own KV, GDN/conv state, parity, length) that share the weights.

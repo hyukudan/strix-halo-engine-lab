@@ -48,3 +48,12 @@ for marker, guard in (("cudaError_t dense_big_split(", "f8"), ("cudaError_t dens
     function = big[big.index(marker):]
     assert function.index(f"if ({guard} && !dense_big_fast8_supported())") < function.index("Scratch& S")
 print("engine ownership, dispatch wiring, slot bounds and FAST8 guards: PASS")
+# Every main-session window entry runs the shared input prologue (bounds + decode_attn8 shadow catch-up) before run_rows.
+calls = [m.start() for m in re.finditer(r"\brun_rows\(rows, want\)", cuda)]
+assert len(calls) >= 2, "expected forward and forward_fed to reach run_rows"
+for call in calls:
+    header = max(cuda.rfind("\n    RowsOut ", 0, call), cuda.rfind("\n    void ", 0, call))
+    entry = cuda[header:call]
+    assert "window_prologue(rows);" in entry, "a run_rows entry skips window_prologue: " + entry[:80].strip()
+assert cuda.count("decode8_catch_up();") == 1, "the decode_attn8 catch-up belongs to window_prologue only"
+print("window entries share the input prologue: PASS")

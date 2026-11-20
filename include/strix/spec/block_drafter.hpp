@@ -122,6 +122,12 @@ public:
     void commit(std::span<const std::uint32_t> tokens) { proposer_.commit(tokens); }
     // Engine's tabled verify wall at `rows` (shape of the cost curve; measured walls rescale it).
     void seed_verify_ms(std::uint32_t rows, double ms) { arbiter_.seed_cost(rows, ms); }
+    // Stated confidence of the chain drafter: conditional survival P(draft d accepted | drafts < d accepted), d = 1 ..,
+    // as `weight` pseudo-observations per depth (Arbiter::seed_model_survival). An offline acceptance measurement (a host
+    // oracle's) becomes the prior the online counts refine. Prices the chain windows only; emitted ids never change.
+    void seed_chain_survival(std::span<const double> conditional, double weight = 8.0) {
+        arbiter_.seed_model_survival(conditional, weight);
+    }
     // launch (optional): handed to ChainDrafter::draft_prelaunch for every chain call of this block.
     [[nodiscard]] Block next(const StepParams& params, const PrelaunchFn* launch = nullptr);
     // After the pass. verify_ms = wall of verify + commit (without drafting). emitted = accepted drafts + next token.

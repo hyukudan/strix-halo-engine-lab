@@ -50,6 +50,10 @@ void enqueue_decode_scalar_tables(float* out, void* stream);
 // A8 quantization of rows x width values (width a multiple of 32), as quantize_a8 per row.
 void enqueue_quantize_a8(const float* values, std::uint32_t width, std::uint32_t rows, std::int8_t* codes, float* deltas,
                          std::int32_t* sums, void* stream);
+// Same values and bits; row r of the output at codes + r * pitch, deltas / sums + r * (pitch / 32) (pitch >= width, a
+// multiple of 32; strix::a8_row_pitch(width) avoids the aliasing row pitches). Input row r stays at values + r * width.
+void enqueue_quantize_a8(const float* values, std::uint32_t width, std::uint32_t rows, std::uint32_t pitch, std::int8_t* codes,
+                         float* deltas, std::int32_t* sums, void* stream);
 
 // out[(r * expert_count + e) * outputs + o] = row o of expert experts[e] times activation row r,
 // as product_iq2_xxs / product_q2_k / product_mxfp4. Activation row r: codes + r * width,

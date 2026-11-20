@@ -37,11 +37,12 @@ def _arrays(rows, fields):
     return {k: np.asarray([r[k] for r in rows], dtype=np.int64 if k in INT_FIELDS else np.float64) for k in fields}
 
 
-def reduce_pair(ref_path, cand_path, fmt="steps"):
+def reduce_pair(ref_path, cand_path, fmt="steps", **reader_kw):
+    """reader_kw: the format's extra inputs (``head``: ids=, rows=), the same for both files."""
     read = reader(fmt)
     rows, labels, identical, vocab = [], [], True, None
     h_ref, h_cand = hashlib.sha256(), hashlib.sha256()     # digests of the bytes actually reduced
-    ref_iter, cand_iter = read(ref_path, h_ref), read(cand_path, h_cand)
+    ref_iter, cand_iter = read(ref_path, h_ref, **reader_kw), read(cand_path, h_cand, **reader_kw)
     while True:
         a = next(ref_iter, None)
         b = next(cand_iter, None)

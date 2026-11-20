@@ -77,5 +77,14 @@ if(STRIX_ENABLE_HIP_RUNTIME AND TARGET strix_hip_runtime)
             -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee -Wall -Wextra)
         target_include_directories(strix-dense-flash-terms-hip-tests PRIVATE "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/include")
         target_link_libraries(strix-dense-flash-terms-hip-tests PRIVATE strix_hip_runtime)
+        # Kernel bench of the shared dense flash core on the engine shapes (synthetic data, no model): median ms, TF/s and
+        # an output digest per case (two builds of the core with equal digests give equal bits). Run explicitly on a GPU.
+        add_executable(strix-dense-flash-bench "${CMAKE_SOURCE_DIR}/tests/hip_dense_flash_bench.hip")
+        set_target_properties(strix-dense-flash-bench PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_compile_options(strix-dense-flash-bench PRIVATE
+            -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee -Wall -Wextra)
+        target_include_directories(strix-dense-flash-bench PRIVATE "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/include")
+        target_link_libraries(strix-dense-flash-bench PRIVATE strix_hip_runtime)
     endif()
 endif()

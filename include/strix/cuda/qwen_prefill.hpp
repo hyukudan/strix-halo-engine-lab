@@ -83,6 +83,12 @@ struct Config {
     // Tensor-core GSQ experts (gsq_bf16_mma) in steps of <= 16 rows run the decode tile form (bitwise the tile form);
     // false = the tile form at every row count (lever row expert_decode_tile).
     bool expert_decode_tile = true;
+    // Tensor-core GSQ experts: launches averaging >= native_mma::kWideMinAvgRows rows per expert run the wide 128-row tile
+    // form (bitwise the tile form; lever row expert_wide_tile, opt-in until its timing receipt).
+    bool expert_wide_tile = false;
+    // Its planner parameter: minimum average rows per expert of a launch for the wide form (0 = native_mma::kWideMinAvgRows);
+    // the lever value `--expert-wide-tile N`, measured per device by the no-model tile bench (TILEWIDE line).
+    std::uint32_t expert_wide_min_rows = 0;
     // Explicit unqualified CUDA A8 route-storage candidate. Omitted: environment;
     // false: individual OFF. Baseline/defaults/exact masters always suppress it.
     std::optional<bool> moe_route_bf16;
@@ -106,7 +112,20 @@ struct Config {
         bool ple_a8 = false;   // PLE key/value projections on the shared dense A8 projection (qwen_dense, int8 tensor cores)
     } forms;
     qwen_packs::ExpertArithmetic expert_arithmetic=qwen_packs::ExpertArithmetic::incumbent;
+    // Per-regime experts (TURBO, profile rows expert_turbo + expert_turbo_rows): when set, expert_arithmetic runs only on
+    // prefill blocks of at least expert_regime_min_rows rows; every other MoE call (step/verify windows, smaller blocks)
+    // runs *expert_narrow. Unset: expert_arithmetic everywhere. See expert_arithmetic_for.
+    std::optional<qwen_packs::ExpertArithmetic> expert_narrow;
+    std::uint32_t expert_regime_min_rows = 0;
 };
+
+// The expert arithmetic of one routed-MoE call. `window`: a step/verify window (decode regime); `rows`: the block's rows.
+// A prefill block is one session (run_block(&seg, 1, ...)), so the choice depends only on that session's own prompt and
+// block schedule, never on its cohort.
+inline qwen_packs::ExpertArithmetic expert_arithmetic_for(const Config& c, bool window, std::uint32_t rows) {
+    if (!c.expert_narrow || (!window && rows >= c.expert_regime_min_rows)) return c.expert_arithmetic;
+    return *c.expert_narrow;
+}
 
 // Diagnostic snapshot, not the node wire or a portable session/cache format.
 // Same engine instance and target only. Default snapshots invalidate derived pools;

@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "strix/qwen35/config.hpp"
 #include "strix/qwen35/engine_types.hpp"
@@ -112,6 +113,18 @@ public:
     [[nodiscard]] std::size_t hidden_row_bytes() const;
     void export_hidden(float* host, std::uint32_t rows) const;       // device -> host, synchronizes
     void import_hidden(const float* host, std::uint32_t rows) const; // host -> hidden_rows(), stream-ordered
+    // Stage range of a rank that owns more layers than it runs in the prefill (the decoder of a relayed plan): windows run
+    // [first, last) and commit at `last`. Default = the owned range (unchanged behaviour); set_stage(layer_begin(),
+    // layer_end()) restores it before the decode.
+    void set_stage(std::uint32_t first, std::uint32_t last);
+    // Layer state of [first, last) at the committed positions: per layer in order, GDN = recurrent matrix + conv history,
+    // attention = K then V rows [0, committed) (position-major). export synchronizes; import requires no pending window
+    // and the same committed count, overwrites those layers' state and drops the V^T copy (rebuilt from the cache by the
+    // next wide window: same bytes). Bytes cross unchanged, so a decoder that imports every other stage's layers holds
+    // exactly the single-rank state.
+    [[nodiscard]] std::size_t state_bytes(std::uint32_t first, std::uint32_t last) const;
+    void export_state(std::uint32_t first, std::uint32_t last, void* host) const;
+    void import_state(std::uint32_t first, std::uint32_t last, std::uint32_t positions, const void* host);
     [[nodiscard]] void* stream_handle() const;          // hipStream_t of every launch (staging copies order on it)
 
     void read_top(const HipRowsOut& o, std::uint32_t rows, std::uint32_t* host) const;  // synchronizes
@@ -140,6 +153,14 @@ public:
     // written by earlier calls (own bf16 KV, positions explicit). want_top=false skips lm_head + argmax.
     HipMtpOut mtp_forward(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0,
                           bool want_top = true);
+    // Device-fed MTP chain (strix/spec/mtp_chain.hpp, MtpFeedEngine): the chain enqueues a whole draft without host round
+    // trips and reads the ids once. mtp_step_fed = mtp_forward on one row (same launches and operands) whose input id is
+    // *in_host (by value) or feed slot in_slot (an earlier step's pick), its pick written into slot out_slot.
+    static constexpr std::uint32_t kMtpFeedSlots = 64;
+    HipMtpOut mtp_step_fed(const std::uint32_t* in_host, std::uint32_t in_slot, std::uint32_t out_slot, const float* hidden_dev,
+                           std::uint32_t pos, bool want_top);
+    void mtp_feed_put(std::uint32_t slot, const std::uint32_t* top_dev);  // slot = *top_dev (async, device to device)
+    void mtp_feed_read(std::uint32_t n, std::uint32_t* host) const;       // host[0..n) = slots 0..n-1 (synchronizes)
     // Device helpers for the shared chain glue (all on the engine stream).
     [[nodiscard]] float* alloc_f32(std::size_t n) const;
     void free_f32(float* p) const;
@@ -147,6 +168,22 @@ public:
     // Timing only: set the committed length to `pos` WITHOUT computing (KV / state keep their contents; positions below pos are
     // whatever the cache holds). Used to sample window cost at long context without running the whole prefill.
     void bench_seek(std::uint32_t pos);
+
+    // Exact tensor-parallel decode over N processes (one per device), each holding the whole model and the same
+    // committed state (a replicated one-rank prefill). From this call on, every window (rows <= max_rows, whole model)
+    // computes only this rank's columns / heads (shares by `rates`, strix/pair/column_split.hpp) and joins the others'
+    // through `gather`: fn(ctx, stream, slots, slot_bytes, bytes), ordered on `stream` after the producers of this
+    // rank's slot (slots + rank * slot_bytes, first `bytes`), must fill the first `bytes` of every other slot with that
+    // rank's and order later work on `stream` after it; every rank makes the same calls in the same order. Ids are the
+    // one-rank ids bit for bit; logits rows are gathered (and bitwise) only with `full_logits`, otherwise logits stay
+    // null and read_top carries the split argmax. The committed state is sliced to this rank's heads (one way).
+    struct TpGather {
+        void* ctx = nullptr;
+        void (*fn)(void* ctx, void* stream, void* slots, std::size_t slot_bytes, std::size_t bytes) = nullptr;
+    };
+    void enable_tp(std::uint32_t rank, const std::vector<double>& rates, TpGather gather, bool full_logits = false);
+    [[nodiscard]] bool tp_on() const;
+    [[nodiscard]] std::string tp_receipt() const;  // shares per tensor class, gathers per token
 
 private:
     HipEngine();

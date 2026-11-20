@@ -101,9 +101,11 @@ __global__ __launch_bounds__(256) void prologue_kernel(Rows v, std::uint32_t cle
 // ---------------------------------------------------------------------------------------------------------------------
 // csr: build_prefill_csr_waves (known_rows.hip:460-532) with cap 16, transcribed (32 waves of 32 lanes; the AMD
 // ballot/shfl peer loop becomes __match_any_sync, and a __syncwarp separates the position reads from the leader updates,
-// which the AMD wave executes in lockstep). Also emits this port's tiles (runs of <= 64 assignments of one expert).
-__global__ __launch_bounds__(1024) void csr_kernel(Rows v, std::uint32_t rows) {
-    constexpr unsigned Waves = 32U, cap = hip_batch, tcap = tile_rows;
+// which the AMD wave executes in lockstep). Also emits this port's tiles (runs of <= tcap assignments of one expert, cut at
+// multiples of tcap of the expert's run). tcap is a compile-time trait: tile_rows (64) for every route, kWideRows (128) for
+// the wide tensor-core form, so the tile arithmetic stays folded constants.
+template <unsigned tcap> __global__ __launch_bounds__(1024) void csr_kernel(Rows v, std::uint32_t rows) {
+    constexpr unsigned Waves = 32U, cap = hip_batch;
     const Csr& csr = v.csr;
     const unsigned t = threadIdx.x, lane = t & 31U, wave = t / 32U, count = rows * top_k, span = (count + Waves - 1U) / Waves;
     const unsigned first = wave * span, last = min(count, first + span);
@@ -349,9 +351,12 @@ void enqueue_prologue(const Rows& v, std::uint32_t rows, std::uint32_t clear_wor
     prologue_kernel<<<rows, 256, 0, s>>>(v, clear_words);
     check(cudaGetLastError(), "MoE prologue");
 }
-void enqueue_csr(const Rows& v, std::uint32_t rows, cudaStream_t s) {
+void enqueue_csr(const Rows& v, std::uint32_t rows, cudaStream_t s, std::uint32_t rows_per_tile) {
     if (rows * top_k > 65535U * 32U) throw std::invalid_argument("MoE CSR rows");
-    csr_kernel<<<1, 1024, 0, s>>>(v, rows);
+    if (rows_per_tile == tile_rows) csr_kernel<tile_rows><<<1, 1024, 0, s>>>(v, rows);
+    else if (rows_per_tile == ::strix::cuda::core::native_mma::kWideRows)
+        csr_kernel<::strix::cuda::core::native_mma::kWideRows><<<1, 1024, 0, s>>>(v, rows);
+    else throw std::invalid_argument("MoE CSR tile rows");
     check(cudaGetLastError(), "MoE CSR");
 }
 void enqueue_project(const Rows& v, std::uint32_t rows, const Weights& w, const amdmath::Tables& tables, cudaStream_t s, bool moe_mma) {
@@ -489,62 +494,97 @@ bool native_types(const Weights& w) {
 // gsq-iq-bf16mma-cuda-v1 (FAST, explicit selection only): the GSQ storage type binds the tensor-core kernels at compile
 // time. Same CSR tiles, input rows, intermediates and rawdots as the native route; merge / commit are unchanged.
 namespace native_mma = ::strix::cuda::core::native_mma;
-// Steps of native_mma::decode_form(rows) bind the decode-tile trait (one m16 block, deep weight ring): bitwise the same.
-template <unsigned G> void launch_mma_project(const Rows& v, const Weights& w, unsigned tiles, bool decode, cudaStream_t s) {
+// Steps of native_mma::decode_form(rows) bind the decode-tile trait (one m16 block, deep weight ring); launches of
+// native_mma::wide_form bind the wide trait (128-row CSR tiles, 512 threads, dynamic stage memory). All bitwise the same.
+enum class MmaForm { tile, decode, wide };
+template <class K> void stage_attribute(K kernel, unsigned bytes) {
+    static_assert(native_mma::kWideThreads <= 1024U, "block size");
+    check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes)), "MoE wide stage attribute");
+}
+template <unsigned G> void launch_mma_project(const Rows& v, const Weights& w, unsigned tiles, MmaForm form, cudaStream_t s) {
     const dim3 grid(tiles, ffn / kMmaProjectOutputs);
-    if (decode)
+    if (form == MmaForm::decode)
         native_mma_project_kernel<G, MoeBinding, native_mma::kDecodeMBlocks, native_mma::kDecodeAhead><<<grid, kMmaThreads, 0, s>>>(w.gate, w.up, v);
-    else native_mma_project_kernel<G, MoeBinding><<<grid, kMmaThreads, 0, s>>>(w.gate, w.up, v);
+    else if (form == MmaForm::wide) {
+        constexpr unsigned bytes = native_mma_stage_bytes(native_mma::kWideMBlocks, true);
+        const auto kernel = native_mma_project_kernel<G, MoeBinding, native_mma::kWideMBlocks>;
+        static const bool attribute = (stage_attribute(kernel, bytes), true);
+        (void)attribute;
+        kernel<<<grid, native_mma::kWideThreads, bytes, s>>>(w.gate, w.up, v);
+    } else native_mma_project_kernel<G, MoeBinding><<<grid, kMmaThreads, 0, s>>>(w.gate, w.up, v);
 }
-template <unsigned T> void launch_mma_down(const Rows& v, const Weights& w, unsigned tiles, bool decode, cudaStream_t s) {
+template <unsigned T> void launch_mma_down(const Rows& v, const Weights& w, unsigned tiles, MmaForm form, cudaStream_t s) {
     const dim3 grid(tiles, hidden / kMmaDownOutputs);
-    if (decode)
+    if (form == MmaForm::decode)
         native_mma_down_kernel<T, MoeBinding, native_mma::kDecodeMBlocks, native_mma::kDecodeAhead><<<grid, kMmaThreads, 0, s>>>(w.down, v);
-    else native_mma_down_kernel<T, MoeBinding><<<grid, kMmaThreads, 0, s>>>(w.down, v);
+    else if (form == MmaForm::wide) {
+        constexpr unsigned bytes = native_mma_stage_bytes(native_mma::kWideMBlocks, false);
+        const auto kernel = native_mma_down_kernel<T, MoeBinding, native_mma::kWideMBlocks>;
+        static const bool attribute = (stage_attribute(kernel, bytes), true);
+        (void)attribute;
+        kernel<<<grid, native_mma::kWideThreads, bytes, s>>>(w.down, v);
+    } else native_mma_down_kernel<T, MoeBinding><<<grid, kMmaThreads, 0, s>>>(w.down, v);
 }
-void enqueue_mma_experts(const Rows& v, std::uint32_t rows, const Weights& w, unsigned tiles, cudaStream_t s) {
-    const bool decode = w.decode_tile && native_mma::decode_form(rows);
+// The tensor-core form of a launch: decided on the host from the row count alone, before the CSR (its tile rows follow).
+MmaForm mma_form(const Weights& w, std::uint32_t rows) {
+    if (w.decode_tile && native_mma::decode_form(rows)) return MmaForm::decode;
+    const unsigned min_avg = w.wide_min_avg ? w.wide_min_avg : native_mma::kWideMinAvgRows;
+    if (w.wide_tile && native_mma::wide_form(std::uint64_t{rows} * top_k, experts, min_avg)) return MmaForm::wide;
+    return MmaForm::tile;
+}
+void enqueue_mma_experts(const Rows& v, const Weights& w, unsigned tiles, MmaForm form, cudaStream_t s) {
     switch (w.gate_type) {
-    case 18: launch_mma_project<18>(v, w, tiles, decode, s); break;
-    case 21: launch_mma_project<21>(v, w, tiles, decode, s); break;
-    case 22: launch_mma_project<22>(v, w, tiles, decode, s); break;
-    case 23: launch_mma_project<23>(v, w, tiles, decode, s); break;
-    case 42: launch_mma_project<42>(v, w, tiles, decode, s); break;
+    case 18: launch_mma_project<18>(v, w, tiles, form, s); break;
+    case 21: launch_mma_project<21>(v, w, tiles, form, s); break;
+    case 22: launch_mma_project<22>(v, w, tiles, form, s); break;
+    case 23: launch_mma_project<23>(v, w, tiles, form, s); break;
+    case 42: launch_mma_project<42>(v, w, tiles, form, s); break;
     default: throw std::invalid_argument("gsq-iq-bf16mma-cuda-v1: gate storage");
     }
     check(cudaGetLastError(), "MoE tensor-core gate/up");
-    if (w.down_type == 20) launch_mma_down<20>(v, w, tiles, decode, s);
-    else if (w.down_type == 42) launch_mma_down<42>(v, w, tiles, decode, s);
+    if (w.down_type == 20) launch_mma_down<20>(v, w, tiles, form, s);
+    else if (w.down_type == 42) launch_mma_down<42>(v, w, tiles, form, s);
     else throw std::invalid_argument("gsq-iq-bf16mma-cuda-v1: down storage");
     check(cudaGetLastError(), "MoE tensor-core down");
 }
 
 // gsq-iq-i8mma-turbo-cuda-v1 (TURBO, profile row expert_turbo or explicit selection): int8 IMMA over the shared A8 input
 // codes (prologue) and the A8 down codes (project_activation_tile, run by the TURBO project kernel). Same CSR tiles;
-// rawdots in the native layout, merge / commit unchanged.
+// rawdots in the native layout, merge / commit unchanged. Grids keep (tiles, slices); the kernels map blocks tile-major
+// (native_mma::tile_major). Steps of native_mma::decode_form(rows) bind the decode-tile trait (one m16 block, the shared
+// kDecodeAhead-deep weight ring), exactly as the BF16 experts above: bitwise the int8 tile form, same lever (decode_tile).
 template <unsigned G> void launch_turbo_project(const Rows& v, const Weights& w, const amdmath::Tables& tables, unsigned tiles,
-                                                cudaStream_t s) {
-    core::moe_turbo::turbo_project_kernel<G, MoeBinding>
-        <<<dim3(tiles, ffn / core::moe_turbo::kTurboProjectOutputs), core::moe_turbo::kTurboThreads, 0, s>>>(w.gate, w.up, v, tables);
+                                                bool decode, cudaStream_t s) {
+    namespace mt = core::moe_turbo;
+    const dim3 grid(tiles, ffn / mt::kTurboProjectOutputs);
+    if (decode)
+        mt::turbo_project_kernel<G, MoeBinding, native_mma::kDecodeMBlocks, native_mma::kDecodeAhead>
+            <<<grid, mt::kTurboThreads, 0, s>>>(w.gate, w.up, v, tables);
+    else mt::turbo_project_kernel<G, MoeBinding><<<grid, mt::kTurboThreads, 0, s>>>(w.gate, w.up, v, tables);
 }
-template <unsigned D> void launch_turbo_down(const Rows& v, const Weights& w, unsigned tiles, cudaStream_t s) {
-    core::moe_turbo::turbo_down_kernel<D, MoeBinding>
-        <<<dim3(tiles, hidden / core::moe_turbo::kTurboDownOutputs), core::moe_turbo::kTurboThreads, 0, s>>>(w.down, v);
+template <unsigned D> void launch_turbo_down(const Rows& v, const Weights& w, unsigned tiles, bool decode, cudaStream_t s) {
+    namespace mt = core::moe_turbo;
+    const dim3 grid(tiles, hidden / mt::kTurboDownOutputs);
+    if (decode)
+        mt::turbo_down_kernel<D, MoeBinding, native_mma::kDecodeMBlocks, native_mma::kDecodeAhead><<<grid, mt::kTurboThreads, 0, s>>>(w.down, v);
+    else mt::turbo_down_kernel<D, MoeBinding><<<grid, mt::kTurboThreads, 0, s>>>(w.down, v);
 }
-void enqueue_turbo_experts(const Rows& v, const Weights& w, const amdmath::Tables& tables, unsigned tiles, cudaStream_t s) {
+void enqueue_turbo_experts(const Rows& v, std::uint32_t rows, const Weights& w, const amdmath::Tables& tables, unsigned tiles,
+                           cudaStream_t s) {
     if (!v.codes.base || !v.deltas.base || !v.down_codes.base || !v.down_deltas.base)
         throw std::invalid_argument("gsq-iq-i8mma-turbo-cuda-v1 needs the A8 input and down code buffers");
+    const bool decode = w.decode_tile && native_mma::decode_form(rows);
     switch (w.gate_type) {
-    case 18: launch_turbo_project<18>(v, w, tables, tiles, s); break;
-    case 21: launch_turbo_project<21>(v, w, tables, tiles, s); break;
-    case 22: launch_turbo_project<22>(v, w, tables, tiles, s); break;
-    case 23: launch_turbo_project<23>(v, w, tables, tiles, s); break;
-    case 42: launch_turbo_project<42>(v, w, tables, tiles, s); break;
+    case 18: launch_turbo_project<18>(v, w, tables, tiles, decode, s); break;
+    case 21: launch_turbo_project<21>(v, w, tables, tiles, decode, s); break;
+    case 22: launch_turbo_project<22>(v, w, tables, tiles, decode, s); break;
+    case 23: launch_turbo_project<23>(v, w, tables, tiles, decode, s); break;
+    case 42: launch_turbo_project<42>(v, w, tables, tiles, decode, s); break;
     default: throw std::invalid_argument("gsq-iq-i8mma-turbo-cuda-v1: gate storage");
     }
     check(cudaGetLastError(), "MoE TURBO int8 gate/up");
-    if (w.down_type == 20) launch_turbo_down<20>(v, w, tiles, s);
-    else if (w.down_type == 42) launch_turbo_down<42>(v, w, tiles, s);
+    if (w.down_type == 20) launch_turbo_down<20>(v, w, tiles, decode, s);
+    else if (w.down_type == 42) launch_turbo_down<42>(v, w, tiles, decode, s);
     else throw std::invalid_argument("gsq-iq-i8mma-turbo-cuda-v1: down storage");
     check(cudaGetLastError(), "MoE TURBO int8 down");
 }
@@ -555,18 +595,22 @@ bool enqueue_routed(const Rows& v, std::uint32_t rows, const Weights& w, const a
     validate_route_storage(v, rows);
     if (v.route_bf16 && (native_types(w) || w.arithmetic==ExpertArithmetic::gsq_a8_dot4))
         qwen_route::require_composition(true, qwen_route::Composition::other_weight_pack);
-    enqueue_csr(v, rows, s);
+    // The wide tensor-core form cuts the CSR tiles at 128 rows (every other route reads 64-row tiles).
+    const bool wide_mma = native_types(w) && w.arithmetic == ExpertArithmetic::gsq_bf16_mma && mma_form(w, rows) == MmaForm::wide;
+    enqueue_csr(v, rows, s, wide_mma ? native_mma::kWideRows : tile_rows);
     if (native_types(w)) {
         if (!v.intermediates.base) throw std::invalid_argument("MoE native expert types need Rows::intermediates");
         if (quant::geometry(w.gate_type).block_elements == 0 || quant::geometry(w.down_type).block_elements == 0)
             throw std::invalid_argument("MoE expert type without a decoder");
         const unsigned tiles = csr_sizes(rows).max_tiles;
         if (w.arithmetic == ExpertArithmetic::gsq_bf16_mma) {
-            enqueue_mma_experts(v, rows, w, tiles, s);
+            const MmaForm form = mma_form(w, rows);
+            enqueue_mma_experts(v, w, form == MmaForm::wide ? native_mma::tile_bound(rows * top_k, experts, native_mma::kWideRows) : tiles,
+                                form, s);
             return false;   // tensor-core GSQ experts: the moe_mma candidate form did not run
         }
         if (w.arithmetic == ExpertArithmetic::gsq_i8_turbo) {
-            enqueue_turbo_experts(v, w, tables, tiles, s);
+            enqueue_turbo_experts(v, rows, w, tables, tiles, s);
             return false;   // TURBO integer GSQ experts: the moe_mma candidate form did not run
         }
         // The storage type binds the compile-time typed decoder (bitwise the runtime-type values; see with_native_source).

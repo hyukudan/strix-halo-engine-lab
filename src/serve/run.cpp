@@ -16,6 +16,10 @@ namespace strix::gemma4::engine { void install_session_service(strix::serve::Ser
 namespace strix::minimax::serve { void install_session_service(strix::serve::ServiceFactories&); }
 #endif
 
+#ifdef STRIX_SERVE_HY4
+namespace strix::hy4::serve { void install_session_service(strix::serve::ServiceFactories&); }
+#endif
+
 namespace strix::serve {
 void ServiceFactories::install(std::string family, ServiceFactory f) {
     if (family.empty() || !f.create || !f.validate || !f.inspect)
@@ -35,6 +39,9 @@ void install_service_factories(ServiceFactories& factories) {
 #endif
 #ifdef STRIX_SERVE_MINIMAX
     minimax::serve::install_session_service(factories);
+#endif
+#ifdef STRIX_SERVE_HY4
+    hy4::serve::install_session_service(factories);
 #endif
 }
 namespace {

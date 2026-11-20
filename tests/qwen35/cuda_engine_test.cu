@@ -2,6 +2,7 @@
 //  1. serial decode == forward_rows(R) + commit(k) chains (random R and k, also k = 0 and k < R), logits and hidden, bf16 and q8_0
 //  2. CUDA graph on == graph off
 //  3. MTP: rows in one call == rows one at a time
+//  --kv8fed: decode_attn8 verify fed (forward_rows_fed) == unfed (forward_rows) after a big prefill (bounded ticket)
 // Home: specific (qwen35 engine test).
 #include <algorithm>
 #include <cmath>
@@ -92,7 +93,102 @@ static bool same(const std::vector<float>& a, const std::vector<float>& b) {
     return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
 }
 
-int main() {
+// --kv8fed (bounded ticket, no model): decode_attn8 (FAST class d8) with the device-fed verify of the spec pre-launch. Both
+// window entries run the same input prologue, so after a big prefill (which advances the committed prefix without the e4m3
+// decode shadow) the first verify fed (forward_rows_fed: ids from MTP feed slots and host values) == unfed (forward_rows):
+// top ids and logits of every row bitwise, then a committed partial window and a second verify; graphs on and off, again
+// after reset(), and fed as the very first window of a fresh engine (shadow allocated on first use).
+struct Verify { std::vector<float> logits; std::vector<std::uint32_t> top; };
+static Verify read_window(q::CudaEngine& E, const q::RowsOut& o, std::uint32_t rows) {
+    const auto& c = E.config();
+    Verify v{std::vector<float>(static_cast<std::size_t>(rows) * c.vocab), std::vector<std::uint32_t>(rows)};
+    for (std::uint32_t r = 0; r < rows; ++r) E.read_logits(o, r, v.logits.data() + static_cast<std::size_t>(r) * c.vocab);
+    E.read_top(o, rows, v.top.data());
+    return v;
+}
+static int kv8fed() {
+    if (!strix::cuda_core::dense_big_fast8_supported()) {
+        std::printf("kv8fed: SKIP (this build has no FAST8 e4m3 tensor-core kernels)\n");
+        return 0;
+    }
+    constexpr std::uint32_t kHost = 0xFFFFFFFFU;  // strix::spec::DraftFeed::kHost
+    q::EngineOptions opt;
+    opt.max_positions = 512;
+    opt.quiet = true;
+    opt.multi_gemv = true;
+    opt.prefill_chunk = 128;
+    opt.decode_attn8 = true;
+    q::Config cfg = small_cfg();
+    cfg.gdn_value_heads = 16;  // large-M prefill admission (as the prefill section of the full test)
+    auto A = q::CudaEngine::synthetic(cfg, q::PackFormat::bf16, opt, 7);  // unfed reference
+    auto B = q::CudaEngine::synthetic(cfg, q::PackFormat::bf16, opt, 7);  // fed (verify pre-launch entry)
+    CHECK(A->prefill_is_big() && B->has_mtp(), "kv8fed: needs the large-M prefill and MTP tensors");
+    if (g_fail) return 1;
+    std::mt19937 rng(1119);
+    std::uint32_t* dev_ids = nullptr;
+    cudaMalloc(reinterpret_cast<void**>(&dev_ids), 8 * 4);
+    // One verify window of 5 rows: row 0 host, rows 1 and 3 from feed slots 2 and 9, rows 2 and 4 host values.
+    auto verify_pair = [&](const std::vector<std::uint32_t>& w, const char* what) {
+        const auto oa = A->forward_rows(w.data(), 5, q::LogitRows::all);
+        const Verify va = read_window(*A, oa, 5);
+        cudaMemcpy(dev_ids, w.data(), 5 * 4, cudaMemcpyHostToDevice);
+        B->mtp_feed_put(2, dev_ids + 1);
+        B->mtp_feed_put(9, dev_ids + 3);
+        const std::uint32_t slot[4] = {2, kHost, 9, kHost}, vals[4] = {0, w[2], 0, w[4]};
+        const auto ob = B->forward_rows_fed(w.data(), 1, slot, vals, 4, q::LogitRows::all);
+        const Verify vb = read_window(*B, ob, 5);
+        const bool ok = va.top == vb.top && std::memcmp(va.logits.data(), vb.logits.data(), va.logits.size() * 4) == 0;
+        bool finite = true;
+        for (float f : va.logits) finite = finite && std::isfinite(f);
+        CHECK(ok && finite, "kv8fed %s: fed verify != unfed verify (top/logits bitwise) or not finite", what);
+        std::printf("  kv8fed %s: top %u %u %u %u %u %s\n", what, va.top[0], va.top[1], va.top[2], va.top[3], va.top[4],
+                    ok ? "fed == unfed bitwise" : "MISMATCH");
+    };
+    auto window = [&](std::uint32_t first) {
+        std::vector<std::uint32_t> w(5);
+        w[0] = first;
+        for (std::uint32_t i = 1; i < 5; ++i) w[i] = static_cast<std::uint32_t>(rng() % cfg.vocab);
+        return w;
+    };
+    const std::size_t n = 387;  // three 128-row chunks and a 3-row tail
+    for (int graphs = 1; graphs >= 0; --graphs) {
+        for (int round = 0; round < 2; ++round) {  // round 1: a second sequence after reset()
+            std::vector<std::uint32_t> prompt(n);
+            for (auto& t : prompt) t = static_cast<std::uint32_t>(rng() % cfg.vocab);
+            std::uint32_t anchor[2] = {};
+            q::CudaEngine* E2[2] = {A.get(), B.get()};
+            for (int e = 0; e < 2; ++e) {
+                E2[e]->set_graphs(graphs != 0);
+                E2[e]->reset();
+                const auto o = E2[e]->prefill(prompt.data(), static_cast<std::uint32_t>(n), q::LogitRows::last);
+                E2[e]->read_top(o, 1, &anchor[e]);
+            }
+            CHECK(anchor[0] == anchor[1], "kv8fed: big prefill anchors differ");
+            char what[64];
+            std::snprintf(what, sizeof what, "graphs %d seq %d first verify", graphs, round);
+            const auto w1 = window(anchor[0]);
+            verify_pair(w1, what);
+            A->commit(3);
+            B->commit(3);
+            std::snprintf(what, sizeof what, "graphs %d seq %d after commit 3", graphs, round);
+            verify_pair(window(w1[3]), what);
+        }
+    }
+    {  // fed as the first window of a fresh engine (no prefill, no earlier unfed window)
+        auto C = q::CudaEngine::synthetic(cfg, q::PackFormat::bf16, opt, 7);
+        A->reset();
+        B.swap(C);  // verify_pair's fed side is now the fresh engine
+        A->set_graphs(true);
+        B->set_graphs(true);
+        verify_pair(window(static_cast<std::uint32_t>(rng() % cfg.vocab)), "fresh engine first window");
+    }
+    cudaFree(dev_ids);
+    std::printf(g_fail ? "kv8fed: FAILED (%d)\n" : "kv8fed: PASS\n", g_fail);
+    return g_fail ? 1 : 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc > 1 && std::strcmp(argv[1], "--kv8fed") == 0) return kv8fed();
     // variants: 0 bf16, 1 q8_0, 2 nvfp4 onfly (all 2-D incl. lm_head, ssm beta/alpha, multi launches), 3 nvfp4 onfly lm_head bf16
     for (int var = 0; var < 4; ++var) {
         const auto pack = var == 1 ? q::PackFormat::q8_0 : q::PackFormat::bf16;

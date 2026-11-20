@@ -19,6 +19,7 @@ namespace strix::cuda_core {
 DenseArith process_policy = DenseArith::mma3, head_policy = DenseArith::mma3;
 DenseArith dense_arith() { return process_policy; }
 std::uint32_t nvfp4_split_k(std::uint32_t, std::uint32_t) { return 1; }
+namespace ftile = ::strix::cuda::core::nvfp4::tile;  // as in dense_big.cu (BigCtx::feed)
 #include "audit_big.inc"
 cudaError_t dense_big_reserve(std::uint32_t, std::uint32_t, std::uint64_t, int, BigCtx* ctx) {
     CK(bind_device(*ctx));
@@ -37,6 +38,7 @@ struct GdnChunkWork { float* ws = nullptr; std::size_t floats = 0; };
 template <class Dims> std::size_t gdn_chunk_workspace_floats(const Dims&, std::uint32_t rows) { return rows; }
 void dense_big_cache_destroy(BigOperandCache*) {}
 void dense_big_ctx_attach_cache(BigCtx*, BigOperandCache*) {}
+void dense_big_ctx_set_tile_feed(BigCtx* ctx, ftile::Feed feed) { if (ctx) ctx->feed = feed; }
 bool dense_big_fast4_supported() { return false; }  // FAST4 is not audited here (generic-build answer); fast8 is, extracted
 }
 struct Engine {
@@ -73,9 +75,16 @@ struct Engine {
 // engine.hip WideScratch: the dense scratch plus the x16 tile buffer of the IU4 wide windows (_Float16 there; the audit
 // never stores a tile, so a 16-bit stand-in keeps this host test free of _Float16).
 using Half = std::uint16_t;
-struct WideScratch : core::DenseWideScratch { Half* xt = nullptr; };
 using hipStream_t = void*;
-struct Tensor { unsigned fmt = 30, inputs = 1, outputs = 1; };
+// engine.hip A4W4 class (core/iu4a4_dense.hpp): the activation codes of one window. The audited tensors carry no A4
+// codes (a4_ok below is false), so its producers are unreachable here.
+namespace strix::core::iu4a4_dense {
+struct Act { std::uint8_t* codes = nullptr; float* u = nullptr; float* base = nullptr; unsigned rows = 0, in = 0; };
+inline bool map2_supported(unsigned) { return false; }
+template <class F> void enqueue_quantise_map2(const float*, const float*, unsigned, const Act&, hipStream_t) { runtime_require(false); }
+}
+struct WideScratch : core::DenseWideScratch { Half* xt = nullptr; core::iu4a4_dense::Act a4{}; };
+struct Tensor { unsigned fmt = 30, inputs = 1, outputs = 1; const void* data = nullptr; };
 unsigned limit = 0;
 float* base_out = nullptr;
 std::vector<unsigned> seen;
@@ -103,6 +112,8 @@ void wide_iu4(const Tensor&, const float*, float*, unsigned, hipStream_t, const 
 // x16 tile form of the IU4 wide windows (core/f16_dense_tall.hpp producers); unreachable here (no type-200 weights).
 bool wide_iu4_x16(const Tensor&, const WideScratch&, unsigned) { return false; }
 struct SiluMul {};
+bool a4_ok(const Tensor&, const WideScratch&) { return false; }
+void a4_linear(const Tensor&, const float*, float*, unsigned, hipStream_t, const WideScratch&, bool = true) { runtime_require(false); }
 namespace strix::core::f16_dense_tall {
 struct TileRne {};
 void enqueue_x16_tiles(const float*, Half*, unsigned, unsigned, hipStream_t) { runtime_require(false); }
@@ -113,6 +124,19 @@ template <class Q> struct WithQ { using type = Q; };
 template <class K> void with_tile_quantiser(K&& k) { k(WithQ<core::f16_dense_tall::TileRne>{}); }
 void x16_tiles(const float*, Half*, unsigned, unsigned, hipStream_t) { runtime_require(false); }
 void silu_mul_host(const float*, const float*, float*, std::size_t) {}
+// engine.hip GLU pair sweep of the IU4 wide windows (core/f16_dense_iu4.hpp iu4a16::GluView, enqueue_glu_x16): taken
+// only with type-200 weights and x16 support (wide_iu4_x16 above is false), so unreachable here.
+int fast4_emu() { return 0; }
+namespace strix::core::dense_iu4 {
+inline std::size_t packed_bytes(unsigned, unsigned) { return 0; }
+}
+namespace strix::core::f16_dense_tall::iu4a16 {
+struct View {};
+struct GluView { View first; const std::uint8_t* second_weight; const std::uint16_t* second_scale; Half* h; };
+inline bool glu_pair_supported(const GluView&) { return false; }
+template <class F> void enqueue_glu_x16(const GluView&, const Half*, hipStream_t) { runtime_require(false); }
+}
+core::f16_dense_tall::iu4a16::View wide_iu4_view(const Tensor&, const float*, float*, unsigned) { return {}; }
 #include "audit_hip.inc"
 #include "audit_cli.inc"
 #include "audit_lengths.inc"
@@ -225,6 +249,16 @@ int main() {
         if (completed) break;
     }
     fail_after = -1; check(completed, "686-7 all allocation failures exercised");
+    for (bool opt_in : {false, true}) {  // FAST4 tile feed reaches every slot context: default lsu, bulk opt-in
+        Engine owned;
+        check(owned.opt.prefill_tile_feed == cc::ftile::Feed::lsu, "pr797 engine default feed = lsu");
+        if (opt_in) owned.opt.prefill_tile_feed = cc::ftile::Feed::bulk;
+        const auto want = opt_in ? cc::ftile::Feed::bulk : cc::ftile::Feed::lsu;
+        owned.pf_init(1);
+        bool all = !owned.pf.sl.empty();
+        for (const auto& s : owned.pf.sl) all = all && s->bc != nullptr && s->bc->feed == want;
+        check(all, "pr797 prefill_tile_feed applied to each slot's dense_big context");
+    }
     { Engine owned; owned.pf_init(1); lifetime.clear();
       { Engine::Events pool{owned.pf, nullptr, nullptr, {}};
         pool.start = std::malloc(1); events.insert(pool.start);

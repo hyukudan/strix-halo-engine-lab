@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -20,6 +21,10 @@ const sp::Lookup no_env = [](const char*) -> const char* { return nullptr; };
 hp::Result run(hp::App app, const Args& args, const sp::Lookup& env = no_env) {
     return hp::resolve_args(hp::engine(app), args, env);
 }
+const char* window_lever(hp::App app) { return app == hp::App::decode ? "wide_rows" : "prefill_rows"; }
+// The app's window cell and the shared A4W4 layer cell (both engines resolve exactly these two rows).
+const sp::Entry& win(const hp::Result& r, hp::App app) { return *r.resolution.find(window_lever(app)); }
+const sp::Entry& a4(const hp::Result& r) { return *r.resolution.find("a4w4_layers"); }
 }  // namespace
 
 int main() {
@@ -44,16 +49,29 @@ int main() {
         require(exact.resolution.profile == sp::Name::standard && dflt.resolution.profile == sp::Name::standard,
                 "exact and default are the default column");
         require(fast.args == user, "fast without allow-pending adds no option");
-        require(fast.resolution.entries.size() == 1U && fast.resolution.entries[0].status == sp::Status::pending &&
-                    fast.resolution.entries[0].value == exact.resolution.entries[0].value,
+        require(fast.resolution.entries.size() == 2U && win(fast, app).status == sp::Status::pending &&
+                    win(fast, app).value == win(exact, app).value,
                 "fast: the wide cell is pending, effective value equals exact");
-        require(fast.resolution.entries[0].target == "64-row FAST wide windows (dense-q8a8-f16-v1)", "pending target reported");
-        require(!sp::applied(fast.resolution.entries[0].status), "fast applies no lever without allow-pending");
+        require(win(fast, app).target == "64-row FAST wide windows (dense-q8a8-f16-v1)", "pending target reported");
+        require(!sp::applied(win(fast, app).status), "fast applies no window lever without allow-pending");
+        // the A4W4 layer table: qualified fast cell (environment lever, no argument), left alone by exact / default
+        require(sp::applied(a4(fast).status) && a4(fast).value == "48-63", "fast applies the qualified A4W4 layer table");
+        require(!sp::applied(a4(exact).status) && !sp::applied(a4(dflt).status) && !sp::applied(a4(none).status),
+                "exact / default / no word leave the A4W4 layer table alone");
+        std::vector<std::pair<std::string, std::string>> put;
+        sp::apply(fast.resolution, [&](const char* k, const char* v) { put.emplace_back(k, v); return true; });
+        require(put == std::vector<std::pair<std::string, std::string>>{{"STRIX_DENSE_A4W4_LAYERS", "48-63"}},
+                "fast exports exactly STRIX_DENSE_A4W4_LAYERS=48-63");
+        const sp::Lookup user_env = [](const char* key) -> const char* {
+            return std::string(key) == "STRIX_DENSE_A4W4_LAYERS" ? "none" : nullptr;
+        };
+        const auto off = run(app, with_fast, user_env);
+        require(a4(off).value == "none" && !sp::applied(a4(off).status), "an explicit STRIX_DENSE_A4W4_LAYERS wins over fast");
         // allow-pending (flag and env) applies the runnable pending cell, in front of the user's options.
         Args allow{"--profile", "fast", "--allow-pending"};
         const auto applied = run(app, allow);
         require(applied.args == Args{opt, "64"}, "fast --allow-pending adds the 64-row option in front");
-        require(applied.resolution.entries[0].status == sp::Status::unqualified, "allow-pending is stamped unqualified");
+        require(win(applied, app).status == sp::Status::unqualified, "allow-pending is stamped unqualified");
         const sp::Lookup allow_env = [](const char* key) -> const char* {
             return std::string(key) == std::string(hp::kAllowEnv) ? "1" : nullptr;
         };
@@ -62,7 +80,7 @@ int main() {
         Args explicit_args{"--profile", "fast", "--allow-pending", opt, "16", "--gen", "8"};
         const auto won = run(app, explicit_args);
         require(won.args == Args{opt, "16", "--gen", "8"}, "explicit option wins, no duplicate from the profile");
-        require(won.resolution.entries[0].status == sp::Status::off || won.resolution.entries[0].status == sp::Status::explicit_cli,
+        require(win(won, app).status == sp::Status::off || win(won, app).status == sp::Status::explicit_cli,
                 "explicit option recorded as explicit");
         // exact-window options keep their meaning: the profile adds no window size.
         const char* exact_opt = app == hp::App::decode ? "--wide-exact" : "--prefill-exact";
@@ -72,7 +90,7 @@ int main() {
         require(run(app, Args{"--profile=/tmp/x"}).args == Args{"--profile=/tmp/x"}, "non-word --profile untouched");
     }
     // the decode app does not see the spec spelling and vice versa
-    require(run(hp::App::decode, Args{"--prefill-rows", "8"}).resolution.entries[0].status == sp::Status::builtin,
+    require(win(run(hp::App::decode, Args{"--prefill-rows", "8"}), hp::App::decode).status == sp::Status::builtin,
             "decode engine ignores --prefill-rows");
     bool refused = false;
     try { run(hp::App::spec, Args{"--profile", "turbo"}); } catch (const std::exception&) { refused = true; }

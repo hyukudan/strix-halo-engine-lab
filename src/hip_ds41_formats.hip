@@ -4,6 +4,7 @@
 #include "strix/hip_ds41_formats.hpp"
 #include "strix/hip_ds41_routes_fast.hpp"
 #include "hip_ds41_routes_fast_body.hpp"
+#include "engram/hip/row_kernel.hpp"  // shared Engram row kernel (decode form)
 #include "strix/ds41_scalar_codecs.hpp"
 
 #include <hip/hip_fp16.h>
@@ -343,14 +344,7 @@ __global__ __launch_bounds__(256) void decode_kernel(WeightFormat format, const 
     }
 }
 
-__global__ __launch_bounds__(256) void engram_kernel(const unsigned char* __restrict__ rows, unsigned long long row_count,
-                                                     float* __restrict__ out) {
-    const unsigned long long index = static_cast<unsigned long long>(blockIdx.x) * 256U + threadIdx.x;
-    if (index >= row_count * engram_row_elements) return;
-    const auto* row = rows + index / engram_row_elements * engram_row_bytes;
-    const unsigned j = static_cast<unsigned>(index % engram_row_elements);
-    out[index] = e4m3_device(row[j]) * e8m0_device(row[256U + j / 32U]);
-}
+// Engram row decode: shared home src/engram/hip/row_kernel.hpp (RowPrepForm::decode, e8m0_per32 x 256 = this model).
 
 __global__ __launch_bounds__(256) void scalar_tables_kernel(float* out) {
     const unsigned c = threadIdx.x;
@@ -362,11 +356,14 @@ __global__ __launch_bounds__(256) void scalar_tables_kernel(float* out) {
     }
 }
 
-__global__ __launch_bounds__(32) void quantize_a8_kernel(const float* __restrict__ values, unsigned width, signed char* __restrict__ codes,
-                                                         float* __restrict__ deltas, int* __restrict__ sums) {
-    const unsigned lane = threadIdx.x, group = blockIdx.x, row = blockIdx.y, groups = width / 32U;
-    const unsigned long long at = static_cast<unsigned long long>(row) * width + 32U * group + lane;
-    const float x = values[at];
+// Output row pitch `pitch` (codes) and pitch / 32 (deltas, sums); pitch == width is the dense layout.
+__global__ __launch_bounds__(32) void quantize_a8_kernel(const float* __restrict__ values, unsigned width, unsigned pitch,
+                                                         signed char* __restrict__ codes, float* __restrict__ deltas,
+                                                         int* __restrict__ sums) {
+    const unsigned lane = threadIdx.x, group = blockIdx.x, row = blockIdx.y, groups = pitch / 32U;
+    const unsigned long long in = static_cast<unsigned long long>(row) * width + 32U * group + lane;
+    const unsigned long long at = static_cast<unsigned long long>(row) * pitch + 32U * group + lane;
+    const float x = values[in];
     float amax = fabsf(x);
     for (int stride = 16; stride; stride /= 2) amax = fmaxf(amax, __shfl_xor(amax, stride, 32));
     const bool tiny = amax > 0.0F && amax < 0x1p-119F;
@@ -2069,11 +2066,15 @@ void enqueue_decode_blocks(WeightFormat format, const void* blocks, std::size_t 
     check(hipGetLastError(), "decode launch");
 }
 void enqueue_decode_engram_rows(const void* rows, std::size_t row_count, float* out, void* stream) {
-    const auto values = static_cast<unsigned long long>(row_count) * engram_row_elements;
-    if (!values) return;
-    hipLaunchKernelGGL(engram_kernel, dim3(static_cast<unsigned>((values + 255U) / 256U)), dim3(256), 0,
-                       static_cast<hipStream_t>(stream), static_cast<const unsigned char*>(rows),
-                       static_cast<unsigned long long>(row_count), out);
+    static_assert(engram_row_elements == 256U && engram_row_bytes == engram::RowFormat{256U, engram::RowScale::e8m0_per32}.bytes(),
+                  "DS41 Engram rows = RowFormat e8m0_per32 x 256");
+    engram::RowPrepView v;
+    v.form = engram::RowPrepForm::decode;
+    v.fmt = engram::RowFormat{256U, engram::RowScale::e8m0_per32};
+    v.rows = static_cast<const std::uint8_t*>(rows);
+    v.row_count = row_count;
+    v.out = out;
+    engram::hip::enqueue_row_prep<engram::RowPrepForm::decode, engram::RowScale::e8m0_per32, 256U>(v, static_cast<hipStream_t>(stream));
     check(hipGetLastError(), "engram decode launch");
 }
 void enqueue_decode_scalar_tables(float* out, void* stream) {
@@ -2082,9 +2083,14 @@ void enqueue_decode_scalar_tables(float* out, void* stream) {
 }
 void enqueue_quantize_a8(const float* values, std::uint32_t width, std::uint32_t rows, std::int8_t* codes, float* deltas,
                          std::int32_t* sums, void* stream) {
-    if (width == 0U || width % 32U != 0U || rows == 0U) throw std::invalid_argument("ds41 A8 quantize geometry");
+    enqueue_quantize_a8(values, width, rows, width, codes, deltas, sums, stream);
+}
+void enqueue_quantize_a8(const float* values, std::uint32_t width, std::uint32_t rows, std::uint32_t pitch, std::int8_t* codes,
+                         float* deltas, std::int32_t* sums, void* stream) {
+    if (width == 0U || width % 32U != 0U || rows == 0U || pitch < width || pitch % 32U != 0U)
+        throw std::invalid_argument("ds41 A8 quantize geometry");
     hipLaunchKernelGGL(quantize_a8_kernel, dim3(width / 32U, rows), dim3(32), 0, static_cast<hipStream_t>(stream), values, width,
-                       reinterpret_cast<signed char*>(codes), deltas, sums);
+                       pitch, reinterpret_cast<signed char*>(codes), deltas, sums);
     check(hipGetLastError(), "A8 quantize launch");
 }
 void enqueue_product(WeightFormat format, const ProductView& view, void* stream) {

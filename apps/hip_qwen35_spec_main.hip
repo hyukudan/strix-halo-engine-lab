@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "strix/qwen35/hip_engine.hpp"
+#include "strix/qwen35/prefill_windows.hpp"
 #include "strix/profiles/qwen_dense_hip.hpp"
 #include "strix/qwen35/hip_spec_defaults.hpp"
 #include "../src/core/dense_linear_iu4.hpp"  // dense_iu4::scalar_x (the costs' bucket form)
@@ -288,7 +289,7 @@ int main(int argc, char** argv) try {
     if (chain_hidden != "post" && chain_hidden != "pre") throw std::invalid_argument("--chain-hidden post|pre");
     if (model.empty() || (ids_file.empty() && !cost_table && !pf_bench))
         throw std::invalid_argument("usage: --model F.gguf (--prompt-file ids | --cost-table | --prefill-bench N [--pf-sample]) [--n-gen N] "
-                                    "[--sources copy,chain,hybrid|none] [--mtp F.gguf] [--chain-hidden post|pre] [--chain-k N] [--mtp-ref] [--dump-ref F] [--dump-out F] "
+                                    "[--sources copy,chain,hybrid|none] [--mtp F.gguf] [--chain-hidden post|pre] [--chain-feed device|host] [--chain-k N] [--mtp-ref] [--dump-ref F] [--dump-out F] "
                                     "[--max-block 1..16] [--check 0|1] [--max-pos N] [--label S]");
     std::vector<std::uint32_t> prompt;
     if (!ids_file.empty()) {
@@ -301,10 +302,10 @@ int main(int argc, char** argv) try {
     opt.max_positions = std::max<std::uint32_t>(max_pos, std::uint32_t(prompt.size()) + n_gen + 128U + (cost_table ? 512U : 0U));
     if (pf_bench) opt.max_positions = std::max(opt.max_positions, pf_bench + 64U);
     opt.quiet = true;
-    if (prefill_rows) {  // explicit window: 16-row exact, or FAST wide unless --prefill-exact
-        opt.prefill_rows = prefill_rows;
-        opt.wide_exact = prefill_exact;
-    }
+    q::PrefillFlags pfl;  // explicit window: 16-row exact, or FAST wide unless --prefill-exact (prefill_windows.hpp)
+    pfl.width = prefill_rows;
+    pfl.exact = prefill_exact;
+    q::apply_prefill_flags(pfl, q::HipEngine::max_rows(), opt);
     auto E = q::HipEngine::from_gguf(model, opt);
     std::printf("prefill windows: %u rows, %s\n", E->prefill_rows(),
                 E->prefill_rows() <= 16U ? "exact (16-row)" : opt.wide_exact ? "exact (wide, bitwise to 16-row)" : "FAST (dense wide class)");
@@ -313,20 +314,21 @@ int main(int argc, char** argv) try {
     std::unique_ptr<HipMtpChain> chain_glue;
     std::unique_ptr<sp::DraftRows> drows;
     std::optional<q::HipDenseCosts> costs;  // measured once per process (first spec run, after its prompt)
-    if (E->has_mtp()) chain_glue = std::make_unique<HipMtpChain>(*E, chain_hidden == "pre", q::HipEngine::mtp_max_rows());
+    if (E->has_mtp()) {
+        chain_glue = std::make_unique<HipMtpChain>(*E, chain_hidden == "pre", q::HipEngine::mtp_max_rows());
+        chain_glue->set_device_feed(plan.device_feed);  // --chain-feed (shared spec flags)
+    }
     std::printf("loaded: weights %.2f GB/pass, state %.0f MB/pass, max_positions %u\n", double(E->weight_bytes()) / 1e9,
                 double(E->state_bytes_per_pass()) / 1e6, opt.max_positions);
 
     auto prefill_ids = [&](const std::vector<std::uint32_t>& ids, std::uint32_t& anchor, bool feed_chain = false) {
         E->reset();
         if (chain_glue) chain_glue->reset();
-        const std::size_t W = E->prefill_rows();
-        for (std::size_t p = 0; p < ids.size(); p += W) {
-            const auto rows = std::uint32_t(std::min<std::size_t>(W, ids.size() - p));
-            const bool last = p + rows == ids.size();
-            const auto o = E->forward_commit(ids.data() + p, rows, last ? q::LogitRows::last : q::LogitRows::none);
+        for (const auto& w : q::plan_prefill(pfl, ids.size(), E->prefill_rows(), q::HipEngine::max_rows()).windows) {
+            const bool last = w.at + w.rows == ids.size();  // the plan asks logits of the last window only
+            const auto o = E->forward_commit(ids.data() + w.at, w.rows, w.want);
             if (last) E->read_top(o, 1, &anchor);
-            if (feed_chain && chain_glue) chain_glue->observe_prefill(o, rows, ids.data() + p, last ? anchor : ids[p + rows]);
+            if (feed_chain && chain_glue) chain_glue->observe_prefill(o, w.rows, ids.data() + w.at, last ? anchor : ids[w.at + w.rows]);
         }
         E->sync();
     };
@@ -549,6 +551,9 @@ int main(int argc, char** argv) try {
                     1000.0 * double(out.size() - 1) / wall, wall / double(std::max<std::size_t>(per_step.size(), 1)), best, prompt.size(), prefill_ms);
         for (unsigned r = 1; r <= 16U; ++r)
             if (windows[r]) std::printf("verify-window %u: %llu calls\n", r, (unsigned long long)windows[r]);
+        if (use_chain && chain_glue)
+            std::printf("mtp-feed[%s]: %s, chain host reads %llu over %llu drafts\n", label.c_str(), chain_glue->device_feed() ? "device" : "host",
+                        (unsigned long long)chain_glue->host_reads(), (unsigned long long)chain_glue->drafts());
         if (use_chain && chain_glue)
             std::printf("mtp[%s]: hidden %s chain_k override %u, mtp_forward calls %llu rows %llu, draft() %llu calls %.1f ms total = %.2f ms/draft, %.2f ms/mtp_forward call; "
                         "chain-source passes %llu (%.1f %%), hybrid blocks %llu (ext proposed %llu accepted %llu)\n",

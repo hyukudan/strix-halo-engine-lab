@@ -567,7 +567,10 @@ int main(int argc, char** argv) try {
     const auto n = argc > 1 ? std::stoul(argv[1]) : 7UL;
     require(n > 0UL && n <= 101UL, "N must be 1..101");
     require(qsa_index_rows_enabled(), "run with STRIX_QSA_INDEX_ROWS=1 for the original rows reference");
-    require(qpf2k_index_batch_enabled(), "run with STRIX_QPF2K_INDEX_BATCH=1");
+    // A launch shape (STRIX_QPF2K_QSA_INDEX_SHAPE, e.g. 4 = 8 rows per workgroup) turns the default batching off and is
+    // exercised here because run() activates the batch itself; the bit checks below are the same for every shape.
+    require(qpf2k_index_batch_enabled() || std::getenv("STRIX_QPF2K_QSA_INDEX_SHAPE"),
+        "run with STRIX_QPF2K_INDEX_BATCH=1 (or a STRIX_QPF2K_QSA_INDEX_SHAPE launch shape)");
     require(qpf2k_index_wmma_enabled(), "run with STRIX_PREFILL_EXACT_FP16=0 and STRIX_PREFILL_INDEX_PROJ_WMMA=1 on gfx1151 wave32");
     Stream stream;
     negative_dispatch(stream.value);

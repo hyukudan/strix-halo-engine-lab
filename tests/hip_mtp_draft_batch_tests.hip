@@ -3,6 +3,7 @@
 // weights: Q8_0 with registered Q4 copies where production reads them).
 #include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/hip_mtp_input_fusion.hpp"
+#include "strix/hip_mtp_prime_rows.hpp"
 #include "strix/hip_mtp_draft_head.hpp"
 #include "strix/hip_mtp_attention.hpp"
 #include <hip/hip_fp16.h>
@@ -11,6 +12,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <numeric>
@@ -240,6 +242,73 @@ void fusion_cases(){
     ok("batched draft input fusion == one-token draft fusion per row (both roundings, 1..8 rows, permuted)",all);
 }
 
+// Prompt priming (STRIX_MTP_PRIME_ROWS): the strided prime-rows fusion (four output rows per wave, or one with
+// STRIX_MTP_PRIME_PROJ_ROWS=1) against the one-token draft fusion of each row alone, bit for bit: both roundings,
+// 2..64 rows (odd counts leave a one-token tail group), hidden rows read in place from separate allocations.
+void prime_fusion_cases(){
+    Stream st;std::mt19937 g(17);
+    auto& packed=*new Device<std::uint8_t>(static_cast<std::size_t>(H)*2*H/32*34);q8_random(packed,41,-9,st.s);
+    strix::register_hip_mtp_draft_q4(packed.p,packed.n/34*32,st.s);check(hipStreamSynchronize(st.s));
+    Device<float> enorm(H),hnorm(H*HC);enorm.write(random_f32(H,g,1,0.1F));hnorm.write(random_f32(H*HC,g,1,0.1F));
+    const std::size_t scratch_bytes=strix::hip_mtp_input_fusion_scratch_bytes(H,HC);
+    const auto align=[](std::size_t v){return (v+255U)&~std::size_t{255U};};
+    const std::size_t at_norm=align(H*2U),at_out=at_norm+align(scratch_bytes),slot=at_out+align(std::size_t{H}*HC*2U);
+    constexpr std::uint32_t P=64;
+    Device<std::uint8_t> slab(slot*P);
+    struct Row {Device<std::uint16_t> wide{H*HC},ref{H*HC};std::vector<std::uint16_t> embedding;Device<float> normalized,projected;
+        explicit Row(std::size_t n):normalized(n),projected(n){}};
+    std::vector<std::unique_ptr<Row>> rows;
+    for(std::uint32_t t=0;t<P;++t){rows.push_back(std::make_unique<Row>(scratch_bytes/4));rows.back()->embedding=random_bf16(H,g);
+        rows.back()->wide.write(random_bf16(H*HC,g,3));}
+    Device<std::uint16_t> embedding_one(H);
+    auto view=[](std::uintptr_t a,std::size_t bytes){return strix::HipMtpInputFusionView{a,bytes,1};};
+    auto v=[&](auto& d){return view(reinterpret_cast<std::uintptr_t>(d.p),d.n*sizeof(*d.p));};
+    auto request=[&](Row& r,strix::HipMtpInputRounding projection){
+        strix::HipMtpInputFusionRequest q;q.hidden_size=H;q.hc_count=HC;q.epsilon=1e-6F;
+        q.embedding_storage=q.hidden_storage=q.output_storage=strix::HipMtpInputStorage::bf16;
+        q.normalized_rounding=strix::HipMtpInputRounding::fp32;q.projection_rounding=projection;
+        q.norm_weight_encoding=strix::MtpNormWeightEncoding::effective_scale;q.norm_encoding_admitted=true;
+        q.arithmetic=strix::MtpInputFusionArithmetic::split_projections_then_add;
+        q.wide_hidden=v(r.wide);q.embedding_norm=v(enorm);q.hidden_norm=v(hnorm);q.packed_projection=v(packed);
+        q.projection_row_stride_bytes=2*H/32*34;q.projection_scratch=v(r.projected);return q;
+    };
+    bool all=true;
+    for(const auto rounding:{strix::HipMtpInputRounding::fp32,strix::HipMtpInputRounding::bf16_rne}){
+        for(auto& r:rows){
+            embedding_one.write(r->embedding);auto q=request(*r,rounding);
+            q.embedding=v(embedding_one);q.normalized_scratch=v(r->normalized);q.output=v(r->ref);
+            strix::launch_hip_mtp_input_fusion_draft(q,st.s);check(hipStreamSynchronize(st.s));
+        }
+        for(const std::uint32_t count:{2U,3U,8U,17U,63U,64U}){
+            const auto perm=order(P,g);std::vector<strix::HipMtpInputFusionRequest> q;
+            slab.poison();
+            for(std::uint32_t t=0;t<count;++t){
+                Row& r=*rows[perm[t]];const auto base=reinterpret_cast<std::uintptr_t>(slab.p)+t*slot;
+                check(hipMemcpy(reinterpret_cast<void*>(base),r.embedding.data(),H*2U,hipMemcpyHostToDevice));
+                auto one=request(r,rounding);one.embedding=view(base,H*2U);one.normalized_scratch=view(base+at_norm,scratch_bytes);
+                one.output=view(base+at_out,std::size_t{H}*HC*2U);q.push_back(one);
+            }
+            strix::launch_hip_mtp_input_fusion_prime_rows(q,st.s);check(hipStreamSynchronize(st.s));
+            const auto got=slab.read();
+            for(std::uint32_t t=0;t<count;++t){
+                where="prime fusion count="+std::to_string(count)+" row="+std::to_string(t)+" (out,normalized)";
+                std::vector<std::uint16_t> out(std::size_t{H}*HC);std::vector<float> norm(scratch_bytes/4);
+                std::memcpy(out.data(),got.data()+t*slot+at_out,out.size()*2U);
+                std::memcpy(norm.data(),got.data()+t*slot+at_norm,scratch_bytes);
+                const auto ref_norm=rows[perm[t]]->normalized.read();
+                // The one-token scratch also holds its split projections after the normalised inputs: compare the
+                // normalised inputs (embedding H + hidden H*HC) only.
+                const std::size_t inputs=std::size_t{H}*(1U+HC);
+                all=all && same(out,rows[perm[t]]->ref.read()) &&
+                    same(std::vector<float>(norm.begin(),norm.begin()+inputs),std::vector<float>(ref_norm.begin(),ref_norm.begin()+inputs));
+            }
+        }
+    }
+    const char* mode=std::getenv("STRIX_MTP_PRIME_PROJ_ROWS");
+    ok(std::string("prime-rows input fusion == one-token draft fusion per row (both roundings, 2..64 rows, permuted, rows/wave ")+
+        (mode && std::string(mode)=="1"?"1":"4")+")",all);
+}
+
 // HC mix: draft split-K/lane-chain mix with and without injection.
 void hyper_cases(){
     Stream st;std::mt19937 g(13);
@@ -363,7 +432,7 @@ void head_cases(bool runner_up){
 } // namespace
 int main(){
     try{
-        gemv_cases(false);gemv_cases(true);bf16_linear_cases();moe_cases();fusion_cases();hyper_cases();head_cases(false);head_cases(true);
+        gemv_cases(false);gemv_cases(true);bf16_linear_cases();moe_cases();fusion_cases();prime_fusion_cases();hyper_cases();head_cases(false);head_cases(true);
     }catch(const std::exception& e){std::printf("FAIL exception: %s\n",e.what());return 1;}
     std::printf("%s (%d failures)\n",failures?"FAILED":"ALL PASS",failures);
     return failures?1:0;

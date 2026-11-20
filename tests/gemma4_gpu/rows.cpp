@@ -182,10 +182,13 @@ void ring_tests() {
             }
             std::reverse(dp.begin(), dp.end());
             compare(device.forward_rows(dp), host.forward_rows(hp));
-            CHECK(ds.digest() == before);
+            // An open transaction has no canonical digest (DeviceStream::digest refuses a busy stream): evaluated but
+            // unpublished rows must leave the committed state unchanged, checked once the commit retires.
             const unsigned accepted = p == 516 ? depth : 0;
             tx->commit(accepted);
             ht->commit(accepted);
+            if (!accepted)
+                CHECK(ds.digest() == before);
             CHECK(ds.digest() == hs.digest());
             if (p < 516) {
                 compare(ingest(device, ds, 1, 17), ingest(host, hs, 1, 17));

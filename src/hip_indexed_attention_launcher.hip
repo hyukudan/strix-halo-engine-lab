@@ -5836,12 +5836,17 @@ void qpf2k_index_flush(hipStream_t stream) {
     }
     std::copy(ib.groups.begin(), ib.groups.end(), slot.views);
     // STRIX_QPF2K_QSA_INDEX_SHAPE (launch shape of the batch; every output keeps its chains and tree, only which wave and
-    // workgroup computes it changes): 0 = OW 2 W 16 (rows_kernel's), 1 = OW 4 W 16, 2 = OW 4 W 8, 3 = OW 2 W 8.
-    static const unsigned shape = [] { const char* v = std::getenv("STRIX_QPF2K_QSA_INDEX_SHAPE"); return v ? static_cast<unsigned>(std::atoi(v)) & 3U : 0U; }();
-    constexpr unsigned RB = 4U;
+    // workgroup computes it changes): 0 = OW 2 W 16 (rows_kernel's), 1 = OW 4 W 16, 2 = OW 4 W 8, 3 = OW 2 W 8,
+    // 4 = RB 8 OW 2 W 16 (8 rows per workgroup staged as BF16 bits: half the weight re-reads; rows_body).
+    static const unsigned shape = [] {
+        const char* v = std::getenv("STRIX_QPF2K_QSA_INDEX_SHAPE");
+        const unsigned s = v ? static_cast<unsigned>(std::atoi(v)) : 0U;
+        return s == 4U ? 4U : s & 3U;
+    }();
     const auto& v0 = ib.groups[0];
-    const auto lds = ib.hidden * RB * static_cast<std::uint32_t>(sizeof(float));
-    const auto launch = [&]<unsigned OW, unsigned W>() {
+    const auto launch = [&]<unsigned OW, unsigned W, unsigned RB = 4U>() {
+        // RB 4 stages FP32 rows, RB 8 BF16 rows: hidden x 16 B either way.
+        const auto lds = ib.hidden * RB * static_cast<std::uint32_t>(RB == 8U ? sizeof(std::uint16_t) : sizeof(float));
         const dim3 grid((v0.first[v0.count] + OW * W - 1U) / (OW * W), static_cast<std::uint32_t>(ib.groups.size()) * (64U / RB));
         hipLaunchKernelGGL(HIP_KERNEL_NAME(qsa_index::rows_batch_kernel<64U, RB, OW, W>), grid, dim3(W * 32U), lds, stream,
             static_cast<const QsaRowsInputViews<64U>*>(slot.views), ib.hidden);
@@ -5852,10 +5857,12 @@ void qpf2k_index_flush(hipStream_t stream) {
             static_cast<const QsaRowsInputViews<64U>*>(slot.views), ib.hidden);
         qpf2k_launch_index_wmma.fetch_add(1U, std::memory_order_relaxed);
     }
-    else if (qpf2k_index_batch_enabled() || ib.wmma) launch.template operator()<2U, 16U>();
+    // Default exact batch: RB 8 (8 rows per workgroup as BF16 bits, half the weight re-reads of RB 4, same chains / tree).
+    else if (qpf2k_index_batch_enabled() || ib.wmma) launch.template operator()<2U, 16U, 8U>();
     else if (shape == 1U) launch.template operator()<4U, 16U>();
     else if (shape == 2U) launch.template operator()<4U, 8U>();
     else if (shape == 3U) launch.template operator()<2U, 8U>();
+    else if (shape == 4U) launch.template operator()<2U, 16U, 8U>();
     else launch.template operator()<2U, 16U>();
     check_hip(hipGetLastError(), "QSA index batch launch");
     check_hip(hipEventRecord(slot.done, stream), "QSA index batch slot record");
