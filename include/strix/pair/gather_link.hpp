@@ -35,6 +35,12 @@ enum class GatherRoute : std::uint8_t { staged = 0, device_direct = 1, channel =
     return channel_requested ? GatherRoute::channel : direct_available ? GatherRoute::device_direct : GatherRoute::staged;
 }
 
+// Host wait per gather: only the staged route returns to the host inside the exchange (the next work is enqueued after
+// it), so only its join segments carry a host wake-up + relaunch gap; the device routes enqueue and return (gap 0 by
+// contract; their `tp link:` counters print the enqueue time only). Planners price the gap of a staged join only when
+// it was measured (strix/pair/planner.hpp).
+[[nodiscard]] constexpr bool route_waits_on_host(GatherRoute r) noexcept { return r == GatherRoute::staged; }
+
 // Stand-in for a route a binding does not offer (the constructor refuses that route, so it is never called).
 struct NoExchange {
     template<class... A> void exchange(A&&...) { throw std::logic_error("gather link: route not bound"); }
