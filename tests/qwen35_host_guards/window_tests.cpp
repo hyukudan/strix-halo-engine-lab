@@ -65,6 +65,16 @@ void set_inputs_kernel(InputPack in, std::uint32_t* pos, std::uint32_t* ids) {
     *pos = in.pos0;
     for (std::uint32_t i = 0; i < cc::kMaxRows; ++i) ids[i] = in.ids[i];
 }
+void set_inputs_tree_kernel(InputPack in, std::uint32_t* pos, std::uint32_t* ids, TreePack tp, std::uint32_t* tree) {
+    calls += 'R';
+    *pos = in.pos0;
+    for (std::uint32_t i = 0; i < cc::kMaxRows; ++i) ids[i] = in.ids[i];
+    tree[0] = tp.leaf;
+    for (std::uint32_t i = 0; i < cc::kMaxRows; ++i) {
+        tree[1 + i] = tp.pos[i];
+        tree[1 + cc::kMaxRows + i] = tp.idx[i];
+    }
+}
 void fed_rows_kernel(FedPack in, const std::uint32_t* feed, std::uint32_t* pos, std::uint32_t* ids) {
     calls += 'F';
     *pos = in.pos0;
@@ -94,6 +104,9 @@ struct Impl {
     std::uint32_t *d_pos = &pos_word, *d_ids = ids_words, *d_feed = feed_words, *d_parity = &parity_word, *d_top = top_words;
     float logit_words[4] = {}, x_words[4] = {}, xn_words[4] = {};
     float *logits = logit_words, *x = x_words, *xn = xn_words;
+    std::uint32_t tree_words[1 + 2 * cc::kMaxRows] = {};
+    std::uint32_t* d_tree = tree_words;
+    bool tree_mode = false, last_tree = false;
     std::uint32_t committed = 0, last_rows = 0, d8_end = 0;
     bool graphs_on = true;
     struct Graph {
@@ -193,6 +206,28 @@ static void run() {
         e.commit_rows(4);
         e.forward(ids, 4, q::LogitRows::last);
         check(calls == "FBTELIBTEL" && shadow_writes.empty() && e.pf.sh.empty() && e.d8_end == 0, "default path untouched");
+    }
+    {  // token-tree window: same prologue, the tree input kernel instead of the linear one, its own graph key
+        strix::spec::TreeWindow tw;
+        tw.rows = 4;
+        tw.chain = 3;
+        tw.leaf = 1u << 3;
+        tw.pos = {0, 1, 2, 2};
+        tw.index = {0, 1, 2, 3};
+        Impl e;
+        e.opt.max_positions = 512;
+        e.prefill_big(20);
+        clear();
+        e.forward(ids, 4, q::LogitRows::all);
+        e.commit_rows(0);
+        e.forward(ids, 4, q::LogitRows::all, &tw);
+        check(calls == "IBTELRBTEL" && e.graphs.size() == 2 && e.tree_mode && e.last_tree, "tree window: own input kernel and graph");
+        check(e.tree_words[0] == tw.leaf && e.tree_words[1 + 3] == 22 && e.tree_words[1 + cc::kMaxRows + 3] == 23,
+              "tree inputs at absolute positions / K/V indices");
+        e.opt.decode_attn8 = true;
+        clear();
+        check(rejects([&] { (void)e.forward(ids, 4, q::LogitRows::all, &tw); }) && calls.empty(),
+              "tree window refused under decode_attn8 before any launch");
     }
 }
 

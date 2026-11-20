@@ -69,6 +69,10 @@ struct RowMap {
     const std::uint32_t* pos = nullptr;
     const std::uint32_t* slot = nullptr;
     std::size_t slot_stride = 0;
+    // Token tree (strix/spec/tree_window.hpp): K/V index of each row's OWN key (null: its position). kv_store writes the row
+    // there and attention reads key pos[r] from there; every other key comes from its position. Rows of a tree window share
+    // positions (a leaf and the chain node of its depth): positions are then non-decreasing instead of ascending.
+    const std::uint32_t* self = nullptr;
 };
 
 }  // namespace strix::cuda_core

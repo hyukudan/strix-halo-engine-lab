@@ -21,6 +21,9 @@ inline constexpr std::uint32_t kDeadBit = 0x8000'0000U;
 // written [layer][column]. offsets = column_offsets(spec).
 void hash_position(const Spec& spec, std::span<const std::uint64_t> offsets, std::span<const std::uint64_t> ngram,
                    std::span<std::uint64_t> rows);
+// The columns of one layer e only (hash_position = this for every layer): rows.size() == spec.columns().
+void hash_layer(const Spec& spec, std::span<const std::uint64_t> offsets, std::uint32_t e,
+                std::span<const std::uint64_t> ngram, std::span<std::uint64_t> rows);
 
 class Hasher {
 public:
@@ -33,6 +36,10 @@ public:
     // Rows of every token of a sequence starting at position 0 (prompt): [token][layer][column].
     [[nodiscard]] std::vector<std::uint64_t> hash_sequence(std::span<const std::uint32_t> tokens);
     [[nodiscard]] std::uint64_t positions() const noexcept { return history_.size(); }
+    // Stateless twin of push for a runner that keeps its own token history: the rows of position t of `tokens`
+    // (tokens[0 .. t], t < tokens.size()) at layer e, relative to the layer's table, rows.size() == columns().
+    // Same padding, unmapped and dead rules as push; the Hasher's own history is not read or changed.
+    void rows_at(std::span<const std::uint32_t> tokens, std::size_t t, std::uint32_t e, std::span<std::uint64_t> rows) const;
     // Verify windows: drop the trailing positions so the history ends after `positions` tokens.
     void truncate(std::uint64_t positions);
     void reset() noexcept { history_.clear(); }
@@ -44,6 +51,18 @@ private:
     std::vector<std::uint32_t> history_;  // compressed ids; kDead for a dead position
     std::vector<std::uint64_t> ngram_;
     static constexpr std::uint32_t kDead = 0xFFFF'FFFFU;
+    static constexpr std::size_t kMaxStatelessNgram = 8;  // rows_at's on-stack n-gram (Hy4 3, DS41 3)
+    // Compressed id of one history token (kDead for a dead position); throws on an unmapped id under Unmapped::reject.
+    [[nodiscard]] std::uint32_t compressed(std::uint32_t token) const;
+    // ngram[o] = compressed id of t - o, padded at the sequence start and behind a dead position.
+    template <class IdAt>
+    void fill_ngram(std::size_t t, IdAt id_at, std::span<std::uint64_t> ngram) const {
+        bool blocked = false;
+        for (std::size_t o = 0; o < ngram.size(); ++o) {
+            blocked = blocked || t < o || id_at(t - o) == kDead;  // nothing reads through a dead position
+            ngram[o] = blocked ? pad_ : id_at(t - o);
+        }
+    }
 };
 
 } // namespace strix::engram

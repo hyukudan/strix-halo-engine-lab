@@ -4,6 +4,7 @@
 #include "strix/spec/block_drafter.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -31,6 +32,12 @@ bool g_fixed = false;
 bool g_prelaunch = false;
 std::uint32_t g_dev[64]{};
 std::string g_cost_kv = "online";  // context cost of the fixed model (spec::set_context_cost)
+// Tree-arbiter cost model of TreeTarget (rv_tree3): a tree window costs the linear window of the same rows + g_tree_extra
+// (the measured per-window surcharge), and a window wider than g_step_rows rows pays g_step_ms more (dense row tile). The
+// fixed seeds stay linear (10.2 + row_ms r), as on the device. g_gap_mode: RunnerChain margins, 0 none, 1 informative
+// (a runner-up that is the target's token has gap 0.3, any other 4.0), 2 uninformative (hash in [0, 6)).
+double g_tree_extra = 0.0, g_step_ms = 0.0;
+std::uint32_t g_step_rows = 32, g_gap_mode = 0;
 double noise(std::uint64_t k) { return g_jitter * double(mix(k * 0x9e3779b9ULL + g_jitter_seed) % 1000) / 1000.0; }
 
 // The "model": response[i] is the greedy token at response position i (a pure function of the position: a valid
@@ -229,6 +236,337 @@ Run run(const World& w, std::uint32_t n_tokens, double accuracy, bool copy, bool
     r.launched = target.launched;
     return r;
 }
+
+// ---- token tree (sibling rows)
+// The tree target computes each row's greedy from the row's PATH (ancestor tokens): a row whose path is the true stream
+// predicts the true next token, any other row a hash of its path - so the walk can only use rows whose context is right.
+struct TreeTarget final : sp::VerifyTarget {
+    const World& w;
+    std::uint32_t committed_rows = 0, tree_width = 32;
+    double row_ms = 0.15;
+    std::uint64_t trees = 0, linear = 0;
+    sp::TreeRows last_tree;
+    std::vector<std::uint32_t> last_linear;
+    explicit TreeTarget(const World& world) : w(world) {}
+    [[nodiscard]] std::uint32_t tree_rows() const override { return tree_width; }
+    std::uint32_t truth(std::uint64_t pos) const { return pos < w.response.size() ? w.response[pos] : 7; }
+    void verify(std::span<const std::uint32_t> tokens, std::vector<std::uint32_t>& greedy) override {
+        ++linear;
+        greedy.clear();
+        for (std::size_t i = 0; i < tokens.size(); ++i) greedy.push_back(truth(committed_rows + i + 1));
+        last_linear.assign(tokens.begin(), tokens.end());
+        g_clock += 10.0 + row_ms * double(tokens.size()) + (tokens.size() > g_step_rows ? g_step_ms : 0.0);
+    }
+    void commit(std::uint32_t k) override {
+        BD_CHECK(k >= 1 && k <= last_linear.size(), "linear commit %u of %zu", k, last_linear.size());
+        committed_rows += k;
+        g_clock += 0.2;
+    }
+    void verify_tree(const sp::TreeRows& t, std::vector<std::uint32_t>& greedy) override {
+        ++trees;
+        const std::size_t n = t.tokens.size();
+        BD_CHECK(n >= 2 && n <= tree_width && t.parent.size() == n && t.depth.size() == n && t.node.size() == n, "tree shape");
+        BD_CHECK(t.parent[0] == -1 && t.depth[0] == 0, "row 0 is the anchor");
+        std::vector<bool> leaf(n, true), right(n, false);
+        for (std::size_t r = 1; r < n; ++r) {
+            BD_CHECK(t.parent[r] >= 0 && std::size_t(t.parent[r]) < r, "parent-closed, topological");
+            leaf[std::size_t(t.parent[r])] = false;
+            BD_CHECK(t.depth[r] == t.depth[std::size_t(t.parent[r])] + 1, "depth = parent depth + 1");
+        }
+        for (std::size_t r = 1; r < n; ++r) {  // recurrent layout: the parent is the last non-leaf row before r
+            std::int32_t last = 0;
+            for (std::size_t q = 1; q < r; ++q)
+                if (!leaf[q]) last = std::int32_t(q);
+            BD_CHECK(t.parent[r] == last, "row %zu parent %d, last non-leaf %d", r, t.parent[r], last);
+        }
+        greedy.assign(n, 0);
+        right[0] = true;  // the anchor is the last emitted (true) token
+        for (std::size_t r = 0; r < n; ++r) {
+            if (r > 0) right[r] = right[std::size_t(t.parent[r])] && t.tokens[r] == truth(committed_rows + t.depth[r]);
+            std::uint64_t h = 0;
+            for (std::int64_t q = std::int64_t(r); q >= 0; q = t.parent[std::size_t(q)]) h = mix(h * 1315423911ULL + t.tokens[std::size_t(q)]);
+            greedy[r] = right[r] ? truth(committed_rows + t.depth[r] + 1) : std::uint32_t(h % 900) + 10;
+        }
+        last_tree = t;
+        g_clock += 10.0 + row_ms * double(n) + (n > g_step_rows ? g_step_ms : 0.0) + g_tree_extra;
+    }
+    void commit_path(std::span<const std::uint32_t> path) override {
+        BD_CHECK(!path.empty() && path[0] == 0, "path starts at the anchor");
+        for (std::size_t i = 1; i < path.size(); ++i) {
+            BD_CHECK(last_tree.parent[path[i]] == std::int32_t(path[i - 1]), "path is a root path");
+            BD_CHECK(last_tree.tokens[path[i]] == truth(committed_rows + i), "committed row %zu is not the stream", i);
+        }
+        committed_rows += std::uint32_t(path.size());
+        g_clock += 0.2;
+    }
+};
+
+// Chain with runner-ups: a wrong draft's runner-up is the true token with probability q_true; drafts 5, wrong runner-ups 6.
+struct RunnerChain final : sp::ChainDrafter {
+    const World& w;
+    double accuracy, q_true;
+    bool report = true;
+    std::uint32_t stream_len = 0;
+    std::vector<std::uint32_t> ru;
+    std::vector<float> gp;
+    std::uint64_t paths = 0, prelaunch_offers = 0;
+    RunnerChain(const World& world, double acc, double q) : w(world), accuracy(acc), q_true(q) {}
+    // Counts the verify pre-launch offers (BlockSpeculator passes a launch only to a linear target) and declines them, so
+    // the step falls back to draft(): the run's ids and blocks must not depend on the offer.
+    bool draft_prelaunch(std::span<const std::uint32_t>, std::uint32_t, std::vector<std::uint32_t>&, const sp::PrelaunchFn&) override {
+        ++prelaunch_offers;
+        return false;
+    }
+    void draft(std::span<const std::uint32_t> prefix, std::uint32_t k, std::vector<std::uint32_t>& out) override {
+        out.clear();
+        ru.clear();
+        gp.clear();
+        for (std::uint32_t j = 0; j < k; ++j) {
+            const std::uint64_t pos = std::uint64_t(stream_len) + prefix.size() + j;
+            const bool right = double(mix(pos * 977 + 5) % 1000) / 1000.0 < accuracy;
+            const bool alt = double(mix(pos * 389 + 11) % 1000) / 1000.0 < q_true;
+            const std::uint32_t t = pos < w.response.size() ? w.response[pos] : 7;
+            out.push_back(right ? t : 5);
+            ru.push_back(!right && alt ? t : 6);
+            if (g_gap_mode == 1) gp.push_back(!right && alt ? 0.3f : 4.0f);
+            else if (g_gap_mode == 2) gp.push_back(float(mix(pos * 131 + 3) % 600) / 100.0f);
+        }
+        g_clock += 0.5 * double(prefix.size() + k);
+    }
+    void accept(std::span<const std::uint32_t> emitted) override { stream_len += std::uint32_t(emitted.size()); }
+    void accept_path(std::span<const std::uint32_t> emitted, std::span<const std::uint32_t> rows) override {
+        BD_CHECK(rows.size() == emitted.size(), "path rows %zu vs emitted %zu", rows.size(), emitted.size());
+        ++paths;
+        accept(emitted);
+    }
+    [[nodiscard]] std::span<const std::uint32_t> runner_ups() const override {
+        return report ? std::span<const std::uint32_t>(ru) : std::span<const std::uint32_t>();
+    }
+    [[nodiscard]] std::span<const float> runner_up_gaps() const override {
+        return report ? std::span<const float>(gp) : std::span<const float>();
+    }
+};
+
+struct TreeRun {
+    std::vector<std::uint32_t> out, trace;
+    sp::SpecStats stats;
+    std::uint64_t steps = 0, sib_rows = 0, taken = 0, prelaunch_offers = 0;
+    double ms = 0.0;
+};
+
+// tree_width 0 = a linear target (reports no tree rows)
+TreeRun run_tree(const World& w, std::uint32_t n_tokens, double acc, double q, std::uint32_t tree_width, bool report,
+                 double row_ms, bool copy) {
+    g_clock = 0.0;
+    sp::BlockConfig cfg;
+    cfg.copy = copy;
+    cfg.fixed_costs = true;
+    cfg.chain_seed_flush_ms = cfg.chain_seed_step_ms = 0.5;
+    cfg.clock_ms = [] { return g_clock; };
+    RunnerChain ch(w, acc, q);
+    ch.report = report;
+    sp::BlockDrafter drafter(cfg, &ch);
+    for (std::uint32_t r = 1; r <= 32; ++r) drafter.seed_verify_ms(r, 10.2 + row_ms * double(r));
+    TreeTarget target(w);
+    target.tree_width = tree_width;
+    target.row_ms = row_ms;
+    drafter.commit(w.prompt);
+    TreeRun r;
+    r.out.push_back(w.response[0]);
+    drafter.commit(std::span<const std::uint32_t>(&r.out[0], 1));
+    ch.stream_len = 1;
+    sp::BlockSpeculator spec(drafter, target);
+    spec.set_prelaunch(g_prelaunch);
+    spec.start(r.out[0]);
+    while (r.out.size() < n_tokens) {
+        sp::StepParams p;
+        p.remaining = n_tokens - std::uint32_t(r.out.size());
+        p.context = w.prompt.size() + r.out.size();
+        p.max_rows = 32;
+        const auto before = r.out.size();
+        const auto rec = spec.step(r.out, p);
+        BD_CHECK(rec.emitted >= 1 && rec.emitted <= p.remaining && r.out.size() == before + rec.emitted, "tree step emitted");
+        BD_CHECK(rec.emitted == rec.accepted + 1 + (rec.sibling_taken ? 1U : 0U), "emitted = main + sibling + next");
+        BD_CHECK(target.committed_rows + 1 == r.out.size(), "committed %u vs emitted %zu", target.committed_rows, r.out.size());
+        ++r.steps;
+        r.sib_rows += rec.siblings;
+        r.taken += rec.sibling_taken;
+        r.trace.push_back(std::uint32_t(rec.source) * 100 + rec.proposed);
+    }
+    r.stats = drafter.stats();
+    r.ms = g_clock;
+    r.prelaunch_offers = ch.prelaunch_offers;
+    return r;
+}
+
+void tree_unit_tests() {
+    // accept_tree on a hand tree: anchor; depth 1 sibling s1 (leaf) + chain c1; depth 2 chain c2 (no sibling)
+    sp::TreeRows t;
+    t.tokens = {100, 21, 11, 12};
+    t.parent = {-1, 0, 0, 2};
+    t.node = {0, -1, 1, 2};
+    t.depth = {0, 1, 1, 2};
+    auto a = sp::accept_tree(t, std::vector<std::uint32_t>{11, 999, 12, 55});  // chain all right
+    BD_CHECK(a.path == (std::vector<std::uint32_t>{0, 2, 3}) && a.main == 2 && !a.sibling, "chain path");
+    BD_CHECK(a.emitted == (std::vector<std::uint32_t>{11, 12, 55}), "chain emitted");
+    a = sp::accept_tree(t, std::vector<std::uint32_t>{21, 77, 12, 55});  // depth 1 = the runner-up
+    BD_CHECK(a.path == (std::vector<std::uint32_t>{0, 1}) && a.main == 0 && a.sibling, "sibling path");
+    BD_CHECK(a.emitted == (std::vector<std::uint32_t>{21, 77}), "sibling: runner-up + the target's next token");
+    a = sp::accept_tree(t, std::vector<std::uint32_t>{33, 77, 12, 55});  // neither: the correction only
+    BD_CHECK(a.path == (std::vector<std::uint32_t>{0}) && a.emitted == (std::vector<std::uint32_t>{33}), "reject at depth 1");
+    // layout from a block: siblings at depths 1 and 3 of a 3-chain
+    sp::Block b;
+    b.drafts = {11, 12, 13};
+    b.alts = {21, sp::kNoToken, 23};
+    b.sib = {1, 0, 1};
+    b.siblings = 2;
+    sp::TreeRows u;
+    b.tree_rows(100, u);
+    BD_CHECK(u.tokens == (std::vector<std::uint32_t>{100, 21, 11, 12, 23, 13}), "layout tokens");
+    BD_CHECK(u.parent == (std::vector<std::int32_t>{-1, 0, 0, 2, 3, 3}), "layout parents");
+    BD_CHECK(u.depth == (std::vector<std::uint32_t>{0, 1, 1, 2, 3, 3}) && b.rows() == 6, "layout depths / rows");
+}
+
+int tree_tests() {
+    tree_unit_tests();
+    {  // verify pre-launch + token tree: a tree target is never offered a pre-launch (its siblings are placed after the
+       // chain ids are read); a linear target is. Either way the ids and blocks equal the run without pre-launch.
+        const auto w = make_world("prose", 40, 600, 71);
+        g_prelaunch = true;
+        const auto tree_pre = run_tree(w, 600, 0.63, 0.35, 32, true, 0.113, false);
+        const auto lin_pre = run_tree(w, 600, 0.63, 0.35, 0, true, 0.113, false);
+        g_prelaunch = false;
+        const auto tree_off = run_tree(w, 600, 0.63, 0.35, 32, true, 0.113, false);
+        const auto lin_off = run_tree(w, 600, 0.63, 0.35, 0, true, 0.113, false);
+        BD_CHECK(tree_pre.prelaunch_offers == 0 && tree_pre.sib_rows > 0, "tree target offered %llu pre-launches (siblings %llu)",
+                 (unsigned long long)tree_pre.prelaunch_offers, (unsigned long long)tree_pre.sib_rows);
+        BD_CHECK(lin_pre.prelaunch_offers > 0 && lin_off.prelaunch_offers == 0, "linear target: pre-launch offers %llu / %llu",
+                 (unsigned long long)lin_pre.prelaunch_offers, (unsigned long long)lin_off.prelaunch_offers);
+        BD_CHECK(tree_pre.out == tree_off.out && tree_pre.trace == tree_off.trace && lin_pre.out == lin_off.out &&
+                     lin_pre.trace == lin_off.trace,
+                 "pre-launch flag changed a tree or linear run");
+        std::printf("tree + pre-launch: tree target 0 offers (%llu sibling rows), linear target %llu offers, ids unchanged\n",
+                    (unsigned long long)tree_pre.sib_rows, (unsigned long long)lin_pre.prelaunch_offers);
+    }
+    int cases = 0;
+    const std::uint32_t n = 1200;
+    std::uint64_t placed = 0, taken = 0;
+    for (const std::string cls : {"prose", "edit", "loop"})
+        for (const double acc : {0.3, 0.63, 0.85})
+            for (const double q : {0.0, 0.35, 0.8})
+                for (const bool copy : {false, true}) {
+                    const auto w = make_world(cls, 40, n, 7 + std::uint64_t(acc * 100));
+                    // linear target + runner-ups vs linear target without: identical decisions and ids (probe only)
+                    const auto lin = run_tree(w, n, acc, q, 0, true, 0.15, copy);
+                    const auto base = run_tree(w, n, acc, q, 0, false, 0.15, copy);
+                    BD_CHECK(lin.trace == base.trace && lin.out == base.out && lin.sib_rows == 0, "probe changed a linear run");
+                    // cheap rows (RTX dense class): siblings placed; ids == serial
+                    const auto tr = run_tree(w, n, acc, q, 32, true, 0.113, copy);
+                    for (std::uint32_t i = 0; i < n; ++i)
+                        BD_CHECK(tr.out[i] == w.response[i], "%s acc %.2f q %.2f copy %d: token %u differs", cls.c_str(), acc, q,
+                                 int(copy), i);
+                    // expensive rows (MoE expert-union class, ~5.6 ms per row): a sibling is placed only where it pays
+                    // (high q), so the run is never slower than the linear one
+                    const auto ex = run_tree(w, n, acc, q, 32, true, 5.6, copy);
+                    const auto ex_lin = run_tree(w, n, acc, q, 0, true, 5.6, copy);
+                    BD_CHECK(ex.ms <= ex_lin.ms * 1.005 && (q > 0.0 || ex.sib_rows * 100 <= ex.steps),
+                             "%s acc %.2f q %.2f: %llu sibling rows in %llu steps at 5.6 ms per row, %.0f vs linear %.0f ms",
+                             cls.c_str(), acc, q, (unsigned long long)ex.sib_rows, (unsigned long long)ex.steps, ex.ms, ex_lin.ms);
+                    for (std::uint32_t i = 0; i < n; ++i) BD_CHECK(ex.out[i] == w.response[i], "expensive-row run differs at %u", i);
+                    // the probe: measured hit rate tracks q (runner-ups at rejections)
+                    std::uint64_t trials = 0, hits = 0;
+                    for (std::size_t d = 0; d < tr.stats.sibling_trials.size(); ++d) {
+                        trials += tr.stats.sibling_trials[d];
+                        hits += tr.stats.sibling_hits[d];
+                    }
+                    if (trials > 200) {
+                        const double m = double(hits) / double(trials);
+                        BD_CHECK(std::abs(m - q) < 0.08, "%s acc %.2f q %.2f: probe measured %.3f", cls.c_str(), acc, q, m);
+                    }
+                    BD_CHECK(tr.taken == tr.stats.sibling_taken && tr.sib_rows == tr.stats.sibling_rows, "stats");
+                    if (q >= 0.35 && !copy && acc <= 0.63)
+                        BD_CHECK(tr.sib_rows > 0 && tr.taken > 0 && tr.ms < lin.ms,
+                                 "%s acc %.2f q %.2f: tree must place and win (rows %llu taken %llu, %.0f vs %.0f ms)", cls.c_str(),
+                                 acc, q, (unsigned long long)tr.sib_rows, (unsigned long long)tr.taken, tr.ms, lin.ms);
+                    if (q == 0.0) BD_CHECK(tr.taken == 0, "q 0 cannot take a sibling");
+                    placed += tr.sib_rows;
+                    taken += tr.taken;
+                    ++cases;
+                }
+    std::printf("tree tests ok: %d cases, sibling rows %llu, taken %llu\n", cases, (unsigned long long)placed,
+                (unsigned long long)taken);
+    return cases;
+}
+
+// rv_tree3: sibling placement priced by measured walls. The device showed a per-window tree surcharge (+0.5..0.7 ms at
+// equal rows) and a step-shaped row cost (8 -> 9 rows +1.2 ms) that the linear seeds do not see; the seeds here stay
+// linear too. Invariants: ids == serial; the tree run is never slower than the linear run (1 %: exploration of a shape
+// before its wall is known + path dependence, see below); a surcharge no sibling set pays stops placement; the learned
+// surcharge equals the modelled one; informative drafter gaps raise the taken / placed ratio and never cost time.
+int tree_arbiter_tests() {
+    const std::uint32_t n = 1200;
+    int cases = 0;
+    double worst = 0.0;
+    for (const std::string cls : {"prose", "edit", "loop"})
+        for (const double acc : {0.3, 0.63, 0.85})
+            for (const double q : {0.1, 0.35, 0.8})
+                for (const double extra : {0.0, 0.7, 3.0})
+                    for (const bool step : {false, true}) {
+                        const auto w = make_world(cls, 40, n, 11 + std::uint64_t(acc * 100));
+                        g_tree_extra = extra;
+                        g_step_rows = step ? 8 : 32;
+                        g_step_ms = step ? 1.2 : 0.0;
+                        const auto tr = run_tree(w, n, acc, q, 32, true, 0.113, false);
+                        const auto lin = run_tree(w, n, acc, q, 0, true, 0.113, false);
+                        for (std::uint32_t i = 0; i < n; ++i)
+                            BD_CHECK(tr.out[i] == w.response[i] && lin.out[i] == w.response[i], "arbiter run differs at %u", i);
+                        worst = std::max(worst, tr.ms / lin.ms);
+                        // 1 %: once one tree window changes the acceptance history, the two runs make different chain
+                        // decisions; that path dependence alone moves the total by up to ~0.9 % here (cases with <= 10 tree
+                        // windows, whose own cost is < 0.1 %). The device gate (on >= off - 0.5 %) is the kit's.
+                        BD_CHECK(tr.ms <= lin.ms * 1.01,
+                                 "%s acc %.2f q %.2f extra %.1f step %d: tree %.0f vs linear %.0f ms (rows %llu taken %llu windows %llu)",
+                                 cls.c_str(), acc, q, extra, int(step), tr.ms, lin.ms, (unsigned long long)tr.sib_rows,
+                                 (unsigned long long)tr.taken, (unsigned long long)tr.stats.tree_windows);
+                        if (!step && extra > 0.0 && tr.stats.tree_windows > 0 && tr.stats.tree_surcharge_ms != 0.0)
+                            BD_CHECK(std::abs(tr.stats.tree_surcharge_ms - extra) < 0.05, "learned surcharge %.3f vs %.1f",
+                                     tr.stats.tree_surcharge_ms, extra);
+                        if (extra == 3.0 && q <= 0.35)  // a surcharge no sibling set pays: placement stops after exploration
+                            BD_CHECK(tr.stats.tree_windows * 20 <= tr.steps, "%s acc %.2f q %.2f: %llu tree windows in %llu steps",
+                                     cls.c_str(), acc, q, (unsigned long long)tr.stats.tree_windows, (unsigned long long)tr.steps);
+                        ++cases;
+                    }
+    // Drafter gaps: informative margins (hit 0.3, miss 4.0) vs uninformative ones at the device's en-prose surcharge.
+    std::uint64_t rows_i = 0, taken_i = 0, rows_u = 0, taken_u = 0;
+    for (const double acc : {0.3, 0.63})
+        for (const double q : {0.1, 0.35}) {
+            const auto w = make_world("prose", 40, n, 17 + std::uint64_t(acc * 100));
+            g_tree_extra = 0.7;
+            g_step_rows = 32;
+            g_step_ms = 0.0;
+            g_gap_mode = 1;
+            const auto inf = run_tree(w, n, acc, q, 32, true, 0.113, false);
+            g_gap_mode = 2;
+            const auto uni = run_tree(w, n, acc, q, 32, true, 0.113, false);
+            BD_CHECK(inf.ms <= uni.ms * 1.005, "acc %.2f q %.2f: informative gaps %.0f vs %.0f ms", acc, q, inf.ms, uni.ms);
+            for (std::uint32_t i = 0; i < n; ++i) BD_CHECK(inf.out[i] == w.response[i], "gap run differs at %u", i);
+            rows_i += inf.sib_rows;
+            taken_i += inf.taken;
+            rows_u += uni.sib_rows;
+            taken_u += uni.taken;
+            ++cases;
+        }
+    BD_CHECK(rows_i > 0 && rows_u > 0 && double(taken_i) / double(rows_i) > 1.5 * double(taken_u) / double(rows_u),
+             "gap selector: taken/placed %llu/%llu vs uninformative %llu/%llu", (unsigned long long)taken_i,
+             (unsigned long long)rows_i, (unsigned long long)taken_u, (unsigned long long)rows_u);
+    g_tree_extra = g_step_ms = 0.0;
+    g_step_rows = 32;
+    g_gap_mode = 0;
+    std::printf("tree arbiter tests ok: %d cases, worst tree/linear %.4f, gap selector taken/placed %llu/%llu vs %llu/%llu\n",
+                cases, worst, (unsigned long long)taken_i, (unsigned long long)rows_i, (unsigned long long)taken_u,
+                (unsigned long long)rows_u);
+    return cases;
+}
 }  // namespace
 
 int main() {
@@ -411,6 +749,8 @@ int main() {
         std::printf("verify pre-launch: same ids, blocks and round records as read-then-verify in 4 of 4 runs, %llu pre-launched steps\n",
                     (unsigned long long)pre_steps);
     }
+    tree_tests();
+    tree_arbiter_tests();
     std::printf("block drafter tests ok: %d cases, copy blocks %llu, chain blocks %llu, hybrid blocks %llu; edit %.2f vs serial %.2f ms/token\n",
                 cases, (unsigned long long)copies, (unsigned long long)chains, (unsigned long long)hybrids, tok_ms_all_loop, tok_ms_serial);
     return 0;

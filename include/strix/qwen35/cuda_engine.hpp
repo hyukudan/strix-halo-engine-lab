@@ -25,6 +25,7 @@
 #include "strix/qwen35/config.hpp"
 #include "strix/split_k_policy.hpp"
 #include "strix/qwen35/engine_types.hpp"
+#include "strix/spec/tree_window.hpp"
 
 namespace strix::spec { class DraftRows; }
 
@@ -212,6 +213,10 @@ public:
     [[nodiscard]] bool prefill_is_big() const;  // whether prefill() takes the large-M path for this engine
     // Accepts the first k rows of the last forward_rows window (0 <= k <= rows). Async on stream().
     void commit(std::uint32_t k);
+    // Token tree (strix/spec/tree_window.hpp): the rows of `tree` (tokens[tree.rows]) in one window; each row gets the bits a
+    // linear window of its own path gives (EXACT). Accept with commit_path (commit(k) refuses a tree window). Async on stream().
+    RowsOut forward_tree(const std::uint32_t* tokens, const strix::spec::TreeWindow& tree, LogitRows want = LogitRows::all);
+    void commit_path(const strix::spec::PathCommit& pc);
 
     // MTP layer (single full-attention block with its own KV; positions are explicit, no hidden state to commit).
     // Row r runs at position pos0 + r with input token next_tokens[r] (the token FOLLOWING the hidden's position) and
@@ -251,6 +256,12 @@ public:
     // same operands as forward_rows(tokens) with tokens = host ids + the feed ids; nothing is read or waited for.
     RowsOut forward_rows_fed(const std::uint32_t* host_ids, std::uint32_t nhost, const std::uint32_t* slot,
                              const std::uint32_t* host_vals, std::uint32_t k, LogitRows want = LogitRows::all);
+    // + host2[0..n) = each slot's runner-up (0xFFFFFFFF: none) and gaps[0..n) = its draft-head logit gap top-1 minus
+    // runner-up (NaN: none; nullptr: not read); one synchronization (token-tree siblings / probe).
+    void mtp_feed_read2(std::uint32_t n, std::uint32_t* host, std::uint32_t* host2, float* gaps = nullptr) const;
+    // Draft runner-ups (argmax2 + gap) on / off (default off: the draft head runs the plain argmax launches and
+    // mtp_feed_read2 reports none). A token-tree verify target turns them on (Qwen35SpecTarget::set_tree).
+    void set_runner_ups(bool on);
     // Draft-only MTP head over a vocabulary subset (strix/spec/draft_rows.hpp, group 16 = one NVFP4 tile of the head):
     // before each head launch the engine copies the rows' new tiles into a compact head (device-to-device, no
     // re-quantisation) and maps the argmax back to token ids on the device, so MtpOut::top stays a token id. MtpOut::logits
