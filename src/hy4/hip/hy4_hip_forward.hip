@@ -1871,6 +1871,106 @@ struct Forward::Impl {
         nx.sink(nx.ph, p0, R);
     }
 
+    // ---- pair prime on a whole-model rank: layer-stage windows, then the state re-laid out (strix/pair/relayout.hpp) ----
+    // Rows of `count` prompt positions from position 0 that the one-node prompt plan runs as windows (the rest: tail steps).
+    [[nodiscard]] std::uint32_t window_rows(std::uint32_t count) const {
+        if (rmax == 0U) return 0U;
+        const auto plan = prompt_plan(0U, count, rmax);
+        std::uint32_t n = 0;
+        for (const auto& pw : plan.windows) n += pw.rows;
+        if (plan.lead != 0U || n + plan.tail != count) throw std::logic_error("hy4 hip forward: prompt plan from position 0");
+        return n;
+    }
+    float* range_seam() {
+        if (!seam) seam = alloc<float>(std::size_t{rmax} * 4U * c.hidden);
+        return seam;
+    }
+    // Window [start, start + R) of layers [a, b) (one stage of a StageMap) with this rank's caches: the stage form's
+    // prefill_window (embedding when a == 0, X rows in / out through `seam` otherwise, head on request when b == layers);
+    // with b == layers the window's output_norm rows go to the prompt-hidden sink. One whole window of the one-node
+    // prompt plan (no tail rows): the same windows as prefill(), the same bits. The first range of a window records its
+    // ids; every later range of that window must carry the same ids. The position stays 0 until seat().
+    const std::vector<float>& range_window(std::span<const std::uint32_t> win, std::uint32_t start, std::uint32_t a, std::uint32_t b,
+                                           bool head) {
+        if (first != 0U || last != c.layers) throw std::logic_error("hy4 hip forward: range windows run on a whole-model rank");
+        if (rmax == 0U) throw std::runtime_error("hy4 hip forward: range windows need prompt rows");
+        if (a >= b || b > c.layers || (head && b != c.layers)) throw std::invalid_argument("hy4 hip forward: range window layers");
+        if (pos != 0U) throw std::logic_error("hy4 hip forward: range windows start a prompt (reset first)");
+        const auto R = static_cast<std::uint32_t>(win.size());
+        const auto plan = stage_window_plan(start, R, rmax);
+        if (plan.windows.size() != 1U || plan.tail != 0U || plan.windows.front().p0 != start || plan.windows.front().rows != R)
+            throw std::logic_error("hy4 hip forward: a range window is one whole prompt window (no tail rows)");
+        if (std::size_t{start} + R > context) throw std::runtime_error("hy4 hip forward: context full");
+        if (tokens.size() == start) {
+            for (const auto id : win) {
+                if (id >= c.vocab) throw std::invalid_argument("hy4 hip forward: token outside the vocabulary");
+                tokens.push_back(id);
+            }
+        } else if (tokens.size() >= std::size_t{start} + R) {
+            for (std::uint32_t i = 0; i < R; ++i)
+                if (tokens[start + i] != win[i]) throw std::logic_error("hy4 hip forward: range window ids differ from the window's");
+        } else {
+            throw std::logic_error("hy4 hip forward: range window out of prompt order");
+        }
+        (void)range_seam();
+        struct Restore {
+            Impl& m;
+            std::uint32_t f, l;
+            ~Restore() {
+                m.first = f;
+                m.last = l;
+            }
+        } restore{*this, first, last};
+        first = a;
+        last = b;
+        times = {};
+        prefill_window(start, R, head);
+        first = restore.f;
+        last = restore.l;
+        if (b == c.layers) prompt_hidden_rows(start, R);  // pr.x0 holds the window's X rows after the last layer
+        return head ? logits : empty;
+    }
+    // After every window's ranges ran here or were imported: the position after them (tail steps / decode follow).
+    void seat(std::uint32_t positions) {
+        if (first != 0U || last != c.layers) throw std::logic_error("hy4 hip forward: seat on a whole-model rank");
+        if (tokens.size() != positions || pos != 0U) throw std::logic_error("hy4 hip forward: seat position differs from the ids recorded");
+        engram_release_all();
+        pos = positions;
+    }
+    // Per-layer state of `positions` prompt rows (hy4_hip_plan layer_caches): the latent rows (by position, or the ring's
+    // first min(P, ring) slots = every written slot), the indexer's token-key ring and group keys of indexed layers.
+    struct CachePiece {
+        std::uint16_t* base;
+        std::size_t elements;
+    };
+    [[nodiscard]] std::array<CachePiece, 3> cache_pieces(std::uint32_t l, std::uint32_t positions) const {
+        if (first != 0U || last != c.layers || l >= c.layers) throw std::logic_error("hy4 hip forward: cache pieces on a whole-model rank");
+        if (positions > context) throw std::invalid_argument("hy4 hip forward: cache positions beyond the context");
+        const auto lc = layer_caches(c, l, context, rows::cache_rows(rmax, vr.max));
+        const auto rows_of = [positions](std::uint64_t n) { return static_cast<std::size_t>(std::min<std::uint64_t>(positions, n)); };
+        std::array<CachePiece, 3> pieces{};
+        pieces[0] = {latent[l], rows_of(lc.latent_rows) * lc.latent.width};
+        if (c.indexed[l] != 0U) {
+            pieces[1] = {tkeys[l], rows_of(lc.token_rows) * lc.token_keys.width};
+            const std::uint64_t groups = (std::uint64_t{positions} + c.index_ratio - 1U) / c.index_ratio;
+            pieces[2] = {gkeys[l], static_cast<std::size_t>(std::min<std::uint64_t>(groups, lc.group_rows)) * lc.group_keys.width};
+        }
+        return pieces;
+    }
+    void cache_copy(std::uint32_t l, std::uint32_t positions, std::byte* host, std::size_t bytes, bool out) {
+        std::size_t at = 0;
+        for (const auto& piece : cache_pieces(l, positions)) {
+            if (piece.elements == 0U) continue;
+            const std::size_t n = piece.elements * sizeof(std::uint16_t);
+            if (at + n > bytes) throw std::invalid_argument("hy4 hip forward: cache bytes of layer " + std::to_string(l));
+            if (out) check(hipMemcpyAsync(host + at, piece.base, n, hipMemcpyDeviceToHost, s), "cache export");
+            else check(hipMemcpyAsync(piece.base, host + at, n, hipMemcpyHostToDevice, s), "cache import");
+            at += n;
+        }
+        if (at != bytes) throw std::invalid_argument("hy4 hip forward: cache bytes of layer " + std::to_string(l));
+        check(hipStreamSynchronize(s), out ? "cache export sync" : "cache import sync");
+    }
+
 #include "hy4/hip/hy4_hip_rows.inc"  // verify rows (hy4_rows): forward_rows / commit_rows over the step's helpers
 };
 
@@ -2032,6 +2132,39 @@ const std::vector<float>& Forward::prefill_window(std::span<const std::uint32_t>
     return impl_->stage_window(tokens, start, head);
 }
 void* Forward::seam_rows() const noexcept { return impl_->seam; }
+std::uint32_t Forward::window_rows(std::uint32_t prompt) const { return impl_->window_rows(prompt); }
+void* Forward::range_seam() { return impl_->range_seam(); }
+const std::vector<float>& Forward::range_window(std::span<const std::uint32_t> tokens, std::uint32_t start, std::uint32_t first_layer,
+                                                std::uint32_t last_layer, bool head) {
+    const Impl::TpOneNode one(impl_->tp);  // the stage form: one-node work on this rank's layer range, no gather
+    return impl_->range_window(tokens, start, first_layer, last_layer, head);
+}
+std::uint64_t Forward::cache_bytes(std::uint32_t layer, std::uint32_t positions) const {
+    std::uint64_t n = 0;
+    for (const auto& p : impl_->cache_pieces(layer, positions)) n += std::uint64_t{p.elements} * sizeof(std::uint16_t);
+    return n;
+}
+void Forward::export_cache(std::uint32_t layer, std::uint32_t positions, std::span<std::byte> out) {
+    impl_->cache_copy(layer, positions, out.data(), out.size(), true);
+}
+void Forward::import_cache(std::uint32_t layer, std::uint32_t positions, std::span<const std::byte> in) {
+    impl_->cache_copy(layer, positions, const_cast<std::byte*>(in.data()), in.size(), false);
+}
+void Forward::seat(std::uint32_t positions) { impl_->seat(positions); }
+void Forward::feed_prompt_hidden(const float* rows, std::uint32_t p0, std::uint32_t n) {
+    if (impl_->nx.sink) impl_->nx.sink(rows, p0, n);
+}
+const std::vector<float>& Forward::prompt_tail(std::span<const std::uint32_t> tokens) {
+    if (!has_head() || !has_embedding()) throw std::logic_error("hy4 hip forward: prompt tail on a whole-model rank");
+    std::vector<float> state;
+    const std::vector<float>* out = &impl_->empty;
+    for (const auto id : tokens) {
+        if (id >= impl_->c.vocab) throw std::invalid_argument("hy4 hip forward: token outside the vocabulary");
+        out = &impl_->step(id, state);
+        impl_->prompt_hidden_step();
+    }
+    return *out;
+}
 std::size_t Forward::seam_row_bytes() const noexcept { return 4U * std::size_t{impl_->c.hidden} * sizeof(float); }
 void* Forward::stream_handle() const noexcept { return impl_->s; }
 void Forward::sync() { check(hipStreamSynchronize(impl_->s), "forward sync"); }

@@ -91,6 +91,29 @@ public:
     const std::vector<float>& prefill_window(std::span<const std::uint32_t> tokens, std::uint32_t start, bool head);
     [[nodiscard]] void* seam_rows() const noexcept;        // device [prompt_rows][4][hidden] FP32 (BF16 values); null on a whole-model rank
     [[nodiscard]] std::size_t seam_row_bytes() const noexcept;  // 4 x hidden x 4 B: one seam row = one decode state
+    // ---- pair prime on a whole-model rank: the stages of a StageMap as layer ranges of THIS forward, then the state
+    // re-laid out for the TP decode (strix/pair/relayout.hpp), KV in place. Prompt from position 0 after reset():
+    //   window_rows(P): rows the one-node prompt plan runs as windows (the stage pipeline runs exactly these windows;
+    //     the P - window_rows(P) tail positions run as steps through prompt_tail, TP steps after enable_tp);
+    //   range_window(ids, start, a, b, head): one window of layers [a, b) (prefill_window's work with this forward's
+    //     caches; input / output rows through range_seam() unless a == 0 / b == layers; b == layers feeds the
+    //     prompt-hidden sink with the window's rows); one-node like prefill() (no gather);
+    //   cache_bytes / export_cache / import_cache(layer, P): the layer's state for P positions (latent rows or ring slots,
+    //     indexer token-key ring and group keys), synchronous host copies;
+    //   seat(P): position P after every window ran here or was imported; feed_prompt_hidden(rows, p0, n): the sink with
+    //     rows produced on the peer (device rows); prompt_tail(ids): steps with the prompt-hidden feed, last logits.
+    // Bits: every cache row is the stage owner's = the one-node prefill's at the same prompt rows (StageMap invariant);
+    // the tail steps are TP steps = the one-node steps (TP invariant): decode ids equal the one-node-primed run.
+    [[nodiscard]] std::uint32_t window_rows(std::uint32_t prompt) const;
+    [[nodiscard]] void* range_seam();
+    const std::vector<float>& range_window(std::span<const std::uint32_t> tokens, std::uint32_t start, std::uint32_t first_layer,
+                                           std::uint32_t last_layer, bool head);
+    [[nodiscard]] std::uint64_t cache_bytes(std::uint32_t layer, std::uint32_t positions) const;
+    void export_cache(std::uint32_t layer, std::uint32_t positions, std::span<std::byte> out);
+    void import_cache(std::uint32_t layer, std::uint32_t positions, std::span<const std::byte> in);
+    void seat(std::uint32_t positions);
+    void feed_prompt_hidden(const float* rows, std::uint32_t p0, std::uint32_t n);
+    const std::vector<float>& prompt_tail(std::span<const std::uint32_t> tokens);
     [[nodiscard]] void* stream_handle() const noexcept;    // the hipStream_t every device operation of this forward runs on
     void sync();
     // step_greedy on a head stage of any range: `state` = X from the previous stage (ignored with the embedding).
