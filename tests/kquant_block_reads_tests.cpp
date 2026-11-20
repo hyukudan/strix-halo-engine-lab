@@ -2,12 +2,15 @@
 // every byte read for a block lies inside the block (or the leading bytes of its own aligned dword), so the last block of
 // a tensor reads nothing past the tensor. Checked twice: span arithmetic for every (parity, step pair, halves), and by replaying
 // the reads byte for byte on a tensor whose last byte is the last byte before an inaccessible page.
+// Q4_K header reuse (q4k_reads): the K loop's two register stages are replayed on a row of random superblocks; every step
+// must decode its own superblock's header and qs bytes, with the header requested only on steps s%4 < 2.
 #include "../src/moe_core/kquant_block_reads.hpp"
 
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <stdexcept>
 #include <string>
 
@@ -132,6 +135,46 @@ void guarded_page_tests() {
         }
     check(total != 0U, "replay");
 }
+
+// One register stage of the Q4_K down trait: the bytes F16xKQuantDown<12>::load leaves in Raw {head, lo, hi}.
+struct Q4Stage { unsigned char head[16], qs[32]; };
+void q4k_replay_tests() {
+    namespace q4 = strix::moe_core::q4k_reads;
+    static_assert(q4::headers_held(4U) && q4::headers_held(24U) && !q4::headers_held(6U));
+    std::mt19937 rng(7U);
+    for (unsigned blocks = 1U; blocks <= 9U; ++blocks) {
+        std::string row(static_cast<std::size_t>(blocks) * q4::block_bytes, '\0');
+        for (auto& c : row) c = static_cast<char>(rng() & 255U);
+        const auto* base = reinterpret_cast<const unsigned char*>(row.data());
+        Q4Stage stage[2];
+        std::memset(stage, 0xA5, sizeof(stage));  // never-written header bytes must not reach a decode
+        unsigned header_loads = 0U, qs_bytes = 0U;
+        const auto fetch = [&](unsigned s) {
+            const unsigned char* blk = base + static_cast<std::size_t>(s / 4U) * q4::block_bytes;
+            Q4Stage& r = stage[s % 2U];
+            if (q4::header_load(s)) { std::memcpy(r.head, blk, q4::header_bytes); ++header_loads; }
+            std::memcpy(r.qs, blk + q4::qs_from_block(s), 32U);
+            qs_bytes += 32U;
+        };
+        const auto decode = [&](unsigned s) {
+            const unsigned char* blk = base + static_cast<std::size_t>(s / 4U) * q4::block_bytes;
+            const Q4Stage& r = stage[s % 2U];
+            check(std::memcmp(r.head, blk, q4::header_bytes) == 0, "Q4_K stage holds another superblock's header");
+            check(std::memcmp(r.qs, blk + 16U + 32U * (s % 4U), 32U) == 0, "Q4_K stage holds the wrong qs bytes");
+        };
+        const unsigned steps = 4U * blocks;
+        fetch(0U);
+        fetch(1U);
+        for (unsigned s = 0U; s < steps; s += 2U) {
+            decode(s);
+            if (s + 2U < steps) fetch(s + 2U);
+            decode(s + 1U);
+            if (s + 3U < steps) fetch(s + 3U);
+        }
+        check(header_loads == 2U * blocks, "Q4_K header requested other than twice per superblock");
+        check(qs_bytes == 128U * blocks, "Q4_K qs bytes not read exactly once");
+    }
+}
 }  // namespace
 
 int main() {
@@ -141,7 +184,8 @@ int main() {
     try {
         span_tests();
         guarded_page_tests();
-        std::puts("Q6_K down block reads PASS");
+        q4k_replay_tests();
+        std::puts("Q6_K down block reads + Q4_K header reuse replay PASS");
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
