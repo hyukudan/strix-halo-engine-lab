@@ -5,3 +5,6 @@ strix_servespec_host_test(NAME strix-prefix-directory-tests
 if(MSVC AND TARGET strix-prefix-directory-tests)
     target_compile_definitions(strix-prefix-directory-tests PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
+# In-flight prefix join (shared serve admission) + short-first prefill turn, fake-engine scheduler.
+strix_servespec_host_test(NAME strix-prefix-join-tests
+    SOURCES tests/prefix_join_tests.cpp src/serve/prefix_directory.cpp)

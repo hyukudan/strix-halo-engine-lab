@@ -191,7 +191,7 @@ target_include_directories(strix_lookup PUBLIC include)
 target_compile_features(strix_lookup PUBLIC cxx_std_20)
 strix_target_warnings(strix_lookup)
 # Shared drafting layer: context proposer (copy cursor, long proposals), lookup/drafter/serial arbiter, stats line.
-add_library(strix_spec STATIC src/spec/drafting.cpp src/spec/block_drafter.cpp src/spec/draft_rows.cpp)
+add_library(strix_spec STATIC src/spec/drafting.cpp src/spec/block_drafter.cpp src/spec/draft_rows.cpp src/spec/block_parallel.cpp)
 target_link_libraries(strix_spec PUBLIC strix_lookup)
 strix_target_warnings(strix_spec)
 
@@ -468,6 +468,11 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-qwen-dense-hip-profile-tests)
     add_test(NAME strix-qwen-dense-hip-profile-tests COMMAND strix-qwen-dense-hip-profile-tests)
     set_tests_properties(strix-qwen-dense-hip-profile-tests PROPERTIES LABELS "cpu;profile")
+    add_executable(strix-qwen35-prefill-windows-tests tests/qwen35_prefill_windows_tests.cpp)
+    target_include_directories(strix-qwen35-prefill-windows-tests PRIVATE include)
+    target_compile_features(strix-qwen35-prefill-windows-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-qwen35-prefill-windows-tests)
+    add_test(NAME strix-qwen35-prefill-windows-tests COMMAND strix-qwen35-prefill-windows-tests)
     add_executable(strix-wave-fit-host-tests tests/wave_fit_host_tests.cpp)
     target_include_directories(strix-wave-fit-host-tests PRIVATE include)
     target_compile_features(strix-wave-fit-host-tests PRIVATE cxx_std_20)
@@ -505,7 +510,8 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-attention-score-reduce-host-tests)
     target_link_libraries(strix-attention-score-reduce-host-tests PRIVATE Threads::Threads)
     add_test(NAME strix-attention-score-reduce-host-tests COMMAND strix-attention-score-reduce-host-tests)
-    # K/V cache storage classes (strix/kv_storage.hpp): bytes, role / tier policy, quantiser layouts, draft-cache ids == serial.
+    # K/V cache storage classes (strix/kv_storage.hpp, the model contract's AttentionKvStorage): bytes, role / tier policy,
+    # contract binding, quantiser layouts, draft-cache ids == serial.
     add_executable(strix-kv-storage-tests tests/kv_storage_tests.cpp)
     target_include_directories(strix-kv-storage-tests PRIVATE include)
     target_compile_features(strix-kv-storage-tests PRIVATE cxx_std_20)
@@ -1080,6 +1086,27 @@ if(NOT TARGET strix-gguf-pack-check)
     strix_target_warnings(strix-gguf-pack-check)
 endif()
 
+# Hy4-flash host reference (CPU oracle): the declared arithmetic of src/hy4/ref/hy4_host_ref.hpp over the pack's tensors.
+# It calls the shared host references (hyper-connection, group indexer, RoPE, SwiGLU, route) where they compute its bits.
+add_library(strix_hy4_ref STATIC src/hy4/ref/hy4_host_ref.cpp src/attn/group_indexer_ref.cpp)
+target_include_directories(strix_hy4_ref PUBLIC include src)
+target_compile_features(strix_hy4_ref PUBLIC cxx_std_20)
+target_link_libraries(strix_hy4_ref PUBLIC strix_weight_archive strix_hc Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(strix_hy4_ref PRIVATE -fno-fast-math -ffp-contract=off)
+endif()
+strix_target_warnings(strix_hy4_ref)
+# The oracle on the real pack: prompt ids + greedy ids, top-K and logits digests per position (device identity receipts).
+add_executable(strix-hy4-ref apps/hy4_ref_main.cpp)
+target_link_libraries(strix-hy4-ref PRIVATE strix_hy4_ref)
+strix_target_warnings(strix-hy4-ref)
+# DFly2 drafter tools on the oracle: target-state taps of a greedy run (the drafter's KV-share / hidden inputs).
+add_library(strix_hy4_dfly_ref STATIC src/hy4/ref/hy4_dfly_ref.cpp)
+target_link_libraries(strix_hy4_dfly_ref PUBLIC strix_hy4_ref)
+strix_target_warnings(strix_hy4_dfly_ref)
+add_executable(strix-hy4-dfly apps/hy4_dfly_main.cpp)
+target_link_libraries(strix-hy4-dfly PRIVATE strix_hy4_dfly_ref)
+strix_target_warnings(strix-hy4-dfly)
 
 # Host-only serving front end (no GPU): JSON, tokenizer, chat template, HTTP and the API mapping.
 add_library(strix_serve STATIC
@@ -1092,6 +1119,7 @@ add_library(strix_serve STATIC
     src/serve/deepseek_chat.cpp
     src/serve/glm_chat.cpp
     src/serve/chat_template_kit.cpp
+    src/serve/hy4_chat.cpp
     src/serve/http_server.cpp
     src/serve/engine.cpp
     src/serve/api.cpp
@@ -1299,6 +1327,10 @@ if(BUILD_TESTING)
     target_link_libraries(strix-spec-mtp-chain-tests PRIVATE strix_spec)
     strix_target_warnings(strix-spec-mtp-chain-tests)
     add_test(NAME strix-spec-mtp-chain-tests COMMAND strix-spec-mtp-chain-tests)
+    add_executable(strix-spec-block-parallel-tests tests/spec_block_parallel_tests.cpp)
+    target_link_libraries(strix-spec-block-parallel-tests PRIVATE strix_spec)
+    strix_target_warnings(strix-spec-block-parallel-tests)
+    add_test(NAME strix-spec-block-parallel-tests COMMAND strix-spec-block-parallel-tests)
     # Host execution of the production plan/lifecycle blocks, with GPU boundaries stubbed.
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
@@ -1422,12 +1454,48 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-glm-chat-tests)
     add_test(NAME strix-glm-chat-tests COMMAND strix-glm-chat-tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/serve/glm_chat_cases.json)
+    # Hy4: the shared BPE with the hy_v4 pre name (the DeepSeek split rule); optional GGUF = vocabulary/id checks.
+    add_executable(strix-hy4-tokenizer-tests tests/hy4_tokenizer_tests.cpp)
+    target_link_libraries(strix-hy4-tokenizer-tests PRIVATE strix_serve)
+    strix_target_warnings(strix-hy4-tokenizer-tests)
+    set(STRIX_HY4_GGUF "" CACHE FILEPATH "Hy4 GGUF (first part; optional, only its header is read)")
+    add_test(NAME strix-hy4-tokenizer-tests COMMAND strix-hy4-tokenizer-tests ${STRIX_HY4_GGUF})
+    add_executable(strix-hy4-chat-tests tests/hy4_chat_tests.cpp)
+    target_link_libraries(strix-hy4-chat-tests PRIVATE strix_serve)
+    strix_target_warnings(strix-hy4-chat-tests)
+    add_test(NAME strix-hy4-chat-tests COMMAND strix-hy4-chat-tests)
+    # Hy4 host reference (CPU oracle): synthetic tiny model end to end + contract invariants; optional GGUF = metadata binding.
+    add_executable(strix-hy4-host-ref-tests tests/hy4_host_ref_tests.cpp)
+    target_link_libraries(strix-hy4-host-ref-tests PRIVATE strix_hy4_ref)
+    strix_target_warnings(strix-hy4-host-ref-tests)
+    add_test(NAME strix-hy4-host-ref-tests COMMAND strix-hy4-host-ref-tests ${STRIX_HY4_GGUF})
+    # DFly2 drafter host reference: synthetic tiny drafter + target view (causal prefix, KV share, slot-0 hidden, switches).
+    add_executable(strix-hy4-dfly-ref-tests tests/hy4_dfly_ref_tests.cpp)
+    target_link_libraries(strix-hy4-dfly-ref-tests PRIVATE strix_hy4_dfly_ref)
+    strix_target_warnings(strix-hy4-dfly-ref-tests)
+    add_test(NAME strix-hy4-dfly-ref-tests COMMAND strix-hy4-dfly-ref-tests)
+    # Hy4 HIP binding plan (stage map: every stage a shared entry; cache plan on the shared cache-row layouts).
+    add_executable(strix-hy4-hip-plan-tests tests/hy4_hip_plan_tests.cpp)
+    target_link_libraries(strix-hy4-hip-plan-tests PRIVATE strix_hy4_ref)
+    strix_target_warnings(strix-hy4-hip-plan-tests)
+    add_test(NAME strix-hy4-hip-plan-tests COMMAND strix-hy4-hip-plan-tests ${STRIX_HY4_GGUF})
+    # Hy4 verify rows (host): ring rewind replay for R <= 8, position words, speculative decode ids == plain greedy.
+    add_executable(strix-hy4-rows-tests tests/hy4_rows_tests.cpp src/attn/group_indexer_ref.cpp)
+    target_link_libraries(strix-hy4-rows-tests PRIVATE strix_hy4_ref strix_spec)
+    strix_target_warnings(strix-hy4-rows-tests)
+    add_test(NAME strix-hy4-rows-tests COMMAND strix-hy4-rows-tests ${STRIX_HY4_GGUF})
     # Rows tile of the head-family dense kernel: tile map and tree map (bits of the single-row reduction).
     add_executable(strix-dense-rows-tile-tests tests/dense_rows_tile_tests.cpp)
     target_include_directories(strix-dense-rows-tile-tests PRIVATE include)
     target_compile_features(strix-dense-rows-tile-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-dense-rows-tile-tests)
     add_test(NAME strix-dense-rows-tile-tests COMMAND strix-dense-rows-tile-tests)
+    # Wave form of the head-family dense kernel: leaf map and tree pairs (bits of the single-row reduction).
+    add_executable(strix-dense-rows-wave-tests tests/dense_rows_wave_tests.cpp)
+    target_include_directories(strix-dense-rows-wave-tests PRIVATE include)
+    target_compile_features(strix-dense-rows-wave-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-dense-rows-wave-tests)
+    add_test(NAME strix-dense-rows-wave-tests COMMAND strix-dense-rows-wave-tests)
     add_executable(strix-serve-deepseek-chat-tests tests/serve_deepseek_chat_tests.cpp)
     target_link_libraries(strix-serve-deepseek-chat-tests PRIVATE strix_serve)
     strix_target_warnings(strix-serve-deepseek-chat-tests)
@@ -1481,6 +1549,10 @@ if(BUILD_TESTING)
     target_compile_features(strix-kquant-block-reads-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-kquant-block-reads-tests)
     add_test(NAME strix-kquant-block-reads-tests COMMAND strix-kquant-block-reads-tests)
+    add_executable(strix-moe-expert-union-tests tests/moe_expert_union_tests.cpp)
+    target_link_libraries(strix-moe-expert-union-tests PRIVATE strix_q4k_a8_contract strix_core)
+    strix_target_warnings(strix-moe-expert-union-tests)
+    add_test(NAME strix-moe-expert-union-tests COMMAND strix-moe-expert-union-tests)
     add_executable(strix-moe-a8-down-contract-tests tests/moe_a8_down_contract_tests.cpp)
     target_link_libraries(strix-moe-a8-down-contract-tests PRIVATE strix_q4k_a8_contract strix_core)
     strix_target_warnings(strix-moe-a8-down-contract-tests)
@@ -3132,6 +3204,11 @@ int main() { return 0; }"
             strix_target_warnings(strix_q4k_a8_dot4_compile_probe)
         endif()
         if(BUILD_TESTING AND STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE)
+            add_executable(strix-hip-moe-a8-union-tests tests/hip_moe_a8_union_tests.hip)
+            target_link_libraries(strix-hip-moe-a8-union-tests PRIVATE strix_q4k_a8_hip_probe strix_q4k_a8_contract strix_core strix_hip_runtime)
+            set_target_properties(strix-hip-moe-a8-union-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+            strix_target_warnings(strix-hip-moe-a8-union-tests)
+            add_test(NAME strix-hip-moe-a8-union-tests COMMAND strix-hip-moe-a8-union-tests)
             add_executable(strix-hip-moe-a8-down-tests tests/hip_moe_a8_down_tests.hip)
             target_link_libraries(strix-hip-moe-a8-down-tests PRIVATE strix_q4k_a8_hip_probe strix_q4k_a8_contract strix_core strix_hip_runtime)
             set_target_properties(strix-hip-moe-a8-down-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
@@ -3169,6 +3246,14 @@ int main() { return 0; }"
                 "$<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64;-fhip-fp32-correctly-rounded-divide-sqrt;-fdenormal-fp-math=ieee>")
             strix_target_warnings(strix-hip-group-pool-tests)
             add_test(NAME strix-hip-group-pool-tests COMMAND strix-hip-group-pool-tests)
+            # Shared Engram row kernel (DS41 decode, Hy4 head_rms_bf16) and MoE route / combine kernels (Hy4 preset / glm5) vs host oracles.
+            add_executable(strix-hip-hy4-routed-tests tests/hip_hy4_routed_tests.hip)
+            set_target_properties(strix-hip-hy4-routed-tests PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+            target_include_directories(strix-hip-hy4-routed-tests PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+            target_compile_options(strix-hip-hy4-routed-tests PRIVATE -fno-fast-math -ffp-contract=off
+                "$<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64;-fhip-fp32-correctly-rounded-divide-sqrt;-fdenormal-fp-math=ieee>")
+            strix_target_warnings(strix-hip-hy4-routed-tests)
+            add_test(NAME strix-hip-hy4-routed-tests COMMAND strix-hip-hy4-routed-tests)
             add_test(NAME strix-hip-moe-wmma-prefill-tests COMMAND strix-hip-moe-wmma-prefill-tests)
             add_test(NAME strix-hip-moe-route-bf16-tests COMMAND strix-hip-moe-wmma-prefill-tests route-bf16)
             add_test(NAME strix-hip-moe-prefill-pool16k-tests COMMAND strix-hip-moe-wmma-prefill-tests pool16k)
@@ -3599,6 +3684,15 @@ int main() { return 0; }"
         strix_target_warnings(strix-hip-ops-dense-rows-tests)
         add_test(NAME strix-hip-ops-dense-rows-tests COMMAND strix-hip-ops-dense-rows-tests)
         set_tests_properties(strix-hip-ops-dense-rows-tests PROPERTIES SKIP_RETURN_CODE 77)
+        # Wave form of launch_hip_dense_rows rows 1 == block form, batched rmsnorm_row == loop form (bitwise); timing printed.
+        add_executable(strix-hip-dense-rows-wave-tests tests/hip_dense_rows_wave_tests.hip)
+        set_target_properties(strix-hip-dense-rows-wave-tests PROPERTIES
+            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        target_include_directories(strix-hip-dense-rows-wave-tests PRIVATE include src)
+        target_link_libraries(strix-hip-dense-rows-wave-tests PRIVATE strix_hip_runtime)
+        strix_target_warnings(strix-hip-dense-rows-wave-tests)
+        add_test(NAME strix-hip-dense-rows-wave-tests COMMAND strix-hip-dense-rows-wave-tests)
+        set_tests_properties(strix-hip-dense-rows-wave-tests PROPERTIES SKIP_RETURN_CODE 77)
         # Rows tile of launch_hip_dense_rows == one single-row launch per row (bitwise); router timing printed.
         add_executable(strix-hip-dense-rows-tile-tests tests/hip_dense_rows_tile_tests.hip)
         set_target_properties(strix-hip-dense-rows-tile-tests PROPERTIES
@@ -4695,6 +4789,10 @@ target_include_directories(strix_engram PUBLIC include PRIVATE src)
 target_compile_features(strix_engram PUBLIC cxx_std_20)
 target_link_libraries(strix_engram PUBLIC Threads::Threads)
 strix_target_warnings(strix_engram)
+# Hy4-flash Engram adapter: the shared Spec from the pack metadata (no hashing code).
+add_library(strix_hy4_engram STATIC src/hy4/hy4_engram_spec.cpp)
+target_link_libraries(strix_hy4_engram PUBLIC strix_engram)
+strix_target_warnings(strix_hy4_engram)
 # deepseek41 layer sites (mHC, norms, RoPE, projection sites, embedding/head, Engram): host reference
 # and the DS41 Engram adapter of strix_engram, with the same strict arithmetic flags as the formats.
 add_library(strix_ds41_layer STATIC src/ds41_layer.cpp src/ds41_engram.cpp)
@@ -4715,6 +4813,10 @@ if(BUILD_TESTING)
     add_test(NAME strix-ds41-layer-tests COMMAND strix-ds41-layer-tests)
     add_executable(strix-engram-core-tests tests/engram_core_tests.cpp)
     target_link_libraries(strix-engram-core-tests PRIVATE strix_ds41_layer)
+    if(TARGET strix_hy4_engram)  # the Hy4 Spec adapter (model package) adds its fixture when present
+        target_link_libraries(strix-engram-core-tests PRIVATE strix_hy4_engram)
+        target_compile_definitions(strix-engram-core-tests PRIVATE STRIX_ENGRAM_HY4=1)
+    endif()
     strix_target_warnings(strix-engram-core-tests)
     add_test(NAME strix-engram-core-tests COMMAND strix-engram-core-tests)
     add_executable(strix-engram-inject-tests tests/engram_inject_tests.cpp)
@@ -6593,6 +6695,13 @@ if(BUILD_TESTING)
     target_compile_features(strix-qwen35-pair-plan-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-qwen35-pair-plan-tests)
     add_test(NAME strix-qwen35-pair-plan-tests COMMAND strix-qwen35-pair-plan-tests)
+    # Hy4-flash placement on the shared planners (pair/placement_inputs.hpp + chain + column_split) over the pack table.
+    add_executable(strix-hy4-placement-tests tests/hy4_placement_tests.cpp)
+    target_include_directories(strix-hy4-placement-tests PRIVATE include)
+    target_compile_features(strix-hy4-placement-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-hy4-placement-tests)
+    add_test(NAME strix-hy4-placement-tests COMMAND strix-hy4-placement-tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/hy4/q4km-component-bytes.tsv)
     # Shared prompt windows (strix/session/prompt_windows.hpp) and the two-stage window picker.
     add_executable(strix-prompt-windows-tests tests/prompt_windows_tests.cpp)
     target_include_directories(strix-prompt-windows-tests PRIVATE include)
@@ -6758,6 +6867,10 @@ if(BUILD_TESTING)
         target_link_libraries(strix-route-policy-tests PRIVATE strix_minimax_msa)
         target_compile_definitions(strix-route-policy-tests PRIVATE STRIX_RP_MINIMAX=1)
     endif()
+    if(TARGET strix_hy4_ref)
+        target_link_libraries(strix-route-policy-tests PRIVATE strix_hy4_ref)
+        target_compile_definitions(strix-route-policy-tests PRIVATE STRIX_RP_HY4=1)
+    endif()
     if(TARGET strix_glm5_host)
         target_link_libraries(strix-route-policy-tests PRIVATE strix_glm5_host)
         target_compile_definitions(strix-route-policy-tests PRIVATE STRIX_RP_GLM5=1)
@@ -6766,4 +6879,27 @@ if(BUILD_TESTING)
         target_compile_options(strix-route-policy-tests PRIVATE -ffp-contract=off)
     endif()
     add_test(NAME strix-route-policy-tests COMMAND strix-route-policy-tests)
+endif()
+
+# Hy4-flash HIP forward (src/hy4/hip: the stage map of hy4_hip_plan.hpp on shared entries; no kernel of its own) and the
+# one-node correctness runner strix-hy4-rank. Needs the HIP runtime and the A8 routed-expert kernels
+# (-DSTRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE=ON).
+option(STRIX_FAMILY_HY4 "Build the Hy4-flash HIP forward and strix-hy4-rank" OFF)
+if(STRIX_FAMILY_HY4)
+    if(NOT STRIX_ENABLE_HIP_RUNTIME OR NOT TARGET strix_q4k_a8_hip_probe)
+        message(FATAL_ERROR "STRIX_FAMILY_HY4 needs STRIX_ENABLE_HIP_RUNTIME=ON and STRIX_BUILD_EXPERIMENTAL_Q4K_A8_PROBE=ON")
+    endif()
+    add_library(strix_hy4_hip STATIC src/hy4/hip/hy4_hip_forward.hip)
+    set_target_properties(strix_hy4_hip PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+    target_include_directories(strix_hy4_hip PUBLIC include src "${STRIX_HIP_INCLUDE_DIR}")
+    target_compile_options(strix_hy4_hip PRIVATE -mno-wavefrontsize64 -fno-fast-math -ffp-contract=off
+        -fhip-fp32-correctly-rounded-divide-sqrt -fdenormal-fp-math=ieee)
+    target_link_libraries(strix_hy4_hip PUBLIC strix_hy4_ref strix_hip_runtime strix_q4k_a8_hip_probe strix_engram strix_ds41_hip)
+    strix_target_warnings(strix_hy4_hip)
+    add_executable(strix-hy4-rank apps/hy4_rank_main.cpp)
+    target_link_libraries(strix-hy4-rank PRIVATE strix_hy4_hip strix_dist strix_device strix_spec)  # pair: shared layer pipeline + link; copy proposer
+    strix_target_warnings(strix-hy4-rank)
+    add_executable(strix-hy4-rows apps/hy4_rows_main.cpp)  # verify rows bench + speculative decode (hy4_hip_rows)
+    target_link_libraries(strix-hy4-rows PRIVATE strix_hy4_hip strix_spec)
+    strix_target_warnings(strix-hy4-rows)
 endif()

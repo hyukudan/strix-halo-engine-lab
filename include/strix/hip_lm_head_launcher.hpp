@@ -41,6 +41,7 @@ struct HipDenseRowsView {
     std::uint32_t x_stride = 0, out_stride = 0;  // elements; 0 = width / outputs
     float* out = nullptr;
     bool row_loop = false;  // true: one single-row launch per row (off switch of the rows tile; identity reference)
+    bool block_rows = false;  // true: one 256-thread block per output (lm_head_kernel): off switch of the wave form; identity reference
 };
 void launch_hip_dense_rows(const HipDenseRowsView& view, void* stream);
 void register_hip_lm_head_kernel_variant(
