@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cmath>
 #include <array>
+#include <type_traits>
 #include <utility>
 #include <cstdio>
 #include <vector>
@@ -1579,9 +1580,9 @@ template<bool Wide> struct f16_qv { using type=uint4; };
 template<> struct f16_qv<false> { using type=uint2; };
 __device__ __forceinline__ uint2 f16_load8(const void* p){return strix::moe_core::GroupedF16Issue::load8<uint2>(p);}
 // The K loop shared by both projections (moe_core/grouped_f16.hpp): two register stages (or one with bit 0).
-template<unsigned Tune,class Regs,class Fetch,class Stage,class Step>
+template<unsigned Tune,class Regs,class Regs1=Regs,class Fetch,class Stage,class Step>
 __device__ __forceinline__ void f16_pipeline(unsigned steps,const Fetch& fetch,const Stage& stage,const Step& step_fn) {
-    strix::moe_core::GroupedF16Issue::pipeline<(Tune&1U)!=0U,Regs>(steps,fetch,stage,step_fn);
+    strix::moe_core::GroupedF16Issue::pipeline<(Tune&1U)!=0U,Regs,Regs1>(steps,fetch,stage,step_fn);
 }
 template<bool Q5K,unsigned Tune,unsigned Core=0U>
 __global__ __launch_bounds__((F16TileX<Tune,Core>::Threads),prefill_core2_min_waves(Tune,Core)) void project_prefill_f16x(const unsigned char* gate,const unsigned char* up,PrefillRows view,
