@@ -75,7 +75,8 @@ void test_glm_exports_and_precedence() {
             const Env env{{row.env, setting}};
             if (setting.empty() && (std::string(row.env) == "STRIX_GLM_PF_SEQPAR" ||
                                     std::string(row.env) == "STRIX_GLM_PF_SCRATCH" ||
-                                    std::string(row.env) == "STRIX_GLM_PF_ATTN_QWIN")) {
+                                    std::string(row.env) == "STRIX_GLM_PF_ATTN_QWIN" ||
+                                    std::string(row.env) == "STRIX_SPEC_ARBITER")) {
                 bool refused = false;
                 try { (void)rd::resolve(r, lookup(env)); }
                 catch (const std::invalid_argument&) { refused = true; }
