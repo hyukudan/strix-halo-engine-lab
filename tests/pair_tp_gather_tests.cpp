@@ -153,10 +153,41 @@ void test_inputs() {
 
 }  // namespace
 
+// Device-direct size split (P796-A): the Communicator's table keeps small sizes on its host path, so those gathers are
+// staged (host-waited) and the label says where the split is; the size-free routes ignore it.
+void test_route_split() {
+    namespace pr = strix::pair;
+    struct R { std::size_t up_to; bool direct; unsigned rings, host_percent; };
+    const std::vector<R> table{{65536U, false, 0U, 0U}, {1048576U, true, 2U, 0U}, {SIZE_MAX, true, 4U, 35U}};
+    const std::vector<R> rings{{32768U, true, 1U, 0U}, {SIZE_MAX, true, 4U, 0U}};
+    const std::vector<R> mixed_first{{65536U, true, 2U, 35U}, {SIZE_MAX, true, 4U, 0U}};
+    check(pr::host_prefix_bytes(table) == 65536U, "host prefix of the measured table: 64 KiB");
+    check(pr::host_prefix_bytes(rings) == 0U, "every size on the rings: no host prefix");
+    check(pr::host_prefix_bytes(mixed_first) == 65536U, "a mixed entry still carries a host part: counted");
+    check(pr::host_prefix_bytes(std::vector<R>{}) == 0U, "empty table: no host prefix");
+    check(pr::effective_route(pr::GatherRoute::device_direct, 10240U, 65536U) == pr::GatherRoute::staged, "1-row gather: staged");
+    check(pr::effective_route(pr::GatherRoute::device_direct, 65537U, 65536U) == pr::GatherRoute::device_direct, "above: device");
+    check(pr::effective_route(pr::GatherRoute::channel, 10U, 65536U) == pr::GatherRoute::channel, "channel ignores the split");
+    check(pr::effective_route(pr::GatherRoute::device_direct, 10U, 0U) == pr::GatherRoute::device_direct, "no split: device");
+    check(pr::route_waits_on_host(pr::effective_route(pr::GatherRoute::device_direct, 10240U, 65536U)), "small gather waits on host");
+    check(pr::gather_route_label(pr::GatherRoute::device_direct, 65536U) ==
+              std::string("device direct (stream-ordered) above 65536 B; staged (host-staged exchange) up to 65536 B"), "split label");
+    check(pr::gather_route_label(pr::GatherRoute::device_direct, 0U) == std::string("device direct (stream-ordered)"), "plain label");
+    Legacy legacy;
+    Fast fast;
+    const Link d(0U, pr::GatherRoute::device_direct, &legacy, &fast, 65536U);
+    check(d.route_for(10240U) == pr::GatherRoute::staged && d.route_for(1U << 20U) == pr::GatherRoute::device_direct &&
+              d.host_max_bytes() == 65536U, "link: route per size");
+    const Link st(0U, pr::GatherRoute::staged, &legacy, &fast, 65536U);
+    check(st.host_max_bytes() == 0U && st.route_label() == std::string(pr::gather_route_name(pr::GatherRoute::staged)),
+          "a split given to another route is dropped");
+}
+
 int main() {
     test_routes();
     test_finish_and_route();
     test_inputs();
+    test_route_split();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return EXIT_FAILURE;

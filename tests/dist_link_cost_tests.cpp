@@ -153,7 +153,21 @@ int main() try {
         try { (void)strix::dist::agree_max(atb, v0); } catch (const std::runtime_error&) { caught = true; }
         require(caught && atb.calls == 1U, "agree_max: a negative peer value is refused after the exchange");
     }
-    std::cout << "PASS: dist link cost (fit, anchor within 10 %, measure, rank agreement)\n";
+    // Regime probe sizes: one regime per fit, never across a host / device split.
+    {
+        using V = std::vector<std::uint64_t>;
+        const std::uint64_t all = ~std::uint64_t{0};
+        require(regime_sizes(0U, all, 1U << 22U) == V{4096U, 65536U, 1048576U}, "one regime: the default sizes");
+        require(regime_sizes(0U, 65536U, 1U << 22U) == V{4096U, 65536U}, "host regime of a 64 KiB split: two defaults");
+        require(regime_sizes(65536U, all, 1048576U) == V{131072U, 1048576U}, "device regime: 2 x split added to the one default");
+        require(regime_sizes(65536U, all, 1U << 21U) == V{131072U, 1048576U, 2097152U}, "device regime: capacity end added");
+        require(regime_sizes(0U, 65536U, 40000U) == V{4096U, 40000U}, "host regime below the split: capacity end added");
+        require(regime_sizes(65536U, all, 81920U) == V{81920U}, "narrow device regime: its one size");
+        require(regime_sizes(65536U, all, 65536U).empty(), "device regime above the capacity: no size");
+        for (const auto& v : {regime_sizes(0U, 65536U, 1U << 22U), regime_sizes(65536U, all, 1U << 22U)})
+            for (std::size_t i = 1; i < v.size(); ++i) require(v[i - 1] < v[i], "ascending, no duplicates");
+    }
+    std::cout << "PASS: dist link cost (fit, anchor within 10 %, measure, rank agreement, regime sizes)\n";
     return 0;
 } catch (const std::exception& e) {
     std::cerr << "FAIL: " << e.what() << '\n';
