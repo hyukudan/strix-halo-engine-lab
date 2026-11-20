@@ -26,13 +26,13 @@ pos)
     st=$(grep -a -h -o 'gate-ref positions [0-9]*' ref-$DOC-$k.log | awk '{print $3}'); F="$F ref-$DOC-$k.rte:$st"; done
   python3 -I $GATE/long_gate.py routes-pos pos-$DOC.npz $F | tail -2 >> $S; RC=${PIPESTATUS[0]} ;;
 arm)
-  N=$3; CTX=$4; ROWS=${5:-2048}
+  N=$3; CTX=$4; ROWS=${5:-2048}; O=arm-$DOC-$N; [ "$ROWS" = 2048 ] || O=armr$ROWS-$DOC-$N
   head -n $N $DOC.ids > p-$DOC-$N.ids; sed -n "$((N + 1)),$((N + 200))p" $DOC.ids > t-$DOC-$N.ids
-  python3 -I $GATE/long_gate.py replay-arm pos-$DOC.npz in-arm-$DOC-$N.rte $N $ROWS 199 > /dev/null || { echo "arm $DOC $N replay file FAILED" >> $S; exit 1; }
-  STRIX_MOE_ROUTES_IN=in-arm-$DOC-$N.rte timeout $TO $BIN $PARTS --ids-file p-$DOC-$N.ids --teacher t-$DOC-$N.ids --gen 200 --top 1 \
-    --context $CTX --prompt-rows $ROWS --dump-logits arm-$DOC-$N.f32 > arm-$DOC-$N.log 2> arm-$DOC-$N.err; RC=$?
-  echo "arm $DOC $N rows $ROWS rc=$RC $(grep -a -h '^prefill tokens' arm-$DOC-$N.log | cut -c1-120) $(grep -a -o '"local_flips":{[^]]*' arm-$DOC-$N.err | cut -c1-90)" >> $S
-  tail_err arm-$DOC-$N.err ;;
+  python3 -I $GATE/long_gate.py replay-arm pos-$DOC.npz in-$O.rte $N $ROWS 199 > /dev/null || { echo "$O replay file FAILED" >> $S; exit 1; }
+  STRIX_MOE_ROUTES_IN=in-$O.rte timeout $TO $BIN $PARTS --ids-file p-$DOC-$N.ids --teacher t-$DOC-$N.ids --gen 200 --top 1     --context $CTX --prompt-rows $ROWS --dump-logits $O.f32 > $O.log 2> $O.err; RC=$?
+  B=""; [ "$O" != arm-$DOC-$N ] && [ -f arm-$DOC-$N.f32 ] && { cmp -s $O.f32 arm-$DOC-$N.f32 && B="bitwise==rows2048" || B="DIFFERS-from-rows2048"; }
+  echo "$O rc=$RC $B $(grep -a -h '^prefill tokens' $O.log | cut -c1-120) $(grep -a -o '"local_flips":{[^]]*' $O.err | cut -c1-90)" >> $S
+  tail_err $O.err ;;
 null)
   N=$3; CTX=$4; P0=$((N - 1024))
   python3 -I $GATE/long_gate.py replay-chunks pos-$DOC.npz in-null-$DOC-$N.rte $P0 $((N + 199)) 8 > /dev/null || { echo "null $DOC $N replay file FAILED" >> $S; exit 1; }
