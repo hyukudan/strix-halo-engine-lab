@@ -104,7 +104,8 @@ struct Options {
     // --prefill-short-first on|off: at each chunk boundary the prefilling request with the fewest remaining rows runs
     // the next chunk (shared select_waiting, at most kMaxQueueOvertakes overtaking chunks per request); off = oldest.
     // Both change only which rows run when: every request's tokens are unchanged (restore and chunking contracts).
-    bool prefix_inflight = true, prefill_short_first = true;
+    // Preserve the legacy scheduling path unless explicitly enabled and qualified on CUDA hardware.
+    bool prefix_inflight = false, prefill_short_first = false;
     std::uint32_t prefill_chunk = 1024;        // rows per prefill chunk while others decode; 0 = auto (fitted, see chunk_done)
     std::uint32_t prefill_overlap_rows = 1024;  // largest chunk on the prefill stream (overlap); its scratch is sized to it
     bool prefill_overlap = false;               // STRIX_QRTX_PREFILL_OVERLAP=1: chunks on a second stream beside the steps

@@ -269,6 +269,26 @@ void test_producer_cancel_and_passed() {
     t.check_states("passed: rows are their own");
 }
 
+// Regression contract for the serving default: new policies must remain opt-in.
+// Combining both opt-outs must behave exactly like the pre-PR oldest-first, non-joining scheduler.
+void test_legacy_prefill_policy() {
+    Sim s;
+    s.join_on = false;
+    s.short_first = false;
+    s.chunk = 1024;
+    s.admit(prompt(1, 6000, 1, 2000));
+    s.step();
+    s.admit(prompt(1, 6000, 2, 2000));
+    expect(s.lanes[1].join_entry == 0 && s.lanes[1].cached == 0,
+           "legacy: a second request never joins an in-flight prefix");
+    s.run();
+    expect(s.computed == 2 * (8000 - 1),
+           "legacy: both requests compute the full prompt without in-flight reuse");
+    expect(s.lanes[0].done_at == 8000 - 1 && s.lanes[1].done_at == 2 * (8000 - 1),
+           "legacy: oldest request finishes its prompt before the next request");
+    s.check_states("legacy: both opt-outs preserve each request's exact rows");
+}
+
 void test_short_first() {
     for (const bool sf : {true, false}) {
         Sim s;
@@ -317,6 +337,7 @@ int main() {
     test_burst_join();
     test_producer_cancel_and_passed();
     test_short_first();
+    test_legacy_prefill_policy();
     if (failures) {
         std::cerr << failures << " failure(s)\n";
         return EXIT_FAILURE;
