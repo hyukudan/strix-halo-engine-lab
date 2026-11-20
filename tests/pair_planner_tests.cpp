@@ -85,12 +85,17 @@ void test_qwen_dense_decode() {
     bool listed = false;
     for (const auto& l : pl::refusal_lines(p)) listed = listed || has(l, "plan_refused: form=tensor reason=\"needs links.ab");
     check(listed, "refusal lines print why");
-    // measured in-token trip on the channel, gap not yet measured for the route
+    // measured in-token trip; the host-waited staged route still needs its measured gap per join segment
     dv::set_measured(s, 0U, 1U, dv::GapClass::in_token, cost(32.0, 2.8));
+    c.route = GatherRoute::staged;
     p = pl::plan(m, c, pl::Request{});
-    check(has(form(p, pl::Form::tensor).reason, "needs the measured host gap per join segment of route channel"), "gap of the route needed");
+    check(has(form(p, pl::Form::tensor).reason, "needs the measured host gap per join segment of route staged"), "staged: gap of the route needed");
+    // the device-waited channel returns without a host wait: gap 0 by contract, nothing to measure
+    c.route = GatherRoute::channel;
+    p = pl::plan(m, c, pl::Request{});
+    check(p.chosen.form == pl::Form::tensor && form(p, pl::Form::tensor).gap_ms == 0.0, "channel: no host gap needed");
     c.gap_measured = {true, false, true};
-    c.segment_gap_us = {17.0, 0.0, 0.0};   // staged: 4.4 ms over 257 segments; channel: counter printed sync 0
+    c.segment_gap_us = {17.0, 0.0, 5.0};   // staged: 4.4 ms over 257 segments; a channel value is never priced (no host wait)
     p = pl::plan(m, c, pl::Request{});
     const auto& t = form(p, pl::Form::tensor);
     check(p.chosen.form == pl::Form::tensor && t.trips == 257U && t.exact, "channel: tensor, 257 exact joins");
@@ -197,6 +202,54 @@ void test_spec_overlap_inputs() {
     p = pl::plan(m, c, q);
     check(p.chosen.form == pl::Form::layers && has(p.chosen.reason, "forced; would be refused"), "force prints the refusal it overrides");
 }
+// A pair-only model: the single form fits no unit (resident bytes > known memory), so no gain bar applies and the
+// two-unit form wins on its own price; unknown memory is not a refusal (the rate decides as before).
+void test_does_not_fit() {
+    dv::Set s = two_units(243.0, "usb4", 4.58);
+    for (auto& u : s.units) u.memory_bytes = 120000000000ULL;
+    dv::set_measured(s, 0U, 1U, dv::GapClass::in_token, cost(22.0, 2.8));
+    const auto m = qwen_dense();
+    pl::Costs c;
+    c.set = &s;
+    c.route = GatherRoute::channel;
+    pl::Request q;
+    q.resident_bytes = 150000000000ULL;
+    const auto p = pl::plan(m, c, q);
+    check(!form(p, pl::Form::single).admissible && has(form(p, pl::Form::single).reason, "does not fit: resident 150.0 GB > a 120.0 GB, b 120.0 GB"),
+          "single refused: does not fit, names the units");
+    check(p.chosen.form == pl::Form::tensor && !std::isfinite(p.single_ms) && has(p.line, "form=tensor") && has(p.line, "single_ms=inf"),
+          "pair-only: tensor chosen without a single bar");
+    bool listed = false;
+    for (const auto& l : pl::refusal_lines(p)) listed = listed || has(l, "plan_refused: form=single reason=\"does not fit");
+    check(listed, "refusal line for the single form");
+    q.resident_bytes = 100000000000ULL;
+    check(pl::plan(m, c, q).single_ms < 60.0, "fits: single priced");
+    for (auto& u : s.units) u.memory_bytes = 0U;
+    q.resident_bytes = 150000000000ULL;
+    check(pl::plan(m, c, q).all[0].admissible, "memory unknown: single priced by its rate");
+}
+
+// The Qwen dense TP decode binding: a measured one-node pass (62.0 ms) enters as a replicated fixed stage
+// (split::with_measured_single), the chained channel trip (22 us) as the in-token class; single = the measured pass,
+// tensor = half the bytes + the same fixed ms + 257 trips.
+void test_calibrated_qwen_dense() {
+    dv::Set s = two_units(243.0, "usb4", 4.58);
+    dv::set_measured(s, 0U, 1U, dv::GapClass::in_token, cost(22.0, 2.8));
+    auto m = qwen_dense();
+    const auto cal = sp::with_measured_single(m, sp::Pass{}, 243.0e6, 62.0);
+    check(std::abs(cal.fixed_ms - (62.0 - 14.0e9 / 243.0e6)) < 1e-9, "residual = measured - stage model");
+    pl::Costs c;
+    c.set = &s;
+    c.route = GatherRoute::channel;
+    const auto p = pl::plan(m, c, pl::Request{});
+    const auto& t = form(p, pl::Form::tensor);
+    check(std::abs(p.single_ms - 62.0) < 1e-9, "single = the measured one-node pass");
+    // 28.81 + 4.39 fixed; link 256 x (22 + 3.93) + 22 us = 6.66 ms; gap 0 (channel)
+    check(p.chosen.form == pl::Form::tensor && std::abs(t.compute_ms - (28.81 + cal.fixed_ms)) < 0.05 &&
+              std::abs(t.link_ms - 6.66) < 0.05 && t.gap_ms == 0.0 && t.uncertainty == 0.0,
+          "calibrated tensor arithmetic, in-token trip measured");
+    check(std::abs(t.ms - 39.86) < 0.1 && has(p.line, "single_ms=62.0"), "prediction ~39.9 ms vs 62.0 one node");
+}
 }  // namespace
 
 int main() {
@@ -207,6 +260,8 @@ int main() {
         test_exactness();
         test_prefill_layers();
         test_spec_overlap_inputs();
+        test_does_not_fit();
+        test_calibrated_qwen_dense();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: exception %s\n", e.what());
         return 1;

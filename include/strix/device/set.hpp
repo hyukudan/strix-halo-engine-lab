@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
@@ -111,6 +112,38 @@ struct Set {
     std::sort(s.links.begin(), s.links.end(), [](const SetLink& x, const SetLink& y) {
         return x.a != y.a ? x.a < y.a : x.b != y.b ? x.b < y.b : x.name < y.name;
     });
+    return s;
+}
+
+// A Set from resolved per-rank read rates (bytes/ms; 0 = unknown) for a caller that already resolved its ranks (e.g. the
+// tensor-parallel rates of strix/pair/tp_inputs.hpp, which read the topology or the --tp-rates override): one unit per
+// rank (id "rank<r>", host / memory not stated) and one link per unit pair named `link` ("<link>-<a><b>" above two
+// units) whose rate and round trip are unknown, so a planner prices its trips only from set_measured. Every rank that
+// resolved the same rates builds the same digest.
+[[nodiscard]] inline Set rank_set(const std::vector<double>& read_bytes_per_ms, FactSource src, const std::string& link) {
+    if (read_bytes_per_ms.empty()) throw std::invalid_argument("device set: no ranks");
+    Set s;
+    s.source = "ranks";
+    const auto n = static_cast<std::uint32_t>(read_bytes_per_ms.size());
+    for (std::uint32_t r = 0; r < n; ++r) {
+        const double v = read_bytes_per_ms[r];
+        if (!std::isfinite(v) || v < 0.0) throw std::invalid_argument("device set: rank read rate must be finite and >= 0");
+        Unit u;
+        u.id = "rank" + std::to_string(r);
+        u.rank = r;
+        u.read_bytes_per_ms = v;
+        u.read_src = v > 0.0 ? src : FactSource::unknown;
+        s.units.push_back(std::move(u));
+    }
+    for (std::uint32_t a = 0; a < n; ++a)
+        for (std::uint32_t b = a + 1U; b < n; ++b) {
+            SetLink l;
+            l.name = n == 2U ? link : link + "-" + std::to_string(a) + std::to_string(b);
+            l.a = a;
+            l.b = b;
+            l.resource = "link-" + l.name;
+            s.links.push_back(std::move(l));
+        }
     return s;
 }
 

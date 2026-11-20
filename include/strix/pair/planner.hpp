@@ -9,12 +9,18 @@
 //     measured host gap per join segment of its gather route; missing numbers refuse the form and name the key;
 //   - the trip of a tensor join is priced with the gap class its segment's compute implies; when only a faster class
 //     was measured it is used with +25 % uncertainty and the line says so;
-//   - the host gap per join segment (wake-up + relaunch after a host wait: zero only for a route measured at zero);
+//   - the host gap per join segment (wake-up + relaunch after a host wait): 0 by contract for a device-waited route
+//     (pair::route_waits_on_host false), else the measured value; unmeasured on a host-waited route refuses the form;
+//   - the fixed cost the stage model cannot see (launches, host gaps) enters as stages: callers that measured a one-unit
+//     pass append its residual with split::with_measured_single before calling plan() (no second formula here);
+//   - memory fit: Request::resident_bytes larger than a unit's known memory refuses the single form on that unit
+//     ("does not fit"); a pair-only model then has no single bar and the fastest admissible two-unit form wins;
 //   - a GAIN BAR: a multi-device form is admissible only if ms x (1 + uncertainty) < single x (1 - margin);
 //   - a reason string on every refusal and one receipt line with counts and bytes, so prediction and measurement compare.
 // Prints only: callers still choose their form (an engine binds the chosen form in its own change, with its measurement).
 // Host test: tests/pair_planner_tests.cpp.
-// Home: shared (host shared). Bound by: none yet (engines describe their pass as split::Stage rows and print the line).
+// Home: shared (host shared). Bound by: the qwen35 dense HIP tensor-parallel decode placement (measured trip + measured
+// one-node pass); other pair engines describe their pass as split::Stage rows and call the same entry.
 #include "strix/device/set.hpp"
 #include "strix/pair/gather_link.hpp"
 #include "strix/pair/split_plan.hpp"
@@ -59,11 +65,13 @@ struct Request {
     std::uint32_t rows = 1;         // rows per pass: 1 (plain), R (verify window), prompt window rows (prefill)
     std::uint32_t windows = 1;      // passes in the request (prefill windows); decode: 1
     std::uint32_t a = 0, b = 1;     // the two units a two-unit form uses (line order)
+    std::uint64_t resident_bytes = 0; // bytes one unit must hold to run the whole model alone (single form); 0 = not stated
     double hop_bytes_per_row = 0.0; // layers forms: residual row crossing a cut
     // decode_spec: the drafter (one unit's draft time per window) and the acceptance statistics.
     double draft_ms = 0.0;
     bool draft_reads_hidden = false;
-    overlap::Acceptance acceptance{};
+    overlap::Acceptance acceptance{};   // fresh windows (drafted after the true ids and hidden rows)
+    overlap::Acceptance speculative{};  // windows drafted on the guess; empty = same as fresh (ids-only drafter)
     bool forced = false; Form force = Form::single;   // override: still printed with its prediction
 };
 
@@ -179,13 +187,19 @@ inline std::string make_line(const Plan& p, Regime regime, const device::Set& se
 
     // single: every unit with a known read rate; the best one
     Candidate& one = out.all[static_cast<std::size_t>(Form::single)];
-    std::string missing;
+    std::string missing, no_fit;
     for (const auto& u : set.units) {
+        if (q.resident_bytes > 0U && u.memory_bytes > 0U && u.memory_bytes < q.resident_bytes) {
+            no_fit += (no_fit.empty() ? "" : ", ") + u.id + detail::fmt(" %.1f GB", double(u.memory_bytes) / 1e9);
+            continue;
+        }
         if (u.read_bytes_per_ms <= 0.0) { missing += (missing.empty() ? "" : ", ") + u.id; continue; }
         const double ms = split::single_pass_ms(model, pass, u.read_bytes_per_ms) * double(pass.windows) + draft;
         if (ms < one.ms) { one.ms = one.compute_ms = ms; one.units = {u.rank}; one.admissible = true; }
     }
-    if (!one.admissible) one.reason = "needs nodes." + missing + ".memory_gbytes_ps";
+    if (!one.admissible)
+        one.reason = !missing.empty() ? "needs nodes." + missing + ".memory_gbytes_ps"
+                                      : "does not fit: resident " + detail::fmt("%.1f GB", double(q.resident_bytes) / 1e9) + " > " + no_fit;
     out.single_ms = one.ms;
 
     // two-unit forms share their prerequisites
@@ -208,7 +222,8 @@ inline std::string make_line(const Plan& p, Regime regime, const device::Set& se
         const auto tr = detail::trip_for(*link, device::gap_class(seg_us), decode);
         const auto ri = static_cast<std::size_t>(costs.route);
         if (!tr.known) ten.reason = "needs links." + link->name + " measured trip cost (" + device::gap_class_name(device::gap_class(seg_us)) + ")";
-        else if (decode && !costs.gap_measured[ri]) ten.reason = std::string("needs the measured host gap per join segment of route ") + gather_route_name(costs.route);
+        else if (decode && route_waits_on_host(costs.route) && !costs.gap_measured[ri])
+            ten.reason = std::string("needs the measured host gap per join segment of route ") + gather_route_name(costs.route);
         else {
             const auto e = split::tensor(model, pass, split::Costs{rates, tr.cost, 0.0, costs.allow_fast});
             ten.units = {q.a, q.b};
@@ -216,7 +231,7 @@ inline std::string make_line(const Plan& p, Regime regime, const device::Set& se
             ten.trips = e.trips * pass.windows;
             ten.compute_ms = e.compute_ms + draft;
             ten.link_ms = e.link_ms;
-            ten.gap_ms = double(ten.trips) * costs.segment_gap_us[ri] / 1000.0;
+            ten.gap_ms = route_waits_on_host(costs.route) ? double(ten.trips) * costs.segment_gap_us[ri] / 1000.0 : 0.0;
             ten.ms = ten.compute_ms + ten.link_ms + ten.gap_ms;
             ten.link_bytes = detail::bytes_of(e, tr.cost, pass.windows);
             ten.uncertainty = tr.uncertainty;
@@ -259,6 +274,8 @@ inline std::string make_line(const Plan& p, Regime regime, const device::Set& se
     if (!spec) ovl.reason = "speculative decode only";
     else if (!two_reason.empty()) ovl.reason = two_reason;
     else if (overlap::windows(q.acceptance) == 0U) ovl.reason = "needs the acceptance histogram";
+    else if (q.draft_reads_hidden && overlap::windows(q.speculative) == 0U)
+        ovl.reason = "needs the acceptance of speculative windows (the drafter reads the target hidden)";
     else {
         const auto tr = detail::trip_for(*link, device::GapClass::in_token, true);
         if (!tr.known) ovl.reason = "needs links." + link->name + " measured trip cost";
@@ -273,13 +290,12 @@ inline std::string make_line(const Plan& p, Regime regime, const device::Set& se
             w.draft_ms = q.draft_ms;
             w.rows = pass.rows;
             w.hop_bytes_per_row = q.hop_bytes_per_row;
-            w.draft_reads_hidden = q.draft_reads_hidden;
             overlap::Pair p;
             p.speed1 = rates[0] / rates[1];
             p.link = chain::Link{tr.cost.bytes_per_ms, tr.cost.bytes_per_ms, tr.cost.latency_ms};
             if (w.layer_ms.size() < 2U) ovl.reason = "one layer: nothing to cut";
             else {
-                const auto e = overlap::overlapped(w, p, q.acceptance);
+                const auto e = overlap::overlapped(w, p, q.acceptance, q.speculative);
                 ovl.units = {q.a, q.b};
                 ovl.cut = e.cut;
                 ovl.ms = e.ms;

@@ -107,6 +107,28 @@ void test_same_box_and_unknown() {
     check(throws([&] { (void)resolve_set(bad); }), "a link joining no two nodes is refused");
 }
 
+// Resolved rank rates without a topology file: units by rank, one link per pair with unknown rate; same rates, same digest.
+void test_rank_set() {
+    const std::vector<double> r = {243.0e6, 243.0e6};
+    auto a = strix::device::rank_set(r, strix::device::FactSource::declared, "tp");
+    auto b = strix::device::rank_set(r, strix::device::FactSource::declared, "tp");
+    check(a.units.size() == 2U && a.links.size() == 1U && a.units[1].id == "rank1" && a.units[1].rank == 1U, "rank_set: units by rank");
+    check(a.links[0].name == "tp" && a.links[0].bytes_per_ms == 0.0 && a.links[0].src == strix::device::RateSource::unknown &&
+              !a.links[0].cost_measured[1], "rank_set: link rate unknown, nothing measured");
+    check(a.units[0].read_src == strix::device::FactSource::declared && a.link(0U, 1U) != nullptr, "rank_set: rate source kept");
+    check(strix::device::digest(a) == strix::device::digest(b), "rank_set: same rates, same digest");
+    strix::dist::LinkCost c;
+    c.latency_us = 22.0;
+    strix::device::set_measured(a, 1U, 0U, strix::device::GapClass::in_token, c);
+    check(strix::device::digest(a) != strix::device::digest(b), "rank_set: a measured trip changes the digest");
+    const auto three = strix::device::rank_set({1.0e6, 0.0, 2.0e6}, strix::device::FactSource::declared, "x");
+    check(three.links.size() == 3U && three.links[2].name == "x-12" && three.units[1].read_src == strix::device::FactSource::unknown,
+          "rank_set: every pair linked, a zero rate stays unknown");
+    bool threw = false;
+    try { (void)strix::device::rank_set({-1.0}, strix::device::FactSource::declared, "x"); } catch (const std::invalid_argument&) { threw = true; }
+    check(threw, "rank_set: negative rate refused");
+}
+
 void test_one_node() {
     Topology t;
     t.source = "single";
@@ -121,6 +143,7 @@ int main() {
     test_measured_costs_and_digest();
     test_same_box_and_unknown();
     test_one_node();
+    test_rank_set();
     if (failures != 0) {
         std::fprintf(stderr, "device set tests: %d failure(s)\n", failures);
         return 1;
