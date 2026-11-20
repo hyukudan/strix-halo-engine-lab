@@ -436,7 +436,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_MTP_PRIME_BATCH` | qwen | 64 rows (clamped to 8..128; 8 restores original batches) | [qwen-mtp-prime-rows](optimizations.md#qwen-mtp-prime-rows) |
 | `STRIX_MTP_PRIME_PROJ_ROWS` | qwen | 4 output rows per wave (1: one row per wave) | [qwen-mtp-prime-rows](optimizations.md#qwen-mtp-prime-rows) |
 | `STRIX_MTP_PRIME_ROWS` | qwen | ON (STRIX_MTP_PRIME_ROWS=0: disable) | [qwen-mtp-prime-rows](optimizations.md#qwen-mtp-prime-rows) |
-| `STRIX_QSA_MTP_POOL` | qwen | 1 (eligible native MTP CLI, the singl... | [qwen-qsa-mtp-pool](optimizations.md#qwen-qsa-mtp-pool) |
+| `STRIX_QSA_MTP_POOL` | qwen | 1 (eligible native MTP CLI, HTTP serv... | [qwen-qsa-mtp-pool](optimizations.md#qwen-qsa-mtp-pool) |
 
 ### Exact vs FAST (9)
 
