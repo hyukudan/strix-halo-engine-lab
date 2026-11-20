@@ -4,12 +4,14 @@
 // window width, for v = 1..3, uneven cuts and 1..9 chunks (more than one StagePipes group). Also: a half cut and a
 // missing range hook are refused, and a seam from another model/plan identity stops both ranks.
 #include "strix/pair/layer_pipeline.hpp"
+#include "strix/pair/link_mux.hpp"
 
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -134,8 +136,10 @@ Result reference(const Weights& m, const std::vector<std::uint32_t>& prompt, uns
     return r;
 }
 
+// muxed: both directions of the stage pipes ride ONE link through strix::pair::LinkMux (channel 0 forward, 1 reverse,
+// small pieces so frames are cut); after close() the decode runs on the same raw link.
 std::vector<Result> run_pair(const Weights& m, const std::vector<std::uint32_t>& prompt, unsigned width, unsigned gen,
-                             const StageMap& map, unsigned bad_identity_rank = 2U) {
+                             const StageMap& map, unsigned bad_identity_rank = 2U, bool muxed = false) {
     Channel forward, reverse;
     std::vector<Result> out(2);
     const auto chunks = layers::windows(prompt.size(), width).size();
@@ -148,7 +152,20 @@ std::vector<Result> run_pair(const Weights& m, const std::vector<std::uint32_t>&
             const std::uint64_t identity = rank == bad_identity_rank ? 2U : 1U;
             PipeOptions options;
             options.validate = layers::stage_validator(identity, map, width, row_bytes);
-            StagePipes pipes(rank, map, chunks, forward.end(rank), reverse.end(rank), options);
+            std::unique_ptr<strix::pair::LinkMux> mux;
+            PipeLink fl = forward.end(rank), rl = reverse.end(rank);
+            if (muxed) {
+                const auto raw = forward.end(rank);
+                mux = std::make_unique<strix::pair::LinkMux>(raw.send, raw.receive, [&](const std::string&) { forward.abort(); },
+                                                             2U, std::size_t{24});
+                for (std::uint32_t ch = 0; ch < 2U; ++ch) {
+                    auto& l = ch == 0U ? fl : rl;
+                    l.send = [&mux, ch](std::span<const std::byte> d) { mux->send(ch, d); };
+                    l.receive = [&mux, ch](std::span<std::byte> d) { mux->receive(ch, d); };
+                    l.abort = [&mux] { mux->abort("stage pipe abort"); };
+                }
+            }
+            auto pipes = std::make_unique<StagePipes>(rank, map, chunks, fl, rl, options);
             layers::StageOps ops;
             ops.row_bytes = row_bytes;
             ops.range = [&](std::span<const std::uint32_t> tok, const layers::Window& w, std::uint32_t a, std::uint32_t b, bool head) {
@@ -156,7 +173,9 @@ std::vector<Result> run_pair(const Weights& m, const std::vector<std::uint32_t>&
             ops.seam = [&](PipeFrame& f, bool save, std::size_t bytes) {
                 if (save) std::memcpy(f.payload.data(), t.x.data(), bytes); else std::memcpy(t.x.data(), f.payload.data(), bytes); };
             ops.fence = [] {};
-            (void)layers::prefill(map, rank, prompt, width, identity, pipes, ops);
+            (void)layers::prefill(map, rank, prompt, width, identity, *pipes, ops);
+            pipes.reset();
+            if (mux) mux->close();
             const bool head_rank = map.owner(map.stages() - 1U) == rank;
             if (head_rank) out[rank].logits = t.logits;
             layers::DecodeOps d;
@@ -203,6 +222,12 @@ int main() {
                        std::memcmp(got[1].logits.data(), ref.logits.data(), ref.logits.size() * sizeof(float)) == 0,
                    tag + ": head logits bitwise == single rank");
             expect(got[0].ids == ref.ids && got[1].ids == ref.ids, tag + ": greedy ids == single rank on both ranks");
+            const auto mux = run_pair(m, prompt, c.width, gen, map, 2U, true);
+            expect(mux[0].error.empty() && mux[1].error.empty(), tag + " muxed: ran (" + mux[0].error + " | " + mux[1].error + ")");
+            expect(mux[1].logits.size() == ref.logits.size() &&
+                       std::memcmp(mux[1].logits.data(), ref.logits.data(), ref.logits.size() * sizeof(float)) == 0 &&
+                       mux[0].ids == ref.ids && mux[1].ids == ref.ids,
+                   tag + " muxed: one link carries both directions, logits bitwise and ids == single rank");
         }
     }
     {   // a seam from another identity stops both ranks (no hang)
@@ -221,6 +246,6 @@ int main() {
         try { layers::check_stage_map(StageMap::parse("0,6,12", L), 0U, false); } catch (const std::invalid_argument&) { threw = true; }
         expect(threw, "missing range hook refused");
     }
-    if (failures == 0) std::printf("PASS pair layer stages (4 maps x 5 prompt/width cases + identity + refusals)\n");
+    if (failures == 0) std::printf("PASS pair layer stages (4 maps x 5 prompt/width cases, separate and muxed links + identity + refusals)\n");
     return failures == 0 ? 0 : 1;
 }
