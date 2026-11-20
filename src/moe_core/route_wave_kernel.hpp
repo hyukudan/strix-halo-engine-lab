@@ -93,11 +93,14 @@ __device__ __forceinline__ float combine_bf16(float x) {
 
 // w: [rows][TopK] (bf16_steps: may be null = unit weights); eo: [rows][TopK][Width]; shared (base): [rows][Width]
 // (fma_f32: required; bf16_steps: may be null); y: [rows][Width]. Grid: (ceil(Width / 256), rows) x 256 threads.
-template <moe::CombineForm Form, unsigned TopK, unsigned Width>
-__global__ void combine_kernel(const float* w, const float* eo, const float* shared, float* y) {
+// RoundEo: each eo operand is read as its bfloat16 rounding (combine_bf16 == ds41::round_to_bf16 bits), i.e. the
+// value a separate glu::epilogue<bf16> launch over eo would have stored: that launch folds into the combine.
+template <moe::CombineForm Form, unsigned TopK, unsigned Width, bool RoundEo>
+__device__ __forceinline__ void combine_body(const float* w, const float* eo, const float* shared, float* y) {
     const unsigned r = blockIdx.y, d = blockIdx.x * 256 + threadIdx.x;
     if (d >= Width) return;
     if constexpr (Form == moe::CombineForm::fma_f32) {
+        static_assert(!RoundEo, "moe combine: RoundEo is bound for bf16_steps only");
         float acc = 0.0F;
         for (unsigned k = 0; k < TopK; ++k)
             acc = __builtin_fmaf(w[static_cast<std::size_t>(r) * TopK + k], eo[(static_cast<std::size_t>(r) * TopK + k) * Width + d], acc);
@@ -105,13 +108,22 @@ __global__ void combine_kernel(const float* w, const float* eo, const float* sha
     } else {
         float acc = 0.0F;
         for (unsigned k = 0; k < TopK; ++k) {
-            const float e = eo[(static_cast<std::size_t>(r) * TopK + k) * Width + d];
+            const float raw = eo[(static_cast<std::size_t>(r) * TopK + k) * Width + d];
+            const float e = RoundEo ? combine_bf16(raw) : raw;
             const float term = w == nullptr ? e : combine_bf16(e * w[static_cast<std::size_t>(r) * TopK + k]);
             acc = combine_bf16(acc + term);
         }
         const std::size_t at = static_cast<std::size_t>(r) * Width + d;
         y[at] = shared == nullptr ? acc : combine_bf16(acc + shared[at]);
     }
+}
+template <moe::CombineForm Form, unsigned TopK, unsigned Width>
+__global__ void combine_kernel(const float* w, const float* eo, const float* shared, float* y) {
+    combine_body<Form, TopK, Width, false>(w, eo, shared, y);
+}
+template <moe::CombineForm Form, unsigned TopK, unsigned Width>
+__global__ void combine_rounded_eo_kernel(const float* w, const float* eo, const float* shared, float* y) {
+    combine_body<Form, TopK, Width, true>(w, eo, shared, y);
 }
 
 // Host entries (instantiate in the binding TU; the policy / form / shape are template arguments).
@@ -125,6 +137,15 @@ void enqueue_combine(const float* w, const float* eo, const float* shared, float
     if (Form == moe::CombineForm::fma_f32 && (w == nullptr || shared == nullptr)) throw std::invalid_argument("moe combine: fma_f32 needs w and shared");
     if (rows == 0U) return;
     hipLaunchKernelGGL((combine_kernel<Form, TopK, Width>), dim3((Width + 255U) / 256U, rows), dim3(256), 0, stream, w, eo, shared, y);
+}
+// The same combine with every eo operand rounded to bfloat16 on read (combine_rounded_eo_kernel): bitwise the
+// pair glu::launch_epilogue<bf16>(eo) + enqueue_combine, one launch fewer.
+template <moe::CombineForm Form, unsigned TopK, unsigned Width>
+void enqueue_combine_rounded_eo(const float* w, const float* eo, const float* shared, float* y, unsigned rows, hipStream_t stream) {
+    static_assert(Form == moe::CombineForm::bf16_steps, "moe combine: RoundEo is bound for bf16_steps only");
+    if (rows == 0U) return;
+    hipLaunchKernelGGL((combine_rounded_eo_kernel<Form, TopK, Width>), dim3((Width + 255U) / 256U, rows), dim3(256), 0, stream, w, eo,
+                       shared, y);
 }
 
 }  // namespace strix::moe_core
