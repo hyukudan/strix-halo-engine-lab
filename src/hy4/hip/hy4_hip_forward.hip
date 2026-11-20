@@ -987,9 +987,11 @@ struct Forward::Impl {
         check(hipGetLastError(), "flash rows launch");
         const auto& vb = t(blk(l, "attn_v_b.weight"));
         if (vb.type != 8U || vb.bytes != row_bytes(8U, kl) * vd * H) throw std::runtime_error("hy4 hip forward: attn_v_b is not Q8_0");
-        q8a8_rows(vb.p, kl, vd, R, pr.olat, H * kl, pr.o, H * vd, H, kl, vd);
+        // pf_store_epilogue: each head's product rounds its vd columns in the GEMM's store (batched form, no bias); the H
+        // products cover the R x H*vd rows once, so this is the separate pass's function on the same FP32 sums: same bits.
+        q8a8_rows(vb.p, kl, vd, R, pr.olat, H * kl, pr.o, H * vd, H, kl, vd, pf_store_epilogue);
         const std::size_t n = std::size_t{R} * H * vd;
-        glu::launch_epilogue<glu::Round::bf16>(pr.o, nullptr, n, n, pr.o, s);
+        if (!pf_store_epilogue) glu::launch_epilogue<glu::Round::bf16>(pr.o, nullptr, n, n, pr.o, s);
         glu::launch_sigmoid_gate<glu::DeclaredExp, glu::Round::bf16>(pr.o, pr.gate, n, pr.o, s);
         linear_rows(blk(l, "attn_output.weight"), pr.o, H * vd, c.hidden, R, pr.f);
         norm_rows(pr.f, t(blk(l, "post_attention_norm.weight")).f(), c.hidden, R, pr.f);
