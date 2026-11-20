@@ -24,6 +24,12 @@
 
 namespace strix::hy4::hipbind {
 
+// Head of the next-token block's drafts (want_top). full: the pack's BF16 output.weight through the shared device greedy
+// (the verify's own head). q8 / q4: the shared MTP draft head (strix/hip_mtp_draft_head.hpp) over a draft-only Q8_0 (Q4_0)
+// copy of every output.weight row, built at first use (ggml Q8_0 rule; 394 / 209 MB): FAST-class draft logits, the verify
+// head is unchanged, so emitted ids are not affected; only drafts can differ.
+enum class NextnHead : std::uint8_t { full, q8, q4 };
+
 struct ForwardOptions {
     std::vector<std::filesystem::path> parts;  // the pack's GGUF parts (all of them; the Engram table is read by row)
     std::uint32_t depth = 0;                   // 0: the pack's depth; else Config::truncated(depth)
@@ -32,6 +38,7 @@ struct ForwardOptions {
     std::uint32_t prompt_rows = 0;             // batched prompt window (rows per launch, multiple of 8, >= 16); 0 = none
     std::uint32_t verify_rows = 0;             // rows of a verify pass (forward_rows, 1..8); rings sized for them; 0 = none
     bool nextn = false;                        // also load the pack's next-token (MTP) block: nextn_rows() (whole-model rank)
+    NextnHead nextn_head = NextnHead::full;    // the drafts' head (want_top of nextn_rows)
 };
 
 struct LoadReport {
@@ -129,13 +136,16 @@ public:
     static constexpr std::uint32_t kNextnRows = 32;  // widest nextn_rows call
     [[nodiscard]] bool has_nextn() const noexcept;
     void set_nextn_row_loop(bool on) noexcept;
+    // The drafts' head from the next nextn_rows call on (the device check compares the forms on the same rows).
+    void set_nextn_head(NextnHead head);
     // outputs = trailing rows whose top / hidden the caller reads (default all). Rows [0, rows - outputs) only write the
     // block's caches (bitwise the full form's: the latent row and the indexer keys depend only on the row's input); their
     // pre / post rows are unspecified and their top is 0. want_top needs outputs >= 1. The row loop computes every row.
     static constexpr std::uint32_t kAllRows = ~0U;
     NextnOut nextn_rows(const std::uint32_t* tokens, const float* hidden, std::uint32_t rows, std::uint32_t pos0, bool want_top,
                         std::uint32_t outputs = kAllRows);
-    // Logits of the last nextn_rows row (host copy; want_top must have been set): the device-vs-oracle check.
+    // Logits of the last nextn_rows row (host copy; want_top must have been set): the device-vs-oracle check. Always the
+    // full BF16 head's logits (recomputed from the row when the drafts use a q8 / q4 head).
     [[nodiscard]] const std::vector<float>& nextn_logits();
     // prefill() reports every prompt row's output_norm(hidden) (device rows, valid during the call) with its first position:
     // the MTP teacher input of the prompt. Empty function = off (the default; no extra work).

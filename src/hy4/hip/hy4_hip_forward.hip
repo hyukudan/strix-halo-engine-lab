@@ -32,6 +32,7 @@
 #include "strix/hip_generation_output.hpp"
 #include "strix/hip_ggml_weight_formats.hpp"
 #include "strix/hip_lm_head_launcher.hpp"
+#include "strix/hip_mtp_draft_head.hpp"
 #include "../../hip_q8_rows_sites.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/hip_moe_a8_down.hpp"
@@ -296,6 +297,10 @@ struct Forward::Impl {
                                     // async uploads (position, dense list length) read their own slot
         std::vector<float> logits;                 // host copy of the last want_top row (nextn_logits)
         bool logits_ready = false;
+        bool logits_full = false;                  // logits_d holds the last want_top row's full-head logits
+        const float* last_post = nullptr;          // device row of the last want_top call (nextn_logits recompute)
+        NextnHead head = NextnHead::full;
+        std::unique_ptr<strix::HipMtpDraftHead> q8, q4;  // shared draft heads (built at first use)
         float* ph = nullptr;                       // [rmax][hidden] prompt rows: output_norm(hc_head collapse)
         float* pu = nullptr;                       // [rmax][hidden] collapse
         hcc::MixRow<kHead>* mixh = nullptr;        // [rmax]
@@ -1420,6 +1425,7 @@ struct Forward::Impl {
         const std::uint32_t saved_p0 = vr.p0;  // the rows form binds the verify workspace (committed: vr.rows == 0)
         const bool rows_form = !nx.row_loop && nx.words != nullptr && vr.rows == 0U && R >= 2U;
         nx.logits_ready = false;
+        nx.logits_full = false;
         std::uint32_t bad = 0;
         try {
             if (rows_form) {  // KV-only rows [0, R - outputs), then the output rows: each range in chunks of vr.max
@@ -1454,11 +1460,19 @@ struct Forward::Impl {
                 norm(nx.x, t(blk(L, "nextn.shared_head_norm.weight")).f(), c.hidden, c.rms_eps, nx.post + r * h);
                 nx.top[r] = 0U;
             }
-            if (want_top) {  // the shared head and device greedy row on the last row
-                linear("output.weight", nx.post + (R - 1U) * h, c.hidden, c.vocab, logits_d, false);
-                const strix::ExecutionBufferAddress lg{{}, reinterpret_cast<std::uintptr_t>(logits_d), std::uint64_t{c.vocab} * 4U, 0U};
-                const strix::ExecutionBufferAddress pa{{}, reinterpret_cast<std::uintptr_t>(greedy_partials), greedy_bytes, 0U};
-                strix::enqueue_hip_greedy_rows(std::span<const strix::ExecutionBufferAddress>(&lg, 1U), c.vocab, pa, greedy_reply, s);
+            if (want_top) {  // the drafts' head on the last row: the BF16 head + device greedy, or the shared draft head
+                nx.last_post = nx.post + (R - 1U) * h;
+                if (nx.head == NextnHead::full) {
+                    linear("output.weight", nx.last_post, c.hidden, c.vocab, logits_d, false);
+                    const strix::ExecutionBufferAddress lg{{}, reinterpret_cast<std::uintptr_t>(logits_d), std::uint64_t{c.vocab} * 4U, 0U};
+                    const strix::ExecutionBufferAddress pa{{}, reinterpret_cast<std::uintptr_t>(greedy_partials), greedy_bytes, 0U};
+                    strix::enqueue_hip_greedy_rows(std::span<const strix::ExecutionBufferAddress>(&lg, 1U), c.vocab, pa, greedy_reply, s);
+                    nx.logits_full = true;
+                } else {
+                    auto& dh = draft_head();
+                    dh.begin_chain();
+                    dh.launch(nx.last_post, 0U, s);
+                }
             }
             check(hipMemcpyAsync(&bad, flag, 4, hipMemcpyDeviceToHost, s), "flag read");
             check(hipStreamSynchronize(s), "next-token sync");
@@ -1473,8 +1487,12 @@ struct Forward::Impl {
         vr.p0 = saved_p0;
         if (bad) throw std::runtime_error("hy4 hip forward: non-finite value in a cache / operand row (next-token block)");
         if (want_top) {
-            if (greedy_reply->status != 0U) throw std::runtime_error("hy4 hip forward: non-finite logit (next-token greedy status)");
-            nx.top[R - 1U] = greedy_reply->token;
+            if (nx.head == NextnHead::full) {
+                if (greedy_reply->status != 0U) throw std::runtime_error("hy4 hip forward: non-finite logit (next-token greedy status)");
+                nx.top[R - 1U] = greedy_reply->token;
+            } else {
+                nx.top[R - 1U] = draft_head().read(1U)[0];  // throws on a non-finite selected row
+            }
             nx.logits_ready = true;
         }
         return {nx.top, nx.pre, nx.post};
@@ -1482,10 +1500,35 @@ struct Forward::Impl {
 
     const std::vector<float>& nextn_logits() {
         if (!nx.logits_ready) throw std::logic_error("hy4 hip forward: nextn_logits without a want_top next-token call");
+        if (!nx.logits_full) {  // the drafts used a q8 / q4 head: the full head's logits of the same row
+            linear("output.weight", nx.last_post, c.hidden, c.vocab, logits_d, false);
+            nx.logits_full = true;
+        }
         nx.logits.resize(c.vocab);
         check(hipMemcpyAsync(nx.logits.data(), logits_d, nx.logits.size() * 4U, hipMemcpyDeviceToHost, s), "next-token logits read");
         check(hipStreamSynchronize(s), "next-token logits sync");
         return nx.logits;
+    }
+
+    // The shared MTP draft head over a Q8_0 (Q4_0) copy of every output.weight row (BF16 source), built at first use.
+    strix::HipMtpDraftHead& draft_head() {
+        auto& slot = nx.head == NextnHead::q4 ? nx.q4 : nx.q8;
+        if (!slot) {
+            const auto& head = t("output.weight");
+            if (head.type != kTypeBf16 || head.dims.size() != 2U || head.dims[0] != c.hidden || head.dims[1] != c.vocab)
+                throw std::runtime_error("hy4 hip forward: the q8 / q4 draft head gathers a BF16 output.weight [vocab][hidden]");
+            strix::HipMtpDraftHeadConfig cfg;
+            cfg.hidden_size = c.hidden;
+            cfg.vocab_size = c.vocab;
+            cfg.max_depth = 1U;  // one selection per call (begin_chain per call)
+            cfg.full = false;
+            cfg.source = strix::HipMtpDraftHeadSource::bf16;
+            cfg.q4 = nx.head == NextnHead::q4;
+            cfg.base_tokens.resize(c.vocab);
+            for (std::uint32_t i = 0; i < c.vocab; ++i) cfg.base_tokens[i] = i;  // every row: ids identity
+            slot = std::make_unique<strix::HipMtpDraftHead>(head.p, std::move(cfg), static_cast<void*>(s));
+        }
+        return *slot;
     }
 
     // prefill(): the sink receives every prompt row's output_norm(hc_head collapse) (the MTP teacher input)
@@ -1521,6 +1564,7 @@ Forward::Forward(const ForwardOptions& o) : impl_(std::make_unique<Impl>()) {
     if (o.verify_rows > rows::kMaxVerifyRows) throw std::invalid_argument("hy4 hip forward: verify rows outside 0..8");
     impl_->vr.max = o.verify_rows;
     impl_->nx.on = o.nextn;  // before load(): wanted() admits the next-token block
+    impl_->nx.head = o.nextn_head;
     if (o.nextn && (impl_->first != 0U || impl_->last != impl_->c.layers || impl_->c.nextn != 1U))
         throw std::invalid_argument("hy4 hip forward: the next-token block needs a whole-model rank of a pack that carries it");
     check(hipStreamCreateWithFlags(&impl_->s, hipStreamNonBlocking), "stream");
@@ -1539,6 +1583,8 @@ const std::vector<float>& Forward::prefill(const std::vector<std::uint32_t>& pro
 Forward::~Forward() {
     if (impl_ && impl_->s) {
         (void)hipStreamSynchronize(impl_->s);
+        impl_->nx.q8.reset();  // the draft heads synchronise their stream (s) on destruction
+        impl_->nx.q4.reset();
         (void)hipStreamDestroy(impl_->s);
     }
     if (impl_ && impl_->greedy_reply) (void)hipHostFree(impl_->greedy_reply);
@@ -1551,6 +1597,7 @@ Forward::~Forward() {
 const float* Forward::rows_hidden() const noexcept { return impl_->vr.xn; }
 bool Forward::has_nextn() const noexcept { return impl_->nx.on; }
 void Forward::set_nextn_row_loop(bool on) noexcept { impl_->nx.row_loop = on; }
+void Forward::set_nextn_head(NextnHead head) { impl_->nx.head = head; }
 Forward::NextnOut Forward::nextn_rows(const std::uint32_t* tokens, const float* hidden, std::uint32_t rows, std::uint32_t pos0, bool want_top,
                                       std::uint32_t outputs) {
     return impl_->nextn_rows(tokens, hidden, rows, pos0, want_top, outputs);
