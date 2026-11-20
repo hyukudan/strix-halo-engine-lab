@@ -44,7 +44,7 @@ identity names every applied lever.
 | `--prefill-gdn chunk16` | same regime (gated together with FAST4) | `--prefill-gdn serial` |
 | `--prefill-gdn chunk16tc` | never (opt-in; FAST `gdn-chunk16-tf32-v1`, identity `-gdnc16t`, quality gate pending) | `--prefill-gdn chunk16` |
 | `--prefill-hid bf16` | never (opt-in with `--prefill-arith fast4`; FAST `nvfp4-tile-h16-v1`, identity `-h16`, quality gate pending) | `--prefill-hid f32` |
-| `--prefill-attn8 on` | same regime, prompt of at least 32,768 tokens (32K gate passed; no 8K gate) | `--prefill-attn8 off` |
+| `--prefill-attn8 on` | same regime, prompt of at least 8,192 tokens (8K and 32K gates passed) | `--prefill-attn8 off` |
 | `--split-k fast` | spec CLI (decode windows), `--turbo-weights onfly\|converted`: FAST `nvfp4-splitk-fast-v1` (gate passed; spec verify 0.6-0.7 % faster). Decode CLI: pending (its `fast` already applies FAST4; that combination has no gate yet) | `--split-k exact` |
 | `--decode-attn8 on` | pending on both CLIs (no qualified regime yet: gate at 8K / 28K / 64K not run). Decode / verify attention on e4m3 tensor cores over the e4m3 K/V shadow, identity `-d8`; verify rows give the same bits as one-row decode; on the spec CLI it also covers the prefill windows. Explicit `--decode-attn8 on` runs it in any regime | `--decode-attn8 off` |
 
@@ -395,6 +395,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_GLM_R1B_DENSE` | glm | 7 | [glm-r1b-dense-auto](optimizations.md#glm-r1b-dense-auto) |
 | `STRIX_GLM_R1B_HC` | glm | 4 | [glm-r1b-hc-v4](optimizations.md#glm-r1b-hc-v4) |
 | `STRIX_GLM_SPEC_KDA_TREE` | glm | on (Xfer verify exchange, KDA tree 2,... | [glm-mtp-spec](optimizations.md#glm-mtp-spec) |
+| `STRIX_HY4_ROWS_EXPERT_UNION` | hy4 | on | [hy4-rows-expert-union](optimizations.md#hy4-rows-expert-union) |
 | `STRIX_MM_ATTEND4_DECODE` | minimax | 1 | [mm-attend4-decode](optimizations.md#mm-attend4-decode) |
 | `STRIX_MM_DRAFT_LIN` | minimax | opt | [mm-draft-lin](optimizations.md#mm-draft-lin) |
 | `STRIX_MM_DSPARK_ATTN` | minimax | 2 | [mm-dspark-attn](optimizations.md#mm-dspark-attn) |

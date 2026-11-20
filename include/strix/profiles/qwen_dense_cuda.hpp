@@ -57,7 +57,8 @@ inline constexpr Lever table[] = {
     {.name = "prefill_attn8", .env = "", .option = "--prefill-attn8", .value = {"", "on", "", ""}, .builtin = "off",
      .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
      .target = "on (e4m3 flash over an e4m3 KV shadow, identity -a8)", .off = "off",
-     .source = "with fast4+chunk16: 32K 2/2 windows PASS KL 0.00589 top-1 0.9746-0.9805, warm 12,354 vs 10,946 tok/s; no 8K gate"},
+     .source = "with fast4+chunk16: 8K 2/2 windows PASS KL 0.01498 top-1 0.9688 per window, warm 14,361 tok/s (600 W); 32K 2/2 windows PASS KL 0.00589 top-1 "
+                      "0.9746-0.9805, warm 12,354 vs 10,946 tok/s"},
     {.name = "split_k", .env = "", .option = "--split-k", .value = {"", "fast", "", ""}, .builtin = "exact",
      .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
      .target = "fast (nvfp4-splitk-fast-v1, identity -skf1)", .off = "exact",
@@ -87,8 +88,8 @@ inline constexpr Qualified qualified[] = {
     {"prefill_arith", Weights::nvfp4_rtn, Route::large_prefill, 0,
      "52dd7d1f0: FAST4 + chunk16 gate 8K / 32K PASS (converted NVFP4 pack); 8K 13,437-13,714 tok/s"},
     {"prefill_gdn", Weights::nvfp4_rtn, Route::large_prefill, 0, "52dd7d1f0: gated with fast4 (same windows)"},
-    {"prefill_attn8", Weights::nvfp4_rtn, Route::large_prefill, 32768,
-     "with fast4 + chunk16: 32K gate 2/2 windows PASS (KL 0.00589); 8K gate not run"},
+    {"prefill_attn8", Weights::nvfp4_rtn, Route::large_prefill, 8192,
+     "with fast4 + chunk16: 8K gate 2/2 windows PASS (KL 0.01498); 32K gate 2/2 windows PASS (KL 0.00589)"},
     // nvfp4-splitk-fast-v1 on the spec CLI (converted NVFP4 pack, RTX PRO 6000 at 600 W, greedy, sub15d): quality gate
     // EXACT -> FAST 4 windows x 512 rows pooled KL 0.00000 (q99 9.5e-06), top-1 0.9990, dNLL -0.00000; spec ids == FAST
     // serial x1200 on code / think / en / ja; two strict A/B pairs (exact, fast, exact, fast; 3 runs each): verify

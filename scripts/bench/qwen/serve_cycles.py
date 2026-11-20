@@ -8,7 +8,8 @@ joint cycles whose lane count equals the burst's concurrency (the decode window)
 and per lane, cycle ms (draft + target), window tok/s (emitted / cycle ms), the host gap between consecutive cycles
 (wall-clock step minus cycle ms: admission, streaming and per-lane host work outside the cycle), the owner topologies
 (#R2/#R4/#R8 counts, with each one's mean target ms and emissions), and from the result JSON the steady and
-end-to-end tok/s and the ordered per-request id hashes. --pairs A,B names two arm prefixes: bursts NAME=A<k> and
+end-to-end tok/s and the ordered per-request id hashes, and the wide copy passes abandoned inside the burst with
+the rows accepted before each rejected one (STRIX_CYCLE_LOG=1 "wide abandon ... accepted=K" lines). --pairs A,B names two arm prefixes: bursts NAME=A<k> and
 B<k> of one concurrency are compared (ids per request, window tok/s, wall tok/s). Only the standard library.
 
 The result burst is the one whose live lanes equal the C of NAME (c<C>-...): use min(concurrency, slots), or
@@ -42,6 +43,14 @@ def cycles(lines):
         out.append(dict(wall=int(m.group(1)), lanes=int(m.group(2)), probe=int(m.group(3)), members=members,
                         draft=float(m.group(5)), target=float(m.group(6))))
     return out
+
+
+ABANDON = re.compile(r"(?:^|\s)wide abandon at=\d+ rows=(\d+) accepted=(\d+)")
+
+
+def abandons(lines):
+    """Rows accepted before the rejected row of each abandoned wide copy pass, in log order."""
+    return [int(m.group(2)) for m in map(ABANDON.search, lines) if m]
 
 
 def topo(members):
@@ -170,6 +179,7 @@ def main():
         lanes = int(re.search(r"c(\d+)", name).group(1))
         try:
             row = burst_row(name, cycles(lines[first - 1:last]), res, lanes, index)
+            row["abandons"] = abandons(lines[first - 1:last])
         except (ValueError, KeyError, TypeError) as e:
             raise SystemExit("%s: %s: %s" % (name, path, e))
         row["evicted_ms"] = int(parts[4]) if len(parts) > 4 and parts[4] else None
@@ -177,14 +187,17 @@ def main():
         row["busy_pct"] = float(parts[6]) if len(parts) > 6 and parts[6] else None
         rows.append(row)
     print("| burst | cycles@C | probes | emit/cycle | emit/lane | cycle ms | draft ms | target ms | rows/cycle | gap ms | "
-          "window tok/s | steady tok/s | wall tok/s | TTFT p50 s | evicted ms | MHz | busy % | top topologies (n, target ms, emit) |")
+          "window tok/s | steady tok/s | wall tok/s | TTFT p50 s | evicted ms | MHz | busy % | wide abandons (accepted) | "
+          "top topologies (n, target ms, emit) |")
     for r in rows:
         tops = "; ".join("%s:%d,%.1f,%.1f" % (k, *v) for k, v in list(r.get("topologies", {}).items())[:3])
-        print("| %s | %d | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+        ab = r["abandons"]
+        print("| %s | %d | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
             r["name"], r["cycles"], r.get("probes", "n/a"), fmt(r.get("emit_per_cycle"), 2), fmt(r.get("emit_per_lane"), 2),
             fmt(r.get("cycle_ms")), fmt(r.get("draft_ms")), fmt(r.get("target_ms")), fmt(r.get("rows_per_cycle")),
             fmt(r.get("gap_ms"), 2), fmt(r.get("window_tok_s")), fmt(r.get("steady_tok_s")), fmt(r.get("e2e_tok_s")),
-            fmt(r.get("ttft_p50_s"), 2), r["evicted_ms"], fmt(r["clock_mhz"], 0), fmt(r["busy_pct"], 0), tops))
+            fmt(r.get("ttft_p50_s"), 2), r["evicted_ms"], fmt(r["clock_mhz"], 0), fmt(r["busy_pct"], 0),
+            "%d (%s)" % (len(ab), " ".join(map(str, ab))) if ab else "0", tops))
     ok = True
     if args.pairs:
         a, b = args.pairs.split(",")
