@@ -20,7 +20,8 @@ struct GroupedF16Issue {
     }
     // The K loop: two register stages (or one with OneStage), LDS-only barriers. fetch(step, regs) issues the global
     // loads of a step, stage(step, regs, buffer) converts and writes the LDS tiles, step_fn(buffer) consumes them.
-    template<bool OneStage,class Regs,class Fetch,class Stage,class Step>
+    // Regs1 (two stages only): the odd steps' register stage type when it differs from the even steps' (default: the same).
+    template<bool OneStage,class Regs,class Regs1=Regs,class Fetch,class Stage,class Step>
     static __device__ __forceinline__ void pipeline(unsigned steps,const Fetch& fetch,const Stage& stage,const Step& step_fn) {
         if constexpr(OneStage) {
             Regs r;
@@ -33,7 +34,7 @@ struct GroupedF16Issue {
                 step_fn(0U);
             }
         } else {
-            Regs r0,r1;
+            Regs r0;Regs1 r1;
             fetch(0U,r0);fetch(1U,r1); // steps is even
 #pragma unroll 1
             for(unsigned step=0;step<steps;step+=2U) {

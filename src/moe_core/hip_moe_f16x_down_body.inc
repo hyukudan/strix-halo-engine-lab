@@ -45,13 +45,21 @@
     const unsigned b_expert=(Tune&16384U)?0U:expert; // probe 16384 (hot B): expert 0's weights
 #ifdef STRIX_F16X_DOWN_KQ
     const auto* b_src=weights+(static_cast<unsigned long long>(b_expert)*hidden+tile*Columns+b_col)*(width/256U)*KQ::block_bytes;
-    struct Regs { uint4 a[AParts][4]{}; typename KQ::Raw b[BBlocks]; };
+    struct Regs { uint4 a[AParts][4]{}; typename F16xKQuantRegs<KQ,BBlocks>::type b; };
+    // Pair traits (KQ::pair): the even step's register stage (Regs) holds the B bytes of the step pair and the odd one
+    // (Regs1) only A; the odd step's FP16 B words wait in `held` from the even stage to the odd one.
+    struct RegsA { uint4 a[AParts][4]{}; };
+    using Regs1=std::conditional_t<KQ::pair,RegsA,Regs>;
+    static_assert(!KQ::pair||(Tune&1U)==0U,"K-quant pair reads need the two register stages");
+    [[maybe_unused]] uint4 held[BBlocks][4];
+#define STRIX_F16X_DOWN_REGS auto
 #else
+#define STRIX_F16X_DOWN_REGS Regs
     const auto* b_src=weights+(static_cast<unsigned long long>(b_expert)*hidden+tile*Columns+b_col)*groups*block_bytes;
     struct Regs { uint4 a[AParts][4]{}; DownBlock<Q51> b[BBlocks]; };
 #endif
     struct Cvt { uint4 a[AParts][2],b[BBlocks][4]; };
-    const auto fetch=[&](unsigned step,Regs& r) {
+    const auto fetch=[&](unsigned step,STRIX_F16X_DOWN_REGS& r) {
         if constexpr((Tune&1024U)!=0U)return;
         if constexpr((Tune&2048U)==0U)
 #pragma unroll
@@ -64,22 +72,38 @@
             for(unsigned q=0;q<4U;++q)r.a[j][q]=f16_load(a_src[j]+64U*step+4U*q);
         }
 #ifdef STRIX_F16X_DOWN_KQ
-        if constexpr((Tune&4096U)==0U)
+        if constexpr((Tune&4096U)==0U) {
+            if constexpr(KQ::pair) {
+                if constexpr(std::is_same_v<std::remove_cvref_t<decltype(r)>,Regs>)
+                    r.b=KQ::template load_pair<BBlocks>(b_src,step,BBlocks*b_part);
+            } else
 #pragma unroll
-        for(unsigned k=0;k<BBlocks;++k)r.b[k]=KQ::load(b_src,step,BBlocks*b_part+k);
+            for(unsigned k=0;k<BBlocks;++k)r.b[k]=KQ::load(b_src,step,BBlocks*b_part+k);
+        }
 #else
         if constexpr((Tune&4096U)==0U)
 #pragma unroll
         for(unsigned k=0;k<BBlocks;++k)r.b[k]=down_block<Q51>(b_src,2U*step+BBlocks*b_part+k);
 #endif
     };
-    const auto convert=[&](unsigned step,const Regs& r,Cvt& cv) {
+    const auto convert=[&](unsigned step,const STRIX_F16X_DOWN_REGS& r,Cvt& cv) {
 #pragma unroll
         for(unsigned j=0;j<AParts;++j) {
             cv.a[j][0]=f16_from_f32(r.a[j][0],r.a[j][1],a_scale[j]);
             cv.a[j][1]=f16_from_f32(r.a[j][2],r.a[j][3],a_scale[j]);
             if constexpr(Core!=0U)if(!a_live[j]){cv.a[j][0]=uint4{0U,0U,0U,0U};cv.a[j][1]=uint4{0U,0U,0U,0U};}
         }
+#ifdef STRIX_F16X_DOWN_KQ
+        if constexpr(KQ::pair) {  // even stage: both steps' words (the odd ones to held); odd stage: the held words
+            if constexpr(std::is_same_v<std::remove_cvref_t<decltype(r)>,Regs>)
+                KQ::template decode_pair<Tune,BBlocks>(r.b,BBlocks*b_part,cv.b,held);
+            else
+#pragma unroll
+            for(unsigned k=0;k<BBlocks;++k)
+#pragma unroll
+                for(unsigned q=0;q<4U;++q)cv.b[k][q]=held[k][q];
+        } else
+#endif
 #pragma unroll
         for(unsigned k=0;k<BBlocks;++k) {
             const unsigned half=BBlocks*b_part+k;
@@ -117,14 +141,20 @@
 #pragma unroll
             for(unsigned q=0;q<4U;++q)*st.b16(b_col,8U*(4U*(BBlocks*b_part+k)+q))=cv.b[k][q];
     };
-    const auto stage=[&](unsigned step,const Regs& r,unsigned buf) {
+    const auto stage=[&](unsigned step,const STRIX_F16X_DOWN_REGS& r,unsigned buf) {
         Stage& st=sb[buf];
         if constexpr((Tune&512U)!=0U) {
 #pragma unroll
             for(unsigned j=0;j<AParts;++j){*st.a16(a_row[j],16U*a_part[j])=r.a[j][0];*st.a16(a_row[j],16U*a_part[j]+8U)=r.a[j][2];}
 #pragma unroll
             for(unsigned k=0;k<BBlocks;++k)for(unsigned q=0;q<4U;++q) {
+#ifdef STRIX_F16X_DOWN_KQ
+                uint4 w{};  // probe: raw B bytes staged (pair traits: the even stage's first bytes, the odd stage zeros)
+                if constexpr(!KQ::pair)__builtin_memcpy(&w,&r.b[k],sizeof(w)<sizeof(r.b[k])?sizeof(w):sizeof(r.b[k]));
+                else if constexpr(std::is_same_v<std::remove_cvref_t<decltype(r)>,Regs>)__builtin_memcpy(&w,&r.b,sizeof(w));
+#else
                 uint4 w;__builtin_memcpy(&w,&r.b[k],sizeof(w)<sizeof(r.b[k])?sizeof(w):sizeof(r.b[k]));
+#endif
                 *st.b16(b_col,8U*(4U*(BBlocks*b_part+k)+q))=w;
             }
             return;
@@ -142,7 +172,12 @@
         f16_pipeline_d<prefill_core2_depth(Core),Regs>(steps,fetch,stage,[&](unsigned){f16_step_rows_s<Core>(sb[0],rbase,smb,cols,i,acc);});
     } else if constexpr(Core!=0U)
         f16_by_mb(mb,[&]<unsigned MB>(){f16_pipeline_d<prefill_core2_depth(Core),Regs>(steps,fetch,stage,[&](unsigned){f16_step_rows_u<MB,Core>(sb[0],rbase,cols,i,acc);});});
+#ifdef STRIX_F16X_DOWN_KQ
+    else f16_pipeline<Tune,Regs,Regs1>(steps,fetch,stage,[&](unsigned){if constexpr((Tune&256U)==0U)f16_step_rows(sb[0],rbase,mb,cols,i,acc);});
+#else
     else f16_pipeline<Tune,Regs>(steps,fetch,stage,[&](unsigned){if constexpr((Tune&256U)==0U)f16_step_rows(sb[0],rbase,mb,cols,i,acc);});
+#endif
+#undef STRIX_F16X_DOWN_REGS
 #pragma unroll
     for(unsigned mi=0;mi<4U;++mi)if(mi<mb)
 #pragma unroll
