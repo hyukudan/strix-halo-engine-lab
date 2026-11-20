@@ -15,6 +15,7 @@
 // prefix + correction and rolls back the rejected rows' state. The layer only reads emitted tokens, so it needs no
 // rollback, and no decision of it can change the emitted ids.
 #include "strix/lookup/index.hpp"
+#include "strix/spec/wide_window.hpp"
 
 #include <array>
 #include <cstdint>
@@ -99,6 +100,11 @@ struct ArbiterConfig {
     // The probe is charged its cost: it fires only when its priced score (expected tokens / (verify + draft ms)) is within
     // frontier_loss of the pick, so it can cost at most frontier_loss / frontier_every of the throughput per pass.
     double frontier_loss = 0.05;
+    // The exploration probe (min_model_passes, probe_every) is charged the same way: it runs at the deepest legal window
+    // whose priced excess over the pick stays within frontier_loss x probe_every pick passes (none: the shallowest), so a
+    // context where serial wins (K/V-priced verify rows) never pays an unpriced deep pass (128K, k 15: ~8 serial passes).
+    // false = the previous form (always the deepest legal window). Drafts never change emitted tokens.
+    bool charge_probe = true;
     // Per-depth learned drafter: the cumulative survival S_j is shrunk toward the geometric continuation of the shallower
     // depths (m_j = B_{j-1}^2 / B_{j-2}, m_1 = the prior mean) instead of the flat prior mean, and a depth without evidence is
     // priced at m_j. The flat mean (false, the previous form) pulls deep, little-evidenced S_j up toward 0.5: measured on the

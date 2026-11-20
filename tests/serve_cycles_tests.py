@@ -122,21 +122,29 @@ class IdentityVerdict(unittest.TestCase):
         self.assertTrue(v.startswith("UNAVAILABLE"), v)
 
 
+class WideAbandons(unittest.TestCase):
+    def test_accepted_rows_in_order_and_stamped_lines(self):
+        lines = ["wide abandon at=812 rows=32 accepted=11", "serve cycle seq=3 rows=8",
+                 "12:00:01.250 wide abandon at=900 rows=16 accepted=3", "xwide abandon at=1 rows=32 accepted=9"]
+        self.assertEqual(sc.abandons(lines), [11, 3])
+        self.assertEqual(sc.abandons([]), [])
+
+
 class MainEndToEnd(unittest.TestCase):
-    def run_main(self, files, bursts, pairs="A,B"):
+    def run_main(self, files, bursts, pairs="A,B", extra_lines=()):
         # The spec separator is ':', so the files are named relative to the temporary directory (no drive letter).
         cwd = os.getcwd()
         with tempfile.TemporaryDirectory() as d:
             os.chdir(d)
             try:
-                return self.run_in(files, bursts, pairs)
+                return self.run_in(files, bursts, pairs, extra_lines)
             finally:
                 os.chdir(cwd)
 
-    def run_in(self, files, bursts, pairs):
+    def run_in(self, files, bursts, pairs, extra_lines=()):
         log = "srv.err"
         with open(log, "w") as f:
-            f.write("\n".join([plan_line(7, 4, 3, 180.0)] * 4 + [plan_line(2, 2, 2, 50.0)] * 4) + "\n")
+            f.write("\n".join([plan_line(7, 4, 3, 180.0)] * 4 + [plan_line(2, 2, 2, 50.0)] * 4 + list(extra_lines)) + "\n")
         specs = []
         for name, first, last, key, extra in bursts:
             path = key + ".json"
@@ -172,6 +180,15 @@ class MainEndToEnd(unittest.TestCase):
                                         [("c7-A1", 1, 4, "a", suffix), ("c7-B1", 1, 4, "b", suffix)])
                 self.assertEqual(rc, 0, out)
                 self.assertIn("ids IDENTICAL", out)
+
+    def test_abandon_column_counts_the_burst_range_only(self):
+        files = dict(a=dict(bursts=[burst(7, ["h"] * 7)]), b=dict(bursts=[burst(7, ["h"] * 7)]))
+        extra = ["wide abandon at=40 rows=32 accepted=14", "wide abandon at=90 rows=32 accepted=4"]
+        rc, out = self.run_main(files, [("c7-A1", 1, 4, "a", ":0"), ("c7-B1", 9, 10, "b", ":0")], extra_lines=extra)
+        self.assertEqual(rc, 0, out)
+        rows = [l for l in out.splitlines() if l.startswith("| c7-")]
+        self.assertIn("| 0 |", rows[0])
+        self.assertIn("| 2 (14 4) |", rows[1])
 
     def test_only_one_arm_fails_closed(self):
         files = dict(a=dict(bursts=[burst(7, ["h"] * 7)]))

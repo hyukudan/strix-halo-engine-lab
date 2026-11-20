@@ -1,13 +1,20 @@
-// Host tests of the deferred prompt MTP rows policy (include/strix/cuda/qwen_mtp_defer.hpp): a deferred call runs
+// Host tests of the deferred prompt MTP rows policy (include/strix/spec/mtp_defer.hpp): a deferred call runs
 // before anything rewrites the block buffers it reads or reads the rows it writes, is dropped exactly when its session's
 // rows are replaced, freed or restarted, and windows never touch the block's tap rows.
-#include "strix/cuda/qwen_mtp_defer.hpp"
+#include "strix/spec/mtp_defer.hpp"
+#include "strix/cuda/qwen_mtp_defer.hpp"  // forwarding header: must name the same functions
 
 #include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
 
-namespace qmd = strix::cuda::qwen_mtp_defer;
+namespace qmd = strix::spec::mtp_defer;
+// Same entity: two non-type template arguments naming the same function are the same specialization.
+template <auto A, auto B> struct SameEntity { static constexpr bool value = false; };
+template <auto A> struct SameEntity<A, A> { static constexpr bool value = true; };
+static_assert(SameEntity<&qmd::on_use, &strix::cuda::qwen_mtp_defer::on_use>::value &&
+              SameEntity<&qmd::defer_block, &strix::cuda::qwen_mtp_defer::defer_block>::value,
+              "the forwarding header aliases the shared policy");
 
 namespace {
 int failures = 0;
