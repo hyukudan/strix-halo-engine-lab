@@ -1356,12 +1356,12 @@ struct Forward::Impl {
             // next window's reads run while this window computes.
             engram_submit(win.p0, win.rows, [this](std::uint32_t q) { return tokens[q]; });
             if (wi + 1U < plan.windows.size()) {
-                const auto nx = plan.windows[wi + 1U];
+                const auto next_win = plan.windows[wi + 1U];
                 const std::size_t have = tokens.size();
-                bool ids_ok = nx.p0 == win.p0 + win.rows && i + nx.rows <= prompt.size();
-                for (std::uint32_t r = 0; ids_ok && r < nx.rows; ++r) ids_ok = prompt[i + r] < c.vocab;
+                bool ids_ok = next_win.p0 == win.p0 + win.rows && i + next_win.rows <= prompt.size();
+                for (std::uint32_t r = 0; ids_ok && r < next_win.rows; ++r) ids_ok = prompt[i + r] < c.vocab;
                 if (ids_ok)  // else the window's own checks throw when it is reached
-                    engram_submit(nx.p0, nx.rows, [this, &prompt, have, i](std::uint32_t q) {
+                    engram_submit(next_win.p0, next_win.rows, [this, &prompt, have, i](std::uint32_t q) {
                         return q < have ? tokens[q] : prompt[i + (q - have)];
                     });
             }
@@ -1524,9 +1524,9 @@ struct Forward::Impl {
         void* sp = nullptr;
         check(hipHostMalloc(&sp, kNextnRows * sizeof(Staging), hipHostMallocDefault), "next-token row staging");
         nx.stages = static_cast<Staging*>(sp);
-        void* tp = nullptr;
-        check(hipHostMalloc(&tp, kNextnRows * sizeof(std::uint32_t), hipHostMallocDefault), "next-token ids");
-        nx.top = static_cast<std::uint32_t*>(tp);
+        void* top_host = nullptr;
+        check(hipHostMalloc(&top_host, kNextnRows * sizeof(std::uint32_t), hipHostMallocDefault), "next-token ids");
+        nx.top = static_cast<std::uint32_t*>(top_host);
         std::fill(nx.top, nx.top + kNextnRows, 0U);
         if (vr.max >= 2U) {  // the rows form runs through the verify workspace (allocate_verify before this)
             nx.xr = alloc<float>(std::size_t{vr.max} * h);
