@@ -1486,9 +1486,9 @@ struct Forward::Impl {
         void* sp = nullptr;
         check(hipHostMalloc(&sp, kNextnRows * sizeof(Staging), hipHostMallocDefault), "next-token row staging");
         nx.stages = static_cast<Staging*>(sp);
-        void* tp = nullptr;
-        check(hipHostMalloc(&tp, kNextnRows * sizeof(std::uint32_t), hipHostMallocDefault), "next-token ids");
-        nx.top = static_cast<std::uint32_t*>(tp);
+        void* top_host = nullptr;
+        check(hipHostMalloc(&top_host, kNextnRows * sizeof(std::uint32_t), hipHostMallocDefault), "next-token ids");
+        nx.top = static_cast<std::uint32_t*>(top_host);
         std::fill(nx.top, nx.top + kNextnRows, 0U);
         if (vr.max >= 2U) {  // the rows form runs through the verify workspace (allocate_verify before this)
             nx.xr = alloc<float>(std::size_t{vr.max} * h);
