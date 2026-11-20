@@ -255,10 +255,13 @@ void campaign_defaults_contract(){
     n.sample_options=false;n.cohort.push_back({});require(!mtp_ngram_draft_requested(n),"auto stays off with cohort requests");
     n.cohort.clear();n.golden_dump="g";require(!mtp_ngram_draft_requested(n),"auto stays off when dumping a golden");
     n.golden_dump.clear();
-    // The batched HTTP route resolves the same mode as the single request (it was deaf to the engine mode: =copy
-    // proposed nothing on the default served route); STRIX_BATCH_NGRAM only overrides it when set.
-    require(mtp_batch_lookup(n,nullptr).on && mtp_batch_lookup(n,"").on && !mtp_batch_lookup(n,nullptr).default_context,
-        "batch route: auto runs where admissible, like the single route");
+    // Previously STRIX_BATCH_NGRAM was the only engine-level batch switch (off by default). The fix must honor
+    // explicit --mtp-ngram-draft modes without silently enabling the single-request auto policy for HTTP batches.
+    require(!mtp_batch_lookup(n,nullptr).on && !mtp_batch_lookup(n,"").on && !mtp_batch_lookup(n,nullptr).default_context,
+        "batch route: auto preserves the historical off-by-default policy");
+    n.ngram_draft=true;
+    require(mtp_batch_lookup(n,nullptr).on,"batch route: explicit --mtp-ngram-draft enables prompt lookup");
+    n.ngram_draft=false;
     require(!mtp_batch_lookup(n,"0").on && !mtp_batch_lookup(n,"off").on,"batch route: STRIX_BATCH_NGRAM=0 is the off switch");
     n.ngram_off=true;require(!mtp_batch_lookup(n,nullptr).on,"batch route: =off disables it");
     require(mtp_batch_lookup(n,"1").on,"batch route: STRIX_BATCH_NGRAM=1 forces it");
