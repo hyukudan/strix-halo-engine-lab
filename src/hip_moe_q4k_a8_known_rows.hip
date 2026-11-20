@@ -1584,17 +1584,22 @@ template<unsigned Tune,class Regs,class Regs1=Regs,class Fetch,class Stage,class
 __device__ __forceinline__ void f16_pipeline(unsigned steps,const Fetch& fetch,const Stage& stage,const Step& step_fn) {
     strix::moe_core::GroupedF16Issue::pipeline<(Tune&1U)!=0U,Regs,Regs1>(steps,fetch,stage,step_fn);
 }
-template<bool Q5K,unsigned Tune,unsigned Core=0U>
+// HdrReuse: the body's superblock header reuse (hip_moe_f16x_project_body.inc, the STRIX_QPF2K_MOE_HDR mechanism of the
+// P1 / DA16 entries): steps s%4 >= 2 keep step s-2's header bytes in the register stage. The K-quant envelope sets it; every
+// other launch keeps the default (false: the same code as before the flag existed).
+template<bool Q5K,unsigned Tune,unsigned Core=0U,bool HdrReuse=false>
 __global__ __launch_bounds__((F16TileX<Tune,Core>::Threads),prefill_core2_min_waves(Tune,Core)) void project_prefill_f16x(const unsigned char* gate,const unsigned char* up,PrefillRows view,
     unsigned hidden,unsigned outputs,const uint4* a16) {
 #define STRIX_F16X_BATCH_TILE const unsigned batch=blockIdx.y,tile=blockIdx.x;
 #define STRIX_F16X_LDS(S,R) __shared__ __align__(16) S sb[1]; __shared__ R rows;
+#define STRIX_F16X_HDR_REUSE HdrReuse
 #include "moe_core/hip_moe_f16x_project_body.inc"
+#undef STRIX_F16X_HDR_REUSE
 #undef STRIX_F16X_BATCH_TILE
 #undef STRIX_F16X_LDS
 }
 // Clamp trait entry of the same body (clamped routed experts, e.g. limit 10): h = silu(min(g, L)) * clamp(u, -L, L), the
-// non-finite check on the raw g / u. Only the K-quant envelope of enqueue_prefill launches it; the entry above is unchanged.
+// non-finite check on the raw g / u. Only the K-quant envelope of enqueue_prefill launches it (with the header reuse above).
 template<bool Q5K,unsigned Tune>
 __global__ __launch_bounds__((F16TileX<Tune,0U>::Threads),prefill_core2_min_waves(Tune,0U)) void project_prefill_f16x_clamped(
     const unsigned char* gate,const unsigned char* up,PrefillRows view,unsigned hidden,unsigned outputs,const uint4* a16,float swiglu_limit) {
@@ -1602,7 +1607,9 @@ __global__ __launch_bounds__((F16TileX<Tune,0U>::Threads),prefill_core2_min_wave
 #define STRIX_F16X_BATCH_TILE const unsigned batch=blockIdx.y,tile=blockIdx.x;
 #define STRIX_F16X_LDS(S,R) __shared__ __align__(16) S sb[1]; __shared__ R rows;
 #define STRIX_F16X_SWIGLU_LIMIT swiglu_limit
+#define STRIX_F16X_HDR_REUSE true
 #include "moe_core/hip_moe_f16x_project_body.inc"
+#undef STRIX_F16X_HDR_REUSE
 #undef STRIX_F16X_SWIGLU_LIMIT
 #undef STRIX_F16X_BATCH_TILE
 #undef STRIX_F16X_LDS
@@ -2117,8 +2124,9 @@ static void enqueue_prefill_kquant(const Request& request,const PrefillRows& row
             hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_clamped<false,Tune>),project_grid,dim3(Threads),0,stream,
                 gate,up,rows,shape.hidden,shape.rows,a16,request.swiglu_limit);
         } else {
-            prefill_resources<project_prefill_f16x<false,Tune>,Threads>("gate_up_q4k",Tune);
-            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x<false,Tune>),project_grid,dim3(Threads),0,stream,
+            // Header reuse (template flag HdrReuse): the same body and bytes as the clamped entry's.
+            prefill_resources<project_prefill_f16x<false,Tune,0U,true>,Threads>("gate_up_q4k",Tune);
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x<false,Tune,0U,true>),project_grid,dim3(Threads),0,stream,
                 gate,up,rows,shape.hidden,shape.rows,a16);
         }
         hip_check(hipGetLastError(),"FP16 prefill WMMA gate/up projection (K-quant envelope)");

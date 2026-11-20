@@ -50,7 +50,7 @@
     // (Regs1) only A; the odd step's FP16 B words wait in `held` from the even stage to the odd one.
     struct RegsA { uint4 a[AParts][4]{}; };
     using Regs1=std::conditional_t<KQ::pair,RegsA,Regs>;
-    static_assert(!KQ::pair||(Tune&1U)==0U,"K-quant pair reads need the two register stages");
+    static_assert((Tune&1U)==0U,"K-quant reads keep step s-2's bytes in the register stage: they need the two register stages");
     [[maybe_unused]] uint4 held[BBlocks][4];
 #define STRIX_F16X_DOWN_REGS auto
 #else
@@ -78,7 +78,7 @@
                     r.b=KQ::template load_pair<BBlocks>(b_src,step,BBlocks*b_part);
             } else
 #pragma unroll
-            for(unsigned k=0;k<BBlocks;++k)r.b[k]=KQ::load(b_src,step,BBlocks*b_part+k);
+            for(unsigned k=0;k<BBlocks;++k)KQ::load(r.b[k],b_src,step,BBlocks*b_part+k);
         }
 #else
         if constexpr((Tune&4096U)==0U)

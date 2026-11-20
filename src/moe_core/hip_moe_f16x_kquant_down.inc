@@ -14,10 +14,16 @@ template<> struct F16xKQuantDown<12U> {
     static constexpr unsigned block_bytes=144U;
     static constexpr bool pair=false;  // per-step reads (load / decode per half)
     struct Raw { uint4 head,lo,hi; };
-    // Superblocks are 16-B aligned (144 B, rows of whole superblocks).
-    __device__ __forceinline__ static Raw load(const unsigned char* row,unsigned step,unsigned) {
+    // Superblocks are 16-B aligned (144 B, rows of whole superblocks). Loads into the register stage `r`, which (two
+    // alternating stages, grouped_f16.hpp) last held step s-2: for s%4 >= 2 that is the same superblock, so its 16-B header
+    // (d, dmin, scale bytes) is already there and is not requested again; only the step's 32 qs bytes are.
+    // Rule and replay test: kquant_block_reads.hpp q4k_reads.
+    __device__ __forceinline__ static void load(Raw& r,const unsigned char* row,unsigned step,unsigned) {
+        namespace q4=strix::moe_core::q4k_reads;
         const unsigned char* blk=row+(step/4U)*block_bytes;
-        return {f16_load(blk),f16_load(blk+16U+32U*(step%4U)),f16_load(blk+32U+32U*(step%4U))};
+        if(q4::header_load(step))r.head=f16_load(blk);
+        r.lo=f16_load(blk+q4::qs_from_block(step));
+        r.hi=f16_load(blk+q4::qs_from_block(step)+16U);
     }
     template<unsigned Tune>
     __device__ __forceinline__ static void decode(const Raw& r,unsigned step,unsigned half,uint4 (&out)[4]) {
