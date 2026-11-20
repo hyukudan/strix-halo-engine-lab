@@ -15,9 +15,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Benchmark completion-marker regression (CPU-only)
+        shell: bash
+        run: python3 scripts/bench/moe-grouped/test_buckets.py
+
       - name: Reject raw NUL bytes in sources
         shell: bash
         run: python3 tools/ci/check_source_bytes.py
+
+      # Common-core rule (AGENTS.md "Shared code first"): counts may only go down, see tools/ci/check_layering.py.
+      - name: Layering ratchet
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B tools/ci/test_check_layering.py
+          python3 -B tools/ci/check_layering.py
 
       # The option qualification kit tests (ctest) need numpy for the system python3.
       - name: Install Python test dependency
@@ -27,6 +39,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends python3-numpy
           python3 -c 'import numpy; print("numpy", numpy.__version__)'
+
+      - name: Logit gate tail rule tests
+        shell: bash
+        run: python3 -B tools/strix-gate/test_tail_rule.py
 
       - name: Configure, build and test core
         shell: bash

@@ -83,7 +83,7 @@ struct Weights {
     std::uint32_t down_type = type_q5_1;       // 7 or 8
     const std::uint8_t* down = nullptr;        // [experts][hidden][ffn/32 blocks]
     ExpertArithmetic arithmetic=ExpertArithmetic::incumbent;
-    bool decode_tile = true;   // gsq_bf16_mma: steps of <= 16 rows bind the decode tile form (bitwise the tile form)
+    bool decode_tile = true;   // gsq_bf16_mma / gsq_i8_turbo: steps of <= 16 rows bind the decode tile form (bitwise the tile form)
 };
 
 // The single steps (tests) and the whole routed MoE of one layer. Any rows >= 1 is accepted (the HIP entry requires
