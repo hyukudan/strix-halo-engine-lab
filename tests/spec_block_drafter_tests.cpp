@@ -445,8 +445,7 @@ int tree_tests() {
         BD_CHECK(tree_pre.out == tree_off.out && tree_pre.trace == tree_off.trace && lin_pre.out == lin_off.out &&
                      lin_pre.trace == lin_off.trace,
                  "pre-launch flag changed a tree or linear run");
-        std::printf("tree + pre-launch: tree target 0 offers (%llu sibling rows), linear target %llu offers, ids unchanged
-",
+        std::printf("tree + pre-launch: tree target 0 offers (%llu sibling rows), linear target %llu offers, ids unchanged\n",
                     (unsigned long long)tree_pre.sib_rows, (unsigned long long)lin_pre.prelaunch_offers);
     }
     int cases = 0;
