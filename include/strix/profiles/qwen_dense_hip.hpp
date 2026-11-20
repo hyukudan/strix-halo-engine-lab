@@ -32,7 +32,7 @@ enum class App { decode, spec };
 
 // Columns: default, fast, quality, turbo. builtin = today's behaviour with the option absent.
 inline constexpr sp::Lever table[] = {
-    {.name = "wide_rows", .env = "", .option = "--wide", .value = {"", "64", "", ""}, .builtin = "16-row windows",
+    {.name = "wide_rows", .env = "", .option = "--wide", .value = {"", "64", "", ""}, .builtin = "engine default (64-row EXACT windows, IU4)",
      .kind = sp::Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
      .target = "64-row FAST wide windows (dense-q8a8-f16-v1)", .off = "16",
      .source = "composite FAST gate (wide prefill rows > 16) pending"},
