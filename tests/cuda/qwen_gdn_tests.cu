@@ -841,9 +841,9 @@ int main(int argc, char** argv) {
     test_norm(syn, 37, false);
     test_norm(syn, 300, true);
     test_core(syn, "synthetic", 150);
-    test_core_overlap(syn, 1024, false);
-    test_core_overlap(syn, 1500, true);
-    test_core_overlap(syn, 4173, true);
+    test_core_overlap(syn, 4096, false);
+    test_core_overlap(syn, 6000, true);
+    test_core_overlap(syn, 8269, true);
     if (real) {
         strix::qwen_gguf::Model model;
         const auto w0 = real_weights(model, 0);

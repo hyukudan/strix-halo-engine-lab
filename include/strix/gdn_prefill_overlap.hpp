@@ -16,10 +16,13 @@
 
 namespace strix::gdn_overlap {
 
-inline constexpr std::uint32_t kAlign = 256;        // segment starts (rows from the first row of the call)
-inline constexpr std::uint32_t kMinRows = 1024;     // calls below this stay one segment (serial)
-inline constexpr std::uint32_t kMinSegment = 512;   // smallest segment (except the last)
-inline constexpr std::uint32_t kMaxSegments = 4;    // 3 of 4 segments overlapped; more only adds launches
+// Measured on the RTX PRO (no model, qwen_gdn_tests --bench-core-overlap): every extra segment costs ~86 us (event hops,
+// launches, pipeline ramp) against ~0.13 us per overlapped row, so 512-row segments lose (T=1024 2 x 512 -3.9 %, T=2048
+// 4 x 512 -0.9 %) while 1024-2048-row segments win (T=4096 4 x 1024 +6.7 %, T=8192 4 x 2048 +12.8 %).
+inline constexpr std::uint32_t kAlign = 256;         // segment starts (rows from the first row of the call)
+inline constexpr std::uint32_t kMinSegment = 2048;   // segments are at least this long (the last at least 1280)
+inline constexpr std::uint32_t kMaxSegments = 4;     // 3 of 4 segments overlapped; more only adds fixed cost
+inline constexpr std::uint32_t kMinRows = 2U * kMinSegment;  // calls below this stay one segment (serial)
 
 struct Plan {
     std::uint32_t n = 1;        // segments (1 = serial, the incumbent order)
@@ -30,10 +33,11 @@ struct Plan {
 // narrowed once per call would gain narrowings at the segment ends).
 [[nodiscard]] constexpr Plan plan(std::uint32_t count, bool enabled) noexcept {
     if (!enabled || count < kMinRows) return Plan{1, count};
-    const std::uint32_t quarter = count / kMaxSegments + (count % kMaxSegments ? 1U : 0U);
-    std::uint32_t segment = (quarter + kAlign - 1U) / kAlign * kAlign;
-    if (segment < kMinSegment) segment = kMinSegment;
-    return Plan{count / segment + (count % segment ? 1U : 0U), segment};
+    // n balanced segments of >= kMinSegment rows: segment = ceil(count / n) rounded up to kAlign, so the last one is
+    // count - (n - 1) * segment >= count / n - (n - 1) * (kAlign - 1) > 0 and the plan has exactly n segments
+    const std::uint32_t n = count / kMinSegment < kMaxSegments ? count / kMinSegment : kMaxSegments;
+    const std::uint32_t share = count / n + (count % n ? 1U : 0U);
+    return Plan{n, (share + kAlign - 1U) / kAlign * kAlign};
 }
 
 // first row of segment i < p.n (fits: it is below count)
