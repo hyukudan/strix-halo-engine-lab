@@ -83,8 +83,12 @@ public:
 
     [[nodiscard]] Link& link() noexcept { return link_; }
 
-    // Times the gather form on the engine stream (each call ends with a stream wait, so it is complete) at the start-up
-    // sizes that fit the capacity, fits latency + bytes / rate, and agrees field-wise with the peer. Restarts the counters.
+    // Times the gather form on the engine stream at the start-up sizes that fit the capacity, fits latency + bytes / rate,
+    // and agrees field-wise with the peer. Restarts the counters. One sample = kProbeChain gathers enqueued back to back
+    // and ONE stream wait, divided by kProbeChain: the decode step never waits on the stream after a gather (the next
+    // work is stream-ordered behind it), so a stream wait per probed gather would price a host wake + an empty-queue
+    // relaunch that the step does not run (Hy4 TP2 staged: 237 us probed vs ~80-128 us effective per in-step trip).
+    static constexpr unsigned kProbeChain = 16U;
     [[nodiscard]] dist::LinkCost measure_link() {
         hipStream_t stream = stream_;
         std::vector<std::uint64_t> sizes;
@@ -96,10 +100,14 @@ public:
         dist::LinkCost mine;
         try {
             ::strix::hip_check_message(hipMemsetAsync(buf, 0, 2U * slot, stream), "tp gather: probe buffer");
-            const auto samples = dist::measure([&](std::uint64_t bytes) {
-                link_.gather(stream, buf, slot, std::size_t(bytes));
+            auto samples = dist::measure([&](std::uint64_t bytes) {
+                for (unsigned k = 0; k < kProbeChain; ++k) link_.gather(stream, buf, slot, std::size_t(bytes));
                 HipOps::sync(stream);
-            }, sizes, 5U, 35U);
+            }, sizes, 2U, 35U);
+            for (auto& x : samples) {
+                x.p50_us /= double(kProbeChain);
+                x.p90_us /= double(kProbeChain);
+            }
             mine = dist::fit(samples);
         } catch (...) {
             (void)hipStreamSynchronize(stream);
@@ -110,6 +118,12 @@ public:
         link_.reset_counters();
         if (fast_) fast_->drain();  // the channel's progress work is complete before the transport carries the agreement
         return dist::agree(comm_->transport(), mine);
+    }
+    // One measured scalar agreed by both ranks (dist::agree_max over the pair transport, the channel drained first):
+    // e.g. the timed one-node pass a placement is calibrated with. Both ranks call it at the same point.
+    [[nodiscard]] double agree_max(double mine) {
+        if (fast_) fast_->drain();
+        return dist::agree_max(comm_->transport(), mine);
     }
     // After the last gather of a run, before its results are printed (both ranks): surfaces a failed integrity check of
     // the channel's last messages (pair::GatherLink::finish).

@@ -154,6 +154,33 @@ inline void check(std::span<const Stage> stages, const Costs& c) {
     return t;
 }
 
+// A measured one-rank pass prices what the stage model cannot see (launch-bound kernels, host gaps between launches, a
+// read rate below the declared one): residual = measured_ms - single_pass_ms(stages, p, rate) is appended as ONE
+// replicated stage of fixed ms, paid on every rank whatever its share, so the single and the tensor forms both carry it.
+// Attributing the whole residual to fixed work is the conservative side for a multi-rank form (a read-efficiency shortfall
+// would shrink with the split). A residual below zero (the model is slower than measured) is not priced. `rate`: the read
+// rate (bytes/ms) of the rank whose pass was measured (an agreed max over ranks pairs with the slowest declared rate).
+struct Calibration {
+    double model_ms = 0.0;     // single_pass_ms of the stages before the residual stage
+    double measured_ms = 0.0;  // the measured one-rank pass
+    double fixed_ms = 0.0;     // the residual appended (>= 0)
+};
+[[nodiscard]] inline Calibration with_measured_single(std::vector<Stage>& stages, const Pass& p, double rate, double measured_ms) {
+    if (!std::isfinite(measured_ms) || !(measured_ms > 0.0)) throw std::invalid_argument("split plan: measured pass must be > 0 ms");
+    if (!std::isfinite(rate) || !(rate > 0.0)) throw std::invalid_argument("split plan: calibration rate must be > 0");
+    Calibration c;
+    c.model_ms = single_pass_ms(stages, p, rate);
+    c.measured_ms = measured_ms;
+    c.fixed_ms = std::max(0.0, measured_ms - c.model_ms);
+    Stage s;
+    s.name = "measured fixed (one-rank pass - stage model)";
+    s.layer = stages.empty() ? 0U : stages.back().layer;
+    s.axis = Axis::replicated;
+    s.fixed_ms = c.fixed_ms;
+    stages.push_back(s);
+    return c;
+}
+
 // Tensor form over all ranks of `c.rates`: per stage each rank's share (split_units over the axis units; slots by
 // assign_slots), a barrier + exchange at every join.
 [[nodiscard]] inline Estimate tensor(std::span<const Stage> stages, const Pass& p, const Costs& c) {
