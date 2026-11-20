@@ -106,7 +106,7 @@ jobs:
           ccache --version | head -1
           ccache --zero-stats
 
-      # Pull requests read the newest main cache; only main, nightly and manual runs write one.
+      # A pull request reads its own newest cache, else main's newest; its saves stay in its own scope.
       - name: Restore compiler cache
         uses: actions/cache/restore@v4
         with:
@@ -213,7 +213,7 @@ jobs:
         run: ccache --show-stats || true
 
       - name: Save compiler cache
-        if: always() && github.event_name != 'pull_request'
+        if: always()
         uses: actions/cache/save@v4
         with:
           path: ~/.ccache-host
@@ -242,7 +242,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Pull requests read the newest main cache; only main, nightly and manual runs write one.
+      # A pull request reads its own newest cache, else main's newest; its saves stay in its own scope.
       - name: Restore compiler cache
         uses: actions/cache/restore@v4
         with:
@@ -288,7 +288,7 @@ jobs:
           } 2>&1 | tee hip-offline-build.log
 
       - name: Save compiler cache
-        if: always() && github.event_name != 'pull_request'
+        if: always()
         uses: actions/cache/save@v4
         with:
           path: ~/.ccache-hip
