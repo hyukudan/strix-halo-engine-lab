@@ -9,7 +9,9 @@
 // per-window limits) on gfx1151 one node over the prompt range of the receipts below, and on the pair by identity with
 // one node; outside a qualified regime the fast cell is pending (runs only with --allow-pending or an explicit
 // --prompt-rows, stamped "unqualified"). The layer split (pair cut, windows crossing as FP32 rows) changes no bit and is
-// not a profile lever. No TURBO version: turbo is
+// not a profile lever; on the pair, when no width is given, the width and the interleaved stage map per prompt length
+// come from the shared planner over the measured pair cost (src/hy4/hip/hy4_hip_plan.hpp pair_stage_plan; the resolver
+// stamps the width). No TURBO version: turbo is
 // refused. Promoting a regime after its gate is one `qualified` row, never code. Host-only.
 #include "strix/engine_profile.hpp"
 
