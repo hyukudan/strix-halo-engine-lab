@@ -25,7 +25,17 @@ inline hipError_t hipMalloc(void** p, std::size_t n) {
     *p = std::calloc(1U, n == 0U ? 1U : n);
     return *p ? hipSuccess : hipErrorOutOfMemory;
 }
-inline hipError_t hipHostMalloc(void** p, std::size_t n, unsigned = 0U) { return hipMalloc(p, n); }
+// Real HIP pinned host allocations are sufficiently aligned for StagedReady (alignas(64)).
+// malloc/calloc only promises max_align_t and made the CPU stub itself undefined for placement-new StagedReady.
+inline hipError_t hipHostMalloc(void** p, std::size_t n, unsigned = 0U) {
+    constexpr std::size_t alignment = 64U;
+    if (n > (~std::size_t{0}) - (alignment - 1U)) return hipErrorOutOfMemory;
+    const std::size_t bytes = ((n == 0U ? 1U : n) + alignment - 1U) & ~(alignment - 1U);
+    *p = std::aligned_alloc(alignment, bytes);
+    if (!*p) return hipErrorOutOfMemory;
+    std::memset(*p, 0, bytes);
+    return hipSuccess;
+}
 inline hipError_t hipFree(void* p) { std::free(p); return hipSuccess; }
 inline hipError_t hipHostFree(void* p) { std::free(p); return hipSuccess; }
 inline hipError_t hipHostRegister(void*, std::size_t, unsigned) { return hipSuccess; }
