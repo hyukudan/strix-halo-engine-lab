@@ -652,9 +652,82 @@ static void bench(u32 count) {
     cudaFree(dh); cudaFree(dhist); cudaFree(ds); cudaFree(scratch);
 }
 
+// Co-residency counter for staggered prompt segments: the recurrence of segment A (one CTA per SM, latency bound) against
+// gates + conv + norm of segment B. serial = all on one stream; overlap = A's recurrence on stream 1, B's kernels on
+// stream 2. Prints both walls, the alone times and A's final state memcmp (launch order must not change bits).
+struct OverlapSeg {
+    Workspace ws;
+    u16* dh = nullptr; u16* dhist = nullptr; float* ds = nullptr; void* scratch = nullptr; void* decay = nullptr;
+    explicit OverlapSeg(u32 n) : ws(n) {}
+};
+static void bench_overlap(u32 count) {
+    const auto hw = synthetic_weights(5);
+    DevWeights dw(hw);
+    OverlapSeg a(count), b(count);
+    u32 seed = 81;
+    for (OverlapSeg* s : {&a, &b}) {
+        s->ws.put(0, CW, make_bf16_values(static_cast<size_t>(count) * CW, seed, 2.0F, CW));
+        s->ws.put(kOffZ, VW, make_bf16_values(static_cast<size_t>(count) * VW, seed + 1, 3.0F, VW));
+        s->dh = dev_upload(make_hidden(count, seed + 2)); seed += 10;
+        CK(cudaMalloc(&s->dhist, CW * 8)); CK(cudaMemset(s->dhist, 0, CW * 8));
+        CK(cudaMalloc(&s->ds, g::kMatrixFloats * 4));
+        CK(cudaMalloc(&s->scratch, g::core_scratch_bytes(count)));
+        s->decay = static_cast<unsigned char*>(s->scratch) + (g::conv_scratch_bytes(count) + 255U) / 256U * 256U;
+    }
+    // A's recurrence inputs once (gates + conv); the timed recurrence reads them unchanged.
+    g::launch_gates(a.dh, H, a.ws.rows(), count, dw.w(), g_tables, nullptr);
+    g::launch_conv(a.ws.rows(), count, a.dhist, a.scratch, dw.w(), g_tables, nullptr);
+    CK(cudaDeviceSynchronize());
+    cudaStream_t s1, s2;
+    CK(cudaStreamCreateWithFlags(&s1, cudaStreamNonBlocking)); CK(cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking));
+    cudaEvent_t e0, e1, fork, join;
+    CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1)); CK(cudaEventCreate(&fork)); CK(cudaEventCreate(&join));
+    auto partner = [&](cudaStream_t s) {
+        CK(cudaMemsetAsync(b.dhist, 0, CW * 8, s));
+        g::launch_gates(b.dh, H, b.ws.rows(), count, dw.w(), g_tables, s);
+        g::launch_conv(b.ws.rows(), count, b.dhist, b.scratch, dw.w(), g_tables, s);
+        g::launch_norm(b.ws.rows(), count, dw.w(), g_tables, s);
+    };
+    auto recur = [&](cudaStream_t s) {
+        CK(cudaMemsetAsync(a.ds, 0, g::kMatrixFloats * 4, s));
+        g::launch_recurrence(a.ws.rows(), count, a.ds, a.decay, g_tables, s);
+    };
+    // mode 0 serial, 1 overlap, 2 recurrence alone, 3 partner alone
+    auto run = [&](int mode) {
+        CK(cudaEventRecord(e0, s1));
+        if (mode == 0) { recur(s1); partner(s1); }
+        else if (mode == 1) {
+            CK(cudaEventRecord(fork, s1)); CK(cudaStreamWaitEvent(s2, fork, 0));
+            recur(s1); partner(s2);
+            CK(cudaEventRecord(join, s2)); CK(cudaStreamWaitEvent(s1, join, 0));
+        } else if (mode == 2) recur(s1);
+        else partner(s1);
+        CK(cudaEventRecord(e1, s1)); CK(cudaEventSynchronize(e1));
+        float t = 0.0F; CK(cudaEventElapsedTime(&t, e0, e1));
+        return t;
+    };
+    const size_t nstate = g::kMatrixFloats;
+    std::vector<float> ref(nstate), ov(nstate);
+    for (int m = 0; m < 4; ++m) (void)run(m);  // warm-up
+    (void)run(0); CK(cudaMemcpy(ref.data(), a.ds, nstate * 4, cudaMemcpyDeviceToHost));
+    float t[4][5];
+    for (int rep = 0; rep < 5; ++rep)
+        for (int m = 0; m < 4; ++m) t[m][rep] = run(m);
+    (void)run(1); CK(cudaMemcpy(ov.data(), a.ds, nstate * 4, cudaMemcpyDeviceToHost));
+    const bool same_bits = std::memcmp(ref.data(), ov.data(), nstate * 4) == 0;
+    auto med = [](const float* v) { std::vector<float> x(v, v + 5); std::sort(x.begin(), x.end()); return x[2]; };
+    const float ser = med(t[0]), ovl = med(t[1]), rec = med(t[2]), par = med(t[3]);
+    std::printf("overlap T=%u: serial %.3f ms overlap %.3f ms recurrence %.3f ms partner %.3f ms hidden %.1f %% of min(rec,partner) "
+                "state %s\n", count, ser, ovl, rec, par, 100.0 * (ser - ovl) / std::min(rec, par), same_bits ? "EQUAL" : "DIFFERENT");
+    for (int m = 0; m < 4; ++m)
+        std::printf("overlap T=%u mode %d reps %.3f %.3f %.3f %.3f %.3f\n", count, m, t[m][0], t[m][1], t[m][2], t[m][3], t[m][4]);
+    for (OverlapSeg* s : {&a, &b}) { cudaFree(s->dh); cudaFree(s->dhist); cudaFree(s->ds); cudaFree(s->scratch); }
+    cudaStreamDestroy(s1); cudaStreamDestroy(s2);
+}
+
 int main(int argc, char** argv) {
     std::string tables = "qrtx-build\\tables", fixture = "qrtx-build\\fx";
-    bool real = true, replay_only = false; u32 bench_rows = 0;
+    bool real = true, replay_only = false; u32 bench_rows = 0, overlap_rows = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--tables" && i + 1 < argc) tables = argv[++i];
@@ -662,9 +735,11 @@ int main(int argc, char** argv) {
         else if (a == "--no-real") real = false;
         else if (a == "--replay-only") replay_only = true;
         else if (a == "--bench" && i + 1 < argc) bench_rows = static_cast<u32>(std::atoi(argv[++i]));
+        else if (a == "--bench-overlap" && i + 1 < argc) overlap_rows = static_cast<u32>(std::atoi(argv[++i]));
     }
     g_tables = am::load_tables(tables);
     if (bench_rows) { bench(bench_rows); am::free_tables(g_tables); return 0; }
+    if (overlap_rows) { bench_overlap(overlap_rows); am::free_tables(g_tables); return 0; }
     if (replay_only) {
         strix::qwen_gguf::Model model;
         replay_fixture(model, fixture);
