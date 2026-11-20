@@ -284,6 +284,54 @@ int main() {
         std::vector<double> acc3;
         const auto stop = e.begin_cycle(115, V{}, 0, 7, acc3, 0.0);
         check(stop == V({116,117,118}) && e.stats().edit_cuts >= 1, "a copy proposal stops before the edited token");
+        {   // mtp_context_observe_config: the observe-only drafter indexed by the copy anchor makes the same wide proposals
+            // and learns the same long-anchor cells as the min_suffix index (random small-alphabet contexts with repeated
+            // spans, outputs copying spans with edits: long bigram chains).
+            std::mt19937 obs_rng(7);
+            const auto pick = [&](std::uint32_t n) { return static_cast<std::uint32_t>(obs_rng() % n); };
+            const auto it = [](const V& v, std::size_t i) { return v.begin() + static_cast<std::ptrdiff_t>(i); };
+            MtpContextDraftConfig obs_base; obs_base.copy_edit = true; obs_base.wide_anchor = 16; obs_base.prior = 0.95;
+            const auto obs_cfg = mtp_context_observe_config(obs_base);
+            auto chained = obs_base; chained.chain_fresh = 12;
+            check(obs_cfg.min_suffix == obs_base.copy_anchor && mtp_context_observe_config(chained).min_suffix == obs_base.min_suffix,
+                "observe config: indexed by the copy anchor, chain copy keeps its keys");
+            std::size_t proposals = 0, compared = 0;
+            for (int trial = 0; trial < 30; ++trial) {
+                V src; for (int i = 0; i < 400; ++i) src.push_back(pick(5) + 1);
+                for (int k = 0; k < 3; ++k) { const auto from = pick(300); const V span(it(src, from), it(src, from + 60)); src.insert(src.end(), span.begin(), span.end()); }
+                V out;
+                while (out.size() < 400) {
+                    const auto from = pick(static_cast<std::uint32_t>(src.size() - 80));
+                    for (std::uint32_t j = 0; j < 80; ++j) out.push_back(pick(25) == 0 ? 6 + pick(3) : src[from + j]);
+                }
+                MtpContextDraft oa(obs_base), ob(obs_cfg); oa.reset(src); ob.reset(src);
+                std::size_t at = 0;
+                while (at + 40 < out.size()) {
+                    const auto pa = oa.propose_wide(out[at], 31, 0.0), pb = ob.propose_wide(out[at], 31, 0.0);
+                    ++compared;
+                    check(pa == pb, "observe config: same wide proposal");
+                    if (!pa.empty()) {
+                        ++proposals;
+                        std::size_t same = 0; while (same < pa.size() && pa[same] == out[at + 1 + same]) ++same;
+                        if (same == pa.size()) {
+                            const V em(it(out, at + 1), it(out, at + 33)); oa.finish_cycle(em, 31, 31); ob.finish_cycle(em, 31, 31);
+                            at += 32; continue;
+                        }
+                        const V tr(it(out, at + 1), it(out, at + 2 + same)); oa.abandon_wide(tr); ob.abandon_wide(tr);
+                    }
+                    std::vector<double> aa, ab;
+                    (void)oa.begin_cycle(out[at], V{}, 0, 7, aa, 0.0); oa.discard_selection();
+                    (void)ob.begin_cycle(out[at], V{}, 0, 7, ab, 0.0); ob.discard_selection();
+                    const std::size_t step = 1U + pick(8);
+                    const V em(it(out, at + 1), it(out, at + 1 + step));
+                    oa.finish_cycle(em, 0, 0); ob.finish_cycle(em, 0, 0); at += step;
+                    for (const std::size_t row : {std::size_t{0}, std::size_t{1}, std::size_t{3}})
+                        check(oa.acceptance(16, true, row) == ob.acceptance(16, true, row), "observe config: same long-anchor cells");
+                }
+            }
+            std::printf("observe config equivalence: %zu wide proposals in %zu comparisons\n", proposals, compared);
+            check(proposals >= 10 && compared >= 1000, "observe config: the equivalence saw wide proposals");
+        }
         MtpContextDraft s(c); s.reset(prompt);
         check(s.propose_wide(108, 60).empty(), "a context continuation shorter than the requested rows is refused");
         check(s.propose_wide(108, 0).empty(), "zero rows propose nothing");
