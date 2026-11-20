@@ -90,6 +90,8 @@ int main() {
     // --cost-kv: the shared context cost switch (spec::set_context_cost), default online.
     RC_CHECK(d.cost_kv == "auto" && parse({"--cost-kv", "online"}).cost_kv == "online" && parse({"--cost-kv", "off"}).cost_kv == "off" && parse({"--cost-kv", "0.3"}).cost_kv == "0.3",
              "--cost-kv parsed");
+    RC_CHECK(parse({"--spec-costs", "calibrated"}).costs_explicit && !parse({"--mtp", "off"}).costs_explicit,
+             "an explicit --spec-costs is recorded (exact TP decode refuses an explicit non-table choice)");
     for (const auto& bad : std::vector<std::vector<std::string>>{{"--draft-rows", "yes"}, {"--spec-costs", "auto"}, {"--mtp"},
                                                                  {"--cost-kv", "maybe"}, {"--cost-kv", "-1"}}) {
         bool threw = false;

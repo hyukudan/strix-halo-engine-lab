@@ -1,6 +1,7 @@
 // GLM-5.3-Flash Tier A host emulation (see glm_host.hpp; orders R1-R18 of design notes).
 // Build with -ffp-contract=off -fno-fast-math: every fmaf below is the only fused operation.
 #include "glm/host/glm_host.hpp"
+#include "strix/moe/route_policy.hpp"
 
 #include <algorithm>
 #include <numeric>
@@ -267,22 +268,15 @@ void dense_r1b(std::span<const float> x, const Mat& w, std::span<float> y) {
 }
 
 Route route(std::span<const float> x, const Mat& router, const float* bias, Identity id) {
-    std::vector<float> s(kExperts), choice(kExperts);
+    std::vector<float> s(kExperts);
     if (id == Identity::kR1b) dense_r1b(x, router, s);
     else dense(x, router, s);
-    for (unsigned e = 0; e < kExperts; ++e) {
-        s[e] = sigmoid(s[e]);
-        choice[e] = s[e] + bias[e];
-    }
-    const auto ids = topk_ordered(choice, kTopE);
+    for (unsigned e = 0; e < kExperts; ++e) s[e] = sigmoid(s[e]);
+    // Selection (ordered keys, ids ascending) and weights: the shared router policy, preset glm5.
+    constexpr strix::moe::RoutePolicy policy = strix::moe::preset::glm5;
+    static_assert(policy.experts == kExperts && policy.top_k == kTopE && policy.scale == kRouteScale && policy.renorm_eps == kRouteDenEps);
     Route r;
-    float den = 0.0F;
-    for (unsigned k = 0; k < kTopE; ++k) {
-        r.id[k] = ids[k];
-        den = den + s[ids[k]];
-    }
-    den = den + kRouteDenEps;
-    for (unsigned k = 0; k < kTopE; ++k) r.w[k] = (s[ids[k]] / den) * kRouteScale;
+    strix::moe::route_select_ref(policy, s, std::span<const float>(bias, kExperts), r.id, r.w);
     return r;
 }
 

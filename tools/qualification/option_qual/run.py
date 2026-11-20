@@ -40,7 +40,7 @@ from . import evidence
 REPEAT_SUFFIX = "@repeat"
 KEEP_ENV = ("PATH", "HOME", "LD_LIBRARY_PATH", "SYSTEMROOT")
 DROP_PREFIX = ("STRIX_", "HIP_", "HSA_")
-HOOK_ENV = ("STRIX_BITCALC_LOGITS_OUT", "STRIX_BITCALC_FORCE_TOKENS")
+HOOK_ENV = ("STRIX_BITCALC_LOGITS_OUT", "STRIX_BITCALC_FORCE_TOKENS", "STRIX_MOE_ROUTES_OUT", "STRIX_MOE_ROUTES_IN")
 CONFIG_BUDGET = 90.0      # seconds per invocation for --print-effective-config captures
 MAX_CAP_FRACTION = 0.9    # cap with no timing evidence yet: this share of the cap limit
 START_HEADROOM = 10.0     # least start-up allowance: preflight and repair before an invocation's first run
@@ -69,8 +69,13 @@ def load_arms(path, needed, *, data=None):
         if name not in arms:
             raise ValueError(f"arms file lacks arm {name}")
         spec = arms[name]
-        if set(spec) - {"env", "argv", "model", "model_receipt"}:
-            raise ValueError(f"arm {name}: only env, argv, model and model_receipt are allowed")
+        if set(spec) - {"env", "argv", "model", "model_receipt", "routes"}:
+            raise ValueError(f"arm {name}: only env, argv, model, model_receipt and routes are allowed")
+        # FAST gate v2 (MoE): {"out": true} records this arm's routes to routes/<case>.<arm>.rte; {"in": "REF"} replays
+        # arm REF's file of the same case (REF must run first in the case).
+        routes = spec.get("routes", {})
+        if not isinstance(routes, dict) or set(routes) - {"out", "in"} or not isinstance(routes.get("out", False), bool) or                 ("in" in routes and (not isinstance(routes["in"], str) or routes["in"] == name)):
+            raise ValueError(f"arm {name}: routes must be {{\"out\": bool, \"in\": \"OTHER_ARM\"}}")
         if ("model" in spec) != ("model_receipt" in spec):
             raise ValueError(f"arm {name}: model and model_receipt must be specified together")
         if set(spec.get("env", {})) & set(HOOK_ENV):
@@ -636,6 +641,16 @@ class Runner:
         env = clean_env(spec.get("env", {}))
         env["STRIX_BITCALC_LOGITS_OUT"] = str(bin_path)
         env["STRIX_BITCALC_FORCE_TOKENS"] = str(cont_file)
+        routes = spec.get("routes", {})
+        if routes.get("out") or "in" in routes:
+            (self.out / "routes").mkdir(parents=True, exist_ok=True)
+        if routes.get("out"):
+            env["STRIX_MOE_ROUTES_OUT"] = str(self.out / "routes" / f"{case['case_id']}.{arm_label}.rte")
+        if "in" in routes:
+            src = self.out / "routes" / f"{case['case_id']}.{routes['in']}.rte"
+            if not src.exists():
+                raise ValueError(f"{case['case_id']}.{arm_label}: replay source {src.name} missing (run arm {routes['in']} first)")
+            env["STRIX_MOE_ROUTES_IN"] = str(src)
         argv = self.launcher + [self.binary, self.models[arm_name], *map(str, ids), "--generate", str(case["cont_tokens"]),
                                 *spec.get("argv", [])]
         cap = self.cap(case["nominal_length"])

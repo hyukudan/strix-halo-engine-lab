@@ -121,7 +121,7 @@ int run_pair(const Options& options, const Runtime& runtime, std::span<const std
         while (const auto n = prompt_chunk_rows(prompt.size(), processed, state->frontier(), chunk)) {
             const auto begin = Clock::now();
             auto tx = state->begin();
-            (void)backend.prefill_rows(*tx, prompt.subspan(processed, n), false, false);
+            (void)backend.prefill_rows(*tx, prompt.subspan(processed, n), HiddenDemand::none, false);
             tx->commit(n);
             processed += n;
             const auto end = Clock::now();

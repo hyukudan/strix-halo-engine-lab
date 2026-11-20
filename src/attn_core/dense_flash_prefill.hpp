@@ -12,7 +12,8 @@
 // w / Split, head-dim slice w % Split): the slice's FP16 queries stay in registers as A fragments for the whole
 // row tile, the wave computes the slice's partial scores Q[16][D/Split] . K[16][D/Split]^T and owns the output
 // accumulators O[16][D/Split]. Per key tile:
-//   1. stage: the prefetched K rows ([key][D], padded pitch) and V^T rows ([d][16 keys]) go to LDS;   barrier
+//   1. stage: the prefetched K rows ([key][D], padded pitch) and V^T rows ([d][16 keys], the slot32 rows of
+//      core/lds_rows.hpp: conflict-free PV fragment reads, plain [d][16] rows read 2-way) go to LDS;    barrier
 //      the next tile's global loads are issued right away and land during the math;
 //   2. QK on WMMA, the Split partials go to LDS as FP32;                                             barrier
 //   3. every wave of the row tile sums the partials (fixed order), scales by scale*log2(e), applies the causal and
@@ -163,10 +164,10 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
                 const unsigned key = idx / (D / 8U), c = idx % (D / 8U);
                 *reinterpret_cast<U4*>(&ks[key * KP + 8U * c]) = kreg[i];
                 const unsigned d = idx >> 1, h = idx & 1U;
-                *reinterpret_cast<U4*>(&vs[d * 16U + 8U * h]) = vreg[i];
+                *reinterpret_cast<U4*>(&vs[8U * ::strix::core::lds_rows::slot32(d, h)]) = vreg[i];
                 if constexpr (Two) {
                     *reinterpret_cast<U4*>(&ks_lo[key * KP + 8U * c]) = klreg[i];
-                    *reinterpret_cast<U4*>(&vs_lo[d * 16U + 8U * h]) = vlreg[i];
+                    *reinterpret_cast<U4*>(&vs_lo[8U * ::strix::core::lds_rows::slot32(d, h)]) = vlreg[i];
                 }
             }
         }
@@ -276,13 +277,13 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
 #pragma unroll
                 for (unsigned e = 0; e < 8; ++e) c[e] *= scale[e];
                 if constexpr (Two) {
-                    const unsigned at = (d0 + 16U * f + rr) * 16U;
-                    const Frag vh = tile::frag32(&vs[at]);
-                    c = tile::mma<O>(pa, tile::frag32(&vs_lo[at]), c);
+                    const unsigned at = d0 + 16U * f + rr;
+                    const Frag vh = tile::frag_slot32(vs, at);
+                    c = tile::mma<O>(pa, tile::frag_slot32(vs_lo, at), c);
                     c = tile::mma<O>(pl, vh, c);
                     acc[f] = tile::mma<O>(pa, vh, c);
                 } else {
-                    acc[f] = tile::mma<O>(pa, tile::frag32(&vs[(d0 + 16U * f + rr) * 16U]), c);
+                    acc[f] = tile::mma<O>(pa, tile::frag_slot32(vs, d0 + 16U * f + rr), c);
                 }
             }
         }

@@ -112,6 +112,10 @@ captured graph; each replay first copies the 12 maps from pinned memory. The MTP
 the same way (positions and the pending token from pinned memory, maps 12..18). Kernel bodies and their operation order
 are unchanged, so the logits are bit-identical. Switches: `STRIX_QRTX_QSA_GRAPH=0` (cut graphs, eager cores) and
 `STRIX_QRTX_DRAFT_GRAPH=0` (eager draft chain), both default on.
+`STRIX_QRTX_COMMIT_ASYNC=1` (opt-in, not yet measured) returns from the decode commit without synchronising: the
+recurrent-state replay, conv rollback and MTP cache rows of the accepted rows finish on the stream while the host does
+its between-step work. The draft queues behind them, the next window synchronises first, and the launches and their
+order are unchanged (shared protocol `include/strix/spec/commit_tail.hpp`).
 The C1 draft chain runs as two graph segments [0, a) and [a, depth): the second only when no draft of the first fell
 below min_p (the verify would discard its steps). Kept drafts and verified tokens are unchanged; `a` comes from a
 histogram of kept drafts (shared chooser `include/strix/mtp_draft_split.hpp`, expected steps a + P(kept > a) (depth - a

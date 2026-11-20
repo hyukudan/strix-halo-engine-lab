@@ -16,8 +16,9 @@ inline constexpr unsigned v2_block = 128;
 // except the per-layer embedding model (fp16), with canonical attention.
 inline constexpr const char* v2_identity = "g4-wmma-pf-v2";
 inline constexpr const char* v2_policy = "ple_model=fp16;.*=hilo_k128";
-// Row bound of one prefill call (the identity chunk of plan()/Prompt).
-inline constexpr unsigned max_chunk_rows = chunk_rows;
+// Row bound of one prefill call. chunk_rows stays the identity chunk of plan()/Prompt and the attention piece: a
+// longer pass (CHUNK1024, WMMA linears) runs its attention in chunk_rows pieces aligned to absolute positions.
+inline constexpr unsigned max_chunk_rows = 2 * chunk_rows;
 enum class Mode { exact, wmma };
 // Empty/auto stays exact unless the coordinator supplies complete qualification
 // admission. Numerical-band helpers alone must never set wmma_admitted.
@@ -32,8 +33,9 @@ struct Chunk {
                                       std::uint32_t admitted_context = max_positions);
 // Host/runtime levers of the exact prefill chunk. Each one leaves every output
 // byte unchanged; a set bit in ChunkResult::levers says the lever ran for that
-// chunk (receipt engagement counter). Each is default on; STRIX_G4_PREFILL_<NAME>=0
-// turns it off. The switches are read per chunk so one process can A/B them.
+// chunk (receipt engagement counter). Existing levers are default on; STRIX_G4_PREFILL_<NAME>=0
+// turns them off. CHUNK1024 is opt-in (STRIX_G4_PREFILL_CHUNK1024=1), preserving 512-row default.
+// The switches are read per chunk so one process can A/B them.
 enum Lever : std::uint32_t {
     lever_pinned_taps = 1U << 0U, // PINNED_TAPS: taps/hidden through pinned asynchronous copies, only when consumed
     lever_device_finite = 1U << 1U, // DEVICE_FINITE: taps checked finite on the device, inside the failure fence
@@ -43,6 +45,7 @@ enum Lever : std::uint32_t {
     lever_decode24 = 1U << 5U, // DECODE24: Q4_K/Q6_K many-row decoders use the 24-bit integer multiply
     lever_shared_q6 = 1U << 6U, // SHARED_Q6: wide Q6_K many-row linears decode each weight once per workgroup (LDS)
     lever_last_kv = 1U << 7U, // LAST_KV: rows stop at the last K/V-owning (or tapped) layer (strix/prefill_row_liveness.hpp)
+    lever_chunk_1024 = 1U << 8U, // CHUNK1024: engine prompt passes of up to max_chunk_rows on WMMA linears (attention in pieces)
 };
 struct LeverName {
     Lever bit;
@@ -58,11 +61,33 @@ inline constexpr LeverName lever_names[] = {
     {lever_decode24, "decode24", "STRIX_G4_PREFILL_DECODE24"},
     {lever_shared_q6, "shared_q6", "STRIX_G4_PREFILL_SHARED_Q6"},
     {lever_last_kv, "last_kv", "STRIX_G4_PREFILL_LAST_KV"},
+    {lever_chunk_1024, "chunk_1024", "STRIX_G4_PREFILL_CHUNK1024"},
 };
+// Attention pieces of a pass segment of rows at absolute position start: split where the position crosses a multiple of
+// chunk_rows, so every piece has the rows, end position and stride that a chunk_rows pass gives it (same bytes).
+struct AttentionPiece {
+    unsigned offset = 0, rows = 0; // rows from the segment's first row
+    std::uint64_t start = 0;       // absolute position of the piece's first row
+};
+template <class F> void for_each_attention_piece(std::uint64_t start, unsigned rows, F&& f) {
+    for (unsigned r = 0; r < rows;) {
+        const auto position = start + r;
+        const auto left = std::uint64_t(chunk_rows) - position % chunk_rows;
+        const auto n = unsigned(left < rows - r ? left : rows - r);
+        f(AttentionPiece{r, n, position});
+        r += n;
+    }
+}
+[[nodiscard]] inline unsigned attention_piece_count(std::uint64_t start, unsigned rows) {
+    unsigned count = 0;
+    for_each_attention_piece(start, rows, [&](const AttentionPiece&) { ++count; });
+    return count;
+}
 [[nodiscard]] inline bool lever_enabled(Lever bit) {
     for (const auto& l : lever_names)
         if (l.bit == bit) {
             const auto* p = std::getenv(l.toggle);
+            if (bit == lever_chunk_1024) return p && *p && std::string_view(p) != "0";
             return !p || std::string_view(p) != "0";
         }
     return false;

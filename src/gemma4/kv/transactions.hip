@@ -2,6 +2,7 @@
 #include "storage.hpp"
 #include "gemma4/kernels/internal.hpp"
 #include "strix/model_content_hash.hpp"
+#include "strix/env_flags.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <string>
@@ -37,6 +38,38 @@ __global__ void publish_batch_kernel(const detail::Publication* descriptors, std
     if (d.width)
         publish_rows(d.k, d.v, d.tags, d.overlay_k, d.overlay_v, start, rows, d.slots, d.width, d.global);
 }
+// One block per (row, producer). The committed state equals the ordered loop above: every row of a commit owns a
+// distinct slot except on a ring that the commit itself wraps, where only the last `slots` rows survive the ordered
+// loop, so earlier rows are skipped here. Each row's tag is stored after that row's K/V; nothing reads the cache
+// before commit synchronizes the queue.
+__global__ void publish_grid_kernel(const detail::Publication* descriptors, std::uint64_t start, unsigned rows) {
+    const auto d = descriptors[blockIdx.y];
+    const unsigned r = blockIdx.x;
+    if (!d.width || (!d.global && rows - r > d.slots))
+        return;
+    const auto p = start + r;
+    const auto slot = d.global ? p : p % d.slots;
+    const std::size_t dst = std::size_t(slot) * d.width, src = std::size_t(r) * d.width;
+    if (d.width % 4 == 0) {
+        const auto* ok = reinterpret_cast<const float4*>(d.overlay_k + src);
+        const auto* ov = reinterpret_cast<const float4*>(d.overlay_v + src);
+        auto* k = reinterpret_cast<float4*>(d.k + dst);
+        auto* v = reinterpret_cast<float4*>(d.v + dst);
+        for (unsigned i = threadIdx.x; i < d.width / 4; i += blockDim.x) {
+            const float4 a = ok[i], b = ov[i];
+            k[i] = a;
+            v[i] = b;
+        }
+    } else
+        for (unsigned i = threadIdx.x; i < d.width; i += blockDim.x) {
+            const float a = d.overlay_k[src + i], b = d.overlay_v[src + i];
+            d.k[dst + i] = a;
+            d.v[dst + i] = b;
+        }
+    __syncthreads();
+    if (threadIdx.x == 0)
+        d.tags[slot] = p;
+}
 __global__ void store_kernel(const float* k, const float* v, const KvWrite* dst, unsigned width) {
     const auto r = blockIdx.x;
     for (unsigned i = threadIdx.x; i < width; i += blockDim.x) {
@@ -56,6 +89,26 @@ void stream_copy(Queue q, void* dst, const void* src, std::size_t bytes, hipMemc
     stream_checked(hipStreamSynchronize(static_cast<hipStream_t>(q)));
 }
 } // namespace
+namespace detail {
+void launch_publication(const Publication* descriptors, unsigned producers, std::uint64_t start, unsigned rows,
+                        PublishOrder order, void* queue) {
+    if (!rows || !producers)
+        return;
+    const auto stream = static_cast<hipStream_t>(queue);
+    if (order == PublishOrder::grid)
+        hipLaunchKernelGGL(publish_grid_kernel, dim3(rows, producers), dim3(128), 0, stream, descriptors, start, rows);
+    else
+        hipLaunchKernelGGL(publish_batch_kernel, dim3(producers), dim3(128), 0, stream, descriptors, start, rows);
+    launch_checked();
+}
+PublishOrder publish_order() {
+    // Opt-in (=1) enables the grid after end-to-end qualification; keep the historical ordered publish by default.
+    // The byte-equivalent per-(row,producer) implementation remains available for explicit measurement.
+    static const PublishOrder order =
+        envcfg::flag("STRIX_G4_KV_PUBLISH_GRID", false, EnvFlagMatch::exact) ? PublishOrder::grid : PublishOrder::ordered;
+    return order;
+}
+} // namespace detail
 DeviceStream::Impl::~Impl() {
     if (pinned_publication)
         (void)hipHostFree(pinned_publication);
@@ -104,10 +157,8 @@ void DeviceStream::Impl::Txn::commit(std::size_t count) {
                                               hipMemcpyHostToDevice, static_cast<hipStream_t>(stream->queue)));
             } else
                 stream->publication.upload(descriptors.data(), bytes);
-            hipLaunchKernelGGL(publish_batch_kernel, dim3(unsigned(descriptors.size())), dim3(128), 0,
-                               static_cast<hipStream_t>(stream->queue),
-                               stream->publication.as<detail::Publication>(), start, unsigned(count));
-            launch_checked();
+            detail::launch_publication(stream->publication.as<detail::Publication>(), unsigned(descriptors.size()),
+                                       start, unsigned(count), detail::publish_order(), stream->queue);
         } else if (count)
             for (std::size_t l = 0; l < stream->cache.size(); ++l) {
                 auto& c = stream->cache[l];

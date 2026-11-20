@@ -409,6 +409,8 @@ struct DeviceDistRank::Impl {
     DistAccel* acc = nullptr;  // FAST-class accelerators of the current forward (nullptr = dense)
     std::int64_t last_started = -1;
     std::uint64_t request = 0;
+    Buf rope_c, rope_s;          // uploaded ForwardTables::rope, valid while rope_id matches (0 = none)
+    std::uint64_t rope_id = 0;
     Buf digests;             // [nblocks][2] unsigned long long (device digests of the owned key blocks)
     Buf norms;               // [nblocks][3] unsigned: max ||q||, max ||k|| (fp32 bits), max |V| (bf16 bits) of the rank's rows
 
@@ -613,7 +615,15 @@ DeviceRunResult DeviceDistRank::run_blocks(const ForwardTables& t, std::uint32_t
     };
     DeviceRunResult res;
     // per-forward tables (all S rows on both ranks; the rank reads its own rows)
-    Buf d_temb = upload(t.t_emb), d_rc = upload(t.rope.c), d_rs = upload(t.rope.s), d_mrow = upload(t.mod_row);
+    // The rope depends only on the layout: keep the uploaded copy while ForwardTables::rope_id is unchanged.
+    if (!t.rope_id || t.rope_id != I.rope_id) {
+        I.rope_id = 0;
+        I.rope_c = upload(t.rope.c);
+        I.rope_s = upload(t.rope.s);
+        I.rope_id = t.rope_id;
+    }
+    const Buf &d_rc = I.rope_c, &d_rs = I.rope_s;
+    Buf d_temb = upload(t.t_emb), d_mrow = upload(t.mod_row);
     const std::uint32_t nt = t.n_t, mrows = nt * 3U;
     Buf d_ada(std::size_t{nt} * 6U * kHidden * 3U * 4U);
     Buf d_mod[6];

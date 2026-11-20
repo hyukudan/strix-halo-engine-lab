@@ -9,7 +9,7 @@
 
 #if !defined(STRIX_G4_DRAFT_ROWS_API)
 int main() {
-    std::printf("SKIP: staged-rows draft API (DraftSession propose_window/wants_hidden/stage_rows) is not applied\n");
+    std::printf("SKIP: staged-rows draft API (DraftSession propose_window/hidden_demand/stage_rows) is not applied\n");
     return 0;
 }
 #else
@@ -67,7 +67,7 @@ struct MultiCandidate final : en::DraftSession {
     }
     void append(std::span<const float> t, std::span<const std::uint64_t> p) override { inner->append(t, p); }
     void attach(en::StreamState& state) override { inner->attach(state); }
-    bool wants_hidden() const override { return inner->wants_hidden(); }
+    strix::gemma4::HiddenDemand hidden_demand() const override { return inner->hidden_demand(); }
     void stage_rows(std::span<const float> t, std::span<const float> h, std::span<const std::uint32_t> n,
                     std::span<const std::uint64_t> p) override { inner->stage_rows(t, h, n, p); }
     void stage(std::span<const float> t, std::span<const std::uint64_t> p) override { inner->stage(t, p); }
@@ -132,7 +132,7 @@ struct Recording final : en::DraftSession {
     }
     void append(std::span<const float> t, std::span<const std::uint64_t> p) override { inner->append(t, p); }
     void attach(en::StreamState& state) override { inner->attach(state); }
-    bool wants_hidden() const override { return inner->wants_hidden(); }
+    strix::gemma4::HiddenDemand hidden_demand() const override { return inner->hidden_demand(); }
     void stage_rows(std::span<const float> t, std::span<const float> h, std::span<const std::uint32_t> n,
                     std::span<const std::uint64_t> p) override { inner->stage_rows(t, h, n, p); }
     void stage(std::span<const float> t, std::span<const std::uint64_t> p) override { inner->stage(t, p); }

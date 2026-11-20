@@ -30,6 +30,10 @@ struct IndexProjView {
     float* iq;                // rows x 256
     float* ik;                // rows x 128
     std::uint32_t rows;
+    // 0 = every output; kProjQ = the index key only (iq not written): the caller's step selects every block
+    // (strix/sparse_select_policy.hpp), so no kernel reads iq. Honoured by the decode register-ring kernel (the decode
+    // route); the other forms compute every output (a superset, same ik bits).
+    std::uint32_t first_out = 0;
 };
 // Picks the decode kernel for rows <= 8 (ring 32 for one row, ring 16 + row pairs per wave above: measured) and the
 // slab kernel above (all exact). STRIX_MMATTN_PROJ_RING / STRIX_MMATTN_PROJ_SPLIT=0 override for benches.

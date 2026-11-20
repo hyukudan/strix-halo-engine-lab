@@ -35,12 +35,20 @@ inline std::vector<std::string> split(const std::string& text) {
     while (std::getline(in, item, ',')) if (!item.empty()) out.push_back(item);
     return out;
 }
-// The receipt without wall-clock timings and lever engagement fields.
-inline std::string comparable(const Json& receipt) {
+// The receipt without wall-clock timings and lever engagement fields. With 1024-row passes on either side (CHUNK1024)
+// the prompt takes fewer, longer calls: target_calls is then the only other field allowed to differ.
+inline std::string comparable(const Json& receipt, bool calls_may_differ = false) {
     Json out = Json::object();
     for (const auto& [key, value] : receipt.as_object())
-        if (key != "timings" && key != "prefill_levers" && key != "prefill_taps" && key != "ab_run_ms" && key != "ab_graphs") out.set(key, value);
+        if (key != "timings" && key != "prefill_levers" && key != "prefill_taps" && key != "ab_run_ms" && key != "ab_graphs" &&
+            !(calls_may_differ && key == "target_calls"))
+            out.set(key, value);
     return out.dump();
+}
+// The receipt ran at least one 1024-row prefill pass (CHUNK1024 engaged).
+inline bool wide_passes(const Json& receipt) {
+    const auto* levers = receipt.find("prefill_levers");
+    return levers && levers->find("chunk_1024");
 }
 inline double number(const Json& j, const char* object, const char* key) {
     const auto* o = j.find(object); const auto* v = o ? o->find(key) : nullptr;
@@ -136,7 +144,8 @@ inline int run(int argc, char** argv) {
                     const auto ms = decode ? receipt.find("ab_run_ms")->as_double() : number(receipt, "timings", "prefill_ms");
                     const auto state = receipt.find("state_digest")->as_string(), produced = receipt.find("ids") ? receipt.find("ids")->dump() : "";
                     if (!first.set) { first.receipt = receipt; first.digest = state; first.ids = produced; first.set = true; }
-                    const auto text = comparable(receipt), reference = comparable(first.receipt);
+                    const bool calls_may_differ = wide_passes(receipt) || wide_passes(first.receipt);
+                    const auto text = comparable(receipt, calls_may_differ), reference = comparable(first.receipt, calls_may_differ);
                     const bool equal_state = state == first.digest && produced == first.ids, equal_receipt = text == reference;
                     same &= equal_state; receipts &= equal_receipt;
                     (arm == "on" ? on : off).push_back(ms);

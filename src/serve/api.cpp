@@ -1056,7 +1056,11 @@ struct ApiService::Impl {
             auto effort = v->as_string();
             if (effort == "minimal") effort = "low";
             if (effort == "none") input.enable_thinking = false;
-            else input.reasoning_effort = effort;
+            else {
+                const auto& off = config.thinking_off_efforts;
+                if (std::find(off.begin(), off.end(), effort) != off.end()) input.enable_thinking = false;
+                input.reasoning_effort = effort;
+            }
         }
         std::string text;
         try { text = config.chat_renderer ? config.chat_renderer(input) : render_chat_template(input); }

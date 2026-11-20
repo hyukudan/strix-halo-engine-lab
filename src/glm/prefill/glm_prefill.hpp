@@ -21,7 +21,8 @@ void kda_prefill(const dev::KdaDev& k, const float* qkv, const float* f, const f
 // Profiling hook (bench only): when set, kda_prefill records 5 events (before prep, conv commit, scan, out, after).
 void set_kda_profile(hipEvent_t* ev5);
 // Explicit KDA scan version for bitwise gates and paired timing (same bits): 1 = v1 (shuffle tree), 3 = v3 (quad-DPP
-// tree), 5 = v5 (v3 with the batch fill off the serial path); 0 = the default (v5; STRIX_GLM_PF_KDA_SCAN=3 / 1).
+// tree), 5 = v5 (v3 with the batch fill off the serial path), 6 = v6 (v5 with the prep kernel fused into the batch fill;
+// scratch and beta are not written); 0 = the default (v5; STRIX_GLM_PF_KDA_SCAN=6 / 3 / 1).
 void set_kda_scan_version(unsigned v);
 
 // ---- DSA indexer + MLA. The slot holds positions [0, t0) on entry.
@@ -68,7 +69,9 @@ void mla_attention_rows(const dev::DsaSlot& slot, const std::uint32_t* tokens, c
                         hipStream_t s);
 void mla_attention_rows(const dev::DsaSlot& slot, const std::uint32_t* tokens, const std::uint32_t* n, const float* q,
                         const std::uint16_t* kv_b, unsigned heads, float* qt, float* e, float* ob, float* o, unsigned C,
-                        hipStream_t s, unsigned query_window);
+                        hipStream_t s, unsigned query_window, unsigned max_keys = ~0U);
+// max_keys: host upper bound of every row's list length (attn_core causal_list_bound of the chunk end; ~0U = unknown,
+// the list capacity kMaxTokens). Selects the FAST flash core's Pf loads only (bitwise either way).
 
 // Scores v7 (heads 32; heads 64 runs v5) and o-bar v10 are the defaults (STRIX_GLM_PF_SCORES=6 / STRIX_GLM_PF_OBAR=7
 // restore the previous ones); STRIX_GLM_PF_OBAR=6 opts into o-bar v6 (exact, slower: not a default).

@@ -15,11 +15,11 @@ public:
     ForwardResult forward_rows(std::span<const RowPlan> rows) override {
         ForwardPlan plan(*this,rows); execute(plan); return std::move(plan.result);
     }
-    PrefillRows prefill_rows(KvTxn& tx,std::span<const std::uint32_t> tokens,bool export_hidden,bool taps) override {
+    PrefillRows prefill_rows(KvTxn& tx,std::span<const std::uint32_t> tokens,HiddenDemand export_hidden,bool taps) override {
         const PrefillItem item{&tx,tokens}; PrefillPlan plan(*this,{&item,1},export_hidden,taps,false);
         execute(plan); return std::move(plan.result.at(0));
     }
-    std::vector<PrefillRows> prefill_rows_batch(std::span<const PrefillItem> items,bool export_hidden,bool taps) override {
+    std::vector<PrefillRows> prefill_rows_batch(std::span<const PrefillItem> items,HiddenDemand export_hidden,bool taps) override {
         PrefillPlan plan(*this,items,export_hidden,taps,true);execute(plan);return std::move(plan.result);
     }
     std::size_t prefill_chunk_rows() const override {return target_.prefill_chunk_rows();}

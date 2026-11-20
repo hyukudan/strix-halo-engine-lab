@@ -1,20 +1,23 @@
 #pragma once
 // Work model of exact speculation on the qwen35 HIP dense binding (Strix Halo gfx1151, 27B IU4 pack): the fixed costs
 // the shared controller prices every decision with (strix/spec/block_drafter.hpp BlockConfig::fixed_costs), the same
-// mechanism and arm shape as the CUDA dense app's sub15d (apps/cuda_qwen35_spec_main.cu, cc_decode3), with this node's
+// mechanism and arm shape as the CUDA dense app's speculative arm (apps/cuda_qwen35_spec_main.cu), with this device's
 // numbers. Decisions are a pure function of (this model, acceptance history): no wall clock enters them.
 //   verify  V(r) = the measured wall of r's IU4 row bucket (1/2/4/8/16): the dense core computes the whole bucket
 //           (src/core/dense_linear_iu4.hpp), rows <= 8 are one weight stream, 9-16 two 8-row calls.
 //   draft   first position (flush: catch-up of the accepted rows + head + host sync) and each further position:
 //           MTP layer (Q8_0, 0.45 GB) + the draft head's rows (full IU4 head 0.71 GB x fraction f) at ~190 GB/s.
-// Learned walls (the previous form, `fixed = false`) froze depths at their first sample: on this node a 3-row window
+// Learned walls (the previous form, `fixed = false`) froze depths at their first sample: on the reference device a 3-row window
 // costs 127 ms under the old partial-bucket core, so the first k = 2 decision priced every non-bucket depth out
-// (receipt HDD2-T1: code k ~ 1, E 1.90). Host-compilable (no HIP): tests/hip_dense_spec_costs_tests.cpp.
+// (measured receipt of the reference device: code k ~ 1, E 1.90). Host-compilable (no HIP): tests/hip_dense_spec_costs_tests.cpp.
 // Cost source (HipDenseCosts): "calibrated" (default) = the walls of this device and model, measured once per process at
 // decode start (hip_spec_defaults.hpp hip_dense_measure_costs: verify windows of each row bucket after the prompt); the
 // draft prices follow from the model's MTP-layer and head bytes at the stream rate V(1) implies (one row streams every
-// weight once). "table" = the compiled cluster1 receipt below, a FALLBACK only (calibration off or invalid), reported as
+// weight once). "table" = the compiled receipt of the reference device below, a FALLBACK only (calibration off or invalid), reported as
 // such on the run's spec config line. The same flags and resolver serve every entry point (HipDenseSpecArgs).
+// Exact tensor-parallel decode (--tp-rank) is the one forced use of the table: every rank must choose the same verify
+// windows, so it runs the table, labelled "table (forced: ranks must agree)"; an explicit calibrated / learned request
+// with --tp-rank is refused (a TP-calibrated table agreed by both ranks is the follow-up).
 // Home: qwen35 HIP binding (shared resolver of the family); the controller itself is shared (src/spec).
 #include <cmath>
 #include <cstdint>
@@ -25,7 +28,7 @@
 
 namespace strix::qwen35 {
 
-// FALLBACK table (not a policy): verify wall per full row bucket, ms (HDD2-T1 cost table, cluster1, commit full, ctx 256+).
+// FALLBACK table (not a policy; forced only under exact TP decode, see above): verify wall per full row bucket, ms (measured receipt of the reference device, commit full, ctx 256+).
 inline constexpr std::uint32_t kHipDenseBucketRows[] = {1U, 2U, 4U, 8U, 16U};
 inline constexpr double kHipDenseBucketMsScalar[] = {73.141, 73.747, 76.526, 82.637, 126.841};  // STRIX_IU4_SCALAR_X on (default)
 inline constexpr double kHipDenseBucketMsVector[] = {76.646, 76.934, 89.104, 118.866, 214.443};  // STRIX_IU4_SCALAR_X=0
@@ -102,6 +105,7 @@ struct HipDenseSpecArgs {
     std::string draft_packs;
     HipDenseCostMode costs = HipDenseCostMode::calibrated;
     std::string cost_kv = "auto";  // --cost-kv auto|online|off|KV: context cost of the table / calibrated model (hip_dense_cost_kv)
+    bool costs_explicit = false;  // --spec-costs was given (exact TP decode refuses an explicit non-table choice)
 };
 [[nodiscard]] inline const char* hip_dense_cost_mode_name(HipDenseCostMode m) {
     return m == HipDenseCostMode::calibrated ? "calibrated" : m == HipDenseCostMode::table ? "table" : "learned";
@@ -119,6 +123,7 @@ bool parse_hip_dense_spec_arg(const std::string& flag, Next&& next, HipDenseSpec
         a.draft_packs = next();
     } else if (flag == "--spec-costs") {
         const std::string v = next();
+        a.costs_explicit = true;
         if (v == "calibrated") a.costs = HipDenseCostMode::calibrated;
         else if (v == "table" || v == "fixed") a.costs = HipDenseCostMode::table;
         else if (v == "learned") a.costs = HipDenseCostMode::learned;
