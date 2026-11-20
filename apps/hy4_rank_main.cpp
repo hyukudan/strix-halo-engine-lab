@@ -513,12 +513,13 @@ int run(int argc, char** argv) {
         else throw std::invalid_argument("unknown argument " + a);
     }
     // A pair width picked from --window-costs is a prompt_rows setting like --prompt-rows: the resolver stamps it.
-    // On the interleaved pair route (no two-stage option, windows on) the shared planner picks the width from the prompt
-    // length and the measured pair cost (hy4_hip_plan.hpp pair_stage_plan); the width changes no bit.
+    // On the interleaved pair route (no two-stage option) the shared planner picks the width from the prompt
+    // length and the measured pair cost (hy4_hip_plan.hpp pair_stage_plan); the width changes no bit. The pair always runs
+    // in windows, so the pick does not wait for a profile width: a profile whose prompt_rows lever is pending leaves 0 here.
     const bool stage_route = stage_map.empty() && cut == 0U && !pipe_guess && window_costs.empty();
     if (std::getenv("HY4_RANK") != nullptr && !rows_explicit) {
         std::uint32_t picked = strix::hy4::hipbind::pair_window_rows(prompt.size(), window_costs);
-        if (picked == 0U && stage_route && o.prompt_rows != 0U && !o.parts.empty() && !prompt.empty()) {
+        if (picked == 0U && stage_route && !o.parts.empty() && !prompt.empty()) {
             const std::uint32_t depth = o.depth != 0U ? o.depth : strix::hy4::Config::from_gguf(o.parts.front()).layers;
             picked = strix::hy4::hipbind::pair_stage_plan(prompt.size(), depth).choice.chunk;
         }
