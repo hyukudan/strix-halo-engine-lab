@@ -198,10 +198,10 @@ enum class Epi : std::uint32_t {
 //   bulk: one producer warp copies each record with one 1-D bulk copy into a full / empty mbarrier ring; the eight MMA warps
 //         wait for and release each stage per warp.
 enum class Feed : std::uint32_t { lsu, bulk };
-// Default feed of every FAST4 tile GEMM: bulk. Measured on sm_120 at 4,096 rows (no model, same binary, ABAB): bulk == lsu
-// bitwise in every fixture check and bulk/lsu = 0.93 glu, 0.92 down, 0.93 down_r, 0.85-0.86 o / o_r, 0.85 kv, 0.98 qkv.
-// lsu stays the governed rollback (engine option --prefill-tile-feed lsu); the choice never enters an identity.
-inline constexpr Feed kDefaultFeed = Feed::bulk;
+// Keep the established lsu feed by default. The measured bulk feed is explicit opt-in until end-to-end
+// FAST4 prefill regression and bitwise receipts are available on the target CUDA hardware.
+// --prefill-tile-feed lsu restores this default; feed does not alter the arithmetic identity.
+inline constexpr Feed kDefaultFeed = Feed::lsu;
 inline constexpr const char* feed_name(Feed f) { return f == Feed::bulk ? "bulk" : f == Feed::lsu ? "lsu" : "?"; }
 // Strict spelling "bulk" | "lsu"; anything else returns false and leaves *out unchanged.
 inline bool parse_feed(const char* s, Feed* out) {
