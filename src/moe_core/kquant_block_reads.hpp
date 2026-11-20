@@ -65,3 +65,32 @@ inline constexpr unsigned d_from_block = 208U;  // 16-bit load
 static_assert(all_reads_in_block(), "Q6_K down decode reads outside its block");
 
 }  // namespace strix::moe_core::q6k_reads
+
+// Q4_K reads of the f16x K-quant envelope (down trait F16xKQuantDown<12> and the gate/up body's header reuse): a 144-byte
+// superblock is a 16-byte header (FP16 d, FP16 dmin, 12 scale bytes) and 128 qs bytes; the 64-K step s reads qs bytes
+// 16+32(s%4)..47+32(s%4). The two register stages of the K loop (grouped_f16.hpp pipeline) alternate by step parity and
+// fetch(s+2) refills the stage that step s just consumed, so the stage that receives step s last held step s-2: for s%4 >= 2
+// that is the same superblock, and its header is not requested again (rows are whole superblocks: steps % 4 == 0).
+namespace strix::moe_core::q4k_reads {
+inline constexpr unsigned block_bytes = 144U, header_bytes = 16U;
+[[nodiscard]] constexpr bool header_load(unsigned step) { return step % 4U < 2U; }
+[[nodiscard]] constexpr unsigned qs_from_block(unsigned step) { return header_bytes + 32U * (step % 4U); }
+// Replay of the pipeline's fetch / stage order (fetch 0, fetch 1, then per pair: stage s, fetch s+2, stage s+1, fetch s+3):
+// true iff every stage decodes the header of its own superblock s/4.
+[[nodiscard]] constexpr bool headers_held(unsigned steps) {
+    if (steps == 0U || steps % 4U != 0U) return false;
+    int held[2] = {-1, -1};
+    const auto fetch = [&](unsigned s) { if (header_load(s)) held[s % 2U] = static_cast<int>(s / 4U); };
+    fetch(0U);
+    fetch(1U);
+    for (unsigned s = 0U; s < steps; s += 2U) {
+        if (held[0] != static_cast<int>(s / 4U)) return false;
+        if (s + 2U < steps) fetch(s + 2U);
+        if (held[1] != static_cast<int>((s + 1U) / 4U)) return false;
+        if (s + 3U < steps) fetch(s + 3U);
+    }
+    return true;
+}
+static_assert(headers_held(4U) && headers_held(24U) && headers_held(64U), "Q4_K header reuse decodes a stale header");
+
+}  // namespace strix::moe_core::q4k_reads
