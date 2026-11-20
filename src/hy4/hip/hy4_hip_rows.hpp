@@ -13,6 +13,7 @@
 #include "strix/spec/block_drafter.hpp"
 #include "strix/spec/engine_target.hpp"
 #include "strix/spec/mtp_chain.hpp"
+#include "strix/spec/pair_round.hpp"
 
 #include <algorithm>
 #include <array>
@@ -208,13 +209,33 @@ private:
     float* last_ = nullptr;
 };
 
+// The next-token block tensor-parallel for one decode (Forward::set_nextn_tp), the one-node form again after it.
+template <class Fwd>
+class NextnTp {
+public:
+    NextnTp(Fwd& f, bool on) : f_(f), on_(on) {
+        if (on_) f_.set_nextn_tp(true);
+    }
+    ~NextnTp() {
+        if (on_) f_.set_nextn_tp(false);
+    }
+    NextnTp(const NextnTp&) = delete;
+    NextnTp& operator=(const NextnTp&) = delete;
+
+private:
+    Fwd& f_;
+    bool on_;
+};
+
 // Verify target of the chain arm: the rows contract plus the chain's view of each pass (the committed rows' hidden).
 template <class Fwd>
 class ChainVerifyTarget final : public spec::VerifyTarget {
 public:
     ChainVerifyTarget(Fwd& f, MtpDrafter<Fwd>& chain) : f_(f), chain_(chain) {}
     void verify(std::span<const std::uint32_t> tokens, std::vector<std::uint32_t>& greedy) override {
+        const auto t0 = std::chrono::steady_clock::now();
         f_.forward_rows(tokens, false);  // synchronises
+        verify_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         const auto g = f_.rows_greedy();
         const auto R = static_cast<std::uint32_t>(tokens.size());
         if (g.size() < R) throw std::logic_error("hy4 rows: verify greedy rows");
@@ -222,10 +243,12 @@ public:
         chain_.observe_verify(typename MtpEngine<Fwd>::Rows{nullptr, nullptr, f_.rows_hidden()}, R);
     }
     void commit(std::uint32_t k) override { f_.commit_rows(k); }
+    [[nodiscard]] double verify_ms() const noexcept { return verify_ms_; }  // wall of the verify passes (receipt)
 
 private:
     Fwd& f_;
     MtpDrafter<Fwd>& chain_;
+    double verify_ms_ = 0.0;
 };
 
 struct SpecOptions {
@@ -239,6 +262,9 @@ struct SpecOptions {
     std::vector<double> chain_survival;
     double survival_weight = 8.0;
     bool copy = true;  // the copy source (and the hybrid copy + chain block); false = chain only
+    // tensor-parallel pair: the next-token block runs on both ranks with their shares (Forward::set_nextn_tp; rank 1 replays
+    // the draft rounds on its own chain); false = the one-node block on rank 0 while rank 1 waits. Both ranks must agree.
+    bool draft_tp = true;
 };
 struct SpecResult {
     std::vector<std::uint32_t> ids;                   // emitted ids, ids[0] = the anchor
@@ -249,6 +275,7 @@ struct SpecResult {
     // chain arm: next-token block calls / rows, chain drafts, their wall (ms) and synchronising id reads
     std::uint64_t chain_calls = 0, chain_rows = 0, chain_drafts = 0, chain_reads = 0;
     double chain_ms = 0;
+    double verify_ms = 0;  // chain arm: wall of the verify passes (forward_rows, synchronised)
 };
 
 namespace detail {
@@ -301,25 +328,57 @@ SpecResult spec_run(Fwd& f, std::span<const std::uint32_t> prompt, std::uint32_t
 // Output ids are those of plain greedy decode when forward_rows rows == step (the shared controller emits only the
 // target's own greedy ids: accepted drafts equal them, the first mismatch is replaced by the target's id).
 template <class Fwd>
-SpecResult spec_decode(Fwd& f, std::span<const std::uint32_t> prompt, std::uint32_t anchor, std::uint32_t n, const SpecOptions& o) {
+SpecResult spec_decode(Fwd& f, std::span<const std::uint32_t> prompt, std::uint32_t anchor, std::uint32_t n, const SpecOptions& o,
+                       const spec::pair_round::Exchange* pair = nullptr) {
     VerifyEngine<Fwd> engine(f);
     spec::EngineVerifyTarget<VerifyEngine<Fwd>> target(engine);
-    return detail::spec_run(f, prompt, anchor, n, o, nullptr, {}, target);
+    if (pair == nullptr) return detail::spec_run(f, prompt, anchor, n, o, nullptr, {}, target);
+    spec::pair_round::PairVerifyLeader lead(target, *pair, [&f] { return std::uint64_t{f.position()}; });
+    auto res = detail::spec_run(f, prompt, anchor, n, o, nullptr, {}, lead);
+    lead.finish();
+    return res;
 }
 // The same with the next-token block chain (`mtp` installed before the prefill and finished with the anchor): the copy,
 // chain and hybrid arms (copy and hybrid unless o.copy is false). The chain changes which rows are verified, never an id.
 template <class Fwd>
 SpecResult spec_decode(Fwd& f, std::span<const std::uint32_t> prompt, std::uint32_t anchor, std::uint32_t n, const SpecOptions& o,
-                       MtpSource<Fwd>& mtp) {
+                       MtpSource<Fwd>& mtp, const spec::pair_round::Exchange* pair = nullptr) {
     auto& ch = mtp.chain();
     ChainVerifyTarget<Fwd> target(f, ch);
-    auto res = detail::spec_run(f, prompt, anchor, n, o, &ch, o.chain_survival, target);
+    SpecResult res;
+    if (pair == nullptr) res = detail::spec_run(f, prompt, anchor, n, o, &ch, o.chain_survival, target);
+    else {  // tensor-parallel pair, rank 0: the drafter here, every verify also on rank 1 (spec_follow); with draft_tp every
+            // chain draft too (rank 1 runs the same draft calls on its own chain: draft rounds)
+        spec::pair_round::PairVerifyLeader lead(target, *pair, [&f] { return std::uint64_t{f.position()}; });
+        const NextnTp tp(f, o.draft_tp);
+        res = detail::spec_run(f, prompt, anchor, n, o, o.draft_tp ? &lead.chain(ch) : &ch, o.chain_survival, lead);
+        lead.finish();
+    }
     res.chain_calls = ch.calls();
     res.chain_rows = ch.rows();
     res.chain_drafts = ch.drafts();
     res.chain_reads = ch.host_reads();
     res.chain_ms = ch.draft_wall_ms();
+    res.verify_ms = target.verify_ms();
     return res;
+}
+
+// Tensor-parallel pair, rank 1 (Forward::enable_tp on both ranks): no drafter; replays rank 0's verify passes and commits
+// (strix/spec/pair_round.hpp) until its end message, which carries rank 0's position (checked).
+template <class Fwd>
+spec::pair_round::FollowResult spec_follow(Fwd& f, const spec::pair_round::Exchange& pair) {
+    VerifyEngine<Fwd> engine(f);
+    spec::EngineVerifyTarget<VerifyEngine<Fwd>> target(engine);
+    return spec::pair_round::pair_follow(target, pair, [&f] { return std::uint64_t{f.position()}; });
+}
+// The same with rank 0's drafter on both ranks (SpecOptions::draft_tp on both): `mtp` installed before this rank's prefill
+// of the same prompt and finished with the same anchor; its chain replays rank 0's draft rounds (draft ids cross-checked).
+template <class Fwd>
+spec::pair_round::FollowResult spec_follow(Fwd& f, const spec::pair_round::Exchange& pair, MtpSource<Fwd>& mtp) {
+    auto& ch = mtp.chain();
+    ChainVerifyTarget<Fwd> target(f, ch);
+    const NextnTp tp(f, true);
+    return spec::pair_round::pair_follow(target, pair, [&f] { return std::uint64_t{f.position()}; }, &ch);
 }
 
 }  // namespace strix::hy4::hipbind::rows

@@ -5736,3 +5736,27 @@ envelope of the known-rows MoE down (`PrefillRows::rawdots_bf16`).
 - **Measured gain:** One node, 4096-token bench prompt (a ~66-token sequence repeated), 2048-row windows, alternated
   A-B / B-A: warm prompt 7,680 / 7,694 ms -> 7,307 / 7,409 ms (-4.3 %), cold 7,879 / 7,942 -> 7,593 / 7,557 ms (-4.2 %).
 - **Implementation / evidence:** [dense core](../src/core/f16_dense_q8a8.hpp), [known-rows down](../src/hip_moe_q4k_a8_known_rows.hip), [binding](../src/hy4/hip/hy4_hip_forward.hip)
+
+### Hy4-flash exact tensor-parallel decode over two nodes
+
+**Engine:** `hy4` (HIP). **Control:** `--tp-rank 0|1` on both ranks of `strix-hy4-rank` (`--tp-rates A,B` required,
+`--tp-transport`, `--tp-trip-us`, `--tp-force`; needs `--prompt-rows`). **Default:** off (one node) unless `--tp-rank`
+is given; with it, the shared split planner (`include/strix/pair/split_plan.hpp`, the decode pass described as stages
+by `include/strix/hy4/tp_layout.hpp` decode_stages) keeps the decode on one node when the group does not win (unless
+`--tp-force`).
+
+Each rank loads the whole pack and prefills alone (replicated, same bits). From the first decode step
+(`Forward::enable_tp`), each rank computes its share and the shared pair gather (`include/strix/pair/gather_link.hpp`,
+HIP side `src/xport/tp_gather_hip.hpp`) swaps the halves: attention by heads (gate, q_b, rope, K_b, the query image, the
+sparse flash as one 16-head tile per rank on indexed layers or one of the two 32-head groups on sliding layers, V_b,
+the gate; then o joined), o_proj by output rows, the layer-0 FFN by rows, the routed experts by slot (A8 probe / down
+over 8 of the 16 slots at the rank's ids) with the shared expert's gate/up rows in the same join, the head by
+vocabulary rows. Router, latent down / up, the shared down projection, hyper-connection sites, norms, Engram, the
+indexer and the greedy pick stay replicated. The shares are written where `tp_layout.hpp` places them, so the gathered
+buffer is the one-node buffer (no join pass): 128 gathers per token. Every split output is a whole per-head / per-row /
+per-slot result of the same kernel and the combine runs over all 16 slot rows in slot order.
+- **Off switch:** omit `--tp-rank`.
+- **Exactness evidence:** generated ids equal the one-node run on both ranks (300 of 300 and 128 of 128, 1024-token
+  prompt); host test `tests/hy4_tp_layout_tests.cpp` (shares tile, the MoE join leaves the slot rows contiguous, the
+  planner's joins equal the step's gathers).
+- **Measured:** one node | pair | one node: 16.52 | 19.92 | 16.51 tok/s (host-staged gather route, +21 %).

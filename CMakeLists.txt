@@ -1346,6 +1346,11 @@ if(BUILD_TESTING)
     target_compile_features(strix-q8-0-rule-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-q8-0-rule-tests)
     add_test(NAME strix-q8-0-rule-tests COMMAND strix-q8-0-rule-tests)
+    add_executable(strix-pair-bf16-wire-tests tests/pair_bf16_wire_tests.cpp)
+    target_include_directories(strix-pair-bf16-wire-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_features(strix-pair-bf16-wire-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-pair-bf16-wire-tests)
+    add_test(NAME strix-pair-bf16-wire-tests COMMAND strix-pair-bf16-wire-tests)
     add_executable(strix-spec-mtp-chain-tests tests/spec_mtp_chain_tests.cpp)
     target_link_libraries(strix-spec-mtp-chain-tests PRIVATE strix_spec)
     strix_target_warnings(strix-spec-mtp-chain-tests)
@@ -1355,6 +1360,10 @@ if(BUILD_TESTING)
     target_compile_features(strix-owned-layer-ordinals-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-owned-layer-ordinals-tests)
     add_test(NAME strix-owned-layer-ordinals-tests COMMAND strix-owned-layer-ordinals-tests)
+    add_executable(strix-spec-pair-round-tests tests/spec_pair_round_tests.cpp)
+    target_link_libraries(strix-spec-pair-round-tests PRIVATE strix_spec Threads::Threads)
+    strix_target_warnings(strix-spec-pair-round-tests)
+    add_test(NAME strix-spec-pair-round-tests COMMAND strix-spec-pair-round-tests)
     add_executable(strix-spec-block-parallel-tests tests/spec_block_parallel_tests.cpp)
     target_link_libraries(strix-spec-block-parallel-tests PRIVATE strix_spec)
     strix_target_warnings(strix-spec-block-parallel-tests)
@@ -3562,7 +3571,7 @@ int main() { return 0; }"
         strix_check_kernel_scratch(strix-hip-decode-token)
     endif()
     # Shared Channel instantiation of the TP slot gathers (src/xport/tp_gather*.hpp): the pair gather link's channel route,
-    # bound by every family's exact TP decode (qwen35 dense today).
+    # bound by every family's exact TP decode (qwen35 dense, hy4).
     add_library(strix_tp_xport STATIC src/xport/tp_gather.hip)
     set_target_properties(strix_tp_xport PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
     target_link_libraries(strix_tp_xport PUBLIC strix_dist)
@@ -6796,6 +6805,12 @@ if(BUILD_TESTING)
     strix_target_warnings(strix-hy4-placement-tests)
     add_test(NAME strix-hy4-placement-tests COMMAND strix-hy4-placement-tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/hy4/q4km-component-bytes.tsv)
+    # Hy4-flash exact tensor-parallel layout (strix/hy4/tp_layout.hpp): shares tile, MoE join, planner joins = step gathers.
+    add_executable(strix-hy4-tp-layout-tests tests/hy4_tp_layout_tests.cpp)
+    target_include_directories(strix-hy4-tp-layout-tests PRIVATE include)
+    target_compile_features(strix-hy4-tp-layout-tests PRIVATE cxx_std_20)
+    strix_target_warnings(strix-hy4-tp-layout-tests)
+    add_test(NAME strix-hy4-tp-layout-tests COMMAND strix-hy4-tp-layout-tests)
     # Shared prompt windows (strix/session/prompt_windows.hpp) and the two-stage window picker.
     add_executable(strix-prompt-windows-tests tests/prompt_windows_tests.cpp)
     target_include_directories(strix-prompt-windows-tests PRIVATE include)
@@ -7004,9 +7019,9 @@ if(STRIX_FAMILY_HY4)
     target_link_libraries(strix_hy4_hip PRIVATE strix_state_cache strix_tiled_core)  # state image files; head Q8_0 transcode
     strix_target_warnings(strix_hy4_hip)
     add_executable(strix-hy4-rank apps/hy4_rank_main.cpp)
-    target_link_libraries(strix-hy4-rank PRIVATE strix_hy4_hip strix_dist strix_device strix_spec)  # pair: shared layer pipeline + link; copy proposer
+    target_link_libraries(strix-hy4-rank PRIVATE strix_hy4_hip strix_dist strix_device strix_spec strix_tp_xport)  # pair: shared layer pipeline + link (gather channel); copy proposer
     strix_target_warnings(strix-hy4-rank)
     add_executable(strix-hy4-rows apps/hy4_rows_main.cpp)  # verify rows bench + speculative decode (hy4_hip_rows)
-    target_link_libraries(strix-hy4-rows PRIVATE strix_hy4_hip strix_spec)
+    target_link_libraries(strix-hy4-rows PRIVATE strix_hy4_hip strix_spec strix_dist strix_tp_xport)  # --tp-rank: pair gather + round messages
     strix_target_warnings(strix-hy4-rows)
 endif()
