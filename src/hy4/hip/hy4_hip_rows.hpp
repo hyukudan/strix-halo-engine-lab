@@ -215,7 +215,9 @@ class ChainVerifyTarget final : public spec::VerifyTarget {
 public:
     ChainVerifyTarget(Fwd& f, MtpDrafter<Fwd>& chain) : f_(f), chain_(chain) {}
     void verify(std::span<const std::uint32_t> tokens, std::vector<std::uint32_t>& greedy) override {
+        const auto t0 = std::chrono::steady_clock::now();
         f_.forward_rows(tokens, false);  // synchronises
+        verify_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         const auto g = f_.rows_greedy();
         const auto R = static_cast<std::uint32_t>(tokens.size());
         if (g.size() < R) throw std::logic_error("hy4 rows: verify greedy rows");
@@ -223,10 +225,12 @@ public:
         chain_.observe_verify(typename MtpEngine<Fwd>::Rows{nullptr, nullptr, f_.rows_hidden()}, R);
     }
     void commit(std::uint32_t k) override { f_.commit_rows(k); }
+    [[nodiscard]] double verify_ms() const noexcept { return verify_ms_; }  // wall of the verify passes (receipt)
 
 private:
     Fwd& f_;
     MtpDrafter<Fwd>& chain_;
+    double verify_ms_ = 0.0;
 };
 
 struct SpecOptions {
@@ -250,6 +254,7 @@ struct SpecResult {
     // chain arm: next-token block calls / rows, chain drafts, their wall (ms) and synchronising id reads
     std::uint64_t chain_calls = 0, chain_rows = 0, chain_drafts = 0, chain_reads = 0;
     double chain_ms = 0;
+    double verify_ms = 0;  // chain arm: wall of the verify passes (forward_rows, synchronised)
 };
 
 namespace detail {
@@ -331,6 +336,7 @@ SpecResult spec_decode(Fwd& f, std::span<const std::uint32_t> prompt, std::uint3
     res.chain_drafts = ch.drafts();
     res.chain_reads = ch.host_reads();
     res.chain_ms = ch.draft_wall_ms();
+    res.verify_ms = target.verify_ms();
     return res;
 }
 

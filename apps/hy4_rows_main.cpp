@@ -542,6 +542,12 @@ int main(int argc, char** argv) {
                             static_cast<unsigned long long>(res.chain_drafts), static_cast<unsigned long long>(res.chain_reads), res.chain_ms,
                             res.chain_drafts ? res.chain_ms / static_cast<double>(res.chain_drafts) : 0.0, so.copy ? "+copy+hybrid" : "only",
                             so.chain_step_ms, so.chain_flush_ms);
+            if (mtp)  // where a pass's wall goes: verify passes, drafter (flush + chain), the rest (round message, host)
+                std::printf("WALL %s total %.1f ms verify %.1f draft %.1f other %.1f (per pass %.2f / %.2f / %.2f)\n", label.c_str(), res.wall_ms,
+                            res.verify_ms, res.chain_ms, res.wall_ms - res.verify_ms - res.chain_ms,
+                            res.verify_ms / static_cast<double>(std::max<std::size_t>(res.steps.size(), 1U)),
+                            res.chain_ms / static_cast<double>(std::max<std::size_t>(res.steps.size(), 1U)),
+                            (res.wall_ms - res.verify_ms - res.chain_ms) / static_cast<double>(std::max<std::size_t>(res.steps.size(), 1U)));
             std::fflush(stdout);
             if (!equal) rc = 3;
         }
