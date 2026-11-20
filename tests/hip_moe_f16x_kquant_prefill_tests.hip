@@ -6,7 +6,9 @@
 // - down raw slot dots vs a host double sum over the device h (scaled and rounded as the kernel stages it);
 // - clamp entry with limit 1e30 == unclamped entry, bitwise, on every h and raw dot;
 // - fail-closed admission (top_k 17, form 4, clamp with a Q8_0 down, route BF16 view).
-// Bench mode (`bench`): E512 T4096 K16 H1536 I1536, Q6_K and Q4_K down with clamp 10; prologue+CSR / gate-up / down ms per layer.
+// Bench mode (`bench [REPS [ROWS]]`): E512 T=ROWS (default 4096; 2048 = one 8K-prompt window of the first binder) K16 H1536 I1536,
+// Q6_K and Q4_K down with clamp 10; prologue+CSR / gate-up / down ms per layer.
+// Check mode also prints a DIGEST line per case (FNV-1a 64 of the h and raw-dot bits): equal across builds = bitwise equal.
 // Real mode (`real GGUF GATE_AT UP_AT DOWN_AT DOWN_TYPE`): one model-B MoE layer's experts read from the pack at the absolute
 // tensor offsets (synthetic BF16 rows, uniform random top-16 routes, clamp 10): windows of 16 / 512 / 2048 / 4096 rows, stage
 // times, sampled rows vs the FP16-operand reference (pass/fail) and the FAST-class drift vs an FP32-weight reference.
@@ -330,10 +332,10 @@ int real(const char* gguf, std::uint64_t gate_at, std::uint64_t up_at, std::uint
     std::printf("%s real layer (%u failures)\n", fails == 0U ? "PASS" : "FAIL", fails);
     return fails == 0U ? 0 : 1;
 }
-int bench(unsigned reps) {
+int bench(unsigned reps, unsigned rows) {
     int rc = 0;
     for (const unsigned down : {14U, 12U}) {
-        const Case c{down == 14U ? "bench-q6k" : "bench-q4k", 1536U, 1536U, 512U, 4096U, 16U, down, 10.0F, 1.0F};
+        const Case c{down == 14U ? "bench-q6k" : "bench-q4k", 1536U, 1536U, 512U, rows, 16U, down, 10.0F, 1.0F};
         Fixture f(c, false);
         BenchHook hk{};
         for (auto& e : hk.ev) check(hipEventCreate(&e), "event");
@@ -367,7 +369,8 @@ int main(int argc, char** argv) {
     try {
         const std::string mode = argc > 1 ? argv[1] : "check";
         kr::reserve_prefill_pools(6560U);  // ceil(4096 * 16 / 10) rows of CSR capacity, rounded to 8
-        if (mode == "bench") return bench(argc > 2 ? static_cast<unsigned>(std::atoi(argv[2])) : 10U);
+        if (mode == "bench")
+            return bench(argc > 2 ? static_cast<unsigned>(std::atoi(argv[2])) : 10U, argc > 3 ? static_cast<unsigned>(std::atoi(argv[3])) : 4096U);
         if (mode == "real" && argc == 7)
             return real(argv[2], std::strtoull(argv[3], nullptr, 10), std::strtoull(argv[4], nullptr, 10), std::strtoull(argv[5], nullptr, 10),
                 static_cast<unsigned>(std::atoi(argv[6])));
@@ -382,6 +385,12 @@ int main(int argc, char** argv) {
             const Run r = f.run(c.limit);
             unsigned clamped = 0, checked = 0;
             const unsigned bad = compare(f, r, c.limit, clamped, checked);
+            const auto fnv = [](const std::vector<float>& v) {
+                std::uint64_t x = 0xcbf29ce484222325ULL;
+                for (const float f32 : v) { const auto b = std::bit_cast<std::uint32_t>(f32); for (unsigned k = 0; k < 32U; k += 8U) { x ^= (b >> k) & 255U; x *= 0x100000001b3ULL; } }
+                return static_cast<unsigned long long>(x);
+            };
+            std::printf("DIGEST %s h %016llx raw %016llx\n", c.name, fnv(r.h), fnv(r.raw));
             const bool coverage = !std::isfinite(c.limit) || clamped > 0U;
             std::printf("%s %s: tune %u, %u h checked, %u clamped, %u failures\n", bad == 0U && coverage ? "PASS" : "FAIL", c.name, r.tune,
                 checked, clamped, bad);
