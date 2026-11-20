@@ -257,6 +257,49 @@ void check_profile_regime() {
     CHECK(head(hp::Device::unknown, one, 17) == "0/pending");
 }
 
+// pf_mha (environment lever STRIX_HY4_PF_MHA): fast sets it, and strix::profile::apply exports it, exactly where a
+// `qualified` row covers the regime; elsewhere it stays pending and nothing is exported; an explicit value wins.
+void check_profile_pf_mha() {
+    namespace sp = strix::profile;
+    namespace hp = strix::hy4::profile;
+    const auto run = [](hp::Device d, hp::Topology t, std::uint64_t tokens, const char* env, std::string* exported) {
+        sp::Inputs in;
+        in.env = [env](const char* k) -> const char* { return std::strcmp(k, "STRIX_HY4_PF_MHA") == 0 ? env : nullptr; };
+        std::vector<std::string> args{"--profile", "fast"};
+        sp::take_options(hp::engine(), args, in);
+        hp::Regime r;
+        r.device = d;
+        r.topology = t;
+        r.prompt_tokens = tokens;
+        const auto res = hp::resolve(r, in);
+        exported->clear();
+        sp::apply(res->resolution, [exported](const char* k, const char* v) {
+            if (std::strcmp(k, "STRIX_HY4_PF_MHA") == 0) *exported = v;
+            return true;
+        });
+        const auto* e = res->find("pf_mha");
+        return e == nullptr ? std::string("missing") : e->value + "/" + sp::status_name(e->status);
+    };
+    const auto g = hp::Device::gfx1151;
+    const auto one = hp::Topology::one_node;
+    const auto pair = hp::Topology::pair;
+    for (const auto t : {one, pair})
+        for (const std::uint64_t tokens : {std::uint64_t{17}, std::uint64_t{8192}, std::uint64_t{32568}, std::uint64_t{1} << 20}) {
+            hp::Regime r;
+            r.device = g;
+            r.topology = t;
+            r.prompt_tokens = tokens;
+            const bool gated = hp::qualification("pf_mha", "1", r, hp::qualified) != nullptr;
+            std::string ex;
+            const auto got = run(g, t, tokens, nullptr, &ex);
+            CHECK(gated ? (got == "1/profile" && ex == "1") : (got == "0/pending" && ex.empty()));
+            CHECK(run(g, t, tokens, "0", &ex) == "0/off" && ex.empty());
+            CHECK(run(g, t, tokens, "1", &ex) == "1/explicit-env" && ex.empty());
+        }
+    std::string ex;
+    CHECK(run(hp::Device::unknown, one, 17, nullptr, &ex) == "0/pending" && ex.empty());
+}
+
 void check_indexer_binding() {
     namespace gi = strix::attn::group_indexer;
     float scale = 0.0F;
@@ -303,6 +346,7 @@ int main(int argc, char** argv) {
         check_stage_windows();
         check_profile();
         check_profile_regime();
+        check_profile_pf_mha();
         if (argc > 1 && std::filesystem::exists(argv[1])) {
             const auto real = strix::hy4::Config::from_gguf(argv[1]);
             check_config(real, "pack");

@@ -34,6 +34,14 @@ inline constexpr sp::Lever table[] = {
      .target = "1 (Q8_0 copy of the BF16 head for the decode head, hy4-head-bf16-q8_0-v1)", .off = "0",
      .source = "shared core::convert_bf16_q8_0 (ggml q8_0 rule) at load; FAST gate v2 per regime: see `qualified`",
      .provisional = {false, false, false, false}},
+    // Read by the forward as an environment switch: the profile exports it (strix::profile::apply) where qualified; an
+    // explicit STRIX_HY4_PF_MHA=0|1 wins.
+    {.name = "pf_mha", .env = "STRIX_HY4_PF_MHA", .option = "", .value = {"", "1", "", ""}, .builtin = "0",
+     .kind = sp::Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
+     .target = "1 (expanded-MHA prompt attention for the sliding layers on the shared dense flash core)", .off = "0",
+     .source = "K_b^T re-quantised once (core::q8_0::transpose), A8 latent, bf16 K / V images; FAST gate v2 per regime: "
+               "see `qualified`",
+     .provisional = {false, false, false, false}},
 };
 
 // Regime of a run, known before the forward loads. An unknown device resolves every FAST cell to pending.

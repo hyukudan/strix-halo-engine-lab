@@ -447,6 +447,7 @@ int run(int argc, char** argv) {
     if (const auto* e = resolved->find("prompt_rows"); e != nullptr && !rows_explicit && strix::profile::applied(e->status))
         o.prompt_rows = static_cast<std::uint32_t>(std::stoul(e->value));
     if (const auto* e = resolved->find("head_q8"); e != nullptr && !head_explicit && strix::profile::applied(e->status)) o.head_q8 = e->value == "1";
+    strix::profile::apply(profile);  // environment levers the profile sets (pf_mha), before any forward reads them
     std::cout << profile.describe() << "regime " << hp::device_name(regime.device) << " / " << hp::topology_name(regime.topology)
               << " / prompt " << regime.prompt_tokens << "\n" << std::flush;
     for (const auto& n : profile.notices()) std::cerr << n << '\n';
