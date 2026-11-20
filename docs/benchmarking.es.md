@@ -72,6 +72,11 @@ que el ticket):
 | `pfab` | A/B de prefill en par con una sola carga: `pf_pair_ab.sh --arms B:-/C:K=V+K=V --reps N` corre todos los brazos de un ABAB estricto dentro de un único par de procesos (`--pf-ttft-arms` / `--pf-ttft-reps` de la app de rango, `include/strix/env_arms.hpp` compartido; solo interruptores leídos en cada llamada), primer prefill frío, el resto caliente; `pf_clk.py` imprime por prefill el brazo, segundos, tok/s, ocupación, sclk, ciclos GPU por token, `evicted_ms` de KFD, MemAvailable mínima y el hash de logits. Para tickets bundle de 360 s. | `scripts/bench/pfab/pf_pair_ab.sh --bin BIN --model DIR --prompts A.u32 --out DIR --peer HOST --mode fast --arms B:STRIX_GLM_PF_MLA_WMMA=0/C:- --reps 4` |
 | `kfdevict` | Evicciones de colas KFD sin root: sonda dentro del proceso (eventos de evicción propios con su causa, restauración, asignaciones userptr), muestreador del nodo de `evicted_ms` frente a contadores de reclaim / compactación y ventanas de GPU ocupada, generador de presión de memoria controlada y micro A/B de respaldos de memoria host. | `scripts/bench/kfdevict/README.md` |
 
+GEMM denso de 4 bits frente a la biblioteca del fabricante (HIP): `tools/hip_dense_iu4_probe.hip <filas> cmp in:n ...`
+mide las entradas IU4 W4A16 de producción (núcleo small-M hasta 16 filas, el núcleo WMMA alto por encima) y
+`tools/hipblaslt_gemm_yardstick.cpp` mide hipBLASLt (FP16 / BF16, y pregunta si existe una solución con pesos int4) en las
+mismas formas, para que las dos columnas comparen el mismo producto.
+
 El servicio de prefill DeepSeek en la RTX (`strix-cuda-ds41-prefill-service`) se mide con
 `tools/ds41_prefill_service_client.py`. Las rutas en sí se describen en [discrete-gpu.es.md](discrete-gpu.es.md).
 
