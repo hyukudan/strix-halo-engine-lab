@@ -754,10 +754,10 @@ struct Forward::Impl {
         float* const gk = pout;                        // [K][I]
         float* const uk = pout + std::size_t{K} * I;   // [K][I]
         for (std::uint32_t k = 0; k < K; ++k) {
-            const std::uint32_t e = nx.ids_host[k];
-            if (e >= c.experts) throw std::runtime_error("hy4 hip forward: routed expert id outside the experts");
-            linear(wg.p + e * gate_slice, wg.type, z, L, I, gk + std::size_t{k} * I, false);
-            linear(wu.p + e * gate_slice, wu.type, z, L, I, uk + std::size_t{k} * I, false);
+            const std::uint32_t ex = nx.ids_host[k];
+            if (ex >= c.experts) throw std::runtime_error("hy4 hip forward: routed expert id outside the experts");
+            linear(wg.p + ex * gate_slice, wg.type, z, L, I, gk + std::size_t{k} * I, false);
+            linear(wu.p + ex * gate_slice, wu.type, z, L, I, uk + std::size_t{k} * I, false);
         }
         glu::launch_epilogue<glu::Round::bf16>(pout, nullptr, 2U * std::size_t{K} * I, 2U * std::size_t{K} * I, pout, s);  // BF16 Linear outputs
         glu::launch_swiglu<glu::DeclaredExp, glu::Round::bf16>(gk, uk, std::size_t{K} * I, c.swiglu_limit, nx.act, s);
