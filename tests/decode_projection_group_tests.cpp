@@ -58,9 +58,47 @@ void check_group(const std::vector<std::uint32_t>& units, const char* name) {
         for (unsigned c : v) check(c == 1U, name);  // bijection
 }
 
+// Paired members (pair_unit): an optional plain member of `plain` units, then gate / up of `half` units each.
+// Invariant: the launch walk is a bijection onto the group's units; an even paired launch unit maps to gate j and the
+// next launch unit to up j of the same j; that partner sits in the same backend output group of `outs` units (q8_rows
+// R1 direct: 4), so the even unit's store sees both; plain units map to themselves.
+void check_pair(std::uint32_t plain, std::uint32_t half, unsigned outs, const char* name) {
+    strix::decode::GroupIndex<3> g;
+    if (plain) g.add(plain);
+    g.add(half);
+    g.add(half);
+    const unsigned gate = plain ? 1U : 0U;
+    std::vector<unsigned> seen(g.total(), 0U);
+    for (std::uint32_t u = 0; u < g.total(); ++u) {
+        const std::uint32_t v = strix::decode::pair_unit(u, plain, half);
+        if (v >= g.total()) {
+            check(false, name);
+            continue;
+        }
+        ++seen[v];
+        unsigned m;
+        std::uint32_t local;
+        strix::decode::locate(g.first, g.count, v, m, local);
+        if (u < plain) {
+            check(v == u && m == 0U, name);
+            continue;
+        }
+        const std::uint32_t k = u - plain;
+        check(local == k / 2U && m == gate + (k & 1U), name);
+        if (!(k & 1U)) check(u / outs == (u + 1U) / outs, name);  // partner in the same output group
+    }
+    for (unsigned c : seen) check(c == 1U, name);
+}
+
 }  // namespace
 
 int main() {
+    // Paired GLU members: Hy4 MoE layer (latent down 1536 + shared gate / up 1536), Hy4 dense layer (gate / up 13824).
+    check_pair(1536U, 1536U, 4U, "hy4 ffn input group");
+    check_pair(0U, 13824U, 4U, "hy4 dense gate+up");
+    check_pair(2U, 1U, 2U, "smallest pair");
+    for (std::uint32_t p = 0; p < 40U; p += 2U)
+        for (std::uint32_t h = 1; h < 23U; ++h) check_pair(p, h, 4U, "pair sweep");
     // Qwen 27B dense (HIP dense_iu4 group launch, units = 64-column blocks): gate+up, GDN qkv+z, attention q+k+v.
     check_group<4>({17408U / 64U, 17408U / 64U}, "gate+up");
     check_group<4>({10240U / 64U, 6144U / 64U}, "qkv+z");
