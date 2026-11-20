@@ -69,7 +69,7 @@ runs.
 | `STRIX_GLM_PF_OBAR` | 10, 7, 6, 5, 4, 2 |
 | `STRIX_GLM_PF_MLA_GEMM` | 3, 2, 1 |
 | `STRIX_GLM_PF_SCORES` | 7, 6, 5, 4, 3, 2 |
-| `STRIX_GLM_PF_KDA_SCAN` | 5, 3, 1 |
+| `STRIX_GLM_PF_KDA_SCAN` | 6, 5, 3, 1 |
 | `STRIX_GLM_PF_DENSE_ROWS` | 4, 3, 2, 1 |
 | `STRIX_GLM_PF_DENSE_FORM` | 0, 1, 2, 3, 4, 5, 6, 7 (physical form of version 4; 0 = automatic per shape) |
 
@@ -114,7 +114,8 @@ prompts together and each alone and reports EXACT/FAIL with tok/s per concurrenc
 
 `--prefix-cache-gib G` sets the host-RAM prompt snapshot LRU to G GiB per rank (default 4;
 `--prefix-cache-gib 0` turns it off; set the same budget on both ranks). Stores require both ranks to snapshot successfully and each rank to have
-at least 16 GiB MemAvailable; missing memory readings and oversize snapshots refuse the store. A hit restores
+MemAvailable covering the snapshot plus the RAM margin of the load admission (8 GiB, `STRIX_GLM_MEM_MARGIN_GIB`);
+missing memory readings and oversize snapshots refuse the store (counted in `strix_glm_serve_prefix_refused_total`, reason on stderr). A hit restores
 the longest strict prompt-prefix key, then prefills the suffix through the usual chunk scheduler. With MTP,
 the key includes the prompt's first greedy output token and restores at the original prompt frontier.
 The contract is exact trunk restoration and unchanged emitted tokens; MTP rows retain the existing

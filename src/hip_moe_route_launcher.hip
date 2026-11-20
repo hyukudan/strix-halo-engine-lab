@@ -6,6 +6,7 @@
 #include "strix/hip_launch_context.hpp"
 #include "strix/hip_moe_route_launcher.hpp"
 #include "strix/known_window_cohort.hpp"
+#include "strix/moe/route_file.hpp"
 #include "strix/q6p_registry.hpp"
 #include "strix/wave_router_contract.hpp"
 
@@ -1611,14 +1612,55 @@ PreparedRouterLaunch prepare_router_launch(const ExecutionDispatchContext& conte
 
     return {&config, hidden, indices, route_weights, &runtime_tensor, kind};
 }
+// FAST gate v2 route tap (include/strix/moe/route_file.hpp): inactive unless STRIX_MOE_ROUTES_OUT / _IN or
+// STRIX_MOE_ROUTE_NULL is set, then one call costs a stream sync and two strided copies each way. Rows are
+// tile-major: row t * n + r lives at ids[r] + t * ids_stride (n = ids.size() pointers, tiles >= 1).
+void tap_routes(std::uint32_t layer, std::uint32_t top_k, std::uint32_t* const* ids, float* const* weights,
+                std::uint32_t n, std::uint32_t tiles, std::uint64_t ids_stride, std::uint64_t weights_stride) {
+    auto& tap = strix::moe::RouteTap::instance();
+    if (!tap.active()) return;
+    const auto stream = hip_execution_stream();
+    hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+    check_hip(hipStreamIsCapturing(stream, &capture), "route tap capture query");
+    if (capture != hipStreamCaptureStatusNone)
+        throw std::runtime_error("MoE route tap needs eager execution: the router stream is being captured into a graph");
+    check_hip(hipStreamSynchronize(stream), "route tap sync");
+    const std::size_t row_bytes = std::size_t{top_k} * 4U, pitch = row_bytes * n;
+    std::vector<std::uint32_t> host_ids(std::size_t{n} * tiles * top_k);
+    std::vector<float> host_weights(host_ids.size());
+    const auto copy = [&](void* host, void* device, std::uint64_t stride, bool to_device) {
+        const std::size_t spitch = tiles > 1U ? static_cast<std::size_t>(stride) : row_bytes;
+        check_hip(to_device ? hipMemcpy2DAsync(device, spitch, host, pitch, row_bytes, tiles, hipMemcpyHostToDevice, stream)
+                            : hipMemcpy2DAsync(host, pitch, device, spitch, row_bytes, tiles, hipMemcpyDeviceToHost, stream),
+                  "route tap copy");
+    };
+    for (std::uint32_t r = 0; r < n; ++r) {
+        copy(host_ids.data() + std::size_t{r} * top_k, ids[r], ids_stride, false);
+        copy(host_weights.data() + std::size_t{r} * top_k, weights[r], weights_stride, false);
+    }
+    check_hip(hipStreamSynchronize(stream), "route tap read");
+    if (!tap.on_call(layer, n * tiles, top_k, host_ids.data(), host_weights.data())) return;
+    for (std::uint32_t r = 0; r < n; ++r) {
+        copy(host_ids.data() + std::size_t{r} * top_k, ids[r], ids_stride, true);
+        copy(host_weights.data() + std::size_t{r} * top_k, weights[r], weights_stride, true);
+    }
+    check_hip(hipStreamSynchronize(stream), "route tap write");
+}
 void preflight_moe_route(const ExecutionDispatchContext& context, void* user_data) {
     const auto prepared = prepare_router_launch(context, user_data);
     if (prepared.config->parallel_projection)
         (void)prepare_parallel_router_workspace(context, *prepared.config);
 }
 
+void launch_moe_route_kernels(const PreparedRouterLaunch& prepared, const ExecutionDispatchContext& context);
 void launch_moe_route(const ExecutionDispatchContext& context, void* user_data) {
     const auto prepared = prepare_router_launch(context, user_data);
+    launch_moe_route_kernels(prepared, context);
+    auto* ids = reinterpret_cast<std::uint32_t*>(prepared.indices.address);
+    auto* weights = reinterpret_cast<float*>(prepared.route_weights.address);
+    tap_routes(context.layer.value_or(0xFFFFFFFFU), prepared.config->top_k, &ids, &weights, 1U, 1U, 0U, 0U);
+}
+void launch_moe_route_kernels(const PreparedRouterLaunch& prepared, const ExecutionDispatchContext& context) {
     const auto& config = *prepared.config;
     const auto& hidden = prepared.hidden;
     const auto& indices = prepared.indices;
@@ -1907,6 +1949,8 @@ void moe_route_known_window_rows_launch(std::span<const ExecutionDispatchContext
     const auto prepared = prepare_router_rows(rows, config);
     if (config.activation == HipActivationStorage::bf16) launch_router_rows_by_weight<std::uint16_t>(prepared, config);
     else launch_router_rows_by_weight<float>(prepared, config);
+    tap_routes(rows.front().layer.value_or(0xFFFFFFFFU), config.top_k, prepared.args.indices, prepared.args.weights,
+               prepared.rows, 1U, 0U, 0U);
 }
 void moe_route_known_window_cohort_launch(std::span<const std::span<const ExecutionDispatchContext>> segments,
     const HipMoeRouteLauncherConfig& config) {
@@ -1934,6 +1978,7 @@ void moe_route_known_window_cohort_launch(std::span<const std::span<const Execut
     hipLaunchKernelGGL(HIP_KERNEL_NAME(rows_moe_route_select_kernel<RouterSelect::wave,RouterCohortRowsArgs>),
         dim3(args.count),dim3(kThreads),0,hip_execution_stream(),args,config.expert_count,config.top_k,config.normalize_selected);
     check_hip(hipGetLastError(),"wide router cohort select launch");
+    tap_routes(segments[0].front().layer.value_or(0xFFFFFFFFU),config.top_k,args.indices,args.weights,args.count,1U,0U,0U);
 }
 
 namespace {
@@ -2132,6 +2177,16 @@ void moe_route_known_prefill_rows_preflight(std::span<const ExecutionDispatchCon
 void moe_route_known_prefill_rows_launch(std::span<const ExecutionDispatchContext> rows,
     const HipMoeRouteLauncherConfig& config) {
     route_prefill(rows, config, true);
+    if (!strix::moe::RouteTap::instance().active()) return;
+    // route_prefill admitted every 8-row tile one stride apart (it throws otherwise): tile t row r = tile 0 row r + t strides.
+    const auto first = prepare_router_rows(rows.first(8U), config);
+    const auto second = prepare_router_rows(rows.subspan(8U, 8U), config);
+    const auto stride = [](const auto* a, const auto* b) {
+        return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(b) - reinterpret_cast<std::uintptr_t>(a));
+    };
+    tap_routes(rows.front().layer.value_or(0xFFFFFFFFU), config.top_k, first.args.indices, first.args.weights, 8U,
+               static_cast<std::uint32_t>(rows.size() / 8U), stride(first.args.indices[0], second.args.indices[0]),
+               stride(first.args.weights[0], second.args.weights[0]));
 }
 
 void register_hip_moe_route_kernel_variant(

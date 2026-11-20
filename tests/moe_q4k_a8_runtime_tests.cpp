@@ -64,9 +64,11 @@ int main() {
     for (auto h : {0ULL,128ULL,257ULL,2816ULL,~0ULL})
         rejects([&]{(void)build_runtime_workspace(h,640,512,10);}, "invalid H");
     rejects([]{(void)build_runtime_workspace(2560,641,512,10);}, "invalid I");
+    rejects([]{(void)build_runtime_workspace(2560,1568,512,10);}, "I above the C1 envelope");
     rejects([]{(void)build_runtime_workspace(2560,640,513,10);}, "invalid E");
     rejects([]{(void)build_runtime_workspace(2560,640,5,10);}, "K exceeds E");
-    rejects([]{(void)build_runtime_workspace(2560,640,512,11);}, "invalid K");
+    rejects([]{(void)build_runtime_workspace(2560,640,512,17);}, "invalid K (C1 envelope top-16)");
+    (void)build_runtime_workspace(1536,1536,512,16,false,true);  // model-B preset admitted
     const auto down = build_runtime_workspace(2560,640,512,10,true,true);
     check(down.rawdots_offset == 65280 && down.rawdots_bytes == 102400 &&
         down.down_codes_offset == 167680 && down.down_codes_bytes == 6400 &&

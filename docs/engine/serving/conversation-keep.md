@@ -37,6 +37,14 @@ which are always verified, the same as at every chunk boundary of a chunked MTP 
 `STRIX_GLM_SERVE_REPLY_KEEP=1` (opt-in, plain decode only) also snapshots the end of a reply. Its follow-up is
 not always token-identical to a cold prefill, so it stays off.
 
+Root entry (default on, `STRIX_GLM_SERVE_PREFIX_ROOT=0` turns it off): when a chat starts with system messages
+(the request's stable prefix), the prefill call ends at the deepest multiple of 1,024 rows strictly inside them and
+the pair keeps that state too, under the key of those ids. Another conversation with the same system prompt and a
+different user turn restores it. The KDA state cannot be cut from a longer entry, so this state is kept on the way
+through the prefill; the rows each call computes are unchanged. Measured on a served pair, one run per arm, a
+3,263-token producer and a 3,270-token sibling chat sharing one system prompt (root 3,072 rows): sibling
+TTFT 6.88 s -> 1.18 s, producer 6.02 s -> 6.38 s (one more prefill call), answers identical in both arms.
+
 Measured on a served pair, three-turn conversation, 48 generated tokens per turn, follow-up turns:
 
 | Case | Follow-up TTFT off -> on | End-to-end tok/s off -> on | Prefill tokens computed |

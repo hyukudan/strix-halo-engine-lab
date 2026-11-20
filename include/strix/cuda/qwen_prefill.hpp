@@ -112,7 +112,20 @@ struct Config {
         bool ple_a8 = false;   // PLE key/value projections on the shared dense A8 projection (qwen_dense, int8 tensor cores)
     } forms;
     qwen_packs::ExpertArithmetic expert_arithmetic=qwen_packs::ExpertArithmetic::incumbent;
+    // Per-regime experts (TURBO, profile rows expert_turbo + expert_turbo_rows): when set, expert_arithmetic runs only on
+    // prefill blocks of at least expert_regime_min_rows rows; every other MoE call (step/verify windows, smaller blocks)
+    // runs *expert_narrow. Unset: expert_arithmetic everywhere. See expert_arithmetic_for.
+    std::optional<qwen_packs::ExpertArithmetic> expert_narrow;
+    std::uint32_t expert_regime_min_rows = 0;
 };
+
+// The expert arithmetic of one routed-MoE call. `window`: a step/verify window (decode regime); `rows`: the block's rows.
+// A prefill block is one session (run_block(&seg, 1, ...)), so the choice depends only on that session's own prompt and
+// block schedule, never on its cohort.
+inline qwen_packs::ExpertArithmetic expert_arithmetic_for(const Config& c, bool window, std::uint32_t rows) {
+    if (!c.expert_narrow || (!window && rows >= c.expert_regime_min_rows)) return c.expert_arithmetic;
+    return *c.expert_narrow;
+}
 
 // Diagnostic snapshot, not the node wire or a portable session/cache format.
 // Same engine instance and target only. Default snapshots invalidate derived pools;

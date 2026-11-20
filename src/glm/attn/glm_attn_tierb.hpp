@@ -68,6 +68,7 @@ void kda_o(const Mat& m, const float* x, unsigned x_stride, unsigned rows, float
            Knobs k = env_knobs(), const strix::pair::ProducerPublish* pub = nullptr);
 void dsa_a(const Mat& q_a, const Mat& kv_a, const float* x, unsigned x_stride, unsigned rows, float* qa, unsigned qa_stride,
            float* kva, unsigned kva_stride, void* ws, hipStream_t s, Knobs k = env_knobs());
+// qI == nullptr: q_b only (the indexer query is not needed, sparse_select_policy.hpp); q keeps the same bits.
 void dsa_b(const Mat& q_b, const Mat& wq_b, const float* qr, unsigned qr_stride, unsigned rows, float* q, unsigned q_stride,
            float* qI, unsigned qI_stride, void* ws, hipStream_t s, Knobs k = env_knobs());
 void dsa_o(const Mat& m, const float* x, unsigned x_stride, unsigned rows, float* y, unsigned y_stride, void* ws, hipStream_t s,

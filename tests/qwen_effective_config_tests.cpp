@@ -4145,8 +4145,14 @@ int main(int argc, char** arguments) {
         explicit_t.options.known_prefix_tail_rows.clear();
         explicit_t.options.prefix_cache_host_bytes=gib_bytes;
         const auto cached=resolve(explicit_t,memory);
-        expect(cached.options.known_prefix_prefill_rows==2048 && cached.options.prefix_cache_block_rows==1024,
-            "explicit T wins and configured cache defaults to 1024 checkpoints");
+        // The single MTP route keeps row-class checkpoints on the 128-row class grid; other routes keep 1024.
+        const bool row_class=!cached.options.http_batch && cached.options.mtp.enabled;
+        expect(cached.options.known_prefix_prefill_rows==2048 &&
+            cached.options.prefix_cache_block_rows==(row_class?qwen_row_class_grid:std::uint64_t{1024}),
+            "explicit T wins and configured cache defaults to class-grid (single MTP route) or 1024 checkpoints");
+        auto no_class=explicit_t;no_class.environment["STRIX_PREFIX_CACHE_ROW_CLASS"]="0";
+        expect(resolve(no_class,memory).options.prefix_cache_block_rows==1024,
+            "STRIX_PREFIX_CACHE_ROW_CLASS=0 keeps the 1024-row checkpoint default");
         explicit_t.options.prefix_cache_block_rows_explicit=true;
         explicit_t.options.prefix_cache_block_rows=0;
         expect(resolve(explicit_t,memory).options.prefix_cache_block_rows==0,"explicit zero restores T checkpoints");

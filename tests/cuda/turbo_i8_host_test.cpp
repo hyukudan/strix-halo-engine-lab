@@ -5,6 +5,8 @@
 // 3. A whole tile, emulated in the kernel's order (groups, m16 blocks, lanes, C elements, scale owner lanes), equals the
 //    contract's reference loop bit for bit, for one-scale and two-scale weights and partial tiles with garbage rows.
 // 4. Sensitivity: the unpermuted placement with the same loads gives wrong dots.
+// Raster: 5. the shared tile-major map is a bijection of the TURBO grids with the slices of one tile on consecutive blocks.
+#include "../../src/cuda/core/native_mma.hpp"
 #include "../../src/cuda/core/turbo_i8.hpp"
 
 #include <cstdint>
@@ -225,6 +227,24 @@ int main() {
         const float acc = 1.0F, dot = 3.0F, e = 1.0F / 3.0F, s = 3.0F;
         const float p = e * s;  // rounded once
         check(ti::step(acc, dot, e, s) == std::fma(dot, p, acc), "step = fma(dot, fl(e * s), acc)");
+    }
+    {   // 5. tile-major raster of the TURBO grids (project ffn/64 = 10 slices, down hidden/128 = 20 slices)
+        bool bij = true, consecutive = true;
+        for (unsigned slices : {10U, 20U})
+            for (unsigned grid_x : {1U, 7U, 64U, 1601U}) {
+                std::vector<unsigned char> seen(std::size_t(grid_x) * slices, 0U);
+                for (unsigned by = 0; by < slices; ++by)
+                    for (unsigned bx = 0; bx < grid_x; ++bx) {
+                        const auto ts = strix::cuda::core::native_mma::tile_major(bx, by, grid_x, slices);
+                        if (ts.tile >= grid_x || ts.slice >= slices) { bij = false; continue; }
+                        seen[std::size_t(ts.tile) * slices + ts.slice] += 1U;
+                        const unsigned l = bx + grid_x * by;
+                        consecutive &= ts.tile == l / slices && ts.slice == l % slices;
+                    }
+                for (unsigned char c : seen) bij &= c == 1U;
+            }
+        check(bij, "tile-major map is a bijection of the TURBO grids");
+        check(consecutive, "consecutive blocks are the slices of one tile");
     }
     if (failures) { std::fprintf(stderr, "%d failure(s)\n", failures); return 1; }
     std::printf("turbo_i8_host_test: ok (%u tiles, %u outputs bitwise)\n", cases, compared);

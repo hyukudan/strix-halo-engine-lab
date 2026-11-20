@@ -13,6 +13,11 @@ namespace strix::gemma4 {
 
 enum class WeightFormat { bf16, f32, q8_0, q4_k, q6_k, exl3_mul1 };
 enum class AttentionKind { sliding, global };
+// Final-norm hidden rows a drafter reads from a target pass (engine <-> prefill contract). last_committed: only the
+// pass's last committed row (MTP: its single carried state); all_rows: every row (EAGLE stages the sequence). The
+// prefill plan keeps rows only for what is demanded (strix/prefill_row_liveness.hpp every_row / head_row).
+enum class HiddenDemand : unsigned char { none, last_committed, all_rows };
+[[nodiscard]] constexpr HiddenDemand merge(HiddenDemand a, HiddenDemand b) { return a < b ? b : a; }
 
 // Row-major [outputs, inputs], except the explicitly tiled EXL3 format.
 // Ordinary strides are bytes; their quantization blocks never cross rows.

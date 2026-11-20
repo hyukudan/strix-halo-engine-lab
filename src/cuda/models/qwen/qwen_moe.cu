@@ -550,7 +550,8 @@ void enqueue_mma_experts(const Rows& v, const Weights& w, unsigned tiles, MmaFor
 
 // gsq-iq-i8mma-turbo-cuda-v1 (TURBO, profile row expert_turbo or explicit selection): int8 IMMA over the shared A8 input
 // codes (prologue) and the A8 down codes (project_activation_tile, run by the TURBO project kernel). Same CSR tiles;
-// rawdots in the native layout, merge / commit unchanged.
+// rawdots in the native layout, merge / commit unchanged. Grids keep (tiles, slices); the kernels map blocks tile-major
+// (native_mma::tile_major).
 template <unsigned G> void launch_turbo_project(const Rows& v, const Weights& w, const amdmath::Tables& tables, unsigned tiles,
                                                 cudaStream_t s) {
     core::moe_turbo::turbo_project_kernel<G, MoeBinding>

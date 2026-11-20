@@ -148,7 +148,11 @@ std::vector<std::pair<std::size_t, std::size_t>> pre_split(const CodePoints& tex
     return pieces;
 }
 
-// The DeepSeek V3/V4 pre-tokenizer (GGUF `joyai-llm` / `deepseek-v3`): a sequence of three isolating splits, each
+// GGUF pre names whose tokenizer.json carries exactly the DeepSeek V3/V4 rule below: `joyai-llm`, `deepseek-v3` and
+// `hy_v4` (its three Split regexes and the regex-free ByteLevel step are the same strings, no normalizer).
+bool deepseek_rule(std::string_view pre) { return pre == "joyai-llm" || pre == "deepseek-v3" || pre == "hy_v4"; }
+
+// The DeepSeek V3/V4 pre-tokenizer (GGUF `joyai-llm` / `deepseek-v3` / `hy_v4`): a sequence of three isolating splits, each
 // applied to every piece the previous one produced (matches and the text between them are both pieces):
 //   1. \p{N}{1,3}
 //   2. [\x{4E00}-\x{9FA5}\x{3040}-\x{309F}\x{30A0}-\x{30FF}]+
@@ -472,9 +476,9 @@ BpeTokenizer::~BpeTokenizer() = default;
 
 std::shared_ptr<const BpeTokenizer> BpeTokenizer::from_parts(std::vector<std::string> tokens, std::vector<std::int32_t> types,
     std::span<const std::string> merges, std::string pre) {
-    const bool deepseek = pre == "joyai-llm" || pre == "deepseek-v3", glm = pre == "glm4";
+    const bool deepseek = deepseek_rule(pre), glm = pre == "glm4";
     if (pre != "qwen35" && !deepseek && !glm)
-        throw std::invalid_argument("tokenizer: only the qwen35, DeepSeek V3/V4 (joyai-llm, deepseek-v3) and glm4 byte-level BPE pre-tokenizers are implemented, not " + pre);
+        throw std::invalid_argument("tokenizer: only the qwen35, DeepSeek V3/V4 (joyai-llm, deepseek-v3, hy_v4) and glm4 byte-level BPE pre-tokenizers are implemented, not " + pre);
     if (tokens.empty() || types.size() != tokens.size()) throw std::invalid_argument("tokenizer: token and type tables differ");
     std::shared_ptr<BpeTokenizer> out(new BpeTokenizer());
     auto& impl = *out->impl_;
@@ -721,7 +725,7 @@ std::vector<std::string> BpeTokenizer::pre_tokenize(std::string_view text, std::
         for (const auto& [begin, end] : pre_split(points, true)) out.emplace_back(text.substr(begin, end - begin));
         return out;
     }
-    if (pre != "joyai-llm" && pre != "deepseek-v3") throw std::invalid_argument("tokenizer: unknown pre-tokenizer");
+    if (!deepseek_rule(pre)) throw std::invalid_argument("tokenizer: unknown pre-tokenizer");
     for (const auto& [begin, end] : pre_split_deepseek(points)) out.emplace_back(text.substr(begin, end - begin));
     return out;
 }
