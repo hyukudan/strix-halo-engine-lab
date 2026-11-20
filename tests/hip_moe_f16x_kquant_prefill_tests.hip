@@ -368,7 +368,7 @@ int bench(unsigned reps, unsigned rows) {
 int main(int argc, char** argv) {
     try {
         const std::string mode = argc > 1 ? argv[1] : "check";
-        kr::reserve_prefill_pools(6560U);  // ceil(4096 * 16 / 10) rows of CSR capacity, rounded to 8
+        kr::reserve_prefill_pools(6560U, 1536U);  // ceil(4096 * 16 / 10) rows of CSR capacity, rounded to 8; DA16 image for I 1536
         if (mode == "bench")
             return bench(argc > 2 ? static_cast<unsigned>(std::atoi(argv[2])) : 10U, argc > 3 ? static_cast<unsigned>(std::atoi(argv[3])) : 4096U);
         if (mode == "real" && argc == 7)
@@ -395,6 +395,25 @@ int main(int argc, char** argv) {
             std::printf("%s %s: tune %u, %u h checked, %u clamped, %u failures\n", bad == 0U && coverage ? "PASS" : "FAIL", c.name, r.tune,
                 checked, clamped, bad);
             fails += bad + (coverage ? 0U : 1U);
+            {  // DA16 image down (h converted once per batch into the shared FP16 image, poisoned first) == the plain down
+               // (FP32 h converted per column tile), bitwise on h and raw dots; each arm must have taken its path.
+                kr::prefill_test_poison_da16(f.stream, 6560U);
+                kr::set_prefill_da16(1);
+                const Run img = f.run(c.limit);
+                const bool img_ran = kr::prefill_da16_ran();
+                kr::set_prefill_da16(0);
+                const Run plain = f.run(c.limit);
+                const bool plain_ran = kr::prefill_da16_ran();
+                kr::set_prefill_da16(-1);
+                const bool same = img.h.size() == plain.h.size() && img.raw.size() == plain.raw.size() &&
+                    std::memcmp(img.h.data(), plain.h.data(), img.h.size() * 4U) == 0 &&
+                    std::memcmp(img.raw.data(), plain.raw.data(), img.raw.size() * 4U) == 0 &&
+                    std::memcmp(img.raw.data(), r.raw.data(), r.raw.size() * 4U) == 0;
+                const bool ok = same && img_ran && !plain_ran;
+                std::printf("%s %s: DA16 image down (ran %d) == plain down (ran %d), bitwise (h and raw dots)\n", ok ? "PASS" : "FAIL",
+                    c.name, img_ran ? 1 : 0, plain_ran ? 1 : 0);
+                fails += ok ? 0U : 1U;
+            }
             if (!std::isfinite(c.limit)) {  // clamp entry with a limit no value reaches == the unclamped entry, bitwise
                 const Run big = f.run(1e30F);
                 const bool same = big.h.size() == r.h.size() && std::memcmp(big.h.data(), r.h.data(), r.h.size() * 4U) == 0 &&

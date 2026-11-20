@@ -44,6 +44,24 @@ __device__ __forceinline__ void project_f16x_body(const unsigned char* gate,cons
 #undef STRIX_F16X_BATCH_TILE
 #undef STRIX_F16X_LDS
 }
+// Clamp trait of the same body (project_prefill_f16x_clamped's lines: h = silu(min(g, L)) * clamp(u, -L, L)), Q4_K, Core 0;
+// the item form of the K-quant envelope's DA16 gate/up (hip_moe_prefill_da16.inc).
+template<unsigned Tune,bool Reuse>
+__device__ __forceinline__ void project_f16x_body_clamped(const unsigned char* gate,const unsigned char* up,const PrefillRows& view,
+    unsigned hidden,unsigned outputs,const uint4* a16,const unsigned p1_batch,const unsigned p1_tile,
+    typename F16LdsOf<F16TileX<Tune,0U>>::Stage* const p1_sb,typename F16LdsOf<F16TileX<Tune,0U>>::Rows& p1_rows,float p1_limit) {
+    constexpr bool Q5K=false;
+    constexpr unsigned Core=0U;
+#define STRIX_F16X_BATCH_TILE const unsigned batch=p1_batch,tile=p1_tile;
+#define STRIX_F16X_LDS(S,R) S* const sb=p1_sb; R& rows=p1_rows;
+#define STRIX_F16X_HDR_REUSE Reuse
+#define STRIX_F16X_SWIGLU_LIMIT p1_limit
+#include "hip_moe_f16x_project_body.inc"
+#undef STRIX_F16X_SWIGLU_LIMIT
+#undef STRIX_F16X_HDR_REUSE
+#undef STRIX_F16X_BATCH_TILE
+#undef STRIX_F16X_LDS
+}
 template<bool Q51,unsigned Tune,unsigned Core>
 __device__ __forceinline__ void down_f16x_body(const unsigned char* weights,const PrefillRows& view,unsigned hidden,unsigned width,
     const FuseArgT<Core>& fuse,const unsigned p1_batch,const unsigned p1_tile,

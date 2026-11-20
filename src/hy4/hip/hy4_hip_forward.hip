@@ -567,7 +567,8 @@ struct Forward::Impl {
             check(hipMemcpy2D(p, dst, kb.p, src, src, rows, hipMemcpyDeviceToDevice), "k_b image");
             kb_pad[l] = p;
         }
-        strix::moe_q4k_a8::known_rows::reserve_prefill_pools(((rmax * c.top_k + 9U) / 10U + 7U) / 8U * 8U);  // CSR pool: rows x 10
+        strix::moe_q4k_a8::known_rows::reserve_prefill_pools(((rmax * c.top_k + 9U) / 10U + 7U) / 8U * 8U,  // CSR pool: rows x 10
+                                                             c.expert_ff);  // DA16 h image of the K-quant envelope
     }
 
     // ---- stages (each one shared entry) ----------------------------------------------------------------------

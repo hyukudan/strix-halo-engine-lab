@@ -196,6 +196,9 @@ bool prefill_certificate_produced();
 void set_prefill_route_prune(moe_core::RoutePrune prune);
 // Reserve once before any prefill submission; largest compiled T first, on its device.
 void reserve_prefill_pools(unsigned rows);
+// Same, declaring the widest routed expert (intermediate width) the caller runs: the shared DA16 FP16 h image is sized
+// for it (K-quant envelope, e.g. I 1536), so its down stages A as a copy of the image instead of converting FP32 h per tile.
+void reserve_prefill_pools(unsigned rows, unsigned image_width);
 std::array<std::uint64_t, 2> prefill_test_image_generations();
 void prefill_test_poison_da16(hipStream_t stream, unsigned rows);
 // qpf2k/moe-mi test hooks: STRIX_QPF2K_MOE_SMALL override (batches with <= rows assignments take the depth-3 body; 0 = off,

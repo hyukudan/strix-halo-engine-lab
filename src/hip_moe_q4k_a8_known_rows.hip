@@ -1682,9 +1682,11 @@ __global__ __launch_bounds__(F16Tile<Tune>::Threads,prefill_core2_min_waves(Tune
 #include "moe_core/hip_moe_f16x_kquant_down.inc"
 // K-quant down trait entry of the same body (Type 12 = Q4_K, 14 = Q6_K; plain schedule, Core 0, no fused merge).
 // RoundDots (PrefillRows::rawdots_bf16): each raw slot dot is stored as ops::glu::epilogue<Round::bf16> of the same value.
-template<unsigned Type,unsigned Tune,bool RoundDots>
+// A16 (DA16 image trait): A is staged as a copy of the batch's FP16 image (project_prefill_f16x_*da16 wrote it from the same
+// FP32 h with the same scale and f16_from_f32), not converted per column tile: the same halves in LDS, the same bits.
+template<unsigned Type,unsigned Tune,bool RoundDots,bool A16=false>
 __global__ __launch_bounds__(F16Tile<Tune>::Threads,prefill_core2_min_waves(Tune,0U)) void down_prefill_f16x_kq(const unsigned char* weights,
-    PrefillRows view,unsigned hidden,unsigned width) {
+    PrefillRows view,unsigned hidden,unsigned width,const uint4* image=nullptr) {
     constexpr unsigned Core=0U;
     using KQ=F16xKQuantDown<Type>;
     const FuseArgT<0U> fuse{};
@@ -1693,7 +1695,9 @@ __global__ __launch_bounds__(F16Tile<Tune>::Threads,prefill_core2_min_waves(Tune
 #define STRIX_F16X_DOWN_GUARD if(csr.summary[0]||batch>=csr.summary[2])return;
 #define STRIX_F16X_DOWN_KQ 1
 #define STRIX_F16X_DOWN_ROUND RoundDots
+#define STRIX_F16X_DOWN_A16 A16
 #include "moe_core/hip_moe_f16x_down_body.inc"
+#undef STRIX_F16X_DOWN_A16
 #undef STRIX_F16X_DOWN_ROUND
 #undef STRIX_F16X_DOWN_KQ
 #undef STRIX_F16X_BATCH_TILE
@@ -2096,9 +2100,20 @@ static void enqueue_prefill_kquant(const Request& request,const PrefillRows& row
     if(form!=3)throw std::invalid_argument("A8 prefill K-quant envelope runs the FP16 profile form only (form 3)");
     if(rows.route_bf16||rows.route_i8||prefill_route_prune_state().active())
         throw std::invalid_argument("A8 prefill K-quant envelope: route BF16 / I8 and route prune are not qualified here");
-    if(prefill_route()!=0U||prefill_da16()||prefill_core2()!=0U||prefill_small()!=0U||direct_b_requested()||prefill_tiers()!=0) {
-        static const bool witness=[]{std::fprintf(stderr,"qpf2k MoE K-quant envelope: plain f16x schedule (ROUTE / DA16 / core2 / "
+    if(prefill_route()!=0U||prefill_core2()!=0U||prefill_small()!=0U||direct_b_requested()||prefill_tiers()!=0) {
+        static const bool witness=[]{std::fprintf(stderr,"qpf2k MoE K-quant envelope: plain f16x schedule (ROUTE / core2 / "
             "SMALL / DIRECT_B / tiers not applied: sized by max_rows / max_top_k)\n");return true;}();
+        (void)witness;
+    }
+    // DA16 (shared image mechanism, hip_moe_prefill_da16.inc): the last gate/up tile of a batch writes the batch's FP16 down
+    // operand image once; the K-quant down stages it as a copy. Needs the image reserved for this width
+    // (reserve_prefill_pools(rows, I)); otherwise the plain down runs (witness). Same bits either way.
+    const std::uint64_t image_halves=static_cast<std::uint64_t>(count)*shape.top_k*shape.rows;
+    const bool da16=prefill_da16_kquant()&&da16_image_width()>=shape.rows&&
+        image_halves*2U<=da16_image_bytes()&&shape.rows%64U==0U;
+    if(prefill_da16_kquant()&&!da16) {
+        static const bool witness=[]{std::fprintf(stderr,"qpf2k MoE K-quant envelope: DA16 image not reserved for this width "
+            "(reserve_prefill_pools(rows, I)): plain down\n");return true;}();
         (void)witness;
     }
     direct_b_reason()=direct_b_requested()?"format":"off";
@@ -2119,7 +2134,24 @@ static void enqueue_prefill_kquant(const Request& request,const PrefillRows& row
         prefill_stage_reached(1U,stream);
         const unsigned assignments=count*shape.top_k,batches=std::min(assignments,shape.experts+(assignments+cap-1U)/cap);
         const dim3 project_grid(shape.rows/Outs,batches),down_grid(shape.hidden/Tile::Columns,batches);
-        if(clamp) {
+        unsigned* arrive=nullptr;uint4* image=nullptr;
+        if(da16) {
+            if(batches>da16_counter_words())throw std::invalid_argument("A8 prefill K-quant envelope: DA16 batch counters exceed the pool");
+            prefill_da16_flag()=true;
+            static const bool witness=[]{std::fprintf(stderr,"qpf2k MoE K-quant envelope: da16 active\n");return true;}();(void)witness;
+            arrive=da16_counters();image=da16_image();
+            hip_check(hipMemsetAsync(arrive,0,static_cast<std::size_t>(batches)*sizeof(unsigned),stream),"K-quant envelope DA16 counters clear");
+        }
+        if(da16&&clamp) {
+            prefill_resources<project_prefill_f16x_clamped_da16<Tune>,Threads>("gate_up_q4k_clamped_da16",Tune);
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_clamped_da16<Tune>),project_grid,dim3(Threads),0,stream,
+                gate,up,rows,shape.hidden,shape.rows,a16,arrive,image,request.swiglu_limit);
+        } else if(da16) {
+            // project_prefill_f16x_da16_mg: the base body with the header reuse (= the plain envelope's) + the image.
+            prefill_resources<project_prefill_f16x_da16_mg<false,Tune>,Threads>("gate_up_q4k_da16",Tune);
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_da16_mg<false,Tune>),project_grid,dim3(Threads),0,stream,
+                gate,up,rows,shape.hidden,shape.rows,a16,arrive,image);
+        } else if(clamp) {
             prefill_resources<project_prefill_f16x_clamped<false,Tune>,Threads>("gate_up_q4k_clamped",Tune);
             hipLaunchKernelGGL(HIP_KERNEL_NAME(project_prefill_f16x_clamped<false,Tune>),project_grid,dim3(Threads),0,stream,
                 gate,up,rows,shape.hidden,shape.rows,a16,request.swiglu_limit);
@@ -2133,9 +2165,15 @@ static void enqueue_prefill_kquant(const Request& request,const PrefillRows& row
         prefill_stage_reached(2U,stream);
         // rows.rawdots_bf16: the same kernel stores each raw slot dot once-rounded to BF16 (the caller's epilogue pass goes).
         const auto down=[&]<unsigned Type,bool Round>(const char* name) {
+            if(da16) {
+                prefill_resources<down_prefill_f16x_kq<Type,Tune,Round,true>,Threads>(name,Tune);
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_kq<Type,Tune,Round,true>),down_grid,dim3(Threads),0,stream,
+                    down_weights,rows,shape.hidden,shape.rows,static_cast<const uint4*>(image));
+                return;
+            }
             prefill_resources<down_prefill_f16x_kq<Type,Tune,Round>,Threads>(name,Tune);
             hipLaunchKernelGGL(HIP_KERNEL_NAME(down_prefill_f16x_kq<Type,Tune,Round>),down_grid,dim3(Threads),0,stream,
-                down_weights,rows,shape.hidden,shape.rows);
+                down_weights,rows,shape.hidden,shape.rows,static_cast<const uint4*>(nullptr));
         };
         if(down_type==14U) {
             if(rows.rawdots_bf16)down.template operator()<14U,true>("down_q6k_bf16");
@@ -2757,20 +2795,25 @@ bool prefill_da16_ran(){return prefill_da16_flag();}
 bool prefill_tile64_ran(){return prefill_tile64_flag();}
 bool prefill_certificate_produced(){return prefill_certificate_flag();}
 bool prefill_clear_skipped(){return prefill_clear_skipped_flag();}
-void reserve_prefill_pools(unsigned rows) {
+void reserve_prefill_pools(unsigned rows, unsigned image_width) {
+    // The DA16 image grows to the widest expert any caller declared (the K-quant envelope's I); never shrinks.
+    const bool wider=image_width>da16_image_width();
+    if(wider)da16_image_width()=image_width;
     prefill_pool_owner().setup(rows, [] {
         (void)f16_prefill_a16(true); (void)da16_image(true);
         if(prefill_tiers())(void)prefill_tier_lists(true);
         (void)da16_counters(true); (void)p1_counter_pool(true);
         (void)fuse_counter_pool(true); (void)csr_mw_scratch(true);
     });
+    if(wider)(void)da16_image(true);  // pools already set up at these rows: grow the image alone
 }
+void reserve_prefill_pools(unsigned rows){reserve_prefill_pools(rows,max_rows);}
 std::array<std::uint64_t, 2> prefill_test_image_generations() {
     return {f16_prefill_a16_pool().generation(), da16_image_pool().generation()};
 }
 void prefill_test_poison_da16(hipStream_t stream, unsigned rows) {
     reserve_prefill_pools(rows);
-    hip_check(hipMemsetAsync(da16_image(),0xa5,static_cast<std::size_t>(prefill_pool_rows())*max_top_k*max_rows*2U,stream),"poison DA16 image");
+    hip_check(hipMemsetAsync(da16_image(),0xa5,da16_image_bytes(),stream),"poison DA16 image");
 }
 const void* prefill_test_da16_image(){return da16_image();}
 void prefill_test_poison_a16(hipStream_t stream, unsigned rows) {
