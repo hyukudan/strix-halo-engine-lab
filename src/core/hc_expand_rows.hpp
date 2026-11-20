@@ -135,13 +135,18 @@ inline void launch_expand_rows(const float* X, const float* mix, const float* y,
 
 // Host contract of the restrict pointers: written ranges (Xo, rr) disjoint from every other range, vector-aligned rows.
 inline bool ranges_disjoint(const void* a, std::size_t an, const void* b, std::size_t bn) {
+    if (a == nullptr || b == nullptr || an == 0 || bn == 0) return true;
     const auto pa = reinterpret_cast<std::uintptr_t>(a), pb = reinterpret_cast<std::uintptr_t>(b);
-    return a == nullptr || b == nullptr || pa + an <= pb || pb + bn <= pa;
+    // Compare offsets instead of computing address + size (which can wrap at UINTPTR_MAX).
+    return pa <= pb ? pb - pa >= an : pa - pb >= bn;
 }
 inline bool aligned_to(const void* p, std::size_t bytes) { return reinterpret_cast<std::uintptr_t>(p) % bytes == 0; }
 template <class P>
 inline bool expand_rows_admissible(unsigned lanes, const float* X, const float* mix, const float* y, const float* y1, const float* Xo,
                                    const float* rr, unsigned rows) {
+    // y1 is optional, but a nonempty expansion always needs all other read/write buffers.
+    // Refuse missing buffers before selecting the restrict-qualified kernel.
+    if (rows > 0 && (!X || !mix || !y || !Xo || (P::kNorm && !rr))) return false;
     const std::size_t nx = std::size_t{rows} * P::kStreams * P::kHidden * sizeof(float), ny = std::size_t{rows} * P::kHidden * sizeof(float);
     const std::size_t nm = std::size_t{rows} * P::kMixStride * sizeof(float), nr = std::size_t{rows} * sizeof(float);
     const std::size_t vec = std::size_t{lanes} * sizeof(float);
