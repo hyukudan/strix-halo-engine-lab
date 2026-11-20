@@ -1251,9 +1251,9 @@ struct Forward::Impl {
                   "head mixes");
             check(hcc::enqueue_collapse<kHead>(x0, mixh, 1U, c.hidden, u, s), "head collapse");
             norm(u, t("output_norm.weight").f(), c.hidden, c.rms_eps, xn);
-            const auto vr = share(c.vocab);  // enable_tp: this rank's vocabulary rows, then the logits joined
-            linear_rows("output.weight", xn, c.hidden, c.vocab, vr, logits_d, false);
-            if (tp.world == 2U) tp_gather(logits_d, vr.count * 4U);
+            const auto vocab_rows = share(c.vocab);  // enable_tp: this rank's vocabulary rows, then the logits joined
+            linear_rows("output.weight", xn, c.hidden, c.vocab, vocab_rows, logits_d, false);
+            if (tp.world == 2U) tp_gather(logits_d, vocab_rows.count * 4U);
             if (greedy) {  // the shared device greedy row: first max, lowest token on ties (no logits copy)
                 const strix::ExecutionBufferAddress lg{{}, reinterpret_cast<std::uintptr_t>(logits_d), std::uint64_t{c.vocab} * 4U, 0U};
                 const strix::ExecutionBufferAddress pa{{}, reinterpret_cast<std::uintptr_t>(greedy_partials), greedy_bytes, 0U};
