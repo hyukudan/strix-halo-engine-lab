@@ -59,15 +59,15 @@ int main(int argc, char** argv) {
     if (data_class > 3U) { std::printf("HB_RAND must be 0..3\n"); return 2; }
     if (data_class != 0U) {
         auto fill = [](void* p, std::size_t bytes, std::uint32_t z, unsigned cls) {
-            std::vector<std::uint16_t> h(bytes / 2U);
-            for (auto& e : h) {
+            std::vector<std::uint16_t> host(bytes / 2U);
+            for (auto& e : host) {
                 z = z * 1664525U + 1013904223U;
                 if (cls == 3U) { e = static_cast<std::uint16_t>(z >> 16); continue; }
                 const float v = cls == 1U ? float(int((z >> 16) & 15U) - 8) / 16.0F : float(int(z >> 9) % 2001 - 1000) / 1000.0F;
                 const _Float16 f = static_cast<_Float16>(v);
                 std::memcpy(&e, &f, sizeof(e));
             }
-            CK(hipMemcpy(p, h.data(), h.size() * 2U, hipMemcpyHostToDevice));
+            CK(hipMemcpy(p, host.data(), host.size() * 2U, hipMemcpyHostToDevice));
         };
         fill(w, max_w, 7U, data_class);                          // weights: the class
         fill(x, max_x, 11U, data_class == 3U ? 3U : 2U);         // activations: full-mantissa (or random bytes)
