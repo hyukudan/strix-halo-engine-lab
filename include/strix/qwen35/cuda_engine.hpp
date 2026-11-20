@@ -92,9 +92,9 @@ struct EngineOptions {
     // --prefill-norm-fold off is the rollback.
     bool prefill_norm_fold = true;
     // FAST4 only: stage feed of the tile GEMMs (cuda/core nvfp4_tile Feed). bulk = one producer warpgroup with 1-D bulk copies
-    // into an mbarrier ring; lsu = every thread's cp.async + one CTA barrier per stage. Same bits (no identity suffix). Default
-    // bulk: fixture bitwise PASS + strict ABAB at 4,096 rows on sm_120 (glu 0.93, down 0.92 x lsu); --prefill-tile-feed lsu is
-    // the rollback.
+    // into an mbarrier ring; lsu = every thread's cp.async + one CTA barrier per stage. Same bits (no identity suffix).
+    // Default lsu preserves the incumbent kernel; opt in to the measured operator-level bulk feed with --prefill-tile-feed bulk.
+    // End-to-end prefill validation is still required before a default switch.
     cuda::core::nvfp4::tile::Feed prefill_tile_feed = cuda::core::nvfp4::tile::kDefaultFeed;
     std::uint32_t prefill_chunk = 2048;  // rows per large-M chunk (multiple of 128, <= 8192); buffers are allocated on first use
     // Wave-aligned steps (strix/wave_fit.hpp, scheduling only, bitwise): prompts of >= this many tokens step by the largest
