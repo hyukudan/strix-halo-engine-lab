@@ -28,6 +28,8 @@ namespace strix::hy4::hipbind {
 // (the verify's own head). q8 / q4: the shared MTP draft head (strix/hip_mtp_draft_head.hpp) over a draft-only Q8_0 (Q4_0)
 // copy of every output.weight row, built at first use (ggml Q8_0 rule; 394 / 209 MB): FAST-class draft logits, the verify
 // head is unchanged, so emitted ids are not affected; only drafts can differ.
+// Default q4 (measured, cluster1 300 ids, ids == plain on every run: code 27.93 -> 29.22, think 27.18 -> 28.72, prose
+// 20.83 -> 21.34 tok/s; the 191-row device check agrees with the BF16 head on 186 rows at 2.19 ms less per draft).
 enum class NextnHead : std::uint8_t { full, q8, q4 };
 
 struct ForwardOptions {
@@ -38,7 +40,7 @@ struct ForwardOptions {
     std::uint32_t prompt_rows = 0;             // batched prompt window (rows per launch, multiple of 8, >= 16); 0 = none
     std::uint32_t verify_rows = 0;             // rows of a verify pass (forward_rows, 1..8); rings sized for them; 0 = none
     bool nextn = false;                        // also load the pack's next-token (MTP) block: nextn_rows() (whole-model rank)
-    NextnHead nextn_head = NextnHead::full;    // the drafts' head (want_top of nextn_rows)
+    NextnHead nextn_head = NextnHead::q4;      // the drafts' head (want_top of nextn_rows)
 };
 
 struct LoadReport {
