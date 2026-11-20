@@ -106,6 +106,7 @@ struct HipDenseSpecArgs {
     HipDenseCostMode costs = HipDenseCostMode::calibrated;
     std::string cost_kv = "auto";  // --cost-kv auto|online|off|KV: context cost of the table / calibrated model (hip_dense_cost_kv)
     bool costs_explicit = false;  // --spec-costs was given (exact TP decode refuses an explicit non-table choice)
+    bool chain_feed_device = true;  // --chain-feed device|host: MTP chain ids stay on the device (host = one read per position)
 };
 [[nodiscard]] inline const char* hip_dense_cost_mode_name(HipDenseCostMode m) {
     return m == HipDenseCostMode::calibrated ? "calibrated" : m == HipDenseCostMode::table ? "table" : "learned";
@@ -121,6 +122,10 @@ bool parse_hip_dense_spec_arg(const std::string& flag, Next&& next, HipDenseSpec
         a.draft_rows = v == "on";
     } else if (flag == "--draft-pack") {
         a.draft_packs = next();
+    } else if (flag == "--chain-feed") {
+        const std::string v = next();
+        if (v != "device" && v != "host") throw std::invalid_argument("--chain-feed device|host");
+        a.chain_feed_device = v == "device";
     } else if (flag == "--spec-costs") {
         const std::string v = next();
         a.costs_explicit = true;

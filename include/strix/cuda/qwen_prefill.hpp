@@ -83,6 +83,12 @@ struct Config {
     // Tensor-core GSQ experts (gsq_bf16_mma) in steps of <= 16 rows run the decode tile form (bitwise the tile form);
     // false = the tile form at every row count (lever row expert_decode_tile).
     bool expert_decode_tile = true;
+    // Tensor-core GSQ experts: launches averaging >= native_mma::kWideMinAvgRows rows per expert run the wide 128-row tile
+    // form (bitwise the tile form; lever row expert_wide_tile, opt-in until its timing receipt).
+    bool expert_wide_tile = false;
+    // Its planner parameter: minimum average rows per expert of a launch for the wide form (0 = native_mma::kWideMinAvgRows);
+    // the lever value `--expert-wide-tile N`, measured per device by the no-model tile bench (TILEWIDE line).
+    std::uint32_t expert_wide_min_rows = 0;
     // Explicit unqualified CUDA A8 route-storage candidate. Omitted: environment;
     // false: individual OFF. Baseline/defaults/exact masters always suppress it.
     std::optional<bool> moe_route_bf16;

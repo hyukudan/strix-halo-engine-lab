@@ -346,6 +346,64 @@ void test_stage_chunks(std::uint32_t out, std::uint32_t in, std::uint32_t rows, 
             for (const int n : cover) CHECK(n == 1);
         }
 }
+
+// Feed default + spelling: every GemmArgs runs the incumbent lsu feed unless a caller opts into bulk; strict parse (the feed
+// is scheduling only, so valid() admits both and nothing else).
+void test_feed_default() {
+    static_assert(T::kDefaultFeed == T::Feed::lsu, "the FAST4 tile default must preserve the incumbent lsu feed");
+    const T::GemmArgs fresh{};
+    CHECK(fresh.feed == T::kDefaultFeed);
+    T::Feed f = T::Feed::lsu;
+    CHECK(T::parse_feed("bulk", &f) && f == T::Feed::bulk);
+    CHECK(T::parse_feed("lsu", &f) && f == T::Feed::lsu);
+    for (const char* bad : {"", "Bulk", "bulk ", "lsux", "tma", "on", "1"}) {
+        f = T::Feed::lsu;
+        CHECK(!T::parse_feed(bad, &f) && f == T::Feed::lsu);
+    }
+    CHECK(!T::parse_feed(nullptr, &f));
+    CHECK(std::strcmp(T::feed_name(T::Feed::bulk), "bulk") == 0 && std::strcmp(T::feed_name(T::Feed::lsu), "lsu") == 0);
+}
+
+// Feed::bulk invariant: copying the kStageRecs records of a stage (stage_record: one bulk copy of `bytes` from base + ks * bytes)
+// writes, for every stage ks, exactly the (source byte -> shared byte) pairs the lsu feed's chunks write (stage_chunk), each shared
+// byte once; !ok records are exactly the zero-filled chunks; stage_bytes is the sum of the copied records (the mbarrier
+// transaction count) and every bulk size / offset is 16-byte aligned.
+void test_stage_records(std::uint32_t out, std::uint32_t in, std::uint32_t rows, bool glu) {
+    const std::uint32_t KS = in / T::kK, rows_pad = T::rows_padded(rows), wtiles = out / 16, ntiles = rows_pad / 8;
+    const std::uint32_t tiles_m = glu ? (2 * out + T::kCtaOut - 1) / T::kCtaOut : (out + T::kCtaOut - 1) / T::kCtaOut;
+    const std::uint32_t tiles_n = rows_pad / T::kCtaRows, stage = T::kStageChunks * 16;
+    struct Src {
+        std::uint32_t which;
+        std::size_t byte;
+        bool ok;
+    };
+    for (std::uint32_t tm = 0; tm < tiles_m; ++tm)
+        for (std::uint32_t tn = 0; tn < tiles_n; ++tn)
+            for (const std::uint32_t ks : {0U, 1U, KS - 1}) {
+                std::vector<Src> lsu(stage, Src{9, 0, false}), bulk(stage, Src{9, 0, false});
+                for (std::uint32_t c = 0; c < T::kStageChunks; ++c) {
+                    const T::StageChunk q = T::stage_chunk(c, tm, tn, glu, KS, wtiles, ntiles);
+                    for (std::uint32_t b = 0; b < 16; ++b)
+                        lsu[q.dst + b] = Src{q.which, q.base + static_cast<std::size_t>(ks) * q.step + b, q.ok};
+                }
+                std::uint32_t copied = 0;
+                std::vector<int> cover(stage, 0);
+                for (std::uint32_t i = 0; i < T::kStageRecs; ++i) {
+                    const T::StageRecord r = T::stage_record(i, tm, tn, glu, KS, wtiles, ntiles);
+                    CHECK(r.dst % 16 == 0 && r.bytes % 16 == 0 && r.base % 16 == 0 && r.dst + r.bytes <= stage);
+                    if (r.ok) copied += r.bytes;
+                    for (std::uint32_t b = 0; b < r.bytes; ++b) {
+                        bulk[r.dst + b] = Src{r.which, r.base + static_cast<std::size_t>(ks) * r.bytes + b, r.ok};
+                        ++cover[r.dst + b];
+                    }
+                }
+                CHECK(copied == T::stage_bytes(tm, tn, glu, KS, wtiles, ntiles));
+                for (std::uint32_t b = 0; b < stage; ++b) {
+                    CHECK(cover[b] == 1 && bulk[b].ok == lsu[b].ok);
+                    if (lsu[b].ok) CHECK(bulk[b].which == lsu[b].which && bulk[b].byte == lsu[b].byte);
+                }
+            }
+}
 }  // namespace
 
 // GatedHeadNorm (arch/sm120/nvfp4_tile.cuh) is bitwise equal to gdn_chunk.cu chunk_norm_kernel only if, in the 256-thread row CTA,
@@ -388,6 +446,11 @@ int main() {
     test_stage_chunks(48, 256, 40, false);    // partial weight tile (wtiles 3 < 8 slots), padded rows
     test_stage_chunks(256, 384, 300, false);  // two weight tiles x two activation tiles
     test_stage_chunks(80, 128, 20, true);     // GLU, partial 64-channel tile (w2 slots)
+    test_feed_default();
+    test_stage_records(48, 256, 40, false);    // bulk feed: partial weight tile (!ok records), padded rows
+    test_stage_records(256, 384, 300, false);  // bulk feed: two weight tiles x two activation tiles, KS 3
+    test_stage_records(80, 128, 20, true);     // bulk feed: GLU, partial 64-channel tile, KS 1
+    test_stage_records(1040, 640, 520, true);  // bulk feed: GLU, 17 x 64-channel tiles (last partial), three activation tiles
     test_epilogue_ownership(48, 40, false);     // partial weight tile, padded rows
     test_epilogue_ownership(256, 300, false);   // two weight tiles x two activation tiles
     test_epilogue_ownership(80, 20, true);      // GLU, partial 64-channel tile
@@ -398,6 +461,6 @@ int main() {
         std::fprintf(stderr, "nvfp4_tile_host: %d failures\n", g_fail);
         return 1;
     }
-    std::printf("nvfp4_tile_host: PASS (layouts, fragments, coordinates, GLU, quantiser, contract, stage producer, epilogue ownership, norm fold, gated norm fold)\n");
+    std::printf("nvfp4_tile_host: PASS (layouts, fragments, coordinates, GLU, quantiser, contract, stage producer, bulk stage records, epilogue ownership, norm fold, gated norm fold)\n");
     return 0;
 }

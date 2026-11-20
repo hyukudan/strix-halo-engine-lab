@@ -45,6 +45,7 @@ struct BigCtx {
     float* rscale = nullptr;  // f8 activation row scales [rows_pad]
     std::uint64_t rscale_bytes = 0;
     BigOperandCache* cache = nullptr;  // resident expanded operands shared with other contexts (not owned)
+    ftile::Feed feed = ftile::kDefaultFeed;  // stage feed of the FAST4 tile GEMMs on this context (scheduling only, bitwise)
 };
 // Resident expanded operands (dense_big.hpp): one arena, one entry per (weight data, operand class), filled on first use.
 struct BigOperandCache {
@@ -763,6 +764,9 @@ void dense_big_cache_destroy(BigOperandCache* cache) { delete cache; }
 void dense_big_ctx_attach_cache(BigCtx* ctx, BigOperandCache* cache) {
     if (ctx) ctx->cache = cache;
 }
+void dense_big_ctx_set_tile_feed(BigCtx* ctx, ftile::Feed feed) {
+    if (ctx) ctx->feed = feed;
+}
 
 cudaError_t dense_big_cache_reserve(BigOperandCache* cache, const DenseWeight* weights, std::size_t n, BigClass cls, operand_cache::Mode mode,
                                     std::uint64_t cap_bytes, BigCacheReport* report) {
@@ -959,6 +963,7 @@ cudaError_t gemm4(Scratch& S, const DenseWeight& w, const BigAct& a, float* y, c
     g.rows = a.rows;
     g.rows_pad = a.rows_pad;
     g.epi = epi == BigEpi::residual ? ftile::Epi::residual : epi == BigEpi::silu_mul ? ftile::Epi::silu_mul : ftile::Epi::store;
+    g.feed = S.feed;
     return ftile::gemm_enqueue(g, s);
 }
 }  // namespace
@@ -983,6 +988,7 @@ cudaError_t dense_big_glu4(const DenseWeight& gate, const DenseWeight& up, const
     g.rows = a.rows;
     g.rows_pad = a.rows_pad;
     g.epi = ftile::Epi::glu;
+    g.feed = S.feed;
     return ftile::gemm_enqueue(g, s);
 }
 

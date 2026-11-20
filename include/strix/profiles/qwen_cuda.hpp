@@ -137,6 +137,16 @@ inline constexpr Lever table[] = {
      .kind = Kind::exact, .ready = {true, true, true, true}, .runnable = {true, true, true, true},
      .target = "", .off = "0",
      .source = "decode tile form of the tensor-core GSQ experts: exact (bitwise the tile form; greedy ids equal on prose/edit/json)"},
+    // Exact schedule trait of the tensor-core GSQ experts: launches averaging >= N rows per expert (the row's value; `on` =
+    // native_mma::kWideMinAvgRows = the RTX PRO TILEWIDE; N from the device's no-model tile bench) run 128-row CSR tiles in
+    // 512-thread blocks (one weight row per lane), so a 128-row run of an expert decodes its codes once instead of twice;
+    // bitwise the tile form (same MMA and scale-FMA order per output, same m16 position per row). Opt-in until its timing
+    // receipt: `--expert-wide-tile on|N` / STRIX_QRTX_EXPERT_WIDE_TILE=1|N.
+    {.name = "expert_wide_tile", .env = "STRIX_QRTX_EXPERT_WIDE_TILE", .option = "--expert-wide-tile",
+     .value = {"", "", "", ""}, .builtin = "0",
+     .kind = Kind::exact, .ready = {true, true, true, true}, .runnable = {true, true, true, true},
+     .target = "", .off = "0",
+     .source = "wide 128-row tile form of the tensor-core GSQ experts: exact by construction (bitwise the tile form); timing pending"},
 };
 inline std::span<const Lever> levers() { return table; }
 
@@ -165,6 +175,8 @@ struct Choice {
     std::optional<std::uint32_t> expert_turbo_rows{512};
     bool mtp_defer_prompt = false;  // exact: Config::defer_prompt_mtp
     bool expert_decode_tile = true; // exact: Config::expert_decode_tile (absent row = on)
+    bool expert_wide_tile = false;  // exact: Config::expert_wide_tile (opt-in)
+    std::uint32_t expert_wide_min_rows = 0;  // its planner parameter (value N of the row; 0 = the builtin threshold)
     bool fast() const { return moe_route_bf16 || hc_mma || mtp_mma || qsa_mma || moe_mma || ple_a8; }
     bool operator==(const Choice&) const = default;
 };
@@ -179,6 +191,24 @@ inline bool lever_on(const pr::Resolution& r, std::string_view name) {
     const auto* entry = r.find(name);
     if (!entry || entry->status == pr::Status::pending || entry->status == pr::Status::off) return false;
     return normalise(name, entry->value) == "1";
+}
+// expert_wide_tile takes on / off or N = the minimum average rows per expert of a launch for the wide form (1..65535;
+// on = the builtin threshold). N comes from the device's no-model tile bench; it changes the schedule only (exact row).
+inline void wide_tile_value(const pr::Resolution& r, bool& on, std::uint32_t& min_rows) {
+    on = false;
+    min_rows = 0;
+    const auto* entry = r.find("expert_wide_tile");
+    if (!entry || entry->status == pr::Status::pending || entry->status == pr::Status::off) return;
+    const std::string_view v = entry->value;
+    const bool digits = !v.empty() && v.size() <= 5 && v.find_first_not_of("0123456789") == std::string_view::npos;
+    if (!digits || v == "0" || v == "1") {
+        on = normalise("expert_wide_tile", v) == "1";
+        return;
+    }
+    const unsigned long n = std::stoul(std::string(v));
+    if (n > 65535UL) throw std::invalid_argument("expert_wide_tile is on, off or rows per expert 2..65535 (got '" + std::string(v) + "')");
+    on = true;
+    min_rows = static_cast<std::uint32_t>(n);
 }
 // expert_turbo_rows: a decimal N >= 1, or off (nullopt). Absent from the resolution (exact/fast with no switch): builtin.
 inline std::optional<std::uint32_t> turbo_rows(const pr::Resolution& r) {
@@ -210,6 +240,7 @@ inline Choice choose(const pr::Resolution& r) {
     c.expert_turbo_rows = turbo_rows(r);
     c.mtp_defer_prompt = lever_on(r, "mtp_defer_prompt");
     c.expert_decode_tile = r.find("expert_decode_tile") == nullptr || lever_on(r, "expert_decode_tile");
+    wide_tile_value(r, c.expert_wide_tile, c.expert_wide_min_rows);
     return c;
 }
 // Flip together with the members' fast-column `ready` cells when the whole-bundle gate receipt passes.

@@ -69,6 +69,42 @@ STRIX_NATIVE_MMA_HD unsigned m_blocks(unsigned count) { return (count + 15U) >> 
 // groups is unchanged, so both forms are bitwise the same arithmetic; only the load schedule and the tile capacity differ.
 inline constexpr unsigned kTileMBlocks = 4U, kDecodeMBlocks = 1U, kTileAhead = 1U, kDecodeAhead = 3U;
 STRIX_NATIVE_MMA_HD bool decode_form(unsigned rows) { return rows <= 16U * kDecodeMBlocks; }
+// Wide-tile form (lever row expert_wide_tile). A tile holds up to kWideRows = 128 rows of one expert (kWideMBlocks m16
+// blocks) in a block of kWideThreads = 512 threads (16 warps, one block per SM: the warps per SM of two tile-form blocks).
+// Warp w owns column block w % 8 and ONE weight row per lane (project: matrix w / 8, gate or up; down: n8 block w / 8),
+// so it keeps 8 x 4 = 32 accumulators like the tile form, and every weight code is still decoded once per tile: a run of
+// 128 rows of an expert is decoded once instead of twice. CSR tiles are the expert's runs cut at multiples of the tile
+// rows, so a wide tile is exactly two consecutive 64-row tiles and every row keeps its m16 block position (64 and 128 are
+// multiples of 16): each output's MMA and scale-FMA sequence is unchanged, bitwise the tile form.
+inline constexpr unsigned kWideMBlocks = 8U, kWideThreads = 512U, kWideRows = 16U * kWideMBlocks, kTileRows = 64U;
+STRIX_NATIVE_MMA_HD constexpr bool wide(unsigned mb) { return mb > kTileMBlocks; }
+STRIX_NATIVE_MMA_HD constexpr unsigned block_threads(unsigned mb) { return wide(mb) ? kWideThreads : kThreads; }
+STRIX_NATIVE_MMA_HD constexpr unsigned min_blocks(unsigned mb) { return wide(mb) ? 1U : 2U; }
+STRIX_NATIVE_MMA_HD constexpr unsigned tile_capacity(unsigned mb) { return wide(mb) ? kWideRows : kTileRows; }
+// Warp map: column block of warp w (project: 8 outputs of project_output; down: 16 of down_output), the weight rows per lane
+// (parts: gate + up / two n8 blocks in the tile forms, one in the wide form) and the first part the warp owns.
+STRIX_NATIVE_MMA_HD constexpr unsigned column_block(unsigned warp) { return warp % 8U; }
+STRIX_NATIVE_MMA_HD constexpr unsigned warp_parts(unsigned mb) { return wide(mb) ? 1U : 2U; }
+STRIX_NATIVE_MMA_HD constexpr unsigned first_part(unsigned mb, unsigned warp) { return wide(mb) ? warp / 8U : 0U; }
+static_assert(kWideRows % kTileRows == 0U && kTileRows % 16U == 0U, "a wide tile is whole 64-row tiles of whole m16 blocks");
+static_assert(kWideMBlocks * warp_parts(kWideMBlocks) == kTileMBlocks * warp_parts(kTileMBlocks),
+              "the wide form keeps the tile form's 32 accumulators per thread");
+static_assert(kWideThreads / 32U == 8U * warp_parts(kTileMBlocks), "16 warps: 8 column blocks x the 2 parts of a tile-form warp");
+// Launch rule (backend-neutral): the wide form when the launch routes at least min_avg rows per expert on average
+// (min_avg = 0: off). min_avg is a planner parameter: the lever value `--expert-wide-tile N` (N rows per expert), taken
+// from the no-model tile bench of the device (its TILEWIDE line: the smallest rows-per-expert case from which the wide
+// form is faster at every larger case). kWideMinAvgRows is only the value of a bare `on`: the TILEWIDE of the RTX PRO 6000
+// Blackwell (sm_120, 188 SMs; tile bench 11-19, 11/11 cases bits EQUAL): wide / tile time 0.79-0.96 at every case from 80
+// to 320 rows per expert, 1.05-1.07 at 48-64. Another device takes its own TILEWIDE as `--expert-wide-tile N`.
+inline constexpr unsigned kWideMinAvgRows = 80U;
+STRIX_NATIVE_MMA_HD bool wide_form(std::uint64_t assignments, unsigned experts, unsigned min_avg) {
+    return min_avg != 0U && assignments >= std::uint64_t{min_avg} * experts;
+}
+// Upper bound of the CSR tiles of a launch (the kernels' grid x): one partial tile per expert plus the full ones.
+STRIX_NATIVE_MMA_HD unsigned tile_bound(unsigned assignments, unsigned experts, unsigned rows_per_tile) {
+    const unsigned x = experts + (assignments + rows_per_tile - 1U) / rows_per_tile;
+    return x < assignments ? x : assignments;
+}
 // Group held by ring slot `slot` after group `group` was taken (slot 0 = the next group to consume; the kernels load
 // ring_group(group, ahead, groups) into the last slot). Past the last group a slot re-loads `group` itself (never
 // consumed, never past the weight row): with ahead = 1 this is the tile form's `next` expression.

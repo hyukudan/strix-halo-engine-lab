@@ -1254,12 +1254,12 @@ establecen rendimiento.
 The separate [MTP committed key service](engine/qsa-committed-pool.md) uses
 `STRIX_QSA_MTP_POOL` and one thirteen-entry owner per session. The
 [route table](engine/qsa-committed-pool.md) enables it by default on the native MTP CLI,
-on the single-request HTTP runner, and for YaRN MTP CLI factor 2 through 524288 and factor 4 through
-1048576 (with rolling PLE); both `=0` off switches remain authoritative.
+on HTTP serving (the single-request runner and every batch slot), and for YaRN MTP CLI factor 2 through
+524288 and factor 4 through 1048576 (with rolling PLE); both `=0` off switches remain authoritative.
 
-- **Preconditions:** Single HTTP runner: `--http-batch 0`, a configuration the batch runner cannot take, or an AUTO/capped batch whose measured capacity is one slot. In that last case the fallback keeps the service only when the slot still fits with it charged. Includes the in-memory prefix cache. Batch slots, nested scheduling, sessions, disk prefix restore, state import, serving prefixes and YaRN HTTP keep the opt-in `STRIX_QSA_MTP_POOL=1`. Product profiles do not change the decision.
-- **Exactness evidence:** Bitwise per request, same binary, default vs `STRIX_QSA_MTP_POOL=0`: token IDs, prompt state digest, committed target state and the full-vocabulary logits of every committed step. `STRIX_QSA_MTP_POOL_CHECK=1` compared all 13 roles with 0 differences. The timing-based window controller may pick a different R2/R4/R8 owner on the faster cycle, which changes speculative rows and predictor KV but not a committed token. Details in [the route document](engine/qsa-committed-pool.md#single-request-http-runner).
-- **Measured gain:** single HTTP runner, 127.6K-token prompt (131K context), dense-A8 T=8192, R2/R4/R8 prefix windows, in-memory prefix cache, one Strix Halo node, ABBA on one binary: decode 39.5 to 52.0 tok/s on the cold request (+32 %) and 41.6 to 55.8 tok/s on restored follow-up turns (+34 %); prefill unchanged (176-183 s cold, about 7 s restored); tokens identical.
+- **Preconditions:** HTTP serving: the single runner (`--http-batch 0` or a configuration the batch runner cannot take) and every slot of an AUTO, capped or explicit batch, one owner per slot charged per slot in the capacity fit. Includes the in-memory prefix cache. Nested scheduling, sessions, disk prefix restore, state import, serving prefixes and YaRN HTTP keep the opt-in `STRIX_QSA_MTP_POOL=1`. Product profiles do not change the decision.
+- **Exactness evidence:** Bitwise per request, same binary, default vs `STRIX_QSA_MTP_POOL=0`: token IDs, prompt state digest, committed target state and the full-vocabulary logits of every committed step. `STRIX_QSA_MTP_POOL_CHECK=1` compared all 13 roles with 0 differences. Batch slots: token IDs identical per request (8.5K sequential and two concurrent cohort requests, 40K, 80K) and the built-in check 0 differences over 119.8 M scores including two-member cohort cycles. The timing-based window controller may pick a different R2/R4/R8 owner on the faster cycle, which changes speculative rows and predictor KV but not a committed token. Details in [the route document](engine/qsa-committed-pool.md#http-serving-single-runner-and-batch-slots).
+- **Measured gain:** single HTTP runner, 127.6K-token prompt (131K context), dense-A8 T=8192, R2/R4/R8 prefix windows, in-memory prefix cache, one Strix Halo node, ABBA on one binary: decode 39.5 to 52.0 tok/s on the cold request (+32 %) and 41.6 to 55.8 tok/s on restored follow-up turns (+34 %); prefill unchanged (176-183 s cold, about 7 s restored); tokens identical. AUTO batch slots (98,304 context, one request at a time, one A/B pair per length, same binary): 8.5K 81.0 to 82.9 tok/s, 40K 62.4 to 80.6 tok/s, 80K 65.0 to 80.0 tok/s (+23 %, 8-row round 96.1 to 78.0 ms).
 - **Off switch:** `STRIX_QSA_MTP_POOL=0`
 
 <a id="qwen-qsa-decode-select"></a>
@@ -5105,6 +5105,25 @@ the longest cached prefix of its token ids and prefills only the rest.
 - **Measured gain:** No throughput figure published yet. Follow-up agent turns report 48,128-49,664 restored tokens in `cached_tokens`.
 - **Implementation / evidence:** [Qwen RTX serve guide](models/qwen3.8/rtx-serve.md#prompt-prefix-cache), [cache](../apps/cuda_qwen_prefix_cache.hpp)
 
+<a id="qwen-rtx-expert-wide-tile"></a>
+
+### Tensor-core expert wide tile form (128 rows)
+
+**Engine:** `qwen-rtx`. **Control:** `--expert-wide-tile on|off|N`, `STRIX_QRTX_EXPERT_WIDE_TILE` (lever row `expert_wide_tile`). **Default:** off (opt-in until its timing receipt).
+
+A prefill launch whose experts receive at least N rows each on average cuts 128-row CSR tiles and runs them in
+512-thread blocks: each warp keeps one column block and one weight row per lane (32 accumulators per thread, as the
+64-row tile form), so a 128-row run of an expert decodes its weight codes once instead of twice. MMA count, activation
+bytes per row and warps per SM do not change. N is a planner parameter per device: the no-model tile bench prints it
+(`TILEWIDE min_rows=N`); `on` uses the builtin value (128, provisional).
+
+- **Preconditions:** CUDA Qwen MoE with `gsq_bf16_mma` experts (the FAST expert arithmetic) on prefill launches above 16 rows; decode steps keep the decode form.
+- **Automatic selection:** none yet; when on, the launch picks the wide form from its average rows per expert.
+- **Exactness evidence:** Exact schedule trait: a wide tile is exactly two consecutive 64-row tiles; every row keeps its m16 position and order and each output's MMA and scale-FMA sequence is unchanged, so outputs are bitwise the tile form (host test on edge counts and 200 random 512-expert routings; the bench compares both forms' device hashes). Contract and bundle id do not change.
+- **Off switch:** `--expert-wide-tile off`; `STRIX_QRTX_EXPERT_WIDE_TILE=0` (the default).
+- **Measured gain:** Not yet measured.
+- **Implementation / evidence:** [kernels](../src/cuda/core/moe_a8_mma.cuh), [form contract and launch rule](../src/cuda/core/native_mma.hpp), [lever row](../include/strix/profiles/qwen_cuda.hpp), [bench](../tests/cuda/qwen_moe_tile_bench.cu)
+
 <a id="qwen-rtx-expert-decode-tile"></a>
 
 ### Tensor-core expert decode tile form
@@ -5231,6 +5250,24 @@ host wait for the ids. The host no longer stands between the last draft kernel a
 - **Off switch:** `--prelaunch 0` (the default).
 - **Measured gain:** Not yet measured.
 - **Implementation / evidence:** [contract](../include/strix/spec/block_drafter.hpp), [MTP chain](../include/strix/spec/mtp_chain.hpp), [CUDA binding](../src/qwen35/cuda/engine.cu)
+
+<a id="qwen-dense-cuda-fast4-tile-bulk-feed"></a>
+### Qwen dense 27B CUDA FAST4 tile GEMM: bulk stage feed
+
+**Engine:** `qwen-rtx` (dense 27B, FAST4 prefill). **Control:** `--prefill-tile-feed bulk|lsu` on `strix-cuda-qwen35-decode`. **Default:** `lsu` (unchanged).
+
+The FAST4 tile GEMM (W4A4, `nvfp4-tile-mma-f32-v1`) was bound by its stage feed, not by the tensor pipe: every one of the
+eight MMA warps issued its share of the 1,728 16-byte copies of a 27,648-byte stage and the whole CTA met at a barrier once
+per stage. The `bulk` feed of the shared tile family gives the copies to a producer warpgroup (one 1-D bulk copy per
+contiguous record, 40 per stage, into a full / empty mbarrier ring); the MMA warps issue no copy instruction and wait per
+warp for their stage. The stage holds the same bytes at the same offsets and every accumulator sees the same MMA order.
+
+- **Preconditions:** `--prefill-arith fast4` (sm_120, NVFP4 weights): every FAST4 tile GEMM of the large prefill (gate/up GLU, down, q/k/v, o, the residual forms). Other prefill classes do not use the tile family; the effective config prints `prefill-tile-feed: n/a (FAST4 only)`.
+- **Selection:** opt-in with `--prefill-tile-feed bulk` for FAST4 GEMMs; without that option the effective config prints `prefill-tile-feed: lsu`.
+- **Exactness evidence:** Scheduling only, no identity suffix: device fixture `nvfp4_tile_device` bulk output equal to lsu bit for bit in 9 checks (store, residual, silu_mul and GLU forms, partial weight and activation tiles); host oracle `nvfp4_tile_host` checks that the bulk records write exactly the bytes of the lsu chunks; host tests pin the default and that the option never changes the engine identity.
+- **Off switch:** `--prefill-tile-feed lsu` (also the default; preserves the incumbent launch path).
+- **Measured gain:** Operator bench reported for RTX PRO 6000, 4,096 rows, no model, strict ABAB in one process: bulk / lsu = 0.934 gate/up GLU, 0.921 down, 0.929 down (residual), 0.850 o, 0.858 o (residual), 0.846 k/v, 0.977 q/k/v. The lsu form is reported as neutral versus main within noise on 7 shapes. These are operator-level results, not an end-to-end prefill qualification; retain lsu by default until that is measured.
+- **Implementation / evidence:** [tile contract](../include/strix/cuda/core/nvfp4_tile.hpp), [sm_120 kernel](../src/cuda/core/arch/sm120/nvfp4_tile.cuh), [dense_big binding](../src/cuda_core/dense/dense_big.cu), [fixture](../tests/nvfp4_tile/tile_device.cu)
 
 ## Platform (kernel)
 
@@ -5626,12 +5663,22 @@ split-argmax kernels (`src/core/tp_join.hpp`). The run's `tp link:` line splits 
 exchange; the staged route does not wait for the stream first, the Communicator orders its copy after the producer)
 and `rest`. A vocabulary head that cannot be split (not IU4, or V not a multiple of 64) runs replicated on every rank,
 in the drafter as in the target (`include/strix/pair/tp_layout.hpp` head_columns).
-- **Off switch:** omit `--tp-rank`; `STRIX_TP_F16_GATHER=0` / `STRIX_TP_SPLIT_DRAFT=0` for the levers.
+`STRIX_TP_CHANNEL` (default on; `=0` restores the staged route) carries the in-token gathers on the shared device-waited channel
+(`src/xport/channel_communicator.hpp` over `xport::Channel<tp_gather::Traits>`, `src/xport/tp_gather_traits.hpp`,
+HIP operations `src/xport/hip_channel_runtime.hpp`): a copy kernel publishes this rank's share, the progress thread
+runs the wire, the stream waits on the receive flag, and the host never waits per gather. Same bytes, same slots, same
+stream order and join kernels; `STRIX_TP_XPORT_*` tunes the channel
+(depth, progress CPU, timeout). The run ends by draining the channel, which checks the last messages (deferred
+integrity check): a failure ends the run with an error before any result is printed.
+- **Off switch:** omit `--tp-rank`; `STRIX_TP_F16_GATHER=0` / `STRIX_TP_SPLIT_DRAFT=0` for the levers;
+  `STRIX_TP_CHANNEL=0` for the staged route.
 - **Exactness evidence:** generated ids equal the one-node plain reference over 1,200 tokens (code prompt) with the
   levers on and off, and over 200 plain tokens. The one-node dense IU4 kernels compile to the same ISA as before; only
   the column-share kernel is new.
 - **Measured gain:** two Strix Halo nodes over USB4, EXACT, code prompt, 1,200 tokens with MTP speculation: one node
-  46.76 / 46.68 tok/s, tensor parallel 58.50 tok/s in the same run (+25 %).
+  46.76 / 46.68 tok/s, tensor parallel 58.50 tok/s in the same run (+25 %). Channel route, same prompt and length,
+  ABA in one run each: one node 46.77 / 46.69 tok/s vs channel 65.38 tok/s (x1.40); staged 58.26 / 58.25 tok/s vs
+  channel 65.28 tok/s (+12.1 %); generated ids equal the one-node reference on all six arms.
 
 ### Qwen 27B pair prefill: decode relay to one node
 
@@ -5666,3 +5713,26 @@ another with the single-row instruction sequence.
   187.3 -> 137.5 ms. Speculative decode with the shared copy proposer, 300 ids, code prompt: plain 16.65 -> 20.16 tok/s
   (E 1.37 tokens per pass); prose: no proposals, 17.06 -> 17.06 tok/s.
 - **Implementation / evidence:** [union form](../src/hip_moe_q4k_a8_probe.hip), [plan](../include/strix/moe/expert_union.hpp), [binding](../src/hy4/hip/hy4_hip_rows.inc)
+
+<a id="hy4-pf-store-epilogue"></a>
+
+## Hy4-flash prompt windows: bf16 epilogue in the producers' store
+
+**Engine:** `hy4`. **Control:** `STRIX_HY4_PF_STORE_EPILOGUE`. **Default:** on.
+
+The windowed prompt (`--prompt-rows`) ran a separate `glu::launch_epilogue<Round::bf16>` pass over every Q8_0 Linear
+output and over the routed experts' FP32 raw slot dots. The shared producers now apply the same function to the same
+FP32 value in their store: the q8a8 dense core (`View::round_bf16` / `View::bias` select the `kernel_linear` entry; the
+plain kernel is unchanged; with K parts the epilogue runs on the last part only, on the full sum) and the K-quant
+envelope of the known-rows MoE down (`PrefillRows::rawdots_bf16`).
+
+- **Preconditions:** Hy4-flash windowed prompt; q8a8 dense calls with batch <= 1 outside the operand-image form; the
+  K-quant envelope of the known-rows down. Other forms refuse the flag (and keep the separate pass).
+- **Exactness evidence:** Same bits by construction (same function on the same register value); the unbiased bf16
+  epilogue is idempotent over all 2^32 FP32 patterns (host test `tests/ops_rope_glu_host_tests.cpp`); one node, 4096
+  tokens: last-position logits digest a0db1a8a45606112 and last generated position digest equal with the lever on,
+  off and on the parent commit.
+- **Off switch:** `STRIX_HY4_PF_STORE_EPILOGUE=0` keeps the separate epilogue passes.
+- **Measured gain:** One node, 4096-token bench prompt (a ~66-token sequence repeated), 2048-row windows, alternated
+  A-B / B-A: warm prompt 7,680 / 7,694 ms -> 7,307 / 7,409 ms (-4.3 %), cold 7,879 / 7,942 -> 7,593 / 7,557 ms (-4.2 %).
+- **Implementation / evidence:** [dense core](../src/core/f16_dense_q8a8.hpp), [known-rows down](../src/hip_moe_q4k_a8_known_rows.hip), [binding](../src/hy4/hip/hy4_hip_forward.hip)

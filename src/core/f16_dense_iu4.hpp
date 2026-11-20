@@ -148,6 +148,20 @@ inline void enqueue(const View& v, hipStream_t stream, unsigned waves = 0U) {
     if (waves_for(v.rows, v.in, waves) == 16U) launch<16>(v, stream);
     else launch<8>(v, stream);
 }
+// STRIX_F16_IU4_X16_256 (default on; 0 = the previous rules): the x16 form from 256 rows, 16-wave x16 CTAs (below).
+inline bool x16_from_256() {
+    static const bool on = envcfg::flag("STRIX_F16_IU4_X16_256", true);
+    return on;
+}
+// CTA waves of the x16 form (the same bits for 8 and 16): STRIX_F16_IU4_WAVES or the caller's choice when set, else 16
+// from 256 rows (measured on gfx1151, x16 form, 7 Qwen shapes in, n in [4096, 17408], two rounds: 16 waves faster at
+// 384 / 512 rows on every shape, at 4096 rows by 4-8 % where the direct rule picked 8 (in < 8192, e.g. 4096 -> 12288:
+// 10.3-11.1 vs 11.1-11.4 ms) and equal on 5120 -> 17408), else the direct form's rule (waves_for).
+inline unsigned x16_waves_for(unsigned rows, unsigned in, unsigned waves = 0U) {
+    static const unsigned env = static_cast<unsigned>(envcfg::integer("STRIX_F16_IU4_WAVES", 0));
+    if (waves == 8U || waves == 16U || env == 8U || env == 16U) return waves_for(rows, in, waves);
+    return x16_from_256() && rows >= 256U ? 16U : waves_for(rows, in);
+}
 // x16 form of enqueue: xt = enqueue_x16_tiles(v.x, xt, v.rows, v.in) of the same x (x16_bytes(rows, in)); same bits.
 inline void enqueue_x16(const View& v, const _Float16* xt, hipStream_t stream, unsigned waves = 0U) {
     const auto go = [&](auto wv) {
@@ -156,14 +170,17 @@ inline void enqueue_x16(const View& v, const _Float16* xt, hipStream_t stream, u
             hipLaunchKernelGGL((kernel_x16<decltype(tc)::value, W>), grid, dim3(32U * W), 0, stream, w, xt);
         });
     };
-    if (waves_for(v.rows, v.in, waves) == 16U) go(std::integral_constant<unsigned, 16U>{});
+    if (x16_waves_for(v.rows, v.in, waves) == 16U) go(std::integral_constant<unsigned, 16U>{});
     else go(std::integral_constant<unsigned, 8U>{});
 }
-// Where the x16 form was measured faster on gfx1151 (hd4 probe, 512 rows, tile pass included): FP32 x above 16 MiB
+// Where the x16 form was measured faster on gfx1151 (tile pass included): from 512 rows, FP32 x above 16 MiB
 // (17408 -> 5120: 3163 -> 2266 us; x = 35.6 MB is re-read from DRAM by each of the 20 column blocks, the FP16 tiles fit
-// the 32 MB MALL) and n >= 10240 (5120 -> 17408: 2202 -> 2121 us, 5120 -> 10240: 1305 -> 1246 us). Narrower shapes keep
-// the direct form until measured; so do windows below the measured 512 rows.
+// the 32 MB MALL) or n >= 10240 (5120 -> 17408: 2202 -> 2121 us, 5120 -> 10240: 1305 -> 1246 us); from 256 to 511 rows
+// (x16_waves_for's 16-wave CTAs) on every measured shape with in, n in [4096, 17408] (tile pass included, vs the direct
+// form with 8 waves: 256 rows -1..-9 %, 384 rows -1..-27 %, e.g. 17408 -> 5120 at 384 rows: 2712 -> 1797 + 32 us).
+// Other shapes keep the direct form until measured.
 inline bool x16_pays(unsigned rows, unsigned in, unsigned n) {
-    return rows >= 512U && (n >= 10240U || std::uint64_t(rows) * in * 4U > (std::uint64_t(16) << 20U));
+    return (rows >= 512U && (n >= 10240U || std::uint64_t(rows) * in * 4U > (std::uint64_t(16) << 20U))) ||
+           (x16_from_256() && rows >= 256U && rows < 512U && in >= 4096U && n >= 4096U);
 }
 }  // namespace strix::core::f16_dense_tall::iu4a16
