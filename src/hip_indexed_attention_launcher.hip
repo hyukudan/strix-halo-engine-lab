@@ -5857,7 +5857,8 @@ void qpf2k_index_flush(hipStream_t stream) {
             static_cast<const QsaRowsInputViews<64U>*>(slot.views), ib.hidden);
         qpf2k_launch_index_wmma.fetch_add(1U, std::memory_order_relaxed);
     }
-    else if (qpf2k_index_batch_enabled() || ib.wmma) launch.template operator()<2U, 16U>();
+    // Default exact batch: RB 8 (8 rows per workgroup as BF16 bits, half the weight re-reads of RB 4, same chains / tree).
+    else if (qpf2k_index_batch_enabled() || ib.wmma) launch.template operator()<2U, 16U, 8U>();
     else if (shape == 1U) launch.template operator()<4U, 16U>();
     else if (shape == 2U) launch.template operator()<4U, 8U>();
     else if (shape == 3U) launch.template operator()<2U, 8U>();
