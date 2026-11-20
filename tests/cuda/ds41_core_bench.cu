@@ -9,6 +9,7 @@
 #include "strix/cuda/ds41_weights.hpp"
 
 #include "strix/ds41_layer.hpp"
+#include "strix/head_argmax.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -79,6 +80,7 @@ int main(int argc, char** argv) try {
     void* ew = ws.take_bytes(c::engram_workspace_bytes(R, 24, H));
     float* logits = ws.take<float>(std::size_t{R} * V);
     auto* cand = ws.take<d::ArgmaxCandidate>(R);
+    void* argmax_partial = ws.take_bytes(strix::head_argmax::workspace_bytes(R));
     std::printf("device %s; layer %u, %u rows, %d iterations (shared GPU: numbers under whatever else runs)\n", devinfo.name.c_str(), layer,
                 R, iters);
 
@@ -274,7 +276,7 @@ int main(int argc, char** argv) try {
                 v.a8 = xa;
                 c::enqueue_norm(v, s);
                 q8("output.weight", V, H, xa, logits);
-                c::enqueue_argmax({logits, R, V, 0, 0, cand}, s);
+                c::enqueue_argmax({logits, R, V, 0, 0, cand, argmax_partial}, s);
             }};
     // load every weight once (first run), then warm up
     for (auto& op : ops) op.run();

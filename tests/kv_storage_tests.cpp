@@ -1,6 +1,7 @@
 // Host tests of strix/kv_storage.hpp: bytes, role / tier policy, the quantiser layouts behind the forms, and the draft-cache
 // invariant (a drafter reading a quantised cache changes acceptance, never the ids emitted by exact verification).
 #include "strix/kv_storage.hpp"
+#include "strix/model_contract.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -10,6 +11,8 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -146,6 +149,21 @@ void test_bytes_and_policy() {
     check(strix::kv::name(Form::int8_token) == "kv-int8-tok-v1", "int8 name = the QSA identity word");
 }
 
+// One table: the model contract's KV storage is this Form, its identity word comes from kv::name.
+void test_contract_binding() {
+    static_assert(std::is_same_v<strix::AttentionKvStorage, Form>, "the contract's KV storage is kv::Form");
+    static_assert(static_cast<std::uint32_t>(strix::AttentionKvStorage::bf16) == 0U &&
+                      static_cast<std::uint32_t>(strix::AttentionKvStorage::int8_token) == 1U,
+                  "contract enumerator values unchanged");
+    for (Form f : {Form::bf16, Form::int8_token, Form::e4m3_token})
+        check(std::string_view(strix::attention_kv_storage_name(f)) == strix::kv::name(f),
+              "attention_kv_storage_name = kv::name for every form");
+    check(std::string_view(strix::attention_kv_storage_name(strix::AttentionKvStorage::bf16)) == "bf16",
+          "contract bf16 word");
+    check(std::string_view(strix::attention_kv_storage_name(strix::AttentionKvStorage::int8_token)) == "kv-int8-tok-v1",
+          "contract int8 word");
+}
+
 // The layout lesson of the source: keys carry fixed outlier channels (per-token scales are set by them, so 4-bit per-token
 // keys flatten every other channel); values have per-token magnitude and no channel structure (either layout serves).
 void test_layouts() {
@@ -259,6 +277,7 @@ void test_draft_cache_exact() {
 
 int main() {
     test_bytes_and_policy();
+    test_contract_binding();
     test_layouts();
     test_draft_cache_exact();
     if (failures != 0) {

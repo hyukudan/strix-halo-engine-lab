@@ -36,8 +36,11 @@ using moe_a8::cp_wait_all;
 constexpr unsigned kTurboThreads = ti::kThreads;
 constexpr unsigned kTurboProjectOutputs = ti::kProjectOutputs;  // grid (tiles, ffn / 64)
 constexpr unsigned kTurboDownOutputs = ti::kDownOutputs;        // grid (tiles, hidden / 128)
-constexpr unsigned kStageA = ti::kTileRows * ti::kPitch;        // int8 codes of one stage
-constexpr unsigned kStageBytes = kStageA + ti::kTileRows * 16U; // + 4 FP32 deltas per row
+// One stage for MB m16 blocks of rows: int8 codes, then 4 FP32 deltas per row. The tile form stages kTileRows = 4 blocks;
+// the decode form (native_mma::decode_form) one block.
+template <unsigned MB> inline constexpr unsigned kStageAOf = 16U * MB * ti::kPitch;
+template <unsigned MB> inline constexpr unsigned kStageBytesOf = kStageAOf<MB> + 16U * MB * 16U;
+static_assert(16U * native_mma::kTileMBlocks == ti::kTileRows, "the tile form stages a whole TURBO tile");
 static_assert(ti::kStageK == 128U, "4 groups (16 B of deltas) per staged row");
 
 // D = A(16x32 s8) * B(32x8 s8) + C, C = (c, c, c, c).
@@ -126,38 +129,54 @@ __device__ __forceinline__ void turbo_group(float (&acc)[4], const unsigned char
     }
 }
 
-// Stages `count` rows of 128 codes + 4 deltas (rows >= count are not written: an MMA row reaches only its own C row, and
-// those C rows are never stored).
+// The TURBO kernels' field loader for the shared weight ring (moe_a8::ring_fill / ring_advance): the int8 fragment's words.
+template <class Decode> struct TurboRaw {
+    static __device__ __forceinline__ typename Decode::Raw get(const std::uint8_t* row, unsigned group, unsigned lane) {
+        return turbo_raw<Decode>(row, group, lane);
+    }
+};
+
+// Stages `count` (<= 16 MB) rows of 128 codes + 4 deltas (rows >= count are not written: an MMA row reaches only its own C
+// row, and those C rows are never stored).
+template <unsigned MB>
 __device__ __forceinline__ void turbo_stage(unsigned char* st, unsigned count, unsigned t, const std::int8_t* const* code_rows,
                                             const float* const* delta_rows, unsigned s) {
     for (unsigned i = t; i < count * 8U; i += kTurboThreads) {
         const unsigned r = i >> 3, c = i & 7U;
         cp16(st + r * ti::kPitch + 16U * c, code_rows[r] + s * ti::kStageK + 16U * c);
     }
-    for (unsigned r = t; r < count; r += kTurboThreads) cp16(st + kStageA + 16U * r, delta_rows[r] + 4U * s);
+    for (unsigned r = t; r < count; r += kTurboThreads) cp16(st + kStageAOf<MB> + 16U * r, delta_rows[r] + 4U * s);
     cp_commit();
 }
 
 // grid (tiles, ffn / 64), tile-major raster, 256 threads. Gate and up of one output are the same C element of two
 // accumulators; the FP32 g / u tile then goes through Binding::activation_tile (the A8 SwiGLU + per-32 down quantizer,
 // fail-closed flags).
-template <unsigned T, class Binding>
+// MB m16 blocks per tile and a D-deep weight ring (moe_a8::ring_fill): (kTileMBlocks, kTileAhead) for any tile, the decode
+// form (kDecodeMBlocks, kDecodeAhead) when native_mma::decode_form(rows) holds for the launch, as for the BF16 kernels.
+// Each output's IMMA and turbo_i8::step sequence over the groups is the same in both forms: bitwise the same outputs.
+template <unsigned T, class Binding, unsigned MB = native_mma::kTileMBlocks, unsigned D = native_mma::kTileAhead>
 __global__ __launch_bounds__(kTurboThreads, 2) void turbo_project_kernel(const std::uint8_t* gate, const std::uint8_t* up,
                                                                          typename Binding::Rows v, typename Binding::Tables tables) {
+    static_assert(MB >= 1U && MB <= native_mma::kTileMBlocks && D >= 1U, "tile capacity and ring depth");
     using Decode = weight::GsqDecode<T>;
     constexpr unsigned hidden = Binding::hidden, ffn = Binding::ffn, projection_nonfinite = Binding::projection_nonfinite;
     constexpr unsigned stages = hidden / ti::kStageK, groups_per_stage = ti::kStageK / 32U;
     constexpr std::uint64_t row_bytes = std::uint64_t(hidden / Decode::be) * Decode::bb;
     static_assert(hidden % ti::kStageK == 0U && hidden % Decode::be == 0U && ffn % kTurboProjectOutputs == 0U,
                   "TURBO project covers whole stages, storage blocks and output blocks");
-    constexpr unsigned kTileBytes = 2U * ti::kTileRows * kTurboProjectOutputs * 4U;  // g / u FP32 tile after the K loop
-    constexpr unsigned kStage = kStageBytes;
+    constexpr unsigned kTileBytes = 2U * 16U * MB * kTurboProjectOutputs * 4U;  // g / u FP32 tile after the K loop
+    constexpr unsigned kStage = kStageBytesOf<MB>;
     constexpr unsigned kSmem = kTileBytes > 2U * kStage ? kTileBytes : 2U * kStage;
     const auto& csr = v.csr;
     const native_mma::TileSlice ts = native_mma::tile_major(blockIdx.x, blockIdx.y, gridDim.x, ffn / kTurboProjectOutputs);
     if ((csr.summary[0] & ~projection_nonfinite) || ts.tile >= *csr.tile_count) return;
     const unsigned tile_begin = csr.tile_begins[ts.tile], count = csr.tile_begins[ts.tile + 1U] - tile_begin;
     const unsigned expert = csr.tile_experts[ts.tile];
+    if constexpr (MB < native_mma::kTileMBlocks) if (count > 16U * MB) {  // decode form over a wider tile: fail closed
+        if (threadIdx.x == 0U) atomicOr(csr.summary, projection_nonfinite);
+        return;
+    }
     __shared__ alignas(16) unsigned char smem[kSmem];
     __shared__ unsigned row_of[ti::kTileRows], slot_of[ti::kTileRows];
     __shared__ const std::int8_t* code_rows[ti::kTileRows];
@@ -177,38 +196,38 @@ __global__ __launch_bounds__(kTurboThreads, 2) void turbo_project_kernel(const s
     const auto grid = turbo_grid<T, kOwnSmem>(grid_words);
     const std::uint64_t wr = std::uint64_t(expert) * ffn + out_base + g;
     const std::uint8_t* wrow[2] = {gate + wr * row_bytes, up + wr * row_bytes};
-    const unsigned mblocks = ti::m_blocks(count);  // block-uniform
-    float acc[4][2][4];
+    const unsigned mblocks = ti::m_blocks(count);  // block-uniform, <= MB
+    float acc[MB][2][4];
 #pragma unroll
-    for (unsigned m = 0; m < 4U; ++m)
+    for (unsigned m = 0; m < MB; ++m)
 #pragma unroll
         for (unsigned mat = 0; mat < 2U; ++mat)
 #pragma unroll
             for (unsigned i = 0; i < 4U; ++i) acc[m][mat][i] = 0.0F;
-    turbo_stage(smem, count, t, code_rows, delta_rows, 0U);
-    // Weight fields of the next group are loaded before this group's decode and IMMAs (and across the stage barrier): the
-    // global round trip overlaps one group of work. The last group re-loads itself (no branch, no read past the row).
+    turbo_stage<MB>(smem, count, t, code_rows, delta_rows, 0U);
+    // Weight fields of the next D groups are loaded before this group's decode and IMMAs (and across the stage barrier): the
+    // global round trips overlap D groups of work. The last groups re-load the last one (no branch, no read past the row).
     constexpr unsigned groups = stages * groups_per_stage;
-    typename Decode::Raw ahead[2] = {turbo_raw<Decode>(wrow[0], 0U, lane), turbo_raw<Decode>(wrow[1], 0U, lane)};
+    typename Decode::Raw ahead[D][2];
+    moe_a8::ring_fill<Decode, D, TurboRaw<Decode>>(ahead, wrow[0], wrow[1], groups, lane);
 #pragma unroll 1
     for (unsigned s = 0; s < stages; ++s) {
         cp_wait_all();
         __syncthreads();  // stage s landed; every warp finished stage s - 1, so its buffer is free
-        if (s + 1U < stages) turbo_stage(smem + ((s + 1U) & 1U) * kStage, count, t, code_rows, delta_rows, s + 1U);
+        if (s + 1U < stages) turbo_stage<MB>(smem + ((s + 1U) & 1U) * kStage, count, t, code_rows, delta_rows, s + 1U);
         const unsigned char* A = smem + (s & 1U) * kStage;
-        const float* E = reinterpret_cast<const float*>(A + kStageA);  // [row][4]
+        const float* E = reinterpret_cast<const float*>(A + kStageAOf<MB>);  // [row][4]
 #pragma unroll
         for (unsigned j = 0; j < groups_per_stage; ++j) {
-            const unsigned group = s * groups_per_stage + j, next = group + 1U < groups ? group + 1U : group;
-            const typename Decode::Raw raw[2] = {ahead[0], ahead[1]};
-            ahead[0] = turbo_raw<Decode>(wrow[0], next, lane);
-            ahead[1] = turbo_raw<Decode>(wrow[1], next, lane);
+            const unsigned group = s * groups_per_stage + j;
+            const typename Decode::Raw raw[2] = {ahead[0][0], ahead[0][1]};
+            moe_a8::ring_advance<Decode, D, TurboRaw<Decode>>(ahead, wrow[0], wrow[1], group, groups, lane);
             unsigned b[2][2];
             float scale[2][2][2];
             turbo_weights<Decode>(raw[0], group, grid, lane, b[0], scale[0]);
             turbo_weights<Decode>(raw[1], group, grid, lane, b[1], scale[1]);
 #pragma unroll
-            for (unsigned m = 0; m < 4U; ++m) {
+            for (unsigned m = 0; m < MB; ++m) {
                 if (m >= mblocks) break;
                 const unsigned row0 = 16U * m + g;
                 const float e[2] = {E[4U * row0 + j], E[4U * (row0 + 8U) + j]};
@@ -219,10 +238,10 @@ __global__ __launch_bounds__(kTurboThreads, 2) void turbo_project_kernel(const s
         }
     }
     __syncthreads();  // the stage buffers become the g / u tile
-    float* Gt = reinterpret_cast<float*>(smem);  // [64 rows][64 outputs]
-    float* Ut = Gt + ti::kTileRows * kTurboProjectOutputs;
+    float* Gt = reinterpret_cast<float*>(smem);  // [16 MB rows][64 outputs]
+    float* Ut = Gt + 16U * MB * kTurboProjectOutputs;
 #pragma unroll
-    for (unsigned m = 0; m < 4U; ++m)
+    for (unsigned m = 0; m < MB; ++m)
 #pragma unroll
         for (unsigned i = 0; i < 4U; ++i) {
             const unsigned row = 16U * m + ti::c_row(lane, i), o = 8U * warp + ti::c_col(lane, i);
@@ -235,20 +254,26 @@ __global__ __launch_bounds__(kTurboThreads, 2) void turbo_project_kernel(const s
 
 // grid (tiles, hidden / 128), 256 threads. Reads the A8 down codes / deltas of each (row, slot) and writes FP32
 // rawdots[row][slot * hidden + o] (the native route's storage; merge / commit unchanged).
-template <unsigned T, class Binding>
+// MB / D: as turbo_project_kernel (decode form when native_mma::decode_form(rows); bitwise the tile form).
+template <unsigned T, class Binding, unsigned MB = native_mma::kTileMBlocks, unsigned D = native_mma::kTileAhead>
 __global__ __launch_bounds__(kTurboThreads, 2) void turbo_down_kernel(const std::uint8_t* down, typename Binding::Rows v) {
+    static_assert(MB >= 1U && MB <= native_mma::kTileMBlocks && D >= 1U, "tile capacity and ring depth");
     using Decode = weight::GsqDecode<T>;
     constexpr unsigned hidden = Binding::hidden, ffn = Binding::ffn;
     constexpr unsigned stages = ffn / ti::kStageK, groups_per_stage = ti::kStageK / 32U;
     constexpr std::uint64_t row_bytes = std::uint64_t(ffn / Decode::be) * Decode::bb;
     static_assert(ffn % ti::kStageK == 0U && ffn % Decode::be == 0U && hidden % kTurboDownOutputs == 0U,
                   "TURBO down covers whole stages, storage blocks and output blocks");
-    constexpr unsigned kStage = kStageBytes;
+    constexpr unsigned kStage = kStageBytesOf<MB>;
     const auto& csr = v.csr;
     const native_mma::TileSlice ts = native_mma::tile_major(blockIdx.x, blockIdx.y, gridDim.x, hidden / kTurboDownOutputs);
     if (csr.summary[0] || ts.tile >= *csr.tile_count) return;
     const unsigned tile_begin = csr.tile_begins[ts.tile], count = csr.tile_begins[ts.tile + 1U] - tile_begin;
     const unsigned expert = csr.tile_experts[ts.tile];
+    if constexpr (MB < native_mma::kTileMBlocks) if (count > 16U * MB) {  // as in the project kernel: fail closed
+        if (threadIdx.x == 0U) atomicOr(csr.summary, Binding::projection_nonfinite);
+        return;
+    }
     __shared__ alignas(16) unsigned char smem[2U * kStage];
     __shared__ unsigned row_of[ti::kTileRows], slot_of[ti::kTileRows];
     __shared__ const std::int8_t* code_rows[ti::kTileRows];
@@ -269,36 +294,36 @@ __global__ __launch_bounds__(kTurboThreads, 2) void turbo_down_kernel(const std:
     const std::uint8_t* wrow[2];
 #pragma unroll
     for (unsigned n = 0; n < 2U; ++n) wrow[n] = down + (std::uint64_t(expert) * hidden + out_base + 8U * n + g) * row_bytes;
-    const unsigned mblocks = ti::m_blocks(count);  // block-uniform
-    float acc[4][2][4];
+    const unsigned mblocks = ti::m_blocks(count);  // block-uniform, <= MB
+    float acc[MB][2][4];
 #pragma unroll
-    for (unsigned m = 0; m < 4U; ++m)
+    for (unsigned m = 0; m < MB; ++m)
 #pragma unroll
         for (unsigned n = 0; n < 2U; ++n)
 #pragma unroll
             for (unsigned i = 0; i < 4U; ++i) acc[m][n][i] = 0.0F;
-    turbo_stage(smem, count, t, code_rows, delta_rows, 0U);
-    constexpr unsigned groups = stages * groups_per_stage;  // fields one group ahead, as in turbo_project_kernel
-    typename Decode::Raw ahead[2] = {turbo_raw<Decode>(wrow[0], 0U, lane), turbo_raw<Decode>(wrow[1], 0U, lane)};
+    turbo_stage<MB>(smem, count, t, code_rows, delta_rows, 0U);
+    constexpr unsigned groups = stages * groups_per_stage;  // fields D groups ahead, as in turbo_project_kernel
+    typename Decode::Raw ahead[D][2];
+    moe_a8::ring_fill<Decode, D, TurboRaw<Decode>>(ahead, wrow[0], wrow[1], groups, lane);
 #pragma unroll 1
     for (unsigned s = 0; s < stages; ++s) {
         cp_wait_all();
         __syncthreads();
-        if (s + 1U < stages) turbo_stage(smem + ((s + 1U) & 1U) * kStage, count, t, code_rows, delta_rows, s + 1U);
+        if (s + 1U < stages) turbo_stage<MB>(smem + ((s + 1U) & 1U) * kStage, count, t, code_rows, delta_rows, s + 1U);
         const unsigned char* A = smem + (s & 1U) * kStage;
-        const float* E = reinterpret_cast<const float*>(A + kStageA);
+        const float* E = reinterpret_cast<const float*>(A + kStageAOf<MB>);
 #pragma unroll
         for (unsigned j = 0; j < groups_per_stage; ++j) {
-            const unsigned group = s * groups_per_stage + j, next = group + 1U < groups ? group + 1U : group;
-            const typename Decode::Raw raw[2] = {ahead[0], ahead[1]};
-            ahead[0] = turbo_raw<Decode>(wrow[0], next, lane);
-            ahead[1] = turbo_raw<Decode>(wrow[1], next, lane);
+            const unsigned group = s * groups_per_stage + j;
+            const typename Decode::Raw raw[2] = {ahead[0][0], ahead[0][1]};
+            moe_a8::ring_advance<Decode, D, TurboRaw<Decode>>(ahead, wrow[0], wrow[1], group, groups, lane);
             unsigned b[2][2];
             float scale[2][2][2];
             turbo_weights<Decode>(raw[0], group, grid, lane, b[0], scale[0]);
             turbo_weights<Decode>(raw[1], group, grid, lane, b[1], scale[1]);
 #pragma unroll
-            for (unsigned m = 0; m < 4U; ++m) {
+            for (unsigned m = 0; m < MB; ++m) {
                 if (m >= mblocks) break;
                 const unsigned row0 = 16U * m + g;
                 const float e[2] = {E[4U * row0 + j], E[4U * (row0 + 8U) + j]};
@@ -308,7 +333,7 @@ __global__ __launch_bounds__(kTurboThreads, 2) void turbo_down_kernel(const std:
         }
     }
 #pragma unroll
-    for (unsigned m = 0; m < 4U; ++m)
+    for (unsigned m = 0; m < MB; ++m)
 #pragma unroll
         for (unsigned n = 0; n < 2U; ++n)
 #pragma unroll
