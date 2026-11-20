@@ -58,8 +58,10 @@ int main(int argc, char** argv) {
     const unsigned data_class = std::getenv("HB_RAND") ? unsigned(std::atoi(std::getenv("HB_RAND"))) : 0U;
     if (data_class > 3U) { std::printf("HB_RAND must be 0..3\n"); return 2; }
     if (data_class != 0U) {
+        // A 64 MiB random block repeated over the buffer: same data class, a period above the 32 MiB last-level cache,
+        // and a fill time that does not grow with multi-GB batched weights.
         auto fill = [](void* p, std::size_t bytes, std::uint32_t z, unsigned cls) {
-            std::vector<std::uint16_t> host(bytes / 2U);
+            std::vector<std::uint16_t> host(std::min(bytes, std::size_t(64) << 20) / 2U);
             for (auto& e : host) {
                 z = z * 1664525U + 1013904223U;
                 if (cls == 3U) { e = static_cast<std::uint16_t>(z >> 16); continue; }
@@ -67,7 +69,8 @@ int main(int argc, char** argv) {
                 const _Float16 f = static_cast<_Float16>(v);
                 std::memcpy(&e, &f, sizeof(e));
             }
-            CK(hipMemcpy(p, host.data(), host.size() * 2U, hipMemcpyHostToDevice));
+            for (std::size_t off = 0; off < bytes; off += host.size() * 2U)
+                CK(hipMemcpy(static_cast<char*>(p) + off, host.data(), std::min(host.size() * 2U, bytes - off), hipMemcpyHostToDevice));
         };
         fill(w, max_w, 7U, data_class);                          // weights: the class
         fill(x, max_x, 11U, data_class == 3U ? 3U : 2U);         // activations: full-mantissa (or random bytes)
