@@ -75,7 +75,7 @@ void check_gemm(const char* name, std::uint32_t out, std::uint32_t in, std::uint
     const auto xt = down(dxt, ha.tile.size());
     const auto rs = down(drs, ha.rows_pad);
     const bool qsame = xt == ha.tile && std::memcmp(rs.data(), ha.rs.data(), rs.size() * 4) == 0;
-    T::GemmArgs g;  // reference arm: Feed::lsu (the default is bulk; bulk_bitwise re-runs it with bulk)
+    T::GemmArgs g;  // reference arm: Feed::lsu (also the default; bulk_bitwise re-runs it with bulk)
     g.feed = T::Feed::lsu;
     g.w = dw;
     g.x = dxt;
@@ -346,7 +346,7 @@ void bench(const char* name, std::uint32_t out, std::uint32_t in, std::uint32_t 
     if (glu) CU(cudaMemset(w2, 0x35, T::w_tile_bytes(out, in)));
     CU(cudaMemset(x, 0x3c, static_cast<std::size_t>(rows) * in * 4));
     CU(T::quantize_enqueue(x, rows, in, xt, rs, nullptr));
-    T::GemmArgs g;  // lsu arm (explicit: the default feed is bulk)
+    T::GemmArgs g;  // lsu arm (the default feed, explicit for ABAB benchmark)
     g.feed = T::Feed::lsu;
     g.w = w;
     g.w2 = glu ? w2 : nullptr;
