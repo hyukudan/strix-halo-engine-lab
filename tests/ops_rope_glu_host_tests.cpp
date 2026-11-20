@@ -7,6 +7,7 @@
 #include "ops/glu/glu.hpp"
 #include "ops/rope/rope.hpp"
 
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -121,6 +122,29 @@ void store_epilogue_tests() {
         if (b == nullptr) ok = ok && same_bits(strix::ops::glu::epilogue<Round::bf16>(one, nullptr, o), one);
     }
     check(ok, "store epilogue == plain store + epilogue pass (parts, bias, no bias)");
+    // (3) Batched form (q8a8 kernel_linear, batch > 1, no bias; Hy4 attn_v_b: H products of vd columns, out_stride H * vd,
+    //     batch_out vd): product z stores row r column o at r * stride + z * batch_out + o. These indices cover
+    //     [0, rows * stride) exactly once, so the per-product store epilogue = the separate pass over the whole buffer.
+    for (const auto& shape : {std::array<std::size_t, 3>{7U, 64U, 256U}, std::array<std::size_t, 3>{16U, 3U, 48U}}) {
+        const std::size_t rows = shape[0], heads = shape[1], cols = shape[2], stride = heads * cols, n = rows * stride;
+        std::vector<float> sums(n), pass(n), fused(n, 0.0F);
+        std::vector<unsigned> hits(n, 0U);
+        for (std::size_t i = 0; i < n; ++i) sums[i] = next_value(40.0F);
+        for (std::size_t i = 0; i < n; ++i) pass[i] = strix::ops::glu::epilogue<Round::bf16>(sums[i], nullptr, 0U);  // separate pass
+        for (std::size_t z = 0; z < heads; ++z)
+            for (std::size_t r = 0; r < rows; ++r)
+                for (std::size_t o = 0; o < cols; ++o) {
+                    const std::size_t at = r * stride + z * cols + o;  // StoreRounded::put of product z (out + z * batch_out)
+                    ++hits[at];
+                    fused[at] = strix::ops::glu::epilogue<Round::bf16>(sums[at], nullptr, o);
+                }
+        bool cover = true, same = true;
+        for (std::size_t i = 0; i < n; ++i) {
+            cover = cover && hits[i] == 1U;
+            same = same && same_bits(pass[i], fused[i]);
+        }
+        check(cover && same, "batched store epilogue covers every element once and equals the separate pass");
+    }
 }
 
 // The MODEL_B reference rotation, written independently of the op (modelb-host-ref-v1).

@@ -39,7 +39,8 @@ struct View {
     // Linear epilogue in the store (round_bf16 != 0): out[r][o] = ops::glu::epilogue<Round::bf16>(total, bias, o), total =
     // the value Store writes today (sum, or out + sum when accumulating), bias == nullptr = no bias. Same bits as the plain
     // store followed by a separate glu::launch_epilogue<Round::bf16>(out, bias, count, rows * count, out) when out_stride
-    // == count; enqueue_parts applies it on the last K part only. Not with the operand-image form or batch > 1.
+    // == count; enqueue_parts applies it on the last K part only. Not with the operand-image form. Batched form (batch > 1):
+    // product z rounds its own columns out + z * batch_out (same function per element); a bias is refused there.
     const float* bias = nullptr;
     std::uint32_t round_bf16 = 0U;
 };
@@ -148,20 +149,25 @@ template <class E> struct StoreImage {
     template <class F> __device__ __forceinline__ void run(F&& f) { f(*this); }
 };
 
-template <unsigned TC, unsigned Waves, unsigned Form> __global__ __launch_bounds__(32 * Waves) void kernel(View v) {
-    __shared__ Storage<TC> lds;
-    if (v.batch > 1U) {  // product blockIdx.z of a batched launch (CTA-uniform)
+// Product blockIdx.z of a batched launch (CTA-uniform): its weight, A8 rows and output columns.
+__device__ __forceinline__ void select_product(View& v) {
+    if (v.batch > 1U) {
         const unsigned z = blockIdx.z;
         v.weight += static_cast<std::size_t>(z) * v.batch_weight_bytes;
         v.codes += static_cast<std::size_t>(z) * v.batch_in;
         v.deltas += static_cast<std::size_t>(z) * (v.batch_in / 32U);
         v.out += static_cast<std::size_t>(z) * v.batch_out;
     }
+}
+template <unsigned TC, unsigned Waves, unsigned Form> __global__ __launch_bounds__(32 * Waves) void kernel(View v) {
+    __shared__ Storage<TC> lds;
+    select_product(v);
     core<TC>(nullptr, v.in, v.rows, Cols<Waves, Form>{v}, lds, Store{v.count, v.tile0, v.accumulate});
 }
-// The same chains with the View's Linear epilogue in the store (round_bf16 != 0; one product, batch <= 1).
+// The same chains with the View's Linear epilogue in the store (round_bf16 != 0; batched form without a bias).
 template <unsigned TC, unsigned Waves, unsigned Form> __global__ __launch_bounds__(32 * Waves) void kernel_linear(View v) {
     __shared__ Storage<TC> lds;
+    select_product(v);
     core<TC>(nullptr, v.in, v.rows, Cols<Waves, Form>{v}, lds, StoreRounded{v.count, v.tile0, v.accumulate, v.bias});
 }
 template <unsigned TC, unsigned Waves, class E>
@@ -173,7 +179,7 @@ __global__ __launch_bounds__(32 * Waves) void kernel_image(View v, std::uint16_t
 inline bool supported(const View& v) {
     return ::strix::weight::hip::Q8F16Source::supported(v) &&
            (v.batch <= 1U || (v.batch <= 65535U && v.batch_in % 32U == 0U)) &&
-           (v.round_bf16 == 0U ? v.bias == nullptr : v.batch <= 1U);  // a bias exists only with the store epilogue
+           (v.round_bf16 == 0U ? v.bias == nullptr : v.batch <= 1U || v.bias == nullptr);  // bias: store epilogue, one product
 }
 
 // Rows per weight read = 16 * waves (the same bits either way). waves 0 = the rule: STRIX_F16_Q8A8_WAVES (8 or 16) when
@@ -199,12 +205,12 @@ template <unsigned Waves, unsigned Form> inline void launch(View v, hipStream_t 
     const Plan pl = plan(tiles, v.rows, true);
     const unsigned gz = v.batch > 1U ? v.batch : 1U;  // batched form: one product per grid z
     v.tile0 = 0U;
-    if (v.round_bf16 != 0U) {  // the store-epilogue entry: same grid and chains (supported(): one product)
-        if (pl.full) hipLaunchKernelGGL((kernel_linear<16, Waves, Form>), dim3(gx, pl.full), dim3(32U * Waves), 0, stream, v);
+    if (v.round_bf16 != 0U) {  // the store-epilogue entry: same grid and chains (batched: no bias, supported())
+        if (pl.full) hipLaunchKernelGGL((kernel_linear<16, Waves, Form>), dim3(gx, pl.full, gz), dim3(32U * Waves), 0, stream, v);
         v.tile0 = 16U * pl.full;
-        if (pl.tc == 1U) hipLaunchKernelGGL((kernel_linear<1, Waves, Form>), dim3(gx, pl.gy), dim3(32U * Waves), 0, stream, v);
-        if (pl.tc == 2U) hipLaunchKernelGGL((kernel_linear<2, Waves, Form>), dim3(gx, pl.gy), dim3(32U * Waves), 0, stream, v);
-        if (pl.tc == 4U) hipLaunchKernelGGL((kernel_linear<4, Waves, Form>), dim3(gx, pl.gy), dim3(32U * Waves), 0, stream, v);
+        if (pl.tc == 1U) hipLaunchKernelGGL((kernel_linear<1, Waves, Form>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v);
+        if (pl.tc == 2U) hipLaunchKernelGGL((kernel_linear<2, Waves, Form>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v);
+        if (pl.tc == 4U) hipLaunchKernelGGL((kernel_linear<4, Waves, Form>), dim3(gx, pl.gy, gz), dim3(32U * Waves), 0, stream, v);
         return;
     }
     if (pl.full) hipLaunchKernelGGL((kernel<16, Waves, Form>), dim3(gx, pl.full, gz), dim3(32U * Waves), 0, stream, v);
