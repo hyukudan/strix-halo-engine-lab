@@ -2701,6 +2701,17 @@
   },
   {
     "engine": "glm",
+    "name": "MTP drafting arbiter (prompt lookup)",
+    "flag_or_env": "STRIX_SPEC_ARBITER",
+    "default": "on",
+    "exact": "Committed tokens are the greedy verify tokens in every arm; token fnv equal ON vs OFF on 3 prompts (1K, 6K, 850-token copy), both ranks take the same decision from the replicated cost table.",
+    "gain": "Pair ABBA, 256 tokens: 20.4 -> 15.1 ms/token (1K), 21.1 -> 15.0 (6K), 19.7 -> 13.7 (copy prompt).",
+    "preconditions": "Two-rank TP2 MTP decode (--mtp-spec); lookup windows up to 7 drafts (8 rows).",
+    "off_switch": "STRIX_SPEC_ARBITER=0 (or --baseline)",
+    "doc_anchor": "docs/optimizations.md#glm-mtp-arbiter"
+  },
+  {
+    "engine": "glm",
     "name": "Prefill indexer scores v3 and select v2",
     "flag_or_env": "STRIX_GLM_PF_IDX; STRIX_GLM_PF_SELECT",
     "default": "3 / 2",

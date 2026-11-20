@@ -4394,6 +4394,21 @@ cache in chunks during prefill. Committed tokens are the target's greedy tokens.
 `STRIX_GLM_MOE_PIPE=1` is included as an opt-in experiment (default off, not yet gated); the fused decode HC norm
 (`STRIX_GLM_HC_NORM`) is now a default, see [below](#glm-hc-norm-fused).
 
+<a id="glm-mtp-arbiter"></a>
+
+### MTP drafting arbiter (prompt lookup)
+
+**Engine:** `glm`. **Control:** `STRIX_SPEC_ARBITER`. **Default:** on.
+
+Each MTP cycle asks the shared `strix::spec` ContextProposer + Arbiter for plain / the MTP chain / a prompt-lookup
+window (up to 7 drafts). Costs are seeded every cycle from the replicated merged cost table with learning off, so both
+TP2 ranks take the same decision without an extra exchange. The serve keeps the lookup context per request.
+
+- **Exactness evidence:** committed tokens are the greedy verify tokens in every arm; token fnv equal ON vs OFF on 3 prompts.
+- **Off switch:** STRIX_SPEC_ARBITER=0 (or --baseline) keeps the MTP chain alone.
+- **Measured gain:** pair ABBA, 256 tokens: 20.4 -> 15.1 ms/token (1K), 21.1 -> 15.0 (6K), 19.7 -> 13.7 (copy prompt).
+- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [spec runtime](../src/glm/spec/glm_spec_run.cpp)
+
 <a id="glm-pf-indexer-v2"></a>
 
 ### Prefill indexer scores v3 and select v2

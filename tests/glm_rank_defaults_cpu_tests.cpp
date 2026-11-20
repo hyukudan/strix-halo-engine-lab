@@ -170,8 +170,9 @@ void test_apply_env_default() {
     CHECK(resolve(cat(kDeploy, kDecodeWork), {}).env.at("STRIX_GLM_SPEC_XCH").value == "xfer");
     CHECK(resolve({"--baseline"}, {}).env.at("STRIX_GLM_SPEC_XCH").value == "comm");
     CHECK(resolve({}, {{"STRIX_GLM_SPEC_XCH", "comm"}}).env.at("STRIX_GLM_SPEC_XCH").source == "explicit");
-    // shared Arbiter binding (opt-in): default off, baseline off, explicit 1 on, anything else refused at startup
-    CHECK(!resolve(cat(kDeploy, kDecodeWork), {}).spec_arbiter);
+    // shared Arbiter binding: default on, baseline off, explicit 0 off / 1 on, anything else refused at startup
+    CHECK(resolve(cat(kDeploy, kDecodeWork), {}).spec_arbiter);
+    CHECK(!resolve(cat(kDeploy, kDecodeWork), {{"STRIX_SPEC_ARBITER", "0"}}).spec_arbiter);
     CHECK(!resolve({"--baseline"}, {}).spec_arbiter);
     CHECK(resolve(cat(kDeploy, kDecodeWork), {{"STRIX_SPEC_ARBITER", "1"}}).spec_arbiter);
     CHECK(resolve({"--baseline"}, {{"STRIX_SPEC_ARBITER", "1"}}).spec_arbiter);
