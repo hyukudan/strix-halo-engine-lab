@@ -5,7 +5,8 @@
 # with HB_BATCH). Per bucket: strix-hip-moe-wmma-prefill-tests bench2 under a rocprofv3 kernel trace (gate/up and down
 # kernel times), then the attribution tunes 338 (no WMMA) and 594 (no dequantisation) at the two largest buckets
 # (diagnostic, bits not exact by design). Rows default 8 16 32 64 128 256; T = rows x 512 / 10 rounded down to 8.
-# Env: ROCPROF (default rocprofv3 on PATH, else $ROCM_PATH/bin). Writes OUT_DIR/summary.txt (<= 60 lines) and OUT_DIR/buckets.done. Run inside the node's GPU turn (~60 s).
+# Env: ROCPROF (default rocprofv3 on PATH, else $ROCM_PATH/bin); ATTRIB=0 skips the attribution tunes; HB_ARMS / HB_RAND
+# pass to the yardstick (defaults 3 / 2: D FP32 and D FP16 on full-mantissa data). Writes OUT_DIR/summary.txt (<= 60 lines) and OUT_DIR/buckets.done. Run inside the node's GPU turn (~60 s).
 set -u
 B=${1:?BUILD_DIR}; Y=${2:?YARDSTICK}; OUT=${3:?OUT_DIR}; shift 3
 ROWS=${*:-8 16 32 64 128 256}
@@ -40,9 +41,11 @@ run() {  # run LABEL ROWS [env...]
 }
 for r in $ROWS; do run "r$r" "$r" BENCH_CORES=0; done
 big=$(echo "$ROWS" | tr ' ' '\n' | sort -n | tail -2 | tr '\n' ' ')
-for r in $big; do for tu in 338 594; do run "r$r-tune$tu" "$r" BENCH_CORES=0 BENCH_NOCHECK=1 STRIX_INTPREFILL_MOE_TUNE=$tu; done; done
-echo "== vendor FP16 strided-batched, 512 experts (D FP16)" >> "$S"
+[ "${ATTRIB:-1}" = 1 ] && for r in $big; do for tu in 338 594; do run "r$r-tune$tu" "$r" BENCH_CORES=0 BENCH_NOCHECK=1 STRIX_INTPREFILL_MOE_TUNE=$tu; done; done
+# Vendor arms: HB_ARMS (default 3 = D FP32 then D FP16), data class HB_RAND (default 2 = full-mantissa, the class of the
+# bench's random K-quant blocks; 0 = the old constant bytes, which raise the vendor's sustained clock).
+echo "== vendor FP16 strided-batched, 512 experts, arms ${HB_ARMS:-3}, data class ${HB_RAND:-2}, sclk $(clock)" >> "$S"
 for r in $ROWS; do
-  HB_ARMS=2 HB_BATCH=512 timeout 20 "$Y" "$r" 2560:1280 640:2560 2>&1 | grep '^hb' | sed -E 's/ algos.*//' >> "$S"
+  HB_RAND=${HB_RAND:-2} HB_ARMS=${HB_ARMS:-3} HB_BATCH=512 timeout 20 "$Y" "$r" 2560:1280 640:2560 2>&1 | grep '^hb' | sed -E 's/ algos.*//' >> "$S"
 done
 touch "$OUT/buckets.done"
