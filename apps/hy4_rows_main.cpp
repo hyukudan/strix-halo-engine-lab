@@ -7,7 +7,7 @@
 //   --mtp (with --prompt-rows): the pack's next-token block is loaded and drafts as the shared MtpChain (chain + hybrid
 //     arms of the Arbiter, the copy source kept unless --mtp-copy 0); --chain-ms STEP,FLUSH seeds its walls, --survival
 //     c1,c2,... its stated confidence (default: the host oracle's prose conditionals). MTP line: block calls / rows / wall.
-//   --mtp-head full|q8|q4: the drafts' head (default full = the BF16 head; q8 / q4 = the shared MTP draft head over a Q8_0 /
+//   --mtp-head full|q8|q4: the drafts' head (default q4; full = the BF16 head; q8 / q4 = the shared MTP draft head over a Q8_0 /
 //     Q4_0 copy of output.weight). The taps run prints MTPHEAD: the three forms on the same block rows (agreement, ms).
 //   --mtp-taps DIR (with --mtp, first content): prompt + --taps-gen N greedy ids through verify rows of 1 (bitwise the
 //     step), the target hidden (output_norm) of every fed position written as a taps run of strix-hy4-dfly mtp; then the
