@@ -75,7 +75,8 @@ void check_gemm(const char* name, std::uint32_t out, std::uint32_t in, std::uint
     const auto xt = down(dxt, ha.tile.size());
     const auto rs = down(drs, ha.rows_pad);
     const bool qsame = xt == ha.tile && std::memcmp(rs.data(), ha.rs.data(), rs.size() * 4) == 0;
-    T::GemmArgs g;
+    T::GemmArgs g;  // reference arm: Feed::lsu (the default is bulk; bulk_bitwise re-runs it with bulk)
+    g.feed = T::Feed::lsu;
     g.w = dw;
     g.x = dxt;
     g.rs = drs;
@@ -140,7 +141,8 @@ void check_glu(std::uint32_t ch, std::uint32_t in, std::uint32_t rows, std::uint
     CU(T::repack_enqueue(dg, ch, in, tg, nullptr));
     CU(T::repack_enqueue(du, ch, in, tu, nullptr));
     CU(T::quantize_enqueue(dx, rows, in, dxt, drs, nullptr));
-    T::GemmArgs g;
+    T::GemmArgs g;  // reference arm: Feed::lsu
+    g.feed = T::Feed::lsu;
     g.w = tg;
     g.w2 = tu;
     g.x = dxt;
@@ -344,7 +346,8 @@ void bench(const char* name, std::uint32_t out, std::uint32_t in, std::uint32_t 
     if (glu) CU(cudaMemset(w2, 0x35, T::w_tile_bytes(out, in)));
     CU(cudaMemset(x, 0x3c, static_cast<std::size_t>(rows) * in * 4));
     CU(T::quantize_enqueue(x, rows, in, xt, rs, nullptr));
-    T::GemmArgs g;
+    T::GemmArgs g;  // lsu arm (explicit: the default feed is bulk)
+    g.feed = T::Feed::lsu;
     g.w = w;
     g.w2 = glu ? w2 : nullptr;
     g.x = xt;

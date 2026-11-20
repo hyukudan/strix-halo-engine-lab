@@ -115,6 +115,7 @@ Las tablas listan los flags seleccionados. La lista completa de variables de ent
 | Flag | Motor | Por defecto | Qué hace | Cuándo lo quiere otro hardware |
 |---|---|---|---|---|
 | `--block-schedule default\|tail-large` | qwen-rtx | `tail-large` | Orden de bloques en los kernels grandes. | `default` en GPUs con otro número de CUs. |
+| `--prefill-tile-feed bulk\|lsu` | qwen-rtx (CLI de decode del denso 27B, prefill FAST4) | `bulk` | Alimentación de etapas de las GEMM tile FAST4: `bulk` = un warpgroup productor con copias bulk, `lsu` = copias por hilo + una barrera de CTA por etapa. Mismos bits. [Detalles](optimizations.md#qwen-dense-cuda-fast4-tile-bulk-feed) | `lsu` es la vuelta atrás. |
 | `--prefill auto` | glm | `auto` | Elige la ruta de prefill. | - |
 | `--prefill-chunk N` | glm | 512 | Tamaño de chunk de prefill en filas. | Mayor con más cómputo; menor con menos memoria. |
 | `--prefill-path device` | deepseek serve | `device` | Prefill en la GPU. | - |

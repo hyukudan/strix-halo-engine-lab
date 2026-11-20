@@ -11,6 +11,7 @@
 // is split ONCE per layer input into bf16 planes (hi, mid, lo; `terms` 3 = exact, 2/1 = FAST mma2/mma1) or one f16 plane
 // (nvfp4), shared by every GEMM that reads the same x. Weights other than bf16 are expanded per call into a bf16/f16 scratch
 // (q8_0: int8 values exact in bf16 + FP32 scales; nvfp4: e2m1*e4m3 exact in f16), or once into a resident operand cache (below).
+#include "strix/cuda/core/nvfp4_tile.hpp"
 #include "strix/cuda_core/operand_cache_plan.hpp"
 #include "strix/cuda_core/types.hpp"
 
@@ -102,5 +103,8 @@ cudaError_t dense_big_cache_reserve(BigOperandCache* cache, const DenseWeight* w
                                     operand_cache::Mode mode, std::uint64_t cap_bytes, BigCacheReport* report);
 // Every dense_big_gemm on ctx consults `cache` (nullptr detaches). Several contexts (streams) may share one cache.
 void dense_big_ctx_attach_cache(BigCtx* ctx, BigOperandCache* cache);
+// Stage feed of the FAST4 tile GEMMs (dense_big_gemm with a.f4, dense_big_glu4) on ctx. Scheduling only: both feeds produce the
+// same bits. A new context (and the module default context) uses nvfp4::tile::kDefaultFeed (bulk); Feed::lsu is the rollback.
+void dense_big_ctx_set_tile_feed(BigCtx* ctx, ::strix::cuda::core::nvfp4::tile::Feed feed);
 
 }  // namespace strix::cuda_core

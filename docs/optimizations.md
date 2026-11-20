@@ -5155,6 +5155,24 @@ host wait for the ids. The host no longer stands between the last draft kernel a
 - **Measured gain:** Not yet measured.
 - **Implementation / evidence:** [contract](../include/strix/spec/block_drafter.hpp), [MTP chain](../include/strix/spec/mtp_chain.hpp), [CUDA binding](../src/qwen35/cuda/engine.cu)
 
+<a id="qwen-dense-cuda-fast4-tile-bulk-feed"></a>
+### Qwen dense 27B CUDA FAST4 tile GEMM: bulk stage feed
+
+**Engine:** `qwen-rtx` (dense 27B, FAST4 prefill). **Control:** `--prefill-tile-feed bulk|lsu` on `strix-cuda-qwen35-decode`. **Default:** `bulk`.
+
+The FAST4 tile GEMM (W4A4, `nvfp4-tile-mma-f32-v1`) was bound by its stage feed, not by the tensor pipe: every one of the
+eight MMA warps issued its share of the 1,728 16-byte copies of a 27,648-byte stage and the whole CTA met at a barrier once
+per stage. The `bulk` feed of the shared tile family gives the copies to a producer warpgroup (one 1-D bulk copy per
+contiguous record, 40 per stage, into a full / empty mbarrier ring); the MMA warps issue no copy instruction and wait per
+warp for their stage. The stage holds the same bytes at the same offsets and every accumulator sees the same MMA order.
+
+- **Preconditions:** `--prefill-arith fast4` (sm_120, NVFP4 weights): every FAST4 tile GEMM of the large prefill (gate/up GLU, down, q/k/v, o, the residual forms). Other prefill classes do not use the tile family; the effective config prints `prefill-tile-feed: n/a (FAST4 only)`.
+- **Automatic selection:** on for every FAST4 tile GEMM; the effective config prints `prefill-tile-feed: bulk`.
+- **Exactness evidence:** Scheduling only, no identity suffix: device fixture `nvfp4_tile_device` bulk output equal to lsu bit for bit in 9 checks (store, residual, silu_mul and GLU forms, partial weight and activation tiles); host oracle `nvfp4_tile_host` checks that the bulk records write exactly the bytes of the lsu chunks; host tests pin the default and that the option never changes the engine identity.
+- **Off switch:** `--prefill-tile-feed lsu`.
+- **Measured gain:** Operator bench, RTX PRO 6000, 4,096 rows, no model, strict ABAB in one process: bulk / lsu = 0.934 gate/up GLU, 0.921 down, 0.929 down (residual), 0.850 o, 0.858 o (residual), 0.846 k/v, 0.977 q/k/v. The lsu form is main's machine code (same time as main within noise on 7 shapes). End-to-end prefill: not yet measured.
+- **Implementation / evidence:** [tile contract](../include/strix/cuda/core/nvfp4_tile.hpp), [sm_120 kernel](../src/cuda/core/arch/sm120/nvfp4_tile.cuh), [dense_big binding](../src/cuda_core/dense/dense_big.cu), [fixture](../tests/nvfp4_tile/tile_device.cu)
+
 ## Platform (kernel)
 
 <a id="platform-perfopt"></a>

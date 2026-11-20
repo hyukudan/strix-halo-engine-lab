@@ -198,6 +198,23 @@ enum class Epi : std::uint32_t {
 //   bulk: one producer warp copies each record with one 1-D bulk copy into a full / empty mbarrier ring; the eight MMA warps
 //         wait for and release each stage per warp.
 enum class Feed : std::uint32_t { lsu, bulk };
+// Default feed of every FAST4 tile GEMM: bulk. Measured on sm_120 at 4,096 rows (no model, same binary, ABAB): bulk == lsu
+// bitwise in every fixture check and bulk/lsu = 0.93 glu, 0.92 down, 0.93 down_r, 0.85-0.86 o / o_r, 0.85 kv, 0.98 qkv.
+// lsu stays the governed rollback (engine option --prefill-tile-feed lsu); the choice never enters an identity.
+inline constexpr Feed kDefaultFeed = Feed::bulk;
+inline constexpr const char* feed_name(Feed f) { return f == Feed::bulk ? "bulk" : f == Feed::lsu ? "lsu" : "?"; }
+// Strict spelling "bulk" | "lsu"; anything else returns false and leaves *out unchanged.
+inline bool parse_feed(const char* s, Feed* out) {
+    if (s == nullptr || out == nullptr) return false;
+    const auto eq = [](const char* a, const char* b) {
+        while (*a != '\0' && *a == *b) ++a, ++b;
+        return *a == *b;
+    };
+    if (eq(s, "bulk")) *out = Feed::bulk;
+    else if (eq(s, "lsu")) *out = Feed::lsu;
+    else return false;
+    return true;
+}
 struct GemmArgs {
     const std::uint8_t* w = nullptr;   // W tile layout, out rows (glu: gate, channels rows)
     const std::uint8_t* w2 = nullptr;  // glu: up, same shape
@@ -208,7 +225,7 @@ struct GemmArgs {
     float gs = 1.f, gs2 = 1.f;         // FP32 tensor scales of w, w2
     std::uint32_t out = 0, in = 0, rows = 0, rows_pad = 0;
     Epi epi = Epi::store;
-    Feed feed = Feed::lsu;
+    Feed feed = kDefaultFeed;
 };
 STRIX_NVFP4_TILE_HD bool bytes_disjoint(const void* p, std::size_t pb, const void* q, std::size_t qb) {
     const std::uintptr_t a = reinterpret_cast<std::uintptr_t>(p), b = reinterpret_cast<std::uintptr_t>(q);

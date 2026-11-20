@@ -347,6 +347,23 @@ void test_stage_chunks(std::uint32_t out, std::uint32_t in, std::uint32_t rows, 
         }
 }
 
+// Feed default + spelling: every GemmArgs runs the bulk feed unless a caller asks for lsu (the rollback); strict parse (the feed
+// is scheduling only, so valid() admits both and nothing else).
+void test_feed_default() {
+    static_assert(T::kDefaultFeed == T::Feed::bulk, "the FAST4 tile default feed is bulk (measured); lsu is the rollback");
+    const T::GemmArgs fresh{};
+    CHECK(fresh.feed == T::kDefaultFeed);
+    T::Feed f = T::Feed::lsu;
+    CHECK(T::parse_feed("bulk", &f) && f == T::Feed::bulk);
+    CHECK(T::parse_feed("lsu", &f) && f == T::Feed::lsu);
+    for (const char* bad : {"", "Bulk", "bulk ", "lsux", "tma", "on", "1"}) {
+        f = T::Feed::lsu;
+        CHECK(!T::parse_feed(bad, &f) && f == T::Feed::lsu);
+    }
+    CHECK(!T::parse_feed(nullptr, &f));
+    CHECK(std::strcmp(T::feed_name(T::Feed::bulk), "bulk") == 0 && std::strcmp(T::feed_name(T::Feed::lsu), "lsu") == 0);
+}
+
 // Feed::bulk invariant: copying the kStageRecs records of a stage (stage_record: one bulk copy of `bytes` from base + ks * bytes)
 // writes, for every stage ks, exactly the (source byte -> shared byte) pairs the lsu feed's chunks write (stage_chunk), each shared
 // byte once; !ok records are exactly the zero-filled chunks; stage_bytes is the sum of the copied records (the mbarrier
@@ -429,6 +446,7 @@ int main() {
     test_stage_chunks(48, 256, 40, false);    // partial weight tile (wtiles 3 < 8 slots), padded rows
     test_stage_chunks(256, 384, 300, false);  // two weight tiles x two activation tiles
     test_stage_chunks(80, 128, 20, true);     // GLU, partial 64-channel tile (w2 slots)
+    test_feed_default();
     test_stage_records(48, 256, 40, false);    // bulk feed: partial weight tile (!ok records), padded rows
     test_stage_records(256, 384, 300, false);  // bulk feed: two weight tiles x two activation tiles, KS 3
     test_stage_records(80, 128, 20, true);     // bulk feed: GLU, partial 64-channel tile, KS 1

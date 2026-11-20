@@ -19,6 +19,7 @@ namespace strix::cuda_core {
 DenseArith process_policy = DenseArith::mma3, head_policy = DenseArith::mma3;
 DenseArith dense_arith() { return process_policy; }
 std::uint32_t nvfp4_split_k(std::uint32_t, std::uint32_t) { return 1; }
+namespace ftile = ::strix::cuda::core::nvfp4::tile;  // as in dense_big.cu (BigCtx::feed)
 #include "audit_big.inc"
 cudaError_t dense_big_reserve(std::uint32_t, std::uint32_t, std::uint64_t, int, BigCtx* ctx) {
     CK(bind_device(*ctx));
@@ -37,6 +38,7 @@ struct GdnChunkWork { float* ws = nullptr; std::size_t floats = 0; };
 template <class Dims> std::size_t gdn_chunk_workspace_floats(const Dims&, std::uint32_t rows) { return rows; }
 void dense_big_cache_destroy(BigOperandCache*) {}
 void dense_big_ctx_attach_cache(BigCtx*, BigOperandCache*) {}
+void dense_big_ctx_set_tile_feed(BigCtx* ctx, ftile::Feed feed) { if (ctx) ctx->feed = feed; }
 bool dense_big_fast4_supported() { return false; }  // FAST4 is not audited here (generic-build answer); fast8 is, extracted
 }
 struct Engine {
@@ -225,6 +227,16 @@ int main() {
         if (completed) break;
     }
     fail_after = -1; check(completed, "686-7 all allocation failures exercised");
+    for (bool rollback : {false, true}) {  // FAST4 tile feed reaches every slot context: default bulk, lsu the rollback
+        Engine owned;
+        check(owned.opt.prefill_tile_feed == cc::ftile::Feed::bulk, "pr797 engine default feed = bulk");
+        if (rollback) owned.opt.prefill_tile_feed = cc::ftile::Feed::lsu;
+        const auto want = rollback ? cc::ftile::Feed::lsu : cc::ftile::Feed::bulk;
+        owned.pf_init(1);
+        bool all = !owned.pf.sl.empty();
+        for (const auto& s : owned.pf.sl) all = all && s->bc != nullptr && s->bc->feed == want;
+        check(all, "pr797 prefill_tile_feed applied to each slot's dense_big context");
+    }
     { Engine owned; owned.pf_init(1); lifetime.clear();
       { Engine::Events pool{owned.pf, nullptr, nullptr, {}};
         pool.start = std::malloc(1); events.insert(pool.start);
