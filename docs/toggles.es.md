@@ -271,7 +271,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_GLM_PF_AUX_COMBINE` | glm | 1 | [glm-pf-aux-combine](optimizations.md#glm-pf-aux-combine) |
 | `STRIX_GLM_PF_DENSE_FORM` | glm | automático (0) | [glm-pf-dense-rows-v4](optimizations.md#glm-pf-dense-rows-v4) |
 | `STRIX_GLM_PF_DENSE_ROWS` | glm | 4 | [glm-pf-dense-rows-v4](optimizations.md#glm-pf-dense-rows-v4) |
-| `STRIX_GLM_PF_HC_EXPAND_ROWS` | glm | 2 | [glm-pf-hc-expand-rows](optimizations.md#glm-pf-hc-expand-rows) |
+| `STRIX_GLM_PF_HC_EXPAND_BW` | glm | 1 | [glm-pf-hc-expand-bw](optimizations.md#glm-pf-hc-expand-bw) |
 | `STRIX_GLM_PF_HC_FUSE` | glm | 1 | [glm-pf-hc-fuse](optimizations.md#glm-pf-hc-fuse) |
 | `STRIX_GLM_PF_HC_HOIST` | glm | 1, 1 | [glm-pf-sumexp](optimizations.md#glm-pf-sumexp) |
 | `STRIX_GLM_PF_IDX` | glm | 3 / 2 | [glm-pf-indexer-v2](optimizations.md#glm-pf-indexer-v2) |

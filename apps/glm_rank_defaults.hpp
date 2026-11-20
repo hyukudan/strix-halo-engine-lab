@@ -132,8 +132,8 @@ inline const std::vector<EnvItem>& env_items() {
          "Measurement: TP2 partial sum formed on load by the fused mHC expand (rank order, the sum2 expression; summed rows not stored), logits bitwise on the pair; seam sum + fused expand 4.26 -> 3.91 ms per call, 8,192-token TTFT 14.55 -> 14.17 s with dense rows v3 and the output-bar v10 (=0 restores sum2 + expand)", false, true},
         {"pf-hc-hoist", "STRIX_GLM_PF_HC_HOIST", "1", "0",
          "Measurement: the fused mHC expand issues its loads (y, or y0 + y1 with the partial sum on load) ahead of its 16 dependent steps, bitwise on the device stress set (47 checks, 0 failures) (=0 keeps the loads inside each step)", false, true},
-        {"pf-hc-expand-rows", "STRIX_GLM_PF_HC_EXPAND_ROWS", "2", "1",
-         "Measurement: fused mHC expand + norm runs two rows per block (also on the TP2 pair-sum path), same per-row operation order, logits bitwise on the pair; 8K TTFT 13.671 -> 13.611 s (-0.44 %) (=1 restores one row per block)", true, true},
+        {"pf-hc-expand-bw", "STRIX_GLM_PF_HC_EXPAND_BW", "1", "0",
+         "Measurement: fused mHC expand + norm on the shared row expansion (src/core/hc_expand_rows.hpp; mix in registers, X / y loaded once, streaming stores), same bits (device fixture vs the original one-row kernel; pair logits / state / tokens fnv equal); replaces the two-row kernel (removed). Pair 8K exact, ABAB, two runs per arm: prefill cold / warm 13.84 / 14.56 s (two-row) vs 13.81 / 14.50 s, no change beyond the spread; the traced 10.8 -> 2.2 ms per call was the GPU share each kernel got beside the other prefill stream, isolated the shared kernel costs the same as the one-row kernel (=0 restores the one-row kernel)", false, true},
     };
     return items;
 }

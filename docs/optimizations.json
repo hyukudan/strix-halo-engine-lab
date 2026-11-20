@@ -2767,14 +2767,14 @@
   },
   {
     "engine": "glm",
-    "name": "Prefill mHC expand + norm, two rows per block",
-    "flag_or_env": "STRIX_GLM_PF_HC_EXPAND_ROWS",
-    "default": "2",
-    "exact": "Host and device gates bitwise against the one-row kernel (including the TP2 pair-sum path); pair logits bitwise equal the anchors on both ranks at 8K.",
-    "gain": "Two-node pair, alternating arms, 8,192 tokens: TTFT 13.671 -> 13.611 s (-0.44 %), measured with the other exact prefill levers of that build enabled",
+    "name": "Prefill mHC expand + norm on the shared row expansion",
+    "flag_or_env": "STRIX_GLM_PF_HC_EXPAND_BW",
+    "default": "1",
+    "exact": "Device fixture bitwise against the original one-row kernel (payload, guards and flag by memcmp, special values, pair-sum path); pair logits, state and token digests equal at 8K.",
+    "gain": "None in wall time (two-node pair 8,192 tokens, ABAB, cold / warm: 13.84 / 14.56 s two-row kernel vs 13.81 / 14.50 s); removes a model-private kernel family. Traced per-call time 10.8 -> 2.2 ms was the GPU share beside the other prefill stream; isolated, the shared kernel costs the same as the one-row kernel.",
     "preconditions": "Exact chunked prefill with the fused expand + norm (STRIX_GLM_PF_HC_FUSE=1, the default).",
-    "off_switch": "STRIX_GLM_PF_HC_EXPAND_ROWS=1, or --baseline",
-    "doc_anchor": "docs/optimizations.md#glm-pf-hc-expand-rows"
+    "off_switch": "STRIX_GLM_PF_HC_EXPAND_BW=0, or --baseline",
+    "doc_anchor": "docs/optimizations.md#glm-pf-hc-expand-bw"
   },
   {
     "engine": "glm",

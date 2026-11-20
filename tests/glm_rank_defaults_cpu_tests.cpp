@@ -163,6 +163,10 @@ void test_apply_env_default() {
     CHECK(resolve({"--baseline"}, {}).env.at("STRIX_GLM_PF_MLA_GEMM").value == "2");
     for (const char* v : {"1", "2", "3"})
         CHECK(resolve({}, {{"STRIX_GLM_PF_MLA_GEMM", v}}).env.at("STRIX_GLM_PF_MLA_GEMM").source == "explicit");
+    CHECK(resolve({}, {}).env.at("STRIX_GLM_PF_HC_EXPAND_BW").value == "1");
+    CHECK(resolve({"--baseline"}, {}).env.at("STRIX_GLM_PF_HC_EXPAND_BW").value == "0");
+    for (const char* v : {"0", "1"})
+        CHECK(resolve({}, {{"STRIX_GLM_PF_HC_EXPAND_BW", v}}).env.at("STRIX_GLM_PF_HC_EXPAND_BW").source == "explicit");
     CHECK(resolve({}, {}).env.at("STRIX_GLM_PF_SUMEXP").value == "1");
     CHECK(resolve({"--baseline"}, {}).env.at("STRIX_GLM_PF_SUMEXP").value == "0");
     for (const char* v : {"0", "1"})
@@ -193,8 +197,8 @@ void test_apply_env_default() {
     CHECK(set == merge(kHp, {{"HSA_DISABLE_FRAGMENT_ALLOCATOR", "1"}, {"STRIX_GLM_PF_PIPELINE", "2"},
                               {"STRIX_DIST_ASYNC_START", "1"}, {"STRIX_GLM_SPEC_KDA_TREE", "2"},
                               {"STRIX_GLM_PF_EXACT_X", "auto"}, {"STRIX_GLM_PF_EXACTMOE_V", "auto"},
-                              {"STRIX_GLM_HC_NORM", "1"}, {"STRIX_GLM_PF_HC_EXPAND_ROWS", "2"}}));
-    // = the receipt's optimization env + the prefill overlap + the two-barrier KDA verify tree + the fused HC norm + two-row mHC expand
+                              {"STRIX_GLM_HC_NORM", "1"}}));
+    // = the receipt's optimization env + the prefill overlap + the two-barrier KDA verify tree + the fused HC norm
     // an explicit value is never overwritten
     const auto expl = resolve(cat(kDeploy, kDecodeWork), {{"STRIX_DIST_CRC_PARALLEL", "0"}});
     Env set2;

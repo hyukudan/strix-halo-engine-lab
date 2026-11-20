@@ -123,7 +123,6 @@ model-kernel src/glm/engine/glm_r1b.hip 10
 model-kernel src/glm/kernels/glm_dsa.hip 6
 model-kernel src/glm/kernels/glm_tier_a.hip 9
 model-kernel src/glm/moe/glm_moe.hip 7
-model-kernel src/glm/prefill/glm_hc_expand_cta.inc 1
 model-kernel src/glm/prefill/glm_pf_exact.hip 5
 model-kernel src/glm/prefill/glm_pf_exact_moe.hip 8
 model-kernel src/glm/prefill/glm_pf_kda_wmma.hpp 2
@@ -331,7 +330,7 @@ raw-getenv src/glm/prefill/glm_pf_path.hip 7
 raw-getenv src/glm/prefill/glm_pf_variants.hpp 1
 raw-getenv src/glm/prefill/glm_pf_wmma.hpp 2
 raw-getenv src/glm/prefill/glm_pf_wmma_x.hpp 4
-raw-getenv src/glm/prefill/glm_prefill.hip 7
+raw-getenv src/glm/prefill/glm_prefill.hip 6
 raw-getenv src/glm/spec/glm_spec_dev.hip 1
 raw-getenv src/glm/xfer/glm_xfer_exchange.hip 1
 raw-getenv src/h3/block/parallel.hpp 1
