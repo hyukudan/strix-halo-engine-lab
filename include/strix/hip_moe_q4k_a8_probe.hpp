@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/moe/expert_union.hpp"
 #include "strix/moe_q4k_a8_contract.hpp"
 #include <hip/hip_runtime.h>
 namespace strix::moe_q4k_a8 {
@@ -9,6 +10,10 @@ inline constexpr unsigned invalid_route = 1U, nonfinite_activation = 2U, invalid
 // After an enqueue exception, every writable view is indeterminate even if status is0.
 // Read-only data stays immutable; mutable views/status have exclusive stream ownership.
 void enqueue_probe(const Request&, const Bindings&, hipStream_t stream = nullptr);
+// Union rows form (strix/moe/expert_union.hpp, validate_union): shape.logical_rows = R <= 8 rows of a verify window; the
+// plan is written here (it also validates every row's routes) and read by enqueue_down_*_union. Each distinct expert's
+// gate / up rows are read once for all rows that chose it; outputs are bitwise those of R enqueue_probe calls.
+void enqueue_probe_union(const Request&, const Bindings&, DeviceBytes plan, hipStream_t stream);
 // One serial row in two launches: one CTA clears clear_words floats of the caller's accumulation, validates the routes
 // and route weights and quantizes (the same status, codes, deltas and sums as clearing the accumulation and status,
 // validate_routes_kernel and enqueue_probe's validation and quantizer), then enqueue_probe's projection.
