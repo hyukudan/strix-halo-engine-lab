@@ -27,6 +27,7 @@ using Clock = std::chrono::steady_clock;
 double seconds(Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double>(b - a).count(); }
 
 constexpr std::size_t kTxFlag = 0, kRxFlag = 8, kHeadFlag = 16;  // u64 index: separate 64-byte lines
+constexpr std::size_t kAbortWord = 24;  // u64 index: sticky device wait abort (RxView::abort), 0 = none
 constexpr std::size_t kHeadCounter = 8;  // unsigned index in counter_dev_ (64 bytes): the head producer's own counter
 
 __global__ void publish_kernel(std::uint64_t* flag, std::uint64_t sequence) {
@@ -239,6 +240,12 @@ void Channel<Traits>::init() {
     std::memset(tx_host_, 0, total);
     std::memset(rx_host_, 0, total);
     std::memset(flags_host_, 0, 4096);
+    {  // device wait backstop: twice the host timeout in wall-clock ticks (the host path, which releases the flag with ~0
+       // on a failure or its own timeout, always acts first)
+        int dev = 0, khz = 0;
+        if (hipGetDevice(&dev) == hipSuccess && hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, dev) == hipSuccess && khz > 0)
+            wait_budget_ = wait_budget_ticks(options_.timeout, static_cast<std::uint64_t>(khz));
+    }
     hip_check(hipMalloc(reinterpret_cast<void**>(&counter_dev_), 64), "counter");
     hip_check(hipMemset(counter_dev_, 0, 64), "counter");
     hip_check(hipMalloc(reinterpret_cast<void**>(&gate_dev_), 64), "gate");
@@ -445,7 +452,7 @@ RxView Channel<Traits>::recv_view() {
     received_ = s;
     last_local_ = tx_dev_ + (tx_slot(s) - tx_host_);
     last_folded_ = !folded_.empty() && folded_[(s - 1) % options_.depth] != 0 ? fx_dev_ + ((s - 1) % options_.depth) * fx_stride_ : nullptr;
-    return RxView{rx_dev_ + (rx_slot(s) - rx_host_), flags_dev_ + kRxFlag, s, gate_dev_};
+    return RxView{rx_dev_ + (rx_slot(s) - rx_host_), flags_dev_ + kRxFlag, s, gate_dev_, flags_dev_ + kAbortWord, wait_budget_};
 }
 
 template<class Traits>
@@ -467,6 +474,12 @@ void Channel<Traits>::drain() {
 
 template<class Traits>
 void Channel<Traits>::check() const {
+    if (flags_host_ != nullptr) {
+        const std::uint64_t aborted = __atomic_load_n(&flags_host_[kAbortWord], __ATOMIC_ACQUIRE);
+        if (aborted != 0)
+            throw std::runtime_error("glmxfer: device wait for message " + std::to_string(aborted) + " ran out of its budget (" +
+                                     std::to_string(2 * options_.timeout.count()) + " ms): the RX flag was never released");
+    }
     if (!failed_.load(std::memory_order_acquire)) return;
     std::lock_guard<std::mutex> g(failure_mutex_);
     throw std::runtime_error("glmxfer: exchange failed: " + failure_);
