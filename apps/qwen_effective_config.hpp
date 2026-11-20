@@ -2208,11 +2208,10 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
         << (config.environment.contains("STRIX_BITCALC_LOGITS_OUT") ? "true" : "false")
         << ",\"forced_tokens\":"
         << (config.environment.contains("STRIX_BITCALC_FORCE_TOKENS") ? "true" : "false") << "},";
-    // AUTO/capped HTTP batch owns no pool; a one-slot fallback re-admits it at startup (stderr qsa-mtp-pool line).
-    if(const bool pooled=qsa_mtp_pool_route(o,config.gsq_owner); pooled || qsa_mtp_pool_single_fallback_pending(o,config.gsq_owner)) {
+    // HTTP batch slots own one pool each (charged per slot); startup admission still decides (stderr qsa-mtp-pool line).
+    if(qsa_mtp_pool_route(o,config.gsq_owner)) {
         const auto plan=mtp_qsa_pool_plan(o.context_tokens);
-        out << "\"qsa_mtp_pool\":{\"requested\":true,\"effective\":\""
-            << (pooled?"runtime-admission-required":"single-fallback-only") << "\",\"route\":\""
+        out << "\"qsa_mtp_pool\":{\"requested\":true,\"effective\":\"runtime-admission-required\",\"route\":\""
             << (!o.http_serve?"cli":o.http_batch?"http-batch":"http-single") << "\",\"source\":\""
             << (o.qsa_mtp_pool_explicit_opt_in?"STRIX_QSA_MTP_POOL=1":"default")
             << "\",\"format\":\"bf16\",\"entries\":13,\"key_bytes\":"
