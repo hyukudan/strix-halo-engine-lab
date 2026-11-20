@@ -347,10 +347,10 @@ void test_stage_chunks(std::uint32_t out, std::uint32_t in, std::uint32_t rows, 
         }
 }
 
-// Feed default + spelling: every GemmArgs runs the bulk feed unless a caller asks for lsu (the rollback); strict parse (the feed
+// Feed default + spelling: every GemmArgs runs the incumbent lsu feed unless a caller opts into bulk; strict parse (the feed
 // is scheduling only, so valid() admits both and nothing else).
 void test_feed_default() {
-    static_assert(T::kDefaultFeed == T::Feed::bulk, "the FAST4 tile default feed is bulk (measured); lsu is the rollback");
+    static_assert(T::kDefaultFeed == T::Feed::lsu, "the FAST4 tile default must preserve the incumbent lsu feed");
     const T::GemmArgs fresh{};
     CHECK(fresh.feed == T::kDefaultFeed);
     T::Feed f = T::Feed::lsu;
