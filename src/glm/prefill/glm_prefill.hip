@@ -350,7 +350,7 @@ static_assert(kScan5TB * 32U == kScanLanes * kScanV, "scan v6 prepares one batch
 __device__ __forceinline__ float norm_tree128(const float* e) {  // e[m] = element l + 32 m of lane l
     float t = (e[0] + e[2]) + (e[1] + e[3]);                         // level 64: (l, l + 64), (l + 32, l + 96); level 32
 #pragma unroll
-    for (unsigned hh = 16; hh > 0; hh >>= 1U) t = t + __shfl_xor(t, hh, 32);
+    for (int hh = 16; hh > 0; hh >>= 1) t = t + __shfl_xor(t, hh, 32);
     return t;
 }
 constexpr unsigned kScan6Ch = 10;                       // per lane: q 4, k 4, own v 2
