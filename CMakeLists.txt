@@ -1286,6 +1286,13 @@ if(BUILD_TESTING)
     add_executable(strix-spec-tree-window-tests tests/spec_tree_window_tests.cpp)
     target_link_libraries(strix-spec-tree-window-tests PRIVATE strix_spec)
     strix_target_warnings(strix-spec-tree-window-tests)
+    # Host graph oracle: FMA contraction can differ between the serial call and the tree loop on x86,
+    # changing one rounded bit before greedy_of hashes it. The production GPU path is tested separately.
+    if(MSVC)
+        target_compile_options(strix-spec-tree-window-tests PRIVATE /fp:strict)
+    else()
+        target_compile_options(strix-spec-tree-window-tests PRIVATE -ffp-contract=off -fno-fast-math)
+    endif()
     add_test(NAME strix-spec-tree-window-tests COMMAND strix-spec-tree-window-tests)
     add_executable(strix-spec-draft-rows-tests tests/spec_draft_rows_tests.cpp)
     target_link_libraries(strix-spec-draft-rows-tests PRIVATE strix_spec)
