@@ -92,15 +92,61 @@ __device__ __forceinline__ void ring_advance(typename Decode::Raw (&ring)[D][2],
     ring[D - 1U][0] = Load::get(row0, next, lane);
     ring[D - 1U][1] = Load::get(row1, next, lane);
 }
+// Activation stage storage: static shared memory for the tile forms; the wide form's stages (twice the rows: 72 KB project,
+// 80 KB down, over the 48 KB static limit) live in the launch's dynamic shared memory, slot i at byte i * sizeof(A)
+// (native_mma_stage_bytes on the host).
+template <class A, bool Dynamic, unsigned Slot = 0U>
+__device__ __forceinline__ A& stage_buffer() {
+    if constexpr (Dynamic) {
+        extern __shared__ uint4 moe_a8_mma_stage[];
+        return *reinterpret_cast<A*>(reinterpret_cast<unsigned char*>(moe_a8_mma_stage) + Slot * sizeof(A));
+    } else {
+        __shared__ alignas(16) A buffer;
+        return buffer;
+    }
+}
+template <unsigned MB> using ProjectStage = std::uint16_t[2][16U * MB][kMmaProjectPitch];
+template <unsigned MB> using DownStage = std::uint16_t[2][16U * MB][kMmaDownPitch];
+// Dynamic shared memory bytes of a launch of the project / down kernel of MB (0 for the tile forms).
+__host__ __device__ constexpr unsigned native_mma_stage_bytes(unsigned mb, bool project) {
+    return native_mma::wide(mb) ? (project ? 2U * 16U * mb * kMmaProjectPitch * 2U : 2U * (2U * 16U * mb * kMmaDownPitch * 2U)) : 0U;
+}
+// The same ring over R weight rows per lane: R = 2 (tile and decode forms: gate + up, or two n8 blocks) is the two-row
+// ring above; R = 1 is the wide form's single row (native_mma::wide), the same loads and slot order for that row.
+template <class Decode, unsigned D, unsigned R>
+__device__ __forceinline__ void ring_start(typename Decode::Raw (&ring)[D][R], const std::uint8_t* const (&rows)[R], unsigned groups,
+                                           unsigned lane) {
+    if constexpr (R == 2U) ring_fill<Decode>(ring, rows[0], rows[1], groups, lane);
+    else {
+        static_assert(R == 1U, "one or two weight rows per lane");
+#pragma unroll
+        for (unsigned i = 0; i < D; ++i) ring[i][0] = mma_raw<Decode>(rows[0], native_mma::ring_group(0U, i, groups), lane);
+    }
+}
+template <class Decode, unsigned D, unsigned R>
+__device__ __forceinline__ void ring_step(typename Decode::Raw (&ring)[D][R], const std::uint8_t* const (&rows)[R], unsigned group,
+                                          unsigned groups, unsigned lane) {
+    if constexpr (R == 2U) ring_advance<Decode>(ring, rows[0], rows[1], group, groups, lane);
+    else {
+#pragma unroll
+        for (unsigned i = 0; i + 1U < D; ++i) ring[i][0] = ring[i + 1U][0];
+        ring[D - 1U][0] = mma_raw<Decode>(rows[0], native_mma::ring_group(group, D, groups), lane);
+    }
+}
 
 // grid (tiles, ffn / 64), tile-major raster (native_mma::tile_major), 256 threads. Writes h = native_activation(gate, up) into intermediates[row][slot * 2 * ffn + o]
 // with the exact route's layout and fail-closed flags. Gate and up of one output are in the same lane (same C element).
 // MB m16 blocks per tile and a D-deep weight ring: (kTileMBlocks, kTileAhead) for any tile, (kDecodeMBlocks,
 // kDecodeAhead) when native_mma::decode_form(rows) holds for the launch; bitwise the same outputs (see native_mma.hpp).
+// MB = kWideMBlocks is the wide form (128-row CSR tiles, 512 threads): warp w multiplies matrix w / 8 only, and the up
+// warps hand their accumulators to the gate warps of the same columns through shared memory for the activation.
 template <unsigned T, class Binding, unsigned MB = native_mma::kTileMBlocks, unsigned D = native_mma::kTileAhead>
-__global__ __launch_bounds__(kMmaThreads, 2) void native_mma_project_kernel(const std::uint8_t* gate, const std::uint8_t* up,
-                                                                            typename Binding::Rows v) {
-    static_assert(MB >= 1U && MB <= native_mma::kTileMBlocks && D >= 1U, "tile capacity and ring depth");
+__global__ __launch_bounds__(native_mma::block_threads(MB), native_mma::min_blocks(MB))
+void native_mma_project_kernel(const std::uint8_t* gate, const std::uint8_t* up, typename Binding::Rows v) {
+    static_assert(MB >= 1U && (MB <= native_mma::kTileMBlocks || MB == native_mma::kWideMBlocks) && D >= 1U,
+                  "tile capacity and ring depth");
+    constexpr bool wide = native_mma::wide(MB);
+    constexpr unsigned threads = native_mma::block_threads(MB), mats = native_mma::warp_parts(MB), cap = native_mma::tile_capacity(MB);
     using Decode = weight::GsqDecode<T>;
     constexpr unsigned hidden = Binding::hidden, ffn = Binding::ffn, projection_nonfinite = Binding::projection_nonfinite;
     constexpr unsigned stages = hidden / kMmaProjectK, groups_per_stage = kMmaProjectK / 32U;
@@ -112,27 +158,37 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_project_kernel(cons
     if (csr.summary[0] || ts.tile >= *csr.tile_count) return;
     const unsigned tile_begin = csr.tile_begins[ts.tile], count = csr.tile_begins[ts.tile + 1U] - tile_begin;
     const unsigned expert = csr.tile_experts[ts.tile];
-    if constexpr (MB < native_mma::kTileMBlocks) if (count > 16U * MB) {  // decode form over a wider tile: fail closed
+    if constexpr (MB != native_mma::kTileMBlocks) if (count > 16U * MB) {  // a form over a wider tile: fail closed
         if (threadIdx.x == 0U) atomicOr(csr.summary, projection_nonfinite);
         return;
     }
-    __shared__ alignas(16) std::uint16_t X[2][16U * MB][kMmaProjectPitch];
-    __shared__ unsigned row_of[kNativeTileRows], slot_of[kNativeTileRows];
+    ProjectStage<MB>& X = stage_buffer<ProjectStage<MB>, wide>();
+    static_assert(!wide || sizeof(ProjectStage<MB>) == native_mma_stage_bytes(MB, true), "host and kernel stage bytes");
+    __shared__ unsigned row_of[cap], slot_of[cap];
     __shared__ std::uint32_t grid_words[Decode::grid_words ? Decode::grid_words : 1U];  // the type's codebook (<= 8 KB)
     const unsigned t = threadIdx.x, lane = t & 31U, warp = t >> 5, g = lane >> 2, q = lane & 3U;
-    const unsigned out_base = native_mma::project_output(ts.slice, warp, 0U);
-    if (t < kNativeTileRows) {
+    const unsigned column_block = native_mma::column_block(warp), mat0 = native_mma::first_part(MB, warp);  // tile forms: both matrices
+    const unsigned out_base = native_mma::project_output(ts.slice, column_block, 0U);
+    // Weight rows of this lane, issued before the first barrier (they depend on no shared memory).
+    const std::uint64_t wr = std::uint64_t(expert) * ffn + out_base + g;
+    const std::uint8_t* wrow[mats];
+    if constexpr (wide) wrow[0] = (mat0 ? up : gate) + wr * row_bytes;
+    else { wrow[0] = gate + wr * row_bytes; wrow[1] = up + wr * row_bytes; }
+    constexpr unsigned groups = stages * groups_per_stage;
+    typename Decode::Raw ahead[D][mats];
+    if constexpr (wide) ring_start<Decode>(ahead, wrow, groups, lane);
+    if (t < cap) {
         const unsigned a = t < count ? t : 0U;
         row_of[t] = csr.rows[tile_begin + a]; slot_of[t] = csr.slots[tile_begin + a];
     }
-    weight::gsq_grid_fill<T>(grid_words, t, kMmaThreads);
+    weight::gsq_grid_fill<T>(grid_words, t, threads);
     __syncthreads();
     const weight::GsqSmemGrid grid{grid_words};
     // Thread t copies word t % 64 of rows t / 64 + 4 i. Rows >= count are not written: an MMA row reaches only its own C
     // row, and those C rows are never stored.
     const auto load = [&](unsigned buf, unsigned s) {
         const unsigned w = t & 63U;
-        for (unsigned r = t >> 6; r < count; r += kMmaThreads / 64U) {
+        for (unsigned r = t >> 6; r < count; r += threads / 64U) {
             const std::uint16_t* src = at(v.input, row_of[r]) + s * kMmaProjectK + 2U * w;
             std::uint16_t* dst = &X[buf][r][2U * w];
             if ((reinterpret_cast<std::uintptr_t>(src) & 3U) == 0U) ptx::cp_async4(dst, src);
@@ -140,22 +196,19 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_project_kernel(cons
         }
         cp_commit();
     };
-    const std::uint64_t wr = std::uint64_t(expert) * ffn + out_base + g;
-    const std::uint8_t* wrow[2] = {gate + wr * row_bytes, up + wr * row_bytes};
     const unsigned mblocks = native_mma::m_blocks(count);  // block-uniform, <= MB
-    float acc[MB][2][4];
+    float acc[MB][mats][4];
 #pragma unroll
     for (unsigned m = 0; m < MB; ++m)
 #pragma unroll
-        for (unsigned mat = 0; mat < 2U; ++mat)
+        for (unsigned mat = 0; mat < mats; ++mat)
 #pragma unroll
             for (unsigned i = 0; i < 4U; ++i) acc[m][mat][i] = 0.0F;
     load(0U, 0U);
     // Weight fields of the next D groups are loaded before this group's decode and MMAs (and across the stage barrier):
     // the global round trips overlap D groups of work. The last groups re-load the last one (no read past the row).
-    constexpr unsigned groups = stages * groups_per_stage;
-    typename Decode::Raw ahead[D][2];
-    ring_fill<Decode>(ahead, wrow[0], wrow[1], groups, lane);
+    // (The wide form issued its ring before the first barrier: one block per SM, nothing else hides that latency.)
+    if constexpr (!wide) ring_start<Decode>(ahead, wrow, groups, lane);
 #pragma unroll 1
     for (unsigned s = 0; s < stages; ++s) {
         cp_wait_all();
@@ -165,12 +218,14 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_project_kernel(cons
 #pragma unroll
         for (unsigned j = 0; j < groups_per_stage; ++j) {
             const unsigned group = s * groups_per_stage + j;
-            const typename Decode::Raw raw[2] = {ahead[0][0], ahead[0][1]};
-            ring_advance<Decode>(ahead, wrow[0], wrow[1], group, groups, lane);
-            unsigned b[2][2][2];
-            float scale[2][2][2];
-            mma_weights<Decode>(raw[0], group, grid, lane, b[0], scale[0]);
-            mma_weights<Decode>(raw[1], group, grid, lane, b[1], scale[1]);
+            typename Decode::Raw raw[mats];
+#pragma unroll
+            for (unsigned mat = 0; mat < mats; ++mat) raw[mat] = ahead[0][mat];
+            ring_step<Decode>(ahead, wrow, group, groups, lane);
+            unsigned b[mats][2][2];
+            float scale[mats][2][2];
+#pragma unroll
+            for (unsigned mat = 0; mat < mats; ++mat) mma_weights<Decode>(raw[mat], group, grid, lane, b[mat], scale[mat]);
 #pragma unroll
             for (unsigned m = 0; m < MB; ++m) {
                 if (m >= mblocks) break;
@@ -178,7 +233,7 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_project_kernel(cons
                 mma_rows(xs, kMmaProjectPitch, 16U * m + g, 32U * j + 4U * q, a0);
                 mma_rows(xs, kMmaProjectPitch, 16U * m + g, 32U * j + 16U + 4U * q, a1);
 #pragma unroll
-                for (unsigned mat = 0; mat < 2U; ++mat) {
+                for (unsigned mat = 0; mat < mats; ++mat) {
                     float p[4] = {0.0F, 0.0F, 0.0F, 0.0F};
                     mma_bf16(p, a0, b[mat][0][0], b[mat][0][1]);
                     if constexpr (Decode::halves) {
@@ -191,13 +246,32 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_project_kernel(cons
             }
         }
     }
+    // Up value of each C element: the own accumulator (tile forms), or the up warp's (same column block, same lane), passed
+    // through the activation stage as [column block][m][i][lane] words once every warp has finished reading it.
+    [[maybe_unused]] float* exchange = reinterpret_cast<float*>(&X[0][0][0]);
+    if constexpr (wide) {
+        static_assert(8U * MB * 4U * 32U * sizeof(float) <= sizeof(X), "the up exchange fits the activation stage");
+        __syncthreads();
+        if (mat0 == 1U) {
+#pragma unroll
+            for (unsigned m = 0; m < MB; ++m)
+                if (m < mblocks)
+#pragma unroll
+                    for (unsigned i = 0; i < 4U; ++i) exchange[((column_block * MB + m) * 4U + i) * 32U + lane] = acc[m][0][i];
+        }
+        __syncthreads();
+        if (mat0 == 1U) return;
+    }
 #pragma unroll
     for (unsigned m = 0; m < MB; ++m)
 #pragma unroll
         for (unsigned i = 0; i < 4U; ++i) {
             const unsigned row = 16U * m + native_mma::c_row(lane, i);
             if (row < count) {
-                const float h = Binding::native_activation(acc[m][0][i], acc[m][1][i]);
+                float up_value;
+                if constexpr (wide) up_value = exchange[((column_block * MB + m) * 4U + i) * 32U + lane];
+                else up_value = acc[m][mats - 1U][i];
+                const float h = Binding::native_activation(acc[m][0][i], up_value);
                 at(v.intermediates, row_of[row])[slot_of[row] * 2U * ffn + out_base + native_mma::c_col(lane, i)] = h;
                 if (!isfinite(h)) { atomicOr(at(v.status, row_of[row]), projection_nonfinite); atomicOr(csr.summary, projection_nonfinite); }
             }
@@ -207,9 +281,14 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_project_kernel(cons
 // grid (tiles, hidden / 128), tile-major raster (native_mma::tile_major), 256 threads. Reads h from intermediates[row][slot * 2 * ffn + k] and writes FP32
 // rawdots[row][slot * hidden + o] (the exact route's storage; merge / commit unchanged). h enters as hi + lo BF16
 // (native_mma::split); both MMAs of a half share the code fragment. MB and D as in the project kernel.
+// The wide form (MB = kWideMBlocks, 512 threads): warp w owns the n8 block w / 8 of column block w % 8 only.
 template <unsigned T, class Binding, unsigned MB = native_mma::kTileMBlocks, unsigned D = native_mma::kTileAhead>
-__global__ __launch_bounds__(kMmaThreads, 2) void native_mma_down_kernel(const std::uint8_t* down, typename Binding::Rows v) {
-    static_assert(MB >= 1U && MB <= native_mma::kTileMBlocks && D >= 1U, "tile capacity and ring depth");
+__global__ __launch_bounds__(native_mma::block_threads(MB), native_mma::min_blocks(MB))
+void native_mma_down_kernel(const std::uint8_t* down, typename Binding::Rows v) {
+    static_assert(MB >= 1U && (MB <= native_mma::kTileMBlocks || MB == native_mma::kWideMBlocks) && D >= 1U,
+                  "tile capacity and ring depth");
+    constexpr bool wide = native_mma::wide(MB);
+    constexpr unsigned threads = native_mma::block_threads(MB), nblocks = native_mma::warp_parts(MB), cap = native_mma::tile_capacity(MB);
     namespace nm = native_mma;
     using Decode = weight::GsqDecode<T>;
     constexpr unsigned hidden = Binding::hidden, ffn = Binding::ffn;
@@ -222,21 +301,29 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_down_kernel(const s
     if (csr.summary[0] || ts.tile >= *csr.tile_count) return;
     const unsigned tile_begin = csr.tile_begins[ts.tile], count = csr.tile_begins[ts.tile + 1U] - tile_begin;
     const unsigned expert = csr.tile_experts[ts.tile];
-    if constexpr (MB < native_mma::kTileMBlocks) if (count > 16U * MB) {  // as in the project kernel: fail closed
+    if constexpr (MB != native_mma::kTileMBlocks) if (count > 16U * MB) {  // as in the project kernel: fail closed
         if (threadIdx.x == 0U) atomicOr(csr.summary, Binding::projection_nonfinite);
         return;
     }
-    __shared__ alignas(16) std::uint16_t Xh[2][16U * MB][kMmaDownPitch];
-    __shared__ alignas(16) std::uint16_t Xl[2][16U * MB][kMmaDownPitch];
-    __shared__ unsigned row_of[kNativeTileRows], slot_of[kNativeTileRows];
+    DownStage<MB>& Xh = stage_buffer<DownStage<MB>, wide, 0U>();
+    DownStage<MB>& Xl = stage_buffer<DownStage<MB>, wide, 1U>();
+    static_assert(!wide || 2U * sizeof(DownStage<MB>) == native_mma_stage_bytes(MB, false), "host and kernel stage bytes");
+    __shared__ unsigned row_of[cap], slot_of[cap];
     __shared__ std::uint32_t grid_words[Decode::grid_words ? Decode::grid_words : 1U];  // the type's codebook (none: 4 B)
     const unsigned t = threadIdx.x, lane = t & 31U, warp = t >> 5, g = lane >> 2, q = lane & 3U;
-    const unsigned out_base = native_mma::down_output(ts.slice, warp, 0U, 0U);
-    if (t < kNativeTileRows) {
+    const unsigned column_block = native_mma::column_block(warp), n0 = native_mma::first_part(MB, warp);  // tile forms: both n8 blocks
+    const unsigned out_base = native_mma::down_output(ts.slice, column_block, 0U, 0U);
+    const std::uint8_t* wrow[nblocks];
+#pragma unroll
+    for (unsigned n = 0; n < nblocks; ++n) wrow[n] = down + (std::uint64_t(expert) * hidden + out_base + 8U * (n0 + n) + g) * row_bytes;
+    constexpr unsigned groups = stages * groups_per_stage;
+    typename Decode::Raw ahead[D][nblocks];
+    if constexpr (wide) ring_start<Decode>(ahead, wrow, groups, lane);  // before the first barrier, as in the project kernel
+    if (t < cap) {
         const unsigned a = t < count ? t : 0U;
         row_of[t] = csr.rows[tile_begin + a]; slot_of[t] = csr.slots[tile_begin + a];
     }
-    weight::gsq_grid_fill<T>(grid_words, t, kMmaThreads);
+    weight::gsq_grid_fill<T>(grid_words, t, threads);
     __syncthreads();
     const weight::GsqSmemGrid grid{grid_words};
     // Thread t holds 16 h values of the next stage (row t / 4, values 16 (t % 4) ..) in registers across the MMAs and then
@@ -273,22 +360,17 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_down_kernel(const s
         dh[0] = make_uint4(hi[0], hi[1], hi[2], hi[3]); dh[1] = make_uint4(hi[4], hi[5], hi[6], hi[7]);
         dl[0] = make_uint4(lo[0], lo[1], lo[2], lo[3]); dl[1] = make_uint4(lo[4], lo[5], lo[6], lo[7]);
     };
-    const std::uint8_t* wrow[2];
-#pragma unroll
-    for (unsigned n = 0; n < 2U; ++n) wrow[n] = down + (std::uint64_t(expert) * hidden + out_base + 8U * n + g) * row_bytes;
     const unsigned mblocks = native_mma::m_blocks(count);  // block-uniform, <= MB
-    float acc[MB][2][4];
+    float acc[MB][nblocks][4];
 #pragma unroll
     for (unsigned m = 0; m < MB; ++m)
 #pragma unroll
-        for (unsigned n = 0; n < 2U; ++n)
+        for (unsigned n = 0; n < nblocks; ++n)
 #pragma unroll
             for (unsigned i = 0; i < 4U; ++i) acc[m][n][i] = 0.0F;
     fetch(0U); put(0U);
     // Weight fields D groups ahead, as in the project kernel (the last groups re-load the last one).
-    constexpr unsigned groups = stages * groups_per_stage;
-    typename Decode::Raw ahead[D][2];
-    ring_fill<Decode>(ahead, wrow[0], wrow[1], groups, lane);
+    if constexpr (!wide) ring_start<Decode>(ahead, wrow, groups, lane);
     __syncthreads();
 #pragma unroll 1
     for (unsigned s = 0; s < stages; ++s) {
@@ -299,12 +381,14 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_down_kernel(const s
 #pragma unroll
         for (unsigned j = 0; j < groups_per_stage; ++j) {
             const unsigned group = s * groups_per_stage + j;
-            const typename Decode::Raw raw[2] = {ahead[0][0], ahead[0][1]};
-            ring_advance<Decode>(ahead, wrow[0], wrow[1], group, groups, lane);
-            unsigned b[2][2][2];
-            float scale[2][2][2];
-            mma_weights<Decode>(raw[0], group, grid, lane, b[0], scale[0]);
-            mma_weights<Decode>(raw[1], group, grid, lane, b[1], scale[1]);
+            typename Decode::Raw raw[nblocks];
+#pragma unroll
+            for (unsigned n = 0; n < nblocks; ++n) raw[n] = ahead[0][n];
+            ring_step<Decode>(ahead, wrow, group, groups, lane);
+            unsigned b[nblocks][2][2];
+            float scale[nblocks][2][2];
+#pragma unroll
+            for (unsigned n = 0; n < nblocks; ++n) mma_weights<Decode>(raw[n], group, grid, lane, b[n], scale[n]);
 #pragma unroll
             for (unsigned m = 0; m < MB; ++m) {
                 if (m >= mblocks) break;
@@ -314,7 +398,7 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_down_kernel(const s
                 mma_rows(xh, kMmaDownPitch, 16U * m + g, 32U * j + 16U + 4U * q, h1);
                 mma_rows(xl, kMmaDownPitch, 16U * m + g, 32U * j + 16U + 4U * q, l1);
 #pragma unroll
-                for (unsigned n = 0; n < 2U; ++n) {
+                for (unsigned n = 0; n < nblocks; ++n) {
                     float p[4] = {0.0F, 0.0F, 0.0F, 0.0F};
                     mma_bf16(p, h0, b[n][0][0], b[n][0][1]);
                     mma_bf16(p, l0, b[n][0][0], b[n][0][1]);
@@ -334,12 +418,12 @@ __global__ __launch_bounds__(kMmaThreads, 2) void native_mma_down_kernel(const s
 #pragma unroll
     for (unsigned m = 0; m < MB; ++m)
 #pragma unroll
-        for (unsigned n = 0; n < 2U; ++n)
+        for (unsigned n = 0; n < nblocks; ++n)
 #pragma unroll
             for (unsigned i = 0; i < 4U; i += 2U) {
                 const unsigned row = 16U * m + nm::c_row(lane, i);
                 if (row < count) {
-                    float* dst = at(v.rawdots, row_of[row]) + slot_of[row] * hidden + out_base + 8U * n + nm::c_col(lane, i);
+                    float* dst = at(v.rawdots, row_of[row]) + slot_of[row] * hidden + out_base + 8U * (n0 + n) + nm::c_col(lane, i);
                     *reinterpret_cast<float2*>(dst) = make_float2(acc[m][n][i], acc[m][n][i + 1U]);
                 }
             }

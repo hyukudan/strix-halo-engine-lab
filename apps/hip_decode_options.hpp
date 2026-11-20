@@ -302,8 +302,6 @@ struct Options {
     bool yarn_mtp_draft_top2=false,yarn_mtp_q4_all=true,yarn_mtp_greedy_rows=true,yarn_mtp_pipeline=true;
     bool yarn_mtp_pool_off = false;
     bool ple_rolling_explicit_opt_in = false, qsa_mtp_pool_explicit_opt_in = false;
-    // Startup only: AUTO/capped HTTP batch fell back to the single runner and that slot does not fit with the pool.
-    bool qsa_mtp_pool_fallback_unfit = false;
     bool mtp_cli_phase_retirement = true;
     bool prefill_profile_automatic = false;
     bool prefill_profile_deferred = false;
@@ -1145,22 +1143,27 @@ inline void validate_resolved_teacher_forced_score(const Options& options, std::
         (o.rotary.mode()!=RotaryMode::yarn ||
          (o.rotary.factor()==2U && o.context_tokens<=524288U) ||
          (o.rotary.factor()==4U && o.context_tokens<=1048576U));
-    // The single-request HTTP runner owns one service: every ordinary request starts a fresh epoch and the
-    // in-memory prefix-cache restore hook invalidates both domains. Batch slots, sessions, disk prefix restore,
-    // state import and YaRN HTTP keep the explicit opt-in. A resolved AUTO/capped batch that falls back to one
-    // slot is admitted only when startup charged the pool to that slot (qsa_mtp_pool_fallback_unfit).
-    const bool qualified_http_single=o.http_serve && !o.http_batch && !o.session_live_control &&
+    // HTTP serving, the single runner and every batch slot alike: each request owner holds its own service (one
+    // per slot, charged per slot in the capacity fit), every admitted request starts a fresh epoch (batch
+    // admission and cancellation included), the in-memory prefix-cache restore hook invalidates both domains and
+    // the cohort cycle of concurrent slots scores each member from its own owner. Sessions, nested scheduling,
+    // disk prefix restore, state import and YaRN HTTP keep the explicit opt-in.
+    const bool qualified_http=o.http_serve && !o.session_live_control &&
         o.session_load.empty() && o.session_save.empty() && o.session_then_prompt.empty() && !o.session_mtp_fixed &&
         !o.session_management_requested && o.prefix_cache_dir.empty() && o.prefix_cache_then_prompts.empty() &&
         o.serving_prefix_files.empty() && !o.rtx_state_import && !o.prefix_cache_roundtrip &&
-        o.mtp.sample_repeats==1U && o.rotary.mode()!=RotaryMode::yarn && !o.qsa_mtp_pool_fallback_unfit;
+        o.mtp.sample_repeats==1U && o.rotary.mode()!=RotaryMode::yarn;
     const char* explicit_on=std::getenv("STRIX_QSA_MTP_POOL");
-    if (!qualified_cli && !qualified_http_single && !o.qsa_mtp_pool_explicit_opt_in &&
+    if (!qualified_cli && !qualified_http && !o.qsa_mtp_pool_explicit_opt_in &&
         !(explicit_on && std::string_view(explicit_on)=="1"))
-        return o.qsa_mtp_pool_fallback_unfit ? "single-fallback-does-not-fit" : "unqualified-route-requires-STRIX_QSA_MTP_POOL=1";
+        return "unqualified-route-requires-STRIX_QSA_MTP_POOL=1";
     if (!qpf2k::long_context_item_enabled("STRIX_QSA_DECODE_POOL_BF16",gsq)) return "bf16-disabled";
     if (o.execution.mode==DecodeExecutionMode::graph || o.qsa_hierarchical_selection) return "unsupported-control";
-    if (!o.mtp.cohort.empty() || !o.mtp.copy_wide_rows.empty()) return "unconverted-writer-span";
+    // Wide copy cycles compose: their tiled owner never leases the pool (committed_pool is bound only on non-prefill
+    // owners), the next verify window leases certified at the new frontier and the lazy build refills the gap from
+    // the tiled rows' raw bytes; an abandoned cycle leaves only non-committed blocks behind. The CLI cohort keeps the
+    // decline (its planner charges one pool for every member).
+    if (!o.mtp.cohort.empty()) return "unconverted-writer-span";
     if (o.rotary.mode()==RotaryMode::yarn &&
         (!o.context_tokens || o.context_tokens>o.rotary.effective_max() ||
          o.rotary.factor()!=(o.context_tokens<=524288U?2U:4U))) return "unqualified-rotary";
@@ -1175,14 +1178,6 @@ inline void validate_resolved_teacher_forced_score(const Options& options, std::
     if (!qsa_mtp_pool_route(o,gsq) || model.full_attention_layers!=12 || model.indexer_head_dim!=128 ||
         model.indexer_n_heads!=4 || model.indexer_compress_ratio!=4) return 0;
     return mtp_qsa_pool_plan(o.context_tokens).reserved_bytes;
-}
-// AUTO or capped HTTP batch serving falls back to the single runner when startup capacity is one slot. Batch
-// sizing excludes the pool; startup charges it to that slot again before the single route keeps it.
-[[nodiscard]] inline bool qsa_mtp_pool_single_fallback_pending(const Options& o,bool gsq=false) {
-    if (!o.http_serve || o.session_live_control || !o.http_batch || (o.http_batch_explicit && o.http_batch_cap==1U) ||
-        qsa_mtp_pool_route(o,gsq)) return false;
-    auto single=o;single.http_batch=0;
-    return qsa_mtp_pool_route(single,gsq);
 }
 
 // The prefix state cache restores and captures whole tiled blocks: it runs only on the tiled

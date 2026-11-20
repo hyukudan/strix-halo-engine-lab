@@ -167,4 +167,18 @@ inline LinkCost agree(Transport& transport, const LinkCost& mine) {
     return combine(mine, peer);
 }
 
+// One measured scalar agreed by both ranks (e.g. a timed one-rank pass that decides a placement): one symmetric exchange,
+// every rank returns max(own, peer), so both decide from identical bits. Refuses a non-finite or negative value on
+// either side after the exchange completed on both ranks.
+inline double agree_max(Transport& transport, double mine) {
+    std::array<std::byte, sizeof(double)> out{}, in{};
+    std::memcpy(out.data(), &mine, sizeof(double));
+    transport.exchange(out, in);
+    double peer = 0.0;
+    std::memcpy(&peer, in.data(), sizeof(double));
+    if (!std::isfinite(mine) || mine < 0.0) throw std::invalid_argument("agree_max: the local value is not finite and >= 0");
+    if (!std::isfinite(peer) || peer < 0.0) throw std::runtime_error("agree_max: the peer sent a value that is not finite and >= 0");
+    return std::max(mine, peer);
+}
+
 } // namespace strix::dist

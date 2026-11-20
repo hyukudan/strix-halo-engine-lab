@@ -160,9 +160,11 @@ The tables below list the curated flags. The full list of environment variables 
 | `--engram-direct`, `--engram-mapped` | deepseek | `direct` | Engram table access. | `mapped` when memory is short. |
 | `--decode-xch xfer\|comm`, `STRIX_GLM_DECODE_XCH` | glm | `xfer` (`comm` in baseline) | Decode exchange mode. | Compare both on a different interconnect. |
 | `--wb-defer`, `--wb-stream`, `--ce-pacing` (`--no-*`) | deepseek-rtx | on | Write-back and copy-engine pacing. Also `STRIX_DS41_WB_STREAM`, `STRIX_DS41_CE_PACING`. | Off on links where the copy engine is not the bottleneck. |
-| `--tp-rank 0\|1`, `--tp-transport`, `--tp-rates A,B`, `--tp-trip-us`, `--tp-force` | qwen dense decode (HIP) | off (one node) | Exact tensor-parallel decode over two ranks: column / head shares, exact gathers. `--tp-rates` (GB/s per rank) overrides the topology rates, `--tp-trip-us` the measured trip latency, `--tp-force` keeps the group when the planner says it loses. [Entry](optimizations.md#qwen-27b-exact-tensor-parallel-decode-over-two-nodes). | Per-rank rates come from the topology declaration; a same-box pair measures its own trip at start-up. |
+| `--tp-rank 0\|1`, `--tp-transport`, `--tp-rates A,B`, `--tp-trip-us`, `--tp-gap-us`, `--tp-force` | qwen dense decode (HIP) | off (one node) | Exact tensor-parallel decode over two ranks: column / head shares, exact gathers. Placement by the shared planner from the one-node pass measured at start-up and the probed trip (`plan:` line; a losing plan decodes one node on both ranks). `--tp-rates` (GB/s per rank) overrides the topology rates, `--tp-trip-us` the measured trip latency, `--tp-gap-us` gives the measured host gap per join of the staged route (unknown = the split is refused), `--tp-force` keeps the group when the planner says it loses. [Entry](optimizations.md#qwen-27b-exact-tensor-parallel-decode-over-two-nodes). | Per-rank rates come from the topology declaration; a same-box pair measures its own trip at start-up. |
 | `--topology FILE --node ID`, `STRIX_TOPOLOGY` | qwen dense decode (HIP) | none | Topology declaration read for the tensor-parallel rates (`memory_gbytes_ps` of both nodes). | Declare each node's measured memory rate. |
 | `STRIX_PAIR_DECODE_RELAY=1` | qwen pair prefill (HIP) | off | After the layered prefill, moves each stage's layer state once to a node that holds the whole model and decodes there. Not measured on this tree. [Entry](optimizations.md#qwen-27b-pair-prefill-decode-relay-to-one-node). | When one node holds the whole model and the layer split serialises decode. |
+| `STRIX_TP_CHANNEL=0` | qwen dense decode (HIP, `--tp-rank`) | on | `=0` restores the staged route (host wait per gather). On: carries the tensor-parallel gathers on the shared device-waited channel: no host wait per gather; the last messages are checked at the end of the run. Same bytes, same slots, same join kernels. [Entry](optimizations.md#qwen-27b-exact-tensor-parallel-decode-over-two-nodes). | Any pair whose host wait per gather costs more than the channel's progress thread. |
+| `STRIX_TP_XPORT_DEPTH`, `_FOLD`, `_PUBLISH`, `_CRC` (`0\|1\|deferred`), `_TX_MEM`, `_RX_MEM`, `_PROGRESS_CPU`, `_CRC_CPU`, `_IDLE_SPIN_US`, `_TIMEOUT_MS`, `_TEST_CORRUPT` | qwen dense decode (HIP, channel route) | channel defaults (deferred CRC above 1 KB) | Settings of the channel the gathers ride: ring depth, publication, integrity check, buffer memory, progress / CRC CPUs, idle spin, peer timeout; `_TEST_CORRUPT` injects a corrupt message (tests only). Both ranks must agree. | Pin the progress CPU away from the engine's host thread on busy hosts. |
 | `STRIX_DS41_OB_SPLIT=K` | deepseek | off | Splits the o_b exchange into K chunks that overlap compute. Exact. Slower on the host path. | Try on a faster interconnect or with GPU-direct. |
 
 Pair setup: [pair-setup.md](pair-setup.md).
@@ -301,6 +303,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_GLM_PF_WMMA` | glm | off (opt-in FAST identity) | [glm-pf-wmma-x](optimizations.md#glm-pf-wmma-x) |
 | `STRIX_GLM_PF_WMMA_LIVE_FRAG` | glm | 1 | [glm-pf-wmma-live-fragments](optimizations.md#glm-pf-wmma-live-fragments) |
 | `STRIX_GLM_PF_WMMA_SHARED128` | glm | 1 | [glm-pf-wmma-shared128](optimizations.md#glm-pf-wmma-shared128) |
+| `STRIX_HY4_PF_STORE_EPILOGUE` | hy4 | on | [hy4-pf-store-epilogue](optimizations.md#hy4-pf-store-epilogue) |
 | `STRIX_INTPREFILL_DENSE_ROWS` | qwen | 512 | [qwen-intprefill-dense-rows](optimizations.md#qwen-intprefill-dense-rows) |
 | `STRIX_MMX_PREFILL_GATHER_TOK` | minimax | 1 | [mm-pf-gather-tok](optimizations.md#mm-pf-gather-tok) |
 | `STRIX_MMX_PREFILL_MTFIT` | minimax | 1 | [mm-pf-mtfit](optimizations.md#mm-pf-mtfit) |
@@ -445,7 +448,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_MTP_PRIME_BATCH` | qwen | 64 rows (clamped to 8..128; 8 restores original batches) | [qwen-mtp-prime-rows](optimizations.md#qwen-mtp-prime-rows) |
 | `STRIX_MTP_PRIME_PROJ_ROWS` | qwen | 4 output rows per wave (1: one row per wave) | [qwen-mtp-prime-rows](optimizations.md#qwen-mtp-prime-rows) |
 | `STRIX_MTP_PRIME_ROWS` | qwen | ON (STRIX_MTP_PRIME_ROWS=0: disable) | [qwen-mtp-prime-rows](optimizations.md#qwen-mtp-prime-rows) |
-| `STRIX_QSA_MTP_POOL` | qwen | 1 (eligible native MTP CLI, the singl... | [qwen-qsa-mtp-pool](optimizations.md#qwen-qsa-mtp-pool) |
+| `STRIX_QSA_MTP_POOL` | qwen | 1 (eligible native MTP CLI, HTTP serv... | [qwen-qsa-mtp-pool](optimizations.md#qwen-qsa-mtp-pool) |
 
 ### Exact vs FAST (10)
 
@@ -462,7 +465,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_QSA_DECODE_POOL_BF16` | qwen | 1 (plain append-only serial decode un... | [qwen-qsa-decode-pool](optimizations.md#qwen-qsa-decode-pool) |
 | `STRIX_QWEN_ROUTER_BF16` | qwen | OFF (opt-in: STRIX_QWEN_ROUTER_BF16=1) | [qwen-exact-bf16-router-weights](optimizations.md#qwen-exact-bf16-router-weights) |
 
-### Kernel paths (122)
+### Kernel paths (123)
 
 | Toggle | Engine | Default | Details |
 |---|---|---|---|
@@ -590,6 +593,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_ROUTER_STAGE_ACT` | qwen | ON | [qwen-router](optimizations.md#qwen-router) |
 | `STRIX_SERVE_HEALTH_RECORD` | qwen | ON | [operations/service-health.md](operations/service-health.md) |
 | `STRIX_SERVE_OBSERVE_EXPIRY_S` | deepseek | 60 seconds | [ds-observation](optimizations.md#ds-observation) |
+| `STRIX_QRTX_EXPERT_WIDE_TILE` | qwen-rtx | off (`1` = on with the builtin threshold, `N` = on from N rows per expert) | [qwen-rtx-expert-wide-tile](optimizations.md#qwen-rtx-expert-wide-tile) |
 
 ### Debug only (7)
 

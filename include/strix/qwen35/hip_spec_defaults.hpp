@@ -16,9 +16,11 @@
 // Speculation is exact: verify windows are bitwise equal to row-by-row decode (hip_engine.hpp), and drafts (MTP layer
 // precision, head subset) only steer how many tokens a window accepts, never which tokens are emitted.
 // Home: shared host resolver of the qwen35 HIP family (both apps call it); the mechanisms are shared (strix/spec).
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -38,6 +40,7 @@ struct HipDenseSpecPlan {
     std::vector<std::string> draft_packs;  // pack id files (comma list of --draft-pack)
     HipDenseCostMode costs = HipDenseCostMode::calibrated;
     std::string cost_kv = "auto";  // context cost of the calibrated / table model (hip_dense_cost_kv)
+    bool device_feed = true;       // MTP chain device feed (MtpChain::set_device_feed; ids bitwise either way)
 };
 
 // `mtp`: "auto" / "" / "off" / "none" / path; `draft_rows`: false = full head (off switch). `has_layer` answers whether
@@ -48,6 +51,7 @@ HipDenseSpecPlan resolve_hip_dense_spec(const std::string& model, const HipDense
     HipDenseSpecPlan p;
     p.costs = args.costs;
     p.cost_kv = args.cost_kv;
+    p.device_feed = args.chain_feed_device;
     const std::string mtp = plain ? std::string("off") : args.mtp;
     const bool draft_rows = args.draft_rows;
     const std::string& draft_packs = args.draft_packs;
@@ -108,21 +112,35 @@ inline spec::BlockConfig hip_dense_block_config(const HipDenseSpecPlan& plan, do
 // one warm-up and one timed verify window per row bucket (1 / 2 / 4 / 8 / 16 rows), each discarded (commit(0): the
 // committed state is untouched, as for any rejected window); about 2 x (V1 + V2 + V4 + V8 + V16), ~0.9 s on a 27B pack.
 // Invalid walls fall back to the table (source table, reported). table / learned: the compiled table.
+// One timed window of `rows` rows of token `token`, discarded (commit(0): the committed state is untouched, as for any
+// rejected window): the verify target's request (spec/engine_target.hpp) up to the host wait for its results, ms.
+template <class Engine>
+double hip_dense_time_window(Engine& e, std::uint32_t token, std::uint32_t rows) {
+    std::uint32_t t[Engine::max_rows()];
+    for (auto& v : t) v = token;
+    const auto t0 = std::chrono::steady_clock::now();
+    (void)e.forward_rows(t, rows, Engine::LogitRows::all);
+    e.commit(0);
+    e.sync();
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+// The one-row pass of this device after the prompt (a placement input: split::with_measured_single): one warm-up window,
+// then the median of three timed windows, all discarded. ~4 x the plain step (~0.25 s on a 27B pack).
+template <class Engine>
+double hip_dense_measure_pass(Engine& e, std::uint32_t token) {
+    (void)hip_dense_time_window(e, token, 1U);
+    double w[3];
+    for (auto& v : w) v = hip_dense_time_window(e, token, 1U);
+    std::sort(std::begin(w), std::end(w));
+    return w[1];
+}
 template <class Engine>
 HipDenseCosts hip_dense_measure_costs(Engine& e, HipDenseCostMode mode, bool scalar_x, std::uint32_t token) {
     if (mode != HipDenseCostMode::calibrated) return hip_dense_table_costs(scalar_x);
-    std::uint32_t t[Engine::max_rows()];
-    for (auto& v : t) v = token;
     const std::uint32_t rows[5] = {1U, 2U, 4U, 8U, 16U};
     double walls[5] = {};
     for (int pass = 0; pass < 2; ++pass)  // pass 0 warms every bucket's kernels (first launches), pass 1 is timed
-        for (std::uint32_t i = 0; i < 5U; ++i) {
-            const auto t0 = std::chrono::steady_clock::now();
-            (void)e.forward_rows(t, rows[i], Engine::LogitRows::all);  // the verify target's request (spec/engine_target.hpp)
-            e.commit(0);
-            e.sync();
-            walls[i] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        }
+        for (std::uint32_t i = 0; i < 5U; ++i) walls[i] = hip_dense_time_window(e, token, rows[i]);
     return hip_dense_calibrated_costs(walls, e.weight_bytes(), e.mtp_weight_bytes(), e.head_weight_bytes(), scalar_x);
 }
 

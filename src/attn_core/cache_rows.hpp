@@ -6,6 +6,7 @@
 #include <hip/hip_runtime.h>
 
 #include "strix/attn/cache_rows.hpp"
+#include "wmma_types.hpp"  // ImageEpilogue: the operand rounding the attention cores read (tile::to_bf16)
 
 #include <cstddef>
 #include <cstdint>
@@ -39,6 +40,18 @@ __global__ __launch_bounds__(kBlock) void store_rows_kernel(StoreArgs a) {
     }
     if (!ok && a.flag != nullptr) atomicOr(a.flag, 1U);
 }
+
+// The writer as a producer's store epilogue (policy E of core/f16_dense_q8a8.hpp StoreImage): the producer's FP32 output
+// x is stored as tile::to_bf16(x) == encode(x) for every non-NaN x (a NaN raises the flag on both paths), and the flag
+// is raised under the same rule as store_rows (encodes_finite). The image rows are the producer's rows (ring 0, rows
+// as wide as the producer's out_stride): the bits store_rows writes from the producer's FP32 output, without it.
+struct ImageEpilogue {
+    using Args = unsigned*;  // the writer's flag (nullptr: none)
+    static constexpr tile::Operand kOp = tile::Operand::bf16;
+    static __device__ __forceinline__ void pair(const Args& flag, unsigned, unsigned, float& x0, float& x1) {
+        if (flag != nullptr && !(cr::encodes_finite(x0) && cr::encodes_finite(x1))) atomicOr(flag, 1U);
+    }
+};
 
 // rows == 0 is a no-op. Errors: width 0, a null cache / source.
 inline hipError_t store_rows(const StoreArgs& a, hipStream_t stream) {
