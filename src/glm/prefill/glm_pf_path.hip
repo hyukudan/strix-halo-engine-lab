@@ -3,6 +3,7 @@
 // -fno-gpu-flush-denormals-to-zero (the Tier A kernels it calls are bitwise to src/glm/host).
 #include "glm/prefill/glm_pf_path.hpp"
 
+#include "attn_core/flash_pf_policy.hpp"
 #include "glm/kernels/glm_dsa.hpp"
 #include "glm/kernels/glm_tier_a.hpp"
 #include "glm/prefill/glm_pf_moe.hpp"
@@ -333,10 +334,10 @@ public:
             dsa_append_rows(sl, t0, fused_latent ? kva_ : lat_, key_, gate_, iw, c.flag, R, c.stream, false, 0,
                             fused_latent ? w.kv_a_norm : nullptr);
             indexer_select_rows_bounded(sl, t0, qI_, wh_, keys_, tok_, ntok_, R, c.stream);
-            if (attention_window_ == 0)
-                mla_attention_rows(sl, tok_, ntok_, q_, w.kv_b, H, qt_, e_, ob_, o_, R, c.stream);
-            else
-                mla_attention_rows(sl, tok_, ntok_, q_, w.kv_b, H, qt_, e_, ob_, o_, R, c.stream, attention_window_);
+            // Window 0 = one window of R rows (attention_scratch_rows), the same launches as the unwindowed entry.
+            // Rows t0 .. t0 + R - 1 select distinct causal keys, at most kMaxTokens: the flash core's Pf bound.
+            const unsigned max_keys = strix::attn_core::sparse::causal_list_bound(std::uint64_t{t0} + R, kMaxTokens);
+            mla_attention_rows(sl, tok_, ntok_, q_, w.kv_b, H, qt_, e_, ob_, o_, R, c.stream, attention_window_, max_keys);
         }
         linear(c, w.o, o_, y, R, H * kMlaDim, kHidden);
     }

@@ -4177,8 +4177,14 @@ int main(int argc, char** arguments) {
         explicit_t.options.known_prefix_tail_rows.clear();
         explicit_t.options.prefix_cache_host_bytes=gib_bytes;
         const auto cached=resolve(explicit_t,memory);
-        expect(cached.options.known_prefix_prefill_rows==2048 && cached.options.prefix_cache_block_rows==1024,
-            "explicit T wins and configured cache defaults to 1024 checkpoints");
+        // The single MTP route keeps row-class checkpoints on the 128-row class grid; other routes keep 1024.
+        const bool row_class=!cached.options.http_batch && cached.options.mtp.enabled;
+        expect(cached.options.known_prefix_prefill_rows==2048 &&
+            cached.options.prefix_cache_block_rows==(row_class?qwen_row_class_grid:std::uint64_t{1024}),
+            "explicit T wins and configured cache defaults to class-grid (single MTP route) or 1024 checkpoints");
+        auto no_class=explicit_t;no_class.environment["STRIX_PREFIX_CACHE_ROW_CLASS"]="0";
+        expect(resolve(no_class,memory).options.prefix_cache_block_rows==1024,
+            "STRIX_PREFIX_CACHE_ROW_CLASS=0 keeps the 1024-row checkpoint default");
         explicit_t.options.prefix_cache_block_rows_explicit=true;
         explicit_t.options.prefix_cache_block_rows=0;
         expect(resolve(explicit_t,memory).options.prefix_cache_block_rows==0,"explicit zero restores T checkpoints");
@@ -5134,8 +5140,11 @@ int main(int argc, char** arguments) {
             }
         }
         mtp_pool.http_serve=true;mtp_pool.qsa_mtp_pool_explicit_opt_in=true;
-        mtp_pool.mtp.copy_wide_rows={32};expect(!qsa_mtp_pool_route(mtp_pool),"wide writers decline before allocation");
-        mtp_pool.mtp.copy_wide_rows.clear();mtp_pool.baseline=true;expect(!qsa_mtp_pool_route(mtp_pool),"baseline retains historical MTP");
+        mtp_pool.mtp.copy_wide_rows={32,16};
+        expect(qsa_mtp_pool_route(mtp_pool) && qsa_mtp_pool_decline(mtp_pool)==nullptr,"wide copy rows keep the pool");
+        mtp_pool.mtp.cohort.resize(1);
+        expect(std::string_view(qsa_mtp_pool_decline(mtp_pool))=="unconverted-writer-span","the CLI cohort still declines");
+        mtp_pool.mtp.cohort.clear();mtp_pool.mtp.copy_wide_rows.clear();mtp_pool.baseline=true;expect(!qsa_mtp_pool_route(mtp_pool),"baseline retains historical MTP");
         // Serial decode pool route: plain append-only CLI only; every multi-request or rewriting route is excluded.
         const auto route = [&](std::vector<std::string> extra) {
             std::vector<std::string> args{"decoder","target.gguf","1","2","3","--generate","4"};

@@ -25,7 +25,7 @@ You only need this page to inspect a path, to debug, or to move the engine to di
 | Profile | What it does |
 |---|---|
 | `--profile exact` (alias `default`) | Current production path; exports no profile overrides. This is the default. |
-| `--profile fast` | Adds every qualified bit-changing option, and the rows selected for fast ahead of their receipt (stamped "qualification in progress" in the receipt). Rows that are neither stay off (see `--allow-pending`). MiniMax: the qualified bundle `mm-fast-pf-v2` (the same members and prefill identity as `STRIX_MM_FAST_PREFILL=1`; refused with `--baseline`). GLM pair: nothing (`STRIX_GLM_PF_WMMA` is unqualified for fast: its FAST prefill set fails the 8K quality gate; it runs only when set explicitly). DeepSeek pair: the FAST bundle and its Engram / shared / MoE FP16 levers stay explicit until their quality gate. A set switch, `0` included, wins. |
+| `--profile fast` | Adds every qualified bit-changing option, and the rows selected for fast ahead of their receipt (stamped "qualification in progress" in the receipt). Rows that are neither stay off (see `--allow-pending`). MiniMax: the qualified bundle `mm-fast-pf-v2` (the same members and prefill identity as `STRIX_MM_FAST_PREFILL=1`; refused with `--baseline`). GLM pair: nothing (`STRIX_GLM_PF_WMMA` is unqualified for fast: its FAST prefill set fails the 8K quality gate; it runs only when set explicitly). DeepSeek pair: the FAST bundle `ds41-fast-pf-v1` with its Engram / shared / MoE FP16 levers (selected together ahead of a full receipt: FAST gate v2, no replay, final PASS for prompts <= 8,192 on 882 rows; provisional above, 32K class 126 rows; the receipt says "qualification in progress"). A set switch, `0` included, wins. |
 | `--profile quality` | A higher-precision pack where one exists (Nemotron EXL3). Otherwise equal to `default`. |
 | `--profile` on `strix-cuda-ds41-prefill-service` | DS41 RTX prefill service: takes the same word (`exact`/`default`, `fast`; `STRIX_DS41_PROFILE`) and `--allow-pending` as the replica, through the same resolver (`strix/profiles/ds41_rtx.hpp`). Today every fast row is pending (listed in `levers`, never used), so `fast` runs as `exact`. |
 
@@ -42,7 +42,7 @@ identity names every applied lever.
 |---|---|---|
 | `--prefill-arith fast4` | decode CLI large prefill, `--turbo-weights onfly\|converted` (W4A4 gate 8K/32K passed) | `--prefill-arith exact` |
 | `--prefill-gdn chunk16` | same regime (gated together with FAST4) | `--prefill-gdn serial` |
-| `--prefill-attn8 on` | same regime, prompt of at least 32,768 tokens (32K gate passed; no 8K gate) | `--prefill-attn8 off` |
+| `--prefill-attn8 on` | same regime, prompt of at least 8,192 tokens (8K and 32K gates passed) | `--prefill-attn8 off` |
 | `--split-k fast` | spec CLI (decode windows), `--turbo-weights onfly\|converted`: FAST `nvfp4-splitk-fast-v1` (gate passed; spec verify 0.6-0.7 % faster). Decode CLI: pending (its `fast` already applies FAST4; that combination has no gate yet) | `--split-k exact` |
 | `--decode-attn8 on` | pending on both CLIs (no qualified regime yet: gate at 8K / 28K / 64K not run). Decode / verify attention on e4m3 tensor cores over the e4m3 K/V shadow, identity `-d8`; verify rows give the same bits as one-row decode; on the spec CLI it also covers the prefill windows. Explicit `--decode-attn8 on` runs it in any regime | `--decode-attn8 off` |
 
@@ -122,6 +122,7 @@ The tables below list the curated flags. The full list of environment variables 
 | `--block-schedule default\|tail-large` | qwen-rtx | `tail-large` | Order of blocks in the large kernels. | `default` on GPUs with a different CU count. |
 | `--prefill auto` | glm | `auto` | Picks the prefill path. | - |
 | `--prefill-chunk N` | glm | 512 | Prefill chunk size in rows. | Larger with more compute; smaller with less memory. |
+| `--prefill-route windows\|large`, `--prefill-chunk N` | qwen-rtx (27B spec CLI) | `windows` | `large`: the prompt goes through the decode CLI's large prefill (`--prefill-chunk N` rows per chunk; 0 = engine default) and its rows feed the MTP chain. Opt-in, not yet measured against `windows`. | - |
 | `--prefill-path device` | deepseek serve | `device` | Prefill on the GPU. | - |
 | `--wide-exact N` | qwen (27B HIP decode app) | off (16-row windows) | EXACT prefill windows of N rows, every row bitwise the 16-row result; only when every large dense projection is IU4 (other formats resolve to 16 rows). `--wide N` (> 16) is the FAST wide class. [Details](optimizations.md#qwen27-hip-decode-step). | 64 measured best on Strix (exact attention costs more per row in wider grids). |
 | `--prefill-rows N`, `--prefill-exact` | qwen (27B HIP spec app) | 64-row EXACT windows (IU4 dense projections; 16 rows otherwise) | `--prefill-rows 16` = 16-row windows; N > 16 = the FAST wide class unless `--prefill-exact` is given. [Details](optimizations.md#qwen27-hip-decode-step). | - |
@@ -136,6 +137,7 @@ The tables below list the curated flags. The full list of environment variables 
 |---|---|---|---|---|
 | `--mtp-bundle`, `--rope-yarn 2\|4 --context C` | qwen | - | MTP draft bundle; YaRN for long context. | - |
 | `--prelaunch 0\|1` | qwen-rtx (dense 27B spec CLI) | `0` | Launches the verify behind the device-fed MTP draft (same ids). | - |
+| `--mtp-catchup kv\|full` | qwen-rtx (27B spec CLI) | `kv` | K/V-only MTP catch-up: catch-up chunks whose outputs nobody reads write only the MTP K/V (same K/V, same drafts). `full` = the full MTP pass (off switch). [Details](optimizations.md#qwen27-cuda-mtp-kv-catchup) | - |
 | `--mtp 0\|1` | glm | resolved (see `--print-effective-config`) | Turns the MTP draft off or on. | `0` when memory is short. |
 | `--identity r1b\|r1` | glm | `r1b` | Decode identity. | `r1` to compare. |
 | `--dspark`, `--no-dspark`, `--dspark-vocab auto\|full` | deepseek | on when the draft is found | DSpark speculative draft. | `--no-dspark` when memory is short. |
@@ -155,6 +157,9 @@ The tables below list the curated flags. The full list of environment variables 
 | `--engram-direct`, `--engram-mapped` | deepseek | `direct` | Engram table access. | `mapped` when memory is short. |
 | `--decode-xch xfer\|comm`, `STRIX_GLM_DECODE_XCH` | glm | `xfer` (`comm` in baseline) | Decode exchange mode. | Compare both on a different interconnect. |
 | `--wb-defer`, `--wb-stream`, `--ce-pacing` (`--no-*`) | deepseek-rtx | on | Write-back and copy-engine pacing. Also `STRIX_DS41_WB_STREAM`, `STRIX_DS41_CE_PACING`. | Off on links where the copy engine is not the bottleneck. |
+| `--tp-rank 0\|1`, `--tp-transport`, `--tp-rates A,B`, `--tp-trip-us`, `--tp-force` | qwen dense decode (HIP) | off (one node) | Exact tensor-parallel decode over two ranks: column / head shares, exact gathers. `--tp-rates` (GB/s per rank) overrides the topology rates, `--tp-trip-us` the measured trip latency, `--tp-force` keeps the group when the planner says it loses. [Entry](optimizations.md#qwen-27b-exact-tensor-parallel-decode-over-two-nodes). | Per-rank rates come from the topology declaration; a same-box pair measures its own trip at start-up. |
+| `--topology FILE --node ID`, `STRIX_TOPOLOGY` | qwen dense decode (HIP) | none | Topology declaration read for the tensor-parallel rates (`memory_gbytes_ps` of both nodes). | Declare each node's measured memory rate. |
+| `STRIX_PAIR_DECODE_RELAY=1` | qwen pair prefill (HIP) | off | After the layered prefill, moves each stage's layer state once to a node that holds the whole model and decodes there. Not measured on this tree. [Entry](optimizations.md#qwen-27b-pair-prefill-decode-relay-to-one-node). | When one node holds the whole model and the layer split serialises decode. |
 | `STRIX_DS41_OB_SPLIT=K` | deepseek | off | Splits the o_b exchange into K chunks that overlap compute. Exact. Slower on the host path. | Try on a faster interconnect or with GPU-direct. |
 
 Pair setup: [pair-setup.md](pair-setup.md).
@@ -279,7 +284,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_GLM_PF_MLA_OB16` | glm | on when the MLA WMMA out GEMM runs (same bits); 0 = FP32 o-bar | [glm-pf-mla-wmma](optimizations.md#glm-pf-mla-wmma) |
 | `STRIX_GLM_PF_TOPK_OVERLAP` | glm | off; 1 = diagnostic: per FAST flash call, top-k list sizes vs union sizes of aligned row pairs / quads / octets (dense prefix and sparse rows), syncs the stream (not for timing), bits unchanged | [glm-pf-mla-wmma](optimizations.md#glm-pf-mla-wmma) |
 | `STRIX_GLM_PF_MLA_GEMM_HEADS` | glm | on (exact and FAST; same bits); 0 = rows-then-head CTA order | [glm-pf-mla-gemm-heads](optimizations.md#glm-pf-mla-gemm-heads) |
-| `STRIX_GLM_PF_KDA_SCAN` | glm | 5 | [glm-pf-kda-scan-v5](optimizations.md#glm-pf-kda-scan-v5) |
+| `STRIX_GLM_PF_KDA_SCAN` | glm | 6 | [glm-pf-kda-scan-v6](optimizations.md#glm-pf-kda-scan-v6) |
 | `STRIX_GLM_PF_MIXNORM` | glm | 1 | [glm-pf-mixnorm](optimizations.md#glm-pf-mixnorm) |
 | `STRIX_GLM_PF_MLA_GEMM` | glm | 3 (v3); 2 selects v2 | [glm-pf-mla-gemm-v2](optimizations.md#glm-pf-mla-gemm-v2) |
 | `STRIX_GLM_PF_OBAR` | glm | 10 | [glm-pf-obar-v5](optimizations.md#glm-pf-obar-v5) |
@@ -387,6 +392,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_GLM_R1B_DENSE` | glm | 7 | [glm-r1b-dense-auto](optimizations.md#glm-r1b-dense-auto) |
 | `STRIX_GLM_R1B_HC` | glm | 4 | [glm-r1b-hc-v4](optimizations.md#glm-r1b-hc-v4) |
 | `STRIX_GLM_SPEC_KDA_TREE` | glm | on (Xfer verify exchange, KDA tree 2,... | [glm-mtp-spec](optimizations.md#glm-mtp-spec) |
+| `STRIX_HY4_ROWS_EXPERT_UNION` | hy4 | on | [hy4-rows-expert-union](optimizations.md#hy4-rows-expert-union) |
 | `STRIX_MM_ATTEND4_DECODE` | minimax | 1 | [mm-attend4-decode](optimizations.md#mm-attend4-decode) |
 | `STRIX_MM_DRAFT_LIN` | minimax | opt | [mm-draft-lin](optimizations.md#mm-draft-lin) |
 | `STRIX_MM_DSPARK_ATTN` | minimax | 2 | [mm-dspark-attn](optimizations.md#mm-dspark-attn) |
@@ -438,7 +444,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_MTP_PRIME_ROWS` | qwen | ON (STRIX_MTP_PRIME_ROWS=0: disable) | [qwen-mtp-prime-rows](optimizations.md#qwen-mtp-prime-rows) |
 | `STRIX_QSA_MTP_POOL` | qwen | 1 (eligible native MTP CLI, HTTP serv... | [qwen-qsa-mtp-pool](optimizations.md#qwen-qsa-mtp-pool) |
 
-### Exact vs FAST (9)
+### Exact vs FAST (10)
 
 | Toggle | Engine | Default | Details |
 |---|---|---|---|
@@ -449,6 +455,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_GLM_PF_EXACTMOE_V` | glm | auto | [glm-pf-exact-moe-auto](optimizations.md#glm-pf-exact-moe-auto) |
 | `STRIX_GLM_PF_EXACT_X` | glm | auto | [glm-pf-exact-x](optimizations.md#glm-pf-exact-x) |
 | `STRIX_QPF2K_MOE_ROUTE_BF16` | qwen | OFF | [qwen-moe-route-bf16](optimizations.md#qwen-moe-route-bf16) |
+| `STRIX_QRTX_EXPERT_TURBO_ROWS` | qwen-rtx | 512 under `--profile turbo` only (`off` = int8 in every MoE call) | [qwen-rtx-turbo-experts](optimizations.md#qwen-rtx-turbo-experts) |
 | `STRIX_QSA_DECODE_POOL_BF16` | qwen | 1 (plain append-only serial decode un... | [qwen-qsa-decode-pool](optimizations.md#qwen-qsa-decode-pool) |
 | `STRIX_QWEN_ROUTER_BF16` | qwen | OFF (opt-in: STRIX_QWEN_ROUTER_BF16=1) | [qwen-exact-bf16-router-weights](optimizations.md#qwen-exact-bf16-router-weights) |
 

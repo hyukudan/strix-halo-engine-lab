@@ -120,4 +120,14 @@ struct Bindings {
 };
 // Pure host admission; no allocation, HIP call or buffer mutation.
 void validate(const Request& request, const Bindings& bindings);
+// Union rows form (strix/moe/expert_union.hpp) of the C1 probe: shape.logical_rows = R (1..8). input / routes / codes /
+// deltas / sums / output are R contiguous C1 extents (each row slice passes validate() with logical_rows 1); gate / up /
+// status are shared; plan is the expert_union plan (expert_union::plan_bytes, written by the probe). Q4_K gate / up only and
+// hidden <= c1_max_rows (the kernel stages one weight row in registers). Pure host admission, like validate().
+// Why not the family's window form (strix/hip_moe_q4k_a8_known_rows.hpp, CSR of (row, slot) per expert): that form is
+// bounded by max_rows / max_top_k above (LDS staging, top-k <= 10), so a top-16 geometry is admitted only by the C1
+// bounds (c1_max_rows / c1_max_top_k). The union form is a trait of this family for that wide geometry, not a second
+// family. Convergence (open): one plan for both forms, and one window form once a receipt at the top-8 geometry says
+// which is faster.
+void validate_union(const Request& request, const Bindings& bindings, DeviceBytes plan);
 }  // namespace strix::moe_q4k_a8

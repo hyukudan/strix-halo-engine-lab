@@ -12,6 +12,7 @@
 #include "strix/deepseek41_model.hpp"
 #include "strix/ds41_formats.hpp"
 #include "strix/ds41_layer.hpp"
+#include "strix/head_argmax.hpp"
 #include "strix/ds41_moe.hpp"
 
 #include <algorithm>
@@ -387,6 +388,7 @@ int main(int argc, char** argv) try {
         auto ds = dev(stream), dp = dev(pre_carry);
         c::DeviceBuffer<float> dl(logits.size());
         c::DeviceBuffer<d::ArgmaxCandidate> cand(R);
+        c::DeviceBuffer<std::uint8_t> argmax_partial(strix::head_argmax::workspace_bytes(R));
         c::A8Rows a{ws.take<std::int8_t>(std::size_t{R} * H), ws.take<float>(std::size_t{R} * H / 32U), ws.take<std::int32_t>(std::size_t{R} * H / 32U),
                     R, H, H};
         c::NormView v;
@@ -404,7 +406,7 @@ int main(int argc, char** argv) try {
         q.x = a;
         q.out = dl.get();
         c::enqueue_q8_0_a8(q, s);
-        c::enqueue_argmax({dl.get(), R, V, 0, 0, cand.get()}, s);
+        c::enqueue_argmax({dl.get(), R, V, 0, 0, cand.get(), argmax_partial.get()}, s);
         expect_bits("head logits", host(dl), logits);
         const auto got = cand.download();
         for (std::uint32_t r = 0; r < R; ++r) {

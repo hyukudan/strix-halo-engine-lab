@@ -350,6 +350,7 @@ int run(const Args& a,const b::ImageConfig& cfg) {
         b::StreamInputs input;input.T=1;input.H=a.height/16;input.W=a.width/16;input.text=text;input.cond_video=conditions;
         std::cout<<"{\"image_parallel\":\""<<(a.work.sequence?"sequence":"request")<<"\",\"rank\":"<<a.rank
                  <<",\"packed_tokens\":"<<L.seq_len<<",\"local_requests\":"<<a.work.requests.size()<<"}\n";
+        d::ForwardTables tables; // per-sigma tables; the layout-only rope is computed and uploaded once
         for(const auto request:a.work.requests) {
             if(sparse) forward.reset_accel_run();
             const auto output=request_output(a,request);
@@ -364,7 +365,8 @@ int run(const Args& a,const b::ImageConfig& cfg) {
                 const auto plan=b::ForwardPlan::build(L,sigma,tags,b::ImageConfig::plan_policy());
                 const b::PddContext pc{cfg.sigmas,sigma,1,1};b::StreamOutputs out;
                 if(rank) {
-                    auto f=rank->forward(L,plan,input,d::ForwardTables::build(g,L,plan),50,run_options,nullptr,&pc);
+                    tables.update(g,L,plan);
+                    auto f=rank->forward(L,plan,input,tables,50,run_options,nullptr,&pc);
                     if(comm) std::cerr<<"image pair request "<<request<<" step "<<step<<" rank "<<a.rank<<": "<<f.run.comm_stats<<'\n';
                     if(comm && run_options.timing) {
                         double blk=0,loc=0,ex=0,fin=0;

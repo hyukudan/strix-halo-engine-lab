@@ -84,6 +84,8 @@ struct FamilyMap {
     bool (*model)(const gguf::FileInfo&, Model&, std::string& error);
     std::uint64_t retained_array_elements;  // gguf::Limits::max_retained_array_elements the resolver needs
 };
+// Family tables (src/weight/adapters/<family>.cpp).
+[[nodiscard]] const FamilyMap& hy4_flash_map();
 // nullptr when no table describes the architecture.
 [[nodiscard]] const FamilyMap* find_family(std::string_view architecture);
 

@@ -1,6 +1,7 @@
 // Host reference of the two-node schedule (see host_dist.hpp).
 #include "h3/dist/host_dist.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <stdexcept>
@@ -16,11 +17,22 @@ using block::kNormEps;
 
 ForwardTables ForwardTables::build(const block::GlobalWeights& g, const block::PackedLayout& L, const block::ForwardPlan& p) {
     ForwardTables t;
-    t.t_emb = block::curve_t_emb(g, p.t_vals);
-    t.n_t = p.n_t();
-    t.rope = block::rope_table(block::rope_angles(L.position_ids, g.inv_freq));
-    t.mod_row = block::mod_row_of(p.mod_segments, L.seq_len);
+    t.update(g, L, p);
     return t;
+}
+
+void ForwardTables::update(const block::GlobalWeights& g, const block::PackedLayout& L, const block::ForwardPlan& p) {
+    t_emb = block::curve_t_emb(g, p.t_vals);
+    n_t = p.n_t();
+    // Vector == compares element values; a NaN position never matches, so it recomputes (never a stale table).
+    if (!rope_id || rope_pos != L.position_ids || rope_freq != g.inv_freq) {
+        static std::atomic<std::uint64_t> next_rope_id{0};
+        rope = block::rope_table(block::rope_angles(L.position_ids, g.inv_freq));
+        rope_pos = L.position_ids;
+        rope_freq = g.inv_freq;
+        rope_id = ++next_rope_id;
+    }
+    mod_row = block::mod_row_of(p.mod_segments, L.seq_len);
 }
 
 std::shared_ptr<const block::BlockWeights> SharedBlockSource::block(std::uint32_t i) {

@@ -10,6 +10,7 @@
 #include "strix/qwen_onfly_i4.hpp"
 #include "strix/qwen_allon.hpp"
 #include "hip_decode_options.hpp"
+#include "qwen_tiled_prompt_plan.hpp"
 #include "known_prefill_reservation.hpp"
 #include "strix/model_mapping_accounting.hpp"
 #include "qwen_moe_route_bf16.hpp"
@@ -1904,7 +1905,12 @@ inline EffectiveConfig resolve_effective_config(const RequestedOptions& request,
     if (o.http_serve && !o.baseline && o.prefix_cache && o.prefix_cache_host_bytes &&
         !o.prefix_cache_block_rows_explicit && o.known_prefix_prefill_rows >= 1024 &&
         o.known_prefix_prefill_rows % 1024 == 0) {
-        o.prefix_cache_block_rows = 1024;
+        // The single tiled-MTP route also keeps the row-class checkpoint at a prompt's class end
+        // (qwen_row_class_point), which must sit on the cache grid: its unit is the 128-row class grid
+        // (every 1024 and full-T boundary stays on it). STRIX_PREFIX_CACHE_ROW_CLASS=0 keeps 1024.
+        const bool row_class = !o.http_batch && o.mtp.enabled &&
+            !env_is(result.environment, "STRIX_PREFIX_CACHE_ROW_CLASS", "0");
+        o.prefix_cache_block_rows = row_class ? qwen_row_class_grid : 1024U;
         result.sources["--prefix-cache-block-rows"] = OptionSource::automatic;
     }
     return result;
@@ -2180,6 +2186,15 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     else out << "{\"rotary\":" << o.rotary.json() << ',';
     out << "\"weight_plans\":" << serve::Json(strix::weight::family_plan_notice(config.weight_plans)).dump() << ',';
     out << "\"profile\":" << o.product_profile.json() << ',';
+    if (o.mtp.copy_wide_auto || !o.mtp.copy_wide_rows.empty()) {
+        // The CLI and the server resolve the same sizes; the server uses them only while one request is live
+        // (mtp_wide_copy_rows_effective, STRIX_MTP_SERVE_WIDE=0 turns them off there).
+        std::string sizes;
+        for (const auto rows : o.mtp.copy_wide_rows) sizes += (sizes.empty() ? "" : ",") + std::to_string(rows);
+        out << "\"mtp_copy_wide\":{\"requested\":\"" << (o.mtp.copy_wide_auto ? "auto" : "explicit") << "\",\"rows\":\"" << sizes
+            << "\",\"serve\":\"lone request\",\"reason\":"
+            << serve::Json(o.mtp.copy_wide_auto ? o.mtp.copy_wide_reason : std::string("explicit sizes")).dump() << "},";
+    }
     if (!o.suppressed_yarn_request.empty())
         out << "\"suppressed_yarn_request\":\"" << yarn_json_error(o.suppressed_yarn_request) << "\",";
     // YaRN preflight can verify a drop before device setup. Native inspection

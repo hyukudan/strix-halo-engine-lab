@@ -134,13 +134,21 @@ inline void apply(const cp::Choice& choice, qp::Config& config) {
     config.defer_prompt_mtp = config.defer_prompt_mtp || choice.mtp_defer_prompt;
     // Config::expert_decode_tile (exact schedule trait): the lever row `expert_decode_tile` (on unless switched off).
     config.expert_decode_tile = config.expert_decode_tile && choice.expert_decode_tile;
-    // TURBO / FAST expert rows: an explicit --expert-arithmetic other than incumbent keeps its own contract.
-    if (choice.expert_turbo && choice.expert_fast)
-        throw std::invalid_argument("--expert-turbo and --expert-fast select different expert arithmetics; set one");
-    if (choice.expert_turbo && config.expert_arithmetic == qwen_packs::ExpertArithmetic::incumbent)
-        config.expert_arithmetic = qwen_packs::ExpertArithmetic::gsq_i8_turbo;
-    if (choice.expert_fast && config.expert_arithmetic == qwen_packs::ExpertArithmetic::incumbent)
-        config.expert_arithmetic = qwen_packs::ExpertArithmetic::gsq_bf16_mma;
+    // TURBO / FAST expert rows: an explicit --expert-arithmetic other than incumbent keeps its own contract (every MoE call).
+    // expert_turbo runs the int8 experts in its regime (expert_turbo_rows: prefill blocks of >= N rows); every other MoE
+    // call keeps the arithmetic the run has without it (expert_fast: the BF16 FAST experts, else the pack's own), so
+    // TURBO = FAST + int8 experts where they win. expert_turbo_rows off: int8 in every MoE call.
+    if (config.expert_arithmetic != qwen_packs::ExpertArithmetic::incumbent) return;
+    const auto narrow = choice.expert_fast ? qwen_packs::ExpertArithmetic::gsq_bf16_mma : qwen_packs::ExpertArithmetic::incumbent;
+    if (!choice.expert_turbo) {
+        config.expert_arithmetic = narrow;
+        return;
+    }
+    config.expert_arithmetic = qwen_packs::ExpertArithmetic::gsq_i8_turbo;
+    if (choice.expert_turbo_rows) {
+        config.expert_narrow = narrow;
+        config.expert_regime_min_rows = *choice.expert_turbo_rows;
+    }
 }
 
 inline qp::Config resolve_route(qp::Config config, const pr::Lookup& lookup = {}) {
@@ -158,6 +166,19 @@ inline qp::Config resolve_route(qp::Config config, const pr::Lookup& lookup = {}
 inline std::string with_expert_arithmetic(std::string contract, qwen_packs::ExpertArithmetic expert) {
     if (expert != qwen_packs::ExpertArithmetic::incumbent) contract += "+" + std::string(qwen_packs::expert_arithmetic_name(expert));
     return contract;
+}
+// The per-regime expert rule (Config::expert_narrow set) as a stable string, e.g.
+// "prefill_rows>=512:gsq-iq-i8mma-turbo-cuda-v1,else:gsq-iq-bf16mma-cuda-v1"; empty without a split.
+inline std::string expert_regime(const qp::Config& c) {
+    if (!c.expert_narrow) return {};
+    return "prefill_rows>=" + std::to_string(c.expert_regime_min_rows) + ":" +
+        std::string(qwen_packs::expert_arithmetic_name(c.expert_arithmetic)) + ",else:" +
+        std::string(qwen_packs::expert_arithmetic_name(*c.expert_narrow));
+}
+// Contract of a resolved config: without a split, the historical bytes; with one, the rule in brackets.
+inline std::string with_expert_arithmetic(std::string contract, const qp::Config& c) {
+    if (!c.expert_narrow) return with_expert_arithmetic(std::move(contract), c.expert_arithmetic);
+    return contract + "+experts[" + expert_regime(c) + "]";
 }
 
 inline Resolved resolve(const Request& r, Entry entry, std::string_view default_model = {}) {
@@ -194,7 +215,7 @@ inline Resolved resolve(const Request& r, Entry entry, std::string_view default_
         if(c.forms.moe_mma) throw std::invalid_argument(name+": single-chain moe_mma composition unqualified; use --moe-mma off");
         if(c.route_policy->enabled) throw std::invalid_argument(name+": native IQ RouteBF16 composition unqualified");
     }
-    out.contract = with_expert_arithmetic(cp::arithmetic_contract(out.choice), c.expert_arithmetic);
+    out.contract = with_expert_arithmetic(cp::arithmetic_contract(out.choice), c);
     const auto name = [&](std::string n, std::string v, std::string why) { out.differences.push_back({std::move(n), std::move(v), std::move(why)}); };
     if (entry == Entry::serve) {
         if (r.release_by_layer.value_or(false))
@@ -255,6 +276,13 @@ inline ::strix::serve::Json forms_json(const qwen_prefill::Config::Forms& f, boo
     return forms;
 }
 
+// Whether the resolved run IS the TURBO bundle (cp::kTurboBundle), from the effective values of either entry.
+inline cp::BundleStatus turbo_bundle(const Resolved& r) {
+    return cp::turbo_bundle_status(r.choice, r.config.expert_arithmetic == qwen_packs::ExpertArithmetic::gsq_i8_turbo,
+                                   r.config.expert_narrow == qwen_packs::ExpertArithmetic::gsq_bf16_mma,
+                                   !r.config.turbo_onfly_nvfp4);
+}
+
 inline std::string effective_config_json(const Resolved& r) {
     using J = ::strix::serve::Json;
     const auto& c = r.config;
@@ -263,6 +291,14 @@ inline std::string effective_config_json(const Resolved& r) {
     out.set("profile", J(pr::name(r.resolution.profile)));
     out.set("arithmetic_contract", J(r.contract));
     out.set("expert_arithmetic",J(std::string(qwen_packs::expert_arithmetic_name(c.expert_arithmetic))));
+    if (c.expert_narrow) {  // per-regime experts (TURBO): absent otherwise, so exact/fast receipts keep their bytes
+        auto regime = J::object();
+        regime.set("prefill_blocks_min_rows", J(static_cast<std::uint64_t>(c.expert_regime_min_rows)));
+        regime.set("prefill_blocks", J(std::string(qwen_packs::expert_arithmetic_name(c.expert_arithmetic))));
+        regime.set("windows_and_smaller_blocks", J(std::string(qwen_packs::expert_arithmetic_name(*c.expert_narrow))));
+        regime.set("rule", J(expert_regime(c)));
+        out.set("expert_regime", std::move(regime));
+    }
     out.set("forms", forms_json(c.forms, c.moe_route_bf16.value_or(false)));
     auto route = J::object();
     route.set("requested", J(c.route_policy->requested));
@@ -284,6 +320,14 @@ inline std::string effective_config_json(const Resolved& r) {
         fb.set("id", J(bundle.id.empty() ? std::string("none") : bundle.id));
         fb.set("detail", J(bundle.detail));
         out.set("fast_bundle", std::move(fb));
+    }
+    // TURBO bundle (kTurboBundle): under --profile turbo, or whenever the effective values are the bundle; absent otherwise.
+    const auto tbundle = turbo_bundle(r);
+    if (r.resolution.is_turbo() || !tbundle.id.empty()) {
+        auto tb = J::object();
+        tb.set("id", J(tbundle.id.empty() ? std::string("none") : tbundle.id));
+        tb.set("detail", J(tbundle.detail));
+        out.set("turbo_bundle", std::move(tb));
     }
     out.set("form_identities", J(cp::form_identities(r.choice)));
     out.set("resolution", ::strix::serve::parse_json(r.resolution.json()));
@@ -341,7 +385,7 @@ inline cp::Choice choice_of(const qp::Config& c) {
 }
 // Resolved::contract recomputed from a resolved Config (a running service holds only the Config).
 inline std::string config_arithmetic_contract(const qp::Config& c) {
-    return with_expert_arithmetic(cp::arithmetic_contract(choice_of(c)), c.expert_arithmetic);
+    return with_expert_arithmetic(cp::arithmetic_contract(choice_of(c)), c);
 }
 // Routed-expert arithmetic classes the loaded engine MAY dispatch (qwen_moe enqueue_routed), from load-time facts only.
 // native_experts (Prefill::native_experts) is true when ANY layer has native expert types: it proves the native IQ FP32
@@ -379,6 +423,7 @@ inline ::strix::serve::Json expert_dispatch_json(const qp::Config& c, std::strin
     out.set("layer_mix", J(std::string(native_experts ? "unknown" : "a8-route-only")));
     out.set("executed_class", J(std::string("not-observed")));
     out.set("declared_expert_arithmetic", J(std::string(qwen_packs::expert_arithmetic_name(c.expert_arithmetic))));
+    if (c.expert_narrow) out.set("declared_expert_regime", J(expert_regime(c)));
     out.set("declared_moe_mma", J(c.forms.moe_mma));
     out.set("declared_contract", J(config_arithmetic_contract(c)));
     auto source = J::object();
@@ -422,6 +467,10 @@ inline ::strix::cuda::qwen_route::Identity numerical_identity(const qp::Config& 
         id.prefill="cuda-qwen-gsq-i8turbo-prefill-v1";
         id.hash=route::hash_part(id.hash,qwen_packs::gsq_i8_turbo_contract);
     }
+    if(c.expert_narrow) {  // per-regime experts: the prefill state depends on the rule (block rows decide the arithmetic)
+        id.prefill="cuda-qwen-gsq-expert-regime-prefill-v1";
+        id.hash=route::hash_part(id.hash,expert_regime(c));
+    }
     return id;
 }
 // Hand-off producer id: the exact CUDA path keeps its historical id bytes; a FAST arithmetic folds its contract in, so an
@@ -434,6 +483,7 @@ inline std::uint64_t handoff_numerical_id_config(std::string_view exact_name,con
     if(config.expert_arithmetic==qwen_packs::ExpertArithmetic::incumbent)
         return handoff_numerical_id(exact_name,choice_of(config));
     return fnv64(std::string(exact_name)+"|"+cp::arithmetic_contract(choice_of(config))+"|"+
-                 cp::form_identities(choice_of(config))+"|"+std::string(qwen_packs::expert_arithmetic_name(config.expert_arithmetic)));
+                 cp::form_identities(choice_of(config))+"|"+(config.expert_narrow?expert_regime(config):
+                 std::string(qwen_packs::expert_arithmetic_name(config.expert_arithmetic))));
 }
 }  // namespace strix::cuda::qwen_options

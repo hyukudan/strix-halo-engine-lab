@@ -12,6 +12,10 @@
 #if defined(STRIX_RP_MINIMAX)
 #include "strix/minimax_moe.hpp"
 #endif
+#if defined(STRIX_RP_HY4)
+#include "hy4/ref/hy4_host_ref.hpp"
+#include "strix/hy4/presets.hpp"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -303,8 +307,36 @@ void pin(const char* name, const Digest& d, std::uint64_t expected) {
 
 }  // namespace
 
+#if defined(STRIX_RP_HY4)
+// strix::hy4::preset::route through the shared oracle == the Hy4-flash CPU oracle's router (src/hy4/ref route: stable sort on
+// score + bias, ids ascending, ascending sum): ids and weight bits, including rows with many tied keys.
+void hy4_oracle_compare() {
+    const RoutePolicy p = strix::hy4::preset::route;
+    Lcg g{17};
+    bool ok = true;
+    for (int row = 0; row < 64; ++row) {
+        auto z = logits(g, p.experts);
+        auto b = biases(g, p.experts);
+        if (row % 4 == 0)
+            for (std::size_t e = 0; e < z.size(); ++e) {  // coarse logits, no bias: ties at the cut
+                z[e] = static_cast<float>(static_cast<int>(z[e] * 2.0F)) * 0.5F;
+                b[e] = 0.0F;
+            }
+        std::vector<float> s(p.experts);
+        route_scores_ref<Ds41Math>(p.score, z, s);
+        const Row r = oracle(p, s, b);
+        const auto ref = strix::hy4::route(z, b, p.top_k, p.scale);
+        ok = ok && ref.ids.size() == p.top_k && same(r, ref.ids.data(), ref.weights.data());
+    }
+    check(ok, "hy4: shared oracle (strix::hy4::preset::route) = Hy4 CPU oracle route ids and weight bits");
+}
+#endif
+
 int main() {
     modelb_top16();
+#if defined(STRIX_RP_HY4)
+    hy4_oracle_compare();
+#endif
     ties_and_keys();
     clamp_trait();
     Digest ds41;

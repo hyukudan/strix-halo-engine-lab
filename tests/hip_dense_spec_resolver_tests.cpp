@@ -90,8 +90,13 @@ int main() {
     // --cost-kv: the shared context cost switch (spec::set_context_cost), default online.
     RC_CHECK(d.cost_kv == "auto" && parse({"--cost-kv", "online"}).cost_kv == "online" && parse({"--cost-kv", "off"}).cost_kv == "off" && parse({"--cost-kv", "0.3"}).cost_kv == "0.3",
              "--cost-kv parsed");
+    RC_CHECK(parse({"--spec-costs", "calibrated"}).costs_explicit && !parse({"--mtp", "off"}).costs_explicit,
+             "an explicit --spec-costs is recorded (exact TP decode refuses an explicit non-table choice)");
+    // --chain-feed: the MTP chain's device feed (default) or one synchronizing read per position (A/B; ids bitwise either way).
+    RC_CHECK(d.chain_feed_device && parse({"--chain-feed", "device"}).chain_feed_device && !parse({"--chain-feed", "host"}).chain_feed_device,
+             "--chain-feed parsed");
     for (const auto& bad : std::vector<std::vector<std::string>>{{"--draft-rows", "yes"}, {"--spec-costs", "auto"}, {"--mtp"},
-                                                                 {"--cost-kv", "maybe"}, {"--cost-kv", "-1"}}) {
+                                                                 {"--cost-kv", "maybe"}, {"--cost-kv", "-1"}, {"--chain-feed", "on"}}) {
         bool threw = false;
         try { (void)parse(bad); } catch (const std::invalid_argument&) { threw = true; }
         RC_CHECK(threw, "%s %s must be refused", bad[0].c_str(), bad.size() > 1 ? bad[1].c_str() : "");
@@ -102,6 +107,8 @@ int main() {
     const auto pm = q::resolve_hip_dense_spec("with-mtp.gguf", d, false, has);
     RC_CHECK(pm.mtp_source == "with-mtp.gguf" && pm.mtp_reason == "model" && pm.draft_rows, "auto + layer = model");
     RC_CHECK(q::resolve_hip_dense_spec("plain.gguf", d, false, has).mtp_reason == "absent", "auto without layer = absent");
+    RC_CHECK(pm.device_feed && !q::resolve_hip_dense_spec("with-mtp.gguf", parse({"--chain-feed", "host"}), false, has).device_feed,
+             "plan.device_feed follows --chain-feed (default device)");
     const auto plain = q::resolve_hip_dense_spec("with-mtp.gguf", d, true, has);
     RC_CHECK(plain.mtp_source.empty() && plain.mtp_reason == "off" && !plain.draft_rows, "every-logit runs are plain");
     auto fa = d;
@@ -177,7 +184,7 @@ int main() {
         const std::string src = read(root + app);
         for (const char* need : {"parse_hip_dense_spec_arg(a, next, spec_args)", "resolve_hip_dense_spec(model, spec_args",
                                  "hip_dense_measure_costs(*E, plan.costs", "hip_dense_block_config(plan, head_fraction,",
-                                 "hip_dense_seed_verify(drafter, bc.max_block, bc.fixed_costs,"})
+                                 "hip_dense_seed_verify(drafter, bc.max_block, bc.fixed_costs,", "set_device_feed(plan.device_feed)"})
             RC_CHECK(src.find(need) != std::string::npos, "%s: missing shared call %s", app, need);
         for (const char* banned : {"a == \"--draft-rows\"", "a == \"--spec-costs\"", "a == \"--draft-pack\"", "sp::BlockConfig bc;",
                                    "drafter.seed_verify_ms("})

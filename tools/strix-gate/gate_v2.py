@@ -5,7 +5,11 @@ Limits are the FAST gate's (KL <= 0.02, top-1 >= 0.93, dNLL <= 0.01), applied po
 that the reference's own chaos is not charged to the lever:
   R1 MoE engines: the lever arm replays the reference's expert routes (ids and weights); the route flip rate of the
      free-running lever arm, over the free-running null arm's, must be <= 1.5 (reported per window and pooled).
-  R2 per window: KL <= max(0.02, 1.5 x the null arm's KL on that window); the pooled KL limit stays 0.02.
+  R2 per window: KL <= max(0.02, 1.5 x the null arm's KL on that window).
+  Null floor (pooled bars only): a pooled bar whose pooled null (same windows, row-weighted mean of the null arms) fails
+     it, or lies within 2 of its own row se of failing it, is judged relative to that null and only relaxed:
+     KL <= max(0.02, null + 0.02), top-1 >= min(0.93, null - 0.01), dNLL <= max(0.01, null + 0.01). Printed on its own
+     NULL-FLOOR line (JSON pooled.null_floor), with the bars that pass only under the floor.
      Top-1 and dNLL per window are three-state (one-sided, z = 2): PASS at disagreement <= L, FAIL above
      L + z x sqrt(L (1 - L) / rows), UNRESOLVED between, with L = max(0.07, 1.5 x the null arm's disagreement); dNLL
      PASS at <= 0.01, FAIL above 0.01 + z x se, UNRESOLVED between, se capped at 1.5 x the null's se on that window.
@@ -41,7 +45,8 @@ import sys
 import numpy as np
 
 LIMITS = {"max_kl": 0.02, "min_top1": 0.93, "max_dnll": 0.01, "null_factor": 1.5, "max_flip_ratio": 1.5, "min_rows": 800,
-          "window_z": 2.0, "suspect_z": 3.0, "se_null_cap": 1.5, "ref_nll_factor": 3.0, "ref_nll_margin": 2.0}
+          "window_z": 2.0, "suspect_z": 3.0, "se_null_cap": 1.5, "ref_nll_factor": 3.0, "ref_nll_margin": 2.0,
+          "floor_z": 2.0, "floor_kl_margin": 0.02, "floor_top1_margin": 0.01, "floor_dnll_margin": 0.01}
 EXIT = {"PASS": 0, "FAIL": 1, "UNRESOLVED": 3, "HOLD": 4}
 ROUTE_MAGIC = b"STXROUT1"
 RECEIPT = re.compile(rb"^strix-route-file/v1 (\{.*\})\s*$", re.M)
@@ -98,12 +103,13 @@ def _judge(kl, agree, d, null_kl, null_dis, null_d, limits):
 
 
 def window_stats(name, kl, agree, nll_ref, nll_cand, null_kls, hit_ref=None, hit_cand=None, limits=LIMITS, null_top1s=None,
-                 null_nlls=None, cls=None):
+                 null_nlls=None, cls=None, null_kl_rows=None):
     """One window: R2 KL limit relative to this window's null; top-1 and dNLL PASS / UNRESOLVED / FAIL on its rows; R4.
 
     null_top1s: the null arms' top-1 agreement on this window (None: the null-relative top-1 term is absent).
     null_nlls: the null arms' per-row NLL on the same labels (the first is used: se cap and the paired reference check).
-    cls: the window's content class, declared before scoring (None: one class for the whole gate set)."""
+    cls: the window's content class, declared before scoring (None: one class for the whole gate set).
+    null_kl_rows: the first null arm's per-row KL on this window (None: the pooled null-floor KL has no se term)."""
     kl, agree = np.asarray(kl, np.float64), np.asarray(agree, bool)
     nll_ref = np.asarray(nll_ref, np.float64)
     nll_cand = np.asarray(nll_cand, np.float64)
@@ -124,6 +130,10 @@ def window_stats(name, kl, agree, nll_ref, nll_cand, null_kls, hit_ref=None, hit
         if null_nll.shape != nll_ref.shape or not np.isfinite(null_nll).all():
             raise GateError(f"{name}: invalid or unpaired null NLL rows")
         null_d = null_nll - nll_ref
+    if null_kl_rows is not None:
+        null_kl_rows = np.asarray(null_kl_rows, np.float64)
+        if null_kl_rows.shape != kl.shape or not np.isfinite(null_kl_rows).all():
+            raise GateError(f"{name}: invalid or unpaired null KL rows")
     w = {"name": name, "class": cls or "all", "rows": int(kl.size), "dnll_rows": int(d.size),
          "ref_nll": float(nll_ref.mean())}
     w.update(_judge(kl, agree, d, null_kl, null_dis, null_d, limits))
@@ -137,6 +147,10 @@ def window_stats(name, kl, agree, nll_ref, nll_cand, null_kls, hit_ref=None, hit
     w["_rows"] = {"kl": kl, "agree": agree, "dnll": d}
     if null_d is not None:
         w["_rows"]["null_dnll"] = null_d
+    if null_kl_rows is not None:
+        w["_rows"]["null_kl"] = null_kl_rows
+    if null_nlls:   # every null's mean dNLL (the pooled null floor uses their mean, like the null KL)
+        w["null_dnll_mean"] = float(np.mean([np.mean(np.asarray(x, np.float64) - nll_ref) for x in null_nlls]))
     return w
 
 
@@ -222,7 +236,7 @@ def check_replay(ref_receipt, arm_receipt, ref_file, what, null=False):
             "null": arm_receipt.get("null")}
 
 
-def verdict(windows, flips=None, limits=LIMITS):
+def verdict(windows, flips=None, limits=LIMITS, allow_null_floor=False):
     """Pooled + per-window verdict. windows: window_stats dicts with their per-row arrays under '_rows'."""
     if len({w["name"] for w in windows}) != len(windows):
         raise GateError("duplicate window in pooled evidence")
@@ -235,8 +249,11 @@ def verdict(windows, flips=None, limits=LIMITS):
               "dnll": dnll, "dnll_se": se, "held_out": held}
     if d.size < limits["min_rows"]:
         raise GateError(f"{d.size} scored dNLL rows pooled, v2 needs at least {limits['min_rows']} (se {se:.4f})")
-    checks = {"kl": pooled["kl"] <= limits["max_kl"], "top1": pooled["top1"] >= limits["min_top1"],
-              "dnll": dnll <= limits["max_dnll"], "windows": all(w["state"] != "fail" for w in windows)}
+    floor = null_floor(windows, pooled, limits)
+    pooled["null_floor"] = floor
+    floor["enabled"] = bool(allow_null_floor)
+    checks = {b: floor[b]["pass"] if allow_null_floor else floor[b]["absolute_pass"] for b in FLOOR_BARS}
+    checks["windows"] = all(w["state"] != "fail" for w in windows)
     pooled["classes"] = class_verdicts(windows, limits)
     final_pass = {c["name"] for c in pooled["classes"] if c["final"] and c["state"] == "pass"}
     for w in windows:
@@ -265,6 +282,68 @@ def verdict(windows, flips=None, limits=LIMITS):
         pooled["state"] = "PASS"
     pooled["pass"] = pooled["state"] == "PASS"
     return pooled
+
+
+FLOOR_BARS = ("kl", "top1", "dnll")
+
+
+def null_floor(windows, pooled, limits=LIMITS):
+    """Null-floor rule for the POOLED bars, judged against the pooled null of the same windows (row-weighted).
+
+    A bar is engaged when the pooled null fails it or lies within floor_z of its own row se of failing it (the null is
+    not measurably inside the bar). An engaged bar only relaxes: KL <= max(0.02, null + 0.02), top-1 >= min(0.93,
+    null - 0.01), dNLL <= max(0.01, null + 0.01). Without the null's evidence for a bar (no per-window null top-1 / null
+    NLL rows) that bar stays absolute. The pooled null is the mean of the null arms; its se comes from the first null's
+    rows (KL without per-row null KL: se 0)."""
+    rows = np.array([w["rows"] for w in windows], np.float64)
+    z = limits["floor_z"]
+    out = {"z": z}
+    nk = float(np.dot(rows, [w["null_kl"] for w in windows]) / rows.sum())
+    kr = [w["_rows"].get("null_kl") for w in windows]
+    nk_se = mean_se(np.concatenate(kr))[1] if all(x is not None for x in kr) else None
+    nt = nt_se = None
+    if all("null_top1" in w for w in windows):
+        nt = float(np.dot(rows, [w["null_top1"] for w in windows]) / rows.sum())
+        nt_se = math.sqrt(nt * (1.0 - nt) / rows.sum())
+    nd = nd_se = None
+    if all("null_dnll" in w["_rows"] for w in windows):
+        nd_se = mean_se(np.concatenate([w["_rows"]["null_dnll"] for w in windows]))[1]
+        drows = np.array([w["dnll_rows"] for w in windows], np.float64)
+        nd = float(np.dot(drows, [w["null_dnll_mean"] for w in windows]) / drows.sum())
+    for b, value, absl, null, se, margin, sign in (
+            ("kl", pooled["kl"], limits["max_kl"], nk, nk_se, limits["floor_kl_margin"], 1.0),
+            ("top1", pooled["top1"], limits["min_top1"], nt, nt_se, limits["floor_top1_margin"], -1.0),
+            ("dnll", pooled["dnll"], limits["max_dnll"], nd, nd_se, limits["floor_dnll_margin"], 1.0)):
+        # sign +1: lower is better (value <= limit); -1: higher is better (value >= limit)
+        engaged = null is not None and sign * (null + sign * z * (se or 0.0) - absl) > 0.0
+        limit = absl
+        if engaged:
+            limit = max(absl, null + margin) if sign > 0 else min(absl, null - margin)
+        out[b] = {"value": value, "absolute": absl, "null": null, "null_se": se, "margin": margin, "engaged": engaged,
+                  "limit": limit, "relaxed": limit != absl, "pass": bool(sign * (limit - value) >= 0.0),
+                  "absolute_pass": bool(sign * (absl - value) >= 0.0)}
+    out["applied"] = [b for b in FLOOR_BARS if out[b]["relaxed"]]
+    out["decisive"] = [b for b in out["applied"] if out[b]["pass"] and not out[b]["absolute_pass"]]
+    return out
+
+
+def floor_line(p):
+    """The separate NULL-FLOOR verdict line: every pooled bar, its pooled null, engaged or not, the limit used."""
+    f = p["null_floor"]
+    parts = []
+    for b in FLOOR_BARS:
+        x = f[b]
+        nul = "null n/a" if x["null"] is None else (
+            f"null {x['null']:.5f}" + (f" se {x['null_se']:.5f}" if x["null_se"] is not None else " se n/a"))
+        op = ">=" if b == "top1" else "<="
+        lim = (f"limit {x['limit']:.5f} = null {'-' if b == 'top1' else '+'} {x['margin']:g}" if x["relaxed"] else
+               f"limit {x['absolute']:g} absolute{' (engaged, relax-only)' if x['engaged'] else ''}")
+        parts.append(f"{b} {x['value']:.5f} {op} {lim}, {nul} -> {'pass' if x['pass'] else 'FAIL'}")
+    tail = ("not applied (every pooled null measurably inside its bar)" if not f["applied"] else
+            f"applied to {','.join(f['applied'])}" + (f"; these pooled bars pass ONLY under the floor: {','.join(f['decisive'])}"
+                                                      if f["decisive"] else ""))
+    policy = "enabled by explicit opt-in" if f["enabled"] else "ADVISORY ONLY; absolute pooled limits govern PASS/FAIL"
+    return f"NULL-FLOOR ({policy}; pooled null of the same windows, z {f['z']:g}): " + "; ".join(parts) + f" -> {tail}"
 
 
 def class_verdicts(windows, limits=LIMITS):
@@ -339,8 +418,11 @@ def pooled_line(p):
                ("off-distribution reference " + ",".join(p.get("off_distribution", []))) if p.get("off_distribution") else "")
                if x) + " (examine the exact path on those windows, then re-run)", "PASS": ""}[p["state"]]
     lines = [class_line(c) for c in p.get("classes", [])]
-    lines.append(f"POOLED v2 rows {p['rows']} (dNLL rows {p['dnll_rows']}, >= {LIMITS['min_rows']}): KL {p['kl']:.5f} (<= 0.02) "
-                 f"top-1 {p['top1']:.4f} dNLL {p['dnll']:+.5f} se {p['dnll_se']:.5f}{fl} -> {p['state']}"
+    lines.append(floor_line(p))
+    lim = {b: p["null_floor"][b]["limit" if p["null_floor"]["enabled"] else "absolute"] for b in FLOOR_BARS}
+    lines.append(f"POOLED v2 rows {p['rows']} (dNLL rows {p['dnll_rows']}, >= {LIMITS['min_rows']}): KL {p['kl']:.5f} "
+                 f"(<= {lim['kl']:.5g}) top-1 {p['top1']:.4f} (>= {lim['top1']:.5g}) dNLL {p['dnll']:+.5f} (<= "
+                 f"{lim['dnll']:+.5g}) se {p['dnll_se']:.5f}{fl} -> {p['state']}"
                  + (f" {why}" if why else ""))
     return "\n".join(lines)
 
@@ -441,7 +523,7 @@ def qual(a):
         w = window_stats(case, ra["kl_rc"], ra["agree"].astype(bool), ra["nll_r"], ra["nll_c"],
                          [float(x["kl_rc"].mean()) for x in nulls], ra["top1_r_is_label"], ra["top1_c_is_label"],
                          null_top1s=[float(x["agree"].mean()) for x in nulls], null_nlls=[x["nll_c"] for x in nulls],
-                         cls=window_class(case, classes, manifest))
+                         cls=window_class(case, classes, manifest), null_kl_rows=nulls[0]["kl_rc"])
         moe = route(a.ref).exists()
         f = None
         if moe:
@@ -479,7 +561,7 @@ def qual(a):
     if traced and not replay:
         print(f"R1: no route tap: every arm ran free, so KL / top-1 / dNLL include route flips; flips from the engine trace "
               f"on {traced} of {len(windows)} windows (slots = prompt rows x traced layers)")
-    p = verdict(windows, flips if flips else None)
+    p = verdict(windows, flips if flips else None, allow_null_floor=getattr(a, 'allow_null_floor', False))
     print(pooled_line(p))
     if a.json:
         doc = {"schema": "strix-fast-gate-v2/v1", "limits": LIMITS, "ref": a.ref, "cand": a.cand, "null": a.null,
@@ -523,6 +605,7 @@ def main(argv=None):
     q.add_argument("--classes", help="JSON {case: content class} declared before scoring (default: prompt-length band "
                    "with --manifest, else one class)")
     q.add_argument("--json")
+    q.add_argument("--allow-null-floor", action="store_true", help="explicitly opt in to relaxed pooled acceptance bars; default keeps absolute FAST limits")
     a = ap.parse_args(argv)
     try:
         return qual(a)
