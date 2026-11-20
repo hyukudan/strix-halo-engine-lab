@@ -5,10 +5,12 @@
 //                      (only addresses change; every arm computes the same chains on the same kind of operands);
 //   batched vs tall  : the same MACs as one product with all heads stacked as rows (one weight, same K and outputs);
 //   control shapes   : wide-K launches of the same core (stride 2^k vs padded).
-// Operand values are a fixed finite pattern (timing does not depend on them; outputs are not checked).
+// Operand values: a fixed finite pattern, or (rand) fixed-seed full-mantissa values; the output bits are hashed per arm.
 // Build: hipcc -std=c++20 -O3 --offload-arch=gfx1151 -Iinclude -Isrc tools/hip_q8a8_shape_probe.hip -o q8a8_shape_probe
-// Run:   q8a8_shape_probe [seconds per arm, default 0.4] [rows, default 2048]
-// Output: one line per arm: "arm <name> ms <per launch> tf <rate> launches <n>"; nothing names a model.
+// Run:   q8a8_shape_probe [seconds per arm, default 0.4] [rows, default 2048] [layout (default) | dense] [const | rand]
+//        dense = one product per arm at prefill projection widths; rand = full-mantissa operands, fixed seed
+// Output: one line per arm: "arm <name> ms <per launch> tf <rate> launches <n> bits <hash of the output>"; nothing names
+// a model.
 #include "core/f16_dense_q8a8.hpp"
 
 #include <hip/hip_runtime.h>
@@ -18,6 +20,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
+#include <span>
+#include <string>
+#include <vector>
 
 #define CK(x)                                                                                   \
     do {                                                                                        \
@@ -109,8 +115,14 @@ void run(const Shape& s, const Buffers& buf, double secs) {
     float ms = 0.0F;
     CK(hipEventElapsedTime(&ms, e0, e1));
     const double per = static_cast<double>(ms) / static_cast<double>(n);
-    std::printf("arm %s ms %.3f tf %.2f launches %d window %.3f-%.3f\n", s.name, per, 2.0 * macs / (per * 1e-3) / 1e12, n, t0,
-                now_s());
+    // Output bits (FNV-1a over the arm's output extent after the timed launches; accumulate is off, so every launch
+    // writes the same values): equal lines across two builds = the same bits for this shape and data.
+    std::vector<std::uint32_t> host(out_extent(s));
+    CK(hipMemcpy(host.data(), buf.out, host.size() * 4U, hipMemcpyDeviceToHost));
+    std::uint64_t h = 1469598103934665603ULL;
+    for (const std::uint32_t w : host) h = (h ^ w) * 1099511628211ULL;
+    std::printf("arm %s ms %.3f tf %.2f launches %d bits %016llx window %.3f-%.3f\n", s.name, per,
+                2.0 * macs / (per * 1e-3) / 1e12, n, static_cast<unsigned long long>(h), t0, now_s());
     std::fflush(stdout);
     CK(hipEventDestroy(e0));
     CK(hipEventDestroy(e1));
@@ -120,8 +132,10 @@ void run(const Shape& s, const Buffers& buf, double secs) {
 int main(int argc, char** argv) {
     const double secs = argc > 1 ? std::atof(argv[1]) : 0.4;
     const std::uint32_t R = argc > 2 ? static_cast<std::uint32_t>(std::atoi(argv[2])) : 2048U;
-    if (R == 0U || R > 4096U || secs <= 0.0 || secs > 5.0) {
-        std::fprintf(stderr, "usage: q8a8_shape_probe [seconds 0-5] [rows 1-4096]\n");
+    const std::string set = argc > 3 ? argv[3] : "layout", data = argc > 4 ? argv[4] : "const";
+    if (R == 0U || R > 4096U || secs <= 0.0 || secs > 5.0 || (set != "layout" && set != "dense") ||
+        (data != "const" && data != "rand")) {
+        std::fprintf(stderr, "usage: q8a8_shape_probe [seconds 0-5] [rows 1-4096] [layout|dense] [const|rand]\n");
         return 1;
     }
     // Head-batched products: 64 heads, K_b form (256 padded K -> 512 outputs, row = 576 floats per head) and V_b form
@@ -141,8 +155,25 @@ int main(int argc, char** argv) {
         {"wide_o_pad", R, 16384U, 3072U, 16384U + 128U, 3072U, 1U, 0U, 0U},
         {"wide_gate", R, 3072U, 16384U, 3072U, 16384U, 1U, 0U, 0U},
     };
+    // Dense set: one product per arm at the widths of a 3072-wide MLA model with 1024 / 512 low-rank projections,
+    // 64 x 256 gated heads and 1536-wide routed latents (operand pitch of strix/a8_row_pitch.hpp for 4096-byte
+    // multiples), plus the head-batched K_b / V_b products at their padded layout.
+    const Shape dense[] = {
+        {"d_3072_16384", R, 3072U, 16384U, 3072U, 16384U, 1U, 0U, 0U},
+        {"d_3072_1024", R, 3072U, 1024U, 3072U, 1024U, 1U, 0U, 0U},
+        {"d_1024_16384", R, 1024U, 16384U, 1024U, 16384U, 1U, 0U, 0U},
+        {"d_3072_576", R, 3072U, 576U, 3072U, 576U, 1U, 0U, 0U},
+        {"d_16384_3072", R, 16384U, 3072U, 16384U + 128U, 3072U, 1U, 0U, 0U},
+        {"d_13824_3072", R, 13824U, 3072U, 13824U, 3072U, 1U, 0U, 0U},
+        {"d_3072_1536", R, 3072U, 1536U, 3072U, 1536U, 1U, 0U, 0U},
+        {"d_1536_3072", R, 1536U, 3072U, 1536U, 3072U, 1U, 0U, 0U},
+        {"kb_pad", R, 256U, 512U, H * 256U + 128U, H * 576U + 32U, H, 256U, 576U},
+        {"vb_pad", R, 512U, 256U, H * 512U + 128U, H * 256U + 32U, H, 512U, 256U},
+    };
+    const Shape* first = set == "dense" ? dense : shapes;
+    const std::size_t arms = set == "dense" ? std::size(dense) : std::size(shapes);
     Buffers buf;
-    for (const Shape& s : shapes) {
+    for (const Shape& s : std::span<const Shape>(first, arms)) {
         buf.codes_bytes = std::max(buf.codes_bytes, codes_extent(s));
         buf.delta_floats = std::max(buf.delta_floats, delta_extent(s));
         buf.out_floats = std::max(buf.out_floats, out_extent(s));
@@ -157,10 +188,30 @@ int main(int argc, char** argv) {
     CK(hipMemset(buf.codes, 0x11, buf.codes_bytes));
     CK(hipMemset(buf.deltas, 0x3a, buf.delta_floats * 4U));
     CK(hipMemset(buf.out, 0, buf.out_floats * 4U));
+    if (data == "rand") {  // full-mantissa operands (the sustained clock depends on the operand bits): fixed seed
+        std::uint64_t st = 0x9e3779b97f4a7c15ULL;
+        const auto next = [&st] {
+            st ^= st << 13U, st ^= st >> 7U, st ^= st << 17U;
+            return st;
+        };
+        std::vector<std::uint8_t> w(buf.weight_bytes);
+        for (std::size_t b = 0; b + 34U <= w.size(); b += 34U) {  // Q8_0 blocks: FP16 scale in [2^-9, 2^-8), 32 codes
+            const auto sc = static_cast<std::uint16_t>(0x1800U | (next() & 0x3ffU));
+            w[b] = static_cast<std::uint8_t>(sc & 0xffU), w[b + 1U] = static_cast<std::uint8_t>(sc >> 8U);
+            for (unsigned i = 2; i < 34U; ++i) w[b + i] = static_cast<std::uint8_t>(next() % 255U + 129U);  // -127..127
+        }
+        std::vector<std::int8_t> c(buf.codes_bytes);
+        for (auto& x : c) x = static_cast<std::int8_t>(static_cast<int>(next() % 255U) - 127);
+        std::vector<float> d(buf.delta_floats);
+        for (auto& x : d) x = 1.0F / 127.0F * (0.5F + static_cast<float>(next() % 1024U) / 1024.0F);
+        CK(hipMemcpy(buf.weight, w.data(), w.size(), hipMemcpyHostToDevice));
+        CK(hipMemcpy(buf.codes, c.data(), c.size(), hipMemcpyHostToDevice));
+        CK(hipMemcpy(buf.deltas, d.data(), d.size() * 4U, hipMemcpyHostToDevice));
+    }
     CK(hipDeviceSynchronize());
-    std::printf("probe q8a8 rows %u seconds %.2f bytes weight %zu codes %zu deltas %zu out %zu\n", R, secs, buf.weight_bytes,
-                buf.codes_bytes, buf.delta_floats * 4U, buf.out_floats * 4U);
-    for (const Shape& s : shapes) run(s, buf, secs);
+    std::printf("probe q8a8 rows %u seconds %.2f set %s data %s bytes weight %zu codes %zu deltas %zu out %zu\n", R, secs,
+                set.c_str(), data.c_str(), buf.weight_bytes, buf.codes_bytes, buf.delta_floats * 4U, buf.out_floats * 4U);
+    for (const Shape& s : std::span<const Shape>(first, arms)) run(s, buf, secs);
     CK(hipFree(buf.weight));
     CK(hipFree(buf.codes));
     CK(hipFree(buf.deltas));
