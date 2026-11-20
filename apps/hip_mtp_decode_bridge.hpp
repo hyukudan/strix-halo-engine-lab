@@ -2959,8 +2959,8 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                 runner.growth_memory_ok=parents->batch_memory_ok;
                 if(parents->grow_batch_slot) runner.grow_factory=[&] {return prepare_slot(parents->grow_batch_slot(), runner.slots());};
                 // Prompt lookup in batched decoding: the engine's --mtp-ngram-draft mode, resolved and built as for the
-                // single request (mtp_batch_lookup + enable_ngram: auto where admissible, =on/ctx/copy/wide required,
-                // =off none); STRIX_BATCH_NGRAM overrides it (0 = off switch). A request's "ngram_draft" field forces it
+                // single request's builder (mtp_batch_lookup + enable_ngram): only explicit =on/ctx/copy/wide enables it;
+                // =auto (the default) keeps the existing batch OFF behavior. STRIX_BATCH_NGRAM overrides it (0 = off). A request forces it
                 // on/off. Solo cycles use it as a single request does; cohort cycles keep only context rows at the chain
                 // gate (STRIX_BATCH_NGRAM_GATE, default 0.9). Greedy requests only.
                 {
