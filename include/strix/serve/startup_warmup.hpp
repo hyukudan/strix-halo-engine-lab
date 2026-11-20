@@ -10,7 +10,9 @@
 //
 // Exactness: later requests run the same arithmetic on the same buffers (bitwise lever); the cost is one T-row
 // prompt at start. Not covered: growth that depends on the context position a prompt reaches (prompts longer than T
-// reach positions the warm-up did not); a full-context warm-up would cost a full-context prefill at every start.
+// reach positions the warm-up did not); a full-context warm-up would cost a full-context prefill at every start. Nor
+// data that depends on the token ids: file-backed per-token rows the memory cannot keep resident are still read on
+// the first request that uses those tokens.
 // STRIX_SERVE_WARMUP=0 keeps the lazy start.
 
 #include "strix/lever.hpp"
