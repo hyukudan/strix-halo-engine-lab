@@ -16,7 +16,7 @@ void require(bool ok, const char* what) {
 
 int main() {
     using namespace strix::serve;
-    require(startup_warmup_lever.default_on, "warm-up is default ON");
+    require(!startup_warmup_lever.default_on, "warm-up preserves the lazy-start default");
     require(startup_warmup_lever.exactness == strix::lever::Exactness::bitwise, "warm-up is bitwise for later requests");
 
     // The tile bounds the rows; a short context leaves room for the output token.
@@ -44,20 +44,23 @@ int main() {
     require(hi - lo > 100000U && repeats < 4U, "ids spread over the range");
     for (const auto id : startup_warmup_prompt(64U, 3U)) require(id == 1U, "tiny vocabulary stays valid");
 
-    // Default and disabled modes of the switch: unset = on (the bitwise lever's default), 0 = the lazy start (no plan,
-    // no run, the "none (off)" line), 1 = on, anything else refused.
+    // Unset and 0 preserve lazy start; an explicit 1 enables warm-up. All other values are refused.
     namespace lever = strix::lever;
-    require(lever::select(startup_warmup_lever, {}, nullptr).on && lever::select(startup_warmup_lever, {}, "").on,
-            "unset switch: warm-up on");
+    require(!lever::select(startup_warmup_lever, {}, nullptr).on && !lever::select(startup_warmup_lever, {}, "").on,
+            "unset switch: warm-up off (existing lazy start)");
     require(!lever::select(startup_warmup_lever, {}, "0").on && lever::select(startup_warmup_lever, {}, "1").on,
-            "STRIX_SERVE_WARMUP=0 off, =1 on");
+            "STRIX_SERVE_WARMUP=0 off, =1 opt-in on");
     bool refused = false;
     try {
         (void)lever::select(startup_warmup_lever, {}, "yes");
     } catch (const std::invalid_argument&) { refused = true; }
     require(refused, "switch values other than 0/1 refused");
     const auto off = plan_startup_warmup(lever::select(startup_warmup_lever, {}, "0").on, 8192U, 40960U);
-    require(off.rows == 0U && off.reason == "off", "disabled: no plan");
+    const auto unset = plan_startup_warmup(lever::select(startup_warmup_lever, {}, nullptr).on, 8192U, 40960U);
+    const auto enabled = plan_startup_warmup(lever::select(startup_warmup_lever, {}, "1").on, 8192U, 40960U);
+    require(off.rows == 0U && off.reason == "off" && unset.rows == 0U && unset.reason == "off",
+            "disabled/default: no synthetic request");
+    require(enabled.rows == 8192U && enabled.outputs == 1U, "explicit opt-in warm-up");
 
     // The run wrapper hands the planned prompt to the engine and does nothing without a plan.
     std::size_t seen = 0;

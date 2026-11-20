@@ -13,7 +13,7 @@
 // reach positions the warm-up did not); a full-context warm-up would cost a full-context prefill at every start. Nor
 // data that depends on the token ids: file-backed per-token rows the memory cannot keep resident are still read on
 // the first request that uses those tokens.
-// STRIX_SERVE_WARMUP=0 keeps the lazy start.
+// Opt-in: STRIX_SERVE_WARMUP=1 warms the request path; unset or 0 preserves the lazy start.
 //
 // Failure (bounded fail-open): the warm-up is one request of bounded size (at most T prompt rows and `outputs` tokens).
 // When the request path reports that request as failed (StartupWarmupFailed: the runner finished it with an error, as
@@ -35,7 +35,7 @@
 namespace strix::serve {
 
 inline constexpr lever::Decl startup_warmup_lever{
-    "serve-startup-warmup", "STRIX_SERVE_WARMUP", lever::Exactness::bitwise, true, {}, {},
+    "serve-startup-warmup", "STRIX_SERVE_WARMUP", lever::Exactness::bitwise, false, {}, {},
     "server start, first-use request-path scratch sized before listening (docs/toggles.md)"};
 
 [[nodiscard]] inline bool startup_warmup_enabled() { return lever::select(startup_warmup_lever, {}).on; }
