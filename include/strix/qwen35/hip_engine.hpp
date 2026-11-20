@@ -153,6 +153,14 @@ public:
     // written by earlier calls (own bf16 KV, positions explicit). want_top=false skips lm_head + argmax.
     HipMtpOut mtp_forward(const std::uint32_t* next_tokens, const float* hidden_dev, std::uint32_t rows, std::uint32_t pos0,
                           bool want_top = true);
+    // Device-fed MTP chain (strix/spec/mtp_chain.hpp, MtpFeedEngine): the chain enqueues a whole draft without host round
+    // trips and reads the ids once. mtp_step_fed = mtp_forward on one row (same launches and operands) whose input id is
+    // *in_host (by value) or feed slot in_slot (an earlier step's pick), its pick written into slot out_slot.
+    static constexpr std::uint32_t kMtpFeedSlots = 64;
+    HipMtpOut mtp_step_fed(const std::uint32_t* in_host, std::uint32_t in_slot, std::uint32_t out_slot, const float* hidden_dev,
+                           std::uint32_t pos, bool want_top);
+    void mtp_feed_put(std::uint32_t slot, const std::uint32_t* top_dev);  // slot = *top_dev (async, device to device)
+    void mtp_feed_read(std::uint32_t n, std::uint32_t* host) const;       // host[0..n) = slots 0..n-1 (synchronizes)
     // Device helpers for the shared chain glue (all on the engine stream).
     [[nodiscard]] float* alloc_f32(std::size_t n) const;
     void free_f32(float* p) const;
