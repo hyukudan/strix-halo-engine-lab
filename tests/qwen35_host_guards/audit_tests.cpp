@@ -227,11 +227,11 @@ int main() {
         if (completed) break;
     }
     fail_after = -1; check(completed, "686-7 all allocation failures exercised");
-    for (bool rollback : {false, true}) {  // FAST4 tile feed reaches every slot context: default bulk, lsu the rollback
+    for (bool opt_in : {false, true}) {  // FAST4 tile feed reaches every slot context: default lsu, bulk opt-in
         Engine owned;
-        check(owned.opt.prefill_tile_feed == cc::ftile::Feed::bulk, "pr797 engine default feed = bulk");
-        if (rollback) owned.opt.prefill_tile_feed = cc::ftile::Feed::lsu;
-        const auto want = rollback ? cc::ftile::Feed::lsu : cc::ftile::Feed::bulk;
+        check(owned.opt.prefill_tile_feed == cc::ftile::Feed::lsu, "pr797 engine default feed = lsu");
+        if (opt_in) owned.opt.prefill_tile_feed = cc::ftile::Feed::bulk;
+        const auto want = opt_in ? cc::ftile::Feed::bulk : cc::ftile::Feed::lsu;
         owned.pf_init(1);
         bool all = !owned.pf.sl.empty();
         for (const auto& s : owned.pf.sl) all = all && s->bc != nullptr && s->bc->feed == want;
