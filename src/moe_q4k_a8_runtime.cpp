@@ -59,9 +59,10 @@ RuntimeWorkspace build_runtime_workspace(std::uint64_t hidden, std::uint64_t row
 }
 RuntimeWorkspace build_runtime_workspace(std::uint64_t hidden, std::uint64_t rows,
     std::uint64_t experts, std::uint64_t top_k, bool q51_slot_rawdots, bool a8_down) {
-    if (hidden < 256 || hidden > 2560 || hidden % 256 != 0 ||
-        rows < 32 || rows > 640 || rows % 32 != 0 ||
-        experts == 0 || experts > 512 || top_k == 0 || top_k > 10 || top_k > experts)
+    // C1 envelope (moe_q4k_a8_contract.hpp geometry presets); the multi-row forms keep max_rows / max_top_k themselves.
+    if (hidden < 256 || hidden > max_hidden || hidden % 256 != 0 ||
+        rows < 32 || rows > c1_max_rows || rows % 32 != 0 ||
+        experts == 0 || experts > max_experts || top_k == 0 || top_k > c1_max_top_k || top_k > experts)
         throw std::invalid_argument("Q4K A8 runtime unsupported H/I/E/K geometry");
     if (a8_down && (rows % 128U != 0 || hidden % 64U != 0))
         throw std::invalid_argument("A8 down runtime requires I divisible by 128 and H divisible by 64");

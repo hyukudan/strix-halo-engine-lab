@@ -1,6 +1,7 @@
 #include "strix/hip_mtp_prime_rows.hpp"
 #include <type_traits>
 #include "strix/hip_check.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_mtp_fast_draft.hpp"
 #include "strix/hip_mtp_input_fusion.hpp"
@@ -230,16 +231,81 @@ __global__ __launch_bounds__(256) void mtp_input_projections_wave_rows(HipMtpInp
 // rounding/output casts). Rows per wave only regroup independent rows, so R=1 here matches any R there.
 // Tokens come in groups of Count per block (blockIdx.y = group, `total` tokens): 40 accumulators per token, so a
 // group of 8 spilled (t3 trace: 1.9 ms at 8 tokens against 42 us for one); groups only regroup independent tokens.
-template<bool Q4,unsigned Count,class Rows=HipMtpInputFusionRows>
+// R (rows per wave, prompt priming): wave w of block b owns output rows (b*8 + w)*R .. +R-1. With R=1 every FMA
+// needs its own input load (40 loads for 40 FMAs per token and column group: L1-load bound, 39 us per primed row
+// at H 2560 on gfx1151). R>1 loads the Count tokens' 40 inputs of a column group once into registers and runs
+// every row's unchanged chains on them (per row and token: same column groups, same rounded es*code / ws*code
+// products, same element and stream order, same tree and casts), so R only regroups independent rows, as in
+// mtp_input_projections_wave_rows.
+template<bool Q4,unsigned Count,class Rows=HipMtpInputFusionRows,unsigned R=1U>
 __global__ __launch_bounds__(256) void mtp_input_projections_batch(HipMtpInputFusionRequest r,Rows all,
     const unsigned char* weights,unsigned total) {
+    static_assert(R>=1U && Count>=1U);
     constexpr unsigned block=Q4?18U:34U,hc=4U;
-    const unsigned lane=threadIdx.x%32U,row=blockIdx.x*8U+threadIdx.x/32U,h=r.hidden_size;
+    const unsigned lane=threadIdx.x%32U,row=(blockIdx.x*8U+threadIdx.x/32U)*R,h=r.hidden_size;
     if(row>=h)return;
     const unsigned first=blockIdx.y*Count,valid=total-first<Count?total-first:Count;
     HipMtpInputFusionRows rows{};
 #pragma unroll
     for(unsigned t=0;t<Count;++t){const auto u=first+(t<valid?t:0U);rows.normalized[t]=all.normalized[u];rows.output[t]=all.output[u];}
+    if constexpr(R>1U) {
+        float embedding[R][Count],sums[R][Count][hc];
+#pragma unroll
+        for(unsigned k=0;k<R;++k)
+#pragma unroll
+            for(unsigned t=0;t<Count;++t){embedding[k][t]=0.0F;for(unsigned s=0;s<hc;++s)sums[k][t][s]=0.0F;}
+        for(unsigned base=8U*lane;base<h;base+=256U) {
+            float xe[Count][8],xs[Count][hc][8];
+#pragma unroll
+            for(unsigned t=0;t<Count;++t) {
+                const auto* input=reinterpret_cast<const float*>(rows.normalized[t]);
+#pragma unroll
+                for(unsigned i=0;i<8U;++i){xe[t][i]=input[base+i];for(unsigned s=0;s<hc;++s)xs[t][s][i]=input[h+s*h+base+i];}
+            }
+#pragma unroll
+            for(unsigned k=0;k<R;++k) {
+                if(row+k>=h)break;
+                const auto* packed=weights+static_cast<std::uint64_t>(row+k)*(2U*h/32U)*block;
+                const auto* e=packed+(base/32U)*block;const auto* w=packed+((h+base)/32U)*block;
+                const float es=__half2float(*reinterpret_cast<const __half*>(e)),ws=__half2float(*reinterpret_cast<const __half*>(w));
+                float ec[8],wc[8];
+#pragma unroll
+                for(unsigned i=0;i<8U;++i){ec[i]=es*block_code<Q4>(e,base%32U+i);wc[i]=ws*block_code<Q4>(w,base%32U+i);}
+#pragma unroll
+                for(unsigned t=0;t<Count;++t)
+#pragma unroll
+                    for(unsigned i=0;i<8U;++i) {
+                        embedding[k][t]=fmaf(ec[i],xe[t][i],embedding[k][t]);
+#pragma unroll
+                        for(unsigned s=0;s<hc;++s) sums[k][t][s]=fmaf(wc[i],xs[t][s][i],sums[k][t][s]);
+                    }
+            }
+        }
+#pragma unroll
+        for(unsigned k=0;k<R;++k)
+#pragma unroll
+            for(unsigned t=0;t<Count;++t)
+                for(unsigned d=16U;d;d>>=1U) {
+                    embedding[k][t]+=strix::qwen_dpp::xor32(embedding[k][t], d);
+                    for(unsigned s=0;s<hc;++s) sums[k][t][s]+=strix::qwen_dpp::xor32(sums[k][t][s], d);
+                }
+        if(lane)return;
+#pragma unroll
+        for(unsigned k=0;k<R;++k) {
+            if(row+k>=h)break;
+#pragma unroll
+            for(unsigned t=0;t<Count;++t) {
+                if(t>=valid) break;
+                const float projected=rounded(embedding[k][t],r.projection_rounding);
+                for(unsigned s=0;s<hc;++s) {
+                    const float v=projected+rounded(sums[k][t][s],r.projection_rounding);
+                    if(r.output_storage==HipMtpInputStorage::bf16)reinterpret_cast<std::uint16_t*>(rows.output[t])[s*h+row+k]=to_bf16(v);
+                    else reinterpret_cast<float*>(rows.output[t])[s*h+row+k]=v;
+                }
+            }
+        }
+        return;
+    }
     const auto* packed=weights+static_cast<std::uint64_t>(row)*(2U*h/32U)*block;
     float embedding[Count],sums[Count][hc];
 #pragma unroll
@@ -425,6 +491,18 @@ template<class Rows> void launch_mtp_input_fusion_rows(std::span<const HipMtpInp
     // STRIX_MTP_DRAFT_BATCH_PROJ_GROUP=1|2|4: tokens per block (default 2).
     static const unsigned group=[]{const char* v=std::getenv("STRIX_MTP_DRAFT_BATCH_PROJ_GROUP");
         const unsigned g=v?static_cast<unsigned>(std::atoi(v)):2U;return g==1U||g==4U?g:2U;}();
+    // Prompt priming: four output rows per wave on two-token groups (mtp_input_projections_batch R: 80 input and
+    // 40 accumulator registers per lane). STRIX_MTP_PRIME_PROJ_ROWS=1 keeps one row per wave (cached, restart).
+    if constexpr(std::is_same_v<Rows,HipMtpInputFusionPrimeRows>) {
+        static const bool four=strix::envcfg::integer("STRIX_MTP_PRIME_PROJ_ROWS",4)!=1;
+        if(four && n>1U) {
+            constexpr unsigned rows_per_wave=4U,tokens=2U;
+            const dim3 grid4((r.hidden_size+8U*rows_per_wave-1U)/(8U*rows_per_wave),(n+tokens-1U)/tokens);
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_projections_batch<true,tokens,Rows,rows_per_wave>),grid4,dim3(256U),0U,stream,r,rows,q4,n);
+            hip_check(hipGetLastError(),"MTP prime fused projection launch");
+            return;
+        }
+    }
     const auto g=std::min(group,n);
     const dim3 grid((r.hidden_size+7U)/8U,(n+g-1U)/g);
     if(g==1U) hipLaunchKernelGGL(HIP_KERNEL_NAME(mtp_input_projections_batch<true,1U,Rows>),grid,dim3(256U),0U,stream,r,rows,q4,n);

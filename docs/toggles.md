@@ -25,7 +25,7 @@ You only need this page to inspect a path, to debug, or to move the engine to di
 | Profile | What it does |
 |---|---|
 | `--profile exact` (alias `default`) | Current production path; exports no profile overrides. This is the default. |
-| `--profile fast` | Adds every qualified bit-changing option, and the rows selected for fast ahead of their receipt (stamped "qualification in progress" in the receipt). Rows that are neither stay off (see `--allow-pending`). MiniMax: the qualified bundle `mm-fast-pf-v2` (the same members and prefill identity as `STRIX_MM_FAST_PREFILL=1`; refused with `--baseline`). GLM pair: nothing (`STRIX_GLM_PF_WMMA` is unqualified for fast: its FAST prefill set fails the 8K quality gate; it runs only when set explicitly). DeepSeek pair: the FAST bundle and its Engram / shared / MoE FP16 levers stay explicit until their quality gate. A set switch, `0` included, wins. |
+| `--profile fast` | Adds every qualified bit-changing option, and the rows selected for fast ahead of their receipt (stamped "qualification in progress" in the receipt). Rows that are neither stay off (see `--allow-pending`). MiniMax: the qualified bundle `mm-fast-pf-v2` (the same members and prefill identity as `STRIX_MM_FAST_PREFILL=1`; refused with `--baseline`). GLM pair: nothing (`STRIX_GLM_PF_WMMA` is unqualified for fast: its FAST prefill set fails the 8K quality gate; it runs only when set explicitly). DeepSeek pair: the FAST bundle `ds41-fast-pf-v1` with its Engram / shared / MoE FP16 levers (selected together ahead of a full receipt: FAST gate v2, no replay, final PASS for prompts <= 8,192 on 882 rows; provisional above, 32K class 126 rows; the receipt says "qualification in progress"). A set switch, `0` included, wins. |
 | `--profile quality` | A higher-precision pack where one exists (Nemotron EXL3). Otherwise equal to `default`. |
 | `--profile` on `strix-cuda-ds41-prefill-service` | DS41 RTX prefill service: takes the same word (`exact`/`default`, `fast`; `STRIX_DS41_PROFILE`) and `--allow-pending` as the replica, through the same resolver (`strix/profiles/ds41_rtx.hpp`). Today every fast row is pending (listed in `levers`, never used), so `fast` runs as `exact`. |
 
@@ -157,6 +157,9 @@ The tables below list the curated flags. The full list of environment variables 
 | `--engram-direct`, `--engram-mapped` | deepseek | `direct` | Engram table access. | `mapped` when memory is short. |
 | `--decode-xch xfer\|comm`, `STRIX_GLM_DECODE_XCH` | glm | `xfer` (`comm` in baseline) | Decode exchange mode. | Compare both on a different interconnect. |
 | `--wb-defer`, `--wb-stream`, `--ce-pacing` (`--no-*`) | deepseek-rtx | on | Write-back and copy-engine pacing. Also `STRIX_DS41_WB_STREAM`, `STRIX_DS41_CE_PACING`. | Off on links where the copy engine is not the bottleneck. |
+| `--tp-rank 0\|1`, `--tp-transport`, `--tp-rates A,B`, `--tp-trip-us`, `--tp-force` | qwen dense decode (HIP) | off (one node) | Exact tensor-parallel decode over two ranks: column / head shares, exact gathers. `--tp-rates` (GB/s per rank) overrides the topology rates, `--tp-trip-us` the measured trip latency, `--tp-force` keeps the group when the planner says it loses. [Entry](optimizations.md#qwen-27b-exact-tensor-parallel-decode-over-two-nodes). | Per-rank rates come from the topology declaration; a same-box pair measures its own trip at start-up. |
+| `--topology FILE --node ID`, `STRIX_TOPOLOGY` | qwen dense decode (HIP) | none | Topology declaration read for the tensor-parallel rates (`memory_gbytes_ps` of both nodes). | Declare each node's measured memory rate. |
+| `STRIX_PAIR_DECODE_RELAY=1` | qwen pair prefill (HIP) | off | After the layered prefill, moves each stage's layer state once to a node that holds the whole model and decodes there. Not measured on this tree. [Entry](optimizations.md#qwen-27b-pair-prefill-decode-relay-to-one-node). | When one node holds the whole model and the layer split serialises decode. |
 | `STRIX_DS41_OB_SPLIT=K` | deepseek | off | Splits the o_b exchange into K chunks that overlap compute. Exact. Slower on the host path. | Try on a faster interconnect or with GPU-direct. |
 
 Pair setup: [pair-setup.md](pair-setup.md).
@@ -181,8 +184,8 @@ the shared tiled core (`src/core`) landed, with the same bits.
 |---|---|---|---|
 | `STRIX_DS41_PF_CORE=0\|moe\|dense\|1` | deepseek | per form | Which prefill products run on the shared tiled core instead of the DeepSeek kernels: `moe` = expert gate/up and down, `dense` = the dense Q8_0 x A8 products, `1` = both, `0` = none. Same bits either way. Unset: the shared core where the rank fixture measures it faster, the Q8_0 gate/up (-0.6..-2.2 %) and down (-6.0..-7.2 %) of the shared expert (-2.8..-3.9 % for both), and only in 16-row batches with `STRIX_DS41_FAST_MOE` off and `STRIX_DS41_PREFILL_STAGE` not `1`, and the routed IQ2_XXS gate/up for hidden widths that are a multiple of 1024 (-7.1..-8.2 % at 2048 / 4096 / 8192 rows; other widths keep the DeepSeek kernels) and Q2_K down (-2.4..-3.4 %), which run there without the LDS weight tile so that two workgroups share a WGP; the dense products stay on the DeepSeek kernels. Resolved once per run; any other value, the empty one included, is rejected. |
 | `STRIX_DS41_FAST_I4=1` | deepseek | off | Draft lossy prefill: GGUF expert weights decoded in the kernel to INT4, A8 input requantized to A4. Runs on the shared core. `STRIX_DS41_FAST_I4_SCOPE=all\|gu` picks gate/up/down (default) or gate/up only. Not quality-qualified. |
-| `STRIX_GLM_MODEL_FORMAT=fast_i4` | glm | `exl3` | Lossy format: the routed gate/up experts of the late MoE layers are stored as INT4 (W4A4 prefill, W4A16 decode), their EXL3 copy is released. Refuses the exact identities. Against FAST on the pair: prefill logits KL 0.0145, top-1 95.4 %, NLL -0.002 (gate 0.02 / 93 % / +0.01); teacher-forced decode tokens KL 0.0098, top-1 94.8 %; prefill 8K -2.0 %, 32K -3.2 %; plain and MTP decode speed unchanged. |
-| `STRIX_GLM_FAST_I4_EXL3_LAYERS=<list>` | glm | `0-14` | With `fast_i4`: MoE layers (ordinals, ranges `a-b`, or `none`) that keep the EXL3 routed experts. An early INT4 layer costs a saturating quality step, late layers are cheap; INT4 on every layer does not pass the quality gate. |
+| `STRIX_GLM_MODEL_FORMAT=fast_i4` | glm | `exl3` | Lossy format: the routed gate/up experts of the late MoE layers are stored as INT4 (W4A4 prefill, W4A16 decode), their EXL3 copy is released. Refuses the exact identities and runs only on top of the FAST prefill (`STRIX_GLM_PF_WMMA=1`). Not a qualified FAST lever: FAST gate v2 against the exact reference (4 windows x 255 rows of 2K-token prompts, one-FP16-ulp null) fails the pooled bars for every arm, the exact null included (null KL 0.141), so no GLM prefill lever can pass it as written. With the former 27-layer set (ordinals 15-41) two windows fail beyond 1.5 x the null and pooled top-1 drops to 0.898; with the default 17-layer set (ordinals 25-41) every window passes that FAST alone passes (pooled KL 0.132, top-1 0.926, FAST alone 0.130 / 0.931). Earlier v1 receipt of the 27-layer set against FAST: prefill logits KL 0.0145, top-1 95.4 %, NLL -0.002; teacher-forced decode tokens KL 0.0098, top-1 94.8 %; prefill 8K -2.0 %, 32K -3.2 %; plain and MTP decode speed unchanged. The 17-layer set's prefill speed is not measured. |
+| `STRIX_GLM_FAST_I4_EXL3_LAYERS=<list>` | glm | `0-24` | With `fast_i4`: MoE layers (ordinals, ranges `a-b`, or `none`) that keep the EXL3 routed experts. An early INT4 layer costs a saturating quality step, late layers are cheap. `0-24` (INT4 on ordinals 25-41) passes every FAST gate v2 window; `0-14` fails two windows; INT4 on every layer fails. |
 | `STRIX_GLM_FAST_I4_SCOPE=gate_up\|all` | glm | `gate_up` | With `fast_i4`: which routed matrices are INT4. `all` adds the down projection (8K warm prefill -3.6 % against FAST; thinner quality margin). |
 | `STRIX_GLM_FAST_I4_SCALE=fast_full\|legacy` | glm | `fast_full` | With `fast_i4`: weight scale rule of the load-time conversion. `fast_full` uses the full nibble range [-8, 7] at 0.9 of the non-clipping scale (weight error 0.0095 against 0.0115 for `legacy`, same conversion time). |
 | `STRIX_GLM_FAST_I4_PAIRED=0` | glm | on | With `fast_i4` and scope `gate_up`: turns off the paired gate/up kernel (one kernel reads the gate and up INT4 weights and its SwiGLU epilogue writes the down input) and runs the separate gate, up and activation calls. Same output bits either way. |
@@ -281,7 +284,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_GLM_PF_MLA_OB16` | glm | on when the MLA WMMA out GEMM runs (same bits); 0 = FP32 o-bar | [glm-pf-mla-wmma](optimizations.md#glm-pf-mla-wmma) |
 | `STRIX_GLM_PF_TOPK_OVERLAP` | glm | off; 1 = diagnostic: per FAST flash call, top-k list sizes vs union sizes of aligned row pairs / quads / octets (dense prefix and sparse rows), syncs the stream (not for timing), bits unchanged | [glm-pf-mla-wmma](optimizations.md#glm-pf-mla-wmma) |
 | `STRIX_GLM_PF_MLA_GEMM_HEADS` | glm | on (exact and FAST; same bits); 0 = rows-then-head CTA order | [glm-pf-mla-gemm-heads](optimizations.md#glm-pf-mla-gemm-heads) |
-| `STRIX_GLM_PF_KDA_SCAN` | glm | 5 | [glm-pf-kda-scan-v5](optimizations.md#glm-pf-kda-scan-v5) |
+| `STRIX_GLM_PF_KDA_SCAN` | glm | 6 | [glm-pf-kda-scan-v6](optimizations.md#glm-pf-kda-scan-v6) |
 | `STRIX_GLM_PF_MIXNORM` | glm | 1 | [glm-pf-mixnorm](optimizations.md#glm-pf-mixnorm) |
 | `STRIX_GLM_PF_MLA_GEMM` | glm | 3 (v3); 2 selects v2 | [glm-pf-mla-gemm-v2](optimizations.md#glm-pf-mla-gemm-v2) |
 | `STRIX_GLM_PF_OBAR` | glm | 10 | [glm-pf-obar-v5](optimizations.md#glm-pf-obar-v5) |
@@ -374,7 +377,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_SERVE_FP16_MTP` | qwen | ON: explicit-sidecar MTP servers keep the automatic FP16 prefill arithmetic with the unqualified fast options off; `0` declines it | [default-prompt-prefill](engine/serving/serving.md#default-prompt-prefill) |
 | `STRIX_QRTX_PLE_A8` | qwen-rtx | off (opt-in under `--profile fast`, FAST gate pending) | [qwen-rtx-ple-a8](optimizations.md#qwen-rtx-ple-a8) |
 
-### Decode, MTP and DSpark (25)
+### Decode, MTP and DSpark (26)
 
 | Toggle | Engine | Default | Details |
 |---|---|---|---|
@@ -404,6 +407,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_QWEN_DECODE_FUSE` | qwen | ON (code default; STRIX_QWEN_DECODE_FUSE=0 restores the three-launch sequence) | [qwen-decode-fuse](optimizations.md#qwen-decode-fuse) |
 | `STRIX_QWEN_YARN_MTP` | qwen | table-backed QSA MTP pool and rolling... | [qwen-yarn-mtp](optimizations.md#qwen-yarn-mtp) |
 | `STRIX_TOOL_DRAFT_PREFIX_GATE` | qwen | ON (batched decoding) | [qwen-tool-draft](optimizations.md#qwen-tool-draft) |
+| `STRIX_QRTX_COMMIT_ASYNC` | qwen-rtx | off | [qwen-rtx-commit-async](optimizations.md#qwen-rtx-commit-async) |
 
 ### Pair transport (25)
 
@@ -435,6 +439,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_MTP_JOINT_PLAN` | qwen | calibrated-c3 when STRIX_MTP_BATCH_JO... | [joint-plan-rule](engine/scheduling/joint-serving-windows.md#joint-plan-rule) |
 | `STRIX_MTP_JOINT_RULE_FILE` | qwen | calibrated-c3 when STRIX_MTP_BATCH_JO... | [joint-plan-rule](engine/scheduling/joint-serving-windows.md#joint-plan-rule) |
 | `STRIX_MTP_PRIME_BATCH` | qwen | 64 rows (clamped to 8..128; 8 restores original batches) | [qwen-mtp-prime-rows](optimizations.md#qwen-mtp-prime-rows) |
+| `STRIX_MTP_PRIME_PROJ_ROWS` | qwen | 4 output rows per wave (1: one row per wave) | [qwen-mtp-prime-rows](optimizations.md#qwen-mtp-prime-rows) |
 | `STRIX_MTP_PRIME_ROWS` | qwen | ON (STRIX_MTP_PRIME_ROWS=0: disable) | [qwen-mtp-prime-rows](optimizations.md#qwen-mtp-prime-rows) |
 | `STRIX_QSA_MTP_POOL` | qwen | 1 (eligible native MTP CLI, the singl... | [qwen-qsa-mtp-pool](optimizations.md#qwen-qsa-mtp-pool) |
 
@@ -581,7 +586,7 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_SERVE_HEALTH_RECORD` | qwen | ON | [operations/service-health.md](operations/service-health.md) |
 | `STRIX_SERVE_OBSERVE_EXPIRY_S` | deepseek | 60 seconds | [ds-observation](optimizations.md#ds-observation) |
 
-### Debug only (3)
+### Debug only (7)
 
 | Toggle | Engine | Default | Details |
 |---|---|---|---|
@@ -589,3 +594,6 @@ Follow the link for the gain, preconditions and off switch. Defaults are shorten
 | `STRIX_ROUTE_RECEIPT` | platform | ON | [platform-route-receipt](optimizations.md#platform-route-receipt) |
 | `STRIX_DS41_OB_READY_EPILOGUE` | deepseek | auto | [ds-ready](optimizations.md#ds-ready) |
 | `STRIX_SERVE_BACKEND_PROBE` | qwen | ON | [operations/service-health.md](operations/service-health.md) |
+| `STRIX_MOE_ROUTES_OUT` | qwen-rtx (shared MoE route tap) | off | FAST gate: record every router call's expert ids and weights to FILE; [route tap](../include/strix/moe/route_file.hpp) |
+| `STRIX_MOE_ROUTES_IN` | qwen-rtx (shared MoE route tap) | off | FAST gate: replay recorded ids and weights call by call (layer, rows, top-k must match); [route tap](../include/strix/moe/route_file.hpp) |
+| `STRIX_MOE_ROUTE_NULL` | qwen-rtx (shared MoE route tap) | off | FAST gate null control `LAYER[:SEED]`: layer's selected weights move by one FP32 ulp; [route tap](../include/strix/moe/route_file.hpp) |

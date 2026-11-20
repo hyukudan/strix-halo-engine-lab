@@ -15,10 +15,11 @@ struct ForwardPlan final : session::ExecutionPlan {
     ForwardResult result;
 };
 struct PrefillPlan final : session::ExecutionPlan {
-    PrefillPlan(session::Backend& b, std::span<const PrefillItem> i, bool h, bool t, bool grouped)
+    PrefillPlan(session::Backend& b, std::span<const PrefillItem> i, HiddenDemand h, bool t, bool grouped)
         : ExecutionPlan(b), items(i), hidden(h), taps(t), batch(grouped) {}
     std::span<const PrefillItem> items;
-    bool hidden, taps, batch;
+    HiddenDemand hidden;
+    bool taps, batch;
     std::vector<PrefillRows> result;
 };
 

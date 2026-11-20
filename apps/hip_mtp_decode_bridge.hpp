@@ -629,8 +629,10 @@ public:
         // STRIX_RTX_EXPORT_STATE keeps every block synchronous: its export (after_unit) must see this block's predictor
         // rows and held row, which the async path below completes only at the next unit's drain.
         // A registry without a store (STRIX_PROMPT_STATE_DIGEST / --rtx-state-import) captures nothing: those blocks stay async.
+        // The unit ending at the prompt's row-class point stays synchronous too: its capture follows the held row.
+        const bool row_class_end=tiled_.cache && !legacy_cache() && tiled_.cache->row_class_point()==pos_+rows;
         if(pipe_mtp() && !block.final && !(legacy_cache() && (block.capture || tiled_.cache_tails)) &&
-            !rtx_state_export_request()) {
+            !rtx_state_export_request() && !row_class_end) {
             // Same rows, kernels and order as below; the wait moves to the next unit of the prompt.
             std::vector<MtpDeviceView> views;std::vector<std::uint32_t> next;
             if(pos_){views.push_back(view(held_));next.push_back(tokens_[static_cast<std::size_t>(pos_)]);}
@@ -703,6 +705,17 @@ public:
                 }
             }
         }
+        // Row-class checkpoint (the next turn resumes here, off the T grid): after this unit's predictor rows and
+        // held row, before the final row's adoption.
+        if(row_class_end) {
+            // Synchronous capture: finish this unit's deferred owner checks and predictor rows first (no arithmetic change).
+            if(!complete && block.owner->completion_pending()) block.owner->finish_pending_completion();
+            if(!complete && runtime_.prime_hidden_rows_pending()) runtime_.prime_hidden_rows_complete();
+            const bool ready=!block.owner->completion_pending() && !runtime_.prime_hidden_rows_pending() &&
+                runtime_.next_source_position()+1U==pos_;
+            row_class_note_=ready?tiled_.cache->capture_row_class(session_,tokens_):
+                block.owner->completion_pending()?"owner-pending":runtime_.prime_hidden_rows_pending()?"priming-pending":"predictor-frontier";
+        }
         if(tiled_.cache) tiled_.cache->after_unit(session_,tokens_,pos_);
         if(block.capture)++blocks_;else ++tail_blocks_;
         if(grouped)++grouped_blocks_;
@@ -764,6 +777,7 @@ public:
         out<<"\"rows\":"<<tiled_.rows<<",\"tail_rows\":[";
         for(std::size_t t=0;t<tiled_.tails.size();++t)out<<(t?",":"")<<tiled_.tails[t].rows;
         out<<"],\"restored_position\":"<<restored_
+           <<",\"row_class_point\":"<<(tiled_.cache?tiled_.cache->row_class_point():0U)<<",\"row_class\":\""<<row_class_note_<<'"'
            <<",\"blocks\":"<<blocks_<<",\"tail_blocks\":"<<tail_blocks_<<",\"serial_rows\":"<<serial_rows_<<",\"tiled_start\":"<<(adopted_?"true":"false")
            <<",\"prompt_ms\":"<<prompt_ms<<",\"grouped_blocks\":"<<grouped_blocks_
            <<",\"block_ms\":"<<block_ms_<<",\"tail_ms\":"<<tail_ms_<<",\"serial_ms\":"<<serial_ms_;
@@ -1064,6 +1078,7 @@ private:
     std::byte* hidden_allocation_=nullptr;
     Phase phase_=Phase::blocks;
     bool adopted_=false,window_refused_=false,priming_=false;
+    const char* row_class_note_="";   // the row-class capture at this prompt's class point: "captured" or why not
     int balanced_=-1;
     HipPrefixStateCacheSession::Capture capture_;
     std::future<bool> submitter_;
@@ -1145,7 +1160,7 @@ struct MtpBatchRequest {
     std::vector<std::uint32_t> stop_tokens;
     std::shared_ptr<TokenSampler> sampler; // null: first-max selection
     // Request field "ngram_draft": true/false forces this request's context draft source on/off (greedy only);
-    // absent: the engine's batch setting (STRIX_BATCH_NGRAM, off by default).
+    // absent: the engine's --mtp-ngram-draft mode as on the single route (mtp_batch_lookup; STRIX_BATCH_NGRAM overrides).
     std::optional<bool> ngram_draft;
     std::uint32_t draft_depth_max = 0; // request field "draft_depth_max": predictor drafts per cycle at most (0: engine)
     std::optional<bool> tool_draft;    // request field "tool_draft": strict tool-call frames (unset: STRIX_BATCH_TOOL_DRAFT)
@@ -2418,8 +2433,9 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
     const auto golden_prefill_identity=tiled_prompt ? decode_profile_identity : prefill_profile_identity;
     const auto golden_prefill_profile=tiled_prompt ? pair.decode : pair.prefill;
     if(!m.metadata_only && !dump){
-    const auto golden_limit=options.rotary.mode()==RotaryMode::yarn?
-        std::min(m.golden_max_bytes,mtp_payload::golden_file(calibration_rows,width,model.vocab_size,288U)):m.golden_max_bytes;
+    // The golden holds exactly calibration_rows rows (checked below): read at most that file, the size admission charged.
+    const auto golden_limit=
+        std::min(m.golden_max_bytes,mtp_payload::golden_file(calibration_rows,width,model.vocab_size,mtp_payload::golden_header_bound));
     golden=read_mtp_forward_golden_file(m.golden,mtp_cli_digest(m.golden_sha256),golden_limit);
     validate_mtp_forward_golden_rotary(golden,model.rotary_identity(),options.context_tokens,
         prefill_profile_identity,golden_prefill_identity,decode_profile_identity);
@@ -2957,15 +2973,13 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                 runner.slots_capacity=parents->batch_capacity?parents->batch_capacity:runner.slots();
                 runner.growth_memory_ok=parents->batch_memory_ok;
                 if(parents->grow_batch_slot) runner.grow_factory=[&] {return prepare_slot(parents->grow_batch_slot(), runner.slots());};
-                // Prompt lookup in batched decoding (opt-in, off by default): STRIX_BATCH_NGRAM=1 the n-gram extension
-                // (the single request's default source), =ctx the context drafter (--mtp-ngram-draft=ctx); a request's
-                // "ngram_draft" field forces it on/off. Solo cycles use it as a single request does; cohort cycles keep
-                // only context rows at the chain gate (STRIX_BATCH_NGRAM_GATE, default 0.9). Greedy requests only.
+                // Prompt lookup in batched decoding: the engine's --mtp-ngram-draft mode, resolved and built as for the
+                // single request's builder (mtp_batch_lookup + enable_ngram): only explicit =on/ctx/copy/wide enables it;
+                // =auto (the default) keeps the existing batch OFF behavior. STRIX_BATCH_NGRAM overrides it (0 = off). A request forces it
+                // on/off. Solo cycles use it as a single request does; cohort cycles keep only context rows at the chain
+                // gate (STRIX_BATCH_NGRAM_GATE, default 0.9). Greedy requests only.
                 {
-                    const char* mode_env=std::getenv("STRIX_BATCH_NGRAM");
-                    const std::string mode=mode_env?mode_env:"";
-                    const bool engine_on=mode=="1" || mode=="on" || mode=="ctx";
-                    const bool use_context=mode=="ctx" || m.ngram_context;
+                    const auto lookup=mtp_batch_lookup(m,std::getenv("STRIX_BATCH_NGRAM"));
                     runner.wide_rows=wide_rows;
                     if(!runner.wide_rows.empty()) {
                         // Startup check of the owners the wide cycle needs (same lookup the cycle builds from), so a
@@ -2981,13 +2995,12 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
                         }
                         runner.enable_wide=[&enable_ngram](HipMtpGreedyRuntime& greedy,std::span<const std::uint32_t> prompt){enable_ngram(greedy,prompt);};
                     }
-                    runner.enable_context=[engine_on,use_context,ngram_config,&m](HipMtpGreedyRuntime& greedy,std::span<const std::uint32_t> prompt,
+                    runner.enable_context=[lookup,&enable_ngram,&m](HipMtpGreedyRuntime& greedy,std::span<const std::uint32_t> prompt,
                         const std::shared_ptr<TokenSampler>& request_sampler,std::optional<bool> request) {
-                        if(!(request?*request:engine_on) || request_sampler || !greedy.window_verifier() ||
+                        if(!(request?*request:lookup.on) || request_sampler || !greedy.window_verifier() ||
                            greedy.window_verifier()->survival_controller() || !m.draft_chain) return;
-                        if(!use_context) {greedy.enable_ngram_draft(prompt,ngram_config());return;}
-                        MtpContextDraftConfig context;context.copy_edit=m.ngram_copy_edit;
-                        greedy.enable_context_draft(prompt,context,false);
+                        if(!lookup.default_context) {enable_ngram(greedy,prompt);return;}
+                        greedy.enable_context_draft(prompt,MtpContextDraftConfig{},false);
                     };
                 }
                 runner.calibration={calibration_rows,calibration_ms,replay.observation.maximum_hidden_abs_error,

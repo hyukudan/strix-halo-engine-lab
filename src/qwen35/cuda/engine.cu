@@ -651,11 +651,19 @@ struct CudaEngine::Impl {
         }
     }
 
+    // Input prologue of every main-session window entry (forward, forward_fed), after its argument checks and before its input
+    // kernel and run_rows; outside graph capture (the catch-up launches are not part of a trunk graph). decode_attn8: the e4m3
+    // shadow must mirror the committed prefix before the window reads it (prefill() advances committed without it), and the
+    // shadow is allocated on first use. run_rows refuses a window whose entry skipped this.
+    void window_prologue(std::uint32_t rows) {
+        core::require_capacity(committed, rows, opt.max_positions);
+        if (decode8_on()) decode8_catch_up();
+    }
+
     RowsOut forward(const std::uint32_t* tokens, std::uint32_t rows, LogitRows want) {
         if (rows == 0 || rows > RM) throw std::runtime_error("forward_rows: rows must be 1..32");
-        core::require_capacity(committed, rows, opt.max_positions);
         core::validate_token_ids(tokens, rows, c.vocab);
-        if (decode8_on()) decode8_catch_up();
+        window_prologue(rows);
         InputPack in{};
         in.pos0 = committed;
         for (std::uint32_t i = 0; i < rows; ++i) in.ids[i] = tokens[i];
@@ -671,7 +679,6 @@ struct CudaEngine::Impl {
         const std::uint32_t rows = nhost + k;
         if (!mtp_ok) throw std::runtime_error("forward_rows_fed: no MTP feed (no MTP tensors loaded)");
         if (rows == 0 || rows > RM || nhost > rows) throw std::runtime_error("forward_rows_fed: rows must be 1..32");
-        core::require_capacity(committed, rows, opt.max_positions);
         core::validate_token_ids(host_ids, nhost, c.vocab);
         FedPack in{};
         in.pos0 = committed;
@@ -686,6 +693,7 @@ struct CudaEngine::Impl {
                 in.slot[nhost + j] = slot[j];
             }
         }
+        window_prologue(rows);
         fed_rows_kernel<<<1, 32, 0, s>>>(in, d_feed, d_pos, d_ids);
         CK(cudaGetLastError());
         return run_rows(rows, want);
@@ -703,6 +711,7 @@ struct CudaEngine::Impl {
 
     // The window after its inputs are on the device (d_pos, d_ids): replay (or capture) the trunk graph of (rows, want).
     RowsOut run_rows(std::uint32_t rows, LogitRows want) {
+        if (decode8_on() && d8_end != committed) throw std::logic_error("forward_rows: decode_attn8 shadow behind the committed prefix (window_prologue not run)");
         const std::uint32_t key = rows * 4 + static_cast<std::uint32_t>(want);
         if (graphs_on) {
             auto it = graphs.find(key);
@@ -747,7 +756,7 @@ struct CudaEngine::Impl {
             CK(cc::gdn_commit(gd, commit_layers.data(), static_cast<std::uint32_t>(commit_layers.size()), last_rows, kk, d_parity, s));
         }
         // decode_attn8: the window's rows were quantised into the shadow right after kv_store (attn_mixer), so the committed
-        // prefix stays mirrored when the shadow was current at the window start (forward() catches up first).
+        // prefix stays mirrored when the shadow was current at the window start (window_prologue catches up first).
         if (decode8_on() && d8_end == committed) d8_end += kk;
         committed += kk;
         last_rows = 0;

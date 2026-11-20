@@ -98,17 +98,17 @@ struct Backend final : e::Backend {
     std::size_t prefill_chunk_rows() const override { return 16; }
     bool prefill_matches_decode() const override { return same; }
     bool prefill_batch_supported() const override { return true; }
-    e::PrefillRows prefill_rows(g::KvTxn& transaction, std::span<const std::uint32_t> ids, bool hidden, bool taps) override {
+    e::PrefillRows prefill_rows(g::KvTxn& transaction, std::span<const std::uint32_t> ids, g::HiddenDemand hidden, bool taps) override {
         rendezvous();
         auto& tx=static_cast<Tx&>(transaction); Json tokens=Json::array(); for(auto id:ids) tokens.push(std::uint64_t(id));
         trace.push(Json(Json::Object{{"prefill",tokens},{"position",tx.start},{"same",same}}));
         for(auto id:ids) row(tx,tx.start+tx.rows.size(),id^(same?0U:0x40000000U));
         e::PrefillRows out; out.tap_width=5*c.hidden;
         if(taps) out.taps.assign(ids.size()*out.tap_width,0.5F);
-        if(hidden) out.hidden.assign(ids.size()*c.hidden,0.25F);
+        if(hidden!=g::HiddenDemand::none) out.hidden.assign(ids.size()*c.hidden,0.25F);
         return out;
     }
-    std::vector<e::PrefillRows> prefill_rows_batch(std::span<const e::PrefillItem> items, bool hidden, bool taps) override {
+    std::vector<e::PrefillRows> prefill_rows_batch(std::span<const e::PrefillItem> items, g::HiddenDemand hidden, bool taps) override {
         trace.push(Json(Json::Object{{"prefill_batch",std::uint64_t(items.size())}}));
         std::vector<e::PrefillRows> out;
         for(const auto& item:items) out.push_back(prefill_rows(*item.transaction,item.tokens,hidden,taps)); return out;

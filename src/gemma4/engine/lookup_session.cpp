@@ -64,7 +64,7 @@ public:
         return out;
     }
     void attach(StreamState& state) override { if (inner_) inner_->attach(state); }
-    [[nodiscard]] bool wants_hidden() const override { return inner_ && inner_->wants_hidden(); }
+    [[nodiscard]] HiddenDemand hidden_demand() const override { return inner_ ? inner_->hidden_demand() : HiddenDemand::none; }
     // Lookup reads committed tokens only, never target taps: forward the inner drafter's need (MTP: none).
     [[nodiscard]] bool wants_taps() const override { return inner_ && inner_->wants_taps(); }
     [[nodiscard]] bool multi_stream_candidate() const override { return inner_ && inner_->multi_stream_candidate(); }

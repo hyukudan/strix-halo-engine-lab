@@ -103,7 +103,7 @@ public:
         auto j=host.identity();if(native_accounting)j.set("backend","gfx1151-device");return j;
     }
     std::size_t prefill_chunk_rows()const override{return prefill_chunk;}
-    e::PrefillRows prefill_rows(g::KvTxn&,std::span<const std::uint32_t>,bool,bool)override {
+    e::PrefillRows prefill_rows(g::KvTxn&,std::span<const std::uint32_t>,g::HiddenDemand,bool)override {
         ++prefill_calls;throw std::runtime_error("unexpected separate prefill in mixed continuation");
     }
     g::ForwardResult forward_rows(std::span<const g::RowPlan> rows)override {

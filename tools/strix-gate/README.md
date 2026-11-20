@@ -348,6 +348,117 @@ hardware, gpu_clock_mhz), `routes` {effective_config: lines of `--effective-conf
 `metrics` (mean + 95 % interval for T and R), `checks`, `tasks`, `controls`, `performance` (`--perf JSON`: tok_s,
 bytes_per_token, ttft_ms, p95_ms; absent keys are null and listed in `missing`).
 
+## FAST gate v2: `gate_v2.py`
+
+A FAST lever changes result bits. The gate asks whether its arithmetic moves the model's predictions more than the
+limits allow. On long prompts and on MoE models, two things unrelated to the lever can make that ruler fail:
+
+- **Routing chaos.** A MoE router picks a few experts per token from hundreds. A rounding-sized change upstream flips
+  some picks, and the flips cascade through the layers. Even a change that is only a different summation order
+  (exact class) moves the logits this way, so the plain gate charges the lever for the reference's own chaos.
+- **Biased labels and too few rows.** dNLL taken on the reference's own greedy tokens is pushed up by any change.
+  With 64-256 rows its standard error is as large as the 0.01 limit.
+
+v2 keeps the limits: KL <= 0.02, top-1 >= 0.93 and dNLL <= 0.01, applied both pooled and **per window** (per prompt).
+It changes what they are measured on:
+
+| rule | what is measured |
+|---|---|
+| R1 route replay (MoE engines) | The lever arm replays the reference's expert ids and weights at every router call, so KL, top-1 and dNLL measure arithmetic, not route flips. Separately, the route flip rate of the lever running free (its own routes) is divided by the flip rate of the null arm running free. That ratio must be <= 1.5. |
+| R2 null-relative window KL | For each window, the KL limit is max(0.02, 1.5 x the null arm's KL on that same window). The null is a one-ulp perturbation, measured under the same replay as the lever. The pooled limits follow the null floor below. Top-1 and dNLL limits stay absolute per window. |
+| R3 held-out dNLL | dNLL is scored on token ids that neither arm generated: the recorded continuation of the text. The gate refuses labels that all equal an arm's own top-1. At least 800 scored rows are needed pooled, and the standard error is printed. |
+
+| R2b three states per window | Top-1 and dNLL pass at the limit (disagreement <= L = max(0.07, 1.5 x the null's disagreement); dNLL <= 0.01), fail above the limit plus 2 standard errors of the window's rows (dNLL se at most 1.5 x the null's se on that window) and are UNRESOLVED in between. An unresolved window is cleared only by its content class (`--classes C.json`, declared before scoring; default the prompt-length band with a manifest, else one class): the class rows are pooled and judged by the same rule, final on >= 800 rows. |
+| R4 reference check | A window where the lever beats the exact reference by more than 3 se, while the paired lever-minus-null difference is also below -3 se, is "reference suspect". A window whose reference NLL is above max(3 x median, median + 2 nats) of the set (>= 3 windows) is "off-distribution": control or chat-template ids, or a timing prompt used as a gate window. Either holds the verdict. |
+
+### Null floor for the pooled bars
+
+On some engines the exact null itself fails a pooled bar: on GLM-5.3 (4 windows x 255 rows) the one-ulp null scores
+pooled KL 0.141 and dNLL +0.052 against the exact reference, and top-1 0.9304 (se 0.008), so no arm, the exact null
+included, could pass KL <= 0.02. **By default, these calculations are advisory only:** the gate still judges
+PASS/FAIL with the original absolute pooled bars. `qual --allow-null-floor` explicitly opts into using the relaxed
+null-relative bars to decide PASS/FAIL; the JSON records `pooled.null_floor.enabled`. Without the opt-in, a candidate
+failing any absolute pooled bar remains FAIL, regardless of the advisory null-floor result.
+When explicitly enabled, a pooled bar is judged against the pooled null of the same windows:
+
+| bar | engaged when the pooled null ... | limit when engaged (relax-only) |
+|---|---|---|
+| KL | + 2 se > 0.02 | max(0.02, null + 0.02) |
+| top-1 | - 2 se < 0.93 | min(0.93, null - 0.01) |
+| dNLL | + 2 se > 0.01 | max(0.01, null + 0.01) |
+
+The pooled null is the row-weighted mean of the null arms over the same windows; se is the row standard error of the
+first null (top-1: binomial). A bar without the null's evidence (no null top-1 or null NLL rows; KL without per-row
+null KL has se 0) stays absolute. The margins are the FAST allowance on top of the floor: one paired standard error of
+lever-minus-null at ~1,000 rows on GLM (KL 0.019-0.023, top-1 0.007-0.010). The floor never relaxes a window, a class
+or the route flip ratio, and it is never applied silently: the `NULL-FLOOR` line prints every pooled bar with its null,
+se, limit and result, and names the bars that pass only under the floor (JSON `pooled.null_floor`).
+
+Exit 0 = PASS, 1 = FAIL, 3 = UNRESOLVED (provisional: the lever stays opt-in for the unresolved classes), 4 = HOLD
+(reference check: examine the exact path on those windows, then re-run), 2 = no verdict. No verdict is given in these cases:
+- fewer than 800 pooled rows;
+- no null arm;
+- labels that are greedy ids;
+- a replay that did not consume the whole reference record;
+- a null that moved no weight, or a null equal to the reference (KL 0: a bitwise re-run or an absorbed perturbation);
+- route files that describe different router call sequences.
+
+The receipt prints, per window:
+- rows;
+- KL with its limit and that window's null KL;
+- top-1;
+- the content class and the reference's own NLL;
+- dNLL with its standard error (and the null's dNLL and se), the pass and fail thresholds and the window state;
+- flip rates and their ratio;
+- the replay record counts.
+
+Then it prints the pooled line.
+
+**Engine side (shared route tap).** A MoE backend binds `include/strix/moe/route_file.hpp` in one place, right after
+its router writes the selected ids and weights. Three environment switches drive it:
+- `STRIX_MOE_ROUTES_OUT=FILE` records each router call.
+- `STRIX_MOE_ROUTES_IN=FILE` replays the calls. The layer, row count and top-k of every call must match the record,
+  otherwise the run stops with an error.
+- `STRIX_MOE_ROUTE_NULL=LAYER:SEED` is the one-ulp null. Every selected weight of that layer moves by one FP32 ulp, up
+  or down by a seeded hash.
+
+At exit the process prints one `strix-route-file/v1 {json}` line on stderr. It holds the records written and consumed,
+the local flips per layer (the arm's own picks against the replayed ones) and the null's nudge count. With no switch
+set, the tap does nothing. Replay needs eager execution; a captured graph is refused.
+
+```sh
+# option_qual runner output (arms: REF {"routes":{"out":true}}, NULL {"routes":{"in":"REF"},
+#   "env":{"STRIX_MOE_ROUTE_NULL":"0:1"}}, FAST {"routes":{"in":"REF"}}, FASTF / NULLF {"routes":{"out":true}})
+python tools/strix-gate/gate_v2.py qual OUT --ref REF --cand FAST --null NULL --cand-free FASTF --null-free NULLF
+# sealed strix-fast-dump arms
+python tools/strix-gate/fast_logit_gate.py compare REF CAND --ranks 0 --tokens p=p.u32 --rule v2 --null-arm NULL \
+    [--route-flips p=ref.rte,cand_free.rte,null_free.rte]
+```
+
+Qwen HIP kit: `scripts/bench/qwen/fast-gate-v2.sh` (one model load per GPU ticket, resumable; arms in
+`fast-gate-v2-arms.json`: REF, NULL, FAST, the free-running FASTF / NULLF, and the single levers Q / G / R).
+
+**Prefill head dumps and engines without a route tap.** A prefill quality tool that writes the logits of a prompt's
+last rows (`<case>-<arm>.f32`, rows x vocabulary FP32, no header) is read with `--format head`. The manifest
+(`NAME TOKENS IDS_PATH` per row) gives the prompt IDs. Row `j` of a dump is scored against the prompt ID that follows it,
+so the labels are held-out text; the last row has no label and is not scored, which leaves 63 scored rows per window of
+64. An engine that has not bound the route tap runs every arm free. KL, top-1 and dNLL then include the route flips,
+which is a harder test than replay. The R1 flip ratio comes from the engine's per-layer trace lines
+(`{"diag":1,"case":...,"arm":...,"layers":[{"router_ids":N,...}]}`, `--trace-diag LOG`). `router_ids` counts the
+reference's experts missing from the arm's selection. The slots are prompt rows x traced layers, the same for the
+candidate and the null, so the ratio is unit-free. A window with no trace line for either arm adds no flips. A trace
+line for only one of the two arms is no verdict.
+
+```sh
+python tools/strix-gate/gate_v2.py qual DUMPS --format head --manifest windows.tsv \
+    --ref exact --cand m16_sh_eng_fast3 --null n_l0_s1 --trace-diag rank0.log --json gate.json
+```
+
+A missing or malformed arm file is a defect of the evidence (exit 2, no verdict), never a FAIL.
+
+A lever that passes v2 and has a measured speed gain is qualified per prompt-length regime (the profile table's
+`fast_regimes` rows) and runs under `--profile fast`.
+
 ## GLM scored prefill compare: `glm_score_nll.py`
 
 The GLM rank captures the last N prompt rows' logits with `STRIX_GLM_PF_SCORE_LAST=N` and

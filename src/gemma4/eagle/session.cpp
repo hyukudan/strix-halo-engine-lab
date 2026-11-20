@@ -31,7 +31,7 @@ std::array<std::uint32_t, 7> Session::propose_window(std::uint32_t anchor, std::
     for (std::uint32_t i = 0; i < k; ++i) out[i] = last_.tokens[i];
     return out;
 }
-bool Session::wants_hidden() const { return drafter_->config().needs_final(); }
+HiddenDemand Session::hidden_demand() const { return drafter_->config().needs_final() ? HiddenDemand::all_rows : HiddenDemand::none; }
 void Session::stage_rows(std::span<const float> taps, std::span<const float> hidden, std::span<const std::uint32_t> next_tokens,
                          std::span<const std::uint64_t> positions) {
     require(!staged_, "previous stage not published/discarded");
@@ -39,8 +39,9 @@ void Session::stage_rows(std::span<const float> taps, std::span<const float> hid
     // The coordinator stages at most eight rows per step (row cap), matching the drafter's stage limit.
     require(positions.size() <= max_rows, "at most eight committed rows per stage");
     const auto H = drafter_->config().target_hidden;
-    require(!wants_hidden() || hidden.size() >= positions.size() * H, "final hidden rows required (RowPlan::export_hidden)");
-    drafter_->stage({taps, wants_hidden() ? hidden.first(positions.size() * H) : std::span<const float>{}, next_tokens, positions});
+    const bool hidden_rows = drafter_->config().needs_final();
+    require(!hidden_rows || hidden.size() >= positions.size() * H, "final hidden rows required (RowPlan::export_hidden)");
+    drafter_->stage({taps, hidden_rows ? hidden.first(positions.size() * H) : std::span<const float>{}, next_tokens, positions});
     staged_ = true;
 }
 void Session::append(std::span<const float>, std::span<const std::uint64_t>) {

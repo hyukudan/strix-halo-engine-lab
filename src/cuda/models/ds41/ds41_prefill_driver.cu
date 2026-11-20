@@ -30,6 +30,7 @@
 #include "strix/ds41_moe.hpp"
 #endif
 #include "strix/ds41_memory_budget.hpp"
+#include "strix/expert_stream_epoch.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -341,9 +342,7 @@ public:
         run_ = true;
         ++run_id_;
         next_use_ = 0;
-        bytes_streamed_ = 0;
-        file_bytes_streamed_ = 0;
-        io_seconds_ = 0.0;
+        epochs_.open(run_id_);  // a preload still reading publishes into its own counters, never into this run's
         wait_seconds_ = 0.0;
         wake_.notify_all();
     }
@@ -390,6 +389,7 @@ public:
     // After the run: the next run's first layers are loaded while idle.
     void end_run() {
         std::lock_guard<std::mutex> lock(mutex_);
+        epochs_.close();  // the run's counters are final: the getters return them unchanged while the idle preload runs
         run_ = false;
         idle_ready_ = false;
         wake_.notify_all();
@@ -408,6 +408,7 @@ public:
             done_.wait(lock, [&] { return idle_ready_ || !error_.empty(); });
             if (!error_.empty()) throw std::runtime_error(error_);
         }
+        double io_s = 0.0;  // decode-residency reads: no run's I/O
         for (std::uint32_t l = std::max(first, first_); l < std::min(stop, end_); ++l) {
             if (tiers_[l] == ExpertTier::device || decode_view_[l] != nullptr) continue;
             for (const auto& s : slots_)
@@ -424,7 +425,7 @@ public:
                 if (tiers_[l] == ExpertTier::host)
                     STRIX_CUDA_CHECK(cudaMemcpyAsync(dst + at, host_view_[l] + at, x.bytes[k], cudaMemcpyHostToDevice, copy_));
                 else
-                    copy_file_to_device(x.offset[k], x.bytes[k], dst + at);
+                    copy_file_to_device(x.offset[k], x.bytes[k], dst + at, io_s);
                 at += x.bytes[k];
             }
             decode_view_[l] = dst;
@@ -450,10 +451,23 @@ public:
     [[nodiscard]] std::uint32_t host_pin_waits() const { return host_pin_waits_; }
     [[nodiscard]] double host_pin_seconds() const { return host_pin_s_; }
 
-    [[nodiscard]] std::uint64_t bytes_streamed() const { return bytes_streamed_; }
-    [[nodiscard]] std::uint64_t file_bytes_streamed() const { return file_bytes_streamed_; }
-    [[nodiscard]] double io_seconds() const { return io_seconds_; }
-    [[nodiscard]] double wait_seconds() const { return wait_seconds_; }
+    // the current run's counters, or the last ended run's final ones (never the idle preload's)
+    [[nodiscard]] std::uint64_t bytes_streamed() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return epochs_.run().bytes;
+    }
+    [[nodiscard]] std::uint64_t file_bytes_streamed() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return epochs_.run().file_bytes;
+    }
+    [[nodiscard]] double io_seconds() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return epochs_.run().io_seconds;
+    }
+    [[nodiscard]] double wait_seconds() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return wait_seconds_;
+    }
     [[nodiscard]] std::size_t device_bytes() const { return device_bytes_; }
     [[nodiscard]] std::size_t resident_bytes() const { return resident_bytes_; }  // resident layers (device_bytes - slots)
     [[nodiscard]] std::size_t pinned_bytes() const { return pinned_bytes_; }
@@ -482,8 +496,9 @@ private:
         return acquired_[layer];
     }
 
-    // file -> pinned staging -> device (the copy stream), aligned superset pieces; blocks until enqueued.
-    void copy_file_to_device(std::uint64_t offset, std::uint64_t bytes, std::uint8_t* dst) {
+    // file -> pinned staging -> device (the copy stream), aligned superset pieces; blocks until enqueued. io_s: the
+    // caller's job-local file-read time (published under mutex_ when the job is done; never a shared counter).
+    void copy_file_to_device(std::uint64_t offset, std::uint64_t bytes, std::uint8_t* dst, double& io_s) {
         if (staging_.empty()) throw std::logic_error("ds41 cuda prefill: file -> device copy without staging (no device tier and no slots)");
         const std::uint64_t A = FileReader::alignment;
         std::uint64_t done = 0;
@@ -495,7 +510,7 @@ private:
             const std::uint64_t a1 = std::min<std::uint64_t>((at + n + A - 1U) / A * A, file_.size());
             const auto t0 = std::chrono::steady_clock::now();
             file_.read_range(a0, static_cast<std::size_t>(a1 - a0), st.buf->get(), std::size_t{8} << 20);
-            io_seconds_ += seconds_since(t0);
+            io_s += seconds_since(t0);
             STRIX_CUDA_CHECK(cudaMemcpyAsync(dst + done, st.buf->get() + (at - a0), n, cudaMemcpyHostToDevice, copy_));
             STRIX_CUDA_CHECK(cudaEventRecord(st.done->e, copy_));
             st.used = true;
@@ -522,8 +537,9 @@ private:
     }
     void upload_layer(std::uint32_t l, std::uint8_t* dev) {
         std::uint64_t at = 0;
+        double io_s = 0.0;  // load-time reads: no run's I/O
         for (int k = 0; k < 3; ++k) {
-            copy_file_to_device(extents_[l].offset[k], extents_[l].bytes[k], dev + at);
+            copy_file_to_device(extents_[l].offset[k], extents_[l].bytes[k], dev + at, io_s);
             at += extents_[l].bytes[k];
         }
         STRIX_CUDA_CHECK(cudaStreamSynchronize(copy_));
@@ -555,20 +571,26 @@ private:
             if (!run_) {
                 // idle: preload the first S streamed layers for the next run (the previous run's kernels finished)
                 idle_prefetch_done = true;
+                // the preload's counters are its own (job-local, published below): a run that ends, reports or
+                // begins while it still reads never sees them
+                const ExpertStreamJob job = epochs_.start_preload();
                 lock.unlock();
+                ExpertStreamCounters pre{};
                 try {
                     STRIX_CUDA_CHECK(cudaDeviceSynchronize());
                     for (std::size_t j = 0; j < slots_.size(); ++j) {
                         auto& s = slots_[j];
                         if (s.layer == static_cast<std::int32_t>(streamed_[j])) continue;
-                        load_into(s, streamed_[j]);
+                        load_into(s, streamed_[j], pre);
                         STRIX_CUDA_CHECK(cudaStreamSynchronize(copy_));
                     }
                     std::lock_guard<std::mutex> g(mutex_);
+                    epochs_.publish(job, pre);
                     if (!run_) idle_ready_ = true;  // decode residency may adopt the slots now
                     done_.notify_all();
                 } catch (const std::exception& e) {
                     std::lock_guard<std::mutex> g(mutex_);
+                    epochs_.publish(job, pre);
                     error_ = e.what();
                     done_.notify_all();
                 }
@@ -579,12 +601,15 @@ private:
             auto& s = slots_[j % slots_.size()];
             const std::uint32_t layer = uses_[j];
             const bool wait_free = j >= slots_.size();
+            const ExpertStreamJob job = epochs_.run_job();  // captured under mutex_: published for this run only
             lock.unlock();
             try {
+                ExpertStreamCounters c{};
                 if (wait_free) STRIX_CUDA_CHECK(cudaStreamWaitEvent(copy_, s.free->e, 0));
-                if (s.layer != static_cast<std::int32_t>(layer)) load_into(s, layer);
+                if (s.layer != static_cast<std::int32_t>(layer)) load_into(s, layer, c);
                 STRIX_CUDA_CHECK(cudaEventRecord(s.ready->e, copy_));
                 std::lock_guard<std::mutex> g(mutex_);
+                epochs_.publish(job, c);
                 s.loaded_run = run_seen;
                 s.loaded_use = j;
             } catch (const std::exception& e) {
@@ -594,7 +619,8 @@ private:
             done_.notify_all();
         }
     }
-    void load_into(Slot& s, std::uint32_t layer) {
+    // acc: the calling job's local counters (loader thread; published under mutex_ by loop())
+    void load_into(Slot& s, std::uint32_t layer, ExpertStreamCounters& acc) {
         s.layer = -1;
         const auto& x = extents_[layer];
         std::uint64_t at = 0;
@@ -602,11 +628,11 @@ private:
             if (tiers_[layer] == ExpertTier::host)
                 STRIX_CUDA_CHECK(cudaMemcpyAsync(s.buf->get() + at, host_view_[layer] + at, x.bytes[k], cudaMemcpyHostToDevice, copy_));
             else
-                copy_file_to_device(x.offset[k], x.bytes[k], s.buf->get() + at);
+                copy_file_to_device(x.offset[k], x.bytes[k], s.buf->get() + at, acc.io_seconds);
             at += x.bytes[k];
         }
-        bytes_streamed_ += x.total();
-        if (tiers_[layer] == ExpertTier::file) file_bytes_streamed_ += x.total();
+        acc.bytes += x.total();
+        if (tiers_[layer] == ExpertTier::file) acc.file_bytes += x.total();
         s.layer = static_cast<std::int32_t>(layer);
     }
 
@@ -628,14 +654,14 @@ private:
     std::size_t next_staging_ = 0;
     cudaStream_t copy_ = nullptr;
     std::thread worker_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::condition_variable wake_, done_;
     bool stop_ = false, run_ = false;
     std::uint64_t run_id_ = 0;
     std::size_t next_use_ = 0;
     std::string error_;
-    std::atomic<std::uint64_t> bytes_streamed_{0}, file_bytes_streamed_{0};
-    double io_seconds_ = 0.0, wait_seconds_ = 0.0;
+    ExpertStreamEpochs epochs_;  // bytes / file bytes / I/O time of the run and of the idle preload, kept apart
+    double wait_seconds_ = 0.0;
     std::size_t device_bytes_ = 0, pinned_bytes_ = 0, resident_bytes_ = 0;
     // decode residency
     bool idle_ready_ = false;                    // the idle preload after the last run (or the load) is done
