@@ -17,6 +17,7 @@
 
 using namespace strix::gemma4;
 using namespace strix::gemma4::gpu;
+namespace g4kv = strix::gemma4::gpu::detail;
 namespace {
 #define CHECK(x) do { if (!(x)) throw std::runtime_error(std::string("check failed: ") + #x + " line " + std::to_string(__LINE__)); } while (false)
 void hip_ok(hipError_t e, const char* what) {
@@ -35,7 +36,7 @@ struct Arena {
     Arena(std::vector<Producer> producers, unsigned rows, std::uint32_t seed) : layout(std::move(producers)) {
         std::mt19937 rng(seed);
         std::uniform_real_distribution<float> value(-4.0F, 4.0F);
-        std::vector<detail::Publication> d(layout.size());
+        std::vector<g4kv::Publication> d(layout.size());
         for (std::size_t l = 0; l < layout.size(); ++l) {
             const auto& p = layout[l];
             const std::size_t cache = std::size_t(p.slots) * p.width, overlay = std::size_t(rows) * p.width;
@@ -54,7 +55,7 @@ struct Arena {
             d[l] = {k.back().as<float>(), v.back().as<float>(), tags.back().as<std::uint64_t>(),
                     ok.back().as<float>(), ov.back().as<float>(), p.slots, p.width, p.global};
         }
-        descriptors = Buffer(d.size() * sizeof(detail::Publication));
+        descriptors = Buffer(d.size() * sizeof(g4kv::Publication));
         descriptors.upload(d.data(), descriptors.size());
     }
     void reset() {
@@ -67,8 +68,8 @@ struct Arena {
         }
         hip_ok(hipDeviceSynchronize(), "reset");
     }
-    void publish(std::uint64_t start, unsigned rows, detail::PublishOrder order) {
-        detail::launch_publication(descriptors.as<detail::Publication>(), unsigned(layout.size()), start, rows, order, nullptr);
+    void publish(std::uint64_t start, unsigned rows, g4kv::PublishOrder order) {
+        g4kv::launch_publication(descriptors.as<g4kv::Publication>(), unsigned(layout.size()), start, rows, order, nullptr);
         hip_ok(hipDeviceSynchronize(), "publish");
     }
     template <class T> static std::vector<T> read(const Buffer& b, std::size_t n) {
@@ -119,22 +120,22 @@ void gate_case(std::uint64_t start, unsigned rows, std::uint32_t seed) {
     const unsigned capacity = unsigned(start) + rows;
     Arena a({{512, 512, false}, {1024, capacity, true}, {0, 512, false}, {6, 37, false}, {8, capacity, true}}, rows, seed);
     a.reset();
-    a.publish(start, rows, detail::PublishOrder::ordered);
+    a.publish(start, rows, g4kv::PublishOrder::ordered);
     const auto ordered = a.state();
     expect_host(a, ordered, start, rows);
     a.reset();
-    a.publish(start, rows, detail::PublishOrder::grid);
+    a.publish(start, rows, g4kv::PublishOrder::grid);
     const auto grid = a.state();
     CHECK(grid == ordered);
 }
-double median_ms(Arena& a, std::uint64_t start, unsigned rows, detail::PublishOrder order, unsigned reps) {
+double median_ms(Arena& a, std::uint64_t start, unsigned rows, g4kv::PublishOrder order, unsigned reps) {
     hipEvent_t b, e;
     hip_ok(hipEventCreate(&b), "event");
     hip_ok(hipEventCreate(&e), "event");
     std::vector<float> ms;
     for (unsigned i = 0; i < reps + 2; ++i) {
         hip_ok(hipEventRecord(b, nullptr), "record");
-        detail::launch_publication(a.descriptors.as<detail::Publication>(), unsigned(a.layout.size()), start, rows, order, nullptr);
+        g4kv::launch_publication(a.descriptors.as<g4kv::Publication>(), unsigned(a.layout.size()), start, rows, order, nullptr);
         hip_ok(hipEventRecord(e, nullptr), "record");
         hip_ok(hipEventSynchronize(e), "sync");
         float t = 0;
@@ -156,9 +157,9 @@ void bench() {
     double bytes = 0;
     for (const auto& p : e4b) bytes += double(rows) * p.width * 4 * 2 * 2; // K+V, read + write
     for (int round = 0; round < 2; ++round)
-        for (const auto order : {detail::PublishOrder::ordered, detail::PublishOrder::grid}) {
+        for (const auto order : {g4kv::PublishOrder::ordered, g4kv::PublishOrder::grid}) {
             const double t = median_ms(a, start, rows, order, 15);
-            std::cout << "{\"publish_bench\":\"" << (order == detail::PublishOrder::grid ? "grid" : "ordered")
+            std::cout << "{\"publish_bench\":\"" << (order == g4kv::PublishOrder::grid ? "grid" : "ordered")
                       << "\",\"round\":" << round << ",\"rows\":" << rows << ",\"producers\":24,\"median_ms\":" << t
                       << ",\"GBps\":" << bytes / (t * 1e6) << "}\n";
         }
