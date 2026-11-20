@@ -223,8 +223,8 @@ inline bool mtp_ngram_draft_admissible(const MtpCliOptions& m) noexcept {
 inline bool mtp_ngram_draft_requested(const MtpCliOptions& m) noexcept {
     return m.ngram_draft || (!m.ngram_off && mtp_ngram_draft_admissible(m));
 }
-// Prompt lookup on the batched HTTP route: the engine's --mtp-ngram-draft mode resolved exactly as for the single
-// request and the CLI (one resolver; =copy / =ctx / =wide configure the drafter through the same builder).
+// Prompt lookup on the batched HTTP route: preserve its historical off-by-default policy while honoring
+// explicit --mtp-ngram-draft[=on|copy|ctx|wide]. The single-request auto policy is NOT a batch opt-in.
 // STRIX_BATCH_NGRAM overrides it when set: 0 / off none, 1 / on the engine's source, ctx the context drafter with its
 // default configuration when the engine mode is not a context mode. A request's "ngram_draft" field still forces it.
 struct MtpBatchLookup {
@@ -237,7 +237,7 @@ inline MtpBatchLookup mtp_batch_lookup(const MtpCliOptions& m, const char* env) 
         const bool context = v == "ctx";
         return {v == "1" || v == "on" || context, context && !m.ngram_context};
     }
-    return {mtp_ngram_draft_requested(m), false};
+    return {m.ngram_draft && !m.ngram_off, false};
 }
 // Fill the sidecar pins of --mtp-draft-profile that were not given; a given pin must agree.
 inline void apply_mtp_draft_profile(MtpCliOptions& m) {
