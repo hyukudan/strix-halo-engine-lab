@@ -136,6 +136,23 @@ int main() try {
         try { (void)agree(good, infinite); } catch (const std::invalid_argument&) { caught = true; }
         require(caught && good.calls == 1U, "an invalid local fit is sent so the peer can also reject it");
     }
+    // agree_max(): one scalar, both ranks return the same max; a bad value is refused after the exchange.
+    {
+        const double v0 = 60.52, v1 = 60.47;
+        std::vector<std::byte> b0(sizeof(double)), b1(sizeof(double));
+        std::memcpy(b0.data(), &v0, sizeof(double));
+        std::memcpy(b1.data(), &v1, sizeof(double));
+        Loopback at0(b1), at1(b0);
+        const double m0 = strix::dist::agree_max(at0, v0), m1 = strix::dist::agree_max(at1, v1);
+        require(m0 == m1 && m0 == v0 && at0.calls == 1U, "agree_max: identical max on both ranks, one exchange");
+        const double bad = -1.0;
+        std::vector<std::byte> bb(sizeof(double));
+        std::memcpy(bb.data(), &bad, sizeof(double));
+        Loopback atb(bb);
+        bool caught = false;
+        try { (void)strix::dist::agree_max(atb, v0); } catch (const std::runtime_error&) { caught = true; }
+        require(caught && atb.calls == 1U, "agree_max: a negative peer value is refused after the exchange");
+    }
     std::cout << "PASS: dist link cost (fit, anchor within 10 %, measure, rank agreement)\n";
     return 0;
 } catch (const std::exception& e) {

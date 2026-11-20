@@ -209,12 +209,37 @@ static void test_fast_refused() {
     check(threw, "divided stage without units refused");
 }
 
+// A measured one-rank pass: the residual over the stage model is one replicated fixed stage, carried by single AND tensor.
+static void test_measured_single() {
+    std::vector<split::Stage> s(3);
+    s[0] = {.name = "rep", .layer = 0U, .axis = split::Axis::replicated, .units = 1U, .bytes = 0.8e9};
+    s[1] = {.name = "heads", .layer = 0U, .axis = split::Axis::heads, .units = 64U, .bytes = 4.8e9, .join = split::Join::gather,
+            .join_bytes_per_row = 4096.0};
+    s[2] = {.name = "rows", .layer = 0U, .axis = split::Axis::columns, .units = 64U, .bytes = 4.8e9, .join = split::Join::gather,
+            .join_bytes_per_row = 4096.0};
+    const split::Costs c{{100e6, 100e6}, {0.0, 4e6}, 0.0, false};
+    auto m = s;
+    const auto cal = split::with_measured_single(m, split::Pass{}, 100e6, 124.0);
+    check(std::fabs(cal.model_ms - 104.0) < 1e-9 && std::fabs(cal.fixed_ms - 20.0) < 1e-9, "residual = measured - model");
+    check(m.size() == 4U && m.back().axis == split::Axis::replicated && m.back().join == split::Join::none, "one replicated stage appended");
+    const auto p = split::plan(m, split::Pass{}, c);
+    check(std::fabs(p.single.ms - 124.0) < 1e-9, "single form = the measured pass");
+    check(std::fabs(p.tensor.compute_ms - 76.0) < 1e-9 && p.tensor.trips == 2U, "tensor form carries the same fixed ms");
+    auto n = s;
+    const auto neg = split::with_measured_single(n, split::Pass{}, 100e6, 90.0);
+    check(neg.fixed_ms == 0.0 && std::fabs(split::plan(n, split::Pass{}, c).single.ms - 104.0) < 1e-9, "a negative residual is not priced");
+    bool threw = false;
+    try { (void)split::with_measured_single(n, split::Pass{}, 100e6, 0.0); } catch (const std::invalid_argument&) { threw = true; }
+    check(threw, "a pass that was not measured is refused");
+}
+
 int main() {
     test_dense_binding_equivalence();
     test_assign_slots();
     test_slot_join_bitwise();
     test_regimes();
     test_fast_refused();
+    test_measured_single();
     std::printf("pair split plan tests: %s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

@@ -1,14 +1,14 @@
 # Committed QSA key service
 
-The native MTP CLI, the single-request HTTP runner and explicitly opted-in HTTP routes can retain one
-derived QSA key service per session. Twelve target entries serve every admitted R2/R4/R8 verifier and serial
+The native MTP CLI, HTTP serving (the single-request runner and every batch slot) and explicitly
+opted-in routes can retain one derived QSA key service per session. Twelve target entries serve every admitted R2/R4/R8 verifier and serial
 fallback. A separate thirteenth entry serves the predictor, including batched
 predictor dispatch. Each HTTP slot owns its own service.
 
 `STRIX_QSA_MTP_POOL=0` restores the historical MTP key paths, admission bytes and
 inspection image. Otherwise the service defaults on when the route and memory
-admit it on the qualified CLI routes and the single-request HTTP runner in the table
-below. HTTP batch slots, nested scheduling, sessions, disk prefix restore and state
+admit it on the qualified CLI routes and on HTTP serving (single runner and batch
+slots) in the table below. Nested scheduling, sessions, disk prefix restore and state
 import require `STRIX_QSA_MTP_POOL=1`.
 Baseline, GSQ, defaults suppression, explicit FP32 pool storage, graphs,
 hierarchical selection, wide-copy writers and explicit cohort requests retain
@@ -27,27 +27,23 @@ scratch envelope reserves eight rows of max(ceil(B / 4), 16384) FP32 words. A
 driver bookkeeping remains subject to the independent physical headroom reserve.
 The reservation is charged once before window construction and per HTTP slot.
 
-## Single-request HTTP runner
+## HTTP serving: single runner and batch slots
 
-The service is on by default on the single-request HTTP runner (`--http-batch 0`,
-or a configuration the batch runner cannot take). That runner serves one request at
-a time from one service: every ordinary request starts a fresh epoch, and the
-in-memory prefix-cache restore hook invalidates both domains before canonical state
-is restored. Sessions, disk prefix restore (`--prefix-cache-dir`), RTX state import,
-serving prefixes and YaRN HTTP keep the opt-in.
+The service is on by default on HTTP serving: the single-request runner (`--http-batch 0`,
+or a configuration the batch runner cannot take) and every slot of the batch runner
+(AUTO, capped or explicit `--http-batch N`). Each request owner holds its own service
+(one per slot): every admitted request starts a fresh epoch (batch admission and
+cancellation included), the in-memory prefix-cache restore hook invalidates both domains
+before canonical state is restored, and when two or more slots decode together the cohort
+cycle scores each member from its own owner. Nested scheduling, sessions, disk prefix
+restore (`--prefix-cache-dir`), RTX state import, serving prefixes and YaRN HTTP keep the opt-in.
 
-AUTO or capped `--http-batch N` sizes its slots without the service. If measured
-startup capacity resolves to one slot, the server falls back to the single runner and
-fits that slot again with the service charged. It keeps the service only if the slot
-still fits; otherwise it runs the historical key paths. Startup prints
-`qsa-mtp-pool single-fallback enabled=0|1 reserved_bytes=N (limit)`. An explicit
-`--http-batch 1` keeps the batch runner. `--print-effective-config` reports the
-`qsa_mtp_pool` object with `route` (`cli`, `http-single`, `http-batch`), `source`
-(`default` or `STRIX_QSA_MTP_POOL=1`) and `effective`: `runtime-admission-required`
-when the route admits the service, or `single-fallback-only` for AUTO/capped batch,
-where only the one-slot fallback can take it. Each response's `qsa_mtp_pool_active`
-reports the actual owner. Product profiles (`--profile default|fast|quality`) carry no
-pool lever and do not change this decision.
+The capacity fit charges the service to every slot, so a one-slot fallback of an AUTO or
+capped batch already fits it. `--print-effective-config` reports the `qsa_mtp_pool` object
+with `route` (`cli`, `http-single`, `http-batch`), `source` (`default` or
+`STRIX_QSA_MTP_POOL=1`) and `effective` (`runtime-admission-required`). Each response's
+`qsa_mtp_pool_active` reports the actual owner. Product profiles (`--profile default|fast|quality`)
+carry no pool lever and do not change this decision.
 
 Qualification, Strix Halo gfx1151, one binary run with the service default on and
 with `STRIX_QSA_MTP_POOL=0`, servers restarted between arms. The configuration was dense-A8
@@ -70,6 +66,19 @@ differences. The requests covered:
   identical to a pool-off one-slot fallback;
 - `--profile fast`, with the same 10 requests as the explicit single runner. Every fast row is pending on
   this route, so it runs the default arithmetic.
+
+Batch slots, Strix Halo gfx1151, Qwen3.8 Flash-Next UD-Q4_K_XL, one binary, AUTO batch at 98,304 context
+(2-3 slots by MemAvailable) unless noted, servers restarted between arms, greedy chat requests of 256-400 tokens:
+
+- token IDs identical with the service default on and with `STRIX_QSA_MTP_POOL=0` for every request: 8.5K
+  sequential, two concurrent 8.5K/9.4K requests (53 two-member cohort cycles), 40K and 80K;
+- `STRIX_QSA_MTP_POOL_CHECK=1` on the 8.5K sequential and two-member cohort requests: 22,220 checks,
+  119.8 M scores, 0 differences;
+- one service per slot (`reserved_bytes=82329600` at 98,304, `218644480` at 262,144), charged per slot; the
+  measured capacity kept the same slot count as pool off at equal MemAvailable (3 slots at 117.5 GB);
+- decode, one request at a time (one A/B pair each): 8.5K 81.0 -> 82.9 tok/s, 40K 62.4 -> 80.6 tok/s,
+  80K 65.0 -> 80.0 tok/s (8-row rounds 96.1 -> 78.0 ms: the per-round block-score recompute of the
+  historical key paths, 17.3 ms at 80K in a kernel trace, is gone).
 
 `strix-hip-qsa-committed-pool-tests` passes natively and with `--yarn-factor 2` and `--yarn-factor 4`.
 
@@ -130,8 +139,8 @@ single-request HTTP runner, YaRN factor-2 MTP CLI through 524K, factor-4 MTP CLI
 through 1M, and serial YaRN.
 The 1M factor-4 prose gate matched all 256 tokens, every committed full-vocabulary
 logit digest, prompt/final target state and predictor state across serial YaRN,
-pooled MTP and pool-off MTP. The single-runner HTTP evidence is above; it does not
-qualify batch slots, nested scheduling or session ownership. Host tests and builds
+pooled MTP and pool-off MTP. The HTTP single-runner and batch-slot evidence is above; it does not
+qualify nested scheduling or session ownership. Host tests and builds
 add no GPU qualification. Final-prefill seeding and selector algorithm changes are not
 part of this service.
 
@@ -141,8 +150,8 @@ The shipped route policy is:
 |---|---|---|
 | Eligible eager tiled CLI | Default on | Native MTP CLI default on when admitted |
 | Adaptive R2/R4/R8 + min-p | Leased CLI enabled | Enabled when admitted |
-| HTTP single runner (incl. in-memory prefix cache) | Off (unsupported) | Default on; one-slot fallback only if the slot fits with it |
-| HTTP batch slots, nested scheduling | Off (unsupported) | Opt-in: `STRIX_QSA_MTP_POOL=1`, per-slot owner |
+| HTTP single runner and batch slots (incl. in-memory prefix cache) | Off (unsupported) | Default on; one owner per slot, charged per slot |
+| HTTP nested scheduling | Off (unsupported) | Opt-in: `STRIX_QSA_MTP_POOL=1`, per-slot owner |
 | Session load/live/follow-up | Off | Opt-in: `STRIX_QSA_MTP_POOL=1`; fixed-session boundaries invalidate |
 | Disk prefix restore, import, serving prefixes | Plain prompt-wide; MTP warm | Opt-in: `STRIX_QSA_MTP_POOL=1`; restore invalidates both domains |
 | YaRN | Serial default on; MTP f2 through 524K and f4 through 1M default on | MTP f2 through 524K and f4 through 1M default on |

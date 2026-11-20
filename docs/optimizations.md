@@ -1254,12 +1254,12 @@ establecen rendimiento.
 The separate [MTP committed key service](engine/qsa-committed-pool.md) uses
 `STRIX_QSA_MTP_POOL` and one thirteen-entry owner per session. The
 [route table](engine/qsa-committed-pool.md) enables it by default on the native MTP CLI,
-on the single-request HTTP runner, and for YaRN MTP CLI factor 2 through 524288 and factor 4 through
-1048576 (with rolling PLE); both `=0` off switches remain authoritative.
+on HTTP serving (the single-request runner and every batch slot), and for YaRN MTP CLI factor 2 through
+524288 and factor 4 through 1048576 (with rolling PLE); both `=0` off switches remain authoritative.
 
-- **Preconditions:** Single HTTP runner: `--http-batch 0`, a configuration the batch runner cannot take, or an AUTO/capped batch whose measured capacity is one slot. In that last case the fallback keeps the service only when the slot still fits with it charged. Includes the in-memory prefix cache. Batch slots, nested scheduling, sessions, disk prefix restore, state import, serving prefixes and YaRN HTTP keep the opt-in `STRIX_QSA_MTP_POOL=1`. Product profiles do not change the decision.
-- **Exactness evidence:** Bitwise per request, same binary, default vs `STRIX_QSA_MTP_POOL=0`: token IDs, prompt state digest, committed target state and the full-vocabulary logits of every committed step. `STRIX_QSA_MTP_POOL_CHECK=1` compared all 13 roles with 0 differences. The timing-based window controller may pick a different R2/R4/R8 owner on the faster cycle, which changes speculative rows and predictor KV but not a committed token. Details in [the route document](engine/qsa-committed-pool.md#single-request-http-runner).
-- **Measured gain:** single HTTP runner, 127.6K-token prompt (131K context), dense-A8 T=8192, R2/R4/R8 prefix windows, in-memory prefix cache, one Strix Halo node, ABBA on one binary: decode 39.5 to 52.0 tok/s on the cold request (+32 %) and 41.6 to 55.8 tok/s on restored follow-up turns (+34 %); prefill unchanged (176-183 s cold, about 7 s restored); tokens identical.
+- **Preconditions:** HTTP serving: the single runner (`--http-batch 0` or a configuration the batch runner cannot take) and every slot of an AUTO, capped or explicit batch, one owner per slot charged per slot in the capacity fit. Includes the in-memory prefix cache. Nested scheduling, sessions, disk prefix restore, state import, serving prefixes and YaRN HTTP keep the opt-in `STRIX_QSA_MTP_POOL=1`. Product profiles do not change the decision.
+- **Exactness evidence:** Bitwise per request, same binary, default vs `STRIX_QSA_MTP_POOL=0`: token IDs, prompt state digest, committed target state and the full-vocabulary logits of every committed step. `STRIX_QSA_MTP_POOL_CHECK=1` compared all 13 roles with 0 differences. Batch slots: token IDs identical per request (8.5K sequential and two concurrent cohort requests, 40K, 80K) and the built-in check 0 differences over 119.8 M scores including two-member cohort cycles. The timing-based window controller may pick a different R2/R4/R8 owner on the faster cycle, which changes speculative rows and predictor KV but not a committed token. Details in [the route document](engine/qsa-committed-pool.md#http-serving-single-runner-and-batch-slots).
+- **Measured gain:** single HTTP runner, 127.6K-token prompt (131K context), dense-A8 T=8192, R2/R4/R8 prefix windows, in-memory prefix cache, one Strix Halo node, ABBA on one binary: decode 39.5 to 52.0 tok/s on the cold request (+32 %) and 41.6 to 55.8 tok/s on restored follow-up turns (+34 %); prefill unchanged (176-183 s cold, about 7 s restored); tokens identical. AUTO batch slots (98,304 context, one request at a time, one A/B pair per length, same binary): 8.5K 81.0 to 82.9 tok/s, 40K 62.4 to 80.6 tok/s, 80K 65.0 to 80.0 tok/s (+23 %, 8-row round 96.1 to 78.0 ms).
 - **Off switch:** `STRIX_QSA_MTP_POOL=0`
 
 <a id="qwen-qsa-decode-select"></a>
@@ -5611,12 +5611,22 @@ split-argmax kernels (`src/core/tp_join.hpp`). The run's `tp link:` line splits 
 exchange; the staged route does not wait for the stream first, the Communicator orders its copy after the producer)
 and `rest`. A vocabulary head that cannot be split (not IU4, or V not a multiple of 64) runs replicated on every rank,
 in the drafter as in the target (`include/strix/pair/tp_layout.hpp` head_columns).
-- **Off switch:** omit `--tp-rank`; `STRIX_TP_F16_GATHER=0` / `STRIX_TP_SPLIT_DRAFT=0` for the levers.
+`STRIX_TP_CHANNEL` (default on; `=0` restores the staged route) carries the in-token gathers on the shared device-waited channel
+(`src/xport/channel_communicator.hpp` over `xport::Channel<tp_gather::Traits>`, `src/xport/tp_gather_traits.hpp`,
+HIP operations `src/xport/hip_channel_runtime.hpp`): a copy kernel publishes this rank's share, the progress thread
+runs the wire, the stream waits on the receive flag, and the host never waits per gather. Same bytes, same slots, same
+stream order and join kernels; `STRIX_TP_XPORT_*` tunes the channel
+(depth, progress CPU, timeout). The run ends by draining the channel, which checks the last messages (deferred
+integrity check): a failure ends the run with an error before any result is printed.
+- **Off switch:** omit `--tp-rank`; `STRIX_TP_F16_GATHER=0` / `STRIX_TP_SPLIT_DRAFT=0` for the levers;
+  `STRIX_TP_CHANNEL=0` for the staged route.
 - **Exactness evidence:** generated ids equal the one-node plain reference over 1,200 tokens (code prompt) with the
   levers on and off, and over 200 plain tokens. The one-node dense IU4 kernels compile to the same ISA as before; only
   the column-share kernel is new.
 - **Measured gain:** two Strix Halo nodes over USB4, EXACT, code prompt, 1,200 tokens with MTP speculation: one node
-  46.76 / 46.68 tok/s, tensor parallel 58.50 tok/s in the same run (+25 %).
+  46.76 / 46.68 tok/s, tensor parallel 58.50 tok/s in the same run (+25 %). Channel route, same prompt and length,
+  ABA in one run each: one node 46.77 / 46.69 tok/s vs channel 65.38 tok/s (x1.40); staged 58.26 / 58.25 tok/s vs
+  channel 65.28 tok/s (+12.1 %); generated ids equal the one-node reference on all six arms.
 
 ### Qwen 27B pair prefill: decode relay to one node
 

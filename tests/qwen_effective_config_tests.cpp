@@ -5034,7 +5034,7 @@ int main(int argc, char** arguments) {
         expect(requested_prefill_environment()==prior_image,"MTP OFF preserves historical printed environment bytes");
         expect(qsa_mtp_pool_bytes(mtp_pool,ModelContract::qwen38_flash_next())==0,"MTP OFF has no extra admission bytes");
         ::unsetenv("STRIX_QSA_MTP_POOL");
-        for(unsigned route=0;route<15U;++route) {
+        for(unsigned route=0;route<18U;++route) {
             auto draft=mtp_pool;
             if(route==0) draft.http_serve=true;
             if(route==1) { draft.http_serve=true;draft.http_batch=8; }
@@ -5050,10 +5050,13 @@ int main(int argc, char** arguments) {
             if(route==11) { draft.http_serve=true;draft.session_mtp_fixed=true; }
             if(route==12) { draft.http_serve=true;draft.session_management_requested=true; }
             if(route==13) { draft.http_serve=true;draft.rtx_state_import=true; }
-            if(route==14) { draft.http_serve=true;draft.qsa_mtp_pool_fallback_unfit=true; }
-            expect(qsa_mtp_pool_route(draft)==(route==0 || route==7 || route==9),
-                "single HTTP (with RAM prefix cache) and YaRN f4 CLI default on; slots, sessions, disk restore and import stay opt-in");
-            expect(qsa_mtp_pool_single_fallback_pending(draft)==(route==1),"only AUTO/capped batch has a pending single fallback");
+            if(route==14) { draft.http_serve=true;draft.http_batch=4;draft.session_live_control=true; }
+            if(route==15) { draft.http_serve=true;draft.http_batch=3;draft.prefix_cache_host_bytes=1; }
+            if(route==16) { draft.http_serve=true;draft.http_batch=1;draft.http_batch_explicit=true;draft.http_batch_cap=1; }
+            if(route==17) { draft.http_serve=true;draft.http_batch=3;draft.prefix_cache_dir="DIR"; }
+            expect(qsa_mtp_pool_route(draft)==(route==0 || route==1 || route==7 || route==9 || route==15 || route==16),
+                "HTTP single and batch slots (with RAM prefix cache) and YaRN f4 CLI default on; nested scheduling, sessions, "
+                "disk restore and import stay opt-in");
             ::setenv("STRIX_QSA_MTP_POOL","1",1);
             expect(qsa_mtp_pool_route(draft),"explicit env enables unqualified M1 route when supported");
             ::setenv("STRIX_QPF2K_DEFAULTS","0",1);
@@ -5071,40 +5074,39 @@ int main(int argc, char** arguments) {
         ::unsetenv("STRIX_PLE_ROLLING");
         {
             auto single=mtp_pool;single.http_serve=true;
-            auto fallback=single;fallback.http_batch=1;
-            auto unfit=single;unfit.qsa_mtp_pool_fallback_unfit=true;
+            auto batch=single;batch.http_batch=3;
             expect(qsa_mtp_pool_bytes(single,ModelContract::qwen38_flash_next())==218644480 &&
-                qsa_mtp_pool_bytes(fallback,ModelContract::qwen38_flash_next())==0 &&
-                qsa_mtp_pool_bytes(unfit,ModelContract::qwen38_flash_next())==0,
-                "batch sizing excludes the pool; an unfit one-slot fallback keeps it out of admission");
-            expect(std::string_view(qsa_mtp_pool_decline(unfit))=="single-fallback-does-not-fit","unfit fallback names its decline");
-            auto cap_one=fallback;cap_one.http_batch_explicit=true;cap_one.http_batch_cap=1;
-            expect(!qsa_mtp_pool_single_fallback_pending(cap_one),"explicit cap 1 keeps the batch runner");
+                qsa_mtp_pool_bytes(batch,ModelContract::qwen38_flash_next())==218644480,
+                "every HTTP slot (single runner or batch) is charged one pool in the capacity fit");
             auto yarn_http=single;yarn_http.rotary=RotaryDescriptor::yarn(2);yarn_http.context_tokens=262144;
-            expect(!qsa_mtp_pool_route(yarn_http),"YaRN HTTP stays closed by default");
+            auto yarn_batch=batch;yarn_batch.rotary=yarn_http.rotary;yarn_batch.context_tokens=262144;
+            expect(!qsa_mtp_pool_route(yarn_http) && !qsa_mtp_pool_route(yarn_batch),"YaRN HTTP stays closed by default");
             for(const auto name:{qwen::profile::Name::standard,qwen::profile::Name::fast,qwen::profile::Name::quality}) {
                 auto profiled=single;profiled.product_profile=qwen::profile::resolve(name,{});
-                auto profiled_fallback=fallback;profiled_fallback.product_profile=profiled.product_profile;
-                expect(qsa_mtp_pool_route(profiled) && qsa_mtp_pool_single_fallback_pending(profiled_fallback),
-                    "product profiles carry no pool lever: the single HTTP decision is profile independent");
+                auto profiled_batch=batch;profiled_batch.product_profile=profiled.product_profile;
+                expect(qsa_mtp_pool_route(profiled) && qsa_mtp_pool_route(profiled_batch),
+                    "product profiles carry no pool lever: the HTTP decision is profile independent");
             }
             const auto pool_json=[](const Options& o) { EffectiveConfig c;c.options=o;return effective_config_json(c); };
             expect(pool_json(single).find("\"qsa_mtp_pool\":{\"requested\":true,\"effective\":\"runtime-admission-required\",\"route\":\"http-single\",\"source\":\"default\"")!=std::string::npos,
                 "inspection reports the default single HTTP pool");
-            expect(pool_json(fallback).find("\"effective\":\"single-fallback-only\",\"route\":\"http-batch\"")!=std::string::npos &&
-                pool_json(fallback).find("\"reserved_bytes\":218644480")!=std::string::npos,
-                "inspection reports the pool the one-slot fallback may admit");
+            expect(pool_json(batch).find("\"qsa_mtp_pool\":{\"requested\":true,\"effective\":\"runtime-admission-required\",\"route\":\"http-batch\",\"source\":\"default\"")!=std::string::npos &&
+                pool_json(batch).find("\"reserved_bytes\":218644480")!=std::string::npos,
+                "inspection reports the default per-slot batch pool");
             for(const char* name:{"STRIX_QSA_MTP_POOL","STRIX_QPF2K_DEFAULTS"}) {
                 ::setenv(name,"0",1);
-                expect(!qsa_mtp_pool_route(single) && !qsa_mtp_pool_single_fallback_pending(fallback) &&
-                    pool_json(single).find("qsa_mtp_pool")==std::string::npos && pool_json(fallback).find("qsa_mtp_pool")==std::string::npos,
-                    "off switches remove the single HTTP pool, its fallback and its inspection object");
+                expect(!qsa_mtp_pool_route(single) && !qsa_mtp_pool_route(batch) &&
+                    pool_json(single).find("qsa_mtp_pool")==std::string::npos && pool_json(batch).find("qsa_mtp_pool")==std::string::npos,
+                    "off switches remove the HTTP pool and its inspection object");
                 ::unsetenv(name);
             }
         }
         mtp_pool.http_serve=true;mtp_pool.qsa_mtp_pool_explicit_opt_in=true;
-        mtp_pool.mtp.copy_wide_rows={32};expect(!qsa_mtp_pool_route(mtp_pool),"wide writers decline before allocation");
-        mtp_pool.mtp.copy_wide_rows.clear();mtp_pool.baseline=true;expect(!qsa_mtp_pool_route(mtp_pool),"baseline retains historical MTP");
+        mtp_pool.mtp.copy_wide_rows={32,16};
+        expect(qsa_mtp_pool_route(mtp_pool) && qsa_mtp_pool_decline(mtp_pool)==nullptr,"wide copy rows keep the pool");
+        mtp_pool.mtp.cohort.resize(1);
+        expect(std::string_view(qsa_mtp_pool_decline(mtp_pool))=="unconverted-writer-span","the CLI cohort still declines");
+        mtp_pool.mtp.cohort.clear();mtp_pool.mtp.copy_wide_rows.clear();mtp_pool.baseline=true;expect(!qsa_mtp_pool_route(mtp_pool),"baseline retains historical MTP");
         // Serial decode pool route: plain append-only CLI only; every multi-request or rewriting route is excluded.
         const auto route = [&](std::vector<std::string> extra) {
             std::vector<std::string> args{"decoder","target.gguf","1","2","3","--generate","4"};
@@ -6058,11 +6060,10 @@ int main(int argc, char** arguments) {
         {
             auto o=candidate();o.tokens={1};
             auto batch=candidate(8);batch.tokens={1};
-            expect(qsa_mtp_pool_decline(o)==nullptr &&
-                std::string_view(qsa_mtp_pool_decline(batch))=="unqualified-route-requires-STRIX_QSA_MTP_POOL=1" &&
+            expect(qsa_mtp_pool_decline(o)==nullptr && qsa_mtp_pool_decline(batch)==nullptr &&
                 ple_reclaim_inactive_reason(o,HipModelResidencyPolicy{},false)=="http-serving" &&
                 !mtp_prompt_phase_separation(o),
-                "QSA pool defaults on for single HTTP only; rolling PLE and phase retirement exclude default HTTP");
+                "QSA pool defaults on for single and batch HTTP; rolling PLE and phase retirement exclude default HTTP");
         }
         for(const bool bundle_selected:{false,true}) {
             auto o=candidate();o.rotary=validate_qwen_rotary_request(2,true,524288,false);
