@@ -2753,14 +2753,16 @@ const std::vector<std::uint32_t>& DeviceForward::run_step(std::span<const std::u
                         std::copy(u.begin(), u.end(), out + gs);
                         std::copy(d.begin(), d.end(), out + 2U * gs);
                     }));
-                for (auto& f : copies) f.get();
-                m.stream_seconds += seconds_since(t0);
+                // Each expert's upload is queued as soon as its own read is in staging, not after every read: the copy
+                // engine moves expert j while later reads still run. Same bytes, slots and kernels as before.
                 for (std::size_t j = 0; j < experts.size(); ++j) {
+                    copies[j].get();
                     const std::uint8_t* in = m.slot_pinned + j * (2U * gs + ds);
                     check(hipMemcpyAsync(m.slot_gate.p + j * gs, in, gs, hipMemcpyHostToDevice, st), "expert gate");
                     check(hipMemcpyAsync(m.slot_up.p + j * gs, in + gs, gs, hipMemcpyHostToDevice, st), "expert up");
                     check(hipMemcpyAsync(m.slot_down.p + j * ds, in + 2U * gs, ds, hipMemcpyHostToDevice, st), "expert down");
                 }
+                m.stream_seconds += seconds_since(t0);  // reads + upload enqueue (the reads dominate)
                 const std::vector<std::uint32_t> counts{static_cast<std::uint32_t>(routes.experts.size()), routes.max_rows};
                 m.built.experts.upload(routes.experts, st);
                 m.built.begins.upload(routes.begins, st);
