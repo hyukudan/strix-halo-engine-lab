@@ -5133,7 +5133,7 @@ and MTP verify windows and smaller blocks run the FAST BF16 experts, so TURBO de
 One word selects every FAST lever qualified for the run's regime (weights source, route, prompt length), from the data table
 `include/strix/profiles/qwen_dense_cuda.hpp`, through the shared resolver (`strix::profile::resolve`). Both CLIs resolve the same table.
 
-- **Preconditions:** `fast` applies `--prefill-arith fast4` + `--prefill-gdn chunk16` on the decode CLI's large prefill with `--turbo-weights onfly|converted`, and `--prefill-attn8 on` from 32,768 prompt tokens. On the spec CLI's decode windows with `--turbo-weights onfly|converted` it applies `--split-k fast` ([split-K FAST](#qwen-dense-cuda-splitk-fast)). Every other regime (exact pack, native NVFP4; split-K on the decode CLI, where `fast` already applies FAST4 and that combination has no gate) keeps its levers pending and runs exact. `turbo` is refused.
+- **Preconditions:** `fast` applies `--prefill-arith fast4` + `--prefill-gdn chunk16` on the decode CLI's large prefill with `--turbo-weights onfly|converted`, and `--prefill-attn8 on` from 8,192 prompt tokens. On the spec CLI's decode windows with `--turbo-weights onfly|converted` it applies `--split-k fast` ([split-K FAST](#qwen-dense-cuda-splitk-fast)). Every other regime (exact pack, native NVFP4; split-K on the decode CLI, where `fast` already applies FAST4 and that combination has no gate) keeps its levers pending and runs exact. `turbo` is refused.
 - **Automatic selection:** none outside `--profile fast`; `quality` has no rows here and equals `default`.
 - **Fallback notice:** the `profile:` block of the effective config lists each lever as `profile` (with the identity it turns on), `explicit-cli`, `off` or `pending` with the regime it needs.
 - **Exactness evidence:** `exact` leaves every option and the effective config unchanged (host test `strix-qwen35-dense-profile-host-tests`). FAST levers carry their own identities (`-pf-fast4`, `-gdnc16`, `-a8`, `-skf1`) and their gates: FAST4 + chunk16 8K / 32K passed; attn8 32K passed; split-K FAST passed.
@@ -5629,3 +5629,25 @@ decodes alone (a layer split only serialises one-row decode).
   placement line, the relayed state size and time, decode tok/s and ids equal to the one-node reference, for both
   settings.
 - **Measured gain:** not measured on this tree.
+
+<a id="hy4-rows-expert-union"></a>
+
+## Hy4-flash verify rows: routed experts of the window read once
+
+**Engine:** `hy4`. **Control:** `STRIX_HY4_ROWS_EXPERT_UNION`. **Default:** on.
+
+A speculative verify window of R rows (R <= 8) runs the step's stages over all rows in one pass; its routed experts
+read each row's 16 experts separately, so the per-row cost of a window was one more row of expert weights (~14 ms per
+row on one node). The window's experts now go through the union rows form of the shared Q4_K x A8 MoE family: the
+distinct experts of the window are listed once, each is read once, and the rows that chose it are computed one after
+another with the single-row instruction sequence.
+
+- **Preconditions:** Hy4-flash verify rows (`strix-hy4-rows`, the speculative decode path), top-16 of 512 experts, Q4_K
+  gate / up with a K-quant down (the C1 envelope of the family).
+- **Exactness evidence:** Bitwise by construction; on device, rows logits equal the step's logits for 30 / 30 rows
+  (R = 1 / 2 / 4 / 8, per-row and union arms), and speculative decode ids equal plain greedy ids (300 ids, code and prose).
+- **Off switch:** `STRIX_HY4_ROWS_EXPERT_UNION=0` keeps the per-row expert loop.
+- **Measured gain:** One node, verify window, 10-rep alternated medians: R2 73.7 -> 68.7 ms, R4 111.1 -> 91.6 ms, R8
+  187.3 -> 137.5 ms. Speculative decode with the shared copy proposer, 300 ids, code prompt: plain 16.65 -> 20.16 tok/s
+  (E 1.37 tokens per pass); prose: no proposals, 17.06 -> 17.06 tok/s.
+- **Implementation / evidence:** [union form](../src/hip_moe_q4k_a8_probe.hip), [plan](../include/strix/moe/expert_union.hpp), [binding](../src/hy4/hip/hy4_hip_rows.inc)

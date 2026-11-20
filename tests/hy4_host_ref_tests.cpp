@@ -201,6 +201,69 @@ void pack_config(const std::string& path) {
               << c.routed_scale << ", clamp " << c.swiglu_limit << "\n";
 }
 
+// The next-token (MTP) block: it never changes the text layers' results; it attends over its own cached positions;
+// truncate + re-step reproduces the same bits (draft rollback), across an indexer group boundary; misuse throws.
+void next_token_block() {
+    auto c = Config::tiny();
+    c.nextn = 1;
+    c.nextn_heads = 2;
+    c.nextn_indexed = 1;
+    c.validate();
+    auto w = synthetic_weights(c, 17);
+    const auto tokens = sequence(10, c.vocab);
+    const auto plain = run(c, *w, tokens);
+    HostRef ref(c, *w);
+    std::vector<std::vector<float>> text, hidden;
+    std::vector<HostRef::NextnStep> first;
+    for (std::uint32_t p = 0; p + 1U < tokens.size(); ++p) {
+        text.push_back(ref.step(tokens[p]));
+        hidden.push_back(ref.last_hidden(false));
+        first.push_back(ref.nextn_step(tokens[p + 1U], hidden.back(), p));
+    }
+    text.push_back(ref.step(tokens.back()));
+    check(text == plain, "next-token steps changed the text layers' logits");
+    check(ref.nextn_positions() == tokens.size() - 1U, "next-token cached positions");
+    bool finite = true;
+    for (const auto& f : first)
+        for (const auto x : f.logits) finite = finite && std::isfinite(x);
+    check(finite && first[0].hidden.size() == c.hidden, "next-token logits / hidden");
+    // rollback: positions 5.. dropped (tiny ratio groups straddle 5), then the same inputs give the same bits
+    ref.nextn_truncate(5);
+    check(ref.nextn_positions() == 5U, "truncate(5)");
+    bool same = true;
+    for (std::uint32_t p = 5; p + 1U < tokens.size(); ++p) {
+        const auto again = ref.nextn_step(tokens[p + 1U], hidden[p], p);
+        same = same && again.logits == first[p].logits && again.hidden == first[p].hidden && again.argmax == first[p].argmax;
+    }
+    check(same, "truncate + re-step must reproduce the bits");
+    // a chained draft (its own hidden, its own argmax) then rollback leaves the teacher path unchanged
+    const auto d1 = ref.nextn_step(first.back().argmax, first.back().hidden, ref.nextn_positions());
+    check(d1.logits.size() == c.vocab, "chained draft");
+    ref.nextn_truncate(static_cast<std::uint32_t>(tokens.size() - 1U));
+    // the block reads its own cache: a different input at position 0 changes position 3's logits
+    HostRef other(c, *w);
+    for (std::uint32_t p = 0; p < 4U; ++p) {
+        (void)other.step(tokens[p]);
+        const auto tok = p == 0U ? (tokens[1] + 1U) % c.vocab : tokens[p + 1U];
+        const auto o = other.nextn_step(tok, hidden[p], p);
+        if (p == 3U) check(o.logits != first[3].logits, "position 3 must see the cached position 0");
+    }
+    bool threw = false;
+    try { (void)other.nextn_step(tokens[0], hidden[0], 7U); } catch (const std::invalid_argument&) { threw = true; }
+    check(threw, "a position other than the cached count must throw");
+    threw = false;
+    auto none = Config::tiny();
+    auto wn = synthetic_weights(none, 17);
+    HostRef plain_ref(none, *wn);
+    (void)plain_ref.step(tokens[0]);
+    try { (void)plain_ref.nextn_step(tokens[1], plain_ref.last_hidden(false), 0U); } catch (const std::invalid_argument&) { threw = true; }
+    check(threw, "a configuration without the block must throw");
+    check(c.truncated(2).nextn == 0U, "truncated models drop the next-token block");
+    threw = false;
+    try { (void)w->tensor("blk." + std::to_string(c.layers) + ".hc_attn_fn.weight"); } catch (const std::out_of_range&) { threw = true; }
+    check(threw, "the next-token block has no hyper-connection tensors");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -213,6 +276,7 @@ int main(int argc, char** argv) {
         indexed_fallback();
         router();
         engram_hash();
+        next_token_block();
         if (argc > 1) pack_config(argv[1]);
     } catch (const std::exception& error) {
         std::cout << "FAIL exception: " << error.what() << "\n";
