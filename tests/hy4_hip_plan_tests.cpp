@@ -229,7 +229,18 @@ void check_profile_regime() {
     CHECK(run(g, one, 16384, {"--profile", "fast"}, &st) == "4096" && st == "profile / qualified");
     CHECK(run(g, one, gated + 1U, {"--profile", "fast"}, &st) == "0" && st == "pending / qualified +reason");
     CHECK(run(hp::Device::unknown, one, 17, {"--profile", "fast"}, &st) == "0" && st == "pending / qualified +reason");
-    CHECK(run(g, hp::Topology::pair, 17, {"--profile", "fast"}, &st) == "0" && st == "pending / qualified +reason");
+    // the pair inherits each width's one-node gate by identity (same bits at the same width), over the same prompt range
+    const auto pair = hp::Topology::pair;
+    CHECK(run(g, pair, 17, {"--profile", "fast"}, &st) == "4096" && st == "profile / qualified");
+    CHECK(run(g, pair, gated, {"--profile", "fast"}, &st) == "4096" && st == "profile / qualified");
+    CHECK(run(g, pair, gated + 1U, {"--profile", "fast"}, &st) == "0" && st == "pending / qualified +reason");
+    CHECK(run(hp::Device::unknown, pair, 17, {"--profile", "fast"}, &st) == "0" && st == "pending / qualified +reason");
+    for (const char* w : {"1024", "2048", "4096"}) {
+        CHECK(run(g, pair, 8192, {"--prompt-rows", w}, &st) == w && st == "explicit-cli / qualified");
+        CHECK(run(g, one, 8192, {"--prompt-rows", w}, &st) == w && st == "explicit-cli / qualified");
+        CHECK(run(g, pair, gated + 1U, {"--prompt-rows", w}, &st) == w && st == "explicit-cli / unqualified: prompt_rows");
+    }
+    CHECK(run(g, pair, 8192, {"--prompt-rows", "512"}, &st) == "512" && st == "explicit-cli / unqualified: prompt_rows");
     CHECK(run(g, one, 17, {}, &st) == "0" && st == "builtin / qualified");
     CHECK(run(g, one, 17, {"--prompt-rows", "4096"}, &st) == "4096" && st == "explicit-cli / qualified");
     CHECK(run(g, one, 32568, {"--prompt-rows", "4096"}, &st) == "4096" && st == "explicit-cli / qualified");

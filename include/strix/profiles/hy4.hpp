@@ -6,9 +6,10 @@
 // receipt. The device path has no EXACT class today (A8 routed experts, absorbed MLA: compared with the CPU oracle by
 // ids, never called exact), so `default` is the plain invocation (prompt position by position, exports nothing).
 // The batched prompt windows (prompt_rows) are FAST: qualified by gate v2 (route-replayed reference, one-ulp null,
-// per-window limits) on gfx1151 one node over the prompt range of the receipts below; outside a qualified regime the
-// fast cell is pending (runs only with --allow-pending or an explicit --prompt-rows, stamped "unqualified"). The layer
-// split (pair cut, windows crossing as FP32 rows) changes no bit and is not a profile lever. No TURBO version: turbo is
+// per-window limits) on gfx1151 one node over the prompt range of the receipts below, and on the pair by identity with
+// one node; outside a qualified regime the fast cell is pending (runs only with --allow-pending or an explicit
+// --prompt-rows, stamped "unqualified"). The layer split (pair cut, windows crossing as FP32 rows) changes no bit and is
+// not a profile lever. No TURBO version: turbo is
 // refused. Promoting a regime after its gate is one `qualified` row, never code. Host-only.
 #include "strix/engine_profile.hpp"
 
@@ -83,6 +84,21 @@ inline constexpr Qualified qualified[] = {
     {"prompt_rows", "4096", Device::gfx1151, Topology::one_node, 32568,
      "bitwise == prompt_rows 2048 (dumped logits cmp, code 8,192 and 32,568 tokens, build 8ecdaeabfcab) -> the 2048 gate "
      "receipts above; prefill 8K 631.3 -> 650.7 tok/s, 32K 615.1 -> 629.8 tok/s"},
+    {"prompt_rows", "1024", Device::gfx1151, Topology::one_node, 32568,
+     "bitwise == prompt_rows 2048 (logits_fnv64 3998f68136de649a at 4,096 tokens, aa0554f4a6790a56 at 8,192) -> the 2048 "
+     "gate receipts above; one node 1024 rows cost +7.4 % per row at 8K (13,503 vs 12,573 ms)"},
+    // The layer split computes the one-node bits at the same window width (shared stage-plan invariant, hy4_hip_plan
+    // stage_window_plan), so the pair inherits the one-node gate of each width by identity, not by a second gate run:
+    // pair logits_fnv64 == one node at 4,096 tokens rows 1024, 8,192 rows 2048 and 32,768 rows 2048. The width itself is a
+    // flow-shop choice (two_stage_window_rows: wall = (windows + 1) x half-window); every qualified width has the same bits.
+    {"prompt_rows", "1024", Device::gfx1151, Topology::pair, 32568,
+     "pair == one node (logits_fnv64 3998f68136de649a, 4,096 tokens rows 1024) -> the one-node 1024 row"},
+    {"prompt_rows", "2048", Device::gfx1151, Topology::pair, 32568,
+     "pair == one node (logits_fnv64 aa0554f4a6790a56 at 8,192 tokens, 62b91f1ca6ed8e8e at 32,768, rows 2048) -> the "
+     "one-node 2048 gate receipts"},
+    {"prompt_rows", "4096", Device::gfx1151, Topology::pair, 32568,
+     "pair == one node at the same width (rows 1024 / 2048 receipts) and one node 4096 == 2048 -> the one-node 2048 gate "
+     "receipts"},
     // The head copy changes only the decode head's weights (no prompt dependence: no bound); the layer split changes no
     // bit, so the pair's head stage computes the same logits as one node.
     {"head_q8", "1", Device::gfx1151, Topology::one_node, kNoPromptBound,
