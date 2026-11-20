@@ -289,7 +289,8 @@ struct Forward::Impl {
         std::uint32_t* top = nullptr;              // pinned host [kNextnRows]: the greedy id of a want_top row
         float *pre = nullptr, *post = nullptr;     // device [kNextnRows][hidden]
         float *x = nullptr, *cat = nullptr, *act = nullptr;  // [hidden] residual, [2 hidden] eh_proj input, [top_k][expert_ff]
-        std::array<std::uint32_t, 64> ids_host{};  // routed ids of a BF16 expert row
+        Staging* stages = nullptr;  // pinned, one per row of a call: rows run with no host sync between them, so each row's
+                                    // async uploads (position, dense list length) read their own slot
         std::vector<float> logits;                 // host copy of the last want_top row (nextn_logits)
         bool logits_ready = false;
         float* ph = nullptr;                       // [rmax][hidden] prompt rows: output_norm(hc_head collapse)
@@ -550,6 +551,30 @@ struct Forward::Impl {
         linear(tw.p, tw.type, x, width, outputs, y, round, bias);
     }
 
+    // linear() (no rounding) over `groups` weight slices of [outputs][width] in ONE launch of the shared grouped dense rows:
+    // group g = slice gids[g] (device ids, no host read) or g, input x + g * x_stride, output y + g * y_stride; every output
+    // bitwise equal to its own linear() call (tests/hip_dense_rows_tile_tests.hip).
+    void linear_groups(const std::uint8_t* weights, std::uint32_t type, std::uint64_t slice_bytes, std::uint32_t slices,
+                       const std::uint32_t* gids, std::uint32_t groups, const float* x, std::uint32_t x_stride, std::uint32_t width,
+                       std::uint32_t outputs, float* y, std::uint32_t y_stride) {
+        HipDenseRowsView v;
+        v.x = x;
+        v.input = HipActivationStorage::fp32;
+        v.weights = weights;
+        v.ggml_type = type;
+        v.width = width;
+        v.outputs = outputs;
+        v.out = y;
+        v.groups = groups;
+        v.group_ids = gids;
+        v.group_slices = slices;
+        v.group_weight_bytes = slice_bytes;
+        v.group_x_stride = x_stride;
+        v.group_out_stride = y_stride;
+        launch_hip_dense_rows(v, s);
+        check(hipGetLastError(), "grouped linear launch");
+    }
+
     void sync_time(double& slot, std::chrono::steady_clock::time_point& mark) {
         if (!timing) return;
         check(hipStreamSynchronize(s), "timing sync");
@@ -678,9 +703,7 @@ struct Forward::Impl {
         const auto& kb = t(blk(l, "attn_k_b.weight"));
         const auto kb_head = row_bytes(kb.type, c.qk_nope) * kl;
         if (kb.type == 8U) strix::q8_rows::launch_heads_f32(kb.p, H, c.qk_nope, kl, qv, qk, qfull, row, s);  // Q8_0: one launch
-        else
-            for (std::uint32_t h = 0; h < H; ++h)
-                linear(kb.p + h * kb_head, kb.type, qv + std::size_t{h} * qk, c.qk_nope, kl, qfull + std::size_t{h} * row, false);
+        else linear_groups(kb.p, kb.type, kb_head, H, nullptr, H, qv, qk, c.qk_nope, kl, qfull, row);  // one grouped launch
         check(hipMemcpy2DAsync(qfull + kl, row * 4U, qv + c.qk_nope, qk * 4U, rope * 4U, H, hipMemcpyDeviceToDevice, s), "q rope copy");
         check(dcr::store_rows({qfull, row, nullptr, 0U, H, {row, 0U}, qt, flag}, s), "query operand image");
         const float* sinks = t(blk(l, "attn_sinks.weight")).f();
@@ -703,9 +726,7 @@ struct Forward::Impl {
         const auto& vb = t(blk(l, "attn_v_b.weight"));
         const auto vb_head = row_bytes(vb.type, kl) * vd;
         if (vb.type == 8U) strix::q8_rows::launch_heads_f32(vb.p, H, kl, vd, olat, kl, o, vd, s);  // Q8_0: one launch
-        else
-            for (std::uint32_t h = 0; h < H; ++h)
-                linear(vb.p + h * vb_head, vb.type, olat + std::size_t{h} * kl, kl, vd, o + std::size_t{h} * vd, false);
+        else linear_groups(vb.p, vb.type, vb_head, H, nullptr, H, olat, kl, kl, vd, o, vd);  // one grouped launch
         glu::launch_epilogue<glu::Round::bf16>(o, nullptr, H * vd, std::size_t{H} * vd, o, s);
         glu::launch_sigmoid_gate<glu::DeclaredExp, glu::Round::bf16>(o, gate, std::size_t{H} * vd, o, s);
         linear(blk(l, "attn_output.weight"), o, H * vd, c.hidden, f);
@@ -714,29 +735,24 @@ struct Forward::Impl {
     }
 
     // Routed experts of a BF16 block (the next-token block; the oracle's order, hy4_host_ref ffn): the device route's ids
-    // read once (one sync), then per expert e the shared dense rows on its slices g, u = W[e] z (BF16 outputs),
-    // act = swiglu(g, u, swiglu_limit), rawdots[k] = W_d[e] act (rounded by the caller's epilogue). 3 x top_k launches.
+    // stay on the device: the shared grouped dense rows read them (no host read, no sync): g, u = W[ids[k]] z for the
+    // top_k slices (one launch each, BF16 outputs), act = swiglu(g, u, swiglu_limit), rawdots[k] = W_d[ids[k]] act[k]
+    // (one launch; rounded by the caller's epilogue). 3 launches; every output bitwise equal to its per-expert linear().
+    // A routed id outside the experts writes NaN (caught by the non-finite checks downstream).
     void experts_dense(const Tensor& wg, const Tensor& wu, const Tensor& wd) {
         const std::uint32_t K = c.top_k, I = c.expert_ff, L = c.latent;
-        if (!nx.act || K > nx.ids_host.size()) throw std::logic_error("hy4 hip forward: BF16 experts without the next-token workspace");
+        if (!nx.act) throw std::logic_error("hy4 hip forward: BF16 experts without the next-token workspace");
         if (wu.type != wg.type || wd.type != wg.type) throw std::runtime_error("hy4 hip forward: mixed BF16 expert types");
-        check(hipMemcpyAsync(nx.ids_host.data(), ids, K * 4U, hipMemcpyDeviceToHost, s), "expert ids read");
-        check(hipStreamSynchronize(s), "expert ids sync");
         const std::uint64_t gate_slice = row_bytes(wg.type, L) * I, down_slice = row_bytes(wd.type, I) * L;
         if (wg.bytes != gate_slice * c.experts || wu.bytes != gate_slice * c.experts || wd.bytes != down_slice * c.experts)
             throw std::runtime_error("hy4 hip forward: BF16 expert shapes");
         float* const gk = pout;                        // [K][I]
         float* const uk = pout + std::size_t{K} * I;   // [K][I]
-        for (std::uint32_t k = 0; k < K; ++k) {
-            const std::uint32_t ex = nx.ids_host[k];
-            if (ex >= c.experts) throw std::runtime_error("hy4 hip forward: routed expert id outside the experts");
-            linear(wg.p + ex * gate_slice, wg.type, z, L, I, gk + std::size_t{k} * I, false);
-            linear(wu.p + ex * gate_slice, wu.type, z, L, I, uk + std::size_t{k} * I, false);
-        }
+        linear_groups(wg.p, wg.type, gate_slice, c.experts, ids, K, z, 0U, L, I, gk, I);
+        linear_groups(wu.p, wu.type, gate_slice, c.experts, ids, K, z, 0U, L, I, uk, I);
         glu::launch_epilogue<glu::Round::bf16>(pout, nullptr, 2U * std::size_t{K} * I, 2U * std::size_t{K} * I, pout, s);  // BF16 Linear outputs
         glu::launch_swiglu<glu::DeclaredExp, glu::Round::bf16>(gk, uk, std::size_t{K} * I, c.swiglu_limit, nx.act, s);
-        for (std::uint32_t k = 0; k < K; ++k)
-            linear(wd.p + nx.ids_host[k] * down_slice, wd.type, nx.act + std::size_t{k} * I, I, L, rawdots + std::size_t{k} * L, false);
+        linear_groups(wd.p, wd.type, down_slice, c.experts, ids, K, nx.act, I, I, L, rawdots, L);
         check(hipGetLastError(), "BF16 experts launch");
     }
 
@@ -1315,6 +1331,9 @@ struct Forward::Impl {
         nx.x = alloc<float>(h);
         nx.cat = alloc<float>(2U * h);
         nx.act = alloc<float>(std::size_t{c.top_k} * c.expert_ff);
+        void* sp = nullptr;
+        check(hipHostMalloc(&sp, kNextnRows * sizeof(Staging), hipHostMallocDefault), "next-token row staging");
+        nx.stages = static_cast<Staging*>(sp);
         void* tp = nullptr;
         check(hipHostMalloc(&tp, kNextnRows * sizeof(std::uint32_t), hipHostMallocDefault), "next-token ids");
         nx.top = static_cast<std::uint32_t*>(tp);
@@ -1337,6 +1356,7 @@ struct Forward::Impl {
         const std::size_t h = c.hidden;
         const auto& te = t("token_embd.weight");
         const std::uint32_t saved = pos;  // attention / indexer read the query position from pos (the oracle's form)
+        Staging* const saved_stage = stage;
         nx.logits_ready = false;
         std::uint32_t bad = 0;
         try {
@@ -1344,7 +1364,10 @@ struct Forward::Impl {
                 const std::uint32_t p = p0 + r;
                 pos = p;
                 hpos = {p, p / kIdxRatio * kIdxRatio, p / kIdxRatio, 0U};
-                stage->pos = hpos;  // pinned; the previous row ended with the expert-id sync, the step / pass with its own
+                // the row's own pinned slot: no host sync between rows, so row r's queued uploads (position here, the
+                // dense list length in attention) must not be overwritten by row r + 1; the call ends with a sync
+                stage = nx.stages + r;
+                stage->pos = hpos;
                 check(hipMemcpyAsync(dpos, stage->pos.data(), sizeof hpos, hipMemcpyHostToDevice, s), "next-token position upload");
                 const std::array<std::uint32_t, 1> one{toks[r]};
                 launch_hip_embedding_rows({te.p, te.type, c.hidden, c.vocab}, HipActivationStorage::fp32, one, nx.x, c.hidden, s);
@@ -1372,9 +1395,11 @@ struct Forward::Impl {
             check(hipStreamSynchronize(s), "next-token sync");
         } catch (...) {
             pos = saved;
+            stage = saved_stage;
             throw;
         }
         pos = saved;
+        stage = saved_stage;
         if (bad) throw std::runtime_error("hy4 hip forward: non-finite value in a cache / operand row (next-token block)");
         if (want_top) {
             if (greedy_reply->status != 0U) throw std::runtime_error("hy4 hip forward: non-finite logit (next-token greedy status)");
@@ -1449,6 +1474,7 @@ Forward::~Forward() {
     if (impl_ && impl_->stage) (void)hipHostFree(impl_->stage);
     if (impl_ && impl_->engram_stage) (void)hipHostFree(impl_->engram_stage);
     if (impl_ && impl_->nx.top) (void)hipHostFree(impl_->nx.top);
+    if (impl_ && impl_->nx.stages) (void)hipHostFree(impl_->nx.stages);
 }
 const float* Forward::rows_hidden() const noexcept { return impl_->vr.xn; }
 bool Forward::has_nextn() const noexcept { return impl_->nx.on; }
