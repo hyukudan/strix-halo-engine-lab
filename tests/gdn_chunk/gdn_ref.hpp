@@ -1,16 +1,16 @@
 #pragma once
 // CPU references of the gated delta rule (test only): the serial recurrence of gdn.hpp (any float type, key order ascending, the
-// incumbent kernel's order) and the chunk form of strix/cuda_core/gdn_chunk.hpp (float, FMA like the kernels).
+// incumbent kernel's order) and the chunk form of strix/gdn_chunk.hpp (float, FMA like the kernels).
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
 
-#include "strix/cuda_core/gdn_chunk.hpp"
+#include "strix/gdn_chunk.hpp"
 
 namespace gdnref {
 constexpr int D = 128;
-constexpr int C = static_cast<int>(strix::cuda_core::gdn_chunk::kChunk);
+constexpr int C = static_cast<int>(strix::gdn_chunk::kChunk);
 
 struct Problem {
     int key_heads = 2, value_heads = 6, rows = 0;

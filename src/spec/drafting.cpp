@@ -512,12 +512,24 @@ Decision Arbiter::decide(const StepInput& input) {
         d.probe = true;
         model_barred_until_ = 0;
     } else if (model_n > 0 && d.source != Source::model && explore) {
+        // Charged like the frontier probe (ArbiterConfig::charge_probe): the deepest legal window whose priced excess over
+        // the pick (probe wall - probe tokens at the pick's rate) stays within frontier_loss of probe_every pick passes;
+        // none = the shallowest legal window, so exploration never stops. Short contexts: the deepest window's excess is
+        // <= 0 and the probe is the previous one; long contexts (K/V-priced verify rows) cap its depth.
+        const bool charge = config_.charge_probe && d.expected_ms > 0.0 && d.expected_tokens > 0.0 && std::isfinite(d.expected_ms);
+        const double pick_ms_per_token = charge ? d.expected_ms / d.expected_tokens : 0.0;
+        const double budget = config_.frontier_loss * double(config_.probe_every) * d.expected_ms;
         std::uint32_t k = 0, rows = 0;
-        for (const auto w : config_.windows)
-            if (w >= 2 && w <= input.max_rows) { k = std::min(w - 1, model_n); rows = physical(k + 1); }
+        double tokens = 0.0, ms = 0.0;
+        for (const auto w : config_.windows) {
+            if (w < 2 || w > input.max_rows) continue;
+            const auto kw = std::min(w - 1, model_n);
+            const auto rw = physical(kw + 1);
+            const double tw = expected(Source::model, 0, kw), mw = verify_ms(rw, ctx) + draft_ms(kw);
+            if (k == 0 || !charge || mw - tw * pick_ms_per_token <= budget) { k = kw; rows = rw; tokens = tw; ms = mw; }
+        }
         if (k > 0) {
-            d = Decision{Source::model, k, rows, rows > k + 1, expected(Source::model, 0, k),
-                         verify_ms(rows, ctx) + draft_ms(k), true};
+            d = Decision{Source::model, k, rows, rows > k + 1, tokens, ms, true};
             model_barred_until_ = 0;
         }
     }

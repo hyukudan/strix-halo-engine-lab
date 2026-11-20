@@ -39,6 +39,7 @@ model-include src/hip_q8_rows_gemv.hpp 1
 model-include src/hip_serial_graph.hip 1
 model-include src/hip_shared_expert_launcher.hip 1
 model-include src/hy4/hip/hy4_hip_forward.hip 2
+model-include src/hy4/ref/hy4_dfly_ref.cpp 1
 model-include src/hy4/ref/hy4_host_ref.cpp 2
 model-include src/known_prefix_prefill_runtime.cpp 2
 model-include src/moe_core/route_wave_kernel.hpp 1
