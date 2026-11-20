@@ -330,6 +330,17 @@ void one_way_carry() {
 
 int main() {
     setenv("STRIX_HOST_ANON_PIN", "0", 1);
+    // HIP's pinned allocations must support the alignas(64) staged readiness control lines. A CPU stub
+    // based on calloc's max_align_t guarantee is insufficient even when most ordinary tests happen to pass.
+    void* coherent = nullptr;
+    expect(hipHostMalloc(&coherent, sizeof(StagedReady), hipHostMallocCoherent) == hipSuccess && coherent != nullptr,
+           "HIP stub coherent allocation");
+    if (coherent) {
+        expect(reinterpret_cast<std::uintptr_t>(coherent) % alignof(StagedReady) == 0U,
+               "HIP stub pinned memory must align StagedReady");
+        (void)hipHostFree(coherent);
+    }
+    if (failures) return 1;
     std::fputs("[dist-contract] starting carry_interop\n", stderr);
     carry_interop();
     std::fputs("[dist-contract] starting one_way_routes\n", stderr);
