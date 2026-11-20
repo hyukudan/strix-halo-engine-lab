@@ -2320,6 +2320,24 @@ change acceptance, not committed target-greedy tokens. Compare within one load w
   28K x 400 tokens, one run per arm, token ids equal: code 121.54 -> 176.56 tok/s (verify 28.84 -> 19.30 ms per step),
   reasoning 130.54 -> 194.64, prose 101.29 -> 135.84.
 
+<a id="qwen27-cuda-mtp-kv-catchup"></a>
+
+### Qwen 27B CUDA spec: K/V-only MTP catch-up
+
+**Engine:** `qwen-rtx` (27B dense, CUDA: `strix-cuda-qwen35-spec`). **Control:** `--mtp-catchup kv|full`. **Default:**
+`kv` where the engine has the hook. **Home:** shared (host spec layer `include/strix/spec/mtp_chain.hpp`: the
+`MtpKvEngine` concept and the catch-up policy); the CUDA Qwen adapter supplies `mtp_kv` (`src/qwen35/cuda/engine.cu`).
+
+- The MTP chain catches up on committed positions lazily. A catch-up chunk whose block output and draft are never read
+  needs only the MTP layer's K/V; with the hook it issues the same K and V projections, in the same order and with the
+  same operands, and skips q, attention, o_proj, MLP, the MTP norm and the head. K/V bits and drafts are unchanged.
+- Engines without `mtp_kv` are unchanged (concept + `if constexpr`). HIP runs the same shared chain and adopts the
+  form by adding `mtp_kv` to its adapter.
+- Measured (EXACT, RTX PRO 6000 Blackwell, 28,187-token prompt, `--prefill-route large`, one pair): ids, steps and the
+  k histogram equal to `full`; MTP feed 1.960 s -> 0.091 s; decode unchanged (121.78 vs 121.39 tok/s).
+  Not yet measured: the default `windows` prompt route.
+- **Off switch:** `--mtp-catchup full`.
+
 <a id="rtx-kernels"></a>
 
 ### Decode kernel bundle
@@ -4321,23 +4339,27 @@ selections overlap and share latent lines in L2, while a row's absorbed query is
 
 <a id="glm-pf-kda-scan-v3"></a>
 <a id="glm-pf-kda-scan-v5"></a>
+<a id="glm-pf-kda-scan-v6"></a>
 
-### Prefill KDA scan v5
+### Prefill KDA scan v6
 
-**Engine:** `glm`. **Control:** `STRIX_GLM_PF_KDA_SCAN`. **Default:** 5.
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_KDA_SCAN`. **Default:** 6.
 
 The token-sequential KDA recurrence of a prefill chunk keeps every lane's chains and the 128-key pairing tree; the two
 tree levels that cross lanes of a quad (q ^ 2, q ^ 1) read the partner's value through quad DPP moves instead of
 `ds_bpermute` shuffles, which takes four LDS round trips off every token's serial path (v3). v5 also takes the batch
 fill off the serial path: the next 8 tokens' q / k / g are loaded into registers while the current tokens run and are
-stored into the other half of a double LDS buffer (24 KB in all), one barrier per batch.
+stored into the other half of a double LDS buffer (24 KB in all), one barrier per batch. v6 removes the separate prep
+launch: each token's raw row is staged in LDS and the conv, SiLU, norms, gate and beta of v5's prep kernel run inside the
+scan's batch fill (32,576 B of LDS, 186 VGPRs, 2 workgroups per CU as v5); the non-finite test is taken once on the final
+state (non-finite values are absorbing).
 
 - **Preconditions:** Exact chunked prefill.
-- **Automatic selection:** Unset resolves to 5; the resolver reports it. Explicit values win.
+- **Automatic selection:** Unset resolves to 6; the resolver reports it. Explicit values win.
 - **Fallback notice:** None.
 - **Exactness evidence:** Raw scan outputs, outputs and states after every chunk bitwise equal to v1 and to the decode kernel on the prefill gate (real and synthetic weights, special rows).
-- **Off switch:** STRIX_GLM_PF_KDA_SCAN=3 (v3) or =1 (v1)
-- **Measured gain:** v5 1.18-1.20 vs v3 1.23-1.25 us/row per KDA layer (-3.7 %); rank 0 of an 8K pair prefill 0.355 -> 0.340 s in the scan, 8K TTFT 16.60 vs 16.60 s (mean of 8 arms, both run orders: neutral); v3 1.84-1.93 -> 1.23-1.28 us/row per KDA layer at chunk positions 0 / 4096 / 28672 (-33 %); rank 0 of an 8K pair prefill 0.534 -> 0.355 s in the scan, of a 32K one 2.15-2.22 -> 1.43-1.44 s; 8K TTFT 16.63 -> 16.34 s (-1.7 %, alone). Together with MLA scores v6: 32K TTFT 68.76 -> 67.72 s (-1.5 %, mean of both run orders), logits bitwise equal on both ranks
+- **Off switch:** STRIX_GLM_PF_KDA_SCAN=5 (v5), =3 (v3) or =1 (v1)
+- **Measured gain:** v6 prep + conv + scan 2.02 -> 1.82 us/row per KDA layer at C=4096 (2.00 -> 1.82 at C=2048; layer bench, v5 and v6 paired per repetition; v6 bitwise == decode on the prefill gate, 52 checks); v5 1.18-1.20 vs v3 1.23-1.25 us/row per KDA layer (-3.7 %); rank 0 of an 8K pair prefill 0.355 -> 0.340 s in the scan, 8K TTFT 16.60 vs 16.60 s (mean of 8 arms, both run orders: neutral); v3 1.84-1.93 -> 1.23-1.28 us/row per KDA layer at chunk positions 0 / 4096 / 28672 (-33 %); rank 0 of an 8K pair prefill 0.534 -> 0.355 s in the scan, of a 32K one 2.15-2.22 -> 1.43-1.44 s; 8K TTFT 16.63 -> 16.34 s (-1.7 %, alone). Together with MLA scores v6: 32K TTFT 68.76 -> 67.72 s (-1.5 %, mean of both run orders), logits bitwise equal on both ranks
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp)
 
 ### Prefill pipeline and async exchange start
@@ -4875,7 +4897,7 @@ token. A request whose prompt extends a stored key restores the longest one and 
 through the usual chunk scheduler. `strix.prefix_cache` reports `hit_tokens`, `prefill_tokens` and `restore_ms`.
 
 - **Preconditions:** `strix-glm5-serve`; the same budget on both ranks (unequal budgets are refused at the handshake).
-- **Automatic selection:** A store commits only when both ranks snapshot the same bytes and each rank has at least 16 GiB MemAvailable; a miss or a refused store prefills the whole prompt.
+- **Automatic selection:** A store commits only when both ranks snapshot the same bytes and each rank's MemAvailable covers the snapshot plus the load admission's RAM margin (8 GiB, STRIX_GLM_MEM_MARGIN_GIB); a miss or a refused store prefills the whole prompt.
 - **Fallback notice:** None.
 - **Exactness evidence:** Turn-2 tokens equal the same request replayed after clearing the cache (8/8 long, 16/16 short prompts), alone and batched, on both ranks; MTP prefix restore equals a cold run (`--selftest N --selftest-prefix`).
 - **Off switch:** --prefix-cache-gib 0
@@ -5078,12 +5100,29 @@ A row routes to an expert at most once, so a step of at most 16 rows gives every
 Those launches of the tensor-core GSQ expert kernels bind one accumulator block instead of four. The freed registers
 hold a three-group ring of weight fields in flight, where the tile form keeps a one-group lookahead.
 
-- **Preconditions:** CUDA Qwen MoE with `gsq_bf16_mma` experts (the FAST expert arithmetic); steps of at most 16 rows (decode, MTP verify windows, and a prefill block of at most 16 rows: a short prompt or a tail block). Prefill blocks of more than 16 rows keep the tile form; the exact profile runs no tensor-core experts.
+- **Preconditions:** CUDA Qwen MoE with `gsq_bf16_mma` experts (the FAST expert arithmetic) or `gsq_i8_turbo` experts (the TURBO int8 arithmetic, same trait and ring; measured on the device without a model, see Measured gain; the nested TURBO profile runs FAST's experts in decode windows, so this form runs under `--profile turbo --expert-turbo-rows off` only); steps of at most 16 rows (decode, MTP verify windows, and a prefill block of at most 16 rows: a short prompt or a tail block). Prefill blocks of more than 16 rows keep the tile form; the exact profile runs no tensor-core experts.
 - **Automatic selection:** On in every profile (an absent lever row = on); the launch picks the form from the step's row count. A wider tile under the decode form fails closed.
 - **Exactness evidence:** Same MMAs and scale FMAs in the same order for every output (bitwise the tile form). The tile form compiles to the previous instructions for every type except the IQ2_S project kernel (schedule only, same floating-point opcode multiset). Greedy ids equal on prose, edit and json; teacher-forced FAST logits of the decode form identical to the tile form (`--expert-decode-tile off`) on 645 rows of five contents (prose, edit, json, code, an 8K prompt). Contract and bundle id unchanged; `qwen_cuda_profile_host_test` checks the switch, serve == CLI and the unchanged id.
 - **Off switch:** `--expert-decode-tile off`; `STRIX_QRTX_EXPERT_DECODE_TILE=0`
-- **Measured gain:** RTX PRO 6000 600 W, FAST served decode e2e: prose 127.22 -> 137.6 / 138.98, edit 342.37 -> 380.98 / 378.97, json 287.14 -> 316.32 / 317.26 tok/s (one run before, two runs after).
+- **Measured gain:** RTX PRO 6000 600 W, FAST served decode e2e: prose 127.22 -> 137.6 / 138.98, edit 342.37 -> 380.98 / 378.97, json 287.14 -> 316.32 / 317.26 tok/s (one run before, two runs after). int8 form (`gsq_i8_turbo`, no model: routed-expert calls per storage-type pair, weighted by the model's layer mix to a 48-layer step, same card): int8 decode form vs FAST BF16 decode form -0.05 / -0.32 / -1.26 ms per step at 1 / 4 / 16 rows, vs the int8 tile form -0.52 / -1.49 / -6.87 ms; every decode form bitwise its tile form on the device. Not yet measured: end-to-end decode with int8 windows.
 - **Implementation / evidence:** [kernels](../src/cuda/core/moe_a8_mma.cuh), [form constants](../src/cuda/core/native_mma.hpp), [lever row](../include/strix/profiles/qwen_cuda.hpp)
+
+<a id="qwen-rtx-turbo-experts"></a>
+
+### TURBO: int8 tensor-core experts on large prefill blocks
+
+**Engine:** `qwen-rtx`. **Control:** `--profile turbo`; regime `--expert-turbo-rows N`, `STRIX_QRTX_EXPERT_TURBO_ROWS` (lever rows `expert_turbo`, `expert_turbo_rows`). **Default:** off (TURBO is explicit only; `exact`, no profile word and `fast` do not change).
+
+`--profile turbo` runs every FAST lever and adds the int8 tensor-core experts (`gsq-iq-i8mma-turbo-cuda-v1`: A8 int8
+activations x integer codes on int8 IMMA, one FP32 FMA per group) on prefill blocks of at least N rows (N = 512). Decode
+and MTP verify windows and smaller blocks run the FAST BF16 experts, so TURBO decode is FAST decode.
+
+- **Preconditions:** CUDA Qwen MoE (`strix-cuda-qwen-serve`, `qwen_tf_logits`) with GSQ expert packs admitted for both arithmetics; `--profile turbo` given explicitly. The bundle is not marked qualified (`qwen-cuda-turbo-bundle-v2`; it runs FAST's arithmetic in decode, whose decode-class gate is still open).
+- **Automatic selection:** none; the rule is part of the arithmetic contract (`+experts[prefill_rows>=512:...]`), the identities and the bundle id; `--print-effective-config` prints `expert_regime`.
+- **Exactness evidence:** TURBO class (bit-changing, lower precision than FAST). 32K logit gate against the exact reference, 4 prompts x 128 teacher-forced rows: KL 0.00906, top-1 0.9844, dNLL +0.00102 (bar KL <= 0.02, top-1 >= 0.93, dNLL <= 0.01); int8 in every MoE call: KL 0.00948, top-1 0.9785, dNLL +0.00543. Two loads wrote bitwise-identical TURBO logits.
+- **Off switch:** omit `--profile turbo`; `--expert-turbo-rows off` = int8 in every MoE call (decode windows included).
+- **Measured gain:** RTX PRO 6000 600 W, TURBO vs FAST, two runs each: 8,076-token TTFT -7.2 % cold / -6.7 % warm; 32,652-token prefill -6.4 % cold / -6.6 % warm; decode e2e equal within noise (same arithmetic in every window).
+- **Implementation / evidence:** [int8 expert kernels](../src/cuda/core/moe_turbo_i8.cuh), [profile column](../include/strix/profiles/qwen_cuda.hpp), [regime rule](../include/strix/cuda/qwen_options.hpp), [gate](../scripts/bench/cuda/qwen_fast/gate.sh)
 
 <a id="qwen-dense-cuda-profile"></a>
 

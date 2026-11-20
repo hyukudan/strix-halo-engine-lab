@@ -16,6 +16,7 @@
 
 #include "strix/dispatch_resources.hpp"
 #include "strix/dense_rows_tile.hpp"
+#include "strix/dense_rows_wave.hpp"
 #include "strix/q6p_registry.hpp"
 #include "hip_q6p_weights.hpp"
 
@@ -467,6 +468,81 @@ __global__ void lm_head_kernel(
     if (threadIdx.x == 0) {
         logits[vocab_row] =
             scratch[0];
+    }
+}
+
+// Wave form of lm_head_kernel for F32 / F16 / BF16 weights (strix/dense_rows_wave.hpp): one wave32 per output, kWaves
+// outputs per block, kLocal contiguous leaves per lane (one 16-byte weight load per chunk for F16 / BF16, two for F32),
+// the block tree as cross-lane DPP stages then local stages. Bits equal lm_head_kernel's (same leaves, chains, pairs).
+using drw_u32x4 = unsigned __attribute__((ext_vector_type(4)));
+using drw_f32x4 = float __attribute__((ext_vector_type(4)));
+__device__ __forceinline__ void drw_load8(const float* p, float (&v)[8]) {
+    const drw_f32x4 a = reinterpret_cast<const drw_f32x4*>(p)[0], b = reinterpret_cast<const drw_f32x4*>(p)[1];
+    v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w;
+    v[4] = b.x; v[5] = b.y; v[6] = b.z; v[7] = b.w;
+}
+template <bool Half>
+__device__ __forceinline__ void drw_load8_u16(const std::uint16_t* p, float (&v)[8]) {
+    const drw_u32x4 q = *reinterpret_cast<const drw_u32x4*>(p);
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) {
+        const unsigned word = q[j];
+        if constexpr (Half) {
+            v[2U * j] = __half2float(__ushort_as_half(static_cast<unsigned short>(word & 0xffffU)));
+            v[2U * j + 1U] = __half2float(__ushort_as_half(static_cast<unsigned short>(word >> 16U)));
+        } else {  // BF16: the bits are the high half of the FP32 value (bf16_to_float)
+            v[2U * j] = __uint_as_float(word << 16U);
+            v[2U * j + 1U] = __uint_as_float(word & 0xffff0000U);
+        }
+    }
+}
+__device__ __forceinline__ void drw_activation8(const float* p, float (&v)[8]) { drw_load8(p, v); }
+__device__ __forceinline__ void drw_activation8(const std::uint16_t* p, float (&v)[8]) { drw_load8_u16<false>(p, v); }
+template <WeightKind Kind>
+__device__ __forceinline__ void drw_weight8(const void* weights, std::uint64_t at, float (&v)[8]) {
+    if constexpr (Kind == WeightKind::f32) drw_load8(static_cast<const float*>(weights) + at, v);
+    else if constexpr (Kind == WeightKind::f16) drw_load8_u16<true>(static_cast<const std::uint16_t*>(weights) + at, v);
+    else drw_load8_u16<false>(static_cast<const std::uint16_t*>(weights) + at, v);
+}
+template <typename Input, WeightKind Kind>
+__global__ __launch_bounds__(strix::dense_rows_wave::kLanes * strix::dense_rows_wave::kWaves) void dense_rows_wave_kernel(
+    const Input* hidden, const void* weights, std::uint32_t hidden_size, std::uint32_t vocab_size, float* logits) {
+    namespace drw = strix::dense_rows_wave;
+    static_assert(drw::kLeaves == kThreads && drw::kLocal == 8U, "the wave form keeps lm_head_kernel's 256 leaves");
+    static_assert(Kind == WeightKind::f32 || Kind == WeightKind::f16 || Kind == WeightKind::bf16);
+    const auto row = static_cast<std::uint32_t>(blockIdx.x) * drw::kWaves + static_cast<std::uint32_t>(threadIdx.x) / drw::kLanes;
+    if (row >= vocab_size) return;  // whole waves only: the DPP stages below never see a retired lane
+    const auto lane = static_cast<std::uint32_t>(threadIdx.x) % drw::kLanes;
+    float partial[drw::kLocal] = {};
+    const std::uint64_t row_at = static_cast<std::uint64_t>(row) * hidden_size;
+#pragma unroll 4
+    for (std::uint64_t chunk = 0; chunk < hidden_size; chunk += kThreads) {
+        const std::uint64_t base = chunk + drw::leaf(lane, 0U);
+        if (base < hidden_size) {  // width % kLocal == 0 (admissible): all kLocal leaves in range together
+            float a[drw::kLocal], w[drw::kLocal];
+            drw_activation8(hidden + base, a);
+            drw_weight8<Kind>(weights, row_at + base, w);
+#pragma unroll
+            for (std::uint32_t local = 0; local < drw::kLocal; ++local) partial[local] += a[local] * w[local];
+        }
+    }
+#pragma unroll
+    for (std::uint32_t distance = drw::kLanes / 2U; distance > 0; distance >>= 1U) {
+#pragma unroll
+        for (std::uint32_t local = 0; local < drw::kLocal; ++local) {
+            const float partner = strix::qwen_dpp::down_tree32(partial[local], distance);
+            if (lane < distance) partial[local] += partner;
+        }
+    }
+    if (lane == 0) {  // local stages d = 4, 2, 1 of the block tree
+        partial[0] += partial[4];
+        partial[1] += partial[5];
+        partial[2] += partial[6];
+        partial[3] += partial[7];
+        partial[0] += partial[2];
+        partial[1] += partial[3];
+        partial[0] += partial[1];
+        logits[row] = partial[0];
     }
 }
 
@@ -1379,6 +1455,20 @@ void launch_dense_rows_typed(const HipDenseRowsView& v, hipStream_t stream) {
             static_cast<const Input*>(v.x), x_stride, v.weights, v.width, v.outputs, v.rows, v.out, out_stride);
         check_hip(hipGetLastError(), "HIP dense rows tile launch");
         return;
+    }
+    if constexpr (Kind == WeightKind::f32 || Kind == WeightKind::f16 || Kind == WeightKind::bf16) {
+        namespace drw = strix::dense_rows_wave;
+        if (!v.block_rows && drw::admissible(v.width, x_stride, Kind == WeightKind::f32 ? 4U : 2U,
+                                             reinterpret_cast<std::uintptr_t>(v.x), reinterpret_cast<std::uintptr_t>(v.weights),
+                                             static_cast<std::uint32_t>(sizeof(Input)))) {
+            for (std::uint32_t r = 0; r < v.rows; ++r) {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(dense_rows_wave_kernel<Input, Kind>), dim3((v.outputs + drw::kWaves - 1U) / drw::kWaves),
+                    dim3(drw::kLanes * drw::kWaves), 0, stream, static_cast<const Input*>(v.x) + static_cast<std::size_t>(r) * x_stride,
+                    v.weights, v.width, v.outputs, v.out + static_cast<std::size_t>(r) * out_stride);
+            }
+            check_hip(hipGetLastError(), "HIP dense rows wave launch");
+            return;
+        }
     }
     for (std::uint32_t r = 0; r < v.rows; ++r) {
         hipLaunchKernelGGL(HIP_KERNEL_NAME(lm_head_kernel<Input, Kind>), dim3(v.outputs), dim3(kThreads), 0, stream,

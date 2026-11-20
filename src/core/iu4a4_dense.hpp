@@ -1,0 +1,440 @@
+#pragma once
+// Shared A4W4 dense GEMM for prefill row batches on v_wmma_i32_16x16x16_iu4 (gfx11 integer WMMA, IU4 x IU4).
+// Class FAST, contract dense-iu4a4-rot-v1 (iu4a4_rot.hpp: the bit-defined rule; the kernels here perform exactly its
+// operations, the device fixture checks every output bit against iu4a4_rot::dot).
+//
+// Why a separate family: the operand class is integer (both operands 4-bit codes, int32 WMMA sums, integer group
+// scales); the FP16 tall core (f16_dense_tall.hpp) is bound by the f16 WMMA rate (32 clk per 16x16x16 against 16 for
+// iu4). The output side is shared: Cols / Store are the f16_dense_tall policies (ColumnTile, RawStore, Guarded, engine
+// epilogues), so an engine binds this class with the epilogue it already has.
+//
+// Three kernels:
+//   quantise: FP32 rows -> rotated (fwht128 per 128 inputs) 4-bit codes in the iu4 fragment tile layout, the integer
+//     group scales u (one dword per row per 128 block = 4 groups of 32) and the row base. One wave per row.
+//   requantise (load time): the IU4 g64 pack -> rotated per-128 codes (same tile layout) + FP32 steps in a tile order.
+//   gemm: y[m][n] = base_m * sum_b fmaf(float(t_b), wstep[n][b], .) with t_b = sum_{g in b} u_g P_g (int32, exact).
+//
+// Geometry (gemm): the WMMA computes W . x^T: A operand = 16 weight rows n, B operand = 16 activation rows m. The i32
+// result puts one m per lane (m = lane % 16) and 8 n per lane (n = 2 e + lane / 16), so the A-group scale u_g is a lane
+// scalar shared by all W tiles of the wave, and a W block step is 8 floats per lane per W tile (2 x b128).
+// Wave tile kTw W tiles x kTm x tiles; CTA kWavesN x kWavesM waves; grid x = m blocks (fastest: CTAs that run together
+// share one weight block in L2), grid y = n blocks. Each A group's integer sum P_g restarts from a zero C (no carried
+// sum, no lead term: one v_mad_i32_i24 per output per group, and one convert + one FMA per output per 128 inputs).
+// Fragments are loaded straight from global memory (both layouts are fragment-ordered: 8 B per lane, 128 B per tile
+// and k unit), one unit ahead.
+// Limits (callers check supported()): in % 128 == 0, in <= iu4a4_rot::kMaxInputs, n % 16 == 0; quantise: x_stride % 4 == 0.
+// The GEMM copies codes, steps and u in 16 B pieces: Act / Weights buffers start 16 B aligned (as hipMalloc returns).
+#include "f16_dense_tall.hpp"
+#include "iu4a4_rot.hpp"
+#include <hip/hip_runtime.h>
+#include <cstddef>
+#include <cstdint>
+
+namespace strix::core::iu4a4_dense {
+namespace rot = iu4a4_rot;
+inline constexpr const char* kIdentity = rot::kIdentity;
+inline constexpr unsigned kTw = 4U, kTm = 2U;          // wave tile: W tiles x x tiles
+inline constexpr unsigned kWavesN = 2U, kWavesM = 4U;  // CTA = 8 waves
+inline constexpr unsigned kCtaTilesN = kTw * kWavesN, kCtaTilesM = kTm * kWavesM;
+static_assert(rot::kBlock == 128U && rot::kGroupA == 32U, "the kernels walk 8 k units per block, 2 per A group");
+
+inline bool supported(unsigned in, unsigned n) { return in > 0U && in % rot::kBlock == 0U && in <= rot::kMaxInputs && n > 0U && n % 16U == 0U; }
+__host__ __device__ inline unsigned padded_rows(unsigned rows) { return (rows + 15U) & ~15U; }
+// Activation operand of `rows` rows (rows padded to 16; pad rows: codes 0, u 1, base 0).
+inline std::size_t act_code_bytes(unsigned rows, unsigned in) { return std::size_t(padded_rows(rows)) * in / 2U; }
+inline std::size_t act_u_bytes(unsigned rows, unsigned in) { return std::size_t(padded_rows(rows)) * (in / rot::kBlock) * 4U; }
+inline std::size_t act_base_bytes(unsigned rows) { return std::size_t(padded_rows(rows)) * 4U; }
+// Rotated weights: codes in the pack tile layout (n * in / 2 bytes), steps [in/128][n/16][2][8] (n = 16 t + 2 e + h).
+inline std::size_t weight_code_bytes(unsigned in, unsigned n) { return std::size_t(n) * in / 2U; }
+inline std::size_t weight_step_bytes(unsigned in, unsigned n) { return std::size_t(n) * (in / rot::kBlock) * 4U; }
+__host__ __device__ inline std::size_t step_index(unsigned b, unsigned n, unsigned outputs) {
+    return ((std::size_t(b) * (outputs / 16U) + n / 16U) * 2U + (n % 2U)) * 8U + (n % 16U) / 2U;
+}
+
+struct Act {  // codes [in/16][mp/16][16][8] bytes (pack_byte(k, m, mp)); u [in/128][mp]; base [mp]
+    std::uint8_t* codes;
+    std::uint32_t* u;
+    float* base;
+    unsigned rows, in;
+};
+struct Weights {
+    const std::uint8_t* codes;  // rotated pack, tile layout [in/16][n/16][16][8]
+    const float* step;          // step_index order
+    unsigned in, n;
+};
+// Cols policy for a plain row-major output: column tile i = outputs 16 i .. 16 i + 15 of y[r * stride + o].
+struct OutCols {
+    float* y;
+    unsigned stride, tiles;
+    __device__ __forceinline__ f16_dense_tall::ColumnTile tile(unsigned i) const { return {nullptr, y + 16U * i, stride, i < tiles}; }
+};
+
+namespace detail {
+using I2 = int __attribute__((ext_vector_type(2)));
+using I8 = int __attribute__((ext_vector_type(8)));
+using F4 = float __attribute__((ext_vector_type(4)));
+__device__ __forceinline__ float fmax_(float a, float o) { return o > a ? o : a; }
+using I4 = int __attribute__((ext_vector_type(4)));
+typedef const __attribute__((address_space(1))) I4 GI4;
+typedef const __attribute__((address_space(1))) F4 GF4;
+typedef const __attribute__((address_space(1))) std::uint32_t GU32;
+
+// One wave per row (blockDim 256 = 8 rows). Lanes 0-15 take block 2 s, lanes 16-31 block 2 s + 1 of step s; lane
+// holds inputs 8 (lane % 16) .. + 7 of its block (the a4_tiles::Emu lane form, bitwise = fwht128).
+__global__ __launch_bounds__(256) void quantise_kernel(const float* __restrict__ x, unsigned x_stride, Act a) {
+#pragma clang fp contract(off)
+    const unsigned lane = threadIdx.x & 31U, row = blockIdx.x * 8U + (threadIdx.x >> 5U);
+    const unsigned mp = padded_rows(a.rows), in = a.in, blocks = in / rot::kBlock, steps = (blocks + 1U) / 2U;
+    if (row >= mp) return;
+    const unsigned half = lane >> 4U, sub = lane & 15U;
+    const bool live_row = row < a.rows;
+    const float* xr = x + std::size_t(live_row ? row : 0U) * x_stride;
+    const auto load = [&](unsigned s, float (&v)[8]) __attribute__((always_inline)) {
+        const unsigned blk = 2U * s + half;
+        if (live_row && blk < blocks) {
+            const F4* p = reinterpret_cast<const F4*>(xr + blk * rot::kBlock + sub * 8U);
+            const F4 lo = p[0], hi = p[1];
+            for (unsigned j = 0; j < 4U; ++j) v[j] = lo[j], v[4U + j] = hi[j];
+        } else {
+            for (unsigned j = 0; j < 8U; ++j) v[j] = 0.0f;
+        }
+        a4_tiles::Emu<32U, true>::fwht(v);
+    };
+    // Pass 1: row maximum of |rotated| and the first non-finite value in k order.
+    float amax_m = 0.0f, bad = 0.0f;
+    unsigned bad_k = 0xffffffffU;
+    for (unsigned s = 0; s < steps; ++s) {
+        float v[8];
+        load(s, v);
+        for (unsigned j = 0; j < 8U; ++j) {
+            const float m = a4_tiles::fabs_(v[j]);
+            if (!(m <= 3.402823466e38f)) {
+                const unsigned k = (2U * s + half) * rot::kBlock + sub * 8U + j;
+                if (k < bad_k) bad_k = k, bad = v[j];
+            } else {
+                amax_m = fmax_(amax_m, m);
+            }
+        }
+    }
+    for (unsigned d = 1; d < 32U; d *= 2U) {
+        amax_m = fmax_(amax_m, __shfl_xor(amax_m, int(d), 32));
+        const unsigned ok = static_cast<unsigned>(__shfl_xor(static_cast<int>(bad_k), int(d), 32));
+        const float ov = __shfl_xor(bad, int(d), 32);
+        if (ok < bad_k) bad_k = ok, bad = ov;
+    }
+    const bool finite = bad_k == 0xffffffffU;
+    const float base = finite ? amax_m / (7.0f * static_cast<float>(rot::kUMax)) : bad;
+    if (lane == 0U) a.base[row] = base;
+    const bool coded = finite && base > 0.0f;
+    // Pass 2: the same rotation (same bits), group scales, codes.
+    for (unsigned s = 0; s < steps; ++s) {
+        const unsigned blk = 2U * s + half;
+        float v[8];
+        load(s, v);
+        float amax = 0.0f;
+        for (unsigned j = 0; j < 8U; ++j) amax = fmax_(amax, a4_tiles::fabs_(v[j]));
+        amax = fmax_(amax, __shfl_xor(amax, 1, 32));
+        amax = fmax_(amax, __shfl_xor(amax, 2, 32));
+        int ug = 1;
+        if (coded && amax > 0.0f) {
+            const float q = amax / (7.0f * base);
+            ug = q >= static_cast<float>(rot::kUMax) ? rot::kUMax : static_cast<int>(::ceilf(q));
+            ug = ug < 1 ? 1 : ug;
+        }
+        const float step = base * static_cast<float>(ug);
+        std::uint32_t packed = 0U;
+        for (unsigned j = 0; j < 8U; ++j) {
+            const int code = coded ? integer_math::a4_code_f(v[j], step) : 0;
+            packed |= (static_cast<std::uint32_t>(code) & 15U) << (4U * j);
+        }
+        // Group g = sub / 4 of the block; lanes 4 g of each half hold u_g.
+        const unsigned hb = lane & 16U;
+        const std::uint32_t uw = static_cast<std::uint32_t>(__shfl(ug, int(hb), 32)) |
+                                 static_cast<std::uint32_t>(__shfl(ug, int(hb + 4U), 32)) << 8U |
+                                 static_cast<std::uint32_t>(__shfl(ug, int(hb + 8U), 32)) << 16U |
+                                 static_cast<std::uint32_t>(__shfl(ug, int(hb + 12U), 32)) << 24U;
+        if (blk < blocks) {
+            const unsigned k0 = blk * rot::kBlock + sub * 8U;
+            *reinterpret_cast<std::uint32_t*>(a.codes + rot::pack_byte(k0, row, mp)) = packed;
+            if (sub == 0U) a.u[std::size_t(blk) * mp + row] = uw;
+        }
+    }
+}
+
+// CTA form of the quantiser (one 8-wave CTA per row, one read of x): wave w takes steps w, w + 8, ... (a step = 2
+// blocks, as quantise_kernel) and keeps its rotated values in registers; the row maximum and the first non-finite
+// value meet in LDS. Same operations, same bits as quantise_kernel. F::apply(a, b) maps two inputs to the value that
+// is quantised (an engine's gated unit, e.g. SiLU(g) * u, so the FP32 product is never stored); Ident takes a.
+// Rows up to kCtaInputs inputs; quantise_kernel takes longer rows.
+inline constexpr unsigned kCtaSteps = 12U, kCtaInputs = 8U * kCtaSteps * 2U * 128U;  // 24,576
+struct Ident {
+    __device__ __forceinline__ static float apply(float a, float) { return a; }
+};
+template <class F>
+__global__ __launch_bounds__(256) void quantise_cta_kernel(const float* __restrict__ x0, const float* __restrict__ x1, unsigned x_stride, Act a) {
+#pragma clang fp contract(off)
+    __shared__ float s_amax[8], s_bad[8];
+    __shared__ unsigned s_badk[8];
+    const unsigned lane = threadIdx.x & 31U, wave = threadIdx.x >> 5U, row = blockIdx.x;
+    const unsigned mp = padded_rows(a.rows), in = a.in, blocks = in / rot::kBlock, steps = (blocks + 1U) / 2U;
+    const unsigned half = lane >> 4U, sub = lane & 15U;
+    const bool live_row = row < a.rows;
+    const std::size_t ro = std::size_t(live_row ? row : 0U) * x_stride;
+    float v[kCtaSteps][8];
+    float amax_m = 0.0f, bad = 0.0f;
+    unsigned bad_k = 0xffffffffU;
+#pragma unroll
+    for (unsigned q = 0; q < kCtaSteps; ++q) {
+        const unsigned blk = 2U * (wave + 8U * q) + half;
+        if (live_row && blk < blocks) {
+            const std::size_t at = ro + blk * rot::kBlock + sub * 8U;
+            const F4 lo = *reinterpret_cast<const F4*>(x0 + at), hi = *reinterpret_cast<const F4*>(x0 + at + 4U);
+            F4 lo1 = lo, hi1 = hi;
+            if (x1) lo1 = *reinterpret_cast<const F4*>(x1 + at), hi1 = *reinterpret_cast<const F4*>(x1 + at + 4U);
+#pragma unroll
+            for (unsigned j = 0; j < 4U; ++j) {
+                float t0 = F::apply(lo[j], lo1[j]), t1 = F::apply(hi[j], hi1[j]);
+                asm volatile("" : "+v"(t0), "+v"(t1));  // the value rounded once, as a stored FP32 input
+                v[q][j] = t0, v[q][4U + j] = t1;
+            }
+        } else {
+#pragma unroll
+            for (unsigned j = 0; j < 8U; ++j) v[q][j] = 0.0f;
+        }
+        if (wave + 8U * q < steps) {  // wave-uniform: every lane of the wave takes part in the shuffles
+            a4_tiles::Emu<32U, true>::fwht(v[q]);
+#pragma unroll
+            for (unsigned j = 0; j < 8U; ++j) {
+                const float m = a4_tiles::fabs_(v[q][j]);
+                if (!(m <= 3.402823466e38f)) {
+                    const unsigned k = blk * rot::kBlock + sub * 8U + j;
+                    if (k < bad_k) bad_k = k, bad = v[q][j];
+                } else {
+                    amax_m = fmax_(amax_m, m);
+                }
+            }
+        }
+    }
+    for (unsigned d = 1; d < 32U; d *= 2U) {
+        amax_m = fmax_(amax_m, __shfl_xor(amax_m, int(d), 32));
+        const unsigned ok = static_cast<unsigned>(__shfl_xor(static_cast<int>(bad_k), int(d), 32));
+        const float ov = __shfl_xor(bad, int(d), 32);
+        if (ok < bad_k) bad_k = ok, bad = ov;
+    }
+    if (lane == 0U) s_amax[wave] = amax_m, s_bad[wave] = bad, s_badk[wave] = bad_k;
+    __syncthreads();
+    for (unsigned o = 0; o < 8U; ++o) {
+        amax_m = fmax_(amax_m, s_amax[o]);
+        if (s_badk[o] < bad_k) bad_k = s_badk[o], bad = s_bad[o];
+    }
+    const bool finite = bad_k == 0xffffffffU;
+    const float base = finite ? amax_m / (7.0f * static_cast<float>(rot::kUMax)) : bad;
+    if (threadIdx.x == 0U) a.base[row] = base;
+    const bool coded = finite && base > 0.0f;
+#pragma unroll
+    for (unsigned q = 0; q < kCtaSteps; ++q) {
+        if (wave + 8U * q >= steps) continue;
+        const unsigned blk = 2U * (wave + 8U * q) + half;
+        float amax = 0.0f;
+#pragma unroll
+        for (unsigned j = 0; j < 8U; ++j) amax = fmax_(amax, a4_tiles::fabs_(v[q][j]));
+        amax = fmax_(amax, __shfl_xor(amax, 1, 32));
+        amax = fmax_(amax, __shfl_xor(amax, 2, 32));
+        int ug = 1;
+        if (coded && amax > 0.0f) {
+            const float qq = amax / (7.0f * base);
+            ug = qq >= static_cast<float>(rot::kUMax) ? rot::kUMax : static_cast<int>(::ceilf(qq));
+            ug = ug < 1 ? 1 : ug;
+        }
+        const float step = base * static_cast<float>(ug);
+        std::uint32_t packed = 0U;
+#pragma unroll
+        for (unsigned j = 0; j < 8U; ++j) {
+            const int code = coded ? integer_math::a4_code_f(v[q][j], step) : 0;
+            packed |= (static_cast<std::uint32_t>(code) & 15U) << (4U * j);
+        }
+        const unsigned hb = lane & 16U;
+        const std::uint32_t uw = static_cast<std::uint32_t>(__shfl(ug, int(hb), 32)) |
+                                 static_cast<std::uint32_t>(__shfl(ug, int(hb + 4U), 32)) << 8U |
+                                 static_cast<std::uint32_t>(__shfl(ug, int(hb + 8U), 32)) << 16U |
+                                 static_cast<std::uint32_t>(__shfl(ug, int(hb + 12U), 32)) << 24U;
+        if (blk < blocks) {
+            *reinterpret_cast<std::uint32_t*>(a.codes + rot::pack_byte(blk * rot::kBlock + sub * 8U, row, mp)) = packed;
+            if (sub == 0U) a.u[std::size_t(blk) * mp + row] = uw;
+        }
+    }
+}
+
+// One thread per (column n, block b); load time.
+__global__ __launch_bounds__(256) void requantise_kernel(const std::uint8_t* __restrict__ pack, const std::uint16_t* __restrict__ scales,
+                                                         unsigned in, unsigned n, std::uint8_t* __restrict__ dst, float* __restrict__ step) {
+    const std::size_t id = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned blocks = in / rot::kBlock;
+    if (id >= std::size_t(n) * blocks) return;
+    const unsigned col = static_cast<unsigned>(id % n), b = static_cast<unsigned>(id / n);
+    step[step_index(b, col, n)] = rot::requantise_codes(pack, scales, in, n, col, b, dst);
+}
+
+// GEMM main loop. The CTA stages each 128-input block of its 8 W tiles and 8 x tiles in LDS (2 KB per K16 unit:
+// W tiles then x tiles, 128 B each = the global fragment layout, so a piece is one 16 B copy), double buffered: the
+// block b + 1 copy is loaded at the start of block b and stored after it, one barrier per block. The block's side data
+// rides in the same copy (side area: the 8 W tiles' steps, 64 B each, then the 8 x tiles' u, 64 B each), so no global
+// latency sits inside the barrier-synchronised block (measured: global side loads there cost ~25 %). Waves read their
+// fragments with ds_load_b64 from two base registers + immediate offsets (no per-fragment address arithmetic), one
+// unit ahead. The arithmetic per group / block is the contract's (iu4a4_rot::dot), unchanged.
+inline constexpr unsigned kUnitBytes = 2048U, kCodeBytes = 8U * kUnitBytes, kSideBytes = 1024U, kBlockBytes = kCodeBytes + kSideBytes;
+static_assert(kCtaTilesN == 8U && kCtaTilesM == 8U, "a staged unit holds 8 W tiles and 8 x tiles (64 x 16 B per side)");
+template <class Cols, class Store>
+__global__ __launch_bounds__(256) void gemm_kernel(Weights w, Act a, Cols cols, Store store) {
+    __shared__ __attribute__((aligned(16))) std::uint8_t lds[2U * kBlockBytes];
+    const unsigned tid = threadIdx.x, lane = tid & 31U, wave = tid >> 5U, l16 = lane & 15U, hi = lane >> 4U;
+    const unsigned ntiles = f16_dense_tall::detail::uni(w.n) / 16U, mp = padded_rows(f16_dense_tall::detail::uni(a.rows)), mtiles = mp / 16U;
+    const unsigned in = f16_dense_tall::detail::uni(w.in), blocks = in / rot::kBlock;
+    const unsigned wn = wave % kWavesN, wm = wave / kWavesN;
+    const unsigned nt0 = blockIdx.y * kCtaTilesN + wn * kTw, mt0 = blockIdx.x * kCtaTilesM + wm * kTm;
+    const bool live = mt0 < mtiles;  // a wave without a live x tile still copies and meets the barriers
+    unsigned nt[kTw], mt[kTm];
+#pragma unroll
+    for (unsigned i = 0; i < kTw; ++i) nt[i] = nt0 + i < ntiles ? nt0 + i : ntiles - 1U;  // dead tiles read a live one
+#pragma unroll
+    for (unsigned i = 0; i < kTm; ++i) mt[i] = mt0 + i < mtiles ? mt0 + i : mtiles - 1U;
+    // Copy role: piece q of a block = unit 2 q + (tid >> 7); waves 0-1 / 4-5 copy W, 2-3 / 6-7 copy x; 16 B at tid % 64.
+    const unsigned side = (tid >> 6U) & 1U, piece = tid & 63U, cu = tid >> 7U;
+    const unsigned stiles = side == 0U ? ntiles : mtiles, cbase = side == 0U ? blockIdx.y * kCtaTilesN : blockIdx.x * kCtaTilesM;
+    const unsigned ctile = cbase + (piece >> 3U) < stiles ? cbase + (piece >> 3U) : stiles - 1U;
+    const std::size_t ustride = std::size_t(stiles) * 8U;  // one K16 unit of this side, in 16 B pieces
+    const GI4* src = (side == 0U ? (const GI4*)w.codes : (const GI4*)a.codes) + std::size_t(cu) * ustride + std::size_t(ctile) * 8U + (piece & 7U);
+    const unsigned dst = cu * kUnitBytes + side * 1024U + piece * 16U;
+    // Side copy (waves 0-1): piece p < 32: steps of W tile p / 4 (16 floats = 4 pieces); p >= 32: u of x tile (p - 32) / 4.
+    const bool scopy = tid < 64U;
+    const unsigned sq = tid & 31U, sstile = (tid < 32U ? blockIdx.y * kCtaTilesN : blockIdx.x * kCtaTilesM) + (sq >> 2U);
+    const unsigned slim = tid < 32U ? ntiles : mtiles, stc = sstile < slim ? sstile : slim - 1U;
+    const std::size_t sstride = tid < 32U ? std::size_t(ntiles) * 4U : std::size_t(mp) / 4U;  // one block, in 16 B
+    const GI4* ssrc = (tid < 32U ? (const GI4*)w.step : (const GI4*)a.u) + std::size_t(stc) * 4U + (sq & 3U);
+    I4 stg[4], sstg = {0, 0, 0, 0};
+    const auto fetch = [&](unsigned b) __attribute__((always_inline)) {
+#pragma unroll
+        for (unsigned q = 0; q < 4U; ++q) stg[q] = src[(std::size_t(b) * 8U + 2U * q) * ustride];
+        if (scopy) sstg = ssrc[std::size_t(b) * sstride];
+    };
+    const auto put = [&](unsigned buf) __attribute__((always_inline)) {
+#pragma unroll
+        for (unsigned q = 0; q < 4U; ++q) *reinterpret_cast<I4*>(lds + buf * kBlockBytes + dst + q * 2U * kUnitBytes) = stg[q];
+        if (scopy) *reinterpret_cast<I4*>(lds + buf * kBlockBytes + kCodeBytes + tid * 16U) = sstg;
+    };
+    float acc[kTw][kTm][8];
+#pragma unroll
+    for (unsigned i = 0; i < kTw; ++i)
+#pragma unroll
+        for (unsigned j = 0; j < kTm; ++j)
+#pragma unroll
+            for (unsigned e = 0; e < 8U; ++e) acc[i][j][e] = 0.0F;
+    const I8 zero = {0, 0, 0, 0, 0, 0, 0, 0};
+    I2 wa[kTw], xa[kTm], wb[kTw], xb[kTm];  // fragment sets in ping-pong (named: no ring copies)
+    const auto mma = [&](const I2 (&wd)[kTw], const I2 (&xd)[kTm], I8 (&c)[kTw][kTm], bool first) __attribute__((always_inline)) {
+#pragma unroll
+        for (unsigned i = 0; i < kTw; ++i)
+#pragma unroll
+            for (unsigned j = 0; j < kTm; ++j)
+                c[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, wd[i], true, xd[j], first ? zero : c[i][j], false);
+    };
+    fetch(0U);
+    put(0U);
+    __syncthreads();
+    for (unsigned b = 0; b < blocks; ++b) {
+        const bool more = b + 1U < blocks;
+        if (more) fetch(b + 1U);
+        if (live) {
+            const I2* wl = reinterpret_cast<const I2*>(lds + (b & 1U) * kBlockBytes + wn * (kTw * 128U) + l16 * 8U);
+            const I2* xl = reinterpret_cast<const I2*>(lds + (b & 1U) * kBlockBytes + 1024U + wm * (kTm * 128U) + l16 * 8U);
+            const auto load = [&](unsigned k, I2 (&wd)[kTw], I2 (&xd)[kTm]) __attribute__((always_inline)) {
+#pragma unroll
+                for (unsigned i = 0; i < kTw; ++i) wd[i] = wl[(k * kUnitBytes + i * 128U) / 8U];
+#pragma unroll
+                for (unsigned j = 0; j < kTm; ++j) xd[j] = xl[(k * kUnitBytes + j * 128U) / 8U];
+            };
+            const std::uint8_t* sd = lds + (b & 1U) * kBlockBytes + kCodeBytes;
+            std::uint32_t ub[kTm];
+#pragma unroll
+            for (unsigned j = 0; j < kTm; ++j) ub[j] = reinterpret_cast<const std::uint32_t*>(sd + 512U + (wm * kTm + j) * 64U)[l16];
+            I8 t[kTw][kTm];
+            load(0U, wa, xa);
+#pragma unroll
+            for (unsigned g = 0; g < rot::kGroupsPerBlock; ++g) {
+                I8 c[kTw][kTm];
+                load(2U * g + 1U, wb, xb);
+                mma(wa, xa, c, true);
+                if (g + 1U < rot::kGroupsPerBlock) load(2U * g + 2U, wa, xa);
+                mma(wb, xb, c, false);
+#pragma unroll
+                for (unsigned j = 0; j < kTm; ++j) {
+                    const int ug = static_cast<int>((ub[j] >> (8U * g)) & 255U);
+#pragma unroll
+                    for (unsigned i = 0; i < kTw; ++i)
+#pragma unroll
+                        for (unsigned e = 0; e < 8U; ++e) t[i][j][e] = g == 0U ? __mul24(ug, c[i][j][e]) : __mul24(ug, c[i][j][e]) + t[i][j][e];
+                }
+            }
+#pragma unroll
+            for (unsigned i = 0; i < kTw; ++i) {
+                const F4* sb = reinterpret_cast<const F4*>(sd + (wn * kTw + i) * 64U + hi * 32U);
+                const F4 s0 = sb[0], s1 = sb[1];
+#pragma unroll
+                for (unsigned j = 0; j < kTm; ++j)
+#pragma unroll
+                    for (unsigned e = 0; e < 8U; ++e)
+                        acc[i][j][e] = __builtin_fmaf(static_cast<float>(t[i][j][e]), e < 4U ? s0[e] : s1[e - 4U], acc[i][j][e]);
+            }
+        }
+        if (more) put((b + 1U) & 1U);
+        __syncthreads();
+    }
+    if (!live) return;  // after the last barrier
+    store.run([&](auto& s) __attribute__((always_inline)) {
+#pragma unroll
+        for (unsigned j = 0; j < kTm; ++j) {
+            const unsigned m = (mt0 + j) * 16U + l16;
+            if (mt0 + j >= mtiles) continue;
+            const float bm = a.base[mt[j] * 16U + l16];
+#pragma unroll
+            for (unsigned i = 0; i < kTw; ++i) {
+                if (nt0 + i >= ntiles) continue;
+                const f16_dense_tall::ColumnTile ct = cols.tile(nt0 + i);
+                if (!f16_dense_tall::detail::uni(ct.live ? 1U : 0U)) continue;
+#pragma unroll
+                for (unsigned e = 0; e < 8U; ++e) {
+                    const auto st = s.open(nt0 + i, ct, 2U * e + hi);
+                    float v = acc[i][j][e] * bm;
+                    asm volatile("" : "+v"(v));  // y = acc * base rounded once (no contraction into the epilogue)
+                    if (m < a.rows) s.put(st, m, v);
+                }
+            }
+        }
+        s.close();
+    });
+}
+}  // namespace detail
+
+// Host side (stream-ordered; callers check supported() and hipGetLastError()).
+// x: rows of a.in values at x_stride floats. quantise_map2: the quantised value is F::apply(a[k], b[k]) (same stride);
+// with a second input it needs map2_supported(in).
+inline bool map2_supported(unsigned in) { return in <= detail::kCtaInputs; }
+template <class F = detail::Ident> inline void enqueue_quantise_map2(const float* x0, const float* x1, unsigned x_stride, const Act& a, hipStream_t s) {
+    if (a.in <= detail::kCtaInputs) hipLaunchKernelGGL((detail::quantise_cta_kernel<F>), dim3(padded_rows(a.rows)), dim3(256), 0, s, x0, x1, x_stride, a);
+    else hipLaunchKernelGGL(detail::quantise_kernel, dim3((padded_rows(a.rows) + 7U) / 8U), dim3(256), 0, s, x0, x_stride, a);
+}
+inline void enqueue_quantise(const float* x, unsigned x_stride, const Act& a, hipStream_t s) {
+    enqueue_quantise_map2<detail::Ident>(x, nullptr, x_stride, a, s);
+}
+inline void enqueue_requantise(const std::uint8_t* pack, const std::uint16_t* scales, unsigned in, unsigned n, std::uint8_t* dst, float* step,
+                               hipStream_t s) {
+    const std::size_t threads = std::size_t(n) * (in / rot::kBlock);
+    hipLaunchKernelGGL(detail::requantise_kernel, dim3(static_cast<unsigned>((threads + 255U) / 256U)), dim3(256), 0, s, pack, scales, in, n, dst, step);
+}
+template <class Cols, class Store = f16_dense_tall::RawStore>
+inline void enqueue_gemm(const Weights& w, const Act& a, Cols cols, hipStream_t s, Store store = {}) {
+    const unsigned mtiles = padded_rows(a.rows) / 16U, ntiles = w.n / 16U;
+    const dim3 grid((mtiles + kCtaTilesM - 1U) / kCtaTilesM, (ntiles + kCtaTilesN - 1U) / kCtaTilesN);
+    hipLaunchKernelGGL((detail::gemm_kernel<Cols, Store>), grid, dim3(32U * kWavesN * kWavesM), 0, s, w, a, cols, store);
+}
+}  // namespace strix::core::iu4a4_dense

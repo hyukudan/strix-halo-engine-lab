@@ -232,8 +232,8 @@ void kda_case(const KdaW& kw, const std::vector<unsigned>& chunks, std::mt19937&
             rconv_at.push_back(cv);
         }
     }
-    // prefill, every scan version (same bits)
-    for (unsigned sv : {1U, 3U, 5U}) {
+    // prefill, every scan version (same bits); v6 fuses the prep, so it writes no scratch / beta (they stay poisoned)
+    for (unsigned sv : {1U, 3U, 5U, 6U}) {
         P::set_kda_scan_version(sv);
         const unsigned CMAX = *std::max_element(chunks.begin(), chunks.end());
         float *pS = zalloc<float>(SN), *pconv = zalloc<float>(CN);
@@ -253,7 +253,8 @@ void kda_case(const KdaW& kw, const std::vector<unsigned>& chunks, std::mt19937&
                 const auto a1 = down(pscr, static_cast<std::size_t>(C) * SCR), a2 = down(rSCR + static_cast<std::size_t>(t0) * SCR, static_cast<std::size_t>(C) * SCR);
                 const auto b1 = down(pbeta, static_cast<std::size_t>(C) * H), b2 = down(rB + static_cast<std::size_t>(t0) * H, static_cast<std::size_t>(C) * H);
                 const auto o1 = down(pO, static_cast<std::size_t>(C) * CH), o2 = down(rOall + static_cast<std::size_t>(t0) * CH, static_cast<std::size_t>(C) * CH);
-                inter &= bits_eq(a1, a2) && bits_eq(b1, b2) && bits_eq(o1, o2) && all_finite(a1) && all_finite(b1) && all_finite(o1);
+                const bool prep = sv == 6 || (bits_eq(a1, a2) && bits_eq(b1, b2) && all_finite(a1) && all_finite(b1));
+                inter &= prep && bits_eq(o1, o2) && all_finite(o1);
             }
             t0 += C;
         }
@@ -1909,6 +1910,11 @@ int main(int argc, char** argv) {
             try { std::printf("hc-expand-rows=%u\n", P::hc_expand_cta_rows()); }
             catch (const std::invalid_argument& e) { std::fprintf(stderr, "%s\n", e.what()); return 2; }
             return 0;  // no allocation or device work
+        }
+        if (mode == "kda") {  // KDA prefill vs decode only, every scan version (bounded single-ticket gate)
+            test_kda(argv[1], g);
+            std::printf("checks: %d failures: %d\n", checks, failures);
+            return failures ? 1 : 0;
         }
         if (mode == "hcexpand" || mode == "hcexpandbench") {
             test_hc_expand_cta(g, false);

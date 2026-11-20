@@ -17,11 +17,14 @@
 // Usage: hip-dense-iu4-probe [rows=512]   prints one line per (shape, arm): us/call and TFLOPS at the timed clock.
 #include "core/f16_dense_iu4.hpp"
 #include "attn_core/dense_decode.hpp"
+#include "core/dense_linear_iu4.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <utility>
 #include <vector>
 
 namespace iu = strix::core::f16_dense_tall::iu4a16;
@@ -152,6 +155,54 @@ template <int Kind> __global__ __launch_bounds__(256) void rescale_rate(int iter
     if (s == 1234.5F) out[t] = s;
 }
 
+// sd_i4 arms (contract dense-iu4a4-rot-v1, core/iu4a4_rot.hpp; measurement only): 8 column tiles per wave (the
+// register budget of the planned trait), per 128-K block 4 A groups of 32 (Kind 6) or 2 of 64 (Kind 7). C is cumulative
+// (never reset); t = lead * C + sum_g e_g * C with 24-bit multiplies (Abel form: no convert per A group), then
+// acc = fma(float(t), wstep, acc) once per block. e / lead (8 rows per lane) and wstep (one per tile) are loaded from a
+// cache-resident table per group / block, as the production loop would. Values are not meaningful (timing only).
+template <int Kind> __global__ __launch_bounds__(256) void rot_rate(int iters, const int* __restrict__ coef, const float* __restrict__ ws, float* out) {
+    using I8 = int __attribute__((ext_vector_type(8)));
+    using I2 = int __attribute__((ext_vector_type(2)));
+    using F8 = float __attribute__((ext_vector_type(8)));
+    constexpr unsigned kT = 8U, kG = Kind == 6 ? 4U : 2U, kU = 8U / kG;  // tiles, A groups per block, K16 units per group
+    const unsigned t = threadIdx.x, lane = t & 31U;
+    const I2 a = {int(t), int(t * 3U)}, b = {int(t ^ 1U), int(t ^ 2U)};
+    I8 c[kT], s[kT];
+    F8 acc[kT];
+    for (unsigned q = 0; q < kT; ++q)
+        for (unsigned e = 0; e < 8U; ++e) c[q][e] = 0, s[q][e] = 0, acc[q][e] = 0.0F;
+    for (int i = 0; i < iters; ++i) {
+        const I8* cf = reinterpret_cast<const I8*>(coef) + (unsigned(i) & 63U) * (kG + 1U) * 32U + lane;
+        const I8 lead = cf[kG * 32U];
+#pragma unroll
+        for (unsigned q = 0; q < kT; ++q)
+#pragma unroll
+            for (unsigned e = 0; e < 8U; ++e) s[q][e] = __mul24(lead[e], c[q][e]);
+#pragma unroll
+        for (unsigned g = 0; g < kG; ++g) {
+            const I8 eg = cf[g * 32U];
+#pragma unroll
+            for (unsigned k = 0; k < kU; ++k)
+#pragma unroll
+                for (unsigned q = 0; q < kT; ++q) c[q] = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(true, a, true, b, c[q], false);
+#pragma unroll
+            for (unsigned q = 0; q < kT; ++q)
+#pragma unroll
+                for (unsigned e = 0; e < 8U; ++e) s[q][e] += __mul24(eg[e], c[q][e]);
+        }
+        const float* w = ws + (unsigned(i) & 63U) * kT * 32U + lane;
+#pragma unroll
+        for (unsigned q = 0; q < kT; ++q) {
+            const float sw = w[q * 32U];
+#pragma unroll
+            for (unsigned e = 0; e < 8U; ++e) acc[q][e] = __builtin_fmaf(float(s[q][e]), sw, acc[q][e]);
+        }
+    }
+    float r = 0.0F;
+    for (unsigned q = 0; q < kT; ++q) r += acc[q][q];
+    if (r == 1234.5F) out[t] = r;
+}
+
 template <class F> static double time_us(F&& launch, int reps = 20);
 __device__ __forceinline__ float act_silu(float g) { return g / (1.0F + expf(-g)); }
 struct ActSilu {
@@ -245,10 +296,103 @@ static int rates() {
     std::printf("rate a4g64-magic %.1f TOPS\n", ops16 / time_us([&] { hipLaunchKernelGGL(rescale_rate<3>, dim3(640), dim3(256), 0, nullptr, iters, o); }, 5) / 1e6);
     std::printf("rate a4g32-magic %.1f TOPS\n", ops16 / time_us([&] { hipLaunchKernelGGL(rescale_rate<4>, dim3(640), dim3(256), 0, nullptr, iters, o); }, 5) / 1e6);
     std::printf("rate a4g32-cvt %.1f TOPS\n", ops16 / time_us([&] { hipLaunchKernelGGL(rescale_rate<5>, dim3(640), dim3(256), 0, nullptr, iters, o); }, 5) / 1e6);
+    // sd_i4: 64 WMMAs per iteration at iters / 4 = the same work as ops16.
+    int* coef = nullptr;
+    float* wsb = nullptr;
+    CK(hipMalloc(&coef, 64U * 5U * 32U * 8U * sizeof(int)));
+    CK(hipMalloc(&wsb, 64U * 8U * 32U * sizeof(float)));
+    CK(hipMemset(coef, 0, 64U * 5U * 32U * 8U * sizeof(int)));
+    CK(hipMemset(wsb, 0, 64U * 8U * 32U * sizeof(float)));
+    std::printf("rate a4i-g32-w128-abel %.1f TOPS\n", ops16 / time_us([&] { hipLaunchKernelGGL(rot_rate<6>, dim3(640), dim3(256), 0, nullptr, iters / 4, coef, wsb, o); }, 5) / 1e6);
+    std::printf("rate a4i-g64-w128-abel %.1f TOPS\n", ops16 / time_us([&] { hipLaunchKernelGGL(rot_rate<7>, dim3(640), dim3(256), 0, nullptr, iters / 4, coef, wsb, o); }, 5) / 1e6);
+    return 0;
+}
+// cmp mode: our production IU4 g64 W4A16 entries at the given shapes, the "ours" column of a GEMM-library comparison.
+//   hip-dense-iu4-probe <rows> cmp in:n [in:n ...]
+// rows <= 16: the small-M core (dense_linear_iu4 prepare + run: the decode / verify entry; prepare timed alone, run
+// alone); rows > 16: prod16 / prod8 (iu4a16::enqueue) and x16prod+cvt (enqueue_x16_tiles + enqueue_x16).
+// Weights are random codes with scale 1/16 (timing only). wMB = IU4 codes + FP16 scales read once per call.
+static int cmp(unsigned rows, int argc, char** argv) {
+    namespace sm = strix::core::dense_iu4;
+    std::vector<std::pair<unsigned, unsigned>> shapes;
+    unsigned max_in = 0U, max_n = 0U;
+    std::size_t max_w = 0U;
+    for (int i = 3; i < argc; ++i) {
+        unsigned in = 0U, n = 0U;
+        if (std::sscanf(argv[i], "%u:%u", &in, &n) != 2 || in == 0U || n == 0U) {
+            std::printf("bad shape '%s' (want in:n)\n", argv[i]);
+            return 2;
+        }
+        shapes.emplace_back(in, n);
+        max_in = std::max(max_in, in);
+        max_n = std::max(max_n, n);
+        max_w = std::max(max_w, sm::tensor_bytes(n, in));
+    }
+    if (shapes.empty() || rows == 0U) {
+        std::printf("usage: hip-dense-iu4-probe <rows> cmp in:n [in:n ...]\n");
+        return 2;
+    }
+    const std::size_t xrows = std::max<std::size_t>(rows, sm::wide_xh_rows(rows));
+    std::uint8_t* w = nullptr;
+    float *x = nullptr, *y = nullptr;
+    _Float16 *xt = nullptr, *xh = nullptr;
+    CK(hipMalloc(&w, max_w));
+    CK(hipMalloc(&x, std::size_t(rows) * max_in * 4U));
+    CK(hipMalloc(&y, std::size_t(rows) * max_n * 4U));
+    CK(hipMalloc(&xt, std::size_t(rows) * max_in * 2U));
+    CK(hipMalloc(&xh, xrows * max_in * 2U));
+    {
+        std::mt19937 g(7U);
+        std::vector<std::uint8_t> hw(max_w);
+        for (auto& e : hw) e = std::uint8_t(g());
+        CK(hipMemcpy(w, hw.data(), max_w, hipMemcpyHostToDevice));
+        std::vector<float> hx(std::size_t(rows) * max_in);
+        std::uniform_real_distribution<float> d(-1.0F, 1.0F);
+        for (auto& e : hx) e = d(g);
+        CK(hipMemcpy(x, hx.data(), hx.size() * 4U, hipMemcpyHostToDevice));
+        CK(hipMemset(xh, 0, xrows * max_in * 2U));
+    }
+    for (const auto& [in, n] : shapes) {
+        // Scales 1/16 (0x2c00) right after this shape's packed codes (the pack layout).
+        const std::size_t packed = sm::packed_bytes(n, in), sbytes = std::size_t(n) * (in / 64U) * 2U;
+        {
+            std::vector<std::uint16_t> hs(sbytes / 2U, 0x2c00U);
+            CK(hipMemcpy(w + packed, hs.data(), sbytes, hipMemcpyHostToDevice));
+        }
+        const auto* scale = reinterpret_cast<const std::uint16_t*>(w + packed);
+        const double gf = 2.0 * rows * double(in) * n / 1e3;
+        const double wmb = double(packed + sbytes) / 1e6;
+        auto pr = [&](const char* arm, double us) {
+            std::printf("cmp in %5u n %5u rows %5u %-12s %10.1f us %6.2f TFLOPS wMB %.1f %.1f GB/s\n", in, n, rows, arm, us,
+                gf / us / 1e3, wmb, wmb / us * 1e3);
+        };
+        if (rows <= sm::kMaxRows) {
+            if (!sm::supported(n, in)) {
+                std::printf("cmp in %5u n %5u rows %5u small-M unsupported shape\n", in, n, rows);
+                continue;
+            }
+            pr("sm-prepare", time_us([&] { sm::prepare(x, xh, in, rows, nullptr); }));
+            pr("sm-run", time_us([&] { sm::run(w, in, n, xh, y, rows, nullptr); }));
+            continue;
+        }
+        if (in % 128U != 0U || n % 16U != 0U) {
+            std::printf("cmp in %5u n %5u rows %5u tall unsupported shape\n", in, n, rows);
+            continue;
+        }
+        iu::View v{w, scale, x, y, in, n, n, rows, n, 0U, 0U};
+        pr("prod16", time_us([&] { iu::enqueue(v, nullptr, 16U); }));
+        pr("prod8", time_us([&] { iu::enqueue(v, nullptr, 8U); }));
+        pr("x16prod+cvt", time_us([&] {
+            tall::enqueue_x16_tiles(x, xt, rows, in, nullptr);
+            iu::enqueue_x16(v, xt, nullptr);
+        }));
+    }
+    CK(hipFree(w)); CK(hipFree(x)); CK(hipFree(y)); CK(hipFree(xt)); CK(hipFree(xh));
     return 0;
 }
 int main(int argc, char** argv) {
     if (argc > 2 && argv[2][0] == 'r') return rates();
+    if (argc > 2 && std::strcmp(argv[2], "cmp") == 0) return cmp(unsigned(std::atoi(argv[1])), argc, argv);
     const unsigned rows = argc > 1 ? unsigned(std::atoi(argv[1])) : 512U;
     const unsigned shapes[][2] = {{5120U, 17408U}, {17408U, 5120U}, {5120U, 10240U}};
     Bufs b{};
