@@ -6,7 +6,10 @@
 // (prompt position by position, exports nothing). The batched prompt windows (prompt_rows) failed their logit gate on
 // prose: the row is UNQUALIFIED, pending in `fast`; it runs only when set explicitly (--prompt-rows, or --allow-pending)
 // and every such run is stamped "unqualified: prompt_rows". The layer split (pair
-// cut, windows crossing as FP32 rows) changes no bit and is not a profile lever. No TURBO version: turbo is refused.
+// cut, windows crossing as FP32 rows) changes no bit and is not a profile lever; on the pair, when this row turns the
+// windows on and no width is given, the width and the interleaved stage map per prompt length come from the shared
+// planner over the measured pair cost (src/hy4/hip/hy4_hip_plan.hpp pair_stage_plan; the resolver stamps the width).
+// No TURBO version: turbo is refused.
 // Promoting a row after its gate is one edit of `ready` / `provisional` below, never code. Host-only.
 #include "strix/engine_profile.hpp"
 

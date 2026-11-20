@@ -12,6 +12,7 @@
 #include "strix/attn/group_indexer.hpp"
 #include "strix/hy4/presets.hpp"
 #include "strix/pair/layer_pipeline.hpp"
+#include "strix/pair/stage_map.hpp"
 #include "strix/session/prompt_windows.hpp"
 
 #include <cstdint>
@@ -101,6 +102,21 @@ using PromptPlan = strix::session::prompt_windows::Plan;
 using PairWindowCost = strix::pair::layers::WindowCost;
 [[nodiscard]] inline std::uint32_t pair_window_rows(std::size_t prompt, std::span<const PairWindowCost> costs) {
     return strix::pair::layers::two_stage_window_rows(prompt, costs);
+}
+// Measured cost of the Hy4 pair layer pipeline (two Strix Halo nodes over USB4, FAST A8 rows prefill, real text, 11-20
+// receipts): a window of u rows at prompt length n costs 267.9 + (1.3666 + 2.344e-6 n) u ms over both ranks (per-window
+// costs 4K/1024 rows 1,677, 8K/2048 3,106, 32K/2048 3,224 ms); one stage-boundary frame 196 + 26 / 2048 ms per row
+// (100.7 MB of FP32 seam rows per 2048 rows; the latency fitted to the nine v = 1/2/3 receipts at 4K/8K/32K, rms 2.3 %).
+// Data for the shared planner (strix/pair/stage_map.hpp plan_stages). Widths: the measured ones (bitwise equal).
+inline constexpr strix::pair::LayerPipeCost kPairPipeCost{267.9, 1.3666, 2.344e-6, 196.0, 26.0 / 2048.0};
+inline constexpr std::uint32_t kPairWindowRows[] = {1024U, 2048U, 4096U};
+inline constexpr std::uint32_t kPairVirtualStages[] = {1U, 2U, 3U, 4U, 5U};
+// Rows per window and stage map of the pair for a prompt; `width` != 0 keeps that width (the planner picks v only).
+[[nodiscard]] inline strix::pair::StagePlan pair_stage_plan(std::size_t prompt, std::uint32_t layers, std::uint32_t width = 0U) {
+    const std::uint32_t one[] = {width};
+    const std::span<const std::uint32_t> rows = width != 0U ? std::span<const std::uint32_t>(one) : std::span<const std::uint32_t>(kPairWindowRows);
+    return strix::pair::plan_stages(prompt, layers, kPairPipeCost, rows, [](std::uint32_t r) { return prompt_window_ok(r); },
+                                    kPairVirtualStages);
 }
 // Rows of the window [p0, p0 + rows) of an indexed layer that attend the causal prefix (slots < 2048); the rest select.
 [[nodiscard]] constexpr std::uint32_t index_dense_rows(std::uint32_t p0, std::uint32_t rows) {

@@ -242,6 +242,47 @@ int main() {
         expect(strix::pair::default_stage_map(12U, 9U).virtual_stages() == 1U, "12 layers: stages of >= 4 layers -> v = 1");
         expect(strix::pair::default_stage_map(16U, 9U).virtual_stages() == 2U, "16 layers -> v = 2");
     }
+    {   // the shared planner: rows per window and v from the prompt length, the layer cost and the link cost
+        using strix::pair::LayerPipeCost;
+        const std::uint32_t chunks[] = {1024U, 2048U, 4096U};
+        const std::uint32_t vs[] = {1U, 2U, 3U, 4U, 5U};
+        const auto any = [](std::uint32_t) { return true; };
+        const LayerPipeCost cost{270.0, 1.37, 2.3e-6, 30.0, 26.0 / 2048.0};
+        const auto one = strix::pair::plan_stages(1024U, 42U, cost, chunks, any, vs);
+        expect(one.choice.chunk == 0U && one.map.text() == "0,21,42", "plan: prompt of one window -> no window, two-stage cut");
+        const auto p8 = strix::pair::plan_stages(8192U, 42U, cost, chunks, any, vs);
+        expect(p8.choice.chunk != 0U && p8.map.virtual_stages() == p8.choice.virtual_stages && p8.map.virtual_stages() > 1U &&
+                   p8.map.layers() == 42U,
+               "plan 8K: windows, interleaved map with the chosen v");
+        for (std::uint32_t s = 0; s < p8.map.stages(); ++s)
+            expect(p8.map.cuts[s + 1U].layer - p8.map.cuts[s].layer >= 4U, "plan: every stage keeps >= 4 layers");
+        const double w_plan = strix::pair::interleaved_wall_ms(8192U, p8.choice.chunk, p8.choice.virtual_stages, cost.at(8192U));
+        for (const auto c : chunks)
+            for (const auto v : vs)
+                if (c < 8192U && 2U * v * 4U <= 42U)
+                    expect(w_plan <= strix::pair::interleaved_wall_ms(8192U, c, v, cost.at(8192U)), "plan 8K: no candidate is faster");
+        LayerPipeCost slow_link = cost;
+        slow_link.hop_latency_ms = 5000.0;  // a hop dearer than a stage: interleaving loses, two stages remain
+        expect(strix::pair::plan_stages(8192U, 42U, slow_link, chunks, any, vs).choice.virtual_stages == 1U, "plan: slow link -> v = 1");
+        expect(strix::pair::plan_stages(8192U, 12U, cost, chunks, any, vs).choice.virtual_stages == 1U, "plan: 12 layers -> v = 1");
+        expect(strix::pair::plan_stages(8192U, 42U, cost, chunks, [](std::uint32_t c) { return c == 2048U; }, vs).choice.chunk == 2048U,
+               "plan: the engine's width rule binds");
+        bool threw = false;
+        const double short_costs[] = {1.0, 2.0};
+        try { (void)strix::pair::plan_stages(8192U, 42U, cost, chunks, any, vs, short_costs); } catch (const std::invalid_argument&) { threw = true; }
+        expect(threw, "plan: one cost per layer");
+        // The planned map runs bitwise like any map (12-layer model, width 8: v = 2 needs 16 layers at min 4 -> min 2).
+        const std::uint32_t small_chunks[] = {8U, 16U};
+        const LayerPipeCost small{1.0, 1.0, 0.0, 0.0, 0.0};
+        const auto ps = strix::pair::plan_stages(64U, L, small, small_chunks, any, vs, {}, 2U);
+        const auto prompt = make_prompt(64U, 77U);
+        const auto ref = reference(m, prompt, ps.choice.chunk, gen);
+        const auto got = run_pair(m, prompt, ps.choice.chunk, gen, ps.map);
+        expect(ps.choice.chunk != 0U && ps.map.virtual_stages() > 1U && got[1].logits.size() == ref.logits.size() &&
+                   std::memcmp(got[1].logits.data(), ref.logits.data(), ref.logits.size() * sizeof(float)) == 0 &&
+                   got[0].ids == ref.ids && got[1].ids == ref.ids,
+               "plan: the planned width and map give the single-rank bits (" + ps.map.text() + ")");
+    }
     {   // refusals: half cut, missing range hook
         StageMap half;
         half.cuts = {StageCut(0U), StageCut(5U, true), StageCut(12U)};
