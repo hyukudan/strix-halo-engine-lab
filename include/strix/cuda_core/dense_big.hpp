@@ -104,7 +104,7 @@ cudaError_t dense_big_cache_reserve(BigOperandCache* cache, const DenseWeight* w
 // Every dense_big_gemm on ctx consults `cache` (nullptr detaches). Several contexts (streams) may share one cache.
 void dense_big_ctx_attach_cache(BigCtx* ctx, BigOperandCache* cache);
 // Stage feed of the FAST4 tile GEMMs (dense_big_gemm with a.f4, dense_big_glu4) on ctx. Scheduling only: both feeds produce the
-// same bits. A new context (and the module default context) uses nvfp4::tile::kDefaultFeed (bulk); Feed::lsu is the rollback.
+// same bits. A new context (and the module default context) uses nvfp4::tile::kDefaultFeed (lsu); Feed::bulk is opt-in.
 void dense_big_ctx_set_tile_feed(BigCtx* ctx, ::strix::cuda::core::nvfp4::tile::Feed feed);
 
 }  // namespace strix::cuda_core

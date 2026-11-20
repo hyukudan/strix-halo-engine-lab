@@ -137,7 +137,7 @@ int main() {
         f.prefill_norm_fold = false;
         check(engine_identity(f) == off_id, "prefill-norm-fold keeps the FAST4 identity (bitwise)");
     }
-    {  // --prefill-tile-feed: strict bulk|lsu; default bulk (measured); scheduling only -> never part of the engine identity
+    {  // --prefill-tile-feed: strict bulk|lsu; incumbent default lsu, bulk opt-in; scheduling only -> never part of the engine identity
         namespace q = strix::qwen35;
         namespace ft = strix::cuda::core::nvfp4::tile;
         check(q::parse_prefill_tile_feed("bulk") == ft::Feed::bulk && q::parse_prefill_tile_feed("lsu") == ft::Feed::lsu,
@@ -146,8 +146,8 @@ int main() {
             check(rejects([&] { (void)q::parse_prefill_tile_feed(bad); }), "prefill-tile-feed rejects other spellings");
         q::EngineOptions f = a;
         f.prefill_arith = q::PrefillArith::fast4;
-        check(q::EngineOptions{}.prefill_tile_feed == ft::Feed::bulk && ft::kDefaultFeed == ft::Feed::bulk,
-              "prefill-tile-feed default bulk (bitwise, measured)");
+        check(q::EngineOptions{}.prefill_tile_feed == ft::Feed::lsu && ft::kDefaultFeed == ft::Feed::lsu,
+              "prefill-tile-feed default lsu (incumbent path retained)");
         f.prefill_tile_feed = ft::Feed::bulk;
         const std::string bulk_id = engine_identity(f);
         f.prefill_tile_feed = ft::Feed::lsu;

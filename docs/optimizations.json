@@ -3379,7 +3379,7 @@
     "engine": "qwen-rtx",
     "name": "Qwen dense 27B CUDA FAST4 tile GEMM: bulk stage feed",
     "flag_or_env": "--prefill-tile-feed bulk|lsu (strix-cuda-qwen35-decode)",
-    "default": "bulk (every FAST4 tile GEMM of the large prefill)",
+    "default": "lsu (incumbent FAST4 tile GEMM feed; bulk is explicit opt-in)",
     "exact": "Scheduling only, no identity suffix: device fixture bulk == lsu bit for bit in 9 checks; host oracle checks the bulk records write exactly the lsu chunk bytes; host tests pin the default and the unchanged engine identity.",
     "gain": "Operator bench (RTX PRO 6000, 4,096 rows, no model, strict ABAB): bulk / lsu = 0.934 GLU, 0.921 down, 0.929 down residual, 0.850 o, 0.858 o residual, 0.846 k/v, 0.977 q/k/v. End-to-end prefill not yet measured.",
     "preconditions": "--prefill-arith fast4 (sm_120, NVFP4 weights); other prefill classes print prefill-tile-feed: n/a.",

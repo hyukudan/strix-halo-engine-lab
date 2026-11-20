@@ -1842,7 +1842,7 @@ void print_effective_config(const EngineOptions& o, const char* arith, std::FILE
                  o.prefill_arith != PrefillArith::fast4 ? "n/a (FAST4 only)"
                  : o.prefill_tile_feed == cuda::core::nvfp4::tile::Feed::bulk
                      ? "bulk (producer warpgroup, 1-D bulk copies + mbarrier ring, bitwise with lsu)"
-                     : "lsu (per-thread cp.async + CTA barrier per stage, the rollback)");
+                     : "lsu (per-thread cp.async + CTA barrier per stage, default)");
     std::fprintf(f, "  prefill-inflight: %u%s (bounded submission, scheduling only, bitwise)\n  prefill-ramp: %u%s\n", o.prefill_inflight,
                  o.prefill_inflight ? " chunks" : " = unbounded", o.prefill_ramp, o.prefill_ramp ? " rows first chunk, doubling to prefill-chunk" : " (off)");
     if (o.turbo_weights >= TurboWeights::onfly)
