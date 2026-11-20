@@ -9,7 +9,11 @@
 #include <initializer_list>
 
 namespace qmd = strix::spec::mtp_defer;
-static_assert(&qmd::on_use == &strix::cuda::qwen_mtp_defer::on_use && &qmd::defer_block == &strix::cuda::qwen_mtp_defer::defer_block,
+// Same entity: two non-type template arguments naming the same function are the same specialization.
+template <auto A, auto B> struct SameEntity { static constexpr bool value = false; };
+template <auto A> struct SameEntity<A, A> { static constexpr bool value = true; };
+static_assert(SameEntity<&qmd::on_use, &strix::cuda::qwen_mtp_defer::on_use>::value &&
+              SameEntity<&qmd::defer_block, &strix::cuda::qwen_mtp_defer::defer_block>::value,
               "the forwarding header aliases the shared policy");
 
 namespace {
