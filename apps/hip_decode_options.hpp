@@ -1174,6 +1174,20 @@ inline void validate_resolved_teacher_forced_score(const Options& options, std::
 [[nodiscard]] inline bool qsa_mtp_pool_route(const Options& o,bool gsq=false) noexcept {
     return qsa_mtp_pool_decline(o,gsq)==nullptr;
 }
+// Window-cost table key (hip_decode_token_main.cpp -> mtp_cost_table_configuration): false for an option (name before
+// any '=') that does not change what the table persists, the wall of an ordinary 1/2/4/8-row verify window. Prompts,
+// per-run outputs and HTTP front-end settings; and the drafting sources: --mtp-ngram-draft changes which candidates fill
+// a window, not its cost, and the wide copy cycles of --mtp-copy-wide-rows never sample a window cost
+// (skip_cycle_sample) while the owners' compiled plans stay keyed by their kernel-plan / execution identities. Keyed
+// apart, the opt-in wide route read its own younger table (8K served prose 34.8 vs 37.3 tok/s, then equal).
+[[nodiscard]] inline bool cost_table_key_option(std::string_view name) noexcept {
+    static constexpr std::string_view skip[]{"--prompt-ids", "--seqs-file", "--json", "--qual-dump", "--session-dump",
+        "--state-out", "--logprob-token", "--chat-logits", "--http-api-key-file", "--http-bind", "--http-model-id",
+        "--http-max-connections", "--http-max-queue", "--http-sse-keepalive", "--http-sse-progress-interval",
+        "--http-stream-receipts", "--mtp-ngram-draft", "--mtp-copy-wide-rows"};
+    for (const auto s : skip) if (s == name) return false;
+    return true;
+}
 [[nodiscard]] inline std::uint64_t qsa_mtp_pool_bytes(const Options& o,const ModelContract& model,bool gsq=false) {
     if (!qsa_mtp_pool_route(o,gsq) || model.full_attention_layers!=12 || model.indexer_head_dim!=128 ||
         model.indexer_n_heads!=4 || model.indexer_compress_ratio!=4) return 0;

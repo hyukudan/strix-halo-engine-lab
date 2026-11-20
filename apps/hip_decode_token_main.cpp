@@ -1400,11 +1400,6 @@ static int run_decode_entry(
         "--session-cache", "--session-disk", "--session-disk-bytes", "--session-first-generate", "--session-capture-host-bytes", "--session-dir", "--session-ram-bytes", "--session-max-parked", "--http-port",
         "--generate", "--tokens-file", "--record-raw", "--reference", "--teacher-logits-file", "--teacher-logits-rows",
         "--prefix-cache-inflight", "--prefix-cache-disk", "--prefix-cache-durable", "--deploy", "--deploy-check"};
-    // Not part of the window-cost table key: prompts, per-run outputs and HTTP front-end settings.
-    const std::set<std::string_view> cost_table_skip{"--prompt-ids", "--seqs-file", "--json", "--qual-dump", "--session-dump",
-        "--state-out", "--logprob-token", "--chat-logits", "--http-api-key-file", "--http-bind", "--http-model-id",
-        "--http-max-connections", "--http-max-queue", "--http-sse-keepalive", "--http-sse-progress-interval",
-        "--http-stream-receipts"};
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (!arg.starts_with("--")) continue; // positional token IDs
@@ -1416,7 +1411,8 @@ static int run_decode_entry(
         if (arg == "--session-live-control" || arg == "--session-validate-only") continue;
         if (session_io_options.count(arg)) { ++i; continue; }
         options.session_effective_cli += std::to_string(arg.size()) + ":" + std::string(arg);
-        const bool cost_key = !cost_table_skip.count(arg.substr(0, arg.find('=')));
+        // Window-cost table key: every option but prompts, outputs, HTTP front-end settings and drafting sources.
+        const bool cost_key = strix::decode_cli::cost_table_key_option(arg.substr(0, arg.find('=')));
         if (cost_key) options.cost_table_cli += std::to_string(arg.size()) + ":" + std::string(arg);
         if (i + 1 < argc && !std::string_view(argv[i + 1]).starts_with("--")) {
             const std::string_view value = argv[++i];

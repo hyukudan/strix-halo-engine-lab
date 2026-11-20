@@ -423,6 +423,18 @@ void campaign_defaults_contract(){
 
 int main(){try{
     {
+        // Window-cost table key: drafting sources and front-end settings do not split the persisted window costs;
+        // settings that change a window's work still do.
+        using strix::decode_cli::cost_table_key_option;
+        require(!cost_table_key_option("--mtp-ngram-draft") && !cost_table_key_option("--mtp-copy-wide-rows"),
+            "drafting sources are not part of the window-cost key");
+        require(!cost_table_key_option("--http-bind") && !cost_table_key_option("--prompt-ids"),
+            "front-end settings and prompts are not part of the window-cost key");
+        require(cost_table_key_option("--mtp-target-window-rows") && cost_table_key_option("--http-batch") &&
+            cost_table_key_option("--context") && cost_table_key_option("--mtp-spec-min-p"),
+            "window shape, batching, context and min-p stay in the window-cost key");
+    }
+    {
         Env graph_env("STRIX_PRINT_MODEL_GRAPH",nullptr), plan_env("STRIX_PRINT_EXEC_PLAN",nullptr);
         const auto plain=parse({"decode","MODEL.gguf","1"});
         require(!plain.print_model_graph && !plain.print_plan,"inspection remains opt-in");
