@@ -205,9 +205,13 @@ def gate(a):
         windows.append(w)
         flips.append(f)
         lines.append(g.window_line(w, f))
-    pooled = g.verdict(windows, flips)
     for x in lines:
         print(x)
+    try:
+        pooled = g.verdict(windows, flips)
+    except g.GateError as e:
+        print(f"no verdict: {e}")
+        return 2
     print(g.pooled_line(pooled))
     if a.json:
         pathlib.Path(a.json).write_text(json.dumps({"pooled": {k: v for k, v in pooled.items()},
