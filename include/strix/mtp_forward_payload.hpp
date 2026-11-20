@@ -32,4 +32,7 @@ struct HipMtpForwardReplayRowReceipt {
 // Reads at most 288 header bytes; verifies the exact file extent before allocation.
 void require_mtp_forward_golden_geometry(const std::filesystem::path&,std::uint64_t rows,
     std::uint64_t width,std::uint64_t vocabulary,std::uint64_t capacity);
+// Exact full-file extent of a v3 (YaRN) golden of this calibration geometry: what a golden still pending
+// self-generation will occupy, so admission charges its real size instead of the declared maximum.
+[[nodiscard]] std::uint64_t mtp_forward_golden_v3_file_bytes(std::uint64_t rows,std::uint64_t width,std::uint64_t vocabulary);
 } // namespace strix

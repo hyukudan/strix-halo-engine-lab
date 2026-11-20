@@ -525,6 +525,9 @@ inline EffectiveConfig resolve_yarn_config(const RequestedOptions& request,
                         ? *memory.yarn_registered_rolling_owner
                         : prefill_rolling_owner_bytes(o,model,manifest,result.environment,memory.ple_reclaim_page);
                     if (rolling_owner) owners["ple_rolling_owner"] = rolling_owner;
+                    // An explicit prefix state cache budget (yarn_route_refusal admits only explicit) is host memory
+                    // retained for the whole run: charged in every phase (no owner_phases mask = all phases).
+                    if (o.prefix_cache_host_bytes) owners["prefix_cache_host"] = o.prefix_cache_host_bytes;
                     for(const auto& [name,bytes]:owners) result.admission["owner_"+name+"_bytes"]=bytes;
                     for(const auto& [name,cap]:required.owner_caps) {
                         result.admission["owner_"+name+"_cap_bytes"]=cap;

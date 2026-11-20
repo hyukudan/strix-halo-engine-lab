@@ -18,6 +18,7 @@
 
 #include <cuda_runtime.h>
 
+#include "strix/cuda/core/nvfp4_tile.hpp"
 #include "strix/cuda_core/attention_policy.hpp"
 #include "strix/cuda_core/dense.hpp"
 #include "strix/cuda_core/operand_cache_plan.hpp"
@@ -62,6 +63,12 @@ enum class PrefillGdn : std::uint8_t { serial, chunk16 };
     if (s == "off") return false;
     throw std::invalid_argument("--prefill-norm-fold expects on|off, got '" + s + "'");
 }
+// CLI spelling of EngineOptions::prefill_tile_feed ("bulk" | "lsu", nvfp4::tile::parse_feed); anything else is rejected.
+[[nodiscard]] inline cuda::core::nvfp4::tile::Feed parse_prefill_tile_feed(const std::string& s) {
+    cuda::core::nvfp4::tile::Feed f{};
+    if (cuda::core::nvfp4::tile::parse_feed(s.c_str(), &f)) return f;
+    throw std::invalid_argument("--prefill-tile-feed expects bulk|lsu, got '" + s + "'");
+}
 
 struct EngineOptions {
     cuda_core::DenseArith dense_arithmetic = cuda_core::dense_arith();
@@ -85,6 +92,11 @@ struct EngineOptions {
     // on demand. Default on: identity PASS + strict A/B x3 on the device for the hidden fold (8K FAST4 + chunk16 -4.4 %);
     // --prefill-norm-fold off is the rollback.
     bool prefill_norm_fold = true;
+    // FAST4 only: stage feed of the tile GEMMs (cuda/core nvfp4_tile Feed). bulk = one producer warpgroup with 1-D bulk copies
+    // into an mbarrier ring; lsu = every thread's cp.async + one CTA barrier per stage. Same bits (no identity suffix).
+    // Default lsu preserves the incumbent kernel; opt in to the measured operator-level bulk feed with --prefill-tile-feed bulk.
+    // End-to-end prefill validation is still required before a default switch.
+    cuda::core::nvfp4::tile::Feed prefill_tile_feed = cuda::core::nvfp4::tile::kDefaultFeed;
     std::uint32_t prefill_chunk = 2048;  // rows per large-M chunk (multiple of 128, <= 8192); buffers are allocated on first use
     // Wave-aligned steps (strix/wave_fit.hpp, scheduling only, bitwise): prompts of >= this many tokens step by the largest
     // rows <= prefill_chunk whose flash grid fills whole waves (4096 -> 3968 on 188 SMs: flash +16 % at 128K, bench). 0 = off

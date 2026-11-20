@@ -115,6 +115,7 @@ Las tablas listan los flags seleccionados. La lista completa de variables de ent
 | Flag | Motor | Por defecto | Qué hace | Cuándo lo quiere otro hardware |
 |---|---|---|---|---|
 | `--block-schedule default\|tail-large` | qwen-rtx | `tail-large` | Orden de bloques en los kernels grandes. | `default` en GPUs con otro número de CUs. |
+| `--prefill-tile-feed bulk\|lsu` | qwen-rtx (CLI de decode del denso 27B, prefill FAST4) | `lsu` | Alimentación de etapas de las GEMM tile FAST4: `bulk` = warpgroup productor con copias bulk (optativo), `lsu` = copias por hilo y barrera de CTA de la ruta anterior. Bits idénticos en el fixture del operador. [Detalles](optimizations.md#qwen-dense-cuda-fast4-tile-bulk-feed) | Mantener `lsu` hasta validar el prefill completo. |
 | `--prefill auto` | glm | `auto` | Elige la ruta de prefill. | - |
 | `--prefill-chunk N` | glm | 512 | Tamaño de chunk de prefill en filas. | Mayor con más cómputo; menor con menos memoria. |
 | `--prefill-route windows\|large`, `--prefill-chunk N` | qwen-rtx (CLI spec 27B) | `windows` | `large`: el prompt pasa por el prefill grande del CLI de decode (`--prefill-chunk N` filas por chunk; 0 = valor del motor) y sus filas alimentan la cadena MTP. Opcional, aún sin medir frente a `windows`. | - |
@@ -454,7 +455,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_QSA_DECODE_POOL_BF16` | qwen | 1 (plain append-only serial decode un... | [qwen-qsa-decode-pool](optimizations.md#qwen-qsa-decode-pool) |
 | `STRIX_QWEN_ROUTER_BF16` | qwen | OFF (opt-in: STRIX_QWEN_ROUTER_BF16=1) | [qwen-exact-bf16-router-weights](optimizations.md#qwen-exact-bf16-router-weights) |
 
-### Rutas de kernel (122)
+### Rutas de kernel (123)
 
 | Toggle | Motor | Por defecto | Detalles |
 |---|---|---|---|
@@ -582,6 +583,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_ROUTER_STAGE_ACT` | qwen | ON | [qwen-router](optimizations.md#qwen-router) |
 | `STRIX_SERVE_HEALTH_RECORD` | qwen | ON | [operations/service-health.md](operations/service-health.md) |
 | `STRIX_SERVE_OBSERVE_EXPIRY_S` | deepseek | 60 seconds | [ds-observation](optimizations.md#ds-observation) |
+| `STRIX_QRTX_EXPERT_WIDE_TILE` | qwen-rtx | off (`1` = activo con el umbral integrado, `N` = activo desde N filas por experto) | [qwen-rtx-expert-wide-tile](optimizations.md#qwen-rtx-expert-wide-tile) |
 
 ### Solo depuración (5)
 

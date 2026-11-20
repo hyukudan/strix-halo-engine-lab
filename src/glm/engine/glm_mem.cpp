@@ -2,6 +2,7 @@
 #include "glm_mem.hpp"
 #include "strix/deploy/device.hpp"
 #include "strix/env_flags.hpp"
+#include "strix/host_memory.hpp"
 
 #include <fcntl.h>
 #include <pthread.h>
@@ -29,24 +30,8 @@ namespace {
 
 double now_s() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
-// "Key:   123 kB" lines (/proc/meminfo, /proc/self/status) -> bytes.
-std::map<std::string, std::uint64_t> read_kb_file(const std::string& path) {
-    std::map<std::string, std::uint64_t> m;
-    std::ifstream f(path);
-    if (!f) return m;
-    std::string line;
-    while (std::getline(f, line)) {
-        const auto c = line.find(':');
-        if (c == std::string::npos) continue;
-        std::istringstream is(line.substr(c + 1));
-        std::uint64_t v = 0;
-        std::string unit;
-        if (!(is >> v)) continue;
-        is >> unit;
-        m[line.substr(0, c)] = unit == "kB" ? v * 1024 : v;
-    }
-    return m;
-}
+// "Key:   123 kB" lines (/proc/meminfo, /proc/self/status) -> bytes: the shared parser.
+std::map<std::string, std::uint64_t> read_kb_file(const std::string& path) { return strix::host_memory::read_kb_fields(path); }
 
 // GiB (fractions allowed) to bytes; unset/empty keeps `def` bytes, a value that is not a non-negative number throws.
 std::uint64_t env_gib(const char* name, std::uint64_t def) {
@@ -101,15 +86,7 @@ Snapshot Probe::read() const {
     s.shmem = get(mi, "Shmem");
     s.swap_total = get(mi, "SwapTotal");
     s.swap_free = get(mi, "SwapFree");
-    {  // "some avg10=0.00 avg60=... total=..." / "full avg10=0.00 ..."
-        std::ifstream z(p_.psi);
-        std::string kind, kv;
-        while (z >> kind >> kv) {
-            if (kind == "full" && kv.rfind("avg10=", 0) == 0) s.psi_full10 = std::strtod(kv.c_str() + 6, nullptr);
-            std::string rest;
-            std::getline(z, rest);
-        }
-    }
+    s.psi_full10 = strix::host_memory::read_psi(p_.psi).full10;  // shared PSI reading (0 when unreadable)
     const auto st = read_kb_file(p_.status);
     s.rss = get(st, "VmRSS");
     s.rss_anon = get(st, "RssAnon");

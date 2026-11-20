@@ -166,6 +166,7 @@ int main(int argc, char** argv) {
         strix::profile::Pairs lever_cli;             // per-lever options: override the profile, recorded as explicit
         std::string pf_arith, pf_dump;            // --prefill-arith exact|flash|fast|fast2: large-M prefill (absent: windows of --rows)
         std::string pf_norm_fold;                 // --prefill-norm-fold on|off (EngineOptions::prefill_norm_fold; FAST4 only, bitwise)
+        std::string pf_tile_feed;                 // --prefill-tile-feed bulk|lsu (EngineOptions::prefill_tile_feed; FAST4 only, bitwise)
         std::uint32_t pf_chunk = 2048, pf_repeat = 1, pf_slots = 2, pf_wave_min = 0;
         std::uint32_t pf_inflight = q::EngineOptions{}.prefill_inflight, pf_ramp = 0;  // bounded submission / ramp
         for (int i = 1; i < argc; ++i) {
@@ -187,6 +188,7 @@ int main(int argc, char** argv) {
             else if (a == "--prefill-arith") lever_cli.emplace_back("prefill_arith", next());
             else if (a == "--prefill-gdn") lever_cli.emplace_back("prefill_gdn", next());  // serial|chunk16 (FAST, -gdnc16)
             else if (a == "--prefill-norm-fold") pf_norm_fold = next();
+            else if (a == "--prefill-tile-feed") pf_tile_feed = next();
             else if (a == "--flash-pipe") flash_pipe = next();         // pad2|swz3 (bitwise equal; scheduling only)
             else if (a == "--flash-tail") flash_tail = next();         // split|off (bitwise equal; scheduling only; default split)
             else if (a == "--prefill-attn8") lever_cli.emplace_back("prefill_attn8", next());        // on|off: e4m3 flash attention (FAST, identity -a8)
@@ -279,6 +281,7 @@ int main(int argc, char** argv) {
             pf_arith = e->value;  // the large-M prefill route of this CLI follows the resolved arithmetic
         const std::string profile_text = qp::describe(*resolved);
         if (!pf_norm_fold.empty()) opt.prefill_norm_fold = q::parse_prefill_norm_fold(pf_norm_fold);
+        if (!pf_tile_feed.empty()) opt.prefill_tile_feed = q::parse_prefill_tile_feed(pf_tile_feed);
         opt.prefill_chunk = pf_chunk;
         opt.prefill_wave_min_tokens = pf_wave_min;
         opt.prefill_slots = pf_slots;

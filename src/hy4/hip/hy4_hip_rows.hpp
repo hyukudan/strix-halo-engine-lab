@@ -12,10 +12,12 @@
 #include "hy4/hip/hy4_hip_plan.hpp"
 #include "strix/spec/block_drafter.hpp"
 #include "strix/spec/engine_target.hpp"
+#include "strix/spec/mtp_chain.hpp"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <stdexcept>
@@ -34,6 +36,12 @@ inline constexpr bool kExpertUnionDefault = true;  // measured bitwise (ROWS 30/
 // The decode step's device position words of a row at position p: {position, rope slot of its group, closing group, 0}.
 [[nodiscard]] constexpr std::array<std::uint32_t, 4> position_words(std::uint32_t p, std::uint32_t ratio) {
     return {p, p / ratio * ratio, p / ratio, 0U};
+}
+// Rows form of a next-token block call (Forward::nextn_rows): the call's rows run in chunks through the verify rows form;
+// the chunk starting at row `off` of an R-row call holds min(R - off, verify_rows) rows (verify_rows < 2: one row per
+// chunk = the per-row loop). Every row r of the call keeps its own pinned position slot r (no host sync inside a call).
+[[nodiscard]] constexpr std::uint32_t nextn_chunk(std::uint32_t off, std::uint32_t R, std::uint32_t verify_rows) {
+    return off >= R ? 0U : std::min(R - off, std::max(1U, verify_rows));
 }
 // Rows one launch / one pass may write ahead of the oldest live key: the caches are sized for the larger of the batched
 // prompt window and the verify rows.
@@ -110,10 +118,127 @@ private:
     Fwd& f_;
 };
 
+// ---- native MTP drafter: the shared MtpChain (strix/spec/mtp_chain.hpp) over a forward with the next-token block ----
+// Fwd additionally: config().hidden, kNextnRows, nextn_rows(tokens, hidden, rows, pos0, want_top, outputs) -> {top, hidden_pre,
+// hidden_post}, read_ids(top, n, host) (synchronises), rows_hidden() (device rows of the last forward_rows pass: the
+// target's output_norm hidden = the teacher input), set_prompt_hidden(sink), alloc_f32 / free_f32 / copy_f32_async.
+template <class Fwd>
+class MtpEngine {
+public:
+    struct Cfg { std::uint32_t hidden = 0; };
+    struct Rows {
+        const std::uint32_t* top = nullptr;
+        const float* hidden_pre = nullptr;
+        const float* hidden_post = nullptr;
+    };
+    using MtpOut = Rows;
+    explicit MtpEngine(Fwd& f) : f_(f) { cfg_.hidden = f.config().hidden; }
+    [[nodiscard]] const Cfg& config() const { return cfg_; }
+    void read_top(const Rows& r, std::uint32_t n, std::uint32_t* host) { f_.read_ids(r.top, n, host); }
+    MtpOut mtp_forward(const std::uint32_t* next, const float* hidden, std::uint32_t rows, std::uint32_t pos0, bool want_top) {
+        const auto o = f_.nextn_rows(next, hidden, rows, pos0, want_top);
+        return {o.top, o.hidden_pre, o.hidden_post};
+    }
+    // MtpKvRowsEngine (strix/spec/mtp_chain.hpp): only the trailing `outputs` rows' top / hidden are read.
+    MtpOut mtp_forward(const std::uint32_t* next, const float* hidden, std::uint32_t rows, std::uint32_t pos0, bool want_top,
+                       std::uint32_t outputs) {
+        const auto o = f_.nextn_rows(next, hidden, rows, pos0, want_top, outputs);
+        return {o.top, o.hidden_pre, o.hidden_post};
+    }
+    float* alloc_f32(std::size_t n) { return f_.alloc_f32(n); }
+    void free_f32(float* p) { f_.free_f32(p); }
+    void copy_f32_async(float* d, const float* src, std::size_t n) { f_.copy_f32_async(d, src, n); }
+
+private:
+    Fwd& f_;
+    Cfg cfg_;
+};
+template <class Fwd>
+using MtpDrafter = spec::MtpChain<MtpEngine<Fwd>, spec::EngineChainDev>;
+
+// The MTP drafter of one sequence. The teacher pass over the prompt rides on prefill: install(prompt) before
+// f.prefill(prompt) routes every prompt row's hidden into the chain's ring (row i's successor = prompt[i + 1]); the last
+// row waits for the anchor (finish_prompt). Teacher = the target's output_norm hidden, chain = the block's own
+// shared_head_norm output (the numerics the host oracle selected by acceptance: hy4_dfly mtp).
+template <class Fwd>
+class MtpSource {
+public:
+    explicit MtpSource(Fwd& f) : f_(f), eng_(f), chain_(eng_, false, Fwd::kNextnRows) {}
+    ~MtpSource() {
+        f_.set_prompt_hidden({});
+        if (last_) f_.free_f32(last_);
+    }
+    MtpSource(const MtpSource&) = delete;
+    MtpSource& operator=(const MtpSource&) = delete;
+    void install(std::span<const std::uint32_t> prompt) {
+        if (prompt.empty()) throw std::invalid_argument("hy4 rows: MTP prompt is empty");
+        prompt_.assign(prompt.begin(), prompt.end());
+        base_ = f_.position();
+        fed_ = 0;
+        if (!last_) last_ = f_.alloc_f32(f_.config().hidden);
+        f_.set_prompt_hidden([this](const float* rows, std::uint32_t p0, std::uint32_t n) { feed(rows, p0, n); });
+    }
+    // After f.prefill(prompt): anchor = the greedy id after the prompt (the last prompt row's successor).
+    void finish_prompt(std::uint32_t anchor) {
+        f_.set_prompt_hidden({});
+        if (fed_ != prompt_.size()) throw std::logic_error("hy4 rows: MTP prompt rows not all fed by prefill");
+        const typename MtpEngine<Fwd>::Rows o{nullptr, nullptr, last_};
+        chain_.observe_prefill(o, 1U, &prompt_.back(), anchor);
+    }
+    [[nodiscard]] MtpDrafter<Fwd>& chain() { return chain_; }
+
+private:
+    void feed(const float* rows, std::uint32_t p0, std::uint32_t n) {
+        if (p0 != base_ + fed_ || std::size_t{fed_} + n > prompt_.size()) throw std::logic_error("hy4 rows: MTP prompt rows out of order");
+        const std::uint32_t* toks = prompt_.data() + fed_;
+        const bool tail = std::size_t{fed_} + n == prompt_.size();
+        const std::uint32_t head = tail ? n - 1U : n;  // rows whose successor is known now
+        if (head) {
+            const typename MtpEngine<Fwd>::Rows o{nullptr, nullptr, rows};
+            chain_.observe_prefill(o, head, toks, prompt_[fed_ + head]);
+        }
+        if (tail) f_.copy_f32_async(last_, rows + std::size_t{n - 1U} * f_.config().hidden, f_.config().hidden);
+        fed_ += n;
+    }
+    Fwd& f_;
+    MtpEngine<Fwd> eng_;
+    MtpDrafter<Fwd> chain_;
+    std::vector<std::uint32_t> prompt_;
+    std::uint32_t base_ = 0, fed_ = 0;
+    float* last_ = nullptr;
+};
+
+// Verify target of the chain arm: the rows contract plus the chain's view of each pass (the committed rows' hidden).
+template <class Fwd>
+class ChainVerifyTarget final : public spec::VerifyTarget {
+public:
+    ChainVerifyTarget(Fwd& f, MtpDrafter<Fwd>& chain) : f_(f), chain_(chain) {}
+    void verify(std::span<const std::uint32_t> tokens, std::vector<std::uint32_t>& greedy) override {
+        f_.forward_rows(tokens, false);  // synchronises
+        const auto g = f_.rows_greedy();
+        const auto R = static_cast<std::uint32_t>(tokens.size());
+        if (g.size() < R) throw std::logic_error("hy4 rows: verify greedy rows");
+        greedy.assign(g.begin(), g.begin() + R);
+        chain_.observe_verify(typename MtpEngine<Fwd>::Rows{nullptr, nullptr, f_.rows_hidden()}, R);
+    }
+    void commit(std::uint32_t k) override { f_.commit_rows(k); }
+
+private:
+    Fwd& f_;
+    MtpDrafter<Fwd>& chain_;
+};
+
 struct SpecOptions {
     std::uint32_t max_rows = kMaxVerifyRows;  // anchor + drafts per pass
     std::vector<double> verify_ms;            // seeds ms[R - 1], R = 1 .. max_rows (fixed costs: the Arbiter's model)
     std::uint32_t trace = 0;                  // first steps printed by the caller from SpecResult::steps
+    // chain arm (spec_decode with an MtpSource): the drafter's wall seeds (block row + head; the first step after a pass
+    // also flushes the committed rows) and its stated confidence, conditional survival by depth (the host oracle's
+    // acceptance) weighted as pseudo-observations; the Arbiter refines both online and prices the copy / chain / hybrid arms.
+    double chain_step_ms = 6.1, chain_flush_ms = 9.6;
+    std::vector<double> chain_survival;
+    double survival_weight = 8.0;
+    bool copy = true;  // the copy source (and the hybrid copy + chain block); false = chain only
 };
 struct SpecResult {
     std::vector<std::uint32_t> ids;                   // emitted ids, ids[0] = the anchor
@@ -121,31 +246,35 @@ struct SpecResult {
     std::array<std::uint64_t, kMaxVerifyRows + 1> rows_hist{};  // passes by rows
     std::uint64_t proposed = 0, accepted = 0;
     double wall_ms = 0;
+    // chain arm: next-token block calls / rows, chain drafts, their wall (ms) and synchronising id reads
+    std::uint64_t chain_calls = 0, chain_rows = 0, chain_drafts = 0, chain_reads = 0;
+    double chain_ms = 0;
 };
 
-// Speculative greedy decode of n ids after a prompt already in `f` (position == prompt.size()); anchor = the greedy
-// id after the prompt (ids[0]). Copy proposer only (no chain drafter yet); the Arbiter decides the rows of every pass.
-// Output ids are those of plain greedy decode when forward_rows rows == step (the shared controller emits only the
-// target's own greedy ids: accepted drafts equal them, the first mismatch is replaced by the target's id).
+namespace detail {
+// One speculative decode over `target` (the rows contract, with the chain's view when `chain` is set).
 template <class Fwd>
-SpecResult spec_decode(Fwd& f, std::span<const std::uint32_t> prompt, std::uint32_t anchor, std::uint32_t n, const SpecOptions& o) {
+SpecResult spec_run(Fwd& f, std::span<const std::uint32_t> prompt, std::uint32_t anchor, std::uint32_t n, const SpecOptions& o,
+                    spec::ChainDrafter* chain, std::span<const double> survival, spec::VerifyTarget& target) {
     if (o.max_rows < 1U || o.max_rows > kMaxVerifyRows) throw std::invalid_argument("hy4 rows: spec max rows outside 1..8");
     spec::BlockConfig bc;
     bc.max_block = o.max_rows;
     bc.arbiter.windows.clear();
     for (std::uint32_t w = 1; w <= o.max_rows; ++w) bc.arbiter.windows.push_back(w);
-    bc.copy = true;
-    bc.chain = false;
-    bc.hybrid = false;
+    bc.copy = o.copy || chain == nullptr;
+    bc.chain = chain != nullptr;
+    bc.hybrid = chain != nullptr && o.copy;
+    bc.chain_max_k = o.max_rows > 1U ? o.max_rows - 1U : 1U;
+    bc.chain_seed_step_ms = o.chain_step_ms;
+    bc.chain_seed_flush_ms = o.chain_flush_ms;
     bc.fixed_costs = !o.verify_ms.empty();
-    spec::BlockDrafter drafter(bc, nullptr);
+    spec::BlockDrafter drafter(bc, chain);
     for (std::uint32_t r = 1; r <= o.max_rows && r <= o.verify_ms.size(); ++r) drafter.seed_verify_ms(r, o.verify_ms[r - 1U]);
+    if (chain && !survival.empty()) drafter.seed_chain_survival(survival, o.survival_weight);
     drafter.commit(prompt);
     SpecResult res;
     res.ids.push_back(anchor);
     drafter.commit(std::span<const std::uint32_t>(res.ids.data(), 1));
-    VerifyEngine<Fwd> engine(f);
-    spec::EngineVerifyTarget<VerifyEngine<Fwd>> target(engine);
     spec::BlockSpeculator sp(drafter, target);
     sp.start(anchor);
     const auto t0 = std::chrono::steady_clock::now();
@@ -163,6 +292,33 @@ SpecResult spec_decode(Fwd& f, std::span<const std::uint32_t> prompt, std::uint3
     }
     res.wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (res.ids.size() > n) res.ids.resize(n);
+    return res;
+}
+}  // namespace detail
+
+// Speculative greedy decode of n ids after a prompt already in `f` (position == prompt.size()); anchor = the greedy
+// id after the prompt (ids[0]). Copy proposer; the Arbiter decides the rows of every pass.
+// Output ids are those of plain greedy decode when forward_rows rows == step (the shared controller emits only the
+// target's own greedy ids: accepted drafts equal them, the first mismatch is replaced by the target's id).
+template <class Fwd>
+SpecResult spec_decode(Fwd& f, std::span<const std::uint32_t> prompt, std::uint32_t anchor, std::uint32_t n, const SpecOptions& o) {
+    VerifyEngine<Fwd> engine(f);
+    spec::EngineVerifyTarget<VerifyEngine<Fwd>> target(engine);
+    return detail::spec_run(f, prompt, anchor, n, o, nullptr, {}, target);
+}
+// The same with the next-token block chain (`mtp` installed before the prefill and finished with the anchor): the copy,
+// chain and hybrid arms (copy and hybrid unless o.copy is false). The chain changes which rows are verified, never an id.
+template <class Fwd>
+SpecResult spec_decode(Fwd& f, std::span<const std::uint32_t> prompt, std::uint32_t anchor, std::uint32_t n, const SpecOptions& o,
+                       MtpSource<Fwd>& mtp) {
+    auto& ch = mtp.chain();
+    ChainVerifyTarget<Fwd> target(f, ch);
+    auto res = detail::spec_run(f, prompt, anchor, n, o, &ch, o.chain_survival, target);
+    res.chain_calls = ch.calls();
+    res.chain_rows = ch.rows();
+    res.chain_drafts = ch.drafts();
+    res.chain_reads = ch.host_reads();
+    res.chain_ms = ch.draft_wall_ms();
     return res;
 }
 

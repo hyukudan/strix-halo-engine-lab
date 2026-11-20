@@ -5090,6 +5090,25 @@ the longest cached prefix of its token ids and prefills only the rest.
 - **Measured gain:** No throughput figure published yet. Follow-up agent turns report 48,128-49,664 restored tokens in `cached_tokens`.
 - **Implementation / evidence:** [Qwen RTX serve guide](models/qwen3.8/rtx-serve.md#prompt-prefix-cache), [cache](../apps/cuda_qwen_prefix_cache.hpp)
 
+<a id="qwen-rtx-expert-wide-tile"></a>
+
+### Tensor-core expert wide tile form (128 rows)
+
+**Engine:** `qwen-rtx`. **Control:** `--expert-wide-tile on|off|N`, `STRIX_QRTX_EXPERT_WIDE_TILE` (lever row `expert_wide_tile`). **Default:** off (opt-in until its timing receipt).
+
+A prefill launch whose experts receive at least N rows each on average cuts 128-row CSR tiles and runs them in
+512-thread blocks: each warp keeps one column block and one weight row per lane (32 accumulators per thread, as the
+64-row tile form), so a 128-row run of an expert decodes its weight codes once instead of twice. MMA count, activation
+bytes per row and warps per SM do not change. N is a planner parameter per device: the no-model tile bench prints it
+(`TILEWIDE min_rows=N`); `on` uses the builtin value (128, provisional).
+
+- **Preconditions:** CUDA Qwen MoE with `gsq_bf16_mma` experts (the FAST expert arithmetic) on prefill launches above 16 rows; decode steps keep the decode form.
+- **Automatic selection:** none yet; when on, the launch picks the wide form from its average rows per expert.
+- **Exactness evidence:** Exact schedule trait: a wide tile is exactly two consecutive 64-row tiles; every row keeps its m16 position and order and each output's MMA and scale-FMA sequence is unchanged, so outputs are bitwise the tile form (host test on edge counts and 200 random 512-expert routings; the bench compares both forms' device hashes). Contract and bundle id do not change.
+- **Off switch:** `--expert-wide-tile off`; `STRIX_QRTX_EXPERT_WIDE_TILE=0` (the default).
+- **Measured gain:** Not yet measured.
+- **Implementation / evidence:** [kernels](../src/cuda/core/moe_a8_mma.cuh), [form contract and launch rule](../src/cuda/core/native_mma.hpp), [lever row](../include/strix/profiles/qwen_cuda.hpp), [bench](../tests/cuda/qwen_moe_tile_bench.cu)
+
 <a id="qwen-rtx-expert-decode-tile"></a>
 
 ### Tensor-core expert decode tile form
@@ -5216,6 +5235,24 @@ host wait for the ids. The host no longer stands between the last draft kernel a
 - **Off switch:** `--prelaunch 0` (the default).
 - **Measured gain:** Not yet measured.
 - **Implementation / evidence:** [contract](../include/strix/spec/block_drafter.hpp), [MTP chain](../include/strix/spec/mtp_chain.hpp), [CUDA binding](../src/qwen35/cuda/engine.cu)
+
+<a id="qwen-dense-cuda-fast4-tile-bulk-feed"></a>
+### Qwen dense 27B CUDA FAST4 tile GEMM: bulk stage feed
+
+**Engine:** `qwen-rtx` (dense 27B, FAST4 prefill). **Control:** `--prefill-tile-feed bulk|lsu` on `strix-cuda-qwen35-decode`. **Default:** `lsu` (unchanged).
+
+The FAST4 tile GEMM (W4A4, `nvfp4-tile-mma-f32-v1`) was bound by its stage feed, not by the tensor pipe: every one of the
+eight MMA warps issued its share of the 1,728 16-byte copies of a 27,648-byte stage and the whole CTA met at a barrier once
+per stage. The `bulk` feed of the shared tile family gives the copies to a producer warpgroup (one 1-D bulk copy per
+contiguous record, 40 per stage, into a full / empty mbarrier ring); the MMA warps issue no copy instruction and wait per
+warp for their stage. The stage holds the same bytes at the same offsets and every accumulator sees the same MMA order.
+
+- **Preconditions:** `--prefill-arith fast4` (sm_120, NVFP4 weights): every FAST4 tile GEMM of the large prefill (gate/up GLU, down, q/k/v, o, the residual forms). Other prefill classes do not use the tile family; the effective config prints `prefill-tile-feed: n/a (FAST4 only)`.
+- **Selection:** opt-in with `--prefill-tile-feed bulk` for FAST4 GEMMs; without that option the effective config prints `prefill-tile-feed: lsu`.
+- **Exactness evidence:** Scheduling only, no identity suffix: device fixture `nvfp4_tile_device` bulk output equal to lsu bit for bit in 9 checks (store, residual, silu_mul and GLU forms, partial weight and activation tiles); host oracle `nvfp4_tile_host` checks that the bulk records write exactly the bytes of the lsu chunks; host tests pin the default and that the option never changes the engine identity.
+- **Off switch:** `--prefill-tile-feed lsu` (also the default; preserves the incumbent launch path).
+- **Measured gain:** Operator bench reported for RTX PRO 6000, 4,096 rows, no model, strict ABAB in one process: bulk / lsu = 0.934 gate/up GLU, 0.921 down, 0.929 down (residual), 0.850 o, 0.858 o (residual), 0.846 k/v, 0.977 q/k/v. The lsu form is reported as neutral versus main within noise on 7 shapes. These are operator-level results, not an end-to-end prefill qualification; retain lsu by default until that is measured.
+- **Implementation / evidence:** [tile contract](../include/strix/cuda/core/nvfp4_tile.hpp), [sm_120 kernel](../src/cuda/core/arch/sm120/nvfp4_tile.cuh), [dense_big binding](../src/cuda_core/dense/dense_big.cu), [fixture](../tests/nvfp4_tile/tile_device.cu)
 
 ## Platform (kernel)
 

@@ -483,6 +483,10 @@ void linear(const Tensor& w, const float* x, float* out, unsigned rows, hipStrea
 // out = down(SiLU(gate x) * up x). Wide IU4 windows whose down GEMM takes the x16 form get h as x16 tiles straight from the
 // SiLU pass (x16_tiles_map2_kernel<SiluMul>: no FP32 h, no separate tile pass; same bits). wide.xt holds the tiles of x
 // for gate / up, then (stream order, after up) the tiles of h for down. STRIX_DENSE_GLU_X16=0: glu + linear.
+// GLU pair sweep (default; STRIX_DENSE_GLU_PAIR=0 keeps the three launches below): gate and up in ONE x16 GEMM whose
+// store writes SiLU(gate) * up as down's x16 tiles (iu4a16::enqueue_glu_x16; same sums, same expression, same bits; no
+// FP32 gate / up outputs, no map2 pass). The h tiles go to wide.g (rows * I * 4 bytes >= the tiles' rows * I * 2), since
+// wide.xt is still being read. Not under the FAST4 emulation instrument (its quantiser stays in map2).
 void mlp(const Tensor& g, const Tensor& u, const Tensor& d, const float* x, float* h, float* out, unsigned rows, hipStream_t s,
          const WideScratch& wide, const Iu4Scratch& iu4) {
     static const bool fuse = strix::envcfg::flag("STRIX_DENSE_GLU_X16", true);
@@ -497,6 +501,21 @@ void mlp(const Tensor& g, const Tensor& u, const Tensor& d, const float* x, floa
         core::iu4a4_dense::enqueue_quantise_map2<SiluMul>(wide.g, wide.u, d.inputs, act, s);
         a4_linear(d, nullptr, out, rows, s, wide, false);
         return;
+    }
+    static const bool pair = strix::envcfg::flag("STRIX_DENSE_GLU_PAIR", true);
+    const bool wide_glu = rows > 16U && !wide_ok(g, wide) && wide_iu4_ok(g, wide, rows) && wide_iu4_ok(u, wide, rows) &&
+                          wide_iu4_ok(d, wide, rows) && g.outputs == u.outputs && g.inputs == u.inputs && d.inputs == g.outputs;
+    if (fuse && pair && wide_glu && fast4_emu() == 0 && wide_iu4_x16(g, wide, rows) && wide_iu4_x16(d, wide, rows)) {
+        namespace iu = core::f16_dense_tall::iu4a16;
+        iu::GluView gv{wide_iu4_view(g, x, nullptr, rows), static_cast<const std::uint8_t*>(u.data), nullptr, nullptr};
+        gv.h = reinterpret_cast<decltype(gv.h)>(wide.g);
+        gv.second_scale = reinterpret_cast<const std::uint16_t*>(gv.second_weight + core::dense_iu4::packed_bytes(u.outputs, u.inputs));
+        if (iu::glu_pair_supported(gv)) {
+            x16_tiles(x, wide.xt, rows, g.inputs, s);
+            iu::enqueue_glu_x16<SiluMul>(gv, wide.xt, s);
+            wide_iu4(d, h, out, rows, s, gv.h);  // h is not read by the x16 form
+            return;
+        }
     }
     if (fuse && rows > 16U && !wide_ok(g, wide) && wide_iu4_ok(g, wide, rows) && wide_iu4_ok(u, wide, rows) && wide_iu4_ok(d, wide, rows) &&
         g.outputs == u.outputs && d.inputs == g.outputs && wide_iu4_x16(d, wide, rows)) {

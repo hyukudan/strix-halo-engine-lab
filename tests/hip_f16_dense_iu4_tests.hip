@@ -6,7 +6,8 @@
 //     count untouched; 16-wave CTAs give the same bits as 8-wave CTAs;
 //  3. the x16 form (enqueue_x16_tiles + enqueue_x16, column-fast) gives the direct form's bits, 8 and 16 waves;
 //  4. x16 tiles of a producer (enqueue_x16_tiles_map2) == the tile pass over the producer's stored FP32 values;
-//  5. A4 emulation tiles (a4_tiles::Emu, g32 / g64 / Hadamard-128 g32) of both producers == a4_tiles::reference.
+//  5. A4 emulation tiles (a4_tiles::Emu, g32 / g64 / Hadamard-128 g32) of both producers == a4_tiles::reference;
+//  6. the GLU pair sweep (enqueue_glu_x16) writes the same x16 tiles of h as two x16 GEMMs + map2, bit for bit.
 #include "core/a4_tiles.hpp"
 #include "core/f16_dense_iu4.hpp"
 #include "core/iu4.hpp"
@@ -224,6 +225,59 @@ int main() {
         arm(Tag<a4::Emu<32U, true>>{}, "h128g32", 32U, true);
         arm(Tag<a4::Emu<64U, true>>{}, "h128g64", 64U, true);
         CHECK(hipFree(dx)); CHECK(hipFree(d1)); CHECK(hipFree(dp)); CHECK(hipFree(t1)); CHECK(hipFree(t2));
+    }
+    {  // 6. GLU pair sweep (enqueue_glu_x16) == enqueue_x16(first) + enqueue_x16(second) + map2, bit for bit, 8 / 16 waves
+        const unsigned R = 300U, K = 384U, N = 256U;  // partial row CTA; two 128-output pair column blocks
+        std::mt19937 rng(11);
+        std::uniform_int_distribution<int> uc(-8, 7);
+        std::uniform_real_distribution<float> us(-0.05F, 0.05F), ux(-2.0F, 2.0F);
+        const auto pack = [&]() {
+            std::vector<std::uint8_t> w(std::size_t(N) * K / 2U + std::size_t(N) * (K / 64U) * 2U, 0U);
+            for (unsigned o = 0; o < N; ++o)
+                for (unsigned k = 0; k < K; ++k) strix::core::iu4_put(w[strix::core::iu4_weight_byte(int(k), int(o), int(N))], int(k % 2U), uc(rng));
+            auto* sc = reinterpret_cast<std::uint16_t*>(w.data() + std::size_t(N) * K / 2U);
+            for (unsigned i = 0; i < N * (K / 64U); ++i) sc[i] = __builtin_bit_cast(std::uint16_t, static_cast<_Float16>(us(rng)));
+            return w;
+        };
+        const std::vector<std::uint8_t> wg = pack(), wu = pack();
+        std::vector<float> x(std::size_t(R) * K);
+        for (auto& v : x) v = ux(rng);
+        std::uint8_t *dg = nullptr, *du = nullptr;
+        float *dx = nullptr, *yg = nullptr, *yu = nullptr;
+        _Float16 *dxt = nullptr, *href = nullptr, *hpair = nullptr;
+        const std::size_t ht = tall::x16_bytes(R, N);
+        CHECK(hipMalloc(&dg, wg.size())); CHECK(hipMalloc(&du, wu.size())); CHECK(hipMalloc(&dx, x.size() * 4U));
+        CHECK(hipMalloc(&yg, std::size_t(R) * N * 4U)); CHECK(hipMalloc(&yu, std::size_t(R) * N * 4U));
+        CHECK(hipMalloc(&dxt, tall::x16_bytes(R, K))); CHECK(hipMalloc(&href, ht)); CHECK(hipMalloc(&hpair, ht));
+        CHECK(hipMemcpy(dg, wg.data(), wg.size(), hipMemcpyHostToDevice));
+        CHECK(hipMemcpy(du, wu.data(), wu.size(), hipMemcpyHostToDevice));
+        CHECK(hipMemcpy(dx, x.data(), x.size() * 4U, hipMemcpyHostToDevice));
+        const auto view = [&](const std::uint8_t* w, float* y) {
+            iu::View v{};
+            v.weight = w; v.scale = reinterpret_cast<const std::uint16_t*>(w + std::size_t(N) * K / 2U);
+            v.x = dx; v.out = y; v.in = K; v.n = N; v.count = N; v.rows = R; v.out_stride = N;
+            return v;
+        };
+        iu::GluView gv{view(dg, nullptr), du, reinterpret_cast<const std::uint16_t*>(du + std::size_t(N) * K / 2U), hpair};
+        if (!iu::glu_pair_supported(gv)) { std::printf("GLU pair view not supported\n"); return 1; }
+        tall::enqueue_x16_tiles(dx, dxt, R, K, 0);
+        unsigned bad = 0;
+        for (unsigned waves : {8U, 16U}) {
+            CHECK(hipMemset(href, 0x7f, ht)); CHECK(hipMemset(hpair, 0x55, ht));
+            iu::enqueue_x16(view(dg, yg), dxt, 0, waves);
+            iu::enqueue_x16(view(du, yu), dxt, 0, waves);
+            tall::enqueue_x16_tiles_map2<Mul>(yg, yu, href, R, N, 0);
+            iu::enqueue_glu_x16<Mul>(gv, dxt, 0, waves);
+            CHECK(hipGetLastError()); CHECK(hipDeviceSynchronize());
+            std::vector<std::uint16_t> a(ht / 2U), b(ht / 2U);
+            CHECK(hipMemcpy(a.data(), href, ht, hipMemcpyDeviceToHost)); CHECK(hipMemcpy(b.data(), hpair, ht, hipMemcpyDeviceToHost));
+            bad += std::memcmp(a.data(), b.data(), ht) != 0;
+        }
+        std::printf("glu pair: h tiles vs x16(first) + x16(second) + map2, 8 / 16 waves %s\n", bad ? "DIFFER" : "bitwise");
+        failures += bad != 0U;
+        for (void* p : {static_cast<void*>(dg), static_cast<void*>(du), static_cast<void*>(dx), static_cast<void*>(yg), static_cast<void*>(yu),
+                        static_cast<void*>(dxt), static_cast<void*>(href), static_cast<void*>(hpair)})
+            CHECK(hipFree(p));
     }
     std::printf("%s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;

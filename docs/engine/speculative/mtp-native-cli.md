@@ -152,8 +152,8 @@ actual C and profile pair. A bare YaRN command discovers
 `<model>.mtp-bundle.json` beside the GGUF and selects MTP after verifying its
 sidecar through the persistent content-hash cache. Without a bundle it uses serial
 decode with one notice. `STRIX_QWEN_YARN_MTP=0` selects serial; `=1` requires a
-bundle (missing bundles refuse). Explicit `--mtp` remains available. HTTP, session/cache restore, cohorts, wide copy and sampling remain
-closed. Structurally non-serial verifier arithmetic refuses before mutation.
+bundle (missing bundles refuse). Explicit `--mtp` remains available. The single HTTP route (`--http-batch 0`) and an explicit prefix state cache
+budget are admitted (see serving.md); sessions, cohorts, wide copy and sampling remain closed. Structurally non-serial verifier arithmetic refuses before mutation.
 Host admission and compilation do not establish GPU exactness or model fidelity.
 
 Both `STRIX_QSA_MTP_POOL` and `STRIX_PLE_ROLLING` default on for admitted MTP

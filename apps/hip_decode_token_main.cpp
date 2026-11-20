@@ -17,6 +17,7 @@
 #include "strix/route_receipt.hpp"
 #include "strix/device_profile.hpp"
 #include "strix/mtp_cost_table_session.hpp"
+#include "strix/mtp_forward_payload.hpp"
 #include "http_slot_capacity.hpp"
 #include "strix/hip_mtp_native_validation.hpp"
 #include "qwen_prefill_plan.hpp"
@@ -1595,17 +1596,27 @@ static int run_decode_entry(
     // Hash/map the sidecar and calibration once, before any HIP allocation.
     // Keep witnesses alive and revalidate at every candidate and runtime check.
     std::optional<strix::MappedModelFile> serving_sidecar, serving_golden;
+    std::string serving_golden_path;
     std::optional<strix::HipModelResidencyReservation> serving_sidecar_reservation;
     prompt_memory.serving = [&](const strix::decode_cli::Options& candidate) {
         using namespace strix;
         using namespace strix::decode_cli;
         if (!candidate.mtp.enabled) return HttpServingMemory{};
         const auto& m=candidate.mtp;
-        if (!serving_sidecar || !serving_golden || !serving_sidecar_reservation) {
-            serving_sidecar.emplace(MappedModelFile::open_read_only(m.sidecar,m.sidecar_logical_name,generations));
+        // A bundle golden not yet in the cache is self-generated after load (ensure_mtp_bundle_golden) and pinned
+        // then; until that point the check charges the exact v3 golden extent and verifies the sidecar only.
+        const bool golden_pending=!candidate.mtp_bundle_path.empty() && m.golden.empty();
+        if (golden_pending && candidate.rotary.mode()!=RotaryMode::yarn)
+            throw std::invalid_argument("one-slot:native MTP bundle golden pending self-generation (no serving charge)");
+        if (!golden_pending && (serving_golden_path!=m.golden || !serving_golden)) {
+            serving_golden.reset(); serving_golden_path.clear();
             serving_golden.emplace(MappedModelFile::open_read_only(m.golden,"calibration",generations));
-            verify_mtp_serving_assets(m,serving_sidecar->file_sha256(),serving_sidecar->bytes(),
-                serving_golden->file_sha256(),serving_golden->bytes());
+            serving_golden_path=m.golden;
+            verify_mtp_serving_golden(m,serving_golden->file_sha256(),serving_golden->bytes());
+        }
+        if (!serving_sidecar || !serving_sidecar_reservation) {
+            serving_sidecar.emplace(MappedModelFile::open_read_only(m.sidecar,m.sidecar_logical_name,generations));
+            verify_mtp_serving_sidecar(m,serving_sidecar->file_sha256(),serving_sidecar->bytes());
             MtpSidecarAssetEvidence evidence;
             evidence.repository=m.repository; evidence.revision=m.revision; evidence.relative_path=m.source_path;
             evidence.declared_file_sha256=mtp_cli_digest(m.sidecar_sha256); evidence.declared_file_bytes=m.sidecar_bytes;
@@ -1615,7 +1626,8 @@ static int run_decode_entry(
             evidence.converter_reference_sha256=mtp_cli_digest(m.converter_sha256);
             evidence.norm_converter_reference_sha256=mtp_cli_digest(m.norm_converter_sha256);
             evidence.converter_reference_revision=m.converter_revision;
-            const auto sidecar_manifest=build_mtp_sidecar_manifest(model,gguf::read_file(m.sidecar),evidence);
+            const auto sidecar_manifest=build_mtp_sidecar_manifest(model,
+                gguf::read_file(m.sidecar,mtp_sidecar_header_limits(m.header_bytes)),evidence);
             HipModelResidencyPolicy policy;
             policy.mode=m.sidecar_residency=="copy"?HipModelResidencyMode::resident_copy:HipModelResidencyMode::registered_file_mapping;
             policy.reservation_limits={m.sidecar_retained_bytes,m.sidecar_setup_bytes};
@@ -1625,11 +1637,14 @@ static int run_decode_entry(
             }
             serving_sidecar_reservation=plan_hip_model_residency_reservation(*serving_sidecar,sidecar_manifest,policy);
         }
-        serving_sidecar->validate_unchanged(); serving_golden->validate_unchanged();
+        serving_sidecar->validate_unchanged();
         if (!serving_sidecar_reservation) throw std::invalid_argument("one-slot:asset verification unavailable");
-        const auto golden=read_mtp_forward_golden_file(m.golden,mtp_cli_digest(m.golden_sha256),m.golden_max_bytes);
-        if (golden.rows.size()!=mtp_calibration_rows(candidate))
-            throw std::invalid_argument("one-slot:calibration row geometry differs");
+        if (!golden_pending) {
+            serving_golden->validate_unchanged();
+            const auto golden=read_mtp_forward_golden_file(m.golden,mtp_cli_digest(m.golden_sha256),m.golden_max_bytes);
+            if (golden.rows.size()!=mtp_calibration_rows(candidate))
+                throw std::invalid_argument("one-slot:calibration row geometry differs");
+        }
         const auto requests=prompt_compiler_requests(candidate,model,manifest);
         kernels::KernelRegistry registry;
         register_complete_hip_kernel_catalog(model,requests.binding,requests.catalog,registry);
@@ -1639,7 +1654,9 @@ static int run_decode_entry(
             build_serial_execution_tensor_requirements(serial.execution));
         const auto& reservation=*serving_sidecar_reservation;
         return http_mtp_memory(candidate,model,serial,manifest,access,reservation.setup_peak_reserved_bytes,
-            prefill_checked_add(reservation.registered_alias_bytes,reservation.copied_reserved_bytes),serving_golden->bytes());
+            prefill_checked_add(reservation.registered_alias_bytes,reservation.copied_reserved_bytes),
+            golden_pending?mtp_forward_golden_v3_file_bytes(mtp_calibration_rows(candidate),
+                prefill_checked_mul(model.hidden_size,model.hc_count),model.vocab_size):serving_golden->bytes());
     };
     if (yarn && options.mtp.enabled) prompt_memory.estimate_with_score_ring = [&](const strix::decode_cli::Options& candidate, std::uint32_t ring_rows) {
         return strix::decode_cli::compile_prompt_requirements(candidate, model, manifest, mapped.bytes(), nullptr, false, ring_rows);

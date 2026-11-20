@@ -3053,6 +3053,16 @@
   },
   {
     "engine": "qwen-rtx",
+    "name": "Tensor-core expert wide tile form (128 rows)",
+    "flag_or_env": "--expert-wide-tile on|off|N; STRIX_QRTX_EXPERT_WIDE_TILE (lever row expert_wide_tile)",
+    "default": "off (opt-in until its timing receipt); N = minimum average rows per expert of a launch (planner parameter from the device's no-model tile bench, TILEWIDE line); on = builtin 128 (provisional)",
+    "exact": "Exact schedule trait: a wide tile is two consecutive 64-row tiles, same m16 position per row, same MMA and scale-FMA sequence per output: bitwise the tile form (host test; device hash comparison in the bench). Contract and bundle id unchanged.",
+    "gain": "Not yet measured.",
+    "preconditions": "CUDA Qwen MoE with gsq_bf16_mma experts; prefill launches above 16 rows.",
+    "off_switch": "--expert-wide-tile off; STRIX_QRTX_EXPERT_WIDE_TILE=0",
+    "doc_anchor": "docs/optimizations.md#qwen-rtx-expert-wide-tile"
+  },  {
+    "engine": "qwen-rtx",
     "name": "Tensor-core expert decode tile form",
     "flag_or_env": "--expert-decode-tile; STRIX_QRTX_EXPERT_DECODE_TILE (lever row expert_decode_tile)",
     "default": "ON in every profile; acts only where the tensor-core GSQ experts run (gsq_bf16_mma: the FAST expert arithmetic)",
@@ -3062,6 +3072,7 @@
     "off_switch": "--expert-decode-tile off; STRIX_QRTX_EXPERT_DECODE_TILE=0",
     "doc_anchor": "docs/optimizations.md#qwen-rtx-expert-decode-tile"
   },
+
   {
     "engine": "qwen-rtx",
     "name": "TURBO: int8 tensor-core experts on large prefill blocks",
@@ -3410,6 +3421,14 @@
   },
   {
     "engine": "qwen-rtx",
+    "name": "Qwen dense 27B CUDA FAST4 tile GEMM: bulk stage feed",
+    "flag_or_env": "--prefill-tile-feed bulk|lsu (strix-cuda-qwen35-decode)",
+    "default": "lsu (incumbent FAST4 tile GEMM feed; bulk is explicit opt-in)",
+    "exact": "Scheduling only, no identity suffix: device fixture bulk == lsu bit for bit in 9 checks; host oracle checks the bulk records write exactly the lsu chunk bytes; host tests pin the default and the unchanged engine identity.",
+    "gain": "Operator bench (RTX PRO 6000, 4,096 rows, no model, strict ABAB): bulk / lsu = 0.934 GLU, 0.921 down, 0.929 down residual, 0.850 o, 0.858 o residual, 0.846 k/v, 0.977 q/k/v. End-to-end prefill not yet measured.",
+    "preconditions": "--prefill-arith fast4 (sm_120, NVFP4 weights); other prefill classes print prefill-tile-feed: n/a.",
+    "off_switch": "--prefill-tile-feed lsu",
+    "doc_anchor": "docs/optimizations.md#qwen-dense-cuda-fast4-tile-bulk-feed",
     "name": "Qwen 27B CUDA spec: K/V-only MTP catch-up",
     "flag_or_env": "--mtp-catchup kv|full",
     "default": "kv",

@@ -49,6 +49,8 @@
 // chain adds about 2^-24 x sum |a_i b_i| per WMMA step, so cancellation is not covered. Bounds and a host model of
 // these products in this order: two_term_model.hpp.
 // The denominator sums hi + lo of p. LDS adds 16 x (D + 8) x 2 + D x 32 B; Q lo stays in registers.
+// Optional occupancy override: static constexpr unsigned kWavesPerEu (waves per SIMD of flash_prefill<P>; absent = the
+// VGPR budget rule of dense_flash_budget.hpp). For a policy whose launch measured slower at the rule's target.
 // rows() is __host__ __device__. Launch: launch<P>(args, heads, stream, workspace, splits) - grid (row blocks, heads / Group, splits), longest
 // blocks first; workspace_floats(rows, heads, D, splits) FP32 when splits > 1.
 #include <hip/hip_runtime.h>
@@ -56,6 +58,7 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "dense_flash_budget.hpp"
 #include "flash_core.hpp"
 
 namespace strix::attn_core::dense {
@@ -328,10 +331,14 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
     if (bad_value) atomicOr(P::failure(a), 1U);
     if (bad_half) atomicOr(P::failure(a), 4U);
 }
-// Register cap for 8 waves per SIMD (192 VGPRs on gfx1151, 44 B/lane scratch): two 16-wave work-groups per WGP;
-// 1.3x the uncapped 238-VGPR kernel (one work-group per WGP) at 32K.
+// Occupancy target (waves per SIMD): the highest whose VGPR budget holds the key loop without spills
+// (dense_flash_budget.hpp; placement only, same bits).
+template <class P> constexpr unsigned waves_per_eu() {
+    if constexpr (requires { P::kWavesPerEu; }) return P::kWavesPerEu;
+    else return occupancy_target(P::Shape::frags, P::Shape::per_thread, terms_of<P>::value, P::Shape::waves);
+}
 template <class P>
-__global__ __launch_bounds__(P::Shape::threads) __attribute__((amdgpu_waves_per_eu(8))) void flash_prefill(
+__global__ __launch_bounds__(P::Shape::threads) __attribute__((amdgpu_waves_per_eu(waves_per_eu<P>()))) void flash_prefill(
     typename P::Args a, float* ws, unsigned splits, unsigned seg_tiles) {
     flash_body<P>(a, ws, splits, seg_tiles);
 }
