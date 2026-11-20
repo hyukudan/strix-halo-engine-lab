@@ -3691,7 +3691,7 @@ int main() { return 0; }"
         strix_target_warnings(strix-hip-dense-rows-wave-tests)
         add_test(NAME strix-hip-dense-rows-wave-tests COMMAND strix-hip-dense-rows-wave-tests)
         set_tests_properties(strix-hip-dense-rows-wave-tests PROPERTIES SKIP_RETURN_CODE 77)
-        # Rows tile of launch_hip_dense_rows == one single-row launch per row (bitwise); router timing printed.
+        # Rows tile and grouped rows of launch_hip_dense_rows == one single-row launch per row / group (bitwise); timing printed.
         add_executable(strix-hip-dense-rows-tile-tests tests/hip_dense_rows_tile_tests.hip)
         set_target_properties(strix-hip-dense-rows-tile-tests PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
