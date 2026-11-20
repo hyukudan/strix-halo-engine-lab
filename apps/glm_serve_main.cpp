@@ -229,6 +229,14 @@ struct EngineOps {
     std::vector<gs::SlotSpec> spec;
     std::vector<unsigned> hp_row;
     std::uint32_t prefix_restored = 0, prefix_bootstrap_pending = 0;
+    // per slot: the prompt tokens (both ranks see the same chunks), the shared arbiter's lookup context
+    std::vector<std::vector<std::uint32_t>> context{};
+    void remember(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0) {
+        if (!policy.spec_arbiter) return;
+        auto& c = context.at(slot);
+        if (pos0 == 0) c.clear();
+        c.insert(c.end(), tokens.begin(), tokens.end());
+    }
 
     void plain_call() {
         if (dec) throw std::logic_error("engine call while an MTP decoder is open");
@@ -240,8 +248,14 @@ struct EngineOps {
         prefix_bootstrap_pending &= ~(1U << slot);
         eng.reset(slot);
         spec.at(slot) = {};
+        if (policy.spec_arbiter) context.at(slot).clear();  // the lookup index never carries another request's tokens
     }
     static std::uint64_t prefix_state_bound(std::uint64_t p) { return gs::prefix_snapshot_bound(p); }
+    // Store rule of this rank: MemAvailable covers the snapshot bound and leaves the load admission's RAM margin.
+    std::uint64_t ram_margin = ge::mem::Margins::from_env().ram;
+    bool prefix_store_allowed(std::uint64_t bound) const {
+        return gs::prefix_store_fits(gs::prefix_memory_bytes(), bound, ram_margin);
+    }
     std::vector<std::uint8_t> state_bytes_upto(std::uint32_t slot, std::uint64_t p) {
         return eng.state_bytes_upto(slot, p);
     }
@@ -250,6 +264,8 @@ struct EngineOps {
         control.calibration = sp::Calibration{};
         control.cycle = control.step = 0;
         hp_row.at(slot) = 0;
+        // lookup context: the restored prefix tokens are not known here; the index restarts at the suffix
+        if (policy.spec_arbiter) context.at(slot).clear();
         prefix_restored |= 1U << slot;
         prefix_bootstrap_pending |= 1U << slot;
         eng.restore_state(slot, bytes, p);
@@ -257,6 +273,7 @@ struct EngineOps {
     std::uint32_t prefill(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0) {
         plain_call();
         spec.at(slot) = {};
+        remember(slot, tokens, pos0);
         return eng.prefill(slot, tokens, pos0);
     }
     std::vector<std::uint32_t> step(std::span<const gs::WireRow> rows) {
@@ -362,6 +379,7 @@ struct EngineOps {
             hp_row.at(slot) = 0;
             prefix_bootstrap_pending &= ~(1U << slot);
         }
+        remember(slot, tokens, pos0);
         if (pos0 == 0 && last) {
             seed = sp::bootstrap(eng, slot, tokens, bootstrap, control);
             seed_slot = slot;
@@ -681,7 +699,9 @@ struct EngineOps {
     std::vector<std::uint32_t> mtp_run(std::uint32_t slot, std::uint32_t budget, std::uint32_t cycles) {
         if (!dec) {
             if (!seed || seed_slot != slot) throw std::logic_error("mtp_run without a fresh drafter seed");
-            dec = std::make_unique<sp::GreedyDecoder>(eng, slot, *seed, policy, budget, control);
+            auto pol = policy;
+            if (pol.spec_arbiter) pol.context = &context.at(slot);
+            dec = std::make_unique<sp::GreedyDecoder>(eng, slot, *seed, pol, budget, control);
             dec_slot = slot;
             seed.reset();
             spec.at(slot) = {};
@@ -698,7 +718,13 @@ struct EngineOps {
         spec.at(slot) = {};
         if (dec) {
             if (dec_slot != slot) throw std::logic_error("mtp_leave of another slot than the open decoder");
+            if (policy.spec_arbiter) {  // the next decoder of this request indexes what this one emitted
+                const auto& emitted = dec->result().tokens;
+                context.at(slot).insert(context.at(slot).end(), emitted.begin(), emitted.end());
+            }
             dec->finish();
+            if (control.rank == 0 && !dec->result().spec_stats.empty())
+                std::fprintf(stderr, "strix-spec-stats %s\n", dec->result().spec_stats.c_str());
             dec.reset();
         } else {
             eng.flush(slot);
@@ -1231,6 +1257,8 @@ int main(int argc, char** argv) {
             std::printf("rank %u: import receiver on %s (node identity %s%s)\n", rank, ep.c_str(), node.c_str(),
                         import_dsa_once ? ", DSA once: rank 0 relays the DSA components" : "");
         }
+        ops.policy.spec_arbiter = eff.spec_arbiter;
+        ops.context.assign(opt.slots, {});
 
         // RTX import settings every rank must share: a mismatch refuses at hello, before serving.
         if (!import_listen.empty()) {
@@ -1260,8 +1288,12 @@ int main(int argc, char** argv) {
         lc.batch = !serial;
         lc.short_first = short_first;
         lc.prefix_cache_bytes = prefix_cache_bytes;
+        lc.host_available = [] { return gs::prefix_memory_bytes(); };  // pressure rule: the store rule's margin
+        lc.host_floor = ops.ram_margin;
         // Reply-end snapshots (opt-in, exactly "1"; plain decode only: refused under MTP). Rank 1 follows the lead.
         lc.prefix_reply_store = strix::envcfg::flag("STRIX_GLM_SERVE_REPLY_KEEP", false, strix::EnvFlagMatch::exact);
+        // Root store at the system prompt (default on; "0" off). Rank 1 follows the lead.
+        lc.prefix_root = strix::envcfg::flag("STRIX_GLM_SERVE_PREFIX_ROOT", true, strix::EnvFlagMatch::exact);
         lc.prefix_identity = gs::fnv1a64(&hello.model_hash, sizeof(hello.model_hash), hello.identity_hash);
         lc.prefill_chunk = prefill_chunk;
         lc.interleave = serve_prefill_interleave(prefill_mode, opt.max_rows, eng.prefill_pipeline());
@@ -1651,6 +1683,8 @@ int main(int argc, char** argv) {
             counter("strix_glm_serve_mtp_tokens_total", "Tokens emitted on the C1 MTP path.", st.mtp_tokens);
             counter("strix_glm_serve_mtp_seconds_total", "Wall time on the C1 MTP path.", st.mtp_seconds);
             counter("strix_glm_serve_mtp_enters_total", "Entries into the MTP path from plain steps.", st.mtp_enters);
+            counter("strix_glm_serve_mtp_bootstraps_total", "Entries into the MTP path seeded by the request's own MTP prefill.",
+                    st.mtp_bootstraps);
             counter("strix_glm_serve_mtp_leaves_total", "Exits from the MTP path (decoder closed at a cycle boundary).", st.mtp_leaves);
             counter("strix_glm_serve_g2_cycles_total", "Batched self-speculation cycles (one multi-slot verify each).", st.g2_cycles);
             counter("strix_glm_serve_g2_rows_total", "Rows of the batched self-speculation verifies.", st.g2_rows);
@@ -1660,6 +1694,11 @@ int main(int argc, char** argv) {
                 counter("strix_glm_serve_prefix_hits_total", "Prefix cache hits.", st.prefix_hits);
                 counter("strix_glm_serve_prefix_misses_total", "Prefix cache misses.", st.prefix_misses);
                 counter("strix_glm_serve_prefix_stores_total", "Paired prefix stores.", st.prefix_stores);
+                counter("strix_glm_serve_prefix_refused_total", "Paired prefix stores refused (reason on stderr).", st.prefix_refused);
+                counter("strix_glm_serve_prefix_root_stores_total", "Paired root stores at the system prompt (in prefix_stores).",
+                        st.prefix_root_stores);
+                counter("strix_glm_serve_prefix_root_refused_total", "Paired root stores refused (in prefix_refused).",
+                        st.prefix_root_refused);
                 counter("strix_glm_serve_prefix_evictions_total", "Prefix LRU evictions.", st.prefix_evictions);
                 m << "# TYPE strix_glm_serve_prefix_bytes gauge\nstrix_glm_serve_prefix_bytes " << st.prefix_bytes << '\n';
             }

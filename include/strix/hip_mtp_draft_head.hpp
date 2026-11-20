@@ -19,7 +19,6 @@ enum class HipMtpDraftHeadSource : std::uint8_t {q8_0,bf16};
 struct HipMtpDraftHeadConfig {
     std::uint32_t hidden_size=0,vocab_size=0,max_depth=0;
     bool full=true;
-    HipMtpDraftHeadSource source=HipMtpDraftHeadSource::q8_0; // full mode needs q8_0 (it reads the head itself)
     std::vector<std::uint32_t> base_tokens;
     std::uint32_t context_capacity=0;
     // Subset rows requantized Q8_0 -> Q4_0 at gather (about half the head bytes);
@@ -28,6 +27,8 @@ struct HipMtpDraftHeadConfig {
     // Also reduce the runner-up logit and publish its softmax probability (window controller
     // features and diagnostics); the selected token and its probability are unchanged.
     bool runner_up=false;
+    // Last member: aggregate initialisers that stop before it keep the Q8_0 source.
+    HipMtpDraftHeadSource source=HipMtpDraftHeadSource::q8_0; // full mode needs q8_0 (it reads the head itself)
 };
 struct HipMtpDraftHeadStats {
     std::uint32_t rows=0,base_rows=0,context_rows=0,context_dropped=0;

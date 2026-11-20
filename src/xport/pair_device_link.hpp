@@ -3,8 +3,9 @@
 // device exchange is open, seam pieces moved device snapshot to device snapshot in one direction only.
 //
 // Control (headers, piece CRCs, whole-frame CRC, consumption ACK) keeps its order and bytes. A piece above the eager
-// size goes through dist::Communicator::transfer(): the sender posts no receive and the receiver no transmit, the
-// receiving GPU checks the frame's in-band identity and checksum, and no early receive is posted, so no scratch
+// size goes through dist::Communicator::transfer() on every route (a mixed route's host head too): the sender posts no
+// receive and the receiver no transmit, the receiver checks the identity and checksum (in-band on the GPU for the
+// device part, the trailer for a host part), and no early receive is posted, so no scratch
 // payload ever travels in the unused direction. With device CRC the staging computes the seam CRC-32C on the device
 // at both ends (PipeStaging::route_device with device_checked()), so the piece is never copied to the host.
 //   STRIX_PAIR_LINK_ONE_WAY=0     the symmetric exchange (a full-size scratch payload in the unused direction);
@@ -93,8 +94,9 @@ public:
             // checks the frame. The receiver completes the gather before the CRC and before the slot is reused.
             if (!sending) check(hipStreamSynchronize(stream_));
         } else {
-            // Symmetric fallback (switched off, or this size has no pure device route): scratch in the unused
-            // direction. Its early receive is retired once, after the pipe joins (finish()).
+            // Symmetric fallback (STRIX_PAIR_LINK_ONE_WAY=0, or a device engine without a one-way form): scratch in the
+            // unused direction. Its early receive is retired once, after the pipe joins (finish()). Every route of
+            // transfer() (host, device, mixed head + tail) is one way, so the default path never gets here.
             if (!scratch_) {
                 check(hipMalloc(&scratch_, seam_piece_bytes));
                 check(hipMemset(scratch_, 0, seam_piece_bytes));

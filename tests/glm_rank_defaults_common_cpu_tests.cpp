@@ -29,7 +29,7 @@ void test_common_default_rows() {
     static_assert(std::is_same_v<rd::EnvItem, profile::DefaultItem>);
     const Env absent;
     const auto empty = lookup(absent);
-    CHECK(rd::env_items().size() == 43);
+    CHECK(rd::env_items().size() == 44);  // one item per environment selector (+ STRIX_SPEC_ARBITER)
     const auto normal = rd::resolve(rd::scan({}), empty);
     const auto baseline_config = rd::resolve(rd::scan({"--baseline"}), empty);
     CHECK(rd::print(normal).find("effective pf-seqpar=on") != std::string::npos);
@@ -75,7 +75,8 @@ void test_glm_exports_and_precedence() {
             const Env env{{row.env, setting}};
             if (setting.empty() && (std::string(row.env) == "STRIX_GLM_PF_SEQPAR" ||
                                     std::string(row.env) == "STRIX_GLM_PF_SCRATCH" ||
-                                    std::string(row.env) == "STRIX_GLM_PF_ATTN_QWIN")) {
+                                    std::string(row.env) == "STRIX_GLM_PF_ATTN_QWIN" ||
+                                    std::string(row.env) == "STRIX_SPEC_ARBITER")) {
                 bool refused = false;
                 try { (void)rd::resolve(r, lookup(env)); }
                 catch (const std::invalid_argument&) { refused = true; }

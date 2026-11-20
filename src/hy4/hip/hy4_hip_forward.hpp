@@ -38,6 +38,7 @@ struct ForwardOptions {
     std::uint32_t first = 0, last = 0;         // trunk layers of this rank; last 0 = depth
     std::uint32_t context = 4096;              // positions this forward may hold
     std::uint32_t prompt_rows = 0;             // batched prompt window (rows per launch, multiple of 8, >= 16); 0 = none
+    bool head_q8 = false;                      // FAST hy4-head-bf16-q8_0-v1: Q8_0 copy of the BF16 head for the decode head
     std::uint32_t verify_rows = 0;             // rows of a verify pass (forward_rows, 1..8); rings sized for them; 0 = none
     bool nextn = false;                        // also load the pack's next-token (MTP) block: nextn_rows() (whole-model rank)
     NextnHead nextn_head = NextnHead::q4;      // the drafts' head (want_top of nextn_rows)
@@ -98,6 +99,15 @@ public:
     // Back to position 0 for a repeat run of the same process: every cache row is written in position order before a
     // read, so a repeat reproduces the bits (the repeat's logits digest is the check).
     void reset() noexcept;
+    // State image (strix/session/state_image.hpp): the target's cross-position caches (latent rings, indexer token rings,
+    // group keys) + position + token history, so a long teacher-forced reference stops at a ticket boundary and goes on
+    // in a new process with the same bits. load_state() needs the same layout (model depth, rank range, context, ring
+    // rows): another layout is refused. The next-token block's caches are not in the image (refused with nextn on).
+    // Synchronises. Diagnostic / gate tool, no product path.
+    [[nodiscard]] std::string state_layout() const;
+    [[nodiscard]] const std::vector<std::uint32_t>& token_history() const noexcept;  // ids at positions 0 .. position() - 1
+    void save_state(const std::filesystem::path& file) const;
+    void load_state(const std::filesystem::path& file);
     // Undo the last step (pipelined speculation, strix/pair/layer_pipeline.hpp DecodeOps::rewind): position and token
     // history go back one. Every device row a step writes is addressed by its position (latent / token-key rings, the
     // group key the position closes), so the redo at the same position rewrites all of them before any read; a sliding
@@ -140,6 +150,10 @@ public:
     void set_nextn_row_loop(bool on) noexcept;
     // The drafts' head from the next nextn_rows call on (the device check compares the forms on the same rows).
     void set_nextn_head(NextnHead head);
+    // After enable_tp: nextn_rows runs tensor-parallel (this rank's heads, BF16 expert slots 8 + 8 and shared rows, joined;
+    // the drafts' head on both ranks) instead of the one-node form. Both ranks must then make every nextn_rows call in the
+    // same order (strix/spec/pair_round.hpp draft rounds). Bitwise the one-node block: the same joins as the trunk's.
+    void set_nextn_tp(bool on);
     // outputs = trailing rows whose top / hidden the caller reads (default all). Rows [0, rows - outputs) only write the
     // block's caches (bitwise the full form's: the latent row and the indexer keys depend only on the row's input); their
     // pre / post rows are unspecified and their top is 0. want_top needs outputs >= 1. The row loop computes every row.
@@ -170,8 +184,11 @@ public:
     // head by vocabulary rows (logits joined). Router, latent down/up, shared down, HC sites, norms, Engram, indexer
     // and the greedy pick stay replicated. Every split output is a whole per-head / per-row / per-slot result of the
     // same kernel and the joins are concatenations (the combine runs over all 16 slot rows in slot order): bitwise the
-    // one-node step. Both ranks must run the same step sequence (each gather is a symmetric swap). Prefill, prefill
-    // windows and verify rows stay per rank (each rank runs the whole prompt). Whole-model rank only.
+    // one-node step. Both ranks must run the same step sequence (each gather is a symmetric swap). forward_rows (verify
+    // rows) splits the same way over its R rows (heads, o_proj / FFN / shared rows, routed slots 8 + 8 per row; the head
+    // stays replicated): bitwise the one-node pass; both ranks run the same passes (strix/spec/pair_round.hpp). prefill()
+    // and the next-token block (nextn_rows / nextn_logits, the drafter) run the one-node form on each rank that calls them
+    // (no gather), unless set_nextn_tp(true) (nextn_rows then splits like a step on both ranks). Whole-model rank only.
     struct TpGather {
         void* ctx = nullptr;
         void (*fn)(void* ctx, void* stream, void* slots, std::size_t slot_bytes, std::size_t bytes) = nullptr;

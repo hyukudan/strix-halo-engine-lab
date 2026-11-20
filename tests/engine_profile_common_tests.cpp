@@ -96,6 +96,33 @@ int main() {
         require(stamp({{"rows", "32"}, {"window", "1024"}}) == "unqualified: rows,window", "explicit rows listed in order");
     }
 
+    // same_bits: values measured to compute the bits of each other (a scheduling-only choice) share the qualification
+    // of a ready, not provisional column whose value is in the class; outside the class, or with no ready member, the
+    // explicit value stays unqualified.
+    {
+        const Lever width{.name = "rows", .env = "", .option = "--rows", .value = {"", "4096", "", ""}, .builtin = "0",
+            .kind = Kind::bit_changing, .ready = {false, true, false, false}, .runnable = {true, true, false, false},
+            .target = "", .off = "0", .source = "gate receipt; 1024 / 2048 / 4096 bitwise", .same_bits = "1024,2048,4096"};
+        const Lever unready{.name = "window", .env = "", .option = "--window", .value = {"", "4096", "", ""}, .builtin = "0",
+            .kind = Kind::bit_changing, .ready = {}, .runnable = {true, true, false, false}, .target = "", .off = "0",
+            .source = "pending", .same_bits = "2048,4096"};
+        const std::array rows{width, unready};
+        const Engine e{"same_bits", "ALLOW", rows};
+        const Lookup none = [](const char*) -> const char* { return nullptr; };
+        const auto stamp = [&](Pairs cli) {
+            Inputs in;
+            in.env = none;
+            in.cli = std::move(cli);
+            return resolve(e, in).qualification();
+        };
+        require(stamp({{"rows", "4096"}}) == "qualified", "same_bits: the ready column value");
+        require(stamp({{"rows", "1024"}}) == "qualified" && stamp({{"rows", "2048"}}) == "qualified", "same_bits: class members");
+        require(stamp({{"rows", "512"}}) == "unqualified: rows", "same_bits: a value outside the class");
+        require(stamp({{"rows", "10240"}}) == "unqualified: rows" && stamp({{"rows", "02048"}}) == "unqualified: rows",
+                "same_bits: whole list items only");
+        require(stamp({{"window", "2048"}}) == "unqualified: window", "same_bits: no ready member, no qualification");
+    }
+
     // Historical fingerprint must keep its nonstandard seed and FF separators.
     const auto legacy = resolve(engine, inputs);
     std::uint64_t hash = 1469598103934665603ULL;

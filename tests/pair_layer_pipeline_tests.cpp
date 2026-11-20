@@ -141,8 +141,8 @@ Result reference(const Weights& m, const std::vector<std::uint32_t>& prompt, uns
 
 std::vector<Result> run_chain(const Weights& m, const std::vector<std::uint32_t>& prompt, unsigned width, unsigned gen,
                               const std::vector<std::uint32_t>& cuts, std::uint64_t bad_identity_stage = ~0ULL,
-                              Guess guess = Guess::off, const std::vector<std::uint32_t>* truth = nullptr, bool broken_rewind = false,
-                              std::uint32_t relay_decoder = ~0U) {
+                              std::uint32_t relay_decoder = ~0U, Guess guess = Guess::off,
+                              const std::vector<std::uint32_t>* truth = nullptr, bool broken_rewind = false) {
     const unsigned stages = unsigned(cuts.size() - 1U);
     std::vector<std::unique_ptr<Channel>> links;
     for (unsigned i = 0; i + 1U < stages; ++i) links.push_back(std::make_unique<Channel>());
@@ -272,6 +272,19 @@ int main() {
                "cuts " + text(cuts) + " last-row logits bytes differ from one rank");
         ++checked;
     }
+    // relay to one decoder (every stage of every plan): the decoder's ids equal one rank, the others decode nothing
+    unsigned relayed = 0;
+    for (const auto& cuts : plans) {
+        for (std::uint32_t dec = 0; dec + 1U < cuts.size(); ++dec) {
+            const auto r = run_chain(m, prompt, width, gen, cuts, ~0ULL, dec);
+            for (std::size_t s = 0; s < r.size(); ++s) {
+                expect(r[s].error.empty(), "relay cuts " + text(cuts) + " decoder " + std::to_string(dec) + " stage " + std::to_string(s) + " error: " + r[s].error);
+                if (s == dec) expect(r[s].ids == ref.ids, "relay cuts " + text(cuts) + " decoder " + std::to_string(dec) + " ids differ from one rank");
+                else expect(r[s].ids.empty(), "relay: a non-decoder stage decoded");
+            }
+            ++relayed;
+        }
+    }
     // pipelined speculation on the first stage: every guess policy gives the one-rank ids and decode logits bytes;
     // the stage-0 counters match the policy; a rewind that keeps the guessed state is detected.
     const unsigned sgen = 12;
@@ -282,7 +295,7 @@ int main() {
     unsigned spec_checked = 0;
     for (const auto& cuts : spec_plans)
         for (const auto g : {Guess::oracle, Guess::wrong, Guess::alternate, Guess::none}) {
-            const auto r = run_chain(m, prompt, width, sgen, cuts, ~0ULL, g, &sref.ids);
+            const auto r = run_chain(m, prompt, width, sgen, cuts, ~0ULL, ~0U, g, &sref.ids);
             const std::string tag = "spec cuts " + text(cuts) + " policy " + std::to_string(int(g));
             for (std::size_t s = 0; s < r.size(); ++s) {
                 expect(r[s].error.empty(), tag + " stage " + std::to_string(s) + " error: " + r[s].error);
@@ -299,23 +312,10 @@ int main() {
             ++spec_checked;
         }
     {
-        const auto r = run_chain(m, prompt, width, sgen, {0, 4, 7}, ~0ULL, Guess::wrong, &sref.ids, true);
+        const auto r = run_chain(m, prompt, width, sgen, {0, 4, 7}, ~0ULL, ~0U, Guess::wrong, &sref.ids, true);
         const bool same = r.back().ids == sref.ids && r.back().dec_logits.size() == sref.dec_logits.size() &&
                           std::memcmp(r.back().dec_logits.data(), sref.dec_logits.data(), sref.dec_logits.size() * 4U) == 0;
         expect(!same, "negative control: a rewind that keeps the guessed row's state must change ids or logits");
-    }
-    // relay to one decoder (every stage of every plan): the decoder's ids equal one rank, the others decode nothing
-    unsigned relayed = 0;
-    for (const auto& cuts : plans) {
-        for (std::uint32_t dec = 0; dec + 1U < cuts.size(); ++dec) {
-            const auto r = run_chain(m, prompt, width, gen, cuts, ~0ULL, Guess::off, nullptr, false, dec);
-            for (std::size_t s = 0; s < r.size(); ++s) {
-                expect(r[s].error.empty(), "relay cuts " + text(cuts) + " decoder " + std::to_string(dec) + " stage " + std::to_string(s) + " error: " + r[s].error);
-                if (s == dec) expect(r[s].ids == ref.ids, "relay cuts " + text(cuts) + " decoder " + std::to_string(dec) + " ids differ from one rank");
-                else expect(r[s].ids.empty(), "relay: a non-decoder stage decoded");
-            }
-            ++relayed;
-        }
     }
     // a stage with another model/plan identity is refused by name (and nothing hangs)
     const auto bad = run_chain(m, prompt, width, gen, {0, 3, 7}, 1U);
@@ -326,7 +326,7 @@ int main() {
     expect(threw, "non-increasing cuts refused");
     if (failures) { std::fprintf(stderr, "%d failure(s)\n", failures); return 1; }
     std::printf("PASS: layer pipeline over N ranks (%u plans, N=1..4, ids and logits bytes equal to one rank; "
-                "%u pipelined-speculation runs equal, negative control detected; %u relayed decodes equal)\n", checked, spec_checked,
-                relayed);
+                "%u relayed decodes equal; %u pipelined-speculation runs equal, negative control detected)\n",
+                checked, relayed, spec_checked);
     return 0;
 }

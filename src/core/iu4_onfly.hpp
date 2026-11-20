@@ -6,6 +6,7 @@
 // to a multiple of 64 (one wave of the W4A16 core covers 64 columns); pad columns hold zero nibbles and scale 0.
 #include "core/iu4.hpp"
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -111,6 +112,38 @@ STRIX_ONFLY_HD inline void dequant_q8_group(const std::uint8_t* row, unsigned g,
         const float d = f16_bits_to_f32(static_cast<std::uint16_t>(blk[0] | (blk[1] << 8U)));
         for (unsigned j = 0; j < 32U; ++j) w[32U * b + j] = d * static_cast<float>(static_cast<std::int8_t>(blk[2U + j]));
     }
+}
+STRIX_ONFLY_HD inline float bf16_bits_to_f32(std::uint16_t b) {
+    const std::uint32_t x = static_cast<std::uint32_t>(b) << 16U;
+    float f;
+    std::memcpy(&f, &x, 4);
+    return f;
+}
+// One 32-weight Q8_0 block by ggml's quantize_row_q8_0_ref rule: d = amax / 127 stored as FP16 (RNE), q = round half away
+// from zero of x * (1 / d) with the F32 d (not the stored FP16). The load-time BF16 -> Q8_0 transcode
+// (core::convert_bf16_q8_0) and its host reference run this one function. Finite inputs.
+STRIX_ONFLY_HD inline void quantise_q8_0_block(const float* x, std::uint8_t* blk) {
+    float amax = 0.0f;
+    for (unsigned j = 0; j < 32U; ++j) {
+        const float a = x[j] < 0.0f ? -x[j] : x[j];
+        amax = a > amax ? a : amax;
+    }
+    const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+    const std::uint16_t h = f32_to_f16_bits(d);
+    blk[0] = static_cast<std::uint8_t>(h & 0xffU);
+    blk[1] = static_cast<std::uint8_t>(h >> 8U);
+    for (unsigned j = 0; j < 32U; ++j) blk[2U + j] = static_cast<std::uint8_t>(static_cast<std::int8_t>(roundf(x[j] * id)));
+}
+// Host reference of convert_bf16_q8_0: N rows of K BF16 weights (K % 32 == 0) -> N x K/32 blocks of 34 bytes.
+inline std::vector<std::uint8_t> bf16_to_q8_0_host(const std::uint16_t* w, std::size_t n, std::size_t k) {
+    if (!w || !n || !k || k % 32U) throw std::invalid_argument("bf16 -> q8_0: K % 32 == 0");
+    std::vector<std::uint8_t> out(n * q8_row_bytes(k));
+    float x[32];
+    for (std::size_t b = 0; b < n * (k / 32U); ++b) {
+        for (unsigned j = 0; j < 32U; ++j) x[j] = bf16_bits_to_f32(w[b * 32U + j]);
+        quantise_q8_0_block(x, out.data() + b * 34U);
+    }
+    return out;
 }
 
 struct HostCopy {

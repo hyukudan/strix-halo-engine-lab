@@ -54,12 +54,15 @@ de host de los mismos bytes, bit a bit; el flujo de control (CRC por pieza, CRC 
 completa, ACK de consumo) no cambia; la igualdad nativa de logits sigue pendiente. Las piezas de 64 KiB o menos y
 el transporte solo de host conservan el camino de host.
 
-Las rutas de host o mixtas rechazan `transfer()` y usan el intercambio simétrico alternativo,
-con tráfico de relleno en sentido inverso. Con flujos de host disponibles, la tabla
-predeterminada selecciona una ruta mixta por encima de 1 MiB: una pieza completa de 16 MiB
-usa esa alternativa, con preparación en host para la parte mixta. Seleccionar `usb4gpu`
-no demuestra una transferencia sin copias ni en un solo sentido; hay que consultar la tabla
-de rutas y los contadores reales de transferencias en un sentido y de bytes.
+`transfer()` va en un solo sentido en todas las rutas del comunicador: en una ruta de host el
+emisor envía y el receptor recibe y comprueba el trailer; en una ruta mixta (la elección de la
+tabla predeterminada por encima de 1 MiB, es decir, cada pieza completa de 16 MiB) la cabeza
+por host y la cola por dispositivo van cada una en un solo sentido a la vez. No viaja carga de
+relleno en el sentido no usado ni se publica una recepción anticipada. Solo un motor de
+dispositivo sin forma en un sentido la rechaza, y la pieza usa entonces el intercambio
+simétrico alternativo. Seleccionar `usb4gpu` no demuestra una transferencia sin copias (la
+parte mixta se prepara en host); hay que consultar la tabla de rutas y los contadores reales
+de transferencias en un sentido y de bytes.
 
 `STRIX_PAIR_LINK_ONE_WAY=0` recupera el intercambio simétrico (una carga de relleno de tamaño
 completo en el sentido no usado); ambos rangos deben fijarlo igual. `STRIX_PAIR_LINK_DEVICE_CRC=0`

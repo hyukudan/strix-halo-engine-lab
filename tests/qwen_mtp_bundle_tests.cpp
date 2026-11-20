@@ -71,8 +71,10 @@ int main(int argc,char** argv) try {
     std::filesystem::create_directories(admission_file.parent_path());write(admission_file,"cached");
     select_mtp_bundle_golden(selected,model);
     require(selected.mtp.golden==admission_file.string(),"admission selects cached exact identity");
+    require(selected.mtp.golden_sha256==model_content_identity_hex(sha256_file_content(admission_file,FileHashPolicy::cached)) &&
+        mtp_sha256_text(selected.mtp.golden_sha256),"admission pins the selected golden digest for the serving check");
     ++selected.context_tokens;select_mtp_bundle_golden(selected,model);
-    require(selected.mtp.golden.empty(),"changed geometry misses cache");
+    require(selected.mtp.golden.empty() && selected.mtp.golden_sha256.empty(),"changed geometry misses cache and clears the pin");
     env("XDG_CACHE_HOME","");
     auto explicit_args=base;
     explicit_args.push_back("--mtp");

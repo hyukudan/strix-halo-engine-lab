@@ -108,8 +108,8 @@ inline const std::vector<EnvItem>& env_items() {
          "Measurement: MLA scores v7 (v6 in 256-row grid groups) bitwise == v6 / v5, 4.90 / 6.08 / 7.87 / 9.89 vs v6 4.96 / 8.42 / 9.41 / 10.46 us/row per DSA layer at t0 0 / 4096 / 12288 / 28672 (=6 restores v6)", false, true},
         {"pf-mla-gemm-v3", "STRIX_GLM_PF_MLA_GEMM", "3", "2",
          "Measurement: MLA absorb / out GEMM v3 (128x128 VALU tiles, same ascending-k FMA chains) bitwise == v2 on the pair at 8K / 32K, MLA GEMM 0.715 -> 0.425 s (8K) and 2.853 -> 1.628 s (32K) per rank (=2 restores v2, =1 legacy)", false, true},
-        {"pf-kda-scan-v5", "STRIX_GLM_PF_KDA_SCAN", "5", "1",
-         "Measurement: KDA scan v5 (quad-DPP tree, batch fill off the serial path) bitwise == v3 / v1 and decode, 1.84-1.86 -> 1.18-1.20 us/row per KDA layer at t0 0..28672 (v3 1.23-1.25; =3 restores v3)", false, true},
+        {"pf-kda-scan-v6", "STRIX_GLM_PF_KDA_SCAN", "6", "1",
+         "Measurement: KDA scan v6 (v5 with the prep fused into the scan through LDS, non-finite test on the final state) bitwise == v5 / v3 / v1 and decode, prep + conv + scan 2.02 -> 1.82 us/row per KDA layer at C=4096 (2.00 -> 1.82 at C=2048; v5 0.83 + 0.00 + 1.19; =5 restores v5, =3 v3)", false, true},
         {"pf-indexer-v3", "STRIX_GLM_PF_IDX", "3", "1",
          "Measurement: indexer scores v3 same keys as v2, 5.3 vs 9.6 us/row per DSA layer at t0 28672 (=2 restores v2)", false, true},
         {"pf-select-v2", "STRIX_GLM_PF_SELECT", "2", "1",
@@ -118,6 +118,8 @@ inline const std::vector<EnvItem>& env_items() {
          "Measurement: prefill dense rows v4 runs the exact projections on the shared FMA-rows core, same ascending fmaf chain, bitwise == v3; exact two-node prefill 12.68 / 12.69 s vs 12.81 s at 8,192 tokens, logits / state / token hashes equal (=3 restores v3). Dense rows v3 groups the projections of one input (KDA f_a / g_a / b, DSA wk / gate / weights_proj) in one 128 x 64 launch, same ascending fmaf chain, bitwise == v2; grouped calls 6.77 vs 9.33 ms (KDA) and 6.62 vs 8.98 ms (DSA) at 8192 rows; TTFT 14.34 -> 14.29 s at 8,192 tokens (=2 restores v2, =1 v1)", false, true},
         {"pf-dense-form-auto", "STRIX_GLM_PF_DENSE_FORM", "0", "0",
          "Guard: physical form of dense rows v4 (shared FMA-rows core), read only with STRIX_GLM_PF_DENSE_ROWS=4: 0 selects the form per shape, 1..7 force one form where the shape admits it (diagnostic; every form gives the same bytes)", false, true},
+        {"spec-arbiter", "STRIX_SPEC_ARBITER", "1", "0",
+         "Measurement: each MTP cycle chooses plain / MTP chain / prompt lookup (<= 7 drafts) with the shared strix::spec Arbiter, priced from the replicated cost table (both ranks decide the same); tokens stay the greedy tokens (verify, fnv equal), pair ABBA 256 tokens 20.4 -> 15.1 ms/token at 1K, 21.1 -> 15.0 at 6K, 19.7 -> 13.7 on a copy prompt (=0 restores the MTP chain alone)", false, true},
         {"max-rows-auto", "STRIX_GLM_MAX_ROWS_AUTO", "1", "0",
          "Measurement: exact 8192 vs 4096 rows, 8K TTFT -4 %, 32K 116.3 -> 109.9 s (-5.5 %); +7.3 GiB per rank", false, true},
         {"pf-staged", "STRIX_GLM_PF_STAGED", "1", "0",
@@ -250,6 +252,7 @@ struct Effective {
     bool mtp_spec_candidate = false;
     unsigned kmax = 3;
     bool adaptive = true;
+    bool spec_arbiter = false;  // STRIX_SPEC_ARBITER (env_items row; MTP decode only)
     std::string prefill;  // resolved: gemv | ref | wmma
     std::string xch;
     std::map<std::string, Value> env;  // env name -> effective value
@@ -373,6 +376,9 @@ inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& 
         throw std::invalid_argument("STRIX_GLM_PF_SEQPAR must be 0, 1 or auto");
     (void)strix::glm::pf::parse_scratch_policy(e.env.at("STRIX_GLM_PF_SCRATCH").value.c_str());
     (void)strix::glm::pf::parse_query_window_policy(e.env.at("STRIX_GLM_PF_ATTN_QWIN").value.c_str());
+    const auto& arbiter = e.env.at("STRIX_SPEC_ARBITER").value;
+    if (arbiter != "0" && arbiter != "1") throw std::invalid_argument("STRIX_SPEC_ARBITER must be 0 or 1");
+    e.spec_arbiter = arbiter == "1";
     e.world = r.world;
     return e;
 }

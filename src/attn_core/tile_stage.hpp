@@ -4,7 +4,9 @@
 //   loads land during QK) and stores them transposed, V^T[dim][key], as 8-B stores into rows of `Pitch` bytes
 //   (Pitch = 2 x keys + 16: an odd multiple of 16 B, so 16 consecutive dim rows hit distinct bank groups).
 //   sum_partials: the head-dim-split score partials, summed in the fixed order 0 .. Split-1.
+#include "attn_core/wmma_frag.hpp"
 #include "attn_core/wmma_types.hpp"
+#include "core/lds_rows.hpp"
 
 namespace strix::attn_core::tile {
 
@@ -20,6 +22,16 @@ template <unsigned Pitch> __device__ __forceinline__ void store_vt4x8(unsigned c
         const U2 x = U2{pick(v[0], k) | (pick(v[1], k) << 16U), pick(v[2], k) | (pick(v[3], k) << 16U)};
         *reinterpret_cast<U2*>(vt + (d0 + k) * Pitch + 8U * g) = x;
     }
+}
+// Row `row` (16 elements) of a slot32 tile (core/lds_rows.hpp: the dense core's V^T) as an A/B fragment: the bytes
+// frag32 reads from the plain 32-B row.
+__device__ __forceinline__ Frag frag_slot32(const void* tile, unsigned row) {
+    const U4* t = static_cast<const U4*>(tile);
+    const U4 lo = t[::strix::core::lds_rows::slot32(row, 0U)], hi = t[::strix::core::lds_rows::slot32(row, 1U)];
+    Frag f;
+    __builtin_memcpy(&f, &lo, 16U);
+    __builtin_memcpy(reinterpret_cast<char*>(&f) + 16U, &hi, 16U);
+    return f;
 }
 // p[i] = part[0][i] + part[1][i] + ... (fixed order); part slices `stride` floats apart.
 template <unsigned Split, unsigned K> __device__ __forceinline__ void sum_partials(const float* part, unsigned stride, float (&out)[K]) {

@@ -131,11 +131,6 @@ template <class Row> StepLayout step_layout(std::span<const Row> rows) {
     const auto n = static_cast<std::uint32_t>(rows.size());
     return {distinct ? n : one_slot ? 1U : 0U, distinct ? 1U : one_slot ? n : 0U};
 }
-template <class Row> bool step_dense(std::span<const Row> rows, std::uint64_t boundary) {
-    bool dense = true;
-    for (const auto& row : rows) dense &= row.pos < boundary;
-    return dense;
-}
 inline int kv_tile_config(std::size_t rows, int mode) { return mode == -2 ? (rows >= 2048 ? 1 : 7) : mode; }
 inline std::size_t unit_rows(std::size_t members, std::uint32_t max_rows, std::size_t remaining) {
     return std::min<std::size_t>(members * max_rows, remaining);
@@ -182,8 +177,11 @@ inline void admit_index_weights(std::uint64_t available, std::uint64_t needed) {
         throw std::runtime_error("MiniMax index projection: insufficient device memory for selected weight layouts");
 }
 struct IndexRoute { unsigned ring, rows_per_wave; bool lds, tiled; };
-inline IndexRoute index_route(unsigned rows, unsigned ring, unsigned split, unsigned lds) {
-    return {ring != 0 ? ring : rows == 1 ? 32U : 16U, rows > 2 ? split : 0U,
+// key_only (IndexProjView::first_out = kProjQ, short-context steps): 4 waves carry the launch, so loads in flight per
+// wave bound it; ring 48 measured faster at 1 / 2 rows (strict ABC x4, 60 layers' weights: 1 row 31.4 -> 26.2 us,
+// 2 rows 40.1 -> 37.7 us; 4 rows 39.4 vs 39.0 = tie, 8 rows 39.3 vs 41.2 = loss), same bits (every ring is the same chain).
+inline IndexRoute index_route(unsigned rows, unsigned ring, unsigned split, unsigned lds, bool key_only = false) {
+    return {ring != 0 ? ring : key_only && rows <= 2 ? 48U : rows == 1 ? 32U : 16U, rows > 2 ? split : 0U,
             rows >= 2 && rows <= 8 && lds != 0U, rows > 8};
 }
 // Number of complete dense windows. A straddling window takes the sparse path.

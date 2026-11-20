@@ -194,7 +194,7 @@ struct DevicePrefill::Impl {
         checked(hipEventRecord(done, side_queue));
     }
     bool split_panels = false;  // a hilo policy: conversion scratch holds high and low panels
-    unsigned rows_capacity = 0; // rows every row-sized buffer holds (chunk_rows)
+    unsigned rows_capacity = 0; // rows every row-sized buffer holds (max_chunk_rows on WMMA linears, else chunk_rows)
     void size_rows(unsigned rows) {
         const auto& c = w.config;
         const std::size_t hbytes = rows * std::size_t(c.hidden) * sizeof(float), abytes = rows * std::size_t(c.heads) * 512 * sizeof(float);
@@ -527,23 +527,19 @@ DevicePrefill::DevicePrefill(HostWeights weights, RopeTables t, Residency reside
             for (auto matrix : {y.q, y.k, y.v, y.o, y.gate, y.up, y.down, y.ple_gate, y.ple_projection})
                 if (a8_prefill_supported(matrix) && !b.a8_prepared.contains(matrix.data)) b.prepare_a8(matrix);
     const auto& c = b.w.config;
-    const std::size_t hbytes = chunk_rows * std::size_t(c.hidden) * sizeof(float), abytes = chunk_rows * std::size_t(c.heads) * 512 * sizeof(float);
-    for (auto* p : {&b.residual, &b.x, &b.out}) p->resize(hbytes);
-    for (auto* p : {&b.q, &b.att}) p->resize(abytes);
-    for (auto* p : {&b.k, &b.v}) p->resize(chunk_rows * std::size_t(c.kv_heads) * 512 * sizeof(float));
-    b.gate.resize(chunk_rows * std::size_t(std::max(c.inter, c.ple_dim)) * sizeof(float)); b.up.resize(b.gate.size());
-    b.ple.resize(chunk_rows * std::size_t(c.layers) * c.ple_dim * sizeof(float));
-    b.logits.resize(std::size_t(c.vocab) * sizeof(float)); b.taps.resize(5 * hbytes);
-    b.tokens.resize(chunk_rows * sizeof(unsigned)); b.positions.resize(chunk_rows * sizeof(std::uint64_t));
-    // Every layer's descriptors of a full chunk: the per-pass upload never reallocates.
-    b.reads.resize(std::size_t(c.layers) * chunk_rows * sizeof(gpu::KvRead));
-    b.writes.resize(std::size_t(c.layers) * chunk_rows * sizeof(gpu::KvWrite));
+    // Rows of one pass: WMMA linears admit max_chunk_rows (CHUNK1024, chosen by the engine backend), every other route
+    // the identity chunk. Attention scratch stays per chunk_rows piece.
+    const unsigned capacity = linears == Linears::wmma ? max_chunk_rows : chunk_rows;
+    b.logits.resize(std::size_t(c.vocab) * sizeof(float));
+    // Every layer's descriptors of a full pass: the per-pass upload never reallocates.
+    b.reads.resize(std::size_t(c.layers) * capacity * sizeof(gpu::KvRead));
+    b.writes.resize(std::size_t(c.layers) * capacity * sizeof(gpu::KvWrite));
+    b.fuse_ffn = linears == Linears::wmma && fused_ffn_enabled();
+    b.size_rows(capacity);
     b.staging_bytes = b.tokens.size() + b.positions.size() + b.reads.size() + b.writes.size() + 4 * 256;
     checked(hipHostMalloc(&b.staging, b.staging_bytes, hipHostMallocDefault));
     b.failure.resize(sizeof(unsigned)); b.maximum.resize((2 + 11 * c.layers) * sizeof(unsigned));
     b.last_row.resize(std::size_t(c.hidden) * sizeof(float));
-    b.fuse_ffn = linears == Linears::wmma && fused_ffn_enabled();
-    b.size_rows(chunk_rows);
     // Engine-visible selector until the profile row lands: the LinearPolicy
     // spec of the WMMA linears (e.g. 'ple_model=fp16;.*=hilo').
     if (const auto* p = std::getenv("STRIX_G4_PREFILL_LINEAR_POLICY"); p && *p && linears == Linears::wmma)
@@ -587,7 +583,7 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
         const auto rows = unsigned(s.tokens.size());
         if (!tx || tx->published || tx->failed || tx->evaluated || tx->rows || tx->stream->poisoned || !gpu::same_config(tx->stream->config, c))
             throw std::invalid_argument("invalid prefill transaction");
-        if (!rows || s.tokens.size() > chunk_rows || tx->start > tx->stream->admitted || s.tokens.size() > tx->stream->admitted - tx->start ||
+        if (!rows || s.tokens.size() > b.rows_capacity || tx->start > tx->stream->admitted || s.tokens.size() > tx->stream->admitted - tx->start ||
             tx->start > b.table_positions || s.tokens.size() > b.table_positions - tx->start)
             throw std::invalid_argument("prefill row or position bounds");
         for (const auto t : s.tokens) if (t >= c.vocab) throw std::invalid_argument("prefill token out of range");
@@ -596,7 +592,7 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
         input.insert(input.end(), s.tokens.begin(), s.tokens.end());
         n += rows;
     }
-    if (n > chunk_rows) throw std::invalid_argument("prefill row or position bounds");
+    if (n > b.rows_capacity) throw std::invalid_argument("prefill row or position bounds");
     // Hidden rows exported: every row (all_rows), or each segment's last row alone (last_committed: one per segment).
     // Only a single-segment last_committed pass narrows (the plan keeps the pass's last row, not each segment's).
     const bool hidden = demand != HiddenDemand::none, hidden_every = demand == HiddenDemand::all_rows,
@@ -607,6 +603,7 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
     // KV_QUEUE: the commit publishes this pass's rows on the queue that wrote them.
     for (const auto& p : parts) if (p.tx->stream->writer_queue) p.tx->stream->queue = b.queue;
     ChunkResult result; result.rows = n; result.vocab = c.vocab; result.tap_width = 5 * c.hidden;
+    if (n > chunk_rows) result.levers |= lever_chunk_1024;
     // PAIR (prefill/pair.hpp): stage A runs layers [0, cut) and ships the seam; stage B receives it and runs
     // [cut, layers). Off (no pipe): every layer, no seam work.
     auto& ps = pair_stage;
@@ -855,8 +852,14 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
                 narrow(std::size_t(c.heads) * d);
             }
             b.timing(b.stats.attention_ms, [&] {
-            // One attention call per segment, with that segment's rows, KV reads and stride (as forward() alone).
-            for (const auto& p : live_parts) {
+            // One attention call per segment piece: a piece never spans a multiple of chunk_rows, so a longer pass
+            // (CHUNK1024) gives every call the rows, KV reads, end position and stride of the chunk_rows pass (as
+            // forward() alone, same bytes). The narrowed tail row keeps its segment's call.
+            const bool narrowed = live_parts.data() == &tail_part;
+            std::size_t calls = 0;
+            for (const auto& seg : live_parts) calls += narrowed ? 1U : attention_piece_count(seg.tx->start, seg.rows);
+            const bool many = parts.size() > 1 || calls > live_parts.size();
+            const auto attend = [&](const Part& p, std::uint64_t start, bool continued) {
             const auto rows = p.rows;
             auto* q = b.q.as<float>() + std::size_t(p.first) * c.heads * d;
             auto* att = b.att.as<float>() + std::size_t(p.first) * c.heads * d;
@@ -876,23 +879,24 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
                     fp.capacity = capacity; fp.packed = fp.pending = 0;
                 }
                 const bool pack = a.producer == l;
-                const auto from = std::min<std::uint64_t>(fp.packed, p.tx->start);
-                if (pack) fp.pending = p.tx->start + rows;
+                // A continued piece packs from its own start: the previous piece of the pass packed the rows before it.
+                const auto from = continued ? start : std::min<std::uint64_t>(fp.packed, start);
+                if (pack) fp.pending = start + rows;
                 b.grow(b.flash_workspace, flash_workspace_bytes(chunk_rows, c.heads, 512));
                 prefill::attention_flash(q, reads, rows, c.heads, d, att, b.failure.as<unsigned>(), b.queue, fp.buffer.data(),
-                                         capacity, unsigned(p.tx->start + rows - from / 16U * 16U), pack, from,
-                                         unsigned(p.tx->start + rows), b.flash_workspace.data(), b.flash_workspace.size());
+                                         capacity, unsigned(start + rows - from / 16U * 16U), pack, from,
+                                         unsigned(start + rows), b.flash_workspace.data(), b.flash_workspace.size());
             } else if (b.stats.attention == AttentionMode::flash) {
                 // Sliding layers: the window's keys, repacked per pass into the shared buffer (cheap).
                 auto& owner = packed_producer[0];
-                const bool pack = owner != a.producer || !pack_reuse_enabled() || parts.size() > 1;
+                const bool pack = owner != a.producer || !pack_reuse_enabled() || many;
                 owner = a.producer;
                 prefill::attention_flash(q, reads, rows, c.heads, d, att, b.failure.as<unsigned>(), b.queue,
                                          b.attention_halves.data(), p.stride, std::min(p.stride, c.window + rows - 1), pack);
             } else if (b.stats.attention == AttentionMode::wmma) {
                 // Packs are reused across layers only within a one-segment pass: segments share the pack buffers.
                 auto& owner = packed_producer[global ? 1 : 0];
-                const bool pack = !b.stats.attention_packed || owner != a.producer || !pack_reuse_enabled() || parts.size() > 1;
+                const bool pack = !b.stats.attention_packed || owner != a.producer || !pack_reuse_enabled() || many;
                 owner = a.producer;
                 prefill::attention(q, reads, rows, c.heads, d, att, b.failure.as<unsigned>(), b.queue,
                                     b.stats.attention_packed ? (global ? b.global_halves : b.attention_halves).data() : nullptr,
@@ -909,6 +913,13 @@ std::vector<ChunkResult> DevicePrefill::pass(std::span<const PrefillSegment> seg
                                att + std::size_t(r) * c.heads * d, b.failure.as<unsigned>(), b.queue);
             }
             }
+            };
+            for (const auto& seg : live_parts) {
+                if (narrowed) { attend(seg, seg.tx->start, false); continue; }
+                for_each_attention_piece(seg.tx->start, seg.rows, [&](const AttentionPiece& piece) {
+                    attend(Part{seg.tx, seg.first + piece.offset, piece.rows, unsigned((piece.start + piece.rows + 63U) / 64U * 64U)},
+                           piece.start, piece.offset != 0);
+                });
             }
             });
             b.dot(name + "o", y.o, b.att.as<float>(), b.out.as<float>(), live);

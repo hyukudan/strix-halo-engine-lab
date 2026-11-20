@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/gguf_reader.hpp"
 #include "strix/model_contract.hpp"
 #include "strix/model_runtime_binding.hpp"
 #include "strix/mtp_forward_semantics.hpp"
@@ -34,6 +35,9 @@ struct MtpSidecarSourceContract {
     bool shared_target_tensors=false;
     MtpNormWeightEncoding norm_weight_encoding=MtpNormWeightEncoding::effective_scale;
 };
+// The one header-read contract for MTP sidecars (runtime loader and serving pre-load check): bounded metadata and
+// tensors, and the short numeric arrays (rope.dimension_sections) retained so the YaRN rotary contract can be read.
+[[nodiscard]] gguf::Limits mtp_sidecar_header_limits(std::uint64_t metadata_read_budget_bytes);
 [[nodiscard]] ModelManifest build_mtp_sidecar_manifest(const ModelContract&,
     const gguf::FileInfo&,const MtpSidecarAssetEvidence&);
 [[nodiscard]] MtpSidecarSourceContract inspect_mtp_sidecar_source(const ModelContract&,

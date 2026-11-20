@@ -2,8 +2,11 @@
 // Engine-bound shared runner; the adaptive arithmetic remains HIP-free in glm_spec_host.
 #include "glm/spec/glm_spec_host.hpp"
 #include "strix/glm/engine.hpp"
+#include "strix/spec/drafting.hpp"
 #include <array>
 #include <chrono>
+#include <memory>
+#include <string>
 #include <vector>
 
 namespace strix::glm::spec {
@@ -20,6 +23,11 @@ struct DecodePolicy {
     bool adaptive = true;
     unsigned fixed_k = 3;
     std::uint64_t capacity = 0;
+    // spec_arbiter (resolver row STRIX_SPEC_ARBITER, glm_rank_defaults.hpp): the shared strix::spec proposer + arbiter choose per cycle between prompt lookup (up to
+    // 7 drafts), the MTP chain (this runner's own adaptive window) and a plain row. Decisions use replicated data only
+    // (the merged cost table, emitted tokens), so both ranks decide the same. context: the prompt (null: none).
+    bool spec_arbiter = false;
+    const std::vector<std::uint32_t>* context = nullptr;
 };
 struct CycleRecord {
     std::uint64_t p = 0;
@@ -47,6 +55,7 @@ struct RunResult {
     std::array<unsigned, 8> histogram{};
     unsigned cycles = 0, offered = 0, accepted = 0;
     double loop_ms = 0, tail_ms = 0;
+    std::string spec_stats;  // strix-spec-stats JSON when the arbiter ran (else empty)
 };
 // pos0 > 0: positions [0, pos0) are already in the slot (an imported state, Engine::restore_state); only prompt[pos0..]
 // runs, with the same calls the full prompt makes for those rows.
@@ -83,5 +92,9 @@ private:
     std::uint64_t p_ = 0;
     unsigned pending_ = 0;
     std::chrono::steady_clock::time_point start_;
+    std::unique_ptr<strix::spec::ContextProposer> proposer_;  // STRIX_SPEC_ARBITER=1 only
+    std::unique_ptr<strix::spec::Arbiter> arbiter_;
+    strix::spec::SpecStats stats_;
+    double mtp_tokens_ = 0, mtp_ms_ = 0, mtp_n_ = 0;  // decayed MTP-cycle yield and table-priced cycle ms
 };
 }  // namespace strix::glm::spec

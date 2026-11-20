@@ -5,6 +5,8 @@
 // prefill forms hc_mma / mtp_mma / qsa_mma are CUDA numerical identities (FP16 tensor cores, FP32 accumulation).
 #include "strix/profiles/qwen.hpp"
 
+#include <cstdint>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -16,7 +18,8 @@ using pr::Lever;
 using pr::Kind;
 
 // Columns: default, fast, quality, turbo. A form is provisional in fast until its gate receipt flips `ready`. An empty turbo
-// cell is the fast cell (engine_profile.hpp value_column): TURBO runs every FAST form plus the TURBO-only rows below.
+// cell is the fast cell (engine_profile.hpp value_column): TURBO runs every FAST lever plus the TURBO-only rows below, each
+// in the regime where it wins (expert_turbo: prefill blocks of >= expert_turbo_rows rows).
 inline constexpr Lever table[] = {
     // Pending in fast: the engine refuses this storage with the MTP sidecar, graphs, cohorts, node hand-off and the prefix
     // cache (qwen_route::require_composition), i.e. in every shipped CUDA composition. Runnable only by an explicit
@@ -46,11 +49,11 @@ inline constexpr Lever table[] = {
      .target = "qwen-cuda-hc-f16mma-v2", .off = "0",
      .source = "hyper-connection projection/output on FP16 tensor cores, FP32 accumulation; qualification in progress; changes logits",
      .provisional = {false, true, false}},
-    // Not a member of the FAST bundle (kFastBundle): it only changes the draft head, which the prompt-logit gate does not
-    // see, and under the bundle's mtp_defer_prompt its rows run after the first token (no TTFT effect). Explicit in fast;
-    // its turbo cell keeps it in TURBO as before.
+    // Not a member of the FAST or TURBO bundle: it only changes the draft head's prompt K/V (prompt MTP rows, after the
+    // first token under mtp_defer_prompt), which the prompt-logit gate does not see, and its effect on draft acceptance in
+    // decode is unmeasured, so TURBO decode would no longer be FAST decode. Explicit in both (--mtp-mma on).
     {.name = "mtp_mma", .env = "STRIX_QRTX_MTP_MMA", .option = "--mtp-mma",
-     .value = {"", "", "", "1"}, .builtin = "0",
+     .value = {"", "", "", ""}, .builtin = "0",
      .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {false, true, false, true},
      .target = "qwen-cuda-mtp-f16mma-v1", .off = "0",
      .source = "MTP fused projection on FP16 tensor cores, FP32 accumulation; qualification in progress; changes logits",
@@ -81,19 +84,38 @@ inline constexpr Lever table[] = {
      .source = "routed-MoE prefill gate/up and down on int8 tensor cores with one FP32 FMA chain per output; qualification in progress; changes logits",
      .provisional = {false, true, false}},
     // TURBO only: routed GSQ experts on int8 tensor cores (gsq-iq-i8mma-turbo-cuda-v1, src/cuda/core/turbo_i8.hpp), selected
-    // ahead of qualification by `--profile turbo` (provisional). GSQ expert storage only: another pack refuses the start
-    // at admission; `--expert-turbo off` (or STRIX_QRTX_EXPERT_TURBO=0) keeps the pack's own experts under TURBO.
+    // ahead of qualification by `--profile turbo` (provisional), in its regime only (expert_turbo_rows): prefill blocks of
+    // at least that many rows; decode/verify windows and smaller blocks keep the run's other experts (under TURBO the
+    // FAST expert_fast row, so TURBO decode is FAST decode). GSQ expert storage only: another pack refuses the start at
+    // admission; `--expert-turbo off` (or STRIX_QRTX_EXPERT_TURBO=0) keeps the FAST experts under TURBO.
     {.name = "expert_turbo", .env = "STRIX_QRTX_EXPERT_TURBO", .option = "--expert-turbo",
      .value = {"", "", "", "1"}, .builtin = "0",
      .kind = Kind::bit_changing, .ready = {true, true, true, false}, .runnable = {false, false, false, true},
      .target = "gsq-iq-i8mma-turbo-cuda-v1", .off = "0",
-     .source = "routed GSQ experts: A8 int8 activations x integer codes on int8 IMMA, one FP32 FMA per group; TURBO bar pending; changes logits",
+     .source = "routed GSQ experts: A8 int8 activations x integer codes on int8 IMMA, one FP32 FMA per group; 32K logit gate "
+               "(4 prompts x 128 rows) PASS: regime (default rows) KL 0.00906 top-1 0.9844 dNLL +0.00102, int8 in every call "
+               "KL 0.00948 top-1 0.9785 dNLL +0.00543; speed regime per expert_turbo_rows; changes logits",
      .provisional = {false, false, false, true}},
-    // FAST only: routed GSQ experts on BF16 tensor cores (gsq-iq-bf16mma-cuda-v1), the expert member of the FAST bundle.
+    // Regime of expert_turbo (read only when it is on): prefill blocks of at least N rows run the int8 experts, every other
+    // MoE call the run's other expert arithmetic; `off` = int8 in every MoE call (decode windows included). Measured: the
+    // no-model expert bench (one routed-expert call, IQ3_S gate/up + IQ4_NL down) has int8 / BF16 time 0.954 / 0.967 /
+    // 0.953 / 0.957 / 0.898 / 0.915 at 1 / 16 / 128 / 512 / 2048 / 8192 rows, yet int8 in every decode window cost 9-15 %
+    // per step in situ (mtp_mma on); the bench does not reproduce that loss, so windows stay FAST. 512 stays because every
+    // scheduled prefill block (1024/2048/4096/8192, qwen_prefill.hpp block_schedule) is above it: the gated 32K
+    // arithmetic is the int8 one, and no window or tail below 512 rows changes arithmetic without a measurement.
+    {.name = "expert_turbo_rows", .env = "STRIX_QRTX_EXPERT_TURBO_ROWS", .option = "--expert-turbo-rows",
+     .value = {"", "", "", "512"}, .builtin = "512",
+     .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, true},
+     .target = "", .off = "off",
+     .source = "int8 experts on prefill blocks of >= N rows only (decode windows: the FAST experts); expert bench int8/BF16 "
+               "0.95-0.97 at 1-512 rows, 0.90-0.92 at 2048-8192, in-situ decode windows +9-15 % per step with int8: N = 512",
+     .provisional = {false, false, false, true}},
+    // FAST (and TURBO outside expert_turbo's regime): routed GSQ experts on BF16 tensor cores (gsq-iq-bf16mma-cuda-v1), the
+    // expert member of the FAST bundle; its empty turbo cell is the fast cell.
     // Same admission as expert_turbo: GSQ expert storage only (another pack refuses the start); `--expert-fast off` (or
     // STRIX_QRTX_EXPERT_FAST=0) keeps the pack's own experts; an explicit --expert-arithmetic keeps its own contract.
     {.name = "expert_fast", .env = "STRIX_QRTX_EXPERT_FAST", .option = "--expert-fast",
-     .value = {"", "1", "", "0"}, .builtin = "0",
+     .value = {"", "1", ""}, .builtin = "0",
      .kind = Kind::bit_changing, .ready = {true, false, true, true}, .runnable = {false, true, false, false},
      .target = "gsq-iq-bf16mma-cuda-v1", .off = "0",
      .source = "routed GSQ experts: BF16 activations x exact BF16 codes on tensor cores, FP32 accumulation; alone: logit gate "
@@ -115,6 +137,16 @@ inline constexpr Lever table[] = {
      .kind = Kind::exact, .ready = {true, true, true, true}, .runnable = {true, true, true, true},
      .target = "", .off = "0",
      .source = "decode tile form of the tensor-core GSQ experts: exact (bitwise the tile form; greedy ids equal on prose/edit/json)"},
+    // Exact schedule trait of the tensor-core GSQ experts: launches averaging >= N rows per expert (the row's value; `on` =
+    // native_mma::kWideMinAvgRows = the RTX PRO TILEWIDE; N from the device's no-model tile bench) run 128-row CSR tiles in
+    // 512-thread blocks (one weight row per lane), so a 128-row run of an expert decodes its codes once instead of twice;
+    // bitwise the tile form (same MMA and scale-FMA order per output, same m16 position per row). Opt-in until its timing
+    // receipt: `--expert-wide-tile on|N` / STRIX_QRTX_EXPERT_WIDE_TILE=1|N.
+    {.name = "expert_wide_tile", .env = "STRIX_QRTX_EXPERT_WIDE_TILE", .option = "--expert-wide-tile",
+     .value = {"", "", "", ""}, .builtin = "0",
+     .kind = Kind::exact, .ready = {true, true, true, true}, .runnable = {true, true, true, true},
+     .target = "", .off = "0",
+     .source = "wide 128-row tile form of the tensor-core GSQ experts: exact by construction (bitwise the tile form); timing pending"},
 };
 inline std::span<const Lever> levers() { return table; }
 
@@ -138,8 +170,13 @@ struct Choice {
     bool ple_a8 = false;  // after the five above, so their positional initialisers keep their meaning
     bool expert_turbo = false;  // maps to Config::expert_arithmetic (its identity is the arithmetic name, not a form)
     bool expert_fast = false;   // likewise (gsq-iq-bf16mma-cuda-v1)
+    // Regime of expert_turbo (row expert_turbo_rows): int8 experts on prefill blocks of at least this many rows; nullopt:
+    // every MoE call. Read only when expert_turbo is on.
+    std::optional<std::uint32_t> expert_turbo_rows{512};
     bool mtp_defer_prompt = false;  // exact: Config::defer_prompt_mtp
     bool expert_decode_tile = true; // exact: Config::expert_decode_tile (absent row = on)
+    bool expert_wide_tile = false;  // exact: Config::expert_wide_tile (opt-in)
+    std::uint32_t expert_wide_min_rows = 0;  // its planner parameter (value N of the row; 0 = the builtin threshold)
     bool fast() const { return moe_route_bf16 || hc_mma || mtp_mma || qsa_mma || moe_mma || ple_a8; }
     bool operator==(const Choice&) const = default;
 };
@@ -155,6 +192,41 @@ inline bool lever_on(const pr::Resolution& r, std::string_view name) {
     if (!entry || entry->status == pr::Status::pending || entry->status == pr::Status::off) return false;
     return normalise(name, entry->value) == "1";
 }
+// expert_wide_tile takes on / off or N = the minimum average rows per expert of a launch for the wide form (1..65535;
+// on = the builtin threshold). N comes from the device's no-model tile bench; it changes the schedule only (exact row).
+inline void wide_tile_value(const pr::Resolution& r, bool& on, std::uint32_t& min_rows) {
+    on = false;
+    min_rows = 0;
+    const auto* entry = r.find("expert_wide_tile");
+    if (!entry || entry->status == pr::Status::pending || entry->status == pr::Status::off) return;
+    const std::string_view v = entry->value;
+    const bool digits = !v.empty() && v.size() <= 5 && v.find_first_not_of("0123456789") == std::string_view::npos;
+    if (!digits || v == "0" || v == "1") {
+        on = normalise("expert_wide_tile", v) == "1";
+        return;
+    }
+    const unsigned long n = std::stoul(std::string(v));
+    if (n > 65535UL) throw std::invalid_argument("expert_wide_tile is on, off or rows per expert 2..65535 (got '" + std::string(v) + "')");
+    on = true;
+    min_rows = static_cast<std::uint32_t>(n);
+}
+// expert_turbo_rows: a decimal N >= 1, or off (nullopt). Absent from the resolution (exact/fast with no switch): builtin.
+inline std::optional<std::uint32_t> turbo_rows(const pr::Resolution& r) {
+    const auto* entry = r.find("expert_turbo_rows");
+    if (entry && entry->status == pr::Status::off) return std::nullopt;
+    std::string_view text;
+    for (const auto& l : levers()) if (l.name == "expert_turbo_rows") text = l.builtin;
+    if (entry && entry->status != pr::Status::pending) text = entry->value;
+    std::uint64_t n = 0;
+    for (const char ch : text) {
+        if (ch < '0' || ch > '9' || n > 0xffffffffULL / 10U)
+            throw std::invalid_argument("expert_turbo_rows is a row count >= 1 or off (got '" + std::string(text) + "')");
+        n = n * 10U + static_cast<std::uint64_t>(ch - '0');
+    }
+    if (text.empty() || n == 0 || n > 0xffffffffULL)
+        throw std::invalid_argument("expert_turbo_rows is a row count >= 1 or off (got '" + std::string(text) + "')");
+    return static_cast<std::uint32_t>(n);
+}
 inline Choice choose(const pr::Resolution& r) {
     Choice c;
     c.moe_route_bf16 = lever_on(r, "moe_route_bf16");
@@ -165,8 +237,10 @@ inline Choice choose(const pr::Resolution& r) {
     c.ple_a8 = lever_on(r, "ple_a8");
     c.expert_turbo = lever_on(r, "expert_turbo");
     c.expert_fast = lever_on(r, "expert_fast");
+    c.expert_turbo_rows = turbo_rows(r);
     c.mtp_defer_prompt = lever_on(r, "mtp_defer_prompt");
     c.expert_decode_tile = r.find("expert_decode_tile") == nullptr || lever_on(r, "expert_decode_tile");
+    wide_tile_value(r, c.expert_wide_tile, c.expert_wide_min_rows);
     return c;
 }
 // Flip together with the members' fast-column `ready` cells when the whole-bundle gate receipt passes.
@@ -177,24 +251,61 @@ inline constexpr bool kFastBundleQualified = false;
 struct BundleStatus {
     std::string id, detail;
 };
-inline BundleStatus fast_bundle_status(const Choice& c, bool expert_bf16mma) {
-    std::string missing;
-    const auto need = [&](bool ok, std::string_view what) {
-        if (!ok) missing += (missing.empty() ? "" : ", ") + std::string(what);
-    };
-    need(expert_bf16mma, "experts are not gsq-iq-bf16mma-cuda-v1");
-    need(c.qsa_mma, "qsa_mma off");
-    need(c.hc_mma, "hc_mma off");
-    need(c.mtp_defer_prompt, "mtp_defer_prompt off");
-    need(!c.moe_mma, "moe_mma on (not a member)");
-    need(!c.mtp_mma, "mtp_mma on (not a member)");
-    need(!c.moe_route_bf16, "moe_route_bf16 on (not a member)");
-    need(!c.ple_a8, "ple_a8 on (not a member)");
-    if (!missing.empty()) return {"", "outside " + std::string(kFastBundle) + ": " + missing};
-    std::string members;
-    for (const auto m : kFastBundleMembers) members += (members.empty() ? "" : ",") + std::string(m);
-    return {std::string(kFastBundle), "members " + members + (kFastBundleQualified ? "; qualified" :
+namespace bundle_detail {
+struct Missing {
+    std::string text;
+    void need(bool ok, std::string_view what) {
+        if (!ok) text += (text.empty() ? "" : ", ") + std::string(what);
+    }
+};
+inline BundleStatus status(std::string_view id, std::span<const std::string_view> members, const Missing& m, bool qualified) {
+    if (!m.text.empty()) return {"", "outside " + std::string(id) + ": " + m.text};
+    std::string list;
+    for (const auto x : members) list += (list.empty() ? "" : ",") + std::string(x);
+    return {std::string(id), "members " + list + (qualified ? "; qualified" :
         "; provisional: the whole-bundle logit gate has not passed")};
+}
+}  // namespace bundle_detail
+inline BundleStatus fast_bundle_status(const Choice& c, bool expert_bf16mma) {
+    bundle_detail::Missing m;
+    m.need(expert_bf16mma, "experts are not gsq-iq-bf16mma-cuda-v1");
+    m.need(c.qsa_mma, "qsa_mma off");
+    m.need(c.hc_mma, "hc_mma off");
+    m.need(c.mtp_defer_prompt, "mtp_defer_prompt off");
+    m.need(!c.moe_mma, "moe_mma on (not a member)");
+    m.need(!c.mtp_mma, "mtp_mma on (not a member)");
+    m.need(!c.moe_route_bf16, "moe_route_bf16 on (not a member)");
+    m.need(!c.ple_a8, "ple_a8 on (not a member)");
+    return bundle_detail::status(kFastBundle, kFastBundleMembers, m, kFastBundleQualified);
+}
+
+// The RTX Qwen TURBO bundle = the turbo column = the FAST bundle (expert_fast, qsa_mma, hc_mma, mtp_defer_prompt) plus the
+// integer TURBO experts (gsq-iq-i8mma-turbo-cuda-v1) in their regime only: prefill blocks of at least expert_turbo_rows
+// rows; decode/verify windows and smaller blocks run the FAST experts, so TURBO decode is FAST decode (tiers nested; the
+// shared test strix-profile-fast-set-tests asserts that every FAST cell is in the turbo column). Pack's own dense
+// weights. One id for the set that the TURBO logit gate qualifies (FAST thresholds, against the exact reference). Any
+// member overridden (another expert arithmetic, the regime off, --turbo-weights onfly, a form off, mtp_mma, moe_mma or
+// route storage on) leaves the run outside it. v1 was int8 experts in every MoE call plus mtp_mma.
+inline constexpr std::string_view kTurboBundle = "qwen-cuda-turbo-bundle-v2";
+inline constexpr std::string_view kTurboBundleMembers[] = {"expert_fast", "qsa_mma", "hc_mma", "mtp_defer_prompt", "expert_turbo",
+                                                           "expert_turbo_rows"};
+// Flip when the TURBO gate receipts pass on this arithmetic (32K: 4 prompts x 128 rows; the same gate on this tree).
+inline constexpr bool kTurboBundleQualified = false;
+// expert_i8turbo_v1: Config::expert_arithmetic is gsq-iq-i8mma-turbo-cuda-v1; narrow_bf16mma: Config::expert_narrow is
+// gsq-iq-bf16mma-cuda-v1 (the regime split is on and runs the FAST experts outside it).
+inline BundleStatus turbo_bundle_status(const Choice& c, bool expert_i8turbo_v1, bool narrow_bf16mma, bool native_weights) {
+    bundle_detail::Missing m;
+    m.need(expert_i8turbo_v1, "experts are not gsq-iq-i8mma-turbo-cuda-v1");
+    m.need(narrow_bf16mma, "outside the expert_turbo regime the experts are not gsq-iq-bf16mma-cuda-v1");
+    m.need(c.qsa_mma, "qsa_mma off");
+    m.need(c.hc_mma, "hc_mma off");
+    m.need(c.mtp_defer_prompt, "mtp_defer_prompt off");
+    m.need(native_weights, "dense weights not the pack's (--turbo-weights onfly)");
+    m.need(!c.mtp_mma, "mtp_mma on (not a member)");
+    m.need(!c.moe_mma, "moe_mma on (not a member)");
+    m.need(!c.moe_route_bf16, "moe_route_bf16 on (not a member)");
+    m.need(!c.ple_a8, "ple_a8 on (not a member)");
+    return bundle_detail::status(kTurboBundle, kTurboBundleMembers, m, kTurboBundleQualified);
 }
 inline std::string forms_list(const Choice& c) {
     std::string out;

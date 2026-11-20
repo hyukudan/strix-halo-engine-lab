@@ -10,6 +10,10 @@
 // `exact` and `default` are the default column: no option is added, today's behaviour byte for byte. An explicit
 // `--wide` / `--prefill-rows` always wins over the word; `--wide-exact` / `--prefill-exact` keep their own meaning
 // (EXACT wide windows) and suppress the profile's window size. Promoting the cell = flipping ready[fast], never code.
+// Second lever, both apps: the A4W4 layer table (STRIX_DENSE_A4W4_LAYERS, an environment lever exported by take()). Its
+// fast cell is QUALIFIED (kFastGates): the wide IU4 GEMMs of layers 48-63 run the shared A4W4 class
+// (dense-iu4a4-rot-v1), the other layers keep their path. It only acts on wide windows (rows > 16, not the EXACT
+// wide windows), so with today's pending wide cell it needs an explicit --wide / --prefill-rows above 16.
 // Pair app: NOT bound. Its --wide default (512) is already the FAST wide class, so `exact` could not mean today's
 // behaviour there and the 64-row fast cell would shrink the window; it needs its own table once gated.
 // Host-only: no HIP types.
@@ -28,10 +32,14 @@ enum class App { decode, spec };
 
 // Columns: default, fast, quality, turbo. builtin = today's behaviour with the option absent.
 inline constexpr sp::Lever table[] = {
-    {.name = "wide_rows", .env = "", .option = "--wide", .value = {"", "64", "", ""}, .builtin = "16-row windows",
+    {.name = "wide_rows", .env = "", .option = "--wide", .value = {"", "64", "", ""}, .builtin = "engine default (64-row EXACT windows, IU4)",
      .kind = sp::Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
      .target = "64-row FAST wide windows (dense-q8a8-f16-v1)", .off = "16",
      .source = "composite FAST gate (wide prefill rows > 16) pending"},
+    {.name = "a4w4_layers", .env = "STRIX_DENSE_A4W4_LAYERS", .option = "", .value = {"", "48-63", "", ""},
+     .builtin = "no A4W4 layer (STRIX_DENSE_A4W4=1: every layer, unqualified)", .kind = sp::Kind::bit_changing,
+     .ready = {true, true, true, false}, .runnable = {true, true, true, false}, .target = "", .off = "none",
+     .source = "FAST gate v2 PASS, layers 48-63 (docs/models/qwen3.8-27b/README.md#a4w4-layer-table-hip-fast)"},
     {.name = "prefill_rows", .env = "", .option = "--prefill-rows", .value = {"", "64", "", ""},
      .builtin = "engine default (64-row EXACT windows, IU4)",
      .kind = sp::Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
@@ -39,12 +47,16 @@ inline constexpr sp::Lever table[] = {
      .source = "composite FAST gate (wide prefill rows > 16) pending"},
 };
 inline constexpr std::string_view kAllowEnv = "STRIX_QWEN35_HIP_PROFILE_ALLOW_PENDING";
+// FAST gate ledger (strix::profile::FastGate): the qualified fast cells and their receipts.
+inline constexpr sp::FastGate kFastGates[] = {
+    {"a4w4_layers", "48-63", "docs/models/qwen3.8-27b/README.md#a4w4-layer-table-hip-fast"},
+};
 
-// One engine per app: each app owns only its own spelling of the lever.
+// One engine per app: each app owns only its own spelling of the window lever; both take the A4W4 layer table.
 inline sp::Engine engine(App app) {
     const std::span<const sp::Lever> rows(table);
     return {app == App::spec ? "qwen35-hip-spec" : "qwen35-hip-decode", kAllowEnv,
-            app == App::spec ? rows.subspan(1U, 1U) : rows.subspan(0U, 1U)};
+            app == App::spec ? rows.subspan(1U, 2U) : rows.subspan(0U, 2U)};
 }
 
 struct Result {
@@ -66,7 +78,8 @@ inline Result resolve_args(const sp::Engine& eng, std::vector<std::string> args,
     return out;
 }
 
-// App entry: rewrites argc/argv in place (storage lives for the process), prints the pending/unqualified notices.
+// App entry: rewrites argc/argv in place (storage lives for the process), exports the environment levers the profile
+// applies (strix::profile::apply), prints the pending/unqualified notices.
 inline void take(App app, int& argc, char**& argv) {
     static std::vector<std::string> storage;
     static std::vector<char*> pointers;
@@ -74,6 +87,7 @@ inline void take(App app, int& argc, char**& argv) {
     for (int i = 1; i < argc; ++i) args.emplace_back(argv[i]);
     const auto eng = engine(app);
     const auto result = resolve_args(eng, std::move(args));
+    sp::apply(result.resolution);
     for (const auto& entry : result.resolution.entries)
         if (entry.status == sp::Status::pending)
             std::fprintf(stderr, "profile %s: %s pending %s (%s runs)\n", sp::name(result.resolution.profile),

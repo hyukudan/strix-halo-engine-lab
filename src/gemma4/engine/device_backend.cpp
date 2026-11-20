@@ -1,4 +1,5 @@
 #include "runtime.hpp"
+#include "pair.hpp"
 #include "gemma4/kernels/device.hpp"
 #include "gemma4/dflash/device.hpp"
 #include "gemma4/prefill/device.hpp"
@@ -205,15 +206,24 @@ public:
     // STRIX_G4_PREFILL_CHUNK (64..512, a multiple of 64; default 512): prompt rows per prefill chunk. Linears are
     // row-independent and canonical attention reads committed keys exactly as the overlay, so chunk ends do not
     // change bytes (checked by state/logits digests); shorter chunks fill the two-node pipeline sooner.
+    // CHUNK1024 (lever, opt-in; STRIX_G4_PREFILL_CHUNK1024=1): WMMA linears take max_chunk_rows (1024) per pass:
+    // the many small under-filled GEMM grids (narrow/direct tiles) and the per-pass dispatches halve, while attention
+    // runs in chunk_rows pieces aligned to absolute positions with the 512-row calls' arguments (target.hip), so the
+    // committed bytes equal the 512-row chunks. Exact / a8 / EXL3 linears keep 512 (the exact route measured slower at
+    // 1024); an explicit STRIX_G4_PREFILL_CHUNK and the two-node pair route (pipeline fill) keep their chunk.
     std::size_t prefill_chunk_rows() const override {
         static const std::size_t rows = [] {
             const char* v = std::getenv("STRIX_G4_PREFILL_CHUNK");
-            if (!v || !*v) return std::size_t(prefill::chunk_rows);
+            if (!v || !*v) return std::size_t(0);
             char* end = nullptr; const auto n = std::strtoul(v,&end,10);
             if (*end || n < 64 || n > prefill::chunk_rows || n % 64) throw std::invalid_argument("STRIX_G4_PREFILL_CHUNK must be 64..512, a multiple of 64");
             return std::size_t(n);
         }();
-        return prefill_ ? rows : 0;
+        if (!prefill_) return 0;
+        if (rows) return rows;
+        if (prefill_->stats().linears == prefill::Linears::wmma && !pair_enabled() && prefill::lever_enabled(prefill::lever_chunk_1024))
+            return prefill::max_chunk_rows;
+        return prefill::chunk_rows;
     }
     // With the exact decode attention: exact many-row prefill matches non-a8 decode; a8 prefill matches g4-a8-v1 decode.
     // EXL3 keeps its own core order; WMMA prefill never matches decode rows.

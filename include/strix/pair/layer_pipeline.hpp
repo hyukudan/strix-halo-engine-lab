@@ -199,6 +199,8 @@ struct DecodeOps {
     std::function<void(std::span<std::byte>)> export_row;        // synchronizes
     std::function<void(std::span<const std::byte>)> import_row;  // host bytes stay valid until the next forward returns
     std::size_t row_bytes = 0;
+    // Interleaved stages (decode over a StageMap, below): one row through layers [first, last); first == 0 embeds `token`.
+    std::function<void(std::uint32_t token, std::uint32_t first, std::uint32_t last, bool head)> range;
     // Pipelined speculation (optional, first stage of two or more; both set = on). The first stage is idle while the
     // later stages finish row n, so it runs row n+1 on a GUESSED token and sends it only when the relayed token equals
     // the guess; on a miss it undoes the guessed row and runs the true one. The wire carries the same messages as
@@ -209,8 +211,6 @@ struct DecodeOps {
     //   rewrite every device row the guessed forward wrote). A family whose state cannot be undone leaves it empty.
     std::function<bool(std::uint32_t last, std::uint32_t& next)> guess;
     std::function<void()> rewind;
-    // Interleaved stages (decode over a StageMap, below): one row through layers [first, last); first == 0 embeds `token`.
-    std::function<void(std::uint32_t token, std::uint32_t first, std::uint32_t last, bool head)> range;
 };
 struct DecodeStats {
     std::vector<std::uint32_t> ids;

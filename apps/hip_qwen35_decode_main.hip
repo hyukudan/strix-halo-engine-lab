@@ -1,6 +1,8 @@
 // strix-hip-qwen35-decode: Qwen3.8-27B (qwen35 dense) decode on one HIP device over strix::qwen35::HipEngine.
-// Prompt goes through windows of up to --rows tokens (forward_commit), then greedy decode: exact MTP speculation (shared
-// BlockDrafter + MtpChain, verify windows bitwise equal to one row per step) when the shared resolver finds an MTP layer
+// Prompt goes through the engine's resolved forward_commit windows (shared plan: strix/qwen35/prefill_windows.hpp; logits
+// on the last window only; --rows / --dump-logits / --tf-rows keep their diagnostic row paths), then greedy decode:
+// exact MTP speculation (shared BlockDrafter + MtpChain, verify windows bitwise equal to one row per step) when the
+// shared resolver finds an MTP layer
 // (hip_spec_defaults.hpp: --mtp auto|off|FILE, --draft-rows on|off), else one row per step. --dump-logits keeps one row per step.
 // Home: specific = app glue; engine in include/strix/qwen35/hip_engine.hpp, kernels shared.
 #include <algorithm>
@@ -28,6 +30,7 @@
 #include "strix/pair/split_plan.hpp"
 #include "strix/pair/tp_inputs.hpp"
 #include "strix/qwen35/hip_engine.hpp"
+#include "strix/qwen35/prefill_windows.hpp"
 #include "strix/profiles/qwen_dense_hip.hpp"
 #include "strix/qwen35/hip_spec_defaults.hpp"
 #include "strix/spec/engine_target.hpp"
@@ -75,11 +78,8 @@ int main(int argc, char** argv) try {
     using namespace strix::qwen35;
     std::string model, dump, ids_arg = "1";
     HipDenseSpecArgs spec_args;  // the family's shared speculation flags (hip_dense_spec_costs.hpp)
-    unsigned wide = 0;
-    bool wide_exact = false;
-    bool dump_window = false;
-    unsigned tf_rows = 0;
-    unsigned gen = 16, rows = 1, maxpos = 0, repeat = 1;
+    PrefillFlags pf;  // prompt windows: engine defaults unless a width / row path is asked (prefill_windows.hpp)
+    unsigned gen = 16, maxpos = 0, repeat = 1;
     int tp_rank = -1;
     std::string tp_spec = "usb4auto";
     std::vector<double> tp_rates;  // --tp-rates override, GB/s per rank; default: the topology declaration (shares follow the ratio)
@@ -95,12 +95,12 @@ int main(int argc, char** argv) try {
         if (a == "--model") model = next();
         else if (a == "--prompt-ids") ids_arg = next();
         else if (a == "--gen") gen = strix::core::parse_u32(next());
-        else if (a == "--rows") rows = strix::core::parse_u32(next());
-        else if (a == "--wide") wide = strix::core::parse_u32(next());  // prompt windows of N rows, last-row logits only (N > 16 = FAST wide prefill)
-        else if (a == "--wide-exact") { wide = strix::core::parse_u32(next()); wide_exact = true; }  // the same windows, EXACT class (bitwise to --wide 16)
-        else if (a == "--dump-logits") dump = next();
-        else if (a == "--dump-window") dump_window = true;  // with --wide and --dump-logits: every row of the last wide window
-        else if (a == "--tf-rows") tf_rows = strix::core::parse_u32(next());  // with --wide: the last N prompt tokens as <= 16-row windows (row path), all logits
+        else if (a == "--rows") pf.rows = strix::core::parse_u32(next());  // diagnostic: prompt on the decode row path, windows of N rows
+        else if (a == "--wide") { pf.width = strix::core::parse_u32(next()); pf.exact = false; }  // explicit width N (N > 16 = FAST wide prefill)
+        else if (a == "--wide-exact") { pf.width = strix::core::parse_u32(next()); pf.exact = true; }  // explicit width N, EXACT class (bitwise to 16-row)
+        else if (a == "--dump-logits") { dump = next(); pf.dump = true; }
+        else if (a == "--dump-window") pf.dump_window = true;  // wide path with --dump-logits: every row of the last wide window
+        else if (a == "--tf-rows") pf.tf_rows = strix::core::parse_u32(next());  // wide path: the last N prompt tokens as <= 16-row windows (row path)
         else if (a == "--iu4-reference") strix::core::dense_iu4::set_reference(true);  // exactness gate: dequantised-pack reference form
         else if (a == "--max-pos") maxpos = strix::core::parse_u32(next());
         else if (a == "--repeat") repeat = std::max(1U, strix::core::parse_u32(next()));  // prefills per process (reset between): first = cold, last = warm
@@ -147,8 +147,8 @@ int main(int argc, char** argv) try {
         tp_rates = rr.gbytes_ps;
         std::printf("tp rates: %.1f, %.1f GB/s (%s)\n", tp_rates[0], tp_rates[1], rr.source.c_str());
     }
-    if (model.empty() || rows < 1U || rows > HipEngine::max_rows())
-        throw std::invalid_argument("usage: --model GGUF [--prompt-ids 1,2,3] [--gen N] [--rows 1..16] [--dump-logits FILE] [--iu4-reference] [--mtp auto|off|F] [--draft-rows on|off] [--draft-pack F1,F2] [--spec-costs calibrated|table|learned] [--wide N] [--tf-rows N] [--dump-window] [--max-pos N] [--repeat N]; --prompt-ids @FILE reads the list from FILE");
+    if (model.empty() || pf.rows > HipEngine::max_rows())
+        throw std::invalid_argument("usage: --model GGUF [--prompt-ids 1,2,3] [--gen N] [--rows 1..16 (row-path diagnostic)] [--dump-logits FILE] [--iu4-reference] [--mtp auto|off|F] [--draft-rows on|off] [--draft-pack F1,F2] [--spec-costs calibrated|table|learned] [--wide N | --wide-exact N] [--tf-rows N] [--dump-window] [--max-pos N] [--repeat N]; --prompt-ids @FILE reads the list from FILE");
     if (!ids_arg.empty() && ids_arg[0] == '@') {  // long prompts exceed the per-argument limit of the OS
         std::ifstream f(ids_arg.substr(1));
         if (!f) throw std::invalid_argument("cannot read " + ids_arg.substr(1));
@@ -164,8 +164,7 @@ int main(int argc, char** argv) try {
 
     HipEngineOptions opt;
     opt.max_positions = maxpos;
-    opt.prefill_rows = wide;
-    opt.wide_exact = wide_exact;
+    apply_prefill_flags(pf, HipEngine::max_rows(), opt);
     const auto t_load0 = std::chrono::steady_clock::now();
     auto E = HipEngine::from_gguf(model, opt);
     const double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_load0).count();
@@ -188,10 +187,12 @@ int main(int argc, char** argv) try {
     if (!plan.mtp_source.empty()) {
         E->load_mtp(plan.mtp_source);
         chain = std::make_unique<HipMtpChain>(*E, false, HipEngine::mtp_max_rows());
+        chain->set_device_feed(plan.device_feed);  // --chain-feed (shared spec flags)
         if (plan.draft_rows) drows = std::make_unique<strix::spec::DraftRows>(hip_dense_draft_rows_config(V, plan));
     }
-    std::printf("spec: %s (mtp %s%s%s), draft rows %s\n", chain ? "mtp" : "off", plan.mtp_reason.c_str(),
-                plan.mtp_source.empty() ? "" : " ", plan.mtp_source.c_str(), drows ? "subset" : "full");
+    std::printf("spec: %s (mtp %s%s%s), draft rows %s, chain feed %s\n", chain ? "mtp" : "off", plan.mtp_reason.c_str(),
+                plan.mtp_source.empty() ? "" : " ", plan.mtp_source.c_str(), drows ? "subset" : "full",
+                chain && chain->device_feed() ? "device" : "host");
     std::vector<std::uint32_t> uprompt(prompt.begin(), prompt.end());
     std::vector<float> dumped;
     std::uint32_t top[HipEngine::max_rows()];
@@ -207,44 +208,34 @@ int main(int argc, char** argv) try {
         }
         return o;
     };
-    unsigned last_n = 0;
+    // Prompt windows (shared plan, prefill_windows.hpp): chunked by the width the engine resolved, logits only where the
+    // plan asks (the last window; every row on the diagnostic dump paths).
+    const PrefillPlan pplan = plan_prefill(pf, prompt.size(), E->prefill_rows(), HipEngine::max_rows());
+    std::size_t logit_windows = 0;
+    for (const auto& w : pplan.windows) logit_windows += w.tops() ? 1U : 0U;
+    std::printf("prefill windows: requested %s, resolved %u rows, %s path, %zu windows, logits on %zu\n",
+                pplan.requested ? std::to_string(pplan.requested).c_str() : "engine default", pplan.width,
+                pplan.row_path ? "row (diagnostic)" : "forward_commit", pplan.windows.size(), logit_windows);
+    std::vector<std::uint32_t> ptop(std::max(E->prefill_rows(), HipEngine::max_rows()));
+    std::uint32_t first_top = 0;  // the greedy token after the prompt
     double pf_ms = 0.0;
     for (unsigned pass = 0; pass < repeat; ++pass) {
     if (pass) { E->reset(); dumped.clear(); }
     if (chain) chain->reset();
     const auto t_pf0 = std::chrono::steady_clock::now();
-    if (wide) {
-        // --tf-rows N: wide windows up to size - N (no logits), then N teacher-forced rows in <= 16-row windows (the
-        // decode row path, every row's logits dumped): the state a FAST prefill hands to decode, scored on exact rows.
-        const std::size_t wide_end = prompt.size() - std::min<std::size_t>(tf_rows, prompt.size() - 1U);
-        for (std::size_t at = 0; at < wide_end;) {
-            const unsigned n = unsigned(std::min<std::size_t>(wide, wide_end - at));
-            std::vector<std::uint32_t> t(n);
-            for (unsigned i = 0; i < n; ++i) t[i] = std::uint32_t(prompt[at + i]);
-            const bool last = at + n == prompt.size();  // false when --tf-rows leaves a tail
-            const bool rows_all = last && dump_window && !dump.empty();
-            const auto o = E->forward_commit(t.data(), n, last ? (rows_all ? LogitRows::all : LogitRows::last) : LogitRows::none);
-            if (last) {
-                E->read_top(o, 1, top);
-                const unsigned m = rows_all ? n : 1U;
-                if (!dump.empty()) { dumped.resize(std::size_t(m) * V); E->read_logits(o, m, dumped.data()); }
+    for (const auto& w : pplan.windows) {
+        const auto o = E->forward_commit(uprompt.data() + w.at, w.rows, w.want);
+        if (const unsigned m = w.tops()) {
+            E->read_top(o, m, ptop.data());
+            first_top = ptop[m - 1U];
+            if (!dump.empty()) {
+                const auto at = dumped.size();
+                dumped.resize(at + std::size_t(m) * V);
+                E->read_logits(o, m, dumped.data() + at);
             }
-            if (chain) chain->observe_prefill(o, n, t.data(), last ? top[0] : uprompt[at + n]);
-            at += n;
         }
-        last_n = 1;
-        for (std::size_t at = wide_end; at < prompt.size();) {
-            last_n = unsigned(std::min<std::size_t>(HipEngine::max_rows(), prompt.size() - at));
-            const auto o = forward(last_n, prompt.data() + at);
-            if (chain) chain->observe_prefill(o, last_n, uprompt.data() + at, at + last_n == prompt.size() ? top[0] : uprompt[at + last_n]);
-            at += last_n;
-        }
-    } else
-    for (std::size_t at = 0; at < prompt.size();) {
-        last_n = unsigned(std::min<std::size_t>(rows, prompt.size() - at));
-        const auto o = forward(last_n, prompt.data() + at);
-        if (chain) chain->observe_prefill(o, last_n, uprompt.data() + at, at + last_n == prompt.size() ? top[0] : uprompt[at + last_n]);
-        at += last_n;
+        const bool last = w.at + w.rows == prompt.size();
+        if (chain) chain->observe_prefill(o, w.rows, uprompt.data() + w.at, last ? first_top : uprompt[w.at + w.rows]);
     }
     pf_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pf0).count();
     if (repeat > 1U)
@@ -252,7 +243,7 @@ int main(int argc, char** argv) try {
                     pass == 0U ? "cold" : pass + 1U == repeat ? "warm" : "mid", prompt.size(), pf_ms, double(prompt.size()) * 1000.0 / pf_ms);
     }
     std::printf("prompt %zu tokens: %.1f ms\n", prompt.size(), pf_ms);
-    std::vector<int> generated{int(dump.empty() ? top[0] : top[last_n - 1U])};
+    std::vector<int> generated{int(first_top)};
     // Speculation costs of this device (hip_spec_defaults.hpp hip_dense_measure_costs): after the prompt, before the decode
     // clock starts; discarded windows, the committed state is untouched.
     const bool scalar_x = strix::core::dense_iu4::scalar_x();

@@ -21,9 +21,12 @@
 
 #include "glm/engine/glm_fast_attn.hpp"
 #include "glm/engine/glm_fast_moe.hpp"
+#include "glm/engine/glm_fast_i4_defaults.hpp"
 #include "glm/engine/glm_fast_i4_pack.hpp"
 #include "core/host_free_memory.hpp"
+#include "strix/host_memory.hpp"
 #include "core/iu4.hpp"
+#include "core/null_perturb.hpp"
 #include "moe_core/int4_layer_policy.hpp"
 #include "glm/prefill/glm_pf_exact_moe.hpp"
 #include "glm/prefill/glm_pf_wmma.hpp"
@@ -714,16 +717,17 @@ struct Engine::Impl {
     }();
     // Layer / scope policy (src/moe_core/int4_layer_policy.hpp; the engine only names the options and the defaults).
     // STRIX_GLM_FAST_I4_EXL3_LAYERS = none | comma list of trunk MoE ordinals / ranges a-b (0 = the first MoE layer) that
-    // keep the EXL3 routed experts in prefill and decode. Default 0-14: an early INT4 layer costs a saturating KL step
-    // (about 0.007 alone), late layers about 0.0003 each; INT4 on ordinals >= 15 passes the quality gate, all layers do not.
+    // keep the EXL3 routed experts in prefill and decode. Default 0-24 (glm_fast_i4_defaults.hpp): an early INT4 layer
+    // costs a saturating KL step (about 0.007 alone), late layers about 0.0005 each; under FAST gate v2 ordinals >= 15
+    // fail two windows, ordinals >= 25 pass every window FAST alone passes.
     // STRIX_GLM_FAST_I4_SCOPE = gate_up (default: the routed down stays EXL3, the largest error source) | all.
     // STRIX_GLM_FAST_I4_SCALE = fast_full (default: core/iu4.hpp fast full-range rule) | legacy (max|w| / 7).
     const strix::moe_core::Int4LayerPolicy i4_policy = [] {
         strix::moe_core::Int4LayerPolicy policy;
         const char* layers_env = std::getenv("STRIX_GLM_FAST_I4_EXL3_LAYERS");
-        policy.source_mask = strix::moe_core::parse_int4_source_layers(layers_env == nullptr || *layers_env == '\0' ? "0-14" : layers_env, "STRIX_GLM_FAST_I4_EXL3_LAYERS");
+        policy.source_mask = strix::moe_core::parse_int4_source_layers(layers_env == nullptr || *layers_env == '\0' ? fast_i4::kExl3LayersDefault : layers_env, "STRIX_GLM_FAST_I4_EXL3_LAYERS");
         const char* scope_env = std::getenv("STRIX_GLM_FAST_I4_SCOPE");
-        policy.matrices = strix::moe_core::parse_int4_scope(scope_env == nullptr || *scope_env == '\0' ? "gate_up" : scope_env, "STRIX_GLM_FAST_I4_SCOPE");
+        policy.matrices = strix::moe_core::parse_int4_scope(scope_env == nullptr || *scope_env == '\0' ? fast_i4::kScopeDefault : scope_env, "STRIX_GLM_FAST_I4_SCOPE");
         return policy;
     }();
     const unsigned i4_matrices = i4_policy.matrices;
@@ -1530,13 +1534,24 @@ struct Engine::Impl {
         const std::uint64_t stage = mem::round_up(std::max<std::uint64_t>(plan.stage_max, 1), 2 * mem::kMiB);
         lib.set_stage_bytes(stage);
         const std::uint64_t phys = plan.physical(amodel);
-        const mem::Snapshot s0 = probe.read();
+        mem::Snapshot s0 = probe.read();
         std::fprintf(stderr, "mem: rank %u %s\nmem: node %s\n", opt.rank, plan.summary(amodel).c_str(), mem::describe(s0).c_str());
         if (const char* e = std::getenv("STRIX_GLM_MEM_ADMIT"); e != nullptr && std::string(e) == "0") {
             std::fprintf(stderr, "mem: WARNING admission check disabled (STRIX_GLM_MEM_ADMIT=0); the watchdog stays on\n");
         } else {
+            // A node that is short may still be getting memory back from a process that is exiting (the previous run):
+            // the shared recovery wait re-reads while the load does not fit and MemAvailable keeps rising (bounded,
+            // STRIX_HOST_MEMORY_WAIT_S), then the admission below decides on the last reading.
+            const auto terms = load_terms();
+            const auto waited = strix::host_memory::await_memory(
+                strix::host_memory::WaitPolicy::from_env(), [&] { return probe.read(); },
+                [](const mem::Snapshot& s) { return s.mem_available; },
+                [&](const mem::Snapshot& s) { return mem::fits(terms, s, margins); },
+                [](double sec) { std::this_thread::sleep_for(std::chrono::duration<double>(sec)); }, s0);
+            if (waited.reads > 1)
+                std::fprintf(stderr, "mem: rank %u %s\n", opt.rank, strix::host_memory::describe(waited).c_str());
             mem::admit("rank " + std::to_string(opt.rank) + " load (" + std::to_string(opt.layers) + " layers)",
-                       load_terms(),
+                       terms,
                        s0, margins);
         }
         if (const char* e = std::getenv("STRIX_GLM_MEM_PLAN_ONLY"); e != nullptr && std::string(e) == "1") {  // --mem-plan
@@ -2448,14 +2463,16 @@ struct Engine::Impl {
             if (layer_dump != nullptr)
                 hip_ok(hipMemcpyAsync(layer_dump->data() + static_cast<std::size_t>(li) * kHc * kHidden, X, kHc * kHidden * 4,
                                       hipMemcpyDeviceToHost, stream), "layer dump");
-            if (null_layer == static_cast<int>(li))  // test hook: +1 ulp on stream 0 of the row at null_pos
+            // Test hook (gate null): one FP16 ulp on stream 0 of the row at null_pos. Every consumer stages its input as
+            // FP16, so a one-f32-ulp flip was absorbed and the null equalled the reference bitwise (core/null_perturb.hpp).
+            if (null_layer == static_cast<int>(li))
                 for (unsigned q = 0; q < R; ++q)
                     if (rows[q].pos == null_pos) {
                         float* at = X + (static_cast<std::size_t>(q) * kHc) * kHidden + null_elem;
                         std::uint32_t bits = 0;
                         hip_ok(hipMemcpyAsync(&bits, at, 4, hipMemcpyDeviceToHost, stream), "null flip read");
                         hip_ok(hipStreamSynchronize(stream), "null flip sync");
-                        bits += 1;
+                        bits = strix::core::fp16_ulp_up_bits(bits);
                         hip_ok(hipMemcpyAsync(at, &bits, 4, hipMemcpyHostToDevice, stream), "null flip write");
                         hip_ok(hipStreamSynchronize(stream), "null flip sync");
                     }

@@ -79,6 +79,8 @@ std::set<std::string> diff(const qp::Config& a, const qp::Config& b) {
     ne("forms.qsa_mma", a.forms.qsa_mma != b.forms.qsa_mma);
     ne("forms.moe_mma", a.forms.moe_mma != b.forms.moe_mma);
     ne("forms.ple_a8", a.forms.ple_a8 != b.forms.ple_a8);
+    ne("expert_wide_tile", a.expert_wide_tile != b.expert_wide_tile);
+    ne("expert_wide_min_rows", a.expert_wide_min_rows != b.expert_wide_min_rows);
     return d;
 }
 // serve vs cli: the same request. Fails on a Resolution, contract or Config difference that is not named.
@@ -177,7 +179,8 @@ void fast_bundle() {
     check(r.config.defer_prompt_mtp && r.contract == "qwen-cuda;prefill=exact", "STRIX_QRTX_MTP_DEFER_PROMPT=1 through the lookup");
     check(!one({}, qo::Entry::cli).config.defer_prompt_mtp, "default: prompt MTP not deferred");
     check(refuses({"--mtp-defer-prompt", "maybe"}), "--mtp-defer-prompt is on or off");
-    check(refuses({"--profile", "turbo", "--expert-fast", "on"}, {}, qo::Entry::serve), "FAST and TURBO expert rows are exclusive");
+    check(!refuses({"--profile", "turbo", "--expert-fast", "on"}, {}, qo::Entry::serve),
+          "TURBO contains the FAST expert row (an explicit on is the turbo cell's own value)");
 }
 
 void profiles() {
@@ -217,6 +220,34 @@ void profiles() {
     check(ple.contract == "qwen-cuda;prefill=fast;forms=hc_mma,qsa_mma,ple_a8;moe_route_bf16=0;ids=qwen-cuda-hc-f16mma-v2,"
                           "qwen-cuda-qsa-bf16mma-v2,qwen-cuda-ple-a8-v1+gsq-iq-bf16mma-cuda-v1", "ple_a8 contract: " + ple.contract);
     check(status(ple, "ple_a8").rfind("explicit", 0) == 0, "ple_a8: explicit under fast: " + status(ple, "ple_a8"));
+    // expert_wide_tile: exact schedule trait (128-row tiles), opt-in in every profile until its timing receipt; on by option
+    // or env, serve == CLI; contract and bundle id unchanged (bitwise the tile form).
+    check(!fast.config.expert_wide_tile, "fast: wide tile form off (opt-in)");
+    same_request("wide tile on", {"--profile", "fast", "--expert-wide-tile", "on"});
+    for (const auto& wide : {one({"--profile", "fast", "--expert-wide-tile", "on"}, qo::Entry::serve),
+                             one({"--profile", "fast"}, qo::Entry::serve, Env{{"STRIX_QRTX_EXPERT_WIDE_TILE", "1"}})}) {
+        check(wide.config.expert_wide_tile, "wide tile on by option / env: " + status(wide, "expert_wide_tile"));
+        check(wide.contract == fast.contract && bundle_id(wide) == bundle_id(fast), "wide tile on: same contract and bundle id");
+        check(wide.config.expert_wide_min_rows == 0U, "wide tile on: the builtin threshold (0 = native_mma::kWideMinAvgRows)");
+    }
+    // Its planner parameter: N rows per expert from the device's tile bench, by option or env; serve == CLI; exact row.
+    same_request("wide tile rows", {"--profile", "fast", "--expert-wide-tile", "96"});
+    for (const auto& wide : {one({"--profile", "fast", "--expert-wide-tile", "96"}, qo::Entry::serve),
+                             one({"--profile", "fast"}, qo::Entry::cli, Env{{"STRIX_QRTX_EXPERT_WIDE_TILE", "96"}})}) {
+        check(wide.config.expert_wide_tile && wide.config.expert_wide_min_rows == 96U,
+              "wide tile N: on with threshold 96: " + status(wide, "expert_wide_tile"));
+        check(wide.contract == fast.contract && bundle_id(wide) == bundle_id(fast), "wide tile N: same contract and bundle id");
+    }
+    {
+        const auto off = one({"--profile", "fast", "--expert-wide-tile", "off"}, qo::Entry::serve);
+        check(!off.config.expert_wide_tile && off.config.expert_wide_min_rows == 0U, "wide tile off: no threshold");
+        bool refused = false;
+        try { (void)one({"--profile", "fast", "--expert-wide-tile", "70000"}, qo::Entry::serve); } catch (const std::exception&) { refused = true; }
+        check(refused, "wide tile rows above 65535 refused");
+        refused = false;
+        try { (void)one({"--profile", "fast", "--expert-wide-tile", "wide"}, qo::Entry::serve); } catch (const std::exception&) { refused = true; }
+        check(refused, "wide tile malformed value refused");
+    }
     check(cp::form_identities(fast.choice) == "qwen-cuda-hc-f16mma-v2,qwen-cuda-qsa-bf16mma-v2", "fast identities: " + cp::form_identities(fast.choice));
     fast_bundle();
     for (const char* f : {"moe_route_bf16", "qsa_budget", "gdn_fp16_chunk", "output_head"})
@@ -460,9 +491,9 @@ void turbo_binding() {
           "turbo: onfly effective in both entries");
     check(!serve.config.turbo_namespace.empty() && serve.config.turbo_namespace == cli.config.turbo_namespace &&
               serve.config.turbo_namespace == direct.cache_namespace, "turbo: namespace of the qwen_turbo resolver");
-    check(serve.choice == cli.choice && serve.choice.hc_mma && serve.choice.mtp_mma && serve.choice.qsa_mma &&
-              !serve.choice.moe_mma && serve.choice.expert_turbo && serve.contract != plain.contract,
-          "turbo: FAST forms inherited, moe_mma off, integer experts on");
+    check(serve.choice == cli.choice && serve.choice.hc_mma && !serve.choice.mtp_mma && serve.choice.qsa_mma &&
+              !serve.choice.moe_mma && serve.choice.expert_turbo && serve.choice.expert_fast && serve.contract != plain.contract,
+          "turbo: FAST levers inherited (mtp_mma not a FAST lever), moe_mma off, integer experts on");
     check(serve.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::gsq_i8_turbo &&
               cli.config.expert_arithmetic == serve.config.expert_arithmetic &&
               serve.contract.find("gsq-iq-i8mma-turbo-cuda-v1") != std::string::npos,
@@ -475,8 +506,8 @@ void turbo_binding() {
               qo::effective_config_json(serve).find("\"turbo_weights\"") != std::string::npos,
           "turbo: effective config field only under turbo");
     const auto off = qo::resolve(parse(with_paths({"--profile", "turbo", "--expert-turbo", "off"}), none), qo::Entry::serve);
-    check(off.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::incumbent && !off.choice.expert_turbo &&
-              off.choice.hc_mma, "turbo: --expert-turbo off keeps the pack's experts, other rows stay");
+    check(off.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::gsq_bf16_mma && !off.config.expert_narrow &&
+              !off.choice.expert_turbo && off.choice.hc_mma, "turbo: --expert-turbo off keeps the FAST experts, other rows stay");
     const auto bf = qo::resolve(parse(with_paths({"--profile", "turbo", "--expert-arithmetic", "gsq-iq-bf16mma-cuda-v1"}), none),
                                 qo::Entry::serve);
     check(bf.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::gsq_bf16_mma,
@@ -485,13 +516,133 @@ void turbo_binding() {
     check(fast.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::gsq_bf16_mma && !fast.choice.expert_turbo &&
               fast.choice.expert_fast && plain.config.expert_arithmetic == strix::qwen_packs::ExpertArithmetic::incumbent,
           "turbo row selects nothing outside turbo (fast selects the FAST expert row instead)");
-    check(!serve.choice.expert_fast && serve.choice.mtp_mma && serve.choice.mtp_defer_prompt,
-          "turbo: FAST expert row kept out (turbo cell off); mtp_mma and the exact deferral stay in TURBO");
+    check(serve.choice.expert_fast && !serve.choice.mtp_mma && serve.choice.mtp_defer_prompt,
+          "turbo: FAST expert row inherited (outside the int8 regime), mtp_mma explicit only, the exact deferral stays");
     bool threw = false;
     try {
         (void)qo::resolve(parse(with_paths({"--profile", "turbo", "--prefill-moe-route-bf16", "1"}), none), qo::Entry::serve);
     } catch (const std::invalid_argument&) { threw = true; }
     check(threw, "turbo: RouteBF16 with the TURBO expert arithmetic refused");
+    // One TURBO expert arithmetic: the gated int8 form (v1). The two-limb v2 contract name is not selectable.
+    check(refuses({"--profile", "turbo", "--expert-arithmetic", "gsq-iq-i8mma-turbo-cuda-v2"}) &&
+              refuses({"--profile", "turbo", "--expert-arithmetic", "gsq-iq-i8mma-turbo-cuda-v2"}, {}, qo::Entry::serve),
+          "turbo: the two-limb v2 arithmetic is refused in both entries (v1 is the gated arithmetic)");
+    // ONE TURBO identity: plain `--profile turbo` (pack weights) is the TURBO bundle in serve and CLI alike (same status
+    // from the one resolver), named in the effective config; FAST and exact never print it; each override leaves it.
+    const std::string tid(cp::kTurboBundle);
+    const auto treq = parse(with_paths({"--profile", "turbo"}), none);
+    for (const auto entry : {qo::Entry::serve, qo::Entry::cli}) {
+        const auto r = qo::resolve(treq, entry);
+        const auto json = qo::effective_config_json(r);
+        const auto tb = qo::turbo_bundle(r);
+        check(tb.id == tid, "turbo bundle in every entry: " + tb.detail);
+        check(tb.detail.find("expert_fast,qsa_mma,hc_mma,mtp_defer_prompt,expert_turbo,expert_turbo_rows") != std::string::npos &&
+                  tb.detail.find("provisional") != std::string::npos,
+              "turbo bundle lists its members and is provisional: " + tb.detail);
+        check(json.find("\"turbo_bundle\"") != std::string::npos && json.find("\"" + tid + "\"") != std::string::npos &&
+                  json.find("\"fast_bundle\"") == std::string::npos,
+              "turbo effective config names the TURBO bundle only");
+        check(!r.config.turbo_onfly_nvfp4 && r.contract.find("gsq-iq-i8mma-turbo-cuda-v1") != std::string::npos &&
+                  r.contract.find(std::string(cp::kHcIdentity)) != std::string::npos &&
+                  r.contract.find(std::string(cp::kQsaIdentity)) != std::string::npos,
+              "turbo bundle contract carries the FAST form ids and the v1 experts: " + r.contract);
+        check(r.contract.find("+experts[prefill_rows>=512:gsq-iq-i8mma-turbo-cuda-v1,else:gsq-iq-bf16mma-cuda-v1]") != std::string::npos &&
+                  json.find("\"expert_regime\"") != std::string::npos,
+              "turbo contract and effective config carry the per-regime expert rule: " + r.contract);
+    }
+    const auto tserve = qo::resolve(treq, qo::Entry::serve), tcli = qo::resolve(treq, qo::Entry::cli);
+    check(tserve.contract == tcli.contract && tserve.choice == tcli.choice &&
+              qo::numerical_identity(tserve.config).hash == qo::numerical_identity(tcli.config).hash,
+          "turbo bundle: serve == CLI contract, choice and numerical identity");
+    const auto outside = [&](const Args& extra, const std::string& why) {
+        Args args{"--profile", "turbo"};
+        args.insert(args.end(), extra.begin(), extra.end());
+        const auto r = qo::resolve(parse(with_paths(args), none), qo::Entry::serve);
+        const auto json = qo::effective_config_json(r);
+        const auto tb = qo::turbo_bundle(r);
+        check(tb.id.empty() && tb.detail.find(why) != std::string::npos &&
+                  json.find("\"turbo_bundle\"") != std::string::npos && json.find("\"none\"") != std::string::npos,
+              "turbo outside the bundle (" + why + "): " + tb.detail);
+    };
+    outside({"--expert-turbo", "off"}, "experts are not gsq-iq-i8mma-turbo-cuda-v1");
+    outside({"--hc-mma", "off"}, "hc_mma off");
+    outside({"--qsa-mma", "off"}, "qsa_mma off");
+    outside({"--mtp-mma", "on"}, "mtp_mma on (not a member)");
+    outside({"--expert-fast", "off"}, "outside the expert_turbo regime the experts are not gsq-iq-bf16mma-cuda-v1");
+    outside({"--expert-turbo-rows", "off"}, "outside the expert_turbo regime the experts are not gsq-iq-bf16mma-cuda-v1");
+    outside({"--ple-a8", "on"}, "ple_a8 on");
+    outside({"--mtp-defer-prompt", "off"}, "mtp_defer_prompt off");
+    outside({"--turbo-weights", "onfly"}, "--turbo-weights onfly");
+    check(qo::turbo_bundle(fast).id.empty() && qo::effective_config_json(fast).find("turbo_bundle") == std::string::npos &&
+              qo::effective_config_json(plain).find("turbo_bundle") == std::string::npos,
+          "FAST and exact never print the TURBO bundle");
+}
+
+// TURBO = FAST + int8 experts in their regime only: the expert arithmetic of every MoE call under TURBO is FAST's outside
+// prefill blocks of >= expert_turbo_rows rows (decode/verify windows always), so TURBO decode is FAST decode; exact and
+// fast carry no regime (their receipts keep their bytes); the crossover is a resolver row (option, env, off) seen
+// identically by serve and CLI.
+void turbo_regime() {
+    namespace qpk = strix::qwen_packs;
+    using strix::cuda::qwen_prefill::expert_arithmetic_for;
+    const Env none;
+    const auto turbo = qo::resolve(parse(with_paths({"--profile", "turbo"}), none), qo::Entry::serve);
+    const auto fast = qo::resolve(parse(with_paths({"--profile", "fast"}), none), qo::Entry::serve);
+    const auto exact = one({}, qo::Entry::serve);
+    check(turbo.config.expert_narrow == qpk::ExpertArithmetic::gsq_bf16_mma && turbo.config.expert_regime_min_rows == 512,
+          "turbo: regime split on, FAST experts outside it, provisional crossover 512");
+    for (const std::uint32_t rows : {1U, 2U, 8U, 16U, 512U, 1024U, 8192U}) {
+        check(expert_arithmetic_for(turbo.config, true, rows) == expert_arithmetic_for(fast.config, true, rows) &&
+                  expert_arithmetic_for(turbo.config, true, rows) == qpk::ExpertArithmetic::gsq_bf16_mma,
+              "turbo decode/verify window of " + std::to_string(rows) + " rows = FAST experts");
+        check(expert_arithmetic_for(fast.config, false, rows) == qpk::ExpertArithmetic::gsq_bf16_mma &&
+                  expert_arithmetic_for(exact.config, false, rows) == qpk::ExpertArithmetic::incumbent &&
+                  expert_arithmetic_for(exact.config, true, rows) == qpk::ExpertArithmetic::incumbent,
+              "fast/exact: one expert arithmetic in every regime (" + std::to_string(rows) + " rows)");
+    }
+    check(expert_arithmetic_for(turbo.config, false, 511) == qpk::ExpertArithmetic::gsq_bf16_mma &&
+              expert_arithmetic_for(turbo.config, false, 512) == qpk::ExpertArithmetic::gsq_i8_turbo &&
+              expert_arithmetic_for(turbo.config, false, 8192) == qpk::ExpertArithmetic::gsq_i8_turbo,
+          "turbo prefill blocks: int8 at and above the crossover only");
+    check(!fast.config.expert_narrow && !exact.config.expert_narrow &&
+              qo::effective_config_json(fast).find("expert_regime") == std::string::npos &&
+              qo::effective_config_json(exact).find("expert_regime") == std::string::npos &&
+              qo::effective_config_json(exact).find("expert_turbo_rows") == std::string::npos &&
+              qo::effective_config_json(fast).find("expert_turbo_rows") == std::string::npos &&
+              exact.contract == "qwen-cuda;prefill=exact",
+          "exact/fast: no regime field, no new lever row, historical contract");
+    // TURBO contains every FAST choice (the levers FAST selects are selected by TURBO with the same values).
+    check((!fast.choice.hc_mma || turbo.choice.hc_mma) && (!fast.choice.qsa_mma || turbo.choice.qsa_mma) &&
+              (!fast.choice.mtp_defer_prompt || turbo.choice.mtp_defer_prompt) && (!fast.choice.expert_fast || turbo.choice.expert_fast) &&
+              (!fast.choice.mtp_mma || turbo.choice.mtp_mma) && (!fast.choice.moe_mma || turbo.choice.moe_mma) &&
+              turbo.config.defer_prompt_mtp == fast.config.defer_prompt_mtp,
+          "turbo choice contains the fast choice");
+    // The crossover row: option, env, off; serve == CLI; malformed values refused.
+    const auto rows2k = parse(with_paths({"--profile", "turbo", "--expert-turbo-rows", "2048"}), none);
+    const auto s2k = qo::resolve(rows2k, qo::Entry::serve), c2k = qo::resolve(rows2k, qo::Entry::cli);
+    check(s2k.config.expert_regime_min_rows == 2048 && c2k.config.expert_regime_min_rows == 2048 && s2k.contract == c2k.contract &&
+              qo::numerical_identity(s2k.config).hash != qo::numerical_identity(turbo.config).hash,
+          "--expert-turbo-rows 2048: both entries, own identity");
+    const auto env1k = qo::resolve(parse(with_paths({"--profile", "turbo"}), Env{{"STRIX_QRTX_EXPERT_TURBO_ROWS", "1024"}}),
+                                   qo::Entry::serve);
+    check(env1k.config.expert_regime_min_rows == 1024, "STRIX_QRTX_EXPERT_TURBO_ROWS=1024 through the lookup");
+    const auto all = qo::resolve(parse(with_paths({"--profile", "turbo", "--expert-turbo-rows", "off"}), none), qo::Entry::serve);
+    check(!all.config.expert_narrow && all.config.expert_arithmetic == qpk::ExpertArithmetic::gsq_i8_turbo &&
+              expert_arithmetic_for(all.config, true, 1) == qpk::ExpertArithmetic::gsq_i8_turbo &&
+              all.contract.find("+gsq-iq-i8mma-turbo-cuda-v1") != std::string::npos,
+          "--expert-turbo-rows off: int8 in every MoE call (the v1 contract)");
+    check(refuses({"--profile", "turbo", "--expert-turbo-rows", "0"}) && refuses({"--profile", "turbo", "--expert-turbo-rows", "12x"}),
+          "--expert-turbo-rows: a row count >= 1 or off");
+    // Explicit int8 under exact (no expert_fast): the regime split keeps the pack's own experts outside it.
+    const auto ex = one({"--expert-turbo", "on"}, qo::Entry::cli);
+    check(ex.config.expert_arithmetic == qpk::ExpertArithmetic::gsq_i8_turbo && ex.config.expert_narrow == qpk::ExpertArithmetic::incumbent &&
+              expert_arithmetic_for(ex.config, true, 4) == qpk::ExpertArithmetic::incumbent,
+          "explicit --expert-turbo on: int8 in its regime, the pack's experts elsewhere");
+    // An explicit expert arithmetic keeps its own contract in every regime.
+    const auto exp = qo::resolve(parse(with_paths({"--profile", "turbo", "--expert-arithmetic", "gsq-iq-i8mma-turbo-cuda-v1"}), none),
+                                 qo::Entry::serve);
+    check(!exp.config.expert_narrow && expert_arithmetic_for(exp.config, true, 1) == qpk::ExpertArithmetic::gsq_i8_turbo,
+          "explicit --expert-arithmetic: every regime");
 }
 
 // Block fit: shared rows_fit planner (fake allocator) and the resolver binding (every entry, typed schedule strict).
@@ -639,11 +790,13 @@ int main() {
             check(qo::handoff_numerical_id_config("old",tu.config)!=qo::handoff_numerical_id_config("old",gsq.config) &&
                   qo::handoff_numerical_id_config("old",tu.config)!=qo::handoff_numerical_id_config("old",bf.config),"TURBO int8 handoff differs");
             check(refuses({"--expert-arithmetic","gsq-iq-i8mma-turbo-cuda-v1","--moe-mma","on"}),"TURBO int8 single-chain composition rejects explicitly");
+            check(refuses({"--expert-arithmetic","gsq-iq-i8mma-turbo-cuda-v2"}),"no TURBO v2 arithmetic (one int8 expert form)");
         }
         profiles();
         overrides();
         common_options();
         turbo_binding();
+    turbo_regime();
         flat_blocks();
         block_fit();
         moe_window_rows();

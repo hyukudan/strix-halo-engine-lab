@@ -94,15 +94,40 @@ Support for a new model is a binding, not a new engine:
 
 ## Quality gate for FAST levers
 
-- Limits, pooled over the gate set: KL <= 0.02, top-1 agreement >= 0.93, dNLL <= 0.01.
-- Per window the limit is `max(limit, 1.5 x the null of that same window)`, where the null is the
-  distance between two exact runs that differ only in evaluation order (one-ulp class). The
-  pooled limits stay absolute.
+- Limits, pooled over the gate set: KL <= 0.02, top-1 agreement >= 0.93, dNLL <= 0.01. The pooled
+  limits remain absolute for the default quality verdict. The null floor is advisory by default; only an
+  explicit `qual --allow-null-floor` may use its relaxed pooled bars to decide PASS/FAIL. When enabled,
+  a pooled bar whose pooled null fails it or is within 2 null row standard errors of failing is relaxed to
+  `KL <= null + 0.02`, `top-1 >= null - 0.01` or `dNLL <= null + 0.01` (never stricter than the
+  absolute bar). The gate always prints the NULL-FLOOR diagnostic, including whether the policy was
+  enabled; it never relaxes a window, content class or route flip ratio.
+- The null of a window is the distance between two exact runs that differ only in evaluation order
+  (one-ulp class), measured on that same window. A re-run that reproduces the same bits is not a
+  null; an engine without a null arm gets no verdict (the tool refuses it) until it binds a null hook.
+- Per window, with n scored rows:
+  - KL passes up to `max(0.02, 1.5 x the null's KL)`.
+  - top-1: with `L = max(0.07, 1.5 x the null's disagreement)`, the window passes at a disagreement
+    `<= L`, fails above `L + 2 x sqrt(L (1 - L) / n)` and is unresolved in between.
+  - dNLL: the window passes at `<= 0.01`, fails above `0.01 + 2 x se` and is unresolved in between,
+    where `se` is the standard error of the per-row difference, at most 1.5 x the null's.
+- An unresolved window is not a pass. The gate set declares a content class for every window before
+  it is scored (prose, code, structured output, each prompt-length band). The rows of a class are
+  pooled and judged by the same rule; a class verdict is final on at least 800 scored rows. A
+  verdict with an unresolved class, or on fewer rows, is provisional: the lever stays opt-in for
+  that class or band until more held-out rows of the same class settle it.
+- Reference check: a window where the lever beats the exact reference on the true text by more than
+  3 standard errors, and the null does not move the same way, is reported as "reference suspect".
+  It is never counted as a pass: the exact path is examined on that window first, and the gate is
+  run again after the finding.
+- Gate windows are plain text: no control or chat-template ids, and timing prompts are never gate
+  windows. The gate prints the reference's own NLL per window; a window whose reference NLL is far
+  above the rest of the set is flagged as off-distribution and holds the verdict like a reference
+  suspect.
 - MoE engines: the lever arm replays the expert routes of the reference arm, so the gate measures
   arithmetic and not route flips; the route flip rate of the free-running arm is reported.
-- dNLL is scored on token ids that neither arm generated, on at least 800 rows, with its standard
-  error printed. A verdict on fewer rows is provisional.
-- One gate tool for every engine; an engine only binds its route output and input.
+- dNLL is scored on token ids that neither arm generated, with its standard error printed.
+- One gate tool for every engine (`tools/strix-gate/gate_v2.py`: PASS / UNRESOLVED / FAIL, HOLD for
+  the reference check); an engine only binds its route output and input.
 
 ## Measuring
 

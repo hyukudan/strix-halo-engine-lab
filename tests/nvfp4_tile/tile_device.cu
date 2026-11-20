@@ -1,7 +1,8 @@
 // Device fixture + operator bench of the NVFP4 tile GEMM (sm_120; run only through an operator ticket on device 0).
 //   tile_device            : quantiser bytes == host reference (bitwise), GEMM store / residual / silu_mul / glu within the FP32
 //                            accumulation bound of the double reference, repeated launches bitwise identical.
-//   tile_device --bench R  : model shapes of the 27B dense layer at R activation rows, median of 20 timed launches per shape.
+//   tile_device --bench R  : model shapes of the 27B dense layer at R activation rows, median of 20 timed launches per shape
+//                            (lsu and bulk alternating launch by launch); --bench R lsu: lsu alone, main's timing loop.
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -42,6 +43,17 @@ std::vector<E> down(const E* d, std::size_t n) {
 }
 int g_fail = 0;
 
+// Feed::bulk must reproduce the lsu output `y` bit for bit (same stage bytes, same MMA order per accumulator). `reset`: the
+// residual form's starting y (it runs in place); otherwise y is poisoned with NaN first so an unwritten element cannot match.
+bool bulk_bitwise(T::GemmArgs g, const float* reset, const std::vector<float>& y) {
+    if (reset) CU(cudaMemcpy(g.y, reset, y.size() * 4, cudaMemcpyDeviceToDevice));
+    else CU(cudaMemset(g.y, 0xff, y.size() * 4));
+    g.feed = T::Feed::bulk;
+    CU(T::gemm_enqueue(g, nullptr));
+    const auto b = down(g.y, y.size());
+    return std::memcmp(b.data(), y.data(), y.size() * 4) == 0;
+}
+
 // one plain GEMM case: epi store / residual / silu_mul; returns max |err| / bound
 void check_gemm(const char* name, std::uint32_t out, std::uint32_t in, std::uint32_t rows, T::Epi epi, std::uint32_t seed) {
     const Weight w = random_weight(out, in, seed);
@@ -63,7 +75,8 @@ void check_gemm(const char* name, std::uint32_t out, std::uint32_t in, std::uint
     const auto xt = down(dxt, ha.tile.size());
     const auto rs = down(drs, ha.rows_pad);
     const bool qsame = xt == ha.tile && std::memcmp(rs.data(), ha.rs.data(), rs.size() * 4) == 0;
-    T::GemmArgs g;
+    T::GemmArgs g;  // reference arm: Feed::lsu (also the default; bulk_bitwise re-runs it with bulk)
+    g.feed = T::Feed::lsu;
     g.w = dw;
     g.x = dxt;
     g.rs = drs;
@@ -81,6 +94,7 @@ void check_gemm(const char* name, std::uint32_t out, std::uint32_t in, std::uint
     }
     CU(T::gemm_enqueue(g, nullptr));
     const auto y = down(dy, aux.size());
+    const bool bsame = bulk_bitwise(g, epi == T::Epi::residual ? daux : nullptr, y);
     double worst = 0;
     for (std::uint32_t r = 0; r < rows; ++r)
         for (std::uint32_t o = 0; o < out; ++o) {
@@ -104,9 +118,9 @@ void check_gemm(const char* name, std::uint32_t out, std::uint32_t in, std::uint
         CU(T::gemm_enqueue(g, nullptr));
         det = down(dy, aux.size()) == y;
     }
-    const bool ok = qsame && det && worst <= 1.0;
-    std::printf("TILE CHECK %-10s out=%u in=%u rows=%u quant-bitwise=%d deterministic=%d err/bound=%.3f %s\n", name, out, in, rows,
-                qsame ? 1 : 0, det ? 1 : 0, worst, ok ? "PASS" : "FAIL");
+    const bool ok = qsame && det && bsame && worst <= 1.0;
+    std::printf("TILE CHECK %-10s out=%u in=%u rows=%u quant-bitwise=%d deterministic=%d bulk-bitwise=%d err/bound=%.3f %s\n", name,
+                out, in, rows, qsame ? 1 : 0, det ? 1 : 0, bsame ? 1 : 0, worst, ok ? "PASS" : "FAIL");
     g_fail += ok ? 0 : 1;
     for (void* p : {static_cast<void*>(drec), static_cast<void*>(dx), static_cast<void*>(daux), static_cast<void*>(dw),
                     static_cast<void*>(dxt), static_cast<void*>(drs), static_cast<void*>(dy)})
@@ -127,7 +141,8 @@ void check_glu(std::uint32_t ch, std::uint32_t in, std::uint32_t rows, std::uint
     CU(T::repack_enqueue(dg, ch, in, tg, nullptr));
     CU(T::repack_enqueue(du, ch, in, tu, nullptr));
     CU(T::quantize_enqueue(dx, rows, in, dxt, drs, nullptr));
-    T::GemmArgs g;
+    T::GemmArgs g;  // reference arm: Feed::lsu
+    g.feed = T::Feed::lsu;
     g.w = tg;
     g.w2 = tu;
     g.x = dxt;
@@ -142,6 +157,7 @@ void check_glu(std::uint32_t ch, std::uint32_t in, std::uint32_t rows, std::uint
     g.epi = T::Epi::glu;
     CU(T::gemm_enqueue(g, nullptr));
     const auto y = down(dy, static_cast<std::size_t>(rows) * ch);
+    const bool bsame = bulk_bitwise(g, nullptr, y);
     double worst = 0;
     for (std::uint32_t r = 0; r < rows; ++r)
         for (std::uint32_t c = 0; c < ch; ++c) {
@@ -155,8 +171,9 @@ void check_glu(std::uint32_t ch, std::uint32_t in, std::uint32_t rows, std::uint
             const double bound = (gm * sg * 3e-5 * 1.2 * std::fabs(ur * su) + std::fabs(silu(gr * sg)) * um * su * 3e-5) + 1e-30;
             worst = std::max(worst, std::fabs(y[static_cast<std::size_t>(r) * ch + c] - ref) / bound);
         }
-    const bool ok = worst <= 1.0;
-    std::printf("TILE CHECK %-10s ch=%u in=%u rows=%u err/bound=%.3f %s\n", "glu", ch, in, rows, worst, ok ? "PASS" : "FAIL");
+    const bool ok = bsame && worst <= 1.0;
+    std::printf("TILE CHECK %-10s ch=%u in=%u rows=%u bulk-bitwise=%d err/bound=%.3f %s\n", "glu", ch, in, rows, bsame ? 1 : 0, worst,
+                ok ? "PASS" : "FAIL");
     g_fail += ok ? 0 : 1;
     for (void* p : {static_cast<void*>(dg), static_cast<void*>(du), static_cast<void*>(tg), static_cast<void*>(tu),
                     static_cast<void*>(dxt), static_cast<void*>(dx), static_cast<void*>(drs), static_cast<void*>(dy)})
@@ -309,6 +326,11 @@ void bench_norm_quant(std::uint32_t rows, std::uint32_t in, std::uint32_t gdn_in
     CU(cudaEventDestroy(b));
 }
 
+// --bench R lsu: time Feed::lsu alone with main's loop (3 warm-ups, 20 timed launches, each one preceded by the same kernel).
+// The default --bench alternates lsu and bulk launch by launch (fair bulk/lsu ratio), so there every timed lsu launch follows
+// a bulk launch; that sequence is not main's, and the lsu-vs-main comparison must use this mode in both binaries' order.
+bool lsu_only = false;
+
 // timing of one shape with random tiles (no reference): median of 20 launches after 3 warm-ups
 void bench(const char* name, std::uint32_t out, std::uint32_t in, std::uint32_t rows, bool glu, bool residual = false) {
     const std::uint32_t rp = T::rows_padded(rows);
@@ -324,7 +346,8 @@ void bench(const char* name, std::uint32_t out, std::uint32_t in, std::uint32_t 
     if (glu) CU(cudaMemset(w2, 0x35, T::w_tile_bytes(out, in)));
     CU(cudaMemset(x, 0x3c, static_cast<std::size_t>(rows) * in * 4));
     CU(T::quantize_enqueue(x, rows, in, xt, rs, nullptr));
-    T::GemmArgs g;
+    T::GemmArgs g;  // lsu arm (the default feed, explicit for ABAB benchmark)
+    g.feed = T::Feed::lsu;
     g.w = w;
     g.w2 = glu ? w2 : nullptr;
     g.x = xt;
@@ -342,16 +365,25 @@ void bench(const char* name, std::uint32_t out, std::uint32_t in, std::uint32_t 
     cudaEvent_t a, b;
     CU(cudaEventCreate(&a));
     CU(cudaEventCreate(&b));
-    for (int i = 0; i < 3; ++i) CU(T::gemm_enqueue(g, nullptr));
-    std::vector<float> ms;
-    for (int i = 0; i < 20; ++i) {
-        CU(cudaEventRecord(a));
+    T::GemmArgs gb = g;  // Feed::bulk arm, timed launch by launch alternating with the lsu arm (strict ABAB in one process)
+    gb.feed = T::Feed::bulk;
+    for (int i = 0; i < 3; ++i) {
         CU(T::gemm_enqueue(g, nullptr));
+        if (!lsu_only) CU(T::gemm_enqueue(gb, nullptr));
+    }
+    std::vector<float> ms, msb;
+    const auto timed = [&](const T::GemmArgs& ga, std::vector<float>& out_ms) {
+        CU(cudaEventRecord(a));
+        CU(T::gemm_enqueue(ga, nullptr));
         CU(cudaEventRecord(b));
         CU(cudaEventSynchronize(b));
         float t = 0;
         CU(cudaEventElapsedTime(&t, a, b));
-        ms.push_back(t);
+        out_ms.push_back(t);
+    };
+    for (int i = 0; i < 20; ++i) {
+        timed(g, ms);
+        if (!lsu_only) timed(gb, msb);
     }
     float qms = 0;
     CU(cudaEventRecord(a));
@@ -363,6 +395,10 @@ void bench(const char* name, std::uint32_t out, std::uint32_t in, std::uint32_t 
     const double med = ms[ms.size() / 2], macs = static_cast<double>(out) * (glu ? 2 : 1) * in * rows;
     std::printf("TILE BENCH %-6s out=%u in=%u rows=%u ms=%.4f TFLOPS=%.1f quant_ms=%.4f\n", name, out * (glu ? 2 : 1), in, rows, med,
                 2.0 * macs / (med * 1e-3) / 1e12, qms);
+    std::sort(msb.begin(), msb.end());
+    const double medb = lsu_only ? 0.0 : msb[msb.size() / 2];
+    if (!lsu_only) std::printf("TILE BENCH %-6s feed=bulk out=%u in=%u rows=%u ms=%.4f TFLOPS=%.1f bulk/lsu=%.4f\n", name, out * (glu ? 2 : 1), in,
+                rows, medb, 2.0 * macs / (medb * 1e-3) / 1e12, medb / med);
     for (void* p : {static_cast<void*>(w), static_cast<void*>(w2), static_cast<void*>(xt), static_cast<void*>(rs), static_cast<void*>(x),
                     static_cast<void*>(y)})
         CU(cudaFree(p));
@@ -378,6 +414,7 @@ int main(int argc, char** argv) {
     }
     if (argc >= 3 && std::string(argv[1]) == "--bench") {
         const auto rows = static_cast<std::uint32_t>(std::strtoul(argv[2], nullptr, 10));
+        lsu_only = argc >= 4 && std::string(argv[3]) == "lsu";
         bench("glu", 17408, 5120, rows, true);   // FFN gate+up fused
         bench("down", 5120, 17408, rows, false);  // FFN down
         bench("qkv", 10240, 5120, rows, false);   // GDN qkv
@@ -395,6 +432,8 @@ int main(int argc, char** argv) {
     check_gemm("store", 1024, 5120, 24, T::Epi::store, 61);  // model K
     check_glu(80, 128, 20, 31);
     check_glu(192, 1024, 300, 71);
+    check_gemm("residual", 400, 768, 520, T::Epi::residual, 81);  // bulk feed: partial weight tile (!ok records), 3 x 2 tiles, KS 6
+    check_glu(1040, 640, 300, 91);                                // bulk feed: 17 x 64-channel tiles, last partial (!ok w2 slots)
     check_norm_quant(300, 5120, true, 81);   // model width, padding rows 300..511
     check_norm_quant(257, 384, false, 91);   // null gain, NREG 2 -> bucket 8
     check_norm_quant(64, 8192, true, 101);   // widest fused row (NREG 32)

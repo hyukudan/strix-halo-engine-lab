@@ -25,6 +25,8 @@
 #include "strix/spec/drafting.hpp"
 #include "xport/hip_pipe_staging.hpp"
 
+#include <hip/hip_runtime.h>
+
 #include <algorithm>
 #include <cstdlib>
 #include <chrono>
@@ -39,6 +41,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -55,6 +58,109 @@ std::vector<strix::hy4::hipbind::PairWindowCost> parse_window_costs(const std::s
         costs.push_back({static_cast<std::uint32_t>(std::stoul(item.substr(0, colon))), std::stod(item.substr(colon + 1))});
     }
     return costs;
+}
+
+// --gate-ref: the BASE reference of a long teacher-forced document, in pieces (FAST gate v2 of the prompt windows past
+// what one ticket can reference). forward_rows chunks of --verify-rows R (each row bitwise step(): class BASE) run from
+// the state image --state-in (else position 0) over the --ids-file document up to --until; the logits rows of the
+// --score A:B ranges ([A, B) positions) go to --dump-logits F with their positions in F.pos; state images are written at
+// every --save-at P:FILE and at the stop (--state-out). --budget S stops at the first chunk boundary after S seconds of
+// rows (the ticket wall). The route tap (STRIX_MOE_ROUTES_OUT / _IN / STRIX_MOE_ROUTE_NULL) sees the chunks' router
+// calls like any run: a reference records, a null replays + nudges.
+struct GateRef {
+    bool on = false;
+    std::string state_in, state_out;
+    std::uint32_t until = 0;  // 0: the document's end
+    double budget_s = 0.0;    // 0: no budget
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> score;
+    std::vector<std::pair<std::uint32_t, std::string>> save_at;
+};
+
+std::pair<std::uint32_t, std::uint32_t> parse_range(const std::string& v) {
+    const auto colon = v.find(':');
+    if (colon == std::string::npos) throw std::invalid_argument("--score A:B (positions [A, B))");
+    const auto a = static_cast<std::uint32_t>(std::stoul(v.substr(0, colon)));
+    const auto b = static_cast<std::uint32_t>(std::stoul(v.substr(colon + 1)));
+    if (b <= a) throw std::invalid_argument("--score A:B needs A < B");
+    return {a, b};
+}
+
+int run_gate_ref(strix::hy4::hipbind::Forward& fwd, const std::vector<std::uint32_t>& doc, std::uint32_t rows, const GateRef& g,
+                 const std::string& dump_path) {
+    using clock = std::chrono::steady_clock;
+    if (rows == 0U) throw std::invalid_argument("--gate-ref needs --verify-rows R (1..8)");
+    if (!g.state_in.empty()) fwd.load_state(g.state_in);
+    const std::uint32_t p0 = fwd.position();
+    const auto& hist = fwd.token_history();
+    if (p0 > doc.size() || hist.size() != p0 || !std::equal(hist.begin(), hist.end(), doc.begin()))
+        throw std::runtime_error("--gate-ref: the state image's token history is not a prefix of the --ids-file document");
+    const auto end = static_cast<std::uint32_t>(g.until != 0U ? std::min<std::size_t>(g.until, doc.size()) : doc.size());
+    if (p0 > end) throw std::invalid_argument("--gate-ref: the image is past --until");
+    auto saves = g.save_at;
+    std::sort(saves.begin(), saves.end());
+    std::ofstream dump, dpos;
+    if (!dump_path.empty()) {
+        dump.open(dump_path, std::ios::binary | std::ios::trunc);
+        dpos.open(dump_path + ".pos", std::ios::trunc);
+        if (!dump || !dpos) throw std::runtime_error("cannot open " + dump_path);
+    }
+    const auto scored = [&g](std::uint32_t q) {
+        for (const auto& [a, b] : g.score)
+            if (q >= a && q < b) return true;
+        return false;
+    };
+    std::size_t si = 0, dumped = 0;
+    std::uint64_t digest = 0xcbf29ce484222325ULL;
+    const auto save_due = [&](std::uint32_t at) {
+        for (; si < saves.size() && saves[si].first <= at; ++si) {
+            if (saves[si].first < at) {
+                std::cout << "gate-ref: save point " << saves[si].first << " is behind the start " << at << ", skipped\n";
+                continue;
+            }
+            fwd.save_state(saves[si].second);
+            std::cout << "gate-ref: state image at " << at << " -> " << saves[si].second << "\n" << std::flush;
+        }
+    };
+    const auto t0 = clock::now();
+    std::uint32_t p = p0;
+    bool stopped = false;
+    while (p < end) {
+        save_due(p);
+        if (g.budget_s > 0.0 && std::chrono::duration<double>(clock::now() - t0).count() > g.budget_s) {
+            stopped = true;
+            break;
+        }
+        std::uint32_t R = std::min(rows, end - p);
+        if (si < saves.size()) R = std::min(R, saves[si].first - p);
+        bool want = false;
+        for (std::uint32_t r = 0; r < R && !want; ++r) want = scored(p + r);
+        fwd.forward_rows(std::span<const std::uint32_t>(doc.data() + p, R), want);
+        if (want) {
+            const auto& L = fwd.rows_logits();
+            const std::size_t V = L.size() / R;
+            for (std::uint32_t r = 0; r < R; ++r) {
+                if (!scored(p + r)) continue;
+                const float* row = L.data() + std::size_t{r} * V;
+                const auto* bytes = reinterpret_cast<const unsigned char*>(row);
+                for (std::size_t b = 0; b < V * sizeof(float); ++b) digest = (digest ^ bytes[b]) * 0x100000001b3ULL;
+                if (dump) {
+                    dump.write(reinterpret_cast<const char*>(row), static_cast<std::streamsize>(V * sizeof(float)));
+                    dpos << (p + r) << '\n';
+                }
+                ++dumped;
+            }
+        }
+        fwd.commit_rows(R);
+        p += R;
+    }
+    if (!stopped) save_due(p);
+    if (!g.state_out.empty()) fwd.save_state(g.state_out);
+    const double s = std::chrono::duration<double>(clock::now() - t0).count();
+    std::cout << "gate-ref positions " << p0 << ".." << p << " of " << end << (stopped ? " STOPPED (budget)" : " done") << " rows=" << rows
+              << " s=" << std::fixed << std::setprecision(1) << s << " ms_per_pos=" << std::setprecision(2)
+              << (p > p0 ? 1000.0 * s / static_cast<double>(p - p0) : 0.0) << " scored_rows=" << dumped << " logits_fnv64 " << std::hex
+              << digest << std::dec << (g.state_out.empty() ? std::string() : " state_out " + g.state_out) << "\n" << std::flush;
+    return 0;
 }
 
 std::vector<std::uint32_t> read_ids(const std::string& path) {
@@ -469,6 +575,8 @@ int run(int argc, char** argv) {
     std::vector<double> tp_rates;
     double tp_trip_us = 0.0;
     bool tp_force = false;
+    GateRef gref;           // --gate-ref (long BASE reference in pieces)
+    bool head_explicit = false;
     std::string dump_path;  // --dump-logits F: every host logits row (FP32, vocab floats per step) appended to F
     std::vector<strix::hy4::hipbind::PairWindowCost> window_costs;  // --window-costs ROWS:MS,... (pair calibration)
     // The tier word (--profile default|fast|quality, --allow-pending) through the shared resolver; the lever options
@@ -476,9 +584,6 @@ int run(int argc, char** argv) {
     std::vector<std::string> args(argv + 1, argv + argc);
     strix::profile::Inputs inputs;
     strix::profile::take_options(strix::hy4::profile::engine(), args, inputs);
-    auto profile = strix::profile::resolve(strix::hy4::profile::engine(), inputs);
-    for (const auto& e : profile.entries)
-        if (strix::profile::applied(e.status) && e.lever->name == "prompt_rows") o.prompt_rows = static_cast<std::uint32_t>(std::stoul(e.value));
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
         const bool more = i + 1 < args.size();
@@ -490,6 +595,20 @@ int run(int argc, char** argv) {
         else if (a == "--top" && more) top = static_cast<std::uint32_t>(std::stoul(args[++i]));
         else if (a == "--prompt-rows" && more) o.prompt_rows = static_cast<std::uint32_t>(std::stoul(args[++i])), rows_explicit = true;
         else if (a == "--timing") timing = true;
+        else if (a == "--gate-ref") gref.on = true;
+        else if (a == "--head-q8" && more) o.head_q8 = args[++i] == "1", head_explicit = true;
+        else if (a == "--verify-rows" && more) o.verify_rows = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        else if (a == "--state-in" && more) gref.state_in = args[++i];
+        else if (a == "--state-out" && more) gref.state_out = args[++i];
+        else if (a == "--until" && more) gref.until = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        else if (a == "--budget" && more) gref.budget_s = std::stod(args[++i]);
+        else if (a == "--score" && more) gref.score.push_back(parse_range(args[++i]));
+        else if (a == "--save-at" && more) {
+            const std::string v = args[++i];
+            const auto colon = v.find(':');
+            if (colon == std::string::npos) throw std::invalid_argument("--save-at P:FILE");
+            gref.save_at.emplace_back(static_cast<std::uint32_t>(std::stoul(v.substr(0, colon))), v.substr(colon + 1));
+        }
         else if (a == "--dump-logits" && more) dump_path = args[++i];
         else if (a == "--window-costs" && more) window_costs = parse_window_costs(args[++i]);
         else if (a == "--cut" && more) cut = static_cast<std::uint32_t>(std::stoul(args[++i]));
@@ -526,11 +645,29 @@ int run(int argc, char** argv) {
         if (picked != 0U && picked != o.prompt_rows) {
             o.prompt_rows = picked;
             inputs.cli.emplace_back("prompt_rows", std::to_string(picked));
-            profile = strix::profile::resolve(strix::hy4::profile::engine(), inputs);
         }
     }
-    std::cout << profile.describe() << std::flush;
+    // The regime (device, topology, this prompt's length) selects the qualified FAST cells (strix/profiles/hy4.hpp).
+    namespace hp = strix::hy4::profile;
+    hp::Regime regime;
+    regime.topology = std::getenv("HY4_RANK") != nullptr ? hp::Topology::pair : hp::Topology::one_node;
+    regime.prompt_tokens = prompt.size();
+    {
+        int dev = 0;
+        hipDeviceProp_t prop{};
+        if (hipGetDevice(&dev) == hipSuccess && hipGetDeviceProperties(&prop, dev) == hipSuccess) regime.device = hp::device_of(prop.gcnArchName);
+    }
+    const auto resolved = hp::resolve(regime, inputs);
+    const auto& profile = resolved->resolution;
+    if (const auto* e = resolved->find("prompt_rows"); e != nullptr && !rows_explicit && strix::profile::applied(e->status))
+        o.prompt_rows = static_cast<std::uint32_t>(std::stoul(e->value));
+    if (const auto* e = resolved->find("head_q8"); e != nullptr && !head_explicit && strix::profile::applied(e->status)) o.head_q8 = e->value == "1";
+    strix::profile::apply(profile);  // environment levers the profile sets (pf_mha), before any forward reads them
+    std::cout << profile.describe() << "regime " << hp::device_name(regime.device) << " / " << hp::topology_name(regime.topology)
+              << " / prompt " << regime.prompt_tokens << "\n" << std::flush;
     for (const auto& n : profile.notices()) std::cerr << n << '\n';
+    for (const auto& e : profile.entries)
+        if (!e.reason.empty()) std::cerr << e.lever->name << ": " << e.reason << '\n';
     if (o.parts.empty() || prompt.empty())
         throw std::invalid_argument("usage: strix-hy4-rank PART1.gguf [PART2.gguf] --ids-file F [--gen N] [--teacher F] [--layers D] "
                                     "[--context C] [--top K] [--timing] [--prompt-rows R] [--dump-logits F] [--profile default|fast] "
@@ -563,6 +700,7 @@ int run(int argc, char** argv) {
               << static_cast<double>(lr.bytes) / 1073741824.0 << " s=" << std::setprecision(2) << lr.seconds << " GiB/s="
               << (lr.seconds > 0 ? static_cast<double>(lr.bytes) / 1073741824.0 / lr.seconds : 0.0) << "\n"
               << lr.queue_line << std::flush;
+    if (gref.on) return run_gate_ref(fwd, prompt, o.verify_rows, gref, dump_path);
     std::unique_ptr<strix::xport::tp_gather::HipPairGather> tpg;
     if (tp_rank >= 0) {  // after the load: the peer may load slower; open_pair waits up to its timeout
         if (tp_rank > 1 || o.prompt_rows == 0U || tp_rates.size() != 2U)

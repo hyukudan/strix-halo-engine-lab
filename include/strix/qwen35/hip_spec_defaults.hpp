@@ -40,6 +40,7 @@ struct HipDenseSpecPlan {
     std::vector<std::string> draft_packs;  // pack id files (comma list of --draft-pack)
     HipDenseCostMode costs = HipDenseCostMode::calibrated;
     std::string cost_kv = "auto";  // context cost of the calibrated / table model (hip_dense_cost_kv)
+    bool device_feed = true;       // MTP chain device feed (MtpChain::set_device_feed; ids bitwise either way)
 };
 
 // `mtp`: "auto" / "" / "off" / "none" / path; `draft_rows`: false = full head (off switch). `has_layer` answers whether
@@ -50,6 +51,7 @@ HipDenseSpecPlan resolve_hip_dense_spec(const std::string& model, const HipDense
     HipDenseSpecPlan p;
     p.costs = args.costs;
     p.cost_kv = args.cost_kv;
+    p.device_feed = args.chain_feed_device;
     const std::string mtp = plain ? std::string("off") : args.mtp;
     const bool draft_rows = args.draft_rows;
     const std::string& draft_packs = args.draft_packs;
