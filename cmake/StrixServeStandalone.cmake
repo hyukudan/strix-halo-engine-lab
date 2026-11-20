@@ -19,6 +19,8 @@ function(strix_add_standalone_serve serve_target handoff_target)
         ${_root}/src/serve/chat_template.cpp ${_root}/src/serve/deepseek_chat.cpp ${_root}/src/serve/engine.cpp
         ${_root}/src/serve/api.cpp ${_root}/src/serve/ollama.cpp ${_root}/src/serve/media.cpp ${_root}/src/serve/request_fields.cpp ${_root}/src/serve/health.cpp
         ${_root}/src/serve/http_server.cpp ${_root}/src/serve/token_memo.cpp
+        # Shared in-flight prefix join (PrefixDirectory), bound by the RTX serve admission.
+        ${_root}/src/serve/prefix_directory.cpp
         # Called by src/serve/api.cpp (deployment routes, preflight view of the status).
         ${_root}/src/serve/deployment.cpp ${_root}/src/preflight.cpp ${_root}/src/linux_uma_observation.cpp
         ${_root}/src/uma_owner_inventory.cpp)
