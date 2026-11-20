@@ -19,6 +19,8 @@
 #include "strix/spec/drafting.hpp"
 #include "xport/hip_pipe_staging.hpp"
 
+#include <hip/hip_runtime.h>
+
 #include <algorithm>
 #include <cstdlib>
 #include <chrono>
@@ -386,9 +388,6 @@ int run(int argc, char** argv) {
     std::vector<std::string> args(argv + 1, argv + argc);
     strix::profile::Inputs inputs;
     strix::profile::take_options(strix::hy4::profile::engine(), args, inputs);
-    auto profile = strix::profile::resolve(strix::hy4::profile::engine(), inputs);
-    for (const auto& e : profile.entries)
-        if (strix::profile::applied(e.status) && e.lever->name == "prompt_rows") o.prompt_rows = static_cast<std::uint32_t>(std::stoul(e.value));
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
         const bool more = i + 1 < args.size();
@@ -428,13 +427,28 @@ int run(int argc, char** argv) {
     }
     // A pair width picked from --window-costs is a prompt_rows setting like --prompt-rows: the resolver stamps it.
     if (std::getenv("HY4_RANK") != nullptr && !rows_explicit) {
-        if (const std::uint32_t picked = strix::hy4::hipbind::pair_window_rows(prompt.size(), window_costs); picked != 0U) {
+        if (const std::uint32_t picked = strix::hy4::hipbind::pair_window_rows(prompt.size(), window_costs); picked != 0U)
             inputs.cli.emplace_back("prompt_rows", std::to_string(picked));
-            profile = strix::profile::resolve(strix::hy4::profile::engine(), inputs);
-        }
     }
-    std::cout << profile.describe() << std::flush;
+    // The regime (device, topology, this prompt's length) selects the qualified FAST cells (strix/profiles/hy4.hpp).
+    namespace hp = strix::hy4::profile;
+    hp::Regime regime;
+    regime.topology = std::getenv("HY4_RANK") != nullptr ? hp::Topology::pair : hp::Topology::one_node;
+    regime.prompt_tokens = prompt.size();
+    {
+        int dev = 0;
+        hipDeviceProp_t prop{};
+        if (hipGetDevice(&dev) == hipSuccess && hipGetDeviceProperties(&prop, dev) == hipSuccess) regime.device = hp::device_of(prop.gcnArchName);
+    }
+    const auto resolved = hp::resolve(regime, inputs);
+    const auto& profile = resolved->resolution;
+    if (const auto* e = resolved->find("prompt_rows"); e != nullptr && !rows_explicit && strix::profile::applied(e->status))
+        o.prompt_rows = static_cast<std::uint32_t>(std::stoul(e->value));
+    std::cout << profile.describe() << "regime " << hp::device_name(regime.device) << " / " << hp::topology_name(regime.topology)
+              << " / prompt " << regime.prompt_tokens << "\n" << std::flush;
     for (const auto& n : profile.notices()) std::cerr << n << '\n';
+    for (const auto& e : profile.entries)
+        if (!e.reason.empty()) std::cerr << e.lever->name << ": " << e.reason << '\n';
     if (o.parts.empty() || prompt.empty())
         throw std::invalid_argument("usage: strix-hy4-rank PART1.gguf [PART2.gguf] --ids-file F [--gen N] [--teacher F] [--layers D] "
                                     "[--context C] [--top K] [--timing] [--prompt-rows R] [--dump-logits F] [--profile default|fast] "
