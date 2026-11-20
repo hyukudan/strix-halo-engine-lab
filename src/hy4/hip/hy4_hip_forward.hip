@@ -1016,9 +1016,10 @@ struct Forward::Impl {
                 a8::enqueue_down_activation_quantize(dq, db, s);
                 a8::enqueue_down_rawdots(dq, db, s);
             }
-            // each expert's down Linear output is its bf16 rounding: read so by the combine (decode_fuse, one launch fewer;
-            // under tensor parallelism the peer's slots arrive unrounded and are rounded on the same read) or stored here
-            if (!decode_fuse) glu::launch_epilogue<glu::Round::bf16>(raw, nullptr, L, K * L, raw, s);
+            // each expert's down Linear output is its bf16 rounding: read so by the combine (decode_fuse one node, one launch
+            // fewer) or stored here. Under tensor parallelism the slots are stored rounded before the MoE join: the exact
+            // BF16 wire (strix/pair/bf16_wire.hpp) carries only bf16 values; the combine's rounding read is then the identity.
+            if (!decode_fuse || par) glu::launch_epilogue<glu::Round::bf16>(raw, nullptr, L, K * L, raw, s);
             if (par) {  // shared gate/up rows of this rank into its slot, one join, the activation halves into act
                 const auto sr = share(c.shared_ff);
                 linear_rows(blk(l, "ffn_gate_shexp.weight"), xn, h, c.shared_ff, sr, g);
