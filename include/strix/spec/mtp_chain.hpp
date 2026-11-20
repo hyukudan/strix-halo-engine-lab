@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <chrono>
 #include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -46,6 +47,16 @@ template <class E>
 concept MtpPrelaunchEngine = MtpFeedEngine<E> && requires(E& e, std::uint32_t* h, std::uint32_t u) {
     e.mtp_feed_read_async(u);
     e.mtp_feed_wait(u, h);
+};
+
+// KV-ONLY ROWS (optional backend hook, detected by MtpKvRowsEngine): Engine::mtp_forward(next_tokens, hidden_dev, rows, pos0,
+// want_top, outputs) where only the trailing `outputs` rows' top / hidden are read. A catch-up flush reads nothing but the
+// last row of its final chunk (d1 + carry), so every other row only has to write the MTP layer's KV: a one-layer block's
+// cache row depends on the row's input alone, so a backend can skip the query side and the FFN of those rows and keep
+// its caches bitwise the full form's (the drafts and every proposal unchanged). Engines without the hook run every row.
+template <class E>
+concept MtpKvRowsEngine = requires(E& e, const std::uint32_t* t, const float* x, std::uint32_t u) {
+    e.mtp_forward(t, x, u, u, true, u);
 };
 
 template <class Engine, class Dev>
@@ -222,7 +233,7 @@ private:
         while (off < total) {
             const std::uint32_t n = std::min<std::uint32_t>(rows_max_, total - off);
             const bool final_chunk = off + n == total;  // only the last row's draft is needed: earlier chunks skip lm_head
-            const auto m = e_.mtp_forward(next_.data() + off, ring_ + std::size_t(off) * hid_, n, mtp_pos_, final_chunk);
+            const auto m = forward_rows(next_.data() + off, ring_ + std::size_t(off) * hid_, n, mtp_pos_, final_chunk);
             ++calls_;
             rows_ += n;
             mtp_pos_ += n;
@@ -242,6 +253,11 @@ private:
             }
         }
         next_.clear();
+    }
+    // A flush chunk: the final chunk's last row is the only output read (outputs 1), earlier chunks read none (outputs 0).
+    MtpOut forward_rows(const std::uint32_t* next, const float* hidden, std::uint32_t n, std::uint32_t pos0, bool final_chunk) {
+        if constexpr (MtpKvRowsEngine<Engine>) return e_.mtp_forward(next, hidden, n, pos0, final_chunk, final_chunk ? 1U : 0U);
+        else return e_.mtp_forward(next, hidden, n, pos0, final_chunk);
     }
     std::uint32_t step(std::uint32_t input_token, std::uint32_t pos, bool want_top) {
         const auto m = e_.mtp_forward(&input_token, carry_, 1, pos, want_top);
@@ -271,6 +287,15 @@ private:
     std::uint64_t calls_ = 0, rows_ = 0, drafts_ = 0, reads_ = 0, prelaunched_ = 0;
     bool feed_ = true;
     double draft_wall_ms_ = 0.0;
+};
+
+// Dev glue for an engine that owns its device memory and stream through three members:
+//   float* alloc_f32(std::size_t floats), void free_f32(float*), void copy_f32_async(float* dst, const float* src, std::size_t floats)
+// (async device -> device on the engine's stream). Any backend whose engine has them binds MtpChain<Engine, EngineChainDev>.
+struct EngineChainDev {
+    template <class E> static float* alloc(E& e, std::size_t n) { return e.alloc_f32(n); }
+    template <class E> static void release(E& e, float* p) { e.free_f32(p); }
+    template <class E> static void copy(E& e, float* d, const float* s, std::size_t n) { e.copy_f32_async(d, s, n); }
 };
 
 }  // namespace strix::spec

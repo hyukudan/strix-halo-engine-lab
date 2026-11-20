@@ -13,8 +13,10 @@
 // list (shared pool / score scan / G6 select / sparse flash List). Below 2048 the list is the causal prefix.
 #include "hy4/ref/hy4_host_ref.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -29,6 +31,7 @@ struct ForwardOptions {
     std::uint32_t context = 4096;              // positions this forward may hold
     std::uint32_t prompt_rows = 0;             // batched prompt window (rows per launch, multiple of 8, >= 16); 0 = none
     std::uint32_t verify_rows = 0;             // rows of a verify pass (forward_rows, 1..8); rings sized for them; 0 = none
+    bool nextn = false;                        // also load the pack's next-token (MTP) block: nextn_rows() (whole-model rank)
 };
 
 struct LoadReport {
@@ -101,6 +104,48 @@ public:
     [[nodiscard]] const std::vector<float>& rows_logits() const noexcept;
     void commit_rows(std::uint32_t k);
     void set_rows_expert_union(bool on) noexcept;  // routed experts of a window read once (bitwise); A/B aid of the bench
+    // Device [R][hidden] rows of output_norm(hidden) (the head's input) of the last forward_rows pass; valid until the next
+    // pass or the next nextn_rows call (its rows form uses the verify workspace). The MTP teacher input of the committed rows.
+    [[nodiscard]] const float* rows_hidden() const noexcept;
+
+    // ---- next-token (MTP) block (options.nextn, whole-model rank; GGUF block config().layers), host oracle
+    // HostRef::nextn_step. Rows r = 0 .. R-1 at block positions pos0 + r, its own K/V (positions < pos0 cached by earlier
+    // calls; a call rewrites every cache row it reads at or after pos0, so a redo at the same positions replaces a
+    // rejected chain):
+    //   x = eh_proj(cat(enorm(e(tokens[r])), hnorm(hidden[r]))); x = x + attn(L, attn_norm(x)); x = x + ffn(L, ffn_norm(x))
+    //   post = shared_head_norm(x)  (the head's input; a chain step feeds it back as `hidden`)
+    // tokens: host [R]; hidden: device [R][hidden]. want_top: the shared device greedy id of the LAST row's logits (first
+    // max, lowest id on ties) at top[R - 1]; the other entries are 0. The block's numerics are those of the pack (BF16
+    // weights as stored, routed experts by per-expert dense rows): class FAST, a drafter only (the verify decides every id;
+    // never touches the target's caches, position or token history). Synchronises.
+    // Rows form (options.verify_rows >= 2): the call's rows run in chunks of up to verify_rows through the verify rows form
+    // (every non-expert weight read once per chunk; experts per row), each row bitwise equal to the per-row loop;
+    // set_nextn_row_loop(true) runs one row at a time (the identity reference of the device check).
+    struct NextnOut {
+        const std::uint32_t* top = nullptr;   // device [R]
+        const float* hidden_pre = nullptr;    // device [R][hidden]: x before shared_head_norm
+        const float* hidden_post = nullptr;   // device [R][hidden]: shared_head_norm(x)
+    };
+    static constexpr std::uint32_t kNextnRows = 32;  // widest nextn_rows call
+    [[nodiscard]] bool has_nextn() const noexcept;
+    void set_nextn_row_loop(bool on) noexcept;
+    // outputs = trailing rows whose top / hidden the caller reads (default all). Rows [0, rows - outputs) only write the
+    // block's caches (bitwise the full form's: the latent row and the indexer keys depend only on the row's input); their
+    // pre / post rows are unspecified and their top is 0. want_top needs outputs >= 1. The row loop computes every row.
+    static constexpr std::uint32_t kAllRows = ~0U;
+    NextnOut nextn_rows(const std::uint32_t* tokens, const float* hidden, std::uint32_t rows, std::uint32_t pos0, bool want_top,
+                        std::uint32_t outputs = kAllRows);
+    // Logits of the last nextn_rows row (host copy; want_top must have been set): the device-vs-oracle check.
+    [[nodiscard]] const std::vector<float>& nextn_logits();
+    // prefill() reports every prompt row's output_norm(hidden) (device rows, valid during the call) with its first position:
+    // the MTP teacher input of the prompt. Empty function = off (the default; no extra work).
+    void set_prompt_hidden(std::function<void(const float* rows, std::uint32_t p0, std::uint32_t n)> sink);
+    // Device glue of the shared MTP chain (strix/spec/mtp_chain.hpp EngineChainDev) and a synchronising id read.
+    float* alloc_f32(std::size_t floats);
+    void free_f32(float* p) noexcept;
+    void copy_f32_async(float* dst, const float* src, std::size_t floats);
+    void read_ids(const std::uint32_t* device, std::uint32_t n, std::uint32_t* host);
+    void read_f32(const float* device, std::size_t floats, float* host);  // synchronises (taps / checks)
 
     void set_timing(bool on) noexcept;  // per-stage device sync for StepTimes (a first-receipt aid, not a tuned path)
     [[nodiscard]] const StepTimes& times() const noexcept;
