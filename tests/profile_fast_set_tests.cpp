@@ -304,7 +304,7 @@ int main() {
         check_gates("minimax-pair", md::profile_table, {}, mm_rows);
         check_gates("qwen-hip", strix::qwen::profile::table, {});
         check_gates("qwen-cuda", strix::qwen::cuda_profile::table, {});
-        check_gates("qwen35-hip-dense", strix::qwen35::hip_profile::table, {});
+        check_gates("qwen35-hip-dense", strix::qwen35::hip_profile::table, strix::qwen35::hip_profile::kFastGates);
     }
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
