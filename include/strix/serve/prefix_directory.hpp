@@ -57,6 +57,11 @@ public:
     // Ties prefer a sealed entry, then the older one.
     PrefixMatch lookup(const PrefixKey& key, std::span<const std::uint32_t> tokens) const;
 
+    // Every in-flight entry of the same identity whose usable length (common prefix, one suffix token left to the
+    // caller) is at least min_tokens, ascending by entry. For families whose join point is not monotone in the common
+    // length (a boundary certified against each producer's own plan), the caller chooses among them.
+    std::vector<PrefixMatch> inflight_matches(const PrefixKey& key, std::span<const std::uint32_t> tokens) const;
+
     // Registers a prefill in flight on lane. Returns 0 when the prompt is shorter than min_tokens.
     // Entry numbers are never reused.
     std::uint64_t announce(const PrefixKey& key, std::span<const std::uint32_t> tokens, std::uint32_t lane);

@@ -77,6 +77,11 @@ ticket):
 The RTX DeepSeek prefill service (`strix-cuda-ds41-prefill-service`) is measured with
 `tools/ds41_prefill_service_client.py`. The routes themselves are described in [discrete-gpu.md](discrete-gpu.md).
 
+Dense 4-bit GEMM against the vendor library (HIP): `tools/hip_dense_iu4_probe.hip <rows> cmp in:n ...` times the
+production IU4 W4A16 entries (small-M core up to 16 rows, the tall WMMA core above) and
+`tools/hipblaslt_gemm_yardstick.cpp` times hipBLASLt (FP16 / BF16, and asks whether an int4-weight solution exists) at
+the same shapes, so the two columns compare the same product.
+
 The decode-class prompts are in `scripts/bench/prompts/classes/`. Drafting acceptance differs by an order of
 magnitude between prose, a code edit and CSV-to-JSON, so served decode is always reported per class.
 

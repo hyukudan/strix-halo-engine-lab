@@ -491,7 +491,9 @@ double device_wall(std::uint32_t rows, double ctx, double shared = 1.0, double k
     return 12.2 + (rows >= 9 ? 1.1 : 0.0) + (rows >= 17 ? 4.0 : 0.0) + kappa * (ctx / 1024.0) * (1.0 + shared * (r - 1.0)) + 0.08;
 }
 // mode: spec::set_context_cost value ("off" = the previous context-blind seeds, "online" = the default fit, "0.0699" = fixed).
-FrontierRun replay_ctx(const CtxCase& c, const std::string& mode, std::uint64_t seed, double shared = 1.0, int passes = 600) {
+// wall_scale: the device runs this much slower (a warmer run of the same binary); ks: the chosen k per pass.
+FrontierRun replay_ctx(const CtxCase& c, const std::string& mode, std::uint64_t seed, double shared = 1.0, int passes = 600,
+                       double wall_scale = 1.0, std::vector<std::uint32_t>* ks = nullptr) {
     auto config = form(-1);
     config.learn_costs = false;  // BlockConfig::fixed_costs
     sp::set_context_cost(config, mode);
@@ -499,7 +501,7 @@ FrontierRun replay_ctx(const CtxCase& c, const std::string& mode, std::uint64_t 
     for (std::uint32_t r = 1; r <= 32; ++r) a.seed_cost(r, 13.30 + 0.113 * double(r - 1));
     std::vector<double> seeded_draft;
     for (std::uint32_t k = 1; k <= 15; ++k) seeded_draft.push_back(0.494 * double(k));
-    const auto wall = [&](std::uint32_t rows) { return device_wall(rows, c.ctx, shared); };
+    const auto wall = [&](std::uint32_t rows) { return wall_scale * device_wall(rows, c.ctx, shared); };
     Rng rng{seed};
     FrontierRun run;
     std::vector<std::uint32_t> emitted;
@@ -515,6 +517,7 @@ FrontierRun replay_ctx(const CtxCase& c, const std::string& mode, std::uint64_t 
             ++run.model;
             run.k_sum += d.k;
         }
+        if (ks) ks->push_back(d.source == sp::Source::model ? d.k : 0U);
         const double draft = d.source == sp::Source::model ? c.draft * double(d.k) : 0.0;
         emitted.assign(acc + 1, 1U);
         a.observe({d.source, 0, d.k, acc, d.rows, wall(d.rows), draft, in.context}, emitted);
@@ -707,6 +710,27 @@ void cost_fit_tests() {
         };
         const auto off = run("off"), on = run("online");
         SP_CHECK(off.tokens == on.tokens && off.ms == on.ms && off.k_sum == on.k_sum, "walls == seeds: online must decide as off");
+    }
+    // Exactness gates that compare k (K/V-only vs full MTP catch-up, close_spec w0 / w0k): two runs of one binary differ
+    // only in their walls (w0 17.185 vs w0k 17.281 ms per step, +0.56 %). off / fixed: the k sequence is a function of the
+    // seeds and the acceptance history alone, whatever the walls; online: priced from the walls, it may move at 28K
+    // (identified context), so such a gate must run off / fixed.
+    {
+        const auto& c = ctx_cases[0];  // code 28K
+        bool online_moved = false;
+        for (const double scale : {1.0056, 1.02, 1.05}) {
+            for (const char* mode : {"off", "0.0699"}) {
+                std::vector<std::uint32_t> a, b;
+                replay_ctx(c, mode, 11, 1.0, 300, 1.0, &a);
+                replay_ctx(c, mode, 11, 1.0, 300, scale, &b);
+                SP_CHECK(!a.empty() && a == b, "%s: k sequence moved with walls x%.4f", mode, scale);
+            }
+            std::vector<std::uint32_t> a, b;
+            replay_ctx(c, "online", 11, 1.0, 300, 1.0, &a);
+            replay_ctx(c, "online", 11, 1.0, 300, scale, &b);
+            online_moved = online_moved || a != b;
+        }
+        SP_CHECK(online_moved, "online: walls x1.0056..1.05 never moved k (the gate's premise no longer holds; recheck)");
     }
     // Learned costs (DS41 dspark, Gemma4, HIP 'learned'): measured walls price windows; the fit never applies there.
     {
@@ -1062,9 +1086,128 @@ void frontier_tests() {
         a.observe({d.source, 0, d.k, 1, d.rows, 20.0, 0.0}, std::vector<std::uint32_t>(2, 1U));
     }
 }
+// Exploration probe charge (ArbiterConfig::charge_probe). CUDA dense 27B sub15d shape: seeds 13.30 + 0.113 (r - 1) ms,
+// K/V 0.0699 ms per verify row per 1,024 positions (28K receipt), draft 0.824 ms per position, windows up to 16 rows (k 15).
+// The device is the priced model itself (fixed K/V term) and acceptance is a deterministic draw at survival p per depth.
+struct ProbeRun {
+    std::vector<std::uint32_t> ks;  // k of every pass (0 = serial)
+    double tokens = 0.0, ms = 0.0, serial_ms = 0.0, budget = 0.0, max_excess = -1e300;
+    std::uint32_t probes = 0, max_probe_k = 0, min_probe_k = ~0U;
+};
+ProbeRun probe_run(bool charge, std::uint64_t ctx, double p, int passes) {
+    sp::ArbiterConfig config;
+    config.windows = {1, 2, 3, 4, 6, 8, 12, 16};
+    config.learn_costs = false;
+    config.row_kv_ms_per_kpos = 0.0699;
+    config.charge_probe = charge;
+    sp::Arbiter a(config);
+    for (std::uint32_t r = 1; r <= 16; ++r) a.seed_cost(r, 13.30 + 0.113 * double(r - 1));
+    const std::vector<double> survival(15, p);
+    a.seed_model_survival(survival);
+    sp::StepInput in;
+    in.model_max_k = 15;
+    std::vector<double> draft_ms;
+    for (std::uint32_t i = 1; i <= 15; ++i) draft_ms.push_back(0.824 * double(i));
+    in.model_draft_ms = draft_ms;
+    in.context = ctx;
+    ProbeRun run;
+    run.serial_ms = a.verify_ms(1, ctx);
+    run.budget = config.frontier_loss * double(config.probe_every) * run.serial_ms;
+    std::uint64_t s = 0x9E3779B97F4A7C15ULL;
+    const auto draw = [&s] {
+        s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+        return double(s >> 11) * 0x1.0p-53;
+    };
+    for (int i = 0; i < passes; ++i) {
+        const auto d = a.decide(in);
+        run.ks.push_back(d.source == sp::Source::serial ? 0U : d.k);
+        if (d.source == sp::Source::serial) {
+            run.tokens += 1.0;
+            run.ms += run.serial_ms;
+            a.observe({sp::Source::serial, 0, 0, 0, 1, run.serial_ms, 0.0, ctx}, {});
+            continue;
+        }
+        std::uint32_t acc = 0;
+        while (acc < d.k && draw() < p) ++acc;
+        const double v = a.verify_ms(d.rows, ctx), dr = 0.824 * double(d.k);
+        run.tokens += double(acc + 1U);
+        run.ms += v + dr;
+        if (d.probe) {
+            ++run.probes;
+            run.max_probe_k = std::max(run.max_probe_k, d.k);
+            run.min_probe_k = std::min(run.min_probe_k, d.k);
+            if (d.k > 1) run.max_excess = std::max(run.max_excess, d.expected_ms - d.expected_tokens * run.serial_ms);
+        }
+        a.observe({sp::Source::model, 0, d.k, acc, d.rows, v, dr, ctx}, {});
+    }
+    return run;
+}
+
+void probe_charge_tests() {
+    // Short context (2K, serial wins at p 0.05): the deepest probe prices below its budget, so the charged arbiter makes
+    // the previous decisions pass for pass.
+    {
+        const auto on = probe_run(true, 2048, 0.05, 320), off = probe_run(false, 2048, 0.05, 320);
+        SP_CHECK(on.ks == off.ks, "short context: the charged probe changed a decision");
+        SP_CHECK(off.probes >= 8 && off.max_probe_k == 15 && on.max_probe_k == 15, "short context: deep probes (%u, k %u)",
+                 off.probes, off.max_probe_k);
+    }
+    // 128K (serial wins at p 0.4: 22.2 ms vs k 1 at 32.1 ms for 1.4 tokens): the previous probe runs k 15 (~170 ms); the
+    // charged one stays within its budget (frontier_loss x probe_every serial passes) and keeps >= 95 % of serial's rate.
+    {
+        const auto on = probe_run(true, 131072, 0.4, 640), off = probe_run(false, 131072, 0.4, 640);
+        const double serial_rate = 1.0 / on.serial_ms, rate_on = on.tokens / on.ms, rate_off = off.tokens / off.ms;
+        SP_CHECK(off.max_probe_k == 15, "128K: the previous probe runs the deepest k (%u)", off.max_probe_k);
+        SP_CHECK(on.probes >= 16 && on.max_probe_k < 15 && on.min_probe_k >= 1, "128K: charged probes %u, k %u..%u", on.probes,
+                 on.min_probe_k, on.max_probe_k);
+        SP_CHECK(on.max_excess <= on.budget + 1e-9, "128K: priced probe excess %.3f ms > budget %.3f ms", on.max_excess, on.budget);
+        SP_CHECK(rate_on > rate_off && rate_on >= 0.95 * serial_rate,
+                 "128K: charged %.2f tok/s, previous %.2f tok/s, serial %.2f tok/s", 1000.0 * rate_on, 1000.0 * rate_off,
+                 1000.0 * serial_rate);
+        std::printf("probe charge 128K p 0.4: serial %.2f tok/s, previous probe %.2f (k %u), charged %.2f (k %u..%u), %u probes\n",
+                    1000.0 * serial_rate, 1000.0 * rate_off, off.max_probe_k, 1000.0 * rate_on, on.min_probe_k, on.max_probe_k,
+                    on.probes);
+    }
+}
+
 } // namespace
 
+// Shared wide-window rule (strix/spec/wide_window.hpp): kept rows of a miss, break-even span acceptance per keep
+// stride, the measured HIP table (32 on, 16 off) and the CUDA tables' decisions (cap 16 on, cap 8 off).
+void wide_window_tests() {
+    // a miss after k accepted proposals keeps k rows per row, k rounded down to the stride, none all-or-nothing
+    for (std::uint32_t k = 0; k < 31; ++k) {
+        SP_CHECK(sp::wide_window_kept(k, 1) == k, "per-row keep at %u", k);
+        SP_CHECK(sp::wide_window_kept(k, 8) == k / 8 * 8, "stride-8 keep at %u", k);
+        SP_CHECK(sp::wide_window_kept(k, 0) == 0, "all-or-nothing keeps nothing at %u", k);
+    }
+    sp::WideWindowTable hip;
+    hip.narrow_rows = 8; hip.narrow_ms = 78.2; hip.wide = {{32, 166.7}, {16, 142.0}}; hip.keep_stride = 0; hip.full_accept = 0.60;
+    const double p32 = sp::wide_window_break_even(hip.wide[0], hip), p16 = sp::wide_window_break_even(hip.wide[1], hip);
+    SP_CHECK(std::fabs(p32 - 166.7 / (32 * 78.2 / 8)) < 1e-12 && std::fabs(p16 - 142.0 / (16 * 78.2 / 8)) < 1e-12,
+        "all-or-nothing break-even = wide ms / narrow cost of the span (%f %f)", p32, p16);
+    std::string why;
+    const auto sizes = sp::wide_window_sizes(hip, &why);
+    SP_CHECK(sizes == std::vector<std::uint32_t>{32}, "the measured HIP table admits 32 only (%s)", why.c_str());
+    // keeping the accepted prefix lowers the break-even: per row < stride 8 < all-or-nothing
+    auto keep = hip;
+    keep.keep_stride = 8; const double s8 = sp::wide_window_break_even(hip.wide[0], keep);
+    keep.keep_stride = 1; const double s1 = sp::wide_window_break_even(hip.wide[0], keep);
+    SP_CHECK(s1 < s8 && s8 < p32 && s8 < 0.3, "kept rows lower the break-even (%f %f %f)", s1, s8, p32);
+    // a perfect copy source (every span accepted) admits every size that wins when fully accepted
+    auto perfect = hip; perfect.full_accept = 1.0;
+    SP_CHECK((sp::wide_window_sizes(perfect) == std::vector<std::uint32_t>{32, 16}), "a perfect source admits 32 and 16");
+    // slower when fully accepted: never admitted, whatever the acceptance
+    auto slow = perfect; slow.wide = {{16, 160.0}};
+    SP_CHECK(sp::wide_window_sizes(slow).empty() && !sp::wide_window_full_pays(16, 160.0, 8, 78.2), "a slower wide window stays off");
+    // CUDA sm_120 tables (qwen_cohort_plan.hpp copy_wide_measured): cap 16 -> 29.2 ms on, cap 8 -> 62.5 ms off
+    SP_CHECK(sp::wide_window_full_pays(16, 29.2, 8, 8.55 + 1.1 * 8) && !sp::wide_window_full_pays(16, 62.5, 8, 8.55 + 1.1 * 8),
+        "the CUDA decisions are unchanged");
+    SP_CHECK(!sp::wide_window_full_pays(8, 1.0, 8, 78.2), "a window not wider than the narrow one is never wide");
+}
+
 int main() {
+    wide_window_tests();
     index_tests();
     copy_tests();
     arbiter_tests();
@@ -1075,6 +1218,7 @@ int main() {
     context_pricing_tests();
     cost_fit_tests();
     context_gate_tests();
+    probe_charge_tests();
     std::printf("PASS strix-spec-drafting-tests\n");
     return 0;
 }

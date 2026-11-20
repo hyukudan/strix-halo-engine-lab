@@ -6,6 +6,7 @@
 
 #include "strix/ds41_formats.hpp"
 #include "strix/ds41_layer.hpp"
+#include "strix/head_argmax.hpp"
 #include "strix/ds41_moe.hpp"
 
 #include <algorithm>
@@ -533,7 +534,8 @@ void test_argmax(cudaStream_t s) {
     logits[2U * vocab + 7] = NAN;
     auto dl = to_device(logits);
     c::DeviceBuffer<d::ArgmaxCandidate> out(rows);
-    c::enqueue_argmax({dl.get(), rows, vocab, 0, 0, out.get()}, s);
+    c::DeviceBuffer<std::uint8_t> argmax_partial(strix::head_argmax::workspace_bytes(rows));
+    c::enqueue_argmax({dl.get(), rows, vocab, 0, 0, out.get(), argmax_partial.get()}, s);
     auto got = out.download();
     for (std::uint32_t r = 0; r < rows; ++r) {
         const auto s0 = d::vocab_slice(vocab, 2, 0), s1 = d::vocab_slice(vocab, 2, 1);

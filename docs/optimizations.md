@@ -2320,6 +2320,24 @@ change acceptance, not committed target-greedy tokens. Compare within one load w
   28K x 400 tokens, one run per arm, token ids equal: code 121.54 -> 176.56 tok/s (verify 28.84 -> 19.30 ms per step),
   reasoning 130.54 -> 194.64, prose 101.29 -> 135.84.
 
+<a id="qwen27-cuda-mtp-kv-catchup"></a>
+
+### Qwen 27B CUDA spec: K/V-only MTP catch-up
+
+**Engine:** `qwen-rtx` (27B dense, CUDA: `strix-cuda-qwen35-spec`). **Control:** `--mtp-catchup kv|full`. **Default:**
+`kv` where the engine has the hook. **Home:** shared (host spec layer `include/strix/spec/mtp_chain.hpp`: the
+`MtpKvEngine` concept and the catch-up policy); the CUDA Qwen adapter supplies `mtp_kv` (`src/qwen35/cuda/engine.cu`).
+
+- The MTP chain catches up on committed positions lazily. A catch-up chunk whose block output and draft are never read
+  needs only the MTP layer's K/V; with the hook it issues the same K and V projections, in the same order and with the
+  same operands, and skips q, attention, o_proj, MLP, the MTP norm and the head. K/V bits and drafts are unchanged.
+- Engines without `mtp_kv` are unchanged (concept + `if constexpr`). HIP runs the same shared chain and adopts the
+  form by adding `mtp_kv` to its adapter.
+- Measured (EXACT, RTX PRO 6000 Blackwell, 28,187-token prompt, `--prefill-route large`, one pair): ids, steps and the
+  k histogram equal to `full`; MTP feed 1.960 s -> 0.091 s; decode unchanged (121.78 vs 121.39 tok/s).
+  Not yet measured: the default `windows` prompt route.
+- **Off switch:** `--mtp-catchup full`.
+
 <a id="rtx-kernels"></a>
 
 ### Decode kernel bundle
@@ -5097,11 +5115,11 @@ A row routes to an expert at most once, so a step of at most 16 rows gives every
 Those launches of the tensor-core GSQ expert kernels bind one accumulator block instead of four. The freed registers
 hold a three-group ring of weight fields in flight, where the tile form keeps a one-group lookahead.
 
-- **Preconditions:** CUDA Qwen MoE with `gsq_bf16_mma` experts (the FAST expert arithmetic); steps of at most 16 rows (decode, MTP verify windows, and a prefill block of at most 16 rows: a short prompt or a tail block). Prefill blocks of more than 16 rows keep the tile form; the exact profile runs no tensor-core experts.
+- **Preconditions:** CUDA Qwen MoE with `gsq_bf16_mma` experts (the FAST expert arithmetic) or `gsq_i8_turbo` experts (the TURBO int8 arithmetic, same trait and ring; measured on the device without a model, see Measured gain; the nested TURBO profile runs FAST's experts in decode windows, so this form runs under `--profile turbo --expert-turbo-rows off` only); steps of at most 16 rows (decode, MTP verify windows, and a prefill block of at most 16 rows: a short prompt or a tail block). Prefill blocks of more than 16 rows keep the tile form; the exact profile runs no tensor-core experts.
 - **Automatic selection:** On in every profile (an absent lever row = on); the launch picks the form from the step's row count. A wider tile under the decode form fails closed.
 - **Exactness evidence:** Same MMAs and scale FMAs in the same order for every output (bitwise the tile form). The tile form compiles to the previous instructions for every type except the IQ2_S project kernel (schedule only, same floating-point opcode multiset). Greedy ids equal on prose, edit and json; teacher-forced FAST logits of the decode form identical to the tile form (`--expert-decode-tile off`) on 645 rows of five contents (prose, edit, json, code, an 8K prompt). Contract and bundle id unchanged; `qwen_cuda_profile_host_test` checks the switch, serve == CLI and the unchanged id.
 - **Off switch:** `--expert-decode-tile off`; `STRIX_QRTX_EXPERT_DECODE_TILE=0`
-- **Measured gain:** RTX PRO 6000 600 W, FAST served decode e2e: prose 127.22 -> 137.6 / 138.98, edit 342.37 -> 380.98 / 378.97, json 287.14 -> 316.32 / 317.26 tok/s (one run before, two runs after).
+- **Measured gain:** RTX PRO 6000 600 W, FAST served decode e2e: prose 127.22 -> 137.6 / 138.98, edit 342.37 -> 380.98 / 378.97, json 287.14 -> 316.32 / 317.26 tok/s (one run before, two runs after). int8 form (`gsq_i8_turbo`, no model: routed-expert calls per storage-type pair, weighted by the model's layer mix to a 48-layer step, same card): int8 decode form vs FAST BF16 decode form -0.05 / -0.32 / -1.26 ms per step at 1 / 4 / 16 rows, vs the int8 tile form -0.52 / -1.49 / -6.87 ms; every decode form bitwise its tile form on the device. Not yet measured: end-to-end decode with int8 windows.
 - **Implementation / evidence:** [kernels](../src/cuda/core/moe_a8_mma.cuh), [form constants](../src/cuda/core/native_mma.hpp), [lever row](../include/strix/profiles/qwen_cuda.hpp)
 
 <a id="qwen-rtx-turbo-experts"></a>
@@ -5130,7 +5148,7 @@ and MTP verify windows and smaller blocks run the FAST BF16 experts, so TURBO de
 One word selects every FAST lever qualified for the run's regime (weights source, route, prompt length), from the data table
 `include/strix/profiles/qwen_dense_cuda.hpp`, through the shared resolver (`strix::profile::resolve`). Both CLIs resolve the same table.
 
-- **Preconditions:** `fast` applies `--prefill-arith fast4` + `--prefill-gdn chunk16` on the decode CLI's large prefill with `--turbo-weights onfly|converted`, and `--prefill-attn8 on` from 32,768 prompt tokens. On the spec CLI's decode windows with `--turbo-weights onfly|converted` it applies `--split-k fast` ([split-K FAST](#qwen-dense-cuda-splitk-fast)). Every other regime (exact pack, native NVFP4; split-K on the decode CLI, where `fast` already applies FAST4 and that combination has no gate) keeps its levers pending and runs exact. `turbo` is refused.
+- **Preconditions:** `fast` applies `--prefill-arith fast4` + `--prefill-gdn chunk16` on the decode CLI's large prefill with `--turbo-weights onfly|converted`, and `--prefill-attn8 on` from 8,192 prompt tokens. On the spec CLI's decode windows with `--turbo-weights onfly|converted` it applies `--split-k fast` ([split-K FAST](#qwen-dense-cuda-splitk-fast)). Every other regime (exact pack, native NVFP4; split-K on the decode CLI, where `fast` already applies FAST4 and that combination has no gate) keeps its levers pending and runs exact. `turbo` is refused.
 - **Automatic selection:** none outside `--profile fast`; `quality` has no rows here and equals `default`.
 - **Fallback notice:** the `profile:` block of the effective config lists each lever as `profile` (with the identity it turns on), `explicit-cli`, `off` or `pending` with the regime it needs.
 - **Exactness evidence:** `exact` leaves every option and the effective config unchanged (host test `strix-qwen35-dense-profile-host-tests`). FAST levers carry their own identities (`-pf-fast4`, `-gdnc16`, `-a8`, `-skf1`) and their gates: FAST4 + chunk16 8K / 32K passed; attn8 32K passed; split-K FAST passed.
@@ -5626,3 +5644,25 @@ decodes alone (a layer split only serialises one-row decode).
   placement line, the relayed state size and time, decode tok/s and ids equal to the one-node reference, for both
   settings.
 - **Measured gain:** not measured on this tree.
+
+<a id="hy4-rows-expert-union"></a>
+
+## Hy4-flash verify rows: routed experts of the window read once
+
+**Engine:** `hy4`. **Control:** `STRIX_HY4_ROWS_EXPERT_UNION`. **Default:** on.
+
+A speculative verify window of R rows (R <= 8) runs the step's stages over all rows in one pass; its routed experts
+read each row's 16 experts separately, so the per-row cost of a window was one more row of expert weights (~14 ms per
+row on one node). The window's experts now go through the union rows form of the shared Q4_K x A8 MoE family: the
+distinct experts of the window are listed once, each is read once, and the rows that chose it are computed one after
+another with the single-row instruction sequence.
+
+- **Preconditions:** Hy4-flash verify rows (`strix-hy4-rows`, the speculative decode path), top-16 of 512 experts, Q4_K
+  gate / up with a K-quant down (the C1 envelope of the family).
+- **Exactness evidence:** Bitwise by construction; on device, rows logits equal the step's logits for 30 / 30 rows
+  (R = 1 / 2 / 4 / 8, per-row and union arms), and speculative decode ids equal plain greedy ids (300 ids, code and prose).
+- **Off switch:** `STRIX_HY4_ROWS_EXPERT_UNION=0` keeps the per-row expert loop.
+- **Measured gain:** One node, verify window, 10-rep alternated medians: R2 73.7 -> 68.7 ms, R4 111.1 -> 91.6 ms, R8
+  187.3 -> 137.5 ms. Speculative decode with the shared copy proposer, 300 ids, code prompt: plain 16.65 -> 20.16 tok/s
+  (E 1.37 tokens per pass); prose: no proposals, 17.06 -> 17.06 tok/s.
+- **Implementation / evidence:** [union form](../src/hip_moe_q4k_a8_probe.hip), [plan](../include/strix/moe/expert_union.hpp), [binding](../src/hy4/hip/hy4_hip_rows.inc)
