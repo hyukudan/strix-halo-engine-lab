@@ -160,10 +160,20 @@ void check_stage_windows() {
     CHECK(hb::pair_window_rows(4096U, unusable) == 0U);
     // The interleaved pair plan over the measured cost (shared planner): narrower windows on short prompts, more stages
     // per rank and wider windows on long ones; an explicit width keeps it; one window keeps the two-stage cut.
-    CHECK(hb::pair_stage_plan(2048U, 42U).choice.chunk == 1024U);
-    CHECK(hb::pair_stage_plan(4096U, 42U).choice.chunk == 1024U && hb::pair_stage_plan(4096U, 42U).map.virtual_stages() >= 3U);
-    CHECK(hb::pair_stage_plan(8192U, 42U).choice.chunk == 2048U && hb::pair_stage_plan(8192U, 42U).map.virtual_stages() == 5U);
-    CHECK(hb::pair_stage_plan(32768U, 42U).choice.chunk == 4096U && hb::pair_stage_plan(32768U, 42U).map.virtual_stages() == 5U);
+    // Picks of the receipts' fit: 2K rows 1024 v 2, 4K 1024 v 4, 8K 2048 v 4, 32K 4096 v 4.
+    CHECK(hb::pair_stage_plan(2048U, 42U).choice.chunk == 1024U && hb::pair_stage_plan(2048U, 42U).map.virtual_stages() == 2U);
+    CHECK(hb::pair_stage_plan(4096U, 42U).choice.chunk == 1024U && hb::pair_stage_plan(4096U, 42U).map.virtual_stages() == 4U);
+    CHECK(hb::pair_stage_plan(8192U, 42U).choice.chunk == 2048U && hb::pair_stage_plan(8192U, 42U).map.virtual_stages() == 4U);
+    CHECK(hb::pair_stage_plan(32768U, 42U).choice.chunk == 4096U && hb::pair_stage_plan(32768U, 42U).map.virtual_stages() == 4U);
+    // 8K, 2048 rows: v = 5 sends two 172 ms frames per 311 ms stage over the one link (measured seal waits 0.3-0.6 s,
+    // 3.7 % slower than v = 3): the model prices it above v = 3 and v = 4.
+    {
+        const auto c8 = hb::kPairPipeCost.at(8192U);
+        const double v3 = strix::pair::interleaved_wall_ms(8192U, 2048U, 3U, c8);
+        const double v4 = strix::pair::interleaved_wall_ms(8192U, 2048U, 4U, c8);
+        const double v5 = strix::pair::interleaved_wall_ms(8192U, 2048U, 5U, c8);
+        CHECK(v5 > v3 && v4 < v3);
+    }
     CHECK(hb::pair_stage_plan(8192U, 42U, 1024U).choice.chunk == 1024U);
     CHECK(hb::pair_stage_plan(1000U, 42U).choice.chunk == 0U && hb::pair_stage_plan(1000U, 42U).map.text() == "0,21,42");
 }

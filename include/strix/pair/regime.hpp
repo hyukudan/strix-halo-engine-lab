@@ -66,6 +66,7 @@ struct PipelineCost {
     // Interleaved virtual stages (every stage boundary is one hop between the ranks):
     double hop_latency_ms = 0.0;     // per frame, on top of the transfer (seam_ms is the one-off first frame)
     double hop_ms_per_row = 0.0;     // per frame row (activation bytes / link rate)
+    bool one_link = false;           // both directions' frames share one link rate (false: one link per direction)
     double tp_ms_per_row = 0.0;      // resident tensor-parallel route of a split-weight pair (0: none)
     double min_gain = 0.03;          // run noise: the layout-aware rule pipelines only if it wins by this fraction
 };
@@ -141,10 +142,13 @@ inline constexpr std::uint64_t max_stage_events = 1U << 20U;
     return base * rounds + (boundary / 2U) * size + (chunk - base);
 }
 // Deterministic event simulation of that order: stage time P(n / C) / 2v (balanced chunks and stages); hop =
-// hop_latency_ms + hop_ms_per_row x rows on one FIFO link per direction; the producer of frame q waits until
+// hop_latency_ms + hop_ms_per_row x rows on one FIFO link per direction, or with `one_link` on one link that carries
+// both directions (a frame takes the link's earliest free gap at or after its ready time: a route whose two directions
+// share one copy path stalls once the two ranks' frames together outlast a stage); the producer of frame q waits until
 // frame q - 2 of its direction is consumed (two slots); plus seam_ms and the hand-off terms. Returns +inf for
 // an invalid/oversized shape or an order that cannot complete. Empty rows cost zero.
-// At v = 1 with no hop cost this equals the averaged-tail analytical pipeline_wall_ms estimate.
+// At v = 1 with no hop cost this equals the averaged-tail analytical pipeline_wall_ms estimate; at v = 1 only the
+// forward direction carries frames, so `one_link` changes nothing there.
 [[nodiscard]] inline double interleaved_wall_ms(std::uint64_t rows, std::uint32_t chunk, std::uint32_t v,
     const PipelineCost& cost, std::uint32_t group = stage_group_chunks) {
     if (chunk == 0U || v == 0U || group == 0U) return std::numeric_limits<double>::infinity();
@@ -166,6 +170,16 @@ inline constexpr std::uint64_t max_stage_events = 1U << 20U;
     std::size_t next[2] = {0, 0};
     double rank_free[2] = {0.0, 0.0}, link_free[2] = {0.0, 0.0}, last = 0.0;
     double computed[2] = {unset, unset};  // an op that began and waits for its output slot
+    // one_link: booked [start, end) frames, sorted and disjoint (the ranks are simulated in turn, not in time order).
+    std::vector<std::pair<double, double>> link_busy;
+    const auto book = [&](double ready) {
+        auto it = std::lower_bound(link_busy.begin(), link_busy.end(), ready,
+            [](const std::pair<double, double>& b, double x) { return b.second <= x; });
+        double start = ready;
+        for (; it != link_busy.end() && it->first < start + hop; ++it) start = std::max(start, it->second);
+        link_busy.insert(it, {start, start + hop});
+        return start;
+    };
     bool moved = true;
     while (moved) {
         moved = false;
@@ -193,7 +207,7 @@ inline constexpr std::uint64_t max_stage_events = 1U << 20U;
                         if (free_at == unset) { blocked = true; continue; }
                         done = std::max(done, free_at);
                     }
-                    const double start = std::max(done, link_free[r]);
+                    const double start = cost.one_link ? book(done) : std::max(done, link_free[r]);
                     link_free[r] = start + hop;
                     arrival[s * chunks + c] = start + hop;
                 }

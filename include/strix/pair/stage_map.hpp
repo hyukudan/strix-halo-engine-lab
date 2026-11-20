@@ -120,7 +120,8 @@ inline StageMap balance_map(std::span<const double> layer_ms, double tail_ms, st
 
 // Measured cost of a two-rank layer pipeline, as a function of the prompt length n: one window of u rows costs
 // fixed_ms + (ms_per_row + ms_per_row_per_position x n) x u over both ranks (the attention part grows with the context),
-// and every stage boundary sends one frame of hop_latency_ms + hop_ms_per_row x u (copies out and in, fence, link).
+// and every stage boundary sends one frame of hop_latency_ms + hop_ms_per_row x u (copies out and in, fence, link), on
+// one link per direction or, with `one_link`, on one link that both directions share (regime.hpp interleaved_wall_ms).
 // Engines declare it as data from their receipts; `at(n)` is the regime.hpp cost of that prompt.
 struct LayerPipeCost {
     double fixed_ms = 0.0;
@@ -128,12 +129,14 @@ struct LayerPipeCost {
     double ms_per_row_per_position = 0.0;
     double hop_latency_ms = 0.0;
     double hop_ms_per_row = 0.0;
+    bool one_link = false;
     [[nodiscard]] PipelineCost at(std::uint64_t rows) const {
         PipelineCost cost;
         cost.fixed_ms = fixed_ms;
         cost.ms_per_row = ms_per_row + ms_per_row_per_position * static_cast<double>(rows);
         cost.hop_latency_ms = hop_latency_ms;
         cost.hop_ms_per_row = hop_ms_per_row;
+        cost.one_link = one_link;
         return cost;
     }
 };

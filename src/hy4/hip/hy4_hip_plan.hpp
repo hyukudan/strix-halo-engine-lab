@@ -105,10 +105,17 @@ using PairWindowCost = strix::pair::layers::WindowCost;
 }
 // Measured cost of the Hy4 pair layer pipeline (two Strix Halo nodes over USB4, FAST A8 rows prefill, real text, 11-20
 // receipts): a window of u rows at prompt length n costs 267.9 + (1.3666 + 2.344e-6 n) u ms over both ranks (per-window
-// costs 4K/1024 rows 1,677, 8K/2048 3,106, 32K/2048 3,224 ms); one stage-boundary frame 196 + 26 / 2048 ms per row
-// (100.7 MB of FP32 seam rows per 2048 rows; the latency fitted to the nine v = 1/2/3 receipts at 4K/8K/32K, rms 2.3 %).
+// costs 4K/1024 rows 1,677, 8K/2048 3,106, 32K/2048 3,224 ms); one stage-boundary frame 32 + 140 / 2048 ms per row
+// (100.7 MB of FP32 seam rows per 2048 rows: 172 ms) on ONE link for both directions (the host route copies both
+// directions through one path). Fitted to sixteen receipts (v = 1-5, rows 1024-4096, 2K-32K; rms 3.4 %): the frames
+// stall the pipeline once the two ranks' frames outlast a stage (8K v = 5: 2 x 172 > 311 ms, seal waits 0.3-0.6 s;
+// 32K rows 4096 v = 5), never at 4K rows 1024 v = 4 (2 x 102 < 210 ms). The former fit (196 + 26 / 2048 ms per
+// direction) priced every frame by its latency alone and picked v = 5 at 8K, 3.7 % slower than v = 3. The link state
+// varies between sessions: on a faster link (11-21, no stall) v = 5 was 1.1 % faster than v = 4 at 8K and tied at 32K.
+// These constants keep the slow state, so the pick (v = 4) does not lose to v = 3 in either (measured +0.6 % at 8K,
+// +1.2 % at 32K on the fast state; v = 4 keeps 2 x 172 < 388 ms of link slack on the slow one).
 // Data for the shared planner (strix/pair/stage_map.hpp plan_stages). Widths: the measured ones (bitwise equal).
-inline constexpr strix::pair::LayerPipeCost kPairPipeCost{267.9, 1.3666, 2.344e-6, 196.0, 26.0 / 2048.0};
+inline constexpr strix::pair::LayerPipeCost kPairPipeCost{267.9, 1.3666, 2.344e-6, 32.0, 140.0 / 2048.0, true};
 inline constexpr std::uint32_t kPairWindowRows[] = {1024U, 2048U, 4096U};
 inline constexpr std::uint32_t kPairVirtualStages[] = {1U, 2U, 3U, 4U, 5U};
 // Rows per window and stage map of the pair for a prompt; `width` != 0 keeps that width (the planner picks v only).

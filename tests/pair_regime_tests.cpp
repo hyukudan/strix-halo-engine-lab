@@ -79,6 +79,26 @@ int main() try {
         require(interleaved_wall_ms(8000U, 1000U, 2U, flat, 6U) == std::numeric_limits<double>::infinity(), "group 6 stalls");
         require(interleaved_wall_ms(8000U, 1000U, 2U, flat, 5U) < 1e9, "group 5 completes");
         require(near(interleaved_wall_ms(8000U, 1000U, 2U, flat), interleaved_wall_ms(8000U, 1000U, 2U, flat, 4U), 1e-12), "default group 4");
+        // (6) one link for both directions. Hand case C = 2, v = 2, t = 100 ms, hop 150 ms: one link per direction
+        // 1,000 ms; one shared link 1,100 ms (chunk 0's reverse frame, ready at 350, waits for chunk 1's forward frame
+        // [250, 400]; every later frame slips 50 ms and the last stage begins at 1,000).
+        PipelineCost link{};
+        link.ms_per_row = 0.4;  // P(1000) = 400 ms, t = 100 ms at v = 2
+        link.hop_latency_ms = 150.0;
+        require(near(interleaved_wall_ms(2000U, 1000U, 2U, link), 1000.0, 1e-9), "hand case, a link per direction = 1,000 ms");
+        link.one_link = true;
+        require(near(interleaved_wall_ms(2000U, 1000U, 2U, link), 1100.0, 1e-9), "hand case, one shared link = 1,100 ms");
+        // v = 1 sends forward frames only (no change); otherwise sharing the link is never faster.
+        for (const std::uint32_t v : {1U, 2U, 3U, 5U})
+            for (const double hop : {0.0, 20.0, 150.0, 400.0}) {
+                PipelineCost apart = flat;
+                apart.fixed_ms = 50.0;
+                apart.hop_latency_ms = hop;
+                PipelineCost shared = apart;
+                shared.one_link = true;
+                const double wa = interleaved_wall_ms(8000U, 1000U, v, apart), wb = interleaved_wall_ms(8000U, 1000U, v, shared);
+                require(v == 1U ? near(wa, wb, 1e-9) : wb >= wa - 1e-9, "one link: equal at v = 1, never faster");
+            }
         require(strix::pair::stage_sequence(5U, 2U, 8U, 2U) == 13U && strix::pair::stage_sequence(5U, 1U, 8U, 2U) == 5U &&
             strix::pair::stage_sequence(1U, 2U, 2U, 3U) == 3U, "stage sequence: group base x rounds + round x size + offset");
         // (3) MiniMax 8K (FAST stack): P(u) = 580 + 1.9946 u ms per chunk, FP32 seam 22 ms per 4,096 rows,
