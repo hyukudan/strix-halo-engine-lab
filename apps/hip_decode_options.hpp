@@ -33,6 +33,7 @@
 #include "strix/onfly_i4.hpp"
 #include "qwen_mtp_bundle.hpp"
 #include "strix/session/speculation_default.hpp"
+#include "strix/spec/wide_window.hpp"
 #include "strix/mtp_depth_window_controller.hpp"
 #include <cerrno>
 #include <charconv>
@@ -171,6 +172,10 @@ struct MtpCliOptions {
     // copied tokens in one N-row tiled known forward (the N-row tiled tail owner, all-rows heads) instead of the
     // 8-row verify window, trying the largest size first (apps/hip_mtp_wide_copy.hpp). Empty = off.
     std::vector<std::uint32_t> copy_wide_rows;
+    // --mtp-copy-wide-rows auto: the sizes come from the shared wide-window rule (strix/spec/wide_window.hpp) over this
+    // backend's measured table (hip_qwen_wide_copy_table); copy_wide_reason holds the rule's line per size.
+    bool copy_wide_auto=false;
+    std::string copy_wide_reason;
     // --mtp-draft-profile NAME: a qualified draft (strix/mtp_draft_profiles.hpp) whose identity and
     // provenance pins fill the sidecar options that are not given (a given pin must agree).
     std::string draft_profile;
@@ -1586,6 +1591,16 @@ inline void validate_resolved_gdn_islands(const Options& options) {
         throw std::invalid_argument("GDN islands require resolved D1 and virtual/prefetch input with virtual output");
 }
 
+// Measured wide copy table of the Qwen HIP route (gfx1151, one served lone request, decode profile; same binary,
+// def / wide ABAB x 3, token ids equal in 24 of 24 run/prompt pairs): 8-row window 78.2 ms (code edit), 32-row tiled
+// owner 166.7 ms, 16-row 142 ms (one sample). The wide cycle is all-or-nothing (apps/hip_mtp_wide_copy.hpp: a rejected
+// row discards the pass); about 9 of 15 long copy-edit proposals were accepted to the last row (0.60). With these the rule
+// admits 32 (break-even 0.53) and refuses 16 (0.91). Re-measure after a verify-owner change or a keep_stride change.
+[[nodiscard]] inline strix::spec::WideWindowTable hip_qwen_wide_copy_table() {
+    strix::spec::WideWindowTable t;
+    t.narrow_rows=8U;t.narrow_ms=78.2;t.wide={{32U,166.7},{16U,142.0}};t.keep_stride=0U;t.full_accept=0.60;
+    return t;
+}
 // The single resolver of the wide copy cycle (--mtp-copy-wide-rows). The CLI runs it for its one request; the
 // HTTP server runs it only while exactly one request is live, and STRIX_MTP_SERVE_WIDE=0 (serve_switch=false)
 // forces it off there. Returns the configured sizes (descending) or empty. Both routes call this, never the raw option.
@@ -2477,8 +2492,10 @@ inline Options parse_options(
                 m.sample_options=true;m.sample_timing_schedule=value=="adaptive";
             }
             else if(key=="--mtp-copy-wide-rows") {
-                // 0 alone = off; otherwise a descending list of distinct sizes from {32, 16}.
-                if(value!="0") for(std::size_t begin=0;begin<=value.size();) {
+                // 0 alone = off; auto = the shared rule over the measured table; otherwise a descending list of
+                // distinct sizes from {32, 16}.
+                if(value=="auto") {m.copy_wide_auto=true;m.copy_wide_rows=strix::spec::wide_window_sizes(hip_qwen_wide_copy_table(),&m.copy_wide_reason);}
+                else if(value!="0") for(std::size_t begin=0;begin<=value.size();) {
                     const auto end=std::min(value.find(',',begin),value.size());
                     const auto rows=parse_u64(value.substr(begin,end-begin),"MTP copy wide rows");
                     if((rows!=16U && rows!=32U) || (!m.copy_wide_rows.empty() && rows>=m.copy_wide_rows.back()))

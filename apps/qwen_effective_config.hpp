@@ -2174,6 +2174,15 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     else out << "{\"rotary\":" << o.rotary.json() << ',';
     out << "\"weight_plans\":" << serve::Json(strix::weight::family_plan_notice(config.weight_plans)).dump() << ',';
     out << "\"profile\":" << o.product_profile.json() << ',';
+    if (o.mtp.copy_wide_auto || !o.mtp.copy_wide_rows.empty()) {
+        // The CLI and the server resolve the same sizes; the server uses them only while one request is live
+        // (mtp_wide_copy_rows_effective, STRIX_MTP_SERVE_WIDE=0 turns them off there).
+        std::string sizes;
+        for (const auto rows : o.mtp.copy_wide_rows) sizes += (sizes.empty() ? "" : ",") + std::to_string(rows);
+        out << "\"mtp_copy_wide\":{\"requested\":\"" << (o.mtp.copy_wide_auto ? "auto" : "explicit") << "\",\"rows\":\"" << sizes
+            << "\",\"serve\":\"lone request\",\"reason\":"
+            << serve::Json(o.mtp.copy_wide_auto ? o.mtp.copy_wide_reason : std::string("explicit sizes")).dump() << "},";
+    }
     if (!o.suppressed_yarn_request.empty())
         out << "\"suppressed_yarn_request\":\"" << yarn_json_error(o.suppressed_yarn_request) << "\",";
     // YaRN preflight can verify a drop before device setup. Native inspection

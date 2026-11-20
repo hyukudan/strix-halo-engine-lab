@@ -1064,7 +1064,42 @@ void frontier_tests() {
 }
 } // namespace
 
+// Shared wide-window rule (strix/spec/wide_window.hpp): kept rows of a miss, break-even span acceptance per keep
+// stride, the measured HIP table (32 on, 16 off) and the CUDA tables' decisions (cap 16 on, cap 8 off).
+void wide_window_tests() {
+    // a miss after k accepted proposals keeps k rows per row, k rounded down to the stride, none all-or-nothing
+    for (std::uint32_t k = 0; k < 31; ++k) {
+        SP_CHECK(sp::wide_window_kept(k, 1) == k, "per-row keep at %u", k);
+        SP_CHECK(sp::wide_window_kept(k, 8) == k / 8 * 8, "stride-8 keep at %u", k);
+        SP_CHECK(sp::wide_window_kept(k, 0) == 0, "all-or-nothing keeps nothing at %u", k);
+    }
+    sp::WideWindowTable hip;
+    hip.narrow_rows = 8; hip.narrow_ms = 78.2; hip.wide = {{32, 166.7}, {16, 142.0}}; hip.keep_stride = 0; hip.full_accept = 0.60;
+    const double p32 = sp::wide_window_break_even(hip.wide[0], hip), p16 = sp::wide_window_break_even(hip.wide[1], hip);
+    SP_CHECK(std::fabs(p32 - 166.7 / (32 * 78.2 / 8)) < 1e-12 && std::fabs(p16 - 142.0 / (16 * 78.2 / 8)) < 1e-12,
+        "all-or-nothing break-even = wide ms / narrow cost of the span (%f %f)", p32, p16);
+    std::string why;
+    const auto sizes = sp::wide_window_sizes(hip, &why);
+    SP_CHECK(sizes == std::vector<std::uint32_t>{32}, "the measured HIP table admits 32 only (%s)", why.c_str());
+    // keeping the accepted prefix lowers the break-even: per row < stride 8 < all-or-nothing
+    auto keep = hip;
+    keep.keep_stride = 8; const double s8 = sp::wide_window_break_even(hip.wide[0], keep);
+    keep.keep_stride = 1; const double s1 = sp::wide_window_break_even(hip.wide[0], keep);
+    SP_CHECK(s1 < s8 && s8 < p32 && s8 < 0.3, "kept rows lower the break-even (%f %f %f)", s1, s8, p32);
+    // a perfect copy source (every span accepted) admits every size that wins when fully accepted
+    auto perfect = hip; perfect.full_accept = 1.0;
+    SP_CHECK((sp::wide_window_sizes(perfect) == std::vector<std::uint32_t>{32, 16}), "a perfect source admits 32 and 16");
+    // slower when fully accepted: never admitted, whatever the acceptance
+    auto slow = perfect; slow.wide = {{16, 160.0}};
+    SP_CHECK(sp::wide_window_sizes(slow).empty() && !sp::wide_window_full_pays(16, 160.0, 8, 78.2), "a slower wide window stays off");
+    // CUDA sm_120 tables (qwen_cohort_plan.hpp copy_wide_measured): cap 16 -> 29.2 ms on, cap 8 -> 62.5 ms off
+    SP_CHECK(sp::wide_window_full_pays(16, 29.2, 8, 8.55 + 1.1 * 8) && !sp::wide_window_full_pays(16, 62.5, 8, 8.55 + 1.1 * 8),
+        "the CUDA decisions are unchanged");
+    SP_CHECK(!sp::wide_window_full_pays(8, 1.0, 8, 78.2), "a window not wider than the narrow one is never wide");
+}
+
 int main() {
+    wide_window_tests();
     index_tests();
     copy_tests();
     arbiter_tests();

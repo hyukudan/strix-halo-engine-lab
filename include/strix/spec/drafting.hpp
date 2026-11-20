@@ -15,6 +15,7 @@
 // prefix + correction and rolls back the rejected rows' state. The layer only reads emitted tokens, so it needs no
 // rollback, and no decision of it can change the emitted ids.
 #include "strix/lookup/index.hpp"
+#include "strix/spec/wide_window.hpp"
 
 #include <array>
 #include <cstdint>
