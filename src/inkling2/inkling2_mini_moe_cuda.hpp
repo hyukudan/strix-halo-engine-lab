@@ -5,7 +5,7 @@
 #include "inkling2_mini_moe_dispatch.hpp"
 
 #if defined(__CUDACC__) && !defined(__HIPCC__)
-#include "cuda/core/route_wave.cuh"
+#include "moe_core/route_wave_kernel.hpp"
 #include "strix/cuda/core/moe_route_tap.hpp"
 #endif
 
@@ -14,16 +14,6 @@ namespace strix::inkling2 {
 using MiniCudaMoeBackend = cuda::core::grouped_dispatch::CudaBackend;
 
 #if defined(__CUDACC__) && !defined(__HIPCC__)
-namespace mini_cuda_moe_detail {
-
-struct Router {
-    static constexpr auto policy = kMiniRoute;
-    using Math = detail::MiniMoeMath;
-    using Wave = moe::RouteWaveTraits<true>;
-};
-
-}  // namespace mini_cuda_moe_detail
-
 inline constexpr auto enqueue_mini_cuda_router_logits = cuda::core::grouped_dispatch::router_logits<MiniMoeConfig>;
 
 inline cudaError_t enqueue_mini_cuda_resident_moe(
@@ -34,7 +24,7 @@ inline cudaError_t enqueue_mini_cuda_resident_moe(
     moe::RouteTap* tap = nullptr) {
     const auto select = [physical_layer, tap](std::span<const float> scores, std::span<const float> bias,
                            MiniMoeResidentRouteBuffers buffers, unsigned count, cudaStream_t route_stream) {
-        const auto status = cuda::core::route_wave::launch<mini_cuda_moe_detail::Router>(
+        const auto status = moe_core::enqueue_route_wave<kMiniRoute, detail::MiniMoeMath, moe::RouteWaveTraits<true>>(
             scores.data(), bias.data(), buffers.ids.data(), buffers.weights.data(),
             buffers.status.data(), count, route_stream);
         if (status == cudaSuccess)
