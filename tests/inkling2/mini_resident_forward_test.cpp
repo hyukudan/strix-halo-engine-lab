@@ -274,12 +274,12 @@ bool check_ring_append() {
 int main() {
     constexpr auto schedule = mini_schedule();
     constexpr MiniSessionStatePlan wrap_one(2049, 1);
-    static_assert(!mini_append_overwrites_committed_row(wrap_one.visit(schedule[0]), {1023, 1}));
-    static_assert(mini_append_overwrites_committed_row(wrap_one.visit(schedule[0]), {1024, 1}));
-    static_assert(!mini_append_overwrites_committed_row(wrap_one.visit(schedule[5]), {1024, 1}));
+    static_assert(!strix::session::overwrites_committed_row(wrap_one.visit(schedule[0]), {1023, 1}));
+    static_assert(strix::session::overwrites_committed_row(wrap_one.visit(schedule[0]), {1024, 1}));
+    static_assert(!strix::session::overwrites_committed_row(wrap_one.visit(schedule[5]), {1024, 1}));
     constexpr MiniSessionStatePlan wrap_chunk(4096, 1025);
-    static_assert(mini_append_overwrites_committed_row(wrap_chunk.visit(schedule[6]), {1100, 1025}));
-    static_assert(!mini_append_overwrites_committed_row(wrap_chunk.visit(schedule[6]), {1100, 1024}));
+    static_assert(strix::session::overwrites_committed_row(wrap_chunk.visit(schedule[6]), {1100, 1025}));
+    static_assert(!strix::session::overwrites_committed_row(wrap_chunk.visit(schedule[6]), {1100, 1024}));
     static_assert(mini_resident_max_kv_checkpoint_elements() == 2U * 40U * kKvWidth);
     static_assert(mini_controller_path(MessagePath::moe) == "mlp");
     static_assert(mini_input_norm_suffix(schedule[5], MessagePath::key) == "k_input_norm.weight");
@@ -374,5 +374,26 @@ int main() {
         if (!checked_head || !head_state.poisoned() || head_state.committed() != 1U ||
             head_backend.finish_calls != 2U) return 15;
     }
-    return check_ring_append() ? 0 : 16;
+    if (!check_ring_append()) return 16;
+
+    // A failed later prefill chunk must retire the partially committed lane.
+    FixtureBackend sequence_backend;
+    MiniResidentSessionState sequence_state(session_plan, {keys, values}, histories);
+    MiniResidentForward sequence_forward(sequence_backend, sequence_state, {scratch, backup, {}});
+    constexpr std::array sequence{1U, 2U, 3U};
+    bool saw_last = false;
+    try {
+        (void)sequence_state.append_sequence(std::span<const unsigned>(sequence),
+            [&](std::span<const unsigned> tokens, bool last) -> unsigned {
+                if (last) {
+                    saw_last = tokens.size() == 1U && tokens.front() == 3U;
+                    throw std::runtime_error("fixture failed after first prefill chunk");
+                }
+                sequence_forward.append({0U, static_cast<unsigned>(tokens.size())}, inputs, output);
+                return 0U;
+            });
+    } catch (const std::runtime_error&) {
+        return saw_last && sequence_state.poisoned() && sequence_state.committed() == 2U ? 0 : 17;
+    }
+    return 18;
 }

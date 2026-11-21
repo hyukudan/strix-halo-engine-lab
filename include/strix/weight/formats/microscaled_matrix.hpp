@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <limits>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -55,6 +56,25 @@ struct ExpertSlabView {
     Slice block_scales;
     Slice amax;
     Slice denominator;
+
+    // Names follow codes, block scales, then NVFP4 maximum and denominator.
+    // The caller supplies the schema; looking up these slices reads no payload.
+    template <class Find>
+    Status bind_sources(const std::array<std::string, 4>& names, Find find) {
+        std::array<Slice, 4> slices{};
+        const std::size_t count = format == MatrixFormat::nvfp4 ? slices.size() : 2U;
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto* tensor = find(names[i]);
+            if (!tensor) return {Error::malformed, "missing expert tensor " + names[i]};
+            if (const auto status = subslice(tensor->payload, {0, tensor->payload.range.bytes}, slices[i]); !status)
+                return status;
+        }
+        codes = std::move(slices[0]);
+        block_scales = std::move(slices[1]);
+        amax = std::move(slices[2]);
+        denominator = std::move(slices[3]);
+        return {Error::ok, {}};
+    }
 
     Status matrix(std::size_t expert, MatrixView& out) const {
         if (expert >= experts) return {Error::unsupported_shape, "expert outside microscaled slab"};

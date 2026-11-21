@@ -404,6 +404,12 @@ strix_target_warnings(strix_core)
 include(CTest)
 include(cmake/StrixSession.cmake)
 include(cmake/StrixVisionPreprocess.cmake)
+if(BUILD_TESTING)
+    add_executable(weight_resident_slices_tests tests/weight_resident_slices_tests.cpp)
+    target_link_libraries(weight_resident_slices_tests PRIVATE strix-weight)
+    strix_target_warnings(weight_resident_slices_tests)
+    add_test(NAME weight-resident-slices COMMAND weight_resident_slices_tests)
+endif()
 if(NOT STRIX_CUDA_DS41_ONLY)
     add_library(strix_inkling2_mini_checkpoint STATIC
         src/inkling2/inkling2_mini_checkpoint.cpp

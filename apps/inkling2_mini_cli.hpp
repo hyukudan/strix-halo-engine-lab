@@ -1,15 +1,11 @@
 #pragma once
 
 #include "inkling2/inkling2_mini_config.hpp"
+#include "strix/session/greedy_cli.hpp"
 
-#include <bit>
 #include <charconv>
-#include <chrono>
-#include <cstdint>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
-#include <span>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -71,63 +67,14 @@ inline Options parse(int argc, char** argv, unsigned default_prefill_chunk = 0) 
 }
 
 inline unsigned context(const Options& options) {
-    if (options.prompt.empty() || options.prompt.size() > kMaxContext ||
-        options.generate > kMaxContext - options.prompt.size())
-        throw std::invalid_argument("prompt and generation must fit the Mini context");
-    return static_cast<unsigned>(options.prompt.size()) + options.generate;
-}
-
-inline void write_logits(const char* path, std::span<const float> logits) {
-    std::ofstream output(path, std::ios::binary);
-    if (!output) throw std::runtime_error("could not open logits output");
-    for (float value : logits) {
-        const auto bits = std::bit_cast<std::uint32_t>(value);
-        unsigned char encoded[4];
-        for (unsigned i = 0; i < 4; ++i) encoded[i] = static_cast<unsigned char>(bits >> (8U * i));
-        output.write(reinterpret_cast<const char*>(encoded), sizeof(encoded));
-    }
-    output.close();
-    if (!output) throw std::runtime_error("could not write logits output");
+    return session::admit_cli_context(options.prompt.size(), options.generate, kMaxContext,
+                                      "prompt and generation must fit the Mini context");
 }
 
 template <class Decoder>
 void run(Decoder& decoder, const Options& options, std::vector<unsigned>* generated = nullptr) {
-    using clock = std::chrono::steady_clock;
-    const auto milliseconds = [](clock::duration duration) {
-        return std::chrono::duration<double, std::milli>(duration).count();
-    };
-    std::vector<float> logits(options.logits_path ? kOutputVocabulary : 0U);
-    const auto prefill_start = clock::now();
-    auto token = decoder.prefill(options.prompt, logits);
-    const double prefill_ms = milliseconds(clock::now() - prefill_start);
-    if (options.logits_path) write_logits(options.logits_path, logits);
-    unsigned decoded = 0;
-    clock::duration decode_time{};
-    const auto report = [&] {
-        const double decode_ms = milliseconds(decode_time);
-        std::cout << "timing prompt_tokens " << options.prompt.size() << " prefill_ms " << prefill_ms
-                  << " decode_tokens " << decoded << " decode_ms " << decode_ms << " decode_tok_s "
-                  << (decoded != 0U && decode_ms > 0.0 ? 1000.0 * decoded / decode_ms : 0.0) << '\n';
-    };
-
-    std::cout << "next_token " << token << '\n';
-    if (options.generate == 0) {
-        report();
-        return;
-    }
-
-    std::cout << "generated" << std::flush;
-    for (unsigned i = 0; i < options.generate; ++i) {
-        std::cout << ' ' << token << std::flush;
-        if (generated) generated->push_back(token);
-        if (token == kMiniEosToken || i + 1U == options.generate) break;
-        const auto decode_start = clock::now();
-        token = decoder.decode(token);
-        decode_time += clock::now() - decode_start;
-        ++decoded;
-    }
-    std::cout << '\n';
-    report();
+    session::run_greedy_cli(decoder, {options.prompt, options.generate, options.logits_path,
+                                      kOutputVocabulary, kMiniEosToken}, std::cout, generated);
 }
 
 }  // namespace strix::inkling2::cli

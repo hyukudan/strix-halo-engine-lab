@@ -34,6 +34,16 @@ public:
         queue_.publish();
     }
 
+    // A resident plan can also be submitted range by range by placement code.
+    template <class Plan>
+    void load_resident(const Plan& plan, std::span<std::uint8_t> storage) {
+        if (storage.size() < plan.bytes())
+            throw std::invalid_argument("weight load: incomplete resident storage");
+        for (const auto& range : plan.ranges())
+            load(range.source, storage.subspan(range.destination_offset, range.bytes));
+        ready();
+    }
+
     [[nodiscard]] WeightLoadStats stats() const { return queue_.stats(); }
 
 private:

@@ -14,7 +14,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <limits>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -24,13 +23,6 @@
 namespace strix::inkling2 {
 
 namespace detail {
-
-template <class T>
-std::size_t mini_resident_buffer_elements(std::uint64_t count) {
-    if (count > std::numeric_limits<std::size_t>::max() / sizeof(T))
-        throw std::length_error("Inkling 2 Mini: resident buffer exceeds host address space");
-    return static_cast<std::size_t>(count);
-}
 
 struct MiniPinnedLogitsDeleter {
     void operator()(float* address) const noexcept {
@@ -104,9 +96,9 @@ public:
         : max_rows_(MiniResidentBackend::checked_chunk_rows(max_chunk_rows)),
           layout_(max_positions, max_rows_), weight_plan_(read_plan(checkpoint)),
           weight_storage_(weight_plan_.bytes()),
-          keys_(detail::mini_resident_buffer_elements<std::uint16_t>(layout_.kv_elements_per_plane())),
+          keys_(session::cache_buffer_elements<std::uint16_t>(layout_.kv_elements_per_plane())),
           values_(keys_.span().size()),
-          histories_(detail::mini_resident_buffer_elements<float>(layout_.convolution_elements())),
+          histories_(session::cache_buffer_elements<float>(layout_.convolution_elements())),
           activations_(mini_resident_activation_elements(max_rows_)), history_backup_(histories_.span().size()),
           kv_backup_(mini_resident_max_kv_checkpoint_elements()), embeddings_(std::size_t{max_rows_} * kHiddenWidth),
           hidden_(embeddings_.span().size()), logits_(kOutputVocabulary),
@@ -125,17 +117,9 @@ public:
     // committed, retire the session so a retry cannot append the prefix twice.
     [[nodiscard]] unsigned prefill(std::span<const unsigned> prompt, std::span<float> logits = {}) {
         validate_inputs(prompt, logits);
-        const auto first = state_.committed();
-        try {
-            while (prompt.size() > max_rows_) {
-                (void)append(prompt.first(max_rows_), false, {});
-                prompt = prompt.subspan(max_rows_);
-            }
-            return append(prompt, true, logits);
-        } catch (...) {
-            if (state_.committed() != first) broken_ = true;
-            throw;
-        }
+        return state_.append_sequence(prompt, [&](std::span<const unsigned> chunk, bool last) {
+            return append(chunk, last, last ? logits : std::span<float>{});
+        });
     }
 
     [[nodiscard]] unsigned decode(unsigned token) {
@@ -158,13 +142,14 @@ private:
         strix::cuda::core::WeightUploader uploader;
 #endif
         core::WeightSliceLoader loader(uploader, {});
-        return load_mini_resident_weights(weight_plan_, weight_storage_.span(), loader);
+        auto weights = MiniResidentWeights::bind(weight_plan_, weight_storage_.span());
+        loader.load_resident(weight_plan_, weight_storage_.span());
+        return weights;
     }
 
     void validate_inputs(std::span<const unsigned> tokens, std::span<float> logits) const {
-        if (broken_ || state_.poisoned()) throw std::runtime_error("Inkling 2 Mini: device session is invalid");
-        if (tokens.empty() || tokens.size() > kMaxContext - state_.committed() ||
-            !layout_.admits(state_.committed() + static_cast<unsigned>(tokens.size()) - 1U, 1U))
+        if (state_.poisoned()) throw std::runtime_error("Inkling 2 Mini: device session is invalid");
+        if (!layout_.admits_sequence(state_.committed(), tokens.size()))
             throw std::invalid_argument("Inkling 2 Mini: input tokens exceed the session context");
         if (!logits.empty() && logits.size() != kOutputVocabulary)
             throw std::invalid_argument("Inkling 2 Mini: logits output must hold one vocabulary row");
@@ -200,11 +185,7 @@ private:
                                                        embeddings.data(), rows, stream_.get()));
 #endif
         } catch (...) {
-            try {
-                mini_gpu::synchronize(stream_.get());
-            } catch (...) {
-                broken_ = true;
-            }
+            state_.drain_or_poison([&] { mini_gpu::synchronize(stream_.get()); });
             throw;
         }
         forward_.append({state_.committed(), rows}, embeddings, hidden_.span().first(elements),
@@ -250,7 +231,6 @@ private:
     MiniResidentForward<MiniResidentBackend> forward_;
     detail::MiniResidentGreedy greedy_;
     std::unique_ptr<float, detail::MiniPinnedLogitsDeleter> staged_logits_;
-    bool broken_{};
 };
 
 }  // namespace strix::inkling2

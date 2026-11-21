@@ -6,11 +6,11 @@
 #include "inkling2/inkling2_mini_tokenizer.hpp"
 
 #include <algorithm>
-#include <chrono>
 #include <memory>
 
 int main(int argc, char** argv) {
     using namespace strix::inkling2;
+    namespace session = strix::session;
 #if defined(__HIPCC__)
     constexpr auto backend = "HIP";
     constexpr auto executable = "strix-inkling2-mini-hip";
@@ -40,14 +40,13 @@ int main(int argc, char** argv) {
         }
         const auto positions = cli::context(options);
         const auto max_rows = std::min(options.prefill_chunk, static_cast<unsigned>(options.prompt.size()));
-        const auto load_start = std::chrono::steady_clock::now();
+        const auto load_start = session::CliClock::now();
         MiniResidentDecoder decoder(argv[1], positions, max_rows, options.packed_decode);
-        std::cout << "timing load_ms "
-                  << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - load_start).count()
-                  << '\n';
+        session::write_load_timing(std::cout, load_start);
         std::vector<unsigned> generated;
         cli::run(decoder, options, tokenizer ? &generated : nullptr);
-        if (tokenizer && !generated.empty()) std::cout << "text " << tokenizer->decode(generated, true) << '\n';
+        if (tokenizer && !generated.empty())
+            session::write_generated_text(std::cout, tokenizer->decode(generated, true));
     } catch (const std::exception& error) {
         std::cerr << "Inkling 2 Mini " << backend << ": " << error.what() << '\n';
         return 1;

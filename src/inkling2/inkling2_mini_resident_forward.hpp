@@ -19,17 +19,11 @@ namespace strix::inkling2 {
 using MiniConstRows = std::span<const float>;
 using MiniMutableRows = std::span<float>;
 
-struct MiniResidentChunk {
-    unsigned first_position;
-    unsigned rows;
-};
+using MiniResidentChunk = session::KvAppendChunk;
+using MiniResidentSessionState = session::KvStore::RowAppendState<MiniSessionStatePlan>;
+using MiniResidentVisitState = MiniResidentSessionState::VisitRows;
 
 enum class MiniConvolutionStream : unsigned { key, value, attention, moe };
-
-struct MiniResidentVisitState {
-    MiniVisitKvCache kv;
-    std::array<std::span<float>, 4> history;
-};
 
 struct MiniResidentForwardWorkspace {
     std::span<float> activations;
@@ -47,20 +41,8 @@ inline constexpr std::size_t mini_resident_activation_elements(unsigned rows) {
     return rows * per_row;
 }
 
-// A wrapped launch may overwrite at most one row from the window at the old
-// frontier. The layout reserves window-1 prior rows alongside the new chunk.
-// Keeping the additional oldest row in the rollback scratch also preserves
-// the entire old last-position window, not just the next query's prefix.
-inline constexpr bool mini_append_overwrites_committed_row(const MiniVisitStatePlan& visit, MiniResidentChunk chunk) {
-    return visit.kv.ring != 0U && chunk.rows > visit.kv.ring - std::min(visit.window, chunk.first_position);
-}
-
 inline constexpr std::size_t mini_resident_max_kv_checkpoint_elements() {
-    std::size_t result = 0;
-    for (const auto visit : mini_schedule()) {
-        if (uses_sliding_attention(visit)) result += 2U * kKvWidth;
-    }
-    return result;
+    return MiniSessionStatePlan(kMaxContext, 1U).kv_checkpoint_elements();
 }
 
 // Short checkpoint names used by the backend of layer_input(). On a repeated
@@ -87,49 +69,6 @@ inline constexpr std::string_view mini_controller_path(MessagePath path) {
     throw std::invalid_argument("invalid Mini controller path");
 }
 
-template <class Backend> class MiniResidentForward;
-
-// A single externally serialized lane. The caller owns disjoint device
-// allocations, zeros the histories at session creation and keeps all memory
-// alive through the backend's finish(). No unread KV slot requires clearing.
-class MiniResidentSessionState {
-public:
-    MiniResidentSessionState(MiniSessionStatePlan plan, MiniSessionKvPlanes kv, std::span<float> convolution)
-        : plan_(plan), kv_(kv), convolution_(convolution) {
-        if (!mini_visit_kv_cache(plan_, mini_schedule().front(), kv_).keys ||
-            convolution_.size() < plan_.convolution_elements()) {
-            throw std::invalid_argument("incomplete Mini resident session storage");
-        }
-        convolution_ = convolution_.first(static_cast<std::size_t>(plan_.convolution_elements()));
-    }
-
-    MiniResidentSessionState(const MiniResidentSessionState&) = delete;
-    MiniResidentSessionState& operator=(const MiniResidentSessionState&) = delete;
-
-    const MiniSessionStatePlan& plan() const { return plan_; }
-    unsigned committed() const { return committed_; }
-    bool poisoned() const { return poisoned_; }
-
-private:
-    template <class Backend> friend class MiniResidentForward;
-
-    MiniResidentVisitState visit(LayerVisit visit) const {
-        const auto& layout = plan_.visit(visit);
-        MiniResidentVisitState state{mini_visit_kv_cache(plan_, visit, kv_), {}};
-        for (unsigned stream = 0; stream < state.history.size(); ++stream) {
-            state.history[stream] = convolution_.subspan(static_cast<std::size_t>(layout.convolution_offsets[stream]),
-                                                         static_cast<std::size_t>(layout.convolution_elements(stream)));
-        }
-        return state;
-    }
-
-    const MiniSessionStatePlan plan_;
-    MiniSessionKvPlanes kv_;
-    std::span<float> convolution_;
-    unsigned committed_ = 0;
-    bool poisoned_ = false;
-};
-
 // One device chunk, including decode (rows=1). All callbacks enqueue on the
 // same stream, throw on admission/enqueue failure, and retain no host span
 // descriptors or names. Arithmetic lives in backend kernels. finish() waits for prior
@@ -148,104 +87,23 @@ public:
     template <class Finalize = std::nullptr_t, class Validate = std::nullptr_t>
     void append(MiniResidentChunk chunk, MiniConstRows embeddings, MiniMutableRows output,
                 Finalize finalize = nullptr, Validate validate = nullptr) {
-        if (session_.poisoned() || chunk.first_position != session_.committed() ||
-            !session_.plan().admits(chunk.first_position, chunk.rows)) {
-            throw std::invalid_argument("invalid Mini resident append frontier");
-        }
+        session_.require_append(chunk);
         const auto activation_elements = mini_resident_activation_elements(chunk.rows);
         const auto image_elements = activation_elements / kMiniResidentImages;
         if (embeddings.size() != image_elements || output.size() != image_elements ||
-            workspace_.activations.size() < activation_elements ||
-            workspace_.convolution_checkpoint.size() < session_.convolution_.size()) {
+            workspace_.activations.size() < activation_elements) {
             throw std::invalid_argument("incomplete Mini resident forward workspace or output");
         }
-
-        const auto backups = make_kv_backups(chunk);
-        const auto histories = workspace_.convolution_checkpoint.first(session_.convolution_.size());
-        try {
-            backend_.copy(MiniConstRows(session_.convolution_), histories);
-            for (const auto& backup : backups) {
-                if (backup.saved.empty()) break;
-                backend_.copy(std::span<const std::uint16_t>(backup.target), backup.saved);
-            }
-        } catch (...) {
-            // Only checkpoint scratch has been written. Drain any borrowed
-            // buffers before returning or quarantine the lane if not possible.
-            drain_or_poison();
-            throw;
-        }
-
-        try {
+        session_.append(backend_, chunk, workspace_.convolution_checkpoint, workspace_.kv_checkpoint, [&] {
             ChunkForward forward(*this, chunk, image_elements);
             forward.run(embeddings, output);
             if constexpr (!std::is_same_v<Finalize, std::nullptr_t>) finalize(chunk, MiniConstRows(output));
-        } catch (...) {
-            restore(backups, histories);
-            throw;
-        }
-
-        try {
-            backend_.finish();
+        }, [&] {
             if constexpr (!std::is_same_v<Validate, std::nullptr_t>) validate();
-        } catch (...) {
-            // A failed completion or rejected result retires the lane
-            // without publishing the append.
-            session_.poisoned_ = true;
-            throw;
-        }
-        session_.committed_ += chunk.rows;
+        });
     }
 
 private:
-    struct KvBackup {
-        std::span<std::uint16_t> target;
-        std::span<std::uint16_t> saved;
-    };
-    using KvBackups = std::array<KvBackup, 2U * kLogicalVisits>;
-
-    KvBackups make_kv_backups(MiniResidentChunk chunk) const {
-        KvBackups backups{};
-        std::size_t count = 0;
-        for (const auto visit : mini_schedule()) {
-            const auto& layout = session_.plan().visit(visit);
-            if (!mini_append_overwrites_committed_row(layout, chunk)) continue;
-            if (workspace_.kv_checkpoint.size() / kKvWidth < count + 2U) {
-                throw std::invalid_argument("incomplete Mini resident KV checkpoint workspace");
-            }
-            const auto position = chunk.first_position - std::min(layout.window, chunk.first_position);
-            const auto start = layout.kv_offset + attn::cache_rows::row_offset(layout.kv, position);
-            const auto offset = static_cast<std::size_t>(start);
-            for (auto plane : {session_.kv_.keys, session_.kv_.values}) {
-                backups[count] = {plane.subspan(offset, kKvWidth), workspace_.kv_checkpoint.subspan(count * kKvWidth, kKvWidth)};
-                ++count;
-            }
-        }
-        return backups;
-    }
-
-    void drain_or_poison() noexcept {
-        try {
-            backend_.finish();
-        } catch (...) {
-            session_.poisoned_ = true;
-        }
-    }
-
-    void restore(const KvBackups& backups, MiniConstRows histories) noexcept {
-        try {
-            backend_.finish();
-            backend_.copy(histories, session_.convolution_);
-            for (const auto& backup : backups) {
-                if (backup.saved.empty()) break;
-                backend_.copy(std::span<const std::uint16_t>(backup.saved), backup.target);
-            }
-            backend_.finish();
-        } catch (...) {
-            session_.poisoned_ = true;
-            drain_or_poison();
-        }
-    }
-
     class ChunkForward {
     public:
         ChunkForward(MiniResidentForward& owner, MiniResidentChunk chunk, std::size_t elements)

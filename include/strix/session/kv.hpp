@@ -112,6 +112,10 @@ struct Hooks {
 
 class KvStore {
 public:
+  // Optional physical payload for hooks backed by contiguous/ring KV rows and
+  // recurrent histories. See kv_row_append.hpp for the layout policy contract.
+  template <class Plan> class RowAppendState;
+
   KvStore(std::uint32_t slots, std::uint32_t ranks, Hooks hooks);
   // Hooks and their resources must outlive this destructor. It attempts release
   // of all live/quarantined generations without throwing. Backends must reclaim

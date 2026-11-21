@@ -2,12 +2,10 @@
 #include "inkling2_mini_expert_layout.hpp"
 #include "inkling2_mini_config.hpp"
 #include "inkling2_mini_schedule.hpp"
-#include "strix/ggml_dequant.hpp"
 #include "strix/serve/json.hpp"
-#include "strix/weight/registry.hpp"
+#include "strix/weight/typed_slice.hpp"
 
 #include <algorithm>
-#include <bit>
 #include <initializer_list>
 #include <map>
 
@@ -21,8 +19,9 @@ using weight::Error;
 
 std::vector<MiniTextTensorSpec> mini_text_tensor_schema() {
     std::vector<MiniTextTensorSpec> specs;
-    const auto tensor = [&](const std::string& suffix, std::string_view dtype, Extents extents) {
-        specs.push_back({"model.llm." + suffix, dtype, extents});
+    const auto tensor = [&](const std::string& suffix, std::string_view dtype, Extents extents,
+                            bool resident = true) {
+        specs.push_back({"model.llm." + suffix, dtype, extents, resident});
     };
     const auto bf16 = [&](const std::string& suffix, Extents extents) {
         tensor(suffix, "BF16", extents);
@@ -96,8 +95,8 @@ std::vector<MiniTextTensorSpec> mini_text_tensor_schema() {
             if (layer < kMxFp8First) {
                 tensor(stem, "U8", {kExperts, rows, columns / 2});
                 tensor(stem + "_scale", "F8_E4M3", {kExperts, rows, columns / 16});
-                tensor(stem + "_amax", "F32", {kExperts});
-                tensor(stem + "_outer_scale_denominator", "F32", {1});
+                tensor(stem + "_amax", "F32", {kExperts}, false);
+                tensor(stem + "_outer_scale_denominator", "F32", {1}, false);
             } else {
                 // MXFP8 stores E4M3 values and unsigned E8M0 scale bytes per 32 columns.
                 tensor(stem, "F8_E4M3", {kExperts, rows, columns});
@@ -199,38 +198,7 @@ weight::Status MiniTextWeights::read(std::string_view full_name, std::span<float
                                     std::size_t first_element) const {
     const auto* tensor = find(full_name);
     if (!tensor) return {Error::malformed, "unknown Mini weight " + std::string(full_name)};
-    const bool f32 = tensor->wire_dtype == "F32";
-    if (!f32 && tensor->wire_dtype != "BF16")
-        return {Error::unknown_format, "Mini plain weight read requires BF16 or F32"};
-    const std::size_t width = f32 ? 4U : 2U;
-    const auto count = tensor->payload.range.bytes / width;
-    if (first_element > count || out.size() > count - first_element)
-        return {Error::unsupported_shape, "Mini plain weight read outside tensor " + std::string(full_name)};
-    if (out.empty()) return {Error::ok, {}};
-
-    const std::uint64_t bytes = std::uint64_t{out.size()} * width;
-    if (bytes > SIZE_MAX) return {Error::memory_budget, "Mini plain weight read exceeds addressable storage"};
-    weight::Slice slice;
-    if (const auto status = weight::subslice(tensor->payload, {std::uint64_t{first_element} * width, bytes}, slice);
-        !status) return status;
-    if constexpr (std::endian::native == std::endian::little) {
-        if (f32) return weight::read_slice(slice, std::as_writable_bytes(out));
-    }
-
-    std::vector<weight::Byte> raw(static_cast<std::size_t>(bytes));
-    if (const auto status = weight::read_slice(slice, raw); !status) return status;
-    // Safetensors is little endian, including its plain F32 payload.
-    if (f32) {
-        for (std::size_t i = 0; i < out.size(); ++i) {
-            std::uint32_t bits = 0;
-            for (unsigned j = 0; j < 4; ++j)
-                bits |= std::to_integer<std::uint32_t>(raw[4 * i + j]) << (8U * j);
-            out[i] = std::bit_cast<float>(bits);
-        }
-    } else {
-        ggml_dequant::dequantize_row(weight::gguf_type(weight::safetensors_format(tensor->wire_dtype)), raw, out);
-    }
-    return {Error::ok, {}};
+    return weight::read_float_slice(*tensor, out, first_element);
 }
 
 weight::Status MiniTextWeights::expert_layer(unsigned physical, MiniExpertProjection projection,
@@ -245,22 +213,11 @@ weight::Status MiniTextWeights::expert_layer(unsigned physical, MiniExpertProjec
     const auto format = mini_expert_format(physical);
     const auto prefix = "model.llm.layers." + std::to_string(physical) + ".mlp.experts." +
                         (gate_up ? "w13_weight" : "w2_weight");
-    using weight::microscaled::MatrixFormat;
     MiniExpertLayerView result{format, mini_expert_row_order(projection),
                                kExperts, geometry.outputs, geometry.inputs, {}, {}, {}, {}};
-    const auto slice = [&](const std::string& name, weight::Slice& dst) {
-        const auto* tensor = find(name);
-        if (!tensor) return weight::Status{Error::malformed, "missing Mini expert tensor " + name};
-        return weight::subslice(tensor->payload, {0, tensor->payload.range.bytes}, dst);
-    };
-    if (const auto status = slice(prefix, result.codes); !status) return status;
-    if (const auto status = slice(prefix + "_scale", result.block_scales); !status)
+    const std::array names{prefix, prefix + "_scale", prefix + "_amax", prefix + "_outer_scale_denominator"};
+    if (const auto status = result.bind_sources(names, [&](std::string_view name) { return find(name); }); !status)
         return status;
-    if (format == MatrixFormat::nvfp4) {
-        if (const auto status = slice(prefix + "_amax", result.amax); !status) return status;
-        if (const auto status = slice(prefix + "_outer_scale_denominator", result.denominator); !status)
-            return status;
-    }
     out = std::move(result);
     return {Error::ok, {}};
 }

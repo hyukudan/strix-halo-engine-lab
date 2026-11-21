@@ -13,6 +13,7 @@ struct MiniTextTensorSpec {
     std::string name;
     std::string_view wire_dtype;
     std::vector<std::uint64_t> extents;
+    bool resident = true;
 };
 
 struct MiniCheckpointSummary {

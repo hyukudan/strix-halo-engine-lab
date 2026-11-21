@@ -27,11 +27,7 @@ std::string text_parameter(std::string_view suffix) {
     return "model.llm." + std::string(suffix);
 }
 
-struct VisitStorage {
-    std::vector<float> keys;
-    std::vector<float> values;
-    std::array<std::vector<float>, 4> history;
-};
+using VisitStorage = session::GrowingVisitCache<float, MiniVisitStatePlan::stream_count>;
 
 }  // namespace
 
@@ -54,12 +50,7 @@ struct MiniHostDecoder::Impl {
         const bool full = is_full_attention(visit.physical_layer);
         const unsigned window = plan.kv.ring;
 
-        const auto kv_elements = std::size_t{window == 0 ? position + 1U : window} * kKvWidth;
-        state.keys.resize(kv_elements);
-        state.values.resize(kv_elements);
-        for (unsigned i = 0; i < state.history.size(); ++i) {
-            state.history[i].resize((kConvTaps - 1U) * plan.convolution_widths[i]);
-        }
+        state.prepare(plan, position);
 
         const auto layer = visit.physical_layer;
         const auto query_gain = parameter(mini_layer_parameter(layer, "attn.q_l2_clip.scale"), kQueryWidth);
