@@ -233,7 +233,7 @@ private:
     void* tx_alloc_ = nullptr;
     void* rx_alloc_ = nullptr;
     std::uint64_t* flags_host_ = nullptr;  // [0] TX flag (GPU writes), [8] RX flag (CPU writes), [24] device wait abort
-    std::uint64_t wait_budget_ = 0;        // RxView::budget of recv_view() (device wall-clock ticks, 0 = unbounded)
+    std::uint64_t wait_budget_ = 0;        // RxView::budget of recv_view() (shader cycles, WaitMeter; 0 = unbounded)
     std::uint64_t* flags_dev_ = nullptr;
     unsigned* counter_dev_ = nullptr;
     std::uint64_t* gate_dev_ = nullptr;
