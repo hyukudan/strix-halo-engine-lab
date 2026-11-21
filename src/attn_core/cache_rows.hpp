@@ -41,9 +41,22 @@ __device__ __forceinline__ void store_row(const StoreArgs& a) {
     if (!ok && a.flag != nullptr) atomicOr(a.flag, 1U);
 }
 
+// store_rows_kernel keeps its own body (the same steps as store_row) so existing callers compile to the same
+// machine code as before the paired entry existed.
 template <unsigned kBlock>
 __global__ __launch_bounds__(kBlock) void store_rows_kernel(StoreArgs a) {
-    store_row<kBlock>(a);
+    const unsigned k = blockIdx.x;
+    const std::uint64_t p = a.positions != nullptr ? a.positions[k] : std::uint64_t{a.first_position} + k;
+    std::uint16_t* dst = a.cache + cr::row_offset(a.layout, p);
+    const float* src = a.src + static_cast<std::size_t>(k) * a.src_stride;
+    bool ok = true;
+    for (unsigned i = threadIdx.x; i < a.layout.width; i += kBlock) {
+        const float x = src[i];
+        const std::uint16_t b = cr::encode(x);
+        ok = ok && cr::finite(x) && cr::finite(b);
+        dst[i] = b;
+    }
+    if (!ok && a.flag != nullptr) atomicOr(a.flag, 1U);
 }
 
 template <unsigned kBlock>

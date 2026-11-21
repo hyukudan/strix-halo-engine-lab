@@ -48,7 +48,8 @@ inline Error launch_error() { return hipGetLastError(); }
 inline Error clear(unsigned* p, std::size_t bytes, Stream stream) { return hipMemsetAsync(p, 0, bytes, stream); }
 __device__ __forceinline__ unsigned ballot(bool active) { return static_cast<unsigned>(__ballot(active)); }
 __device__ __forceinline__ unsigned shuffle(unsigned value, unsigned source) {
-    return static_cast<unsigned>(__shfl(static_cast<int>(value), static_cast<int>(source), 32));
+    // Default width (the wave size) as before the CUDA form existed: same machine code for existing HIP planners.
+    return static_cast<unsigned>(__shfl(static_cast<int>(value), static_cast<int>(source)));
 }
 __device__ __forceinline__ unsigned wave_index(unsigned thread) { return ::strix::core::wave_index(thread); }
 __device__ __forceinline__ unsigned wave_scan(unsigned value, unsigned lane) {
@@ -77,6 +78,20 @@ __device__ __forceinline__ unsigned wave_scan(unsigned value, unsigned lane) {
 #endif
 
 } // namespace detail
+
+// HIP spells the wave primitives exactly as before the CUDA form existed, so existing HIP planners compile to the same
+// machine code; CUDA uses the detail helpers.
+#if defined(__HIPCC__)
+#define STRIX_DEVICE_PLAN_BALLOT(x) static_cast<unsigned>(__ballot(x))
+#define STRIX_DEVICE_PLAN_SHUFFLE(v, s) static_cast<unsigned>(__shfl(static_cast<int>(v), static_cast<int>(s)))
+#define STRIX_DEVICE_PLAN_WAVE_INDEX(t) ::strix::core::wave_index(t)
+#define STRIX_DEVICE_PLAN_WAVE_SCAN(v, l) ::strix::core::ordered_reduce::wave_inclusive_scan(v, l)
+#else
+#define STRIX_DEVICE_PLAN_BALLOT(x) detail::ballot(x)
+#define STRIX_DEVICE_PLAN_SHUFFLE(v, s) detail::shuffle(v, s)
+#define STRIX_DEVICE_PLAN_WAVE_INDEX(t) detail::wave_index(t)
+#define STRIX_DEVICE_PLAN_WAVE_SCAN(v, l) detail::wave_scan(v, l)
+#endif
 
 template <class P> struct Args {
     unsigned rows;
@@ -139,17 +154,17 @@ template <class P> __global__ __launch_bounds__(P::kRows) void rank_kernel(Args<
 #pragma unroll
     for (unsigned k = 0; k < K; ++k) if (e[k] >= E) done |= 1U << k;
     for (;;) {
-        const unsigned pending = detail::ballot(done != all);
+        const unsigned pending = STRIX_DEVICE_PLAN_BALLOT(done != all);
         if (!pending) break;
         const unsigned leader = static_cast<unsigned>(__builtin_ctz(pending));
         unsigned mine = E;
 #pragma unroll
         for (unsigned k = K; k-- > 0;) if (!(done >> k & 1U)) mine = e[k];
-        const unsigned x = detail::shuffle(mine, leader);
+        const unsigned x = STRIX_DEVICE_PLAN_SHUFFLE(mine, leader);
         unsigned slot = K;
 #pragma unroll
         for (unsigned k = 0; k < K; ++k) if (e[k] == x) slot = k;
-        const unsigned holders = detail::ballot(slot < K);
+        const unsigned holders = STRIX_DEVICE_PLAN_BALLOT(slot < K);
         if (slot < K) {
             rk[slot] = cnt[wave][x] + static_cast<unsigned>(__builtin_popcount(holders & ((1U << lane) - 1U)));
             done |= 1U << slot;
@@ -270,7 +285,7 @@ __global__ __launch_bounds__(P::kThreads) void csr_count_kernel(typename P::View
         }
     }
     if constexpr(Certificate) {
-        const unsigned bad=detail::ballot(unsafe);
+        const unsigned bad=STRIX_DEVICE_PLAN_BALLOT(unsafe);
         if(bad&&(t&31U)==0U)P::certificate(v);
     }
     const unsigned per=(rows+gridDim.x-1U)/gridDim.x;
@@ -313,11 +328,11 @@ __global__ __launch_bounds__(P::kThreads) void csr_scan_kernel(typename P::View 
         constexpr unsigned kScanWaves=P::kExperts/32U;
         static_assert(P::kExperts%32U==0U&&P::kExperts<=P::kThreads&&kScanWaves<=32U,"csr_scan: experts in whole waves");
         __shared__ unsigned wave_total[3][kScanWaves];
-        const unsigned lane=t&31U,wave=detail::wave_index(t);
+        const unsigned lane=t&31U,wave=STRIX_DEVICE_PLAN_WAVE_INDEX(t);
         unsigned in[3]={n,n!=0U,nb};
         if(t<P::kExperts) {
 #pragma unroll
-            for(unsigned k=0;k<3U;++k)in[k]=detail::wave_scan(in[k],lane);
+            for(unsigned k=0;k<3U;++k)in[k]=STRIX_DEVICE_PLAN_WAVE_SCAN(in[k],lane);
             if(lane==31U)for(unsigned k=0;k<3U;++k)wave_total[k][wave]=in[k];
         }
         __syncthreads();
@@ -368,11 +383,11 @@ __global__ __launch_bounds__(P::kThreads) void csr_scatter_kernel(typename P::Vi
         const unsigned a=step+lane;
         const bool valid=a<last&&planned(a);
         const unsigned e=valid?expert_at(a):0U;
-        unsigned active=detail::ballot(valid),peers=0U;
+        unsigned active=STRIX_DEVICE_PLAN_BALLOT(valid),peers=0U;
 #if defined(__HIPCC__)
         while(active) {
-            const unsigned leader_e=detail::shuffle(e,static_cast<unsigned>(__ffs(active)-1));
-            const unsigned same=detail::ballot(valid&&e==leader_e)&active;
+            const unsigned leader_e=static_cast<unsigned>(__shfl(static_cast<int>(e),__ffs(active)-1,32));
+            const unsigned same=STRIX_DEVICE_PLAN_BALLOT(valid&&e==leader_e)&active;
             if(valid&&e==leader_e)peers=same;
             active&=~same;
         }

@@ -108,10 +108,50 @@ __device__ __forceinline__ void route_wave_body(const float* logits, const float
     if constexpr (Traits::checked_status) status[r] = 0U;
 }
 
-// Keep the established four-argument entry and the checked entry's wave32 launch bound.
+// The established four-argument entry keeps its own body so the GLM and HY4 instantiations compile to the same
+// machine code as before the checked entry existed; route_wave_body above is the checked trait form of the same
+// algorithm (same score, key, top-k, ordering and renormalisation steps).
 template <const moe::RoutePolicy& P, class Math>
 __global__ void route_wave_kernel(const float* logits, const float* bias, std::uint32_t* ids, float* w) {
-    route_wave_body<P, Math, moe::RouteWaveTraits<>>(logits, bias, ids, w, nullptr);
+    static_assert(moe::validate(P) == nullptr, "route_wave_kernel: invalid policy");
+    static_assert(P.score == moe::RouteScore::sigmoid && P.selection_bias && P.key == moe::RouteKey::ordered_bits &&
+                      P.renormalize && (P.top_k > 1U || P.renorm_single),
+                  "route_wave_kernel: sigmoid + selection bias, ordered keys, renormalised weights");
+    using Pol = RouteWavePolicy<P>;
+    constexpr std::uint32_t experts = P.experts, top_k = P.top_k;
+    constexpr std::uint32_t all = Pol::candidates == 32U ? ~0U : (1U << Pol::candidates) - 1U;
+    __shared__ float sg[experts];
+    __shared__ std::uint32_t pick_s[top_k];
+    const unsigned r = blockIdx.x, lane = threadIdx.x;
+    const float* lg = logits + static_cast<std::size_t>(r) * experts;
+    float key[Pol::candidates];
+#pragma unroll
+    for (unsigned i = 0; i < Pol::candidates; ++i) {
+        const unsigned e = lane + 32 * i;
+        const float v = moe::sigmoid_score<Math>(lg[e]);
+        sg[e] = v;
+        key[i] = __builtin_bit_cast(float, moe::route_ordered_key(v + bias[e]));
+    }
+    route_wave_topk(key, all, experts, top_k, lane, Pol{lane, pick_s});
+    __syncthreads();
+    if (lane != 0) return;
+    std::uint32_t pick[top_k];
+    for (unsigned k = 0; k < top_k; ++k) pick[k] = pick_s[k];
+    if constexpr (P.order == moe::RouteOrder::ascending_id) {
+        for (unsigned a = 1; a < top_k; ++a)  // ascending id
+            for (unsigned b = a; b > 0 && pick[b - 1] > pick[b]; --b) {
+                const std::uint32_t t = pick[b];
+                pick[b] = pick[b - 1];
+                pick[b - 1] = t;
+            }
+    }
+    float den = 0.0F;
+    for (unsigned k = 0; k < top_k; ++k) den = den + sg[pick[k]];
+    den = den + P.renorm_eps;
+    for (unsigned k = 0; k < top_k; ++k) {
+        ids[static_cast<std::size_t>(r) * top_k + k] = pick[k];
+        w[static_cast<std::size_t>(r) * top_k + k] = (sg[pick[k]] / den) * P.scale;
+    }
 }
 
 template <const moe::RoutePolicy& P, class Math, class Traits>
