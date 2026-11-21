@@ -156,7 +156,8 @@ struct SessionEngine::Impl {
             const std::uint64_t width=std::uint64_t(c.kv_heads)*c.layer[i].head_dim;
             const auto rows=c.layer[i].attention==AttentionKind::global?positions:c.window;
             total+=rows*(2*width*sizeof(float)+sizeof(std::uint64_t));
-        }return total;
+        }
+        return total;
     }
     bool reusable(const PrefixSnapshot& p) const {
         if(p.purpose==PrefixSnapshot::Purpose::complete_turn)

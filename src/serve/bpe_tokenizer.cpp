@@ -385,9 +385,9 @@ struct BpeTokenizer::Impl {
             }
         }
         // False when the table is full: the caller replaces it.
-        bool insert(std::size_t hash, std::string_view piece, const std::vector<std::uint32_t>& ids) {
+        bool insert(std::size_t hash, std::string_view piece, const std::vector<std::uint32_t>& piece_ids) {
             if (size.load(std::memory_order_relaxed) >= limit) return false;
-            auto entry = std::make_unique<Entry>(Entry{hash, std::string(piece), ids});
+            auto entry = std::make_unique<Entry>(Entry{hash, std::string(piece), piece_ids});
             for (std::size_t i = hash & (slots - 1U);; i = (i + 1U) & (slots - 1U)) {
                 Entry* seen = table[i].load(std::memory_order_acquire);
                 if (!seen && table[i].compare_exchange_strong(seen, entry.get(), std::memory_order_release,
