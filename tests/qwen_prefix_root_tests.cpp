@@ -5,7 +5,12 @@
 //    continuation boundary with a certificate, so publishing it changes no plan, certificate or row (exhaustive sweep);
 // 3. the selector with requested=false is the previous formula (exhaustive); a requested boundary is selected;
 // 4. no-model replay: producer publishes the selected full-T boundaries, a sibling with the same prefix restores the
-//    deepest one inside the prefix; restored rows with and without the root request.
+//    deepest one inside the prefix (only boundaries the capture order admits); restored rows with and without the
+//    root request;
+// 5. capture order (prefix_capture_fence): the incumbent same-T-owner rule is unchanged; a requested boundary whose
+//    next unit is another owner is fenced (event on a known tail-owner stream, host otherwise), a cadence one refused;
+// 6. the served case (system 6258 of n 6277): the root 6144 is followed by a tail owner; under the incumbent order
+//    the sibling restores 4096 (the device failure), fenced it restores 6144.
 #include "qwen_cache_admission.hpp"
 #include "qwen_tiled_prompt_plan.hpp"
 
@@ -36,14 +41,29 @@ bool previous_selected(std::uint64_t p, std::uint64_t covered, std::uint64_t til
     return tile && cadence && (p % cadence == 0 || p > covered || covered - p < tile);
 }
 
+// The capture order at full-T boundary p, as prepare_capture (apps/hip_prefix_state_cache.hpp) sees the bridge's
+// order: the producer is the T owner's stream, the predictor stream is shared, a tail owner's stream is known.
+// fence_on=false: the incumbent rule (another owner next always refuses).
+PrefixCaptureFence capture_fence(const QwenTiledPlanConfig& c, std::uint64_t n, std::uint64_t p, bool requested,
+                                 bool fence_on = true) {
+    auto cursor = *qwen_full_t_continuation(c, n, p);
+    const auto next = qwen_prompt_next(c, cursor, p, n);
+    if (!next) return PrefixCaptureFence::refused;
+    const bool same = next->t_owner && next->owner == c.block;
+    if (!same && !fence_on) return PrefixCaptureFence::refused;
+    const bool known = same || (next->kind == QwenPlanKind::tail_owner && !next->t_owner);
+    return prefix_capture_fence(same, known, same, true, requested);
+}
+
 // Deepest boundary a producer of n tokens publishes at or below `limit` (the sibling's shared prefix).
 std::uint64_t restored_by_sibling(const QwenTiledPlanConfig& c, std::uint64_t n, std::uint64_t stable,
-                                  std::uint64_t block, std::uint64_t cadence, bool root_on) {
+                                  std::uint64_t block, std::uint64_t cadence, bool root_on, bool fence_on = true) {
     const auto root = root_on ? prefix_root_capture(stable, n, c.rows) : 0;
     std::uint64_t best = 0;
     for (std::uint64_t p = c.rows; p < n; p += c.rows) {
         if (!qwen_full_t_continuation(c, n, p)) continue;
         if (!prefix_capture_boundary_selected(p, n - 1, block, cadence, p == root)) continue;
+        if (capture_fence(c, n, p, p == root, fence_on) == PrefixCaptureFence::refused) continue;
         if (p <= stable) best = p;
     }
     return best;
@@ -109,6 +129,47 @@ int main() {
         }
         std::printf("root-replay mean gain rows=%llu over %llu prefixes\n",
                     static_cast<unsigned long long>(gain_rows / cases), static_cast<unsigned long long>(cases));
+
+        // 5. ordering rule. Incumbent: admitted iff the next unit is this T owner on the producer stream and the
+        //    predictor stream is shared; that stays exactly the `stream` class.
+        for (int bits = 0; bits < 32; ++bits) {
+            const bool same = (bits & 1) != 0, known = (bits & 2) != 0, producer = (bits & 4) != 0;
+            const bool pred = (bits & 8) != 0, req = (bits & 16) != 0;
+            const auto f = prefix_capture_fence(same, known, producer, pred, req);
+            if (same)
+                require((f == PrefixCaptureFence::stream) == (known && producer && pred) &&
+                            (f == PrefixCaptureFence::stream || f == PrefixCaptureFence::refused),
+                        "same owner incumbent");
+            else if (!pred || !req)
+                require(f == PrefixCaptureFence::refused, "cadence / foreign predictor refused");
+            else
+                require(f == (!known      ? PrefixCaptureFence::host
+                              : producer ? PrefixCaptureFence::stream
+                                         : PrefixCaptureFence::event),
+                        "requested fenced");
+        }
+        // Every root of the sweep is admitted; a cadence boundary followed by another owner never is.
+        std::uint64_t fenced = 0, hosted = 0;
+        for (std::uint64_t n = 2; n <= 16384; n += 7)
+            for (std::uint64_t s = 1; s <= n + 64; s += 509) {
+                const auto r = prefix_root_capture(s, n, c.rows);
+                if (!r) continue;
+                const auto f = capture_fence(c, n, r, true);
+                require(f != PrefixCaptureFence::refused, "root admitted n=" + std::to_string(n));
+                fenced += f == PrefixCaptureFence::event ? 1U : 0U;
+                hosted += f == PrefixCaptureFence::host ? 1U : 0U;
+                if (f != PrefixCaptureFence::stream)
+                    require(capture_fence(c, n, r, false) == PrefixCaptureFence::refused, "cadence cross-owner refused");
+            }
+        require(fenced > 0, "sweep reached tail-owner roots");
+        std::printf("root-fence roots event=%llu host=%llu\n", static_cast<unsigned long long>(fenced),
+                    static_cast<unsigned long long>(hosted));
+
+        // 6. the served case: n 6277, system 6258 (sibling prompt 6275).
+        require(prefix_root_capture(6258, 6277, c.rows) == 6144, "served root");
+        require(capture_fence(c, 6277, 6144, true) == PrefixCaptureFence::event, "served root: tail-owner event fence");
+        require(restored_by_sibling(c, 6277, 6258, 1024, cadence, true, false) == 4096, "incumbent order: 4096");
+        require(restored_by_sibling(c, 6277, 6258, 1024, cadence, true) == 6144, "fenced: 6144");
         std::printf("qwen prefix root tests PASS\n");
         return 0;
     } catch (const std::exception& e) {

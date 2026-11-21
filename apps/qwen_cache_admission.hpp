@@ -225,6 +225,23 @@ inline bool prefix_capture_boundary_selected(std::uint64_t position, std::uint64
 inline std::uint64_t prefix_root_capture(std::uint64_t stable_prefix, std::uint64_t n, std::uint32_t tile) {
     return session::root_mark(stable_prefix, n, tile, 2);
 }
+// How an asynchronous capture at a full-T boundary is ordered against the unit that writes the state next.
+// stream: the next unit is the same T owner on the producer stream (incumbent: stream order, no dependency added).
+// event:  a requested boundary (root mark, waiting joiner) whose next unit is another owner with a known stream: that
+//         stream waits on the target snapshot event before its first write (device side, no host wait, no copy).
+// host:   the same, the next owner's stream unknown (window / serial rows): the host waits on the snapshot once.
+// The predictor must be the same stream for both units (its rows and held row stay stream ordered); a cadence
+// boundary followed by another owner stays refused.
+enum class PrefixCaptureFence : std::uint8_t { refused, stream, event, host };
+inline PrefixCaptureFence prefix_capture_fence(bool next_same_t_owner, bool next_stream_known, bool next_stream_is_producer,
+    bool predictor_same, bool requested) {
+    if(!predictor_same) return PrefixCaptureFence::refused;
+    if(next_same_t_owner)
+        return next_stream_known && next_stream_is_producer ? PrefixCaptureFence::stream : PrefixCaptureFence::refused;
+    if(!requested) return PrefixCaptureFence::refused;
+    if(!next_stream_known) return PrefixCaptureFence::host;
+    return next_stream_is_producer ? PrefixCaptureFence::stream : PrefixCaptureFence::event;
+}
 // Observer ownership never depends on storage admission, budget or family.
 inline bool cache_observer_required(bool tiled, bool import_export, bool diagnostic) {
     return tiled && (import_export || diagnostic);

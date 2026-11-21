@@ -163,8 +163,11 @@ struct PrefixDmaQuarantine {
 // Positive runtime evidence for the next writers. Unknown ownership refuses capture.
 // Predictor sources must remain owned by this stream through snapshot submission;
 // any later host/default-stream writer must follow the incumbent priming completion.
+// next_other_owner: the next unit is not this T owner (a tail / window / serial owner); next_target is then its
+// producer stream when known. Admitted only at a requested boundary, fenced (prefix_capture_fence).
 struct PrefixCaptureOrder {
     std::optional<hipStream_t> next_target, predictor, next_predictor;
+    bool next_other_owner=false;
 };
 
 // Attach-time HIP resources; a descriptor retains this owner through DMA/quarantine.
@@ -202,13 +205,24 @@ struct PrefixAsyncCapture : std::enable_shared_from_this<PrefixAsyncCapture> {
     bool poisoned=false, split_target=false, metadata_complete=true;
     const void* owner_tag=nullptr;
     hipStream_t target_stream=nullptr;
+    // A requested cross-owner capture (PrefixCaptureFence event/host): fence_stream already waits on target_ready.
+    bool fenced=false;
+    hipStream_t fence_stream=nullptr;
     // Serialized runner thread only. Query is deliberately nonblocking; no producer wait.
+    // A fenced capture orders any other writer after the target snapshot instead (device wait on a known
+    // stream, host wait on an unknown one): it is the request's one requested boundary, never poisoned.
     static void before_writer(const void* tag,hipStream_t stream) {
         auto d=slot;
         if(!d || !tag || d->owner_tag!=tag || d->poisoned || stream==d->target_stream) return;
+        if(d->fenced && stream && stream==d->fence_stream) return;
         const auto status=hipEventQuery(d->target_ready);
         if(status==hipSuccess) return;
         if(status!=hipErrorNotReady) {d->fatal();check(status,"prefix writer tripwire query");}
+        if(d->fenced) {
+            const auto e=stream?hipStreamWaitEvent(stream,d->target_ready,0):hipEventSynchronize(d->target_ready);
+            if(e!=hipSuccess) {d->fatal();check(e,"prefix writer fence");}
+            return;
+        }
         d->poisoned=true;d->store->record_tripwire_skip();
     }
     using RowChain=std::vector<std::shared_ptr<const PrefixCacheSegment>>;
@@ -715,6 +729,7 @@ public:
     [[nodiscard]] const std::optional<QwenPlanCursor>& continuation() const {return continuation_;}
     [[nodiscard]] const ModelContentIdentity& active_identity() const {return certified_path_?plan_identity_:identity_;}
     void request_capture(std::uint64_t position) { requested_captures_.insert(position); }
+    [[nodiscard]] bool capture_requested(std::uint64_t position) const { return requested_captures_.contains(position); }
     [[nodiscard]] std::uint64_t cached_boundary(std::span<const std::uint32_t> prompt) const {
         if(!store_ || prompt.empty()) return 0;
         const auto digests=prefix_cache_block_digests(active_identity(),prompt,block_rows_,(prompt.size()-1U)/block_rows_);
@@ -923,13 +938,15 @@ private:
         if(!retain_) {store_->record_no_store_skip();return {};}
         auto cursor=*qwen_full_t_continuation(plan_,plan_n_,p);
         const auto next=qwen_prompt_next(plan_,cursor,p,plan_n_);
-        // Even a matching handle cannot authorize a different tail/window/serial owner.
-        // An incumbent partial block of this same T owner uses the same ordered stream.
-        if(!next || !next->t_owner || next->owner!=plan_.block ||
-            !order.next_target || *order.next_target!=producer || !order.predictor ||
-            !order.next_predictor || *order.predictor!=*order.next_predictor) {
-            store_->record_cross_stream_skip();return {};
-        }
+        // An incumbent partial block of this same T owner uses the same ordered stream. A different
+        // tail/window/serial owner is admitted only at a requested boundary and only fenced (event or host):
+        // the plan and the caller's order must agree that the next unit is another owner.
+        const bool next_same=next && next->t_owner && next->owner==plan_.block;
+        const auto fence=!next || next_same==order.next_other_owner ? PrefixCaptureFence::refused :
+            prefix_capture_fence(next_same,order.next_target.has_value(),order.next_target && *order.next_target==producer,
+                order.predictor && order.next_predictor && *order.predictor==*order.next_predictor,
+                requested_captures_.contains(p) && selected);
+        if(fence==PrefixCaptureFence::refused) {store_->record_cross_stream_skip();return {};}
         const auto resources=std::static_pointer_cast<PrefixCaptureResources>(store_->capture_resources);
         if(PrefixAsyncCapture::slot) {store_->record_staging_skip(false);if(resources) store_->record_no_slot();return {};}
         if(resources && resources->poisoned) {store_->record_no_slot();return {};}
@@ -1010,6 +1027,13 @@ private:
             d->started=true;
             try {
                 d->snapshot(false,producer);
+                // Fence the next owner after the snapshot reads, before any of its writes (it launches later).
+                d->fenced=fence==PrefixCaptureFence::event || fence==PrefixCaptureFence::host;
+                if(fence==PrefixCaptureFence::event) {
+                    d->fence_stream=*order.next_target;
+                    PrefixAsyncCapture::check(hipStreamWaitEvent(d->fence_stream,d->target_ready,0),"prefix cross-owner fence");
+                } else if(fence==PrefixCaptureFence::host)
+                    PrefixAsyncCapture::check(hipEventSynchronize(d->target_ready),"prefix cross-owner host fence");
                 if(split_target) d->submit_target_download();
             } catch(...) {d->fatal();throw;}
             return d;

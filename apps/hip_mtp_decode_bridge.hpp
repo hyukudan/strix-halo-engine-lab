@@ -648,9 +648,11 @@ public:
                 next.push_back(tokens_[static_cast<std::size_t>(pos_+r+1U)]);}
             const auto stream=static_cast<hipStream_t>(runtime_.resources().stream());
             const auto* last=block_hidden_+static_cast<std::size_t>(rows-1U)*width_;
-            if((block.capture || tiled_.cache_tails) && tiled_.cache && !legacy_cache())
+            if((block.capture || tiled_.cache_tails) && tiled_.cache && !legacy_cache()) {
+                const auto order=capture_order(block,grouped,stream);
                 capture_=tiled_.cache->try_prepare_capture(session_,tokens_,block.owner->producer_stream(),
-                    !block.owner->completion_pending(),capture_order(block,grouped,stream),n_-1U,block.owner->producer_lifetime(),runtime_.resources().shared_from_this(),batch_?this:nullptr);
+                    !block.owner->completion_pending(),order,n_-1U,block.owner->producer_lifetime(),runtime_.resources().shared_from_this(),capture_tag(order));
+            }
             int device=0;strix::hip_check(hipGetDevice(&device),"get priming device");
             const auto submit=[this,device,stream,last,capture=capture_,views=std::move(views),next=std::move(next)] {
                 try {
@@ -681,9 +683,10 @@ public:
         const bool split_capture=(block.capture || tiled_.cache_tails) && tiled_.cache && tiled_.cache->pooled_capture();
         if(split_capture) {
             const auto stream=static_cast<hipStream_t>(runtime_.resources().stream());
+            const auto order=capture_order(block,grouped,stream);
             capture_=tiled_.cache->try_prepare_target_capture(session_,tokens_,block.owner->producer_stream(),
-                !block.owner->completion_pending(),capture_order(block,grouped,stream),n_-1U,
-                block.owner->producer_lifetime(),runtime_.resources().shared_from_this(),batch_?this:nullptr);
+                !block.owner->completion_pending(),order,n_-1U,
+                block.owner->producer_lifetime(),runtime_.resources().shared_from_this(),capture_tag(order));
         }
         runtime_.prime_hidden_rows(qualified_,activated_,views,next,producer_rotary_);
         strix::hip_check(hipMemcpy(held_,block_hidden_+static_cast<std::size_t>(rows-1U)*width_,static_cast<std::size_t>(width_),hipMemcpyDeviceToDevice),
@@ -703,8 +706,9 @@ public:
                 }
             } else if(complete) {
                 const auto stream=static_cast<hipStream_t>(runtime_.resources().stream());
-                capture_=tiled_.cache->try_prepare_capture(session_,tokens_,block.owner->producer_stream(),true,capture_order(block,grouped,stream),n_-1U,
-                    block.owner->producer_lifetime(),runtime_.resources().shared_from_this(),batch_?this:nullptr);
+                const auto order=capture_order(block,grouped,stream);
+                capture_=tiled_.cache->try_prepare_capture(session_,tokens_,block.owner->producer_stream(),true,order,n_-1U,
+                    block.owner->producer_lifetime(),runtime_.resources().shared_from_this(),capture_tag(order));
                 if(capture_) {
                     capture_->submit_predictor(stream);
                     capture_->commit(true);
@@ -860,12 +864,23 @@ public:
     }
 private:
     using Phase=QwenPlanPhase;
+    // Captures tagged with this prompt get the writer tripwire (batch) or the writer fence (cross-owner).
+    const void* capture_tag(const PrefixCaptureOrder& order) const {return batch_ || order.next_other_owner?this:nullptr;}
     PrefixCaptureOrder capture_order(const Block& block,bool grouped,hipStream_t snapshot_predictor) const {
         if(grouped || small_ || (batch_ && forced_ladder_) || adopted_ || !certified_request_) return {};
         QwenPlanCursor cursor{phase_,tail_,balanced_};
         const auto next=qwen_prompt_next(plan_config_,cursor,session_.next_position,n_,false,small_,adopted_);
-        if(!next || !next->t_owner ||
-            block.owner!=tiled_.block_owner.get() || next->owner!=plan_config_.block) return {};
+        if(!next || block.owner!=tiled_.block_owner.get()) return {};
+        const auto mtp=static_cast<hipStream_t>(runtime_.resources().stream());
+        if(!next->t_owner || next->owner!=plan_config_.block) {
+            // Another owner writes next: only a requested boundary (root mark) is captured, fenced by the cache
+            // (the tail owner's stream waits on the snapshot; window / serial rows: a host wait). Not in batch mode.
+            if(batch_ || !tiled_.cache->capture_requested(session_.next_position)) return {};
+            PrefixCaptureOrder order{std::nullopt,snapshot_predictor,mtp,true};
+            if(next->kind==QwenPlanKind::tail_owner && !next->t_owner && next->tail<tiled_.tails.size() &&
+               tiled_.tails[next->tail].owner) order.next_target=tiled_.tails[next->tail].owner->producer_stream();
+            return order;
+        }
         if(batch_) {
             const auto p=session_.next_position;
             const bool nest=qwen_batch_nest_possible(batch_cert_.nesting_possible,batch_cert_.config.nest_rows,tiled_.rows,n_-p);
@@ -873,7 +888,6 @@ private:
                 trace_.back(),tiled_.rows,qwen_producer_trace_ok(plan_config_,n_,p,trace_),
                 next->t_owner,static_cast<std::uint32_t>(next->end-next->begin),nest)) return {};
         }
-        const auto mtp=static_cast<hipStream_t>(runtime_.resources().stream());
         // The next target writes on this actual owner stream. Predictor rows and held_ are
         // next written on mtp. The next target uses the spare tap buffer; drain_priming
         // joins the worker and completes mtp (including its snapshot) before tap reuse or
@@ -926,7 +940,8 @@ public:
     std::function<void(HipKnownPrefixWindow&,const std::function<void()>&)> execute_native;
     void drain_for_handoff(){drain_priming();}
     void set_request_order(std::uint64_t value) {request_order_=value;}
-    void before_writer(hipStream_t stream) const {if(batch_cert_.enabled) PrefixAsyncCapture::before_writer(this,stream);}
+    // A no-op unless the pending capture carries this tag (batch certification, or a fenced cross-owner capture).
+    void before_writer(hipStream_t stream) const {PrefixAsyncCapture::before_writer(this,stream);}
 private:
     std::vector<float> pair_logits_;
     void run_block(const Block& block) {
