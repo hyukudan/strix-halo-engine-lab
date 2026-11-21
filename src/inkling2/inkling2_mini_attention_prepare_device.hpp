@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/dense_row_plan.hpp"
 #include "inkling2_mini_attention_prepare.hpp"
 #include "inkling2_mini_state.hpp"
 
@@ -80,11 +81,7 @@ struct MiniAttentionOutputRows {
     float* output;           // [row][kHiddenWidth]
 };
 
-struct MiniAttentionLinear {
-    const std::uint16_t* weights;
-    unsigned outputs;
-    float* output;
-};
+using MiniAttentionLinear = core::Bf16RowProjection;
 
 inline bool mini_attention_device_aligned(const void* pointer) {
     return pointer && reinterpret_cast<std::uintptr_t>(pointer) % 16U == 0;

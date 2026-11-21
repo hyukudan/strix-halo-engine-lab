@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/bf16_lm_head.hpp"
 #include "cuda/core/short_convolution.cuh"
 #include "inkling2_mini_attention_prepare_device.hpp"
 #include "inkling2_mini_dense_cuda.hpp"
@@ -26,20 +27,10 @@ struct MiniPreparedCudaBackend : MiniPreparedRowsDevice<cudaStream_t> {
     cuda_core::BigCtx* big_context = nullptr;
 
     Status linear(const float* input, unsigned width, unsigned rows, std::span<const MiniAttentionLinear> views) const {
-        constexpr std::size_t max_projections = 4U;
-        while (!views.empty()) {
-            std::array<MiniCudaDenseProjection, max_projections> projections{};
-            const auto count = std::min(max_projections, views.size());
-            for (std::size_t i = 0; i < count; ++i) {
-                const auto& p = views[i];
-                projections[i] = {p.weights, p.outputs, p.output};
-            }
-            const auto status = enqueue_mini_cuda_dense_rows(
-                input, width, rows, std::span(projections).first(count), stream, arithmetic, big_context);
-            if (status != success) return status;
-            views = views.subspan(count);
-        }
-        return success;
+        return core::for_each_bf16_projection_group<cuda_core::kMaxBf16RowProjections>(views, success,
+            [&](std::span<const MiniAttentionLinear> group) {
+                return enqueue_mini_cuda_dense_rows(input, width, rows, group, stream, arithmetic, big_context);
+            });
     }
 
     Status convolve(const core::ShortConvolution& plan, unsigned rows, const float* input, const float* lag_weights,
@@ -83,11 +74,10 @@ inline constexpr unsigned kMiniCudaOutputVocabulary = kOutputVocabulary;
 inline cudaError_t enqueue_mini_cuda_logits(
     const std::uint16_t* output_weight, const float* normalized_hidden, float* logits, unsigned rows,
     cudaStream_t stream, cuda_core::DenseArith arithmetic = cuda_core::DenseArith::mma3) {
-    const MiniCudaDenseProjection projection{output_weight, kOutputVocabulary, logits};
-    if (auto status = enqueue_mini_cuda_dense_rows(normalized_hidden, kHiddenWidth, rows,
-            std::span(&projection, 1U), stream, arithmetic); status != cudaSuccess) return status;
-    namespace prep = core::prepared_rows_device;
-    return prep::elements(std::size_t{rows} * kOutputVocabulary, prep::Bf16Softcap{logits, kLogitSoftcap}, stream);
+    return core::enqueue_bf16_softcap_head(rows, {output_weight, kOutputVocabulary, logits}, kLogitSoftcap, stream,
+        [&](std::span<const MiniCudaDenseProjection> projections) {
+            return enqueue_mini_cuda_dense_rows(normalized_hidden, kHiddenWidth, rows, projections, stream, arithmetic);
+        });
 }
 
 }  // namespace strix::inkling2

@@ -20,19 +20,10 @@ struct MiniPreparedHipBackend : MiniPreparedRowsDevice<hipStream_t> {
     static constexpr auto invalid = hipErrorInvalidValue;
 
     Status linear(const float* input, unsigned width, unsigned rows, std::span<const MiniAttentionLinear> views) const {
-        constexpr auto max_projections = core::fma_rows::kGroupMax;
-        while (!views.empty()) {
-            std::array<MiniHipDenseProjection, max_projections> projections{};
-            const auto count = std::min<std::size_t>(max_projections, views.size());
-            for (std::size_t i = 0; i < count; ++i) {
-                const auto& p = views[i];
-                projections[i] = {p.weights, p.outputs, p.output};
-            }
-            const auto status = enqueue_mini_hip_dense_rows(input, width, rows, std::span(projections).first(count), stream);
-            if (status != success) return status;
-            views = views.subspan(count);
-        }
-        return success;
+        return core::for_each_bf16_projection_group<core::fma_rows::kGroupMax>(views, success,
+            [&](std::span<const MiniAttentionLinear> group) {
+                return enqueue_mini_hip_dense_rows(input, width, rows, group, stream);
+            });
     }
 
     Status convolve(const core::ShortConvolution& plan, unsigned rows, const float* input, const float* lag_weights,
