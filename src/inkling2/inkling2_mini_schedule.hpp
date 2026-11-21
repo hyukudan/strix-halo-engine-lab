@@ -1,47 +1,45 @@
 #pragma once
-#include <array>
-#include <cstddef>
-#include <stdexcept>
+
+#include "core/looped_layers.hpp"
 
 namespace strix::inkling2 {
 
-// Physical weights are shared across the three core passes. Logical visits
-// have independent runtime attention/convolution state.
-struct LayerVisit {
-    unsigned physical_layer;
-    unsigned pass;
-    unsigned logical_layer;
-};
-
+using core::LayerVisit;
 inline constexpr unsigned kPhysicalLayers = 24;
-inline constexpr unsigned kLogicalVisits = 48;
 inline constexpr unsigned kCoreFirst = 6;
 inline constexpr unsigned kCoreLast = 18;
 inline constexpr unsigned kCorePasses = 3;
+inline constexpr unsigned kResidualBlockLayers = 6;
+using MiniLayers = core::LoopedLayers<kPhysicalLayers, kCoreFirst, kCoreLast, kCorePasses>;
+inline constexpr unsigned kLogicalVisits = MiniLayers::visits;
 
-constexpr std::array<LayerVisit, kLogicalVisits> mini_schedule() {
-    std::array<LayerVisit, kLogicalVisits> out{};
-    unsigned i = 0;
-    for (unsigned layer = 0; layer < kCoreFirst; ++layer)
-        out[i] = {layer, 0, i}, ++i;
-    for (unsigned pass = 0; pass < kCorePasses; ++pass)
-        for (unsigned layer = kCoreFirst; layer < kCoreLast; ++layer)
-            out[i] = {layer, pass, i}, ++i;
-    for (unsigned layer = kCoreLast; layer < kPhysicalLayers; ++layer)
-        out[i] = {layer, 0, i}, ++i;
-    return out;
-}
-
-constexpr bool is_core(unsigned physical_layer) {
-    return physical_layer >= kCoreFirst && physical_layer < kCoreLast;
-}
-
+constexpr auto mini_schedule() { return MiniLayers::schedule(); }
+constexpr bool is_core(unsigned physical_layer) { return MiniLayers::is_core(physical_layer); }
 constexpr unsigned state_slot(unsigned physical_layer, unsigned pass) {
-    if (physical_layer >= kPhysicalLayers || (is_core(physical_layer) ? pass >= kCorePasses : pass != 0))
-        throw std::out_of_range("invalid Inkling 2 Mini layer/pass");
-    if (physical_layer < kCoreFirst) return physical_layer;
-    if (is_core(physical_layer)) return kCoreFirst + pass * (kCoreLast - kCoreFirst) + physical_layer - kCoreFirst;
-    return kCoreFirst + kCorePasses * (kCoreLast - kCoreFirst) + physical_layer - kCoreLast;
+    return MiniLayers::state_slot(physical_layer, pass);
 }
 
-} // namespace strix::inkling2
+constexpr bool starts_residual_block(LayerVisit visit) {
+    return visit.physical_layer % kResidualBlockLayers == 0;
+}
+
+constexpr bool is_full_attention(unsigned physical_layer) {
+    return physical_layer % kResidualBlockLayers == kResidualBlockLayers - 1U;
+}
+
+// A repeated pass reads the incoming residual at its second core block
+// boundary, plus the hidden output at the end of that pass.
+constexpr bool captures_message_boundary(LayerVisit visit) {
+    return visit.physical_layer == kCoreFirst + kResidualBlockLayers &&
+           visit.pass + 1U < kCorePasses;
+}
+
+// The official reference numbers pass-zero slots by physical layer, then
+// appends caches for repeats. Takes a visit from mini_schedule().
+constexpr unsigned reference_state_slot(LayerVisit visit) {
+    return visit.pass == 0 ? visit.physical_layer
+        : kPhysicalLayers + (visit.pass - 1U) * MiniLayers::core_width
+              + (visit.physical_layer - kCoreFirst);
+}
+
+}  // namespace strix::inkling2

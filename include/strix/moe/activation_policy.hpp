@@ -23,4 +23,19 @@ STRIX_MOE_ACT_HD inline SwigluClamped swiglu_clamp(float gate, float up, float l
     return {gate > limit ? limit : gate, up < -limit ? -limit : (up > limit ? limit : up)};
 }
 
+// The sigmoid operates on the raw gate. Only the linear gate factor
+// and the up projection are softcapped.
+template <class Math>
+struct SoftcappedSwiglu {
+    float gate_cap;
+    float up_cap;
+
+    STRIX_MOE_ACT_HD float operator()(float gate, float up) const {
+        const float capped_gate = gate_cap * Math::tanh(gate / gate_cap);
+        const float capped_up = up_cap * Math::tanh(up / up_cap);
+        const float sigmoid = 1.0F / (1.0F + Math::exp(-gate));
+        return (capped_gate * sigmoid) * capped_up;
+    }
+};
+
 }  // namespace strix::moe
