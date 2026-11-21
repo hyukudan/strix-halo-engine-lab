@@ -248,13 +248,6 @@ cudaError_t by_terms(const MmaCall& c, const MmaArgs& ma, std::uint32_t tiles, c
 
 }  // namespace
 
-bool dense_mma_supported(const MmaCall& c) {
-    if (c.format == WeightFormat::f32 || c.in % 32 != 0 || c.rows == 0 || c.rows > 32) return false;
-    for (int j = 0; j < c.n; ++j)
-        if (c.out[j] % 16 != 0) return false;
-    return true;
-}
-
 template <bool RoundBf16>
 static cudaError_t launch_mma(const MmaCall& c, cudaStream_t s) {
     MmaArgs ma{};
@@ -272,6 +265,13 @@ static cudaError_t launch_mma(const MmaCall& c, cudaStream_t s) {
     if (c.format == WeightFormat::bf16)
         return fused ? by_terms<WeightFormat::bf16, true>(c, ma, tiles, s) : by_terms<WeightFormat::bf16, false>(c, ma, tiles, s);
     return fused ? by_terms<WeightFormat::q8_0, true>(c, ma, tiles, s) : by_terms<WeightFormat::q8_0, false>(c, ma, tiles, s);
+}
+
+bool dense_mma_supported(const MmaCall& c) {
+    if (c.format == WeightFormat::f32 || c.in % 32 != 0 || c.rows == 0 || c.rows > 32) return false;
+    for (int j = 0; j < c.n; ++j)
+        if (c.out[j] % 16 != 0) return false;
+    return true;
 }
 
 cudaError_t dense_mma_launch(const MmaCall& c, cudaStream_t s) {
