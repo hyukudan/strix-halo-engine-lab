@@ -6,6 +6,7 @@
 #include "inkling2/inkling2_mini_tokenizer.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <memory>
 
 int main(int argc, char** argv) {
@@ -37,7 +38,11 @@ int main(int argc, char** argv) {
         }
         const auto positions = cli::context(options);
         const auto max_rows = std::min(options.prefill_chunk, static_cast<unsigned>(options.prompt.size()));
+        const auto load_start = std::chrono::steady_clock::now();
         MiniResidentDecoder decoder(argv[1], positions, max_rows, options.packed_decode);
+        std::cout << "timing load_ms "
+                  << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - load_start).count()
+                  << '\n';
         std::vector<unsigned> generated;
         cli::run(decoder, options, tokenizer ? &generated : nullptr);
         if (tokenizer && !generated.empty()) std::cout << "text " << tokenizer->decode(generated, true) << '\n';
