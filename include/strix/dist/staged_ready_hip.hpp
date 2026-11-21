@@ -1,6 +1,7 @@
 #pragma once
-#include "strix/dist/staged_ready.hpp"
+// The HIP runtime comes first: shared headers below define __host__ __device__ helpers that need its device builtins.
 #include <hip/hip_runtime.h>
+#include "strix/dist/staged_ready.hpp"
 
 namespace strix::dist {
 

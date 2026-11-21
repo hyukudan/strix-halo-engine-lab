@@ -1,6 +1,7 @@
 #pragma once
-#include "backend.hpp"
+// The HIP runtime comes first: shared headers below define __host__ __device__ helpers that need its device builtins.
 #include <hip/hip_runtime.h>
+#include "backend.hpp"
 
 namespace strix::core {
 // Creation-time probe only; unknown HIP errors propagate to the caller.

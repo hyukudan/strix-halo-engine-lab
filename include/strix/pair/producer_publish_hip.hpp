@@ -1,6 +1,7 @@
 #pragma once
-#include "strix/pair/producer_publish.hpp"
+// The HIP runtime comes first: shared headers below define __host__ __device__ helpers that need its device builtins.
 #include <hip/hip_runtime.h>
+#include "strix/pair/producer_publish.hpp"
 
 namespace strix::pair {
 

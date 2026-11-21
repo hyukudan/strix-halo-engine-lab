@@ -1,11 +1,12 @@
 #pragma once
+// The HIP runtime comes first: shared headers below define __host__ __device__ helpers that need its device builtins.
+#include <hip/hip_runtime.h>
 #include "channel.hpp"
 #include "staging.hpp"
 #include "row_fold.hpp"
 // Shared TP2 staging/progress engine; engine-specific wire ABI lives in Traits.
 #include "strix/dist/communicator.hpp"
 
-#include <hip/hip_runtime.h>
 
 #include <atomic>
 #include <chrono>
