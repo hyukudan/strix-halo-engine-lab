@@ -123,7 +123,6 @@ model-kernel src/glm/engine/glm_r1b.hip 10
 model-kernel src/glm/kernels/glm_dsa.hip 6
 model-kernel src/glm/kernels/glm_tier_a.hip 9
 model-kernel src/glm/moe/glm_moe.hip 7
-model-kernel src/glm/prefill/glm_hc_expand_cta.inc 1
 model-kernel src/glm/prefill/glm_pf_exact.hip 5
 model-kernel src/glm/prefill/glm_pf_exact_moe.hip 8
 model-kernel src/glm/prefill/glm_pf_kda_wmma.hpp 2
@@ -191,7 +190,7 @@ model-kernel src/minimax/rtxpf/fp32_identity.hip 5
 model-kernel src/moe_core/hip_ds41_prefill_grouped.inc 4
 model-kernel src/moe_core/hip_ds41_prefill_variants.inc 5
 model-kernel src/moe_core/qwen_grouped_tiles.inc 2
-model-kernel src/qwen35/cuda/engine.cu 9
+model-kernel src/qwen35/cuda/engine.cu 10
 model-kernel src/qwen35/hip/engine.hip 10
 raw-getenv include/strix/cohort_step_plan.hpp 2
 raw-getenv include/strix/compact_stage_images.hpp 4
@@ -331,7 +330,7 @@ raw-getenv src/glm/prefill/glm_pf_path.hip 7
 raw-getenv src/glm/prefill/glm_pf_variants.hpp 1
 raw-getenv src/glm/prefill/glm_pf_wmma.hpp 2
 raw-getenv src/glm/prefill/glm_pf_wmma_x.hpp 4
-raw-getenv src/glm/prefill/glm_prefill.hip 7
+raw-getenv src/glm/prefill/glm_prefill.hip 6
 raw-getenv src/glm/spec/glm_spec_dev.hip 1
 raw-getenv src/glm/xfer/glm_xfer_exchange.hip 1
 raw-getenv src/h3/block/parallel.hpp 1
@@ -341,7 +340,7 @@ raw-getenv src/h3/te/te_gpu.hip 2
 raw-getenv src/h3/te/te_pack_reader.cpp 1
 raw-getenv src/hip_deepseek41_batch_dspark.hip 6
 raw-getenv src/hip_deepseek41_batch_forward.hip 17
-raw-getenv src/hip_deepseek41_device_forward.hip 11
+raw-getenv src/hip_deepseek41_device_forward.hip 10
 raw-getenv src/hip_deepseek41_prefill.hip 30
 raw-getenv src/hip_dense_f16_tiled.hpp 4
 raw-getenv src/hip_ds41_attention.hip 4

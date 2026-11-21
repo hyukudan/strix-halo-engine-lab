@@ -362,6 +362,15 @@ __global__ __launch_bounds__(256) void quantise_activations(
     }
     if (lane == 0) scales[index] = scale;
 }
+// BF16 -> Q8_0 (load-time transcode): one thread per 32-weight block; the arithmetic is core/iu4_onfly.hpp
+// quantise_q8_0_block (ggml quantize_row_q8_0_ref rule), the host-tested reference.
+__global__ __launch_bounds__(256) void bf16_q8_0_convert_kernel(const uint16_t* w, size_t blocks, uint8_t* q8) {
+    const size_t b = size_t(blockIdx.x) * 256U + threadIdx.x;
+    if (b >= blocks) return;
+    float x[32];
+    for (unsigned j = 0; j < 32U; ++j) x[j] = onfly::bf16_bits_to_f32(w[b * 32U + j]);
+    onfly::quantise_q8_0_block(x, q8 + b * 34U);
+}
 // Q8_0 -> IU4 g64 (TURBO+ onfly weights): one thread per (output column, K64 group); the arithmetic is
 // core/iu4_onfly.hpp quantise_group, the host-tested reference. The caller zero-fills the padded copy first.
 __global__ __launch_bounds__(256) void q8_0_iu4_convert_kernel(const uint8_t* q8, int inputs, int outputs, int padded,
@@ -466,6 +475,12 @@ hipError_t convert_q8_0_iu4(const uint8_t* q8, int inputs, int outputs, uint8_t*
     if (hipError_t e = hipMemsetAsync(ws, 0, onfly::scale_bytes(padded, size_t(inputs)), stream); e != hipSuccess) return e;
     const size_t items = size_t(outputs) * size_t(inputs / 64);
     wmma_tiled::q8_0_iu4_convert_kernel<<<unsigned((items + 255U) / 256U), 256, 0, stream>>>(q8, inputs, outputs, int(padded), wq, ws, scale_rule);
+    return hipGetLastError();
+}
+hipError_t convert_bf16_q8_0(const uint16_t* w, int inputs, int outputs, uint8_t* q8, hipStream_t stream) {
+    if (!w || !q8 || inputs <= 0 || inputs % 32 || outputs <= 0) return hipErrorInvalidValue;
+    const size_t blocks = size_t(outputs) * size_t(inputs / 32);
+    wmma_tiled::bf16_q8_0_convert_kernel<<<unsigned((blocks + 255U) / 256U), 256, 0, stream>>>(w, blocks, q8);
     return hipGetLastError();
 }
 hipError_t convert_exl3_iu4(const uint32_t* const* trellis, int bits, int experts, int inputs, int outputs,

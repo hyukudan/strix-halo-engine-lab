@@ -7,13 +7,23 @@
 // - Q6_K: d*sc*(q-32), an exact FP32 product (d 11 bits, |sc| <= 127 7 bits or -128, |q-32| <= 31 5 bits or 32: powers of two
 //   add no bits), so the only rounding is the FP16 one.
 template<unsigned Type> struct F16xKQuantDown;
+// The B register stage of the body: one raw per half (per-step reads), or one step-pair read (KQ::pair).
+template<class KQ,unsigned Halves,bool P=KQ::pair> struct F16xKQuantRegs { using type=typename KQ::Raw[Halves]; };
+template<class KQ,unsigned Halves> struct F16xKQuantRegs<KQ,Halves,true> { using type=typename KQ::template Pair<Halves>; };
 template<> struct F16xKQuantDown<12U> {
     static constexpr unsigned block_bytes=144U;
+    static constexpr bool pair=false;  // per-step reads (load / decode per half)
     struct Raw { uint4 head,lo,hi; };
-    // Superblocks are 16-B aligned (144 B, rows of whole superblocks).
-    __device__ __forceinline__ static Raw load(const unsigned char* row,unsigned step,unsigned) {
+    // Superblocks are 16-B aligned (144 B, rows of whole superblocks). Loads into the register stage `r`, which (two
+    // alternating stages, grouped_f16.hpp) last held step s-2: for s%4 >= 2 that is the same superblock, so its 16-B header
+    // (d, dmin, scale bytes) is already there and is not requested again; only the step's 32 qs bytes are.
+    // Rule and replay test: kquant_block_reads.hpp q4k_reads.
+    __device__ __forceinline__ static void load(Raw& r,const unsigned char* row,unsigned step,unsigned) {
+        namespace q4=strix::moe_core::q4k_reads;
         const unsigned char* blk=row+(step/4U)*block_bytes;
-        return {f16_load(blk),f16_load(blk+16U+32U*(step%4U)),f16_load(blk+32U+32U*(step%4U))};
+        if(q4::header_load(step))r.head=f16_load(blk);
+        r.lo=f16_load(blk+q4::qs_from_block(step));
+        r.hi=f16_load(blk+q4::qs_from_block(step)+16U);
     }
     template<unsigned Tune>
     __device__ __forceinline__ static void decode(const Raw& r,unsigned step,unsigned half,uint4 (&out)[4]) {
@@ -36,41 +46,72 @@ template<> struct F16xKQuantDown<12U> {
 // with alignbit (the Q8_0 down discipline); d is one 16-bit load inside the block. Offsets and the in-block rule:
 // moe_core/kquant_block_reads.hpp (host-tested). Half h of step s, n = (s%4)/2, j = 2(s%2)+h: ql bytes 64n+32h (nibble 4(s%2)),
 // qh bytes 128+32n (bits 2j), scales 8n+2j (l < 16) and 8n+2j+1; code byte (q << 2) ^ 0x80 = 4(q-32) as int8, times d*sc/4.
+// Step pairs (pair = true): steps 2m and 2m+1 read the same ql / qh bytes and the scale bytes 8n..8n+7, so the even step's
+// register stage loads them once (load_pair) and decode_pair yields the FP16 words of both steps (same bytes, same
+// expression as one step's decode); the body keeps the odd step's words in registers for its stage.
 template<> struct F16xKQuantDown<14U> {
     static constexpr unsigned block_bytes=210U;
-    struct Raw { Dword4 l0,l1; unsigned l2; Dword4 h0,h1; unsigned h2,sc,d,odd; };
-    __device__ __forceinline__ static Raw load(const unsigned char* row,unsigned step,unsigned half) {
+    static constexpr bool pair=true;
+    template<unsigned Halves> struct Pair { unsigned ql[8U*Halves+1U],qh[9],sc[3],d,odd; };
+    // Halves consecutive halves from `first` of the pair (step even).
+    template<unsigned Halves>
+    __device__ __forceinline__ static Pair<Halves> load_pair(const unsigned char* row,unsigned step,unsigned first) {
         const unsigned char* blk=row+(step/4U)*block_bytes;
         namespace q6=::strix::moe_core::q6k_reads;
         const unsigned odd=static_cast<unsigned>(reinterpret_cast<std::uintptr_t>(blk))&2U;
         const unsigned char* base=blk-odd;  // dword-aligned (blocks start on even bytes)
-        const auto* ql=reinterpret_cast<const unsigned*>(base+q6::ql_from_base(step,half));
+        const auto* ql=reinterpret_cast<const unsigned*>(base+q6::ql_from_base(step,first));
         const auto* qh=reinterpret_cast<const unsigned*>(base+q6::qh_from_base(step));
-        const unsigned sc_at=q6::sc_at(odd,step,half);  // from base; the two scale bytes never straddle a dword
-        Raw r;
-        r.l0=reinterpret_cast<const Dword4*>(ql)[0];r.l1=reinterpret_cast<const Dword4*>(ql)[1];r.l2=ql[8];
-        r.h0=reinterpret_cast<const Dword4*>(qh)[0];r.h1=reinterpret_cast<const Dword4*>(qh)[1];r.h2=qh[8];
-        r.sc=*reinterpret_cast<const unsigned*>(base+q6::sc_word_from_base(odd,step,half))>>(8U*(sc_at&3U));
+        Pair<Halves> r;
+#pragma unroll
+        for(unsigned q=0;q<2U*Halves;++q) {
+            const Dword4 v=reinterpret_cast<const Dword4*>(ql)[q];
+            r.ql[4U*q]=v.x;r.ql[4U*q+1U]=v.y;r.ql[4U*q+2U]=v.z;r.ql[4U*q+3U]=v.w;
+        }
+        r.ql[8U*Halves]=ql[8U*Halves];
+#pragma unroll
+        for(unsigned q=0;q<2U;++q) {
+            const Dword4 v=reinterpret_cast<const Dword4*>(qh)[q];
+            r.qh[4U*q]=v.x;r.qh[4U*q+1U]=v.y;r.qh[4U*q+2U]=v.z;r.qh[4U*q+3U]=v.w;
+        }
+        r.qh[8]=qh[8];
+        const auto* sc=reinterpret_cast<const unsigned*>(base+q6::sc_pair_from_base(step));
+        r.sc[0]=sc[0];r.sc[1]=sc[1];
+        r.sc[2]=*reinterpret_cast<const unsigned*>(base+q6::sc_tail_from_base(odd,step));
         r.d=*reinterpret_cast<const unsigned short*>(blk+q6::d_from_block);  // in-block: the last block needs no slack
         r.odd=odd;
         return r;
     }
-    template<unsigned Tune>
-    __device__ __forceinline__ static void decode(const Raw& r,unsigned step,unsigned half,uint4 (&out)[4]) {
-        const unsigned j=2U*(step%2U)+half,sh=8U*r.odd,nib=4U*(step%2U);
-        const unsigned l[9]{r.l0.x,r.l0.y,r.l0.z,r.l0.w,r.l1.x,r.l1.y,r.l1.z,r.l1.w,r.l2};
-        const unsigned h[9]{r.h0.x,r.h0.y,r.h0.z,r.h0.w,r.h1.x,r.h1.y,r.h1.z,r.h1.w,r.h2};
+    template<unsigned Tune,unsigned Halves>
+    __device__ __forceinline__ static void decode_pair(const Pair<Halves>& r,unsigned first,uint4 (&even)[Halves][4],
+        uint4 (&odd)[Halves][4]) {
+        const unsigned sh=8U*r.odd;
         const float d=__half2float(__ushort_as_half(static_cast<unsigned short>(r.d)));
-        const float a0=d*static_cast<float>(static_cast<signed char>(r.sc&255U))*0.25F;
-        const float a1=d*static_cast<float>(static_cast<signed char>((r.sc>>8U)&255U))*0.25F;
-        uint2 v[8];
+        const unsigned sc[2]{__builtin_amdgcn_alignbit(r.sc[1],r.sc[0],sh),__builtin_amdgcn_alignbit(r.sc[2],r.sc[1],sh)};
+        unsigned hi[8];
 #pragma unroll
-        for(unsigned w=0;w<8U;++w) {
-            const unsigned lo=__builtin_amdgcn_alignbit(l[w+1U],l[w],sh),hi=__builtin_amdgcn_alignbit(h[w+1U],h[w],sh);
-            const unsigned code=((((lo>>nib)&0x0f0f0f0fU)|(((hi>>(2U*j))&0x03030303U)<<4U))<<2U)^0x80808080U;
-            v[w]=f16_scaled_s8(code,w<4U?a0:a1);
+        for(unsigned w=0;w<8U;++w)hi[w]=__builtin_amdgcn_alignbit(r.qh[w+1U],r.qh[w],sh);
+#pragma unroll
+        for(unsigned k=0;k<Halves;++k) {
+            unsigned lo[8];
+#pragma unroll
+            for(unsigned w=0;w<8U;++w)lo[w]=__builtin_amdgcn_alignbit(r.ql[8U*k+w+1U],r.ql[8U*k+w],sh);
+            const unsigned half=first+k;
+#pragma unroll
+            for(unsigned p=0;p<2U;++p) {  // step parity: nibble 4p, bit pair j = 2p + half, scale bytes 2j and 2j + 1
+                const unsigned j=2U*p+half,nib=4U*p,s=sc[p]>>(16U*(half&1U));
+                const float a0=d*static_cast<float>(static_cast<signed char>(s&255U))*0.25F;
+                const float a1=d*static_cast<float>(static_cast<signed char>((s>>8U)&255U))*0.25F;
+                uint2 v[8];
+#pragma unroll
+                for(unsigned w=0;w<8U;++w) {
+                    const unsigned code=((((lo[w]>>nib)&0x0f0f0f0fU)|(((hi[w]>>(2U*j))&0x03030303U)<<4U))<<2U)^0x80808080U;
+                    v[w]=f16_scaled_s8(code,w<4U?a0:a1);
+                }
+                uint4 (&out)[Halves][4]=p?odd:even;
+#pragma unroll
+                for(unsigned q=0;q<4U;++q)out[k][q]={v[2U*q].x,v[2U*q].y,v[2U*q+1U].x,v[2U*q+1U].y};
+            }
         }
-#pragma unroll
-        for(unsigned q=0;q<4U;++q)out[q]={v[2U*q].x,v[2U*q].y,v[2U*q+1U].x,v[2U*q+1U].y};
     }
 };

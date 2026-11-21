@@ -75,7 +75,8 @@ public:
             fast_ = std::make_unique<ChannelComm>(comm_.get(), channel_.get(), runtime_);
             link_ = Link(rank, pair::GatherRoute::channel, comm_.get(), fast_.get());
         } else {
-            link_ = Link(rank, route, comm_.get(), nullptr);
+            // Device-direct: the Communicator's size table keeps the small sizes on its host path (host_prefix_bytes).
+            link_ = Link(rank, route, comm_.get(), nullptr, direct ? pair::host_prefix_bytes(comm_->routes()) : 0U);
         }
     }
     HipPairGather(const HipPairGather&) = delete;
@@ -88,11 +89,18 @@ public:
     // and ONE stream wait, divided by kProbeChain: the decode step never waits on the stream after a gather (the next
     // work is stream-ordered behind it), so a stream wait per probed gather would price a host wake + an empty-queue
     // relaunch that the step does not run (Hy4 TP2 staged: 237 us probed vs ~80-128 us effective per in-step trip).
+    // step_bytes: the step's gather size. On a device-direct route whose size table splits host / rings, the probe stays
+    // in the regime of step_bytes (dist::regime_sizes), so one line never spans the two paths; other routes probe the
+    // default sizes that fit.
     static constexpr unsigned kProbeChain = 16U;
-    [[nodiscard]] dist::LinkCost measure_link() {
+    [[nodiscard]] dist::LinkCost measure_link(std::uint64_t step_bytes = 0U) {
         hipStream_t stream = stream_;
         std::vector<std::uint64_t> sizes;
-        for (const auto b : dist::default_link_sizes) if (b <= capacity_) sizes.push_back(b);
+        const std::uint64_t split = link_.host_max_bytes();
+        if (split != 0U)
+            sizes = step_bytes <= split ? dist::regime_sizes(0U, split, capacity_) : dist::regime_sizes(split, ~std::uint64_t{0}, capacity_);
+        else
+            for (const auto b : dist::default_link_sizes) if (b <= capacity_) sizes.push_back(b);
         if (sizes.empty()) throw std::invalid_argument("tp gather: capacity below the smallest link probe size");
         const std::size_t slot = std::size_t(sizes.back());
         void* buf = nullptr;
@@ -124,6 +132,13 @@ public:
     [[nodiscard]] double agree_max(double mine) {
         if (fast_) fast_->drain();
         return dist::agree_max(comm_->transport(), mine);
+    }
+    // The pair transport for a host phase between gathers (a layer-stage prompt pass and its state re-layout,
+    // strix/pair/relayout.hpp): the channel drained first, as agree_max. Both ranks enter and leave the phase at the same
+    // point and no gather is enqueued while the caller uses it; the phase leaves the byte stream aligned.
+    [[nodiscard]] dist::Transport& host_transport() {
+        if (fast_) fast_->drain();
+        return comm_->transport();
     }
     // After the last gather of a run, before its results are printed (both ranks): surfaces a failed integrity check of
     // the channel's last messages (pair::GatherLink::finish).

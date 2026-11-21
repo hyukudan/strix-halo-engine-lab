@@ -4,6 +4,7 @@
 // double-precision reference. Shared by the host oracle (tile_host.cpp) and the device fixture (tile_device.cu).
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -13,6 +14,22 @@
 namespace tile_ref {
 namespace T = strix::cuda::core::nvfp4::tile;
 namespace N = strix::cuda::core::nvfp4;
+
+// BF16 of nvfp4-tile-h16-v1, written from the IEEE definition (independent of cuda_bf16.h): round to nearest even on the upper
+// 16 bits; NaN stays a quiet NaN. bf16_widen is exact.
+inline std::uint16_t bf16_rn_bits(float f) {
+    std::uint32_t u = 0;
+    std::memcpy(&u, &f, 4);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return static_cast<std::uint16_t>((u >> 16) | 0x40u);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return static_cast<std::uint16_t>(u >> 16);
+}
+inline float bf16_widen(std::uint16_t b) {
+    const std::uint32_t u = static_cast<std::uint32_t>(b) << 16;
+    float f = 0.f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
 
 // decode record layout, written from its documentation (not from rec_slot): byte of input k of row o, and the scale byte
 inline std::size_t rec_code(std::uint32_t o, std::uint32_t k, std::uint32_t in) {

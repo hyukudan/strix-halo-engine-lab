@@ -16,6 +16,7 @@
 // Any engine with IU4 g64 dense weights binds it by filling View; nothing here names a model.
 // Home: shared (backend core, HIP; arch: gfx11 WMMA through f16_dense_tall). Bound: qwen35 HIP (rows > 16).
 // Limits (callers check with supported()): in % 128 == 0, n % 16 == 0, count <= n, rows * in * 4 < 2^32.
+#include "dense_pair_map.hpp"
 #include "f16_dense_q8a8.hpp"
 
 namespace strix::core::f16_dense_tall::iu4a16 {
@@ -63,17 +64,22 @@ template <unsigned Waves> struct Cols {
         std::uint32_t w[8];
         std::uint32_t s;
     };
-    __device__ __forceinline__ Raw stage_load(unsigned tile, unsigned col, unsigned unit) const {
-        const unsigned o0 = 16U * (v.tile0 + tile) + col, o = o0 < v.count ? o0 : v.count - 1U;
-        const std::size_t col_bytes = (std::size_t(o / 16U) * 16U + o % 16U) * 8U, kt_bytes = std::size_t(v.n) * 8U;
+    // Loads of output column o of the pack (weight, scale) with n columns and `in` inputs (shared by the pair policy).
+    __device__ __forceinline__ static Raw load(const std::uint8_t* weight, const std::uint16_t* scale, unsigned n, unsigned in,
+                                               unsigned o, unsigned unit) {
+        const std::size_t col_bytes = (std::size_t(o / 16U) * 16U + o % 16U) * 8U, kt_bytes = std::size_t(n) * 8U;
         Raw r;
 #pragma unroll
         for (unsigned j = 0; j < 4U; ++j) {
-            const auto t = *(detail::GlobalU2*)(v.weight + std::size_t(unit + j) * kt_bytes + col_bytes);
+            const auto t = *(detail::GlobalU2*)(weight + std::size_t(unit + j) * kt_bytes + col_bytes);
             r.w[2U * j] = t[0], r.w[2U * j + 1U] = t[1];
         }
-        r.s = v.scale[std::size_t(o) * (v.in / 64U) + unit / 4U];
+        r.s = scale[std::size_t(o) * (in / 64U) + unit / 4U];
         return r;
+    }
+    __device__ __forceinline__ Raw stage_load(unsigned tile, unsigned col, unsigned unit) const {
+        const unsigned o0 = 16U * (v.tile0 + tile) + col, o = o0 < v.count ? o0 : v.count - 1U;
+        return load(v.weight, v.scale, v.n, v.in, o, unit);
     }
     __device__ __forceinline__ void stage_decode(const Raw& raw, U4* nb) const {
         // The empty asm keeps every decode instruction here (measured: the compiler otherwise hoists the XOR and the
@@ -109,6 +115,63 @@ template <unsigned TC, unsigned Waves> __global__ __launch_bounds__(32 * Waves) 
 template <unsigned TC, unsigned Waves> __global__ __launch_bounds__(32 * Waves) void kernel_x16(View v, const _Float16* xt) {
     __shared__ Storage<TC> lds;
     core<TC>(v.x, v.in, v.rows, X16Cols<Cols<Waves>>{{v}, xt, v.rows}, lds, Store{v.count, v.tile0, v.accumulate});
+}
+
+// GLU pair sweep: h = F(first x, second x) for two IU4 projections of the same input and width (e.g. gate and up), in
+// ONE launch of the x16 form. Each 16-tile CTA computes 8 output tiles twice (slots 0-7 first member, 8-15 second:
+// core/dense_pair_map.hpp); the core's pair store gets both FP32 sums of an output in registers and writes F of them,
+// rounded to FP16 (RNE), straight into the x16 tiles of h (the A operand of the next x16 GEMM). Bits: each sum is the
+// WMMA chain of kernel_x16 for that column (same A fragments, same decoded B column, same k order), and the store is
+// enqueue_x16_tiles_map2<F, TileRne>'s expression (F::apply, FP32 value pinned, one RNE cast): the tiles of h are
+// bit-identical to kernel_x16(first) + kernel_x16(second) + map2, without the two FP32 outputs and the map2 pass.
+// F: static float apply(float first, float second) (the engine's activation; nothing here names one).
+struct GluView {
+    View first;                          // first member's pack, x / in / rows; n == count (all outputs); out unused
+    const std::uint8_t* second_weight;   // second member's pack: same n, in and layout
+    const std::uint16_t* second_scale;
+    _Float16* h;                         // x16 tiles of h: (o / 64 * rows + r) * 64 + o % 64, o < count
+};
+inline bool glu_pair_supported(const GluView& g) {
+    const View& v = g.first;
+    return v.weight && v.scale && g.second_weight && g.second_scale && g.h && v.rows && v.in && v.in % 128U == 0U &&
+           v.count == v.n && v.count % 128U == 0U && std::uint64_t(v.rows) * v.in * 4U < (1ULL << 32U);
+}
+template <unsigned Waves> struct PairCols : Cols<Waves> {
+    const std::uint8_t* second_weight;
+    const std::uint16_t* second_scale;
+    __device__ __forceinline__ ColumnTile tile(unsigned i) const {
+        const unsigned o = 16U * dense_pair_map::out_tile<16U>(i);
+        return {nullptr, nullptr, 0U, o < this->v.count};
+    }
+    __device__ __forceinline__ typename Cols<Waves>::Raw stage_load(unsigned tile, unsigned col, unsigned unit) const {
+        const bool second = dense_pair_map::second<16U>(tile);
+        const unsigned o = 16U * dense_pair_map::out_tile<16U>(tile) + col;  // count % 128 == 0: every column is live
+        return Cols<Waves>::load(second ? second_weight : this->v.weight, second ? second_scale : this->v.scale, this->v.n, this->v.in,
+                                 o, unit);
+    }
+    __device__ __forceinline__ void stage(unsigned tile, unsigned col, unsigned unit, U4* nb) const {
+        this->stage_decode(stage_load(tile, col, unit), nb);
+    }
+};
+template <class F> struct GluX16Store {
+    _Float16* h;
+    std::uint32_t rows;
+    struct Tile {
+        unsigned o;
+    };
+    __device__ __forceinline__ Tile open(unsigned i, const ColumnTile&, unsigned c) const { return {16U * dense_pair_map::out_tile<16U>(i) + c}; }
+    __device__ __forceinline__ void put_pair(const Tile& t, unsigned r, float first, float second) const {
+        float y = F::apply(first, second);
+        asm volatile("" : "+v"(y));  // as x16_tiles_map2_kernel: the FP32 value is fixed before the FP16 cast
+        h[dense_pair_map::x16_index(rows, r, t.o)] = static_cast<_Float16>(y);
+    }
+    __device__ __forceinline__ void close() const {}
+    template <class Fn> __device__ __forceinline__ void run(Fn&& f) { f(*this); }
+};
+template <class F, unsigned Waves> __global__ __launch_bounds__(32 * Waves) void kernel_glu_x16(GluView g, const _Float16* xt) {
+    __shared__ Storage<16> lds;
+    core<16>(g.first.x, g.first.in, g.first.rows, X16Cols<PairCols<Waves>>{{{g.first}, g.second_weight, g.second_scale}, xt, g.first.rows},
+             lds, GluX16Store<F>{g.h, g.first.rows});
 }
 
 inline bool supported(const View& v) {
@@ -171,6 +234,17 @@ inline void enqueue_x16(const View& v, const _Float16* xt, hipStream_t stream, u
         });
     };
     if (x16_waves_for(v.rows, v.in, waves) == 16U) go(std::integral_constant<unsigned, 16U>{});
+    else go(std::integral_constant<unsigned, 8U>{});
+}
+// GLU pair sweep (kernel_glu_x16): xt = the x16 tiles of g.first.x; writes the x16 tiles of h into g.h (x16_bytes(rows,
+// count), must not alias xt). Caller checks glu_pair_supported(g) and the launch error. Column-fast grid, as enqueue_x16.
+template <class F> inline void enqueue_glu_x16(const GluView& g, const _Float16* xt, hipStream_t stream, unsigned waves = 0U) {
+    const auto go = [&](auto wv) {
+        constexpr unsigned W = decltype(wv)::value;
+        const dim3 grid(dense_pair_map::column_blocks<16U>(g.first.count / 16U), (g.first.rows + 16U * W - 1U) / (16U * W));
+        hipLaunchKernelGGL((kernel_glu_x16<F, W>), grid, dim3(32U * W), 0, stream, g, xt);
+    };
+    if (waves_for(g.first.rows, g.first.in, waves) == 16U) go(std::integral_constant<unsigned, 16U>{});
     else go(std::integral_constant<unsigned, 8U>{});
 }
 // Where the x16 form was measured faster on gfx1151 (tile pass included): from 512 rows, FP32 x above 16 MiB

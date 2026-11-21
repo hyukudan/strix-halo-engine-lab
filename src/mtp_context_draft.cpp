@@ -8,16 +8,9 @@ namespace strix {
 namespace {
 constexpr std::size_t kSuffixCells = 4; // suffix 2, 3, 4-7, 8+
 constexpr std::size_t kRowCells = 3;    // row 0, 1-2, 3+
-std::uint64_t hash_of(const std::uint32_t* begin, std::size_t n) noexcept {
-    std::uint64_t h = 0xcbf29ce484222325ULL;
-    for (std::size_t i = 0; i < n; ++i) {
-        h ^= begin[i] + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-        h *= 0xff51afd7ed558ccdULL;
-    }
-    return h;
 }
-}
-MtpContextDraft::MtpContextDraft(MtpContextDraftConfig config) : config_(config) {
+MtpContextDraft::MtpContextDraft(MtpContextDraftConfig config)
+    : config_(config), index_(std::max<std::uint32_t>(config.min_suffix, 1U)) {
     if (config_.min_suffix < 1 || config_.max_suffix < config_.min_suffix || config_.max_suffix > 32 ||
         !config_.max_rows || config_.max_rows > 7 || !std::isfinite(config_.prior) ||
         !(config_.prior > 0.0 && config_.prior < 1.0) || !std::isfinite(config_.prior_weight) ||
@@ -39,16 +32,14 @@ void MtpContextDraft::reset(std::span<const std::uint32_t> prompt) {
     started_ = false; wide_ = false; selected_rows_ = 0; shadow_ = {}; pending_probe_ = {}; stats_ = {}; edited_.clear();
     chain_kept_ = chain_rows_ = chain_source_ = chain_next_ = 0; chain_open_ = chain_established_ = false;
     chain_right_ = 0.9; chain_tried_ = 1.0;
-    context_.reserve(prompt.size() + 1024);
+    context_.reserve(prompt.size() + 1024); index_.reserve(prompt.size() + 1024);
     for (const auto t : prompt) push(t);
 }
 void MtpContextDraft::push(std::uint32_t token) {
     if (context_.size() >= std::numeric_limits<std::uint32_t>::max())
         throw std::length_error("MTP n-gram context exceeds index capacity");
     context_.push_back(token);
-    const auto end = context_.size() - 1;
-    for (std::uint32_t n = config_.min_suffix; n <= config_.max_suffix && n <= context_.size(); ++n)
-        index_[Key{hash_of(&context_[end + 1 - n], n), n}].push_back(static_cast<std::uint32_t>(end));
+    index_.push(context_);
 }
 double MtpContextDraft::acceptance(std::uint32_t suffix, bool unanimous, std::size_t row) const {
     const auto c = cell(suffix, unanimous, row);
@@ -60,44 +51,48 @@ std::vector<std::uint32_t> MtpContextDraft::lookup(std::span<const std::uint32_t
     if (occurrences) *occurrences = 0;
     if (!length) return {};
     const auto total = context_.size() + extra.size();
+    const std::uint32_t min_n = config_.min_suffix;
+    if (total < min_n) return {};
     const auto at = [&](std::size_t i) { return i < context_.size() ? context_[i] : extra[i - context_.size()]; };
-    std::vector<std::uint32_t> key;
-    for (std::uint32_t n = config_.max_suffix; n >= config_.min_suffix; --n) {
-        if (total < n) continue;
-        key.clear();
-        for (std::size_t i = total - n; i < total; ++i) key.push_back(at(i));
-        const auto hit = index_.find(Key{hash_of(key.data(), n), n});
-        if (hit == index_.end()) continue;
-        std::vector<std::size_t> positions;
-        for (const auto end : hit->second) {
-            if (static_cast<std::size_t>(end) + 1 >= context_.size()) continue;
-            if (std::equal(key.begin(), key.end(), context_.begin() + (end + 1 - n)))
-                positions.push_back(static_cast<std::size_t>(end) + 1);
-        }
-        if (positions.empty()) continue;
-        if (occurrences) *occurrences = static_cast<std::uint32_t>(positions.size());
-        std::vector<std::uint32_t> out;
-        // Vote at each step among spans that agreed with every previous winning token.
-        // Ties use the latest occurrence, then token id; unordered-map iteration is immaterial.
-        while (!positions.empty() && out.size() < length) {
-            struct Vote { std::size_t count = 0, latest = 0; };
-            std::unordered_map<std::uint32_t, Vote> votes;
-            for (const auto pos : positions) { auto& v = votes[context_[pos]]; ++v.count; v.latest = std::max(v.latest, pos); }
-            std::uint32_t winner = 0; Vote best;
-            for (const auto& [token, v] : votes)
-                if (v.count > best.count || (v.count == best.count && (v.latest > best.latest ||
-                    (v.latest == best.latest && token < winner)))) { winner = token; best = v; }
-            if (out.empty()) support = static_cast<std::uint32_t>(best.count);
-            out.push_back(winner);
-            positions.erase(std::remove_if(positions.begin(), positions.end(), [&](std::size_t pos) {
-                return context_[pos] != winner || pos + 1 >= context_.size();
-            }), positions.end());
-            for (auto& pos : positions) ++pos;
-        }
-        suffix = n;
-        return out;
+    std::vector<std::uint32_t> key(min_n);
+    for (std::size_t i = 0; i < min_n; ++i) key[i] = at(total - min_n + i);
+    // The longest exact suffix n (min_suffix..max_suffix) of context + extra that occurred before with a committed
+    // continuation, and every end where it occurred: the candidates of its min_suffix-token key, each measured.
+    std::vector<std::pair<std::size_t, std::uint32_t>> found;  // (end, exact common suffix), most recent first
+    std::uint32_t longest = 0;
+    index_.for_each(key, [&](std::size_t end) {
+        if (end + 1 >= context_.size()) return true;
+        std::uint32_t m = 0;
+        while (m < config_.max_suffix && m <= end && m < total && context_[end - m] == at(total - 1 - m)) ++m;
+        if (m >= min_n) { found.emplace_back(end, m); longest = std::max(longest, m); }
+        return true;
+    });
+    if (found.empty()) return {};
+    const std::uint32_t n = longest;
+    std::vector<std::size_t> positions;
+    for (auto f = found.rbegin(); f != found.rend(); ++f)
+        if (f->second >= n) positions.push_back(f->first + 1);  // ascending
+    if (occurrences) *occurrences = static_cast<std::uint32_t>(positions.size());
+    std::vector<std::uint32_t> out;
+    // Vote at each step among spans that agreed with every previous winning token.
+    // Ties use the latest occurrence, then token id; unordered-map iteration is immaterial.
+    while (!positions.empty() && out.size() < length) {
+        struct Vote { std::size_t count = 0, latest = 0; };
+        std::unordered_map<std::uint32_t, Vote> votes;
+        for (const auto pos : positions) { auto& v = votes[context_[pos]]; ++v.count; v.latest = std::max(v.latest, pos); }
+        std::uint32_t winner = 0; Vote best;
+        for (const auto& [token, v] : votes)
+            if (v.count > best.count || (v.count == best.count && (v.latest > best.latest ||
+                (v.latest == best.latest && token < winner)))) { winner = token; best = v; }
+        if (out.empty()) support = static_cast<std::uint32_t>(best.count);
+        out.push_back(winner);
+        positions.erase(std::remove_if(positions.begin(), positions.end(), [&](std::size_t pos) {
+            return context_[pos] != winner || pos + 1 >= context_.size();
+        }), positions.end());
+        for (auto& pos : positions) ++pos;
     }
-    return {};
+    suffix = n;
+    return out;
 }
 std::vector<std::uint32_t> MtpContextDraft::begin_copy_cycle(std::uint32_t pending, std::size_t room,
     std::vector<double>& acceptance_out, double min_probability, double mtp_expected) {
@@ -207,18 +202,24 @@ std::size_t MtpContextDraft::chain_match(std::span<const std::uint32_t> extra, s
     const auto total = context_.size() + extra.size();
     if (total < 4) return 0;
     const auto at = [&](std::size_t i) { return i < context_.size() ? context_[i] : extra[i - context_.size()]; };
-    const std::uint32_t key[3] = {at(total - 3), at(total - 2), at(total - 1)};
-    const auto hit = index_.find(Key{hash_of(key, 3), 3});
-    if (hit == index_.end()) return 0;
+    // Occurrences of the last 3 tokens: the candidates of the min_suffix-token key (<= 3 with chain copy on) that
+    // match at least 3 tokens.
+    if (config_.min_suffix > 3 || config_.max_suffix < 3) return 0;
+    std::vector<std::uint32_t> key(config_.min_suffix);
+    for (std::size_t i = 0; i < key.size(); ++i) key[i] = at(total - key.size() + i);
     constexpr std::size_t kMaxMatch = 64;
+    bool occurred = false;
     std::size_t best_end = 0, best_match = 0;
-    for (const auto end32 : hit->second) {
-        const auto end = static_cast<std::size_t>(end32);
-        if (end + 1 >= total) continue; // the tail itself
+    index_.for_each(key, [&](std::size_t end) {
         std::size_t m = 0;
         while (m < kMaxMatch && m <= end && at(end - m) == at(total - 1 - m)) ++m;
+        if (m < 3) return true;
+        occurred = true;
+        if (end + 1 >= total) return true; // the tail itself
         if (m > best_match || (m == best_match && end > best_end)) { best_match = m; best_end = end; }
-    }
+        return true;
+    });
+    if (!occurred) return 0;
     source = best_end + 1;
     return best_match;
 }

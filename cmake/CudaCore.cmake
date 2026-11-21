@@ -68,7 +68,7 @@ if(MSVC)
 endif()
 
 add_executable(qwen35_cuda_engine_test ${_cc_root}/tests/qwen35/cuda_engine_test.cu)
-target_link_libraries(qwen35_cuda_engine_test PRIVATE strix_qwen35_cuda)
+target_link_libraries(qwen35_cuda_engine_test PRIVATE strix_qwen35_cuda strix_spec)  # strix_spec: token-tree walk (accept_tree)
 target_compile_options(qwen35_cuda_engine_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
 if(MSVC)
     target_compile_options(qwen35_cuda_engine_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/EHsc,/Zc:preprocessor,/utf-8>)

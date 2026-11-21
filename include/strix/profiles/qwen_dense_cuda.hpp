@@ -50,6 +50,10 @@ inline constexpr Lever table[] = {
      .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
      .target = "chunk16 (gdn-chunk16-f32-v1, identity -gdnc16)", .off = "serial",
      .source = "chunked GDN prefill; gated together with fast4 (52dd7d1f0); ignored under prefill_arith exact"},
+    {.name = "prefill_hid", .env = "", .option = "--prefill-hid", .value = {"", "bf16", "", ""}, .builtin = "f32",
+     .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
+     .target = "bf16 (nvfp4-tile-h16-v1: BF16 FFN hidden rows, identity -h16)", .off = "f32",
+     .source = "FAST4 glu epilogue stores BF16 H, down operand quantised from it (half the H bytes); no gate receipt yet"},
     {.name = "prefill_attn8", .env = "", .option = "--prefill-attn8", .value = {"", "on", "", ""}, .builtin = "off",
      .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
      .target = "on (e4m3 flash over an e4m3 KV shadow, identity -a8)", .off = "off",
@@ -175,6 +179,7 @@ template <class Options>
 void apply(Options& o, const Resolved& r) {
     using A = std::remove_cvref_t<decltype(o.prefill_arith)>;
     using G = std::remove_cvref_t<decltype(o.prefill_gdn)>;
+    using H = std::remove_cvref_t<decltype(o.prefill_hid)>;
     using S = std::remove_cvref_t<decltype(o.nvfp4_split)>;
     const auto take = [&r](std::string_view lever) -> const std::string* {
         const auto* e = r.find(lever);
@@ -184,6 +189,7 @@ void apply(Options& o, const Resolved& r) {
     std::optional<A> arith;
     std::optional<bool> big, attn8;
     std::optional<G> gdn;
+    std::optional<H> hid;
     std::optional<S> split;
     std::optional<bool> dec8;
     if (const auto* v = take("prefill_arith")) {
@@ -196,10 +202,10 @@ void apply(Options& o, const Resolved& r) {
         else if (*v == "fast4") arith = A::fast4;
         else throw std::runtime_error("--prefill-arith expects windows|exact|flash|fast|fast2|fast8|fast4");
     }
-    if (const auto* v = take("prefill_gdn")) {
-        if (*v != "serial" && *v != "chunk16") throw std::invalid_argument("--prefill-gdn expects serial|chunk16, got '" + *v + "'");
-        gdn = *v == "chunk16" ? G::chunk16 : G::serial;
-    }
+    // enum levers: converted by the engine's own spelling table (parse_lever_value, found by ADL on the option type), never a
+    // second list here (a second list rejected --prefill-gdn chunk16tc on the CLI while the engine parser accepted it)
+    if (const auto* v = take("prefill_gdn")) gdn = parse_lever_value(G{}, *v);
+    if (const auto* v = take("prefill_hid")) hid = parse_lever_value(H{}, *v);
     if (const auto* v = take("prefill_attn8")) {
         if (*v != "on" && *v != "off") throw std::runtime_error("--prefill-attn8 expects on|off");
         attn8 = *v == "on";
@@ -215,6 +221,7 @@ void apply(Options& o, const Resolved& r) {
     if (arith) o.prefill_arith = *arith;
     if (big) o.prefill_big = *big;
     if (gdn) o.prefill_gdn = *gdn;
+    if (hid) o.prefill_hid = *hid;
     if (attn8) o.prefill_attn8 = *attn8;
     if (split) o.nvfp4_split = *split;
     if (dec8) o.decode_attn8 = *dec8;

@@ -1895,7 +1895,7 @@ void bench_hc_seam(std::mt19937& g) {
     hok(hipHostFree(hQ), "host free");
     free_all();
 }
-#include "hip_glm_hc_expand_cta_fixture.inc"
+#include "hip_glm_hc_expand_fixture.inc"
 
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -1907,7 +1907,7 @@ int main(int argc, char** argv) {
     if (const char* only = std::getenv("STRIX_GLM_PF_TEST_ONLY"); only != nullptr) {
         const std::string mode(only);
         if (mode == "hcexpand-config") {
-            try { std::printf("hc-expand-rows=%u\n", P::hc_expand_cta_rows()); }
+            try { std::printf("hc-expand-bw=%d\n", P::hc_expand_bw_enabled() ? 1 : 0); }
             catch (const std::invalid_argument& e) { std::fprintf(stderr, "%s\n", e.what()); return 2; }
             return 0;  // no allocation or device work
         }
@@ -1917,8 +1917,8 @@ int main(int argc, char** argv) {
             return failures ? 1 : 0;
         }
         if (mode == "hcexpand" || mode == "hcexpandbench") {
-            test_hc_expand_cta(g, false);
-            if (failures == 0 && want_timing && mode == "hcexpandbench") test_hc_expand_cta(g, true);
+            test_hc_expand(g, false);
+            if (failures == 0 && want_timing && mode == "hcexpandbench") test_hc_expand(g, true);
             std::printf("checks: %d failures: %d\n", checks, failures);
             return failures ? 1 : 0;
         }

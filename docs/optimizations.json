@@ -292,6 +292,28 @@
   },
   {
     "engine": "qwen",
+    "name": "Resident copy registered source",
+    "flag_or_env": "STRIX_MODEL_COPY_REGISTERED",
+    "default": "AUTO (ON on HIP >= 7.17 integrated GPUs)",
+    "exact": "Same bytes at the same device addresses; a piece the runtime refuses to register is copied directly.",
+    "gain": "One Strix Halo node, warm GGUF, 3 GiB fresh regions: HIP 7.17 direct 24-27 GB/s vs registered 50-57 GB/s; Qwen3-0.6B resident copy on HIP 7.17 46 vs 57 ms; HIP 7.16 keeps direct (36 vs 47-48 ms forced registered).",
+    "preconditions": "--residency copy or a copied MTP sidecar; HIP runtime >= 7.17 on an integrated GPU (automatic rule).",
+    "off_switch": "STRIX_MODEL_COPY_REGISTERED=0",
+    "doc_anchor": "docs/optimizations.md#resident-copy-registered-source"
+  },
+  {
+    "engine": "qwen",
+    "name": "Qwen dense HIP shared weight load",
+    "flag_or_env": "STRIX_LOAD_WORKERS",
+    "default": "ON",
+    "exact": "Same tensor bytes at the same device buffers; 8 greedy ids identical over 6 runs (old and new loader, cold and warm).",
+    "gain": "Qwen3.8-27B IU4 GGUF on one Strix Halo node: cold load 9.4 / 9.3 s \u2192 2.6 / 2.5 s, warm 3.3 \u2192 2.5 s; no page-cache residue (was +14.4 GB)",
+    "preconditions": "Dense 27B HIP engine; O_DIRECT where the file system accepts it.",
+    "off_switch": "none (private loader removed); STRIX_LOAD_WORKERS=1 serialises the reads",
+    "doc_anchor": "docs/optimizations.md#qwen-dense-hip-shared-weight-load"
+  },
+  {
+    "engine": "qwen",
     "name": "Serving PLE table re-warm",
     "flag_or_env": "STRIX_PLE_REWARM",
     "default": "ON (bounded)",
@@ -2701,6 +2723,17 @@
   },
   {
     "engine": "glm",
+    "name": "MTP drafting arbiter (prompt lookup)",
+    "flag_or_env": "STRIX_SPEC_ARBITER",
+    "default": "on",
+    "exact": "Committed tokens are the greedy verify tokens in every arm; token fnv equal ON vs OFF on 3 prompts (1K, 6K, 850-token copy), both ranks take the same decision from the replicated cost table.",
+    "gain": "Pair ABBA, 256 tokens: 20.4 -> 15.1 ms/token (1K), 21.1 -> 15.0 (6K), 19.7 -> 13.7 (copy prompt).",
+    "preconditions": "Two-rank TP2 MTP decode (--mtp-spec); lookup windows up to 7 drafts (8 rows).",
+    "off_switch": "STRIX_SPEC_ARBITER=0 (or --baseline)",
+    "doc_anchor": "docs/optimizations.md#glm-mtp-arbiter"
+  },
+  {
+    "engine": "glm",
     "name": "Prefill indexer scores v3 and select v2",
     "flag_or_env": "STRIX_GLM_PF_IDX; STRIX_GLM_PF_SELECT",
     "default": "3 / 2",
@@ -2745,14 +2778,14 @@
   },
   {
     "engine": "glm",
-    "name": "Prefill mHC expand + norm, two rows per block",
-    "flag_or_env": "STRIX_GLM_PF_HC_EXPAND_ROWS",
-    "default": "2",
-    "exact": "Host and device gates bitwise against the one-row kernel (including the TP2 pair-sum path); pair logits bitwise equal the anchors on both ranks at 8K.",
-    "gain": "Two-node pair, alternating arms, 8,192 tokens: TTFT 13.671 -> 13.611 s (-0.44 %), measured with the other exact prefill levers of that build enabled",
+    "name": "Prefill mHC expand + norm on the shared row expansion",
+    "flag_or_env": "STRIX_GLM_PF_HC_EXPAND_BW",
+    "default": "1",
+    "exact": "Device fixture bitwise against the original one-row kernel (payload, guards and flag by memcmp, special values, pair-sum path); pair logits, state and token digests equal at 8K.",
+    "gain": "None in wall time (two-node pair 8,192 tokens, ABAB, cold / warm: 13.84 / 14.56 s two-row kernel vs 13.81 / 14.50 s); removes a model-private kernel family. Traced per-call time 10.8 -> 2.2 ms was the GPU share beside the other prefill stream; isolated, the shared kernel costs the same as the one-row kernel.",
     "preconditions": "Exact chunked prefill with the fused expand + norm (STRIX_GLM_PF_HC_FUSE=1, the default).",
-    "off_switch": "STRIX_GLM_PF_HC_EXPAND_ROWS=1, or --baseline",
-    "doc_anchor": "docs/optimizations.md#glm-pf-hc-expand-rows"
+    "off_switch": "STRIX_GLM_PF_HC_EXPAND_BW=0, or --baseline",
+    "doc_anchor": "docs/optimizations.md#glm-pf-hc-expand-bw"
   },
   {
     "engine": "glm",
@@ -3053,6 +3086,16 @@
   },
   {
     "engine": "qwen-rtx",
+    "name": "Tensor-core expert wide tile form (128 rows)",
+    "flag_or_env": "--expert-wide-tile on|off|N; STRIX_QRTX_EXPERT_WIDE_TILE (lever row expert_wide_tile)",
+    "default": "off (opt-in until its timing receipt); N = minimum average rows per expert of a launch (planner parameter from the device's no-model tile bench, TILEWIDE line); on = builtin 128 (provisional)",
+    "exact": "Exact schedule trait: a wide tile is two consecutive 64-row tiles, same m16 position per row, same MMA and scale-FMA sequence per output: bitwise the tile form (host test; device hash comparison in the bench). Contract and bundle id unchanged.",
+    "gain": "Not yet measured.",
+    "preconditions": "CUDA Qwen MoE with gsq_bf16_mma experts; prefill launches above 16 rows.",
+    "off_switch": "--expert-wide-tile off; STRIX_QRTX_EXPERT_WIDE_TILE=0",
+    "doc_anchor": "docs/optimizations.md#qwen-rtx-expert-wide-tile"
+  },  {
+    "engine": "qwen-rtx",
     "name": "Tensor-core expert decode tile form",
     "flag_or_env": "--expert-decode-tile; STRIX_QRTX_EXPERT_DECODE_TILE (lever row expert_decode_tile)",
     "default": "ON in every profile; acts only where the tensor-core GSQ experts run (gsq_bf16_mma: the FAST expert arithmetic)",
@@ -3062,6 +3105,7 @@
     "off_switch": "--expert-decode-tile off; STRIX_QRTX_EXPERT_DECODE_TILE=0",
     "doc_anchor": "docs/optimizations.md#qwen-rtx-expert-decode-tile"
   },
+
   {
     "engine": "qwen-rtx",
     "name": "TURBO: int8 tensor-core experts on large prefill blocks",
@@ -3375,6 +3419,7 @@
   {"engine":"qwen-rtx","name":"Qwen dense 27B CUDA product profile","flag_or_env":"--profile exact|default|fast|quality (strix-cuda-qwen35-decode, strix-cuda-qwen35-spec)","default":"exact (no option changed)","exact":"exact leaves every option and the effective config unchanged (strix-qwen35-dense-profile-host-tests); FAST levers keep their own identities and gates (FAST4 + chunk16 8K/32K passed; attn8 32K passed; split-K FAST passed)","gain":"none of its own (selection only); FAST4 + chunk16 8K 13,437-13,714 tok/s","preconditions":"fast: --prefill-arith fast4 + --prefill-gdn chunk16 on the decode CLI large prefill with --turbo-weights onfly|converted; --prefill-attn8 on from 8,192 prompt tokens; --split-k fast on the spec CLI (decode windows) with --turbo-weights onfly|converted; split-k pending on the decode CLI (no gate with FAST4); turbo refused","off_switch":"--profile exact or the lever's own option","doc_anchor":"docs/optimizations.md#qwen-dense-cuda-profile"},
   {"engine":"qwen-rtx","name":"Qwen dense 27B CUDA decode attention on an e4m3 K/V shadow (decode_attn8)","flag_or_env":"--decode-attn8 on|off (strix-cuda-qwen35-decode, strix-cuda-qwen35-spec)","default":"off; --profile fast does not apply it (quality gate pending)","exact":"FAST class (bit-changing, identity -d8); verify of R rows == R one-row decode steps inside the class; off = exact attention_decode, exact and e4m3 prefill kernels machine-code identical; gate 8K/28K/64K not run","gain":"not yet measured","preconditions":"CUDA Qwen dense 27B main session; spec CLI also covers its prefill windows; slot batches and the MTP block keep BF16","off_switch":"--decode-attn8 off (default) or --profile exact","doc_anchor":"docs/optimizations.md#qwen-dense-cuda-decode-attn8"},
   {"engine":"qwen-rtx","name":"Qwen dense 27B CUDA NVFP4 GEMV split-K FAST (nvfp4-splitk-fast-v1)","flag_or_env":"--split-k exact|fast (strix-cuda-qwen35-decode, strix-cuda-qwen35-spec); --profile fast on the spec CLI","default":"exact (nvfp4-splitk-exact-v1, target 1000 blocks per call)","exact":"FAST class (bit-changing, identity -skf1): gate EXACT -> FAST 4 x 512 rows pooled KL 0.00000 (q99 9.5e-06), top-1 0.9990, dNLL -0.00000; spec ids == FAST serial x1200 (code, think, en, ja); --split-k exact ids == EXACT serial","gain":"RTX PRO 6000 600 W, converted NVFP4, spec decode sub15d x1200, 2 A/B pairs: think 262.02/261.66 -> 263.83/263.90 tok/s (verify 14.07/14.08 -> 13.99/13.98 ms/step); code 334.32/333.94 -> 335.53/336.18 tok/s (within 3x spread)","preconditions":"NVFP4 weights (onfly|converted); split_k_policy rows for 188 SMs cc 12.0, other devices run EXACT targets; --profile fast applies it on the spec CLI only (decode CLI pending: no gate with FAST4)","off_switch":"--split-k exact (also under --profile fast) or --profile exact","doc_anchor":"docs/optimizations.md#qwen-dense-cuda-splitk-fast"},
+  {"engine":"qwen-rtx","name":"Qwen dense 27B CUDA prefill: TF32 GDN chunk scan (gdn-chunk16-tf32-v1) and BF16 FFN hidden rows (nvfp4-tile-h16-v1)","flag_or_env":"--prefill-gdn chunk16tc, --prefill-hid bf16 (strix-cuda-qwen35-decode large prefill)","default":"off (chunk16 / f32); --profile fast does not apply them (quality gate pending)","exact":"FAST class (bit-changing, identities -gdnc16t / -h16); --profile exact cannot reach them; FP32 scan kernels and FP32 tile instantiations machine-code identical; quality gate not passed yet","gain":"not yet measured end to end","preconditions":"decode CLI large prefill; bf16 hidden rows need --prefill-arith fast4 and NVFP4 FFN weights","off_switch":"--prefill-gdn chunk16 (or serial), --prefill-hid f32","doc_anchor":"docs/optimizations.md#qwen-dense-cuda-pf-tf32-h16"},
   {
     "engine": "qwen-rtx",
     "name": "Asynchronous decode commit tail",
@@ -3410,6 +3455,14 @@
   },
   {
     "engine": "qwen-rtx",
+    "name": "Qwen dense 27B CUDA FAST4 tile GEMM: bulk stage feed",
+    "flag_or_env": "--prefill-tile-feed bulk|lsu (strix-cuda-qwen35-decode)",
+    "default": "lsu (incumbent FAST4 tile GEMM feed; bulk is explicit opt-in)",
+    "exact": "Scheduling only, no identity suffix: device fixture bulk == lsu bit for bit in 9 checks; host oracle checks the bulk records write exactly the lsu chunk bytes; host tests pin the default and the unchanged engine identity.",
+    "gain": "Operator bench (RTX PRO 6000, 4,096 rows, no model, strict ABAB): bulk / lsu = 0.934 GLU, 0.921 down, 0.929 down residual, 0.850 o, 0.858 o residual, 0.846 k/v, 0.977 q/k/v. End-to-end prefill not yet measured.",
+    "preconditions": "--prefill-arith fast4 (sm_120, NVFP4 weights); other prefill classes print prefill-tile-feed: n/a.",
+    "off_switch": "--prefill-tile-feed lsu",
+    "doc_anchor": "docs/optimizations.md#qwen-dense-cuda-fast4-tile-bulk-feed",
     "name": "Qwen 27B CUDA spec: K/V-only MTP catch-up",
     "flag_or_env": "--mtp-catchup kv|full",
     "default": "kv",
@@ -3432,5 +3485,6 @@
     "off_switch": "STRIX_HY4_ROWS_EXPERT_UNION=0",
     "doc_anchor": "docs/optimizations.md#hy4-rows-expert-union"
   },
-  {"engine": "hy4", "name": "Prompt windows: bf16 epilogue in the producers' store", "flag_or_env": "STRIX_HY4_PF_STORE_EPILOGUE", "default": "ON", "exact": "Bitwise: same function on the same FP32 value; bf16 epilogue idempotent over all 2^32 patterns; 4096-token logits digest a0db1a8a45606112 equal on, off and parent.", "gain": "One node, 4096-token bench prompt, 2048-row windows, A-B/B-A: warm -4.3 %, cold -4.2 %.", "preconditions": "Hy4-flash --prompt-rows; q8a8 dense batch <= 1 outside the operand-image form; K-quant known-rows down. Other forms refuse it.", "off_switch": "STRIX_HY4_PF_STORE_EPILOGUE=0", "doc_anchor": "docs/optimizations.md#hy4-pf-store-epilogue"}
+  {"engine": "hy4", "name": "Prompt windows: bf16 epilogue in the producers' store", "flag_or_env": "STRIX_HY4_PF_STORE_EPILOGUE", "default": "ON", "exact": "Bitwise: same function on the same FP32 value; bf16 epilogue idempotent over all 2^32 patterns; 4096-token logits digest a0db1a8a45606112 equal on, off and parent.", "gain": "One node, 4096-token bench prompt, 2048-row windows, A-B/B-A: warm -4.3 %, cold -4.2 %.", "preconditions": "Hy4-flash --prompt-rows; q8a8 dense batch <= 1 outside the operand-image form; K-quant known-rows down. Other forms refuse it.", "off_switch": "STRIX_HY4_PF_STORE_EPILOGUE=0", "doc_anchor": "docs/optimizations.md#hy4-pf-store-epilogue"},
+  {"engine":"hy4","name":"Hy4-flash exact tensor-parallel decode over two nodes","flag_or_env":"--tp-rank 0|1; --tp-rates A,B; --tp-transport; --tp-trip-us; --tp-force","default":"off (one node) unless --tp-rank is given; the shared split planner keeps one node when the group does not win","exact":"Generated ids equal the one-node run on both ranks (300 of 300 and 128 of 128, 1024-token prompt).","gain":"Two nodes over USB4, EXACT, 1024-token prompt, 128 greedy ids: one node 16.52 / 16.51 tok/s, tensor parallel 19.92 tok/s (+21 %, host-staged gather route).","preconditions":"Both ranks hold the whole pack; per-rank read rates from --tp-rates; the trip cost is measured at start-up and agreed by both ranks; --prompt-rows (each rank prefills alone).","off_switch":"omit --tp-rank","doc_anchor":"docs/optimizations.md#hy4-flash-exact-tensor-parallel-decode-over-two-nodes"}
 ]

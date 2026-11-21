@@ -16,9 +16,13 @@
 // A run reproduces its logits bit for bit on every host. A backend identity is EXACT when it matches these bits;
 // an identity that changes activation precision (A8 / FP8 activations, fused or reordered sums) is a declared FAST
 // class compared by logits distance and token agreement, never called exact.
+#include "strix/engram/hasher.hpp"
+#include "strix/hy4/engram_spec.hpp"
+
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -27,7 +31,9 @@ namespace strix::hy4 {
 struct Config {
     std::uint32_t hidden = 3072, vocab = 120832, layers = 42;
     float rms_eps = 1e-5F, hc_eps = 1e-6F;
-    float engram_norm_eps = 0.0078125F;  // nn.RMSNorm(eps=None) on BF16 = finfo(bf16).eps (forward-pass Q2)
+    // torch nn.RMSNorm(eps=None) resolves to the opmath (float) epsilon, not finfo(bf16).eps: measured 1.19e-7 on BF16
+    // and FP32 input (torch 2.10). Feeds the oracle and the HIP forward (one field).
+    float engram_norm_eps = 0x1p-23F;
     std::uint32_t q_lora = 1024, kv_lora = 512, qk_nope = 192, qk_rope = 64, v_head = 256;
     float rope_theta_indexed = 1e7F, rope_theta_sliding = 1e4F;
     std::uint32_t window = 512;  // keys q-window+1 .. q (the query included)
@@ -45,6 +51,7 @@ struct Config {
     std::vector<std::uint64_t> head_sizes;     // [engram layer][head] prime moduli
     std::vector<std::int32_t> token_map;
     std::uint32_t pad_token = 120002;
+    std::uint32_t engram_table_size = kLookupTableSize;  // ids >= min(this, token_map size) read the pad's compressed id
     // Next-token (MTP) block after the text layers (GGUF nextn_predict_layers; block id `layers`): 0 = none. Its
     // attention form: `nextn_heads` heads, indexed (DSA) when the block carries the indexer tensors (the pack's
     // attention.indexer.types array covers the text layers only).
@@ -95,10 +102,22 @@ struct Route {
 // rows x width >= min_work (tests pass 1 to split the tiny model's loops).
 void set_ref_threads(unsigned threads, std::size_t min_work = std::size_t{1} << 20) noexcept;
 
-// Engram table rows of one token for Engram layer ordinal `ordinal`: window = (tok[q], tok[q-1], tok[q-2]) with the
-// pad id before the sequence start; heads order-2 first, then order-3.
-[[nodiscard]] std::vector<std::uint64_t> engram_rows(const Config& config, std::uint32_t ordinal,
-                                                     const std::vector<std::uint32_t>& window);
+// Engram table rows through the shared hash (strix/engram/hasher.hpp): the Spec of the configuration (the same adapter as
+// the pack loader, hy4::engram_spec) and the flat-table base of each Engram layer. Rows of position q of a token
+// history at Engram layer ordinal `ordinal`, heads order-2 first, then order-3; the pad id before the sequence start;
+// ids >= the reference table size read the pad's compressed id.
+[[nodiscard]] engram::Spec engram_spec(const Config& config);
+class EngramRows {
+public:
+    explicit EngramRows(const Config& config);
+    [[nodiscard]] std::uint32_t columns() const noexcept { return hasher_.columns(); }
+    // rows.size() == columns(); flat-table rows (per_layer_token_embd.weight row ids).
+    void at(std::span<const std::uint32_t> tokens, std::uint32_t q, std::uint32_t ordinal, std::span<std::uint64_t> rows) const;
+
+private:
+    engram::Hasher hasher_;
+    std::vector<std::uint64_t> base_;  // [Engram layer] first row of the layer inside the one flat table
+};
 
 class HostRef {
 public:

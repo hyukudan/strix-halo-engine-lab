@@ -83,6 +83,16 @@ GreedyDecoder::GreedyDecoder(engine::Engine& e, std::uint32_t slot, Seed seed, c
     if (!disabled_) { drafts_.push_back(seed.draft); confidences_.push_back(seed.confidence); }
     hp_ = seed.hp;
     p_ = seed.p;
+    if (policy.spec_arbiter) {
+        proposer_ = std::make_unique<strix::spec::ContextProposer>();
+        // learn_costs off: decide() is a pure function of the seeds (the merged cost table, replicated) and the emitted
+        // tokens, so both TP2 ranks take the same decision with no extra exchange.
+        strix::spec::ArbiterConfig config;
+        config.learn_costs = false;
+        arbiter_ = std::make_unique<strix::spec::Arbiter>(config);
+        if (policy.context) proposer_->commit(*policy.context);
+        proposer_->commit(std::span<const std::uint32_t>(&seed.y0, 1));
+    }
     start_ = Clock::now();
     done_ = out_.tokens.size() >= budget_;
 }
@@ -116,7 +126,44 @@ bool GreedyDecoder::cycle() {
     const unsigned limit = draft_limit(adaptive ? policy.kmax : std::min(policy.kmax, policy.fixed_k),
                                        remaining, p, policy.capacity);
     if (drafts.size() > limit) { drafts.resize(limit); confidences.resize(limit); }
-    if (adaptive && !drafts.empty() && !window_gate_open(table, control.calibration.probability(1, confidences[0]))) {
+    // Shared arbiter (adaptive cycles only): lookup / MTP chain / plain, priced with the merged table (+ the catch-up
+    // every cycle pays). Lookup drafts replace the MTP seed; the catch-up below re-seeds MTP from the committed tokens.
+    namespace ss = strix::spec;
+    ss::Source source = ss::Source::model;
+    ss::Proposal proposal;
+    if (arbiter_ && adaptive) {
+        for (std::uint32_t r = 1; r <= 8; ++r) arbiter_->seed_cost(r, table.verify_ms[r] + table.catchup_ms);
+        // <= 7 lookup drafts: the catch-up then feeds acc.m + 1 <= 8 tokens to Engine::mtp (its n <= 8 contract);
+        // a longer verify window must split that catch-up first.
+        constexpr unsigned kLookupMax = 7;
+        static_assert(kLookupMax + 1 <= 8, "catch-up of a lookup cycle exceeds Engine::mtp's 8 rows");
+        const unsigned lk_limit = draft_limit(kLookupMax, remaining, p, policy.capacity);
+        const auto t0 = Clock::now();
+        proposal = proposer_->propose({}, lk_limit);
+        stats_.lookup_time(std::chrono::duration<double, std::micro>(Clock::now() - t0).count());
+        ss::StepInput in;
+        in.lookup = &proposal;
+        in.max_rows = lk_limit + 1;
+        in.context = p;
+        if (!drafts.empty() && limit > 0) {
+            in.model_max_k = limit;
+            in.model_pass_tokens = mtp_n_ > 0 ? mtp_tokens_ / mtp_n_ : 0.0;
+            in.model_pass_ms = mtp_n_ > 0 ? mtp_ms_ / mtp_n_ : 1.0;
+        }
+        const auto d = arbiter_->decide(in);
+        source = d.source;
+        if (source == ss::Source::lookup) {
+            if (d.k > proposal.tokens.size() || d.k > lk_limit)
+                throw std::logic_error("spec arbiter: lookup window beyond the proposal or the draft limit");
+            drafts.assign(proposal.tokens.begin(), proposal.tokens.begin() + d.k);
+            confidences.assign(d.k, 1.0F);
+        } else if (source == ss::Source::serial) {
+            drafts.clear(); confidences.clear();
+        }
+    }
+    const bool lookup_cycle = source == ss::Source::lookup;
+    if (!lookup_cycle && adaptive && !drafts.empty() &&
+        !window_gate_open(table, control.calibration.probability(1, confidences[0]))) {
         drafts.clear(); confidences.clear();
     }
     WindowEstimate estimate;
@@ -127,8 +174,8 @@ bool GreedyDecoder::cycle() {
         estimate.cycle_ms = table.verify_ms[estimate.k + 1] +
                             static_cast<float>(estimate.k - 1) * table.step_ms + table.catchup_ms;
     };
-    if (!drafts.empty()) add_estimate(confidences[0]);
-    while (!drafts.empty() && drafts.size() < limit) {
+    if (!drafts.empty() && !lookup_cycle) add_estimate(confidences[0]);
+    while (!lookup_cycle && !drafts.empty() && drafts.size() < limit) {
         if (adaptive && !window_extend(table, estimate,
             control.calibration.probability(estimate.k + 1, confidences.back()), limit)) break;
         const auto token = drafts.back();
@@ -167,12 +214,36 @@ bool GreedyDecoder::cycle() {
         ++depth.offered;
         if (d <= acc.m + 1 && d <= remaining) {
             ++depth.reached;
-            control.calibration.observe(d, confidences[d - 1], d <= acc.m);
+            // MTP confidence calibration learns from MTP drafts only
+            if (!lookup_cycle) control.calibration.observe(d, confidences[d - 1], d <= acc.m);
         }
         if (d <= acc.m) ++depth.accepted;
     }
+    const auto emitted_from = out.tokens.size();
     out.tokens.insert(out.tokens.end(), drafts.begin(), drafts.begin() + acc.m);
     if (acc.has_bonus) out.tokens.push_back(acc.bonus);
+    if (arbiter_) {
+        const std::span<const std::uint32_t> emitted(out.tokens.data() + emitted_from, out.tokens.size() - emitted_from);
+        if (adaptive) {
+            const auto s = rec.k == 0 ? ss::Source::serial : source;
+            // verify_ms 0: local walls never feed a decision (both ranks must decide the same)
+            const ss::Outcome o{s, proposal.bucket(), rec.k, acc.m, rec.k + 1, 0.0, 0.0, p};
+            arbiter_->observe(o, emitted);
+            auto shown = o;  // the stats line shows this rank's walls
+            shown.verify_ms = rec.verify;
+            shown.draft_ms = rec.extend;
+            stats_.record(shown, static_cast<std::uint32_t>(emitted.size()));
+            if (s == ss::Source::model) {
+                constexpr double decay = 0.95;
+                const double priced = table.verify_ms[rec.k + 1] + (rec.k > 0 ? static_cast<float>(rec.k - 1) * table.step_ms : 0.0F) +
+                                      table.catchup_ms;
+                mtp_tokens_ = mtp_tokens_ * decay + static_cast<double>(emitted.size());
+                mtp_ms_ = mtp_ms_ * decay + priced;
+                mtp_n_ = mtp_n_ * decay + 1;
+            }
+        }
+        proposer_->commit(emitted);
+    }
     const auto tm = Clock::now();
     e.commit(slot, acc.rows, p);
     rec.commit = ms(tm, Clock::now());
@@ -187,6 +258,8 @@ bool GreedyDecoder::cycle() {
     rec.checksum = 2166136261U;
     for (const auto x : {control.cycle, rec.k, rec.table_version, acc.m, acc.rows})
         rec.checksum = (rec.checksum ^ x) * 16777619U;
+    // arbiter on: the source is part of the trace too (a cross-rank choice divergence shows); off: trace unchanged
+    if (arbiter_) rec.checksum = (rec.checksum ^ (lookup_cycle ? 1U : 0U)) * 16777619U;
     if (!acc.stop) {
         if (!acc.has_bonus) throw std::logic_error("nonterminal acceptance without bonus");
         std::vector<std::uint32_t> cu(drafts.begin(), drafts.begin() + acc.m);
@@ -216,6 +289,10 @@ void GreedyDecoder::finish() {
     finished_ = true;
     const auto tail = Clock::now();
     out_.loop_ms = ms(start_, tail);
+    if (arbiter_) {
+        stats_.index_bytes = proposer_->bytes();
+        out_.spec_stats = stats_.json();
+    }
     e_.flush(slot_);
     out_.tail_ms = ms(tail, Clock::now());
 }

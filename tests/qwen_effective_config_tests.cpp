@@ -537,6 +537,9 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
             const auto slot=o.known_prefix_prefill_rows==8192?919596612U:751824452U;
             return HttpServingMemory{2819704288ULL,2775625728ULL,slot,slot};
         };
+        // The served wide copy default adds its 32-row tiled tail owner: +33,873,416 bytes of committed host peak;
+        // T8192 is still admitted at every availability below.
+        constexpr std::uint64_t wide_default_peak=103224760751ULL+33873416ULL;
         for (bool inspect:{false,true}) for (auto available:{130374098944ULL,131955068928ULL,132000509952ULL}) {
             production.options.print_effective_config=inspect;
             observed.available=available;
@@ -544,7 +547,7 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
             validate_effective_startup(admitted);
             expect(admitted.options.known_prefix_prefill_rows==8192 &&
                 admitted.host_compilation.at("target_registered_backing_bytes")==registered &&
-                admitted.host_compilation.at("serve_committed_host_peak_bytes")==103224760751ULL,
+                admitted.host_compilation.at("serve_committed_host_peak_bytes")==wide_default_peak,
                 "native serving committed target backing admits T8192 in startup and inspection");
             const auto& o=admitted.options;
             const auto r=observed.estimate(o); const auto m=observed.serving(o);
@@ -558,10 +561,10 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
             reserved.options.known_prefill_uma_explicit=true;reserved.options.known_prefill_uma_budget=200000000000ULL;
             const auto warm=resolve(reserved,roomy);
             expect(warm.options.known_prefix_prefill_rows==8192 &&
-                warm.host_compilation.at("serve_committed_host_peak_bytes")==103224760751ULL+table,
+                warm.host_compilation.at("serve_committed_host_peak_bytes")==wide_default_peak+table,
                 "HTTP automatic prefill reserves warmed PLE backing exactly once");
             reserved.environment["STRIX_PLE_WARM"]="0";
-            expect(resolve(reserved,roomy).host_compilation.at("serve_committed_host_peak_bytes")==103224760751ULL,
+            expect(resolve(reserved,roomy).host_compilation.at("serve_committed_host_peak_bytes")==wide_default_peak,
                 "PLE warm OFF restores automatic prefill backing total");
             const auto primary=r.model_backing+r.state_d1+r.serial_scratch+r.workspace+r.tails+
                 r.metadata+r.runtime_payload+r.external_host;
@@ -652,7 +655,8 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
     validate_effective_startup(startup);
     expect(startup.options.known_prefix_window && startup.options.known_prefix_full_rows &&
         startup.options.known_prefix_expert_union && startup.options.known_window_router_rows &&
-        startup.options.known_prefix_tail_rows==std::vector<std::uint32_t>({1024,256,64,16}) &&
+        startup.options.known_prefix_tail_rows==std::vector<std::uint32_t>({1024,256,64,32,16}) &&
+        startup.options.mtp.copy_wide_default && startup.options.known_prefix_wide_only_tail_rows==std::vector<std::uint32_t>({32}) &&
         startup.options.prefix_cache_block_rows==0 &&
         numerical_profile_pair(startup.options).decode==dense_a8_profile,
         "serve_prefill_production_mtp_ceilings: preserve explicit route organizations, tails, cache and decode arithmetic");
@@ -880,8 +884,9 @@ void serve_prefill_admission_tests(const ModelContract& model, const ModelManife
         explicit_config.options.known_prefill_metadata_budget==startup.options.known_prefill_metadata_budget &&
         explicit_config.options.known_prefill_uma_budget==startup.options.known_prefill_uma_budget &&
         explicit_config.options.known_prefill_host_headroom==startup.options.known_prefill_host_headroom &&
-        explicit_config.options.known_prefix_tail_rows==startup.options.known_prefix_tail_rows,
-        "serve_prefill_production_guards: explicit T/budgets win");
+        explicit_config.options.known_prefix_tail_rows==std::vector<std::uint32_t>({1024,256,64,16}) &&
+        !explicit_config.options.mtp.copy_wide_default && explicit_config.options.mtp.copy_wide_rows.empty(),
+        "serve_prefill_production_guards: explicit T/budgets win (explicit tails without 32 withdraw the wide default)");
     expect(numerical_profile_pair(explicit_config.options).decode==numerical_profile_pair(startup.options).decode &&
         numerical_profile_pair(explicit_config.options).prefill==dense_a8_profile && !explicit_config.options.prefill_profile_automatic,
         "serve_prefill_production_guards: an explicit tiled configuration keeps its resolved arithmetic");
@@ -1957,7 +1962,7 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
             expect(resolve(forbidden,memory).error=="YaRN MTP cohort/wide/sampling/metadata routes are not supported",
                 "cert control preserves the bounded explicit MTP route refusal");
             forbidden=cli; forbidden.options.http_serve=true;
-            expect(resolve(forbidden,memory).error=="YaRN on HTTP serving not supported","cert control preserves named HTTP refusal");
+            expect(resolve(forbidden,memory).error=="YaRN HTTP serving requires the MTP route","cert control preserves named HTTP refusal");
             forbidden=cli; forbidden.options.prefix_cache_roundtrip=true;
             expect(resolve(forbidden,memory).error=="YaRN requires plain serial CLI without cache, replay or recording","cert control preserves named cache refusal");
         }
@@ -2248,12 +2253,44 @@ void yarn_admission_tests(const gguf::FileInfo& info, const ModelManifest& manif
         auto bad = request;
         const char* reason = nullptr;
         if (route == 0) { bad.options.mtp.enabled = true; bad.options.mtp.sample_options=true; reason = "YaRN MTP cohort/wide/sampling/metadata routes are not supported"; }
-        if (route == 1) { bad.options.http_serve = true; reason = "YaRN on HTTP serving not supported"; }
+        if (route == 1) { bad.options.http_serve = true; reason = "YaRN HTTP serving requires the MTP route"; }
         if (route == 2) { bad.options.teacher_forced_score = true; reason = "YaRN with teacher scoring not yet qualified"; }
         if (route == 3) { bad.options.gdn_islands = true; reason = "YaRN graph capture path not yet qualified"; }
         if (route == 4) { bad.options.session_save = "checkpoint"; reason = "YaRN with session save/restore not yet qualified"; }
-        if (route == 5) { bad.options.prefix_cache_host_bytes = 4096; reason = "YaRN with prefix state cache not yet qualified"; }
+        if (route == 5) { bad.options.prefix_cache_dir = "cache"; reason = "YaRN prefix state cache requires an explicit --prefix-cache-host-bytes"; }
         expect(resolve(bad,memory).error == reason,"YaRN named route refusal");
+    }
+    {
+        // QFN-3: YaRN serving opt-in. The single greedy HTTP MTP route with an explicit prefix budget is admitted by
+        // the shared refusal; batch/cohort, sampling and unaudited HTTP controls keep named refusals. The rotary
+        // descriptor itself is bound by the cache identities (prefix_dma_tests, session_state_cache_tests).
+        Options serve;
+        serve.rotary = RotaryDescriptor::yarn(2); serve.context_tokens = 524288U; serve.context_explicit = true;
+        serve.mtp.enabled = true; serve.http_serve = true; serve.http_batch_explicit = true;
+        serve.prefix_cache_host_bytes = UINT64_C(8) << 30U;
+        serve.supplied_options = {"--rope-yarn","--context","--http-serve","--http-batch","--http-port","--prefix-cache-host-bytes"};
+        expect(yarn_route_refusal(serve).empty(), "YaRN single HTTP MTP route with explicit prefix budget is admitted");
+        auto batch = serve; batch.http_batch_explicit = false;
+        expect(yarn_route_refusal(batch).find("--http-batch 0") != std::string::npos, "YaRN HTTP needs the explicit single route");
+        auto capped = serve; capped.http_batch = capped.http_batch_cap = 2U;
+        expect(yarn_route_refusal(capped).find("--http-batch 0") != std::string::npos, "YaRN HTTP batch slots refuse");
+        auto sampled = serve; sampled.http_sampling = "sample";
+        expect(yarn_route_refusal(sampled) == "YaRN HTTP sampling not supported (greedy only)", "YaRN HTTP sampling refuses");
+        auto fast = serve; fast.supplied_options.insert("--http-selection-fast");
+        expect(yarn_route_refusal(fast) == "YaRN MTP explicit target override not supported: --http-selection-fast",
+            "unaudited HTTP selection control refuses by name");
+        auto implicit = serve; implicit.prefix_cache_host_bytes = 0; implicit.prefix_cache_dir = "cache";
+        expect(yarn_route_refusal(implicit) == "YaRN prefix state cache requires an explicit --prefix-cache-host-bytes",
+            "YaRN cache budget is explicit only");
+        auto band = serve; band.context_tokens = 600000U;
+        expect(yarn_route_refusal(band) == "YaRN MTP requires f2 at C<=524288 and f4 at C<=1048576", "factor band unchanged");
+        // One resolver: the same request on the CLI and on the single HTTP route takes the same QSA MTP pool decision.
+        auto cli = serve; cli.http_serve = false; cli.http_batch_explicit = false; cli.prefix_cache_host_bytes = 0;
+        auto http = serve; http.prefix_cache_host_bytes = 0;
+        const char* cli_pool = qsa_mtp_pool_decline(cli);
+        const char* http_pool = qsa_mtp_pool_decline(http);
+        expect((cli_pool == nullptr) == (http_pool == nullptr) &&
+            (!cli_pool || std::string_view(cli_pool) == std::string_view(http_pool)), "YaRN CLI and HTTP single resolve the same pool route");
     }
     {
         auto unknown = request; unknown.environment["STRIX_QPF2K_SHADOW_MAX_TOKENS"] = "300000";
@@ -5079,8 +5116,14 @@ int main(int argc, char** arguments) {
                 qsa_mtp_pool_bytes(batch,ModelContract::qwen38_flash_next())==218644480,
                 "every HTTP slot (single runner or batch) is charged one pool in the capacity fit");
             auto yarn_http=single;yarn_http.rotary=RotaryDescriptor::yarn(2);yarn_http.context_tokens=262144;
+            // QFN-3: the single YaRN HTTP route takes the CLI factor band (one resolver); outside it, closed.
+            auto yarn_cli=yarn_http;yarn_cli.http_serve=false;
+            expect(qsa_mtp_pool_route(yarn_http)==qsa_mtp_pool_route(yarn_cli) && qsa_mtp_pool_route(yarn_http),
+                "YaRN single HTTP route resolves the CLI pool decision");
+            auto yarn_out=yarn_http;yarn_out.context_tokens=600000;
+            expect(!qsa_mtp_pool_route(yarn_out),"YaRN HTTP outside the factor band stays closed");
             auto yarn_batch=batch;yarn_batch.rotary=yarn_http.rotary;yarn_batch.context_tokens=262144;
-            expect(!qsa_mtp_pool_route(yarn_http) && !qsa_mtp_pool_route(yarn_batch),"YaRN HTTP stays closed by default");
+            expect(!qsa_mtp_pool_route(yarn_batch),"YaRN HTTP batch slots stay closed by default");
             for(const auto name:{qwen::profile::Name::standard,qwen::profile::Name::fast,qwen::profile::Name::quality}) {
                 auto profiled=single;profiled.product_profile=qwen::profile::resolve(name,{});
                 auto profiled_batch=batch;profiled_batch.product_profile=profiled.product_profile;
@@ -6020,6 +6063,12 @@ int main(int argc, char** arguments) {
         {auto o=candidate();o.mtp.target_capture_bytes=o.mtp.target_capture_bytes+1;reject_mtp(o);}
         {auto o=candidate();o.mtp.window_rows_set={2,4};reject_mtp(o);}
         {auto o=candidate();o.mtp.copy_wide_rows={16};reject_mtp(o);}
+        {   // the served wide copy default is part of the bound command; the same fields typed explicitly are not
+            auto o=candidate();o.mtp.copy_wide_rows={32};o.mtp.ngram_context=o.mtp.ngram_copy_edit=o.mtp.ngram_wide_only=true;
+            o.mtp.copy_wide_auto=true;reject_mtp(o);
+            o.mtp.copy_wide_default=true;
+            expect(cache_mtp_contract_qualified(o),"the served wide copy default keeps the bound production MTP contract");
+            o.mtp.ngram_draft=true;reject_mtp(o);}
         {auto o=candidate();o.mtp.draft_vocab="other.bin";reject_mtp(o);}
         {auto o=candidate();o.mtp.draft_profile="base";reject_mtp(o);}
         {auto o=candidate();o.mtp.cohort_mode="sequential";reject_mtp(o);}

@@ -389,4 +389,16 @@ cudaError_t argmax_rows(const float* logits, std::uint32_t vocab, std::uint32_t 
     return hp::pick_rows<hp::Launch::pdl>(v, hp::EmitIndex{out}, stream);  // main's launch form for this core (PDL)
 }
 
+cudaError_t argmax2_rows(const float* logits, std::uint32_t vocab, std::uint32_t rows, std::uint32_t* out, std::uint32_t* out2,
+                         void* workspace, cudaStream_t stream, float* gap) {
+    if (workspace == nullptr || out2 == nullptr || rows == 0 || rows > kMaxRows) return cudaErrorInvalidValue;
+    namespace hp = strix::cuda::core::head_argmax;  // runner-up trait of the same shared head pick
+    hp::View v;
+    v.logits = logits;
+    v.count = vocab;
+    v.rows = rows;
+    return hp::pick2_rows<hp::Launch::pdl>(v, static_cast<strix::head_argmax::Pick2*>(workspace), hp::EmitIndex2{out, out2, gap},
+                                           stream);
+}
+
 }  // namespace strix::cuda_core

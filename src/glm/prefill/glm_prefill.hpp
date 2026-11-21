@@ -129,18 +129,14 @@ bool hc_expand_norm_split();
 void hc_norm_factor_rows(const float* X, float* rr, unsigned rows, hipStream_t s);
 void hc_expand_norm_rows(const float* X, const float* mix, const float* y, float* Xo, float* rr, unsigned* flag, unsigned rows,
                          hipStream_t s);
-// Two-row expand CTA: strict cached STRIX_GLM_PF_HC_EXPAND_ROWS=1 (kernel default) / 2 (rank default).
-// Default keeps the existing kernel. Explicit gate API bypasses the selector: each row
-// uses 256 threads and its own ordered tree. y1 != nullptr forms rank-ordered y + y1
-// before multiplication; hoist 0/1/2 are the existing load-placement controls.
-// Hoist 2 requires disjoint X/Xo. No resource, payload or performance qualification implied.
-unsigned hc_expand_cta_rows();
-void hc_expand_norm_rows_cta(unsigned cta_rows, unsigned hoist, const float* X, const float* mix,
-                             const float* y, const float* y1, float* Xo, float* rr, unsigned* flag,
-                             unsigned rows, hipStream_t s);
-// Gate/bench only: prints all variants' attributes and occupancy; false on spills or
-// an unlaunchable block. Does device work, unlike reading hc_expand_cta_rows().
-bool hc_expand_cta_resources();
+// STRIX_GLM_PF_HC_EXPAND_BW (default 1; =0 restores the one-row hc_expand_norm_rows_h kernel): hc_expand_norm_rows / hc_sum_expand_norm_rows run
+// the shared bandwidth-organised row expansion (src/core/hc_expand_rows.hpp, GLM policy glm_hc_expand_bw.inc): the mix row
+// in registers once, X / y loaded once per row through restrict pointers, streaming X loads / Xo stores; every expression
+// and its order unchanged (same bits). hc_expand_bw_rows returns false (nothing launched) when the ranges break its
+// restrict contract (Xo / rr overlapping an input, or misaligned rows); y1 null = single-rank y.
+bool hc_expand_bw_enabled();
+bool hc_expand_bw_rows(const float* X, const float* mix, const float* y, const float* y1, float* Xo, float* rr, unsigned* flag,
+                       unsigned rows, hipStream_t s);
 void hc_pre_rows_normed(const float* X, const float* fn, const float* base, const float* scale, const float* rr, float* z, float* mix,
                         float* xc, unsigned rows, hipStream_t s);
 // STRIX_GLM_PF_SUMEXP (default 1; =0 restores the exchange's sum2 then hc_expand_norm_rows): the pipelined TP2 seam hands

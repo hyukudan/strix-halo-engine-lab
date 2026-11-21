@@ -51,4 +51,14 @@ struct Layout {
     return static_cast<std::size_t>(chunks(rows)) * value_heads * Layout::block;
 }
 
+// Scan trait of the chunk family (K1 and its workspace are shared by both):
+//   f32  = gdn-chunk16-f32-v1: K2 on FP32 FFMA, state tile in shared memory (grid value_heads x 4, 128 threads).
+//   tf32 = gdn-chunk16-tf32-v1: K2 on mma.m16n8k8.tf32 with FP32 accumulation; the FP32 state S^T lives in the accumulator
+//          fragments for the whole launch (grid value_heads x 2, 4 warps x 16 value columns). Every product operand is rounded
+//          to TF32 (cvt.rna: 10-bit mantissa, relative 2^-11); sums, decays and the state stay FP32. Same algebra as above,
+//          other bits: FAST class, engine identity suffix -gdnc16t, gated on its own.
+enum class Scan : std::uint8_t { f32 = 0, tf32 = 1 };
+inline constexpr const char* kIdentityTf32 = "gdn-chunk16-tf32-v1";
+[[nodiscard]] constexpr const char* identity(Scan s) noexcept { return s == Scan::tf32 ? kIdentityTf32 : kIdentity; }
+
 }  // namespace strix::gdn_chunk

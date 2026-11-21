@@ -1048,8 +1048,7 @@ void bench_rank(const DeviceExperts& x, std::uint32_t top_k, std::uint32_t owned
                         label + " T=" + std::to_string(rows) + " arm " + arms[arm].name + ": the default arms do not compare two routes");
                     std::cout << "RANK-ROUTE " << label << " T=" << rows << " arm " << arms[arm].name << ": gate/up "
                               << (gu_core ? "shared core" : "engine kernels") << ", down " << (dn_core ? "shared core" : "engine kernels")
-                              << (a != 0U && gu_core == ref_gu_core && dn_core == ref_dn_core ? " (SAME ROUTE as arm " + arms[0].name + ")" : "") << '
-';
+                              << (a != 0U && gu_core == ref_gu_core && dn_core == ref_dn_core ? " (SAME ROUTE as arm " + arms[0].name + ")" : "") << '\n';
                 }
                 hipLaunchKernelGGL(flush_kernel, dim3(1024), dim3(256), 0, nullptr, flush.data, flush.count, sink.data);
                 enqueue_prefill(x, in, r2 && std::strcmp(r2, "1") == 0 ? view32 : view, run, false, ev);

@@ -4,12 +4,14 @@
 // window width, for v = 1..3, uneven cuts and 1..9 chunks (more than one StagePipes group). Also: a half cut and a
 // missing range hook are refused, and a seam from another model/plan identity stops both ranks.
 #include "strix/pair/layer_pipeline.hpp"
+#include "strix/pair/link_mux.hpp"
 
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -134,8 +136,10 @@ Result reference(const Weights& m, const std::vector<std::uint32_t>& prompt, uns
     return r;
 }
 
+// muxed: both directions of the stage pipes ride ONE link through strix::pair::LinkMux (channel 0 forward, 1 reverse,
+// small pieces so frames are cut); after close() the decode runs on the same raw link.
 std::vector<Result> run_pair(const Weights& m, const std::vector<std::uint32_t>& prompt, unsigned width, unsigned gen,
-                             const StageMap& map, unsigned bad_identity_rank = 2U) {
+                             const StageMap& map, unsigned bad_identity_rank = 2U, bool muxed = false) {
     Channel forward, reverse;
     std::vector<Result> out(2);
     const auto chunks = layers::windows(prompt.size(), width).size();
@@ -148,7 +152,20 @@ std::vector<Result> run_pair(const Weights& m, const std::vector<std::uint32_t>&
             const std::uint64_t identity = rank == bad_identity_rank ? 2U : 1U;
             PipeOptions options;
             options.validate = layers::stage_validator(identity, map, width, row_bytes);
-            StagePipes pipes(rank, map, chunks, forward.end(rank), reverse.end(rank), options);
+            std::unique_ptr<strix::pair::LinkMux> mux;
+            PipeLink fl = forward.end(rank), rl = reverse.end(rank);
+            if (muxed) {
+                const auto raw = forward.end(rank);
+                mux = std::make_unique<strix::pair::LinkMux>(raw.send, raw.receive, [&](const std::string&) { forward.abort(); },
+                                                             2U, std::size_t{24});
+                for (std::uint32_t ch = 0; ch < 2U; ++ch) {
+                    auto& l = ch == 0U ? fl : rl;
+                    l.send = [&mux, ch](std::span<const std::byte> d) { mux->send(ch, d); };
+                    l.receive = [&mux, ch](std::span<std::byte> d) { mux->receive(ch, d); };
+                    l.abort = [&mux] { mux->abort("stage pipe abort"); };
+                }
+            }
+            auto pipes = std::make_unique<StagePipes>(rank, map, chunks, fl, rl, options);
             layers::StageOps ops;
             ops.row_bytes = row_bytes;
             ops.range = [&](std::span<const std::uint32_t> tok, const layers::Window& w, std::uint32_t a, std::uint32_t b, bool head) {
@@ -156,7 +173,9 @@ std::vector<Result> run_pair(const Weights& m, const std::vector<std::uint32_t>&
             ops.seam = [&](PipeFrame& f, bool save, std::size_t bytes) {
                 if (save) std::memcpy(f.payload.data(), t.x.data(), bytes); else std::memcpy(t.x.data(), f.payload.data(), bytes); };
             ops.fence = [] {};
-            (void)layers::prefill(map, rank, prompt, width, identity, pipes, ops);
+            (void)layers::prefill(map, rank, prompt, width, identity, *pipes, ops);
+            pipes.reset();
+            if (mux) mux->close();
             const bool head_rank = map.owner(map.stages() - 1U) == rank;
             if (head_rank) out[rank].logits = t.logits;
             layers::DecodeOps d;
@@ -203,6 +222,12 @@ int main() {
                        std::memcmp(got[1].logits.data(), ref.logits.data(), ref.logits.size() * sizeof(float)) == 0,
                    tag + ": head logits bitwise == single rank");
             expect(got[0].ids == ref.ids && got[1].ids == ref.ids, tag + ": greedy ids == single rank on both ranks");
+            const auto mux = run_pair(m, prompt, c.width, gen, map, 2U, true);
+            expect(mux[0].error.empty() && mux[1].error.empty(), tag + " muxed: ran (" + mux[0].error + " | " + mux[1].error + ")");
+            expect(mux[1].logits.size() == ref.logits.size() &&
+                       std::memcmp(mux[1].logits.data(), ref.logits.data(), ref.logits.size() * sizeof(float)) == 0 &&
+                       mux[0].ids == ref.ids && mux[1].ids == ref.ids,
+                   tag + " muxed: one link carries both directions, logits bitwise and ids == single rank");
         }
     }
     {   // a seam from another identity stops both ranks (no hang)
@@ -210,6 +235,53 @@ int main() {
         const auto prompt = make_prompt(37, 5U);
         const auto got = run_pair(m, prompt, 8, gen, map, 1U);
         expect(!got[0].error.empty() && !got[1].error.empty(), "identity mismatch stops both ranks");
+    }
+    {   // the shared default map: v = 3 on uniform layers, v = 1 for one window, v lowered for few layers
+        expect(strix::pair::default_stage_map(42U, 4U).text() == "0,7,14,21,28,35,42", "default 42 layers 4 windows = v3 uniform");
+        expect(strix::pair::default_stage_map(42U, 1U).text() == "0,21,42", "default one window = two-stage cut");
+        expect(strix::pair::default_stage_map(12U, 9U).virtual_stages() == 1U, "12 layers: stages of >= 4 layers -> v = 1");
+        expect(strix::pair::default_stage_map(16U, 9U).virtual_stages() == 2U, "16 layers -> v = 2");
+    }
+    {   // the shared planner: rows per window and v from the prompt length, the layer cost and the link cost
+        using strix::pair::LayerPipeCost;
+        const std::uint32_t chunks[] = {1024U, 2048U, 4096U};
+        const std::uint32_t vs[] = {1U, 2U, 3U, 4U, 5U};
+        const auto any = [](std::uint32_t) { return true; };
+        const LayerPipeCost cost{270.0, 1.37, 2.3e-6, 30.0, 26.0 / 2048.0};
+        const auto one = strix::pair::plan_stages(1024U, 42U, cost, chunks, any, vs);
+        expect(one.choice.chunk == 0U && one.map.text() == "0,21,42", "plan: prompt of one window -> no window, two-stage cut");
+        const auto p8 = strix::pair::plan_stages(8192U, 42U, cost, chunks, any, vs);
+        expect(p8.choice.chunk != 0U && p8.map.virtual_stages() == p8.choice.virtual_stages && p8.map.virtual_stages() > 1U &&
+                   p8.map.layers() == 42U,
+               "plan 8K: windows, interleaved map with the chosen v");
+        for (std::uint32_t s = 0; s < p8.map.stages(); ++s)
+            expect(p8.map.cuts[s + 1U].layer - p8.map.cuts[s].layer >= 4U, "plan: every stage keeps >= 4 layers");
+        const double w_plan = strix::pair::interleaved_wall_ms(8192U, p8.choice.chunk, p8.choice.virtual_stages, cost.at(8192U));
+        for (const auto c : chunks)
+            for (const auto v : vs)
+                if (c < 8192U && 2U * v * 4U <= 42U)
+                    expect(w_plan <= strix::pair::interleaved_wall_ms(8192U, c, v, cost.at(8192U)), "plan 8K: no candidate is faster");
+        LayerPipeCost slow_link = cost;
+        slow_link.hop_latency_ms = 5000.0;  // a hop dearer than a stage: interleaving loses, two stages remain
+        expect(strix::pair::plan_stages(8192U, 42U, slow_link, chunks, any, vs).choice.virtual_stages == 1U, "plan: slow link -> v = 1");
+        expect(strix::pair::plan_stages(8192U, 12U, cost, chunks, any, vs).choice.virtual_stages == 1U, "plan: 12 layers -> v = 1");
+        expect(strix::pair::plan_stages(8192U, 42U, cost, chunks, [](std::uint32_t c) { return c == 2048U; }, vs).choice.chunk == 2048U,
+               "plan: the engine's width rule binds");
+        bool threw = false;
+        const double short_costs[] = {1.0, 2.0};
+        try { (void)strix::pair::plan_stages(8192U, 42U, cost, chunks, any, vs, short_costs); } catch (const std::invalid_argument&) { threw = true; }
+        expect(threw, "plan: one cost per layer");
+        // The planned map runs bitwise like any map (12-layer model, width 8: v = 2 needs 16 layers at min 4 -> min 2).
+        const std::uint32_t small_chunks[] = {8U, 16U};
+        const LayerPipeCost small{1.0, 1.0, 0.0, 0.0, 0.0};
+        const auto ps = strix::pair::plan_stages(64U, L, small, small_chunks, any, vs, {}, 2U);
+        const auto prompt = make_prompt(64U, 77U);
+        const auto ref = reference(m, prompt, ps.choice.chunk, gen);
+        const auto got = run_pair(m, prompt, ps.choice.chunk, gen, ps.map);
+        expect(ps.choice.chunk != 0U && ps.map.virtual_stages() > 1U && got[1].logits.size() == ref.logits.size() &&
+                   std::memcmp(got[1].logits.data(), ref.logits.data(), ref.logits.size() * sizeof(float)) == 0 &&
+                   got[0].ids == ref.ids && got[1].ids == ref.ids,
+               "plan: the planned width and map give the single-rank bits (" + ps.map.text() + ")");
     }
     {   // refusals: half cut, missing range hook
         StageMap half;
@@ -221,6 +293,6 @@ int main() {
         try { layers::check_stage_map(StageMap::parse("0,6,12", L), 0U, false); } catch (const std::invalid_argument&) { threw = true; }
         expect(threw, "missing range hook refused");
     }
-    if (failures == 0) std::printf("PASS pair layer stages (4 maps x 5 prompt/width cases + identity + refusals)\n");
+    if (failures == 0) std::printf("PASS pair layer stages (4 maps x 5 prompt/width cases, separate and muxed links + identity + refusals)\n");
     return failures == 0 ? 0 : 1;
 }

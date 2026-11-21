@@ -104,6 +104,67 @@ inline StageMap balance_map(std::span<const double> layer_ms, double tail_ms, st
     return map;
 }
 
+// Default stage map of a two-rank layer pipeline when the deployment names none: v stages per rank, whole-layer cuts from
+// balance_map over uniform layer costs (an engine with a measured per-layer cost calls balance_map itself). Fill and drain
+// cost one stage (P / 2v) instead of a half pass, for 2v - 2 more seam hops per window. Measured (Hy4 42 layers, 2048-row
+// windows, bitwise equal to v = 1): v = 3 beats v = 1 by 13-17 % at 4 windows (8K) and 4 % at 16 (32K). One window has
+// nothing to overlap: v = 1. v is lowered until every stage holds at least `min_layers` layers.
+[[nodiscard]] inline StageMap default_stage_map(std::uint32_t layers, std::uint64_t windows, std::uint32_t v = 3U,
+                                                std::uint32_t min_layers = 4U) {
+    if (layers < 2U) throw std::invalid_argument("pair stage map: a layer pipeline needs two layers");
+    if (windows < 2U) v = 1U;
+    while (v > 1U && 2U * v * std::max(min_layers, 1U) > layers) --v;
+    const std::vector<double> uniform(layers, 1.0);
+    return balance_map(uniform, 0.0, std::max(v, 1U), [](std::uint32_t) { return true; });
+}
+
+// Measured cost of a two-rank layer pipeline, as a function of the prompt length n: one window of u rows costs
+// fixed_ms + (ms_per_row + ms_per_row_per_position x n) x u over both ranks (the attention part grows with the context),
+// and every stage boundary sends one frame of hop_latency_ms + hop_ms_per_row x u (copies out and in, fence, link).
+// Engines declare it as data from their receipts; `at(n)` is the regime.hpp cost of that prompt.
+struct LayerPipeCost {
+    double fixed_ms = 0.0;
+    double ms_per_row = 0.0;
+    double ms_per_row_per_position = 0.0;
+    double hop_latency_ms = 0.0;
+    double hop_ms_per_row = 0.0;
+    [[nodiscard]] PipelineCost at(std::uint64_t rows) const {
+        PipelineCost cost;
+        cost.fixed_ms = fixed_ms;
+        cost.ms_per_row = ms_per_row + ms_per_row_per_position * static_cast<double>(rows);
+        cost.hop_latency_ms = hop_latency_ms;
+        cost.hop_ms_per_row = hop_ms_per_row;
+        return cost;
+    }
+};
+struct StagePlan {
+    PipelineChoice choice;  // chunk = rows per window (0: no window shorter than the prompt), virtual_stages = v
+    StageMap map;           // 2v stages over the layers (one stage per rank when v = 1)
+};
+// Rows per window AND stages per rank of a two-rank layer pipeline from the prompt length, the per-layer cost and the
+// link cost, instead of fixed constants: the shared event model (regime.hpp interleaved_wall_ms through
+// choose_pipeline) over `chunks` x `virtual_stages`; v is legal when every one of the 2v stages keeps at least
+// `min_layers` whole layers. The map is balance_map over `layer_ms` (uniform when empty). Scheduling only: every layer
+// sees the same windows in prompt order, so the bits follow the window width alone (an engine whose width changes no
+// bit may hand any width; otherwise it passes its one legal width). No window shorter than the prompt: chunk 0, v = 1.
+template <class Legal>
+[[nodiscard]] StagePlan plan_stages(std::uint64_t rows, std::uint32_t layers, const LayerPipeCost& cost,
+    std::span<const std::uint32_t> chunks, Legal&& legal, std::span<const std::uint32_t> virtual_stages,
+    std::span<const double> layer_ms = {}, std::uint32_t min_layers = 4U) {
+    if (layers < 2U) throw std::invalid_argument("pair stage plan: a layer pipeline needs two layers");
+    if (!layer_ms.empty() && layer_ms.size() != layers) throw std::invalid_argument("pair stage plan: one cost per layer");
+    const auto legal_v = [&](std::uint32_t v) { return v >= 1U && 2U * v * std::max(min_layers, 1U) <= layers; };
+    StagePlan plan;
+    plan.choice = choose_pipeline(rows, cost.at(rows), chunks, std::forward<Legal>(legal), virtual_stages, legal_v,
+        LayoutDecl{});
+    const std::uint32_t v = plan.choice.chunk == 0U ? 1U : plan.choice.virtual_stages;
+    plan.choice.virtual_stages = v;
+    const std::vector<double> uniform(layer_ms.empty() ? layers : 0U, 1.0);
+    plan.map = balance_map(layer_ms.empty() ? std::span<const double>(uniform) : layer_ms, 0.0, v,
+        [](std::uint32_t) { return true; });
+    return plan;
+}
+
 // One direction of the pair link: ordered send/receive of that direction's frames and their ACKs.
 struct PipeLink {
     Pipe::Send send;

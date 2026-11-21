@@ -1,10 +1,13 @@
 #include "strix/mtp_context_draft.hpp"
 #include "strix/mtp_window_controller.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
+#include <random>
 #include <string>
+#include <unordered_map>
 #include <vector>
 namespace {
 int failures = 0;
@@ -15,6 +18,59 @@ using V = std::vector<std::uint32_t>;
 using strix::MtpContextDraft;
 using strix::MtpContextDraftConfig;
 V bytes(const std::string& s) { V out; for (const unsigned char c : s) out.push_back(c); return out; }
+// Reference of MtpContextDraft::lookup with one index per suffix length (the incumbent's semantics, brute force):
+// the longest n in [min,max] with an exact earlier occurrence followed by a committed token, its majority vote.
+struct RefLookup { V out; std::uint32_t suffix = 0, support = 0, occurrences = 0; };
+RefLookup ref_lookup(const V& context, const V& extra, std::size_t length, std::uint32_t min_n, std::uint32_t max_n) {
+    RefLookup r;
+    if (!length) return r;
+    const auto total = context.size() + extra.size();
+    const auto at = [&](std::size_t i) { return i < context.size() ? context[i] : extra[i - context.size()]; };
+    for (std::uint32_t n = max_n; n >= min_n; --n) {
+        if (total < n) continue;
+        std::vector<std::size_t> positions;
+        for (std::size_t end = n - 1; end + 1 < context.size(); ++end) {
+            bool same = true;
+            for (std::uint32_t k = 0; k < n && same; ++k) same = context[end + 1 - n + k] == at(total - n + k);
+            if (same) positions.push_back(end + 1);
+        }
+        if (positions.empty()) continue;
+        r.occurrences = static_cast<std::uint32_t>(positions.size());
+        while (!positions.empty() && r.out.size() < length) {
+            struct Vote { std::size_t count = 0, latest = 0; };
+            std::unordered_map<std::uint32_t, Vote> votes;
+            for (const auto pos : positions) { auto& v = votes[context[pos]]; ++v.count; v.latest = std::max(v.latest, pos); }
+            std::uint32_t winner = 0; Vote best;
+            for (const auto& [token, v] : votes)
+                if (v.count > best.count || (v.count == best.count && (v.latest > best.latest ||
+                    (v.latest == best.latest && token < winner)))) { winner = token; best = v; }
+            if (r.out.empty()) r.support = static_cast<std::uint32_t>(best.count);
+            r.out.push_back(winner);
+            positions.erase(std::remove_if(positions.begin(), positions.end(), [&](std::size_t pos) {
+                return context[pos] != winner || pos + 1 >= context.size();
+            }), positions.end());
+            for (auto& pos : positions) ++pos;
+        }
+        r.suffix = n;
+        return r;
+    }
+    return r;
+}
+// Prompt-like token stream: skewed vocabulary with copied spans (code / document edits).
+V prompt_like(std::size_t n, std::uint32_t seed) {
+    std::mt19937 rng(seed);
+    V out; out.reserve(n);
+    while (out.size() < n) {
+        if (out.size() > 64 && rng() % 4 == 0) {
+            const std::size_t len = 8 + rng() % 40, from = rng() % (out.size() - 8);
+            for (std::size_t i = 0; i < len && from + i < out.size() && out.size() < n; ++i) out.push_back(out[from + i]);
+        } else {
+            const auto r = rng() % 1000;
+            out.push_back(r < 600 ? static_cast<std::uint32_t>(rng() % 64) : static_cast<std::uint32_t>(rng() % 32000));
+        }
+    }
+    return out;
+}
 }
 int main() {
     {
@@ -228,6 +284,54 @@ int main() {
         std::vector<double> acc3;
         const auto stop = e.begin_cycle(115, V{}, 0, 7, acc3, 0.0);
         check(stop == V({116,117,118}) && e.stats().edit_cuts >= 1, "a copy proposal stops before the edited token");
+        {   // mtp_context_observe_config: the observe-only drafter indexed by the copy anchor makes the same wide proposals
+            // and learns the same long-anchor cells as the min_suffix index (random small-alphabet contexts with repeated
+            // spans, outputs copying spans with edits: long bigram chains).
+            std::mt19937 obs_rng(7);
+            const auto pick = [&](std::uint32_t n) { return static_cast<std::uint32_t>(obs_rng() % n); };
+            const auto it = [](const V& v, std::size_t i) { return v.begin() + static_cast<std::ptrdiff_t>(i); };
+            MtpContextDraftConfig obs_base; obs_base.copy_edit = true; obs_base.wide_anchor = 16; obs_base.prior = 0.95;
+            const auto obs_cfg = mtp_context_observe_config(obs_base);
+            auto chained = obs_base; chained.chain_fresh = 12;
+            check(obs_cfg.min_suffix == obs_base.copy_anchor && mtp_context_observe_config(chained).min_suffix == obs_base.min_suffix,
+                "observe config: indexed by the copy anchor, chain copy keeps its keys");
+            std::size_t proposals = 0, compared = 0;
+            for (int trial = 0; trial < 30; ++trial) {
+                V src; for (int i = 0; i < 400; ++i) src.push_back(pick(5) + 1);
+                for (int k = 0; k < 3; ++k) { const auto from = pick(300); const V span(it(src, from), it(src, from + 60)); src.insert(src.end(), span.begin(), span.end()); }
+                V out;
+                while (out.size() < 400) {
+                    const auto from = pick(static_cast<std::uint32_t>(src.size() - 80));
+                    for (std::uint32_t j = 0; j < 80; ++j) out.push_back(pick(25) == 0 ? 6 + pick(3) : src[from + j]);
+                }
+                MtpContextDraft oa(obs_base), ob(obs_cfg); oa.reset(src); ob.reset(src);
+                std::size_t at = 0;
+                while (at + 40 < out.size()) {
+                    const auto pa = oa.propose_wide(out[at], 31, 0.0), pb = ob.propose_wide(out[at], 31, 0.0);
+                    ++compared;
+                    check(pa == pb, "observe config: same wide proposal");
+                    if (!pa.empty()) {
+                        ++proposals;
+                        std::size_t same = 0; while (same < pa.size() && pa[same] == out[at + 1 + same]) ++same;
+                        if (same == pa.size()) {
+                            const V em(it(out, at + 1), it(out, at + 33)); oa.finish_cycle(em, 31, 31); ob.finish_cycle(em, 31, 31);
+                            at += 32; continue;
+                        }
+                        const V tr(it(out, at + 1), it(out, at + 2 + same)); oa.abandon_wide(tr); ob.abandon_wide(tr);
+                    }
+                    std::vector<double> aa, ab;
+                    (void)oa.begin_cycle(out[at], V{}, 0, 7, aa, 0.0); oa.discard_selection();
+                    (void)ob.begin_cycle(out[at], V{}, 0, 7, ab, 0.0); ob.discard_selection();
+                    const std::size_t step = 1U + pick(8);
+                    const V em(it(out, at + 1), it(out, at + 1 + step));
+                    oa.finish_cycle(em, 0, 0); ob.finish_cycle(em, 0, 0); at += step;
+                    for (const std::size_t row : {std::size_t{0}, std::size_t{1}, std::size_t{3}})
+                        check(oa.acceptance(16, true, row) == ob.acceptance(16, true, row), "observe config: same long-anchor cells");
+                }
+            }
+            std::printf("observe config equivalence: %zu wide proposals in %zu comparisons\n", proposals, compared);
+            check(proposals >= 10 && compared >= 1000, "observe config: the equivalence saw wide proposals");
+        }
         MtpContextDraft s(c); s.reset(prompt);
         check(s.propose_wide(108, 60).empty(), "a context continuation shorter than the requested rows is refused");
         check(s.propose_wide(108, 0).empty(), "zero rows propose nothing");
@@ -344,6 +448,62 @@ int main() {
         MtpContextDraft s4(c);
         s4.reset(V{1,2,3,4,50,9,10,11,12,13,14, 99, 1,2,3});
         check(s4.begin_copy_cycle(4, 7, acc, 0.7F).empty(), "a 4-token anchor is below the default copy anchor");
+    }
+    {
+        // One min_suffix-key index answers every suffix length exactly as one index per length did.
+        const std::uint32_t ranges[][2] = {{2, 16}, {1, 4}, {3, 8}, {2, 2}, {4, 16}};
+        std::mt19937 rng(7);
+        std::size_t compared = 0, hits = 0;
+        for (const auto& range : ranges) {
+            MtpContextDraftConfig c; c.min_suffix = range[0]; c.max_suffix = range[1];
+            for (int trial = 0; trial < 300; ++trial) {
+                const auto alphabet = static_cast<std::uint32_t>(2 + rng() % 5);
+                V context(rng() % 200);
+                for (auto& t : context) t = static_cast<std::uint32_t>(rng() % alphabet);
+                if (trial % 3 == 0 && context.size() > 40)
+                    for (std::size_t i = 0; i < 20; ++i) context.push_back(context[i + 10]);
+                MtpContextDraft d(c);
+                d.reset(context);
+                for (int q = 0; q < 6; ++q) {
+                    V extra(rng() % 5);
+                    for (auto& t : extra) t = static_cast<std::uint32_t>(rng() % alphabet);
+                    const std::size_t length = rng() % 9;
+                    std::uint32_t suffix = 99, support = 99, occurrences = 99;
+                    const auto out = d.lookup(extra, length, suffix, support, &occurrences);
+                    const auto r = ref_lookup(context, extra, length, c.min_suffix, c.max_suffix);
+                    ++compared; hits += r.out.empty() ? 0U : 1U;
+                    if (out != r.out || suffix != r.suffix || support != r.support || occurrences != r.occurrences) {
+                        check(false, "single-key index lookup equals the per-length index (min " + std::to_string(c.min_suffix) +
+                            " max " + std::to_string(c.max_suffix) + " context " + std::to_string(context.size()) + ")");
+                        break;
+                    }
+                }
+            }
+        }
+        check(hits > compared / 4, "the equivalence sample exercises matches");
+        // Host cost of indexing an 80K prompt (printed, not asserted): the incumbent's one map entry per position
+        // and suffix length (2..16) against this index.
+        const auto prompt = prompt_like(80291, 11);
+        const auto t0 = std::chrono::steady_clock::now();
+        MtpContextDraft d(MtpContextDraftConfig{});
+        d.reset(prompt);
+        const auto t1 = std::chrono::steady_clock::now();
+        struct K { std::uint64_t h; std::uint32_t n; bool operator==(const K& o) const noexcept { return h == o.h && n == o.n; } };
+        struct KH { std::size_t operator()(const K& k) const noexcept { return static_cast<std::size_t>(k.h ^ (k.n * 0x9e3779b97f4a7c15ULL)); } };
+        std::unordered_map<K, std::vector<std::uint32_t>, KH> per_length;
+        for (std::size_t end = 0; end < prompt.size(); ++end)
+            for (std::uint32_t n = 2; n <= 16 && n <= end + 1; ++n) {
+                std::uint64_t h = 0xcbf29ce484222325ULL;
+                for (std::size_t i = end + 1 - n; i <= end; ++i) { h ^= prompt[i] + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); h *= 0xff51afd7ed558ccdULL; }
+                per_length[K{h, n}].push_back(static_cast<std::uint32_t>(end));
+            }
+        const auto t2 = std::chrono::steady_clock::now();
+        std::uint32_t suffix = 0, support = 0;
+        const V tail(prompt.end() - 24, prompt.end() - 4);
+        check(!d.lookup(tail, 4, suffix, support).empty() || suffix == 0, "80K lookup runs");
+        std::printf("context draft 80K reset: single-key index %.1f ms, per-length index %.1f ms (%zu keys)\n",
+            std::chrono::duration<double, std::milli>(t1 - t0).count(), std::chrono::duration<double, std::milli>(t2 - t1).count(),
+            per_length.size());
     }
     return failures ? 1 : 0;
 }

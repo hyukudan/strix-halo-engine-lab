@@ -7,8 +7,9 @@
 //
 //   strix-cuda-qwen-serve --model M.gguf --tables DIR --rope-table rope_cs.bin [--mtp-sidecar S.gguf --draft-vocab V.bin]
 //       [--max-positions 32768] [--bind 127.0.0.1] [--port 8090] [--api-key-file F] [--model-id ID]
-//       [--mtp-depth 7] [--min-p 0.7] [--max-queue 64] [--http-slots 4] [--prefill-chunk 1024|auto] [--prefill-overlap-rows 1024]
+//       [--mtp-depth 7] [--min-p P (default 0.7, in [0,1])] [--max-queue 64] [--http-slots 4] [--prefill-chunk 1024|auto] [--prefill-overlap-rows 1024]
 //       [--admit-grace-ms 2] [--cohort-depth fair|max] [--slot-margin-mib 2048] [--block-rows N] [--mtp-defer-prompt on|off]
+//       [--http-anthropic-thinking-budget enforce|note]
 //       [--expert-residency auto|full|tiered] [--vram-budget-gib N] [--print-effective-config]
 //       [--prefix-cache on|off] [--prefix-cache-block 256] [--prefix-cache-stride 16384] [--prefix-cache-root on|off]
 //       [--prefix-cache-host-mb N] [--prefix-cache-vram-mb 0]
@@ -35,6 +36,7 @@
 #include "strix/deploy/memory_plan.hpp"
 #include "cuda_qwen_prefix_cache.hpp"
 #include "strix/mtp_depth_host.hpp"
+#include "strix/mtp_draft_profiles.hpp"
 #include "cuda_qwen_serve_policy.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/cuda/qwen_cohort.hpp"
@@ -43,6 +45,7 @@
 #include "strix/residency/residency_cli.hpp"
 #include "strix/serve/api.hpp"
 #include "strix/serve/bpe_tokenizer.hpp"
+#include "strix/serve/constraint_selection.hpp"
 #include "strix/serve/engine.hpp"
 #include "strix/serve/http_server.hpp"
 #include "strix/serve/prefix_join.hpp"
@@ -97,7 +100,9 @@ struct Options {
     std::string bind = "127.0.0.1", api_key_file, model_id = "qwen3.8-flash-next";
     int port = 8090;
     std::uint32_t mtp_depth = 7, max_queue = 64;
-    float min_p = 0.7F;
+    float min_p = 0.7F;                         // resolved draft min-p (strix/mtp_draft_profiles.hpp, CUDA)
+    std::optional<float> min_p_explicit;        // --min-p: always wins (0 is a real value)
+    std::string_view min_p_source;              // explicit | unprofiled
     std::uint32_t http_slots = 16, admit_grace_ms = 2;
     // --prefix-cache-inflight on|off: a prompt sharing a prefix with a prompt still prefilling waits for the producer's
     // checkpoint at the shared block boundary and restores it (shared strix::serve prefix join; needs the prefix cache).
@@ -115,7 +120,11 @@ struct Options {
     std::string cohort_depth = "fair";
     std::uint32_t slot_margin_mib = 2048;       // free VRAM that must remain after a new slot's session
     bool print_effective_config = false;        // resolve (GGUF header + live card/host numbers), print, exit: no model load
-    cuda_qwen_serve::SessionPolicy session;     // per-request session capacity (one resolver for both serve paths)
+    // --http-anthropic-thinking-budget enforce|note (as the HIP server): Anthropic thinking.budget_tokens becomes the
+    // request's thinking budget (enforce) or is noted as not enforced (note, default). strix.thinking_policy requests
+    // are always enforced (the shared selection over the verified rows' argmax).
+    bool anthropic_thinking_budget_enforce = false;
+    cuda_qwen_serve::SessionPolicy session;    // per-request session capacity (one resolver for both serve paths)
 };
 
 Options parse(int argc, char** argv) {
@@ -173,7 +182,13 @@ Options parse(int argc, char** argv) {
         else if (a == "--api-key-file") o.api_key_file = next();
         else if (a == "--model-id") o.model_id = next();
         else if (a == "--mtp-depth") o.mtp_depth = static_cast<std::uint32_t>(std::stoul(next()));
-        else if (a == "--min-p") o.min_p = std::stof(next());
+        else if (a == "--min-p") {
+            const auto value = next();
+            std::size_t end = 0;
+            const float v = std::stof(value, &end);
+            if (end != value.size()) throw std::invalid_argument("--min-p needs a number");
+            o.min_p_explicit = v;
+        }
         else if (a == "--max-queue") o.max_queue = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--session-granule") o.session.granule = std::stoull(next());
         else if (a == "--session-reserve") {
@@ -186,9 +201,21 @@ Options parse(int argc, char** argv) {
         else if (a == "--prefill-overlap-rows") o.prefill_overlap_rows = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--admit-grace-ms") o.admit_grace_ms = static_cast<std::uint32_t>(std::stoul(next()));
         else if (a == "--cohort-depth") o.cohort_depth = next();
+        else if (a == "--http-anthropic-thinking-budget") {
+            const auto v = next();
+            if (v != "enforce" && v != "note") throw std::invalid_argument("--http-anthropic-thinking-budget requires enforce|note");
+            o.anthropic_thinking_budget_enforce = v == "enforce";
+        }
         else if (strix::residency::consume_cli_arg(a, next, residency_cli)) {}  // --expert-residency, --vram-budget-gib, --print-effective-config
         else if (a == "--slot-margin-mib") o.slot_margin_mib = static_cast<std::uint32_t>(std::stoul(next()));
         else throw std::invalid_argument("unknown option " + a);
+    }
+    {
+        // No CUDA draft identity is resolved from the loaded sidecar yet, so the draft is unprofiled here (every CUDA
+        // column is the legacy 0.7 until an RTX receipt qualifies another value keyed on the sidecar SHA-256).
+        const auto r = strix::resolve_mtp_draft_min_probability(o.min_p_explicit, nullptr, strix::MtpDraftBackend::cuda);
+        o.min_p = r.value;
+        o.min_p_source = r.source;
     }
     const auto resolved = qo::resolve(request, qo::Entry::serve);
     o.engine = resolved.config;
@@ -238,11 +265,24 @@ std::string read_key(const std::string& path) {
 
 class CudaQwenEngine final : public serve::GenerationEngine {
 public:
-    CudaQwenEngine(qp::Prefill& engine, const Options& o, px::Cache& cache) : e_(engine), o_(o), cache_(cache) {}
+    CudaQwenEngine(qp::Prefill& engine, const Options& o, px::Cache& cache, serve::ArgmaxConstraintRequests& constraints)
+        : e_(engine), o_(o), cache_(cache), constraints_(constraints) {}
 
     serve::GenerationStats generate(serve::GenerationJob& job) override {
         serve::GenerationStats st;
         st.prompt_tokens = job.prompt.size();
+        // A request policy (thinking budget): selected on the host from each verified row's argmax (shared
+        // select_greedy_window); null = the plain greedy rule below, unchanged.
+        std::shared_ptr<serve::ConstraintSelection> selection;
+        std::unique_ptr<strix::MtpSelectionTransaction> transaction;
+        if (job.constraint) {
+            try { selection = constraints_.make(job.constraint); }
+            catch (const std::invalid_argument& ex) {
+                st.error_status = 400; st.error_code = "unsupported_constraint";
+                throw serve::GenerationRequestError(st, ex.what());
+            }
+            transaction = selection->window_transaction();
+        }
         const auto t0 = Clock::now();
         const std::uint64_t n = job.prompt.size();
         const std::uint64_t cap = o_.engine.max_positions;
@@ -325,8 +365,25 @@ public:
             }
             const auto r = e_.verify(rows.data(), static_cast<std::uint32_t>(rows.size()), pos);
             std::uint32_t keep = 1;
-            while (keep < rows.size() && rows[keep] == r.argmax[keep - 1]) ++keep;
+            // The window's tokens: argmax[0, keep), or the request policy's selection (a forced closure ends it).
+            std::span<const std::uint32_t> verified(r.argmax.data(), rows.size());
+            strix::GreedyWindowSelection chosen;
+            if (transaction) {
+                try {
+                    chosen = strix::select_greedy_window(*transaction, std::span<const std::uint32_t>(rows).subspan(1), verified);
+                } catch (const strix::MtpSelectionError& ex) {
+                    e_.commit(0);  // undo the window (exact); the request ends with the refusal
+                    if (defer_step) e_.mtp_settle(0);
+                    st.error_status = 400; st.error_code = "constraint_failure";
+                    throw serve::GenerationRequestError(st, ex.what());
+                }
+                keep = static_cast<std::uint32_t>(chosen.ids.size());
+                verified = chosen.ids;
+            } else {
+                while (keep < rows.size() && rows[keep] == r.argmax[keep - 1]) ++keep;
+            }
             e_.commit(keep);
+            if (chosen.receipt) chosen.receipt->publish();
             if (defer_step) e_.mtp_settle(0);  // no host wait; the next draft reads them in stream order
             if (dh.on()) {
                 if (selected) dh.finish(static_cast<std::uint32_t>(rows.size()), keep - 1,
@@ -336,13 +393,13 @@ public:
             ++st.cycles;
             st.accepted += keep - 1;
             pos += keep;
-            pending = r.argmax[keep - 1];
+            pending = verified[keep - 1];
             // emit the verified tokens up to max_tokens and the first stop token (included)
             std::vector<std::uint32_t> out;
             bool stopped = false;
             for (std::uint32_t j = 0; j < keep && st.generated_tokens + out.size() < job.max_tokens; ++j) {
-                out.push_back(r.argmax[j]);
-                if (std::find(job.stop_tokens.begin(), job.stop_tokens.end(), r.argmax[j]) != job.stop_tokens.end()) { stopped = true; break; }
+                out.push_back(verified[j]);
+                if (std::find(job.stop_tokens.begin(), job.stop_tokens.end(), verified[j]) != job.stop_tokens.end()) { stopped = true; break; }
             }
             if (first && job.observed) st.first_token_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             first = false;
@@ -359,8 +416,9 @@ public:
         std::string extra = head;
         for (std::size_t i = 0; i < emitted.size() && i < 4096; ++i) extra += (i ? "," : "") + std::to_string(emitted[i]);
         extra += "],\"prefix_cached\":" + std::to_string(st.cached_tokens) + ",\"prefix_restore_ms\":" + std::to_string(prefix_restore_ms)
-            + ",\"prefix_capture_ms\":" + std::to_string(prefix_capture_ms) + "}";
+            + ",\"prefix_capture_ms\":" + std::to_string(prefix_capture_ms) + ",\"draft_chain\":" + e_.draft_stats() + "}";
         st.engine_extra.emplace_back("rtx", extra);
+        if (selection) st.constraint = selection->verdict(st.finish, mtp ? "mtp-host" : "serial-host");
         return st;
     }
     [[nodiscard]] std::uint64_t context_tokens() const override { return o_.engine.max_positions; }
@@ -369,6 +427,7 @@ private:
     qp::Prefill& e_;
     const Options& o_;
     px::Cache& cache_;
+    serve::ArgmaxConstraintRequests& constraints_;
 };
 
 // Continuous batching over up to http_slots requests (one engine session each): between scheduler steps it admits
@@ -377,7 +436,8 @@ private:
 // The tokens a request emits, its stop rule and its receipts follow CudaQwenEngine::generate() exactly.
 class CohortServer {
 public:
-    CohortServer(qp::Prefill& engine, const Options& o, serve::GenerationQueue& queue, px::Cache& cache) : e_(engine), o_(o), queue_(queue), cache_(cache) {
+    CohortServer(qp::Prefill& engine, const Options& o, serve::GenerationQueue& queue, px::Cache& cache, serve::ArgmaxConstraintRequests& constraints)
+        : e_(engine), o_(o), queue_(queue), cache_(cache), constraints_(constraints) {
         mtp_ = !o_.engine.mtp_sidecar_gguf.empty() && o_.mtp_depth > 0;
         dh_ = std::make_unique<strix::MtpDepthHost>(std::min<std::uint32_t>(o_.mtp_depth, qc::kWindowRows - 1U), o_.min_p, mtp_ && strix::mtp_depth_controller_enabled());
         if (o_.prefill_overlap) e_.enable_prefill_overlap(o_.prefill_overlap_rows);
@@ -484,6 +544,9 @@ private:
         // the drafter over the prompt, built on a worker while the prompt prefills (14-22 ms of host work at 8K that
         // otherwise sits between the prefill and the first token); taken when the slot starts decoding
         std::future<std::unique_ptr<qc::ContextDraft>> ctx_build;
+        // the request's policy (thinking budget): selection state and its window transaction (qc::Stream::selection)
+        std::shared_ptr<serve::ConstraintSelection> selection;
+        std::unique_ptr<strix::MtpSelectionTransaction> transaction;
         serve::GenerationStats st;
         Clock::time_point t0, t_decode;
         double prefill_gpu_ms = 0;   // overlapped chunks: GPU time on the prefill stream (events)
@@ -533,6 +596,11 @@ private:
             st.error_status = 400;
             st.error_code = "context_length_exceeded";
             error = "prompt longer than the context";
+        }
+        else if (t.job.constraint && !serve::ArgmaxConstraintRequests::admits(*t.job.constraint)) {
+            st.error_status = 400;
+            st.error_code = "unsupported_constraint";
+            error = "this engine selects from each row's argmax only: response_format, logprobs and logit transforms are not executed";
         }
         if (error.empty()) return false;
         queue_.finish(t, st, error);
@@ -816,6 +884,11 @@ private:
         end_prefix_entries(s);  // prompt done: it serves no further join (its end checkpoint is in the cache)
         s.ctx = s.ctx_build.valid() ? s.ctx_build.get() : nullptr;  // built in start() (same mode, same prompt)
         s.stream = qc::Stream{s.session, job.prompt[s.n - 1], s.n - 1, job.draft_depth_max, s.ctx.get(), job.copy_rows, job.window_rows};
+        if (job.constraint) {  // admitted by reject_early (argmax-decidable policy)
+            s.selection = constraints_.make(job.constraint);
+            s.transaction = s.selection->window_transaction();
+            s.stream.selection = s.transaction.get();
+        }
         s.st.finish = "length";
         if (job.max_tokens == 0) finish(s, {}, "length");
     }
@@ -912,6 +985,10 @@ private:
     void finish(Slot& s, const std::string& error, const char* why) {
         auto& st = s.st;
         st.finish = why;
+        if (s.selection) st.constraint = s.selection->verdict(why, mtp_ ? "mtp-host" : "serial-host");
+        s.stream.selection = nullptr;
+        s.transaction.reset();
+        s.selection.reset();
         if (s.phase == Phase::decode)
             st.decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - s.t_decode).count();
         const double queue_ms = std::chrono::duration<double, std::milli>(s.job->started - s.job->submitted).count();
@@ -939,7 +1016,7 @@ private:
             ",\"copy_wide_accepted\":" + std::to_string(s.ctx->wide_accepted);
         extra += ",\"prefix_cached\":" + std::to_string(st.cached_tokens) + ",\"prefix_restore_ms\":" + std::to_string(s.prefix_restore_ms)
             + ",\"prefix_capture_ms\":" + std::to_string(s.prefix_capture_ms) + ",\"prefix_join\":" + std::to_string(s.join_boundary)
-            + ",\"prefill_overtakes\":" + std::to_string(s.overtakes) + "}";
+            + ",\"prefill_overtakes\":" + std::to_string(s.overtakes) + ",\"draft_chain\":" + e_.draft_stats() + "}";
         st.engine_extra.emplace_back("rtx", extra);
         end_prefix_entries(s);
         queue_.finish(*s.job, std::move(st), error);
@@ -951,6 +1028,7 @@ private:
     const Options& o_;
     serve::GenerationQueue& queue_;
     px::Cache& cache_;
+    serve::ArgmaxConstraintRequests& constraints_;
     std::vector<Slot> slots_;
     bool mtp_ = false;
     const qc::ContextMode context_mode_ = qc::context_mode_default();
@@ -1001,6 +1079,7 @@ int main(int argc, char** argv) {
         }
         std::cerr << "strix-cuda-qwen-serve: loading " << o.engine.model_gguf << std::endl;
         if (!o.engine.mtp_sidecar_gguf.empty() && o.mtp_depth > 0) std::cerr << "strix-cuda-qwen-serve: " << strix::mtp_depth_state_line(o.min_p) << ", mtp_depth=" << o.mtp_depth
+            << ", min_p_source=" << o.min_p_source
             << ", context_draft=" << qc::context_mode_name(qc::context_mode_default())
             << ", copy_rows=" << qc::copy_rows_default() << ", copy_wide=" << (qc::copy_wide_switch() < 0 ? "auto" : qc::copy_wide_switch() ? "on" : "off")
             << " (effective " << ((qc::copy_wide_switch() < 0 ? qc::copy_wide_pays(qc::copy_rows_default(), qc::copy_wide_model()) : qc::copy_wide_switch() == 1) ? "on" : "off")
@@ -1044,6 +1123,14 @@ int main(int argc, char** argv) {
         if (const auto end = tokenizer->find("<|endoftext|>"); end != UINT32_MAX) config.stop_tokens.push_back(end);
         std::sort(config.stop_tokens.begin(), config.stop_tokens.end());
         config.stop_tokens.erase(std::unique(config.stop_tokens.begin(), config.stop_tokens.end()), config.stop_tokens.end());
+        // Thinking budgets (strix.thinking_policy thinking-budget-v1; Anthropic budget_tokens with
+        // --http-anthropic-thinking-budget enforce): the shared selection forces the closure on the verified rows'
+        // argmax (select_greedy_window), the HIP server's rule. No response_format / logprobs / logit transforms here.
+        serve::ArgmaxConstraintRequests constraints(tokenizer);
+        const bool mtp_windows = !o.engine.mtp_sidecar_gguf.empty() && o.mtp_depth > 0;
+        config.engine_thinking_budget = serve::thinking_closure_usable(*tokenizer, config.stop_tokens);
+        config.enforce_anthropic_thinking_budget = o.anthropic_thinking_budget_enforce;
+        config.constraint_execution_routes = {mtp_windows ? "mtp-host" : "serial-host"};
         serve::GenerationQueue queue(o.max_queue);
         px::Cache prefix_cache(o.engine, o.prefix);
         config.state_cache_stats = [&prefix_cache] { return prefix_cache.stats_json(); };
@@ -1057,10 +1144,10 @@ int main(int argc, char** argv) {
             status.set("prefix_cache", serve::parse_json(prefix_cache.stats_json()));
             status.set("device", serve::parse_json(device_json));
         };
-        CudaQwenEngine adapter(engine, o, prefix_cache);
+        CudaQwenEngine adapter(engine, o, prefix_cache, constraints);
         std::optional<CohortServer> cohort;  // --http-slots > 1: continuous batching; 1: the serialized queue.run path
         if (o.http_slots > 1) {
-            cohort.emplace(engine, o, queue, prefix_cache);
+            cohort.emplace(engine, o, queue, prefix_cache, constraints);
             std::cerr << "strix-cuda-qwen-serve: " << o.http_slots << " slots (cohort decode), sessions "
                       << cuda_qwen_serve::describe(o.session) << ", prefill chunk "
                       << (o.prefill_chunk ? std::to_string(o.prefill_chunk) + " rows" : std::string("auto"))

@@ -42,6 +42,8 @@ el resolvedor compartido para ambas CLI: `fast` enciende cada palanca solo en el
 |---|---|---|
 | `--prefill-arith fast4` | prefill grande de la CLI de decode, `--turbo-weights onfly\|converted` (gate W4A4 8K/32K superado) | `--prefill-arith exact` |
 | `--prefill-gdn chunk16` | mismo régimen (cualificado junto con FAST4) | `--prefill-gdn serial` |
+| `--prefill-gdn chunk16tc` | nunca (opt-in; FAST `gdn-chunk16-tf32-v1`, identidad `-gdnc16t`, gate de calidad pendiente) | `--prefill-gdn chunk16` |
+| `--prefill-hid bf16` | nunca (opt-in con `--prefill-arith fast4`; FAST `nvfp4-tile-h16-v1`, identidad `-h16`, gate de calidad pendiente) | `--prefill-hid f32` |
 | `--prefill-attn8 on` | mismo régimen, prompt de al menos 8.192 tokens (gates 8K y 32K superados) | `--prefill-attn8 off` |
 | `--split-k fast` | CLI spec (ventanas de decode), `--turbo-weights onfly\|converted`: FAST `nvfp4-splitk-fast-v1` (gate superado; verify de spec 0,6-0,7 % más rápido). CLI de decode: pendiente (su `fast` ya aplica FAST4; esa combinación aún no tiene gate) | `--split-k exact` |
 | `--decode-attn8 on` | pendiente en ambas CLI (sin régimen cualificado: gate a 8K / 28K / 64K sin ejecutar). Atención de decode / verify en tensor cores e4m3 sobre la sombra e4m3 del K/V, identidad `-d8`; las filas de verify dan los mismos bits que el decode de una fila; en la CLI spec cubre también las ventanas de prefill. `--decode-attn8 on` explícito lo ejecuta en cualquier régimen | `--decode-attn8 off` |
@@ -115,6 +117,7 @@ Las tablas listan los flags seleccionados. La lista completa de variables de ent
 | Flag | Motor | Por defecto | Qué hace | Cuándo lo quiere otro hardware |
 |---|---|---|---|---|
 | `--block-schedule default\|tail-large` | qwen-rtx | `tail-large` | Orden de bloques en los kernels grandes. | `default` en GPUs con otro número de CUs. |
+| `--prefill-tile-feed bulk\|lsu` | qwen-rtx (CLI de decode del denso 27B, prefill FAST4) | `lsu` | Alimentación de etapas de las GEMM tile FAST4: `bulk` = warpgroup productor con copias bulk (optativo), `lsu` = copias por hilo y barrera de CTA de la ruta anterior. Bits idénticos en el fixture del operador. [Detalles](optimizations.md#qwen-dense-cuda-fast4-tile-bulk-feed) | Mantener `lsu` hasta validar el prefill completo. |
 | `--prefill auto` | glm | `auto` | Elige la ruta de prefill. | - |
 | `--prefill-chunk N` | glm | 512 | Tamaño de chunk de prefill en filas. | Mayor con más cómputo; menor con menos memoria. |
 | `--prefill-route windows\|large`, `--prefill-chunk N` | qwen-rtx (CLI spec 27B) | `windows` | `large`: el prompt pasa por el prefill grande del CLI de decode (`--prefill-chunk N` filas por chunk; 0 = valor del motor) y sus filas alimentan la cadena MTP. Opcional, aún sin medir frente a `windows`. | - |
@@ -155,7 +158,7 @@ Las tablas listan los flags seleccionados. La lista completa de variables de ent
 | `--tp-rank 0\|1`, `--tp-transport`, `--tp-rates A,B`, `--tp-trip-us`, `--tp-gap-us`, `--tp-force` | qwen dense decode (HIP) | off (un nodo) | Decode exacto en paralelo de tensores sobre dos ranks: reparto por columnas / cabezas, gathers exactos. Colocación por el planificador compartido con la pasada de un nodo medida al arrancar y el viaje sondeado (línea `plan:`; un plan perdedor decodifica en un nodo en ambos ranks). `--tp-rates` (GB/s por rank) sustituye las tasas de la topología, `--tp-trip-us` la latencia medida del viaje, `--tp-gap-us` el hueco de host medido por unión de la ruta staged (desconocido = la división se rechaza), `--tp-force` mantiene el grupo cuando el planificador dice que pierde. [Entrada](optimizations.md#qwen-27b-exact-tensor-parallel-decode-over-two-nodes). | Las tasas por rank salen de la declaración de topología; un par en la misma caja mide su propio viaje al arrancar. |
 | `--topology FILE --node ID`, `STRIX_TOPOLOGY` | qwen dense decode (HIP) | ninguno | Declaración de topología leída para las tasas del paralelo de tensores (`memory_gbytes_ps` de ambos nodos). | Declara la tasa de memoria medida de cada nodo. |
 | `STRIX_PAIR_DECODE_RELAY=1` | qwen pair prefill (HIP) | off | Tras el prefill por capas, mueve una vez el estado de cada etapa a un nodo que tiene el modelo entero y decodifica allí. No medido en este árbol. [Entrada](optimizations.md#qwen-27b-pair-prefill-decode-relay-to-one-node). | Cuando un nodo tiene el modelo entero y el reparto por capas serializa el decode. |
-| `STRIX_TP_CHANNEL=0` | qwen dense decode (HIP, `--tp-rank`) | on | `=0` vuelve a la ruta por host (espera del host por gather). On: lleva los gathers del paralelo de tensores por el canal compartido con espera en el dispositivo: sin espera del host por gather; los últimos mensajes se comprueban al final de la ejecución. Mismos bytes, mismos slots, mismos kernels de unión. [Entrada](optimizations.md#qwen-27b-exact-tensor-parallel-decode-over-two-nodes). | Cualquier par donde la espera del host por gather cuesta más que el hilo de progreso del canal. |
+| `STRIX_TP_CHANNEL=0` | qwen dense decode + `strix-hy4-rank` (HIP, `--tp-rank`) | on | `=0` vuelve a la ruta por host (espera del host por gather). On: lleva los gathers del paralelo de tensores por el canal compartido con espera en el dispositivo: sin espera del host por gather; los últimos mensajes se comprueban al final de la ejecución. Mismos bytes, mismos slots, mismos kernels de unión. [Entrada](optimizations.md#qwen-27b-exact-tensor-parallel-decode-over-two-nodes). | Cualquier par donde la espera del host por gather cuesta más que el hilo de progreso del canal. |
 | `STRIX_TP_XPORT_DEPTH`, `_FOLD`, `_PUBLISH`, `_CRC` (`0\|1\|deferred`), `_TX_MEM`, `_RX_MEM`, `_PROGRESS_CPU`, `_CRC_CPU`, `_IDLE_SPIN_US`, `_TIMEOUT_MS`, `_TEST_CORRUPT` | qwen dense decode (HIP, ruta canal) | valores del canal (CRC diferido por encima de 1 KB) | Ajustes del canal por el que van los gathers: profundidad del anillo, publicación, comprobación de integridad, memoria de los búferes, CPUs de progreso / CRC, espera activa, timeout del peer; `_TEST_CORRUPT` inyecta un mensaje corrupto (solo pruebas). Ambos ranks deben coincidir. | Fija la CPU de progreso lejos del hilo del motor en hosts cargados. |
 | `STRIX_DS41_OB_SPLIT=K` | deepseek | off | Parte el intercambio o_b en K trozos que se solapan con el cómputo. Exacto. Más lento en la ruta por host. | Prueba en una interconexión más rápida o con GPU-direct. |
 
@@ -236,6 +239,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_PREFIX_CACHE` | qwen | ON on the qualified single tiled-MTP ... | [certified-mtp-subset](engine/serving/prefix-state-cache.md#certified-mtp-subset) |
 | `STRIX_PREFIX_QUEUE_PROTECT` | qwen | off | Una petición en espera retiene una referencia al estado de prefijo compatible más largo del nivel host; el desalojo lo salta hasta que la petición se admite, se cancela o se rechaza (con tope de bytes). |
 | `STRIX_SERVE_STARTUP_OVERLAP` | servidor compartido (enlazado: minimax) | on | Arranque del servidor: el trabajo de host que no depende de los pesos del modelo (el fichero del drafter de MiniMax) se lee en su propio hilo junto a la carga de pesos y se recoge donde antes se leía. Mismos bytes; `0` mantiene el arranque en serie. |
+| `STRIX_SERVE_WARMUP` | servidor compartido (enlazado: serve por lotes HIP de qwen; DS41 mantiene su `STRIX_DS41_SERVE_WARM`) | off (activar con `1`) | Arranque del servidor: un prompt sintético del tile de prefill T del serve más un token recorre el camino de petición del propio motor antes de escuchar (sin almacén de prefijos ni borradores), de modo que el scratch de dispositivo de primer uso de la clase de T filas se reserva al arrancar y no en la primera petición. Las peticiones siguientes hacen la misma aritmética (mismos ids); cuesta un prompt de T filas al arrancar. No cubre el crecimiento que depende de posiciones de contexto más allá de T ni las filas por token respaldadas por fichero que no caben en memoria. Si la petición de calentamiento falla (el runner la informa como cualquier petición fallida), el servidor arranca igualmente, en modo perezoso, y la línea de arranque dice FAILED; un fallo del motor durante ella sigue deteniendo el arranque. Sin configurar o con `0` se conserva el arranque perezoso anterior; `1` activa el calentamiento. |
 | `STRIX_PREFIX_CACHE_DISK` | qwen | ON: joining wherever the prefix cache... | [certified-restart-and-in-flight-joining](engine/serving/prefix-state-cache.md#certified-restart-and-in-flight-joining) |
 | `STRIX_PREFIX_CACHE_DURABLE` | qwen | ON: joining wherever the prefix cache... | [certified-restart-and-in-flight-joining](engine/serving/prefix-state-cache.md#certified-restart-and-in-flight-joining) |
 | `STRIX_PREFIX_CACHE_INFLIGHT` | qwen | ON: joining wherever the prefix cache... | [certified-restart-and-in-flight-joining](engine/serving/prefix-state-cache.md#certified-restart-and-in-flight-joining) |
@@ -269,7 +273,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_GLM_PF_AUX_COMBINE` | glm | 1 | [glm-pf-aux-combine](optimizations.md#glm-pf-aux-combine) |
 | `STRIX_GLM_PF_DENSE_FORM` | glm | automático (0) | [glm-pf-dense-rows-v4](optimizations.md#glm-pf-dense-rows-v4) |
 | `STRIX_GLM_PF_DENSE_ROWS` | glm | 4 | [glm-pf-dense-rows-v4](optimizations.md#glm-pf-dense-rows-v4) |
-| `STRIX_GLM_PF_HC_EXPAND_ROWS` | glm | 2 | [glm-pf-hc-expand-rows](optimizations.md#glm-pf-hc-expand-rows) |
+| `STRIX_GLM_PF_HC_EXPAND_BW` | glm | 1 | [glm-pf-hc-expand-bw](optimizations.md#glm-pf-hc-expand-bw) |
 | `STRIX_GLM_PF_HC_FUSE` | glm | 1 | [glm-pf-hc-fuse](optimizations.md#glm-pf-hc-fuse) |
 | `STRIX_GLM_PF_HC_HOIST` | glm | 1, 1 | [glm-pf-sumexp](optimizations.md#glm-pf-sumexp) |
 | `STRIX_GLM_PF_IDX` | glm | 3 / 2 | [glm-pf-indexer-v2](optimizations.md#glm-pf-indexer-v2) |
@@ -454,7 +458,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_QSA_DECODE_POOL_BF16` | qwen | 1 (plain append-only serial decode un... | [qwen-qsa-decode-pool](optimizations.md#qwen-qsa-decode-pool) |
 | `STRIX_QWEN_ROUTER_BF16` | qwen | OFF (opt-in: STRIX_QWEN_ROUTER_BF16=1) | [qwen-exact-bf16-router-weights](optimizations.md#qwen-exact-bf16-router-weights) |
 
-### Rutas de kernel (122)
+### Rutas de kernel (123)
 
 | Toggle | Motor | Por defecto | Detalles |
 |---|---|---|---|
@@ -558,6 +562,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_MM_XB_WARM` | minimax | 8 | [mm-xb-warm](optimizations.md#mm-xb-warm) |
 | `STRIX_MM_XB_WARM_O` | minimax | 8 | [mm-xb-warm-o](optimizations.md#mm-xb-warm-o) |
 | `STRIX_MODEL_PREFAULT` | qwen | ON | [registration-prefault](optimizations.md#registration-prefault) |
+| `STRIX_MODEL_COPY_REGISTERED` | qwen | AUTO | [resident-copy-registered-source](optimizations.md#resident-copy-registered-source) |
 | `STRIX_MODEL_REGISTER_MLOCK` | qwen | ON when RLIMIT_MEMLOCK covers the reg... | [registered-page-lock](optimizations.md#registered-page-lock) |
 | `STRIX_PLE_PREISSUE` | qwen | ON | [qwen-ple-preissue](optimizations.md#qwen-ple-preissue) |
 | `STRIX_PLE_RECLAIMABLE` | qwen | auto | [qwen-l1](optimizations.md#qwen-l1) |
@@ -582,6 +587,7 @@ Sigue el enlace para ver la ganancia, las precondiciones y el interruptor de apa
 | `STRIX_ROUTER_STAGE_ACT` | qwen | ON | [qwen-router](optimizations.md#qwen-router) |
 | `STRIX_SERVE_HEALTH_RECORD` | qwen | ON | [operations/service-health.md](operations/service-health.md) |
 | `STRIX_SERVE_OBSERVE_EXPIRY_S` | deepseek | 60 seconds | [ds-observation](optimizations.md#ds-observation) |
+| `STRIX_QRTX_EXPERT_WIDE_TILE` | qwen-rtx | off (`1` = activo con el umbral integrado, `N` = activo desde N filas por experto) | [qwen-rtx-expert-wide-tile](optimizations.md#qwen-rtx-expert-wide-tile) |
 
 ### Solo depuración (5)
 

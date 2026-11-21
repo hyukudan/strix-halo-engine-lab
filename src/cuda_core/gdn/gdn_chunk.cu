@@ -294,6 +294,159 @@ __global__ void __launch_bounds__(128) chunk_scan_kernel(const float* __restrict
     }
 }
 
+// ---- K2 tf32 (gdn-chunk16-tf32-v1): one (value head, 64-column value tile) per CTA; warp w owns value columns 16 w .. 16 w + 15
+// with ALL 128 keys, so its FP32 state S^T[16 v][128 k] is 16 accumulator fragments (64 registers) for the whole launch and no
+// product needs a cross-warp sum. Per chunk and warp: X^T = S^T W^T and Y^T = S^T Q^T (2 x 32 mma), O^T = exp(G) Y^T + U^T P^T
+// (4 mma), S^T = exp(G_last) S^T + U'^T K (32 mma); every A operand is a C fragment as it is (gdn_chunk.hpp tc::perm). The next
+// chunk's operands stream into the other shared-memory stage by cp.async during this chunk: one barrier per chunk.
+namespace tcs = gc::tc;
+constexpr int WTS = static_cast<int>(tcs::kWtStride), QS = static_cast<int>(tcs::kQStride), KS = static_cast<int>(tcs::kKStride),
+              US = static_cast<int>(tcs::kUStride), PTS = static_cast<int>(tcs::kPtStride);
+constexpr int SWT = static_cast<int>(tcs::Stage::wt), SQ = static_cast<int>(tcs::Stage::q), SK = static_cast<int>(tcs::Stage::k),
+              SU = static_cast<int>(tcs::Stage::u), SPT = static_cast<int>(tcs::Stage::pt), SG = static_cast<int>(tcs::Stage::g),
+              SFL = static_cast<int>(tcs::Stage::floats);
+
+__device__ __forceinline__ std::uint32_t to_tf32(float x) {
+    std::uint32_t r;
+    asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x));
+    return r;
+}
+__device__ __forceinline__ void mma_tf32(float (&d)[4], const std::uint32_t (&a)[4], std::uint32_t b0, std::uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+// 16-byte cp.async; valid == false fills the 16 bytes with zeros (src must still be a mapped address)
+__device__ __forceinline__ void cp16z(float* dst, const float* src, bool valid) {
+    const auto s = static_cast<std::uint32_t>(__cvta_generic_to_shared(dst));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(s), "l"(src), "r"(valid ? 16 : 0) : "memory");
+}
+
+__global__ void __launch_bounds__(128) chunk_scan_tc_kernel(const float* __restrict__ qkvc, const float* __restrict__ ws, float* base,
+                                                            float* __restrict__ out, GdnDims d, std::uint32_t rows,
+                                                            const std::uint32_t* parity_dev) {
+    extern __shared__ __align__(16) float smem[];
+    const int t = static_cast<int>(threadIdx.x), lane = t & 31, warp = t >> 5, g = lane >> 2, tq = lane & 3;
+    const std::uint32_t h = blockIdx.x, kh = h % d.key_heads, ch = d.conv_channels(), vh = d.value_heads, nch = gc::chunks(rows);
+    const int c0 = static_cast<int>(blockIdx.y * tcs::kCtaCols);          // first value column of the CTA tile
+    const int vw = static_cast<int>(warp * static_cast<int>(tcs::kVCols));  // first value column of this warp inside the tile
+    const std::size_t side = static_cast<std::size_t>(vh) * D * D;
+    const std::uint32_t par = *parity_dev;
+    const float* s_in = base + par * side + static_cast<std::size_t>(h) * D * D;
+    float* s_out = base + (1u - par) * side + static_cast<std::size_t>(h) * D * D;
+
+    // one operand stage: Wt, q, k rows (zero past `rows`), this CTA's U~ columns, Pt, G; one cp.async group
+    auto load = [&](std::uint32_t c, float* st) {
+        const float* blk = ws + gc::block_offset(c, h, vh);
+        for (int n = t; n < D * 4; n += 128) {
+            const int k = n >> 2, f = (n & 3) * 4;
+            cp16z(st + SWT + k * WTS + f, blk + L::wt + k * C + f, true);
+        }
+        for (int n = t; n < C * (D / 4); n += 128) {
+            const int i = n >> 5, f = (n & 31) * 4;
+            const std::uint32_t r = c * C + static_cast<std::uint32_t>(i);
+            const bool in = r < rows;
+            const float* row = qkvc + static_cast<std::size_t>(in ? r : 0u) * ch;
+            cp16z(st + SQ + i * QS + f, row + kh * D + f, in);
+            cp16z(st + SK + i * KS + f, row + d.qk_width() + kh * D + f, in);
+        }
+        for (int n = t; n < C * 16; n += 128) {
+            const int i = n >> 4, f = (n & 15) * 4;
+            cp16z(st + SU + i * US + f, blk + L::u + i * D + c0 + f, true);
+        }
+        if (t < C * 4) cp16z(st + SPT + (t >> 2) * PTS + (t & 3) * 4, blk + L::pt + (t >> 2) * C + (t & 3) * 4, true);
+        if (t < C / 4) cp16z(st + SG + t * 4, blk + L::g + t * 4, true);
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    };
+
+    float acc[D / 8][4];  // block nt, element e = S[key 8 nt + c_col(e)][value c0 + vw + c_row(e)]
+#pragma unroll
+    for (int nt = 0; nt < D / 8; ++nt)
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+            acc[nt][e] = s_in[static_cast<std::size_t>(8 * nt + tcs::c_col(lane, e)) * D + c0 + vw + tcs::c_row(lane, e)];
+    load(0, smem);
+    for (std::uint32_t c = 0; c < nch; ++c) {
+        const float* st = smem + static_cast<int>(c & 1u) * SFL;
+        asm volatile("cp.async.wait_group 0;" ::: "memory");
+        __syncthreads();  // stage c landed for every thread; every read of the other stage (chunk c - 1) is done
+        if (c + 1 < nch) load(c + 1, smem + static_cast<int>((c + 1) & 1u) * SFL);
+
+        // X^T = S^T W^T, Y^T = S^T Q^T: k-slot t <-> key 8 nt + 2t, k-slot t + 4 <-> key 8 nt + 2t + 1 (tc::perm)
+        float x[2][4] = {}, y[2][4] = {};
+#pragma unroll
+        for (int nt = 0; nt < D / 8; ++nt) {
+            std::uint32_t a[4];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) a[e] = to_tf32(acc[nt][tcs::a_from_c(e)]);
+            const int k0 = 8 * nt + 2 * tq;
+#pragma unroll
+            for (int ni = 0; ni < 2; ++ni) {
+                const int i = 8 * ni + g;
+                mma_tf32(x[ni], a, to_tf32(st[SWT + k0 * WTS + i]), to_tf32(st[SWT + (k0 + 1) * WTS + i]));
+                const float2 qq = *reinterpret_cast<const float2*>(st + SQ + i * QS + k0);
+                mma_tf32(y[ni], a, to_tf32(qq.x), to_tf32(qq.y));
+            }
+        }
+        // U^T = U~^T - X^T, O^T = exp(G_i) Y^T at the C fragment (rows = values, columns = chunk rows i)
+        float u[2][4], o[2][4];
+#pragma unroll
+        for (int ni = 0; ni < 2; ++ni)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int i = 8 * ni + tcs::c_col(lane, e);
+                u[ni][e] = st[SU + i * US + vw + tcs::c_row(lane, e)] - x[ni][e];
+                o[ni][e] = cc_expf(st[SG + i]) * y[ni][e];
+            }
+        // O^T += U^T P^T: U's columns are the k index (rows j), so its C fragment is the A operand
+#pragma unroll
+        for (int kj = 0; kj < 2; ++kj) {
+            std::uint32_t a[4];
+#pragma unroll
+            for (int e = 0; e < 4; ++e) a[e] = to_tf32(u[kj][tcs::a_from_c(e)]);
+            const int j0 = 8 * kj + 2 * tq;
+#pragma unroll
+            for (int ni = 0; ni < 2; ++ni) {
+                const int i = 8 * ni + g;
+                mma_tf32(o[ni], a, to_tf32(st[SPT + j0 * PTS + i]), to_tf32(st[SPT + (j0 + 1) * PTS + i]));
+            }
+        }
+#pragma unroll
+        for (int ni = 0; ni < 2; ++ni)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const std::uint32_t r = c * C + static_cast<std::uint32_t>(8 * ni + tcs::c_col(lane, e));
+                if (r < rows) out[static_cast<std::size_t>(r) * d.v_width() + h * D + static_cast<std::uint32_t>(c0 + vw + tcs::c_row(lane, e))] = o[ni][e];
+            }
+        // S^T = exp(G_last) S^T + U'^T K with U'[j] = exp(G_last - G_j) U[j]
+        const float glast = st[SG + C - 1], dlast = cc_expf(glast);
+        std::uint32_t ua[2][4];
+#pragma unroll
+        for (int kj = 0; kj < 2; ++kj) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) u[kj][e] *= cc_expf(glast - st[SG + 8 * kj + tcs::c_col(lane, e)]);
+#pragma unroll
+            for (int e = 0; e < 4; ++e) ua[kj][e] = to_tf32(u[kj][tcs::a_from_c(e)]);
+        }
+#pragma unroll
+        for (int nt = 0; nt < D / 8; ++nt) {
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[nt][e] *= dlast;
+            const int kk = 8 * nt + g;
+#pragma unroll
+            for (int kj = 0; kj < 2; ++kj) {
+                const int j0 = 8 * kj + 2 * tq;
+                mma_tf32(acc[nt], ua[kj], to_tf32(st[SK + j0 * KS + kk]), to_tf32(st[SK + (j0 + 1) * KS + kk]));
+            }
+        }
+    }
+#pragma unroll
+    for (int nt = 0; nt < D / 8; ++nt)
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+            s_out[static_cast<std::size_t>(8 * nt + tcs::c_col(lane, e)) * D + c0 + vw + tcs::c_row(lane, e)] = acc[nt][e];
+}
+
 // ---- K3: gated RMSNorm (swish gate) of one (row, value head); same formula as the serial kernel's epilogue. The arithmetic is
 // gated_norm.cuh, shared with the FAST4 folded quantiser (nvfp4_tile.cuh GatedHeadNorm), which relies on warp q holding positions
 // 32 q .. 32 q + 31 in lane order.
@@ -318,13 +471,22 @@ cudaError_t gdn_chunk_delta(const GdnDims& d, const GdnLayer& layer, const GdnSt
                             float* out, std::uint32_t rows, float eps, const std::uint32_t* parity_dev, const GdnChunkWork& w,
                             cudaStream_t stream) {
     if (d.key_dim != gc::kDim || d.value_dim != gc::kDim || rows == 0 || rows > 65535u || w.ws == nullptr ||
-        w.floats < gc::workspace_floats(d.value_heads, rows))
+        w.floats < gc::workspace_floats(d.value_heads, rows) || w.scan > static_cast<std::uint8_t>(gc::Scan::tf32))
         return cudaErrorInvalidValue;
     chunk_prep_kernel<<<dim3(gc::chunks(rows), d.value_heads), 128, 0, stream>>>(win.qkv_c, win.a_raw, win.b_raw, layer.ssm_a,
                                                                                  layer.dt_bias, w.ws, d, rows);
     if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
-    chunk_scan_kernel<<<dim3(d.value_heads, gc::kDim / gc::kVTile), 128, 0, stream>>>(win.qkv_c, w.ws, state.delta_base, out, d, rows,
-                                                                                     parity_dev);
+    if (w.scan == static_cast<std::uint8_t>(gc::Scan::tf32)) {
+        static_assert(gc::kDim % gc::tc::kCtaCols == 0 && gc::tc::kWarps * 32 == 128, "tf32 scan geometry");
+        static const cudaError_t attr = cudaFuncSetAttribute(chunk_scan_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                             static_cast<int>(gc::tc::kSmemBytes));
+        if (attr != cudaSuccess) return attr;
+        chunk_scan_tc_kernel<<<dim3(d.value_heads, gc::kDim / gc::tc::kCtaCols), 128, gc::tc::kSmemBytes, stream>>>(
+            win.qkv_c, w.ws, state.delta_base, out, d, rows, parity_dev);
+    } else {
+        chunk_scan_kernel<<<dim3(d.value_heads, gc::kDim / gc::kVTile), 128, 0, stream>>>(win.qkv_c, w.ws, state.delta_base, out, d,
+                                                                                         rows, parity_dev);
+    }
     if (auto e = cudaGetLastError(); e != cudaSuccess) return e;
     if (w.defer_norm) return cudaSuccess;
     return gdn_chunk_norm(d, layer.norm_gain, z, out, rows, eps, stream);

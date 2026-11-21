@@ -526,7 +526,13 @@ inline void select_mtp_bundle_golden(Options& options, const ModelContract& mode
     const auto identity=mtp_bundle_golden_identity(options,model);
     const auto shipped=std::filesystem::path(options.mtp_bundle_path).parent_path()/"goldens"/(identity+".golden");
     const auto cached=std::filesystem::is_regular_file(shipped)?shipped:mtp_golden_cache_dir()/(identity+".golden");
-    options.mtp.golden=std::filesystem::is_regular_file(cached)?cached.string():std::string{};
+    // Path and pin travel together (as main pins the ensured golden): the serving pre-load check verifies the digest.
+    if (std::filesystem::is_regular_file(cached)) {
+        options.mtp.golden=cached.string();
+        options.mtp.golden_sha256=model_content_identity_hex(sha256_file_content(cached,FileHashPolicy::cached));
+    } else {
+        options.mtp.golden.clear();options.mtp.golden_sha256.clear();
+    }
 }
 inline EffectiveConfig initialize_prefill_config(const RequestedOptions& request) {
     EffectiveConfig result;
@@ -2180,14 +2186,16 @@ inline std::string effective_config_json(const EffectiveConfig& config) {
     else out << "{\"rotary\":" << o.rotary.json() << ',';
     out << "\"weight_plans\":" << serve::Json(strix::weight::family_plan_notice(config.weight_plans)).dump() << ',';
     out << "\"profile\":" << o.product_profile.json() << ',';
-    if (o.mtp.copy_wide_auto || !o.mtp.copy_wide_rows.empty()) {
+    if (o.mtp.copy_wide_auto || !o.mtp.copy_wide_rows.empty() || !o.mtp.copy_wide_reason.empty()) {
         // The CLI and the server resolve the same sizes; the server uses them only while one request is live
-        // (mtp_wide_copy_rows_effective, STRIX_MTP_SERVE_WIDE=0 turns them off there).
+        // (mtp_wide_copy_rows_effective, STRIX_MTP_SERVE_WIDE=0 turns them off there). "default": the served default
+        // (apply_mtp_copy_wide_default), with its withdrawal reason when the resolved prompt route has no wide tail.
         std::string sizes;
         for (const auto rows : o.mtp.copy_wide_rows) sizes += (sizes.empty() ? "" : ",") + std::to_string(rows);
-        out << "\"mtp_copy_wide\":{\"requested\":\"" << (o.mtp.copy_wide_auto ? "auto" : "explicit") << "\",\"rows\":\"" << sizes
-            << "\",\"serve\":\"lone request\",\"reason\":"
-            << serve::Json(o.mtp.copy_wide_auto ? o.mtp.copy_wide_reason : std::string("explicit sizes")).dump() << "},";
+        const bool by_default = o.mtp.copy_wide_default || (!o.mtp.copy_wide_explicit && o.mtp.copy_wide_rows.empty());
+        out << "\"mtp_copy_wide\":{\"requested\":\"" << (by_default ? "default" : o.mtp.copy_wide_auto ? "auto" : "explicit")
+            << "\",\"rows\":\"" << sizes << "\",\"serve\":\"lone request\",\"reason\":"
+            << serve::Json(o.mtp.copy_wide_reason.empty() ? std::string("explicit sizes") : o.mtp.copy_wide_reason).dump() << "},";
     }
     if (!o.suppressed_yarn_request.empty())
         out << "\"suppressed_yarn_request\":\"" << yarn_json_error(o.suppressed_yarn_request) << "\",";

@@ -11,6 +11,7 @@
 // is split ONCE per layer input into bf16 planes (hi, mid, lo; `terms` 3 = exact, 2/1 = FAST mma2/mma1) or one f16 plane
 // (nvfp4), shared by every GEMM that reads the same x. Weights other than bf16 are expanded per call into a bf16/f16 scratch
 // (q8_0: int8 values exact in bf16 + FP32 scales; nvfp4: e2m1*e4m3 exact in f16), or once into a resident operand cache (below).
+#include "strix/cuda/core/nvfp4_tile.hpp"
 #include "strix/cuda_core/operand_cache_plan.hpp"
 #include "strix/cuda_core/types.hpp"
 
@@ -53,6 +54,9 @@ cudaError_t dense_big_split(const float* x, std::uint32_t rows, std::uint32_t in
                             cudaStream_t stream, BigCtx* ctx = nullptr, bool f8 = false);
 // FAST4 split: x (FP32 [rows][in], 16-byte aligned, in % 128 == 0) -> NVFP4 X tile + per-row scales (dense_big_fast4_supported()).
 cudaError_t dense_big_split4(const float* x, std::uint32_t rows, std::uint32_t in, BigAct* out, cudaStream_t stream, BigCtx* ctx = nullptr);
+// The same from BF16 rows (bit patterns, [rows][in], 16-byte aligned): bit for bit dense_big_split4 of their exact FP32 widening.
+cudaError_t dense_big_split4(const std::uint16_t* x_bf16, std::uint32_t rows, std::uint32_t in, BigAct* out, cudaStream_t stream,
+                             BigCtx* ctx = nullptr);
 // FAST4 split of rmsnorm(x, gain, eps) without the f32 normalised rows: the same BigAct, bit for bit, as rmsnorm(x -> xn) followed by
 // dense_big_split4(xn). cudaErrorInvalidValue when the width does not fit the fused producer (dense_big_norm_split4_fits); the caller
 // then runs rmsnorm + dense_big_split4.
@@ -66,6 +70,9 @@ cudaError_t dense_big_gated_norm_split4(const float* x, const float* z, const fl
 // FAST4 fused gate/up: y[r][c] = silu(gate_r[c]) * up_r[c] in ONE GEMM (gate and up 16-row tiles of the same channels side by side
 // in each warp, SwiGLU in registers; same rounding steps as BigEpi::silu_mul on two GEMMs). a must come from dense_big_split4.
 cudaError_t dense_big_glu4(const DenseWeight& gate, const DenseWeight& up, const BigAct& a, float* y, cudaStream_t stream,
+                           BigCtx* ctx = nullptr);
+// The same with BF16 hidden rows (FAST nvfp4-tile-h16-v1): y_bf16[r][c] = bf16_rn(the FP32 value the overload above stores).
+cudaError_t dense_big_glu4(const DenseWeight& gate, const DenseWeight& up, const BigAct& a, std::uint16_t* y_bf16, cudaStream_t stream,
                            BigCtx* ctx = nullptr);
 // y[r][o] = epilogue(W x_r), r < a.rows. The planes must come from dense_big_split with the same format class as w.
 cudaError_t dense_big_gemm(const DenseWeight& w, const BigAct& a, float* y, const float* aux, BigEpi epi, cudaStream_t stream,
@@ -102,5 +109,8 @@ cudaError_t dense_big_cache_reserve(BigOperandCache* cache, const DenseWeight* w
                                     operand_cache::Mode mode, std::uint64_t cap_bytes, BigCacheReport* report);
 // Every dense_big_gemm on ctx consults `cache` (nullptr detaches). Several contexts (streams) may share one cache.
 void dense_big_ctx_attach_cache(BigCtx* ctx, BigOperandCache* cache);
+// Stage feed of the FAST4 tile GEMMs (dense_big_gemm with a.f4, dense_big_glu4) on ctx. Scheduling only: both feeds produce the
+// same bits. A new context (and the module default context) uses nvfp4::tile::kDefaultFeed (lsu); Feed::bulk is opt-in.
+void dense_big_ctx_set_tile_feed(BigCtx* ctx, ::strix::cuda::core::nvfp4::tile::Feed feed);
 
 }  // namespace strix::cuda_core

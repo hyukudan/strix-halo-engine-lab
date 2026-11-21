@@ -18,6 +18,7 @@
 #include "strix/serve/engine.hpp"
 #include "strix/serve/serial_session_owner.hpp"
 #include "strix/serve/http_server.hpp"
+#include "strix/serve/startup_warmup.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -72,13 +73,7 @@ public:
         ranked_=policy.ranked;
         std::fprintf(stderr,"constraint mask ahead: %s, ranked membership: %u\n",ahead_?"on":"off",argmax_first_?ranked_:0U);
     }
-    bool available(std::span<const std::uint32_t> stops) const {
-        const auto id=tokenizer_->find("</think>");
-        return id!=UINT32_MAX && tokenizer_->token_bytes(id)=="</think>" &&
-            (tokenizer_->type(id)==serve::BpeTokenizer::TokenType::control ||
-             tokenizer_->type(id)==serve::BpeTokenizer::TokenType::user_defined) &&
-            std::find(stops.begin(),stops.end(),id)==stops.end();
-    }
+    bool available(std::span<const std::uint32_t> stops) const {return serve::thinking_closure_usable(*tokenizer_,stops);}
     std::shared_ptr<MtpConstraintRow> make(const std::shared_ptr<const serve::ConstraintSpec>& spec) {
         if(!spec) return {};
         if(!trie_) trie_=std::make_shared<serve::TokenByteTrie>(*tokenizer_,spec->eos_ids);
@@ -361,6 +356,33 @@ inline MtpDecodeServe make_http_serve(const Options& options, std::string engine
 // and decodes every active request together; a request leaves when it ends, without stopping the others.
 // With --http-sampling sample, a request with temperature > 0 samples (sampling-v1) with its own policy
 // and seed.
+// Shared serve warm-up (strix/serve/startup_warmup.hpp) on the batched runner: one prompt of the slots' tile T and one
+// token through admit/step before the owner and the listener exist, so the first-use prefill scratch of the T row class
+// grows here and not on the first request. Nothing is kept: no prefix store, no drafting, no peers.
+inline void warm_up_batch_runner(MtpBatchRunner& runner, const Options& options) {
+    const auto plan = serve::plan_startup_warmup(serve::startup_warmup_enabled(), runner.tile_rows(), options.context_tokens);
+    // A warm-up request the runner finishes with an error (or never finishes: not admitted) is reported and the server
+    // starts lazily (StartupWarmupFailed, bounded fail-open); an exception out of admit/step still fails the start.
+    const auto warm = serve::run_startup_warmup(plan, runner.vocabulary(), [&](std::vector<std::uint32_t> prompt) {
+        MtpBatchRequest request;
+        request.cache_retention = serve::CacheRetention::no_store;
+        request.prompt = std::move(prompt);
+        request.max_tokens = plan.outputs;
+        request.ngram_draft = false;
+        request.tool_draft = false;
+        request.ngram_peers = false;
+        request.on_tokens = [](std::span<const std::uint32_t>) { return true; };
+        bool finished = false;
+        std::string error;
+        request.on_finish = [&](const MtpServeResult& result) { finished = true; error = result.error; };
+        (void)runner.admit(std::move(request));
+        while (runner.active()) runner.step();
+        if (!finished || !error.empty())
+            throw serve::StartupWarmupFailed(error.empty() ? std::string("no completion") : error);
+    });
+    std::cerr << serve::startup_warmup_line("strix serve", plan, warm) << std::endl;
+}
+
 inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::string engine_description,
     std::optional<StartupPreflight> startup = {}, serve::Json assets = {},
     std::shared_ptr<const serve::BpeTokenizer> supplied_tokenizer = {}, std::function<void()> before_listen = {},
@@ -369,6 +391,7 @@ inline MtpDecodeBatchServe make_http_batch_serve(const Options& options, std::st
         supplied_tokenizer = std::move(supplied_tokenizer), before_listen, deployment = std::move(deployment)](MtpBatchRunner& runner) {
         if(options.cache_readiness_recheck) options.cache_readiness_recheck();
         const auto tokenizer = supplied_tokenizer ? supplied_tokenizer : serve::BpeTokenizer::load_gguf(options.model_path);
+        warm_up_batch_runner(runner, options);
         serve::ApiConfig config;
         config.model_id = options.http_model_id;
         config.http_slots = options.http_batch ? options.http_batch : 1U;

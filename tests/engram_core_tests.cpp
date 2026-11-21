@@ -162,6 +162,30 @@ void test_ds41_rebind() {
     strix::ds41::EngramHasher h(c);
     std::vector<std::uint64_t> rows(16);
     expect(throws([&] { h.push(500, rows); }), "DS41 rejects an unmapped token");
+    expect(throws([&] { h.rows_at(std::vector<std::uint32_t>{500}, 0, 0, std::span<std::uint64_t>(rows.data(), h.columns())); }),
+           "DS41 rows_at rejects an unmapped token");
+    {
+        // Stateless rows_at equals the stateful push at every position and layer (dead positions included) and
+        // leaves the Hasher's history untouched.
+        strix::ds41::EngramHasher sh(ds41_contract());
+        Lcg r{777};
+        std::vector<std::uint32_t> tokens(300);
+        for (auto& t : tokens) {
+            t = static_cast<std::uint32_t>(r.next() % 1000U);
+            if (r.next() % 11U == 0U) t = strix::ds41::engram_dead_token(t);
+        }
+        const auto all = sh.hash_sequence(tokens);
+        const std::size_t per = static_cast<std::size_t>(sh.layers()) * sh.columns();
+        std::vector<std::uint64_t> one(sh.columns());
+        bool equal_rows = true;
+        for (std::size_t t = 0; t < tokens.size(); ++t)
+            for (std::uint32_t e = 0; e < sh.layers(); ++e) {
+                sh.rows_at(tokens, t, e, one);
+                equal_rows = equal_rows && std::equal(one.begin(), one.end(), all.begin() + static_cast<std::ptrdiff_t>(t * per + e * sh.columns()));
+            }
+        expect(equal_rows, "DS41 rows_at equals push (every position, every layer, dead positions)");
+        expect(sh.positions() == tokens.size(), "rows_at does not touch the history");
+    }
     c.rows[1] += 1U;
     expect(throws([&] { strix::ds41::EngramHasher bad(c); }), "DS41 primes must sum to the table rows");
 }
@@ -300,6 +324,28 @@ void test_hy4() {
     h.truncate(2);
     h.push(77, one);
     expect(std::equal(one.begin(), one.end(), rows.begin() + 128), "HY4 truncate rewinds the history");
+    // Stateless rows_at (the Hy4 forwards' entry): equal to push per layer; the 14 ids 120,818..120,831 read the
+    // pad's compressed id at every n-gram slot.
+    std::vector<std::uint64_t> col(16), pad_col(16);
+    bool same = true;
+    for (std::size_t t = 0; t < tokens.size(); ++t)
+        for (std::uint32_t e = 0; e < 4U; ++e) {
+            h.rows_at(tokens, t, e, col);
+            same = same && std::equal(col.begin(), col.end(), rows.begin() + static_cast<std::ptrdiff_t>(t * 64U + e * 16U));
+        }
+    expect(same, "HY4 rows_at equals hash_sequence");
+    bool unmapped_pad = true;
+    for (std::uint32_t id = kTable; id < kVocab; ++id)
+        for (std::size_t slot = 0; slot < 3U; ++slot)
+            for (std::uint32_t e = 0; e < 4U; ++e) {
+                std::vector<std::uint32_t> w{77, 5, 120000}, wp = w;
+                w[2U - slot] = id;
+                wp[2U - slot] = kPad;
+                h.rows_at(w, 2, e, col);
+                h.rows_at(wp, 2, e, pad_col);
+                unmapped_pad = unmapped_pad && col == pad_col;
+            }
+    expect(unmapped_pad, "HY4 ids 120,818..120,831 read the pad at every n-gram slot");
     // Bad packs.
     auto bad = meta;
     bad.layer_multipliers[3] += 1;

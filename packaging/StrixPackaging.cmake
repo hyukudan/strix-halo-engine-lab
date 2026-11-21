@@ -354,7 +354,13 @@ else()
     set(CPACK_DEBIAN_TOOLS_PACKAGE_DEPENDS "${_strix_deb_cxx}python3, python3-numpy")
     if(STRIX_PACKAGE_BACKEND STREQUAL "hip" AND STRIX_DPKG_DEB AND
        (NOT STRIX_DPKG_SHLIBDEPS OR NOT EXISTS "/etc/debian_version"))
-        message(FATAL_ERROR "HIP DEBs require dpkg-shlibdeps and a Debian shlibs database")
+        if(STRIX_PACKAGING)
+            message(FATAL_ERROR "HIP DEBs require dpkg-shlibdeps and a Debian shlibs database")
+        endif()
+        # Development configure (no release packaging asked): a HIP DEB cannot carry its ABI scan here, so the
+        # DEB generator is left out instead of failing the configure; TGZ / RPM stay available.
+        list(REMOVE_ITEM _strix_pkg_generators DEB)
+        message(STATUS "HIP DEB generator disabled: dpkg-shlibdeps or the Debian shlibs database is missing")
     endif()
     set(CPACK_DEBIAN_HIP_PACKAGE_SHLIBDEPS ON)
     set(CPACK_DEBIAN_HIP_PACKAGE_DEPENDS "${STRIX_PACKAGE_DEB_HIP_DEPENDS}")

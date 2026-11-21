@@ -25,8 +25,10 @@
 #include <algorithm>
 #include <chrono>
 #include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 #include "strix/spec/block_drafter.hpp"
@@ -46,6 +48,23 @@ template <class E>
 concept MtpPrelaunchEngine = MtpFeedEngine<E> && requires(E& e, std::uint32_t* h, std::uint32_t u) {
     e.mtp_feed_read_async(u);
     e.mtp_feed_wait(u, h);
+};
+
+// Optional runner-up hook (token-tree siblings): the feed slots' second ids, read with the ids in one synchronization.
+template <class E>
+concept MtpRunnerUpEngine = MtpFeedEngine<E> && requires(E& e, std::uint32_t* h, std::uint32_t u) { e.mtp_feed_read2(u, h, h); };
+// ... and the runner-ups' drafter logit gaps (top-1 minus runner-up; the sibling selector), in the same synchronization.
+template <class E>
+concept MtpGapEngine = MtpRunnerUpEngine<E> && requires(E& e, std::uint32_t* h, float* g, std::uint32_t u) { e.mtp_feed_read2(u, h, h, g); };
+
+// KV-ONLY ROWS (optional backend hook, detected by MtpKvRowsEngine): Engine::mtp_forward(next_tokens, hidden_dev, rows, pos0,
+// want_top, outputs) where only the trailing `outputs` rows' top / hidden are read. A catch-up flush reads nothing but the
+// last row of its final chunk (d1 + carry), so every other row only has to write the MTP layer's KV: a one-layer block's
+// cache row depends on the row's input alone, so a backend can skip the query side and the FFN of those rows and keep
+// its caches bitwise the full form's (the drafts and every proposal unchanged). Engines without the hook run every row.
+template <class E>
+concept MtpKvRowsEngine = requires(E& e, const std::uint32_t* t, const float* x, std::uint32_t u) {
+    e.mtp_forward(t, x, u, u, true, u);
 };
 
 // K/V-ONLY CATCH-UP (optional backend hook, detected by MtpKvEngine): Engine::mtp_kv(next_tokens, hidden_dev, rows, pos0)
@@ -80,6 +99,10 @@ public:
         next_.clear();
         mtp_pos_ = 0;
         d1_ = 0;
+        d1_ru_ = kNoToken;
+        d1_gap_ = -1.0f;
+        ru_.clear();
+        gap_.clear();
         last_rows_ = 0;
     }
     // The last verify pass (rows of [anchor, drafts...]); accept() needs its hidden rows.
@@ -98,6 +121,8 @@ public:
     void draft(std::span<const std::uint32_t> prefix, std::uint32_t k, std::vector<std::uint32_t>& out) override {
         const auto t0 = std::chrono::steady_clock::now();
         out.clear();
+        ru_.clear();  // runner-ups: device-fed drafts on an engine with the hook only
+        gap_.clear();  // their gaps: an engine with the gap hook only
         if constexpr (MtpFeedEngine<Engine>) {
             if (feed_ && std::size_t(k) + 1 <= Engine::kMtpFeedSlots) {
                 draft_fed(prefix, k, out);
@@ -123,6 +148,19 @@ public:
         if (last_rows_ == 0) return;
         // rows 0..emitted-1 of the last verify are committed; emitted[i] follows row i
         push_hidden(last_, static_cast<std::uint32_t>(emitted.size()), emitted.data());
+    }
+    // Tree verify: the committed rows are the path's rows (emitted[i] follows verify row rows[i]); each run of consecutive
+    // rows is one copy, so a linear path (0, 1, ..) is the same single copy as accept().
+    void accept_path(std::span<const std::uint32_t> emitted, std::span<const std::uint32_t> rows) override {
+        if (last_rows_ == 0) return;
+        if (rows.size() != emitted.size()) throw std::invalid_argument("MtpChain: path rows != emitted tokens");
+        for (std::size_t i = 0; i < rows.size();) {
+            std::size_t j = i + 1;
+            while (j < rows.size() && rows[j] == rows[j - 1] + 1) ++j;
+            if (rows[j - 1] >= last_rows_) throw std::invalid_argument("MtpChain: path row outside the last verify");
+            push_hidden(last_, static_cast<std::uint32_t>(j - i), emitted.data() + i, rows[i]);
+            i = j;
+        }
     }
 
     [[nodiscard]] std::uint64_t calls() const { return calls_; }    // mtp_forward calls (flush chunks + chain steps)
@@ -184,7 +222,10 @@ private:
         }
         for (std::uint32_t j = 1; j < k; ++j)
             fed_step(j == 1 && !first_dev ? &d1_ : nullptr, j == 1 ? first_slot : j, 1 + j, pos++, true);
-        std::uint32_t ids[Engine::kMtpFeedSlots]{};
+        std::uint32_t ids[Engine::kMtpFeedSlots]{}, ru[Engine::kMtpFeedSlots];
+        float gp[Engine::kMtpFeedSlots];
+        for (auto& u : ru) u = kNoToken;  // runner-ups / gaps come only from mtp_feed_read2 (the pre-launch read carries none)
+        for (auto& g : gp) g = -1.0f;
         const bool read = first_dev || k > 1;
         if constexpr (MtpPrelaunchEngine<Engine>) {
             if (launch) {
@@ -203,13 +244,33 @@ private:
             }
         }
         if (read && launch == nullptr) {
-            e_.mtp_feed_read(k + 1, ids);
+            if constexpr (MtpGapEngine<Engine>) e_.mtp_feed_read2(k + 1, ids, ru, gp);
+            else if constexpr (MtpRunnerUpEngine<Engine>) e_.mtp_feed_read2(k + 1, ids, ru);
+            else e_.mtp_feed_read(k + 1, ids);
             ++reads_;
         }
-        if (flushed) d1_ = ids[0];
+        if (flushed) {
+            d1_ = ids[0];
+            d1_ru_ = MtpRunnerUpEngine<Engine> ? ru[0] : kNoToken;
+            d1_gap_ = MtpGapEngine<Engine> ? gp[0] : -1.0f;
+        }
         out.push_back(first_dev ? ids[first_slot] : d1_);
         for (std::uint32_t j = 1; j < k; ++j) out.push_back(ids[1 + j]);
+        if constexpr (MtpRunnerUpEngine<Engine>) {
+            ru_.push_back(first_dev ? ru[first_slot] : d1_ru_);
+            for (std::uint32_t j = 1; j < k; ++j) ru_.push_back(ru[1 + j]);
+        }
+        if constexpr (MtpGapEngine<Engine>) {
+            gap_.push_back(first_dev ? gp[first_slot] : d1_gap_);
+            for (std::uint32_t j = 1; j < k; ++j) gap_.push_back(gp[1 + j]);
+        }
     }
+
+public:
+    [[nodiscard]] std::span<const std::uint32_t> runner_ups() const override { return ru_; }
+    [[nodiscard]] std::span<const float> runner_up_gaps() const override { return gap_; }
+
+private:
     void fed_step(const std::uint32_t* in_host, std::uint32_t in_slot, std::uint32_t out_slot, std::uint32_t pos, bool want_top) {
         if constexpr (MtpFeedEngine<Engine>) {
             const auto m = e_.mtp_step_fed(in_host, in_slot, out_slot, carry_, pos, want_top);
@@ -218,8 +279,8 @@ private:
             Dev::copy(e_, carry_, pre_ ? m.hidden_pre : m.hidden_post, hid_);
         }
     }
-    void push_hidden(const Rows& o, std::uint32_t rows, const std::uint32_t* next_tokens) {
-        const float* src = pre_ ? o.hidden_pre : o.hidden_post;
+    void push_hidden(const Rows& o, std::uint32_t rows, const std::uint32_t* next_tokens, std::uint32_t first = 0) {
+        const float* src = (pre_ ? o.hidden_pre : o.hidden_post) + std::size_t(first) * hid_;
         std::uint32_t done = 0;
         while (done < rows) {
             if (next_.size() == ring_n_) flush(false, false);  // forced: its last-row outputs are overwritten by a later flush
@@ -249,7 +310,7 @@ private:
                 off += n;
                 continue;
             }
-            const auto m = e_.mtp_forward(next_.data() + off, ring_ + std::size_t(off) * hid_, n, mtp_pos_, final_chunk);
+            const auto m = forward_rows(next_.data() + off, ring_ + std::size_t(off) * hid_, n, mtp_pos_, final_chunk);
             ++calls_;
             rows_ += n;
             mtp_pos_ += n;
@@ -264,11 +325,18 @@ private:
                     e_.read_top(ro, n, top_tmp_);
                     ++reads_;
                     d1_ = top_tmp_[n - 1];
+                    d1_ru_ = kNoToken;  // host-read flush: no runner-up
+                    d1_gap_ = -1.0f;
                 }
                 Dev::copy(e_, carry_, (pre_ ? m.hidden_pre : m.hidden_post) + std::size_t(n - 1) * hid_, hid_);
             }
         }
         next_.clear();
+    }
+    // A flush chunk: the final chunk's last row is the only output read (outputs 1), earlier chunks read none (outputs 0).
+    MtpOut forward_rows(const std::uint32_t* next, const float* hidden, std::uint32_t n, std::uint32_t pos0, bool final_chunk) {
+        if constexpr (MtpKvRowsEngine<Engine>) return e_.mtp_forward(next, hidden, n, pos0, final_chunk, final_chunk ? 1U : 0U);
+        else return e_.mtp_forward(next, hidden, n, pos0, final_chunk);
     }
     std::uint32_t step(std::uint32_t input_token, std::uint32_t pos, bool want_top) {
         const auto m = e_.mtp_forward(&input_token, carry_, 1, pos, want_top);
@@ -293,12 +361,24 @@ private:
     float* ring_ = nullptr;
     float* carry_ = nullptr;
     std::vector<std::uint32_t> next_, succ_;
-    std::uint32_t mtp_pos_ = 0, d1_ = 0;
+    std::uint32_t mtp_pos_ = 0, d1_ = 0, d1_ru_ = kNoToken;  // d1_ru_: runner-up of d1_ (device-fed flush only)
+    std::vector<std::uint32_t> ru_;                           // runner-ups of the last draft (empty: none)
+    float d1_gap_ = -1.0f;                                    // gap of d1_ru_ (device-fed flush on a gap engine only)
+    std::vector<float> gap_;                                  // gaps of ru_ (empty: the engine has no gap hook)
     std::uint32_t top_tmp_[32]{};
     std::uint64_t calls_ = 0, rows_ = 0, drafts_ = 0, reads_ = 0, kv_calls_ = 0, prelaunched_ = 0;
     bool feed_ = true;
     bool kv_catchup_ = true;
     double draft_wall_ms_ = 0.0;
+};
+
+// Dev glue for an engine that owns its device memory and stream through three members:
+//   float* alloc_f32(std::size_t floats), void free_f32(float*), void copy_f32_async(float* dst, const float* src, std::size_t floats)
+// (async device -> device on the engine's stream). Any backend whose engine has them binds MtpChain<Engine, EngineChainDev>.
+struct EngineChainDev {
+    template <class E> static float* alloc(E& e, std::size_t n) { return e.alloc_f32(n); }
+    template <class E> static void release(E& e, float* p) { e.free_f32(p); }
+    template <class E> static void copy(E& e, float* d, const float* s, std::size_t n) { e.copy_f32_async(d, s, n); }
 };
 
 }  // namespace strix::spec

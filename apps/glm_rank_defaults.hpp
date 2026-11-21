@@ -118,6 +118,8 @@ inline const std::vector<EnvItem>& env_items() {
          "Measurement: prefill dense rows v4 runs the exact projections on the shared FMA-rows core, same ascending fmaf chain, bitwise == v3; exact two-node prefill 12.68 / 12.69 s vs 12.81 s at 8,192 tokens, logits / state / token hashes equal (=3 restores v3). Dense rows v3 groups the projections of one input (KDA f_a / g_a / b, DSA wk / gate / weights_proj) in one 128 x 64 launch, same ascending fmaf chain, bitwise == v2; grouped calls 6.77 vs 9.33 ms (KDA) and 6.62 vs 8.98 ms (DSA) at 8192 rows; TTFT 14.34 -> 14.29 s at 8,192 tokens (=2 restores v2, =1 v1)", false, true},
         {"pf-dense-form-auto", "STRIX_GLM_PF_DENSE_FORM", "0", "0",
          "Guard: physical form of dense rows v4 (shared FMA-rows core), read only with STRIX_GLM_PF_DENSE_ROWS=4: 0 selects the form per shape, 1..7 force one form where the shape admits it (diagnostic; every form gives the same bytes)", false, true},
+        {"spec-arbiter", "STRIX_SPEC_ARBITER", "1", "0",
+         "Measurement: each MTP cycle chooses plain / MTP chain / prompt lookup (<= 7 drafts) with the shared strix::spec Arbiter, priced from the replicated cost table (both ranks decide the same); tokens stay the greedy tokens (verify, fnv equal), pair ABBA 256 tokens 20.4 -> 15.1 ms/token at 1K, 21.1 -> 15.0 at 6K, 19.7 -> 13.7 on a copy prompt (=0 restores the MTP chain alone)", false, true},
         {"max-rows-auto", "STRIX_GLM_MAX_ROWS_AUTO", "1", "0",
          "Measurement: exact 8192 vs 4096 rows, 8K TTFT -4 %, 32K 116.3 -> 109.9 s (-5.5 %); +7.3 GiB per rank", false, true},
         {"pf-staged", "STRIX_GLM_PF_STAGED", "1", "0",
@@ -130,8 +132,8 @@ inline const std::vector<EnvItem>& env_items() {
          "Measurement: TP2 partial sum formed on load by the fused mHC expand (rank order, the sum2 expression; summed rows not stored), logits bitwise on the pair; seam sum + fused expand 4.26 -> 3.91 ms per call, 8,192-token TTFT 14.55 -> 14.17 s with dense rows v3 and the output-bar v10 (=0 restores sum2 + expand)", false, true},
         {"pf-hc-hoist", "STRIX_GLM_PF_HC_HOIST", "1", "0",
          "Measurement: the fused mHC expand issues its loads (y, or y0 + y1 with the partial sum on load) ahead of its 16 dependent steps, bitwise on the device stress set (47 checks, 0 failures) (=0 keeps the loads inside each step)", false, true},
-        {"pf-hc-expand-rows", "STRIX_GLM_PF_HC_EXPAND_ROWS", "2", "1",
-         "Measurement: fused mHC expand + norm runs two rows per block (also on the TP2 pair-sum path), same per-row operation order, logits bitwise on the pair; 8K TTFT 13.671 -> 13.611 s (-0.44 %) (=1 restores one row per block)", true, true},
+        {"pf-hc-expand-bw", "STRIX_GLM_PF_HC_EXPAND_BW", "1", "0",
+         "Measurement: fused mHC expand + norm on the shared row expansion (src/core/hc_expand_rows.hpp; mix in registers, X / y loaded once, streaming stores), same bits (device fixture vs the original one-row kernel; pair logits / state / tokens fnv equal); replaces the two-row kernel (removed). Pair 8K exact, ABAB, two runs per arm: prefill cold / warm 13.84 / 14.56 s (two-row) vs 13.81 / 14.50 s, no change beyond the spread; the traced 10.8 -> 2.2 ms per call was the GPU share each kernel got beside the other prefill stream, isolated the shared kernel costs the same as the one-row kernel (=0 restores the one-row kernel)", false, true},
     };
     return items;
 }
@@ -250,6 +252,7 @@ struct Effective {
     bool mtp_spec_candidate = false;
     unsigned kmax = 3;
     bool adaptive = true;
+    bool spec_arbiter = false;  // STRIX_SPEC_ARBITER (env_items row; MTP decode only)
     std::string prefill;  // resolved: gemv | ref | wmma
     std::string xch;
     std::map<std::string, Value> env;  // env name -> effective value
@@ -373,6 +376,9 @@ inline Effective resolve(const Request& r, const EnvGet& env, const ModelFacts& 
         throw std::invalid_argument("STRIX_GLM_PF_SEQPAR must be 0, 1 or auto");
     (void)strix::glm::pf::parse_scratch_policy(e.env.at("STRIX_GLM_PF_SCRATCH").value.c_str());
     (void)strix::glm::pf::parse_query_window_policy(e.env.at("STRIX_GLM_PF_ATTN_QWIN").value.c_str());
+    const auto& arbiter = e.env.at("STRIX_SPEC_ARBITER").value;
+    if (arbiter != "0" && arbiter != "1") throw std::invalid_argument("STRIX_SPEC_ARBITER must be 0 or 1");
+    e.spec_arbiter = arbiter == "1";
     e.world = r.world;
     return e;
 }

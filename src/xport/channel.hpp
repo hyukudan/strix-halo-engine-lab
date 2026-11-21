@@ -44,9 +44,24 @@ struct RxView {
     // exchange 2.4x): block 0 polls the host flag and opens the gate, the other blocks poll the gate in L2. nullptr:
     // every block polls the host flag.
     std::uint64_t* gate = nullptr;
+    // Bounded wait (backstop for a host side that never releases the flag: dead or stuck progress thread): after
+    // `budget` ticks of the device's constant-rate wall clock (wall_clock64) the poller records `sequence` once in
+    // `abort` (host-mapped, sticky: the first expiry stays), opens the gate and falls through; the owner's check()
+    // throws with that sequence, so the window that read the payload fails instead of the kernel hanging.
+    // budget 0 (or abort nullptr) = unbounded: the form of every view built without them.
+    std::uint64_t* abort = nullptr;
+    std::uint64_t budget = 0;
 };
 
 // What a producer kernel needs to publish its own message (Publish::producer): see glm_xfer_device.hpp.
+// Device wait budget of a channel whose host timeout is `timeout`: twice it, in ticks of a wall clock of `khz` kHz
+// (hipDeviceAttributeWallClockRate); saturates instead of wrapping; 0 (unbounded) for a zero timeout or rate.
+constexpr std::uint64_t wait_budget_ticks(std::chrono::milliseconds timeout, std::uint64_t khz) {
+    if (timeout.count() <= 0 || khz == 0) return 0;
+    const auto ms = static_cast<std::uint64_t>(timeout.count());
+    return ms > ~std::uint64_t{0} / 2U / khz ? ~std::uint64_t{0} : 2U * ms * khz;
+}
+
 struct ProducerTarget {
     std::uint64_t* flag = nullptr;    // device pointer of the TX flag
     unsigned* counter = nullptr;      // device scratch, reset by the last block
@@ -215,7 +230,8 @@ private:
     std::byte* rx_dev_ = nullptr;
     void* tx_alloc_ = nullptr;
     void* rx_alloc_ = nullptr;
-    std::uint64_t* flags_host_ = nullptr;  // [0] TX flag (GPU writes), [8] RX flag (CPU writes)
+    std::uint64_t* flags_host_ = nullptr;  // [0] TX flag (GPU writes), [8] RX flag (CPU writes), [24] device wait abort
+    std::uint64_t wait_budget_ = 0;        // RxView::budget of recv_view() (device wall-clock ticks, 0 = unbounded)
     std::uint64_t* flags_dev_ = nullptr;
     unsigned* counter_dev_ = nullptr;
     std::uint64_t* gate_dev_ = nullptr;

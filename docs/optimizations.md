@@ -317,6 +317,30 @@ Before the registered ranges of a mapped model are pinned, the same ranges are r
 - **Measured gain:** One Strix Halo node, Qwen MoE UD-Q4_K_XL GGUF (82.5 GB registered), same binary ON vs OFF: cold page cache, load-only 21.9 vs 36.6 s; engine registration done at 21.4 vs 35.9 s, first token 84.9 vs 98.5 s; warm page cache 1.37 / 1.38 vs 1.99 / 2.00 s (ABAB). Peak RSS and bytes read unchanged.
 - **Implementation / evidence:** `src/hip_model_residency.cpp` (`create_impl`), `MappedModelFile::prefault_parallel`
 
+### Resident copy registered source
+
+**Engine:** every HIP engine that copies a mapped model into device memory (`--residency copy`, `--mtp-sidecar-residency copy`). **Control:** `STRIX_MODEL_COPY_REGISTERED`. **Default:** automatic (ON on HIP runtimes from 7.17 on integrated GPUs, OFF elsewhere).
+
+HIP 7.17 copies pageable host memory to an integrated GPU through a CPU staging buffer, so a resident copy straight from the read-only model mapping fell to 24-27 GB/s (74-79 GB/s on HIP 7.16). On those runtimes the copy now registers each 256 MiB piece of its range (the piece rule of the registered path, `STRIX_MODEL_REGISTER_CHUNK_BYTES`), copies it and releases the registration at once; nothing of the model stays registered after setup. On HIP 7.16 and on discrete GPUs the direct copy stays (on 7.16 it is the faster form).
+
+- **Preconditions:** `--residency copy` or a copied MTP sidecar; the rule reads the HIP runtime version and the device's integrated attribute.
+- **Exactness evidence:** Same bytes at the same device addresses (byte comparison of every arm in the transfer bench; same `copied_bytes`). A piece the runtime refuses to register is copied directly.
+- **Off switch:** STRIX_MODEL_COPY_REGISTERED=0 (1 forces it everywhere)
+- **Measured gain:** One Strix Halo node (gfx1151), page-cache-warm GGUF, 3 GiB regions read for the first time: direct 24-27 GB/s on HIP 7.17 vs registered 50-57 GB/s (both runtimes); HIP 7.16 direct 74-79 GB/s. Whole resident copy of Qwen3-0.6B Q8_0 (0.80 GB): HIP 7.17 46 / 46 ms registered vs 57 / 57 ms direct; HIP 7.16 the rule keeps direct, 36 / 36 ms vs 47-48 ms forced registered (ABAB, same binary per runtime).
+- **Implementation / evidence:** `src/hip_model_residency.cpp` (`copy_through_registered_source`), rule and piece plan `include/strix/residency/copy_source.hpp`, test `tests/model_copy_source_tests.cpp`
+
+### Qwen dense HIP shared weight load
+
+**Engine:** `qwen` (dense 27B HIP engine: `strix-hip-qwen35-decode`, `-spec`, `-pair`). **Control:** `STRIX_LOAD_WORKERS`, `STRIX_LOAD_STAGING_MIB` (the shared loader's knobs). **Default:** ON.
+
+The dense engine's own loader read each tensor with one buffered stream into a 64 MiB pageable buffer and copied it with a synchronous `hipMemcpy`, so reading and copying alternated on one thread and the whole file stayed in the page cache. Its tensors now queue on the shared range loader (`core::HipRangeWeightLoader`, the one DeepSeek, MiniMax and Hy4 use): parallel unbuffered reads into pinned staging, uploads overlapped with the reads, one wait before the first use (trunk and MTP layer).
+
+- **Preconditions:** a file system that accepts O_DIRECT (else buffered reads through the same queue).
+- **Exactness evidence:** Same tensor bytes at the same device buffers; 8 greedy ids identical over 6 runs (old and new loader, cold and warm).
+- **Off switch:** none (the private loader is removed); `STRIX_LOAD_WORKERS=1` serialises the reads.
+- **Measured gain:** One Strix Halo node, Qwen3.8-27B IU4 GGUF (13.96 GiB of weights), page cache dropped: load 9.4 / 9.3 s -> 2.6 / 2.5 s (5.8 GiB/s); page cache warm: 3.3 -> 2.5 s. The file no longer stays in the page cache after the load (+14.4 GB of cache before).
+- **Implementation / evidence:** `src/qwen35/hip/engine.hip` (`Loader`), shared `src/core/hip_range_weight_loader.hpp`
+
 ### Serving PLE table re-warm
 
 **Engine:** `qwen`. **Control:** `STRIX_PLE_REWARM`. **Default:** ON (bounded).
@@ -1128,6 +1152,8 @@ the decode app keeps 16-row windows unless `--wide-exact N`, the pair app keeps 
 - `STRIX_DECODE_FUSE`: each residual add folds into the next RMS norm, and for windows of <= 16 rows the norms and the
   SiLU pass store the prepared FP16 rows of the next IU4 projections (one prepare per input instead of one per
   projection); projections of the same prepared rows run as one launch (`include/strix/decode_projection_group.hpp`).
+  The two-device tensor-parallel pass uses the same switch: the residual adds fold into the norms and the norms store
+  the prepared rows its IU4 column shares read.
 - `STRIX_IU4_ONE_SWEEP`: scalar-activation windows of 9..16 rows read the IU4 weights once (one 16-row sweep,
   `include/strix/decode_weight_sweep.hpp`) instead of two 8-row sweeps; rows <= 8 are unaffected.
 - EXACT wide prefill windows: the 16-row arithmetic over 64-row windows; the IU4 dense projections take one row-block
@@ -4412,6 +4438,21 @@ cache in chunks during prefill. Committed tokens are the target's greedy tokens.
 `STRIX_GLM_MOE_PIPE=1` is included as an opt-in experiment (default off, not yet gated); the fused decode HC norm
 (`STRIX_GLM_HC_NORM`) is now a default, see [below](#glm-hc-norm-fused).
 
+<a id="glm-mtp-arbiter"></a>
+
+### MTP drafting arbiter (prompt lookup)
+
+**Engine:** `glm`. **Control:** `STRIX_SPEC_ARBITER`. **Default:** on.
+
+Each MTP cycle asks the shared `strix::spec` ContextProposer + Arbiter for plain / the MTP chain / a prompt-lookup
+window (up to 7 drafts). Costs are seeded every cycle from the replicated merged cost table with learning off, so both
+TP2 ranks take the same decision without an extra exchange. The serve keeps the lookup context per request.
+
+- **Exactness evidence:** committed tokens are the greedy verify tokens in every arm; token fnv equal ON vs OFF on 3 prompts.
+- **Off switch:** STRIX_SPEC_ARBITER=0 (or --baseline) keeps the MTP chain alone.
+- **Measured gain:** pair ABBA, 256 tokens: 20.4 -> 15.1 ms/token (1K), 21.1 -> 15.0 (6K), 19.7 -> 13.7 (copy prompt).
+- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [spec runtime](../src/glm/spec/glm_spec_run.cpp)
+
 <a id="glm-pf-indexer-v2"></a>
 
 ### Prefill indexer scores v3 and select v2
@@ -4490,24 +4531,26 @@ read back. Covers the plain sites and the sites already fed by the fused expand 
 - **Measured gain:** Two-node pair TTFT, alternating arms: 8,192 tokens 15.07 -> 14.95 s (544 -> 548 tok/s, -0.8 %), 32,768 tokens 63.23 -> 62.23 s (518 -> 527 tok/s, -1.6 %)
 - **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip)
 
-<a id="glm-pf-hc-expand-rows"></a>
+<a id="glm-pf-hc-expand-bw"></a>
 
-### Prefill mHC expand + norm, two rows per block
+### Prefill mHC expand + norm on the shared row expansion
 
-**Engine:** `glm`. **Control:** `STRIX_GLM_PF_HC_EXPAND_ROWS`. **Default:** 2.
+**Engine:** `glm`. **Control:** `STRIX_GLM_PF_HC_EXPAND_BW`. **Default:** 1.
 
-The fused hyper-connection expand + next-site norm of the exact prefill processes two token rows per thread block
-instead of one, on the plain path and on the TP2 path that forms the pair sum on load. Each row keeps the same lane
-mapping, reduction order and rounding as the one-row kernel; only the block placement changes, which halves the
-block count and shares the mixing weights between the two rows.
+The fused hyper-connection expand + next-site norm of the exact prefill runs on the shared row-expansion kernel
+(`src/core/hc_expand_rows.hpp`) through a GLM policy: one token row per work-group, the row's mixing weights held in
+registers, X and y read once through restrict pointers, streaming loads of X and stores of Xo. Every expression and its
+order are those of the one-row kernel (including the TP2 pair sum formed on load), so the bits are unchanged. Ranges that
+break the restrict contract (an output overlapping an input, misaligned rows) keep the one-row kernel. It replaces the
+earlier model-private two-rows-per-block kernel (`STRIX_GLM_PF_HC_EXPAND_ROWS`, removed).
 
 - **Preconditions:** Exact chunked prefill with the fused expand + norm (`STRIX_GLM_PF_HC_FUSE=1`, the default).
-- **Automatic selection:** The engine default sets 2; the resolver reports it. Explicit values win; values other than 1 and 2 are rejected.
-- **Fallback notice:** None.
-- **Exactness evidence:** Host and device gates bitwise against the one-row kernel, including the pair-sum path; pair logits bitwise equal the anchors on both ranks at 8K.
-- **Off switch:** STRIX_GLM_PF_HC_EXPAND_ROWS=1, or --baseline
-- **Measured gain:** Two-node pair, alternating arms, 8,192 tokens: TTFT 13.671 -> 13.611 s (-0.44 %), measured with the other exact prefill levers of that build enabled.
-- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip), [CTA kernel](../src/glm/prefill/glm_hc_expand_cta.inc)
+- **Automatic selection:** Code default 1; the resolver reports it. Explicit values win; values other than 0 and 1 are rejected.
+- **Fallback notice:** None (a range outside the restrict contract runs the one-row kernel, same bits).
+- **Exactness evidence:** Device fixture bitwise against the original one-row kernel (payload, guards and flag by memcmp, special values, the pair-sum path, the mapped receive view); pair logits, state and token digests equal at 8K.
+- **Off switch:** STRIX_GLM_PF_HC_EXPAND_BW=0, or --baseline
+- **Measured gain:** None in wall time: two-node pair, 8,192 tokens, ABAB with two prefills per process, prefill cold / warm 13.84 / 14.56 s (two-row kernel) vs 13.81 / 14.50 s, within the spread of each arm. The traced per-call time fell 10.8 -> 2.2 ms, but that is the GPU share each kernel got while the other prefill stream ran; isolated, the shared kernel costs the same as the one-row kernel. The change removes a model-private kernel family.
+- **Implementation / evidence:** [resolver](../apps/glm_rank_defaults.hpp), [prefill kernels](../src/glm/prefill/glm_prefill.hip), [shared row expansion](../src/core/hc_expand_rows.hpp), [GLM policy](../src/glm/prefill/glm_hc_expand_bw.inc)
 
 <a id="glm-pf-staged"></a>
 
@@ -5090,6 +5133,25 @@ the longest cached prefix of its token ids and prefills only the rest.
 - **Measured gain:** No throughput figure published yet. Follow-up agent turns report 48,128-49,664 restored tokens in `cached_tokens`.
 - **Implementation / evidence:** [Qwen RTX serve guide](models/qwen3.8/rtx-serve.md#prompt-prefix-cache), [cache](../apps/cuda_qwen_prefix_cache.hpp)
 
+<a id="qwen-rtx-expert-wide-tile"></a>
+
+### Tensor-core expert wide tile form (128 rows)
+
+**Engine:** `qwen-rtx`. **Control:** `--expert-wide-tile on|off|N`, `STRIX_QRTX_EXPERT_WIDE_TILE` (lever row `expert_wide_tile`). **Default:** off (opt-in until its timing receipt).
+
+A prefill launch whose experts receive at least N rows each on average cuts 128-row CSR tiles and runs them in
+512-thread blocks: each warp keeps one column block and one weight row per lane (32 accumulators per thread, as the
+64-row tile form), so a 128-row run of an expert decodes its weight codes once instead of twice. MMA count, activation
+bytes per row and warps per SM do not change. N is a planner parameter per device: the no-model tile bench prints it
+(`TILEWIDE min_rows=N`); `on` uses the builtin value (128, provisional).
+
+- **Preconditions:** CUDA Qwen MoE with `gsq_bf16_mma` experts (the FAST expert arithmetic) on prefill launches above 16 rows; decode steps keep the decode form.
+- **Automatic selection:** none yet; when on, the launch picks the wide form from its average rows per expert.
+- **Exactness evidence:** Exact schedule trait: a wide tile is exactly two consecutive 64-row tiles; every row keeps its m16 position and order and each output's MMA and scale-FMA sequence is unchanged, so outputs are bitwise the tile form (host test on edge counts and 200 random 512-expert routings; the bench compares both forms' device hashes). Contract and bundle id do not change.
+- **Off switch:** `--expert-wide-tile off`; `STRIX_QRTX_EXPERT_WIDE_TILE=0` (the default).
+- **Measured gain:** Not yet measured.
+- **Implementation / evidence:** [kernels](../src/cuda/core/moe_a8_mma.cuh), [form contract and launch rule](../src/cuda/core/native_mma.hpp), [lever row](../include/strix/profiles/qwen_cuda.hpp), [bench](../tests/cuda/qwen_moe_tile_bench.cu)
+
 <a id="qwen-rtx-expert-decode-tile"></a>
 
 ### Tensor-core expert decode tile form
@@ -5216,6 +5278,50 @@ host wait for the ids. The host no longer stands between the last draft kernel a
 - **Off switch:** `--prelaunch 0` (the default).
 - **Measured gain:** Not yet measured.
 - **Implementation / evidence:** [contract](../include/strix/spec/block_drafter.hpp), [MTP chain](../include/strix/spec/mtp_chain.hpp), [CUDA binding](../src/qwen35/cuda/engine.cu)
+
+<a id="qwen-dense-cuda-fast4-tile-bulk-feed"></a>
+### Qwen dense 27B CUDA FAST4 tile GEMM: bulk stage feed
+
+**Engine:** `qwen-rtx` (dense 27B, FAST4 prefill). **Control:** `--prefill-tile-feed bulk|lsu` on `strix-cuda-qwen35-decode`. **Default:** `lsu` (unchanged).
+
+The FAST4 tile GEMM (W4A4, `nvfp4-tile-mma-f32-v1`) was bound by its stage feed, not by the tensor pipe: every one of the
+eight MMA warps issued its share of the 1,728 16-byte copies of a 27,648-byte stage and the whole CTA met at a barrier once
+per stage. The `bulk` feed of the shared tile family gives the copies to a producer warpgroup (one 1-D bulk copy per
+contiguous record, 40 per stage, into a full / empty mbarrier ring); the MMA warps issue no copy instruction and wait per
+warp for their stage. The stage holds the same bytes at the same offsets and every accumulator sees the same MMA order.
+
+- **Preconditions:** `--prefill-arith fast4` (sm_120, NVFP4 weights): every FAST4 tile GEMM of the large prefill (gate/up GLU, down, q/k/v, o, the residual forms). Other prefill classes do not use the tile family; the effective config prints `prefill-tile-feed: n/a (FAST4 only)`.
+- **Selection:** opt-in with `--prefill-tile-feed bulk` for FAST4 GEMMs; without that option the effective config prints `prefill-tile-feed: lsu`.
+- **Exactness evidence:** Scheduling only, no identity suffix: device fixture `nvfp4_tile_device` bulk output equal to lsu bit for bit in 9 checks (store, residual, silu_mul and GLU forms, partial weight and activation tiles); host oracle `nvfp4_tile_host` checks that the bulk records write exactly the bytes of the lsu chunks; host tests pin the default and that the option never changes the engine identity.
+- **Off switch:** `--prefill-tile-feed lsu` (also the default; preserves the incumbent launch path).
+- **Measured gain:** Operator bench reported for RTX PRO 6000, 4,096 rows, no model, strict ABAB in one process: bulk / lsu = 0.934 gate/up GLU, 0.921 down, 0.929 down (residual), 0.850 o, 0.858 o (residual), 0.846 k/v, 0.977 q/k/v. The lsu form is reported as neutral versus main within noise on 7 shapes. These are operator-level results, not an end-to-end prefill qualification; retain lsu by default until that is measured.
+- **Implementation / evidence:** [tile contract](../include/strix/cuda/core/nvfp4_tile.hpp), [sm_120 kernel](../src/cuda/core/arch/sm120/nvfp4_tile.cuh), [dense_big binding](../src/cuda_core/dense/dense_big.cu), [fixture](../tests/nvfp4_tile/tile_device.cu)
+
+<a id="qwen-dense-cuda-pf-tf32-h16"></a>
+
+### Qwen dense 27B CUDA prefill: TF32 GDN chunk scan and BF16 FFN hidden rows (FAST, opt-in)
+
+**Engine:** `qwen-rtx` (dense 27B). **Control:** `--prefill-gdn chunk16tc` and `--prefill-hid bf16` on `strix-cuda-qwen35-decode` (large prefill route). **Default:** off (`chunk16` / `f32`); `--profile fast` does not turn either on until its quality gate passes. **Class:** FAST (bit-changing, quality-gated).
+
+Two traits of shared kernel families, no new family:
+
+- `chunk16tc` (`gdn-chunk16-tf32-v1`, identity `-gdnc16t`): the K2 scan of the chunked GDN prefill
+  (`src/cuda_core/gdn/gdn_chunk.cu`) runs its products on `mma.m16n8k8.tf32` with FP32 accumulation; the FP32 state stays in
+  accumulator fragments for the whole launch (a key permutation inside each 8-key block makes the C fragment of one product
+  the A fragment of the next). Only product operands are rounded to TF32; sums, decays and the state stay FP32; the chunks
+  and the K1 workspace are those of `chunk16`.
+- `bf16` hidden rows (`nvfp4-tile-h16-v1`, identity `-h16`): the fused gate/up epilogue of the FAST4 tile GEMM stores
+  H = silu(gate) * up as BF16 (round to nearest even) and the down operand is quantised from those rows by the same
+  quantiser core (exact widening). A compile-time trait of the tile kernels: the FP32 instantiations carry no H16 code.
+
+- **Preconditions:** decode CLI large prefill; `bf16` hidden rows need `--prefill-arith fast4` and NVFP4 FFN weights.
+- **Automatic selection:** none (no `qualified` regime in `include/strix/profiles/qwen_dense_cuda.hpp`).
+- **Exactness evidence:** `--profile exact` cannot reach either trait (host test `strix-qwen35-dense-profile-host-tests`);
+  the FP32 scan kernels and the FP32 tile instantiations are machine-code identical to the code without the traits.
+  Quality gate: not passed yet.
+- **Off switch:** `--prefill-gdn chunk16` (or `serial`), `--prefill-hid f32`.
+- **Measured gain:** not yet measured end to end (timed rounds follow the gate).
+- **Implementation / evidence:** [GDN chunk family](../src/cuda_core/gdn/gdn_chunk.cu), [tile family](../src/cuda/core/arch/sm120/nvfp4_tile.cuh), [GDN host test](../tests/gdn_chunk/gdn_chunk_host.cpp), [tile host test](../tests/nvfp4_tile/tile_host.cpp), [profile test](../tests/qwen35_dense_profile_host_tests.cpp)
 
 ## Platform (kernel)
 
@@ -5684,3 +5790,27 @@ envelope of the known-rows MoE down (`PrefillRows::rawdots_bf16`).
 - **Measured gain:** One node, 4096-token bench prompt (a ~66-token sequence repeated), 2048-row windows, alternated
   A-B / B-A: warm prompt 7,680 / 7,694 ms -> 7,307 / 7,409 ms (-4.3 %), cold 7,879 / 7,942 -> 7,593 / 7,557 ms (-4.2 %).
 - **Implementation / evidence:** [dense core](../src/core/f16_dense_q8a8.hpp), [known-rows down](../src/hip_moe_q4k_a8_known_rows.hip), [binding](../src/hy4/hip/hy4_hip_forward.hip)
+
+### Hy4-flash exact tensor-parallel decode over two nodes
+
+**Engine:** `hy4` (HIP). **Control:** `--tp-rank 0|1` on both ranks of `strix-hy4-rank` (`--tp-rates A,B` required,
+`--tp-transport`, `--tp-trip-us`, `--tp-force`; needs `--prompt-rows`). **Default:** off (one node) unless `--tp-rank`
+is given; with it, the shared split planner (`include/strix/pair/split_plan.hpp`, the decode pass described as stages
+by `include/strix/hy4/tp_layout.hpp` decode_stages) keeps the decode on one node when the group does not win (unless
+`--tp-force`).
+
+Each rank loads the whole pack and prefills alone (replicated, same bits). From the first decode step
+(`Forward::enable_tp`), each rank computes its share and the shared pair gather (`include/strix/pair/gather_link.hpp`,
+HIP side `src/xport/tp_gather_hip.hpp`) swaps the halves: attention by heads (gate, q_b, rope, K_b, the query image, the
+sparse flash as one 16-head tile per rank on indexed layers or one of the two 32-head groups on sliding layers, V_b,
+the gate; then o joined), o_proj by output rows, the layer-0 FFN by rows, the routed experts by slot (A8 probe / down
+over 8 of the 16 slots at the rank's ids) with the shared expert's gate/up rows in the same join, the head by
+vocabulary rows. Router, latent down / up, the shared down projection, hyper-connection sites, norms, Engram, the
+indexer and the greedy pick stay replicated. The shares are written where `tp_layout.hpp` places them, so the gathered
+buffer is the one-node buffer (no join pass): 128 gathers per token. Every split output is a whole per-head / per-row /
+per-slot result of the same kernel and the combine runs over all 16 slot rows in slot order.
+- **Off switch:** omit `--tp-rank`.
+- **Exactness evidence:** generated ids equal the one-node run on both ranks (300 of 300 and 128 of 128, 1024-token
+  prompt); host test `tests/hy4_tp_layout_tests.cpp` (shares tile, the MoE join leaves the slot rows contiguous, the
+  planner's joins equal the step's gathers).
+- **Measured:** one node | pair | one node: 16.52 | 19.92 | 16.51 tok/s (host-staged gather route, +21 %).

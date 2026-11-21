@@ -49,6 +49,15 @@
 // chain adds about 2^-24 x sum |a_i b_i| per WMMA step, so cancellation is not covered. Bounds and a host model of
 // these products in this order: two_term_model.hpp.
 // The denominator sums hi + lo of p. LDS adds 16 x (D + 8) x 2 + D x 32 B; Q lo stays in registers.
+// Optional occupancy override: static constexpr unsigned kWavesPerEu (waves per SIMD of flash_prefill<P>; absent = the
+// VGPR budget rule of dense_flash_budget.hpp). For a policy whose launch measured slower at the rule's target.
+// Optional one-term traits (absent: the code paths above, unchanged; used by the MLA expanded-MHA prefill form):
+//   float sink(const Args&, row, head)               learned sink logit (natural units): out = O / (l + 2^(z log2(e) - m)),
+//                                                    the sink column of the softmax with no value (sparse_flash_wmma's rule)
+//   static constexpr bool kValueRows = true;          V given as rows instead of value_t:
+//   const uint16_t* value(const Args&, pos, kv_head) kOp V[pos][0..D), 16-B aligned; staged transposed into the same LDS
+//   static constexpr unsigned kRope;                  MLA decoupled rope key: K[pos][head] = key(pos, head)[0 .. D - kRope)
+//   const uint16_t* rope_key(const Args&, pos)       followed by rope_key(pos)[0 .. kRope) shared by every head (16-B aligned)
 // rows() is __host__ __device__. Launch: launch<P>(args, heads, stream, workspace, splits) - grid (row blocks, heads / Group, splits), longest
 // blocks first; workspace_floats(rows, heads, D, splits) FP32 when splits > 1.
 #include <hip/hip_runtime.h>
@@ -56,6 +65,7 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "dense_flash_budget.hpp"
 #include "flash_core.hpp"
 
 namespace strix::attn_core::dense {
@@ -81,6 +91,14 @@ struct Shape {
 // FP16 terms per operand of a policy: P::kTerms when declared, else 1.
 template <class P, class = void> struct terms_of { static constexpr unsigned value = 1; };
 template <class P> struct terms_of<P, std::void_t<decltype(P::kTerms)>> { static constexpr unsigned value = P::kTerms; };
+// The optional traits (see the policy list above).
+template <class P> concept DenseSink = requires(const typename P::Args& a, float& z) { z = P::sink(a, 0U, 0U); };
+template <class P> concept DenseValueRows = requires { P::kValueRows; } && P::kValueRows;
+template <class P> concept DenseRopeKey = requires { P::kRope; };
+template <class P> constexpr unsigned rope_of() {
+    if constexpr (DenseRopeKey<P>) return P::kRope;
+    else return 0U;
+}
 
 __device__ inline unsigned window_lo(unsigned p, unsigned window) { return window && p >= window ? p - window + 1U : 0U; }
 
@@ -92,6 +110,10 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
     constexpr bool Two = terms_of<P>::value == 2U;
     static_assert(terms_of<P>::value == 1U || Two, "kTerms is 1 or 2");
     static_assert(S::lds_bytes + (Two ? 16 * KP * 2 + D * 16 * 2 : 0) <= 65536, "LDS budget (two-term)");
+    constexpr bool VRows = DenseValueRows<P>;
+    [[maybe_unused]] constexpr unsigned KR = rope_of<P>(), KN = D - KR;  // key columns from key() / from rope_key()
+    static_assert(!Two || (!VRows && KR == 0U), "row-major V and the shared rope key are one-term traits");
+    static_assert(KR % 8U == 0U && KR < D, "the rope key is whole 16-byte pieces");
     __shared__ __attribute__((aligned(16))) std::uint16_t ks[16 * KP];
     __shared__ __attribute__((aligned(16))) std::uint16_t vs[D * 16];
     [[maybe_unused]] __shared__ __attribute__((aligned(16))) std::uint16_t ks_lo[Two ? 16 * KP : 8];
@@ -146,10 +168,20 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
             const unsigned idx = tid + i * T;
             if (S::pieces % T == 0 || idx < S::pieces) {
                 const unsigned key = idx / (D / 8U), c = idx % (D / 8U);
-                kreg[i] = *reinterpret_cast<const U4*>(P::key(a, kt + key, kvh) + 8U * c);
-                const unsigned d = idx >> 1, h = idx & 1U;
-                vreg[i] = *reinterpret_cast<const U4*>(P::value_t(a, kvh, d) + kt + 8U * h);
+                if constexpr (KR != 0U) {  // MLA: the head's own columns, then the rope key every head shares
+                    const std::uint16_t* kp = 8U * c < KN ? P::key(a, kt + key, kvh) + 8U * c : P::rope_key(a, kt + key) + (8U * c - KN);
+                    kreg[i] = *reinterpret_cast<const U4*>(kp);
+                } else {
+                    kreg[i] = *reinterpret_cast<const U4*>(P::key(a, kt + key, kvh) + 8U * c);
+                }
+                if constexpr (VRows) {  // piece = 8 columns of one key row; consecutive threads = consecutive keys
+                    vreg[i] = *reinterpret_cast<const U4*>(P::value(a, kt + idx % 16U, kvh) + 8U * (idx / 16U));
+                } else {
+                    const unsigned d = idx >> 1, h = idx & 1U;
+                    vreg[i] = *reinterpret_cast<const U4*>(P::value_t(a, kvh, d) + kt + 8U * h);
+                }
                 if constexpr (Two) {
+                    const unsigned d = idx >> 1, h = idx & 1U;
                     klreg[i] = *reinterpret_cast<const U4*>(P::key_lo(a, kt + key, kvh) + 8U * c);
                     vlreg[i] = *reinterpret_cast<const U4*>(P::value_t_lo(a, kvh, d) + kt + 8U * h);
                 }
@@ -163,8 +195,17 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
             if (S::pieces % T == 0 || idx < S::pieces) {
                 const unsigned key = idx / (D / 8U), c = idx % (D / 8U);
                 *reinterpret_cast<U4*>(&ks[key * KP + 8U * c]) = kreg[i];
-                const unsigned d = idx >> 1, h = idx & 1U;
-                *reinterpret_cast<U4*>(&vs[8U * ::strix::core::lds_rows::slot32(d, h)]) = vreg[i];
+                [[maybe_unused]] const unsigned d = idx >> 1, h = idx & 1U;
+                if constexpr (VRows) {  // V[key][8 vc + e] -> the V^T row d = 8 vc + e, column key (same slot32 rows)
+                    const unsigned vk = idx % 16U, vc = idx / 16U, vh = vk / 8U, vo = vk % 8U;
+#pragma unroll
+                    for (unsigned e = 0; e < 4U; ++e) {
+                        vs[8U * ::strix::core::lds_rows::slot32(8U * vc + 2U * e, vh) + vo] = static_cast<std::uint16_t>(vreg[i][e] & 0xffffU);
+                        vs[8U * ::strix::core::lds_rows::slot32(8U * vc + 2U * e + 1U, vh) + vo] = static_cast<std::uint16_t>(vreg[i][e] >> 16U);
+                    }
+                } else {
+                    *reinterpret_cast<U4*>(&vs[8U * ::strix::core::lds_rows::slot32(d, h)]) = vreg[i];
+                }
                 if constexpr (Two) {
                     *reinterpret_cast<U4*>(&ks_lo[key * KP + 8U * c]) = klreg[i];
                     *reinterpret_cast<U4*>(&vs_lo[8U * ::strix::core::lds_rows::slot32(d, h)]) = vlreg[i];
@@ -313,8 +354,11 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
 #pragma unroll
         for (unsigned e = 0; e < 8; ++e) {
             const unsigned r = sub + 2U * e + hw;
-            const float total = __shfl(denominator, int(2U * e + hw), 32);
+            float total = __shfl(denominator, int(2U * e + hw), 32);
+            [[maybe_unused]] const float row_max = DenseSink<P> ? __shfl(maximum, int(2U * e + hw), 32) : 0.0F;
             if (r < block_rows) {
+                if constexpr (DenseSink<P>)  // the sink column: 2^(z log2(e) - m), no value
+                    total += __builtin_amdgcn_exp2f(P::sink(a, row_base + r, head) * 1.4426950408889634F - row_max);
                 float* o = P::out(a, row_base + r, head) + d0;
 #pragma unroll
                 for (unsigned f = 0; f < F; ++f) {
@@ -328,10 +372,14 @@ __device__ __forceinline__ void flash_body(typename P::Args a, float* ws, unsign
     if (bad_value) atomicOr(P::failure(a), 1U);
     if (bad_half) atomicOr(P::failure(a), 4U);
 }
-// Register cap for 8 waves per SIMD (192 VGPRs on gfx1151, 44 B/lane scratch): two 16-wave work-groups per WGP;
-// 1.3x the uncapped 238-VGPR kernel (one work-group per WGP) at 32K.
+// Occupancy target (waves per SIMD): the highest whose VGPR budget holds the key loop without spills
+// (dense_flash_budget.hpp; placement only, same bits).
+template <class P> constexpr unsigned waves_per_eu() {
+    if constexpr (requires { P::kWavesPerEu; }) return P::kWavesPerEu;
+    else return occupancy_target(P::Shape::frags, P::Shape::per_thread, terms_of<P>::value, P::Shape::waves);
+}
 template <class P>
-__global__ __launch_bounds__(P::Shape::threads) __attribute__((amdgpu_waves_per_eu(8))) void flash_prefill(
+__global__ __launch_bounds__(P::Shape::threads) __attribute__((amdgpu_waves_per_eu(waves_per_eu<P>()))) void flash_prefill(
     typename P::Args a, float* ws, unsigned splits, unsigned seg_tiles) {
     flash_body<P>(a, ws, splits, seg_tiles);
 }
@@ -354,6 +402,7 @@ __global__ __launch_bounds__(P::Shape::dim / 4U) void combine(typename P::Args a
         const float4 v = *reinterpret_cast<const float4*>(ws + at * D + d);
         o[0] += w * v.x; o[1] += w * v.y; o[2] += w * v.z; o[3] += w * v.w;
     }
+    if constexpr (DenseSink<P>) l += __builtin_amdgcn_exp2f(P::sink(a, row, head) * 1.4426950408889634F - m);
     float* out = P::out(a, row, head) + d;
     bool bad = false;
 #pragma unroll

@@ -229,6 +229,14 @@ struct EngineOps {
     std::vector<gs::SlotSpec> spec;
     std::vector<unsigned> hp_row;
     std::uint32_t prefix_restored = 0, prefix_bootstrap_pending = 0;
+    // per slot: the prompt tokens (both ranks see the same chunks), the shared arbiter's lookup context
+    std::vector<std::vector<std::uint32_t>> context{};
+    void remember(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0) {
+        if (!policy.spec_arbiter) return;
+        auto& c = context.at(slot);
+        if (pos0 == 0) c.clear();
+        c.insert(c.end(), tokens.begin(), tokens.end());
+    }
 
     void plain_call() {
         if (dec) throw std::logic_error("engine call while an MTP decoder is open");
@@ -240,6 +248,7 @@ struct EngineOps {
         prefix_bootstrap_pending &= ~(1U << slot);
         eng.reset(slot);
         spec.at(slot) = {};
+        if (policy.spec_arbiter) context.at(slot).clear();  // the lookup index never carries another request's tokens
     }
     static std::uint64_t prefix_state_bound(std::uint64_t p) { return gs::prefix_snapshot_bound(p); }
     // Store rule of this rank: MemAvailable covers the snapshot bound and leaves the load admission's RAM margin.
@@ -255,6 +264,8 @@ struct EngineOps {
         control.calibration = sp::Calibration{};
         control.cycle = control.step = 0;
         hp_row.at(slot) = 0;
+        // lookup context: the restored prefix tokens are not known here; the index restarts at the suffix
+        if (policy.spec_arbiter) context.at(slot).clear();
         prefix_restored |= 1U << slot;
         prefix_bootstrap_pending |= 1U << slot;
         eng.restore_state(slot, bytes, p);
@@ -262,6 +273,7 @@ struct EngineOps {
     std::uint32_t prefill(std::uint32_t slot, std::span<const std::uint32_t> tokens, std::uint64_t pos0) {
         plain_call();
         spec.at(slot) = {};
+        remember(slot, tokens, pos0);
         return eng.prefill(slot, tokens, pos0);
     }
     std::vector<std::uint32_t> step(std::span<const gs::WireRow> rows) {
@@ -367,6 +379,7 @@ struct EngineOps {
             hp_row.at(slot) = 0;
             prefix_bootstrap_pending &= ~(1U << slot);
         }
+        remember(slot, tokens, pos0);
         if (pos0 == 0 && last) {
             seed = sp::bootstrap(eng, slot, tokens, bootstrap, control);
             seed_slot = slot;
@@ -686,7 +699,9 @@ struct EngineOps {
     std::vector<std::uint32_t> mtp_run(std::uint32_t slot, std::uint32_t budget, std::uint32_t cycles) {
         if (!dec) {
             if (!seed || seed_slot != slot) throw std::logic_error("mtp_run without a fresh drafter seed");
-            dec = std::make_unique<sp::GreedyDecoder>(eng, slot, *seed, policy, budget, control);
+            auto pol = policy;
+            if (pol.spec_arbiter) pol.context = &context.at(slot);
+            dec = std::make_unique<sp::GreedyDecoder>(eng, slot, *seed, pol, budget, control);
             dec_slot = slot;
             seed.reset();
             spec.at(slot) = {};
@@ -703,7 +718,13 @@ struct EngineOps {
         spec.at(slot) = {};
         if (dec) {
             if (dec_slot != slot) throw std::logic_error("mtp_leave of another slot than the open decoder");
+            if (policy.spec_arbiter) {  // the next decoder of this request indexes what this one emitted
+                const auto& emitted = dec->result().tokens;
+                context.at(slot).insert(context.at(slot).end(), emitted.begin(), emitted.end());
+            }
             dec->finish();
+            if (control.rank == 0 && !dec->result().spec_stats.empty())
+                std::fprintf(stderr, "strix-spec-stats %s\n", dec->result().spec_stats.c_str());
             dec.reset();
         } else {
             eng.flush(slot);
@@ -1236,6 +1257,8 @@ int main(int argc, char** argv) {
             std::printf("rank %u: import receiver on %s (node identity %s%s)\n", rank, ep.c_str(), node.c_str(),
                         import_dsa_once ? ", DSA once: rank 0 relays the DSA components" : "");
         }
+        ops.policy.spec_arbiter = eff.spec_arbiter;
+        ops.context.assign(opt.slots, {});
 
         // RTX import settings every rank must share: a mismatch refuses at hello, before serving.
         if (!import_listen.empty()) {

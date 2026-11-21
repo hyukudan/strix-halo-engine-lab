@@ -197,7 +197,7 @@ void pinned_absent_taps_tests() {
     for (unsigned r = 0; r < tokens.size(); ++r) tokens[r] = (r * 3 + 1) % model.config.vocab;
     gpu::DeviceStream stream(model.config, 1024);
     auto tx = stream.begin();
-    const auto out = target.forward(*tx, tokens, false, true, false, true, true);
+    const auto out = target.forward(*tx, tokens, false, true, HiddenDemand::none, true, true);
     const auto taps = out.tap_rows();
     CHECK(taps.size() == tokens.size() * std::size_t(out.tap_width));
     const auto hidden = model.config.hidden;
@@ -220,17 +220,17 @@ void pinned_views_tests() {
     for (unsigned start = 0; start < tokens.size(); start += pf::chunk_rows) {
         const auto chunk = std::span(tokens).subspan(start, std::min<std::size_t>(pf::chunk_rows, tokens.size() - start));
         auto ta = plain.begin();
-        const auto a = target.forward(*ta, chunk, false, true, true, true, false);
+        const auto a = target.forward(*ta, chunk, false, true, HiddenDemand::all_rows, true, false);
         const auto a_taps = vec(a.tap_rows()), a_hidden = vec(a.hidden_rows());
         CHECK(a.pinned_taps.empty() && a_taps.size() == chunk.size() * a.tap_width && a_hidden.size() == chunk.size() * model.config.hidden);
         ta->commit(unsigned(chunk.size()));
         auto tb = views.begin();
-        const auto b = target.forward(*tb, chunk, false, true, true, true, true);
+        const auto b = target.forward(*tb, chunk, false, true, HiddenDemand::all_rows, true, true);
         CHECK(!b.pinned_taps.empty() && !b.pinned_hidden.empty());
         bytes(b.last_logits, a.last_logits); bytes(vec(b.tap_rows()), a_taps); bytes(vec(b.hidden_rows()), a_hidden);
         tb->commit(unsigned(chunk.size()));
         auto tc = untapped.begin();
-        const auto c = target.forward(*tc, chunk, false, true, true, false, true);
+        const auto c = target.forward(*tc, chunk, false, true, HiddenDemand::all_rows, false, true);
         CHECK(c.tap_rows().empty());
         bytes(c.last_logits, a.last_logits); bytes(vec(c.hidden_rows()), a_hidden);
         tc->commit(unsigned(chunk.size()));
@@ -262,7 +262,7 @@ void batch_tests() {
             gpu::DeviceStream stream(model.config, 1024);
             (void)target.run(stream, prefix);
             auto tx = stream.begin();
-            const auto out = target.forward(*tx, chunk, false, false, true, true, false);
+            const auto out = target.forward(*tx, chunk, false, false, HiddenDemand::all_rows, true, false);
             auto taps = vec(out.tap_rows()), hidden = vec(out.hidden_rows());
             tx->commit(unsigned(chunk.size()));
             return std::tuple(std::move(taps), std::move(hidden), stream.digest());
@@ -278,7 +278,7 @@ void batch_tests() {
                 std::vector<pf::PrefillSegment> segments;
                 if (offset) segments = {{to.get(), chunk_other}, {tm.get(), chunk_mine}};
                 else segments = {{tm.get(), chunk_mine}, {to.get(), chunk_other}};
-                const auto out = target.forward_batch(segments, true, true, views);
+                const auto out = target.forward_batch(segments, HiddenDemand::all_rows, true, views);
                 CHECK(out.size() == 2);
                 const auto& m = out[offset ? 1 : 0]; const auto& o = out[offset ? 0 : 1];
                 CHECK(m.rows == chunk_mine.size() && o.rows == chunk_other.size());

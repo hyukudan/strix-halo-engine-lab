@@ -15,6 +15,9 @@
 
 namespace strix::hy4 {
 
+// Reference lookup table size (configuration_hy_v4_flash engram_lookup_table_size): ids at or past it read the pad's
+// compressed id. The pack's map covers the whole vocabulary (120832), the reference table 120818.
+inline constexpr std::uint32_t kLookupTableSize = 120818;
 struct EngramPackMeta {
     std::vector<std::uint32_t> layers;
     std::uint32_t ngram_size = 0, heads_per_ngram = 0, row_elements = 0;
@@ -23,9 +26,7 @@ struct EngramPackMeta {
     std::vector<std::uint64_t> head_offsets;  // optional (empty: not checked)
     std::uint32_t pad_token_id = 0;
     std::vector<std::int32_t> token_map;
-    // Reference lookup table size (configuration_hy_v4_flash engram_lookup_table_size): ids at or past it read the
-    // pad's compressed id. The pack's map covers the whole vocabulary (120832), the reference table 120818.
-    std::uint32_t lookup_table_size = 120818;
+    std::uint32_t lookup_table_size = kLookupTableSize;
 };
 
 // Throws std::invalid_argument on an inconsistent pack (negative map entry or multiplier, head offsets that are

@@ -279,12 +279,12 @@ int main(int argc, char** argv) try {
         for (const double g : tp_rates) bpms.push_back(g * 1e6);  // GB/s -> bytes/ms
         const double one_ms = tpg->agree_max(hip_dense_measure_pass(*E, std::uint32_t(generated[0])));
         const auto cal = psp::with_measured_single(stages, psp::Pass{}, *std::min_element(bpms.begin(), bpms.end()), one_ms);
-        const auto lc = tpg->measure_link();
+        const auto lc = tpg->measure_link(std::uint64_t(gather_row));
         const auto trip = strix::pair::tp::trip_cost(lc, tp_trip_us);
         std::printf("tp calibration: one node pass %.1f ms measured (timed windows, agreed max), stage model %.1f ms, fixed residual %.1f ms\n",
                     one_ms, cal.model_ms, cal.fixed_ms);
         std::printf("tp link cost: %s; trip %.1f us%s, %s\n", lc.describe().c_str(), trip.latency_ms * 1000.0,
-                    tp_trip_us > 0.0 ? " (--tp-trip-us)" : " (measured)", strix::pair::gather_route_name(tpg->link().route()));
+                    tp_trip_us > 0.0 ? " (--tp-trip-us)" : " (measured)", tpg->link().route_label().c_str());
         // The probe is the step's join form (gathers enqueued back to back behind work, no host wait): the in-token class.
         auto set = strix::device::rank_set(bpms, strix::device::FactSource::declared, "tp");
         strix::dist::LinkCost tc = lc;
@@ -292,7 +292,7 @@ int main(int argc, char** argv) try {
         strix::device::set_measured(set, 0U, 1U, strix::device::GapClass::in_token, tc);
         ppl::Costs pc;
         pc.set = &set;
-        pc.route = tpg->link().route();
+        pc.route = tpg->link().route_for(std::uint64_t(gather_row));  // the route the step's gathers take
         if (tp_gap_us >= 0.0) {
             pc.gap_measured[static_cast<std::size_t>(strix::pair::GatherRoute::staged)] = true;
             pc.segment_gap_us[static_cast<std::size_t>(strix::pair::GatherRoute::staged)] = tp_gap_us;
@@ -407,7 +407,7 @@ int main(int argc, char** argv) try {
             const auto& tl = tpg->link();
             const double n = double(tl.calls());
             std::printf("tp link: %llu gathers, %.1f per pass, route %s, link %.2f ms/pass (%.1f us/gather), rest %.2f ms/pass\n",
-                        (unsigned long long)tl.calls(), n / passes, strix::pair::gather_route_name(tl.route()),
+                        (unsigned long long)tl.calls(), n / passes, tl.route_label().c_str(),
                         tl.link_ms() / passes, n > 0.0 ? tl.link_ms() * 1000.0 / n : 0.0, (ms - tl.link_ms()) / passes);
             // the planner's prediction is per plain pass: compared only when every step is one token (no speculation)
             if (!steps) std::printf("plan_check: form=tensor pred_ms=%.1f measured_ms=%.1f err=%+.1f %%\n", tp_pred_ms, per, 100.0 * (tp_pred_ms - per) / per);

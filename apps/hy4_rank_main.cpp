@@ -12,12 +12,20 @@
 //   token with the token relayed back: the same work as one node, so the ids and logits equal the one-node run.
 #include "hy4/hip/hy4_hip_forward.hpp"
 #include "hy4/hip/hy4_hip_plan.hpp"
+#include "strix/hy4/tp_layout.hpp"
+#include "strix/env_flags.hpp"
 #include "strix/pair/layer_pipeline.hpp"
+#include "strix/pair/tp_inputs.hpp"
+#include "xport/tp_gather_hip.hpp"
 #include "strix/pair/link.hpp"
 #include "strix/pair/link_flags.hpp"
+#include "strix/pair/link_mux.hpp"
+#include "strix/pair/stage_map.hpp"
 #include "strix/profiles/hy4.hpp"
 #include "strix/spec/drafting.hpp"
 #include "xport/hip_pipe_staging.hpp"
+
+#include <hip/hip_runtime.h>
 
 #include <algorithm>
 #include <cstdlib>
@@ -28,10 +36,12 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -48,6 +58,109 @@ std::vector<strix::hy4::hipbind::PairWindowCost> parse_window_costs(const std::s
         costs.push_back({static_cast<std::uint32_t>(std::stoul(item.substr(0, colon))), std::stod(item.substr(colon + 1))});
     }
     return costs;
+}
+
+// --gate-ref: the BASE reference of a long teacher-forced document, in pieces (FAST gate v2 of the prompt windows past
+// what one ticket can reference). forward_rows chunks of --verify-rows R (each row bitwise step(): class BASE) run from
+// the state image --state-in (else position 0) over the --ids-file document up to --until; the logits rows of the
+// --score A:B ranges ([A, B) positions) go to --dump-logits F with their positions in F.pos; state images are written at
+// every --save-at P:FILE and at the stop (--state-out). --budget S stops at the first chunk boundary after S seconds of
+// rows (the ticket wall). The route tap (STRIX_MOE_ROUTES_OUT / _IN / STRIX_MOE_ROUTE_NULL) sees the chunks' router
+// calls like any run: a reference records, a null replays + nudges.
+struct GateRef {
+    bool on = false;
+    std::string state_in, state_out;
+    std::uint32_t until = 0;  // 0: the document's end
+    double budget_s = 0.0;    // 0: no budget
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> score;
+    std::vector<std::pair<std::uint32_t, std::string>> save_at;
+};
+
+std::pair<std::uint32_t, std::uint32_t> parse_range(const std::string& v) {
+    const auto colon = v.find(':');
+    if (colon == std::string::npos) throw std::invalid_argument("--score A:B (positions [A, B))");
+    const auto a = static_cast<std::uint32_t>(std::stoul(v.substr(0, colon)));
+    const auto b = static_cast<std::uint32_t>(std::stoul(v.substr(colon + 1)));
+    if (b <= a) throw std::invalid_argument("--score A:B needs A < B");
+    return {a, b};
+}
+
+int run_gate_ref(strix::hy4::hipbind::Forward& fwd, const std::vector<std::uint32_t>& doc, std::uint32_t rows, const GateRef& g,
+                 const std::string& dump_path) {
+    using clock = std::chrono::steady_clock;
+    if (rows == 0U) throw std::invalid_argument("--gate-ref needs --verify-rows R (1..8)");
+    if (!g.state_in.empty()) fwd.load_state(g.state_in);
+    const std::uint32_t p0 = fwd.position();
+    const auto& hist = fwd.token_history();
+    if (p0 > doc.size() || hist.size() != p0 || !std::equal(hist.begin(), hist.end(), doc.begin()))
+        throw std::runtime_error("--gate-ref: the state image's token history is not a prefix of the --ids-file document");
+    const auto end = static_cast<std::uint32_t>(g.until != 0U ? std::min<std::size_t>(g.until, doc.size()) : doc.size());
+    if (p0 > end) throw std::invalid_argument("--gate-ref: the image is past --until");
+    auto saves = g.save_at;
+    std::sort(saves.begin(), saves.end());
+    std::ofstream dump, dpos;
+    if (!dump_path.empty()) {
+        dump.open(dump_path, std::ios::binary | std::ios::trunc);
+        dpos.open(dump_path + ".pos", std::ios::trunc);
+        if (!dump || !dpos) throw std::runtime_error("cannot open " + dump_path);
+    }
+    const auto scored = [&g](std::uint32_t q) {
+        for (const auto& [a, b] : g.score)
+            if (q >= a && q < b) return true;
+        return false;
+    };
+    std::size_t si = 0, dumped = 0;
+    std::uint64_t digest = 0xcbf29ce484222325ULL;
+    const auto save_due = [&](std::uint32_t at) {
+        for (; si < saves.size() && saves[si].first <= at; ++si) {
+            if (saves[si].first < at) {
+                std::cout << "gate-ref: save point " << saves[si].first << " is behind the start " << at << ", skipped\n";
+                continue;
+            }
+            fwd.save_state(saves[si].second);
+            std::cout << "gate-ref: state image at " << at << " -> " << saves[si].second << "\n" << std::flush;
+        }
+    };
+    const auto t0 = clock::now();
+    std::uint32_t p = p0;
+    bool stopped = false;
+    while (p < end) {
+        save_due(p);
+        if (g.budget_s > 0.0 && std::chrono::duration<double>(clock::now() - t0).count() > g.budget_s) {
+            stopped = true;
+            break;
+        }
+        std::uint32_t R = std::min(rows, end - p);
+        if (si < saves.size()) R = std::min(R, saves[si].first - p);
+        bool want = false;
+        for (std::uint32_t r = 0; r < R && !want; ++r) want = scored(p + r);
+        fwd.forward_rows(std::span<const std::uint32_t>(doc.data() + p, R), want);
+        if (want) {
+            const auto& L = fwd.rows_logits();
+            const std::size_t V = L.size() / R;
+            for (std::uint32_t r = 0; r < R; ++r) {
+                if (!scored(p + r)) continue;
+                const float* row = L.data() + std::size_t{r} * V;
+                const auto* bytes = reinterpret_cast<const unsigned char*>(row);
+                for (std::size_t b = 0; b < V * sizeof(float); ++b) digest = (digest ^ bytes[b]) * 0x100000001b3ULL;
+                if (dump) {
+                    dump.write(reinterpret_cast<const char*>(row), static_cast<std::streamsize>(V * sizeof(float)));
+                    dpos << (p + r) << '\n';
+                }
+                ++dumped;
+            }
+        }
+        fwd.commit_rows(R);
+        p += R;
+    }
+    if (!stopped) save_due(p);
+    if (!g.state_out.empty()) fwd.save_state(g.state_out);
+    const double s = std::chrono::duration<double>(clock::now() - t0).count();
+    std::cout << "gate-ref positions " << p0 << ".." << p << " of " << end << (stopped ? " STOPPED (budget)" : " done") << " rows=" << rows
+              << " s=" << std::fixed << std::setprecision(1) << s << " ms_per_pos=" << std::setprecision(2)
+              << (p > p0 ? 1000.0 * s / static_cast<double>(p - p0) : 0.0) << " scored_rows=" << dumped << " logits_fnv64 " << std::hex
+              << digest << std::dec << (g.state_out.empty() ? std::string() : " state_out " + g.state_out) << "\n" << std::flush;
+    return 0;
 }
 
 std::vector<std::uint32_t> read_ids(const std::string& path) {
@@ -266,6 +379,184 @@ int run_pair(strix::hy4::hipbind::ForwardOptions o, const std::vector<std::uint3
     return 0;
 }
 
+// Interleaved virtual stages of the shared layer pipeline (--stage-map CUTS, e.g. 0,10,21,32,42; strix/pair/stage_map.hpp,
+// layers::prefill / decode over a StageMap): stage s runs on rank s % 2. This rank builds one Forward per stage it owns
+// (a layer range of the same pack: the weights and caches of those layers only, as a two-stage rank holds its half), so
+// the pipe fills and drains in one stage (P / 2v) instead of one half-pass (P / 2). Both seam directions ride the one pair
+// link through the shared LinkMux; the decode then runs on the raw link (2v hops per token). Bits: every layer sees the
+// same windows in prompt order (the shared stage-map invariant), so the head logits equal the two-stage and the one-node
+// prefill at the same width.
+int run_pair_stages(strix::hy4::hipbind::ForwardOptions o, const std::vector<std::uint32_t>& prompt, std::uint32_t gen,
+                    const std::string& map_text, std::uint32_t repeat, std::uint16_t port) {
+    namespace layers = strix::pair::layers;
+    using Forward = strix::hy4::hipbind::Forward;
+    using clock = std::chrono::steady_clock;
+    const auto ms_since = [](clock::time_point t) { return std::chrono::duration<double, std::milli>(clock::now() - t).count(); };
+    const unsigned rank = strix::pair::env_rank("HY4");
+    if (o.prompt_rows == 0U) throw std::invalid_argument("the pair runs the prompt in windows: --prompt-rows R");
+    const auto full = strix::hy4::Config::from_gguf(o.parts.front());
+    const std::uint32_t depth = o.depth != 0U ? o.depth : full.layers;
+    const auto map = strix::pair::StageMap::parse(map_text, depth);
+    layers::check_stage_map(map, rank, true);
+    struct Owned {
+        std::uint32_t stage = 0, first = 0, last = 0;
+        std::unique_ptr<Forward> fwd;
+        double ms = 0;  // this pass: the forward calls of every chunk of the stage
+    };
+    std::vector<Owned> own;
+    const auto t_load = clock::now();
+    std::uint64_t load_bytes = 0;
+    std::uint32_t load_tensors = 0;
+    for (std::uint32_t s = 0; s < map.stages(); ++s) {
+        if (map.owner(s) != rank) continue;
+        auto so = o;
+        so.first = map.cuts[s].layer;
+        so.last = map.cuts[s + 1U].layer;
+        own.push_back({s, so.first, so.last, std::make_unique<Forward>(so), 0.0});
+        load_bytes += own.back().fwd->load_report().bytes;
+        load_tensors += own.back().fwd->load_report().tensors;
+    }
+    std::cout << "hy4 rank " << rank << " stage map " << map.text() << " (v=" << map.virtual_stages() << ") stages";
+    for (const auto& w : own) std::cout << ' ' << w.stage << ":[" << w.first << ',' << w.last << ')';
+    std::cout << " rows=" << o.prompt_rows << "\nload tensors=" << load_tensors << " GiB=" << std::fixed << std::setprecision(3)
+              << static_cast<double>(load_bytes) / 1073741824.0 << " s=" << std::setprecision(2) << ms_since(t_load) / 1000.0
+              << "\n" << std::flush;
+    const auto by_range = [&own](std::uint32_t a, std::uint32_t b) -> Owned& {
+        for (auto& w : own)
+            if (w.first == a && w.last == b) return w;
+        throw std::logic_error("hy4 stage map: a range this rank does not own");
+    };
+    const auto by_stage = [&own](std::uint32_t s) -> Owned& {
+        for (auto& w : own)
+            if (w.stage == s) return w;
+        throw std::logic_error("hy4 stage map: a stage this rank does not own");
+    };
+    auto link = strix::pair::open_link(rank, "HY4", port);
+    strix::dist::Transport* t = link.get();
+    const std::size_t row_bytes = own.front().fwd->seam_row_bytes();
+    const std::uint32_t W = o.prompt_rows;
+    const std::uint64_t identity = layers::fnv(
+        layers::fnv(14695981039346656037ULL, "hy4|" + std::to_string(std::filesystem::file_size(o.parts.front())) + "|" +
+                                                 std::to_string(depth) + "|" + map.text() + "|" + std::to_string(W)),
+        std::span<const std::uint32_t>(prompt));
+    const auto chunks = layers::windows(prompt.size(), W).size();
+    const auto barrier = [&] {  // both ranks start each timed phase together (load skew stays out of the timing)
+        std::uint64_t w = 0x52524142ULL;
+        if (rank == 0U) {
+            t->receive(std::as_writable_bytes(std::span(&w, 1)));
+            t->send(std::as_bytes(std::span(&w, 1)));
+        } else {
+            t->send(std::as_bytes(std::span(&w, 1)));
+            t->receive(std::as_writable_bytes(std::span(&w, 1)));
+        }
+    };
+    // The seam copies run on the stream of the stage that produces (save, after its range) or consumes (load, before its
+    // range) the rows: prefill(map) calls seam(load) for step k before range(k), so `step` indexes the pipes' order.
+    Owned* cur = &own.front();
+    strix::pair::StagePipes* pipes_now = nullptr;
+    std::size_t step = 0;
+    std::vector<float> head_logits;
+    layers::StageOps ops;
+    ops.row_bytes = row_bytes;
+    ops.range = [&](std::span<const std::uint32_t> tok, const layers::Window& w, std::uint32_t a, std::uint32_t b, bool head) {
+        auto& st = by_range(a, b);
+        cur = &st;
+        const auto r0 = clock::now();
+        const auto& l = st.fwd->prefill_window(tok, w.start, head);
+        if (head) head_logits = l;
+        st.ms += ms_since(r0);
+        ++step;
+    };
+    ops.seam = [&](strix::pair::PipeFrame& f, bool save, std::size_t bytes) {
+        if (!save) cur = &by_stage(pipes_now->order().at(step).stage);
+        f.staging->copy(save, 0, cur->fwd->seam_rows(), bytes);
+    };
+    ops.fence = [&] { cur->fwd->sync(); };
+    std::uint32_t first_token = 0;
+    std::uint64_t digest0 = 0;
+    const bool head_rank = rank == map.owner(map.stages() - 1U);
+    for (std::uint32_t pass = 0; pass < repeat; ++pass) {
+        for (auto& w : own) {
+            if (pass != 0U) w.fwd->reset();
+            w.fwd->sync();
+            w.ms = 0;
+        }
+        barrier();  // before the pipes: their progress threads read the same transport
+        strix::pair::LinkMux mux([t](std::span<const std::byte> d) { t->send(d); }, [t](std::span<std::byte> d) { t->receive(d); },
+                                 [t](const std::string& why) { t->abort(why); }, 2U, std::size_t{16} << 20U);
+        const auto channel = [&mux](std::uint32_t ch) {
+            return strix::pair::PipeLink{[&mux, ch](std::span<const std::byte> d) { mux.send(ch, d); },
+                                         [&mux, ch](std::span<std::byte> d) { mux.receive(ch, d); },
+                                         [&mux] { mux.abort("hy4 stage pipe stopped"); }};
+        };
+        strix::pair::PipeOptions po;
+        po.validate = layers::stage_validator(identity, map, W, row_bytes);
+        po.profile_label = "hy4-stage-profile";
+        auto pipes = std::make_unique<strix::pair::StagePipes>(
+            rank, map, chunks, channel(0U), channel(1U), std::move(po), [&cur, W, row_bytes] {
+                return strix::pair::make_hip_pipe_staging(std::size_t{W} * row_bytes,
+                                                          [&cur] { return static_cast<hipStream_t>(cur->fwd->stream_handle()); });
+            });
+        pipes_now = pipes.get();
+        step = 0;
+        const auto t0 = clock::now();
+        const auto st = layers::prefill(map, rank, prompt, W, identity, *pipes, ops);
+        for (auto& w : own) w.fwd->sync();
+        const double wall = ms_since(t0);
+        pipes.reset();
+        pipes_now = nullptr;
+        mux.close();
+        const std::uint64_t digest = head_rank ? fnv(head_logits) : 0U;
+        if (pass == 0U) digest0 = digest;
+        double busy = 0;
+        for (const auto& w : own) busy += w.ms;
+        std::cout << "prefill tokens=" << prompt.size() << " rows=" << W << " map " << map.text() << " rank " << rank << " run "
+                  << pass << " (" << (pass == 0U ? "cold" : "warm") << ") ms=" << std::setprecision(1) << wall << " tok_s="
+                  << 1000.0 * static_cast<double>(prompt.size()) / wall << " seam_wait_ms=" << st.wait_ms << " seal_ms="
+                  << st.seal_ms << " busy_ms=" << busy << " windows=" << chunks
+                  << (pass != 0U && digest != digest0 ? " REPEAT_DIGEST_DIFFERS" : "") << "\n";
+        std::cout << "stage ms per window:";
+        for (const auto& w : own)
+            std::cout << ' ' << w.stage << ":[" << w.first << ',' << w.last << ")=" << w.ms / static_cast<double>(chunks);
+        std::cout << "\n";
+        if (head_rank) {
+            first_token = greedy(head_logits);
+            print_top(prompt.size() - 1U, prompt.back(), head_logits, 5U);
+            std::cout << "hy4 prefill run " << pass << ": " << prompt.size() << " tokens wall " << std::setprecision(1) << wall
+                      << " ms logits_fnv64 " << std::hex << std::setw(16) << std::setfill('0') << digest << std::dec << std::setfill(' ')
+                      << "\n" << std::flush;
+            std::cerr << "prefill-wall-ms=" << wall << "\n";
+        }
+    }
+    // Greedy decode over the same map on the raw link: the row visits the 2v stages, the head rank relays the token.
+    std::vector<float> state(row_bytes / sizeof(float));
+    std::uint32_t next = 0;
+    layers::DecodeOps d;
+    d.row_bytes = row_bytes;
+    d.range = [&](std::uint32_t tok, std::uint32_t a, std::uint32_t b, bool head) {
+        auto& st = by_range(a, b);
+        if (head) next = st.fwd->step_greedy(tok, state);
+        else (void)st.fwd->step(tok, state);
+    };
+    d.top = [&] { return next; };
+    d.export_row = [&](std::span<std::byte> b) { std::memcpy(b.data(), state.data(), row_bytes); };
+    d.import_row = [&](std::span<const std::byte> b) {
+        state.resize(row_bytes / sizeof(float));
+        std::memcpy(state.data(), b.data(), row_bytes);
+    };
+    layers::Link lk;
+    lk.send = [t](std::span<const std::byte> b) { t->send(b); };
+    lk.receive = [t](std::span<std::byte> b) { t->receive(b); };
+    barrier();
+    const auto dec = layers::decode(map, rank, first_token, gen, lk, d);
+    std::cout << "ids";
+    for (const auto id : dec.ids) std::cout << ' ' << id;
+    const double steps = gen > 1U ? static_cast<double>(gen - 1U) : 0.0;
+    std::cout << "\ntime gen_ms=" << std::setprecision(1) << dec.total_ms << " decode_tok_s=" << std::setprecision(2)
+              << (dec.total_ms > 0 ? 1000.0 * steps / dec.total_ms : 0.0) << " rank " << rank << "\n";
+    return 0;
+}
+
 int run(int argc, char** argv) {
     const auto kept = strix::pair::strip_flags(argc, argv, "HY4", false);  // --rank / --peer / --transport -> HY4_*
     (void)kept;
@@ -274,6 +565,18 @@ int run(int argc, char** argv) {
     std::uint32_t gen = 0, top = 5, cut = 0, repeat = 1;
     std::uint16_t port = 29755;
     bool timing = false, rows_explicit = false, pipe_guess = false;
+    std::string stage_map;  // --stage-map CUTS: interleaved virtual stages of the pair (run_pair_stages)
+    // Exact tensor-parallel decode over 2 whole-model ranks (Forward::enable_tp; the shared gather link and planner, as the
+    // Qwen dense TP binding): --tp-rank 0|1 [--tp-transport usb4auto|tcp-listen:PORT|tcp-connect:HOST:PORT]
+    // --tp-rates GB/s,GB/s [--tp-trip-us U] [--tp-force]. Each rank loads the whole pack and prefills alone; the decode
+    // steps run on both ranks with this rank's shares; the plan refuses the pair when it does not win (unless forced).
+    int tp_rank = -1;
+    std::string tp_spec = "usb4auto";
+    std::vector<double> tp_rates;
+    double tp_trip_us = 0.0;
+    bool tp_force = false;
+    GateRef gref;           // --gate-ref (long BASE reference in pieces)
+    bool head_explicit = false;
     std::string dump_path;  // --dump-logits F: every host logits row (FP32, vocab floats per step) appended to F
     std::vector<strix::hy4::hipbind::PairWindowCost> window_costs;  // --window-costs ROWS:MS,... (pair calibration)
     // The tier word (--profile default|fast|quality, --allow-pending) through the shared resolver; the lever options
@@ -281,9 +584,6 @@ int run(int argc, char** argv) {
     std::vector<std::string> args(argv + 1, argv + argc);
     strix::profile::Inputs inputs;
     strix::profile::take_options(strix::hy4::profile::engine(), args, inputs);
-    auto profile = strix::profile::resolve(strix::hy4::profile::engine(), inputs);
-    for (const auto& e : profile.entries)
-        if (strix::profile::applied(e.status) && e.lever->name == "prompt_rows") o.prompt_rows = static_cast<std::uint32_t>(std::stoul(e.value));
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
         const bool more = i + 1 < args.size();
@@ -295,11 +595,34 @@ int run(int argc, char** argv) {
         else if (a == "--top" && more) top = static_cast<std::uint32_t>(std::stoul(args[++i]));
         else if (a == "--prompt-rows" && more) o.prompt_rows = static_cast<std::uint32_t>(std::stoul(args[++i])), rows_explicit = true;
         else if (a == "--timing") timing = true;
+        else if (a == "--gate-ref") gref.on = true;
+        else if (a == "--head-q8" && more) o.head_q8 = args[++i] == "1", head_explicit = true;
+        else if (a == "--verify-rows" && more) o.verify_rows = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        else if (a == "--state-in" && more) gref.state_in = args[++i];
+        else if (a == "--state-out" && more) gref.state_out = args[++i];
+        else if (a == "--until" && more) gref.until = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        else if (a == "--budget" && more) gref.budget_s = std::stod(args[++i]);
+        else if (a == "--score" && more) gref.score.push_back(parse_range(args[++i]));
+        else if (a == "--save-at" && more) {
+            const std::string v = args[++i];
+            const auto colon = v.find(':');
+            if (colon == std::string::npos) throw std::invalid_argument("--save-at P:FILE");
+            gref.save_at.emplace_back(static_cast<std::uint32_t>(std::stoul(v.substr(0, colon))), v.substr(colon + 1));
+        }
         else if (a == "--dump-logits" && more) dump_path = args[++i];
         else if (a == "--window-costs" && more) window_costs = parse_window_costs(args[++i]);
         else if (a == "--cut" && more) cut = static_cast<std::uint32_t>(std::stoul(args[++i]));
+        else if (a == "--stage-map" && more) stage_map = args[++i];
         else if (a == "--repeat" && more) repeat = static_cast<std::uint32_t>(std::stoul(args[++i]));
         else if (a == "--port" && more) port = static_cast<std::uint16_t>(std::stoul(args[++i]));
+        else if (a == "--tp-rank" && more) tp_rank = static_cast<int>(std::stoul(args[++i]));
+        else if (a == "--tp-transport" && more) tp_spec = args[++i];
+        else if (a == "--tp-trip-us" && more) tp_trip_us = std::stod(args[++i]);
+        else if (a == "--tp-force") tp_force = true;
+        else if (a == "--tp-rates" && more) {
+            std::stringstream ss(args[++i]);
+            for (std::string v; std::getline(ss, v, ',');) tp_rates.push_back(std::stod(v));
+        }
         else if (a == "--pipe-guess" && more) {
             const std::string v = args[++i];
             if (v != "copy" && v != "off") throw std::invalid_argument("--pipe-guess copy|off");
@@ -309,18 +632,61 @@ int run(int argc, char** argv) {
         else throw std::invalid_argument("unknown argument " + a);
     }
     // A pair width picked from --window-costs is a prompt_rows setting like --prompt-rows: the resolver stamps it.
+    // On the interleaved pair route (no two-stage option) the shared planner picks the width from the prompt
+    // length and the measured pair cost (hy4_hip_plan.hpp pair_stage_plan); the width changes no bit. The pair always runs
+    // in windows, so the pick does not wait for a profile width: a profile whose prompt_rows lever is pending leaves 0 here.
+    const bool stage_route = stage_map.empty() && cut == 0U && !pipe_guess && window_costs.empty();
     if (std::getenv("HY4_RANK") != nullptr && !rows_explicit) {
-        if (const std::uint32_t picked = strix::hy4::hipbind::pair_window_rows(prompt.size(), window_costs); picked != 0U) {
+        std::uint32_t picked = strix::hy4::hipbind::pair_window_rows(prompt.size(), window_costs);
+        if (picked == 0U && stage_route && !o.parts.empty() && !prompt.empty()) {
+            const std::uint32_t depth = o.depth != 0U ? o.depth : strix::hy4::Config::from_gguf(o.parts.front()).layers;
+            picked = strix::hy4::hipbind::pair_stage_plan(prompt.size(), depth).choice.chunk;
+        }
+        if (picked != 0U && picked != o.prompt_rows) {
+            o.prompt_rows = picked;
             inputs.cli.emplace_back("prompt_rows", std::to_string(picked));
-            profile = strix::profile::resolve(strix::hy4::profile::engine(), inputs);
         }
     }
-    std::cout << profile.describe() << std::flush;
+    // The regime (device, topology, this prompt's length) selects the qualified FAST cells (strix/profiles/hy4.hpp).
+    namespace hp = strix::hy4::profile;
+    hp::Regime regime;
+    regime.topology = std::getenv("HY4_RANK") != nullptr ? hp::Topology::pair : hp::Topology::one_node;
+    regime.prompt_tokens = prompt.size();
+    {
+        int dev = 0;
+        hipDeviceProp_t prop{};
+        if (hipGetDevice(&dev) == hipSuccess && hipGetDeviceProperties(&prop, dev) == hipSuccess) regime.device = hp::device_of(prop.gcnArchName);
+    }
+    const auto resolved = hp::resolve(regime, inputs);
+    const auto& profile = resolved->resolution;
+    if (const auto* e = resolved->find("prompt_rows"); e != nullptr && !rows_explicit && strix::profile::applied(e->status))
+        o.prompt_rows = static_cast<std::uint32_t>(std::stoul(e->value));
+    if (const auto* e = resolved->find("head_q8"); e != nullptr && !head_explicit && strix::profile::applied(e->status)) o.head_q8 = e->value == "1";
+    strix::profile::apply(profile);  // environment levers the profile sets (pf_mha), before any forward reads them
+    std::cout << profile.describe() << "regime " << hp::device_name(regime.device) << " / " << hp::topology_name(regime.topology)
+              << " / prompt " << regime.prompt_tokens << "\n" << std::flush;
     for (const auto& n : profile.notices()) std::cerr << n << '\n';
+    for (const auto& e : profile.entries)
+        if (!e.reason.empty()) std::cerr << e.lever->name << ": " << e.reason << '\n';
     if (o.parts.empty() || prompt.empty())
         throw std::invalid_argument("usage: strix-hy4-rank PART1.gguf [PART2.gguf] --ids-file F [--gen N] [--teacher F] [--layers D] "
                                     "[--context C] [--top K] [--timing] [--prompt-rows R] [--dump-logits F] [--profile default|fast] "
-                                    "[--rank 0|1 --cut K --repeat K --port P --pipe-guess copy|off --window-costs ROWS:MS,...]");
+                                    "[--rank 0|1 --cut K | --stage-map C0,C1,..,L|off --repeat K --port P --pipe-guess copy|off --window-costs ROWS:MS,...]");
+    // Pair default: the shared interleaved stage map with v from the shared planner at this width (strix/pair/stage_map.hpp
+    // plan_stages over the measured pair cost; bitwise equal to the two-stage cut, measured faster); --stage-map off, --cut,
+    // --pipe-guess or --window-costs keep the two-stage route.
+    if (std::getenv("HY4_RANK") != nullptr && stage_route && o.prompt_rows != 0U) {
+        const std::uint32_t depth = o.depth != 0U ? o.depth : strix::hy4::Config::from_gguf(o.parts.front()).layers;
+        const auto plan = strix::hy4::hipbind::pair_stage_plan(prompt.size(), depth, o.prompt_rows);
+        std::cout << "pair plan rows " << o.prompt_rows << " map " << plan.map.text() << " (" << plan.choice.reason << ")\n";
+        if (plan.map.virtual_stages() > 1U) stage_map = plan.map.text();
+    }
+    if (stage_map == "off") stage_map.clear();
+    if (std::getenv("HY4_RANK") != nullptr && !stage_map.empty()) {
+        if (cut != 0U || pipe_guess || !window_costs.empty())
+            throw std::invalid_argument("--stage-map replaces --cut; --pipe-guess and --window-costs are two-stage options");
+        return run_pair_stages(o, prompt, gen, stage_map, std::max(repeat, 1U), port);
+    }
     if (std::getenv("HY4_RANK") != nullptr)
         return run_pair(o, prompt, gen, cut, std::max(repeat, 1U), port, rows_explicit, pipe_guess, window_costs);
     using clock = std::chrono::steady_clock;
@@ -334,6 +700,19 @@ int run(int argc, char** argv) {
               << static_cast<double>(lr.bytes) / 1073741824.0 << " s=" << std::setprecision(2) << lr.seconds << " GiB/s="
               << (lr.seconds > 0 ? static_cast<double>(lr.bytes) / 1073741824.0 / lr.seconds : 0.0) << "\n"
               << lr.queue_line << std::flush;
+    if (gref.on) return run_gate_ref(fwd, prompt, o.verify_rows, gref, dump_path);
+    std::unique_ptr<strix::xport::tp_gather::HipPairGather> tpg;
+    if (tp_rank >= 0) {  // after the load: the peer may load slower; open_pair waits up to its timeout
+        if (tp_rank > 1 || o.prompt_rows == 0U || tp_rates.size() != 2U)
+            throw std::invalid_argument("--tp-rank 0|1 needs --prompt-rows (each rank prefills alone) and --tp-rates A,B (GB/s)");
+        auto opened = strix::dist::open_pair(tp_spec, static_cast<std::uint32_t>(tp_rank));
+        if (!opened.receipt.empty()) std::cout << "tp transport: " << opened.receipt << "\n";
+        // largest gather: half the logits row (vocab / 2 FP32); the link probe sizes fit in 1 MiB
+        // route: the shared policy (pair::select_route); the device-waited channel unless STRIX_TP_CHANNEL=0 (staged)
+        tpg = std::make_unique<strix::xport::tp_gather::HipPairGather>(std::move(opened), static_cast<std::uint32_t>(tp_rank), 1U << 20,
+                                                                       static_cast<hipStream_t>(fwd.stream_handle()),
+                                                                       strix::envcfg::flag("STRIX_TP_CHANNEL", true));
+    }
     std::ofstream dump;
     if (!dump_path.empty()) {
         dump.open(dump_path, std::ios::binary | std::ios::trunc);
@@ -369,8 +748,50 @@ int run(int argc, char** argv) {
                   << t.total << "]\n";
         p0 = prompt.size() - 1U;
     }
+    // tp placement, decided once from measurements: both ranks first run kTpCalib decode-form steps one node (each holds
+    // the whole pack, so the ids are the split form's ids), the smaller of the last two is this rank's one-node pass,
+    // agreed max over the ranks; the planner prices the stage model's residual as fixed work on every rank
+    // (split::with_measured_single), the trip comes from the start-up probe of the route the decode runs. One node wins ->
+    // both ranks keep decoding one node (the same ids); --tp-force runs the split anyway.
+    constexpr std::size_t kTpCalib = 3U;
+    std::vector<double> tp_calib_ms;
+    bool tp_placed = !tpg, tp_on = false;
+    double tp_ms = 0.0;
+    std::size_t tp_steps = 0;
+    const auto tp_place = [&] {
+        namespace psp = strix::pair::split;
+        auto stages = strix::hy4::tp::decode_stages(c, [&](const std::string& n) { return fwd.tensor_bytes(n); });
+        std::vector<double> bpms;
+        for (const double g : tp_rates) bpms.push_back(g * 1e6);  // GB/s -> bytes/ms
+        const auto n = tp_calib_ms.size();
+        const double one_ms = tpg->agree_max(std::min(tp_calib_ms[n - 1U], tp_calib_ms[n - 2U]));
+        const auto cal = psp::with_measured_single(stages, psp::Pass{}, *std::min_element(bpms.begin(), bpms.end()), one_ms);
+        // trip cost measured now over the gather form the decode runs, agreed by both ranks (identical bits)
+        const auto lc = tpg->measure_link();
+        const auto trip = strix::pair::tp::trip_cost(lc, tp_trip_us);
+        const auto plan = psp::plan(stages, psp::Pass{}, psp::Costs{bpms, trip, 0.0, false});
+        const bool wins = plan.tensor.admissible && plan.tensor.ms < plan.single.ms;
+        std::cout << "tp calibration: one node pass " << std::setprecision(1) << one_ms << " ms measured (" << kTpCalib
+                  << " one-node steps, agreed max), stage model " << cal.model_ms << " ms, fixed residual " << cal.fixed_ms << " ms\n"
+                  << "tp link cost: " << lc.describe() << "; trip " << trip.latency_ms * 1000.0 << " us"
+                  << (tp_trip_us > 0.0 ? " (--tp-trip-us)" : " (measured)") << ", " << strix::pair::gather_route_name(tpg->link().route())
+                  << "\ntp placement: one rank " << plan.single.ms << " ms/pass, 2 ranks " << plan.tensor.ms << " ms/pass (compute "
+                  << plan.tensor.compute_ms << " + " << plan.tensor.trips << " trips " << plan.tensor.link_ms << ") -> "
+                  << (wins ? "decode on all ranks" : tp_force ? "group loses, forced" : "decode stays on one node (both ranks)") << "\n";
+        if (!wins && !tp_force) return;
+        fwd.enable_tp(static_cast<std::uint32_t>(tp_rank), {&tpg->link(), &strix::xport::tp_gather::HipPairGather::Link::fn});
+        if (plan.tensor.trips != fwd.tp_gathers_per_step())
+            throw std::logic_error("tp: planner trips differ from the step's gathers");
+        tpg->link().reset_counters();
+        tp_on = true;
+        std::cout << fwd.tp_receipt() << "\n" << std::flush;
+    };
     for (std::size_t p = p0; p < steps; ++p) {
         if (p < prompt.size()) token = prompt[p];
+        if (!tp_placed && tp_calib_ms.size() >= kTpCalib) {
+            tp_place();
+            tp_placed = true;
+        }
         const auto s0 = clock::now();
         const bool batched = o.prompt_rows != 0U && p + 1U == prompt.size();
         const bool device = top == 0U && !batched;  // --top 0: the shared device greedy row, no logits on the host
@@ -380,6 +801,11 @@ int run(int argc, char** argv) {
         if (dump && !logits.empty())
             dump.write(reinterpret_cast<const char*>(logits.data()), static_cast<std::streamsize>(logits.size() * sizeof(float)));
         (p < prompt.size() ? prompt_ms : gen_ms) += step_ms;
+        if (!tp_placed && !batched) tp_calib_ms.push_back(step_ms);
+        if (tp_on && !batched) {
+            tp_ms += step_ms;
+            ++tp_steps;
+        }
         std::vector<std::uint32_t> order(logits.size());
         std::iota(order.begin(), order.end(), 0U);
         const auto k = std::min<std::size_t>(std::max<std::size_t>(top, 1U), order.size());
@@ -405,12 +831,19 @@ int run(int argc, char** argv) {
             token = g < teacher.size() ? teacher[g] : next;
         }
     }
+    if (tpg) tpg->finish();  // the channel's last gathers are checked before any result is printed
     std::cout << "ids";
     for (const auto id : generated) std::cout << ' ' << id;
     const auto gen_steps = gen > 1U ? gen - 1U : 0U;
     std::cout << "\n" << std::setprecision(1) << "time prompt_ms=" << prompt_ms << " gen_ms=" << gen_ms
               << " total_ms=" << std::chrono::duration<double, std::milli>(clock::now() - t0).count() << " decode_tok_s="
               << std::setprecision(2) << (gen_ms > 0 ? 1000.0 * gen_steps / gen_ms : 0.0) << "\n";
+    if (tpg)
+        std::cout << fwd.tp_receipt() << "\ntp link: " << tpg->link().calls() << " gathers, host time in the exchange "
+                  << std::setprecision(1) << tpg->link().link_ms() << " ms (" << std::setprecision(3)
+                  << (tp_steps > 0 ? tpg->link().link_ms() / static_cast<double>(tp_steps) : 0.0) << " ms/step); split steps "
+                  << tp_steps << " decode_tok_s=" << std::setprecision(2)
+                  << (tp_ms > 0 ? 1000.0 * static_cast<double>(tp_steps) / tp_ms : 0.0) << "\n";
     return 0;
 }
 

@@ -1331,6 +1331,11 @@ public:
         return true;
     }
     [[nodiscard]] std::size_t slots() const noexcept { return slots_.size(); }
+    // The prompt tile T of the slots' tiled prompts (0: no slot) and the model vocabulary: the serve warm-up's plan.
+    [[nodiscard]] std::uint32_t tile_rows() const noexcept {
+        return slots_.empty() || !slots_.front()->parents ? 0U : slots_.front()->parents->tiled.rows;
+    }
+    [[nodiscard]] std::uint64_t vocabulary() const noexcept { return model_.vocab_size; }
     // Queue protection over the prefix store every slot shares (slot 0's session supplies the lookup identity
     // and block rows). Resolved at each call: the automatic cache attaches only after the late fit, and a
     // declined or absent cache makes both calls no-ops. The HTTP owner binds it; default OFF (envcfg lever).
@@ -2717,7 +2722,7 @@ inline void run_mtp_decode_bridge(const Options& options,const ModelContract& mo
             if(const char* v=std::getenv("STRIX_MTP_WIDE_ANCHOR")) context.wide_anchor=static_cast<std::uint32_t>(std::strtoul(v,nullptr,10));
             // =wide: the extension drafts every ordinary cycle; the context drafter only observes and proposes wide.
             if(m.ngram_wide_only) greedy.enable_ngram_draft(prompt,ngram_config());
-            greedy.enable_context_draft(prompt,context,m.ngram_wide_only);
+            greedy.enable_context_draft(prompt,m.ngram_wide_only?mtp_context_observe_config(context):context,m.ngram_wide_only);
         };
         const auto enable_draft_on=[&](HipMtpRuntime& draft_runtime,std::span<const std::uint32_t> prompt,
             const std::shared_ptr<TokenSampler>& draft_sampler) {

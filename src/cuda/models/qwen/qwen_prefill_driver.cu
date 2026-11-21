@@ -66,6 +66,8 @@
 #include <thread>
 #include <vector>
 
+#include "strix/startup_markers.hpp"
+
 namespace strix::cuda::qwen_prefill {
 namespace {
 
@@ -183,6 +185,7 @@ struct SessionState {
     std::uint16_t *mtp_kv = nullptr, *mtp_index = nullptr;  // MTP predictor cache rows
     float* mtp_pooled = nullptr;                // the draft attention's pooled keys over the MTP cache
     std::uint32_t mtp_pooled_valid = 0;
+    std::uint32_t draft_full = 0;  // the previous draft() chain kept its whole depth (DraftSplit context)
     float* gdn_state = nullptr;                 // [36][48*128*128] (current; decode windows swap it with gdn_other)
     float* gdn_other = nullptr;                 // decode: the window's output state (S0 stays in gdn_state)
     float* gdn_base = nullptr;                  // the first GDN state buffer (graph key parity)
@@ -463,10 +466,12 @@ struct Prefill::Impl : BlockFields {
     std::uint64_t* draft_pos = nullptr;         // device [8]
     std::uint64_t* draft_pos_pinned = nullptr;  // [8] + the pending token word after them
     std::uint64_t draft_captures = 0, draft_replays = 0;
-    // Draft chain in two graph segments [0, a) and [a, depth) (rtxmax3, shared chooser strix/mtp_draft_split.hpp): the second
-    // runs only when no draft of the first fell below min_p. STRIX_QRTX_DRAFT_SPLIT: unset/auto, 0 = one segment, N = fixed a.
-    strix::mtp::DraftSplit draft_split{strix::mtp::DraftSplit::mode_from_env("STRIX_QRTX_DRAFT_SPLIT")};
-    std::uint64_t draft_split_runs = 0, draft_second_runs = 0;
+    // Draft chain in graph segments [0, b1) [b1, b2) ... (rtxmax3; shared chooser strix/mtp_draft_split.hpp): a segment runs
+    // only when no draft before it fell below min_p. STRIX_QRTX_DRAFT_SPLIT: unset/auto, 0 = one segment, N = fixed first
+    // segment; STRIX_QRTX_DRAFT_SEGMENTS: segment cap (unset = depth, 2 = the single split).
+    strix::mtp::DraftSplit draft_split{strix::mtp::DraftSplit::mode_from_env("STRIX_QRTX_DRAFT_SPLIT"), 0.25, 8,
+                                       strix::mtp::DraftSplit::segments_from_env("STRIX_QRTX_DRAFT_SEGMENTS")};
+    std::uint64_t draft_split_runs = 0, draft_second_runs = 0, draft_ns = 0;  // draft_ns: host wall of draft() chains
     // batched draft chains (draft_cohort): row j = the j-th chain by descending depth
     std::uint16_t* bd_wide = nullptr;          // [3][8][10240] attention / mlp / source wide rows
     std::uint16_t* bd_fused = nullptr;         // [8][10240] input-fusion rows
@@ -615,7 +620,14 @@ void Prefill::Impl::upload_model() {
     int slot = 0;
     void* scratch = nullptr;  // raw bytes of a tensor that is transcoded on the device
     std::uint64_t scratch_bytes = 0;
+    // Load phase split (host wall time; printed with STRIX_STARTUP_MARKERS=1): header/index, device allocation,
+    // file read (fread), waits for a staging slot (upload or transcode behind), final drain. Timing only.
+    double index_s = 0, alloc_s = 0, read_s = 0, wait_s = 0;
+    std::uint64_t read_bytes = 0;
+    const auto since = [](Clock::time_point from) { return std::chrono::duration<double>(Clock::now() - from).count(); };
+    const auto load_begin = Clock::now();
     for (const auto& part : model_parts(cfg.model_gguf)) {
+    auto mark = Clock::now();
     const auto pinfo = gguf::read_file(part);
     std::shared_ptr<const weight::Source> owner;
     auto admission = weight::open_source(part,owner);
@@ -627,6 +639,7 @@ void Prefill::Impl::upload_model() {
     source_weights.insert(source_weights.end(),admitted.begin(),admitted.end());
     std::FILE* f = std::fopen(part.c_str(), "rb");
     if (!f) throw std::runtime_error("cannot open " + part);
+    index_s += since(mark);
     for (auto t : pinfo.tensors) {
         if (t.name.rfind("per_layer_token_embd", 0) == 0) { ple_part = part; info.tensors.push_back(t); continue; }  // PLE (host)
         if (t.name == "output.weight" && !cfg.decode) { info.tensors.push_back(t); continue; }                  // head (node)
@@ -638,6 +651,7 @@ void Prefill::Impl::upload_model() {
         if (target != Target::native && !transcode::supported(t.ggml_type))
             throw std::runtime_error("no decoder for " + t.name + " type " + std::to_string(t.ggml_type));
         void* raw = nullptr;
+        mark = Clock::now();
         if (target == Target::native) raw = dev_alloc<std::uint8_t>(t.byte_size, t.name.c_str());
         else {
             if (scratch_bytes < t.byte_size) {
@@ -650,11 +664,17 @@ void Prefill::Impl::upload_model() {
             }
             raw = scratch;
         }
+        alloc_s += since(mark);
         _fseeki64(f, static_cast<long long>(t.absolute_offset), SEEK_SET);
         for (std::uint64_t off = 0; off < t.byte_size; off += kChunk) {
             const auto n = std::min(kChunk, t.byte_size - off);
+            mark = Clock::now();
             ck(cudaEventSynchronize(done[slot]), "staging reuse");
+            wait_s += since(mark);
+            mark = Clock::now();
             if (std::fread(staging[slot], 1, static_cast<std::size_t>(n), f) != n) throw std::runtime_error("short read " + t.name);
+            read_s += since(mark);
+            read_bytes += n;
             ck(cudaMemcpyAsync(static_cast<std::uint8_t*>(raw) + off, staging[slot], n, cudaMemcpyHostToDevice, stream), "upload");
             ck(cudaEventRecord(done[slot], stream), "event");
             slot ^= 1;
@@ -682,7 +702,13 @@ void Prefill::Impl::upload_model() {
     }
     std::fclose(f);
     }
+    const auto drain_begin = Clock::now();
     ck(cudaStreamSynchronize(stream), "upload sync");
+    if (startup::enabled())
+        std::fprintf(stderr, "strix-load-phases backend=cuda loader=qwen_upload_model wall_s=%.2f read_s=%.2f read_gb=%.2f "
+                     "read_gbps=%.2f wait_s=%.2f alloc_s=%.2f index_s=%.2f drain_s=%.2f\n", since(load_begin), read_s,
+                     static_cast<double>(read_bytes) / 1e9, read_s > 0 ? static_cast<double>(read_bytes) / 1e9 / read_s : 0.0,
+                     wait_s, alloc_s, index_s, since(drain_begin));
     if (scratch) cudaFree(scratch);
     cudaFreeHost(staging[0]);
     cudaFreeHost(staging[1]);
@@ -1393,14 +1419,15 @@ Prefill::Prefill(const Config& config) : impl_(std::make_unique<Impl>()) {
         ck(cudaMemcpy(m.rope, cs.data(), cs.size() * sizeof(qsa::RopeTable), cudaMemcpyHostToDevice), "rope upload");
     }
     const auto t0 = Clock::now();
-    m.upload_model();
+    { startup::Phase phase("qwen_upload_model"); m.upload_model(); }
     if (m.native_experts) qwen_route::require_composition(m.route_policy.enabled,
         qwen_route::Composition::other_weight_pack);
-    m.upload_ple();
-    m.upload_mtp();
-    m.allocate();
-    m.upload_draft();
-    m.new_session(config.session_positions ? config.session_positions : config.max_positions);  // session 0: the single-session API
+    { startup::Phase phase("qwen_upload_ple"); m.upload_ple(); }
+    { startup::Phase phase("qwen_upload_mtp"); m.upload_mtp(); }
+    { startup::Phase phase("qwen_allocate"); m.allocate(); }
+    { startup::Phase phase("qwen_upload_draft"); m.upload_draft(); }
+    { startup::Phase phase("qwen_session");
+      m.new_session(config.session_positions ? config.session_positions : config.max_positions); }  // session 0: the single-session API
     if (m.cfg.block_fit) m.allocate_fitted_block();  // last: the block capacity takes what the fixed buffers left
     {
         const char* v = std::getenv("STRIX_QRTX_GRAPHS");
@@ -1759,6 +1786,8 @@ void Prefill::Impl::run_block(const Segment* seg, std::uint32_t count, std::uint
         moe::Weights ew;
         ew.arithmetic = expert_arithmetic_for(cfg, window, moe_rows);  // per regime (TURBO: int8 on large prefill blocks)
         ew.decode_tile = cfg.expert_decode_tile;
+        ew.wide_tile = cfg.expert_wide_tile;
+        ew.wide_min_avg = cfg.expert_wide_min_rows;
         ew.gate_type = lw[l].gate_type;
         ew.down_type = lw[l].down_type;
         ew.gate = static_cast<const std::uint8_t*>(lw[l].p[k_ffn_gate_exps_weight]);
@@ -2850,6 +2879,17 @@ GraphCounters Prefill::graph_counters() const {
 
 std::uint32_t Prefill::max_positions() const { return impl_->cfg.max_positions; }
 
+std::string Prefill::draft_stats() const {
+    const auto& m = *impl_;
+    const auto& t = m.draft_split.tally();
+    std::string s = "{\"chains\":" + std::to_string(t.chains) + ",\"launched\":" + std::to_string(t.launched) + ",\"kept\":" +
+        std::to_string(t.kept) + ",\"second\":" + std::to_string(t.turns) + ",\"split\":" + std::to_string(m.draft_split_runs) +
+        ",\"ms\":" + std::to_string(static_cast<double>(m.draft_ns) * 1e-6) + ",\"captures\":" + std::to_string(m.draft_captures) +
+        ",\"replays\":" + std::to_string(m.draft_replays) + ",\"hist\":[";
+    for (std::uint32_t n = 0; n < strix::mtp::DraftSplit::kBins; ++n) s += (n ? "," : "") + std::to_string(m.draft_split.kept(n));
+    return s + "]}";
+}
+
 std::string Prefill::graph_stats() const {
     const auto& m = *impl_;
     char buf[256];
@@ -3136,6 +3176,7 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
     depth = static_cast<std::uint32_t>(std::min<std::uint64_t>(depth, room));
     Draft out;
     if (depth == 0) return out;
+    const auto t_chain = std::chrono::steady_clock::now();
     const auto mw = [&](const char* n) { return m.mw.get(std::string("blk.48.") + n); };
     const auto mwf = [&](const char* n) { return static_cast<const float*>(mw(n)); };
     const auto mwts = m.mtp_weights();
@@ -3157,11 +3198,14 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
     // from device memory (the eager chain runs once per key first; any position, pooled state or token replays it).
     qsa::MultiShape dshape{};
     const std::uint32_t one_row = 1;
-    const std::uint32_t first_segment = per_step_sync ? depth : m.draft_split.first_segment(depth);
-    if (first_segment < depth) ++m.draft_split_runs;
+    const std::vector<std::uint32_t> ends = per_step_sync ? std::vector<std::uint32_t>{depth} : m.draft_split.segment_ends(depth, S.draft_full);
+    if (ends.size() > 1) ++m.draft_split_runs;
     bool stopped = false;
-    for (std::uint32_t k0 = 0, k1 = first_segment; k0 < depth && !stopped; k0 = k1, k1 = depth) {
-    if (k0 > 0) ++m.draft_second_runs;
+    std::uint32_t launched = 0, turns = 0;  // steps launched / segments after the first that ran (receipt tally)
+    for (std::size_t seg = 0; seg < ends.size() && !stopped; ++seg) {
+    const std::uint32_t k0 = seg ? ends[seg - 1] : 0U, k1 = ends[seg];
+    if (k0 > 0) ++m.draft_second_runs, ++turns;
+    launched += k1 - k0;
     source = k0 ? wide_src : S.held;  // segment 2 continues from the chain's wide state and m.draft_token on the device
     const Impl::DraftKey dkey{reinterpret_cast<std::uintptr_t>(S.held), reinterpret_cast<std::uintptr_t>(S.mtp_kv),
                               reinterpret_cast<std::uintptr_t>(S.mtp_index), reinterpret_cast<std::uintptr_t>(S.mtp_pooled),
@@ -3313,7 +3357,10 @@ Draft Prefill::draft(SessionId session, std::uint32_t pending, std::uint32_t dep
         }
     }
     }  // segments
-    if (!per_step_sync) m.draft_split.note(static_cast<std::uint32_t>(out.tokens.size()));
+    if (!per_step_sync) m.draft_split.note(static_cast<std::uint32_t>(out.tokens.size()), launched, turns, S.draft_full);
+    S.draft_full = out.tokens.size() == depth ? 1U : 0U;
+    m.draft_ns += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_chain).count());
     return out;
 }
 

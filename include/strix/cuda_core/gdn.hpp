@@ -41,7 +41,11 @@ struct GdnWindow {
 // beta = sigmoid(b); g = ssm_a * softplus(a + dt_bias) (softplus: x > 20 -> x, else log1p(exp(x))); S *= exp(g);
 // d = (v - S^T k) * beta; S += k (x) d; o = S^T q (k ascending, per v column sequential). out: [rows][value_width].
 cudaError_t gdn_window(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,
-                       float* out, std::uint32_t rows, float eps, const std::uint32_t* parity_dev, cudaStream_t stream);
+                       float* out, std::uint32_t rows, float eps, const std::uint32_t* parity_dev, cudaStream_t stream,
+                       const std::uint32_t* leaf_dev = nullptr);
+// leaf_dev (token-tree window, strix/spec/tree_window.hpp): device u32 mask; a row whose bit is set gets the output a linear
+// window of its path gives (conv over the current taps, delta rule from the current S, same operations) and advances neither
+// the taps nor S, so the next row continues from its parent (the last non-leaf row). nullptr = the linear kernels, unchanged.
 
 constexpr std::uint32_t kMaxGdnLayers = 64;
 struct GdnCommitLayer {
@@ -54,6 +58,12 @@ struct GdnCommitLayer {
 // committed side into the shadow side (same arithmetic as the window forward, no output), then flips. k == 0 is a no-op.
 cudaError_t gdn_commit(const GdnDims& d, const GdnCommitLayer* layers, std::uint32_t n, std::uint32_t window_rows,
                        std::uint32_t k, std::uint32_t* parity_dev, cudaStream_t stream);
+// Token-tree commit (strix/spec/tree_window.hpp PathCommit): accepts the rows of [0, end) of the last window except `skip`
+// (leaves not on the path; the row end - 1 is never skipped). replay = re-apply those rows to the committed side first (false
+// only when they are exactly the rows the window applied: every non-leaf row); conv taps = the last three accepted rows; flip.
+// gdn_commit(k) == gdn_commit_path(end = k, skip = 0, replay = k < window_rows).
+cudaError_t gdn_commit_path(const GdnDims& d, const GdnCommitLayer* layers, std::uint32_t n, std::uint32_t window_rows,
+                            std::uint32_t end, std::uint32_t skip, bool replay, std::uint32_t* parity_dev, cudaStream_t stream);
 
 // ---- Multi-session decode: several sessions (state slots) in one batch. A GROUP is a run of consecutive rows of ONE state slot
 // (a decode lane carries 1 row, a verify window several). Device tables [groups]: row0 (first row of the group in the batch buffers),
@@ -87,10 +97,12 @@ cudaError_t gdn_prefill_flip(std::uint32_t* parity_dev, cudaStream_t stream);
 // carry the identity suffix. ws = device workspace of >= gdn_chunk_workspace_floats(d, rows) floats; ws == nullptr = serial kernel.
 // defer_norm (chunked path only): the gated RMSNorm (third kernel) is NOT applied; `out` keeps the raw delta-rule output and the caller
 // owns the norm: gdn_chunk_norm, or a consumer that folds the same arithmetic (FAST4 gated_norm_quantize_enqueue, bitwise equal).
+// scan: the K2 trait of the chunk family (gdn_chunk.hpp Scan): 0 = f32 (gdn-chunk16-f32-v1), 1 = tf32 (gdn-chunk16-tf32-v1).
 struct GdnChunkWork {
     float* ws = nullptr;
     std::size_t floats = 0;
     bool defer_norm = false;
+    std::uint8_t scan = 0;
 };
 [[nodiscard]] std::size_t gdn_chunk_workspace_floats(const GdnDims& d, std::uint32_t rows);
 cudaError_t gdn_prefill_layer(const GdnDims& d, const GdnLayer& layer, const GdnState& state, const GdnWindow& win, const float* z,

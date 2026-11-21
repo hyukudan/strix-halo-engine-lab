@@ -72,4 +72,20 @@ MtpSelectionPrefix walk_mtp_selection(std::span<const std::uint32_t> proposals,
     std::size_t row_limit, std::size_t output_limit, std::span<const std::uint32_t> eos_ids,
     const std::function<std::uint32_t(std::size_t)>& select_row);
 
+// Device-greedy engines (the host receives each verified row's argmax only; a non-finite row fails the window before
+// selection, so every row is finite): the window's selected prefix under a selection transaction. Window row r takes
+// the input row r (row 0 = the pending token, row r > 0 = drafts[r - 1]) and replies argmax[r]. Rows are decided from
+// row 0 by select_known(argmax[r], 0) until a selected token differs from the next input row, or the last row. The
+// engine then commits ids.size() rows, emits ids, feeds ids.back() as its next input and publishes the receipt after
+// its commit. When the policy forces nothing this is the greedy rule (ids = argmax[0, 1 + accepted drafts)); a forced
+// token (a thinking-budget closure) ends the prefix at its row unless it equals that row's draft. Stops and output
+// limits stay the engine's (no eos or output limit here). Throws MtpSelectionError (transaction discarded) when a row
+// needs host logits: such a policy is not decidable from argmax replies and must be refused at admission.
+struct GreedyWindowSelection {
+    std::vector<std::uint32_t> ids;
+    std::unique_ptr<MtpSelectionReceipt> receipt;
+};
+[[nodiscard]] GreedyWindowSelection select_greedy_window(MtpSelectionTransaction& transaction,
+    std::span<const std::uint32_t> drafts, std::span<const std::uint32_t> argmax);
+
 }  // namespace strix

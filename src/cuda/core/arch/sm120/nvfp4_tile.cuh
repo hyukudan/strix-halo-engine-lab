@@ -1,12 +1,14 @@
 #pragma once
 // sm_120 kernels of the NVFP4 tile GEMM (contract, layouts and identity: strix/cuda/core/nvfp4_tile.hpp).
 //
-// Tile: CTA = 128 weight rows (A, mma m) x 256 activation rows (B, mma n), K 128 per stage, 3-stage cp.async ring, 8 warps as
+// Tile: CTA = 128 weight rows (A, mma m) x 256 activation rows (B, mma n), K 128 per stage, 3-stage ring fed by cp.async
+// (gemm_kernel<Feed::lsu>) or by bulk copies from a producer warpgroup (gemm_kernel<Feed::bulk>), 8 MMA warps as
 // 2 (weight) x 4 (rows), warp tile 64 x 64 = 4 x 8 m16n8k64 MMAs per 64-input block, 128 FP32 accumulators per thread.
 // Work per MAC: smem->register 0.021 B (LDS.128 A fragment + LDS.64 B fragment + one u32 scale each), L2->smem 0.0066 B
 // ((1/128 + 1/256) x 0.5625 B), so the kernel stays under both data pipes at the FP4 tensor rate (2,048 MAC/clk/SM).
 // Rasterisation: activation tiles vary fastest, so co-resident CTAs share one weight tile and each weight is read from DRAM about
 // once per call; the 256-row activation tiles (<= 12 MB per 4K x 5120 input) stay in L2.
+#include <cuda_bf16.h>
 #include <cuda_fp4.h>
 #include <cuda_fp8.h>
 
@@ -42,14 +44,71 @@ __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_grou
 template <int N>
 __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N)); }
 
-__global__ void __launch_bounds__(kThreads, 1) gemm_kernel(const GemmArgs a) {
+// ---- Feed::bulk (strix/cuda/core/nvfp4_tile.hpp). Warp kMmaWarps is the producer: it copies each record of a stage with ONE 1-D
+// bulk copy (TMA engine, async proxy) into a full / empty mbarrier ring, so no copy instruction enters the MMA warps' MIO queue
+// (a profile of the dense FAST4 prefill: 7 LDGSTS per thread per stage queued ahead of the kb0 fragments; moving them into
+// the MMA window lost 4-7 %).
+// The eight MMA warps wait for a stage and release it per warp: no CTA-wide barrier per stage. The records already sit in MMA
+// fragment order, so there is no tensor map, swizzle or ldmatrix. Same stage bytes at the same shared offsets (stage_record ==
+// the chunks of stage_chunk, tile_host), the same stage MMA and epilogue text: bitwise equal to Feed::lsu.
+// Registers are split per SM sub-partition (warp w runs on SMSP w % 4, 16 K registers each). One extra warp would put three warps
+// on SMSP 0 and cap EVERY thread at 168 registers (the MMA warps then spill around the epilogue's calls: SASS of the 9-warp form).
+// So the producer is a whole warpgroup (warps 8-11, one per SMSP) that gives its registers back (setmaxnreg 40) to the MMA
+// warpgroups (232): per SMSP 2 x 232 + 40 = 504 x 32 <= 16,384. Only warp 8 copies; warps 9-11 leave after the hand-over.
+constexpr std::uint32_t kMmaWarps = kThreads / 32, kBulkThreads = kThreads + 128, kProducerRegs = 40, kMmaRegs = 232;
+static_assert(2 * kMmaRegs + kProducerRegs <= 16384 / 32, "per-SMSP register file");
+__device__ __forceinline__ void mbar_init(std::uint32_t bar, std::uint32_t count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(bar), "r"(count) : "memory");
+}
+__device__ __forceinline__ void mbar_wait(std::uint32_t bar, std::uint32_t parity) {
+    asm volatile(
+        "{\n"
+        ".reg .pred p;\n"
+        "WAIT:\n"
+        "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
+        "@!p bra WAIT;\n"
+        "}" ::"r"(bar),
+        "r"(parity)
+        : "memory");
+}
+__device__ __forceinline__ void mbar_arrive(std::uint32_t bar) {
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(bar) : "memory");
+}
+__device__ __forceinline__ void mbar_expect_tx(std::uint32_t bar, std::uint32_t bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(bar), "r"(bytes) : "memory");
+}
+__device__ __forceinline__ void bulk_copy(std::uint32_t dst, const void* src, std::uint32_t bytes, std::uint32_t bar) {
+    // .shared::cta destination: the ::cluster form made ptxas test the CTA rank of every destination (and keep a call) per copy
+    asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(dst), "l"(src),
+                 "r"(bytes), "r"(bar)
+                 : "memory");
+}
+template <std::uint32_t N>
+__device__ __forceinline__ void regs_dec() {
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" ::"n"(N));
+}
+template <std::uint32_t N>
+__device__ __forceinline__ void regs_inc() {
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" ::"n"(N));
+}
+
+// Feed trait (strix/cuda/core/nvfp4_tile.hpp): ONE kernel, the feed a compile-time parameter. The stage MMA and the epilogue are
+// written once, inline in this body; only the stage copy and its synchronisation sit under `if constexpr`. Feed::lsu therefore
+// instantiates exactly the text of the cp.async kernel and its SASS is identical to it (with the stage MMA and the epilogue in
+// __forceinline__ helpers ptxas re-scheduled the lsu kernel: 10,016 -> 11,488 instructions, 2-4.6 % slower on 4 of 5 dense
+// FAST4 shapes). Feed::bulk adds the producer warpgroup below. Same loads and MMA order per accumulator: bitwise equal.
+// H16 (nvfp4-tile-h16-v1, compile-time trait): the GLU epilogue stores BF16 hidden rows (a.y16) instead of FP32 (a.y). The
+// FP32 instantiation (H16 = false) has no H16 code at all, so its machine code is the trait-free kernel's.
+template <Feed F, bool H16>
+__global__ void __launch_bounds__(F == Feed::bulk ? kBulkThreads : kThreads, 1) gemm_kernel(const GemmArgs a) {
+    constexpr bool kBulk = F == Feed::bulk;
     extern __shared__ __align__(16) unsigned char smem[];
     const std::uint32_t KS = a.in / kK, tiles_n = a.rows_pad / kCtaRows, wtiles = a.out / 16, ntiles = a.rows_pad / 8;
     const std::uint32_t tm = blockIdx.x / tiles_n, tn = blockIdx.x % tiles_n;
     const bool glu = a.epi == Epi::glu;
     const std::uint32_t tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, wm = warp & 1, wn = warp >> 1;
     const std::uint32_t sbase = static_cast<std::uint32_t>(__cvta_generic_to_shared(smem));
-    // one stage = the 8 weight records and the 32 activation records of input block ks, copied verbatim. Thread tid copies the
+    // Feed::lsu: one stage = the 8 weight records and the 32 activation records of input block ks, copied verbatim. Thread tid copies the
     // 16-byte chunks c = tid + i * kThreads (i < kPer, c < kChunks). Which record / tile / source a chunk reads does not depend on ks,
     // so its source base, ks stride, shared offset and predicates are computed ONCE here; a stage then costs kPer cp.async plus one
     // multiply-add each. (Recomputing them per stage in a rolled, divergent loop was ~1,860 clk per 128-K stage serialised after the
@@ -75,6 +134,54 @@ __global__ void __launch_bounds__(kThreads, 1) gemm_kernel(const GemmArgs a) {
         for (std::uint32_t i = 0; i < kPer; ++i)
             if (live[i]) cp16(st + dst[i], src[i] + static_cast<std::size_t>(ks) * step[i], okc[i]);
     };
+    std::uint32_t full0 = 0, empty0 = 0;  // Feed::bulk: full[0 .. kStages), empty[0 .. kStages) mbarriers
+    if constexpr (kBulk) {
+        __shared__ __align__(8) std::uint64_t bars[2 * kStages];
+        full0 = static_cast<std::uint32_t>(__cvta_generic_to_shared(bars));
+        empty0 = full0 + kStages * 8;
+    if (tid == 0) {
+#pragma unroll
+        for (std::uint32_t s = 0; s < kStages; ++s) {
+            mbar_init(full0 + 8 * s, 1);
+            mbar_init(empty0 + 8 * s, kMmaWarps);
+        }
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    }
+    __syncthreads();
+        // each role's code is reached only through its own setmaxnreg (ptxas allocates it under that budget)
+        if (warp >= kMmaWarps) {  // producer warpgroup; warp 8 lane l owns records l and l + 32 of every stage, resolved once
+            regs_dec<kProducerRegs>();
+            if (warp != kMmaWarps) return;
+            const std::uint32_t tx = stage_bytes(tm, tn, glu, KS, wtiles, ntiles);
+            StageRecord r[2];
+            const std::uint8_t* rsrc[2];
+            bool mine[2];
+#pragma unroll
+            for (std::uint32_t j = 0; j < 2; ++j) {
+                const std::uint32_t i = lane + 32 * j;
+                mine[j] = i < kStageRecs;
+                r[j] = stage_record(mine[j] ? i : 0, tm, tn, glu, KS, wtiles, ntiles);
+                rsrc[j] = (r[j].which == 2 ? a.x : r[j].which == 1 ? a.w2 : a.w) + r[j].base;
+                if (mine[j] && !r[j].ok)  // never copied: zero the slot of every stage once (published by the first full arrive)
+                    for (std::uint32_t s = 0; s < kStages; ++s)
+                        for (std::uint32_t o = 0; o < r[j].bytes; o += 16)
+                            *reinterpret_cast<uint4*>(smem + s * kStage + r[j].dst + o) = make_uint4(0, 0, 0, 0);
+            }
+            __syncwarp();
+            for (std::uint32_t ks = 0; ks < KS; ++ks) {
+                const std::uint32_t s = ks % kStages, full = full0 + 8 * s;
+                if (ks >= kStages) mbar_wait(empty0 + 8 * s, (ks / kStages - 1) & 1U);
+                if (lane == 0) mbar_expect_tx(full, tx);
+                __syncwarp();
+#pragma unroll
+                for (std::uint32_t j = 0; j < 2; ++j)
+                    if (mine[j] && r[j].ok)
+                        bulk_copy(sbase + s * kStage + r[j].dst, rsrc[j] + static_cast<std::size_t>(ks) * r[j].bytes, r[j].bytes, full);
+            }
+            return;
+        }
+        regs_inc<kMmaRegs>();
+    }
     float acc[4][8][4];
 #pragma unroll
     for (int i = 0; i < 4; ++i)
@@ -82,16 +189,22 @@ __global__ void __launch_bounds__(kThreads, 1) gemm_kernel(const GemmArgs a) {
         for (int j = 0; j < 8; ++j)
 #pragma unroll
             for (int z = 0; z < 4; ++z) acc[i][j][z] = 0.f;
+    if constexpr (!kBulk) {
 #pragma unroll
-    for (std::uint32_t s = 0; s + 1 < kStages; ++s) {
-        if (s < KS) load(s, s);
-        cp_commit();
+        for (std::uint32_t s = 0; s + 1 < kStages; ++s) {
+            if (s < KS) load(s, s);
+            cp_commit();
+        }
     }
     for (std::uint32_t ks = 0; ks < KS; ++ks) {
-        cp_wait<kStages - 2>();
-        __syncthreads();  // stage ks landed for every thread; stage (ks - 1) % kStages is free
-        if (ks + kStages - 1 < KS) load((ks + kStages - 1) % kStages, ks + kStages - 1);
-        cp_commit();
+        if constexpr (kBulk) {
+            mbar_wait(full0 + 8 * (ks % kStages), (ks / kStages) & 1U);
+        } else {
+            cp_wait<kStages - 2>();
+            __syncthreads();  // stage ks landed for every thread; stage (ks - 1) % kStages is free
+            if (ks + kStages - 1 < KS) load((ks + kStages - 1) % kStages, ks + kStages - 1);
+            cp_commit();
+        }
         const unsigned char* sA = smem + (ks % kStages) * kStage;
         const unsigned char* sB = sA + kAStage;
 #pragma unroll
@@ -113,8 +226,13 @@ __global__ void __launch_bounds__(kThreads, 1) gemm_kernel(const GemmArgs a) {
                 for (std::uint32_t mt = 0; mt < 4; ++mt) mma(acc[mt][nt], af[mt], bf, sa[mt], sb);
             }
         }
+        if constexpr (kBulk) {
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");  // this warp's reads of slot ks % kStages before its refill
+            __syncwarp();
+            if (lane == 0) mbar_arrive(empty0 + 8 * (ks % kStages));
+        }
     }
-    cp_wait<0>();
+    if constexpr (!kBulk) cp_wait<0>();
     // Epilogue loads first, stores after. y may alias aux (the residual GEMMs run in place) and, as plain pointers, rs too, so the
     // compiler may not move a load above an earlier store: written per element, the residual path was 128 LDG -> FADD -> STG chains
     // per thread and rs was re-read after every store, each paying a full memory latency while the CTA held its SM (+0.19-0.20 ms
@@ -154,7 +272,9 @@ __global__ void __launch_bounds__(kThreads, 1) gemm_kernel(const GemmArgs a) {
                     if (ch >= a.out) continue;
                     const float gate = __fmul_rn(acc[2 * p][nt][z], __fmul_rn(a.gs, rs));
                     const float up = __fmul_rn(acc[2 * p + 1][nt][z], __fmul_rn(a.gs2, rs));
-                    a.y[yrow + ch] = __fmul_rn(strix::cuda_core::cc_silu(gate), up);
+                    const float h = __fmul_rn(strix::cuda_core::cc_silu(gate), up);
+                    if constexpr (H16) a.y16[yrow + ch] = __bfloat16_as_ushort(__float2bfloat16_rn(h));  // nvfp4-tile-h16-v1
+                    else a.y[yrow + ch] = h;
                 }
             } else {
 #pragma unroll
@@ -183,17 +303,9 @@ __device__ __forceinline__ void zero_row(std::uint32_t r, std::uint32_t in, std:
 
 // THE activation quantiser of the family (one rule for every producer): 16 values of row r, group q, row scale ts -> e4m3 group scale
 // (a16 / 6 / ts, saturated at 448) and 16 e2m1 codes (v / (scale * ts), clamped to +-6, round to nearest even).
-__device__ __forceinline__ void quantize_group(const float4* g4, float ts, std::uint32_t r, std::uint32_t q, std::uint32_t in,
-                                               std::uint8_t* __restrict__ xt) {
-    float v[16];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const float4 f = g4[i];
-        v[4 * i] = f.x;
-        v[4 * i + 1] = f.y;
-        v[4 * i + 2] = f.z;
-        v[4 * i + 3] = f.w;
-    }
+// Every producer (FP32 rows, BF16 rows, the norm folds) hands this core the group's 16 FP32 values.
+__device__ __forceinline__ void quantize_values(const float (&v)[16], float ts, std::uint32_t r, std::uint32_t q, std::uint32_t in,
+                                                std::uint8_t* __restrict__ xt) {
     float a16 = 0.f;
 #pragma unroll
     for (int i = 0; i < 16; ++i) a16 = fmaxf(a16, fabsf(v[i]));
@@ -216,9 +328,59 @@ __device__ __forceinline__ void quantize_group(const float4* g4, float ts, std::
     *reinterpret_cast<std::uint32_t*>(xt + x_code_byte(r, 16 * q + 8, in)) = word[1];
     xt[x_scale_byte(r, q, in)] = sc.__x;
 }
+__device__ __forceinline__ void quantize_group(const float4* g4, float ts, std::uint32_t r, std::uint32_t q, std::uint32_t in,
+                                               std::uint8_t* __restrict__ xt) {
+    float v[16];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float4 f = g4[i];
+        v[4 * i] = f.x;
+        v[4 * i + 1] = f.y;
+        v[4 * i + 2] = f.z;
+        v[4 * i + 3] = f.w;
+    }
+    quantize_values(v, ts, r, q, in, xt);
+}
 
-// one CTA per row; rows >= `rows` (padding up to rows_pad) are written as zero codes / scales / rs.
-__global__ void __launch_bounds__(256) quantize_kernel(const float* __restrict__ x, std::uint32_t rows, std::uint32_t in,
+// Row element types of quantize_kernel: FP32, or BF16 bit patterns widened exactly (bf16 b -> float bits b << 16), so a BF16 row
+// quantises bit for bit as its FP32 widening. Both load 16 bytes per access (4 FP32 / 8 BF16 values).
+__device__ __forceinline__ float bf16_lo(std::uint32_t w) { return __uint_as_float(w << 16); }          // element 2i (little endian)
+__device__ __forceinline__ float bf16_hi(std::uint32_t w) { return __uint_as_float(w & 0xffff0000u); }  // element 2i + 1
+__device__ __forceinline__ float abs_max16(const float* row, std::uint32_t i) {  // |max| of 16-byte vector i
+    const float4 v = reinterpret_cast<const float4*>(row)[i];
+    return fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+}
+__device__ __forceinline__ float abs_max16(const std::uint16_t* row, std::uint32_t i) {
+    const uint4 u = reinterpret_cast<const uint4*>(row)[i];
+    const float a = fmaxf(fmaxf(fabsf(bf16_lo(u.x)), fabsf(bf16_hi(u.x))), fmaxf(fabsf(bf16_lo(u.y)), fabsf(bf16_hi(u.y))));
+    const float b = fmaxf(fmaxf(fabsf(bf16_lo(u.z)), fabsf(bf16_hi(u.z))), fmaxf(fabsf(bf16_lo(u.w)), fabsf(bf16_hi(u.w))));
+    return fmaxf(a, b);
+}
+__device__ __forceinline__ void quantize_row_group(const float* row, float ts, std::uint32_t r, std::uint32_t q, std::uint32_t in,
+                                                   std::uint8_t* __restrict__ xt) {
+    quantize_group(reinterpret_cast<const float4*>(row) + 4 * q, ts, r, q, in, xt);
+}
+__device__ __forceinline__ void quantize_row_group(const std::uint16_t* row, float ts, std::uint32_t r, std::uint32_t q,
+                                                   std::uint32_t in, std::uint8_t* __restrict__ xt) {
+    const uint4* g = reinterpret_cast<const uint4*>(row) + 2 * q;
+    float v[16];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const uint4 u = g[i];
+        const std::uint32_t w[4] = {u.x, u.y, u.z, u.w};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            v[8 * i + 2 * j] = bf16_lo(w[j]);
+            v[8 * i + 2 * j + 1] = bf16_hi(w[j]);
+        }
+    }
+    quantize_values(v, ts, r, q, in, xt);
+}
+
+// one CTA per row; rows >= `rows` (padding up to rows_pad) are written as zero codes / scales / rs. T = float | std::uint16_t (BF16).
+// The amax is exact in any order (fmaxf of exact values), so both element types reach quantize_values with the same ts and values.
+template <class T>
+__global__ void __launch_bounds__(256) quantize_kernel(const T* __restrict__ x, std::uint32_t rows, std::uint32_t in,
                                                        std::uint8_t* __restrict__ xt, float* __restrict__ rs) {
     __shared__ float red[8];
     const std::uint32_t r = blockIdx.x, groups = in / 16;
@@ -226,12 +388,10 @@ __global__ void __launch_bounds__(256) quantize_kernel(const float* __restrict__
         zero_row(r, in, xt, rs);
         return;
     }
-    const float4* row = reinterpret_cast<const float4*>(x + static_cast<std::size_t>(r) * in);
+    const T* row = x + static_cast<std::size_t>(r) * in;
+    constexpr std::uint32_t kPerVec = 16 / sizeof(T);
     float amax = 0.f;
-    for (std::uint32_t i = threadIdx.x; i < in / 4; i += blockDim.x) {
-        const float4 v = row[i];
-        amax = fmaxf(amax, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
-    }
+    for (std::uint32_t i = threadIdx.x; i < in / kPerVec; i += blockDim.x) amax = fmaxf(amax, abs_max16(row, i));
 #pragma unroll
     for (int d = 16; d; d >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, d));
     if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = amax;
@@ -241,7 +401,7 @@ __global__ void __launch_bounds__(256) quantize_kernel(const float* __restrict__
     for (int w = 1; w < 8; ++w) amax = fmaxf(amax, red[w]);
     const float ts = __fdiv_rn(amax, kRowScaleDiv);
     if (threadIdx.x == 0) rs[r] = ts;
-    for (std::uint32_t q = threadIdx.x; q < groups; q += blockDim.x) quantize_group(row + 4 * q, ts, r, q, in, xt);
+    for (std::uint32_t q = threadIdx.x; q < groups; q += blockDim.x) quantize_row_group(row, ts, r, q, in, xt);
 }
 
 // Row normalisers folded into the quantiser (norm_quantize_kernel's Norm trait). apply() turns thread t's elements v[i] = x[t + 256 i]

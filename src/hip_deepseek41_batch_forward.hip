@@ -1322,9 +1322,19 @@ void BatchForward::exchange_host(std::span<const std::byte> out, std::span<std::
     auto& m = *impl_;
     if (!m.distributed()) throw std::logic_error("deepseek41 batch forward: exchange_host needs world 2");
     if (out.size() != in.size() || out.size() > control_bytes) throw std::invalid_argument("deepseek41 batch forward: control messages are equal and <= 64 KiB");
+    const dist::Tag tag{static_cast<std::uint32_t>(dist::TagKind::control), 0xC0U, 0U};
+    // Host-routed sizes (every control message on the default route table): the communicator's host path moves the
+    // same message (trailer, sequence, CRC) with no device copy; the peer may use either path. The caller's buffers may
+    // be written or read by work queued on the model stream, so the stream is drained first, as the device round trip
+    // below ends drained. STRIX_DS41_HOST_EXCHANGE=0: the device round trip (four copies) for every size.
+    static const bool host_control = strix::envcfg::flag("STRIX_DS41_HOST_EXCHANGE", true);
+    if (host_control && m.options.communicator->host_routed(out.size())) {
+        check(hipStreamSynchronize(m.stream), "control");
+        m.options.communicator->exchange_host(out, in, tag);
+        return;
+    }
     check(hipMemcpyAsync(m.control.p, out.data(), out.size(), hipMemcpyHostToDevice, m.stream), "control upload");
-    m.options.communicator->exchange(m.stream, m.control.p, m.control.p + control_bytes, out.size(),
-                                     dist::Tag{static_cast<std::uint32_t>(dist::TagKind::control), 0xC0U, 0U});
+    m.options.communicator->exchange(m.stream, m.control.p, m.control.p + control_bytes, out.size(), tag);
     check(hipMemcpyAsync(in.data(), m.control.p + control_bytes, in.size(), hipMemcpyDeviceToHost, m.stream), "control download");
     check(hipStreamSynchronize(m.stream), "control");
 }

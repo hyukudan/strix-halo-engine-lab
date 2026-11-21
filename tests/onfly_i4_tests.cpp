@@ -353,6 +353,41 @@ int main() {
     q6p::iu4::unregister_tensor(&tensor, copy);
     expect(q6p::iu4::find(&tensor) == nullptr && q6p::iu4::count() == 0, "retired");
 
+    {  // BF16 -> Q8_0 load-time transcode (core::convert_bf16_q8_0 runs quantise_q8_0_block): ggml quantize_row_q8_0_ref
+        // rule against an independent oracle (exhaustive nearest FP16 for d, round half away from zero for q).
+        constexpr std::size_t BN = 3U, BK = 96U;
+        std::vector<std::uint16_t> wb(BN * BK);
+        std::uint32_t bseed = 77U;
+        for (auto& v : wb) {
+            const float f = (static_cast<float>(lcg(bseed) % 20001U) - 10000.0f) * 1e-5f * (1.0f + static_cast<float>(lcg(bseed) % 7U));
+            std::uint32_t u;
+            std::memcpy(&u, &f, 4);
+            v = static_cast<std::uint16_t>(u >> 16U);  // truncation is fine: any BF16 value is a valid input
+        }
+        for (std::size_t j = 0; j < 32U; ++j) wb[32U + j] = 0U;  // an all-zero block -> d = 0, q = 0
+        const auto bq8 = core::onfly::bf16_to_q8_0_host(wb.data(), BN, BK);
+        expect(bq8.size() == BN * (BK / 32U) * 34U, "bf16 -> q8_0 size");
+        bool same = true;
+        for (std::size_t b = 0; b < BN * (BK / 32U) && same; ++b) {
+            float x[32], amax = 0.0f;
+            for (unsigned j = 0; j < 32U; ++j) {
+                x[j] = core::onfly::bf16_bits_to_f32(wb[b * 32U + j]);
+                amax = std::fmax(amax, std::fabs(x[j]));
+            }
+            const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+            const std::uint16_t dh = oracle_f16(d);
+            same = bq8[b * 34U] == (dh & 0xffU) && bq8[b * 34U + 1U] == (dh >> 8U);
+            for (unsigned j = 0; j < 32U && same; ++j) {
+                const long q = std::lround(static_cast<double>(x[j] * id));
+                same = static_cast<std::int8_t>(bq8[b * 34U + 2U + j]) == q && q >= -127 && q <= 127;
+            }
+        }
+        expect(same, "bf16 -> q8_0 equals the independent ggml-rule oracle");
+        bool zero = bq8[34U] == 0U && bq8[35U] == 0U;
+        for (unsigned j = 0; j < 32U; ++j) zero = zero && bq8[36U + j] == 0U;
+        expect(zero, "all-zero block -> d 0, q 0");
+    }
+
     if (failures) { std::cerr << failures << " failure(s)\n"; return 1; }
     std::cout << "onfly i4 host tests passed\n";
     return 0;

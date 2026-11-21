@@ -109,6 +109,21 @@ nodo B: strix-hy4-rank PART1.gguf PART2.gguf --rank 1 --peer NODO_A --ids-file p
 un ancho de ventana: `--prompt-rows R`, o una calibración `--window-costs FILAS:MS,...` (milisegundos de media ventana
 por ancho, medidos en el despliegue) con la que elige el ancho de menor tiempo de canalización.
 
+Decodificación exacta en paralelo de tensores (los dos nodos tienen el pack entero y prellenan el prompt cada uno; cada
+paso de decodificación se reparte):
+
+```
+nodo A: strix-hy4-rank PART1.gguf PART2.gguf --tp-rank 0 --tp-rates 217,217 --ids-file prompt.ids --gen 128 --context 4160 --prompt-rows 1024 --top 0
+nodo B: strix-hy4-rank PART1.gguf PART2.gguf --tp-rank 1 --tp-rates 217,217 --ids-file prompt.ids --gen 128 --context 4160 --prompt-rows 1024 --top 0
+```
+
+La atención se reparte por cabezas; o_proj, la FFN de la capa 0, el experto compartido y la cabeza, por filas; los
+expertos enrutados, por ranura (8 + 8 de las 16). 128 all-gathers por token sobre el enlace de gather compartido del
+par (`--tp-transport`, por defecto `usb4auto`) unen las partes. Cada salida repartida es un resultado entero del mismo
+kernel y las uniones son concatenaciones, así que los ids son los de un nodo. Al arrancar, los dos rangos miden el
+enlace y el planificador compartido imprime `tp placement:`; rechaza el par cuando lo predice más lento (`--tp-force`
+lo ejecuta igualmente, `--tp-trip-us` sustituye el viaje medido).
+
 ## Medidas
 
 Clase (ver [Clase aritmética](#clase-aritmética)): la línea de la ruta por defecto es BASE; las filas de la tabla usan la
@@ -135,8 +150,14 @@ lento que estas filas:
 
 Con 4096 tokens el par reprodujo los ids voraces y el resumen de logits de la última posición de un nodo.
 
-El par no acelera la decodificación: para un token las dos mitades se ejecutan una tras otra y el salto se suma.
-La decodificación lee unos 9,7 GiB de pesos por token, así que un nodo está cerca de su límite de ancho de banda.
+La división por capas no acelera la decodificación: para un token las dos mitades se ejecutan una tras otra y el salto
+se suma. La decodificación lee unos 9,7 GiB de pesos por token, así que un nodo está cerca de su límite de ancho de banda.
+
+Decodificación exacta en paralelo de tensores (prompt de 1024 tokens, 128 ids voraces, elección voraz en el
+dispositivo, ruta de gather por el host), un nodo | par | un nodo en una secuencia: 16,52 | 19,92 | 16,51 tok/s
+(mediana por paso 60,5 | 49,9 | 60,5 ms); los ids del par son los de un nodo en los dos rangos (y 300 de 300 en una
+ejecución más larga). Cada rango lee cerca del 56 % de los bytes por token de un nodo; el resto del paso son los 128
+gathers.
 
 ## Pruebas
 

@@ -417,18 +417,47 @@ std::uint64_t required_weight_bytes(
         "unreachable LM-head weight kind");
 }
 
+// Row addressing of the single-row dense kernels (a trait; the arithmetic is the kernel's): PlainRows = one product (every
+// existing launch); DenseGroups = grouped rows (HipDenseRowsView::groups): grid row y is group g = first + y, which reads
+// the weight slice ids[g] (device) or g, its input at hidden + g * x_stride and writes logits + g * out_stride.
+struct PlainRows {
+    template <typename Input>
+    __device__ __forceinline__ bool resolve(const Input*&, const void*&, float*&) const { return true; }
+};
+struct DenseGroups {
+    const std::uint32_t* ids;
+    std::uint32_t slices, x_stride, out_stride, first;
+    std::uint64_t weight_bytes;
+    template <typename Input>
+    __device__ __forceinline__ bool resolve(const Input*& hidden, const void*& weights, float*& logits) const {
+        const auto g = first + static_cast<std::uint32_t>(blockIdx.y);
+        const std::uint32_t slice = ids ? ids[g] : g;
+        hidden += static_cast<std::size_t>(g) * x_stride;
+        logits += static_cast<std::size_t>(g) * out_stride;
+        if (slice >= slices) return false;
+        weights = static_cast<const std::uint8_t*>(weights) + slice * weight_bytes;
+        return true;
+    }
+};
+
 template <
     typename Input,
-    WeightKind Kind>
+    WeightKind Kind,
+    typename Addr = PlainRows>
 __global__ void lm_head_kernel(
     const Input* hidden,
     const void* weights,
     std::uint32_t hidden_size,
     std::uint32_t vocab_size,
-    float* logits) {
+    float* logits,
+    Addr addr) {
     const auto vocab_row =
         static_cast<std::uint32_t>(
             blockIdx.x);
+    if (!addr.resolve(hidden, weights, logits)) {  // the block's group names a slice outside the weights
+        if (threadIdx.x == 0 && vocab_row < vocab_size) logits[vocab_row] = __int_as_float(0x7fc00000);
+        return;
+    }
     if (vocab_row >= vocab_size) {
         return;
     }
@@ -504,15 +533,19 @@ __device__ __forceinline__ void drw_weight8(const void* weights, std::uint64_t a
     else if constexpr (Kind == WeightKind::f16) drw_load8_u16<true>(static_cast<const std::uint16_t*>(weights) + at, v);
     else drw_load8_u16<false>(static_cast<const std::uint16_t*>(weights) + at, v);
 }
-template <typename Input, WeightKind Kind>
+template <typename Input, WeightKind Kind, typename Addr = PlainRows>
 __global__ __launch_bounds__(strix::dense_rows_wave::kLanes * strix::dense_rows_wave::kWaves) void dense_rows_wave_kernel(
-    const Input* hidden, const void* weights, std::uint32_t hidden_size, std::uint32_t vocab_size, float* logits) {
+    const Input* hidden, const void* weights, std::uint32_t hidden_size, std::uint32_t vocab_size, float* logits, Addr addr) {
     namespace drw = strix::dense_rows_wave;
     static_assert(drw::kLeaves == kThreads && drw::kLocal == 8U, "the wave form keeps lm_head_kernel's 256 leaves");
     static_assert(Kind == WeightKind::f32 || Kind == WeightKind::f16 || Kind == WeightKind::bf16);
     const auto row = static_cast<std::uint32_t>(blockIdx.x) * drw::kWaves + static_cast<std::uint32_t>(threadIdx.x) / drw::kLanes;
     if (row >= vocab_size) return;  // whole waves only: the DPP stages below never see a retired lane
     const auto lane = static_cast<std::uint32_t>(threadIdx.x) % drw::kLanes;
+    if (!addr.resolve(hidden, weights, logits)) {  // the block's group names a slice outside the weights
+        if (lane == 0) logits[row] = __int_as_float(0x7fc00000);
+        return;
+    }
     float partial[drw::kLocal] = {};
     const std::uint64_t row_at = static_cast<std::uint64_t>(row) * hidden_size;
 #pragma unroll 4
@@ -1173,7 +1206,8 @@ void launch_typed(
         config.hidden_size,
         config.vocab_size,
         reinterpret_cast<float*>(
-            logits.address));
+            logits.address),
+        PlainRows{});
     check_hip(
         hipGetLastError(),
         "HIP LM-head launch");
@@ -1448,6 +1482,38 @@ template <typename Input, WeightKind Kind>
 void launch_dense_rows_typed(const HipDenseRowsView& v, hipStream_t stream) {
     const auto x_stride = v.x_stride ? v.x_stride : v.width;
     const auto out_stride = v.out_stride ? v.out_stride : v.outputs;
+    if (v.groups > 1 || v.group_ids) {  // grouped rows (rows == 1 checked by launch_hip_dense_rows): grid row y = group
+        DenseGroups gr{v.group_ids, v.group_ids ? v.group_slices : v.groups, v.group_x_stride,
+                       v.group_out_stride ? v.group_out_stride : v.outputs, 0U, v.group_weight_bytes};
+        const std::uint32_t per = v.group_loop ? 1U : v.groups;  // groups per launch (group_loop: the identity reference)
+        bool wave = false;
+        if constexpr (Kind == WeightKind::f32 || Kind == WeightKind::f16 || Kind == WeightKind::bf16) {
+            // the wave form's alignment holds for every group: slice stride and input stride keep 16-byte steps
+            wave = !v.block_rows &&
+                   strix::dense_rows_wave::admissible(v.width, x_stride, Kind == WeightKind::f32 ? 4U : 2U,
+                                                      reinterpret_cast<std::uintptr_t>(v.x),
+                                                      reinterpret_cast<std::uintptr_t>(v.weights),
+                                                      static_cast<std::uint32_t>(sizeof(Input))) &&
+                   v.group_weight_bytes % 16U == 0U && (std::uint64_t{v.group_x_stride} * sizeof(Input)) % 16U == 0U;
+        }
+        for (gr.first = 0; gr.first < v.groups; gr.first += per) {
+            bool launched = false;
+            if constexpr (Kind == WeightKind::f32 || Kind == WeightKind::f16 || Kind == WeightKind::bf16) {
+                namespace drw = strix::dense_rows_wave;
+                if (wave) {
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(dense_rows_wave_kernel<Input, Kind, DenseGroups>),
+                                       dim3((v.outputs + drw::kWaves - 1U) / drw::kWaves, per), dim3(drw::kLanes * drw::kWaves), 0,
+                                       stream, static_cast<const Input*>(v.x), v.weights, v.width, v.outputs, v.out, gr);
+                    launched = true;
+                }
+            }
+            if (!launched)
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(lm_head_kernel<Input, Kind, DenseGroups>), dim3(v.outputs, per), dim3(kThreads), 0,
+                                   stream, static_cast<const Input*>(v.x), v.weights, v.width, v.outputs, v.out, gr);
+        }
+        check_hip(hipGetLastError(), "HIP dense rows grouped launch");
+        return;
+    }
     if (v.rows > 1 && !v.row_loop) {
         const auto g = strix::dense_rows_tile::grid(v.rows, v.outputs);
         if (g.y > 65535U) throw std::invalid_argument("HIP dense rows: too many rows for one rows-tile launch");
@@ -1464,7 +1530,7 @@ void launch_dense_rows_typed(const HipDenseRowsView& v, hipStream_t stream) {
             for (std::uint32_t r = 0; r < v.rows; ++r) {
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(dense_rows_wave_kernel<Input, Kind>), dim3((v.outputs + drw::kWaves - 1U) / drw::kWaves),
                     dim3(drw::kLanes * drw::kWaves), 0, stream, static_cast<const Input*>(v.x) + static_cast<std::size_t>(r) * x_stride,
-                    v.weights, v.width, v.outputs, v.out + static_cast<std::size_t>(r) * out_stride);
+                    v.weights, v.width, v.outputs, v.out + static_cast<std::size_t>(r) * out_stride, PlainRows{});
             }
             check_hip(hipGetLastError(), "HIP dense rows wave launch");
             return;
@@ -1473,7 +1539,7 @@ void launch_dense_rows_typed(const HipDenseRowsView& v, hipStream_t stream) {
     for (std::uint32_t r = 0; r < v.rows; ++r) {
         hipLaunchKernelGGL(HIP_KERNEL_NAME(lm_head_kernel<Input, Kind>), dim3(v.outputs), dim3(kThreads), 0, stream,
             static_cast<const Input*>(v.x) + static_cast<std::size_t>(r) * x_stride, v.weights, v.width, v.outputs,
-            v.out + static_cast<std::size_t>(r) * out_stride);
+            v.out + static_cast<std::size_t>(r) * out_stride, PlainRows{});
     }
     check_hip(hipGetLastError(), "HIP dense rows launch");
 }
@@ -1497,6 +1563,17 @@ void launch_hip_dense_rows(const HipDenseRowsView& v, void* stream) {
         throw std::invalid_argument("HIP dense rows: null pointer or empty geometry");
     if ((v.x_stride != 0 && v.x_stride < v.width) || (v.out_stride != 0 && v.out_stride < v.outputs))
         throw std::invalid_argument("HIP dense rows: stride below the row width");
+    if (v.groups == 0) throw std::invalid_argument("HIP dense rows: zero groups");
+    if (v.groups > 1 || v.group_ids) {
+        if (v.rows != 1) throw std::invalid_argument("HIP dense rows: grouped rows take one row per group");
+        if (v.groups > 65535U) throw std::invalid_argument("HIP dense rows: too many groups for one grouped launch");
+        if (v.group_ids && v.group_slices == 0) throw std::invalid_argument("HIP dense rows: grouped ids without a slice count");
+        if (v.group_out_stride != 0 && v.group_out_stride < v.outputs)
+            throw std::invalid_argument("HIP dense rows: group output stride below the outputs");
+        const std::uint64_t n = std::uint64_t{v.outputs} * v.width;
+        const std::uint64_t product = v.ggml_type == 8U ? n / 32U * 34U : n * (v.ggml_type == 0U ? 4U : 2U);
+        if (v.group_weight_bytes < product) throw std::invalid_argument("HIP dense rows: group slice smaller than one product");
+    }
     const auto s = static_cast<hipStream_t>(stream);
     switch (v.input) {
     case HipActivationStorage::bf16: launch_dense_rows_input<std::uint16_t>(v, s); return;
@@ -1982,7 +2059,7 @@ void launch_hip_mtp_lm_head(const MtpNativeContext& c,void* stream) {
             reinterpret_cast<const void*>(c.tensors->lm_head.runtime->address),
             static_cast<std::uint32_t>(c.model->hidden_size),
             static_cast<std::uint32_t>(c.model->vocab_size),
-            reinterpret_cast<float*>(c.resources->view(HipMtpBuffer::logits).address));
+            reinterpret_cast<float*>(c.resources->view(HipMtpBuffer::logits).address), PlainRows{});
     };
     switch(weight_kind(c.tensors->lm_head.manifest->ggml_type)) {
     case WeightKind::f32:launch.template operator()<WeightKind::f32>();break;

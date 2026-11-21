@@ -49,12 +49,22 @@ inline bool prefill_da16() {
     const int o=prefill_da16_override();
     return o<0?env:o==1;
 }
-// FP16 image of every (row, slot) h in CSR order: prefill_max_rows x max_top_k assignments x max_rows (intermediate) halves.
+// FP16 image of every (row, slot) h in CSR order: prefill_pool_rows x max_top_k assignments x width halves, width =
+// max(max_rows, the widest expert of the reserving caller: reserve_prefill_pools(rows, image_width), e.g. the K-quant
+// envelope's I 1536; a top-16 caller already reserves pool rows = rows x 16 / 10).
+inline unsigned& da16_image_width(){static unsigned v=max_rows;return v;}
+inline std::size_t da16_image_bytes(){return static_cast<std::size_t>(prefill_pool_rows())*max_top_k*da16_image_width()*2U;}
 HipPrefillPool& da16_image_pool(){static HipPrefillPool pool;return pool;}
 inline uint4* da16_image(bool setup = false) {
     auto& pool = da16_image_pool();
-    return static_cast<uint4*>(pool.get(static_cast<std::size_t>(prefill_pool_rows())*max_top_k*max_rows*2U,
-        "DA16 image allocation",setup));
+    return static_cast<uint4*>(pool.get(da16_image_bytes(),"DA16 image allocation",setup));
+}
+// K-quant envelope DA16 (enqueue_prefill_kquant): STRIX_QPF2K_MOE_DA16 = 0 or set_prefill_da16(0) keeps the plain f16x
+// down (FP32 h staged and converted per column tile); unset / 1 converts each batch's h once (same halves, same bits).
+inline bool prefill_da16_kquant() {
+    static const int env=strix::envcfg::integer("STRIX_QPF2K_MOE_DA16", -1);
+    const int o=prefill_da16_override();
+    return (o<0?env:o)!=0;
 }
 // Test hook state: the last enqueue_prefill of this thread took the DA16 path.
 inline bool& prefill_da16_flag(){static thread_local bool v=false;return v;}
@@ -69,9 +79,11 @@ inline unsigned* da16_counters(bool setup = false) {
 // then the arrival count; the last arriving tile of the batch writes the batch's FP16 image.
 // Reuse (MoE header reuse, STRIX_QPF2K_MOE_HDR): the body skips reloading the superblock header / Q5_K qh words that the
 // register stage already holds (hip_moe_f16x_project_body.inc); the base kernel instantiates Reuse = false.
-template<bool Q5K,unsigned Tune,bool Reuse,bool Listed=false,unsigned Tag=0U>
+// Clamp (K-quant envelope, clamped routed experts): project_prefill_f16x_clamped's body (project_f16x_body_clamped, Q4_K).
+template<bool Q5K,unsigned Tune,bool Reuse,bool Listed=false,unsigned Tag=0U,bool Clamp=false>
 __device__ __forceinline__ void project_prefill_f16x_da16_entry(const unsigned char* gate,const unsigned char* up,
-    const PrefillRows& view,unsigned hidden,unsigned outputs,const uint4* a16,unsigned* arrive,uint4* image,const unsigned* list=nullptr) {
+    const PrefillRows& view,unsigned hidden,unsigned outputs,const uint4* a16,unsigned* arrive,uint4* image,const unsigned* list=nullptr,
+    float swiglu_limit=0.0F) {
     using L=F16LdsOf<F16TileX<Tune,0U>>;
     __shared__ __align__(16) typename L::Stage sb[1];
     __shared__ typename L::Rows rows;
@@ -79,7 +91,8 @@ __device__ __forceinline__ void project_prefill_f16x_da16_entry(const unsigned c
     __shared__ float scale_of[F16TileX<Tune,0U>::Batch];
     if constexpr(Listed)if(blockIdx.y>=list[0])return;
     const unsigned batch=Listed?list[1U+blockIdx.y]:blockIdx.y,t=threadIdx.x;
-    project_f16x_body<Q5K,Tune,0U,Reuse,Tag>(gate,up,view,hidden,outputs,a16,batch,blockIdx.x,sb,rows);
+    if constexpr(Clamp)project_f16x_body_clamped<Tune,Reuse>(gate,up,view,hidden,outputs,a16,batch,blockIdx.x,sb,rows,swiglu_limit);
+    else{(void)swiglu_limit;project_f16x_body<Q5K,Tune,0U,Reuse,Tag>(gate,up,view,hidden,outputs,a16,batch,blockIdx.x,sb,rows);}
     const auto& csr=view.csr;
     // The body's own guard (bit 8 masked: it may be set by other CTAs meanwhile, the rest is fixed before the launch).
     if((csr.summary[0]&~projection_nonfinite)||batch>=csr.summary[2])return;
@@ -117,6 +130,13 @@ template<bool Q5K,unsigned Tune>
 __global__ __launch_bounds__((F16TileX<Tune,0U>::Threads)) void project_prefill_f16x_da16_mg(const unsigned char* gate,const unsigned char* up,
     PrefillRows view,unsigned hidden,unsigned outputs,const uint4* a16,unsigned* arrive,uint4* image) {
     project_prefill_f16x_da16_entry<Q5K,Tune,true>(gate,up,view,hidden,outputs,a16,arrive,image);
+}
+// K-quant envelope, clamped routed experts: project_prefill_f16x_clamped (header reuse on, same launch bounds) + the image.
+template<unsigned Tune>
+__global__ __launch_bounds__((F16TileX<Tune,0U>::Threads),prefill_core2_min_waves(Tune,0U)) void project_prefill_f16x_clamped_da16(
+    const unsigned char* gate,const unsigned char* up,PrefillRows view,unsigned hidden,unsigned outputs,const uint4* a16,unsigned* arrive,
+    uint4* image,float swiglu_limit) {
+    project_prefill_f16x_da16_entry<false,Tune,true,false,0U,true>(gate,up,view,hidden,outputs,a16,arrive,image,nullptr,swiglu_limit);
 }
 // Down: down_prefill_f16x (Core 0, no probe bits) with A staged from the image. B, the K chain and the epilogue are the base's.
 template<bool Q51,unsigned Tune,bool UniformA>

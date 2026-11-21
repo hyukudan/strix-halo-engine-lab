@@ -18,12 +18,14 @@
 
 #include <cuda_runtime.h>
 
+#include "strix/cuda/core/nvfp4_tile.hpp"
 #include "strix/cuda_core/attention_policy.hpp"
 #include "strix/cuda_core/dense.hpp"
 #include "strix/cuda_core/operand_cache_plan.hpp"
 #include "strix/qwen35/config.hpp"
 #include "strix/split_k_policy.hpp"
 #include "strix/qwen35/engine_types.hpp"
+#include "strix/spec/tree_window.hpp"
 
 namespace strix::spec { class DraftRows; }
 
@@ -48,18 +50,42 @@ enum class PrefillArith : std::uint8_t { exact, flash, fast, fast2, fast8, fast4
 //   serial  = the decode recurrence row by row (gdn.hpp gdn_prefill_layer), bitwise equal to the windows.
 //   chunk16 = FAST gdn-chunk16-f32-v1 (strix/cuda_core/gdn_chunk.hpp): 16-row chunks, FP32, all SMs; bits differ (identity
 //             suffix -gdnc16), opt-in until its logit gate passes.
-enum class PrefillGdn : std::uint8_t { serial, chunk16 };
-// CLI / option spelling of PrefillGdn ("serial" | "chunk16"); anything else is rejected, never mapped to a default.
+//   chunk16tc = FAST gdn-chunk16-tf32-v1: the same chunks and workspace, the sequential scan on TF32 tensor cores with the FP32
+//             state in accumulator registers (identity suffix -gdnc16t, its own gate).
+enum class PrefillGdn : std::uint8_t { serial, chunk16, chunk16tc };
+// CLI / option spelling of PrefillGdn ("serial" | "chunk16" | "chunk16tc"); anything else is rejected, never mapped to a default.
 [[nodiscard]] inline PrefillGdn parse_prefill_gdn(const std::string& s) {
     if (s == "serial") return PrefillGdn::serial;
     if (s == "chunk16") return PrefillGdn::chunk16;
-    throw std::invalid_argument("--prefill-gdn expects serial|chunk16, got '" + s + "'");
+    if (s == "chunk16tc") return PrefillGdn::chunk16tc;
+    throw std::invalid_argument("--prefill-gdn expects serial|chunk16|chunk16tc, got '" + s + "'");
 }
+// FFN hidden rows H = silu(gate) * up of the FAST4 large-M prefill, between the fused gate/up GEMM and the down quantiser:
+//   f32  = FP32 rows (nvfp4-tile-mma-f32-v1 as gated with fast4).
+//   bf16 = FAST nvfp4-tile-h16-v1: the glu epilogue rounds each FP32 product to BF16 (RNE) and the down operand is quantised from
+//          those rows (same quantiser rule on the exact widening): half the H bytes written and read; identity suffix -h16.
+// Acts only under prefill_arith fast4 with NVFP4 gate / up / down weights; ignored (and not in the identity) otherwise.
+enum class PrefillHid : std::uint8_t { f32, bf16 };
+[[nodiscard]] inline PrefillHid parse_prefill_hid(const std::string& s) {
+    if (s == "f32") return PrefillHid::f32;
+    if (s == "bf16") return PrefillHid::bf16;
+    throw std::invalid_argument("--prefill-hid expects f32|bf16, got '" + s + "'");
+}
+// The ONE spelling table of each enum lever for the profile applier (strix/profiles/qwen_dense_cuda.hpp apply() finds these by
+// argument-dependent lookup on the option's type): a resolved value is converted exactly as the per-lever CLI option would be.
+[[nodiscard]] inline PrefillGdn parse_lever_value(PrefillGdn, const std::string& s) { return parse_prefill_gdn(s); }
+[[nodiscard]] inline PrefillHid parse_lever_value(PrefillHid, const std::string& s) { return parse_prefill_hid(s); }
 // CLI spelling of EngineOptions::prefill_norm_fold ("on" | "off"); anything else is rejected.
 [[nodiscard]] inline bool parse_prefill_norm_fold(const std::string& s) {
     if (s == "on") return true;
     if (s == "off") return false;
     throw std::invalid_argument("--prefill-norm-fold expects on|off, got '" + s + "'");
+}
+// CLI spelling of EngineOptions::prefill_tile_feed ("bulk" | "lsu", nvfp4::tile::parse_feed); anything else is rejected.
+[[nodiscard]] inline cuda::core::nvfp4::tile::Feed parse_prefill_tile_feed(const std::string& s) {
+    cuda::core::nvfp4::tile::Feed f{};
+    if (cuda::core::nvfp4::tile::parse_feed(s.c_str(), &f)) return f;
+    throw std::invalid_argument("--prefill-tile-feed expects bulk|lsu, got '" + s + "'");
 }
 
 struct EngineOptions {
@@ -78,12 +104,18 @@ struct EngineOptions {
     // Large-M prefill (CudaEngine::prefill). Default exact = bitwise equal to the windowed path.
     PrefillArith prefill_arith = PrefillArith::exact;
     PrefillGdn prefill_gdn = PrefillGdn::serial;  // ignored (and not in the identity) under prefill_arith exact
+    PrefillHid prefill_hid = PrefillHid::f32;     // FAST4 FFN hidden rows (see PrefillHid); ignored unless prefill_arith fast4
     // FAST4 only: the hidden RMSNorms (attn / post) and, on the chunked GDN path, the gated RMSNorm of the ssm_out input are folded
     // into the A-operand quantiser (cuda_core dense_big_norm_split4 / dense_big_gated_norm_split4), so no f32 normalised rows are
     // written and re-read. Bitwise equal to norm + quantise (no identity suffix); a non-FAST4 consumer gets the f32 rows materialised
     // on demand. Default on: identity PASS + strict A/B x3 on the device for the hidden fold (8K FAST4 + chunk16 -4.4 %);
     // --prefill-norm-fold off is the rollback.
     bool prefill_norm_fold = true;
+    // FAST4 only: stage feed of the tile GEMMs (cuda/core nvfp4_tile Feed). bulk = one producer warpgroup with 1-D bulk copies
+    // into an mbarrier ring; lsu = every thread's cp.async + one CTA barrier per stage. Same bits (no identity suffix).
+    // Default lsu preserves the incumbent kernel; opt in to the measured operator-level bulk feed with --prefill-tile-feed bulk.
+    // End-to-end prefill validation is still required before a default switch.
+    cuda::core::nvfp4::tile::Feed prefill_tile_feed = cuda::core::nvfp4::tile::kDefaultFeed;
     std::uint32_t prefill_chunk = 2048;  // rows per large-M chunk (multiple of 128, <= 8192); buffers are allocated on first use
     // Wave-aligned steps (strix/wave_fit.hpp, scheduling only, bitwise): prompts of >= this many tokens step by the largest
     // rows <= prefill_chunk whose flash grid fills whole waves (4096 -> 3968 on 188 SMs: flash +16 % at 128K, bench). 0 = off
@@ -129,7 +161,9 @@ struct EngineOptions {
     const std::string pf = (o.prefill_arith == PrefillArith::exact
         ? std::string()
         : std::string("-pf-") + pf_names[static_cast<unsigned>(o.prefill_arith)] + (o.prefill_attn8 ? "-a8" : "") +
-              (o.prefill_gdn == PrefillGdn::chunk16 ? "-gdnc16" : "")) + (o.decode_attn8 ? "-d8" : "");
+              (o.prefill_gdn == PrefillGdn::chunk16 ? "-gdnc16" : o.prefill_gdn == PrefillGdn::chunk16tc ? "-gdnc16t" : "") +
+              (o.prefill_arith == PrefillArith::fast4 && o.prefill_hid == PrefillHid::bf16 ? "-h16" : "")) +
+          (o.decode_attn8 ? "-d8" : "");
     if (o.turbo_weights == TurboWeights::off) return "qwen35-cuda-exact-" + a + "-v1" + pf;
     // the FAST split policy changes the NVFP4 GEMV summation order (decode, verify and the exact prefill's split ranges)
     const std::string sk = o.nvfp4_split == split_k::Profile::fast ? "-skf1" : "";
@@ -200,6 +234,10 @@ public:
     [[nodiscard]] bool prefill_is_big() const;  // whether prefill() takes the large-M path for this engine
     // Accepts the first k rows of the last forward_rows window (0 <= k <= rows). Async on stream().
     void commit(std::uint32_t k);
+    // Token tree (strix/spec/tree_window.hpp): the rows of `tree` (tokens[tree.rows]) in one window; each row gets the bits a
+    // linear window of its own path gives (EXACT). Accept with commit_path (commit(k) refuses a tree window). Async on stream().
+    RowsOut forward_tree(const std::uint32_t* tokens, const strix::spec::TreeWindow& tree, LogitRows want = LogitRows::all);
+    void commit_path(const strix::spec::PathCommit& pc);
 
     // MTP layer (single full-attention block with its own KV; positions are explicit, no hidden state to commit).
     // Row r runs at position pos0 + r with input token next_tokens[r] (the token FOLLOWING the hidden's position) and
@@ -239,6 +277,12 @@ public:
     // same operands as forward_rows(tokens) with tokens = host ids + the feed ids; nothing is read or waited for.
     RowsOut forward_rows_fed(const std::uint32_t* host_ids, std::uint32_t nhost, const std::uint32_t* slot,
                              const std::uint32_t* host_vals, std::uint32_t k, LogitRows want = LogitRows::all);
+    // + host2[0..n) = each slot's runner-up (0xFFFFFFFF: none) and gaps[0..n) = its draft-head logit gap top-1 minus
+    // runner-up (NaN: none; nullptr: not read); one synchronization (token-tree siblings / probe).
+    void mtp_feed_read2(std::uint32_t n, std::uint32_t* host, std::uint32_t* host2, float* gaps = nullptr) const;
+    // Draft runner-ups (argmax2 + gap) on / off (default off: the draft head runs the plain argmax launches and
+    // mtp_feed_read2 reports none). A token-tree verify target turns them on (Qwen35SpecTarget::set_tree).
+    void set_runner_ups(bool on);
     // Draft-only MTP head over a vocabulary subset (strix/spec/draft_rows.hpp, group 16 = one NVFP4 tile of the head):
     // before each head launch the engine copies the rows' new tiles into a compact head (device-to-device, no
     // re-quantisation) and maps the argmax back to token ids on the device, so MtpOut::top stays a token id. MtpOut::logits

@@ -65,6 +65,47 @@ ha::Pick naive(const std::vector<float>& x, std::uint32_t first) {
     }
     return p;
 }
+// Runner-up trait (Pick2): the same device shape with push2 per lane and merge2 for the butterfly and the chunk merge.
+bool same2(const ha::Pick2& a, const ha::Pick2& b) {
+    std::uint32_t va = 0, vb = 0;
+    std::memcpy(&va, &a.value2, 4);
+    std::memcpy(&vb, &b.value2, 4);
+    return same(a.first, b.first) && a.index2 == b.index2 && (a.index2 == ha::kNone || va == vb);
+}
+ha::Pick2 chunked2(const std::vector<float>& x, std::uint32_t first, std::uint32_t chunks, std::uint32_t threads,
+                   std::mt19937& rng) {
+    const auto count = static_cast<std::uint32_t>(x.size());
+    std::vector<ha::Pick2> parts(chunks);
+    for (std::uint32_t c = 0; c < chunks; ++c) {
+        std::uint32_t lo = 0, hi = 0;
+        ha::chunk_range(count, chunks, c, lo, hi);
+        std::vector<ha::Pick2> lane(threads);
+        for (std::uint32_t t = 0; t < threads; ++t)
+            for (std::uint32_t i = lo + t; i < hi; i += threads) {
+                const float y = x[i];
+                if (!std::isfinite(y)) ++lane[t].first.nonfinite;
+                else ha::push2(lane[t], y, first + i);
+            }
+        for (std::uint32_t d = threads / 2U; d; d /= 2U)
+            for (std::uint32_t t = 0; t < d; ++t) lane[t] = ha::merge2(lane[t], lane[t + d]);
+        parts[c] = lane[0];
+    }
+    std::shuffle(parts.begin(), parts.end(), rng);
+    ha::Pick2 p;
+    for (const auto& q : parts) p = ha::merge2(p, q);
+    return p;
+}
+// Runner-up written independently: the first maximum over the finite values other than the top-1 index.
+std::uint32_t naive_second(const std::vector<float>& x, std::uint32_t first, std::uint32_t top) {
+    std::uint32_t best = ha::kNone;
+    float bv = 0.0F;
+    for (std::size_t j = 0; j < x.size(); ++j) {
+        const auto i = static_cast<std::uint32_t>(first + j);
+        if (!std::isfinite(x[j]) || i == top) continue;
+        if (best == ha::kNone || x[j] > bv) { best = i; bv = x[j]; }
+    }
+    return best;
+}
 }  // namespace
 
 int main() {
@@ -88,6 +129,24 @@ int main() {
         for (const std::uint32_t chunks : chunk_set)
             for (const std::uint32_t threads : {32U, 256U})
                 check(same(chunked(x, first, chunks, threads, rng), ref), "chunked == reference");
+        const ha::Pick2 ref2 = ha::reference2(x, first);
+        check(same(ref2.first, ref), "top-2 trait: first == the top-1 pick (bits and index)");
+        check(ref2.index2 == naive_second(x, first, ref.index), "top-2 trait: runner-up == naive second first-max");
+        for (const std::uint32_t chunks : chunk_set)
+            for (const std::uint32_t threads : {32U, 256U})
+                check(same2(chunked2(x, first, chunks, threads, rng), ref2), "top-2 chunked == reference2");
+    }
+    {  // top-2 ties: equal values keep index order (+0 == -0); one finite value -> no runner-up
+        std::vector<float> x = {2.0F, 5.0F, 5.0F, -0.0F};
+        ha::Pick2 p = ha::reference2(x);
+        check(p.first.index == 1U && p.index2 == 2U, "top-2 tie at the max: 1 then 2");
+        x = {0.0F, -0.0F, -1.0F};
+        p = ha::reference2(x);
+        check(p.first.index == 0U && p.index2 == 1U, "top-2 +0 / -0: 0 then 1");
+        const float nan2 = std::numeric_limits<float>::quiet_NaN();
+        x = {nan2, 3.0F, nan2};
+        p = ha::reference2(x);
+        check(p.first.index == 1U && p.index2 == ha::kNone && p.first.nonfinite == 2U, "top-2 one finite: no runner-up");
     }
     {  // +0 == -0: the lower index wins whichever sign comes first
         std::vector<float> x = {-1.0F, -0.0F, 0.0F, -2.0F};
@@ -112,6 +171,7 @@ int main() {
     }
     check(ha::default_chunks(248320) == ha::kMaxChunks && ha::default_chunks(10) == 1U, "default chunks");
     check(ha::workspace_bytes(16) == 16U * 128U * 12U, "workspace bytes");
+    check(ha::workspace2_bytes(16) == 16U * 128U * 20U, "workspace2 bytes");
     {  // chunk_range covers [0, count) exactly once for every chunk count, including chunks > count
         bool ok = true;
         for (std::uint32_t count : {1U, 5U, 1000U, 248320U})
@@ -126,6 +186,44 @@ int main() {
                 if (next != count) ok = false;
             }
         check(ok, "chunk_range partition");
+    }
+    {  // Split-vocabulary pair words (MiniMax host head_argmax; device mirror in xport argmax_exchange).
+        const std::uint32_t half = 1000;
+        // The rule the MiniMax host scan used before binding: first max per half (`l[i] > l[best]`), then
+        // `v1 > v0 ? id1 : id0` across ranks. Finite rows only (it threw on the rank that saw a non-finite logit).
+        const auto legacy = [](const std::vector<float>& l0, const std::vector<float>& l1, std::uint32_t id0_1) {
+            std::uint32_t b0 = 0, b1 = 0;
+            for (std::uint32_t i = 0; i < l0.size(); ++i) if (l0[i] > l0[b0]) b0 = i;
+            for (std::uint32_t i = 0; i < l1.size(); ++i) if (l1[i] > l1[b1]) b1 = i;
+            return l1[b1] > l0[b0] ? id0_1 + b1 : b0;
+        };
+        const auto pair = [&](const std::vector<float>& l0, const std::vector<float>& l1) {
+            // Both ranks call pair_pick(rank 0's word, rank 1's word), so they agree by construction.
+            return ha::pair_pick(ha::pair_word(ha::reference(l0, 0)), ha::pair_word(ha::reference(l1, half)));
+        };
+        std::uniform_int_distribution<int> small(-4, 4);
+        bool same = true;
+        for (int t = 0; t < 2000; ++t) {
+            const auto ut = static_cast<std::size_t>(t);
+            const std::size_t n0 = 1 + ut % 37, n1 = 1 + ut % 23;
+            std::vector<float> l0(n0), l1(n1);
+            for (auto& v : l0) v = static_cast<float>(small(rng)) * 0.5F;  // many planted ties within and across halves
+            for (auto& v : l1) v = static_cast<float>(small(rng)) * 0.5F;
+            if (ut % 5 == 0) l0[ut % n0] = -0.0F;
+            if (ut % 7 == 0) l1[ut % n1] = 0.0F;
+            same &= pair(l0, l1) == legacy(l0, l1, half);
+        }
+        check(same, "pair pick == legacy MiniMax host rule on finite rows (ties, +0/-0)");
+        check(pair({1.0F, 2.0F}, {2.0F, 1.0F}) == 1U, "pair tie across halves -> rank 0");
+        check(pair({-0.0F}, {0.0F}) == 0U, "pair +0 == -0 -> rank 0");
+        check(pair({1.0F, 2.0F}, {2.5F, 2.5F}) == half, "pair rank 1 larger -> its first max");
+        check(pair({1.0F, nan}, {2.0F}) == ha::kNone, "pair NaN on rank 0 fails both");
+        check(pair({1.0F}, {inf, 0.0F}) == ha::kNone, "pair +inf on rank 1 fails both");
+        check(pair({-inf}, {1.0F}) == ha::kNone, "pair -inf fails both");
+        const auto w = ha::pair_word(ha::reference(std::vector<float>{3.5F, 7.25F, 7.25F}, 40));
+        float v = 0.0F;
+        std::memcpy(&v, &w.value_bits, 4);
+        check(w.index == 41U && v == 7.25F, "pair word carries value bits + global index");
     }
     std::printf("%s head_argmax: %d failures\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

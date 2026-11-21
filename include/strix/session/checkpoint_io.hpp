@@ -20,10 +20,10 @@ struct Options {
     bool durable = true;
     DirectIo direct = DirectIo::buffered;
     unsigned permissions = 0600;
-    std::string temporary_prefix; // optional legacy accounting name, within target directory
+    std::string temporary_prefix{}; // optional legacy accounting name, within target directory
     bool sync_parent = true; // a grouped adopter may sync all payload names before its manifest
     bool drop_page_cache = false; // POSIX buffered publication: advise after sync, before close
-    std::string temporary_suffix; // optional accounting extension (for example .tmp)
+    std::string temporary_suffix{}; // optional accounting extension (for example .tmp)
 };
 enum class Operation { none, allocation, create, read, write, sync, replace, directory_sync };
 class Error : public std::runtime_error {

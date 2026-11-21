@@ -83,6 +83,12 @@ struct Config {
     // Tensor-core GSQ experts (gsq_bf16_mma) in steps of <= 16 rows run the decode tile form (bitwise the tile form);
     // false = the tile form at every row count (lever row expert_decode_tile).
     bool expert_decode_tile = true;
+    // Tensor-core GSQ experts: launches averaging >= native_mma::kWideMinAvgRows rows per expert run the wide 128-row tile
+    // form (bitwise the tile form; lever row expert_wide_tile, opt-in until its timing receipt).
+    bool expert_wide_tile = false;
+    // Its planner parameter: minimum average rows per expert of a launch for the wide form (0 = native_mma::kWideMinAvgRows);
+    // the lever value `--expert-wide-tile N`, measured per device by the no-model tile bench (TILEWIDE line).
+    std::uint32_t expert_wide_min_rows = 0;
     // Explicit unqualified CUDA A8 route-storage candidate. Omitted: environment;
     // false: individual OFF. Baseline/defaults/exact masters always suppress it.
     std::optional<bool> moe_route_bf16;
@@ -373,6 +379,10 @@ public:
     void set_multiseg(bool on);
     void set_graph_cap(std::size_t cap);            // LRU cap (>= 1); evicts down to it now
     [[nodiscard]] std::string graph_stats() const;
+    // Single-session draft() chains since load (JSON): chains, steps launched / kept, host turns ("second": segments after
+    // the first), split chains, host wall ms, graph captures / replays, histogram of kept drafts
+    // (strix/mtp_draft_split.hpp). Receipt counters only.
+    [[nodiscard]] std::string draft_stats() const;
     [[nodiscard]] GraphCounters graph_counters() const;
     [[nodiscard]] std::uint32_t max_positions() const;
 

@@ -9,7 +9,9 @@
 #include <cstdlib>
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sp = strix::spec;
@@ -84,6 +86,43 @@ struct FakeFedEngine : FakeEngine {
     }
 };
 static_assert(!sp::MtpFeedEngine<FakeEngine> && sp::MtpFeedEngine<FakeFedEngine>, "feed hook detection");
+// The fed fake with the runner-up hook: a slot's runner-up is its id + 1000 (wherever the id came from).
+struct FakeRuEngine : FakeFedEngine {
+    std::uint32_t feed2[kMtpFeedSlots]{};
+    FakeMtpOut mtp_step_fed(const std::uint32_t* in_host, std::uint32_t in_slot, std::uint32_t out_slot, const float* hidden,
+                            std::uint32_t pos, bool want_top) {
+        const FakeMtpOut o = FakeFedEngine::mtp_step_fed(in_host, in_slot, out_slot, hidden, pos, want_top);
+        if (want_top) feed2[out_slot] = feed[out_slot] + 1000U;
+        return o;
+    }
+    void mtp_feed_put(std::uint32_t slot, const std::uint32_t* top) {
+        feed[slot] = *top;
+        feed2[slot] = *top + 1000U;
+    }
+    void mtp_feed_read2(std::uint32_t n, std::uint32_t* host, std::uint32_t* host2) {
+        mtp_feed_read(n, host);
+        std::memcpy(host2, feed2, n * 4U);
+    }
+};
+static_assert(sp::MtpRunnerUpEngine<FakeRuEngine> && !sp::MtpRunnerUpEngine<FakeFedEngine>, "runner-up hook detection");
+// The same fake with the KV-only rows hook: rows outside the trailing `outputs` get poisoned outputs (NaN hidden, a top id
+// no other row produces), so any read of them changes a later call's hidden operand or a proposal.
+struct FakeKvEngine : FakeEngine {
+    using FakeEngine::mtp_forward;
+    std::vector<std::pair<unsigned, bool>> kv_calls;  // (outputs, want_top) of every 6-argument call
+    unsigned kv_only_rows = 0;
+    FakeMtpOut mtp_forward(const std::uint32_t* t, const float* hidden, unsigned rows, unsigned pos0, bool want_top, unsigned outputs) {
+        const FakeMtpOut o = mtp_forward(t, hidden, rows, pos0, want_top);
+        kv_calls.emplace_back(outputs, want_top);
+        for (unsigned r = 0; r + std::min(outputs, rows) < rows; ++r) {
+            out_h[r * kH] = std::numeric_limits<float>::quiet_NaN();
+            out_top[r] = 0xBADu;
+            ++kv_only_rows;
+        }
+        return o;
+    }
+};
+static_assert(!sp::MtpKvRowsEngine<FakeEngine> && sp::MtpKvRowsEngine<FakeKvEngine>, "KV-only rows hook detection");
 
 // The fed fake with the verify pre-launch hooks: the async read snapshots the slots into staging (what the device copy
 // sees in stream order); the wait returns that snapshot. `order` records a (async read), l (launch), w (wait).
@@ -363,6 +402,28 @@ int main() {
                  "call %zu differs", i);
     MC_CHECK(fed_reads == 70, "the k = 70 draft falls back to one read per position (max %llu)", (unsigned long long)fed_reads);
     MC_CHECK(host_reads == 70, "host path reads once per position (max %llu)", (unsigned long long)host_reads);
+    // KV-only rows == every row computed: same calls, same proposals; flush chunks pass outputs 0, the final chunk 1
+    {
+        FakeEngine pe;
+        FakeKvEngine ke;
+        std::uint64_t pr = 0, kr = 0;
+        bool pfed = false, kfed = false;
+        const auto pp = scenario(pe, pr, pfed);
+        const auto kp = scenario(ke, kr, kfed);
+        MC_CHECK(pp == kp, "KV-only proposals differ (%zu vs %zu ids)", pp.size(), kp.size());
+        MC_CHECK(pe.calls.size() == ke.calls.size(), "KV-only call count %zu vs %zu", pe.calls.size(), ke.calls.size());
+        for (std::size_t i = 0; i < pe.calls.size(); ++i)
+            MC_CHECK(pe.calls[i].tokens == ke.calls[i].tokens && pe.calls[i].hidden0 == ke.calls[i].hidden0 &&
+                         pe.calls[i].pos0 == ke.calls[i].pos0 && pe.calls[i].want_top == ke.calls[i].want_top,
+                     "KV-only call %zu differs (a poisoned row was read)", i);
+        bool saw_none = false;
+        for (const auto& [outputs, want_top] : ke.kv_calls) {
+            MC_CHECK(outputs == (want_top ? 1U : 0U), "flush chunk outputs %u with want_top %d", outputs, int(want_top));
+            saw_none = saw_none || outputs == 0U;
+        }
+        MC_CHECK(!ke.kv_calls.empty() && saw_none && ke.kv_only_rows > 0U, "KV-only hook engaged (%zu calls, %u rows)",
+                 ke.kv_calls.size(), ke.kv_only_rows);
+    }
     std::uint64_t fed_small = 0;
     {
         FakeFedEngine f2;
@@ -464,6 +525,50 @@ int main() {
         FakeFedEngine f4;
         sp::MtpChain<FakeFedEngine, HostDev> c4(f4, false, 3, 8);
         MC_CHECK(!c4.draft_prelaunch({}, 2, out, grab), "engine without the pre-launch hooks: declined");
+    }
+    {  // token tree: the accepted path's verify rows (0, 2, 4) are caught up, not rows 0..2
+        FakeEngine et;
+        sp::MtpChain<FakeEngine, HostDev> ct(et, false, 3, 8);
+        ct.observe_prefill(pf, 5, prompt, 99);
+        ct.draft({}, 2, out);
+        std::vector<float> th(5 * kH, 0.0F);
+        for (unsigned i = 0; i < 5; ++i) th[i * kH] = 100.0F + 10.0F * float(i);
+        FakeRows tr;
+        tr.hidden_post = tr.hidden_pre = th.data();
+        ct.observe_verify(tr, 5);
+        const std::uint32_t path[3] = {0, 2, 4}, temitted[3] = {601, 602, 603};
+        ct.accept_path(temitted, path);
+        const auto b0 = et.calls.size();
+        ct.draft({}, 1, out);
+        MC_CHECK(et.calls.size() == b0 + 1 && et.calls[b0].tokens == std::vector<std::uint32_t>({601, 602, 603}), "tree catch-up tokens");
+        MC_CHECK(et.calls[b0].hidden0 == std::vector<float>({100.0F, 120.0F, 140.0F}), "tree catch-up hidden = path rows");
+        const std::uint32_t lin[2] = {0, 1}, lemitted[2] = {604, 605};  // a linear path = one copy, as accept()
+        ct.observe_verify(tr, 5);
+        ct.accept_path(lemitted, lin);
+        const auto b1 = et.calls.size();
+        ct.draft({}, 1, out);
+        MC_CHECK(et.calls[b1].hidden0 == std::vector<float>({100.0F, 110.0F}), "linear path hidden");
+        MC_CHECK(ct.runner_ups().empty(), "no runner-up hook: no runner-ups");
+    }
+    {  // runner-ups ride with the ids: flushed d1 (slot 0), copy-prefix prediction (slot 1), chain steps, host d1 reuse
+        FakeRuEngine er;
+        sp::MtpChain<FakeRuEngine, HostDev> cr(er, false, 3, 8);
+        cr.observe_prefill(pf, 5, prompt, 99);
+        auto aligned = [&](const char* what) {
+            const auto ru = cr.runner_ups();
+            MC_CHECK(ru.size() == out.size(), "%s: %zu runner-ups for %zu drafts", what, ru.size(), out.size());
+            for (std::size_t j = 0; j < out.size(); ++j)
+                MC_CHECK(ru[j] == out[j] + 1000U, "%s: runner-up %zu = %u for draft %u", what, j, ru[j], out[j]);
+        };
+        cr.draft({}, 4, out);
+        aligned("flush + chain");
+        cr.draft({}, 2, out);
+        aligned("host d1, no flush");
+        cr.draft(std::vector<std::uint32_t>({8, 9}), 3, out);
+        aligned("copy prefix");
+        cr.set_device_feed(false);
+        cr.draft({}, 2, out);
+        MC_CHECK(cr.runner_ups().empty(), "host-fed draft: no runner-ups");
     }
     std::puts("spec_mtp_chain_tests: PASS");
     return 0;

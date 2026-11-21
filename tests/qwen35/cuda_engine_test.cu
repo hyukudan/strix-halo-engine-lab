@@ -13,6 +13,7 @@
 
 #include "strix/qwen35/cuda_engine.hpp"
 #include "strix/cuda_core/dense_big.hpp"
+#include "strix/spec/tree_window.hpp"
 
 namespace q = strix::qwen35;
 static int g_fail = 0;
@@ -87,6 +88,63 @@ static void run_chain(q::CudaEngine& E, const std::vector<std::uint32_t>& tok, R
         // later windows overwrite the same positions with identical bits when the engine is exact.
     }
     if (mark) std::printf("  chain: %d full, %d partial, %d zero commits\n", full, partial, zero_k);
+}
+
+// Token-tree windows (strix/spec/tree_window.hpp) over the teacher-forced stream tok: chain drafts true up to a random wrong
+// depth, leaf siblings (some = the true token at the wrong depth). Every row whose path is a prefix of tok must give the
+// serial bits (logits + hidden) at its position; the commit takes the true path (a true leaf: K/V move + path replay), so
+// every later window also checks the committed state.
+static void run_tree(q::CudaEngine& E, const std::vector<std::uint32_t>& tok, const Rec& ser, std::mt19937& rng, bool mark) {
+    namespace sp = strix::spec;
+    const auto& c = E.config();
+    E.reset();
+    std::size_t pos = 0;
+    int compared = 0, leaf_true = 0, taken = 0, mism = 0;
+    std::vector<float> lg(c.vocab), hd(32 * c.hidden);
+    while (pos + 1 < tok.size()) {
+        const auto n = static_cast<std::uint32_t>(std::min<std::size_t>(1 + rng() % 12, tok.size() - pos - 1));
+        const std::uint32_t wrong = 1 + static_cast<std::uint32_t>(rng() % (n + 1));  // > n: every draft true
+        sp::Block b;
+        for (std::uint32_t j = 1; j <= n; ++j) {
+            const std::uint32_t truth = tok[pos + j];
+            const std::uint32_t d = j < wrong ? truth : (truth + 1 + static_cast<std::uint32_t>(rng() % 2000)) % 2048;
+            std::uint32_t alt = (j == wrong && rng() % 2 == 0) ? truth : (d + 1 + static_cast<std::uint32_t>(rng() % 2000)) % 2048;
+            if (alt == d) alt = (d + 1) % 2048;
+            const bool sib = n + 1 + b.siblings < 32 && rng() % 2 == 0;
+            b.drafts.push_back(d);
+            b.alts.push_back(alt);
+            b.sib.push_back(sib ? 1 : 0);
+            b.siblings += sib ? 1 : 0;
+        }
+        sp::TreeRows t;
+        b.tree_rows(tok[pos], t);
+        const auto w = sp::tree_window(t);
+        const auto o = E.forward_tree(t.tokens.data(), w, q::LogitRows::all);
+        E.read_hidden(o.hidden_post, w.rows, hd.data());
+        std::vector<std::uint8_t> on(w.rows, 0);
+        std::vector<std::uint32_t> greedy(w.rows, 0xffffffffu);
+        on[0] = 1;
+        for (std::uint32_t r = 0; r < w.rows; ++r) {
+            if (r > 0) on[r] = on[static_cast<std::size_t>(t.parent[r])] && t.tokens[r] == tok[pos + w.pos[r]];
+            if (!on[r]) continue;
+            const std::size_t p = pos + w.pos[r];
+            greedy[r] = tok[p + 1];
+            E.read_logits(o, r, lg.data());
+            const bool ok = std::memcmp(lg.data(), &ser.logits[p * c.vocab], c.vocab * 4) == 0 &&
+                            std::memcmp(&hd[static_cast<std::size_t>(r) * c.hidden], &ser.hidden[p * c.hidden], c.hidden * 4) == 0;
+            mism += ok ? 0 : 1;
+            ++compared;
+            leaf_true += (w.leaf >> r & 1u) ? 1 : 0;
+        }
+        const auto acc = sp::accept_tree(t, greedy);
+        taken += acc.sibling ? 1 : 0;
+        const auto pc = sp::path_commit(w, acc.path);
+        E.commit_path(pc);
+        pos += pc.accepted;
+    }
+    CHECK(mism == 0, "tree rows differ from serial: %d of %d", mism, compared);
+    CHECK(taken > 0 && leaf_true >= taken, "tree coverage: %d leaves taken", taken);
+    if (mark) std::printf("  tree: %d on-path rows == serial (%d true leaves, %d taken)\n", compared, leaf_true, taken);
 }
 
 static bool same(const std::vector<float>& a, const std::vector<float>& b) {
@@ -222,7 +280,11 @@ int main(int argc, char** argv) {
         E->set_graphs(false);
         run_chain(*E, tok, chg, rng, false);
         CHECK(same(ser.logits, chg.logits), "graph-off chain logits differ from serial");
+        run_tree(*E, tok, ser, rng, false);  // token tree, graphs off
         E->set_graphs(true);
+        run_tree(*E, tok, ser, rng, true);  // token tree, graphs on (tree graphs keyed apart from the linear ones)
+        run_chain(*E, tok, chg, rng, false);  // linear windows after tree windows: unchanged
+        CHECK(same(ser.logits, chg.logits), "chain after tree differs from serial");
         {  // Every pack, including mixed eligible/ineligible BF16 and Q8 projections.
             opt.multi_gemv = false;
             opt.use_graphs = false;

@@ -21,6 +21,16 @@ struct AttentionDims {
 cudaError_t kv_store(const AttentionDims& d, const float* k, const float* v, __nv_bfloat16* k_cache,
                      __nv_bfloat16* v_cache, const std::uint32_t* pos0_dev, std::uint32_t rows, cudaStream_t stream, const RowMap& rm = {});
 
+// Token-tree commit (strix/spec/tree_window.hpp): copies the K and V row at index `from` to index `to` (every KV head) in each of
+// the `layers` single-session caches (bits copied, no conversion). One launch for all layers.
+constexpr std::uint32_t kMaxKvMoveLayers = 64;
+struct KvLayerCaches {
+    __nv_bfloat16* k[kMaxKvMoveLayers];
+    __nv_bfloat16* v[kMaxKvMoveLayers];
+};
+cudaError_t kv_move_row(const AttentionDims& d, const KvLayerCaches& caches, std::uint32_t layers, std::uint32_t from, std::uint32_t to,
+                        cudaStream_t stream);
+
 constexpr std::uint32_t kAttnChunk = 256;  // positions per reduction chunk
 [[nodiscard]] __host__ __device__ inline std::uint32_t attn_max_chunks(const AttentionDims& d) { return (d.max_positions + kAttnChunk - 1) / kAttnChunk; }
 
@@ -114,6 +124,7 @@ inline cudaError_t attention_decode_kv(const AttentionDims& d, const float* q, c
                                        const KvShadowE4m3* kv8, const std::uint32_t* pos0_dev, std::uint32_t rows, float* out,
                                        float* scratch, cudaStream_t stream, const RowMap& rm = {}) {
     if (kv8 == nullptr) return attention_decode(d, q, qv, gate, gv, k_cache, v_cache, pos0_dev, rows, out, scratch, stream, rm);
+    if (rm.self != nullptr) return cudaErrorNotSupported;  // the e4m3 shadow is indexed by position: no token-tree leaf K/V index
     if (const cudaError_t e = kv_shadow_e4m3_rows(d, k_cache, v_cache, *kv8, pos0_dev, rows, stream, rm); e != cudaSuccess) return e;
     return attention_decode8(d, q, qv, gate, gv, *kv8, pos0_dev, rows, out, scratch, stream, rm);
 }

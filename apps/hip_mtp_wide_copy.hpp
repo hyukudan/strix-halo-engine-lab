@@ -28,7 +28,8 @@
 #include <vector>
 
 namespace strix::decode_cli {
-// Wide copy verify (opt-in, --mtp-copy-wide-rows 32[,16] with --mtp-ngram-draft=copy on the tiled MTP prompt; each
+// Wide copy verify (--mtp-copy-wide-rows 32[,16]|auto with --mtp-ngram-draft=copy|wide on the tiled MTP prompt, or the
+// served default of apps/hip_decode_options.hpp apply_mtp_copy_wide_default; each
 // listed size has its own tiled tail owner, tried largest first, sharing the snapshot and hidden-row buffers).
 //
 // A cycle whose context drafter has a long, confident, unanimous copy span (HipMtpGreedyRuntime::propose_wide)

@@ -155,6 +155,33 @@ STRIX_NVFP4_TILE_HD StageChunk stage_chunk(std::uint32_t c, std::uint32_t tile_m
     }
     return r;
 }
+// ---- the same stage as whole records (Feed::bulk): record i < kStageWRecs is weight slot i, the others activation slot
+// i - kStageWRecs. A record is the contiguous run of stage_chunk chunks with one source and step == its size, so copying records
+// lands the same bytes at the same stage offsets as copying chunks (tile_host checks it chunk by chunk). !ok records are not
+// copied; their slots hold zeros, as the zero-filled chunks do.
+inline constexpr std::uint32_t kStageRecs = kStageWRecs + kStageXRecs;
+struct StageRecord {
+    std::size_t base;
+    std::uint32_t dst, bytes, which;
+    bool ok;
+};
+STRIX_NVFP4_TILE_HD StageRecord stage_record(std::uint32_t i, std::uint32_t tile_m, std::uint32_t tile_n, bool glu, std::uint32_t ks_count,
+                                             std::uint32_t w_tiles, std::uint32_t x_tiles) {
+    const bool wrec = i < kStageWRecs;
+    const std::uint32_t c = wrec ? i * (kWRec / 16) : kStageChunksW + (i - kStageWRecs) * (kXRec / 16);
+    const StageChunk q = stage_chunk(c, tile_m, tile_n, glu, ks_count, w_tiles, x_tiles);
+    return StageRecord{q.base, q.dst, wrec ? kWRec : kXRec, q.which, q.ok};
+}
+// bytes one stage of tile (tile_m, tile_n) receives from bulk copies (the mbarrier transaction count)
+STRIX_NVFP4_TILE_HD std::uint32_t stage_bytes(std::uint32_t tile_m, std::uint32_t tile_n, bool glu, std::uint32_t ks_count,
+                                              std::uint32_t w_tiles, std::uint32_t x_tiles) {
+    std::uint32_t n = 0;
+    for (std::uint32_t i = 0; i < kStageRecs; ++i) {
+        const StageRecord r = stage_record(i, tile_m, tile_n, glu, ks_count, w_tiles, x_tiles);
+        if (r.ok) n += r.bytes;
+    }
+    return n;
+}
 STRIX_NVFP4_TILE_HD std::uint32_t act_row(std::uint32_t tile_n, std::uint32_t wn, std::uint32_t nt, std::uint32_t t, std::uint32_t z) {
     return (tile_n * 32 + wn * 8 + nt) * 8 + 2 * t + (z & 1);
 }
@@ -165,6 +192,29 @@ enum class Epi : std::uint32_t {
     silu_mul,  // y = silu(aux) * (acc * (gs * rs))
     glu,       // y[ch] = silu(gate * (gs * rs)) * (up * (gs2 * rs)); w = gate tile, w2 = up tile, out = channels
 };
+// Stage feed trait (scheduling only: same stage bytes at the same shared offsets, same fragment loads and MMA order per
+// accumulator -> bitwise-identical output; kArithmeticId and every identity are unchanged by it).
+//   lsu : every thread copies 16-byte chunks with cp.async and the CTA synchronises once per stage (the incumbent).
+//   bulk: one producer warp copies each record with one 1-D bulk copy into a full / empty mbarrier ring; the eight MMA warps
+//         wait for and release each stage per warp.
+enum class Feed : std::uint32_t { lsu, bulk };
+// Keep the established lsu feed by default. The measured bulk feed is explicit opt-in until end-to-end
+// FAST4 prefill regression and bitwise receipts are available on the target CUDA hardware.
+// --prefill-tile-feed lsu restores this default; feed does not alter the arithmetic identity.
+inline constexpr Feed kDefaultFeed = Feed::lsu;
+inline constexpr const char* feed_name(Feed f) { return f == Feed::bulk ? "bulk" : f == Feed::lsu ? "lsu" : "?"; }
+// Strict spelling "bulk" | "lsu"; anything else returns false and leaves *out unchanged.
+inline bool parse_feed(const char* s, Feed* out) {
+    if (s == nullptr || out == nullptr) return false;
+    const auto eq = [](const char* a, const char* b) {
+        while (*a != '\0' && *a == *b) ++a, ++b;
+        return *a == *b;
+    };
+    if (eq(s, "bulk")) *out = Feed::bulk;
+    else if (eq(s, "lsu")) *out = Feed::lsu;
+    else return false;
+    return true;
+}
 struct GemmArgs {
     const std::uint8_t* w = nullptr;   // W tile layout, out rows (glu: gate, channels rows)
     const std::uint8_t* w2 = nullptr;  // glu: up, same shape
@@ -172,25 +222,35 @@ struct GemmArgs {
     const float* rs = nullptr;         // [rows_pad] row scales
     const float* aux = nullptr;        // residual / gate input, [rows][out]
     float* y = nullptr;                // [rows][out]
+    // Output trait (glu only): BF16 rows instead of y, identity "nvfp4-tile-h16-v1": each element is the FP32 value the y form
+    // stores, rounded to BF16 (round to nearest even), as a bit pattern. Exactly one of y / y16 is set.
+    std::uint16_t* y16 = nullptr;      // [rows][out]
     float gs = 1.f, gs2 = 1.f;         // FP32 tensor scales of w, w2
     std::uint32_t out = 0, in = 0, rows = 0, rows_pad = 0;
     Epi epi = Epi::store;
+    Feed feed = kDefaultFeed;
 };
+inline constexpr const char* kIdentityH16 = "nvfp4-tile-h16-v1";
 STRIX_NVFP4_TILE_HD bool bytes_disjoint(const void* p, std::size_t pb, const void* q, std::size_t qb) {
     const std::uintptr_t a = reinterpret_cast<std::uintptr_t>(p), b = reinterpret_cast<std::uintptr_t>(q);
     return a + pb <= b || b + qb <= a;
 }
 // host validation of the shape contract (no device work). Aliasing contract of the epilogue (it issues all of a thread's rs / aux
 // loads before that thread's y stores): each y element is read only by the thread that writes it, so aux is y itself (in place)
-// or disjoint from y, and rs never overlaps y.
+// or disjoint from y, and rs never overlaps y. The BF16 output (y16) is glu only (no aux) and never overlaps rs.
 STRIX_NVFP4_TILE_HD bool valid(const GemmArgs& a) {
-    if (!a.w || !a.x || !a.rs || !a.y || a.out == 0 || a.out % 16 || a.in == 0 || a.in % kK || a.rows == 0) return false;
+    if ((a.y == nullptr) == (a.y16 == nullptr)) return false;
+    if (a.y16 && a.epi != Epi::glu) return false;
+    if (!a.w || !a.x || !a.rs || a.out == 0 || a.out % 16 || a.in == 0 || a.in % kK || a.rows == 0) return false;
     if (a.rows_pad != rows_padded(a.rows)) return false;
     if ((a.epi == Epi::residual || a.epi == Epi::silu_mul) && !a.aux) return false;
     if (a.epi == Epi::glu && !a.w2) return false;
-    const std::size_t ybytes = static_cast<std::size_t>(a.rows) * a.out * sizeof(float);
-    if (!bytes_disjoint(a.rs, static_cast<std::size_t>(a.rows_pad) * sizeof(float), a.y, ybytes)) return false;
-    if (a.aux && a.aux != a.y && !bytes_disjoint(a.aux, ybytes, a.y, ybytes)) return false;
+    if (a.feed != Feed::lsu && a.feed != Feed::bulk) return false;
+    const std::size_t elems = static_cast<std::size_t>(a.rows) * a.out;
+    const void* const yp = a.y16 ? static_cast<const void*>(a.y16) : static_cast<const void*>(a.y);
+    const std::size_t ybytes = elems * (a.y16 ? sizeof(std::uint16_t) : sizeof(float));
+    if (!bytes_disjoint(a.rs, static_cast<std::size_t>(a.rows_pad) * sizeof(float), yp, ybytes)) return false;
+    if (a.aux && a.aux != a.y && !bytes_disjoint(a.aux, elems * sizeof(float), yp, ybytes)) return false;
     return true;
 }
 }  // namespace strix::cuda::core::nvfp4::tile

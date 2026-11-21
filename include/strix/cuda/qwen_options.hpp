@@ -134,6 +134,9 @@ inline void apply(const cp::Choice& choice, qp::Config& config) {
     config.defer_prompt_mtp = config.defer_prompt_mtp || choice.mtp_defer_prompt;
     // Config::expert_decode_tile (exact schedule trait): the lever row `expert_decode_tile` (on unless switched off).
     config.expert_decode_tile = config.expert_decode_tile && choice.expert_decode_tile;
+    // Config::expert_wide_tile (exact schedule trait): the lever row `expert_wide_tile` (opt-in).
+    config.expert_wide_tile = config.expert_wide_tile || choice.expert_wide_tile;
+    if (config.expert_wide_min_rows == 0U) config.expert_wide_min_rows = choice.expert_wide_min_rows;
     // TURBO / FAST expert rows: an explicit --expert-arithmetic other than incumbent keeps its own contract (every MoE call).
     // expert_turbo runs the int8 experts in its regime (expert_turbo_rows: prefill blocks of >= N rows); every other MoE
     // call keeps the arithmetic the run has without it (expert_fast: the BF16 FAST experts, else the pack's own), so

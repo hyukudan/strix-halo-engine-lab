@@ -9,18 +9,18 @@ constexpr std::size_t kSuffixCells = 3;  // suffix 2, 3, 4+
 constexpr std::size_t kRowCells = 3;     // row 0, 1-2, 3+
 constexpr std::size_t kPeerFirst = kSuffixCells * 2 * kRowCells; // then one row-bucketed group for peer proposals
 
-std::uint64_t mix(std::uint64_t h, std::uint32_t t) noexcept {
-    h ^= t + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-    return h * 0xff51afd7ed558ccdULL;
-}
-std::uint64_t hash_of(const std::uint32_t* begin, std::size_t n) noexcept {
-    std::uint64_t h = 0xcbf29ce484222325ULL;
-    for (std::size_t i = 0; i < n; ++i) h = mix(h, begin[i]);
-    return h;
+// Exact common suffix of S (accessed through at, `total` tokens) and of `context` up to `end`, capped at `cap`.
+template <class At>
+std::uint32_t common_suffix(const std::vector<std::uint32_t>& context, std::size_t end, const At& at, std::size_t total,
+    std::uint32_t cap) noexcept {
+    std::uint32_t m = 0;
+    while (m < cap && m <= end && m < total && context[end - m] == at(total - 1 - m)) ++m;
+    return m;
 }
 }  // namespace
 
-MtpNgramDraft::MtpNgramDraft(MtpNgramDraftConfig config) : config_(config) {
+MtpNgramDraft::MtpNgramDraft(MtpNgramDraftConfig config)
+    : config_(config), index_(std::max<std::uint32_t>(config.min_suffix, 1U)) {
     if (config_.min_suffix < 1 || config_.max_suffix < config_.min_suffix || config_.max_suffix > 8 ||
         !config_.max_rows || config_.prior <= 0.0 || config_.prior >= 1.0 || config_.prior_weight <= 0.0)
         throw std::invalid_argument("MTP n-gram draft configuration is out of range");
@@ -42,14 +42,13 @@ void MtpNgramDraft::reset(std::span<const std::uint32_t> prompt) {
     shadow_ = {};
     stats_ = {};
     context_.reserve(prompt.size() + 1024);
+    index_.reserve(prompt.size() + 1024);
     for (const auto t : prompt) push(t);
 }
 
 void MtpNgramDraft::push(std::uint32_t token) {
     context_.push_back(token);
-    const auto end = context_.size() - 1;
-    for (std::uint32_t n = config_.min_suffix; n <= config_.max_suffix && n <= context_.size(); ++n)
-        index_[Key{hash_of(&context_[end + 1 - n], n), n}].push_back(static_cast<std::uint32_t>(end));
+    index_.push(context_);
 }
 
 double MtpNgramDraft::acceptance(std::uint32_t suffix, bool supported, std::size_t row) const {
@@ -73,24 +72,23 @@ std::vector<std::uint32_t> MtpNgramDraft::peer_lookup(std::span<const std::uint3
     const auto lowest = std::max(config_.peer_min_suffix, config_.min_suffix);
     for (std::uint32_t n = config_.max_suffix; n >= lowest; --n) {
         if (total < n) continue;
-        key.clear();
-        for (std::size_t i = total - n; i < total; ++i) key.push_back(at(i));
-        const Key k{hash_of(key.data(), n), n};
         for (const auto* peer : peers_) {
             if (!peer || peer == this || peer->config_.min_suffix > n || peer->config_.max_suffix < n) continue;
-            const auto hit = peer->index_.find(k);
-            if (hit == peer->index_.end()) continue;
+            // The peer's most recent end of an exact n-token match with a continuation: its key candidates, measured.
             const auto& pc = peer->context_;
-            for (auto e = hit->second.rbegin(); e != hit->second.rend(); ++e) {
-                const std::size_t end = *e;
-                if (end + 1 >= pc.size()) continue;  // no continuation yet
-                bool same = true;
-                for (std::uint32_t q = 0; q < n && same; ++q) same = pc[end + 1 - n + q] == key[q];
-                if (!same) continue;
-                std::vector<std::uint32_t> out;
-                for (std::size_t i = end + 1; i < pc.size() && out.size() < length; ++i) out.push_back(pc[i]);
-                return out;
-            }
+            key.assign(peer->config_.min_suffix, 0U);
+            for (std::size_t i = 0; i < key.size(); ++i) key[i] = at(total - key.size() + i);
+            std::size_t chosen = SIZE_MAX;
+            peer->index_.for_each(key, [&](std::size_t end) {
+                if (end + 1 >= pc.size()) return true;  // no continuation yet
+                if (common_suffix(pc, end, at, total, n) < n) return true;
+                chosen = end;
+                return false;
+            });
+            if (chosen == SIZE_MAX) continue;
+            std::vector<std::uint32_t> out;
+            for (std::size_t i = chosen + 1; i < pc.size() && out.size() < length; ++i) out.push_back(pc[i]);
+            return out;
         }
     }
     return {};
@@ -101,35 +99,34 @@ std::vector<std::uint32_t> MtpNgramDraft::lookup(std::span<const std::uint32_t> 
     suffix = 0; support = 0;
     const auto total = context_.size() + extra.size();
     const auto at = [&](std::size_t i) { return i < context_.size() ? context_[i] : extra[i - context_.size()]; };
-    std::vector<std::uint32_t> key;
-    for (std::uint32_t n = config_.max_suffix; n >= config_.min_suffix; --n) {
-        if (total < n) continue;
-        key.clear();
-        for (std::size_t i = total - n; i < total; ++i) key.push_back(at(i));
-        const auto hit = index_.find(Key{hash_of(key.data(), n), n});
-        if (hit == index_.end()) continue;
-        // Most recent earlier occurrence that really matches (hash collisions are checked) and is not the
-        // suffix itself.
-        const auto& ends = hit->second;
-        std::size_t chosen = SIZE_MAX;
-        std::uint32_t count = 0;
-        std::uint32_t first = 0;
-        for (auto e = ends.rbegin(); e != ends.rend(); ++e) {
-            const std::size_t end = *e;
-            if (end + 1 >= total) continue;
-            bool same = true;
-            for (std::uint32_t k = 0; k < n && same; ++k) same = context_[end + 1 - n + k] == key[k];
-            if (!same) continue;
-            if (chosen == SIZE_MAX) { chosen = end; first = at(end + 1); }
-            if (at(end + 1) == first) ++count;
-        }
-        if (chosen == SIZE_MAX) continue;
-        std::vector<std::uint32_t> out;
-        for (std::size_t i = chosen + 1; i < total && out.size() < length; ++i) out.push_back(at(i));
-        suffix = n; support = count;
-        return out;
+    const std::uint32_t min_n = config_.min_suffix;
+    if (total < min_n) return {};
+    std::vector<std::uint32_t> key(min_n);
+    for (std::size_t i = 0; i < min_n; ++i) key[i] = at(total - min_n + i);
+    // The longest exact suffix n (min_suffix..max_suffix) with an earlier occurrence that is not the suffix itself:
+    // the candidates of its min_suffix-token key (most recent first), each measured.
+    std::vector<std::pair<std::size_t, std::uint32_t>> found;  // (end, exact common suffix)
+    std::uint32_t n = 0;
+    index_.for_each(key, [&](std::size_t end) {
+        if (end + 1 >= total) return true;
+        const auto m = common_suffix(context_, end, at, total, config_.max_suffix);
+        if (m >= min_n) { found.emplace_back(end, m); n = std::max(n, m); }
+        return true;
+    });
+    // Its most recent occurrence supplies the continuation; support counts the occurrences continuing alike.
+    std::size_t chosen = SIZE_MAX;
+    std::uint32_t count = 0;
+    std::uint32_t first = 0;
+    for (const auto& [end, m] : found) {
+        if (m < n) continue;
+        if (chosen == SIZE_MAX) { chosen = end; first = at(end + 1); }
+        if (at(end + 1) == first) ++count;
     }
-    return {};
+    if (chosen == SIZE_MAX) return {};
+    std::vector<std::uint32_t> out;
+    for (std::size_t i = chosen + 1; i < total && out.size() < length; ++i) out.push_back(at(i));
+    suffix = n; support = count;
+    return out;
 }
 
 std::vector<std::uint32_t> MtpNgramDraft::begin_cycle(std::uint32_t pending, std::span<const std::uint32_t> drafts,

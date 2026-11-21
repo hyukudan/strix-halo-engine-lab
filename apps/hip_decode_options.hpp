@@ -164,18 +164,24 @@ struct MtpCliOptions {
     // =ctx / =copy (experimental, never by default): the context drafter (strix/mtp_context_draft.hpp) replaces
     // the extension, required like =on; copy also lets long context spans replace confident drafts.
     bool ngram_context=false,ngram_copy_edit=false;
-    // =wide (experimental, never by default): the extension as =on for every ordinary cycle, plus the copy context
-    // drafter only observing and proposing --mtp-copy-wide-rows cycles (no ordinary cycle changes).
+    // =wide: the extension as =on for every ordinary cycle, plus the copy context drafter only observing and proposing
+    // --mtp-copy-wide-rows cycles (no ordinary cycle changes). The served default (copy_wide_default) sets the same
+    // observing drafter without forcing the extension.
     bool ngram_wide_only=false;
-    // --mtp-copy-wide-rows N[,M] (0 or absent = off, the default; a descending list of distinct sizes from 32 and 16):
-    // with =copy on the tiled MTP prompt, a cycle whose context span is long, unanimous and confident verifies N-1
-    // copied tokens in one N-row tiled known forward (the N-row tiled tail owner, all-rows heads) instead of the
-    // 8-row verify window, trying the largest size first (apps/hip_mtp_wide_copy.hpp). Empty = off.
+    // --mtp-copy-wide-rows N[,M] (0 = off; a descending list of distinct sizes from 32 and 16): with =copy or =wide on
+    // the tiled MTP prompt, a cycle whose context span is long, unanimous and confident verifies N-1 copied tokens in
+    // one N-row tiled known forward (the N-row tiled tail owner, all-rows heads) instead of the 8-row verify window,
+    // trying the largest size first (apps/hip_mtp_wide_copy.hpp). Empty = off. Absent: off on the CLI, the served
+    // default on --http-serve (apply_mtp_copy_wide_default).
     std::vector<std::uint32_t> copy_wide_rows;
     // --mtp-copy-wide-rows auto: the sizes come from the shared wide-window rule (strix/spec/wide_window.hpp) over this
     // backend's measured table (hip_qwen_wide_copy_table); copy_wide_reason holds the rule's line per size.
     bool copy_wide_auto=false;
     std::string copy_wide_reason;
+    // The served default resolved the auto sizes (no --mtp-ngram-draft and no --mtp-copy-wide-rows was given).
+    bool copy_wide_default=false;
+    // The command named an n-gram mode / a wide size list (either one keeps the served default out).
+    bool ngram_mode_explicit=false,copy_wide_explicit=false;
     // --mtp-draft-profile NAME: a qualified draft (strix/mtp_draft_profiles.hpp) whose identity and
     // provenance pins fill the sidecar options that are not given (a given pin must agree).
     std::string draft_profile;
@@ -216,7 +222,7 @@ inline float mtp_draft_min_probability(const MtpCliOptions& m) {
     if(m.spec_min_p>=0.0) return static_cast<float>(m.spec_min_p);
     if(m.window_rows_set.empty()) return 0.0F;
     const auto* profile=find_mtp_draft_profile_by_sha256(m.sidecar_sha256);
-    return mtp_depth_domain_min_probability(profile?profile->min_probability:0.5F);
+    return mtp_depth_domain_min_probability(mtp_draft_backend_min_probability(profile,MtpDraftBackend::hip));
 }
 // The n-gram extension runs: explicitly required, or by default (auto) where it is admissible:
 // greedy, one request, the draft chain with prefix windows, a generation route. The bridge also leaves
@@ -584,9 +590,9 @@ inline bool cache_mtp_contract_qualified(const Options& o) {
         m.policy_identity==1 &&
         m.ngram_draft==false &&
         m.ngram_off==false &&
-        m.ngram_context==false &&
-        m.ngram_copy_edit==false &&
-        m.ngram_wide_only==false &&
+        // the served wide copy default is part of the bound command (its tokens are the ordinary windows' tokens)
+        (m.copy_wide_default || (m.ngram_context==false && m.ngram_copy_edit==false && m.ngram_wide_only==false &&
+            m.copy_wide_rows.empty())) &&
         m.sample_options==false &&
         m.sample_temperature==0 &&
         m.sample_top_p==1 &&
@@ -607,7 +613,7 @@ inline bool cache_mtp_contract_qualified(const Options& o) {
         m.runtime_bytes==134217728 &&
         m.target_capture_bytes==268435456 &&
         m.window_rows_set==std::vector<std::uint32_t>{2,4,8} &&
-        m.copy_wide_rows.empty() && m.cohort.empty() && m.cohort_mode.empty() &&
+        m.cohort.empty() && m.cohort_mode.empty() &&
         m.golden_dump.empty() && m.draft_profile.empty() && m.draft_vocab.starts_with("auto:") &&
         m.draft_vocab.size()>5 && m.sidecar_residency=="register" &&
         !o.rtx_state_import && o.rtx_state_import_decode_threads==4 &&
@@ -1135,24 +1141,24 @@ inline void validate_resolved_teacher_forced_score(const Options& options, std::
     if (!o.mtp.enabled) return "not-mtp";
     if (o.yarn_mtp_pool_off) return "disabled";
     if (!qpf2k::long_context_item_enabled("STRIX_QSA_MTP_POOL",gsq) || o.baseline) return "disabled";
+    const bool qualified_rotary=o.rotary.mode()!=RotaryMode::yarn ||
+        (o.rotary.factor()==2U && o.context_tokens<=524288U) || (o.rotary.factor()==4U && o.context_tokens<=1048576U);
     const bool qualified_cli=!o.http_serve && o.session_load.empty() && o.session_save.empty() &&
         !o.session_live_control && o.session_then_prompt.empty() && !o.session_mtp_fixed &&
         !o.session_management_requested && !o.prefix_cache_host_bytes && o.prefix_cache_dir.empty() &&
         o.prefix_cache_then_prompts.empty() && o.serving_prefix_files.empty() && !o.rtx_state_import && !o.prefix_cache_roundtrip &&
-        o.mtp.sample_repeats==1U &&
-        (o.rotary.mode()!=RotaryMode::yarn ||
-         (o.rotary.factor()==2U && o.context_tokens<=524288U) ||
-         (o.rotary.factor()==4U && o.context_tokens<=1048576U));
+        o.mtp.sample_repeats==1U && qualified_rotary;
     // HTTP serving, the single runner and every batch slot alike: each request owner holds its own service (one
     // per slot, charged per slot in the capacity fit), every admitted request starts a fresh epoch (batch
     // admission and cancellation included), the in-memory prefix-cache restore hook invalidates both domains and
     // the cohort cycle of concurrent slots scores each member from its own owner. Sessions, nested scheduling,
-    // disk prefix restore, state import and YaRN HTTP keep the explicit opt-in.
+    // disk prefix restore and state import keep the explicit opt-in. YaRN HTTP (single route only) takes the
+    // CLI's factor band, so the same request resolves the same pool route on both; YaRN batch slots keep the opt-in.
     const bool qualified_http=o.http_serve && !o.session_live_control &&
         o.session_load.empty() && o.session_save.empty() && o.session_then_prompt.empty() && !o.session_mtp_fixed &&
         !o.session_management_requested && o.prefix_cache_dir.empty() && o.prefix_cache_then_prompts.empty() &&
         o.serving_prefix_files.empty() && !o.rtx_state_import && !o.prefix_cache_roundtrip &&
-        o.mtp.sample_repeats==1U && o.rotary.mode()!=RotaryMode::yarn;
+        o.mtp.sample_repeats==1U && (o.http_batch ? o.rotary.mode()!=RotaryMode::yarn : qualified_rotary);
     const char* explicit_on=std::getenv("STRIX_QSA_MTP_POOL");
     if (!qualified_cli && !qualified_http && !o.qsa_mtp_pool_explicit_opt_in &&
         !(explicit_on && std::string_view(explicit_on)=="1"))
@@ -1173,6 +1179,20 @@ inline void validate_resolved_teacher_forced_score(const Options& options, std::
 }
 [[nodiscard]] inline bool qsa_mtp_pool_route(const Options& o,bool gsq=false) noexcept {
     return qsa_mtp_pool_decline(o,gsq)==nullptr;
+}
+// Window-cost table key (hip_decode_token_main.cpp -> mtp_cost_table_configuration): false for an option (name before
+// any '=') that does not change what the table persists, the wall of an ordinary 1/2/4/8-row verify window. Prompts,
+// per-run outputs and HTTP front-end settings; and the drafting sources: --mtp-ngram-draft changes which candidates fill
+// a window, not its cost, and the wide copy cycles of --mtp-copy-wide-rows never sample a window cost
+// (skip_cycle_sample) while the owners' compiled plans stay keyed by their kernel-plan / execution identities. Keyed
+// apart, the opt-in wide route read its own younger table (8K served prose 34.8 vs 37.3 tok/s, then equal).
+[[nodiscard]] inline bool cost_table_key_option(std::string_view name) noexcept {
+    static constexpr std::string_view skip[]{"--prompt-ids", "--seqs-file", "--json", "--qual-dump", "--session-dump",
+        "--state-out", "--logprob-token", "--chat-logits", "--http-api-key-file", "--http-bind", "--http-model-id",
+        "--http-max-connections", "--http-max-queue", "--http-sse-keepalive", "--http-sse-progress-interval",
+        "--http-stream-receipts", "--mtp-ngram-draft", "--mtp-copy-wide-rows"};
+    for (const auto s : skip) if (s == name) return false;
+    return true;
 }
 [[nodiscard]] inline std::uint64_t qsa_mtp_pool_bytes(const Options& o,const ModelContract& model,bool gsq=false) {
     if (!qsa_mtp_pool_route(o,gsq) || model.full_attention_layers!=12 || model.indexer_head_dim!=128 ||
@@ -1298,7 +1318,24 @@ inline void validate_http_serve(const Options& o, bool defer_prefill = false) {
 // prefill arithmetic of a T-row block over fewer rows. `--known-prefix-tail-rows LIST` replaces the set and
 // `--known-prefix-tail-rows none` keeps the remainder serial.
 inline constexpr std::array<std::uint32_t, 4> default_known_prefill_tail_rows{1024U, 256U, 64U, 16U};
-inline void apply_default_known_prefill_tails(Options& options, const char* schedule = nullptr) {
+// The resolved prompt route decides the served wide copy default (apply_mtp_copy_wide_default): when the route has no
+// tiled tail block of a default size (explicit tails, a 2048-row fallback tile, an untiled prompt) or runs the baseline,
+// the default is withdrawn entirely and the command runs exactly as without it; it never turns into a startup error.
+// Explicit --mtp-copy-wide-rows keeps its own validation. Not decided while the HTTP prefill is still pending.
+inline void settle_mtp_copy_wide_default(Options& options) {
+    auto& m = options.mtp;
+    if (!m.copy_wide_default || http_prefill_pending(options)) return;
+    const auto& tails = options.known_prefix_tail_rows;
+    const bool kept = !options.baseline && mtp_tiled_prompt(options) &&
+        std::all_of(m.copy_wide_rows.begin(), m.copy_wide_rows.end(),
+            [&](std::uint32_t rows) { return std::find(tails.begin(), tails.end(), rows) != tails.end(); });
+    if (kept) return;
+    m.copy_wide_rows.clear();
+    m.ngram_context = m.ngram_copy_edit = m.ngram_wide_only = false;
+    m.copy_wide_auto = m.copy_wide_default = false;
+    m.copy_wide_reason = "served default withdrawn: the resolved prompt route has no tiled tail block of the wide size";
+}
+inline void apply_default_known_prefill_tail_rows(Options& options, const char* schedule) {
     if (!options.known_prefix_tail_rows.empty() || options.known_prefix_tail_rows_off || !options.known_prefix_window ||
         (!options.known_prefix_prefill_explicit && !options.automatic_prefill) || !options.known_prefix_full_rows || options.teacher_forced_score ||
         options.known_prefix_output_policy == strix::KnownWindowOutputPolicy::state_only)
@@ -1353,6 +1390,10 @@ inline void apply_default_known_prefill_tails(Options& options, const char* sche
             tails.insert(std::upper_bound(tails.begin(), tails.end(), wide, std::greater<std::uint32_t>()), wide);
             options.known_prefix_wide_only_tail_rows.push_back(wide);
         }
+}
+inline void apply_default_known_prefill_tails(Options& options, const char* schedule = nullptr) {
+    apply_default_known_prefill_tail_rows(options, schedule);
+    settle_mtp_copy_wide_default(options);
 }
 
 // Whether a tail owner of `rows` tiles prompts. Under a split prefill profile the wide copy cycle verifies on its own
@@ -1612,6 +1653,26 @@ inline void validate_resolved_gdn_islands(const Options& options) {
     t.narrow_rows=8U;t.narrow_ms=78.2;t.wide={{32U,166.7},{16U,142.0}};t.keep_stride=0U;t.full_accept=0.60;
     return t;
 }
+// The served default of the wide copy cycle. An --http-serve MTP command that names neither --mtp-ngram-draft nor
+// --mtp-copy-wide-rows, where n-gram drafting is admissible on the tiled prompt and no fixed-MTP session route is asked
+// for, takes the auto sizes of the shared rule with the observing copy drafter of =wide. The n-gram extension keeps
+// its own default policy (ngram_draft stays false: the batch route's lookup default and the survival-controller
+// exclusion are unchanged). Per cycle, a wide forward runs only on a unanimous 16-token copy anchor of a lone greedy
+// request; other cycles and requests run the ordinary windows with the same tokens. The resolved prompt route can
+// still withdraw it (settle_mtp_copy_wide_default). Off: --mtp-copy-wide-rows 0, an explicit --mtp-ngram-draft mode, or
+// STRIX_MTP_SERVE_WIDE=0.
+inline void apply_mtp_copy_wide_default(Options& o,
+    bool serve_switch=strix::envcfg::flag("STRIX_MTP_SERVE_WIDE",true)) {
+    auto& m=o.mtp;
+    const bool tiled=mtp_tiled_prompt(o) || http_prefill_pending(o) || (o.mtp_native_bundle && !o.known_prefix_window);
+    if(!o.http_serve || !serve_switch || !m.enabled || m.ngram_mode_explicit || m.copy_wide_explicit ||
+       !mtp_ngram_draft_admissible(m) || !tiled || o.session_mtp_fixed || o.baseline)
+        return;
+    m.copy_wide_rows=strix::spec::wide_window_sizes(hip_qwen_wide_copy_table(),&m.copy_wide_reason);
+    if(m.copy_wide_rows.empty()) return;
+    m.ngram_context=m.ngram_copy_edit=m.ngram_wide_only=true;
+    m.copy_wide_auto=m.copy_wide_default=true;
+}
 // The single resolver of the wide copy cycle (--mtp-copy-wide-rows). The CLI runs it for its one request; the
 // HTTP server runs it only while exactly one request is live, and STRIX_MTP_SERVE_WIDE=0 (serve_switch=false)
 // forces it off there. Returns the configured sizes (descending) or empty. Both routes call this, never the raw option.
@@ -1795,10 +1856,35 @@ inline void validate_resolved_mtp_cli(const Options& o) {
             (o.http_serve?" --prefetch-q8-lm-head":"")+" (greedy window rows; STRIX_MTP_GREEDY_ROWS=0 keeps per-row selectors)");
 }
 
+// YaRN serving above the native extent (opt-in: explicit --rope-yarn). The position descriptor is already data in
+// every cache identity (prefix entry namespace and session numerical config: session_numerical_config; cache family
+// numerical contract), so a YaRN entry never meets a native one. Admitted: the single greedy HTTP MTP route and an
+// explicit prefix state cache budget (the automatic budget declines "rotary-cache-unqualified" until a receipt row
+// exists). Batch/cohort serving, sampling and session save/restore keep their named refusals.
+inline bool yarn_http_single_route(const Options& o) noexcept {
+    return o.http_serve && o.http_batch_explicit && !o.http_batch_cap && !o.http_batch && !o.session_live_control;
+}
+inline bool yarn_admitted_serving_flag(std::string_view flag) noexcept {
+    for (const std::string_view admitted : {"--http-serve","--http-batch","--http-bind","--http-port","--http-model-id",
+            "--http-api-key-file","--http-max-connections","--http-max-queue","--http-default-max-tokens",
+            "--http-sse-keepalive","--http-sse-progress-interval","--http-stream-receipts","--http-capabilities",
+            "--http-responses","--http-thinking-budget","--http-anthropic-thinking-budget",
+            "--prefix-cache","--prefix-cache-host-bytes","--prefix-cache-dir","--prefix-cache-disk","--prefix-cache-disk-bytes",
+            "--prefix-cache-every","--prefix-cache-block-rows","--prefix-cache-retention","--prefix-cache-staging-bytes",
+            "--prefix-cache-inflight","--prefix-cache-durable"})
+        if (flag == admitted) return true;
+    return false;
+}
 inline std::string yarn_route_refusal(const Options& o) {
     if (o.session_options_requested || !o.session_save.empty() || !o.session_load.empty())
         return "YaRN with session save/restore not yet qualified";
-    if (prefix_state_cache_requested(o)) return "YaRN with prefix state cache not yet qualified";
+    if (prefix_state_cache_requested(o) && !o.prefix_cache_host_bytes)
+        return "YaRN prefix state cache requires an explicit --prefix-cache-host-bytes";
+    if (!o.prefix_cache_then_prompts.empty()) return "YaRN prefix state cache follow-up prompts not yet qualified";
+    if (o.http_serve && !o.mtp.enabled) return "YaRN HTTP serving requires the MTP route";
+    if (o.http_batch || (o.http_serve && !yarn_http_single_route(o)))
+        return "YaRN HTTP serving requires the single route --http-batch 0 (batch/cohort rotary sites not audited)";
+    if (o.http_serve && o.http_sampling == "sample") return "YaRN HTTP sampling not supported (greedy only)";
     if (o.mtp.enabled) {
         if(o.rotary.factor()!=(o.context_tokens<=524288U?2U:4U))
             return "YaRN MTP requires f2 at C<=524288 and f4 at C<=1048576";
@@ -1817,6 +1903,7 @@ inline std::string yarn_route_refusal(const Options& o) {
                flag=="--known-prefill-uma-budget" || flag=="--known-prefill-host-headroom" ||
                flag=="--known-prefix-workspace-budget-bytes" || flag=="--known-prefix-host-metadata-budget-bytes" ||
                flag=="--known-prefix-uma-budget-bytes" || flag=="--known-prefix-host-headroom-bytes") continue;
+            if(yarn_admitted_serving_flag(flag)) continue;
             const std::array canonical_flags{
                 "--parallel-hyper-mix","--staged-hyper-projections","--fused-staged-hyper-mix",
                 "--typed-fused-hyper-projections","--prefetch-typed-hyper-rows","--prefetch-q8-hyper-output",
@@ -1830,7 +1917,6 @@ inline std::string yarn_route_refusal(const Options& o) {
             return "YaRN MTP explicit target override not supported: "+flag;
         }
     } else if(o.mtp.supplied) return "YaRN MTP parameters require --mtp";
-    if (o.http_serve || o.http_batch) return "YaRN on HTTP serving not supported";
     if (o.teacher_forced_score) return "YaRN with teacher scoring not yet qualified";
     if (o.execution.mode != DecodeExecutionMode::eager || o.gdn_islands || o.prepared_eager)
         return "YaRN graph capture path not yet qualified";
@@ -2415,7 +2501,7 @@ inline Options parse_options(
             const auto mode=argument=="--mtp-ngram-draft"?std::string_view("on"):argument.substr(18);
             if(mode!="on" && mode!="off" && mode!="auto" && mode!="ctx" && mode!="copy" && mode!="wide")
                 throw std::invalid_argument("--mtp-ngram-draft is on, off, auto, ctx, copy or wide");
-            options.mtp.supplied=true;options.mtp.ngram_off=mode=="off";
+            options.mtp.supplied=true;options.mtp.ngram_mode_explicit=true;options.mtp.ngram_off=mode=="off";
             options.mtp.ngram_context=mode=="ctx" || mode=="copy" || mode=="wide";
             options.mtp.ngram_copy_edit=mode=="copy" || mode=="wide";options.mtp.ngram_wide_only=mode=="wide";
             options.mtp.ngram_draft=mode=="on" || options.mtp.ngram_context;continue;
@@ -2505,6 +2591,7 @@ inline Options parse_options(
             else if(key=="--mtp-copy-wide-rows") {
                 // 0 alone = off; auto = the shared rule over the measured table; otherwise a descending list of
                 // distinct sizes from {32, 16}.
+                m.copy_wide_explicit=true;
                 if(value=="auto") {m.copy_wide_auto=true;m.copy_wide_rows=strix::spec::wide_window_sizes(hip_qwen_wide_copy_table(),&m.copy_wide_reason);}
                 else if(value!="0") for(std::size_t begin=0;begin<=value.size();) {
                     const auto end=std::min(value.find(',',begin),value.size());
@@ -3557,6 +3644,7 @@ inline Options parse_options(
         throw std::invalid_argument("offline compile provenance requires --offline-tuning-cache");
     validate_moe_token_cost_options(options);
     validate_prompt_lookup_snapshot_options(options);
+    apply_mtp_copy_wide_default(options);
     if (!defer_qpf2k_defaults)
         apply_default_known_prefill_tails(options);
     if (!http_prefill_pending(options)) validate_known_prefill_options(options);

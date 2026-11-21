@@ -28,6 +28,17 @@ STRIX_DECODE_HD inline void locate(const std::uint32_t* first, unsigned count, s
     local = unit - first[member];
 }
 
+// Paired members (a GLU's gate and up, equal unit counts): the group lists them consecutively (gate at units
+// [first, first + half), up at [first + half, first + 2 half)) but the launch walks them interleaved, so one
+// backend output group holds gate j and up j side by side and its store can apply the GLU to both:
+// launch unit first + 2j -> group unit first + j (gate j), first + 2j + 1 -> first + half + j (up j).
+// Units below `first` are unchanged. A permutation of the units, so a paired group changes no bits either.
+STRIX_DECODE_HD inline std::uint32_t pair_unit(std::uint32_t unit, std::uint32_t first, std::uint32_t half) {
+    if (unit < first) return unit;
+    const std::uint32_t k = unit - first;
+    return first + (k & 1U) * half + (k >> 1U);
+}
+
 // Host builder of the prefix table: first[m + 1] = first[m] + units of member m.
 template <unsigned Max> struct GroupIndex {
     std::uint32_t first[Max + 1U] = {};

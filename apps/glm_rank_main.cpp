@@ -1159,7 +1159,10 @@ int main(int argc, char** argv) {
                             opt.rank * eng.vocab_slice(), eng.vocab_slice());
                 std::fflush(stdout);
             } else if (mtp_spec_on) {
-                result = sp::decode_greedy(eng, 0, seed, {eff.kmax, eff.adaptive, eff.kmax, opt.capacity}, decode_n, control);
+                sp::DecodePolicy policy{eff.kmax, eff.adaptive, eff.kmax, opt.capacity};
+                policy.spec_arbiter = eff.spec_arbiter;
+                policy.context = &toks;
+                result = sp::decode_greedy(eng, 0, seed, policy, decode_n, control);
                 out = result.tokens;
             } else for (unsigned i = 1; i < decode_n; ++i) {
                 const ge::Row r{0, next, pos++};
@@ -1192,6 +1195,7 @@ int main(int argc, char** argv) {
                             result.depths[3].accepted, result.depths[3].offered,
                             result.histogram[1], result.histogram[2], result.histogram[3],
                             result.cycles ? double(decode_n - 1) / result.cycles : 0.0);
+                if (!result.spec_stats.empty()) std::printf("rank %u strix-spec-stats %s\n", opt.rank, result.spec_stats.c_str());
             }
             std::printf("rank %u tokens:", opt.rank);
             for (auto t : out) std::printf(" %u", t);

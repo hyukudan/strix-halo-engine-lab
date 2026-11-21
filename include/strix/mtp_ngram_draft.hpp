@@ -12,10 +12,10 @@
 // against the tokens the verifier emitted, whether it was used or not ("shadow" scoring, host work
 // only), starting from a pessimistic prior. Below the floor the extension is not proposed, so a request
 // that does not copy (free prose, summaries) never sees an extension row.
+#include "strix/context_key_index.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <span>
-#include <unordered_map>
 #include <vector>
 
 namespace strix {
@@ -66,17 +66,12 @@ public:
     std::vector<std::uint32_t> lookup(std::span<const std::uint32_t> extra, std::size_t length,
         std::uint32_t& suffix, std::uint32_t& support) const;
 private:
-    struct Key {
-        std::uint64_t hash; std::uint32_t n;
-        bool operator==(const Key& o) const noexcept { return hash == o.hash && n == o.n; }
-    };
-    struct KeyHash { std::size_t operator()(const Key& k) const noexcept { return static_cast<std::size_t>(k.hash ^ (k.n * 0x9e3779b97f4a7c15ULL)); } };
     void push(std::uint32_t token);
     [[nodiscard]] static std::size_t cell(std::uint32_t suffix, bool supported, std::size_t row) noexcept;
     MtpNgramDraftConfig config_;
     std::vector<std::uint32_t> context_;
-    // n-gram (by hash of its tokens) -> end positions in context_, ascending
-    std::unordered_map<Key, std::vector<std::uint32_t>, KeyHash> index_;
+    // Ends of every min_suffix-token key in context_; longer suffixes are measured on its candidates.
+    ContextKeyIndex index_;
     std::vector<double> right_, tried_;  // online acceptance table
     bool started_ = false;
     std::vector<const MtpNgramDraft*> peers_;

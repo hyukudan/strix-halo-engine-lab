@@ -21,6 +21,22 @@
 // ~0.5 ms of host time) then runs while the GPU drafts instead of with the GPU idle. Both sides are optional
 // (ChainDrafter::draft_prelaunch, VerifyTarget::verify_launch_fed); either one declining falls back to the read-then-verify
 // order. Off unless BlockSpeculator::set_prelaunch(true).
+// Token tree (sibling rows): when the drafter reports its runner-up per chain position (ChainDrafter::runner_ups) and the
+// target verifies tree rows (VerifyTarget::tree_rows() > 0), the runner-up at main depth j may be added as a LEAF row
+// beside the chain node of depth j (same parent). It pays exactly +1 token when the target's token at depth j is the
+// runner-up (the linear block emits the same token as its correction and stops; the sibling row also yields the target's
+// next token). Placement is a per-step decision on a SET of siblings (the best-gain prefix): the set is placed only when
+// it raises the block's tokens per ms, priced by MEASURED walls: P = T(rows with siblings) - L(chain rows), L = the
+// measured linear verify wall per window rows (else the Arbiter's price), T = the measured tree-window wall per rows (else
+// L + the learned tree surcharge). A tree window carries a per-window surcharge and the row cost is step shaped (dense row
+// tiles), so neither a per-row marginal nor a linear seed can price it (rv_tree3: tree +0.5..0.7 ms at equal rows, 8 -> 9
+// rows +1.2 ms on CUDA dense 27B). Where rows are expensive (MoE expert union) no sibling is placed. q_j is learned from
+// EVERY rejection that had a runner-up, placed or not, per depth and per drafter logit-gap bucket (top-1 minus top-2
+// logit = log p1/p2 of the drafter, ChainDrafter::runner_up_gaps): q = q_depth x lift(gap bucket).
+// Row layout: depth order; at each depth the leaf sibling precedes the chain node, so every row's parent is the last
+// non-leaf row before it (a recurrent target evaluates rows in order and does not keep a leaf row's state). The accepted
+// path (anchor + main prefix [+ sibling]) is committed by VerifyTarget::commit_path; a block without siblings uses
+// verify / commit(k) exactly as before.
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -69,7 +85,21 @@ public:
     // The last verify pass emitted `emitted` (accepted drafts + next token): emitted[i] follows verify row i
     // (row 0 = the anchor). Rows 0..emitted.size()-1 are now committed target positions.
     virtual void accept(std::span<const std::uint32_t> emitted) = 0;
+    // Optional: runner-up id (second most likely) of each position written by the last draft(), aligned with its `out`;
+    // kNoToken where none. Empty span: the drafter has no runner-ups (no siblings, no probe).
+    [[nodiscard]] virtual std::span<const std::uint32_t> runner_ups() const { return {}; }
+    // Optional, aligned with runner_ups(): the drafter's top-1 minus top-2 logit at each position (log p1 / p2; NaN or
+    // negative where unknown). Empty span: no margins (sibling q uses the depth estimate only).
+    [[nodiscard]] virtual std::span<const float> runner_up_gaps() const { return {}; }
+    // Tree verify: emitted[i] follows verify row rows[i] (rows[0] = 0, the anchor; a root path of the last tree). A
+    // drafter that reads the target's verify rows (hidden states) must override; the default ignores the rows.
+    virtual void accept_path(std::span<const std::uint32_t> emitted, std::span<const std::uint32_t> rows) {
+        (void)rows;
+        accept(emitted);
+    }
 };
+
+inline constexpr std::uint32_t kNoToken = 0xFFFFFFFFU;
 
 struct BlockConfig {
     ArbiterConfig arbiter = [] {
@@ -94,6 +124,13 @@ struct BlockConfig {
     // never chosen again): measured on CUDA dense 27B, three identical Japanese runs gave 80 / 115 / 99 tok/s and k = 15 /
     // k = 1 / k = 1 where k = 3 was the optimum. false = the previous learned form.
     bool fixed_costs = false;
+    // Token-tree siblings (see the header comment): placed only with a tree target and a drafter with runner-ups, and
+    // only where the cost rule pays. sibling_prior = Beta prior (hits, misses) of q_j before measurements (mean 0.25,
+    // inside the 15-55 % measured on HIP Qwen MoE MTP, decision-register X-014).
+    bool siblings = true;
+    std::array<double, 2> sibling_prior = {1.0, 3.0};
+    // Pseudo-trials of the gap-bucket lift toward 1 (a bucket with few trials keeps the depth estimate).
+    double sibling_gap_kappa = 4.0;
     std::function<double()> clock_ms; // wall clock in ms (default steady_clock); tests inject a virtual clock
 };
 
@@ -101,6 +138,16 @@ struct StepParams {
     std::uint32_t remaining = ~0U;  // tokens left in the budget
     std::uint32_t max_rows = ~0U;   // legal rows this step (context room)
     std::uint64_t context = 0;      // committed positions (cost bin)
+    std::uint32_t tree_rows = 0;    // widest tree window of the target (0: linear only; BlockSpeculator sets it)
+};
+
+// Rows of a block as the target sees them: tokens[0] = anchor; parent[r] = parent row (-1 for the anchor, < r);
+// depth[r] = stream offset of row r (position committed + depth[r]); node[r] = main depth j (1..) of a chain row, or
+// -(j) for the sibling at depth j, 0 for the anchor.
+struct TreeRows {
+    std::vector<std::uint32_t> tokens;
+    std::vector<std::int32_t> parent, node;
+    std::vector<std::uint32_t> depth;
 };
 
 struct Block {
@@ -111,9 +158,40 @@ struct Block {
     std::uint32_t bucket = 0;           // copy proposal bucket
     Decision decision{};
     double draft_ms = 0.0;
-    [[nodiscard]] std::uint32_t rows() const { return std::uint32_t(drafts.size()) + 1; }
+    // Token tree: alts[j] = the drafter's runner-up at main depth j + 1 (kNoToken: none; size == drafts.size() or 0);
+    // sib[j] != 0: that runner-up is verified as a leaf row (sibling of drafts[j]).
+    std::vector<std::uint32_t> alts;
+    std::vector<float> alt_gap;  // aligned with alts when the drafter reports margins (else empty)
+    std::vector<std::uint8_t> sib;
+    std::uint32_t siblings = 0;  // sibling rows placed
+    double sib_gain = 0.0;       // predicted extra tokens of the placed siblings (before calibration)
+    [[nodiscard]] std::uint32_t rows() const { return std::uint32_t(drafts.size()) + 1 + siblings; }
     [[nodiscard]] bool hybrid() const { return copy > 0 && ext > 0; }
+    // The verify rows (anchor first) in the layout described in the header comment.
+    void tree_rows(std::uint32_t anchor, TreeRows& out) const;
 };
+
+// Drafter logit-gap buckets of the sibling q (edges in logits: gap = log p1 / p2). -1: no gap (NaN / negative).
+inline constexpr std::array<float, 5> kSiblingGapEdges = {0.5f, 1.0f, 2.0f, 3.0f, 5.0f};
+inline constexpr std::size_t kSiblingGapBuckets = kSiblingGapEdges.size() + 1;
+static_assert(kSiblingGapBuckets == std::tuple_size_v<decltype(SpecStats::sibling_gap_trials)>,
+              "SpecStats gap arrays follow the bucket edges");
+[[nodiscard]] inline int sibling_gap_bucket(float gap) {
+    if (!(gap >= 0.0f)) return -1;
+    int b = 0;
+    for (const float e : kSiblingGapEdges) b += gap >= e ? 1 : 0;
+    return b;
+}
+
+// Walk of a verified tree: from the anchor, follow the child row whose token equals the target's greedy at the current
+// row (chain node first; a sibling is a leaf). path = rows taken (path[0] = 0); emitted = their tokens after the anchor
+// + the target's token after the last row; main = chain drafts accepted; sibling = the path ends on a sibling row.
+struct TreeAccept {
+    std::vector<std::uint32_t> path, emitted;
+    std::uint32_t main = 0;
+    bool sibling = false;
+};
+TreeAccept accept_tree(const TreeRows& rows, std::span<const std::uint32_t> greedy);
 
 class BlockDrafter {
 public:
@@ -122,11 +200,18 @@ public:
     void commit(std::span<const std::uint32_t> tokens) { proposer_.commit(tokens); }
     // Engine's tabled verify wall at `rows` (shape of the cost curve; measured walls rescale it).
     void seed_verify_ms(std::uint32_t rows, double ms) { arbiter_.seed_cost(rows, ms); }
+    // Stated confidence of the chain drafter: conditional survival P(draft d accepted | drafts < d accepted), d = 1 ..,
+    // as `weight` pseudo-observations per depth (Arbiter::seed_model_survival). An offline acceptance measurement (a host
+    // oracle's) becomes the prior the online counts refine. Prices the chain windows only; emitted ids never change.
+    void seed_chain_survival(std::span<const double> conditional, double weight = 8.0) {
+        arbiter_.seed_model_survival(conditional, weight);
+    }
     // launch (optional): handed to ChainDrafter::draft_prelaunch for every chain call of this block.
     [[nodiscard]] Block next(const StepParams& params, const PrelaunchFn* launch = nullptr);
     // After the pass. verify_ms = wall of verify + commit (without drafting). emitted = accepted drafts + next token.
+    // path: verify rows of a tree's accepted path (empty: rows 0..emitted.size()-1 of a linear block).
     void observe(const Block& block, std::uint32_t accepted, double verify_ms, std::span<const std::uint32_t> emitted,
-                 std::uint64_t context);
+                 std::uint64_t context, std::span<const std::uint32_t> path = {});
     [[nodiscard]] const Arbiter& arbiter() const { return arbiter_; }
     [[nodiscard]] const SpecStats& stats() const { return stats_; }
     [[nodiscard]] double now_ms() const;
@@ -148,6 +233,32 @@ private:
     double step_ms_;                          // marginal ms per extra chain step
     std::vector<double> model_ms_;            // scratch: Arbiter model_draft_ms table
     std::array<std::array<double, 2>, 16> ext_{};  // hybrid extension (accept, reject) per depth (chain_max_k <= 16)
+    std::array<std::array<double, 2>, 16> sib_q_{};  // runner-up at a rejection: (hit, miss) per main depth
+    std::array<std::array<double, 2>, kSiblingGapBuckets> gap_q_{};  // the same, per drafter logit-gap bucket
+    // Measured verify + commit walls per window rows, linear and tree windows apart (EWMA, at most 16 samples of memory;
+    // the first window of each shape is not learned: it carries the one-off graph capture). sur_ = mean tree surcharge
+    // (tree wall - linear price at the same rows), the price of a tree shape not yet measured.
+    struct WallBin {
+        double ms = 0.0;
+        std::uint32_t seen = 0;
+    };
+    std::array<WallBin, 33> lin_wall_{}, tree_wall_{};
+    WallBin sur_{};
+    // Realised vs predicted sibling tokens over tree windows: the predicted gain is scaled by (taken + 4) / (predicted + 4).
+    double gain_pred_ = 0.0, gain_real_ = 0.0;
+    // The run's measured rate: emitted tokens and verify + draft ms, decayed (x 0.98 per pass).
+    double run_tok_ = 0.0, run_ms_ = 0.0;
+    static void learn_wall(WallBin& b, double ms, bool skip_first);
+    [[nodiscard]] double lin_price(std::uint32_t rows, std::uint64_t context) const;
+    [[nodiscard]] double tree_price(std::uint32_t rows, std::uint64_t context) const;
+    void take_runner_ups(Block& b, std::uint32_t first, std::uint32_t n) const;
+    void place_siblings(Block& b, const StepParams& params) const;
+    [[nodiscard]] double sibling_q(std::uint32_t depth, float gap = -1.0f) const;
+
+public:
+    // Learned tree surcharge (ms; 0 until a tree shape has been measured twice) and whether it is measured.
+    [[nodiscard]] double tree_surcharge_ms() const { return sur_.ms; }
+    [[nodiscard]] std::uint32_t tree_surcharge_samples() const { return sur_.seen; }
 };
 
 // What BlockSpeculator needs from an engine: R-row verify of [anchor, drafts...] and a prefix commit.
@@ -171,11 +282,29 @@ public:
         (void)greedy;
         throw std::logic_error("VerifyTarget::verify_collect without a pre-launched verify");
     }
+    // Token-tree rows (optional). 0 = linear windows only (verify_tree / commit_path are never called).
+    [[nodiscard]] virtual std::uint32_t tree_rows() const { return 0; }
+    // rows.tokens[r] at stream position committed + rows.depth[r], attending the committed prefix and its ancestor rows
+    // (rows.parent); greedy[r] = argmax after row r. Must give each row the bits a linear window of its path gives.
+    virtual void verify_tree(const TreeRows& rows, std::vector<std::uint32_t>& greedy) {
+        (void)rows;
+        (void)greedy;
+        throw std::logic_error("verify target: no tree rows (tree_rows() == 0)");
+    }
+    // Accept a root path of the last verify_tree (path[0] = 0, each row the parent of the next) as positions
+    // committed .. committed + path.size() - 1; every other row is rolled back. Default: a contiguous row prefix only.
+    virtual void commit_path(std::span<const std::uint32_t> path) {
+        for (std::size_t i = 0; i < path.size(); ++i)
+            if (path[i] != i) throw std::logic_error("verify target: no tree rows (tree_rows() == 0)");
+        commit(static_cast<std::uint32_t>(path.size()));
+    }
 };
 
 struct StepRecord {
     Source source = Source::serial;
     std::uint32_t rows = 1, proposed = 0, accepted = 0, copy = 0, ext = 0, emitted = 0;
+    std::uint32_t siblings = 0;  // sibling rows verified
+    bool sibling_taken = false;  // the accepted path ended on a sibling (+1 token)
     double verify_ms = 0.0, draft_ms = 0.0;
 };
 
@@ -240,6 +369,7 @@ private:
     std::vector<std::uint32_t> rows_, greedy_, host_rows_;
     bool prelaunch_ = false;
     std::uint64_t prelaunched_ = 0;
+    TreeRows tree_;
 };
 
 }  // namespace strix::spec
