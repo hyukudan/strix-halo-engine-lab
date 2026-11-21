@@ -18,6 +18,7 @@ public:
     // The input has already passed the Mini text schema. NVFP4 host-only
     // sidecars are fetched separately when the resident expert views bind.
     [[nodiscard]] static MiniResidentWeightPlan make(const MiniTextWeights& weights);
+    [[nodiscard]] const weight::ResidentSlicePlan& slices() const { return slices_; }
     [[nodiscard]] std::size_t bytes() const { return slices_.bytes(); }
     [[nodiscard]] std::span<const MiniResidentRange> ranges() const { return slices_.ranges(); }
 

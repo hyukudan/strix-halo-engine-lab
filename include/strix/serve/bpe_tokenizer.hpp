@@ -32,6 +32,15 @@ public:
     // A Hugging Face tokenizer.json with a GLM-4/5 or o200k split, byte-level BPE, no NFC and ignore_merges.
     // Added tokens become control (special) or user-defined tokens. EOS is the known model-end marker when present.
     static std::shared_ptr<const BpeTokenizer> load_hf_json(const std::string& path);
+    // A model can require a specific vocabulary and a sentinel token in addition to the BPE layout.
+    struct HfIdentity {
+        std::string_view pre;
+        std::size_t vocab_size;
+        std::uint32_t eos;
+        std::string_view sentinel;
+        std::uint32_t sentinel_id;
+    };
+    static std::shared_ptr<const BpeTokenizer> load_hf_json(const std::string& path, const HfIdentity& expected);
     static std::shared_ptr<const BpeTokenizer> from_parts(std::vector<std::string> tokens, std::vector<std::int32_t> types,
         std::span<const std::string> merges, std::string pre);
     ~BpeTokenizer();

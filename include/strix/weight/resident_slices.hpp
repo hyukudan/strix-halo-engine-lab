@@ -21,12 +21,12 @@ public:
 
     // Offsets are sorted within a shard so queued reads follow file order.
     [[nodiscard]] static ResidentSlicePlan make(std::vector<NamedTensor> tensors, std::size_t alignment) {
-        if (!std::has_single_bit(alignment) || alignment < alignof(float) || alignment < alignof(std::uint16_t))
+        if (tensors.empty() || !std::has_single_bit(alignment) || alignment < alignof(float) || alignment < alignof(std::uint16_t))
             throw std::invalid_argument("invalid resident tensor alignment");
         for (const auto& [name, raw] : tensors)
-            if (!raw || !raw->payload.source || raw->payload.range.bytes == 0U)
+            if (name.empty() || !raw || raw->payload.range.bytes == 0U)
                 throw std::invalid_argument("missing resident tensor " + std::string(name));
-        std::ranges::sort(tensors, {}, [](const auto& tensor) { return tensor.second->payload.range.offset; });
+        std::ranges::stable_sort(tensors, {}, [](const auto& tensor) { return tensor.second->payload.range.offset; });
 
         ResidentSlicePlan plan;
         plan.alignment_ = alignment;
@@ -34,14 +34,19 @@ public:
         constexpr auto limit = std::numeric_limits<std::size_t>::max();
         const auto mask = alignment - 1U;
         for (const auto& [name, raw] : tensors) {
+            Slice payload;
+            if (const auto status = subslice(raw->payload, {0, raw->payload.range.bytes}, payload); !status)
+                throw std::invalid_argument("invalid resident tensor " + std::string(name) + ": " + status.detail);
             if (plan.bytes_ > limit - mask)
                 throw std::overflow_error("resident alignment exceeds address space");
             const auto offset = (plan.bytes_ + mask) & ~mask;
             if (raw->payload.range.bytes > limit - offset)
                 throw std::overflow_error("resident weights exceed address space");
             const auto bytes = static_cast<std::size_t>(raw->payload.range.bytes);
-            plan.ranges_.push_back({raw->payload, offset, bytes});
-            plan.tensors_.emplace(std::string(name), Tensor{offset, bytes, slice_dtype(raw->wire_dtype)});
+            const auto dtype = slice_dtype(raw->wire_dtype);
+            if (!plan.tensors_.emplace(std::string(name), Tensor{offset, bytes, dtype}).second)
+                throw std::invalid_argument("duplicate resident tensor " + std::string(name));
+            plan.ranges_.push_back({std::move(payload), offset, bytes});
             plan.bytes_ = offset + bytes;
         }
         return plan;
@@ -49,6 +54,12 @@ public:
 
     [[nodiscard]] std::size_t bytes() const { return bytes_; }
     [[nodiscard]] std::span<const ResidentSliceRange> ranges() const { return ranges_; }
+
+    void require_storage(std::span<const std::uint8_t> storage) const {
+        if (bytes_ == 0U || storage.size() < bytes_ ||
+            reinterpret_cast<std::uintptr_t>(storage.data()) % alignment_ != 0U)
+            throw std::invalid_argument("incompatible resident weight storage");
+    }
 
 private:
     friend class ResidentSlices;
@@ -68,19 +79,21 @@ class ResidentSlices {
 public:
     [[nodiscard]] static ResidentSlices bind(const ResidentSlicePlan& plan,
                                               std::span<const std::uint8_t> storage) {
-        if (plan.bytes() == 0U || storage.size() < plan.bytes() ||
-            reinterpret_cast<std::uintptr_t>(storage.data()) % plan.alignment_ != 0U)
-            throw std::invalid_argument("incompatible resident weight storage");
+        plan.require_storage(storage);
         return {storage.first(plan.bytes()), plan};
     }
 
     [[nodiscard]] std::span<const std::uint16_t> bf16(std::string_view name) const {
         const auto bytes = tensor(name, SliceDtype::bf16);
+        if (bytes.size() % sizeof(std::uint16_t) != 0U)
+            throw std::invalid_argument("incomplete scalar in resident tensor " + std::string(name));
         return {reinterpret_cast<const std::uint16_t*>(bytes.data()), bytes.size() / sizeof(std::uint16_t)};
     }
 
     [[nodiscard]] std::span<const float> f32(std::string_view name) const {
         const auto bytes = tensor(name, SliceDtype::f32);
+        if (bytes.size() % sizeof(float) != 0U)
+            throw std::invalid_argument("incomplete scalar in resident tensor " + std::string(name));
         return {reinterpret_cast<const float*>(bytes.data()), bytes.size() / sizeof(float)};
     }
 

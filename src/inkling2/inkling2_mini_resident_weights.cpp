@@ -5,14 +5,7 @@
 namespace strix::inkling2 {
 namespace {
 
-constexpr std::string_view kPrefix = "model.llm.";
-
 constexpr std::array kProjections{MiniExpertProjection::gate_up, MiniExpertProjection::down};
-
-std::string expert_name(unsigned layer, MiniExpertProjection projection) {
-    return "layers." + std::to_string(layer) + ".mlp.experts." +
-           (projection == MiniExpertProjection::gate_up ? "w13_weight" : "w2_weight");
-}
 
 void check(weight::Status status) {
     if (!status) throw std::runtime_error("Inkling 2 Mini resident weights: " + status.detail);
@@ -27,7 +20,7 @@ MiniResidentWeightPlan MiniResidentWeightPlan::make(const MiniTextWeights& weigh
     tensors.reserve(schema.size());
     for (const auto& spec : schema) {
         if (!spec.resident) continue;
-        tensors.emplace_back(std::string_view(spec.name).substr(kPrefix.size()), weights.find(spec.name));
+        tensors.emplace_back(std::string_view(spec.name).substr(kMiniTextTensorPrefix.size()), weights.find(spec.name));
     }
     plan.slices_ = weight::ResidentSlicePlan::make(std::move(tensors), kAlignment);
     for (unsigned layer = 0; layer < kPhysicalLayers; ++layer)
@@ -43,9 +36,11 @@ MiniResidentWeights MiniResidentWeights::bind(const MiniResidentWeightPlan& plan
     for (unsigned layer = 0; layer < kPhysicalLayers; ++layer) {
         for (unsigned i = 0; i < kProjections.size(); ++i) {
             const auto projection = kProjections[i];
-            const auto name = expert_name(layer, projection);
+            const auto names = mini_expert_slab_names(layer, projection);
+            const auto codes = std::string_view(names.codes).substr(kMiniTextTensorPrefix.size());
+            const auto scales = std::string_view(names.block_scales).substr(kMiniTextTensorPrefix.size());
             std::array<weight::microscaled::PackedMatrix, kExperts> matrices;
-            check(bound.slices_.bind_expert_slab(plan.slabs_[layer][i], name, name + "_scale", matrices));
+            check(bound.slices_.bind_expert_slab(plan.slabs_[layer][i], codes, scales, matrices));
             for (unsigned expert = 0; expert < kExperts; ++expert) {
                 auto& pair = bound.experts_[layer * kExperts + expert];
                 (projection == MiniExpertProjection::gate_up ? pair.gate_up : pair.down) = matrices[expert];

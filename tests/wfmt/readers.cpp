@@ -1,4 +1,10 @@
 #include "strix/weight/admission.hpp"
+#include "strix/weight/tensor_access.hpp"
+#include "strix/weight/formats/microscaled_matrix.hpp"
+
+#include <algorithm>
+#include <array>
+#include <bit>
 #include "strix/weight/registry.hpp"
 #include "strix/ds41_native_fp8.hpp"
 #include "strix/vision/gguf_weights.hpp"
@@ -18,8 +24,61 @@ void check(bool condition,const char* message){if(!condition)throw std::runtime_
 void u64(std::vector<Byte>& b,std::uint64_t n,unsigned width=8){for(unsigned i=0;i<width;++i)b.push_back(Byte((n>>(8*i))&255));}
 void text(std::vector<Byte>& b,std::string_view s){u64(b,s.size());for(auto c:s)b.push_back(Byte(c));}
 std::vector<Byte> safe(std::string header,std::size_t payload){std::vector<Byte> b;u64(b,header.size());for(char c:header)b.push_back(Byte(c));for(std::size_t i=0;i<payload;++i)b.push_back(Byte(i&255));return b;}
+void tensor_access_test() {
+    auto wire = safe(R"({
+        "fp32":{"dtype":"F32","shape":[1],"data_offsets":[4,8]},
+        "codes":{"dtype":"F8_E4M3","shape":[1,1,32],"data_offsets":[8,40]},
+        "scales":{"dtype":"U8","shape":[1,1,1],"data_offsets":[40,41]},
+        "skip.image":{"dtype":"BF16","shape":[1],"data_offsets":[41,43]},
+        "bf16":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]}
+    })", 43);
+    const std::array scalars{Byte{0x80}, Byte{0x3f}, Byte{0x00}, Byte{0x80},
+                            Byte{0x00}, Byte{0x00}, Byte{0x60}, Byte{0x40}};
+    std::ranges::copy(scalars, wire.end() - 43);
+
+    TensorIndex index;
+    check(bool(index_safetensors(memory_source(wire), index)), "index sliced tensor fixture");
+    const std::array specs{TensorSpec{"fp32", "F32", {1}}, TensorSpec{"bf16", "BF16", {2}},
+                           TensorSpec{"codes", "F8_E4M3", {1, 1, 32}}, TensorSpec{"scales", "U8", {1, 1, 1}}};
+    const TensorSchema schema{Container::safetensors, "safetensors@1", specs, "skip."};
+    TensorSchemaSummary summary;
+    check(bool(validate_tensor_schema(index, schema, summary)) && summary.tensors == 4 &&
+          summary.ignored_tensors == 1 && summary.bytes == 41, "admit exact tensor schema");
+
+    constexpr std::string_view manifest = R"({"metadata":{"total_size":43},"weight_map":{
+        "fp32":"single.safetensors","bf16":"single.safetensors","codes":"single.safetensors",
+        "scales":"single.safetensors","skip.image":"single.safetensors"}})";
+    check(bool(validate_safetensors_shard_manifest(index, manifest, "single.safetensors")), "verify shard manifest");
+    auto duplicate = index;
+    duplicate.tensors[1] = duplicate.tensors[0];
+    check(!validate_safetensors_shard_manifest(duplicate, manifest, "single.safetensors"),
+          "manifest coverage requires distinct names");
+
+    TensorLookup lookup;
+    check(bool(lookup.bind(index, schema)) && !lookup.find("skip.image"), "bind only the declared tensor namespace");
+    check(!lookup.bind(std::move(duplicate), schema) && lookup.find("fp32"), "failed admission preserves lookup");
+    std::array<float, 1> scalar{};
+    check(bool(lookup.read_floats("bf16", scalar, 1)) && std::bit_cast<std::uint32_t>(scalar[0]) == 0x80000000U,
+          "partial BF16 read preserves negative zero");
+    check(bool(lookup.read_floats("fp32", scalar)) && scalar[0] == 3.5F, "F32 read preserves file bits");
+    check(lookup.read_floats("codes", scalar).code == Error::unknown_format &&
+          lookup.read_floats("bf16", scalar, 2).code == Error::unsupported_shape,
+          "plain read rejects wrong dtype and bounds");
+
+    using namespace microscaled;
+    ExpertSlabView slab{MatrixFormat::mxfp8, RowOrder::contiguous, 1, 1, 32, {}, {}, {}, {}};
+    const ExpertSlabNames names{"codes", "scales", {}, {}};
+    check(bool(slab.bind_sources(lookup, names)) && slab.codes.range.bytes == 32, "bind named packed slab");
+    check(!slab.bind_sources(lookup, {"codes", "missing", {}, {}}) && slab.block_scales.range.bytes == 1,
+          "failed slab binding preserves source slices");
+    auto wrong_geometry = slab;
+    wrong_geometry.columns = 64;
+    check(wrong_geometry.bind_sources(lookup, names).code == Error::malformed,
+          "named slab binding checks slice sizes against geometry");
+}
 }
 bool wfmt_readers_test() try {
+    tensor_access_test();
     std::vector<Byte> gg;for(char c:std::string("GGUF"))gg.push_back(Byte(c));u64(gg,3,4);u64(gg,2);u64(gg,0);
     for(unsigned type:{1U,8U}){text(gg,type==1?"a.weight":"b.weight");u64(gg,2,4);u64(gg,32);u64(gg,2);u64(gg,type,4);u64(gg,type==1?0:128);}
     while(gg.size()%32)gg.push_back(Byte{0});const auto payload=gg.size();for(unsigned i=0;i<196;++i)gg.push_back(Byte(i&255));

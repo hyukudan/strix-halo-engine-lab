@@ -115,11 +115,10 @@ bool check_weight_reads(HeaderSource& source, const wei::TensorIndex& index) {
     } catch (const std::invalid_argument&) {
     }
 
-    mini::MiniExpertMatrixView fp4_view;
+    wei::microscaled::MatrixView fp4;
     constexpr unsigned expert = 73;
-    if (!expects(text.expert_matrix(19, expert, mini::MiniExpertProjection::gate_up, fp4_view), wei::Error::ok))
+    if (!expects(text.expert_matrix(19, expert, mini::MiniExpertProjection::gate_up, fp4), wei::Error::ok))
         return false;
-    const auto& fp4 = fp4_view.matrix;
     const auto* fp4_tensor = text.find("model.llm.layers.19.mlp.experts.w13_weight");
     const auto* fp4_scales = text.find("model.llm.layers.19.mlp.experts.w13_weight_scale");
     const auto* fp4_amax = text.find("model.llm.layers.19.mlp.experts.w13_weight_amax");
@@ -147,10 +146,9 @@ bool check_weight_reads(HeaderSource& source, const wei::TensorIndex& index) {
     source.stage(fp4.amax) = {wei::Byte{0}, wei::Byte{0}, wei::Byte{0}, wei::Byte{0x41}};  // 8
     source.stage(fp4.denominator) = {wei::Byte{0}, wei::Byte{0}, wei::Byte{0x80}, wei::Byte{0x40}};  // 4
 
-    mini::MiniExpertMatrixView fp8_view;
-    if (!expects(text.expert_matrix(20, expert, mini::MiniExpertProjection::down, fp8_view), wei::Error::ok))
+    wei::microscaled::MatrixView fp8;
+    if (!expects(text.expert_matrix(20, expert, mini::MiniExpertProjection::down, fp8), wei::Error::ok))
         return false;
-    const auto& fp8 = fp8_view.matrix;
     const auto* fp8_scales = text.find("model.llm.layers.20.mlp.experts.w2_weight_scale");
     if (!fp8_scales || fp8.format != wei::microscaled::MatrixFormat::mxfp8 ||
         fp8.columns != 1152 || fp8.rows != 2304 || fp8.amax.source || fp8.denominator.source ||
@@ -162,9 +160,9 @@ bool check_weight_reads(HeaderSource& source, const wei::TensorIndex& index) {
     fp8_scale_codes[36] = wei::Byte{128};
     if (source.payload_reads() != 0) return false;
 
-    mini::MiniExpertMatrix packed;
+    wei::microscaled::StagedMatrix packed;
     std::vector<float> row(fp4.columns);
-    if (!expects(packed.load(fp4_view), wei::Error::ok) || source.payload_reads() != 4 ||
+    if (!expects(packed.load(fp4, wei::microscaled::RowOrder::interleaved_halves), wei::Error::ok) || source.payload_reads() != 4 ||
         !expects(packed.decode_row(0, row), wei::Error::ok) || row[0] != 2.0F ||
         !expects(packed.decode_row(1, row), wei::Error::ok) || row[0] != 1.0F || row[1] != -1.0F ||
         !expects(packed.decode_row(1152, row), wei::Error::ok) || row[0] != 8.0F ||
@@ -172,12 +170,12 @@ bool check_weight_reads(HeaderSource& source, const wei::TensorIndex& index) {
         source.payload_reads() != 4) return false;
 
     row.resize(fp8.columns);
-    if (!expects(packed.load(fp8_view), wei::Error::ok) || source.payload_reads() != 6 ||
+    if (!expects(packed.load(fp8), wei::Error::ok) || source.payload_reads() != 6 ||
         !expects(packed.decode_row(0, row), wei::Error::ok) || row[0] != 1.0F ||
         !expects(packed.decode_row(1, row), wei::Error::ok) || row[0] != -4.0F ||
-        !expects(text.expert_matrix(24, expert, mini::MiniExpertProjection::down, fp8_view),
+        !expects(text.expert_matrix(24, expert, mini::MiniExpertProjection::down, fp8),
                  wei::Error::unsupported_shape) ||
-        !expects(text.expert_matrix(19, 128, mini::MiniExpertProjection::gate_up, fp4_view),
+        !expects(text.expert_matrix(19, 128, mini::MiniExpertProjection::gate_up, fp4),
                  wei::Error::unsupported_shape))
         return false;
 

@@ -170,7 +170,7 @@ private:
 #endif
         core::WeightSliceLoader loader(uploader, {});
         auto weights = MiniResidentWeights::bind(weight_plan_, weight_storage_.span());
-        loader.load_resident(weight_plan_, weight_storage_.span());
+        loader.load_resident(weight_plan_.slices(), weight_storage_.span());
         return weights;
     }
 

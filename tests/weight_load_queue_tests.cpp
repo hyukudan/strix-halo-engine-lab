@@ -1,4 +1,7 @@
 #include "core/weight_load_queue.hpp"
+#include "core/weight_slice_loader.hpp"
+
+#include <array>
 
 #include <atomic>
 #include <cstdint>
@@ -510,6 +513,34 @@ void gguf_tensor_ranges() {
     require(same && up.peak_bytes <= 2 * mib && up.clean(), "GGUF tensors back to back land byte-exact in their own buffers");
 }
 
+static void resident_slice_ranges() {
+    namespace weight = strix::weight;
+    const std::array<std::uint8_t, 6> raw{0x80, 0x3f, 0x00, 0x00, 0x60, 0x40};
+    const auto source = weight::memory_source(std::as_bytes(std::span(raw)));
+    weight::RawTensor gain, bias;
+    gain.wire_dtype = "BF16";
+    gain.payload = {source, {0U, 2U}};
+    bias.wire_dtype = "F32";
+    bias.payload = {source, {2U, 4U}};
+    constexpr std::size_t alignment = 16;
+    const auto plan = weight::ResidentSlicePlan::make({{"bias", &bias}, {"gain", &gain}}, alignment);
+    alignas(alignment) std::array<std::uint8_t, 32> destination;
+    destination.fill(0xff);
+    HostUploader uploader(std::chrono::milliseconds(10));
+    strix::core::WeightSliceLoader loader(uploader, {});
+    try {
+        loader.load_resident(plan, std::span(destination).subspan(1));
+        throw std::runtime_error("resident loader accepted a misaligned address");
+    } catch (const std::invalid_argument&) {
+        require(loader.stats().upload_bytes == 0U, "misaligned resident plan queued an upload");
+    }
+    loader.load_resident(plan, destination);
+    const auto view = weight::ResidentSlices::bind(plan, destination);
+    require(view.bf16("gain").front() == 0x3f80 && view.f32("bias").front() == 3.5F &&
+            destination[2] == 0xff && destination[15] == 0xff && destination[20] == 0xff &&
+            loader.stats().upload_bytes == raw.size(), "resident load drains queued copies and preserves padding");
+}
+
 int main() {
 #ifdef _MSC_VER
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
@@ -531,6 +562,7 @@ int main() {
         cancel_in_cleanup();
         small_budget_ranges();
         gguf_tensor_ranges();
+        resident_slice_ranges();
     } catch (const std::exception& e) {
         std::cerr << "weight load queue tests: " << e.what() << "\n";
         return 1;

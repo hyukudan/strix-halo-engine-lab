@@ -26,6 +26,8 @@ inline Status read_float_slice(const RawTensor& tensor, std::span<float> out,
     const bool f32 = dtype == SliceDtype::f32;
     const std::size_t width = f32 ? 4U : 2U;
     const auto count = tensor.payload.range.bytes / width;
+    if (tensor.payload.range.bytes % width != 0U)
+        return {Error::malformed, "incomplete scalar in tensor " + tensor.name};
     if (first_element > count || out.size() > count - first_element)
         return {Error::unsupported_shape, "plain weight read outside tensor " + tensor.name};
     if (out.empty()) return {Error::ok, {}};
@@ -43,12 +45,7 @@ inline Status read_float_slice(const RawTensor& tensor, std::span<float> out,
     std::vector<Byte> raw(static_cast<std::size_t>(bytes));
     if (const auto status = read_slice(slice, raw); !status) return status;
     if (f32) {
-        for (std::size_t i = 0; i < out.size(); ++i) {
-            std::uint32_t bits = 0;
-            for (unsigned j = 0; j < 4; ++j)
-                bits |= std::to_integer<std::uint32_t>(raw[4 * i + j]) << (8U * j);
-            out[i] = std::bit_cast<float>(bits);
-        }
+        for (std::size_t i = 0; i < out.size(); ++i) out[i] = decode_f32_le(raw.data() + 4U * i);
     } else {
         ggml_dequant::dequantize_row(gguf_type(safetensors_format(tensor.wire_dtype)), raw, out);
     }

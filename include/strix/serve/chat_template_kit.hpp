@@ -27,6 +27,14 @@ namespace strix::serve::chat_kit {
 // A tool call's arguments as an object: an object, or a JSON string holding one (empty text = {}).
 [[nodiscard]] Json call_arguments(const Json& call, const std::string& name);
 
+// Python float text for finite values (shortest round-trip with Python's fixed/exponent cutoffs).
+[[nodiscard]] std::string python_float(double value);
+
+// Compact Jinja tojson output with UTF-8 kept, Python number spelling and optional object-key sorting.
+// Top-level sorting leaves the order of members in nested objects intact.
+enum class JsonKeyOrder { preserve, top_level, recursive };
+[[nodiscard]] std::string compact_json(const Json& value, JsonKeyOrder order = JsonKeyOrder::preserve);
+
 // The spellings of one template's key/value tool-call grammar.
 struct KvToolGrammar {
     std::string_view think_end;    // ends the reasoning block

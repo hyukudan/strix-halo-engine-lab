@@ -14,12 +14,7 @@ using MiniLayers = core::LoopedLayers<kPhysicalLayers, kCoreFirst, kCoreLast, kC
 inline constexpr unsigned kLogicalVisits = MiniLayers::visits;
 
 constexpr auto mini_schedule() { return MiniLayers::schedule(); }
-constexpr bool valid_mini_visit(LayerVisit visit) {
-    constexpr auto schedule = mini_schedule();
-    return visit.logical_layer < schedule.size() &&
-           schedule[visit.logical_layer].physical_layer == visit.physical_layer &&
-           schedule[visit.logical_layer].pass == visit.pass;
-}
+constexpr bool valid_mini_visit(LayerVisit visit) { return MiniLayers::valid_visit(visit); }
 constexpr bool is_core(unsigned physical_layer) { return MiniLayers::is_core(physical_layer); }
 constexpr unsigned state_slot(unsigned physical_layer, unsigned pass) {
     return MiniLayers::state_slot(physical_layer, pass);

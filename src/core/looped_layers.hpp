@@ -48,6 +48,15 @@ struct LoopedLayers {
         return plan;
     }
 
+    // Validate a family-supplied physical/pass/logical tuple before addressing
+    // persistent storage for the visit.
+    static constexpr bool valid_visit(LayerVisit visit) {
+        constexpr auto plan = schedule();
+        return visit.logical_layer < plan.size() &&
+               plan[visit.logical_layer].physical_layer == visit.physical_layer &&
+               plan[visit.logical_layer].pass == visit.pass;
+    }
+
     // The adapter captures the previous pass before restoring the entry.
     // Persistent state is only addressed by run_layer's visit.
     template <class Adapter>

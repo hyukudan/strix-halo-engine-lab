@@ -6,11 +6,27 @@
 // on every stage of a layer pipeline: a stage window's plan from an aligned start concatenates to the one-rank plan, so
 // the pipeline's bits equal the one-rank prefill at the same rmax.
 // Home: shared (host shared). Bound by: bindings that run the prompt in windows (one node and pipeline stages).
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
 namespace strix::session::prompt_windows {
+
+// Unaligned, bounded prompt chunks. Only the final chunk needs a head result.
+// A scalar reference binds max_rows=1. The caller owns append transactions
+// and any recovery needed after a callback has committed part of the prompt.
+template <class Token, class Append>
+void append_chunks(std::span<const Token> prompt, std::size_t max_rows, Append&& append) {
+    if (prompt.empty() || !max_rows) throw std::invalid_argument("invalid prompt chunk bounds");
+    while (!prompt.empty()) {
+        const auto rows = std::min(prompt.size(), max_rows);
+        append(prompt.first(rows), rows == prompt.size());
+        prompt = prompt.subspan(rows);
+    }
+}
 
 struct Rule {
     std::uint32_t align = 8;      // window start and rows are multiples of align

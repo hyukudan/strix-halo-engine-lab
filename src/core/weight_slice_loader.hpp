@@ -1,6 +1,6 @@
 #pragma once
 
-#include "strix/weight/source.hpp"
+#include "strix/weight/resident_slices.hpp"
 #include "weight_load_queue.hpp"
 
 #include <list>
@@ -35,10 +35,8 @@ public:
     }
 
     // A resident plan can also be submitted range by range by placement code.
-    template <class Plan>
-    void load_resident(const Plan& plan, std::span<std::uint8_t> storage) {
-        if (storage.size() < plan.bytes())
-            throw std::invalid_argument("weight load: incomplete resident storage");
+    void load_resident(const weight::ResidentSlicePlan& plan, std::span<std::uint8_t> storage) {
+        plan.require_storage(storage);
         for (const auto& range : plan.ranges())
             load(range.source, storage.subspan(range.destination_offset, range.bytes));
         ready();

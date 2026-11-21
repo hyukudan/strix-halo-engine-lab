@@ -57,6 +57,10 @@ int main() {
     static_assert(schedule[41].physical_layer == 17 && schedule[41].pass == 2);
     static_assert(schedule[42].physical_layer == 18);
     static_assert(schedule[47].physical_layer == 23);
+    static_assert(valid_mini_visit(schedule[18]));
+    static_assert(!valid_mini_visit({6, 2, 18}));
+    static_assert(!valid_mini_visit({7, 1, 18}));
+    static_assert(!valid_mini_visit({6, 1, 48}));
     static_assert(reference_state_slot(schedule[18]) == 24);
     static_assert(reference_state_slot(schedule[30]) == 36);
     static_assert(reference_state_slot(schedule[42]) == 18);

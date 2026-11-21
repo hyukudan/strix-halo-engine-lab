@@ -21,9 +21,9 @@ build/strix-inkling2-mini-inspect MODEL_DIR/model-00001-of-00001.safetensors \
     MODEL_DIR/model.safetensors.index.json
 ```
 
-Expert matrices in physical layers 0–19 pack two E2M1 values in each byte.
+Expert matrices in physical layers 0â€“19 pack two E2M1 values in each byte.
 Each block of 16 has an E4M3 scale and each expert has an outer scale of
-`amax / outer_scale_denominator`. Layers 20–23 use E4M3 weights with E8M0
+`amax / outer_scale_denominator`. Layers 20â€“23 use E4M3 weights with E8M0
 scales for blocks of 32. This schema validates their metadata. Scale values
 and device weight decoding are separate numerical checks.
 
@@ -54,10 +54,16 @@ cmake -S . -B build-cuda -DSTRIX_CUDA_CORE=ON -DCMAKE_CUDA_ARCHITECTURES=120
 cmake --build build-cuda --target strix-inkling2-mini-cuda
 ```
 
-Both commands accept token IDs or raw text via `--prompt`. For text input,
-the official `tokenizer.json` defaults to the checkpoint directory. Supply
-`--tokenizer FILE` to select another copy of the same tokenizer.
-The entry points use greedy sampling and can emit one FP32 logits row.
+Both commands accept token IDs, raw text via `--prompt`, or chat via
+`--messages FILE`. The chat file can be a JSON message array or an object
+with `messages` and optional `tools` and `reasoning_effort` fields. The
+official `tokenizer.json` defaults to the checkpoint directory. Supply
+`--tokenizer FILE` to select another copy of the same tokenizer. Use
+`--tokenize FILE` to print raw-text token IDs without loading model weights.
+
+Generation defaults to greedy selection and can emit one FP32 prompt logits row
+with `--logits FILE`. CPU and device generation accept `--temperature`,
+`--top-k` and `--seed` through the shared sampler.
 
 ```sh
 build-hip/strix-inkling2-mini-hip MODEL.safetensors \
@@ -66,17 +72,17 @@ build-cuda/strix-inkling2-mini-cuda MODEL.safetensors \
     TOKEN_ID TOKEN_ID --prefill-chunk 128 --generate 24
 ```
 
-`--packed-decode` selects the experimental one-row packed expert GEMV on
-either backend. Two kernels combine gate/up with the BF16 activation
-and down with ordered expert combine. The reduction tree differs from
-grouped GEMM. Grouped GEMM stays the default until device comparison.
+HIP defaults to the one-row packed expert GEMV for decode. CUDA defaults to
+grouped GEMM. Use `--packed-decode` or `--grouped-decode` to select the
+route explicitly. The packed route uses one kernel for gate/up with BF16
+activation and one for down with ordered expert combine.
 
 ## Execution and reuse
 
 | Stage | Shared component | Mini binding |
 | --- | --- | --- |
 | Weights | `strix-weight` safetensors indexer and packed K16 NVFP4/MXFP8 operand view | 822 text tensor names, extents and dtypes, including quantization sidecars. The loader exposes contiguous code and scale ranges by physical layer and projection for device residency. CPU and device expert tiles decode compact weights into BF16 operands with the checkpoint's gate/up row order. |
-| Tied layers | `src/core/looped_layers.hpp` | 24 physical layers, with layers 6–17 visited three times for 48 visits |
+| Tied layers | `src/core/looped_layers.hpp` | 24 physical layers, with layers 6â€“17 visited three times for 48 visits |
 | Residual and cross-pass messages | `src/core/residual_reference.hpp` | Save the prelude output and block bank. Before each repeat, capture the previous pass's second block input and final output, then restore the prelude. Read four messages from the captured bank and apply rank-64 gates. |
 | Attention | `src/attn_core` causal GQA reference, prepared BF16 cache binding, dense HIP prefill and CUDA Flash | 24 query heads, 8 KV heads and dimension 128. Both backends append prepared K/V together and dispatch attention with relative logits and dynamic sinks on the same stream. |
 | Short convolutions | `src/core/short_convolution.hpp` and the shared HIP/CUDA device body | Four histories per visit for K, V, post-attention and post-MoE. Full attention uses dynamic K/V taps. Local K/V and both output convolutions use static depthwise taps. The device primitive updates history after the output rows have consumed the previous history. |

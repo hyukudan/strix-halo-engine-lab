@@ -593,7 +593,7 @@ int main() {
         expect(!disabled.enabled() && !disabled.hook(),"no environment leaves measurement disabled");
         const char* capture="bitcalc-measurement-test.bin";
         const char* tokens="bitcalc-measurement-test.tokens";
-        {std::ofstream file(tokens);file<<"2, 0\n";}
+        {std::ofstream file(tokens,std::ios::binary);file<<"2, 0\n";}
         set_environment("STRIX_BITCALC_LOGITS_OUT",capture);
         set_environment("STRIX_BITCALC_FORCE_TOKENS",tokens);
         {

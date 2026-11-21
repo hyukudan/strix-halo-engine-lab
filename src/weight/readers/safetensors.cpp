@@ -52,6 +52,40 @@ Status index_safetensors(std::shared_ptr<const Source> source,TensorIndex& out) 
         out=std::move(result);return {Error::ok,{}};
     }catch(const std::exception& e){return {Error::malformed,e.what()};}
 }
+Status validate_safetensors_shard_manifest(const TensorIndex& index, std::string_view json,
+                                         std::string_view shard) {
+    if (index.container != Container::safetensors)
+        return {Error::unknown_format, "expected a safetensors index"};
+    try {
+        const auto manifest = serve::parse_json_unique(json);
+        const auto* metadata = manifest.find("metadata");
+        const auto* total_size = metadata ? metadata->find("total_size") : nullptr;
+        const auto* weights = manifest.find("weight_map");
+        if (!total_size || !weights || weights->as_object().size() != index.tensors.size())
+            return {Error::malformed, "manifest does not describe every tensor in the shard"};
+
+        std::map<std::string_view, std::string_view> shards;
+        for (const auto& [name, owner] : weights->as_object()) shards.emplace(name, owner.as_string());
+
+        std::uint64_t payload_bytes = 0;
+        for (const auto& tensor : index.tensors) {
+            const auto it = shards.find(tensor.name);
+            if (it == shards.end() || it->second != shard)
+                return {Error::malformed, "missing or incorrect shard mapping for " + tensor.name};
+            shards.erase(it);
+            if (tensor.payload.range.bytes > std::numeric_limits<std::uint64_t>::max() - payload_bytes)
+                return {Error::malformed, "shard payload total overflows"};
+            payload_bytes += tensor.payload.range.bytes;
+        }
+        const auto declared = total_size->as_int();
+        if (declared < 0 || static_cast<std::uint64_t>(declared) != payload_bytes)
+            return {Error::malformed, "manifest total_size disagrees with the shard payload"};
+        return {Error::ok, {}};
+    } catch (const serve::JsonError& error) {
+        return {Error::malformed, error.what()};
+    }
+}
+
 FormatId safetensors_format(std::string_view dtype) noexcept {
     if(dtype=="F32")return {"plain.f32",1};if(dtype=="F16")return {"plain.f16",1};if(dtype=="BF16")return {"plain.bf16",1};
     if(dtype=="F64")return {"typed.f64",1};if(dtype=="I8")return {"typed.i8",1};if(dtype=="U8")return {"typed.u8",1};

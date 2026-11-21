@@ -436,7 +436,7 @@ if(NOT STRIX_CUDA_DS41_ONLY)
     add_executable(strix-inkling2-mini-cpu
         apps/inkling2_mini_cpu.cpp
         src/inkling2/inkling2_mini_host.cpp)
-    target_link_libraries(strix-inkling2-mini-cpu PRIVATE strix_inkling2_mini_checkpoint)
+    target_link_libraries(strix-inkling2-mini-cpu PRIVATE strix_inkling2_mini_checkpoint strix_serve)
     strix_target_warnings(strix-inkling2-mini-cpu)
     if(MSVC)
         target_compile_options(strix-inkling2-mini-cpu PRIVATE /fp:strict)
@@ -1203,6 +1203,8 @@ add_library(strix_serve STATIC
     src/serve/glm_chat.cpp
     src/serve/chat_template_kit.cpp
     src/serve/hy4_chat.cpp
+    src/serve/inkling2_chat.cpp
+    src/serve/serial_generation_cli.cpp
     src/serve/http_server.cpp
     src/serve/engine.cpp
     src/serve/api.cpp
@@ -1230,7 +1232,11 @@ if(BUILD_TESTING AND TARGET strix_inkling2_mini_checkpoint)
     endif()
     set(STRIX_INKLING2_TOKENIZER_JSON "" CACHE FILEPATH "Optional official Inkling 2 Mini tokenizer.json for fixture checks")
     add_test(NAME inkling2-mini-tokenizer COMMAND inkling2-mini-tokenizer-test ${STRIX_INKLING2_TOKENIZER_JSON})
-    set_tests_properties(inkling2-mini-tokenizer PROPERTIES LABELS "cpu;inkling2")
+    add_executable(inkling2-mini-chat-test tests/inkling2/mini_chat_test.cpp)
+    target_link_libraries(inkling2-mini-chat-test PRIVATE strix_serve)
+    strix_target_warnings(inkling2-mini-chat-test)
+    add_test(NAME inkling2-mini-chat COMMAND inkling2-mini-chat-test)
+    set_tests_properties(inkling2-mini-tokenizer inkling2-mini-chat PROPERTIES LABELS "cpu;inkling2")
 endif()
 strix_session_add_runtime()
 
@@ -1504,7 +1510,7 @@ if(BUILD_TESTING)
     # Shared weight-load queue: overlapped reads, per-ticket staging inside a resident budget, one publication wait.
     add_executable(strix-weight-load-queue-tests tests/weight_load_queue_tests.cpp)
     target_include_directories(strix-weight-load-queue-tests PRIVATE src include)
-    target_link_libraries(strix-weight-load-queue-tests PRIVATE Threads::Threads)
+    target_link_libraries(strix-weight-load-queue-tests PRIVATE Threads::Threads strix-weight)
     target_compile_features(strix-weight-load-queue-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-weight-load-queue-tests)
     add_test(NAME strix-weight-load-queue-tests COMMAND strix-weight-load-queue-tests)
@@ -2823,6 +2829,11 @@ if(BUILD_TESTING)
     target_link_libraries(strix-bitcalc-measurement-tests PRIVATE strix_core)
     strix_target_warnings(strix-bitcalc-measurement-tests)
     add_test(NAME strix-bitcalc-measurement-tests COMMAND strix-bitcalc-measurement-tests)
+
+    add_executable(strix-serial-generation-cli-tests tests/serial_generation_cli_tests.cpp)
+    target_link_libraries(strix-serial-generation-cli-tests PRIVATE strix_serve)
+    strix_target_warnings(strix-serial-generation-cli-tests)
+    add_test(NAME strix-serial-generation-cli-tests COMMAND strix-serial-generation-cli-tests)
 
     add_executable(strix-serial-request-tests tests/serial_request_tests.cpp)
     target_link_libraries(strix-serial-request-tests PRIVATE strix_core)

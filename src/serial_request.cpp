@@ -57,6 +57,63 @@ std::uint32_t select_greedy_token(
     return best;
 }
 
+namespace {
+
+// Both logit-backed and preselected continuations leave the last output pending.
+template <class Select, class Consume>
+SerialGreedyRequestResult continue_serial(const SerialTokenContinuationRequest& request,
+    Select select, Consume consume, const std::function<void(std::uint32_t)>& emit = {}) {
+    SerialGreedyRequestResult result;
+    auto& position = result.final_position;
+    position = request.start_position;
+    if (!request.max_new_tokens) return result;
+
+    const auto remaining = request.context_capacity - position;
+    const auto emissions = remaining == std::numeric_limits<std::uint64_t>::max()
+        ? request.max_new_tokens : std::min(request.max_new_tokens, remaining + 1U);
+    if (emissions > result.generated_tokens.max_size())
+        throw std::length_error("greedy continuation response exceeds host vector capacity");
+    result.generated_tokens.reserve(static_cast<std::size_t>(emissions));
+
+    for (;;) {
+        const auto next = select(result.generated_tokens.size(), position);
+        if (next >= request.vocab_size)
+            throw std::invalid_argument("greedy emission token is outside vocabulary");
+        startup::first_token();
+        power::mark_first_token();
+        result.generated_tokens.push_back(next);
+        if (emit) emit(next);
+        if (next == request.eos_token_id) {
+            result.stop_reason = SerialRequestStopReason::eos;
+            return result;
+        }
+        if (position >= request.context_capacity) {
+            result.stop_reason = SerialRequestStopReason::context_capacity;
+            return result;
+        }
+        if (result.generated_tokens.size() >= request.max_new_tokens) return result;
+        consume(next, position);
+        ++result.steps_executed;
+        ++position;
+    }
+}
+
+}  // namespace
+
+SerialGreedyRequestResult execute_serial_token_continuation(
+    const SerialTokenContinuationRequest& request,
+    const std::function<std::uint32_t(std::uint32_t, std::uint64_t)>& decode,
+    const std::function<void(std::uint32_t)>& emit) {
+    if (!request.vocab_size || request.vocab_size > std::uint64_t{UINT32_MAX} + 1U ||
+        request.initial_token >= request.vocab_size || request.eos_token_id >= request.vocab_size ||
+        !request.context_capacity || request.start_position > request.context_capacity || !decode)
+        throw std::invalid_argument("invalid serial token continuation");
+
+    auto pending = request.initial_token;
+    return continue_serial(request, [&](std::uint64_t, std::uint64_t) { return pending; },
+        [&](std::uint32_t input, std::uint64_t position) { pending = decode(input, position); }, emit);
+}
+
 SerialGreedyRequestResult execute_serial_greedy_continuation(
     const SerialGreedyContinuationRequest& request,
     SerialGreedyStepBackend& backend) {
@@ -88,82 +145,14 @@ SerialGreedyRequestResult execute_serial_greedy_continuation(
             "serial greedy continuation EOS token is outside vocabulary");
     }
 
-    SerialGreedyRequestResult result;
-    result.final_position =
-        request.start_position;
-    std::vector<float> logits(
-        request.initial_logits.begin(),
-        request.initial_logits.end());
-
-    if (request.max_new_tokens == 0) {
-        return result;
-    }
-
-    // Reserve before the first continuation input can mutate model state. At
-    // most one final token is emitted without being consumed at capacity.
-    const auto remaining = request.context_capacity - request.start_position;
-    const auto emissions = remaining == std::numeric_limits<std::uint64_t>::max()
-        ? request.max_new_tokens : std::min(request.max_new_tokens, remaining + 1U);
-    if (emissions > result.generated_tokens.max_size())
-        throw std::length_error("greedy continuation response exceeds host vector capacity");
-    result.generated_tokens.reserve(static_cast<std::size_t>(emissions));
-
-    std::uint64_t position =
-        request.start_position;
-    while (result.generated_tokens.size() <
-           request.max_new_tokens) {
-        const auto argmax =
-            select_greedy_token(
-                logits,
-                request.vocab_size);
-        const auto next = request.emission_hook
-            ? request.emission_hook(result.generated_tokens.size(), position - 1U, argmax, logits)
-            : argmax;
-        if (next >= request.vocab_size)
-            throw std::invalid_argument("greedy emission token is outside vocabulary");
-        startup::first_token();
-        power::mark_first_token();
-        result.generated_tokens.push_back(
-            next);
-
-        if (next ==
-            request.eos_token_id) {
-            result.stop_reason =
-                SerialRequestStopReason::eos;
-            result.final_position =
-                position;
-            return result;
-        }
-
-        if (position >=
-            request.context_capacity) {
-            result.stop_reason =
-                SerialRequestStopReason::context_capacity;
-            result.final_position =
-                position;
-            return result;
-        }
-
-        if (result.generated_tokens.size() >=
-            request.max_new_tokens) {
-            result.stop_reason =
-                SerialRequestStopReason::max_new_tokens;
-            result.final_position =
-                position;
-            return result;
-        }
-
-        logits =
-            backend.execute(
-                next,
-                position);
-        ++result.steps_executed;
-        ++position;
-        result.final_position =
-            position;
-    }
-
-    return result;
+    std::vector<float> logits(request.initial_logits.begin(), request.initial_logits.end());
+    return continue_serial({0U, request.start_position, request.vocab_size, request.context_capacity,
+                            request.max_new_tokens, request.eos_token_id},
+        [&](std::uint64_t emitted, std::uint64_t position) {
+            const auto argmax = select_greedy_token(logits, request.vocab_size);
+            return request.emission_hook ? request.emission_hook(emitted, position - 1U, argmax, logits) : argmax;
+        },
+        [&](std::uint32_t input, std::uint64_t position) { logits = backend.execute(input, position); });
 }
 
 namespace {

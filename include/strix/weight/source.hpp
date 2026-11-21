@@ -1,7 +1,15 @@
 #pragma once
 #include "types.hpp"
+#include <bit>
 #include <istream>
 namespace strix::weight {
+// Decode one little-endian F32 from four source bytes, at any byte alignment.
+inline float decode_f32_le(const Byte* bytes) {
+    std::uint32_t bits = 0;
+    for (unsigned i = 0; i < 4; ++i) bits |= std::to_integer<std::uint32_t>(bytes[i]) << (8U * i);
+    return std::bit_cast<float>(bits);
+}
+
 struct Source {
   virtual ~Source() = default;
   virtual Status read(ByteRange, std::span<Byte>) const = 0;

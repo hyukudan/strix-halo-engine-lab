@@ -1,4 +1,5 @@
 #include "inkling2_mini_host.hpp"
+#include "inkling2_mini_expert_layout.hpp"
 
 #include "attn_core/causal_gqa_reference.hpp"
 #include "core/linear_microscaled_reference.hpp"
@@ -117,11 +118,12 @@ struct MiniHostDecoder::Impl {
         const auto bias = parameter(mini_layer_parameter(layer, "mlp.gate.bias"), kExperts);
         const auto project = [&](unsigned expert, strix::moe::ExpertProjection kind,
                                  std::span<const float> row, std::span<float> output) {
-            MiniExpertMatrixView view;
-            require_checkpoint(weights.expert_matrix(layer, expert, kind == strix::moe::ExpertProjection::gate_up
-                ? MiniExpertProjection::gate_up : MiniExpertProjection::down, view));
-            MiniExpertMatrix matrix;
-            require_checkpoint(matrix.load(view));
+            const auto projection = kind == strix::moe::ExpertProjection::gate_up
+                ? MiniExpertProjection::gate_up : MiniExpertProjection::down;
+            weight::microscaled::MatrixView view;
+            require_checkpoint(weights.expert_matrix(layer, expert, projection, view));
+            weight::microscaled::StagedMatrix matrix;
+            require_checkpoint(matrix.load(view, mini_expert_row_order(projection)));
             using weight::microscaled::MatrixFormat;
             if (matrix.format() == MatrixFormat::nvfp4) {
                 core::microscaled_matvec_reference<MatrixFormat::nvfp4>(matrix.packed(), row, output);

@@ -7,6 +7,8 @@ add_library(strix-weight STATIC
     ${STRIX_WEIGHT_ROOT}/src/weight/model_binding.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/readers/gguf.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/readers/safetensors.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/tensor_access.cpp
+    ${STRIX_WEIGHT_ROOT}/src/weight/formats/microscaled_matrix.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/readers/pack.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/adapters/qwen.cpp
     ${STRIX_WEIGHT_ROOT}/src/weight/adapters/ds41.cpp

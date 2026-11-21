@@ -1,5 +1,7 @@
 #pragma once
 
+#include "strix/session/prompt_windows.hpp"
+
 #include "strix/attn/cache_rows.hpp"
 #include "strix/session/kv.hpp"
 
@@ -220,11 +222,11 @@ public:
         const auto max_chunk = plan_.max_chunk();
         const auto first = committed_;
         try {
-            while (tokens.size() > max_chunk) {
-                (void)append(tokens.first(max_chunk), false);
-                tokens = tokens.subspan(max_chunk);
-            }
-            return append(tokens, true);
+            unsigned result{};
+            prompt_windows::append_chunks(tokens, max_chunk, [&](auto chunk, bool last) {
+                result = append(chunk, last);
+            });
+            return result;
         } catch (...) {
             if (committed_ != first) poison();
             throw;

@@ -638,6 +638,15 @@ std::shared_ptr<const BpeTokenizer> BpeTokenizer::load_hf_json(const std::string
     return out;
 }
 
+std::shared_ptr<const BpeTokenizer> BpeTokenizer::load_hf_json(const std::string& path, const HfIdentity& expected) {
+    auto tokenizer = load_hf_json(path);
+    if (tokenizer->pre() != expected.pre || tokenizer->vocab_size() != expected.vocab_size ||
+        tokenizer->eos_token() != expected.eos || tokenizer->find(expected.sentinel) != expected.sentinel_id) {
+        throw std::invalid_argument("tokenizer: " + path + " does not match the checkpoint tokenizer identity");
+    }
+    return tokenizer;
+}
+
 std::shared_ptr<const BpeTokenizer> BpeTokenizer::load_gguf(const std::string& path) {
     auto parts = read_gguf_tokenizer(path);
     if (parts.model != "gpt2") throw std::invalid_argument("tokenizer: GGUF tokenizer model is not byte-level BPE (gpt2)");

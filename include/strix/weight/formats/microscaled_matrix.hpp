@@ -4,15 +4,15 @@
 #include "strix/weight/source.hpp"
 
 #include <array>
-#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <span>
-#include <string>
 #include <utility>
 #include <vector>
+
+namespace strix::weight { class TensorLookup; }
 
 namespace strix::weight::microscaled {
 
@@ -28,10 +28,8 @@ struct MatrixView {
 
 namespace detail {
 
-inline float decode_f32_le(const Byte* bytes) {
-    std::uint32_t bits = 0;
-    for (unsigned i = 0; i < 4; ++i) bits |= std::to_integer<std::uint32_t>(bytes[i]) << (8U * i);
-    return std::bit_cast<float>(bits);
+inline bool valid_row_order(RowOrder order, std::size_t rows) {
+    return order == RowOrder::contiguous || (order == RowOrder::interleaved_halves && rows % 2U == 0);
 }
 
 inline Status read_f32(const Slice& slice, float& out) {
@@ -43,6 +41,13 @@ inline Status read_f32(const Slice& slice, float& out) {
 }
 
 }  // namespace detail
+
+struct ExpertSlabNames {
+    std::string codes;
+    std::string block_scales;
+    std::string amax;
+    std::string denominator;
+};
 
 // Raw source layout for one physical projection's [expert][row][column]
 // checkpoints. Codes and scales can be uploaded in two spans with no widening.
@@ -57,24 +62,9 @@ struct ExpertSlabView {
     Slice amax;
     Slice denominator;
 
-    // Names follow codes, block scales, then NVFP4 maximum and denominator.
-    // The caller supplies the schema; looking up these slices reads no payload.
-    template <class Find>
-    Status bind_sources(const std::array<std::string, 4>& names, Find find) {
-        std::array<Slice, 4> slices{};
-        const std::size_t count = format == MatrixFormat::nvfp4 ? slices.size() : 2U;
-        for (std::size_t i = 0; i < count; ++i) {
-            const auto* tensor = find(names[i]);
-            if (!tensor) return {Error::malformed, "missing expert tensor " + names[i]};
-            if (const auto status = subslice(tensor->payload, {0, tensor->payload.range.bytes}, slices[i]); !status)
-                return status;
-        }
-        codes = std::move(slices[0]);
-        block_scales = std::move(slices[1]);
-        amax = std::move(slices[2]);
-        denominator = std::move(slices[3]);
-        return {Error::ok, {}};
-    }
+    // Attach named source slices to the declared geometry without reading
+    // payloads. Only NVFP4 uses the two outer-scale sidecar names.
+    Status bind_sources(const TensorLookup&, const ExpertSlabNames&);
 
     Status matrix(std::size_t expert, MatrixView& out) const {
         if (expert >= experts) return {Error::unsupported_shape, "expert outside microscaled slab"};
@@ -112,7 +102,7 @@ struct ExpertSlabView {
             std::vector<Byte> maxima(experts * 4U);
             if (const auto status = read_slice(amax, maxima); !status) return status;
             for (std::size_t expert = 0; expert < experts; ++expert) {
-                const float maximum = detail::decode_f32_le(maxima.data() + 4U * expert);
+                const float maximum = decode_f32_le(maxima.data() + 4U * expert);
                 outer[expert] = maximum / divisor;
                 if (!std::isfinite(outer[expert]) || maximum < 0.0F)
                     return {Error::malformed, "invalid per-expert NVFP4 outer scale"};
@@ -130,7 +120,7 @@ private:
         const bool nvfp4 = format == MatrixFormat::nvfp4;
         if (!nvfp4 && format != MatrixFormat::mxfp8)
             return {Error::unknown_format, "unknown microscaled slab format"};
-        if (row_order != RowOrder::contiguous && (row_order != RowOrder::interleaved_halves || rows % 2U != 0))
+        if (!detail::valid_row_order(row_order, rows))
             return {Error::unsupported_shape, "invalid microscaled slab row order"};
         const auto block = nvfp4 ? kNvfp4BlockColumns : kMxfp8BlockColumns;
         constexpr auto limit = std::numeric_limits<std::size_t>::max();
@@ -154,7 +144,11 @@ private:
 // matches the source, so the same staging is usable by host and device callers.
 class StagedMatrix {
 public:
-    Status load(const MatrixView& view) {
+    Status load(const MatrixView& view) { return load(view, RowOrder::contiguous); }
+
+    Status load(const MatrixView& view, RowOrder order) {
+        if (!detail::valid_row_order(order, view.rows))
+            return {Error::unsupported_shape, "invalid microscaled matrix row order"};
         const bool nvfp4 = view.format == MatrixFormat::nvfp4;
         if (!nvfp4 && view.format != MatrixFormat::mxfp8)
             return {Error::unknown_format, "unknown microscaled matrix format"};
@@ -165,6 +159,7 @@ public:
 
         StagedMatrix loaded;
         loaded.format_ = view.format;
+        loaded.order_ = order;
         loaded.rows_ = view.rows;
         loaded.columns_ = view.columns;
         const auto elements = view.rows * view.columns;
@@ -198,6 +193,7 @@ public:
     [[nodiscard]] MatrixFormat format() const { return format_; }
     [[nodiscard]] std::span<const std::uint8_t> codes() const { return codes_; }
     [[nodiscard]] std::span<const std::uint8_t> block_scales() const { return scales_; }
+    [[nodiscard]] PackedMatrix packed() const { return packed(order_); }
     [[nodiscard]] PackedMatrix packed(RowOrder order) const {
         const float outer = rows() != 0 && format_ == MatrixFormat::nvfp4 ? amax_ / denominator_ : 1.0F;
         return {codes_.data(), scales_.data(), rows(), columns(), outer, order};
@@ -206,6 +202,7 @@ public:
     Status decode_row(std::size_t row, std::span<float> out) const {
         if (row >= rows() || out.size() != columns_)
             return {Error::unsupported_shape, "microscaled matrix row outside its geometry"};
+        row = physical_row(order_, rows_, row);
         const bool nvfp4 = format_ == MatrixFormat::nvfp4;
         const auto code_bytes = nvfp4 ? columns_ / 2U : columns_;
         const auto scale_bytes = columns_ / (nvfp4 ? kNvfp4BlockColumns : kMxfp8BlockColumns);
@@ -222,6 +219,7 @@ public:
 
 private:
     MatrixFormat format_{};
+    RowOrder order_{};
     std::size_t rows_{};
     std::size_t columns_{};
     float amax_{};

@@ -54,6 +54,20 @@ struct SerialGreedyContinuationRequest {
     GreedyEmissionHook emission_hook{};
 };
 
+// Continue after a backend has committed the prompt and selected its next ID.
+// Decode consumes the preceding ID and returns the checked selection for the
+// next row. Emit sees each published ID, including EOS, without consuming it.
+struct SerialTokenContinuationRequest {
+    std::uint32_t initial_token;
+    std::uint64_t start_position, vocab_size, context_capacity, max_new_tokens;
+    std::uint32_t eos_token_id;
+};
+
+[[nodiscard]] SerialGreedyRequestResult execute_serial_token_continuation(
+    const SerialTokenContinuationRequest& request,
+    const std::function<std::uint32_t(std::uint32_t, std::uint64_t)>& decode,
+    const std::function<void(std::uint32_t)>& emit = {});
+
 struct GreedyPrefixRestore {
     std::uint64_t consumed_prefix = 0;
     // Present only for an exact full-prefix hit. This token has NOT been

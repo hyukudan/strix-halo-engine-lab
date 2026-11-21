@@ -1,4 +1,10 @@
+#if defined(STRIX_INKLING2_APP_CLI_TEST)
 #include "inkling2_mini_cli.hpp"
+#endif
+#include "strix/session/cli_output.hpp"
+#include "strix/session/head_gate_cli.hpp"
+
+#include <iostream>
 
 #include <array>
 #include <bit>
@@ -6,7 +12,9 @@
 
 namespace {
 
+#if defined(STRIX_INKLING2_APP_CLI_TEST)
 namespace cli = strix::inkling2::cli;
+#endif
 namespace session = strix::session;
 namespace fs = std::filesystem;
 
@@ -68,12 +76,17 @@ struct Decoder {
     }
 };
 
+#if defined(STRIX_INKLING2_APP_CLI_TEST)
 cli::Options parse(std::initializer_list<std::string> arguments) {
     std::vector<std::string> storage{"mini", "model"};
     storage.insert(storage.end(), arguments);
     std::vector<char*> argv;
     for (auto& value : storage) argv.push_back(value.data());
-    auto options = cli::parse(static_cast<int>(argv.size()), argv.data(), 128U);
+    const strix::serve::SerialGenerationFamily family{"mini", "Mini", "MODEL",
+        8U, 8U, 16U, 0U, nullptr, 8U, true, false,
+        [](const std::string&) -> std::shared_ptr<const strix::serve::BpeTokenizer> { return {}; },
+        true, [](std::string_view) { return std::string{}; }};
+    auto options = cli::parse(static_cast<int>(argv.size()), argv.data(), family);
     // Only use fields that own their values after the temporary argument storage expires.
     return options;
 }
@@ -84,6 +97,11 @@ void test_options() {
     require(parse({"1", "--profile", "exact"}).tier.profile == Name::standard, "expected explicit exact");
     require(parse({"1", "--profile", "fast"}).tier.profile == Name::fast, "expected FAST");
     require(parse({"1", "--profile", "turbo"}).tier.profile == Name::turbo, "expected TURBO");
+    require(parse({"1"}).generation.packed_decode, "expected packed default");
+    require(!parse({"1", "--grouped-decode"}).generation.packed_decode, "expected grouped override");
+    expect_invalid([] { (void)parse({"1", "--packed-decode", "--grouped-decode"}); });
+    expect_invalid([] { (void)parse({"--messages", "chat.json", "--tokenize", "input.txt"}); });
+    expect_invalid([] { (void)parse({"--tokenize", "input.txt", "--generate", "0"}); });
     expect_invalid([] { (void)parse({"--gate-rows", "64"}); });
     expect_invalid([] { (void)parse({"1", "--profile", "fake"}); });
     const auto gate = parse({"--gate-manifest", "windows.tsv", "--gate-out", "out", "--gate-arm", "REF",
@@ -93,6 +111,8 @@ void test_options() {
     cli::write_profile(gate.tier, profile_line, true);
     require(profile_line.str() == "profile exact levers none reference BASE\n", "device profile receipt differs");
 }
+
+#endif
 
 void test_windows(const fs::path& directory) {
     using session::HeadGateMode;
@@ -154,7 +174,9 @@ void test_windows(const fs::path& directory) {
 int main() {
     try {
         const TempDir directory;
+#if defined(STRIX_INKLING2_APP_CLI_TEST)
         test_options();
+#endif
         test_windows(directory.path);
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

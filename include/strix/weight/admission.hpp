@@ -30,6 +30,8 @@ Status index_gguf(std::shared_ptr<const Source>, TensorIndex&);
 Status namespace_index(TensorIndex&, std::string shard);
 Status index_gguf(const gguf::FileInfo&, std::shared_ptr<const Source>, TensorIndex&);
 Status index_safetensors(std::shared_ptr<const Source>, TensorIndex&);
+// Verify the supported single-shard manifest contract without reading any payload.
+Status validate_safetensors_shard_manifest(const TensorIndex&, std::string_view json, std::string_view shard);
 Status index_pack(std::shared_ptr<const Source>, TensorIndex&);
 Status admit(const Registry&, const AdmissionRequest&, WeightMap&);
 Status validate_binding(const Registry&, const WeightMapEntry&);

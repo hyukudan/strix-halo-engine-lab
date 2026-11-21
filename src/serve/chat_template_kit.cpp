@@ -1,6 +1,9 @@
 #include "strix/serve/chat_template_kit.hpp"
 
 #include <algorithm>
+#include <array>
+#include <charconv>
+#include <cmath>
 #include <string>
 
 namespace strix::serve::chat_kit {
@@ -60,7 +63,53 @@ Json call_arguments(const Json& call, const std::string& name) {
     raise("Tool call arguments for function \"" + name + "\" must be an object/mapping or a JSON string.");
 }
 
+std::string python_float(double value) {
+    if (!std::isfinite(value)) raise("Expected a finite JSON number.");
+    std::array<char, 32> buffer{};
+    const auto scientific = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value,
+                                          std::chars_format::scientific);
+    if (scientific.ec != std::errc{}) raise("Could not format a JSON number.");
+    const std::string_view text(buffer.data(), scientific.ptr);
+    const auto e = text.find('e');
+    int exponent{};
+    const auto parsed = std::from_chars(buffer.data() + e + 2U, scientific.ptr, exponent);
+    if (parsed.ec != std::errc{}) raise("Could not format a JSON number exponent.");
+    if (text[e + 1U] == '-') exponent = -exponent;
+    if (exponent < -4 || exponent >= 16) return std::string(text);
+    const auto fixed = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value, std::chars_format::fixed);
+    if (fixed.ec != std::errc{}) raise("Could not format a JSON number.");
+    std::string result(buffer.data(), fixed.ptr);
+    if (result.find('.') == std::string::npos) result += ".0";
+    return result;
+}
+
 namespace {
+
+Json json_for_template(const Json& value, JsonKeyOrder order) {
+    const auto nested_order = order == JsonKeyOrder::recursive ? order : JsonKeyOrder::preserve;
+    if (value.is_object()) {
+        Json::Object members;
+        members.reserve(value.size());
+        for (const auto& [key, item] : value.as_object())
+            members.emplace_back(key, json_for_template(item, nested_order));
+        if (order != JsonKeyOrder::preserve)
+            std::ranges::sort(members, {}, &Json::Member::first);
+        return Json(std::move(members));
+    }
+    if (value.is_array()) {
+        Json::Array items;
+        items.reserve(value.size());
+        for (const auto& item : value.as_array()) items.push_back(json_for_template(item, nested_order));
+        return Json(std::move(items));
+    }
+    if (value.is_number()) {
+        const auto& number = value.number_source();
+        if (number.find_first_of(".eE") != std::string::npos)
+            return Json::number_text(python_float(value.as_double()));
+        if (number == "-0") return Json(0);
+    }
+    return value;
+}
 
 // As parse_assistant_output: the schema of one parameter of a request tool.
 const Json* parameter_schema(const Json& tools, const std::string& function, const std::string& parameter) {
@@ -87,6 +136,10 @@ Json typed_value(const std::string& text, const Json* schema) {
 }
 
 }  // namespace
+
+std::string compact_json(const Json& value, JsonKeyOrder order) {
+    return json_for_template(value, order).dump();
+}
 
 AssistantOutput parse_kv_tool_output(const std::string& text, bool reasoning_open, const KvToolGrammar& g, const Json& tools) {
     AssistantOutput out;
