@@ -98,6 +98,8 @@ std::uint32_t nvfp4_split_k(std::uint32_t out, std::uint32_t in);
 // when a GEMV is captured after another GEMV on the same stream, a side node that depends only on that previous GEMV
 // prefetches the head of this GEMV's weights into L2 while the window kernels between the two run.
 // mode -1 = lever STRIX_CUDA_WEIGHT_READAHEAD (default on; =0 turns it off), 0 = off, 1 = on.
+// Consumers with rows > kNvfp4ReadaheadMaxRows (the RB4 tile, bound by its row work) never get a side node.
+constexpr std::uint32_t kNvfp4ReadaheadMaxRows = 24;
 void nvfp4_set_readahead(int mode);
 // This thread's read-ahead mode (-1 = follow nvfp4_set_readahead / the lever, 0 = off, 1 = on); returns the previous one.
 // Captures are thread-local (cudaStreamCaptureModeThreadLocal), so a capture site scopes it with Nvfp4ReadaheadScope.

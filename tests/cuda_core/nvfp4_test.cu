@@ -678,9 +678,13 @@ static void test_readahead(std::uint32_t rows, unsigned long long win_ns, int re
     cc::set_programmatic_launch(true);
     const bool same = arm[0].out.size() == arm[1].out.size() &&
                       std::memcmp(arm[0].out.data(), arm[1].out.data(), arm[0].out.size() * 4) == 0;
-    const bool added = arm[0].bytes == 0 && arm[1].bytes > 0 && arm[1].nodes == arm[0].nodes + (3 * S - 1);
+    // Consumers above the stream-bound rows get no side node (strix/decode_weight_sweep.hpp readahead_rows_ok).
+    const bool eligible = rows <= cc::kNvfp4ReadaheadMaxRows;
+    const bool added = eligible ? arm[0].bytes == 0 && arm[1].bytes > 0 && arm[1].nodes == arm[0].nodes + (3 * S - 1)
+                                : arm[0].bytes == 0 && arm[1].bytes == 0 && arm[1].nodes == arm[0].nodes;
     expect(same, "read-ahead: graph outputs bitwise equal off vs on");
-    expect(added, "read-ahead: one side node per GEMV after the first (on), none (off)");
+    expect(added, eligible ? "read-ahead: one side node per GEMV after the first (on), none (off)"
+                           : "read-ahead: no side node for consumers above the stream-bound rows");
     std::printf("RA rows %u win %llu us pdl %d: nodes off %zu on %zu, last head %.1f MB | bitwise %s | off %.2f us on %.2f us "
                 "per chain (%+.1f %%)\n",
                 rows, win_ns / 1000, pdl ? 1 : 0, arm[0].nodes, arm[1].nodes, arm[1].bytes / 1048576.0, same ? "yes" : "NO",

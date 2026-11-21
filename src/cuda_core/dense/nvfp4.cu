@@ -323,6 +323,7 @@ __global__ void fp4_readahead(const ReadaheadArgs a) {
 // STRIX_CUDA_WEIGHT_READAHEAD: bitwise (prefetch only); default ON (gain plus neutral). No-model bench, RTX PRO 6000 at
 // 528 W: 4/4 configurations bitwise and faster (rows 8 -4.2 / -6.9 %, rows 16 -1.2 / -3.1 % per 3-set verify chain);
 // Qwen dense 27B served decode ABAB x3, ids equal: B/A 1.0044 (B ahead in 5 of 6 runs). STRIX_CUDA_WEIGHT_READAHEAD=0 off.
+// Rows 24 gains (-3.3 / -2.7 %), rows 32 loses (+2.1 / +1.6 %): consumers above 24 rows get no side node.
 inline constexpr ::strix::lever::Decl readahead_lever{
     .name = "cuda_weight_readahead", .env = "STRIX_CUDA_WEIGHT_READAHEAD", .exactness = ::strix::lever::Exactness::bitwise,
     .default_on = true, .source = "tests/cuda_core/nvfp4_test.cu --readahead (bitwise, -1.2..-6.9 %); served ABAB B/A 1.0044"};
@@ -356,9 +357,14 @@ cudaError_t capture_info(cudaStream_t s, cudaStreamCaptureStatus* st, unsigned l
 
 // Before a GEMV is captured: when the previous GEMV on this stream belongs to the same capture, add the read-ahead node
 // (depends on that GEMV only, nothing depends on it: a leaf of the graph, so the stream order is unchanged).
-cudaError_t readahead_before(const Jobs& jobs, std::uint32_t in, int tiles_per_block, std::uint32_t gx,
-                             std::uint32_t maxks, bool fused, cudaStream_t s) {
-    if (!readahead_on()) return cudaSuccess;
+// Consumer rows: the rule's stream-bound tiles are RB 1..3 (rows <= 24, launch_by_rows). RB4 (rows 25..32) is bound by
+// its row work: no-model verify chain, RTX PRO 6000 at 528 W, bitwise 4/4: rows 24 -3.3 / -2.7 % with the side node,
+// rows 32 +2.1 / +1.6 % (tests/cuda_core/nvfp4_test.cu --readahead 24 / 32), so RB4 consumers get none
+// (kNvfp4ReadaheadMaxRows, cuda_core/nvfp4.hpp).
+static_assert(kNvfp4ReadaheadMaxRows == 24, "read-ahead row bound = the RB3 tile's last row count (launch_by_rows)");
+cudaError_t readahead_before(const Jobs& jobs, std::uint32_t in, std::uint32_t rows, int tiles_per_block,
+                             std::uint32_t gx, std::uint32_t maxks, bool fused, cudaStream_t s) {
+    if (!readahead_on() || !::strix::decode::readahead_rows_ok(rows, kNvfp4ReadaheadMaxRows)) return cudaSuccess;
     cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
     unsigned long long id = 0;
     cudaGraph_t graph = nullptr;
@@ -448,7 +454,7 @@ cudaError_t launch_gemv(Jobs& jobs, const float* x, std::uint32_t in, std::uint3
     }
     // Both launches carry the programmatic-serialization attribute (off switch: set_programmatic_launch(false) gives the
     // previous fully serialised form; same kernels, same bits).
-    cudaError_t e = readahead_before(jobs, in, kWarpsPerBlock * MT, gx, maxks, fused, s);
+    cudaError_t e = readahead_before(jobs, in, rows, kWarpsPerBlock * MT, gx, maxks, fused, s);
     if (e != cudaSuccess) return e;
     e = launch_pdl_smem(fp4_gemv<RB, MT>, dim3(gx, maxks, fused ? 2 : 1), dim3(kWarpsPerBlock * 32),
                         static_cast<std::size_t>(kSlab) * RB * 2048, s, jobs, x, in, rows);

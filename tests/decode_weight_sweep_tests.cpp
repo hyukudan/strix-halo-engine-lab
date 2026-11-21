@@ -8,7 +8,8 @@
 //      fmaf(scale, dot, acc), groups ascending) gives bitwise the same F32 for rows-per-sweep 1, 4, 8, 16 and operand
 //      chunks 4, 8, 16, because each row's operations and their order are the same; only the grouping changes.
 //   4. Read-ahead (readahead_checks below): the dispatch-order pieces are exactly the GEMV's reads, each record once,
-//      and the lead prefix is the longest one within min(bytes, cache / 4).
+//      and the lead prefix is the longest one within min(bytes, cache / 4); consumers get a side node only for rows
+//      1..stream_bound_rows (readahead_rows_ok).
 #include "strix/decode_weight_sweep.hpp"
 
 #include <algorithm>
@@ -162,6 +163,13 @@ void readahead_checks() {
     readahead_case(grid({320}, {48}, {1}, 48, 8), "out, rows > 16");
     readahead_case(grid({7}, {3}, {1}, 10, 16), "ragged: one partial block, ks not dividing chunks");
     check(strix::decode::readahead_budget(100ULL << 20U, 128ULL << 20U) == (32ULL << 20U), "budget caps at cache / 4");
+    // Consumer rows: eligible exactly for 1..stream_bound_rows (CUDA NVFP4: 24 = the last stream-bound tile, RB3).
+    for (unsigned rows = 0U; rows <= 40U; ++rows) {
+        const bool want = rows >= 1U && rows <= 24U;
+        check(strix::decode::readahead_rows_ok(rows, 24U) == want, "rows rule: side node only for rows 1..24");
+    }
+    static_assert(strix::decode::readahead_rows_ok(24U, 24U) && !strix::decode::readahead_rows_ok(25U, 24U),
+                  "rows rule is constexpr and inclusive at the bound");
 }
 
 }  // namespace

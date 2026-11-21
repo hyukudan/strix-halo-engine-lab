@@ -114,6 +114,14 @@ STRIX_DECODE_HD constexpr unsigned long long readahead_block_records(const Reada
     return n;
 }
 
+// Whether a consumer GEMV of `rows` activation rows is read-ahead eligible. The read-ahead only pays while the GEMV is
+// bound by its weight stream; once the row tile makes it bound by its row work, the head it would fetch early arrives
+// in time anyway and the side node only competes with the window kernels. `stream_bound_rows` is the largest row count
+// of the backend's weight-stream-bound tiles (CUDA NVFP4: kNvfp4ReadaheadMaxRows). Rows outside it get no side node.
+constexpr bool readahead_rows_ok(unsigned rows, unsigned stream_bound_rows) {
+    return rows >= 1U && rows <= stream_bound_rows;
+}
+
 constexpr unsigned long long readahead_budget(unsigned long long consumer_bytes, unsigned long long cache_bytes) {
     const unsigned long long cap = cache_bytes / kReadaheadCacheDivisor;
     return consumer_bytes < cap ? consumer_bytes : cap;
