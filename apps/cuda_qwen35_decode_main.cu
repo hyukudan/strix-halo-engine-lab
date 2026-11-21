@@ -186,7 +186,7 @@ int main(int argc, char** argv) {
             else if (a == "--max-pos") max_pos = strix::core::parse_u32(next());
             else if (a == "--profile") profile = strix::qwen35::profile::parse(next());  // one tier word; exact = default
             else if (a == "--prefill-arith") lever_cli.emplace_back("prefill_arith", next());
-            else if (a == "--prefill-gdn") lever_cli.emplace_back("prefill_gdn", next());  // serial|chunk16|chunk16tc (FAST, -gdnc16|-gdnc16t)
+            else if (a == "--prefill-gdn") lever_cli.emplace_back("prefill_gdn", next());  // serial|chunk16|chunk16tc (FAST, -gdnc16|-gdnc16t2)
             else if (a == "--prefill-hid") lever_cli.emplace_back("prefill_hid", next());  // f32|bf16 (FAST4 FFN hidden rows, -h16)
             else if (a == "--prefill-norm-fold") pf_norm_fold = next();
             else if (a == "--prefill-tile-feed") pf_tile_feed = next();

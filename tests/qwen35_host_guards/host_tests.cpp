@@ -124,7 +124,7 @@ int main() {
         check(serial_id.ends_with("-pf-fast4") && chunk_id == serial_id + "-gdnc16", "chunk16 FAST identity suffix");
         check(q::parse_prefill_gdn("chunk16tc") == q::PrefillGdn::chunk16tc, "prefill-gdn chunk16tc");
         f.prefill_gdn = q::PrefillGdn::chunk16tc;
-        check(engine_identity(f) == serial_id + "-gdnc16t", "chunk16tc FAST identity suffix (tf32 scan, distinct from -gdnc16)");
+        check(engine_identity(f) == serial_id + "-gdnc16t2", "chunk16tc FAST identity suffix (tf32 scan, distinct from -gdnc16)");
         f.prefill_gdn = q::PrefillGdn::chunk16;
         f.prefill_arith = q::PrefillArith::exact;
         check(engine_identity(f).find("gdnc16") == std::string::npos, "chunk16 ignored under the exact prefill policy");
@@ -135,7 +135,7 @@ int main() {
         f.prefill_arith = q::PrefillArith::fast4;
         f.prefill_gdn = q::PrefillGdn::chunk16tc;
         f.prefill_hid = q::PrefillHid::bf16;
-        check(engine_identity(f) == serial_id + "-gdnc16t-h16", "bf16 hidden rows FAST identity suffix -h16");
+        check(engine_identity(f) == serial_id + "-gdnc16t2-h16", "bf16 hidden rows FAST identity suffix -h16");
         f.prefill_arith = q::PrefillArith::fast8;
         check(engine_identity(f).find("-h16") == std::string::npos, "prefill-hid ignored outside fast4");
     }

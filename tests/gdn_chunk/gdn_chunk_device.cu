@@ -101,7 +101,8 @@ struct Fixture {
     }
 };
 
-// scan 0 = f32 (gdn-chunk16-f32-v1, bound 1e-4), 1 = tf32 (gdn-chunk16-tf32-v1, TF32 operands: bound 3e-3)
+// scan 0 = f32 (gdn-chunk16-f32-v1), 1 = tf32 (gdn-chunk16-tf32-v2, split TF32: FP32-class); both bound 1e-4 (v1 measured 2.4e-4 /
+// 3.0e-4 out / state at 4,096 rows and fails it)
 static int check(std::uint32_t rows, std::uint8_t scan) {
     Fixture f(rows, 1234u + rows);
     const std::size_t side = std::size_t{f.d.value_heads} * 128 * 128;
@@ -120,7 +121,7 @@ static int check(std::uint32_t rows, std::uint8_t scan) {
     const bool det = std::memcmp(o_c.data(), o_c2.data(), o_c.size() * 4) == 0 && std::memcmp(s_c.data(), s_c2.data(), s_c.size() * 4) == 0;
     const bool committed_untouched = std::memcmp(s_c.data(), f.h_delta.data(), side * 4) == 0;
     const double eo = rel(o_c, o_s, 0, o_s.size()), es = rel(s_c, s_s, side, side);
-    const double bound = scan ? 3e-3 : 1e-4;
+    const double bound = 1e-4;
     const bool ok = det && committed_untouched && eo <= bound && es <= bound;
     std::printf("GDN CHECK scan=%s rows=%u out_rel=%.3e state_rel=%.3e deterministic=%d committed-side-untouched=%d (bound %.0e) %s\n",
                 scan ? "tf32" : "f32", rows, eo, es, det ? 1 : 0, committed_untouched ? 1 : 0, bound, ok ? "PASS" : "FAIL");

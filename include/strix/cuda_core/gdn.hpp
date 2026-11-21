@@ -97,7 +97,7 @@ cudaError_t gdn_prefill_flip(std::uint32_t* parity_dev, cudaStream_t stream);
 // carry the identity suffix. ws = device workspace of >= gdn_chunk_workspace_floats(d, rows) floats; ws == nullptr = serial kernel.
 // defer_norm (chunked path only): the gated RMSNorm (third kernel) is NOT applied; `out` keeps the raw delta-rule output and the caller
 // owns the norm: gdn_chunk_norm, or a consumer that folds the same arithmetic (FAST4 gated_norm_quantize_enqueue, bitwise equal).
-// scan: the K2 trait of the chunk family (gdn_chunk.hpp Scan): 0 = f32 (gdn-chunk16-f32-v1), 1 = tf32 (gdn-chunk16-tf32-v1).
+// scan: the K2 trait of the chunk family (gdn_chunk.hpp Scan): 0 = f32 (gdn-chunk16-f32-v1), 1 = tf32 (gdn-chunk16-tf32-v2).
 struct GdnChunkWork {
     float* ws = nullptr;
     std::size_t floats = 0;

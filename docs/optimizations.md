@@ -5305,11 +5305,15 @@ warp for their stage. The stage holds the same bytes at the same offsets and eve
 
 Two traits of shared kernel families, no new family:
 
-- `chunk16tc` (`gdn-chunk16-tf32-v1`, identity `-gdnc16t`): the K2 scan of the chunked GDN prefill
+- `chunk16tc` (`gdn-chunk16-tf32-v2`, identity `-gdnc16t2`): the K2 scan of the chunked GDN prefill
   (`src/cuda_core/gdn/gdn_chunk.cu`) runs its products on `mma.m16n8k8.tf32` with FP32 accumulation; the FP32 state stays in
   accumulator fragments for the whole launch (a key permutation inside each 8-key block makes the C fragment of one product
-  the A fragment of the next). Only product operands are rounded to TF32; sums, decays and the state stay FP32; the chunks
-  and the K1 workspace are those of `chunk16`.
+  the A fragment of the next). Every product runs in split TF32 (each operand = TF32 hi + TF32 lo, three mma per product,
+  lo * lo dropped); sums, decays and the state stay FP32, so the error is FP32-class (the host emulation of the kernel loop
+  holds the f32 trait's 2e-5 bound). The chunks and the K1 workspace are those of `chunk16`. The single-TF32 `-v1` lost
+  bits where the recurrence carries or cancels them: the state write `S += U'^T K` put a 2^-11 error into every carried
+  increment, the delta read `W S0` feeds the small residual `U = U~ - W S0`, and the output reads rounded `P U` and `Q S0`;
+  its 8K gate failed one window on dNLL. Cost: 300 instead of 100 mma per chunk and warp.
 - `bf16` hidden rows (`nvfp4-tile-h16-v1`, identity `-h16`): the fused gate/up epilogue of the FAST4 tile GEMM stores
   H = silu(gate) * up as BF16 (round to nearest even) and the down operand is quantised from those rows by the same
   quantiser core (exact widening). A compile-time trait of the tile kernels: the FP32 instantiations carry no H16 code.

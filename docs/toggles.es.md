@@ -42,7 +42,7 @@ el resolvedor compartido para ambas CLI: `fast` enciende cada palanca solo en el
 |---|---|---|
 | `--prefill-arith fast4` | prefill grande de la CLI de decode, `--turbo-weights onfly\|converted` (gate W4A4 8K/32K superado) | `--prefill-arith exact` |
 | `--prefill-gdn chunk16` | mismo régimen (cualificado junto con FAST4) | `--prefill-gdn serial` |
-| `--prefill-gdn chunk16tc` | nunca (opt-in; FAST `gdn-chunk16-tf32-v1`, identidad `-gdnc16t`, gate de calidad pendiente) | `--prefill-gdn chunk16` |
+| `--prefill-gdn chunk16tc` | nunca (opt-in; FAST `gdn-chunk16-tf32-v2`, identidad `-gdnc16t2`, gate de calidad pendiente) | `--prefill-gdn chunk16` |
 | `--prefill-hid bf16` | nunca (opt-in con `--prefill-arith fast4`; FAST `nvfp4-tile-h16-v1`, identidad `-h16`, gate de calidad pendiente) | `--prefill-hid f32` |
 | `--prefill-attn8 on` | mismo régimen, prompt de al menos 8.192 tokens (gates 8K y 32K superados) | `--prefill-attn8 off` |
 | `--split-k fast` | CLI spec (ventanas de decode), `--turbo-weights onfly\|converted`: FAST `nvfp4-splitk-fast-v1` (gate superado; verify de spec 0,6-0,7 % más rápido). CLI de decode: pendiente (su `fast` ya aplica FAST4; esa combinación aún no tiene gate) | `--split-k exact` |

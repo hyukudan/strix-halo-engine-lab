@@ -2044,7 +2044,7 @@ void print_effective_config(const EngineOptions& o, const char* arith, std::FILE
                  o.prefill_arith == PrefillArith::exact ? "serial (exact prefill keeps the decode windows)"
                  : o.prefill_gdn == PrefillGdn::chunk16 ? "chunk16 (FAST gdn-chunk16-f32-v1, identity -gdnc16)"
                  : o.prefill_gdn == PrefillGdn::chunk16tc
-                     ? "chunk16tc (FAST gdn-chunk16-tf32-v1: chunk scan on TF32 tensor cores, FP32 state in registers, identity -gdnc16t)"
+                     ? "chunk16tc (FAST gdn-chunk16-tf32-v2: chunk scan on TF32 tensor cores, every product in split TF32 (FP32-class), FP32 state in registers, identity -gdnc16t2)"
                      : "serial (decode recurrence, bitwise)");
     std::fprintf(f, "  prefill-hid: %s\n",
                  o.prefill_arith != PrefillArith::fast4 ? "n/a (FAST4 only)"

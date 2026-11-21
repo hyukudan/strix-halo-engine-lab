@@ -5,10 +5,12 @@
 //  2. padding rows (beta 0, g 0, zero q/k/v) leave the state unchanged and emit nothing: chunk calls of any length compose with
 //     each other and with serial decode rows (prefill -> decode hand-off);
 //  3. workspace layout: blocks float4-aligned, workspace_floats covers every (chunk, head) block.
-//  4. tf32 scan (gdn-chunk16-tf32-v1): the fragment maps of gdn_chunk.hpp tc are bijections and a C fragment is the next
+//  4. tf32 scan (gdn-chunk16-tf32-v2): the fragment maps of gdn_chunk.hpp tc are bijections and a C fragment is the next
 //     product's A fragment under perm; every kernel fragment load at the tc strides is bank-conflict free; a lane-level
-//     emulation of chunk_scan_tc_kernel's loop (TF32 operands) matches serial(double) within 3e-3, and is visibly wrong
-//     without the permutation (negative control).
+//     emulation of chunk_scan_tc_kernel's loop (every product in split TF32) matches serial(double) within the f32 chunk
+//     bound 2e-5, and is visibly wrong without the permutation (negative control);
+//  5. tf32-v2 precision: on a 1,024-row prefill from an empty state the split products cut the error of the same loop with
+//     every product in single TF32 (the v1 arithmetic, control arm) by >= 10x on the output and on the final state.
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -76,7 +78,7 @@ static std::vector<float> init_state(int vh, unsigned seed) {
     return s;
 }
 
-// ---- 4. tf32 scan (gdn-chunk16-tf32-v1, src/cuda_core/gdn/gdn_chunk.cu chunk_scan_tc_kernel): lane-level emulation with the
+// ---- 4. tf32 scan (gdn-chunk16-tf32-v2, src/cuda_core/gdn/gdn_chunk.cu chunk_scan_tc_kernel): lane-level emulation with the
 // shared fragment maps (gdn_chunk.hpp tc), the kernel's shared-memory index expressions and TF32 rounding of every product operand.
 namespace tc = gc::tc;
 constexpr int TC = static_cast<int>(gc::kChunk);
@@ -106,6 +108,27 @@ static void mma(float (&d)[32][4], const float (&a)[32][4], const float (&b)[32]
             for (int k = 0; k < 8; ++k) s += static_cast<double>(A[tc::c_row(l, e)][k]) * B[k][tc::c_col(l, e)];
             d[l][e] = static_cast<float>(s);
         }
+}
+// split TF32 operand (gdn_chunk.hpp tf32-v2): hi = rna(x), lo = rna(x - hi)
+static float tf32_lo(float x) { return tf32(x - tf32(x)); }
+// d += A B as the kernel's mma_tf32x3 (split; cross terms into ds, which may be d: mma_tf32x3_apart / mma_tf32x3) or one mma
+// (single TF32, the v1 control arm); a / b hold the FP32 operands
+static void mma_op(float (&d)[32][4], float (&ds)[32][4], const float (&a)[32][4], const float (&b)[32][2], bool split) {
+    float ah[32][4], bh[32][2];
+    for (int l = 0; l < 32; ++l) {
+        for (int e = 0; e < 4; ++e) ah[l][e] = tf32(a[l][e]);
+        for (int e = 0; e < 2; ++e) bh[l][e] = tf32(b[l][e]);
+    }
+    if (split) {
+        float al[32][4], bl[32][2];
+        for (int l = 0; l < 32; ++l) {
+            for (int e = 0; e < 4; ++e) al[l][e] = tf32_lo(a[l][e]);
+            for (int e = 0; e < 2; ++e) bl[l][e] = tf32_lo(b[l][e]);
+        }
+        mma(ds, al, bh);
+        mma(ds, ah, bl);
+    }
+    mma(d, ah, bh);
 }
 // K1 of chunk c, head h into one operand stage at the tc strides (the chunk algebra of gdn_ref.hpp chunked, float + fma)
 static void stage_chunk(const gdnref::Problem& p, int h, int c, int c0, std::vector<float>& st) {
@@ -160,7 +183,7 @@ static void stage_chunk(const gdnref::Problem& p, int h, int c, int c0, std::vec
 }
 // The kernel's chunk loop for value head h, both 64-column CTA tiles, 4 warps each. S: [D k][D v] of head h (in/out);
 // out: [rows][value_heads][D]. use_perm = false feeds C fragments as A without the permutation (negative control).
-static void emulate_tc(const gdnref::Problem& p, int h, float* S, std::vector<float>& out, bool use_perm) {
+static void emulate_tc(const gdnref::Problem& p, int h, float* S, std::vector<float>& out, bool use_perm, bool split = true) {
     const int nch = (p.rows + TC - 1) / TC;
     std::vector<float> st(tc::Stage::floats);
     auto from_c = [&](int e) { return use_perm ? tc::a_from_c(e) : e; };
@@ -174,42 +197,42 @@ static void emulate_tc(const gdnref::Problem& p, int h, float* S, std::vector<fl
             stage_chunk(p, h, c, c0, st);
             const float* s = st.data();
             for (int w = 0; w < static_cast<int>(tc::kWarps); ++w) {
-                float x[2][32][4] = {}, y[2][32][4] = {}, u[2][32][4], o[2][32][4], a[32][4], b[32][2], ua[2][32][4];
+                float x[2][32][4] = {}, y[2][32][4] = {}, xs[2][32][4] = {}, ys[2][32][4] = {}, u[2][32][4], o[2][32][4], a[32][4], b[32][2], ua[2][32][4];
                 for (int nt = 0; nt < D / 8; ++nt) {
                     for (int l = 0; l < 32; ++l)
-                        for (int e = 0; e < 4; ++e) a[l][e] = tf32(acc[w][nt][l][from_c(e)]);
+                        for (int e = 0; e < 4; ++e) a[l][e] = acc[w][nt][l][from_c(e)];
                     for (int ni = 0; ni < 2; ++ni) {
                         for (int l = 0; l < 32; ++l) {
                             const int k0 = 8 * nt + 2 * (l & 3), i = 8 * ni + (l >> 2);
-                            b[l][0] = tf32(s[SWT + k0 * WTS + i]);
-                            b[l][1] = tf32(s[SWT + (k0 + 1) * WTS + i]);
+                            b[l][0] = s[SWT + k0 * WTS + i];
+                            b[l][1] = s[SWT + (k0 + 1) * WTS + i];
                         }
-                        mma(x[ni], a, b);
+                        mma_op(x[ni], xs[ni], a, b, split);
                         for (int l = 0; l < 32; ++l) {
                             const int k0 = 8 * nt + 2 * (l & 3), i = 8 * ni + (l >> 2);
-                            b[l][0] = tf32(s[SQ + i * QS + k0]);
-                            b[l][1] = tf32(s[SQ + i * QS + k0 + 1]);
+                            b[l][0] = s[SQ + i * QS + k0];
+                            b[l][1] = s[SQ + i * QS + k0 + 1];
                         }
-                        mma(y[ni], a, b);
+                        mma_op(y[ni], ys[ni], a, b, split);
                     }
                 }
                 for (int ni = 0; ni < 2; ++ni)
                     for (int l = 0; l < 32; ++l)
                         for (int e = 0; e < 4; ++e) {
                             const int i = 8 * ni + tc::c_col(l, e);
-                            u[ni][l][e] = s[SU + i * US + 16 * w + tc::c_row(l, e)] - x[ni][l][e];
-                            o[ni][l][e] = std::exp(s[SG + i]) * y[ni][l][e];
+                            u[ni][l][e] = s[SU + i * US + 16 * w + tc::c_row(l, e)] - (x[ni][l][e] + xs[ni][l][e]);
+                            o[ni][l][e] = std::exp(s[SG + i]) * (y[ni][l][e] + ys[ni][l][e]);
                         }
                 for (int kj = 0; kj < 2; ++kj) {
                     for (int l = 0; l < 32; ++l)
-                        for (int e = 0; e < 4; ++e) a[l][e] = tf32(u[kj][l][from_c(e)]);
+                        for (int e = 0; e < 4; ++e) a[l][e] = u[kj][l][from_c(e)];
                     for (int ni = 0; ni < 2; ++ni) {
                         for (int l = 0; l < 32; ++l) {
                             const int j0 = 8 * kj + 2 * (l & 3), i = 8 * ni + (l >> 2);
-                            b[l][0] = tf32(s[SPT + j0 * PTS + i]);
-                            b[l][1] = tf32(s[SPT + (j0 + 1) * PTS + i]);
+                            b[l][0] = s[SPT + j0 * PTS + i];
+                            b[l][1] = s[SPT + (j0 + 1) * PTS + i];
                         }
-                        mma(o[ni], a, b);
+                        mma_op(o[ni], o[ni], a, b, split);
                     }
                 }
                 for (int ni = 0; ni < 2; ++ni)
@@ -225,7 +248,7 @@ static void emulate_tc(const gdnref::Problem& p, int h, float* S, std::vector<fl
                     for (int l = 0; l < 32; ++l)
                         for (int e = 0; e < 4; ++e) u[kj][l][e] *= std::exp(glast - s[SG + 8 * kj + tc::c_col(l, e)]);
                     for (int l = 0; l < 32; ++l)
-                        for (int e = 0; e < 4; ++e) ua[kj][l][e] = tf32(u[kj][l][from_c(e)]);
+                        for (int e = 0; e < 4; ++e) ua[kj][l][e] = u[kj][l][from_c(e)];
                 }
                 for (int nt = 0; nt < D / 8; ++nt) {
                     for (int l = 0; l < 32; ++l)
@@ -233,10 +256,10 @@ static void emulate_tc(const gdnref::Problem& p, int h, float* S, std::vector<fl
                     for (int kj = 0; kj < 2; ++kj) {
                         for (int l = 0; l < 32; ++l) {
                             const int j0 = 8 * kj + 2 * (l & 3), kk = 8 * nt + (l >> 2);
-                            b[l][0] = tf32(s[SK + j0 * KS + kk]);
-                            b[l][1] = tf32(s[SK + (j0 + 1) * KS + kk]);
+                            b[l][0] = s[SK + j0 * KS + kk];
+                            b[l][1] = s[SK + (j0 + 1) * KS + kk];
                         }
-                        mma(acc[w][nt], ua[kj], b);
+                        mma_op(acc[w][nt], acc[w][nt], ua[kj], b, split);
                     }
                 }
             }
@@ -349,17 +372,16 @@ int main() {
     }
     // 4c. the kernel's chunk loop (emulated) vs serial(double): rows 1..300, partial chunks, both CTA tiles, heads 0 and 5
     {
-        struct TCase { int rows; float glo, ghi; };
-        const TCase tcases[] = {{1, -7.f, -1.f}, {17, -7.f, -1.f}, {40, -7.f, 1.f}, {300, -9.f, -5.f}};
-        unsigned sd0 = 500;
-        double worst_o = 0, worst_s = 0;
-        for (const TCase& cs : tcases) {
-            const auto p = make(cs.rows, sd0++, cs.glo, cs.ghi);
-            const auto s0 = init_state(p.value_heads, sd0++);
+        // relative error of o (every row) and of the final state, heads 0 and 5; zero_state = a prefill from an empty state
+        auto tc_error = [](int rows, unsigned case_seed, float glo, float ghi, bool zero_state, bool split, double& eo, double& es) {
+            const auto p = make(rows, case_seed, glo, ghi);
+            auto s0 = init_state(p.value_heads, case_seed + 1000u);
+            if (zero_state) std::fill(s0.begin(), s0.end(), 0.f);
             std::vector<double> sd(s0.begin(), s0.end()), od;
             gdnref::serial<double>(p, 0, p.rows, sd, od);
             std::vector<float> st = s0, ot(od.size(), 0.f);
-            for (const int h : {0, 5}) emulate_tc(p, h, &st[static_cast<std::size_t>(h) * D * D], ot, true);
+            for (const int h : {0, 5}) emulate_tc(p, h, &st[static_cast<std::size_t>(h) * D * D], ot, true, split);
+            eo = es = 0;
             for (const int h : {0, 5}) {
                 std::vector<float> o1, s1(st.begin() + static_cast<std::ptrdiff_t>(h) * D * D, st.begin() + static_cast<std::ptrdiff_t>(h + 1) * D * D);
                 std::vector<double> o2, s2(sd.begin() + static_cast<std::ptrdiff_t>(h) * D * D, sd.begin() + static_cast<std::ptrdiff_t>(h + 1) * D * D);
@@ -369,14 +391,32 @@ int main() {
                         o1.push_back(ot[o]);
                         o2.push_back(od[o]);
                     }
-                worst_o = std::max(worst_o, rel(o1, o2));
-                worst_s = std::max(worst_s, rel(s1, s2));
+                eo = std::max(eo, rel(o1, o2));
+                es = std::max(es, rel(s1, s2));
             }
+        };
+        struct TCase { int rows; float glo, ghi; };
+        const TCase tcases[] = {{1, -7.f, -1.f}, {17, -7.f, -1.f}, {40, -7.f, 1.f}, {300, -9.f, -5.f}};
+        unsigned sd0 = 500;
+        double worst_o = 0, worst_s = 0;
+        for (const TCase& cs : tcases) {
+            double eo = 0, es = 0;
+            tc_error(cs.rows, sd0++, cs.glo, cs.ghi, false, true, eo, es);
+            worst_o = std::max(worst_o, eo);
+            worst_s = std::max(worst_s, es);
         }
-        char msg[200];
-        std::snprintf(msg, sizeof msg, "tf32 scan emulation vs serial(double): worst o %.2e state %.2e (bound 3e-3; TF32 operands, rel 2^-11)",
+        char msg[220];
+        std::snprintf(msg, sizeof msg, "tf32 scan emulation vs serial(double): worst o %.2e state %.2e (bound 2e-5 = the f32 chunk bound; split TF32)",
                       worst_o, worst_s);
-        check(worst_o < 3e-3 && worst_s < 3e-3, msg);
+        check(worst_o < 2e-5 && worst_s < 2e-5, msg);
+        // 4d. tf32-v2 precision: a 1,024-row prefill from an empty state (64 carried chunks), the kernel's split products vs the
+        // same loop with every product single TF32 (the v1 arithmetic, control arm)
+        double v2o = 0, v2s = 0, v1o = 0, v1s = 0;
+        tc_error(1024, 900u, -9.f, -5.f, true, true, v2o, v2s);
+        tc_error(1024, 900u, -9.f, -5.f, true, false, v1o, v1s);
+        std::snprintf(msg, sizeof msg, "tf32-v2 split products vs single TF32 (v1), 1,024 rows from an empty state: o %.2e -> %.2e (%.0fx, need >= 10x), state %.2e -> %.2e (%.0fx, need >= 10x)",
+                      v1o, v2o, v1o / v2o, v1s, v2s, v1s / v2s);
+        check(v1o >= 10.0 * v2o && v1s >= 10.0 * v2s, msg);
         // negative control: C fragments fed as A WITHOUT the permutation must be visibly wrong (the test sees the map)
         const auto p = make(40, 777, -7.f, 1.f);
         const auto s0 = init_state(p.value_heads, 778);

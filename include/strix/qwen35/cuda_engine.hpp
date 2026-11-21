@@ -50,8 +50,8 @@ enum class PrefillArith : std::uint8_t { exact, flash, fast, fast2, fast8, fast4
 //   serial  = the decode recurrence row by row (gdn.hpp gdn_prefill_layer), bitwise equal to the windows.
 //   chunk16 = FAST gdn-chunk16-f32-v1 (strix/cuda_core/gdn_chunk.hpp): 16-row chunks, FP32, all SMs; bits differ (identity
 //             suffix -gdnc16), opt-in until its logit gate passes.
-//   chunk16tc = FAST gdn-chunk16-tf32-v1: the same chunks and workspace, the sequential scan on TF32 tensor cores with the FP32
-//             state in accumulator registers (identity suffix -gdnc16t, its own gate).
+//   chunk16tc = FAST gdn-chunk16-tf32-v2: the same chunks and workspace, the sequential scan on TF32 tensor cores with the FP32
+//             state in accumulator registers (identity suffix -gdnc16t2, its own gate).
 enum class PrefillGdn : std::uint8_t { serial, chunk16, chunk16tc };
 // CLI / option spelling of PrefillGdn ("serial" | "chunk16" | "chunk16tc"); anything else is rejected, never mapped to a default.
 [[nodiscard]] inline PrefillGdn parse_prefill_gdn(const std::string& s) {
@@ -161,7 +161,7 @@ struct EngineOptions {
     const std::string pf = (o.prefill_arith == PrefillArith::exact
         ? std::string()
         : std::string("-pf-") + pf_names[static_cast<unsigned>(o.prefill_arith)] + (o.prefill_attn8 ? "-a8" : "") +
-              (o.prefill_gdn == PrefillGdn::chunk16 ? "-gdnc16" : o.prefill_gdn == PrefillGdn::chunk16tc ? "-gdnc16t" : "") +
+              (o.prefill_gdn == PrefillGdn::chunk16 ? "-gdnc16" : o.prefill_gdn == PrefillGdn::chunk16tc ? "-gdnc16t2" : "") +
               (o.prefill_arith == PrefillArith::fast4 && o.prefill_hid == PrefillHid::bf16 ? "-h16" : "")) +
           (o.decode_attn8 ? "-d8" : "");
     if (o.turbo_weights == TurboWeights::off) return "qwen35-cuda-exact-" + a + "-v1" + pf;

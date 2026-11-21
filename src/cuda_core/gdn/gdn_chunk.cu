@@ -294,11 +294,12 @@ __global__ void __launch_bounds__(128) chunk_scan_kernel(const float* __restrict
     }
 }
 
-// ---- K2 tf32 (gdn-chunk16-tf32-v1): one (value head, 64-column value tile) per CTA; warp w owns value columns 16 w .. 16 w + 15
+// ---- K2 tf32 (gdn-chunk16-tf32-v2): one (value head, 64-column value tile) per CTA; warp w owns value columns 16 w .. 16 w + 15
 // with ALL 128 keys, so its FP32 state S^T[16 v][128 k] is 16 accumulator fragments (64 registers) for the whole launch and no
-// product needs a cross-warp sum. Per chunk and warp: X^T = S^T W^T and Y^T = S^T Q^T (2 x 32 mma), O^T = exp(G) Y^T + U^T P^T
-// (4 mma), S^T = exp(G_last) S^T + U'^T K (32 mma); every A operand is a C fragment as it is (gdn_chunk.hpp tc::perm). The next
-// chunk's operands stream into the other shared-memory stage by cp.async during this chunk: one barrier per chunk.
+// product needs a cross-warp sum. Per chunk and warp, every product in split TF32 (3 mma each, gdn_chunk.hpp Scan): X^T = S^T W^T
+// and Y^T = S^T Q^T (2 x 96 mma), O^T = exp(G) Y^T + U^T P^T (12 mma), S^T = exp(G_last) S^T + U'^T K (96 mma): 300 mma. Every A
+// operand is a C fragment as it is (gdn_chunk.hpp tc::perm). The next chunk's operands stream into the other shared-memory stage
+// by cp.async during this chunk: one barrier per chunk.
 namespace tcs = gc::tc;
 constexpr int WTS = static_cast<int>(tcs::kWtStride), QS = static_cast<int>(tcs::kQStride), KS = static_cast<int>(tcs::kKStride),
               US = static_cast<int>(tcs::kUStride), PTS = static_cast<int>(tcs::kPtStride);
@@ -315,6 +316,28 @@ __device__ __forceinline__ void mma_tf32(float (&d)[4], const std::uint32_t (&a)
     asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                  : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+// split TF32 operand (gdn_chunk.hpp tf32-v2): x = hi + lo with hi = rna(x), lo = rna(x - hi)
+struct Tf32Pair {
+    std::uint32_t hi, lo;
+};
+__device__ __forceinline__ Tf32Pair split_tf32(float x) {
+    const std::uint32_t hi = to_tf32(x);
+    return {hi, to_tf32(x - __uint_as_float(hi))};
+}
+// d += A B in split TF32: the two cross terms first, the hi * hi term last (lo * lo, relative 2^-22, dropped)
+__device__ __forceinline__ void mma_tf32x3(float (&d)[4], const std::uint32_t (&ah)[4], const std::uint32_t (&al)[4], Tf32Pair b0,
+                                           Tf32Pair b1) {
+    mma_tf32(d, al, b0.hi, b1.hi);
+    mma_tf32(d, ah, b0.lo, b1.lo);
+    mma_tf32(d, ah, b0.hi, b1.hi);
+}
+// the same with the cross terms in their own accumulator ds (the caller adds d + ds after a long reduction)
+__device__ __forceinline__ void mma_tf32x3_apart(float (&d)[4], float (&ds)[4], const std::uint32_t (&ah)[4], const std::uint32_t (&al)[4],
+                                                 Tf32Pair b0, Tf32Pair b1) {
+    mma_tf32(ds, al, b0.hi, b1.hi);
+    mma_tf32(ds, ah, b0.lo, b1.lo);
+    mma_tf32(d, ah, b0.hi, b1.hi);
 }
 // 16-byte cp.async; valid == false fills the 16 bytes with zeros (src must still be a mapped address)
 __device__ __forceinline__ void cp16z(float* dst, const float* src, bool valid) {
@@ -372,20 +395,25 @@ __global__ void __launch_bounds__(128) chunk_scan_tc_kernel(const float* __restr
         __syncthreads();  // stage c landed for every thread; every read of the other stage (chunk c - 1) is done
         if (c + 1 < nch) load(c + 1, smem + static_cast<int>((c + 1) & 1u) * SFL);
 
-        // X^T = S^T W^T, Y^T = S^T Q^T: k-slot t <-> key 8 nt + 2t, k-slot t + 4 <-> key 8 nt + 2t + 1 (tc::perm)
-        float x[2][4] = {}, y[2][4] = {};
+        // X^T = S^T W^T, Y^T = S^T Q^T (split TF32): k-slot t <-> key 8 nt + 2t, k-slot t + 4 <-> key 8 nt + 2t + 1 (tc::perm).
+        // The cross terms go to their own accumulators xs / ys: 8 independent 32-deep chains instead of 4 48-deep ones.
+        float x[2][4] = {}, y[2][4] = {}, xs[2][4] = {}, ys[2][4] = {};
 #pragma unroll
         for (int nt = 0; nt < D / 8; ++nt) {
-            std::uint32_t a[4];
+            std::uint32_t ah[4], al[4];
 #pragma unroll
-            for (int e = 0; e < 4; ++e) a[e] = to_tf32(acc[nt][tcs::a_from_c(e)]);
+            for (int e = 0; e < 4; ++e) {
+                const Tf32Pair s = split_tf32(acc[nt][tcs::a_from_c(e)]);
+                ah[e] = s.hi;
+                al[e] = s.lo;
+            }
             const int k0 = 8 * nt + 2 * tq;
 #pragma unroll
             for (int ni = 0; ni < 2; ++ni) {
                 const int i = 8 * ni + g;
-                mma_tf32(x[ni], a, to_tf32(st[SWT + k0 * WTS + i]), to_tf32(st[SWT + (k0 + 1) * WTS + i]));
+                mma_tf32x3_apart(x[ni], xs[ni], ah, al, split_tf32(st[SWT + k0 * WTS + i]), split_tf32(st[SWT + (k0 + 1) * WTS + i]));
                 const float2 qq = *reinterpret_cast<const float2*>(st + SQ + i * QS + k0);
-                mma_tf32(y[ni], a, to_tf32(qq.x), to_tf32(qq.y));
+                mma_tf32x3_apart(y[ni], ys[ni], ah, al, split_tf32(qq.x), split_tf32(qq.y));
             }
         }
         // U^T = U~^T - X^T, O^T = exp(G_i) Y^T at the C fragment (rows = values, columns = chunk rows i)
@@ -395,20 +423,24 @@ __global__ void __launch_bounds__(128) chunk_scan_tc_kernel(const float* __restr
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
                 const int i = 8 * ni + tcs::c_col(lane, e);
-                u[ni][e] = st[SU + i * US + vw + tcs::c_row(lane, e)] - x[ni][e];
-                o[ni][e] = cc_expf(st[SG + i]) * y[ni][e];
+                u[ni][e] = st[SU + i * US + vw + tcs::c_row(lane, e)] - (x[ni][e] + xs[ni][e]);
+                o[ni][e] = cc_expf(st[SG + i]) * (y[ni][e] + ys[ni][e]);
             }
-        // O^T += U^T P^T: U's columns are the k index (rows j), so its C fragment is the A operand
+        // O^T += U^T P^T (split TF32): U's columns are the k index (rows j), so its C fragment is the A operand
 #pragma unroll
         for (int kj = 0; kj < 2; ++kj) {
-            std::uint32_t a[4];
+            std::uint32_t ah[4], al[4];
 #pragma unroll
-            for (int e = 0; e < 4; ++e) a[e] = to_tf32(u[kj][tcs::a_from_c(e)]);
+            for (int e = 0; e < 4; ++e) {
+                const Tf32Pair s = split_tf32(u[kj][tcs::a_from_c(e)]);
+                ah[e] = s.hi;
+                al[e] = s.lo;
+            }
             const int j0 = 8 * kj + 2 * tq;
 #pragma unroll
             for (int ni = 0; ni < 2; ++ni) {
                 const int i = 8 * ni + g;
-                mma_tf32(o[ni], a, to_tf32(st[SPT + j0 * PTS + i]), to_tf32(st[SPT + (j0 + 1) * PTS + i]));
+                mma_tf32x3(o[ni], ah, al, split_tf32(st[SPT + j0 * PTS + i]), split_tf32(st[SPT + (j0 + 1) * PTS + i]));
             }
         }
 #pragma unroll
@@ -418,15 +450,19 @@ __global__ void __launch_bounds__(128) chunk_scan_tc_kernel(const float* __restr
                 const std::uint32_t r = c * C + static_cast<std::uint32_t>(8 * ni + tcs::c_col(lane, e));
                 if (r < rows) out[static_cast<std::size_t>(r) * d.v_width() + h * D + static_cast<std::uint32_t>(c0 + vw + tcs::c_row(lane, e))] = o[ni][e];
             }
-        // S^T = exp(G_last) S^T + U'^T K with U'[j] = exp(G_last - G_j) U[j]
+        // S^T = exp(G_last) S^T + U'^T K (split TF32) with U'[j] = exp(G_last - G_j) U[j]
         const float glast = st[SG + C - 1], dlast = cc_expf(glast);
-        std::uint32_t ua[2][4];
+        std::uint32_t uh[2][4], ul[2][4];
 #pragma unroll
         for (int kj = 0; kj < 2; ++kj) {
 #pragma unroll
             for (int e = 0; e < 4; ++e) u[kj][e] *= cc_expf(glast - st[SG + 8 * kj + tcs::c_col(lane, e)]);
 #pragma unroll
-            for (int e = 0; e < 4; ++e) ua[kj][e] = to_tf32(u[kj][tcs::a_from_c(e)]);
+            for (int e = 0; e < 4; ++e) {
+                const Tf32Pair s = split_tf32(u[kj][tcs::a_from_c(e)]);
+                uh[kj][e] = s.hi;
+                ul[kj][e] = s.lo;
+            }
         }
 #pragma unroll
         for (int nt = 0; nt < D / 8; ++nt) {
@@ -436,7 +472,7 @@ __global__ void __launch_bounds__(128) chunk_scan_tc_kernel(const float* __restr
 #pragma unroll
             for (int kj = 0; kj < 2; ++kj) {
                 const int j0 = 8 * kj + 2 * tq;
-                mma_tf32(acc[nt], ua[kj], to_tf32(st[SK + j0 * KS + kk]), to_tf32(st[SK + (j0 + 1) * KS + kk]));
+                mma_tf32x3(acc[nt], uh[kj], ul[kj], split_tf32(st[SK + j0 * KS + kk]), split_tf32(st[SK + (j0 + 1) * KS + kk]));
             }
         }
     }

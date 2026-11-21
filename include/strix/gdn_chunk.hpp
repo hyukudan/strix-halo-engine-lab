@@ -53,12 +53,17 @@ struct Layout {
 
 // Scan trait of the chunk family (K1 and its workspace are shared by both):
 //   f32  = gdn-chunk16-f32-v1: K2 on FP32 FFMA, state tile in shared memory (grid value_heads x 4, 128 threads).
-//   tf32 = gdn-chunk16-tf32-v1: K2 on mma.m16n8k8.tf32 with FP32 accumulation; the FP32 state S^T lives in the accumulator
-//          fragments for the whole launch (grid value_heads x 2, 4 warps x 16 value columns). Every product operand is rounded
-//          to TF32 (cvt.rna: 10-bit mantissa, relative 2^-11); sums, decays and the state stay FP32. Same algebra as above,
-//          other bits: FAST class, engine identity suffix -gdnc16t, gated on its own.
+//   tf32 = gdn-chunk16-tf32-v2: K2 on mma.m16n8k8.tf32 with FP32 accumulation; the FP32 state S^T lives in the accumulator
+//          fragments for the whole launch (grid value_heads x 2, 4 warps x 16 value columns). Every product runs in split TF32
+//          (x = hi + lo, hi = rna(x), lo = rna(x - hi), cvt.rna keeps 10 mantissa bits; A B ~ A_lo B_hi + A_hi B_lo + A_hi B_hi,
+//          the lo * lo term (relative 2^-22) dropped) with FP32 accumulation; sums, decays and the state stay FP32. Result:
+//          FP32-class error (the f32 trait's bounds hold). v1 rounded every operand once (relative 2^-11) and lost bits where
+//          the recurrence carries or cancels them: the state write U'^T K put a 2^-11 error into every carried increment, the
+//          delta read W S0 feeds U = U~ - W S0 (a small residual), and P U / Q S0 rounded the output (v1 state and output
+//          errors ~1,000-2,000x the f32 trait in the host emulation). 300 mma per chunk and warp (v1: 100). Same algebra as
+//          f32, other bits: FAST class, engine identity suffix -gdnc16t2, gated on its own.
 enum class Scan : std::uint8_t { f32 = 0, tf32 = 1 };
-inline constexpr const char* kIdentityTf32 = "gdn-chunk16-tf32-v1";
+inline constexpr const char* kIdentityTf32 = "gdn-chunk16-tf32-v2";
 [[nodiscard]] constexpr const char* identity(Scan s) noexcept { return s == Scan::tf32 ? kIdentityTf32 : kIdentity; }
 
 }  // namespace strix::gdn_chunk
