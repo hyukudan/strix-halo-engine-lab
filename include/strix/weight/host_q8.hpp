@@ -3,6 +3,16 @@
 #include "registry.hpp"
 #include "cache.hpp"
 namespace strix::weight {
+struct MatrixLoadGeometry {
+ std::uint64_t row_bytes, bytes;
+};
+// Compact rank-two [N,K] image geometry for the shared BF16/Q8_0 loaders.
+Status matrix_load_geometry(FormatId, const Shape&, MatrixLoadGeometry&);
+// Load a complete compact, little-endian BF16 matrix or transcode it into Q8_0.
+// The caller publishes the destination only on success. Conversion uses bounded
+// input staging, so the complete BF16 and Q8_0 images need not coexist in RAM.
+Status load_bf16_matrix(const Slice&, const Shape&, FormatId destination, std::span<Byte>);
+
 // One vendor-free storage contract; operand rounding and reduction remain typed.
 struct Q8Storage {
  static constexpr std::uint32_t elements=32, bytes=34, scale_bytes=2;

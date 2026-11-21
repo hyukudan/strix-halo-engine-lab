@@ -5,7 +5,7 @@ std::span<const FormatDescriptor> plain_formats() {
  static const FormatDescriptor formats[] = {
   descriptor({"plain.f32",1},"F32",plain_linear,true,fixed<1,4,1>,false,all_linear_roles | (1ull<<unsigned(Role::lookup_row)) | (1ull<<unsigned(Role::auxiliary))),
   descriptor({"plain.f16",1},"F16",plain_linear,true,fixed<1,2,1>,false,all_linear_roles | (1ull<<unsigned(Role::lookup_row)) | (1ull<<unsigned(Role::auxiliary))),
-  descriptor({"plain.bf16",1},"BF16",plain_linear,true,fixed<1,2,1>,false,all_linear_roles | (1ull<<unsigned(Role::lookup_row)) | (1ull<<unsigned(Role::auxiliary))),
+  descriptor(kBf16WeightStorage,"BF16",plain_linear,true,fixed<1,2,1>,false,all_linear_roles | (1ull<<unsigned(Role::lookup_row)) | (1ull<<unsigned(Role::auxiliary))),
   descriptor({"typed.i8",1},"I8",typed_auxiliary,false,fixed<1,1,1>,false,auxiliary_roles),
   descriptor({"typed.u8",1},"U8",typed_auxiliary,false,fixed<1,1,1>,false,auxiliary_roles),
   descriptor({"typed.i16",1},"I16",typed_auxiliary,false,fixed<1,2,1>,false,auxiliary_roles),

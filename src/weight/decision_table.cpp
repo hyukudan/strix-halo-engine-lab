@@ -1,4 +1,5 @@
 #include <strix/weight/resolve.hpp>
+#include <strix/weight/levers.hpp>
 #include <cmath>
 #include <algorithm>
 #include <limits>
@@ -6,6 +7,20 @@
 #include <charconv>
 #include <set>
 namespace strix::weight {
+const WeightLoadDecision* find_weight_load_decision(Id policy, const WeightLoadScope& scope,
+                                                  std::span<const WeightLoadDecision> decisions) {
+    if (scope.device_class.empty() || scope.compiler_id.empty() || scope.regime.empty() ||
+        scope.build == Digest256{} || scope.checkpoint == Digest256{}) return nullptr;
+    for (const auto& row : decisions) {
+        const auto& s = row.scope;
+        if (row.policy == policy && s.backend == scope.backend && s.device_class == scope.device_class &&
+            s.compiler_id == scope.compiler_id && s.regime == scope.regime && s.build == scope.build &&
+            s.checkpoint == scope.checkpoint && !(row.gate_v2_pass == Digest256{}) &&
+            !(row.measured_gain == Digest256{})) return &row;
+    }
+    return nullptr;
+}
+
 Status validate_qualification(const Qualification& q) {
     if (q.receipt == Digest256{} || q.device_class.empty() || q.compiler_id.empty() || q.shape_regime.empty() ||
         q.build_identity == Digest256{} || q.incumbent_implementation == Digest256{} ||

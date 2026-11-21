@@ -1,7 +1,9 @@
 #include "strix/weight/host_q8.hpp"
+#include "core/iu4_onfly.hpp"
 #include "h3/te/te_sha256.hpp"
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -42,6 +44,71 @@ public:
  std::string shard_name() const override { return source_->shard_name(); }
 };
 }
+
+Status matrix_load_geometry(FormatId storage, const Shape& shape, MatrixLoadGeometry& out) {
+ if (!(storage == kBf16WeightStorage) && !(storage == kQ8WeightStorage))
+  return {Error::unknown_format, "no compact BF16 matrix loader for requested storage"};
+ if (shape.rank != 2 || !shape.dims[0] || !shape.dims[1])
+  return {Error::unsupported_shape, "weight matrix requires nonempty [N,K]"};
+ Geometry geometry{};
+ if (const auto status = format_geometry(storage, {}, geometry); !status) return status;
+ if (shape.dims[1] % geometry.block_elements)
+  return {Error::unsupported_shape, "weight row does not contain whole format blocks"};
+ const auto blocks = shape.dims[1] / geometry.block_elements;
+ if (blocks > UINT64_MAX / geometry.block_bytes)
+  return {Error::memory_budget, "weight row byte count overflow"};
+ const auto row_bytes = blocks * geometry.block_bytes;
+ if (shape.dims[0] > UINT64_MAX / row_bytes)
+  return {Error::memory_budget, "weight matrix byte count overflow"};
+ out = {row_bytes, shape.dims[0] * row_bytes};
+ return {Error::ok, {}};
+}
+
+Status load_bf16_matrix(const Slice& source, const Shape& shape, FormatId destination, std::span<Byte> out) {
+ MatrixLoadGeometry input{}, output{};
+ if (const auto status = matrix_load_geometry(kBf16WeightStorage, shape, input); !status) return status;
+ if (const auto status = matrix_load_geometry(destination, shape, output); !status) return status;
+ if (source.range.bytes != input.bytes || out.size() != output.bytes)
+  return {Error::malformed, "weight matrix payload size differs from planned geometry"};
+ if (destination == kBf16WeightStorage) return read_slice(source, out);
+
+ constexpr std::size_t block_bytes = Q8Storage::elements * sizeof(std::uint16_t);
+ std::array<Byte, 65536> staging;
+ std::size_t written = 0;
+ for (std::uint64_t offset = 0; offset < input.bytes;) {
+  const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(staging.size(), input.bytes - offset));
+  Slice chunk{};
+  if (const auto status = subslice(source, {offset, count}, chunk); !status) return status;
+  if (const auto status = read_slice(chunk, std::span(staging).first(count)); !status) return status;
+  for (std::size_t block = 0; block < count; block += block_bytes) {
+   float values[Q8Storage::elements];
+   float amax = 0.0F;
+   for (std::size_t lane = 0; lane < Q8Storage::elements; ++lane) {
+    const auto pos = block + lane * sizeof(std::uint16_t);
+    const auto bits = static_cast<std::uint16_t>(std::to_integer<unsigned>(staging[pos]) |
+                                               (std::to_integer<unsigned>(staging[pos + 1]) << 8U));
+    values[lane] = core::onfly::bf16_bits_to_f32(bits);
+    if (!std::isfinite(values[lane])) return {Error::malformed, "nonfinite BF16 matrix weight"};
+    amax = std::max(amax, std::abs(values[lane]));
+   }
+   auto* packed = reinterpret_cast<std::uint8_t*>(out.data() + written);
+   const float scale = amax / 127.0F;
+   if (scale < std::numeric_limits<float>::min()) {
+    // This FP16 scale is zero. Canonicalize the block before an FP32
+    // reciprocal of a subnormal could overflow in the shared encoder.
+    std::fill_n(packed, Q8Storage::bytes, std::uint8_t{0});
+   } else {
+    if ((core::onfly::f32_to_f16_bits(scale) & 0x7c00U) == 0x7c00U)
+     return {Error::malformed, "BF16 block scale overflows Q8_0 FP16 scale"};
+    core::onfly::quantise_q8_0_block(values, packed);
+   }
+   written += Q8Storage::bytes;
+  }
+  offset += count;
+ }
+ return {Error::ok, {}};
+}
+
 Status q8_weight_from_legacy(std::span<const Byte> raw,std::shared_ptr<const void> owner,
                             std::uint32_t outputs,std::uint32_t width,std::uint32_t stride,
                             std::uint32_t prefix,TensorId tensor,WeightView& out) {
@@ -54,7 +121,7 @@ Status q8_weight_from_legacy(std::span<const Byte> raw,std::shared_ptr<const voi
   auto base=view_source(raw,std::move(owner),"host-q8");
   auto source=std::make_shared<RowSource>(std::move(base),outputs,logical,stride,prefix);
   WeightView result{};
-  result.tensor=tensor; result.storage={"gguf.q8_0",1}; result.shape={{outputs,width,0,0},2};
+  result.tensor=tensor; result.storage=kQ8WeightStorage; result.shape={{outputs,width,0,0},2};
   result.geometry={Q8Storage::elements,Q8Storage::bytes,Q8Storage::elements,1,1,Q8Storage::elements,1,true};
   result.payload={std::move(source),{0,std::uint64_t(outputs)*logical}};
   auto status=validate_weight(result); if(!status) return status;
@@ -63,7 +130,7 @@ Status q8_weight_from_legacy(std::span<const Byte> raw,std::shared_ptr<const voi
  catch(const std::exception& error) { return {Error::malformed,error.what()}; }
 }
 Status validate_q8_shape(const WeightView& weight,std::uint64_t outputs,std::uint64_t width) {
- if(!(weight.storage==FormatId{"gguf.q8_0",1})) return {Error::unsupported_arithmetic,"only existing Q8_0 operand contract is registered; IQ/trellis/NVFP4 require separate qualified arithmetic"};
+ if(!(weight.storage==kQ8WeightStorage)) return {Error::unsupported_arithmetic,"only existing Q8_0 operand contract is registered; IQ/trellis/NVFP4 require separate qualified arithmetic"};
  if(weight.shape.rank!=2 || weight.shape.dims[0]!=outputs || weight.shape.dims[1]!=width ||
     !outputs || !width || outputs>UINT32_MAX || width>UINT32_MAX || width%Q8Storage::elements ||
     Q8Storage::row_bytes(width)>UINT32_MAX) return {Error::unsupported_shape,"Q8 logical shape differs from launch"};

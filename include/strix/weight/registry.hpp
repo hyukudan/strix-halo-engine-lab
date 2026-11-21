@@ -1,6 +1,8 @@
 #pragma once
 #include "types.hpp"
 namespace strix::weight {
+inline constexpr FormatId kBf16WeightStorage{"plain.bf16", 1};
+inline constexpr FormatId kQ8WeightStorage{"gguf.q8_0", 1};
 inline constexpr std::uint64_t plain_linear = 1ull << 0;
 inline constexpr std::uint64_t quantized_linear = 1ull << 1;
 inline constexpr std::uint64_t transformed_linear = 1ull << 2;

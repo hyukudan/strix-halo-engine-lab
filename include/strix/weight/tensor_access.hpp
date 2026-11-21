@@ -2,6 +2,8 @@
 
 #include "admission.hpp"
 
+#include <optional>
+
 namespace strix::weight {
 
 // Exact wire schema, in file dimension order. Other tensors are rejected
@@ -11,6 +13,8 @@ struct TensorSpec {
     std::string_view wire_dtype;
     std::vector<std::uint64_t> extents;
     bool resident = true;
+    // An opted-in BF16 matrix role for a family load plan. Other tensors load as stored.
+    std::optional<Role> load_matrix_role{};
 };
 
 struct TensorSchema {

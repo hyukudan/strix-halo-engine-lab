@@ -1,10 +1,40 @@
 #include <strix/weight/resolve.hpp>
 #include <strix/weight/admission.hpp>
+#include <strix/weight/levers.hpp>
 #include <algorithm>
 #include <cmath>
 #include <limits>
 #include <sstream>
 namespace strix::weight {
+WeightLoadPlan resolve_weight_load(const Registry& registry, const WeightLoadPolicy& policy,
+                                   const WeightLoadRequest& request,
+                                   std::span<const WeightLoadDecision> decisions) {
+    WeightLoadPlan plan{policy.id, kBf16WeightStorage, profile::Status::builtin, "BF16 tier"};
+    if (request.tier != profile::Name::fast && request.tier != profile::Name::turbo) return plan;
+    if (!request.enabled) {
+        plan.status = profile::Status::off;
+        plan.reason = "weight load lever disabled";
+        return plan;
+    }
+    const bool runnable = !policy.id.name.empty() && policy.id.revision &&
+        policy.target == kQ8WeightStorage && find_format(registry, policy.target) &&
+        std::ranges::find(request.consumer_formats, policy.target) != request.consumer_formats.end();
+    const auto* decision = runnable ? find_weight_load_decision(policy.id, request.scope, decisions) : nullptr;
+    plan.status = profile::admit_column(decision != nullptr, runnable, request.allow_pending);
+    if (plan.status == profile::Status::pending) {
+        plan.reason = runnable ? "no matching gate v2 PASS and measured gain" : "shared format consumer unavailable";
+        return plan;
+    }
+    plan.storage = policy.target;
+    plan.reason = "unqualified weight load arm";
+    if (decision) {
+        plan.gate_v2_pass = decision->gate_v2_pass;
+        plan.measured_gain = decision->measured_gain;
+        plan.reason = "gate v2 PASS and measured gain";
+    }
+    return plan;
+}
+
 bool operator==(const Digest256& a, const Digest256& b) noexcept { return a.bytes == b.bytes; }
 bool operator==(const ImageKey& a, const ImageKey& b) noexcept {
     return a.source == b.source && a.sidecars == b.sidecars && a.metadata == b.metadata &&

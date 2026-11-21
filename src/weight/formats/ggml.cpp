@@ -7,7 +7,7 @@ std::span<const FormatDescriptor> ggml_formats() {
   descriptor({"gguf.q4_1",1},"GGUF:3",quantized_linear,false,fixed<32,20>),
   descriptor({"gguf.q5_0",1},"GGUF:6",quantized_linear,true,fixed<32,22>),
   descriptor({"gguf.q5_1",1},"GGUF:7",quantized_linear,true,fixed<32,24>),
-  descriptor({"gguf.q8_0",1},"GGUF:8",quantized_linear,true,fixed<32,34>,true),
+  descriptor(kQ8WeightStorage,"GGUF:8",quantized_linear,true,fixed<32,34>,true),
   descriptor({"gguf.q8_1",1},"GGUF:9",quantized_linear,false,fixed<32,36>),
   descriptor({"gguf.q3_k",1},"GGUF:11",quantized_linear,true,fixed<256,110>),
   descriptor({"gguf.q4_k",1},"GGUF:12",quantized_linear,true,fixed<256,144>),

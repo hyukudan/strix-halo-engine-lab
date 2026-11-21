@@ -25,16 +25,17 @@ weight::microscaled::ExpertSlabNames mini_expert_slab_names(unsigned physical, M
 
 std::vector<MiniTextTensorSpec> mini_text_tensor_schema() {
     std::vector<MiniTextTensorSpec> specs;
-    const auto tensor = [&](const std::string& suffix, std::string_view dtype, Extents extents) {
-        specs.push_back({std::string(kMiniTextTensorPrefix) + suffix, dtype, extents});
+    const auto tensor = [&](const std::string& suffix, std::string_view dtype, Extents extents,
+                            std::optional<weight::Role> role = {}) {
+        specs.push_back({std::string(kMiniTextTensorPrefix) + suffix, dtype, extents, true, role});
     };
-    const auto bf16 = [&](const std::string& suffix, Extents extents) {
-        tensor(suffix, "BF16", extents);
+    const auto bf16 = [&](const std::string& suffix, Extents extents, std::optional<weight::Role> role = {}) {
+        tensor(suffix, "BF16", extents, role);
     };
     bf16("embed.weight", {kVocabulary, kHiddenWidth});
     bf16("embed_norm.weight", {kHiddenWidth});
     bf16("norm.weight", {kHiddenWidth});
-    bf16("unembed.weight", {kVocabulary, kHiddenWidth});
+    bf16("unembed.weight", {kVocabulary, kHiddenWidth}, weight::Role::head);
     tensor("attn_res.output_query", "F32", {kHiddenWidth});
     tensor("middle_cycle_cross_pass_queries", "F32", {2U * MiniLayers::core_width, kHiddenWidth});
     tensor("middle_cycle_cross_pass_kv_queries", "F32", {2U * MiniLayers::core_width, kHiddenWidth});
@@ -42,8 +43,8 @@ std::vector<MiniTextTensorSpec> mini_text_tensor_schema() {
     for (unsigned layer = 0; layer < kPhysicalLayers; ++layer) {
         const auto id = std::to_string(layer);
         const auto prefix = "layers." + id + ".";
-        const auto layer_bf16 = [&](const std::string& suffix, Extents extents) {
-            bf16(prefix + suffix, extents);
+        const auto layer_bf16 = [&](const std::string& suffix, Extents extents, std::optional<weight::Role> role = {}) {
+            bf16(prefix + suffix, extents, role);
         };
         // The stored index names the preceding layer. The first layer uses the embedding
         // directly, and each full-attention layer has separate Q, K and V queries.
@@ -54,10 +55,10 @@ std::vector<MiniTextTensorSpec> mini_text_tensor_schema() {
         }
         tensor("attn_res.mlp_queries." + id, "F32", {kHiddenWidth});
 
-        layer_bf16("attn.wq_du.weight", {kQueryWidth, kHiddenWidth});
-        layer_bf16("attn.wk_dv.weight", {kKvWidth, kHiddenWidth});
-        layer_bf16("attn.wv_dv.weight", {kKvWidth, kHiddenWidth});
-        layer_bf16("attn.wo_ud.weight", {kHiddenWidth, kQueryWidth});
+        layer_bf16("attn.wq_du.weight", {kQueryWidth, kHiddenWidth}, weight::Role::attention_q);
+        layer_bf16("attn.wk_dv.weight", {kKvWidth, kHiddenWidth}, weight::Role::attention_k);
+        layer_bf16("attn.wv_dv.weight", {kKvWidth, kHiddenWidth}, weight::Role::attention_v);
+        layer_bf16("attn.wo_ud.weight", {kHiddenWidth, kQueryWidth}, weight::Role::attention_o);
         layer_bf16("attn.wr_du.weight", {kQueryHeads * kRelativeWidth, kHiddenWidth});
         layer_bf16("attn.rel_logits_proj.proj", {kRelativeWidth, kRelativeExtent});
         layer_bf16("attn.q_l2_clip.scale", {kQueryHeads, kHeadWidth});
