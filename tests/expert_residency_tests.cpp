@@ -134,6 +134,11 @@ void test_resolve() {
             REQUIRE(has(j, k));
         REQUIRE(has(j, std::to_string(d.slots_per_layer).c_str()));
         REQUIRE(j.front() == '{' && j.back() == '}');
+        // Intel Clang treats char as signed: JSON must escape controls while preserving UTF-8 bytes.
+        d.reason = std::string("q\"\\\n") + "\xC3\xA9";
+        const std::string escaped = decision_json(d);
+        REQUIRE(has(escaped, R"("reason":"q\"\\\n)"));
+        REQUIRE(has(escaped, "\xC3\xA9"));
     }
     {  // device profile cap (route_budget) is a residency input: same plan as the equal explicit budget, smaller cap wins
         const CardBytes card{96 * GiB, 96 * GiB};
