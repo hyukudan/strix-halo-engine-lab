@@ -20,7 +20,7 @@ enum class ReductionOrder { lane_strided_fma_lds_halving };
 enum class OutputForm { plain, bf16_double, bf16_once };
 
 template <class Traits>
-constexpr OutputForm output_form_of() {
+STRIX_OPS_NORM_HD constexpr OutputForm output_form_of() {
     if constexpr (requires { Traits::output_form; }) return Traits::output_form;
     else return OutputForm::plain;
 }

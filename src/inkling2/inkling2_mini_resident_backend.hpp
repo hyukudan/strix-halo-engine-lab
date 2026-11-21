@@ -1,7 +1,7 @@
 #pragma once
 
-#include "core/prepared_rows_device.hpp"
-#include "core/resident_device.hpp"
+#include "core/row_transforms.hpp"
+#include "strix/device/runtime.hpp"
 #include "inkling2_mini_controller_device.hpp"
 #include "inkling2_mini_residual_device.hpp"
 #include "moe_core/microscaled_r1.hpp"
@@ -20,7 +20,7 @@
 
 namespace strix::inkling2 {
 
-namespace mini_gpu = core::resident_device;
+namespace mini_gpu = device::native;
 
 class MiniResidentBackend {
 public:
@@ -65,7 +65,7 @@ public:
           tiles_(moe_core::device_grouped::tile_bound(max_rows_, kExpertsPerToken, kExperts, Moe::rows_per_tile)),
           controller_(mini_controller_elements(max_rows_)), attention_(attention_elements(max_rows_)),
 #if defined(__HIPCC__)
-          attention_partials_(attn_core::prepared_gqa_hip_key_split_workspace_floats<MiniPreparedGqaShape>(max_rows_)),
+          attention_partials_(attn_core::dense::key_split_workspace_floats(max_rows_, kQueryHeads, kHeadWidth)),
 #endif
           lag_weights_(kPhysicalLayers * kMiniConvLayerElements),
           matrices_(kPhysicalLayers * kExperts), route_data_(route_elements(max_rows_, tiles_)),

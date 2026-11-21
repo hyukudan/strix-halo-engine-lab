@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/resident_device.hpp"
+#include "strix/device/runtime.hpp"
 #include "core/weight_load_queue.hpp"
 
 #include <mutex>
@@ -13,14 +13,14 @@ class WeightUploader final : public strix::core::WeightUploader {
 public:
     std::uint8_t* allocate(std::uint64_t bytes) override {
         void* result = nullptr;
-        namespace api = strix::core::resident_device;
+        namespace api = strix::device::native;
         api::check(cudaMallocHost(&result, static_cast<std::size_t>(bytes)), "allocate weight upload staging");
         return static_cast<std::uint8_t*>(result);
     }
     void release(std::uint8_t* staging, std::uint64_t) noexcept override { (void)cudaFreeHost(staging); }
 
     Token submit(const std::uint8_t* staging, const Copy* copies, std::size_t count) override {
-        namespace api = strix::core::resident_device;
+        namespace api = strix::device::native;
         std::lock_guard lock(mutex_);
         api::select(device_);
         try {
@@ -40,8 +40,8 @@ public:
     void drain() override {}
 
 private:
-    int device_{strix::core::resident_device::current_device()};
-    strix::core::resident_device::StreamOwner stream_;
+    int device_{strix::device::native::current_device()};
+    strix::device::native::StreamOwner stream_;
     std::mutex mutex_;
     Token latest_{};
 };

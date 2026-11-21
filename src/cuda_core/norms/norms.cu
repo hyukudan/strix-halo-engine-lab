@@ -1,5 +1,6 @@
 // RMSNorm (stored gain), gated RMSNorm, per-group l2norm, residual add. Reduction order documented in norms.hpp.
 #include "strix/cuda_core/norms.hpp"
+#include "core/pointwise.hpp"
 
 #include "../common.cuh"
 
@@ -95,8 +96,7 @@ cudaError_t run(const float* x, const GroupedView& xv, const Gain<M>* gain, cons
 }
 
 __global__ void add_kernel(float* x, const float* d, std::uint32_t count) {
-    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < count) x[i] = __fadd_rn(x[i], d[i]);
+    core::pointwise::visit_elements<false>(count, core::pointwise::Add{x, d, x});
 }
 
 }  // namespace

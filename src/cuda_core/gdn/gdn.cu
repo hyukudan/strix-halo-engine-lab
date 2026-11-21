@@ -1,6 +1,7 @@
 // Gated DeltaNet decode with deferred commit: causal depthwise conv (k=4) + SiLU, l2norm q/k, delta rule with sequential rows
 // into a shadow state side, gated RMSNorm. See gdn.hpp for the contract.
 #include "strix/cuda_core/gdn.hpp"
+#include "core/short_convolution.hpp"
 
 #include <cmath>
 
@@ -46,10 +47,10 @@ __device__ __forceinline__ void conv_rows(float w0, float w1, float w2, float w3
         if (static_cast<std::uint32_t>(g0) >= n) break;
 #pragma unroll
         for (int i = g0; i < g0 + G; ++i) {
-            float sum = __fmul_rn(w0, s0);
-            sum = __fadd_rn(sum, __fmul_rn(w1, s1));
-            sum = __fadd_rn(sum, __fmul_rn(w2, s2));
-            sum = __fadd_rn(sum, __fmul_rn(w3, xv[i]));
+            const float samples[] = {s0, s1, s2, xv[i]};
+            const float weights[] = {w0, w1, w2, w3};
+            const float sum = core::causal_conv::weighted_taps<true, true>(4,
+                [&](int tap) { return weights[tap]; }, [&](int tap) { return samples[tap]; });
             yv[i] = cc_silu(sum);
             bool on = static_cast<std::uint32_t>(i) < n;
             if constexpr (TREE) on = on && ((leaf >> (r + static_cast<std::uint32_t>(i))) & 1u) == 0u;

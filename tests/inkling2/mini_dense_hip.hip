@@ -1,4 +1,5 @@
 #include "inkling2/inkling2_mini_dense_hip.hpp"
+#include "core/row_transforms.hpp"
 
 #include <algorithm>
 #include <array>
@@ -231,7 +232,7 @@ int main() {
     serial.output = fixture->norm_serial.data();
     require_hip(mini::enqueue_mini_hip_rms(parallel, stream));
     require_hip(mini::enqueue_mini_hip_rms(serial, stream, mini::MiniHipRmsReduction::serial_reference));
-    namespace prep = strix::core::prepared_rows_device;
+    namespace prep = strix::core::row_transforms;
     require_hip(prep::elements(fixture->logits.size(),
                                prep::Bf16Softcap{fixture->logits.data(), mini::kLogitSoftcap}, stream));
     require_hip(hipStreamSynchronize(stream));

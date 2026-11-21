@@ -2,7 +2,13 @@
 
 #include "norm.hpp"
 
-#include <hip/hip_runtime.h>
+#include "core/pointwise.hpp"
+#include "row_reduction.hpp"
+#include "strix/weight/formats/scalar_float.hpp"
+
+#include <cmath>
+#include <cstdint>
+#include <limits>
 #include <cstddef>
 #include <type_traits>
 
@@ -12,6 +18,13 @@ namespace strix::ops::norm {
 struct NoStore {
     __device__ void operator()(std::size_t, float) const {}
 };
+
+template <unsigned L>
+__device__ __forceinline__ float square_partial(const float* input, unsigned width, unsigned lane) {
+    float sum = 0.0F;
+    for (unsigned i = lane; i < width; i += L) sum = __builtin_fmaf(input[i], input[i], sum);
+    return sum;
+}
 
 // One row of the norm: L lane-strided FMA chains, then the engine's LDS halving tree. Traits adapters must inline
 // without changing evaluation order.
@@ -25,14 +38,14 @@ __device__ __forceinline__ void rmsnorm_row(float* s, const float* xr, float* xw
                                             float eps, float* yr, std::size_t base, const Store& store) {
     static_assert(Traits::reduction_order == ReductionOrder::lane_strided_fma_lds_halving);
     float a = 0.0F;
-    for (unsigned i = threadIdx.x; i < n; i += L) {
-        if constexpr (Residual) {
+    if constexpr (Residual) {
+        for (unsigned i = threadIdx.x; i < n; i += L) {
             const float v = xr[i] + rr[i];
             xw[i] = v;
             a = __builtin_fmaf(v, v, a);
-        } else {
-            a = __builtin_fmaf(xr[i], xr[i], a);
         }
+    } else {
+        a = square_partial<L>(xr, n, threadIdx.x);
     }
     const float ss = Traits::template reduce<L>(s, a);
     const float r = Traits::inv_sqrt(ss / static_cast<float>(n) + eps);
@@ -40,11 +53,16 @@ __device__ __forceinline__ void rmsnorm_row(float* s, const float* xr, float* xw
     for (unsigned i = threadIdx.x; i < n; i += L) {
         const float v = Residual ? xw[i] : xr[i];  // this thread's own store of the first loop
         float y = 0.0F;
-        if constexpr (form == OutputForm::plain) y = w ? (v * r) * Traits::load(w, wt, i) : v * r;
+        if constexpr (requires { Traits::finish(v * r, wt); }) y = Traits::finish(v * r, wt);
+        else if constexpr (form == OutputForm::plain) y = w ? (v * r) * Traits::load(w, wt, i) : v * r;
         else y = finish<form>(v * r, w ? Traits::load(w, wt, i) : 1.0F, w != nullptr);
         yr[i] = y;
         if constexpr (!std::is_same_v<Store, NoStore>) {
+#if defined(__HIPCC__)
             asm volatile("" : "+v"(y));  // y rounded to FP32 before the consumer's conversion (no mixed-precision fold)
+#else
+            asm volatile("" : "+f"(y));
+#endif
             store(base + i, y);
         }
     }
@@ -85,6 +103,76 @@ __global__ void rmsnorm_fused_kernel(float* x, const float* r, const typename Tr
     const std::size_t base = static_cast<std::size_t>(blockIdx.x) * n;
     rmsnorm_row<Traits, L, Residual>(s, x + base, x + base, Residual ? r + base : nullptr, w, wt, n, eps, y + base, base,
                                      store);
+}
+
+struct LogPositionScale {
+    unsigned first = 0;
+    unsigned floor = 0;  // Zero disables the positional scale.
+    float alpha = 0.0F;
+};
+
+struct Bf16HeadClipArgs {
+    const float* input;
+    const std::uint16_t* gain;  // [group][width], optional
+    float* output;
+    unsigned rows;
+    unsigned groups;
+    unsigned width;
+    float epsilon;
+    float threshold;
+    LogPositionScale position;
+};
+
+// Use the shared LDS reduction with an L2 clip epilogue on BF16-rounded inputs. The
+// optional per-head gain follows the BF16 projection boundary and precedes
+// clipping. The clip output rounds to BF16 before optional position scaling.
+template <unsigned Threads>
+__global__ void clip_kernel(Bf16HeadClipArgs args) {
+    __shared__ float reductions[Threads];
+    const auto group = blockIdx.x;
+    const auto lane = threadIdx.x;
+    for (unsigned row = blockIdx.y; row < args.rows; row += gridDim.y) {
+        const auto base = (std::size_t{row} * args.groups + group) * args.width;
+        float value = 0.0F;
+        if (lane < args.width) {
+            const auto gain_offset = std::size_t{group} * args.width + lane;
+            const float gain = args.gain
+                ? weight::scalar_float::u2f(std::uint32_t{args.gain[gain_offset]} << 16U) : 1.0F;
+            value = __fmul_rn(weight::scalar_float::bf16_round(args.input[base + lane]), gain);
+        }
+        const float square = lds_halving_sum<Threads>(reductions, __fmul_rn(value, value));
+        const float scale = fminf(1.0F, __fdiv_rn(args.threshold, __fadd_rn(__fsqrt_rn(square), args.epsilon)));
+        if (lane < args.width) {
+            float clipped = weight::scalar_float::bf16_round(__fmul_rn(value, scale));
+            const unsigned absolute = args.position.first + row;
+            if (args.position.floor != 0 && absolute >= args.position.floor) {
+                const float ratio = __fdiv_rn(static_cast<float>(absolute + 1U), static_cast<float>(args.position.floor));
+                const float log_scale = __fadd_rn(1.0F, __fmul_rn(args.position.alpha, logf(ratio)));
+                clipped = weight::scalar_float::bf16_round(__fmul_rn(clipped, log_scale));
+            }
+            args.output[base + lane] = clipped;
+        }
+    }
+}
+
+// Contiguous rows. In-place operation is safe when input and output match exactly.
+inline core::pointwise::Status l2_clip_bf16(const Bf16HeadClipArgs& args, core::pointwise::Stream stream) {
+    constexpr unsigned max_rows = std::numeric_limits<unsigned>::max() - 65535U;
+    constexpr auto max_floats = std::numeric_limits<std::size_t>::max() / sizeof(float);
+    if (!args.input || !args.output || args.rows == 0 || args.rows > max_rows || args.groups == 0 ||
+        args.groups > 0x7FFFFFFFU || args.width == 0 || args.width > 256 ||
+        args.groups > max_floats / args.rows / args.width ||
+        !(args.epsilon > 0.0F) || !std::isfinite(args.epsilon) ||
+        !(args.threshold > 0.0F) || !std::isfinite(args.threshold) ||
+        (args.position.floor != 0 && (!std::isfinite(args.position.alpha) ||
+                                     args.rows > std::numeric_limits<unsigned>::max() - args.position.first))) {
+        return core::pointwise::invalid;
+    }
+    const dim3 grid(args.groups, args.rows < 65535U ? args.rows : 65535U);
+    if (args.width <= 32U) clip_kernel<32><<<grid, 32, 0, stream>>>(args);
+    else if (args.width <= 128U) clip_kernel<128><<<grid, 128, 0, stream>>>(args);
+    else clip_kernel<256><<<grid, 256, 0, stream>>>(args);
+    return core::pointwise::last_error();
 }
 
 }  // namespace strix::ops::norm

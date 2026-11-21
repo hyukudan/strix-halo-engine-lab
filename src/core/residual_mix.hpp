@@ -6,7 +6,6 @@
 #include <limits>
 #include <span>
 #include <stdexcept>
-#include <type_traits>
 
 #include "core/dense_row_plan.hpp"
 
@@ -17,11 +16,12 @@
 #endif
 
 #if defined(__HIPCC__) || defined(__CUDACC__)
-#include "ops/norm/row_reduction.hpp"
+#include "core/pointwise.hpp"
+#include "ops/norm/norm_device.hpp"
 #include "strix/attn/group_pool.hpp"
 #endif
 
-namespace strix::core::residual_device {
+namespace strix::core::residual_mix {
 
 inline constexpr unsigned kMaxBanks = 8;
 inline constexpr unsigned kMaxQueries = 8;
@@ -129,31 +129,31 @@ inline constexpr unsigned kGridLimit = 65535;
 namespace gi = attn::group_indexer;
 namespace pool = attn::group_pool;
 
-__device__ __forceinline__ float square_partial(const float* input, unsigned width, unsigned lane) {
-    float sum = 0.0F;
-    for (unsigned i = lane; i < width; i += kThreads) sum = fmaf(input[i], input[i], sum);
-    return sum;
-}
-
 __device__ __forceinline__ float rms_inverse(float squares, unsigned width, float epsilon) {
     return 1.0F / pool::sqrt_rn(squares / static_cast<float>(width) + epsilon);
 }
 
 __device__ __forceinline__ float inverse_rms(const float* input, unsigned width, float epsilon, float* scratch) {
-    const float sum = square_partial(input, width, threadIdx.x);
+    const float sum = ops::norm::square_partial<kThreads>(input, width, threadIdx.x);
     const float squares = ops::norm::lds_halving_sum<kThreads>(scratch, sum);
     return rms_inverse(squares, width, epsilon);
 }
 
+struct BankNorm {
+    using Scale = float;
+    using ScaleFormat = bool;
+    static constexpr auto reduction_order = ops::norm::ReductionOrder::lane_strided_fma_lds_halving;
+    template <unsigned L>
+    __device__ static float reduce(float* shared, float part) { return ops::norm::lds_halving_sum<L>(shared, part); }
+    __device__ static float inv_sqrt(float value) { return 1.0F / pool::sqrt_rn(value); }
+    __device__ static float finish(float value, bool round) { return round ? gi::bf16_round(value) : value; }
+};
+
 __device__ __forceinline__ void normalize_rows(NormalizeArgs args, float* scratch) {
     for (std::size_t row = blockIdx.x; row < args.rows; row += gridDim.x) {
-        const auto* in = args.input + row * args.input_stride;
-        auto* out = args.output + row * args.output_stride;
-        const float inverse = inverse_rms(in, args.width, args.epsilon, scratch);
-        for (unsigned i = threadIdx.x; i < args.width; i += kThreads) {
-            const float value = in[i] * inverse;
-            out[i] = args.round_bf16 ? gi::bf16_round(value) : value;
-        }
+        ops::norm::rmsnorm_row<BankNorm, kThreads, false>(
+            scratch, args.input + row * args.input_stride, nullptr, nullptr, nullptr, args.round_bf16,
+            args.width, args.epsilon, args.output + row * args.output_stride, 0, ops::norm::NoStore{});
         __syncthreads();
     }
 }
@@ -167,9 +167,9 @@ struct NormalizePair {
     NormalizeArgs operands[2];
 };
 
-static __global__ void normalize_pair(NormalizePair args) {
+static __global__ void normalize_pair(NormalizeArgs first, NormalizeArgs second) {
     __shared__ float scratch[kThreads];
-    normalize_rows(args.operands[blockIdx.y], scratch);
+    normalize_rows(blockIdx.y == 0U ? first : second, scratch);
 }
 
 template <bool Normalized>
@@ -213,8 +213,8 @@ static __global__ void mix(MixArgs args) {
             float scale = 1.0F;
             if constexpr (!Normalized) {
                 if constexpr (ParallelBanks) {
-                    const float low = square_partial(source, args.width, lane);
-                    const float high = square_partial(source, args.width, lane + bank_threads);
+                    const float low = ops::norm::square_partial<kThreads>(source, args.width, lane);
+                    const float high = ops::norm::square_partial<kThreads>(source, args.width, lane + bank_threads);
                     const float squares = ops::norm::lds_halving_sum<bank_threads>(bank_scratch, low + high);
                     scale = rms_inverse(squares, args.width, args.epsilon);
                 } else {
@@ -262,31 +262,29 @@ static __global__ void mix(MixArgs args) {
     }
 }
 
-template <class Args>
-static __global__ void pointwise(Args args) {
-    const auto first = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
-    const auto step = std::size_t{gridDim.x} * blockDim.x;
-    for (std::size_t i = first; i < args.elements; i += step) {
-        if constexpr (std::is_same_v<Args, AddArgs>) {
-            const float value = args.lhs[i] + args.rhs[i];
-            args.output[i] = args.round_bf16 ? gi::bf16_round(value) : value;
-        } else if constexpr (std::is_same_v<Args, RoundArgs>) {
-            args.output[i] = gi::bf16_round(args.input[i]);
-        } else {
-            const float retained = __fmul_rn(__fsub_rn(1.0F, tanhf(args.forget[i])), args.current[i]);
-            const float incoming = __fmul_rn(tanhf(args.gain[i]), args.message[i]);
-            args.output[i] = __fadd_rn(retained, incoming);
-        }
-    }
-}
+struct AddRound {
+    const float* lhs;
+    const float* rhs;
+    float* output;
+    __device__ void operator()(std::size_t i) const { output[i] = gi::bf16_round(__fadd_rn(lhs[i], rhs[i])); }
+};
 
-inline Error last_error() {
-#if defined(__HIPCC__)
-    return hipGetLastError();
-#else
-    return cudaGetLastError();
-#endif
-}
+struct Round {
+    const float* input;
+    float* output;
+    __device__ void operator()(std::size_t i) const { output[i] = gi::bf16_round(input[i]); }
+};
+
+struct Controller {
+    ControllerArgs args;
+    __device__ void operator()(std::size_t i) const {
+        const float retained = __fmul_rn(__fsub_rn(1.0F, tanhf(args.forget[i])), args.current[i]);
+        const float incoming = __fmul_rn(tanhf(args.gain[i]), args.message[i]);
+        args.output[i] = __fadd_rn(retained, incoming);
+    }
+};
+
+using pointwise::last_error;
 
 template <bool ParallelBanks = false>
 inline Error launch_mix_schedule(const MixArgs& args, Stream stream) {
@@ -302,13 +300,11 @@ inline Error launch_mix_schedule(const MixArgs& args, Stream stream) {
     return last_error();
 }
 
-template <class Args>
-inline Error launch_pointwise(Args args, Stream stream, bool pointers_valid) {
-    if (args.elements == 0U) return success;
-    if (!pointers_valid || args.elements > kMaxElements) return invalid_value;
-    const auto blocks = static_cast<unsigned>(std::min<std::size_t>((args.elements - 1U) / kThreads + 1U, kGridLimit));
-    pointwise<<<blocks, kThreads, 0, stream>>>(args);
-    return last_error();
+template <class Transform>
+inline Error launch_pointwise(std::size_t elements, Transform transform, Stream stream, bool pointers_valid) {
+    if (elements == 0U) return success;
+    if (!pointers_valid) return invalid_value;
+    return pointwise::elements(elements, transform, stream);
 }
 
 }  // namespace detail
@@ -335,15 +331,20 @@ inline Error launch_mix(const MixArgs& args, Stream stream) {
 
 // Pointwise operations support exact in-place aliasing with any input.
 inline Error launch_add(AddArgs args, Stream stream) {
-    return detail::launch_pointwise(args, stream, args.lhs && args.rhs && args.output);
+    const bool valid = args.lhs && args.rhs && args.output;
+    if (args.round_bf16)
+        return detail::launch_pointwise(args.elements, detail::AddRound{args.lhs, args.rhs, args.output}, stream, valid);
+    return detail::launch_pointwise(args.elements, pointwise::Add{args.lhs, args.rhs, args.output}, stream, valid);
 }
 
 inline Error launch_round(RoundArgs args, Stream stream) {
-    return detail::launch_pointwise(args, stream, args.input && args.output);
+    return detail::launch_pointwise(args.elements, detail::Round{args.input, args.output}, stream,
+                                    args.input && args.output);
 }
 
 inline Error launch_controller(ControllerArgs args, Stream stream) {
-    return detail::launch_pointwise(args, stream, args.current && args.message && args.forget && args.gain && args.output);
+    return detail::launch_pointwise(args.elements, detail::Controller{args}, stream,
+                                    args.current && args.message && args.forget && args.gain && args.output);
 }
 
 using ConstRows = std::span<const float>;
@@ -467,7 +468,8 @@ void enqueue_low_rank_controller(LowRankController plan, ControllerWeights weigh
     const auto stream = operations.stream();
     operations.check(launch_mix(mix, stream));
     const dim3 grid(std::min(rows, detail::kGridLimit), 2U);
-    detail::normalize_pair<<<grid, detail::kThreads, 0, stream>>>(normalize);
+    detail::normalize_pair<<<grid, detail::kThreads, 0, stream>>>(
+        normalize.operands[0], normalize.operands[1]);
     operations.check(detail::last_error());
 
     const Bf16RowProjection down[] = {{weights.down, plan.rank, latent.data(), plan.round_latent_bf16}};
@@ -480,4 +482,4 @@ void enqueue_low_rank_controller(LowRankController plan, ControllerWeights weigh
 }
 #endif
 
-}  // namespace strix::core::residual_device
+}  // namespace strix::core::residual_mix

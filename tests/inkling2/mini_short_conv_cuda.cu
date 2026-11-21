@@ -1,4 +1,4 @@
-#include "cuda/core/short_convolution.cuh"
+#include "core/short_convolution.hpp"
 #include "short_conv_device_fixture.hpp"
 
 #include <cstdlib>
@@ -10,8 +10,8 @@ struct Cuda {
     using Stream = cudaStream_t;
     static constexpr auto name = "Cuda";
     static constexpr auto invalid_value = cudaErrorInvalidValue;
-    static constexpr auto launch = &strix::cuda_core::short_conv::launch;
-    static constexpr auto launch_rounded = &strix::cuda_core::short_conv::launch_with_store<true>;
+    static constexpr auto launch = &strix::core::causal_conv::launch_with_store<false>;
+    static constexpr auto launch_rounded = &strix::core::causal_conv::launch_with_store<true>;
 
     static void require(cudaError_t status) {
         if (status == cudaSuccess) return;

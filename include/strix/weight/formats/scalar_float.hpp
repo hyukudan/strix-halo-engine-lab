@@ -25,6 +25,10 @@ STRIX_SCALAR_FLOAT_HD std::uint16_t bf16_encode(float x) {
     return static_cast<std::uint16_t>((bits + 0x7fffU + ((bits >> 16U) & 1U)) >> 16U);
 }
 
+STRIX_SCALAR_FLOAT_HD float bf16_round(float x) {
+    return u2f(std::uint32_t{bf16_encode(x)} << 16U);
+}
+
 // E8M0: 2^(e - 127); 0 -> 2^-127 (subnormal), 255 -> NaN.
 STRIX_SCALAR_FLOAT_HD float e8m0(std::uint8_t e) {
     const std::uint32_t b = e == 0U ? 0x00400000U : static_cast<std::uint32_t>(e) << 23U;

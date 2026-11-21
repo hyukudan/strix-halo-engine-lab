@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/short_convolution_device.hpp"
+#include "core/short_convolution.hpp"
 
 #include <algorithm>
 #include <array>
@@ -14,7 +14,7 @@
 
 namespace strix::tests::short_conv {
 
-using strix::core::short_conv_device::Args;
+using strix::core::causal_conv::Args;
 using strix::core::ShortConvolution;
 using strix::core::causal_short_convolution;
 

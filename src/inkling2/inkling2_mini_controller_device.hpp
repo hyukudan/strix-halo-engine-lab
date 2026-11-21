@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/residual_device.hpp"
+#include "core/residual_mix.hpp"
 #include "inkling2_mini_forward.hpp"
 #include "inkling2_mini_resident_forward.hpp"
 #include "inkling2_mini_resident_weights.hpp"
@@ -8,7 +8,7 @@
 #if defined(__HIPCC__) || defined(__CUDACC__)
 namespace strix::inkling2 {
 
-inline constexpr core::residual_device::LowRankController kMiniController{
+inline constexpr core::residual_mix::LowRankController kMiniController{
     kHiddenWidth, kControllerRank, 2U, 1e-6F, true, true,
 };
 
@@ -24,7 +24,7 @@ void enqueue_mini_layer_input(
     const MiniResidentWeights& weights, LayerVisit visit, MessagePath path, unsigned rows,
     std::span<const float> raw, std::span<const std::span<const float>> previous_bank,
     std::span<float> output, std::span<float> scratch, Operations& operations) {
-    namespace residual = core::residual_device;
+    namespace residual = core::residual_mix;
     const auto row_elements = std::size_t{rows} * kHiddenWidth;
     if (!valid_mini_visit(visit) || rows == 0 || rows > kMaxContext ||
         raw.size() != row_elements || output.size() != row_elements)

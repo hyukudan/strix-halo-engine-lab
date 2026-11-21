@@ -36,7 +36,7 @@ add_library(strix_cuda_core_kernels STATIC
     ${_cc_root}/src/cuda_core/attention/attention_flash8.cu
     ${_cc_root}/src/cuda_core/gdn/gdn.cu
     ${_cc_root}/src/cuda_core/gdn/gdn_chunk.cu)  # FAST chunked GDN prefill (gdn-chunk16-f32-v1)
-target_include_directories(strix_cuda_core_kernels PUBLIC ${_cc_root}/include)
+target_include_directories(strix_cuda_core_kernels PUBLIC ${_cc_root}/include PRIVATE ${_cc_root}/src)
 # Identity: no FMA contraction, IEEE division and sqrt, no flush-to-zero (as the existing Qwen CUDA build).
 target_compile_options(strix_cuda_core_kernels PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--prec-div=true;--prec-sqrt=true;--ftz=false>)
 if(MSVC)

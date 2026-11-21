@@ -1,3 +1,4 @@
+#include "core/short_convolution.hpp"
 #include "strix/env_flags.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/qpf2k_defaults.hpp"
@@ -1265,21 +1266,12 @@ __device__ __forceinline__ void conv_update_body(
         float_to_bf16(
             qkv[channel]);
 
-    float sum = 0.0F;
-    for (std::uint32_t index = 0;
-         index < kernel_size;
-         ++index) {
-        sum +=
-            bf16_to_float(
-                state[index]) *
-            load_small(
-                conv_weights,
-                weight_kind_value,
-                static_cast<std::uint64_t>(
-                    channel) *
-                    kernel_size +
-                index);
-    }
+    const float sum = core::causal_conv::weighted_taps<false>(kernel_size,
+        [&](std::uint32_t tap) { return bf16_to_float(state[tap]); },
+        [&](std::uint32_t tap) {
+            return load_small(conv_weights, weight_kind_value,
+                              static_cast<std::uint64_t>(channel) * kernel_size + tap);
+        });
     const float silu =
         sum /
         (1.0F +

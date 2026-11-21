@@ -1,5 +1,11 @@
 #pragma once
 
+#if defined(__HIPCC__) || defined(__CUDACC__)
+#include "core/pointwise.hpp"
+#include "strix/weight/formats/scalar_float.hpp"
+#include <limits>
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -86,5 +92,157 @@ inline void causal_short_convolution(
         std::ranges::copy(input.last(carried), history.last(carried).begin());
     }
 }
+
+#if defined(__HIPCC__) || defined(__CUDACC__)
+namespace causal_conv {
+
+struct Args {
+    std::size_t rows;
+    const float* input;            // [row][channel]
+    const float* static_weights;   // [lag][channel], current tap first
+    const float* dynamic_weights;  // [row][group][lag], or nullptr with no dynamic groups
+    float* history;                // [taps - 1][channel], oldest first
+    float* output;                 // [row][channel]
+};
+
+// Accumulation order follows the accessor's tap order. CUDA GDN starts with
+// the first multiply, HIP GDN starts at +0, and projected convolution uses
+// explicit FP32 operations even in a TU that enables contraction.
+template <bool ExplicitRound, bool FirstProduct = false, class Index, class Sample, class Weight>
+__device__ __forceinline__ float weighted_taps(Index taps, const Sample& sample, const Weight& weight) {
+    float sum = 0.0F;
+    Index tap{0};
+    if constexpr (FirstProduct) {
+        sum = __fmul_rn(sample(tap), weight(tap));
+        ++tap;
+    }
+    for (; tap < taps; ++tap) {
+        if constexpr (ExplicitRound) sum = __fadd_rn(sum, __fmul_rn(sample(tap), weight(tap)));
+        else sum += sample(tap) * weight(tap);
+    }
+    return sum;
+}
+
+namespace detail {
+
+__device__ __forceinline__ void commit_channel(const ShortConvolution& plan, const Args& args, std::size_t channel) {
+    const auto history_rows = plan.taps - 1;
+    const auto carried = args.rows < history_rows ? args.rows : history_rows;
+    const auto kept = history_rows - carried;
+    for (std::size_t h = 0; h < kept; ++h) {
+        args.history[h * plan.channels + channel] = args.history[(h + carried) * plan.channels + channel];
+    }
+    for (std::size_t h = kept; h < history_rows; ++h) {
+        const auto row = args.rows - (history_rows - h);
+        args.history[h * plan.channels + channel] = args.input[row * plan.channels + channel];
+    }
+}
+
+template <bool Dynamic, bool Decode, bool RoundOutput = false>
+__global__ void convolve(const ShortConvolution plan, const Args args, const std::size_t group_width) {
+#if defined(__clang__)
+#pragma clang fp contract(off) reassociate(off)
+#endif
+    const std::size_t first_channel = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t channel_stride = std::size_t(gridDim.x) * blockDim.x;
+    for (std::size_t channel = first_channel; channel < plan.channels; channel += channel_stride) {
+        std::size_t group = 0;
+        if constexpr (Dynamic) group = channel / group_width;
+        for (std::size_t row = blockIdx.y; row < args.rows; row += gridDim.y) {
+            const float* projected_taps = nullptr;
+            if constexpr (Dynamic) projected_taps = args.dynamic_weights + (row * plan.dynamic_groups + group) * plan.taps;
+            const auto sample = [&](std::size_t lag) {
+                return lag <= row ? args.input[(row - lag) * plan.channels + channel]
+                    : args.history[(plan.taps - 1 - (lag - row)) * plan.channels + channel];
+            };
+            const auto weight = [&](std::size_t lag) {
+                const float value = args.static_weights[lag * plan.channels + channel];
+                if constexpr (Dynamic) return __fadd_rn(value, projected_taps[lag]);
+                return value;
+            };
+            const float sum = weighted_taps<true>(plan.taps, sample, weight);
+            const auto index = row * plan.channels + channel;
+            const float residual = __fmul_rn(plan.residual_weight, args.input[index]);
+            const float result = __fdiv_rn(__fadd_rn(sum, residual), plan.output_divisor);
+            if constexpr (RoundOutput) args.output[index] = weight::scalar_float::bf16_round(result);
+            else args.output[index] = result;
+        }
+        if constexpr (Decode) commit_channel(plan, args, channel);
+    }
+}
+
+template <bool RoundOutput>
+__global__ void commit_prefill(const ShortConvolution plan, const Args args) {
+    const std::size_t first_channel = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t channel_stride = std::size_t(gridDim.x) * blockDim.x;
+    for (std::size_t channel = first_channel; channel < plan.channels; channel += channel_stride) {
+        commit_channel(plan, args, channel);
+    }
+}
+
+}  // namespace detail
+
+struct LaunchPlan {
+    unsigned channel_blocks;
+    unsigned row_blocks;
+    std::size_t group_width;
+
+    static constexpr unsigned threads = 256;
+    static constexpr std::size_t grid_limit = 65535;
+};
+
+inline bool valid(const ShortConvolution& plan, const Args& args) {
+    constexpr auto max_elements = std::numeric_limits<std::size_t>::max() / sizeof(float);
+    return valid_short_convolution_plan(plan) && args.input != nullptr && args.static_weights != nullptr &&
+           args.output != nullptr && (plan.taps == 1 || args.history != nullptr) &&
+           (plan.dynamic_groups == 0) == (args.dynamic_weights == nullptr) &&
+           args.rows <= max_elements / plan.channels && plan.taps <= max_elements / plan.channels &&
+           (plan.dynamic_groups == 0 || args.rows <= max_elements / plan.taps / plan.dynamic_groups);
+}
+
+inline LaunchPlan launch_plan(const ShortConvolution& plan, const Args& args) {
+    return {
+        static_cast<unsigned>(std::min((plan.channels - 1) / LaunchPlan::threads + 1, LaunchPlan::grid_limit)),
+        static_cast<unsigned>(std::min(args.rows, LaunchPlan::grid_limit)),
+        plan.dynamic_groups == 0 ? 0 : plan.channels / plan.dynamic_groups,
+    };
+}
+
+
+template <bool RoundOutput, bool Decode>
+inline void enqueue(const ShortConvolution& plan, const Args& args, LaunchPlan config,
+                    pointwise::Stream stream) {
+    const dim3 grid(config.channel_blocks, config.row_blocks);
+    if (plan.dynamic_groups != 0) {
+        detail::convolve<true, Decode, RoundOutput><<<grid, LaunchPlan::threads, 0, stream>>>(
+            plan, args, config.group_width);
+    } else {
+        detail::convolve<false, Decode, RoundOutput><<<grid, LaunchPlan::threads, 0, stream>>>(
+            plan, args, config.group_width);
+    }
+}
+
+// Each decode thread owns its channel's history. A prefill needs a separate
+// commit so all rows can read the previous history before any update.
+template <bool RoundOutput>
+inline pointwise::Status launch_with_store(const ShortConvolution& plan, const Args& args,
+                                           pointwise::Stream stream) {
+    constexpr pointwise::Status success{};
+    if (args.rows == 0) return success;
+    if (!valid(plan, args)) return pointwise::invalid;
+    const auto config = launch_plan(plan, args);
+    if (args.rows == 1) {
+        enqueue<RoundOutput, true>(plan, args, config, stream);
+        return pointwise::last_error();
+    }
+    enqueue<RoundOutput, false>(plan, args, config, stream);
+    const auto status = pointwise::last_error();
+    if (status != success || plan.taps == 1) return status;
+    detail::commit_prefill<RoundOutput><<<config.channel_blocks, LaunchPlan::threads, 0, stream>>>(plan, args);
+    return pointwise::last_error();
+}
+
+}  // namespace causal_conv
+#endif
 
 }  // namespace strix::core

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/residual_device.hpp"
+#include "core/residual_mix.hpp"
 #include "core/residual_reference.hpp"
 #include "inkling2/inkling2_mini_config.hpp"
 #include "inkling2/inkling2_mini_controller_device.hpp"
@@ -27,7 +27,7 @@
 namespace strix::tests::mini_residual {
 namespace {
 
-namespace device = core::residual_device;
+namespace device = core::residual_mix;
 namespace ref = core::residual_reference;
 namespace gi = attn::group_indexer;
 
