@@ -1,8 +1,3 @@
-add_library(strix_serve_service_lifecycle STATIC src/serve/serve_session.cpp)
-target_link_libraries(strix_serve_service_lifecycle PUBLIC strix_session_runtime)
-strix_target_warnings(strix_serve_service_lifecycle)
-target_link_libraries(strix_session_shell PRIVATE strix_serve_service_lifecycle)
-
 if(STRIX_ENABLE_HIP_RUNTIME OR BUILD_TESTING)
     add_library(strix_qwen_serve_options STATIC src/qwen/session_service.cpp)
     target_include_directories(strix_qwen_serve_options PUBLIC src PRIVATE apps)
@@ -12,6 +7,12 @@ if(STRIX_ENABLE_HIP_RUNTIME OR BUILD_TESTING)
 endif()
 
 if(BUILD_TESTING)
+    add_executable(strix-qwen-serve-adapter-link-tests tests/qwen_serve_adapter_link_tests.cpp)
+    target_link_libraries(strix-qwen-serve-adapter-link-tests PRIVATE strix_qwen_serve_options)
+    strix_target_warnings(strix-qwen-serve-adapter-link-tests)
+    add_test(NAME strix-qwen-serve-adapter-link-tests COMMAND strix-qwen-serve-adapter-link-tests)
+    set_tests_properties(strix-qwen-serve-adapter-link-tests PROPERTIES TIMEOUT 30 LABELS "cpu;serve;qwen")
+
     add_executable(strix-qwen-serve-factory-tests tests/qwen_serve_factory_tests.cpp)
     target_include_directories(strix-qwen-serve-factory-tests PRIVATE apps tests)
     target_link_libraries(strix-qwen-serve-factory-tests PRIVATE strix_qwen_serve_options strix_session_shell)
@@ -27,7 +28,7 @@ function(strix_link_qwen_serve)
         target_include_directories(strix_qwen_hip_decode PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
         target_link_libraries(strix_qwen_hip_decode PRIVATE strix_hip_runtime strix_serve strix_serve_json
             strix_assets strix_qwen_model_description strix_device_profile strix_qwen_http_session_owner
-            strix_qwen_serve_options strix_serve_service_lifecycle)
+            strix_qwen_serve_options)
         target_compile_options(strix_qwen_hip_decode PRIVATE
             "SHELL:-include \"${CMAKE_CURRENT_SOURCE_DIR}/include/strix/hip_runtime_telemetry.hpp\"")
         strix_target_warnings(strix_qwen_hip_decode)
@@ -39,14 +40,17 @@ function(strix_link_qwen_serve)
             target_link_libraries(strix-qwen-serve-factory-tests PRIVATE strix_hip_runtime)
             target_compile_definitions(strix-qwen-serve-factory-tests PRIVATE STRIX_EXPECT_QWEN_SERVICE=1)
         endif()
+        if(TARGET strix-qwen-serve-adapter-link-tests AND DEFINED STRIX_HIP_ARCHS)
+            set_target_properties(strix-qwen-serve-adapter-link-tests PROPERTIES
+                HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
+        endif()
     endif()
     if(TARGET strix-hip-mtp-model-qualification)
-        target_link_libraries(strix-hip-mtp-model-qualification PRIVATE
-            strix_qwen_serve_options strix_serve_service_lifecycle)
+        target_link_libraries(strix-hip-mtp-model-qualification PRIVATE strix_qwen_serve_options)
     endif()
     if(TARGET strix-http-batch-session-tests)
         target_link_libraries(strix-http-batch-session-tests PRIVATE
-            strix_qwen_http_session_owner strix_qwen_serve_options strix_serve_service_lifecycle)
+            strix_qwen_http_session_owner strix_qwen_serve_options)
     endif()
 endfunction()
 cmake_language(DEFER CALL strix_link_qwen_serve)

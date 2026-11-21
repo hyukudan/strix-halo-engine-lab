@@ -22,16 +22,6 @@ namespace strix::qwen { void install_session_service(strix::serve::ServiceFactor
 #endif
 
 namespace strix::serve {
-void ServiceFactories::install(std::string family, ServiceFactory f) {
-    if (family.empty() || bool(f.create) == bool(f.create_scoped) || !f.validate || !f.inspect)
-        throw std::invalid_argument("service factory requires family, validation, inspection and construction");
-    if (!factories_.emplace(std::move(family), std::move(f)).second)
-        throw std::invalid_argument("duplicate service factory");
-}
-const ServiceFactory* ServiceFactories::find(const std::string& family) const {
-    const auto it = factories_.find(family);
-    return it == factories_.end() ? nullptr : &it->second;
-}
 void install_service_factories(ServiceFactories& factories) {
 #ifdef STRIX_SERVE_GEMMA4
     gemma4::engine::install_session_service(factories);

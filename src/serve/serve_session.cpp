@@ -2,9 +2,22 @@
 
 #include <chrono>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
+#include <utility>
 
 namespace strix::serve {
+void ServiceFactories::install(std::string family, ServiceFactory f) {
+    if (family.empty() || bool(f.create) == bool(f.create_scoped) || !f.validate || !f.inspect)
+        throw std::invalid_argument("service factory requires family, validation, inspection and construction");
+    if (!factories_.emplace(std::move(family), std::move(f)).second)
+        throw std::invalid_argument("duplicate service factory");
+}
+const ServiceFactory* ServiceFactories::find(const std::string& family) const {
+    const auto it = factories_.find(family);
+    return it == factories_.end() ? nullptr : &it->second;
+}
+
 void serve_session(const HttpServerConfig& config, SessionService& service, bool owner_on_caller) {
     auto& runtime = service.runtime();
     try {
