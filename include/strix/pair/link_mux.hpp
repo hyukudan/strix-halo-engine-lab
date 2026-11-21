@@ -48,7 +48,9 @@ public:
     LinkMux& operator=(const LinkMux&) = delete;
     // Not closed (an exception unwound past the owner): abort, so the peer fails instead of waiting for frames.
     ~LinkMux() {
-        if (!closed_) abort("link mux destroyed before close");
+        if (!closed_) {
+            try { abort("link mux destroyed before close"); } catch (...) {}  // destructors must not throw
+        }
         if (reader_.joinable()) reader_.join();
     }
 
@@ -58,10 +60,16 @@ public:
         if (channel >= ch_.size()) throw std::out_of_range("link mux: no such channel");
         for (std::size_t at = 0; at < data.size(); at += piece_) {
             const std::size_t n = std::min(piece_, data.size() - at);
-            std::lock_guard lock(send_mu_);
-            throw_if_failed();
-            put_header(channel, n);
-            send_(data.subspan(at, n));
+            try {
+                std::lock_guard lock(send_mu_);
+                throw_if_failed();
+                put_header(channel, n);
+                send_(data.subspan(at, n));
+            } catch (...) {
+                // A header may already be on the wire. Without aborting, the peer blocks awaiting its payload.
+                fail_transport("link mux: transport send failed");
+                throw;
+            }
         }
     }
 
@@ -147,6 +155,12 @@ private:
         if (!failed_) { failed_ = true; why_ = why; }
         cv_.notify_all();
     }
+    // Release both transports after a partial frame or a malformed header. Merely setting failed_ wakes this
+    // rank's channel clients, but leaves the other rank's reader blocked inside its transport receive().
+    void fail_transport(const std::string& why) {
+        fail(why);
+        try { abort_(why); } catch (...) {}  // preserve the originating exception / fail-closed state
+    }
     void read_loop() {
         try {
             for (;;) {
@@ -198,9 +212,9 @@ private:
                 }
             }
         } catch (const std::exception& e) {
-            fail(e.what());
+            fail_transport(e.what());
         } catch (...) {
-            fail("link mux reader failed");
+            fail_transport("link mux reader failed");
         }
     }
 
