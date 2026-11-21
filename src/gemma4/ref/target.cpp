@@ -272,9 +272,41 @@ struct HostTarget::Impl {
     RopeTables tables;
     OutputPool pool;
     LinearRecipe recipe;
-    Impl(HostWeights weights, RopeTables t, std::uint32_t workers, LinearRecipe r) : w(std::move(weights)), tables(std::move(t)), pool(host_workers(workers)), recipe(std::move(r)) {}
+    std::unique_ptr<core::DenseReference> ops;
+    Impl(HostWeights weights, RopeTables t, std::uint32_t workers, LinearRecipe r, std::unique_ptr<core::DenseReference> operators)
+        : w(std::move(weights)), tables(std::move(t)), pool(host_workers(workers)), recipe(std::move(r)), ops(std::move(operators)) {}
+    static core::Q8Rows q8(LinearView v) {
+        if (v.format != WeightFormat::q8_0) throw std::invalid_argument("reference operator requires Q8_0 weights");
+        return {v.data, v.outputs, v.inputs, v.row_bytes};
+    }
+    void embed(LinearView weights, std::uint32_t row, std::span<float> out, float scale) {
+        if (ops) {
+            ops->gather(q8(weights), row, out);
+            for (auto& value : out) value = embedding_value(value, scale);
+            return;
+        }
+        for (std::size_t i = 0; i < out.size(); ++i)
+            out[i] = embedding_value(weight_at(weights, row, static_cast<std::uint32_t>(i)), scale);
+    }
+    void normalize(const std::vector<float>& x, LinearView weights, std::vector<float>& out,
+                   std::size_t rows, std::uint32_t width) {
+        if (!ops) { norm(x, weights, out, rows, width, w.config.eps); return; }
+        const auto scale = vector_weight(weights);
+        out.resize(rows * width);
+        ops->rms_norm(x, scale, out, width, w.config.eps);
+        finite(out);
+    }
+    void normalize_in_place(std::span<float> data, std::span<const float> scale, std::uint32_t width) {
+        ops->rms_norm(data, scale, data, width, w.config.eps);
+        finite(data);
+    }
     void linear(LinearView v, const std::vector<float>& x, std::size_t rows, std::vector<float>& out) {
         out.resize(rows * v.outputs);
+        if (ops) {
+            ops->linear(q8(v), x, out);
+            finite(out);
+            return;
+        }
         // A named recipe (g4-a8-v1) owns its quantized formats; EXL3 and the rest keep their recipes.
         if (recipe && recipe(v, x.data(), rows, out.data(), [this](std::size_t count, const std::function<void(std::size_t, std::size_t)>& job) { pool.run(count, job); })) {
             finite(out);
@@ -300,18 +332,27 @@ struct HostTarget::Impl {
         const auto pairs = global ? 256U : 128U;
         const auto table = global ? tables.global : tables.sliding;
         const auto base = std::size_t(position) * pairs * 2;
+        const auto active = std::min(dim / 2U, global ? 64U : 128U);
+        if (ops) {
+            std::span<float> head_rows(x, std::size_t(count) * dim);
+            normalize_in_place(head_rows, {scale, dim}, dim);
+            ops->rope(head_rows, table.subspan(base, std::size_t(active) * 2U), dim);
+            return;
+        }
         for (std::uint32_t h = 0; h < count; ++h) {
             float* v = x + h * dim;
             if (!std::isfinite(lane_dot(v,v,dim))) throw std::runtime_error("nonfinite g4-v1 head norm reduction");
             rms_norm(v, scale, v, dim, w.config.eps);
-            for (std::uint32_t i = 0; i < std::min(dim / 2U, global ? 64U : 128U); ++i) {
+            for (std::uint32_t i = 0; i < active; ++i) {
                 const float a = v[i], b = v[i + dim / 2U], cs = table[base + 2U * i], sn = table[base + 2U * i + 1];
                 v[i] = a * cs - b * sn; v[i + dim / 2U] = b * cs + a * sn;
             }
         }
     }
 };
-HostTarget::HostTarget(HostWeights w, RopeTables tables, std::uint32_t workers, LinearRecipe recipe) : impl_(std::make_unique<Impl>(std::move(w), std::move(tables), workers, std::move(recipe))) {
+HostTarget::HostTarget(HostWeights w, RopeTables tables, std::uint32_t workers, LinearRecipe recipe,
+                       std::unique_ptr<core::DenseReference> operators)
+    : impl_(std::make_unique<Impl>(std::move(w), std::move(tables), workers, std::move(recipe), std::move(operators))) {
     validate_config(impl_->w.config);
     if (impl_->w.layer.size() != impl_->w.config.layers) throw std::runtime_error("incomplete host layer weights");
     if (std::fegetround() != FE_TONEAREST) throw std::runtime_error("g4-v1 requires round-to-nearest-even");
@@ -356,26 +397,37 @@ ForwardResult HostTarget::forward_rows(std::span<const RowPlan> plans) {
     if (n == 0) return result;
     std::vector<float> residual(n * c.hidden), x, q, k, v, attention, out, gate, up, ple;
     for (std::size_t r = 0; r < n; ++r)
-        for (std::uint32_t i = 0; i < c.hidden; ++i) residual[r * c.hidden + i] = embedding_value(weight_at(w.embedding, rows[r]->token, i));
+        impl_->embed(w.embedding, rows[r]->token, std::span<float>(residual).subspan(r * c.hidden, c.hidden), embedding_scale);
     impl_->linear(w.ple_model, residual, n, ple);
     for (auto& a : ple) a = a * model_ple_scale;
     const auto ple_norm = vector_weight(w.ple_model_norm);
-    for (std::size_t r = 0; r < n; ++r)
+    std::vector<float> ple_embedding;
+    if (impl_->ops) {
+        ple_embedding.resize(std::size_t(c.layers) * c.ple_dim);
+        impl_->normalize_in_place(ple, ple_norm, c.ple_dim);
+    }
+    for (std::size_t r = 0; r < n; ++r) {
+        if (impl_->ops) impl_->embed(w.ple_table, rows[r]->token, ple_embedding, ple_embedding_scale);
         for (std::uint32_t l = 0; l < c.layers; ++l) {
             auto* slice = ple.data() + (r * c.layers + l) * c.ple_dim;
-            if (!std::isfinite(lane_dot(slice,slice,c.ple_dim))) throw std::runtime_error("nonfinite g4-v1 PLE norm reduction");
-            rms_norm(slice, ple_norm.data(), slice, c.ple_dim, c.eps);
+            if (!impl_->ops) {
+                if (!std::isfinite(lane_dot(slice,slice,c.ple_dim))) throw std::runtime_error("nonfinite g4-v1 PLE norm reduction");
+                rms_norm(slice, ple_norm.data(), slice, c.ple_dim, c.eps);
+            }
             for (std::uint32_t i = 0; i < c.ple_dim; ++i) {
-                const float table = embedding_value(weight_at(w.ple_table, rows[r]->token, l * c.ple_dim + i), ple_embedding_scale);
+                const auto col = l * c.ple_dim + i;
+                const float table = impl_->ops ? ple_embedding[col] :
+                    embedding_value(weight_at(w.ple_table, rows[r]->token, col), ple_embedding_scale);
                 slice[i] = (slice[i] + table) * ple_combine_scale;
             }
         }
+    }
     finite(ple);
     for (std::uint32_t l = 0; l < c.layers; ++l) {
         const auto& y = w.layer[l]; const auto& lc = c.layer[l];
         const auto d = lc.head_dim, qw = c.heads * d, kw = c.kv_heads * d;
         const bool global = lc.attention == AttentionKind::global;
-        norm(residual, y.input_norm, x, n, c.hidden, c.eps);
+        impl_->normalize(residual, y.input_norm, x, n, c.hidden);
         impl_->linear(y.q, x, n, q);
         const auto qnorm = vector_weight(y.q_norm);
         for (std::size_t r = 0; r < n; ++r) impl_->head_norm_rope(q.data() + r * qw, c.heads, d, qnorm.data(), rows[r]->position, global);
@@ -384,7 +436,8 @@ ForwardResult HostTarget::forward_rows(std::span<const RowPlan> plans) {
             const auto knorm = vector_weight(y.k_norm);
             for (std::size_t r = 0; r < n; ++r) {
                 impl_->head_norm_rope(k.data() + r * kw, c.kv_heads, d, knorm.data(), rows[r]->position, global);
-                for (std::uint32_t h = 0; h < c.kv_heads; ++h) {
+                if (impl_->ops) impl_->normalize_in_place({v.data() + r * kw, kw}, {}, d);
+                else for (std::uint32_t h = 0; h < c.kv_heads; ++h) {
                     auto* head = v.data() + r * kw + h * d;
                     if (!std::isfinite(lane_dot(head,head,d))) throw std::runtime_error("nonfinite g4-v1 V norm reduction");
                     rms_norm(head,nullptr,head,d,c.eps);
@@ -403,6 +456,17 @@ ForwardResult HostTarget::forward_rows(std::span<const RowPlan> plans) {
             const auto p = rows[r]->position;
             const auto first = global || p < c.window ? 0 : p - c.window + 1;
             const auto* tx = static_cast<HostStream::Impl::Txn*>(rows[r]->transaction);
+            if (impl_->ops) {
+                const auto positions = static_cast<std::size_t>(p - first + 1);
+                std::vector<float> keys(positions * kw), values(keys.size());
+                for (std::size_t j = 0; j < positions; ++j) {
+                    std::copy_n(tx->read(lc.producer, first + j, false), kw, keys.data() + j * kw);
+                    std::copy_n(tx->read(lc.producer, first + j, true), kw, values.data() + j * kw);
+                }
+                impl_->ops->attention({{q.data() + r * qw, qw}, keys, values, positions, c.heads, c.kv_heads, d},
+                                      {attention.data() + r * qw, qw});
+                continue;
+            }
             for (std::uint32_t h = 0; h < c.heads; ++h) {
                 const auto g = h / (c.heads / c.kv_heads);
                 std::vector<float> scores(std::size_t(p - first + 1));
@@ -435,26 +499,26 @@ ForwardResult HostTarget::forward_rows(std::span<const RowPlan> plans) {
             }
         }
         finite(attention);
-        impl_->linear(y.o, attention, n, out); norm(out, y.post_attention_norm, x, n, c.hidden, c.eps);
+        impl_->linear(y.o, attention, n, out); impl_->normalize(out, y.post_attention_norm, x, n, c.hidden);
         for (std::size_t i = 0; i < residual.size(); ++i) residual[i] = residual[i] + x[i];
-        norm(residual, y.pre_ffn_norm, x, n, c.hidden, c.eps);
+        impl_->normalize(residual, y.pre_ffn_norm, x, n, c.hidden);
         impl_->linear(y.gate, x, n, gate); impl_->linear(y.up, x, n, up);
         for (std::size_t i = 0; i < gate.size(); ++i) gate[i] = gelu_tanh(gate[i]) * up[i];
         finite(gate);
-        impl_->linear(y.down, gate, n, out); norm(out, y.post_ffn_norm, x, n, c.hidden, c.eps);
+        impl_->linear(y.down, gate, n, out); impl_->normalize(out, y.post_ffn_norm, x, n, c.hidden);
         for (std::size_t i = 0; i < residual.size(); ++i) residual[i] = residual[i] + x[i];
         impl_->linear(y.ple_gate, residual, n, gate);
         for (std::size_t r = 0; r < n; ++r)
             for (std::uint32_t i = 0; i < c.ple_dim; ++i) gate[r * c.ple_dim + i] = gelu_tanh(gate[r * c.ple_dim + i]) * ple[(r * c.layers + l) * c.ple_dim + i];
         finite(gate);
-        impl_->linear(y.ple_projection, gate, n, out); norm(out, y.post_ple_norm, x, n, c.hidden, c.eps);
+        impl_->linear(y.ple_projection, gate, n, out); impl_->normalize(out, y.post_ple_norm, x, n, c.hidden);
         const float scalar = weight_at(y.scalar, 0, 0);
         for (std::size_t i = 0; i < residual.size(); ++i) residual[i] = (residual[i] + x[i]) * scalar;
         finite(residual);
         for (std::size_t t = 0; t < 5; ++t) if (tap_layers[t] == l)
             for (std::size_t r = 0; r < n; ++r) std::copy_n(residual.data() + r * c.hidden, c.hidden, result.taps.data() + rows[r]->output_row * result.tap_width + t * c.hidden);
     }
-    norm(residual, w.final_norm, x, n, c.hidden, c.eps);
+    impl_->normalize(residual, w.final_norm, x, n, c.hidden);
     if (std::any_of(rows.begin(),rows.end(),[](const RowPlan* r) { return r->export_hidden; })) {
         result.hidden.resize(result.rows * c.hidden);
         for (std::size_t r = 0; r < n; ++r) if (rows[r]->export_hidden)

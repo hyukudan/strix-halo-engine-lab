@@ -168,7 +168,9 @@ Json effective_config(const Backend& backend, const Request& request, bool draft
         j.set("mtp_confidence",confidence.json());
     }
     j.set("dflash_environment",environment ? environment : "unset");
-    j.set("qualification","per profile: see profile.levers (ready rows applied, pending rows listed)");
+    const auto* qualification = j.find("qualification");
+    if (!qualification || qualification->as_string() != "PENDING-HARDWARE")
+        j.set("qualification","per profile: see profile.levers (ready rows applied, pending rows listed)");
 #ifdef __linux__
     utsname system{};
     j.set("kernel",uname(&system) == 0 ? system.release : "unavailable");

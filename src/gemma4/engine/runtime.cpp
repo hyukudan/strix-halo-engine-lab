@@ -1,4 +1,7 @@
 #include "runtime.hpp"
+#ifdef STRIX_GEMMA4_INTEL_BACKEND
+#include "intel/core/reference.hpp"
+#endif
 #include "deployment.hpp"
 #include "lookup.hpp"
 #include "gemma4/exl3/pack.hpp"
@@ -107,7 +110,14 @@ Options parse_options(int argc, char** argv) {
     o.request.sampling.validate();
     if (!o.threads || !o.streams || !o.request.max_tokens || o.model.empty() || (o.rope.empty() && !o.deploy_check)) throw std::invalid_argument("model, --rope-tables and positive limits required; use --help");
     if (o.output != "json" && o.output != "ids" && o.output != "text") throw std::invalid_argument("output must be json/ids/text");
-    if (o.backend != "host" && o.backend != "device") throw std::invalid_argument("backend must be host/device");
+    if (o.backend != "host" && o.backend != "device" && o.backend != "intel")
+        throw std::invalid_argument("backend must be host/device/intel");
+    if (o.backend == "intel") {
+        if (!o.draft.empty() || !o.draft_eagle.empty() || !o.draft_mtp.empty() || o.request.dflash == DraftMode::on)
+            throw std::invalid_argument("Intel reference runs without a drafter");
+        o.request.dflash = DraftMode::off;
+        draft_off = true;
+    }
     // Shared speculation opt-out: same as `--draft off` unless a drafter or STRIX_G4_DRAFT was given explicitly.
     if ((no_mtp || strix::session::speculation_environment_off(std::getenv(strix::session::speculation_environment))) &&
         o.draft.empty() && o.draft_eagle.empty() && o.draft_mtp.empty() && !std::getenv("STRIX_G4_DRAFT")) draft_off = true;
@@ -138,6 +148,21 @@ std::string read_text(const std::filesystem::path& path) {
     return {std::istreambuf_iterator<char>(f),std::istreambuf_iterator<char>()};
 }
 Runtime::Runtime(const Options& o) {
+#ifdef STRIX_GEMMA4_INTEL_BACKEND
+    std::unique_ptr<core::DenseReference> reference;
+#endif
+    const bool intel_selected = o.backend == "intel";
+    if (intel_selected) {
+#ifdef STRIX_GEMMA4_INTEL_BACKEND
+        if (!o.exl3_arm.empty() || o.model.extension() != ".gguf")
+            throw std::invalid_argument("Intel reference requires the Gemma E4B Q8_0 GGUF contract");
+        if (!o.draft.empty() || !o.draft_eagle.empty() || !o.draft_mtp.empty() || o.request.dflash == DraftMode::on)
+            throw std::invalid_argument("Intel reference runs without a drafter");
+        if (!o.inspect) reference = intel::open_reference();
+#else
+        throw std::invalid_argument("Intel reference backend is not built");
+#endif
+    }
     // EXL3 core identity: fixed once for this session from the pack and --streams
     // (STRIX_G4_EXL3_IDENTITY forces it); recorded below and in the model identity.
     if (!o.exl3_arm.empty()) (void)exl3::configure_identity(exl3::pack_arm(o.exl3_arm), o.streams);
@@ -149,6 +174,22 @@ Runtime::Runtime(const Options& o) {
         manifest.config.max_positions = o.deployment_context;
     }
     if (o.backend == "host") backend = std::make_unique<HostBackend>(manifest,rope.view,o.threads);
+#ifdef STRIX_GEMMA4_INTEL_BACKEND
+    else if (intel_selected) {
+        for (const auto& tensor_record : manifest.tensors) {
+            const auto view = tensor_record.view;
+            if (tensor_record.shape.size() == 2) {
+                if (view.format != WeightFormat::q8_0)
+                    throw std::invalid_argument("Intel reference requires a Q8_0 matrix: " + tensor_record.name);
+                (void)intel::q8_matrix_bytes({view.data, view.outputs, view.inputs, view.row_bytes});
+            } else if (view.format != WeightFormat::f32 && view.format != WeightFormat::bf16) {
+                throw std::invalid_argument("Intel reference requires an F32 or BF16 vector: " + tensor_record.name);
+            }
+        }
+        manifest.identity = "g4-intel-q8-f32-reference-v1";
+        backend = std::make_unique<HostBackend>(manifest,rope.view,1U,std::move(reference),"intel-reference");
+    }
+#endif
     else {
 #ifdef STRIX_GEMMA4_DEVICE_BACKEND
         backend = make_device_backend(manifest,rope.view,o.inspect);
@@ -243,7 +284,7 @@ Runtime::Runtime(const Options& o) {
     // Prompt lookup (STRIX_G4_LOOKUP, default auto): wraps the MTP drafter with the per-request selector, or stands
     // alone when no drafter is loaded; =0 off. DFlash and e4b-eagle sessions are left unchanged. Drafting off (--dflash off or
     // STRIX_G4_DFLASH=0) leaves it out entirely, so those receipts carry no prompt_lookup.
-    const bool drafting_off = o.request.dflash == DraftMode::off || !dflash::enabled_from_environment();
+    const bool drafting_off = intel_selected || o.request.dflash == DraftMode::off || !dflash::enabled_from_environment();
     if (const auto lookup = lookup::LookupConfig::from_environment();
         lookup::wraps(lookup, bool(drafts), mtp_kind, drafting_off)) {
         drafts = lookup::hybrid_factory(std::move(drafts),lookup);
@@ -251,7 +292,7 @@ Runtime::Runtime(const Options& o) {
         if (!metadata.find("draft_kind")) metadata.set("draft_kind","prompt-lookup");
     }
     metadata.set("profile",strix::serve::parse_json_unique(o.profile.json()));
-    metadata.set("qualification",o.profile.qualification());
+    metadata.set("qualification",intel_selected ? "PENDING-HARDWARE" : o.profile.qualification());
     metadata.set("feature_identity",features::freeze(manifest,
         o.tokenizer.empty() ? std::string{} : metadata.find("tokenizer_hash")->as_string()).json());
     backend = std::make_unique<MetadataBackend>(std::move(backend),std::move(metadata));
@@ -270,7 +311,7 @@ ServePreparation prepare_serve(int argc,char** argv) {
         }
         if (!streams_given) options.streams = std::uint32_t(serve_slots());
         if (options.help) {
-            report << "strix-gemma4-serve MODEL --rope-tables TABLE_DIR --tokenizer tokenizer.json [--bind 127.0.0.1 --port 8080] [--dflash on|off|auto] [--draft-mtp DIR | --draft DRAFT.gguf --draft-rope TABLE.g4dr | --draft-eagle FILE] [--threads 1..16]\n"
+            report << "strix-gemma4-serve MODEL --rope-tables TABLE_DIR --tokenizer tokenizer.json [--backend host|device|intel] [--bind 127.0.0.1 --port 8080] [--dflash on|off|auto] [--draft-mtp DIR | --draft DRAFT.gguf --draft-rope TABLE.g4dr | --draft-eagle FILE] [--threads 1..16]\n"
                 "drafters: --draft-mtp DIR (Gemma-4-E4B-it MTP assistant: a drafter-mtp/ package or a model dir containing one; recommended),\n"
                 "  --draft DRAFT.gguf --draft-rope TABLE.g4dr (DFlash), --draft-eagle EAGLE.gguf (e4b-eagle fallback)\n"
                 "env: STRIX_G4_DRAFT_KIND=dflash|mtp|eagle (how --draft is read), STRIX_G4_MTP_TOPK=1..64 (clusters, default 64),\n"

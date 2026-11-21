@@ -27,6 +27,7 @@ struct Capabilities {
     std::uint64_t local_bytes = 0;   // SLM per work-group
     bool integrated = false;         // host-unified memory
     bool xmx = false;                // joint_matrix / DPAS available
+    bool device_usm = false;
 };
 
 struct Queue {

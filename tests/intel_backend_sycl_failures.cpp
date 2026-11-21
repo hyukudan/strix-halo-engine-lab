@@ -1,5 +1,6 @@
 // Exercises the actual backend.cpp SYCL branch with a host fault-injection double.
 #include "intel/core/backend.hpp"
+#include "intel/core/reference.hpp"
 #include <sycl/sycl.hpp>
 #include <cstdio>
 #include <cstdlib>
@@ -86,6 +87,16 @@ void open_failures() {
     require(!queue.impl && inject::live == 0, "owner closes");
     close_queue(queue);
 }
+
+void missing_reference_device() {
+    inject::have_device = false;
+    bool declined = false;
+    try { (void)open_reference(); }
+    catch (const std::runtime_error& error) {
+        declined = std::string_view(error.what()) == "no Level Zero GPU at ordinal 0";
+    }
+    require(declined && inject::live == 0, "missing Level Zero device must refuse without owning a queue");
+}
 } // namespace
 
 void wfmt_intel_queue_test();
@@ -100,6 +111,7 @@ int main(int argc, char** argv) {
         if (name == "async") async_failures();
         else if (name == "sync") sync_failures();
         else if (name == "open") open_failures();
+        else if (name == "reference") missing_reference_device();
         else if (name == "queues") wfmt_intel_queue_test();
         else throw std::runtime_error("expected async, sync or open");
     } catch (const std::exception& e) {

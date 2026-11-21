@@ -194,7 +194,31 @@ arch = "xe2"
 os = "linux"
 function = "cli-generate"
 state = "declared"
-note = "PENDING-HARDWARE: the Intel Arc scaffold has no full-model entrypoint. See src/intel/."
+note = "PENDING-HARDWARE: no Qwen model binding is established for Intel Arc."
+
+[[support]]
+family = "gemma4"
+format = "gguf-q8-0"
+backend = "intel"
+arch = "xe2"
+os = "linux"
+function = "cli-generate"
+state = "implemented"
+sources = ["src/intel/core/reference_sycl.cpp", "src/gemma4/engine/runtime.cpp", "apps/gemma4_decode_main.cpp"]
+entrypoint = "strix-gemma4-decode MODEL.gguf --backend intel --rope-tables DIR --ids PROMPT.ids --max-tokens N"
+note = "PENDING-HARDWARE: compile-only CI target for the discrete Arc reference path. Device execution and model fidelity are pending."
+
+[[support]]
+family = "gemma4"
+format = "gguf-q8-0"
+backend = "intel"
+arch = "xe2"
+os = "linux"
+function = "serve"
+state = "implemented"
+sources = ["src/intel/core/reference_sycl.cpp", "src/gemma4/engine/session_service.cpp"]
+entrypoint = "src/gemma4/engine/session_service.cpp#install_session_service"
+note = "PENDING-HARDWARE: compile-only reference path through the existing session API. Device execution and cancellation verification are pending."
 
 [[support]]
 family = "qwen"

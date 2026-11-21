@@ -6,7 +6,7 @@
 #if defined(STRIX_HAVE_SYCL) && STRIX_HAVE_SYCL
 #include "strix/device/intel_enumerator.hpp"
 
-#include <sycl/sycl.hpp>
+#include "backend_sycl.hpp"
 #include <atomic>
 #include <memory>
 #include <utility>
@@ -25,7 +25,6 @@ const char* status_name(Status status) noexcept {
 }
 
 #if defined(STRIX_HAVE_SYCL) && STRIX_HAVE_SYCL
-// Not compiled in CI yet (no oneAPI toolchain on the build hosts): written against SYCL 2020 + the Intel extensions.
 namespace {
 struct QueueState {
     // The handler owns its state too, including while the SYCL queue is destroyed.
@@ -48,6 +47,8 @@ template <class F> Status status_boundary(F&& action) noexcept {
 }
 } // namespace
 
+sycl::queue& detail::native_queue(Queue queue) { return q(queue)->queue; }
+
 bool sycl_built() noexcept { return true; }
 
 Status open_queue(int ordinal, Queue* queue, Capabilities* caps) {
@@ -67,6 +68,7 @@ Status open_queue(int ordinal, Queue* queue, Capabilities* caps) {
                 fresh.integrated = device::intel_arch_integrated(fresh.arch);
                 fresh.subgroup = arch::xe2::kSubgroup;
                 fresh.xmx = arch::xe2::selects(fresh.arch);
+                fresh.device_usm = d.has(sycl::aspect::usm_device_allocations);
                 *caps = std::move(fresh);
             }
             queue->impl = pending.release();

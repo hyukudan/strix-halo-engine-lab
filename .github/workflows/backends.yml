@@ -68,7 +68,8 @@ jobs:
           if ! command -v icpx >/dev/null; then set +e; source /opt/intel/oneapi/setvars.sh >/dev/null; set -e; fi
           command -v icpx
           CXX=icpx cmake -S . -B build/backend-intel -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DSTRIX_BACKEND_INTEL=ON -DSTRIX_ENABLE_HIP_RUNTIME=OFF -DBUILD_TESTING=ON
+            -DSTRIX_BACKEND_INTEL=ON -DSTRIX_ENABLE_HIP_RUNTIME=OFF -DSTRIX_FAMILY_GEMMA4=ON -DBUILD_TESTING=ON
           grep -Fx 'STRIX_INTEL_SYCL_COMPILES:INTERNAL=1' build/backend-intel/CMakeCache.txt
           cmake --build build/backend-intel --target strix_device_intel strix_intel_core \
-            strix-intel-backend-host-tests strix-intel-sycl-boundary-tests
+            strix-intel-backend-host-tests strix-intel-sycl-boundary-tests \
+            strix-gemma4-decode strix-gemma4-serve strix_gemma4_session_service

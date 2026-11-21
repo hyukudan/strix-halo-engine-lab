@@ -242,14 +242,16 @@ protected:
     virtual std::unique_ptr<detail::SubmissionFence> enqueue_batch(
         std::shared_ptr<detail::QueueState>, std::vector<BoundCommand>);
     void run(detail::QueueState&, const std::function<void()>&);
+    // Family execution plans use the same ownership and range checks as
+    // registered operations before accessing native backend storage.
+    detail::QueueState& checked(const Queue&) const;
+    detail::BoundBuffer checked(const BufferSlice&) const;
 
 private:
     struct Registration { OperationKey key; OperationSchema schema; Executor execute; };
     std::vector<Registration> registry_;
     mutable bool registry_sealed_ = false;
     const std::shared_ptr<const void> owner_ = std::make_shared<const int>(0);
-    detail::QueueState& checked(const Queue&) const;
-    detail::BoundBuffer checked(const BufferSlice&) const;
     const Registration& registered(const OperationKey&);
     detail::BoundOperation bind_operation(const Operation&, const OperationSchema&) const;
     BoundCommand bind_step(const SubmissionStep&);

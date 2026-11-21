@@ -2,9 +2,11 @@
 // arch selection and the no-SYCL stubs. No device, no oneAPI toolchain.
 #include "intel/arch/xe2/caps.hpp"
 #include "intel/core/backend.hpp"
+#include "intel/core/reference.hpp"
 #include "strix/device/intel_enumerator.hpp"
 
 #include <cmath>
+#include <array>
 #include <bit>
 #include <cstdint>
 #include <cstdio>
@@ -207,6 +209,56 @@ void arch_and_stubs() {
     require(intel::enqueue_dense_q8a8(q, intel::dense::Q8A8View{}) == intel::Status::unsupported, "invalid view first");
     require(std::string(intel::status_name(intel::Status::not_built)) == "not_built", "status name");
 }
+
+void reference_admission() {
+    using intel::Status;
+    intel::Capabilities caps;
+    require(intel::reference_refusal(Status::unsupported, caps) == "no Level Zero GPU at ordinal 0", "no device reason");
+    require(intel::reference_refusal(Status::device_error, caps) == "failed to open the Level Zero GPU queue", "open failure reason");
+    require(!intel::reference_refusal(Status::ok, caps).empty(), "unknown architecture refused");
+    caps.arch = "xe2-bmg";
+    require(intel::reference_refusal(Status::ok, caps) == "Intel reference requires device USM allocations", "USM reason");
+    caps.device_usm = true;
+    require(intel::reference_refusal(Status::ok, caps).empty(), "Arc reference admits without XMX");
+    caps.integrated = true;
+    require(!intel::reference_refusal(Status::ok, caps).empty(), "integrated refused");
+    if (!intel::sycl_built()) {
+        bool declined = false;
+        try { (void)intel::open_reference(); }
+        catch (const std::runtime_error& error) {
+            declined = std::string_view(error.what()) == intel::reference_refusal(Status::not_built, caps);
+        }
+        require(declined, "host-only open must refuse with reason");
+    }
+
+    std::array<std::uint8_t, 68> packed{};
+    require(intel::q8_matrix_bytes({packed.data(), 2, 32, 34}) == packed.size(), "packed rows");
+    packed[1] = 0x3cU; // 1.0 half scale
+    packed[2] = 0xfdU; // -3 signed code
+    require(intel::dense::q8_row_dot<false>(packed.data(), 32, [](std::uint32_t, std::uint32_t lane) {
+        return lane == 0U ? 2.0F : 0.0F;
+    }) == -6.0F, "Q8-by-F32 dot");
+    bool rejected = false;
+    try { (void)intel::q8_matrix_bytes({packed.data(), 2, 32, 35}); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "wrong matrix pitch refused");
+
+    std::array<float, 8> query{};
+    std::array<float, 6> keys{}, values{};
+    core::DenseAttentionRow row{query, keys, values, 3, 4, 1, 2};
+    require(intel::attention_score_elements(row, query.size()) == 12, "GQA score extent");
+    row.kv_heads = 3;
+    rejected = false;
+    try { (void)intel::attention_score_elements(row, query.size()); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "invalid grouping refused");
+    row.kv_heads = 1;
+    row.positions = std::numeric_limits<std::size_t>::max();
+    rejected = false;
+    try { (void)intel::attention_score_elements(row, query.size()); }
+    catch (const std::overflow_error&) { rejected = true; }
+    require(rejected, "context extent overflow refused");
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -219,6 +271,7 @@ int main(int argc, char** argv) {
         const std::string name = argc == 2 ? argv[1] : "";
         if (name == "dense") dense_boundaries_and_bits();
         else if (name == "memory") memory_boundaries();
+        else if (name == "reference") reference_admission();
         else {
             require(name.empty(), "unknown test name");
             half_rounding();

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gemma4/model/model.hpp"
+#include "strix/core/dense_reference.hpp"
 #include <functional>
 
 namespace strix::gemma4 {
@@ -43,7 +44,8 @@ using LinearRecipe = std::function<bool(LinearView, const float* x, std::size_t 
 class HostTarget final : public Target {
 public:
     // Model and table storage must outlive this reference. Workers parallelize outputs only.
-    HostTarget(HostWeights weights, RopeTables tables, std::uint32_t workers = 16, LinearRecipe recipe = {});
+    HostTarget(HostWeights weights, RopeTables tables, std::uint32_t workers = 16, LinearRecipe recipe = {},
+               std::unique_ptr<core::DenseReference> operators = {});
     ~HostTarget() override;
     ForwardResult forward_rows(std::span<const RowPlan> rows) override;
 private:

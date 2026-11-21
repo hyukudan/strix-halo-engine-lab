@@ -50,8 +50,10 @@ private:
     dflash::DraftContext context_;
 };
 }
-HostBackend::HostBackend(const ModelManifest& manifest, RopeTables tables, std::uint32_t workers)
-    : manifest_(manifest), tables_(tables), target_(bind_host_weights(manifest),tables,workers), workers_(std::clamp(workers,1U,16U)) {
+HostBackend::HostBackend(const ModelManifest& manifest, RopeTables tables, std::uint32_t workers,
+                         std::unique_ptr<core::DenseReference> operators, std::string_view name)
+    : manifest_(manifest), tables_(tables), target_(bind_host_weights(manifest),tables,workers,{},std::move(operators)),
+      workers_(std::clamp(workers,1U,16U)), name_(name) {
     const auto* setting = std::getenv("STRIX_G4_HOST_PARALLEL");
     if (setting && std::string(setting) == "0") workers_ = 1;
 }
@@ -59,7 +61,7 @@ std::unique_ptr<StreamState> HostBackend::create_stream() { return std::make_uni
 ForwardResult HostBackend::forward_rows(std::span<const RowPlan> rows) { return target_.forward_rows(rows); }
 strix::serve::Json HostBackend::identity() const {
     auto j = strix::serve::Json::object();
-    j.set("backend","host-reference"); j.set("identity",manifest_.identity);
+    j.set("backend",name_); j.set("identity",manifest_.identity);
     j.set("model_hash",manifest_.model_hash); j.set("rope_hash",tables_.hash); j.set("cache_dtype",manifest_.cache_dtype);
     j.set("workers",std::uint64_t(workers_)); j.set("row_cap",8);
     auto switches = strix::serve::Json::object();

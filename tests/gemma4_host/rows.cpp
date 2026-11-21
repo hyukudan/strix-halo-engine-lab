@@ -6,13 +6,15 @@
 
 using namespace strix::gemma4;
 namespace {
-ModelManifest tiny(bool aliases, WeightFormat format = WeightFormat::f32) {
+ModelManifest tiny(bool aliases, WeightFormat format = WeightFormat::f32, bool all_q8 = false) {
     ModelManifest m;
     auto& c = m.config;
     c.hidden = 32; c.layers = aliases ? 6 : 2; c.inter = 48; c.vocab = 37; c.heads = 4; c.kv_heads = 1;
     if (format != WeightFormat::f32) { c.hidden = 256; c.inter = 256; }
     c.ple_dim = 16; c.window = 8; c.max_positions = 64;
-    for (unsigned l = 0; l < c.layers; ++l) c.layer.push_back({l%2 ? AttentionKind::global : AttentionKind::sliding,8,l < 2 ? l : l%2});
+    if (all_q8) c.ple_dim = 32;
+    for (unsigned l = 0; l < c.layers; ++l)
+        c.layer.push_back({l%2 ? AttentionKind::global : AttentionKind::sliding,all_q8 ? 32U : 8U,l < 2 ? l : l%2});
     std::mt19937 random(471);
     for (const auto& [name, shape] : required_tensors(c)) {
         const auto outputs = shape.size() == 2 ? std::uint32_t(shape[0]) : 1U, inputs = std::uint32_t(shape.back());
@@ -22,7 +24,7 @@ ModelManifest tiny(bool aliases, WeightFormat format = WeightFormat::f32) {
             if (name.find("norm") != std::string::npos) x = 0.5F + x;
             if (name.ends_with("layer_scalar")) x = 0.875F;
         }
-        if (shape.size() == 2 && inputs == 256 && format != WeightFormat::f32) {
+        if (shape.size() == 2 && (all_q8 || inputs == 256) && format != WeightFormat::f32) {
             const auto stride = packed_row_bytes(format, inputs);
             auto packed = std::make_shared<std::vector<std::uint8_t>>(std::size_t(outputs) * stride);
             auto* data = packed->data();
@@ -63,6 +65,66 @@ std::vector<float> ingest(HostTarget& target, HostStream& stream, std::size_t co
     const auto result = target.forward_rows(plans); tx->commit(count);
     if (taps) *taps = result.taps;
     return result.logits;
+}
+
+class TestOperators final : public strix::core::DenseReference {
+public:
+    unsigned gathers = 0, norms = 0, rotations = 0, heads = 0;
+    bool fail_head = true;
+    std::vector<std::size_t> contexts;
+
+    void gather(strix::core::Q8Rows weights, std::uint32_t row, std::span<float> out) override {
+        CHECK(row < weights.rows && out.size() == weights.width);
+        ++gathers;
+        std::fill(out.begin(), out.end(), 0.0F);
+    }
+    void linear(strix::core::Q8Rows weights, std::span<const float> input, std::span<float> out) override {
+        CHECK(out.size() == input.size() / weights.width * weights.rows);
+        if (weights.rows == 37U) {
+            ++heads;
+            if (fail_head) throw std::runtime_error("test head failure");
+        }
+        std::fill(out.begin(), out.end(), 0.0F);
+    }
+    void rms_norm(std::span<const float> input, std::span<const float> scale,
+                  std::span<float> out, std::uint32_t width, float epsilon) override {
+        CHECK(out.size() == input.size() && (scale.empty() || scale.size() == width) && epsilon == norm_eps);
+        ++norms;
+        if (input.data() != out.data()) std::copy(input.begin(), input.end(), out.begin());
+    }
+    void rope(std::span<float> head_rows, std::span<const float> angles, std::uint32_t width) override {
+        CHECK(head_rows.size() % width == 0 && angles.size() == width && angles[0] == 1.0F);
+        ++rotations;
+    }
+    void attention(const strix::core::DenseAttentionRow& row, std::span<float> out) override {
+        CHECK(row.keys.size() == row.positions * row.kv_heads * row.width);
+        CHECK(row.keys.size() == row.values.size() && row.query.size() == out.size());
+        contexts.push_back(row.positions);
+        std::fill(out.begin(), out.end(), 0.0F);
+    }
+};
+
+void reference_operator_transaction(const RopeTables& tables) {
+    const auto model = tiny(true, WeightFormat::q8_0, true);
+    auto operators = std::make_unique<TestOperators>();
+    auto* probe = operators.get();
+    HostTarget target(bind_host_weights(model), tables, 1, {}, std::move(operators));
+    HostStream stream(model.config);
+    const auto initial = stream.digest();
+    {
+        auto tx = stream.begin();
+        const std::array<RowPlan, 1> rows{{{0,0,0,2,tx.get(),0,true}}};
+        refuses([&] { (void)target.forward_rows(rows); });
+        refuses([&] { tx->commit(1); });
+    }
+    CHECK(stream.frontier() == 0 && stream.digest() == initial);
+    CHECK(probe->gathers == 2 && probe->norms > 0 && probe->rotations > 0 && probe->heads == 1);
+    probe->fail_head = false;
+    (void)ingest(target, stream, 8, 2);
+    probe->contexts.clear();
+    (void)ingest(target, stream, 1, 2);
+    CHECK((probe->contexts == std::vector<std::size_t>{8,9,8,9,8,9}));
+    CHECK(stream.frontier() == 9 && probe->heads == 3);
 }
 
 void compare_cpu_linear(const RopeTables& tables) {
@@ -111,6 +173,7 @@ int main() {
         for (std::size_t i = 0; i < sliding.size(); i+=2) sliding[i] = 1;
         for (std::size_t i = 0; i < global.size(); i+=2) global[i] = 1;
         const RopeTables tables{sliding,global,64,"synthetic-identity-rotation"};
+        reference_operator_transaction(tables);
         compare_cpu_linear(tables);
         for (const bool aliases : {false,true}) {
             const auto model = tiny(aliases);

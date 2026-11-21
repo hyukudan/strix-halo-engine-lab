@@ -9,7 +9,6 @@
 #include "strix/weight/host_q8.hpp"
 
 #include <cstdint>
-#include <cstring>
 
 namespace strix::intel::dense {
 
@@ -32,23 +31,37 @@ inline bool supported(const Q8A8View& v) {
            required <= v.row_bytes && v.out_stride >= v.count;
 }
 
+inline float q8_scale(const std::uint8_t* block) {
+    return fp16::to_float(static_cast<std::uint16_t>(block[0] | (std::uint32_t(block[1]) << 8U)));
+}
+
+inline float q8_value(const std::uint8_t* block, std::uint32_t lane, float scale) {
+    const auto code = static_cast<std::int8_t>(block[2U + lane]);
+    return static_cast<float>(code) * scale;
+}
+
+template<bool RoundWeights, class Activation>
+inline float q8_row_dot(const std::uint8_t* weights, std::uint32_t width, Activation activation) {
+    float acc = 0.0F;
+    for (std::uint32_t b = 0; b < width / 32U; ++b) {
+        const auto* block = weights + static_cast<std::size_t>(b) * 34U;
+        const float d = q8_scale(block);
+        for (std::uint32_t j = 0; j < 32U; ++j) {
+            float w = q8_value(block, j, d);
+            if constexpr (RoundWeights) w = fp16::round(w);
+            acc += w * activation(b, j);
+        }
+    }
+    return acc;
+}
+
 inline void q8a8_cell(const Q8A8View& v, std::uint32_t r, std::uint32_t o) {
     const std::uint8_t* w = v.weight + static_cast<std::size_t>(o) * v.row_bytes + v.k_bytes;
     const std::int8_t* a = v.codes + static_cast<std::size_t>(r) * v.x_stride;
     const float* delta = v.deltas + static_cast<std::size_t>(r) * (v.x_stride / 32U);
-    float acc = 0.0F;
-    for (std::uint32_t b = 0; b < v.in / 32U; ++b) {
-        const std::size_t block_offset = static_cast<std::size_t>(b) * 34U;
-        std::uint16_t scale_bits = 0;
-        std::memcpy(&scale_bits, w + block_offset, sizeof scale_bits);
-        const float d = fp16::to_float(scale_bits);
-        for (std::uint32_t j = 0; j < 32U; ++j) {
-            const auto code_w = static_cast<std::int8_t>(w[block_offset + 2U + j]);
-            const float w16 = fp16::round(static_cast<float>(code_w) * d);
-            const float a16 = fp16::round(static_cast<float>(a[b * 32U + j]) * delta[b]);
-            acc += w16 * a16;
-        }
-    }
+    const float acc = q8_row_dot<true>(w, v.in, [=](std::uint32_t block, std::uint32_t lane) {
+        return fp16::round(static_cast<float>(a[block * 32U + lane]) * delta[block]);
+    });
     float& y = v.out[static_cast<std::size_t>(r) * v.out_stride + o];
     y = v.accumulate ? y + acc : acc;
 }

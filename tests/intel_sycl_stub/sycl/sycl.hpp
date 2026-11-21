@@ -13,6 +13,7 @@
 #include <deque>
 #include <memory>
 #include <cstring>
+#include <cmath>
 
 namespace sycl {
 struct exception : std::runtime_error { exception() : std::runtime_error("injected SYCL failure") {} };
@@ -29,7 +30,7 @@ struct Work {
     std::deque<std::function<void()>> pending;
     std::size_t submitted=0,completed=0;
 };
-inline bool execute=false;
+inline bool execute=false, have_device=true;
 inline std::vector<std::shared_ptr<Work>> queues;
 inline void submit(const std::shared_ptr<Work>& work,std::function<void()> action) {
     work->pending.push_back(std::move(action)); ++work->submitted;
@@ -57,9 +58,12 @@ struct pci_address { using type = std::string; };
 }
 namespace property::queue { struct in_order {}; }
 enum class backend { ext_oneapi_level_zero };
-enum class aspect { ext_intel_device_id, ext_intel_device_info_uuid, ext_intel_pci_address };
+enum class aspect { ext_intel_device_id, ext_intel_device_info_uuid, ext_intel_pci_address, usm_device_allocations };
 struct device {
-    static std::vector<device> get_devices(info::device_type) { return {device{}}; }
+    static std::vector<device> get_devices(info::device_type) {
+        if (!test::have_device) return {};
+        return {device{}};
+    }
     backend get_backend() const { return backend::ext_oneapi_level_zero; }
     bool has(aspect) const { return true; }
     template<class T> typename T::type get_info() const {
@@ -69,7 +73,7 @@ struct device {
     }
 };
 template<int N> struct range {
-    range(std::size_t, std::size_t) {}
+    explicit range(std::size_t, std::size_t = 0) {}
 };
 template<int N> struct id {
     std::size_t operator[](std::size_t) const { return 0; }
@@ -101,9 +105,9 @@ public:
         test::fail(test::Fault::copy);
         if(test::execute) test::submit(work_,[=] { std::memcpy(dst,src,bytes); });
     }
-    template<class F> void parallel_for(range<2>, F action) {
+    template<int N, class F> void parallel_for(range<N>, F action) {
         test::fail(test::Fault::submit);
-        if(test::execute) test::submit(work_,[=] { action(id<2>{}); });
+        if(test::execute) test::submit(work_,[=] { action(id<N>{}); });
     }
 };
 inline void* allocation(test::Fault kind) {
@@ -111,7 +115,11 @@ inline void* allocation(test::Fault kind) {
     return test::null_alloc ? nullptr : &test::storage;
 }
 inline void* malloc_device(std::size_t, queue&) { return allocation(test::Fault::device_alloc); }
+inline void* aligned_alloc_device(std::size_t, std::size_t, queue&) { return allocation(test::Fault::device_alloc); }
 inline void* malloc_shared(std::size_t, queue&) { return allocation(test::Fault::shared_alloc); }
 inline void* malloc_host(std::size_t, queue&) { return allocation(test::Fault::host_alloc); }
 inline void free(void*, queue&) { test::fail(test::Fault::release); }
+using std::exp;
+using std::isfinite;
+using std::sqrt;
 } // namespace sycl
