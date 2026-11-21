@@ -376,6 +376,8 @@ int main() try {
         const auto msg = http(port, "POST", "/v1/messages", R"({"max_tokens":8,"thinking":{"type":"disabled"},"messages":[{"role":"user","content":"Hi"}]})",
             "X-Request-Id: message-0001\r\n");
         check(msg.status == 200 && header_value(msg, "X-Request-Id") == "message-0001", "messages echoes the id " + std::to_string(msg.status) + " " + msg.body);
+        // A completed response must already be present in the request ring on the next GET.
+        check(at(newest(port), "id").as_string() == "message-0001", "messages record visible after HTTP reply");
         const auto bad_json = http(port, "POST", "/v1/chat/completions", "{nope", "X-Request-Id: badjson-0001\r\n");
         check(bad_json.status == 400 && header_value(bad_json, "X-Request-Id") == "badjson-0001", "an error response echoes the id");
         const auto failed = http(port, "POST", "/v1/chat/completions", R"({"messages":[{"role":"user","content":"FAIL"}]})",
