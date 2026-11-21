@@ -23,6 +23,7 @@
 
 #include "h3/gemm/ref.hpp"
 #include "h3/gemm/operand.hpp"
+#include "strix/hip/legacy_intrinsics.hpp"
 
 namespace strix::h3::gemm::dev {
 
@@ -45,7 +46,7 @@ constexpr unsigned kQThreads = 256U, kQTeams = kQThreads / 16U, kQMaxIters = 4U;
 template <int Mask> __device__ __forceinline__ int xor_lane(int v) {
     constexpr int ctrl = Mask == 1 ? 0xB1 : Mask == 2 ? 0x4E : Mask == 3 ? 0x1B : 0x160 + Mask;
     static_assert(Mask == 1 || Mask == 2 || Mask == 3 || Mask == 4 || Mask == 8 || Mask == 12);
-    return __builtin_amdgcn_update_dpp(0, v, ctrl, 0xF, 0xF, false);
+    return STRIX_HIP_UPDATE_DPP_ROW_SHARE_XMASK(0, v, ctrl, 0xF, 0xF, false);
 }
 template <int Mask> __device__ __forceinline__ std::int64_t xor_lane(std::int64_t v) {
     const auto u = static_cast<std::uint64_t>(v);

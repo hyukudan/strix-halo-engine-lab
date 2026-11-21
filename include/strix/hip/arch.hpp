@@ -40,6 +40,9 @@ struct ArchCaps {
     constexpr bool rdna3_wmma_wave32() const { return matrix == Matrix::Wmma16Rdna3; }
     constexpr bool rdna4_wmma() const { return matrix == Matrix::Wmma16Rdna4; }
     constexpr bool mfma() const { return matrix == Matrix::Mfma; }
+    constexpr bool dpp_row_share_xmask() const {
+        return family == Family::Rdna3 || family == Family::Rdna35 || family == Family::Rdna4;
+    }
     constexpr bool native_exchange16() const { return rdna3_wmma_wave32(); }
     constexpr bool native_sudot4() const { return rdna3_wmma_wave32(); }
     constexpr bool native_udot4() const { return rdna3_wmma_wave32(); }

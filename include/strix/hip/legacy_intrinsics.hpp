@@ -85,6 +85,16 @@ constexpr unsigned dot4(unsigned a, unsigned b, unsigned acc) {
 #define STRIX_HIP_EXCHANGE16(old, src, fi, bc) ::strix::hip::arch::unavailable<unsigned>(old, src, fi, bc)
 #endif
 
+// Preserve immediate operands and the distinct update/move semantics on RDNA.
+// Launchers already refuse wave64 for the kernels that use these controls.
+#if !defined(__HIP_DEVICE_COMPILE__) || !__HIP_DEVICE_COMPILE__ || STRIX_HAS_DPP_ROW_SHARE_XMASK
+#define STRIX_HIP_UPDATE_DPP_ROW_SHARE_XMASK __builtin_amdgcn_update_dpp
+#define STRIX_HIP_MOV_DPP_ROW_SHARE_XMASK __builtin_amdgcn_mov_dpp
+#else
+#define STRIX_HIP_UPDATE_DPP_ROW_SHARE_XMASK(...) ::strix::hip::arch::unavailable<int>(__VA_ARGS__)
+#define STRIX_HIP_MOV_DPP_ROW_SHARE_XMASK(...) ::strix::hip::arch::unavailable<int>(__VA_ARGS__)
+#endif
+
 #if !defined(__HIP_DEVICE_COMPILE__) || STRIX_HAS_SUDOT4
 #define STRIX_HIP_SUDOT4 __builtin_amdgcn_sudot4
 #elif STRIX_HIP_ARCH_RDNA4

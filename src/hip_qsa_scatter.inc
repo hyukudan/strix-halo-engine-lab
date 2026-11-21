@@ -1,7 +1,7 @@
 template <unsigned D> __device__ __forceinline__ float qsa_lane_xor(float v) {
     // Distance 16: permlanex16 with the identity selects swaps the two 16-lane rows (lane L ^ 16).
     if constexpr (D == 16U) return __uint_as_float(STRIX_HIP_EXCHANGE16(__float_as_uint(v), __float_as_uint(v), false, false));
-    else return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0x160 | static_cast<int>(D), 0xf, 0xf, false));
+    else return __int_as_float(STRIX_HIP_MOV_DPP_ROW_SHARE_XMASK(__float_as_int(v), 0x160 | static_cast<int>(D), 0xf, 0xf, false));
 }
 // Reduce-scatter of P per-lane partial sums (P a power of two <= 16): lane step D (16, 8, ...)
 // halves the values a lane carries, the lower lane keeping the lower half. Every head's sum

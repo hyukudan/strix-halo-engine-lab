@@ -1,4 +1,5 @@
 #pragma once
+#include "strix/hip/legacy_intrinsics.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/hip_dense_trellis.hpp"
 
@@ -138,7 +139,7 @@ __device__ __forceinline__ void group_rows(const Segments& s, std::uint32_t g, s
 // Lane ^ D: shared exact exchange for distance 16; retain the existing row-local DPP.
 template <unsigned D> __device__ __forceinline__ float lane_xor(float v) {
     if constexpr (D == 16U) return strix::qwen_dpp::xor32<16U>(v);
-    else return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0x160 | static_cast<int>(D), 0xf, 0xf, false));
+    else return __int_as_float(STRIX_HIP_MOV_DPP_ROW_SHARE_XMASK(__float_as_int(v), 0x160 | static_cast<int>(D), 0xf, 0xf, false));
 }
 
 // v holds pairs x leaves values (index pair * L + leaf). Lane steps 16..1 split the
@@ -1224,7 +1225,7 @@ template <class Site> constexpr unsigned a8_family_of() {
 
 __device__ __forceinline__ float dense_a8_canonical(float v) { return v != v ? __uint_as_float(kDenseA8CanonicalNan) : v; }
 template <unsigned D> __device__ __forceinline__ int lane_xor_int(int v) {
-    return __builtin_amdgcn_mov_dpp(v, 0x160 | static_cast<int>(D), 0xf, 0xf, false);
+    return STRIX_HIP_MOV_DPP_ROW_SHARE_XMASK(v, 0x160 | static_cast<int>(D), 0xf, 0xf, false);
 }
 
 // One block's quarter (8 features; the block's four lanes form one DPP quad): codes packed

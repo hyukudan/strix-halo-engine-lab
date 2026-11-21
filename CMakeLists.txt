@@ -472,6 +472,9 @@ if(BUILD_TESTING)
     target_compile_features(strix-hip-arch-layer-host-tests PRIVATE cxx_std_20)
     strix_target_warnings(strix-hip-arch-layer-host-tests)
     add_test(NAME strix-hip-arch-layer-host-tests COMMAND strix-hip-arch-layer-host-tests)
+    add_test(NAME strix-hip-arch-dense-a8-target-host-tests COMMAND "${CMAKE_COMMAND}"
+        -S "${CMAKE_CURRENT_SOURCE_DIR}/tests/device_profile_host/dense_a8_target"
+        -B "${CMAKE_CURRENT_BINARY_DIR}/dense-a8-target-host-test" -G "${CMAKE_GENERATOR}")
     add_executable(strix-split-k-policy-host-tests tests/split_k_policy_host_tests.cpp)
     target_include_directories(strix-split-k-policy-host-tests PRIVATE include)
     target_compile_features(strix-split-k-policy-host-tests PRIVATE cxx_std_20)
@@ -4200,16 +4203,7 @@ int main() { return 0; }"
             ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
         strix_target_warnings(strix-hip-dense-trellis-tests)
 
-        # Dense A8 profile prototypes: dot4 decode form vs iu8 WMMA prefill form (header-only, standalone).
-        add_executable(strix-hip-dense-a8-wmma-tests tests/hip_dense_a8_wmma_tests.hip)
-        set_target_properties(strix-hip-dense-a8-wmma-tests PROPERTIES
-            HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${STRIX_HIP_ARCHS}")
-        target_compile_options(strix-hip-dense-a8-wmma-tests PRIVATE
-            ${STRIX_HIP_WAVE32_FLAG} -fno-fast-math -ffp-contract=off -fdenormal-fp-math=ieee)
-        # hip_q8_rows_gemv.hpp reads the Q6P32 registry (strix/q6p_registry.hpp).
-        target_link_libraries(strix-hip-dense-a8-wmma-tests PRIVATE strix_hip_runtime)
-        strix_target_warnings(strix-hip-dense-a8-wmma-tests)
-        add_test(NAME strix-hip-dense-a8-wmma-tests COMMAND strix-hip-dense-a8-wmma-tests)
+        include(cmake/StrixDenseA8WmmaTest.cmake)
         # q8_rows head rows: one launch_heads == H per-head launches (bitwise), MLA absorb geometries; --bench times them.
         add_executable(strix-hip-q8-rows-heads-tests tests/hip_q8_rows_heads_tests.hip)
         set_target_properties(strix-hip-q8-rows-heads-tests PROPERTIES

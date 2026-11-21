@@ -17,8 +17,8 @@ namespace {
 constexpr unsigned kWave = 32, kWaves = 8, kMaxRows = 8;
 
 template <unsigned D> __device__ __forceinline__ float xor_lane(float v) {  // DPP row_xmask: lane ^ D (D < 16)
-    return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(__builtin_bit_cast(int, v), __builtin_bit_cast(int, v),
-                                                                  static_cast<int>(0x160U + D), 0xF, 0xF, false));
+    return __builtin_bit_cast(float, STRIX_HIP_UPDATE_DPP_ROW_SHARE_XMASK(
+        __builtin_bit_cast(int, v), __builtin_bit_cast(int, v), static_cast<int>(0x160U + D), 0xF, 0xF, false));
 }
 
 // E4M3 code `c` (bits 0..7 of `b`) times the block scale as F32. Every packed value is an F16 value (ds41_packed), so

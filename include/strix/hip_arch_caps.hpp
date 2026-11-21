@@ -41,6 +41,17 @@
 #define STRIX_HIP_TARGET_WAVE_SIZE 0
 #endif
 
+// DPP controls 0x150-0x16f require GFX10 or later. CDNA's DPP builtins
+// accept other controls, so builtin availability alone is insufficient.
+#if STRIX_HIP_ARCH_RDNA3_LAYOUT || STRIX_HIP_ARCH_RDNA4 || \
+    defined(__gfx1010__) || defined(__gfx1011__) || defined(__gfx1012__) || defined(__gfx1013__) || \
+    defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1033__) || \
+    defined(__gfx1034__) || defined(__gfx1035__) || defined(__gfx1036__)
+#define STRIX_HAS_DPP_ROW_SHARE_XMASK 1
+#else
+#define STRIX_HAS_DPP_ROW_SHARE_XMASK 0
+#endif
+
 // The packed IU4/IU8 operand ABI used by integer_projection is RDNA 3.5 only.
 #define STRIX_HAS_RDNA35_WMMA (STRIX_HIP_ARCH_RDNA35 && \
     STRIX_HAS_BUILTIN(__builtin_amdgcn_wmma_i32_16x16x16_iu4_w32) && \

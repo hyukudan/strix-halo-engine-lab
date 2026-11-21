@@ -69,7 +69,8 @@ template <unsigned G>
 __device__ __forceinline__ float gdn_lane_group_sum_fused(float sum) {
 #pragma clang fp contract(off)
     if constexpr (G > 1U) {
-        sum = sum + __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(sum), 0x160 + static_cast<int>(G / 2U), 0xf, 0xf, true));
+        sum = sum + __int_as_float(STRIX_HIP_UPDATE_DPP_ROW_SHARE_XMASK(
+            0, __float_as_int(sum), 0x160 + static_cast<int>(G / 2U), 0xf, 0xf, true));
         return gdn_lane_group_sum_fused<G / 2U>(sum);
     } else return sum;
 }

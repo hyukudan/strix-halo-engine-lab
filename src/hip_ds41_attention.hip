@@ -50,7 +50,8 @@ struct BlockTimer {
 template <unsigned D> __device__ __forceinline__ float xor_lane(float v) {
     const unsigned x = __builtin_bit_cast(unsigned, v);
     if constexpr (D == 16U) return __builtin_bit_cast(float, STRIX_HIP_EXCHANGE16(x, x, false, false));
-    else return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(static_cast<int>(x), static_cast<int>(x), static_cast<int>(0x160U + D), 0xF, 0xF, false));
+    else return __builtin_bit_cast(float, STRIX_HIP_UPDATE_DPP_ROW_SHARE_XMASK(
+        static_cast<int>(x), static_cast<int>(x), static_cast<int>(0x160U + D), 0xF, 0xF, false));
 }
 // The same exchange without tying the result to the source register (DPP old operand undefined: every lane of a
 // row_xmask exchange is in bounds), so the source stays live without a copy. The empty asm keeps the moved value out
@@ -60,7 +61,7 @@ template <unsigned D> __device__ __forceinline__ float xor_lane_nt(float v) {
     const unsigned x = __builtin_bit_cast(unsigned, v);
     if constexpr (D == 16U) return __builtin_bit_cast(float, STRIX_HIP_EXCHANGE16(x, x, false, false));
     else {
-        int r = __builtin_amdgcn_mov_dpp(static_cast<int>(x), static_cast<int>(0x160U + D), 0xF, 0xF, true);
+        int r = STRIX_HIP_MOV_DPP_ROW_SHARE_XMASK(static_cast<int>(x), static_cast<int>(0x160U + D), 0xF, 0xF, true);
         asm("" : "+v"(r));
         return __builtin_bit_cast(float, r);
     }

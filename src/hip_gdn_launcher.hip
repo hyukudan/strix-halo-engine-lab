@@ -3263,7 +3263,7 @@ template <unsigned G>
 __device__ __forceinline__ float gdn_lane_group_sum(float sum) {
 #pragma clang fp contract(off)
     if constexpr (G > 1U) {
-        sum = sum + __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(sum), 0x160 + static_cast<int>(G / 2U),
+        sum = sum + __int_as_float(STRIX_HIP_MOV_DPP_ROW_SHARE_XMASK(__float_as_int(sum), 0x160 + static_cast<int>(G / 2U),
             0xf, 0xf, false));  // DPP row_xmask:G/2
         return gdn_lane_group_sum<G / 2U>(sum);
     } else return sum;

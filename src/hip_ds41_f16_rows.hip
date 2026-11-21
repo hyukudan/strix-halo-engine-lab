@@ -15,8 +15,8 @@ namespace {
 constexpr unsigned kWave = 32, kRows = 8;
 
 template <unsigned D> __device__ __forceinline__ float xor_lane(float v) {  // DPP row_xmask: lane ^ D (D < 16)
-    return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(__builtin_bit_cast(int, v), __builtin_bit_cast(int, v),
-                                                                  static_cast<int>(0x160U + D), 0xF, 0xF, false));
+    return __builtin_bit_cast(float, STRIX_HIP_UPDATE_DPP_ROW_SHARE_XMASK(
+        __builtin_bit_cast(int, v), __builtin_bit_cast(int, v), static_cast<int>(0x160U + D), 0xF, 0xF, false));
 }
 __device__ __forceinline__ float half_value(std::uint16_t h) {  // exact (the conversion of f16_to_float for every non-NaN)
     return static_cast<float>(__builtin_bit_cast(_Float16, h));

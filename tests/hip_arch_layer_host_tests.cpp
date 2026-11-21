@@ -32,6 +32,8 @@ static_assert(a::kGfx1151.native_sudot4() && a::kGfx1151.native_udot4());
 static_assert(a::kGfx1200.rdna4_wmma() && a::kGfx1201.rdna4_wmma());
 static_assert(!a::kGfx1200.rdna3_wmma_wave32() && !a::kGfx1201.rdna3_wmma_wave32());
 static_assert(a::kGfx942.mfma() && a::kGfx950.mfma());
+static_assert(a::kGfx1151.dpp_row_share_xmask() && a::kGfx1200.dpp_row_share_xmask() && a::kGfx1201.dpp_row_share_xmask());
+static_assert(!a::kGfx942.dpp_row_share_xmask() && !a::kGfx950.dpp_row_share_xmask() && !a::kUnknown.dpp_row_share_xmask());
 static_assert(a::target_from_name("gfx1151:xnack-") == a::Target::Gfx1151);
 static_assert(a::target_from_name("gfx11510") == a::Target::Unknown);
 static_assert(a::dot4<true, true>(0x7f80ff02U, 0xff01ff03U, 4U) == 0xffffff0cU);
@@ -79,6 +81,7 @@ bool launch_guards() {
     for (int ordinal : {3, 4, 6}) {
         mock::active_device = ordinal;
         if (!refuses(wave32, "requires wave32 lane layout")) return false;
+        if (!refuses(legacy, "requires wave32 lane layout")) return false;
     }
     mock::active_device = 5;
     if (!refuses(legacy, "unknown HIP architecture")) return false;
