@@ -16,6 +16,10 @@ inline constexpr moe::RoutePolicy kMiniRoute{
     moe::RouteScore::sigmoid, true, moe::RouteKey::float_serial,
     moe::RouteOrder::selection, kExperts, kExpertsPerToken, 1, 1, true, true, 1e-20F, kRouteScale};
 static_assert(moe::validate(kMiniRoute) == nullptr);
+// The route policy as a type, for the shared checked route-wave launchers.
+struct MiniRoutePolicy {
+    static constexpr moe::RoutePolicy value = kMiniRoute;
+};
 
 template <class Math>
 inline constexpr moe::SoftcappedSwiglu<Math> kMiniExpertActivation{kMlpGateSoftcap, kMlpUpSoftcap};

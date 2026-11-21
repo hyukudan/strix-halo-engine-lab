@@ -304,12 +304,12 @@ private:
                                std::span<const MiniMoeExpert> matrices, unsigned* failure) {
         namespace decode = moe_core::microscaled_r1;
 #if defined(__HIPCC__)
-        check(moe_core::enqueue_route_wave<kMiniRoute, detail::MiniMoeMath, moe::RouteWaveTraits<true, true>>(
+        check(moe_core::enqueue_route_wave<MiniRoutePolicy, detail::MiniMoeMath, moe::RouteWaveTraits<true, true>>(
             logits.data(), bias.data(), route.ids.data(), route.weights.data(), failure, 1U, stream_));
         moe_core::route_tap(layer, 1U, kExpertsPerToken, kExperts, route.ids.data(),
                             route.weights.data(), stream_, gate_route_tap_);
 #else
-        check(cuda::core::route_wave::launch<mini_cuda_moe_detail::Router>(
+        check(moe_core::enqueue_route_wave<MiniRoutePolicy, detail::MiniMoeMath, moe::RouteWaveTraits<true>>(
             logits.data(), bias.data(), route.ids.data(), route.weights.data(), failure, 1U, stream_));
         cuda::core::route_tap(layer, 1U, kExpertsPerToken, kExperts, route.ids.data(),
                               route.weights.data(), stream_, gate_route_tap_);

@@ -64,7 +64,7 @@ struct RouteWavePolicy {
 template <const moe::RoutePolicy& P, class Math, class Traits>
 __device__ __forceinline__ void route_wave_body(const float* logits, const float* bias, std::uint32_t* ids,
                                                float* w, unsigned* status, unsigned rows) {
-    static_assert(moe::validate(P) == nullptr, "route_wave_kernel: invalid policy");
+    // moe::validate(P) is checked by the host launchers (constexpr host function).
     static_assert(P.score == moe::RouteScore::sigmoid && P.selection_bias &&
                       (P.key == moe::RouteKey::ordered_bits || Traits::checked_status) &&
                       P.renormalize && (P.top_k > 1U || P.renorm_single),
@@ -251,6 +251,7 @@ void enqueue_route_wave(const float* logits, const float* bias, std::uint32_t* i
 template <const moe::RoutePolicy& P, class Math, class Traits>
 hipError_t enqueue_route_wave(const float* logits, const float* bias, std::uint32_t* ids, float* w,
                               unsigned* status, unsigned rows, hipStream_t stream) {
+    static_assert(moe::validate(P) == nullptr, "route_wave_kernel: invalid policy");
     if (rows == 0U || !logits || !bias || !ids || !w || !status) return hipErrorInvalidValue;
     hipLaunchKernelGGL((route_wave_status_entry<P, Math, Traits>), dim3(rows), dim3(32U), 0, stream, logits, bias,
                        ids, w, status, rows);
@@ -272,15 +273,33 @@ void enqueue_combine_rounded_eo(const float* w, const float* eo, const float* sh
                        shared, y);
 }
 
+// Policy-type entry: Policy::value names the route policy. The HIP form forwards to the reference entry above
+// (same kernel instantiation). CUDA kernels take the policy as a type because nvcc's host stub cannot name an
+// inline variable used as a reference template argument of a __global__ function under MSVC.
+template <class Policy, class Math, class Traits>
+hipError_t enqueue_route_wave(const float* logits, const float* bias, std::uint32_t* ids, float* w,
+                              unsigned* status, unsigned rows, hipStream_t stream) {
+    return enqueue_route_wave<Policy::value, Math, Traits>(logits, bias, ids, w, status, rows, stream);
+}
+
 #else
-template <const moe::RoutePolicy& P, class Math, class Traits>
+template <class Policy, class Math, class Traits>
+__global__ __launch_bounds__(kCheckedRouteRowsPerBlock * 32U) void route_wave_policy_entry(
+    const float* logits, const float* bias, std::uint32_t* ids, float* w, unsigned* status, unsigned rows) {
+    static_assert(Traits::checked_status);
+    route_wave_body<Policy::value, Math, Traits>(logits, bias, ids, w, status, rows);
+}
+
+template <class Policy, class Math, class Traits>
 cudaError_t enqueue_route_wave(const float* logits, const float* bias, std::uint32_t* ids, float* w,
                                unsigned* status, unsigned rows, cudaStream_t stream) {
+    static_assert(moe::validate(Policy::value) == nullptr, "route_wave_kernel: invalid policy");
     if (rows == 0U) return cudaSuccess;
     if (!logits || !bias || !ids || !w || !status || rows > 0x7fffffffU) return cudaErrorInvalidValue;
     constexpr unsigned waves = kCheckedRouteRowsPerBlock;
     const unsigned blocks = (rows - 1U) / waves + 1U;
-    route_wave_status_entry<P, Math, Traits><<<blocks, waves * 32U, 0, stream>>>(logits, bias, ids, w, status, rows);
+    route_wave_policy_entry<Policy, Math, Traits><<<blocks, waves * 32U, 0, stream>>>(logits, bias, ids, w, status,
+                                                                                      rows);
     return cudaGetLastError();
 }
 #endif

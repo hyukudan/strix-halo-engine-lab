@@ -23,7 +23,7 @@ inline cudaError_t enqueue_mini_cuda_resident_moe(
     moe::RouteTap* tap = nullptr) {
     const auto select = [physical_layer, tap](std::span<const float> scores, std::span<const float> bias,
                            MiniMoeResidentRouteBuffers buffers, unsigned count, cudaStream_t route_stream) {
-        const auto status = moe_core::enqueue_route_wave<kMiniRoute, detail::MiniMoeMath, moe::RouteWaveTraits<true>>(
+        const auto status = moe_core::enqueue_route_wave<MiniRoutePolicy, detail::MiniMoeMath, moe::RouteWaveTraits<true>>(
             scores.data(), bias.data(), buffers.ids.data(), buffers.weights.data(),
             buffers.status.data(), count, route_stream);
         if (status == cudaSuccess)

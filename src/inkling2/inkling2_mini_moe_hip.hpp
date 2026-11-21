@@ -19,7 +19,7 @@ inline hipError_t enqueue_mini_hip_resident_moe(
     MiniMoeWorkspace workspace, hipStream_t stream, moe::RouteTap* tap = nullptr) {
     const auto select = [physical, tap](std::span<const float> logits, std::span<const float> selection_bias,
                            MiniMoeResidentRouteBuffers route, unsigned count, hipStream_t route_stream) {
-        const auto status = moe_core::enqueue_route_wave<kMiniRoute, detail::MiniMoeMath, moe::RouteWaveTraits<true, true>>(
+        const auto status = moe_core::enqueue_route_wave<MiniRoutePolicy, detail::MiniMoeMath, moe::RouteWaveTraits<true, true>>(
             logits.data(), selection_bias.data(), route.ids.data(), route.weights.data(),
             route.status.data(), count, route_stream);
         if (status == hipSuccess)
