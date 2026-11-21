@@ -37,7 +37,7 @@ endif()
 
 set(STRIX_PACKAGE_CORE_TARGETS strix-serve strix-skeleton-serve strix-memory-plan strix-model-describe
     strix-qwen-chain-plan strix-deepseek41-expert-server)
-set(STRIX_PACKAGE_TOOLS_TARGETS strix-inspect-gguf strix-tokenize strix-model-manifest strix-deepseek41-inspect
+set(STRIX_PACKAGE_TOOLS_TARGETS strix strix-inspect-gguf strix-tokenize strix-model-manifest strix-deepseek41-inspect
     strix-deepseek41-model-describe strix-ds41-prepare-load strix-gemma4-tokenize)
 set(STRIX_PACKAGE_HIP_TARGETS strix-hip-decode-token strix-deepseek41-rank strix-deepseek41-serve
     strix-deepseek41-prefill strix-deepseek41-prefix strix-deepseek41-batch strix-deepseek41-pipeline-front
@@ -230,6 +230,12 @@ elseif(STRIX_PACKAGE_BACKEND STREQUAL "cuda")
 else()
     set(_strix_pkg_arch_lines "host: no GPU code")
 endif()
+if(STRIX_PACKAGE_BACKEND MATCHES "^(hip|cuda)$")
+    string(REPLACE ";" "\n" _strix_pkg_arch_receipt "${_strix_pkg_arch_lines}")
+    file(WRITE "${_strix_pkg_out}/${STRIX_PACKAGE_BACKEND}-archs.txt" "${_strix_pkg_arch_receipt}\n")
+    install(FILES "${_strix_pkg_out}/${STRIX_PACKAGE_BACKEND}-archs.txt"
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/strix/support" COMPONENT ${STRIX_PACKAGE_BACKEND})
+endif()
 string(REPLACE ";" ", " _strix_pkg_arch_summary "${_strix_pkg_arch_lines}")
 if(STRIX_PACKAGE_BACKEND MATCHES "^(hip|cuda)$")
     string(REPLACE ";" "\n" _strix_pkg_arch_manifest "${_strix_pkg_arch_lines}")
@@ -384,7 +390,7 @@ else()
     endif()
     set(CPACK_DEBIAN_CORE_PACKAGE_DEPENDS "${_strix_deb_cxx}")
     string(REGEX REPLACE ", $" "" CPACK_DEBIAN_CORE_PACKAGE_DEPENDS "${CPACK_DEBIAN_CORE_PACKAGE_DEPENDS}")
-    set(CPACK_DEBIAN_TOOLS_PACKAGE_DEPENDS "${_strix_deb_cxx}python3, python3-numpy")
+    set(CPACK_DEBIAN_TOOLS_PACKAGE_DEPENDS "${_strix_deb_cxx}strix-core, python3, python3-numpy")
     if(STRIX_PACKAGE_BACKEND STREQUAL "hip" AND STRIX_DPKG_DEB AND
        (NOT STRIX_DPKG_SHLIBDEPS OR NOT EXISTS "/etc/debian_version"))
         if(STRIX_PACKAGING)
@@ -409,7 +415,7 @@ else()
     set(CPACK_RPM_PACKAGE_LICENSE "Apache-2.0")
     set(CPACK_RPM_PACKAGE_GROUP "Applications/Engineering")
     set(CPACK_RPM_PACKAGE_RELOCATABLE OFF)
-    set(CPACK_RPM_TOOLS_PACKAGE_REQUIRES "python3, python3-numpy")
+    set(CPACK_RPM_TOOLS_PACKAGE_REQUIRES "strix-core, python3, python3-numpy")
     set(CPACK_RPM_DOCS_PACKAGE_ARCHITECTURE noarch)
     set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION /usr/lib/systemd /usr/lib/systemd/system /usr/lib/sysusers.d
         /usr/share/doc)

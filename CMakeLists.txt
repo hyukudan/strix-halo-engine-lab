@@ -40,6 +40,8 @@ if(STRIX_CUDA_NVFP4_ONLY)
     return()
 endif()
 
+include(cmake/StrixCli.cmake)
+
 # Install rules and CPack packages (docs/install.md). Deferred to the end of this file so every target exists,
 # also in the CUDA-only modes below that return() early.
 cmake_language(DEFER CALL include "${CMAKE_CURRENT_SOURCE_DIR}/packaging/StrixPackaging.cmake")

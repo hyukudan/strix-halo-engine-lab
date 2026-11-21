@@ -8,6 +8,8 @@ Packages contain the engine programs, the model registry (`share/strix/models`),
 license notices and the user documentation. They never contain weights, mmproj files, draft models, tokenizers
 extracted from models, lab code, artifacts or captures: models are yours to place (e.g. `/var/lib/strix/models`).
 
+See the [Strix command-line guide](getting-started/strix-cli.md) for diagnostics, planning and engine launch.
+
 ## Support matrix
 
 See the [generated model support and evidence matrix](support-matrix.md).

@@ -1,0 +1,13 @@
+schema = "strix-registry/v1"
+
+[models.fixture_qwen]
+name = "fixture-qwen"
+description = "models/fixture-qwen.toml"
+family = "qwen"
+apps = ["apps/hip_decode_token_main.cpp"]
+
+[models.fixture_pair]
+name = "fixture-pair"
+description = "models/fixture-pair.toml"
+family = "deepseek41"
+apps = ["apps/deepseek41_serve_main.cpp"]
