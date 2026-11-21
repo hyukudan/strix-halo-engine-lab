@@ -5195,7 +5195,7 @@ and MTP verify windows and smaller blocks run the FAST BF16 experts, so TURBO de
 One word selects every FAST lever qualified for the run's regime (weights source, route, prompt length), from the data table
 `include/strix/profiles/qwen_dense_cuda.hpp`, through the shared resolver (`strix::profile::resolve`). Both CLIs resolve the same table.
 
-- **Preconditions:** `fast` applies `--prefill-arith fast4` + `--prefill-gdn chunk16` on the decode CLI's large prefill with `--turbo-weights onfly|converted`, and `--prefill-attn8 on` from 8,192 prompt tokens. On the spec CLI's decode windows with `--turbo-weights onfly|converted` it applies `--split-k fast` ([split-K FAST](#qwen-dense-cuda-splitk-fast)). Every other regime (exact pack, native NVFP4; split-K on the decode CLI, where `fast` already applies FAST4 and that combination has no gate) keeps its levers pending and runs exact. `turbo` is refused.
+- **Preconditions:** `fast` applies `--prefill-arith fast4` + `--prefill-gdn chunk16tc` on the decode CLI's large prefill with `--turbo-weights onfly|converted`, and `--prefill-attn8 on` from 8,192 prompt tokens. On the spec CLI's decode windows with `--turbo-weights onfly|converted` it applies `--split-k fast` ([split-K FAST](#qwen-dense-cuda-splitk-fast)). Every other regime (exact pack, native NVFP4; split-K on the decode CLI, where `fast` already applies FAST4 and that combination has no gate) keeps its levers pending and runs exact. `turbo` is refused.
 - **Automatic selection:** none outside `--profile fast`; `quality` has no rows here and equals `default`.
 - **Fallback notice:** the `profile:` block of the effective config lists each lever as `profile` (with the identity it turns on), `explicit-cli`, `off` or `pending` with the regime it needs.
 - **Exactness evidence:** `exact` leaves every option and the effective config unchanged (host test `strix-qwen35-dense-profile-host-tests`). FAST levers carry their own identities (`-pf-fast4`, `-gdnc16`, `-a8`, `-skf1`) and their gates: FAST4 + chunk16 8K / 32K passed; attn8 32K passed; split-K FAST passed.
@@ -5299,9 +5299,9 @@ warp for their stage. The stage holds the same bytes at the same offsets and eve
 
 <a id="qwen-dense-cuda-pf-tf32-h16"></a>
 
-### Qwen dense 27B CUDA prefill: TF32 GDN chunk scan and BF16 FFN hidden rows (FAST, opt-in)
+### Qwen dense 27B CUDA prefill: TF32 GDN chunk scan and BF16 FFN hidden rows (FAST)
 
-**Engine:** `qwen-rtx` (dense 27B). **Control:** `--prefill-gdn chunk16tc` and `--prefill-hid bf16` on `strix-cuda-qwen35-decode` (large prefill route). **Default:** off (`chunk16` / `f32`); `--profile fast` does not turn either on until its quality gate passes. **Class:** FAST (bit-changing, quality-gated).
+**Engine:** `qwen-rtx` (dense 27B). **Control:** `--prefill-gdn chunk16tc` and `--prefill-hid bf16` on `strix-cuda-qwen35-decode` (large prefill route). **Default:** `chunk16tc` under `--profile fast` (decode CLI large prefill, NVFP4 onfly/converted; 8K and 32K gates passed), otherwise off (`chunk16`); `bf16` stays off, `--profile fast` does not turn it on until its quality gate passes. **Class:** FAST (bit-changing, quality-gated).
 
 Two traits of shared kernel families, no new family:
 
@@ -5319,12 +5319,17 @@ Two traits of shared kernel families, no new family:
   quantiser core (exact widening). A compile-time trait of the tile kernels: the FP32 instantiations carry no H16 code.
 
 - **Preconditions:** decode CLI large prefill; `bf16` hidden rows need `--prefill-arith fast4` and NVFP4 FFN weights.
-- **Automatic selection:** none (no `qualified` regime in `include/strix/profiles/qwen_dense_cuda.hpp`).
+- **Automatic selection:** `chunk16tc` through the `prefill_gdn` row of `qualified` in `include/strix/profiles/qwen_dense_cuda.hpp`; `bf16` none.
 - **Exactness evidence:** `--profile exact` cannot reach either trait (host test `strix-qwen35-dense-profile-host-tests`);
   the FP32 scan kernels and the FP32 tile instantiations are machine-code identical to the code without the traits.
-  Quality gate: not passed yet.
+  `chunk16tc`: the device fixture puts the split-TF32 scan at FP32 class against the serial kernel (4,096 rows: output
+  2.97e-7, state 2.55e-7; the single-TF32 `-v1` measured 2.44e-4 / 2.97e-4); quality gate PASS with `fast4` at 8K (2/2
+  windows, pooled KL 0.01243, top-1 0.9727, dNLL -0.0108) and with `fast4` + `attn8` at 32K (2/2 windows, pooled KL
+  0.00761, top-1 0.9727, dNLL -0.0047). `bf16`: quality gate not passed yet.
 - **Off switch:** `--prefill-gdn chunk16` (or `serial`), `--prefill-hid f32`.
-- **Measured gain:** not yet measured end to end (timed rounds follow the gate).
+- **Measured gain:** RTX PRO 6000 at 600 W, 8K, one smoke run (not an ABAB series): `fast4` + `chunk16tc` 14,382 tok/s
+  warm, against 13,437-13,714 for `fast4` + `chunk16` in earlier receipts; no-model GDN K1+K2 per 4,096-row launch f32
+  1.399 ms -> split TF32 1.171 ms. `bf16`: not yet measured end to end.
 - **Implementation / evidence:** [GDN chunk family](../src/cuda_core/gdn/gdn_chunk.cu), [tile family](../src/cuda/core/arch/sm120/nvfp4_tile.cuh), [GDN host test](../tests/gdn_chunk/gdn_chunk_host.cpp), [tile host test](../tests/nvfp4_tile/tile_host.cpp), [profile test](../tests/qwen35_dense_profile_host_tests.cpp)
 
 ## Platform (kernel)

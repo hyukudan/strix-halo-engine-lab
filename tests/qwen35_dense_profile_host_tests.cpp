@@ -89,12 +89,12 @@ int main() {
                     check(text.empty(), "EXACT printed profile text (effective config not byte-identical)");
                 }
 
-    // 2. FAST, decode CLI (large prefill), NVFP4 onfly/converted: fast4 + chunk16 + attn8 from 8K; split_k pending
+    // 2. FAST, decode CLI (large prefill), NVFP4 onfly/converted: fast4 + chunk16tc + attn8 from 8K; split_k pending
     //    there (qualified on the spec windows route only: no composition receipt with fast4 + chunk16).
     for (const auto w : {TurboWeights::onfly, TurboWeights::converted}) {
         std::string text;
         const Options o8 = run(Name::fast, w, qp::Route::large_prefill, 8192, {}, &text);
-        check(o8.prefill_arith == PrefillArith::fast4 && o8.prefill_gdn == PrefillGdn::chunk16, "FAST 8K bundle");
+        check(o8.prefill_arith == PrefillArith::fast4 && o8.prefill_gdn == PrefillGdn::chunk16tc, "FAST 8K bundle");
         check(o8.prefill_attn8 && o8.nvfp4_split == Split::exact && o8.prefill_big, "FAST 8K: attn8 on, split_k off");
         const Options o4 = run(Name::fast, w, qp::Route::large_prefill, 4096);
         check(!o4.prefill_attn8 && o4.prefill_arith == PrefillArith::fast4, "FAST below 8K: attn8 stays off");
@@ -107,7 +107,7 @@ int main() {
               "FAST text prints the identity of an applied lever");
         check(text.find("profile-fingerprint: ") != std::string::npos, "FAST fingerprint line");
         const Options o32 = run(Name::fast, w, qp::Route::large_prefill, 32768);
-        check(o32.prefill_arith == PrefillArith::fast4 && o32.prefill_gdn == PrefillGdn::chunk16 && o32.prefill_attn8, "FAST 32K adds attn8");
+        check(o32.prefill_arith == PrefillArith::fast4 && o32.prefill_gdn == PrefillGdn::chunk16tc && o32.prefill_attn8, "FAST 32K adds attn8");
     }
     // FAST in unqualified weight regimes: nothing changes on either route.
     for (const auto t : all_t)
@@ -171,9 +171,10 @@ int main() {
         check(!c.prefill_big && c.prefill_arith == PrefillArith::exact, "--prefill-arith windows");
         const Options d = run(Name::fast, TurboWeights::converted, qp::Route::large_prefill, 32768, {{"prefill_attn8", "off"}, {"prefill_arith", "exact"}});
         check(d.prefill_arith == PrefillArith::exact && !d.prefill_attn8, "explicit off switches under fast");
-        // every engine spelling passes the resolver (the CLI path once kept a second spelling list that refused chunk16tc)
-        const Options e = run(Name::fast, TurboWeights::converted, qp::Route::large_prefill, 8192, {{"prefill_gdn", "chunk16tc"}});
-        check(e.prefill_arith == PrefillArith::fast4 && e.prefill_gdn == PrefillGdn::chunk16tc, "explicit --prefill-gdn chunk16tc under fast");
+        // every engine spelling passes the resolver (the CLI path once kept a second spelling list that refused chunk16tc);
+        // chunk16 (the f32 scan) stays reachable under fast as an explicit choice
+        const Options e = run(Name::fast, TurboWeights::converted, qp::Route::large_prefill, 8192, {{"prefill_gdn", "chunk16"}});
+        check(e.prefill_arith == PrefillArith::fast4 && e.prefill_gdn == PrefillGdn::chunk16, "explicit --prefill-gdn chunk16 under fast");
         const Options f = run(std::nullopt, TurboWeights::converted, qp::Route::large_prefill, 0,
                               {{"prefill_arith", "fast4"}, {"prefill_gdn", "chunk16tc"}, {"prefill_hid", "bf16"}});
         check(f.prefill_arith == PrefillArith::fast4 && f.prefill_gdn == PrefillGdn::chunk16tc && f.prefill_hid == PrefillHid::bf16,

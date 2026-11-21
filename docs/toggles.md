@@ -41,8 +41,8 @@ identity names every applied lever.
 | Lever (option) | `fast` turns it on when | Off switch |
 |---|---|---|
 | `--prefill-arith fast4` | decode CLI large prefill, `--turbo-weights onfly\|converted` (W4A4 gate 8K/32K passed) | `--prefill-arith exact` |
-| `--prefill-gdn chunk16` | same regime (gated together with FAST4) | `--prefill-gdn serial` |
-| `--prefill-gdn chunk16tc` | never (opt-in; FAST `gdn-chunk16-tf32-v2`, identity `-gdnc16t2`, quality gate pending) | `--prefill-gdn chunk16` |
+| `--prefill-gdn chunk16tc` | same regime (FAST `gdn-chunk16-tf32-v2`, identity `-gdnc16t2`; gated with FAST4 at 8K and with FAST4 + attn8 at 32K) | `--prefill-gdn chunk16` (f32 scan) or `serial` |
+| `--prefill-gdn chunk16` | never under `fast` (explicit choice; f32 scan, gated together with FAST4) | `--prefill-gdn serial` |
 | `--prefill-hid bf16` | never (opt-in with `--prefill-arith fast4`; FAST `nvfp4-tile-h16-v1`, identity `-h16`, quality gate pending) | `--prefill-hid f32` |
 | `--prefill-attn8 on` | same regime, prompt of at least 8,192 tokens (8K and 32K gates passed) | `--prefill-attn8 off` |
 | `--split-k fast` | spec CLI (decode windows), `--turbo-weights onfly\|converted`: FAST `nvfp4-splitk-fast-v1` (gate passed; spec verify 0.6-0.7 % faster). Decode CLI: pending (its `fast` already applies FAST4; that combination has no gate yet) | `--split-k exact` |

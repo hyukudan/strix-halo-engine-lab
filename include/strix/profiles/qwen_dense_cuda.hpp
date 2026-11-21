@@ -46,10 +46,12 @@ inline constexpr Lever table[] = {
      .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
      .target = "fast4 (nvfp4-tile-mma-f32-v1, identity -pf-fast4)", .off = "exact",
      .source = "W4A4 FAST4 large-M prefill; gate with chunk16 PASS 8K KL 0.01275 top-1 0.9648, 32K KL 0.00626 top-1 0.9668 (52dd7d1f0)"},
-    {.name = "prefill_gdn", .env = "", .option = "--prefill-gdn", .value = {"", "chunk16", "", ""}, .builtin = "serial",
+    {.name = "prefill_gdn", .env = "", .option = "--prefill-gdn", .value = {"", "chunk16tc", "", ""}, .builtin = "serial",
      .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
-     .target = "chunk16 (gdn-chunk16-f32-v1, identity -gdnc16)", .off = "serial",
-     .source = "chunked GDN prefill; gated together with fast4 (52dd7d1f0); ignored under prefill_arith exact"},
+     .target = "chunk16tc (gdn-chunk16-tf32-v2: split-TF32 tensor-core chunk scan, identity -gdnc16t2)", .off = "serial",
+     .source = "chunked GDN prefill, K2 scan in split TF32 (FP32-class); with fast4: 8K 2/2 windows PASS KL 0.01243 top-1 0.9727, "
+               "with fast4 + attn8: 32K 2/2 windows PASS KL 0.00761 top-1 0.9727; chunk16 (f32 scan) stays selectable; "
+               "ignored under prefill_arith exact"},
     {.name = "prefill_hid", .env = "", .option = "--prefill-hid", .value = {"", "bf16", "", ""}, .builtin = "f32",
      .kind = Kind::bit_changing, .ready = {true, false, true, false}, .runnable = {true, true, true, false},
      .target = "bf16 (nvfp4-tile-h16-v1: BF16 FFN hidden rows, identity -h16)", .off = "f32",
@@ -87,9 +89,14 @@ struct Qualified {
 inline constexpr Qualified qualified[] = {
     {"prefill_arith", Weights::nvfp4_rtn, Route::large_prefill, 0,
      "52dd7d1f0: FAST4 + chunk16 gate 8K / 32K PASS (converted NVFP4 pack); 8K 13,437-13,714 tok/s"},
-    {"prefill_gdn", Weights::nvfp4_rtn, Route::large_prefill, 0, "52dd7d1f0: gated with fast4 (same windows)"},
+    // chunk16tc (gdn-chunk16-tf32-v2) gated in the FAST compositions on the converted NVFP4 pack, RTX PRO 6000 at 600 W:
+    // 8K (fast4) 2/2 windows PASS pooled KL 0.01243 top-1 0.9727 dNLL -0.0108; 32K (fast4 + attn8) 2/2 windows PASS pooled
+    // KL 0.00761 top-1 0.9727 dNLL -0.0047. The earlier chunk16 receipt (52dd7d1f0) stays valid for --prefill-gdn chunk16.
+    {"prefill_gdn", Weights::nvfp4_rtn, Route::large_prefill, 0,
+     "gdn-chunk16-tf32-v2 with fast4: 8K gate 2/2 windows PASS (KL 0.01243); with fast4 + attn8: 32K gate 2/2 windows PASS (KL 0.00761)"},
     {"prefill_attn8", Weights::nvfp4_rtn, Route::large_prefill, 8192,
-     "with fast4 + chunk16: 8K gate 2/2 windows PASS (KL 0.01498); 32K gate 2/2 windows PASS (KL 0.00589)"},
+     "with fast4 + chunk16: 8K gate 2/2 windows PASS (KL 0.01498); 32K gate 2/2 windows PASS (KL 0.00589); "
+     "with fast4 + chunk16tc: 32K gate 2/2 windows PASS (KL 0.00761)"},
     // nvfp4-splitk-fast-v1 on the spec CLI (converted NVFP4 pack, RTX PRO 6000 at 600 W, greedy, sub15d): quality gate
     // EXACT -> FAST 4 windows x 512 rows pooled KL 0.00000 (q99 9.5e-06), top-1 0.9990, dNLL -0.00000; spec ids == FAST
     // serial x1200 on code / think / en / ja; two strict A/B pairs (exact, fast, exact, fast; 3 runs each): verify
@@ -99,9 +106,9 @@ inline constexpr Qualified qualified[] = {
     {"split_k", Weights::nvfp4_rtn, Route::windows, 0,
      "gate EXACT -> FAST pooled KL 0.00000 top-1 0.9990; spec ids == FAST serial x1200 (4 contents); "
      "verify -0.6 % think, -0.7 % code (RTX PRO 6000, 600 W)"},
-    // Decode CLI (large prefill) row: NOT added. There `fast` already applies fast4 + chunk16 and the composition
-    // fast4 + chunk16 + skf1 has no joint gate receipt (G1 measured split-K alone, FAST-before == EXACT). Condition to add
-    // {"split_k", Weights::nvfp4_rtn, Route::large_prefill, 0, ...}: a composition gate of that bundle against fast4 + chunk16.
+    // Decode CLI (large prefill) row: NOT added. There `fast` already applies fast4 + chunk16tc and the composition
+    // fast4 + chunk16tc + skf1 has no joint gate receipt (G1 measured split-K alone, FAST-before == EXACT). Condition to add
+    // {"split_k", Weights::nvfp4_rtn, Route::large_prefill, 0, ...}: a composition gate of that bundle against fast4 + chunk16tc.
 };
 
 inline bool offered(std::string_view lever, Route route) {
