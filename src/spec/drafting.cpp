@@ -142,6 +142,16 @@ Arbiter::Arbiter(ArbiterConfig config) : config_(std::move(config)) {
     for (auto& c : cost_) { c.ms.assign(w.back() + 1, 0.0); c.weight.assign(w.back() + 1, 0.0); c.seed.assign(w.back() + 1, 0.0); }
 }
 
+void Arbiter::reset_observations() {
+    Arbiter fresh(config_);
+    for (std::size_t b = 0; b < cost_.size(); ++b) {
+        fresh.cost_[b].seed = std::move(cost_[b].seed);
+        fresh.cost_[b].seed_lo = cost_[b].seed_lo;
+        fresh.cost_[b].seed_hi = cost_[b].seed_hi;
+    }
+    *this = std::move(fresh);
+}
+
 std::uint32_t Arbiter::physical(std::uint32_t rows) const {
     for (const auto w : config_.windows)
         if (w >= rows) return w;

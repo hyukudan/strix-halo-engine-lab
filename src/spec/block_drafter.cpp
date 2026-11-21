@@ -34,6 +34,25 @@ BlockDrafter::BlockDrafter(BlockConfig config, ChainDrafter* chain)
 
 double BlockDrafter::now_ms() const { return config_.clock_ms(); }
 
+void BlockDrafter::set_row_rule(const RowRule& rule) {
+    if (sampled_ != rule.sampled()) {
+        arbiter_.reset_observations();
+        ext_ = {};
+        sib_q_ = {};
+        gap_q_ = {};
+        gain_pred_ = gain_real_ = 0.0;
+        lin_wall_ = {};
+        tree_wall_ = {};
+        sur_ = {};
+        std::fill(chain_w_.begin(), chain_w_.end(), 0.0);
+        step_learned_ = false;
+        step_ms_ = config_.chain_seed_step_ms;
+        run_tok_ = run_ms_ = 0.0;
+        sampled_ = rule.sampled();
+    }
+    if (chain_) chain_->set_row_rule(rule);
+}
+
 double BlockDrafter::chain_ms(std::uint32_t steps) const {
     steps = std::clamp<std::uint32_t>(steps, 1, chain_steps_cap);
     if (config_.fixed_costs) return config_.chain_seed_flush_ms + config_.chain_seed_step_ms * double(steps - 1);
@@ -74,6 +93,7 @@ void BlockDrafter::learn_chain_ms(std::uint32_t steps, double ms) {
 Block BlockDrafter::next(const StepParams& params, const PrelaunchFn* launch) {
     // Every chain call of this block: the pre-launch form when the caller asked for it and the chain supports it.
     const auto chain_draft = [&](std::span<const std::uint32_t> prefix, std::uint32_t k, std::vector<std::uint32_t>& out) {
+        if (sampled_) chain_->set_first_position(params.context + 1);
         if (launch == nullptr || !chain_->draft_prelaunch(prefix, k, out, *launch)) chain_->draft(prefix, k, out);
     };
     Block b;
@@ -441,10 +461,20 @@ void RoundTraceWriter::round(const RoundRecord& r) {
     ++records_;
 }
 
+void BlockSpeculator::set_row_rule(const RowRule& rule) {
+    drafter_.set_row_rule(rule);
+    target_.set_row_rule(rule);
+    row_rule_ = rule;
+}
+
 StepRecord BlockSpeculator::step(std::vector<std::uint32_t>& out, const StepParams& params) {
     StepRecord r;
+    if (params.remaining == 0 || params.max_rows == 0) return r;
+    const bool sampled = row_rule_.sampled();
+    const bool serial_sampled = sampled && !target_.supports_row_rule(true);
+    if (sampled) target_.set_first_position(params.context + 1);
     StepParams p = params;
-    p.tree_rows = target_.tree_rows();
+    p.tree_rows = serial_sampled ? 0 : target_.tree_rows();
     // Verify pre-launch: the target enqueues the verify of [anchor, host prefix, device drafts] inside the chain call,
     // before the drafted ids are read back (the host launch overlaps the GPU draft). launched_rows = its row count.
     // A tree target (p.tree_rows > 0) is not pre-launched: the drafter places sibling rows only after the chain ids are
@@ -456,7 +486,8 @@ StepRecord BlockSpeculator::step(std::vector<std::uint32_t>& out, const StepPara
         host_rows_.insert(host_rows_.end(), prefix.begin(), prefix.end());
         if (target_.verify_launch_fed(host_rows_, feed)) launched_rows = host_rows_.size() + feed.k;
     };
-    auto block = drafter_.next(p, (prelaunch_ && p.tree_rows == 0) ? &launch : nullptr);
+    // Pre-launch currently carries engine-owned argmax ids. Sampled verification uses the host row hook.
+    auto block = serial_sampled ? Block{} : drafter_.next(p, (prelaunch_ && !sampled && p.tree_rows == 0) ? &launch : nullptr);
     if (block.decision.rows == 0) {
         if (launched_rows != 0) throw std::logic_error("block speculator: verify pre-launched for an empty block");
         return r;
@@ -468,7 +499,11 @@ StepRecord BlockSpeculator::step(std::vector<std::uint32_t>& out, const StepPara
         rows_.assign(1, anchor_);
         rows_.insert(rows_.end(), block.drafts.begin(), block.drafts.end());
         const double t0 = drafter_.now_ms();
-        if (launched_rows != 0) {
+        if (serial_sampled) {
+            const auto logits = target_.verify_serial_logits(anchor_);
+            if (logits.empty()) throw std::logic_error("block speculator: sampled serial decode requires target host logits");
+            greedy_.assign(1, row_rule_.row_token(logits, params.context + 1));
+        } else if (launched_rows != 0) {
             if (launched_rows != rows_.size()) throw std::logic_error("block speculator: pre-launched verify has the wrong row count");
             target_.verify_collect(rows_, greedy_);
             ++prelaunched_;

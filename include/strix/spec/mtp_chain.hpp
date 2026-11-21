@@ -93,6 +93,7 @@ public:
     }
     MtpChain(const MtpChain&) = delete;
     MtpChain& operator=(const MtpChain&) = delete;
+    void set_row_rule(const RowRule& rule) override { rule_ = rule; }
 
     // New sequence (the engine is reset by the caller): forget the MTP positions.
     void reset() {
@@ -124,7 +125,7 @@ public:
         ru_.clear();  // runner-ups: device-fed drafts on an engine with the hook only
         gap_.clear();  // their gaps: an engine with the gap hook only
         if constexpr (MtpFeedEngine<Engine>) {
-            if (feed_ && std::size_t(k) + 1 <= Engine::kMtpFeedSlots) {
+            if (device_feed() && std::size_t(k) + 1 <= Engine::kMtpFeedSlots) {
                 draft_fed(prefix, k, out);
                 draft_wall_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                 ++drafts_;
@@ -132,7 +133,7 @@ public:
             }
         }
         if (!next_.empty()) flush();
-        // carry_ = MTP hidden after the last committed row; d1_ = its prediction (the token after the anchor's successor)
+        // carry_ = MTP hidden after the last committed row; d1_ predicts the token immediately after the anchor.
         std::uint32_t pos = mtp_pos_;  // speculative rows from here on are overwritten by the next flush
         std::uint32_t tok = d1_;       // chain token for the next step when there is no prefix
         for (std::size_t i = 0; i < prefix.size(); ++i)  // feed the copy tokens: only the last step's prediction is used
@@ -169,14 +170,14 @@ public:
     [[nodiscard]] double draft_wall_ms() const { return draft_wall_ms_; }
     // Device feed (on by default where the engine has the hooks); false = one synchronizing read per position (rollback).
     void set_device_feed(bool on) { feed_ = on; }
-    [[nodiscard]] bool device_feed() const { return MtpFeedEngine<Engine> && feed_; }
+    [[nodiscard]] bool device_feed() const { return MtpFeedEngine<Engine> && feed_ && !coupled_host_draft(); }
     [[nodiscard]] std::uint64_t host_reads() const { return reads_; }  // synchronizing id reads issued by the chain
     // Verify pre-launch: draft_fed() (same calls, same ids), with launch(prefix, feed) called after the draft is enqueued
     // and the ids' copy to host staging is queued, before waiting for that copy.
     bool draft_prelaunch(std::span<const std::uint32_t> prefix, std::uint32_t k, std::vector<std::uint32_t>& out,
                          const PrelaunchFn& launch) override {
         if constexpr (MtpPrelaunchEngine<Engine>) {
-            if (!feed_ || k == 0 || std::size_t(k) + 1 > Engine::kMtpFeedSlots || k > DraftFeed::kMax) return false;
+            if (!device_feed() || k == 0 || std::size_t(k) + 1 > Engine::kMtpFeedSlots || k > DraftFeed::kMax) return false;
             const auto t0 = std::chrono::steady_clock::now();
             out.clear();
             draft_fed(prefix, k, out, &launch);
@@ -203,6 +204,31 @@ public:
     [[nodiscard]] std::uint64_t kv_calls() const { return kv_calls_; }  // K/V-only catch-up calls (not in calls())
 
 private:
+    // Optional synchronized host read of one logical output row. ids is empty for the full vocabulary, or maps
+    // each compact logit to its token. Id-only engines keep deterministic drafts under sampling. Device-side
+    // coupled drafting belongs to the sampler owner's kernel (phase 2).
+    static constexpr bool has_draft_logits = requires(Engine& e, const MtpOut& out, std::uint32_t row,
+                                                     std::vector<float>& logits, std::vector<std::uint32_t>& ids) {
+        e.read_mtp_logits(out, row, logits, ids);
+    };
+    [[nodiscard]] bool coupled_host_draft() const { return has_draft_logits && rule_.sampled(); }
+
+    std::uint32_t read_draft(const MtpOut& out, std::uint32_t rows, std::uint64_t position) {
+        ++reads_;
+        if constexpr (has_draft_logits) {
+            if (rule_.sampled()) {
+                draft_logits_.clear();
+                draft_ids_.clear();
+                e_.read_mtp_logits(out, rows - 1, draft_logits_, draft_ids_);
+                return rule_.draft_token(draft_logits_, draft_ids_, position);
+            }
+        }
+        Rows ro{};
+        ro.top = out.top;
+        e_.read_top(ro, rows, top_tmp_);
+        return top_tmp_[rows - 1];
+    }
+
     // draft() over the device feed: the same mtp calls in the same order, ids read once at the end (DEVICE FEED above).
     // launch (pre-launch only): called once after the copy of the ids to host staging is queued, before the wait.
     void draft_fed(std::span<const std::uint32_t> prefix, std::uint32_t k, std::vector<std::uint32_t>& out,
@@ -320,11 +346,8 @@ private:
                     if (fed) e_.mtp_feed_put(0, m.top + (n - 1));
                 }
                 if (!fed) {
-                    Rows ro{};
-                    ro.top = m.top;
-                    e_.read_top(ro, n, top_tmp_);
-                    ++reads_;
-                    d1_ = top_tmp_[n - 1];
+                    // The final hidden row is mtp_pos_ - 1. MTP consumes its successor and predicts the following id.
+                    d1_ = read_draft(m, n, std::uint64_t(mtp_pos_) + 1);
                     d1_ru_ = kNoToken;  // host-read flush: no runner-up
                     d1_gap_ = -1.0f;
                 }
@@ -343,17 +366,15 @@ private:
         ++calls_;
         ++rows_;
         std::uint32_t t = 0;
-        if (want_top) {
-            Rows ro{};
-            ro.top = m.top;
-            e_.read_top(ro, 1, &t);
-            ++reads_;
-        }
+        if (want_top) t = read_draft(m, 1, std::uint64_t(pos) + 2);
         Dev::copy(e_, carry_, pre_ ? m.hidden_pre : m.hidden_post, hid_);
         return t;
     }
 
     Engine& e_;
+    RowRule rule_;
+    std::vector<float> draft_logits_;
+    std::vector<std::uint32_t> draft_ids_;
     bool pre_;
     std::uint32_t hid_, rows_max_, ring_n_;
     Rows last_{};

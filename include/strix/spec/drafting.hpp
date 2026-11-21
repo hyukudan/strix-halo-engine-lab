@@ -193,6 +193,8 @@ struct Outcome {
 class Arbiter {
 public:
     explicit Arbiter(ArbiterConfig config = {});
+    // Drop observations and pending predictions on a greedy/sampled transition. Keep the verify cost seeds.
+    void reset_observations();
     // Engine's tabled verify wall at `rows`: the shape of the cost curve; measured walls set its scale and replace
     // the seed where measured. context: the bin to seed; the default seeds every bin.
     void seed_cost(std::uint32_t rows, double ms, std::uint64_t context = ~0ULL);

@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -129,6 +130,10 @@ public:
 
     void read_top(const HipRowsOut& o, std::uint32_t rows, std::uint32_t* host) const;  // synchronizes
     void read_logits(const HipRowsOut& o, std::uint32_t rows, float* host) const;       // [rows][vocab], synchronizes
+    void read_logits_rows(const HipRowsOut& o, std::uint32_t rows, float* host) const {
+        if (!o.logits) throw std::logic_error("qwen35 verify: sampled rows require full logits");
+        read_logits(o, rows, host);
+    }
     void sync() const;
 
     // MTP layer (blk.<layers>.* of a side GGUF: attn_norm, post_attention_norm, ffn_*, attn_q/k/v/output, q/k norms, nextn.enorm /

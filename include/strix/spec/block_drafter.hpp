@@ -1,7 +1,7 @@
 #pragma once
 
 // Block drafting on the shared drafting layer: ONE linear block per verify step, built from mixed sources, verified
-// exactly (greedy longest prefix) by any target that can run R rows and commit a prefix.
+// exactly (longest matching prefix) by any target that can run R rows and commit a prefix.
 // Home: shared (strix::spec, model-agnostic: emitted ids + measured walls only; no engine, GGUF or device types).
 //
 // Sources of the block (the Arbiter of drafting.hpp picks copy vs chain and the window from measured costs; the
@@ -12,8 +12,8 @@
 //           drafts `ext` more tokens. Used only when the copy proposal ended below the window and the extension's
 //           expected gain per ms beats the copy-only block.
 // Exactness: drafts are arbitrary ids. BlockSpeculator verifies [anchor, drafts...] in one target pass, accepts the
-// longest prefix equal to the target's greedy rows, emits accepted drafts + the target's next token (the bonus or the
-// correction) and commits accepted + 1 rows. Emitted ids equal serial greedy decode for ANY block.
+// longest prefix equal to the target's row tokens, emits accepted drafts + the target's next token (the bonus or the
+// correction) and commits accepted + 1 rows. Emitted ids equal serial decode under the request's rule for ANY block.
 //
 // VERIFY PRE-LAUNCH (scheduling only; same kernels, operands and stream order, so the bits are unchanged): a chain that
 // keeps its drafted ids on the device (engine feed slots) lets the target ENQUEUE the verify of [anchor, drafts] right
@@ -49,6 +49,7 @@
 #include <vector>
 
 #include "strix/spec/drafting.hpp"
+#include "strix/spec/row_rule.hpp"
 
 namespace strix::spec {
 
@@ -68,6 +69,10 @@ using PrelaunchFn = std::function<void(std::span<const std::uint32_t> prefix, co
 class ChainDrafter {
 public:
     virtual ~ChainDrafter() = default;
+    // Optional coupled drafting. Deterministic proposals remain valid under either rule.
+    virtual void set_row_rule(const RowRule&) {}
+    // Position predicted by the anchor, before any copy prefix is fed to draft().
+    virtual void set_first_position(std::uint64_t) {}
     // Writes `k` tokens that follow (stream + prefix) into `out`; prefix = tokens a copy source supplies (the
     // chain state is advanced through them). Must not change committed target state; its own speculative state is
     // overwritten by accept().
@@ -138,7 +143,7 @@ struct BlockConfig {
 struct StepParams {
     std::uint32_t remaining = ~0U;  // tokens left in the budget
     std::uint32_t max_rows = ~0U;   // legal rows this step (context room)
-    std::uint64_t context = 0;      // committed positions (cost bin)
+    std::uint64_t context = 0;      // committed positions (cost bin); the uncommitted anchor is at context
     std::uint32_t tree_rows = 0;    // widest tree window of the target (0: linear only; BlockSpeculator sets it)
     std::optional<std::uint32_t> eos{};  // emit this selection without consuming its draft row
 };
@@ -185,7 +190,7 @@ static_assert(kSiblingGapBuckets == std::tuple_size_v<decltype(SpecStats::siblin
     return b;
 }
 
-// Walk of a verified tree: from the anchor, follow the child row whose token equals the target's greedy at the current
+// Walk of a verified tree: from the anchor, follow the child row whose token equals the target's token at the current
 // row (chain node first; a sibling is a leaf). path = rows taken (path[0] = 0); emitted = their tokens after the anchor
 // + the target's token after the last row; main = chain drafts accepted; sibling = the path ends on a sibling row.
 struct TreeAccept {
@@ -199,6 +204,7 @@ TreeAccept accept_tree(const TreeRows& rows, std::span<const std::uint32_t> gree
 class BlockDrafter {
 public:
     explicit BlockDrafter(BlockConfig config = {}, ChainDrafter* chain = nullptr);
+    void set_row_rule(const RowRule& rule);
     // Emitted stream tokens in order, once each (prompt first; the anchor is part of the stream).
     void commit(std::span<const std::uint32_t> tokens) { proposer_.commit(tokens); }
     // Engine's tabled verify wall at `rows` (shape of the cost curve; measured walls rescale it).
@@ -229,6 +235,7 @@ private:
     ChainDrafter* chain_;
     ContextProposer proposer_;
     Arbiter arbiter_;
+    bool sampled_ = false;
     Proposal proposal_;
     SpecStats stats_;
     std::vector<double> chain_ms_, chain_w_;  // [steps] measured EWMA
@@ -268,7 +275,17 @@ public:
 class VerifyTarget {
 public:
     virtual ~VerifyTarget() = default;
-    // tokens[0] = anchor (last emitted token, not yet in the target). greedy[i] = argmax after row i (size == tokens).
+    virtual void set_row_rule(const RowRule&) {}
+    [[nodiscard]] virtual bool supports_row_rule(bool sampled) const { return !sampled; }
+    // Position predicted by the anchor (StepParams::context + 1); targets may use their own committed count.
+    virtual void set_first_position(std::uint64_t) {}
+    // Serial fallback for targets that cannot sample windows. Forward the anchor and return its host logits.
+    // The row must be available for commit(1) after the caller samples it.
+    virtual std::span<const float> verify_serial_logits(std::uint32_t) {
+        throw std::logic_error("block speculator: sampled serial decode requires target host logits");
+    }
+    // tokens[0] = anchor (last emitted token, not yet in the target). greedy[i] is the target's token after
+    // row i under the request's RowRule (argmax at temperature 0). Size == tokens.
     virtual void verify(std::span<const std::uint32_t> tokens, std::vector<std::uint32_t>& greedy) = 0;
     // Accept the first k rows of the last verify (1 <= k <= rows); the rest is rolled back.
     virtual void commit(std::uint32_t k) = 0;
@@ -288,7 +305,8 @@ public:
     // Token-tree rows (optional). 0 = linear windows only (verify_tree / commit_path are never called).
     [[nodiscard]] virtual std::uint32_t tree_rows() const { return 0; }
     // rows.tokens[r] at stream position committed + rows.depth[r], attending the committed prefix and its ancestor rows
-    // (rows.parent); greedy[r] = argmax after row r. Must give each row the bits a linear window of its path gives.
+    // (rows.parent); greedy[r] is the target's token under the rule at committed + depth[r] + 1.
+    // Must give each row the bits a linear window of its path gives.
     virtual void verify_tree(const TreeRows& rows, std::vector<std::uint32_t>& greedy) {
         (void)rows;
         (void)greedy;
@@ -311,7 +329,7 @@ struct StepRecord {
     double verify_ms = 0.0, draft_ms = 0.0;
 };
 
-// One verify round of BlockSpeculator (the rollout record): what was drafted, the target's greedy id at EVERY verified row
+// One verify round of BlockSpeculator (the rollout record): what was drafted, the target's id at EVERY verified row
 // (the rejected rows included) and what was emitted (= drafts[0, accepted) + greedy[accepted]). The spans are valid only
 // during RoundSink::round. Recording never changes a decision: the sink sees the round after commit.
 struct RoundRecord {
@@ -351,7 +369,9 @@ private:
 
 class BlockSpeculator {
 public:
-    BlockSpeculator(BlockDrafter& drafter, VerifyTarget& target) : drafter_(drafter), target_(target) {}
+    BlockSpeculator(BlockDrafter& drafter, VerifyTarget& target, const RowRule& rule = {})
+        : drafter_(drafter), target_(target) { set_row_rule(rule); }
+    void set_row_rule(const RowRule& rule);
     // anchor = last emitted token (already committed to the drafter's stream, NOT in the target).
     void start(std::uint32_t anchor) { anchor_ = anchor; }
     // Verify pre-launch (see the top of this file). Bits unchanged; off by default until its timing receipt.
@@ -367,6 +387,7 @@ public:
 private:
     BlockDrafter& drafter_;
     VerifyTarget& target_;
+    RowRule row_rule_;
     RoundSink* sink_ = nullptr;
     std::uint32_t anchor_ = 0;
     std::vector<std::uint32_t> rows_, greedy_, host_rows_;
