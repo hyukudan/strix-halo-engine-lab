@@ -18,6 +18,7 @@
 
 #include "strix/cuda/ds41_parts_host_driver.hpp"
 #include "strix/ds41_hot_placement.hpp"
+#include "strix/residency/expert_residency.hpp"
 
 #include <cuda_runtime.h>
 
@@ -68,12 +69,7 @@ struct HotResidencyOptions {
     unsigned load_threads = 8;                       // layers loaded in parallel
 };
 
-struct HotRefillStats {
-    std::uint32_t remote = 0;      // remote (layer, expert) of the token at the layers seen so far
-    std::uint32_t dynamic_hits = 0;
-    std::uint32_t copies = 0;      // enqueued
-    std::uint32_t not_in_source = 0, over_budget = 0, no_slot = 0;
-};
+using HotRefillStats = residency::RefillStats;
 
 class HotResidency {
 public:
@@ -93,7 +89,7 @@ public:
     // Starts a token: resets the per-token copy budget and the stats.
     void begin_token();
     void set_copies_per_token(std::uint32_t n) noexcept { copies_per_token_ = n; }
-    [[nodiscard]] const HotRefillStats& token_stats() const noexcept { return stats_; }
+    [[nodiscard]] const HotRefillStats& token_stats() const noexcept { return refill_policy_.stats(); }
     // `stream` waits for the dynamic copies of `layer` enqueued by the previous token (no-op if none).
     void before_layer(std::uint32_t layer, cudaStream_t stream);
     // After PartsHost::run_layer of `layer` (R1 window, ids in router order on the host): marks the dynamic slots the
@@ -114,10 +110,8 @@ private:
     std::vector<std::unique_ptr<Layer>> layers_;  // [placement layers], null if not held
     MoeShape shape_;
     std::uint32_t copies_per_token_ = 0;
-    std::uint64_t token_ = 0;
     cudaStream_t refill_ = nullptr;
-    HotRefillStats stats_;
-    std::uint32_t copies_left_ = 0;
+    residency::ExpertRefill refill_policy_;
     std::uint64_t device_bytes_ = 0, source_bytes_ = 0;
     std::vector<void*> source_chunks_;
     std::uint32_t* required_ = nullptr;  // mapped pinned [layers]

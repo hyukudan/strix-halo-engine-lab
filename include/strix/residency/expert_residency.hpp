@@ -9,8 +9,10 @@
 // maps it. Planner::table(layer)[expert] is the slot or -1 (the adapter routes -1 to the CPU / zero slot).
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -147,6 +149,39 @@ private:
     std::vector<std::vector<std::uint8_t>> used_;         // observed in the current (or just ended) step
     bool ended_ = true;
     Receipt rc_;
+};
+
+struct RefillStats {
+    std::uint32_t remote = 0, dynamic_hits = 0, copies = 0;
+    std::uint32_t not_in_source = 0, over_budget = 0, no_slot = 0;
+    std::uint32_t evictions = 0;
+    std::uint64_t copied_bytes = 0;
+};
+
+struct RefillLayer {
+    std::size_t static_slots;
+    std::span<std::int32_t> slot_of;       // expert -> slot or -1
+    std::span<std::int32_t> occupants;     // dynamic slot -> expert or -1
+    std::span<std::uint64_t> last_used;   // same indexing as occupants
+    std::span<const std::uint8_t* const> sources; // expert -> source or null
+    std::uint64_t expert_bytes;
+};
+
+// Refill in route order, within one token-wide copy budget. The adapter
+// supplies its device wait and copy operations and publishes the table after
+// apply() returns true. All routed hits are marked before choosing any victim.
+class ExpertRefill {
+public:
+    void begin_token(std::uint32_t copy_budget) noexcept;
+    [[nodiscard]] const RefillStats& stats() const noexcept { return stats_; }
+    bool apply(RefillLayer layer, std::span<const std::uint32_t> ids,
+               const std::function<void()>& wait,
+               const std::function<void(std::size_t, const std::uint8_t*)>& copy);
+
+private:
+    std::uint64_t token_ = 0;
+    std::uint32_t copies_left_ = 0;
+    RefillStats stats_;
 };
 
 }  // namespace strix::residency

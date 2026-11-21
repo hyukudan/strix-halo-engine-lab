@@ -385,7 +385,6 @@ add_library(strix_core STATIC
     src/projection_reduction.cpp
     src/ple_lookup.cpp
     src/ple_reclaim.cpp
-    src/ple_direct.cpp
     src/ple_rolling.cpp
     src/ple_workspace.cpp
     src/rtx_state_import.cpp

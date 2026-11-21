@@ -19,6 +19,7 @@
 using namespace strix::ple_reclaim;
 namespace {
 void require(bool b, const char* why) { if (!b) throw std::runtime_error(why); }
+#if defined(__linux__)
 template<class F> void refuses(F f) {
     bool caught = false;
     try { f(); } catch (const std::exception&) { caught = true; }
@@ -286,6 +287,29 @@ void ring_faults() {
     tail.ensure(std::array<std::uint64_t,2>{0,1},false); check_row(tail,page+47U);
     refuses([&] { check_row(tail,page+48U); });
 }
+void backend_fallback_bytes() {
+    // All backends work on the same aligned runs. The CQ seam gives a stable
+    // comparison even on a host whose kernel refuses io_uring setup.
+    const auto read = synthetic();
+    DirectPageCache ring(-1, 16U * page, page, 4U * page, read, {0, true});
+    const std::array<std::uint64_t, 4> pages{4, 2, 3, 4};
+    require(ring.ensure(pages, false) == 3U, "ring reserves each page once");
+    std::array<std::byte, 2U * page> expected{};
+    ring.copy(2U * page + 19U, expected);
+    const auto reference = ring.stats();
+    require(reference.reads == 2U && reference.bytes == 4U * page, "probe and one coalesced read");
+    for (const int code : {ENOSYS, EPERM, EINVAL}) {
+        DirectPageCache pool(-1, 16U * page, page, 4U * page, read, {code, false});
+        require(std::strcmp(pool.reader(), "pread-pool") == 0 && pool.fallback_errno() == code,
+                "typed setup fallback selects the worker pool");
+        require(pool.ensure(pages, false) == 3U, "pool reserves the same pages");
+        std::array<std::byte, 2U * page> actual{};
+        pool.copy(2U * page + 19U, actual);
+        const auto receipt = pool.stats();
+        require(actual == expected && receipt.reads == reference.reads && receipt.bytes == reference.bytes,
+                "backend fallback preserves bytes and read accounting");
+    }
+}
 void block_order() {
     constexpr std::uint64_t block=1024, cap=4096U*page;
     auto cache=std::make_shared<DirectPageCache>(-1,8192U*page,page,cap,synthetic(),DirectPageCache::TestRing{0,true});
@@ -393,7 +417,6 @@ void adaptive_replay() {
     require(!touched && manager->healthy(),"invalid or incomplete horizons refuse before touch");
     turn->finish(); require(cache->stats().used_bytes==0,"adaptive/replay turn drains all sources");
 }
-#if defined(__linux__)
 void filesystem() {
     char path[]="/tmp/strix-ple-direct-XXXXXX";
     const int fd=::mkstemp(path);
@@ -414,11 +437,24 @@ void filesystem() {
     ::unlink(path);
     if (supported) {
         DirectPageCache cache(direct,bytes.size(),page,1024U*page);
+        const int fallback_fd = ::dup(direct);
+        require(fallback_fd >= 0, "duplicate direct descriptor for fallback comparison");
+        DirectPageCache fallback(fallback_fd, bytes.size(), page, 128U * page, {}, {EPERM, false});
+        require(std::strcmp(fallback.reader(), "pread-pool") == 0 && fallback.fallback_errno() == EPERM,
+                "forced native fallback retains the direct descriptor");
         std::vector<std::uint64_t> pages(128);
         for (std::size_t i=0; i<pages.size(); ++i) pages[i]=i;
         const auto probes = cache.stats().reads;
         cache.ensure(pages,false); check_row(cache,page-43);
         require(cache.stats().reads==probes+4,"real O_DIRECT coalesced reads");
+        const auto fallback_probes = fallback.stats().reads;
+        fallback.ensure(pages, false);
+        require(fallback.stats().reads == fallback_probes + 4U, "fallback uses the same native read ranges");
+        std::vector<std::byte> selected_bytes(128U * page), fallback_bytes(selected_bytes.size());
+        cache.copy(0, selected_bytes);
+        fallback.copy(0, fallback_bytes);
+        require(fallback_bytes == selected_bytes && std::equal(selected_bytes.begin(), selected_bytes.end(), bytes.begin()),
+                "native primary reader and forced pread fallback agree with fixture bytes");
         cache.erase(pages);
         std::vector<std::uint64_t> sparse(1024);
         for (std::size_t i=0; i<sparse.size(); ++i) sparse[i]=i*2U;
@@ -441,10 +477,15 @@ void filesystem() {
 }
 int main() {
     try {
-        setup_prime(); logic_and_faults(); concurrent_reads(); critical_order(false); critical_order(true);
-        queued_promotion(); ring_faults(); block_order(); owned_decode_lru(); adaptive_replay();
 #if defined(__linux__)
+        setup_prime(); logic_and_faults(); concurrent_reads(); critical_order(false); critical_order(true);
+        queued_promotion(); ring_faults(); backend_fallback_bytes(); block_order(); owned_decode_lru(); adaptive_replay();
         filesystem();
+#else
+        bool refused = false;
+        try { DirectPageCache unsupported(-1, 4096, 4096, 4096); }
+        catch (const DirectUnsupported&) { refused = true; }
+        require(refused, "direct reader must refuse before I/O on this platform");
 #endif
         std::cout << "PLE direct CPU tests passed\n";
         return 0;

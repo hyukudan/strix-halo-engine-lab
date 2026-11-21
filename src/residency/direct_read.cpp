@@ -1,4 +1,4 @@
-#include "strix/ple_direct.hpp"
+#include "strix/residency/direct_read.hpp"
 
 #include <algorithm>
 #include <array>
@@ -27,7 +27,7 @@
 #include <unistd.h>
 #endif
 
-namespace strix::ple_reclaim {
+namespace strix::residency {
 namespace {
 thread_local bool background_read = false;
 thread_local DirectActivity* read_activity = nullptr;
@@ -633,4 +633,4 @@ DirectStats DirectPageCache::stats() const {
 }
 bool DirectPageCache::healthy() const { const std::lock_guard lock(impl_->mutex); return !impl_->error; }
 
-} // namespace strix::ple_reclaim
+} // namespace strix::residency

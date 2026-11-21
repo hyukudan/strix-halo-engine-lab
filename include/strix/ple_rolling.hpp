@@ -18,7 +18,6 @@
 #include <exception>
 
 namespace strix::ple_reclaim {
-class DirectPageCache;
 
 // Zero selects the historical prompt-wide planner. Invalid tuning fails closed.
 [[nodiscard]] std::uint64_t rolling_positions(const char* rolling, const char* exact_memory, const char* positions);

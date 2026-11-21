@@ -1,6 +1,7 @@
 #include "strix/residency/expert_residency.hpp"
 
 #include "strix/env_flags.hpp"
+#include "strix/residency/replacement.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -8,7 +9,9 @@
 #include <cstdlib>
 #include <numeric>
 #include <limits>
+#include <ranges>
 #include <stdexcept>
+#include <utility>
 
 namespace strix::residency {
 namespace {
@@ -407,6 +410,60 @@ Receipt Planner::receipt() const {
         for (std::uint32_t s = 0; s < slots_; ++s)
             if (slot_expert_[l][s] >= 0) r.resident_bytes += bytes_[l];
     return r;
+}
+
+void ExpertRefill::begin_token(std::uint32_t copy_budget) noexcept {
+    ++token_;
+    stats_ = {};
+    copies_left_ = copy_budget;
+}
+
+bool ExpertRefill::apply(RefillLayer layer, std::span<const std::uint32_t> ids,
+                         const std::function<void()>& wait,
+                         const std::function<void(std::size_t, const std::uint8_t*)>& copy) {
+    std::vector<std::uint32_t> misses;
+    for (const auto expert : ids) {
+        const auto slot = layer.slot_of[expert];
+        if (slot >= static_cast<std::int32_t>(layer.static_slots)) {
+            ++stats_.dynamic_hits;
+            layer.last_used[static_cast<std::size_t>(slot) - layer.static_slots] = token_;
+        } else if (slot < 0) {
+            ++stats_.remote;
+            misses.push_back(expert);
+        }
+    }
+    if (misses.empty() || layer.occupants.empty()) return false;
+
+    using Rank = std::pair<bool, std::uint64_t>; // empty before occupied; then oldest
+    constexpr Rank empty{false, 0};
+    const auto slots = std::views::iota(std::size_t{0}, layer.occupants.size());
+    bool copied = false;
+    for (const auto expert : misses) {
+        const auto* source = layer.sources[expert];
+        if (!source) { ++stats_.not_in_source; continue; }
+        if (!copies_left_) { ++stats_.over_budget; continue; }
+        const auto candidate = select_victim(slots.begin(), slots.end(), empty, [&](std::size_t slot) -> std::optional<Rank> {
+            if (layer.occupants[slot] < 0) return empty;
+            if (layer.last_used[slot] < token_) return Rank{true, layer.last_used[slot]};
+            return std::nullopt;
+        });
+        if (candidate == slots.end()) { ++stats_.no_slot; continue; }
+        if (!copied) wait();
+        const auto victim = *candidate;
+        const auto old_expert = layer.occupants[victim];
+        if (old_expert >= 0) layer.slot_of[static_cast<std::size_t>(old_expert)] = -1;
+        const auto slot = layer.static_slots + victim;
+        copy(slot, source);
+        layer.occupants[victim] = static_cast<std::int32_t>(expert);
+        layer.last_used[victim] = token_;
+        layer.slot_of[expert] = static_cast<std::int32_t>(slot);
+        ++stats_.copies;
+        stats_.copied_bytes += layer.expert_bytes;
+        if (old_expert >= 0) ++stats_.evictions;
+        --copies_left_;
+        copied = true;
+    }
+    return copied;
 }
 
 }  // namespace strix::residency

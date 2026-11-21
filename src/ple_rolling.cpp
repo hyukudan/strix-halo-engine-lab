@@ -1,5 +1,6 @@
 #include "strix/ple_rolling.hpp"
 #include "strix/ple_direct.hpp"
+#include "strix/residency/replacement.hpp"
 #include <algorithm>
 #include <charconv>
 #include <iterator>
@@ -392,12 +393,11 @@ void RollingPipeline::source(std::span<const std::uint64_t> rows, const std::fun
             if (extra > decode_allowance_ / page_)
                 throw std::runtime_error("PLE rolling: source wave exceeds owned decode quota");
             while (extra > decode_allowance_ / page_ - decode_.size()) {
-                auto victim = decode_lru_.end();
-                for (auto it = decode_lru_.end(); it != decode_lru_.begin();) {
-                    --it;
-                    if (refs_.at(*it) == 1U && !std::binary_search(p.begin(), p.end(), *it)) { victim = it; break; }
-                }
-                if (victim == decode_lru_.end()) throw std::runtime_error("PLE rolling: owned decode quota held by readers");
+                const auto oldest = residency::select_oldest(decode_lru_.rbegin(), decode_lru_.rend(), [&](auto page) {
+                    return refs_.at(page) == 1U && !std::binary_search(p.begin(), p.end(), page);
+                });
+                if (oldest == decode_lru_.rend()) throw std::runtime_error("PLE rolling: owned decode quota held by readers");
+                const auto victim = std::prev(oldest.base());
                 const auto pg = *victim;
                 decode_lru_index_.erase(pg); decode_lru_.erase(victim); decode_.erase(pg);
                 release(Pages{pg});
@@ -659,12 +659,11 @@ void ResidencyManager::source(std::uint64_t id, std::uintptr_t table, std::uint6
         if (uncached) *uncached = needed.size();
         const bool refresh = s.cache.size() + needed.size() > capacity;
         while (s.cache.size() + needed.size() > capacity) {
-            auto victim = s.lru.end();
-            for (auto it = s.lru.end(); it != s.lru.begin();) {
-                --it;
-                if (!s.sources.contains(*it) && !std::binary_search(p.begin(), p.end(), *it)) { victim = it; break; }
-            }
-            if (victim == s.lru.end()) throw std::runtime_error("PLE residency: in-flight sources exhaust reserved quota");
+            const auto oldest = residency::select_oldest(s.lru.rbegin(), s.lru.rend(), [&](auto page) {
+                return !s.sources.contains(page) && !std::binary_search(p.begin(), p.end(), page);
+            });
+            if (oldest == s.lru.rend()) throw std::runtime_error("PLE residency: in-flight sources exhaust reserved quota");
+            const auto victim = std::prev(oldest.base());
             const auto pg = *victim; s.cache.erase(pg); s.lru.erase(victim); release(Pages{pg});
         }
         if (refresh) { ++stats_.epochs; sample(); }

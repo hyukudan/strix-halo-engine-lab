@@ -9,7 +9,6 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
-#include <limits>
 #include <atomic>
 #include <mutex>
 #include <stdexcept>
@@ -329,9 +328,7 @@ void HotResidency::reset_dynamic() {
 }
 
 void HotResidency::begin_token() {
-    ++token_;
-    stats_ = {};
-    copies_left_ = copies_per_token_;
+    refill_policy_.begin_token(copies_per_token_);
 }
 
 void HotResidency::before_layer(std::uint32_t l, cudaStream_t stream) {
@@ -355,33 +352,9 @@ void HotResidency::refill(std::uint32_t l, const std::uint32_t* ids, std::uint32
                           std::uint32_t sequence) {
     auto& lay = *layers_.at(l);
     const std::uint64_t gb = shape_.gate_expert_bytes(), db = shape_.down_expert_bytes();
-    // the slots this token used
-    std::vector<std::uint32_t> misses;
-    for (std::uint32_t k = 0; k < K; ++k) {
-        const auto e = ids[k];
-        const auto s = lay.rl.host_slot_of[e];
-        if (s >= static_cast<std::int32_t>(lay.statics)) {
-            ++stats_.dynamic_hits;
-            lay.dyn_used[static_cast<std::size_t>(s) - lay.statics] = token_;
-        } else if (s < 0) {
-            ++stats_.remote;
-            misses.push_back(e);
-        }
-    }
-    if (misses.empty() || !lay.dynamics) return;
-    bool waited = false, any = false;
-    for (const auto e : misses) {
-        if (!lay.source[e]) { ++stats_.not_in_source; continue; }
-        if (copies_left_ == 0) { ++stats_.over_budget; continue; }
-        // victim: an empty slot, else the least recently used slot not used by this token
-        std::size_t victim = lay.dynamics;
-        std::uint64_t oldest = std::numeric_limits<std::uint64_t>::max();
-        for (std::size_t d = 0; d < lay.dynamics; ++d) {
-            if (lay.dyn_expert[d] < 0) { victim = d; break; }
-            if (lay.dyn_used[d] < token_ && lay.dyn_used[d] < oldest) { oldest = lay.dyn_used[d]; victim = d; }
-        }
-        if (victim == lay.dynamics) { ++stats_.no_slot; continue; }
-        if (!waited) {
+    const bool any = refill_policy_.apply(
+        {lay.statics, lay.rl.host_slot_of, lay.dyn_expert, lay.dyn_used, lay.source, 2U * gb + db}, {ids, K},
+        [&] {
             // the table staging of the previous update must be consumed, and this token's layer done with the slots
             STRIX_CUDA_CHECK(cudaEventSynchronize(lay.refilled));
             if (done_flag_dev) {
@@ -391,21 +364,12 @@ void HotResidency::refill(std::uint32_t l, const std::uint32_t* ids, std::uint32
             } else {
                 STRIX_CUDA_CHECK(cudaStreamWaitEvent(refill_, layer_done, 0));
             }
-            waited = true;
-        }
-        if (lay.dyn_expert[victim] >= 0) lay.rl.host_slot_of[static_cast<std::size_t>(lay.dyn_expert[victim])] = -1;
-        const std::uint64_t slot = lay.statics + victim;
-        const auto* src = lay.source[e];
-        STRIX_CUDA_CHECK(cudaMemcpyAsync(lay.gate.get() + slot * gb, src, gb, cudaMemcpyHostToDevice, refill_));
-        STRIX_CUDA_CHECK(cudaMemcpyAsync(lay.up.get() + slot * gb, src + gb, gb, cudaMemcpyHostToDevice, refill_));
-        STRIX_CUDA_CHECK(cudaMemcpyAsync(lay.down.get() + slot * db, src + 2U * gb, db, cudaMemcpyHostToDevice, refill_));
-        lay.dyn_expert[victim] = static_cast<std::int32_t>(e);
-        lay.dyn_used[victim] = token_;
-        lay.rl.host_slot_of[e] = static_cast<std::int32_t>(slot);
-        ++stats_.copies;
-        --copies_left_;
-        any = true;
-    }
+        },
+        [&](std::size_t slot, const std::uint8_t* src) {
+            STRIX_CUDA_CHECK(cudaMemcpyAsync(lay.gate.get() + slot * gb, src, gb, cudaMemcpyHostToDevice, refill_));
+            STRIX_CUDA_CHECK(cudaMemcpyAsync(lay.up.get() + slot * gb, src + gb, gb, cudaMemcpyHostToDevice, refill_));
+            STRIX_CUDA_CHECK(cudaMemcpyAsync(lay.down.get() + slot * db, src + 2U * gb, db, cudaMemcpyHostToDevice, refill_));
+        });
     if (!any) return;
     std::copy(lay.rl.host_slot_of.begin(), lay.rl.host_slot_of.end(), lay.staging);
     STRIX_CUDA_CHECK(cudaMemcpyAsync(lay.d_slot_of.get(), lay.staging, shape_.experts * 4U, cudaMemcpyHostToDevice, refill_));
