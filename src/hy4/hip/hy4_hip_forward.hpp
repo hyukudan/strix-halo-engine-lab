@@ -107,11 +107,23 @@ public:
     // the tail steps are TP steps = the one-node steps (TP invariant): decode ids equal the one-node-primed run.
     [[nodiscard]] std::uint32_t window_rows(std::uint32_t prompt) const;
     [[nodiscard]] void* range_seam();
+    // resident (pair window ring, strix/pair/window_ring.hpp): the window's X rows stay in the forward's own rows between
+    // consecutive ranges of the SAME window ([0, a1), [a1, a2), ... in layer order, no other window in between): no seam
+    // copies, and the window's Engram rows are read ahead at its first range and released after its last.
     const std::vector<float>& range_window(std::span<const std::uint32_t> tokens, std::uint32_t start, std::uint32_t first_layer,
-                                           std::uint32_t last_layer, bool head);
+                                           std::uint32_t last_layer, bool head, bool resident = false);
+    // The prompt's window ids recorded at once (position 0 after reset(); `ids` = the window_rows(P) positions), so the
+    // range windows of a context split may run out of prompt order (the Engram hash reads the earlier ids).
+    void record_prompt(std::span<const std::uint32_t> ids);
     [[nodiscard]] std::uint64_t cache_bytes(std::uint32_t layer, std::uint32_t positions) const;
     void export_cache(std::uint32_t layer, std::uint32_t positions, std::span<std::byte> out);
     void import_cache(std::uint32_t layer, std::uint32_t positions, std::span<const std::byte> in);
+    // The layer's cache rows written by positions [p0, p1) only (every slot of them: latent rows / ring slots, indexer token
+    // ring slots, the group keys the range closes; p0, p1 multiples of the index ratio): the window ring's message.
+    // Synchronous host copies; the same piece order on both ranks.
+    [[nodiscard]] std::uint64_t rows_bytes(std::uint32_t layer, std::uint32_t p0, std::uint32_t p1) const;
+    void export_rows(std::uint32_t layer, std::uint32_t p0, std::uint32_t p1, std::span<std::byte> out);
+    void import_rows(std::uint32_t layer, std::uint32_t p0, std::uint32_t p1, std::span<const std::byte> in);
     void seat(std::uint32_t positions);
     void feed_prompt_hidden(const float* rows, std::uint32_t p0, std::uint32_t n);
     const std::vector<float>& prompt_tail(std::span<const std::uint32_t> tokens);

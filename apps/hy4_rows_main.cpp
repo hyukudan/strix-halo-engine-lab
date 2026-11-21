@@ -19,11 +19,14 @@
 //   [--tp-rank 0|1 [--tp-transport usb4auto|tcp-listen:PORT|tcp-connect:HOST:PORT]]: the same run on a tensor-parallel
 //     pair (each rank loads the whole pack): bench rows / plain steps on both ranks with their shares; --spec: rank 0
 //     drafts and decides, rank 1 replays its verify passes (FOLLOW line), ids compared with plain greedy on rank 0.
-//     [--prefill-route auto|stages|one]: how the pair primes a prompt. stages: the layer-stage pipeline of the shared
+//     [--prefill-route auto|stages|one|ring]: how the pair primes a prompt. stages: the layer-stage pipeline of the shared
 //     StageMap (default_stage_map) over the pair link on each rank's whole-model forward, the caches re-laid out for the
 //     TP decode (strix/pair/relayout.hpp), the drafter's teacher rows replayed, the tail as TP steps (one process, KV in
 //     place; bits = the one-node prime). one: every rank primes the whole prompt one-node (the previous form). auto
 //     (default): stages when relayout::stage_prime_wins (>= 2 full windows of >= 256 rows), else one. STAGES line: the split of the prime.
+//     ring: the context-parallel window ring (strix/pair/window_ring.hpp: window k on rank k % 2, every layer, the peer's
+//     cache rows of window k-1 before each layer; both ranks end with every row, no relayout; bits = the one-node prime;
+//     needs two windows). RING line: run / wait / load / save split and the bytes moved.
 #include "hy4/hip/hy4_hip_forward.hpp"
 #include "hy4/hip/hy4_hip_rows.hpp"
 #include "strix/spec/block_parallel.hpp"
@@ -34,6 +37,7 @@
 #include "strix/pair/link_mux.hpp"
 #include "strix/pair/relayout.hpp"
 #include "strix/pair/stage_map.hpp"
+#include "strix/pair/window_ring.hpp"
 #include "xport/hip_pipe_staging.hpp"
 #include "xport/tp_gather_hip.hpp"
 
@@ -121,6 +125,44 @@ void swap_words(strix::dist::Transport& t, unsigned rank, std::span<const std::b
         t.receive(peer);
         t.send(mine);
     }
+}
+
+// The end of a pair prime once every window's caches are on this rank: the drafter's teacher pass over the windows' rows
+// (host `hidden`, prompt order, as prefill() feeds them), position Pw, then the tail as TP steps (or the last window's
+// logits), the anchor.
+struct PrimeEnd {
+    std::uint32_t anchor = 0;
+    double block_ms = 0, tail_ms = 0;
+};
+PrimeEnd prime_end(hb::Forward& f, const std::vector<std::uint32_t>& prompt, hb::rows::MtpSource<hb::Forward>* mtp, std::uint32_t Pw,
+                   std::uint32_t W, const std::vector<strix::pair::layers::Window>& chunks, const std::vector<float>& hidden,
+                   std::vector<float>& logits) {
+    const double t0 = now_ms();
+    const std::size_t h = f.config().hidden;
+    const auto stream = static_cast<hipStream_t>(f.stream_handle());
+    if (mtp) mtp->install(prompt);  // position 0: the teacher rows' first position
+    f.seat(Pw);
+    if (mtp) {  // the block's teacher pass: the windows' rows in prompt order, as prefill() feeds them
+        float* dev = f.alloc_f32(std::size_t{W} * h);
+        try {
+            for (const auto& w : chunks) {
+                if (hipMemcpyAsync(dev, hidden.data() + std::size_t{w.start} * h, std::size_t{w.rows} * h * sizeof(float), hipMemcpyHostToDevice,
+                                   stream) != hipSuccess)
+                    throw std::runtime_error("pair prime: teacher rows upload");
+                f.feed_prompt_hidden(dev, w.start, w.rows);
+            }
+            f.sync();
+        } catch (...) {
+            f.free_f32(dev);
+            throw;
+        }
+        f.free_f32(dev);
+    }
+    const double t_block = now_ms();
+    if (Pw != prompt.size()) logits = f.prompt_tail(std::span<const std::uint32_t>(prompt).subspan(Pw));
+    const auto anchor = argmax(logits.data(), logits.size());
+    if (mtp) mtp->finish_prompt(anchor);
+    return {anchor, t_block - t0, now_ms() - t_block};
 }
 
 // The pair prime as layer stages on this rank's whole-model forward (both ranks, same point, same prompt): the windows
@@ -215,40 +257,116 @@ std::uint32_t prime_stages(hb::Forward& f, const std::vector<std::uint32_t>& pro
         }
     }
     const double t_hidden = now_ms();
-    if (mtp) mtp->install(prompt);  // position 0: the teacher rows' first position
-    f.seat(Pw);
-    if (mtp) {  // the block's teacher pass: the windows' rows in prompt order, as prefill() feeds them
-        float* dev = f.alloc_f32(std::size_t{W} * h);
-        try {
-            for (const auto& w : chunks) {
-                if (hipMemcpyAsync(dev, hidden.data() + std::size_t{w.start} * h, std::size_t{w.rows} * h * sizeof(float), hipMemcpyHostToDevice,
-                                   stream) != hipSuccess)
-                    throw std::runtime_error("--prefill-route stages: teacher rows upload");
-                f.feed_prompt_hidden(dev, w.start, w.rows);
-            }
-            f.sync();
-        } catch (...) {
-            f.free_f32(dev);
-            throw;
-        }
-        f.free_f32(dev);
-    }
-    const double t_block = now_ms();
-    if (!no_tail) logits = f.prompt_tail(std::span<const std::uint32_t>(prompt).subspan(Pw));
-    const auto anchor = argmax(logits.data(), logits.size());
-    if (mtp) mtp->finish_prompt(anchor);
+    const auto end = prime_end(f, prompt, mtp, Pw, W, chunks, hidden, logits);
     const double t_end = now_ms();
     std::printf("STAGES rank %u map %s windows %zu rows %u tail %u: stages %.1f relayout %.1f (sent %.1f MB, received %.1f MB) "
                 "teacher+logits %.1f block %.1f tail %.1f total %.1f ms\n",
                 rank, map.text().c_str(), chunks.size(), W, P - Pw, t_stages - t0, t_relayout - t_stages, static_cast<double>(rs.sent) / 1e6,
-                static_cast<double>(rs.received) / 1e6, t_hidden - t_relayout, t_block - t_hidden, t_end - t_block, t_end - t0);
-    return anchor;
+                static_cast<double>(rs.received) / 1e6, t_hidden - t_relayout, end.block_ms, end.tail_ms, t_end - t0);
+    return end.anchor;
+}
+
+// The pair prime as a context-parallel window ring (strix/pair/window_ring.hpp) on this rank's whole-model forward (both
+// ranks, same point, same prompt): window k of the one-node prompt plan runs on rank k % 2 through every layer (resident
+// range_window per layer); before layer L its rank loads the peer's layer-L cache rows of window k-1 (export_rows /
+// import_rows: every slot window k-1 wrote), and the last window's rows cross once more, so both ranks end with every
+// cache row: no relayout. Each window runs the one-node kernels on the one-node inputs: bits = the one-node prime at the
+// same rows. Each rank's own windows' teacher rows go to a drafting peer; the last window's head logits (no tail) to the
+// peer; the tail as TP steps.
+std::uint32_t prime_ring(hb::Forward& f, const std::vector<std::uint32_t>& prompt, hb::rows::MtpSource<hb::Forward>* mtp,
+                         const StagePrime& sp) {
+    namespace layers = strix::pair::layers;
+    namespace ring = strix::pair::ring;
+    const double t0 = now_ms();
+    auto& t = sp.gather->host_transport();
+    const unsigned rank = sp.rank;
+    f.reset();
+    const auto P = static_cast<std::uint32_t>(prompt.size());
+    const std::uint32_t Pw = f.window_rows(P), W = sp.rows;
+    const auto chunks = layers::windows(Pw, W);
+    if (chunks.size() < 2U) throw std::invalid_argument("--prefill-route ring: the prompt needs two full windows of --prompt-rows");
+    const std::size_t h = f.config().hidden;
+    const std::uint32_t L = f.config().layers;
+    const std::uint64_t identity = layers::fnv(
+        layers::fnv(14695981039346656037ULL, "hy4-ring|" + sp.pack + "|" + std::to_string(L) + "|" + std::to_string(W)),
+        std::span<const std::uint32_t>(prompt));
+    std::array<std::uint64_t, 2> mine{identity, mtp ? 1ULL : 0ULL}, peer{};
+    swap_words(t, rank, std::as_bytes(std::span(mine)), std::as_writable_bytes(std::span(peer)));
+    if (peer[0] != identity) throw std::runtime_error("--prefill-route ring: the ranks prime different requests");
+    const bool no_tail = Pw == P;
+    const std::size_t last = chunks.size() - 1U;
+    std::vector<float> hidden;
+    const auto stream = static_cast<hipStream_t>(f.stream_handle());
+    if (mtp || peer[1] != 0U) {
+        hidden.resize(std::size_t{Pw} * h);
+        f.set_prompt_hidden([&hidden, h, stream](const float* rows, std::uint32_t p0, std::uint32_t n) {
+            if (hipMemcpyAsync(hidden.data() + std::size_t{p0} * h, rows, std::size_t{n} * h * sizeof(float), hipMemcpyDeviceToHost, stream) !=
+                    hipSuccess ||
+                hipStreamSynchronize(stream) != hipSuccess)
+                throw std::runtime_error("--prefill-route ring: teacher rows read");
+        });
+    }
+    f.record_prompt(std::span<const std::uint32_t>(prompt.data(), Pw));
+    std::vector<float> logits;
+    ring::Ops ops;
+    ops.run = [&](std::size_t k, const layers::Window& w, std::uint32_t l) {
+        const bool head = no_tail && k == last && l + 1U == L;
+        const auto& lg = f.range_window(std::span<const std::uint32_t>(prompt.data() + w.start, w.rows), w.start, l, l + 1U, head, true);
+        if (head) logits = lg;
+    };
+    ops.bytes = [&f](const layers::Window& w, std::uint32_t l) { return static_cast<std::size_t>(f.rows_bytes(l, w.start, w.start + w.rows)); };
+    ops.save = [&f](const layers::Window& w, std::uint32_t l, std::span<std::byte> out) { f.export_rows(l, w.start, w.start + w.rows, out); };
+    ops.load = [&f](const layers::Window& w, std::uint32_t l, std::span<const std::byte> in) { f.import_rows(l, w.start, w.start + w.rows, in); };
+    ring::Stats rs;
+    {
+        strix::pair::LinkMux mux([&t](std::span<const std::byte> d) { t.send(d); }, [&t](std::span<std::byte> d) { t.receive(d); },
+                                 [&t](const std::string& why) { t.abort(why); }, 1U, std::size_t{16} << 20U);
+        const ring::Link lk{[&mux](std::span<const std::byte> d) { mux.send(0U, d); }, [&mux](std::span<std::byte> d) { mux.receive(0U, d); },
+                            [&mux](const std::string& why) { mux.abort(why); }};
+        rs = ring::prefill(chunks, L, rank, identity, lk, ops);
+        mux.close();
+    }
+    f.set_prompt_hidden({});
+    const double t_ring = now_ms();
+    // each rank's own windows' teacher rows to a drafting peer (rank 0 sends first: no crossing sends on the raw link)
+    const auto send_own = [&] {
+        for (std::size_t k = rank; k < chunks.size(); k += 2U)
+            t.send(std::as_bytes(std::span(hidden.data() + std::size_t{chunks[k].start} * h, std::size_t{chunks[k].rows} * h)));
+    };
+    const auto receive_peer = [&] {
+        for (std::size_t k = 1U - rank; k < chunks.size(); k += 2U)
+            t.receive(std::as_writable_bytes(std::span(hidden.data() + std::size_t{chunks[k].start} * h, std::size_t{chunks[k].rows} * h)));
+    };
+    if (rank == 0U) {
+        if (peer[1] != 0U) send_own();
+        if (mtp) receive_peer();
+    } else {
+        if (mtp) receive_peer();
+        if (peer[1] != 0U) send_own();
+    }
+    if (no_tail) {
+        if (rank == ring::owner(last)) t.send(std::as_bytes(std::span(logits)));
+        else {
+            logits.resize(f.config().vocab);
+            t.receive(std::as_writable_bytes(std::span(logits)));
+        }
+    }
+    const double t_hidden = now_ms();
+    const auto end = prime_end(f, prompt, mtp, Pw, W, chunks, hidden, logits);
+    const double t_end = now_ms();
+    std::printf("RING rank %u windows %zu (here %zu) rows %u tail %u: ring %.1f (run %.1f wait %.1f load %.1f save %.1f send-wait %.1f; "
+                "sent %.1f MB, received %.1f MB) teacher+logits %.1f block %.1f tail %.1f total %.1f ms\n",
+                rank, chunks.size(), rs.windows_here, W, P - Pw, t_ring - t0, rs.run_ms, rs.wait_ms, rs.load_ms, rs.save_ms, rs.send_wait_ms,
+                static_cast<double>(rs.sent) / 1e6, static_cast<double>(rs.received) / 1e6, t_hidden - t_ring, end.block_ms, end.tail_ms,
+                t_end - t0);
+    return end.anchor;
 }
 
 // The prompt into a fresh forward: position by position (class BASE) or the batched prompt windows (--prompt-rows).
 // Returns the anchor = greedy id after the last prompt token. sp (TP pair): --prefill-route (prime_stages).
 std::uint32_t prime(hb::Forward& f, const std::vector<std::uint32_t>& prompt, bool batched,
                     hb::rows::MtpSource<hb::Forward>* mtp = nullptr, const StagePrime* sp = nullptr) {
+    if (batched && sp && sp->route == "ring") return prime_ring(f, prompt, mtp, *sp);
     if (batched && sp && sp->route != "one") {
         std::uint64_t full = 0;
         for (const auto& w : strix::pair::layers::windows(f.window_rows(static_cast<std::uint32_t>(prompt.size())), sp->rows))
@@ -502,8 +620,8 @@ int main(int argc, char** argv) {
             else if (a == "--tp-transport" && more) tp_spec = argv[++i];
             else if (a == "--prefill-route" && more) {
                 prefill_route = argv[++i];
-                if (prefill_route != "auto" && prefill_route != "stages" && prefill_route != "one")
-                    throw std::invalid_argument("--prefill-route auto|stages|one");
+                if (prefill_route != "auto" && prefill_route != "stages" && prefill_route != "one" && prefill_route != "ring")
+                    throw std::invalid_argument("--prefill-route auto|stages|one|ring");
             }
             else if (a == "--mtp-head" && more) {
                 const std::string v = argv[++i];

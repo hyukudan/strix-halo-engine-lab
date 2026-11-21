@@ -1672,13 +1672,18 @@ struct Forward::Impl {
     }
 
     // One window [p0, p0 + R) whose tokens are already in `tokens`; head = the last row's logits.
-    void prefill_window(std::uint32_t p0, std::uint32_t R, bool head) {
+    // resident: X rows stay in pr.x0 across consecutive layer ranges of one window (no seam copies); keep_engram: the
+    // window's Engram rows stay queued for its later ranges (released by the last range or engram_release_all).
+    void prefill_window(std::uint32_t p0, std::uint32_t R, bool head, bool resident = false, bool keep_engram = false) {
         engram_submit(p0, R, [this](std::uint32_t q) { return tokens[q]; });  // no-op when prefill() queued it ahead
         struct EngramRelease {  // after the window sync below (or on a throw): the uploads have consumed the rows
             Impl& m;
             std::uint32_t at;
-            ~EngramRelease() { m.engram_release(at); }
-        } engram_release_guard{*this, p0};
+            bool keep;
+            ~EngramRelease() {
+                if (!keep) m.engram_release(at);
+            }
+        } engram_release_guard{*this, p0, keep_engram};
         auto mark = std::chrono::steady_clock::now();
         const std::size_t n = 4U * std::size_t{c.hidden};
         if (first == 0U) {
@@ -1687,7 +1692,7 @@ struct Forward::Impl {
             for (std::size_t i = 0; i < four.size(); ++i) four[i] = tokens[p0 + i / 4U];
             launch_hip_embedding_rows({te.p, te.type, c.hidden, c.vocab}, HipActivationStorage::fp32, four, pr.x0, c.hidden, s);
             glu::launch_epilogue<glu::Round::bf16>(pr.x0, nullptr, n * R, n * R, pr.x0, s);
-        } else {  // X rows of the previous stage (layer pipeline seam)
+        } else if (!resident) {  // X rows of the previous stage (layer pipeline seam); resident: already in pr.x0
             check(hipMemcpyAsync(pr.x0, seam, n * R * 4U, hipMemcpyDeviceToDevice, s), "seam rows in");
         }
         sync_time(times.embed, mark);
@@ -1703,7 +1708,7 @@ struct Forward::Impl {
             sync_time(times.ffn, mark);
         }
         std::uint32_t bad = 0;
-        if (last != c.layers)  // X rows for the next stage (layer pipeline seam)
+        if (last != c.layers && !resident)  // X rows for the next stage (layer pipeline seam)
             check(hipMemcpyAsync(seam, pr.x0, n * R * 4U, hipMemcpyDeviceToDevice, s), "seam rows out");
         if (head) {
             const float* xl = pr.x0 + std::size_t{R - 1U} * n;
@@ -2145,8 +2150,11 @@ struct Forward::Impl {
     // prompt plan (no tail rows): the same windows as prefill(), the same bits. The first range of a window records its
     // ids; every later range of that window must carry the same ids. The position stays 0 until seat().
     const std::vector<float>& range_window(std::span<const std::uint32_t> win, std::uint32_t start, std::uint32_t a, std::uint32_t b,
-                                           bool head) {
+                                           bool head, bool resident = false) {
         if (first != 0U || last != c.layers) throw std::logic_error("hy4 hip forward: range windows run on a whole-model rank");
+        if (resident && a != 0U && (res_start != start || res_layer != a))
+            throw std::logic_error("hy4 hip forward: a resident range continues its window's previous range");
+        res_start = kNoResident;
         if (rmax == 0U) throw std::runtime_error("hy4 hip forward: range windows need prompt rows");
         if (a >= b || b > c.layers || (head && b != c.layers)) throw std::invalid_argument("hy4 hip forward: range window layers");
         if (pos != 0U) throw std::logic_error("hy4 hip forward: range windows start a prompt (reset first)");
@@ -2175,14 +2183,76 @@ struct Forward::Impl {
                 m.last = l;
             }
         } restore{*this, first, last};
+        // resident: the window's Engram rows of every layer queued once, at its first range (read ahead of the GPU)
+        if (resident && a == 0U) engram_submit(start, R, [this](std::uint32_t q) { return tokens[q]; });
         first = a;
         last = b;
         times = {};
-        prefill_window(start, R, head);
+        prefill_window(start, R, head, resident, resident && b != c.layers);
         first = restore.f;
         last = restore.l;
         if (b == c.layers) prompt_hidden_rows(start, R);  // pr.x0 holds the window's X rows after the last layer
+        if (resident && b != c.layers) {
+            res_start = start;
+            res_layer = b;
+        }
         return head ? logits : empty;
+    }
+    static constexpr std::uint32_t kNoResident = 0xFFFFFFFFU;
+    std::uint32_t res_start = kNoResident, res_layer = 0;  // the resident window's start and its next layer
+    void record_prompt(std::span<const std::uint32_t> prompt_ids) {
+        if (first != 0U || last != c.layers) throw std::logic_error("hy4 hip forward: record_prompt on a whole-model rank");
+        if (pos != 0U || !tokens.empty()) throw std::logic_error("hy4 hip forward: record_prompt starts a prompt (reset first)");
+        if (prompt_ids.size() > context) throw std::runtime_error("hy4 hip forward: context full");
+        for (const auto id : prompt_ids)
+            if (id >= c.vocab) throw std::invalid_argument("hy4 hip forward: token outside the vocabulary");
+        tokens.assign(prompt_ids.begin(), prompt_ids.end());
+    }
+    // The window ring's message pieces of layer l for positions [p0, p1): {base, rows layout, first row, end row} in the
+    // position space of each piece (group keys: groups of index_ratio positions).
+    struct RowPiece {
+        std::uint16_t* base;
+        cr::Rows rows;
+        std::uint64_t p0, p1;
+    };
+    [[nodiscard]] std::array<RowPiece, 3> row_pieces(std::uint32_t l, std::uint32_t p0, std::uint32_t p1) const {
+        if (first != 0U || last != c.layers || l >= c.layers) throw std::logic_error("hy4 hip forward: cache rows on a whole-model rank");
+        if (p0 > p1 || p1 > context) throw std::invalid_argument("hy4 hip forward: cache rows beyond the context");
+        const auto lc = layer_caches(c, l, context, rows::cache_rows(rmax, vr.max));
+        std::array<RowPiece, 3> pieces{};
+        pieces[0] = {latent[l], lc.latent, p0, p1};
+        if (c.indexed[l] != 0U) {
+            if (p0 % c.index_ratio != 0U || p1 % c.index_ratio != 0U)
+                throw std::invalid_argument("hy4 hip forward: cache rows of an indexed layer start and end on a group");
+            pieces[1] = {tkeys[l], lc.token_keys, p0, p1};
+            pieces[2] = {gkeys[l], lc.group_keys, p0 / c.index_ratio, p1 / c.index_ratio};
+        }
+        return pieces;
+    }
+    std::uint64_t rows_bytes(std::uint32_t l, std::uint32_t p0, std::uint32_t p1) const {
+        std::uint64_t n = 0;
+        for (const auto& piece : row_pieces(l, p0, p1)) {
+            if (piece.base == nullptr) continue;
+            const auto sp = cr::slot_spans(piece.rows, piece.p0, piece.p1);
+            for (unsigned i = 0; i < sp.count; ++i) n += sp.span[i].rows * piece.rows.width * sizeof(std::uint16_t);
+        }
+        return n;
+    }
+    void rows_copy(std::uint32_t l, std::uint32_t p0, std::uint32_t p1, std::byte* host, std::size_t bytes, bool out) {
+        if (rows_bytes(l, p0, p1) != bytes) throw std::invalid_argument("hy4 hip forward: cache rows bytes of layer " + std::to_string(l));
+        std::size_t at = 0;
+        for (const auto& piece : row_pieces(l, p0, p1)) {
+            if (piece.base == nullptr) continue;
+            const auto sp = cr::slot_spans(piece.rows, piece.p0, piece.p1);
+            for (unsigned i = 0; i < sp.count; ++i) {
+                std::uint16_t* dev = piece.base + static_cast<std::size_t>(sp.span[i].slot) * piece.rows.width;
+                const auto n = static_cast<std::size_t>(sp.span[i].rows) * piece.rows.width * sizeof(std::uint16_t);
+                if (out) check(hipMemcpyAsync(host + at, dev, n, hipMemcpyDeviceToHost, s), "cache rows export");
+                else check(hipMemcpyAsync(dev, host + at, n, hipMemcpyHostToDevice, s), "cache rows import");
+                at += n;
+            }
+        }
+        check(hipStreamSynchronize(s), out ? "cache rows export sync" : "cache rows import sync");
     }
     // After every window's ranges ran here or were imported: the position after them (tail steps / decode follow).
     void seat(std::uint32_t positions) {
@@ -2392,9 +2462,17 @@ void* Forward::seam_rows() const noexcept { return impl_->seam; }
 std::uint32_t Forward::window_rows(std::uint32_t prompt) const { return impl_->window_rows(prompt); }
 void* Forward::range_seam() { return impl_->range_seam(); }
 const std::vector<float>& Forward::range_window(std::span<const std::uint32_t> tokens, std::uint32_t start, std::uint32_t first_layer,
-                                                std::uint32_t last_layer, bool head) {
+                                                std::uint32_t last_layer, bool head, bool resident) {
     const Impl::TpOneNode one(impl_->tp);  // the stage form: one-node work on this rank's layer range, no gather
-    return impl_->range_window(tokens, start, first_layer, last_layer, head);
+    return impl_->range_window(tokens, start, first_layer, last_layer, head, resident);
+}
+void Forward::record_prompt(std::span<const std::uint32_t> ids) { impl_->record_prompt(ids); }
+std::uint64_t Forward::rows_bytes(std::uint32_t layer, std::uint32_t p0, std::uint32_t p1) const { return impl_->rows_bytes(layer, p0, p1); }
+void Forward::export_rows(std::uint32_t layer, std::uint32_t p0, std::uint32_t p1, std::span<std::byte> out) {
+    impl_->rows_copy(layer, p0, p1, out.data(), out.size(), true);
+}
+void Forward::import_rows(std::uint32_t layer, std::uint32_t p0, std::uint32_t p1, std::span<const std::byte> in) {
+    impl_->rows_copy(layer, p0, p1, const_cast<std::byte*>(in.data()), in.size(), false);
 }
 std::uint64_t Forward::cache_bytes(std::uint32_t layer, std::uint32_t positions) const {
     std::uint64_t n = 0;
@@ -2428,6 +2506,7 @@ void Forward::sync() { check(hipStreamSynchronize(impl_->s), "forward sync"); }
 void Forward::reset() noexcept {
     impl_->pos = 0;
     impl_->tokens.clear();
+    impl_->res_start = Impl::kNoResident;
     impl_->times = {};
 }
 const std::vector<std::uint32_t>& Forward::token_history() const noexcept { return impl_->tokens; }
