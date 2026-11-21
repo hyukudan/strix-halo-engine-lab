@@ -141,10 +141,10 @@ void test_token_bytes() {
             const auto [inputs, outputs] = mini::mini_expert_geometry(projection);
             const auto layout = mini::mini_expert_format(visit.physical_layer);
             using weight::microscaled::MatrixFormat;
-            const unsigned row_bytes = layout == MatrixFormat::nvfp4 ?
-                inputs / 2 + inputs / weight::microscaled::kNvfp4BlockColumns :
-                inputs + inputs / weight::microscaled::kMxfp8BlockColumns;
-            expert_bytes += std::uint64_t{row_bytes} * outputs * mini::kExpertsPerToken;
+            const std::uint64_t row_bytes = layout == MatrixFormat::nvfp4 ?
+                std::uint64_t{inputs} / 2U + std::uint64_t{inputs} / weight::microscaled::kNvfp4BlockColumns :
+                std::uint64_t{inputs} + std::uint64_t{inputs} / weight::microscaled::kMxfp8BlockColumns;
+            expert_bytes += row_bytes * outputs * mini::kExpertsPerToken;
         }
     }
     for (const auto format : {weight::kBf16WeightStorage, weight::kQ8WeightStorage}) {
