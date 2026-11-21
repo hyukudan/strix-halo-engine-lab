@@ -1,3 +1,6 @@
+// The HIP runtime comes first: <cstring> (reached through the headers below) binds std::memcpy to the overloads
+// visible at that point, and the device helpers need the device overload.
+#include <hip/hip_runtime.h>
 #include "strix/env_flags.hpp"
 #include "strix/hip_qwen_dpp_reduce.hpp"
 #include "strix/qpf2k_defaults.hpp"
