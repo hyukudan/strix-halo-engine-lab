@@ -39,8 +39,12 @@ STRIX_NVFP4_TEST_HD Mismatch check_quads(const Table& table, const strix::core::
         const auto quad = table.decode_quad(std::uint32_t{low} | (std::uint32_t{high} << 8U));
         const auto actual_first = (f2u(quad.template widen<0U>()) >> 16U) | f2u(quad.template widen<1U>());
         const auto actual_second = (f2u(quad.template widen<2U>()) >> 16U) | f2u(quad.template widen<3U>());
-        const auto expected_first = operand.decode_pair(&low, scale);
-        const auto expected_second = operand.decode_pair(&high, scale);
+        // Production decodes codes loaded from memory; keep the unrolled
+        // constant codes opaque so the reference sees the same arithmetic.
+        const auto low_code = strix::core::nvfp4_table_detail::opaque_code(low);
+        const auto high_code = strix::core::nvfp4_table_detail::opaque_code(high);
+        const auto expected_first = operand.decode_pair(&low_code, scale);
+        const auto expected_second = operand.decode_pair(&high_code, scale);
         if (actual_first != expected_first) return {2U * code, actual_first, expected_first};
         if (actual_second != expected_second) return {2U * code + 1U, actual_second, expected_second};
     }
