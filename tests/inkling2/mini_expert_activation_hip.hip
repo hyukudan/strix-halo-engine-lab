@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "moe_core/expert_activation.hpp"
 
 #include <array>

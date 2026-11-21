@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "attn_core/prepared_bf16_attention.hpp"
 #include "inkling2/inkling2_mini_attention_hip.hpp"
 #include "strix/ds41_scalar_codecs.hpp"

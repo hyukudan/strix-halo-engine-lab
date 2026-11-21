@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "core/short_convolution.hpp"
 #include "short_conv_device_fixture.hpp"
 

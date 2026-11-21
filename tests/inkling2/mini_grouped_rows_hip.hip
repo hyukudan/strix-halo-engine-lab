@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "moe_core/grouped_rows.hpp"
 
 #include <algorithm>

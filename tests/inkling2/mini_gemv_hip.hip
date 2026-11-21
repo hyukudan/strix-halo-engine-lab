@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "inkling2/inkling2_mini_dense_hip.hpp"
 #include "strix/weight/formats/scalar_float.hpp"
 

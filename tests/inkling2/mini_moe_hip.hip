@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "inkling2/inkling2_mini_moe_hip.hpp"
 #include "mini_moe_device_fixture.hpp"
 

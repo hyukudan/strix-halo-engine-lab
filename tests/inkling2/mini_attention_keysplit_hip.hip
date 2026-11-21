@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "attn_core/dense_flash_keysplit.hpp"
 #include "attn_core/prepared_bf16_attention.hpp"
 #include "strix/ds41_scalar_codecs.hpp"

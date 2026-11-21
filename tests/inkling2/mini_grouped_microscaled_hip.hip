@@ -1,3 +1,5 @@
+#include "strix/hip/legacy_intrinsics.hpp"
+#include "strix/hip/legacy_launch.hpp"
 #include "inkling2/inkling2_mini_expert_hip.hpp"
 #include "moe_core/grouped_microscaled.hpp"
 
