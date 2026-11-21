@@ -1160,6 +1160,8 @@ add_library(strix_model_registry STATIC src/model_registry.cpp)
 target_link_libraries(strix_model_registry PUBLIC strix_model_description)
 strix_target_warnings(strix_model_registry)
 include(cmake/StrixSupport.cmake)
+include(cmake/StrixVulkan.cmake)
+include(cmake/StrixMetal.cmake)
 
 add_library(strix_qwen_model_description STATIC
     src/qwen_model_description.cpp src/model_contract.cpp src/gguf_reader.cpp

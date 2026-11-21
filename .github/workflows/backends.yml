@@ -7,6 +7,13 @@ on:
       - 'src/cuda_core/**'
       - 'src/qwen35/cuda/**'
       - 'src/intel/**'
+      - 'src/core/gpu_port.*'
+      - 'src/vulkan/**'
+      - 'src/metal/**'
+      - 'include/strix/core/dense_reference.hpp'
+      - 'include/strix/session/backend.hpp'
+      - 'src/session/backend_cpu.cpp'
+      - 'tests/gpu_port_host_tests.cpp'
       - 'cmake/**'
       - 'CMakeLists.txt'
       - '.github/workflows/backends.yml'
@@ -73,3 +80,31 @@ jobs:
           cmake --build build/backend-intel --target strix_device_intel strix_intel_core \
             strix-intel-backend-host-tests strix-intel-sycl-boundary-tests \
             strix-gemma4-decode strix-gemma4-serve strix_gemma4_session_service
+
+  vulkan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools and Vulkan headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libvulkan-dev glslang-tools
+      - name: Compile Vulkan reference and host tests
+        run: |
+          cmake -S . -B build/backend-vulkan -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DSTRIX_BACKEND_VULKAN=ON -DSTRIX_ENABLE_HIP_RUNTIME=OFF \
+            -DSTRIX_WARNINGS_AS_ERRORS=ON -DBUILD_TESTING=ON
+          cmake --build build/backend-vulkan --target strix_vulkan_core strix-gpu-port-host-tests
+          test -s build/backend-vulkan/strix_vulkan_rms.spv
+
+  metal:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile Metal reference and host tests
+        run: |
+          cmake -S . -B build/backend-metal -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DSTRIX_BACKEND_METAL=ON -DSTRIX_ENABLE_HIP_RUNTIME=OFF \
+            -DSTRIX_WARNINGS_AS_ERRORS=ON -DBUILD_TESTING=ON
+          cmake --build build/backend-metal --target strix_metal_core strix-gpu-port-host-tests
+          xcrun -sdk macosx metal -c src/metal/core/rms_norm.metal -o build/backend-metal/rms_norm.air
