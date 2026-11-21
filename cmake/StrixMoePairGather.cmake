@@ -1,0 +1,6 @@
+add_executable(strix-moe-pair-gather-tests tests/moe_pair_gather_tests.cpp)
+target_include_directories(strix-moe-pair-gather-tests PRIVATE src)
+target_compile_features(strix-moe-pair-gather-tests PRIVATE cxx_std_20)
+strix_target_warnings(strix-moe-pair-gather-tests)
+add_test(NAME strix-moe-pair-gather-tests COMMAND strix-moe-pair-gather-tests)
+set_tests_properties(strix-moe-pair-gather-tests PROPERTIES LABELS "cpu;moe;exactness")

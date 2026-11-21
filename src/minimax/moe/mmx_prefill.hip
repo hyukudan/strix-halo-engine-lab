@@ -18,6 +18,7 @@
 #include "core/wmma_tiled.hpp"  // shared tiled core: grouped IU4 kernel and convert_exl3_iu4 (strix_tiled_core)
 #endif
 #include "moe_core/device_plan.hpp"
+#include "moe_core/pair_gather.hpp"
 #include "moe_core/grouped_policy.hpp"
 #include "core/linear_plan.hpp"  // fixed_linear_contract: rows-free dense K chain (invariant order)
 #include "strix/env_flags.hpp"
@@ -213,33 +214,14 @@ __device__ __forceinline__ void fakeq128(float (&v)[4]) {
     strix::core::iu4_fake128(v);
 }
 
-// Tile-major position (v4) of row R (padded row index), column ch of a K-wide matrix: [R/16][ch/16][R%16][ch%16].
-__device__ __forceinline__ std::size_t tiled_at(unsigned R, unsigned ch, unsigned K) {
-    return ((static_cast<std::size_t>(R >> 4U) * (K >> 4U) + (ch >> 4U)) << 8U) + ((R & 15U) << 4U) + (ch & 15U);
-}
+using strix::moe_core::tiled_at;
+using strix::moe_core::gather_transform_tiled_kernel;
 
-// v4: gather + input transform (transform_block's operation order), stored tile-major.
-__global__ __launch_bounds__(256) void gather_transform_tiled_kernel(const float* y, Tables t) {
-    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
-    const unsigned q = blockIdx.x * 8U + wave;
-    if (q >= t.pairs * 2 * kHB) return;
-    const unsigned p = q / (2 * kHB), rem = q % (2 * kHB), m = rem / kHB, b = rem % kHB;
-    const PGroup& g = t.groups[t.pair_group[p]];
-    const std::uint16_t* suh = m == 0 ? g.w.gate.suh : g.w.up.suh;
-    const float* x = moe_row_in(y, t, t.pair_row[p]);
-    float v[4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const unsigned c = b * 128U + lane + 32U * static_cast<unsigned>(j);
-        const float scaled = InputTransform::scale(x[c], suh[c]);
-        v[j] = static_cast<float>(static_cast<_Float16>(scaled));
+struct GatherInputRows {
+    static __device__ __forceinline__ const float* row(const float* y, const Tables& tables, unsigned token) {
+        return moe_row_in(y, tables, token);
     }
-    InputTransform::h128(v, lane);
-    _Float16* out = t.xt + static_cast<std::size_t>(m) * t.tpairs * kHidden;
-    const unsigned R = g.tbegin + (p - g.pair_begin);
-#pragma unroll
-    for (int j = 0; j < 4; ++j) out[tiled_at(R, b * 128U + lane + 32U * static_cast<unsigned>(j), kHidden)] = static_cast<_Float16>(v[j]);
-}
+};
 
 // v4, token-major: one wave = one (token, 128-block). It reads the token's fp32 block once and runs
 // gather_transform_tiled_kernel's per-(pair, matrix) statements for the token's 4 routed pairs and its shared pair, gate
@@ -1793,7 +1775,7 @@ void launch_device_planned(const Tables& t, const float* y, float* out, pfk::Ite
                            hipStream_t stream) {
     const unsigned T = t.rows;
     if (token_gather) launch_gather_token(y, t, T, stream);
-    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gather_transform_tiled_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, y, t);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (gather_transform_tiled_kernel<kHidden, Tables, GatherInputRows>), dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, y, t);
     launched("gather transform");
     mark("gather", stream);
     const bool pair = prefill_pipe_pair(T), side = prefill_tail_stream();
@@ -2224,7 +2206,7 @@ void enqueue_prefill_moe(const PrefillMoeView& v, void* workspace, std::size_t w
     // The token gather implements A4 fake quant; force it for the shadow call
     // even when the ordinary path selected the tiled gather.
     if (v.fakeq_a4 == PrefillFakeq::on || prefill_gather_tok()) launch_gather_token(v.y, t, v.rows, stream);
-    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gather_transform_tiled_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
+    else STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (gather_transform_tiled_kernel<kHidden, Tables, GatherInputRows>), dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, v.y, t);
     launched("gather transform");
     mark("gather", stream);
     {

@@ -60,10 +60,6 @@ __global__ __launch_bounds__(128) void grouped_kernel(const Item* items, unsigne
 unsigned mt_class(unsigned rows) { return rows <= 16 ? 0U : rows <= 32 ? 1U : rows <= 64 ? 2U : 3U; }
 
 
-__global__ __launch_bounds__(256) void gather_transform_kernel(const float* x, Tables t) {
-    Core::gather_transform_kernel(x, t);
-}
-
 __global__ __launch_bounds__(256) void gather_transform_v3_kernel(const float* x, Tables t) {
     Core::gather_transform_v3_kernel(x, t);
 }
@@ -307,7 +303,7 @@ void enqueue_prefill_moe_glm(const PrefillMoeView& v, void* workspace, std::size
     if (gather_v3())
         STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gather_transform_v3_kernel, dim3(t.tpairs / 16, 2, kHB / kG3Blocks), dim3(256), 0, stream, v.x, t);
     else
-        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, gather_transform_kernel, dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, v.x, t);
+        STRIX_HIP_LAUNCH_GGL(Rdna3Layout, (strix::moe_core::gather_transform_tiled_kernel<kH, Tables>), dim3((t.pairs * 2 * kHB + 7) / 8), dim3(256), 0, stream, v.x, t);
     launched("gather transform");
     mark("gather", stream);
     launch_stage<kH, kI>(v.bits_gu, items_d, p.gu_count, p.gu_ctas, stream);

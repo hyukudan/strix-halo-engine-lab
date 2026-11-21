@@ -1,5 +1,6 @@
 #pragma once
 #include "grouped_core.hpp"
+#include "pair_gather.hpp"
 
 namespace strix::moe_core {
 // One-split, tile-major variant. The adapter owns launches and host planning.
@@ -144,30 +145,6 @@ static __device__ __forceinline__ void item_core(const Item& it, unsigned bx, un
             }
         }
     }
-}
-static __device__ __forceinline__ std::size_t tiled_at(unsigned R, unsigned ch, unsigned K) {
-    return ((static_cast<std::size_t>(R >> 4U) * (K >> 4U) + (ch >> 4U)) << 8U) + ((R & 15U) << 4U) + (ch & 15U);
-}
-static __device__ __forceinline__ void gather_transform_kernel(const float* x, Tables t) {
-    const unsigned wave = threadIdx.x >> 5U, lane = threadIdx.x & 31U;
-    const unsigned q = blockIdx.x * 8U + wave;
-    if (q >= t.pairs * 2 * kHB) return;
-    const unsigned p = q / (2 * kHB), rem = q % (2 * kHB), m = rem / kHB, b = rem % kHB;
-    const GroupDev& g = t.groups[t.pair_group[p]];
-    const std::uint16_t* suh = m == 0 ? g.w.gate.suh : g.w.up.suh;
-    const float* xr = x + static_cast<std::size_t>(t.pair_row[p]) * kH;
-    float v[4];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const unsigned c = b * 128U + lane + 32U * static_cast<unsigned>(j);
-        const float scaled = materialize(xr[c] * half_bits(suh[c]));
-        v[j] = static_cast<float>(static_cast<_Float16>(scaled));
-    }
-    hadamard128(v, lane);
-    _Float16* out = t.xt + static_cast<std::size_t>(m) * t.tpairs * kH;
-    const unsigned R = g.tbegin + (p - g.pair_begin);
-#pragma unroll
-    for (int j = 0; j < 4; ++j) out[tiled_at(R, b * 128U + lane + 32U * static_cast<unsigned>(j), kH)] = static_cast<_Float16>(v[j]);
 }
 static __device__ __forceinline__ void gather_transform_v3_kernel(const float* x, Tables t) {
     __shared__ alignas(16) _Float16 sv[16][kG3Pitch];
